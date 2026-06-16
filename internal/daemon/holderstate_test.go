@@ -251,28 +251,30 @@ func TestHolderStateRefreshDiscardsSnapshotRacedByInPlaceUpdate(t *testing.T) {
 	})
 }
 
-// TestHolderStateHeldDead pins the held-dead discriminator on the cache:
-// held-dead is PRESENT in the holder's last List but not Live, and the wedged
-// return relays the holder's deep-probe verdict for dead dirs only. Driven
-// through refresh so the matrix verifies how List rows are actually stored —
-// one mounts entry per registered mount, so a TCC-blocked or never-mounted
-// dir (which the holder never registers) is absent and can never read
-// held-dead.
+// TestHolderStateHeldDead pins the held-dead discriminator on the cache: a dir
+// is held-dead when it is PRESENT in the holder's last List but either not Live
+// (shallow) or marked wedged by the daemon's own deep probe; the second return
+// relays that wedge verdict. The List rows come through refresh (one mounts
+// entry per registered mount, so a TCC-blocked or never-mounted dir the holder
+// never registers is absent and can never read held-dead); the wedge verdict is
+// the daemon's own, forced via markDeepWedged (the holder ships no wedge field).
 func TestHolderStateHeldDead(t *testing.T) {
 	cases := map[string]struct {
 		mounts     []mountd.MountInfo
+		wedge      bool // force the daemon's deep verdict wedged after refresh
 		unhealthy  bool
 		wantDead   bool
 		wantWedged bool
 	}{
-		"present, dead, and deep-wedged is the wedge signature": {
-			mounts:     []mountd.MountInfo{{Dir: "/pool/acct-01", Base: "/b", Live: false, Wedged: true}},
+		"shallow-live but deep-wedged is the wedge signature": {
+			mounts:     []mountd.MountInfo{{Dir: "/pool/acct-01", Base: "/b", Live: true}},
+			wedge:      true,
 			wantDead:   true,
 			wantWedged: true,
 		},
-		"present and dead without a wedge verdict is plain dead": {
-			// An out-of-band `umount -f`, a dead fuse-t worker, or an old
-			// holder that predates the deep probe and never sets Wedged.
+		"present and not Live without a wedge verdict is plain dead": {
+			// An out-of-band `umount -f` or a dead fuse-t worker: the holder
+			// names the dir but its shallow liveness probe fails.
 			mounts:   []mountd.MountInfo{{Dir: "/pool/acct-01", Base: "/b", Live: false}},
 			wantDead: true,
 		},
@@ -283,7 +285,8 @@ func TestHolderStateHeldDead(t *testing.T) {
 			mounts: []mountd.MountInfo{{Dir: "/pool/other", Base: "/b", Live: false}},
 		},
 		"unreachable holder never reads held-dead": {
-			mounts:    []mountd.MountInfo{{Dir: "/pool/acct-01", Base: "/b", Live: false, Wedged: true}},
+			mounts:    []mountd.MountInfo{{Dir: "/pool/acct-01", Base: "/b", Live: true}},
+			wedge:     true,
 			unhealthy: true,
 		},
 	}
@@ -291,6 +294,9 @@ func TestHolderStateHeldDead(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var h holderState
 			h.refresh(mountd.NewClient(startCannedHolder(t, tc.mounts)))
+			if tc.wedge {
+				h.markDeepWedged("/pool/acct-01")
+			}
 			if tc.unhealthy {
 				h.markUnhealthy()
 			}
@@ -302,17 +308,19 @@ func TestHolderStateHeldDead(t *testing.T) {
 	}
 }
 
-// TestWireStatusCountsWedged pins the WedgedMounts surface: refresh installs
-// the holder's per-dir wedge verdicts and wireStatus counts them; a fresh
-// mount supersedes its dir's verdict in place, and an unreachable holder
+// TestWireStatusCountsWedged pins the WedgedMounts surface: it counts the
+// daemon's OWN deep-probe verdicts (not anything from the holder's List); a
+// fresh mount clears its dir's verdict in place, and an unreachable holder
 // counts zero.
 func TestWireStatusCountsWedged(t *testing.T) {
 	var h holderState
 	h.refresh(mountd.NewClient(startCannedHolder(t, []mountd.MountInfo{
-		{Dir: "/pool/a", Base: "/b", Live: false, Wedged: true},
-		{Dir: "/pool/b", Base: "/b", Live: false, Wedged: true},
+		{Dir: "/pool/a", Base: "/b", Live: true},
+		{Dir: "/pool/b", Base: "/b", Live: true},
 		{Dir: "/pool/c", Base: "/b", Live: true},
 	})))
+	h.markDeepWedged("/pool/a")
+	h.markDeepWedged("/pool/b")
 	if got := h.wireStatus().WedgedMounts; got != 2 {
 		t.Fatalf("WedgedMounts = %d, want 2 of 3", got)
 	}

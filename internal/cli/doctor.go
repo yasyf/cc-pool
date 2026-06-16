@@ -190,15 +190,15 @@ func listHolderMounts() []mountd.MountInfo {
 }
 
 // reportWedges flags partial-wedge mirrors on fuse rows: mounts that answer
-// shallow metadata stats but hang bulk reads. Two sources, same line: the
-// holder's own List verdict (MountInfo.Wedged, its 30s deep-probe ticker),
-// and a bounded local deep probe of every row the holder still claims Live —
-// the holder's verdict lags its ticker, and with the daemon down nothing else
-// would surface the wedge. ErrProbeMissing is no verdict (a pre-probe
-// holder's mount), never a wedge. nil mounts (holder unreachable) reports
-// nothing. deepProbeAt is bounded by design, like reportCarcasses' stat
-// seams: nothing doctor runs against a possibly wedged mirror may block
-// unboundedly.
+// shallow metadata stats but hang bulk reads. The holder ships no deep
+// verdict (the daemon owns the probe), so doctor runs its OWN bounded local
+// deep probe of every fuse row the holder still reports Live — independent of
+// the daemon, so it surfaces a wedge even when the daemon is down (a key
+// doctor case the daemon's cached count cannot cover). ErrProbeMissing is no
+// verdict (a pre-upgrade holder's mount predating the probe file), never a
+// wedge. nil mounts (holder unreachable) reports nothing. deepProbeAt is
+// bounded by design, like reportCarcasses' stat seams: nothing doctor runs
+// against a possibly wedged mirror may block unboundedly.
 func reportWedges(accts []store.Account, mounts []mountd.MountInfo, report func(string, bool, string)) {
 	byDir := make(map[string]mountd.MountInfo, len(mounts))
 	for _, mi := range mounts {
@@ -209,16 +209,10 @@ func reportWedges(accts []store.Account, mounts []mountd.MountInfo, report func(
 			continue
 		}
 		mi, held := byDir[a.ConfigDir]
-		if !held {
+		if !held || !mi.Live {
 			continue
 		}
-		wedged := mi.Wedged
-		if !wedged && mi.Live {
-			if err := deepProbeAt(a.ConfigDir); err != nil && !errors.Is(err, overlay.ErrProbeMissing) {
-				wedged = true
-			}
-		}
-		if wedged {
+		if err := deepProbeAt(a.ConfigDir); err != nil && !errors.Is(err, overlay.ErrProbeMissing) {
 			report(fmt.Sprintf("acct-%02d mirror", a.ID), false,
 				"wedged (serves metadata but hangs reads) — daemon will remount; relaunch its sessions")
 		}

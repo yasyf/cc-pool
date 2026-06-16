@@ -185,18 +185,9 @@ func fakeMountAlive(t *testing.T, fn func(base, dir string) bool) {
 	t.Cleanup(func() { mountAlive = prev })
 }
 
-// fakeDeepRead overrides the deepRead seam for one test, restoring it after.
-// Same no-parallel rule as fakeMounted.
-func fakeDeepRead(t *testing.T, fn func(dir string) error) {
-	t.Helper()
-	prev := deepRead
-	deepRead = fn
-	t.Cleanup(func() { deepRead = prev })
-}
-
 // registryBases flattens the registry snapshot to dir -> base. The handler
 // tables assert row membership through it; epoch and mount-time behavior is
-// pinned separately (TestListReportsWedgedEpochMountedAt).
+// pinned separately (TestListReportsEpochMountedAt).
 func registryBases(s *Server) map[string]string {
 	bases := map[string]string{}
 	for dir, row := range s.snapshotRegistry() {
@@ -776,8 +767,8 @@ func TestServerMountUnmountHappyPath(t *testing.T) {
 		t.Fatalf("list = %+v, want one entry", mounts)
 	}
 	m := mounts[0]
-	if m.Dir != dir || m.Base != base || !m.Live || m.Wedged {
-		t.Fatalf("list entry = %+v, want live unwedged %s <- %s", m, dir, base)
+	if m.Dir != dir || m.Base != base || !m.Live {
+		t.Fatalf("list entry = %+v, want live %s <- %s", m, dir, base)
 	}
 	if m.Epoch != 1 {
 		t.Errorf("Epoch = %d, want 1 for the holder's first mount of %s", m.Epoch, dir)
@@ -1152,24 +1143,6 @@ func TestBadRequestsOverTheWire(t *testing.T) {
 	})
 }
 
-// wedgedProbeErr is the canned deep-probe failure the deep-verdict tests
-// inject through the deepRead seam.
-func wedgedProbeErr() error {
-	return fmt.Errorf("%w: read parked past the probe timeout", overlay.ErrProbeWedged)
-}
-
-// seedLiveRegisteredMirror returns a handler server with one registered,
-// shallow-live mirror at dir — the substrate every deep-verdict test starts
-// from, since only the deep probe can distinguish a partial wedge.
-func seedLiveRegisteredMirror(t *testing.T, base, dir string) *Server {
-	t.Helper()
-	s := newHandlerServer(&fakeHost{})
-	s.registry[dir] = mountRow{Base: base}
-	fakeMounted(t, func(string) bool { return true })
-	fakeMountAlive(t, func(string, string) bool { return true })
-	return s
-}
-
 // listOne dispatches OpList and returns its single entry.
 func listOne(t *testing.T, s *Server) MountInfo {
 	t.Helper()
@@ -1180,209 +1153,9 @@ func listOne(t *testing.T, s *Server) MountInfo {
 	return resp.Mounts[0]
 }
 
-func TestDeepProbeFlipsLiveAfterStrikes(t *testing.T) {
-	const base, dir = "/pool/base", "/pool/acct-01"
-	s := seedLiveRegisteredMirror(t, base, dir)
-	fakeDeepRead(t, func(string) error { return wedgedProbeErr() })
-
-	s.deepProbePass()
-	s.deepProbePass()
-
-	if s.deepOK(dir) {
-		t.Fatal("deepOK = true after two consecutive failed passes, want wedged")
-	}
-	if m := listOne(t, s); m.Live || !m.Wedged {
-		t.Errorf("list entry = %+v, want Live=false Wedged=true (shallow-alive, deep-dead)", m)
-	}
-}
-
-func TestDeepProbeSingleStrikeKeepsLive(t *testing.T) {
-	const base, dir = "/pool/base", "/pool/acct-01"
-	s := seedLiveRegisteredMirror(t, base, dir)
-	fakeDeepRead(t, func(string) error { return wedgedProbeErr() })
-
-	s.deepProbePass()
-
-	if !s.deepOK(dir) {
-		t.Fatal("deepOK = false after a single strike, want still healthy (wedge needs two)")
-	}
-	if m := listOne(t, s); !m.Live || m.Wedged {
-		t.Errorf("list entry = %+v, want Live=true Wedged=false after one strike", m)
-	}
-}
-
-func TestDeepProbeRecoveryRestoresLive(t *testing.T) {
-	const base, dir = "/pool/base", "/pool/acct-01"
-	s := seedLiveRegisteredMirror(t, base, dir)
-	probeErr := wedgedProbeErr()
-	fakeDeepRead(t, func(string) error { return probeErr })
-
-	s.deepProbePass()
-	s.deepProbePass()
-	if s.deepOK(dir) {
-		t.Fatal("precondition: two failed passes must wedge the verdict")
-	}
-
-	probeErr = nil
-	s.deepProbePass()
-	if !s.deepOK(dir) {
-		t.Fatal("deepOK = false after a successful probe, want the wedge cleared")
-	}
-	if m := listOne(t, s); !m.Live || m.Wedged {
-		t.Errorf("list entry = %+v, want Live=true Wedged=false after recovery", m)
-	}
-
-	// Success must also reset the strike counter: one fresh failure may not
-	// re-wedge on the back of pre-recovery strikes.
-	probeErr = wedgedProbeErr()
-	s.deepProbePass()
-	if !s.deepOK(dir) {
-		t.Error("deepOK = false one strike after recovery; success must reset the strike count")
-	}
-}
-
-// TestDeepProbeMissingIsNoVerdict pins the ErrProbeMissing semantics: never a
-// strike (in either direction — it neither advances nor resets the count),
-// and holder-side it is logged exactly once per dir.
-func TestDeepProbeMissingIsNoVerdict(t *testing.T) {
-	const base, dir = "/pool/base", "/pool/acct-01"
-	s := seedLiveRegisteredMirror(t, base, dir)
-	var logBuf strings.Builder
-	s.Log = log.New(&logBuf, "", 0)
-	probeErr := fmt.Errorf("%w: %s", overlay.ErrProbeMissing, dir)
-	fakeDeepRead(t, func(string) error { return probeErr })
-
-	s.deepProbePass()
-	s.deepProbePass()
-	s.deepProbePass()
-	if !s.deepOK(dir) {
-		t.Fatal("deepOK = false after missing-probe passes; ErrProbeMissing must never strike")
-	}
-	if m := listOne(t, s); !m.Live || m.Wedged {
-		t.Errorf("list entry = %+v, want Live=true Wedged=false under a missing probe file", m)
-	}
-	// Count the holder-side message, not the sentinel text — the logged line
-	// embeds the error, whose own message also says "probe file missing".
-	if got := strings.Count(logBuf.String(), "missing from this holder's own mirror"); got != 1 {
-		t.Errorf("missing-probe log lines = %d, want exactly 1 per dir:\n%s", got, logBuf.String())
-	}
-
-	// No-verdict cuts both ways: a missing probe between two genuine failures
-	// must not reset the strike count either — fail, missing, fail wedges.
-	probeErr = wedgedProbeErr()
-	s.deepProbePass()
-	probeErr = fmt.Errorf("%w: %s", overlay.ErrProbeMissing, dir)
-	s.deepProbePass()
-	probeErr = wedgedProbeErr()
-	s.deepProbePass()
-	if s.deepOK(dir) {
-		t.Error("deepOK = true after fail/missing/fail; a missing probe must not reset strikes")
-	}
-}
-
-// TestDeepProbePassSkipsHeldClaim pins that the deep loop never touches a dir
-// whose in-flight claim is held: the pass skips it (no probe, no verdict
-// change) instead of blocking behind the mount/unmount that owns it.
-func TestDeepProbePassSkipsHeldClaim(t *testing.T) {
-	const base = "/pool/base"
-	const dirHeld, dirFree = "/pool/acct-01", "/pool/acct-02"
-	s := newHandlerServer(&fakeHost{})
-	s.registry[dirHeld] = mountRow{Base: base}
-	s.registry[dirFree] = mountRow{Base: base}
-	s.inflight[dirHeld] = true
-	var probed []string
-	fakeDeepRead(t, func(dir string) error {
-		probed = append(probed, dir)
-		return wedgedProbeErr()
-	})
-
-	s.deepProbePass()
-	if want := []string{dirFree}; !reflect.DeepEqual(probed, want) {
-		t.Errorf("probed = %v, want %v (a held claim must be skipped, never blocked on)", probed, want)
-	}
-	s.mu.Lock()
-	_, hasVerdict := s.deep[dirHeld]
-	s.mu.Unlock()
-	if hasVerdict {
-		t.Error("skipped dir accrued deep-probe state; a skipped pass must leave the verdict untouched")
-	}
-
-	// Once the claim is released, the next pass probes the dir again.
-	s.mu.Lock()
-	delete(s.inflight, dirHeld)
-	s.mu.Unlock()
-	probed = nil
-	s.deepProbePass()
-	if want := []string{dirHeld, dirFree}; !reflect.DeepEqual(probed, want) {
-		t.Errorf("probed after release = %v, want %v", probed, want)
-	}
-}
-
-// TestDeepProbeWedgedJoinsNoPileup pins the holder-shaped no-pileup property:
-// consecutive deepProbePass sweeps against one parked probe read must JOIN
-// the in-flight read — exactly one probe body, Inflight()==1 throughout —
-// while each timed-out pass still advances strikes to wedged. The joiner is a
-// real overlay.StatProbes, the same mechanism DeepProbeWithin runs on, so a
-// wedged mirror costs one parked goroutine and one fd no matter how many 30s
-// ticks elapse.
-func TestDeepProbeWedgedJoinsNoPileup(t *testing.T) {
-	const base, dir = "/pool/base", "/pool/acct-01"
-	s := seedLiveRegisteredMirror(t, base, dir)
-
-	// Mirror DeepProbeWithin's exact shape: StatProbes.Do around a read body,
-	// a timed-out Do reads as wedged. The body parks on block like a wedged
-	// mirror's uninterruptible read; bodies counts how many ever started.
-	var probes overlay.StatProbes[error]
-	var bodies atomic.Int32
-	block := make(chan struct{})
-	fakeDeepRead(t, func(d string) error {
-		err, ok := probes.Do(d, 50*time.Millisecond, func() error {
-			bodies.Add(1)
-			<-block
-			return nil
-		})
-		if !ok {
-			return wedgedProbeErr()
-		}
-		return err
-	})
-	// Drain the parked body before the deepRead seam is restored (cleanups
-	// run LIFO, so this runs before fakeDeepRead's restore).
-	t.Cleanup(func() {
-		close(block)
-		deadline := time.Now().Add(5 * time.Second)
-		for probes.Inflight() != 0 {
-			if time.Now().After(deadline) {
-				t.Error("parked probe body never drained")
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
-	})
-
-	s.deepProbePass()
-	if got := probes.Inflight(); got != 1 {
-		t.Fatalf("Inflight after the first pass = %d, want 1 parked probe", got)
-	}
-	if !s.deepOK(dir) {
-		t.Fatal("deepOK = false after one timed-out pass, want healthy (wedge needs two strikes)")
-	}
-
-	s.deepProbePass()
-	if got := probes.Inflight(); got != 1 {
-		t.Errorf("Inflight after the second pass = %d, want still 1 (the pass must join the parked read, never stack another)", got)
-	}
-	if got := bodies.Load(); got != 1 {
-		t.Errorf("probe bodies started = %d, want exactly 1 across both passes", got)
-	}
-	if s.deepOK(dir) {
-		t.Fatal("deepOK = true after two timed-out passes, want wedged")
-	}
-}
-
-// TestListReportsWedgedEpochMountedAt pins the additive List fields: Epoch
-// starts at 1, bumps on remount, and MountedAt stamps the current mount.
-func TestListReportsWedgedEpochMountedAt(t *testing.T) {
+// TestListReportsEpochMountedAt pins the additive List fields: Epoch starts at
+// 1, bumps on remount, and MountedAt stamps the current mount.
+func TestListReportsEpochMountedAt(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
 	fake := &fakeHost{}
 	installLiveSeams(t, fake)
@@ -1393,8 +1166,8 @@ func TestListReportsWedgedEpochMountedAt(t *testing.T) {
 		t.Fatalf("mount: %+v", resp)
 	}
 	m := listOne(t, s)
-	if !m.Live || m.Wedged {
-		t.Errorf("list entry = %+v, want live and unwedged", m)
+	if !m.Live {
+		t.Errorf("list entry = %+v, want live", m)
 	}
 	if m.Epoch != 1 {
 		t.Errorf("Epoch = %d, want 1 for the holder's first mount", m.Epoch)
@@ -1417,51 +1190,7 @@ func TestListReportsWedgedEpochMountedAt(t *testing.T) {
 	if m.MountedAt < first || m.MountedAt > time.Now().Unix() {
 		t.Errorf("MountedAt after remount = %d, want within [%d, now]", m.MountedAt, first)
 	}
-	if !m.Live || m.Wedged {
-		t.Errorf("list entry after remount = %+v, want live and unwedged", m)
+	if !m.Live {
+		t.Errorf("list entry after remount = %+v, want live", m)
 	}
-}
-
-// TestHandleMountRemountsDeepWedgedMirror pins the heal path Phase 3 exists
-// for: a held mirror that passes every shallow stat but is deep-wedged must
-// NOT read idempotently OK — handleMount routes it through the provider's
-// forced teardown and a fresh Setup, bumps the epoch, and resets the verdict.
-func TestHandleMountRemountsDeepWedgedMirror(t *testing.T) {
-	const base, dir = "/pool/base", "/pool/acct-01"
-	fake := &fakeHost{}
-	installLiveSeams(t, fake)
-	s := newHandlerServer(fake)
-	if resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir}); !resp.OK {
-		t.Fatalf("mount: %+v", resp)
-	}
-
-	fakeDeepRead(t, func(string) error { return wedgedProbeErr() })
-	s.deepProbePass()
-	s.deepProbePass()
-	if s.deepOK(dir) {
-		t.Fatal("precondition: two failed passes must wedge the verdict")
-	}
-
-	resp := s.dispatch(Request{Op: OpMount, Base: base, Dir: dir})
-	if !resp.OK {
-		t.Fatalf("mount over a deep-wedged mirror = %+v, want the teardown+remount recovery", resp)
-	}
-	setups, tears := fake.calls()
-	if want := []hostCall{{base, dir}}; !reflect.DeepEqual(tears, want) {
-		t.Errorf("Teardown calls = %v, want the wedged mirror torn down once", tears)
-	}
-	if want := []hostCall{{base, dir}, {base, dir}}; !reflect.DeepEqual(setups, want) {
-		t.Errorf("Setup calls = %v, want the initial mount and the remount", setups)
-	}
-	if !s.deepOK(dir) {
-		t.Error("deep verdict not reset by the remount")
-	}
-	row, ok := s.registered(dir)
-	if !ok || row.Epoch != 2 {
-		t.Errorf("registry row after remount = %+v (ok %v), want Epoch 2", row, ok)
-	}
-	if m := listOne(t, s); !m.Live || m.Wedged {
-		t.Errorf("list entry after remount = %+v, want live and unwedged", m)
-	}
-	assertClaimsReleased(t, s, 0)
 }

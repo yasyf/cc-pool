@@ -573,16 +573,43 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 		s.log.Printf("holder supervision: list accounts: %v", err)
 		return
 	}
-	// One session scan per pass, taken lazily on the first held-dead row —
-	// the count only flavors the held-dead log line.
+	// One session scan per pass — but only when there are fuse rows to heal or
+	// probe: the periodic in-use probe gates on a live session, and the
+	// held-dead log line wants the count too. A symlink-only or empty pool
+	// never scans. A failed scan is non-fatal — the gate then reads zero
+	// sessions and skips probing (the caution direction), and the held-dead
+	// line reports 0.
 	var sessions []procscan.Session
-	scanned := false
+	if len(fuse) > 0 {
+		ses, serr := s.scan()
+		if serr != nil {
+			s.log.Printf("holder supervision: session scan: %v", serr)
+		}
+		sessions = ses
+	}
 	now := time.Now()
 	inPass := make(map[int]bool, len(fuse))
 	for _, a := range fuse {
 		inPass[a.ID] = true
 		if ctx.Err() != nil {
 			return
+		}
+		// Periodic in-use deep probe: only a mount the holder still vouches for
+		// (shallow-live) AND backing at least one live session AND not probed
+		// within the interval AND not mid-conversion. A fresh wedge flips the
+		// verdict here so the ready() check just below sends the row to heal in
+		// this same pass. IDLE mounts (no live session) are never probed — that
+		// is the whole point of moving the probe into the daemon; an idle
+		// mount's wedge is caught at select time instead (handleSelect). The
+		// probe is a bounded read (deepProbe, 5s; concurrent same-dir probes
+		// join one in-flight read), so it runs without the poll claim.
+		if s.holder.shallowLive(a.ConfigDir) &&
+			procscan.CountByConfigDir(sessions, a.ConfigDir) > 0 &&
+			s.holder.dueForDeepProbe(a.ConfigDir, now, deepProbeInterval) &&
+			!s.isConverting(a.ID) {
+			if msg := s.holder.recordDeep(a.ConfigDir, deepProbe(a.ConfigDir)); msg != "" {
+				s.log.Printf("%s", msg)
+			}
 		}
 		if s.holder.ready(a.ConfigDir) {
 			delete(s.sup.rowRetry, a.ID)
@@ -607,20 +634,12 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 			delete(s.sup.rowRetry, a.ID)
 		default:
 			if dead, wedged := s.holder.heldDead(a.ConfigDir); dead {
-				if !scanned {
-					scanned = true
-					ses, serr := s.scan()
-					if serr != nil {
-						s.log.Printf("holder supervision: session scan: %v", serr)
-					}
-					sessions = ses
-				}
-				// The holder's deep-probe verdict picks the copy: a deep wedge
-				// serves metadata but hangs reads, while a plain-dead registered
-				// mirror (an out-of-band `umount -f`, a dead fuse-t worker, or
-				// an old holder that cannot deep-probe) fails reads outright.
-				// The relaunch guidance holds in both shapes — sessions on the
-				// old mirror are orphaned by the remount either way.
+				// The deep-probe verdict picks the copy: a deep wedge serves
+				// metadata but hangs reads, while a plain-dead registered mirror
+				// (an out-of-band `umount -f` or a dead fuse-t worker) fails
+				// reads outright. The relaunch guidance holds in both shapes —
+				// sessions on the old mirror are orphaned by the remount either
+				// way.
 				desc := "dead mirror (fails reads outright; unmounted out of band or its fuse worker died?)"
 				if wedged {
 					desc = "wedged mirror (serves metadata but hangs reads)"

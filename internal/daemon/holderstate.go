@@ -1,10 +1,13 @@
 package daemon
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/mountd"
+	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/version"
 )
 
@@ -13,6 +16,37 @@ import (
 // a pool with a genuinely down mount cannot turn every select into holder
 // RPCs.
 const holderRefreshFloor = 5 * time.Second
+
+// deepProbe is the daemon's seam over the bounded deep bulk-read wedge probe
+// (overlay.DeepProbeWithin, 5s); tests inject verdicts without a real fuse
+// mount. Concurrent probes of the same dir — the periodic supervisor probe and
+// any number of select-time probes — join one in-flight read inside overlay
+// (StatProbes), so the daemon needs no claim/inflight machinery of its own.
+var deepProbe = overlay.DeepProbeWithin
+
+// deepProbeInterval throttles the periodic in-use probe: a dir is re-probed at
+// most once per interval even though the supervisor ticks faster (so an in-use
+// mount is not probed several times per interval). A var so tests can shrink
+// it. The select-time probe is deliberately NOT throttled — it is a
+// correctness gate on an idle mirror whose verdict may be cold or stale.
+var deepProbeInterval = 30 * time.Second
+
+// deepWedgeStrikes is how many consecutive periodic deep-probe failures flip a
+// dir's verdict to wedged: two, so one transient slow read under load never
+// un-vouches a healthy mirror serving live sessions. The select-time probe
+// bypasses this debounce (markDeepWedged): an idle mirror about to serve a new
+// session has no live session to spuriously orphan, so a single observed wedge
+// is actionable.
+const deepWedgeStrikes = 2
+
+// deepVerdict is one dir's daemon-side deep-probe state. wedged flips at
+// deepWedgeStrikes consecutive failures (recordDeep) or immediately at select
+// time (markDeepWedged), and stays until a probe succeeds or the dir is
+// remounted (noteMounted clears it). Guarded by holderState.mu.
+type deepVerdict struct {
+	strikes int
+	wedged  bool
+}
 
 // holderState is the daemon's cache of mount-holder truth: reachability, the
 // holder's version, and per-dir liveness of every mount the holder owns. The
@@ -27,16 +61,24 @@ type holderState struct {
 	mu      sync.Mutex
 	healthy bool
 	version string
-	mounts  map[string]bool // dir -> Live, per the holder's last List
-	// wedged, epochs, and mountedAt mirror the holder's per-dir deep-probe
-	// verdict, mount epoch, and mount time from the last List, keyed like
-	// mounts (one entry per registered mount). A zero Epoch/MountedAt on the
-	// wire means the holder predates the fields and stores as 0/zero-time
-	// here. Like mounts they describe a reachable holder's registry, so they
-	// are replaced wholesale by refresh and cleared by markUnhealthy.
-	wedged      map[string]bool
-	epochs      map[string]uint64
-	mountedAt   map[string]time.Time
+	mounts  map[string]bool // dir -> Live (shallow), per the holder's last List
+	// epochs and mountedAt mirror the holder's per-dir mount epoch and mount
+	// time from the last List, keyed like mounts (one entry per registered
+	// mount). A zero Epoch/MountedAt on the wire means the holder predates the
+	// fields and stores as 0/zero-time here. Like mounts they describe a
+	// reachable holder's registry, so they are replaced wholesale by refresh
+	// and cleared by markUnhealthy.
+	epochs    map[string]uint64
+	mountedAt map[string]time.Time
+	// deep is the daemon's OWN per-dir deep-probe verdict — NOT sourced from
+	// the holder (which ships none). It is maintained by recordDeep/
+	// markDeepWedged (the periodic supervisor probe and the select-time probe)
+	// and persists across refresh (a poll does not re-probe); noteMounted/
+	// noteUnmounted clear a dir's entry and markUnhealthy drops them all (an
+	// unreachable holder's verdict is meaningless). lastProbed throttles the
+	// periodic probe (per dir, once per deepProbeInterval).
+	deep       map[string]*deepVerdict
+	lastProbed map[string]time.Time
 	refreshedAt time.Time
 	// bases mirrors the holder's dir -> base registry from the last
 	// successful List. Unlike mounts it SURVIVES markUnhealthy: it exists so
@@ -92,13 +134,11 @@ func (h *holderState) refresh(c *mountd.Client) {
 	}
 	m := make(map[string]bool, len(mounts))
 	b := make(map[string]string, len(mounts))
-	w := make(map[string]bool, len(mounts))
 	e := make(map[string]uint64, len(mounts))
 	at := make(map[string]time.Time, len(mounts))
 	for _, mi := range mounts {
 		m[mi.Dir] = mi.Live
 		b[mi.Dir] = mi.Base
-		w[mi.Dir] = mi.Wedged
 		e[mi.Dir] = mi.Epoch
 		if mi.MountedAt != 0 {
 			at[mi.Dir] = time.Unix(mi.MountedAt, 0)
@@ -113,7 +153,9 @@ func (h *holderState) refresh(c *mountd.Client) {
 		return
 	}
 	h.healthy, h.version, h.mounts, h.bases, h.refreshedAt = true, ver, m, b, time.Now()
-	h.wedged, h.epochs, h.mountedAt = w, e, at
+	h.epochs, h.mountedAt = e, at
+	// deep and lastProbed are the daemon's own probe state, NOT holder truth —
+	// a List does not re-probe, so they persist across refresh untouched.
 	if len(m) > 0 {
 		h.everMounted = true
 	}
@@ -193,36 +235,143 @@ func (h *holderState) markUnhealthy() {
 	h.mu.Lock()
 	h.gen++
 	h.healthy, h.version, h.mounts, h.refreshedAt = false, "", nil, time.Now()
-	h.wedged, h.epochs, h.mountedAt = nil, nil, nil
+	h.epochs, h.mountedAt = nil, nil
+	// An unreachable holder serves nothing, so its dirs' deep verdicts are
+	// meaningless — drop them (and the probe clock) so a respawned holder's
+	// fresh mounts start with a clean slate.
+	h.deep, h.lastProbed = nil, nil
 	h.mu.Unlock()
 }
 
-// ready reports whether the cache vouches for a live mirror at dir.
+// wedgedLocked reports dir's cached deep-probe verdict. Caller holds h.mu.
+func (h *holderState) wedgedLocked(dir string) bool {
+	v := h.deep[dir]
+	return v != nil && v.wedged
+}
+
+// ready reports whether the cache vouches for a live mirror at dir: a reachable
+// holder, Live (shallow) in its last List, AND the daemon's own deep probe has
+// not marked the mirror wedged. A deep-wedged mirror keeps shallow Live=true,
+// so folding the verdict in is what excludes it from selection (and, being
+// not-ready, sends it to the supervisor's heal).
 func (h *holderState) ready(dir string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.healthy && h.mounts[dir] && !h.wedgedLocked(dir)
+}
+
+// shallowLive reports whether a reachable holder vouches for dir's shallow
+// liveness (mountpoint present, base visible) — ready() WITHOUT the deep-probe
+// fold. The periodic probe gates on it: a mount the holder no longer serves is
+// not worth deep-probing, and a deep-wedged mount (shallow-live) must stay
+// probe-eligible so a recovery probe can clear the verdict.
+func (h *holderState) shallowLive(dir string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.healthy && h.mounts[dir]
 }
 
-// heldDead reports the held-dead signature for dir: a healthy holder's
-// last List NAMES the dir (the holder's registry owns a mount there) yet
-// reports it not Live — serving registry metadata while the mirror fails its
-// liveness probes. Present-but-dead is the precise discriminator: refresh
-// stores exactly one mounts entry per List row, and the holder registers a
-// mount only after a successful Setup (setupAndRegister never records a
-// failed one), so a TCC-blocked or never-mounted dir is ABSENT from the map
-// and reads false here — heldDead can never hot-loop a TCC-blocked row.
-// wedged is the holder's deep-probe verdict for a dead dir — it splits the
-// two dead shapes: a deep wedge serves metadata but hangs reads, while a
-// plain-dead registered mirror (an out-of-band `umount -f`, a dead fuse-t
-// worker, or an old holder that cannot deep-probe and never sets Wedged)
-// fails reads outright.
+// heldDead reports the held-dead signature for dir: a healthy holder NAMES the
+// dir in its last List (its registry owns a mount there) yet the dir is not
+// servable — either the holder reports it not Live (a plain-dead mirror: an
+// out-of-band `umount -f` or a dead fuse-t worker, fails reads outright) or the
+// daemon's own deep probe marked it wedged (shallow-alive, bulk reads hang).
+// Present is the precise discriminator: refresh stores exactly one mounts entry
+// per List row, and the holder registers a mount only after a successful Setup,
+// so a TCC-blocked or never-mounted dir is ABSENT and reads false here —
+// heldDead can never hot-loop a TCC-blocked row. wedged splits the two dead
+// shapes for the caller's log copy.
 func (h *holderState) heldDead(dir string) (dead, wedged bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	live, present := h.mounts[dir]
-	dead = h.healthy && present && !live
-	return dead, dead && h.wedged[dir]
+	w := h.wedgedLocked(dir)
+	dead = h.healthy && present && (!live || w)
+	return dead, dead && w
+}
+
+// deepWedged reports dir's cached deep-probe verdict (false when unknown).
+func (h *holderState) deepWedged(dir string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.wedgedLocked(dir)
+}
+
+// dueForDeepProbe reports whether dir has not been deep-probed within interval
+// (a never-probed dir is always due). The periodic supervisor probe gates on
+// it so an in-use mount is probed at most once per interval.
+func (h *holderState) dueForDeepProbe(dir string, now time.Time, interval time.Duration) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	last, ok := h.lastProbed[dir]
+	return !ok || now.Sub(last) >= interval
+}
+
+// recordDeep folds one deep-probe outcome into dir's debounced verdict and
+// stamps the probe time. A success resets the strike count and clears any
+// wedge (returning a recovery log line); overlay.ErrProbeMissing is no verdict
+// (a pre-probe holder's mirror across an upgrade — never a strike); any other
+// failure is a strike, and deepWedgeStrikes consecutive strikes flip the
+// verdict to wedged (returning the wedge log line). The returned string is ""
+// when nothing log-worthy happened.
+func (h *holderState) recordDeep(dir string, err error) (logMsg string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stampProbedLocked(dir)
+	if errors.Is(err, overlay.ErrProbeMissing) {
+		return "" // no verdict
+	}
+	v := h.deep[dir]
+	if v == nil {
+		v = &deepVerdict{}
+		if h.deep == nil {
+			h.deep = map[string]*deepVerdict{}
+		}
+		h.deep[dir] = v
+	}
+	switch {
+	case err == nil:
+		if v.wedged {
+			logMsg = fmt.Sprintf("deep probe %s: recovered; the mirror reads live again", dir)
+		}
+		v.strikes, v.wedged = 0, false
+	default:
+		v.strikes++
+		if v.strikes == deepWedgeStrikes {
+			v.wedged = true
+			logMsg = fmt.Sprintf("deep probe %s: %d consecutive failures; marking the mirror wedged (serves metadata but hangs bulk reads): %v", dir, v.strikes, err)
+		}
+	}
+	return logMsg
+}
+
+// markDeepWedged forces dir's verdict to wedged immediately, bypassing the
+// strike debounce, and stamps the probe time. The select-time probe uses it:
+// an idle mirror about to serve a NEW session has no live session a false
+// positive could orphan, so a single observed wedge is actionable — and the
+// forced verdict both refuses the select and sends the row to the supervisor's
+// heal, which clears it on a successful remount (noteMounted).
+func (h *holderState) markDeepWedged(dir string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stampProbedLocked(dir)
+	v := h.deep[dir]
+	if v == nil {
+		v = &deepVerdict{}
+		if h.deep == nil {
+			h.deep = map[string]*deepVerdict{}
+		}
+		h.deep[dir] = v
+	}
+	v.strikes, v.wedged = deepWedgeStrikes, true
+}
+
+// stampProbedLocked records that dir was just deep-probed. Caller holds h.mu.
+func (h *holderState) stampProbedLocked(dir string) {
+	if h.lastProbed == nil {
+		h.lastProbed = map[string]time.Time{}
+	}
+	h.lastProbed[dir] = time.Now()
 }
 
 // noteMounted records a mirror the daemon just established or adopted without
@@ -239,10 +388,12 @@ func (h *holderState) noteMounted(dir string) {
 		h.mounts = map[string]bool{}
 	}
 	h.mounts[dir] = true
-	// A fresh live mount supersedes the last List's wedge verdict for the dir
-	// (Wedged is always false when Live is true). Epoch and mount time are
-	// NOT fabricated — the next refresh installs the holder's polled truth.
-	delete(h.wedged, dir)
+	// A fresh mount supersedes any prior deep-probe verdict and probe clock for
+	// the dir: the corpse is gone, so clear the wedge and let the dir be
+	// re-probed promptly. Epoch and mount time are NOT fabricated — the next
+	// refresh installs the holder's polled truth.
+	delete(h.deep, dir)
+	delete(h.lastProbed, dir)
 	h.everMounted = true
 	h.tccErr = ""
 }
@@ -256,7 +407,8 @@ func (h *holderState) noteUnmounted(dir string) {
 	h.gen++
 	delete(h.mounts, dir)
 	delete(h.bases, dir)
-	delete(h.wedged, dir)
+	delete(h.deep, dir)
+	delete(h.lastProbed, dir)
 	delete(h.epochs, dir)
 	delete(h.mountedAt, dir)
 	h.mu.Unlock()
@@ -277,14 +429,16 @@ func (h *holderState) wireStatus() *HolderStatus {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	live := 0
-	for _, ok := range h.mounts {
-		if ok {
+	for dir, ok := range h.mounts {
+		// A deep-wedged mirror is shallow-Live but not servable — count it only
+		// under WedgedMounts, never as a healthy live mount (matches ready).
+		if ok && !h.wedgedLocked(dir) {
 			live++
 		}
 	}
 	wedged := 0
-	for _, w := range h.wedged {
-		if w {
+	for _, v := range h.deep {
+		if v.wedged {
 			wedged++
 		}
 	}

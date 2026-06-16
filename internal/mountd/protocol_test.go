@@ -120,12 +120,14 @@ func TestWireFreezeResponse(t *testing.T) {
 			want: `{"proto":1,"ok":true,"mounts":[{"dir":"/pool/acct-01","base":"/pool/base","live":false}]}`,
 		},
 		{
-			// Additive proto-1 extension: the deep-probe fields ride alongside
-			// the frozen trio and vanish when zero (the case above pins that an
-			// old-shape MountInfo still marshals to the exact old bytes).
-			name: "MountInfo deep-probe fields are additive",
-			in:   Response{Proto: 1, OK: true, Mounts: []MountInfo{{Dir: "/pool/acct-01", Base: "/pool/base", Live: false, Wedged: true, Epoch: 3, MountedAt: 1765500000}}},
-			want: `{"proto":1,"ok":true,"mounts":[{"dir":"/pool/acct-01","base":"/pool/base","live":false,"wedged":true,"epoch":3,"mounted_at":1765500000}]}`,
+			// Additive proto-1 extension: the epoch/mount-time fields ride
+			// alongside the frozen trio and vanish when zero (the case above
+			// pins that an old-shape MountInfo still marshals to the exact old
+			// bytes). The deep verdict is NOT on the wire — the daemon owns the
+			// probe, so the holder ships no wedge field.
+			name: "MountInfo epoch and mount-time fields are additive",
+			in:   Response{Proto: 1, OK: true, Mounts: []MountInfo{{Dir: "/pool/acct-01", Base: "/pool/base", Live: false, Epoch: 3, MountedAt: 1765500000}}},
+			want: `{"proto":1,"ok":true,"mounts":[{"dir":"/pool/acct-01","base":"/pool/base","live":false,"epoch":3,"mounted_at":1765500000}]}`,
 		},
 	}
 	for _, tc := range tests {

@@ -47,59 +47,17 @@ func TestRemoteProviderSpawnTimeoutDefault(t *testing.T) {
 	}
 }
 
+// TestRemoteProviderSetupAdoptsLiveMountWithZeroRPC: a shallow-live mirror is
+// adopted with zero RPC — the holder kept serving it across a daemon restart.
+// Detecting a partial wedge is the daemon's job (its own deep probe), not
+// Setup's, so Setup does no deep read here.
 func TestRemoteProviderSetupAdoptsLiveMountWithZeroRPC(t *testing.T) {
 	const base, dir = "/pool/base", "/pool/acct-01"
 	fakeMounted(t, func(string) bool { return true })
 	fakeMountAlive(t, func(string, string) bool { return true })
-	fakeDeepRead(t, func(string) error { return nil })
 
 	if err := deadEndProvider(t).Setup(base, dir); err != nil {
 		t.Fatalf("Setup of an already-live mirror = %v, want nil (adopt, zero RPC)", err)
-	}
-}
-
-// TestSetupAdoptionAcceptsMissingProbe: a shallow-live mirror whose deep probe
-// reports ErrProbeMissing was mounted by a holder that predates the probe file
-// — no verdict, so it adopts with zero RPC exactly as before the deep gate.
-func TestSetupAdoptionAcceptsMissingProbe(t *testing.T) {
-	const base, dir = "/pool/base", "/pool/acct-01"
-	fakeMounted(t, func(string) bool { return true })
-	fakeMountAlive(t, func(string, string) bool { return true })
-	probes := 0
-	fakeDeepRead(t, func(d string) error {
-		probes++
-		return fmt.Errorf("%w: %s", overlay.ErrProbeMissing, d)
-	})
-
-	if err := deadEndProvider(t).Setup(base, dir); err != nil {
-		t.Fatalf("Setup of an old-holder mirror without the probe file = %v, want nil (adopt, zero RPC)", err)
-	}
-	if probes != 1 {
-		t.Errorf("deep probes = %d, want exactly 1", probes)
-	}
-}
-
-// TestSetupAdoptionRejectsDeepWedge: a mirror that passes every shallow stat
-// but fails the deep probe must NOT be adopted — Setup falls through to the
-// Mount RPC so the deep-aware holder remounts it.
-func TestSetupAdoptionRejectsDeepWedge(t *testing.T) {
-	const base, dir = "/pool/base", "/pool/acct-01"
-	fakeMounted(t, func(string) bool { return true })
-	fakeMountAlive(t, func(string, string) bool { return true })
-	fakeDeepRead(t, func(string) error {
-		return fmt.Errorf("%w: read parked past the probe timeout", overlay.ErrProbeWedged)
-	})
-	// A canned holder that answers OK; what matters is that the Mount RPC is
-	// issued at all instead of the zero-RPC adopt.
-	socket, requests := startRawHolder(t, func(string) string { return `{"proto":1,"ok":true}` })
-
-	p := NewRemoteProvider(socket, filepath.Join(t.TempDir(), "holder.log"))
-	if err := p.Setup(base, dir); err != nil {
-		t.Fatalf("Setup of a deep-wedged mirror = %v, want nil (holder remounts it)", err)
-	}
-	got := requests()
-	if len(got) != 1 || !strings.Contains(got[0], `"op":"mount"`) {
-		t.Fatalf("holder saw %q, want exactly one mount RPC (a deep wedge must defeat the zero-RPC adopt)", got)
 	}
 }
 

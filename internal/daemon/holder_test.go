@@ -709,11 +709,11 @@ func TestSuperviseTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 }
 
 // TestSuperviseTickRemountsHeldDeadRow pins the held-dead heal: a dir the
-// holder NAMES in List (registered, shallow-mounted) but reports dead is
-// logged loudly — the holder's deep-probe verdict picks the copy (a wedge
-// hangs reads; a plain-dead mirror fails them outright), the live-session
-// count and relaunch guidance appear in both shapes — and remounted through
-// the ordinary healFuse path.
+// holder NAMES in List but that is not servable is logged loudly — the
+// daemon's deep-probe verdict picks the copy (a deep wedge is shallow-live but
+// hangs reads; a plain-dead mirror fails its shallow liveness outright), the
+// live-session count and relaunch guidance appear in both shapes — and
+// remounted through the ordinary healFuse path.
 func TestSuperviseTickRemountsHeldDeadRow(t *testing.T) {
 	const (
 		wedgeCopy = "wedged mirror (serves metadata but hangs reads)"
@@ -738,9 +738,15 @@ func TestSuperviseTickRemountsHeldDeadRow(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s, dirs, fake, _ := newSuperviseServer(t)
 			flipToFuse(t, s, 1)
+			// A deep wedge is shallow-Live=true (it answers shallow stats) but
+			// is marked wedged by the daemon's OWN deep probe; a plain-dead
+			// mirror fails its shallow liveness (Live=false).
 			s.holderSocket = startCannedHolder(t, []mountd.MountInfo{
-				{Dir: dirs[1], Base: "/base", Live: false, Wedged: tc.wedged},
+				{Dir: dirs[1], Base: "/base", Live: tc.wedged},
 			})
+			if tc.wedged {
+				s.holder.markDeepWedged(dirs[1])
+			}
 			var buf bytes.Buffer
 			s.log = log.New(&buf, "", 0)
 

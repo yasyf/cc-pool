@@ -46,23 +46,20 @@ type Request struct {
 	Dir   string `json:"dir,omitempty"`
 }
 
-// MountInfo is one mount in a list or shutdown response. Live is kernel
-// truth, not registry membership: dir is currently a mountpoint (the
+// MountInfo is one mount in a list or shutdown response. Live is shallow
+// kernel truth, not registry membership: dir is currently a mountpoint (the
 // device-id check, overlay.Mounted) AND base's contents are visible through
 // it (overlay.MountAlive). Either half alone can lie — a dead mirror exposes
-// the underlying dir, whose leftover entries can shadow base's. Live also
-// folds in the holder's cached deep-probe verdict (a deep-wedged mirror reads
-// Live=false), so old daemons need nothing to be protected from a partial
-// wedge — they already key selection off Live.
+// the underlying dir, whose leftover entries can shadow base's. Live does NOT
+// reflect a partial wedge (shallow-alive but bulk reads hang): the holder
+// ships no deep verdict — the daemon deep-probes through the kernel mount and
+// keeps its own per-dir verdict. A lingering pre-upgrade holder may still send
+// a "wedged" field; a current daemon ignores it (it uses its own probe), so
+// the field is gone from the wire entirely.
 type MountInfo struct {
 	Dir  string `json:"dir"`
 	Base string `json:"base"`
 	Live bool   `json:"live"`
-	// Wedged reports the partial-wedge signature: the mirror answers the
-	// shallow liveness stats (mountpoint present, base visible) but fails the
-	// deep bulk-read probe — serving metadata while hanging large reads.
-	// Always false when Live is true.
-	Wedged bool `json:"wedged,omitempty"`
 	// Epoch increments each time this holder (re)mounts Dir, starting at 1
 	// for the holder's first mount of it. Zero means the holder predates the
 	// field.

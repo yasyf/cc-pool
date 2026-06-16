@@ -19,14 +19,12 @@ import (
 	"github.com/yasyf/cc-pool/internal/version"
 )
 
-// mounted, mountAlive, and deepRead are seams over the overlay kernel
-// mountpoint checks (overlay.Mounted, overlay.MountAlive) and the bounded
-// deep bulk-read probe (overlay.DeepProbeWithin) so tests can fake mount
-// state without real fuse mounts.
+// mounted and mountAlive are seams over the overlay kernel mountpoint checks
+// (overlay.Mounted, overlay.MountAlive) so tests can fake mount state without
+// real fuse mounts.
 var (
 	mounted    = overlay.Mounted
 	mountAlive = overlay.MountAlive
-	deepRead   = overlay.DeepProbeWithin
 )
 
 // Server is the running mount holder. It owns a registry of the mounts IT
@@ -65,10 +63,6 @@ type Server struct {
 	// mirror's teardown and its remount — monotonic per dir for this holder
 	// process's lifetime, never reset or deleted.
 	epochs map[string]uint64
-	// deep holds the per-dir cached deep-probe verdict deepProbeLoop
-	// maintains; deepOK reads it without I/O. setupAndRegister deletes a
-	// dir's entry on (re)mount so a fresh mirror starts healthy.
-	deep map[string]*deepVerdict
 }
 
 // mountRow is one registry entry: the base a dir mirrors, which (re)mount of
@@ -78,26 +72,6 @@ type mountRow struct {
 	Epoch     uint64
 	MountedAt time.Time
 }
-
-// deepVerdict is one dir's deep-probe state. wedged flips at
-// deepWedgeStrikes consecutive failures and stays until a probe succeeds or
-// the dir is remounted. loggedMissing dedupes the once-per-dir surprise log
-// for ErrProbeMissing (this holder's own mirrors always serve the probe
-// file). Guarded by Server.mu.
-type deepVerdict struct {
-	strikes       int
-	wedged        bool
-	loggedMissing bool
-}
-
-// deepWedgeStrikes is how many consecutive deep-probe failures flip a dir's
-// verdict to wedged: two, so one transient slow read under load never
-// un-vouches a healthy mirror.
-const deepWedgeStrikes = 2
-
-// deepProbeInterval paces deepProbeLoop's passes. A var, not a const, so
-// tests can shrink it.
-var deepProbeInterval = 30 * time.Second
 
 // Run binds the holder socket and serves until ctx is cancelled, the process
 // is signalled (SIGTERM/SIGINT), or an OpShutdown lands. On the way out it
@@ -137,11 +111,6 @@ func (s *Server) Run(ctx context.Context) error {
 	// (OpShutdown). Set before the accept loop spawns any handler.
 	s.triggerShutdown = stop
 
-	// The deep-probe loop exits with ctx; it is deliberately NOT in s.wg — a
-	// pass in flight at shutdown is harmless (each read is bounded inside
-	// overlay, and the final sweep claims dirs the loop never holds).
-	go s.deepProbeLoop(ctx)
-
 	s.Log.Printf("mountd %s started; socket=%s", version.String(), s.Socket)
 
 	// Break the accept loop on shutdown.
@@ -174,14 +143,13 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
-// initState resets the registry, the in-flight gate, the epoch counters, and
-// the deep-probe verdicts. Run calls it before serving; handler-level tests
-// call it to dispatch without a socket.
+// initState resets the registry, the in-flight gate, and the epoch counters.
+// Run calls it before serving; handler-level tests call it to dispatch without
+// a socket.
 func (s *Server) initState() {
 	s.registry = map[string]mountRow{}
 	s.inflight = map[string]bool{}
 	s.epochs = map[string]uint64{}
-	s.deep = map[string]*deepVerdict{}
 }
 
 // listen binds the unix socket with 0600 perms. Unlike the daemon, the holder
@@ -401,11 +369,13 @@ func (s *Server) handleMount(req Request) Response {
 		}
 		// Bounded: a wedged mirror's stats never return, and a wedged probe
 		// reads dead — routing into the forced teardown below, the designed
-		// recovery — instead of hanging the handler. deepOK is the cached
-		// deep-probe verdict (no I/O): a deep-wedged mirror passes the shallow
-		// stats yet must NOT read idempotently OK — it falls through to the
-		// same forced teardown + fresh Setup.
-		if s.liveWithin(req.Base, req.Dir) && s.deepOK(req.Dir) {
+		// recovery — instead of hanging the handler. A shallow-live mirror is
+		// idempotently OK here; detecting and healing a partial wedge
+		// (shallow-alive, bulk reads hang) is the daemon's job now — it
+		// deep-probes the mirror and tears a wedged one down (mountFuse) before
+		// it issues this Mount, so a remount RPC only ever lands after the
+		// corpse is gone and this path remounts a clean dir.
+		if s.liveWithin(req.Base, req.Dir) {
 			return Response{OK: true} // idempotent: this exact mount is held and live
 		}
 		// Mount is ensure-mounted: the registered mirror died while the holder
@@ -446,9 +416,8 @@ func (s *Server) handleMount(req Request) Response {
 }
 
 // setupAndRegister mounts base at dir via the provider and records the mount:
-// a fresh registry row with a bumped epoch and the mount time, and the dir's
-// deep-probe verdict reset so the new mirror starts healthy. The caller holds
-// dir's in-flight claim.
+// a fresh registry row with a bumped epoch and the mount time. The caller
+// holds dir's in-flight claim.
 func (s *Server) setupAndRegister(base, dir string) Response {
 	if err := s.Host.Setup(base, dir); err != nil {
 		// Ordered: ErrMountTimeout (proven grant, transient) must classify
@@ -467,7 +436,6 @@ func (s *Server) setupAndRegister(base, dir string) Response {
 	s.mu.Lock()
 	s.epochs[dir]++
 	s.registry[dir] = mountRow{Base: base, Epoch: s.epochs[dir], MountedAt: time.Now()}
-	delete(s.deep, dir)
 	s.mu.Unlock()
 	s.Log.Printf("mounted %s <- %s", dir, base)
 	return Response{OK: true}
@@ -545,120 +513,16 @@ func (s *Server) handleList() Response {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Live folds the cached deep-probe verdict into the shallow kernel
-			// truth (no extra I/O — deepOK is a lock-guarded map read), so old
-			// daemons that only know Live are protected from a partial wedge.
-			// Wedged names the signature explicitly for deep-aware drivers:
-			// shallow-alive but deep-dead.
-			shallow := s.liveWithin(row.Base, dir)
-			deep := s.deepOK(dir)
-			mounts[i].Live = shallow && deep
-			mounts[i].Wedged = shallow && !deep
+			// Live is shallow kernel truth only — mountpoint present and base
+			// visible. Detecting a partial wedge (shallow-alive, bulk reads
+			// hang) is the daemon's job: it deep-probes through the same kernel
+			// mount and keeps its own per-dir verdict, so the holder ships no
+			// deep verdict at all.
+			mounts[i].Live = s.liveWithin(row.Base, dir)
 		}()
 	}
 	wg.Wait()
 	return Response{OK: true, Mounts: mounts}
-}
-
-// deepProbeLoop periodically deep-probes every registered mirror, maintaining
-// the cached per-dir verdicts deepOK serves. It exits when ctx is done — the
-// holder's shutdown path.
-func (s *Server) deepProbeLoop(ctx context.Context) {
-	ticker := time.NewTicker(deepProbeInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.deepProbePass()
-		}
-	}
-}
-
-// deepProbePass runs one deep-probe sweep: snapshot the registry, then probe
-// each dir OUTSIDE the lock (each read is bounded inside overlay). A dir
-// whose in-flight claim is currently held is skipped for this pass — never
-// blocked on — so a probe never delays a mount/unmount; the skipped dir's
-// verdict is left exactly as it was. The skip is check-then-probe, not a
-// claim: an op that takes the claim after the check can tear down and remount
-// the dir while the probe is still reading, and the stale verdict then lands
-// on the fresh mirror (or recreates a deep entry for a dir deregistered
-// mid-probe; remounts clear it like any other). The strike design absorbs
-// that TOCTOU — a false wedge needs deepWedgeStrikes consecutive racing
-// passes and the next successful probe resets the verdict — whereas holding
-// the claim across the probe would block mounts behind a multi-second read.
-func (s *Server) deepProbePass() {
-	snap := s.snapshotRegistry()
-	dirs := make([]string, 0, len(snap))
-	for dir := range snap {
-		dirs = append(dirs, dir)
-	}
-	sort.Strings(dirs)
-	for _, dir := range dirs {
-		if s.claimHeld(dir) {
-			continue
-		}
-		s.recordDeepVerdict(dir, deepRead(dir))
-	}
-}
-
-// claimHeld reports whether dir's in-flight claim is currently held, without
-// taking it.
-func (s *Server) claimHeld(dir string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inflight[dir]
-}
-
-// recordDeepVerdict folds one deep-probe outcome into dir's cached verdict:
-// success resets it to healthy; any failure EXCEPT overlay.ErrProbeMissing is
-// a strike, and deepWedgeStrikes consecutive strikes flip the verdict to
-// wedged until a probe succeeds or the dir is remounted. ErrProbeMissing is
-// no-verdict, never a strike — and holder-side it is surprising (this
-// holder's own mirrors always serve the probe file), so it is logged once per
-// dir.
-func (s *Server) recordDeepVerdict(dir string, err error) {
-	var msg string
-	s.mu.Lock()
-	v := s.deep[dir]
-	if v == nil {
-		v = &deepVerdict{}
-		s.deep[dir] = v
-	}
-	switch {
-	case err == nil:
-		if v.wedged {
-			msg = fmt.Sprintf("deep probe %s: recovered; marking the mirror live again", dir)
-		}
-		v.strikes = 0
-		v.wedged = false
-	case errors.Is(err, overlay.ErrProbeMissing):
-		if !v.loggedMissing {
-			v.loggedMissing = true
-			msg = fmt.Sprintf("deep probe %s: probe file missing from this holder's own mirror (unexpected; treating as no verdict): %v", dir, err)
-		}
-	default:
-		v.strikes++
-		if v.strikes == deepWedgeStrikes {
-			v.wedged = true
-			msg = fmt.Sprintf("deep probe %s: %d consecutive failures; marking the mirror wedged (serves metadata but hangs bulk reads): %v", dir, v.strikes, err)
-		}
-	}
-	s.mu.Unlock()
-	if msg != "" {
-		s.Log.Printf("%s", msg)
-	}
-}
-
-// deepOK returns dir's cached deep-probe verdict: false only while the dir is
-// marked wedged. It NEVER does I/O — the mount and list paths that fold it in
-// must stay fast.
-func (s *Server) deepOK(dir string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v, ok := s.deep[dir]
-	return !ok || !v.wedged
 }
 
 // handleShutdown sweeps every owned mount, replies with the dirs that failed

@@ -225,12 +225,14 @@ func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 	}
 }
 
-// TestReportWedges pins the partial-wedge check: a holder-flagged Wedged row
-// is reported; a Live row is deep-probed locally and reported only when the
-// probe fails with a real verdict (ErrProbeMissing is no verdict); nil mounts
-// (unreachable holder) and symlink rows report nothing and never probe. The
-// wedge copy must carry the metadata-vs-reads signature and the relaunch
-// guidance.
+// TestReportWedges pins the partial-wedge check: doctor deep-probes every
+// shallow-Live fuse row locally (the holder ships no verdict — the daemon owns
+// the probe, and doctor's independent probe surfaces a wedge even with the
+// daemon down) and reports it only when the probe fails with a real verdict
+// (ErrProbeMissing is no verdict); a not-Live row is left to reportCarcasses;
+// nil mounts (unreachable holder) and symlink rows report nothing and never
+// probe. The wedge copy must carry the metadata-vs-reads signature and the
+// relaunch guidance.
 func TestReportWedges(t *testing.T) {
 	accts := []store.Account{
 		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(overlay.KindFuse)},
@@ -243,10 +245,6 @@ func TestReportWedges(t *testing.T) {
 		want       []reportCall
 		wantProbed []string // dirs deepProbeAt must be called with, in order
 	}{
-		"wedged row reported without probing": {
-			mounts: []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b", Wedged: true}},
-			want:   []reportCall{{"acct-01 mirror", false, wedgeDetail}},
-		},
 		"live row with failing deep probe reported": {
 			mounts:     []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b", Live: true}},
 			probeErr:   fmt.Errorf("%w: hung", overlay.ErrProbeWedged),
@@ -265,11 +263,11 @@ func TestReportWedges(t *testing.T) {
 		"holder unreachable (nil mounts) is silent and never probes": {
 			mounts: nil,
 		},
-		"dead unwedged row is silent (reportCarcasses' beat)": {
+		"not-Live row is silent (reportCarcasses' beat)": {
 			mounts: []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b"}},
 		},
 		"symlink row is never probed or reported": {
-			mounts: []mountd.MountInfo{{Dir: "/p/acct-02", Base: "/b", Live: true, Wedged: true}},
+			mounts: []mountd.MountInfo{{Dir: "/p/acct-02", Base: "/b", Live: true}},
 		},
 	}
 	for name, tc := range cases {

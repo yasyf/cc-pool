@@ -518,6 +518,9 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 					}
 					return Response{OK: false, Error: fmt.Sprintf("acct-%02d's dir is unexpectedly a mountpoint (wedged unmount?); see `ccp doctor` and the daemon log", sn.Account.ID)}
 				}
+				if !s.probeWinnerReady(sn.Account) {
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d's fuse mirror is wedged; the daemon is remounting it — retry shortly", sn.Account.ID)}
+				}
 				if !s.tryReserve(sn.Account.ID) {
 					return Response{OK: false, Error: fmt.Sprintf("acct-%02d is migrating overlays; retry shortly", sn.Account.ID)}
 				}
@@ -591,6 +594,13 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		}
 	}
 	best := bySnap[r.AccountID]
+	// Deep-probe the winner before handing it to a session — the only probe of
+	// an idle mirror (the periodic supervisor probe skips session-less mounts).
+	// A wedge marks it (excluding it from the retry's ranking) and refuses; the
+	// client retries onto a healthy account, whose own probe runs then.
+	if !s.probeWinnerReady(best.Account) {
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d's fuse mirror is wedged; the daemon is remounting it — retry shortly", best.Account.ID)}
+	}
 	if !req.NoMark {
 		if !s.tryReserve(best.Account.ID) {
 			// A conversion claimed the winner between the filter above and
@@ -887,6 +897,38 @@ func (s *Server) mountReady(a store.Account) bool {
 	return !overlayMounted(a.ConfigDir)
 }
 
+// probeWinnerReady deep-probes a chosen fuse account's mirror at select time —
+// right before it is handed to a session — and reports whether it is safe to
+// assign. This is the ONLY probe of an IDLE mirror: the periodic supervisor
+// probe skips mounts with no live session, so an idle mirror's partial wedge
+// (shallow-alive, bulk reads hang) would otherwise go undetected until a
+// session landed on it and hung. A live wedge is force-marked wedged — so
+// selection excludes it AND the supervisor remounts it within a tick — and
+// reads not-ready; the caller refuses the select and the client retries (onto
+// a healthy account, whose own probe runs on that retry, or the same one once
+// the supervisor has remounted it). It is bounded by the 5s deep-probe timeout
+// — under the select handler's 10s connection deadline — so it never remounts
+// inline (a teardown+remount can take far longer); the supervisor owns the
+// heal. Non-fuse accounts and healthy or pre-probe (ErrProbeMissing) mirrors
+// read ready. A single observed wedge is enough (no debounce): an idle mirror
+// about to serve a NEW session has no live session a false positive could
+// orphan.
+func (s *Server) probeWinnerReady(a store.Account) bool {
+	if a.OverlayKind != string(overlay.KindFuse) {
+		return true
+	}
+	err := deepProbe(a.ConfigDir)
+	if err != nil && !errors.Is(err, overlay.ErrProbeMissing) {
+		s.holder.markDeepWedged(a.ConfigDir)
+		s.log.Printf("acct-%02d mirror wedged at select (serves metadata but hangs reads); excluding it and letting the supervisor remount it — relaunch once it recovers: %v", a.ID, err)
+		return false
+	}
+	if msg := s.holder.recordDeep(a.ConfigDir, err); msg != "" {
+		s.log.Printf("%s", msg)
+	}
+	return true
+}
+
 // holderClient returns a client for the mount-holder socket.
 func (s *Server) holderClient() *mountd.Client {
 	return mountd.NewClient(s.holderSocket)
@@ -1164,7 +1206,13 @@ func (s *Server) mountFuse(a store.Account) error {
 		return fmt.Errorf("provider resolved for fuse reports kind %q; refusing to mount through it", prov.Kind())
 	}
 	base, dir := pool.ClaudeDir(), a.ConfigDir
-	if overlayMounted(dir) && prov.Health(base, dir) != nil {
+	// A dead mount comes down first — never mount through one. Health is
+	// shallow (no deep read on the poll hot path), so a partial wedge
+	// (shallow-alive, bulk reads hang) passes it; the daemon's own deep-probe
+	// verdict catches that case. Without this, the remount RPC would hit the
+	// holder's now-idempotent handleMount, which treats a shallow-live mirror
+	// as already mounted and never replaces the wedged one.
+	if overlayMounted(dir) && (prov.Health(base, dir) != nil || s.holder.deepWedged(dir)) {
 		if err := prov.Teardown(base, dir); err != nil {
 			return fmt.Errorf("clear dead mount before remounting: %w", err)
 		}
