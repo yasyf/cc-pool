@@ -28,8 +28,9 @@ const OAuthAccountKey = "oauthAccount"
 //   - anonymousId:    per-account anonymous analytics identity.
 //   - projects:       per-account project state (history, allowed tools);
 //     sharing it would commingle session state across accounts — except the
-//     per-project approval keys in ClaudeJSONSharedProjectKeys, which
-//     overlaySharedProjectKeys carves out and shares in both directions.
+//     per-project trust/approval keys and local-scope MCP server definitions in
+//     ClaudeJSONSharedProjectKeys, which overlaySharedProjectKeys carves out and
+//     shares in both directions.
 //   - firstStartTime: per-account startup record.
 //   - numStartups:    per-account startup counter, bumped every launch.
 var ClaudeJSONPrivateKeys = map[string]bool{
@@ -45,14 +46,23 @@ var ClaudeJSONPrivateKeys = map[string]bool{
 // object that DO propagate between the base ~/.claude.json and an account's
 // private copy, in both directions — the per-project exception to the
 // "projects" entry in ClaudeJSONPrivateKeys. They record trust/approval
-// decisions and MCP server enablement, which are properties of the project,
-// not of the account answering the prompt; without sharing them every pool
-// account re-asks every dialog. Everything else inside a project entry
-// (history, allowed tools, session state) stays private.
+// decisions, MCP server enablement, and the project's local-scope MCP server
+// definitions, which are properties of the project (and the single user's
+// machine), not of the account answering the prompt; without sharing them
+// every pool account re-asks every dialog and a `claude mcp add --scope local`
+// server is invisible to pooled sessions. Everything else inside a project
+// entry (history, allowed tools, session state) stays private.
+//
+//   - mcpServers: local-scope per-project server definitions written by
+//     `claude mcp add --scope local`. Unlike enabledMcpjsonServers (which only
+//     records approval of .mcp.json servers, themselves shared via the project
+//     tree), this carries the full server config, so sharing it is what gives a
+//     pooled session the same project MCP servers as plain claude.
 var ClaudeJSONSharedProjectKeys = map[string]bool{
 	"hasTrustDialogAccepted":                  true,
 	"hasClaudeMdExternalIncludesApproved":     true,
 	"hasClaudeMdExternalIncludesWarningShown": true,
+	"mcpServers":                              true,
 	"enabledMcpjsonServers":                   true,
 	"disabledMcpjsonServers":                  true,
 }

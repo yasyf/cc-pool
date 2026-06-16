@@ -290,6 +290,27 @@ func TestMergeClaudeJSONSharedProjectKeys(t *testing.T) {
 			wantChanged: true,
 			wantProj:    map[string]map[string]string{"/p": {"enabledMcpjsonServers": `[]`}},
 		},
+		"local-scope mcpServers crosses into an existing entry, private session state survives": {
+			private:     `{"projects": {"/p":{"history":["mine"],"allowedTools":["Bash"]}}}`,
+			base:        `{"projects": {"/p":{"history":["theirs"],"mcpServers":{"XcodeBuildMCP":{"type":"stdio","command":"npx","args":["-y","xcodebuildmcp@latest","mcp"]}}}}}`,
+			wantChanged: true,
+			wantProj: map[string]map[string]string{
+				"/p": {
+					"mcpServers":   `{"XcodeBuildMCP":{"type":"stdio","command":"npx","args":["-y","xcodebuildmcp@latest","mcp"]}}`,
+					"history":      `["mine"]`,
+					"allowedTools": `["Bash"]`,
+				},
+			},
+		},
+		"local-scope mcpServers minted for a never-opened project, no session state leaks": {
+			private:     `{"theme":"dark"}`,
+			base:        `{"projects": {"/new":{"history":["h"],"mcpServers":{"srv":{"type":"http","url":"https://example/mcp"}}}}}`,
+			wantChanged: true,
+			wantProj: map[string]map[string]string{
+				"/new": {"mcpServers": `{"srv":{"type":"http","url":"https://example/mcp"}}`},
+			},
+			absentInProj: map[string][]string{"/new": {"history"}},
+		},
 		"numeric base projects errors":    {private: projPrivate, base: `{"projects": 5}`, wantErr: "merge shared project keys"},
 		"null base projects errors":       {private: projPrivate, base: `{"projects": null}`, wantErr: "merge shared project keys"},
 		"numeric private projects errors": {private: `{"projects": 5}`, base: projBase, wantErr: "merge shared project keys"},
@@ -517,6 +538,12 @@ func TestSplitClaudeJSONSharedProjectKeys(t *testing.T) {
 			payload:  `{"projects": {"/b":{"enabledMcpjsonServers":["s"]}}}`,
 			base:     `{"projects": {"/b":{"hasTrustDialogAccepted":true}}}`,
 			wantProj: map[string]map[string]string{"/b": {"hasTrustDialogAccepted": `true`, "enabledMcpjsonServers": `["s"]`}},
+		},
+		"local-scope mcpServers writes through to base, base session history retained": {
+			payload:      `{"projects": {"/b":{"history":["mine"],"allowedTools":["Bash"],"mcpServers":{"XcodeBuildMCP":{"type":"stdio","command":"npx"}}}}}`,
+			base:         `{"projects": {"/b":{"history":["theirs"]}}}`,
+			wantProj:     map[string]map[string]string{"/b": {"mcpServers": `{"XcodeBuildMCP":{"type":"stdio","command":"npx"}}`, "history": `["theirs"]`}},
+			absentInProj: map[string][]string{"/b": {"allowedTools"}},
 		},
 		"numeric payload projects errors": {payload: `{"projects": 5}`, base: `{"theme":"light"}`, wantErr: "split shared project keys"},
 		"null payload projects errors":    {payload: `{"projects": null}`, base: `{"theme":"light"}`, wantErr: "split shared project keys"},

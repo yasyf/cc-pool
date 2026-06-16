@@ -379,6 +379,30 @@ func TestMirrorClaudeJSONRenameWriteThroughSharedProjectKeys(t *testing.T) {
 	}
 }
 
+// TestMirrorClaudeJSONWriteThroughLocalMcpServers: a commit that adds a
+// project's local-scope mcpServers (what `claude mcp add --scope local` writes)
+// pushes the full server definitions through to base while the account's
+// session history stays private — the write-through half of plain-claude parity
+// for per-project local servers.
+func TestMirrorClaudeJSONWriteThroughLocalMcpServers(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	committed := `{"theme":"dark","oauthAccount":{"accountUuid":"acct-own"},"projects":{"/base":{"history":["acct-h1"],"mcpServers":{"XcodeBuildMCP":{"type":"stdio","command":"npx","args":["-y","xcodebuildmcp@latest","mcp"]}}}}}`
+	commitClaudeJSON(t, fs, home, committed)
+
+	base := raw(t, mustReadFile(t, filepath.Join(home, ".claude.json")))
+	proj := raw(t, base["projects"])
+	entry := raw(t, proj["/base"])
+	if got, want := string(entry["mcpServers"]), `{"XcodeBuildMCP":{"type":"stdio","command":"npx","args":["-y","xcodebuildmcp@latest","mcp"]}}`; got != want {
+		t.Errorf("base /base mcpServers = %s, want the committed local server written through %s", got, want)
+	}
+	if string(entry["history"]) != `["theirs"]` {
+		t.Errorf("base /base history = %s, want its own [\"theirs\"] — account history must never cross", entry["history"])
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil", err)
+	}
+}
+
 // TestMirrorClaudeJSONWriteThroughSkipsMissingBase: with no base ~/.claude.json
 // a commit must not mint one — cc-pool must not pre-empt vanilla claude's own
 // onboarding.

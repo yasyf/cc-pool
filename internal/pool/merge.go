@@ -23,8 +23,9 @@ const (
 	// MergeRecreated: the account file was missing and was recreated as
 	// base-minus-blacklist — no onboarding wizard, no inherited identity. The
 	// recreated file does mint a skeleton projects entry per base project
-	// carrying only overlay.ClaudeJSONSharedProjectKeys (desired: trust and
-	// MCP approvals carry over, history and session state never do).
+	// carrying only overlay.ClaudeJSONSharedProjectKeys (desired: trust, MCP
+	// approvals, and local-scope MCP server definitions carry over, history and
+	// session state never do).
 	MergeRecreated MergeOutcome = "recreated"
 	// MergeSkippedOverlay: the account's recorded overlay kind is not symlink;
 	// the fuse arm owns its own merged view, so the launch merge stays out.
