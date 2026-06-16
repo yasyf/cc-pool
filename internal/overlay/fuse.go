@@ -153,11 +153,20 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 	// littering ._<name> sidecar files into the backing dir. namedattr routes
 	// xattrs to the mirror's xattr ops instead (fuse-t supports NFSv4 named
 	// attributes but ships with them disabled by default since v1.0.46).
+	// rwsize=1048576: fuse-t's NFS read/write RPC size (default 32768). A wedged
+	// mirror's signature is a large sequential read hanging while small ops stay
+	// instant — multi-READ-RPC readahead (see probe.go). Raising rwsize to 1 MiB
+	// cuts the RPCs a bulk transfer fans out (a 1.5 MiB read drops from ~47 RPCs
+	// to 2), shrinking that readahead surface. 1 MiB mounts and moves 32 MiB
+	// cleanly here; the intermittent wedge could not be reproduced on demand to
+	// A/B it, so this is a mechanism-driven mitigation, not a measured one —
+	// deep-probe detection (probe.go) stays the safety net.
 	opts := []string{
 		"-o", "volname=cc-pool-" + filepath.Base(accountDir),
 		"-o", "noattrcache",
 		"-o", "nobrowse",
 		"-o", "namedattr",
+		"-o", "rwsize=1048576",
 	}
 	go func() {
 		defer close(done)

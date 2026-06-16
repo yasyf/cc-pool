@@ -32,10 +32,11 @@ instead of auto-selecting.
 
 This is the imperative equivalent of:
 
-    CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CONFIG_DIR=$(ccp select) claude ...
+    CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CODE_DEBUG_LOGS_DIR="$HOME/.claude/debug" CLAUDE_CONFIG_DIR=$(ccp select) claude ...
 
 (The plugin var keeps the session writing canonical ~/.claude plugin paths into
-the shared plugin state; ` + "`ccp run`" + ` sets it for you.)`,
+the shared plugin state; the debug var keeps DEBUG=1's verbose per-session log
+off the fuse-t mirror, where the bulk write would wedge it. ` + "`ccp run`" + ` sets both for you.)`,
 		// Pass every argument straight through to claude; ccp owns no flags here.
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -106,21 +107,37 @@ func execClaude(configDir string, args []string) error {
 // the same canonical spellings as plain claude. A value already present in
 // environ is respected: a user-set global plugin root applies to plain claude
 // too, and overriding it here would split the roots this pin exists to unify.
+//
+// It likewise pins CLAUDE_CODE_DEBUG_LOGS_DIR to the shared base's debug dir.
+// claude otherwise derives that dir from CLAUDE_CONFIG_DIR and, under DEBUG=1,
+// streams a verbose per-session log into it — a high-volume sequential write
+// that, through the pooled CLAUDE_CONFIG_DIR's fuse-t mirror, hits the bulk-I/O
+// path that wedges the mount and hangs the session forever (see
+// internal/overlay/probe.go). Pinning the canonical ~/.claude/debug keeps that
+// write off the mirror entirely — exactly where plain claude already logs; the
+// per-session UUID filenames mean pooled sessions never collide. A pre-set
+// value is respected, like the plugin root.
 func execEnv(environ []string, configDir string) []string {
 	const cfgKey = "CLAUDE_CONFIG_DIR="
 	const pluginKey = "CLAUDE_CODE_PLUGIN_CACHE_DIR="
-	out := make([]string, 0, len(environ)+2)
+	const debugKey = "CLAUDE_CODE_DEBUG_LOGS_DIR="
+	out := make([]string, 0, len(environ)+3)
 	havePlugin := false
+	haveDebug := false
 	for _, e := range environ {
 		if strings.HasPrefix(e, cfgKey) {
 			continue
 		}
 		havePlugin = havePlugin || strings.HasPrefix(e, pluginKey)
+		haveDebug = haveDebug || strings.HasPrefix(e, debugKey)
 		out = append(out, e)
 	}
 	out = append(out, cfgKey+configDir)
 	if !havePlugin {
 		out = append(out, pluginKey+filepath.Join(pool.ClaudeDir(), "plugins"))
+	}
+	if !haveDebug {
+		out = append(out, debugKey+filepath.Join(pool.ClaudeDir(), "debug"))
 	}
 	return out
 }

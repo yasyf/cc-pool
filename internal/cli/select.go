@@ -26,10 +26,11 @@ func newSelectCmd() *cobra.Command {
 		Long: `select scores every account and prints only the chosen account's config dir
 to stdout, so it composes as:
 
-    CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CONFIG_DIR=$(ccp select) claude
+    CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CODE_DEBUG_LOGS_DIR="$HOME/.claude/debug" CLAUDE_CONFIG_DIR=$(ccp select) claude
 
-(Prefer ` + "`ccp run`" + `, which sets both vars itself. The plugin var keeps the
-session writing canonical ~/.claude plugin paths into the shared plugin state.)
+(Prefer ` + "`ccp run`" + `, which sets these vars itself. The plugin var keeps the
+session writing canonical ~/.claude plugin paths into the shared plugin state;
+the debug var keeps DEBUG=1's verbose per-session log off the fuse-t mirror.)
 
 Diagnostics go to stderr. With the daemon running, select reads its cached
 scores; otherwise it samples usage live.`,
