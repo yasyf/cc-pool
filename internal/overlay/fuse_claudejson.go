@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
 )
@@ -25,13 +26,17 @@ const syntheticFhBase = uint64(1) << 62
 
 // writeThroughMu serializes every base ~/.claude.json read→split→write cycle
 // across ALL mounts: each account's mirror writes through to the same base
-// file. It is deliberately held across the cycle's I/O (a documented exception
-// to the lock-scope rule): the read-modify-write must be atomic against other
-// in-process write-throughs, and all mounts live in the single daemon process,
-// so this lock is the complete story. Against a concurrently-running vanilla
-// claude we accept last-writer-wins within the window — blacklisted keys are
-// structurally protected because base is re-read each cycle and blacklisted
-// keys are never copied.
+// file, and the read-modify-write must be atomic against other in-process
+// write-throughs. It is held across the cycle's I/O (a documented exception to
+// the lock-scope rule), but ONLY inside the background write-through worker
+// (writeThroughLoop) — never on a fuse handler goroutine. A fuse Release/Rename
+// schedules the cycle and returns at once, so a contended lock or a slow base
+// rewrite can never park a fuse-t worker thread and stall the mount's NFS
+// server (the "not responding" wedge). All mounts live in the single holder
+// process, so this lock is the complete story. Against a concurrently-running
+// vanilla claude we accept last-writer-wins within the window — blacklisted
+// keys are structurally protected because base is re-read each cycle and
+// blacklisted keys are never copied.
 var writeThroughMu sync.Mutex
 
 // claudeJSONView serves /.claude.json as a live merged document: read opens
@@ -54,6 +59,19 @@ type claudeJSONView struct {
 	cacheOK   bool
 	readErr   error // last merged-read failure; cleared by the next successful merge
 	writeErr  error // last write-through failure; cleared only by a successful write-through
+
+	// Write-through worker coordination (guarded by mu). The base
+	// read→split→write runs OFF the fuse handler path: Release/Rename call
+	// scheduleWriteThrough and return immediately, so a contended writeThroughMu
+	// or a slow base rewrite can never park a fuse-t worker thread and stall the
+	// mount's NFS server (the "not responding" wedge). wtRunning marks a cycle
+	// goroutine in flight; wtPending coalesces a commit arriving mid-cycle into
+	// exactly one more cycle (which re-reads the private file, so the latest
+	// committed state always wins); wtIdle, when non-nil, is closed when the
+	// worker goes idle, so flushWithin can wait the last cycle out.
+	wtRunning bool
+	wtPending bool
+	wtIdle    chan struct{}
 }
 
 // mergeKey identifies one (private, base) input pair for the merge cache.
@@ -260,21 +278,86 @@ func (v *claudeJSONView) overrideMergedAttr(stat *fuse.Stat_t) int {
 	return 0
 }
 
-// writeThrough propagates the committed private /.claude.json's shareable keys
-// into the shared base ~/.claude.json. It runs after claude's commit durably
-// landed (rename or dirty write-handle release), so it must never fail the
-// fuse op: failures land in writeErr and surface through FuseProvider.Health
-// (the daemon logs them every poll; ccp doctor shows them), cleared only by
-// the next successful write-through. A missing base file skips the
-// write-through entirely — deliberate policy: cc-pool must not pre-empt
-// vanilla claude's own onboarding by minting ~/.claude.json.
-func (v *claudeJSONView) writeThrough() {
-	writeThroughMu.Lock()
-	defer writeThroughMu.Unlock()
-	err := v.writeThroughBase()
+// scheduleWriteThrough requests a base write-through and returns IMMEDIATELY —
+// it never runs the read→split→write itself. That I/O is the work that used to
+// run inline in the fuse Release/Rename handler under the process-global
+// writeThroughMu; holding a fuse-t worker there serialized every account's
+// commit handler and starved the mount's NFS server ("nfs server … not
+// responding"). Here a handler only flips a flag and (at most) spawns the
+// worker, so it returns at fuse-op speed. A commit arriving while a cycle runs
+// is coalesced into one more cycle; each cycle re-reads the private file, so
+// the latest committed shareable keys always win.
+func (v *claudeJSONView) scheduleWriteThrough() {
 	v.mu.Lock()
-	v.writeErr = err
+	if v.wtRunning {
+		v.wtPending = true
+		v.mu.Unlock()
+		return
+	}
+	v.wtRunning = true
 	v.mu.Unlock()
+	go v.writeThroughLoop()
+}
+
+// writeThroughLoop drains write-through requests until none remain, then exits
+// (no idle goroutine lingers per mount). Each cycle takes writeThroughMu for
+// cross-account base atomicity OFF the fuse handler path. The cycle must never
+// fail a fuse op: failures land in writeErr and surface through
+// FuseProvider.Health (the daemon logs them every poll; ccp doctor shows them),
+// cleared only by the next successful write-through. A missing base file skips
+// the write-through entirely — deliberate policy: cc-pool must not pre-empt
+// vanilla claude's own onboarding by minting ~/.claude.json.
+func (v *claudeJSONView) writeThroughLoop() {
+	for {
+		writeThroughMu.Lock()
+		err := v.writeThroughBase()
+		writeThroughMu.Unlock()
+
+		v.mu.Lock()
+		v.writeErr = err
+		if v.wtPending {
+			v.wtPending = false
+			v.mu.Unlock()
+			continue
+		}
+		v.wtRunning = false
+		if v.wtIdle != nil {
+			close(v.wtIdle)
+			v.wtIdle = nil
+		}
+		v.mu.Unlock()
+		return
+	}
+}
+
+// flushWithin waits up to d for any in-flight write-through to drain, so a
+// teardown (or a test) sees the last committed shareable keys reach base before
+// the mirror goes away. Returns true once the worker is idle. The base and
+// private files are real local files (never a fuse mount), so a cycle cannot
+// hang on a wedged mirror; the bound only guards a genuinely stuck local write.
+// d <= 0 waits indefinitely.
+func (v *claudeJSONView) flushWithin(d time.Duration) bool {
+	v.mu.Lock()
+	if !v.wtRunning {
+		v.mu.Unlock()
+		return true
+	}
+	if v.wtIdle == nil {
+		v.wtIdle = make(chan struct{})
+	}
+	ch := v.wtIdle
+	v.mu.Unlock()
+
+	if d <= 0 {
+		<-ch
+		return true
+	}
+	select {
+	case <-ch:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // writeThroughBase runs one base read→split→write cycle. Caller holds

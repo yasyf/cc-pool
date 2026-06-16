@@ -253,6 +253,11 @@ func (p *FuseProvider) Teardown(base, accountDir string) error {
 			case <-time.After(forceGrace):
 			}
 		}
+		// The mirror is gone; drain a write-through the last commit scheduled so
+		// its shareable keys still reach the (real, non-mount) base file before
+		// the view is discarded. Bounded like the unmount: a stuck local write
+		// must not hang teardown — it stays in writeErr/Health.
+		h.fs.cj.flushWithin(unmountGrace)
 	}
 	// Honest teardown: confirm the path is no longer a mountpoint. If the
 	// unmount wedged (e.g. fuse-t issue-45), report it so callers do NOT

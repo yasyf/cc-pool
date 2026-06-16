@@ -5,6 +5,7 @@ package overlay
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -120,6 +121,14 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	if string(pb) != committed {
 		t.Fatalf("private file after commit = %q, want the full payload %q", pb, committed)
 	}
+	// The commit's base write-through now runs off the fuse handler; drain it
+	// before asserting the base sibling.
+	mountMu.Lock()
+	mh := mounts[mnt]
+	mountMu.Unlock()
+	if mh == nil || !mh.fs.cj.flushWithin(5*time.Second) {
+		t.Fatal("base write-through did not drain after the commit")
+	}
 	sb, err := os.ReadFile(sibling)
 	if err != nil {
 		t.Fatalf("read base sibling after commit: %v", err)
@@ -196,6 +205,11 @@ func commitClaudeJSON(t *testing.T, fs *mirrorFS, home, payload string) {
 	}
 	if st := fs.Rename("/.claude.json.tmp.ab12cd34", "/.claude.json"); st != 0 {
 		t.Fatalf("rename commit = %d, want 0", st)
+	}
+	// Rename now schedules the base write-through off-handler; drain it so the
+	// caller can assert base/healthErr deterministically.
+	if !fs.cj.flushWithin(5 * time.Second) {
+		t.Fatal("write-through did not drain within 5s")
 	}
 }
 
@@ -556,6 +570,9 @@ func TestMirrorClaudeJSONWriteHandleRelease(t *testing.T) {
 	if st := fs.Release(claudeJSONFusePath, fh); st != 0 {
 		t.Fatalf("release = %d, want 0", st)
 	}
+	if !fs.cj.flushWithin(5 * time.Second) {
+		t.Fatal("release write-through did not drain within 5s")
+	}
 	got := raw(t, mustReadFile(t, filepath.Join(home, ".claude.json")))
 	if string(got["theme"]) != `"in-place"` {
 		t.Errorf("base theme = %s, want \"in-place\" after release write-through", got["theme"])
@@ -761,6 +778,9 @@ func TestMirrorClaudeJSONTruncateHandleMarksDirty(t *testing.T) {
 	if st := fs.Release(claudeJSONFusePath, fh); st != 0 {
 		t.Fatalf("release = %d, want 0", st)
 	}
+	if !fs.cj.flushWithin(5 * time.Second) {
+		t.Fatal("truncate-release write-through did not drain within 5s")
+	}
 	got := raw(t, mustReadFile(t, filepath.Join(home, ".claude.json")))
 	if string(got["theme"]) != `"truncated"` {
 		t.Fatalf("base theme = %s, want \"truncated\" after a truncate-only release write-through", got["theme"])
@@ -784,6 +804,104 @@ func TestMirrorClaudeJSONFailedRenameSkipsWriteThrough(t *testing.T) {
 	if err := fs.healthErr(); err != nil {
 		t.Fatalf("healthErr = %v, want nil after a failed rename", err)
 	}
+}
+
+// TestMirrorClaudeJSONReleaseDoesNotBlockOnWriteThrough is the root-cause
+// regression: a /.claude.json commit must return at fuse-op speed even while a
+// base write-through is mid-cycle. Holding writeThroughMu parks the background
+// worker; the Rename handler must still return promptly (it only schedules) and
+// must NOT have touched base yet. Releasing the lock then lets the drained
+// write-through reach base. This pins that the process-global base lock never
+// sits on a fuse handler goroutine — the stall that wedged the mount's NFS
+// server ("nfs server … not responding").
+func TestMirrorClaudeJSONReleaseDoesNotBlockOnWriteThrough(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	committed := `{"theme":"unblocked","oauthAccount":{"accountUuid":"acct-own"}}`
+	if err := os.WriteFile(filepath.Join(home, "acct.private", ".claude.json.tmp.ab12cd34"), []byte(committed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	writeThroughMu.Lock() // freeze any write-through cycle mid-flight
+	rename := make(chan int, 1)
+	go func() { rename <- fs.Rename("/.claude.json.tmp.ab12cd34", "/.claude.json") }()
+	select {
+	case st := <-rename:
+		if st != 0 {
+			writeThroughMu.Unlock()
+			t.Fatalf("rename commit = %d, want 0", st)
+		}
+	case <-time.After(2 * time.Second):
+		writeThroughMu.Unlock()
+		t.Fatal("Rename blocked while writeThroughMu was held — write-through must not run on the fuse handler")
+	}
+	// The worker is parked on the held lock, so base must still be untouched.
+	if got := mustReadFile(t, filepath.Join(home, ".claude.json")); string(got) != mergeBase {
+		writeThroughMu.Unlock()
+		t.Fatalf("base written while the worker was blocked on the lock:\n%s", got)
+	}
+	writeThroughMu.Unlock()
+
+	if !fs.cj.flushWithin(5 * time.Second) {
+		t.Fatal("write-through did not drain after releasing the lock")
+	}
+	got := raw(t, mustReadFile(t, filepath.Join(home, ".claude.json")))
+	if string(got["theme"]) != `"unblocked"` {
+		t.Fatalf("base theme = %s, want \"unblocked\" once the write-through drained", got["theme"])
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil", err)
+	}
+}
+
+// TestMirrorClaudeJSONCoalescedCommits fires many commits back-to-back without
+// draining between them. However the schedules and the worker interleave, the
+// drained base must reflect the LAST committed shareable keys — coalescing must
+// never drop the final write.
+func TestMirrorClaudeJSONCoalescedCommits(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	var last string
+	for i := 0; i < 20; i++ {
+		last = fmt.Sprintf("theme-%d", i)
+		payload := fmt.Sprintf(`{"theme":%q,"oauthAccount":{"accountUuid":"acct-own"}}`, last)
+		if err := os.WriteFile(filepath.Join(home, "acct.private", ".claude.json.tmp.ab12cd34"), []byte(payload), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if st := fs.Rename("/.claude.json.tmp.ab12cd34", "/.claude.json"); st != 0 {
+			t.Fatalf("rename commit %d = %d, want 0", i, st)
+		}
+	}
+	if !fs.cj.flushWithin(5 * time.Second) {
+		t.Fatal("write-through did not drain")
+	}
+	got := raw(t, mustReadFile(t, filepath.Join(home, ".claude.json")))
+	if string(got["theme"]) != `"`+last+`"` {
+		t.Fatalf("base theme = %s, want the last commit's %q", got["theme"], last)
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil", err)
+	}
+}
+
+// TestMirrorClaudeJSONFlushWithinTimesOut: flushWithin must return false when a
+// write-through cannot drain in time, so a bounded teardown never blocks
+// forever on a stuck base write.
+func TestMirrorClaudeJSONFlushWithinTimesOut(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	if err := os.WriteFile(filepath.Join(home, "acct.private", ".claude.json.tmp.ab12cd34"), []byte(`{"theme":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeThroughMu.Lock()
+	if st := fs.Rename("/.claude.json.tmp.ab12cd34", "/.claude.json"); st != 0 {
+		writeThroughMu.Unlock()
+		t.Fatalf("rename = %d, want 0", st)
+	}
+	drained := fs.cj.flushWithin(100 * time.Millisecond)
+	writeThroughMu.Unlock()
+	if drained {
+		t.Fatal("flushWithin reported drained while the write-through was blocked")
+	}
+	// Let the now-unblocked worker finish before the temp dir is cleaned up.
+	fs.cj.flushWithin(5 * time.Second)
 }
 
 // TestFuseProviderHealthJoinsMirrorErrors pins the Health glue between the

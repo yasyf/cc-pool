@@ -241,8 +241,10 @@ func (fs *mirrorFS) Release(path string, fh uint64) int {
 		// The fd actually wrote into the private /.claude.json (an in-place
 		// commit): propagate the shareable keys to base after the close. A
 		// write-capable fd that never wrote stays clean — write-through would
-		// push possibly-stale private shareable keys over a newer base.
-		fs.cj.writeThrough()
+		// push possibly-stale private shareable keys over a newer base. The
+		// propagation runs off this handler (scheduleWriteThrough) so the close
+		// never blocks on base I/O and stalls the mount.
+		fs.cj.scheduleWriteThrough()
 	}
 	return st
 }
@@ -381,8 +383,9 @@ func (fs *mirrorFS) Rename(oldpath string, newpath string) int {
 		// propagate its shareable keys to base. The private rename's status is
 		// ALWAYS returned — the commit durably happened, so a write-through
 		// failure must not fail the save; it goes sticky and surfaces via
-		// Health.
-		fs.cj.writeThrough()
+		// Health. Propagation runs off this handler (scheduleWriteThrough) so
+		// the rename never blocks on base I/O and stalls the mount.
+		fs.cj.scheduleWriteThrough()
 	}
 	return st
 }
