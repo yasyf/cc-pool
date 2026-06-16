@@ -138,6 +138,9 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 	// view and its shareable-key write-through.
 	baseClaudeJSON := filepath.Join(filepath.Dir(base), ".claude.json")
 	fs := newMirrorFS(base, priv, baseClaudeJSON)
+	// Snapshot base's current top-level names before serving: those present as
+	// live symlinks (sharedLink), carving claude's bulk I/O out of the NFS path.
+	fs.snapshotShared()
 	host := fuse.NewFileSystemHost(fs)
 	host.SetCapReaddirPlus(true)
 	done := make(chan struct{})

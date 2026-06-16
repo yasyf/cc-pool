@@ -1,6 +1,7 @@
 package procscan
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -132,9 +133,9 @@ func TestScanPopulatesStartedAt(t *testing.T) {
 	orig := psOutput
 	t.Cleanup(func() { psOutput = orig })
 
-	psOutput = func() ([]byte, error) { return []byte(sample), nil }
+	psOutput = func(context.Context) ([]byte, error) { return []byte(sample), nil }
 	before := time.Now()
-	got, err := Scan()
+	got, err := Scan(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,8 +156,48 @@ func TestScanPopulatesStartedAt(t *testing.T) {
 		t.Errorf("pid 1010 StartedAt = %v, want zero for malformed etime", sa)
 	}
 
-	psOutput = func() ([]byte, error) { return nil, errors.New("ps exploded") }
-	if _, err := Scan(); err == nil {
+	psOutput = func(context.Context) ([]byte, error) { return nil, errors.New("ps exploded") }
+	if _, err := Scan(context.Background()); err == nil {
 		t.Fatal("Scan must propagate a ps failure")
+	}
+}
+
+// TestScanBoundsWedgedPS proves the timeout releases the CALLER even when ps is
+// truly unkillable: the stub ignores its ctx entirely — a real ps wedged on a
+// D-state read off a hung fuse-t mount does not cooperatively unblock on
+// cancellation, which is the whole problem — yet Scan returns DeadlineExceeded
+// within a generous bound. Only a goroutine-decoupled Scan passes this; a
+// synchronous psOutput call (even with WaitDelay) would hang here, since
+// cmd.Wait parks in waitpid and SIGKILL cannot reap a D-state ps.
+func TestScanBoundsWedgedPS(t *testing.T) {
+	origOut, origTimeout := psOutput, scanTimeout
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		close(release) // free the parked stub goroutine before restoring the seams
+		psOutput, scanTimeout = origOut, origTimeout
+	})
+
+	scanTimeout = 20 * time.Millisecond
+	psOutput = func(ctx context.Context) ([]byte, error) {
+		<-release // ignore ctx — mimic a ps that SIGKILL cannot reap
+		return nil, ctx.Err()
+	}
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := Scan(context.Background())
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Scan err = %v, want context.DeadlineExceeded", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("Scan took %v, want ≲ scanTimeout (%v)", elapsed, scanTimeout)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Scan did not return within the bound — the timeout did not release the caller")
 	}
 }

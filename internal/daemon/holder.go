@@ -488,7 +488,7 @@ func (s *Server) skewReplaceGate() (fuse []store.Account, reason string) {
 	if !sameAccountIDs(fuse, fresh) {
 		return bail("the fuse account set changed mid-gate")
 	}
-	sessions, err := s.scan()
+	sessions, err := s.scan(context.Background())
 	if err != nil {
 		return bail(fmt.Sprintf("session scan: %v", err))
 	}
@@ -581,7 +581,7 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 	// line reports 0.
 	var sessions []procscan.Session
 	if len(fuse) > 0 {
-		ses, serr := s.scan()
+		ses, serr := s.scan(ctx)
 		if serr != nil {
 			s.log.Printf("holder supervision: session scan: %v", serr)
 		}

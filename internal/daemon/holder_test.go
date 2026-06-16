@@ -142,7 +142,7 @@ func newSuperviseServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv, *
 	rec := newSpawnRecorder(t)
 	s.spawnHolder = rec.fn
 	s.holderSocket = filepath.Join(sockDir, "m.sock")
-	s.scanSessions = func() ([]procscan.Session, error) { return nil, nil }
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
 	s.startedAt = time.Now().Add(-reservationTTL - time.Second)
 	s.holderGoneWait = 2 * time.Second
 	s.peerPID = func(string) (int, error) { return 4242, nil }
@@ -793,12 +793,12 @@ func TestSuperviseSkewGateLegs(t *testing.T) {
 		},
 		"scan failure fails closed": {
 			mutate: func(t *testing.T, s *Server, _ map[int]string, _ string) {
-				s.scanSessions = func() ([]procscan.Session, error) { return nil, errors.New("ps exploded") }
+				s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, errors.New("ps exploded") }
 			},
 		},
 		"live session on a fuse dir defers": {
 			mutate: func(t *testing.T, s *Server, dirs map[int]string, _ string) {
-				s.scanSessions = func() ([]procscan.Session, error) {
+				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 					return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 				}
 			},
@@ -811,7 +811,7 @@ func TestSuperviseSkewGateLegs(t *testing.T) {
 		"live session on a holder-only dir defers": {
 			extraDir: true,
 			mutate: func(t *testing.T, s *Server, _ map[int]string, extra string) {
-				s.scanSessions = func() ([]procscan.Session, error) {
+				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 					return []procscan.Session{{PID: 4242, ConfigDir: extra}}, nil
 				}
 			},
@@ -1305,7 +1305,7 @@ func TestSuperviseLogsOncePerTransition(t *testing.T) {
 		h := startSkewedHolder(t, []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}}, true)
 		s.holderSocket = h.socket
 		// A stable blocking reason, so consecutive ticks defer identically.
-		s.scanSessions = func() ([]procscan.Session, error) { return nil, errors.New("ps exploded") }
+		s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, errors.New("ps exploded") }
 		var buf bytes.Buffer
 		s.log = log.New(&buf, "", 0)
 
@@ -1928,7 +1928,7 @@ func TestSuperviseRemountBreakerEscalatesUnderLiveSession(t *testing.T) {
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 	// A live session on the very dir the breaker is about to force down: a
 	// session gate would consult it and bail; the breaker must not.
-	s.scanSessions = func() ([]procscan.Session, error) {
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 	}
 

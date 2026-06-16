@@ -89,7 +89,7 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 		return nil, ErrNoAccounts
 	}
 
-	sessions, scanErr := scanSessions() // best-effort; nil sessions on error
+	sessions, scanErr := scanSessions(ctx) // best-effort; nil sessions on error
 
 	if opts.Live {
 		m.sampleStale(ctx, accts, sessions, opts.FreshFor)
@@ -221,7 +221,7 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 // RefreshLeadTime and the account is idle, so the launched session starts with
 // a healthy token. Errors are returned but non-fatal to the caller.
 func (m *Manager) PreflightRefresh(ctx context.Context, a store.Account) error {
-	sessions, _ := procscan.Scan()
+	sessions, _ := procscan.Scan(ctx)
 	idle := procscan.CountByConfigDir(sessions, a.ConfigDir) == 0
 	if !idle {
 		return nil

@@ -369,7 +369,7 @@ func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
-	setup := func(t *testing.T, scan func() ([]procscan.Session, error)) *Manager {
+	setup := func(t *testing.T, scan func(context.Context) ([]procscan.Session, error)) *Manager {
 		t.Helper()
 		old := scanSessions
 		scanSessions = scan
@@ -402,7 +402,7 @@ func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 	}
 
 	t.Run("zero-claude scan reaps and the pin binds warm", func(t *testing.T) {
-		m := setup(t, func() ([]procscan.Session, error) { return nil, nil })
+		m := setup(t, func(context.Context) ([]procscan.Session, error) { return nil, nil })
 		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj"})
 		if err != nil {
 			t.Fatal(err)
@@ -416,7 +416,7 @@ func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 	})
 
 	t.Run("scan failure skips the sweep and the pin holds", func(t *testing.T) {
-		m := setup(t, func() ([]procscan.Session, error) { return nil, errors.New("ps exploded") })
+		m := setup(t, func(context.Context) ([]procscan.Session, error) { return nil, errors.New("ps exploded") })
 		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj"})
 		if err != nil {
 			t.Fatal(err)
@@ -432,7 +432,7 @@ func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 	})
 
 	t.Run("fresh dead row survives the reap grace", func(t *testing.T) {
-		m := setup(t, func() ([]procscan.Session, error) { return nil, nil })
+		m := setup(t, func(context.Context) ([]procscan.Session, error) { return nil, nil })
 		// A just-marked checkout (ccp run pre-exec) looks dead to a claude-only
 		// scan; the grace keeps it alive.
 		if _, err := m.Store.OpenSession(1, 4000001, "dir", "/other", now); err != nil {

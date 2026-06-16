@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -147,8 +148,8 @@ func TestIdleMountsNeverPeriodicallyProbed(t *testing.T) {
 	s.holderSocket = startCannedHolder(t, []mountd.MountInfo{
 		{Dir: dirs[1], Base: "/base", Live: true},
 	})
-	s.scanSessions = func() ([]procscan.Session, error) { return nil, nil } // idle: no sessions
-	shrinkProbeInterval(t, 0)                                               // due every tick — only the session gate can suppress probing
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil } // idle: no sessions
+	shrinkProbeInterval(t, 0)                                                              // due every tick — only the session gate can suppress probing
 	var probes int32
 	swapDeepProbe(t, func(string) error { atomic.AddInt32(&probes, 1); return nil })
 
@@ -170,7 +171,7 @@ func TestInUseMountProbedAndHealedWithinInterval(t *testing.T) {
 	s.holderSocket = startCannedHolder(t, []mountd.MountInfo{
 		{Dir: dirs[1], Base: "/base", Live: true},
 	})
-	s.scanSessions = func() ([]procscan.Session, error) {
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 	}
 	shrinkProbeInterval(t, 0)

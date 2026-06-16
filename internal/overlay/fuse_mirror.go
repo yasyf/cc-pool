@@ -31,6 +31,18 @@ type mirrorFS struct {
 	privateRoot string          // per-account backing for ExcludedEntries
 	cj          *claudeJSONView // merged read view + base write-through for /.claude.json
 	probe       *probeView      // virtual read-only /.ccp-probe for deep wedge probing
+	// shared is the set of top-level base names present at mount time, captured
+	// by snapshotShared. Only these present as live symlinks into base
+	// (sharedLink), carving claude's bulk transcript/history I/O out of fuse-t's
+	// NFS path. It is the empty set until Setup snapshots it, so the method-level
+	// tests (which never mount) see pure passthrough. Snapshotting at mount time
+	// — rather than carving any name that merely exists in base — is what keeps a
+	// create-through-mount safe: were a brand-new top-level file to flip to a
+	// symlink the instant CREATE lands it in base, the kernel's immediate
+	// post-CREATE Getattr would race it into a symlink and the in-flight NFS
+	// write would fail EIO. Entries born after the mount stay passthrough; the
+	// next mount snapshots and carves them.
+	shared map[string]bool
 }
 
 func newMirrorFS(root, privateRoot, baseClaudeJSON string) *mirrorFS {
@@ -75,6 +87,59 @@ func topComponent(path string) string {
 		p = p[:i]
 	}
 	return p
+}
+
+// isTopLevel reports whether path names exactly one component ("/projects" yes,
+// "/projects/p.json" and "/" no).
+func isTopLevel(path string) bool {
+	p := strings.TrimPrefix(path, "/")
+	return p != "" && !strings.ContainsRune(p, '/')
+}
+
+// snapshotShared records the top-level names present in base at mount time;
+// only these present as live symlinks (see sharedLink and the shared field).
+// Called once from Setup before the mount serves, so no client op can race the
+// snapshot. A read failure leaves the set empty (pure passthrough) rather than
+// guessing.
+func (fs *mirrorFS) snapshotShared() {
+	entries, err := os.ReadDir(fs.root)
+	if err != nil {
+		return
+	}
+	fs.shared = make(map[string]bool, len(entries))
+	for _, e := range entries {
+		fs.shared[e.Name()] = true
+	}
+}
+
+// sharedLink reports whether path is a shared top-level entry the mirror should
+// present as a LIVE SYMLINK into base, returning the absolute base target. The
+// shared entries (projects/, history, todos/, shell-snapshots/, statsig/,
+// settings.json, …) are pure passthrough — presenting them as symlinks lets the
+// kernel resolve them OUTSIDE the mount, so all of claude's bulk transcript and
+// history I/O bypasses fuse-t's chunked NFS layer entirely, exactly as the
+// on-disk symlink provider already does. The mirror keeps doing real work only
+// for the carve-outs this excludes: /.claude.json (merged read + write-through),
+// private names (privateRoot redirect) and /.ccp-probe (virtual). Only names in
+// the mount-time snapshot (fs.shared) qualify — an entry born after the mount
+// stays passthrough so a create-through-mount never flips type mid-write; its
+// content is still served live through the symlink once a later mount carves it.
+func (fs *mirrorFS) sharedLink(path string) (string, bool) {
+	if !isTopLevel(path) {
+		return "", false
+	}
+	name := strings.TrimPrefix(path, "/")
+	if !fs.shared[name] {
+		return "", false
+	}
+	if privateName(name) || path == claudeJSONFusePath || name == ProbeFileName {
+		return "", false
+	}
+	target := filepath.Join(fs.root, name)
+	if _, err := os.Lstat(target); err != nil {
+		return "", false
+	}
+	return target, true
 }
 
 func errno(err error) int {
@@ -127,6 +192,19 @@ func (fs *mirrorFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 			return errno(err)
 		}
 		copyStat(stat, &st)
+		return 0
+	}
+	if target, ok := fs.sharedLink(path); ok {
+		// Synthesize a symlink stat from the target's own metadata, then override
+		// the type and size to those of a symlink pointing at the absolute base
+		// path. The kernel follows the link OUTSIDE the mount, so the carved bulk
+		// I/O never traverses fuse-t's NFS layer (see sharedLink).
+		if err := syscall.Lstat(target, &st); err != nil {
+			return errno(err)
+		}
+		copyStat(stat, &st)
+		stat.Mode = fuse.S_IFLNK | 0o777
+		stat.Size = int64(len(target))
 		return 0
 	}
 	if err := syscall.Lstat(fs.real(path), &st); err != nil {
@@ -362,6 +440,12 @@ func (fs *mirrorFS) Readlink(path string) (int, string) {
 		// The virtual probe is a regular file; answering here keeps a shadowed
 		// base symlink's target from leaking through the probe name.
 		return -int(syscall.EINVAL), ""
+	}
+	if target, ok := fs.sharedLink(path); ok {
+		// The live symlink Getattr synthesized for a shared top-level entry: its
+		// target is the absolute base path, which the kernel resolves outside the
+		// mount (see sharedLink).
+		return 0, target
 	}
 	buf := make([]byte, 4096)
 	n, err := syscall.Readlink(fs.real(path), buf)

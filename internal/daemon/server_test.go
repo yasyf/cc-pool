@@ -15,14 +15,20 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
 // newTestServer builds a Server over a temp-dir store with two accounts:
 // acct-1 emptier (util 10) than acct-2 (util 50), both freshly sampled. The
-// temp config dirs guarantee procscan can never attribute a
-// real claude process to them, and the empty fake keychain makes any
-// best-effort preflight refresh a harmless miss.
+// empty fake keychain makes any best-effort preflight refresh a harmless miss.
+//
+// scanSessions is stubbed to report no live sessions so the daemon tests never
+// shell out to the real `ps`: a live claude could never be attributed to these
+// temp config dirs anyway (so the result is identical), and the real ps is an
+// external the suite must not depend on — doubly so here, where a wedged mount
+// on the dev box would hang it (the very failure this package's scan bound
+// guards against). Tests that need live pids set their own s.scanSessions.
 func newTestServer(t *testing.T) (*Server, map[int]string) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
@@ -52,6 +58,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		},
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
+		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		reservations:    map[int]time.Time{},
 		converting:      map[int]bool{},
 		rlStreak:        map[int]int{},

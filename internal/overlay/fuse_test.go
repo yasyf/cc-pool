@@ -142,6 +142,70 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	}
 }
 
+// TestFuseMirrorCarvesBulkAsSymlinks pins the bulk-carve: shared top-level
+// entries present through the mount as LIVE SYMLINKS into base, so the kernel
+// resolves them outside the mount and claude's bulk transcript/history writes
+// bypass fuse-t's NFS layer entirely. It needs a real fuse-t mount and skips
+// (like TestFuseMirrorRoundTrip) when one is unavailable.
+func TestFuseMirrorCarvesBulkAsSymlinks(t *testing.T) {
+	base := t.TempDir()
+	mnt := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, "projects"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &FuseProvider{}
+	if err := p.Setup(base, mnt); err != nil {
+		t.Skipf("fuse-t mount unavailable (acceptable; symlink is the default): %v", err)
+	}
+	defer p.Teardown(base, mnt)
+
+	// A shared top-level DIR presents as a symlink to its absolute base path.
+	fi, err := os.Lstat(filepath.Join(mnt, "projects"))
+	if err != nil {
+		t.Fatalf("lstat projects through mount: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("projects mode = %v, want a symlink (bulk must be carved out of the mount)", fi.Mode())
+	}
+	if got, err := os.Readlink(filepath.Join(mnt, "projects")); err != nil || got != filepath.Join(base, "projects") {
+		t.Fatalf("readlink projects = %q (err %v), want %q", got, err, filepath.Join(base, "projects"))
+	}
+
+	// A shared top-level FILE presents as a symlink too.
+	sfi, err := os.Lstat(filepath.Join(mnt, "settings.json"))
+	if err != nil {
+		t.Fatalf("lstat settings.json through mount: %v", err)
+	}
+	if sfi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("settings.json mode = %v, want a symlink", sfi.Mode())
+	}
+	if got, err := os.Readlink(filepath.Join(mnt, "settings.json")); err != nil || got != filepath.Join(base, "settings.json") {
+		t.Fatalf("readlink settings.json = %q (err %v), want %q", got, err, filepath.Join(base, "settings.json"))
+	}
+
+	// A multi-MB write through the carved symlink lands directly in base — the
+	// kernel resolves mnt/projects outside the mount, so the bytes never touch
+	// fuse-t. Read them back from base to prove it.
+	big := make([]byte, 4<<20)
+	for i := range big {
+		big[i] = byte(i*31 + 7)
+	}
+	if err := os.WriteFile(filepath.Join(mnt, "projects", "big.bin"), big, 0o644); err != nil {
+		t.Fatalf("write multi-MB file through carved symlink: %v", err)
+	}
+	back, err := os.ReadFile(filepath.Join(base, "projects", "big.bin"))
+	if err != nil {
+		t.Fatalf("bulk write did not land in base: %v", err)
+	}
+	if !bytes.Equal(back, big) {
+		t.Fatalf("base big.bin = %d bytes, want the %d written through the mount", len(back), len(big))
+	}
+}
+
 // TestMirrorRealRedirectsLocalEntries pins the path-mapping table without
 // needing a live mount: every PrivateEntry top component (and its subtree)
 // must back onto privateRoot; everything else onto root.

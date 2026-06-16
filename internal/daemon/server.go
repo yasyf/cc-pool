@@ -103,7 +103,7 @@ type Server struct {
 
 	// scanSessions overrides procscan.Scan for the fuse→symlink fallback gate;
 	// nil means the real scan. Tests inject session lists and scan failures.
-	scanSessions func() ([]procscan.Session, error)
+	scanSessions func(context.Context) ([]procscan.Session, error)
 
 	// startedAt is when this daemon began serving (stamped in Run). The
 	// skew-replace gate requires uptime ≥ reservationTTL: a freshly-started
@@ -541,7 +541,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	// Reconcile session rows against reality before consulting the pin: a
 	// claude that just exited must read as warm (bind), not live (hold), and
 	// pollOnce's ~3.5-minute cadence is too coarse for a quick resume.
-	if sessions, err := procscan.Scan(); err == nil {
+	if sessions, err := procscan.Scan(ctx); err == nil {
 		if _, cerr := s.m.Store.CloseDeadSessions(procscan.AlivePIDs(sessions), time.Now()); cerr != nil {
 			s.log.Printf("close dead sessions: %v", cerr)
 		}
@@ -936,11 +936,11 @@ func (s *Server) holderClient() *mountd.Client {
 
 // scan resolves session scanning through the test seam; nil means
 // procscan.Scan.
-func (s *Server) scan() ([]procscan.Session, error) {
+func (s *Server) scan(ctx context.Context) ([]procscan.Session, error) {
 	if s.scanSessions != nil {
-		return s.scanSessions()
+		return s.scanSessions(ctx)
 	}
-	return procscan.Scan()
+	return procscan.Scan(ctx)
 }
 
 // overlayFor resolves a kind through the Manager's injectable seam (tests fake
@@ -1272,7 +1272,7 @@ func (s *Server) fallbackToSymlink(a store.Account) {
 		return
 	}
 	defer s.endConvert(a.ID)
-	sessions, err := s.scan()
+	sessions, err := s.scan(context.Background())
 	if err != nil {
 		s.log.Printf("acct-%02d deferring fuse→symlink fallback: session scan: %v", a.ID, err)
 		return

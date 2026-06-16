@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -465,7 +466,7 @@ func TestFallbackToSymlinkClaimAtomicAgainstSelect(t *testing.T) {
 		t.Fatal(err)
 	}
 	reservedMidFallback := false
-	s.scanSessions = func() ([]procscan.Session, error) {
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 		reservedMidFallback = s.tryReserve(1)
 		return nil, nil
 	}
@@ -1077,11 +1078,11 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			fake.setupErr = tc.setupErr
 			switch tc.scanKind {
 			case "live":
-				s.scanSessions = func() ([]procscan.Session, error) {
+				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 					return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 				}
 			case "err":
-				s.scanSessions = func() ([]procscan.Session, error) {
+				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 					return nil, errors.New("ps exploded")
 				}
 			}

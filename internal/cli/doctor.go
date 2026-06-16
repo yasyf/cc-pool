@@ -98,7 +98,7 @@ func newDoctorCmd() *cobra.Command {
 				if len(holderMounts) > 0 {
 					// A failed scan skips the stale check silently: it is
 					// advisory, and doctor degrades rather than aborts.
-					sessions, _ = scanSessions()
+					sessions, _ = scanSessions(cmd.Context())
 				}
 				reportStaleSessions(accts, holderMounts, sessions, report)
 

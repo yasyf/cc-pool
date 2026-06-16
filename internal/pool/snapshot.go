@@ -55,7 +55,7 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 	if err != nil {
 		return nil, err
 	}
-	sessions, _ := procscan.Scan()
+	sessions, _ := procscan.Scan(ctx)
 	if live {
 		m.sampleStale(ctx, accts, sessions, fresh)
 	}

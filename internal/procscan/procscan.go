@@ -8,6 +8,7 @@
 package procscan
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -39,18 +40,63 @@ var (
 	psArgs = []string{"-Eww", "-ax", "-o", "pid=,etime=,command="}
 	// psOutput is the process-table seam: the real ps in production, canned
 	// output in tests (which must never scan real processes).
-	psOutput = func() ([]byte, error) { return exec.Command(psBin, psArgs...).Output() }
+	psOutput = func(ctx context.Context) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, psBin, psArgs...)
+		// A ps blocked reading a D-state process (one wedged on a hung fuse-t
+		// mount) cannot be reaped by SIGKILL, so cmd.Wait stays parked in
+		// waitpid regardless of ctx — WaitDelay does NOT change that. What
+		// frees the CALLER is Scan's goroutine decoupling (see Scan). WaitDelay
+		// is still worth setting: once ps finally exits (the mount unwedged) it
+		// closes the orphaned stdout pipe and lets the abandoned goroutine
+		// drain instead of blocking forever on the output copy.
+		cmd.WaitDelay = 1 * time.Second
+		return cmd.Output()
+	}
 )
+
+// scanTimeout bounds one Scan. A var so tests can shrink it.
+var scanTimeout = 3 * time.Second
 
 var configDirRE = regexp.MustCompile(`(?:^|\s)CLAUDE_CONFIG_DIR=(\S+)`)
 
-// Scan returns all live claude sessions.
-func Scan() ([]Session, error) {
-	out, err := psOutput()
-	if err != nil {
-		return nil, err
+// Scan returns all live claude sessions. It bounds the underlying `ps` with
+// scanTimeout: a wedged fuse-t mount can drive a process into uninterruptible
+// D-state, and a `ps` reading that process blocks in-kernel forever, which
+// would hang every launch and daemon poll.
+//
+// Releasing the CALLER takes more than exec.CommandContext + WaitDelay: cmd.Wait
+// blocks in waitpid first, and neither ctx cancellation nor WaitDelay makes
+// waitpid return for an unkillable (D-state) ps. So Scan runs psOutput in a
+// goroutine and returns on the deadline regardless of whether ps ever dies. The
+// abandoned goroutine stays parked in waitpid until the mount unwedges and ps
+// finally exits; the buffered channel keeps it from leaking on send. A
+// DeadlineExceeded surfaces as a normal error, which callers treat as "no
+// sessions discovered".
+func Scan(ctx context.Context) ([]Session, error) {
+	cctx, cancel := context.WithTimeout(ctx, scanTimeout)
+	defer cancel()
+	// Capture the seam before spawning so the goroutine never reads the package
+	// var: a goroutine left parked on an unkillable ps would otherwise race a
+	// test swapping psOutput. Production never mutates it.
+	run := psOutput
+	type result struct {
+		out []byte
+		err error
 	}
-	return parse(string(out), time.Now()), nil
+	ch := make(chan result, 1)
+	go func() {
+		out, err := run(cctx)
+		ch <- result{out, err}
+	}()
+	select {
+	case <-cctx.Done():
+		return nil, fmt.Errorf("ps scan: %w", cctx.Err())
+	case r := <-ch:
+		if r.err != nil {
+			return nil, fmt.Errorf("ps scan: %w", r.err)
+		}
+		return parse(string(r.out), time.Now()), nil
+	}
 }
 
 // parse extracts sessions from `ps -Eww -o pid=,etime=,command=` output. now

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -235,7 +236,7 @@ func runServiceUninstall(cmd *cobra.Command, purge, force bool) error {
 // account dir. A failed scan aborts — proceeding blind could yank a dir out
 // from under a session we could not see.
 func gateUninstallSessions(accts []store.Account, purge bool) error {
-	sessions, err := scanSessions()
+	sessions, err := scanSessions(context.Background())
 	if err != nil {
 		return fmt.Errorf("cannot verify no live sessions: %w; re-run with --force to skip this check", err)
 	}

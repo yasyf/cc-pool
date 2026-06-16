@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -263,7 +264,7 @@ func TestUninstallSessionGate(t *testing.T) {
 			fuseDir, symDir := home(t)
 			tc := c.build(fuseDir, symDir)
 			scanned := false
-			swapVar(t, &scanSessions, func() ([]procscan.Session, error) {
+			swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) {
 				scanned = true
 				return tc.sessions, tc.scanErr
 			})
@@ -310,7 +311,7 @@ func TestUninstallSessionGate(t *testing.T) {
 // failed dirs are reported, and the success line lands once the socket dies.
 func TestUninstallShutsDownHolder(t *testing.T) {
 	tempHome(t)
-	swapVar(t, &scanSessions, func() ([]procscan.Session, error) { return nil, nil })
+	swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) { return nil, nil })
 	swapVar(t, &dirMounted, func(string) bool { return false })
 	swapVar(t, &holderGoneWait, 2*time.Second)
 	stubStopDaemon(t)
@@ -340,7 +341,7 @@ func TestUninstallShutsDownHolder(t *testing.T) {
 // line still lands once the socket dies.
 func TestUninstallEscalatesToKillOnWedgedHolder(t *testing.T) {
 	tempHome(t)
-	swapVar(t, &scanSessions, func() ([]procscan.Session, error) { return nil, nil })
+	swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) { return nil, nil })
 	swapVar(t, &dirMounted, func(string) bool { return false })
 	swapVar(t, &holderGoneWait, 300*time.Millisecond)
 	stubStopDaemon(t)
@@ -393,7 +394,7 @@ func TestUninstallSurvivorMount(t *testing.T) {
 			if err := os.MkdirAll(fuseDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			swapVar(t, &scanSessions, func() ([]procscan.Session, error) { return nil, nil })
+			swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) { return nil, nil })
 			swapVar(t, &dirMounted, func(dir string) bool { return dir == fuseDir })
 			stubStopDaemon(t)
 

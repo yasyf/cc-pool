@@ -150,7 +150,7 @@ func (s *Server) convertAccount(a store.Account, to overlay.Kind, force bool) Mi
 	if !force {
 		// Never convert blind: a failed scan means we cannot know whether a
 		// live claude has this dir as its config dir.
-		sessions, err := procscan.Scan()
+		sessions, err := procscan.Scan(context.Background())
 		if err != nil {
 			res.Outcome = MigrationFailed
 			res.Detail = fmt.Sprintf("session scan: %v", err)

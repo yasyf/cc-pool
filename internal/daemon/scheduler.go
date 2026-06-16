@@ -68,7 +68,7 @@ func (s *Server) pollOnce(ctx context.Context) {
 	// Only reconcile sessions on a successful scan: AlivePIDs always returns a
 	// non-nil map, so reconciling off a failed (nil) scan would treat every PID
 	// as dead and close every active session.
-	sessions, err := procscan.Scan()
+	sessions, err := procscan.Scan(ctx)
 	if err != nil {
 		s.log.Printf("procscan: %v", err)
 	} else {
