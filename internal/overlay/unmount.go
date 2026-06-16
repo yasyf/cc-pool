@@ -33,7 +33,7 @@ var unmountFn = unix.Unmount
 
 // forceUnmountProbes joins concurrent and repeated force-unmounts per dir. Its
 // own StatProbes instance, never shared with the stat or deep probes
-// (ownProbes/aliveProbes/deepProbes): a parked MNT_FORCE against a
+// (aliveProbes/deepProbes): a parked MNT_FORCE against a
 // permanently-wedged carcass must never block — or be answered by — a liveness
 // stat behind its join, and vice versa. The join is what makes the
 // at-most-one-parked-goroutine-per-carcass contract true: the daemon re-issues

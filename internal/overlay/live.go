@@ -71,22 +71,12 @@ func (p *StatProbes[V]) Inflight() int {
 	return len(p.inflight)
 }
 
-// statProbeTimeout bounds the overlay package's own wedge-prone kernel stats
-// (FuseProvider.Teardown's post-unmount verification). A var, not a const, so
-// tests can shrink it.
+// statProbeTimeout bounds the overlay package's own wedge-prone kernel stats.
+// Its sole remaining user is aliveProbes via MountAliveWithin: FuseProvider.
+// Teardown's post-unmount check is now the non-blocking Mounted (a cached
+// Getfsstat read that cannot wedge), which needs no bound. A var, not a const,
+// so tests can shrink it.
 var statProbeTimeout = 2 * time.Second
-
-// ownProbes joins the overlay package's own bounded mountpoint stats.
-var ownProbes StatProbes[bool]
-
-// MountedWithin reports Mounted(dir) bounded by the package's stat-probe
-// timeout; ok=false means the stat did not answer within the bound (a wedged
-// mirror) and the caller must fail toward its safe direction — selection
-// reads not-ready, sweeps are skipped, teardown verification reads
-// still-mounted.
-func MountedWithin(dir string) (mounted, ok bool) {
-	return ownProbes.Do(dir, statProbeTimeout, func() bool { return Mounted(dir) })
-}
 
 // MountAlive reports whether accountDir currently mirrors base. It compares a
 // stat of base itself (always exists) seen through the mountpoint.
@@ -111,14 +101,14 @@ func MountAlive(base, accountDir string) bool {
 var mountAliveFn = MountAlive
 
 // aliveProbes joins the package's own bounded mount-liveness probes. Its own
-// instance, keyed like ownProbes by the account dir but never shared with it:
-// a MountAlive verdict must never join (or be answered by) a plain Mounted
-// probe of the same dir.
+// StatProbes instance, keyed by the account dir but never shared with the deep
+// probes: a read-through MountAlive verdict must never join (or be answered by)
+// a deep-read probe of the same dir.
 var aliveProbes StatProbes[bool]
 
 // MountAliveWithin reports MountAlive(base, accountDir) bounded by the
 // package's stat-probe timeout. A probe that does not answer within the bound
-// reads NOT alive — unlike MountedWithin there is no ok return, because every
+// reads NOT alive — there is no ok return, because every
 // liveness caller fails the same direction: a mirror that cannot answer a 2s
 // stat is exactly the dead-or-wedged mount the check exists to flag, and
 // reading it as alive would let a wedged mirror pass for healthy.

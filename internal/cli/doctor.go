@@ -263,12 +263,14 @@ func reportStaleSessions(accts []store.Account, mounts []mountd.MountInfo, sessi
 // reportCarcasses flags dead mounts on fuse rows: the dir is a mountpoint but
 // ~/.claude is not visible through it — a carcass left by a holder that died.
 // The daemon's supervision remounts these within its tick; doctor seeing one
-// means that has not happened yet (or the daemon is down). Both seams are
-// bounded (overlay's stat-probe harness): on a wedged mirror an unanswered
-// mountpoint stat reads still-mounted and an unanswered aliveness stat reads
-// dead — a carcass-suspect that cannot answer a 2s stat is exactly what this
-// check exists to flag — so the row is reported within the bound instead of
-// parking doctor in the very uninterruptible sleep it is checking for.
+// means that has not happened yet (or the daemon is down). The mountpoint seam
+// (dirMounted) is now overlay.Mounted — a non-blocking cached Getfsstat read
+// that cannot park, with no still-mounted fold; only the aliveness seam
+// (mountAliveAt) is a bounded stat-probe whose unanswered read folds to
+// NOT-alive. A carcass-suspect that cannot answer a 2s aliveness stat is
+// exactly what this check exists to flag, so the row is reported within that
+// single bound instead of parking doctor in the very uninterruptible sleep it
+// is checking for.
 func reportCarcasses(accts []store.Account, report func(string, bool, string)) {
 	for _, a := range accts {
 		if overlay.Kind(a.OverlayKind) != overlay.KindFuse {

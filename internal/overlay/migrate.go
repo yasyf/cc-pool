@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
 // ResolvedConflictLogf surfaces every private-file collision that moveEntry
@@ -232,19 +231,4 @@ func HasPrivateEntries(dir string) (bool, error) {
 		}
 	}
 	return false, nil
-}
-
-// Mounted reports whether dir is currently a mountpoint (its device id differs
-// from its parent's). Symlink-provider operations consult it to refuse writing
-// symlinks "into" a live fuse mirror — those writes would pass through to the
-// real ~/.claude.
-func Mounted(dir string) bool {
-	var ds, ps syscall.Stat_t
-	if syscall.Lstat(dir, &ds) != nil {
-		return false
-	}
-	if syscall.Lstat(filepath.Dir(dir), &ps) != nil {
-		return false
-	}
-	return ds.Dev != ps.Dev
 }

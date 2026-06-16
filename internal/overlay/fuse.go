@@ -79,8 +79,9 @@ func mountProven() bool {
 // and its throwaway mount (HostProbe) is the process's first, so it waits the
 // full 14s: the failure path fits (14s wait + 3s drain = 17), but a mount
 // coming live near the 14s bound whose Teardown then wedges (3s unmountGrace
-// + 2s forceGrace + <=2s bounded MountedWithin) totals ~21s — an accepted
-// tail. That conjunction (a near-deadline first mount AND a wedged teardown
+// + 2s forceGrace; the post-unmount Mounted check is now a non-blocking
+// Getfsstat read, ~0) totals ~19s — still an accepted tail, now further under
+// the 20s deadline. That conjunction (a near-deadline first mount AND a wedged teardown
 // of the just-live probe mount) is vanishingly narrow, and the blown deadline
 // fails loud as one transient "mount holder probe failed" fuse-unavailable
 // verdict (pool.DetectOverlayKind), re-proven on the next probe.
@@ -273,10 +274,10 @@ func (p *FuseProvider) Teardown(base, accountDir string) error {
 	}
 	// Honest teardown: confirm the path is no longer a mountpoint. If the
 	// unmount wedged (e.g. fuse-t issue-45), report it so callers do NOT
-	// RemoveAll through a live mount into the backing ~/.claude. Bounded: the
-	// stat itself can wedge with the mirror a forced unmount failed to clear,
-	// and a probe that does not answer reads still-mounted — never torn down.
-	if m, ok := MountedWithin(accountDir); !ok || m {
+	// RemoveAll through a live mount into the backing ~/.claude. Mounted is a
+	// non-blocking Getfsstat read of the kernel mount table, so this check
+	// cannot itself wedge on the mirror a forced unmount failed to clear.
+	if Mounted(accountDir) {
 		return fmt.Errorf("%w: %s; refusing to treat it as torn down", ErrUnmountWedged, accountDir)
 	}
 	return nil

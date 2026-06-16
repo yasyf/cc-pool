@@ -38,17 +38,13 @@ const preflightTimeout = 8 * time.Second
 // version-skewed holder to release the socket after being told to step down.
 const defaultEvictTimeout = 5 * time.Second
 
-// overlayMounted is a test seam over the bounded kernel mountpoint check;
-// production never overrides it. The stat itself goes through a possibly
-// wedged fuse-t mirror (no soft/timeout mount options), so it is bounded,
-// and a probe that does not answer reads MOUNTED — the caution direction at
-// every call site: mountReady's non-fuse arm reads not-ready, sweepAndMount
-// skips the sweep, mountFuse's pre-clear and reconcile's stale-clear route
-// into the provider's bounded teardown instead of stat-ing further.
-var overlayMounted = func(dir string) bool {
-	mounted, ok := overlay.MountedWithin(dir)
-	return mounted || !ok
-}
+// overlayMounted is a test seam over the kernel mountpoint check; production
+// never overrides it. overlay.Mounted reads the kernel mount table via
+// Getfsstat (non-blocking, cannot wedge on a dead fuse-t mirror), so there is
+// no fail-direction to fold — it answers membership directly. Every call site
+// (mountReady's non-fuse arm, sweepAndMount, mountFuse's pre-clear, reconcile's
+// stale-clear) consumes that plain bool.
+var overlayMounted = overlay.Mounted
 
 // Server is the running daemon.
 type Server struct {

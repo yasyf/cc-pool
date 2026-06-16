@@ -107,6 +107,15 @@ func TestFuseConvertRoundTrip(t *testing.T) {
 		}
 	}
 
+	// The mirror is live, so Mounted must see dir as a mountpoint. The kernel
+	// records this $TMPDIR mount under its firmlinked f_mntonname
+	// (/private/var/...), which dir's raw /var/... spelling would miss — this
+	// proves mountCandidates' parent-resolved second spelling against a REAL
+	// kernel mount table.
+	if !overlay.Mounted(dir) {
+		t.Fatal("dir not seen as mounted while fuse mirror is live")
+	}
+
 	// Reverse — the rollout's rollback command.
 	back, err := m.ConvertOverlay(fused, overlay.KindSymlink)
 	if err != nil {

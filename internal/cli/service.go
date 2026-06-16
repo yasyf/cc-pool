@@ -26,13 +26,13 @@ import (
 // real implementation in production and a fake in tests.
 var (
 	scanSessions = procscan.Scan
-	// dirMounted and mountAliveAt are bounded kernel-truth probes (overlay's
-	// 2s stat-probe harness): against a partially wedged mirror the raw
-	// Mounted/MountAlive stats park in uninterruptible sleep, which would
-	// hang doctor's carcass check and the uninstall sweeps forever. Their
-	// timeout fail directions differ — see mountedBounded and
-	// overlay.MountAliveWithin.
-	dirMounted   = mountedBounded
+	// dirMounted is a non-blocking Getfsstat read of the kernel mount table
+	// (overlay.Mounted): it answers membership without touching the mirror, so
+	// it can never hang doctor's carcass check or the uninstall sweeps on a
+	// partially wedged mount. mountAliveAt stays the bounded liveness probe
+	// (overlay's 2s stat-probe harness): it reads base THROUGH the mount, where
+	// a parked mirror is read as dead and flagged.
+	dirMounted   = overlay.Mounted
 	mountAliveAt = overlay.MountAliveWithin
 	// deepProbeAt is doctor's bounded wedge probe (a 2 MiB read with a 5s
 	// bound) — like the stat seams above, it can never hang doctor on a
@@ -49,17 +49,6 @@ var (
 	// the daemon's defaultHolderGoneWait.
 	holderGoneWait = 70 * time.Second
 )
-
-// mountedBounded is dirMounted's production body: overlay.MountedWithin with
-// an unanswered probe read as still-mounted, the safe direction at every call
-// site. Doctor's carcass check moves on to the bounded aliveness probe (which
-// reads a parked mirror as dead and flags it), and the uninstall/purge sweeps
-// refuse to treat a dir that cannot answer a stat as unmounted — RemoveAll
-// through a still-live mirror would delete inside ~/.claude.
-func mountedBounded(dir string) bool {
-	mounted, ok := overlay.MountedWithin(dir)
-	return !ok || mounted
-}
 
 func newServiceCmd() *cobra.Command {
 	cmd := &cobra.Command{

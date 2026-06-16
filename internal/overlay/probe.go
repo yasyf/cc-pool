@@ -57,7 +57,7 @@ var (
 var deepProbeTimeout = 5 * time.Second
 
 // deepProbes joins concurrent deep probes per dir. Deliberately its OWN
-// StatProbes instance, never shared with the shallow stat probes (ownProbes
+// StatProbes instance, never shared with the shallow stat probes (aliveProbes
 // here, liveProbes in mountd): a parked 2 MiB read against a wedged mirror
 // must never block a shallow liveness stat behind its join.
 var deepProbes StatProbes[error]

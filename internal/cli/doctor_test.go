@@ -154,14 +154,16 @@ func TestReportCarcasses(t *testing.T) {
 
 // TestReportCarcassesBoundedOnParkedProbe pins doctor's behavior on the exact
 // failure the carcass check exists for: a wedged mirror whose kernel stats
-// park in uninterruptible sleep. The seams run a real overlay.StatProbes
-// harness — the same machinery the production seam targets
-// (overlay.MountedWithin / overlay.MountAliveWithin) are built on — with the
-// timeout shrunk and both stat bodies for one row parked on a channel.
+// park in uninterruptible sleep. The mountpoint arm (dirMounted) is now the
+// non-blocking overlay.Mounted — a cached Getfsstat read that cannot park — so
+// the only wedge-prone seam left is the aliveness arm (mountAliveAt). The bound
+// therefore comes solely from MountAliveWithin/aliveProbes; the harness runs
+// that real machinery (overlay.StatProbes, what the production seam is built
+// on) with the timeout shrunk and the parked row's aliveness stat stuck on a
+// channel, while dirMounted answers mounted instantly for both rows.
 // reportCarcasses must still return within the bound and flag the parked row
-// (the production folds: an unanswered mountpoint stat reads still-mounted,
-// an unanswered aliveness stat reads NOT alive), while the healthy fast row
-// stays silent.
+// (an unanswered aliveness stat reads NOT alive, and a mountpoint that is not
+// alive is a carcass), while the healthy fast row stays silent.
 func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 	const parkedDir, healthyDir = "/p/acct-01", "/p/acct-02"
 	accts := []store.Account{
@@ -169,18 +171,12 @@ func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 		{ID: 2, ConfigDir: healthyDir, OverlayKind: string(overlay.KindFuse)},
 	}
 	const probeTimeout = 20 * time.Millisecond
-	var mountedProbes, aliveProbes overlay.StatProbes[bool]
+	var aliveProbes overlay.StatProbes[bool]
 	release := make(chan struct{})
-	swapVar(t, &dirMounted, func(dir string) bool {
-		mounted, ok := mountedProbes.Do(dir, probeTimeout, func() bool {
-			if dir == parkedDir {
-				<-release
-			}
-			return true
-		})
-		// mountedBounded's fold: an unanswered stat reads still-mounted.
-		return !ok || mounted
-	})
+	// The mountpoint arm is the non-blocking overlay.Mounted: it reads the
+	// kernel mount table and cannot park, so both rows are seen mounted
+	// instantly. Only the aliveness arm reads base THROUGH the mount and wedges.
+	swapVar(t, &dirMounted, func(string) bool { return true })
 	swapVar(t, &mountAliveAt, func(_, dir string) bool {
 		alive, ok := aliveProbes.Do(dir, probeTimeout, func() bool {
 			if dir == parkedDir {
@@ -191,14 +187,14 @@ func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 		// overlay.MountAliveWithin's fold: an unanswered stat reads NOT alive.
 		return ok && alive
 	})
-	// Unpark and drain the probe bodies before the seam restores run
+	// Unpark and drain the probe body before the seam restores run
 	// (cleanups run LIFO).
 	t.Cleanup(func() {
 		close(release)
 		deadline := time.Now().Add(5 * time.Second)
-		for mountedProbes.Inflight()+aliveProbes.Inflight() != 0 {
+		for aliveProbes.Inflight() != 0 {
 			if time.Now().After(deadline) {
-				t.Error("parked probe bodies never drained")
+				t.Error("parked probe body never drained")
 				return
 			}
 			time.Sleep(time.Millisecond)
@@ -211,10 +207,10 @@ func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 	elapsed := time.Since(start)
 
 	// Beating the 2s production statProbeTimeout proves the verdict is
-	// bounded, with a wide margin over the two 20ms fake timeouts to keep the
+	// bounded, with a wide margin over the single 20ms fake timeout to keep the
 	// assertion unflaky.
 	if elapsed >= 2*time.Second {
-		t.Fatalf("reportCarcasses took %v against parked probes, want a bounded verdict", elapsed)
+		t.Fatalf("reportCarcasses took %v against a parked aliveness probe, want a bounded verdict", elapsed)
 	}
 	if len(*calls) != 1 {
 		t.Fatalf("got %d reports %+v, want exactly the parked carcass", len(*calls), *calls)
