@@ -10,8 +10,8 @@
 # release.yml's bump-formula job rewrites the version line and the `# app`
 # sha256 on every tagged release — keep the marker, never hand-edit them.
 cask "cc-pool-status" do
-  version "0.26.2"
-  sha256 "13f62a4a4157d4d290b6e4f574df20da646f62bf92813f670f3cc6c82984b24f" # app
+  version "0.27.0"
+  sha256 "94eab65a4016d9a138a748267588e587176dc8864c1e69248dcd9d43363a4f48" # app
 
   url "https://github.com/yasyf/cc-pool/releases/download/v#{version}/cc-pool-status-v#{version}-darwin.zip"
   name "cc-pool Status"
