@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -843,4 +844,104 @@ func mustReadFile(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// readdirEntries runs Readdir at path and returns the names it fills, asserting
+// every entry carries a nil stat — the mirror's contract: on fuse-t's FUSE2
+// backend a filler stat never reaches the readdir reply, so nil is both cheap
+// and correct, and the path-based Getattr stays authoritative for /.claude.json.
+func readdirEntries(t *testing.T, fs *mirrorFS, path string) []string {
+	t.Helper()
+	var names []string
+	st := fs.Readdir(path, func(name string, stat *fuse.Stat_t, ofst int64) bool {
+		if stat != nil {
+			t.Errorf("Readdir(%q) filled %q with a non-nil stat; entries must be nil-stat", path, name)
+		}
+		names = append(names, name)
+		return true
+	}, 0, ^uint64(0))
+	if st != 0 {
+		t.Fatalf("Readdir(%q) = %d, want 0", path, st)
+	}
+	return names
+}
+
+// mirrorTree builds a mirrorFS over a fresh home-shaped temp tree (base =
+// home/.claude, private backing = home/acct.private, base sibling =
+// home/.claude.json) and returns it with the base and private paths.
+func mirrorTree(t *testing.T) (fs *mirrorFS, base, priv string) {
+	t.Helper()
+	home := t.TempDir()
+	base = filepath.Join(home, ".claude")
+	priv = filepath.Join(home, "acct.private")
+	for _, d := range []string{base, priv} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return newMirrorFS(base, priv, filepath.Join(home, ".claude.json")), base, priv
+}
+
+func mustTouch(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustMkdir(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMirrorReaddirRootMergesPrivateEntries pins the root listing contract:
+// base entries appear, privateRoot's PrivateEntry names are merged in, a name
+// present in both is listed once (the `seen` dedup), a non-private privateRoot
+// stray is never listed, and the virtual .ccp-probe is shadowed by name.
+func TestMirrorReaddirRootMergesPrivateEntries(t *testing.T) {
+	fs, base, priv := mirrorTree(t)
+	// base (mirrored root)
+	mustTouch(t, filepath.Join(base, "settings.json"))
+	mustMkdir(t, filepath.Join(base, "projects"))
+	mustMkdir(t, filepath.Join(base, "daemon"))      // also in priv → dedup
+	mustTouch(t, filepath.Join(base, ProbeFileName)) // shadowed virtual probe → never listed
+	// private backing
+	mustTouch(t, filepath.Join(priv, ".claude.json")) // PrivateEntry → merged in
+	mustMkdir(t, filepath.Join(priv, "daemon"))       // collides with base → one entry
+	mustTouch(t, filepath.Join(priv, "stray.txt"))    // not a PrivateEntry → excluded
+
+	got := readdirEntries(t, fs, "/")
+
+	for _, w := range []string{".", "..", "settings.json", "projects", "daemon", ".claude.json"} {
+		if !slices.Contains(got, w) {
+			t.Errorf("Readdir(/) missing %q; got %v", w, got)
+		}
+	}
+	for _, w := range []string{ProbeFileName, "stray.txt"} {
+		if slices.Contains(got, w) {
+			t.Errorf("Readdir(/) should not list %q; got %v", w, got)
+		}
+	}
+	if n := slices.Index(got, "daemon"); n < 0 || slices.Contains(got[n+1:], "daemon") {
+		t.Errorf("daemon must be listed exactly once (seen-dedup); got %v", got)
+	}
+}
+
+// TestMirrorReaddirSubdirOmitsPrivateMerge pins the path=="/" guard: the
+// privateRoot merge happens only at the root, never inside a subdirectory.
+func TestMirrorReaddirSubdirOmitsPrivateMerge(t *testing.T) {
+	fs, base, priv := mirrorTree(t)
+	mustMkdir(t, filepath.Join(base, "projects"))
+	mustTouch(t, filepath.Join(base, "projects", "p.json"))
+	mustTouch(t, filepath.Join(priv, ".claude.json")) // must not leak into a subdir listing
+
+	got := readdirEntries(t, fs, "/projects")
+	if !slices.Contains(got, "p.json") {
+		t.Errorf("Readdir(/projects) missing p.json; got %v", got)
+	}
+	if slices.Contains(got, ".claude.json") {
+		t.Errorf("Readdir(/projects) leaked private .claude.json; got %v", got)
+	}
 }
