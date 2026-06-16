@@ -153,9 +153,66 @@ func TestUsageSampleExtraUsageRoundTrip(t *testing.T) {
 	if !got.ExtraEnabled || got.ExtraUsed != 177 || got.ExtraLimit != 5000 {
 		t.Fatalf("extra usage did not round-trip: %+v", got)
 	}
-	recent, err := s.RecentUsageSamples(1, 1)
+	recent, err := s.UsageSamplesSince(1, time.Time{})
 	if err != nil || len(recent) != 1 || !recent[0].ExtraEnabled {
 		t.Fatalf("recent samples missing extra usage: %+v err=%v", recent, err)
+	}
+}
+
+func TestUsageSamplesSince(t *testing.T) {
+	s := openTest(t)
+	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s2", KeychainAccount: "u2"})
+	now := time.Now().Truncate(time.Second)
+	// acct 1: three samples spanning 90 minutes plus one older than the cutoff.
+	for _, sp := range []struct {
+		age  time.Duration
+		util float64
+	}{{0, 30}, {30 * time.Minute, 20}, {60 * time.Minute, 10}, {120 * time.Minute, 5}} {
+		if err := s.InsertUsageSample(UsageSample{AccountID: 1, TS: now.Add(-sp.age), Util5h: sp.util}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// acct 2 inside the window must never leak into acct 1's result.
+	if err := s.InsertUsageSample(UsageSample{AccountID: 2, TS: now, Util5h: 99}); err != nil {
+		t.Fatal(err)
+	}
+
+	since := now.Add(-90 * time.Minute) // cutoff sits exactly on the 60-min sample? no — on nothing; boundary tested below
+	got, err := s.UsageSamplesSince(1, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The 120-min-old sample is older than the cutoff; the acct-2 row is excluded.
+	if len(got) != 3 {
+		t.Fatalf("got %d samples, want 3: %+v", len(got), got)
+	}
+	// Newest first.
+	if got[0].Util5h != 30 || got[1].Util5h != 20 || got[2].Util5h != 10 {
+		t.Fatalf("ordering wrong: %+v", got)
+	}
+	for _, g := range got {
+		if g.AccountID != 1 {
+			t.Fatalf("other-account row leaked: %+v", g)
+		}
+	}
+
+	// Inclusive boundary: a cutoff landing exactly on a sample's ts includes it.
+	exact := now.Add(-60 * time.Minute)
+	got2, err := s.UsageSamplesSince(1, exact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got2) != 3 || got2[2].Util5h != 10 {
+		t.Fatalf("inclusive boundary dropped the on-cutoff sample: %+v", got2)
+	}
+	// One second later excludes it.
+	got3, err := s.UsageSamplesSince(1, exact.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got3) != 2 {
+		t.Fatalf("strict-after cutoff want 2, got %d: %+v", len(got3), got3)
 	}
 }
 

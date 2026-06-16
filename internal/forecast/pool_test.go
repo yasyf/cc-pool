@@ -17,62 +17,116 @@ func TestPoolOf(t *testing.T) {
 		"never sampled pool": {
 			[]PoolAccount{{}, {}}, Pool{}, false,
 		},
-		"all rate-limited is panic with zero remaining": {
+		"all rate-limited is panic with zero everything": {
 			[]PoolAccount{
 				{HasUsage: true, RateLimited: true, Remaining5h: 100},
 				{HasUsage: true, RateLimited: true, Remaining5h: 100},
 			},
 			Pool{Mood: MoodPanic}, true,
 		},
-		"rate-limited account excluded from mean and burn": {
-			// The RL account's fabricated remaining 100 and wild burn must
-			// not leak into the rollup.
+		"pace arithmetic over two usable accounts": {
+			// burn sums to 20 over usable regen 20×2=40 → Pace5h 0.5; burn7
+			// sums to 0.8 over 7d regen → Pace7d. No resets: dry = 140/20 = 7h.
 			[]PoolAccount{
-				{HasUsage: true, Remaining5h: 80, Remaining7d: 60, BurnPerHour: 10},
-				{HasUsage: true, RateLimited: true, Remaining5h: 100, BurnPerHour: 50},
+				{HasUsage: true, Remaining5h: 80, Remaining7d: 60, Burn5hPerHour: 10, Burn7dPerHour: 0.3},
+				{HasUsage: true, Remaining5h: 60, Remaining7d: 40, Burn5hPerHour: 10, Burn7dPerHour: 0.5},
 			},
-			Pool{Remaining5h: 80, Remaining7d: 60, BurnPerHour: 10, NetBurnPerHour: 10,
+			Pool{Remaining5h: 70, Remaining7d: 50, BurnPerHour: 20,
+				Pace5h: 0.5, Pace7d: 0.8 / (regen7dPerHour * 2), NetBurnPerHour: 10,
+				DryAt: now.Add(7 * time.Hour), Mood: MoodEasy}, true,
+		},
+		"exhausted account stays in the pace denominator": {
+			// The zero-burn (exhausted) account counts as usable, so Pace5h is
+			// 20/(20×2)=0.5 — not 1.0 as it would be if only the burner counted.
+			[]PoolAccount{
+				{HasUsage: true, Remaining5h: 60, Remaining7d: 50, Burn5hPerHour: 20, Burn7dPerHour: 1.0},
+				{HasUsage: true, Remaining5h: 0, Remaining7d: 10, Burn5hPerHour: 0, Burn7dPerHour: 0},
+			},
+			Pool{Remaining5h: 30, Remaining7d: 30, BurnPerHour: 20,
+				Pace5h: 0.5, Pace7d: 1.0 / (regen7dPerHour * 2), NetBurnPerHour: 10,
+				DryAt: now.Add(3 * time.Hour), Mood: MoodWorried}, true,
+		},
+		"rate-limited account excluded from mean and both paces": {
+			// The RL account's fabricated remaining 100 and wild burns must not
+			// leak into the rollup or the denominator: usable is 1.
+			[]PoolAccount{
+				{HasUsage: true, Remaining5h: 80, Remaining7d: 60, Burn5hPerHour: 10, Burn7dPerHour: 0.5},
+				{HasUsage: true, RateLimited: true, Remaining5h: 100, Burn5hPerHour: 50, Burn7dPerHour: 5},
+			},
+			Pool{Remaining5h: 80, Remaining7d: 60, BurnPerHour: 10,
+				Pace5h: 0.5, Pace7d: 0.5 / regen7dPerHour, NetBurnPerHour: 10,
 				DryAt: now.Add(8 * time.Hour), Mood: MoodEasy}, true,
 		},
-		"stale accounts count toward remaining with zero burn": {
-			[]PoolAccount{
-				{HasUsage: true, Remaining5h: 50, Remaining7d: 40},
-				{HasUsage: true, Remaining5h: 30, Remaining7d: 20},
-			},
-			Pool{Remaining5h: 40, Remaining7d: 30, Mood: MoodEasy}, true,
+		"relief no longer suppresses a later wall": {
+			// HEADLINE: remaining 30, burn 40, reset at +30m. The window
+			// refills to 100 at +30m crediting only the 20 it used, then drains
+			// 40%/h to dry at +3h — the old naive code suppressed this to zero.
+			[]PoolAccount{{HasUsage: true, Remaining5h: 30, Remaining7d: 30, Burn5hPerHour: 40,
+				Resets5h: now.Add(30 * time.Minute)}},
+			Pool{Remaining5h: 30, Remaining7d: 30, BurnPerHour: 40,
+				Pace5h: 2.0, NetBurnPerHour: -50,
+				DryAt: now.Add(3 * time.Hour), Mood: MoodWorried}, true,
 		},
-		"dry-out projected from combined capacity and burn": {
-			// 50 points at 25%/hr = 2h; remaining 50 is easy, bumped to
-			// uneasy by the projected dry-out.
-			[]PoolAccount{{HasUsage: true, Remaining5h: 50, BurnPerHour: 25}},
-			Pool{Remaining5h: 50, BurnPerHour: 25, NetBurnPerHour: 25,
-				DryAt: now.Add(2 * time.Hour), Mood: MoodUneasy}, true,
-		},
-		"reset relief before dry-out suppresses it and the bump": {
-			// The reset at exactly now+1h is inside the net-burn horizon
-			// (inclusive end): the window ends the hour refilled at 100, so
-			// net = 50−100 = −50 even as the gross burn stays 25.
-			[]PoolAccount{{HasUsage: true, Remaining5h: 50, BurnPerHour: 25,
+		"sustainable pace with chained resets never dries": {
+			// Pace exactly 1.0 (burn 20 = regen 20): the known reset plus the
+			// 5h chain refill exactly what the window drains, so the simulation
+			// never reaches 0 inside the 24h horizon.
+			[]PoolAccount{{HasUsage: true, Remaining5h: 50, Remaining7d: 50, Burn5hPerHour: 20,
 				Resets5h: now.Add(time.Hour)}},
-			Pool{Remaining5h: 50, BurnPerHour: 25, NetBurnPerHour: -50,
-				Mood: MoodEasy}, true,
+			Pool{Remaining5h: 50, Remaining7d: 50, BurnPerHour: 20,
+				Pace5h: 1.0, NetBurnPerHour: -50, Mood: MoodEasy}, true,
 		},
-		"past reset does not suppress dry-out": {
-			[]PoolAccount{{HasUsage: true, Remaining5h: 50, BurnPerHour: 25,
+		"refill credits only what the window used": {
+			// remaining 90, burn 60, reset at +10m. Used only 10 by the reset,
+			// so the refill credits 100−80=20 (window was near full) → total
+			// back to 100, dry at +1h50m. A flat +100 model would over-credit
+			// and push the wall out to +3h10m.
+			[]PoolAccount{{HasUsage: true, Remaining5h: 90, Remaining7d: 90, Burn5hPerHour: 60,
+				Resets5h: now.Add(10 * time.Minute)}},
+			Pool{Remaining5h: 90, Remaining7d: 90, BurnPerHour: 60,
+				Pace5h: 3.0, NetBurnPerHour: 40,
+				DryAt: now.Add(110 * time.Minute), Mood: MoodEasy}, true,
+		},
+		"dry exactly at reset lets the refill win": {
+			// remaining 20, burn 20 → naive dry would land exactly at the +1h
+			// reset; the strict-before tie-break hands it to the refill, so the
+			// window survives and never dries.
+			[]PoolAccount{{HasUsage: true, Remaining5h: 20, Remaining7d: 20, Burn5hPerHour: 20,
+				Resets5h: now.Add(time.Hour)}},
+			Pool{Remaining5h: 20, Remaining7d: 20, BurnPerHour: 20,
+				Pace5h: 1.0, NetBurnPerHour: -80, Mood: MoodWorried}, true,
+		},
+		"past reset neither suppresses nor credits": {
+			// remaining 50, burn 25, reset 1h ago: no relief scheduled, so the
+			// pool dries in 2h — the past reset adds nothing either way.
+			[]PoolAccount{{HasUsage: true, Remaining5h: 50, Remaining7d: 50, Burn5hPerHour: 25,
 				Resets5h: now.Add(-time.Hour)}},
-			Pool{Remaining5h: 50, BurnPerHour: 25, NetBurnPerHour: 25,
+			Pool{Remaining5h: 50, Remaining7d: 50, BurnPerHour: 25,
+				Pace5h: 1.25, NetBurnPerHour: 25,
 				DryAt: now.Add(2 * time.Hour), Mood: MoodUneasy}, true,
 		},
-		"earliest future reset across accounts is the relief": {
-			// Combined: 90 points at 30%/hr = 3h dry; the 2h reset lands first.
-			// Both resets are beyond the net-burn horizon, so net is the plain
-			// mean of burns: (20+10)/2 = 15.
-			[]PoolAccount{
-				{HasUsage: true, Remaining5h: 40, BurnPerHour: 20, Resets5h: now.Add(2 * time.Hour)},
-				{HasUsage: true, Remaining5h: 50, BurnPerHour: 10, Resets5h: now.Add(4 * time.Hour)},
-			},
-			Pool{Remaining5h: 45, BurnPerHour: 30, NetBurnPerHour: 15,
-				Mood: MoodEasy}, true,
+		"wall beyond the horizon has no clock": {
+			// remaining 100, burn 4, no reset → dry at +25h, past the 24h
+			// horizon: DryAt is zero and pace 0.2 carries the (sustainable) story.
+			[]PoolAccount{{HasUsage: true, Remaining5h: 100, Remaining7d: 100, Burn5hPerHour: 4}},
+			Pool{Remaining5h: 100, Remaining7d: 100, BurnPerHour: 4,
+				Pace5h: 0.2, NetBurnPerHour: 4, Mood: MoodChill}, true,
+		},
+		"wall beyond the horizon with a far reset still has no clock": {
+			// remaining 100, burn 4 → dry at +25h, past the 24h horizon. A reset
+			// 30h out is itself beyond the horizon, so it schedules no relief and
+			// must not leak a clock for a wall the horizon already disowns.
+			[]PoolAccount{{HasUsage: true, Remaining5h: 100, Remaining7d: 100, Burn5hPerHour: 4,
+				Resets5h: now.Add(30 * time.Hour)}},
+			Pool{Remaining5h: 100, Remaining7d: 100, BurnPerHour: 4,
+				Pace5h: 0.2, NetBurnPerHour: 4, Mood: MoodChill}, true,
+		},
+		"drained but unexhausted dries now": {
+			// remaining 0 with a live burn and no reset: the wall is already
+			// here, DryAt = now.
+			[]PoolAccount{{HasUsage: true, Remaining5h: 0, Remaining7d: 20, Burn5hPerHour: 10}},
+			Pool{Remaining5h: 0, Remaining7d: 20, BurnPerHour: 10,
+				Pace5h: 0.5, NetBurnPerHour: 0, DryAt: now, Mood: MoodPanic}, true,
 		},
 		"remaining clamped before aggregation": {
 			[]PoolAccount{
@@ -80,59 +134,6 @@ func TestPoolOf(t *testing.T) {
 				{HasUsage: true, Remaining5h: 100, Remaining7d: 100},
 			},
 			Pool{Remaining5h: 50, Remaining7d: 100, Mood: MoodEasy}, true,
-		},
-		"net burn is the mean of burns with no resets": {
-			// 120 points at 30%/hr = dry in 4h; Burn sums to 30 while net is
-			// the mean (10+20)/2 = 15, matching how Remaining5h (mean 60) moves.
-			[]PoolAccount{
-				{HasUsage: true, Remaining5h: 80, BurnPerHour: 10},
-				{HasUsage: true, Remaining5h: 40, BurnPerHour: 20},
-			},
-			Pool{Remaining5h: 60, BurnPerHour: 30, NetBurnPerHour: 15,
-				DryAt: now.Add(4 * time.Hour), Mood: MoodEasy}, true,
-		},
-		"reset inside the horizon credits the refill": {
-			// acct-1 drains 90→10, dropping 80. acct-2 resets at +30m: it
-			// refills to 100, then drains 40%/hr for the remaining 30m to end
-			// at 80 — a −60 drop. Net = (80−60)/2 = 10 while Burn stays 120.
-			// The +30m reset also lands before the 55m dry-out, suppressing it.
-			[]PoolAccount{
-				{HasUsage: true, Remaining5h: 90, BurnPerHour: 80},
-				{HasUsage: true, Remaining5h: 20, BurnPerHour: 40, Resets5h: now.Add(30 * time.Minute)},
-			},
-			Pool{Remaining5h: 55, BurnPerHour: 120, NetBurnPerHour: 10,
-				Mood: MoodEasy}, true,
-		},
-		"refill-dominant pool recovers with negative net": {
-			// A nearly-drained slow burner resets at +15m: refilled to 100,
-			// it drains 2%/hr for the remaining 45m to end at 98.5. Net =
-			// 5−98.5 = −93.5 — refills outpace burn.
-			[]PoolAccount{{HasUsage: true, Remaining5h: 5, BurnPerHour: 2,
-				Resets5h: now.Add(15 * time.Minute)}},
-			Pool{Remaining5h: 5, BurnPerHour: 2, NetBurnPerHour: -93.5,
-				Mood: MoodAlarmed}, true,
-		},
-		"reset beyond the horizon is ignored by net burn": {
-			// The +90m reset still suppresses the 5h dry-out, but lands
-			// outside the net-burn hour: net is the plain burn 10.
-			[]PoolAccount{{HasUsage: true, Remaining5h: 50, BurnPerHour: 10,
-				Resets5h: now.Add(90 * time.Minute)}},
-			Pool{Remaining5h: 50, BurnPerHour: 10, NetBurnPerHour: 10,
-				Mood: MoodEasy}, true,
-		},
-		"net burn clamps depletion at zero remaining": {
-			// 20 points at 50%/hr is gone in 24m; the account cannot drop
-			// below 0, so net is 20, not 50.
-			[]PoolAccount{{HasUsage: true, Remaining5h: 20, BurnPerHour: 50}},
-			Pool{Remaining5h: 20, BurnPerHour: 50, NetBurnPerHour: 20,
-				DryAt: now.Add(24 * time.Minute), Mood: MoodAlarmed}, true,
-		},
-		"exhausted account resetting soon is a full recovery term": {
-			// Estimates are gated for exhausted accounts (burn 0), but the
-			// +20m reset refills 0→100 inside the hour: net = −100.
-			[]PoolAccount{{HasUsage: true, Remaining5h: 0, BurnPerHour: 0,
-				Resets5h: now.Add(20 * time.Minute)}},
-			Pool{NetBurnPerHour: -100, Mood: MoodAlarmed}, true,
 		},
 	}
 	for name, tc := range cases {
@@ -149,6 +150,12 @@ func TestPoolOf(t *testing.T) {
 			}
 			if math.Abs(got.BurnPerHour-tc.want.BurnPerHour) > 1e-9 {
 				t.Errorf("BurnPerHour = %v, want %v", got.BurnPerHour, tc.want.BurnPerHour)
+			}
+			if math.Abs(got.Pace5h-tc.want.Pace5h) > 1e-9 {
+				t.Errorf("Pace5h = %v, want %v", got.Pace5h, tc.want.Pace5h)
+			}
+			if math.Abs(got.Pace7d-tc.want.Pace7d) > 1e-9 {
+				t.Errorf("Pace7d = %v, want %v", got.Pace7d, tc.want.Pace7d)
 			}
 			if math.Abs(got.NetBurnPerHour-tc.want.NetBurnPerHour) > 1e-9 {
 				t.Errorf("NetBurnPerHour = %v, want %v", got.NetBurnPerHour, tc.want.NetBurnPerHour)

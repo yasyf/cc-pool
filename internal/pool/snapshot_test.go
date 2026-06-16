@@ -23,6 +23,64 @@ func seedClimb(t *testing.T, st *store.Store, accountID int, base time.Time, uti
 	}
 }
 
+// seed7dClimb inserts a steady 7d-window climb (2%/2h, dropping back in time)
+// spanning 6h and ending at util at base. The 5h field tracks too so the rows
+// are realistic, but only Util7d matters here.
+func seed7dClimb(t *testing.T, st *store.Store, accountID int, base time.Time, util float64) {
+	t.Helper()
+	for i := 0; i < 4; i++ {
+		if err := st.InsertUsageSample(store.UsageSample{
+			AccountID: accountID,
+			TS:        base.Add(-time.Duration(i) * 2 * time.Hour),
+			Util5h:    util - float64(i)*2,
+			Util7d:    util - float64(i)*2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestSnapshotBurn7d pins the standalone gated 7d drain on Snapshot: a fresh
+// 6h climb yields the secant burn, while a stale latest sample gates it to 0.
+func TestSnapshotBurn7d(t *testing.T) {
+	cases := map[string]struct {
+		sampleAge time.Duration
+		wantBurn  float64
+	}{
+		"fresh 6h climb yields the 7d burn":      {0, 1}, // 6% over 6h = 1%/hr
+		"stale latest gates the 7d burn to zero": {6 * time.Minute, 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { st.Close() })
+			if err := st.UpsertAccount(store.Account{
+				ID: 1, ConfigDir: t.TempDir(),
+				KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			base := time.Now().Truncate(time.Second).Add(-tc.sampleAge)
+			seed7dClimb(t, st, 1, base, 6)
+
+			m := &Manager{Store: st, LockDir: t.TempDir()}
+			snaps, err := m.Snapshots(t.Context(), false, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snaps) != 1 {
+				t.Fatalf("snapshots = %d, want 1", len(snaps))
+			}
+			if got := snaps[0].Burn7dPerHour; got != tc.wantBurn {
+				t.Errorf("Burn7dPerHour = %v, want %v", got, tc.wantBurn)
+			}
+		})
+	}
+}
+
 // TestSnapshotsForecast pins the gated/ungated burn split: the scoring burn
 // stays live on a stale sample (reservation re-ranks need it), while the
 // display forecast zeroes out past DisplayStaleAfter. Reverting either half

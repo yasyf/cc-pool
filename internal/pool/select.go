@@ -192,7 +192,7 @@ func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessio
 // empty when the account was never sampled.
 func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now time.Time) (score.Input, []store.UsageSample, error) {
 	in := score.Input{AccountID: a.ID}
-	samples, err := m.Store.RecentUsageSamples(a.ID, forecast.BurnSampleLimit)
+	samples, err := m.Store.UsageSamplesSince(a.ID, now.Add(-forecast.Burn7dWindow))
 	if err != nil {
 		return in, nil, err
 	}

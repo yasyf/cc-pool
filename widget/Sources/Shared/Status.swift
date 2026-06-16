@@ -38,7 +38,20 @@ extension PoolStatus {
     /// daemon-side history, so the fallback simply omits them. nil means no
     /// account has ever been sampled.
     var outlook: PoolOutlook? {
-        if let pool { return pool }
+        if let pool {
+            // A daemon that ships the pool block but predates pace: re-derive
+            // pace5h locally from gross burn and the usable count, mirroring
+            // forecast.PoolOf (pace5h = grossBurn / (20 × usable)). PoolOutlook
+            // itself lacks the count, so it must be filled here.
+            guard pool.pace5hRaw == nil else { return pool }
+            let usableCount = accounts.filter { $0.hasUsage && !$0.rateLimited }.count
+            let pace5h = usableCount == 0 ? 0 : pool.burn5hPerHour / (20 * Double(usableCount))
+            return PoolOutlook(remaining5hPct: pool.remaining5hPct,
+                               remaining7dPct: pool.remaining7dPct,
+                               burnRaw: pool.burnRaw, netBurnRaw: pool.netBurnRaw,
+                               pace5hRaw: pace5h, pace7dRaw: 0,
+                               dryAtRaw: pool.dryAtRaw, moodRaw: pool.moodRaw)
+        }
         let sampled = accounts.filter(\.hasUsage)
         if sampled.isEmpty { return nil }
         let usable = sampled.filter { !$0.rateLimited }
@@ -47,8 +60,8 @@ extension PoolStatus {
         let mood: Mood = usable.isEmpty
             ? .panic : Mood(remaining5h: mean5, dryProjected: false)
         return PoolOutlook(remaining5hPct: mean5, remaining7dPct: mean7,
-                           burnRaw: nil, netBurnRaw: nil, dryAtRaw: nil,
-                           moodRaw: mood.rawValue)
+                           burnRaw: nil, netBurnRaw: nil, pace5hRaw: nil, pace7dRaw: nil,
+                           dryAtRaw: nil, moodRaw: mood.rawValue)
     }
 }
 
@@ -61,6 +74,8 @@ struct PoolOutlook: Decodable {
     // restrictive property's access, and the fixtures below must call it.
     fileprivate let burnRaw: Double? // omitempty
     fileprivate let netBurnRaw: Double? // omitempty
+    fileprivate let pace5hRaw: Double? // pace_5h; nil only from pre-pace daemons
+    fileprivate let pace7dRaw: Double? // pace_7d; nil only from pre-pace daemons
     fileprivate let dryAtRaw: Date? // omitzero
     fileprivate let moodRaw: String?
 
@@ -68,6 +83,11 @@ struct PoolOutlook: Decodable {
     /// Mean drain net of upcoming 5h refills, pp/h. nil from daemons that
     /// predate the field — callers fall back to the gross burn.
     var netBurn5hPerHour: Double? { netBurnRaw }
+    /// Gross 5h burn ÷ pool regeneration rate; 1.0 = sustainable forever.
+    /// nil only from pre-pace daemons, where PoolStatus.outlook re-derives it.
+    var pace5h: Double { pace5hRaw ?? 0 }
+    /// Gross 7d burn ÷ weekly regeneration rate; 1.0 = sustainable forever.
+    var pace7d: Double { pace7dRaw ?? 0 }
     var dryAt: Date? { dryAtRaw?.nonZero }
     /// An unknown future mood name degrades by re-deriving from the numbers
     /// the daemon shipped, not by failing decode or defaulting to calm.
@@ -81,6 +101,8 @@ struct PoolOutlook: Decodable {
         case remaining7dPct = "remaining_7d_pct"
         case burnRaw = "burn_5h_per_hour"
         case netBurnRaw = "net_burn_5h_per_hour"
+        case pace5hRaw = "pace_5h"
+        case pace7dRaw = "pace_7d"
         case dryAtRaw = "dry_at"
         case moodRaw = "mood"
     }
@@ -311,7 +333,7 @@ extension PoolStatus {
         ],
         pool: PoolOutlook(
             remaining5hPct: 38, remaining7dPct: 56,
-            burnRaw: 13, netBurnRaw: 4,
+            burnRaw: 13, netBurnRaw: 4, pace5hRaw: 0.62, pace7dRaw: 1.3,
             dryAtRaw: Date().addingTimeInterval(2.6 * 3600),
             moodRaw: Mood.worried.rawValue))
 
@@ -325,9 +347,23 @@ extension PoolStatus {
             accounts: sample.accounts,
             pool: PoolOutlook(
                 remaining5hPct: 38, remaining7dPct: 56, burnRaw: 13, netBurnRaw: 4,
+                pace5hRaw: 0.62, pace7dRaw: 1.3,
                 dryAtRaw: mood == .chill ? nil : Date().addingTimeInterval(2.6 * 3600),
                 moodRaw: mood.rawValue))
     }
+
+    /// A daemon that ships the pool block but predates the pace fields: gross
+    /// burn is present, pace_5h/pace_7d absent. Exercises the version-skew
+    /// derivation in `outlook` (pace5h = grossBurn / (20 × usable)).
+    static let samplePrePace = PoolStatus(
+        proto: 1,
+        version: "dev",
+        generatedAt: Date().addingTimeInterval(-90),
+        accounts: sample.accounts,
+        pool: PoolOutlook(
+            remaining5hPct: 38, remaining7dPct: 56, burnRaw: 13, netBurnRaw: 4,
+            pace5hRaw: nil, pace7dRaw: nil,
+            dryAtRaw: nil, moodRaw: Mood.worried.rawValue))
 
     /// A pre-forecast daemon's snapshot: no pool block, no per-account
     /// predictions. Exercises the derived-outlook fallback path in previews.

@@ -35,8 +35,13 @@ type Snapshot struct {
 	// Forecast is the gated display forecast — zero when the account is
 	// idle, stale, rate-limited, or exhausted. Only it reaches the status
 	// wire's prediction fields.
-	Forecast  forecast.Estimate
-	SampleAge time.Duration
+	Forecast forecast.Estimate
+	// Burn7dPerHour is the gated display drain of the 7d window in
+	// percent/hour — a standalone signal (deliberately not folded into the
+	// 5h-only Forecast) that feeds only the pool pace rollup. Zero when the
+	// account is idle, stale, rate-limited, exhausted, or past its 7d reset.
+	Burn7dPerHour float64
+	SampleAge     time.Duration
 	// Extra-usage (pay-as-you-go overage) state from the latest sample, for
 	// status display: an exhausted account with ExtraEnabled bills credits
 	// instead of rate-limiting.
@@ -101,6 +106,7 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 			Resets7d:       in.Resets7d,
 			Burn5hPerHour:  in.Burn5hPerHour,
 			Forecast:       forecast.Estimate5h(samples[i], r.Exhausted, now),
+			Burn7dPerHour:  forecast.Burn7dGated(samples[i], r.Exhausted, now),
 			ExtraEnabled:   latest.ExtraEnabled,
 			ExtraUsed:      latest.ExtraUsed,
 			ExtraLimit:     latest.ExtraLimit,

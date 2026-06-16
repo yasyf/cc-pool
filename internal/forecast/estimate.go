@@ -28,11 +28,8 @@ type Estimate struct {
 // pending. Projections anchor at the latest sample's timestamp — utilization
 // is known as of the sample, not as of now.
 func Estimate5h(samples []store.UsageSample, exhausted bool, now time.Time) Estimate {
-	if len(samples) == 0 || exhausted {
-		return Estimate{}
-	}
-	latest := samples[0]
-	if latest.RateLimited || now.Sub(latest.TS) > score.DisplayStaleAfter {
+	latest, ok := displayable(samples, exhausted, now)
+	if !ok {
 		return Estimate{}
 	}
 	if !latest.Resets5h.IsZero() && !latest.Resets5h.After(now) {
@@ -52,6 +49,36 @@ func Estimate5h(samples []store.UsageSample, exhausted bool, now time.Time) Esti
 		est.DepletedAt = depleted
 	}
 	return est
+}
+
+// displayable reports whether the latest sample is fit to drive a display
+// forecast — not exhausted, not the zeroed 429 placeholder, not stale — and
+// returns it. It is the gate shared by every gated display projection;
+// window-specific reset gates stay with their estimator.
+func displayable(samples []store.UsageSample, exhausted bool, now time.Time) (store.UsageSample, bool) {
+	if len(samples) == 0 || exhausted {
+		return store.UsageSample{}, false
+	}
+	latest := samples[0]
+	if latest.RateLimited || now.Sub(latest.TS) > score.DisplayStaleAfter {
+		return store.UsageSample{}, false
+	}
+	return latest, true
+}
+
+// Burn7dGated is the display-safe 7d drain in percent/hour: 0 unless the
+// latest sample is displayable. A passed 7d reset (Resets7d set and not after
+// now) additionally zeroes it — the sample predates the refill. A passed 5h
+// reset does NOT gate it; the windows are independent.
+func Burn7dGated(samples []store.UsageSample, exhausted bool, now time.Time) float64 {
+	latest, ok := displayable(samples, exhausted, now)
+	if !ok {
+		return 0
+	}
+	if !latest.Resets7d.IsZero() && !latest.Resets7d.After(now) {
+		return 0
+	}
+	return Burn7d(samples, now)
 }
 
 func hours(h float64) time.Duration {

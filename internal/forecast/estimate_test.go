@@ -26,6 +26,14 @@ func withReset(samples []store.UsageSample, reset time.Time) []store.UsageSample
 	return samples
 }
 
+// withReset7d stamps Resets7d on every sample.
+func withReset7d(samples []store.UsageSample, reset time.Time) []store.UsageSample {
+	for i := range samples {
+		samples[i].Resets7d = reset
+	}
+	return samples
+}
+
 func TestEstimate5h(t *testing.T) {
 	now := time.Date(2026, 6, 11, 12, 0, 0, 0, time.UTC)
 	// burning: util 50 now, +1%/3min over 12 minutes = 20%/hr.
@@ -85,6 +93,42 @@ func TestEstimate5h(t *testing.T) {
 			}
 			if !got.DepletedAt.Equal(got.DepletedAt.Truncate(time.Second)) {
 				t.Errorf("DepletedAt %v carries sub-second precision", got.DepletedAt)
+			}
+		})
+	}
+}
+
+func TestBurn7dGated(t *testing.T) {
+	now := time.Date(2026, 6, 11, 12, 0, 0, 0, time.UTC)
+	hr := time.Hour
+	// burning7d: 12% drained over 6h = 2%/hr, newest first, age-shifted by off.
+	burning7d := func(off time.Duration) []store.UsageSample {
+		return []store.UsageSample{
+			s7(now, off, 12), s7(now, off+2*hr, 8),
+			s7(now, off+4*hr, 4), s7(now, off+6*hr, 0),
+		}
+	}
+
+	cases := map[string]struct {
+		samples   []store.UsageSample
+		exhausted bool
+		want      float64
+	}{
+		"burning yields the 7d burn":   {burning7d(0), false, 2},
+		"exhausted is gated":           {burning7d(0), true, 0},
+		"rate-limited latest is gated": {append([]store.UsageSample{rlSample(now, 0)}, burning7d(0)...), false, 0},
+		"stale latest is gated":        {burning7d(6 * time.Minute), false, 0},
+		"passed 7d reset is gated":     {withReset7d(burning7d(0), now.Add(-time.Minute)), false, 0},
+		"passed 5h reset does not gate": {
+			// A passed 5h reset is irrelevant to the 7d window: burn survives.
+			withReset(burning7d(0), now.Add(-time.Minute)), false, 2,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := Burn7dGated(tc.samples, tc.exhausted, now)
+			if math.Abs(got-tc.want) > 1e-9 {
+				t.Errorf("Burn7dGated = %v, want %v", got, tc.want)
 			}
 		})
 	}

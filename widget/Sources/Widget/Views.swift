@@ -118,7 +118,7 @@ struct PoolHeaderView: View {
     }
 
     private func secondLine(_ o: PoolOutlook) -> String {
-        "7d \(Int((100 - o.remaining7dPct).rounded()))% · " + o.burnPhrase
+        "7d \(Int((100 - o.remaining7dPct).rounded()))% · " + o.pacePhrase
     }
 }
 
@@ -199,18 +199,30 @@ struct AccountRow: View {
         }
     }
 
-    /// Detail line: burn projection first (the forward-looking fact), then
-    /// the CLI's RESETS column for both windows plus overage spend.
+    /// The week is "heavy" — and so worth showing its reset clock — once this
+    /// much of the 7d window is spent. Below it, the 7d reset is just noise.
+    private static let weekHeavyUsedPct = 40.0
+
+    /// Detail line: the forward-looking projection (now carrying its own reset
+    /// clock), the relief time when depleting before reset, the 7d reset only
+    /// when the week is heavily spent, then overage spend.
     private var detail: String? {
         var parts: [String] = []
-        if let prediction = account.predictionText() {
+        if account.unusable {
+            // Rate-limited / exhausted: the recovery time is the only fact.
+            if let reset = account.resets5h?.nonZero {
+                parts.append("resets " + reset.formatted(date: .omitted, time: .shortened))
+            }
+        } else if let prediction = account.predictionText() {
             parts.append(prediction)
+            // The depleting form names a deadline but not the relief; append
+            // the 5h reset time so the row shows both.
+            if prediction.hasSuffix(" left"), let reset = account.resets5h?.nonZero {
+                parts.append("resets " + reset.formatted(date: .omitted, time: .shortened))
+            }
         }
-        if let reset = account.resets5h?.nonZero {
-            parts.append("5h resets " + reset.formatted(date: .omitted, time: .shortened))
-        }
-        if let reset = account.resets7d?.nonZero {
-            parts.append("7d resets " + reset.formatted(.dateTime.weekday(.abbreviated).hour().minute()))
+        if 100 - account.remaining7d >= Self.weekHeavyUsedPct, let reset = account.resets7d?.nonZero {
+            parts.append("7d resets " + weekResetText(reset))
         }
         if account.hasOverage {
             let used = (account.extraUsed ?? 0) / 100
@@ -221,6 +233,16 @@ struct AccountRow: View {
             }
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// The 7d reset as an abbreviated weekday ("Wed"), but the hour ("8 AM")
+    /// when it lands within a day — so a same-day weekday never misreads as
+    /// next week.
+    private func weekResetText(_ reset: Date, now: Date = .now) -> String {
+        if reset.timeIntervalSince(now) < 24 * 3600 {
+            return reset.formatted(.dateTime.hour())
+        }
+        return reset.formatted(.dateTime.weekday(.abbreviated))
     }
 }
 
@@ -488,6 +510,7 @@ struct MessageView: View {
     CCPoolStatusWidget()
 } timeline: {
     StatusEntry(date: .now, state: .ok(.sample, stale: false))
+    StatusEntry(date: .now, state: .ok(.samplePrePace, stale: false))
     StatusEntry(date: .now, state: .ok(.sampleLegacy, stale: false))
     StatusEntry(date: .now, state: .ok(.sample, stale: true))
     StatusEntry(date: .now, state: .noFile)
@@ -497,6 +520,7 @@ struct MessageView: View {
     CCPoolStatusWidget()
 } timeline: {
     StatusEntry(date: .now, state: .ok(.sample, stale: false))
+    StatusEntry(date: .now, state: .ok(.samplePrePace, stale: false))
     StatusEntry(date: .now, state: .ok(.sampleLegacy, stale: false))
     StatusEntry(date: .now, state: .unreadable)
 }

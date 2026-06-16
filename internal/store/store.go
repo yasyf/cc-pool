@@ -336,12 +336,16 @@ func (s *Store) LatestUsageSample(accountID int) (UsageSample, bool, error) {
 	return u, true, nil
 }
 
-// RecentUsageSamples returns up to limit of an account's most recent samples,
-// newest first. Used to estimate the utilization burn rate.
-func (s *Store) RecentUsageSamples(accountID, limit int) ([]UsageSample, error) {
+// UsageSamplesSince returns an account's samples at or after since, newest
+// first. The inclusive lower bound is served by idx_usage_acct_ts. A time
+// bound (rather than a row limit) is what the burn estimators need: a fixed
+// limit either over-fetches on a tight cadence or silently under-covers the
+// window after a backoff gap.
+func (s *Store) UsageSamplesSince(accountID int, since time.Time) ([]UsageSample, error) {
 	rows, err := s.db.Query(
 		`SELECT `+usageSampleCols+`
-		 FROM usage_samples WHERE account_id=? ORDER BY ts DESC LIMIT ?`, accountID, limit)
+		 FROM usage_samples WHERE account_id=? AND ts>=? ORDER BY ts DESC`,
+		accountID, since.Unix())
 	if err != nil {
 		return nil, err
 	}

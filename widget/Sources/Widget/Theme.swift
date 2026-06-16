@@ -103,7 +103,11 @@ extension AccountStatus {
             return "~\(compactETA(to: depleted, from: now)) left"
         }
         if let projected = projected5hAtReset, (burn5hPerHour ?? 0) > 0.5 {
-            return "→\(Int((100 - projected).rounded()))% by reset"
+            let used = Int((100 - projected).rounded())
+            if let reset = resets5h?.nonZero {
+                return "→\(used)% by " + reset.formatted(date: .omitted, time: .shortened)
+            }
+            return "→\(used)% by reset"
         }
         return nil
     }
@@ -111,23 +115,27 @@ extension AccountStatus {
 
 extension PoolOutlook {
     /// The headline caption: the dry-out clock when one is projected, else
-    /// the shared burn phrase.
+    /// the shared pace phrase.
     func caption(now: Date = .now) -> String {
         if let dry = dryAt {
             guard dry > now else { return "drying now" }
             return "dry ~" + dry.formatted(date: .omitted, time: .shortened)
         }
-        return burnPhrase
+        return pacePhrase
     }
 
-    /// Drain phrase shared by the small/medium caption and the large header's
-    /// second line: NET burn (drain minus upcoming 5h refills) when the
-    /// daemon ships it, gross for older daemons. A negative net — refills
-    /// outpacing drain — reads as refilling; under ±1 pp/h reads as cruising.
-    var burnPhrase: String {
-        let rate = netBurn5hPerHour ?? burn5hPerHour
-        if rate >= 1 { return "burn \(Int(rate.rounded()))%/h" }
-        if rate <= -1 { return "refilling \(Int((-rate).rounded()))%/h" }
-        return "cruising"
+    /// Pace phrase shared by the small/medium caption and the large header's
+    /// second line. A negative net burn — refills outpacing drain — reads as
+    /// refilling (kept from the net-burn era); otherwise the binding pace (the
+    /// max of the dimensionless 5h/7d ratios, 1.0 = sustainable forever) is
+    /// shown, labeled when the week binds. Under 0.02 reads as cruising.
+    var pacePhrase: String {
+        if let net = netBurn5hPerHour, net <= -1 {
+            return "refilling \(Int((-net).rounded()))%/h"
+        }
+        let binding = max(pace5h, pace7d)
+        if binding < 0.02 { return "cruising" }
+        let pct = "\(Int((binding * 100).rounded()))%"
+        return pace7d > pace5h ? "7d pace \(pct)" : "pace \(pct)"
     }
 }

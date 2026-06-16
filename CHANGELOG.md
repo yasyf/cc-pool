@@ -6,6 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-06-16
+
+### Changed
+- The widget header shows **pool pace** in place of the old "burn N%/h". That
+  phrase summed every account's window drain but measured it against nothing, so
+  it read as most dire when the pool was healthiest — "burn 58%/h" looks fatal,
+  yet a six-account pool regenerates ~120%/h and holds that line indefinitely.
+  Pace divides the gross burn by the pool's regeneration rate: below 1.0 the
+  pool refills forever (`pace 48%`), above 1.0 a wall is coming. The binding
+  window is shown, labeled when the week is the constraint (`7d pace 130%`). The
+  "refilling N%/h" and dry-clock captions are unchanged.
+- The pool dry-out clock is refill-aware. It used to disappear whenever any
+  account's reset fell before the projected wall — even when burn kept
+  outpacing refills past that reset — so a genuine deadline could read as "no
+  wall." It now forward-simulates the staggered resets and reports the first
+  moment combined capacity actually reaches zero.
+- The large widget's per-account line is tighter: the projection and its 5h
+  reset collapse into one clause (`→37% by 5:20 AM`), and the weekly reset shows
+  only once the week is meaningfully spent (7d ≥ 40% used).
+
+### Added
+- The `ccp status --json` pool block gains `pace_5h` and `pace_7d` (gross burn
+  over regeneration rate; 1.0 is sustainable), and each account gains
+  `burn_7d_per_hour`. The existing `burn_5h_per_hour` and `net_burn_5h_per_hour`
+  keys are untouched and the protocol version is unchanged, so a widget built
+  before this release keeps decoding the snapshot and simply ignores the new
+  keys. A widget from this release talking to an older daemon re-derives pace
+  locally from the gross burn, so it shows pace either way.
+
 ## [0.19.0] - 2026-06-11
 
 ### Added

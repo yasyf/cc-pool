@@ -1025,6 +1025,7 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 			// The wire ships the gated display forecast, never the raw
 			// scoring burn (which stays live on stale samples).
 			Burn5hPerHour:      sn.Forecast.BurnPerHour,
+			Burn7dPerHour:      sn.Burn7dPerHour,
 			Projected5hAtReset: sn.Forecast.AtReset,
 			Depleted5hAt:       sn.Forecast.DepletedAt,
 			ExtraEnabled:       sn.ExtraEnabled,

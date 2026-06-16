@@ -117,6 +117,8 @@ type AccountStatus struct {
 	// rate-limited, exhausted, or too little burn history); the widget
 	// decodes them as optionals.
 	Burn5hPerHour float64 `json:"burn_5h_per_hour,omitempty"` // %/hr drain
+	// Burn7dPerHour is the gated display drain of the 7d window, %/hr.
+	Burn7dPerHour float64 `json:"burn_7d_per_hour,omitempty"`
 	// Projected5hAtReset is the projected REMAINING percent at Resets5h,
 	// clamped to 0..100 (matching the remaining_5h convention).
 	Projected5hAtReset float64 `json:"projected_5h_at_reset,omitempty"`
@@ -161,9 +163,18 @@ type PoolOutlook struct {
 	// 0, and the widget treats an absent key as "daemon predates the field"
 	// and falls back to the gross burn — omitting 0 would caption a balanced
 	// pool with its gross rate.
-	NetBurn5hPerHour float64       `json:"net_burn_5h_per_hour"`
-	DryAt            time.Time     `json:"dry_at,omitzero"`
-	Mood             forecast.Mood `json:"mood"`
+	NetBurn5hPerHour float64 `json:"net_burn_5h_per_hour"`
+	// Pace5h and Pace7d are the gross burn divided by the pool's regeneration
+	// rate for each window (forecast.Pool.Pace5h/Pace7d): <1 is sustainable
+	// indefinitely, 1 is exactly break-even, >1 means a wall is coming.
+	// Deliberately NOT omitempty: 0 is a real value (an idle pool sustains
+	// forever), and the widget treats an absent key as "daemon predates the
+	// field" and re-derives pace locally — omitting 0 would flip an idle pool
+	// to that skew path.
+	Pace5h float64       `json:"pace_5h"`
+	Pace7d float64       `json:"pace_7d"`
+	DryAt  time.Time     `json:"dry_at,omitzero"`
+	Mood   forecast.Mood `json:"mood"`
 }
 
 // NewStatusSnapshot stamps accounts with the protocol version, build version,
@@ -188,12 +199,13 @@ func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 	pa := make([]forecast.PoolAccount, 0, len(accounts))
 	for _, a := range accounts {
 		pa = append(pa, forecast.PoolAccount{
-			HasUsage:    a.HasUsage,
-			RateLimited: a.RateLimited,
-			Remaining5h: a.Remaining5h,
-			Remaining7d: a.Remaining7d,
-			BurnPerHour: a.Burn5hPerHour,
-			Resets5h:    a.Resets5h,
+			HasUsage:      a.HasUsage,
+			RateLimited:   a.RateLimited,
+			Remaining5h:   a.Remaining5h,
+			Remaining7d:   a.Remaining7d,
+			Burn5hPerHour: a.Burn5hPerHour,
+			Burn7dPerHour: a.Burn7dPerHour,
+			Resets5h:      a.Resets5h,
 		})
 	}
 	if p, ok := forecast.PoolOf(pa, now); ok {
@@ -202,6 +214,8 @@ func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 			Remaining7dPct:   p.Remaining7d,
 			Burn5hPerHour:    p.BurnPerHour,
 			NetBurn5hPerHour: p.NetBurnPerHour,
+			Pace5h:           p.Pace5h,
+			Pace7d:           p.Pace7d,
 			DryAt:            p.DryAt,
 			Mood:             p.Mood,
 		}

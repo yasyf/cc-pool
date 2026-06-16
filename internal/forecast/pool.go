@@ -1,6 +1,9 @@
 package forecast
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 // Mood is the pool-health alarm level, computed daemon-side so every consumer
 // (widget mascot, CLI) agrees on one source of truth. Levels order
@@ -35,12 +38,13 @@ func (m Mood) worse() Mood {
 
 // PoolAccount is one account's contribution to the pool rollup.
 type PoolAccount struct {
-	HasUsage    bool
-	RateLimited bool
-	Remaining5h float64 // percent 0..100
-	Remaining7d float64 // percent 0..100
-	BurnPerHour float64 // gated display burn (Estimate.BurnPerHour)
-	Resets5h    time.Time
+	HasUsage      bool
+	RateLimited   bool
+	Remaining5h   float64 // percent 0..100
+	Remaining7d   float64 // percent 0..100
+	Burn5hPerHour float64 // gated display 5h burn (Estimate.BurnPerHour)
+	Burn7dPerHour float64 // gated display 7d burn (Burn7dGated)
+	Resets5h      time.Time
 }
 
 // Pool is the pool-wide rollup behind the widget's headline and mascot.
@@ -50,9 +54,18 @@ type Pool struct {
 	// equal weights are the only honest aggregate.
 	Remaining5h float64
 	Remaining7d float64
-	// BurnPerHour is the summed drain across usable accounts, in
-	// percent-of-one-account's-window per hour.
+	// BurnPerHour is the summed 5h drain across usable accounts, in
+	// percent-of-one-account's-window per hour. It is the Pace5h numerator and
+	// stays wire-live for --json consumers.
 	BurnPerHour float64
+	// Pace5h is the gross 5h burn divided by the pool's 5h regeneration rate
+	// (regen5hPerHour × usable accounts). 1.0 is the sustainable fixed point:
+	// below it the pool refills indefinitely, above it a wall is coming.
+	Pace5h float64
+	// Pace7d is the gross 7d burn divided by the pool's 7d regeneration rate
+	// (regen7dPerHour × usable accounts), with the same 1.0-is-sustainable
+	// semantics over the weekly window.
+	Pace7d float64
 	// NetBurnPerHour is the projected change of the pool's mean 5h remaining
 	// over the next hour, in percentage points per hour, crediting 5h-window
 	// refills that land inside that hour. Positive means draining; negative
@@ -60,10 +73,11 @@ type Pool struct {
 	// BurnPerHour it is mean-based, so it describes exactly how fast
 	// Remaining5h moves.
 	NetBurnPerHour float64
-	// DryAt is when the pool's combined 5h remaining hits 0 at the combined
-	// burn, assuming selection keeps rebalancing load freely. Zero when burn
-	// is 0 or a reset refills some window first — absence means "relief
-	// arrives first", not "infinite runway".
+	// DryAt is when the pool's combined 5h remaining hits 0 under a forward
+	// simulation that drains every usable account by its even share and
+	// credits each window's reset (known, then chained every resetPeriod5h).
+	// Zero means no wall lands within dryHorizon — a farther wall is pace's
+	// story, not a clock's.
 	DryAt time.Time
 	Mood  Mood
 }
@@ -87,42 +101,110 @@ func PoolOf(accts []PoolAccount, now time.Time) (Pool, bool) {
 		return Pool{}, false
 	}
 
-	var usable int
-	var sum5, sum7, burn, drop float64
-	var earliestReset time.Time
+	var usableAccts []PoolAccount
+	var sum5, sum7, burn, burn7, drop float64
 	for _, a := range accts {
 		if !a.HasUsage || a.RateLimited {
 			continue
 		}
-		usable++
+		usableAccts = append(usableAccts, a)
 		sum5 += clamp(a.Remaining5h)
 		sum7 += clamp(a.Remaining7d)
-		burn += a.BurnPerHour
+		burn += a.Burn5hPerHour
+		burn7 += a.Burn7dPerHour
 		drop += netDrop(a, now)
-		if a.Resets5h.After(now) && (earliestReset.IsZero() || a.Resets5h.Before(earliestReset)) {
-			earliestReset = a.Resets5h
-		}
 	}
+	usable := len(usableAccts)
 	var p Pool
 	if usable > 0 {
 		p.Remaining5h = sum5 / float64(usable)
 		p.Remaining7d = sum7 / float64(usable)
 		p.BurnPerHour = burn
+		p.Pace5h = burn / (regen5hPerHour * float64(usable))
+		p.Pace7d = burn7 / (regen7dPerHour * float64(usable))
 		p.NetBurnPerHour = drop / float64(usable) / netBurnHorizon.Hours()
-		if burn > 0 {
-			dry := now.Add(hours(sum5 / burn)).Truncate(time.Second)
-			if earliestReset.IsZero() || dry.Before(earliestReset) {
-				p.DryAt = dry
-			}
-		}
+		p.DryAt = dryAt(usableAccts, sum5, burn, now)
 	}
 	p.Mood = moodOf(usable, p.Remaining5h, !p.DryAt.IsZero())
 	return p, true
 }
 
+const (
+	// regen5hPerHour is how fast one account's 5h window refills, in points per
+	// hour (a full 100% window every 5h).
+	regen5hPerHour = 100.0 / 5
+	// regen7dPerHour is how fast one account's 7d window refills, in points per
+	// hour (a full 100% window every 7×24h).
+	regen7dPerHour = 100.0 / (7 * 24)
+	// resetPeriod5h is the assumed spacing of chained 5h resets: under burn,
+	// selection reopens a window the moment it refills, so future resets recur
+	// every 5h.
+	resetPeriod5h = 5 * time.Hour
+	// dryHorizon bounds the dry-out simulation. Burns are short secants;
+	// extrapolating past ~5 reset cycles is noise, a farther wall is pace's
+	// story, and the bound keeps the projected event list finite.
+	dryHorizon = 24 * time.Hour
+)
+
+// dryAt forward-simulates the pool's combined 5h remaining to find the first
+// instant it hits 0, or zero time if no wall lands within dryHorizon. Each
+// usable account drains its even share of the gross burn; each window's reset
+// (the known Resets5h, then a chain every resetPeriod5h out to dryHorizon)
+// credits back only what that window actually used since it was last full —
+// 100 − max(0, lastRem − share·Δt). For a homogeneous pool the fixed point is
+// exactly pace = 1; a heterogeneous mix (idle or exhausted low-remaining
+// members) makes the even-share drain an approximation, so a rare conservative
+// clock can surface on a pool that pace alone calls sustainable. Ties (dry
+// landing exactly on a reset) go to the refill, matching the strict-before
+// convention in Estimate5h. Past, zero, or beyond-horizon resets contribute
+// their remaining but schedule no relief: they neither suppress a later wall
+// (the old naive bug) nor fabricate one.
+func dryAt(usableAccts []PoolAccount, sum5, burn float64, now time.Time) time.Time {
+	if burn <= 0 {
+		return time.Time{}
+	}
+	share := burn / float64(len(usableAccts))
+
+	type event struct {
+		at      time.Time
+		lastRem float64 // remaining the window held when it was last full
+		lastAt  time.Time
+	}
+	horizon := now.Add(dryHorizon)
+	var events []event
+	for _, a := range usableAccts {
+		if !a.Resets5h.After(now) || !a.Resets5h.Before(horizon) {
+			continue // reset past, zero, or beyond the horizon: no relief scheduled
+		}
+		events = append(events, event{at: a.Resets5h, lastRem: clamp(a.Remaining5h), lastAt: now})
+		for t := a.Resets5h.Add(resetPeriod5h); t.Before(horizon); t = t.Add(resetPeriod5h) {
+			events = append(events, event{at: t, lastRem: 100, lastAt: t.Add(-resetPeriod5h)})
+		}
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].at.Before(events[j].at) })
+
+	total := sum5
+	at := now
+	for _, e := range events {
+		dry := at.Add(hours(total / burn))
+		if dry.Before(e.at) {
+			return dry.Truncate(time.Second)
+		}
+		total -= burn * e.at.Sub(at).Hours() // drain up to the reset
+		levelAtReset := max(0, e.lastRem-share*e.at.Sub(e.lastAt).Hours())
+		total += 100 - levelAtReset // credit the window back to full
+		at = e.at
+	}
+	dry := at.Add(hours(total / burn))
+	if dry.Before(horizon) {
+		return dry.Truncate(time.Second)
+	}
+	return time.Time{}
+}
+
 // moodOf maps pool state to an alarm level: thresholds on mean remaining,
-// bumped one level worse when a dry-out is projected before any reset relief
-// (the overshoot signal).
+// bumped one level worse when a dry-out is projected — the forward simulation
+// hits 0 inside dryHorizon (the overshoot signal).
 func moodOf(usable int, remaining5h float64, dryProjected bool) Mood {
 	if usable == 0 {
 		return MoodPanic // nothing can serve right now
@@ -158,9 +240,9 @@ func netDrop(a PoolAccount, now time.Time) float64 {
 	start := clamp(a.Remaining5h)
 	if a.Resets5h.After(now) && !a.Resets5h.After(now.Add(netBurnHorizon)) {
 		rest := netBurnHorizon - a.Resets5h.Sub(now)
-		return start - max(0, 100-a.BurnPerHour*rest.Hours())
+		return start - max(0, 100-a.Burn5hPerHour*rest.Hours())
 	}
-	return start - max(0, start-a.BurnPerHour*netBurnHorizon.Hours())
+	return start - max(0, start-a.Burn5hPerHour*netBurnHorizon.Hours())
 }
 
 func clamp(v float64) float64 { return max(0, min(100, v)) }

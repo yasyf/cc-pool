@@ -172,7 +172,7 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			Score: 95.5, Remaining5h: 90, Remaining7d: 80, ActiveSessions: 2,
 			RateLimited: true, Exhausted: true, HasUsage: true, Stale: true,
 			Resets5h: now, Resets7d: now, SampleAge: "30s",
-			Burn5hPerHour: 12, Projected5hAtReset: 62, Depleted5hAt: now,
+			Burn5hPerHour: 12, Burn7dPerHour: 8, Projected5hAtReset: 62, Depleted5hAt: now,
 			ExtraEnabled: true, ExtraUsed: 177, ExtraLimit: 5000,
 		}
 		// A second usable burning account with no known reset, so the pool
@@ -210,7 +210,8 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			"id", "config_dir", "label", "overlay_kind", "score",
 			"remaining_5h", "remaining_7d", "active_sessions", "rate_limited",
 			"exhausted", "has_usage", "stale", "resets_5h", "resets_7d",
-			"sample_age", "burn_5h_per_hour", "projected_5h_at_reset", "depleted_5h_at",
+			"sample_age", "burn_5h_per_hour", "burn_7d_per_hour",
+			"projected_5h_at_reset", "depleted_5h_at",
 			"extra_enabled", "extra_used", "extra_limit", "components",
 		})
 
@@ -220,7 +221,7 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		}
 		assertKeys(t, "pool", poolBlock, []string{
 			"remaining_5h_pct", "remaining_7d_pct", "burn_5h_per_hour",
-			"net_burn_5h_per_hour", "dry_at", "mood",
+			"net_burn_5h_per_hour", "pace_5h", "pace_7d", "dry_at", "mood",
 		})
 		// Only acct-2 is usable (acct-1 is rate-limited): mean remaining 50,
 		// projected dry with no reset relief bumps easy to uneasy.
@@ -231,6 +232,16 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		// its burn: 50→40 over the hour.
 		if got := string(poolBlock["net_burn_5h_per_hour"]); got != "10" {
 			t.Errorf("pool net_burn_5h_per_hour = %s, want 10", got)
+		}
+		// Pace5h = gross burn / (20%/h × usable). One usable account
+		// (acct-1 is rate-limited) burning 10 → 10/(20×1) = 0.5, binary-exact.
+		if got := string(poolBlock["pace_5h"]); got != "0.5" {
+			t.Errorf("pool pace_5h = %s, want 0.5", got)
+		}
+		// acct-2 has no 7d burn and acct-1 is excluded, so the 7d pace is a
+		// real 0 — pinned because pace is deliberately not omitempty.
+		if got := string(poolBlock["pace_7d"]); got != "0" {
+			t.Errorf("pool pace_7d = %s, want 0", got)
 		}
 
 		// score.Components has no json tags, so its keys are PascalCase amid
@@ -299,10 +310,21 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertKeys(t, "idle pool", poolBlock, []string{
-			"remaining_5h_pct", "remaining_7d_pct", "net_burn_5h_per_hour", "mood",
+			"remaining_5h_pct", "remaining_7d_pct", "net_burn_5h_per_hour",
+			"pace_5h", "pace_7d", "mood",
 		})
 		if got := string(poolBlock["net_burn_5h_per_hour"]); got != "0" {
 			t.Errorf("idle pool net_burn_5h_per_hour = %s, want 0", got)
+		}
+		// Both paces are deliberately NOT omitempty: an idle pool sustains
+		// forever (pace 0), and an absent key would read as "old daemon" and
+		// flip the widget to its local skew derivation. The keys must appear
+		// with a literal 0.
+		if got := string(poolBlock["pace_5h"]); got != "0" {
+			t.Errorf("idle pool pace_5h = %s, want 0", got)
+		}
+		if got := string(poolBlock["pace_7d"]); got != "0" {
+			t.Errorf("idle pool pace_7d = %s, want 0", got)
 		}
 	})
 
@@ -375,6 +397,21 @@ func TestWriteStatusSnapshotForecast(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The 7d burn needs a wider lookback (Burn7dWindow=6h, min span 3h), so seed
+	// a separate hourly Util7d climb of +2%/hr out to -4h. The recent 5h cluster
+	// holds Util7d flat at the top (latest.Util7d), so the 7d secant is the clean
+	// endpoint slope (latest.Util7d − 2) / 4h = 2%/hr. Util5h on these older rows
+	// is irrelevant: they fall outside the 45-min 5h window.
+	for i := 1; i <= 4; i++ {
+		if err := s.m.Store.InsertUsageSample(store.UsageSample{
+			AccountID: 1,
+			TS:        latest.TS.Add(-time.Duration(i) * time.Hour),
+			Util5h:    latest.Util5h,
+			Util7d:    latest.Util7d - float64(i)*2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	if err := s.writeStatusSnapshot(t.Context()); err != nil {
 		t.Fatal(err)
@@ -392,6 +429,10 @@ func TestWriteStatusSnapshotForecast(t *testing.T) {
 	}
 	if acct1.Burn5hPerHour != 40 {
 		t.Errorf("acct-1 burn_5h_per_hour = %v, want 40", acct1.Burn5hPerHour)
+	}
+	// The seeded +2%/hr Util7d climb surfaces as the gated 7d display drain.
+	if acct1.Burn7dPerHour != 2 {
+		t.Errorf("acct-1 burn_7d_per_hour = %v, want 2", acct1.Burn7dPerHour)
 	}
 	// No reset is known, so depletion is projected and at-reset is omitted:
 	// 90 points left at 40%/hr = 2h15m from the latest sample.
@@ -417,6 +458,19 @@ func TestWriteStatusSnapshotForecast(t *testing.T) {
 	// No reset lands inside the hour, so net is the mean of burns: (40+0)/2.
 	if snap.Pool.NetBurn5hPerHour != 20 {
 		t.Errorf("pool net_burn_5h_per_hour = %v, want 20", snap.Pool.NetBurn5hPerHour)
+	}
+	// Pace5h = Σburn5h / (20%/h × usable) = 40/(20×2) = 1.0, exactly the
+	// break-even fixed point.
+	if snap.Pool.Pace5h != 1 {
+		t.Errorf("pool pace_5h = %v, want 1", snap.Pool.Pace5h)
+	}
+	// Pace7d = Σburn7d / (regen7dPerHour × usable). Only acct-1 burns the 7d
+	// window (2%/hr); acct-2 has a single sample, so its 7d burn is 0. Replicate
+	// PoolOf's float ops to pin the value bit-exactly.
+	regen7d := 100.0 / (7 * 24)
+	wantPace7d := 2.0 / (regen7d * 2)
+	if snap.Pool.Pace7d != wantPace7d {
+		t.Errorf("pool pace_7d = %v, want %v", snap.Pool.Pace7d, wantPace7d)
 	}
 	if snap.Pool.DryAt.IsZero() {
 		t.Error("pool dry_at missing despite positive burn and no reset relief")
