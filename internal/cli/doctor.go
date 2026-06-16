@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"time"
 
@@ -330,29 +331,53 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 		report(prefix+" overlay", true, string(prov.Kind()))
 	}
 
-	// Private files stranded in a fuse backing dir by an interrupted
-	// migration: a non-fuse account must hold its .claude.json (and friends)
-	// in the account dir itself.
-	if overlay.Kind(a.OverlayKind) != overlay.KindFuse {
-		priv := overlay.FusePrivateRoot(a.ConfigDir)
-		switch has, herr := overlay.HasPrivateEntries(priv); {
-		case herr != nil:
-			report(prefix+" private files", false, herr.Error())
-		case has && fix:
-			// Only heal when no daemon holds the pool: a CLI-side heal cannot
-			// see the daemon's converting claim, and racing an in-flight
-			// conversion would move files under its teardown sequence. With a
-			// daemon up, the same recovery runs under the claim via
-			// `ccp migrate` (or the daemon's own startup reconcile).
-			if daemon.NewClient().Available() {
-				report(prefix+" private files", false, "stranded in "+priv+"; the daemon is running — re-run `ccp migrate`, or stop the daemon and re-run doctor --fix")
-			} else if healed, ferr := m.HealStrandedPrivate(a); ferr != nil {
-				report(prefix+" private files", false, ferr.Error())
-			} else if healed {
-				report(prefix+" private files", true, "restored from "+priv)
-			}
-		case has:
-			report(prefix+" private files", false, "stranded in "+priv+" by an interrupted migration")
-		}
+	checkStrandedPrivate(m, a, fix, cmd.OutOrStdout(), report)
+}
+
+// checkStrandedPrivate reports — and, under --fix with no running daemon, heals
+// — private files stranded in a fuse backing dir by an interrupted migration: a
+// non-fuse account must hold its .claude.json (and friends) in the account dir
+// itself. When this CLI process drives the heal it wires
+// overlay.ResolvedConflictLogf at out for the duration of the move, so a
+// last-write-wins discard of a duplicate stranded copy is reported rather than
+// lost silently. The daemon sets the same seam at startup, but a daemon-less
+// `doctor --fix` is its own actor and must surface the recovery itself; the
+// wiring is scoped to the single synchronous heal call (this process runs no
+// concurrent move) and restored after, so it never leaks across commands.
+func checkStrandedPrivate(m *pool.Manager, a store.Account, fix bool, out io.Writer, report func(string, bool, string)) {
+	if overlay.Kind(a.OverlayKind) == overlay.KindFuse {
+		return
+	}
+	prefix := fmt.Sprintf("acct-%02d", a.ID)
+	priv := overlay.FusePrivateRoot(a.ConfigDir)
+	has, herr := overlay.HasPrivateEntries(priv)
+	switch {
+	case herr != nil:
+		report(prefix+" private files", false, herr.Error())
+		return
+	case !has:
+		return
+	case !fix:
+		report(prefix+" private files", false, "stranded in "+priv+" by an interrupted migration")
+		return
+	}
+	// Only heal when no daemon holds the pool: a CLI-side heal cannot see the
+	// daemon's converting claim, and racing an in-flight conversion would move
+	// files under its teardown sequence. With a daemon up, the same recovery
+	// runs under the claim via `ccp migrate` (or the daemon's own startup
+	// reconcile).
+	if daemon.NewClient().Available() {
+		report(prefix+" private files", false, "stranded in "+priv+"; the daemon is running — re-run `ccp migrate`, or stop the daemon and re-run doctor --fix")
+		return
+	}
+	prev := overlay.ResolvedConflictLogf
+	overlay.ResolvedConflictLogf = func(format string, args ...any) { warn(out, format, args...) }
+	healed, ferr := m.HealStrandedPrivate(a)
+	overlay.ResolvedConflictLogf = prev
+	switch {
+	case ferr != nil:
+		report(prefix+" private files", false, ferr.Error())
+	case healed:
+		report(prefix+" private files", true, "restored from "+priv)
 	}
 }

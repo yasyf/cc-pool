@@ -1,11 +1,21 @@
 package overlay
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// setMtime stamps path's mtime so last-write-wins resolution is deterministic.
+func setMtime(t *testing.T, path string, mtime time.Time) {
+	t.Helper()
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
@@ -28,10 +38,11 @@ func readFile(t *testing.T, path string) string {
 
 func TestMovePrivateEntries(t *testing.T) {
 	cases := []struct {
-		name    string
-		setup   func(t *testing.T, from, to string)
-		wantErr string // substring; "" means success
-		verify  func(t *testing.T, from, to string)
+		name           string
+		setup          func(t *testing.T, from, to string)
+		wantErr        string // substring; "" means success
+		verify         func(t *testing.T, from, to string)
+		verifyResolved func(t *testing.T, resolved []string)
 	}{
 		{
 			name: "moves identity, credential, and tmp siblings",
@@ -128,18 +139,125 @@ func TestMovePrivateEntries(t *testing.T) {
 			},
 		},
 		{
-			name: "file collision fails loud with both copies intact",
+			name: "file collision, identical content drops src and keeps dst",
 			setup: func(t *testing.T, from, to string) {
-				writeFile(t, filepath.Join(from, ".claude.json"), "src-identity")
-				writeFile(t, filepath.Join(to, ".claude.json"), "dst-identity")
+				writeFile(t, filepath.Join(from, ".claude.json"), "identity")
+				writeFile(t, filepath.Join(to, ".claude.json"), "identity")
 			},
-			wantErr: "collision",
 			verify: func(t *testing.T, from, to string) {
-				if got := readFile(t, filepath.Join(from, ".claude.json")); got != "src-identity" {
+				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "identity" {
+					t.Errorf("destination disturbed: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, ".claude.json")); !os.IsNotExist(err) {
+					t.Error("identical duplicate not removed from source")
+				}
+			},
+			verifyResolved: func(t *testing.T, resolved []string) {
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "identical duplicate discarded") {
+					t.Errorf("resolution log = %v, want one 'identical duplicate discarded'", resolved)
+				}
+			},
+		},
+		{
+			name: "file collision, src newer wins last-write",
+			setup: func(t *testing.T, from, to string) {
+				base := time.Now()
+				writeFile(t, filepath.Join(to, ".claude.json"), "stale-dst")
+				setMtime(t, filepath.Join(to, ".claude.json"), base.Add(-time.Hour))
+				writeFile(t, filepath.Join(from, ".claude.json"), "fresh-src")
+				setMtime(t, filepath.Join(from, ".claude.json"), base)
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "fresh-src" {
+					t.Errorf("newer source did not win: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, ".claude.json")); !os.IsNotExist(err) {
+					t.Error("stale source not removed")
+				}
+			},
+			verifyResolved: func(t *testing.T, resolved []string) {
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy'", resolved)
+				}
+			},
+		},
+		{
+			name: "file collision, dst newer is kept",
+			setup: func(t *testing.T, from, to string) {
+				base := time.Now()
+				writeFile(t, filepath.Join(from, ".claude.json"), "stale-src")
+				setMtime(t, filepath.Join(from, ".claude.json"), base.Add(-time.Hour))
+				writeFile(t, filepath.Join(to, ".claude.json"), "fresh-dst")
+				setMtime(t, filepath.Join(to, ".claude.json"), base)
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "fresh-dst" {
+					t.Errorf("newer destination disturbed: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, ".claude.json")); !os.IsNotExist(err) {
+					t.Error("stale source not removed")
+				}
+			},
+			verifyResolved: func(t *testing.T, resolved []string) {
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy'", resolved)
+				}
+			},
+		},
+		{
+			name: "file collision, equal mtimes keep dst (tie-breaker)",
+			setup: func(t *testing.T, from, to string) {
+				ts := time.Now()
+				writeFile(t, filepath.Join(from, ".claude.json"), "src-tie")
+				setMtime(t, filepath.Join(from, ".claude.json"), ts)
+				writeFile(t, filepath.Join(to, ".claude.json"), "dst-tie")
+				setMtime(t, filepath.Join(to, ".claude.json"), ts)
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "dst-tie" {
+					t.Errorf("tie did not keep dst: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, ".claude.json")); !os.IsNotExist(err) {
+					t.Error("tie did not remove src")
+				}
+			},
+			verifyResolved: func(t *testing.T, resolved []string) {
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy' from the equal-mtime tie", resolved)
+				}
+			},
+		},
+		{
+			name: "src file vs dst dir fails loud with both intact",
+			setup: func(t *testing.T, from, to string) {
+				writeFile(t, filepath.Join(from, ".claude.json"), "i-am-a-file")
+				if err := os.MkdirAll(filepath.Join(to, ".claude.json"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantErr: "type mismatch",
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(from, ".claude.json")); got != "i-am-a-file" {
 					t.Errorf("source clobbered: %q", got)
 				}
-				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "dst-identity" {
-					t.Errorf("destination clobbered: %q", got)
+				if fi, err := os.Lstat(filepath.Join(to, ".claude.json")); err != nil || !fi.IsDir() {
+					t.Errorf("destination dir disturbed: fi=%v err=%v", fi, err)
+				}
+			},
+		},
+		{
+			name: "src dir vs dst file fails loud with both intact",
+			setup: func(t *testing.T, from, to string) {
+				writeFile(t, filepath.Join(from, "backups", "b.bak"), "bak")
+				writeFile(t, filepath.Join(to, "backups"), "i-am-a-file")
+			},
+			wantErr: "type mismatch",
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(from, "backups", "b.bak")); got != "bak" {
+					t.Errorf("source dir clobbered: %q", got)
+				}
+				if got := readFile(t, filepath.Join(to, "backups")); got != "i-am-a-file" {
+					t.Errorf("destination file clobbered: %q", got)
 				}
 			},
 		},
@@ -162,18 +280,25 @@ func TestMovePrivateEntries(t *testing.T) {
 			},
 		},
 		{
-			name: "dir merge child collision fails with both intact",
+			name: "dir merge child file collision resolves last-write-wins",
 			setup: func(t *testing.T, from, to string) {
-				writeFile(t, filepath.Join(from, "backups", "x"), "src")
-				writeFile(t, filepath.Join(to, "backups", "x"), "dst")
+				base := time.Now()
+				writeFile(t, filepath.Join(to, "backups", "x"), "stale-dst")
+				setMtime(t, filepath.Join(to, "backups", "x"), base.Add(-time.Hour))
+				writeFile(t, filepath.Join(from, "backups", "x"), "fresh-src")
+				setMtime(t, filepath.Join(from, "backups", "x"), base)
 			},
-			wantErr: "collision",
 			verify: func(t *testing.T, from, to string) {
-				if got := readFile(t, filepath.Join(from, "backups", "x")); got != "src" {
-					t.Errorf("source clobbered: %q", got)
+				if got := readFile(t, filepath.Join(to, "backups", "x")); got != "fresh-src" {
+					t.Errorf("newer nested source did not win: %q", got)
 				}
-				if got := readFile(t, filepath.Join(to, "backups", "x")); got != "dst" {
-					t.Errorf("destination clobbered: %q", got)
+				if _, err := os.Lstat(filepath.Join(from, "backups")); !os.IsNotExist(err) {
+					t.Error("merged source dir not removed")
+				}
+			},
+			verifyResolved: func(t *testing.T, resolved []string) {
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy' from the nested merge", resolved)
 				}
 			},
 		},
@@ -216,6 +341,12 @@ func TestMovePrivateEntries(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			from, to := t.TempDir(), t.TempDir()
+			var resolved []string
+			prev := ResolvedConflictLogf
+			ResolvedConflictLogf = func(format string, args ...any) {
+				resolved = append(resolved, fmt.Sprintf(format, args...))
+			}
+			defer func() { ResolvedConflictLogf = prev }()
 			tc.setup(t, from, to)
 			err := MovePrivateEntries(from, to)
 			if tc.wantErr == "" {
@@ -228,6 +359,9 @@ func TestMovePrivateEntries(t *testing.T) {
 				}
 			}
 			tc.verify(t, from, to)
+			if tc.verifyResolved != nil {
+				tc.verifyResolved(t, resolved)
+			}
 		})
 	}
 }

@@ -163,6 +163,11 @@ func Run(ctx context.Context) error {
 		polling:      map[int]bool{},
 		rlStreak:     map[int]int{},
 	}
+	// Make overlay's crash-repair conflict resolution observable: every
+	// private-file collision the migrate path reconciles (in the mount sweep,
+	// either convert direction, or a stranded-private heal) is logged here.
+	// Assigned once, before serve spawns any worker.
+	overlay.ResolvedConflictLogf = s.log.Printf
 	return s.serve(ctx)
 }
 

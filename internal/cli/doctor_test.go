@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
@@ -390,5 +394,97 @@ func TestCountFuse(t *testing.T) {
 	}
 	if got := countFuse(nil); got != 0 {
 		t.Errorf("countFuse(nil) = %d, want 0", got)
+	}
+}
+
+// TestDoctorHealReportsDiscardedDuplicate pins the CLI-side observability of the
+// crash-repair conflict resolution: a daemon-less `doctor --fix` drives the
+// stranded-private heal itself, so when both roots hold the same private file
+// with differing content it must REPORT — not silently discard — the older
+// copy. The test installs NO ResolvedConflictLogf seam of its own; it relies on
+// checkStrandedPrivate wiring it, so it catches the production silence the
+// default no-op would leave (the daemon-only wiring this fix closed). It then
+// probes the seam to prove the wiring was restored, so it cannot leak into the
+// next command.
+func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	base := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(filepath.Join(base, "projects"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := filepath.Join(home, "acct-01")
+	if err := (&overlay.SymlinkProvider{}).Setup(base, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// The collision an abnormal shutdown leaves: the same private file in both
+	// the account dir and the stranded backing root, with differing content.
+	// The newer backing copy must survive; the older in-dir copy is discarded
+	// and that discard must be reported.
+	priv := overlay.FusePrivateRoot(dir)
+	if err := os.MkdirAll(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	inDir := filepath.Join(dir, ".last-update-result.json")
+	if err := os.WriteFile(inDir, []byte("stale-in-dir"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(inDir, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(priv, ".last-update-result.json"), []byte("fresh-from-priv"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(priv, ".last-update-result.json"), now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Open(filepath.Join(home, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc", KeychainAccount: "user", OverlayKind: "symlink"}
+	if err := st.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	m := &pool.Manager{Store: st}
+
+	report, calls := captureReports()
+	var out bytes.Buffer
+	checkStrandedPrivate(m, a, true, &out, report)
+
+	if !strings.Contains(out.String(), "discarded stale duplicate") {
+		t.Errorf("doctor heal output does not report the discarded duplicate: %q", out.String())
+	}
+	healed := false
+	for _, c := range *calls {
+		if strings.Contains(c.label, "private files") && c.healthy && strings.Contains(c.detail, "restored from") {
+			healed = true
+		}
+	}
+	if !healed {
+		t.Errorf("missing healthy 'restored from' report: %+v", *calls)
+	}
+	got, err := os.ReadFile(inDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "fresh-from-priv" {
+		t.Errorf("healed file = %q, want the newer backing copy", got)
+	}
+
+	// The seam must be restored after the heal, never left pointed at this
+	// command's buffer: a later write through the seam must not reach out.
+	before := out.Len()
+	overlay.ResolvedConflictLogf("leak probe")
+	if out.Len() != before {
+		t.Errorf("seam leaked past the heal: a write after checkStrandedPrivate still hit the doctor buffer")
 	}
 }

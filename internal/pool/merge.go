@@ -61,9 +61,12 @@ func mergeClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (MergeOu
 	private, err := os.ReadFile(dst)
 	if os.IsNotExist(err) {
 		// A copy stranded in the fuse private backing dir is the fingerprint
-		// of an interrupted conversion. Minting a fresh file here would
-		// manufacture the exact collision HealStrandedPrivate refuses to
-		// clobber through, so point at doctor instead.
+		// of an interrupted conversion. Minting a fresh file here would make
+		// the freshly-written (empty) copy the newer one, so when
+		// HealStrandedPrivate moves the stranded copy back its last-write-wins
+		// resolution would keep this mint and discard the real stranded
+		// identity. Point at doctor instead so the heal restores the stranded
+		// copy intact.
 		stranded := filepath.Join(overlay.FusePrivateRoot(accountDir), ".claude.json")
 		if stranded != dst {
 			if _, serr := os.Lstat(stranded); serr == nil {

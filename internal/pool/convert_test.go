@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -506,6 +507,59 @@ func TestStrandedPrivateMergeRefusalKeepsHealable(t *testing.T) {
 	}
 	if string(got["oauthAccount"]) != `{"accountUuid":"u-1","emailAddress":"a@example.com"}` {
 		t.Fatalf("identity disturbed by the post-heal merge: %s", got["oauthAccount"])
+	}
+}
+
+// TestHealResolvesDuplicatePrivateFile pins the crash-repair fix: when an
+// abnormal shutdown leaves the same private file in BOTH the account dir and
+// the fuse private backing dir, the heal's MovePrivateEntries used to hit a
+// file-file collision and refuse forever — dead-locking the account. It now
+// resolves last-write-wins (newer copy survives), the heal converges, and the
+// resolution is reported through the overlay seam.
+func TestHealResolvesDuplicatePrivateFile(t *testing.T) {
+	m, a, dir := newConvertFixture(t, nil)
+	priv := overlay.FusePrivateRoot(dir)
+	if err := os.MkdirAll(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Same private name in both roots: the stranded backing copy is newer.
+	base := time.Now()
+	if err := os.WriteFile(filepath.Join(dir, ".last-update-result.json"), []byte("stale-in-dir"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dir, ".last-update-result.json"), base.Add(-time.Hour), base.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(priv, ".last-update-result.json"), []byte("fresh-from-priv"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(priv, ".last-update-result.json"), base, base); err != nil {
+		t.Fatal(err)
+	}
+
+	var resolved []string
+	prev := overlay.ResolvedConflictLogf
+	overlay.ResolvedConflictLogf = func(format string, args ...any) {
+		resolved = append(resolved, fmt.Sprintf(format, args...))
+	}
+	defer func() { overlay.ResolvedConflictLogf = prev }()
+
+	healed, err := m.HealStrandedPrivate(a)
+	if err != nil || !healed {
+		t.Fatalf("heal with a duplicate private file: healed=%v err=%v, want true,nil", healed, err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, ".last-update-result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "fresh-from-priv" {
+		t.Fatalf("healed file = %q, want the newer backing copy", got)
+	}
+	if _, err := os.Stat(priv); !os.IsNotExist(err) {
+		t.Errorf("emptied private root not removed: %v", err)
+	}
+	if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
+		t.Errorf("resolution log = %v, want one 'kept newer copy'", resolved)
 	}
 }
 

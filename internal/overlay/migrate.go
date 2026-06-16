@@ -1,12 +1,30 @@
 package overlay
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
 )
+
+// ResolvedConflictLogf surfaces every private-file collision that moveEntry
+// reconciles by last-write-wins, so the recovery is observable and never silent
+// data loss. Each process that drives a move wires it: the daemon points it at
+// its logger at startup, and a daemon-less `doctor --fix` points it at its
+// output for the duration of the heal it runs itself. The default no-op keeps
+// the overlay package free of a logging dependency and silent in tests.
+//
+// It is a package-level seam rather than a return value because the conflict is
+// resolved deep inside an idempotent move that several callers invoke as a bare
+// expression — two of them inside errors.Join — and the pool.Manager methods
+// that drive conversion and healing carry no logger of their own. Threading a
+// resolved-list return up through those signatures (and their daemon callers)
+// would not let those log-less sites report anything; this seam makes every
+// path observable with no ripple. No lock guards it: it is assigned once at
+// daemon startup, before any sweep or conversion runs.
+var ResolvedConflictLogf = func(format string, args ...any) {}
 
 // This file holds the untagged primitives that overlay conversion (and crash
 // repair) is built from. They compile in every build variant: even a non-fuse
@@ -30,9 +48,11 @@ func FusePrivateRoot(accountDir string) string {
 // left untouched. It is idempotent and resumable: already-moved entries are
 // skipped, so re-running after a crash converges. A directory that exists on
 // both sides is merged child-by-child (fuse Setup pre-creates empty excluded
-// dirs in the backing root); a file that exists on both sides is a collision
-// and fails loudly with both copies intact — identity files are never
-// clobbered. Per-entry failures are collected with errors.Join, like Sync.
+// dirs in the backing root); a regular file that exists on both sides is
+// reconciled (see moveEntry) so an abnormal shutdown can never strand the
+// account; a file-vs-directory clash at one name is genuine corruption and
+// fails loudly with both copies intact. Per-entry failures are collected with
+// errors.Join, like Sync.
 func MovePrivateEntries(from, to string) error {
 	if from == "" || to == "" {
 		return fmt.Errorf("move private entries: empty root (from %q, to %q)", from, to)
@@ -70,8 +90,19 @@ func MovePrivateEntries(from, to string) error {
 	return errors.Join(errs...)
 }
 
-// moveEntry renames src to dst. An existing destination directory is merged;
-// an existing destination file is a collision.
+// moveEntry renames src to dst, reconciling an existing destination by kind:
+//   - dst missing: plain rename.
+//   - both directories: merged child-by-child (mergeDir).
+//   - both regular files: a collision left by an abnormal shutdown that wrote
+//     the same private file into both roots. Refusing forever dead-locks the
+//     account (the mount sweep and the symlink retreat each hit it from opposite
+//     directions), so it is RESOLVED, not refused: identical content drops src
+//     and keeps dst; differing content is last-write-wins, the newer mtime
+//     surviving at dst (ties keep dst). Every resolution is reported through
+//     ResolvedConflictLogf — a deliberate recovery, never silent data loss.
+//   - one a file and the other a directory: genuine corruption; fail loudly
+//     with both copies intact (never clobber a directory with a file, or
+//     vice-versa).
 func moveEntry(src, dst string) error {
 	dfi, err := os.Lstat(dst)
 	if err != nil {
@@ -87,10 +118,61 @@ func moveEntry(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("stat %q: %w", src, err)
 	}
-	if sfi.IsDir() && dfi.IsDir() {
+	switch {
+	case sfi.IsDir() && dfi.IsDir():
 		return mergeDir(src, dst)
+	case sfi.Mode().IsRegular() && dfi.Mode().IsRegular():
+		return resolveFileConflict(src, dst, sfi, dfi)
+	default:
+		return fmt.Errorf("private entry type mismatch: %q and %q are not both regular files or both directories; refusing to clobber across types", src, dst)
 	}
-	return fmt.Errorf("private entry collision: %q already exists, refusing to clobber it with %q", dst, src)
+}
+
+// resolveFileConflict reconciles a regular-file-vs-regular-file collision so an
+// abnormal shutdown that left a private file in both roots can never strand the
+// account. Identical bytes: drop src, keep dst. Differing bytes: last-write-
+// wins — the newer mtime survives at dst (src renamed over dst when src is
+// newer; src removed when dst is newer or the mtimes tie). The resolution is
+// reported through ResolvedConflictLogf so it is observable.
+func resolveFileConflict(src, dst string, sfi, dfi os.FileInfo) error {
+	same, err := sameContent(src, dst)
+	if err != nil {
+		return err
+	}
+	if same {
+		if err := os.Remove(src); err != nil {
+			return fmt.Errorf("drop identical duplicate %q: %w", src, err)
+		}
+		ResolvedConflictLogf("resolved private-file conflict on %s (identical duplicate discarded)", dst)
+		return nil
+	}
+	if sfi.ModTime().After(dfi.ModTime()) {
+		if err := os.Rename(src, dst); err != nil {
+			return fmt.Errorf("replace stale %q with newer %q: %w", dst, src, err)
+		}
+		ResolvedConflictLogf("resolved private-file conflict on %s (kept newer copy, discarded stale duplicate)", dst)
+		return nil
+	}
+	if err := os.Remove(src); err != nil {
+		return fmt.Errorf("discard stale duplicate %q: %w", src, err)
+	}
+	ResolvedConflictLogf("resolved private-file conflict on %s (kept newer copy, discarded stale duplicate)", dst)
+	return nil
+}
+
+// sameContent reports whether two files hold identical bytes. Private files are
+// small (identity, credentials, update markers), so a full read-and-compare is
+// cheap and exact — no size or hash shortcut needed.
+func sameContent(a, b string) (bool, error) {
+	ab, err := os.ReadFile(a)
+	if err != nil {
+		return false, fmt.Errorf("read %q: %w", a, err)
+	}
+	bb, err := os.ReadFile(b)
+	if err != nil {
+		return false, fmt.Errorf("read %q: %w", b, err)
+	}
+	return bytes.Equal(ab, bb), nil
 }
 
 // mergeDir moves src's children into dst (recursing into shared subdirs) and
