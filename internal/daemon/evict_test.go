@@ -178,13 +178,15 @@ func TestHandleShutdownEndsServe(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(sockDir) })
 
 	s := &Server{
-		m:            &pool.Manager{Store: st},
-		socket:       filepath.Join(sockDir, "d.sock"),
-		snapshot:     filepath.Join(t.TempDir(), "status.json"),
-		log:          log.New(io.Discard, "", 0),
-		evictTimeout: defaultEvictTimeout,
-		reservations: map[int]time.Time{},
-		rlStreak:     map[int]int{},
+		m:               &pool.Manager{Store: st},
+		socket:          filepath.Join(sockDir, "d.sock"),
+		snapshot:        filepath.Join(t.TempDir(), "status.json"),
+		log:             log.New(io.Discard, "", 0),
+		evictTimeout:    defaultEvictTimeout,
+		reservations:    map[int]time.Time{},
+		rlStreak:        map[int]int{},
+		authStreak:      map[int]int{},
+		lastAuthAttempt: map[int]time.Time{},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

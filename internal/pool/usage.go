@@ -140,11 +140,30 @@ func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error 
 	return m.writeCred(a, src, cred)
 }
 
-// SampleUsage fetches the account's usage windows, refreshing once on 401, and
-// records a usage_sample. Returns the usage and whether the account is
+// SampleOpts controls how SampleUsage may recover a 401.
+//
+// AllowRefresh permits the normal idle-account refresh: the account has no live
+// session, so it owns its own token chain and pre-flight + 401 refresh are safe.
+//
+// AllowBusyRefresh permits the guarded busy-account refresh: a session is live
+// but its access token has expired (a long-parked session refreshes only on API
+// traffic), so usage sampling would 401 forever. The daemon sets this ONLY when
+// the busy state is a procscan-visible session (never a bare reservation, whose
+// claude is mid-launch and about to read the Keychain) AND it has already seen a
+// consecutive 401, giving any waking session a full poll to refresh first. Even
+// then fetchUsage refreshes only when the token is provably expired and a fresh
+// Keychain re-read still yields that same expired credential — proof no session
+// rotated it underneath us.
+type SampleOpts struct {
+	AllowRefresh     bool
+	AllowBusyRefresh bool
+}
+
+// SampleUsage fetches the account's usage windows, recovering a 401 per opts,
+// and records a usage_sample. Returns the usage and whether the account is
 // currently rate-limited.
-func (m *Manager) SampleUsage(ctx context.Context, a store.Account, allowRefresh bool) (*oauth.Usage, bool, error) {
-	usage, rateLimited, err := m.sampleUsage(ctx, a, allowRefresh)
+func (m *Manager) SampleUsage(ctx context.Context, a store.Account, opts SampleOpts) (*oauth.Usage, bool, error) {
+	usage, rateLimited, err := m.sampleUsage(ctx, a, opts)
 	if err != nil {
 		return nil, rateLimited, err
 	}
@@ -156,43 +175,102 @@ func (m *Manager) SampleUsage(ctx context.Context, a store.Account, allowRefresh
 // refresh AND fetchUsage's 401-retry refresh must form one atomic cycle, or
 // another goroutine could rotate the token between them and the retry would
 // re-POST a consumed single-use refresh token.
-func (m *Manager) sampleUsage(ctx context.Context, a store.Account, allowRefresh bool) (*oauth.Usage, bool, error) {
+func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleOpts) (*oauth.Usage, bool, error) {
 	release, err := m.lockAccount(ctx, a.ID)
 	if err != nil {
 		return nil, false, err
 	}
 	defer release()
-	cred, src, _, err := m.ensureFreshToken(ctx, a, RefreshLeadTime, allowRefresh)
+	cred, src, _, err := m.ensureFreshToken(ctx, a, RefreshLeadTime, opts.AllowRefresh)
 	if err != nil && !errors.Is(err, ErrNeedsLogin) {
 		// Even on transient refresh failure we may still have a usable token.
 		if cred == nil {
 			return nil, false, err
 		}
 	}
-	return m.fetchUsage(ctx, a, src, cred, allowRefresh)
+	return m.fetchUsage(ctx, a, src, cred, opts)
 }
 
-// fetchUsage fetches usage, refreshing once on 401. Caller must hold the
-// per-account lock (lockAccount).
-func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src keychain.Source, cred *keychain.Credential, allowRefresh bool) (*oauth.Usage, bool, error) {
+// sameTokens reports whether two credentials carry byte-identical access AND
+// refresh tokens — the test for "no session rotated the chain underneath us".
+func sameTokens(a, b *keychain.Credential) bool {
+	return a.ClaudeAiOauth.AccessToken == b.ClaudeAiOauth.AccessToken &&
+		a.ClaudeAiOauth.RefreshToken == b.ClaudeAiOauth.RefreshToken
+}
+
+// fetchUsage fetches usage and, on a 401, walks the recovery ladder:
+//
+//  1. re-read the Keychain (a live session may have rotated the token since our
+//     pre-flight read) and retry once with the new access token — a pure read,
+//     it never spends a refresh token;
+//  2. with no refresh token, the account is definitively signed out → ErrNeedsLogin;
+//  3. refresh+retry when permitted — always for an idle account (AllowRefresh),
+//     or for a busy account under the strict busy guard (AllowBusyRefresh AND the
+//     token is provably expired AND a fresh re-read still yields that same
+//     credential). A Revoked refresh that finds the credential changed on re-read
+//     means a session won the race (transient); unchanged means truly revoked
+//     (ErrNeedsLogin).
+//
+// Caller must hold the per-account lock (lockAccount).
+func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src keychain.Source, cred *keychain.Credential, opts SampleOpts) (*oauth.Usage, bool, error) {
 	usage, err := m.OAuth.Usage(ctx, cred.ClaudeAiOauth.AccessToken)
 	if err == nil {
 		return usage, false, nil
 	}
 	var ue *oauth.UsageError
-	if errors.As(err, &ue) {
-		if ue.RateLimited() {
-			return &oauth.Usage{}, true, nil
+	if !errors.As(err, &ue) {
+		return nil, false, err
+	}
+	if ue.RateLimited() {
+		return &oauth.Usage{}, true, nil
+	}
+	if !ue.Unauthorized() {
+		return nil, false, err
+	}
+
+	// Rung 1: re-read and retry with a session-rotated token (pure read).
+	if reread, _, rerr := m.readCred(a); rerr == nil && reread.ClaudeAiOauth.AccessToken != cred.ClaudeAiOauth.AccessToken {
+		if usage, err2 := m.OAuth.Usage(ctx, reread.ClaudeAiOauth.AccessToken); err2 == nil {
+			return usage, false, nil
 		}
-		if ue.Unauthorized() && allowRefresh && cred.HasRefreshToken() {
-			refreshed, rerr := m.refresh(ctx, a, src, cred)
-			if rerr == nil {
-				if usage, err2 := m.OAuth.Usage(ctx, refreshed.ClaudeAiOauth.AccessToken); err2 == nil {
-					_ = m.Store.LogRefresh(a.ID, true, "")
-					return usage, false, nil
-				}
+		cred = reread // the rotated token also 401s; refresh from it below
+	}
+
+	// Rung 2: no refresh token → definitively signed out.
+	if !cred.HasRefreshToken() {
+		return nil, false, fmt.Errorf("%w: %v", ErrNeedsLogin, err)
+	}
+
+	// Rung 3: may we refresh? Idle accounts always may; a busy account only
+	// under the guard — provably expired and unchanged on a fresh re-read.
+	mayRefresh := opts.AllowRefresh
+	if !mayRefresh && opts.AllowBusyRefresh && cred.Expired() {
+		if reread, _, rerr := m.readCred(a); rerr == nil && sameTokens(reread, cred) {
+			mayRefresh = true
+		}
+	}
+	if !mayRefresh {
+		return nil, false, err
+	}
+
+	refreshed, rfErr := m.refresh(ctx, a, src, cred)
+	if rfErr != nil {
+		_ = m.Store.LogRefresh(a.ID, false, rfErr.Error())
+		var re *oauth.RefreshError
+		if errors.As(rfErr, &re) && re.Revoked() {
+			// Revoked: a session that rotated the chain in the meantime leaves a
+			// different credential on disk (transient); an unchanged credential
+			// is a genuine server-side revocation (re-login required).
+			if reread, _, rerr := m.readCred(a); rerr == nil && !sameTokens(reread, cred) {
+				return nil, false, err
 			}
+			return nil, false, fmt.Errorf("%w: %v", ErrNeedsLogin, rfErr)
 		}
+		return nil, false, err
+	}
+	_ = m.Store.LogRefresh(a.ID, true, "")
+	if usage, err2 := m.OAuth.Usage(ctx, refreshed.ClaudeAiOauth.AccessToken); err2 == nil {
+		return usage, false, nil
 	}
 	return nil, false, err
 }

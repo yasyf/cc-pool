@@ -44,7 +44,7 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 	fo := &fakeOAuth{currentRT: "rt-0"}
 	m := &Manager{Store: st, OAuth: fo, Keychain: fk, LockDir: t.TempDir()}
 
-	if _, _, err := m.SampleUsage(context.Background(), a, true); err != nil {
+	if _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true}); err != nil {
 		t.Fatalf("SampleUsage: %v", err)
 	}
 	if got := fo.refreshes; got != 1 {
@@ -100,7 +100,7 @@ func TestSampleUsagePersistsExtraUsage(t *testing.T) {
 	}
 	m := &Manager{Store: st, OAuth: &fakeOAuth{currentRT: "rt-0"}, Keychain: fk, LockDir: t.TempDir()}
 
-	if _, _, err := m.SampleUsage(context.Background(), a, false); err != nil {
+	if _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: false}); err != nil {
 		t.Fatalf("SampleUsage: %v", err)
 	}
 	got, ok, err := st.LatestUsageSample(1)

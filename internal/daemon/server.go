@@ -84,6 +84,13 @@ type Server struct {
 	polling      map[int]bool      // accountID -> scheduler/reconcile owns the dir this iteration
 	replacing    bool              // a holder replacement is in flight; fences NEW conversions (see beginReplace)
 	rlStreak     map[int]int       // accountID -> consecutive 429 count
+	// authStreak counts consecutive unrecovered 401s per account; at
+	// needsLoginAfter the account is flagged needs-login. lastAuthAttempt stamps
+	// the last sample of a flagged account so flagged accounts back off to
+	// needsLoginPollInterval instead of 401-spamming every poll. Both are
+	// scheduler-goroutine-local, like rlStreak — no lock.
+	authStreak      map[int]int
+	lastAuthAttempt map[int]time.Time
 
 	// fuseGateFn overrides the migrate handler's fuse-capability gate; nil
 	// means the real check (FuseBuilt + probe mount). Tests inject outcomes
@@ -150,18 +157,20 @@ func Run(ctx context.Context) error {
 	defer m.Close()
 
 	s := &Server{
-		m:            m,
-		socket:       pool.SocketPath(),
-		holderSocket: pool.MountsSocketPath(),
-		holderLog:    pool.MountHolderLogPath(),
-		snapshot:     pool.StatusSnapshotPath(),
-		log:          log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
-		evictTimeout: defaultEvictTimeout,
-		startedAt:    time.Now(),
-		reservations: map[int]time.Time{},
-		converting:   map[int]bool{},
-		polling:      map[int]bool{},
-		rlStreak:     map[int]int{},
+		m:               m,
+		socket:          pool.SocketPath(),
+		holderSocket:    pool.MountsSocketPath(),
+		holderLog:       pool.MountHolderLogPath(),
+		snapshot:        pool.StatusSnapshotPath(),
+		log:             log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
+		evictTimeout:    defaultEvictTimeout,
+		startedAt:       time.Now(),
+		reservations:    map[int]time.Time{},
+		converting:      map[int]bool{},
+		polling:         map[int]bool{},
+		rlStreak:        map[int]int{},
+		authStreak:      map[int]int{},
+		lastAuthAttempt: map[int]time.Time{},
 	}
 	// Make overlay's crash-repair conflict resolution observable: every
 	// private-file collision the migrate path reconciles (in the mount sweep,
@@ -935,6 +944,7 @@ func (s *Server) rankWithReservations(snaps []pool.Snapshot) ([]score.Result, ma
 			ActiveSessions: sn.ActiveSessions + s.reservedCount(sn.Account.ID),
 			RateLimited:    sn.RateLimited,
 			RefreshFailed:  sn.Stale && !sn.HasUsage,
+			NeedsLogin:     sn.NeedsLogin,
 		})
 	}
 	return score.Rank(inputs, time.Now()), bySnap
@@ -968,6 +978,7 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 			ActiveSessions: sn.ActiveSessions,
 			RateLimited:    sn.RateLimited,
 			Exhausted:      sn.Exhausted,
+			NeedsLogin:     sn.NeedsLogin,
 			HasUsage:       sn.HasUsage,
 			Stale:          sn.Stale,
 			Resets5h:       sn.Resets5h,

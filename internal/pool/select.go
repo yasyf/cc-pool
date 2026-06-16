@@ -172,7 +172,9 @@ func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessio
 			defer wg.Done()
 			cctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 			defer cancel()
-			_, _, _ = m.SampleUsage(cctx, a, allowRefresh)
+			// The daemonless CLI path never busy-refreshes: only the daemon owns
+			// the consecutive-401 streak that gates it.
+			_, _, _ = m.SampleUsage(cctx, a, SampleOpts{AllowRefresh: allowRefresh})
 		}()
 	}
 	wg.Wait()
@@ -202,6 +204,9 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 	in.ActiveSessions = procscan.CountByConfigDir(sessions, a.ConfigDir)
 	if r, ok, _ := m.Store.LastRefresh(a.ID); ok && !r.OK {
 		in.RefreshFailed = true
+	}
+	if h, err := m.Store.GetAuthHealth(a.ID); err == nil && h.NeedsLogin {
+		in.NeedsLogin = true
 	}
 	return in, samples, nil
 }

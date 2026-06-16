@@ -263,6 +263,7 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 			ActiveSessions: a.ActiveSessions,
 			RateLimited:    a.RateLimited,
 			Exhausted:      a.Exhausted,
+			NeedsLogin:     a.NeedsLogin,
 			Stale:          a.Stale,
 			Resets5h:       a.Resets5h,
 			Resets7d:       a.Resets7d,
@@ -286,12 +287,14 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 // a usable one, however high its forward-looking score.
 func snapshotTier(s pool.Snapshot) int {
 	switch {
-	case !s.RateLimited && !s.Exhausted:
-		return 0
-	case !s.RateLimited:
+	case s.NeedsLogin:
+		return 3 // needs a human (`ccp login`); below even rate-limited
+	case s.RateLimited:
+		return 2
+	case s.Exhausted:
 		return 1
 	default:
-		return 2
+		return 0
 	}
 }
 
@@ -357,6 +360,10 @@ func renderTable(snaps []pool.Snapshot, pin dirPin) string {
 // healthy. Shared by the plain table and the TUI.
 func snapshotFlags(s pool.Snapshot) string {
 	var flags []string
+	if s.NeedsLogin {
+		// Most actionable state — a human must run `ccp login N`. Lead with it.
+		flags = append(flags, badStyle.Render(fmt.Sprintf("needs login: run `ccp login %d`", s.Account.ID)))
+	}
 	if s.Stale {
 		flags = append(flags, warnStyle.Render("stale"))
 	}

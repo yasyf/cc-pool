@@ -461,3 +461,69 @@ func TestRefreshLog(t *testing.T) {
 		t.Fatalf("last refresh = %+v ok=%v err=%v", e, ok, err)
 	}
 }
+
+func TestAuthHealthTransitions(t *testing.T) {
+	s := openTest(t)
+	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+
+	// No row → healthy.
+	if h, err := s.GetAuthHealth(1); err != nil || h.NeedsLogin {
+		t.Fatalf("fresh account = %+v err=%v, want healthy", h, err)
+	}
+
+	// false→true: changed, Since stamped, err recorded.
+	t0 := time.Unix(1_000_000, 0)
+	changed, err := s.SetNeedsLogin(1, t0, "401 revoked")
+	if err != nil || !changed {
+		t.Fatalf("first SetNeedsLogin changed=%v err=%v, want true", changed, err)
+	}
+	h, _ := s.GetAuthHealth(1)
+	if !h.NeedsLogin || !h.Since.Equal(t0) || h.LastErr != "401 revoked" {
+		t.Fatalf("after flag = %+v", h)
+	}
+
+	// true→true: not changed; Since preserved even with a later timestamp; err updates.
+	changed, _ = s.SetNeedsLogin(1, t0.Add(time.Hour), "401 again")
+	if changed {
+		t.Fatal("repeat SetNeedsLogin must report changed=false")
+	}
+	h, _ = s.GetAuthHealth(1)
+	if !h.Since.Equal(t0) {
+		t.Fatalf("Since must measure the whole outage; got %v want %v", h.Since, t0)
+	}
+	if h.LastErr != "401 again" {
+		t.Fatalf("LastErr should update; got %q", h.LastErr)
+	}
+
+	// ListAuthHealth surfaces only flagged accounts.
+	if m, err := s.ListAuthHealth(); err != nil || len(m) != 1 || !m[1].NeedsLogin {
+		t.Fatalf("ListAuthHealth = %+v err=%v", m, err)
+	}
+
+	// true→false: changed once, then a no-op clear reports unchanged.
+	changed, err = s.ClearNeedsLogin(1)
+	if err != nil || !changed {
+		t.Fatalf("ClearNeedsLogin changed=%v err=%v, want true", changed, err)
+	}
+	if changed, _ := s.ClearNeedsLogin(1); changed {
+		t.Fatal("clearing an already-healthy account must report changed=false")
+	}
+	if h, _ := s.GetAuthHealth(1); h.NeedsLogin || !h.Since.IsZero() || h.LastErr != "" {
+		t.Fatalf("after clear = %+v, want healthy/zeroed", h)
+	}
+	if m, _ := s.ListAuthHealth(); len(m) != 0 {
+		t.Fatalf("ListAuthHealth after clear = %+v, want empty", m)
+	}
+}
+
+func TestDeleteAccountRemovesAuthHealth(t *testing.T) {
+	s := openTest(t)
+	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	s.SetNeedsLogin(1, time.Now(), "x")
+	if err := s.DeleteAccount(1); err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := s.GetAuthHealth(1); h.NeedsLogin {
+		t.Fatal("auth_health row should be deleted with its account")
+	}
+}

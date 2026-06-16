@@ -75,3 +75,15 @@ type RefreshEntry struct {
 	OK        bool
 	Err       string
 }
+
+// AuthHealth is an account's authentication health. NeedsLogin is set by the
+// daemon once it concludes the stored refresh token is gone/revoked and only an
+// interactive `ccp login` can recover the account; Since marks the false→true
+// transition, and LastErr is the failure that triggered it. No secrets — only a
+// flag, a timestamp, and an error string.
+type AuthHealth struct {
+	AccountID  int
+	NeedsLogin bool
+	Since      time.Time // zero when NeedsLogin is false
+	LastErr    string
+}

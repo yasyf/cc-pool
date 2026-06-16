@@ -315,6 +315,12 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 		report(prefix+" keychain", false, kerr.Error())
 	}
 
+	// Auth health: the daemon flags an account when its refresh token is gone or
+	// revoked, so its Keychain item may be present and readable yet useless.
+	if h, herr := m.Store.GetAuthHealth(a.ID); herr == nil && h.NeedsLogin {
+		report(prefix+" auth", false, fmt.Sprintf("needs re-login — run `ccp login %d`", a.ID))
+	}
+
 	// Overlay health.
 	prov := pool.OverlayProviderFor(overlay.Kind(a.OverlayKind))
 	if err := prov.Health(pool.ClaudeDir(), a.ConfigDir); err != nil {

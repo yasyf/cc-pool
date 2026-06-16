@@ -16,7 +16,11 @@ var (
 	W7d          = 0.25
 	WSession     = 2.00
 	PenRateLimit = 100.0
-	PenStale     = 20.0
+	// PenNeedsLogin matches PenRateLimit: a signed-out account also cannot serve.
+	// It is paired with Available=false (and PickFallback skipping it), so the
+	// penalty only orders needs-login accounts among themselves.
+	PenNeedsLogin = 100.0
+	PenStale      = 20.0
 
 	// StaleAfter is the sample age past which the selection penalty engages. It
 	// is deliberately short so select prefers the freshest-sampled account; it is
@@ -88,6 +92,7 @@ type Input struct {
 	ActiveSessions int
 	RateLimited    bool // a live 429 / rate-limit observed
 	RefreshFailed  bool // the most recent refresh attempt failed
+	NeedsLogin     bool // the daemon flagged the account: refresh token gone/revoked
 }
 
 // staleAfter reports whether this account's data is older than d, its refresh
@@ -106,18 +111,19 @@ func (in Input) staleAfter(now time.Time, d time.Duration) bool {
 
 // Components is the per-term breakdown, for `status` and debugging.
 type Components struct {
-	Eff5             float64 // reset-aware effective 5h remaining
-	Eff7             float64 // reset-aware effective 7d remaining
-	RawRemaining5h   float64 // 100 − util5, no reset credit (drives barriers/runway/sticky)
-	RawRemaining7d   float64 // 100 − util7
-	Remaining5h      float64 // W5h · Eff5 (weighted contribution)
-	Remaining7d      float64 // W7d · Eff7
-	SessionPenalty   float64
-	RateLimitPenalty float64
-	StalePenalty     float64
-	Barrier5h        float64
-	Barrier7d        float64
-	RunwayPenalty    float64
+	Eff5              float64 // reset-aware effective 5h remaining
+	Eff7              float64 // reset-aware effective 7d remaining
+	RawRemaining5h    float64 // 100 − util5, no reset credit (drives barriers/runway/sticky)
+	RawRemaining7d    float64 // 100 − util7
+	Remaining5h       float64 // W5h · Eff5 (weighted contribution)
+	Remaining7d       float64 // W7d · Eff7
+	SessionPenalty    float64
+	RateLimitPenalty  float64
+	NeedsLoginPenalty float64
+	StalePenalty      float64
+	Barrier5h         float64
+	Barrier7d         float64
+	RunwayPenalty     float64
 }
 
 // Result is a scored account.
@@ -128,6 +134,7 @@ type Result struct {
 	Resets5h    time.Time
 	Stale       bool
 	RateLimited bool
+	NeedsLogin  bool // refresh token gone/revoked; only `ccp login` recovers it
 	Exhausted   bool // a window is fully used and its reset is still pending
 	// ExhaustedUntil is when the account actually recovers: the latest reset
 	// among the windows that tripped the gate. Zero unless Exhausted.
@@ -203,6 +210,9 @@ func Score(in Input, now time.Time) Result {
 	if in.RateLimited {
 		c.RateLimitPenalty = PenRateLimit
 	}
+	if in.NeedsLogin {
+		c.NeedsLoginPenalty = PenNeedsLogin
+	}
 	// The penalty engages at the short StaleAfter; the displayed Stale flag uses
 	// the longer DisplayStaleAfter so a normally-polled account isn't shown stale.
 	if in.staleAfter(now, StaleAfter) {
@@ -211,7 +221,7 @@ func Score(in Input, now time.Time) Result {
 	stale := in.staleAfter(now, DisplayStaleAfter)
 
 	score := c.Remaining5h + c.Remaining7d -
-		c.SessionPenalty - c.RateLimitPenalty - c.StalePenalty -
+		c.SessionPenalty - c.RateLimitPenalty - c.NeedsLoginPenalty - c.StalePenalty -
 		c.Barrier5h - c.Barrier7d - c.RunwayPenalty
 	return Result{
 		AccountID:      in.AccountID,
@@ -220,9 +230,10 @@ func Score(in Input, now time.Time) Result {
 		Resets5h:       in.Resets5h,
 		Stale:          stale,
 		RateLimited:    in.RateLimited,
+		NeedsLogin:     in.NeedsLogin,
 		Exhausted:      exhausted,
 		ExhaustedUntil: exhaustedUntil,
-		Available:      !in.RateLimited && !exhausted,
+		Available:      !in.RateLimited && !exhausted && !in.NeedsLogin,
 	}
 }
 
@@ -344,10 +355,11 @@ func Pick(ranked []Result) (Result, bool) {
 // PickFallback returns the best exhausted-but-not-rate-limited account, the
 // least-bad pick when Pick found nothing: an exhausted account can still serve
 // (billing extra-usage credits or waiting out its reset), a rate-limited one
-// cannot. ok=false if every account is rate-limited or the pool is empty.
+// cannot, and neither can a needs-login one (no valid token at all). ok=false if
+// every account is rate-limited / needs-login, or the pool is empty.
 func PickFallback(ranked []Result) (Result, bool) {
 	for _, r := range ranked {
-		if !r.RateLimited {
+		if !r.RateLimited && !r.NeedsLogin {
 			return r, true
 		}
 	}

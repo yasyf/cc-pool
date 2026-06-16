@@ -234,7 +234,7 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 
 	// Validate end-to-end with a single usage fetch (best-effort; a transient
 	// failure here does not unwind the add).
-	if _, _, err := m.SampleUsage(ctx, acct, true); err != nil {
+	if _, _, err := m.SampleUsage(ctx, acct, SampleOpts{AllowRefresh: true}); err != nil {
 		return &acct, fmt.Errorf("account added but usage validation failed: %w", err)
 	}
 	return &acct, nil

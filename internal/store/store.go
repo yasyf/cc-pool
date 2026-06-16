@@ -70,6 +70,12 @@ CREATE TABLE IF NOT EXISTS sticky (
   selected_at INTEGER NOT NULL,
   manual      INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS auth_health (
+  account_id  INTEGER PRIMARY KEY,
+  needs_login INTEGER NOT NULL DEFAULT 0,
+  since       INTEGER,
+  last_err    TEXT NOT NULL DEFAULT ''
+);
 `
 
 // Open opens (creating if needed) the database at path and applies the schema.
@@ -232,6 +238,7 @@ func (s *Store) DeleteAccount(id int) error {
 		`DELETE FROM sessions WHERE account_id=?`,
 		`DELETE FROM refresh_log WHERE account_id=?`,
 		`DELETE FROM sticky WHERE account_id=?`,
+		`DELETE FROM auth_health WHERE account_id=?`,
 		`DELETE FROM accounts WHERE id=?`,
 	} {
 		if _, err := tx.Exec(q, id); err != nil {
@@ -608,4 +615,90 @@ func (s *Store) LastRefresh(accountID int) (RefreshEntry, bool, error) {
 	e.TS = time.Unix(ts, 0)
 	e.OK = ok != 0
 	return e, true, nil
+}
+
+// GetAuthHealth returns an account's auth health. An account with no row reads
+// as healthy (NeedsLogin false) — the common case.
+func (s *Store) GetAuthHealth(accountID int) (AuthHealth, error) {
+	row := s.db.QueryRow(
+		`SELECT account_id,needs_login,since,last_err FROM auth_health WHERE account_id=?`, accountID)
+	var h AuthHealth
+	var needs int
+	var since sql.NullInt64
+	if err := row.Scan(&h.AccountID, &needs, &since, &h.LastErr); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AuthHealth{AccountID: accountID}, nil
+		}
+		return AuthHealth{}, fmt.Errorf("get auth health for account %d: %w", accountID, err)
+	}
+	h.NeedsLogin = needs != 0
+	if since.Valid {
+		h.Since = time.Unix(since.Int64, 0)
+	}
+	return h, nil
+}
+
+// ListAuthHealth returns the needs-login accounts keyed by id (healthy accounts
+// are omitted), for the status snapshot to fold over all accounts in one query.
+func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
+	rows, err := s.db.Query(`SELECT account_id,needs_login,since,last_err FROM auth_health WHERE needs_login=1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int]AuthHealth{}
+	for rows.Next() {
+		var h AuthHealth
+		var needs int
+		var since sql.NullInt64
+		if err := rows.Scan(&h.AccountID, &needs, &since, &h.LastErr); err != nil {
+			return nil, err
+		}
+		h.NeedsLogin = needs != 0
+		if since.Valid {
+			h.Since = time.Unix(since.Int64, 0)
+		}
+		out[h.AccountID] = h
+	}
+	return out, rows.Err()
+}
+
+// SetNeedsLogin flags an account as needing interactive re-login, recording the
+// error and stamping Since on the false→true transition only (a repeated flag
+// while already set preserves the original Since, so the timer measures the
+// whole outage). It returns changed=true only on that transition, so the daemon
+// logs the remediation hint exactly once. The daemon's poll loop is the sole
+// writer, so the read-then-write is race-free.
+func (s *Store) SetNeedsLogin(accountID int, at time.Time, errMsg string) (bool, error) {
+	prev, err := s.GetAuthHealth(accountID)
+	if err != nil {
+		return false, err
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO auth_health(account_id,needs_login,since,last_err) VALUES(?,1,?,?)
+		 ON CONFLICT(account_id) DO UPDATE SET
+		   needs_login=1,
+		   last_err=excluded.last_err,
+		   since=CASE WHEN auth_health.needs_login=1 THEN auth_health.since ELSE excluded.since END`,
+		accountID, at.Unix(), errMsg); err != nil {
+		return false, fmt.Errorf("set needs-login for account %d: %w", accountID, err)
+	}
+	return !prev.NeedsLogin, nil
+}
+
+// ClearNeedsLogin clears an account's needs-login flag, returning changed=true
+// only on the true→false transition (a no-op clear of an already-healthy
+// account returns false), so the daemon logs recovery exactly once.
+func (s *Store) ClearNeedsLogin(accountID int) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE auth_health SET needs_login=0, since=NULL, last_err='' WHERE account_id=? AND needs_login=1`,
+		accountID)
+	if err != nil {
+		return false, fmt.Errorf("clear needs-login for account %d: %w", accountID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }

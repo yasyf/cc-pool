@@ -50,11 +50,13 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		m: &pool.Manager{
 			Store: st, OAuth: &fakeOAuth{}, Keychain: newFakeKeychain(), LockDir: t.TempDir(),
 		},
-		snapshot:     filepath.Join(t.TempDir(), "status.json"),
-		log:          log.New(io.Discard, "", 0),
-		reservations: map[int]time.Time{},
-		converting:   map[int]bool{},
-		rlStreak:     map[int]int{},
+		snapshot:        filepath.Join(t.TempDir(), "status.json"),
+		log:             log.New(io.Discard, "", 0),
+		reservations:    map[int]time.Time{},
+		converting:      map[int]bool{},
+		rlStreak:        map[int]int{},
+		authStreak:      map[int]int{},
+		lastAuthAttempt: map[int]time.Time{},
 	}, dirs
 }
 
@@ -509,12 +511,14 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	s := &Server{
-		m:            &pool.Manager{Store: st},
-		socket:       filepath.Join(sockDir, "d.sock"),
-		snapshot:     filepath.Join(t.TempDir(), "status.json"),
-		log:          log.New(&logBuf, "", 0),
-		reservations: map[int]time.Time{},
-		rlStreak:     map[int]int{},
+		m:               &pool.Manager{Store: st},
+		socket:          filepath.Join(sockDir, "d.sock"),
+		snapshot:        filepath.Join(t.TempDir(), "status.json"),
+		log:             log.New(&logBuf, "", 0),
+		reservations:    map[int]time.Time{},
+		rlStreak:        map[int]int{},
+		authStreak:      map[int]int{},
+		lastAuthAttempt: map[int]time.Time{},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

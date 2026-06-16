@@ -438,3 +438,37 @@ func TestIncidentRegression20260610(t *testing.T) {
 		}
 	}
 }
+
+// TestScoreNeedsLoginExcluded pins that a signed-out account is unavailable, is
+// skipped by both Pick and PickFallback (it has no valid token at all), and the
+// penalty is recorded — even when its raw headroom is full.
+func TestScoreNeedsLoginExcluded(t *testing.T) {
+	now := time.Now()
+	r := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 0, NeedsLogin: true}, now)
+	if r.Available {
+		t.Fatal("a needs-login account must be unavailable")
+	}
+	if !r.NeedsLogin || r.Components.NeedsLoginPenalty != PenNeedsLogin {
+		t.Fatalf("needs-login penalty not recorded: %+v", r)
+	}
+
+	// A needs-login account loses selection to a healthy one and is not even a
+	// fallback when it is the only non-rate-limited account.
+	inputs := []Input{
+		{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 0, NeedsLogin: true},
+		{AccountID: 2, HasUsage: true, SampleTS: now, Util5h: 50},
+	}
+	ranked := Rank(inputs, now)
+	best, ok := Pick(ranked)
+	if !ok || best.AccountID != 2 {
+		t.Fatalf("Pick = id %d ok=%v, want the healthy acct 2", best.AccountID, ok)
+	}
+
+	onlyFlagged := Rank([]Input{{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 0, NeedsLogin: true}}, now)
+	if _, ok := Pick(onlyFlagged); ok {
+		t.Fatal("Pick must find nothing when the only account needs login")
+	}
+	if _, ok := PickFallback(onlyFlagged); ok {
+		t.Fatal("PickFallback must skip a needs-login account")
+	}
+}

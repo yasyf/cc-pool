@@ -37,6 +37,11 @@ func (c *Credential) ExpiresWithin(d time.Duration) bool {
 	return time.Until(c.Expiry()) <= d
 }
 
+// Expired reports whether the access token is already at or past its expiry.
+func (c *Credential) Expired() bool {
+	return c.ExpiresWithin(0)
+}
+
 // HasRefreshToken reports whether a usable refresh token is present. Claude
 // clears the refresh token to "" when it detects a dead token, so an empty
 // value means re-login is required.

@@ -24,6 +24,7 @@ type Snapshot struct {
 	ActiveSessions int
 	RateLimited    bool
 	Exhausted      bool // a window is fully used and its reset is still pending
+	NeedsLogin     bool // refresh token gone/revoked; only `ccp login` recovers it
 	Stale          bool
 	Resets5h       time.Time
 	Resets7d       time.Time
@@ -94,6 +95,7 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 			ActiveSessions: in.ActiveSessions,
 			RateLimited:    in.RateLimited,
 			Exhausted:      r.Exhausted,
+			NeedsLogin:     r.NeedsLogin,
 			Stale:          r.Stale,
 			Resets5h:       in.Resets5h,
 			Resets7d:       in.Resets7d,

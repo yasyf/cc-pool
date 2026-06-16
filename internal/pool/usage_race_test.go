@@ -167,7 +167,7 @@ func TestPerAccountLockSerializesCredentialCycle(t *testing.T) {
 			<-start
 			for i := 0; i < iterations; i++ {
 				if g%2 == 0 {
-					if _, _, err := m.SampleUsage(context.Background(), a, true); err != nil {
+					if _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true}); err != nil {
 						t.Errorf("SampleUsage: %v", err)
 						return
 					}

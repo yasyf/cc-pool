@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
@@ -23,6 +25,15 @@ const (
 	// Exponential rate-limit backoff: 3, 6, 12, … capped at 15 minutes.
 	rateLimitBackoffBase = 3 * time.Minute
 	rateLimitBackoffCap  = 15 * time.Minute
+
+	// needsLoginAfter is how many consecutive unrecovered 401s flag an account
+	// needs-login (a definitive ErrNeedsLogin flags it immediately). At 180s+
+	// per poll, 3 is ~10 minutes of confirmed failure before we surface it.
+	needsLoginAfter = 3
+	// needsLoginPollInterval is how often a flagged account is re-sampled: often
+	// enough to auto-recover within minutes of `ccp login`, rarely enough to
+	// stop the per-poll 401 spam.
+	needsLoginPollInterval = 15 * time.Minute
 )
 
 // rlBackoff returns the backoff duration for a given consecutive-429 streak.
@@ -117,6 +128,15 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 		time.Since(last.TS) < rlBackoff(s.rlStreak[a.ID]) {
 		return false
 	}
+	// A flagged (needs-login) account backs off to needsLoginPollInterval: a
+	// revoked account stops 401-spamming every poll but still auto-recovers
+	// within minutes of `ccp login`. A 401 inserts no usage sample, so this
+	// can't ride the rate-limit backoff above — it needs its own clock.
+	if health, _ := s.m.Store.GetAuthHealth(a.ID); health.NeedsLogin {
+		if last, ok := s.lastAuthAttempt[a.ID]; ok && time.Since(last) < needsLoginPollInterval {
+			return false
+		}
+	}
 	if i > 0 {
 		select {
 		case <-ctx.Done():
@@ -155,8 +175,18 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 		}
 	}
 
+	// Busy-account refresh is permitted only when a procscan-visible session
+	// (never a bare reservation, whose claude is mid-launch) holds the account
+	// AND we have already seen a consecutive 401 — giving a lazily-waking
+	// session a full poll to refresh its own token before we touch the chain.
+	busyBySession := procscan.CountByConfigDir(sessions, a.ConfigDir) > 0
+	opts := pool.SampleOpts{
+		AllowRefresh:     idle,
+		AllowBusyRefresh: busyBySession && s.authStreak[a.ID] >= 1,
+	}
+
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	_, rateLimited, err := s.m.SampleUsage(cctx, a, idle)
+	_, rateLimited, err := s.m.SampleUsage(cctx, a, opts)
 	cancel()
 	// rlStreak is scheduler-local (this goroutine only) — no lock needed.
 	if rateLimited {
@@ -164,10 +194,55 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 	} else if err == nil {
 		s.rlStreak[a.ID] = 0
 	}
-	if err != nil {
-		s.log.Printf("acct-%02d sample: %v", a.ID, err)
-	}
+	s.handleAuthOutcome(a, err)
 	return false
+}
+
+// handleAuthOutcome folds one sample's outcome into the account's auth health:
+// a success clears any needs-login flag and the 401 streak (logged once on the
+// transition); a definitive ErrNeedsLogin flags immediately; a plain 401
+// increments the streak and flags at needsLoginAfter; any other error is logged
+// as before. Scheduler-goroutine-local — no lock.
+func (s *Server) handleAuthOutcome(a store.Account, err error) {
+	if err == nil {
+		s.authStreak[a.ID] = 0
+		if changed, cerr := s.m.Store.ClearNeedsLogin(a.ID); cerr != nil {
+			s.log.Printf("acct-%02d clear needs-login: %v", a.ID, cerr)
+		} else if changed {
+			s.log.Printf("acct-%02d auth recovered; needs-login cleared", a.ID)
+		}
+		return
+	}
+	if errors.Is(err, pool.ErrNeedsLogin) {
+		s.flagNeedsLogin(a, err)
+		return
+	}
+	var ue *oauth.UsageError
+	if errors.As(err, &ue) && ue.Unauthorized() {
+		s.authStreak[a.ID]++
+		s.lastAuthAttempt[a.ID] = time.Now()
+		if s.authStreak[a.ID] >= needsLoginAfter {
+			s.flagNeedsLogin(a, err)
+			return
+		}
+		s.log.Printf("acct-%02d sample: %v", a.ID, err)
+		return
+	}
+	s.log.Printf("acct-%02d sample: %v", a.ID, err)
+}
+
+// flagNeedsLogin marks an account needs-login, stamping the attempt clock so the
+// backoff engages, and logs the remediation command once (on the transition).
+func (s *Server) flagNeedsLogin(a store.Account, err error) {
+	s.lastAuthAttempt[a.ID] = time.Now()
+	changed, serr := s.m.Store.SetNeedsLogin(a.ID, time.Now(), err.Error())
+	if serr != nil {
+		s.log.Printf("acct-%02d set needs-login: %v", a.ID, serr)
+		return
+	}
+	if changed {
+		s.log.Printf("acct-%02d needs re-login — run `ccp login %d`: %v", a.ID, a.ID, err)
+	}
 }
 
 // jitter returns a deterministic-ish jitter in [0, max) derived from seed,
