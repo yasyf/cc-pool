@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1149,5 +1150,118 @@ func TestMirrorReaddirSubdirOmitsPrivateMerge(t *testing.T) {
 	}
 	if slices.Contains(got, ".claude.json") {
 		t.Errorf("Readdir(/projects) leaked private .claude.json; got %v", got)
+	}
+}
+
+// TestMirrorSharedLinkSyntheticStatNoSyscall pins the syscall-free carve-out
+// presentation: after snapshotShared, a shared top-level entry's Getattr and
+// Readlink serve a precomputed synthetic S_IFLNK stat (size = len(target)) and
+// the absolute base target WITHOUT stat-ing the target — proven by deleting the
+// targets after the snapshot and asserting the calls still succeed (a dangling
+// symlink, exactly as a real on-disk symlink to a deleted file would). Distinct
+// synthetic inodes keep the NFS client from aliasing two carve-outs.
+func TestMirrorSharedLinkSyntheticStatNoSyscall(t *testing.T) {
+	fs, base, _ := mirrorTree(t)
+	mustMkdir(t, filepath.Join(base, "projects"))
+	mustTouch(t, filepath.Join(base, "settings.json"))
+	fs.snapshotShared()
+
+	// Remove the targets AFTER the snapshot: a syscall-free getattr/readlink must
+	// still serve the synthetic presentation; an Lstat here would fail ENOENT.
+	if err := os.RemoveAll(filepath.Join(base, "projects")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(base, "settings.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	inos := map[uint64]string{}
+	for _, name := range []string{"projects", "settings.json"} {
+		path := "/" + name
+		target := filepath.Join(base, name)
+		var stat fuse.Stat_t
+		if st := fs.Getattr(path, &stat, ^uint64(0)); st != 0 {
+			t.Fatalf("Getattr(%q) = %d, want 0 (synthetic, no syscall on a deleted target)", path, st)
+		}
+		if stat.Mode != fuse.S_IFLNK|0o777 {
+			t.Errorf("Getattr(%q).Mode = %#o, want %#o", path, stat.Mode, fuse.S_IFLNK|0o777)
+		}
+		if stat.Size != int64(len(target)) {
+			t.Errorf("Getattr(%q).Size = %d, want len(target) = %d", path, stat.Size, len(target))
+		}
+		if stat.Ino < sharedLinkInoBase {
+			t.Errorf("Getattr(%q).Ino = %d, want a synthetic ino >= %d", path, stat.Ino, sharedLinkInoBase)
+		}
+		if prev, dup := inos[stat.Ino]; dup {
+			t.Errorf("Getattr(%q).Ino = %d collides with %q", path, stat.Ino, prev)
+		}
+		inos[stat.Ino] = name
+		if st, got := fs.Readlink(path); st != 0 || got != target {
+			t.Fatalf("Readlink(%q) = (%d, %q), want (0, %q)", path, st, got, target)
+		}
+	}
+
+	// A non-carved name (a private entry) is never presented as a symlink.
+	if _, ok := fs.sharedEntryFor(claudeJSONFusePath); ok {
+		t.Errorf("/.claude.json must not be a carve-out symlink")
+	}
+}
+
+// TestMirrorClaudeJSONMergedConcurrentSingleFlight pins the single-flight
+// refactor: many goroutines racing merged() on one freshly-invalidated key must
+// all return bytes identical to a serial merge, with no data race (run -race)
+// and no torn result, and the cache must stay coherent afterward. The
+// single-flight wrapper collapses the concurrent recompute herd; this guards
+// that collapsing it never corrupts or tears the shared result.
+func TestMirrorClaudeJSONMergedConcurrentSingleFlight(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	privPath := filepath.Join(home, "acct.private", ".claude.json")
+	basePath := filepath.Join(home, ".claude.json")
+
+	// Prime the cache for the initial key, then invalidate it by rewriting the
+	// private file so the concurrent callers all miss and contend the merge.
+	if _, st := fs.cj.merged(); st != 0 {
+		t.Fatalf("warm merged = %d, want 0", st)
+	}
+	newPriv := `{"theme":"contended","oauthAccount":{"accountUuid":"acct-own"},"numStartups":3}`
+	if err := os.WriteFile(privPath, []byte(newPriv), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want, _, err := MergeClaudeJSON([]byte(newPriv), mustReadFile(t, basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	results := make([][]byte, n)
+	codes := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results[i], codes[i] = fs.cj.merged()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if codes[i] != 0 {
+			t.Fatalf("goroutine %d merged status = %d, want 0", i, codes[i])
+		}
+		if !bytes.Equal(results[i], want) {
+			t.Fatalf("goroutine %d merged bytes diverged from the serial merge:\n got %s\nwant %s", i, results[i], want)
+		}
+	}
+	// The cache stays coherent: a subsequent serial read still serves the bytes.
+	got, st := fs.cj.merged()
+	if st != 0 || !bytes.Equal(got, want) {
+		t.Fatalf("post-contention merged = (%d, %s), want (0, %s)", st, got, want)
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil", err)
 	}
 }

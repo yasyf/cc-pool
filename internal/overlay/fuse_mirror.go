@@ -8,10 +8,26 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
 	"golang.org/x/sys/unix"
 )
+
+// sharedLinkInoBase is the first synthetic inode handed to a carve-out symlink.
+// 1<<62 keeps the synthetic fileids clear of the real backing inode numbers the
+// mirror serves for /.claude.json and the private entries, so the NFS client
+// never aliases a symlink with a real object.
+const sharedLinkInoBase = uint64(1) << 62
+
+// sharedEntry is a precomputed live-symlink presentation for a shared top-level
+// entry: the absolute base target and a synthetic S_IFLNK stat. Both are fixed
+// for the mount's life — the carve-out targets are immutable links the kernel
+// resolves OUTSIDE the mount — so Getattr/Readlink serve them with zero syscalls.
+type sharedEntry struct {
+	target string
+	stat   fuse.Stat_t
+}
 
 // mirrorFS is a passthrough filesystem: most operations are applied directly to
 // the corresponding path under root (~/.claude), so reads and writes are shared
@@ -31,18 +47,18 @@ type mirrorFS struct {
 	privateRoot string          // per-account backing for ExcludedEntries
 	cj          *claudeJSONView // merged read view + base write-through for /.claude.json
 	probe       *probeView      // virtual read-only /.ccp-probe for deep wedge probing
-	// shared is the set of top-level base names present at mount time, captured
-	// by snapshotShared. Only these present as live symlinks into base
-	// (sharedLink), carving claude's bulk transcript/history I/O out of fuse-t's
-	// NFS path. It is the empty set until Setup snapshots it, so the method-level
-	// tests (which never mount) see pure passthrough. Snapshotting at mount time
-	// — rather than carving any name that merely exists in base — is what keeps a
-	// create-through-mount safe: were a brand-new top-level file to flip to a
-	// symlink the instant CREATE lands it in base, the kernel's immediate
-	// post-CREATE Getattr would race it into a symlink and the in-flight NFS
-	// write would fail EIO. Entries born after the mount stay passthrough; the
-	// next mount snapshots and carves them.
-	shared map[string]bool
+	// sharedStat maps each shared top-level base name present at mount time to its
+	// precomputed live-symlink presentation (absolute target + synthetic S_IFLNK
+	// stat). Only these present as live symlinks into base (sharedLink), carving
+	// claude's bulk transcript/history I/O out of fuse-t's NFS path. It is nil
+	// until Setup snapshots it, so the method-level tests (which never mount) see
+	// pure passthrough. Snapshotting at mount time — rather than carving any name
+	// that merely exists in base — is what keeps a create-through-mount safe: were
+	// a brand-new top-level file to flip to a symlink the instant CREATE lands it
+	// in base, the kernel's immediate post-CREATE Getattr would race it into a
+	// symlink and the in-flight NFS write would fail EIO. Entries born after the
+	// mount stay passthrough; the next mount snapshots and carves them.
+	sharedStat map[string]sharedEntry
 }
 
 func newMirrorFS(root, privateRoot, baseClaudeJSON string) *mirrorFS {
@@ -96,20 +112,63 @@ func isTopLevel(path string) bool {
 	return p != "" && !strings.ContainsRune(p, '/')
 }
 
-// snapshotShared records the top-level names present in base at mount time;
-// only these present as live symlinks (see sharedLink and the shared field).
-// Called once from Setup before the mount serves, so no client op can race the
-// snapshot. A read failure leaves the set empty (pure passthrough) rather than
-// guessing.
+// snapshotShared records the top-level names present in base at mount time and
+// precomputes each one's live-symlink presentation (target + synthetic S_IFLNK
+// stat); only these present as live symlinks (see sharedLink and the sharedStat
+// field). Called once from Setup before the mount serves, so no client op can
+// race the snapshot. A read failure leaves the map nil (pure passthrough) rather
+// than guessing. The private names, the merged /.claude.json, and the virtual
+// probe are excluded here once, so the per-call sharedLink needs no syscall and
+// no re-check.
 func (fs *mirrorFS) snapshotShared() {
 	entries, err := os.ReadDir(fs.root)
 	if err != nil {
 		return
 	}
-	fs.shared = make(map[string]bool, len(entries))
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	now := time.Now()
+	ts := fuse.Timespec{Sec: now.Unix(), Nsec: int64(now.Nanosecond())}
+	ino := sharedLinkInoBase
+	fs.sharedStat = make(map[string]sharedEntry, len(entries))
 	for _, e := range entries {
-		fs.shared[e.Name()] = true
+		name := e.Name()
+		if privateName(name) || "/"+name == claudeJSONFusePath || name == ProbeFileName {
+			continue
+		}
+		target := filepath.Join(fs.root, name)
+		fs.sharedStat[name] = sharedEntry{
+			target: target,
+			stat: fuse.Stat_t{
+				Ino:      ino,
+				Mode:     fuse.S_IFLNK | 0o777,
+				Nlink:    1,
+				Uid:      uid,
+				Gid:      gid,
+				Size:     int64(len(target)),
+				Atim:     ts,
+				Mtim:     ts,
+				Ctim:     ts,
+				Birthtim: ts,
+			},
+		}
+		ino++
 	}
+}
+
+// sharedEntryFor returns the precomputed live-symlink presentation for a shared
+// top-level entry, or false for everything else (nested paths, private names,
+// /.claude.json, the probe, and any name not present in base at mount time).
+// It is a pure map lookup: snapshotShared already applied the exclusions and
+// captured the target + synthetic stat, so no syscall and no re-check is needed.
+// A target deleted from base after the mount is not pruned here — the entry then
+// presents as a dangling symlink (the kernel resolves it OUTSIDE the mount and
+// gets ENOENT there), exactly as a real on-disk symlink to a deleted file would.
+func (fs *mirrorFS) sharedEntryFor(path string) (sharedEntry, bool) {
+	if !isTopLevel(path) {
+		return sharedEntry{}, false
+	}
+	e, ok := fs.sharedStat[strings.TrimPrefix(path, "/")]
+	return e, ok
 }
 
 // sharedLink reports whether path is a shared top-level entry the mirror should
@@ -121,25 +180,12 @@ func (fs *mirrorFS) snapshotShared() {
 // on-disk symlink provider already does. The mirror keeps doing real work only
 // for the carve-outs this excludes: /.claude.json (merged read + write-through),
 // private names (privateRoot redirect) and /.ccp-probe (virtual). Only names in
-// the mount-time snapshot (fs.shared) qualify — an entry born after the mount
+// the mount-time snapshot (fs.sharedStat) qualify — an entry born after the mount
 // stays passthrough so a create-through-mount never flips type mid-write; its
 // content is still served live through the symlink once a later mount carves it.
 func (fs *mirrorFS) sharedLink(path string) (string, bool) {
-	if !isTopLevel(path) {
-		return "", false
-	}
-	name := strings.TrimPrefix(path, "/")
-	if !fs.shared[name] {
-		return "", false
-	}
-	if privateName(name) || path == claudeJSONFusePath || name == ProbeFileName {
-		return "", false
-	}
-	target := filepath.Join(fs.root, name)
-	if _, err := os.Lstat(target); err != nil {
-		return "", false
-	}
-	return target, true
+	e, ok := fs.sharedEntryFor(path)
+	return e.target, ok
 }
 
 func errno(err error) int {
@@ -194,17 +240,12 @@ func (fs *mirrorFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 		copyStat(stat, &st)
 		return 0
 	}
-	if target, ok := fs.sharedLink(path); ok {
-		// Synthesize a symlink stat from the target's own metadata, then override
-		// the type and size to those of a symlink pointing at the absolute base
-		// path. The kernel follows the link OUTSIDE the mount, so the carved bulk
-		// I/O never traverses fuse-t's NFS layer (see sharedLink).
-		if err := syscall.Lstat(target, &st); err != nil {
-			return errno(err)
-		}
-		copyStat(stat, &st)
-		stat.Mode = fuse.S_IFLNK | 0o777
-		stat.Size = int64(len(target))
+	if e, ok := fs.sharedEntryFor(path); ok {
+		// A shared top-level entry presents as a live symlink to the absolute base
+		// path; the kernel follows it OUTSIDE the mount, so the carved bulk I/O
+		// never traverses fuse-t's NFS layer (see sharedLink). The synthetic stat
+		// is precomputed at mount time (snapshotShared), so this costs no syscall.
+		*stat = e.stat
 		return 0
 	}
 	if err := syscall.Lstat(fs.real(path), &st); err != nil {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
+	"golang.org/x/sync/singleflight"
 )
 
 // claudeJSONFusePath is the fuse path of claude's primary state file — the one
@@ -50,6 +51,14 @@ type claudeJSONView struct {
 	privatePath string // committed per-account file under the private backing root
 	basePath    string // shared ~/.claude.json, sibling of the mirrored root
 
+	// mergeSF collapses concurrent cache-miss recomputes of the merged view to a
+	// single merge. Under ~20 concurrent sessions a base write-through bumps every
+	// mount's cache key at once, so without it each concurrent getattr/open would
+	// independently re-run the MB-scale ReadFile+Unmarshal+merge (a thundering
+	// herd). Keyed on the mergeKey, so misses for the same (priv,base) snapshot
+	// share one result. Has its own internal locking — never held under mu.
+	mergeSF singleflight.Group
+
 	mu        sync.Mutex          // guards every field below — the one synchronization story for this view
 	nextFh    uint64              // next synthetic handle ID
 	snapshots map[uint64][]byte   // synthetic fh → per-handle merged snapshot
@@ -81,6 +90,12 @@ type claudeJSONView struct {
 type mergeKey struct {
 	privMtimeNS, privSize int64
 	baseMtimeNS, baseSize int64
+}
+
+// sfKey renders the merge key as a singleflight key so concurrent recomputes for
+// the same (priv,base) snapshot coalesce.
+func (k mergeKey) sfKey() string {
+	return fmt.Sprintf("%d:%d:%d:%d", k.privMtimeNS, k.privSize, k.baseMtimeNS, k.baseSize)
 }
 
 func newClaudeJSONView(privatePath, basePath string) *claudeJSONView {
@@ -137,6 +152,32 @@ func (v *claudeJSONView) merged() ([]byte, int) {
 		}
 		v.mu.Unlock()
 	}
+	// A non-cacheable key (private file unstattable) can't be coalesced — recompute
+	// directly. Otherwise single-flight on the key so the concurrent post-commit
+	// miss herd shares one merge of the MB-scale file (see mergeSF).
+	if !cacheable {
+		return v.recompute(key, false)
+	}
+	r, _, _ := v.mergeSF.Do(key.sfKey(), func() (any, error) {
+		buf, st := v.recompute(key, true)
+		return mergeResult{buf: buf, st: st}, nil
+	})
+	res := r.(mergeResult)
+	return res.buf, res.st
+}
+
+// mergeResult carries recompute's (bytes, errno) result through singleflight.
+type mergeResult struct {
+	buf []byte
+	st  int
+}
+
+// recompute is merged()'s cache-miss body: read the private and base files,
+// merge them, and (when cacheable) store the result. Split out so mergeSF can
+// wrap it. The read-error fallback contract is merged()'s: a missing private
+// file is -ENOENT; an unparseable private/base records readErr and falls back to
+// the raw private bytes so the session never sees EIO; a success clears readErr.
+func (v *claudeJSONView) recompute(key mergeKey, cacheable bool) ([]byte, int) {
 	priv, err := os.ReadFile(v.privatePath)
 	if err != nil {
 		return nil, errno(err)
