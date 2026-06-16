@@ -1682,3 +1682,378 @@ func TestReviveRemountsPreRowMounts(t *testing.T) {
 			s.holder.ready(preRow), s.holder.ready(dirs[1]))
 	}
 }
+
+// swapForceUnmount replaces the daemon's direct force-unmount seam for one
+// test, restoring it after. Tests using it must not run in parallel.
+func swapForceUnmount(t *testing.T, fn func(string) error) {
+	t.Helper()
+	prev := forceUnmount
+	forceUnmount = fn
+	t.Cleanup(func() { forceUnmount = prev })
+}
+
+// stringSet builds a set from dirs for order-independent comparison.
+func stringSet(dirs []string) map[string]bool {
+	m := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		m[d] = true
+	}
+	return m
+}
+
+// TestReviveForceUnmountsOrphansBeforeSpawn pins Fix 1a: the moment the holder
+// is detected dead, every wedged fuse carcass is force-unmounted DIRECTLY (no
+// holder) BEFORE the respawn, and a dir that is not a mountpoint is skipped.
+func TestReviveForceUnmountsOrphansBeforeSpawn(t *testing.T) {
+	cases := map[string]struct {
+		mounted  map[int]bool // which fuse dirs read as (wedged) mountpoints
+		wantDirs []int        // account ids whose dirs must be force-unmounted
+	}{
+		"both wedged carcasses cleared before respawn": {
+			mounted:  map[int]bool{1: true, 2: true},
+			wantDirs: []int{1, 2},
+		},
+		"non-mountpoint skipped": {
+			mounted:  map[int]bool{1: true},
+			wantDirs: []int{1},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, dirs, _, rec := newSuperviseServer(t)
+			flipToFuse(t, s, 1)
+			flipToFuse(t, s, 2)
+
+			mountedByDir := map[string]bool{}
+			for id, m := range tc.mounted {
+				mountedByDir[dirs[id]] = m
+			}
+			fakeOverlayMounted(t, func(dir string) bool { return mountedByDir[dir] })
+
+			var (
+				mu              sync.Mutex
+				unmounted       []string
+				unmountsAtSpawn = -1
+			)
+			swapForceUnmount(t, func(dir string) error {
+				mu.Lock()
+				unmounted = append(unmounted, dir)
+				mu.Unlock()
+				return nil
+			})
+			base := rec.fn
+			s.spawnHolder = func(socket, logPath string, to time.Duration) error {
+				mu.Lock()
+				if unmountsAtSpawn < 0 {
+					unmountsAtSpawn = len(unmounted)
+				}
+				mu.Unlock()
+				return base(socket, logPath, to)
+			}
+
+			s.superviseTick(t.Context())
+
+			want := make([]string, 0, len(tc.wantDirs))
+			for _, id := range tc.wantDirs {
+				want = append(want, dirs[id])
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !reflect.DeepEqual(stringSet(unmounted), stringSet(want)) {
+				t.Fatalf("force-unmounted %v, want %v", unmounted, want)
+			}
+			if rec.count() != 1 {
+				t.Fatalf("spawns = %d, want 1 (the respawn must still run after clearing carcasses)", rec.count())
+			}
+			if unmountsAtSpawn != len(want) {
+				t.Fatalf("unmounts before spawn = %d, want %d (every carcass cleared before respawn)", unmountsAtSpawn, len(want))
+			}
+		})
+	}
+}
+
+// TestReviveForceUnmountsCarriedOrphanBeforeSpawn pins Fix 1a's carry branch:
+// orphanDirs unions the fuse account rows with the dead holder's carried pre-row
+// mounts (carriedBases) — a `ccp add` mid-login the holder served before its row
+// landed at FinalizeAdd. That carried dir is a wedged carcass too, so it must be
+// force-unmounted DIRECTLY (no holder), BEFORE the respawn, even though no
+// account row names it. (TestReviveForceUnmountsOrphansBeforeSpawn covers only
+// the account-row dirs; carriedBases stays empty there.)
+func TestReviveForceUnmountsCarriedOrphanBeforeSpawn(t *testing.T) {
+	s, dirs, _, rec := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	preRow, err := os.MkdirTemp("/tmp", "ccp-prerow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(preRow) })
+
+	// Prime carriedBases from a live holder serving a pre-row dir (no account
+	// row), then crash it: the snapshot survives markUnhealthy into the revive.
+	old := startSkewedHolder(t, []mountd.MountInfo{
+		{Dir: dirs[1], Base: "/base", Live: true},
+		{Dir: preRow, Base: "/base2", Live: true},
+	}, false)
+	s.holderSocket = old.socket
+	s.holder.refresh(s.holderClient())
+	_ = old.ln.Close() // the holder crashes; carriedBases keeps the pre-row dir
+
+	// Only the carried pre-row dir reads as a wedged mountpoint.
+	fakeOverlayMounted(t, func(dir string) bool { return dir == preRow })
+
+	var (
+		mu              sync.Mutex
+		unmounted       []string
+		unmountsAtSpawn = -1
+	)
+	swapForceUnmount(t, func(dir string) error {
+		mu.Lock()
+		unmounted = append(unmounted, dir)
+		mu.Unlock()
+		return nil
+	})
+	base := rec.fn
+	s.spawnHolder = func(socket, logPath string, to time.Duration) error {
+		mu.Lock()
+		if unmountsAtSpawn < 0 {
+			unmountsAtSpawn = len(unmounted)
+		}
+		mu.Unlock()
+		return base(socket, logPath, to)
+	}
+
+	s.superviseTick(t.Context())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(stringSet(unmounted), stringSet([]string{preRow})) {
+		t.Fatalf("force-unmounted %v, want the carried pre-row dir [%s]", unmounted, preRow)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("spawns = %d, want 1 (the respawn must still run after clearing the carried carcass)", rec.count())
+	}
+	if unmountsAtSpawn != 1 {
+		t.Fatalf("unmounts before spawn = %d, want 1 (the carried carcass cleared before respawn)", unmountsAtSpawn)
+	}
+}
+
+// driveRetryTicks runs n steady-state supervision ticks against a settled
+// holder, rewinding the per-row backoff window before each so every tick makes
+// a real heal attempt (mirroring the supervise cadence without sleeping).
+func driveRetryTicks(t *testing.T, s *Server, id, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if st, ok := s.sup.rowRetry[id]; ok {
+			st.retryAt = time.Now().Add(-time.Second)
+			s.sup.rowRetry[id] = st
+		}
+		s.superviseTick(t.Context())
+	}
+}
+
+// TestRemountBreakerThreshold pins the breaker const guard: a single transient
+// mount failure must never escalate, so the threshold must be at least 2.
+func TestRemountBreakerThreshold(t *testing.T) {
+	if remountBreakerThreshold < 2 {
+		t.Fatalf("remountBreakerThreshold = %d, want >= 2 so a single transient mount failure never escalates", remountBreakerThreshold)
+	}
+}
+
+// TestSuperviseRemountBreakerEscalates pins Fix 1b: after exactly
+// remountBreakerThreshold consecutive wedged remounts the breaker fires —
+// force-unmounting the carcass, converting the row to symlink, dropping the
+// ledger entry, dropping the holder-cache vouch, and surfacing it loudly.
+func TestSuperviseRemountBreakerEscalates(t *testing.T) {
+	s, dirs, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil) // healthy, vouches for nothing
+	fake.setupErr = mountTimeoutChain()        // healRetry forever — the wedged shape
+	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+
+	var (
+		mu        sync.Mutex
+		unmounted []string
+	)
+	swapForceUnmount(t, func(dir string) error {
+		mu.Lock()
+		unmounted = append(unmounted, dir)
+		mu.Unlock()
+		return nil
+	})
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+
+	driveRetryTicks(t, s, 1, remountBreakerThreshold)
+
+	mu.Lock()
+	gotUnmounted := append([]string(nil), unmounted...)
+	mu.Unlock()
+	if len(gotUnmounted) != 1 || gotUnmounted[0] != dirs[1] {
+		t.Fatalf("breaker force-unmounted %v, want exactly [%s]", gotUnmounted, dirs[1])
+	}
+	if got := kindOf(t, s, 1); got != "symlink" {
+		t.Fatalf("row kind after the breaker = %q, want symlink", got)
+	}
+	if _, ok := s.sup.rowRetry[1]; ok {
+		t.Fatal("breaker left a rowRetry entry; the churn would continue")
+	}
+	if s.holder.ready(dirs[1]) {
+		t.Fatal("breaker did not drop the holder-cache vouch for the converted dir")
+	}
+	if !strings.Contains(buf.String(), "never recovered") {
+		t.Fatalf("breaker escalation not surfaced in the log:\n%s", buf.String())
+	}
+}
+
+// TestSuperviseRemountBreakerEscalatesUnderLiveSession pins that the breaker is
+// UNGATED by live sessions: a never-recovering mount is a whole-machine hazard,
+// not a healthy mount, so escalateWedgedRow force-unmounts the carcass and
+// converts the row to symlink even with a live session on the dir (relaunch is
+// the documented fix, exactly as the held-dead remount policy accepts). The
+// idle/session gate belongs only to fallbackToSymlink on the genuine-mount path;
+// a regression adding one here would reintroduce the freeze hazard the kill-9
+// incident exposed — with every other breaker test running an idle scan, this is
+// the only case that fails if it does.
+func TestSuperviseRemountBreakerEscalatesUnderLiveSession(t *testing.T) {
+	s, dirs, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil) // healthy, vouches for nothing
+	fake.setupErr = mountTimeoutChain()        // healRetry forever — the wedged shape
+	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+	// A live session on the very dir the breaker is about to force down: a
+	// session gate would consult it and bail; the breaker must not.
+	s.scanSessions = func() ([]procscan.Session, error) {
+		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+	}
+
+	var (
+		mu        sync.Mutex
+		unmounted []string
+	)
+	swapForceUnmount(t, func(dir string) error {
+		mu.Lock()
+		unmounted = append(unmounted, dir)
+		mu.Unlock()
+		return nil
+	})
+
+	driveRetryTicks(t, s, 1, remountBreakerThreshold)
+
+	mu.Lock()
+	gotUnmounted := append([]string(nil), unmounted...)
+	mu.Unlock()
+	if len(gotUnmounted) != 1 || gotUnmounted[0] != dirs[1] {
+		t.Fatalf("breaker force-unmounted %v under a live session, want exactly [%s] (it must stay ungated)", gotUnmounted, dirs[1])
+	}
+	if got := kindOf(t, s, 1); got != "symlink" {
+		t.Fatalf("row kind after the breaker = %q, want symlink (a live session must not block escalation)", got)
+	}
+	if _, ok := s.sup.rowRetry[1]; ok {
+		t.Fatal("breaker left a rowRetry entry; the churn would continue")
+	}
+	if s.holder.ready(dirs[1]) {
+		t.Fatal("breaker did not drop the holder-cache vouch for the converted dir")
+	}
+}
+
+// TestSuperviseRemountBreakerHoldsUnderThreshold pins that fewer than the
+// threshold consecutive failures keep retrying — no escalation, the row stays
+// fuse, and the ledger keeps counting.
+func TestSuperviseRemountBreakerHoldsUnderThreshold(t *testing.T) {
+	s, dirs, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	fake.setupErr = mountTimeoutChain()
+	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+
+	var unmounts int
+	swapForceUnmount(t, func(string) error { unmounts++; return nil })
+
+	driveRetryTicks(t, s, 1, remountBreakerThreshold-1)
+
+	if unmounts != 0 {
+		t.Fatalf("force-unmounts under the threshold = %d, want 0", unmounts)
+	}
+	if got := kindOf(t, s, 1); got != "fuse" {
+		t.Fatalf("row kind under the threshold = %q, want fuse (still retrying)", got)
+	}
+	if got := s.sup.rowRetry[1].hazard; got != remountBreakerThreshold-1 {
+		t.Fatalf("hazard count = %d, want %d (one short of the breaker)", got, remountBreakerThreshold-1)
+	}
+}
+
+// TestSuperviseRemountBreakerResetsOnMount pins that a successful mount before
+// the threshold clears the breaker's hazard count: a row that recovers never
+// fires the breaker, and a later failure restarts the count from one.
+func TestSuperviseRemountBreakerResetsOnMount(t *testing.T) {
+	s, dirs, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	fake.setupErr = mountTimeoutChain()
+	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+
+	var unmounts int
+	swapForceUnmount(t, func(string) error { unmounts++; return nil })
+
+	// A few wedged attempts short of the breaker…
+	driveRetryTicks(t, s, 1, remountBreakerThreshold-2)
+	if got := s.sup.rowRetry[1].hazard; got != remountBreakerThreshold-2 {
+		t.Fatalf("hazard before recovery = %d, want %d", got, remountBreakerThreshold-2)
+	}
+
+	// …then the mount comes up: the ledger entry is dropped entirely.
+	fake.setupErr = nil
+	driveRetryTicks(t, s, 1, 1)
+	if _, ok := s.sup.rowRetry[1]; ok {
+		t.Fatal("a successful mount left a rowRetry entry")
+	}
+	if !s.holder.ready(dirs[1]) {
+		t.Fatal("recovered row not vouched for")
+	}
+
+	// A fresh wedge starts the hazard count over from one — never near the
+	// threshold — so the recovered row never carries stale breaker progress.
+	fake.setupErr = mountTimeoutChain()
+	driveRetryTicks(t, s, 1, 1)
+	if got := s.sup.rowRetry[1].hazard; got != 1 {
+		t.Fatalf("hazard after a fresh failure = %d, want 1 (reset by the recovery)", got)
+	}
+	if unmounts != 0 {
+		t.Fatalf("force-unmounts across a recovering row = %d, want 0", unmounts)
+	}
+}
+
+// TestSuperviseRemountBreakerNeverEscalatesTCC pins the load-bearing exclusion:
+// a TCC-blocked row is a CLEAN not-mounted state, so it must retry FOREVER for
+// the human to grant Network Volumes — the breaker must never escalate it, even
+// far past the threshold.
+func TestSuperviseRemountBreakerNeverEscalatesTCC(t *testing.T) {
+	s, dirs, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive) // healTCCBlocked
+	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+
+	var unmounts int
+	swapForceUnmount(t, func(string) error { unmounts++; return nil })
+
+	ticks := remountBreakerThreshold + 3
+	driveRetryTicks(t, s, 1, ticks)
+
+	if unmounts != 0 {
+		t.Fatalf("TCC-blocked row force-unmounted %d time(s); it must retry forever", unmounts)
+	}
+	if got := kindOf(t, s, 1); got != "fuse" {
+		t.Fatalf("TCC-blocked row kind = %q, want fuse (still waiting on the grant)", got)
+	}
+	st, ok := s.sup.rowRetry[1]
+	if !ok {
+		t.Fatal("TCC-blocked row dropped its retry ledger; it would stop retrying")
+	}
+	if st.failures != ticks {
+		t.Fatalf("TCC failures = %d, want %d (kept backing off)", st.failures, ticks)
+	}
+	if st.hazard != 0 {
+		t.Fatalf("TCC hazard = %d, want 0 (never counts toward the breaker)", st.hazard)
+	}
+}

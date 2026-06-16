@@ -40,6 +40,21 @@ const (
 	defaultHolderGoneWait = 70 * time.Second
 )
 
+// remountBreakerThreshold is the circuit-breaker limit on retryUnvouchedFuseRows:
+// after this many CONSECUTIVE wedged/never-recovering heal failures (mount-up
+// timeouts, a wedged unmount in the way — never a TCC block, which is a clean
+// not-mounted state), the loop stops retrying the row forever and escalates
+// (escalateWedgedRow). A mount that never comes up churns indefinitely and can
+// keep re-wedging the kernel — the whole-machine hazard the kill-9 holder-death
+// incident exposed — so the row is forced down and converted to symlink instead
+// of retried into eternity.
+const remountBreakerThreshold = 5
+
+// forceUnmount force-unmounts an orphaned fuse carcass directly, without
+// routing through the (possibly dead) holder; seamed so tests assert the calls
+// without real mounts. Production: overlay.ForceUnmount (bounded).
+var forceUnmount = overlay.ForceUnmount
+
 // backoffAfter returns the wait after `failures` consecutive failures: base
 // doubling per failure, capped at limit. Zero or negative failure counts
 // never shrink below base.
@@ -83,8 +98,15 @@ type supervisor struct {
 // rowRetryState is one fuse row's remount-backoff bookkeeping in
 // supervisor.rowRetry.
 type rowRetryState struct {
-	failures int       // consecutive failed heal attempts
+	failures int       // consecutive failed heal attempts (drives the backoff window)
 	retryAt  time.Time // backoff: earliest next heal attempt
+	// hazard counts CONSECUTIVE wedged/never-recovering heal failures for the
+	// circuit breaker (remountBreakerThreshold). It is advanced only by hazard
+	// outcomes (healRetry/healFallback) and reset by a successful mount or a
+	// healTCCBlocked — a TCC block is a clean not-mounted state that must retry
+	// forever, so it backs off (via failures) but never counts toward the
+	// breaker.
+	hazard int
 }
 
 // superviseHolder watches the detached mount holder until ctx is cancelled:
@@ -167,6 +189,20 @@ func (s *Server) reviveHolder(ctx context.Context) {
 			fuse = append(fuse, a)
 		}
 	}
+	// Snapshot the dead holder's dir->base registry BEFORE the spawn:
+	// verifySpawnedHolder's refresh installs the fresh holder's (empty) List,
+	// after which the pre-row mounts' bases are gone from the cache.
+	carry := s.holder.carriedBases()
+	// The holder is dead, so every mirror it served is now a wedged NFS
+	// carcass: markUnhealthy already dropped them from the cache and the
+	// pipeline below remounts them FRESH, so force-unmounting them now — directly,
+	// without the dead holder — loses nothing and removes a whole-machine hazard
+	// the moment it appears, instead of letting it linger through the slow
+	// respawn→remount path (the kill-9 fork-bomb incident: a lingering wedged
+	// mount hangs every lsof/stat on the box). Done before every early return so
+	// even a pure build or a respawn-backoff tick still clears the carcasses.
+	s.forceUnmountOrphans(orphanDirs(fuse, carry))
+
 	if len(fuse) == 0 && !s.holder.hadMounts() {
 		return // nothing for a holder to serve
 	}
@@ -178,10 +214,6 @@ func (s *Server) reviveHolder(ctx context.Context) {
 	if time.Now().Before(s.sup.retryAt) {
 		return
 	}
-	// Snapshot the dead holder's dir->base registry BEFORE the spawn:
-	// verifySpawnedHolder's refresh installs the fresh holder's (empty) List,
-	// after which the pre-row mounts' bases are gone from the cache.
-	carry := s.holder.carriedBases()
 	if err := s.spawn(); err != nil {
 		s.noteSpawnFailure(err)
 		return
@@ -193,6 +225,54 @@ func (s *Server) reviveHolder(ctx context.Context) {
 	s.log.Printf("mount holder respawned")
 	s.remountFuseRows(ctx, fuse)
 	s.remountCarriedDirs(ctx, rowDirs, carry)
+}
+
+// forceUnmountOrphans force-unmounts every dir in dirs that is currently a
+// mountpoint, directly via the bounded overlay.ForceUnmount — bypassing the
+// (dead) holder entirely. A dead holder's mirrors are ALWAYS dead carcasses
+// (the cache dropped them and reviveHolder remounts them fresh), so this loses
+// nothing and removes the whole-machine hazard a wedged NFS carcass becomes
+// (the kill-9 incident: lsof/stat on the box then block forever on it). Yes it
+// yanks fds from any live session still on a dir — the mirror is already
+// wedged and a relaunch is the fix, consistent with the held-dead remount
+// policy. Each unmount is bounded inside overlay.ForceUnmount so a carcass the
+// kernel will not even MNT_FORCE cannot hang the supervise goroutine.
+// Mountpoint membership uses the bounded overlayMounted seam (a probe that
+// cannot answer reads still-mounted, so a wedged dir is unmounted rather than
+// skipped); a dir provably not a mountpoint is skipped.
+func (s *Server) forceUnmountOrphans(dirs []string) {
+	for _, dir := range dirs {
+		if !overlayMounted(dir) {
+			continue
+		}
+		if err := forceUnmount(dir); err != nil {
+			s.log.Printf("force-unmount orphaned carcass %s: %v", dir, err)
+			continue
+		}
+		s.log.Printf("force-unmounted orphaned mount %s after holder death", dir)
+	}
+}
+
+// orphanDirs is the deduplicated set of mountpoints a dead holder may have left
+// wedged: every fuse row's ConfigDir plus every carried pre-row mount dir
+// (a `ccp add` mid-login the holder served before its account row landed).
+func orphanDirs(fuse []store.Account, carry map[string]string) []string {
+	seen := make(map[string]bool, len(fuse)+len(carry))
+	dirs := make([]string, 0, len(fuse)+len(carry))
+	add := func(d string) {
+		if d == "" || seen[d] {
+			return
+		}
+		seen[d] = true
+		dirs = append(dirs, d)
+	}
+	for _, a := range fuse {
+		add(a.ConfigDir)
+	}
+	for dir := range carry {
+		add(dir)
+	}
+	return dirs
 }
 
 // verifySpawnedHolder re-polls the holder after a spawn that reported success
@@ -518,7 +598,9 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 		switch {
 		case err != nil:
 			s.log.Printf("acct-%02d re-read row before remount: %v", a.ID, err)
-			s.advanceRowBackoff(a.ID)
+			// A DB re-read failure is not a mount hazard; back off, never trip
+			// the breaker on it.
+			s.advanceRowRetry(a.ID, false)
 		case fresh.OverlayKind != string(overlay.KindFuse):
 			// Converted while this pass's listing aged: its owner left it
 			// consistent, and a non-fuse row needs no remount ledger.
@@ -546,10 +628,21 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 				s.log.Printf("acct-%02d %s; remounting under %d live session(s) — relaunch them",
 					a.ID, desc, procscan.CountByConfigDir(sessions, a.ConfigDir))
 			}
-			if s.healFuse(fresh) == healMounted {
+			switch s.healFuse(fresh) {
+			case healMounted:
 				delete(s.sup.rowRetry, a.ID)
-			} else {
-				s.advanceRowBackoff(a.ID)
+			case healTCCBlocked:
+				// A clean not-mounted state waiting on the human's Network
+				// Volumes grant: back off, but NEVER count it toward the breaker —
+				// it must retry forever for the grant to land.
+				s.advanceRowRetry(a.ID, false)
+			default:
+				// healRetry/healFallback: the mirror is not up and we keep
+				// trying. Count it as a hazard; once the consecutive count hits
+				// the breaker threshold, stop churning and escalate.
+				if s.advanceRowRetry(a.ID, true) >= remountBreakerThreshold {
+					s.escalateWedgedRow(fresh)
+				}
 			}
 		}
 		s.endPoll(a.ID)
@@ -561,17 +654,67 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 	}
 }
 
-// advanceRowBackoff books one failed heal attempt against account id's
-// remount ledger: the failure count grows and the next attempt waits out the
-// doubled window.
-func (s *Server) advanceRowBackoff(id int) {
+// advanceRowRetry books one failed heal attempt against account id's remount
+// ledger: the failure count grows and the next attempt waits out the doubled
+// window. hazard reports whether the failure was a wedged/never-recovering
+// mount (healRetry/healFallback) — those advance the breaker's consecutive
+// hazard count; a non-hazard failure (a TCC block or a DB re-read error)
+// resets it, since the breaker only ever escalates a genuinely stuck mirror.
+// Returns the post-update hazard count for the breaker check.
+func (s *Server) advanceRowRetry(id int, hazard bool) int {
 	if s.sup.rowRetry == nil {
 		s.sup.rowRetry = make(map[int]rowRetryState)
 	}
 	st := s.sup.rowRetry[id]
 	st.failures++
+	if hazard {
+		st.hazard++
+	} else {
+		st.hazard = 0
+	}
 	st.retryAt = time.Now().Add(backoffAfter(st.failures, remountBackoffBase, remountBackoffCap))
 	s.sup.rowRetry[id] = st
+	return st.hazard
+}
+
+// escalateWedgedRow is the circuit breaker for a fuse row whose mount never
+// recovers (remountBreakerThreshold consecutive wedged/never-recovering heals).
+// Retrying forever lets a wedged NFS carcass linger and re-wedge the kernel —
+// the whole-machine hazard the kill-9 incident exposed — so this is a SEPARATE,
+// UNGATED hazard-remediation escalation, distinct from the idle-gated
+// fallbackToSymlink on the genuine-mount-failure path: it force-unmounts the
+// carcass directly (the dead-mount fds are already useless; relaunch is the fix,
+// exactly as the held-dead remount policy accepts) and converts the row to
+// symlink so the dir is usable again. It still takes the converting claim
+// (beginConvertUnderPoll, under the caller's held poll claim) so a select
+// cannot land mid-conversion; only the live-session/scan IDLE gate is skipped,
+// because a never-recovering mount is a hazard, not a healthy mount. Converting
+// to symlink makes both the scheduler poll and the next supervision pass skip
+// the row (non-fuse), so the breaker never fights them. The ledger entry is
+// dropped to stop the churn and the escalation is logged loudly. Caller holds
+// the account's poll claim.
+func (s *Server) escalateWedgedRow(a store.Account) {
+	if !s.beginConvertUnderPoll(a.ID) {
+		// A select reserved the dir between the heal and here; let it run and
+		// re-fire the breaker next windowed tick (the ledger entry stays).
+		s.log.Printf("acct-%02d remount breaker deferred: reserved by a pending select", a.ID)
+		return
+	}
+	defer s.endConvert(a.ID)
+	s.log.Printf("acct-%02d fuse mount never recovered after %d consecutive attempts; force-unmounting and falling back to symlink — relaunch any sessions on it",
+		a.ID, remountBreakerThreshold)
+	if overlayMounted(a.ConfigDir) {
+		if err := forceUnmount(a.ConfigDir); err != nil {
+			s.log.Printf("acct-%02d remount breaker: force-unmount %s: %v", a.ID, a.ConfigDir, err)
+		}
+	}
+	if _, err := s.m.ConvertOverlay(a, overlay.KindSymlink); err != nil {
+		s.log.Printf("acct-%02d remount breaker: convert to symlink: %v", a.ID, err)
+		return
+	}
+	s.holder.noteUnmounted(a.ConfigDir)
+	delete(s.sup.rowRetry, a.ID)
+	s.log.Printf("acct-%02d fell back to symlink after exhausting fuse remount attempts", a.ID)
 }
 
 // remountReplacedRows heals every fuse row after a holder replacement, under
