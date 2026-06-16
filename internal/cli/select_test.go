@@ -413,6 +413,83 @@ func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
 	}
 }
 
+// TestResolveSelectionMountsNotReadyError pins the honest-error split at the
+// daemon fast path: a none-available reply tagged MountsNotReady (every account
+// has capacity but no mirror is mounted/healthy — the holder is mid-replacement)
+// must surface ErrMountsNotReady, while a plain none-available reply keeps
+// ErrNoneAvailable. The two sentinels are distinct so the user is never told
+// "exhausted or rate-limited" for a mount-layer problem.
+func TestResolveSelectionMountsNotReadyError(t *testing.T) {
+	cases := map[string]struct {
+		resp    daemon.Response
+		wantErr error
+		notErr  error
+	}{
+		"mounts not ready": {
+			daemon.Response{OK: false, NoneAvailable: true, MountsNotReady: true, Error: pool.ErrMountsNotReady.Error()},
+			pool.ErrMountsNotReady, pool.ErrNoneAvailable,
+		},
+		"plain none available": {
+			daemon.Response{OK: false, NoneAvailable: true, Error: pool.ErrNoneAvailable.Error()},
+			pool.ErrNoneAvailable, pool.ErrMountsNotReady,
+		},
+	}
+	for name, tc := range cases {
+		tc := tc
+		t.Run(name, func(t *testing.T) {
+			// Short HOME under /tmp: macOS caps the unix socket path at 104 bytes.
+			home, err := os.MkdirTemp("/tmp", "ccp-home")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.RemoveAll(home) })
+			t.Setenv("HOME", home)
+
+			st := openTestStore(t)
+			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ln, err := net.Listen("unix", pool.SocketPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { ln.Close() })
+			selectResp := tc.resp
+			go func() {
+				for {
+					conn, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					var req daemon.Request
+					_ = json.NewDecoder(conn).Decode(&req)
+					resp := daemon.Response{Proto: daemon.ProtocolVersion, OK: true, Version: version.String()}
+					if req.Op == daemon.OpSelect {
+						resp = selectResp
+						resp.Proto = daemon.ProtocolVersion
+						resp.Version = version.String()
+					}
+					_ = json.NewEncoder(conn).Encode(resp)
+					conn.Close()
+				}
+			}()
+
+			m := &pool.Manager{Store: st}
+			cmd := &cobra.Command{}
+			cmd.SetErr(&bytes.Buffer{})
+			cmd.SetContext(context.Background())
+
+			_, _, err = resolveSelection(cmd, m, selectReq{cwd: "/proj"})
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("resolveSelection err = %v, want errors.Is %v", err, tc.wantErr)
+			}
+			if errors.Is(err, tc.notErr) {
+				t.Fatalf("err must not match the other sentinel %v; err = %v", tc.notErr, err)
+			}
+		})
+	}
+}
+
 // TestMergeDaemonPick pins the daemon-pick merge hook's degradation contract:
 // a nil or unknown SelectedID warns and skips (a daemon hiccup must not block
 // the launch), while a valid id merges the base's shareable settings.

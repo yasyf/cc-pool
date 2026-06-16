@@ -20,6 +20,12 @@ var ErrNoAccounts = errors.New("no accounts in the pool — run `ccp add`")
 // or — for NoFallback callers — exhausted.
 var ErrNoneAvailable = errors.New("no account is currently available (all exhausted or rate-limited)")
 
+// ErrMountsNotReady means every account has capacity but none has a mounted,
+// healthy mirror right now — all are mid-migration, unmounted, or the mount
+// holder is being replaced. Distinct from ErrNoneAvailable (a capacity verdict)
+// so the surfaced message points at the mount layer, not at usage limits.
+var ErrMountsNotReady = errors.New("no account is currently available: every account mirror is unmounted or being migrated (the mount holder may be mid-replacement) — retry shortly")
+
 // SelectOptions tunes a selection.
 type SelectOptions struct {
 	// Live samples usage synchronously for accounts whose latest sample is

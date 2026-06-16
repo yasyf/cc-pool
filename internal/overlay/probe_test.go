@@ -92,6 +92,31 @@ func TestDeepProbeWithinMissingFile(t *testing.T) {
 	}
 }
 
+// TestDeepProbeWithinPermissionDeniedIsMissing pins the cross-upgrade escape
+// hatch for a permission-class open refusal (EPERM/EACCES → os.ErrPermission):
+// a mirror hosted by a holder predating the probe-in-daemon move refuses the
+// daemon's external open, and that must read as ErrProbeMissing (no verdict),
+// never a wedge — otherwise a healthy old-holder mount false-wedges across an
+// upgrade and the daemon refuses every account.
+func TestDeepProbeWithinPermissionDeniedIsMissing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits, so open(2) would not return EACCES")
+	}
+	dir := t.TempDir()
+	// A mode-0000 probe file: os.Open returns EACCES, which maps to
+	// os.ErrPermission — the same shape as the old holder's EPERM refusal.
+	if err := os.WriteFile(filepath.Join(dir, ProbeFileName), []byte("x"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	err := DeepProbeWithin(dir)
+	if !errors.Is(err, ErrProbeMissing) {
+		t.Errorf("errors.Is(err, ErrProbeMissing) = false for a permission-denied open; err = %v", err)
+	}
+	if errors.Is(err, ErrProbeWedged) {
+		t.Errorf("a permission-denied open must be \"no verdict\", never a wedge; err = %v", err)
+	}
+}
+
 func TestDeepProbeWithinFullRead(t *testing.T) {
 	dir := t.TempDir()
 	buf := make([]byte, ProbeFileSize)

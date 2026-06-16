@@ -34,10 +34,14 @@ const ProbeFileName = ".ccp-probe"
 const ProbeFileSize = 2 << 20
 
 var (
-	// ErrProbeMissing means dir does not serve the probe file (ENOENT): the
-	// mirror was mounted by a holder that predates the probe. Callers treat it
-	// as "no verdict" — never as a wedge — so old-holder mounts keep working
-	// across an upgrade until they are naturally remounted.
+	// ErrProbeMissing means dir does not serve a readable probe file to an
+	// external opener: the open returned ENOENT, or a permission-class refusal
+	// (EPERM/EACCES). Both are the signature of a mirror mounted by a holder
+	// that predates the probe-in-daemon contract — the deep probe moved from the
+	// holder into the daemon, so a pre-move holder's mirror refuses the daemon's
+	// external open. Callers treat it as "no verdict" — never as a wedge — so
+	// old-holder mounts keep working across an upgrade until they are naturally
+	// remounted.
 	ErrProbeMissing = errors.New("probe file missing")
 
 	// ErrProbeWedged means the deep probe could not pull the full probe file
@@ -95,7 +99,12 @@ var (
 func readProbeFile(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		// ENOENT and a permission-class refusal (EPERM/EACCES → os.ErrPermission)
+		// both mean this mirror does not serve a readable probe to an external
+		// opener — a holder predating the probe-in-daemon move. No verdict (see
+		// ErrProbeMissing): never a wedge. A genuine partial wedge is the timeout
+		// or short/replayed read below, never an instant open refusal.
+		if os.IsNotExist(err) || errors.Is(err, os.ErrPermission) {
 			return fmt.Errorf("%w: %s", ErrProbeMissing, path)
 		}
 		return fmt.Errorf("deep probe open %s: %w", path, err)

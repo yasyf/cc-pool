@@ -560,7 +560,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	}
 	if len(usable) == 0 {
 		soonest := soonestReset(snaps)
-		resp := Response{OK: false, Error: pool.ErrNoneAvailable.Error(), NoneAvailable: true}
+		resp := Response{OK: false, Error: pool.ErrMountsNotReady.Error(), NoneAvailable: true, MountsNotReady: true}
 		if !soonest.IsZero() {
 			resp.SoonestReset = &soonest
 		}

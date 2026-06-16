@@ -232,10 +232,15 @@ type Response struct {
 	PinHeldAccount *int `json:"pin_held_account,omitempty"`
 	// NoneAvailable: select found no servable account (all rate-limited or the
 	// pool is empty) — a structured signal so clients don't match error strings.
-	NoneAvailable bool              `json:"none_available,omitempty"`
-	Accounts      []AccountStatus   `json:"accounts,omitempty"`   // status
-	Holder        *HolderStatus     `json:"holder,omitempty"`     // status: mount-holder cache
-	Version       string            `json:"version,omitempty"`    // health
-	Migrations    []MigrationResult `json:"migrations,omitempty"` // migrate
-	SoonestReset  *time.Time        `json:"soonest_reset,omitempty"`
+	NoneAvailable bool `json:"none_available,omitempty"`
+	// MountsNotReady: the none-available verdict is a mount-layer fact, not a
+	// capacity one — every account has headroom but none has a mounted, healthy
+	// mirror (all migrating, unmounted, or the holder is mid-replacement). Lets
+	// the client surface that instead of the misleading "exhausted/rate-limited".
+	MountsNotReady bool              `json:"mounts_not_ready,omitempty"`
+	Accounts       []AccountStatus   `json:"accounts,omitempty"`   // status
+	Holder         *HolderStatus     `json:"holder,omitempty"`     // status: mount-holder cache
+	Version        string            `json:"version,omitempty"`    // health
+	Migrations     []MigrationResult `json:"migrations,omitempty"` // migrate
+	SoonestReset   *time.Time        `json:"soonest_reset,omitempty"`
 }

@@ -154,6 +154,9 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 					}
 					// fall through to the live waiting loop
 				case outcomeFail:
+					if resp.MountsNotReady {
+						return "", "", pool.ErrMountsNotReady
+					}
 					return "", "", pool.ErrNoneAvailable
 				}
 			}
