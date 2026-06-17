@@ -352,6 +352,9 @@ func (t statusTUI) renderDetail() string {
 	if c.RateLimitPenalty > 0 {
 		pen = append(pen, fmt.Sprintf("  %-18s %+5.1f", "rate-limited", -c.RateLimitPenalty))
 	}
+	if c.NeedsLoginPenalty > 0 {
+		pen = append(pen, fmt.Sprintf("  %-18s %+5.1f", "needs-login", -c.NeedsLoginPenalty))
+	}
 	if c.StalePenalty > 0 {
 		pen = append(pen, fmt.Sprintf("  %-18s %+5.1f", "stale data", -c.StalePenalty))
 	}

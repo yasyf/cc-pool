@@ -320,7 +320,7 @@ struct SmallView: View {
 // MARK: - Pieces
 
 extension AccountStatus {
-    var unusable: Bool { rateLimited || isExhausted }
+    var unusable: Bool { rateLimited || isExhausted || needsLogin }
 }
 
 /// Capsule gauge. The bar fills with % USED — matching the `ccp status`
@@ -415,6 +415,16 @@ struct BadgeRow: View {
             }
             if account.isExhausted {
                 Image(systemName: "hourglass.bottomhalf.filled")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.red)
+            }
+            // The bottom tier: no live token at all until `ccp login N` runs, so
+            // it gets the red error treatment plus a word, not just a glyph.
+            if account.needsLogin {
+                Image(systemName: "person.crop.circle.badge.exclamationmark")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.red)
+                Text("needs login")
                     .font(.system(size: 10))
                     .foregroundStyle(.red)
             }

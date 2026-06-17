@@ -81,10 +81,11 @@ type Server struct {
 	replacing    bool              // a holder replacement is in flight; fences NEW conversions (see beginReplace)
 	rlStreak     map[int]int       // accountID -> consecutive 429 count
 	// authStreak counts consecutive unrecovered 401s per account; at
-	// needsLoginAfter the account is flagged needs-login. lastAuthAttempt stamps
-	// the last sample of a flagged account so flagged accounts back off to
-	// needsLoginPollInterval instead of 401-spamming every poll. Both are
-	// scheduler-goroutine-local, like rlStreak — no lock.
+	// needsLoginAfter the account's poll backs off to needsLoginPollInterval
+	// (it is NOT flagged — only a definitive ErrNeedsLogin flags). lastAuthAttempt
+	// stamps the last sample of a backed-off or flagged account so it stops
+	// 401-spamming every poll. Both are scheduler-goroutine-local, like rlStreak
+	// — no lock.
 	authStreak      map[int]int
 	lastAuthAttempt map[int]time.Time
 

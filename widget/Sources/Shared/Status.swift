@@ -148,6 +148,7 @@ struct AccountStatus: Decodable, Identifiable {
     let activeSessions: Int
     let rateLimited: Bool
     let exhausted: Bool? // omitempty in Go
+    fileprivate let needsLoginRaw: Bool? // omitempty; refresh token gone/revoked
     let hasUsage: Bool
     let stale: Bool
     let resets5h: Date?
@@ -169,6 +170,7 @@ struct AccountStatus: Decodable, Identifiable {
         case remaining7d = "remaining_7d"
         case activeSessions = "active_sessions"
         case rateLimited = "rate_limited"
+        case needsLoginRaw = "needs_login"
         case hasUsage = "has_usage"
         case resets5h = "resets_5h"
         case resets7d = "resets_7d"
@@ -181,6 +183,7 @@ struct AccountStatus: Decodable, Identifiable {
     }
 
     var isExhausted: Bool { exhausted ?? false }
+    var needsLogin: Bool { needsLoginRaw ?? false }
     var hasOverage: Bool { (extraEnabled ?? false) && (extraUsed ?? 0) > 0 }
     var depleted5hAt: Date? { depleted5hAtRaw?.nonZero }
 
@@ -192,6 +195,7 @@ struct AccountStatus: Decodable, Identifiable {
     /// Mirrors snapshotTier in internal/cli/status.go: status must never rank
     /// an unusable account above a usable one, however high its score.
     var tier: Int {
+        if needsLogin { return 3 }
         if !rateLimited && !isExhausted { return 0 }
         if !rateLimited { return 1 }
         return 2
@@ -280,7 +284,7 @@ extension PoolStatus {
                 id: 1, configDir: "/Users/you/.cc-pool/accounts/acct-01",
                 label: "work@example.com", score: 88.4,
                 remaining5h: 58, remaining7d: 91, activeSessions: 4,
-                rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(3 * 3600),
                 resets7d: Date().addingTimeInterval(4 * 86400),
                 burn5hPerHour: 22, projected5hAtReset: nil,
@@ -290,7 +294,7 @@ extension PoolStatus {
                 id: 2, configDir: "/Users/you/.cc-pool/accounts/acct-02",
                 label: "rebecca.fallon.engineering@example-corp.com", score: 64.0,
                 remaining5h: 60, remaining7d: 41, activeSessions: 2,
-                rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(2 * 3600),
                 resets7d: Date().addingTimeInterval(3 * 86400),
                 burn5hPerHour: 6, projected5hAtReset: 48, depleted5hAtRaw: nil,
@@ -299,7 +303,7 @@ extension PoolStatus {
                 id: 3, configDir: "/Users/you/.cc-pool/accounts/acct-03",
                 label: "personal@example.com", score: 41.0,
                 remaining5h: 22, remaining7d: 58, activeSessions: 0,
-                rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(90 * 60),
                 resets7d: Date().addingTimeInterval(2 * 86400),
                 burn5hPerHour: 2, projected5hAtReset: 19, depleted5hAtRaw: nil,
@@ -308,7 +312,7 @@ extension PoolStatus {
                 id: 4, configDir: "/Users/you/.cc-pool/accounts/acct-04",
                 label: "side@example.com", score: 18.0,
                 remaining5h: 12, remaining7d: 35, activeSessions: 0,
-                rateLimited: false, exhausted: nil, hasUsage: true, stale: true,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: true,
                 resets5h: Date().addingTimeInterval(3600),
                 resets7d: Date().addingTimeInterval(5 * 86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
@@ -317,7 +321,7 @@ extension PoolStatus {
                 id: 5, configDir: "/Users/you/.cc-pool/accounts/acct-05",
                 label: "fresh@example.com", score: 0.0,
                 remaining5h: 0, remaining7d: 0, activeSessions: 0,
-                rateLimited: false, exhausted: nil, hasUsage: false, stale: false,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: false, stale: false,
                 resets5h: nil, resets7d: nil,
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
                 extraEnabled: nil, extraUsed: nil, extraLimit: nil),
@@ -325,7 +329,7 @@ extension PoolStatus {
                 id: 6, configDir: "/Users/you/.cc-pool/accounts/acct-06",
                 label: "", score: -40.2,
                 remaining5h: 1, remaining7d: 12, activeSessions: 0,
-                rateLimited: true, exhausted: true, hasUsage: true, stale: false,
+                rateLimited: true, exhausted: true, needsLoginRaw: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(40 * 60),
                 resets7d: Date().addingTimeInterval(86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
@@ -376,7 +380,7 @@ extension PoolStatus {
                 id: 1, configDir: "/Users/you/.cc-pool/accounts/acct-01",
                 label: "work@example.com", score: 80.1,
                 remaining5h: 72, remaining7d: 88, activeSessions: 1,
-                rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(3 * 3600),
                 resets7d: Date().addingTimeInterval(4 * 86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
@@ -385,7 +389,7 @@ extension PoolStatus {
                 id: 2, configDir: "/Users/you/.cc-pool/accounts/acct-02",
                 label: "personal@example.com", score: 55.0,
                 remaining5h: 48, remaining7d: 61, activeSessions: 0,
-                rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(2 * 3600),
                 resets7d: Date().addingTimeInterval(2 * 86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
@@ -394,7 +398,7 @@ extension PoolStatus {
                 id: 3, configDir: "/Users/you/.cc-pool/accounts/acct-03",
                 label: "", score: 12.0,
                 remaining5h: 15, remaining7d: 30, activeSessions: 0,
-                rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(3600),
                 resets7d: Date().addingTimeInterval(86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,

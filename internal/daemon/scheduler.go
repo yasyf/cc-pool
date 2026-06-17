@@ -26,9 +26,13 @@ const (
 	rateLimitBackoffBase = 3 * time.Minute
 	rateLimitBackoffCap  = 15 * time.Minute
 
-	// needsLoginAfter is how many consecutive unrecovered 401s flag an account
-	// needs-login (a definitive ErrNeedsLogin flags it immediately). At 180s+
-	// per poll, 3 is ~10 minutes of confirmed failure before we surface it.
+	// needsLoginAfter is how many consecutive transient 401s back the account's
+	// poll off to needsLoginPollInterval. It does NOT flag needs-login — only a
+	// definitive ErrNeedsLogin (a confirmed revocation) flags. A plain 401 also
+	// surfaces a transient (5xx/network) refresh failure, so escalating on the
+	// streak would falsely sign out a recoverable account; instead the streak
+	// only throttles the 401 spam while the account stays selectable. At 180s+
+	// per poll, 3 is ~10 minutes of repeated failure before we throttle.
 	needsLoginAfter = 3
 	// needsLoginPollInterval is how often a flagged account is re-sampled: often
 	// enough to auto-recover within minutes of `ccp login`, rarely enough to
@@ -128,11 +132,13 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 		time.Since(last.TS) < rlBackoff(s.rlStreak[a.ID]) {
 		return false
 	}
-	// A flagged (needs-login) account backs off to needsLoginPollInterval: a
-	// revoked account stops 401-spamming every poll but still auto-recovers
-	// within minutes of `ccp login`. A 401 inserts no usage sample, so this
+	// A flagged (needs-login) account OR one riding a high transient-401 streak
+	// backs off to needsLoginPollInterval: a revoked account stops 401-spamming
+	// every poll but still auto-recovers within minutes of `ccp login`, and a
+	// transiently-failing one stops spamming while staying selectable (its
+	// AuthHealth.NeedsLogin is never set). A 401 inserts no usage sample, so this
 	// can't ride the rate-limit backoff above — it needs its own clock.
-	if health, _ := s.m.Store.GetAuthHealth(a.ID); health.NeedsLogin {
+	if health, _ := s.m.Store.GetAuthHealth(a.ID); health.NeedsLogin || s.authStreak[a.ID] >= needsLoginAfter {
 		if last, ok := s.lastAuthAttempt[a.ID]; ok && time.Since(last) < needsLoginPollInterval {
 			return false
 		}
@@ -179,6 +185,15 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 	// (never a bare reservation, whose claude is mid-launch) holds the account
 	// AND we have already seen a consecutive 401 — giving a lazily-waking
 	// session a full poll to refresh its own token before we touch the chain.
+	//
+	// Accepted gap: a busy account whose token is server-revoked while still
+	// clock-fresh keeps 401ing but is never refreshed (fetchUsage's busy guard
+	// requires an expired token), so the daemon never confirms revocation and
+	// never flags needs-login — the live session owns that recovery (it hits
+	// `/login` itself). It self-heals here once the token clock-expires:
+	// AllowBusyRefresh then refreshes, the invalid_grant surfaces, and the
+	// account is flagged. Forcing a refresh on a fresh busy token to detect this
+	// sooner would risk double-spending a refresh token the session still needs.
 	busyBySession := procscan.CountByConfigDir(sessions, a.ConfigDir) > 0
 	opts := pool.SampleOpts{
 		AllowRefresh:     idle,
@@ -200,9 +215,11 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 
 // handleAuthOutcome folds one sample's outcome into the account's auth health:
 // a success clears any needs-login flag and the 401 streak (logged once on the
-// transition); a definitive ErrNeedsLogin flags immediately; a plain 401
-// increments the streak and flags at needsLoginAfter; any other error is logged
-// as before. Scheduler-goroutine-local — no lock.
+// transition); a definitive ErrNeedsLogin (a confirmed revocation) flags
+// immediately; a plain 401 — which a transient (5xx/network) refresh failure
+// also surfaces as — only increments the streak, driving the poll backoff
+// without ever flagging the account; any other error is logged as before.
+// Scheduler-goroutine-local — no lock.
 func (s *Server) handleAuthOutcome(a store.Account, err error) {
 	if err == nil {
 		s.authStreak[a.ID] = 0
@@ -221,10 +238,6 @@ func (s *Server) handleAuthOutcome(a store.Account, err error) {
 	if errors.As(err, &ue) && ue.Unauthorized() {
 		s.authStreak[a.ID]++
 		s.lastAuthAttempt[a.ID] = time.Now()
-		if s.authStreak[a.ID] >= needsLoginAfter {
-			s.flagNeedsLogin(a, err)
-			return
-		}
 		s.log.Printf("acct-%02d sample: %v", a.ID, err)
 		return
 	}

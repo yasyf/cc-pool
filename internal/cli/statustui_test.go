@@ -2,12 +2,14 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -127,6 +129,31 @@ func TestStatusTUIPinErrorSurfaced(t *testing.T) {
 	if tui.pinErr != nil {
 		t.Fatalf("recovered toggle must clear the error, got %v", tui.pinErr)
 	}
+}
+
+// TestStatusTUIDetailNeedsLoginPenalty: the detail pane renders the needs-login
+// penalty row exactly when the scorer engaged it, matching the format of the
+// adjacent rate-limited row, and omits it when the penalty is zero.
+func TestStatusTUIDetailNeedsLoginPenalty(t *testing.T) {
+	// The cursor sits on acct-2 (snaps[1]), so its Components drive renderDetail.
+	want := fmt.Sprintf("  %-18s %+5.1f", "needs-login", -score.PenNeedsLogin)
+
+	t.Run("rendered when the penalty is engaged", func(t *testing.T) {
+		tui := pinTUI("/proj", dirPin{}, &fakeToggle{})
+		tui.snaps[1].Components.NeedsLoginPenalty = score.PenNeedsLogin
+		detail := stripANSI(tui.renderDetail())
+		if !strings.Contains(detail, want) {
+			t.Fatalf("detail must show the needs-login penalty row %q:\n%s", want, detail)
+		}
+	})
+
+	t.Run("absent when the penalty is zero", func(t *testing.T) {
+		tui := pinTUI("/proj", dirPin{}, &fakeToggle{})
+		detail := stripANSI(tui.renderDetail())
+		if strings.Contains(detail, "needs-login") {
+			t.Fatalf("detail must omit the needs-login row when the penalty is zero:\n%s", detail)
+		}
+	})
 }
 
 // TestStatusTUIViewShowsPin: the pinned account's row is badged, the detail

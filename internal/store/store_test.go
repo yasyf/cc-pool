@@ -139,6 +139,85 @@ func TestUsageSampleLatest(t *testing.T) {
 	}
 }
 
+func TestLatestGoodUsageSample(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	// A sample spec: age before now, util_7d, and whether it is a 429 marker.
+	type spec struct {
+		age         time.Duration
+		util7d      float64
+		rateLimited bool
+	}
+	cases := map[string]struct {
+		samples   []spec
+		wantOK    bool
+		wantUtil  float64
+		wantAgeTS time.Duration // expected good sample's age before now
+	}{
+		"reads through a newer rate_limited marker to the last good sample": {
+			samples: []spec{
+				{age: 2 * time.Minute, util7d: 73, rateLimited: false},
+				{age: 0, util7d: 0, rateLimited: true},
+			},
+			wantOK: true, wantUtil: 73, wantAgeTS: 2 * time.Minute,
+		},
+		"returns the newest good sample, skipping interleaved markers": {
+			samples: []spec{
+				{age: 4 * time.Minute, util7d: 40, rateLimited: false},
+				{age: 3 * time.Minute, util7d: 0, rateLimited: true},
+				{age: 2 * time.Minute, util7d: 55, rateLimited: false},
+				{age: 1 * time.Minute, util7d: 0, rateLimited: true},
+			},
+			wantOK: true, wantUtil: 55, wantAgeTS: 2 * time.Minute,
+		},
+		"ok=false when only rate_limited markers exist": {
+			samples: []spec{
+				{age: 2 * time.Minute, util7d: 0, rateLimited: true},
+				{age: 0, util7d: 0, rateLimited: true},
+			},
+			wantOK: false,
+		},
+		"ok=false when the account was never sampled": {
+			samples: nil,
+			wantOK:  false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := openTest(t)
+			s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+			for _, sp := range tc.samples {
+				if err := s.InsertUsageSample(UsageSample{
+					AccountID:   1,
+					TS:          now.Add(-sp.age),
+					Util7d:      sp.util7d,
+					RateLimited: sp.rateLimited,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, ok, err := s.LatestGoodUsageSample(1)
+			if err != nil {
+				t.Fatalf("LatestGoodUsageSample: %v", err)
+			}
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v (got %+v)", ok, tc.wantOK, got)
+			}
+			if !tc.wantOK {
+				return
+			}
+			if got.RateLimited {
+				t.Fatalf("returned a rate_limited row: %+v", got)
+			}
+			if got.Util7d != tc.wantUtil {
+				t.Errorf("Util7d = %v, want %v", got.Util7d, tc.wantUtil)
+			}
+			if wantTS := now.Add(-tc.wantAgeTS); !got.TS.Equal(wantTS) {
+				t.Errorf("TS = %v, want %v", got.TS, wantTS)
+			}
+		})
+	}
+}
+
 func TestUsageSampleExtraUsageRoundTrip(t *testing.T) {
 	s := openTest(t)
 	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})

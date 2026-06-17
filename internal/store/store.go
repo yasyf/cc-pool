@@ -336,6 +336,24 @@ func (s *Store) LatestUsageSample(accountID int) (UsageSample, bool, error) {
 	return u, true, nil
 }
 
+// LatestGoodUsageSample returns the most recent NON-rate-limited sample for an
+// account, or ok=false. A 429 records a zeroed rate_limited placeholder (which
+// the daemon's backoff keys on); display reads through to this last-known-good
+// utilization instead of showing that placeholder's 0%.
+func (s *Store) LatestGoodUsageSample(accountID int) (UsageSample, bool, error) {
+	row := s.db.QueryRow(
+		`SELECT `+usageSampleCols+`
+		 FROM usage_samples WHERE account_id=? AND rate_limited=0 ORDER BY ts DESC LIMIT 1`, accountID)
+	u, err := scanUsageSample(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return u, false, nil
+	}
+	if err != nil {
+		return u, false, err
+	}
+	return u, true, nil
+}
+
 // UsageSamplesSince returns an account's samples at or after since, newest
 // first. The inclusive lower bound is served by idx_usage_acct_ts. A time
 // bound (rather than a row limit) is what the burn estimators need: a fixed

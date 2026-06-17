@@ -68,13 +68,15 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 
 	inputs := make([]score.Input, len(accts))
 	samples := make([][]store.UsageSample, len(accts))
+	goods := make([]*store.UsageSample, len(accts))
 	for i, a := range accts {
-		in, recent, err := m.scoreInput(a, sessions, now)
+		in, recent, good, err := m.scoreInput(a, sessions, now)
 		if err != nil {
 			return nil, err
 		}
 		inputs[i] = in
 		samples[i] = recent
+		goods[i] = good
 	}
 	results := make(map[int]score.Result)
 	for _, r := range score.Rank(inputs, now) {
@@ -85,9 +87,11 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 	for i, a := range accts {
 		in := inputs[i]
 		r := results[a.ID]
-		var latest store.UsageSample
-		if len(samples[i]) > 0 {
-			latest = samples[i][0]
+		// Extra-usage (overage) reads through to the last known-good sample for
+		// the same reason as utilization: a rate-limit placeholder zeroes it.
+		var good store.UsageSample
+		if goods[i] != nil {
+			good = *goods[i]
 		}
 		s := Snapshot{
 			Account:        a,
@@ -107,9 +111,9 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 			Burn5hPerHour:  in.Burn5hPerHour,
 			Forecast:       forecast.Estimate5h(samples[i], r.Exhausted, now),
 			Burn7dPerHour:  forecast.Burn7dGated(samples[i], r.Exhausted, now),
-			ExtraEnabled:   latest.ExtraEnabled,
-			ExtraUsed:      latest.ExtraUsed,
-			ExtraLimit:     latest.ExtraLimit,
+			ExtraEnabled:   good.ExtraEnabled,
+			ExtraUsed:      good.ExtraUsed,
+			ExtraLimit:     good.ExtraLimit,
 			Components:     r.Components,
 		}
 		if in.HasUsage {

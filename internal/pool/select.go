@@ -111,12 +111,12 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	extraByID := make(map[int]bool, len(accts))
 	for _, a := range accts {
 		byID[a.ID] = a
-		in, samples, err := m.scoreInput(a, sessions, now)
+		in, _, good, err := m.scoreInput(a, sessions, now)
 		if err != nil {
 			return nil, err
 		}
 		inByID[a.ID] = in
-		extraByID[a.ID] = len(samples) > 0 && samples[0].ExtraEnabled
+		extraByID[a.ID] = good != nil && good.ExtraEnabled
 		inputs = append(inputs, in)
 	}
 
@@ -186,26 +186,40 @@ func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessio
 	wg.Wait()
 }
 
-// scoreInput assembles a score.Input for one account from cached state, also
-// returning its recent samples (newest first) so callers can compute display
-// forecasts and surface fields scoring ignores (extra usage). The slice is
-// empty when the account was never sampled.
-func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now time.Time) (score.Input, []store.UsageSample, error) {
+// scoreInput assembles a score.Input for one account from cached state. It also
+// returns the recent samples (newest first) for display forecasts, and the last
+// known-good sample (nil when the account was never sampled cleanly) — the
+// source of every field that must survive a rate-limit placeholder: utilization,
+// resets, sample age, and the extra-usage (overage) display.
+func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now time.Time) (score.Input, []store.UsageSample, *store.UsageSample, error) {
 	in := score.Input{AccountID: a.ID}
 	samples, err := m.Store.UsageSamplesSince(a.ID, now.Add(-forecast.Burn7dWindow))
 	if err != nil {
-		return in, nil, err
+		return in, nil, nil, err
 	}
+	var good *store.UsageSample
 	if len(samples) > 0 {
 		s := samples[0]
 		in.HasUsage = true
-		in.SampleTS = s.TS
-		in.Util5h = s.Util5h
-		in.Util7d = s.Util7d
-		in.Resets5h = s.Resets5h
-		in.Resets7d = s.Resets7d
 		in.RateLimited = s.RateLimited
 		in.Burn5hPerHour = forecast.Burn5h(samples, now)
+		// Utilization, resets, the sample timestamp, and extra-usage read through
+		// to the last known-good sample: a 429 on the usage poll records a zeroed
+		// rate_limited placeholder as the newest row (load-bearing for the daemon
+		// backoff), so sourcing them from samples[0] would show 0% / no-overage
+		// for a rate-limited account instead of its last real reading. ok=false
+		// (never sampled cleanly) leaves them zero — an honest "rate-limited,
+		// utilization unknown".
+		if g, ok, gerr := m.Store.LatestGoodUsageSample(a.ID); gerr != nil {
+			return in, nil, nil, fmt.Errorf("latest good usage sample for account %d: %w", a.ID, gerr)
+		} else if ok {
+			good = &g
+			in.SampleTS = g.TS
+			in.Util5h = g.Util5h
+			in.Util7d = g.Util7d
+			in.Resets5h = g.Resets5h
+			in.Resets7d = g.Resets7d
+		}
 	}
 	in.ActiveSessions = procscan.CountByConfigDir(sessions, a.ConfigDir)
 	if r, ok, _ := m.Store.LastRefresh(a.ID); ok && !r.OK {
@@ -214,7 +228,7 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 	if h, err := m.Store.GetAuthHealth(a.ID); err == nil && h.NeedsLogin {
 		in.NeedsLogin = true
 	}
-	return in, samples, nil
+	return in, samples, good, nil
 }
 
 // PreflightRefresh refreshes the chosen account's token if it expires within

@@ -435,14 +435,24 @@ func TestHandleStatusPropagatesExhaustionAndOverage(t *testing.T) {
 }
 
 // TestHandleSelectNoneAvailable: all rate-limited → structured NoneAvailable
-// (not just an error string) plus the soonest reset for --wait.
+// (not just an error string) plus the soonest reset for --wait. The soonest
+// reset reads through to each account's last known-good sample: a live 429
+// records a zeroed placeholder (no reset), so the window reset that --wait
+// reports comes from the prior good reading, not the rate-limit marker.
 func TestHandleSelectNoneAvailable(t *testing.T) {
 	s, _ := newTestServer(t)
 	now := time.Now().Add(time.Minute)
 	reset := now.Add(30 * time.Minute)
 	for id := 1; id <= 2; id++ {
+		// A real prior reading carrying the window reset, then a rate-limit
+		// marker on top (zeroed, as the production 429 path records it).
 		if err := s.m.Store.InsertUsageSample(store.UsageSample{
-			AccountID: id, TS: now, Util5h: 50, Resets5h: reset, RateLimited: true,
+			AccountID: id, TS: now, Util5h: 50, Resets5h: reset,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.m.Store.InsertUsageSample(store.UsageSample{
+			AccountID: id, TS: now.Add(time.Second), RateLimited: true,
 		}); err != nil {
 			t.Fatal(err)
 		}
