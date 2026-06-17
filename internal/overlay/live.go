@@ -123,12 +123,16 @@ func MountAliveWithin(base, accountDir string) bool {
 // tests can shrink it.
 var mountPollInterval = 100 * time.Millisecond
 
-// waitMounted polls until base's contents are visible through accountDir.
-// Probe-first, then deadline, then sleep: the ordering guarantees one final
-// probe at/after the deadline, so a mount that lands while the last sleep
-// straddles the deadline is kept rather than reported dead (and a timeout of
-// zero probes exactly once).
-func waitMounted(base, accountDir string, timeout time.Duration) bool {
+// waitMounted polls until base's contents are visible through accountDir, or
+// the serve loop exits first. Probe-first, then deadline, then an interruptible
+// sleep: the ordering guarantees one final probe at/after the deadline, so a
+// mount that lands while the last sleep straddles the deadline is kept rather
+// than reported dead (and a timeout of zero probes exactly once). serveExited
+// closing means host.Mount returned — a hard mount(2) failure that will never
+// come live — so the loop bails after one final probe instead of burning the
+// rest of the timeout; pass a nil channel to disable the bail (the select case
+// on a nil channel never fires, leaving the plain poll cadence).
+func waitMounted(base, accountDir string, timeout time.Duration, serveExited <-chan struct{}) bool {
 	deadline := time.Now().Add(timeout)
 	for {
 		if mountAliveFn(base, accountDir) {
@@ -137,6 +141,13 @@ func waitMounted(base, accountDir string, timeout time.Duration) bool {
 		if !time.Now().Before(deadline) {
 			return false
 		}
-		time.Sleep(mountPollInterval)
+		select {
+		case <-serveExited:
+			// The serve goroutine returned, so no mount will come live. One last
+			// probe keeps a mount that landed in the instant the loop slept; an
+			// empty/torn-down dir fails it (base's entries are not visible).
+			return mountAliveFn(base, accountDir)
+		case <-time.After(mountPollInterval):
+		}
 	}
 }

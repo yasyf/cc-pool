@@ -187,7 +187,11 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 	if !mountProven() {
 		wait = firstMountWait
 	}
-	if !waitMounted(base, accountDir, wait) {
+	// Pass done so a hard mount(2) failure (serve goroutine returns, closing
+	// done) bails in ~100ms instead of burning the full wait; a slow-but-serving
+	// mount keeps done open and waits as before.
+	start := time.Now()
+	if !waitMounted(base, accountDir, wait, done) {
 		host.Unmount()
 		// Bounded wait: a mount stuck on the one-time "Network Volumes" TCC
 		// grant must not hang the daemon; the holder retries it.
@@ -197,8 +201,9 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 		}
 		// Re-read mountProven at failure time: a sibling mount coming live
 		// mid-wait proves the grant and turns this from TCC into a transient
-		// timeout — exactly the kill-9 revive-storm incident shape.
-		return mountWaitErr(accountDir, wait, mountProven())
+		// timeout — exactly the kill-9 revive-storm incident shape. The reported
+		// duration is the actual time waited, honest about an early serve-exit bail.
+		return mountWaitErr(accountDir, time.Since(start), mountProven())
 	}
 	mountMu.Lock()
 	mounts[accountDir] = &mountHandle{host: host, fs: fs, done: done}

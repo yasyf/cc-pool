@@ -116,6 +116,10 @@ func (s *Server) Run(ctx context.Context) error {
 	// Break the accept loop on shutdown.
 	go func() {
 		<-ctx.Done()
+		// Proof of trigger receipt before the wg.Wait drain: if a handler then
+		// wedges in-flight, the unified holder log still shows the holder began
+		// shutting down (the drain never reaches "mountd stopped").
+		s.Log.Printf("shutdown trigger received; closing listener")
 		closeListener()
 	}()
 	for {
@@ -530,6 +534,10 @@ func (s *Server) handleList() Response {
 // the ctx closes the listener, never this live connection, so the reply
 // (written by handle after dispatch returns) still lands.
 func (s *Server) handleShutdown() Response {
+	// Log the true count before the sweep: Run's post-drain unmountAll runs
+	// again after this and sees zero, so this is the only place the OpShutdown
+	// path reports how many mounts it owned.
+	s.Log.Printf("shutdown: sweeping %d owned mount(s)", len(s.snapshotRegistry()))
 	failed := s.unmountAll()
 	s.triggerShutdown()
 	return Response{OK: true, Mounts: failed}

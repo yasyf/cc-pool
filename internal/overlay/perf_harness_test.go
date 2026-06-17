@@ -183,7 +183,7 @@ func runPerfArm(t *testing.T, vol string, opts []string, clients int, warmup, du
 	host.SetCapReaddirPlus(true)
 	done := make(chan struct{})
 	go func() { defer close(done); host.Mount(mnt, opts) }()
-	if !waitMounted(base, mnt, 15*time.Second) {
+	if !waitMounted(base, mnt, 15*time.Second, done) {
 		host.Unmount()
 		select {
 		case <-done:

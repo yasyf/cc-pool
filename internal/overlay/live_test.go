@@ -103,7 +103,7 @@ func TestWaitMountedChecksAtDeadline(t *testing.T) {
 		}
 		return true
 	})
-	if !waitMounted("base", "acct", 0) {
+	if !waitMounted("base", "acct", 0, nil) {
 		t.Fatal("waitMounted = false, want true: a zero timeout must still run one at-deadline probe")
 	}
 	if got := calls.Load(); got != 1 {
@@ -117,7 +117,7 @@ func TestWaitMountedTimesOutBounded(t *testing.T) {
 		calls.Add(1)
 		return false
 	})
-	if waitMounted("base", "acct", 0) {
+	if waitMounted("base", "acct", 0, nil) {
 		t.Fatal("waitMounted = true, want false: the probe never saw a live mount")
 	}
 	if got := calls.Load(); got != 1 {
@@ -141,12 +141,47 @@ func TestWaitMountedLateMountKept(t *testing.T) {
 	swapMountAlive(t, func(base, accountDir string) bool {
 		return !time.Now().Before(flipAt)
 	})
-	if !waitMounted("base", "acct", timeout) {
+	if !waitMounted("base", "acct", timeout, nil) {
 		t.Fatal("waitMounted = false, want true: a mount landing after the deadline must be kept by the final at-deadline probe")
 	}
 	if waited := time.Since(start); waited < timeout {
 		t.Fatalf("waitMounted returned after %v, before the %v deadline — the late-flip path was not exercised", waited, timeout)
 	}
+}
+
+func TestWaitMountedBailsOnServeExit(t *testing.T) {
+	swapMountPollInterval(t, 50*time.Millisecond)
+
+	t.Run("serve exit, dir never live -> bail false well before timeout", func(t *testing.T) {
+		swapMountAlive(t, func(base, accountDir string) bool { return false })
+		exited := make(chan struct{})
+		close(exited) // the serve goroutine already returned: a hard mount(2) failure
+		const timeout = 10 * time.Second
+		start := time.Now()
+		if waitMounted("base", "acct", timeout, exited) {
+			t.Fatal("waitMounted = true, want false: serve loop exited and the dir is not live")
+		}
+		if waited := time.Since(start); waited >= timeout {
+			t.Fatalf("waitMounted waited %v (>= the %v timeout); it did not bail on the closed serve-exit channel", waited, timeout)
+		}
+	})
+
+	t.Run("serve exit, final probe sees the mount -> kept", func(t *testing.T) {
+		var calls atomic.Int32
+		swapMountAlive(t, func(base, accountDir string) bool {
+			// Top-of-loop probe misses; the one final probe after serve-exit
+			// catches a mount that landed in the same instant.
+			return calls.Add(1) > 1
+		})
+		exited := make(chan struct{})
+		close(exited)
+		if !waitMounted("base", "acct", 10*time.Second, exited) {
+			t.Fatal("waitMounted = false, want true: the final probe after serve-exit saw a live mount")
+		}
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("probe calls = %d, want 2 (top probe + one final probe on serve-exit)", got)
+		}
+	})
 }
 
 func TestMountWaitErrSentinels(t *testing.T) {

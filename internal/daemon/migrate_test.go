@@ -1109,6 +1109,50 @@ func TestHealFuseTaxonomy(t *testing.T) {
 	}
 }
 
+// TestHealFuseSweepFailureRetries pins the errSweepStranded gate: a failure in
+// mountFuse's pre-Setup sweep of stranded private files is not a mount verdict,
+// so it retries next poll instead of irreversibly demoting the account to
+// symlink. A file-vs-directory private-entry collision — which
+// MovePrivateEntries refuses loudly, and which the symlink retreat would hit
+// the same way — is the deterministic trigger.
+func TestHealFuseSweepFailureRetries(t *testing.T) {
+	s, dirs, fake := newMigrateServer(t)
+	fake.setupErr = nil // Setup must never be reached; the sweep fails first.
+
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.OverlayKind = "fuse"
+	if err := s.m.Store.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+
+	// A private file in the underlay collides with a private DIR of the same
+	// name in the backing root: moveEntry refuses the file-vs-dir clash, so the
+	// sweep fails before Setup is attempted.
+	dir := dirs[1]
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte("identity"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(overlay.FusePrivateRoot(dir), ".credentials.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := s.healFuse(a); got != healRetry {
+		t.Fatalf("healFuse outcome = %d, want healRetry (%d): a pre-Setup sweep failure must not convert", got, healRetry)
+	}
+	if got := kindOf(t, s, 1); got != "fuse" {
+		t.Fatalf("row kind = %q, want \"fuse\": a sweep failure must not demote to symlink", got)
+	}
+	if s.isConverting(1) {
+		t.Fatal("a sweep failure leaked a converting claim")
+	}
+	if s.holder.wireStatus().TCCError != "" {
+		t.Fatal("a sweep failure wrongly recorded a TCC block")
+	}
+}
+
 // TestSelectServesFuseAccountWhenHolderVouches is the positive arm of the
 // carcass fix: a fuse account is selectable exactly when the holder cache
 // vouches for its mirror.

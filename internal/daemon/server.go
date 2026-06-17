@@ -1127,11 +1127,22 @@ const (
 	healFallback                      // genuine mount failure; gated symlink fallback attempted
 )
 
+// errSweepStranded marks a failure in mountFuse's pre-Setup sweep of stranded
+// private files (HasPrivateEntries/MovePrivateEntries) — distinct from a mount
+// failure: Setup was never attempted, so it is not a mount verdict. healFuse
+// routes it to healRetry, never the irreversible symlink fallback. A transient
+// local-I/O blip must not permanently demote the account (the scheduler only
+// re-heals fuse rows, so a fallback never auto-reverts), and a same-identity
+// collision that refuses the sweep would refuse the symlink retreat the same
+// way — so converting fixes nothing and only fails closed every poll.
+var errSweepStranded = errors.New("sweep stranded private files")
+
 // healFuse establishes a fuse account's mirror, classifying failures instead
 // of blindly converting: transient holder conditions (holder unreachable, the
 // dir busy, a wedged unmount in the way, a mount-up timeout under a proven
-// "Network Volumes" grant, or an error class only a newer holder
-// understands — none is a mount verdict) and a
+// "Network Volumes" grant, an error class only a newer holder understands, or a
+// failure sweeping stranded private files before Setup is even attempted — none
+// is a mount verdict) and a
 // mount blocked pending the macOS "Network Volumes" TCC grant all retry next
 // poll, and only a genuine mount failure falls back to symlink — itself gated
 // on the account being idle (see fallbackToSymlink). Used by the startup
@@ -1175,6 +1186,12 @@ func (s *Server) healFuse(a store.Account) healOutcome {
 		s.holder.recordTCC(err.Error())
 		s.log.Printf("acct-%02d fuse mount blocked pending the macOS \"Network Volumes\" grant, retrying next poll: %v", a.ID, err)
 		return healTCCBlocked
+	case errors.Is(err, errSweepStranded):
+		// The sweep of stranded private files failed BEFORE Setup was attempted,
+		// so this is not a mount verdict. Converting would hit the same collision
+		// the other way (and never auto-reverts), so retry next poll, loudly.
+		s.log.Printf("acct-%02d mount deferred (could not sweep stranded private files before mounting), retrying next poll: %v", a.ID, err)
+		return healRetry
 	default:
 		s.log.Printf("acct-%02d mount failed; attempting gated symlink fallback: %v", a.ID, err)
 		s.fallbackToSymlink(a)
@@ -1239,10 +1256,10 @@ func (s *Server) sweepAndMount(prov overlay.Provider, a store.Account, base, dir
 	if !overlayMounted(dir) {
 		switch has, err := overlay.HasPrivateEntries(dir); {
 		case err != nil:
-			return fmt.Errorf("check underlay for stranded private files: %w", err)
+			return fmt.Errorf("%w: check underlay: %w", errSweepStranded, err)
 		case has:
 			if err := overlay.MovePrivateEntries(dir, overlay.FusePrivateRoot(dir)); err != nil {
-				return fmt.Errorf("sweep stranded private files into backing dir: %w", err)
+				return fmt.Errorf("%w: move into backing dir: %w", errSweepStranded, err)
 			}
 			s.log.Printf("acct-%02d swept private files from the mount underlay into the backing dir", a.ID)
 		}
