@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/mountd"
 )
 
 // startFakeHolder runs a real mountd.Server backed by the daemon's fake fuse
@@ -27,9 +27,10 @@ func startFakeHolder(t *testing.T, fake *fakeFuseProv) *mountd.Client {
 	}
 	t.Cleanup(func() { os.RemoveAll(sockDir) })
 	srv := &mountd.Server{
-		Socket: filepath.Join(sockDir, "m.sock"),
-		Host:   fake,
-		Log:    log.New(io.Discard, "", 0),
+		Socket:  filepath.Join(sockDir, "m.sock"),
+		Host:    fake,
+		Version: version.String(),
+		Log:     log.New(io.Discard, "", 0),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

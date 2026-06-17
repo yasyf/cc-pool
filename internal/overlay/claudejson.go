@@ -62,9 +62,9 @@ var ClaudeJSONSharedProjectKeys = map[string]bool{
 	"hasTrustDialogAccepted":                  true,
 	"hasClaudeMdExternalIncludesApproved":     true,
 	"hasClaudeMdExternalIncludesWarningShown": true,
-	"mcpServers":                              true,
-	"enabledMcpjsonServers":                   true,
-	"disabledMcpjsonServers":                  true,
+	"mcpServers":             true,
+	"enabledMcpjsonServers":  true,
+	"disabledMcpjsonServers": true,
 }
 
 // MergeClaudeJSON overlays base's shareable top-level keys onto private and

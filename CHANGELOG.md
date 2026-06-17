@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The FUSE-T mount machinery is extracted into
+  [github.com/yasyf/fusekit](https://github.com/yasyf/fusekit) — the detached
+  mount-holder protocol (`fusekit/mountd`) and the mount/serve/teardown
+  primitives (the root `fusekit` package). cc-pool keeps only its
+  mirror-specific code (the `overlay` provider and the `pool` holder seam), and
+  runtime is byte-identical.
+
+### Added
+- A missing libfuse-t now surfaces as a graceful mount failure instead of
+  crashing the mount holder (cgofuse-load panic recovery → `ErrFuseUnavailable`),
+  and dead/wedged NFS carcasses are cleared before a remount (`ClearCarcass`).
+
 ## [0.28.0] - 2026-06-16
 
 ### Changed

@@ -44,7 +44,6 @@ cc-pool/
 │   ├── cli/            # ccp subcommands (init, add, select, run, status, doctor, …)
 │   ├── daemon/         # background poller: usage polling, idle token refresh, socket protocol; supervises the detached mount-holder process
 │   ├── keychain/       # macOS Keychain access for Claude Code credentials
-│   ├── mountd/         # detached mount-holder process (protocol, server, client, spawn)
 │   ├── oauth/          # Claude OAuth refresh + /api/oauth/usage client
 │   ├── overlay/        # shared ~/.claude overlay providers (symlink, fuse-t mirror)
 │   ├── peerpid/        # identify/kill the exact process holding a unix socket
@@ -60,6 +59,8 @@ cc-pool/
 ├── AGENTS.md           # This file — shared conventions
 └── STYLEGUIDE.md       # Full style guide
 ```
+
+The FUSE-T mount machinery — the detached mount-holder protocol (`fusekit/mountd`) and the mount/serve/teardown primitives (the root `fusekit` package) — now lives in [`github.com/yasyf/fusekit`](https://github.com/yasyf/fusekit). cc-pool keeps only its mirror-specific code (the `overlay` provider and the holder seam in `pool/`) and, from the extraction, gains cgofuse-load panic-recovery (a missing libfuse-t surfaces as `ErrFuseUnavailable` instead of crashing the holder) and pre-mount carcass clearing (`ClearCarcass`) — otherwise runtime byte-identical.
 
 Two filesystem trees, never confused:
 

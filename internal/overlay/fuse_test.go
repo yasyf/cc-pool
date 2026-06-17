@@ -18,6 +18,37 @@ import (
 	"github.com/winfsp/cgofuse/fuse"
 )
 
+// TestFuseMountOptionsByteIdentical pins the cc-pool mount-option WIRING:
+// buildMirrorConfig must hand fusekit a flat -o slice byte-identical to the one
+// the pre-extraction inline Setup passed to cgofuse at v0.28.1 — volname,
+// noattrcache (forced on darwin by MountOptions.Build), nobrowse, namedattr,
+// then rwsize=1048576 carried via MountOptions.Extra. A drift here (a reordered
+// flag, a dropped rwsize, a missing noattrcache) silently changes fuse-t mount
+// behavior, so the exact slice is the contract. fusekit's options_test pins
+// Build in isolation; this pins that cc-pool feeds it the right fields.
+func TestFuseMountOptionsByteIdentical(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "acct-01")
+	cfg := buildMirrorConfig(base, dir)
+	// buildMirrorConfig records the mirror in the process-global registry; this
+	// test never mounts, so drop it so a later test's dir reuse can't collide.
+	t.Cleanup(func() {
+		mirrorMu.Lock()
+		delete(mirrors, dir)
+		mirrorMu.Unlock()
+	})
+	want := []string{
+		"-o", "volname=cc-pool-acct-01",
+		"-o", "noattrcache",
+		"-o", "nobrowse",
+		"-o", "namedattr",
+		"-o", "rwsize=1048576",
+	}
+	if !slices.Equal(cfg.Options, want) {
+		t.Fatalf("mount options = %q, want the byte-identical v0.28.1 string %q", cfg.Options, want)
+	}
+}
+
 // TestFuseMirrorRoundTrip mounts a passthrough mirror via fuse-t and verifies
 // reads and writes pass straight through to the backing dir (no copy-up). It
 // requires fuse-t installed and may trip the one-time "Network Volumes" grant;
@@ -124,10 +155,10 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	}
 	// The commit's base write-through now runs off the fuse handler; drain it
 	// before asserting the base sibling.
-	mountMu.Lock()
-	mh := mounts[mnt]
-	mountMu.Unlock()
-	if mh == nil || !mh.fs.cj.flushWithin(5*time.Second) {
+	mirrorMu.Lock()
+	mfs := mirrors[mnt]
+	mirrorMu.Unlock()
+	if mfs == nil || !mfs.cj.flushWithin(5*time.Second) {
 		t.Fatal("base write-through did not drain after the commit")
 	}
 	sb, err := os.ReadFile(sibling)
@@ -970,11 +1001,11 @@ func TestMirrorClaudeJSONFlushWithinTimesOut(t *testing.T) {
 }
 
 // TestFuseProviderHealthJoinsMirrorErrors pins the Health glue between the
-// package mounts registry and the mirror's sticky errors: a registered (but
+// package mirrors registry and the mirror's sticky errors: a registered (but
 // dead) mount's write-through failure must surface through FuseProvider.Health
 // joined with the liveness error, and an unregistered dir reports only the
 // liveness error — never another mount's sticky state. No live mount needed:
-// the handle is registered by hand, the way Setup would.
+// the mirrorFS is registered by hand, the way buildMirrorConfig would.
 func TestFuseProviderHealthJoinsMirrorErrors(t *testing.T) {
 	fs, home := newClaudeJSONMirror(t, mergePrivate, `{not json`)
 	base := filepath.Join(home, ".claude")
@@ -992,13 +1023,13 @@ func TestFuseProviderHealthJoinsMirrorErrors(t *testing.T) {
 	}
 
 	accountDir := t.TempDir()
-	mountMu.Lock()
-	mounts[accountDir] = &mountHandle{fs: fs}
-	mountMu.Unlock()
+	mirrorMu.Lock()
+	mirrors[accountDir] = fs
+	mirrorMu.Unlock()
 	t.Cleanup(func() {
-		mountMu.Lock()
-		delete(mounts, accountDir)
-		mountMu.Unlock()
+		mirrorMu.Lock()
+		delete(mirrors, accountDir)
+		mirrorMu.Unlock()
 	})
 
 	p := &FuseProvider{}

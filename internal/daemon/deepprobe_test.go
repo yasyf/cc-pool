@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/procscan"
+	"github.com/yasyf/fusekit/mountd"
 )
 
 // swapDeepProbe overrides the daemon's deep-probe seam for one test, restoring

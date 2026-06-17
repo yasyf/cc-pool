@@ -18,12 +18,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/peerpid"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/mountd"
 )
 
 // spawnRecorder is an injectable Server.spawnHolder seam: it records every

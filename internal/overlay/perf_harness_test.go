@@ -30,6 +30,30 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// waitMirrorUp polls until base's contents show through mnt, the timeout
+// elapses, or the serve goroutine exits first (done closed → a hard mount(2)
+// failure that will never come live, after which one final probe keeps a mount
+// that landed in the same instant). It is a harness-local stand-in for the
+// deleted overlay.waitMounted: the perf arm mounts cgofuse by hand with custom
+// A/B opts (so it cannot route through the FuseProvider/MountSet lifecycle),
+// and only needs a bounded readiness wait, not fusekit's full mount machinery.
+func waitMirrorUp(base, mnt string, timeout time.Duration, done <-chan struct{}) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if MountAlive(base, mnt) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		select {
+		case <-done:
+			return MountAlive(base, mnt)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
 // BenchmarkGetattrSharedLink quantifies win B: a carve-out symlink getattr is now
 // syscall-free (serves the precomputed synthetic stat) vs the pre-change cost of
 // an Lstat(target)+copyStat+override. Run:
@@ -183,7 +207,7 @@ func runPerfArm(t *testing.T, vol string, opts []string, clients int, warmup, du
 	host.SetCapReaddirPlus(true)
 	done := make(chan struct{})
 	go func() { defer close(done); host.Mount(mnt, opts) }()
-	if !waitMounted(base, mnt, 15*time.Second, done) {
+	if !waitMirrorUp(base, mnt, 15*time.Second, done) {
 		host.Unmount()
 		select {
 		case <-done:

@@ -3,18 +3,18 @@ package pool
 import (
 	"fmt"
 
-	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/fusekit/mountd"
 )
 
 // OverlayProviderFor returns the provider for a stored overlay kind. It is
 // the pool's one resolver and never silently substitutes kinds: KindFuse maps
-// to the mount-holder-backed RemoteProvider (which always reports KindFuse,
+// to the mount-holder-backed remoteFuse adapter (which always reports KindFuse,
 // even in a build that could not host the mounts itself); everything else
 // maps to the symlink provider.
 func OverlayProviderFor(kind overlay.Kind) overlay.Provider {
 	if kind == overlay.KindFuse {
-		return mountd.NewRemoteProvider(MountsSocketPath(), MountHolderLogPath())
+		return newRemoteFuse()
 	}
 	return &overlay.SymlinkProvider{}
 }
@@ -44,7 +44,7 @@ func DetectOverlayKind() (overlay.Kind, string) {
 	if !CanHostFuse() {
 		return overlay.KindSymlink, "this build cannot host fuse mounts; install fuse-t (brew install macos-fuse-t/cask/fuse-t), then brew reinstall cc-pool"
 	}
-	if err := mountd.EnsureRunning(MountsSocketPath(), MountHolderLogPath(), mountd.DefaultSpawnTimeout); err != nil {
+	if err := SpawnHolder(MountsSocketPath(), MountHolderLogPath(), mountd.DefaultSpawnTimeout); err != nil {
 		return overlay.KindSymlink, fmt.Sprintf("mount holder did not start: %v", err)
 	}
 	ok, err := mountd.NewClient(MountsSocketPath()).Probe()

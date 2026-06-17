@@ -16,10 +16,10 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/keychain"
-	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/mountd"
 )
 
 // fakeFuseProv stands in for the fuse provider so handler-level conversion
@@ -42,6 +42,15 @@ type fakeFuseProv struct {
 
 func (f *fakeFuseProv) Kind() overlay.Kind          { return overlay.KindFuse }
 func (f *fakeFuseProv) Sync(base, dir string) error { return nil }
+
+// State satisfies fusekit's narrow mountd.Host seam (which replaced the old
+// mounted/mountAlive package-var seams): the fake holder reports real kernel
+// liveness, so any /tmp test dir reads (false, false) — exactly the prior
+// behavior of the deleted in-tree server's overlay.Mounted/overlay.MountAlive
+// defaults.
+func (f *fakeFuseProv) State(base, dir string) (mounted, alive bool) {
+	return overlay.Mounted(dir), overlay.MountAlive(base, dir)
+}
 
 func (f *fakeFuseProv) Health(base, dir string) error {
 	f.mu.Lock()

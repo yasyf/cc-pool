@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/mountd"
 )
 
 // holderRefreshFloor rate-limits select-path cache refreshes: a fuse row the
@@ -77,8 +77,8 @@ type holderState struct {
 	// noteUnmounted clear a dir's entry and markUnhealthy drops them all (an
 	// unreachable holder's verdict is meaningless). lastProbed throttles the
 	// periodic probe (per dir, once per deepProbeInterval).
-	deep       map[string]*deepVerdict
-	lastProbed map[string]time.Time
+	deep        map[string]*deepVerdict
+	lastProbed  map[string]time.Time
 	refreshedAt time.Time
 	// bases mirrors the holder's dir -> base registry from the last
 	// successful List. Unlike mounts it SURVIVES markUnhealthy: it exists so

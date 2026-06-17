@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/peerpid"
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/mountd"
 )
 
 const (
@@ -836,12 +837,12 @@ func (s *Server) canSpawnHolder() bool {
 }
 
 // spawn starts a mount holder on the daemon's holder socket through the seam;
-// nil means mountd.EnsureRunning.
+// nil means pool.SpawnHolder.
 func (s *Server) spawn() error {
 	if s.spawnHolder != nil {
 		return s.spawnHolder(s.holderSocket, s.holderLog, mountd.DefaultSpawnTimeout)
 	}
-	return mountd.EnsureRunning(s.holderSocket, s.holderLog, mountd.DefaultSpawnTimeout)
+	return pool.SpawnHolder(s.holderSocket, s.holderLog, mountd.DefaultSpawnTimeout)
 }
 
 // killPeerPid force-terminates the process holding socket through the seam,

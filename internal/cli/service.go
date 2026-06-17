@@ -11,7 +11,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
-	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/peerpid"
 	"github.com/yasyf/cc-pool/internal/pool"
@@ -19,6 +18,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/service"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/mountd"
 )
 
 // Test seams. CLI tests must never scan real processes, stat real

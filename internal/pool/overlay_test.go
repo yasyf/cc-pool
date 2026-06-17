@@ -3,7 +3,6 @@ package pool
 import (
 	"testing"
 
-	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
 )
 
@@ -30,9 +29,9 @@ func TestOverlayProviderFor(t *testing.T) {
 				}
 				return
 			}
-			rp, ok := p.(*mountd.RemoteProvider)
+			rp, ok := p.(remoteFuse)
 			if !ok {
-				t.Fatalf("OverlayProviderFor(%q) = %T, want *mountd.RemoteProvider", tc.kind, p)
+				t.Fatalf("OverlayProviderFor(%q) = %T, want pool.remoteFuse", tc.kind, p)
 			}
 			// KindFuse always — even in a build that cannot host mounts itself —
 			// so stored-kind fences never silently flip.

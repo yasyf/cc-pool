@@ -16,7 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
@@ -24,6 +23,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/mountd"
 )
 
 // reservationTTL is how long a select-reservation suppresses re-picking the
@@ -120,7 +120,7 @@ type Server struct {
 	// shrink it.
 	holderGoneWait time.Duration
 
-	// spawnHolder overrides holder spawning; nil means mountd.EnsureRunning,
+	// spawnHolder overrides holder spawning; nil means pool.SpawnHolder,
 	// which only the fuse build can perform. Tests inject outcomes — which
 	// also lets pure builds exercise the supervision flow.
 	spawnHolder func(socket, logPath string, timeout time.Duration) error
