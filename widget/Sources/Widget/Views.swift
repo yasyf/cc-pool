@@ -514,41 +514,24 @@ struct MessageView: View {
     }
 }
 
-// MARK: - Previews
+// MARK: - Widget background
 
-#Preview("medium", as: .systemMedium) {
-    CCPoolStatusWidget()
-} timeline: {
-    StatusEntry(date: .now, state: .ok(.sample, stale: false))
-    StatusEntry(date: .now, state: .ok(.samplePrePace, stale: false))
-    StatusEntry(date: .now, state: .ok(.sampleLegacy, stale: false))
-    StatusEntry(date: .now, state: .ok(.sample, stale: true))
-    StatusEntry(date: .now, state: .noFile)
-}
+/// The widget background: the system tertiary fill with a faint radial wash
+/// of the mascot's mood color. Lives inside containerBackground — macOS 14
+/// widgets must not paint their own full-bleed background — and stays subtle
+/// (≤ 0.18 opacity) so secondary/tertiary text keeps contrast in both
+/// appearances. Dimmed alongside the content when the snapshot is stale.
+struct MoodWashBackground: View {
+    let state: StatusEntry.State
 
-#Preview("small", as: .systemSmall) {
-    CCPoolStatusWidget()
-} timeline: {
-    StatusEntry(date: .now, state: .ok(.sample, stale: false))
-    StatusEntry(date: .now, state: .ok(.samplePrePace, stale: false))
-    StatusEntry(date: .now, state: .ok(.sampleLegacy, stale: false))
-    StatusEntry(date: .now, state: .unreadable)
-}
-
-#Preview("large", as: .systemLarge) {
-    CCPoolStatusWidget()
-} timeline: {
-    StatusEntry(date: .now, state: .ok(.sample, stale: false))
-    StatusEntry(date: .now, state: .ok(.sample, stale: true))
-}
-
-#Preview("moods", as: .systemMedium) {
-    CCPoolStatusWidget()
-} timeline: {
-    StatusEntry(date: .now, state: .ok(.sample(mood: .chill), stale: false))
-    StatusEntry(date: .now, state: .ok(.sample(mood: .easy), stale: false))
-    StatusEntry(date: .now, state: .ok(.sample(mood: .uneasy), stale: false))
-    StatusEntry(date: .now, state: .ok(.sample(mood: .worried), stale: false))
-    StatusEntry(date: .now, state: .ok(.sample(mood: .alarmed), stale: false))
-    StatusEntry(date: .now, state: .ok(.sample(mood: .panic), stale: false))
+    var body: some View {
+        ZStack {
+            Rectangle().fill(.fill.tertiary)
+            if case .ok(let status, let stale) = state, let outlook = status.outlook {
+                RadialGradient(colors: [outlook.mood.tint.opacity(0.18), .clear],
+                               center: .topLeading, startRadius: 0, endRadius: 240)
+                    .opacity(stale ? 0.55 : 1)
+            }
+        }
+    }
 }

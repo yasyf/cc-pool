@@ -148,6 +148,22 @@ plugin root too, so the session writes canonical plugin paths into the shared
 CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CONFIG_DIR=$(ccp select) claude
 ```
 
+### The Notification Center widget
+
+<img src="docs/assets/widget-medium.png" width="377"
+     alt="cc-pool medium widget: pool mascot and headline above per-account 5h/7d usage bars">
+
+`ccp status` without the terminal: per-account 5h/7d usage bars, live-session
+counts, and a pool mascot whose mood tracks how fast the pool is draining.
+
+```sh
+ccp widget
+```
+
+That installs the widget app from a Homebrew cask and prints the steps to add
+it from the widget gallery. Data flow, build-from-source, and troubleshooting
+live in [widget/README.md](widget/README.md).
+
 ## How it works
 
 ### `~/.claude` is sacred

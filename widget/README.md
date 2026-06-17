@@ -4,6 +4,9 @@ A macOS WidgetKit widget that shows `ccp status` at a glance: per-account 5h/7d
 usage bars, live-session counts, and flags (stale / rate-limited / exhausted /
 overage), in the same order as the CLI's table.
 
+<img src="../docs/assets/widget-medium.png" width="377"
+     alt="The medium cc-pool widget, rendered from sample data">
+
 ## How it gets data
 
 The daemon writes an atomic snapshot to `~/.cc-pool/status.json` after every
@@ -58,6 +61,19 @@ open ~/Applications/CCPoolStatus.app
 `project.yml` is the source of truth; the `.xcodeproj` and everything under
 `Generated/` are emitted by xcodegen and gitignored. To work in the Xcode UI:
 `xcodegen generate && open CCPoolStatus.xcodeproj`.
+
+## Regenerating the docs screenshot
+
+`docs/assets/widget-medium.png` (used above and in the main README) is rendered
+from the `PoolStatus.sample` fixture — never captured from a live widget — so
+it's reproducible and shows no real account data:
+
+```sh
+./scripts/render-screenshot.sh
+```
+
+Re-run it whenever the widget UI changes. It needs only the Xcode toolchain
+(`xcrun swiftc`), not xcodegen or xcodebuild.
 
 ## Signing
 
