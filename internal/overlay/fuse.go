@@ -149,8 +149,13 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 	// fuse-t mount options (its NFS backend has NO soft/timeout/retrans knobs;
 	// the coherence lever is noattrcache). The backing ~/.claude is written
 	// directly by plain `claude` while a pooled session reads through this
-	// mirror, so disable attribute caching to avoid stale reads. nobrowse
-	// keeps the mount out of Finder sidebars.
+	// mirror, so disable attribute caching to avoid stale reads. noattrcache is
+	// LOAD-BEARING for /.claude.json specifically: with attr caching on, the NFS
+	// client clamps a merged-view read to a stale cached size and serves a TORN
+	// (truncated) /.claude.json after an external base edit — close-to-open does
+	// not save it (pinned by TestFuseAttrCacheNoTornRead). Removing noattrcache to
+	// kill the GETATTR storm needs /.claude.json moved off this mount first (see
+	// the perf notes / Phase 3b). nobrowse keeps the mount out of Finder sidebars.
 	// namedattr: macOS's NFS client defaults to nonamedattr, under which every
 	// xattr op on the mount fails ENOTSUP — and ENOTSUP from setxattr is
 	// exactly what trips xnu's AppleDouble fallback (bsd/vfs/vfs_xattr.c),

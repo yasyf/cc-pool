@@ -1153,6 +1153,127 @@ func TestMirrorReaddirSubdirOmitsPrivateMerge(t *testing.T) {
 	}
 }
 
+// TestFuseAttrCacheNoTornRead pins the load-bearing reason noattrcache stays on
+// (fuse.go): plain `claude` edits ~/.claude.json externally (varying its size)
+// while a pooled session reads the merged view through the mount via fresh opens,
+// and every read must be a COMPLETE document — never truncated/torn. noattrcache
+// makes the NFS client revalidate every read, so this holds; dropping it makes
+// the client clamp reads to a stale cached size and serve a torn /.claude.json
+// (close-to-open does NOT save it — measured), which would corrupt a session's
+// state. Needs a real fuse-t mount; skips otherwise.
+func TestFuseAttrCacheNoTornRead(t *testing.T) {
+	base := t.TempDir()
+	mnt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sibling := filepath.Join(filepath.Dir(base), ".claude.json")
+	mkBase := func(pad int) []byte {
+		return []byte(`{"theme":"light","sharedKey":"` + strings.Repeat("x", pad) + `","oauthAccount":{"accountUuid":"base"}}`)
+	}
+	if err := os.WriteFile(sibling, mkBase(1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := &FuseProvider{}
+	if err := p.Setup(base, mnt); err != nil {
+		t.Skipf("fuse-t mount unavailable (acceptable; symlink is the default): %v", err)
+	}
+	defer p.Teardown(base, mnt)
+	if err := os.WriteFile(filepath.Join(FusePrivateRoot(mnt), ".claude.json"), []byte(`{"theme":"dark","oauthAccount":{"accountUuid":"acct"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cj := filepath.Join(mnt, ".claude.json")
+	if _, err := os.ReadFile(cj); err != nil { // warm the attr cache
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for i := 1; time.Now().Before(deadline); i++ {
+		if err := os.WriteFile(sibling, mkBase(i%400+1), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(cj)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if !json.Valid(b) {
+			t.Fatalf("TORN READ at i=%d: %d bytes not valid JSON: %q", i, len(b), b)
+		}
+	}
+}
+
+// TestFuseAttrCacheBaseToAccountCTO pins base->account propagation of the merged
+// /.claude.json view: an external edit to the base ~/.claude.json must reach a
+// pooled session reading through the mount on a fresh open, and reads must never
+// be short/torn. It needs a real fuse-t mount and skips when one is unavailable.
+func TestFuseAttrCacheBaseToAccountCTO(t *testing.T) {
+	base := t.TempDir()
+	mnt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sibling := filepath.Join(filepath.Dir(base), ".claude.json")
+	if err := os.WriteFile(sibling, []byte(`{"theme":"light","sharedKey":"v1","oauthAccount":{"accountUuid":"base"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := &FuseProvider{}
+	if err := p.Setup(base, mnt); err != nil {
+		t.Skipf("fuse-t mount unavailable (acceptable; symlink is the default): %v", err)
+	}
+	defer p.Teardown(base, mnt)
+	if err := os.WriteFile(filepath.Join(FusePrivateRoot(mnt), ".claude.json"), []byte(`{"theme":"dark","oauthAccount":{"accountUuid":"acct"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cjPath := filepath.Join(mnt, ".claude.json")
+	readVal := func() string {
+		b, err := os.ReadFile(cjPath)
+		if err != nil {
+			t.Fatalf("read .claude.json through mount: %v", err)
+		}
+		return strings.Trim(string(raw(t, b)["sharedKey"]), `"`)
+	}
+	// assertNoTear: at a stable point, the stat size must equal the bytes a full
+	// read returns (a merged-view size/read mismatch truncates the client).
+	assertNoTear := func() {
+		fi, err := os.Stat(cjPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(cjPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Size() != int64(len(b)) {
+			t.Fatalf("short/torn read: stat size %d != %d bytes read", fi.Size(), len(b))
+		}
+	}
+
+	// Warm: the merged view reflects base's v1 (and caches its attrs).
+	if got := readVal(); got != "v1" {
+		t.Fatalf("warm merged sharedKey = %q, want v1", got)
+	}
+	assertNoTear()
+
+	// External edit to base — a longer value so size AND mtime move.
+	if err := os.WriteFile(sibling, []byte(`{"theme":"light","sharedKey":"v2-after-external-edit","oauthAccount":{"accountUuid":"base"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close-to-open: a fresh open+read must observe v2. If dropping noattrcache
+	// broke base->account propagation, this never converges.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if strings.HasPrefix(readVal(), "v2") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("external base edit not visible through the mount within 15s — close-to-open propagation regressed")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	assertNoTear()
+}
+
 // TestMirrorSharedLinkSyntheticStatNoSyscall pins the syscall-free carve-out
 // presentation: after snapshotShared, a shared top-level entry's Getattr and
 // Readlink serve a precomputed synthetic S_IFLNK stat (size = len(target)) and
