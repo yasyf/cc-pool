@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -51,9 +52,9 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	if err != nil {
 		return err
 	}
-	bin, err := exec.LookPath("claude")
+	c, err := loginCommand(a.ConfigDir)
 	if err != nil {
-		return fmt.Errorf("`claude` not found on PATH: %w", err)
+		return err
 	}
 
 	out := cmd.OutOrStdout()
@@ -61,8 +62,6 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 
 	fd := int(os.Stdin.Fd())
 	state, _ := term.GetState(fd) // nil on non-TTY; restore is nil-safe
-	c := exec.Command(bin, "/login")
-	c.Env = execEnv(os.Environ(), a.ConfigDir)
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := c.Start(); err != nil {
 		return fmt.Errorf("start claude /login: %w", err)
@@ -72,6 +71,31 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	<-procExit
 	restoreTerminal(out, fd, state)
 
+	if err := finishRelogin(cmd.Context(), m, a); err != nil {
+		return err
+	}
+	success(out, "%s re-logged in.", accountName(a.Label))
+	return nil
+}
+
+// loginCommand builds the `claude /login` command for an account's config dir,
+// with the credential-isolating env from execEnv. The caller owns the child's
+// stdio: runRelogin attaches it to the terminal directly, while the status TUI
+// hands it to tea.ExecProcess. Shared so both paths spawn an identical login.
+func loginCommand(configDir string) (*exec.Cmd, error) {
+	bin, err := exec.LookPath("claude")
+	if err != nil {
+		return nil, fmt.Errorf("`claude` not found on PATH: %w", err)
+	}
+	c := exec.Command(bin, "/login")
+	c.Env = execEnv(os.Environ(), configDir)
+	return c, nil
+}
+
+// finishRelogin verifies a `claude /login` left a usable credential for the
+// account, re-asserts our Keychain ACL over it, and clears the needs-login flag.
+// Shared by the `ccp login` command and the status TUI's re-login action.
+func finishRelogin(ctx context.Context, m *pool.Manager, a store.Account) error {
 	// A real login leaves a fresh, usable credential in whichever backend the
 	// account uses. If it didn't, the daemon will re-flag on its next poll, so
 	// we refuse to clear the flag here.
@@ -81,13 +105,12 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	}
 	// Re-assert our `security`-trusted ACL over the freshly written item (a
 	// no-op rewrite for the plaintext-file backend).
-	if err := m.AdoptRotatedToken(cmd.Context(), a); err != nil {
+	if err := m.AdoptRotatedToken(ctx, a); err != nil {
 		return fmt.Errorf("re-assert credential for %s: %w", accountName(a.Label), err)
 	}
 	if _, err := m.Store.ClearNeedsLogin(a.ID); err != nil {
 		return fmt.Errorf("clear needs-login for %s: %w", accountName(a.Label), err)
 	}
-	success(out, "%s re-logged in.", accountName(a.Label))
 	return nil
 }
 

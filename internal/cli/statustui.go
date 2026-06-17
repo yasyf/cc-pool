@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
+	"github.com/yasyf/cc-pool/internal/store"
 )
 
 // statusRefreshInterval is how often the TUI re-polls the daemon (or live
@@ -61,6 +63,12 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 		toggle: func(accountID int) (bool, error) {
 			return m.TogglePin(cwd, accountID, time.Now())
 		},
+		buildLogin: func(a store.Account) (*exec.Cmd, error) {
+			return loginCommand(a.ConfigDir)
+		},
+		finishLogin: func(a store.Account) error {
+			return finishRelogin(ctx, m, a)
+		},
 	}
 	p := tea.NewProgram(model,
 		tea.WithContext(ctx),
@@ -88,18 +96,22 @@ type statusData struct {
 type statusTUI struct {
 	ctx        context.Context
 	cwd        string // launch directory; "" hides pin controls
-	gather     func(context.Context) (statusData, error)
-	toggle     func(accountID int) (bool, error)
-	snaps      []pool.Snapshot
-	pin        dirPin
-	cursorID   int
-	width      int
-	height     int
-	err        error
-	pinErr     error
-	pinBusy    bool // a toggle is in flight; drop repeat presses
-	lastUpdate time.Time
-	quitting   bool
+	gather      func(context.Context) (statusData, error)
+	toggle      func(accountID int) (bool, error)
+	buildLogin  func(a store.Account) (*exec.Cmd, error) // build the interactive `claude /login`
+	finishLogin func(a store.Account) error              // verify + adopt + clear, off the UI goroutine
+	snaps       []pool.Snapshot
+	pin         dirPin
+	cursorID    int
+	width       int
+	height      int
+	err         error
+	pinErr      error
+	pinBusy     bool // a toggle is in flight; drop repeat presses
+	reloginErr  error
+	reloginBusy bool // a re-login is in flight; drop repeat presses
+	lastUpdate  time.Time
+	quitting    bool
 }
 
 // Bubble Tea messages.
@@ -110,7 +122,11 @@ type (
 	}
 	errMsg     struct{ err error }
 	pinDoneMsg struct{ err error }
-	tickMsg    time.Time
+	// reloginExitedMsg fires once claude /login exited and tea.ExecProcess
+	// handed the terminal back; the verify+adopt+clear still has to run.
+	reloginExitedMsg struct{ account store.Account }
+	reloginDoneMsg   struct{ err error }
+	tickMsg          time.Time
 )
 
 func (t statusTUI) Init() tea.Cmd {
@@ -137,6 +153,15 @@ func (t statusTUI) togglePinCmd(accountID int) tea.Cmd {
 	return func() tea.Msg {
 		_, err := t.toggle(accountID)
 		return pinDoneMsg{err: err}
+	}
+}
+
+// finishReloginCmd runs the post-login verify+adopt+clear off the UI goroutine
+// after claude /login exited, keeping the Keychain/network I/O off the render
+// loop.
+func (t statusTUI) finishReloginCmd(a store.Account) tea.Cmd {
+	return func() tea.Msg {
+		return reloginDoneMsg{err: t.finishLogin(a)}
 	}
 }
 
@@ -169,6 +194,27 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			t.pinBusy = true
 			t.pinErr = nil
 			return t, t.togglePinCmd(t.current().Account.ID)
+		case "a":
+			// Re-login only the account that needs it — the remedy the badge
+			// advertises. claude /login takes over the terminal via ExecProcess.
+			s := t.current()
+			if len(t.snaps) == 0 || t.reloginBusy || t.buildLogin == nil || !s.NeedsLogin {
+				return t, nil
+			}
+			c, err := t.buildLogin(s.Account)
+			if err != nil {
+				t.reloginErr = err
+				return t, nil
+			}
+			t.reloginBusy = true
+			t.reloginErr = nil
+			a := s.Account
+			return t, tea.ExecProcess(c, func(error) tea.Msg {
+				// The exit status is not the signal: a real login is confirmed
+				// only by the usable credential it leaves behind, exactly as
+				// `ccp login` checks. finishLogin is the sole gate.
+				return reloginExitedMsg{account: a}
+			})
 		}
 		return t, nil
 	case snapsMsg:
@@ -189,6 +235,17 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return t, nil
 		}
 		return t, t.refreshCmd()
+	case reloginExitedMsg:
+		// claude exited and the terminal is back under our control; finish the
+		// verify+adopt+clear off the UI goroutine.
+		return t, t.finishReloginCmd(msg.account)
+	case reloginDoneMsg:
+		t.reloginBusy = false
+		t.reloginErr = msg.err
+		if msg.err != nil {
+			return t, nil
+		}
+		return t, t.refreshCmd() // pick up the cleared flag / fresh sample
 	case tickMsg:
 		return t, tea.Batch(t.refreshCmd(), tickCmd())
 	}
@@ -262,17 +319,24 @@ func (t statusTUI) View() string {
 	}
 	listBox := panelStyle.Width(contentW).Render(t.renderList())
 	detailBox := panelStyle.Width(contentW).Render(t.renderDetail())
-	help := "↑/↓ navigate · r refresh · q quit"
+	// Each binding is advertised only where it actually works on the cursor's
+	// account, and names the effect the press will have.
+	helpParts := []string{"↑/↓ navigate"}
+	if t.current().NeedsLogin {
+		helpParts = append(helpParts, "a re-login")
+	}
 	if t.cwd != "" {
-		// The pin binding is only advertised where the key actually works,
-		// and names the effect the press will have on the cursor's account.
 		pinKey := "p pin"
 		if t.pin.ok && t.current().Account.ID == t.pin.view.AccountID {
 			pinKey = "p unpin"
 		}
-		help = "↑/↓ navigate · " + pinKey + " · r refresh · q quit"
+		helpParts = append(helpParts, pinKey)
 	}
-	footer := dimStyle.Render(help)
+	helpParts = append(helpParts, "r refresh", "q quit")
+	footer := dimStyle.Render(strings.Join(helpParts, " · "))
+	if t.reloginErr != nil {
+		footer = badStyle.Render(fmt.Sprintf("re-login failed: %v", t.reloginErr)) + "  " + footer
+	}
 	if t.pinErr != nil {
 		footer = badStyle.Render(fmt.Sprintf("pin failed: %v", t.pinErr)) + "  " + footer
 	}
