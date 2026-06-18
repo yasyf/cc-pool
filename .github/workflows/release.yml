@@ -166,17 +166,12 @@ jobs:
       # not in this repo — so `brew install yasyf/tap/cc-pool` works without a
       # bespoke tap URL. Release assets still come from THIS repo's GitHub
       # Releases (the url lines below point at github.com/yasyf/cc-pool/...).
-      # HOMEBREW_TAP_TOKEN must be a PAT (or fine-grained token) with push
-      # access to yasyf/homebrew-tap; the default GITHUB_TOKEN cannot push
-      # cross-repo.
-      - name: Check out the external Homebrew tap
-        uses: actions/checkout@v6
-        with:
-          repository: yasyf/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: tap
-
-      - name: Write the bumped Formula and Cask into the tap
+      # We render the files into a local staging dir and hand it to the shared
+      # publish composite action, which checks out the tap, copies the staging
+      # contents in, and commits/pushes. HOMEBREW_TAP_TOKEN must be a PAT (or
+      # fine-grained token) with push access to yasyf/homebrew-tap; the default
+      # GITHUB_TOKEN cannot push cross-repo.
+      - name: Write the bumped Formula and Cask into the staging dir
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           PURE_SHA="${{ needs.build.outputs.pure_sha256 }}"
@@ -184,7 +179,7 @@ jobs:
           APP_SHA="${{ needs.build.outputs.app_sha256 }}"
           test -n "$PURE_SHA" && test -n "$FUSE_SHA" && test -n "$APP_SHA"
 
-          mkdir -p tap/Formula tap/Casks
+          mkdir -p tap-staging/Formula tap-staging/Casks
 
           # Formula: prebuilt universal binary from THIS repo's GitHub Releases,
           # with a `service` block for `brew services` (the reason cc-pool stays
@@ -193,7 +188,7 @@ jobs:
           # version; the heredoc interpolates ${VERSION} / ${*_SHA} from the
           # release just built above. Keep this in sync with the install logic
           # the project documents — only the publish LOCATION moved to the tap.
-          cat > tap/Formula/cc-pool.rb <<RUBY
+          cat > tap-staging/Formula/cc-pool.rb <<RUBY
           # Homebrew formula for cc-pool. Installs the prebuilt universal binary from
           # GitHub Releases — no Go toolchain needed. \`brew install --HEAD\` builds from
           # source instead.
@@ -307,7 +302,7 @@ jobs:
           # so the dependency stays `depends_on formula: "cc-pool"`. The url
           # interpolates #{version}, so only the version line + the `# app` sha
           # change per release.
-          cat > tap/Casks/cc-pool-status.rb <<RUBY
+          cat > tap-staging/Casks/cc-pool-status.rb <<RUBY
           # Homebrew cask for the cc-pool Notification Center widget (CCPoolStatus.app).
           #
           # Install with \`ccp widget\` — it disables quarantine, which this app needs:
@@ -353,22 +348,18 @@ jobs:
 
           # Fail loud if the interpolation produced something unexpected; allow
           # idempotent re-runs (re-tagging the same version is a no-op push).
-          grep -q "releases/download/v${VERSION}/" tap/Formula/cc-pool.rb
-          grep -q "${PURE_SHA}\" # pure" tap/Formula/cc-pool.rb
-          grep -q "${FUSE_SHA}\" # fuse" tap/Formula/cc-pool.rb
-          grep -q "version \"${VERSION}\"" tap/Casks/cc-pool-status.rb
-          grep -q "${APP_SHA}\" # app" tap/Casks/cc-pool-status.rb
+          grep -q "releases/download/v${VERSION}/" tap-staging/Formula/cc-pool.rb
+          grep -q "${PURE_SHA}\" # pure" tap-staging/Formula/cc-pool.rb
+          grep -q "${FUSE_SHA}\" # fuse" tap-staging/Formula/cc-pool.rb
+          grep -q "version \"${VERSION}\"" tap-staging/Casks/cc-pool-status.rb
+          grep -q "${APP_SHA}\" # app" tap-staging/Casks/cc-pool-status.rb
 
-      - name: Commit and push to the tap
-        run: |
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/cc-pool.rb Casks/cc-pool-status.rb
-          # --cached so brand-new (untracked) files count as a change too.
-          if git diff --cached --quiet; then
-            echo "tap already at ${GITHUB_REF_NAME}; nothing to push"
-            exit 0
-          fi
-          git commit -m "cc-pool: bump to ${GITHUB_REF_NAME}"
-          git push origin HEAD
+      # The shared composite action checks out yasyf/homebrew-tap, merges the
+      # staging dir's contents into the tap root, and commits/pushes (it no-ops
+      # when nothing changed — re-tagging the same version is idempotent).
+      - name: Publish the bumped files to the tap
+        uses: yasyf/homebrew-tap/.github/actions/publish@main
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          dir: tap-staging
+          message: "cc-pool ${{ github.ref_name }}"
