@@ -181,14 +181,20 @@ func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleO
 		return nil, false, err
 	}
 	defer release()
-	cred, src, _, err := m.ensureFreshToken(ctx, a, RefreshLeadTime, opts.AllowRefresh)
-	if err != nil && !errors.Is(err, ErrNeedsLogin) {
-		// Even on transient refresh failure we may still have a usable token.
-		if cred == nil {
-			return nil, false, err
-		}
+	cred, src, _, freshErr := m.ensureFreshToken(ctx, a, RefreshLeadTime, opts.AllowRefresh)
+	if freshErr != nil && !errors.Is(freshErr, ErrNeedsLogin) && cred == nil {
+		// Transient refresh failure with no usable token to fall back on.
+		return nil, false, freshErr
 	}
-	return m.fetchUsage(ctx, a, src, cred, opts)
+	usage, rateLimited, err := m.fetchUsage(ctx, a, src, cred, opts)
+	// A confirmed revocation from the pre-flight refresh (invalid_grant) must not be
+	// masked by a usage-endpoint 429 or a plain transient 401: surface it so the daemon
+	// flags needs-login. fetchUsage's rung-1 re-read still gets first crack at a
+	// session-rotated token — a clean recovery (no error, not rate-limited) suppresses it.
+	if errors.Is(freshErr, ErrNeedsLogin) && (err != nil || rateLimited) {
+		return nil, false, freshErr
+	}
+	return usage, rateLimited, err
 }
 
 // sameTokens reports whether two credentials carry byte-identical access AND

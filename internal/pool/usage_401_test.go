@@ -141,6 +141,52 @@ func assertNeverCanonical(t *testing.T, touched []string) {
 	}
 }
 
+// fakeOAuthRevoked reproduces the daemon mask: the pre-flight refresh confirms a
+// revocation (400 invalid_grant) while the usage endpoint returns a 429, so a
+// naive sampleUsage would surface rate-limited and swallow the needs-login.
+type fakeOAuthRevoked struct{}
+
+func (fakeOAuthRevoked) Refresh(_ context.Context, _, _ string) (*oauth.TokenResponse, error) {
+	return nil, &oauth.RefreshError{Status: 400, Body: "invalid_grant"}
+}
+
+func (fakeOAuthRevoked) Usage(_ context.Context, _ string) (*oauth.Usage, error) {
+	return nil, &oauth.UsageError{Status: 429}
+}
+
+// TestSampleUsageRevokedNotMaskedByRateLimit: a confirmed pre-flight revocation
+// must not be masked by a usage-endpoint 429. SampleUsage surfaces ErrNeedsLogin
+// (not rateLimited=true), and the error path records no usage sample.
+func TestSampleUsageRevokedNotMaskedByRateLimit(t *testing.T) {
+	kc := &rotatingKeychain{
+		current: cred401("at-0", "rt-stale", time.Now().Add(-time.Hour)),
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "acct-1-suffixed", KeychainAccount: "user", OverlayKind: "symlink"}
+	if err := st.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Store: st, OAuth: fakeOAuthRevoked{}, Keychain: kc, LockDir: t.TempDir()}
+
+	_, rateLimited, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
+	if !errors.Is(err, ErrNeedsLogin) {
+		t.Fatalf("err = %v, want ErrNeedsLogin (revocation masked by 429)", err)
+	}
+	if rateLimited {
+		t.Fatalf("rateLimited = true, want false (a revoked account is not rate-limited)")
+	}
+	if _, ok, serr := st.LatestUsageSample(a.ID); serr != nil {
+		t.Fatalf("LatestUsageSample: %v", serr)
+	} else if ok {
+		t.Fatalf("a usage sample was recorded, want none (error path must skip recordSample)")
+	}
+	assertNeverCanonical(t, kc.touchedServices())
+}
+
 // TestFetchUsage401RereadRetriesRotatedToken: the pre-flight read gets the stale
 // token, a session rotates the chain, and rung 1 (a pure re-read) retries with
 // the rotated token — recovering WITHOUT spending a refresh token.

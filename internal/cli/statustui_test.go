@@ -315,6 +315,29 @@ func TestStatusTUIReloginAction(t *testing.T) {
 		}
 	})
 
+	t.Run("a re-logs in a stale rate-limited account", func(t *testing.T) {
+		fl := &fakeLogin{}
+		tui := statusTUI{
+			snaps: []pool.Snapshot{{
+				Account:     store.Account{ID: 7, Label: "carol@example.com"},
+				Score:       10,
+				HasUsage:    true,
+				Stale:       true,
+				RateLimited: true,
+			}},
+			cursorID:    7,
+			buildLogin:  fl.build,
+			finishLogin: fl.finish,
+		}
+		got, cmd := pressA(t, tui)
+		if !got.reloginBusy || cmd == nil {
+			t.Fatalf("a on a stale rate-limited account must not be inert: busy=%v cmd=%v", got.reloginBusy, cmd)
+		}
+		if len(fl.built) != 1 || fl.built[0] != 7 {
+			t.Fatalf("buildLogin calls = %v, want [7]", fl.built)
+		}
+	})
+
 	t.Run("build error surfaces without starting a login", func(t *testing.T) {
 		fl := &fakeLogin{buildErr: errors.New("`claude` not found on PATH")}
 		tui, cmd := pressA(t, reloginTUI(fl))

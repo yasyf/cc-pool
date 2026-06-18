@@ -169,6 +169,13 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(statusRefreshInterval, func(tm time.Time) tea.Msg { return tickMsg(tm) })
 }
 
+// reloginable reports whether the status TUI should offer its 'a' re-login action:
+// any non-serving state a manual `claude /login` can clear. Mirrors `ccp login`,
+// which has no health gate.
+func reloginable(s pool.Snapshot) bool {
+	return s.NeedsLogin || s.Stale || s.RateLimited || s.Exhausted
+}
+
 func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -195,10 +202,10 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			t.pinErr = nil
 			return t, t.togglePinCmd(t.current().Account.ID)
 		case "a":
-			// Re-login only the account that needs it — the remedy the badge
+			// Re-login any account a login can recover — the remedy the badge
 			// advertises. claude /login takes over the terminal via ExecProcess.
 			s := t.current()
-			if len(t.snaps) == 0 || t.reloginBusy || t.buildLogin == nil || !s.NeedsLogin {
+			if len(t.snaps) == 0 || t.reloginBusy || t.buildLogin == nil || !reloginable(s) {
 				return t, nil
 			}
 			c, err := t.buildLogin(s.Account)
@@ -322,7 +329,7 @@ func (t statusTUI) View() string {
 	// Each binding is advertised only where it actually works on the cursor's
 	// account, and names the effect the press will have.
 	helpParts := []string{"↑/↓ navigate"}
-	if t.current().NeedsLogin {
+	if reloginable(t.current()) {
 		helpParts = append(helpParts, "a re-login")
 	}
 	if t.cwd != "" {
