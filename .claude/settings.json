@@ -35,10 +35,17 @@
         "repo": "yasyf/skills"
       },
       "autoUpdate": true
+    },
+    "captain-hook": {
+      "source": {
+        "source": "github",
+        "repo": "yasyf/captain-hook"
+      }
     }
   },
   "enabledPlugins": {
-    "codex@skills": true
+    "codex@skills": true,
+    "captain-hook@captain-hook": true
   },
   "hooks": {
     "PreToolUse": [
