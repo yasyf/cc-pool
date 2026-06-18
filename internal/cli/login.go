@@ -24,6 +24,11 @@ const (
 	killGrace = 3 * time.Second
 )
 
+// inputModeReset disables the terminal input modes claude may have enabled —
+// bracketed paste, mouse (normal/button/any), SGR mouse, focus reporting, and
+// the kitty keyboard protocol — so a force-killed claude can't leave them on.
+const inputModeReset = "\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[<u"
+
 // awaitOutcome is how a watched login ended.
 type awaitOutcome int
 
@@ -84,15 +89,16 @@ func newIdentityProbe(read identityFunc, kind overlay.Kind, configDir string) fu
 
 // runWatchedLogin runs `claude /login` attached to the terminal and watches
 // for the account's own login identity to land; when it does, it closes claude
-// for the user. The child stays in our foreground process group (a background
-// pgrp touching the tty would be stopped with SIGTTIN/SIGTTOU), so termination
-// signals target c.Process directly and the terminal is only restored after the
-// child has exited.
+// for the user. It delegates the spawn/poll/terminate to watchAndClose (the
+// single watched-login primitive) and owns only terminal setup/teardown. The
+// child stays in our foreground process group (a background pgrp touching the
+// tty would be stopped with SIGTTIN/SIGTTOU), so termination signals target
+// c.Process directly and the terminal is only restored after the child exited.
 //
 // On the kept-existing reuse path (the dir already holds a logged-in identity)
 // completion cannot be detected — the identity is already present, so an
-// identity probe would fire immediately — so the session runs unwatched and the
-// user exits claude themselves, exactly the pre-watcher behavior.
+// identity probe would fire immediately — so the session runs with a never-fire
+// probe and the user exits claude themselves, exactly the pre-watcher behavior.
 func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd) error {
 	bin, err := exec.LookPath("claude")
 	if err != nil {
@@ -102,8 +108,10 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 	// (SeedKeptExisting — the documented reuse path): there the identity is
 	// already present, so the identity probe would fire immediately. PrepareAdd
 	// already computed this, so no credential read is needed here.
-	watch := p.ClaudeJSONSeed != pool.SeedKeptExisting
-	if !watch {
+	probe := func() (bool, error) { return false, nil }
+	if p.ClaudeJSONSeed != pool.SeedKeptExisting {
+		probe = newIdentityProbe(pool.AccountIdentity, p.OverlayKind, p.ConfigDir)
+	} else {
 		note(cmd.OutOrStdout(), "Found an existing login. Exit claude when done; it's reused unless you log in again.")
 	}
 
@@ -113,37 +121,34 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 	c := exec.Command(bin, "/login")
 	c.Env = execEnv(os.Environ(), p.ConfigDir)
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	outcome, werr := watchAndClose(ctx, c, probe)
+	restoreTerminal(cmd.OutOrStdout(), fd, state)
+	// awaitCred: a fresh account identity landed — a real login completed (a
+	// startup adoption of the global credential writes none); claude was closed.
+	// A cancellation while closing still stops the add here, not at finalize.
+	if outcome == awaitCred {
+		return ctx.Err()
+	}
+	// awaitExited (user quit claude) and awaitCanceled (ctx canceled or a probe
+	// error) both surface the watch error directly.
+	return werr
+}
+
+// watchAndClose starts c, polls probe every loginPollInterval, and closes c (via
+// terminate) once the probe fires or ctx cancels; on a manual exit it leaves c
+// alone. Returns the await outcome and its error. The caller owns terminal setup
+// and teardown.
+func watchAndClose(ctx context.Context, c *exec.Cmd, probe func() (bool, error)) (awaitOutcome, error) {
 	if err := c.Start(); err != nil {
-		return fmt.Errorf("start claude /login: %w", err)
+		return awaitCanceled, fmt.Errorf("start claude /login: %w", err)
 	}
 	procExit := make(chan error, 1)
 	go func() { procExit <- c.Wait() }()
-
-	if !watch {
-		werr := <-procExit
-		restoreTerminal(cmd.OutOrStdout(), fd, state)
-		return werr
-	}
-
-	probe := newIdentityProbe(pool.AccountIdentity, p.OverlayKind, p.ConfigDir)
-	outcome, werr := awaitLogin(ctx, procExit, probe, loginPollInterval)
-	switch outcome {
-	case awaitExited:
-		// The user closed claude themselves; finalize proceeds as before.
-		restoreTerminal(cmd.OutOrStdout(), fd, state)
-		return werr
-	case awaitCanceled:
+	outcome, err := awaitLogin(ctx, procExit, probe, loginPollInterval)
+	if outcome != awaitExited {
 		terminate(c, procExit)
-		restoreTerminal(cmd.OutOrStdout(), fd, state)
-		return werr
 	}
-
-	// awaitCred: a fresh account identity landed — a real login completed (a
-	// startup adoption of the global credential writes none). Close claude. A
-	// cancellation while closing still stops the add here, not at finalize.
-	terminate(c, procExit)
-	restoreTerminal(cmd.OutOrStdout(), fd, state)
-	return ctx.Err()
+	return outcome, err
 }
 
 // terminate closes the child: SIGTERM, a grace period, then SIGKILL; always
@@ -169,7 +174,7 @@ func restoreTerminal(out io.Writer, fd int, state *term.State) {
 		_ = term.Restore(fd, state)
 	}
 	if isTTY() {
-		fmt.Fprint(out, "\x1b[?1049l\x1b[?25h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[<u\x1b[0m")
+		fmt.Fprint(out, "\x1b[?1049l\x1b[?25h"+inputModeReset+"\x1b[0m")
 	}
 }
 

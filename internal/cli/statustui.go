@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/keychain"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -122,12 +124,47 @@ type (
 	}
 	errMsg     struct{ err error }
 	pinDoneMsg struct{ err error }
-	// reloginExitedMsg fires once claude /login exited and tea.ExecProcess
-	// handed the terminal back; the verify+adopt+clear still has to run.
+	// reloginExitedMsg fires once claude /login exited — whether cc-pool
+	// auto-closed it on a fresh credential or the user quit it — and the watched
+	// tea.Exec spawn handed the terminal back; the verify+adopt+clear still has to
+	// run, and finishLogin stays the sole credential gate.
 	reloginExitedMsg struct{ account store.Account }
 	reloginDoneMsg   struct{ err error }
 	tickMsg          time.Time
 )
+
+// watchedLogin runs `claude /login` for the status TUI while polling for a fresh
+// credential; when one lands it closes claude, so re-login auto-closes exactly
+// like `ccp login`. Implements tea.ExecCommand: Bubble Tea calls Run with the
+// renderer paused and the terminal released, so the poll+terminate run off the UI
+// goroutine without fighting claude for the tty.
+type watchedLogin struct {
+	ctx  context.Context
+	cmd  *exec.Cmd
+	read credReader
+	out  io.Writer // claude's (and the TUI's) output; where the input-mode reset is emitted
+}
+
+func (w *watchedLogin) SetStdin(r io.Reader)  { w.cmd.Stdin = r }
+func (w *watchedLogin) SetStdout(o io.Writer) { w.cmd.Stdout = o; w.out = o }
+func (w *watchedLogin) SetStderr(o io.Writer) { w.cmd.Stderr = o }
+
+func (w *watchedLogin) Run() error {
+	baseline := ""
+	if cred, err := w.read(); err == nil {
+		baseline = cred.ClaudeAiOauth.AccessToken
+	}
+	outcome, _ := watchAndClose(w.ctx, w.cmd, newReloginProbe(w.read, baseline))
+	// Bubble Tea's post-Exec restore re-enters the alt screen, shows the cursor,
+	// and restores raw mode, but does not disable the input modes claude turned on
+	// that the TUI doesn't use. When we force-killed claude (anything but a clean
+	// self-exit), reset only those input modes — Bubble Tea owns alt-screen/cursor
+	// and will re-enter and repaint them itself.
+	if outcome != awaitExited && isTTY() {
+		fmt.Fprint(w.out, inputModeReset)
+	}
+	return nil // finishRelogin (post-exit, via reloginExitedMsg) stays the sole credential gate
+}
 
 func (t statusTUI) Init() tea.Cmd {
 	return tea.Batch(t.refreshCmd(), tickCmd())
@@ -203,7 +240,9 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return t, t.togglePinCmd(t.current().Account.ID)
 		case "a":
 			// Re-login any account a login can recover — the remedy the badge
-			// advertises. claude /login takes over the terminal via ExecProcess.
+			// advertises. claude /login takes over the terminal via a watched
+			// tea.Exec spawn that auto-closes claude once a fresh credential lands
+			// (the user may also exit it manually).
 			s := t.current()
 			if len(t.snaps) == 0 || t.reloginBusy || t.buildLogin == nil || !reloginable(s) {
 				return t, nil
@@ -216,12 +255,13 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			t.reloginBusy = true
 			t.reloginErr = nil
 			a := s.Account
-			return t, tea.ExecProcess(c, func(error) tea.Msg {
-				// The exit status is not the signal: a real login is confirmed
-				// only by the usable credential it leaves behind, exactly as
-				// `ccp login` checks. finishLogin is the sole gate.
-				return reloginExitedMsg{account: a}
-			})
+			wl := &watchedLogin{ctx: t.ctx, cmd: c, read: func() (*keychain.Credential, error) {
+				return reloginCred(a)
+			}}
+			// The exit status is not the signal: a real login is confirmed only by
+			// the usable credential it leaves behind, exactly as `ccp login`
+			// checks. finishLogin is the sole gate.
+			return t, tea.Exec(wl, func(error) tea.Msg { return reloginExitedMsg{account: a} })
 		}
 		return t, nil
 	case snapsMsg:
