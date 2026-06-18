@@ -361,8 +361,8 @@ func renderTable(snaps []pool.Snapshot, pin dirPin) string {
 func snapshotFlags(s pool.Snapshot) string {
 	var flags []string
 	if s.NeedsLogin {
-		// Most actionable state — a human must run `ccp login N`. Lead with it.
-		flags = append(flags, badStyle.Render(fmt.Sprintf("needs login: run `ccp login %d`", s.Account.ID)))
+		// Most actionable state — lead with it.
+		flags = append(flags, badStyle.Render("needs login"))
 	}
 	if s.Stale {
 		flags = append(flags, warnStyle.Render("stale"))
