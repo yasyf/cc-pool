@@ -177,15 +177,24 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 // TestFuseMirrorCarvesBulkAsSymlinks pins the bulk-carve: shared top-level
 // entries present through the mount as LIVE SYMLINKS into base, so the kernel
 // resolves them outside the mount and claude's bulk transcript/history writes
-// bypass fuse-t's NFS layer entirely. It needs a real fuse-t mount and skips
-// (like TestFuseMirrorRoundTrip) when one is unavailable.
+// bypass fuse-t's NFS layer entirely. settings.json is the ONE shared file that
+// is NOT carved — it is a virtual merged-view file (injected plansDirectory), so
+// it presents as a regular file carrying the injected content, asserted here so
+// the regression sentinel fails loudly if the carve-out exclusion is dropped. It
+// needs a real fuse-t mount and skips (like TestFuseMirrorRoundTrip) when one is
+// unavailable.
 func TestFuseMirrorCarvesBulkAsSymlinks(t *testing.T) {
 	base := t.TempDir()
 	mnt := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(base, "projects"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{}`), 0o644); err != nil {
+	// history is a shared top-level FILE that IS carved as a symlink (claude's
+	// bulk transcript I/O); settings.json is the merged-view exception.
+	if err := os.WriteFile(filepath.Join(base, "history"), []byte("h0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{"theme":"dark"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -208,15 +217,42 @@ func TestFuseMirrorCarvesBulkAsSymlinks(t *testing.T) {
 	}
 
 	// A shared top-level FILE presents as a symlink too.
+	hfi, err := os.Lstat(filepath.Join(mnt, "history"))
+	if err != nil {
+		t.Fatalf("lstat history through mount: %v", err)
+	}
+	if hfi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("history mode = %v, want a symlink (a shared file must be carved out of the mount)", hfi.Mode())
+	}
+	if got, err := os.Readlink(filepath.Join(mnt, "history")); err != nil || got != filepath.Join(base, "history") {
+		t.Fatalf("readlink history = %q (err %v), want %q", got, err, filepath.Join(base, "history"))
+	}
+
+	// settings.json is the merged-view exception: it is NOT a symlink but a
+	// regular file whose served content carries the injected plansDirectory
+	// (pointing at <base>/plans). Were it carved like the others, the injection
+	// would never run — this is the regression sentinel for that exclusion.
 	sfi, err := os.Lstat(filepath.Join(mnt, "settings.json"))
 	if err != nil {
 		t.Fatalf("lstat settings.json through mount: %v", err)
 	}
-	if sfi.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("settings.json mode = %v, want a symlink", sfi.Mode())
+	if sfi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("settings.json mode = %v, want a regular file (the merged-view exception, never a carved symlink)", sfi.Mode())
 	}
-	if got, err := os.Readlink(filepath.Join(mnt, "settings.json")); err != nil || got != filepath.Join(base, "settings.json") {
-		t.Fatalf("readlink settings.json = %q (err %v), want %q", got, err, filepath.Join(base, "settings.json"))
+	if !sfi.Mode().IsRegular() {
+		t.Fatalf("settings.json mode = %v, want a regular file", sfi.Mode())
+	}
+	served, err := os.ReadFile(filepath.Join(mnt, "settings.json"))
+	if err != nil {
+		t.Fatalf("read settings.json through mount: %v", err)
+	}
+	sgot := raw(t, served)
+	wantPlans := `"` + filepath.Join(base, "plans") + `"`
+	if string(sgot["plansDirectory"]) != wantPlans {
+		t.Fatalf("served settings.json plansDirectory = %s, want the injected %s — carve-out exclusion regressed", sgot["plansDirectory"], wantPlans)
+	}
+	if string(sgot["theme"]) != `"dark"` {
+		t.Fatalf("served settings.json theme = %s, want base's \"dark\" preserved", sgot["theme"])
 	}
 
 	// A multi-MB write through the carved symlink lands directly in base — the
@@ -1315,6 +1351,10 @@ func TestFuseAttrCacheBaseToAccountCTO(t *testing.T) {
 func TestMirrorSharedLinkSyntheticStatNoSyscall(t *testing.T) {
 	fs, base, _ := mirrorTree(t)
 	mustMkdir(t, filepath.Join(base, "projects"))
+	// history is a shared top-level FILE that IS carved as a symlink;
+	// settings.json is deliberately NOT — it is the merged-view exception, guarded
+	// below — so the file half of this litmus uses history.
+	mustTouch(t, filepath.Join(base, "history"))
 	mustTouch(t, filepath.Join(base, "settings.json"))
 	fs.snapshotShared()
 
@@ -1323,12 +1363,12 @@ func TestMirrorSharedLinkSyntheticStatNoSyscall(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(base, "projects")); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(base, "settings.json")); err != nil {
+	if err := os.Remove(filepath.Join(base, "history")); err != nil {
 		t.Fatal(err)
 	}
 
 	inos := map[uint64]string{}
-	for _, name := range []string{"projects", "settings.json"} {
+	for _, name := range []string{"projects", "history"} {
 		path := "/" + name
 		target := filepath.Join(base, name)
 		var stat fuse.Stat_t
@@ -1356,6 +1396,12 @@ func TestMirrorSharedLinkSyntheticStatNoSyscall(t *testing.T) {
 	// A non-carved name (a private entry) is never presented as a symlink.
 	if _, ok := fs.sharedEntryFor(claudeJSONFusePath); ok {
 		t.Errorf("/.claude.json must not be a carve-out symlink")
+	}
+	// settings.json was present in base at snapshot time, yet it is the
+	// merged-view exception (injected plansDirectory) — it must be excluded from
+	// the carve-out so its intercepts run, never presented as a symlink.
+	if _, ok := fs.sharedEntryFor(settingsJSONFusePath); ok {
+		t.Errorf("/settings.json must not be a carve-out symlink (it is the merged-view exception)")
 	}
 }
 

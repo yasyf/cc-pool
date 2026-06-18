@@ -52,6 +52,15 @@ var ExcludedEntries = map[string]bool{
 // them in the base and linking them they would be born as real per-account dirs
 // and scatter. plans (plan-mode plans) is the motivating case. Disjoint from
 // ExcludedEntries / PrivateEntry.
+//
+// SharedEntries["plans"] is the underlying physical share — the symlink-account
+// mechanism (acct-NN/plans → ~/.claude/plans) and the fuse base-absent fallback
+// both rely on it, so it must stay. On top of it, fuse accounts ADDITIONALLY get
+// the canonical ~/.claude/plans path REPORTED to the session via an injected
+// settings.json plansDirectory (settingsView, fuse_settings.go), so a pooled
+// claude writes and reports the shared path directly rather than its per-account
+// $CONFIG_DIR/plans. The injection is an additive reporting layer, not a
+// replacement for this physical share.
 var SharedEntries = map[string]bool{
 	"plans": true,
 }

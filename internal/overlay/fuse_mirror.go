@@ -46,6 +46,7 @@ type mirrorFS struct {
 	root        string          // ~/.claude
 	privateRoot string          // per-account backing for ExcludedEntries
 	cj          *claudeJSONView // merged read view + base write-through for /.claude.json
+	settings    *settingsView   // injected read view + base write-through for /settings.json
 	probe       *probeView      // virtual read-only /.ccp-probe for deep wedge probing
 	// sharedStat maps each shared top-level base name present at mount time to its
 	// precomputed live-symlink presentation (absolute target + synthetic S_IFLNK
@@ -69,6 +70,7 @@ func newMirrorFS(root, privateRoot, baseClaudeJSON string) *mirrorFS {
 		root:        absRoot,
 		privateRoot: absPriv,
 		cj:          newClaudeJSONView(filepath.Join(absPriv, ".claude.json"), absBase),
+		settings:    newSettingsView(filepath.Join(absRoot, "settings.json"), filepath.Join(absRoot, "plans")),
 		probe:       newProbeView(),
 	}
 }
@@ -117,9 +119,9 @@ func isTopLevel(path string) bool {
 // stat); only these present as live symlinks (see sharedLink and the sharedStat
 // field). Called once from Setup before the mount serves, so no client op can
 // race the snapshot. A read failure leaves the map nil (pure passthrough) rather
-// than guessing. The private names, the merged /.claude.json, and the virtual
-// probe are excluded here once, so the per-call sharedLink needs no syscall and
-// no re-check.
+// than guessing. The private names, the merged /.claude.json, the injected
+// /settings.json, and the virtual probe are excluded here once, so the per-call
+// sharedLink needs no syscall and no re-check.
 func (fs *mirrorFS) snapshotShared() {
 	entries, err := os.ReadDir(fs.root)
 	if err != nil {
@@ -132,7 +134,7 @@ func (fs *mirrorFS) snapshotShared() {
 	fs.sharedStat = make(map[string]sharedEntry, len(entries))
 	for _, e := range entries {
 		name := e.Name()
-		if privateName(name) || "/"+name == claudeJSONFusePath || name == ProbeFileName {
+		if privateName(name) || "/"+name == claudeJSONFusePath || "/"+name == settingsJSONFusePath || name == ProbeFileName {
 			continue
 		}
 		target := filepath.Join(fs.root, name)
@@ -157,7 +159,8 @@ func (fs *mirrorFS) snapshotShared() {
 
 // sharedEntryFor returns the precomputed live-symlink presentation for a shared
 // top-level entry, or false for everything else (nested paths, private names,
-// /.claude.json, the probe, and any name not present in base at mount time).
+// /.claude.json, /settings.json, the probe, and any name not present in base at
+// mount time).
 // It is a pure map lookup: snapshotShared already applied the exclusions and
 // captured the target + synthetic stat, so no syscall and no re-check is needed.
 // A target deleted from base after the mount is not pruned here — the entry then
@@ -173,16 +176,17 @@ func (fs *mirrorFS) sharedEntryFor(path string) (sharedEntry, bool) {
 
 // sharedLink reports whether path is a shared top-level entry the mirror should
 // present as a LIVE SYMLINK into base, returning the absolute base target. The
-// shared entries (projects/, history, todos/, shell-snapshots/, statsig/,
-// settings.json, …) are pure passthrough — presenting them as symlinks lets the
-// kernel resolve them OUTSIDE the mount, so all of claude's bulk transcript and
-// history I/O bypasses fuse-t's chunked NFS layer entirely, exactly as the
-// on-disk symlink provider already does. The mirror keeps doing real work only
-// for the carve-outs this excludes: /.claude.json (merged read + write-through),
-// private names (privateRoot redirect) and /.ccp-probe (virtual). Only names in
-// the mount-time snapshot (fs.sharedStat) qualify — an entry born after the mount
-// stays passthrough so a create-through-mount never flips type mid-write; its
-// content is still served live through the symlink once a later mount carves it.
+// shared entries (projects/, history, todos/, shell-snapshots/, statsig/, …) are
+// pure passthrough — presenting them as symlinks lets the kernel resolve them
+// OUTSIDE the mount, so all of claude's bulk transcript and history I/O bypasses
+// fuse-t's chunked NFS layer entirely, exactly as the on-disk symlink provider
+// already does. The mirror keeps doing real work only for the carve-outs this
+// excludes: /.claude.json (merged read + write-through), /settings.json (injected
+// read + write-through), private names (privateRoot redirect) and /.ccp-probe
+// (virtual). Only names in the mount-time snapshot (fs.sharedStat) qualify — an
+// entry born after the mount stays passthrough so a create-through-mount never
+// flips type mid-write; its content is still served live through the symlink once
+// a later mount carves it.
 func (fs *mirrorFS) sharedLink(path string) (string, bool) {
 	e, ok := fs.sharedEntryFor(path)
 	return e.target, ok
@@ -227,6 +231,11 @@ func (fs *mirrorFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 		// is purely virtual and shadows any real base entry of the same name.
 		return fs.probe.getattr(stat)
 	}
+	if settingsFh(fh) {
+		// Settings synthetic handles share the merged-view range, so route them
+		// BEFORE cj (see settingsFhBase).
+		return fs.settings.getattrSnapshot(fh, stat)
+	}
 	if syntheticFh(fh) {
 		return fs.cj.getattrSnapshot(fh, stat)
 	}
@@ -255,6 +264,9 @@ func (fs *mirrorFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 	if path == claudeJSONFusePath {
 		return fs.cj.overrideMergedAttr(stat)
 	}
+	if path == settingsJSONFusePath {
+		return fs.settings.overrideMergedAttr(stat)
+	}
 	return 0
 }
 
@@ -265,9 +277,23 @@ func (fs *mirrorFS) Open(path string, flags int) (int, uint64) {
 	if path == claudeJSONFusePath && flags&syscall.O_ACCMODE == syscall.O_RDONLY {
 		return fs.cj.openSnapshot()
 	}
+	if path == settingsJSONFusePath && flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+		return fs.settings.openSnapshot()
+	}
 	fd, err := syscall.Open(fs.real(path), flags, 0)
 	if err != nil {
 		return errno(err), ^uint64(0)
+	}
+	if path == settingsJSONFusePath {
+		// A writable open of the shared settings.json reads/writes base directly
+		// (no private redirect). Mark the real fd dirty at open: unlike cj, the
+		// settings write-through only ever STRIPS our own injected key by
+		// value-equality (it never copies stale content across), so a write-through
+		// scheduled by an open that turns out not to write is a harmless no-op
+		// (writeThroughBase's bytes.Equal short-circuit). The baseline guarantees
+		// no write path (an O_TRUNC at open, an in-place rewrite) can leave an
+		// injected plansDirectory committed into base.
+		fs.settings.markDirty(uint64(fd))
 	}
 	return 0, uint64(fd)
 }
@@ -287,6 +313,9 @@ func (fs *mirrorFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 	if probeFh(fh) {
 		return fs.probe.read(fh, buff, ofst)
 	}
+	if settingsFh(fh) {
+		return fs.settings.readSnapshot(fh, buff, ofst)
+	}
 	if syntheticFh(fh) {
 		return fs.cj.readSnapshot(fh, buff, ofst)
 	}
@@ -304,8 +333,9 @@ func (fs *mirrorFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
 		return -int(syscall.EBADF)
 	}
 	if syntheticFh(fh) {
-		// Synthetic merged-view handles are read-only; without this guard the
-		// huge handle ID would be passed to pwrite as a bogus fd int.
+		// Synthetic merged-view handles (cj AND settings) are read-only; without
+		// this guard the huge handle ID would be passed to pwrite as a bogus fd
+		// int. settingsFh ⊂ syntheticFh, so this one check covers both.
 		return -int(syscall.EBADF)
 	}
 	n, err := syscall.Pwrite(int(fh), buff, ofst)
@@ -315,6 +345,9 @@ func (fs *mirrorFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
 	if path == claudeJSONFusePath {
 		fs.cj.markDirty(fh)
 	}
+	if path == settingsJSONFusePath {
+		fs.settings.markDirty(fh)
+	}
 	return n
 }
 
@@ -323,8 +356,9 @@ func (fs *mirrorFS) Truncate(path string, size int64, fh uint64) int {
 		return -int(syscall.EPERM)
 	}
 	if syntheticFh(fh) {
-		// Synthetic merged-view handles are read-only; without this guard the
-		// huge handle ID would be passed to ftruncate as a bogus fd int.
+		// Synthetic merged-view handles (cj AND settings) are read-only; without
+		// this guard the huge handle ID would be passed to ftruncate as a bogus fd
+		// int. settingsFh ⊂ syntheticFh, so this one check covers both.
 		return -int(syscall.EINVAL)
 	}
 	var err error
@@ -332,6 +366,9 @@ func (fs *mirrorFS) Truncate(path string, size int64, fh uint64) int {
 		err = syscall.Ftruncate(int(fh), size)
 		if err == nil && path == claudeJSONFusePath {
 			fs.cj.markDirty(fh)
+		}
+		if err == nil && path == settingsJSONFusePath {
+			fs.settings.markDirty(fh)
 		}
 	} else {
 		err = syscall.Truncate(fs.real(path), size)
@@ -351,6 +388,12 @@ func (fs *mirrorFS) Release(path string, fh uint64) int {
 		fs.probe.release(fh)
 		return 0
 	}
+	if settingsFh(fh) {
+		// Settings synthetic handles share the merged-view range, so route them
+		// BEFORE cj (see settingsFhBase).
+		fs.settings.closeSnapshot(fh)
+		return 0
+	}
 	if syntheticFh(fh) {
 		fs.cj.closeSnapshot(fh)
 		return 0
@@ -364,6 +407,15 @@ func (fs *mirrorFS) Release(path string, fh uint64) int {
 		// propagation runs off this handler (scheduleWriteThrough) so the close
 		// never blocks on base I/O and stalls the mount.
 		fs.cj.scheduleWriteThrough()
+	}
+	if path == settingsJSONFusePath && fs.settings.takeDirty(fh) {
+		// A writable settings.json fd is closing: strip our injected
+		// plansDirectory back out of base so the real file stays pristine. The fd
+		// is marked dirty at open (writable opens read/write base directly), so
+		// every writable close runs the strip; it is a no-op when nothing was
+		// injected (writeThroughBase's bytes.Equal short-circuit). Off this
+		// handler (scheduleWriteThrough) so the close never blocks on base I/O.
+		fs.settings.scheduleWriteThrough()
 	}
 	return st
 }
@@ -511,6 +563,15 @@ func (fs *mirrorFS) Rename(oldpath string, newpath string) int {
 		// Health. Propagation runs off this handler (scheduleWriteThrough) so
 		// the rename never blocks on base I/O and stalls the mount.
 		fs.cj.scheduleWriteThrough()
+	}
+	if st == 0 && newpath == settingsJSONFusePath {
+		// claude's atomic save (tmp + rename) just committed settings.json into
+		// base; strip our injected plansDirectory back out so the real file stays
+		// pristine. The rename's status is ALWAYS returned — the commit durably
+		// happened, so a write-through failure must not fail the save; it goes
+		// sticky and surfaces via Health. Off this handler (scheduleWriteThrough)
+		// so the rename never blocks on base I/O and stalls the mount.
+		fs.settings.scheduleWriteThrough()
 	}
 	return st
 }

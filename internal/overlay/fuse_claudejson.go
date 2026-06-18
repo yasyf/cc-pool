@@ -433,13 +433,18 @@ func (v *claudeJSONView) writeThroughBase() error {
 	return nil
 }
 
-// healthErr joins the view's two independent failure domains for
-// FuseProvider.Health: the last merged-read failure (cleared by the next
-// successful merge) and the last base write-through failure (cleared only by
-// a successful write-through). The daemon logs the joined error every poll
-// and ccp doctor shows it.
+// healthErr joins both views' independent failure domains for
+// FuseProvider.Health: each view's last merged/served-read failure (cleared by
+// the next successful recompute) and last base write-through failure (cleared
+// only by a successful write-through). The daemon logs the joined error every
+// poll and ccp doctor shows it. The two views' locks are taken in turn (never
+// nested) — there is no lock-ordering hazard.
 func (fs *mirrorFS) healthErr() error {
 	fs.cj.mu.Lock()
-	defer fs.cj.mu.Unlock()
-	return errors.Join(fs.cj.readErr, fs.cj.writeErr)
+	cjRead, cjWrite := fs.cj.readErr, fs.cj.writeErr
+	fs.cj.mu.Unlock()
+	fs.settings.mu.Lock()
+	setRead, setWrite := fs.settings.readErr, fs.settings.writeErr
+	fs.settings.mu.Unlock()
+	return errors.Join(cjRead, cjWrite, setRead, setWrite)
 }

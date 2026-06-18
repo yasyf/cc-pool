@@ -247,15 +247,16 @@ func (p *FuseProvider) Health(base, accountDir string) error {
 
 // Teardown unmounts the account dir's mirror via fuseMounts (cgofuse graceful
 // unmount → MNT_FORCE → verify, all bounded by fusekit so a wedged fuse-t fault
-// can't hang the daemon's shutdown), then drains the mirror's /.claude.json
-// write-through. It refuses to tear down base itself. The drain runs AFTER the
-// unmount: once the mount is gone no further commit can schedule a write-through,
-// so this captures the LAST one the mirror scheduled — its shareable keys must
-// still reach the real base sibling (~/.claude.json, a plain file OUTSIDE the
-// mount, which the write-through reads/writes directly), and the view is then
-// discarded. Bounded like the unmount: a stuck local write must not hang
-// teardown — it stays in writeErr/Health. Draining before the unmount would race
-// an in-flight commit landing during the unmount window.
+// can't hang the daemon's shutdown), then drains both the /.claude.json and
+// /settings.json write-throughs. It refuses to tear down base itself. The drain
+// runs AFTER the unmount: once the mount is gone no further commit can schedule a
+// write-through, so this captures the LAST one each view scheduled — .claude.json's
+// shareable keys must still reach the real base sibling (~/.claude.json) and
+// settings.json's last strip must still reach ~/.claude/settings.json (both plain
+// files OUTSIDE the mount, which the write-through reads/writes directly), and the
+// views are then discarded. Bounded like the unmount: a stuck local write must not
+// hang teardown — it stays in writeErr/Health. Draining before the unmount would
+// race an in-flight commit landing during the unmount window.
 func (p *FuseProvider) Teardown(base, accountDir string) error {
 	if accountDir == base || accountDir == "" {
 		return fmt.Errorf("refusing to tear down base dir %q", accountDir)
@@ -268,6 +269,7 @@ func (p *FuseProvider) Teardown(base, accountDir string) error {
 	err := fuseMounts.Teardown(base, accountDir)
 	if ok {
 		fs.cj.flushWithin(unmountGrace)
+		fs.settings.flushWithin(unmountGrace)
 	}
 	return err
 }
