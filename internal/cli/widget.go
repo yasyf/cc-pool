@@ -9,13 +9,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Widget app cask coordinates. The tap URL is spelled out because the tap
-// repo is not named homebrew-cc-pool, so brew cannot infer it from the short
-// name and `brew install yasyf/cc-pool/…` cannot auto-tap.
+// Widget app cask coordinates. The cask lives in the shared external tap
+// yasyf/homebrew-tap, so `brew install --cask yasyf/tap/cc-pool-status` would
+// auto-tap; we still tap explicitly (with the URL) up front so the install is
+// a single non-tapping step and works regardless of how cc-pool was installed.
 const (
 	widgetCask    = "cc-pool-status"
-	widgetTap     = "yasyf/cc-pool"
-	widgetTapURL  = "https://github.com/yasyf/cc-pool"
+	widgetTap     = "yasyf/homebrew-tap"
+	widgetTapURL  = "https://github.com/yasyf/homebrew-tap"
 	widgetAppName = "CCPoolStatus"
 	widgetAppPath = "/Applications/CCPoolStatus.app" // the cask's default appdir
 )

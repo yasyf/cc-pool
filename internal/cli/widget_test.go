@@ -21,7 +21,7 @@ echo "brew $* [casks_opts=$HOMEBREW_CASK_OPTS]" >> "$FAKE_LOG"
 case "$1" in
   tap)
     if [ $# -eq 1 ]; then
-      [ -n "$FAKE_TAPPED" ] && echo "yasyf/cc-pool"
+      [ -n "$FAKE_TAPPED" ] && echo "yasyf/homebrew-tap"
       exit 0
     fi
     exit 0;;
@@ -68,9 +68,9 @@ func TestRunWidgetSequence(t *testing.T) {
 		"fresh install taps and installs": {
 			want: []string{
 				"brew tap [",
-				"brew tap yasyf/cc-pool https://github.com/yasyf/cc-pool [",
+				"brew tap yasyf/homebrew-tap https://github.com/yasyf/homebrew-tap [",
 				"brew list --cask cc-pool-status [",
-				"brew install -y --cask yasyf/cc-pool/cc-pool-status [casks_opts=--no-quarantine]\n",
+				"brew install -y --cask yasyf/homebrew-tap/cc-pool-status [casks_opts=--no-quarantine]\n",
 				"xattr -p com.apple.quarantine /Applications/CCPoolStatus.app\n",
 				"open -g /Applications/CCPoolStatus.app\n",
 			},
@@ -89,7 +89,7 @@ func TestRunWidgetSequence(t *testing.T) {
 		"quarantined install is stripped": {
 			quarantined: true,
 			want: []string{
-				"brew install -y --cask yasyf/cc-pool/cc-pool-status [casks_opts=--no-quarantine]\n",
+				"brew install -y --cask yasyf/homebrew-tap/cc-pool-status [casks_opts=--no-quarantine]\n",
 				"xattr -p com.apple.quarantine /Applications/CCPoolStatus.app\n",
 				"xattr -dr com.apple.quarantine /Applications/CCPoolStatus.app\n",
 				"open -g /Applications/CCPoolStatus.app\n",

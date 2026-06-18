@@ -22,12 +22,12 @@ never log it out), and secrets stay in the macOS Keychain, never in cc-pool's da
 ## Install
 
 ```sh
-brew tap yasyf/cc-pool https://github.com/yasyf/cc-pool
-brew install yasyf/cc-pool/cc-pool
+brew install yasyf/tap/cc-pool
 ```
 
 macOS only. The binary installs as `cc-pool` with a `ccp` symlink; the default build is
-pure Go.
+pure Go. The Notification Center widget is a separate cask (`ccp widget` installs it, or
+`brew install --cask yasyf/tap/cc-pool-status`).
 
 ## Quickstart
 

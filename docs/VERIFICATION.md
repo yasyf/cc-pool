@@ -11,9 +11,9 @@ cannot be automated. Run from a clean machine state where possible.
 CGO_ENABLED=0 go build -o /usr/local/bin/cc-pool ./cmd/cc-pool
 ln -sf /usr/local/bin/cc-pool /usr/local/bin/ccp
 
-# Or via the tap once released:
-brew tap yasyf/cc-pool https://github.com/yasyf/cc-pool
-brew install yasyf/cc-pool/cc-pool
+# Or via the shared tap once released:
+brew install yasyf/tap/cc-pool
+brew install --cask yasyf/tap/cc-pool-status   # the Notification Center widget
 ```
 
 ## 1. Release installs and reports version
