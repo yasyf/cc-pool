@@ -70,7 +70,7 @@ func TestRunWidgetSequence(t *testing.T) {
 				"brew tap [",
 				"brew tap yasyf/cc-pool https://github.com/yasyf/cc-pool [",
 				"brew list --cask cc-pool-status [",
-				"brew install --cask yasyf/cc-pool/cc-pool-status [casks_opts=--no-quarantine]\n",
+				"brew install -y --cask yasyf/cc-pool/cc-pool-status [casks_opts=--no-quarantine]\n",
 				"xattr -p com.apple.quarantine /Applications/CCPoolStatus.app\n",
 				"open -g /Applications/CCPoolStatus.app\n",
 			},
@@ -81,7 +81,7 @@ func TestRunWidgetSequence(t *testing.T) {
 			want: []string{
 				"brew tap [",
 				"brew list --cask cc-pool-status [",
-				"brew upgrade --cask cc-pool-status [casks_opts=--no-quarantine]\n",
+				"brew upgrade -y --cask cc-pool-status [casks_opts=--no-quarantine]\n",
 				"open -g /Applications/CCPoolStatus.app\n",
 			},
 			absent: []string{"brew install", "brew tap yasyf"},
@@ -89,7 +89,7 @@ func TestRunWidgetSequence(t *testing.T) {
 		"quarantined install is stripped": {
 			quarantined: true,
 			want: []string{
-				"brew install --cask yasyf/cc-pool/cc-pool-status [casks_opts=--no-quarantine]\n",
+				"brew install -y --cask yasyf/cc-pool/cc-pool-status [casks_opts=--no-quarantine]\n",
 				"xattr -p com.apple.quarantine /Applications/CCPoolStatus.app\n",
 				"xattr -dr com.apple.quarantine /Applications/CCPoolStatus.app\n",
 				"open -g /Applications/CCPoolStatus.app\n",

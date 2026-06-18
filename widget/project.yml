@@ -43,6 +43,9 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.yasyf.cc-pool.status
+        # Sources/App/Assets.xcassets is auto-included by the Sources/App source
+        # path; this names its appiconset as the app icon the widget gallery shows.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # The host app is deliberately NOT sandboxed (non-App-Store): its file
         # watcher needs to observe ~/.cc-pool freely. No entitlements file.
     dependencies:
