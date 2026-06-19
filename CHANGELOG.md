@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- The `CCPoolStatus.app` widget is now Developer ID signed, notarized, and
+  stapled at release time, so the `cc-pool-status` cask installs and launches
+  under Gatekeeper without a quarantine workaround. `ccp widget` no longer
+  strips quarantine, and the cask drops `HOMEBREW_CASK_OPTS=--no-quarantine`.
 - The FUSE-T mount machinery is extracted into
   [github.com/yasyf/fusekit](https://github.com/yasyf/fusekit) — the detached
   mount-holder protocol (`fusekit/mountd`) and the mount/serve/teardown

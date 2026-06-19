@@ -8,16 +8,15 @@ import (
 	"testing"
 )
 
-// fakeWidgetTools installs fake `brew`, `open`, and `xattr` executables on
-// PATH that log every invocation (brew also logs HOMEBREW_CASK_OPTS), and
-// returns the log path. FAKE_TAPPED / FAKE_INSTALLED / FAKE_QUARANTINED env
+// fakeWidgetTools installs fake `brew` and `open` executables on PATH that log
+// every invocation, and returns the log path. FAKE_TAPPED / FAKE_INSTALLED env
 // vars steer the fakes' answers.
 func fakeWidgetTools(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "calls.log")
 	brew := `#!/bin/sh
-echo "brew $* [casks_opts=$HOMEBREW_CASK_OPTS]" >> "$FAKE_LOG"
+echo "brew $*" >> "$FAKE_LOG"
 case "$1" in
   tap)
     if [ $# -eq 1 ]; then
@@ -35,16 +34,7 @@ exit 0
 echo "open $*" >> "$FAKE_LOG"
 exit 0
 `
-	xattr := `#!/bin/sh
-echo "xattr $*" >> "$FAKE_LOG"
-case "$1" in
-  -p)
-    [ -n "$FAKE_QUARANTINED" ] && exit 0
-    exit 1;;
-esac
-exit 0
-`
-	for name, body := range map[string]string{"brew": brew, "open": open, "xattr": xattr} {
+	for name, body := range map[string]string{"brew": brew, "open": open} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -54,60 +44,45 @@ exit 0
 	return logPath
 }
 
-// TestRunWidgetSequence pins the exact brew/xattr/open invocations: fresh
-// installs tap and install, re-runs upgrade without re-tapping, both carry
-// --no-quarantine via HOMEBREW_CASK_OPTS (the Homebrew 5 spelling — the
-// install flag is gone, and the ad-hoc-signed app is blocked by Gatekeeper if
-// quarantined), and a quarantine bit that slipped through is stripped.
+// TestRunWidgetSequence pins the exact brew/open invocations: a fresh install
+// taps then installs, a re-run upgrades without re-tapping, and the quarantine
+// workaround is gone — no xattr and no --no-quarantine (the app is Developer ID
+// signed, notarized, and stapled).
 func TestRunWidgetSequence(t *testing.T) {
 	cases := map[string]struct {
-		tapped, installed, quarantined bool
-		want                           []string
-		absent                         []string
+		tapped, installed bool
+		want              []string
+		absent            []string
 	}{
 		"fresh install taps and installs": {
 			want: []string{
-				"brew tap [",
-				"brew tap yasyf/homebrew-tap https://github.com/yasyf/homebrew-tap [",
-				"brew list --cask cc-pool-status [",
-				"brew install -y --cask yasyf/homebrew-tap/cc-pool-status [casks_opts=--no-quarantine]\n",
-				"xattr -p com.apple.quarantine /Applications/CCPoolStatus.app\n",
+				"brew tap\n",
+				"brew tap yasyf/homebrew-tap https://github.com/yasyf/homebrew-tap\n",
+				"brew list --cask cc-pool-status\n",
+				"brew install -y --cask yasyf/homebrew-tap/cc-pool-status\n",
 				"open -g /Applications/CCPoolStatus.app\n",
 			},
-			absent: []string{"upgrade", "xattr -dr"},
+			absent: []string{"upgrade", "xattr", "--no-quarantine"},
 		},
 		"existing install upgrades without re-tapping": {
 			tapped: true, installed: true,
 			want: []string{
-				"brew tap [",
-				"brew list --cask cc-pool-status [",
-				"brew upgrade -y --cask cc-pool-status [casks_opts=--no-quarantine]\n",
+				"brew tap\n",
+				"brew list --cask cc-pool-status\n",
+				"brew upgrade -y --cask cc-pool-status\n",
 				"open -g /Applications/CCPoolStatus.app\n",
 			},
-			absent: []string{"brew install", "brew tap yasyf"},
-		},
-		"quarantined install is stripped": {
-			quarantined: true,
-			want: []string{
-				"brew install -y --cask yasyf/homebrew-tap/cc-pool-status [casks_opts=--no-quarantine]\n",
-				"xattr -p com.apple.quarantine /Applications/CCPoolStatus.app\n",
-				"xattr -dr com.apple.quarantine /Applications/CCPoolStatus.app\n",
-				"open -g /Applications/CCPoolStatus.app\n",
-			},
+			absent: []string{"brew install", "brew tap yasyf", "xattr", "--no-quarantine"},
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			logPath := fakeWidgetTools(t)
-			t.Setenv("HOMEBREW_CASK_OPTS", "") // pin the asserted casks_opts value
 			if tc.tapped {
 				t.Setenv("FAKE_TAPPED", "1")
 			}
 			if tc.installed {
 				t.Setenv("FAKE_INSTALLED", "1")
-			}
-			if tc.quarantined {
-				t.Setenv("FAKE_QUARANTINED", "1")
 			}
 
 			cmd := newWidgetCmd()
@@ -140,28 +115,6 @@ func TestRunWidgetSequence(t *testing.T) {
 				t.Errorf("output missing enable instructions:\n%s", out.String())
 			}
 		})
-	}
-}
-
-// TestBrewCaskKeepsUserOpts: a user's existing HOMEBREW_CASK_OPTS survive with
-// --no-quarantine appended, never replaced.
-func TestBrewCaskKeepsUserOpts(t *testing.T) {
-	logPath := fakeWidgetTools(t)
-	t.Setenv("HOMEBREW_CASK_OPTS", "--appdir=/Custom")
-
-	cmd := newWidgetCmd()
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-	cmd.SetErr(&out)
-	if err := cmd.RunE(cmd, nil); err != nil {
-		t.Fatalf("runWidget: %v\n%s", err, out.String())
-	}
-	logBytes, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(logBytes), "[casks_opts=--appdir=/Custom --no-quarantine]") {
-		t.Errorf("user HOMEBREW_CASK_OPTS not preserved — log:\n%s", logBytes)
 	}
 }
 

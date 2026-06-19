@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 
@@ -43,9 +42,6 @@ func runWidget(cmd *cobra.Command) error {
 	}
 	step(out, "Installing the widget app…")
 	if err := brewInstallWidget(cmd); err != nil {
-		return err
-	}
-	if err := dequarantineWidget(cmd); err != nil {
 		return err
 	}
 	// Launching once registers the embedded widget extension with macOS so it
@@ -97,35 +93,15 @@ func brewInstallWidget(cmd *cobra.Command) error {
 	return nil
 }
 
-// brewCask runs a brew cask install/upgrade with quarantine disabled. The app
-// is ad-hoc signed (no Developer ID), so a quarantined copy is blocked by
-// Gatekeeper on launch. Homebrew 5 removed the --no-quarantine install flag;
-// only the HOMEBREW_CASK_OPTS option survives (env_config's
-// cask_opts_quarantine?), appended here so existing user opts are kept.
-// dequarantineWidget backstops it after the install.
+// brewCask runs a brew cask install/upgrade unattended. The widget app is
+// Developer ID signed, notarized, and stapled, so a normal quarantined install
+// validates — no quarantine handling needed.
 func brewCask(cmd *cobra.Command, args ...string) error {
 	// -y / --no-ask disables Homebrew's default ask-mode confirmation so the
 	// install runs unattended. It follows the subcommand: `brew install -y --cask …`.
 	c := exec.Command("brew", append([]string{args[0], "-y"}, args[1:]...)...)
-	opts := strings.TrimSpace(os.Getenv("HOMEBREW_CASK_OPTS") + " --no-quarantine")
-	c.Env = append(os.Environ(), "HOMEBREW_CASK_OPTS="+opts)
 	c.Stdout, c.Stderr = cmd.OutOrStdout(), cmd.ErrOrStderr()
 	return c.Run()
-}
-
-// dequarantineWidget strips the quarantine attribute if the install picked it
-// up anyway — a second line of defense should brew change its quarantine
-// knobs again. Without it, launching the ad-hoc-signed app fails loud at the
-// Gatekeeper prompt rather than silently, but fails all the same.
-func dequarantineWidget(cmd *cobra.Command) error {
-	if exec.Command("xattr", "-p", "com.apple.quarantine", widgetAppPath).Run() != nil {
-		return nil // not quarantined (or not at the default appdir)
-	}
-	note(cmd.OutOrStdout(), "Removing the quarantine flag (the app is ad-hoc signed)…")
-	if err := runStreamed(cmd, "xattr", "-dr", "com.apple.quarantine", widgetAppPath); err != nil {
-		return fmt.Errorf("remove quarantine from %s: %w", widgetAppPath, err)
-	}
-	return nil
 }
 
 // runStreamed runs a command with its output streamed to the user.

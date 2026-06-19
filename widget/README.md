@@ -26,10 +26,10 @@ System Settings → Login Items for always-fresh updates.
 ccp widget
 ```
 
-That installs the prebuilt app from the `cc-pool-status` Homebrew cask with
-quarantine disabled (`HOMEBREW_CASK_OPTS=--no-quarantine` — the app is ad-hoc
-signed, and Gatekeeper blocks a quarantined copy), launches it once so macOS
-discovers the widget, and prints the enable steps:
+That installs the prebuilt app from the `cc-pool-status` Homebrew cask (the
+release build is Developer ID signed, notarized, and stapled, so a normal
+install passes Gatekeeper), launches it once so macOS discovers the widget, and
+prints the enable steps:
 
 Open Notification Center (click the menu-bar clock), scroll down →
 **Edit Widgets** → search "cc-pool" → add the small, medium, or large widget. Desktop
@@ -77,10 +77,13 @@ Re-run it whenever the widget UI changes. It needs only the Xcode toolchain
 
 ## Signing
 
-Builds are ad-hoc signed (`CODE_SIGN_IDENTITY=-`) — fine for an app that is
-never quarantined (the cask installs with `--no-quarantine`; local builds
-never get the quarantine bit). If chronod refuses to load the ad-hoc-signed
-widget, build with a free personal team instead:
+Release builds (CI) are **Developer ID signed, notarized, and stapled**, so the
+cask installs and launches under Gatekeeper with no quarantine workaround — see
+the widget-app step in `.github/workflows/release.yml`.
+
+Local builds are ad-hoc signed (`CODE_SIGN_IDENTITY=-`), which is fine for a
+hand-built copy (local builds never get the quarantine bit). If chronod refuses
+to load the ad-hoc-signed widget, build with a free personal team instead:
 
 ```sh
 xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
