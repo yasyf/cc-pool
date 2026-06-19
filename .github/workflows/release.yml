@@ -130,6 +130,12 @@ jobs:
           # Developer ID + hardened runtime so a quarantined cask install launches
           # without Gatekeeper blocking it; xcodebuild signs inside-out (appex,
           # then app), applying each target's entitlements from project.yml.
+          # CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO: a plain `xcodebuild build`
+          # (unlike archive + -exportArchive) injects get-task-allow=YES even in a
+          # Release build, which notarization rejects on every executable. Disabling
+          # the injection drops it; the appex keeps its sandbox + ~/.cc-pool read
+          # exception, which come from its own entitlements file (explicit, not
+          # injected).
           xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
             -configuration Release -derivedDataPath build build \
             MARKETING_VERSION="${GITHUB_REF_NAME#v}" \
@@ -138,6 +144,7 @@ jobs:
             CODE_SIGN_IDENTITY="$MACOS_SIGN_IDENTITY" \
             DEVELOPMENT_TEAM="$TEAM_ID" \
             ENABLE_HARDENED_RUNTIME=YES \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
             OTHER_CODE_SIGN_FLAGS="--timestamp"
           APP=build/Build/Products/Release/CCPoolStatus.app
           # The appex must carry the sandbox + ~/.cc-pool read exception, or the
@@ -145,10 +152,6 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign -d --entitlements - "$APP/Contents/PlugIns/CCPoolStatusWidget.appex" 2>&1 |
             grep -q "temporary-exception.files.home-relative-path.read-only"
-          # No get-task-allow pre-check: with no entitlements file, the Release
-          # host app is signed with an auto-generated get-task-allow=false, which
-          # is harmless (only get-task-allow=true is a debuggable build). notarytool
-          # below is the authority — it rejects a true value and accepts false.
           # The stamp must actually reach both bundles ($(…) wiring lives in
           # project.yml's info.properties) — a silent 1/1.0 re-ships the
           # stale-gallery bug. The appex is the bundle chronod inspects.
@@ -156,10 +159,20 @@ jobs:
           test "$(plutil -extract CFBundleVersion raw "$APP/Contents/PlugIns/CCPoolStatusWidget.appex/Contents/Info.plist")" != 1
           # Notarize the whole bundle, then staple the ticket so a quarantined
           # install validates offline (an app can be stapled; a bare binary can't).
+          # notarytool submit --wait exits 0 even when the result is Invalid, so
+          # capture the JSON, fail loud on any non-Accepted status, and print the
+          # per-issue log — the only place the rejection reason appears.
           ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/CCPoolStatus-notarize.zip"
           xcrun notarytool submit "$RUNNER_TEMP/CCPoolStatus-notarize.zip" \
             --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" \
-            --wait --timeout 20m
+            --wait --timeout 20m --output-format json > "$RUNNER_TEMP/notary-submit.json"
+          cat "$RUNNER_TEMP/notary-submit.json"
+          SUBMIT_ID="$(plutil -extract id raw -o - "$RUNNER_TEMP/notary-submit.json")"
+          if [ "$(plutil -extract status raw -o - "$RUNNER_TEMP/notary-submit.json")" != "Accepted" ]; then
+            xcrun notarytool log "$SUBMIT_ID" \
+              --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" || true
+            echo "::error::notarization not Accepted for CCPoolStatus.app (submission $SUBMIT_ID)"; exit 1
+          fi
           xcrun stapler staple "$APP"
           xcrun stapler validate "$APP"
           # ditto -c -k preserves the bundle metadata a plain zip would drop;
