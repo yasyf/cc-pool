@@ -244,3 +244,19 @@ func (m *Manager) SetDefaultOverlayKind(kind overlay.Kind) error {
 	}
 	return nil
 }
+
+// ConfiguredOverlayKind returns the pool's recorded default overlay kind (the
+// provider new accounts are minted with and that `ccp migrate` converts toward)
+// and whether one has been recorded yet. Unlike ensureOverlayKind it is a pure
+// read — it never detects or persists — so callers like `doctor` can compare an
+// account's live kind against the configured default without side effects.
+func (m *Manager) ConfiguredOverlayKind() (overlay.Kind, bool, error) {
+	v, ok, err := m.Store.GetMeta(metaOverlayKind)
+	if err != nil {
+		return "", false, fmt.Errorf("read default overlay kind: %w", err)
+	}
+	if !ok {
+		return "", false, nil
+	}
+	return overlay.Kind(v), true, nil
+}

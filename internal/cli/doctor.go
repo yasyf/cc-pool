@@ -333,7 +333,34 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 		report(prefix+" overlay", true, string(prov.Kind()))
 	}
 
+	checkFuseFallback(m, a, report)
 	checkStrandedPrivate(m, a, fix, cmd.OutOrStdout(), report)
+}
+
+// checkFuseFallback surfaces an account on the symlink overlay while the pool's
+// recorded default is fuse and this machine can host fuse — almost always the
+// aftermath of an automatic fuse→symlink fallback (the mount holder crash-looped
+// or fuse-t went unavailable). That fallback is permanent until re-promoted, so
+// doctor is where the user learns to undo it: `ccp migrate` converts symlink
+// accounts back to fuse once fuse-t is healthy. The fuse-hosting check honors
+// the Manager's CanHostFuse seam so it is exercisable without a fuse build.
+func checkFuseFallback(m *pool.Manager, a store.Account, report func(string, bool, string)) {
+	if overlay.Kind(a.OverlayKind) != overlay.KindSymlink {
+		return
+	}
+	canHostFuse := pool.CanHostFuse()
+	if m.CanHostFuse != nil {
+		canHostFuse = m.CanHostFuse()
+	}
+	if !canHostFuse {
+		return
+	}
+	def, ok, err := m.ConfiguredOverlayKind()
+	if err != nil || !ok || def != overlay.KindFuse {
+		return
+	}
+	report(fmt.Sprintf("acct-%02d fuse fallback", a.ID), false,
+		"on symlink but the pool default is fuse — likely an automatic fallback after the mount holder failed; re-run `ccp migrate` once fuse-t is healthy")
 }
 
 // checkStrandedPrivate reports — and, under --fix with no running daemon, heals

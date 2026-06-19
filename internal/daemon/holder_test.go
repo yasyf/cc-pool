@@ -907,8 +907,14 @@ func TestSuperviseSkewGateLegs(t *testing.T) {
 			if h.shutdownCount() != 0 {
 				t.Fatal("a blocked gate leg stopped the serving holder")
 			}
-			if rec.count() != 0 || fake.setupCount() != 0 {
-				t.Fatalf("a blocked gate leg disturbed mounts: spawns=%d setups=%d", rec.count(), fake.setupCount())
+			// The replace itself must not proceed: no successor holder is
+			// spawned. (A deferred skew-replace now falls through to the
+			// steady-state heal, which may remount an unvouched row through the
+			// EXISTING holder — so setups are no longer necessarily zero; the
+			// no-successor-spawn check is what proves the replace was gated, and
+			// the heal never spawns a holder of its own.)
+			if rec.count() != 0 {
+				t.Fatalf("a blocked gate leg spawned a successor holder: spawns=%d", rec.count())
 			}
 			// A blocked leg must not leave replace claims behind: acct-1 stays
 			// selectable (tryReserve refuses only a converting claim on it).
@@ -2061,5 +2067,242 @@ func TestSuperviseRemountBreakerNeverEscalatesTCC(t *testing.T) {
 	}
 	if st.hazard != 0 {
 		t.Fatalf("TCC hazard = %d, want 0 (never counts toward the breaker)", st.hazard)
+	}
+}
+
+// TestReviveBreakerThreshold pins the holder-level breaker const guard: a single
+// holder death must never fall the whole pool back to symlink, so the threshold
+// must be at least 2.
+func TestReviveBreakerThreshold(t *testing.T) {
+	if reviveBreakerThreshold < 2 {
+		t.Fatalf("reviveBreakerThreshold = %d, want >= 2 so a single holder death never falls back to symlink", reviveBreakerThreshold)
+	}
+}
+
+// TestReviveBreakerFallsBackWhenHolderKeepsDying pins Fix A's crash-loop trigger:
+// after reviveBreakerThreshold consecutive deaths with no recovery at our
+// version, the next revive force-unmounts the pool and retreats every fuse row
+// to symlink — BEFORE respawning the doomed holder — instead of churning again.
+func TestReviveBreakerFallsBackWhenHolderKeepsDying(t *testing.T) {
+	s, _, _, rec := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	flipToFuse(t, s, 2)
+	// Already revived threshold-1 times without ever returning at our version (a
+	// stuck old holder). The socket is dead, so this tick is the next death: the
+	// transition pushes the count to the threshold and the breaker fires.
+	s.sup.reviveHazard = reviveBreakerThreshold - 1
+	s.sup.sawUnhealthy = false
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+
+	s.superviseTick(t.Context())
+
+	if got := kindOf(t, s, 1); got != "symlink" {
+		t.Fatalf("acct-01 kind after the crash-loop breaker = %q, want symlink", got)
+	}
+	if got := kindOf(t, s, 2); got != "symlink" {
+		t.Fatalf("acct-02 kind after the crash-loop breaker = %q, want symlink", got)
+	}
+	if rec.count() != 0 {
+		t.Fatalf("crash-loop breaker spawned a holder (%d) instead of retreating to symlink before the respawn", rec.count())
+	}
+	if s.sup.reviveHazard != 0 {
+		t.Fatalf("reviveHazard = %d, want 0 (cleared once the whole pool retreated)", s.sup.reviveHazard)
+	}
+	if !strings.Contains(buf.String(), "falling back to symlink") {
+		t.Fatalf("crash-loop fallback not surfaced in the log:\n%s", buf.String())
+	}
+}
+
+// TestReviveBreakerFallsBackWhenHolderWillNotSpawn pins Fix A's NFS-unavailable
+// trigger: when the holder will not spawn at all, after reviveBreakerThreshold
+// consecutive failed spawns the fuse rows retreat to the always-available
+// symlink overlay so the pool keeps working without a mount holder.
+func TestReviveBreakerFallsBackWhenHolderWillNotSpawn(t *testing.T) {
+	s, _, _, rec := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	flipToFuse(t, s, 2)
+	rec.setErr(errors.New("fuse-t unavailable")) // the holder will not spawn
+
+	// Rewind the spawn backoff before each tick so the failure ledger advances
+	// every tick instead of waiting out the doubling window.
+	for i := 0; i < reviveBreakerThreshold; i++ {
+		s.sup.retryAt = time.Now().Add(-time.Second)
+		s.superviseTick(t.Context())
+	}
+
+	if rec.count() != reviveBreakerThreshold {
+		t.Fatalf("spawn attempts = %d, want %d (one per tick up to the breaker)", rec.count(), reviveBreakerThreshold)
+	}
+	if got := kindOf(t, s, 1); got != "symlink" {
+		t.Fatalf("acct-01 kind after the spawn-failure breaker = %q, want symlink", got)
+	}
+	if got := kindOf(t, s, 2); got != "symlink" {
+		t.Fatalf("acct-02 kind after the spawn-failure breaker = %q, want symlink", got)
+	}
+}
+
+// TestReviveBreakerHoldsUnderThreshold pins that fewer than the threshold
+// consecutive spawn failures keep reviving — no fallback, the row stays fuse.
+func TestReviveBreakerHoldsUnderThreshold(t *testing.T) {
+	s, _, _, rec := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	rec.setErr(errors.New("fuse-t unavailable"))
+
+	for i := 0; i < reviveBreakerThreshold-1; i++ {
+		s.sup.retryAt = time.Now().Add(-time.Second)
+		s.superviseTick(t.Context())
+	}
+
+	if got := kindOf(t, s, 1); got != "fuse" {
+		t.Fatalf("acct-01 kind under the threshold = %q, want fuse (still reviving)", got)
+	}
+	if s.sup.failures != reviveBreakerThreshold-1 {
+		t.Fatalf("spawn failures = %d, want %d (one short of the breaker)", s.sup.failures, reviveBreakerThreshold-1)
+	}
+}
+
+// TestSuperviseReviveBreakerResetsAtOurVersion pins that a genuine our-version
+// holder — the real recovery — clears the crash-loop breaker, so a normal
+// holder restart never drifts toward a spurious symlink fallback.
+func TestSuperviseReviveBreakerResetsAtOurVersion(t *testing.T) {
+	s, dirs, _, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.sup.reviveHazard = reviveBreakerThreshold - 1
+	s.sup.sawUnhealthy = true
+	s.holderSocket = startCannedHolder(t, []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}})
+
+	s.superviseTick(t.Context())
+
+	if s.sup.reviveHazard != 0 {
+		t.Fatalf("reviveHazard = %d, want 0 (an our-version holder is the real recovery)", s.sup.reviveHazard)
+	}
+	if got := kindOf(t, s, 1); got != "fuse" {
+		t.Fatalf("acct-01 kind = %q, want fuse (recovery, not fallback)", got)
+	}
+}
+
+// TestSuperviseReviveBreakerNotResetBySpawnedSkew pins the load-bearing
+// correctness point: an old holder we keep reviving but cannot replace stays
+// "settled" at spawnedSkew between deaths — that must NOT reset the crash-loop
+// breaker, or it would never trip on exactly the stuck-old-holder loop it
+// exists for.
+func TestSuperviseReviveBreakerNotResetBySpawnedSkew(t *testing.T) {
+	s, dirs, _, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.sup.reviveHazard = reviveBreakerThreshold - 1
+	s.sup.sawUnhealthy = true
+	h := startSkewedHolder(t, []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}}, false)
+	s.holderSocket = h.socket
+	s.sup.spawnedSkew = h.version // the version our own spawns keep producing
+
+	s.superviseTick(t.Context())
+
+	if s.sup.reviveHazard != reviveBreakerThreshold-1 {
+		t.Fatalf("reviveHazard = %d, want %d (a spawnedSkew settle must NOT reset the crash-loop breaker)", s.sup.reviveHazard, reviveBreakerThreshold-1)
+	}
+}
+
+// TestSuperviseReviveBreakerStaleClusterResets pins reviveHazardWindow: a death
+// far enough after the previous one starts a FRESH crash-loop cluster, so
+// occasional far-apart transient deaths (e.g. under a healthy reverse-skew
+// holder that settles at spawnedSkew and never resets the count) never add up
+// to a spurious whole-pool demotion.
+func TestSuperviseReviveBreakerStaleClusterResets(t *testing.T) {
+	s, _, _, rec := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	// Two deaths' worth of accumulated hazard — but the last one was long ago.
+	s.sup.reviveHazard = reviveBreakerThreshold - 1
+	s.sup.lastReviveAt = time.Now().Add(-reviveHazardWindow - time.Minute)
+	s.sup.sawUnhealthy = false
+
+	s.superviseTick(t.Context())
+
+	if s.sup.reviveHazard != 1 {
+		t.Fatalf("reviveHazard = %d, want 1 (a stale prior death must start a fresh cluster, not accumulate)", s.sup.reviveHazard)
+	}
+	if got := kindOf(t, s, 1); got != "fuse" {
+		t.Fatalf("acct-01 kind = %q, want fuse (a far-apart death must not demote the pool)", got)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("spawn attempts = %d, want 1 (a single fresh death still revives normally, not a fallback)", rec.count())
+	}
+}
+
+// TestReviveBreakerBailsOnWedgedForceUnmount pins the wedged-unmount guard: when
+// the crash-loop fallback's forced unmount never completes, the row is left fuse
+// and armed rather than handed to ConvertOverlay — whose Teardown would see the
+// dir still mounted and re-spawn the very holder the breaker is retreating from
+// (the wedged-carcass churn the breaker exists to stop).
+func TestReviveBreakerBailsOnWedgedForceUnmount(t *testing.T) {
+	s, dirs, _, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.sup.reviveHazard = reviveBreakerThreshold - 1
+	s.sup.sawUnhealthy = false
+	// The dir reads as a (wedged) mountpoint whose forced unmount never
+	// completes — the exact edge where an un-guarded ConvertOverlay would
+	// re-spawn the holder through its Teardown.
+	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+	swapForceUnmount(t, func(string) error { return errors.New("force-unmount timed out") })
+
+	s.superviseTick(t.Context())
+
+	if got := kindOf(t, s, 1); got != "fuse" {
+		t.Fatalf("acct-01 kind = %q, want fuse (a wedged force-unmount must NOT convert through a re-spawning Teardown)", got)
+	}
+	if s.sup.reviveHazard < reviveBreakerThreshold {
+		t.Fatalf("reviveHazard = %d, want >= %d (a bailed fallback leaves the breaker armed to retry)", s.sup.reviveHazard, reviveBreakerThreshold)
+	}
+}
+
+// TestSuperviseSkewedDeferHealsWedgedRowToSymlink pins Fix B: when the
+// skew-replace gate defers (a live session blocks it) under a skewed holder we
+// did not spawn, the steady-state heal still runs, so a never-recovering wedged
+// row reaches the remount breaker and escalates to symlink — instead of being
+// stranded until the pool goes idle.
+func TestSuperviseSkewedDeferHealsWedgedRowToSymlink(t *testing.T) {
+	s, dirs, fake, rec := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	// Healthy but skewed, vouches for nothing, and NOT spawnedSkew (it stays
+	// "") — so superviseTick routes to replaceSkewedHolder, not the settled
+	// branch.
+	h := startSkewedHolder(t, nil, false)
+	s.holderSocket = h.socket
+	fake.setupErr = mountTimeoutChain() // the row stays wedged (healRetry forever)
+	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+	var (
+		mu        sync.Mutex
+		unmounted []string
+	)
+	swapForceUnmount(t, func(dir string) error {
+		mu.Lock()
+		unmounted = append(unmounted, dir)
+		mu.Unlock()
+		return nil
+	})
+	// A live session on the dir makes the skew-replace gate defer; without Fix B
+	// the deferral heals nothing and the wedged row never escalates.
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+	}
+
+	for i := 0; i < remountBreakerThreshold; i++ {
+		if st, ok := s.sup.rowRetry[1]; ok {
+			st.retryAt = time.Now().Add(-time.Second)
+			s.sup.rowRetry[1] = st
+		}
+		s.superviseTick(t.Context())
+	}
+
+	if got := kindOf(t, s, 1); got != "symlink" {
+		t.Fatalf("wedged row under a deferred skew-replace = %q, want symlink (Fix B makes the breaker reachable)", got)
+	}
+	if rec.count() != 0 {
+		t.Fatalf("skewed-defer heal spawned a holder (%d); it must heal through the existing holder", rec.count())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(unmounted) != 1 || unmounted[0] != dirs[1] {
+		t.Fatalf("breaker force-unmounted %v, want exactly [%s]", unmounted, dirs[1])
 	}
 }

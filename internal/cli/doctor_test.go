@@ -482,3 +482,58 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 		t.Errorf("seam leaked past the heal: a write after checkStrandedPrivate still hit the doctor buffer")
 	}
 }
+
+// TestDoctorSurfacesFuseFallback pins the degraded-overlay surfacing: an account
+// demoted to symlink while the pool default is fuse (an automatic fallback) is
+// reported with the re-promote guidance — but only when this machine can host
+// fuse, and never for a symlink-default pool or a fuse account.
+func TestDoctorSurfacesFuseFallback(t *testing.T) {
+	cases := map[string]struct {
+		acctKind    string
+		defaultKind overlay.Kind
+		canHostFuse bool
+		wantReport  bool
+	}{
+		"symlink account, fuse default, can host -> surfaced": {"symlink", overlay.KindFuse, true, true},
+		"symlink account, symlink default -> quiet":           {"symlink", overlay.KindSymlink, true, false},
+		"symlink account, fuse default, cannot host -> quiet": {"symlink", overlay.KindFuse, false, false},
+		"fuse account -> quiet":                               {"fuse", overlay.KindFuse, true, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			st, err := store.Open(filepath.Join(home, "test.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { st.Close() })
+			// Record the default with fuse-hosting enabled (SetDefaultOverlayKind
+			// refuses a fuse default otherwise), then set the check-time capability.
+			m := &pool.Manager{Store: st, CanHostFuse: func() bool { return true }}
+			if err := m.SetDefaultOverlayKind(tc.defaultKind); err != nil {
+				t.Fatal(err)
+			}
+			m.CanHostFuse = func() bool { return tc.canHostFuse }
+
+			a := store.Account{ID: 3, ConfigDir: filepath.Join(home, "acct-03"), OverlayKind: tc.acctKind}
+			report, calls := captureReports()
+			checkFuseFallback(m, a, report)
+
+			got := false
+			for _, c := range *calls {
+				if strings.Contains(c.label, "fuse fallback") {
+					got = true
+					if c.healthy {
+						t.Errorf("fuse-fallback report marked healthy; want a failure")
+					}
+					if !strings.Contains(c.detail, "ccp migrate") {
+						t.Errorf("detail missing the re-promote guidance: %q", c.detail)
+					}
+				}
+			}
+			if got != tc.wantReport {
+				t.Fatalf("surfaced = %v, want %v (calls=%+v)", got, tc.wantReport, *calls)
+			}
+		})
+	}
+}

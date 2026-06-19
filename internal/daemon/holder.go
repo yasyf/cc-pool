@@ -51,6 +51,29 @@ const (
 // of retried into eternity.
 const remountBreakerThreshold = 5
 
+// reviveBreakerThreshold is the holder-level circuit breaker. After this many
+// CONSECUTIVE holder deaths (each force-unmounting EVERY mount and losing
+// in-flight writes — see reviveHolder) without the holder ever returning at
+// THIS daemon's version — a stuck old holder we cannot replace under live
+// sessions, or fuse-t/NFS gone unavailable so a holder will not spawn at all —
+// the supervisor stops reviving it and falls every fuse row back to the
+// always-available symlink overlay (fallbackCrashLoopedRows). Lower than
+// remountBreakerThreshold because a holder-level loop churns the WHOLE pool
+// each cycle, so its data-loss blast radius warrants a faster retreat. A clean
+// holder restart only reaches 1 (the next settled tick at our version resets
+// it), so this never false-trips on a normal respawn or a one-off death.
+const reviveBreakerThreshold = 3
+
+// reviveHazardWindow bounds what counts as a CONSECUTIVE death for the
+// crash-loop breaker: two deaths farther apart than this start a fresh cluster
+// (reviveHazard resets to 1). Without it, a holder that settles healthy at a
+// spawnedSkew version between deaths (which deliberately does NOT reset the
+// count — see reviveHazard) would accumulate unrelated, far-apart transient
+// deaths over its whole lifetime and eventually demote a perfectly healthy
+// pool. A real crash loop re-dies every few minutes, well inside this window;
+// genuinely occasional deaths fall outside it and never accumulate.
+const reviveHazardWindow = 30 * time.Minute
+
 // forceUnmount force-unmounts an orphaned fuse carcass directly, without
 // routing through the (possibly dead) holder; seamed so tests assert the calls
 // without real mounts. Production: overlay.ForceUnmount (bounded).
@@ -89,6 +112,19 @@ type supervisor struct {
 	// produced when it differs from ours (see noteSpawnedVersion): the
 	// reverse-skew steady state superviseTick must never re-replace.
 	spawnedSkew string
+	// reviveHazard counts CONSECUTIVE holder deaths (and failed respawns) that
+	// never restored a holder at THIS daemon's version — the crash-loop signal
+	// behind reviveBreakerThreshold. Incremented once per unreachable transition
+	// in reviveHolder and per failed spawn/verify there; reset ONLY by a settled
+	// tick at our version (superviseTick) — never by a spawnedSkew settle, which
+	// is the very stuck-old-holder loop the breaker exists for — once the whole
+	// pool has retreated to symlink (fallbackCrashLoopedRows), or when a death
+	// lands more than reviveHazardWindow after the prior one (a stale cluster).
+	reviveHazard int
+	// lastReviveAt timestamps the most recent unreachable transition, so a death
+	// far enough after it (reviveHazardWindow) starts a fresh crash-loop cluster
+	// rather than accumulating with long-ago, unrelated deaths.
+	lastReviveAt time.Time
 	// rowRetry is the per-account remount backoff ledger for fuse rows the
 	// holder cannot vouch for (see retryUnvouchedFuseRows). Lazily
 	// initialized; like the rest of supervisor, only the supervise goroutine
@@ -160,11 +196,26 @@ func (s *Server) superviseTick(ctx context.Context) {
 		// any stale spawn-error/deferral surface, and retry whatever fuse
 		// rows this healthy holder still cannot vouch for.
 		s.resetSpawnBackoff()
+		if ver == version.String() {
+			// A genuine our-version holder is the real recovery, and only it
+			// clears the crash-loop breaker: a spawnedSkew holder staying
+			// "settled" between deaths is the stuck-old-holder loop the breaker
+			// exists for, so it must NOT reset the count.
+			s.sup.reviveHazard = 0
+		}
 		s.sup.lastDefer = ""
 		s.retryUnvouchedFuseRows(ctx)
 		return
 	}
-	s.replaceSkewedHolder(ctx)
+	if s.replaceSkewedHolder(ctx) {
+		// The skew-replace deferred (e.g., live sessions on a fuse row). The
+		// holder is healthy but skewed and we cannot replace it now, so its
+		// wedged rows would otherwise never advance the remount breaker — run
+		// the steady-state heal so a never-recovering mirror under this skewed
+		// holder still falls back to symlink instead of waiting for the pool to
+		// go idle.
+		s.retryUnvouchedFuseRows(ctx)
+	}
 }
 
 // reviveHolder handles an unreachable holder: when fuse rows (or mounts a
@@ -175,6 +226,14 @@ func (s *Server) superviseTick(ctx context.Context) {
 func (s *Server) reviveHolder(ctx context.Context) {
 	if !s.sup.sawUnhealthy {
 		s.sup.sawUnhealthy = true
+		now := time.Now()
+		if !s.sup.lastReviveAt.IsZero() && now.Sub(s.sup.lastReviveAt) > reviveHazardWindow {
+			// The previous death was long ago — this is not the same crash loop.
+			// Start a fresh cluster so far-apart transient deaths never add up.
+			s.sup.reviveHazard = 0
+		}
+		s.sup.lastReviveAt = now
+		s.sup.reviveHazard++
 		s.log.Printf("mount holder unreachable")
 	}
 	accts, err := s.m.Store.ListAccounts()
@@ -207,6 +266,16 @@ func (s *Server) reviveHolder(ctx context.Context) {
 	if len(fuse) == 0 && !s.holder.hadMounts() {
 		return // nothing for a holder to serve
 	}
+	if s.canSpawnHolder() && s.sup.reviveHazard >= reviveBreakerThreshold {
+		// The holder keeps dying without ever returning at our version: every
+		// revive force-unmounts the whole pool and loses in-flight writes, and
+		// the live-session gate blocks the only upgrade path. Stop reviving it —
+		// retreat the fuse rows to the always-available symlink overlay instead
+		// of churning them again. (A pure build that cannot spawn never carves a
+		// symlink retreat here — it has no fuse rows of its own to fall back.)
+		s.fallbackCrashLoopedRows(ctx, fuse)
+		return
+	}
 	if !s.canSpawnHolder() {
 		// A pure build cannot spawn a holder; attempting would refuse with
 		// the same error every tick. The transition above already logged.
@@ -217,9 +286,21 @@ func (s *Server) reviveHolder(ctx context.Context) {
 	}
 	if err := s.spawn(); err != nil {
 		s.noteSpawnFailure(err)
+		if s.sup.failures >= reviveBreakerThreshold {
+			// The holder will not spawn at all (fuse-t/NFS unavailable): every
+			// fuse dir is unmounted and unusable. Retreat to symlink so the pool
+			// keeps working without a mount holder.
+			s.fallbackCrashLoopedRows(ctx, fuse)
+		}
 		return
 	}
 	if !s.verifySpawnedHolder() {
+		if s.sup.failures >= reviveBreakerThreshold {
+			// Spawn reports success but the holder never passes its health check
+			// (a socket held by an unresponsive process); same dead end as a
+			// failed spawn — retreat to symlink.
+			s.fallbackCrashLoopedRows(ctx, fuse)
+		}
 		return
 	}
 	s.sup.sawUnhealthy = false
@@ -338,7 +419,13 @@ func (s *Server) noteSpawnedVersion(ver string) {
 // so the cache stops vouching and the gone-wait runs with the claims still
 // held — a holder observed gone continues the replace; one still serving
 // defers (never killed: it may never have received the Shutdown).
-func (s *Server) replaceSkewedHolder(ctx context.Context) {
+//
+// Returns true when the replace DEFERRED on a blocked gate leg (the holder is
+// still serving, skewed): superviseTick then runs the steady-state heal so a
+// wedged row under the un-replaceable skewed holder is not stranded. Every
+// other path — a clean replace, or any failure after the gate cleared — returns
+// false (we acted on the holder this tick; the next tick re-assesses).
+func (s *Server) replaceSkewedHolder(ctx context.Context) (deferred bool) {
 	_, ver := s.holder.view()
 	fuse, reason := s.skewReplaceGate()
 	if reason != "" {
@@ -346,7 +433,7 @@ func (s *Server) replaceSkewedHolder(ctx context.Context) {
 			s.sup.lastDefer = reason
 			s.log.Printf("deferring replacement of version-skewed mount holder (%s): %s", ver, reason)
 		}
-		return
+		return true
 	}
 	defer s.endReplace(accountIDs(fuse))
 	s.sup.lastDefer = ""
@@ -403,6 +490,7 @@ func (s *Server) replaceSkewedHolder(ctx context.Context) {
 	}
 	s.remountReplacedRows(ctx, fuse)
 	s.log.Printf("mount holder replaced at %s", version.String())
+	return false
 }
 
 // reapWedgedHolder handles a holder that acked Shutdown but kept its socket
@@ -735,6 +823,84 @@ func (s *Server) escalateWedgedRow(a store.Account) {
 	s.holder.noteUnmounted(a.ConfigDir)
 	delete(s.sup.rowRetry, a.ID)
 	s.log.Printf("acct-%02d fell back to symlink after exhausting fuse remount attempts", a.ID)
+}
+
+// fallbackCrashLoopedRows retreats every fuse account to the symlink overlay
+// after the mount holder crash-looped past reviveBreakerThreshold (or will not
+// spawn at all). It is the holder-level analog of escalateWedgedRow: an UNGATED
+// hazard remediation (the mounts are already down from the revive's
+// force-unmount, sessions are already orphaned and must relaunch), distinct
+// from the idle-gated fallbackToSymlink. Each row is taken with beginConvert —
+// reviveHolder holds no poll claim — so a select, a scheduler poll, or another
+// conversion cannot interleave; a row that cannot be claimed or fails to
+// convert is left for a later tick. Only when EVERY row retreated is the
+// crash-loop breaker cleared, so a deliberate later re-promotion to fuse gets a
+// fresh revive budget while any straggler keeps retrying meanwhile.
+func (s *Server) fallbackCrashLoopedRows(ctx context.Context, fuse []store.Account) {
+	if len(fuse) == 0 {
+		return // nothing to retreat (a symlink-only pool past the spawn-failure breaker)
+	}
+	allDone := true
+	for _, a := range fuse {
+		if ctx.Err() != nil {
+			return
+		}
+		if !s.beginConvert(a.ID) {
+			s.log.Printf("acct-%02d crash-loop symlink fallback deferred: reserved, polling, or converting", a.ID)
+			allDone = false
+			continue
+		}
+		ok := s.fallbackCrashLoopedRow(a)
+		s.endConvert(a.ID)
+		if !ok {
+			allDone = false
+		}
+	}
+	if allDone {
+		// The whole pool retreated to symlink: clear BOTH breakers so a later
+		// deliberate re-promotion to fuse gets a fresh revive budget (the
+		// spawn-failure breaker keys on s.sup.failures, which resetSpawnBackoff
+		// clears) — a straggler left behind keeps both counters armed instead.
+		s.sup.reviveHazard = 0
+		s.resetSpawnBackoff()
+	}
+}
+
+// fallbackCrashLoopedRow converts one fuse row to symlink under the caller's
+// held convert claim, re-reading it first (a row converted in the gap is left
+// alone) and force-unmounting any mount still standing. Reports whether the row
+// ended up off fuse (converted, or already non-fuse); a convert error reports
+// false so the breaker stays armed and retries it next tick. Caller holds the
+// account's convert claim (beginConvert).
+func (s *Server) fallbackCrashLoopedRow(a store.Account) bool {
+	fresh, err := s.m.Store.GetAccount(a.ID)
+	switch {
+	case err != nil:
+		s.log.Printf("acct-%02d crash-loop fallback: re-read row: %v", a.ID, err)
+		return false
+	case fresh.OverlayKind != string(overlay.KindFuse):
+		return true // already converted by another path
+	}
+	s.log.Printf("acct-%02d mount holder unrecoverable (crash loop or will not spawn); falling back to symlink — relaunch any sessions on it", a.ID)
+	if overlayMounted(fresh.ConfigDir) {
+		if err := forceUnmount(fresh.ConfigDir); err != nil {
+			// The forced unmount wedged (the kernel will not complete it). Do NOT
+			// proceed into ConvertOverlay: its Teardown would see the dir still
+			// mounted and re-spawn the very holder we are retreating from — the
+			// wedged-carcass churn the breaker exists to stop. Leave the row fuse
+			// and armed; a dir whose unmount the kernel refuses cannot be safely
+			// symlinked anyway.
+			s.log.Printf("acct-%02d crash-loop fallback: force-unmount %s wedged; leaving fuse, retrying next tick: %v", a.ID, fresh.ConfigDir, err)
+			return false
+		}
+	}
+	if _, err := s.m.ConvertOverlay(fresh, overlay.KindSymlink); err != nil {
+		s.log.Printf("acct-%02d crash-loop fallback: convert to symlink: %v", a.ID, err)
+		return false
+	}
+	s.holder.noteUnmounted(fresh.ConfigDir)
+	s.log.Printf("acct-%02d fell back to symlink after the mount holder crash-looped", a.ID)
+	return true
 }
 
 // remountReplacedRows heals every fuse row after a holder replacement, under
