@@ -49,6 +49,30 @@ jobs:
       - name: Install fuse-t (build-time headers for the -tags fuse variant)
         run: brew install macos-fuse-t/cask/fuse-t
 
+      - name: Import Developer ID certificate
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KP="$(openssl rand -base64 24)"
+          security create-keychain -p "$KP" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KP" "$KEYCHAIN"
+          echo -n "$MACOS_SIGN_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_SIGN_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KP" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/[\" ]//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "MACOS_SIGN_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/{print $2; exit}')" >> "$GITHUB_ENV"
+          echo -n "$MACOS_NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          echo "MACOS_NOTARY_KEY_FILE=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_KEY_ID=$MACOS_NOTARY_KEY_ID" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_ISSUER=$MACOS_NOTARY_ISSUER_ID" >> "$GITHUB_ENV"
+
       - name: Build universal binaries (pure Go + fuse, arm64 + amd64 via lipo)
         run: |
           VERSION="${GITHUB_REF_NAME}"
@@ -68,11 +92,21 @@ jobs:
           CGO_ENABLED=1 GOARCH=amd64 CC="clang -arch x86_64" go build -tags fuse -ldflags "$LDFLAGS" -o dist/fuse-amd64 ./cmd/cc-pool
           lipo -create -output dist/fuse/cc-pool dist/fuse-arm64 dist/fuse-amd64
 
-          # Re-apply ad-hoc signatures post-lipo (mandatory on arm64), then
-          # smoke-test that the native slices load and report the right version.
-          codesign --force -s - dist/pure/cc-pool dist/fuse/cc-pool
+          # Developer ID sign (hardened runtime) post-lipo, then smoke-test the native
+          # slices. macOS 15/26 SIGKILL ad-hoc/Team-less signatures, so the old
+          # `codesign -s -` is replaced. The fuse build dlopens libfuse-t (another team's
+          # dylib) so it needs disable-library-validation; the pure build doesn't.
+          printf '%s' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.cs.disable-library-validation</key><true/></dict></plist>' > "$RUNNER_TEMP/fuse-ents.plist"
+          codesign --force --options runtime --timestamp -s "$MACOS_SIGN_IDENTITY" dist/pure/cc-pool
+          codesign --force --options runtime --timestamp --entitlements "$RUNNER_TEMP/fuse-ents.plist" -s "$MACOS_SIGN_IDENTITY" dist/fuse/cc-pool
+          codesign --verify --strict dist/pure/cc-pool dist/fuse/cc-pool
           dist/pure/cc-pool --version | grep -q "${VERSION}"
           dist/fuse/cc-pool --version | grep -q "${VERSION}"
+          # Notarize both universal binaries (bare Mach-O — recorded against cdhash, not stapled).
+          for b in dist/pure/cc-pool dist/fuse/cc-pool; do
+            z="$(mktemp -d)/cc-pool.zip"; ditto -c -k "$b" "$z"
+            xcrun notarytool submit "$z" --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" --wait --timeout 20m
+          done
 
           # Every tarball contains a binary named exactly `cc-pool`.
           cp dist/pure-arm64 dist/arm64/cc-pool
