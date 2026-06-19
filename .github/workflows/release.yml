@@ -145,14 +145,10 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign -d --entitlements - "$APP/Contents/PlugIns/CCPoolStatusWidget.appex" 2>&1 |
             grep -q "temporary-exception.files.home-relative-path.read-only"
-          # Developer ID/Release must NOT carry get-task-allow — a leaked debug
-          # entitlement makes notarytool reject. Fail loud if it appears on either
-          # bundle (a bare `! … | grep` would be skipped by errexit and never fail).
-          for b in "$APP" "$APP/Contents/PlugIns/CCPoolStatusWidget.appex"; do
-            if codesign -d --entitlements - "$b" 2>&1 | grep -q "get-task-allow"; then
-              echo "::error::get-task-allow present in $b" >&2; exit 1
-            fi
-          done
+          # No get-task-allow pre-check: with no entitlements file, the Release
+          # host app is signed with an auto-generated get-task-allow=false, which
+          # is harmless (only get-task-allow=true is a debuggable build). notarytool
+          # below is the authority — it rejects a true value and accepts false.
           # The stamp must actually reach both bundles ($(…) wiring lives in
           # project.yml's info.properties) — a silent 1/1.0 re-ships the
           # stale-gallery bug. The appex is the bundle chronod inspects.
