@@ -29,5 +29,6 @@ func SpawnHolder(socket, logPath string, timeout time.Duration) error {
 		Args:           []string{"mount-holder", "--socket", socket},
 		Timeout:        timeout,
 		CannotHostHint: cannotHostHint,
+		StableExecDir:  HolderBinDir(),
 	}.EnsureRunning()
 }

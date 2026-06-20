@@ -94,6 +94,18 @@ func MountHolderLogPath() string {
 	return filepath.Join(StateDir(), "mount-holder.log")
 }
 
+// HolderBinDir is the stable, non-versioned directory under which the mount
+// holder binary is materialized as a copy (~/.cc-pool/bin). The holder is
+// spawned from this fixed path — passed to fusekit as mountd.Spawn.StableExecDir
+// — so its resolved executable path never changes across `brew upgrade`. macOS
+// tccd keys the one-time "Network Volumes" grant on the holder's resolved path,
+// and Homebrew installs each version at a new Cellar path; spawning from this
+// fixed copy (whose embedded Developer-ID requirement survives the byte copy)
+// keeps the grant across versions instead of re-prompting every upgrade.
+func HolderBinDir() string {
+	return filepath.Join(StateDir(), "bin")
+}
+
 // StatusSnapshotPath is the daemon's on-disk status mirror
 // (~/.cc-pool/status.json), rewritten atomically after every completed poll
 // for out-of-process readers like the Notification Center widget.

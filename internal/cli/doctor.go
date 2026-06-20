@@ -20,6 +20,7 @@ import (
 
 func newDoctorCmd() *cobra.Command {
 	var fix bool
+	var openSettings bool
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check accounts' Keychain items and overlays; --fix repairs drift",
@@ -115,11 +116,22 @@ func newDoctorCmd() *cobra.Command {
 				} else {
 					_, _ = fmt.Fprintln(out, "\nAll checks passed.")
 				}
+
+				// --open-settings jumps straight to the Network Volumes pane when
+				// the holder is TCC-blocked. Best-effort: a failure to launch it
+				// is a warning, never a command failure — the detail line above
+				// already carries the copy-pasteable deep link.
+				if openSettings && cachedHolder != nil && cachedHolder.TCCError != "" {
+					if err := mountd.OpenNetworkVolumesSettings(cmd.Context()); err != nil {
+						warn(cmd.ErrOrStderr(), "couldn't open the Network Volumes settings pane: %v", err)
+					}
+				}
 				return nil
 			})
 		},
 	}
 	cmd.Flags().BoolVar(&fix, "fix", false, "attempt to repair detected drift")
+	cmd.Flags().BoolVar(&openSettings, "open-settings", false, "if the mount holder is TCC-blocked, open the Network Volumes settings pane")
 	return cmd
 }
 
@@ -170,7 +182,7 @@ func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)
 		return
 	}
 	if f.cached.TCCError != "" {
-		report("mount holder TCC", false, f.cached.TCCError)
+		report("mount holder TCC", false, f.cached.TCCError+` — open Settings: open "`+mountd.NetworkVolumesSettingsURL+`"`)
 	}
 	if f.cached.SpawnError != "" {
 		report("mount holder spawn", false, f.cached.SpawnError)

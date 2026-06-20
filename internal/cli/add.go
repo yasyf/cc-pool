@@ -2,6 +2,7 @@ package cli
 
 import (
 	"errors"
+	"io"
 	"os/exec"
 
 	"github.com/charmbracelet/huh"
@@ -125,6 +126,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	if pending.FallbackReason != "" {
 		warn(cmd.ErrOrStderr(), "fuse overlay unavailable (%s); using symlinks", pending.FallbackReason)
 	}
+	noteFuseFirstMount(out, pending.OverlayKind)
 
 	if err := loginFlow(cmd, pending, opts); err != nil {
 		return nil, err
@@ -174,6 +176,17 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	}
 	success(out, "Added %s.", name)
 	return acct, nil
+}
+
+// noteFuseFirstMount warns about macOS's one-time "Network Volumes" prompt the
+// account's first fuse mount triggers. It fires only on a fuse build hosting a
+// fuse account — a symlink overlay never mounts, so it never prompts. Migrate
+// already says this in its own flow, so this covers the add/init path only.
+func noteFuseFirstMount(out io.Writer, kind overlay.Kind) {
+	if !overlay.FuseBuilt() || kind != overlay.KindFuse {
+		return
+	}
+	note(out, `macOS will show a one-time "Network Volumes" prompt for cc-pool — click Allow.`)
 }
 
 // defaultLabel resolves a new account's label: an explicit --label wins;

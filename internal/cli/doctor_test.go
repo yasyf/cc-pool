@@ -77,7 +77,7 @@ func TestReportHolder(t *testing.T) {
 			fuseRows: 1,
 			want:     []reportCall{{"mount holder", true, cur}},
 		},
-		"cached TCC block fails": {
+		"cached TCC block fails with the settings deep link": {
 			facts: holderFacts{
 				reachable: true, version: cur, daemonUp: true,
 				cached: &daemon.HolderStatus{TCCError: "grant Network Volumes access"},
@@ -85,7 +85,9 @@ func TestReportHolder(t *testing.T) {
 			fuseRows: 1,
 			want: []reportCall{
 				{"mount holder", true, cur},
-				{"mount holder TCC", false, "grant Network Volumes access"},
+				// The raw fusekit error AND the copy-pasteable deep link must
+				// both ride the one detail line.
+				{"mount holder TCC", false, `grant Network Volumes access — open Settings: open "` + mountd.NetworkVolumesSettingsURL + `"`},
 			},
 		},
 		"cached spawn failure fails": {

@@ -179,20 +179,28 @@ re-classifies correctly.
 
 ### TCC across a binary swap
 
-The grant is per process path. The Homebrew install execs the stable `opt`
-symlink precisely so upgrades keep the grant.
+tccd keys the grant on the holder's RESOLVED executable path (`client_type=1`
+in TCC.db). Homebrew installs each version at a new versioned Cellar path, so a
+holder spawned from there would re-prompt on every upgrade. cc-pool sidesteps
+this by spawning the holder from a stable copy at `~/.cc-pool/bin/mount-holder`
+(fusekit `mountd.Spawn.StableExecDir`): the path is constant across versions,
+and the copy's embedded Developer-ID designated requirement survives the byte
+copy, so tccd matches the same grant and never re-prompts.
 
 ```sh
-# (a) upgrade via brew (opt path stable): kill the holder so the new binary
-#     respawns it, expect NO new TCC prompt and a clean remount (step 2 lines).
-# (b) run a holder from a NEW path (e.g. a source build in /tmp): expect the
-#     full step-6 sequence — blocked copy, footer, doctor failure — until the
-#     new path is granted.
+# (a) upgrade via brew, then kill the holder so the new binary respawns it from
+#     the same ~/.cc-pool/bin/mount-holder copy: expect NO new TCC prompt and a
+#     clean remount (step 2 lines). TCC.db holds a single client_type=1 row for
+#     ~/.cc-pool/bin/mount-holder, unchanged by the upgrade.
+# (b) run a holder from a NEW path (e.g. a source build in /tmp without the
+#     stable copy): expect the full step-6 sequence — blocked copy, footer,
+#     doctor failure — until the new path is granted.
 ```
 
-Still unverified on-device: whether an ad-hoc-signed binary swap at the SAME
-path (the cdhash changes, the path does not) keeps the grant. To be settled
-in the on-device verification phase; record the result here either way.
+Still unverified on-device: whether a new Developer-ID signature whose
+designated requirement still matches keeps the grant after the stable copy is
+refreshed with a fresh build. To be settled in the on-device verification
+phase; record the result here either way.
 
 ## 7. Partial wedge: deep probe, auto remount, orphaned sessions
 

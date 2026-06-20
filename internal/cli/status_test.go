@@ -19,7 +19,12 @@ import (
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/mountd"
 )
+
+// tccHint is the copy-pasteable deep link holderFooter appends to a TCC-blocked
+// alert so users can jump to the Network Volumes pane.
+var tccHint = ` — open Settings: open "` + mountd.NetworkVolumesSettingsURL + `"`
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
@@ -602,9 +607,9 @@ func TestHolderFooter(t *testing.T) {
 			&daemon.HolderStatus{Version: "0.0.1-old", Mounts: 1, Skewed: true},
 			"mount holder 0.0.1-old skewed; will be replaced when idle",
 		},
-		"TCC blocked": {
+		"TCC blocked carries the settings deep link": {
 			&daemon.HolderStatus{TCCError: "grant Network Volumes access"},
-			"mount holder: TCC blocked — grant Network Volumes access",
+			"mount holder: TCC blocked — grant Network Volumes access" + tccHint,
 		},
 		"respawn failing": {
 			&daemon.HolderStatus{SpawnError: "exec format error"},
@@ -612,7 +617,7 @@ func TestHolderFooter(t *testing.T) {
 		},
 		"TCC outranks spawn and skew": {
 			&daemon.HolderStatus{Skewed: true, TCCError: "tcc-msg", SpawnError: "spawn-msg"},
-			"mount holder: TCC blocked — tcc-msg",
+			"mount holder: TCC blocked — tcc-msg" + tccHint,
 		},
 		"spawn outranks skew": {
 			&daemon.HolderStatus{Version: "0.0.1-old", Skewed: true, SpawnError: "spawn-msg"},
@@ -653,7 +658,7 @@ func TestHolderFooterWedged(t *testing.T) {
 		},
 		"TCC outranks wedged": {
 			&daemon.HolderStatus{TCCError: "tcc-msg", WedgedMounts: 1},
-			"mount holder: TCC blocked — tcc-msg",
+			"mount holder: TCC blocked — tcc-msg" + tccHint,
 		},
 		"spawn outranks wedged": {
 			&daemon.HolderStatus{SpawnError: "spawn-msg", WedgedMounts: 1},

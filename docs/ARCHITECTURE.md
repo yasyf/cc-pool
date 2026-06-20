@@ -53,7 +53,11 @@ providers:
   [fuse-t](https://github.com/macos-fuse-t/fuse-t) — kext-less, mounted as you, no root —
   and hosted by a detached cc-pool **mount-holder** process, so daemon restarts and upgrades
   never disturb live sessions' mounts. Requires a `-tags fuse` build (cgo) and a one-time
-  *Network Volumes* privacy grant.
+  *Network Volumes* privacy grant. macOS tccd keys that grant on the holder's resolved
+  executable path, so cc-pool spawns the holder from a stable copy at `~/.cc-pool/bin`
+  (fusekit `mountd.Spawn.StableExecDir`) — a fixed path whose embedded Developer-ID
+  requirement survives the byte copy — and the grant persists across `brew upgrade` instead
+  of re-prompting at each new Cellar path.
 
 A few entries stay per-account instead of shared: `daemon/` and `ide/` (Claude's PID-keyed
 supervisor and IDE lock/socket files, which would collide across concurrent sessions),

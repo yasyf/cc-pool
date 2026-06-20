@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/mountd"
 )
 
 func newStatusCmd() *cobra.Command {
@@ -152,7 +153,7 @@ func holderFooter(h *daemon.HolderStatus) string {
 	// and only asks for a doctor run; skew is cosmetic.
 	switch {
 	case h.TCCError != "":
-		return warnStyle.Render("mount holder: TCC blocked — " + h.TCCError)
+		return warnStyle.Render(`mount holder: TCC blocked — ` + h.TCCError + ` — open Settings: open "` + mountd.NetworkVolumesSettingsURL + `"`)
 	case h.SpawnError != "":
 		return warnStyle.Render("mount holder: respawn failing — " + h.SpawnError)
 	case h.WedgedMounts > 0:

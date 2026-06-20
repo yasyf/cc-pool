@@ -80,9 +80,13 @@ func WritePlist() (string, error) {
 		return "", err
 	}
 	// Do NOT EvalSymlinks here: a Homebrew install exposes a stable
-	// /opt/homebrew/bin/cc-pool symlink into a versioned Cellar path.
-	// Resolving to the Cellar path would change every upgrade and re-trigger the
-	// fuse-t "Network Volumes" TCC prompt. launchd happily execs the symlink.
+	// /opt/homebrew/bin/cc-pool symlink into a versioned Cellar path. Keeping the
+	// symlink means the daemon's launchd program path stays constant across
+	// `brew upgrade` instead of churning to each new Cellar path. (TCC is not the
+	// reason: the daemon never mounts, so its executable path never figured into
+	// the "Network Volumes" grant — only the mount holder's identity does, and the
+	// holder runs from a stable copy under pool.HolderBinDir via fusekit's
+	// StableExecDir.) launchd happily execs the symlink.
 	path, err := PlistPath()
 	if err != nil {
 		return "", err

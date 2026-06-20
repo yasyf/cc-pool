@@ -38,5 +38,6 @@ func newRemoteFuse() remoteFuse {
 		LogPath:        MountHolderLogPath(),
 		Args:           []string{"mount-holder", "--socket", MountsSocketPath()},
 		CannotHostHint: cannotHostHint,
+		StableExecDir:  HolderBinDir(),
 	}}
 }
