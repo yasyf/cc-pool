@@ -303,7 +303,7 @@ func summarizeAdds(cmd *cobra.Command, m *pool.Manager, added []store.Account) {
 	step(cmd.OutOrStdout(), "\nYour pool now has %s.", plural(total, "account"))
 }
 
-func shouldAbandon(cmd *cobra.Command) bool {
+func shouldAbandon(_ *cobra.Command) bool {
 	if !isTTY() {
 		return false
 	}

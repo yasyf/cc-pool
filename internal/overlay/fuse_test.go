@@ -56,7 +56,7 @@ func TestFuseMountOptionsByteIdentical(t *testing.T) {
 func TestFuseMirrorRoundTrip(t *testing.T) {
 	base := t.TempDir()
 	mnt := t.TempDir()
-	if err := os.WriteFile(filepath.Join(base, "hello.txt"), []byte("hi"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, "hello.txt"), []byte("hi"), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
 
@@ -64,10 +64,10 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	if err := p.Setup(base, mnt); err != nil {
 		t.Skipf("fuse-t mount unavailable (acceptable; symlink is the default): %v", err)
 	}
-	defer p.Teardown(base, mnt)
+	defer func() { _ = p.Teardown(base, mnt) }()
 
 	// Read through the mount.
-	got, err := os.ReadFile(filepath.Join(mnt, "hello.txt"))
+	got, err := os.ReadFile(filepath.Join(mnt, "hello.txt")) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatalf("read through mount: %v", err)
 	}
@@ -76,10 +76,10 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	}
 
 	// Write through the mount must land in base (shared, no copy-up).
-	if err := os.WriteFile(filepath.Join(mnt, "written.txt"), []byte("pass"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(mnt, "written.txt"), []byte("pass"), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatalf("write through mount: %v", err)
 	}
-	back, err := os.ReadFile(filepath.Join(base, "written.txt"))
+	back, err := os.ReadFile(filepath.Join(base, "written.txt")) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatalf("write did not pass through to base: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	}
 
 	// A new entry created directly in base appears live through the mount.
-	if err := os.Mkdir(filepath.Join(base, "newdir"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(base, "newdir"), 0o755); err != nil { //nolint:gosec // G301: dir perms are intentional for this test's fixture layout
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(mnt, "newdir")); err != nil {
@@ -120,7 +120,7 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	if err := os.WriteFile(privFile, []byte(`{"theme":"dark","oauthAccount":{"accountUuid":"acct-own"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	merged, err := os.ReadFile(filepath.Join(mnt, ".claude.json"))
+	merged, err := os.ReadFile(filepath.Join(mnt, ".claude.json")) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatalf("merged read through mount: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	if err := os.Rename(tmp, filepath.Join(mnt, ".claude.json")); err != nil {
 		t.Fatalf("claude-style commit through mount: %v", err)
 	}
-	pb, err := os.ReadFile(privFile)
+	pb, err := os.ReadFile(privFile) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatalf("read private file after commit: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	if mfs == nil || !mfs.cj.flushWithin(5*time.Second) {
 		t.Fatal("base write-through did not drain after the commit")
 	}
-	sb, err := os.ReadFile(sibling)
+	sb, err := os.ReadFile(sibling) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatalf("read base sibling after commit: %v", err)
 	}
@@ -186,15 +186,15 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 func TestFuseMirrorCarvesBulkAsSymlinks(t *testing.T) {
 	base := t.TempDir()
 	mnt := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(base, "projects"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(base, "projects"), 0o755); err != nil { //nolint:gosec // G301: dir perms are intentional for this test's fixture layout
 		t.Fatal(err)
 	}
 	// history is a shared top-level FILE that IS carved as a symlink (claude's
 	// bulk transcript I/O); settings.json is the merged-view exception.
-	if err := os.WriteFile(filepath.Join(base, "history"), []byte("h0"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, "history"), []byte("h0"), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{"theme":"dark"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{"theme":"dark"}`), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
 
@@ -202,7 +202,7 @@ func TestFuseMirrorCarvesBulkAsSymlinks(t *testing.T) {
 	if err := p.Setup(base, mnt); err != nil {
 		t.Skipf("fuse-t mount unavailable (acceptable; symlink is the default): %v", err)
 	}
-	defer p.Teardown(base, mnt)
+	defer func() { _ = p.Teardown(base, mnt) }()
 
 	// A shared top-level DIR presents as a symlink to its absolute base path.
 	fi, err := os.Lstat(filepath.Join(mnt, "projects"))
@@ -242,7 +242,7 @@ func TestFuseMirrorCarvesBulkAsSymlinks(t *testing.T) {
 	if !sfi.Mode().IsRegular() {
 		t.Fatalf("settings.json mode = %v, want a regular file", sfi.Mode())
 	}
-	served, err := os.ReadFile(filepath.Join(mnt, "settings.json"))
+	served, err := os.ReadFile(filepath.Join(mnt, "settings.json")) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatalf("read settings.json through mount: %v", err)
 	}
@@ -262,10 +262,10 @@ func TestFuseMirrorCarvesBulkAsSymlinks(t *testing.T) {
 	for i := range big {
 		big[i] = byte(i*31 + 7)
 	}
-	if err := os.WriteFile(filepath.Join(mnt, "projects", "big.bin"), big, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(mnt, "projects", "big.bin"), big, 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatalf("write multi-MB file through carved symlink: %v", err)
 	}
-	back, err := os.ReadFile(filepath.Join(base, "projects", "big.bin"))
+	back, err := os.ReadFile(filepath.Join(base, "projects", "big.bin")) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatalf("bulk write did not land in base: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestFuseMirrorCarvesBulkAsSymlinks(t *testing.T) {
 // must back onto privateRoot; everything else onto root.
 func TestMirrorRealRedirectsLocalEntries(t *testing.T) {
 	fs := newMirrorFS("/base", "/priv", "/.claude.json")
-	cases := map[string]string{
+	cases := map[string]string{ //nolint:gosec // G101: a test fixture map of names, not real credentials
 		"/.claude.json":                      "/priv/.claude.json",
 		"/.claude.json.tmp.ab12cd34":         "/priv/.claude.json.tmp.ab12cd34",
 		"/.credentials.json":                 "/priv/.credentials.json",
@@ -457,14 +457,14 @@ func TestMirrorClaudeJSONRenameWriteThrough(t *testing.T) {
 	committed := `{"theme":"solarized","newSetting":42,"oauthAccount":{"accountUuid":"acct-own"},"numStartups":8}`
 	commitClaudeJSON(t, fs, home, committed)
 
-	priv, err := os.ReadFile(filepath.Join(home, "acct.private", ".claude.json"))
+	priv, err := os.ReadFile(filepath.Join(home, "acct.private", ".claude.json")) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(priv) != committed {
 		t.Fatalf("private file = %q, want the full committed payload %q (migrate depends on it)", priv, committed)
 	}
-	baseBytes, err := os.ReadFile(filepath.Join(home, ".claude.json"))
+	baseBytes, err := os.ReadFile(filepath.Join(home, ".claude.json")) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,16 +568,16 @@ func TestMirrorClaudeJSONWriteThroughSkipsMissingBase(t *testing.T) {
 // clears on the next successful write-through.
 func TestMirrorClaudeJSONWriteThroughErrStickyAndClears(t *testing.T) {
 	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
-	if err := os.Chmod(home, 0o500); err != nil {
+	if err := os.Chmod(home, 0o500); err != nil { //nolint:gosec // G302: perms are intentionally set to exercise the permission path in this test
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(home, 0o700) })
+	t.Cleanup(func() { _ = os.Chmod(home, 0o700) }) //nolint:gosec // G302: perms are intentionally set to exercise the permission path in this test
 
 	commitClaudeJSON(t, fs, home, `{"theme":"solarized"}`) // fatals unless rename returns 0
 	if err := fs.healthErr(); err == nil {
 		t.Fatal("healthErr = nil, want the sticky write-through failure")
 	}
-	baseBytes, err := os.ReadFile(filepath.Join(home, ".claude.json"))
+	baseBytes, err := os.ReadFile(filepath.Join(home, ".claude.json")) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +585,7 @@ func TestMirrorClaudeJSONWriteThroughErrStickyAndClears(t *testing.T) {
 		t.Fatalf("base changed despite the failed write-through:\n%s", baseBytes)
 	}
 
-	if err := os.Chmod(home, 0o700); err != nil {
+	if err := os.Chmod(home, 0o700); err != nil { //nolint:gosec // G302: perms are intentionally set to exercise the permission path in this test
 		t.Fatal(err)
 	}
 	commitClaudeJSON(t, fs, home, `{"theme":"zenburn"}`)
@@ -657,15 +657,15 @@ func TestMirrorClaudeJSONNoopWriteThroughClearsWriteErr(t *testing.T) {
 	if err := fs.healthErr(); err != nil {
 		t.Fatalf("healthErr = %v, want nil after the first commit", err)
 	}
-	if err := os.Chmod(home, 0o500); err != nil {
+	if err := os.Chmod(home, 0o500); err != nil { //nolint:gosec // G302: perms are intentionally set to exercise the permission path in this test
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(home, 0o700) })
+	t.Cleanup(func() { _ = os.Chmod(home, 0o700) }) //nolint:gosec // G302: perms are intentionally set to exercise the permission path in this test
 	commitClaudeJSON(t, fs, home, `{"theme":"zenburn","numStartups":7}`)
 	if err := fs.healthErr(); err == nil {
 		t.Fatal("healthErr = nil, want the sticky write-through failure")
 	}
-	if err := os.Chmod(home, 0o700); err != nil {
+	if err := os.Chmod(home, 0o700); err != nil { //nolint:gosec // G302: perms are intentionally set to exercise the permission path in this test
 		t.Fatal(err)
 	}
 	// Shareable state back to exactly what base holds: the write-through skips
@@ -1113,7 +1113,7 @@ func readMergedClaudeJSON(t *testing.T, fs *mirrorFS) []byte {
 // mustReadFile reads a file or fails the test.
 func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1127,7 +1127,7 @@ func mustReadFile(t *testing.T, path string) []byte {
 func readdirEntries(t *testing.T, fs *mirrorFS, path string) []string {
 	t.Helper()
 	var names []string
-	st := fs.Readdir(path, func(name string, stat *fuse.Stat_t, ofst int64) bool {
+	st := fs.Readdir(path, func(name string, stat *fuse.Stat_t, _ int64) bool {
 		if stat != nil {
 			t.Errorf("Readdir(%q) filled %q with a non-nil stat; entries must be nil-stat", path, name)
 		}
@@ -1231,7 +1231,7 @@ func TestMirrorReaddirSubdirOmitsPrivateMerge(t *testing.T) {
 func TestFuseAttrCacheNoTornRead(t *testing.T) {
 	base := t.TempDir()
 	mnt := t.TempDir()
-	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{}`), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
 	sibling := filepath.Join(filepath.Dir(base), ".claude.json")
@@ -1245,12 +1245,12 @@ func TestFuseAttrCacheNoTornRead(t *testing.T) {
 	if err := p.Setup(base, mnt); err != nil {
 		t.Skipf("fuse-t mount unavailable (acceptable; symlink is the default): %v", err)
 	}
-	defer p.Teardown(base, mnt)
+	defer func() { _ = p.Teardown(base, mnt) }()
 	if err := os.WriteFile(filepath.Join(FusePrivateRoot(mnt), ".claude.json"), []byte(`{"theme":"dark","oauthAccount":{"accountUuid":"acct"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cj := filepath.Join(mnt, ".claude.json")
-	if _, err := os.ReadFile(cj); err != nil { // warm the attr cache
+	if _, err := os.ReadFile(cj); err != nil { //nolint:gosec // G304: cj is under the test's own t.TempDir() (warm the attr cache)
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(4 * time.Second)
@@ -1258,7 +1258,7 @@ func TestFuseAttrCacheNoTornRead(t *testing.T) {
 		if err := os.WriteFile(sibling, mkBase(i%400+1), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		b, err := os.ReadFile(cj)
+		b, err := os.ReadFile(cj) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 		if err != nil {
 			t.Fatalf("read %d: %v", i, err)
 		}
@@ -1275,7 +1275,7 @@ func TestFuseAttrCacheNoTornRead(t *testing.T) {
 func TestFuseAttrCacheBaseToAccountCTO(t *testing.T) {
 	base := t.TempDir()
 	mnt := t.TempDir()
-	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{}`), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
 	sibling := filepath.Join(filepath.Dir(base), ".claude.json")
@@ -1286,14 +1286,14 @@ func TestFuseAttrCacheBaseToAccountCTO(t *testing.T) {
 	if err := p.Setup(base, mnt); err != nil {
 		t.Skipf("fuse-t mount unavailable (acceptable; symlink is the default): %v", err)
 	}
-	defer p.Teardown(base, mnt)
+	defer func() { _ = p.Teardown(base, mnt) }()
 	if err := os.WriteFile(filepath.Join(FusePrivateRoot(mnt), ".claude.json"), []byte(`{"theme":"dark","oauthAccount":{"accountUuid":"acct"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	cjPath := filepath.Join(mnt, ".claude.json")
 	readVal := func() string {
-		b, err := os.ReadFile(cjPath)
+		b, err := os.ReadFile(cjPath) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 		if err != nil {
 			t.Fatalf("read .claude.json through mount: %v", err)
 		}
@@ -1306,7 +1306,7 @@ func TestFuseAttrCacheBaseToAccountCTO(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		b, err := os.ReadFile(cjPath)
+		b, err := os.ReadFile(cjPath) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1329,10 +1329,7 @@ func TestFuseAttrCacheBaseToAccountCTO(t *testing.T) {
 	// Close-to-open: a fresh open+read must observe v2. If dropping noattrcache
 	// broke base->account propagation, this never converges.
 	deadline := time.Now().Add(15 * time.Second)
-	for {
-		if strings.HasPrefix(readVal(), "v2") {
-			break
-		}
+	for !strings.HasPrefix(readVal(), "v2") {
 		if time.Now().After(deadline) {
 			t.Fatal("external base edit not visible through the mount within 15s — close-to-open propagation regressed")
 		}

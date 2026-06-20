@@ -39,7 +39,7 @@ func AccountIdentity(kind overlay.Kind, configDir string) (*Identity, error) {
 // .claude.json. Missing file or missing/empty identity → ErrNoIdentity;
 // unparseable JSON is a real error.
 func readIdentity(path string) (*Identity, error) {
-	src, err := os.ReadFile(path)
+	src, err := os.ReadFile(path) //nolint:gosec // G304: path is a cc-pool-managed account .claude.json under the state dir
 	if os.IsNotExist(err) {
 		return nil, ErrNoIdentity
 	}

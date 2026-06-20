@@ -225,7 +225,7 @@ func TestFuseSettingsBaseUnchangedThroughRealMount(t *testing.T) {
 	mnt := t.TempDir()
 	const original = `{"theme":"dark"}`
 	settingsPath := filepath.Join(base, "settings.json")
-	if err := os.WriteFile(settingsPath, []byte(original), 0o644); err != nil {
+	if err := os.WriteFile(settingsPath, []byte(original), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
 
@@ -238,7 +238,7 @@ func TestFuseSettingsBaseUnchangedThroughRealMount(t *testing.T) {
 
 	// Read through the mount: the served bytes carry the injected plansDirectory
 	// pointing at the mounted base's <base>/plans.
-	served, err := os.ReadFile(filepath.Join(mnt, "settings.json"))
+	served, err := os.ReadFile(filepath.Join(mnt, "settings.json")) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatalf("read settings.json through mount: %v", err)
 	}

@@ -47,7 +47,8 @@ func Util7d(s store.UsageSample) float64 { return s.Util7d }
 // monotone within a window, so the secant is unbiased and maximally smooth
 // against the API's integer-percent quantization.
 func secantBurn(samples []store.UsageSample, util func(store.UsageSample) float64,
-	window, minSpan time.Duration, now time.Time) float64 {
+	window, minSpan time.Duration, now time.Time,
+) float64 {
 	usable := make([]store.UsageSample, 0, len(samples))
 	for _, s := range samples {
 		if s.RateLimited || now.Sub(s.TS) > window {

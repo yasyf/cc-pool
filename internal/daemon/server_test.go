@@ -35,7 +35,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 
 	dirs := map[int]string{}
 	now := time.Now()
@@ -524,7 +524,7 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 
 	var logBuf bytes.Buffer
 	s := &Server{
@@ -566,7 +566,7 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 
 	// Park a handler mid-request: it blocks in Decode awaiting the closing brace.
 	parked := dial()
-	defer parked.Close()
+	defer func() { _ = parked.Close() }()
 	if _, err := parked.Write([]byte(`{"op":"status"`)); err != nil {
 		t.Fatal(err)
 	}
@@ -574,7 +574,7 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	// A full round-trip on a second connection orders the parked connection's
 	// accept (and wg tracking) before the cancellation below.
 	probe := dial()
-	defer probe.Close()
+	defer func() { _ = probe.Close() }()
 	if _, err := probe.Write([]byte(`{"op":"health"}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -652,7 +652,7 @@ func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	s.socket = filepath.Join(sockDir, "d.sock")
 	s.evictTimeout = defaultEvictTimeout
 	var buf bytes.Buffer

@@ -16,6 +16,7 @@ var acctAttrRE = regexp.MustCompile(`"acct"<blob>="([^"]*)"`)
 // reflects exactly what Claude wrote at /login time. Returns ErrNotFound if no
 // item exists for the service.
 func DiscoverAccount(service string) (string, error) {
+	//nolint:gosec // G204: securityBin is the fixed /usr/bin/security path; service is a cc-pool-derived keychain service name
 	cmd := exec.Command(securityBin, "find-generic-password", "-s", service)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out

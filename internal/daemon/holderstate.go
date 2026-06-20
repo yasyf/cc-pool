@@ -367,8 +367,8 @@ func (h *holderState) recordDeep(dir string, err error) (logMsg string) {
 		}
 		h.deep[dir] = v
 	}
-	switch {
-	case err == nil:
+	switch err {
+	case nil:
 		if v.wedged {
 			logMsg = fmt.Sprintf("deep probe %s: recovered; the mirror reads live again", dir)
 		}

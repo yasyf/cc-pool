@@ -27,9 +27,9 @@ func newListCmd() *cobra.Command {
 					return nil
 				}
 				tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
-				fmt.Fprintln(tw, "ACCT\tLABEL\tOVERLAY\tCONFIG DIR\tKEYCHAIN SERVICE")
+				_, _ = fmt.Fprintln(tw, "ACCT\tLABEL\tOVERLAY\tCONFIG DIR\tKEYCHAIN SERVICE")
 				for _, a := range accts {
-					fmt.Fprintf(tw, "acct-%02d\t%s\t%s\t%s\t%s\n",
+					_, _ = fmt.Fprintf(tw, "acct-%02d\t%s\t%s\t%s\t%s\n",
 						a.ID, accountName(a.Label), a.OverlayKind, a.ConfigDir, a.KeychainService)
 				}
 				return tw.Flush()
@@ -99,10 +99,10 @@ func newEnvCmd() *cobra.Command {
 				// shareable .claude.json settings before the user execs claude.
 				mergeLaunchSettings(cmd, m, a)
 				out := cmd.OutOrStdout()
-				fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(a.ConfigDir))
+				_, _ = fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(a.ConfigDir))
 				// Pin claude's plugin root to the shared base so the session
 				// writes canonical ~/.claude plugin paths; see execEnv.
-				fmt.Fprintf(out, "export CLAUDE_CODE_PLUGIN_CACHE_DIR=%s\n", shellQuote(filepath.Join(pool.ClaudeDir(), "plugins")))
+				_, _ = fmt.Fprintf(out, "export CLAUDE_CODE_PLUGIN_CACHE_DIR=%s\n", shellQuote(filepath.Join(pool.ClaudeDir(), "plugins")))
 				return nil
 			})
 		},

@@ -154,7 +154,7 @@ func TestMirrorXattrPrivateEntryRouting(t *testing.T) {
 // can never land orphaned in the shared base.
 func TestMirrorXattrSidecarRouting(t *testing.T) {
 	fs := newMirrorFS("/base", "/priv", "/.claude.json")
-	cases := map[string]string{
+	cases := map[string]string{ //nolint:gosec // G101: a test fixture map of names, not real credentials
 		"/._.claude.json":              "/priv/._.claude.json",
 		"/._.claude.json.tmp.ab12cd34": "/priv/._.claude.json.tmp.ab12cd34",
 		"/._.credentials.json":         "/priv/._.credentials.json",
@@ -345,7 +345,7 @@ func TestSweepAppleDoubleLitter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got []string
+	got := make([]string, 0, len(entries))
 	for _, e := range entries {
 		got = append(got, e.Name())
 	}
@@ -375,7 +375,7 @@ func TestSpikeNamedattrMount(t *testing.T) {
 	if err := p.Setup(src, mnt); err != nil {
 		t.Fatalf("mount: %v", err)
 	}
-	defer p.Teardown(src, mnt)
+	defer func() { _ = p.Teardown(src, mnt) }()
 
 	assertNoSidecars := func(stage string) {
 		t.Helper()
@@ -401,7 +401,7 @@ func TestSpikeNamedattrMount(t *testing.T) {
 
 	const attr = "com.example.ccp-spike"
 	file := filepath.Join(mnt, "spike.txt")
-	if err := os.WriteFile(file, []byte("payload"), 0o644); err != nil {
+	if err := os.WriteFile(file, []byte("payload"), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatalf("write through mount: %v", err)
 	}
 	if err := unix.Setxattr(file, attr, []byte("v1"), 0); err != nil {

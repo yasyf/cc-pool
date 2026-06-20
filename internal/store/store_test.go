@@ -12,7 +12,7 @@ func openTest(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -86,13 +86,13 @@ func TestNextAccountIndex(t *testing.T) {
 	if n, _ := s.NextAccountIndex(); n != 1 {
 		t.Fatalf("first index = %d, want 1", n)
 	}
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-	s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 	if n, _ := s.NextAccountIndex(); n != 3 {
 		t.Fatalf("next index = %d, want 3", n)
 	}
 	// Remove 1 -> reused.
-	s.DeleteAccount(1)
+	_ = s.DeleteAccount(1)
 	if n, _ := s.NextAccountIndex(); n != 1 {
 		t.Fatalf("reused index = %d, want 1", n)
 	}
@@ -121,7 +121,7 @@ func TestMetaRoundTrip(t *testing.T) {
 
 func TestUsageSampleLatest(t *testing.T) {
 	s := openTest(t)
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 	old := UsageSample{AccountID: 1, TS: time.Now().Add(-time.Minute), Util5h: 10}
 	cur := UsageSample{AccountID: 1, TS: time.Now(), Util5h: 50, Resets5h: time.Now().Add(time.Hour), RateLimited: true}
 	if err := s.InsertUsageSample(old); err != nil {
@@ -184,7 +184,7 @@ func TestLatestGoodUsageSample(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			s := openTest(t)
-			s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+			_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 			for _, sp := range tc.samples {
 				if err := s.InsertUsageSample(UsageSample{
 					AccountID:   1,
@@ -220,7 +220,7 @@ func TestLatestGoodUsageSample(t *testing.T) {
 
 func TestUsageSampleExtraUsageRoundTrip(t *testing.T) {
 	s := openTest(t)
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 	in := UsageSample{AccountID: 1, TS: time.Now(), Util5h: 100, ExtraEnabled: true, ExtraUsed: 177, ExtraLimit: 5000}
 	if err := s.InsertUsageSample(in); err != nil {
 		t.Fatal(err)
@@ -240,8 +240,8 @@ func TestUsageSampleExtraUsageRoundTrip(t *testing.T) {
 
 func TestUsageSamplesSince(t *testing.T) {
 	s := openTest(t)
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-	s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s2", KeychainAccount: "u2"})
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s2", KeychainAccount: "u2"})
 	now := time.Now().Truncate(time.Second)
 	// acct 1: three samples spanning 90 minutes plus one older than the cutoff.
 	for _, sp := range []struct {
@@ -299,10 +299,10 @@ func TestSessionsReconcile(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
 	started := now.Add(-2 * SessionReapGrace) // old enough to reap
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 	id1, _ := s.OpenSession(1, 111, "b", "/proj", started)
-	s.OpenSession(1, 222, "b", "/proj", started)
-	s.OpenSession(1, 333, "b", "/proj", now) // fresh: inside the reap grace
+	_, _ = s.OpenSession(1, 222, "b", "/proj", started)
+	_, _ = s.OpenSession(1, 333, "b", "/proj", now) // fresh: inside the reap grace
 	if n, _ := s.ActiveSessionCount(1); n != 3 {
 		t.Fatalf("active = %d, want 3", n)
 	}
@@ -349,8 +349,8 @@ func mustActive(t *testing.T, s *Store) []Session {
 func TestCloseDeadSessionsEndsAtLastSeen(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
-	s.OpenSession(1, 555, "b", "/proj", now.Add(-5*time.Hour))
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	_, _ = s.OpenSession(1, 555, "b", "/proj", now.Add(-5*time.Hour))
 
 	// A reconcile 4h ago saw the pid alive; the process then died unobserved.
 	if _, err := s.CloseDeadSessions(map[int]bool{555: true}, now.Add(-4*time.Hour)); err != nil {
@@ -373,7 +373,7 @@ func TestCloseDeadSessionsEndsAtLastSeen(t *testing.T) {
 func TestGetCwdActivity(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 
 	act, err := s.GetCwdActivity("/proj", 1)
 	if err != nil || act.Live != 0 || !act.LastEnded.IsZero() {
@@ -382,14 +382,14 @@ func TestGetCwdActivity(t *testing.T) {
 
 	// One live, two ended (the later end must win), one unattributed
 	// (cwd-less) row, and one row on a DIFFERENT account in the same directory.
-	s.OpenSession(1, 100, "b", "/proj", now.Add(-3*time.Hour))
+	_, _ = s.OpenSession(1, 100, "b", "/proj", now.Add(-3*time.Hour))
 	early, _ := s.OpenSession(1, 200, "b", "/proj", now.Add(-2*time.Hour))
 	late, _ := s.OpenSession(1, 300, "b", "/proj", now.Add(-90*time.Minute))
-	s.CloseSession(early, now.Add(-time.Hour))
-	s.CloseSession(late, now.Add(-10*time.Minute))
-	s.OpenSession(1, 400, "b", "", now)
+	_ = s.CloseSession(early, now.Add(-time.Hour))
+	_ = s.CloseSession(late, now.Add(-10*time.Minute))
+	_, _ = s.OpenSession(1, 400, "b", "", now)
 	other, _ := s.OpenSession(2, 500, "c", "/proj", now.Add(-time.Hour))
-	s.CloseSession(other, now.Add(-time.Minute))
+	_ = s.CloseSession(other, now.Add(-time.Minute))
 
 	act, err = s.GetCwdActivity("/proj", 1)
 	if err != nil {
@@ -416,9 +416,9 @@ func TestDeleteStickyVersion(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
 
-	s.UpsertSticky("/proj", 1, now.Add(-2*time.Hour))
+	_ = s.UpsertSticky("/proj", 1, now.Add(-2*time.Hour))
 	// Concurrent writer repins before the stale delete lands.
-	s.PinManual("/proj", 2, now)
+	_ = s.PinManual("/proj", 2, now)
 	if err := s.DeleteStickyVersion("/proj", now.Add(-2*time.Hour), false); err != nil {
 		t.Fatal(err)
 	}
@@ -437,8 +437,8 @@ func TestDeleteStickyVersion(t *testing.T) {
 
 func TestSticky(t *testing.T) {
 	s := openTest(t)
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-	s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 
 	if _, ok, err := s.GetSticky("/proj"); ok || err != nil {
 		t.Fatalf("empty table: ok=%v err=%v", ok, err)
@@ -499,7 +499,7 @@ func TestPinManualAndDeleteSticky(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 
 	// PinManual overrides an existing auto pin.
-	s.UpsertSticky("/proj", 1, now.Add(-time.Minute))
+	_ = s.UpsertSticky("/proj", 1, now.Add(-time.Minute))
 	if err := s.PinManual("/proj", 2, now); err != nil {
 		t.Fatal(err)
 	}
@@ -532,27 +532,27 @@ func TestPruneSticky(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
 	cutoff := now.Add(-time.Hour)
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 
 	// /old: selected long ago, no sessions -> pruned (today's rule preserved).
-	s.UpsertSticky("/old", 1, now.Add(-2*time.Hour))
+	_ = s.UpsertSticky("/old", 1, now.Add(-2*time.Hour))
 	// /fresh: recent select -> survives.
-	s.UpsertSticky("/fresh", 1, now)
+	_ = s.UpsertSticky("/fresh", 1, now)
 	// /live: stale select but a live tracked session holds it.
-	s.UpsertSticky("/live", 1, now.Add(-3*time.Hour))
-	s.OpenSession(1, 100, "b", "/live", now.Add(-3*time.Hour))
+	_ = s.UpsertSticky("/live", 1, now.Add(-3*time.Hour))
+	_, _ = s.OpenSession(1, 100, "b", "/live", now.Add(-3*time.Hour))
 	// /warm: stale select, last session ended within the TTL.
-	s.UpsertSticky("/warm", 1, now.Add(-3*time.Hour))
+	_ = s.UpsertSticky("/warm", 1, now.Add(-3*time.Hour))
 	warm, _ := s.OpenSession(1, 200, "b", "/warm", now.Add(-3*time.Hour))
-	s.CloseSession(warm, now.Add(-30*time.Minute))
+	_ = s.CloseSession(warm, now.Add(-30*time.Minute))
 	// /cold: stale select, last session ended before the cutoff.
-	s.UpsertSticky("/cold", 1, now.Add(-3*time.Hour))
+	_ = s.UpsertSticky("/cold", 1, now.Add(-3*time.Hour))
 	cold, _ := s.OpenSession(1, 300, "b", "/cold", now.Add(-3*time.Hour))
-	s.CloseSession(cold, now.Add(-2*time.Hour))
+	_ = s.CloseSession(cold, now.Add(-2*time.Hour))
 	// /manual-new: never-used manual pin inside its 1h minimum.
-	s.PinManual("/manual-new", 1, now.Add(-30*time.Minute))
+	_ = s.PinManual("/manual-new", 1, now.Add(-30*time.Minute))
 	// /manual-old: never-used manual pin past its 1h minimum.
-	s.PinManual("/manual-old", 1, now.Add(-2*time.Hour))
+	_ = s.PinManual("/manual-old", 1, now.Add(-2*time.Hour))
 
 	n, err := s.PruneSticky(cutoff)
 	if err != nil {
@@ -575,8 +575,8 @@ func TestPruneSticky(t *testing.T) {
 
 func TestDeleteAccountRemovesSticky(t *testing.T) {
 	s := openTest(t)
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-	s.UpsertSticky("/proj", 1, time.Now())
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertSticky("/proj", 1, time.Now())
 	if err := s.DeleteAccount(1); err != nil {
 		t.Fatal(err)
 	}
@@ -587,11 +587,11 @@ func TestDeleteAccountRemovesSticky(t *testing.T) {
 
 func TestRefreshLog(t *testing.T) {
 	s := openTest(t)
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 	if _, ok, _ := s.LastRefresh(1); ok {
 		t.Fatal("expected no refresh yet")
 	}
-	s.LogRefresh(1, false, "boom")
+	_ = s.LogRefresh(1, false, "boom")
 	e, ok, err := s.LastRefresh(1)
 	if err != nil || !ok || e.OK || e.Err != "boom" {
 		t.Fatalf("last refresh = %+v ok=%v err=%v", e, ok, err)
@@ -600,7 +600,7 @@ func TestRefreshLog(t *testing.T) {
 
 func TestAuthHealthTransitions(t *testing.T) {
 	s := openTest(t)
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 
 	// No row → healthy.
 	if h, err := s.GetAuthHealth(1); err != nil || h.NeedsLogin {
@@ -654,8 +654,8 @@ func TestAuthHealthTransitions(t *testing.T) {
 
 func TestDeleteAccountRemovesAuthHealth(t *testing.T) {
 	s := openTest(t)
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-	s.SetNeedsLogin(1, time.Now(), "x")
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	_, _ = s.SetNeedsLogin(1, time.Now(), "x")
 	if err := s.DeleteAccount(1); err != nil {
 		t.Fatal(err)
 	}

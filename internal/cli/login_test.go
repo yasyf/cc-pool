@@ -68,7 +68,6 @@ func TestAwaitLogin(t *testing.T) {
 			t.Fatalf("outcome = %v err = %v, want awaitCanceled, context.Canceled", outcome, err)
 		}
 	})
-
 }
 
 func TestNewIdentityProbe(t *testing.T) {

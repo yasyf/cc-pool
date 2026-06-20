@@ -177,7 +177,7 @@ func TestSeedClaudeJSON(t *testing.T) {
 
 func readFile(t *testing.T, path string) []byte {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // G304: path is a cc-pool-managed/test-owned file, not external input
 	if err != nil {
 		t.Fatal(err)
 	}

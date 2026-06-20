@@ -13,21 +13,21 @@ import (
 type MergeOutcome string
 
 const (
-	// MergeApplied: base keys were merged in and the account file rewritten.
+	// MergeApplied means base keys were merged in and the account file rewritten.
 	MergeApplied MergeOutcome = "applied"
-	// MergeUnchanged: the account file already held every shareable base key;
+	// MergeUnchanged means the account file already held every shareable base key;
 	// nothing was written, so a live session's rewriter was never raced.
 	MergeUnchanged MergeOutcome = "unchanged"
-	// MergeNoBase: no ~/.claude.json exists; there is nothing to propagate.
+	// MergeNoBase means no ~/.claude.json exists; there is nothing to propagate.
 	MergeNoBase MergeOutcome = "no-base"
-	// MergeRecreated: the account file was missing and was recreated as
+	// MergeRecreated means the account file was missing and was recreated as
 	// base-minus-blacklist — no onboarding wizard, no inherited identity. The
 	// recreated file does mint a skeleton projects entry per base project
 	// carrying only overlay.ClaudeJSONSharedProjectKeys (desired: trust, MCP
 	// approvals, and local-scope MCP server definitions carry over, history and
 	// session state never do).
 	MergeRecreated MergeOutcome = "recreated"
-	// MergeSkippedOverlay: the account's recorded overlay kind is not symlink;
+	// MergeSkippedOverlay means the account's recorded overlay kind is not symlink;
 	// the fuse arm owns its own merged view, so the launch merge stays out.
 	MergeSkippedOverlay MergeOutcome = "skipped-overlay"
 )
@@ -49,7 +49,7 @@ func mergeClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (MergeOu
 		return "", fmt.Errorf("%s is a live mountpoint; refusing to merge through a mirror", accountDir)
 	}
 
-	base, err := os.ReadFile(srcPath)
+	base, err := os.ReadFile(srcPath) //nolint:gosec // G304: srcPath is the user's own ~/.claude.json resolved by cc-pool, not external input
 	if os.IsNotExist(err) {
 		return MergeNoBase, nil
 	}
@@ -59,7 +59,7 @@ func mergeClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (MergeOu
 
 	dst := filepath.Join(prov.PrivateRoot(accountDir), ".claude.json")
 	recreate := false
-	private, err := os.ReadFile(dst)
+	private, err := os.ReadFile(dst) //nolint:gosec // G304: dst is the account's own .claude.json under the cc-pool-managed config dir
 	if os.IsNotExist(err) {
 		// A copy stranded in the fuse private backing dir is the fingerprint
 		// of an interrupted conversion. Minting a fresh file here would make

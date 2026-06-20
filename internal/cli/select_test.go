@@ -26,7 +26,7 @@ func selectTestManager(t *testing.T) *pool.Manager {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	if err := st.UpsertAccount(store.Account{
 		ID: 5, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "work@example.com",
 		KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
@@ -313,6 +313,7 @@ func TestResolveSelectionMergesBaseSettings(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			m := exhaustedPoolManager(t) // sets HOME; accounts are symlink-kind
 			marker := []byte(`{"mergeMarker": "yes"}`)
+			//nolint:gosec // G703: HOME is the test's own t.TempDir(), not external input
 			if err := os.WriteFile(filepath.Join(os.Getenv("HOME"), ".claude.json"), marker, 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -325,7 +326,7 @@ func TestResolveSelectionMergesBaseSettings(t *testing.T) {
 			if err != nil || dir == "" {
 				t.Fatalf("selection must succeed: dir=%q err=%v", dir, err)
 			}
-			b, err := os.ReadFile(filepath.Join(dir, ".claude.json"))
+			b, err := os.ReadFile(filepath.Join(dir, ".claude.json")) //nolint:gosec // G304: path is a cc-pool-managed/test-owned file, not external input
 			if err != nil {
 				t.Fatalf("account .claude.json missing after launch merge: %v", err)
 			}
@@ -355,7 +356,7 @@ func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(home) })
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
 	t.Setenv("HOME", home)
 	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mergeMarker": "yes"}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -378,7 +379,7 @@ func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -393,7 +394,7 @@ func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
 				resp.Dir = dir
 			}
 			_ = json.NewEncoder(conn).Encode(resp)
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
@@ -442,7 +443,7 @@ func TestResolveSelectionMountsNotReadyError(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { os.RemoveAll(home) })
+			t.Cleanup(func() { _ = os.RemoveAll(home) })
 			t.Setenv("HOME", home)
 
 			st := openTestStore(t)
@@ -453,7 +454,7 @@ func TestResolveSelectionMountsNotReadyError(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { ln.Close() })
+			t.Cleanup(func() { _ = ln.Close() })
 			selectResp := tc.resp
 			go func() {
 				for {
@@ -470,7 +471,7 @@ func TestResolveSelectionMountsNotReadyError(t *testing.T) {
 						resp.Version = version.String()
 					}
 					_ = json.NewEncoder(conn).Encode(resp)
-					conn.Close()
+					_ = conn.Close()
 				}
 			}()
 
@@ -554,7 +555,7 @@ func TestMergeDaemonPick(t *testing.T) {
 // readSelectTestFile reads a file or fails the test.
 func readSelectTestFile(t *testing.T, path string) []byte {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // G304: path is a cc-pool-managed/test-owned file, not external input
 	if err != nil {
 		t.Fatal(err)
 	}

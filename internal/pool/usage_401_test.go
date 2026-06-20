@@ -122,7 +122,7 @@ func newManager401(t *testing.T, kc CredentialStore, fo *fakeOAuth401) (*Manager
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "acct-1-suffixed", KeychainAccount: "user", OverlayKind: "symlink"}
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)
@@ -165,7 +165,7 @@ func TestSampleUsageRevokedNotMaskedByRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "acct-1-suffixed", KeychainAccount: "user", OverlayKind: "symlink"}
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)

@@ -19,7 +19,7 @@ import (
 // readSnapshot reads and decodes the snapshot file, failing the test on any error.
 func readSnapshot(t *testing.T, path string) StatusSnapshot {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path is under the test's own t.TempDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,8 +332,10 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		// An exhausted account refilling inside the horizon: net is negative
 		// (recovering) and must reach the wire — the widget's "refilling"
 		// caption depends on it.
-		drained := AccountStatus{ID: 1, HasUsage: true, Remaining5h: 0, Remaining7d: 50,
-			Resets5h: now.Add(20 * time.Minute)}
+		drained := AccountStatus{
+			ID: 1, HasUsage: true, Remaining5h: 0, Remaining7d: 50,
+			Resets5h: now.Add(20 * time.Minute),
+		}
 		data, err := json.Marshal(NewStatusSnapshot([]AccountStatus{drained}, now))
 		if err != nil {
 			t.Fatal(err)

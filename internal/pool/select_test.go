@@ -56,7 +56,7 @@ func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { st.Close() })
+			t.Cleanup(func() { _ = st.Close() })
 			a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "s", KeychainAccount: "u"}
 			if err := st.UpsertAccount(a); err != nil {
 				t.Fatal(err)

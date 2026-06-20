@@ -29,4 +29,6 @@ func MountAlive(base, accountDir string) bool { return fusekit.MountAlive(base, 
 // alive — every liveness caller fails the same direction: a mirror that cannot
 // answer the stat is exactly the dead-or-wedged mount the check exists to flag.
 // It wraps fusekit.MountAliveWithin.
-func MountAliveWithin(base, accountDir string) bool { return fusekit.MountAliveWithin(base, accountDir) }
+func MountAliveWithin(base, accountDir string) bool {
+	return fusekit.MountAliveWithin(base, accountDir)
+}

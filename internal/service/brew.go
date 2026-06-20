@@ -13,6 +13,7 @@ const BrewLabel = "homebrew.mxcl." + FormulaName
 // brewServices runs `brew services <action> cc-pool`, streaming brew's
 // output to the user.
 func brewServices(action string) error {
+	//nolint:gosec // G204: a fixed `brew services <action> <FormulaName>` invocation; action is a cc-pool constant
 	cmd := exec.Command("brew", "services", action, FormulaName)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	return cmd.Run()
@@ -33,7 +34,7 @@ func BrewStart() error { return brewServices("start") }
 func BrewKickstart() error {
 	target := domainTarget() + "/" + BrewLabel
 	if out, err := launchctl("kickstart", target); err != nil {
-		return fmt.Errorf("launchctl kickstart %s: %v: %s", target, err, out)
+		return fmt.Errorf("launchctl kickstart %s: %w: %s", target, err, out)
 	}
 	return nil
 }

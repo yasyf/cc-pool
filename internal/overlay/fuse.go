@@ -1,6 +1,6 @@
 //go:build fuse && cgo && darwin
 
-// Package overlay's fuse provider: an in-process passthrough MIRROR of
+// Package overlay here defines the fuse provider: an in-process passthrough MIRROR of
 // ~/.claude mounted at an account dir via fuse-t (kext-less, NFS-over-loopback,
 // mounted as the user without root). A single backing dir means writes pass
 // straight through to ~/.claude and are shared live — no copy-up.
@@ -173,6 +173,7 @@ func buildMirrorConfig(base, dir string) fusekit.Config {
 // FuseProvider mounts a passthrough mirror of base at the account dir.
 type FuseProvider struct{}
 
+// Kind reports the provider kind (KindFuse).
 func (p *FuseProvider) Kind() Kind { return KindFuse }
 
 // PrivateRoot is the per-account backing dir beside the mountpoint. Private

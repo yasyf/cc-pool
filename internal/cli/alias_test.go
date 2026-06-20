@@ -65,7 +65,7 @@ func TestRCPath(t *testing.T) {
 		t.Run("bash "+c.name, func(t *testing.T) {
 			home := t.TempDir()
 			for _, f := range c.present {
-				if err := os.WriteFile(filepath.Join(home, f), nil, 0o644); err != nil {
+				if err := os.WriteFile(filepath.Join(home, f), nil, 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -120,7 +120,7 @@ func TestAliasInstalled(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), ".zshrc")
 			if c.write {
-				if err := os.WriteFile(path, []byte(c.content), 0o644); err != nil {
+				if err := os.WriteFile(path, []byte(c.content), 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -145,7 +145,7 @@ func TestAppendAlias(t *testing.T) {
 		if !res.Wrote || res.AlreadyPresent {
 			t.Fatalf("result = %+v, want Wrote", res)
 		}
-		data, err := os.ReadFile(filepath.Join(home, ".zshrc"))
+		data, err := os.ReadFile(filepath.Join(home, ".zshrc")) //nolint:gosec // G304: home is the test's own t.TempDir()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -160,7 +160,7 @@ func TestAppendAlias(t *testing.T) {
 		if _, err := appendAlias(shellZsh, home); err != nil {
 			t.Fatal(err)
 		}
-		first, err := os.ReadFile(filepath.Join(home, ".zshrc"))
+		first, err := os.ReadFile(filepath.Join(home, ".zshrc")) //nolint:gosec // G304: home/path is under the test's own t.TempDir()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -171,7 +171,7 @@ func TestAppendAlias(t *testing.T) {
 		if res.Wrote || !res.AlreadyPresent {
 			t.Fatalf("result = %+v, want AlreadyPresent", res)
 		}
-		second, err := os.ReadFile(filepath.Join(home, ".zshrc"))
+		second, err := os.ReadFile(filepath.Join(home, ".zshrc")) //nolint:gosec // G304: home/path is under the test's own t.TempDir()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -184,13 +184,13 @@ func TestAppendAlias(t *testing.T) {
 		home := t.TempDir()
 		prior := "export FOO=bar\n"
 		path := filepath.Join(home, ".zshrc")
-		if err := os.WriteFile(path, []byte(prior), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(prior), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := appendAlias(shellZsh, home); err != nil {
 			t.Fatal(err)
 		}
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path) //nolint:gosec // G304: home/path is under the test's own t.TempDir()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -215,7 +215,7 @@ func TestAppendAlias(t *testing.T) {
 		if err != nil || !info.IsDir() {
 			t.Fatalf("fish config dir not created: %v", err)
 		}
-		data, err := os.ReadFile(filepath.Join(home, ".config", "fish", "config.fish"))
+		data, err := os.ReadFile(filepath.Join(home, ".config", "fish", "config.fish")) //nolint:gosec // G304: path is a cc-pool-managed/test-owned file, not external input
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -228,7 +228,7 @@ func TestAppendAlias(t *testing.T) {
 		home := t.TempDir()
 		path := filepath.Join(home, ".zshrc")
 		prior := "alias claude='mine'\n"
-		if err := os.WriteFile(path, []byte(prior), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(prior), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		res, err := appendAlias(shellZsh, home)
@@ -238,7 +238,7 @@ func TestAppendAlias(t *testing.T) {
 		if res.Wrote || !res.AlreadyPresent {
 			t.Fatalf("result = %+v, want AlreadyPresent", res)
 		}
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path) //nolint:gosec // G304: path is a cc-pool-managed/test-owned file, not external input
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -249,7 +249,7 @@ func TestAppendAlias(t *testing.T) {
 
 	t.Run("bash routes to the existing bashrc", func(t *testing.T) {
 		home := t.TempDir()
-		if err := os.WriteFile(filepath.Join(home, ".bashrc"), nil, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(home, ".bashrc"), nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		res, err := appendAlias(shellBash, home)

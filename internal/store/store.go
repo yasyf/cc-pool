@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite" // registers the pure-Go "sqlite" database/sql driver
 )
 
 // Store wraps the sqlite connection.
@@ -87,7 +87,7 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(1) // serialize writes; sqlite + WAL is fine for our load
 	s := &Store{db: db}
 	if err := s.applySchema(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
@@ -204,7 +204,7 @@ func (s *Store) ListAccounts() ([]Account, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []Account
 	for rows.Next() {
 		a, err := scanAccount(rows)
@@ -232,7 +232,7 @@ func (s *Store) DeleteAccount(id int) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, q := range []string{
 		`DELETE FROM usage_samples WHERE account_id=?`,
 		`DELETE FROM sessions WHERE account_id=?`,
@@ -254,7 +254,7 @@ func (s *Store) NextAccountIndex() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	used := map[int]bool{}
 	for rows.Next() {
 		var id int
@@ -367,7 +367,7 @@ func (s *Store) UsageSamplesSince(accountID int, since time.Time) ([]UsageSample
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []UsageSample
 	for rows.Next() {
 		u, err := scanUsageSample(rows)
@@ -414,7 +414,7 @@ func (s *Store) ListActiveSessions() ([]Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []Session
 	for rows.Next() {
 		var se Session
@@ -667,7 +667,7 @@ func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := map[int]AuthHealth{}
 	for rows.Next() {
 		var h AuthHealth

@@ -58,7 +58,7 @@ func runStatusJSON(cmd *cobra.Command, m *pool.Manager, forceLive bool) error {
 	if err != nil {
 		return fmt.Errorf("encode status snapshot: %w", err)
 	}
-	fmt.Fprintln(cmd.OutOrStdout(), string(out))
+	_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(out))
 	return nil
 }
 
@@ -100,11 +100,11 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 		}
 		out := renderTable(snaps, pin)
 		if watch {
-			fmt.Fprint(cmd.OutOrStdout(), "\033[H\033[2J") // clear
+			_, _ = fmt.Fprint(cmd.OutOrStdout(), "\033[H\033[2J") // clear
 		}
-		fmt.Fprintln(cmd.OutOrStdout(), out)
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), out)
 		if line := holderFooter(holder); line != "" {
-			fmt.Fprintln(cmd.OutOrStdout(), line)
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 		}
 		return nil
 	}

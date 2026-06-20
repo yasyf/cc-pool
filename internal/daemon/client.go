@@ -27,7 +27,7 @@ func (c *Client) Available() bool {
 	if err != nil {
 		return false
 	}
-	conn.Close()
+	_ = conn.Close()
 	return true
 }
 
@@ -37,7 +37,7 @@ func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
 	if err != nil {
 		return nil, ErrDaemonUnavailable
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 
 	req.Proto = ProtocolVersion
@@ -109,7 +109,7 @@ func (c *Client) WaitGone(timeout time.Duration) bool {
 		if err != nil {
 			return true
 		}
-		conn.Close()
+		_ = conn.Close()
 		time.Sleep(100 * time.Millisecond)
 	}
 	return false

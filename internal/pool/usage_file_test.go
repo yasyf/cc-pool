@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -52,7 +53,7 @@ func TestRefreshUsesFileBackendWhenKeychainEmpty(t *testing.T) {
 	}
 
 	// The Keychain was never written — the account stays on the file backend.
-	if _, err := fk.Read(a.KeychainService, a.KeychainAccount); err != keychain.ErrNotFound {
+	if _, err := fk.Read(a.KeychainService, a.KeychainAccount); !errors.Is(err, keychain.ErrNotFound) {
 		t.Fatal("refresh wrote the credential to the Keychain instead of the file")
 	}
 }

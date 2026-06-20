@@ -44,6 +44,6 @@ func TestNewRemoteFuse(t *testing.T) {
 
 // TestRemoteFuseImplementsProvider is a runtime restatement of the compile-time
 // assertion in remotefuse.go: the adapter satisfies overlay.Provider.
-func TestRemoteFuseImplementsProvider(t *testing.T) {
+func TestRemoteFuseImplementsProvider(_ *testing.T) {
 	var _ overlay.Provider = newRemoteFuse()
 }

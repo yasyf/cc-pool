@@ -212,10 +212,14 @@ func TestUsableForSticky(t *testing.T) {
 		{"exactly at floor", Result{Available: true, Components: Components{RawRemaining5h: StickyMinRemaining5h}}, true},
 		// The incident shape: exhausted with an imminent reset — eff5 is high but
 		// the pin must be abandoned. Raw remaining, not eff, drives the floor.
-		{"exhausted despite high eff5", Result{Available: false, Exhausted: true,
-			Components: Components{Eff5: 93, RawRemaining5h: 0}}, false},
-		{"high eff cannot mask low raw", Result{Available: true,
-			Components: Components{Eff5: 95, RawRemaining5h: 5}}, false},
+		{"exhausted despite high eff5", Result{
+			Available: false, Exhausted: true,
+			Components: Components{Eff5: 93, RawRemaining5h: 0},
+		}, false},
+		{"high eff cannot mask low raw", Result{
+			Available:  true,
+			Components: Components{Eff5: 95, RawRemaining5h: 5},
+		}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -234,27 +238,41 @@ func TestExhaustedGate(t *testing.T) {
 		wantExhausted bool
 		wantAvailable bool
 	}{
-		{"pegged 5h, future reset",
+		{
+			"pegged 5h, future reset",
 			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 100, Resets5h: now.Add(20 * time.Minute)},
-			true, false},
-		{"pegged 5h, past reset (stale pre-poll sample)",
+			true, false,
+		},
+		{
+			"pegged 5h, past reset (stale pre-poll sample)",
 			Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-2 * time.Minute), Util5h: 100, Resets5h: now.Add(-time.Minute)},
-			false, true},
-		{"pegged 5h, unknown reset",
+			false, true,
+		},
+		{
+			"pegged 5h, unknown reset",
 			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 100},
-			false, true},
-		{"util 99 below threshold",
+			false, true,
+		},
+		{
+			"util 99 below threshold",
 			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 99, Resets5h: now.Add(20 * time.Minute)},
-			false, true},
-		{"pegged 7d, future reset",
+			false, true,
+		},
+		{
+			"pegged 7d, future reset",
 			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util7d: 100, Resets7d: now.Add(24 * time.Hour)},
-			true, false},
-		{"never sampled",
+			true, false,
+		},
+		{
+			"never sampled",
 			Input{AccountID: 1, HasUsage: false},
-			false, true},
-		{"rate-limited and exhausted",
+			false, true,
+		},
+		{
+			"rate-limited and exhausted",
 			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 100, Resets5h: now.Add(20 * time.Minute), RateLimited: true},
-			true, false},
+			true, false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -278,20 +296,26 @@ func TestExhaustedUntilBindingReset(t *testing.T) {
 	now := time.Now()
 	reset5, reset7 := now.Add(20*time.Minute), now.Add(3*24*time.Hour)
 
-	sevenOnly := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now,
-		Util5h: 20, Util7d: 100, Resets5h: reset5, Resets7d: reset7}, now)
+	sevenOnly := Score(Input{
+		AccountID: 1, HasUsage: true, SampleTS: now,
+		Util5h: 20, Util7d: 100, Resets5h: reset5, Resets7d: reset7,
+	}, now)
 	if !sevenOnly.Exhausted || !sevenOnly.ExhaustedUntil.Equal(reset7) {
 		t.Fatalf("7d-only exhaustion must recover at the 7d reset: %+v", sevenOnly)
 	}
 
-	both := Score(Input{AccountID: 2, HasUsage: true, SampleTS: now,
-		Util5h: 100, Util7d: 100, Resets5h: reset5, Resets7d: reset7}, now)
+	both := Score(Input{
+		AccountID: 2, HasUsage: true, SampleTS: now,
+		Util5h: 100, Util7d: 100, Resets5h: reset5, Resets7d: reset7,
+	}, now)
 	if !both.ExhaustedUntil.Equal(reset7) {
 		t.Fatalf("both-windows exhaustion must recover at the LATEST reset, got %v", both.ExhaustedUntil)
 	}
 
-	fiveOnly := Score(Input{AccountID: 3, HasUsage: true, SampleTS: now,
-		Util5h: 100, Util7d: 10, Resets5h: reset5, Resets7d: reset7}, now)
+	fiveOnly := Score(Input{
+		AccountID: 3, HasUsage: true, SampleTS: now,
+		Util5h: 100, Util7d: 10, Resets5h: reset5, Resets7d: reset7,
+	}, now)
 	if !fiveOnly.ExhaustedUntil.Equal(reset5) {
 		t.Fatalf("5h-only exhaustion must recover at the 5h reset, got %v", fiveOnly.ExhaustedUntil)
 	}
@@ -302,15 +326,19 @@ func TestExhaustedUntilBindingReset(t *testing.T) {
 // window already refilled, mirroring the gate's and windowFrac's self-lift.
 func TestRawRemainingSelfLiftsAtReset(t *testing.T) {
 	now := time.Now()
-	r := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-2 * time.Minute),
-		Util5h: 100, Resets5h: now.Add(-time.Minute), Burn5hPerHour: 50}, now)
+	r := Score(Input{
+		AccountID: 1, HasUsage: true, SampleTS: now.Add(-2 * time.Minute),
+		Util5h: 100, Resets5h: now.Add(-time.Minute), Burn5hPerHour: 50,
+	}, now)
 	if r.Components.RawRemaining5h != 100 {
 		t.Fatalf("raw remaining must self-lift at the reset, got %.1f", r.Components.RawRemaining5h)
 	}
 	// The refilled window scores exactly like a genuinely-full one with the
 	// same burn (the burn-derived runway penalty legitimately remains).
-	full := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-2 * time.Minute),
-		Util5h: 0, Burn5hPerHour: 50}, now)
+	full := Score(Input{
+		AccountID: 1, HasUsage: true, SampleTS: now.Add(-2 * time.Minute),
+		Util5h: 0, Burn5hPerHour: 50,
+	}, now)
 	if r.Components.Barrier5h != 0 || r.Components.RunwayPenalty != full.Components.RunwayPenalty {
 		t.Fatalf("post-reset sample must score as a full window: barrier=%.1f runway=%.1f want runway=%.1f",
 			r.Components.Barrier5h, r.Components.RunwayPenalty, full.Components.RunwayPenalty)
@@ -319,8 +347,10 @@ func TestRawRemainingSelfLiftsAtReset(t *testing.T) {
 		t.Fatal("a sticky pin must survive the post-reset poll gap")
 	}
 	// Control: the same sample pre-reset keeps the full penalties.
-	pre := Score(Input{AccountID: 2, HasUsage: true, SampleTS: now,
-		Util5h: 100, Resets5h: now.Add(time.Minute), Burn5hPerHour: 50}, now)
+	pre := Score(Input{
+		AccountID: 2, HasUsage: true, SampleTS: now,
+		Util5h: 100, Resets5h: now.Add(time.Minute), Burn5hPerHour: 50,
+	}, now)
 	if pre.Components.RawRemaining5h != 0 || pre.Components.Barrier5h != BarrierKnee {
 		t.Fatalf("pre-reset pegged sample must keep raw=0/full barrier: %+v", pre.Components)
 	}

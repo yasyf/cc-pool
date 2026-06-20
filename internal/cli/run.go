@@ -87,6 +87,7 @@ func execClaude(configDir string, args []string) error {
 		return fmt.Errorf("`claude` not found on PATH: %w", err)
 	}
 	argv := append([]string{"claude"}, args...)
+	//nolint:gosec // G204: bin is the resolved claude executable; argv are this CLI's own passthrough args
 	if err := syscall.Exec(bin, argv, execEnv(os.Environ(), configDir)); err != nil {
 		return fmt.Errorf("exec claude: %w", err)
 	}

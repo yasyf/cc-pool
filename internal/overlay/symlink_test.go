@@ -11,15 +11,15 @@ func makeBase(t *testing.T) string {
 	t.Helper()
 	base := t.TempDir()
 	for _, d := range []string{"projects", "skills", "daemon", "ide", "backups"} {
-		if err := os.MkdirAll(filepath.Join(base, d), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(base, d), 0o750); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// A backup in base must never become visible to accounts.
-	if err := os.WriteFile(filepath.Join(base, "backups", "seed.bak"), []byte("b"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, "backups", "seed.bak"), []byte("b"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte("{}"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// A .claude.json in base (private file) must never be linked into accounts.
@@ -35,7 +35,7 @@ func makeBase(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(base, "remote-settings.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(base, ".DS_Store"), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, ".DS_Store"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return base
@@ -110,7 +110,7 @@ func TestSymlinkSetupSharesAndExcludes(t *testing.T) {
 // file must stay exactly as written.
 func TestCredentialsFileNeverShared(t *testing.T) {
 	base := makeBase(t)
-	want, err := os.ReadFile(filepath.Join(base, ".credentials.json"))
+	want, err := os.ReadFile(filepath.Join(base, ".credentials.json")) //nolint:gosec // G304: base is under the test's own t.TempDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestCredentialsFileNeverShared(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(acct, ".credentials.json")); !os.IsNotExist(err) {
 		t.Fatalf("Sync linked .credentials.json into the account dir")
 	}
-	if got, _ := os.ReadFile(filepath.Join(base, ".credentials.json")); string(got) != string(want) {
+	if got, _ := os.ReadFile(filepath.Join(base, ".credentials.json")); string(got) != string(want) { //nolint:gosec // G304: base is under the test's own t.TempDir()
 		t.Fatalf("base .credentials.json was modified: got %q, want %q", got, want)
 	}
 }
@@ -191,7 +191,7 @@ func TestPrivateEntry(t *testing.T) {
 func TestSyncSkipsPreexistingLastUpdateResult(t *testing.T) {
 	base := makeBase(t)
 	// Base (~/.claude) has its own copy, so Sync iterates over the name.
-	if err := os.WriteFile(filepath.Join(base, ".last-update-result.json"), []byte("{}"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, ".last-update-result.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	acct := filepath.Join(t.TempDir(), "acct-01")
@@ -200,7 +200,7 @@ func TestSyncSkipsPreexistingLastUpdateResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Simulate claude's atomic write: a real (non-symlink) file in the account dir.
-	if err := os.WriteFile(filepath.Join(acct, ".last-update-result.json"), []byte("{}"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(acct, ".last-update-result.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// A re-sync (what the daemon poll does) must not error on the real file.
@@ -243,7 +243,7 @@ func TestSyncSkipsPreexistingRemoteSettings(t *testing.T) {
 	if fi.Mode()&os.ModeSymlink != 0 {
 		t.Error("remote-settings.json should stay a private real file, not a symlink")
 	}
-	if got, _ := os.ReadFile(filepath.Join(acct, "remote-settings.json")); string(got) != `{"acct":1}` {
+	if got, _ := os.ReadFile(filepath.Join(acct, "remote-settings.json")); string(got) != `{"acct":1}` { //nolint:gosec // G304: acct is under the test's own t.TempDir()
 		t.Errorf("account remote-settings.json content = %q, want %q", got, `{"acct":1}`)
 	}
 }
@@ -278,7 +278,7 @@ func TestSyncRemovesStaleLinkAtPrivateName(t *testing.T) {
 		t.Fatalf("Health after self-heal: %v", err)
 	}
 	// Base's copy survives untouched.
-	if got, _ := os.ReadFile(filepath.Join(base, "remote-settings.json")); string(got) != "{}" {
+	if got, _ := os.ReadFile(filepath.Join(base, "remote-settings.json")); string(got) != "{}" { //nolint:gosec // G304: base is under the test's own t.TempDir()
 		t.Errorf("base remote-settings.json content = %q, want %q", got, "{}")
 	}
 }
@@ -296,13 +296,13 @@ func TestSyncContinuesPastConflictAndJoinsErrors(t *testing.T) {
 	}
 	// Claude lazily writes two real files into the account dir...
 	for _, name := range []string{"aaa.json", "mmm.json"} {
-		if err := os.WriteFile(filepath.Join(acct, name), []byte("acct"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(acct, name), []byte("acct"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// ...then base gains the same names plus one that sorts after both.
 	for _, name := range []string{"aaa.json", "mmm.json", "zzz.json"} {
-		if err := os.WriteFile(filepath.Join(base, name), []byte("base"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(base, name), []byte("base"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -322,7 +322,7 @@ func TestSyncContinuesPastConflictAndJoinsErrors(t *testing.T) {
 	}
 	// The conflicting real files are never clobbered.
 	for _, name := range []string{"aaa.json", "mmm.json"} {
-		if got, _ := os.ReadFile(filepath.Join(acct, name)); string(got) != "acct" {
+		if got, _ := os.ReadFile(filepath.Join(acct, name)); string(got) != "acct" { //nolint:gosec // G304: acct is under the test's own t.TempDir()
 			t.Errorf("conflict file %q clobbered: content = %q, want %q", name, got, "acct")
 		}
 	}
@@ -336,7 +336,7 @@ func TestWriteThroughSymlinkLandsInBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Writing through the account's projects symlink must land in base.
-	if err := os.WriteFile(filepath.Join(acct, "projects", "x.json"), []byte("1"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(acct, "projects", "x.json"), []byte("1"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(base, "projects", "x.json")); err != nil {
@@ -381,10 +381,10 @@ func TestSyncSharesPlans(t *testing.T) {
 
 	// A plan written through acct-01 is visible through acct-02 (shared) and
 	// physically lands in base.
-	if err := os.WriteFile(filepath.Join(acct1, "plans", "p.md"), []byte("plan"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(acct1, "plans", "p.md"), []byte("plan"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(filepath.Join(acct2, "plans", "p.md"))
+	got, err := os.ReadFile(filepath.Join(acct2, "plans", "p.md")) //nolint:gosec // G304: acct2 is under the test's own t.TempDir()
 	if err != nil {
 		t.Fatalf("plan not visible to the second account: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestSyncPicksUpNewEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	// New top-level entry appears in base after setup.
-	if err := os.MkdirAll(filepath.Join(base, "plugins"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(base, "plugins"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.Health(base, acct); err == nil {

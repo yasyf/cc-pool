@@ -162,7 +162,7 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 		// pending TCC grant retry next poll; only a genuine mount failure
 		// falls back to symlink, and only when the account is idle.
 		if a.OverlayKind == string(overlay.KindFuse) {
-			s.healFuse(a)
+			s.healFuse(ctx, a)
 		}
 	}
 
@@ -258,14 +258,14 @@ func (s *Server) flagNeedsLogin(a store.Account, err error) {
 	}
 }
 
-// jitter returns a deterministic-ish jitter in [0, max) derived from seed,
+// jitter returns a deterministic-ish jitter in [0, span) derived from seed,
 // avoiding Math.random (unavailable / non-reproducible).
-func jitter(max time.Duration, seed int64) time.Duration {
-	if max <= 0 {
+func jitter(span time.Duration, seed int64) time.Duration {
+	if span <= 0 {
 		return 0
 	}
 	if seed < 0 {
 		seed = -seed
 	}
-	return time.Duration(seed % int64(max))
+	return time.Duration(seed % int64(span))
 }

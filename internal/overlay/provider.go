@@ -23,6 +23,7 @@ import "strings"
 // Kind identifies an overlay provider.
 type Kind string
 
+// Supported overlay provider kinds.
 const (
 	KindSymlink Kind = "symlink"
 	KindFuse    Kind = "fuse"

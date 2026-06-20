@@ -93,6 +93,7 @@ func Read(service, account string) (*Credential, error) {
 
 // readRaw returns the raw secret bytes for (service, account).
 func readRaw(service, account string) ([]byte, error) {
+	//nolint:gosec // G204: securityBin is the fixed /usr/bin/security path; account/service are cc-pool-derived keychain identifiers
 	cmd := exec.Command(securityBin,
 		"find-generic-password", "-a", account, "-s", service, "-w")
 	var out, errb bytes.Buffer
@@ -128,6 +129,7 @@ func Write(service, account string, cred *Credential) error {
 
 func writeRaw(service, account string, blob []byte) error {
 	hexed := hex.EncodeToString(blob)
+	//nolint:gosec // G204: securityBin is the fixed /usr/bin/security path; account/service/hexed are cc-pool-derived, not external input
 	cmd := exec.Command(securityBin,
 		"add-generic-password", "-U", "-a", account, "-s", service, "-X", hexed)
 	var errb bytes.Buffer
@@ -143,6 +145,7 @@ func Delete(service, account string) error {
 	if account == "" {
 		account = AccountLabel()
 	}
+	//nolint:gosec // G204: securityBin is the fixed /usr/bin/security path; account/service are cc-pool-derived keychain identifiers
 	cmd := exec.Command(securityBin,
 		"delete-generic-password", "-a", account, "-s", service)
 	var errb bytes.Buffer

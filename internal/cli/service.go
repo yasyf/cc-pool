@@ -69,25 +69,25 @@ func newServiceCmd() *cobra.Command {
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				out := cmd.OutOrStdout()
 				if service.IsBrewManaged() {
-					fmt.Fprintln(out, "Management: Homebrew (brew services)")
+					_, _ = fmt.Fprintln(out, "Management: Homebrew (brew services)")
 					if info, err := service.BrewInfo(); err == nil {
-						fmt.Fprintln(out, info)
+						_, _ = fmt.Fprintln(out, info)
 					}
 				} else {
-					fmt.Fprintf(out, "Management: self-managed LaunchAgent (loaded: %v)\n", service.Loaded())
+					_, _ = fmt.Fprintf(out, "Management: self-managed LaunchAgent (loaded: %v)\n", service.Loaded())
 				}
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
-					fmt.Fprintf(out, "Daemon: running (%s)\n", resp.Version)
+					_, _ = fmt.Fprintf(out, "Daemon: running (%s)\n", resp.Version)
 				} else {
-					fmt.Fprintln(out, "Daemon: not responding")
+					_, _ = fmt.Fprintln(out, "Daemon: not responding")
 				}
-				fmt.Fprintf(out, "Socket: %s\n", pool.SocketPath())
+				_, _ = fmt.Fprintf(out, "Socket: %s\n", pool.SocketPath())
 				fuseRows, err := fuseAccountRows()
 				if err != nil {
 					return err
 				}
 				if line := holderStatusLine(mountd.NewClient(pool.MountsSocketPath()), fuseRows); line != "" {
-					fmt.Fprintln(out, line)
+					_, _ = fmt.Fprintln(out, line)
 				}
 				return nil
 			},

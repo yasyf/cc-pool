@@ -29,7 +29,7 @@ func writeFile(t *testing.T, path, content string) {
 
 func readFile(t *testing.T, path string) string {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // G304: path is under the test's own t.TempDir()
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
@@ -46,7 +46,7 @@ func TestMovePrivateEntries(t *testing.T) {
 	}{
 		{
 			name: "moves identity, credential, and tmp siblings",
-			setup: func(t *testing.T, from, to string) {
+			setup: func(t *testing.T, from, _ string) {
 				writeFile(t, filepath.Join(from, ".claude.json"), `{"oauthAccount":"a"}`)
 				writeFile(t, filepath.Join(from, ".credentials.json"), "secret")
 				writeFile(t, filepath.Join(from, ".claude.json.tmp.ab12"), "tmp")
@@ -72,7 +72,7 @@ func TestMovePrivateEntries(t *testing.T) {
 		},
 		{
 			name: "moves excluded dirs with nested contents",
-			setup: func(t *testing.T, from, to string) {
+			setup: func(t *testing.T, from, _ string) {
 				writeFile(t, filepath.Join(from, "backups", "2026", "x.bak"), "bak")
 				writeFile(t, filepath.Join(from, "daemon", "roster.json"), "roster")
 			},
@@ -90,7 +90,7 @@ func TestMovePrivateEntries(t *testing.T) {
 		},
 		{
 			name: "leaves shared symlinks and unclassified entries alone",
-			setup: func(t *testing.T, from, to string) {
+			setup: func(t *testing.T, from, _ string) {
 				if err := os.Symlink("/tmp/elsewhere", filepath.Join(from, "projects")); err != nil {
 					t.Fatal(err)
 				}
@@ -117,7 +117,7 @@ func TestMovePrivateEntries(t *testing.T) {
 					t.Fatalf("first run: %v", err)
 				}
 			},
-			verify: func(t *testing.T, from, to string) {
+			verify: func(t *testing.T, _, to string) {
 				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "id" {
 					t.Errorf(".claude.json = %q, want id", got)
 				}
@@ -129,7 +129,7 @@ func TestMovePrivateEntries(t *testing.T) {
 				writeFile(t, filepath.Join(to, ".claude.json"), "already-moved")
 				writeFile(t, filepath.Join(from, "backups", "b.bak"), "bak")
 			},
-			verify: func(t *testing.T, from, to string) {
+			verify: func(t *testing.T, _, to string) {
 				if got := readFile(t, filepath.Join(to, ".claude.json")); got != "already-moved" {
 					t.Errorf(".claude.json = %q, want already-moved", got)
 				}
@@ -311,7 +311,7 @@ func TestMovePrivateEntries(t *testing.T) {
 				writeFile(t, filepath.Join(from, "backups", ".DS_Store"), "cruft")
 				writeFile(t, filepath.Join(from, "backups", "b.bak"), "bak")
 			},
-			verify: func(t *testing.T, from, to string) {
+			verify: func(t *testing.T, _, to string) {
 				if _, err := os.Lstat(filepath.Join(to, "backups", ".DS_Store")); !os.IsNotExist(err) {
 					t.Error(".DS_Store merged instead of dropped")
 				}
@@ -322,7 +322,7 @@ func TestMovePrivateEntries(t *testing.T) {
 		},
 		{
 			name: "stale symlink at a private name is removed, not moved",
-			setup: func(t *testing.T, from, to string) {
+			setup: func(t *testing.T, from, _ string) {
 				if err := os.Symlink("/tmp/elsewhere", filepath.Join(from, ".claude.json")); err != nil {
 					t.Fatal(err)
 				}
@@ -387,7 +387,7 @@ func TestHasPrivateEntries(t *testing.T) {
 	}{
 		{
 			name:  "missing dir has none",
-			setup: func(t *testing.T, dir string) { os.RemoveAll(dir) },
+			setup: func(_ *testing.T, dir string) { _ = os.RemoveAll(dir) },
 			want:  false,
 		},
 		{

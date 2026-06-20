@@ -39,7 +39,7 @@ func tempHome(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(home) })
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
 	t.Setenv("HOME", home)
 	return home
 }
@@ -54,7 +54,7 @@ func seedAccounts(t *testing.T, accts ...store.Account) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	for _, a := range accts {
 		if a.KeychainService == "" {
 			a.KeychainService = "ccp-test-missing"
@@ -73,7 +73,7 @@ func seedAccounts(t *testing.T, accts ...store.Account) {
 func stubStopDaemon(t *testing.T) *bool {
 	t.Helper()
 	called := false
-	swapVar(t, &stopDaemon, func(cmd *cobra.Command) error {
+	swapVar(t, &stopDaemon, func(_ *cobra.Command) error {
 		called = true
 		return nil
 	})
@@ -117,7 +117,7 @@ func startFakeHolder(t *testing.T, fh *fakeHolder) *fakeHolder {
 		t.Fatal(err)
 	}
 	fh.ln = ln
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go fh.serve()
 	return fh
 }
@@ -130,7 +130,7 @@ func (f *fakeHolder) serve() {
 		}
 		var req mountd.Request
 		if err := json.NewDecoder(conn).Decode(&req); err != nil {
-			conn.Close() // Available() probes dial-and-close; not an op
+			_ = conn.Close() // Available() probes dial-and-close; not an op
 			continue
 		}
 		f.mu.Lock()
@@ -149,9 +149,9 @@ func (f *fakeHolder) serve() {
 			resp.Mounts = f.shutdownFailed
 		}
 		_ = json.NewEncoder(conn).Encode(resp)
-		conn.Close()
+		_ = conn.Close()
 		if req.Op == mountd.OpShutdown && f.closeOnShutdown {
-			f.ln.Close()
+			_ = f.ln.Close()
 			return
 		}
 	}
@@ -352,7 +352,7 @@ func TestUninstallEscalatesToKillOnWedgedHolder(t *testing.T) {
 			return 0, fmt.Errorf("kill aimed at %q, want the holder socket", socket)
 		}
 		killed = true
-		fh.ln.Close() // the "kill" releases the socket
+		_ = fh.ln.Close() // the "kill" releases the socket
 		return 4242, nil
 	})
 
@@ -418,7 +418,7 @@ func TestUninstallSurvivorMount(t *testing.T) {
 			if serr != nil {
 				t.Fatalf("reopen store: %v", serr)
 			}
-			defer st.Close()
+			defer func() { _ = st.Close() }()
 			accts, lerr := st.ListAccounts()
 			if lerr != nil {
 				t.Fatalf("list accounts: %v", lerr)

@@ -13,12 +13,12 @@ import (
 type SeedOutcome string
 
 const (
-	// SeedCopied: ~/.claude.json was copied in with oauthAccount stripped.
+	// SeedCopied means ~/.claude.json was copied in with oauthAccount stripped.
 	SeedCopied SeedOutcome = "copied"
-	// SeedNoSource: no ~/.claude.json exists; claude onboards fresh (correct —
+	// SeedNoSource means no ~/.claude.json exists; claude onboards fresh (correct —
 	// there is nothing to inherit).
 	SeedNoSource SeedOutcome = "no-source"
-	// SeedKeptExisting: the account already holds logged-in state (a prior add
+	// SeedKeptExisting means the account already holds logged-in state (a prior add
 	// completed its login but was not finalized); it is left untouched.
 	SeedKeptExisting SeedOutcome = "kept-existing"
 )
@@ -44,7 +44,7 @@ const (
 func seedClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (SeedOutcome, error) {
 	dst := filepath.Join(prov.PrivateRoot(accountDir), ".claude.json")
 
-	if existing, err := os.ReadFile(dst); err == nil {
+	if existing, err := os.ReadFile(dst); err == nil { //nolint:gosec // G304: dst is the account's own .claude.json under the cc-pool-managed config dir
 		var cur map[string]json.RawMessage
 		if json.Unmarshal(existing, &cur) == nil {
 			if _, ok := cur[overlay.OAuthAccountKey]; ok {
@@ -56,7 +56,7 @@ func seedClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (SeedOutc
 		return "", fmt.Errorf("read existing %s: %w", dst, err)
 	}
 
-	src, err := os.ReadFile(srcPath)
+	src, err := os.ReadFile(srcPath) //nolint:gosec // G304: srcPath is the user's own ~/.claude.json resolved by cc-pool
 	if os.IsNotExist(err) {
 		return SeedNoSource, nil
 	}

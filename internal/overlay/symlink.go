@@ -12,6 +12,7 @@ import (
 // top-level entries that appear in base later are picked up by Sync.
 type SymlinkProvider struct{}
 
+// Kind reports the provider kind (KindSymlink).
 func (p *SymlinkProvider) Kind() Kind { return KindSymlink }
 
 // PrivateRoot is accountDir itself: private files live directly in the

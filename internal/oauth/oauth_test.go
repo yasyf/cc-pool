@@ -20,7 +20,8 @@ func TestRefreshRequestAndResponse(t *testing.T) {
 		}
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &gotBody)
-		json.NewEncoder(w).Encode(TokenResponse{
+		//nolint:gosec // G117: a test fixture token response, not a real credential
+		_ = json.NewEncoder(w).Encode(TokenResponse{
 			AccessToken: "new-at", RefreshToken: "new-rt", ExpiresIn: 3600,
 		})
 	}))
@@ -50,7 +51,7 @@ func TestRefreshRequestAndResponse(t *testing.T) {
 }
 
 func TestRefreshRevoked(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
 	}))
 	defer srv.Close()
@@ -71,7 +72,7 @@ func TestUsageHeadersAndParsing(t *testing.T) {
 		if got := r.Header.Get("anthropic-beta"); got != betaHeader {
 			t.Errorf("anthropic-beta = %q, want %q", got, betaHeader)
 		}
-		io.WriteString(w, `{
+		_, _ = io.WriteString(w, `{
 			"five_hour":{"utilization":40.0,"resets_at":1700000000},
 			"seven_day":{"utilization":10.0,"resets_at":1700600000}
 		}`)
@@ -103,7 +104,7 @@ func TestUsageHeadersAndParsing(t *testing.T) {
 // rest without error. utilization is a percent in [0,100] (e.g. 13.0 == 13%).
 func TestUsageIgnoresUnknownWindows(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		io.WriteString(w, `{
+		_, _ = io.WriteString(w, `{
 			"five_hour":{"utilization":31.0,"resets_at":"2026-06-08T12:10:01+00:00"},
 			"seven_day":{"utilization":56.0,"resets_at":"2026-06-11T13:00:00+00:00"},
 			"seven_day_oauth_apps":null,
@@ -145,7 +146,7 @@ func TestUsageExtraUsageAbsent(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				io.WriteString(w, body)
+				_, _ = io.WriteString(w, body)
 			}))
 			defer srv.Close()
 			c := New()
@@ -205,7 +206,7 @@ func TestResetTimeDecoding(t *testing.T) {
 // resets_at as a string, which the old *float64 field could not decode.
 func TestUsageStringResetsAt(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		io.WriteString(w, `{"five_hour":{"utilization":40.0,"resets_at":"1700000000"}}`)
+		_, _ = io.WriteString(w, `{"five_hour":{"utilization":40.0,"resets_at":"1700000000"}}`)
 	}))
 	defer srv.Close()
 	c := New()
@@ -223,7 +224,7 @@ func TestUsageUserAgentSent(t *testing.T) {
 	var ua string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ua = r.Header.Get("User-Agent")
-		io.WriteString(w, `{"five_hour":{"utilization":50.0,"resets_at":1}}`)
+		_, _ = io.WriteString(w, `{"five_hour":{"utilization":50.0,"resets_at":1}}`)
 	}))
 	defer srv.Close()
 	c := New()
@@ -237,7 +238,7 @@ func TestUsageUserAgentSent(t *testing.T) {
 }
 
 func TestUsageRateLimited(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "slow down", http.StatusTooManyRequests)
 	}))
 	defer srv.Close()

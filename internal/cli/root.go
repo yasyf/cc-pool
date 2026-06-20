@@ -107,7 +107,7 @@ func withManager(fn func(*pool.Manager) error) error {
 	if err != nil {
 		return err
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 	return fn(m)
 }
 

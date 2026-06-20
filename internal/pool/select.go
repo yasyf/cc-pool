@@ -148,9 +148,11 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 		_, _ = m.Store.OpenSession(best.AccountID, opts.PID, byID[best.AccountID].ConfigDir, opts.Cwd, now)
 	}
 	bi := inByID[best.AccountID]
-	res := &SelectResult{Best: byID[best.AccountID], Result: best, Ranked: ranked,
+	res := &SelectResult{
+		Best: byID[best.AccountID], Result: best, Ranked: ranked,
 		Sticky: outcome == StickyBind, HasUsage: bi.HasUsage, Util5h: bi.Util5h, Util7d: bi.Util7d,
-		ExhaustedFallback: fallback, ExtraEnabled: extraByID[best.AccountID], byID: byID}
+		ExhaustedFallback: fallback, ExtraEnabled: extraByID[best.AccountID], byID: byID,
+	}
 	if outcome == StickyHoldManual {
 		held := pin.AccountID
 		res.PinHeldAccount = &held

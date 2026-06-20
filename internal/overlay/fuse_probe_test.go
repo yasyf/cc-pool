@@ -21,7 +21,7 @@ import (
 // deterministic (an empty base is vacuously live before the mount lands).
 func mountProbeMirror(t *testing.T, base, mnt string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(base, "hello.txt"), []byte("hi"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, "hello.txt"), []byte("hi"), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
 	p := &FuseProvider{}
@@ -36,7 +36,7 @@ func mountProbeMirror(t *testing.T, base, mnt string) {
 // returning that nonce.
 func readProbeThroughMount(t *testing.T, mnt string) uint64 {
 	t.Helper()
-	got, err := os.ReadFile(filepath.Join(mnt, ProbeFileName))
+	got, err := os.ReadFile(filepath.Join(mnt, ProbeFileName)) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatalf("read probe through mount: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestMirrorProbeFileRejectsWrites(t *testing.T) {
 	mountProbeMirror(t, base, mnt)
 	probePath := filepath.Join(mnt, ProbeFileName)
 	victim := filepath.Join(mnt, "victim.txt")
-	if err := os.WriteFile(victim, []byte("keep"), 0o644); err != nil {
+	if err := os.WriteFile(victim, []byte("keep"), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
 
@@ -137,30 +137,30 @@ func TestMirrorProbeFileRejectsWrites(t *testing.T) {
 		op   func() error
 	}{
 		{"open for write", func() error {
-			f, err := os.OpenFile(probePath, os.O_WRONLY, 0)
+			f, err := os.OpenFile(probePath, os.O_WRONLY, 0) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 			if err == nil {
-				f.Close()
+				_ = f.Close()
 			}
 			return err
 		}},
 		{"open read-write", func() error {
-			f, err := os.OpenFile(probePath, os.O_RDWR, 0)
+			f, err := os.OpenFile(probePath, os.O_RDWR, 0) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 			if err == nil {
-				f.Close()
+				_ = f.Close()
 			}
 			return err
 		}},
 		{"create over", func() error {
-			f, err := os.OpenFile(probePath, os.O_CREATE|os.O_WRONLY, 0o600)
+			f, err := os.OpenFile(probePath, os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 			if err == nil {
-				f.Close()
+				_ = f.Close()
 			}
 			return err
 		}},
 		{"create exclusive", func() error {
-			f, err := os.OpenFile(probePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+			f, err := os.OpenFile(probePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 			if err == nil {
-				f.Close()
+				_ = f.Close()
 			}
 			return err
 		}},
@@ -174,7 +174,7 @@ func TestMirrorProbeFileRejectsWrites(t *testing.T) {
 		{"chtimes", func() error { return os.Chtimes(probePath, time.Now(), time.Now()) }},
 		{"setxattr", func() error { return unix.Setxattr(probePath, "user.ccp-test", []byte("x"), 0) }},
 		{"removexattr", func() error { return unix.Removexattr(probePath, "user.ccp-test") }},
-		{"mkdir", func() error { return os.Mkdir(probePath, 0o755) }},
+		{"mkdir", func() error { return os.Mkdir(probePath, 0o755) }}, //nolint:gosec // G301: dir perms are intentional for this test's fixture layout
 		{"symlink onto", func() error { return os.Symlink(victim, probePath) }},
 		{"link onto", func() error { return os.Link(victim, probePath) }},
 		{"link away", func() error { return os.Link(probePath, filepath.Join(mnt, "hardlinked")) }},
@@ -211,7 +211,7 @@ func TestMirrorProbeFileShadowsRealBaseEntry(t *testing.T) {
 	base, mnt := t.TempDir(), t.TempDir()
 	basePath := filepath.Join(base, ProbeFileName)
 	junk := []byte("junk left by something that is not us")
-	if err := os.WriteFile(basePath, junk, 0o644); err != nil {
+	if err := os.WriteFile(basePath, junk, 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
 	before, err := os.Lstat(basePath)
@@ -264,7 +264,7 @@ func TestMirrorProbeFileShadowsRealBaseEntry(t *testing.T) {
 		}
 	}
 
-	back, err := os.ReadFile(basePath)
+	back, err := os.ReadFile(basePath) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		t.Fatalf("read real base entry: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestProbeFhRangeDisjoint(t *testing.T) {
 // call proves the guard holds if that reachability ever changes.
 func TestMirrorProbeOpsGuardedWithoutMount(t *testing.T) {
 	base, priv := t.TempDir(), t.TempDir()
-	if err := os.WriteFile(filepath.Join(base, "hello.txt"), []byte("hi"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, "hello.txt"), []byte("hi"), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
 	fs := newMirrorFS(base, priv, filepath.Join(t.TempDir(), ".claude.json"))
@@ -363,7 +363,7 @@ func TestMirrorProbeOpsGuardedWithoutMount(t *testing.T) {
 	// A shadowed base DIRECTORY named .ccp-probe is the one input where an
 	// unguarded Rmdir would delete from base.
 	shadowDir := filepath.Join(base, ProbeFileName)
-	if err := os.Mkdir(shadowDir, 0o755); err != nil {
+	if err := os.Mkdir(shadowDir, 0o755); err != nil { //nolint:gosec // G301: dir perms are intentional for this test's fixture layout
 		t.Fatal(err)
 	}
 	if st := fs.Rmdir(probeFusePath); st != -int(syscall.EPERM) {
@@ -382,7 +382,7 @@ func TestMirrorProbeOpsGuardedWithoutMount(t *testing.T) {
 	if st := fs.Chmod(probeFusePath, 0o600); st != -int(syscall.EPERM) {
 		t.Errorf("Chmod(%s) = %d, want -EPERM", probeFusePath, st)
 	}
-	if st := fs.Chown(probeFusePath, uint32(os.Getuid()), uint32(os.Getgid())); st != -int(syscall.EPERM) {
+	if st := fs.Chown(probeFusePath, uint32(os.Getuid()), uint32(os.Getgid())); st != -int(syscall.EPERM) { //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 		t.Errorf("Chown(%s) = %d, want -EPERM", probeFusePath, st)
 	}
 	if st := fs.Utimens(probeFusePath, []fuse.Timespec{{Sec: 1}, {Sec: 1}}); st != -int(syscall.EPERM) {
@@ -406,10 +406,10 @@ func TestMirrorProbeOpsGuardedWithoutMount(t *testing.T) {
 
 	// The filter is root-only: a nested .ccp-probe is an ordinary real file.
 	sub := filepath.Join(base, "projects")
-	if err := os.Mkdir(sub, 0o755); err != nil {
+	if err := os.Mkdir(sub, 0o755); err != nil { //nolint:gosec // G301: dir perms are intentional for this test's fixture layout
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sub, ProbeFileName), nil, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(sub, ProbeFileName), nil, 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
 	nested := map[string]bool{}

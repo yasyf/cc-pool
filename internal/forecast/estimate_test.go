@@ -60,7 +60,8 @@ func TestEstimate5h(t *testing.T) {
 				sample(now, 0, 50), sample(now, 6*time.Minute, 50),
 				sample(now, 12*time.Minute, 50),
 			},
-			false, Estimate{},
+			false,
+			Estimate{},
 		},
 		"projection at a future reset": {
 			// 50% used, 20%/hr, reset in 1h: 70% used at reset = 30% left.

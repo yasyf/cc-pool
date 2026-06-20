@@ -32,10 +32,10 @@ type fakeFuse struct {
 }
 
 func (f *fakeFuse) Kind() overlay.Kind            { return overlay.KindFuse }
-func (f *fakeFuse) Sync(base, dir string) error   { return nil }
-func (f *fakeFuse) Health(base, dir string) error { return nil }
+func (f *fakeFuse) Sync(_, _ string) error        { return nil }
+func (f *fakeFuse) Health(_, _ string) error      { return nil }
 func (f *fakeFuse) PrivateRoot(dir string) string { return overlay.FusePrivateRoot(dir) }
-func (f *fakeFuse) Setup(base, dir string) error {
+func (f *fakeFuse) Setup(_, dir string) error {
 	privIdentity := false
 	if _, err := os.Stat(filepath.Join(overlay.FusePrivateRoot(dir), ".claude.json")); err == nil {
 		privIdentity = true
@@ -59,7 +59,8 @@ func (f *fakeFuse) Setup(base, dir string) error {
 	f.created = mounted
 	return nil
 }
-func (f *fakeFuse) Teardown(base, dir string) error {
+
+func (f *fakeFuse) Teardown(_, _ string) error {
 	*f.ops = append(*f.ops, "fuse.teardown")
 	if f.teardownErr != nil {
 		return f.teardownErr
@@ -548,7 +549,7 @@ func TestHealResolvesDuplicatePrivateFile(t *testing.T) {
 	if err != nil || !healed {
 		t.Fatalf("heal with a duplicate private file: healed=%v err=%v, want true,nil", healed, err)
 	}
-	got, err := os.ReadFile(filepath.Join(dir, ".last-update-result.json"))
+	got, err := os.ReadFile(filepath.Join(dir, ".last-update-result.json")) //nolint:gosec // G304: dir is under the test's own t.TempDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,7 +613,7 @@ func TestSetDefaultOverlayKind(t *testing.T) {
 
 func readFileT(t *testing.T, path string) string {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // G304: path is under the test's own t.TempDir()
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}

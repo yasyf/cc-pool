@@ -158,7 +158,7 @@ func Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	s := &Server{
 		m:               m,
@@ -185,8 +185,8 @@ func Run(ctx context.Context) error {
 }
 
 // detectClaudeVersion runs `claude --version` (best-effort) to stamp the UA.
-func detectClaudeVersion() string {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+func detectClaudeVersion(ctx context.Context) string {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "claude", "--version").Output()
 	if err != nil {
@@ -209,7 +209,7 @@ func (s *Server) serve(ctx context.Context) error {
 	// may stale-check, remove, bind, or unlink the socket path. It must
 	// outlive the listener (Close releases it), so this defer is registered
 	// first and runs last.
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 	// closeListener unlinks the socket exactly once. *net.UnixListener.Close
 	// unlinks the socket file and is NOT idempotent: a second Close (the late
 	// deferred one, after a slow teardown) would delete a successor daemon's
@@ -250,7 +250,7 @@ func (s *Server) serve(ctx context.Context) error {
 	go func() {
 		defer s.wg.Done()
 		s.holder.refresh(s.holderClient())
-		oauth.SetUserAgentVersion(detectClaudeVersion())
+		oauth.SetUserAgentVersion(detectClaudeVersion(ctx))
 		s.reconcileOverlays(ctx)
 		// Supervision starts only after the startup reconcile so it never
 		// races the initial mounts; from here it owns crash→respawn→remount
@@ -319,18 +319,18 @@ func (s *Server) listen() (net.Listener, *os.File, error) {
 	// The lock is ours, but a live peer may predate the lock discipline (an
 	// old-version daemon holds no flock): evict or refuse it exactly as before.
 	if err := s.evictHolder(); err != nil {
-		lock.Close()
+		_ = lock.Close()
 		return nil, nil, err
 	}
 	_ = os.Remove(s.socket) // stale socket: the lock is ours and any live peer was evicted
 	ln, err := net.Listen("unix", s.socket)
 	if err != nil {
-		lock.Close()
+		_ = lock.Close()
 		return nil, nil, err
 	}
 	if err := os.Chmod(s.socket, 0o600); err != nil {
-		ln.Close()
-		lock.Close()
+		_ = ln.Close()
+		_ = lock.Close()
 		return nil, nil, err
 	}
 	return ln, lock, nil
@@ -353,15 +353,15 @@ func (s *Server) flockSocket() (*os.File, error) {
 	c := &Client{socket: s.socket}
 	resp, herr := c.Health()
 	if herr != nil {
-		lock.Close()
+		_ = lock.Close()
 		return nil, fmt.Errorf("another cc-pool daemon owns %s.lock but does not answer health yet (it may still be starting); refusing to start", s.socket)
 	}
 	if resp.Version == version.String() {
-		lock.Close()
+		_ = lock.Close()
 		return nil, errors.New("another cc-pool daemon at the same version is already running")
 	}
 	if err := s.evictPeer(c, resp.Version); err != nil {
-		lock.Close()
+		_ = lock.Close()
 		return nil, err
 	}
 	// Eviction is observed at socket death (WaitGone), but the peer's flock is
@@ -377,7 +377,7 @@ func (s *Server) flockSocket() (*os.File, error) {
 			return lock, nil
 		}
 		if time.Now().After(deadline) {
-			lock.Close()
+			_ = lock.Close()
 			return nil, fmt.Errorf("daemon lock still held %s after evicting the skewed peer: %w", s.evictTimeout, err)
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -426,7 +426,7 @@ func (s *Server) evictPeer(c *Client, ver string) error {
 // handle serves one connection. ctx is the daemon's lifecycle context (bounds
 // shutdown); the conn deadline independently bounds a single slow client.
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	var req Request
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
@@ -535,8 +535,10 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 				}
 				s.recordSticky(req.Cwd, sn.Account.ID)
 				id := sn.Account.ID
-				return Response{OK: true, Dir: sn.Account.ConfigDir, SelectedID: &id,
-					Remaining5h: sn.Remaining5h, Remaining7d: sn.Remaining7d, HasUsage: sn.HasUsage}
+				return Response{
+					OK: true, Dir: sn.Account.ConfigDir, SelectedID: &id,
+					Remaining5h: sn.Remaining5h, Remaining7d: sn.Remaining7d, HasUsage: sn.HasUsage,
+				}
 			}
 		}
 		return Response{OK: false, Error: fmt.Sprintf("account %d not found", *req.Account)}
@@ -639,10 +641,12 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 			s.log.Printf("acct-%02d preflight refresh: %v", best.Account.ID, err)
 		}
 	}()
-	resp := Response{OK: true, Dir: best.Account.ConfigDir, SelectedID: &id,
+	resp := Response{
+		OK: true, Dir: best.Account.ConfigDir, SelectedID: &id,
 		Sticky:      outcome == pool.StickyBind,
 		Remaining5h: best.Remaining5h, Remaining7d: best.Remaining7d, HasUsage: best.HasUsage,
-		ExhaustedFallback: fallback, ExtraEnabled: best.ExtraEnabled}
+		ExhaustedFallback: fallback, ExtraEnabled: best.ExtraEnabled,
+	}
 	if outcome == pool.StickyHoldManual {
 		held := pin.AccountID
 		resp.PinHeldAccount = &held
@@ -681,7 +685,7 @@ func runnerUp(ranked []score.Result, winnerID int, fallback bool) string {
 		if r.AccountID == winnerID {
 			continue
 		}
-		if !r.Available && !(fallback && !r.RateLimited) {
+		if !r.Available && (!fallback || r.RateLimited) {
 			continue
 		}
 		return fmt.Sprintf(" · runner-up acct-%02d %.1f", r.AccountID, r.Score)
@@ -1067,14 +1071,14 @@ func (s *Server) reconcileOverlays(ctx context.Context) {
 			s.log.Printf("acct-%02d busy converting; skipping startup reconcile", a.ID)
 			continue
 		}
-		s.reconcileAccount(a)
+		s.reconcileAccount(ctx, a)
 		s.endPoll(a.ID)
 	}
 }
 
 // reconcileAccount brings one account's on-disk overlay in line with its row.
 // Caller holds the poll claim.
-func (s *Server) reconcileAccount(a store.Account) {
+func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 	switch overlay.Kind(a.OverlayKind) {
 	case overlay.KindFuse:
 		prov := s.overlayFor(overlay.KindFuse)
@@ -1088,7 +1092,7 @@ func (s *Server) reconcileAccount(a store.Account) {
 			s.log.Printf("acct-%02d adopted live mount", a.ID)
 			return
 		}
-		s.healFuse(a)
+		s.healFuse(ctx, a)
 	default:
 		// A live mountpoint under a FUSE row is normal at startup (the
 		// detached holder survived the daemon restart) — but under a NON-fuse
@@ -1157,7 +1161,7 @@ var errSweepStranded = errors.New("sweep stranded private files")
 // callers hold the account's poll claim or the holder replace's converting
 // claim (under the latter, the fallback's beginConvertUnderPoll refuses and
 // the conversion defers to the next poll — by design).
-func (s *Server) healFuse(a store.Account) healOutcome {
+func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 	err := s.mountFuse(a)
 	switch {
 	case err == nil:
@@ -1201,7 +1205,7 @@ func (s *Server) healFuse(a store.Account) healOutcome {
 		return healRetry
 	default:
 		s.log.Printf("acct-%02d mount failed; attempting gated symlink fallback: %v", a.ID, err)
-		s.fallbackToSymlink(a)
+		s.fallbackToSymlink(ctx, a)
 		return healFallback
 	}
 }
@@ -1288,13 +1292,13 @@ func (s *Server) sweepAndMount(prov overlay.Provider, a store.Account, base, dir
 // hand-rolled fallback left them stranded there, severing the account from
 // its .claude.json identity. Callers must hold the account's poll claim; the
 // conversion must not race another overlay mutation on the dir.
-func (s *Server) fallbackToSymlink(a store.Account) {
+func (s *Server) fallbackToSymlink(ctx context.Context, a store.Account) {
 	if !s.beginConvertUnderPoll(a.ID) {
 		s.log.Printf("acct-%02d deferring fuse→symlink fallback: reserved by a pending select or already converting", a.ID)
 		return
 	}
 	defer s.endConvert(a.ID)
-	sessions, err := s.scan(context.Background())
+	sessions, err := s.scan(ctx)
 	if err != nil {
 		s.log.Printf("acct-%02d deferring fuse→symlink fallback: session scan: %v", a.ID, err)
 		return

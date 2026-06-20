@@ -118,6 +118,7 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 	fd := int(os.Stdin.Fd())
 	state, _ := term.GetState(fd) // nil on non-TTY; restore is nil-safe
 
+	//nolint:gosec // G204: bin is the resolved claude executable path; "/login" is a fixed argument
 	c := exec.Command(bin, "/login")
 	c.Env = execEnv(os.Environ(), p.ConfigDir)
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
@@ -174,7 +175,7 @@ func restoreTerminal(out io.Writer, fd int, state *term.State) {
 		_ = term.Restore(fd, state)
 	}
 	if isTTY() {
-		fmt.Fprint(out, "\x1b[?1049l\x1b[?25h"+inputModeReset+"\x1b[0m")
+		_, _ = fmt.Fprint(out, "\x1b[?1049l\x1b[?25h"+inputModeReset+"\x1b[0m")
 	}
 }
 
@@ -188,21 +189,21 @@ func waitForLogin(ctx context.Context, out io.Writer, kind overlay.Kind, configD
 	ticker := time.NewTicker(loginPollInterval)
 	defer ticker.Stop()
 	for i := 0; ; i++ {
-		fmt.Fprintf(out, "\r%s %s", spinnerFrames[i%len(spinnerFrames)], dimStyle.Render("waiting for login… press ctrl-c to abort"))
+		_, _ = fmt.Fprintf(out, "\r%s %s", spinnerFrames[i%len(spinnerFrames)], dimStyle.Render("waiting for login… press ctrl-c to abort"))
 		select {
 		case <-ctx.Done():
-			fmt.Fprint(out, "\r\x1b[K")
+			_, _ = fmt.Fprint(out, "\r\x1b[K")
 			return ctx.Err()
 		case <-ticker.C:
 			done, err := probe()
 			if err != nil {
-				fmt.Fprint(out, "\r\x1b[K")
+				_, _ = fmt.Fprint(out, "\r\x1b[K")
 				return err
 			}
 			if !done {
 				continue
 			}
-			fmt.Fprint(out, "\r\x1b[K")
+			_, _ = fmt.Fprint(out, "\r\x1b[K")
 			success(out, "Logged in.")
 			return nil
 		}

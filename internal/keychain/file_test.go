@@ -1,6 +1,7 @@
 package keychain
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,7 +12,7 @@ func TestFileCredentialRoundTrip(t *testing.T) {
 	if FileCredentialExists(dir) {
 		t.Fatal("fresh dir reports a credential file")
 	}
-	if _, err := ReadFileCredential(dir); err != ErrNotFound {
+	if _, err := ReadFileCredential(dir); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("ReadFileCredential on empty dir = %v, want ErrNotFound", err)
 	}
 
@@ -77,7 +78,7 @@ func TestLocateCredential(t *testing.T) {
 	cfg := t.TempDir()
 
 	// Neither backend holds a credential.
-	if _, _, err := LocateCredential(cfg, svc); err != ErrNotFound {
+	if _, _, err := LocateCredential(cfg, svc); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("LocateCredential with nothing = %v, want ErrNotFound", err)
 	}
 

@@ -244,7 +244,7 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src keychain.
 
 	// Rung 2: no refresh token → definitively signed out.
 	if !cred.HasRefreshToken() {
-		return nil, false, fmt.Errorf("%w: %v", ErrNeedsLogin, err)
+		return nil, false, fmt.Errorf("%w: %w", ErrNeedsLogin, err)
 	}
 
 	// Rung 3: may we refresh? Idle accounts always may; a busy account only
@@ -270,7 +270,7 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src keychain.
 			if reread, _, rerr := m.readCred(a); rerr == nil && !sameTokens(reread, cred) {
 				return nil, false, err
 			}
-			return nil, false, fmt.Errorf("%w: %v", ErrNeedsLogin, rfErr)
+			return nil, false, fmt.Errorf("%w: %w", ErrNeedsLogin, rfErr)
 		}
 		return nil, false, err
 	}

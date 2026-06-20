@@ -95,6 +95,7 @@ func loginCommand(configDir string) (*exec.Cmd, error) {
 	if err != nil {
 		return nil, fmt.Errorf("`claude` not found on PATH: %w", err)
 	}
+	//nolint:gosec // G204: bin is the resolved claude executable path; "/login" is a fixed argument
 	c := exec.Command(bin, "/login")
 	c.Env = execEnv(os.Environ(), configDir)
 	return c, nil

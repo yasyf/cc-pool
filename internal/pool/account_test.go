@@ -21,7 +21,7 @@ func openTestStore(t *testing.T) *store.Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	return st
 }
 
@@ -130,7 +130,7 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	// Plain claude's state: ~/.claude with shared entries, ~/.claude.json.
 	base := ClaudeDir()
 	for _, d := range []string{"projects", "backups"} {
-		if err := os.MkdirAll(filepath.Join(base, d), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(base, d), 0o750); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -216,7 +216,7 @@ func TestPrepareAddRequiresInit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st := openTestStore(t)
 	m := &Manager{Store: st}
-	if _, err := m.PrepareAdd(); err == nil || err != ErrNotInitialized {
+	if _, err := m.PrepareAdd(); err == nil || !errors.Is(err, ErrNotInitialized) {
 		t.Fatalf("PrepareAdd on fresh pool = %v, want ErrNotInitialized", err)
 	}
 }
@@ -255,7 +255,7 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 		if _, err := m.PrepareAdd(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fk.Read(svc, "tester"); err != keychain.ErrNotFound {
+		if _, err := fk.Read(svc, "tester"); !errors.Is(err, keychain.ErrNotFound) {
 			t.Errorf("stale item survived: %v", err)
 		}
 		if del := fk.deletedServices(); len(del) != 1 || del[0] != svc {
@@ -279,7 +279,7 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 		if _, err := m.PrepareAdd(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fk.Read(svc, "someone-else"); err != keychain.ErrNotFound {
+		if _, err := fk.Read(svc, "someone-else"); !errors.Is(err, keychain.ErrNotFound) {
 			t.Errorf("label-mismatched stale item survived: %v", err)
 		}
 	})
@@ -365,7 +365,7 @@ func TestAbandonAddDeletesKeychainItem(t *testing.T) {
 	if err := m.AbandonAdd(pending); err != nil {
 		t.Fatalf("AbandonAdd: %v", err)
 	}
-	if _, err := fk.Read(pending.KeychainService, "claude-wrote-this"); err != keychain.ErrNotFound {
+	if _, err := fk.Read(pending.KeychainService, "claude-wrote-this"); !errors.Is(err, keychain.ErrNotFound) {
 		t.Errorf("credential survived the rollback: %v", err)
 	}
 	if _, err := os.Stat(pending.ConfigDir); !os.IsNotExist(err) {
@@ -409,17 +409,18 @@ type stubOverlay struct {
 	setups   int
 }
 
-func (s *stubOverlay) Kind() overlay.Kind              { return s.kind }
-func (s *stubOverlay) Sync(base, dir string) error     { return nil }
-func (s *stubOverlay) Health(base, dir string) error   { return nil }
-func (s *stubOverlay) Teardown(base, dir string) error { return nil }
+func (s *stubOverlay) Kind() overlay.Kind         { return s.kind }
+func (s *stubOverlay) Sync(_, _ string) error     { return nil }
+func (s *stubOverlay) Health(_, _ string) error   { return nil }
+func (s *stubOverlay) Teardown(_, _ string) error { return nil }
 func (s *stubOverlay) PrivateRoot(dir string) string {
 	if s.kind == overlay.KindFuse {
 		return overlay.FusePrivateRoot(dir)
 	}
 	return dir
 }
-func (s *stubOverlay) Setup(base, dir string) error {
+
+func (s *stubOverlay) Setup(_, dir string) error {
 	s.setups++
 	if s.setupErr != nil {
 		return s.setupErr

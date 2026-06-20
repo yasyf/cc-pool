@@ -1,6 +1,7 @@
 package keychain
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -73,7 +74,7 @@ func TestSecurityRoundTrip(t *testing.T) {
 	const svc = "Claude Code-credentials-deadbeef"
 	const acct = "tester"
 
-	if _, err := Read(svc, acct); err != ErrNotFound {
+	if _, err := Read(svc, acct); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound before write, got %v", err)
 	}
 
@@ -103,7 +104,7 @@ func TestSecurityRoundTrip(t *testing.T) {
 	if err := Delete(svc, acct); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if _, err := Read(svc, acct); err != ErrNotFound {
+	if _, err := Read(svc, acct); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Read after Delete = %v, want ErrNotFound", err)
 	}
 	if err := Delete(svc, acct); err != nil {
@@ -173,7 +174,7 @@ esac
 exit 1
 `
 	path := filepath.Join(dir, "security")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil { //nolint:gosec // G306: this writes an executable stub script for the test; it must be 0755
 		t.Fatal(err)
 	}
 	return path

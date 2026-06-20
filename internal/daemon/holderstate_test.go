@@ -25,7 +25,7 @@ func startFakeHolder(t *testing.T, fake *fakeFuseProv) *mountd.Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	srv := &mountd.Server{
 		Socket:  filepath.Join(sockDir, "m.sock"),
 		Host:    fake,
@@ -65,13 +65,13 @@ func startCannedHolder(t *testing.T, mounts []mountd.MountInfo) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	socket := filepath.Join(sockDir, "m.sock")
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go serveCannedHolder(ln, mounts)
 	return socket
 }
@@ -92,7 +92,7 @@ func serveCannedHolder(ln net.Listener, mounts []mountd.MountInfo) {
 			resp.Mounts = mounts
 		}
 		_ = json.NewEncoder(conn).Encode(resp)
-		conn.Close()
+		_ = conn.Close()
 	}
 }
 
@@ -106,7 +106,7 @@ func TestHolderStateRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(deadDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(deadDir) })
 
 	h := &holderState{healthy: true, version: "x", mounts: map[string]bool{"/pool/acct-01": true}}
 	h.refresh(mountd.NewClient(filepath.Join(deadDir, "no.sock")))
@@ -147,13 +147,13 @@ func startGatedListHolder(t *testing.T, mounts []mountd.MountInfo) (socket strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	socket = filepath.Join(sockDir, "m.sock")
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	entered := make(chan struct{})
 	releaseCh := make(chan struct{})
 	var enterOnce, relOnce sync.Once
@@ -167,7 +167,7 @@ func startGatedListHolder(t *testing.T, mounts []mountd.MountInfo) (socket strin
 			}
 			var req mountd.Request
 			if err := json.NewDecoder(conn).Decode(&req); err != nil {
-				conn.Close()
+				_ = conn.Close()
 				continue
 			}
 			resp := mountd.Response{OK: true, Version: version.String()}
@@ -177,7 +177,7 @@ func startGatedListHolder(t *testing.T, mounts []mountd.MountInfo) (socket strin
 				resp.Mounts = mounts
 			}
 			_ = json.NewEncoder(conn).Encode(resp)
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 	return socket, entered, release

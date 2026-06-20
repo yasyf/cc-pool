@@ -138,14 +138,14 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv overlay.P
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := overlay.FusePrivateRoot(dir)
 	if err := fuseProv.Teardown(base, dir); err != nil {
-		return fmt.Errorf("convert acct-%02d: %w (and rollback unmount failed: %v; private files remain in %s until the daemon reconciles)",
+		return fmt.Errorf("convert acct-%02d: %w (and rollback unmount failed: %w; private files remain in %s until the daemon reconciles)",
 			a.ID, cause, err, priv)
 	}
 	if err := errors.Join(
 		overlay.MovePrivateEntries(priv, dir),
 		symProv.Setup(base, dir),
 	); err != nil {
-		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %v)", a.ID, cause, err)
+		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
 	}
 	removePrivateRootIfEmpty(priv)
 	return fmt.Errorf("convert acct-%02d: %w (rolled back to symlink)", a.ID, cause)

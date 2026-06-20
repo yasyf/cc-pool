@@ -27,7 +27,7 @@ const (
 	// ClientID is Claude Code's public OAuth client id.
 	ClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
-	tokenEndpoint = "https://platform.claude.com/v1/oauth/token"
+	tokenEndpoint = "https://platform.claude.com/v1/oauth/token" //nolint:gosec // G101: a public OAuth token endpoint URL, not a credential
 	usageEndpoint = "https://api.anthropic.com/api/oauth/usage"
 
 	// betaHeader is required for the usage endpoint.
@@ -143,7 +143,7 @@ func (c *Client) refresh(ctx context.Context, refreshToken string) (*TokenRespon
 	if err != nil {
 		return nil, fmt.Errorf("oauth refresh request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	if resp.StatusCode != http.StatusOK {
@@ -333,7 +333,7 @@ func (c *Client) Usage(ctx context.Context, accessToken string) (*Usage, error) 
 	if err != nil {
 		return nil, fmt.Errorf("oauth usage request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	if resp.StatusCode != http.StatusOK {

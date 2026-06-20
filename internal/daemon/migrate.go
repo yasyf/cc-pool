@@ -74,7 +74,7 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 			})
 			continue
 		}
-		res := s.convertAccount(a, to, req.Force)
+		res := s.convertAccount(ctx, a, to, req.Force)
 		converted = converted || res.Outcome == MigrationDone
 		results = append(results, res)
 	}
@@ -118,7 +118,7 @@ func (s *Server) fuseGate() string {
 // idle and accepts that one writing mid-conversion may briefly error. The
 // claim and reservation gates always hold — those mean another part of the
 // daemon owns the dir right now.
-func (s *Server) convertAccount(a store.Account, to overlay.Kind, force bool) MigrationResult {
+func (s *Server) convertAccount(ctx context.Context, a store.Account, to overlay.Kind, force bool) MigrationResult {
 	res := MigrationResult{ID: a.ID, Label: a.Label, From: a.OverlayKind, To: string(to)}
 	if a.OverlayKind == string(to) {
 		res.Outcome = MigrationAlready
@@ -150,7 +150,7 @@ func (s *Server) convertAccount(a store.Account, to overlay.Kind, force bool) Mi
 	if !force {
 		// Never convert blind: a failed scan means we cannot know whether a
 		// live claude has this dir as its config dir.
-		sessions, err := procscan.Scan(context.Background())
+		sessions, err := procscan.Scan(ctx)
 		if err != nil {
 			res.Outcome = MigrationFailed
 			res.Detail = fmt.Sprintf("session scan: %v", err)

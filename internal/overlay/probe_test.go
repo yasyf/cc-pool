@@ -206,7 +206,7 @@ func TestDeepProbeWithinTimeoutWedged(t *testing.T) {
 
 	// Unwedge for a clean exit: a writer opening the FIFO releases the parked
 	// open, and closing it EOFs the read so the probe goroutine drains.
-	w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+	w, err := os.OpenFile(fifo, os.O_WRONLY, 0) //nolint:gosec // G304: fifo is under the test's own t.TempDir()
 	if err != nil {
 		t.Fatal(err)
 	}

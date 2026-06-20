@@ -20,6 +20,7 @@ func (c *Client) EnsureRunning(timeout time.Duration) bool {
 	if err != nil {
 		return false
 	}
+	//nolint:gosec // G204: exe is this binary's own resolved path; "daemon" is a fixed subcommand
 	cmd := exec.Command(exe, "daemon")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from our session

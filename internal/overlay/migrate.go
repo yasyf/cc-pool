@@ -23,7 +23,7 @@ import (
 // would not let those log-less sites report anything; this seam makes every
 // path observable with no ripple. No lock guards it: it is assigned once at
 // daemon startup, before any sweep or conversion runs.
-var ResolvedConflictLogf = func(format string, args ...any) {}
+var ResolvedConflictLogf = func(_ string, _ ...any) {}
 
 // This file holds the untagged primitives that overlay conversion (and crash
 // repair) is built from. They compile in every build variant: even a non-fuse
@@ -163,11 +163,11 @@ func resolveFileConflict(src, dst string, sfi, dfi os.FileInfo) error {
 // small (identity, credentials, update markers), so a full read-and-compare is
 // cheap and exact — no size or hash shortcut needed.
 func sameContent(a, b string) (bool, error) {
-	ab, err := os.ReadFile(a)
+	ab, err := os.ReadFile(a) //nolint:gosec // G304: a/b are cc-pool-managed overlay paths under the state dir, compared during conversion
 	if err != nil {
 		return false, fmt.Errorf("read %q: %w", a, err)
 	}
-	bb, err := os.ReadFile(b)
+	bb, err := os.ReadFile(b) //nolint:gosec // G304: a/b are cc-pool-managed overlay paths under the state dir, compared during conversion
 	if err != nil {
 		return false, fmt.Errorf("read %q: %w", b, err)
 	}

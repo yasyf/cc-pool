@@ -106,7 +106,7 @@ func aliasLine(kind shellKind) string {
 // never clobber). A missing file counts as not installed; other read errors
 // propagate so we never silently re-append after a partial read.
 func aliasInstalled(path string) (bool, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path is the user's own shell rc file resolved by cc-pool, not external input
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
 	}
@@ -165,15 +165,15 @@ func appendAlias(kind shellKind, home string) (aliasResult, error) {
 	if installed {
 		return aliasResult{Path: path, AlreadyPresent: true}, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return aliasResult{}, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
 	}
 	block := "\n" + aliasMarker + "\n" + aliasLine(kind) + "\n"
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644) //nolint:gosec // G304: path is the user's own shell rc file; 0644 matches a world-readable rc
 	if err != nil {
 		return aliasResult{}, fmt.Errorf("open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.WriteString(block); err != nil {
 		return aliasResult{}, fmt.Errorf("write %s: %w", path, err)
 	}

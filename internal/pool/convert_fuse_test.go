@@ -79,13 +79,13 @@ func TestFuseConvertRoundTrip(t *testing.T) {
 
 	priv := overlay.FusePrivateRoot(dir)
 	// Identity readable THROUGH the live mount, physically homed in .private.
-	if got, err := os.ReadFile(filepath.Join(dir, ".claude.json")); err != nil || string(got) != identityJSON {
+	if got, err := os.ReadFile(filepath.Join(dir, ".claude.json")); err != nil || string(got) != identityJSON { //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 		t.Fatalf("identity through mount = %q err=%v", got, err)
 	}
-	if got, err := os.ReadFile(filepath.Join(priv, ".claude.json")); err != nil || string(got) != identityJSON {
+	if got, err := os.ReadFile(filepath.Join(priv, ".claude.json")); err != nil || string(got) != identityJSON { //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 		t.Fatalf("identity in private root = %q err=%v", got, err)
 	}
-	if got, err := os.ReadFile(filepath.Join(dir, "backups", "b.bak")); err != nil || string(got) != "bak" {
+	if got, err := os.ReadFile(filepath.Join(dir, "backups", "b.bak")); err != nil || string(got) != "bak" { //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 		t.Fatalf("backups through mount = %q err=%v", got, err)
 	}
 	// Shared entries serve from base through the mirror.
@@ -127,13 +127,13 @@ func TestFuseConvertRoundTrip(t *testing.T) {
 	if overlay.Mounted(dir) {
 		t.Fatal("dir still mounted after reverse conversion")
 	}
-	if got, err := os.ReadFile(filepath.Join(dir, ".claude.json")); err != nil || string(got) != identityJSON {
+	if got, err := os.ReadFile(filepath.Join(dir, ".claude.json")); err != nil || string(got) != identityJSON { //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 		t.Fatalf("identity after reverse = %q err=%v", got, err)
 	}
 	if target, err := os.Readlink(filepath.Join(dir, "projects")); err != nil || target != filepath.Join(base, "projects") {
 		t.Fatalf("projects link after reverse = %q err=%v", target, err)
 	}
-	if got, err := os.ReadFile(filepath.Join(dir, "backups", "b.bak")); err != nil || string(got) != "bak" {
+	if got, err := os.ReadFile(filepath.Join(dir, "backups", "b.bak")); err != nil || string(got) != "bak" { //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 		t.Fatalf("backups after reverse = %q err=%v", got, err)
 	}
 }

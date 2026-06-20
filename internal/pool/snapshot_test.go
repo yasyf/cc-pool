@@ -56,7 +56,7 @@ func TestSnapshotBurn7d(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { st.Close() })
+			t.Cleanup(func() { _ = st.Close() })
 			if err := st.UpsertAccount(store.Account{
 				ID: 1, ConfigDir: t.TempDir(),
 				KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
@@ -102,7 +102,7 @@ func TestSnapshotsForecast(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { st.Close() })
+			t.Cleanup(func() { _ = st.Close() })
 			if err := st.UpsertAccount(store.Account{
 				ID: 1, ConfigDir: t.TempDir(),
 				KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",

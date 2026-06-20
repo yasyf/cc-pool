@@ -18,6 +18,7 @@ const ProtocolVersion = 1
 // Op is a request operation.
 type Op string
 
+// Recognized request operations.
 const (
 	OpSelect   Op = "select"   // pick the best account; optionally mark a checkout
 	OpStatus   Op = "status"   // return scored status for all accounts
@@ -53,6 +54,7 @@ type Request struct {
 // MigrationOutcome classifies one account's migrate result.
 type MigrationOutcome string
 
+// Possible per-account migrate outcomes.
 const (
 	MigrationDone    MigrationOutcome = "done"    // converted
 	MigrationAlready MigrationOutcome = "already" // was already the target kind

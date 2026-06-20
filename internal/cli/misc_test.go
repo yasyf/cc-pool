@@ -59,7 +59,7 @@ func TestEnvMergesBaseSettings(t *testing.T) {
 	if !strings.Contains(stdout.String(), "export CLAUDE_CONFIG_DIR='"+dir+"'") {
 		t.Fatalf("env exports missing the config dir: %q", stdout.String())
 	}
-	b, err := os.ReadFile(filepath.Join(dir, ".claude.json"))
+	b, err := os.ReadFile(filepath.Join(dir, ".claude.json")) //nolint:gosec // G304: path is a cc-pool-managed/test-owned file, not external input
 	if err != nil {
 		t.Fatalf("account .claude.json missing after the env merge: %v", err)
 	}

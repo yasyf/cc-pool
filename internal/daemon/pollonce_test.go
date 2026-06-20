@@ -149,7 +149,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 
 	a := store.Account{
 		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
@@ -211,7 +211,7 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 
 	a := store.Account{
 		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
@@ -278,7 +278,7 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 
 	a := store.Account{
 		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
@@ -349,7 +349,7 @@ func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 
 	a := store.Account{
 		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),

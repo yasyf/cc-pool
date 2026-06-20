@@ -44,28 +44,28 @@ func usageStyle(usedPct float64) lipgloss.Style {
 
 // step prints a top-level progress line, undecorated.
 func step(w io.Writer, format string, a ...any) {
-	fmt.Fprintln(w, fmt.Sprintf(format, a...))
+	_, _ = fmt.Fprintln(w, fmt.Sprintf(format, a...))
 }
 
 // success prints a completed action with a green check.
 func success(w io.Writer, format string, a ...any) {
-	fmt.Fprintln(w, okStyle.Render("✓")+" "+fmt.Sprintf(format, a...))
+	_, _ = fmt.Fprintln(w, okStyle.Render("✓")+" "+fmt.Sprintf(format, a...))
 }
 
 // note prints a dimmed secondary line beneath a step.
 func note(w io.Writer, format string, a ...any) {
-	fmt.Fprintln(w, dimStyle.Render(fmt.Sprintf(format, a...)))
+	_, _ = fmt.Fprintln(w, dimStyle.Render(fmt.Sprintf(format, a...)))
 }
 
 // warn prints a warning. Callers pass the command's stderr.
 func warn(w io.Writer, format string, a ...any) {
-	fmt.Fprintln(w, warnStyle.Render("warning:")+" "+fmt.Sprintf(format, a...))
+	_, _ = fmt.Fprintln(w, warnStyle.Render("warning:")+" "+fmt.Sprintf(format, a...))
 }
 
 // fail prints a failed action with a red cross. Callers pass the command's
 // stderr.
 func fail(w io.Writer, format string, a ...any) {
-	fmt.Fprintln(w, badStyle.Render("✗")+" "+fmt.Sprintf(format, a...))
+	_, _ = fmt.Fprintln(w, badStyle.Render("✗")+" "+fmt.Sprintf(format, a...))
 }
 
 // spinnerFrames is the braille spinner cycle shared by every in-place progress
@@ -92,10 +92,10 @@ func withSpinner(out io.Writer, msg string, fn func() error) error {
 	for i := 0; ; i++ {
 		select {
 		case err := <-done:
-			fmt.Fprint(out, "\r\x1b[K")
+			_, _ = fmt.Fprint(out, "\r\x1b[K")
 			return err
 		case <-t.C:
-			fmt.Fprintf(out, "\r%s %s", spinnerFrames[i%len(spinnerFrames)], dimStyle.Render(msg))
+			_, _ = fmt.Fprintf(out, "\r%s %s", spinnerFrames[i%len(spinnerFrames)], dimStyle.Render(msg))
 		}
 	}
 }

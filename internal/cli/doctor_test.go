@@ -443,7 +443,7 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc", KeychainAccount: "user", OverlayKind: "symlink"}
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)
@@ -466,7 +466,7 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 	if !healed {
 		t.Errorf("missing healthy 'restored from' report: %+v", *calls)
 	}
-	got, err := os.ReadFile(inDir)
+	got, err := os.ReadFile(inDir) //nolint:gosec // G304: path is a cc-pool-managed/test-owned file, not external input
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +506,7 @@ func TestDoctorSurfacesFuseFallback(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { st.Close() })
+			t.Cleanup(func() { _ = st.Close() })
 			// Record the default with fuse-hosting enabled (SetDefaultOverlayKind
 			// refuses a fuse default otherwise), then set the check-time capability.
 			m := &pool.Manager{Store: st, CanHostFuse: func() bool { return true }}

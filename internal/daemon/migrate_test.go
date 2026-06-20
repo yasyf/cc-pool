@@ -40,8 +40,8 @@ type fakeFuseProv struct {
 	teardownFn  func(base, dir string) error
 }
 
-func (f *fakeFuseProv) Kind() overlay.Kind          { return overlay.KindFuse }
-func (f *fakeFuseProv) Sync(base, dir string) error { return nil }
+func (f *fakeFuseProv) Kind() overlay.Kind     { return overlay.KindFuse }
+func (f *fakeFuseProv) Sync(_, _ string) error { return nil }
 
 // State satisfies fusekit's narrow mountd.Host seam (which replaced the old
 // mounted/mountAlive package-var seams): the fake holder reports real kernel
@@ -52,7 +52,7 @@ func (f *fakeFuseProv) State(base, dir string) (mounted, alive bool) {
 	return overlay.Mounted(dir), overlay.MountAlive(base, dir)
 }
 
-func (f *fakeFuseProv) Health(base, dir string) error {
+func (f *fakeFuseProv) Health(_, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.healths++
@@ -418,7 +418,7 @@ func TestFallbackToSymlinkRestoresPrivateFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.fallbackToSymlink(a)
+	s.fallbackToSymlink(t.Context(), a)
 
 	got, err := os.ReadFile(filepath.Join(dirs[1], ".claude.json"))
 	if err != nil || string(got) != "identity" {
@@ -446,7 +446,7 @@ func TestFallbackToSymlinkRestoresPrivateFiles(t *testing.T) {
 	}
 	fake.teardownErr = errors.New("still mounted")
 
-	s.fallbackToSymlink(a)
+	s.fallbackToSymlink(t.Context(), a)
 
 	if _, err := os.Stat(filepath.Join(priv2, ".claude.json")); err != nil {
 		t.Fatalf("identity moved despite failed unmount: %v", err)
@@ -480,7 +480,7 @@ func TestFallbackToSymlinkClaimAtomicAgainstSelect(t *testing.T) {
 		return nil, nil
 	}
 
-	s.fallbackToSymlink(a)
+	s.fallbackToSymlink(t.Context(), a)
 
 	if reservedMidFallback {
 		t.Fatal("a select reserved the account between the idle gate and the conversion")
@@ -613,7 +613,7 @@ func TestMountFuseSweepsUnderlay(t *testing.T) {
 	// A wrong-kind injected fake must be refused loudly, never mounted
 	// through — the real resolver always yields a fuse provider, so the fence
 	// guards against fakes that would run symlink code on fuse paths.
-	s.m.OverlayFor = func(kind overlay.Kind) overlay.Provider { return &overlay.SymlinkProvider{} }
+	s.m.OverlayFor = func(_ overlay.Kind) overlay.Provider { return &overlay.SymlinkProvider{} }
 	if err := s.mountFuse(a); err == nil || !strings.Contains(err.Error(), "reports kind") {
 		t.Fatalf("mountFuse with a wrong-kind provider = %v, want a kind refusal", err)
 	}
@@ -706,7 +706,7 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res := s.convertAccount(a, overlay.KindFuse, true)
+	res := s.convertAccount(t.Context(), a, overlay.KindFuse, true)
 	if res.Outcome != MigrationBusy {
 		t.Fatalf("outcome = %s, want busy despite force", res.Outcome)
 	}
@@ -743,7 +743,7 @@ func TestConvertAccountRefetchesRow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res := s.convertAccount(stale, overlay.KindFuse, false) // stale still says symlink
+	res := s.convertAccount(t.Context(), stale, overlay.KindFuse, false) // stale still says symlink
 	if res.Outcome != MigrationAlready {
 		t.Fatalf("outcome = %s (%s), want already", res.Outcome, res.Detail)
 	}
@@ -856,7 +856,7 @@ func TestMountFuseClearsDeadMountThenSweepsThenMounts(t *testing.T) {
 		// The sweep must complete before the mount: the identity must already
 		// be in the backing dir, or the mirror would shadow it.
 		if _, err := os.Stat(filepath.Join(overlay.FusePrivateRoot(dirs[1]), ".claude.json")); err != nil {
-			return fmt.Errorf("setup ran before the sweep: %v", err)
+			return fmt.Errorf("setup ran before the sweep: %w", err)
 		}
 		return nil
 	}
@@ -1099,7 +1099,7 @@ func TestHealFuseTaxonomy(t *testing.T) {
 				t.Fatal("tryReserve failed on a free account")
 			}
 
-			if got := s.healFuse(a); got != tc.wantOutcome {
+			if got := s.healFuse(t.Context(), a); got != tc.wantOutcome {
 				t.Fatalf("healFuse outcome = %d, want %d", got, tc.wantOutcome)
 			}
 			if got := kindOf(t, s, 1); got != tc.wantKind {
@@ -1148,7 +1148,7 @@ func TestHealFuseSweepFailureRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := s.healFuse(a); got != healRetry {
+	if got := s.healFuse(t.Context(), a); got != healRetry {
 		t.Fatalf("healFuse outcome = %d, want healRetry (%d): a pre-Setup sweep failure must not convert", got, healRetry)
 	}
 	if got := kindOf(t, s, 1); got != "fuse" {

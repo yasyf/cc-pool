@@ -33,10 +33,11 @@ func (h *flockHandle) release() {
 // ctx is done, polling rather than blocking in the syscall so cancellation is
 // observed and no goroutine is leaked on a stuck holder.
 func flockAcquire(ctx context.Context, path string) (*flockHandle, error) {
+	//nolint:gosec // G703: path is a cc-pool-owned lock path under the state dir, not user-tainted input
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create lock dir: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: path is a cc-pool-owned lock file under the state dir, not user input
 	if err != nil {
 		return nil, fmt.Errorf("open lock %s: %w", path, err)
 	}
@@ -46,12 +47,12 @@ func flockAcquire(ctx context.Context, path string) (*flockHandle, error) {
 			return &flockHandle{f: f}, nil
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) {
-			f.Close()
+			_ = f.Close()
 			return nil, fmt.Errorf("flock %s: %w", path, err)
 		}
 		select {
 		case <-ctx.Done():
-			f.Close()
+			_ = f.Close()
 			return nil, fmt.Errorf("flock %s: %w", path, ctx.Err())
 		case <-time.After(flockPollInterval):
 		}

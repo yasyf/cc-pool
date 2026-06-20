@@ -64,8 +64,8 @@ func (v *probeView) getattr(stat *fuse.Stat_t) int {
 	*stat = fuse.Stat_t{
 		Mode:     fuse.S_IFREG | 0o444,
 		Nlink:    1,
-		Uid:      uint32(os.Getuid()),
-		Gid:      uint32(os.Getgid()),
+		Uid:      uint32(os.Getuid()), //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
+		Gid:      uint32(os.Getgid()), //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 		Size:     ProbeFileSize,
 		Blksize:  4096,
 		Blocks:   (ProbeFileSize + 511) / 512,

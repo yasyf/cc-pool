@@ -127,7 +127,7 @@ func (fs *mirrorFS) snapshotShared() {
 	if err != nil {
 		return
 	}
-	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid()) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 	now := time.Now()
 	ts := fuse.Timespec{Sec: now.Unix(), Nsec: int64(now.Nanosecond())}
 	ino := sharedLinkInoBase
@@ -243,7 +243,7 @@ func (fs *mirrorFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 	if fh != ^uint64(0) {
 		// A real handle at /.claude.json is a write handle (read opens are
 		// synthetic): raw Fstat, no merged-view override.
-		if err := syscall.Fstat(int(fh), &st); err != nil {
+		if err := syscall.Fstat(int(fh), &st); err != nil { //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 			return errno(err)
 		}
 		copyStat(stat, &st)
@@ -293,9 +293,9 @@ func (fs *mirrorFS) Open(path string, flags int) (int, uint64) {
 		// (writeThroughBase's bytes.Equal short-circuit). The baseline guarantees
 		// no write path (an O_TRUNC at open, an in-place rewrite) can leave an
 		// injected plansDirectory committed into base.
-		fs.settings.markDirty(uint64(fd))
+		fs.settings.markDirty(uint64(fd)) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 	}
-	return 0, uint64(fd)
+	return 0, uint64(fd) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 }
 
 func (fs *mirrorFS) Create(path string, flags int, mode uint32) (int, uint64) {
@@ -306,10 +306,10 @@ func (fs *mirrorFS) Create(path string, flags int, mode uint32) (int, uint64) {
 	if err != nil {
 		return errno(err), ^uint64(0)
 	}
-	return 0, uint64(fd)
+	return 0, uint64(fd) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 }
 
-func (fs *mirrorFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
+func (fs *mirrorFS) Read(_ string, buff []byte, ofst int64, fh uint64) int {
 	if probeFh(fh) {
 		return fs.probe.read(fh, buff, ofst)
 	}
@@ -319,7 +319,7 @@ func (fs *mirrorFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 	if syntheticFh(fh) {
 		return fs.cj.readSnapshot(fh, buff, ofst)
 	}
-	n, err := syscall.Pread(int(fh), buff, ofst)
+	n, err := syscall.Pread(int(fh), buff, ofst) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 	if err != nil {
 		return errno(err)
 	}
@@ -338,7 +338,7 @@ func (fs *mirrorFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
 		// int. settingsFh ⊂ syntheticFh, so this one check covers both.
 		return -int(syscall.EBADF)
 	}
-	n, err := syscall.Pwrite(int(fh), buff, ofst)
+	n, err := syscall.Pwrite(int(fh), buff, ofst) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 	if err != nil {
 		return errno(err)
 	}
@@ -363,7 +363,7 @@ func (fs *mirrorFS) Truncate(path string, size int64, fh uint64) int {
 	}
 	var err error
 	if fh != ^uint64(0) {
-		err = syscall.Ftruncate(int(fh), size)
+		err = syscall.Ftruncate(int(fh), size) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 		if err == nil && path == claudeJSONFusePath {
 			fs.cj.markDirty(fh)
 		}
@@ -376,11 +376,11 @@ func (fs *mirrorFS) Truncate(path string, size int64, fh uint64) int {
 	return errno(err)
 }
 
-func (fs *mirrorFS) Fsync(path string, datasync bool, fh uint64) int {
+func (fs *mirrorFS) Fsync(_ string, _ bool, fh uint64) int {
 	if probeFh(fh) || syntheticFh(fh) {
 		return 0 // probe bytes and merged snapshots are memory; nothing to sync
 	}
-	return errno(syscall.Fsync(int(fh)))
+	return errno(syscall.Fsync(int(fh))) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 }
 
 func (fs *mirrorFS) Release(path string, fh uint64) int {
@@ -398,7 +398,7 @@ func (fs *mirrorFS) Release(path string, fh uint64) int {
 		fs.cj.closeSnapshot(fh)
 		return 0
 	}
-	st := errno(syscall.Close(int(fh)))
+	st := errno(syscall.Close(int(fh))) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 	if path == claudeJSONFusePath && fs.cj.takeDirty(fh) {
 		// The fd actually wrote into the private /.claude.json (an in-place
 		// commit): propagate the shareable keys to base after the close. A
@@ -430,15 +430,15 @@ func (fs *mirrorFS) Opendir(path string) (int, uint64) {
 	if err != nil {
 		return errno(err), ^uint64(0)
 	}
-	return 0, uint64(fd)
+	return 0, uint64(fd) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 }
 
-func (fs *mirrorFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, ofst int64, fh uint64) int {
+func (fs *mirrorFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, _ int64, _ uint64) int {
 	dir, err := os.Open(fs.real(path))
 	if err != nil {
 		return errno(err)
 	}
-	defer dir.Close()
+	defer func() { _ = dir.Close() }()
 	names, err := dir.Readdirnames(-1)
 	if err != nil {
 		return errno(err)
@@ -482,8 +482,8 @@ func (fs *mirrorFS) Readdir(path string, fill func(name string, stat *fuse.Stat_
 	return 0
 }
 
-func (fs *mirrorFS) Releasedir(path string, fh uint64) int {
-	return errno(syscall.Close(int(fh)))
+func (fs *mirrorFS) Releasedir(_ string, fh uint64) int {
+	return errno(syscall.Close(int(fh))) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 }
 
 func (fs *mirrorFS) Mkdir(path string, mode uint32) int {
@@ -598,8 +598,8 @@ func (fs *mirrorFS) Utimens(path string, tmsp []fuse.Timespec) int {
 		return errno(syscall.EINVAL)
 	}
 	tv := []syscall.Timeval{
-		{Sec: tmsp[0].Sec, Usec: int32(tmsp[0].Nsec / 1000)},
-		{Sec: tmsp[1].Sec, Usec: int32(tmsp[1].Nsec / 1000)},
+		{Sec: tmsp[0].Sec, Usec: int32(tmsp[0].Nsec / 1000)}, //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
+		{Sec: tmsp[1].Sec, Usec: int32(tmsp[1].Nsec / 1000)}, //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 	}
 	return errno(syscall.Utimes(fs.real(path), tv))
 }
@@ -708,13 +708,13 @@ func (fs *mirrorFS) Removexattr(path string, name string) int {
 
 // copyStat converts a Go syscall.Stat_t (darwin) into a fuse.Stat_t.
 func copyStat(dst *fuse.Stat_t, src *syscall.Stat_t) {
-	dst.Dev = uint64(src.Dev)
+	dst.Dev = uint64(src.Dev) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 	dst.Ino = uint64(src.Ino)
 	dst.Mode = uint32(src.Mode)
 	dst.Nlink = uint32(src.Nlink)
 	dst.Uid = src.Uid
 	dst.Gid = src.Gid
-	dst.Rdev = uint64(src.Rdev)
+	dst.Rdev = uint64(src.Rdev) //nolint:gosec // G115: FUSE/syscall ABI conversion of a kernel-supplied stat/offset field; the value is bounded by the OS
 	dst.Size = src.Size
 	dst.Atim = fuse.Timespec{Sec: src.Atimespec.Sec, Nsec: src.Atimespec.Nsec}
 	dst.Mtim = fuse.Timespec{Sec: src.Mtimespec.Sec, Nsec: src.Mtimespec.Nsec}

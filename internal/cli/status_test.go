@@ -122,8 +122,8 @@ func TestAbbreviateHome(t *testing.T) {
 // formatter's .Local() is a no-op and the expected strings hold in any zone.
 func TestHumanizeResetAt(t *testing.T) {
 	now := time.Date(2026, 6, 8, 10, 0, 0, 0, time.Local) // Monday
-	at := func(mo, d, h, min int) time.Time {
-		return time.Date(2026, time.Month(mo), d, h, min, 0, 0, time.Local)
+	at := func(mo, d, h, minute int) time.Time {
+		return time.Date(2026, time.Month(mo), d, h, minute, 0, 0, time.Local)
 	}
 	cases := map[string]struct {
 		in   time.Time
@@ -160,8 +160,10 @@ func TestRenderTableEmpty(t *testing.T) {
 func TestRenderTablePin(t *testing.T) {
 	snaps := []pool.Snapshot{
 		{Account: store.Account{ID: 1, Label: "best@example.com"}, Score: 90, HasUsage: true},
-		{Account: store.Account{ID: 2, Label: "pinned@example.com"}, Score: 50, HasUsage: true,
-			Util5h: 10, Util7d: 10, Remaining5h: 90, Components: score.Components{RawRemaining5h: 90}},
+		{
+			Account: store.Account{ID: 2, Label: "pinned@example.com"}, Score: 50, HasUsage: true,
+			Util5h: 10, Util7d: 10, Remaining5h: 90, Components: score.Components{RawRemaining5h: 90},
+		},
 	}
 	pin := dirPin{cwd: "/proj", ok: true, view: pool.PinView{
 		AccountID: 2, Manual: true, Binding: true,
@@ -187,8 +189,10 @@ func TestRenderTablePin(t *testing.T) {
 // account cannot serve — each arm of the UsableForSticky mirror independently.
 func TestRenderPinLine(t *testing.T) {
 	healthySnap := func(raw5 float64) []pool.Snapshot {
-		return []pool.Snapshot{{Account: store.Account{ID: 2, Label: "p@example.com"},
-			HasUsage: true, Components: score.Components{RawRemaining5h: raw5}}}
+		return []pool.Snapshot{{
+			Account:  store.Account{ID: 2, Label: "p@example.com"},
+			HasUsage: true, Components: score.Components{RawRemaining5h: raw5},
+		}}
 	}
 	snaps := healthySnap(50)
 	view := func(manual, live, binding bool) pool.PinView {
@@ -457,7 +461,7 @@ func TestStatusSnapshotJSONLiveFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	if err := st.UpsertAccount(store.Account{
 		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "work@example.com",
 		KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
@@ -516,7 +520,7 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { os.RemoveAll(home) })
+			t.Cleanup(func() { _ = os.RemoveAll(home) })
 			t.Setenv("HOME", home)
 
 			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
@@ -526,7 +530,7 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { ln.Close() })
+			t.Cleanup(func() { _ = ln.Close() })
 			go func() {
 				for {
 					conn, err := ln.Accept()
@@ -542,7 +546,7 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 							HasUsage: true, Remaining5h: 50, Remaining7d: 50,
 						}},
 					})
-					conn.Close()
+					_ = conn.Close()
 				}
 			}()
 
@@ -550,7 +554,7 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { st.Close() })
+			t.Cleanup(func() { _ = st.Close() })
 			if err := st.UpsertAccount(store.Account{
 				ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "from-store",
 				KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
@@ -688,7 +692,7 @@ func TestRunStatusPlainHolderFooter(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { os.RemoveAll(home) })
+			t.Cleanup(func() { _ = os.RemoveAll(home) })
 			t.Setenv("HOME", home)
 			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 				t.Fatal(err)
@@ -697,7 +701,7 @@ func TestRunStatusPlainHolderFooter(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { ln.Close() })
+			t.Cleanup(func() { _ = ln.Close() })
 			go func() {
 				for {
 					conn, err := ln.Accept()
@@ -714,7 +718,7 @@ func TestRunStatusPlainHolderFooter(t *testing.T) {
 						}},
 						Holder: tc.holder,
 					})
-					conn.Close()
+					_ = conn.Close()
 				}
 			}()
 
@@ -722,7 +726,7 @@ func TestRunStatusPlainHolderFooter(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { st.Close() })
+			t.Cleanup(func() { _ = st.Close() })
 
 			var buf bytes.Buffer
 			cmd := &cobra.Command{}

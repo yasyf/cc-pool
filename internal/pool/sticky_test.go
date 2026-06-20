@@ -18,7 +18,7 @@ func openTestManager(t *testing.T) *Manager {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	return &Manager{Store: st, LockDir: t.TempDir()}
 }
 
@@ -77,95 +77,139 @@ func TestStickyPick(t *testing.T) {
 		wantRowGone bool // row 4 hygiene: expired records are deleted on read
 	}{
 		// No-data fallback (row 10): selected_at freshness alone binds.
-		{name: "fresh select binds with no sessions", cwd: "/proj", record: true, recordID: 2,
-			recordedAt: now.Add(-30 * time.Minute), ranked: healthy, wantOutcome: StickyBind, wantID: 2},
-		{name: "exactly at TTL still binds", cwd: "/proj", record: true, recordID: 2,
-			recordedAt: now.Add(-StickyTTL), ranked: healthy, wantOutcome: StickyBind, wantID: 2},
-		{name: "expired with no sessions misses and is dropped", cwd: "/proj", record: true, recordID: 2,
-			recordedAt: now.Add(-StickyTTL - time.Minute), ranked: healthy, wantOutcome: StickyMiss, wantRowGone: true},
+		{
+			name: "fresh select binds with no sessions", cwd: "/proj", record: true, recordID: 2,
+			recordedAt: now.Add(-30 * time.Minute), ranked: healthy, wantOutcome: StickyBind, wantID: 2,
+		},
+		{
+			name: "exactly at TTL still binds", cwd: "/proj", record: true, recordID: 2,
+			recordedAt: now.Add(-StickyTTL), ranked: healthy, wantOutcome: StickyBind, wantID: 2,
+		},
+		{
+			name: "expired with no sessions misses and is dropped", cwd: "/proj", record: true, recordID: 2,
+			recordedAt: now.Add(-StickyTTL - time.Minute), ranked: healthy, wantOutcome: StickyMiss, wantRowGone: true,
+		},
 
 		// Activity rules: live sessions hold, warm ends bind, cold ends expire.
-		{name: "live-only session holds", cwd: "/proj", record: true, recordID: 2,
+		{
+			name: "live-only session holds", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-10 * time.Minute),
 			sessions:   []session{{started: now.Add(-10 * time.Minute)}},
-			ranked:     healthy, wantOutcome: StickyHold, wantID: 2},
-		{name: "long session keeps stale pin alive", cwd: "/proj", record: true, recordID: 2,
+			ranked:     healthy, wantOutcome: StickyHold, wantID: 2,
+		},
+		{
+			name: "long session keeps stale pin alive", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-3 * time.Hour), // selected long ago, session still running
 			sessions:   []session{{started: now.Add(-3 * time.Hour)}},
-			ranked:     healthy, wantOutcome: StickyHold, wantID: 2},
-		{name: "warm ended session binds despite stale select", cwd: "/proj", record: true, recordID: 2,
+			ranked:     healthy, wantOutcome: StickyHold, wantID: 2,
+		},
+		{
+			name: "warm ended session binds despite stale select", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-3 * time.Hour), // the headline fix: >1h session, ended 10m ago
 			sessions:   []session{{started: now.Add(-3 * time.Hour), ended: ts(-10 * time.Minute)}},
-			ranked:     healthy, wantOutcome: StickyBind, wantID: 2},
-		{name: "warm end binds even with another session live", cwd: "/proj", record: true, recordID: 2,
+			ranked:     healthy, wantOutcome: StickyBind, wantID: 2,
+		},
+		{
+			name: "warm end binds even with another session live", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-3 * time.Hour),
 			sessions: []session{
 				{started: now.Add(-2 * time.Hour), ended: ts(-10 * time.Minute)},
 				{started: now.Add(-30 * time.Minute)}, // still live
 			},
-			ranked: healthy, wantOutcome: StickyBind, wantID: 2},
-		{name: "warm window keys off the later end", cwd: "/proj", record: true, recordID: 2,
+			ranked: healthy, wantOutcome: StickyBind, wantID: 2,
+		},
+		{
+			name: "warm window keys off the later end", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-5 * time.Hour),
 			sessions: []session{
 				{started: now.Add(-5 * time.Hour), ended: ts(-4 * time.Hour)},
 				{started: now.Add(-3 * time.Hour), ended: ts(-30 * time.Minute)},
 			},
-			ranked: healthy, wantOutcome: StickyBind, wantID: 2},
-		{name: "cold ended sessions expire the pin", cwd: "/proj", record: true, recordID: 2,
+			ranked: healthy, wantOutcome: StickyBind, wantID: 2,
+		},
+		{
+			name: "cold ended sessions expire the pin", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-3 * time.Hour),
 			sessions:   []session{{started: now.Add(-3 * time.Hour), ended: ts(-2 * time.Hour)}},
-			ranked:     healthy, wantOutcome: StickyMiss, wantRowGone: true},
-		{name: "cold history but fresh select binds", cwd: "/proj", record: true, recordID: 2,
+			ranked:     healthy, wantOutcome: StickyMiss, wantRowGone: true,
+		},
+		{
+			name: "cold history but fresh select binds", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-5 * time.Minute), // e.g. a pid-0 select after old sessions
 			sessions:   []session{{started: now.Add(-3 * time.Hour), ended: ts(-2 * time.Hour)}},
-			ranked:     healthy, wantOutcome: StickyBind, wantID: 2},
+			ranked:     healthy, wantOutcome: StickyBind, wantID: 2,
+		},
 
 		// Activity is account-scoped: the cache a pin protects belongs to the
 		// pinned account, so another account's sessions neither warm nor hold.
-		{name: "other account's warm end cannot warm the pin", cwd: "/proj", record: true, recordID: 2,
+		{
+			name: "other account's warm end cannot warm the pin", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-3 * time.Hour),
 			sessions:   []session{{account: 1, started: now.Add(-3 * time.Hour), ended: ts(-10 * time.Minute)}},
-			ranked:     healthy, wantOutcome: StickyMiss, wantRowGone: true},
-		{name: "other account's live session cannot hold the pin", cwd: "/proj", record: true, recordID: 2,
+			ranked:     healthy, wantOutcome: StickyMiss, wantRowGone: true,
+		},
+		{
+			name: "other account's live session cannot hold the pin", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-3 * time.Hour),
 			sessions:   []session{{account: 1, started: now.Add(-3 * time.Hour)}},
-			ranked:     healthy, wantOutcome: StickyMiss, wantRowGone: true},
+			ranked:     healthy, wantOutcome: StickyMiss, wantRowGone: true,
+		},
 
 		// Manual pins: no warm-cache requirement, no live-session skip.
-		{name: "manual binds with no sessions", cwd: "/proj", record: true, manual: true, recordID: 2,
-			recordedAt: now.Add(-30 * time.Minute), ranked: healthy, wantOutcome: StickyBind, wantID: 2},
-		{name: "manual binds through a live session", cwd: "/proj", record: true, manual: true, recordID: 2,
+		{
+			name: "manual binds with no sessions", cwd: "/proj", record: true, manual: true, recordID: 2,
+			recordedAt: now.Add(-30 * time.Minute), ranked: healthy, wantOutcome: StickyBind, wantID: 2,
+		},
+		{
+			name: "manual binds through a live session", cwd: "/proj", record: true, manual: true, recordID: 2,
 			recordedAt: now.Add(-10 * time.Minute),
 			sessions:   []session{{started: now.Add(-10 * time.Minute)}},
-			ranked:     healthy, wantOutcome: StickyBind, wantID: 2},
-		{name: "manual expires like auto and is dropped", cwd: "/proj", record: true, manual: true, recordID: 2,
-			recordedAt: now.Add(-2 * time.Hour), ranked: healthy, wantOutcome: StickyMiss, wantRowGone: true},
-		{name: "manual to unusable account is held", cwd: "/proj", record: true, manual: true, recordID: 2,
-			recordedAt: now, ranked: pinUnusable, wantOutcome: StickyHoldManual, wantID: 2},
+			ranked:     healthy, wantOutcome: StickyBind, wantID: 2,
+		},
+		{
+			name: "manual expires like auto and is dropped", cwd: "/proj", record: true, manual: true, recordID: 2,
+			recordedAt: now.Add(-2 * time.Hour), ranked: healthy, wantOutcome: StickyMiss, wantRowGone: true,
+		},
+		{
+			name: "manual to unusable account is held", cwd: "/proj", record: true, manual: true, recordID: 2,
+			recordedAt: now, ranked: pinUnusable, wantOutcome: StickyHoldManual, wantID: 2,
+		},
 
 		// Unusable auto pins are abandoned (2026-06-10 incident behavior).
-		{name: "near-full auto pin abandoned", cwd: "/proj", record: true, recordID: 2,
-			recordedAt: now, ranked: pinUnusable, wantOutcome: StickyMiss},
-		{name: "rate-limited auto pin abandoned", cwd: "/proj", record: true, recordID: 2,
+		{
+			name: "near-full auto pin abandoned", cwd: "/proj", record: true, recordID: 2,
+			recordedAt: now, ranked: pinUnusable, wantOutcome: StickyMiss,
+		},
+		{
+			name: "rate-limited auto pin abandoned", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now, ranked: []score.Result{
 				{AccountID: 1, Score: 80, Available: true, Components: score.Components{RawRemaining5h: 90}},
 				{AccountID: 2, Score: -50, Available: false, Components: score.Components{RawRemaining5h: 50}},
-			}, wantOutcome: StickyMiss},
+			}, wantOutcome: StickyMiss,
+		},
 		// The 2026-06-10 incident: the pinned account is exhausted but its
 		// imminent reset keeps eff5 high — the pin must still be abandoned.
-		{name: "exhausted auto pin abandoned", cwd: "/proj", record: true, recordID: 2,
+		{
+			name: "exhausted auto pin abandoned", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now, ranked: []score.Result{
 				{AccountID: 1, Score: 80, Available: true, Components: score.Components{RawRemaining5h: 60}},
 				{AccountID: 2, Score: 65, Available: false, Exhausted: true, Components: score.Components{Eff5: 93, RawRemaining5h: 0}},
-			}, wantOutcome: StickyMiss},
+			}, wantOutcome: StickyMiss,
+		},
 
 		// Structural misses.
-		{name: "account deleted", cwd: "/proj", record: true, recordID: 9,
-			recordedAt: now, ranked: healthy, wantOutcome: StickyMiss},
-		{name: "empty cwd disabled", cwd: "", record: true, recordID: 2,
-			recordedAt: now, ranked: healthy, wantOutcome: StickyMiss},
-		{name: "no record", cwd: "/other", record: true, recordID: 2,
-			recordedAt: now, ranked: healthy, wantOutcome: StickyMiss},
+		{
+			name: "account deleted", cwd: "/proj", record: true, recordID: 9,
+			recordedAt: now, ranked: healthy, wantOutcome: StickyMiss,
+		},
+		{
+			name: "empty cwd disabled", cwd: "", record: true, recordID: 2,
+			recordedAt: now, ranked: healthy, wantOutcome: StickyMiss,
+		},
+		{
+			name: "no record", cwd: "/other", record: true, recordID: 2,
+			recordedAt: now, ranked: healthy, wantOutcome: StickyMiss,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -173,7 +217,7 @@ func TestStickyPick(t *testing.T) {
 			if tc.record {
 				var err error
 				if tc.manual {
-					m.Store.UpsertAccount(store.Account{ID: tc.recordID, ConfigDir: "dir", KeychainService: "s", KeychainAccount: "u"})
+					_ = m.Store.UpsertAccount(store.Account{ID: tc.recordID, ConfigDir: "dir", KeychainService: "s", KeychainAccount: "u"})
 					err = m.Store.PinManual("/proj", tc.recordID, tc.recordedAt)
 				} else {
 					err = m.Store.UpsertSticky("/proj", tc.recordID, tc.recordedAt)
@@ -246,7 +290,7 @@ func TestPinAPI(t *testing.T) {
 		if err := m.PinManual("/proj", 9, now); err == nil {
 			t.Fatal("unknown account must fail")
 		}
-		m.Store.UpsertAccount(store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+		_ = m.Store.UpsertAccount(store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 		if err := m.PinManual("/proj", 1, now); err != nil {
 			t.Fatal(err)
 		}
@@ -258,8 +302,8 @@ func TestPinAPI(t *testing.T) {
 
 	t.Run("toggle pins, repins, unpins", func(t *testing.T) {
 		m := openTestManager(t)
-		m.Store.UpsertAccount(store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-		m.Store.UpsertAccount(store.Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+		_ = m.Store.UpsertAccount(store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+		_ = m.Store.UpsertAccount(store.Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 
 		pinned, err := m.TogglePin("/proj", 1, now)
 		if err != nil || !pinned {
@@ -281,14 +325,14 @@ func TestPinAPI(t *testing.T) {
 			t.Fatal("pin should be gone")
 		}
 		// An AUTO pin to the toggled account also unpins (release the dir).
-		m.Store.UpsertSticky("/proj", 2, now)
+		_ = m.Store.UpsertSticky("/proj", 2, now)
 		pinned, err = m.TogglePin("/proj", 2, now)
 		if err != nil || pinned {
 			t.Fatalf("auto unpin toggle: pinned=%v err=%v", pinned, err)
 		}
 		// An EXPIRED unpruned pin counts as absent: the press must pin, not
 		// silently release a pin the selector already misses.
-		m.Store.PinManual("/proj", 2, now.Add(-2*time.Hour))
+		_ = m.Store.PinManual("/proj", 2, now.Add(-2*time.Hour))
 		pinned, err = m.TogglePin("/proj", 2, now)
 		if err != nil || !pinned {
 			t.Fatalf("toggle on an expired pin must pin: pinned=%v err=%v", pinned, err)
@@ -300,7 +344,7 @@ func TestPinAPI(t *testing.T) {
 
 	t.Run("view reflects state and hides expired pins", func(t *testing.T) {
 		m := openTestManager(t)
-		m.Store.UpsertAccount(store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+		_ = m.Store.UpsertAccount(store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 
 		if _, ok, err := m.PinView("/proj", now); ok || err != nil {
 			t.Fatalf("no pin: ok=%v err=%v", ok, err)
@@ -326,7 +370,7 @@ func TestPinAPI(t *testing.T) {
 		if !pv.Live || !pv.ExpiresAt.IsZero() {
 			t.Fatalf("live view = %+v", pv)
 		}
-		m.Store.UpsertSticky("/auto", 1, now)
+		_ = m.Store.UpsertSticky("/auto", 1, now)
 		seedSessionFor(t, m, 1, "/auto", now.Add(-10*time.Minute), nil)
 		pv, _, _ = m.PinView("/auto", now)
 		if pv.Manual || pv.Binding {
@@ -334,7 +378,7 @@ func TestPinAPI(t *testing.T) {
 		}
 
 		// Expired pins are invisible.
-		m.Store.PinManual("/stale", 1, now.Add(-2*time.Hour))
+		_ = m.Store.PinManual("/stale", 1, now.Add(-2*time.Hour))
 		if _, ok, _ := m.PinView("/stale", now); ok {
 			t.Fatal("expired pin must not render")
 		}
@@ -346,7 +390,7 @@ func TestPinAPI(t *testing.T) {
 // select path treats stickiness as best-effort.
 func TestClassifyDegradesOnStoreError(t *testing.T) {
 	m := openTestManager(t)
-	m.Store.Close() // force GetCwdActivity to fail
+	_ = m.Store.Close() // force GetCwdActivity to fail
 	now := time.Now()
 	ps := m.classify(store.Sticky{Cwd: "/proj", AccountID: 1, SelectedAt: now.Add(-10 * time.Minute)}, now)
 	if ps.live || ps.warm {
@@ -378,7 +422,7 @@ func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 		dir := t.TempDir()
 		for id, util := range map[int]float64{1: 10, 2: 50} {
 			if err := m.Store.UpsertAccount(store.Account{
-				ID: id, ConfigDir: filepath.Join(dir, "acct", string(rune('a'+id))),
+				ID: id, ConfigDir: filepath.Join(dir, "acct", string(rune('a'+id))), //nolint:gosec // G115: id is a small test-loop index; 'a'+id stays well within rune range
 				KeychainService: "svc", KeychainAccount: "u",
 			}); err != nil {
 				t.Fatal(err)
@@ -460,7 +504,7 @@ func TestSelectHonorsSticky(t *testing.T) {
 		dir := t.TempDir()
 		for id, util := range map[int]float64{1: 10, 2: 50} {
 			if err := m.Store.UpsertAccount(store.Account{
-				ID: id, ConfigDir: filepath.Join(dir, "acct", string(rune('a'+id))),
+				ID: id, ConfigDir: filepath.Join(dir, "acct", string(rune('a'+id))), //nolint:gosec // G115: id is a small test-loop index; 'a'+id stays well within rune range
 				KeychainService: "svc", KeychainAccount: "u",
 			}); err != nil {
 				t.Fatal(err)
@@ -593,7 +637,7 @@ func TestSelectAllExhaustedFallback(t *testing.T) {
 	dir := t.TempDir()
 	for id, util7 := range map[int]float64{1: 90, 2: 10} {
 		if err := m.Store.UpsertAccount(store.Account{
-			ID: id, ConfigDir: filepath.Join(dir, "acct", string(rune('a'+id))),
+			ID: id, ConfigDir: filepath.Join(dir, "acct", string(rune('a'+id))), //nolint:gosec // G115: id is a small test-loop index; 'a'+id stays well within rune range
 			KeychainService: "svc", KeychainAccount: "u",
 		}); err != nil {
 			t.Fatal(err)

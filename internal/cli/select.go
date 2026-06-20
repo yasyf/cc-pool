@@ -50,7 +50,7 @@ scores; otherwise it samples usage live.`,
 				if err != nil {
 					return err
 				}
-				fmt.Fprintln(cmd.OutOrStdout(), dir)
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), dir)
 				announceLine(cmd, line)
 				return nil
 			})

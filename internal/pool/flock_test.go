@@ -25,7 +25,7 @@ func bumpUnderLock(t *testing.T, lockPath, counterPath string) {
 		return
 	}
 	defer h.release()
-	b, err := os.ReadFile(counterPath)
+	b, err := os.ReadFile(counterPath) //nolint:gosec // G304: counterPath is under the test's own t.TempDir()
 	if err != nil {
 		t.Errorf("read counter: %v", err)
 		return
@@ -64,7 +64,7 @@ func TestFlockSerializesCriticalSection(t *testing.T) {
 	}
 	wg.Wait()
 
-	b, err := os.ReadFile(counterPath)
+	b, err := os.ReadFile(counterPath) //nolint:gosec // G304: counterPath is under the test's own t.TempDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,6 +114,7 @@ func TestFlockChildHolds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("child acquire: %v", err)
 	}
+	//nolint:gosec // G703: readyPath is under the test's own t.TempDir(), not external input
 	if err := os.WriteFile(readyPath, []byte("1"), 0o600); err != nil {
 		t.Fatalf("child signal ready: %v", err)
 	}
@@ -129,6 +130,7 @@ func TestFlockCrossProcess(t *testing.T) {
 	lockPath := filepath.Join(dir, "x.lock")
 	readyPath := filepath.Join(dir, "ready")
 
+	//nolint:gosec // G204: re-execs this test binary (os.Args[0]) with fixed flags to take the flock from a separate process
 	child := exec.Command(os.Args[0], "-test.run=^TestFlockChildHolds$", "-test.v")
 	child.Env = append(os.Environ(),
 		flockChildLockEnv+"="+lockPath,

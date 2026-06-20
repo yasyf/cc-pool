@@ -63,7 +63,7 @@ func BenchmarkGetattrSharedLink(b *testing.B) {
 	home := b.TempDir()
 	base := filepath.Join(home, ".claude")
 	priv := filepath.Join(home, "acct.private")
-	_ = os.MkdirAll(filepath.Join(base, "projects"), 0o755)
+	_ = os.MkdirAll(filepath.Join(base, "projects"), 0o755) //nolint:gosec // G301: dir perms are intentional for this test's fixture layout
 	_ = os.MkdirAll(priv, 0o700)
 	fs := newMirrorFS(base, priv, filepath.Join(home, ".claude.json"))
 	fs.snapshotShared()
@@ -327,7 +327,7 @@ func sampleCPU(vol string, selfPid int, window time.Duration) (nfs, self float64
 
 // topCPU returns one pid's %CPU from the SECOND (1s-delta) sample of `top -l 2`.
 func topCPU(pid string) float64 {
-	out, _ := exec.Command("top", "-l", "2", "-s", "1", "-stats", "pid,cpu", "-pid", pid).CombinedOutput()
+	out, _ := exec.Command("top", "-l", "2", "-s", "1", "-stats", "pid,cpu", "-pid", pid).CombinedOutput() //nolint:gosec // G204: a fixed diagnostic subprocess in a perf harness test, not user input
 	var cpu float64
 	for _, ln := range strings.Split(string(out), "\n") {
 		f := strings.Fields(ln)
@@ -341,7 +341,7 @@ func topCPU(pid string) float64 {
 }
 
 func nfsv4Pid(vol string) string {
-	out, _ := exec.Command("pgrep", "-f", "go-nfsv4.*"+vol).CombinedOutput()
+	out, _ := exec.Command("pgrep", "-f", "go-nfsv4.*"+vol).CombinedOutput() //nolint:gosec // G204: a fixed diagnostic subprocess in a perf harness test, not user input
 	return strings.TrimSpace(strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)[0])
 }
 
@@ -353,10 +353,10 @@ func sampleNFSStacks(vol string) string {
 		return "(go-nfsv4 not found)"
 	}
 	f := filepath.Join(os.TempDir(), "ccp_perf_nfs_"+vol+".txt")
-	if err := exec.Command("sample", pid, "5", "-file", f).Run(); err != nil {
+	if err := exec.Command("sample", pid, "5", "-file", f).Run(); err != nil { //nolint:gosec // G204: a fixed diagnostic subprocess in a perf harness test, not user input
 		return "(sample failed: " + err.Error() + ")"
 	}
-	b, err := os.ReadFile(f)
+	b, err := os.ReadFile(f) //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 	if err != nil {
 		return "(read sample failed)"
 	}
@@ -379,14 +379,14 @@ func buildSyntheticClaude(t *testing.T, nProj int) (base, baseCJ string) {
 	baseCJ = filepath.Join(home, ".claude.json")
 	for _, name := range []string{"projects", "history", "todos", "shell-snapshots", "statsig"} {
 		d := filepath.Join(base, name)
-		if err := os.MkdirAll(d, 0o755); err != nil {
+		if err := os.MkdirAll(d, 0o755); err != nil { //nolint:gosec // G301: dir perms are intentional for this test's fixture layout
 			t.Fatal(err)
 		}
 		for k := 0; k < 5; k++ {
-			_ = os.WriteFile(filepath.Join(d, "f"+strconv.Itoa(k)+".jsonl"), []byte("{}\n"), 0o644)
+			_ = os.WriteFile(filepath.Join(d, "f"+strconv.Itoa(k)+".jsonl"), []byte("{}\n"), 0o644) //nolint:gosec // G306: perms are intentional for this test fixture file
 		}
 	}
-	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{}`), 0o644); err != nil { //nolint:gosec // G306: perms are intentional for this test fixture file
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(baseCJ, buildClaudeJSON(nProj, "base"), 0o600); err != nil {

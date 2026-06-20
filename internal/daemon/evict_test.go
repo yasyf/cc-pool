@@ -58,7 +58,7 @@ func newFakeDaemonOpts(t *testing.T, ver string, releaseOnStop, flocked bool, lo
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	socket := filepath.Join(sockDir, "d.sock")
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
@@ -66,7 +66,7 @@ func newFakeDaemonOpts(t *testing.T, ver string, releaseOnStop, flocked bool, lo
 	}
 	f := &fakeDaemon{ln: ln, socket: socket, version: ver, releaseOnStop: releaseOnStop, lockDelay: lockDelay}
 	if flocked {
-		lock, err := os.OpenFile(socket+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+		lock, err := os.OpenFile(socket+".lock", os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: socket is under the test's own t.TempDir()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -74,10 +74,10 @@ func newFakeDaemonOpts(t *testing.T, ver string, releaseOnStop, flocked bool, lo
 			t.Fatal(err)
 		}
 		f.lock = lock
-		t.Cleanup(func() { f.lock.Close() })
+		t.Cleanup(func() { _ = f.lock.Close() })
 	}
 	go f.serve()
-	t.Cleanup(func() { f.ln.Close() })
+	t.Cleanup(func() { _ = f.ln.Close() })
 	return f
 }
 
@@ -89,29 +89,29 @@ func (f *fakeDaemon) serve() {
 		}
 		var req Request
 		if err := json.NewDecoder(conn).Decode(&req); err != nil {
-			conn.Close() // probe dial (e.g. WaitGone) with no request body
+			_ = conn.Close() // probe dial (e.g. WaitGone) with no request body
 			continue
 		}
 		_ = json.NewEncoder(conn).Encode(Response{OK: true, Version: f.version})
-		conn.Close()
+		_ = conn.Close()
 		if req.Op == OpShutdown && f.releaseOnStop {
 			if f.lockDelay > 0 {
 				// Socket first, flock later: a real dying daemon's listener
 				// closes at ctx-cancel time, but its flock — serve's last
 				// defer — is released only after the goroutine drain.
-				f.ln.Close()
+				_ = f.ln.Close()
 				time.Sleep(f.lockDelay)
 				if f.lock != nil {
-					f.lock.Close()
+					_ = f.lock.Close()
 				}
 				return
 			}
 			// Lock before socket: by the time a successor's WaitGone observes
 			// the socket gone, the flock is free.
 			if f.lock != nil {
-				f.lock.Close()
+				_ = f.lock.Close()
 			}
-			f.ln.Close() // release the socket so a successor can rebind
+			_ = f.ln.Close() // release the socket so a successor can rebind
 			return
 		}
 	}
@@ -145,8 +145,8 @@ func TestListenEvictsSkewedHolder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen should evict the skewed holder and bind, got err = %v", err)
 	}
-	defer ln.Close()
-	defer lock.Close()
+	defer func() { _ = ln.Close() }()
+	defer func() { _ = lock.Close() }()
 	if ln == nil {
 		t.Fatal("listen returned a nil listener after eviction")
 	}
@@ -175,7 +175,7 @@ func TestHandleShutdownEndsServe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 
 	s := &Server{
 		m:               &pool.Manager{Store: st},
@@ -191,7 +191,7 @@ func TestHandleShutdownEndsServe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { err := s.serve(ctx); st.Close(); done <- err }()
+	go func() { err := s.serve(ctx); _ = st.Close(); done <- err }()
 
 	cl := &Client{socket: s.socket}
 	deadline := time.Now().Add(5 * time.Second)
@@ -226,7 +226,7 @@ func TestWaitGone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	socket := filepath.Join(sockDir, "d.sock")
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
@@ -237,7 +237,7 @@ func TestWaitGone(t *testing.T) {
 	if cl.WaitGone(300 * time.Millisecond) {
 		t.Fatal("WaitGone reported gone while the socket is live")
 	}
-	ln.Close()
+	_ = ln.Close()
 	if !cl.WaitGone(2 * time.Second) {
 		t.Fatal("WaitGone did not report gone after the socket was closed")
 	}
@@ -263,13 +263,13 @@ func TestListenRefusedWhileLockHeld(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { os.RemoveAll(sockDir) })
+		t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 		socket := filepath.Join(sockDir, "d.sock")
-		lock, err := os.OpenFile(socket+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+		lock, err := os.OpenFile(socket+".lock", os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: socket is under the test's own t.TempDir()
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer lock.Close()
+		defer func() { _ = lock.Close() }()
 		// flock contends between two open file descriptions even in one
 		// process, so holding it here stands in for a concurrently starting
 		// daemon that won the lock but has not bound its socket yet.
@@ -313,8 +313,8 @@ func TestListenEvictsFlockedSkewedDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen should evict the flocked skewed daemon and bind: %v", err)
 	}
-	defer ln.Close()
-	defer lock.Close()
+	defer func() { _ = ln.Close() }()
+	defer func() { _ = lock.Close() }()
 }
 
 // TestListenWaitsOutEvictedPeersFlockDrain pins the post-evict lock poll: a
@@ -331,8 +331,8 @@ func TestListenWaitsOutEvictedPeersFlockDrain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen must wait out the evicted peer's flock drain: %v", err)
 	}
-	defer ln.Close()
-	defer lock.Close()
+	defer func() { _ = ln.Close() }()
+	defer func() { _ = lock.Close() }()
 }
 
 // TestListenEvictedPeerNeverReleasesFlock is the bounded-wait negative: an
@@ -356,7 +356,7 @@ func TestCrashedDaemonLockAndSocketReclaimed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	socket := filepath.Join(sockDir, "d.sock")
 	if err := os.WriteFile(socket+".lock", nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -375,8 +375,8 @@ func TestCrashedDaemonLockAndSocketReclaimed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen over a crashed daemon's leavings: %v", err)
 	}
-	defer ln2.Close()
-	defer lock.Close()
+	defer func() { _ = ln2.Close() }()
+	defer func() { _ = lock.Close() }()
 	if _, err := os.Stat(socket + ".lock"); err != nil {
 		t.Fatalf("lock file must survive (never unlinked): %v", err)
 	}
@@ -391,7 +391,7 @@ func TestEvictHolderKillsWedgedOrphan(t *testing.T) {
 	var gotSocket string
 	setKillSocketPeer(t, func(socket string) (int, error) {
 		gotSocket = socket
-		f.ln.Close() // the "kill" releases the socket so the successor can rebind
+		_ = f.ln.Close() // the "kill" releases the socket so the successor can rebind
 		return 999001, nil
 	})
 
@@ -400,8 +400,8 @@ func TestEvictHolderKillsWedgedOrphan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen should reap the wedged orphan and bind, got err = %v", err)
 	}
-	defer ln.Close()
-	defer lock.Close()
+	defer func() { _ = ln.Close() }()
+	defer func() { _ = lock.Close() }()
 	if gotSocket != f.socket {
 		t.Fatalf("killSocketPeer got socket %q, want the held daemon socket %q", gotSocket, f.socket)
 	}

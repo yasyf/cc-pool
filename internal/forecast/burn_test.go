@@ -133,8 +133,10 @@ func TestBurn7d(t *testing.T) {
 		"forty-five-minute staircase is rejected": {
 			// A noisy 45-min climb that Burn5h would read as a steep slope: the
 			// 7d span is far below Burn7dMinSpan, so it yields nothing.
-			[]store.UsageSample{s7(now, 0, 4), s7(now, 15*time.Minute, 3),
-				s7(now, 30*time.Minute, 2), s7(now, 45*time.Minute, 1)},
+			[]store.UsageSample{
+				s7(now, 0, 4), s7(now, 15*time.Minute, 3),
+				s7(now, 30*time.Minute, 2), s7(now, 45*time.Minute, 1),
+			},
 			0,
 		},
 		"sub-three-hour span yields zero": {
@@ -156,8 +158,10 @@ func TestBurn7d(t *testing.T) {
 		"rate-limited placeholder does not fake a reset": {
 			// The zeroed 429 sample mid-stream is dropped; the window stays
 			// intact at 12% over 6h = 2%/hr.
-			[]store.UsageSample{s7(now, 0, 12), s7(now, 2*hr, 8), rlSample(now, 3*hr),
-				s7(now, 4*hr, 4), s7(now, 6*hr, 0)},
+			[]store.UsageSample{
+				s7(now, 0, 12), s7(now, 2*hr, 8), rlSample(now, 3*hr),
+				s7(now, 4*hr, 4), s7(now, 6*hr, 0),
+			},
 			2,
 		},
 		"samples beyond the window are excluded": {

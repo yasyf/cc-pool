@@ -87,7 +87,7 @@ func WritePlist() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return "", err
 	}
 	if err := pool.EnsureStateDir(); err != nil {
@@ -105,7 +105,7 @@ func WritePlist() (string, error) {
 	}); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -115,6 +115,7 @@ func domainTarget() string  { return "gui/" + strconv.Itoa(os.Getuid()) }
 func serviceTarget() string { return domainTarget() + "/" + Label }
 
 func launchctl(args ...string) (string, error) {
+	//nolint:gosec // G204: launchctl is fixed; args are this package's own launchd subcommand tokens, not user input
 	cmd := exec.Command("launchctl", args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
@@ -130,14 +131,14 @@ func Install() error {
 	// Best-effort remove any previous instance so bootstrap does not conflict.
 	_, _ = launchctl("bootout", serviceTarget())
 	if out, err := launchctl("bootstrap", domainTarget(), plist); err != nil {
-		return fmt.Errorf("launchctl bootstrap: %v: %s", err, out)
+		return fmt.Errorf("launchctl bootstrap: %w: %s", err, out)
 	}
 	_, _ = launchctl("enable", serviceTarget())
 	// bootstrap already started the agent (RunAtLoad); plain `kickstart` (no
 	// `-k`) only covers the loaded-but-not-running race and is a no-op when it is
 	// already running, so we don't kill and cold-start it a second time.
 	if out, err := launchctl("kickstart", serviceTarget()); err != nil {
-		return fmt.Errorf("launchctl kickstart: %v: %s", err, out)
+		return fmt.Errorf("launchctl kickstart: %w: %s", err, out)
 	}
 	return nil
 }

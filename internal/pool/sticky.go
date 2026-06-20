@@ -19,15 +19,15 @@ var StickyTTL = time.Hour
 type StickyOutcome int
 
 const (
-	// StickyMiss: no pin worth honoring — rank freely and record the winner.
+	// StickyMiss means no pin worth honoring — rank freely and record the winner.
 	StickyMiss StickyOutcome = iota
-	// StickyBind: launch on the pinned account.
+	// StickyBind means launch on the pinned account.
 	StickyBind
-	// StickyHold: the pin is alive but only live sessions carry it — a new
+	// StickyHold means the pin is alive but only live sessions carry it — a new
 	// session cannot resume one, so rank freely without repointing the pin;
 	// it binds for a TTL once a session ends.
 	StickyHold
-	// StickyHoldManual: a manual pin whose account is temporarily unusable —
+	// StickyHoldManual is a manual pin whose account is temporarily unusable —
 	// rank freely, keep the pin, and surface the bypass to the user.
 	StickyHoldManual
 )

@@ -97,7 +97,7 @@ var (
 // fresh (see lastProbeNonce). It runs inside a deepProbes goroutine; on a
 // wedged mirror it parks in open or read until the kernel answers.
 func readProbeFile(path string) error {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // G304: path is a cc-pool-managed overlay mirror file under the state dir
 	if err != nil {
 		// ENOENT and a permission-class refusal (EPERM/EACCES → os.ErrPermission)
 		// both mean this mirror does not serve a readable probe to an external
@@ -109,7 +109,7 @@ func readProbeFile(path string) error {
 		}
 		return fmt.Errorf("deep probe open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	// F_NOCACHE: without it the NFS client's page cache can satisfy the whole
 	// read after the first probe, proving nothing about the mirror. The
 	// mirror's advancing-mtime Getattr is the second half of the same defense.
@@ -164,9 +164,9 @@ func FillProbe(nonce uint64, ofst int64, buff []byte) {
 // the nonce and the byte's file offset. Cheap on purpose — the mirror
 // regenerates it for every NFS READ of the 2 MiB file.
 func probeByte(nonce uint64, off int64) byte {
-	x := nonce + uint64(off)*0x9E3779B97F4A7C15
+	x := nonce + uint64(off)*0x9E3779B97F4A7C15 //nolint:gosec // G115: off is a non-negative file offset; the wraparound is intended for the probe hash
 	x ^= x >> 30
 	x *= 0xBF58476D1CE4E5B9
 	x ^= x >> 27
-	return byte(x)
+	return byte(x) //nolint:gosec // G115: deliberately truncating the splitmix64 hash to one byte for the probe pattern
 }

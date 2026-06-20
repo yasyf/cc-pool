@@ -141,7 +141,7 @@ func TestPerAccountLockSerializesCredentialCycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 
 	a := store.Account{ID: 1, KeychainService: "svc", KeychainAccount: "user"}
 	fk := newFakeKeychain()

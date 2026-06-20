@@ -55,7 +55,7 @@ func runWidget(cmd *cobra.Command) error {
 		}
 	}
 	success(out, "Widget installed.")
-	fmt.Fprint(out, widgetInstructions())
+	_, _ = fmt.Fprint(out, widgetInstructions())
 	return nil
 }
 
@@ -99,6 +99,7 @@ func brewInstallWidget(cmd *cobra.Command) error {
 func brewCask(cmd *cobra.Command, args ...string) error {
 	// -y / --no-ask disables Homebrew's default ask-mode confirmation so the
 	// install runs unattended. It follows the subcommand: `brew install -y --cask …`.
+	//nolint:gosec // G204: args are this CLI's own fixed `brew install --cask` argv, not user input
 	c := exec.Command("brew", append([]string{args[0], "-y"}, args[1:]...)...)
 	c.Stdout, c.Stderr = cmd.OutOrStdout(), cmd.ErrOrStderr()
 	return c.Run()
@@ -106,6 +107,7 @@ func brewCask(cmd *cobra.Command, args ...string) error {
 
 // runStreamed runs a command with its output streamed to the user.
 func runStreamed(cmd *cobra.Command, name string, args ...string) error {
+	//nolint:gosec // G204: name/args are this CLI's own fixed subprocess invocation, not user input
 	c := exec.Command(name, args...)
 	c.Stdout, c.Stderr = cmd.OutOrStdout(), cmd.ErrOrStderr()
 	return c.Run()

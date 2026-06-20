@@ -19,9 +19,9 @@ const credentialFile = ".credentials.json"
 type Source int
 
 const (
-	// SourceKeychain: the macOS Keychain item named ServiceName(configDir).
+	// SourceKeychain is the macOS Keychain item named ServiceName(configDir).
 	SourceKeychain Source = iota
-	// SourceFile: claude's plaintext $CONFIG_DIR/.credentials.json fallback.
+	// SourceFile is claude's plaintext $CONFIG_DIR/.credentials.json fallback.
 	SourceFile
 )
 
@@ -40,7 +40,7 @@ func FileCredentialExists(configDir string) bool {
 // returning ErrNotFound when the file is absent.
 func ReadFileCredential(configDir string) (*Credential, error) {
 	path := FileCredentialPath(configDir)
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // G304: path is the account's own .credentials.json under the cc-pool-managed config dir
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound
 	}
@@ -92,13 +92,13 @@ func writeCredentialFile(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	defer func() { _ = os.Remove(tmp.Name()) }() // no-op after a successful rename
 	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {

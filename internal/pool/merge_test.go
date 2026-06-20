@@ -185,7 +185,7 @@ func TestMergeClaudeJSON(t *testing.T) {
 		if err := os.MkdirAll(priv, 0o000); err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _ = os.Chmod(priv, 0o700) })
+		t.Cleanup(func() { _ = os.Chmod(priv, 0o700) }) //nolint:gosec // G302: restoring a test dir to traversable perms in cleanup
 		_, err := mergeClaudeJSON(prov, acct, writeSrc(t, mergeBaseJSON))
 		if !errors.Is(err, os.ErrPermission) {
 			t.Fatalf("err = %v, want a wrapped permission error from the stranded-copy probe", err)
@@ -255,10 +255,10 @@ func TestMergeClaudeJSON(t *testing.T) {
 	t.Run("unchanged merge provably skips the write", func(t *testing.T) {
 		acct := t.TempDir()
 		writeDst(t, acct, `{"theme": "light", "acctOnly": 1}`)
-		if err := os.Chmod(acct, 0o500); err != nil {
+		if err := os.Chmod(acct, 0o500); err != nil { //nolint:gosec // G302: deliberately makes the dir read-only to exercise the write-failure path
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _ = os.Chmod(acct, 0o700) })
+		t.Cleanup(func() { _ = os.Chmod(acct, 0o700) }) //nolint:gosec // G302: restoring a test dir to traversable perms in cleanup
 		// Any write attempt fails in a read-only dir, so MergeUnchanged with no
 		// error proves the write was skipped, not survived.
 		out, err := mergeClaudeJSON(prov, acct, writeSrc(t, `{"theme": "light"}`))

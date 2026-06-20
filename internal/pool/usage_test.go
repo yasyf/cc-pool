@@ -24,7 +24,7 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 
 	svc := keychain.ServiceName("/tmp/ccp-test/acct-01")
 	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: svc, KeychainAccount: "user", OverlayKind: "symlink"}
@@ -84,7 +84,7 @@ func TestSampleUsagePersistsExtraUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user", OverlayKind: "symlink"}
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)

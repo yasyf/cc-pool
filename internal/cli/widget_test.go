@@ -35,7 +35,7 @@ echo "open $*" >> "$FAKE_LOG"
 exit 0
 `
 	for name, body := range map[string]string{"brew": brew, "open": open} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil { //nolint:gosec // G306: these are executable fake-binary stub scripts; they must be 0755
 			t.Fatal(err)
 		}
 	}
@@ -93,7 +93,7 @@ func TestRunWidgetSequence(t *testing.T) {
 				t.Fatalf("runWidget: %v\n%s", err, out.String())
 			}
 
-			logBytes, err := os.ReadFile(logPath)
+			logBytes, err := os.ReadFile(logPath) //nolint:gosec // G304: path is a cc-pool-managed/test-owned file, not external input
 			if err != nil {
 				t.Fatal(err)
 			}

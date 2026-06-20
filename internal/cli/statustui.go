@@ -96,8 +96,8 @@ type statusData struct {
 // a toggle closure that pins/unpins the launch directory to the cursor's
 // account.
 type statusTUI struct {
-	ctx        context.Context
-	cwd        string // launch directory; "" hides pin controls
+	ctx         context.Context
+	cwd         string // launch directory; "" hides pin controls
 	gather      func(context.Context) (statusData, error)
 	toggle      func(accountID int) (bool, error)
 	buildLogin  func(a store.Account) (*exec.Cmd, error) // build the interactive `claude /login`
@@ -161,7 +161,7 @@ func (w *watchedLogin) Run() error {
 	// self-exit), reset only those input modes — Bubble Tea owns alt-screen/cursor
 	// and will re-enter and repaint them itself.
 	if outcome != awaitExited && isTTY() {
-		fmt.Fprint(w.out, inputModeReset)
+		_, _ = fmt.Fprint(w.out, inputModeReset)
 	}
 	return nil // finishRelogin (post-exit, via reloginExitedMsg) stays the sole credential gate
 }
@@ -403,7 +403,8 @@ func (t statusTUI) View() string {
 func (t statusTUI) renderList() string {
 	hdr := hdrStyle.Render(fmt.Sprintf("   %-22s %8s %8s %8s %5s",
 		"ACCOUNT", "SCORE", "5h used", "7d used", "LIVE"))
-	lines := []string{hdr}
+	lines := make([]string, 0, 1+len(t.snaps))
+	lines = append(lines, hdr)
 	cursor := t.sortedIndex()
 	for i, s := range t.snaps {
 		bestMark := " "
@@ -445,15 +446,15 @@ func (t statusTUI) renderDetail() string {
 	}
 	b.WriteString(panelTitle.Render(fmt.Sprintf("%s · next pick: %s", accountName(s.Account.Label), pick)))
 	b.WriteByte('\n')
-	b.WriteString(fmt.Sprintf("score %.1f\n", s.Score))
+	_, _ = fmt.Fprintf(&b, "score %.1f\n", s.Score)
 
 	// Positive contributions: reset-aware effective headroom × its weight. Labeled
 	// "effective" (not "free") because the reset credit can lift it above the raw
 	// remaining shown by the usage bars below; tinted by how depleted it is.
 	eff5Str := usageStyle(100 - c.Eff5).Render(fmt.Sprintf("%3.0f%%", c.Eff5))
 	eff7Str := usageStyle(100 - c.Eff7).Render(fmt.Sprintf("%3.0f%%", c.Eff7))
-	b.WriteString(fmt.Sprintf("  5h  %s effective  ×%.2f  = %+5.1f\n", eff5Str, score.W5h, c.Remaining5h))
-	b.WriteString(fmt.Sprintf("  7d  %s effective  ×%.2f  = %+5.1f\n", eff7Str, score.W7d, c.Remaining7d))
+	_, _ = fmt.Fprintf(&b, "  5h  %s effective  ×%.2f  = %+5.1f\n", eff5Str, score.W5h, c.Remaining5h)
+	_, _ = fmt.Fprintf(&b, "  7d  %s effective  ×%.2f  = %+5.1f\n", eff7Str, score.W7d, c.Remaining7d)
 
 	// Penalties, only the ones actually engaged.
 	var pen []string

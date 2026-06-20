@@ -137,7 +137,7 @@ func newSuperviseServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	rec := newSpawnRecorder(t)
 	s.spawnHolder = rec.fn
 	s.holderSocket = filepath.Join(sockDir, "m.sock")
@@ -207,7 +207,7 @@ func startDegradedHolder(t *testing.T, ver string, releaseOnShutdown bool) *skew
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	socket := filepath.Join(sockDir, "m.sock")
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
@@ -229,7 +229,7 @@ func startWedgedDegradedHolder(t *testing.T, ver string) *skewedHolder {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	socket := filepath.Join(sockDir, "m.sock")
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
@@ -247,7 +247,7 @@ func newSkewedHolder(t *testing.T, mounts []mountd.MountInfo, releaseOnShutdown,
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	socket := filepath.Join(sockDir, "m.sock")
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
@@ -282,14 +282,14 @@ func (h *skewedHolder) serve() {
 		}
 		var req mountd.Request
 		if err := json.NewDecoder(conn).Decode(&req); err != nil {
-			conn.Close() // probe dial (WaitGone) with no request body
+			_ = conn.Close() // probe dial (WaitGone) with no request body
 			continue
 		}
 		resp := mountd.Response{OK: true, Version: h.version}
 		switch req.Op {
 		case mountd.OpList:
 			if h.failList {
-				conn.Close() // drop the List reply: Health-ok + List-fail = Degraded
+				_ = conn.Close() // drop the List reply: Health-ok + List-fail = Degraded
 				continue
 			}
 			resp.Mounts = h.mounts
@@ -306,7 +306,7 @@ func (h *skewedHolder) serve() {
 			}
 		}
 		if req.Op == mountd.OpShutdown && h.noReplyShutdown {
-			conn.Close() // reply lost on the wire; the "sweep" already ran
+			_ = conn.Close() // reply lost on the wire; the "sweep" already ran
 			if h.releaseOnShutdown {
 				_ = h.ln.Close()
 				return
@@ -314,7 +314,7 @@ func (h *skewedHolder) serve() {
 			continue
 		}
 		_ = json.NewEncoder(conn).Encode(resp)
-		conn.Close()
+		_ = conn.Close()
 		if req.Op == mountd.OpShutdown && h.releaseOnShutdown {
 			_ = h.ln.Close()
 			return
@@ -484,7 +484,7 @@ func TestSuperviseZombieSocketEngagesBackoff(t *testing.T) {
 			if err != nil {
 				return // listener closed: defined exit
 			}
-			conn.Close() // accepts, never answers: the zombie shape
+			_ = conn.Close() // accepts, never answers: the zombie shape
 		}
 	}()
 	var buf bytes.Buffer
@@ -842,17 +842,17 @@ func TestSuperviseSkewGateLegs(t *testing.T) {
 		wantReplace bool
 	}{
 		"young daemon defers": {
-			mutate: func(t *testing.T, s *Server, _ map[int]string, _ string) {
+			mutate: func(_ *testing.T, s *Server, _ map[int]string, _ string) {
 				s.startedAt = time.Now()
 			},
 		},
 		"scan failure fails closed": {
-			mutate: func(t *testing.T, s *Server, _ map[int]string, _ string) {
+			mutate: func(_ *testing.T, s *Server, _ map[int]string, _ string) {
 				s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, errors.New("ps exploded") }
 			},
 		},
 		"live session on a fuse dir defers": {
-			mutate: func(t *testing.T, s *Server, dirs map[int]string, _ string) {
+			mutate: func(_ *testing.T, s *Server, dirs map[int]string, _ string) {
 				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 					return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 				}
@@ -865,7 +865,7 @@ func TestSuperviseSkewGateLegs(t *testing.T) {
 		// session is even consulted; the session here is belt and braces.)
 		"live session on a holder-only dir defers": {
 			extraDir: true,
-			mutate: func(t *testing.T, s *Server, _ map[int]string, extra string) {
+			mutate: func(_ *testing.T, s *Server, _ map[int]string, extra string) {
 				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 					return []procscan.Session{{PID: 4242, ConfigDir: extra}}, nil
 				}
@@ -1468,7 +1468,7 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { os.RemoveAll(sockDir) })
+		t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 		socket := filepath.Join(sockDir, "m.sock")
 		ln, err := net.Listen("unix", socket)
 		if err != nil {
@@ -1483,7 +1483,7 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 					return // listener closed: defined exit
 				}
 				dials.Add(1)
-				conn.Close()
+				_ = conn.Close()
 			}
 		}()
 		return socket, &dials
@@ -1499,8 +1499,8 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 		if err != nil {
 			t.Fatalf("listen should evict the skewed daemon and bind: %v", err)
 		}
-		defer ln.Close()
-		defer lock.Close()
+		defer func() { _ = ln.Close() }()
+		defer func() { _ = lock.Close() }()
 		if got := dials.Load(); got != 0 {
 			t.Fatalf("daemon eviction dialed the mounts socket %d time(s)", got)
 		}
@@ -1513,7 +1513,7 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 			if socket != f.socket {
 				t.Errorf("kill aimed at %q, want the daemon socket %q", socket, f.socket)
 			}
-			f.ln.Close() // the "kill" releases the daemon socket
+			_ = f.ln.Close() // the "kill" releases the daemon socket
 			return 999001, nil
 		})
 		s := testServer(f.socket, 2*time.Second)
@@ -1522,8 +1522,8 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 		if err != nil {
 			t.Fatalf("listen should reap the wedged orphan and bind: %v", err)
 		}
-		defer ln.Close()
-		defer lock.Close()
+		defer func() { _ = ln.Close() }()
+		defer func() { _ = lock.Close() }()
 		if got := dials.Load(); got != 0 {
 			t.Fatalf("daemon eviction dialed the mounts socket %d time(s)", got)
 		}
@@ -1564,7 +1564,7 @@ func bindVersionedHolder(t *testing.T, socket, ver string, list func() []mountd.
 				}
 			}
 			_ = json.NewEncoder(conn).Encode(resp)
-			conn.Close()
+			_ = conn.Close()
 			if isShutdown {
 				shutdowns.Add(1)
 				_ = ln.Close()
@@ -1707,7 +1707,7 @@ func TestReviveRemountsPreRowMounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(preRow) })
+	t.Cleanup(func() { _ = os.RemoveAll(preRow) })
 	var mu sync.Mutex
 	var pairs [][2]string
 	fake.setupFn = func(base, dir string) error {
@@ -1853,7 +1853,7 @@ func TestReviveForceUnmountsCarriedOrphanBeforeSpawn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(preRow) })
+	t.Cleanup(func() { _ = os.RemoveAll(preRow) })
 
 	// Prime carriedBases from a live holder serving a pre-row dir (no account
 	// row), then crash it: the snapshot survives markUnhealthy into the revive.
@@ -2485,10 +2485,10 @@ func TestSkewReplaceGateForce(t *testing.T) {
 		s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 			return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 		}
-		if _, reason := s.skewReplaceGate(false); !strings.Contains(reason, "live session") {
+		if _, reason := s.skewReplaceGate(t.Context(), false); !strings.Contains(reason, "live session") {
 			t.Fatalf("unforced gate reason = %q, want a live-session deferral", reason)
 		}
-		fuse, reason := s.skewReplaceGate(true)
+		fuse, reason := s.skewReplaceGate(t.Context(), true)
 		if reason != "" {
 			t.Fatalf("forced gate deferred: %q, want clear despite the session", reason)
 		}
@@ -2504,7 +2504,7 @@ func TestSkewReplaceGateForce(t *testing.T) {
 		s.holder.bases = map[string]string{"/nonexistent/pre-row-dir": "/base"}
 		s.holder.mu.Unlock()
 
-		if _, reason := s.skewReplaceGate(true); !strings.Contains(reason, "no account row") {
+		if _, reason := s.skewReplaceGate(t.Context(), true); !strings.Contains(reason, "no account row") {
 			t.Fatalf("forced gate reason = %q, want a pre-row deferral (hole A)", reason)
 		}
 	})

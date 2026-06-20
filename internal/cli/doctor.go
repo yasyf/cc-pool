@@ -35,9 +35,9 @@ func newDoctorCmd() *cobra.Command {
 						ok = false
 					}
 					if detail != "" {
-						fmt.Fprintf(out, "%s %s: %s\n", mark, label, detail)
+						_, _ = fmt.Fprintf(out, "%s %s: %s\n", mark, label, detail)
 					} else {
-						fmt.Fprintf(out, "%s %s\n", mark, label)
+						_, _ = fmt.Fprintf(out, "%s %s\n", mark, label)
 					}
 				}
 
@@ -108,12 +108,12 @@ func newDoctorCmd() *cobra.Command {
 
 				if !ok {
 					if fix {
-						fmt.Fprintln(out, "\nApplied fixes where possible; re-run `ccp doctor` to confirm.")
+						_, _ = fmt.Fprintln(out, "\nApplied fixes where possible; re-run `ccp doctor` to confirm.")
 					} else {
-						fmt.Fprintln(out, "\nIssues found. Re-run with --fix to repair.")
+						_, _ = fmt.Fprintln(out, "\nIssues found. Re-run with --fix to repair.")
 					}
 				} else {
-					fmt.Fprintln(out, "\nAll checks passed.")
+					_, _ = fmt.Fprintln(out, "\nAll checks passed.")
 				}
 				return nil
 			})

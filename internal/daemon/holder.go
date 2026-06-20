@@ -496,7 +496,7 @@ func (s *Server) noteSpawnedVersion(ver string) {
 // false (we acted on the holder this tick; the next tick re-assesses).
 func (s *Server) replaceSkewedHolder(ctx context.Context, force bool) (deferred bool) {
 	_, ver := s.holder.view()
-	fuse, reason := s.skewReplaceGate(force)
+	fuse, reason := s.skewReplaceGate(ctx, force)
 	if reason != "" {
 		if reason != s.sup.lastDefer {
 			s.sup.lastDefer = reason
@@ -630,7 +630,7 @@ func (s *Server) reapWedgedHolder(ctx context.Context, cl *mountd.Client, oldPID
 //     fuse row's dir AND every dir the holder serves (kernel truth, covering
 //     mounts whose rows were deleted while a teardown was refused). BOTH skipped
 //     under force.
-func (s *Server) skewReplaceGate(force bool) (fuse []store.Account, reason string) {
+func (s *Server) skewReplaceGate(ctx context.Context, force bool) (fuse []store.Account, reason string) {
 	if !s.canSpawnHolder() {
 		return nil, "this build cannot spawn a replacement holder (no fuse support)"
 	}
@@ -697,7 +697,7 @@ func (s *Server) skewReplaceGate(force bool) (fuse []store.Account, reason strin
 		// (beginReplace, the re-list, the pre-row guard above) still holds.
 		return fuse, ""
 	}
-	sessions, err := s.scan(context.Background())
+	sessions, err := s.scan(ctx)
 	if err != nil {
 		return bail(fmt.Sprintf("session scan: %v", err))
 	}
@@ -734,7 +734,7 @@ func (s *Server) remountFuseRows(ctx context.Context, accts []store.Account) {
 		case err != nil:
 			s.log.Printf("acct-%02d re-read row before remount: %v", a.ID, err)
 		case fresh.OverlayKind == string(overlay.KindFuse):
-			s.healFuse(fresh)
+			s.healFuse(ctx, fresh)
 		}
 		s.endPoll(a.ID)
 	}
@@ -835,7 +835,7 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 				s.log.Printf("acct-%02d %s; remounting under %d live session(s) — relaunch them",
 					a.ID, desc, procscan.CountByConfigDir(sessions, a.ConfigDir))
 			}
-			switch s.healFuse(fresh) {
+			switch s.healFuse(ctx, fresh) {
 			case healMounted:
 				delete(s.sup.rowRetry, a.ID)
 			case healTCCBlocked:
@@ -1016,7 +1016,7 @@ func (s *Server) remountReplacedRows(ctx context.Context, accts []store.Account)
 		if s.holder.ready(a.ConfigDir) {
 			continue
 		}
-		s.healFuse(a)
+		s.healFuse(ctx, a)
 	}
 }
 
