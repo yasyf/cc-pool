@@ -12,7 +12,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/overlay"
-	"github.com/yasyf/cc-pool/internal/peerpid"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/service"
@@ -38,7 +37,7 @@ var (
 	// bound) — like the stat seams above, it can never hang doctor on a
 	// wedged mirror.
 	deepProbeAt    = overlay.DeepProbeWithin
-	killHolderPeer = peerpid.Kill
+	killHolderPeer = func(socket string) (int, error) { return mountd.NewClient(socket).Kill() }
 	stopDaemon     = stopDaemonService
 	brewManaged    = service.IsBrewManaged
 	brewStop       = service.BrewStop

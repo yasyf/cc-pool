@@ -60,8 +60,14 @@ type deepVerdict struct {
 type holderState struct {
 	mu      sync.Mutex
 	healthy bool
-	version string
-	mounts  map[string]bool // dir -> Live (shallow), per the holder's last List
+	// degraded is the holder-alive-but-List-failed verdict: Health answered (so
+	// the holder is responsive at a known version) but List did not, so its
+	// live-mount set is unknowable this poll. Distinct from !healthy (Health
+	// itself failed → the holder is gone or socket-wedged): a degraded holder is
+	// alive, version is KEPT, and mounts is fail-closed nil. degraded ⟹ !healthy.
+	degraded bool
+	version  string
+	mounts   map[string]bool // dir -> Live (shallow), per the holder's last List
 	// epochs and mountedAt mirror the holder's per-dir mount epoch and mount
 	// time from the last List, keyed like mounts (one entry per registered
 	// mount). A zero Epoch/MountedAt on the wire means the holder predates the
@@ -113,30 +119,32 @@ type holderState struct {
 	gen uint64
 }
 
-// refresh polls the holder once (Health + List) and replaces the cache. Any
-// failure marks the holder unhealthy and clears the mounts — a cache that
-// cannot vouch for a dir must not let selection trust it. The RPCs run
+// refresh polls the holder once (Client.Poll = Health then List) and replaces
+// the cache. The verdict splits three ways: a Health failure is unreachable
+// (markUnhealthy — version cleared, the holder is gone or socket-wedged); a
+// Health success with a List failure is DEGRADED (markDegraded — the holder is
+// alive at a known version, but its mounts are unreadable this poll, so they
+// fail closed); only a full success installs a mounts snapshot. The RPCs run
 // outside the lock; a snapshot raced by an in-place update is discarded (see
-// gen).
+// gen). A cache that cannot vouch for a dir must not let selection trust it.
 func (h *holderState) refresh(c *mountd.Client) {
 	h.mu.Lock()
 	startGen := h.gen
 	h.mu.Unlock()
-	ver, err := c.Health()
-	if err != nil {
+	res, _ := c.Poll() // Reachable/Degraded encode the outcome; the raw error is unused on this hot poll path
+	if !res.Reachable {
 		h.markUnhealthy()
 		return
 	}
-	mounts, err := c.List()
-	if err != nil {
-		h.markUnhealthy()
+	if res.Degraded {
+		h.markDegraded(res.Version)
 		return
 	}
-	m := make(map[string]bool, len(mounts))
-	b := make(map[string]string, len(mounts))
-	e := make(map[string]uint64, len(mounts))
-	at := make(map[string]time.Time, len(mounts))
-	for _, mi := range mounts {
+	m := make(map[string]bool, len(res.Mounts))
+	b := make(map[string]string, len(res.Mounts))
+	e := make(map[string]uint64, len(res.Mounts))
+	at := make(map[string]time.Time, len(res.Mounts))
+	for _, mi := range res.Mounts {
 		m[mi.Dir] = mi.Live
 		b[mi.Dir] = mi.Base
 		e[mi.Dir] = mi.Epoch
@@ -152,7 +160,7 @@ func (h *holderState) refresh(c *mountd.Client) {
 		// put, so the next refreshIfStale re-polls promptly.
 		return
 	}
-	h.healthy, h.version, h.mounts, h.bases, h.refreshedAt = true, ver, m, b, time.Now()
+	h.healthy, h.degraded, h.version, h.mounts, h.bases, h.refreshedAt = true, false, res.Version, m, b, time.Now()
 	h.epochs, h.mountedAt = e, at
 	// deep and lastProbed are the daemon's own probe state, NOT holder truth —
 	// a List does not re-probe, so they persist across refresh untouched.
@@ -161,11 +169,24 @@ func (h *holderState) refresh(c *mountd.Client) {
 	}
 }
 
-// view snapshots holder reachability and the version it reported.
+// view snapshots holder reachability and the version it reported. A degraded
+// holder reads healthy=false here (Health answered but the cache cannot vouch
+// for any mount); routing that must distinguish degraded from unreachable uses
+// viewState.
 func (h *holderState) view() (healthy bool, version string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.healthy, h.version
+}
+
+// viewState snapshots the three-way reachability verdict for superviseTick's
+// routing: fully healthy, degraded (alive at version, mounts unreadable), or
+// unreachable (both false). degraded ⟹ !healthy, so a caller routes degraded
+// before the !healthy revive.
+func (h *holderState) viewState() (healthy, degraded bool, version string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.healthy, h.degraded, h.version
 }
 
 // hadMounts reports whether a holder ever served a mount in this daemon's
@@ -234,11 +255,28 @@ func (h *holderState) refreshIfStale(c *mountd.Client) {
 func (h *holderState) markUnhealthy() {
 	h.mu.Lock()
 	h.gen++
-	h.healthy, h.version, h.mounts, h.refreshedAt = false, "", nil, time.Now()
+	h.healthy, h.degraded, h.version, h.mounts, h.refreshedAt = false, false, "", nil, time.Now()
 	h.epochs, h.mountedAt = nil, nil
 	// An unreachable holder serves nothing, so its dirs' deep verdicts are
 	// meaningless — drop them (and the probe clock) so a respawned holder's
 	// fresh mounts start with a clean slate.
+	h.deep, h.lastProbed = nil, nil
+	h.mu.Unlock()
+}
+
+// markDegraded records a holder that answered Health at ver but whose List
+// failed: it is alive at a known version, but its live-mount set is unreadable
+// this poll, so mounts fail closed (nil → ready/shallowLive read not-live) and
+// the version is KEPT so superviseTick can tell a skewed degraded holder (force
+// a converge) from an our-version one (heal its rows). Like markUnhealthy it
+// bumps gen so a racing snapshot is discarded, drops the now-unvouchable deep
+// verdicts, and lets bases survive — but unlike it, keeps the version and sets
+// the degraded flag.
+func (h *holderState) markDegraded(ver string) {
+	h.mu.Lock()
+	h.gen++
+	h.healthy, h.degraded, h.version, h.mounts, h.refreshedAt = false, true, ver, nil, time.Now()
+	h.epochs, h.mountedAt = nil, nil
 	h.deep, h.lastProbed = nil, nil
 	h.mu.Unlock()
 }
@@ -383,7 +421,9 @@ func (h *holderState) noteMounted(dir string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.gen++
-	h.healthy = true
+	// A successful Setup proves the holder is fully serving this dir, so it
+	// supersedes a prior degraded verdict (degraded ⟹ !healthy): clear both.
+	h.healthy, h.degraded = true, false
 	if h.mounts == nil {
 		h.mounts = map[string]bool{}
 	}

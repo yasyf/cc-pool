@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
-	"github.com/yasyf/cc-pool/internal/peerpid"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
@@ -157,6 +156,10 @@ type skewedHolder struct {
 	version           string
 	mounts            []mountd.MountInfo
 	releaseOnShutdown bool
+	// failList drops the List reply (closing the connection) while Health still
+	// answers — the holder-alive-but-its-mounts-unreadable shape that Client.Poll
+	// reports as Degraded. Health, Shutdown, and probe dials are unaffected.
+	failList bool
 	// noReplyShutdown closes the connection instead of writing the Shutdown
 	// reply — the sweep-ran-but-the-reply-was-lost wire shape (mountd's real
 	// Shutdown runs its unmount sweep BEFORE replying).
@@ -191,6 +194,51 @@ func startBlockingSkewedHolder(t *testing.T, mounts []mountd.MountInfo, releaseO
 func startNoReplySkewedHolder(t *testing.T, mounts []mountd.MountInfo, releaseOnShutdown bool) *skewedHolder {
 	t.Helper()
 	return newSkewedHolder(t, mounts, releaseOnShutdown, false, true)
+}
+
+// startDegradedHolder serves Health at ver but drops every List reply — the
+// Client.Poll Degraded shape (holder alive at a known version, mounts
+// unreadable). releaseOnShutdown lets a forced converge complete by freeing the
+// socket for the replacement spawn. All fields are set before serve starts, so
+// the serve goroutine never races the test's setup.
+func startDegradedHolder(t *testing.T, ver string, releaseOnShutdown bool) *skewedHolder {
+	t.Helper()
+	sockDir, err := os.MkdirTemp("/tmp", "ccp-degr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	socket := filepath.Join(sockDir, "m.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &skewedHolder{ln: ln, socket: socket, version: ver, releaseOnShutdown: releaseOnShutdown, failList: true}
+	go h.serve()
+	t.Cleanup(func() { _ = h.ln.Close() })
+	return h
+}
+
+// startWedgedDegradedHolder is a degraded holder whose Shutdown also wedges: it
+// drops the Shutdown reply (so the RPC errors) and never releases its socket (so
+// WaitGone reports it still serving). A forced converge must reap such a holder
+// rather than defer to it forever. All fields are set before serve starts.
+func startWedgedDegradedHolder(t *testing.T, ver string) *skewedHolder {
+	t.Helper()
+	sockDir, err := os.MkdirTemp("/tmp", "ccp-wdeg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	socket := filepath.Join(sockDir, "m.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &skewedHolder{ln: ln, socket: socket, version: ver, failList: true, noReplyShutdown: true}
+	go h.serve()
+	t.Cleanup(func() { _ = h.ln.Close() })
+	return h
 }
 
 func newSkewedHolder(t *testing.T, mounts []mountd.MountInfo, releaseOnShutdown, block, noReply bool) *skewedHolder {
@@ -240,6 +288,10 @@ func (h *skewedHolder) serve() {
 		resp := mountd.Response{OK: true, Version: h.version}
 		switch req.Op {
 		case mountd.OpList:
+			if h.failList {
+				conn.Close() // drop the List reply: Health-ok + List-fail = Degraded
+				continue
+			}
 			resp.Mounts = h.mounts
 		case mountd.OpShutdown:
 			h.mu.Lock()
@@ -407,11 +459,14 @@ func TestSuperviseRespawnBackoffAndSpawnError(t *testing.T) {
 }
 
 // TestSuperviseZombieSocketEngagesBackoff pins the live-but-unresponsive
-// holder shape: a socket that accepts connections but fails health checks
-// defeats EnsureRunning's Available() short-circuit, so a "successful" spawn
-// changes nothing. The post-spawn verification must book it as a failure —
-// backoff engaged, SpawnError surfaced, no "respawned" celebration, and the
-// unreachable transition logged once, not per tick.
+// holder shape: a socket that accepts connections but fails health checks is
+// alive (its peer answers), so reviveHolder spares its mirrors the force-unmount
+// — but it is NOT given a free pass. The held socket defeats EnsureRunning's
+// Available() short-circuit, so a "successful" spawn changes nothing; the
+// post-spawn verification must still book it as a failure — backoff engaged,
+// SpawnError surfaced, no "respawned" celebration — so the spawn-fail breaker
+// can still retreat it to symlink. The alive-but-unresponsive transition is
+// logged once, not per tick.
 func TestSuperviseZombieSocketEngagesBackoff(t *testing.T) {
 	s, _, _, rec := newSuperviseServer(t)
 	flipToFuse(t, s, 1)
@@ -451,13 +506,13 @@ func TestSuperviseZombieSocketEngagesBackoff(t *testing.T) {
 	}
 
 	// Next tick: still inside the backoff window — no second spawn, and the
-	// unreachable transition is not re-logged (sawUnhealthy never reset).
+	// alive-but-unresponsive transition is not re-logged (sawWedgedAlive never reset).
 	s.superviseTick(t.Context())
 	if rec.count() != 1 {
 		t.Fatalf("attempts inside the backoff window = %d, want 1", rec.count())
 	}
-	if got := strings.Count(buf.String(), "mount holder unreachable"); got != 1 {
-		t.Fatalf("unreachable logged %d times across two ticks, want 1:\n%s", got, buf.String())
+	if got := strings.Count(buf.String(), "alive but unresponsive"); got != 1 {
+		t.Fatalf("alive-but-unresponsive logged %d times across two ticks, want 1:\n%s", got, buf.String())
 	}
 	if got := strings.Count(buf.String(), "failed its health check"); got != 1 {
 		t.Fatalf("identical verification failure logged %d times, want 1:\n%s", got, buf.String())
@@ -1258,7 +1313,7 @@ func TestSuperviseSkewWedgedKillIdentityGate(t *testing.T) {
 		// the socket has no peer, nothing to signal, the replace proceeds.
 		s.killHolderPeer = func(string, int) (int, error) {
 			_ = h.ln.Close()
-			return 0, peerpid.ErrUnreachable
+			return 0, mountd.ErrUnreachable
 		}
 
 		s.superviseTick(t.Context())
@@ -2304,5 +2359,179 @@ func TestSuperviseSkewedDeferHealsWedgedRowToSymlink(t *testing.T) {
 	defer mu.Unlock()
 	if len(unmounted) != 1 || unmounted[0] != dirs[1] {
 		t.Fatalf("breaker force-unmounted %v, want exactly [%s]", unmounted, dirs[1])
+	}
+}
+
+// TestSuperviseDegradedSkewedForceConverges pins the headline fix: a degraded
+// (Health-ok, List-failing) SKEWED holder converges onto our version even on a
+// busy pool — after a one-tick debounce — and KEEPS fuse (never retreats to
+// symlink).
+func TestSuperviseDegradedSkewedForceConverges(t *testing.T) {
+	s, dirs, _, rec := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	h := startDegradedHolder(t, "0.0.0-skewed", true) // releases its socket on Shutdown
+	s.holderSocket = h.socket
+	// A busy pool: a live session on the fuse row. The forced converge must
+	// replace the holder anyway — it is already failing that session's mirror.
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+	}
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+
+	// Tick 1: the degraded debounce holds — no converge yet.
+	s.superviseTick(t.Context())
+	if rec.count() != 0 {
+		t.Fatalf("converge fired on the first degraded tick; the debounce should hold (spawns = %d)", rec.count())
+	}
+	if s.sup.degradedStreak != 1 {
+		t.Fatalf("degradedStreak = %d after one degraded tick, want 1", s.sup.degradedStreak)
+	}
+
+	// Tick 2: the streak reaches the threshold — force-converge despite the session.
+	s.superviseTick(t.Context())
+	if rec.count() != 1 {
+		t.Fatalf("forced converge spawned %d replacement holders, want 1:\n%s", rec.count(), buf.String())
+	}
+	if got := kindOf(t, s, 1); got != "fuse" {
+		t.Fatalf("acct-1 after converge = %q, want fuse (converge keeps fuse, never retreats to symlink)", got)
+	}
+	if !strings.Contains(buf.String(), "mount holder replaced") {
+		t.Fatalf("no replacement logged:\n%s", buf.String())
+	}
+}
+
+// TestSuperviseDegradedOurVersionDoesNotConverge pins the other degraded arm: a
+// degraded holder at OUR version is healed in place, never converged — so it
+// never spawns a replacement (the pre-fix code would have marked it unhealthy
+// and revived/spawned).
+func TestSuperviseDegradedOurVersionDoesNotConverge(t *testing.T) {
+	s, _, _, rec := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	h := startDegradedHolder(t, version.String(), false) // our version, but List fails
+	s.holderSocket = h.socket
+
+	for i := 0; i < degradedStrikes; i++ {
+		s.superviseTick(t.Context())
+	}
+
+	if rec.count() != 0 {
+		t.Fatalf("an our-version degraded holder spawned %d replacements; it must heal in place, never converge", rec.count())
+	}
+}
+
+// TestReviveHolderAlivePreservesMirrors pins the reviveHolder alive split: a
+// holder whose socket still has a live peer (alive but Health-wedged) keeps its
+// mirrors and does not advance the crash-loop breaker, while a genuinely dead
+// one (no peer) is force-unmounted and counts toward the breaker.
+func TestReviveHolderAlivePreservesMirrors(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		alive       bool
+		wantUnmount bool
+		wantHazard  int
+		wantLog     string
+	}{
+		{"alive holder preserved", true, false, 0, "alive but unresponsive"},
+		{"dead holder force-unmounted", false, true, 1, "mount holder unreachable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, dirs, _, rec := newSuperviseServer(t)
+			flipToFuse(t, s, 1)
+			rec.setServe(false) // keep the spawn from binding a real holder — isolate the alive split
+			s.peerAlive = func(string) bool { return tc.alive }
+			var (
+				mu        sync.Mutex
+				unmounted []string
+			)
+			swapForceUnmount(t, func(dir string) error {
+				mu.Lock()
+				unmounted = append(unmounted, dir)
+				mu.Unlock()
+				return nil
+			})
+			fakeOverlayMounted(t, func(string) bool { return true })
+			var buf bytes.Buffer
+			s.log = log.New(&buf, "", 0)
+
+			s.reviveHolder(t.Context())
+
+			mu.Lock()
+			n := len(unmounted)
+			mu.Unlock()
+			if tc.wantUnmount != (n > 0) {
+				t.Fatalf("force-unmounted %v, wantUnmount=%v", unmounted, tc.wantUnmount)
+			}
+			if s.sup.reviveHazard != tc.wantHazard {
+				t.Fatalf("reviveHazard = %d, want %d", s.sup.reviveHazard, tc.wantHazard)
+			}
+			if !strings.Contains(buf.String(), tc.wantLog) {
+				t.Fatalf("log = %q, want it to contain %q", buf.String(), tc.wantLog)
+			}
+			_ = dirs
+		})
+	}
+}
+
+// TestSkewReplaceGateForce pins the forced gate: force bypasses the live-session
+// leg but never a claim-safety leg — a held session clears under force, while a
+// holder-served dir with no account row (a `ccp add` mid-login, surfaced via the
+// surviving bases registry since a degraded holder's mounts map is nil) still
+// defers (hole A).
+func TestSkewReplaceGateForce(t *testing.T) {
+	t.Run("force bypasses a live session", func(t *testing.T) {
+		s, dirs, _, _ := newSuperviseServer(t)
+		flipToFuse(t, s, 1)
+		s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+			return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+		}
+		if _, reason := s.skewReplaceGate(false); !strings.Contains(reason, "live session") {
+			t.Fatalf("unforced gate reason = %q, want a live-session deferral", reason)
+		}
+		fuse, reason := s.skewReplaceGate(true)
+		if reason != "" {
+			t.Fatalf("forced gate deferred: %q, want clear despite the session", reason)
+		}
+		s.endReplace(accountIDs(fuse)) // release the claims the gate holds on success
+	})
+
+	t.Run("force still defers a pre-row dir (hole A)", func(t *testing.T) {
+		s, _, _, _ := newSuperviseServer(t)
+		flipToFuse(t, s, 1)
+		// A degraded holder's mounts map is nil, so the pre-row guard must read the
+		// surviving bases registry. Seed a holder-served dir with no account row.
+		s.holder.mu.Lock()
+		s.holder.bases = map[string]string{"/nonexistent/pre-row-dir": "/base"}
+		s.holder.mu.Unlock()
+
+		if _, reason := s.skewReplaceGate(true); !strings.Contains(reason, "no account row") {
+			t.Fatalf("forced gate reason = %q, want a pre-row deferral (hole A)", reason)
+		}
+	})
+}
+
+// TestSuperviseForcedConvergeReapsShutdownWedgedHolder pins the forced-converge
+// escape hatch: a degraded skewed holder that wedges Shutdown (errors, never
+// releases its socket) must be REAPED, not deferred to. The idle replace
+// correctly defers to a maybe-healthy holder that will not ack, but the degraded
+// route has no death path to reach reviveHolder's breaker, so deferring here
+// would re-fire the converge every tick with no retreat.
+func TestSuperviseForcedConvergeReapsShutdownWedgedHolder(t *testing.T) {
+	s, _, _, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	h := startWedgedDegradedHolder(t, "0.0.0-skewed")
+	s.holderSocket = h.socket
+	s.holderGoneWait = 300 * time.Millisecond
+	signalled := false
+	s.killHolderPeer = func(string, int) (int, error) {
+		signalled = true
+		_ = h.ln.Close() // the kill frees the socket for the replacement spawn
+		return 4242, nil
+	}
+
+	s.replaceSkewedHolder(t.Context(), true)
+
+	if !signalled {
+		t.Fatal("forced converge against a Shutdown-wedged degraded holder did not reap it (the idle path would defer forever)")
 	}
 }

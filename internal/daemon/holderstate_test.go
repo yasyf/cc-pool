@@ -352,3 +352,56 @@ func TestHolderStateNoteMounted(t *testing.T) {
 		t.Fatalf("TCC guidance survived a successful mount: %+v", ws)
 	}
 }
+
+// TestHolderStateRefreshDegraded pins the third refresh arm: a holder that
+// answers Health but whose List fails is DEGRADED, not unreachable — its
+// version is kept (so the supervisor can tell a skewed degraded holder from an
+// our-version one), its mounts fail closed (nil → ready false), and the bases
+// registry survives (the pre-row guard reads it when mounts is nil).
+func TestHolderStateRefreshDegraded(t *testing.T) {
+	const ver = "v1.2.3 (abc1234)"
+	h := &holderState{bases: map[string]string{"/pool/acct-01": "/base"}}
+	deg := startDegradedHolder(t, ver, false)
+
+	h.refresh(mountd.NewClient(deg.socket))
+
+	healthy, degraded, got := h.viewState()
+	if healthy || !degraded || got != ver {
+		t.Fatalf("viewState = (%v, %v, %q), want (false, true, %q)", healthy, degraded, got, ver)
+	}
+	if h.ready("/pool/acct-01") {
+		t.Fatal("a degraded holder vouched for a mount; mounts must fail closed")
+	}
+	if b := h.carriedBases(); b["/pool/acct-01"] != "/base" {
+		t.Fatalf("bases = %v, want the pre-degraded registry preserved", b)
+	}
+}
+
+// TestHolderStateMarkDegraded pins markDegraded directly: it keeps the version,
+// fails the mounts closed, preserves bases, and bumps gen so a racing refresh
+// snapshot is discarded.
+func TestHolderStateMarkDegraded(t *testing.T) {
+	h := &holderState{
+		healthy: true,
+		version: "old",
+		mounts:  map[string]bool{"/d": true},
+		bases:   map[string]string{"/d": "/b"},
+	}
+	g := h.gen
+
+	h.markDegraded("v9")
+
+	healthy, degraded, ver := h.viewState()
+	if healthy || !degraded || ver != "v9" {
+		t.Fatalf("viewState = (%v, %v, %q), want (false, true, v9)", healthy, degraded, ver)
+	}
+	if h.ready("/d") {
+		t.Fatal("markDegraded left a vouched mount; mounts must be nil")
+	}
+	if h.carriedBases()["/d"] != "/b" {
+		t.Fatal("markDegraded dropped bases; the registry must survive")
+	}
+	if h.gen == g {
+		t.Fatal("markDegraded did not bump gen; a racing snapshot would not be discarded")
+	}
+}

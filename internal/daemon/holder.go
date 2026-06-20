@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
-	"github.com/yasyf/cc-pool/internal/peerpid"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -74,6 +73,15 @@ const reviveBreakerThreshold = 3
 // genuinely occasional deaths fall outside it and never accumulate.
 const reviveHazardWindow = 30 * time.Minute
 
+// degradedStrikes debounces the degraded verdict (holder alive but its List
+// failed): a single transient List blip under load must not trigger a
+// destructive forced converge or a needless heal sweep, so superviseTick acts
+// on a degraded holder only after this many CONSECUTIVE degraded ticks. Two —
+// the same one-transient-blip tolerance as deepWedgeStrikes — so a persistently
+// degraded skewed holder (the serial-List incident) still converges on the next
+// tick, while a one-off List timeout is waited out.
+const degradedStrikes = 2
+
 // forceUnmount force-unmounts an orphaned fuse carcass directly, without
 // routing through the (possibly dead) holder; seamed so tests assert the calls
 // without real mounts. Production: overlay.ForceUnmount (bounded).
@@ -103,11 +111,20 @@ func spawnBackoff(failures int) time.Duration {
 // bookkeeping and the last-logged conditions backing once-per-transition
 // logging. Only the supervise goroutine touches it — no lock.
 type supervisor struct {
-	sawUnhealthy bool      // last tick found the holder unreachable
+	sawUnhealthy bool      // last tick found the holder unreachable (genuine-death path)
 	failures     int       // consecutive spawn failures
 	retryAt      time.Time // backoff: earliest next spawn attempt
 	lastSpawnErr string    // last logged spawn-failure text
 	lastDefer    string    // last logged skew-replace deferral reason
+	// sawWedgedAlive backs the once-per-episode "alive but unresponsive" log on
+	// reviveHolder's alive branch (Health failed yet the socket still has a live
+	// peer). Separate from sawUnhealthy so the crash-loop breaker's death count
+	// is never advanced by an alive holder.
+	sawWedgedAlive bool
+	// degradedStreak counts CONSECUTIVE degraded ticks for the degradedStrikes
+	// debounce. Reset to 0 by any non-degraded tick (fully healthy or a Health
+	// failure), so a one-off List blip never reaches the act threshold.
+	degradedStreak int
 	// spawnedSkew is the version the last daemon-initiated spawn actually
 	// produced when it differs from ours (see noteSpawnedVersion): the
 	// reverse-skew steady state superviseTick must never re-replace.
@@ -172,13 +189,22 @@ func (s *Server) superviseHolder(ctx context.Context) {
 // ticks deterministically.
 func (s *Server) superviseTick(ctx context.Context) {
 	s.holder.refresh(s.holderClient())
-	healthy, ver := s.holder.view()
+	healthy, degraded, ver := s.holder.viewState()
+	if degraded {
+		// Health answered but List failed: the holder is alive at a known
+		// version with an unreadable mount set. Route by version (after a
+		// debounce) — never the destructive revive, which is for a holder that
+		// is actually gone.
+		s.handleDegraded(ctx, ver)
+		return
+	}
+	s.sup.degradedStreak = 0
 	if !healthy {
 		s.reviveHolder(ctx)
 		return
 	}
-	if s.sup.sawUnhealthy {
-		s.sup.sawUnhealthy = false
+	if s.sup.sawUnhealthy || s.sup.sawWedgedAlive {
+		s.sup.sawUnhealthy, s.sup.sawWedgedAlive = false, false
 		s.log.Printf("mount holder reachable again (%s)", ver)
 	}
 	if ver == "" {
@@ -207,7 +233,7 @@ func (s *Server) superviseTick(ctx context.Context) {
 		s.retryUnvouchedFuseRows(ctx)
 		return
 	}
-	if s.replaceSkewedHolder(ctx) {
+	if s.replaceSkewedHolder(ctx, false) {
 		// The skew-replace deferred (e.g., live sessions on a fuse row). The
 		// holder is healthy but skewed and we cannot replace it now, so its
 		// wedged rows would otherwise never advance the remount breaker — run
@@ -218,13 +244,49 @@ func (s *Server) superviseTick(ctx context.Context) {
 	}
 }
 
-// reviveHolder handles an unreachable holder: when fuse rows (or mounts a
-// holder previously served) need one and this build can spawn it, respawn
-// under exponential backoff, then remount whatever the fresh holder does not
-// serve — fuse rows AND the dead holder's pre-row mounts (`ccp add`'s login
-// window) — closing the crash→remount loop at the supervision cadence.
+// handleDegraded routes a degraded holder (alive, version known, mounts
+// unreadable this poll) after the degradedStrikes debounce. A skewed degraded
+// holder is the serial-List incident — a build predating fusekit's parallel
+// List whose List blows the daemon's poll deadline every tick; converging it
+// onto our version (which List-reads cleanly) is the fix, forced past the idle
+// gate because the degraded holder is already failing, not merely old. An
+// our-version (or our-spawn) degraded holder is a rare List blip under the
+// parallel List; its rows are healed in place, never replaced. The one-tick
+// debounce waits out a transient blip before either action.
+func (s *Server) handleDegraded(ctx context.Context, ver string) {
+	s.sup.degradedStreak++
+	if s.sup.degradedStreak < degradedStrikes {
+		return
+	}
+	if ver != "" && ver != version.String() && ver != s.sup.spawnedSkew {
+		s.replaceSkewedHolder(ctx, true)
+		return
+	}
+	s.retryUnvouchedFuseRows(ctx)
+}
+
+// reviveHolder handles a Health-failed holder. It splits on liveness: a holder
+// whose socket has no peer is genuinely dead — its mirrors are force-unmounted
+// (dead carcasses, remounted fresh below) and the crash-loop breaker advances —
+// while one whose socket still has a live peer is alive but its (in-memory)
+// Health RPC is wedged. The destructive force-unmount-all is for the dead case
+// ONLY: yanking every session's fds from a holder that is still there would
+// churn the pool for nothing. The alive holder is NOT given a free pass, only
+// spared the force-unmount: its held socket defeats EnsureRunning's Available()
+// short-circuit, so the spawn below "succeeds", the verify fails, and the
+// spawn-fail breaker still retreats its rows to symlink if it never recovers
+// (the e9109e9 contract). When the holder respawns or recovers, it remounts
+// whatever the fresh holder does not serve — fuse rows AND the dead holder's
+// pre-row mounts (`ccp add`'s login window).
 func (s *Server) reviveHolder(ctx context.Context) {
-	if !s.sup.sawUnhealthy {
+	alive := s.peerAliveOn(s.holderSocket)
+	switch {
+	case alive:
+		if !s.sup.sawWedgedAlive {
+			s.sup.sawWedgedAlive = true
+			s.log.Printf("mount holder alive but unresponsive; preserving its mirrors (recovers, or the spawn-fail breaker retreats them)")
+		}
+	case !s.sup.sawUnhealthy:
 		s.sup.sawUnhealthy = true
 		now := time.Now()
 		if !s.sup.lastReviveAt.IsZero() && now.Sub(s.sup.lastReviveAt) > reviveHazardWindow {
@@ -253,15 +315,19 @@ func (s *Server) reviveHolder(ctx context.Context) {
 	// verifySpawnedHolder's refresh installs the fresh holder's (empty) List,
 	// after which the pre-row mounts' bases are gone from the cache.
 	carry := s.holder.carriedBases()
-	// The holder is dead, so every mirror it served is now a wedged NFS
-	// carcass: markUnhealthy already dropped them from the cache and the
-	// pipeline below remounts them FRESH, so force-unmounting them now — directly,
-	// without the dead holder — loses nothing and removes a whole-machine hazard
-	// the moment it appears, instead of letting it linger through the slow
-	// respawn→remount path (the kill-9 fork-bomb incident: a lingering wedged
-	// mount hangs every lsof/stat on the box). Done before every early return so
-	// even a pure build or a respawn-backoff tick still clears the carcasses.
-	s.forceUnmountOrphans(orphanDirs(fuse, carry))
+	// A genuinely dead holder's mirrors are wedged NFS carcasses: markUnhealthy
+	// already dropped them from the cache and the pipeline below remounts them
+	// FRESH, so force-unmounting them now — directly, without the dead holder —
+	// loses nothing and removes a whole-machine hazard the moment it appears,
+	// instead of letting it linger through the slow respawn→remount path (the
+	// kill-9 fork-bomb incident: a lingering wedged mount hangs every lsof/stat on
+	// the box). Done before every early return so even a pure build or a
+	// respawn-backoff tick still clears the carcasses. An ALIVE-but-unresponsive
+	// holder is skipped: its mirrors may still be live, and yanking them would
+	// churn the very sessions the alive split exists to protect.
+	if !alive {
+		s.forceUnmountOrphans(orphanDirs(fuse, carry))
+	}
 
 	if len(fuse) == 0 && !s.holder.hadMounts() {
 		return // nothing for a holder to serve
@@ -303,7 +369,7 @@ func (s *Server) reviveHolder(ctx context.Context) {
 		}
 		return
 	}
-	s.sup.sawUnhealthy = false
+	s.sup.sawUnhealthy, s.sup.sawWedgedAlive = false, false
 	s.log.Printf("mount holder respawned")
 	s.remountFuseRows(ctx, fuse)
 	s.remountCarriedDirs(ctx, rowDirs, carry)
@@ -401,11 +467,14 @@ func (s *Server) noteSpawnedVersion(ver string) {
 	}
 }
 
-// replaceSkewedHolder retires a healthy holder running a different build and
-// remounts every fuse row on a fresh holder at our version. This is the ONLY
-// path that ever stops a serving holder besides `ccp service uninstall`, so
-// it runs solely when the pool is provably idle (skewReplaceGate) — and the
-// gate returns with the replace claims HELD on every fuse row, so from
+// replaceSkewedHolder retires a holder running a different build and remounts
+// every fuse row on a fresh holder at our version. Besides `ccp service
+// uninstall` this is the only path that ever stops a serving holder, so it runs
+// only when skewReplaceGate clears: idle (force=false, the steady-state path) or
+// — when the skewed holder is degraded and actively failing (force=true, the
+// handleDegraded path) — bypassing just the busy/uptime legs while every claim
+// safety stays. The gate returns with the replace claims HELD on every fuse
+// row, so from
 // gate-clear through the old holder's mount sweep and the remount below, no
 // select can reserve a fuse dir and no conversion can begin (the sweep runs
 // before the Shutdown reply lands; without the claims that whole window would
@@ -425,9 +494,9 @@ func (s *Server) noteSpawnedVersion(ver string) {
 // wedged row under the un-replaceable skewed holder is not stranded. Every
 // other path — a clean replace, or any failure after the gate cleared — returns
 // false (we acted on the holder this tick; the next tick re-assesses).
-func (s *Server) replaceSkewedHolder(ctx context.Context) (deferred bool) {
+func (s *Server) replaceSkewedHolder(ctx context.Context, force bool) (deferred bool) {
 	_, ver := s.holder.view()
-	fuse, reason := s.skewReplaceGate()
+	fuse, reason := s.skewReplaceGate(force)
 	if reason != "" {
 		if reason != s.sup.lastDefer {
 			s.sup.lastDefer = reason
@@ -465,10 +534,15 @@ func (s *Server) replaceSkewedHolder(ctx context.Context) (deferred bool) {
 	case ctx.Err() != nil && !gone:
 		s.log.Printf("daemon shutting down mid-replace; the next daemon's reconcile finishes the job")
 		return
-	case !gone && shutdownErr != nil:
-		// No ack and still serving: the holder may never have received the
-		// Shutdown at all, and a healthy serving holder is never killed.
-		// Defer; the next tick's refresh restores cache truth and re-gates.
+	case !gone && shutdownErr != nil && !force:
+		// No ack and still serving on the IDLE replace: the holder may never
+		// have received the Shutdown at all, and a healthy serving holder is
+		// never killed. Defer; the next tick's refresh restores cache truth and
+		// re-gates. A FORCED converge does NOT defer here — it falls through to
+		// the reap below: a degraded holder that will not ack Shutdown is exactly
+		// the wedge the bounded peer-gated kill exists for, and deferring would
+		// re-fire the converge every tick with no retreat (the degraded route has
+		// no death path to reach reviveHolder's breaker).
 		s.log.Printf("skewed holder shutdown: %v; holder still serving, retrying next tick", shutdownErr)
 		return
 	case !gone:
@@ -497,7 +571,7 @@ func (s *Server) replaceSkewedHolder(ctx context.Context) (deferred bool) {
 // past the gone-wait: the SIGKILL escape hatch, deliberately loud — and gated
 // on peer identity. The old holder exiting and a fresh holder binding inside
 // one of WaitGone's probe gaps is indistinguishable from a wedge at the
-// socket level, so the kill goes through peerpid.KillPid: the socket's
+// socket level, so the kill goes through mountd.Client.KillPeer: the socket's
 // current peer is resolved and compared against the pid captured at gate
 // time INSIDE one dial, and the signal lands on that same resolved pid — a
 // successor that bound the socket in between is refused, never shot. An
@@ -511,7 +585,7 @@ func (s *Server) reapWedgedHolder(ctx context.Context, cl *mountd.Client, oldPID
 	}
 	pid, kerr := s.killPeerPid(s.holderSocket, oldPID)
 	switch {
-	case errors.Is(kerr, peerpid.ErrUnreachable):
+	case errors.Is(kerr, mountd.ErrUnreachable):
 		// Released between WaitGone's last probe and now — nothing to kill.
 		return true
 	case kerr != nil:
@@ -529,13 +603,16 @@ func (s *Server) reapWedgedHolder(ctx context.Context, cl *mountd.Client, oldPID
 // skewReplaceGate evaluates every leg of the idle gate, returning the fuse
 // rows for the remount and the first blocking reason — "" means clear, and
 // means the replace claims are HELD on every fuse row (the caller must
-// endReplace). The legs, in claim-first order (the convertAccount pattern:
-// claim, then scan — so nothing can land between a clean scan and the
-// holder's sweep):
+// endReplace). force (the degraded-skew converge) bypasses ONLY the busy and
+// uptime legs — a degraded holder is already failing the sessions, so a clean
+// swap beats leaving them on it; every claim-safety leg below still holds. The
+// legs, in claim-first order (the convertAccount pattern: claim, then scan — so
+// nothing can land between a clean scan and the holder's sweep):
 //   - this build must be able to spawn the replacement: never stop a holder
 //     we cannot succeed;
-//   - daemon uptime ≥ reservationTTL: a freshly-started daemon's reservation
-//     map is empty while a ≤30s-old select may not have exec'd its claude yet;
+//   - daemon uptime ≥ reservationTTL (skipped under force): a freshly-started
+//     daemon's reservation map is empty while a ≤30s-old select may not have
+//     exec'd its claude yet;
 //   - beginReplace claims every fuse row — refusing on any live reservation,
 //     any mid-poll account, or ANY in-flight conversion (a symlink→fuse
 //     migrate is about to Mount through the holder being retired; its row
@@ -544,19 +621,23 @@ func (s *Server) reapWedgedHolder(ctx context.Context, cl *mountd.Client, oldPID
 //     between the listing and the claim could have flipped a row either way,
 //     leaving an unclaimed fuse row (selectable mid-sweep) or a claimed
 //     symlink row; a changed set defers one tick;
-//   - the session scan must succeed — fail closed;
-//   - every dir in the holder's List must have an account row: a pre-row dir
-//     is a `ccp add` mid-login (its row lands at FinalizeAdd), invisible to
-//     the claims, and the sweep would yank its mirror under the login;
-//   - zero sessions on every fuse row's dir AND every dir in the holder's
-//     List — kernel truth, covering mounts whose rows were deleted while a
-//     teardown was refused.
-func (s *Server) skewReplaceGate() (fuse []store.Account, reason string) {
+//   - every dir the holder serves must have an account row: a pre-row dir is a
+//     `ccp add` mid-login (its row lands at FinalizeAdd), invisible to the
+//     claims, and the sweep would yank its mirror under the login. Under force
+//     the served set comes from the surviving bases registry, since a degraded
+//     holder's mounts map is nil;
+//   - the session scan must succeed — fail closed — and zero sessions on every
+//     fuse row's dir AND every dir the holder serves (kernel truth, covering
+//     mounts whose rows were deleted while a teardown was refused). BOTH skipped
+//     under force.
+func (s *Server) skewReplaceGate(force bool) (fuse []store.Account, reason string) {
 	if !s.canSpawnHolder() {
 		return nil, "this build cannot spawn a replacement holder (no fuse support)"
 	}
-	if up := time.Since(s.startedAt); up < reservationTTL {
-		return nil, fmt.Sprintf("daemon up only %s; a pre-restart select may not be visible yet", up.Round(time.Second))
+	if !force {
+		if up := time.Since(s.startedAt); up < reservationTTL {
+			return nil, fmt.Sprintf("daemon up only %s; a pre-restart select may not be visible yet", up.Round(time.Second))
+		}
 	}
 	fuse, err := s.fuseAccounts()
 	if err != nil {
@@ -577,10 +658,6 @@ func (s *Server) skewReplaceGate() (fuse []store.Account, reason string) {
 	if !sameAccountIDs(fuse, fresh) {
 		return bail("the fuse account set changed mid-gate")
 	}
-	sessions, err := s.scan(context.Background())
-	if err != nil {
-		return bail(fmt.Sprintf("session scan: %v", err))
-	}
 	all, err := s.m.Store.ListAccounts()
 	if err != nil {
 		return bail(fmt.Sprintf("list account dirs: %v", err))
@@ -593,7 +670,17 @@ func (s *Server) skewReplaceGate() (fuse []store.Account, reason string) {
 	for _, a := range fuse {
 		dirs[a.ConfigDir] = true
 	}
-	for _, dir := range s.holder.mountDirs() {
+	// The holder-served dirs the pre-row guard checks. A forced converge runs
+	// against a DEGRADED holder whose mounts map is nil, so mountDirs() is empty
+	// — the surviving bases registry (carriedBases) is the only record of what it
+	// serves, including a `ccp add` mid-login mount with no account row yet.
+	served := s.holder.mountDirs()
+	if force {
+		for dir := range s.holder.carriedBases() {
+			served = append(served, dir)
+		}
+	}
+	for _, dir := range served {
 		// A holder-served dir with no account row is a `ccp add` mid-login:
 		// the row only lands at FinalizeAdd, so the replace claims cannot see
 		// it and the sweep would yank the mirror under the login. Defer.
@@ -601,6 +688,18 @@ func (s *Server) skewReplaceGate() (fuse []store.Account, reason string) {
 			return bail(fmt.Sprintf("holder serves %s with no account row (an add may be in flight)", dir))
 		}
 		dirs[dir] = true
+	}
+	if force {
+		// A forced converge replaces a degraded skewed holder despite live
+		// sessions: it is already failing their mirrors, so a clean swap onto our
+		// version is strictly better than leaving them on it. Only the session
+		// scan and its zero-sessions gate are skipped — every other claim
+		// (beginReplace, the re-list, the pre-row guard above) still holds.
+		return fuse, ""
+	}
+	sessions, err := s.scan(context.Background())
+	if err != nil {
+		return bail(fmt.Sprintf("session scan: %v", err))
 	}
 	for dir := range dirs {
 		if n := procscan.CountByConfigDir(sessions, dir); n > 0 {
@@ -1012,22 +1111,33 @@ func (s *Server) spawn() error {
 }
 
 // killPeerPid force-terminates the process holding socket through the seam,
-// but only when its peer pid matches wantPID; nil means peerpid.KillPid
+// but only when its peer pid matches wantPID; nil means mountd.Client.KillPeer
 // (peer credentials resolved and matched in one dial, never a name match).
 func (s *Server) killPeerPid(socket string, wantPID int) (int, error) {
 	if s.killHolderPeer != nil {
 		return s.killHolderPeer(socket, wantPID)
 	}
-	return peerpid.KillPid(socket, wantPID)
+	return mountd.NewClient(socket).KillPeer(wantPID)
 }
 
 // peerPIDOf resolves the pid holding socket through the seam; nil means
-// peerpid.PeerPID.
+// mountd.Client.PeerPID.
 func (s *Server) peerPIDOf(socket string) (int, error) {
 	if s.peerPID != nil {
 		return s.peerPID(socket)
 	}
-	return peerpid.PeerPID(socket)
+	return mountd.NewClient(socket).PeerPID()
+}
+
+// peerAliveOn reports whether socket currently has a live peer, through the
+// seam; nil means mountd.Client.PeerAlive. It is the reviveHolder gate that
+// distinguishes a genuinely dead holder (no peer → revive) from one that is
+// alive but unresponsive (peer present → defer, never force-unmount).
+func (s *Server) peerAliveOn(socket string) bool {
+	if s.peerAlive != nil {
+		return s.peerAlive(socket)
+	}
+	return mountd.NewClient(socket).PeerAlive()
 }
 
 // noteSpawnFailure records one failed spawn attempt: backoff bookkeeping, the

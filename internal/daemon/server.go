@@ -126,18 +126,25 @@ type Server struct {
 	spawnHolder func(socket, logPath string, timeout time.Duration) error
 
 	// killHolderPeer overrides the wedged-holder escape hatch; nil means
-	// peerpid.KillPid, which resolves the socket's current peer and signals
-	// it only when it matches wantPID — identity check and kill share one
-	// resolution, so a successor that bound the socket in between can never
+	// mountd.Client.KillPeer, which resolves the socket's current peer and
+	// signals it only when it matches wantPID — identity check and kill share
+	// one resolution, so a successor that bound the socket in between can never
 	// be shot. Tests inject it so no real process is ever signalled.
 	killHolderPeer func(socket string, wantPID int) (int, error)
 
 	// peerPID overrides peer-pid lookup on the holder socket — the identity
 	// check gating the wedged-holder kill (the kill must land only on the
 	// exact process that was gated, never a successor that bound the socket
-	// in between); nil means peerpid.PeerPID. Tests inject it so no real
+	// in between); nil means mountd.Client.PeerPID. Tests inject it so no real
 	// socket peer is ever resolved.
 	peerPID func(socket string) (int, error)
+
+	// peerAlive overrides the reviveHolder liveness gate — true when the holder
+	// socket still has a live peer (alive-but-unresponsive: defer, never
+	// force-unmount) vs false (genuinely gone: revive). nil means
+	// mountd.Client.PeerAlive. Tests inject it so revive paths run without a
+	// real socket; the default is false so a fake holder reads as dead.
+	peerAlive func(socket string) bool
 
 	// sup is superviseHolder's tick-local state (respawn backoff, transition
 	// logging); only the supervise goroutine touches it.
