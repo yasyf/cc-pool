@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // This file holds the untagged deep-probe contract: the synthetic probe file's
@@ -110,11 +108,12 @@ func readProbeFile(path string) error {
 		return fmt.Errorf("deep probe open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
-	// F_NOCACHE: without it the NFS client's page cache can satisfy the whole
-	// read after the first probe, proving nothing about the mirror. The
+	// disableReadCache: without it the NFS client's page cache can satisfy the
+	// whole read after the first probe, proving nothing about the mirror. The
 	// mirror's advancing-mtime Getattr is the second half of the same defense.
-	if _, err := unix.FcntlInt(f.Fd(), unix.F_NOCACHE, 1); err != nil {
-		return fmt.Errorf("deep probe %s: set F_NOCACHE: %w", path, err)
+	// It is a no-op off Darwin (the mount holder only runs on macOS/fuse-t).
+	if err := disableReadCache(f); err != nil {
+		return fmt.Errorf("deep probe %s: disable read cache: %w", path, err)
 	}
 	var header [8]byte
 	hn, err := io.ReadFull(f, header[:])
