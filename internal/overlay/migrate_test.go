@@ -379,6 +379,254 @@ func TestMovePrivateEntriesRejectsBadRoots(t *testing.T) {
 	}
 }
 
+// TestMoveSharedOrphans pins the shared-orphan sweep the fuse→symlink retreat
+// runs (from = the bare account mountpoint, to = base ~/.claude): real entries
+// at shared names move into base, private/identity/excluded entries never do,
+// and an already-correct symlink is left in place.
+func TestMoveSharedOrphans(t *testing.T) {
+	cases := []struct {
+		name           string
+		setup          func(t *testing.T, from, to string)
+		wantErr        string // substring; "" means success
+		verify         func(t *testing.T, from, to string)
+		verifyResolved func(t *testing.T, resolved []string)
+	}{
+		{
+			name: "moves an orphaned shared dir into base",
+			setup: func(t *testing.T, from, _ string) {
+				writeFile(t, filepath.Join(from, "projects", "p.json"), "session")
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(to, "projects", "p.json")); got != "session" {
+					t.Errorf("orphan not moved into base: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, "projects")); !os.IsNotExist(err) {
+					t.Error("orphan dir not removed from the mountpoint")
+				}
+			},
+		},
+		{
+			name: "merges an orphaned shared dir into an existing base dir",
+			setup: func(t *testing.T, from, to string) {
+				writeFile(t, filepath.Join(from, "projects", "a.json"), "a")
+				writeFile(t, filepath.Join(to, "projects", "b.json"), "b")
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(to, "projects", "a.json")); got != "a" {
+					t.Errorf("merged child a.json = %q, want a", got)
+				}
+				if got := readFile(t, filepath.Join(to, "projects", "b.json")); got != "b" {
+					t.Errorf("pre-existing base child b.json disturbed: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, "projects")); !os.IsNotExist(err) {
+					t.Error("merged orphan dir not removed from the mountpoint")
+				}
+			},
+		},
+		{
+			name: "shared file collision keeps the newer copy (src newer)",
+			setup: func(t *testing.T, from, to string) {
+				ts := time.Now()
+				writeFile(t, filepath.Join(to, "history.jsonl"), "old")
+				setMtime(t, filepath.Join(to, "history.jsonl"), ts.Add(-time.Hour))
+				writeFile(t, filepath.Join(from, "history.jsonl"), "new")
+				setMtime(t, filepath.Join(from, "history.jsonl"), ts)
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(to, "history.jsonl")); got != "new" {
+					t.Errorf("newer source did not win: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, "history.jsonl")); !os.IsNotExist(err) {
+					t.Error("stale source not removed")
+				}
+			},
+			verifyResolved: func(t *testing.T, resolved []string) {
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy'", resolved)
+				}
+			},
+		},
+		{
+			name: "shared file collision keeps base when base is newer",
+			setup: func(t *testing.T, from, to string) {
+				ts := time.Now()
+				writeFile(t, filepath.Join(from, "history.jsonl"), "old")
+				setMtime(t, filepath.Join(from, "history.jsonl"), ts.Add(-time.Hour))
+				writeFile(t, filepath.Join(to, "history.jsonl"), "fresh")
+				setMtime(t, filepath.Join(to, "history.jsonl"), ts)
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(to, "history.jsonl")); got != "fresh" {
+					t.Errorf("newer base disturbed: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, "history.jsonl")); !os.IsNotExist(err) {
+					t.Error("stale source not removed")
+				}
+			},
+			verifyResolved: func(t *testing.T, resolved []string) {
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "kept newer copy") {
+					t.Errorf("resolution log = %v, want one 'kept newer copy'", resolved)
+				}
+			},
+		},
+		{
+			name: "identical shared file is discarded",
+			setup: func(t *testing.T, from, to string) {
+				writeFile(t, filepath.Join(from, "history.jsonl"), "same")
+				writeFile(t, filepath.Join(to, "history.jsonl"), "same")
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(to, "history.jsonl")); got != "same" {
+					t.Errorf("base disturbed: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(from, "history.jsonl")); !os.IsNotExist(err) {
+					t.Error("identical duplicate not removed from source")
+				}
+			},
+			verifyResolved: func(t *testing.T, resolved []string) {
+				if len(resolved) != 1 || !strings.Contains(resolved[0], "identical duplicate discarded") {
+					t.Errorf("resolution log = %v, want one 'identical duplicate discarded'", resolved)
+				}
+			},
+		},
+		{
+			name: "leaves an already-correct symlink untouched",
+			setup: func(t *testing.T, from, to string) {
+				// A retreat resumed after its links were laid: from/projects is the
+				// correct link into base, base/projects holds the data.
+				writeFile(t, filepath.Join(to, "projects", "p.json"), "data")
+				if err := os.Symlink(filepath.Join(to, "projects"), filepath.Join(from, "projects")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			verify: func(t *testing.T, from, to string) {
+				fi, err := os.Lstat(filepath.Join(from, "projects"))
+				if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+					t.Errorf("correct symlink was moved or removed: fi=%v err=%v", fi, err)
+				}
+				if got := readFile(t, filepath.Join(to, "projects", "p.json")); got != "data" {
+					t.Errorf("base data disturbed: %q", got)
+				}
+			},
+		},
+		{
+			name: "never moves identity or private files to base",
+			setup: func(t *testing.T, from, _ string) {
+				writeFile(t, filepath.Join(from, ".claude.json"), `{"oauthAccount":"a"}`)
+				writeFile(t, filepath.Join(from, ".credentials.json"), "secret")
+				writeFile(t, filepath.Join(from, ".claude.json.tmp.ab12"), "tmp")
+				writeFile(t, filepath.Join(from, "remote-settings.json"), "rs")
+				writeFile(t, filepath.Join(from, ".last-update-result.json"), "upd")
+			},
+			verify: func(t *testing.T, from, to string) {
+				for _, name := range []string{".claude.json", ".credentials.json", ".claude.json.tmp.ab12", "remote-settings.json", ".last-update-result.json"} {
+					if _, err := os.Lstat(filepath.Join(from, name)); err != nil {
+						t.Errorf("private file %q moved out of the account dir: %v", name, err)
+					}
+					if _, err := os.Lstat(filepath.Join(to, name)); !os.IsNotExist(err) {
+						t.Errorf("private file %q leaked into base", name)
+					}
+				}
+			},
+		},
+		{
+			name: "never moves an excluded dir to base",
+			setup: func(t *testing.T, from, _ string) {
+				writeFile(t, filepath.Join(from, "backups", "b.bak"), "bak")
+			},
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(from, "backups", "b.bak")); got != "bak" {
+					t.Errorf("excluded dir moved or disturbed: %q", got)
+				}
+				if _, err := os.Lstat(filepath.Join(to, "backups")); !os.IsNotExist(err) {
+					t.Error("excluded backups leaked into base")
+				}
+			},
+		},
+		{
+			name: "skips .DS_Store",
+			setup: func(t *testing.T, from, _ string) {
+				writeFile(t, filepath.Join(from, ".DS_Store"), "cruft")
+			},
+			verify: func(t *testing.T, _, to string) {
+				if _, err := os.Lstat(filepath.Join(to, ".DS_Store")); !os.IsNotExist(err) {
+					t.Error(".DS_Store leaked into base")
+				}
+			},
+		},
+		{
+			name: "src file vs dst dir fails loud with both intact",
+			setup: func(t *testing.T, from, to string) {
+				writeFile(t, filepath.Join(from, "history.jsonl"), "i-am-a-file")
+				if err := os.MkdirAll(filepath.Join(to, "history.jsonl"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantErr: "type mismatch",
+			verify: func(t *testing.T, from, to string) {
+				if got := readFile(t, filepath.Join(from, "history.jsonl")); got != "i-am-a-file" {
+					t.Errorf("source clobbered: %q", got)
+				}
+				if fi, err := os.Lstat(filepath.Join(to, "history.jsonl")); err != nil || !fi.IsDir() {
+					t.Errorf("destination dir disturbed: fi=%v err=%v", fi, err)
+				}
+			},
+		},
+		{
+			name: "idempotent second run",
+			setup: func(t *testing.T, from, to string) {
+				writeFile(t, filepath.Join(from, "projects", "p.json"), "session")
+				if err := MoveSharedOrphans(from, to); err != nil {
+					t.Fatalf("first run: %v", err)
+				}
+			},
+			verify: func(t *testing.T, _, to string) {
+				if got := readFile(t, filepath.Join(to, "projects", "p.json")); got != "session" {
+					t.Errorf("projects/p.json = %q, want session", got)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			from, to := t.TempDir(), t.TempDir()
+			var resolved []string
+			prev := ResolvedConflictLogf
+			ResolvedConflictLogf = func(format string, args ...any) {
+				resolved = append(resolved, fmt.Sprintf(format, args...))
+			}
+			defer func() { ResolvedConflictLogf = prev }()
+			tc.setup(t, from, to)
+			err := MoveSharedOrphans(from, to)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("MoveSharedOrphans: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("MoveSharedOrphans error = %v, want substring %q", err, tc.wantErr)
+			}
+			tc.verify(t, from, to)
+			if tc.verifyResolved != nil {
+				tc.verifyResolved(t, resolved)
+			}
+		})
+	}
+}
+
+func TestMoveSharedOrphansRejectsBadRoots(t *testing.T) {
+	dir := t.TempDir()
+	if err := MoveSharedOrphans(filepath.Join(dir, "missing"), dir); err == nil {
+		t.Error("missing source did not error")
+	}
+	if err := MoveSharedOrphans(dir, dir); err == nil {
+		t.Error("from == to did not error")
+	}
+	if err := MoveSharedOrphans("", dir); err == nil {
+		t.Error("empty from did not error")
+	}
+}
+
 func TestHasPrivateEntries(t *testing.T) {
 	cases := []struct {
 		name  string

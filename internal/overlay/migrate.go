@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 )
 
-// ResolvedConflictLogf surfaces every private-file collision that moveEntry
+// ResolvedConflictLogf surfaces every file collision that moveEntry
 // reconciles by last-write-wins, so the recovery is observable and never silent
 // data loss. Each process that drives a move wires it: the daemon points it at
 // its logger at startup, and a daemon-less `doctor --fix` points it at its
@@ -89,11 +89,71 @@ func MovePrivateEntries(from, to string) error {
 	return errors.Join(errs...)
 }
 
+// MoveSharedOrphans relocates every top-level SHARED orphan from one root to the
+// other via the same data-preserving moveEntry primitive MovePrivateEntries uses.
+// A shared orphan is a real (non-symlink) entry whose name is neither a skip
+// entry nor a PrivateEntry — exactly the symlink provider's "linked into base"
+// default class (SymlinkProvider.Sync). It exists when claude wrote to a bare
+// account mountpoint while its fuse mirror was force-unmounted: those writes land
+// as real dirs/files at shared names that, with the mirror up, are symlinks into
+// base. The retreat to the symlink overlay must move them into base
+// (~/.claude/<name>, where the link points anyway — every account already shares
+// that base) BEFORE laying the links, or assertSymlink refuses to clobber them
+// and the retreat fails ("cannot link …: a non-symlink already exists there").
+//
+// Symmetric to MovePrivateEntries, with two deliberate differences:
+//   - it classifies by exclusion (!skipEntries && !PrivateEntry) rather than
+//     PrivateEntry, so identity, credentials, and the excluded private dirs are
+//     never candidates and never reach base;
+//   - it LEAVES an already-correct symlink in place rather than removing it: for
+//     a shared name the symlink IS the desired end state, so a retreat resumed
+//     after its links were partially laid converges instead of un-linking.
+//
+// Directories merge child-by-child (mergeDir), file collisions resolve
+// newest-wins (resolveFileConflict), a file-vs-dir clash fails loud with both
+// copies intact. Per-entry failures are collected with errors.Join. Idempotent
+// and resumable.
+func MoveSharedOrphans(from, to string) error {
+	if from == "" || to == "" {
+		return fmt.Errorf("move shared orphans: empty root (from %q, to %q)", from, to)
+	}
+	if from == to {
+		return fmt.Errorf("move shared orphans: from and to are both %q", from)
+	}
+	entries, err := os.ReadDir(from)
+	if err != nil {
+		return fmt.Errorf("read account dir %q: %w", from, err)
+	}
+	if err := os.MkdirAll(to, 0o700); err != nil {
+		return fmt.Errorf("mkdir base dir %q: %w", to, err)
+	}
+	var errs []error
+	for _, e := range entries {
+		name := e.Name()
+		if skipEntries[name] || PrivateEntry(name) {
+			continue
+		}
+		src := filepath.Join(from, name)
+		// An existing symlink at a shared name is the overlay's own correct
+		// artifact (the link into base) — leave it. Unlike a private name (where a
+		// symlink is necessarily stale and MovePrivateEntries removes it), here it
+		// is the desired end state, so a resumed retreat whose links were already
+		// laid must not move it into base.
+		if fi, err := os.Lstat(src); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		if err := moveEntry(src, filepath.Join(to, name)); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // moveEntry renames src to dst, reconciling an existing destination by kind:
 //   - dst missing: plain rename.
 //   - both directories: merged child-by-child (mergeDir).
 //   - both regular files: a collision left by an abnormal shutdown that wrote
-//     the same private file into both roots. Refusing forever dead-locks the
+//     the same file into both roots. Refusing forever dead-locks the
 //     account (the mount sweep and the symlink retreat each hit it from opposite
 //     directions), so it is RESOLVED, not refused: identical content drops src
 //     and keeps dst; differing content is last-write-wins, the newer mtime
@@ -123,12 +183,12 @@ func moveEntry(src, dst string) error {
 	case sfi.Mode().IsRegular() && dfi.Mode().IsRegular():
 		return resolveFileConflict(src, dst, sfi, dfi)
 	default:
-		return fmt.Errorf("private entry type mismatch: %q and %q are not both regular files or both directories; refusing to clobber across types", src, dst)
+		return fmt.Errorf("entry type mismatch: %q and %q are not both regular files or both directories; refusing to clobber across types", src, dst)
 	}
 }
 
 // resolveFileConflict reconciles a regular-file-vs-regular-file collision so an
-// abnormal shutdown that left a private file in both roots can never strand the
+// abnormal shutdown that left a file in both roots can never strand the
 // account. Identical bytes: drop src, keep dst. Differing bytes: last-write-
 // wins — the newer mtime survives at dst (src renamed over dst when src is
 // newer; src removed when dst is newer or the mtimes tie). The resolution is
@@ -142,26 +202,27 @@ func resolveFileConflict(src, dst string, sfi, dfi os.FileInfo) error {
 		if err := os.Remove(src); err != nil {
 			return fmt.Errorf("drop identical duplicate %q: %w", src, err)
 		}
-		ResolvedConflictLogf("resolved private-file conflict on %s (identical duplicate discarded)", dst)
+		ResolvedConflictLogf("resolved file conflict on %s (identical duplicate discarded)", dst)
 		return nil
 	}
 	if sfi.ModTime().After(dfi.ModTime()) {
 		if err := os.Rename(src, dst); err != nil {
 			return fmt.Errorf("replace stale %q with newer %q: %w", dst, src, err)
 		}
-		ResolvedConflictLogf("resolved private-file conflict on %s (kept newer copy, discarded stale duplicate)", dst)
+		ResolvedConflictLogf("resolved file conflict on %s (kept newer copy, discarded stale duplicate)", dst)
 		return nil
 	}
 	if err := os.Remove(src); err != nil {
 		return fmt.Errorf("discard stale duplicate %q: %w", src, err)
 	}
-	ResolvedConflictLogf("resolved private-file conflict on %s (kept newer copy, discarded stale duplicate)", dst)
+	ResolvedConflictLogf("resolved file conflict on %s (kept newer copy, discarded stale duplicate)", dst)
 	return nil
 }
 
-// sameContent reports whether two files hold identical bytes. Private files are
-// small (identity, credentials, update markers), so a full read-and-compare is
-// cheap and exact — no size or hash shortcut needed.
+// sameContent reports whether two files hold identical bytes. It runs only on a
+// regular-file collision (rare), so a full read-and-compare is exact and cheap
+// enough even for the larger shared files (e.g. history.jsonl) — no size or hash
+// shortcut needed.
 func sameContent(a, b string) (bool, error) {
 	ab, err := os.ReadFile(a) //nolint:gosec // G304: a/b are cc-pool-managed overlay paths under the state dir, compared during conversion
 	if err != nil {

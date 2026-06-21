@@ -28,6 +28,7 @@ type fakeFuse struct {
 	setupErr      error
 	teardownErr   error
 	wrongIdentity bool
+	onSetup       func(dir string) // optional: runs inside Setup (e.g. to stage an orphan) before setupErr
 	created       string
 }
 
@@ -41,6 +42,9 @@ func (f *fakeFuse) Setup(_, dir string) error {
 		privIdentity = true
 	}
 	*f.ops = append(*f.ops, fmt.Sprintf("fuse.setup(priv-identity=%v)", privIdentity))
+	if f.onSetup != nil {
+		f.onSetup(dir)
+	}
 	if f.setupErr != nil {
 		return f.setupErr
 	}
@@ -376,6 +380,123 @@ func TestConvertToSymlinkAbortsOnFailedUnmount(t *testing.T) {
 	}
 	if storedKind(t, m, a.ID) != "fuse" {
 		t.Fatal("row flipped despite failed unmount")
+	}
+}
+
+// TestConvertToSymlinkSweepsSharedOrphans reproduces the incident: a fuse account
+// whose mirror was force-unmounted while claude wrote to the bare mountpoint, so
+// real entries now sit at shared names (projects/, history.jsonl). Before the fix
+// the retreat failed at `lay symlinks: cannot link ".../projects": a non-symlink
+// already exists there`. The retreat must instead relocate the orphans into base
+// (merging with what base already holds), lay clean links, and never leak the
+// account's private identity into the shared base.
+func TestConvertToSymlinkSweepsSharedOrphans(t *testing.T) {
+	m, a, dir := newConvertFixture(t, nil) // real resolver
+	base := ClaudeDir()
+	priv := overlay.FusePrivateRoot(dir)
+
+	// Fuse rest state: private files live in the backing dir, no links in the dir.
+	if err := os.MkdirAll(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, ".claude.json"), filepath.Join(priv, ".claude.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "backups"), filepath.Join(priv, "backups")); err != nil {
+		t.Fatal(err)
+	}
+	// Replace the projects link with a REAL orphan dir and add an orphan file at a
+	// shared name — exactly what claude writes into a bare, unmounted mountpoint.
+	if err := os.Remove(filepath.Join(dir, "projects")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "projects", "existing.json"), []byte("base-side"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "projects"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "projects", "p.json"), []byte("orphan-session"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "history.jsonl"), []byte("orphan-history"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.OverlayKind = "fuse"
+	if err := m.Store.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+
+	back, err := m.ConvertOverlay(a, overlay.KindSymlink)
+	if err != nil {
+		t.Fatalf("retreat with shared orphans: %v", err)
+	}
+	if back.OverlayKind != "symlink" || storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row not flipped to symlink")
+	}
+	// Orphans relocated into base, merging with the pre-existing base child.
+	if got := readFileT(t, filepath.Join(base, "projects", "p.json")); got != "orphan-session" {
+		t.Fatalf("orphan project not swept into base: %q", got)
+	}
+	if got := readFileT(t, filepath.Join(base, "projects", "existing.json")); got != "base-side" {
+		t.Fatalf("pre-existing base project disturbed: %q", got)
+	}
+	if got := readFileT(t, filepath.Join(base, "history.jsonl")); got != "orphan-history" {
+		t.Fatalf("orphan history not swept into base: %q", got)
+	}
+	// Clean links re-laid at the shared names (this used to fail).
+	if target, err := os.Readlink(filepath.Join(dir, "projects")); err != nil || target != filepath.Join(base, "projects") {
+		t.Fatalf("projects not re-linked into base: target=%q err=%v", target, err)
+	}
+	if _, err := os.Readlink(filepath.Join(dir, "history.jsonl")); err != nil {
+		t.Fatalf("history.jsonl not re-linked into base: %v", err)
+	}
+	// Identity restored locally and NEVER leaked into the shared base.
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored: %q", got)
+	}
+	if _, err := os.Lstat(filepath.Join(base, ".claude.json")); !os.IsNotExist(err) {
+		t.Fatal("account identity leaked into the shared base")
+	}
+	if got := readFileT(t, filepath.Join(dir, "backups", "b.bak")); got != "bak" {
+		t.Fatalf("backups not restored: %q", got)
+	}
+	if _, err := os.Lstat(priv); !os.IsNotExist(err) {
+		t.Fatal("emptied private root not removed")
+	}
+}
+
+// TestRollbackToSymlinkSweepsSharedOrphans pins the second call site: a failed
+// fuse Setup that left a real orphan at a shared name in the bare dir must still
+// roll back cleanly — the orphan swept into base, the links re-laid.
+func TestRollbackToSymlinkSweepsSharedOrphans(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{
+		ops:      &ops,
+		setupErr: errors.New("mount timed out"),
+		onSetup: func(dir string) {
+			// claude touched the bare mountpoint before the mount came up.
+			_ = os.WriteFile(filepath.Join(dir, "history.jsonl"), []byte("orphan"), 0o600)
+		},
+	}
+	m, a, dir := newConvertFixture(t, fake)
+	base := ClaudeDir()
+
+	_, err := m.ConvertOverlay(a, overlay.KindFuse)
+	if err == nil || !strings.Contains(err.Error(), "rolled back to symlink") {
+		t.Fatalf("error = %v, want rollback report", err)
+	}
+	if storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row flipped despite failed mount")
+	}
+	if got := readFileT(t, filepath.Join(base, "history.jsonl")); got != "orphan" {
+		t.Fatalf("orphan not swept into base during rollback: %q", got)
+	}
+	if _, err := os.Readlink(filepath.Join(dir, "history.jsonl")); err != nil {
+		t.Fatalf("history.jsonl not re-linked after rollback: %v", err)
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored after rollback: %q", got)
 	}
 }
 

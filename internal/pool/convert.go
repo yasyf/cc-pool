@@ -141,10 +141,16 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv overlay.P
 		return fmt.Errorf("convert acct-%02d: %w (and rollback unmount failed: %w; private files remain in %s until the daemon reconciles)",
 			a.ID, cause, err, priv)
 	}
+	// Restore private files into dir and sweep orphaned shared entries out to
+	// base before re-linking. Both moves run regardless (disjoint name sets), but
+	// Setup is sequenced AFTER them so it never lays links over an un-swept dir.
 	if err := errors.Join(
 		overlay.MovePrivateEntries(priv, dir),
-		symProv.Setup(base, dir),
+		overlay.MoveSharedOrphans(dir, base),
 	); err != nil {
+		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
+	}
+	if err := symProv.Setup(base, dir); err != nil {
 		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
 	}
 	removePrivateRootIfEmpty(priv)
@@ -170,6 +176,13 @@ func (m *Manager) convertToSymlink(a store.Account, fuseProv, symProv overlay.Pr
 		}
 	} else if !os.IsNotExist(err) {
 		return a, fmt.Errorf("convert acct-%02d: stat private root: %w", a.ID, err)
+	}
+	// Relocate any shared entries claude wrote as real dirs/files into the bare
+	// mountpoint while its mirror was force-unmounted: they sit at shared names
+	// that Setup is about to symlink into base, so move them into base first or
+	// assertSymlink refuses to clobber them and the retreat fails.
+	if err := overlay.MoveSharedOrphans(dir, base); err != nil {
+		return a, fmt.Errorf("convert acct-%02d: relocate orphaned shared entries: %w", a.ID, err)
 	}
 	if err := symProv.Setup(base, dir); err != nil {
 		return a, fmt.Errorf("convert acct-%02d: lay symlinks: %w", a.ID, err)
