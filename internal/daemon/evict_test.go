@@ -18,6 +18,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/proc"
 )
 
 // fakeDaemon is a minimal stand-in for a running daemon holding the socket: it
@@ -245,7 +246,7 @@ func TestWaitGone(t *testing.T) {
 
 // guardKillSocketPeer swaps killSocketPeer for a no-op for the duration of a
 // test, so a real daemon on the developer's machine can never be signalled by
-// a listen()/evictHolder path.
+// a listen()/evictPeer path.
 func guardKillSocketPeer(t *testing.T) {
 	t.Helper()
 	setKillSocketPeer(t, func(string) (int, error) { return 0, nil })
@@ -278,8 +279,8 @@ func TestListenRefusedWhileLockHeld(t *testing.T) {
 		}
 
 		s := testServer(socket, time.Second)
-		if _, _, err := s.listen(); err == nil || !strings.Contains(err.Error(), "may still be starting") {
-			t.Fatalf("listen with the daemon lock held = %v, want a may-still-be-starting refusal", err)
+		if _, _, err := s.listen(); !errors.Is(err, proc.ErrPeerStarting) {
+			t.Fatalf("listen with the daemon lock held = %v, want proc.ErrPeerStarting", err)
 		}
 		if _, statErr := os.Stat(socket); !errors.Is(statErr, fs.ErrNotExist) {
 			t.Fatalf("a losing daemon must not create (or have removed) the socket; stat err = %v", statErr)
@@ -342,8 +343,8 @@ func TestListenEvictedPeerNeverReleasesFlock(t *testing.T) {
 	guardKillSocketPeer(t)
 	f := newFlockedFakeDaemonLateLockRelease(t, "0.0.0-old", time.Hour)
 	s := testServer(f.socket, 400*time.Millisecond)
-	if _, _, err := s.listen(); err == nil || !strings.Contains(err.Error(), "still held") {
-		t.Fatalf("listen with the peer's flock never released = %v, want a lock-still-held failure", err)
+	if _, _, err := s.listen(); !errors.Is(err, proc.ErrLockStillHeld) {
+		t.Fatalf("listen with the peer's flock never released = %v, want proc.ErrLockStillHeld", err)
 	}
 }
 

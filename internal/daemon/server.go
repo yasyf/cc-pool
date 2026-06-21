@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,6 +23,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/mountd"
+	"github.com/yasyf/fusekit/proc"
 )
 
 // reservationTTL is how long a select-reservation suppresses re-picking the
@@ -146,9 +146,18 @@ type Server struct {
 	// real socket; the default is false so a fake holder reads as dead.
 	peerAlive func(socket string) bool
 
-	// sup is superviseHolder's tick-local state (respawn backoff, transition
-	// logging); only the supervise goroutine touches it.
-	sup supervisor
+	// sup is the generic holder supervisor (revive / spare / replace, spawn
+	// backoff, crash-loop breaker, version-skew settle). Constructed in serve
+	// before supervision starts; only the supervise goroutine drives it.
+	sup *proc.Supervisor
+	// policy is the cc-pool adapter behind sup — proc.Policy plus the holder
+	// child-control callbacks and the reconstructed status/log surfaces.
+	policy *holderPolicy
+	// rowRetry is the per-account remount backoff ledger for fuse rows the
+	// holder cannot vouch for (see retryUnvouchedFuseRows) — the cc-pool-owned
+	// half of supervision state. Lazily initialized; only the supervise
+	// goroutine touches it — no lock.
+	rowRetry map[int]rowRetryState
 }
 
 // Run is the entry point for `cc-pool daemon`. It blocks until the process
@@ -255,8 +264,10 @@ func (s *Server) serve(ctx context.Context) error {
 		// Supervision starts only after the startup reconcile so it never
 		// races the initial mounts; from here it owns crash→respawn→remount
 		// and the idle-gated replacement of a version-skewed holder. The
-		// Add(1) runs inside this already-tracked goroutine, so the counter
-		// is ≥1 and cannot race a zero-counter Wait.
+		// supervisor is built here, on the supervise goroutine that is its
+		// sole mutator. The Add(1) runs inside this already-tracked goroutine,
+		// so the counter is ≥1 and cannot race a zero-counter Wait.
+		s.buildSupervisor()
 		s.wg.Add(1)
 		go func() { defer s.wg.Done(); s.superviseHolder(ctx) }()
 		s.scheduler(ctx)
@@ -291,116 +302,51 @@ func (s *Server) serve(ctx context.Context) error {
 	return nil
 }
 
-// listen binds the unix socket with 0600 perms, evicting a version-skewed
-// holder first (see evictHolder) and refusing only a live same-version peer.
+// listen binds the unix socket with 0600 perms under an exclusive flock on
+// socket+".lock", refusing a live same-version peer and evicting a
+// version-skewed one. Both the eviction policy and the single-entrant
+// flock/stale-check/bind sequence live in proc.SingleEntrant; the only
+// cc-pool-specific policy is the Evict closure, which speaks the daemon wire.
 //
-// An exclusive flock on socket+".lock" — returned to serve, which holds it
-// for the daemon's lifetime — makes the stale-check/remove/bind sequence
-// single-entrant across processes, the same shape mountd's listen pins.
+// The flock — returned to serve, which holds it for the daemon's lifetime —
+// makes the stale-check/remove/bind sequence single-entrant across processes.
 // Without it, two concurrently starting daemons (a launchd KeepAlive respawn
-// racing a manual start or a brew-services kickstart) both pass evictHolder's
-// health probe before either binds; the loser's os.Remove unlinks the
-// winner's freshly-bound socket, the invisible daemon keeps its scheduler and
-// holder supervisor running with in-memory reservations nobody can see, and
-// its *net.UnixListener.Close unlinks by PATH at exit — deleting the visible
-// daemon's live socket too. The lock file itself is never removed: unlinking
-// a held lock file would let a third daemon flock a fresh inode while the old
+// racing a manual start or a brew-services kickstart) both pass the health
+// probe before either binds; the loser's os.Remove unlinks the winner's
+// freshly-bound socket, the invisible daemon keeps its scheduler and holder
+// supervisor running with in-memory reservations nobody can see, and its
+// *net.UnixListener.Close unlinks by PATH at exit — deleting the visible
+// daemon's live socket too. The lock file itself is never removed: unlinking a
+// held lock file would let a third daemon flock a fresh inode while the old
 // inode's lock is still held, reopening the race.
+//
+// Evict is consulted once per Listen regardless of flock contention and
+// collapses both old eviction points (the flock-contended skewed peer and the
+// flock-less old peer predating the lock discipline) into one verdict: a live
+// same-version peer is refused as a genuine double start; a version-skewed peer
+// is told to step down and evicted (true → Listen polls the lock for the evict
+// bound when contended, or binds when free); no live peer answered (false) lets
+// a free lock bind while a still-contended lock is refused with
+// proc.ErrPeerStarting.
 func (s *Server) listen() (net.Listener, *os.File, error) {
-	// Only the socket's parent dir is needed here (in production that is the
-	// state dir); deriving it from s.socket keeps tests off the real ~/.cc-pool.
-	if err := os.MkdirAll(filepath.Dir(s.socket), 0o700); err != nil {
-		return nil, nil, fmt.Errorf("ensure socket dir: %w", err)
-	}
-	lock, err := s.flockSocket()
-	if err != nil {
-		return nil, nil, err
-	}
-	// The lock is ours, but a live peer may predate the lock discipline (an
-	// old-version daemon holds no flock): evict or refuse it exactly as before.
-	if err := s.evictHolder(); err != nil {
-		_ = lock.Close()
-		return nil, nil, err
-	}
-	_ = os.Remove(s.socket) // stale socket: the lock is ours and any live peer was evicted
-	ln, err := net.Listen("unix", s.socket)
-	if err != nil {
-		_ = lock.Close()
-		return nil, nil, err
-	}
-	if err := os.Chmod(s.socket, 0o600); err != nil {
-		_ = ln.Close()
-		_ = lock.Close()
-		return nil, nil, err
-	}
-	return ln, lock, nil
-}
-
-// flockSocket takes the daemon's lifetime lock on socket+".lock". A held lock
-// belongs to a flock-aware peer: a same-version peer is a genuine double
-// start and is refused; a version-skewed peer is evicted (its death releases
-// its flock) and the lock polled for the evict bound; a peer that answers no
-// health probe may still be mid-start (post-flock, pre-bind) and is refused —
-// launchd retries against whatever it becomes.
-func (s *Server) flockSocket() (*os.File, error) {
-	lock, err := os.OpenFile(s.socket+".lock", os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open daemon lock: %w", err)
-	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
-		return lock, nil
-	}
-	c := &Client{socket: s.socket}
-	resp, herr := c.Health()
-	if herr != nil {
-		_ = lock.Close()
-		return nil, fmt.Errorf("another cc-pool daemon owns %s.lock but does not answer health yet (it may still be starting); refusing to start", s.socket)
-	}
-	if resp.Version == version.String() {
-		_ = lock.Close()
-		return nil, errors.New("another cc-pool daemon at the same version is already running")
-	}
-	if err := s.evictPeer(c, resp.Version); err != nil {
-		_ = lock.Close()
-		return nil, err
-	}
-	// Eviction is observed at socket death (WaitGone), but the peer's flock is
-	// released only at its process exit — serve's lock Close is the last defer,
-	// after the goroutine drain, and a freshly started evictee (the launchd
-	// KeepAlive race this path exists for) can spend seconds there in
-	// non-cancellable startup work. Poll the lock for the same bound WaitGone
-	// used instead of failing the start on the first refusal.
-	deadline := time.Now().Add(s.evictTimeout)
-	for {
-		err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			return lock, nil
-		}
-		if time.Now().After(deadline) {
-			_ = lock.Close()
-			return nil, fmt.Errorf("daemon lock still held %s after evicting the skewed peer: %w", s.evictTimeout, err)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// evictHolder makes way when the socket is already held. A holder at our own
-// version is a genuine double-start and is refused. A version-skewed holder —
-// an orphan launchd no longer tracks (a detached EnsureRunning spawn, or a
-// pre-upgrade image KeepAlive held), which `brew services stop` cannot kill —
-// is told to step down (OpShutdown) and waited out so we can rebind. Only the
-// non-holder ever evicts, and only on a version mismatch, so two daemons can
-// never mutually evict each other.
-func (s *Server) evictHolder() error {
-	c := &Client{socket: s.socket}
-	resp, err := c.Health()
-	if err != nil {
-		return nil // no live holder: stale or missing socket
-	}
-	if resp.Version == version.String() {
-		return errors.New("another cc-pool daemon at the same version is already running")
-	}
-	return s.evictPeer(c, resp.Version)
+	return proc.SingleEntrant{
+		Socket:  s.socket,
+		Timeout: s.evictTimeout,
+		Evict: func() (bool, error) {
+			c := &Client{socket: s.socket}
+			resp, err := c.Health()
+			if err != nil {
+				return false, nil // no live peer answered
+			}
+			if resp.Version == version.String() {
+				return false, errors.New("another cc-pool daemon at the same version is already running")
+			}
+			if err := s.evictPeer(c, resp.Version); err != nil {
+				return false, err
+			}
+			return true, nil // evicted (flock-holder polls; flock-less binds)
+		},
+	}.Listen()
 }
 
 // evictPeer tells a version-skewed peer daemon to step down (OpShutdown) and

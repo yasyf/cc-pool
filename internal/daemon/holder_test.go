@@ -328,23 +328,6 @@ func (h *skewedHolder) shutdownCount() int {
 	return h.shutdowns
 }
 
-func TestSpawnBackoffDoublesAndCaps(t *testing.T) {
-	cases := map[int]time.Duration{
-		1:  spawnBackoffBase,  // first failure -> base
-		2:  20 * time.Second,  // doubled
-		3:  40 * time.Second,  // doubled again
-		6:  320 * time.Second, // still under the cap
-		7:  spawnBackoffCap,   // 640s capped to 10min
-		12: spawnBackoffCap,   // stays capped
-		0:  spawnBackoffBase,  // degenerate input never shrinks below base
-	}
-	for failures, want := range cases {
-		if got := spawnBackoff(failures); got != want {
-			t.Errorf("spawnBackoff(%d) = %v, want %v", failures, got, want)
-		}
-	}
-}
-
 // TestRemountBackoffDoublesAndCaps pins backoffAfter under the per-row
 // remount constants: base-doubling per failure, capped at 2 minutes —
 // deliberately under the 180s scheduler period, so supervision is never the
@@ -406,18 +389,20 @@ func TestSuperviseRespawnConditions(t *testing.T) {
 	}
 }
 
-// TestSuperviseRespawnBackoffAndSpawnError pins the failure ledger: each
-// failed spawn doubles the wait, the failure text is surfaced on the status
-// wire (SpawnError), a tick inside the window never attempts, and a success
-// resets the backoff and clears the surface.
+// TestSuperviseRespawnBackoffAndSpawnError pins the cc-pool surfaces around the
+// proc-owned respawn backoff: a failed spawn surfaces its text on the status
+// wire (SpawnError) end to end, a tick inside the backoff window never re-attempts,
+// and a successful spawn clears the surface. The backoff doubling itself is
+// proc.Supervisor's (TestSpawnBackoffDoublingAndCap); ClearBackoff steps past the
+// window deterministically without sleeping.
 func TestSuperviseRespawnBackoffAndSpawnError(t *testing.T) {
 	s, _, _, rec := newSuperviseServer(t)
 	flipToFuse(t, s, 1)
 	rec.setErr(errors.New("spawn exploded"))
 
 	s.superviseTick(t.Context())
-	if rec.count() != 1 || s.sup.failures != 1 {
-		t.Fatalf("after first failure: attempts=%d failures=%d, want 1/1", rec.count(), s.sup.failures)
+	if rec.count() != 1 {
+		t.Fatalf("after first failure: attempts=%d, want 1", rec.count())
 	}
 	if got := s.holder.wireStatus().SpawnError; !strings.Contains(got, "spawn exploded") {
 		t.Fatalf("SpawnError = %q, want the spawn failure surfaced", got)
@@ -433,25 +418,19 @@ func TestSuperviseRespawnBackoffAndSpawnError(t *testing.T) {
 		t.Fatalf("attempts inside the backoff window = %d, want 1", rec.count())
 	}
 
-	// Window elapsed: the retry runs and the wait doubles.
-	s.sup.retryAt = time.Now().Add(-time.Second)
+	// Window cleared: the retry runs.
+	s.sup.ClearBackoff()
 	s.superviseTick(t.Context())
-	if rec.count() != 2 || s.sup.failures != 2 {
-		t.Fatalf("after second failure: attempts=%d failures=%d, want 2/2", rec.count(), s.sup.failures)
-	}
-	if wait := time.Until(s.sup.retryAt); wait <= spawnBackoffBase {
-		t.Fatalf("second failure's wait = %v, want > %v (doubled)", wait, spawnBackoffBase)
+	if rec.count() != 2 {
+		t.Fatalf("after the cleared window: attempts=%d, want 2", rec.count())
 	}
 
-	// Success resets the backoff and clears the surfaced error.
+	// Success clears the surfaced error.
 	rec.setErr(nil)
-	s.sup.retryAt = time.Now().Add(-time.Second)
+	s.sup.ClearBackoff()
 	s.superviseTick(t.Context())
 	if rec.count() != 3 {
 		t.Fatalf("attempts after the success window = %d, want 3", rec.count())
-	}
-	if s.sup.failures != 0 || !s.sup.retryAt.IsZero() {
-		t.Fatalf("backoff not reset on success: failures=%d retryAt=%v", s.sup.failures, s.sup.retryAt)
 	}
 	if got := s.holder.wireStatus().SpawnError; got != "" {
 		t.Fatalf("SpawnError after success = %q, want cleared", got)
@@ -492,12 +471,11 @@ func TestSuperviseZombieSocketEngagesBackoff(t *testing.T) {
 
 	s.superviseTick(t.Context())
 
-	if rec.count() != 1 {
-		t.Fatalf("spawn attempts = %d, want 1", rec.count())
-	}
-	if s.sup.failures != 1 {
-		t.Fatalf("failures = %d, want the zombie spawn booked as a failure", s.sup.failures)
-	}
+	// The zombie holds the socket, so the spawn's Available probe short-circuits
+	// (proc never invokes the spawn seam — a held socket reads as "already
+	// serving"); the post-spawn verification then fails the health check, booking
+	// it as a failure, surfacing SpawnError, and never celebrating a respawn — so
+	// the spawn-fail breaker can still retreat it.
 	if got := s.holder.wireStatus().SpawnError; !strings.Contains(got, "failed its health check") {
 		t.Fatalf("SpawnError = %q, want the failed verification surfaced", got)
 	}
@@ -505,12 +483,9 @@ func TestSuperviseZombieSocketEngagesBackoff(t *testing.T) {
 		t.Fatalf("zombie socket logged as a successful respawn:\n%s", buf.String())
 	}
 
-	// Next tick: still inside the backoff window — no second spawn, and the
-	// alive-but-unresponsive transition is not re-logged (sawWedgedAlive never reset).
+	// Next tick: still inside the backoff window — and the alive-but-unresponsive
+	// transition is not re-logged (the episode flag never reset).
 	s.superviseTick(t.Context())
-	if rec.count() != 1 {
-		t.Fatalf("attempts inside the backoff window = %d, want 1", rec.count())
-	}
 	if got := strings.Count(buf.String(), "alive but unresponsive"); got != 1 {
 		t.Fatalf("alive-but-unresponsive logged %d times across two ticks, want 1:\n%s", got, buf.String())
 	}
@@ -626,7 +601,7 @@ func TestSuperviseTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups after the first tick = %d, want 1", fake.setupCount())
 	}
-	if st := s.sup.rowRetry[1]; st.failures != 1 || !st.retryAt.After(time.Now()) {
+	if st := s.rowRetry[1]; st.failures != 1 || !st.retryAt.After(time.Now()) {
 		t.Fatalf("rowRetry[1] = %+v, want one failure with a future retryAt", st)
 	}
 
@@ -637,21 +612,21 @@ func TestSuperviseTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	}
 
 	// Window rewound: the retry runs and the failure count advances.
-	st := s.sup.rowRetry[1]
+	st := s.rowRetry[1]
 	st.retryAt = time.Now().Add(-time.Second)
-	s.sup.rowRetry[1] = st
+	s.rowRetry[1] = st
 	s.superviseTick(t.Context())
-	if fake.setupCount() != 2 || s.sup.rowRetry[1].failures != 2 {
+	if fake.setupCount() != 2 || s.rowRetry[1].failures != 2 {
 		t.Fatalf("after the rewound window: setups=%d failures=%d, want 2/2",
-			fake.setupCount(), s.sup.rowRetry[1].failures)
+			fake.setupCount(), s.rowRetry[1].failures)
 	}
 
 	// Failure cleared: the next windowed attempt mounts, vouches, and drops
 	// the ledger entry.
 	fake.setupErr = nil
-	st = s.sup.rowRetry[1]
+	st = s.rowRetry[1]
 	st.retryAt = time.Now().Add(-time.Second)
-	s.sup.rowRetry[1] = st
+	s.rowRetry[1] = st
 	s.superviseTick(t.Context())
 	if fake.setupCount() != 3 {
 		t.Fatalf("setups after clearing the failure = %d, want 3", fake.setupCount())
@@ -659,7 +634,7 @@ func TestSuperviseTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("healed row not vouched for in the holder cache")
 	}
-	if _, ok := s.sup.rowRetry[1]; ok {
+	if _, ok := s.rowRetry[1]; ok {
 		t.Fatal("successful heal left a rowRetry entry")
 	}
 }
@@ -674,7 +649,7 @@ func TestSuperviseTickRetrySkipsClaimedAccount(t *testing.T) {
 	s.holderSocket = startCannedHolder(t, nil)
 	fake.setupErr = mountTimeoutChain()
 	// An eligible ledger entry whose window has passed…
-	s.sup.rowRetry = map[int]rowRetryState{1: {failures: 2, retryAt: time.Now().Add(-time.Second)}}
+	s.rowRetry = map[int]rowRetryState{1: {failures: 2, retryAt: time.Now().Add(-time.Second)}}
 	// …on an account someone else owns.
 	if !s.beginPoll(1) {
 		t.Fatal("beginPoll failed on a free account")
@@ -684,7 +659,7 @@ func TestSuperviseTickRetrySkipsClaimedAccount(t *testing.T) {
 	if fake.setupCount() != 0 {
 		t.Fatal("supervisor raced the claim owner")
 	}
-	if got := s.sup.rowRetry[1].failures; got != 2 {
+	if got := s.rowRetry[1].failures; got != 2 {
 		t.Fatalf("failures after a skip = %d, want 2 unchanged", got)
 	}
 
@@ -694,7 +669,7 @@ func TestSuperviseTickRetrySkipsClaimedAccount(t *testing.T) {
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups after release = %d, want 1", fake.setupCount())
 	}
-	if got := s.sup.rowRetry[1].failures; got != 3 {
+	if got := s.rowRetry[1].failures; got != 3 {
 		t.Fatalf("failures after a real attempt = %d, want 3", got)
 	}
 }
@@ -707,7 +682,7 @@ func TestSuperviseTickRetryLeavesConvertedRowAndPrunes(t *testing.T) {
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
 	// The row earned a ledger entry while fuse…
-	s.sup.rowRetry = map[int]rowRetryState{1: {failures: 1, retryAt: time.Now().Add(-time.Second)}}
+	s.rowRetry = map[int]rowRetryState{1: {failures: 1, retryAt: time.Now().Add(-time.Second)}}
 	// …then converted away.
 	flipToSymlink(t, s, 1)
 
@@ -716,8 +691,8 @@ func TestSuperviseTickRetryLeavesConvertedRowAndPrunes(t *testing.T) {
 	if fake.setupCount() != 0 {
 		t.Fatal("a converted row was healed as fuse")
 	}
-	if len(s.sup.rowRetry) != 0 {
-		t.Fatalf("rowRetry = %v, want the converted row's entry pruned", s.sup.rowRetry)
+	if len(s.rowRetry) != 0 {
+		t.Fatalf("rowRetry = %v, want the converted row's entry pruned", s.rowRetry)
 	}
 }
 
@@ -732,9 +707,9 @@ func TestSuperviseTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
 
 	s.superviseTick(t.Context())
-	if fake.setupCount() != 1 || s.sup.rowRetry[1].failures != 1 {
+	if fake.setupCount() != 1 || s.rowRetry[1].failures != 1 {
 		t.Fatalf("after the first tick: setups=%d failures=%d, want 1/1",
-			fake.setupCount(), s.sup.rowRetry[1].failures)
+			fake.setupCount(), s.rowRetry[1].failures)
 	}
 	if got := s.holder.wireStatus().TCCError; got == "" {
 		t.Fatal("TCC guidance not surfaced for the blocked row")
@@ -748,9 +723,9 @@ func TestSuperviseTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	// Grant landed: the next windowed attempt mounts, vouches, and clears the
 	// guidance through noteMounted.
 	fake.setupErr = nil
-	st := s.sup.rowRetry[1]
+	st := s.rowRetry[1]
 	st.retryAt = time.Now().Add(-time.Second)
-	s.sup.rowRetry[1] = st
+	s.rowRetry[1] = st
 	s.superviseTick(t.Context())
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("granted row not mounted and vouched for")
@@ -758,7 +733,7 @@ func TestSuperviseTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	if got := s.holder.wireStatus().TCCError; got != "" {
 		t.Fatalf("TCCError after the successful mount = %q, want cleared via noteMounted", got)
 	}
-	if _, ok := s.sup.rowRetry[1]; ok {
+	if _, ok := s.rowRetry[1]; ok {
 		t.Fatal("successful heal left a rowRetry entry")
 	}
 }
@@ -823,7 +798,7 @@ func TestSuperviseTickRemountsHeldDeadRow(t *testing.T) {
 			if !strings.Contains(out, "live session") || !strings.Contains(out, "relaunch") {
 				t.Fatalf("held-dead log line missing the session count or relaunch guidance:\n%s", out)
 			}
-			if _, ok := s.sup.rowRetry[1]; ok {
+			if _, ok := s.rowRetry[1]; ok {
 				t.Fatal("successful remount left a rowRetry entry")
 			}
 		})
@@ -1339,7 +1314,7 @@ func TestSuperviseLogsOncePerTransition(t *testing.T) {
 		rec.setErr(errors.New("spawn exploded A"))
 
 		s.superviseTick(t.Context())
-		s.sup.retryAt = time.Now().Add(-time.Second) // force a real second attempt
+		s.sup.ClearBackoff() // force a real second attempt
 		s.superviseTick(t.Context())
 
 		if got := strings.Count(buf.String(), "mount holder unreachable"); got != 1 {
@@ -1351,9 +1326,9 @@ func TestSuperviseLogsOncePerTransition(t *testing.T) {
 
 		// New error text is a new transition: logged again, exactly once.
 		rec.setErr(errors.New("spawn exploded B"))
-		s.sup.retryAt = time.Now().Add(-time.Second)
+		s.sup.ClearBackoff()
 		s.superviseTick(t.Context())
-		s.sup.retryAt = time.Now().Add(-time.Second)
+		s.sup.ClearBackoff()
 		s.superviseTick(t.Context())
 		if got := strings.Count(buf.String(), "spawn exploded B"); got != 1 {
 			t.Fatalf("new spawn failure logged %d times, want 1:\n%s", got, buf.String())
@@ -1677,11 +1652,15 @@ func TestSuperviseReverseSkewSteadyState(t *testing.T) {
 // TestSuperviseTickUnknownVersionNoReplace pins the empty-version guard: a
 // healthy holder whose reported version is "" (unknown) is not skew evidence
 // — wireStatus's Skewed guard agrees — so the tick must neither replace nor
-// respawn it.
+// respawn it. The holder vouches for the fuse row (Live), so the steady-state
+// heal that runs after a healthy, not-degraded tick finds it ready and never
+// churns a mount either.
 func TestSuperviseTickUnknownVersionNoReplace(t *testing.T) {
-	s, _, fake, rec := newSuperviseServer(t)
+	s, dirs, fake, rec := newSuperviseServer(t)
 	flipToFuse(t, s, 1)
-	shutdowns := bindVersionedHolder(t, s.holderSocket, "", nil)
+	shutdowns := bindVersionedHolder(t, s.holderSocket, "", func() []mountd.MountInfo {
+		return []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}}
+	})
 
 	for range 2 {
 		s.superviseTick(t.Context())
@@ -1910,9 +1889,9 @@ func TestReviveForceUnmountsCarriedOrphanBeforeSpawn(t *testing.T) {
 func driveRetryTicks(t *testing.T, s *Server, id, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
-		if st, ok := s.sup.rowRetry[id]; ok {
+		if st, ok := s.rowRetry[id]; ok {
 			st.retryAt = time.Now().Add(-time.Second)
-			s.sup.rowRetry[id] = st
+			s.rowRetry[id] = st
 		}
 		s.superviseTick(t.Context())
 	}
@@ -1961,7 +1940,7 @@ func TestSuperviseRemountBreakerEscalates(t *testing.T) {
 	if got := kindOf(t, s, 1); got != "symlink" {
 		t.Fatalf("row kind after the breaker = %q, want symlink", got)
 	}
-	if _, ok := s.sup.rowRetry[1]; ok {
+	if _, ok := s.rowRetry[1]; ok {
 		t.Fatal("breaker left a rowRetry entry; the churn would continue")
 	}
 	if s.holder.ready(dirs[1]) {
@@ -2015,7 +1994,7 @@ func TestSuperviseRemountBreakerEscalatesUnderLiveSession(t *testing.T) {
 	if got := kindOf(t, s, 1); got != "symlink" {
 		t.Fatalf("row kind after the breaker = %q, want symlink (a live session must not block escalation)", got)
 	}
-	if _, ok := s.sup.rowRetry[1]; ok {
+	if _, ok := s.rowRetry[1]; ok {
 		t.Fatal("breaker left a rowRetry entry; the churn would continue")
 	}
 	if s.holder.ready(dirs[1]) {
@@ -2044,7 +2023,7 @@ func TestSuperviseRemountBreakerHoldsUnderThreshold(t *testing.T) {
 	if got := kindOf(t, s, 1); got != "fuse" {
 		t.Fatalf("row kind under the threshold = %q, want fuse (still retrying)", got)
 	}
-	if got := s.sup.rowRetry[1].hazard; got != remountBreakerThreshold-1 {
+	if got := s.rowRetry[1].hazard; got != remountBreakerThreshold-1 {
 		t.Fatalf("hazard count = %d, want %d (one short of the breaker)", got, remountBreakerThreshold-1)
 	}
 }
@@ -2064,14 +2043,14 @@ func TestSuperviseRemountBreakerResetsOnMount(t *testing.T) {
 
 	// A few wedged attempts short of the breaker…
 	driveRetryTicks(t, s, 1, remountBreakerThreshold-2)
-	if got := s.sup.rowRetry[1].hazard; got != remountBreakerThreshold-2 {
+	if got := s.rowRetry[1].hazard; got != remountBreakerThreshold-2 {
 		t.Fatalf("hazard before recovery = %d, want %d", got, remountBreakerThreshold-2)
 	}
 
 	// …then the mount comes up: the ledger entry is dropped entirely.
 	fake.setupErr = nil
 	driveRetryTicks(t, s, 1, 1)
-	if _, ok := s.sup.rowRetry[1]; ok {
+	if _, ok := s.rowRetry[1]; ok {
 		t.Fatal("a successful mount left a rowRetry entry")
 	}
 	if !s.holder.ready(dirs[1]) {
@@ -2082,7 +2061,7 @@ func TestSuperviseRemountBreakerResetsOnMount(t *testing.T) {
 	// threshold — so the recovered row never carries stale breaker progress.
 	fake.setupErr = mountTimeoutChain()
 	driveRetryTicks(t, s, 1, 1)
-	if got := s.sup.rowRetry[1].hazard; got != 1 {
+	if got := s.rowRetry[1].hazard; got != 1 {
 		t.Fatalf("hazard after a fresh failure = %d, want 1 (reset by the recovery)", got)
 	}
 	if unmounts != 0 {
@@ -2113,7 +2092,7 @@ func TestSuperviseRemountBreakerNeverEscalatesTCC(t *testing.T) {
 	if got := kindOf(t, s, 1); got != "fuse" {
 		t.Fatalf("TCC-blocked row kind = %q, want fuse (still waiting on the grant)", got)
 	}
-	st, ok := s.sup.rowRetry[1]
+	st, ok := s.rowRetry[1]
 	if !ok {
 		t.Fatal("TCC-blocked row dropped its retry ledger; it would stop retrying")
 	}
@@ -2134,35 +2113,27 @@ func TestReviveBreakerThreshold(t *testing.T) {
 	}
 }
 
-// TestReviveBreakerFallsBackWhenHolderKeepsDying pins Fix A's crash-loop trigger:
-// after reviveBreakerThreshold consecutive deaths with no recovery at our
-// version, the next revive force-unmounts the pool and retreats every fuse row
-// to symlink — BEFORE respawning the doomed holder — instead of churning again.
-func TestReviveBreakerFallsBackWhenHolderKeepsDying(t *testing.T) {
-	s, _, _, rec := newSuperviseServer(t)
+// TestReviveBreakerRetreatConvertsPoolToSymlink pins the crash-loop breaker's
+// cc-pool ACTION: when proc trips the breaker and calls Policy.Retreat, every
+// fuse row is force-unmounted and converted to the always-available symlink
+// overlay, logged loudly. The breaker COUNTING is proc.Supervisor's
+// (TestReviveBreakerTripsAndRetreats); this drives the Retreat callback directly
+// — the exact thing proc invokes on a trip.
+func TestReviveBreakerRetreatConvertsPoolToSymlink(t *testing.T) {
+	s, _, _, _ := newSuperviseServer(t)
 	flipToFuse(t, s, 1)
 	flipToFuse(t, s, 2)
-	// Already revived threshold-1 times without ever returning at our version (a
-	// stuck old holder). The socket is dead, so this tick is the next death: the
-	// transition pushes the count to the threshold and the breaker fires.
-	s.sup.reviveHazard = reviveBreakerThreshold - 1
-	s.sup.sawUnhealthy = false
+	s.buildSupervisor()
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
-	s.superviseTick(t.Context())
+	s.policy.Retreat(t.Context(), "child crash-looped")
 
 	if got := kindOf(t, s, 1); got != "symlink" {
-		t.Fatalf("acct-01 kind after the crash-loop breaker = %q, want symlink", got)
+		t.Fatalf("acct-01 kind after the crash-loop retreat = %q, want symlink", got)
 	}
 	if got := kindOf(t, s, 2); got != "symlink" {
-		t.Fatalf("acct-02 kind after the crash-loop breaker = %q, want symlink", got)
-	}
-	if rec.count() != 0 {
-		t.Fatalf("crash-loop breaker spawned a holder (%d) instead of retreating to symlink before the respawn", rec.count())
-	}
-	if s.sup.reviveHazard != 0 {
-		t.Fatalf("reviveHazard = %d, want 0 (cleared once the whole pool retreated)", s.sup.reviveHazard)
+		t.Fatalf("acct-02 kind after the crash-loop retreat = %q, want symlink", got)
 	}
 	if !strings.Contains(buf.String(), "falling back to symlink") {
 		t.Fatalf("crash-loop fallback not surfaced in the log:\n%s", buf.String())
@@ -2178,11 +2149,12 @@ func TestReviveBreakerFallsBackWhenHolderWillNotSpawn(t *testing.T) {
 	flipToFuse(t, s, 1)
 	flipToFuse(t, s, 2)
 	rec.setErr(errors.New("fuse-t unavailable")) // the holder will not spawn
+	s.buildSupervisor()
 
 	// Rewind the spawn backoff before each tick so the failure ledger advances
 	// every tick instead of waiting out the doubling window.
 	for i := 0; i < reviveBreakerThreshold; i++ {
-		s.sup.retryAt = time.Now().Add(-time.Second)
+		s.sup.ClearBackoff()
 		s.superviseTick(t.Context())
 	}
 
@@ -2197,116 +2169,26 @@ func TestReviveBreakerFallsBackWhenHolderWillNotSpawn(t *testing.T) {
 	}
 }
 
-// TestReviveBreakerHoldsUnderThreshold pins that fewer than the threshold
-// consecutive spawn failures keep reviving — no fallback, the row stays fuse.
-func TestReviveBreakerHoldsUnderThreshold(t *testing.T) {
-	s, _, _, rec := newSuperviseServer(t)
-	flipToFuse(t, s, 1)
-	rec.setErr(errors.New("fuse-t unavailable"))
-
-	for i := 0; i < reviveBreakerThreshold-1; i++ {
-		s.sup.retryAt = time.Now().Add(-time.Second)
-		s.superviseTick(t.Context())
-	}
-
-	if got := kindOf(t, s, 1); got != "fuse" {
-		t.Fatalf("acct-01 kind under the threshold = %q, want fuse (still reviving)", got)
-	}
-	if s.sup.failures != reviveBreakerThreshold-1 {
-		t.Fatalf("spawn failures = %d, want %d (one short of the breaker)", s.sup.failures, reviveBreakerThreshold-1)
-	}
-}
-
-// TestSuperviseReviveBreakerResetsAtOurVersion pins that a genuine our-version
-// holder — the real recovery — clears the crash-loop breaker, so a normal
-// holder restart never drifts toward a spurious symlink fallback.
-func TestSuperviseReviveBreakerResetsAtOurVersion(t *testing.T) {
+// TestReviveBreakerRetreatBailsOnWedgedForceUnmount pins the wedged-unmount guard
+// in the Retreat action: when the forced unmount never completes, the row is left
+// fuse rather than handed to ConvertOverlay — whose Teardown would see the dir
+// still mounted and re-spawn the very holder the breaker is retreating from (the
+// wedged-carcass churn the breaker exists to stop). Drives Policy.Retreat
+// directly (proc owns the trip that calls it).
+func TestReviveBreakerRetreatBailsOnWedgedForceUnmount(t *testing.T) {
 	s, dirs, _, _ := newSuperviseServer(t)
 	flipToFuse(t, s, 1)
-	s.sup.reviveHazard = reviveBreakerThreshold - 1
-	s.sup.sawUnhealthy = true
-	s.holderSocket = startCannedHolder(t, []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}})
-
-	s.superviseTick(t.Context())
-
-	if s.sup.reviveHazard != 0 {
-		t.Fatalf("reviveHazard = %d, want 0 (an our-version holder is the real recovery)", s.sup.reviveHazard)
-	}
-	if got := kindOf(t, s, 1); got != "fuse" {
-		t.Fatalf("acct-01 kind = %q, want fuse (recovery, not fallback)", got)
-	}
-}
-
-// TestSuperviseReviveBreakerNotResetBySpawnedSkew pins the load-bearing
-// correctness point: an old holder we keep reviving but cannot replace stays
-// "settled" at spawnedSkew between deaths — that must NOT reset the crash-loop
-// breaker, or it would never trip on exactly the stuck-old-holder loop it
-// exists for.
-func TestSuperviseReviveBreakerNotResetBySpawnedSkew(t *testing.T) {
-	s, dirs, _, _ := newSuperviseServer(t)
-	flipToFuse(t, s, 1)
-	s.sup.reviveHazard = reviveBreakerThreshold - 1
-	s.sup.sawUnhealthy = true
-	h := startSkewedHolder(t, []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}}, false)
-	s.holderSocket = h.socket
-	s.sup.spawnedSkew = h.version // the version our own spawns keep producing
-
-	s.superviseTick(t.Context())
-
-	if s.sup.reviveHazard != reviveBreakerThreshold-1 {
-		t.Fatalf("reviveHazard = %d, want %d (a spawnedSkew settle must NOT reset the crash-loop breaker)", s.sup.reviveHazard, reviveBreakerThreshold-1)
-	}
-}
-
-// TestSuperviseReviveBreakerStaleClusterResets pins reviveHazardWindow: a death
-// far enough after the previous one starts a FRESH crash-loop cluster, so
-// occasional far-apart transient deaths (e.g. under a healthy reverse-skew
-// holder that settles at spawnedSkew and never resets the count) never add up
-// to a spurious whole-pool demotion.
-func TestSuperviseReviveBreakerStaleClusterResets(t *testing.T) {
-	s, _, _, rec := newSuperviseServer(t)
-	flipToFuse(t, s, 1)
-	// Two deaths' worth of accumulated hazard — but the last one was long ago.
-	s.sup.reviveHazard = reviveBreakerThreshold - 1
-	s.sup.lastReviveAt = time.Now().Add(-reviveHazardWindow - time.Minute)
-	s.sup.sawUnhealthy = false
-
-	s.superviseTick(t.Context())
-
-	if s.sup.reviveHazard != 1 {
-		t.Fatalf("reviveHazard = %d, want 1 (a stale prior death must start a fresh cluster, not accumulate)", s.sup.reviveHazard)
-	}
-	if got := kindOf(t, s, 1); got != "fuse" {
-		t.Fatalf("acct-01 kind = %q, want fuse (a far-apart death must not demote the pool)", got)
-	}
-	if rec.count() != 1 {
-		t.Fatalf("spawn attempts = %d, want 1 (a single fresh death still revives normally, not a fallback)", rec.count())
-	}
-}
-
-// TestReviveBreakerBailsOnWedgedForceUnmount pins the wedged-unmount guard: when
-// the crash-loop fallback's forced unmount never completes, the row is left fuse
-// and armed rather than handed to ConvertOverlay — whose Teardown would see the
-// dir still mounted and re-spawn the very holder the breaker is retreating from
-// (the wedged-carcass churn the breaker exists to stop).
-func TestReviveBreakerBailsOnWedgedForceUnmount(t *testing.T) {
-	s, dirs, _, _ := newSuperviseServer(t)
-	flipToFuse(t, s, 1)
-	s.sup.reviveHazard = reviveBreakerThreshold - 1
-	s.sup.sawUnhealthy = false
+	s.buildSupervisor()
 	// The dir reads as a (wedged) mountpoint whose forced unmount never
 	// completes — the exact edge where an un-guarded ConvertOverlay would
 	// re-spawn the holder through its Teardown.
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 	swapForceUnmount(t, func(string) error { return errors.New("force-unmount timed out") })
 
-	s.superviseTick(t.Context())
+	s.policy.Retreat(t.Context(), "child crash-looped")
 
 	if got := kindOf(t, s, 1); got != "fuse" {
 		t.Fatalf("acct-01 kind = %q, want fuse (a wedged force-unmount must NOT convert through a re-spawning Teardown)", got)
-	}
-	if s.sup.reviveHazard < reviveBreakerThreshold {
-		t.Fatalf("reviveHazard = %d, want >= %d (a bailed fallback leaves the breaker armed to retry)", s.sup.reviveHazard, reviveBreakerThreshold)
 	}
 }
 
@@ -2342,9 +2224,9 @@ func TestSuperviseSkewedDeferHealsWedgedRowToSymlink(t *testing.T) {
 	}
 
 	for i := 0; i < remountBreakerThreshold; i++ {
-		if st, ok := s.sup.rowRetry[1]; ok {
+		if st, ok := s.rowRetry[1]; ok {
 			st.retryAt = time.Now().Add(-time.Second)
-			s.sup.rowRetry[1] = st
+			s.rowRetry[1] = st
 		}
 		s.superviseTick(t.Context())
 	}
@@ -2384,8 +2266,8 @@ func TestSuperviseDegradedSkewedForceConverges(t *testing.T) {
 	if rec.count() != 0 {
 		t.Fatalf("converge fired on the first degraded tick; the debounce should hold (spawns = %d)", rec.count())
 	}
-	if s.sup.degradedStreak != 1 {
-		t.Fatalf("degradedStreak = %d after one degraded tick, want 1", s.sup.degradedStreak)
+	if s.policy.degradedStreak != 1 {
+		t.Fatalf("degradedStreak = %d after one degraded tick, want 1", s.policy.degradedStreak)
 	}
 
 	// Tick 2: the streak reaches the threshold — force-converge despite the session.
@@ -2402,9 +2284,12 @@ func TestSuperviseDegradedSkewedForceConverges(t *testing.T) {
 }
 
 // TestSuperviseDegradedOurVersionDoesNotConverge pins the other degraded arm: a
-// degraded holder at OUR version is healed in place, never converged — so it
-// never spawns a replacement (the pre-fix code would have marked it unhealthy
-// and revived/spawned).
+// degraded holder at OUR version is spared the destructive force-converge a
+// SKEWED degraded holder gets — it never spawns a replacement. A degraded holder
+// at our own version is a List blip or an our-side condition, not version skew;
+// the transient case is debounced back to healthy and heals on the next settle,
+// while a persistent one is left serving rather than churned (the pre-fix code
+// would have marked it unhealthy and revived/spawned).
 func TestSuperviseDegradedOurVersionDoesNotConverge(t *testing.T) {
 	s, _, _, rec := newSuperviseServer(t)
 	flipToFuse(t, s, 1)
@@ -2416,30 +2301,33 @@ func TestSuperviseDegradedOurVersionDoesNotConverge(t *testing.T) {
 	}
 
 	if rec.count() != 0 {
-		t.Fatalf("an our-version degraded holder spawned %d replacements; it must heal in place, never converge", rec.count())
+		t.Fatalf("an our-version degraded holder spawned %d replacements; it must be spared the converge, never force-replaced", rec.count())
 	}
 }
 
-// TestReviveHolderAlivePreservesMirrors pins the reviveHolder alive split: a
-// holder whose socket still has a live peer (alive but Health-wedged) keeps its
-// mirrors and does not advance the crash-loop breaker, while a genuinely dead
-// one (no peer) is force-unmounted and counts toward the breaker.
+// TestReviveHolderAlivePreservesMirrors pins the revive alive split (proc
+// contract 1, driven through the cc-pool policy): a holder whose socket still
+// has a live peer (alive but Health-wedged) keeps its mirrors — PeerAlive is
+// consulted, no force-unmount fires, the spare is logged — while a genuinely
+// dead one (no peer) has its carcasses force-unmounted before the respawn, with
+// the death logged. The crash-loop breaker COUNT is proc.Supervisor's
+// (TestContract1SpareWedgedChild).
 func TestReviveHolderAlivePreservesMirrors(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		alive       bool
 		wantUnmount bool
-		wantHazard  int
 		wantLog     string
 	}{
-		{"alive holder preserved", true, false, 0, "alive but unresponsive"},
-		{"dead holder force-unmounted", false, true, 1, "mount holder unreachable"},
+		{"alive holder preserved", true, false, "alive but unresponsive"},
+		{"dead holder force-unmounted", false, true, "mount holder unreachable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, dirs, _, rec := newSuperviseServer(t)
 			flipToFuse(t, s, 1)
 			rec.setServe(false) // keep the spawn from binding a real holder — isolate the alive split
-			s.peerAlive = func(string) bool { return tc.alive }
+			var peerConsulted atomic.Bool
+			s.peerAlive = func(string) bool { peerConsulted.Store(true); return tc.alive }
 			var (
 				mu        sync.Mutex
 				unmounted []string
@@ -2454,16 +2342,16 @@ func TestReviveHolderAlivePreservesMirrors(t *testing.T) {
 			var buf bytes.Buffer
 			s.log = log.New(&buf, "", 0)
 
-			s.reviveHolder(t.Context())
+			s.superviseTick(t.Context())
 
+			if !peerConsulted.Load() {
+				t.Fatal("PeerAlive was never consulted — the meltdown gate was bypassed")
+			}
 			mu.Lock()
 			n := len(unmounted)
 			mu.Unlock()
 			if tc.wantUnmount != (n > 0) {
 				t.Fatalf("force-unmounted %v, wantUnmount=%v", unmounted, tc.wantUnmount)
-			}
-			if s.sup.reviveHazard != tc.wantHazard {
-				t.Fatalf("reviveHazard = %d, want %d", s.sup.reviveHazard, tc.wantHazard)
 			}
 			if !strings.Contains(buf.String(), tc.wantLog) {
 				t.Fatalf("log = %q, want it to contain %q", buf.String(), tc.wantLog)
@@ -2528,8 +2416,13 @@ func TestSuperviseForcedConvergeReapsShutdownWedgedHolder(t *testing.T) {
 		_ = h.ln.Close() // the kill frees the socket for the replacement spawn
 		return 4242, nil
 	}
+	s.buildSupervisor()
+	// ReplaceSafe captures the holder identity at gate time; a wedged degraded
+	// holder's mounts map is nil, so prime the cache (and thus the gate's
+	// pre-row/served read) from one poll before forcing the converge.
+	s.holder.refresh(s.holderClient())
 
-	s.replaceSkewedHolder(t.Context(), true)
+	s.sup.Replace(t.Context(), true)
 
 	if !signalled {
 		t.Fatal("forced converge against a Shutdown-wedged degraded holder did not reap it (the idle path would defer forever)")
