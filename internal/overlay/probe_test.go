@@ -190,6 +190,7 @@ func TestDeepProbeWithinTimeoutWedged(t *testing.T) {
 	if err := unix.Mkfifo(fifo, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	before := deepProbes.Inflight()
 	err := DeepProbeWithin(dir)
 	if err == nil {
 		t.Fatal("DeepProbeWithin = nil against a parked open, want ErrProbeWedged")
@@ -200,24 +201,27 @@ func TestDeepProbeWithinTimeoutWedged(t *testing.T) {
 	if errors.Is(err, ErrProbeMissing) {
 		t.Errorf("a timed-out probe must not read as missing; err = %v", err)
 	}
-	if got := deepProbes.Inflight(); got != 1 {
-		t.Errorf("Inflight = %d, want exactly 1 parked probe goroutine", got)
+	if got := deepProbes.Inflight(); got != before+1 {
+		t.Errorf("Inflight = %d, want %d (one new parked probe goroutine)", got, before+1)
 	}
 
-	// Unwedge for a clean exit: a writer opening the FIFO releases the parked
-	// open, and closing it EOFs the read so the probe goroutine drains.
-	w, err := os.OpenFile(fifo, os.O_WRONLY, 0) //nolint:gosec // G304: fifo is under the test's own t.TempDir()
-	if err != nil {
-		t.Fatal(err)
+	// Best-effort unwedge for a tidy exit: opening the FIFO for writing releases
+	// the parked open so the probe goroutine reads to completion and frees its
+	// fd, and serving bytes before the close makes the close's EOF reliable in
+	// the common case. We deliberately do NOT assert it drains: a real wedge
+	// leaks the goroutine by design (DeepProbeWithin bounds the caller, not the
+	// goroutine), and even with bytes served a macOS FIFO's blocking read can
+	// still miss the writer's EOF under load (~1 in 3000) and strand forever — so
+	// a drain assertion is inherently flaky. The Inflight check above is
+	// delta-based, so a rare straggler never fails this run or a later one.
+	if w, werr := os.OpenFile(fifo, os.O_WRONLY, 0); werr == nil { //nolint:gosec // G304: fifo is under the test's own t.TempDir()
+		go func() {
+			_, _ = w.Write(make([]byte, 128<<10))
+			_ = w.Close()
+		}()
 	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for deepProbes.Inflight() != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("parked probe goroutine did not drain after the FIFO was released")
-		}
+	deadline := time.Now().Add(2 * time.Second)
+	for deepProbes.Inflight() > before && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 }
