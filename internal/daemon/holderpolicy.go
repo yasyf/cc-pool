@@ -203,13 +203,24 @@ func (p *holderPolicy) Reconcile(ctx context.Context, ev proc.ReconcileEvent) {
 		p.s.log.Printf("mount holder unreachable")
 		fuse, err := p.s.fuseAccounts()
 		if err != nil {
-			p.s.log.Printf("holder supervision: list accounts: %v", err)
+			// No fuse set means no orphan set to compute; clear the snapshot so the
+			// respawn never remounts a prior episode's stale carry.
+			p.s.log.Printf("holder supervision: fuse accounts: %v", err)
+			p.carriedSnapshot, p.rowDirsSnapshot = nil, nil
 			return
 		}
 		carry := p.s.holder.carriedBases()
+		// Force-unmount the dead carcasses (the kill-9 whole-machine hazard) BEFORE
+		// and independently of the account-row read: it needs only fuse+carry, so a
+		// transient store failure on ListAccounts must never skip it.
+		p.s.forceUnmountOrphans(orphanDirs(fuse, carry))
 		all, err := p.s.m.Store.ListAccounts()
 		if err != nil {
+			// Carcasses are cleared; the row-dir set is unknown, so snapshot a nil
+			// set — Respawned then remounts the carried dirs without suppressing any
+			// as account rows, and never reads a stale prior-episode set.
 			p.s.log.Printf("holder supervision: list accounts: %v", err)
+			p.carriedSnapshot, p.rowDirsSnapshot = carry, nil
 			return
 		}
 		rowDirs := make(map[string]bool, len(all))
@@ -217,7 +228,6 @@ func (p *holderPolicy) Reconcile(ctx context.Context, ev proc.ReconcileEvent) {
 			rowDirs[a.ConfigDir] = true
 		}
 		p.carriedSnapshot, p.rowDirsSnapshot = carry, rowDirs
-		p.s.forceUnmountOrphans(orphanDirs(fuse, carry))
 
 	case proc.Respawned:
 		fuse, err := p.s.fuseAccounts()
