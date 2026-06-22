@@ -88,20 +88,6 @@ const degradedStrikes = 2
 // without real mounts. Production: overlay.ForceUnmount (bounded).
 var forceUnmount = overlay.ForceUnmount
 
-// backoffAfter returns the wait after `failures` consecutive failures: base
-// doubling per failure, capped at limit. Zero or negative failure counts
-// never shrink below base.
-func backoffAfter(failures int, base, limit time.Duration) time.Duration {
-	d := base
-	for i := 1; i < failures && d < limit; i++ {
-		d *= 2
-	}
-	if d > limit {
-		d = limit
-	}
-	return d
-}
-
 // rowRetryState is one fuse row's remount-backoff bookkeeping in s.rowRetry,
 // the cc-pool-owned half of supervision state that stayed in the daemon when
 // the generic state machine moved to proc.Supervisor.
@@ -122,18 +108,18 @@ type rowRetryState struct {
 // that goroutine stays the sole mutator of supervisor state); tests that drive
 // s.sup.Tick directly call it from their setup. The generic mechanism — revive
 // under spawn backoff, the crash-loop breaker, the version-skew settle — is
-// proc.Supervisor's; every cc-pool judgement is wired through the policy and
-// the child-control callbacks. The Spawn's Override routes the actual bring-up
-// through s.spawn (the injectable seam), so proc drives the lifecycle without
-// exec'ing a child itself — production delegates to pool.SpawnHolder, tests to
-// the canned-holder recorder.
+// proc.Supervisor's; every cc-pool judgement and child-control effect is wired
+// through the holderPolicy, which implements the full proc.Policy. The Spawn's
+// Override routes the actual bring-up through s.spawn (the injectable seam), so
+// proc drives the lifecycle without exec'ing a child itself — production
+// delegates to pool.SpawnHolder, tests to the canned-holder recorder.
 func (s *Server) buildSupervisor() {
 	p := &holderPolicy{s: s}
 	s.policy = p
-	// proc's per-leg WaitGone/spawn wait is Spawn.Timeout; cc-pool's gone-wait
-	// for a retiring holder (holderGoneWait, tests shrink it) is exactly that
-	// leg, so it drives Spawn.Timeout. The actual bring-up timeout lives in the
-	// Override seam, which proc's Timeout never touches.
+	// proc's per-leg WaitGone/reap wait is Supervisor.GoneWait; cc-pool's gone-wait
+	// for a retiring holder (holderGoneWait, tests shrink it) drives it. The actual
+	// bring-up timeout lives in the Override seam (s.spawnIfServing ->
+	// pool.SpawnHolder), so proc's come-up Spawn.Timeout is never exercised.
 	goneWait := s.holderGoneWait
 	if goneWait <= 0 {
 		goneWait = defaultHolderGoneWait
@@ -141,22 +127,22 @@ func (s *Server) buildSupervisor() {
 	s.sup = &proc.Supervisor{
 		Spawn: proc.Spawn{
 			Socket:    s.holderSocket,
-			Timeout:   goneWait,
 			Available: func() bool { return mountd.NewClient(s.holderSocket).Available() },
 			CanHost:   func() error { return nil },
 			Override:  s.spawnIfServing,
 		},
 		MyVersion:     version.String(),
 		Policy:        p,
-		Shutdown:      p.Shutdown,
-		WaitGone:      p.WaitGone,
-		Kill:          p.Kill,
-		Reconcile:     p.Reconcile,
 		OnSpawnError:  p.onSpawnError,
-		Interval:      s.superviseInterval,
+		GoneWait:      goneWait,
 		HazardWindow:  reviveHazardWindow,
 		SpawnBackoff:  proc.Backoff{Base: spawnBackoffBase, Cap: spawnBackoffCap},
 		ReviveBreaker: reviveBreakerThreshold,
+	}
+	// Fail loud at wire time if a Required field is missing, rather than
+	// nil-panicking deep inside a revive or replace.
+	if err := s.sup.Validate(); err != nil {
+		panic(fmt.Sprintf("daemon: holder supervisor misconfigured: %v", err))
 	}
 }
 
@@ -164,8 +150,8 @@ func (s *Server) buildSupervisor() {
 // the generic state machine (revive a dead holder under spawn backoff and the
 // crash-loop breaker, spare an alive-but-wedged one, replace a version-skewed
 // one once the claim gate clears) is proc.Supervisor.Tick; superviseTick wraps
-// it with cc-pool's steady-state heal. proc's own Run is NOT used: its loop
-// would call Tick directly and bypass the heal-after-tick coupling, which
+// it with cc-pool's steady-state heal. proc owns no ticker of its own — the
+// consumer drives the loop, precisely because the heal-after-tick coupling
 // belongs in cc-pool. Started after the startup reconcile so it never races the
 // initial mounts.
 func (s *Server) superviseHolder(ctx context.Context) {
@@ -539,7 +525,7 @@ func (s *Server) advanceRowRetry(id int, hazard bool) int {
 	} else {
 		st.hazard = 0
 	}
-	st.retryAt = time.Now().Add(backoffAfter(st.failures, remountBackoffBase, remountBackoffCap))
+	st.retryAt = time.Now().Add(proc.Backoff{Base: remountBackoffBase, Cap: remountBackoffCap}.After(st.failures))
 	s.rowRetry[id] = st
 	return st.hazard
 }
@@ -757,13 +743,20 @@ func (s *Server) spawn() error {
 	return pool.SpawnHolder(s.holderSocket, s.holderLog, mountd.DefaultSpawnTimeout)
 }
 
-// spawnIfServing is the proc.Spawn.Override: it spawns a holder only when there
-// is something for one to serve — at least one fuse row, or a mount this holder
-// previously served (orphaned carcasses warrant a respawn even with no fuse row
-// left). An empty pool with no history needs no holder, so the spawn is refused
-// with errNothingToServe — booked against proc's backoff (a no-op retreat on an
-// empty fuse set), never actually starting a child.
+// spawnIfServing is the proc.Spawn.Override: it spawns a holder only when this
+// build CAN host one and there is something for it to serve — at least one fuse
+// row, or a mount this holder previously served (orphaned carcasses warrant a
+// respawn even with no fuse row left). A build that cannot host fuse, or an empty
+// pool with no history, refuses the spawn with an ErrSkipSpawn-wrapping sentinel
+// that proc treats as a benign no-op (no backoff, no crash-loop breaker, no
+// surfaced spawn error), never actually starting a child.
 func (s *Server) spawnIfServing() error {
+	if !s.canSpawnHolder() {
+		// A pure-Go build carrying inherited fuse rows cannot host a holder: there
+		// is nothing it can do, so skip the spawn benignly rather than surface a
+		// spawn failure or eventually retreat the rows on the breaker.
+		return fmt.Errorf("this build cannot host a mount holder: %w", proc.ErrSkipSpawn)
+	}
 	fuse, err := s.fuseAccounts()
 	if err != nil {
 		return fmt.Errorf("spawn mount holder: list accounts: %w", err)
@@ -774,10 +767,11 @@ func (s *Server) spawnIfServing() error {
 	return s.spawn()
 }
 
-// errNothingToServe is spawnIfServing's refusal when the pool has no fuse row
-// and no mount history — there is nothing for a holder to serve, so none is
-// spawned.
-var errNothingToServe = errors.New("no fuse rows or mount history; nothing for a mount holder to serve")
+// errNothingToServe is spawnIfServing's refusal when the pool has no fuse row and
+// no mount history — there is nothing for a holder to serve. It wraps
+// proc.ErrSkipSpawn so the Supervisor treats it as a benign no-op (no backoff, no
+// crash-loop breaker advance, no surfaced spawn error), never starting a child.
+var errNothingToServe = fmt.Errorf("no fuse rows or mount history; nothing for a mount holder to serve: %w", proc.ErrSkipSpawn)
 
 // killPeerPid force-terminates the process holding socket through the seam,
 // but only when its peer pid matches wantPID; nil means mountd.Client.KillPeer

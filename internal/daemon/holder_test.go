@@ -23,6 +23,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/mountd"
+	"github.com/yasyf/fusekit/proc"
 )
 
 // spawnRecorder is an injectable Server.spawnHolder seam: it records every
@@ -328,11 +329,12 @@ func (h *skewedHolder) shutdownCount() int {
 	return h.shutdowns
 }
 
-// TestRemountBackoffDoublesAndCaps pins backoffAfter under the per-row
-// remount constants: base-doubling per failure, capped at 2 minutes —
-// deliberately under the 180s scheduler period, so supervision is never the
-// slower recovery path.
+// TestRemountBackoffDoublesAndCaps pins the per-row remount backoff (now
+// proc.Backoff with the remount constants): base-doubling per failure, capped at
+// 2 minutes — deliberately under the 180s scheduler period, so supervision is
+// never the slower recovery path.
 func TestRemountBackoffDoublesAndCaps(t *testing.T) {
+	b := proc.Backoff{Base: remountBackoffBase, Cap: remountBackoffCap}
 	cases := map[int]time.Duration{
 		1:  remountBackoffBase, // first failure -> base
 		2:  20 * time.Second,   // doubled
@@ -344,8 +346,8 @@ func TestRemountBackoffDoublesAndCaps(t *testing.T) {
 		-1: remountBackoffBase, // negative input never shrinks below base
 	}
 	for failures, want := range cases {
-		if got := backoffAfter(failures, remountBackoffBase, remountBackoffCap); got != want {
-			t.Errorf("backoffAfter(%d, base, cap) = %v, want %v", failures, got, want)
+		if got := b.After(failures); got != want {
+			t.Errorf("proc.Backoff{remount}.After(%d) = %v, want %v", failures, got, want)
 		}
 	}
 }
@@ -386,6 +388,34 @@ func TestSuperviseRespawnConditions(t *testing.T) {
 				t.Fatalf("spawn attempted = %v, want %v", got, tc.wantSpawn)
 			}
 		})
+	}
+}
+
+// TestSuperviseEmptyPoolSurfacesNoSpawnError pins regressions-2 (B2): a dead
+// holder on an empty/all-symlink pool (no fuse rows, no mount history) is a
+// benign no-op — spawnIfServing returns errNothingToServe, which wraps
+// proc.ErrSkipSpawn, so proc neither books a failure nor surfaces it. No spurious
+// "respawn failing" SpawnError reaches the status wire (and thus no false
+// ccp doctor / ccp status failure on a routine state), and no child is spawned.
+func TestSuperviseEmptyPoolSurfacesNoSpawnError(t *testing.T) {
+	s, _, _, rec := newSuperviseServer(t)
+	// No flipToFuse: every account stays symlink, so there are no fuse rows and no
+	// mount history, and no holder is up.
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+
+	for range 3 {
+		s.superviseTick(t.Context())
+	}
+
+	if got := s.holder.wireStatus().SpawnError; got != "" {
+		t.Fatalf("empty pool surfaced SpawnError = %q, want empty (nothing-to-serve is a benign no-op)", got)
+	}
+	if rec.count() != 0 {
+		t.Fatalf("empty pool spawned a holder %d times, want 0", rec.count())
+	}
+	if strings.Contains(buf.String(), "spawn mount holder failed") {
+		t.Fatalf("empty pool logged a spawn failure, want none:\n%s", buf.String())
 	}
 }
 
@@ -476,7 +506,7 @@ func TestSuperviseZombieSocketEngagesBackoff(t *testing.T) {
 	// serving"); the post-spawn verification then fails the health check, booking
 	// it as a failure, surfacing SpawnError, and never celebrating a respawn — so
 	// the spawn-fail breaker can still retreat it.
-	if got := s.holder.wireStatus().SpawnError; !strings.Contains(got, "failed its health check") {
+	if got := s.holder.wireStatus().SpawnError; !strings.Contains(got, "is not ready") {
 		t.Fatalf("SpawnError = %q, want the failed verification surfaced", got)
 	}
 	if strings.Contains(buf.String(), "mount holder respawned") {
@@ -489,7 +519,7 @@ func TestSuperviseZombieSocketEngagesBackoff(t *testing.T) {
 	if got := strings.Count(buf.String(), "alive but unresponsive"); got != 1 {
 		t.Fatalf("alive-but-unresponsive logged %d times across two ticks, want 1:\n%s", got, buf.String())
 	}
-	if got := strings.Count(buf.String(), "failed its health check"); got != 1 {
+	if got := strings.Count(buf.String(), "is not ready"); got != 1 {
 		t.Fatalf("identical verification failure logged %d times, want 1:\n%s", got, buf.String())
 	}
 }
@@ -1354,6 +1384,12 @@ func TestSuperviseLogsOncePerTransition(t *testing.T) {
 		if h.shutdownCount() != 0 {
 			t.Fatal("deferred replace still stopped the holder")
 		}
+		// B1 (sloppy-1): a FORWARD-skew holder proc is actively trying to replace
+		// must NOT get the reverse-skew "restart to converge" guidance — that is for
+		// a true reverse-skew (a binary our own spawn settled at), which this is not.
+		if strings.Contains(buf.String(), "restart the daemon to converge") {
+			t.Fatalf("a forward-skew holder being actively replaced wrongly logged reverse-skew converge guidance:\n%s", buf.String())
+		}
 	})
 }
 
@@ -1880,6 +1916,61 @@ func TestReviveForceUnmountsCarriedOrphanBeforeSpawn(t *testing.T) {
 	}
 	if unmountsAtSpawn != 1 {
 		t.Fatalf("unmounts before spawn = %d, want 1 (the carried carcass cleared before respawn)", unmountsAtSpawn)
+	}
+}
+
+// TestReviveForceUnmountsCarriedOrphanWhenStoreReadFails pins the A1 fix
+// (completeness-1): the carried pre-row carcasses are force-unmounted FIRST and
+// independently of the fuse-row store read, so a transient Store.ListAccounts
+// failure during a holder death can no longer skip clearing them — the kill-9
+// whole-machine hazard. Before the fix, fuseAccounts() (itself a ListAccounts)
+// ran first and its error returned BEFORE the unmount, stranding the carcass.
+func TestReviveForceUnmountsCarriedOrphanWhenStoreReadFails(t *testing.T) {
+	s, dirs, _, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	preRow, err := os.MkdirTemp("/tmp", "ccp-prerow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(preRow) })
+
+	// Prime carriedBases from a live holder serving a pre-row dir (no account
+	// row), then crash it: the snapshot survives markUnhealthy into the revive.
+	old := startSkewedHolder(t, []mountd.MountInfo{
+		{Dir: dirs[1], Base: "/base", Live: true},
+		{Dir: preRow, Base: "/base2", Live: true},
+	}, false)
+	s.holderSocket = old.socket
+	s.holder.refresh(s.holderClient())
+	_ = old.ln.Close() // the holder crashes; carriedBases keeps the pre-row dir
+
+	// Only the carried pre-row dir reads as a wedged mountpoint.
+	fakeOverlayMounted(t, func(dir string) bool { return dir == preRow })
+
+	var (
+		mu        sync.Mutex
+		unmounted []string
+	)
+	swapForceUnmount(t, func(dir string) error {
+		mu.Lock()
+		unmounted = append(unmounted, dir)
+		mu.Unlock()
+		return nil
+	})
+
+	// Force every Store read on the death path to fail: ListAccounts (via
+	// fuseAccounts) now errors. The carried carcass clear must STILL run, because
+	// it needs only the in-memory carriedBases — never the store.
+	if err := s.m.Store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	s.superviseTick(t.Context())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(stringSet(unmounted), stringSet([]string{preRow})) {
+		t.Fatalf("with the store read failing, force-unmounted %v, want the carried pre-row dir [%s] still cleared (A1: carcass clear must not be gated behind the store read)", unmounted, preRow)
 	}
 }
 

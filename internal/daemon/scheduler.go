@@ -10,6 +10,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/proc"
 )
 
 const (
@@ -42,7 +43,7 @@ const (
 
 // rlBackoff returns the backoff duration for a given consecutive-429 streak.
 func rlBackoff(streak int) time.Duration {
-	return backoffAfter(streak, rateLimitBackoffBase, rateLimitBackoffCap)
+	return proc.Backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap}.After(streak)
 }
 
 // scheduler runs the periodic usage poll + idle-only refresh + session
