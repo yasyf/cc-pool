@@ -391,9 +391,9 @@ func TestSuperviseRespawnConditions(t *testing.T) {
 	}
 }
 
-// TestSuperviseEmptyPoolSurfacesNoSpawnError pins regressions-2 (B2): a dead
-// holder on an empty/all-symlink pool (no fuse rows, no mount history) is a
-// benign no-op — spawnIfServing returns errNothingToServe, which wraps
+// TestSuperviseEmptyPoolSurfacesNoSpawnError pins that a dead holder on an
+// empty/all-symlink pool (no fuse rows, no mount history) is a benign no-op:
+// spawnIfServing returns errNothingToServe, which wraps
 // proc.ErrSkipSpawn, so proc neither books a failure nor surfaces it. No spurious
 // "respawn failing" SpawnError reaches the status wire (and thus no false
 // ccp doctor / ccp status failure on a routine state), and no child is spawned.
@@ -1384,9 +1384,9 @@ func TestSuperviseLogsOncePerTransition(t *testing.T) {
 		if h.shutdownCount() != 0 {
 			t.Fatal("deferred replace still stopped the holder")
 		}
-		// B1 (sloppy-1): a FORWARD-skew holder proc is actively trying to replace
-		// must NOT get the reverse-skew "restart to converge" guidance — that is for
-		// a true reverse-skew (a binary our own spawn settled at), which this is not.
+		// A FORWARD-skew holder proc is actively trying to replace must NOT get the
+		// reverse-skew "restart to converge" guidance — that is for a true reverse-skew
+		// (a binary our own spawn settled at), which this is not.
 		if strings.Contains(buf.String(), "restart the daemon to converge") {
 			t.Fatalf("a forward-skew holder being actively replaced wrongly logged reverse-skew converge guidance:\n%s", buf.String())
 		}
@@ -1919,12 +1919,12 @@ func TestReviveForceUnmountsCarriedOrphanBeforeSpawn(t *testing.T) {
 	}
 }
 
-// TestReviveForceUnmountsCarriedOrphanWhenStoreReadFails pins the A1 fix
-// (completeness-1): the carried pre-row carcasses are force-unmounted FIRST and
-// independently of the fuse-row store read, so a transient Store.ListAccounts
-// failure during a holder death can no longer skip clearing them — the kill-9
-// whole-machine hazard. Before the fix, fuseAccounts() (itself a ListAccounts)
-// ran first and its error returned BEFORE the unmount, stranding the carcass.
+// TestReviveForceUnmountsCarriedOrphanWhenStoreReadFails pins that the carried
+// pre-row carcasses are force-unmounted FIRST and independently of the fuse-row
+// store read: a transient Store.ListAccounts failure during a holder death must
+// not skip clearing them (the kill-9 whole-machine hazard). The carried set comes
+// from the in-memory carriedBases, so it needs no store read at all — the litmus
+// here closes the store so fuseAccounts() errors, yet the carcass must still clear.
 func TestReviveForceUnmountsCarriedOrphanWhenStoreReadFails(t *testing.T) {
 	s, dirs, _, _ := newSuperviseServer(t)
 	flipToFuse(t, s, 1)

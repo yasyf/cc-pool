@@ -302,8 +302,8 @@ func (p *holderPolicy) noteSettledVersion(ver string) {
 	case ver == "" || ver == version.String():
 		// A genuine settle at our version: the skewed holder we may have been
 		// deferring is gone. Clear BOTH dedups so a future converge note and a future
-		// skew-deferral log afresh (the old once-per-transition reset, which the
-		// extraction had dropped — restored here, not unconditionally).
+		// skew-deferral each log afresh — reset only on a real settle here, never on
+		// the forward-skew default arm below (where a deferral is still in flight).
 		p.lastConvergeVer = ""
 		p.lastDefer = ""
 	case ver == p.s.sup.SpawnedSkew():
