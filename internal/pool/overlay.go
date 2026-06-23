@@ -43,7 +43,7 @@ func CanHostFuse() bool { return overlay.FuseBuilt() }
 // stops it), and a later fuse Setup reuses it.
 func DetectOverlayKind() (overlay.Kind, string) {
 	if !CanHostFuse() {
-		return overlay.KindSymlink, "this build cannot host fuse mounts; install fuse-t (brew install macos-fuse-t/cask/fuse-t), then brew reinstall cc-pool"
+		return overlay.KindSymlink, "this build cannot host fuse mounts; run `ccp fuse enable`"
 	}
 	if err := SpawnHolder(MountsSocketPath(), MountHolderLogPath(), mountd.DefaultSpawnTimeout); err != nil {
 		return overlay.KindSymlink, fmt.Sprintf("mount holder did not start: %v", err)
@@ -55,7 +55,7 @@ func DetectOverlayKind() (overlay.Kind, string) {
 		// (missing/unloadable, or the kernel refusing it). NEVER the TCC grant —
 		// do not send the user chasing a Network Volumes toggle that will not
 		// help. The real cause is in the mount-holder log.
-		return overlay.KindSymlink, fmt.Sprintf("fuse-t cannot mount on this machine (%v); using symlinks — repair fuse-t (brew install macos-fuse-t/cask/fuse-t), then `ccp migrate --to fuse`", err)
+		return overlay.KindSymlink, fmt.Sprintf("fuse-t cannot mount on this machine (%v); using symlinks — run `ccp fuse enable` to (re)install fuse-t and switch back to the live mirror", err)
 	case errors.Is(err, mountd.ErrTCCDenied):
 		// The probe is blocked PENDING the one-time macOS "Network Volumes"
 		// grant — a prompt should have appeared. If one did, grant it and
@@ -65,7 +65,7 @@ func DetectOverlayKind() (overlay.Kind, string) {
 	case err != nil:
 		return overlay.KindSymlink, fmt.Sprintf("mount holder probe failed: %v", err)
 	case !ok:
-		return overlay.KindSymlink, "probe mount declined — install fuse-t (brew install macos-fuse-t/cask/fuse-t)"
+		return overlay.KindSymlink, "probe mount declined — run `ccp fuse enable`"
 	}
 	return overlay.KindFuse, ""
 }

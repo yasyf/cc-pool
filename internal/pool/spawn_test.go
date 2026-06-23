@@ -37,7 +37,7 @@ func TestSpawnHolderPureBuildRefusal(t *testing.T) {
 	if errors.Is(err, mountd.ErrHolderUnavailable) {
 		t.Errorf("errors.Is(err, ErrHolderUnavailable) = true, want false (the sentinels must stay disjoint); err = %v", err)
 	}
-	for _, want := range []string{"cannot host fuse mounts", "brew install macos-fuse-t/cask/fuse-t", "brew reinstall cc-pool"} {
+	for _, want := range []string{"cannot host fuse mounts", "ccp fuse enable"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err.Error(), want)
 		}

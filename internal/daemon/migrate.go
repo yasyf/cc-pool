@@ -80,13 +80,15 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 	}
 
 	resp := Response{OK: true, Migrations: results}
-	if converted {
-		// The new-account default follows the direction being migrated: the
-		// first successful fuse conversion proves this machine mounts, and a
-		// deliberate retreat to symlink should stop minting fuse accounts.
+	// Record the new-account default. Toward fuse, reaching here means the fuse
+	// gate already passed (the holder probe proved this machine mounts), so adopt
+	// fuse even when nothing needed converting — otherwise `ccp fuse enable` on a
+	// fresh or already-fuse pool would leave the default on symlink. The symlink
+	// retreat only flips the default when an account actually converted back.
+	if to == overlay.KindFuse || converted {
 		if err := s.m.SetDefaultOverlayKind(to); err != nil {
 			resp.OK = false
-			resp.Error = fmt.Sprintf("accounts converted, but recording %s as the default for new accounts failed: %v", to, err)
+			resp.Error = fmt.Sprintf("recording %s as the new-account default failed: %v", to, err)
 		}
 	}
 	return resp
@@ -102,7 +104,7 @@ func (s *Server) fuseGate() string {
 		return s.fuseGateFn()
 	}
 	if !overlay.FuseBuilt() {
-		return "this daemon build has no fuse support; install fuse-t (brew install macos-fuse-t/cask/fuse-t), reinstall cc-pool, and restart the daemon"
+		return "this daemon build has no fuse support; run `ccp fuse enable` to install fuse-t and switch to the live-mirror build"
 	}
 	// The reason leads verbatim: a declined probe carries its own fuse-t/TCC
 	// remedy, while holder spawn or probe-RPC failures name their real cause —

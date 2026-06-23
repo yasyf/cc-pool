@@ -9,7 +9,7 @@ require (
 	github.com/descope/go-free-email-providers v0.0.0-20260427134210-d71f4c2c7632
 	github.com/spf13/cobra v1.10.2
 	github.com/winfsp/cgofuse v1.6.1-0.20260531120352-2fa812d1bdc7
-	github.com/yasyf/fusekit v0.7.0
+	github.com/yasyf/fusekit v0.8.0
 	golang.org/x/net v0.56.0
 	golang.org/x/sync v0.21.0
 	golang.org/x/sys v0.46.0

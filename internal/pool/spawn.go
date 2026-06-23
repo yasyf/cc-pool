@@ -7,11 +7,10 @@ import (
 )
 
 // cannotHostHint is the user-facing guidance appended to mountd.ErrCannotHost
-// when a pure (non-fuse) build is asked to host or spawn a mount holder. It is
-// cc-pool's brew text, lifted verbatim from the pre-fusekit EnsureRunning
-// refusal so the install guidance is preserved; the rendered error reads
-// "this binary cannot host fuse mounts: install fuse-t …".
-const cannotHostHint = "install fuse-t (brew install macos-fuse-t/cask/fuse-t) then brew reinstall cc-pool to get the fuse build"
+// when a pure (non-fuse) build is asked to host or spawn a mount holder. It
+// points at the one-step setup command; the rendered error reads "this binary
+// cannot host fuse mounts: run `ccp fuse enable` …".
+const cannotHostHint = "run `ccp fuse enable` to install fuse-t and switch to the live-mirror build"
 
 // SpawnHolder ensures a detached `cc-pool mount-holder --socket <socket>` is
 // serving socket, auto-spawning one (in its own session) and waiting up to

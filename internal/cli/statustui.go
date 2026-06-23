@@ -42,7 +42,7 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 	// --live (the user already opted out of the daemon). The alt-screen clears any
 	// "restarting…" line on entry.
 	if !live {
-		ensureDaemon(cmd)
+		ensureDaemon(cmd, false)
 	}
 	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just hides pin controls
 	model := statusTUI{

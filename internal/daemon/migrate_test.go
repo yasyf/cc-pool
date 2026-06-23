@@ -246,6 +246,39 @@ func TestHandleMigrateReverse(t *testing.T) {
 	}
 }
 
+// TestHandleMigrateToFuseRecordsDefaultWithoutConversions pins the
+// `ccp fuse enable` empty/already-fuse case: migrating toward fuse records fuse
+// as the new-account default even when no account needs converting, because the
+// fuse gate passing already proves this machine can mount. (A symlink retreat,
+// by contrast, only flips the default when an account actually converts back —
+// see TestHandleMigrateReverse.)
+func TestHandleMigrateToFuseRecordsDefaultWithoutConversions(t *testing.T) {
+	s, _, _ := newMigrateServer(t)
+
+	// First migrate converts both accounts and records fuse as the default.
+	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse")); !resp.OK {
+		t.Fatalf("initial migrate failed: %s", resp.Error)
+	}
+	// Drift the recorded default back to symlink while the accounts stay fuse —
+	// standing in for a fresh pool whose fuse migrate converts nothing.
+	if err := s.m.Store.SetMeta("overlay_kind", "symlink"); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
+	if !resp.OK {
+		t.Fatalf("re-migrate failed: %s", resp.Error)
+	}
+	for id, oc := range outcomes(resp) {
+		if oc != MigrationAlready {
+			t.Fatalf("acct %d outcome = %v, want already (no conversion expected)", id, oc)
+		}
+	}
+	if v, _, _ := s.m.Store.GetMeta("overlay_kind"); v != "fuse" {
+		t.Fatalf("meta overlay_kind = %q, want fuse — a zero-conversion fuse migrate must still record the default", v)
+	}
+}
+
 func TestHandleMigrateFuseGateBlocks(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
 	s.fuseGateFn = func() string { return "grant Network Volumes access" }

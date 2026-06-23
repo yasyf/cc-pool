@@ -33,7 +33,7 @@ same setup automatically.`,
 				reportOverlayChoice(cmd, res)
 
 				if !noService {
-					ensureDaemon(cmd)
+					ensureDaemon(cmd, false)
 				}
 
 				step(out, "\nNext, run `ccp add` to pool your subscriptions, including your main one.")
@@ -56,6 +56,6 @@ func reportOverlayChoice(cmd *cobra.Command, res *pool.InitResult) {
 	case res.OverlayFallbackReason != "" && overlay.FuseBuilt():
 		warn(cmd.ErrOrStderr(), "fuse overlay unavailable (%s); using symlinks", res.OverlayFallbackReason)
 	case res.OverlayKind == overlay.KindSymlink && !overlay.FuseBuilt():
-		note(cmd.OutOrStdout(), "For a live-mirror overlay, install fuse-t with `brew install macos-fuse-t/cask/fuse-t`.")
+		note(cmd.OutOrStdout(), "For a live-mirror overlay, run `ccp fuse enable`.")
 	}
 }

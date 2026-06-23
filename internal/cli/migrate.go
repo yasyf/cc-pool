@@ -38,47 +38,16 @@ and re-run. New accounts follow the last migrated-to provider.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
-				if err := requireInit(m); err != nil {
-					return err
-				}
 				kind := overlay.Kind(to)
 				if kind != overlay.KindFuse && kind != overlay.KindSymlink {
 					return fmt.Errorf("unknown overlay kind %q (want fuse or symlink)", to)
 				}
 				if kind == overlay.KindFuse && !overlay.FuseBuilt() {
-					return errors.New("this cc-pool build has no fuse support; install fuse-t (`brew install macos-fuse-t/cask/fuse-t`), then `brew reinstall cc-pool`")
+					return errors.New("this cc-pool build has no fuse support; run `ccp fuse enable` to install fuse-t and switch to the live-mirror build")
 				}
-
-				// The daemon performs the conversion; require one at exactly
-				// this version so the op and its gates exist on the other
-				// end — a stale-version daemon cannot be trusted to drive
-				// them. NOT auto-restarted, purely to keep this command
-				// read-only on the service; the restart itself is mount-safe
-				// (the detached holder keeps serving the mirrors across it)
-				// and the skew error below recommends it plainly.
-				cl := daemon.NewClient()
-				health, err := cl.Health()
-				switch {
-				case errors.Is(err, daemon.ErrDaemonUnavailable):
-					return fmt.Errorf("migration runs inside the daemon (it owns the conversion gates), which is not running; start it with `ccp service install` and re-run: %w", err)
-				case err != nil:
-					// A daemon that accepted the dial but failed the probe is
-					// hung, not absent. Surface that as-is — a restart would
-					// be mount-safe, but prescribing one for a hang would
-					// mask the real failure.
-					return fmt.Errorf("daemon health check: %w", err)
-				}
-				if health.Version != version.String() {
-					return fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) and re-run — mounts and live sessions are unaffected", health.Version, version.String())
-				}
-
-				var acct *int
-				if account > 0 {
-					acct = &account
-				}
-				resp, err := cl.Migrate(acct, string(kind), force)
+				resp, err := requestMigration(m, kind, account, force)
 				if err != nil {
-					return fmt.Errorf("migrate: %w", err)
+					return err
 				}
 				if len(resp.Migrations) == 0 {
 					if resp.Error != "" {
@@ -94,6 +63,44 @@ and re-run. New accounts follow the last migrated-to provider.`,
 	cmd.Flags().StringVar(&to, "to", string(overlay.KindFuse), "target overlay kind: fuse or symlink")
 	cmd.Flags().BoolVar(&force, "force", false, "migrate despite live sessions (idle ones may briefly error mid-flip; launching ones still refuse)")
 	return cmd
+}
+
+// requestMigration runs the client side of an overlay migration, shared by
+// `ccp migrate` and `ccp fuse enable`: require an initialized pool and a healthy
+// daemon at exactly this version (the daemon owns the conversion gates, so a
+// stale-version one cannot be trusted to drive them), then ask it to migrate.
+// account==0 means every account. It deliberately does NOT check this process's
+// own fuse capability: the daemon — not this CLI — hosts the mounts, so
+// `ccp fuse enable` can drive a fuse daemon from a still-pure CLI whose binary
+// was just reinstalled. The daemon is NOT auto-restarted here; the version-skew
+// error recommends a restart plainly, and `ccp fuse enable` forces its own.
+func requestMigration(m *pool.Manager, kind overlay.Kind, account int, force bool) (*daemon.Response, error) {
+	if err := requireInit(m); err != nil {
+		return nil, err
+	}
+	cl := daemon.NewClient()
+	health, err := cl.Health()
+	switch {
+	case errors.Is(err, daemon.ErrDaemonUnavailable):
+		return nil, fmt.Errorf("migration runs inside the daemon (it owns the conversion gates), which is not running; start it with `ccp service install` and re-run: %w", err)
+	case err != nil:
+		// A daemon that accepted the dial but failed the probe is hung, not
+		// absent. Surface that as-is — a restart would be mount-safe, but
+		// prescribing one for a hang would mask the real failure.
+		return nil, fmt.Errorf("daemon health check: %w", err)
+	}
+	if health.Version != version.String() {
+		return nil, fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) and re-run — mounts and live sessions are unaffected", health.Version, version.String())
+	}
+	var acct *int
+	if account > 0 {
+		acct = &account
+	}
+	resp, err := cl.Migrate(acct, string(kind), force)
+	if err != nil {
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	return resp, nil
 }
 
 // renderMigrations prints per-account outcomes and the summary, returning an

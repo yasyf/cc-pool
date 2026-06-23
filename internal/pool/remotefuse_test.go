@@ -35,7 +35,7 @@ func TestNewRemoteFuse(t *testing.T) {
 	if !reflect.DeepEqual(p.Args, wantArgs) {
 		t.Errorf("Args = %v, want %v", p.Args, wantArgs)
 	}
-	for _, want := range []string{"brew install macos-fuse-t/cask/fuse-t", "brew reinstall cc-pool"} {
+	for _, want := range []string{"ccp fuse enable"} {
 		if !strings.Contains(p.CannotHostHint, want) {
 			t.Errorf("CannotHostHint %q does not contain %q", p.CannotHostHint, want)
 		}

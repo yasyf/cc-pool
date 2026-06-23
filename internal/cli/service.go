@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/fuset"
 	"github.com/yasyf/fusekit/mountd"
 	"github.com/yasyf/fusekit/service"
 	"github.com/yasyf/fusekit/version"
@@ -62,7 +63,7 @@ func ccpAgent() service.Agent {
 		LogPath: pool.LogPath(),
 		Env: map[string]string{
 			"PATH":                 os.Getenv("PATH"),
-			"CGOFUSE_LIBFUSE_PATH": "/usr/local/lib/libfuse-t.dylib",
+			"CGOFUSE_LIBFUSE_PATH": fuset.Dylib,
 		},
 	}
 }
@@ -436,17 +437,24 @@ const evictTimeout = 5 * time.Second
 // silently starting (or restarting, after an upgrade) it as needed.
 // Best-effort: failures are warnings, never fatal — no calling flow requires
 // the daemon (selection and add validation fall back to direct sampling).
-func ensureDaemon(cmd *cobra.Command) {
+//
+// force restarts even when a current-version daemon is already responding —
+// for a same-version binary swap (a pure→fuse `brew reinstall`), where the
+// running daemon's on-disk image just changed under it but its version string
+// is unchanged, so the daemonAt short-circuit would otherwise leave the stale
+// image running.
+func ensureDaemon(cmd *cobra.Command, force bool) {
 	want := version.String()
-	if daemonAt(want) {
+	if !force && daemonAt(want) {
 		return
 	}
 	cl := daemon.NewClient()
 	if resp, err := cl.Health(); err == nil && resp.OK {
-		// A version-skewed daemon answers here: launchd's KeepAlive holding a
+		// A version-skewed daemon answers here (launchd's KeepAlive holding a
 		// pre-upgrade image, or a detached EnsureRunning spawn launchd never
-		// tracked.
-		step(cmd.OutOrStdout(), "Restarting the cc-pool daemon to pick up the new version…")
+		// tracked); under force, so does a current-version daemon whose on-disk
+		// binary just changed under it (a pure→fuse reinstall).
+		step(cmd.OutOrStdout(), "Restarting the cc-pool daemon…")
 		// Bootout first: this terminates a launchd-tracked daemon — mount-safe,
 		// since the detached holder keeps serving any fuse mirrors across it —
 		// and disables KeepAlive so launchd can't respawn the pre-upgrade image

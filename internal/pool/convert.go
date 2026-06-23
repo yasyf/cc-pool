@@ -247,7 +247,7 @@ func (m *Manager) SetDefaultOverlayKind(kind overlay.Kind) error {
 	case overlay.KindSymlink:
 	case overlay.KindFuse:
 		if !m.canHostFuse() {
-			return fmt.Errorf("set default overlay %q: this build cannot host fuse mounts — install fuse-t (brew install macos-fuse-t/cask/fuse-t), then brew reinstall cc-pool: %w", kind, ErrConvertUnsupported)
+			return fmt.Errorf("set default overlay %q: this build cannot host fuse mounts — run `ccp fuse enable`: %w", kind, ErrConvertUnsupported)
 		}
 	default:
 		return fmt.Errorf("set default overlay: unknown kind %q", kind)

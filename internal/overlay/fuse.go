@@ -14,7 +14,7 @@
 // surfaces as ErrFuseUnavailable instead of crashing the holder) and pre-mount
 // carcass cleanup (ClearCarcass).
 //
-// cgofuse drives fuse-t natively (it dlopens /usr/local/lib/libfuse-t.dylib).
+// cgofuse drives fuse-t natively (it dlopens fuset.Dylib).
 // Build with: CGO_ENABLED=1 go build -tags fuse ./...
 //
 // Mounts are hosted in-process and block while serving, so the daemon owns
@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit"
+	"github.com/yasyf/fusekit/fuset"
 	"github.com/yasyf/fusekit/mountd"
 )
 
@@ -59,7 +60,7 @@ func init() {
 	// dlopen is lazy (first fuse call), so setting it here is in time, and
 	// os.Setenv updates the C environment under cgo.
 	if os.Getenv("CGOFUSE_LIBFUSE_PATH") == "" {
-		_ = os.Setenv("CGOFUSE_LIBFUSE_PATH", "/usr/local/lib/libfuse-t.dylib")
+		_ = os.Setenv("CGOFUSE_LIBFUSE_PATH", fuset.Dylib)
 	}
 }
 
