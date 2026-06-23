@@ -51,13 +51,28 @@ const (
 // of retried into eternity.
 const remountBreakerThreshold = 5
 
+// tccBreakerThreshold bounds how long the daemon waits for the macOS "Network
+// Volumes" grant before giving up and retreating the row to symlink. A TCC
+// block is a clean not-mounted state (so it never trips remountBreakerThreshold
+// — see rowRetryState.hazard), but it must NOT retry forever: a machine where
+// the grant can never land would otherwise churn doomed mounts and leave every
+// account unusable. After this many CONSECUTIVE TCC-blocked heals — with the
+// per-row backoff (remountBackoff, capped at 2m) the span is ~4-5 minutes,
+// ample for an attentive human to grant — the row escalates to the
+// always-available symlink overlay (escalateTCCBlockedRow). Set ABOVE
+// remountBreakerThreshold: a TCC block is a benign wait, not the kernel hazard a
+// wedged mount is, so it earns a longer grace. The startup capability probe
+// (reconcileOverlays) already retreats a hard-failing pool in one pass, so this
+// per-row grace only governs the genuinely-pending case.
+const tccBreakerThreshold = 6
+
 // reviveBreakerThreshold is the holder-level circuit breaker. After this many
 // CONSECUTIVE holder deaths (each force-unmounting EVERY mount and losing
 // in-flight writes — see reviveHolder) without the holder ever returning at
 // THIS daemon's version — a stuck old holder we cannot replace under live
 // sessions, or fuse-t/NFS gone unavailable so a holder will not spawn at all —
 // the supervisor stops reviving it and falls every fuse row back to the
-// always-available symlink overlay (fallbackCrashLoopedRows). Lower than
+// always-available symlink overlay (retreatAllFuseRows). Lower than
 // remountBreakerThreshold because a holder-level loop churns the WHOLE pool
 // each cycle, so its data-loss blast radius warrants a faster retreat. A clean
 // holder restart only reaches 1 (the next settled tick at our version resets
@@ -97,10 +112,16 @@ type rowRetryState struct {
 	// hazard counts CONSECUTIVE wedged/never-recovering heal failures for the
 	// circuit breaker (remountBreakerThreshold). It is advanced only by hazard
 	// outcomes (healRetry/healFallback) and reset by a successful mount or a
-	// healTCCBlocked — a TCC block is a clean not-mounted state that must retry
-	// forever, so it backs off (via failures) but never counts toward the
-	// breaker.
+	// healTCCBlocked — a TCC block is a clean not-mounted state, so it backs off
+	// (via failures) but never counts toward the wedged breaker.
 	hazard int
+	// tccBlocks counts CONSECUTIVE healTCCBlocked outcomes for the TCC grace
+	// breaker (tccBreakerThreshold): a grant that never lands must not retry
+	// forever. Advanced only by advanceTCCRetry and reset by any non-TCC outcome
+	// (a successful mount drops the whole ledger entry; a wedged/DB failure zeroes
+	// it via advanceRowRetry), so an alternating TCC/wedge row reaches neither
+	// breaker.
+	tccBlocks int
 }
 
 // buildSupervisor constructs the holder supervisor and its cc-pool policy
@@ -485,10 +506,16 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 			case healMounted:
 				delete(s.rowRetry, a.ID)
 			case healTCCBlocked:
-				// A clean not-mounted state waiting on the human's Network
-				// Volumes grant: back off, but NEVER count it toward the breaker —
-				// it must retry forever for the grant to land.
-				s.advanceRowRetry(a.ID, false)
+				// A clean not-mounted state waiting on the macOS "Network
+				// Volumes" grant: back off and give the grant a bounded grace
+				// window. It never counts toward the wedged breaker (it is not a
+				// kernel hazard), but it must NOT retry forever — a grant that can
+				// never land would churn doomed mounts and leave the row unusable
+				// — so once the consecutive TCC-block count crosses
+				// tccBreakerThreshold, retreat the row to symlink.
+				if s.advanceTCCRetry(a.ID) >= tccBreakerThreshold {
+					s.escalateTCCBlockedRow(fresh)
+				}
 			default:
 				// healRetry/healFallback: the mirror is not up and we keep
 				// trying. Count it as a hazard; once the consecutive count hits
@@ -513,7 +540,9 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 // mount (healRetry/healFallback) — those advance the breaker's consecutive
 // hazard count; a non-hazard failure (a TCC block or a DB re-read error)
 // resets it, since the breaker only ever escalates a genuinely stuck mirror.
-// Returns the post-update hazard count for the breaker check.
+// Either way it also resets the TCC grace count, because a non-TCC failure
+// breaks any consecutive-TCC run. Returns the post-update hazard count for the
+// wedged-breaker check.
 func (s *Server) advanceRowRetry(id int, hazard bool) int {
 	if s.rowRetry == nil {
 		s.rowRetry = make(map[int]rowRetryState)
@@ -525,114 +554,148 @@ func (s *Server) advanceRowRetry(id int, hazard bool) int {
 	} else {
 		st.hazard = 0
 	}
+	// A non-TCC outcome breaks any consecutive-TCC run, so the TCC grace breaker
+	// only ever fires on a genuinely stuck-pending grant.
+	st.tccBlocks = 0
 	st.retryAt = time.Now().Add(proc.Backoff{Base: remountBackoffBase, Cap: remountBackoffCap}.After(st.failures))
 	s.rowRetry[id] = st
 	return st.hazard
 }
 
-// escalateWedgedRow is the circuit breaker for a fuse row whose mount never
-// recovers (remountBreakerThreshold consecutive wedged/never-recovering heals).
-// Retrying forever lets a wedged NFS carcass linger and re-wedge the kernel —
-// the whole-machine hazard the kill-9 incident exposed — so this is a SEPARATE,
-// UNGATED hazard-remediation escalation, distinct from the idle-gated
-// fallbackToSymlink on the genuine-mount-failure path: it force-unmounts the
-// carcass directly (the dead-mount fds are already useless; relaunch is the fix,
-// exactly as the held-dead remount policy accepts) and converts the row to
-// symlink so the dir is usable again. It still takes the converting claim
-// (beginConvertUnderPoll, under the caller's held poll claim) so a select
-// cannot land mid-conversion; only the live-session/scan IDLE gate is skipped,
-// because a never-recovering mount is a hazard, not a healthy mount. Converting
-// to symlink makes both the scheduler poll and the next supervision pass skip
-// the row (non-fuse), so the breaker never fights them. The ledger entry is
-// dropped to stop the churn and the escalation is logged loudly. Caller holds
-// the account's poll claim.
-func (s *Server) escalateWedgedRow(a store.Account) {
-	if !s.beginConvertUnderPoll(a.ID) {
-		// A select reserved the dir between the heal and here; let it run and
-		// re-fire the breaker next windowed tick (the ledger entry stays).
-		s.log.Printf("acct-%02d remount breaker deferred: reserved by a pending select", a.ID)
-		return
+// advanceTCCRetry books one TCC-blocked heal against account id's ledger: it
+// backs off like advanceRowRetry (failures++ drives the doubling window) but
+// advances the TCC grace counter instead of the wedged-hazard one, and resets
+// the wedged hazard (a TCC block is a clean not-mounted state, never a wedge).
+// Returns the post-update consecutive TCC-block count for the tccBreakerThreshold
+// check — the wait-for-the-grant grace is bounded, not infinite.
+func (s *Server) advanceTCCRetry(id int) int {
+	if s.rowRetry == nil {
+		s.rowRetry = make(map[int]rowRetryState)
 	}
-	defer s.endConvert(a.ID)
-	s.log.Printf("acct-%02d fuse mount never recovered after %d consecutive attempts; force-unmounting and falling back to symlink — relaunch any sessions on it",
-		a.ID, remountBreakerThreshold)
-	if overlayMounted(a.ConfigDir) {
-		if err := forceUnmount(a.ConfigDir); err != nil {
-			s.log.Printf("acct-%02d remount breaker: force-unmount %s: %v", a.ID, a.ConfigDir, err)
-		}
-	}
-	if _, err := s.m.ConvertOverlay(a, overlay.KindSymlink); err != nil {
-		s.log.Printf("acct-%02d remount breaker: convert to symlink: %v", a.ID, err)
-		return
-	}
-	s.holder.noteUnmounted(a.ConfigDir)
-	delete(s.rowRetry, a.ID)
-	s.log.Printf("acct-%02d fell back to symlink after exhausting fuse remount attempts", a.ID)
+	st := s.rowRetry[id]
+	st.failures++
+	st.hazard = 0
+	st.tccBlocks++
+	st.retryAt = time.Now().Add(proc.Backoff{Base: remountBackoffBase, Cap: remountBackoffCap}.After(st.failures))
+	s.rowRetry[id] = st
+	return st.tccBlocks
 }
 
-// fallbackCrashLoopedRows retreats every fuse account to the symlink overlay
-// after the mount holder crash-looped past reviveBreakerThreshold (or will not
-// spawn at all). It is the holder-level analog of escalateWedgedRow: an UNGATED
-// hazard remediation (the mounts are already down from the revive's
-// force-unmount, sessions are already orphaned and must relaunch), distinct
-// from the idle-gated fallbackToSymlink. Each row is taken with beginConvert —
-// reviveHolder holds no poll claim — so a select, a scheduler poll, or another
-// conversion cannot interleave; a row that cannot be claimed or fails to
-// convert is left for a later tick. The crash-loop breaker itself is
-// proc.Supervisor's: it clears on the next healthy settle at our version (a
-// deliberate re-promotion to fuse mounts through such a holder), never here.
-func (s *Server) fallbackCrashLoopedRows(ctx context.Context, fuse []store.Account) {
+// convertRowToSymlink is the single fuse→symlink retreat primitive every
+// hazard/dead-end path shares (the wedged breaker, the TCC grace breaker, the
+// holder crash-loop retreat, and the startup capability gate). The caller holds
+// a convert claim (beginConvert standalone, or beginConvertUnderPoll under a
+// held poll). It re-reads the row (a conversion that landed in the claim gap is
+// left alone), force-unmounts any standing mount — ABORTING the retreat if the
+// unmount wedges, because ConvertOverlay's Teardown would then re-spawn the very
+// holder being retreated from (the wedged-carcass churn the kill-9 incident
+// exposed) — converts the row, drops the holder-cache vouch and any retry-ledger
+// entry, and logs announce. Returns whether the row ended up off fuse. The
+// idle/live-session gate is deliberately skipped, distinct from the idle-gated
+// fallbackToSymlink: every caller is remediating a hazard or a dead-end (a
+// never-recovering wedge, a grant that will not land, a crash-looped holder, a
+// machine that cannot fuse), where relaunch — not deferral — is the fix.
+func (s *Server) convertRowToSymlink(a store.Account, announce string) bool {
+	fresh, err := s.m.Store.GetAccount(a.ID)
+	switch {
+	case err != nil:
+		s.log.Printf("acct-%02d symlink retreat: re-read row: %v", a.ID, err)
+		return false
+	case fresh.OverlayKind != string(overlay.KindFuse):
+		delete(s.rowRetry, a.ID) // already converted by another path: drop any stale ledger entry
+		return true
+	}
+	s.log.Printf("%s", announce)
+	if overlayMounted(fresh.ConfigDir) {
+		if err := forceUnmount(fresh.ConfigDir); err != nil {
+			// The forced unmount wedged. Do NOT proceed into ConvertOverlay: its
+			// Teardown would see the dir still mounted and re-spawn the holder
+			// being retreated from. Leave the row fuse; a dir whose unmount the
+			// kernel refuses cannot be safely symlinked anyway.
+			s.log.Printf("acct-%02d symlink retreat: force-unmount %s wedged; leaving fuse: %v", a.ID, fresh.ConfigDir, err)
+			return false
+		}
+	}
+	if _, err := s.m.ConvertOverlay(fresh, overlay.KindSymlink); err != nil {
+		s.log.Printf("acct-%02d symlink retreat: convert to symlink: %v", a.ID, err)
+		return false
+	}
+	s.holder.noteUnmounted(fresh.ConfigDir)
+	delete(s.rowRetry, a.ID)
+	return true
+}
+
+// escalateRowToSymlink is the poll-held entry to convertRowToSymlink: the
+// steady-state breakers (escalateWedgedRow, escalateTCCBlockedRow) hold the
+// account's poll claim, so it takes the converting claim with
+// beginConvertUnderPoll — refused over a pending select, leaving the row armed
+// to re-fire next windowed tick. Returns whether the row converted.
+func (s *Server) escalateRowToSymlink(a store.Account, announce string) bool {
+	if !s.beginConvertUnderPoll(a.ID) {
+		s.log.Printf("acct-%02d symlink retreat deferred: reserved by a pending select", a.ID)
+		return false
+	}
+	defer s.endConvert(a.ID)
+	return s.convertRowToSymlink(a, announce)
+}
+
+// escalateWedgedRow is the wedged-mount circuit breaker (remountBreakerThreshold
+// consecutive wedged/never-recovering heals). Retrying forever lets a wedged NFS
+// carcass linger and re-wedge the kernel — the whole-machine hazard the kill-9
+// incident exposed — so it retreats the row to symlink via escalateRowToSymlink.
+// Caller holds the account's poll claim.
+func (s *Server) escalateWedgedRow(a store.Account) {
+	announce := fmt.Sprintf("acct-%02d fuse mount never recovered after %d consecutive attempts; force-unmounting and falling back to symlink — relaunch any sessions on it",
+		a.ID, remountBreakerThreshold)
+	if s.escalateRowToSymlink(a, announce) {
+		s.log.Printf("acct-%02d fell back to symlink after exhausting fuse remount attempts", a.ID)
+	}
+}
+
+// escalateTCCBlockedRow is the TCC grace breaker (tccBreakerThreshold consecutive
+// TCC-blocked heals): the macOS "Network Volumes" grant never landed within the
+// grace window, so the daemon stops waiting and retreats the row to symlink so
+// the account is usable again. It clears the stale process-wide TCC guidance
+// only on a real conversion (tccErr is one string — clearing it in the shared
+// body, or on a deferred/failed conversion, would wipe a concurrent wedged row's
+// still-valid guidance). Caller holds the account's poll claim.
+func (s *Server) escalateTCCBlockedRow(a store.Account) {
+	announce := fmt.Sprintf("acct-%02d \"Network Volumes\" grant never landed after %d attempts; falling back to symlink — `ccp migrate --to fuse` re-promotes once fuse-t can mount here",
+		a.ID, tccBreakerThreshold)
+	if s.escalateRowToSymlink(a, announce) {
+		s.holder.recordTCC("")
+		s.log.Printf("acct-%02d fell back to symlink after the \"Network Volumes\" grant did not land", a.ID)
+	}
+}
+
+// retreatAllFuseRows retreats every fuse account to the always-available symlink
+// overlay, each under its own standalone convert claim (beginConvert — the
+// callers hold no poll claim) so a select, a scheduler poll, or another
+// conversion cannot interleave; a row that cannot be claimed or fails to convert
+// is left for a later pass. reason names the pool-wide condition (logged per
+// row). It is the standalone, whole-pool analog of escalateRowToSymlink: the
+// holder crash-loop breaker (Policy.Retreat) and the startup capability gate
+// (reconcileOverlays) both use it when fuse is unusable for the WHOLE pool, not
+// just one row. Per-row conversion (including the wedged-unmount abort) is
+// convertRowToSymlink, shared with the breakers.
+func (s *Server) retreatAllFuseRows(ctx context.Context, fuse []store.Account, reason string) {
 	if len(fuse) == 0 {
-		return // nothing to retreat (a symlink-only pool past the spawn-failure breaker)
+		return // a symlink-only pool: nothing to retreat
 	}
 	for _, a := range fuse {
 		if ctx.Err() != nil {
 			return
 		}
 		if !s.beginConvert(a.ID) {
-			s.log.Printf("acct-%02d crash-loop symlink fallback deferred: reserved, polling, or converting", a.ID)
+			s.log.Printf("acct-%02d symlink retreat deferred: reserved, polling, or converting", a.ID)
 			continue
 		}
-		s.fallbackCrashLoopedRow(a)
+		announce := fmt.Sprintf("acct-%02d %s; falling back to symlink — relaunch any sessions on it", a.ID, reason)
+		if s.convertRowToSymlink(a, announce) {
+			s.log.Printf("acct-%02d fell back to symlink (%s)", a.ID, reason)
+		}
 		s.endConvert(a.ID)
 	}
-}
-
-// fallbackCrashLoopedRow converts one fuse row to symlink under the caller's
-// held convert claim, re-reading it first (a row converted in the gap is left
-// alone) and force-unmounting any mount still standing. Reports whether the row
-// ended up off fuse (converted, or already non-fuse); a convert error reports
-// false so the breaker stays armed and retries it next tick. Caller holds the
-// account's convert claim (beginConvert).
-func (s *Server) fallbackCrashLoopedRow(a store.Account) bool {
-	fresh, err := s.m.Store.GetAccount(a.ID)
-	switch {
-	case err != nil:
-		s.log.Printf("acct-%02d crash-loop fallback: re-read row: %v", a.ID, err)
-		return false
-	case fresh.OverlayKind != string(overlay.KindFuse):
-		return true // already converted by another path
-	}
-	s.log.Printf("acct-%02d mount holder unrecoverable (crash loop or will not spawn); falling back to symlink — relaunch any sessions on it", a.ID)
-	if overlayMounted(fresh.ConfigDir) {
-		if err := forceUnmount(fresh.ConfigDir); err != nil {
-			// The forced unmount wedged (the kernel will not complete it). Do NOT
-			// proceed into ConvertOverlay: its Teardown would see the dir still
-			// mounted and re-spawn the very holder we are retreating from — the
-			// wedged-carcass churn the breaker exists to stop. Leave the row fuse
-			// and armed; a dir whose unmount the kernel refuses cannot be safely
-			// symlinked anyway.
-			s.log.Printf("acct-%02d crash-loop fallback: force-unmount %s wedged; leaving fuse, retrying next tick: %v", a.ID, fresh.ConfigDir, err)
-			return false
-		}
-	}
-	if _, err := s.m.ConvertOverlay(fresh, overlay.KindSymlink); err != nil {
-		s.log.Printf("acct-%02d crash-loop fallback: convert to symlink: %v", a.ID, err)
-		return false
-	}
-	s.holder.noteUnmounted(fresh.ConfigDir)
-	s.log.Printf("acct-%02d fell back to symlink after the mount holder crash-looped", a.ID)
-	return true
 }
 
 // remountReplacedRows heals every fuse row after a holder replacement, under

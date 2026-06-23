@@ -87,7 +87,7 @@ func TestReportHolder(t *testing.T) {
 				{"mount holder", true, cur},
 				// The raw fusekit error AND the copy-pasteable deep link must
 				// both ride the one detail line.
-				{"mount holder TCC", false, `grant Network Volumes access — open Settings: open "` + mountd.NetworkVolumesSettingsURL + `"`},
+				{"mount holder TCC", false, `grant Network Volumes access — open Settings: open "` + mountd.NetworkVolumesSettingsURL + `" (cc-pool falls back to symlink automatically if the grant never lands)`},
 			},
 		},
 		"cached spawn failure fails": {

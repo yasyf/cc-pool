@@ -16,5 +16,6 @@ func InProcessFuse() (mountd.Host, bool) { return nil, false }
 
 // HostProbe attempts a throwaway in-process probe mount; it must run in the
 // process that will host mounts (capability + TCC grant are per-process). It
-// always fails without the fuse build tag.
-func HostProbe() bool { return false }
+// always reports (false, nil) — no capability, no error — without the fuse
+// build tag.
+func HostProbe() (bool, error) { return false, nil }

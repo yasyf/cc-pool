@@ -182,7 +182,7 @@ func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)
 		return
 	}
 	if f.cached.TCCError != "" {
-		report("mount holder TCC", false, f.cached.TCCError+` — open Settings: open "`+mountd.NetworkVolumesSettingsURL+`"`)
+		report("mount holder TCC", false, f.cached.TCCError+` — open Settings: open "`+mountd.NetworkVolumesSettingsURL+`" (cc-pool falls back to symlink automatically if the grant never lands)`)
 	}
 	if f.cached.SpawnError != "" {
 		report("mount holder spawn", false, f.cached.SpawnError)

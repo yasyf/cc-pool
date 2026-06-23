@@ -35,6 +35,14 @@ var (
 	// observable — and a holder restart resets the deduction.
 	ErrMountTimeout = fusekit.ErrMountTimeout
 
+	// ErrMountFailed means a fuse mount was rejected outright — the holder's
+	// serving goroutine exited before the mount came live (fuse-t not installed
+	// or loadable, the kernel refusing the mount, a bad CGOFUSE_LIBFUSE_PATH).
+	// It is NEVER the "Network Volumes" TCC grant (a pending grant keeps the
+	// mount call blocked, surfacing as ErrMountNotLive), so the daemon must not
+	// retry it for the grant — it retreats the row to symlink instead.
+	ErrMountFailed = fusekit.ErrMountFailed
+
 	// ErrUnmountWedged means an unmount did not take: the dir is still a live
 	// mountpoint and must not be treated as torn down (RemoveAll through it
 	// would reach the backing ~/.claude). fusekit's bounded teardown wraps its

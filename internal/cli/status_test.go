@@ -24,7 +24,7 @@ import (
 
 // tccHint is the copy-pasteable deep link holderFooter appends to a TCC-blocked
 // alert so users can jump to the Network Volumes pane.
-var tccHint = ` — open Settings: open "` + mountd.NetworkVolumesSettingsURL + `"`
+var tccHint = ` — open Settings: open "` + mountd.NetworkVolumesSettingsURL + `" (cc-pool falls back to symlink automatically if the grant never lands)`
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 

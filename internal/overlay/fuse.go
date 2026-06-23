@@ -303,4 +303,4 @@ func sweepAppleDoubleLitter(base string) {
 // delegates to fusekit, whose probe proves fuse-t works on this machine, trips
 // the one-time "Network Volumes" privacy grant, and sets fusekit's process-
 // global mount-proven deduction the real mounts then read.
-func HostProbe() bool { return fusekit.HostProbe() }
+func HostProbe() (bool, error) { return fusekit.HostProbe() }

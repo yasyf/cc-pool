@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
@@ -48,11 +49,23 @@ func DetectOverlayKind() (overlay.Kind, string) {
 		return overlay.KindSymlink, fmt.Sprintf("mount holder did not start: %v", err)
 	}
 	ok, err := mountd.NewClient(MountsSocketPath()).Probe()
-	if err != nil {
+	switch {
+	case errors.Is(err, mountd.ErrMountFailed):
+		// A hard mount(2) rejection: fuse-t cannot mount on this machine
+		// (missing/unloadable, or the kernel refusing it). NEVER the TCC grant —
+		// do not send the user chasing a Network Volumes toggle that will not
+		// help. The real cause is in the mount-holder log.
+		return overlay.KindSymlink, fmt.Sprintf("fuse-t cannot mount on this machine (%v); using symlinks — repair fuse-t (brew install macos-fuse-t/cask/fuse-t), then `ccp migrate --to fuse`", err)
+	case errors.Is(err, mountd.ErrTCCDenied):
+		// The probe is blocked PENDING the one-time macOS "Network Volumes"
+		// grant — a prompt should have appeared. If one did, grant it and
+		// re-promote; if none did, the mount is failing for another reason and
+		// symlinks are the right call anyway.
+		return overlay.KindSymlink, fmt.Sprintf("the macOS \"Network Volumes\" grant is not in place (%v); using symlinks — grant it in System Settings ▸ Privacy & Security if prompted, then `ccp migrate --to fuse`", err)
+	case err != nil:
 		return overlay.KindSymlink, fmt.Sprintf("mount holder probe failed: %v", err)
-	}
-	if !ok {
-		return overlay.KindSymlink, "probe mount declined — install fuse-t (brew install macos-fuse-t/cask/fuse-t) if it is missing, or grant \"Network Volumes\" access in System Settings ▸ Privacy & Security (the failed attempt creates the toggle)"
+	case !ok:
+		return overlay.KindSymlink, "probe mount declined — install fuse-t (brew install macos-fuse-t/cask/fuse-t)"
 	}
 	return overlay.KindFuse, ""
 }

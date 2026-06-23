@@ -1007,6 +1007,17 @@ func (s *Server) reconcileOverlays(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	// Capability gate: one probe settles whether this machine can fuse at all,
+	// BEFORE any per-account cold mount. A hard "no" retreats the whole pool to
+	// symlink in a single pass — replacing a doomed mount per account (the
+	// CPU-churn hazard) with one check — and the per-account loop below then
+	// reconciles the now-symlink rows.
+	if reason := s.fuseHardUnavailable(); reason != "" {
+		s.retreatPoolToSymlink(ctx, accts, reason)
+		if accts, err = s.m.Store.ListAccounts(); err != nil {
+			return
+		}
+	}
 	for _, a := range accts {
 		if ctx.Err() != nil {
 			return
@@ -1019,6 +1030,56 @@ func (s *Server) reconcileOverlays(ctx context.Context) {
 		}
 		s.reconcileAccount(ctx, a)
 		s.endPoll(a.ID)
+	}
+}
+
+// fuseHardUnavailable reports a reason iff a single capability probe proves this
+// machine cannot host fuse mounts right now — the holder is reachable, serves no
+// live mount, and a throwaway probe mount is REJECTED OUTRIGHT (ErrMountFailed:
+// fuse-t missing or unloadable, the kernel refusing the mount). It returns "" in
+// every other case so the per-account heal stays in charge: a pure build (no
+// holder to probe), a holder not yet reachable (the supervisor will spawn one;
+// the per-account heal mounts through it), a holder already serving a live mount
+// (capability self-evident), or a probe merely PENDING the macOS "Network
+// Volumes" grant (the bounded per-row TCC grace handles that — a desktop user
+// may still grant it). One probe here replaces a doomed mount per account when
+// fuse genuinely cannot work.
+func (s *Server) fuseHardUnavailable() string {
+	if !s.canSpawnHolder() {
+		return "" // pure build: inherited fuse rows are inert; nothing to probe
+	}
+	if healthy, _ := s.holder.view(); !healthy {
+		return "" // holder not reachable yet: leave it to the supervisor + per-account heal
+	}
+	if s.holder.wireStatus().Mounts > 0 {
+		return "" // already serving a live mount: capability is proven
+	}
+	if _, err := s.holderClient().Probe(); errors.Is(err, mountd.ErrMountFailed) {
+		return err.Error()
+	}
+	return ""
+}
+
+// retreatPoolToSymlink retreats every fuse row to symlink and records symlink as
+// the new-account default — the whole-pool response to a machine that cannot
+// host fuse mounts. Setting the default keeps a later `ccp add` from minting a
+// fuse account whose dir this machine can never mount; `ccp migrate --to fuse`
+// re-promotes the pool once fuse-t can mount here again.
+func (s *Server) retreatPoolToSymlink(ctx context.Context, accts []store.Account, reason string) {
+	fuse := make([]store.Account, 0, len(accts))
+	for _, a := range accts {
+		if a.OverlayKind == string(overlay.KindFuse) {
+			fuse = append(fuse, a)
+		}
+	}
+	if len(fuse) == 0 {
+		return
+	}
+	s.log.Printf("fuse is unavailable on this machine (%s); retreating %d fuse account(s) to symlink and defaulting new accounts to symlink — see %s",
+		reason, len(fuse), pool.MountHolderLogPath())
+	s.retreatAllFuseRows(ctx, fuse, "fuse-t cannot mount on this machine")
+	if err := s.m.SetDefaultOverlayKind(overlay.KindSymlink); err != nil {
+		s.log.Printf("capability retreat: record symlink as the new-account default: %v", err)
 	}
 }
 
@@ -1139,6 +1200,15 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 		// never the TCC condition. No recordTCC, no scary guidance.
 		s.log.Printf("acct-%02d fuse mount did not come up within the mount wait; retrying: %v", a.ID, err)
 		return healRetry
+	case errors.Is(err, overlay.ErrMountFailed):
+		// A hard mount(2) rejection (the holder's serving goroutine exited
+		// before the mirror came live) — fuse-t not installed/loadable, the
+		// kernel refusing the mount. This is NEVER the TCC grant, so do not wait
+		// for one: retreat to the always-available symlink overlay on this first
+		// heal. The real cause is in the holder log.
+		s.log.Printf("acct-%02d fuse mount rejected outright (not a TCC grant); falling back to symlink — see %s: %v", a.ID, pool.MountHolderLogPath(), err)
+		s.fallbackToSymlink(ctx, a)
+		return healFallback
 	case errors.Is(err, overlay.ErrMountNotLive):
 		s.holder.recordTCC(err.Error())
 		s.log.Printf("acct-%02d fuse mount blocked pending the macOS \"Network Volumes\" grant, retrying next poll: %v", a.ID, err)

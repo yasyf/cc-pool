@@ -615,6 +615,14 @@ func mountTimeoutChain() error {
 	return fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountTimeout, mountd.ErrMountTimeout))
 }
 
+// mountFailedChain is the error a hard mount(2) rejection crosses the wire as:
+// the provider's wrap around overlayClass's dual-wrap of the ClassMountFailed
+// wire sentinel. healFuse must route it to an immediate symlink fallback, never
+// the TCC wait.
+func mountFailedChain() error {
+	return fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountFailed, mountd.ErrMountFailed))
+}
+
 // TestSuperviseTickRetriesUnvouchedRowWithBackoff pins the steady-state heal
 // loop: a fuse row a healthy holder cannot vouch for is retried each tick
 // under per-row backoff — attempts advance the failure count, the window
@@ -2160,11 +2168,15 @@ func TestSuperviseRemountBreakerResetsOnMount(t *testing.T) {
 	}
 }
 
-// TestSuperviseRemountBreakerNeverEscalatesTCC pins the load-bearing exclusion:
-// a TCC-blocked row is a CLEAN not-mounted state, so it must retry FOREVER for
-// the human to grant Network Volumes — the breaker must never escalate it, even
-// far past the threshold.
-func TestSuperviseRemountBreakerNeverEscalatesTCC(t *testing.T) {
+// TestWedgeBreakerNeverEscalatesTCCRow pins the load-bearing exclusion: a
+// TCC-blocked row is a CLEAN not-mounted state, never a kernel wedge, so it must
+// never trip the WEDGED breaker (remountBreakerThreshold) — its hazard count
+// stays 0 no matter how many consecutive TCC blocks accrue. The grant instead
+// gets a bounded grace through the SEPARATE tccBreakerThreshold
+// (TestSuperviseTCCBreakerEscalates); here we drive right up to but not across
+// that grace — already past the wedged threshold — to prove the wedge breaker
+// stays silent.
+func TestWedgeBreakerNeverEscalatesTCCRow(t *testing.T) {
 	s, dirs, fake, _ := newSuperviseServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
@@ -2174,24 +2186,218 @@ func TestSuperviseRemountBreakerNeverEscalatesTCC(t *testing.T) {
 	var unmounts int
 	swapForceUnmount(t, func(string) error { unmounts++; return nil })
 
-	ticks := remountBreakerThreshold + 3
+	// One short of the grant grace, and (since tccBreakerThreshold >
+	// remountBreakerThreshold) already well past the wedged breaker's threshold —
+	// which must NOT fire.
+	ticks := tccBreakerThreshold - 1
 	driveRetryTicks(t, s, 1, ticks)
 
 	if unmounts != 0 {
-		t.Fatalf("TCC-blocked row force-unmounted %d time(s); it must retry forever", unmounts)
+		t.Fatalf("TCC-blocked row force-unmounted %d time(s); the wedged breaker must never fire on it", unmounts)
 	}
 	if got := kindOf(t, s, 1); got != "fuse" {
-		t.Fatalf("TCC-blocked row kind = %q, want fuse (still waiting on the grant)", got)
+		t.Fatalf("TCC-blocked row kind = %q, want fuse (still within the grant grace)", got)
 	}
 	st, ok := s.rowRetry[1]
 	if !ok {
-		t.Fatal("TCC-blocked row dropped its retry ledger; it would stop retrying")
+		t.Fatal("TCC-blocked row dropped its retry ledger before the grace expired")
+	}
+	if st.hazard != 0 {
+		t.Fatalf("TCC hazard = %d, want 0 (never counts toward the wedged breaker even past its threshold)", st.hazard)
+	}
+	if st.tccBlocks != ticks {
+		t.Fatalf("TCC blocks = %d, want %d (the grant grace counts these)", st.tccBlocks, ticks)
 	}
 	if st.failures != ticks {
 		t.Fatalf("TCC failures = %d, want %d (kept backing off)", st.failures, ticks)
 	}
-	if st.hazard != 0 {
-		t.Fatalf("TCC hazard = %d, want 0 (never counts toward the breaker)", st.hazard)
+}
+
+// TestSuperviseTCCBreakerEscalates pins the bounded grant grace: after
+// tccBreakerThreshold consecutive TCC-blocked heals the daemon stops waiting and
+// retreats the row to symlink so the account is usable — dropping the ledger,
+// the holder vouch, and the stale TCC guidance, and surfacing it loudly. A
+// TCC-blocked dir never came up, so it is not a mountpoint and no force-unmount
+// is needed.
+func TestSuperviseTCCBreakerEscalates(t *testing.T) {
+	s, dirs, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive) // healTCCBlocked
+	fakeOverlayMounted(t, func(string) bool { return false })        // never came up
+
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+
+	driveRetryTicks(t, s, 1, tccBreakerThreshold)
+
+	if got := kindOf(t, s, 1); got != "symlink" {
+		t.Fatalf("row kind after the TCC grace = %q, want symlink", got)
+	}
+	if _, ok := s.rowRetry[1]; ok {
+		t.Fatal("TCC breaker left a rowRetry entry; the churn would continue")
+	}
+	if s.holder.ready(dirs[1]) {
+		t.Fatal("TCC breaker did not drop the holder-cache vouch for the converted dir")
+	}
+	if got := s.holder.wireStatus().TCCError; got != "" {
+		t.Fatalf("TCC breaker left stale guidance %q; it must clear on retreat", got)
+	}
+	if !strings.Contains(buf.String(), "Network Volumes") {
+		t.Fatalf("TCC retreat not surfaced in the log:\n%s", buf.String())
+	}
+}
+
+// TestSuperviseTCCBreakerEscalatesUnderLiveSession pins that the TCC grace
+// breaker, like the wedged breaker, is UNGATED by live sessions: once the grace
+// expires the row retreats to symlink even with a session on the dir
+// (escalateRowToSymlink skips the idle gate; the mount never came up, so the
+// retreat repairs the bare dir the session is on).
+func TestSuperviseTCCBreakerEscalatesUnderLiveSession(t *testing.T) {
+	s, dirs, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
+	fakeOverlayMounted(t, func(string) bool { return false })
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+	}
+
+	driveRetryTicks(t, s, 1, tccBreakerThreshold)
+
+	if got := kindOf(t, s, 1); got != "symlink" {
+		t.Fatalf("row kind after the TCC grace = %q, want symlink (a live session must not block the retreat)", got)
+	}
+	if _, ok := s.rowRetry[1]; ok {
+		t.Fatal("TCC breaker left a rowRetry entry under a live session")
+	}
+}
+
+// TestSuperviseTCCBreakerLateGrantPreventsFallback pins the desktop case: a
+// grant that lands before the grace expires mounts the row and prevents the
+// retreat — the row stays fuse, the ledger clears, and the TCC guidance clears.
+func TestSuperviseTCCBreakerLateGrantPreventsFallback(t *testing.T) {
+	s, dirs, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
+	fakeOverlayMounted(t, func(string) bool { return false })
+
+	var unmounts int
+	swapForceUnmount(t, func(string) error { unmounts++; return nil })
+
+	// One short of the grace: still waiting, no retreat.
+	driveRetryTicks(t, s, 1, tccBreakerThreshold-1)
+	if got := kindOf(t, s, 1); got != "fuse" {
+		t.Fatalf("row kind one short of the grace = %q, want fuse (still waiting on the grant)", got)
+	}
+	if got := s.rowRetry[1].tccBlocks; got != tccBreakerThreshold-1 {
+		t.Fatalf("tccBlocks = %d, want %d (one short of the grace)", got, tccBreakerThreshold-1)
+	}
+
+	// The human grants Network Volumes: the next heal mounts the row.
+	fake.setupErr = nil
+	driveRetryTicks(t, s, 1, 1)
+	if got := kindOf(t, s, 1); got != "fuse" {
+		t.Fatalf("row kind after a late grant = %q, want fuse (it mounted, never retreated)", got)
+	}
+	if _, ok := s.rowRetry[1]; ok {
+		t.Fatal("a successful mount left a rowRetry entry")
+	}
+	if !s.holder.ready(dirs[1]) {
+		t.Fatal("granted row not vouched for")
+	}
+	if got := s.holder.wireStatus().TCCError; got != "" {
+		t.Fatalf("late grant left stale TCC guidance %q; a live mount must clear it", got)
+	}
+	if unmounts != 0 {
+		t.Fatalf("force-unmounts across a late-granted row = %d, want 0", unmounts)
+	}
+}
+
+// TestTCCBreakerThreshold pins the TCC grace const guard: a pending grant must
+// get a LONGER grace than the wedged breaker (a benign wait, not a kernel
+// hazard), so the threshold must exceed remountBreakerThreshold.
+func TestTCCBreakerThreshold(t *testing.T) {
+	if tccBreakerThreshold <= remountBreakerThreshold {
+		t.Fatalf("tccBreakerThreshold = %d, want > remountBreakerThreshold (%d): a pending grant earns a longer grace than a kernel wedge", tccBreakerThreshold, remountBreakerThreshold)
+	}
+}
+
+// TestSuperviseHealFuseMountFailedRetreatsImmediately pins that a hard mount
+// rejection (ErrMountFailed — fuse-t cannot mount on this machine) retreats to
+// symlink on the FIRST heal, with no TCC wait and no breaker countdown: it is a
+// dead-end, not a pending grant.
+func TestSuperviseHealFuseMountFailedRetreatsImmediately(t *testing.T) {
+	s, dirs, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	fake.setupErr = mountFailedChain()
+	fakeOverlayMounted(t, func(string) bool { return false }) // never came up
+
+	driveRetryTicks(t, s, 1, 1) // ONE tick
+
+	if got := kindOf(t, s, 1); got != "symlink" {
+		t.Fatalf("row kind after one hard-failure heal = %q, want symlink (immediate retreat, no TCC wait, no breaker countdown)", got)
+	}
+	if s.holder.ready(dirs[1]) {
+		t.Fatal("hard-failure retreat did not drop the holder-cache vouch")
+	}
+}
+
+// TestReconcileCapabilityGateRetreatsPoolWhenFuseUnavailable pins C1: at startup,
+// when the holder is reachable, serves no live mount, and a capability probe is
+// REJECTED OUTRIGHT (ErrMountFailed — fuse-t cannot mount here), reconcileOverlays
+// retreats EVERY fuse row to symlink in one pass and records symlink as the
+// new-account default — instead of churning a doomed mount per account.
+func TestReconcileCapabilityGateRetreatsPoolWhenFuseUnavailable(t *testing.T) {
+	s, _, _, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	flipToFuse(t, s, 2)
+	// Holder reachable, no live mounts, probe hard-fails.
+	s.holderSocket = startCapabilityHolder(t, nil, mountd.ClassMountFailed, "fuse-t not loadable")
+	fakeOverlayMounted(t, func(string) bool { return false }) // nothing mounted
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+
+	s.reconcileOverlays(t.Context())
+
+	if got := kindOf(t, s, 1); got != "symlink" {
+		t.Fatalf("acct-01 kind after the capability gate = %q, want symlink", got)
+	}
+	if got := kindOf(t, s, 2); got != "symlink" {
+		t.Fatalf("acct-02 kind after the capability gate = %q, want symlink", got)
+	}
+	kind, ok, err := s.m.ConfiguredOverlayKind()
+	if err != nil || !ok || kind != overlay.KindSymlink {
+		t.Fatalf("new-account default = (%q, ok=%v, err=%v), want symlink", kind, ok, err)
+	}
+	if !strings.Contains(buf.String(), "fuse is unavailable on this machine") {
+		t.Fatalf("capability retreat not surfaced in the log:\n%s", buf.String())
+	}
+}
+
+// TestReconcileCapabilityGateProceedsWhenProbePending pins that a probe merely
+// PENDING the Network Volumes grant (ErrTCCDenied, not ErrMountFailed) does NOT
+// trip the gate: the rows stay fuse for the per-account heal + bounded TCC grace
+// (a desktop user may still grant), and the new-account default is NOT flipped.
+func TestReconcileCapabilityGateProceedsWhenProbePending(t *testing.T) {
+	s, _, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCapabilityHolder(t, nil, mountd.ClassTCC, "grant pending")
+	// Health fails so reconcileAccount heals rather than adopting; the heal then
+	// TCC-blocks, leaving the row fuse within its grace.
+	fake.healthErr = errors.New("not a mountpoint")
+	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
+	fakeOverlayMounted(t, func(string) bool { return false })
+
+	s.reconcileOverlays(t.Context())
+
+	if got := kindOf(t, s, 1); got != "fuse" {
+		t.Fatalf("acct-01 kind after a PENDING probe = %q, want fuse (the gate must defer to the per-row grace)", got)
+	}
+	if kind, ok, _ := s.m.ConfiguredOverlayKind(); ok && kind == overlay.KindSymlink {
+		t.Fatal("a pending probe flipped the new-account default to symlink; only a hard failure may")
 	}
 }
 

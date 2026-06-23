@@ -96,6 +96,51 @@ func serveCannedHolder(ln net.Listener, mounts []mountd.MountInfo) {
 	}
 }
 
+// startCapabilityHolder serves the mountd wire protocol like startCannedHolder
+// (healthy, the given List) but answers OpProbe with a chosen ErrClass+message —
+// so the startup capability gate can be driven without a real fuse mount. An
+// empty probeErrClass answers a clean FuseOK=true probe (capability proven).
+func startCapabilityHolder(t *testing.T, mounts []mountd.MountInfo, probeErrClass, probeErr string) string {
+	t.Helper()
+	sockDir, err := os.MkdirTemp("/tmp", "ccp-cap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	socket := filepath.Join(sockDir, "m.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return // listener closed: defined exit
+			}
+			var req mountd.Request
+			resp := mountd.Response{OK: true, Version: version.String()}
+			if err := json.NewDecoder(conn).Decode(&req); err == nil {
+				switch req.Op {
+				case mountd.OpList:
+					resp.Mounts = mounts
+				case mountd.OpProbe:
+					if probeErrClass == "" {
+						resp.FuseOK = true
+					} else {
+						resp.ErrClass = probeErrClass
+						resp.Error = probeErr
+					}
+				}
+			}
+			_ = json.NewEncoder(conn).Encode(resp)
+			_ = conn.Close()
+		}
+	}()
+	return socket
+}
+
 // TestHolderStateRefresh pins both refresh arms: a dead socket marks the cache
 // unhealthy and drops every mount entry (selection must stop trusting them —
 // THE carcass input), and a live holder stamps its version and per-dir kernel
