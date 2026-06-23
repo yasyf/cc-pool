@@ -87,13 +87,8 @@ func newServiceCmd() *cobra.Command {
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				out := cmd.OutOrStdout()
-				if ccpAgent().IsBrewManaged() {
-					_, _ = fmt.Fprintln(out, "Management: Homebrew (brew services)")
-					if info, err := ccpAgent().BrewInfo(); err == nil {
-						_, _ = fmt.Fprintln(out, info)
-					}
-				} else {
-					_, _ = fmt.Fprintf(out, "Management: self-managed LaunchAgent (loaded: %v)\n", ccpAgent().Loaded())
+				for _, line := range ccpAgent().StatusLines() {
+					_, _ = fmt.Fprintln(out, line)
 				}
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
 					_, _ = fmt.Fprintf(out, "Daemon: running (%s)\n", resp.Version)
