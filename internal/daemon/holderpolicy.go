@@ -142,7 +142,7 @@ func (p *holderPolicy) ReplaceSafe(ctx context.Context, force bool) string {
 
 // Retreat is the crash-loop breaker action: fall every fuse row back to the
 // always-available symlink overlay (retreatAllFuseRows).
-func (p *holderPolicy) Retreat(ctx context.Context, reason string) {
+func (p *holderPolicy) Retreat(ctx context.Context, _ string) {
 	fuse, err := p.s.fuseAccounts()
 	if err != nil {
 		p.s.log.Printf("holder supervision retreat: list accounts: %v", err)
