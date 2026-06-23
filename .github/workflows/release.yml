@@ -121,7 +121,7 @@ jobs:
       # the default, so select it for the cask payload build.
       - uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: "~> 26.0"
+          xcode-version: "26"
 
       - name: Build the Notification Center widget app (cc-pool-status cask payload)
         run: |
