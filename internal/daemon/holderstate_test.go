@@ -383,6 +383,36 @@ func TestWireStatusCountsWedged(t *testing.T) {
 // TestHolderStateNoteMounted pins the fresh-mount fast path: a successful
 // mount is trusted before any refresh, and it clears recorded TCC guidance
 // (the grant is per holder process, so one live mount proves it landed).
+// TestHolderStateShallowDeadStrikes pins the shallow-dead strike debounce:
+// consecutive observations accumulate, and a fresh mount (noteMounted), a direct
+// reset, or an unreachable holder (markUnhealthy) all clear the count so a
+// later run starts over.
+func TestHolderStateShallowDeadStrikes(t *testing.T) {
+	const dir = "/pool/acct-01"
+	var h holderState
+	if got := h.recordShallowDead(dir); got != 1 {
+		t.Fatalf("first strike = %d, want 1", got)
+	}
+	if got := h.recordShallowDead(dir); got != 2 {
+		t.Fatalf("second strike = %d, want 2", got)
+	}
+	for _, clear := range []struct {
+		name string
+		fn   func()
+	}{
+		{"noteMounted", func() { h.noteMounted(dir) }},
+		{"resetShallowDead", func() { h.resetShallowDead(dir) }},
+		{"markUnhealthy", func() { h.markUnhealthy() }},
+	} {
+		h.recordShallowDead(dir)
+		clear.fn()
+		if got := h.recordShallowDead(dir); got != 1 {
+			t.Fatalf("strike after %s = %d, want a fresh 1", clear.name, got)
+		}
+		h.resetShallowDead(dir)
+	}
+}
+
 func TestHolderStateNoteMounted(t *testing.T) {
 	var h holderState
 	if h.ready("/d") {

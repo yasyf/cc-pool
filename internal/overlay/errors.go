@@ -48,4 +48,12 @@ var (
 	// would reach the backing ~/.claude). fusekit's bounded teardown wraps its
 	// refusal with it.
 	ErrUnmountWedged = fusekit.ErrUnmountWedged
+
+	// ErrLivenessTimeout means a bounded liveness stat of an existing mirror did
+	// not answer in time — the mirror is unresponsive but NOT proven dead (the
+	// holder may be CPU-saturated). RemoteHost.Health wraps its timed-out probe
+	// with it; the daemon's supervision debounces it (a single timeout is not
+	// grounds to remount a mirror serving live sessions) rather than treating it
+	// like a definitive dead reading, which answers fast and stays a plain error.
+	ErrLivenessTimeout = fusekit.ErrLivenessTimeout
 )

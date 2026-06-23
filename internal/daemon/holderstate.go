@@ -39,6 +39,16 @@ var deepProbeInterval = 30 * time.Second
 // is actionable.
 const deepWedgeStrikes = 2
 
+// shallowDeadStrikes is how many consecutive supervision passes must corroborate
+// a holder-reported shallow-dead mirror (present in its List but not Live) as
+// unresponsive-yet-peer-alive before the daemon remounts it. Two, mirroring
+// deepWedgeStrikes: the holder computes List liveness with the same bounded 2s
+// stat that false-negatives under load, so a single shallow-dead reading is not
+// proof a mirror serving live sessions died — only a sustained run is. A
+// corroboration that finds the mirror live, or a definitive dead reading, resets
+// the count.
+const shallowDeadStrikes = 2
+
 // deepVerdict is one dir's daemon-side deep-probe state. wedged flips at
 // deepWedgeStrikes consecutive failures (recordDeep) or immediately at select
 // time (markDeepWedged), and stays until a probe succeeds or the dir is
@@ -83,8 +93,18 @@ type holderState struct {
 	// noteUnmounted clear a dir's entry and markUnhealthy drops them all (an
 	// unreachable holder's verdict is meaningless). lastProbed throttles the
 	// periodic probe (per dir, once per deepProbeInterval).
-	deep        map[string]*deepVerdict
-	lastProbed  map[string]time.Time
+	deep       map[string]*deepVerdict
+	lastProbed map[string]time.Time
+	// shallow counts CONSECUTIVE supervision passes that corroborated a
+	// holder-reported shallow-dead mirror (present in List, Live=false) as
+	// unresponsive-yet-peer-alive. It debounces the plain-dead remount the same
+	// way deep does the wedge: the holder computes List liveness with a bounded
+	// 2s stat that false-negatives under load, so one shallow-dead reading is not
+	// proof a mirror serving live sessions died. Reset by a corroboration that
+	// finds the mirror live, by a definitive-dead reading (which remounts at
+	// once), and by noteMounted/noteUnmounted; dropped wholesale by
+	// markUnhealthy/markDegraded.
+	shallow     map[string]int
 	refreshedAt time.Time
 	// bases mirrors the holder's dir -> base registry from the last
 	// successful List. Unlike mounts it SURVIVES markUnhealthy: it exists so
@@ -257,10 +277,10 @@ func (h *holderState) markUnhealthy() {
 	h.gen++
 	h.healthy, h.degraded, h.version, h.mounts, h.refreshedAt = false, false, "", nil, time.Now()
 	h.epochs, h.mountedAt = nil, nil
-	// An unreachable holder serves nothing, so its dirs' deep verdicts are
-	// meaningless — drop them (and the probe clock) so a respawned holder's
-	// fresh mounts start with a clean slate.
-	h.deep, h.lastProbed = nil, nil
+	// An unreachable holder serves nothing, so its dirs' deep verdicts and
+	// shallow-dead strikes are meaningless — drop them (and the probe clock) so a
+	// respawned holder's fresh mounts start with a clean slate.
+	h.deep, h.lastProbed, h.shallow = nil, nil, nil
 	h.mu.Unlock()
 }
 
@@ -277,7 +297,7 @@ func (h *holderState) markDegraded(ver string) {
 	h.gen++
 	h.healthy, h.degraded, h.version, h.mounts, h.refreshedAt = false, true, ver, nil, time.Now()
 	h.epochs, h.mountedAt = nil, nil
-	h.deep, h.lastProbed = nil, nil
+	h.deep, h.lastProbed, h.shallow = nil, nil, nil
 	h.mu.Unlock()
 }
 
@@ -404,6 +424,31 @@ func (h *holderState) markDeepWedged(dir string) {
 	v.strikes, v.wedged = deepWedgeStrikes, true
 }
 
+// recordShallowDead folds one corroborated shallow-dead observation into dir's
+// debounced strike count and returns the new total. The caller increments only
+// when its own bounded Health re-probe agreed the mirror is unresponsive while
+// the holder PROCESS is alive (slow under load, not proven dead); at
+// shallowDeadStrikes the caller stops debouncing and remounts. A live or
+// definitive-dead corroboration calls resetShallowDead instead.
+func (h *holderState) recordShallowDead(dir string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.shallow == nil {
+		h.shallow = map[string]int{}
+	}
+	h.shallow[dir]++
+	return h.shallow[dir]
+}
+
+// resetShallowDead clears dir's shallow-dead strike count: the mirror answered
+// (the holder's List Live=false was a transient under-load false negative), or
+// it is being remounted, or it vouches live again.
+func (h *holderState) resetShallowDead(dir string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.shallow, dir)
+}
+
 // stampProbedLocked records that dir was just deep-probed. Caller holds h.mu.
 func (h *holderState) stampProbedLocked(dir string) {
 	if h.lastProbed == nil {
@@ -434,6 +479,7 @@ func (h *holderState) noteMounted(dir string) {
 	// refresh installs the holder's polled truth.
 	delete(h.deep, dir)
 	delete(h.lastProbed, dir)
+	delete(h.shallow, dir)
 	h.everMounted = true
 	h.tccErr = ""
 }
@@ -449,6 +495,7 @@ func (h *holderState) noteUnmounted(dir string) {
 	delete(h.bases, dir)
 	delete(h.deep, dir)
 	delete(h.lastProbed, dir)
+	delete(h.shallow, dir)
 	delete(h.epochs, dir)
 	delete(h.mountedAt, dir)
 	h.mu.Unlock()

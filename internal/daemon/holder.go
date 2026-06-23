@@ -468,9 +468,22 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 		}
 		if s.holder.ready(a.ConfigDir) {
 			delete(s.rowRetry, a.ID)
+			s.holder.resetShallowDead(a.ConfigDir)
 			continue
 		}
 		if now.Before(s.rowRetry[a.ID].retryAt) {
+			continue
+		}
+		// Corroborate a shallow PLAIN-dead verdict before remounting: the holder
+		// computes its List Live bool with the same bounded 2s stat that
+		// false-negatives under load, so a present-but-!live mirror (NOT a deep
+		// wedge — the periodic probe above already debounces that) may be merely
+		// slow, not dead. deferShallowDead re-probes with our own bounded Health
+		// and waits out a saturation blip, so one slow stat never tears down a
+		// mirror serving live sessions. A definitive dead reading is not deferred.
+		// It sits AFTER the backoff gate so a backed-off row never spends a ~2s
+		// Health probe (nor re-arms its strike count) while waiting out a retry.
+		if dead, wedged := s.holder.heldDead(a.ConfigDir); dead && !wedged && s.deferShallowDead(a) {
 			continue
 		}
 		if !s.beginPoll(a.ID) {
@@ -531,6 +544,38 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 		if !inPass[id] {
 			delete(s.rowRetry, id)
 		}
+	}
+}
+
+// deferShallowDead corroborates a holder-reported shallow plain-dead mirror
+// before the supervisor remounts it, and reports whether to DEFER the remount
+// this pass. It re-probes with the daemon's own bounded Health (zero RPC; same
+// kernel as the holder but a distinct process), and splits the verdict the
+// holder's single Live bool cannot:
+//   - a live reading (nil) means the holder's List Live=false was a transient
+//     under-load false negative — clear the strike and defer; the next List
+//     re-vouches the mirror.
+//   - a liveness TIMEOUT while the holder PROCESS is alive means slow under
+//     load, not dead — record a strike and defer until shallowDeadStrikes
+//     consecutive passes agree, then proceed.
+//   - a definitive dead reading (no longer a mountpoint / base invisible), or a
+//     timeout with no live holder peer, means proceed now: a genuinely dead
+//     single mirror is healed at once, exactly as before this gate, and a dead
+//     holder is the revive path's job, not a per-mirror remount.
+func (s *Server) deferShallowDead(a store.Account) bool {
+	switch err := s.overlayFor(overlay.KindFuse).Health(pool.ClaudeDir(), a.ConfigDir); {
+	case err == nil:
+		s.holder.resetShallowDead(a.ConfigDir)
+		return true
+	case errors.Is(err, overlay.ErrLivenessTimeout) && s.peerAliveOn(s.holderSocket):
+		if s.holder.recordShallowDead(a.ConfigDir) < shallowDeadStrikes {
+			return true
+		}
+		s.holder.resetShallowDead(a.ConfigDir)
+		return false
+	default:
+		s.holder.resetShallowDead(a.ConfigDir)
+		return false
 	}
 }
 

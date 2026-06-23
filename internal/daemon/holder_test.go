@@ -814,6 +814,12 @@ func TestSuperviseTickRemountsHeldDeadRow(t *testing.T) {
 			})
 			if tc.wedged {
 				s.holder.markDeepWedged(dirs[1])
+			} else {
+				// A plain-dead mirror fails its shallow liveness OUTRIGHT, so the
+				// daemon's own corroboration (deferShallowDead) must read it
+				// definitively dead — not a liveness timeout — for the held-dead
+				// remount to fire without debounce.
+				fake.healthErr = errors.New("not a mountpoint")
 			}
 			var buf bytes.Buffer
 			s.log = log.New(&buf, "", 0)
@@ -838,6 +844,45 @@ func TestSuperviseTickRemountsHeldDeadRow(t *testing.T) {
 			}
 			if _, ok := s.rowRetry[1]; ok {
 				t.Fatal("successful remount left a rowRetry entry")
+			}
+		})
+	}
+}
+
+// TestDeferShallowDead pins the corroboration gate that suppresses false-positive
+// remounts: a holder-reported shallow-dead mirror (List Live=false) is re-probed
+// with the daemon's own Health before the supervisor tears it down. A live or
+// timed-out-but-peer-alive reading DEFERS (the holder's Live=false was a
+// transient under-load false negative or mere slowness); a definitive dead
+// reading, exhausted strikes, or a timeout with no live peer PROCEEDS (remount).
+func TestDeferShallowDead(t *testing.T) {
+	timeout := fmt.Errorf("%w: slow", overlay.ErrLivenessTimeout)
+	dead := errors.New("not a mountpoint")
+	tests := []struct {
+		name       string
+		health     error
+		peerAlive  bool
+		wantDefers []bool // one entry per consecutive deferShallowDead call
+	}{
+		{name: "live corroboration never remounts", health: nil, peerAlive: true, wantDefers: []bool{true, true, true}},
+		{name: "timeout+peer-alive debounces then remounts", health: timeout, peerAlive: true, wantDefers: []bool{true, false}},
+		{name: "timeout+peer-gone remounts at once", health: timeout, peerAlive: false, wantDefers: []bool{false}},
+		{name: "definitive dead remounts at once", health: dead, peerAlive: true, wantDefers: []bool{false}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, fake, _ := newSuperviseServer(t)
+			flipToFuse(t, s, 1)
+			fake.healthErr = tc.health
+			s.peerAlive = func(string) bool { return tc.peerAlive }
+			acct, err := s.m.Store.GetAccount(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, want := range tc.wantDefers {
+				if got := s.deferShallowDead(acct); got != want {
+					t.Fatalf("deferShallowDead call %d = %v, want %v", i+1, got, want)
+				}
 			}
 		})
 	}
