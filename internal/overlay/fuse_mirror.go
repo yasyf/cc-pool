@@ -62,6 +62,15 @@ type mirrorFS struct {
 	sharedStat map[string]sharedEntry
 }
 
+// FusePassthroughOnly reports false: the mirror is NOT pure passthrough. It
+// serves synthetic, handler-generated content keyed on fuse file handles — the
+// merged /.claude.json (per-account identity), the injected /settings.json
+// (plansDirectory), and the virtual /.ccp-probe — which fuse-t's FSKit backend
+// does not honor (it ignores fi->fh and tears those reads, as a Phase-0 spike
+// confirmed). So fusekit keeps fuse-t's NFS backend, which preserves fi->fh.
+// See fusekit.PassthroughOnly.
+func (fs *mirrorFS) FusePassthroughOnly() bool { return false }
+
 func newMirrorFS(root, privateRoot, baseClaudeJSON string) *mirrorFS {
 	absRoot, _ := filepath.Abs(root)
 	absPriv, _ := filepath.Abs(privateRoot)
