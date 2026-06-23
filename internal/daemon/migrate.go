@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // defaultMigrateBudget bounds one migrate request's conversion work so the
@@ -27,11 +28,11 @@ const defaultMigrateBudget = 120 * time.Second
 // (live sessions or reservations) are skipped and reported so the client can
 // re-run later; per-account failures are rolled back by ConvertOverlay.
 func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
-	to := overlay.Kind(req.To)
-	if to != overlay.KindFuse && to != overlay.KindSymlink {
-		return Response{OK: false, Error: fmt.Sprintf("unknown overlay kind %q", req.To)}
+	to, err := fkoverlay.Parse(req.To)
+	if err != nil {
+		return Response{OK: false, Error: fmt.Sprintf("unknown overlay backend %q", req.To)}
 	}
-	if to == overlay.KindFuse {
+	if to.IsFuse() {
 		if msg := s.fuseGate(); msg != "" {
 			return Response{OK: false, Error: msg}
 		}
@@ -85,7 +86,7 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 	// fuse even when nothing needed converting — otherwise `ccp fuse enable` on a
 	// fresh or already-fuse pool would leave the default on symlink. The symlink
 	// retreat only flips the default when an account actually converted back.
-	if to == overlay.KindFuse || converted {
+	if to.IsFuse() || converted {
 		if err := s.m.SetDefaultOverlayKind(to); err != nil {
 			resp.OK = false
 			resp.Error = fmt.Sprintf("recording %s as the new-account default failed: %v", to, err)
@@ -96,20 +97,20 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 
 // fuseGate reports why fuse mirrors cannot be hosted right now, or "" when
 // they can. The probe runs in the mount holder deliberately: mount capability
-// and the macOS "Network Volumes" TCC grant are per-process, and the holder is
+// and the macOS volume-access grant are per-process, and the holder is
 // the process that hosts the mounts — so a missing grant fails here, before
 // any account is disturbed.
 func (s *Server) fuseGate() string {
 	if s.fuseGateFn != nil {
 		return s.fuseGateFn()
 	}
-	if !overlay.FuseBuilt() {
+	if !fusekit.Built() {
 		return "this daemon build has no fuse support; run `ccp fuse enable` to install fuse-t and switch to the live-mirror build"
 	}
 	// The reason leads verbatim: a declined probe carries its own fuse-t/TCC
 	// remedy, while holder spawn or probe-RPC failures name their real cause —
 	// advice that fits one would mislead for the others.
-	if kind, reason := pool.DetectOverlayKind(); kind != overlay.KindFuse {
+	if backend, reason := pool.DetectOverlayBackend(); !backend.IsFuse() {
 		return fmt.Sprintf("fuse unavailable: %s — fix this, then re-run `ccp migrate`", reason)
 	}
 	return ""
@@ -120,7 +121,7 @@ func (s *Server) fuseGate() string {
 // idle and accepts that one writing mid-conversion may briefly error. The
 // claim and reservation gates always hold — those mean another part of the
 // daemon owns the dir right now.
-func (s *Server) convertAccount(ctx context.Context, a store.Account, to overlay.Kind, force bool) MigrationResult {
+func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverlay.Backend, force bool) MigrationResult {
 	res := MigrationResult{ID: a.ID, Label: a.Label, From: a.OverlayKind, To: string(to)}
 	if a.OverlayKind == string(to) {
 		res.Outcome = MigrationAlready
@@ -176,7 +177,7 @@ func (s *Server) convertAccount(ctx context.Context, a store.Account, to overlay
 	// otherwise exclude every freshly-converted fuse account until then (or
 	// keep counting a dismounted mirror in HolderStatus.Mounts after a
 	// retreat).
-	if to == overlay.KindFuse {
+	if to.IsFuse() {
 		s.holder.noteMounted(a.ConfigDir)
 	} else {
 		s.holder.noteUnmounted(a.ConfigDir)

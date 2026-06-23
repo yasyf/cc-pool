@@ -1,33 +1,23 @@
-// Package overlay makes a pool account dir present the live contents of
-// ~/.claude with writes shared straight back, so a pooled session sees the same
-// projects/skills/settings as plain `claude`. Two interchangeable providers:
+// Package overlay holds cc-pool's mirror-specific overlay code: the
+// per-consumer CLASSIFICATION (ExcludedEntries, SharedEntries, SkipEntries,
+// PrivateEntry) that builds the fusekit/overlay Spec, plus the fuse MIRROR and
+// the detached mount-holder host (fuse-tagged) that fusekit/overlay's
+// RemoteFuseProvider drives over its socket. The overlay ABSTRACTION — the
+// Backend type, the symlink/fuse Provider interface, provider selection, and
+// the conversion/migration primitives — now lives in
+// github.com/yasyf/fusekit/overlay; cc-pool is a blind consumer of it.
 //
-//   - symlink (default + always-available fallback): symlink each top-level
-//     entry of ~/.claude into the account dir.
-//   - fuse (preferred when fuse-t is installed; built with -tags fuse): an
-//     in-process passthrough mirror mounted via fuse-t.
-//
-// Both yield the same observable result. A small set of entries is held back
-// from sharing because they are instance-local runtime state that would
-// conflict across concurrent sessions; see ExcludedEntries and PrivateEntry.
-// Held-back files stay per-account, but .claude.json's shareable top-level
-// keys (everything outside ClaudeJSONPrivateKeys, plus the per-project
-// approval keys ClaudeJSONSharedProjectKeys carves out of "projects") still
-// propagate: one-way base→account at launch under symlink
-// (pool.MergeBaseClaudeJSON), two-way under fuse (live merged read view plus
-// shareable-key write-through to ~/.claude.json).
+// A small set of ~/.claude entries is held back from sharing because they are
+// instance-local runtime state that would conflict across concurrent sessions;
+// see ExcludedEntries and PrivateEntry. Held-back files stay per-account, but
+// .claude.json's shareable top-level keys (everything outside
+// ClaudeJSONPrivateKeys, plus the per-project approval keys
+// ClaudeJSONSharedProjectKeys carves out of "projects") still propagate: one-way
+// base→account at launch under symlink (pool.MergeBaseClaudeJSON), two-way under
+// fuse (live merged read view plus shareable-key write-through to ~/.claude.json).
 package overlay
 
 import "strings"
-
-// Kind identifies an overlay provider.
-type Kind string
-
-// Supported overlay provider kinds.
-const (
-	KindSymlink Kind = "symlink"
-	KindFuse    Kind = "fuse"
-)
 
 // ExcludedEntries are top-level ~/.claude entries that must NOT be shared
 // across accounts. Each excluded entry becomes a private, empty per-account
@@ -66,8 +56,9 @@ var SharedEntries = map[string]bool{
 	"plans": true,
 }
 
-// skipEntries are never linked or mirrored (noise / OS cruft).
-var skipEntries = map[string]bool{
+// SkipEntries are never linked or mirrored (noise / OS cruft). Exported so the
+// pool can read it when building the fusekit/overlay Spec.
+var SkipEntries = map[string]bool{
 	".DS_Store": true,
 }
 
@@ -100,30 +91,3 @@ func PrivateEntry(name string) bool {
 		strings.HasPrefix(name, ".last-update-result") ||
 		name == "remote-settings.json" || strings.HasPrefix(name, "remote-settings.json.")
 }
-
-// Provider establishes and maintains an overlay of base at accountDir.
-type Provider interface {
-	Kind() Kind
-
-	// Setup makes accountDir reflect base. Idempotent.
-	Setup(base, accountDir string) error
-
-	// Sync re-asserts the overlay, picking up new top-level entries in base
-	// and repairing drift. Idempotent. Safe to call repeatedly.
-	Sync(base, accountDir string) error
-
-	// Health returns nil if the overlay is intact, else a descriptive error.
-	Health(base, accountDir string) error
-
-	// Teardown removes the overlay from accountDir. It must never touch base.
-	Teardown(base, accountDir string) error
-
-	// PrivateRoot returns the directory where account-local (private) files
-	// physically live. For the symlink provider that is accountDir itself; for
-	// fuse it is the private backing dir beside the mountpoint. Writing there
-	// is correct whether or not a mount is currently up.
-	PrivateRoot(accountDir string) string
-}
-
-// FuseBuilt reports whether this binary includes the fuse provider at all.
-func FuseBuilt() bool { return fuseBuilt }

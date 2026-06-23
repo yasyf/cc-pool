@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 func TestAwaitLogin(t *testing.T) {
@@ -73,28 +73,28 @@ func TestAwaitLogin(t *testing.T) {
 func TestNewIdentityProbe(t *testing.T) {
 	brokenErr := errors.New("parse .claude.json: unexpected end of JSON input")
 	cases := map[string]struct {
-		read    func(overlay.Kind, string) (*pool.Identity, error)
+		read    func(fkoverlay.Backend, string) (*pool.Identity, error)
 		want    bool
 		wantErr error
 	}{
 		// A startup adoption copies the global credential but writes no identity.
 		"no identity yet is not done": {
-			read: func(overlay.Kind, string) (*pool.Identity, error) { return nil, pool.ErrNoIdentity },
+			read: func(fkoverlay.Backend, string) (*pool.Identity, error) { return nil, pool.ErrNoIdentity },
 		},
 		"a real login wrote the account identity is done": {
-			read: func(overlay.Kind, string) (*pool.Identity, error) {
+			read: func(fkoverlay.Backend, string) (*pool.Identity, error) {
 				return &pool.Identity{AccountUUID: "u-1", EmailAddress: "a@example.com"}, nil
 			},
 			want: true,
 		},
 		"a broken identity read aborts instead of silently retrying": {
-			read:    func(overlay.Kind, string) (*pool.Identity, error) { return nil, brokenErr },
+			read:    func(fkoverlay.Backend, string) (*pool.Identity, error) { return nil, brokenErr },
 			wantErr: brokenErr,
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			probe := newIdentityProbe(tc.read, overlay.KindSymlink, "/cfg")
+			probe := newIdentityProbe(tc.read, fkoverlay.BackendSymlink, "/cfg")
 			done, err := probe()
 			if done != tc.want || !errors.Is(err, tc.wantErr) {
 				t.Errorf("probe() = %v, %v; want %v, %v", done, err, tc.want, tc.wantErr)

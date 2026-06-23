@@ -7,6 +7,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // MergeOutcome describes what mergeClaudeJSON did for an account dir.
@@ -42,7 +43,7 @@ const (
 // pre-existing accepted race as SyncOverlay re-laying links during a
 // conversion; the daemon gates its own selects, CLI-only launches were always
 // outside that fence.
-func mergeClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (MergeOutcome, error) {
+func mergeClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (MergeOutcome, error) {
 	// A live mirror over a dir whose row says symlink is the same anomaly
 	// convertToFuse refuses: writing "into" the mirror lands in the wrong root.
 	if overlay.Mounted(accountDir) {
@@ -68,7 +69,7 @@ func mergeClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (MergeOu
 		// resolution would keep this mint and discard the real stranded
 		// identity. Point at doctor instead so the heal restores the stranded
 		// copy intact.
-		stranded := filepath.Join(overlay.FusePrivateRoot(accountDir), ".claude.json")
+		stranded := filepath.Join(fkoverlay.FusePrivateRoot(accountDir), ".claude.json")
 		if stranded != dst {
 			if _, serr := os.Lstat(stranded); serr == nil {
 				return "", fmt.Errorf("%s is missing but a copy is stranded at %s (interrupted overlay conversion); run `ccp doctor`", dst, stranded)
@@ -104,16 +105,24 @@ func mergeClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (MergeOu
 }
 
 // MergeBaseClaudeJSON runs the launch-time shareable-settings merge for an
-// account. It gates on the RECORDED overlay kind: any non-symlink kind is
+// account. It gates on the RECORDED overlay backend: any non-symlink backend is
 // MergeSkippedOverlay, because the fuse arm serves its own live merged view —
-// the gate keys on the row, never on a resolved provider's kind, so no build
+// the gate keys on the row, never on a resolved provider's backend, so no build
 // variant can silently un-gate a fuse account. The daemon's fuse fallback and
-// `ccp migrate`'s row flip keep the recorded kind truthful.
+// `ccp migrate`'s row flip keep the recorded backend truthful.
 func (m *Manager) MergeBaseClaudeJSON(a store.Account) (MergeOutcome, error) {
-	if overlay.Kind(a.OverlayKind) != overlay.KindSymlink {
+	backend, err := fkoverlay.Parse(a.OverlayKind)
+	if err != nil {
+		return "", fmt.Errorf("merge base settings into acct-%02d: parse stored backend: %w", a.ID, err)
+	}
+	if backend != fkoverlay.BackendSymlink {
 		return MergeSkippedOverlay, nil
 	}
-	out, err := mergeClaudeJSON(m.overlayFor(overlay.KindSymlink), a.ConfigDir, ClaudeJSONPath())
+	prov, err := m.overlayFor(fkoverlay.BackendSymlink)
+	if err != nil {
+		return "", fmt.Errorf("merge base settings into acct-%02d: resolve symlink provider: %w", a.ID, err)
+	}
+	out, err := mergeClaudeJSON(prov, a.ConfigDir, ClaudeJSONPath())
 	if err != nil {
 		return "", fmt.Errorf("merge base settings into acct-%02d: %w", a.ID, err)
 	}

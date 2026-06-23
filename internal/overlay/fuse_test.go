@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // TestFuseMountOptionsByteIdentical pins the cc-pool mount-option WIRING:
@@ -103,7 +104,7 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(base, ".claude.json")); !os.IsNotExist(err) {
 		t.Fatalf(".claude.json leaked into base")
 	}
-	if _, err := os.Stat(filepath.Join(FusePrivateRoot(mnt), ".claude.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(fkoverlay.FusePrivateRoot(mnt), ".claude.json")); err != nil {
 		t.Fatalf(".claude.json not in private backing dir: %v", err)
 	}
 
@@ -116,7 +117,7 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	if err := os.WriteFile(sibling, []byte(`{"theme":"light","sharedKey":true,"oauthAccount":{"accountUuid":"base-own"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	privFile := filepath.Join(FusePrivateRoot(mnt), ".claude.json")
+	privFile := filepath.Join(fkoverlay.FusePrivateRoot(mnt), ".claude.json")
 	if err := os.WriteFile(privFile, []byte(`{"theme":"dark","oauthAccount":{"accountUuid":"acct-own"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1246,7 +1247,7 @@ func TestFuseAttrCacheNoTornRead(t *testing.T) {
 		t.Skipf("fuse-t mount unavailable (acceptable; symlink is the default): %v", err)
 	}
 	defer func() { _ = p.Teardown(base, mnt) }()
-	if err := os.WriteFile(filepath.Join(FusePrivateRoot(mnt), ".claude.json"), []byte(`{"theme":"dark","oauthAccount":{"accountUuid":"acct"}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(fkoverlay.FusePrivateRoot(mnt), ".claude.json"), []byte(`{"theme":"dark","oauthAccount":{"accountUuid":"acct"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cj := filepath.Join(mnt, ".claude.json")
@@ -1287,7 +1288,7 @@ func TestFuseAttrCacheBaseToAccountCTO(t *testing.T) {
 		t.Skipf("fuse-t mount unavailable (acceptable; symlink is the default): %v", err)
 	}
 	defer func() { _ = p.Teardown(base, mnt) }()
-	if err := os.WriteFile(filepath.Join(FusePrivateRoot(mnt), ".claude.json"), []byte(`{"theme":"dark","oauthAccount":{"accountUuid":"acct"}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(fkoverlay.FusePrivateRoot(mnt), ".claude.json"), []byte(`{"theme":"dark","oauthAccount":{"accountUuid":"acct"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

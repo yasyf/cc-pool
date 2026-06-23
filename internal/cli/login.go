@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"golang.org/x/term"
 )
 
@@ -64,7 +64,7 @@ func awaitLogin(ctx context.Context, procExit <-chan error, probe func() (bool, 
 }
 
 // identityFunc matches pool.AccountIdentity; injectable for tests.
-type identityFunc func(kind overlay.Kind, configDir string) (*pool.Identity, error)
+type identityFunc func(backend fkoverlay.Backend, configDir string) (*pool.Identity, error)
 
 // newIdentityProbe returns a probe reporting that the account's own .claude.json
 // now carries a fresh oauthAccount identity — the signal that a real
@@ -74,9 +74,9 @@ type identityFunc func(kind overlay.Kind, configDir string) (*pool.Identity, err
 // .credentials.json) at startup, before any login — but it writes no identity,
 // so this never fires on that adoption. ErrNoIdentity means "not yet"; any other
 // error aborts the wait (a broken read must not become a silent retry loop).
-func newIdentityProbe(read identityFunc, kind overlay.Kind, configDir string) func() (bool, error) {
+func newIdentityProbe(read identityFunc, backend fkoverlay.Backend, configDir string) func() (bool, error) {
 	return func() (bool, error) {
-		_, err := read(kind, configDir)
+		_, err := read(backend, configDir)
 		if errors.Is(err, pool.ErrNoIdentity) {
 			return false, nil
 		}
@@ -184,8 +184,8 @@ func restoreTerminal(out io.Writer, fd int, state *term.State) {
 // spinner. Used by the manual login path; unbounded — the user may take
 // arbitrarily long in another terminal, and ^C cancels. A startup adoption of
 // the global credential writes no identity, so it never trips this.
-func waitForLogin(ctx context.Context, out io.Writer, kind overlay.Kind, configDir string) error {
-	probe := newIdentityProbe(pool.AccountIdentity, kind, configDir)
+func waitForLogin(ctx context.Context, out io.Writer, backend fkoverlay.Backend, configDir string) error {
+	probe := newIdentityProbe(pool.AccountIdentity, backend, configDir)
 	ticker := time.NewTicker(loginPollInterval)
 	defer ticker.Stop()
 	for i := 0; ; i++ {

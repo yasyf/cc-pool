@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"golang.org/x/sys/unix"
 )
 
@@ -191,7 +192,7 @@ type armResult struct {
 func runPerfArm(t *testing.T, vol string, opts []string, clients int, warmup, dur time.Duration, nProj int) armResult {
 	base, baseCJ := buildSyntheticClaude(t, nProj)
 	mnt := t.TempDir()
-	priv := FusePrivateRoot(mnt)
+	priv := fkoverlay.FusePrivateRoot(mnt)
 	for name := range ExcludedEntries {
 		_ = os.MkdirAll(filepath.Join(priv, name), 0o700)
 	}

@@ -6,8 +6,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/fuset"
 )
 
@@ -52,7 +52,7 @@ func runFuseEnable(cmd *cobra.Command) error {
 	// A pure build can only swap itself to the fuse build through Homebrew. If it
 	// is not a brew install, there is no automatic path — fail before touching
 	// anything rather than installing fuse-t and leaving the wrong binary behind.
-	reinstallNeeded := !overlay.FuseBuilt()
+	reinstallNeeded := !fusekit.Built()
 	if reinstallNeeded && !ccpAgent().IsBrewManaged() {
 		exe, _ := os.Executable()
 		return fmt.Errorf("cc-pool is not a Homebrew install (running %s), so it cannot swap itself to the fuse build; install fuse-t with `brew install --cask %s` and rebuild with `-tags fuse`, or reinstall via `brew install yasyf/tap/cc-pool`", exe, fuset.Cask)
@@ -97,7 +97,7 @@ func runFuseEnable(cmd *cobra.Command) error {
 			note(out, "Pool not set up yet — run `ccp add`; new accounts will use the live mirror.")
 			return nil
 		}
-		resp, err := requestMigration(m, overlay.KindFuse, 0, false)
+		resp, err := requestMigration(m, pool.FuseBackend(), 0, false)
 		if err != nil {
 			return err
 		}
@@ -108,7 +108,7 @@ func runFuseEnable(cmd *cobra.Command) error {
 			note(out, "No accounts to migrate; fuse is now the default for new accounts.")
 			return nil
 		}
-		return renderMigrations(cmd, resp, overlay.KindFuse, false)
+		return renderMigrations(cmd, resp, "fuse", false)
 	}); err != nil {
 		return err
 	}

@@ -8,8 +8,8 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/keychain"
 	"github.com/yasyf/cc-pool/internal/oauth"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // Refresher is the slice of *oauth.Client the Manager needs: token refresh and
@@ -59,15 +59,15 @@ type Manager struct {
 	OAuth    Refresher
 	Keychain CredentialStore
 
-	// OverlayFor resolves an overlay kind to a provider; nil means
-	// pool.OverlayProviderFor. Tests inject fakes here so conversion logic
+	// OverlayFor resolves an overlay backend to a fusekit/overlay provider; nil
+	// means pool.OverlayProviderFor. Tests inject fakes here so conversion logic
 	// runs without a live mount.
-	OverlayFor func(overlay.Kind) overlay.Provider
+	OverlayFor func(fkoverlay.Backend) (fkoverlay.Provider, error)
 
-	// DetectOverlay resolves the overlay kind for new accounts when none is
-	// recorded yet; nil means pool.DetectOverlayKind. Tests inject verdicts so
+	// DetectOverlay resolves the overlay backend for new accounts when none is
+	// recorded yet; nil means pool.DetectOverlayBackend. Tests inject verdicts so
 	// Init never spawns a mount holder.
-	DetectOverlay func() (overlay.Kind, string)
+	DetectOverlay func() (fkoverlay.Backend, string)
 
 	// CanHostFuse reports whether fuse may be recorded as the new-account
 	// default; nil means pool.CanHostFuse. Tests inject true so conversion

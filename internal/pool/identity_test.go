@@ -6,32 +6,31 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/yasyf/cc-pool/internal/overlay"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // TestAccountIdentityPathMath pins that AccountIdentity is pure path math off
-// the recorded kind — no provider resolution: fuse reads the private backing
-// dir beside the mountpoint, everything else reads the account dir itself.
-// Each case plants a decoy identity at the other location to prove which file
-// was read.
+// the recorded backend — no provider resolution: a fuse backend reads the
+// private backing dir beside the mountpoint, every other backend reads the
+// account dir itself. Each case plants a decoy identity at the other location
+// to prove which file was read.
 func TestAccountIdentityPathMath(t *testing.T) {
 	const right = `{"oauthAccount":{"accountUuid":"u-right","emailAddress":"r@example.com"}}`
 	const decoy = `{"oauthAccount":{"accountUuid":"u-decoy","emailAddress":"d@example.com"}}`
 
 	tests := []struct {
 		name     string
-		kind     overlay.Kind
+		backend  fkoverlay.Backend
 		fuseSide bool // the identity lives in FusePrivateRoot(dir)
 	}{
-		{name: "fuse reads the private backing dir", kind: overlay.KindFuse, fuseSide: true},
-		{name: "symlink reads the account dir", kind: overlay.KindSymlink},
-		{name: "empty kind reads the account dir", kind: overlay.Kind("")},
-		{name: "unknown kind reads the account dir", kind: overlay.Kind("bogus")},
+		{name: "nfs reads the private backing dir", backend: fkoverlay.BackendNFS, fuseSide: true},
+		{name: "fskit reads the private backing dir", backend: fkoverlay.BackendFSKit, fuseSide: true},
+		{name: "symlink reads the account dir", backend: fkoverlay.BackendSymlink},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "acct-01")
-			priv := overlay.FusePrivateRoot(dir)
+			priv := fkoverlay.FusePrivateRoot(dir)
 			for _, d := range []string{dir, priv} {
 				if err := os.MkdirAll(d, 0o700); err != nil {
 					t.Fatal(err)
@@ -47,12 +46,12 @@ func TestAccountIdentityPathMath(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(priv, ".claude.json"), []byte(inPriv), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			id, err := AccountIdentity(tc.kind, dir)
+			id, err := AccountIdentity(tc.backend, dir)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if id.AccountUUID != "u-right" {
-				t.Errorf("AccountIdentity(%q) read %q, want u-right", tc.kind, id.AccountUUID)
+				t.Errorf("AccountIdentity(%q) read %q, want u-right", tc.backend, id.AccountUUID)
 			}
 		})
 	}

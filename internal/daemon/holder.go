@@ -10,7 +10,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/proc"
 	"github.com/yasyf/fusekit/version"
 )
@@ -400,7 +402,7 @@ func (s *Server) remountFuseRows(ctx context.Context, accts []store.Account) {
 		switch {
 		case err != nil:
 			s.log.Printf("acct-%02d re-read row before remount: %v", a.ID, err)
-		case fresh.OverlayKind == string(overlay.KindFuse):
+		case fuseBackedRow(fresh.OverlayKind):
 			s.healFuse(ctx, fresh)
 		}
 		s.endPoll(a.ID)
@@ -496,7 +498,7 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 			// A DB re-read failure is not a mount hazard; back off, never trip
 			// the breaker on it.
 			s.advanceRowRetry(a.ID, false)
-		case fresh.OverlayKind != string(overlay.KindFuse):
+		case !fuseBackedRow(fresh.OverlayKind):
 			// Converted while this pass's listing aged: its owner left it
 			// consistent, and a non-fuse row needs no remount ledger.
 			delete(s.rowRetry, a.ID)
@@ -563,7 +565,14 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 //     single mirror is healed at once, exactly as before this gate, and a dead
 //     holder is the revive path's job, not a per-mirror remount.
 func (s *Server) deferShallowDead(a store.Account) bool {
-	switch err := s.overlayFor(overlay.KindFuse).Health(pool.ClaudeDir(), a.ConfigDir); {
+	prov := s.overlayFor(pool.FuseBackend())
+	if prov == nil {
+		// Wrong-backend injected fake (or a nil resolution): cannot corroborate,
+		// so proceed with the holder's verdict rather than deferring forever.
+		s.holder.resetShallowDead(a.ConfigDir)
+		return false
+	}
+	switch err := prov.Health(pool.ClaudeDir(), a.ConfigDir); {
 	case err == nil:
 		s.holder.resetShallowDead(a.ConfigDir)
 		return true
@@ -646,7 +655,7 @@ func (s *Server) convertRowToSymlink(a store.Account, announce string) bool {
 	case err != nil:
 		s.log.Printf("acct-%02d symlink retreat: re-read row: %v", a.ID, err)
 		return false
-	case fresh.OverlayKind != string(overlay.KindFuse):
+	case !fuseBackedRow(fresh.OverlayKind):
 		delete(s.rowRetry, a.ID) // already converted by another path: drop any stale ledger entry
 		return true
 	}
@@ -661,7 +670,7 @@ func (s *Server) convertRowToSymlink(a store.Account, announce string) bool {
 			return false
 		}
 	}
-	if _, err := s.m.ConvertOverlay(fresh, overlay.KindSymlink); err != nil {
+	if _, err := s.m.ConvertOverlay(fresh, fkoverlay.BackendSymlink); err != nil {
 		s.log.Printf("acct-%02d symlink retreat: convert to symlink: %v", a.ID, err)
 		return false
 	}
@@ -698,18 +707,18 @@ func (s *Server) escalateWedgedRow(a store.Account) {
 }
 
 // escalateTCCBlockedRow is the TCC grace breaker (tccBreakerThreshold consecutive
-// TCC-blocked heals): the macOS "Network Volumes" grant never landed within the
+// TCC-blocked heals): the macOS volume-access grant never landed within the
 // grace window, so the daemon stops waiting and retreats the row to symlink so
 // the account is usable again. It clears the stale process-wide TCC guidance
 // only on a real conversion (tccErr is one string — clearing it in the shared
 // body, or on a deferred/failed conversion, would wipe a concurrent wedged row's
 // still-valid guidance). Caller holds the account's poll claim.
 func (s *Server) escalateTCCBlockedRow(a store.Account) {
-	announce := fmt.Sprintf("acct-%02d \"Network Volumes\" grant never landed after %d attempts; falling back to symlink — `ccp migrate --to fuse` re-promotes once fuse-t can mount here",
+	announce := fmt.Sprintf("acct-%02d macOS volume-access grant never landed after %d attempts; falling back to symlink — `ccp migrate --to fuse` re-promotes once fuse-t can mount here",
 		a.ID, tccBreakerThreshold)
 	if s.escalateRowToSymlink(a, announce) {
 		s.holder.recordTCC("")
-		s.log.Printf("acct-%02d fell back to symlink after the \"Network Volumes\" grant did not land", a.ID)
+		s.log.Printf("acct-%02d fell back to symlink after the macOS volume-access grant did not land", a.ID)
 	}
 }
 
@@ -770,16 +779,16 @@ func (s *Server) remountReplacedRows(ctx context.Context, accts []store.Account)
 // discipline. Carcasses clear through the provider's foreign-mount contract,
 // exactly like mountFuse.
 func (s *Server) remountCarriedDirs(ctx context.Context, rowDirs map[string]bool, carry map[string]string) {
+	prov := s.overlayFor(pool.FuseBackend())
+	if prov == nil || !prov.Backend().IsFuse() {
+		return
+	}
 	for dir, base := range carry {
 		if ctx.Err() != nil {
 			return
 		}
 		if rowDirs[dir] || s.holder.ready(dir) {
 			continue
-		}
-		prov := s.overlayFor(overlay.KindFuse)
-		if prov.Kind() != overlay.KindFuse {
-			return
 		}
 		err := prov.Setup(base, dir)
 		if errors.Is(err, mountd.ErrForeignMount) || errors.Is(err, mountd.ErrBaseMismatch) {
@@ -806,7 +815,7 @@ func (s *Server) fuseAccounts() ([]store.Account, error) {
 	}
 	fuse := make([]store.Account, 0, len(accts))
 	for _, a := range accts {
-		if a.OverlayKind == string(overlay.KindFuse) {
+		if fuseBackedRow(a.OverlayKind) {
 			fuse = append(fuse, a)
 		}
 	}
@@ -839,7 +848,7 @@ func sameAccountIDs(a, b []store.Account) bool {
 // canSpawnHolder reports whether this daemon can spawn a mount holder at all:
 // an injected seam vouches for itself; the real spawn needs the fuse build.
 func (s *Server) canSpawnHolder() bool {
-	return s.spawnHolder != nil || overlay.FuseBuilt()
+	return s.spawnHolder != nil || fusekit.Built()
 }
 
 // spawn starts a mount holder on the daemon's holder socket through the seam;

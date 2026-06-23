@@ -7,7 +7,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
-	"github.com/yasyf/cc-pool/internal/overlay"
 )
 
 func TestRenderMigrations(t *testing.T) {
@@ -66,7 +65,7 @@ func TestRenderMigrations(t *testing.T) {
 			var buf bytes.Buffer
 			cmd := &cobra.Command{}
 			cmd.SetOut(&buf)
-			err := renderMigrations(cmd, &tc.resp, overlay.KindFuse, tc.explicit)
+			err := renderMigrations(cmd, &tc.resp, "fuse", tc.explicit)
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("renderMigrations: %v", err)

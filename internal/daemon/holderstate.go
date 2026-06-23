@@ -123,7 +123,7 @@ type holderState struct {
 	// via HolderStatus; "" when the last spawn succeeded or none was needed.
 	spawnErr string
 	// tccErr is the latest mount-blocked-pending-TCC guidance (the holder's
-	// "Network Volumes" grant walkthrough), kept for status/doctor rendering;
+	// macOS volume-access grant walkthrough), kept for status/doctor rendering;
 	// "" when no mount is TCC-blocked. Cleared by the next successful mount,
 	// which proves the grant landed (the grant is per holder process, so one
 	// live mount clears it for all).

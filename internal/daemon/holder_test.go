@@ -21,7 +21,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/proc"
 	"github.com/yasyf/fusekit/version"
 )
@@ -104,7 +106,7 @@ func flipToFuse(t *testing.T, s *Server, id int) store.Account {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -971,7 +973,7 @@ func TestSuperviseSkewGateLegs(t *testing.T) {
 		},
 		"build that cannot spawn a successor defers": {
 			mutate: func(t *testing.T, s *Server, _ map[int]string, _ string) {
-				if overlay.FuseBuilt() {
+				if fusekit.Built() {
 					t.Skip("fuse build can spawn; this leg pins the pure build")
 				}
 				s.spawnHolder = nil
@@ -2164,7 +2166,7 @@ func TestSuperviseRemountBreakerHoldsUnderThreshold(t *testing.T) {
 	if unmounts != 0 {
 		t.Fatalf("force-unmounts under the threshold = %d, want 0", unmounts)
 	}
-	if got := kindOf(t, s, 1); got != "fuse" {
+	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind under the threshold = %q, want fuse (still retrying)", got)
 	}
 	if got := s.rowRetry[1].hazard; got != remountBreakerThreshold-1 {
@@ -2240,7 +2242,7 @@ func TestWedgeBreakerNeverEscalatesTCCRow(t *testing.T) {
 	if unmounts != 0 {
 		t.Fatalf("TCC-blocked row force-unmounted %d time(s); the wedged breaker must never fire on it", unmounts)
 	}
-	if got := kindOf(t, s, 1); got != "fuse" {
+	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("TCC-blocked row kind = %q, want fuse (still within the grant grace)", got)
 	}
 	st, ok := s.rowRetry[1]
@@ -2288,7 +2290,7 @@ func TestSuperviseTCCBreakerEscalates(t *testing.T) {
 	if got := s.holder.wireStatus().TCCError; got != "" {
 		t.Fatalf("TCC breaker left stale guidance %q; it must clear on retreat", got)
 	}
-	if !strings.Contains(buf.String(), "Network Volumes") {
+	if !strings.Contains(buf.String(), "volume-access grant never landed") {
 		t.Fatalf("TCC retreat not surfaced in the log:\n%s", buf.String())
 	}
 }
@@ -2333,7 +2335,7 @@ func TestSuperviseTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 
 	// One short of the grace: still waiting, no retreat.
 	driveRetryTicks(t, s, 1, tccBreakerThreshold-1)
-	if got := kindOf(t, s, 1); got != "fuse" {
+	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind one short of the grace = %q, want fuse (still waiting on the grant)", got)
 	}
 	if got := s.rowRetry[1].tccBlocks; got != tccBreakerThreshold-1 {
@@ -2343,7 +2345,7 @@ func TestSuperviseTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 	// The human grants Network Volumes: the next heal mounts the row.
 	fake.setupErr = nil
 	driveRetryTicks(t, s, 1, 1)
-	if got := kindOf(t, s, 1); got != "fuse" {
+	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind after a late grant = %q, want fuse (it mounted, never retreated)", got)
 	}
 	if _, ok := s.rowRetry[1]; ok {
@@ -2414,7 +2416,7 @@ func TestReconcileCapabilityGateRetreatsPoolWhenFuseUnavailable(t *testing.T) {
 		t.Fatalf("acct-02 kind after the capability gate = %q, want symlink", got)
 	}
 	kind, ok, err := s.m.ConfiguredOverlayKind()
-	if err != nil || !ok || kind != overlay.KindSymlink {
+	if err != nil || !ok || kind != fkoverlay.BackendSymlink {
 		t.Fatalf("new-account default = (%q, ok=%v, err=%v), want symlink", kind, ok, err)
 	}
 	if !strings.Contains(buf.String(), "fuse is unavailable on this machine") {
@@ -2438,10 +2440,10 @@ func TestReconcileCapabilityGateProceedsWhenProbePending(t *testing.T) {
 
 	s.reconcileOverlays(t.Context())
 
-	if got := kindOf(t, s, 1); got != "fuse" {
+	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("acct-01 kind after a PENDING probe = %q, want fuse (the gate must defer to the per-row grace)", got)
 	}
-	if kind, ok, _ := s.m.ConfiguredOverlayKind(); ok && kind == overlay.KindSymlink {
+	if kind, ok, _ := s.m.ConfiguredOverlayKind(); ok && kind == fkoverlay.BackendSymlink {
 		t.Fatal("a pending probe flipped the new-account default to symlink; only a hard failure may")
 	}
 }
@@ -2529,7 +2531,7 @@ func TestReviveBreakerRetreatBailsOnWedgedForceUnmount(t *testing.T) {
 
 	s.policy.Retreat(t.Context(), "child crash-looped")
 
-	if got := kindOf(t, s, 1); got != "fuse" {
+	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("acct-01 kind = %q, want fuse (a wedged force-unmount must NOT convert through a re-spawning Teardown)", got)
 	}
 }
@@ -2617,7 +2619,7 @@ func TestSuperviseDegradedSkewedForceConverges(t *testing.T) {
 	if rec.count() != 1 {
 		t.Fatalf("forced converge spawned %d replacement holders, want 1:\n%s", rec.count(), buf.String())
 	}
-	if got := kindOf(t, s, 1); got != "fuse" {
+	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("acct-1 after converge = %q, want fuse (converge keeps fuse, never retreats to symlink)", got)
 	}
 	if !strings.Contains(buf.String(), "mount holder replaced") {

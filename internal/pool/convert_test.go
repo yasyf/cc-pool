@@ -9,9 +9,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
+
+// testSpec is the fusekit/overlay Spec the convert tests drive providers with —
+// the same classification cc-pool's production overlaySpec carries, but with a
+// nil Holder (these tests inject a fake fuse provider via the OverlayFor seam
+// and never construct a RemoteFuseProvider).
+func testSpec() fkoverlay.Spec { return overlaySpec() }
+
+// newSymlinkProvider builds a fusekit symlink provider wired with cc-pool's
+// classification — the real provider these tests stage and re-assert.
+func newSymlinkProvider() *fkoverlay.SymlinkProvider {
+	return &fkoverlay.SymlinkProvider{Spec: testSpec()}
+}
 
 const (
 	identityJSON      = `{"oauthAccount":{"accountUuid":"u-1","emailAddress":"a@example.com"}}`
@@ -32,13 +44,13 @@ type fakeFuse struct {
 	created       string
 }
 
-func (f *fakeFuse) Kind() overlay.Kind            { return overlay.KindFuse }
+func (f *fakeFuse) Backend() fkoverlay.Backend    { return fkoverlay.BackendNFS }
 func (f *fakeFuse) Sync(_, _ string) error        { return nil }
 func (f *fakeFuse) Health(_, _ string) error      { return nil }
-func (f *fakeFuse) PrivateRoot(dir string) string { return overlay.FusePrivateRoot(dir) }
+func (f *fakeFuse) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
 func (f *fakeFuse) Setup(_, dir string) error {
 	privIdentity := false
-	if _, err := os.Stat(filepath.Join(overlay.FusePrivateRoot(dir), ".claude.json")); err == nil {
+	if _, err := os.Stat(filepath.Join(fkoverlay.FusePrivateRoot(dir), ".claude.json")); err == nil {
 		privIdentity = true
 	}
 	*f.ops = append(*f.ops, fmt.Sprintf("fuse.setup(priv-identity=%v)", privIdentity))
@@ -54,7 +66,7 @@ func (f *fakeFuse) Setup(_, dir string) error {
 			return err
 		}
 	} else if privIdentity {
-		if err := os.Symlink(filepath.Join(overlay.FusePrivateRoot(dir), ".claude.json"), mounted); err != nil {
+		if err := os.Symlink(filepath.Join(fkoverlay.FusePrivateRoot(dir), ".claude.json"), mounted); err != nil {
 			return err
 		}
 	} else {
@@ -91,7 +103,7 @@ func newConvertFixture(t *testing.T, fake *fakeFuse) (*Manager, store.Account, s
 	}
 
 	dir := filepath.Join(home, "acct-01")
-	if err := (&overlay.SymlinkProvider{}).Setup(base, dir); err != nil {
+	if err := newSymlinkProvider().Setup(base, dir); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(identityJSON), 0o600); err != nil {
@@ -111,11 +123,11 @@ func newConvertFixture(t *testing.T, fake *fakeFuse) (*Manager, store.Account, s
 	}
 	m := &Manager{Store: st}
 	if fake != nil {
-		m.OverlayFor = func(kind overlay.Kind) overlay.Provider {
-			if kind == overlay.KindFuse {
-				return fake
+		m.OverlayFor = func(backend fkoverlay.Backend) (fkoverlay.Provider, error) {
+			if backend.IsFuse() {
+				return fake, nil
 			}
-			return &overlay.SymlinkProvider{}
+			return newSymlinkProvider(), nil
 		}
 	}
 	return m, a, dir
@@ -134,7 +146,7 @@ func TestConvertOverlayNoopWhenAlreadyTarget(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{ops: &ops}
 	m, a, dir := newConvertFixture(t, fake)
-	got, err := m.ConvertOverlay(a, overlay.KindSymlink)
+	got, err := m.ConvertOverlay(a, fkoverlay.BackendSymlink)
 	if err != nil {
 		t.Fatalf("ConvertOverlay: %v", err)
 	}
@@ -146,19 +158,19 @@ func TestConvertOverlayNoopWhenAlreadyTarget(t *testing.T) {
 	}
 }
 
-// TestConvertOverlayRejectsWrongKindFake pins the Kind() equality fences. The
-// real resolver can no longer hand back a wrong-kind provider (KindFuse maps
-// to the holder-backed RemoteProvider, which always reports KindFuse), so the
-// fences guard against wrong-kind INJECTED fakes — a conversion that thinks
-// it is operating fuse-side while running symlink code paths is exactly how
-// account state gets destroyed.
+// TestConvertOverlayRejectsWrongKindFake pins the Backend() equality fences. The
+// real resolver can no longer hand back a wrong-backend provider (a fuse backend
+// maps to the holder-backed RemoteFuseProvider, which always reports its own
+// backend), so the fences guard against wrong-backend INJECTED fakes — a
+// conversion that thinks it is operating fuse-side while running symlink code
+// paths is exactly how account state gets destroyed.
 func TestConvertOverlayRejectsWrongKindFake(t *testing.T) {
-	wrongKind := func(overlay.Kind) overlay.Provider { return &overlay.SymlinkProvider{} }
+	wrongKind := func(fkoverlay.Backend) (fkoverlay.Provider, error) { return newSymlinkProvider(), nil }
 
 	t.Run("target fence", func(t *testing.T) {
 		m, a, dir := newConvertFixture(t, nil)
 		m.OverlayFor = wrongKind
-		_, err := m.ConvertOverlay(a, overlay.KindFuse)
+		_, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 		if !errors.Is(err, ErrConvertUnsupported) {
 			t.Fatalf("ConvertOverlay error = %v, want ErrConvertUnsupported", err)
 		}
@@ -173,18 +185,18 @@ func TestConvertOverlayRejectsWrongKindFake(t *testing.T) {
 	t.Run("source fence", func(t *testing.T) {
 		m, a, dir := newConvertFixture(t, nil)
 		m.OverlayFor = wrongKind
-		a.OverlayKind = "fuse"
+		a.OverlayKind = "nfs"
 		if err := m.Store.UpsertAccount(a); err != nil {
 			t.Fatal(err)
 		}
-		_, err := m.ConvertOverlay(a, overlay.KindSymlink)
+		_, err := m.ConvertOverlay(a, fkoverlay.BackendSymlink)
 		if !errors.Is(err, ErrConvertUnsupported) {
 			t.Fatalf("ConvertOverlay error = %v, want ErrConvertUnsupported", err)
 		}
 		if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
 			t.Fatalf("identity disturbed by refused convert: %q", got)
 		}
-		if storedKind(t, m, a.ID) != "fuse" {
+		if storedKind(t, m, a.ID) != "nfs" {
 			t.Fatal("row changed by refused convert")
 		}
 	})
@@ -200,7 +212,7 @@ func TestConvertOverlayRetreatWithoutLiveMount(t *testing.T) {
 	m, a, dir := newConvertFixture(t, nil) // no seam: the real resolver
 	// Stage the fuse rest state: row says fuse, identity and backups live in
 	// the private backing dir, no links in the (unmounted) account dir.
-	priv := overlay.FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 	if err := os.MkdirAll(priv, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -210,12 +222,12 @@ func TestConvertOverlayRetreatWithoutLiveMount(t *testing.T) {
 	if err := os.Rename(filepath.Join(dir, "backups"), filepath.Join(priv, "backups")); err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if err := m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
 
-	back, err := m.ConvertOverlay(a, overlay.KindSymlink)
+	back, err := m.ConvertOverlay(a, fkoverlay.BackendSymlink)
 	if err != nil {
 		t.Fatalf("retreat without a live mount: %v", err)
 	}
@@ -237,13 +249,13 @@ func TestConvertToFuseHappyPath(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{ops: &ops}
 	m, a, dir := newConvertFixture(t, fake)
-	priv := overlay.FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 
-	got, err := m.ConvertOverlay(a, overlay.KindFuse)
+	got, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 	if err != nil {
 		t.Fatalf("ConvertOverlay: %v", err)
 	}
-	if got.OverlayKind != "fuse" || storedKind(t, m, a.ID) != "fuse" {
+	if got.OverlayKind != "nfs" || storedKind(t, m, a.ID) != "nfs" {
 		t.Fatalf("row not flipped: returned=%s stored=%s", got.OverlayKind, storedKind(t, m, a.ID))
 	}
 	// Move happened BEFORE the mount: Setup must have seen the identity
@@ -267,9 +279,9 @@ func TestConvertToFuseSetupFailureRollsBack(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{ops: &ops, setupErr: errors.New("grant Network Volumes access")}
 	m, a, dir := newConvertFixture(t, fake)
-	priv := overlay.FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 
-	_, err := m.ConvertOverlay(a, overlay.KindFuse)
+	_, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 	if err == nil || !strings.Contains(err.Error(), "rolled back to symlink") {
 		t.Fatalf("error = %v, want rollback report", err)
 	}
@@ -288,7 +300,7 @@ func TestConvertToFuseSetupFailureRollsBack(t *testing.T) {
 	if storedKind(t, m, a.ID) != "symlink" {
 		t.Fatal("row flipped despite failed mount")
 	}
-	if has, _ := overlay.HasPrivateEntries(priv); has {
+	if has, _ := fkoverlay.HasPrivateEntries(priv, testSpec()); has {
 		t.Fatal("private files stranded in backing dir after rollback")
 	}
 }
@@ -297,9 +309,9 @@ func TestConvertToFuseUnmountFailureAbortsRollback(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{ops: &ops, setupErr: errors.New("mount timed out"), teardownErr: errors.New("still mounted")}
 	m, a, dir := newConvertFixture(t, fake)
-	priv := overlay.FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 
-	_, err := m.ConvertOverlay(a, overlay.KindFuse)
+	_, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 	if err == nil || !strings.Contains(err.Error(), "mount timed out") || !strings.Contains(err.Error(), "still mounted") {
 		t.Fatalf("error = %v, want both faults reported", err)
 	}
@@ -321,7 +333,7 @@ func TestConvertToFuseIdentityMismatchRollsBack(t *testing.T) {
 	fake := &fakeFuse{ops: &ops, wrongIdentity: true}
 	m, a, dir := newConvertFixture(t, fake)
 
-	_, err := m.ConvertOverlay(a, overlay.KindFuse)
+	_, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 	if err == nil || !strings.Contains(err.Error(), "identity through mount") {
 		t.Fatalf("error = %v, want identity mismatch", err)
 	}
@@ -337,14 +349,14 @@ func TestConvertToSymlink(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{ops: &ops}
 	m, a, dir := newConvertFixture(t, fake)
-	priv := overlay.FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 
 	// Forward first, then reverse — the round trip the rollout rehearses.
-	fwd, err := m.ConvertOverlay(a, overlay.KindFuse)
+	fwd, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 	if err != nil {
 		t.Fatalf("forward convert: %v", err)
 	}
-	back, err := m.ConvertOverlay(fwd, overlay.KindSymlink)
+	back, err := m.ConvertOverlay(fwd, fkoverlay.BackendSymlink)
 	if err != nil {
 		t.Fatalf("reverse convert: %v", err)
 	}
@@ -369,16 +381,16 @@ func TestConvertToSymlinkAbortsOnFailedUnmount(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{ops: &ops}
 	m, a, _ := newConvertFixture(t, fake)
-	fwd, err := m.ConvertOverlay(a, overlay.KindFuse)
+	fwd, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 	if err != nil {
 		t.Fatalf("forward convert: %v", err)
 	}
 	fake.teardownErr = errors.New("still mounted")
-	_, err = m.ConvertOverlay(fwd, overlay.KindSymlink)
+	_, err = m.ConvertOverlay(fwd, fkoverlay.BackendSymlink)
 	if err == nil || !strings.Contains(err.Error(), "still mounted") {
 		t.Fatalf("error = %v, want unmount failure", err)
 	}
-	if storedKind(t, m, a.ID) != "fuse" {
+	if storedKind(t, m, a.ID) != "nfs" {
 		t.Fatal("row flipped despite failed unmount")
 	}
 }
@@ -393,7 +405,7 @@ func TestConvertToSymlinkAbortsOnFailedUnmount(t *testing.T) {
 func TestConvertToSymlinkSweepsSharedOrphans(t *testing.T) {
 	m, a, dir := newConvertFixture(t, nil) // real resolver
 	base := ClaudeDir()
-	priv := overlay.FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 
 	// Fuse rest state: private files live in the backing dir, no links in the dir.
 	if err := os.MkdirAll(priv, 0o700); err != nil {
@@ -422,12 +434,12 @@ func TestConvertToSymlinkSweepsSharedOrphans(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "history.jsonl"), []byte("orphan-history"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if err := m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
 
-	back, err := m.ConvertOverlay(a, overlay.KindSymlink)
+	back, err := m.ConvertOverlay(a, fkoverlay.BackendSymlink)
 	if err != nil {
 		t.Fatalf("retreat with shared orphans: %v", err)
 	}
@@ -482,7 +494,7 @@ func TestRollbackToSymlinkSweepsSharedOrphans(t *testing.T) {
 	m, a, dir := newConvertFixture(t, fake)
 	base := ClaudeDir()
 
-	_, err := m.ConvertOverlay(a, overlay.KindFuse)
+	_, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 	if err == nil || !strings.Contains(err.Error(), "rolled back to symlink") {
 		t.Fatalf("error = %v, want rollback report", err)
 	}
@@ -502,7 +514,7 @@ func TestRollbackToSymlinkSweepsSharedOrphans(t *testing.T) {
 
 func TestHealStrandedPrivate(t *testing.T) {
 	m, a, dir := newConvertFixture(t, nil)
-	priv := overlay.FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 
 	// Nothing stranded: no-op.
 	healed, err := m.HealStrandedPrivate(a)
@@ -539,7 +551,7 @@ func TestHealStrandedPrivate(t *testing.T) {
 	}
 
 	// Misuse: healing a fuse-kind account is a programmer error.
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if _, err := m.HealStrandedPrivate(a); err == nil {
 		t.Fatal("healing a fuse account did not error")
 	}
@@ -559,7 +571,7 @@ func TestConvertRetreatThenLaunchMergePropagatesBase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fwd, err := m.ConvertOverlay(a, overlay.KindFuse)
+	fwd, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 	if err != nil {
 		t.Fatalf("forward convert: %v", err)
 	}
@@ -568,7 +580,7 @@ func TestConvertRetreatThenLaunchMergePropagatesBase(t *testing.T) {
 		t.Fatalf("merge against the fuse row: outcome=%q err=%v, want %q", out, err, MergeSkippedOverlay)
 	}
 
-	back, err := m.ConvertOverlay(fwd, overlay.KindSymlink)
+	back, err := m.ConvertOverlay(fwd, fkoverlay.BackendSymlink)
 	if err != nil {
 		t.Fatalf("retreat: %v", err)
 	}
@@ -593,7 +605,7 @@ func TestConvertRetreatThenLaunchMergePropagatesBase(t *testing.T) {
 // the stranded identity, and the next launch merge converges.
 func TestStrandedPrivateMergeRefusalKeepsHealable(t *testing.T) {
 	m, a, dir := newConvertFixture(t, nil)
-	priv := overlay.FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 	if err := os.MkdirAll(priv, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -640,7 +652,7 @@ func TestStrandedPrivateMergeRefusalKeepsHealable(t *testing.T) {
 // resolution is reported through the overlay seam.
 func TestHealResolvesDuplicatePrivateFile(t *testing.T) {
 	m, a, dir := newConvertFixture(t, nil)
-	priv := overlay.FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 	if err := os.MkdirAll(priv, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -660,11 +672,11 @@ func TestHealResolvesDuplicatePrivateFile(t *testing.T) {
 	}
 
 	var resolved []string
-	prev := overlay.ResolvedConflictLogf
-	overlay.ResolvedConflictLogf = func(format string, args ...any) {
+	prev := fkoverlay.ResolvedConflictLogf
+	fkoverlay.ResolvedConflictLogf = func(format string, args ...any) {
 		resolved = append(resolved, fmt.Sprintf(format, args...))
 	}
-	defer func() { overlay.ResolvedConflictLogf = prev }()
+	defer func() { fkoverlay.ResolvedConflictLogf = prev }()
 
 	healed, err := m.HealStrandedPrivate(a)
 	if err != nil || !healed {
@@ -689,7 +701,7 @@ func TestSetDefaultOverlayKind(t *testing.T) {
 	st := openTestStore(t)
 	m := &Manager{Store: st}
 
-	if err := m.SetDefaultOverlayKind(overlay.KindSymlink); err != nil {
+	if err := m.SetDefaultOverlayKind(fkoverlay.BackendSymlink); err != nil {
 		t.Fatalf("set symlink default: %v", err)
 	}
 	v, ok, err := st.GetMeta("overlay_kind")
@@ -705,7 +717,7 @@ func TestSetDefaultOverlayKind(t *testing.T) {
 	// provider's kind — the RemoteProvider always reports KindFuse, so a
 	// provider-kind fence would always pass.
 	m.CanHostFuse = func() bool { return false }
-	if err := m.SetDefaultOverlayKind(overlay.KindFuse); !errors.Is(err, ErrConvertUnsupported) {
+	if err := m.SetDefaultOverlayKind(fkoverlay.BackendNFS); !errors.Is(err, ErrConvertUnsupported) {
 		t.Fatalf("fuse default without fuse hosting = %v, want ErrConvertUnsupported", err)
 	}
 	if v, _, _ := st.GetMeta("overlay_kind"); v != "symlink" {
@@ -713,16 +725,16 @@ func TestSetDefaultOverlayKind(t *testing.T) {
 	}
 
 	m.CanHostFuse = func() bool { return true }
-	if err := m.SetDefaultOverlayKind(overlay.KindFuse); err != nil {
+	if err := m.SetDefaultOverlayKind(fkoverlay.BackendNFS); err != nil {
 		t.Fatalf("fuse default with fuse hosting: %v", err)
 	}
-	if v, _, _ := st.GetMeta("overlay_kind"); v != "fuse" {
+	if v, _, _ := st.GetMeta("overlay_kind"); v != "nfs" {
 		t.Fatalf("meta = %q, want fuse", v)
 	}
 
 	// Unseamed, the fence is this build's real capability.
 	m.CanHostFuse = nil
-	err = m.SetDefaultOverlayKind(overlay.KindFuse)
+	err = m.SetDefaultOverlayKind(fkoverlay.BackendNFS)
 	if CanHostFuse() {
 		if err != nil {
 			t.Fatalf("fuse default refused in a fuse build: %v", err)

@@ -2,8 +2,9 @@ package cli
 
 import (
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/fusekit"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 func newInitCmd() *cobra.Command {
@@ -53,9 +54,9 @@ same setup automatically.`,
 // warn-toned noise on every first run.
 func reportOverlayChoice(cmd *cobra.Command, res *pool.InitResult) {
 	switch {
-	case res.OverlayFallbackReason != "" && overlay.FuseBuilt():
+	case res.OverlayFallbackReason != "" && fusekit.Built():
 		warn(cmd.ErrOrStderr(), "fuse overlay unavailable (%s); using symlinks", res.OverlayFallbackReason)
-	case res.OverlayKind == overlay.KindSymlink && !overlay.FuseBuilt():
+	case res.OverlayKind == fkoverlay.BackendSymlink && !fusekit.Built():
 		note(cmd.OutOrStdout(), "For a live-mirror overlay, run `ccp fuse enable`.")
 	}
 }

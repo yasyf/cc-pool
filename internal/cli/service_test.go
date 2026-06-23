@@ -15,11 +15,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -187,8 +187,8 @@ func TestUninstallSessionGate(t *testing.T) {
 		fuseDir = filepath.Join(h, ".cc-pool", "accounts", "acct-01")
 		symDir = filepath.Join(h, ".cc-pool", "accounts", "acct-02")
 		seedAccounts(t,
-			store.Account{ID: 1, ConfigDir: fuseDir, OverlayKind: string(overlay.KindFuse)},
-			store.Account{ID: 2, ConfigDir: symDir, OverlayKind: string(overlay.KindSymlink)},
+			store.Account{ID: 1, ConfigDir: fuseDir, OverlayKind: string(fkoverlay.BackendNFS)},
+			store.Account{ID: 2, ConfigDir: symDir, OverlayKind: string(fkoverlay.BackendSymlink)},
 		)
 		return fuseDir, symDir
 	}
@@ -390,7 +390,7 @@ func TestUninstallSurvivorMount(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			home := tempHome(t)
 			fuseDir := filepath.Join(home, ".cc-pool", "accounts", "acct-01")
-			seedAccounts(t, store.Account{ID: 1, ConfigDir: fuseDir, OverlayKind: string(overlay.KindFuse)})
+			seedAccounts(t, store.Account{ID: 1, ConfigDir: fuseDir, OverlayKind: string(fkoverlay.BackendNFS)})
 			if err := os.MkdirAll(fuseDir, 0o700); err != nil {
 				t.Fatal(err)
 			}

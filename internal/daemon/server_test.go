@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // newTestServer builds a Server over a temp-dir store with two accounts:
@@ -631,17 +631,17 @@ func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s, dirs := newTestServer(t)
 	fake := &fakeFuseProv{} // Health nil: the startup reconcile adopts the mount
-	s.m.OverlayFor = func(kind overlay.Kind) overlay.Provider {
-		if kind == overlay.KindFuse {
-			return fake
+	s.m.OverlayFor = func(backend fkoverlay.Backend) (fkoverlay.Provider, error) {
+		if backend.IsFuse() {
+			return fake, nil
 		}
-		return &overlay.SymlinkProvider{}
+		return &fkoverlay.SymlinkProvider{Spec: s.m.OverlaySpec()}, nil
 	}
 	a, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}

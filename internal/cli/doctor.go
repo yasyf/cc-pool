@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -117,13 +118,16 @@ func newDoctorCmd() *cobra.Command {
 					_, _ = fmt.Fprintln(out, "\nAll checks passed.")
 				}
 
-				// --open-settings jumps straight to the Network Volumes pane when
-				// the holder is TCC-blocked. Best-effort: a failure to launch it
-				// is a warning, never a command failure — the detail line above
-				// already carries the copy-pasteable deep link.
+				// --open-settings jumps straight to the fuse backend's enablement
+				// pane when the holder is TCC-blocked. The pane and the deep links
+				// come from fusekit (Backend.OpenSettings), never a cc-pool literal.
+				// Best-effort: a failure to launch it is a warning, never a command
+				// failure — the detail line above already carries the copy-pasteable
+				// deep link.
 				if openSettings && cachedHolder != nil && cachedHolder.TCCError != "" {
-					if err := mountd.OpenNetworkVolumesSettings(cmd.Context()); err != nil {
-						warn(cmd.ErrOrStderr(), "couldn't open the Network Volumes settings pane: %v", err)
+					fuse := pool.FuseBackend()
+					if err := fuse.OpenSettings(cmd.Context()); err != nil {
+						warn(cmd.ErrOrStderr(), "couldn't open the %s settings pane: %v", fuse.Enablement().Pane, err)
 					}
 				}
 				return nil
@@ -131,8 +135,26 @@ func newDoctorCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&fix, "fix", false, "attempt to repair detected drift")
-	cmd.Flags().BoolVar(&openSettings, "open-settings", false, "if the mount holder is TCC-blocked, open the Network Volumes settings pane")
+	cmd.Flags().BoolVar(&openSettings, "open-settings", false, "if the mount holder needs a macOS grant, open its System Settings pane")
 	return cmd
+}
+
+// fuseGrantHint renders the open-Settings hint for a fuse backend's one-time
+// macOS grant, sourced entirely from fusekit (backend.Enablement) — cc-pool
+// holds no pane literal of its own. It names the pane and offers the first deep
+// link as a copy-pasteable `open` command. Production callers pass
+// pool.FuseBackend(); taking the backend as a parameter keeps cc-pool a blind
+// consumer (a test can hand it any backend and watch the pane flip). A backend
+// that needs no grant yields a bare "grant the required macOS permission".
+func fuseGrantHint(backend fkoverlay.Backend) string {
+	en := backend.Enablement()
+	if !en.Needed {
+		return "grant the required macOS permission"
+	}
+	if len(en.URLs) > 0 {
+		return fmt.Sprintf("open Settings (%s): open %q", en.Pane, en.URLs[0])
+	}
+	return "open Settings: " + en.Pane
 }
 
 // holderFacts is reportHolder's gathered input: holder reachability and
@@ -182,7 +204,7 @@ func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)
 		return
 	}
 	if f.cached.TCCError != "" {
-		report("mount holder TCC", false, f.cached.TCCError+` — open Settings: open "`+mountd.NetworkVolumesSettingsURL+`" (cc-pool falls back to symlink automatically if the grant never lands)`)
+		report("mount holder grant", false, f.cached.TCCError+" — "+fuseGrantHint(pool.FuseBackend())+" (cc-pool falls back to symlink automatically if the grant never lands)")
 	}
 	if f.cached.SpawnError != "" {
 		report("mount holder spawn", false, f.cached.SpawnError)
@@ -217,7 +239,7 @@ func reportWedges(accts []store.Account, mounts []mountd.MountInfo, report func(
 		byDir[mi.Dir] = mi
 	}
 	for _, a := range accts {
-		if overlay.Kind(a.OverlayKind) != overlay.KindFuse {
+		if !fuseBackedRow(a.OverlayKind) {
 			continue
 		}
 		mi, held := byDir[a.ConfigDir]
@@ -252,7 +274,7 @@ func reportStaleSessions(accts []store.Account, mounts []mountd.MountInfo, sessi
 		}
 	}
 	for _, a := range accts {
-		if overlay.Kind(a.OverlayKind) != overlay.KindFuse {
+		if !fuseBackedRow(a.OverlayKind) {
 			continue
 		}
 		at, ok := mountedAt[a.ConfigDir]
@@ -285,7 +307,7 @@ func reportStaleSessions(accts []store.Account, mounts []mountd.MountInfo, sessi
 // is checking for.
 func reportCarcasses(accts []store.Account, report func(string, bool, string)) {
 	for _, a := range accts {
-		if overlay.Kind(a.OverlayKind) != overlay.KindFuse {
+		if !fuseBackedRow(a.OverlayKind) {
 			continue
 		}
 		if dirMounted(a.ConfigDir) && !mountAliveAt(pool.ClaudeDir(), a.ConfigDir) {
@@ -330,7 +352,16 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 	}
 
 	// Overlay health.
-	prov := pool.OverlayProviderFor(overlay.Kind(a.OverlayKind))
+	backend, perr := fkoverlay.Parse(a.OverlayKind)
+	if perr != nil {
+		report(prefix+" overlay", false, perr.Error())
+		return
+	}
+	prov, perr := pool.OverlayProviderFor(backend)
+	if perr != nil {
+		report(prefix+" overlay", false, perr.Error())
+		return
+	}
 	if err := prov.Health(pool.ClaudeDir(), a.ConfigDir); err != nil {
 		if fix {
 			if serr := prov.Sync(pool.ClaudeDir(), a.ConfigDir); serr == nil {
@@ -342,7 +373,7 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 			report(prefix+" overlay", false, err.Error())
 		}
 	} else {
-		report(prefix+" overlay", true, string(prov.Kind()))
+		report(prefix+" overlay", true, string(prov.Backend()))
 	}
 
 	checkFuseFallback(m, a, report)
@@ -357,7 +388,8 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 // accounts back to fuse once fuse-t is healthy. The fuse-hosting check honors
 // the Manager's CanHostFuse seam so it is exercisable without a fuse build.
 func checkFuseFallback(m *pool.Manager, a store.Account, report func(string, bool, string)) {
-	if overlay.Kind(a.OverlayKind) != overlay.KindSymlink {
+	backend, err := fkoverlay.Parse(a.OverlayKind)
+	if err != nil || backend != fkoverlay.BackendSymlink {
 		return
 	}
 	canHostFuse := pool.CanHostFuse()
@@ -368,7 +400,7 @@ func checkFuseFallback(m *pool.Manager, a store.Account, report func(string, boo
 		return
 	}
 	def, ok, err := m.ConfiguredOverlayKind()
-	if err != nil || !ok || def != overlay.KindFuse {
+	if err != nil || !ok || !def.IsFuse() {
 		return
 	}
 	report(fmt.Sprintf("acct-%02d fuse fallback", a.ID), false,
@@ -386,12 +418,12 @@ func checkFuseFallback(m *pool.Manager, a store.Account, report func(string, boo
 // wiring is scoped to the single synchronous heal call (this process runs no
 // concurrent move) and restored after, so it never leaks across commands.
 func checkStrandedPrivate(m *pool.Manager, a store.Account, fix bool, out io.Writer, report func(string, bool, string)) {
-	if overlay.Kind(a.OverlayKind) == overlay.KindFuse {
+	if fuseBackedRow(a.OverlayKind) {
 		return
 	}
 	prefix := fmt.Sprintf("acct-%02d", a.ID)
-	priv := overlay.FusePrivateRoot(a.ConfigDir)
-	has, herr := overlay.HasPrivateEntries(priv)
+	priv := fkoverlay.FusePrivateRoot(a.ConfigDir)
+	has, herr := fkoverlay.HasPrivateEntries(priv, m.OverlaySpec())
 	switch {
 	case herr != nil:
 		report(prefix+" private files", false, herr.Error())
@@ -411,10 +443,10 @@ func checkStrandedPrivate(m *pool.Manager, a store.Account, fix bool, out io.Wri
 		report(prefix+" private files", false, "stranded in "+priv+"; the daemon is running — re-run `ccp migrate`, or stop the daemon and re-run doctor --fix")
 		return
 	}
-	prev := overlay.ResolvedConflictLogf
-	overlay.ResolvedConflictLogf = func(format string, args ...any) { warn(out, format, args...) }
+	prev := fkoverlay.ResolvedConflictLogf
+	fkoverlay.ResolvedConflictLogf = func(format string, args ...any) { warn(out, format, args...) }
 	healed, ferr := m.HealStrandedPrivate(a)
-	overlay.ResolvedConflictLogf = prev
+	fkoverlay.ResolvedConflictLogf = prev
 	switch {
 	case ferr != nil:
 		report(prefix+" private files", false, ferr.Error())

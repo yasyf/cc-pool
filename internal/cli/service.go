@@ -17,6 +17,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/fuset"
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/service"
 	"github.com/yasyf/fusekit/version"
 )
@@ -153,11 +154,23 @@ func fuseAccountRows() (int, error) {
 	return n, err
 }
 
-// countFuse counts the fuse-kind rows in an account list.
+// fuseBackedRow reports whether a stored overlay_kind names a fuse backend.
+// An unparseable value (only ever written by cc-pool, so corruption) reads as
+// non-fuse so the safe symlink path handles the dir. It is the cli package's
+// one place that parses the stored backend string.
+func fuseBackedRow(overlayKind string) bool {
+	b, err := fkoverlay.Parse(overlayKind)
+	if err != nil {
+		return false
+	}
+	return b.IsFuse()
+}
+
+// countFuse counts the fuse-backed rows in an account list.
 func countFuse(accts []store.Account) int {
 	n := 0
 	for _, a := range accts {
-		if overlay.Kind(a.OverlayKind) == overlay.KindFuse {
+		if fuseBackedRow(a.OverlayKind) {
 			n++
 		}
 	}
@@ -244,7 +257,7 @@ func gateUninstallSessions(accts []store.Account, purge bool) error {
 	}
 	var busy []string
 	for _, a := range accts {
-		if !purge && overlay.Kind(a.OverlayKind) != overlay.KindFuse {
+		if !purge && !fuseBackedRow(a.OverlayKind) {
 			continue
 		}
 		var pids []string

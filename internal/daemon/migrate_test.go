@@ -20,6 +20,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // fakeFuseProv stands in for the fuse provider so handler-level conversion
@@ -40,8 +41,8 @@ type fakeFuseProv struct {
 	teardownFn  func(base, dir string) error
 }
 
-func (f *fakeFuseProv) Kind() overlay.Kind     { return overlay.KindFuse }
-func (f *fakeFuseProv) Sync(_, _ string) error { return nil }
+func (f *fakeFuseProv) Backend() fkoverlay.Backend { return fkoverlay.BackendNFS }
+func (f *fakeFuseProv) Sync(_, _ string) error     { return nil }
 
 // State satisfies fusekit's narrow mountd.Host seam (which replaced the old
 // mounted/mountAlive package-var seams): the fake holder reports real kernel
@@ -65,7 +66,7 @@ func (f *fakeFuseProv) healthCount() int {
 	return f.healths
 }
 
-func (f *fakeFuseProv) PrivateRoot(dir string) string { return overlay.FusePrivateRoot(dir) }
+func (f *fakeFuseProv) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
 
 func (f *fakeFuseProv) Setup(base, dir string) error {
 	f.mu.Lock()
@@ -131,11 +132,11 @@ func newMigrateServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv) {
 		}
 	}
 	fake := &fakeFuseProv{}
-	s.m.OverlayFor = func(kind overlay.Kind) overlay.Provider {
-		if kind == overlay.KindFuse {
-			return fake
+	s.m.OverlayFor = func(backend fkoverlay.Backend) (fkoverlay.Provider, error) {
+		if backend.IsFuse() {
+			return fake, nil
 		}
-		return &overlay.SymlinkProvider{}
+		return &fkoverlay.SymlinkProvider{Spec: s.m.OverlaySpec()}, nil
 	}
 	s.fuseGateFn = func() string { return "" }
 	// SetDefaultOverlayKind's fence keys on real fuse-hosting capability
@@ -170,7 +171,7 @@ func kindOf(t *testing.T, s *Server, id int) string {
 func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 
-	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
 	if !resp.OK {
 		t.Fatalf("migrate failed: %s", resp.Error)
 	}
@@ -178,7 +179,7 @@ func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
 	if got[1] != MigrationDone || got[2] != MigrationDone {
 		t.Fatalf("outcomes = %v, want both done", got)
 	}
-	if kindOf(t, s, 1) != "fuse" || kindOf(t, s, 2) != "fuse" {
+	if kindOf(t, s, 1) != "nfs" || kindOf(t, s, 2) != "nfs" {
 		t.Fatal("rows not flipped to fuse")
 	}
 	if fake.setupCount() != 2 {
@@ -192,12 +193,12 @@ func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
 	}
 	// The new-account default follows the migration.
 	v, ok, err := s.m.Store.GetMeta("overlay_kind")
-	if err != nil || !ok || v != "fuse" {
+	if err != nil || !ok || v != "nfs" {
 		t.Fatalf("meta overlay_kind = %q ok=%v err=%v, want fuse", v, ok, err)
 	}
 
 	// Re-running is free and truthful.
-	resp = s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
+	resp = s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
 	if !resp.OK {
 		t.Fatalf("re-run failed: %s", resp.Error)
 	}
@@ -212,7 +213,7 @@ func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
 
 func TestHandleMigrateReverse(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
-	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse")); !resp.OK {
+	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs")); !resp.OK {
 		t.Fatalf("forward migrate failed: %s", resp.Error)
 	}
 
@@ -256,7 +257,7 @@ func TestHandleMigrateToFuseRecordsDefaultWithoutConversions(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 
 	// First migrate converts both accounts and records fuse as the default.
-	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse")); !resp.OK {
+	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs")); !resp.OK {
 		t.Fatalf("initial migrate failed: %s", resp.Error)
 	}
 	// Drift the recorded default back to symlink while the accounts stay fuse —
@@ -265,7 +266,7 @@ func TestHandleMigrateToFuseRecordsDefaultWithoutConversions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
 	if !resp.OK {
 		t.Fatalf("re-migrate failed: %s", resp.Error)
 	}
@@ -274,7 +275,7 @@ func TestHandleMigrateToFuseRecordsDefaultWithoutConversions(t *testing.T) {
 			t.Fatalf("acct %d outcome = %v, want already (no conversion expected)", id, oc)
 		}
 	}
-	if v, _, _ := s.m.Store.GetMeta("overlay_kind"); v != "fuse" {
+	if v, _, _ := s.m.Store.GetMeta("overlay_kind"); v != "nfs" {
 		t.Fatalf("meta overlay_kind = %q, want fuse — a zero-conversion fuse migrate must still record the default", v)
 	}
 }
@@ -283,7 +284,7 @@ func TestHandleMigrateFuseGateBlocks(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
 	s.fuseGateFn = func() string { return "grant Network Volumes access" }
 
-	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
 	if resp.OK || !strings.Contains(resp.Error, "grant Network Volumes access") {
 		t.Fatalf("resp = %+v, want gate error", resp)
 	}
@@ -298,11 +299,16 @@ func TestHandleMigrateFuseGateBlocks(t *testing.T) {
 func TestHandleMigrateValidation(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 
-	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "zfs")); resp.OK || !strings.Contains(resp.Error, "unknown overlay kind") {
-		t.Fatalf("unknown kind: %+v", resp)
+	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "zfs")); resp.OK || !strings.Contains(resp.Error, "unknown overlay backend") {
+		t.Fatalf("unknown backend: %+v", resp)
+	}
+	// The legacy "fuse" value is no longer a concrete backend — the strict
+	// fkoverlay.Parse rejects it, so the wire must carry "nfs"/"fskit"/"symlink".
+	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse")); resp.OK || !strings.Contains(resp.Error, "unknown overlay backend") {
+		t.Fatalf(`legacy "fuse" backend must be rejected on the wire: %+v`, resp)
 	}
 	nine := 9
-	if resp := s.handleMigrate(t.Context(), migrateReq(&nine, "fuse")); resp.OK || !strings.Contains(resp.Error, "account 9 not found") {
+	if resp := s.handleMigrate(t.Context(), migrateReq(&nine, "nfs")); resp.OK || !strings.Contains(resp.Error, "account 9 not found") {
 		t.Fatalf("unknown account: %+v", resp)
 	}
 }
@@ -310,11 +316,11 @@ func TestHandleMigrateValidation(t *testing.T) {
 func TestHandleMigrateSingleAccount(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 	two := 2
-	resp := s.handleMigrate(t.Context(), migrateReq(&two, "fuse"))
+	resp := s.handleMigrate(t.Context(), migrateReq(&two, "nfs"))
 	if !resp.OK || len(resp.Migrations) != 1 || resp.Migrations[0].ID != 2 || resp.Migrations[0].Outcome != MigrationDone {
 		t.Fatalf("resp = %+v, want acct-2 done only", resp)
 	}
-	if kindOf(t, s, 1) != "symlink" || kindOf(t, s, 2) != "fuse" {
+	if kindOf(t, s, 1) != "symlink" || kindOf(t, s, 2) != "nfs" {
 		t.Fatal("wrong rows flipped")
 	}
 }
@@ -325,7 +331,7 @@ func TestHandleMigrateBusyWhenReserved(t *testing.T) {
 		t.Fatal("tryReserve failed on a free account")
 	}
 
-	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
 	if !resp.OK {
 		t.Fatalf("migrate failed: %s", resp.Error)
 	}
@@ -348,7 +354,7 @@ func TestHandleMigrateBusyWhenReserved(t *testing.T) {
 	s.mu.Lock()
 	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
 	s.mu.Unlock()
-	resp = s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
+	resp = s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
 	got = outcomes(resp)
 	if got[1] != MigrationDone || got[2] != MigrationAlready {
 		t.Fatalf("sweep outcomes = %v, want acct-1 done, acct-2 already", got)
@@ -413,7 +419,7 @@ func TestSelectExcludesUnmountedFuseAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "fuse" // row says fuse, but nothing is mounted at the dir
+	a.OverlayKind = "nfs" // row says fuse, but nothing is mounted at the dir
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -439,11 +445,11 @@ func TestFallbackToSymlinkRestoresPrivateFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	priv := overlay.FusePrivateRoot(dirs[1])
+	priv := fkoverlay.FusePrivateRoot(dirs[1])
 	if err := os.MkdirAll(priv, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -466,11 +472,11 @@ func TestFallbackToSymlinkRestoresPrivateFiles(t *testing.T) {
 
 	// Twin negative: a wedged unmount must abort the fallback untouched.
 	a, _ = s.m.Store.GetAccount(2)
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	priv2 := overlay.FusePrivateRoot(dirs[2])
+	priv2 := fkoverlay.FusePrivateRoot(dirs[2])
 	if err := os.MkdirAll(priv2, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +490,7 @@ func TestFallbackToSymlinkRestoresPrivateFiles(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(priv2, ".claude.json")); err != nil {
 		t.Fatalf("identity moved despite failed unmount: %v", err)
 	}
-	if kindOf(t, s, 2) != "fuse" {
+	if kindOf(t, s, 2) != "nfs" {
 		t.Fatal("row flipped despite failed unmount")
 	}
 	if _, err := os.Lstat(filepath.Join(dirs[2], "plans")); !os.IsNotExist(err) {
@@ -503,7 +509,7 @@ func TestFallbackToSymlinkClaimAtomicAgainstSelect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +540,7 @@ func TestReconcileOverlaysHealsStrandedAndFallsBack(t *testing.T) {
 
 	// acct-1: symlink row with an identity stranded by an interrupted
 	// conversion — startup must restore it.
-	priv1 := overlay.FusePrivateRoot(dirs[1])
+	priv1 := fkoverlay.FusePrivateRoot(dirs[1])
 	if err := os.MkdirAll(priv1, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -549,11 +555,11 @@ func TestReconcileOverlaysHealsStrandedAndFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a2.OverlayKind = "fuse"
+	a2.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a2); err != nil {
 		t.Fatal(err)
 	}
-	priv2 := overlay.FusePrivateRoot(dirs[2])
+	priv2 := fkoverlay.FusePrivateRoot(dirs[2])
 	if err := os.MkdirAll(priv2, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -632,7 +638,7 @@ func TestMountFuseSweepsUnderlay(t *testing.T) {
 	if err := s.mountFuse(a); err != nil {
 		t.Fatalf("mountFuse: %v", err)
 	}
-	got, err := os.ReadFile(filepath.Join(overlay.FusePrivateRoot(dirs[1]), ".claude.json"))
+	got, err := os.ReadFile(filepath.Join(fkoverlay.FusePrivateRoot(dirs[1]), ".claude.json"))
 	if err != nil || string(got) != "underlay-identity" {
 		t.Fatalf("identity not swept into backing dir: %q err=%v", got, err)
 	}
@@ -643,12 +649,14 @@ func TestMountFuseSweepsUnderlay(t *testing.T) {
 		t.Fatalf("setups = %d, want 1", fake.setupCount())
 	}
 
-	// A wrong-kind injected fake must be refused loudly, never mounted
+	// A wrong-backend injected fake must be refused loudly, never mounted
 	// through — the real resolver always yields a fuse provider, so the fence
 	// guards against fakes that would run symlink code on fuse paths.
-	s.m.OverlayFor = func(_ overlay.Kind) overlay.Provider { return &overlay.SymlinkProvider{} }
-	if err := s.mountFuse(a); err == nil || !strings.Contains(err.Error(), "reports kind") {
-		t.Fatalf("mountFuse with a wrong-kind provider = %v, want a kind refusal", err)
+	s.m.OverlayFor = func(_ fkoverlay.Backend) (fkoverlay.Provider, error) {
+		return &fkoverlay.SymlinkProvider{Spec: s.m.OverlaySpec()}, nil
+	}
+	if err := s.mountFuse(a); err == nil || !strings.Contains(err.Error(), "no fuse provider") {
+		t.Fatalf("mountFuse with a wrong-backend provider = %v, want a backend refusal", err)
 	}
 }
 
@@ -658,7 +666,7 @@ func TestMountFuseSweepsUnderlay(t *testing.T) {
 // (one under a symlink row is an aborted rollback's wreckage).
 func TestMountReady(t *testing.T) {
 	const dir = "/pool/acct-01"
-	fuse := store.Account{OverlayKind: "fuse", ConfigDir: dir}
+	fuse := store.Account{OverlayKind: "nfs", ConfigDir: dir}
 	sym := store.Account{OverlayKind: "symlink", ConfigDir: dir}
 	cases := map[string]struct {
 		a             store.Account
@@ -710,7 +718,7 @@ func TestHandleMigrateBudgetExhausted(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
 	s.migrateBudget = time.Nanosecond
 
-	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
 	if !resp.OK {
 		t.Fatalf("migrate failed: %s", resp.Error)
 	}
@@ -739,7 +747,7 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res := s.convertAccount(t.Context(), a, overlay.KindFuse, true)
+	res := s.convertAccount(t.Context(), a, fkoverlay.BackendNFS, true)
 	if res.Outcome != MigrationBusy {
 		t.Fatalf("outcome = %s, want busy despite force", res.Outcome)
 	}
@@ -752,7 +760,7 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	s.mu.Lock()
 	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
 	s.mu.Unlock()
-	resp := s.handleMigrate(t.Context(), Request{Op: OpMigrate, To: "fuse", Force: true})
+	resp := s.handleMigrate(t.Context(), Request{Op: OpMigrate, To: "nfs", Force: true})
 	if !resp.OK {
 		t.Fatalf("forced migrate failed: %s", resp.Error)
 	}
@@ -771,12 +779,12 @@ func TestConvertAccountRefetchesRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	fresh := stale
-	fresh.OverlayKind = "fuse" // flipped after the caller's snapshot
+	fresh.OverlayKind = "nfs" // flipped after the caller's snapshot
 	if err := s.m.Store.UpsertAccount(fresh); err != nil {
 		t.Fatal(err)
 	}
 
-	res := s.convertAccount(t.Context(), stale, overlay.KindFuse, false) // stale still says symlink
+	res := s.convertAccount(t.Context(), stale, fkoverlay.BackendNFS, false) // stale still says symlink
 	if res.Outcome != MigrationAlready {
 		t.Fatalf("outcome = %s (%s), want already", res.Outcome, res.Detail)
 	}
@@ -845,7 +853,7 @@ func TestReconcileAdoptsLiveMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -888,7 +896,7 @@ func TestMountFuseClearsDeadMountThenSweepsThenMounts(t *testing.T) {
 	fake.setupFn = func(string, string) error {
 		// The sweep must complete before the mount: the identity must already
 		// be in the backing dir, or the mirror would shadow it.
-		if _, err := os.Stat(filepath.Join(overlay.FusePrivateRoot(dirs[1]), ".claude.json")); err != nil {
+		if _, err := os.Stat(filepath.Join(fkoverlay.FusePrivateRoot(dirs[1]), ".claude.json")); err != nil {
 			return fmt.Errorf("setup ran before the sweep: %w", err)
 		}
 		return nil
@@ -1041,7 +1049,7 @@ func TestHealFuseTaxonomy(t *testing.T) {
 	}{
 		"holder unavailable retries next poll": {
 			setupErr:    fmt.Errorf("mount: %w", mountd.ErrHolderUnavailable),
-			wantOutcome: healRetry, wantKind: "fuse",
+			wantOutcome: healRetry, wantKind: "nfs",
 		},
 		// The exact chain the production spawn leg produces (RemoteProvider.Setup
 		// wrapping EnsureRunning's come-up timeout): a holder spawn blip must
@@ -1049,22 +1057,22 @@ func TestHealFuseTaxonomy(t *testing.T) {
 		"spawn timeout (holder unavailable chain) retries next poll": {
 			setupErr: fmt.Errorf("mount /pool/acct-01: %w",
 				fmt.Errorf("%w: mount holder did not come up on /tmp/m.sock within 5s; check /tmp/holder.log", mountd.ErrHolderUnavailable)),
-			wantOutcome: healRetry, wantKind: "fuse",
+			wantOutcome: healRetry, wantKind: "nfs",
 		},
 		"busy dir retries next poll": {
 			setupErr:    fmt.Errorf("mount: %w", mountd.ErrBusy),
-			wantOutcome: healRetry, wantKind: "fuse",
+			wantOutcome: healRetry, wantKind: "nfs",
 		},
 		"tcc block recorded and retried": {
 			setupErr:    fmt.Errorf("mount: %w", overlay.ErrMountNotLive),
-			wantOutcome: healTCCBlocked, wantKind: "fuse", wantTCC: true,
+			wantOutcome: healTCCBlocked, wantKind: "nfs", wantTCC: true,
 		},
 		// A wedged unmount is no more a mount verdict than ErrBusy — and the
 		// fallback's ConvertOverlay would hit the same wedge, so converting
 		// would fail closed every poll for nothing.
 		"wedged unmount retries next poll": {
 			setupErr:    fmt.Errorf("mount: %w", overlay.ErrUnmountWedged),
-			wantOutcome: healRetry, wantKind: "fuse",
+			wantOutcome: healRetry, wantKind: "nfs",
 		},
 		// The exact chain overlayClass produces for a mount-up timeout under a
 		// proven "Network Volumes" grant: transient fuse-t slowness, never the
@@ -1072,21 +1080,21 @@ func TestHealFuseTaxonomy(t *testing.T) {
 		// every timeout recorded TCC guidance and waited on the grant copy.
 		"mount timeout (proven grant) retries without recording TCC": {
 			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountTimeout, mountd.ErrMountTimeout)),
-			wantOutcome: healRetry, wantKind: "fuse", wantTCC: false,
+			wantOutcome: healRetry, wantKind: "nfs", wantTCC: false,
 		},
 		// Forward skew: a newer holder's error class this daemon predates is
 		// unclassifiable — the protocol's sanctioned extension path must read
 		// as retry, never as the mount failure that converts.
 		"unknown holder error class retries next poll": {
 			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w (quota-exceeded): per-account quota exhausted", mountd.ErrUnknownClass)),
-			wantOutcome: healRetry, wantKind: "fuse",
+			wantOutcome: healRetry, wantKind: "nfs",
 		},
 		// The skew matrix's degrade path: a pre-fix daemon receiving the new
 		// "mount-timeout" class reads it as ErrUnknownClass — which the
 		// additive policy routes to retry, never to the conversion arm.
 		"mount-timeout class on a pre-fix daemon degrades to retry": {
 			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w (mount-timeout): fuse mount did not come up in time", mountd.ErrUnknownClass)),
-			wantOutcome: healRetry, wantKind: "fuse",
+			wantOutcome: healRetry, wantKind: "nfs",
 		},
 		"genuine failure on an idle account converts": {
 			setupErr:    errors.New("mount exploded"),
@@ -1094,17 +1102,17 @@ func TestHealFuseTaxonomy(t *testing.T) {
 		},
 		"genuine failure under a live session defers": {
 			setupErr: errors.New("mount exploded"), scanKind: "live",
-			wantOutcome: healFallback, wantKind: "fuse",
+			wantOutcome: healFallback, wantKind: "nfs",
 		},
 		"genuine failure under a reservation defers": {
 			setupErr: errors.New("mount exploded"), reserve: true,
-			wantOutcome: healFallback, wantKind: "fuse",
+			wantOutcome: healFallback, wantKind: "nfs",
 		},
 		"genuine failure with a failed scan fails closed": {
 			setupErr: errors.New("mount exploded"), scanKind: "err",
-			wantOutcome: healFallback, wantKind: "fuse",
+			wantOutcome: healFallback, wantKind: "nfs",
 		},
-		"clean mount": {wantOutcome: healMounted, wantKind: "fuse"},
+		"clean mount": {wantOutcome: healMounted, wantKind: "nfs"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1113,7 +1121,7 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			a.OverlayKind = "fuse"
+			a.OverlayKind = "nfs"
 			if err := s.m.Store.UpsertAccount(a); err != nil {
 				t.Fatal(err)
 			}
@@ -1165,7 +1173,7 @@ func TestHealFuseSweepFailureRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -1177,14 +1185,14 @@ func TestHealFuseSweepFailureRetries(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte("identity"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(overlay.FusePrivateRoot(dir), ".credentials.json"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(fkoverlay.FusePrivateRoot(dir), ".credentials.json"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 
 	if got := s.healFuse(t.Context(), a); got != healRetry {
 		t.Fatalf("healFuse outcome = %d, want healRetry (%d): a pre-Setup sweep failure must not convert", got, healRetry)
 	}
-	if got := kindOf(t, s, 1); got != "fuse" {
+	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind = %q, want \"fuse\": a sweep failure must not demote to symlink", got)
 	}
 	if s.isConverting(1) {
@@ -1204,7 +1212,7 @@ func TestSelectServesFuseAccountWhenHolderVouches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -1224,7 +1232,7 @@ func fuseRowWithCannedHolder(t *testing.T, s *Server, dirs map[int]string) store
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "fuse"
+	a.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}

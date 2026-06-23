@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/keychain"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // ErrNotInitialized means the pool has not been set up yet (`ccp init` or
@@ -19,7 +19,7 @@ var ErrNotInitialized = errors.New("pool not initialized")
 
 // InitResult summarizes what `ccp init` did.
 type InitResult struct {
-	OverlayKind overlay.Kind
+	OverlayKind fkoverlay.Backend
 	// OverlayFallbackReason says why detection settled on symlink when THIS
 	// Init ran the detection; "" when fuse was chosen or a kind was already
 	// recorded.
@@ -57,7 +57,7 @@ type PendingAdd struct {
 	Index           int
 	ConfigDir       string
 	KeychainService string
-	OverlayKind     overlay.Kind
+	OverlayKind     fkoverlay.Backend
 	// FallbackReason says why fuse was ruled out for this account: a requested
 	// fuse overlay fell back to symlinks at Setup time, or detection ran inside
 	// this PrepareAdd (legacy pools with no recorded kind) and ruled fuse out.
@@ -79,7 +79,11 @@ func (m *Manager) DuplicateIdentity(want Identity) (*store.Account, error) {
 	}
 	for i := range accounts {
 		a := accounts[i]
-		id, err := AccountIdentity(overlay.Kind(a.OverlayKind), a.ConfigDir)
+		backend, err := fkoverlay.Parse(a.OverlayKind)
+		if err != nil {
+			continue
+		}
+		id, err := AccountIdentity(backend, a.ConfigDir)
 		if err != nil {
 			continue
 		}
@@ -111,24 +115,30 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		return nil, err
 	}
 	acctDir := AccountDir(n)
-	kind, detectReason, err := m.ensureOverlayKind()
+	backend, detectReason, err := m.ensureOverlayKind()
 	if err != nil {
 		return nil, err
 	}
-	prov := m.overlayFor(kind)
-	// A detection that just ran here (legacy pool with no recorded kind) and
+	prov, err := m.overlayFor(backend)
+	if err != nil {
+		return nil, fmt.Errorf("resolve overlay provider for %s: %w", acctDir, err)
+	}
+	// A detection that just ran here (legacy pool with no recorded backend) and
 	// ruled fuse out is surfaced exactly like a Setup-time fallback.
 	fallbackReason := detectReason
 	if setupErr := prov.Setup(ClaudeDir(), acctDir); setupErr != nil {
-		if kind != overlay.KindFuse {
+		if !backend.IsFuse() {
 			return nil, fmt.Errorf("set up overlay for %s: %w", acctDir, setupErr)
 		}
 		// A fuse Setup failure means the mount holder is unavailable right
 		// now, not that the add must die: fall back to symlinks EXPLICITLY.
-		// The kind actually established is recorded below and the reason
+		// The backend actually established is recorded below and the reason
 		// rides along so `ccp add` says the substitution out loud.
 		fallbackReason = setupErr.Error()
-		prov = m.overlayFor(overlay.KindSymlink)
+		prov, err = m.overlayFor(fkoverlay.BackendSymlink)
+		if err != nil {
+			return nil, fmt.Errorf("resolve fallback symlink provider for %s (after fuse setup failed: %w): %w", acctDir, setupErr, err)
+		}
 		if err := prov.Setup(ClaudeDir(), acctDir); err != nil {
 			// Both causes ride the chain: the symlink complaint alone would
 			// mask the fuse failure that started this (e.g. ErrForeignMount),
@@ -139,7 +149,7 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		// holder creates it before mounting); drop it so the symlink account
 		// doesn't accrete an inert acct-NN.private. Only-if-empty: anything
 		// inside is unclassified state that must not be destroyed.
-		removePrivateRootIfEmpty(overlay.FusePrivateRoot(acctDir))
+		removePrivateRootIfEmpty(fkoverlay.FusePrivateRoot(acctDir))
 	}
 	seed, err := seedClaudeJSON(prov, acctDir, ClaudeJSONPath())
 	if err != nil {
@@ -169,10 +179,10 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		Index:           n,
 		ConfigDir:       acctDir,
 		KeychainService: svc,
-		// The provider actually established, not the requested kind: a failed
+		// The provider actually established, not the requested backend: a failed
 		// fuse Setup fell back to symlinks above, and recording the request
 		// would mint a row promising a mirror the dir doesn't have.
-		OverlayKind:    prov.Kind(),
+		OverlayKind:    prov.Backend(),
 		FallbackReason: fallbackReason,
 		// The plugin var pins claude's plugin root to the shared base so the
 		// login session (where first-launch marketplace auto-install can run)
@@ -256,7 +266,11 @@ func (m *Manager) AbandonAdd(p *PendingAdd) error {
 	default:
 		credErr = m.Keychain.Delete(p.KeychainService, account)
 	}
-	return errors.Join(credErr, m.removeAccountDir(m.overlayFor(p.OverlayKind), p.ConfigDir))
+	prov, err := m.overlayFor(p.OverlayKind)
+	if err != nil {
+		return errors.Join(credErr, fmt.Errorf("resolve overlay provider for %s: %w", p.ConfigDir, err))
+	}
+	return errors.Join(credErr, m.removeAccountDir(prov, p.ConfigDir))
 }
 
 // Remove deletes an account from the pool: tears down its overlay, removes its
@@ -267,7 +281,14 @@ func (m *Manager) Remove(id int, deleteCredential bool) error {
 	if err != nil {
 		return err
 	}
-	prov := m.overlayFor(overlay.Kind(a.OverlayKind))
+	backend, err := fkoverlay.Parse(a.OverlayKind)
+	if err != nil {
+		return fmt.Errorf("remove acct-%02d: parse stored backend: %w", id, err)
+	}
+	prov, err := m.overlayFor(backend)
+	if err != nil {
+		return fmt.Errorf("remove acct-%02d: resolve overlay provider: %w", id, err)
+	}
 	if err := m.removeAccountDir(prov, a.ConfigDir); err != nil {
 		return err
 	}
@@ -283,7 +304,7 @@ func (m *Manager) Remove(id int, deleteCredential bool) error {
 // its private backing (when the provider keeps one beside the dir, as fuse
 // does). Teardown refusing to operate (e.g. a wedged unmount) aborts the
 // removal so we never RemoveAll through a live mount into the base.
-func (m *Manager) removeAccountDir(prov overlay.Provider, configDir string) error {
+func (m *Manager) removeAccountDir(prov fkoverlay.Provider, configDir string) error {
 	if err := prov.Teardown(ClaudeDir(), configDir); err != nil {
 		return fmt.Errorf("teardown overlay: %w", err)
 	}
@@ -304,22 +325,34 @@ func (m *Manager) removeAccountDir(prov overlay.Provider, configDir string) erro
 // time and periodically by the daemon, which is why explicit `ccp sync` is
 // unnecessary.
 func (m *Manager) SyncOverlay(a store.Account) error {
-	return m.overlayFor(overlay.Kind(a.OverlayKind)).Sync(ClaudeDir(), a.ConfigDir)
+	backend, err := fkoverlay.Parse(a.OverlayKind)
+	if err != nil {
+		return fmt.Errorf("sync overlay for acct-%02d: parse stored backend: %w", a.ID, err)
+	}
+	prov, err := m.overlayFor(backend)
+	if err != nil {
+		return fmt.Errorf("sync overlay for acct-%02d: resolve provider: %w", a.ID, err)
+	}
+	return prov.Sync(ClaudeDir(), a.ConfigDir)
 }
 
-// ensureOverlayKind returns the overlay provider kind for new accounts: the
-// kind recorded at init, detecting and recording one first if absent. The
+// ensureOverlayKind returns the overlay provider backend for new accounts: the
+// backend recorded at init, detecting and recording one first if absent. The
 // returned reason is non-empty only when detection just ran and ruled out
 // fuse; it says why, so callers can surface the substitution to the user.
-func (m *Manager) ensureOverlayKind() (overlay.Kind, string, error) {
+func (m *Manager) ensureOverlayKind() (fkoverlay.Backend, string, error) {
 	if v, ok, err := m.Store.GetMeta(metaOverlayKind); err != nil {
 		return "", "", err
 	} else if ok {
-		return overlay.Kind(v), "", nil
+		b, perr := fkoverlay.Parse(v)
+		if perr != nil {
+			return "", "", fmt.Errorf("read recorded overlay backend: %w", perr)
+		}
+		return b, "", nil
 	}
-	kind, reason := m.detectOverlay()
-	if err := m.Store.SetMeta(metaOverlayKind, string(kind)); err != nil {
+	backend, reason := m.detectOverlay()
+	if err := m.Store.SetMeta(metaOverlayKind, string(backend)); err != nil {
 		return "", "", err
 	}
-	return kind, reason, nil
+	return backend, reason, nil
 }

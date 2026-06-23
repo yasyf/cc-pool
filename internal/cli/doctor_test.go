@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -85,9 +86,10 @@ func TestReportHolder(t *testing.T) {
 			fuseRows: 1,
 			want: []reportCall{
 				{"mount holder", true, cur},
-				// The raw fusekit error AND the copy-pasteable deep link must
-				// both ride the one detail line.
-				{"mount holder TCC", false, `grant Network Volumes access — open Settings: open "` + mountd.NetworkVolumesSettingsURL + `" (cc-pool falls back to symlink automatically if the grant never lands)`},
+				// The raw fusekit error AND the fusekit-sourced grant hint must
+				// both ride the one detail line; the pane/URL come from
+				// Backend.Enablement, not a cc-pool literal.
+				{"mount holder grant", false, "grant Network Volumes access — " + fuseGrantHint(pool.FuseBackend()) + " (cc-pool falls back to symlink automatically if the grant never lands)"},
 			},
 		},
 		"cached spawn failure fails": {
@@ -130,10 +132,10 @@ func TestReportHolder(t *testing.T) {
 // unmounted dirs, and symlink rows are silent.
 func TestReportCarcasses(t *testing.T) {
 	accts := []store.Account{
-		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(overlay.KindFuse)},    // carcass
-		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(overlay.KindFuse)},    // live
-		{ID: 3, ConfigDir: "/p/acct-03", OverlayKind: string(overlay.KindFuse)},    // unmounted
-		{ID: 4, ConfigDir: "/p/acct-04", OverlayKind: string(overlay.KindSymlink)}, // wrong kind
+		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendNFS)},     // carcass
+		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(fkoverlay.BackendNFS)},     // live
+		{ID: 3, ConfigDir: "/p/acct-03", OverlayKind: string(fkoverlay.BackendNFS)},     // unmounted
+		{ID: 4, ConfigDir: "/p/acct-04", OverlayKind: string(fkoverlay.BackendSymlink)}, // wrong kind
 	}
 	swapVar(t, &dirMounted, func(dir string) bool {
 		return dir != "/p/acct-03"
@@ -169,8 +171,8 @@ func TestReportCarcasses(t *testing.T) {
 func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 	const parkedDir, healthyDir = "/p/acct-01", "/p/acct-02"
 	accts := []store.Account{
-		{ID: 1, ConfigDir: parkedDir, OverlayKind: string(overlay.KindFuse)},
-		{ID: 2, ConfigDir: healthyDir, OverlayKind: string(overlay.KindFuse)},
+		{ID: 1, ConfigDir: parkedDir, OverlayKind: string(fkoverlay.BackendNFS)},
+		{ID: 2, ConfigDir: healthyDir, OverlayKind: string(fkoverlay.BackendNFS)},
 	}
 	const probeTimeout = 20 * time.Millisecond
 	var aliveProbes overlay.StatProbes[bool]
@@ -233,8 +235,8 @@ func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 // relaunch guidance.
 func TestReportWedges(t *testing.T) {
 	accts := []store.Account{
-		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(overlay.KindFuse)},
-		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(overlay.KindSymlink)},
+		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendNFS)},
+		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(fkoverlay.BackendSymlink)},
 	}
 	wedgeDetail := "wedged (serves metadata but hangs reads) — daemon will remount; relaunch its sessions"
 	cases := map[string]struct {
@@ -305,8 +307,8 @@ func TestReportWedges(t *testing.T) {
 // etime), a symlink row, and a session born after the mount all stay silent.
 func TestReportStaleSessions(t *testing.T) {
 	mounted := time.Date(2026, 6, 12, 13, 32, 1, 0, time.Local)
-	fuse := store.Account{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(overlay.KindFuse)}
-	sym := store.Account{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(overlay.KindSymlink)}
+	fuse := store.Account{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendNFS)}
+	sym := store.Account{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(fkoverlay.BackendSymlink)}
 	row := func(dir string, at time.Time) mountd.MountInfo {
 		mi := mountd.MountInfo{Dir: dir, Base: "/b", Live: true, Epoch: 2}
 		if !at.IsZero() {
@@ -380,10 +382,10 @@ func TestReportStaleSessions(t *testing.T) {
 // TestCountFuse pins the fuse-row counter both holder checks key on.
 func TestCountFuse(t *testing.T) {
 	accts := []store.Account{
-		{ID: 1, OverlayKind: string(overlay.KindFuse)},
-		{ID: 2, OverlayKind: string(overlay.KindSymlink)},
+		{ID: 1, OverlayKind: string(fkoverlay.BackendNFS)},
+		{ID: 2, OverlayKind: string(fkoverlay.BackendSymlink)},
 		{ID: 3, OverlayKind: ""}, // legacy rows default to symlink
-		{ID: 4, OverlayKind: string(overlay.KindFuse)},
+		{ID: 4, OverlayKind: string(fkoverlay.BackendNFS)},
 	}
 	if got := countFuse(accts); got != 2 {
 		t.Errorf("countFuse = %d, want 2", got)
@@ -414,7 +416,11 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 	}
 
 	dir := filepath.Join(home, "acct-01")
-	if err := (&overlay.SymlinkProvider{}).Setup(base, dir); err != nil {
+	symProv, err := pool.OverlayProviderFor(fkoverlay.BackendSymlink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := symProv.Setup(base, dir); err != nil {
 		t.Fatal(err)
 	}
 
@@ -422,7 +428,7 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 	// the account dir and the stranded backing root, with differing content.
 	// The newer backing copy must survive; the older in-dir copy is discarded
 	// and that discard must be reported.
-	priv := overlay.FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 	if err := os.MkdirAll(priv, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +485,7 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 	// The seam must be restored after the heal, never left pointed at this
 	// command's buffer: a later write through the seam must not reach out.
 	before := out.Len()
-	overlay.ResolvedConflictLogf("leak probe")
+	fkoverlay.ResolvedConflictLogf("leak probe")
 	if out.Len() != before {
 		t.Errorf("seam leaked past the heal: a write after checkStrandedPrivate still hit the doctor buffer")
 	}
@@ -492,14 +498,14 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 func TestDoctorSurfacesFuseFallback(t *testing.T) {
 	cases := map[string]struct {
 		acctKind    string
-		defaultKind overlay.Kind
+		defaultKind fkoverlay.Backend
 		canHostFuse bool
 		wantReport  bool
 	}{
-		"symlink account, fuse default, can host -> surfaced": {"symlink", overlay.KindFuse, true, true},
-		"symlink account, symlink default -> quiet":           {"symlink", overlay.KindSymlink, true, false},
-		"symlink account, fuse default, cannot host -> quiet": {"symlink", overlay.KindFuse, false, false},
-		"fuse account -> quiet":                               {"fuse", overlay.KindFuse, true, false},
+		"symlink account, fuse default, can host -> surfaced": {"symlink", fkoverlay.BackendNFS, true, true},
+		"symlink account, symlink default -> quiet":           {"symlink", fkoverlay.BackendSymlink, true, false},
+		"symlink account, fuse default, cannot host -> quiet": {"symlink", fkoverlay.BackendNFS, false, false},
+		"fuse account -> quiet":                               {"nfs", fkoverlay.BackendNFS, true, false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

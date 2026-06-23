@@ -14,7 +14,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
-	"github.com/yasyf/fusekit/mountd"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -153,7 +152,7 @@ func holderFooter(h *daemon.HolderStatus) string {
 	// and only asks for a doctor run; skew is cosmetic.
 	switch {
 	case h.TCCError != "":
-		return warnStyle.Render(`mount holder: TCC blocked — ` + h.TCCError + ` — open Settings: open "` + mountd.NetworkVolumesSettingsURL + `" (cc-pool falls back to symlink automatically if the grant never lands)`)
+		return warnStyle.Render("mount holder: grant needed — " + h.TCCError + " — " + fuseGrantHint(pool.FuseBackend()) + " (cc-pool falls back to symlink automatically if the grant never lands)")
 	case h.SpawnError != "":
 		return warnStyle.Render("mount holder: respawn failing — " + h.SpawnError)
 	case h.WedgedMounts > 0:

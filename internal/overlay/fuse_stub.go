@@ -7,8 +7,6 @@ import "github.com/yasyf/fusekit/mountd"
 // This file is compiled when the binary is built WITHOUT the fuse provider
 // (the default). The symlink provider is the only one available.
 
-const fuseBuilt = false
-
 // InProcessFuse returns the in-process fuse host, available only in fuse
 // builds — never in this one, so it reports (nil, false). The holder's
 // Server.Run refuses loudly on a nil Host.

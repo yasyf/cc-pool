@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/yasyf/cc-pool/internal/overlay"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // ErrNoIdentity means a .claude.json has no usable top-level "oauthAccount"
@@ -23,14 +23,14 @@ type Identity struct {
 
 // AccountIdentity returns a pool account's identity from its private
 // .claude.json, written by that account's own login. The private path is pure
-// path math off the recorded kind — no provider is resolved, because reading
+// path math off the recorded backend — no provider is resolved, because reading
 // the file must work whether or not a mount or holder is up: fuse keeps it in
-// the private backing dir beside the mountpoint, every other kind in the
+// the private backing dir beside the mountpoint, every other backend in the
 // account dir itself.
-func AccountIdentity(kind overlay.Kind, configDir string) (*Identity, error) {
+func AccountIdentity(backend fkoverlay.Backend, configDir string) (*Identity, error) {
 	priv := configDir
-	if kind == overlay.KindFuse {
-		priv = overlay.FusePrivateRoot(configDir)
+	if backend.IsFuse() {
+		priv = fkoverlay.FusePrivateRoot(configDir)
 	}
 	return readIdentity(filepath.Join(priv, ".claude.json"))
 }

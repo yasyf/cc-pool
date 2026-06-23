@@ -6,9 +6,9 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 type renameOptions struct {
@@ -93,7 +93,12 @@ func renameAuto(cmd *cobra.Command, m *pool.Manager, refs []string, force bool) 
 	}
 	out := cmd.OutOrStdout()
 	for _, a := range accts {
-		ident, err := pool.AccountIdentity(overlay.Kind(a.OverlayKind), a.ConfigDir)
+		backend, err := fkoverlay.Parse(a.OverlayKind)
+		if err != nil {
+			note(out, "acct-%02d: unparseable overlay backend; skipped", a.ID)
+			continue
+		}
+		ident, err := pool.AccountIdentity(backend, a.ConfigDir)
 		if err != nil {
 			note(out, "acct-%02d: no readable identity; skipped", a.ID)
 			continue

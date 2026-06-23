@@ -100,7 +100,7 @@ func MountHolderLogPath() string {
 
 // HolderBinDir is the stable, non-versioned directory under which the mount
 // holder binary is materialized as a copy (~/.cc-pool/bin), passed to fusekit
-// as mountd.Spawn.StableExecDir. macOS tccd keys the one-time "Network Volumes"
+// as mountd.Spawn.StableExecDir. macOS tccd keys the one-time volume-access
 // grant on the holder's resolved path, and Homebrew installs each version at a
 // new Cellar path; spawning from this fixed copy (whose embedded Developer-ID
 // requirement survives the byte copy) keeps the grant across versions instead

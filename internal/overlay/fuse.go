@@ -35,9 +35,8 @@ import (
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/fuset"
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
-
-const fuseBuilt = true
 
 // InProcessFuse returns the in-process fuse host that satisfies the mount
 // holder's narrow seam (mountd.Host: Setup/Teardown/State), available only in
@@ -65,7 +64,7 @@ func init() {
 }
 
 // Mount-up wait bounds, handed to fusekit via Config.Wait/FirstWait. The first
-// mount in a process gets longer: a genuine "Network Volumes" TCC denial fails
+// mount in a process gets longer: a genuine volume-access grant denial fails
 // fast regardless, while a slow but granted fuse-t deserves the extra patience
 // before fusekit surfaces the scary TCC walkthrough. 14s, not 15: the
 // holder-side OpMount budget is the liveWithin probe (<=2s) + this wait + a 3s
@@ -139,7 +138,7 @@ func buildMirrorConfig(base, dir string) fusekit.Config {
 	// The shared ~/.claude.json is a SIBLING of base (~/.claude), not inside it
 	// — the third path the mirror needs, for the merged /.claude.json read view
 	// and its shareable-key write-through.
-	priv := FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 	baseClaudeJSON := filepath.Join(filepath.Dir(base), ".claude.json")
 	fs := newMirrorFS(base, priv, baseClaudeJSON)
 	// Snapshot base's current top-level names before serving: those present as
@@ -171,17 +170,23 @@ func buildMirrorConfig(base, dir string) fusekit.Config {
 	}
 }
 
-// FuseProvider mounts a passthrough mirror of base at the account dir.
+// FuseProvider mounts a passthrough mirror of base at the account dir. It is
+// BOTH the mountd.Host the detached holder serves AND a fusekit/overlay.Provider
+// the in-process mirror and conversion tests drive directly. The cc-pool mirror
+// always serves synthetic content (the merged /.claude.json), never pure
+// passthrough, so its backend is always BackendNFS (PassthroughOnly=false).
 type FuseProvider struct{}
 
-// Kind reports the provider kind (KindFuse).
-func (p *FuseProvider) Kind() Kind { return KindFuse }
+// Backend reports the fuse backend cc-pool's mirror realizes — always NFS,
+// because the mirror serves synthetic content (the merged /.claude.json) and
+// fuse-t's FSKit backend does not honor the fi->fh read semantics that requires.
+func (p *FuseProvider) Backend() fkoverlay.Backend { return fkoverlay.BackendNFS }
 
 // PrivateRoot is the per-account backing dir beside the mountpoint. Private
 // files written there are visible through the mount (mirrorFS redirects
 // PrivateEntry names) and survive whether or not the mount is currently up.
 func (p *FuseProvider) PrivateRoot(accountDir string) string {
-	return FusePrivateRoot(accountDir)
+	return fkoverlay.FusePrivateRoot(accountDir)
 }
 
 // State reports the two kernel-truth halves of mirror liveness as a PAIR for
@@ -214,7 +219,7 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 	sweepAppleDoubleLitter(base)
 
 	// Private backing for excluded (instance-local) entries.
-	priv := FusePrivateRoot(accountDir)
+	priv := fkoverlay.FusePrivateRoot(accountDir)
 	for name := range ExcludedEntries {
 		_ = os.MkdirAll(filepath.Join(priv, name), 0o700)
 	}
@@ -302,6 +307,6 @@ func sweepAppleDoubleLitter(base string) {
 // HostProbe attempts a throwaway in-process probe mount; it must run in the
 // process that will host mounts (capability + TCC grant are per-process). It
 // delegates to fusekit, whose probe proves fuse-t works on this machine, trips
-// the one-time "Network Volumes" privacy grant, and sets fusekit's process-
+// the one-time macOS volume-access grant, and sets fusekit's process-
 // global mount-proven deduction the real mounts then read.
 func HostProbe() (bool, error) { return fusekit.HostProbe() }

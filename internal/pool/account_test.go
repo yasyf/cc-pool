@@ -11,8 +11,8 @@ import (
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/keychain"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 func openTestStore(t *testing.T) *store.Store {
@@ -28,7 +28,7 @@ func openTestStore(t *testing.T) *store.Store {
 // detectSymlink is the DetectOverlay injection for tests whose semantics are
 // provider-independent: a deterministic symlink verdict, so Init never probes
 // (or, in a fuse build, spawns) a mount holder.
-func detectSymlink() (overlay.Kind, string) { return overlay.KindSymlink, "" }
+func detectSymlink() (fkoverlay.Backend, string) { return fkoverlay.BackendSymlink, "" }
 
 func TestDuplicateIdentity(t *testing.T) {
 	st := openTestStore(t)
@@ -404,18 +404,18 @@ func TestConcurrentPrepareAddIndexRace(t *testing.T) {
 // stubOverlay is a minimal injectable provider for PrepareAdd's fuse-fallback
 // tests: a fuse-kind provider whose Setup can be forced to fail.
 type stubOverlay struct {
-	kind     overlay.Kind
+	backend  fkoverlay.Backend
 	setupErr error
 	setups   int
 }
 
-func (s *stubOverlay) Kind() overlay.Kind         { return s.kind }
+func (s *stubOverlay) Backend() fkoverlay.Backend { return s.backend }
 func (s *stubOverlay) Sync(_, _ string) error     { return nil }
 func (s *stubOverlay) Health(_, _ string) error   { return nil }
 func (s *stubOverlay) Teardown(_, _ string) error { return nil }
 func (s *stubOverlay) PrivateRoot(dir string) string {
-	if s.kind == overlay.KindFuse {
-		return overlay.FusePrivateRoot(dir)
+	if s.backend.IsFuse() {
+		return fkoverlay.FusePrivateRoot(dir)
 	}
 	return dir
 }
@@ -430,7 +430,7 @@ func (s *stubOverlay) Setup(_, dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.MkdirAll(overlay.FusePrivateRoot(dir), 0o700)
+	return os.MkdirAll(fkoverlay.FusePrivateRoot(dir), 0o700)
 }
 
 // TestPrepareAddFuseFallback pins the explicit fuse→symlink fallback: when the
@@ -439,7 +439,7 @@ func (s *stubOverlay) Setup(_, dir string) error {
 // and carries the reason for the CLI to print — never a silent substitution,
 // never a row promising a mirror the dir doesn't have.
 func TestPrepareAddFuseFallback(t *testing.T) {
-	setup := func(t *testing.T, fuse overlay.Provider) *Manager {
+	setup := func(t *testing.T, fuse fkoverlay.Provider) *Manager {
 		t.Helper()
 		t.Setenv("HOME", t.TempDir())
 		if err := os.MkdirAll(filepath.Join(ClaudeDir(), "projects"), 0o700); err != nil {
@@ -449,12 +449,12 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 			t.Fatal(err)
 		}
 		m := &Manager{Store: openTestStore(t), Keychain: newFakeKeychain()}
-		m.DetectOverlay = func() (overlay.Kind, string) { return overlay.KindFuse, "" }
-		m.OverlayFor = func(kind overlay.Kind) overlay.Provider {
-			if kind == overlay.KindFuse {
-				return fuse
+		m.DetectOverlay = func() (fkoverlay.Backend, string) { return FuseBackend(), "" }
+		m.OverlayFor = func(kind fkoverlay.Backend) (fkoverlay.Provider, error) {
+			if kind.IsFuse() {
+				return fuse, nil
 			}
-			return &overlay.SymlinkProvider{}
+			return newSymlinkProvider(), nil
 		}
 		if _, err := m.Init(); err != nil {
 			t.Fatal(err)
@@ -463,10 +463,10 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 	}
 
 	t.Run("fuse setup failure falls back to symlinks and says why", func(t *testing.T) {
-		m := setup(t, &stubOverlay{kind: overlay.KindFuse, setupErr: errors.New("mount holder did not start: boom")})
+		m := setup(t, &stubOverlay{backend: fkoverlay.BackendNFS, setupErr: errors.New("mount holder did not start: boom")})
 		// Simulate the holder getting as far as creating the backing dir
 		// before Setup failed: the fallback must not leave it behind.
-		if err := os.MkdirAll(overlay.FusePrivateRoot(AccountDir(1)), 0o700); err != nil {
+		if err := os.MkdirAll(fkoverlay.FusePrivateRoot(AccountDir(1)), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		pending, err := m.PrepareAdd()
@@ -476,7 +476,7 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		if pending.ConfigDir != AccountDir(1) {
 			t.Fatalf("ConfigDir = %q, want %q (the account whose backing dir was pre-created)", pending.ConfigDir, AccountDir(1))
 		}
-		if pending.OverlayKind != overlay.KindSymlink {
+		if pending.OverlayKind != fkoverlay.BackendSymlink {
 			t.Fatalf("OverlayKind = %q, want symlink (the overlay actually established)", pending.OverlayKind)
 		}
 		if pending.FallbackReason != "mount holder did not start: boom" {
@@ -493,12 +493,12 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(pending.ConfigDir, ".claude.json")); err != nil {
 			t.Fatalf("seed not in the account dir: %v", err)
 		}
-		if _, err := os.Lstat(filepath.Join(overlay.FusePrivateRoot(pending.ConfigDir), ".claude.json")); !os.IsNotExist(err) {
+		if _, err := os.Lstat(filepath.Join(fkoverlay.FusePrivateRoot(pending.ConfigDir), ".claude.json")); !os.IsNotExist(err) {
 			t.Fatal("seed leaked into the fuse private root despite the fallback")
 		}
 		// The empty backing dir the fuse attempt left behind was cleaned up —
 		// a symlink account must not accrete an inert acct-NN.private.
-		if _, err := os.Lstat(overlay.FusePrivateRoot(pending.ConfigDir)); !os.IsNotExist(err) {
+		if _, err := os.Lstat(fkoverlay.FusePrivateRoot(pending.ConfigDir)); !os.IsNotExist(err) {
 			t.Fatalf("empty fuse private root left behind after the fallback (lstat err = %v)", err)
 		}
 	})
@@ -506,12 +506,12 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 	t.Run("fuse and fallback both failing reports both causes", func(t *testing.T) {
 		fuseErr := errors.New("dir is a foreign mount carcass")
 		symErr := errors.New("refusing to lay symlinks in a live mountpoint")
-		m := setup(t, &stubOverlay{kind: overlay.KindFuse, setupErr: fuseErr})
-		m.OverlayFor = func(kind overlay.Kind) overlay.Provider {
-			if kind == overlay.KindFuse {
-				return &stubOverlay{kind: overlay.KindFuse, setupErr: fuseErr}
+		m := setup(t, &stubOverlay{backend: fkoverlay.BackendNFS, setupErr: fuseErr})
+		m.OverlayFor = func(kind fkoverlay.Backend) (fkoverlay.Provider, error) {
+			if kind.IsFuse() {
+				return &stubOverlay{backend: fkoverlay.BackendNFS, setupErr: fuseErr}, nil
 			}
-			return &stubOverlay{kind: overlay.KindSymlink, setupErr: symErr}
+			return &stubOverlay{backend: fkoverlay.BackendSymlink, setupErr: symErr}, nil
 		}
 		pending, err := m.PrepareAdd()
 		if pending != nil {
@@ -535,14 +535,14 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 	})
 
 	t.Run("fuse setup success keeps fuse and carries no reason", func(t *testing.T) {
-		stub := &stubOverlay{kind: overlay.KindFuse}
+		stub := &stubOverlay{backend: fkoverlay.BackendNFS}
 		m := setup(t, stub)
 		pending, err := m.PrepareAdd()
 		if err != nil {
 			t.Fatalf("PrepareAdd: %v", err)
 		}
-		if pending.OverlayKind != overlay.KindFuse {
-			t.Fatalf("OverlayKind = %q, want fuse", pending.OverlayKind)
+		if !pending.OverlayKind.IsFuse() {
+			t.Fatalf("OverlayKind = %q, want a fuse backend", pending.OverlayKind)
 		}
 		if pending.FallbackReason != "" {
 			t.Fatalf("FallbackReason = %q, want empty", pending.FallbackReason)
@@ -551,18 +551,18 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 			t.Fatalf("fuse setups = %d, want 1", stub.setups)
 		}
 		// The seed lands in the fuse private root, never through a mount.
-		if _, err := os.Stat(filepath.Join(overlay.FusePrivateRoot(pending.ConfigDir), ".claude.json")); err != nil {
+		if _, err := os.Stat(filepath.Join(fkoverlay.FusePrivateRoot(pending.ConfigDir), ".claude.json")); err != nil {
 			t.Fatalf("seed not in the private root: %v", err)
 		}
 	})
 
 	t.Run("a non-fuse setup failure stays fatal", func(t *testing.T) {
-		m := setup(t, &stubOverlay{kind: overlay.KindFuse})
-		if err := m.SetDefaultOverlayKind(overlay.KindSymlink); err != nil {
+		m := setup(t, &stubOverlay{backend: fkoverlay.BackendNFS})
+		if err := m.SetDefaultOverlayKind(fkoverlay.BackendSymlink); err != nil {
 			t.Fatal(err)
 		}
-		m.OverlayFor = func(overlay.Kind) overlay.Provider {
-			return &stubOverlay{kind: overlay.KindSymlink, setupErr: errors.New("disk full")}
+		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
+			return &stubOverlay{backend: fkoverlay.BackendSymlink, setupErr: errors.New("disk full")}, nil
 		}
 		_, err := m.PrepareAdd()
 		if err == nil || !strings.Contains(err.Error(), "disk full") {
@@ -591,7 +591,7 @@ func TestPrepareAddSurfacesDetectReason(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := &Manager{Store: openTestStore(t), Keychain: newFakeKeychain()}
-	m.DetectOverlay = func() (overlay.Kind, string) { return overlay.KindSymlink, reason }
+	m.DetectOverlay = func() (fkoverlay.Backend, string) { return fkoverlay.BackendSymlink, reason }
 	if err := m.Store.SetMeta(metaInitialized, "1"); err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +600,7 @@ func TestPrepareAddSurfacesDetectReason(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareAdd: %v", err)
 	}
-	if pending.OverlayKind != overlay.KindSymlink {
+	if pending.OverlayKind != fkoverlay.BackendSymlink {
 		t.Fatalf("OverlayKind = %q, want symlink", pending.OverlayKind)
 	}
 	if pending.FallbackReason != reason {
@@ -615,13 +615,13 @@ func TestInitSurfacesOverlayFallbackReason(t *testing.T) {
 	const reason = "probe mount declined (fuse-t missing or Network Volumes access denied)"
 	t.Setenv("HOME", t.TempDir())
 	m := &Manager{Store: openTestStore(t)}
-	m.DetectOverlay = func() (overlay.Kind, string) { return overlay.KindSymlink, reason }
+	m.DetectOverlay = func() (fkoverlay.Backend, string) { return fkoverlay.BackendSymlink, reason }
 
 	res, err := m.Init()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.OverlayKind != overlay.KindSymlink {
+	if res.OverlayKind != fkoverlay.BackendSymlink {
 		t.Fatalf("OverlayKind = %q, want symlink", res.OverlayKind)
 	}
 	if res.OverlayFallbackReason != reason {
@@ -629,7 +629,7 @@ func TestInitSurfacesOverlayFallbackReason(t *testing.T) {
 	}
 
 	// Re-init must not re-detect: the recorded kind wins and no reason leaks.
-	m.DetectOverlay = func() (overlay.Kind, string) {
+	m.DetectOverlay = func() (fkoverlay.Backend, string) {
 		t.Error("re-init re-ran detection")
 		return "", ""
 	}
@@ -637,7 +637,7 @@ func TestInitSurfacesOverlayFallbackReason(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res2.Already || res2.OverlayKind != overlay.KindSymlink || res2.OverlayFallbackReason != "" {
+	if !res2.Already || res2.OverlayKind != fkoverlay.BackendSymlink || res2.OverlayFallbackReason != "" {
 		t.Fatalf("re-init = %+v, want already/symlink/no reason", res2)
 	}
 }
@@ -647,12 +647,12 @@ func TestInitSurfacesOverlayFallbackReason(t *testing.T) {
 func TestInitFuseVerdictCarriesNoReason(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	m := &Manager{Store: openTestStore(t)}
-	m.DetectOverlay = func() (overlay.Kind, string) { return overlay.KindFuse, "" }
+	m.DetectOverlay = func() (fkoverlay.Backend, string) { return FuseBackend(), "" }
 	res, err := m.Init()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.OverlayKind != overlay.KindFuse || res.OverlayFallbackReason != "" {
+	if !res.OverlayKind.IsFuse() || res.OverlayFallbackReason != "" {
 		t.Fatalf("res = %+v, want fuse with no reason", res)
 	}
 }

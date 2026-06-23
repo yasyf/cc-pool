@@ -18,13 +18,13 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/mountd"
 	"github.com/yasyf/fusekit/version"
 )
 
-// tccHint is the copy-pasteable deep link holderFooter appends to a TCC-blocked
-// alert so users can jump to the Network Volumes pane.
-var tccHint = ` — open Settings: open "` + mountd.NetworkVolumesSettingsURL + `" (cc-pool falls back to symlink automatically if the grant never lands)`
+// tccHint is the fusekit-sourced grant hint holderFooter appends to a
+// grant-needed alert so users can jump to the backend's enablement pane. The
+// pane/URL come from Backend.Enablement (fuseGrantHint), never a cc-pool literal.
+var tccHint = " — " + fuseGrantHint(pool.FuseBackend()) + " (cc-pool falls back to symlink automatically if the grant never lands)"
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
@@ -609,7 +609,7 @@ func TestHolderFooter(t *testing.T) {
 		},
 		"TCC blocked carries the settings deep link": {
 			&daemon.HolderStatus{TCCError: "grant Network Volumes access"},
-			"mount holder: TCC blocked — grant Network Volumes access" + tccHint,
+			"mount holder: grant needed — grant Network Volumes access" + tccHint,
 		},
 		"respawn failing": {
 			&daemon.HolderStatus{SpawnError: "exec format error"},
@@ -617,7 +617,7 @@ func TestHolderFooter(t *testing.T) {
 		},
 		"TCC outranks spawn and skew": {
 			&daemon.HolderStatus{Skewed: true, TCCError: "tcc-msg", SpawnError: "spawn-msg"},
-			"mount holder: TCC blocked — tcc-msg" + tccHint,
+			"mount holder: grant needed — tcc-msg" + tccHint,
 		},
 		"spawn outranks skew": {
 			&daemon.HolderStatus{Version: "0.0.1-old", Skewed: true, SpawnError: "spawn-msg"},
@@ -658,7 +658,7 @@ func TestHolderFooterWedged(t *testing.T) {
 		},
 		"TCC outranks wedged": {
 			&daemon.HolderStatus{TCCError: "tcc-msg", WedgedMounts: 1},
-			"mount holder: TCC blocked — tcc-msg" + tccHint,
+			"mount holder: grant needed — tcc-msg" + tccHint,
 		},
 		"spawn outranks wedged": {
 			&daemon.HolderStatus{SpawnError: "spawn-msg", WedgedMounts: 1},

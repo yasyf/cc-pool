@@ -19,26 +19,26 @@ var (
 
 	// ErrMountNotLive means a fuse mount was issued but never came live in a
 	// process that has NOT yet hosted any live mount — on macOS almost always
-	// the one-time "Network Volumes" TCC grant. fusekit.Mount (which
+	// the one-time macOS volume-access grant. fusekit.Mount (which
 	// FuseProvider.Setup delegates to) wraps its mount-timeout error with it only
 	// while the grant is unproven; once any mount in the process has come live,
 	// timeouts wrap ErrMountTimeout instead.
 	ErrMountNotLive = fusekit.ErrMountNotLive
 
 	// ErrMountTimeout means a fuse mount timed out in a process that has
-	// ALREADY hosted a live mount, so the macOS "Network Volumes" TCC grant is
+	// ALREADY hosted a live mount, so the macOS volume-access grant is
 	// proven and this is transient fuse-t slowness — never the TCC condition.
 	// Callers retry; they must never convert the provider or surface TCC
 	// guidance for it. Honest gap: a grant revoked mid-process still reads as
 	// this — established NFS mounts survive revocation, there is no public TCC
-	// query API for Network Volumes, and attempting a mount is the only
+	// query API for the grant, and attempting a mount is the only
 	// observable — and a holder restart resets the deduction.
 	ErrMountTimeout = fusekit.ErrMountTimeout
 
 	// ErrMountFailed means a fuse mount was rejected outright — the holder's
 	// serving goroutine exited before the mount came live (fuse-t not installed
 	// or loadable, the kernel refusing the mount, a bad CGOFUSE_LIBFUSE_PATH).
-	// It is NEVER the "Network Volumes" TCC grant (a pending grant keeps the
+	// It is NEVER the macOS volume-access grant (a pending grant keeps the
 	// mount call blocked, surfacing as ErrMountNotLive), so the daemon must not
 	// retry it for the grant — it retreats the row to symlink instead.
 	ErrMountFailed = fusekit.ErrMountFailed

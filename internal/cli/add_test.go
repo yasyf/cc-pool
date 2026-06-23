@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/yasyf/cc-pool/internal/overlay"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 func TestDefaultLabel(t *testing.T) {
@@ -23,28 +23,28 @@ func TestDefaultLabel(t *testing.T) {
 
 	t.Run("explicit label wins over the account email", func(t *testing.T) {
 		dir := withIdentity(t, `{"accountUuid": "u-1", "emailAddress": "me@example.com"}`)
-		if got := defaultLabel("work", overlay.KindSymlink, dir); got != "work" {
+		if got := defaultLabel("work", fkoverlay.BackendSymlink, dir); got != "work" {
 			t.Errorf("defaultLabel = %q, want the explicit %q", got, "work")
 		}
 	})
 
 	t.Run("empty label prefills a name derived from an org email", func(t *testing.T) {
 		dir := withIdentity(t, `{"accountUuid": "u-1", "emailAddress": "me@example.com"}`)
-		if got := defaultLabel("", overlay.KindSymlink, dir); got != "Example" {
+		if got := defaultLabel("", fkoverlay.BackendSymlink, dir); got != "Example" {
 			t.Errorf("defaultLabel = %q, want %q", got, "Example")
 		}
 	})
 
 	t.Run("empty label prefills the local part of a consumer email", func(t *testing.T) {
 		dir := withIdentity(t, `{"accountUuid": "u-1", "emailAddress": "me@gmail.com"}`)
-		if got := defaultLabel("", overlay.KindSymlink, dir); got != "me" {
+		if got := defaultLabel("", fkoverlay.BackendSymlink, dir); got != "me" {
 			t.Errorf("defaultLabel = %q, want %q", got, "me")
 		}
 	})
 
 	t.Run("unreadable identity stays empty", func(t *testing.T) {
 		dir := withIdentity(t, "")
-		if got := defaultLabel("", overlay.KindSymlink, dir); got != "" {
+		if got := defaultLabel("", fkoverlay.BackendSymlink, dir); got != "" {
 			t.Errorf("defaultLabel = %q, want empty", got)
 		}
 	})

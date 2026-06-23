@@ -10,6 +10,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // Fixture values are compact inside (json.Marshal compacts RawMessage values),
@@ -39,7 +40,7 @@ const (
 )
 
 func TestMergeClaudeJSON(t *testing.T) {
-	prov := &overlay.SymlinkProvider{}
+	prov := newSymlinkProvider()
 
 	writeSrc := func(t *testing.T, content string) string {
 		t.Helper()
@@ -156,7 +157,7 @@ func TestMergeClaudeJSON(t *testing.T) {
 		if err := os.MkdirAll(acct, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		priv := overlay.FusePrivateRoot(acct)
+		priv := fkoverlay.FusePrivateRoot(acct)
 		if err := os.MkdirAll(priv, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -181,7 +182,7 @@ func TestMergeClaudeJSON(t *testing.T) {
 		if err := os.MkdirAll(acct, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		priv := overlay.FusePrivateRoot(acct)
+		priv := fkoverlay.FusePrivateRoot(acct)
 		if err := os.MkdirAll(priv, 0o000); err != nil {
 			t.Fatal(err)
 		}
@@ -379,7 +380,7 @@ func TestMergeBaseClaudeJSON(t *testing.T) {
 	symDir, fuseDir := filepath.Join(home, "acct-01"), filepath.Join(home, "acct-02")
 	for _, a := range []store.Account{
 		{ID: 1, ConfigDir: symDir, KeychainService: "svc", KeychainAccount: "u", OverlayKind: "symlink"},
-		{ID: 2, ConfigDir: fuseDir, KeychainService: "svc", KeychainAccount: "u", OverlayKind: "fuse"},
+		{ID: 2, ConfigDir: fuseDir, KeychainService: "svc", KeychainAccount: "u", OverlayKind: "nfs"},
 	} {
 		if err := st.UpsertAccount(a); err != nil {
 			t.Fatal(err)
@@ -392,10 +393,10 @@ func TestMergeBaseClaudeJSON(t *testing.T) {
 		}
 	}
 
-	var resolved []overlay.Kind
-	m := &Manager{Store: st, OverlayFor: func(kind overlay.Kind) overlay.Provider {
+	var resolved []fkoverlay.Backend
+	m := &Manager{Store: st, OverlayFor: func(kind fkoverlay.Backend) (fkoverlay.Provider, error) {
 		resolved = append(resolved, kind)
-		return &overlay.SymlinkProvider{}
+		return newSymlinkProvider(), nil
 	}}
 
 	fuseAcct, err := st.GetAccount(2)
@@ -424,7 +425,7 @@ func TestMergeBaseClaudeJSON(t *testing.T) {
 	if got := decode(t, readFile(t, filepath.Join(symDir, ".claude.json"))); got["theme"] != "light" {
 		t.Fatalf("base setting did not reach the symlink account: %v", got)
 	}
-	if len(resolved) != 1 || resolved[0] != overlay.KindSymlink {
+	if len(resolved) != 1 || resolved[0] != fkoverlay.BackendSymlink {
 		t.Fatalf("provider not resolved through the OverlayFor seam: %v", resolved)
 	}
 

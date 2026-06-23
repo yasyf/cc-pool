@@ -22,6 +22,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/proc"
 	"github.com/yasyf/fusekit/version"
 )
@@ -185,11 +186,11 @@ func Run(ctx context.Context) error {
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
 	}
-	// Make overlay's crash-repair conflict resolution observable: every
+	// Make fusekit/overlay's crash-repair conflict resolution observable: every
 	// private-file collision the migrate path reconciles (in the mount sweep,
 	// either convert direction, or a stranded-private heal) is logged here.
 	// Assigned once, before serve spawns any worker.
-	overlay.ResolvedConflictLogf = s.log.Printf
+	fkoverlay.ResolvedConflictLogf = s.log.Printf
 	return s.serve(ctx)
 }
 
@@ -463,7 +464,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		for _, sn := range snaps {
 			if sn.Account.ID == *req.Account {
 				if !s.mountReady(sn.Account) {
-					if sn.Account.OverlayKind == string(overlay.KindFuse) {
+					if fuseBackedRow(sn.Account.OverlayKind) {
 						return Response{OK: false, Error: fmt.Sprintf("acct-%02d's fuse mount is not up yet; retry shortly", sn.Account.ID)}
 					}
 					return Response{OK: false, Error: fmt.Sprintf("acct-%02d's dir is unexpectedly a mountpoint (wedged unmount?); see `ccp doctor` and the daemon log", sn.Account.ID)}
@@ -842,7 +843,7 @@ func (s *Server) endPoll(id int) {
 // whose private backing no longer holds the account's identity; lstat on a
 // plain dir is safe.
 func (s *Server) mountReady(a store.Account) bool {
-	if a.OverlayKind == string(overlay.KindFuse) {
+	if fuseBackedRow(a.OverlayKind) {
 		if !s.holder.ready(a.ConfigDir) {
 			s.holder.refreshIfStale(s.holderClient())
 		}
@@ -868,7 +869,7 @@ func (s *Server) mountReady(a store.Account) bool {
 // about to serve a NEW session has no live session a false positive could
 // orphan.
 func (s *Server) probeWinnerReady(a store.Account) bool {
-	if a.OverlayKind != string(overlay.KindFuse) {
+	if !fuseBackedRow(a.OverlayKind) {
 		return true
 	}
 	err := deepProbe(a.ConfigDir)
@@ -897,13 +898,36 @@ func (s *Server) scan(ctx context.Context) ([]procscan.Session, error) {
 	return procscan.Scan(ctx)
 }
 
-// overlayFor resolves a kind through the Manager's injectable seam (tests fake
-// the fuse provider); nil means pool.OverlayProviderFor.
-func (s *Server) overlayFor(kind overlay.Kind) overlay.Provider {
+// overlayFor resolves a backend through the Manager's injectable seam (tests
+// fake the fuse provider); nil means pool.OverlayProviderFor. A resolution
+// failure is logged and yields nil — callers already fence on a wrong-backend
+// (or here, nil) provider, refusing to mount through it.
+func (s *Server) overlayFor(backend fkoverlay.Backend) fkoverlay.Provider {
+	resolve := pool.OverlayProviderFor
 	if s.m.OverlayFor != nil {
-		return s.m.OverlayFor(kind)
+		resolve = s.m.OverlayFor
 	}
-	return pool.OverlayProviderFor(kind)
+	prov, err := resolve(backend)
+	if err != nil {
+		s.log.Printf("resolve overlay provider for backend %q: %v", backend, err)
+		return nil
+	}
+	return prov
+}
+
+// fuseBackedRow reports whether a stored overlay_kind names a fuse backend,
+// failing loud on an unparseable value (the schema only ever writes a valid
+// Backend string). The daemon's hot paths check IsFuse on the stored string
+// constantly; this is the one place that parse lives.
+func fuseBackedRow(overlayKind string) bool {
+	b, err := fkoverlay.Parse(overlayKind)
+	if err != nil {
+		// A row's overlay_kind is written only by cc-pool (always a valid
+		// Backend); an unparseable value is corruption. Treat it as non-fuse so
+		// the dir is handled by the safe symlink path rather than mounted over.
+		return false
+	}
+	return b.IsFuse()
 }
 
 // reservedCount returns the number of live reservations for an account.
@@ -1068,7 +1092,7 @@ func (s *Server) fuseHardUnavailable() string {
 func (s *Server) retreatPoolToSymlink(ctx context.Context, accts []store.Account, reason string) {
 	fuse := make([]store.Account, 0, len(accts))
 	for _, a := range accts {
-		if a.OverlayKind == string(overlay.KindFuse) {
+		if fuseBackedRow(a.OverlayKind) {
 			fuse = append(fuse, a)
 		}
 	}
@@ -1078,7 +1102,7 @@ func (s *Server) retreatPoolToSymlink(ctx context.Context, accts []store.Account
 	s.log.Printf("fuse is unavailable on this machine (%s); retreating %d fuse account(s) to symlink and defaulting new accounts to symlink — see %s",
 		reason, len(fuse), pool.MountHolderLogPath())
 	s.retreatAllFuseRows(ctx, fuse, "fuse-t cannot mount on this machine")
-	if err := s.m.SetDefaultOverlayKind(overlay.KindSymlink); err != nil {
+	if err := s.m.SetDefaultOverlayKind(fkoverlay.BackendSymlink); err != nil {
 		s.log.Printf("capability retreat: record symlink as the new-account default: %v", err)
 	}
 }
@@ -1086,10 +1110,9 @@ func (s *Server) retreatPoolToSymlink(ctx context.Context, accts []store.Account
 // reconcileAccount brings one account's on-disk overlay in line with its row.
 // Caller holds the poll claim.
 func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
-	switch overlay.Kind(a.OverlayKind) {
-	case overlay.KindFuse:
-		prov := s.overlayFor(overlay.KindFuse)
-		if prov.Kind() == overlay.KindFuse && prov.Health(pool.ClaudeDir(), a.ConfigDir) == nil {
+	if fuseBackedRow(a.OverlayKind) {
+		prov := s.overlayFor(pool.FuseBackend())
+		if prov != nil && prov.Backend().IsFuse() && prov.Health(pool.ClaudeDir(), a.ConfigDir) == nil {
 			// The detached holder kept the mirror live across the daemon
 			// restart — the common case. Adopt it untouched, and vouch for it
 			// in the cache directly: a live mirror implies the holder serving
@@ -1100,38 +1123,38 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 			return
 		}
 		s.healFuse(ctx, a)
-	default:
-		// A live mountpoint under a FUSE row is normal at startup (the
-		// detached holder survived the daemon restart) — but under a NON-fuse
-		// row it is wreckage: an aborted rollback's wedged unmount, or a
-		// conversion that died before its row flip, serving a mirror whose
-		// private backing no longer holds the account's identity. It blocks
-		// every symlink repair (they refuse mountpoints); force it down first.
-		if overlayMounted(a.ConfigDir) {
-			prov := s.overlayFor(overlay.KindFuse)
-			if prov.Kind() != overlay.KindFuse {
-				// Only a wrong-kind injected fake can land here; the real
-				// resolver always yields a fuse provider.
-				s.log.Printf("acct-%02d: dir is a stale mountpoint but the resolved provider reports kind %q; skipping", a.ID, prov.Kind())
-				return
-			}
-			if err := prov.Teardown(pool.ClaudeDir(), a.ConfigDir); err != nil {
-				s.log.Printf("acct-%02d: unmount stale mountpoint: %v", a.ID, err)
-				return
-			}
-			s.log.Printf("acct-%02d: cleared a stale mountpoint", a.ID)
-		}
-		// A symlink account can carry private files stranded in a fuse
-		// backing dir by a conversion (or pre-fix fallback) that died
-		// midway — restore them before anything launches on the account.
-		healed, err := s.m.HealStrandedPrivate(a)
-		if err != nil {
-			s.log.Printf("acct-%02d heal stranded private files: %v", a.ID, err)
+		return
+	}
+	// A live mountpoint under a FUSE row is normal at startup (the
+	// detached holder survived the daemon restart) — but under a NON-fuse
+	// row it is wreckage: an aborted rollback's wedged unmount, or a
+	// conversion that died before its row flip, serving a mirror whose
+	// private backing no longer holds the account's identity. It blocks
+	// every symlink repair (they refuse mountpoints); force it down first.
+	if overlayMounted(a.ConfigDir) {
+		prov := s.overlayFor(pool.FuseBackend())
+		if prov == nil || !prov.Backend().IsFuse() {
+			// Only a wrong-backend injected fake (or a nil resolution) can land
+			// here; the real resolver always yields a fuse provider.
+			s.log.Printf("acct-%02d: dir is a stale mountpoint but no fuse provider resolved; skipping", a.ID)
 			return
 		}
-		if healed {
-			s.log.Printf("acct-%02d restored private files stranded by an interrupted migration", a.ID)
+		if err := prov.Teardown(pool.ClaudeDir(), a.ConfigDir); err != nil {
+			s.log.Printf("acct-%02d: unmount stale mountpoint: %v", a.ID, err)
+			return
 		}
+		s.log.Printf("acct-%02d: cleared a stale mountpoint", a.ID)
+	}
+	// A symlink account can carry private files stranded in a fuse
+	// backing dir by a conversion (or pre-fix fallback) that died
+	// midway — restore them before anything launches on the account.
+	healed, err := s.m.HealStrandedPrivate(a)
+	if err != nil {
+		s.log.Printf("acct-%02d heal stranded private files: %v", a.ID, err)
+		return
+	}
+	if healed {
+		s.log.Printf("acct-%02d restored private files stranded by an interrupted migration", a.ID)
 	}
 }
 
@@ -1158,10 +1181,10 @@ var errSweepStranded = errors.New("sweep stranded private files")
 // healFuse establishes a fuse account's mirror, classifying failures instead
 // of blindly converting: transient holder conditions (holder unreachable, the
 // dir busy, a wedged unmount in the way, a mount-up timeout under a proven
-// "Network Volumes" grant, an error class only a newer holder understands, or a
+// macOS volume-access grant, an error class only a newer holder understands, or a
 // failure sweeping stranded private files before Setup is even attempted — none
 // is a mount verdict) and a
-// mount blocked pending the macOS "Network Volumes" TCC grant all retry next
+// mount blocked pending the macOS volume-access grant all retry next
 // poll, and only a genuine mount failure falls back to symlink — itself gated
 // on the account being idle (see fallbackToSymlink). Used by the startup
 // reconcile, the scheduler's per-poll self-heal, and the holder supervisor;
@@ -1195,7 +1218,7 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 		s.log.Printf("acct-%02d mount failed with an error class this daemon does not recognize (newer holder; upgrade the daemon), retrying next poll: %v", a.ID, err)
 		return healRetry
 	case errors.Is(err, overlay.ErrMountTimeout):
-		// The mount timed out in a holder whose "Network Volumes" grant is
+		// The mount timed out in a holder whose macOS volume-access grant is
 		// already proven by an earlier live mount — transient fuse-t slowness,
 		// never the TCC condition. No recordTCC, no scary guidance.
 		s.log.Printf("acct-%02d fuse mount did not come up within the mount wait; retrying: %v", a.ID, err)
@@ -1211,7 +1234,7 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 		return healFallback
 	case errors.Is(err, overlay.ErrMountNotLive):
 		s.holder.recordTCC(err.Error())
-		s.log.Printf("acct-%02d fuse mount blocked pending the macOS \"Network Volumes\" grant, retrying next poll: %v", a.ID, err)
+		s.log.Printf("acct-%02d fuse mount blocked pending the macOS volume-access grant, retrying next poll: %v", a.ID, err)
 		return healTCCBlocked
 	case errors.Is(err, errSweepStranded):
 		// The sweep of stranded private files failed BEFORE Setup was attempted,
@@ -1243,9 +1266,9 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 // one. The Kind fence guards against wrong-kind injected fakes — the real
 // resolver always yields a fuse provider.
 func (s *Server) mountFuse(a store.Account) error {
-	prov := s.overlayFor(overlay.KindFuse)
-	if prov.Kind() != overlay.KindFuse {
-		return fmt.Errorf("provider resolved for fuse reports kind %q; refusing to mount through it", prov.Kind())
+	prov := s.overlayFor(pool.FuseBackend())
+	if prov == nil || !prov.Backend().IsFuse() {
+		return fmt.Errorf("no fuse provider resolved for acct-%02d; refusing to mount through it", a.ID)
 	}
 	base, dir := pool.ClaudeDir(), a.ConfigDir
 	// A dead mount comes down first — never mount through one. Health is
@@ -1279,13 +1302,14 @@ func (s *Server) mountFuse(a store.Account) error {
 // sweepAndMount is one sweep+Setup attempt for mountFuse: with no mount in
 // the way, private files stranded in the underlay are swept into the backing
 // dir, then the provider mounts.
-func (s *Server) sweepAndMount(prov overlay.Provider, a store.Account, base, dir string) error {
+func (s *Server) sweepAndMount(prov fkoverlay.Provider, a store.Account, base, dir string) error {
 	if !overlayMounted(dir) {
-		switch has, err := overlay.HasPrivateEntries(dir); {
+		spec := s.m.OverlaySpec()
+		switch has, err := fkoverlay.HasPrivateEntries(dir, spec); {
 		case err != nil:
 			return fmt.Errorf("%w: check underlay: %w", errSweepStranded, err)
 		case has:
-			if err := overlay.MovePrivateEntries(dir, overlay.FusePrivateRoot(dir)); err != nil {
+			if err := fkoverlay.MovePrivateEntries(dir, fkoverlay.FusePrivateRoot(dir), spec); err != nil {
 				return fmt.Errorf("%w: move into backing dir: %w", errSweepStranded, err)
 			}
 			s.log.Printf("acct-%02d swept private files from the mount underlay into the backing dir", a.ID)
@@ -1323,7 +1347,7 @@ func (s *Server) fallbackToSymlink(ctx context.Context, a store.Account) {
 		s.log.Printf("acct-%02d deferring fuse→symlink fallback: %d live session(s)", a.ID, n)
 		return
 	}
-	if _, err := s.m.ConvertOverlay(a, overlay.KindSymlink); err != nil {
+	if _, err := s.m.ConvertOverlay(a, fkoverlay.BackendSymlink); err != nil {
 		s.log.Printf("acct-%02d symlink fallback: %v", a.ID, err)
 		return
 	}

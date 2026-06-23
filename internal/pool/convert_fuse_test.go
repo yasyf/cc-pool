@@ -9,17 +9,18 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// inProcessFuseSeam routes the fuse kind to THIS process's in-process
+// inProcessFuseSeam routes a fuse backend to THIS process's in-process
 // provider: these tests host their mounts themselves. The real resolver would
-// hand back the holder-backed RemoteProvider, whose plumbing is pinned in
-// internal/mountd.
-func inProcessFuseSeam(kind overlay.Kind) overlay.Provider {
-	if kind == overlay.KindFuse {
-		return &overlay.FuseProvider{}
+// hand back the holder-backed RemoteFuseProvider, whose plumbing is pinned in
+// fusekit/mountd.
+func inProcessFuseSeam(backend fkoverlay.Backend) (fkoverlay.Provider, error) {
+	if backend.IsFuse() {
+		return &overlay.FuseProvider{}, nil
 	}
-	return &overlay.SymlinkProvider{}
+	return newSymlinkProvider(), nil
 }
 
 // TestFuseConvertRoundTrip runs the production symlink→fuse→symlink conversion
@@ -48,7 +49,7 @@ func TestFuseConvertRoundTrip(t *testing.T) {
 	}
 
 	dir := filepath.Join(home, "acct-01")
-	if err := (&overlay.SymlinkProvider{}).Setup(base, dir); err != nil {
+	if err := newSymlinkProvider().Setup(base, dir); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(identityJSON), 0o600); err != nil {
@@ -68,16 +69,16 @@ func TestFuseConvertRoundTrip(t *testing.T) {
 	}
 	m := &Manager{Store: st, OverlayFor: inProcessFuseSeam}
 
-	fused, err := m.ConvertOverlay(a, overlay.KindFuse)
+	fused, err := m.ConvertOverlay(a, FuseBackend())
 	if err != nil {
 		t.Fatalf("convert to fuse: %v", err)
 	}
 	t.Cleanup(func() { _ = (&overlay.FuseProvider{}).Teardown(base, dir) })
-	if fused.OverlayKind != "fuse" {
+	if fused.OverlayKind != "nfs" {
 		t.Fatalf("row = %s, want fuse", fused.OverlayKind)
 	}
 
-	priv := overlay.FusePrivateRoot(dir)
+	priv := fkoverlay.FusePrivateRoot(dir)
 	// Identity readable THROUGH the live mount, physically homed in .private.
 	if got, err := os.ReadFile(filepath.Join(dir, ".claude.json")); err != nil || string(got) != identityJSON { //nolint:gosec // G304: path is under the test's own t.TempDir(), not external input
 		t.Fatalf("identity through mount = %q err=%v", got, err)
@@ -117,7 +118,7 @@ func TestFuseConvertRoundTrip(t *testing.T) {
 	}
 
 	// Reverse — the rollout's rollback command.
-	back, err := m.ConvertOverlay(fused, overlay.KindSymlink)
+	back, err := m.ConvertOverlay(fused, fkoverlay.BackendSymlink)
 	if err != nil {
 		t.Fatalf("convert back to symlink: %v", err)
 	}
@@ -172,7 +173,7 @@ func TestFuseConvertIdentityVerifiedAgainstForeignBase(t *testing.T) {
 	}
 
 	dir := filepath.Join(home, "acct-01")
-	if err := (&overlay.SymlinkProvider{}).Setup(base, dir); err != nil {
+	if err := newSymlinkProvider().Setup(base, dir); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(identityJSON), 0o600); err != nil {
@@ -186,12 +187,12 @@ func TestFuseConvertIdentityVerifiedAgainstForeignBase(t *testing.T) {
 	}
 	m := &Manager{Store: st, OverlayFor: inProcessFuseSeam}
 
-	fused, err := m.ConvertOverlay(a, overlay.KindFuse)
+	fused, err := m.ConvertOverlay(a, FuseBackend())
 	if err != nil {
 		t.Fatalf("convert to fuse with a foreign base identity: %v", err)
 	}
 	t.Cleanup(func() { _ = (&overlay.FuseProvider{}).Teardown(base, dir) })
-	if fused.OverlayKind != "fuse" {
+	if fused.OverlayKind != "nfs" {
 		t.Fatalf("row = %s, want fuse", fused.OverlayKind)
 	}
 
@@ -212,7 +213,7 @@ func TestFuseConvertIdentityVerifiedAgainstForeignBase(t *testing.T) {
 	}
 	// Neither side was rewritten: a conversion is not a commit, so the private
 	// file keeps the identity verbatim and the base sibling keeps its own.
-	if gotPriv := readFileT(t, filepath.Join(overlay.FusePrivateRoot(dir), ".claude.json")); gotPriv != identityJSON {
+	if gotPriv := readFileT(t, filepath.Join(fkoverlay.FusePrivateRoot(dir), ".claude.json")); gotPriv != identityJSON {
 		t.Fatalf("private file = %q, want the untouched identity", gotPriv)
 	}
 	if gotBase := readFileT(t, filepath.Join(home, ".claude.json")); gotBase != foreignBase {

@@ -89,7 +89,7 @@ type HolderStatus struct {
 	// Skewed means a reachable holder runs a different build than the daemon.
 	Skewed bool `json:"skewed"`
 	// TCCError carries the latest mount-blocked-pending-TCC guidance (the
-	// macOS "Network Volumes" grant walkthrough); "" when no mount is blocked.
+	// macOS volume-access grant walkthrough); "" when no mount is blocked.
 	TCCError string `json:"tcc_error,omitempty"`
 	// SpawnError is the daemon's latest failed attempt to spawn a mount
 	// holder; "" when the last spawn succeeded or none was needed. Additive.

@@ -7,9 +7,10 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // addOptions carries `ccp add`'s flags; bare `ccp` reuses the flow with the
@@ -178,26 +179,31 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	return acct, nil
 }
 
-// noteFuseFirstMount warns about macOS's one-time "Network Volumes" prompt the
-// account's first fuse mount triggers. It fires only on a fuse build hosting a
-// fuse account — a symlink overlay never mounts, so it never prompts. Migrate
-// already says this in its own flow, so this covers the add/init path only.
-func noteFuseFirstMount(out io.Writer, kind overlay.Kind) {
-	if !overlay.FuseBuilt() || kind != overlay.KindFuse {
+// noteFuseFirstMount warns about macOS's one-time volume-access grant prompt the
+// account's first fuse mount triggers. The pane name is sourced from the
+// backend's Enablement, never a cc-pool literal. It fires only on a fuse build
+// hosting a fuse account — a symlink overlay never mounts, so it never prompts.
+// Migrate already says this in its own flow, so this covers the add/init path only.
+func noteFuseFirstMount(out io.Writer, backend fkoverlay.Backend) {
+	if !fusekit.Built() || !backend.IsFuse() {
 		return
 	}
-	note(out, `macOS will show a one-time "Network Volumes" prompt for cc-pool — click Allow.`)
+	en := backend.Enablement()
+	if !en.Needed {
+		return
+	}
+	note(out, "macOS will show a one-time grant prompt for cc-pool (%s) — click Allow.", en.Pane)
 }
 
 // defaultLabel resolves a new account's label: an explicit --label wins;
 // otherwise a friendly name derived from the account's logged-in email when
 // readable, else empty (the prefill is decorative — identity-read failures
 // stay silent).
-func defaultLabel(explicit string, kind overlay.Kind, configDir string) string {
+func defaultLabel(explicit string, backend fkoverlay.Backend, configDir string) string {
 	if explicit != "" {
 		return explicit
 	}
-	id, err := pool.AccountIdentity(kind, configDir)
+	id, err := pool.AccountIdentity(backend, configDir)
 	if err != nil {
 		return ""
 	}

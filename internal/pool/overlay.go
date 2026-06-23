@@ -1,71 +1,87 @@
 package pool
 
 import (
-	"errors"
-	"fmt"
+	"context"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// OverlayProviderFor returns the provider for a stored overlay kind. It is
-// the pool's one resolver and never silently substitutes kinds: KindFuse maps
-// to the mount-holder-backed remoteFuse adapter (which always reports KindFuse,
-// even in a build that could not host the mounts itself); everything else
-// maps to the symlink provider.
-func OverlayProviderFor(kind overlay.Kind) overlay.Provider {
-	if kind == overlay.KindFuse {
-		return newRemoteFuse()
+// overlaySpec builds the fusekit/overlay Spec from cc-pool's classification and
+// holder wiring: the per-account-private / excluded / shared / skipped entry
+// sets (cc-pool POLICY, owned by internal/overlay), plus the detached
+// mount-holder seam. PassthroughOnly is false because cc-pool's mirror serves
+// synthetic content (the merged /.claude.json), so FuseBackend always lands on
+// fuse-t's NFS backend. Every fusekit/overlay entry point (ProviderFor, Select,
+// the migration primitives) takes this Spec.
+func overlaySpec() fkoverlay.Spec {
+	return fkoverlay.Spec{
+		IsPrivate:       overlay.PrivateEntry,
+		Excluded:        overlay.ExcludedEntries,
+		Shared:          overlay.SharedEntries,
+		Skip:            overlay.SkipEntries,
+		PassthroughOnly: false,
+		Holder: &fkoverlay.HolderSpec{
+			Socket:         MountsSocketPath(),
+			LogPath:        MountHolderLogPath(),
+			Args:           []string{"mount-holder", "--socket", MountsSocketPath()},
+			CannotHostHint: cannotHostHint,
+			StableExecDir:  HolderBinDir(),
+			// No Version: cc-pool drives holder version-skew convergence through the
+			// fusekit/proc Supervisor (the daemon's holder supervision, fed
+			// MyVersion at daemon startup), NOT through mountd.RemoteHost.Converge —
+			// which cc-pool never calls. RemoteHost reads Version only in Converge,
+			// so setting it here would be inert at best and a double-converge footgun
+			// if that path were ever invoked alongside the proc Supervisor's.
+			SpawnTimeout: mountd.DefaultSpawnTimeout,
+		},
 	}
-	return &overlay.SymlinkProvider{}
 }
+
+// overlaySpec is the package-level spec builder; the Manager method delegates to
+// it so seams and tests share one definition.
+func (m *Manager) overlaySpec() fkoverlay.Spec { return overlaySpec() }
+
+// OverlaySpec exposes cc-pool's fusekit/overlay Spec to other packages (the
+// daemon's mount-sweep path) that drive the migration primitives directly.
+func (m *Manager) OverlaySpec() fkoverlay.Spec { return overlaySpec() }
+
+// OverlayProviderFor returns the fusekit/overlay provider for a stored backend,
+// wired with cc-pool's Spec. It never silently substitutes backends: a fuse
+// backend maps to the holder-backed RemoteFuseProvider (which always reports its
+// own backend, even in a build that could not host the mounts itself); symlink
+// maps to the symlink provider. A bad stored backend fails loud.
+func OverlayProviderFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
+	return fkoverlay.ProviderFor(b, overlaySpec())
+}
+
+// FuseBackend is the fuse backend cc-pool realizes for its mirror — fusekit
+// derives it from the Spec (PassthroughOnly=false → always NFS). Callers that
+// need "the fuse provider" without a stored row (the daemon's mount/heal paths,
+// the `ccp migrate --to fuse` mapping) resolve through this rather than naming a
+// concrete backend, so cc-pool never branches nfs-vs-fskit itself.
+func FuseBackend() fkoverlay.Backend { return fkoverlay.FuseBackend(overlaySpec()) }
 
 // CanHostFuse reports whether THIS binary can host fuse mounts (built with
 // -tags fuse). A running holder spawned from a fuse build is usable by any
 // build regardless.
-func CanHostFuse() bool { return overlay.FuseBuilt() }
+func CanHostFuse() bool { return fusekit.Built() }
 
-// DetectOverlayKind chooses the overlay kind for this machine: fuse when this
-// build can host fuse mounts (CanHostFuse), a mount holder is reachable
-// (auto-spawned), and the holder's probe mount succeeds; else symlink. A build
-// that cannot host mounts gets the symlink verdict without probing — even a
-// reachable leftover holder is deliberately not adopted, because the recorded
-// default must survive that holder's death, the same policy
-// SetDefaultOverlayKind enforces. The probe MUST run in the holder, not here —
-// mount capability and the macOS "Network Volumes" TCC grant are per-process,
-// and the holder is the process that will host the mounts. A symlink verdict
-// carries a human-readable reason saying why fuse was ruled out; a fuse
-// verdict carries "".
+// DetectOverlayBackend chooses the overlay backend for this machine via
+// fusekit/overlay's Select: a fuse backend when this build can host fuse mounts,
+// a mount holder is reachable (auto-spawned), and the holder's probe mount
+// succeeds; else symlink. The probe runs in the holder, not here — mount
+// capability and the macOS grant are per-process. A symlink verdict carries a
+// generic human-readable reason from fusekit (no cc-pool CLI verbs); callers
+// append their own `ccp ...` hints at the edge.
 //
 // A holder spawned here lingers after a symlink verdict: it keeps serving the
 // socket with zero mounts (supervision never retires a same-version idle
-// holder; `ccp doctor` flags it as an orphan and `ccp service uninstall`
-// stops it), and a later fuse Setup reuses it.
-func DetectOverlayKind() (overlay.Kind, string) {
-	if !CanHostFuse() {
-		return overlay.KindSymlink, "this build cannot host fuse mounts; run `ccp fuse enable`"
-	}
-	if err := SpawnHolder(MountsSocketPath(), MountHolderLogPath(), mountd.DefaultSpawnTimeout); err != nil {
-		return overlay.KindSymlink, fmt.Sprintf("mount holder did not start: %v", err)
-	}
-	ok, err := mountd.NewClient(MountsSocketPath()).Probe()
-	switch {
-	case errors.Is(err, mountd.ErrMountFailed):
-		// A hard mount(2) rejection: fuse-t cannot mount on this machine
-		// (missing/unloadable, or the kernel refusing it). NEVER the TCC grant —
-		// do not send the user chasing a Network Volumes toggle that will not
-		// help. The real cause is in the mount-holder log.
-		return overlay.KindSymlink, fmt.Sprintf("fuse-t cannot mount on this machine (%v); using symlinks — run `ccp fuse enable` to (re)install fuse-t and switch back to the live mirror", err)
-	case errors.Is(err, mountd.ErrTCCDenied):
-		// The probe is blocked PENDING the one-time macOS "Network Volumes"
-		// grant — a prompt should have appeared. If one did, grant it and
-		// re-promote; if none did, the mount is failing for another reason and
-		// symlinks are the right call anyway.
-		return overlay.KindSymlink, fmt.Sprintf("the macOS \"Network Volumes\" grant is not in place (%v); using symlinks — grant it in System Settings ▸ Privacy & Security if prompted, then `ccp migrate --to fuse`", err)
-	case err != nil:
-		return overlay.KindSymlink, fmt.Sprintf("mount holder probe failed: %v", err)
-	case !ok:
-		return overlay.KindSymlink, "probe mount declined — run `ccp fuse enable`"
-	}
-	return overlay.KindFuse, ""
+// holder; `ccp doctor` flags it as an orphan and `ccp service uninstall` stops
+// it), and a later fuse Setup reuses it.
+func DetectOverlayBackend() (fkoverlay.Backend, string) {
+	_, backend, reason, _ := fkoverlay.Select(context.Background(), overlaySpec())
+	return backend, reason
 }

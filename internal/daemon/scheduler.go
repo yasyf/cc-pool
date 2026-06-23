@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/oauth"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -162,7 +161,7 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 		// restart. healFuse classifies: transient holder conditions and a
 		// pending TCC grant retry next poll; only a genuine mount failure
 		// falls back to symlink, and only when the account is idle.
-		if a.OverlayKind == string(overlay.KindFuse) {
+		if fuseBackedRow(a.OverlayKind) {
 			s.healFuse(ctx, a)
 		}
 	}

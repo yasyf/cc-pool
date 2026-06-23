@@ -7,12 +7,12 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/yasyf/cc-pool/internal/overlay"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // privateRootProvider stubs a fuse-shaped provider: private files live in a
 // sibling backing dir, not the account dir. Only PrivateRoot matters here.
-type privateRootProvider struct{ overlay.SymlinkProvider }
+type privateRootProvider struct{ fkoverlay.SymlinkProvider }
 
 func (*privateRootProvider) PrivateRoot(accountDir string) string { return accountDir + ".private" }
 
@@ -36,7 +36,7 @@ func decode(t *testing.T, b []byte) map[string]any {
 }
 
 func TestSeedClaudeJSON(t *testing.T) {
-	prov := &overlay.SymlinkProvider{}
+	prov := newSymlinkProvider()
 
 	writeSrc := func(t *testing.T, content string) string {
 		t.Helper()
