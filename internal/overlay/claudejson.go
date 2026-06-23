@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+
+	"github.com/yasyf/fusekit/state"
 )
 
 // OAuthAccountKey is the top-level .claude.json key holding an account's
@@ -283,26 +283,8 @@ func normalizeValue(v json.RawMessage) (json.RawMessage, error) {
 
 // WriteAtomic0600 writes data to dst via temp+rename in dst's directory, so a
 // concurrent reader never sees a partial file. Creates the directory if
-// missing.
+// missing. Thin 0600 wrapper over fusekit/state.AtomicWrite — the one place the
+// temp+rename mirror lives now.
 func WriteAtomic0600(dst string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp.*")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(tmp.Name()) }() // no-op after a successful rename
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), dst)
+	return state.AtomicWrite(dst, data, 0o600)
 }

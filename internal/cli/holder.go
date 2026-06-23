@@ -4,8 +4,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/mountd"
+	"github.com/yasyf/fusekit/version"
 )
 
 // newMountHolderCmd is the hidden entry point for the detached mount-holder

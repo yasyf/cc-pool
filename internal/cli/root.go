@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/version"
 )
 
 // NewRootCmd builds the root command and attaches all subcommands.

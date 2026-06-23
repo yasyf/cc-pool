@@ -17,8 +17,8 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/fusekit/version"
 )
 
 // fakeDaemon is a minimal stand-in for a running daemon holding the socket: it

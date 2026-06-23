@@ -21,9 +21,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/mountd"
 	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/fusekit/version"
 )
 
 // reservationTTL is how long a select-reservation suppresses re-picking the

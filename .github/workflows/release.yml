@@ -77,7 +77,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           COMMIT="$(git rev-parse --short HEAD)"
-          LDFLAGS="-s -w -X github.com/yasyf/cc-pool/internal/version.Version=${VERSION} -X github.com/yasyf/cc-pool/internal/version.Commit=${COMMIT}"
+          LDFLAGS="-s -w -X github.com/yasyf/fusekit/version.Version=${VERSION} -X github.com/yasyf/fusekit/version.Commit=${COMMIT}"
           mkdir -p dist/pure dist/fuse dist/arm64
 
           # Pure Go (symlink overlay; the default install).
@@ -334,7 +334,7 @@ jobs:
             def install_from_source
               ldflags = %W[
                 -s -w
-                -X github.com/yasyf/cc-pool/internal/version.Version=#{version}
+                -X github.com/yasyf/fusekit/version.Version=#{version}
               ]
               args = std_go_args(ldflags: ldflags.join(" "), output: bin/"cc-pool")
               if File.exist?(FUSE_T_HEADER) && File.exist?(FUSE_T_DYLIB)

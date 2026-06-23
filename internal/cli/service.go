@@ -14,10 +14,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
-	"github.com/yasyf/cc-pool/internal/service"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/mountd"
+	"github.com/yasyf/fusekit/service"
+	"github.com/yasyf/fusekit/version"
 )
 
 // Test seams. CLI tests must never scan real processes, stat real
@@ -39,8 +39,8 @@ var (
 	deepProbeAt    = overlay.DeepProbeWithin
 	killHolderPeer = func(socket string) (int, error) { return mountd.NewClient(socket).Kill() }
 	stopDaemon     = stopDaemonService
-	brewManaged    = service.IsBrewManaged
-	brewStop       = service.BrewStop
+	brewManaged    = func() bool { return ccpAgent().IsBrewManaged() }
+	brewStop       = func() error { return ccpAgent().BrewStop() }
 	// holderGoneWait bounds each wait for the mount holder to release its
 	// socket after Shutdown (and again after the kill escalation). The
 	// holder's sweep runs under a 60s op deadline and the client's Shutdown
@@ -48,6 +48,24 @@ var (
 	// the daemon's defaultHolderGoneWait.
 	holderGoneWait = 70 * time.Second
 )
+
+// ccpAgent is cc-pool's daemon LaunchAgent / brew-services descriptor: the
+// generic launchctl + Homebrew lifecycle (fusekit/service) configured with
+// cc-pool's label, formula, daemon args, log path, and fuse-t library env. The
+// program defaults to the running binary (os.Executable), so a Homebrew symlink
+// stays a stable launchd program path across upgrades.
+func ccpAgent() service.Agent {
+	return service.Agent{
+		Label:   "com.yasyf.cc-pool",
+		Formula: "cc-pool",
+		Args:    []string{"daemon"},
+		LogPath: pool.LogPath(),
+		Env: map[string]string{
+			"PATH":                 os.Getenv("PATH"),
+			"CGOFUSE_LIBFUSE_PATH": "/usr/local/lib/libfuse-t.dylib",
+		},
+	}
+}
 
 func newServiceCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -68,13 +86,13 @@ func newServiceCmd() *cobra.Command {
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				out := cmd.OutOrStdout()
-				if service.IsBrewManaged() {
+				if ccpAgent().IsBrewManaged() {
 					_, _ = fmt.Fprintln(out, "Management: Homebrew (brew services)")
-					if info, err := service.BrewInfo(); err == nil {
+					if info, err := ccpAgent().BrewInfo(); err == nil {
 						_, _ = fmt.Fprintln(out, info)
 					}
 				} else {
-					_, _ = fmt.Fprintf(out, "Management: self-managed LaunchAgent (loaded: %v)\n", service.Loaded())
+					_, _ = fmt.Fprintf(out, "Management: self-managed LaunchAgent (loaded: %v)\n", ccpAgent().Loaded())
 				}
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
 					_, _ = fmt.Fprintf(out, "Daemon: running (%s)\n", resp.Version)
@@ -263,11 +281,11 @@ func stopDaemonService(cmd *cobra.Command) error {
 			return fmt.Errorf("brew services stop: %w — a still-running daemon would respawn the mount holder mid-uninstall", err)
 		}
 		// Remove any stale self-rolled agent from before the brew switch.
-		_ = service.Uninstall()
+		_ = ccpAgent().Uninstall()
 		success(out, "Stopped the daemon.")
 		return nil
 	}
-	if err := service.Uninstall(); err != nil {
+	if err := ccpAgent().Uninstall(); err != nil {
 		return err
 	}
 	success(out, "Removed the LaunchAgent.")
@@ -387,23 +405,23 @@ func purgeAll(cmd *cobra.Command) error {
 // LaunchAgent.
 func runServiceInstall(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
-	if service.IsBrewManaged() {
+	if ccpAgent().IsBrewManaged() {
 		// A source-build `ccp service install` leaves a self-rolled
 		// com.yasyf.cc-pool agent that would run alongside the brew one.
 		// Boot it out before delegating.
-		_ = service.Uninstall()
-		if err := service.BrewStart(); err != nil {
+		_ = ccpAgent().Uninstall()
+		if err := ccpAgent().BrewStart(); err != nil {
 			return fmt.Errorf("brew services start: %w", err)
 		}
 		// brew services start only loads the job; a bootout race can leave it
 		// loaded-but-not-running, so force the daemon to actually exec.
-		if err := service.BrewKickstart(); err != nil {
+		if err := ccpAgent().BrewKickstart(); err != nil {
 			warn(cmd.ErrOrStderr(), "couldn't kickstart the brew service: %v", err)
 		}
 		success(out, "Started the daemon.")
 		return nil
 	}
-	if err := service.Install(); err != nil {
+	if err := ccpAgent().Install(); err != nil {
 		return err
 	}
 	success(out, "Installed and started the daemon.")
@@ -433,10 +451,10 @@ func ensureDaemon(cmd *cobra.Command) {
 		// since the detached holder keeps serving any fuse mirrors across it —
 		// and disables KeepAlive so launchd can't respawn the pre-upgrade image
 		// under us. A no-op for an orphan launchd never tracked.
-		if service.IsBrewManaged() {
-			_ = service.BrewStop()
+		if ccpAgent().IsBrewManaged() {
+			_ = ccpAgent().BrewStop()
 		} else {
-			_ = service.Uninstall()
+			_ = ccpAgent().Uninstall()
 		}
 		// An orphan survives bootout. Ask it to step down over the socket (its one
 		// clean-teardown path); if it still won't let go, kill the exact process on

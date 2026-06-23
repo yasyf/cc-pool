@@ -18,8 +18,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/mountd"
+	"github.com/yasyf/fusekit/version"
 )
 
 // tccHint is the copy-pasteable deep link holderFooter appends to a TCC-blocked

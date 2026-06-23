@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/mountd"
+	"github.com/yasyf/fusekit/version"
 )
 
 // startFakeHolder runs a real mountd.Server backed by the daemon's fake fuse

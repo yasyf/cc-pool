@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/mountd"
 	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/fusekit/version"
 )
 
 // holderPolicy adapts the cc-pool daemon to proc.Policy and the Supervisor's

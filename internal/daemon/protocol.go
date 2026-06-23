@@ -9,7 +9,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/forecast"
 	"github.com/yasyf/cc-pool/internal/score"
-	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/version"
 )
 
 // ProtocolVersion is bumped on incompatible wire changes.

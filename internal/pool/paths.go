@@ -22,15 +22,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/yasyf/fusekit/state"
 )
+
+// stateDir is cc-pool's private per-user state tree (~/.cc-pool). The layout
+// mechanics — home resolution, the dir join, idempotent creation, and the
+// atomic status-mirror write — live in fusekit/state; the leaf names below are
+// cc-pool's own.
+var stateDir = state.Dir{App: "cc-pool"}
 
 // Home returns the current user's home directory.
 func Home() (string, error) {
-	h, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
-	}
-	return h, nil
+	return state.Home()
 }
 
 func mustHome() string {
@@ -66,51 +70,50 @@ func AccountsDir() string {
 
 // StateDir is cc-pool's own private state directory (~/.cc-pool).
 func StateDir() string {
-	return filepath.Join(mustHome(), ".cc-pool")
+	return stateDir.Root()
 }
 
 // DBPath is the sqlite database path.
 func DBPath() string {
-	return filepath.Join(StateDir(), "pool.db")
+	return stateDir.Path("pool.db")
 }
 
 // SocketPath is the daemon's unix socket path.
 func SocketPath() string {
-	return filepath.Join(StateDir(), "daemon.sock")
+	return stateDir.Path("daemon.sock")
 }
 
 // LogPath is the daemon log path.
 func LogPath() string {
-	return filepath.Join(StateDir(), "daemon.log")
+	return stateDir.Path("daemon.log")
 }
 
 // MountsSocketPath is the mount-holder's unix socket path.
 func MountsSocketPath() string {
-	return filepath.Join(StateDir(), "mounts.sock")
+	return stateDir.Path("mounts.sock")
 }
 
 // MountHolderLogPath is the mount-holder log path.
 func MountHolderLogPath() string {
-	return filepath.Join(StateDir(), "mount-holder.log")
+	return stateDir.Path("mount-holder.log")
 }
 
 // HolderBinDir is the stable, non-versioned directory under which the mount
-// holder binary is materialized as a copy (~/.cc-pool/bin). The holder is
-// spawned from this fixed path — passed to fusekit as mountd.Spawn.StableExecDir
-// — so its resolved executable path never changes across `brew upgrade`. macOS
-// tccd keys the one-time "Network Volumes" grant on the holder's resolved path,
-// and Homebrew installs each version at a new Cellar path; spawning from this
-// fixed copy (whose embedded Developer-ID requirement survives the byte copy)
-// keeps the grant across versions instead of re-prompting every upgrade.
+// holder binary is materialized as a copy (~/.cc-pool/bin), passed to fusekit
+// as mountd.Spawn.StableExecDir. macOS tccd keys the one-time "Network Volumes"
+// grant on the holder's resolved path, and Homebrew installs each version at a
+// new Cellar path; spawning from this fixed copy (whose embedded Developer-ID
+// requirement survives the byte copy) keeps the grant across versions instead
+// of re-prompting every upgrade.
 func HolderBinDir() string {
-	return filepath.Join(StateDir(), "bin")
+	return stateDir.Path("bin")
 }
 
 // StatusSnapshotPath is the daemon's on-disk status mirror
 // (~/.cc-pool/status.json), rewritten atomically after every completed poll
 // for out-of-process readers like the Notification Center widget.
 func StatusSnapshotPath() string {
-	return filepath.Join(StateDir(), "status.json")
+	return stateDir.Path("status.json")
 }
 
 // AccountDirName is the directory basename for account index n (n >= 1).
@@ -132,7 +135,7 @@ func AccountDir(n int) string {
 
 // EnsureStateDir creates ~/.cc-pool with 0700 perms if missing.
 func EnsureStateDir() error {
-	return os.MkdirAll(StateDir(), 0o700)
+	return stateDir.Ensure()
 }
 
 // EnsureAccountsDir creates ~/.cc-pool/accounts with 0700 perms if missing.

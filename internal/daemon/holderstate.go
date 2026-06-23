@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/mountd"
+	"github.com/yasyf/fusekit/version"
 )
 
 // holderRefreshFloor rate-limits select-path cache refreshes: a fuse row the

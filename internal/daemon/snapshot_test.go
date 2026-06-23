@@ -13,7 +13,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/forecast"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/version"
 )
 
 // readSnapshot reads and decodes the snapshot file, failing the test on any error.
