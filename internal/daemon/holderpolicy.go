@@ -157,7 +157,7 @@ func (p *holderPolicy) Retreat(ctx context.Context, reason string) {
 // either way — an errored RPC is outcome-unknown, not nothing-happened; proc
 // waits the holder out (WaitGone) before deciding. The mountd seam returns
 // (failed, err); only the err drives proc's routing.
-func (p *holderPolicy) Shutdown(ctx context.Context) error {
+func (p *holderPolicy) Shutdown(_ context.Context) error {
 	cl := p.s.holderClient()
 	failed, err := cl.Shutdown()
 	p.s.holder.markUnhealthy()
