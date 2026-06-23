@@ -183,9 +183,35 @@ func (h *holderState) refresh(c *mountd.Client) {
 	h.healthy, h.degraded, h.version, h.mounts, h.bases, h.refreshedAt = true, false, res.Version, m, b, time.Now()
 	h.epochs, h.mountedAt = e, at
 	// deep and lastProbed are the daemon's own probe state, NOT holder truth —
-	// a List does not re-probe, so they persist across refresh untouched.
+	// a List does not re-probe, so a still-listed dir's verdict persists; only
+	// dirs that LEFT the List are pruned (their verdict is stale dead weight).
+	h.pruneAbsentVerdictsLocked(m)
 	if len(m) > 0 {
 		h.everMounted = true
+	}
+}
+
+// pruneAbsentVerdictsLocked drops the daemon's own per-dir probe state (deep,
+// lastProbed, shallow) for any dir NOT present in listed — a dir the holder no
+// longer lists is gone, so its verdict is stale dead weight. Verdicts for
+// still-listed dirs are left untouched (a List does not re-probe). Caller holds
+// h.mu. listed is keyed by dir; its bool value (Live) is irrelevant here —
+// presence is what marks a dir as still served.
+func (h *holderState) pruneAbsentVerdictsLocked(listed map[string]bool) {
+	for dir := range h.deep {
+		if _, ok := listed[dir]; !ok {
+			delete(h.deep, dir)
+		}
+	}
+	for dir := range h.lastProbed {
+		if _, ok := listed[dir]; !ok {
+			delete(h.lastProbed, dir)
+		}
+	}
+	for dir := range h.shallow {
+		if _, ok := listed[dir]; !ok {
+			delete(h.shallow, dir)
+		}
 	}
 }
 

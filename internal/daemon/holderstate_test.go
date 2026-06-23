@@ -413,6 +413,45 @@ func TestHolderStateShallowDeadStrikes(t *testing.T) {
 	}
 }
 
+// TestRefreshPrunesDepartedVerdicts pins that a successful refresh drops the
+// daemon's own probe state (deep, shallow, lastProbed) for a dir that LEFT the
+// holder's List, while keeping it for a dir still listed — so a verdict cannot
+// leak after the mount it described is gone.
+func TestRefreshPrunesDepartedVerdicts(t *testing.T) {
+	const kept, gone = "/pool/acct-01", "/pool/acct-02"
+	var h holderState
+	for _, dir := range []string{kept, gone} {
+		h.markDeepWedged(dir)    // seeds deep + lastProbed
+		h.recordShallowDead(dir) // seeds shallow
+	}
+	// The holder's next List includes only `kept`; `gone` has been dismounted.
+	cl := mountd.NewClient(startCannedHolder(t, []mountd.MountInfo{
+		{Dir: kept, Base: "/base", Live: false},
+	}))
+	h.refresh(cl)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.deep[gone]; ok {
+		t.Error("refresh kept the departed dir's deep verdict")
+	}
+	if _, ok := h.shallow[gone]; ok {
+		t.Error("refresh kept the departed dir's shallow strike")
+	}
+	if _, ok := h.lastProbed[gone]; ok {
+		t.Error("refresh kept the departed dir's probe clock")
+	}
+	if _, ok := h.deep[kept]; !ok {
+		t.Error("refresh pruned the still-listed dir's deep verdict")
+	}
+	if _, ok := h.shallow[kept]; !ok {
+		t.Error("refresh pruned the still-listed dir's shallow strike")
+	}
+	if _, ok := h.lastProbed[kept]; !ok {
+		t.Error("refresh pruned the still-listed dir's probe clock")
+	}
+}
+
 func TestHolderStateNoteMounted(t *testing.T) {
 	var h holderState
 	if h.ready("/d") {
