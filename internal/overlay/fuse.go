@@ -174,13 +174,17 @@ func buildMirrorConfig(base, dir string) fusekit.Config {
 // BOTH the mountd.Host the detached holder serves AND a fusekit/overlay.Provider
 // the in-process mirror and conversion tests drive directly. The cc-pool mirror
 // always serves synthetic content (the merged /.claude.json), never pure
-// passthrough, so its backend is always BackendNFS (PassthroughOnly=false).
+// passthrough, so its backend derives from a non-passthrough Spec — always NFS.
 type FuseProvider struct{}
 
-// Backend reports the fuse backend cc-pool's mirror realizes — always NFS,
-// because the mirror serves synthetic content (the merged /.claude.json) and
-// fuse-t's FSKit backend does not honor the fi->fh read semantics that requires.
-func (p *FuseProvider) Backend() fkoverlay.Backend { return fkoverlay.BackendNFS }
+// Backend reports the fuse backend cc-pool's mirror realizes.
+func (p *FuseProvider) Backend() fkoverlay.Backend {
+	// The cc-pool mirror serves synthetic content (merged /.claude.json), never
+	// pure passthrough, so it derives from a non-passthrough Spec — always NFS
+	// (FSKit can't honor the fi->fh read semantics the merged view needs). This
+	// is the one allowed FuseBackend(spec) derivation in this package.
+	return fkoverlay.FuseBackend(fkoverlay.Spec{PassthroughOnly: false})
+}
 
 // PrivateRoot is the per-account backing dir beside the mountpoint. Private
 // files written there are visible through the mount (mirrorFS redirects

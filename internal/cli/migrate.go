@@ -8,24 +8,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/fusekit"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
-
-// migrateTargetBackend maps a user-facing `--to` word to a fusekit/overlay
-// backend: "symlink" → BackendSymlink, "fuse" → cc-pool's fuse backend
-// (FuseBackend, always NFS). It is the one place the CLI translates the user's
-// vocabulary into a concrete Backend; the user never names "nfs"/"fskit".
-func migrateTargetBackend(to string) (fkoverlay.Backend, bool) {
-	switch to {
-	case "symlink":
-		return fkoverlay.BackendSymlink, true
-	case "fuse":
-		return pool.FuseBackend(), true
-	default:
-		return "", false
-	}
-}
 
 func newMigrateCmd() *cobra.Command {
 	var account int
@@ -54,14 +38,13 @@ and re-run. New accounts follow the last migrated-to provider.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
-				backend, ok := migrateTargetBackend(to)
-				if !ok {
+				if to != "fuse" && to != "symlink" {
 					return fmt.Errorf("unknown overlay kind %q (want fuse or symlink)", to)
 				}
-				if backend.IsFuse() && !fusekit.Built() {
+				if to == "fuse" && !fusekit.Built() {
 					return errors.New("this cc-pool build has no fuse support; run `ccp fuse enable` to install fuse-t and switch to the live-mirror build")
 				}
-				resp, err := requestMigration(m, backend, account, force)
+				resp, err := requestMigration(m, to, account, force)
 				if err != nil {
 					return err
 				}
@@ -90,7 +73,7 @@ and re-run. New accounts follow the last migrated-to provider.`,
 // `ccp fuse enable` can drive a fuse daemon from a still-pure CLI whose binary
 // was just reinstalled. The daemon is NOT auto-restarted here; the version-skew
 // error recommends a restart plainly, and `ccp fuse enable` forces its own.
-func requestMigration(m *pool.Manager, backend fkoverlay.Backend, account int, force bool) (*daemon.Response, error) {
+func requestMigration(m *pool.Manager, to string, account int, force bool) (*daemon.Response, error) {
 	if err := requireInit(m); err != nil {
 		return nil, err
 	}
@@ -112,7 +95,7 @@ func requestMigration(m *pool.Manager, backend fkoverlay.Backend, account int, f
 	if account > 0 {
 		acct = &account
 	}
-	resp, err := cl.Migrate(acct, string(backend), force)
+	resp, err := cl.Migrate(acct, to, force)
 	if err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}

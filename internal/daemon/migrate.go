@@ -28,14 +28,21 @@ const defaultMigrateBudget = 120 * time.Second
 // (live sessions or reservations) are skipped and reported so the client can
 // re-run later; per-account failures are rolled back by ConvertOverlay.
 func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
-	to, err := fkoverlay.Parse(req.To)
-	if err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("unknown overlay backend %q", req.To)}
-	}
-	if to.IsFuse() {
-		if msg := s.fuseGate(); msg != "" {
+	var to fkoverlay.Backend
+	switch req.To {
+	case "fuse":
+		// "fuse" is the user's coarse word; the gate resolves the concrete
+		// backend (nfs/fskit) by running Select inside the daemon, so the CLI
+		// never names a concrete fuse backend.
+		backend, msg := s.fuseGate()
+		if msg != "" {
 			return Response{OK: false, Error: msg}
 		}
+		to = backend
+	case "symlink":
+		to = fkoverlay.BackendSymlink
+	default:
+		return Response{OK: false, Error: fmt.Sprintf("unknown overlay target %q (want fuse or symlink)", req.To)}
 	}
 
 	accts, err := s.m.Store.ListAccounts()
@@ -100,20 +107,21 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 // and the macOS volume-access grant are per-process, and the holder is
 // the process that hosts the mounts — so a missing grant fails here, before
 // any account is disturbed.
-func (s *Server) fuseGate() string {
+func (s *Server) fuseGate() (fkoverlay.Backend, string) {
 	if s.fuseGateFn != nil {
 		return s.fuseGateFn()
 	}
 	if !fusekit.Built() {
-		return "this daemon build has no fuse support; run `ccp fuse enable` to install fuse-t and switch to the live-mirror build"
+		return "", "this daemon build has no fuse support; run `ccp fuse enable` to install fuse-t and switch to the live-mirror build"
 	}
 	// The reason leads verbatim: a declined probe carries its own fuse-t/TCC
 	// remedy, while holder spawn or probe-RPC failures name their real cause —
 	// advice that fits one would mislead for the others.
-	if backend, reason := pool.DetectOverlayBackend(); !backend.IsFuse() {
-		return fmt.Sprintf("fuse unavailable: %s — fix this, then re-run `ccp migrate`", reason)
+	backend, reason := pool.DetectOverlayBackend()
+	if !backend.IsFuse() {
+		return "", fmt.Sprintf("fuse unavailable: %s — fix this, then re-run `ccp migrate`", reason)
 	}
-	return ""
+	return backend, ""
 }
 
 // convertAccount runs one gated conversion, mapping it to a wire outcome.

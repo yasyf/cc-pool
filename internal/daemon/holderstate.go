@@ -8,6 +8,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -128,6 +129,11 @@ type holderState struct {
 	// which proves the grant landed (the grant is per holder process, so one
 	// live mount clears it for all).
 	tccErr string
+	// tccBackend is the fuse backend whose one-time macOS grant the latest
+	// TCC-blocked mount needs, carried so status/doctor render the right pane
+	// without cc-pool naming a concrete backend. "" when no mount is TCC-blocked;
+	// set with tccErr by recordTCC, cleared with it by noteMounted.
+	tccBackend fkoverlay.Backend
 
 	// gen counts in-place cache mutations (noteMounted, noteUnmounted,
 	// markUnhealthy). refresh snapshots it before its RPCs and discards the
@@ -508,6 +514,7 @@ func (h *holderState) noteMounted(dir string) {
 	delete(h.shallow, dir)
 	h.everMounted = true
 	h.tccErr = ""
+	h.tccBackend = ""
 }
 
 // noteUnmounted drops a dir the daemon just dismounted (a fuse→symlink
@@ -528,9 +535,10 @@ func (h *holderState) noteUnmounted(dir string) {
 }
 
 // recordTCC keeps the latest TCC-blocked mount guidance for status rendering.
-func (h *holderState) recordTCC(msg string) {
+func (h *holderState) recordTCC(msg string, backend fkoverlay.Backend) {
 	h.mu.Lock()
 	h.tccErr = msg
+	h.tccBackend = backend
 	h.mu.Unlock()
 }
 
@@ -556,11 +564,12 @@ func (h *holderState) wireStatus() *HolderStatus {
 		}
 	}
 	return &HolderStatus{
-		Version:      h.version,
-		Mounts:       live,
-		WedgedMounts: wedged,
-		Skewed:       h.healthy && h.version != "" && h.version != version.String(),
-		TCCError:     h.tccErr,
-		SpawnError:   h.spawnErr,
+		Version:           h.version,
+		Mounts:            live,
+		WedgedMounts:      wedged,
+		Skewed:            h.healthy && h.version != "" && h.version != version.String(),
+		TCCError:          h.tccErr,
+		TCCBlockedBackend: h.tccBackend,
+		SpawnError:        h.spawnErr,
 	}
 }

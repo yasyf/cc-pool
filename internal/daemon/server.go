@@ -93,7 +93,7 @@ type Server struct {
 	// fuseGateFn overrides the migrate handler's fuse-capability gate; nil
 	// means the real check (FuseBuilt + probe mount). Tests inject outcomes
 	// alongside Manager.OverlayFor.
-	fuseGateFn func() string
+	fuseGateFn func() (fkoverlay.Backend, string)
 
 	// migrateBudget bounds one migrate request's conversion work; zero means
 	// defaultMigrateBudget. Tests shrink it to pin the out-of-time path.
@@ -915,6 +915,19 @@ func (s *Server) overlayFor(backend fkoverlay.Backend) fkoverlay.Provider {
 	return prov
 }
 
+// overlayForRow resolves the overlay provider named by a's stored overlay_kind,
+// keeping cc-pool blind: it carries the received Backend rather than re-deriving
+// one. nil on an unparseable kind (logged) or an unresolvable backend; callers
+// already fence on nil before mounting through the provider.
+func (s *Server) overlayForRow(a store.Account) fkoverlay.Provider {
+	backend, err := fkoverlay.Parse(a.OverlayKind)
+	if err != nil {
+		s.log.Printf("acct-%02d: unparseable overlay_kind %q: %v", a.ID, a.OverlayKind, err)
+		return nil
+	}
+	return s.overlayFor(backend)
+}
+
 // fuseBackedRow reports whether a stored overlay_kind names a fuse backend,
 // failing loud on an unparseable value (the schema only ever writes a valid
 // Backend string). The daemon's hot paths check IsFuse on the stored string
@@ -1111,7 +1124,7 @@ func (s *Server) retreatPoolToSymlink(ctx context.Context, accts []store.Account
 // Caller holds the poll claim.
 func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 	if fuseBackedRow(a.OverlayKind) {
-		prov := s.overlayFor(pool.FuseBackend())
+		prov := s.overlayForRow(a)
 		if prov != nil && prov.Backend().IsFuse() && prov.Health(pool.ClaudeDir(), a.ConfigDir) == nil {
 			// The detached holder kept the mirror live across the daemon
 			// restart — the common case. Adopt it untouched, and vouch for it
@@ -1132,14 +1145,11 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 	// private backing no longer holds the account's identity. It blocks
 	// every symlink repair (they refuse mountpoints); force it down first.
 	if overlayMounted(a.ConfigDir) {
-		prov := s.overlayFor(pool.FuseBackend())
-		if prov == nil || !prov.Backend().IsFuse() {
-			// Only a wrong-backend injected fake (or a nil resolution) can land
-			// here; the real resolver always yields a fuse provider.
-			s.log.Printf("acct-%02d: dir is a stale mountpoint but no fuse provider resolved; skipping", a.ID)
-			return
-		}
-		if err := prov.Teardown(pool.ClaudeDir(), a.ConfigDir); err != nil {
+		// A live mountpoint under a NON-fuse row is wreckage (an aborted
+		// rollback's wedged unmount, or a conversion that died before its row
+		// flip). Force it down directly — backend-agnostic, no provider needed —
+		// so the symlink repair below (which refuses mountpoints) can proceed.
+		if err := forceUnmount(a.ConfigDir); err != nil {
 			s.log.Printf("acct-%02d: unmount stale mountpoint: %v", a.ID, err)
 			return
 		}
@@ -1233,7 +1243,11 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 		s.fallbackToSymlink(ctx, a)
 		return healFallback
 	case errors.Is(err, overlay.ErrMountNotLive):
-		s.holder.recordTCC(err.Error())
+		// a is provably a valid fuse row here (it reached healFuse via a fuse
+		// overlay_kind), so Parse cannot fail; carry the row's backend so status
+		// renders the right grant pane without cc-pool naming nfs/fskit.
+		backend, _ := fkoverlay.Parse(a.OverlayKind)
+		s.holder.recordTCC(err.Error(), backend)
 		s.log.Printf("acct-%02d fuse mount blocked pending the macOS volume-access grant, retrying next poll: %v", a.ID, err)
 		return healTCCBlocked
 	case errors.Is(err, errSweepStranded):
@@ -1266,7 +1280,7 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 // one. The Kind fence guards against wrong-kind injected fakes — the real
 // resolver always yields a fuse provider.
 func (s *Server) mountFuse(a store.Account) error {
-	prov := s.overlayFor(pool.FuseBackend())
+	prov := s.overlayForRow(a)
 	if prov == nil || !prov.Backend().IsFuse() {
 		return fmt.Errorf("no fuse provider resolved for acct-%02d; refusing to mount through it", a.ID)
 	}

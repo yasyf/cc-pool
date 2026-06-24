@@ -81,7 +81,7 @@ func TestReportHolder(t *testing.T) {
 		"cached TCC block fails with the settings deep link": {
 			facts: holderFacts{
 				reachable: true, version: cur, daemonUp: true,
-				cached: &daemon.HolderStatus{TCCError: "grant Network Volumes access"},
+				cached: &daemon.HolderStatus{TCCError: "grant Network Volumes access", TCCBlockedBackend: fkoverlay.BackendNFS},
 			},
 			fuseRows: 1,
 			want: []reportCall{
@@ -89,7 +89,7 @@ func TestReportHolder(t *testing.T) {
 				// The raw fusekit error AND the fusekit-sourced grant hint must
 				// both ride the one detail line; the pane/URL come from
 				// Backend.Enablement, not a cc-pool literal.
-				{"mount holder grant", false, "grant Network Volumes access — " + fuseGrantHint(pool.FuseBackend()) + " (cc-pool falls back to symlink automatically if the grant never lands)"},
+				{"mount holder grant", false, "grant Network Volumes access — " + fuseGrantHint(fkoverlay.BackendNFS) + " (cc-pool falls back to symlink automatically if the grant never lands)"},
 			},
 		},
 		"cached spawn failure fails": {

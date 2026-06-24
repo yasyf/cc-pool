@@ -97,7 +97,7 @@ func runFuseEnable(cmd *cobra.Command) error {
 			note(out, "Pool not set up yet — run `ccp add`; new accounts will use the live mirror.")
 			return nil
 		}
-		resp, err := requestMigration(m, pool.FuseBackend(), 0, false)
+		resp, err := requestMigration(m, "fuse", 0, false)
 		if err != nil {
 			return err
 		}

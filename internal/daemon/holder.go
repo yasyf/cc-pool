@@ -565,7 +565,7 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 //     single mirror is healed at once, exactly as before this gate, and a dead
 //     holder is the revive path's job, not a per-mirror remount.
 func (s *Server) deferShallowDead(a store.Account) bool {
-	prov := s.overlayFor(pool.FuseBackend())
+	prov := s.overlayForRow(a)
 	if prov == nil {
 		// Wrong-backend injected fake (or a nil resolution): cannot corroborate,
 		// so proceed with the holder's verdict rather than deferring forever.
@@ -717,7 +717,7 @@ func (s *Server) escalateTCCBlockedRow(a store.Account) {
 	announce := fmt.Sprintf("acct-%02d macOS volume-access grant never landed after %d attempts; falling back to symlink — `ccp migrate --to fuse` re-promotes once fuse-t can mount here",
 		a.ID, tccBreakerThreshold)
 	if s.escalateRowToSymlink(a, announce) {
-		s.holder.recordTCC("")
+		s.holder.recordTCC("", "")
 		s.log.Printf("acct-%02d fell back to symlink after the macOS volume-access grant did not land", a.ID)
 	}
 }
@@ -779,7 +779,7 @@ func (s *Server) remountReplacedRows(ctx context.Context, accts []store.Account)
 // discipline. Carcasses clear through the provider's foreign-mount contract,
 // exactly like mountFuse.
 func (s *Server) remountCarriedDirs(ctx context.Context, rowDirs map[string]bool, carry map[string]string) {
-	prov := s.overlayFor(pool.FuseBackend())
+	prov := s.overlayFor(fkoverlay.FuseBackend(s.m.OverlaySpec()))
 	if prov == nil || !prov.Backend().IsFuse() {
 		return
 	}

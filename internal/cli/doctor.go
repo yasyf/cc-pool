@@ -125,9 +125,9 @@ func newDoctorCmd() *cobra.Command {
 				// failure — the detail line above already carries the copy-pasteable
 				// deep link.
 				if openSettings && cachedHolder != nil && cachedHolder.TCCError != "" {
-					fuse := pool.FuseBackend()
-					if err := fuse.OpenSettings(cmd.Context()); err != nil {
-						warn(cmd.ErrOrStderr(), "couldn't open the %s settings pane: %v", fuse.Enablement().Pane, err)
+					backend := cachedHolder.TCCBlockedBackend
+					if err := backend.OpenSettings(cmd.Context()); err != nil {
+						warn(cmd.ErrOrStderr(), "couldn't open the %s settings pane: %v", backend.Enablement().Pane, err)
 					}
 				}
 				return nil
@@ -142,8 +142,8 @@ func newDoctorCmd() *cobra.Command {
 // fuseGrantHint renders the open-Settings hint for a fuse backend's one-time
 // macOS grant, sourced entirely from fusekit (backend.Enablement) — cc-pool
 // holds no pane literal of its own. It names the pane and offers the first deep
-// link as a copy-pasteable `open` command. Production callers pass
-// pool.FuseBackend(); taking the backend as a parameter keeps cc-pool a blind
+// link as a copy-pasteable `open` command. Production callers pass the daemon's
+// TCCBlockedBackend; taking the backend as a parameter keeps cc-pool a blind
 // consumer (a test can hand it any backend and watch the pane flip). A backend
 // that needs no grant yields a bare "grant the required macOS permission".
 func fuseGrantHint(backend fkoverlay.Backend) string {
@@ -204,7 +204,7 @@ func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)
 		return
 	}
 	if f.cached.TCCError != "" {
-		report("mount holder grant", false, f.cached.TCCError+" — "+fuseGrantHint(pool.FuseBackend())+" (cc-pool falls back to symlink automatically if the grant never lands)")
+		report("mount holder grant", false, f.cached.TCCError+" — "+fuseGrantHint(f.cached.TCCBlockedBackend)+" (cc-pool falls back to symlink automatically if the grant never lands)")
 	}
 	if f.cached.SpawnError != "" {
 		report("mount holder spawn", false, f.cached.SpawnError)

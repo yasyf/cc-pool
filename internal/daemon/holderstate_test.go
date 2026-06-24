@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yasyf/fusekit/mountd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -457,12 +458,12 @@ func TestHolderStateNoteMounted(t *testing.T) {
 	if h.ready("/d") {
 		t.Fatal("zero cache vouched for a dir")
 	}
-	h.recordTCC("grant pending")
+	h.recordTCC("grant pending", fkoverlay.BackendNFS)
 	h.noteMounted("/d")
 	if !h.ready("/d") {
 		t.Fatal("fresh mount not trusted before the first refresh")
 	}
-	if ws := h.wireStatus(); ws.TCCError != "" {
+	if ws := h.wireStatus(); ws.TCCError != "" || ws.TCCBlockedBackend != "" {
 		t.Fatalf("TCC guidance survived a successful mount: %+v", ws)
 	}
 }

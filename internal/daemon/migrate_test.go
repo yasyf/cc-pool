@@ -138,7 +138,7 @@ func newMigrateServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv) {
 		}
 		return &fkoverlay.SymlinkProvider{Spec: s.m.OverlaySpec()}, nil
 	}
-	s.fuseGateFn = func() string { return "" }
+	s.fuseGateFn = func() (fkoverlay.Backend, string) { return fkoverlay.BackendNFS, "" }
 	// SetDefaultOverlayKind's fence keys on real fuse-hosting capability
 	// (pool.CanHostFuse); these conversions run on fakes, so vouch for
 	// hosting explicitly or the post-migrate default recording would fail in
@@ -171,7 +171,7 @@ func kindOf(t *testing.T, s *Server, id int) string {
 func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 
-	resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
 	if !resp.OK {
 		t.Fatalf("migrate failed: %s", resp.Error)
 	}
@@ -198,7 +198,7 @@ func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
 	}
 
 	// Re-running is free and truthful.
-	resp = s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
+	resp = s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
 	if !resp.OK {
 		t.Fatalf("re-run failed: %s", resp.Error)
 	}
@@ -213,7 +213,7 @@ func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
 
 func TestHandleMigrateReverse(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
-	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs")); !resp.OK {
+	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse")); !resp.OK {
 		t.Fatalf("forward migrate failed: %s", resp.Error)
 	}
 
@@ -257,7 +257,7 @@ func TestHandleMigrateToFuseRecordsDefaultWithoutConversions(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 
 	// First migrate converts both accounts and records fuse as the default.
-	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs")); !resp.OK {
+	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse")); !resp.OK {
 		t.Fatalf("initial migrate failed: %s", resp.Error)
 	}
 	// Drift the recorded default back to symlink while the accounts stay fuse —
@@ -266,7 +266,7 @@ func TestHandleMigrateToFuseRecordsDefaultWithoutConversions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
 	if !resp.OK {
 		t.Fatalf("re-migrate failed: %s", resp.Error)
 	}
@@ -282,9 +282,9 @@ func TestHandleMigrateToFuseRecordsDefaultWithoutConversions(t *testing.T) {
 
 func TestHandleMigrateFuseGateBlocks(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
-	s.fuseGateFn = func() string { return "grant Network Volumes access" }
+	s.fuseGateFn = func() (fkoverlay.Backend, string) { return "", "grant Network Volumes access" }
 
-	resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
 	if resp.OK || !strings.Contains(resp.Error, "grant Network Volumes access") {
 		t.Fatalf("resp = %+v, want gate error", resp)
 	}
@@ -299,16 +299,16 @@ func TestHandleMigrateFuseGateBlocks(t *testing.T) {
 func TestHandleMigrateValidation(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 
-	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "zfs")); resp.OK || !strings.Contains(resp.Error, "unknown overlay backend") {
+	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "zfs")); resp.OK || !strings.Contains(resp.Error, "unknown overlay target") {
 		t.Fatalf("unknown backend: %+v", resp)
 	}
-	// The legacy "fuse" value is no longer a concrete backend — the strict
-	// fkoverlay.Parse rejects it, so the wire must carry "nfs"/"fskit"/"symlink".
-	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse")); resp.OK || !strings.Contains(resp.Error, "unknown overlay backend") {
-		t.Fatalf(`legacy "fuse" backend must be rejected on the wire: %+v`, resp)
+	// The wire vocabulary is the user's coarse words (fuse/symlink); a concrete
+	// fuse backend name is never sent by the CLI and is rejected.
+	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs")); resp.OK || !strings.Contains(resp.Error, "unknown overlay target") {
+		t.Fatalf(`concrete backend "nfs" must be rejected on the wire: %+v`, resp)
 	}
 	nine := 9
-	if resp := s.handleMigrate(t.Context(), migrateReq(&nine, "nfs")); resp.OK || !strings.Contains(resp.Error, "account 9 not found") {
+	if resp := s.handleMigrate(t.Context(), migrateReq(&nine, "fuse")); resp.OK || !strings.Contains(resp.Error, "account 9 not found") {
 		t.Fatalf("unknown account: %+v", resp)
 	}
 }
@@ -316,7 +316,7 @@ func TestHandleMigrateValidation(t *testing.T) {
 func TestHandleMigrateSingleAccount(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 	two := 2
-	resp := s.handleMigrate(t.Context(), migrateReq(&two, "nfs"))
+	resp := s.handleMigrate(t.Context(), migrateReq(&two, "fuse"))
 	if !resp.OK || len(resp.Migrations) != 1 || resp.Migrations[0].ID != 2 || resp.Migrations[0].Outcome != MigrationDone {
 		t.Fatalf("resp = %+v, want acct-2 done only", resp)
 	}
@@ -331,7 +331,7 @@ func TestHandleMigrateBusyWhenReserved(t *testing.T) {
 		t.Fatal("tryReserve failed on a free account")
 	}
 
-	resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
 	if !resp.OK {
 		t.Fatalf("migrate failed: %s", resp.Error)
 	}
@@ -354,7 +354,7 @@ func TestHandleMigrateBusyWhenReserved(t *testing.T) {
 	s.mu.Lock()
 	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
 	s.mu.Unlock()
-	resp = s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
+	resp = s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
 	got = outcomes(resp)
 	if got[1] != MigrationDone || got[2] != MigrationAlready {
 		t.Fatalf("sweep outcomes = %v, want acct-1 done, acct-2 already", got)
@@ -631,6 +631,7 @@ func TestMountFuseSweepsUnderlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
 	if err := os.WriteFile(filepath.Join(dirs[1], ".claude.json"), []byte("underlay-identity"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -718,7 +719,7 @@ func TestHandleMigrateBudgetExhausted(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
 	s.migrateBudget = time.Nanosecond
 
-	resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs"))
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
 	if !resp.OK {
 		t.Fatalf("migrate failed: %s", resp.Error)
 	}
@@ -760,7 +761,7 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	s.mu.Lock()
 	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
 	s.mu.Unlock()
-	resp := s.handleMigrate(t.Context(), Request{Op: OpMigrate, To: "nfs", Force: true})
+	resp := s.handleMigrate(t.Context(), Request{Op: OpMigrate, To: "fuse", Force: true})
 	if !resp.OK {
 		t.Fatalf("forced migrate failed: %s", resp.Error)
 	}
@@ -885,6 +886,7 @@ func TestMountFuseClearsDeadMountThenSweepsThenMounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
 	if err := os.WriteFile(filepath.Join(dirs[1], ".claude.json"), []byte("underlay-identity"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -925,6 +927,7 @@ func TestMountFuseWedgedPreClearAborts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
 	if err := os.WriteFile(filepath.Join(dirs[1], ".claude.json"), []byte("underlay-identity"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -957,6 +960,7 @@ func TestMountFuseForeignCarcassClearedAndRetriedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
 	var foreign atomic.Bool
 	foreign.Store(true)
 	fake.setupFn = func(_, dir string) error {
@@ -989,6 +993,7 @@ func TestMountFuseBaseMismatchClearedAndRetriedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
 	var mismatched atomic.Bool
 	mismatched.Store(true)
 	fake.setupFn = func(_, dir string) error {
@@ -1019,6 +1024,7 @@ func TestMountFusePersistentForeignFailsAfterOneRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
 	fake.setupErr = fmt.Errorf("mount %s: %w", dirs[1], mountd.ErrForeignMount)
 
 	merr := s.mountFuse(a)

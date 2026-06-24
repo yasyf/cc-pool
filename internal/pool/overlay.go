@@ -13,7 +13,7 @@ import (
 // holder wiring: the per-account-private / excluded / shared / skipped entry
 // sets (cc-pool POLICY, owned by internal/overlay), plus the detached
 // mount-holder seam. PassthroughOnly is false because cc-pool's mirror serves
-// synthetic content (the merged /.claude.json), so FuseBackend always lands on
+// synthetic content (the merged /.claude.json), so its fuse backend is always
 // fuse-t's NFS backend. Every fusekit/overlay entry point (ProviderFor, Select,
 // the migration primitives) takes this Spec.
 func overlaySpec() fkoverlay.Spec {
@@ -56,13 +56,6 @@ func (m *Manager) OverlaySpec() fkoverlay.Spec { return overlaySpec() }
 func OverlayProviderFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
 	return fkoverlay.ProviderFor(b, overlaySpec())
 }
-
-// FuseBackend is the fuse backend cc-pool realizes for its mirror — fusekit
-// derives it from the Spec (PassthroughOnly=false → always NFS). Callers that
-// need "the fuse provider" without a stored row (the daemon's mount/heal paths,
-// the `ccp migrate --to fuse` mapping) resolve through this rather than naming a
-// concrete backend, so cc-pool never branches nfs-vs-fskit itself.
-func FuseBackend() fkoverlay.Backend { return fkoverlay.FuseBackend(overlaySpec()) }
 
 // CanHostFuse reports whether THIS binary can host fuse mounts (built with
 // -tags fuse). A running holder spawned from a fuse build is usable by any

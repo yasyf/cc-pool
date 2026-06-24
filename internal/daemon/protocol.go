@@ -9,6 +9,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/forecast"
 	"github.com/yasyf/cc-pool/internal/score"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -91,6 +92,11 @@ type HolderStatus struct {
 	// TCCError carries the latest mount-blocked-pending-TCC guidance (the
 	// macOS volume-access grant walkthrough); "" when no mount is blocked.
 	TCCError string `json:"tcc_error,omitempty"`
+	// TCCBlockedBackend is the fuse backend whose one-time macOS grant the blocked
+	// mount needs; "" when no mount is TCC-blocked. The CLI renders the grant hint
+	// and --open-settings pane from it, so cc-pool stays blind to the concrete
+	// backend (nfs/fskit). Additive.
+	TCCBlockedBackend fkoverlay.Backend `json:"tcc_blocked_backend,omitempty"`
 	// SpawnError is the daemon's latest failed attempt to spawn a mount
 	// holder; "" when the last spawn succeeded or none was needed. Additive.
 	SpawnError string `json:"spawn_error,omitempty"`

@@ -18,13 +18,14 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
 
 // tccHint is the fusekit-sourced grant hint holderFooter appends to a
 // grant-needed alert so users can jump to the backend's enablement pane. The
 // pane/URL come from Backend.Enablement (fuseGrantHint), never a cc-pool literal.
-var tccHint = " — " + fuseGrantHint(pool.FuseBackend()) + " (cc-pool falls back to symlink automatically if the grant never lands)"
+var tccHint = " — " + fuseGrantHint(fkoverlay.BackendNFS) + " (cc-pool falls back to symlink automatically if the grant never lands)"
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
@@ -608,7 +609,7 @@ func TestHolderFooter(t *testing.T) {
 			"mount holder 0.0.1-old skewed; will be replaced when idle",
 		},
 		"TCC blocked carries the settings deep link": {
-			&daemon.HolderStatus{TCCError: "grant Network Volumes access"},
+			&daemon.HolderStatus{TCCError: "grant Network Volumes access", TCCBlockedBackend: fkoverlay.BackendNFS},
 			"mount holder: grant needed — grant Network Volumes access" + tccHint,
 		},
 		"respawn failing": {
@@ -616,7 +617,7 @@ func TestHolderFooter(t *testing.T) {
 			"mount holder: respawn failing — exec format error",
 		},
 		"TCC outranks spawn and skew": {
-			&daemon.HolderStatus{Skewed: true, TCCError: "tcc-msg", SpawnError: "spawn-msg"},
+			&daemon.HolderStatus{Skewed: true, TCCError: "tcc-msg", SpawnError: "spawn-msg", TCCBlockedBackend: fkoverlay.BackendNFS},
 			"mount holder: grant needed — tcc-msg" + tccHint,
 		},
 		"spawn outranks skew": {
@@ -657,7 +658,7 @@ func TestHolderFooterWedged(t *testing.T) {
 			"mount holder: 1 wedged mirror — run `ccp doctor`",
 		},
 		"TCC outranks wedged": {
-			&daemon.HolderStatus{TCCError: "tcc-msg", WedgedMounts: 1},
+			&daemon.HolderStatus{TCCError: "tcc-msg", WedgedMounts: 1, TCCBlockedBackend: fkoverlay.BackendNFS},
 			"mount holder: grant needed — tcc-msg" + tccHint,
 		},
 		"spawn outranks wedged": {

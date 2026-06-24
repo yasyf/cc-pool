@@ -152,7 +152,7 @@ func holderFooter(h *daemon.HolderStatus) string {
 	// and only asks for a doctor run; skew is cosmetic.
 	switch {
 	case h.TCCError != "":
-		return warnStyle.Render("mount holder: grant needed — " + h.TCCError + " — " + fuseGrantHint(pool.FuseBackend()) + " (cc-pool falls back to symlink automatically if the grant never lands)")
+		return warnStyle.Render("mount holder: grant needed — " + h.TCCError + " — " + fuseGrantHint(h.TCCBlockedBackend) + " (cc-pool falls back to symlink automatically if the grant never lands)")
 	case h.SpawnError != "":
 		return warnStyle.Render("mount holder: respawn failing — " + h.SpawnError)
 	case h.WedgedMounts > 0:

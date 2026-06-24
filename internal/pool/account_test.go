@@ -449,7 +449,7 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 			t.Fatal(err)
 		}
 		m := &Manager{Store: openTestStore(t), Keychain: newFakeKeychain()}
-		m.DetectOverlay = func() (fkoverlay.Backend, string) { return FuseBackend(), "" }
+		m.DetectOverlay = func() (fkoverlay.Backend, string) { return fkoverlay.BackendNFS, "" }
 		m.OverlayFor = func(kind fkoverlay.Backend) (fkoverlay.Provider, error) {
 			if kind.IsFuse() {
 				return fuse, nil
@@ -647,7 +647,7 @@ func TestInitSurfacesOverlayFallbackReason(t *testing.T) {
 func TestInitFuseVerdictCarriesNoReason(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	m := &Manager{Store: openTestStore(t)}
-	m.DetectOverlay = func() (fkoverlay.Backend, string) { return FuseBackend(), "" }
+	m.DetectOverlay = func() (fkoverlay.Backend, string) { return fkoverlay.BackendNFS, "" }
 	res, err := m.Init()
 	if err != nil {
 		t.Fatal(err)

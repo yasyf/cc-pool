@@ -69,7 +69,7 @@ func TestFuseConvertRoundTrip(t *testing.T) {
 	}
 	m := &Manager{Store: st, OverlayFor: inProcessFuseSeam}
 
-	fused, err := m.ConvertOverlay(a, FuseBackend())
+	fused, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 	if err != nil {
 		t.Fatalf("convert to fuse: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestFuseConvertIdentityVerifiedAgainstForeignBase(t *testing.T) {
 	}
 	m := &Manager{Store: st, OverlayFor: inProcessFuseSeam}
 
-	fused, err := m.ConvertOverlay(a, FuseBackend())
+	fused, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 	if err != nil {
 		t.Fatalf("convert to fuse with a foreign base identity: %v", err)
 	}

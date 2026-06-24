@@ -80,8 +80,4 @@ func TestOverlaySpecHolderWiring(t *testing.T) {
 			t.Fatalf("Holder.Args = %v, want %v", spec.Holder.Args, wantArgs)
 		}
 	}
-	// cc-pool's mirror always lands on NFS (PassthroughOnly=false).
-	if got := FuseBackend(); got != fkoverlay.BackendNFS {
-		t.Errorf("FuseBackend() = %q, want %q", got, fkoverlay.BackendNFS)
-	}
 }
