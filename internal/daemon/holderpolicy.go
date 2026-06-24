@@ -215,11 +215,9 @@ func (p *holderPolicy) Reconcile(ctx context.Context, ev proc.ReconcileEvent) {
 // reconcileRespawned, which runs after verifySpawned's refresh wiped the cache.
 // Wired to mountd.RetirePolicy.OnChildDied.
 func (p *holderPolicy) reconcileChildDied(_ context.Context) {
-	// proc fires ChildDied only on the genuine-death (no-peer) path (contract 1:
-	// an alive-but-wedged holder is spared), BEFORE the respawn, while
-	// carriedBases still holds the dead holder's registry — snapshot it (and the
-	// row-dir set) here for the Respawned reconcile, which runs after
-	// verifySpawned's refresh wiped the cache.
+	// Snapshot here, while carriedBases still holds the dead holder's registry —
+	// the reconcileRespawned that consumes the snapshot runs after verifySpawned's
+	// refresh has wiped the cache.
 	p.s.log.Printf("mount holder unreachable")
 	// The carried pre-row bases come from the in-memory registry (NO store read),
 	// and a dead holder's mounts are always dead carcasses. Force-unmount THEIR
