@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
@@ -25,6 +24,14 @@ import (
 // struct held.
 type holderPolicy struct {
 	s *Server
+
+	// retire is the fusekit child-control adapter (mountd.RetirePolicy): the
+	// Shutdown RPC, the gone-wait, the peer-gated captured-pid Kill, and the
+	// Reconcile routing now live behind it. holderPolicy composes it and delegates
+	// those four methods, keeping only cc-pool's app-specific seams (the idle/claim
+	// gate, the remount helpers, Retreat, Probe/PeerAlive, and the log/status
+	// surfaces) wired through the adapter's callbacks. Built in buildSupervisor.
+	retire *mountd.RetirePolicy
 
 	// degradedStreak counts CONSECUTIVE degraded polls for the degradedStrikes
 	// debounce (relocated from the old handleDegraded). Reset to 0 by any
@@ -137,6 +144,9 @@ func (p *holderPolicy) ReplaceSafe(ctx context.Context, force bool) string {
 	p.s.log.Printf("replacing version-skewed mount holder (%s) with %s", ver, version.String())
 	p.replaceRows = fuse
 	p.capturedPID, p.capturedPIDErr = p.s.peerPIDOf(p.s.holderSocket)
+	// Hand the gate-time identity to the adapter so its peer-gated Kill lands only
+	// on this exact process, never a successor that bound the socket in between.
+	p.retire.SetCapturedPID(p.capturedPID, p.capturedPIDErr)
 	return ""
 }
 
@@ -151,125 +161,135 @@ func (p *holderPolicy) Retreat(ctx context.Context, _ string) {
 	p.s.retreatAllFuseRows(ctx, fuse, "mount holder unrecoverable (crash loop or will not spawn)")
 }
 
-// Shutdown asks the holder to step down for a graceful replace. The holder
-// sweeps its mounts BEFORE the Shutdown reply lands, so the cache stops vouching
-// either way — an errored RPC is outcome-unknown, not nothing-happened; proc
-// waits the holder out (WaitGone) before deciding. The mountd seam returns
-// (failed, err); only the err drives proc's routing.
-func (p *holderPolicy) Shutdown(_ context.Context) error {
-	cl := p.s.holderClient()
-	failed, err := cl.Shutdown()
-	p.s.holder.markUnhealthy()
-	if err == nil && len(failed) > 0 {
-		p.s.log.Printf("skewed holder reported %d dir(s) that would not unmount", len(failed))
-	}
-	return err
+// Shutdown asks the holder to step down for a graceful replace, delegating the
+// RPC to the adapter. cc-pool's post-Shutdown surfaces (markUnhealthy + the
+// would-not-unmount log) ride the adapter's OnShutdown callback (see
+// buildSupervisor). Only the RPC error drives proc's routing.
+func (p *holderPolicy) Shutdown(ctx context.Context) error {
+	return p.retire.Shutdown(ctx)
 }
 
-// WaitGone reports whether the retiring holder released its socket within d.
+// WaitGone reports whether the retiring holder released its socket within d,
+// delegating to the adapter.
 func (p *holderPolicy) WaitGone(ctx context.Context, d time.Duration) bool {
-	return p.s.holderClient().WaitGoneContext(ctx, d)
+	return p.retire.WaitGone(ctx, d)
 }
 
-// Kill is the peer-gated SIGKILL escape hatch (force-Replace reap only). It
-// kills only the pid captured at gate time; an uncaptured identity refuses
-// before the seam, and mountd.ErrUnreachable (the peer vanished between
-// WaitGone's last probe and now) is translated to proc.ErrChildUnavailable so
-// proc's reapWedged reads it as "nothing to kill, socket free" and proceeds.
+// Kill is the peer-gated SIGKILL escape hatch (force-Replace reap only),
+// delegating to the adapter — which kills only the pid captured at gate time,
+// refuses an uncaptured identity before the seam, and maps a vanished peer
+// (mountd.ErrUnreachable) to proc.ErrChildUnavailable so proc's reapWedged reads
+// it as "nothing to kill, socket free" and proceeds. holderPolicy keeps only the
+// cc-pool log lines (the adapter owns no logging), reading capturedPIDErr to
+// distinguish the uncaptured-identity refusal from a generic seam failure.
 func (p *holderPolicy) Kill() (int, error) {
-	if p.capturedPIDErr != nil {
+	pid, err := p.retire.Kill()
+	switch {
+	case err == nil:
+		p.s.log.Printf("skewed holder wedged after shutdown; killed socket peer pid %d", pid)
+	case errors.Is(err, proc.ErrChildUnavailable):
+		// The peer vanished between WaitGone's last probe and now — nothing to
+		// kill; proc's reapWedged reads this as "socket free" and proceeds.
+	case p.capturedPIDErr != nil:
 		p.s.log.Printf("skewed holder wedged after shutdown, but its pid was not captured at gate time (%v); not killing; retrying next tick", p.capturedPIDErr)
-		return 0, fmt.Errorf("holder pid not captured at gate time: %w", p.capturedPIDErr)
-	}
-	pid, err := p.s.killPeerPid(p.s.holderSocket, p.capturedPID)
-	if errors.Is(err, mountd.ErrUnreachable) {
-		return 0, fmt.Errorf("%w: %w", proc.ErrChildUnavailable, err)
-	}
-	if err != nil {
+	default:
 		p.s.log.Printf("skewed holder wedged after shutdown; kill socket peer: %v; retrying next tick", err)
-		return 0, err
 	}
-	p.s.log.Printf("skewed holder wedged after shutdown; killed socket peer pid %d", pid)
-	return pid, nil
+	return pid, err
 }
 
-// Reconcile dispatches proc's transition events to cc-pool's re-establishment:
-//   - ChildDied (the genuine no-peer death): force-unmount the dead holder's
-//     orphaned carcasses before the respawn (the kill-9 whole-machine hazard),
-//     and stash the carry / row-dir snapshot for the Respawned remount.
-//   - Respawned: remount the fuse rows + the dead holder's pre-row carried dirs.
-//   - ReplaceSucceeded: remount under the HELD replace claims, then release them.
-//   - ReplaceAborted: release the held claims, no remount.
+// Reconcile delegates proc's transition routing to the adapter, which fans the
+// Kind out to cc-pool's per-transition re-establishment callbacks
+// (reconcileChildDied / reconcileRespawned / reconcileReplaceSucceeded /
+// reconcileReplaceAborted, wired in buildSupervisor). The carcass-clear stays in
+// reconcileChildDied, which proc fires BEFORE the respawn — preserving
+// carcass-clear-before-remount.
 func (p *holderPolicy) Reconcile(ctx context.Context, ev proc.ReconcileEvent) {
-	switch ev.Kind {
-	case proc.ChildDied:
-		// proc fires ChildDied only on the genuine-death (no-peer) path (contract 1:
-		// an alive-but-wedged holder is spared), BEFORE the respawn, while
-		// carriedBases still holds the dead holder's registry — snapshot it (and the
-		// row-dir set) here for the Respawned reconcile, which runs after
-		// verifySpawned's refresh wiped the cache.
-		p.s.log.Printf("mount holder unreachable")
-		// The carried pre-row bases come from the in-memory registry (NO store read),
-		// and a dead holder's mounts are always dead carcasses. Force-unmount THEIR
-		// carcasses (the kill-9 whole-machine hazard) FIRST and unconditionally — a
-		// transient store read must never gate carcass clearing, so even the fuse-row
-		// listing below failing cannot skip the carried set.
-		carry := p.s.holder.carriedBases()
-		p.s.forceUnmountOrphans(orphanDirs(nil, carry))
-		fuse, err := p.s.fuseAccounts()
-		if err != nil {
-			// The fuse-row set is unknown (store read failed), but the carried
-			// carcasses are already cleared. Snapshot (carry, nil) so Respawned
-			// remounts the carried dirs and never reads a stale prior-episode set.
-			p.s.log.Printf("holder supervision: fuse accounts: %v", err)
-			p.carriedSnapshot, p.rowDirsSnapshot = carry, nil
-			return
-		}
-		// Now the fuse set is known, clear its row carcasses too (carried dirs are
-		// disjoint from row dirs, so this never re-touches an already-cleared one).
-		p.s.forceUnmountOrphans(orphanDirs(fuse, nil))
-		all, err := p.s.m.Store.ListAccounts()
-		if err != nil {
-			// Carcasses are cleared; the row-dir set is unknown, so snapshot a nil
-			// set — Respawned then remounts the carried dirs without suppressing any
-			// as account rows, and never reads a stale prior-episode set.
-			p.s.log.Printf("holder supervision: list accounts: %v", err)
-			p.carriedSnapshot, p.rowDirsSnapshot = carry, nil
-			return
-		}
-		rowDirs := make(map[string]bool, len(all))
-		for _, a := range all {
-			rowDirs[a.ConfigDir] = true
-		}
-		p.carriedSnapshot, p.rowDirsSnapshot = carry, rowDirs
+	p.retire.Reconcile(ctx, ev)
+}
 
-	case proc.Respawned:
-		// Read-and-clear the ChildDied stash FIRST, before any fallible call. A
-		// Respawned can fire with NO preceding ChildDied (a wedged-alive holder that
-		// recovers when its own spawn-verify finally answers — see proc.Respawned's
-		// contract), so an early return below must never leave a stale snapshot for a
-		// later episode to consume.
-		carry, rowDirs := p.carriedSnapshot, p.rowDirsSnapshot
-		p.carriedSnapshot, p.rowDirsSnapshot = nil, nil
-		fuse, err := p.s.fuseAccounts()
-		if err != nil {
-			p.s.log.Printf("holder supervision: list accounts: %v", err)
-			return
-		}
-		p.s.log.Printf("mount holder respawned")
-		p.s.remountFuseRows(ctx, fuse)
-		p.s.remountCarriedDirs(ctx, rowDirs, carry)
-
-	case proc.ReplaceSucceeded:
-		p.s.remountReplacedRows(ctx, p.replaceRows)
-		p.s.log.Printf("mount holder replaced at %s", version.String())
-		p.s.endReplace(accountIDs(p.replaceRows))
-		p.replaceRows = nil
-
-	case proc.ReplaceAborted:
-		p.s.endReplace(accountIDs(p.replaceRows))
-		p.replaceRows = nil
+// reconcileChildDied handles the genuine no-peer holder death (proc's ChildDied,
+// fired BEFORE the respawn — contract 1: an alive-but-wedged holder is spared):
+// it force-unmounts the dead holder's orphaned carcasses (the kill-9
+// whole-machine hazard) and stashes the carry / row-dir snapshot for
+// reconcileRespawned, which runs after verifySpawned's refresh wiped the cache.
+// Wired to mountd.RetirePolicy.OnChildDied.
+func (p *holderPolicy) reconcileChildDied(_ context.Context) {
+	// proc fires ChildDied only on the genuine-death (no-peer) path (contract 1:
+	// an alive-but-wedged holder is spared), BEFORE the respawn, while
+	// carriedBases still holds the dead holder's registry — snapshot it (and the
+	// row-dir set) here for the Respawned reconcile, which runs after
+	// verifySpawned's refresh wiped the cache.
+	p.s.log.Printf("mount holder unreachable")
+	// The carried pre-row bases come from the in-memory registry (NO store read),
+	// and a dead holder's mounts are always dead carcasses. Force-unmount THEIR
+	// carcasses (the kill-9 whole-machine hazard) FIRST and unconditionally — a
+	// transient store read must never gate carcass clearing, so even the fuse-row
+	// listing below failing cannot skip the carried set.
+	carry := p.s.holder.carriedBases()
+	p.s.forceUnmountOrphans(orphanDirs(nil, carry))
+	fuse, err := p.s.fuseAccounts()
+	if err != nil {
+		// The fuse-row set is unknown (store read failed), but the carried
+		// carcasses are already cleared. Snapshot (carry, nil) so Respawned
+		// remounts the carried dirs and never reads a stale prior-episode set.
+		p.s.log.Printf("holder supervision: fuse accounts: %v", err)
+		p.carriedSnapshot, p.rowDirsSnapshot = carry, nil
+		return
 	}
+	// Now the fuse set is known, clear its row carcasses too (carried dirs are
+	// disjoint from row dirs, so this never re-touches an already-cleared one).
+	p.s.forceUnmountOrphans(orphanDirs(fuse, nil))
+	all, err := p.s.m.Store.ListAccounts()
+	if err != nil {
+		// Carcasses are cleared; the row-dir set is unknown, so snapshot a nil
+		// set — Respawned then remounts the carried dirs without suppressing any
+		// as account rows, and never reads a stale prior-episode set.
+		p.s.log.Printf("holder supervision: list accounts: %v", err)
+		p.carriedSnapshot, p.rowDirsSnapshot = carry, nil
+		return
+	}
+	rowDirs := make(map[string]bool, len(all))
+	for _, a := range all {
+		rowDirs[a.ConfigDir] = true
+	}
+	p.carriedSnapshot, p.rowDirsSnapshot = carry, rowDirs
+}
+
+// reconcileRespawned remounts the fuse rows and the dead holder's pre-row
+// carried dirs after a respawn. Wired to mountd.RetirePolicy.OnRespawned.
+func (p *holderPolicy) reconcileRespawned(ctx context.Context) {
+	// Read-and-clear the ChildDied stash FIRST, before any fallible call. A
+	// Respawned can fire with NO preceding ChildDied (a wedged-alive holder that
+	// recovers when its own spawn-verify finally answers — see proc.Respawned's
+	// contract), so an early return below must never leave a stale snapshot for a
+	// later episode to consume.
+	carry, rowDirs := p.carriedSnapshot, p.rowDirsSnapshot
+	p.carriedSnapshot, p.rowDirsSnapshot = nil, nil
+	fuse, err := p.s.fuseAccounts()
+	if err != nil {
+		p.s.log.Printf("holder supervision: list accounts: %v", err)
+		return
+	}
+	p.s.log.Printf("mount holder respawned")
+	p.s.remountFuseRows(ctx, fuse)
+	p.s.remountCarriedDirs(ctx, rowDirs, carry)
+}
+
+// reconcileReplaceSucceeded remounts under the HELD replace claims, then releases
+// them. Wired to mountd.RetirePolicy.OnReplaceSucceeded.
+func (p *holderPolicy) reconcileReplaceSucceeded(ctx context.Context) {
+	p.s.remountReplacedRows(ctx, p.replaceRows)
+	p.s.log.Printf("mount holder replaced at %s", version.String())
+	p.s.endReplace(accountIDs(p.replaceRows))
+	p.replaceRows = nil
+}
+
+// reconcileReplaceAborted releases the held replace claims with no remount. Wired
+// to mountd.RetirePolicy.OnReplaceAborted.
+func (p *holderPolicy) reconcileReplaceAborted(_ context.Context) {
+	p.s.endReplace(accountIDs(p.replaceRows))
+	p.replaceRows = nil
 }
 
 // onSpawnError surfaces a proc-booked spawn/verify failure on the status wire

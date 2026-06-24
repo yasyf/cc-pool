@@ -139,6 +139,30 @@ type rowRetryState struct {
 func (s *Server) buildSupervisor() {
 	p := &holderPolicy{s: s}
 	s.policy = p
+	// Wire the fusekit child-control adapter: it owns the Shutdown RPC, the
+	// gone-wait, the peer-gated captured-pid Kill, and the Reconcile routing;
+	// cc-pool's app-specific re-establishment rides its callbacks. holderClient()
+	// caches a Client for the fixed-for-life holder socket (tests set
+	// s.holderSocket before the first tick builds the supervisor), and KillPeer
+	// routes the reap through cc-pool's own kill seam (killPeerPid ->
+	// killHolderPeer / mountd.Client.KillPeer) so it stays peer-gated.
+	p.retire = &mountd.RetirePolicy{
+		Client:   s.holderClient(),
+		KillPeer: func(wantPID int) (int, error) { return s.killPeerPid(s.holderSocket, wantPID) },
+		OnShutdown: func(failed []mountd.MountInfo, err error) {
+			// The holder sweeps before the Shutdown reply lands, so the cache must
+			// stop vouching either way; log the would-not-unmount dirs only on a
+			// clean reply (an errored RPC's failed-set is meaningless).
+			s.holder.markUnhealthy()
+			if err == nil && len(failed) > 0 {
+				s.log.Printf("skewed holder reported %d dir(s) that would not unmount", len(failed))
+			}
+		},
+		OnChildDied:        p.reconcileChildDied,
+		OnRespawned:        p.reconcileRespawned,
+		OnReplaceSucceeded: p.reconcileReplaceSucceeded,
+		OnReplaceAborted:   p.reconcileReplaceAborted,
+	}
 	// proc's per-leg WaitGone/reap wait is Supervisor.GoneWait; cc-pool's gone-wait
 	// for a retiring holder (holderGoneWait, tests shrink it) drives it. The actual
 	// bring-up timeout lives in the Override seam (s.spawnIfServing ->
@@ -215,6 +239,12 @@ func (s *Server) superviseTick(ctx context.Context) {
 	}
 	s.sup.Tick(ctx)
 	healthy, degraded, ver := s.holder.viewState()
+	// Publish the skew verdict from this goroutine, where IsSkew is safe to call
+	// (it reads the supervisor's tick-local spawnedSkew), so wireStatus can render
+	// it from the request goroutine under holderState's lock. A reverse-skew
+	// (spawnedSkew) holder is the steady state proc never replaces — IsSkew
+	// excludes it — so it is not reported Skewed.
+	s.holder.setSkewed(healthy && s.sup.IsSkew(ver))
 	if healthy && !degraded {
 		s.policy.noteSettledVersion(ver)
 		s.retryUnvouchedFuseRows(ctx)

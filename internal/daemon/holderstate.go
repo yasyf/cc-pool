@@ -9,7 +9,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/version"
 )
 
 // holderRefreshFloor rate-limits select-path cache refreshes: a fuse row the
@@ -134,6 +133,14 @@ type holderState struct {
 	// without cc-pool naming a concrete backend. "" when no mount is TCC-blocked;
 	// set with tccErr by recordTCC, cleared with it by noteMounted.
 	tccBackend fkoverlay.Backend
+	// skewed is the supervisor's skew verdict (Supervisor.IsSkew), published each
+	// tick by setSkewed from the supervise goroutine — where IsSkew is safe to call
+	// — so wireStatus can render it from the request goroutine under h.mu without
+	// touching the supervisor's tick-local spawnedSkew state. It deliberately
+	// excludes the reverse-skew/spawnedSkew steady state (a holder our own spawns
+	// settle at, which proc never replaces). Cleared by markUnhealthy/markDegraded:
+	// an unreachable or degraded holder is not "skewed".
+	skewed bool
 
 	// gen counts in-place cache mutations (noteMounted, noteUnmounted,
 	// markUnhealthy). refresh snapshots it before its RPCs and discards the
@@ -283,6 +290,15 @@ func (h *holderState) recordSpawnError(msg string) {
 	h.mu.Unlock()
 }
 
+// setSkewed publishes the supervisor's skew verdict (computed on the tick
+// goroutine, where IsSkew is safe) so wireStatus can render it from the request
+// goroutine under the lock without touching the supervisor's tick-local state.
+func (h *holderState) setSkewed(v bool) {
+	h.mu.Lock()
+	h.skewed = v
+	h.mu.Unlock()
+}
+
 // refreshIfStale runs one refresh iff the cache has never been refreshed or
 // its last refresh is older than holderRefreshFloor. It is the select path's
 // backstop for truth the poll cadence misses: a select racing the startup
@@ -309,6 +325,9 @@ func (h *holderState) markUnhealthy() {
 	h.gen++
 	h.healthy, h.degraded, h.version, h.mounts, h.refreshedAt = false, false, "", nil, time.Now()
 	h.epochs, h.mountedAt = nil, nil
+	// An unreachable holder is not "skewed" — clear the status verdict now rather
+	// than carry a stale true until the next tick republishes.
+	h.skewed = false
 	// An unreachable holder serves nothing, so its dirs' deep verdicts and
 	// shallow-dead strikes are meaningless — drop them (and the probe clock) so a
 	// respawned holder's fresh mounts start with a clean slate.
@@ -329,6 +348,9 @@ func (h *holderState) markDegraded(ver string) {
 	h.gen++
 	h.healthy, h.degraded, h.version, h.mounts, h.refreshedAt = false, true, ver, nil, time.Now()
 	h.epochs, h.mountedAt = nil, nil
+	// A degraded holder is not "skewed" on the wire — the tick that converges or
+	// heals it republishes the verdict; clear it now to stay consistent meanwhile.
+	h.skewed = false
 	h.deep, h.lastProbed, h.shallow = nil, nil, nil
 	h.mu.Unlock()
 }
@@ -544,8 +566,9 @@ func (h *holderState) recordTCC(msg string, backend fkoverlay.Backend) {
 
 // wireStatus snapshots the cache as the status op's HolderStatus. Version ""
 // means the holder was unreachable at the last refresh (or a fresh mount was
-// trusted via noteMounted before any refresh succeeded); Skewed is asserted
-// only against a version actually reported by a healthy holder.
+// trusted via noteMounted before any refresh succeeded); Skewed reflects the
+// supervisor's last-tick skew verdict (setSkewed), which excludes the
+// reverse-skew/spawnedSkew steady state proc never replaces.
 func (h *holderState) wireStatus() *HolderStatus {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -567,7 +590,7 @@ func (h *holderState) wireStatus() *HolderStatus {
 		Version:           h.version,
 		Mounts:            live,
 		WedgedMounts:      wedged,
-		Skewed:            h.healthy && h.version != "" && h.version != version.String(),
+		Skewed:            h.skewed,
 		TCCError:          h.tccErr,
 		TCCBlockedBackend: h.tccBackend,
 		SpawnError:        h.spawnErr,

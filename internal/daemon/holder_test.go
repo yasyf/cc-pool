@@ -1648,7 +1648,10 @@ func bindVersionedHolder(t *testing.T, socket, ver string, list func() []mountd.
 // daemon's steady state: re-replacing would exec the same binary, observe the
 // same skew, and sweep every mirror each idle tick forever. Exactly one
 // replace (or revive) may occur; subsequent ticks must leave the successor
-// serving, with the converge guidance logged once and Skewed still surfaced.
+// serving, with the converge guidance logged once — and NOT surfaced as Skewed:
+// a reverse-skew (spawnedSkew) holder is the steady state proc never replaces,
+// so IsSkew (and thus the wire) excludes it, and the converge log is how the
+// operator is informed.
 func TestSuperviseReverseSkewSteadyState(t *testing.T) {
 	t.Run("revive spawns a newer holder and settles", func(t *testing.T) {
 		s, dirs, fake, _ := newSuperviseServer(t)
@@ -1690,8 +1693,11 @@ func TestSuperviseReverseSkewSteadyState(t *testing.T) {
 		if got := strings.Count(buf.String(), "restart the daemon to converge"); got != 1 {
 			t.Fatalf("converge guidance logged %d time(s), want once: %q", got, buf.String())
 		}
-		if ws := s.holder.wireStatus(); !ws.Skewed {
-			t.Fatalf("reverse skew not surfaced on the wire: %+v", ws)
+		// A reverse-skew (spawnedSkew) holder is the steady state proc never
+		// replaces, so IsSkew excludes it and the wire must NOT report it Skewed —
+		// the converge log above is how the operator is informed instead.
+		if ws := s.holder.wireStatus(); ws.Skewed {
+			t.Fatalf("reverse-skew steady state must not be surfaced as Skewed: %+v", ws)
 		}
 	})
 
