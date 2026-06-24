@@ -24,7 +24,7 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test -race -count=1 ./...
+        run: ./scripts/test.sh -race -count=1 ./...
 
       - name: Build (default, pure Go)
         run: go build ./...
@@ -43,7 +43,7 @@ jobs:
             CGO_ENABLED=1 go build -tags fuse ./...
             # Method-level mirror/merged-view tests need no mount; the live
             # mount test self-skips (needs the interactive grant).
-            CGO_ENABLED=1 go test -tags fuse -count=1 -run "Mirror|ClaudeJSON" ./internal/overlay/
+            CGO_ENABLED=1 ./scripts/test.sh -tags fuse -count=1 -run "Mirror|ClaudeJSON" ./internal/overlay/
           else
             echo "::warning::fuse-t unavailable — fuse merged-view tests skipped"
           fi
