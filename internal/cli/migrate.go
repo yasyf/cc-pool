@@ -32,9 +32,10 @@ verified through the mount. Accounts with live sessions or in-flight selects
 are skipped and reported — re-run the command as they free up. A failed mount
 rolls back to a working symlink overlay; nothing is left half-converted.
 
-The mount holder's first fuse mount may pop macOS's one-time "Network
-Volumes" prompt for cc-pool; grant it (System Settings ▸ Privacy & Security)
-and re-run. New accounts follow the last migrated-to provider.`,
+The mount holder's first fuse mount may pop a one-time macOS permission
+prompt for cc-pool; if it is blocked, ccp status and ccp doctor name the
+exact Settings pane to grant — then re-run. New accounts follow the last
+migrated-to provider.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
