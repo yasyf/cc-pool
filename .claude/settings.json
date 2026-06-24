@@ -41,23 +41,20 @@
         "source": "github",
         "repo": "yasyf/captain-hook"
       }
+    },
+    "cc-notes": {
+      "source": {
+        "source": "github",
+        "repo": "yasyf/cc-notes"
+      }
     }
   },
   "enabledPlugins": {
     "codex@skills": true,
-    "captain-hook@captain-hook": true
+    "captain-hook@captain-hook": true,
+    "cc-notes@cc-notes": true
   },
   "hooks": {
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uvx capt-hook run PreToolUse"
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "hooks": [
@@ -78,12 +75,32 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx capt-hook run PreToolUse"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "uvx capt-hook run Stop"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx capt-hook run UserPromptSubmit"
           }
         ]
       }
