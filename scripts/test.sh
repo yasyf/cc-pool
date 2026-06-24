@@ -5,7 +5,7 @@
 #
 # ALWAYS run these repos' tests through this script (CI, local, and any agent or
 # workflow). Never invoke `go test` directly on a real machine.
-# See docs/INCIDENT-holder-spawn-storm-2026-06-24.md.
+# See the cc-notes incident doc: ccn doc show ef281ea (or: ccn doc search "fork storm").
 set -euo pipefail
 
 headroom="${TEST_NPROC_HEADROOM:-400}"

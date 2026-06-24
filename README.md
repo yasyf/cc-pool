@@ -154,9 +154,8 @@ brew uninstall cc-pool
 ## Development
 
 Build with `CGO_ENABLED=0 go build ./cmd/cc-pool`; `go test ./...` passes with no network,
-Keychain, or daemon. The manual end-to-end test matrix lives in
-[docs/VERIFICATION.md](docs/VERIFICATION.md), release history in [CHANGELOG.md](CHANGELOG.md),
-and conventions in [AGENTS.md](AGENTS.md).
+Keychain, or daemon. Release history is in [CHANGELOG.md](CHANGELOG.md) and conventions in
+[AGENTS.md](AGENTS.md).
 
 ## License
 
