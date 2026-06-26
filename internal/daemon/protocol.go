@@ -84,11 +84,9 @@ type HolderStatus struct {
 	Mounts int `json:"mounts"`
 	// WedgedMounts counts the partial-wedge mirrors in the daemon's own
 	// deep-probe verdict: mounts that answer shallow metadata stats but hang
-	// bulk reads. Supervision remounts them automatically; status and doctor
+	// bulk reads. The heal loop remounts them automatically; status and doctor
 	// surface them so already-wedged sessions get relaunched. Additive.
 	WedgedMounts int `json:"wedged_mounts,omitempty"`
-	// Skewed means a reachable holder runs a different build than the daemon.
-	Skewed bool `json:"skewed"`
 	// TCCError carries the latest mount-blocked-pending-TCC guidance (the
 	// macOS volume-access grant walkthrough); "" when no mount is blocked.
 	TCCError string `json:"tcc_error,omitempty"`
@@ -97,9 +95,6 @@ type HolderStatus struct {
 	// and --open-settings pane from it, so cc-pool stays blind to the concrete
 	// backend (nfs/fskit). Additive.
 	TCCBlockedBackend fkoverlay.Backend `json:"tcc_blocked_backend,omitempty"`
-	// SpawnError is the daemon's latest failed attempt to spawn a mount
-	// holder; "" when the last spawn succeeded or none was needed. Additive.
-	SpawnError string `json:"spawn_error,omitempty"`
 }
 
 // AccountStatus is the per-account view returned by status/select.

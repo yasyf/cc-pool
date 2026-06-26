@@ -8,7 +8,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
@@ -111,8 +110,8 @@ func (s *Server) fuseGate() (fkoverlay.Backend, string) {
 	if s.fuseGateFn != nil {
 		return s.fuseGateFn()
 	}
-	if !fusekit.Built() {
-		return "", "this daemon build has no fuse support; run `ccp fuse enable` to install fuse-t and switch to the live-mirror build"
+	if !pool.CanHostFuse() {
+		return "", "fuse is not available on this machine; run `ccp fuse enable` to install the fusekit-holder cask"
 	}
 	// The reason leads verbatim: a declined probe carries its own fuse-t/TCC
 	// remedy, while holder spawn or probe-RPC failures name their real cause —

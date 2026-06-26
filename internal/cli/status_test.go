@@ -593,8 +593,10 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 }
 
 // TestHolderFooter pins the plain-table holder alert: nothing for a nil or
-// healthy-current holder (status stays clean), one line per failure shape,
-// and the priority order TCC > spawn > skew when several apply.
+// healthy-current holder (status stays clean), and the TCC-blocked line carries
+// the fusekit-sourced settings deep link. Skew and spawn failures are no longer
+// surfaced here — the holder is a separate, multi-tenant product whose version
+// and process lifecycle are not cc-pool's to police.
 func TestHolderFooter(t *testing.T) {
 	cases := map[string]struct {
 		h    *daemon.HolderStatus
@@ -604,25 +606,9 @@ func TestHolderFooter(t *testing.T) {
 		"healthy current holder is silent": {
 			&daemon.HolderStatus{Version: version.String(), Mounts: 3}, "",
 		},
-		"skewed": {
-			&daemon.HolderStatus{Version: "0.0.1-old", Mounts: 1, Skewed: true},
-			"mount holder 0.0.1-old skewed; will be replaced when idle",
-		},
 		"TCC blocked carries the settings deep link": {
 			&daemon.HolderStatus{TCCError: "grant Network Volumes access", TCCBlockedBackend: fkoverlay.BackendNFS},
 			"mount holder: grant needed — grant Network Volumes access" + tccHint,
-		},
-		"respawn failing": {
-			&daemon.HolderStatus{SpawnError: "exec format error"},
-			"mount holder: respawn failing — exec format error",
-		},
-		"TCC outranks spawn and skew": {
-			&daemon.HolderStatus{Skewed: true, TCCError: "tcc-msg", SpawnError: "spawn-msg", TCCBlockedBackend: fkoverlay.BackendNFS},
-			"mount holder: grant needed — tcc-msg" + tccHint,
-		},
-		"spawn outranks skew": {
-			&daemon.HolderStatus{Version: "0.0.1-old", Skewed: true, SpawnError: "spawn-msg"},
-			"mount holder: respawn failing — spawn-msg",
 		},
 	}
 	for name, tc := range cases {
@@ -635,8 +621,8 @@ func TestHolderFooter(t *testing.T) {
 }
 
 // TestHolderFooterWedged pins the wedged-mirror footer: silent at zero,
-// singular at one, plural beyond, ranked below the holder-blocking failures
-// (TCC, spawn) but above cosmetic skew.
+// singular at one, plural beyond, printed regardless of the holder's version,
+// and ranked below the holder-blocking TCC grant.
 func TestHolderFooterWedged(t *testing.T) {
 	cases := map[string]struct {
 		h    *daemon.HolderStatus
@@ -653,17 +639,13 @@ func TestHolderFooterWedged(t *testing.T) {
 			&daemon.HolderStatus{Version: version.String(), Mounts: 3, WedgedMounts: 3},
 			"mount holder: 3 wedged mirrors — run `ccp doctor`",
 		},
-		"wedged outranks skew": {
-			&daemon.HolderStatus{Version: "0.0.1-old", Skewed: true, WedgedMounts: 1},
+		"wedged prints regardless of holder version": {
+			&daemon.HolderStatus{Version: "0.0.1-old", WedgedMounts: 1},
 			"mount holder: 1 wedged mirror — run `ccp doctor`",
 		},
 		"TCC outranks wedged": {
 			&daemon.HolderStatus{TCCError: "tcc-msg", WedgedMounts: 1, TCCBlockedBackend: fkoverlay.BackendNFS},
 			"mount holder: grant needed — tcc-msg" + tccHint,
-		},
-		"spawn outranks wedged": {
-			&daemon.HolderStatus{SpawnError: "spawn-msg", WedgedMounts: 1},
-			"mount holder: respawn failing — spawn-msg",
 		},
 	}
 	for name, tc := range cases {
@@ -683,9 +665,9 @@ func TestRunStatusPlainHolderFooter(t *testing.T) {
 		holder *daemon.HolderStatus
 		want   string // "" = no holder mention at all
 	}{
-		"skewed holder prints the footer": {
-			holder: &daemon.HolderStatus{Version: "0.0.1-old", Mounts: 1, Skewed: true},
-			want:   "mount holder 0.0.1-old skewed; will be replaced when idle",
+		"alerting holder prints the footer": {
+			holder: &daemon.HolderStatus{Version: version.String(), Mounts: 1, WedgedMounts: 1},
+			want:   "mount holder: 1 wedged mirror — run `ccp doctor`",
 		},
 		"healthy holder prints nothing": {
 			holder: &daemon.HolderStatus{Version: version.String(), Mounts: 2},

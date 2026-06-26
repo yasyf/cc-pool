@@ -12,15 +12,32 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
 
-// startFakeHolder runs a real mountd.Server backed by the daemon's fake fuse
-// provider on a short /tmp socket (macOS caps sun_path at 104 bytes),
-// returning a client for it.
-func startFakeHolder(t *testing.T, fake *fakeFuseProv) *mountd.Client {
+// fakeHost is the mountd.Host backing startFakeHolder's real mountd.Server. Its
+// State reports kernel-truth liveness — so List answers Live=false for a
+// registered dir that is not really a mountpoint, the carcass shape
+// TestHolderStateRefresh pins — while Setup/Teardown are no-ops: the refresh
+// tests register a mount in the holder's registry without standing up a real
+// mirror. It implements the post-3B mountd.Host seam (Setup takes a
+// fusekit.MountSpec), distinct from fakeFuseProv's fkoverlay.Provider Setup.
+type fakeHost struct{}
+
+func (fakeHost) Setup(fusekit.MountSpec) error { return nil }
+func (fakeHost) Teardown(_, _ string) error    { return nil }
+func (fakeHost) State(base, dir string) (mounted, alive bool) {
+	return overlay.Mounted(dir), overlay.MountAlive(base, dir)
+}
+
+// startFakeHolder runs a real mountd.Server backed by a kernel-truth fake host on
+// a short /tmp socket (macOS caps sun_path at 104 bytes), returning a client for
+// it.
+func startFakeHolder(t *testing.T) *mountd.Client {
 	t.Helper()
 	sockDir, err := os.MkdirTemp("/tmp", "ccp-hold")
 	if err != nil {
@@ -29,7 +46,7 @@ func startFakeHolder(t *testing.T, fake *fakeFuseProv) *mountd.Client {
 	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	srv := &mountd.Server{
 		Socket:  filepath.Join(sockDir, "m.sock"),
-		Host:    fake,
+		Host:    fakeHost{},
 		Version: version.String(),
 		Log:     log.New(io.Discard, "", 0),
 	}
@@ -79,8 +96,8 @@ func startCannedHolder(t *testing.T, mounts []mountd.MountInfo) string {
 
 // serveCannedHolder answers the mountd wire protocol on ln — our version on
 // every op, the given List — until the listener closes. Shared by
-// startCannedHolder and spawnRecorder (which binds at an exact socket path to
-// stand in for a freshly spawned holder).
+// startCannedHolder and hostFuseCapable (which binds at the exact default holder
+// socket so pool.CanHostFuse reads true).
 func serveCannedHolder(ln net.Listener, mounts []mountd.MountInfo) {
 	for {
 		conn, err := ln.Accept()
@@ -159,18 +176,18 @@ func TestHolderStateRefresh(t *testing.T) {
 	if h.ready("/pool/acct-01") {
 		t.Fatal("unreachable holder left a trusted mount entry")
 	}
-	if ws := h.wireStatus(); ws.Version != "" || ws.Mounts != 0 || ws.Skewed {
+	if ws := h.wireStatus(); ws.Version != "" || ws.Mounts != 0 {
 		t.Fatalf("unreachable holder wire view = %+v, want zeroed", ws)
 	}
 
-	cl := startFakeHolder(t, &fakeFuseProv{})
+	cl := startFakeHolder(t)
 	base, dir := t.TempDir(), t.TempDir()
 	if err := cl.Mount(base, dir); err != nil {
 		t.Fatalf("register fake mount: %v", err)
 	}
 	h.refresh(cl)
-	if ws := h.wireStatus(); ws.Version != version.String() || ws.Skewed {
-		t.Fatalf("live holder wire view = %+v, want version %q unskewed", ws, version.String())
+	if ws := h.wireStatus(); ws.Version != version.String() {
+		t.Fatalf("live holder wire view = %+v, want version %q", ws, version.String())
 	}
 	if h.ready(dir) {
 		t.Fatal("cache vouched for a registered but kernel-dead mount")
@@ -469,52 +486,44 @@ func TestHolderStateNoteMounted(t *testing.T) {
 }
 
 // TestHolderStateRefreshDegraded pins the third refresh arm: a holder that
-// answers Health but whose List fails is DEGRADED, not unreachable — its
-// version is kept (so the supervisor can tell a skewed degraded holder from an
-// our-version one), its mounts fail closed (nil → ready false), and the bases
-// registry survives (the pre-row guard reads it when mounts is nil).
+// answers Health but whose List fails is DEGRADED, not unreachable — its version
+// is KEPT (for status) while it reads not-healthy and its mounts fail closed
+// (nil → ready false).
 func TestHolderStateRefreshDegraded(t *testing.T) {
 	const ver = "v1.2.3 (abc1234)"
-	h := &holderState{bases: map[string]string{"/pool/acct-01": "/base"}}
-	deg := startDegradedHolder(t, ver, false)
+	var h holderState
+	socket := startDegradedHolder(t, ver)
 
-	h.refresh(mountd.NewClient(deg.socket))
+	h.refresh(mountd.NewClient(socket))
 
-	healthy, degraded, got := h.viewState()
-	if healthy || !degraded || got != ver {
-		t.Fatalf("viewState = (%v, %v, %q), want (false, true, %q)", healthy, degraded, got, ver)
+	healthy, got := h.view()
+	if healthy || got != ver {
+		t.Fatalf("view = (%v, %q), want (false, %q) for a degraded holder", healthy, got, ver)
 	}
 	if h.ready("/pool/acct-01") {
 		t.Fatal("a degraded holder vouched for a mount; mounts must fail closed")
 	}
-	if b := h.carriedBases(); b["/pool/acct-01"] != "/base" {
-		t.Fatalf("bases = %v, want the pre-degraded registry preserved", b)
-	}
 }
 
 // TestHolderStateMarkDegraded pins markDegraded directly: it keeps the version,
-// fails the mounts closed, preserves bases, and bumps gen so a racing refresh
-// snapshot is discarded.
+// reads not-healthy, fails the mounts closed (nil → ready false), and bumps gen
+// so a racing refresh snapshot is discarded.
 func TestHolderStateMarkDegraded(t *testing.T) {
 	h := &holderState{
 		healthy: true,
 		version: "old",
 		mounts:  map[string]bool{"/d": true},
-		bases:   map[string]string{"/d": "/b"},
 	}
 	g := h.gen
 
 	h.markDegraded("v9")
 
-	healthy, degraded, ver := h.viewState()
-	if healthy || !degraded || ver != "v9" {
-		t.Fatalf("viewState = (%v, %v, %q), want (false, true, v9)", healthy, degraded, ver)
+	healthy, ver := h.view()
+	if healthy || ver != "v9" {
+		t.Fatalf("view = (%v, %q), want (false, v9)", healthy, ver)
 	}
 	if h.ready("/d") {
 		t.Fatal("markDegraded left a vouched mount; mounts must be nil")
-	}
-	if h.carriedBases()["/d"] != "/b" {
-		t.Fatal("markDegraded dropped bases; the registry must survive")
 	}
 	if h.gen == g {
 		t.Fatal("markDegraded did not bump gen; a racing snapshot would not be discarded")

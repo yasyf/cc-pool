@@ -9,7 +9,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
@@ -181,11 +180,12 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 
 // noteFuseFirstMount warns about macOS's one-time volume-access grant prompt the
 // account's first fuse mount triggers. The pane name is sourced from the
-// backend's Enablement, never a cc-pool literal. It fires only on a fuse build
-// hosting a fuse account — a symlink overlay never mounts, so it never prompts.
-// Migrate already says this in its own flow, so this covers the add/init path only.
+// backend's Enablement, never a cc-pool literal. It fires only when this machine
+// can host fuse (the fusekit-holder cask is installed) and the account is
+// fuse-backed — a symlink overlay never mounts, so it never prompts. Migrate
+// already says this in its own flow, so this covers the add/init path only.
 func noteFuseFirstMount(out io.Writer, backend fkoverlay.Backend) {
-	if !fusekit.Built() || !backend.IsFuse() {
+	if !pool.CanHostFuse() || !backend.IsFuse() {
 		return
 	}
 	en := backend.Enablement()

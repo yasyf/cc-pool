@@ -75,7 +75,6 @@ pool.`,
 		newServiceCmd(),
 		newWidgetCmd(),
 		newDaemonCmd(),
-		newMountHolderCmd(),
 	)
 	return root
 }

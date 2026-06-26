@@ -3,6 +3,8 @@ package pool
 import (
 	"testing"
 
+	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
@@ -52,32 +54,45 @@ func TestOverlayProviderForUnknownBackend(t *testing.T) {
 	}
 }
 
-// TestOverlaySpecHolderWiring pins that the Spec cc-pool hands fusekit carries
-// the pool socket/log/holder argv — the wiring a RemoteFuseProvider drives.
+// TestOverlaySpecHolderWiring pins that the Spec cc-pool hands fusekit drives the
+// SHARED holder over RPC: the cask socket/binary, cc-pool's Owner, and the content
+// wiring (bridge socket, source mode, probe path, private prefixes) that makes the
+// provider register a synth-serving AddMount. It must NOT self-exec (no
+// StableExecDir, no "mount-holder" argv) and must NOT version-replace the holder
+// (no Version).
 func TestOverlaySpecHolderWiring(t *testing.T) {
 	spec := overlaySpec()
 	if spec.PassthroughOnly {
 		t.Error("PassthroughOnly = true; cc-pool's mirror serves synthetic content, want false (always NFS)")
 	}
-	if spec.Holder == nil {
+	h := spec.Holder
+	if h == nil {
 		t.Fatal("Holder is nil; fuse selection would be disabled")
 	}
-	if spec.Holder.Socket != MountsSocketPath() {
-		t.Errorf("Holder.Socket = %q, want %q", spec.Holder.Socket, MountsSocketPath())
+	socket := mountd.DefaultHolderSocket()
+	switch {
+	case h.Socket != socket:
+		t.Errorf("Holder.Socket = %q, want the shared socket %q", h.Socket, socket)
+	case h.ExecPath != mountd.HolderExe:
+		t.Errorf("Holder.ExecPath = %q, want the cask binary %q", h.ExecPath, mountd.HolderExe)
+	case h.Owner != HolderOwner:
+		t.Errorf("Holder.Owner = %q, want %q", h.Owner, HolderOwner)
+	case h.BridgeSocket != BridgeSocketPath():
+		t.Errorf("Holder.BridgeSocket = %q, want %q", h.BridgeSocket, BridgeSocketPath())
+	case h.ContentMode != "source":
+		t.Errorf("Holder.ContentMode = %q, want \"source\"", h.ContentMode)
+	case h.ProbePath != "/"+overlay.ProbeFileName:
+		t.Errorf("Holder.ProbePath = %q, want %q", h.ProbePath, "/"+overlay.ProbeFileName)
+	case h.StableExecDir != "":
+		t.Errorf("Holder.StableExecDir = %q, want empty (no self-exec onto the shared holder)", h.StableExecDir)
+	case h.Version != "":
+		t.Errorf("Holder.Version = %q, want empty (cc-pool must not version-replace a shared holder)", h.Version)
 	}
-	if spec.Holder.LogPath != MountHolderLogPath() {
-		t.Errorf("Holder.LogPath = %q, want %q", spec.Holder.LogPath, MountHolderLogPath())
+	wantArgs := []string{"--socket", socket}
+	if len(h.Args) != len(wantArgs) || h.Args[0] != wantArgs[0] || h.Args[1] != wantArgs[1] {
+		t.Fatalf("Holder.Args = %v, want %v (the cask binary's own flags, not a subcommand)", h.Args, wantArgs)
 	}
-	if spec.Holder.StableExecDir != HolderBinDir() {
-		t.Errorf("Holder.StableExecDir = %q, want %q", spec.Holder.StableExecDir, HolderBinDir())
-	}
-	wantArgs := []string{"mount-holder", "--socket", MountsSocketPath()}
-	if len(spec.Holder.Args) != len(wantArgs) {
-		t.Fatalf("Holder.Args = %v, want %v", spec.Holder.Args, wantArgs)
-	}
-	for i := range wantArgs {
-		if spec.Holder.Args[i] != wantArgs[i] {
-			t.Fatalf("Holder.Args = %v, want %v", spec.Holder.Args, wantArgs)
-		}
+	if len(h.PrivatePrefixes) != len(overlay.PrivatePrefixes) {
+		t.Fatalf("Holder.PrivatePrefixes = %v, want %v", h.PrivatePrefixes, overlay.PrivatePrefixes)
 	}
 }

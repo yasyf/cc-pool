@@ -91,3 +91,19 @@ func PrivateEntry(name string) bool {
 		strings.HasPrefix(name, ".last-update-result") ||
 		name == "remote-settings.json" || strings.HasPrefix(name, "remote-settings.json.")
 }
+
+// PrivatePrefixes are the top-level name prefixes the shared holder routes to the
+// per-account private root rather than the shared base ("source" mode): cc-pool's
+// private/synth files AND their atomic-write temp siblings, so claude's tmp→rename
+// commit of, say, .claude.json (.claude.json.tmp.XXXX → .claude.json) stays on one
+// filesystem. They are cc-pool's MountSpec.PrivatePrefixes. The holder matches them
+// with HasPrefix, so each entry covers the exact name and every temp/lock sibling;
+// the excluded private DIRS (daemon/ide/backups) cross separately as the manifest's
+// EntryPrivate entries. These MUST stay in sync with PrivateEntry's file-family
+// arms above — together they are the one private-name policy.
+var PrivatePrefixes = []string{
+	".claude.json",
+	".credentials.json",
+	".last-update-result",
+	"remote-settings.json",
+}

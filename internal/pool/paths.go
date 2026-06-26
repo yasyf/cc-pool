@@ -88,25 +88,20 @@ func LogPath() string {
 	return stateDir.Path("daemon.log")
 }
 
-// MountsSocketPath is the mount-holder's unix socket path.
-func MountsSocketPath() string {
-	return stateDir.Path("mounts.sock")
+// BridgeSocketPath is the daemon's content.BridgeServer data socket
+// (~/.cc-pool/bridge.sock): the shared holder dials it to fetch cc-pool's
+// synthetic entries (the merged .claude.json, the injected settings.json) for
+// every mount whose ContentSocket is this path. The daemon binds it; the holder
+// connects to it.
+func BridgeSocketPath() string {
+	return stateDir.Path("bridge.sock")
 }
 
-// MountHolderLogPath is the mount-holder log path.
+// MountHolderLogPath is the dev-spawned holder's log path. Production launches the
+// signed fusekit-holder cask via launchd (which owns its own log); only a
+// daemon-spawned dev holder (mountd.Spawn) is directed here.
 func MountHolderLogPath() string {
 	return stateDir.Path("mount-holder.log")
-}
-
-// HolderBinDir is the stable, non-versioned directory under which the mount
-// holder binary is materialized as a copy (~/.cc-pool/bin), passed to fusekit
-// as mountd.Spawn.StableExecDir. macOS tccd keys the one-time volume-access
-// grant on the holder's resolved path, and Homebrew installs each version at a
-// new Cellar path; spawning from this fixed copy (whose embedded Developer-ID
-// requirement survives the byte copy) keeps the grant across versions instead
-// of re-prompting every upgrade.
-func HolderBinDir() string {
-	return stateDir.Path("bin")
 }
 
 // StatusSnapshotPath is the daemon's on-disk status mirror

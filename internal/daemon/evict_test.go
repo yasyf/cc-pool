@@ -257,7 +257,7 @@ func guardKillSocketPeer(t *testing.T) {
 // socket path — its os.Remove on a believed-stale socket is exactly the
 // hazard the lock exists to prevent (the loser would unlink the winner's
 // freshly-bound socket, leaving an invisible daemon running its own scheduler
-// and holder supervisor).
+// and heal loop).
 func TestListenRefusedWhileLockHeld(t *testing.T) {
 	t.Run("mid-start peer (no health answer) refused", func(t *testing.T) {
 		sockDir, err := os.MkdirTemp("/tmp", "ccp-lk")

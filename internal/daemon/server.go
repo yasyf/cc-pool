@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,6 +22,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/proc"
@@ -79,7 +81,6 @@ type Server struct {
 	reservations map[int]time.Time // accountID -> reserved-at
 	converting   map[int]bool      // accountID -> overlay conversion in flight
 	polling      map[int]bool      // accountID -> scheduler/reconcile owns the dir this iteration
-	replacing    bool              // a holder replacement is in flight; fences NEW conversions (see beginReplace)
 	rlStreak     map[int]int       // accountID -> consecutive 429 count
 	// authStreak counts consecutive unrecovered 401s per account; at
 	// needsLoginAfter the account's poll backs off to needsLoginPollInterval
@@ -91,7 +92,7 @@ type Server struct {
 	lastAuthAttempt map[int]time.Time
 
 	// fuseGateFn overrides the migrate handler's fuse-capability gate; nil
-	// means the real check (FuseBuilt + probe mount). Tests inject outcomes
+	// means the real check (CanHostFuse + probe mount). Tests inject outcomes
 	// alongside Manager.OverlayFor.
 	fuseGateFn func() (fkoverlay.Backend, string)
 
@@ -109,55 +110,32 @@ type Server struct {
 	// exec'd its claude yet.
 	startedAt time.Time
 
-	// holderLog receives a spawned mount holder's stdout/stderr.
+	// holderLog receives a dev-spawned holder's stdout/stderr (production
+	// launches the signed cask via launchd, which owns its own log).
 	holderLog string
 
-	// superviseInterval is the holder supervision cadence; zero means
-	// defaultSuperviseInterval. Tests shrink it.
-	superviseInterval time.Duration
+	// healInterval is the steady-state heal-loop cadence; zero means
+	// defaultHealInterval. Tests shrink it.
+	healInterval time.Duration
 
-	// holderGoneWait bounds waiting for a retiring holder to release its
-	// socket after acking Shutdown; zero means defaultHolderGoneWait. Tests
-	// shrink it.
-	holderGoneWait time.Duration
-
-	// spawnHolder overrides holder spawning; nil means pool.SpawnHolder,
-	// which only the fuse build can perform. Tests inject outcomes — which
-	// also lets pure builds exercise the supervision flow.
-	spawnHolder func(socket, logPath string, timeout time.Duration) error
-
-	// killHolderPeer overrides the wedged-holder escape hatch; nil means
-	// mountd.Client.KillPeer, which resolves the socket's current peer and
-	// signals it only when it matches wantPID — identity check and kill share
-	// one resolution, so a successor that bound the socket in between can never
-	// be shot. Tests inject it so no real process is ever signalled.
-	killHolderPeer func(socket string, wantPID int) (int, error)
-
-	// peerPID overrides peer-pid lookup on the holder socket — the identity
-	// check gating the wedged-holder kill (the kill must land only on the
-	// exact process that was gated, never a successor that bound the socket
-	// in between); nil means mountd.Client.PeerPID. Tests inject it so no real
-	// socket peer is ever resolved.
-	peerPID func(socket string) (int, error)
-
-	// peerAlive overrides the reviveHolder liveness gate — true when the holder
-	// socket still has a live peer (alive-but-unresponsive: defer, never
-	// force-unmount) vs false (genuinely gone: revive). nil means
-	// mountd.Client.PeerAlive. Tests inject it so revive paths run without a
-	// real socket; the default is false so a fake holder reads as dead.
+	// peerAlive overrides the holder-liveness seam — true when the shared holder
+	// socket still has a live peer (saturated-but-alive: wait it out) vs false
+	// (gone). nil means mountd.Client.PeerAlive. Tests inject it so the heal
+	// paths run without a real socket; the default is false so a fake holder
+	// reads as dead.
 	peerAlive func(socket string) bool
 
-	// sup is the generic holder supervisor (revive / spare / replace, spawn
-	// backoff, crash-loop breaker, version-skew settle). Constructed in serve
-	// before supervision starts; only the supervise goroutine drives it.
-	sup *proc.Supervisor
-	// policy is the cc-pool adapter behind sup — proc.Policy plus the holder
-	// child-control callbacks and the reconstructed status/log surfaces.
-	policy *holderPolicy
-	// rowRetry is the per-account remount backoff ledger for fuse rows the
-	// holder cannot vouch for (see retryUnvouchedFuseRows) — the cc-pool-owned
-	// half of supervision state. Lazily initialized; only the supervise
+	// contentSource is the content.Source the daemon's BridgeServer serves to the
+	// shared holder over the bridge — the merged .claude.json and the injected
+	// settings.json — for every cc-pool mount. Constructed in Run.
+	contentSource *overlay.PoolContentSource
+	// lastContentHealth dedups the content-source health log; only the heal
 	// goroutine touches it — no lock.
+	lastContentHealth string
+
+	// rowRetry is the per-account remount backoff ledger for fuse rows the
+	// holder cannot vouch for (see retryUnvouchedFuseRows). Lazily initialized;
+	// only the heal goroutine touches it — no lock.
 	rowRetry map[int]rowRetryState
 }
 
@@ -173,12 +151,13 @@ func Run(ctx context.Context) error {
 	s := &Server{
 		m:               m,
 		socket:          pool.SocketPath(),
-		holderSocket:    pool.MountsSocketPath(),
+		holderSocket:    mountd.DefaultHolderSocket(),
 		holderLog:       pool.MountHolderLogPath(),
 		snapshot:        pool.StatusSnapshotPath(),
 		log:             log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
 		evictTimeout:    defaultEvictTimeout,
 		startedAt:       time.Now(),
+		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 		reservations:    map[int]time.Time{},
 		converting:      map[int]bool{},
 		polling:         map[int]bool{},
@@ -250,27 +229,29 @@ func (s *Server) serve(ctx context.Context) error {
 	//     can't make a freshly-started daemon look "not responding" to a
 	//     waiting `ccp add`. It only stamps the OAuth User-Agent, whose sole
 	//     consumer is the scheduler's first poll.
-	//  3. Reconcile overlays, then start holder supervision, then run the
+	//  3. Reconcile overlays, then start the heal loop, then run the
 	//     scheduler. These stay sequential in one goroutine — not bare ones —
-	//     because reconcileOverlays must finish before either the
-	//     supervisor's first tick or the scheduler's first poll, both of
+	//     because reconcileOverlays must finish before either the heal
+	//     loop's first tick or the scheduler's first poll, both of
 	//     which can touch fuse Setup (a check-then-act on the same
 	//     mountpoint).
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		// Bind the content bridge first: the shared holder fetches cc-pool's
+		// synthetic entries over it, and holderfs.Build fails a mount loudly if the
+		// consumer is unreachable, so it must be up before any mount registers.
+		s.startContentBridge(ctx)
 		s.holder.refresh(s.holderClient())
 		oauth.SetUserAgentVersion(detectClaudeVersion(ctx))
 		s.reconcileOverlays(ctx)
-		// Supervision starts only after the startup reconcile so it never
-		// races the initial mounts; from here it owns crash→respawn→remount
-		// and the idle-gated replacement of a version-skewed holder. The
-		// supervisor is built here, on the supervise goroutine that is its
-		// sole mutator. The Add(1) runs inside this already-tracked goroutine,
+		// The steady-state heal loop starts only after the startup reconcile so it
+		// never races the initial mounts. cc-pool no longer supervises the shared
+		// holder's lifecycle (the cask's launchd does); this is only the per-account
+		// mount-health net. The Add(1) runs inside this already-tracked goroutine,
 		// so the counter is ≥1 and cannot race a zero-counter Wait.
-		s.buildSupervisor()
 		s.wg.Add(1)
-		go func() { defer s.wg.Done(); s.superviseHolder(ctx) }()
+		go func() { defer s.wg.Done(); s.healFuseRows(ctx) }()
 		s.scheduler(ctx)
 	}()
 
@@ -314,8 +295,8 @@ func (s *Server) serve(ctx context.Context) error {
 // Without it, two concurrently starting daemons (a launchd KeepAlive respawn
 // racing a manual start or a brew-services kickstart) both pass the health
 // probe before either binds; the loser's os.Remove unlinks the winner's
-// freshly-bound socket, the invisible daemon keeps its scheduler and holder
-// supervisor running with in-memory reservations nobody can see, and its
+// freshly-bound socket, the invisible daemon keeps its scheduler and heal
+// loop running with in-memory reservations nobody can see, and its
 // *net.UnixListener.Close unlinks by PATH at exit — deleting the visible
 // daemon's live socket too. The lock file itself is never removed: unlinking a
 // held lock file would let a third daemon flock a fresh inode while the old
@@ -548,7 +529,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	}
 	best := bySnap[r.AccountID]
 	// Deep-probe the winner before handing it to a session — the only probe of
-	// an idle mirror (the periodic supervisor probe skips session-less mounts).
+	// an idle mirror (the periodic heal probe skips session-less mounts).
 	// A wedge marks it (excluding it from the retry's ranking) and refuses; the
 	// client retries onto a healthy account, whose own probe runs then.
 	if !s.probeWinnerReady(best.Account) {
@@ -686,19 +667,14 @@ func (s *Server) tryReserve(id int) bool {
 }
 
 // beginConvert claims an account for overlay conversion iff it has no live
-// reservation, no conversion already in flight, the scheduler/reconcile is
-// not mid-iteration on its dir, and no holder replacement is in flight (a
-// conversion toward fuse would Mount through the very holder being retired —
-// see beginReplace). The check-and-claim is one critical section, closing the
-// race against tryReserve and beginPoll; the converting flag — not the mutex
-// — then owns the account across the conversion's I/O, the same way
+// reservation, no conversion already in flight, and the scheduler/reconcile is
+// not mid-iteration on its dir. The check-and-claim is one critical section,
+// closing the race against tryReserve and beginPoll; the converting flag — not
+// the mutex — then owns the account across the conversion's I/O, the same way
 // reservations bridge select→spawn.
 func (s *Server) beginConvert(id int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.replacing {
-		return false
-	}
 	if t, ok := s.reservations[id]; ok && time.Since(t) <= reservationTTL {
 		return false
 	}
@@ -714,19 +690,16 @@ func (s *Server) beginConvert(id int) bool {
 
 // beginConvertUnderPoll claims an account for an overlay conversion run from
 // inside a poll iteration (the fuse→symlink fallback) iff it has no live
-// reservation, no conversion already in flight, and no holder replacement in
-// flight. Unlike beginConvert it tolerates the caller's own poll claim —
-// healFuse runs under one — which is what makes the fallback claim-atomic
-// against select: once converting is set, tryReserve refuses for the whole
-// ConvertOverlay, closing the gate→convert window a snapshot check would
-// leave open. Callers must hold the account's poll claim (or otherwise be the
-// dir's sole owner) so two conversions can never interleave.
+// reservation and no conversion already in flight. Unlike beginConvert it
+// tolerates the caller's own poll claim — healFuse runs under one — which is
+// what makes the fallback claim-atomic against select: once converting is set,
+// tryReserve refuses for the whole ConvertOverlay, closing the gate→convert
+// window a snapshot check would leave open. Callers must hold the account's
+// poll claim (or otherwise be the dir's sole owner) so two conversions can
+// never interleave.
 func (s *Server) beginConvertUnderPoll(id int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.replacing {
-		return false
-	}
 	if t, ok := s.reservations[id]; ok && time.Since(t) <= reservationTTL {
 		return false
 	}
@@ -744,54 +717,6 @@ func (s *Server) beginConvertUnderPoll(id int) bool {
 func (s *Server) endConvert(id int) {
 	s.mu.Lock()
 	delete(s.converting, id)
-	s.mu.Unlock()
-}
-
-// beginReplace claims every given fuse account for a holder replacement and
-// fences NEW conversions pool-wide, in one critical section. It refuses while
-// ANY conversion is in flight anywhere — a symlink→fuse migrate holds its
-// converting claim on a row still reading symlink (the row flips at the end)
-// and is about to Mount through the holder being retired, so per-fuse-row
-// checks cannot see the dangerous direction — and while any given account
-// holds a live reservation or is mid-poll. Once claimed, tryReserve refuses
-// every fuse row and beginConvert/beginConvertUnderPoll refuse pool-wide
-// until endReplace: no select can land on a dir while the retiring holder
-// sweeps its mirror out from under it (the sweep runs BEFORE the Shutdown
-// reply, so the unprotected window would otherwise span the whole sweep), and
-// no conversion can start against a holder mid-replacement. Returns "" on
-// success, else the blocking reason; on refusal nothing is claimed.
-func (s *Server) beginReplace(ids []int) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.converting) > 0 {
-		return "an overlay conversion is in flight"
-	}
-	for _, id := range ids {
-		if t, ok := s.reservations[id]; ok && time.Since(t) <= reservationTTL {
-			return fmt.Sprintf("acct-%02d is reserved by a pending select", id)
-		}
-		if s.polling[id] {
-			return fmt.Sprintf("acct-%02d is mid-poll", id)
-		}
-	}
-	if s.converting == nil {
-		s.converting = map[int]bool{}
-	}
-	for _, id := range ids {
-		s.converting[id] = true
-	}
-	s.replacing = true
-	return ""
-}
-
-// endReplace releases a holder replacement's per-account claims and the
-// pool-wide conversion fence.
-func (s *Server) endReplace(ids []int) {
-	s.mu.Lock()
-	for _, id := range ids {
-		delete(s.converting, id)
-	}
-	s.replacing = false
 	s.mu.Unlock()
 }
 
@@ -854,17 +779,17 @@ func (s *Server) mountReady(a store.Account) bool {
 
 // probeWinnerReady deep-probes a chosen fuse account's mirror at select time —
 // right before it is handed to a session — and reports whether it is safe to
-// assign. This is the ONLY probe of an IDLE mirror: the periodic supervisor
+// assign. This is the ONLY probe of an IDLE mirror: the periodic heal
 // probe skips mounts with no live session, so an idle mirror's partial wedge
 // (shallow-alive, bulk reads hang) would otherwise go undetected until a
 // session landed on it and hung. A live wedge is force-marked wedged — so
-// selection excludes it AND the supervisor remounts it within a tick — and
+// selection excludes it AND the heal loop remounts it within a tick — and
 // reads not-ready; the caller refuses the select and the client retries (onto
 // a healthy account, whose own probe runs on that retry, or the same one once
-// the supervisor has remounted it). It is bounded by the 5s deep-probe timeout
+// the heal loop has remounted it). It is bounded by the 5s deep-probe timeout
 // — under the select handler's 10s connection deadline — so it never remounts
-// inline (a teardown+remount can take far longer); the supervisor owns the
-// heal. Non-fuse accounts and healthy or pre-probe (ErrProbeMissing) mirrors
+// inline (a teardown+remount can take far longer); the heal loop owns the
+// remount. Non-fuse accounts and healthy or pre-probe (ErrProbeMissing) mirrors
 // read ready. A single observed wedge is enough (no debounce): an idle mirror
 // about to serve a NEW session has no live session a false positive could
 // orphan.
@@ -875,7 +800,7 @@ func (s *Server) probeWinnerReady(a store.Account) bool {
 	err := deepProbe(a.ConfigDir)
 	if err != nil && !errors.Is(err, overlay.ErrProbeMissing) {
 		s.holder.markDeepWedged(a.ConfigDir)
-		s.log.Printf("acct-%02d mirror wedged at select (serves metadata but hangs reads); excluding it and letting the supervisor remount it — relaunch once it recovers: %v", a.ID, err)
+		s.log.Printf("acct-%02d mirror wedged at select (serves metadata but hangs reads); excluding it and letting the heal loop remount it — relaunch once it recovers: %v", a.ID, err)
 		return false
 	}
 	if msg := s.holder.recordDeep(a.ConfigDir, err); msg != "" {
@@ -884,9 +809,43 @@ func (s *Server) probeWinnerReady(a store.Account) bool {
 	return true
 }
 
-// holderClient returns a client for the mount-holder socket.
+// holderClient returns an Owner-scoped client for the shared mount-holder socket:
+// every List/Poll/Reclaim is filtered to cc-pool's own mounts, so the daemon never
+// observes or disturbs another tenant's (e.g. cc-notes').
 func (s *Server) holderClient() *mountd.Client {
-	return mountd.NewClient(s.holderSocket)
+	return &mountd.Client{Socket: s.holderSocket, Owner: pool.HolderOwner}
+}
+
+// startContentBridge binds the daemon's content.BridgeServer and waits for it to
+// accept connections, so the first mount's manifest fetch over the bridge succeeds
+// (holderfs.Build fails a mount loudly if the consumer is unreachable). The server
+// runs until ctx is cancelled, tracked by wg.
+func (s *Server) startContentBridge(ctx context.Context) {
+	sock := pool.BridgeSocketPath()
+	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
+		s.log.Printf("content bridge: create socket dir: %v", err)
+		return
+	}
+	bridge := &content.BridgeServer{Socket: sock, Source: s.contentSource, Version: version.String(), Log: s.log}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		// Fail loud on a bind failure: every fuse mount's manifest fetch depends on
+		// this bridge, so a dead bridge (and the every-mount-defers state it causes)
+		// must be visible, not swallowed. A clean ctx-cancel shutdown returns nil.
+		if err := bridge.Run(ctx); err != nil && ctx.Err() == nil {
+			s.log.Printf("content bridge: serve %s failed; fuse mounts will defer until the daemon restarts: %v", sock, err)
+		}
+	}()
+	cl := content.NewBridgeClient(sock)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil || cl.Available() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	s.log.Printf("content bridge: socket %s did not come up within 3s; mounts may defer until it does", sock)
 }
 
 // scan resolves session scanning through the test seam; nil means
@@ -1068,25 +1027,70 @@ func (s *Server) reconcileOverlays(ctx context.Context) {
 		s.reconcileAccount(ctx, a)
 		s.endPoll(a.ID)
 	}
+	// Clear any wedged carcass on an accounts/ subdir that no row owns — a
+	// pre-row `ccp add` mount whose holder died and whose add never finalized.
+	// Nothing row-driven (the heal loop, reconcileAccount) ever names such a
+	// dir, so this startup sweep is its only cleaner.
+	s.sweepOrphanMountpoints(ctx, accts)
+}
+
+// sweepOrphanMountpoints force-unmounts any mountpoint under the accounts dir
+// that no current account row owns. `ccp add` establishes an account's fuse
+// mount before its row exists (the row lands at FinalizeAdd, after the
+// through-mount identity read); if the holder dies and a hard-interrupted add
+// never finalizes, that wedged-NFS carcass has no row, so neither the row-driven
+// heal loop nor reconcileAccount ever names its dir to clear it — a lingering
+// wedged mount that can freeze the machine. This startup sweep is its only
+// cleaner. forceUnmount is bounded and never touches base; both the ReadDir of
+// the parent and overlayMounted (Getfsstat) are non-blocking, so a wedged child
+// mount cannot park the sweep.
+func (s *Server) sweepOrphanMountpoints(ctx context.Context, accts []store.Account) {
+	rowDirs := make(map[string]bool, len(accts))
+	for _, a := range accts {
+		rowDirs[a.ConfigDir] = true
+	}
+	entries, err := os.ReadDir(pool.AccountsDir())
+	if err != nil {
+		if !os.IsNotExist(err) {
+			s.log.Printf("orphan mount sweep: read accounts dir: %v", err)
+		}
+		return
+	}
+	for _, e := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(pool.AccountsDir(), e.Name())
+		if rowDirs[dir] || !overlayMounted(dir) {
+			continue
+		}
+		s.log.Printf("clearing orphaned mountpoint with no account row (pre-row add carcass?): %s", dir)
+		if err := forceUnmount(dir); err != nil {
+			s.log.Printf("orphan mount sweep: force-unmount %s: %v", dir, err)
+		}
+	}
 }
 
 // fuseHardUnavailable reports a reason iff a single capability probe proves this
 // machine cannot host fuse mounts right now — the holder is reachable, serves no
 // live mount, and a throwaway probe mount is REJECTED OUTRIGHT (ErrMountFailed:
 // fuse-t missing or unloadable, the kernel refusing the mount). It returns "" in
-// every other case so the per-account heal stays in charge: a pure build (no
-// holder to probe), a holder not yet reachable (the supervisor will spawn one;
-// the per-account heal mounts through it), a holder already serving a live mount
+// every other case so the per-account heal stays in charge: no cask holder to
+// probe, a holder not yet reachable (the provider's Setup will lazily (re)spawn
+// one; the per-account heal mounts through it), a holder already serving a live mount
 // (capability self-evident), or a probe merely PENDING the macOS "Network
 // Volumes" grant (the bounded per-row TCC grace handles that — a desktop user
 // may still grant it). One probe here replaces a doomed mount per account when
 // fuse genuinely cannot work.
 func (s *Server) fuseHardUnavailable() string {
 	if !s.canSpawnHolder() {
-		return "" // pure build: inherited fuse rows are inert; nothing to probe
+		return "" // no cask holder to probe; the per-account heal converts each inherited fuse row to symlink as its mount fails
 	}
 	if healthy, _ := s.holder.view(); !healthy {
-		return "" // holder not reachable yet: leave it to the supervisor + per-account heal
+		return "" // holder not reachable yet: the provider's Setup respawns it; leave it to the per-account heal
 	}
 	if s.holder.wireStatus().Mounts > 0 {
 		return "" // already serving a live mount: capability is proven
@@ -1197,19 +1201,17 @@ var errSweepStranded = errors.New("sweep stranded private files")
 // mount blocked pending the macOS volume-access grant all retry next
 // poll, and only a genuine mount failure falls back to symlink — itself gated
 // on the account being idle (see fallbackToSymlink). Used by the startup
-// reconcile, the scheduler's per-poll self-heal, and the holder supervisor;
-// callers hold the account's poll claim or the holder replace's converting
-// claim (under the latter, the fallback's beginConvertUnderPoll refuses and
-// the conversion defers to the next poll — by design).
+// reconcile, the scheduler's per-poll self-heal, and the heal loop; callers
+// hold the account's poll claim.
 func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 	err := s.mountFuse(a)
 	switch {
 	case err == nil:
 		return healMounted
 	case errors.Is(err, mountd.ErrHolderUnavailable), errors.Is(err, mountd.ErrBusy):
-		// RemoteProvider.Setup already attempts a spawn, and superviseHolder
-		// owns respawn policy (with backoff), so there is nothing more to do
-		// this poll.
+		// RemoteFuseProvider.Setup already attempts a lazy (re)spawn of the cask
+		// holder, and the cask's launchd owns its respawn policy, so there is
+		// nothing more to do this poll.
 		s.log.Printf("acct-%02d mount deferred (holder unavailable or dir busy), retrying next poll: %v", a.ID, err)
 		return healRetry
 	case errors.Is(err, overlay.ErrUnmountWedged):
@@ -1255,6 +1257,13 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 		// so this is not a mount verdict. Converting would hit the same collision
 		// the other way (and never auto-reverts), so retry next poll, loudly.
 		s.log.Printf("acct-%02d mount deferred (could not sweep stranded private files before mounting), retrying next poll: %v", a.ID, err)
+		return healRetry
+	case errors.Is(err, mountd.ErrContentUnavailable):
+		// The holder refused the mount ONLY because cc-pool's content bridge was
+		// unreachable — the daemon is likely mid-restart, not a mount verdict. A
+		// permanent symlink demotion here would be irreversible (the heal loop only
+		// re-heals fuse rows), so defer to the next poll once the bridge is back up.
+		s.log.Printf("acct-%02d mount deferred (content bridge unavailable, daemon mid-restart?), retrying next poll: %v", a.ID, err)
 		return healRetry
 	default:
 		s.log.Printf("acct-%02d mount failed; attempting gated symlink fallback: %v", a.ID, err)

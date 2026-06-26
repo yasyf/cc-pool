@@ -25,7 +25,7 @@ func swapDeepProbe(t *testing.T, fn func(dir string) error) {
 }
 
 // shrinkProbeInterval sets the periodic-probe throttle for one test so
-// consecutive supervise ticks each re-probe (production is 30s; the supervisor
+// consecutive heal ticks each re-probe (production is 30s; the heal loop
 // ticks faster, so an unshrunk interval would let only one probe land per
 // test). Restored after; no-parallel.
 func shrinkProbeInterval(t *testing.T, d time.Duration) {
@@ -112,7 +112,7 @@ func TestRecordDeepMissingIsNoVerdict(t *testing.T) {
 
 // TestDeepWedgedFoldsIntoReadyAndHeldDead pins the readiness fold: a
 // shallow-live mirror the daemon's probe marks wedged reads NOT ready (so
-// selection excludes it) and held-dead with the wedge bit (so the supervisor
+// selection excludes it) and held-dead with the wedge bit (so the heal loop
 // remounts it). noteMounted (a fresh remount) clears the verdict.
 func TestDeepWedgedFoldsIntoReadyAndHeldDead(t *testing.T) {
 	var h holderState
@@ -140,10 +140,10 @@ func TestDeepWedgedFoldsIntoReadyAndHeldDead(t *testing.T) {
 
 // TestIdleMountsNeverPeriodicallyProbed is the load-bearing test for the
 // high-traffic fix: a shallow-live mount backing NO live session is never
-// deep-probed by the supervisor, no matter how many ticks elapse. If this
+// deep-probed by the heal loop, no matter how many ticks elapse. If this
 // regresses, the holder's old probe-every-mount waste returns to the daemon.
 func TestIdleMountsNeverPeriodicallyProbed(t *testing.T) {
-	s, dirs, _, _ := newSuperviseServer(t)
+	s, dirs, _ := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, []mountd.MountInfo{
 		{Dir: dirs[1], Base: "/base", Live: true},
@@ -154,7 +154,7 @@ func TestIdleMountsNeverPeriodicallyProbed(t *testing.T) {
 	swapDeepProbe(t, func(string) error { atomic.AddInt32(&probes, 1); return nil })
 
 	for i := 0; i < 5; i++ {
-		s.superviseTick(t.Context())
+		healTick(s, t.Context())
 	}
 	if got := atomic.LoadInt32(&probes); got != 0 {
 		t.Fatalf("deep probes against an idle mount = %d, want 0 (idle mounts are never periodically probed)", got)
@@ -166,7 +166,7 @@ func TestIdleMountsNeverPeriodicallyProbed(t *testing.T) {
 // consecutive failures wedge it, and the same tick's heal remounts it (logging
 // the wedge copy + relaunch guidance) and clears the verdict.
 func TestInUseMountProbedAndHealedWithinInterval(t *testing.T) {
-	s, dirs, fake, _ := newSuperviseServer(t)
+	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, []mountd.MountInfo{
 		{Dir: dirs[1], Base: "/base", Live: true},
@@ -180,12 +180,12 @@ func TestInUseMountProbedAndHealedWithinInterval(t *testing.T) {
 	s.log = log.New(&buf, "", 0)
 
 	// Tick 1: one strike — still ready (debounce), no remount.
-	s.superviseTick(t.Context())
+	healTick(s, t.Context())
 	if fake.setupCount() != 0 {
 		t.Fatalf("setups after one strike = %d, want 0 (a wedge needs two)", fake.setupCount())
 	}
 	// Tick 2: second strike wedges → not ready → remounted this pass.
-	s.superviseTick(t.Context())
+	healTick(s, t.Context())
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups after the wedge = %d, want the mirror remounted once", fake.setupCount())
 	}
@@ -204,9 +204,9 @@ func TestInUseMountProbedAndHealedWithinInterval(t *testing.T) {
 // TestProbeOnAssignRefusesIdleWedge pins the select-time probe — the ONLY
 // probe of an idle mirror: a forced select of a shallow-live-but-wedged mount
 // is refused (a single observed wedge is actionable, no debounce) and the
-// verdict is marked so selection excludes it; the supervisor then remounts it.
+// verdict is marked so selection excludes it; the heal loop then remounts it.
 func TestProbeOnAssignRefusesIdleWedge(t *testing.T) {
-	s, dirs, fake, _ := newSuperviseServer(t)
+	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	// The holder vouches for acct-1's mirror (shallow-live), so mountReady
 	// passes — but the idle mirror is partially wedged, which only the
@@ -226,16 +226,16 @@ func TestProbeOnAssignRefusesIdleWedge(t *testing.T) {
 		t.Fatal("a wedged mirror still reads ready; selection must exclude it")
 	}
 
-	// The supervisor heals the wedge the select surfaced. The mount stays idle
+	// The heal loop heals the wedge the select surfaced. The mount stays idle
 	// (no session), so the periodic probe never runs — the markDeepWedged
 	// verdict alone makes the row not-ready and drives the remount, which
 	// clears the verdict.
 	s.holderSocket = startCannedHolder(t, []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}})
-	s.superviseTick(t.Context())
+	healTick(s, t.Context())
 	if fake.setupCount() == 0 {
-		t.Fatal("supervisor did not remount the wedged mirror the select surfaced")
+		t.Fatal("the heal loop did not remount the wedged mirror the select surfaced")
 	}
 	if !s.holder.ready(dirs[1]) {
-		t.Fatal("mirror not vouched for after the supervisor remount")
+		t.Fatal("mirror not vouched for after the heal-loop remount")
 	}
 }

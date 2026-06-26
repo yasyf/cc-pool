@@ -65,8 +65,8 @@ func (s *Server) scheduler(ctx context.Context) {
 // refreshing the token only for idle accounts.
 func (s *Server) pollOnce(ctx context.Context) {
 	// Refresh the holder cache first: every select until the next poll keys
-	// fuse readiness on it. (superviseHolder owns respawn policy; this is
-	// only the cache.)
+	// fuse readiness on it. (The faster heal loop, healFuseRows, also refreshes
+	// and re-registers unvouched rows; this is just the per-poll prime.)
 	s.holder.refresh(s.holderClient())
 
 	// Only reconcile sessions on a successful scan: AlivePIDs always returns a

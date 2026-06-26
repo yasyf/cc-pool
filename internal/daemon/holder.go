@@ -10,37 +10,24 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/proc"
-	"github.com/yasyf/fusekit/version"
 )
 
 const (
-	// defaultSuperviseInterval is the holder supervision cadence: a crashed
-	// holder is respawned and its mirrors remounted in ~10s instead of the
-	// scheduler's ~3.5-minute poll.
-	defaultSuperviseInterval = 10 * time.Second
-
-	// spawnBackoffBase/spawnBackoffCap bound the respawn backoff: consecutive
-	// spawn failures double the wait 10s → 20s → … capped at 10 minutes.
-	spawnBackoffBase = 10 * time.Second
-	spawnBackoffCap  = 10 * time.Minute
+	// defaultHealInterval is the steady-state heal cadence: a fuse row the shared
+	// holder cannot vouch for is re-registered (or retreated to symlink) in ~10s
+	// instead of waiting for the scheduler's ~3.5-minute poll.
+	defaultHealInterval = 10 * time.Second
 
 	// remountBackoffBase/remountBackoffCap bound the per-row remount backoff
 	// for fuse rows the holder cannot vouch for (see retryUnvouchedFuseRows):
 	// consecutive failed heals double the wait 10s → 20s → … capped at 2
-	// minutes. The cap sits deliberately under the 180s scheduler period —
-	// supervision must never be the slower recovery path.
+	// minutes. The cap sits deliberately under the 180s scheduler period — the
+	// heal must never be the slower recovery path.
 	remountBackoffBase = 10 * time.Second
 	remountBackoffCap  = 2 * time.Minute
-
-	// defaultHolderGoneWait bounds waiting for a retiring holder to release
-	// its socket after acking Shutdown — the holder's own sweep runs under a
-	// 60s op deadline and the client's Shutdown timeout is 65s, so this sits
-	// just above both.
-	defaultHolderGoneWait = 70 * time.Second
 )
 
 // remountBreakerThreshold is the circuit-breaker limit on retryUnvouchedFuseRows:
@@ -68,46 +55,13 @@ const remountBreakerThreshold = 5
 // per-row grace only governs the genuinely-pending case.
 const tccBreakerThreshold = 6
 
-// reviveBreakerThreshold is the holder-level circuit breaker. After this many
-// CONSECUTIVE holder deaths (each force-unmounting EVERY mount and losing
-// in-flight writes — see reviveHolder) without the holder ever returning at
-// THIS daemon's version — a stuck old holder we cannot replace under live
-// sessions, or fuse-t/NFS gone unavailable so a holder will not spawn at all —
-// the supervisor stops reviving it and falls every fuse row back to the
-// always-available symlink overlay (retreatAllFuseRows). Lower than
-// remountBreakerThreshold because a holder-level loop churns the WHOLE pool
-// each cycle, so its data-loss blast radius warrants a faster retreat. A clean
-// holder restart only reaches 1 (the next settled tick at our version resets
-// it), so this never false-trips on a normal respawn or a one-off death.
-const reviveBreakerThreshold = 3
-
-// reviveHazardWindow bounds what counts as a CONSECUTIVE death for the
-// crash-loop breaker: two deaths farther apart than this start a fresh cluster
-// (reviveHazard resets to 1). Without it, a holder that settles healthy at a
-// spawnedSkew version between deaths (which deliberately does NOT reset the
-// count — see reviveHazard) would accumulate unrelated, far-apart transient
-// deaths over its whole lifetime and eventually demote a perfectly healthy
-// pool. A real crash loop re-dies every few minutes, well inside this window;
-// genuinely occasional deaths fall outside it and never accumulate.
-const reviveHazardWindow = 30 * time.Minute
-
-// degradedStrikes debounces the degraded verdict (holder alive but its List
-// failed): a single transient List blip under load must not trigger a
-// destructive forced converge or a needless heal sweep, so superviseTick acts
-// on a degraded holder only after this many CONSECUTIVE degraded ticks. Two —
-// the same one-transient-blip tolerance as deepWedgeStrikes — so a persistently
-// degraded skewed holder (the serial-List incident) still converges on the next
-// tick, while a one-off List timeout is waited out.
-const degradedStrikes = 2
-
 // forceUnmount force-unmounts an orphaned fuse carcass directly, without
 // routing through the (possibly dead) holder; seamed so tests assert the calls
 // without real mounts. Production: overlay.ForceUnmount (bounded).
 var forceUnmount = overlay.ForceUnmount
 
 // rowRetryState is one fuse row's remount-backoff bookkeeping in s.rowRetry,
-// the cc-pool-owned half of supervision state that stayed in the daemon when
-// the generic state machine moved to proc.Supervisor.
+// driving the steady-state heal loop's per-row backoff and circuit breakers.
 type rowRetryState struct {
 	failures int       // consecutive failed heal attempts (drives the backoff window)
 	retryAt  time.Time // backoff: earliest next heal attempt
@@ -126,85 +80,19 @@ type rowRetryState struct {
 	tccBlocks int
 }
 
-// buildSupervisor constructs the holder supervisor and its cc-pool policy
-// adapter. Called once on the supervise goroutine before its loop starts (so
-// that goroutine stays the sole mutator of supervisor state); tests that drive
-// s.sup.Tick directly call it from their setup. The generic mechanism — revive
-// under spawn backoff, the crash-loop breaker, the version-skew settle — is
-// proc.Supervisor's; every cc-pool judgement and child-control effect is wired
-// through the holderPolicy, which implements the full proc.Policy. The Spawn's
-// Override routes the actual bring-up through s.spawn (the injectable seam), so
-// proc drives the lifecycle without exec'ing a child itself — production
-// delegates to pool.SpawnHolder, tests to the canned-holder recorder.
-func (s *Server) buildSupervisor() {
-	p := &holderPolicy{s: s}
-	s.policy = p
-	// Wire the fusekit child-control adapter: it owns the Shutdown RPC, the
-	// gone-wait, the peer-gated captured-pid Kill, and the Reconcile routing;
-	// cc-pool's app-specific re-establishment rides its callbacks. holderClient()
-	// caches a Client for the fixed-for-life holder socket (tests set
-	// s.holderSocket before the first tick builds the supervisor), and KillPeer
-	// routes the reap through cc-pool's own kill seam (killPeerPid ->
-	// killHolderPeer / mountd.Client.KillPeer) so it stays peer-gated.
-	p.retire = &mountd.RetirePolicy{
-		Client:   s.holderClient(),
-		KillPeer: func(wantPID int) (int, error) { return s.killPeerPid(s.holderSocket, wantPID) },
-		OnShutdown: func(failed []mountd.MountInfo, err error) {
-			// The holder sweeps before the Shutdown reply lands, so the cache must
-			// stop vouching either way; log the would-not-unmount dirs only on a
-			// clean reply (an errored RPC's failed-set is meaningless).
-			s.holder.markUnhealthy()
-			if err == nil && len(failed) > 0 {
-				s.log.Printf("skewed holder reported %d dir(s) that would not unmount", len(failed))
-			}
-		},
-		OnChildDied:        p.reconcileChildDied,
-		OnRespawned:        p.reconcileRespawned,
-		OnReplaceSucceeded: p.reconcileReplaceSucceeded,
-		OnReplaceAborted:   p.reconcileReplaceAborted,
-	}
-	// proc's per-leg WaitGone/reap wait is Supervisor.GoneWait; cc-pool's gone-wait
-	// for a retiring holder (holderGoneWait, tests shrink it) drives it. The actual
-	// bring-up timeout lives in the Override seam (s.spawnIfServing ->
-	// pool.SpawnHolder), so proc's come-up Spawn.Timeout is never exercised.
-	goneWait := s.holderGoneWait
-	if goneWait <= 0 {
-		goneWait = defaultHolderGoneWait
-	}
-	s.sup = &proc.Supervisor{
-		Spawn: proc.Spawn{
-			Socket:    s.holderSocket,
-			Available: func() bool { return mountd.NewClient(s.holderSocket).Available() },
-			CanHost:   func() error { return nil },
-			Override:  s.spawnIfServing,
-		},
-		MyVersion:     version.String(),
-		Policy:        p,
-		OnSpawnError:  p.onSpawnError,
-		GoneWait:      goneWait,
-		HazardWindow:  reviveHazardWindow,
-		SpawnBackoff:  proc.Backoff{Base: spawnBackoffBase, Cap: spawnBackoffCap},
-		ReviveBreaker: reviveBreakerThreshold,
-	}
-	// Fail loud at wire time if a Required field is missing, rather than
-	// nil-panicking deep inside a revive or replace.
-	if err := s.sup.Validate(); err != nil {
-		panic(fmt.Sprintf("daemon: holder supervisor misconfigured: %v", err))
-	}
-}
-
-// superviseHolder watches the detached mount holder until ctx is cancelled:
-// the generic state machine (revive a dead holder under spawn backoff and the
-// crash-loop breaker, spare an alive-but-wedged one, replace a version-skewed
-// one once the claim gate clears) is proc.Supervisor.Tick; superviseTick wraps
-// it with cc-pool's steady-state heal. proc owns no ticker of its own — the
-// consumer drives the loop, precisely because the heal-after-tick coupling
-// belongs in cc-pool. Started after the startup reconcile so it never races the
-// initial mounts.
-func (s *Server) superviseHolder(ctx context.Context) {
-	interval := s.superviseInterval
+// healFuseRows runs the steady-state heal loop on a ticker until ctx is
+// cancelled. Each pass refreshes the shared-holder cache, then re-registers (or
+// retreats to symlink) every fuse row the holder cannot vouch for. cc-pool no
+// longer owns the holder's lifecycle — the signed fusekit-holder cask is
+// launchd-managed and shared across tenants, and the provider's Setup lazily
+// (re)spawns it via the cask ExecPath — so there is no holder supervisor here,
+// only the per-account mount-health net (backoff, breakers, deep-probe wedge
+// detection, symlink-retreat). Started after the startup reconcile so it never
+// races the initial mounts.
+func (s *Server) healFuseRows(ctx context.Context) {
+	interval := s.healInterval
 	if interval <= 0 {
-		interval = defaultSuperviseInterval
+		interval = defaultHealInterval
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -213,236 +101,37 @@ func (s *Server) superviseHolder(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.superviseTick(ctx)
+			// Refresh first: the heal ticker runs far faster than the scheduler
+			// poll, so without a refresh it would act on a stale cache.
+			s.holder.refresh(s.holderClient())
+			s.retryUnvouchedFuseRows(ctx)
+			s.logContentHealth()
 		}
 	}
 }
 
-// superviseTick runs one supervision pass: the generic state machine
-// (proc.Supervisor.Tick — revive / spare / replace, spawn backoff, crash-loop
-// breaker, version-skew settle) followed by the cc-pool steady-state heal,
-// gated on the post-tick cache reading healthy and not-degraded — the same
-// outcomes the old hand-rolled tick healed under (a settled holder, or a
-// deferred skew whose rows must still reach the remount breaker). A degraded
-// or unreachable post-tick cache skips the heal: Tick already routed it
-// (force-converge / revive), and a row under a still-degraded or dead holder
-// has no live mirror to vouch for this tick. The reverse-skew converge guidance
-// and the cleared-on-settle spawn-error surface — which proc owns privately —
-// are reconstructed here from the post-tick version.
-func (s *Server) superviseTick(ctx context.Context) {
-	if s.sup == nil {
-		// Production builds the supervisor in serve before the loop; tests drive
-		// superviseTick directly after their setup, so build it lazily on the
-		// first tick — by which point holderSocket / holderGoneWait / the seams
-		// are at their test values.
-		s.buildSupervisor()
+// logContentHealth surfaces the content source's last merged/served-read and base
+// write-through failures (the in-process mirror's healthErr, now over the bridge),
+// logging only on a change so a persistent failure is not repeated every tick.
+func (s *Server) logContentHealth() {
+	if s.contentSource == nil {
+		return
 	}
-	s.sup.Tick(ctx)
-	healthy, degraded, ver := s.holder.viewState()
-	// Publish the skew verdict from this goroutine, where IsSkew is safe to call
-	// (it reads the supervisor's tick-local spawnedSkew), so wireStatus can render
-	// it from the request goroutine under holderState's lock. A reverse-skew
-	// (spawnedSkew) holder is the steady state proc never replaces — IsSkew
-	// excludes it — so it is not reported Skewed.
-	s.holder.setSkewed(healthy && s.sup.IsSkew(ver))
-	if healthy && !degraded {
-		s.policy.noteSettledVersion(ver)
-		s.retryUnvouchedFuseRows(ctx)
+	msg := ""
+	if err := s.contentSource.HealthErrors(); err != nil {
+		msg = err.Error()
+	}
+	if msg != s.lastContentHealth {
+		s.lastContentHealth = msg
+		if msg != "" {
+			s.log.Printf("content source health: %s", msg)
+		}
 	}
 }
 
-// forceUnmountOrphans force-unmounts every dir in dirs that is currently a
-// mountpoint, directly via the bounded overlay.ForceUnmount — bypassing the
-// (dead) holder entirely. A dead holder's mirrors are ALWAYS dead carcasses
-// (the cache dropped them and reviveHolder remounts them fresh), so this loses
-// nothing and removes the whole-machine hazard a wedged NFS carcass becomes
-// (the kill-9 incident: lsof/stat on the box then block forever on it). Yes it
-// yanks fds from any live session still on a dir — the mirror is already
-// wedged and a relaunch is the fix, consistent with the held-dead remount
-// policy. Each unmount is bounded inside overlay.ForceUnmount so a carcass the
-// kernel will not even MNT_FORCE cannot hang the supervise goroutine.
-// Mountpoint membership uses the bounded overlayMounted seam (a probe that
-// cannot answer reads still-mounted, so a wedged dir is unmounted rather than
-// skipped); a dir provably not a mountpoint is skipped.
-func (s *Server) forceUnmountOrphans(dirs []string) {
-	for _, dir := range dirs {
-		if !overlayMounted(dir) {
-			continue
-		}
-		if err := forceUnmount(dir); err != nil {
-			s.log.Printf("force-unmount orphaned carcass %s: %v", dir, err)
-			continue
-		}
-		s.log.Printf("force-unmounted orphaned mount %s after holder death", dir)
-	}
-}
-
-// orphanDirs is the deduplicated set of mountpoints a dead holder may have left
-// wedged: every fuse row's ConfigDir plus every carried pre-row mount dir
-// (a `ccp add` mid-login the holder served before its account row landed).
-func orphanDirs(fuse []store.Account, carry map[string]string) []string {
-	seen := make(map[string]bool, len(fuse)+len(carry))
-	dirs := make([]string, 0, len(fuse)+len(carry))
-	add := func(d string) {
-		if d == "" || seen[d] {
-			return
-		}
-		seen[d] = true
-		dirs = append(dirs, d)
-	}
-	for _, a := range fuse {
-		add(a.ConfigDir)
-	}
-	for dir := range carry {
-		add(dir)
-	}
-	return dirs
-}
-
-// skewReplaceGate evaluates every leg of the idle gate, returning the fuse
-// rows for the remount and the first blocking reason — "" means clear, and
-// means the replace claims are HELD on every fuse row (the caller must
-// endReplace). force (the degraded-skew converge) bypasses ONLY the busy and
-// uptime legs — a degraded holder is already failing the sessions, so a clean
-// swap beats leaving them on it; every claim-safety leg below still holds. The
-// legs, in claim-first order (the convertAccount pattern: claim, then scan — so
-// nothing can land between a clean scan and the holder's sweep):
-//   - this build must be able to spawn the replacement: never stop a holder
-//     we cannot succeed;
-//   - daemon uptime ≥ reservationTTL (skipped under force): a freshly-started
-//     daemon's reservation map is empty while a ≤30s-old select may not have
-//     exec'd its claude yet;
-//   - beginReplace claims every fuse row — refusing on any live reservation,
-//     any mid-poll account, or ANY in-flight conversion (a symlink→fuse
-//     migrate is about to Mount through the holder being retired; its row
-//     only flips at the end, so it is invisible to per-fuse-row checks);
-//   - the fuse set is re-listed under the claims: a conversion that completed
-//     between the listing and the claim could have flipped a row either way,
-//     leaving an unclaimed fuse row (selectable mid-sweep) or a claimed
-//     symlink row; a changed set defers one tick;
-//   - every dir the holder serves must have an account row: a pre-row dir is a
-//     `ccp add` mid-login (its row lands at FinalizeAdd), invisible to the
-//     claims, and the sweep would yank its mirror under the login. Under force
-//     the served set comes from the surviving bases registry, since a degraded
-//     holder's mounts map is nil;
-//   - the session scan must succeed — fail closed — and zero sessions on every
-//     fuse row's dir AND every dir the holder serves (kernel truth, covering
-//     mounts whose rows were deleted while a teardown was refused). BOTH skipped
-//     under force.
-func (s *Server) skewReplaceGate(ctx context.Context, force bool) (fuse []store.Account, reason string) {
-	if !s.canSpawnHolder() {
-		return nil, "this build cannot spawn a replacement holder (no fuse support)"
-	}
-	if !force {
-		if up := time.Since(s.startedAt); up < reservationTTL {
-			return nil, fmt.Sprintf("daemon up only %s; a pre-restart select may not be visible yet", up.Round(time.Second))
-		}
-	}
-	fuse, err := s.fuseAccounts()
-	if err != nil {
-		return nil, fmt.Sprintf("list accounts: %v", err)
-	}
-	ids := accountIDs(fuse)
-	if reason := s.beginReplace(ids); reason != "" {
-		return nil, reason
-	}
-	bail := func(why string) ([]store.Account, string) {
-		s.endReplace(ids)
-		return nil, why
-	}
-	fresh, err := s.fuseAccounts()
-	if err != nil {
-		return bail(fmt.Sprintf("re-list accounts: %v", err))
-	}
-	if !sameAccountIDs(fuse, fresh) {
-		return bail("the fuse account set changed mid-gate")
-	}
-	all, err := s.m.Store.ListAccounts()
-	if err != nil {
-		return bail(fmt.Sprintf("list account dirs: %v", err))
-	}
-	rowDirs := make(map[string]bool, len(all))
-	for _, a := range all {
-		rowDirs[a.ConfigDir] = true
-	}
-	dirs := make(map[string]bool, len(fuse))
-	for _, a := range fuse {
-		dirs[a.ConfigDir] = true
-	}
-	// The holder-served dirs the pre-row guard checks. A forced converge runs
-	// against a DEGRADED holder whose mounts map is nil, so mountDirs() is empty
-	// — the surviving bases registry (carriedBases) is the only record of what it
-	// serves, including a `ccp add` mid-login mount with no account row yet.
-	served := s.holder.mountDirs()
-	if force {
-		for dir := range s.holder.carriedBases() {
-			served = append(served, dir)
-		}
-	}
-	for _, dir := range served {
-		// A holder-served dir with no account row is a `ccp add` mid-login:
-		// the row only lands at FinalizeAdd, so the replace claims cannot see
-		// it and the sweep would yank the mirror under the login. Defer.
-		if !rowDirs[dir] {
-			return bail(fmt.Sprintf("holder serves %s with no account row (an add may be in flight)", dir))
-		}
-		dirs[dir] = true
-	}
-	if force {
-		// A forced converge replaces a degraded skewed holder despite live
-		// sessions: it is already failing their mirrors, so a clean swap onto our
-		// version is strictly better than leaving them on it. Only the session
-		// scan and its zero-sessions gate are skipped — every other claim
-		// (beginReplace, the re-list, the pre-row guard above) still holds.
-		return fuse, ""
-	}
-	sessions, err := s.scan(ctx)
-	if err != nil {
-		return bail(fmt.Sprintf("session scan: %v", err))
-	}
-	for dir := range dirs {
-		if n := procscan.CountByConfigDir(sessions, dir); n > 0 {
-			return bail(fmt.Sprintf("%d live session(s) on %s", n, dir))
-		}
-	}
-	return fuse, ""
-}
-
-// remountFuseRows heals every fuse row the holder cache cannot vouch for,
-// each under the scheduler's poll-claim discipline so supervision never races
-// a poll or conversion on the same account. A claimed account is skipped, not
-// raced — its owner leaves it consistent, and a later revive or poll
-// re-checks. The row is re-read under the claim (the caller's list aged
-// across the spawn I/O) so a row converted in the gap is left alone. Used by
-// reviveHolder; the skew replace remounts under its own claims instead (see
-// remountReplacedRows).
-func (s *Server) remountFuseRows(ctx context.Context, accts []store.Account) {
-	for _, a := range accts {
-		if ctx.Err() != nil {
-			return
-		}
-		if s.holder.ready(a.ConfigDir) {
-			continue
-		}
-		if !s.beginPoll(a.ID) {
-			s.log.Printf("acct-%02d busy; deferring its remount to the next supervision tick", a.ID)
-			continue
-		}
-		fresh, err := s.m.Store.GetAccount(a.ID)
-		switch {
-		case err != nil:
-			s.log.Printf("acct-%02d re-read row before remount: %v", a.ID, err)
-		case fuseBackedRow(fresh.OverlayKind):
-			s.healFuse(ctx, fresh)
-		}
-		s.endPoll(a.ID)
-	}
-}
-
-// retryUnvouchedFuseRows is the steady-state heal loop: on every supervision
-// tick with a healthy settled holder, each fuse row the holder cache cannot
-// vouch for — a remount that failed during a revive, a TCC-blocked row
-// waiting on its grant, or a mirror the holder reports present-but-dead,
+// retryUnvouchedFuseRows is the steady-state heal loop body: each fuse row the
+// holder cache cannot vouch for — a remount that failed earlier, a TCC-blocked
+// row waiting on its grant, or a mirror the holder reports present-but-dead,
 // deep-wedged or plain dead — is retried under per-account exponential backoff
 // (remountBackoffBase doubling to remountBackoffCap, deliberately under the
 // 180s scheduler period). Each attempt runs under the scheduler's poll-claim
@@ -451,13 +140,10 @@ func (s *Server) remountFuseRows(ctx context.Context, accts []store.Account) {
 // converted in the gap is left alone. A successful heal (by this loop or
 // anyone else — ready() covers mounts established by any path) deletes the
 // row's ledger entry; rows that left the fuse set are pruned after the pass.
-// reviveHolder's one-shot remountFuseRows stays separate: a revived holder's
-// rows get one immediate sweep there, and the first steady tick afterwards
-// lands here ~10s later for anything it could not finish.
 func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 	fuse, err := s.fuseAccounts()
 	if err != nil {
-		s.log.Printf("holder supervision: list accounts: %v", err)
+		s.log.Printf("heal loop: list accounts: %v", err)
 		return
 	}
 	// One session scan per pass — but only when there are fuse rows to heal or
@@ -470,7 +156,7 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 	if len(fuse) > 0 {
 		ses, serr := s.scan(ctx)
 		if serr != nil {
-			s.log.Printf("holder supervision: session scan: %v", serr)
+			s.log.Printf("heal loop: session scan: %v", serr)
 		}
 		sessions = ses
 	}
@@ -580,7 +266,7 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 }
 
 // deferShallowDead corroborates a holder-reported shallow plain-dead mirror
-// before the supervisor remounts it, and reports whether to DEFER the remount
+// before the heal loop remounts it, and reports whether to DEFER the remount
 // this pass. It re-probes with the daemon's own bounded Health (zero RPC; same
 // kernel as the holder but a distinct process), and splits the verdict the
 // holder's single Live bool cannot:
@@ -593,7 +279,8 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 //   - a definitive dead reading (no longer a mountpoint / base invisible), or a
 //     timeout with no live holder peer, means proceed now: a genuinely dead
 //     single mirror is healed at once, exactly as before this gate, and a dead
-//     holder is the revive path's job, not a per-mirror remount.
+//     holder is left to the provider's lazy (re)spawn on the next mount, not
+//     handled here.
 func (s *Server) deferShallowDead(a store.Account) bool {
 	prov := s.overlayForRow(a)
 	if prov == nil {
@@ -666,8 +353,8 @@ func (s *Server) advanceTCCRetry(id int) int {
 }
 
 // convertRowToSymlink is the single fuse→symlink retreat primitive every
-// hazard/dead-end path shares (the wedged breaker, the TCC grace breaker, the
-// holder crash-loop retreat, and the startup capability gate). The caller holds
+// hazard/dead-end path shares (the wedged breaker, the TCC grace breaker, and
+// the startup capability gate). The caller holds
 // a convert claim (beginConvert standalone, or beginConvertUnderPoll under a
 // held poll). It re-reads the row (a conversion that landed in the claim gap is
 // left alone), force-unmounts any standing mount — ABORTING the retreat if the
@@ -677,8 +364,8 @@ func (s *Server) advanceTCCRetry(id int) int {
 // entry, and logs announce. Returns whether the row ended up off fuse. The
 // idle/live-session gate is deliberately skipped, distinct from the idle-gated
 // fallbackToSymlink: every caller is remediating a hazard or a dead-end (a
-// never-recovering wedge, a grant that will not land, a crash-looped holder, a
-// machine that cannot fuse), where relaunch — not deferral — is the fix.
+// never-recovering wedge, a grant that will not land, a machine that cannot
+// fuse), where relaunch — not deferral — is the fix.
 func (s *Server) convertRowToSymlink(a store.Account, announce string) bool {
 	fresh, err := s.m.Store.GetAccount(a.ID)
 	switch {
@@ -758,10 +445,9 @@ func (s *Server) escalateTCCBlockedRow(a store.Account) {
 // conversion cannot interleave; a row that cannot be claimed or fails to convert
 // is left for a later pass. reason names the pool-wide condition (logged per
 // row). It is the standalone, whole-pool analog of escalateRowToSymlink: the
-// holder crash-loop breaker (Policy.Retreat) and the startup capability gate
-// (reconcileOverlays) both use it when fuse is unusable for the WHOLE pool, not
-// just one row. Per-row conversion (including the wedged-unmount abort) is
-// convertRowToSymlink, shared with the breakers.
+// startup capability gate (reconcileOverlays) uses it when fuse is unusable for
+// the WHOLE pool, not just one row. Per-row conversion (including the
+// wedged-unmount abort) is convertRowToSymlink, shared with the breakers.
 func (s *Server) retreatAllFuseRows(ctx context.Context, fuse []store.Account, reason string) {
 	if len(fuse) == 0 {
 		return // a symlink-only pool: nothing to retreat
@@ -782,61 +468,6 @@ func (s *Server) retreatAllFuseRows(ctx context.Context, fuse []store.Account, r
 	}
 }
 
-// remountReplacedRows heals every fuse row after a holder replacement, under
-// the replace's already-held converting claims — never beginPoll: those
-// claims, taken at gate time, are what kept selects and conversions off these
-// dirs through the old holder's sweep, and they hold until the caller's
-// endReplace. The rows are stable under them (the gate verified the set and
-// the replacing fence blocks new conversions), so no re-read is needed.
-func (s *Server) remountReplacedRows(ctx context.Context, accts []store.Account) {
-	for _, a := range accts {
-		if ctx.Err() != nil {
-			return
-		}
-		if s.holder.ready(a.ConfigDir) {
-			continue
-		}
-		s.healFuse(ctx, a)
-	}
-}
-
-// remountCarriedDirs remounts a dead holder's pre-row mounts: dirs its
-// registry served that no account row names — a `ccp add` mid-login, whose
-// row only lands at FinalizeAdd. Dropping them would strand the add (its
-// mount died with the holder and nothing else knows the dir exists). The
-// bases come from carriedBases' snapshot of the dead holder's registry; a
-// dir that has since gained a row is left to remountFuseRows' claim
-// discipline. Carcasses clear through the provider's foreign-mount contract,
-// exactly like mountFuse.
-func (s *Server) remountCarriedDirs(ctx context.Context, rowDirs map[string]bool, carry map[string]string) {
-	prov := s.overlayFor(fkoverlay.FuseBackend(s.m.OverlaySpec()))
-	if prov == nil || !prov.Backend().IsFuse() {
-		return
-	}
-	for dir, base := range carry {
-		if ctx.Err() != nil {
-			return
-		}
-		if rowDirs[dir] || s.holder.ready(dir) {
-			continue
-		}
-		err := prov.Setup(base, dir)
-		if errors.Is(err, mountd.ErrForeignMount) || errors.Is(err, mountd.ErrBaseMismatch) {
-			if terr := prov.Teardown(base, dir); terr != nil {
-				s.log.Printf("pre-row mount %s: clear carcass: %v", dir, terr)
-				continue
-			}
-			err = prov.Setup(base, dir)
-		}
-		if err != nil {
-			s.log.Printf("remount pre-row mount %s: %v", dir, err)
-			continue
-		}
-		s.holder.noteMounted(dir)
-		s.log.Printf("remounted pre-row mount %s (in-flight add)", dir)
-	}
-}
-
 // fuseAccounts lists the fuse-kind account rows.
 func (s *Server) fuseAccounts() ([]store.Account, error) {
 	accts, err := s.m.Store.ListAccounts()
@@ -852,97 +483,20 @@ func (s *Server) fuseAccounts() ([]store.Account, error) {
 	return fuse, nil
 }
 
-// accountIDs extracts the row ids, in order.
-func accountIDs(accts []store.Account) []int {
-	ids := make([]int, len(accts))
-	for i, a := range accts {
-		ids[i] = a.ID
-	}
-	return ids
-}
-
-// sameAccountIDs reports whether two account lists name the same ids in the
-// same order (both sides come from the same ordered store query).
-func sameAccountIDs(a, b []store.Account) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].ID != b[i].ID {
-			return false
-		}
-	}
-	return true
-}
-
-// canSpawnHolder reports whether this daemon can spawn a mount holder at all:
-// an injected seam vouches for itself; the real spawn needs the fuse build.
+// canSpawnHolder reports whether this machine can host fuse mounts via the shared
+// holder — the signed fusekit-holder cask is installed, or a holder is already
+// serving the shared socket. It gates the startup capability probe
+// (fuseHardUnavailable). The holder's actual spawn is the provider's job
+// (RemoteFuseProvider.Setup → mountd.Spawn via the cask ExecPath); cc-pool no
+// longer spawns it itself.
 func (s *Server) canSpawnHolder() bool {
-	return s.spawnHolder != nil || fusekit.Built()
+	return pool.CanHostFuse()
 }
 
-// spawn starts a mount holder on the daemon's holder socket through the seam;
-// nil means pool.SpawnHolder.
-func (s *Server) spawn() error {
-	if s.spawnHolder != nil {
-		return s.spawnHolder(s.holderSocket, s.holderLog, mountd.DefaultSpawnTimeout)
-	}
-	return pool.SpawnHolder(s.holderSocket, s.holderLog, mountd.DefaultSpawnTimeout)
-}
-
-// spawnIfServing is the proc.Spawn.Override: it spawns a holder only when this
-// build CAN host one and there is something for it to serve — at least one fuse
-// row, or a mount this holder previously served (orphaned carcasses warrant a
-// respawn even with no fuse row left). A build that cannot host fuse, or an empty
-// pool with no history, refuses the spawn with an ErrSkipSpawn-wrapping sentinel
-// that proc treats as a benign no-op (no backoff, no crash-loop breaker, no
-// surfaced spawn error), never actually starting a child.
-func (s *Server) spawnIfServing() error {
-	if !s.canSpawnHolder() {
-		// A pure-Go build carrying inherited fuse rows cannot host a holder: there
-		// is nothing it can do, so skip the spawn benignly rather than surface a
-		// spawn failure or eventually retreat the rows on the breaker.
-		return fmt.Errorf("this build cannot host a mount holder: %w", proc.ErrSkipSpawn)
-	}
-	fuse, err := s.fuseAccounts()
-	if err != nil {
-		return fmt.Errorf("spawn mount holder: list accounts: %w", err)
-	}
-	if len(fuse) == 0 && !s.holder.hadMounts() {
-		return errNothingToServe
-	}
-	return s.spawn()
-}
-
-// errNothingToServe is spawnIfServing's refusal when the pool has no fuse row and
-// no mount history — there is nothing for a holder to serve. It wraps
-// proc.ErrSkipSpawn so the Supervisor treats it as a benign no-op (no backoff, no
-// crash-loop breaker advance, no surfaced spawn error), never starting a child.
-var errNothingToServe = fmt.Errorf("no fuse rows or mount history; nothing for a mount holder to serve: %w", proc.ErrSkipSpawn)
-
-// killPeerPid force-terminates the process holding socket through the seam,
-// but only when its peer pid matches wantPID; nil means mountd.Client.KillPeer
-// (peer credentials resolved and matched in one dial, never a name match).
-func (s *Server) killPeerPid(socket string, wantPID int) (int, error) {
-	if s.killHolderPeer != nil {
-		return s.killHolderPeer(socket, wantPID)
-	}
-	return mountd.NewClient(socket).KillPeer(wantPID)
-}
-
-// peerPIDOf resolves the pid holding socket through the seam; nil means
-// mountd.Client.PeerPID.
-func (s *Server) peerPIDOf(socket string) (int, error) {
-	if s.peerPID != nil {
-		return s.peerPID(socket)
-	}
-	return mountd.NewClient(socket).PeerPID()
-}
-
-// peerAliveOn reports whether socket currently has a live peer, through the
-// seam; nil means mountd.Client.PeerAlive. It is the reviveHolder gate that
-// distinguishes a genuinely dead holder (no peer → revive) from one that is
-// alive but unresponsive (peer present → defer, never force-unmount).
+// peerAliveOn reports whether the shared holder socket currently has a live peer,
+// through the test seam; nil means mountd.Client.PeerAlive. deferShallowDead uses
+// it to distinguish a saturated-but-alive holder (a slow liveness stat under load
+// → wait it out) from a genuinely gone one.
 func (s *Server) peerAliveOn(socket string) bool {
 	if s.peerAlive != nil {
 		return s.peerAlive(socket)

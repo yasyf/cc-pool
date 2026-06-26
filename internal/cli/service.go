@@ -38,18 +38,17 @@ var (
 	// deepProbeAt is doctor's bounded wedge probe (a 2 MiB read with a 5s
 	// bound) — like the stat seams above, it can never hang doctor on a
 	// wedged mirror.
-	deepProbeAt    = overlay.DeepProbeWithin
-	killHolderPeer = func(socket string) (int, error) { return mountd.NewClient(socket).Kill() }
-	stopDaemon     = stopDaemonService
-	brewManaged    = func() bool { return ccpAgent().IsBrewManaged() }
-	brewStop       = func() error { return ccpAgent().BrewStop() }
-	// holderGoneWait bounds each wait for the mount holder to release its
-	// socket after Shutdown (and again after the kill escalation). The
-	// holder's sweep runs under a 60s op deadline and the client's Shutdown
-	// timeout is 65s, so this sits just above both — the same rationale as
-	// the daemon's defaultHolderGoneWait.
-	holderGoneWait = 70 * time.Second
+	deepProbeAt = overlay.DeepProbeWithin
+	stopDaemon  = stopDaemonService
+	brewManaged = func() bool { return ccpAgent().IsBrewManaged() }
+	brewStop    = func() error { return ccpAgent().BrewStop() }
 )
+
+// holderClient returns an Owner-scoped client for the shared fusekit-holder, so
+// every List/Reclaim sees only cc-pool's own mounts and never another tenant's.
+func holderClient() *mountd.Client {
+	return &mountd.Client{Socket: mountd.DefaultHolderSocket(), Owner: pool.HolderOwner}
+}
 
 // ccpAgent is cc-pool's daemon LaunchAgent / brew-services descriptor: the
 // generic launchctl + Homebrew lifecycle (fusekit/service) configured with
@@ -101,7 +100,7 @@ func newServiceCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				if line := holderStatusLine(mountd.NewClient(pool.MountsSocketPath()), fuseRows); line != "" {
+				if line := holderStatusLine(holderClient(), fuseRows); line != "" {
 					_, _ = fmt.Fprintln(out, line)
 				}
 				return nil
@@ -132,11 +131,11 @@ func holderStatusLine(cl *mountd.Client, fuseRows int) string {
 	if err != nil {
 		return fmt.Sprintf("Mount holder: running (%s, mounts unknown: %v)", ver, err)
 	}
-	line := fmt.Sprintf("Mount holder: running (%s, %s)", ver, plural(len(mounts), "mount"))
-	if ver != version.String() {
-		line += ", version skew — will be replaced when idle"
-	}
-	return line
+	// The holder is a separate, multi-tenant product (the fusekit-holder cask):
+	// its version is unrelated to cc-pool's, and cc-pool never replaces it, so the
+	// version is reported as-is with no skew verdict. `mounts` is Owner-scoped to
+	// cc-pool's own mounts.
+	return fmt.Sprintf("Mount holder: running (%s, %s)", ver, plural(len(mounts), "mount"))
 }
 
 // fuseAccountRows counts the fuse-kind account rows; `ccp service status`
@@ -182,12 +181,13 @@ func newServiceUninstallCmd() *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Stop the daemon and mount holder; --purge also removes pool state",
-		Long: `uninstall stops the background daemon and shuts down the detached mount
-holder, unmounting every fuse account. It refuses while live claude sessions
-sit on dirs it would yank — fuse accounts for a plain uninstall, every
-account with --purge — unless --force vouches for them. --purge additionally
-removes all pool accounts, their Keychain items, and ~/.cc-pool; ~/.claude is
+		Short: "Stop the daemon and release cc-pool's mounts; --purge also removes pool state",
+		Long: `uninstall stops the background daemon and releases cc-pool's mounts from the
+shared fuse holder (it never stops the holder itself — that is multi-tenant and
+launchd-managed, and other tools may be using it). It refuses while live claude sessions
+sit on dirs it would yank — fuse accounts for a plain uninstall, every account
+with --purge — unless --force vouches for them. --purge additionally removes all
+pool accounts, their Keychain items, and ~/.cc-pool; ~/.claude is
 never touched.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -202,8 +202,9 @@ never touched.`,
 // runServiceUninstall is the uninstall flow, strictly gate-before-destruction:
 // (a) refuse while live sessions depend on dirs this run would destroy,
 // (b) stop the daemon (mount-safe: it never touches the holder's mounts),
-// (c) retire the mount holder, (d) re-verify against kernel truth that no
-// account dir is still a mountpoint, and only then (e) purge if asked.
+// (c) reclaim cc-pool's own mounts from the shared holder (never a holder
+// shutdown), (d) re-verify against kernel truth that no account dir is still a
+// mountpoint, and only then (e) purge if asked.
 func runServiceUninstall(cmd *cobra.Command, purge, force bool) error {
 	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 
@@ -222,7 +223,7 @@ func runServiceUninstall(cmd *cobra.Command, purge, force bool) error {
 		return err
 	}
 
-	shutdownHolder(cmd)
+	reclaimHolderMounts(cmd)
 
 	// Kernel-truth sweep verification. A purge must hard-abort on any
 	// survivor: RemoveAll through a live mirror deletes inside ~/.claude.
@@ -282,7 +283,7 @@ func gateUninstallSessions(accts []store.Account, purge bool) error {
 // the holder's mounts on shutdown. A failed stop is fatal, never a warning:
 // everything after this step (the holder sweep, the purge) is only safe once
 // the daemon is actually down — a still-live daemon respawns the holder and
-// remounts fuse rows on its next supervision tick.
+// remounts fuse rows on its next heal tick.
 func stopDaemonService(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	if brewManaged() {
@@ -301,38 +302,29 @@ func stopDaemonService(cmd *cobra.Command) error {
 	return nil
 }
 
-// shutdownHolder retires the detached mount holder: ask it to sweep its
-// mounts and exit, wait out its socket, and escalate to a socket-peer kill —
-// loudly — only when it wedges. A holder that was never reachable is skipped
-// silently (no holder means no process is serving mounts for us), but the
-// caller still re-verifies kernel truth afterwards: a dead holder can leave
-// mount carcasses.
-func shutdownHolder(cmd *cobra.Command) {
+// reclaimHolderMounts releases cc-pool's mounts on the SHARED fusekit-holder when
+// the service is uninstalled: it unmounts only cc-pool-owned mounts (Reclaim) and
+// leaves the holder running. It NEVER shuts the holder down or kills its process —
+// the holder is multi-tenant and launchd/cask-managed, and another consumer (e.g.
+// cc-notes) may still be using it; stopping the holder itself is `brew uninstall
+// --cask fusekit-holder`. A holder that was never reachable is skipped silently,
+// but the caller still re-verifies kernel truth afterwards: a reclaim that wedged
+// can leave mount carcasses.
+func reclaimHolderMounts(cmd *cobra.Command) {
 	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
-	cl := mountd.NewClient(pool.MountsSocketPath())
+	cl := holderClient()
 	if !cl.Available() {
 		return
 	}
-	failed, err := cl.Shutdown()
+	failed, err := cl.Reclaim()
 	if err != nil {
-		warn(errOut, "mount holder shutdown: %v", err)
+		warn(errOut, "release mount-holder mounts: %v", err)
+		return
 	}
 	for _, mi := range failed {
 		warn(errOut, "the mount holder couldn't unmount %s", mi.Dir)
 	}
-	if cl.WaitGone(holderGoneWait) {
-		success(out, "Stopped the mount holder.")
-		return
-	}
-	warn(errOut, "the mount holder won't release %s; killing the process holding it", pool.MountsSocketPath())
-	if _, kerr := killHolderPeer(pool.MountsSocketPath()); kerr != nil {
-		warn(errOut, "couldn't kill the mount holder: %v", kerr)
-	}
-	if cl.WaitGone(holderGoneWait) {
-		success(out, "Stopped the mount holder.")
-		return
-	}
-	warn(errOut, "the mount holder still holds %s; check `ccp service status`", pool.MountsSocketPath())
+	success(out, "Released cc-pool's mounts from the shared holder.")
 }
 
 // poolAccounts lists every account row (empty when the pool has none).

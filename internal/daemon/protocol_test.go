@@ -28,7 +28,7 @@ func TestHolderStatusWireAdditive(t *testing.T) {
 		t.Fatalf("old-shape response decoded a phantom holder: %+v", old.Holder)
 	}
 
-	in := Response{OK: true, Holder: &HolderStatus{Version: "9.9.9", Mounts: 2, Skewed: true, TCCError: "grant pending"}}
+	in := Response{OK: true, Holder: &HolderStatus{Version: "9.9.9", Mounts: 2, TCCError: "grant pending"}}
 	b, err = json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -43,18 +43,17 @@ func TestHolderStatusWireAdditive(t *testing.T) {
 }
 
 // TestHandleStatusCarriesHolderState pins the population: status carries the
-// daemon's cached holder view, with Skewed carried from the supervisor's
-// last-tick verdict (setSkewed, published off the supervise goroutine where
-// IsSkew is safe), and Mounts counting live mirrors only.
+// daemon's cached holder view, with Mounts counting live mirrors only (a
+// shallow-dead entry is excluded).
 func TestHandleStatusCarriesHolderState(t *testing.T) {
 	s, _ := newTestServer(t)
 
-	// The zero cache (holder never reached): present, version empty, no skew.
+	// The zero cache (holder never reached): present, version empty.
 	resp := s.handleStatus(t.Context())
 	if !resp.OK || resp.Holder == nil {
 		t.Fatalf("status = %+v, want a holder view", resp)
 	}
-	if resp.Holder.Version != "" || resp.Holder.Skewed || resp.Holder.Mounts != 0 {
+	if resp.Holder.Version != "" || resp.Holder.Mounts != 0 {
 		t.Fatalf("zero-cache holder = %+v, want the unreachable shape", resp.Holder)
 	}
 
@@ -63,14 +62,10 @@ func TestHandleStatusCarriesHolderState(t *testing.T) {
 	s.holder.version = "0.0.9-old"
 	s.holder.mounts = map[string]bool{"/a": true, "/b": false}
 	s.holder.tccErr = "grant pending"
-	// Skewed is no longer derived in wireStatus; it is the supervisor's last-tick
-	// IsSkew verdict published via setSkewed. A foreign-version holder a tick
-	// would flag — set it here so the status carry-through assertion holds.
-	s.holder.skewed = true
 	s.holder.mu.Unlock()
 
 	resp = s.handleStatus(t.Context())
-	want := &HolderStatus{Version: "0.0.9-old", Mounts: 1, Skewed: true, TCCError: "grant pending"}
+	want := &HolderStatus{Version: "0.0.9-old", Mounts: 1, TCCError: "grant pending"}
 	if !reflect.DeepEqual(resp.Holder, want) {
 		t.Fatalf("holder = %+v, want %+v", resp.Holder, want)
 	}

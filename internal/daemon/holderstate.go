@@ -19,13 +19,13 @@ const holderRefreshFloor = 5 * time.Second
 
 // deepProbe is the daemon's seam over the bounded deep bulk-read wedge probe
 // (overlay.DeepProbeWithin, 5s); tests inject verdicts without a real fuse
-// mount. Concurrent probes of the same dir — the periodic supervisor probe and
+// mount. Concurrent probes of the same dir — the periodic heal probe and
 // any number of select-time probes — join one in-flight read inside overlay
 // (StatProbes), so the daemon needs no claim/inflight machinery of its own.
 var deepProbe = overlay.DeepProbeWithin
 
 // deepProbeInterval throttles the periodic in-use probe: a dir is re-probed at
-// most once per interval even though the supervisor ticks faster (so an in-use
+// most once per interval even though the heal loop ticks faster (so an in-use
 // mount is not probed several times per interval). A var so tests can shrink
 // it. The select-time probe is deliberately NOT throttled — it is a
 // correctness gate on an idle mirror whose verdict may be cold or stale.
@@ -39,7 +39,7 @@ var deepProbeInterval = 30 * time.Second
 // is actionable.
 const deepWedgeStrikes = 2
 
-// shallowDeadStrikes is how many consecutive supervision passes must corroborate
+// shallowDeadStrikes is how many consecutive heal passes must corroborate
 // a holder-reported shallow-dead mirror (present in its List but not Live) as
 // unresponsive-yet-peer-alive before the daemon remounts it. Two, mirroring
 // deepWedgeStrikes: the holder computes List liveness with the same bounded 2s
@@ -58,97 +58,53 @@ type deepVerdict struct {
 	wedged  bool
 }
 
-// holderState is the daemon's cache of mount-holder truth: reachability, the
-// holder's version, and per-dir liveness of every mount the holder owns. The
-// select path keys fuse readiness on it instead of stat-ing through
-// mountpoints — an lstat through a dead fuse-t NFS mount can hang — so it is
-// primed at serve start, refreshed by the startup reconcile, once per
-// scheduler poll, and once per supervision tick, updated in place after a
-// successful mount, and lazily refreshed by mountReady when it cannot vouch
-// for a fuse dir (see refreshIfStale). Respawn/backoff policy lives in
-// superviseHolder; this is only the cache it keys on.
+// holderState is the daemon's cache of shared-holder truth: reachability, the
+// holder's version, and per-dir liveness of every cc-pool mount the holder owns
+// (the cache client is Owner-scoped). The select path keys fuse readiness on it
+// instead of stat-ing through mountpoints — an lstat through a dead fuse-t NFS
+// mount can hang — so it is primed at serve start, refreshed by the startup
+// reconcile, once per scheduler poll, and once per heal tick, updated in place
+// after a successful mount, and lazily refreshed by mountReady when it cannot
+// vouch for a fuse dir (see refreshIfStale).
 type holderState struct {
 	mu      sync.Mutex
 	healthy bool
-	// degraded is the holder-alive-but-List-failed verdict: Health answered (so
-	// the holder is responsive at a known version) but List did not, so its
-	// live-mount set is unknowable this poll. Distinct from !healthy (Health
-	// itself failed → the holder is gone or socket-wedged): a degraded holder is
-	// alive, version is KEPT, and mounts is fail-closed nil. degraded ⟹ !healthy.
-	degraded bool
-	version  string
-	mounts   map[string]bool // dir -> Live (shallow), per the holder's last List
-	// epochs and mountedAt mirror the holder's per-dir mount epoch and mount
-	// time from the last List, keyed like mounts (one entry per registered
-	// mount). A zero Epoch/MountedAt on the wire means the holder predates the
-	// fields and stores as 0/zero-time here. Like mounts they describe a
-	// reachable holder's registry, so they are replaced wholesale by refresh
-	// and cleared by markUnhealthy.
-	epochs    map[string]uint64
-	mountedAt map[string]time.Time
-	// deep is the daemon's OWN per-dir deep-probe verdict — NOT sourced from
-	// the holder (which ships none). It is maintained by recordDeep/
-	// markDeepWedged (the periodic supervisor probe and the select-time probe)
-	// and persists across refresh (a poll does not re-probe); noteMounted/
-	// noteUnmounted clear a dir's entry and markUnhealthy drops them all (an
-	// unreachable holder's verdict is meaningless). lastProbed throttles the
-	// periodic probe (per dir, once per deepProbeInterval).
+	version string
+	mounts  map[string]bool // dir -> Live (shallow), per the holder's last List
+	// deep is the daemon's OWN per-dir deep-probe verdict — NOT sourced from the
+	// holder (which ships none). It is maintained by recordDeep/markDeepWedged (the
+	// periodic heal probe and the select-time probe) and persists across refresh (a
+	// poll does not re-probe); noteMounted/noteUnmounted clear a dir's entry and
+	// markUnhealthy drops them all. lastProbed throttles the periodic probe (per
+	// dir, once per deepProbeInterval).
 	deep       map[string]*deepVerdict
 	lastProbed map[string]time.Time
-	// shallow counts CONSECUTIVE supervision passes that corroborated a
-	// holder-reported shallow-dead mirror (present in List, Live=false) as
-	// unresponsive-yet-peer-alive. It debounces the plain-dead remount the same
-	// way deep does the wedge: the holder computes List liveness with a bounded
-	// 2s stat that false-negatives under load, so one shallow-dead reading is not
-	// proof a mirror serving live sessions died. Reset by a corroboration that
-	// finds the mirror live, by a definitive-dead reading (which remounts at
-	// once), and by noteMounted/noteUnmounted; dropped wholesale by
-	// markUnhealthy/markDegraded.
+	// shallow counts CONSECUTIVE heal passes that corroborated a holder-reported
+	// shallow-dead mirror (present in List, Live=false) as unresponsive-yet-peer-
+	// alive. It debounces the plain-dead remount the same way deep does the wedge:
+	// the holder computes List liveness with a bounded 2s stat that false-negatives
+	// under load, so one shallow-dead reading is not proof a mirror serving live
+	// sessions died. Reset by a corroboration that finds the mirror live, by a
+	// definitive-dead reading, and by noteMounted/noteUnmounted; dropped wholesale
+	// by markUnhealthy/markDegraded.
 	shallow     map[string]int
 	refreshedAt time.Time
-	// bases mirrors the holder's dir -> base registry from the last
-	// successful List. Unlike mounts it SURVIVES markUnhealthy: it exists so
-	// reviveHolder can remount a dead holder's pre-row mounts (`ccp add`'s
-	// login window — no account row names the dir yet), and by the time the
-	// revive runs the cache has already been marked unhealthy. Replaced
-	// wholesale by the next successful refresh; a deliberate dismount
-	// (noteUnmounted) drops its entry so a later revive cannot resurrect it.
-	bases map[string]string
-	// everMounted records that a holder served at least one mount at some
-	// point in this daemon's lifetime. It survives markUnhealthy: a dead
-	// holder may still be worth respawning for its orphaned mirrors even when
-	// no fuse row remains in the store.
-	everMounted bool
-	// spawnErr is the daemon's latest failed holder-spawn attempt, surfaced
-	// via HolderStatus; "" when the last spawn succeeded or none was needed.
-	spawnErr string
-	// tccErr is the latest mount-blocked-pending-TCC guidance (the holder's
-	// macOS volume-access grant walkthrough), kept for status/doctor rendering;
-	// "" when no mount is TCC-blocked. Cleared by the next successful mount,
-	// which proves the grant landed (the grant is per holder process, so one
-	// live mount clears it for all).
+	// tccErr is the latest mount-blocked-pending-TCC guidance (the holder's macOS
+	// volume-access grant walkthrough), kept for status/doctor rendering; "" when no
+	// mount is TCC-blocked. Cleared by the next successful mount, which proves the
+	// grant landed (the grant is per holder process, so one live mount clears it).
 	tccErr string
 	// tccBackend is the fuse backend whose one-time macOS grant the latest
 	// TCC-blocked mount needs, carried so status/doctor render the right pane
 	// without cc-pool naming a concrete backend. "" when no mount is TCC-blocked;
 	// set with tccErr by recordTCC, cleared with it by noteMounted.
 	tccBackend fkoverlay.Backend
-	// skewed is the supervisor's skew verdict (Supervisor.IsSkew), published each
-	// tick by setSkewed from the supervise goroutine — where IsSkew is safe to call
-	// — so wireStatus can render it from the request goroutine under h.mu without
-	// touching the supervisor's tick-local spawnedSkew state. It deliberately
-	// excludes the reverse-skew/spawnedSkew steady state (a holder our own spawns
-	// settle at, which proc never replaces). Cleared by markUnhealthy/markDegraded:
-	// an unreachable or degraded holder is not "skewed".
-	skewed bool
 
 	// gen counts in-place cache mutations (noteMounted, noteUnmounted,
-	// markUnhealthy). refresh snapshots it before its RPCs and discards the
-	// polled snapshot if it changed by install time: an in-place update is
-	// event truth newer than a List computed holder-side before the event, so
-	// installing the snapshot over it would be a lost update — un-vouching a
-	// live fresh mount (and rate-limit-suppressing mountReady's backstop for
-	// the next floor), or re-vouching mirrors a replace just swept.
+	// markUnhealthy/markDegraded). refresh snapshots it before its RPCs and discards
+	// the polled snapshot if it changed by install time: an in-place update is event
+	// truth newer than a List computed holder-side before the event, so installing
+	// the snapshot over it would be a lost update.
 	gen uint64
 }
 
@@ -174,16 +130,8 @@ func (h *holderState) refresh(c *mountd.Client) {
 		return
 	}
 	m := make(map[string]bool, len(res.Mounts))
-	b := make(map[string]string, len(res.Mounts))
-	e := make(map[string]uint64, len(res.Mounts))
-	at := make(map[string]time.Time, len(res.Mounts))
 	for _, mi := range res.Mounts {
 		m[mi.Dir] = mi.Live
-		b[mi.Dir] = mi.Base
-		e[mi.Dir] = mi.Epoch
-		if mi.MountedAt != 0 {
-			at[mi.Dir] = time.Unix(mi.MountedAt, 0)
-		}
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -193,15 +141,11 @@ func (h *holderState) refresh(c *mountd.Client) {
 		// put, so the next refreshIfStale re-polls promptly.
 		return
 	}
-	h.healthy, h.degraded, h.version, h.mounts, h.bases, h.refreshedAt = true, false, res.Version, m, b, time.Now()
-	h.epochs, h.mountedAt = e, at
+	h.healthy, h.version, h.mounts, h.refreshedAt = true, res.Version, m, time.Now()
 	// deep and lastProbed are the daemon's own probe state, NOT holder truth —
 	// a List does not re-probe, so a still-listed dir's verdict persists; only
 	// dirs that LEFT the List are pruned (their verdict is stale dead weight).
 	h.pruneAbsentVerdictsLocked(m)
-	if len(m) > 0 {
-		h.everMounted = true
-	}
 }
 
 // pruneAbsentVerdictsLocked drops the daemon's own per-dir probe state (deep,
@@ -230,73 +174,12 @@ func (h *holderState) pruneAbsentVerdictsLocked(listed map[string]bool) {
 
 // view snapshots holder reachability and the version it reported. A degraded
 // holder reads healthy=false here (Health answered but the cache cannot vouch
-// for any mount); routing that must distinguish degraded from unreachable uses
-// viewState.
+// for any mount); a caller that must distinguish degraded from unreachable reads
+// the version — markDegraded keeps it, markUnhealthy clears it to "".
 func (h *holderState) view() (healthy bool, version string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.healthy, h.version
-}
-
-// viewState snapshots the three-way reachability verdict for superviseTick's
-// routing: fully healthy, degraded (alive at version, mounts unreadable), or
-// unreachable (both false). degraded ⟹ !healthy, so a caller routes degraded
-// before the !healthy revive.
-func (h *holderState) viewState() (healthy, degraded bool, version string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.healthy, h.degraded, h.version
-}
-
-// hadMounts reports whether a holder ever served a mount in this daemon's
-// lifetime (survives markUnhealthy — see everMounted).
-func (h *holderState) hadMounts() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.everMounted
-}
-
-// mountDirs returns every dir in the holder's last List, live or dead —
-// kernel-truth coverage for the skew-replace idle gate, including mounts
-// whose account rows no longer exist.
-func (h *holderState) mountDirs() []string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	dirs := make([]string, 0, len(h.mounts))
-	for dir := range h.mounts {
-		dirs = append(dirs, dir)
-	}
-	return dirs
-}
-
-// carriedBases snapshots the holder's dir -> base registry from its last
-// successful List. It survives markUnhealthy by design (see bases): a revive
-// reads it to remount the dead holder's pre-row mounts.
-func (h *holderState) carriedBases() map[string]string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	carry := make(map[string]string, len(h.bases))
-	for dir, base := range h.bases {
-		carry[dir] = base
-	}
-	return carry
-}
-
-// recordSpawnError keeps the latest holder-spawn failure for status
-// rendering; "" clears it.
-func (h *holderState) recordSpawnError(msg string) {
-	h.mu.Lock()
-	h.spawnErr = msg
-	h.mu.Unlock()
-}
-
-// setSkewed publishes the supervisor's skew verdict (computed on the tick
-// goroutine, where IsSkew is safe) so wireStatus can render it from the request
-// goroutine under the lock without touching the supervisor's tick-local state.
-func (h *holderState) setSkewed(v bool) {
-	h.mu.Lock()
-	h.skewed = v
-	h.mu.Unlock()
 }
 
 // refreshIfStale runs one refresh iff the cache has never been refreshed or
@@ -316,18 +199,12 @@ func (h *holderState) refreshIfStale(c *mountd.Client) {
 	h.refresh(c)
 }
 
-// markUnhealthy records an unreachable holder: every mount entry is dropped
-// and the version cleared — Version "" is the wire signal for unreachable.
-// bases deliberately survives (see its doc): it is the only record of a dead
-// holder's pre-row mounts, read by the revive that follows this very call.
+// markUnhealthy records an unreachable holder: every mount entry is dropped and
+// the version cleared — Version "" is the wire signal for unreachable.
 func (h *holderState) markUnhealthy() {
 	h.mu.Lock()
 	h.gen++
-	h.healthy, h.degraded, h.version, h.mounts, h.refreshedAt = false, false, "", nil, time.Now()
-	h.epochs, h.mountedAt = nil, nil
-	// An unreachable holder is not "skewed" — clear the status verdict now rather
-	// than carry a stale true until the next tick republishes.
-	h.skewed = false
+	h.healthy, h.version, h.mounts, h.refreshedAt = false, "", nil, time.Now()
 	// An unreachable holder serves nothing, so its dirs' deep verdicts and
 	// shallow-dead strikes are meaningless — drop them (and the probe clock) so a
 	// respawned holder's fresh mounts start with a clean slate.
@@ -337,20 +214,13 @@ func (h *holderState) markUnhealthy() {
 
 // markDegraded records a holder that answered Health at ver but whose List
 // failed: it is alive at a known version, but its live-mount set is unreadable
-// this poll, so mounts fail closed (nil → ready/shallowLive read not-live) and
-// the version is KEPT so superviseTick can tell a skewed degraded holder (force
-// a converge) from an our-version one (heal its rows). Like markUnhealthy it
-// bumps gen so a racing snapshot is discarded, drops the now-unvouchable deep
-// verdicts, and lets bases survive — but unlike it, keeps the version and sets
-// the degraded flag.
+// this poll, so mounts fail closed (nil → ready/shallowLive read not-live) while
+// the version is KEPT for status. Like markUnhealthy it bumps gen so a racing
+// snapshot is discarded and drops the now-unvouchable deep verdicts.
 func (h *holderState) markDegraded(ver string) {
 	h.mu.Lock()
 	h.gen++
-	h.healthy, h.degraded, h.version, h.mounts, h.refreshedAt = false, true, ver, nil, time.Now()
-	h.epochs, h.mountedAt = nil, nil
-	// A degraded holder is not "skewed" on the wire — the tick that converges or
-	// heals it republishes the verdict; clear it now to stay consistent meanwhile.
-	h.skewed = false
+	h.healthy, h.version, h.mounts, h.refreshedAt = false, ver, nil, time.Now()
 	h.deep, h.lastProbed, h.shallow = nil, nil, nil
 	h.mu.Unlock()
 }
@@ -365,7 +235,7 @@ func (h *holderState) wedgedLocked(dir string) bool {
 // holder, Live (shallow) in its last List, AND the daemon's own deep probe has
 // not marked the mirror wedged. A deep-wedged mirror keeps shallow Live=true,
 // so folding the verdict in is what excludes it from selection (and, being
-// not-ready, sends it to the supervisor's heal).
+// not-ready, sends it to the heal loop).
 func (h *holderState) ready(dir string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -410,7 +280,7 @@ func (h *holderState) deepWedged(dir string) bool {
 }
 
 // dueForDeepProbe reports whether dir has not been deep-probed within interval
-// (a never-probed dir is always due). The periodic supervisor probe gates on
+// (a never-probed dir is always due). The periodic heal probe gates on
 // it so an in-use mount is probed at most once per interval.
 func (h *holderState) dueForDeepProbe(dir string, now time.Time, interval time.Duration) bool {
 	h.mu.Lock()
@@ -461,8 +331,8 @@ func (h *holderState) recordDeep(dir string, err error) (logMsg string) {
 // strike debounce, and stamps the probe time. The select-time probe uses it:
 // an idle mirror about to serve a NEW session has no live session a false
 // positive could orphan, so a single observed wedge is actionable — and the
-// forced verdict both refuses the select and sends the row to the supervisor's
-// heal, which clears it on a successful remount (noteMounted).
+// forced verdict both refuses the select and sends the row to the heal loop,
+// which clears it on a successful remount (noteMounted).
 func (h *holderState) markDeepWedged(dir string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -521,20 +391,18 @@ func (h *holderState) noteMounted(dir string) {
 	defer h.mu.Unlock()
 	h.gen++
 	// A successful Setup proves the holder is fully serving this dir, so it
-	// supersedes a prior degraded verdict (degraded ⟹ !healthy): clear both.
-	h.healthy, h.degraded = true, false
+	// supersedes a prior degraded verdict (degraded ⟹ !healthy): mark healthy.
+	h.healthy = true
 	if h.mounts == nil {
 		h.mounts = map[string]bool{}
 	}
 	h.mounts[dir] = true
 	// A fresh mount supersedes any prior deep-probe verdict and probe clock for
 	// the dir: the corpse is gone, so clear the wedge and let the dir be
-	// re-probed promptly. Epoch and mount time are NOT fabricated — the next
-	// refresh installs the holder's polled truth.
+	// re-probed promptly.
 	delete(h.deep, dir)
 	delete(h.lastProbed, dir)
 	delete(h.shallow, dir)
-	h.everMounted = true
 	h.tccErr = ""
 	h.tccBackend = ""
 }
@@ -547,12 +415,9 @@ func (h *holderState) noteUnmounted(dir string) {
 	h.mu.Lock()
 	h.gen++
 	delete(h.mounts, dir)
-	delete(h.bases, dir)
 	delete(h.deep, dir)
 	delete(h.lastProbed, dir)
 	delete(h.shallow, dir)
-	delete(h.epochs, dir)
-	delete(h.mountedAt, dir)
 	h.mu.Unlock()
 }
 
@@ -566,9 +431,7 @@ func (h *holderState) recordTCC(msg string, backend fkoverlay.Backend) {
 
 // wireStatus snapshots the cache as the status op's HolderStatus. Version ""
 // means the holder was unreachable at the last refresh (or a fresh mount was
-// trusted via noteMounted before any refresh succeeded); Skewed reflects the
-// supervisor's last-tick skew verdict (setSkewed), which excludes the
-// reverse-skew/spawnedSkew steady state proc never replaces.
+// trusted via noteMounted before any refresh succeeded).
 func (h *holderState) wireStatus() *HolderStatus {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -590,9 +453,7 @@ func (h *holderState) wireStatus() *HolderStatus {
 		Version:           h.version,
 		Mounts:            live,
 		WedgedMounts:      wedged,
-		Skewed:            h.skewed,
 		TCCError:          h.tccErr,
 		TCCBlockedBackend: h.tccBackend,
-		SpawnError:        h.spawnErr,
 	}
 }

@@ -12,15 +12,16 @@ import (
 )
 
 // This file holds the untagged deep-probe contract: the synthetic probe file's
-// name, size, and byte pattern (served by the fuse mirror, fuse_probe.go) plus
-// DeepProbeWithin, the bounded full read the mount-holder runs through the
-// kernel mount to detect a partially wedged mirror. It compiles in every build
-// variant so the daemon and CLI can errors.Is against probe verdicts that
+// name and size (served by the shared fusekit-holder's probe view, holderfs/
+// probe.go) plus DeepProbeWithin, the bounded full read the daemon runs through
+// the kernel mount to detect a partially wedged mirror. It compiles in every
+// build variant so the daemon and CLI can errors.Is against probe verdicts that
 // crossed a process boundary.
 
-// ProbeFileName is the synthetic read-only file every fuse mirror serves at
-// its root for deep wedge probing. It is purely virtual: it never exists in
-// the backing ~/.claude, is hidden from Readdir, and rejects all writes.
+// ProbeFileName is the synthetic read-only file the holder serves at the mount
+// root for deep wedge probing. It is the path cc-pool passes as the mount's
+// ProbePath. It is purely virtual: it never exists in the backing ~/.claude, is
+// hidden from Readdir, and rejects all writes.
 const ProbeFileName = ".ccp-probe"
 
 // ProbeFileSize is the probe file's fixed size: 2 MiB. The observed wedge
@@ -28,7 +29,9 @@ const ProbeFileName = ".ccp-probe"
 // stats and reads instantly while a 1.5 MB sequential read (the only
 // confirmed-bad data point) hung forever — so the probe must be comfortably
 // above that and span many NFS READ RPCs; small reads provably succeed on a
-// wedged mirror and would report it healthy.
+// wedged mirror and would report it healthy. This is a WIRE CONTRACT with the
+// holder: it must equal holderfs's probeSize (the holder serves exactly this
+// many bytes and readProbeFile rejects any other count as wedged).
 const ProbeFileSize = 2 << 20
 
 var (

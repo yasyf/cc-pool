@@ -7,7 +7,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -23,8 +22,9 @@ by default fuse, the live mirror preferred when fuse-t is installed. Accounts
 created before fuse-t was set up stay on symlinks until migrated.
 
 The conversion runs inside the daemon, which owns the gates it needs (select
-reservations, poll claims); the mounts themselves live in a detached cc-pool
-mount-holder process, so daemon restarts and upgrades never disturb them. An
+reservations, poll claims); the mounts themselves live in the shared,
+launchd-managed fusekit-holder that cc-pool drives over RPC, so daemon restarts
+and upgrades never disturb them. An
 account's private files (.claude.json identity, backups, …) move into its
 private backing dir, the old overlay comes down, the mirror mounts over the
 account dir, and the row records the new provider only once the identity is
@@ -42,8 +42,8 @@ migrated-to provider.`,
 				if to != "fuse" && to != "symlink" {
 					return fmt.Errorf("unknown overlay kind %q (want fuse or symlink)", to)
 				}
-				if to == "fuse" && !fusekit.Built() {
-					return errors.New("this cc-pool build has no fuse support; run `ccp fuse enable` to install fuse-t and switch to the live-mirror build")
+				if to == "fuse" && !pool.CanHostFuse() {
+					return errors.New("fuse is not available on this machine; run `ccp fuse enable` to install the fusekit-holder cask")
 				}
 				resp, err := requestMigration(m, to, account, force)
 				if err != nil {

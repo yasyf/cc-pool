@@ -5,14 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/pool"
@@ -98,21 +96,22 @@ type fakeHolder struct {
 	mu  sync.Mutex
 	ops []string
 
-	version         string
-	mounts          []mountd.MountInfo // list response
-	shutdownFailed  []mountd.MountInfo // shutdown response (dirs that failed)
-	closeOnShutdown bool               // release the socket after acking shutdown
-	failHealth      bool               // answer health ops with OK:false
+	version       string
+	mounts        []mountd.MountInfo // list response
+	reclaimFailed []mountd.MountInfo // reclaim response (dirs that failed to unmount)
+	failHealth    bool               // answer health ops with OK:false
 }
 
-// startFakeHolder serves the mount-holder socket under the current HOME.
+// startFakeHolder serves the shared mount-holder socket
+// (~/.fusekit/holder.sock under the current HOME).
 func startFakeHolder(t *testing.T, fh *fakeHolder) *fakeHolder {
 	t.Helper()
 	fh.t = t
-	if err := pool.EnsureStateDir(); err != nil {
+	socket := mountd.DefaultHolderSocket()
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("unix", pool.MountsSocketPath())
+	ln, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,15 +144,11 @@ func (f *fakeHolder) serve() {
 			}
 		case mountd.OpList:
 			resp.Mounts = f.mounts
-		case mountd.OpShutdown:
-			resp.Mounts = f.shutdownFailed
+		case mountd.OpReclaim:
+			resp.Mounts = f.reclaimFailed
 		}
 		_ = json.NewEncoder(conn).Encode(resp)
 		_ = conn.Close()
-		if req.Op == mountd.OpShutdown && f.closeOnShutdown {
-			_ = f.ln.Close()
-			return
-		}
 	}
 }
 
@@ -307,67 +302,35 @@ func TestUninstallSessionGate(t *testing.T) {
 	}
 }
 
-// TestUninstallShutsDownHolder: a reachable holder gets the shutdown op, its
-// failed dirs are reported, and the success line lands once the socket dies.
-func TestUninstallShutsDownHolder(t *testing.T) {
+// TestUninstallReclaimsHolderMounts: a reachable shared holder gets the reclaim
+// op (releasing only cc-pool's own mounts), any dirs it couldn't unmount are
+// warned, and the success line confirms the release. The holder process itself
+// is never shut down — it is multi-tenant and another consumer may still use it.
+func TestUninstallReclaimsHolderMounts(t *testing.T) {
 	tempHome(t)
 	swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) { return nil, nil })
 	swapVar(t, &dirMounted, func(string) bool { return false })
-	swapVar(t, &holderGoneWait, 2*time.Second)
 	stubStopDaemon(t)
 	fh := startFakeHolder(t, &fakeHolder{
-		version:         version.String(),
-		shutdownFailed:  []mountd.MountInfo{{Dir: "/tmp/stuck-dir"}},
-		closeOnShutdown: true,
+		version:       version.String(),
+		reclaimFailed: []mountd.MountInfo{{Dir: "/tmp/stuck-dir"}},
 	})
 
 	cmd, out, errOut := uninstallCmd()
 	if err := runServiceUninstall(cmd, false, false); err != nil {
 		t.Fatalf("uninstall: %v", err)
 	}
-	if !fh.sawOp(mountd.OpShutdown) {
-		t.Error("the holder never received a shutdown op")
+	if !fh.sawOp(mountd.OpReclaim) {
+		t.Error("the holder never received a reclaim op")
+	}
+	if fh.sawOp(mountd.OpShutdown) {
+		t.Error("uninstall must never shut down the shared multi-tenant holder")
 	}
 	if got := stripANSI(errOut.String()); !strings.Contains(got, "couldn't unmount /tmp/stuck-dir") {
 		t.Errorf("failed dir not reported:\n%s", got)
 	}
-	if got := stripANSI(out.String()); !strings.Contains(got, "Stopped the mount holder.") {
-		t.Errorf("missing holder-stopped line:\n%s", got)
-	}
-}
-
-// TestUninstallEscalatesToKillOnWedgedHolder: a holder that acks shutdown but
-// keeps its socket gets the loud socket-peer kill, after which the success
-// line still lands once the socket dies.
-func TestUninstallEscalatesToKillOnWedgedHolder(t *testing.T) {
-	tempHome(t)
-	swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) { return nil, nil })
-	swapVar(t, &dirMounted, func(string) bool { return false })
-	swapVar(t, &holderGoneWait, 300*time.Millisecond)
-	stubStopDaemon(t)
-	fh := startFakeHolder(t, &fakeHolder{version: version.String()}) // never releases on its own
-	killed := false
-	swapVar(t, &killHolderPeer, func(socket string) (int, error) {
-		if socket != pool.MountsSocketPath() {
-			return 0, fmt.Errorf("kill aimed at %q, want the holder socket", socket)
-		}
-		killed = true
-		_ = fh.ln.Close() // the "kill" releases the socket
-		return 4242, nil
-	})
-
-	cmd, out, errOut := uninstallCmd()
-	if err := runServiceUninstall(cmd, false, false); err != nil {
-		t.Fatalf("uninstall: %v", err)
-	}
-	if !killed {
-		t.Fatal("wedged holder was never killed")
-	}
-	if got := stripANSI(errOut.String()); !strings.Contains(got, "killing the process") {
-		t.Errorf("kill escalation must be loud:\n%s", got)
-	}
-	if got := stripANSI(out.String()); !strings.Contains(got, "Stopped the mount holder.") {
-		t.Errorf("missing holder-stopped line after the kill:\n%s", got)
+	if got := stripANSI(out.String()); !strings.Contains(got, "Released cc-pool's mounts from the shared holder.") {
+		t.Errorf("missing holder-released line:\n%s", got)
 	}
 }
 
@@ -437,7 +400,7 @@ func TestUninstallSurvivorMount(t *testing.T) {
 // failed `brew services stop` aborts the run instead of warning and claiming
 // success — everything downstream (the holder sweep, the purge) is only safe
 // once the daemon is actually down, since a live one respawns the holder and
-// remounts fuse rows on its next supervision tick.
+// remounts fuse rows on its next heal tick.
 func TestStopDaemonServiceBrewStopFailureIsFatal(t *testing.T) {
 	swapVar(t, &brewManaged, func() bool { return true })
 	swapVar(t, &brewStop, func() error { return errors.New("brew exploded") })
@@ -508,6 +471,7 @@ func TestHolderStatusLine(t *testing.T) {
 		holder   *fakeHolder // nil = no socket
 		fuseRows int
 		want     []string
+		notWant  []string
 		empty    bool
 	}{
 		"absent with no fuse rows says nothing": {
@@ -526,10 +490,13 @@ func TestHolderStatusLine(t *testing.T) {
 			fuseRows: 0,
 			want:     []string{"Mount holder: running (" + version.String() + ", 0 mounts)"},
 		},
-		"skewed holder warns": {
+		"holder version is reported as-is, never as skew": {
+			// The holder is a separate product (the fusekit-holder cask); its version
+			// is unrelated to cc-pool's, so it is reported with no skew verdict.
 			holder:   &fakeHolder{version: "0.0.1-old", mounts: []mountd.MountInfo{{Dir: "/a"}}},
 			fuseRows: 1,
-			want:     []string{"running (0.0.1-old, 1 mount)", "version skew — will be replaced when idle"},
+			want:     []string{"running (0.0.1-old, 1 mount)"},
+			notWant:  []string{"version skew", "will be replaced"},
 		},
 		"live socket failing health is not responding": {
 			holder:   &fakeHolder{version: version.String(), failHealth: true},
@@ -543,7 +510,7 @@ func TestHolderStatusLine(t *testing.T) {
 			if tc.holder != nil {
 				startFakeHolder(t, tc.holder)
 			}
-			got := holderStatusLine(mountd.NewClient(pool.MountsSocketPath()), tc.fuseRows)
+			got := holderStatusLine(holderClient(), tc.fuseRows)
 			if tc.empty {
 				if got != "" {
 					t.Fatalf("want no line, got %q", got)
@@ -553,6 +520,11 @@ func TestHolderStatusLine(t *testing.T) {
 			for _, want := range tc.want {
 				if !strings.Contains(got, want) {
 					t.Errorf("line %q missing %q", got, want)
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(got, notWant) {
+					t.Errorf("line %q must not contain %q", got, notWant)
 				}
 			}
 		})

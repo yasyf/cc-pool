@@ -84,11 +84,12 @@ func TestRenderMigrations(t *testing.T) {
 }
 
 // TestMigrateHelpIsMountSafe pins the rewritten copy: the help names the
-// detached mount holder and no longer claims a daemon restart unmounts fuse
-// accounts — restarts are mount-safe since the holder landed.
+// shared, launchd-managed fusekit-holder cc-pool drives over RPC and no longer
+// claims a daemon restart unmounts fuse accounts — restarts are mount-safe since
+// the holder landed.
 func TestMigrateHelpIsMountSafe(t *testing.T) {
 	long := newMigrateCmd().Long
-	for _, want := range []string{"mount-holder process", "never disturb them"} {
+	for _, want := range []string{"fusekit-holder", "never disturb them"} {
 		if !strings.Contains(long, want) {
 			t.Errorf("migrate help missing %q:\n%s", want, long)
 		}

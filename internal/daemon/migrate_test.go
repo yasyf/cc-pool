@@ -44,15 +44,6 @@ type fakeFuseProv struct {
 func (f *fakeFuseProv) Backend() fkoverlay.Backend { return fkoverlay.BackendNFS }
 func (f *fakeFuseProv) Sync(_, _ string) error     { return nil }
 
-// State satisfies fusekit's narrow mountd.Host seam (which replaced the old
-// mounted/mountAlive package-var seams): the fake holder reports real kernel
-// liveness, so any /tmp test dir reads (false, false) — exactly the prior
-// behavior of the deleted in-tree server's overlay.Mounted/overlay.MountAlive
-// defaults.
-func (f *fakeFuseProv) State(base, dir string) (mounted, alive bool) {
-	return overlay.Mounted(dir), overlay.MountAlive(base, dir)
-}
-
 func (f *fakeFuseProv) Health(_, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

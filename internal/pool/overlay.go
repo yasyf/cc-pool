@@ -2,21 +2,36 @@ package pool
 
 import (
 	"context"
+	"os"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
-	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
+// HolderOwner is cc-pool's tenant identity on the shared multi-tenant
+// fusekit-holder: every mount cc-pool registers is tagged with it, so the daemon
+// lists/reclaims only its own mounts and never disturbs another consumer's (e.g.
+// cc-notes).
+const HolderOwner = "cc-pool"
+
+// cannotHostHint is the user-facing guidance appended to mountd.ErrCannotHost when
+// the shared holder cannot be spawned (the cask is not installed). It points at
+// the one-step setup command.
+const cannotHostHint = "run `ccp fuse enable` to install the fusekit-holder cask"
+
 // overlaySpec builds the fusekit/overlay Spec from cc-pool's classification and
-// holder wiring: the per-account-private / excluded / shared / skipped entry
-// sets (cc-pool POLICY, owned by internal/overlay), plus the detached
-// mount-holder seam. PassthroughOnly is false because cc-pool's mirror serves
-// synthetic content (the merged /.claude.json), so its fuse backend is always
-// fuse-t's NFS backend. Every fusekit/overlay entry point (ProviderFor, Select,
-// the migration primitives) takes this Spec.
+// the shared-holder wiring: the per-account-private / excluded / shared / skipped
+// entry sets (cc-pool POLICY, owned by internal/overlay), plus the content-mount
+// seam onto the shared fusekit-holder. PassthroughOnly is false because cc-pool
+// serves synthetic content (the merged /.claude.json), so its fuse backend is
+// always fuse-t's NFS backend. The Holder points at the cask binary and the shared
+// holder socket, and carries the CONTENT wiring (BridgeSocket/ContentMode/
+// ProbePath/PrivatePrefixes) so RemoteFuseProvider.Setup registers a synth-serving
+// mount over RPC rather than a passthrough. Every fusekit/overlay entry point
+// (ProviderFor, Select, the migration primitives) takes this Spec.
 func overlaySpec() fkoverlay.Spec {
+	socket := mountd.DefaultHolderSocket()
 	return fkoverlay.Spec{
 		IsPrivate:       overlay.PrivateEntry,
 		Excluded:        overlay.ExcludedEntries,
@@ -24,18 +39,23 @@ func overlaySpec() fkoverlay.Spec {
 		Skip:            overlay.SkipEntries,
 		PassthroughOnly: false,
 		Holder: &fkoverlay.HolderSpec{
-			Socket:         MountsSocketPath(),
+			Socket:         socket,
 			LogPath:        MountHolderLogPath(),
-			Args:           []string{"mount-holder", "--socket", MountsSocketPath()},
+			Args:           []string{"--socket", socket},
+			ExecPath:       mountd.HolderExe,
+			Owner:          HolderOwner,
 			CannotHostHint: cannotHostHint,
-			StableExecDir:  HolderBinDir(),
-			// No Version: cc-pool drives holder version-skew convergence through the
-			// fusekit/proc Supervisor (the daemon's holder supervision, fed
-			// MyVersion at daemon startup), NOT through mountd.RemoteHost.Converge —
-			// which cc-pool never calls. RemoteHost reads Version only in Converge,
-			// so setting it here would be inert at best and a double-converge footgun
-			// if that path were ever invoked alongside the proc Supervisor's.
-			SpawnTimeout: mountd.DefaultSpawnTimeout,
+			SpawnTimeout:   mountd.DefaultSpawnTimeout,
+			// Content wiring: the daemon's BridgeServer socket, the source content
+			// mode, the wedge-probe path, and the private-name prefixes. With these
+			// set, the provider's Setup registers an AddMount (synth over RPC), not a
+			// passthrough. No Version: cc-pool must NEVER version-replace the shared
+			// holder — that would tear down another tenant's mounts (the cask's
+			// launchd owns the holder's lifecycle and upgrades).
+			BridgeSocket:    BridgeSocketPath(),
+			ContentMode:     "source",
+			ProbePath:       "/" + overlay.ProbeFileName,
+			PrivatePrefixes: overlay.PrivatePrefixes,
 		},
 	}
 }
@@ -57,23 +77,28 @@ func OverlayProviderFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
 	return fkoverlay.ProviderFor(b, overlaySpec())
 }
 
-// CanHostFuse reports whether THIS binary can host fuse mounts (built with
-// -tags fuse). A running holder spawned from a fuse build is usable by any
-// build regardless.
-func CanHostFuse() bool { return fusekit.Built() }
+// CanHostFuse reports whether this machine can host fuse mounts via the shared
+// holder: the signed fusekit-holder cask is installed (mountd.HolderExe exists) or
+// a holder is already serving the shared socket. Capability is no longer a
+// build-tag property — a pure-Go cc-pool drives the cask holder, which is the fuse
+// build — so this gates on the cask, not fusekit.Built().
+func CanHostFuse() bool {
+	if _, err := os.Stat(mountd.HolderExe); err == nil {
+		return true
+	}
+	return mountd.NewClient(mountd.DefaultHolderSocket()).Available()
+}
 
 // DetectOverlayBackend chooses the overlay backend for this machine via
-// fusekit/overlay's Select: a fuse backend when this build can host fuse mounts,
-// a mount holder is reachable (auto-spawned), and the holder's probe mount
-// succeeds; else symlink. The probe runs in the holder, not here — mount
-// capability and the macOS grant are per-process. A symlink verdict carries a
-// generic human-readable reason from fusekit (no cc-pool CLI verbs); callers
-// append their own `ccp ...` hints at the edge.
+// fusekit/overlay's Select: a fuse backend when the shared holder is reachable
+// (auto-spawned from the cask) and its probe mount succeeds; else symlink. The
+// probe runs in the holder, not here — mount capability and the macOS grant are
+// per-process. A symlink verdict carries a generic human-readable reason from
+// fusekit (no cc-pool CLI verbs); callers append their own `ccp ...` hints.
 //
 // A holder spawned here lingers after a symlink verdict: it keeps serving the
-// socket with zero mounts (supervision never retires a same-version idle
-// holder; `ccp doctor` flags it as an orphan and `ccp service uninstall` stops
-// it), and a later fuse Setup reuses it.
+// socket with zero mounts (`ccp doctor` flags it as an orphan), and a later fuse
+// Setup reuses it.
 func DetectOverlayBackend() (fkoverlay.Backend, string) {
 	_, backend, reason, _ := fkoverlay.Select(context.Background(), overlaySpec())
 	return backend, reason

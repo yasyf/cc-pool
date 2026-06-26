@@ -16,7 +16,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/version"
 )
 
 func newDoctorCmd() *cobra.Command {
@@ -51,14 +50,12 @@ func newDoctorCmd() *cobra.Command {
 				}
 
 				// Daemon.
-				daemonUp := false
 				var cachedHolder *daemon.HolderStatus
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
 					report("daemon", true, resp.Version)
-					daemonUp = true
-					// The holder's TCC/spawn failures live only in the
-					// daemon's cache (the daemon owns spawning); fetch them
-					// while it is up.
+					// The holder's pending-TCC guidance lives in the daemon's
+					// cache (the heal loop records it on a blocked mount); fetch
+					// it while the daemon is up.
 					if sresp, serr := daemon.NewClient().Status(); serr == nil && sresp.OK {
 						cachedHolder = sresp.Holder
 					}
@@ -71,14 +68,13 @@ func newDoctorCmd() *cobra.Command {
 					return err
 				}
 
-				// Mount holder: reachability vs. the fuse rows that need one,
-				// orphan/skew notes, cached TCC/spawn failures, and a
-				// kernel-truth carcass check per fuse row.
+				// Mount holder: reachability vs. the fuse rows that need one, the
+				// cached pending-TCC guidance, and a kernel-truth carcass check
+				// per fuse row.
 				reachable, holderVer := probeHolder()
 				reportHolder(holderFacts{
 					reachable: reachable,
 					version:   holderVer,
-					daemonUp:  daemonUp,
 					cached:    cachedHolder,
 				}, countFuse(accts), report)
 				reportCarcasses(accts, report)
@@ -163,7 +159,6 @@ func fuseGrantHint(backend fkoverlay.Backend) string {
 type holderFacts struct {
 	reachable bool
 	version   string
-	daemonUp  bool
 	cached    *daemon.HolderStatus
 }
 
@@ -171,7 +166,7 @@ type holderFacts struct {
 // version. A socket that accepts but fails the health probe counts as
 // unreachable — a held-but-unresponsive socket serves nothing.
 func probeHolder() (reachable bool, ver string) {
-	cl := mountd.NewClient(pool.MountsSocketPath())
+	cl := holderClient()
 	if !cl.Available() {
 		return false, ""
 	}
@@ -182,21 +177,17 @@ func probeHolder() (reachable bool, ver string) {
 	return true, v
 }
 
-// reportHolder renders the mount-holder doctor checks from pre-gathered
-// facts. An unreachable holder is only a failure when fuse rows need one (the
-// daemon respawns it; the check catches respawn not happening). A holder with
-// nothing to serve and no daemon to retire it is flagged as an orphan; a
-// version-skewed holder is a note, not a failure — the daemon replaces it
-// once the pool is idle.
+// reportHolder renders the shared-holder doctor checks from pre-gathered facts.
+// An unreachable holder is only a failure when fuse rows need one (the daemon's
+// heal loop lazily respawns the cask holder; the check catches that not
+// happening). The holder is a separate, multi-tenant product, so its version is
+// just reported (no skew comparison against cc-pool's own version), and a holder
+// serving no cc-pool mounts is not an "orphan" — another tenant may use it.
 func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)) {
 	switch {
 	case !f.reachable && fuseRows > 0:
-		report("mount holder", false, fmt.Sprintf("not running with %s; the daemon respawns it automatically — check %s",
+		report("mount holder", false, fmt.Sprintf("not running with %s; install the fusekit-holder cask (`ccp fuse enable`) — check %s",
 			plural(fuseRows, "fuse account"), abbreviateHome(pool.MountHolderLogPath())))
-	case f.reachable && fuseRows == 0 && !f.daemonUp:
-		report("mount holder", true, fmt.Sprintf("orphan (%s) running with no fuse accounts; `ccp service uninstall` stops it", f.version))
-	case f.reachable && f.version != version.String():
-		report("mount holder", true, fmt.Sprintf("%s (version skew; the daemon replaces it when the pool is idle)", f.version))
 	case f.reachable:
 		report("mount holder", true, f.version)
 	}
@@ -206,9 +197,6 @@ func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)
 	if f.cached.TCCError != "" {
 		report("mount holder grant", false, f.cached.TCCError+" — "+fuseGrantHint(f.cached.TCCBlockedBackend)+" (cc-pool falls back to symlink automatically if the grant never lands)")
 	}
-	if f.cached.SpawnError != "" {
-		report("mount holder spawn", false, f.cached.SpawnError)
-	}
 }
 
 // listHolderMounts fetches the holder's mount registry over its socket. nil
@@ -216,7 +204,7 @@ func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)
 // facts" and report nothing — reportHolder already covers an unreachable
 // holder.
 func listHolderMounts() []mountd.MountInfo {
-	mounts, err := mountd.NewClient(pool.MountsSocketPath()).List()
+	mounts, err := holderClient().List()
 	if err != nil {
 		return nil
 	}
@@ -296,7 +284,7 @@ func reportStaleSessions(accts []store.Account, mounts []mountd.MountInfo, sessi
 
 // reportCarcasses flags dead mounts on fuse rows: the dir is a mountpoint but
 // ~/.claude is not visible through it — a carcass left by a holder that died.
-// The daemon's supervision remounts these within its tick; doctor seeing one
+// The daemon's heal loop remounts these within its tick; doctor seeing one
 // means that has not happened yet (or the daemon is down). The mountpoint seam
 // (dirMounted) is now overlay.Mounted — a non-blocking cached Getfsstat read
 // that cannot park, with no still-mounted fold; only the aliveness seam
@@ -382,8 +370,8 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 
 // checkFuseFallback surfaces an account on the symlink overlay while the pool's
 // recorded default is fuse and this machine can host fuse — almost always the
-// aftermath of an automatic fuse→symlink fallback (the mount holder crash-looped
-// or fuse-t went unavailable). That fallback is permanent until re-promoted, so
+// aftermath of an automatic fuse→symlink fallback (a mount never recovered or
+// fuse-t went unavailable). That fallback is permanent until re-promoted, so
 // doctor is where the user learns to undo it: `ccp migrate` converts symlink
 // accounts back to fuse once fuse-t is healthy. The fuse-hosting check honors
 // the Manager's CanHostFuse seam so it is exercisable without a fuse build.

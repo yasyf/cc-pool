@@ -125,7 +125,7 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 
 // gatherStatus prefers the daemon's cached view, falling back to live
 // sampling. The second return is the daemon's mount-holder cache — nil on the
-// live path, where no process supervises the holder.
+// live path, where no daemon is running to cache holder state.
 func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, *daemon.HolderStatus, error) {
 	if !forceLive {
 		resp, err := daemon.NewClient().Status()
@@ -147,18 +147,14 @@ func holderFooter(h *daemon.HolderStatus) string {
 	if h == nil {
 		return ""
 	}
-	// Priority: TCC and a failing respawn block the holder entirely and need
-	// the user; a wedge is narrower (N mirrors, supervision remounts them)
-	// and only asks for a doctor run; skew is cosmetic.
+	// Priority: a pending TCC grant blocks the holder entirely and needs the
+	// user; a wedge is narrower (N mirrors, the heal loop remounts them) and only
+	// asks for a doctor run.
 	switch {
 	case h.TCCError != "":
 		return warnStyle.Render("mount holder: grant needed — " + h.TCCError + " — " + fuseGrantHint(h.TCCBlockedBackend) + " (cc-pool falls back to symlink automatically if the grant never lands)")
-	case h.SpawnError != "":
-		return warnStyle.Render("mount holder: respawn failing — " + h.SpawnError)
 	case h.WedgedMounts > 0:
 		return warnStyle.Render(fmt.Sprintf("mount holder: %s — run `ccp doctor`", plural(h.WedgedMounts, "wedged mirror")))
-	case h.Skewed:
-		return warnStyle.Render(fmt.Sprintf("mount holder %s skewed; will be replaced when idle", h.Version))
 	default:
 		return ""
 	}

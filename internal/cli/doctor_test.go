@@ -34,11 +34,13 @@ func captureReports() (func(string, bool, string), *[]reportCall) {
 	}, &calls
 }
 
-// TestReportHolder pins the doctor's mount-holder checks over every
-// HolderStatus shape: unreachable-with-fuse-rows fails with the respawn hint,
-// unreachable-without-rows says nothing, an orphan holder (no fuse rows, no
-// daemon) is noted, skew is a note not a failure, a healthy current holder is
-// a plain pass, and the daemon's cached TCC/spawn failures each fail loudly.
+// TestReportHolder pins the doctor's mount-holder checks over every holderFacts
+// shape: unreachable-with-fuse-rows fails with the cask-install hint,
+// unreachable-without-rows says nothing, and a reachable holder just reports its
+// version — the holder is a separate, multi-tenant product, so there is no
+// "orphan" line for a holder serving no cc-pool mounts and no skew comparison
+// against cc-pool's own version. The daemon's cached TCC block still fails
+// loudly with the fusekit-sourced grant hint.
 func TestReportHolder(t *testing.T) {
 	cur := version.String()
 	cases := map[string]struct {
@@ -47,40 +49,36 @@ func TestReportHolder(t *testing.T) {
 		want     []reportCall // label + healthy must match; detail is a substring
 		none     bool
 	}{
-		"unreachable with fuse rows fails with the respawn hint": {
-			facts:    holderFacts{reachable: false, daemonUp: true},
+		"unreachable with fuse rows fails with the cask-install hint": {
+			facts:    holderFacts{reachable: false},
 			fuseRows: 2,
 			want: []reportCall{
-				{"mount holder", false, "not running with 2 fuse accounts; the daemon respawns it automatically"},
+				{"mount holder", false, "not running with 2 fuse accounts; install the fusekit-holder cask (`ccp fuse enable`)"},
 			},
 		},
 		"unreachable with no fuse rows says nothing": {
-			facts:    holderFacts{reachable: false, daemonUp: true},
+			facts:    holderFacts{reachable: false},
 			fuseRows: 0,
 			none:     true,
 		},
-		"orphan holder with no fuse rows and no daemon is noted": {
-			facts:    holderFacts{reachable: true, version: cur, daemonUp: false},
+		"reachable holder with no fuse rows just reports its version (no orphan line)": {
+			facts:    holderFacts{reachable: true, version: cur},
 			fuseRows: 0,
-			want: []reportCall{
-				{"mount holder", true, "orphan (" + cur + ") running with no fuse accounts; `ccp service uninstall` stops it"},
-			},
+			want:     []reportCall{{"mount holder", true, cur}},
 		},
-		"version skew is a note, not a failure": {
-			facts:    holderFacts{reachable: true, version: "0.0.1-old", daemonUp: true},
+		"a skewed-version holder is just reported, not flagged (separate product)": {
+			facts:    holderFacts{reachable: true, version: "0.0.1-old"},
 			fuseRows: 1,
-			want: []reportCall{
-				{"mount holder", true, "0.0.1-old (version skew; the daemon replaces it when the pool is idle)"},
-			},
+			want:     []reportCall{{"mount holder", true, "0.0.1-old"}},
 		},
 		"healthy current holder passes plainly": {
-			facts:    holderFacts{reachable: true, version: cur, daemonUp: true},
+			facts:    holderFacts{reachable: true, version: cur},
 			fuseRows: 1,
 			want:     []reportCall{{"mount holder", true, cur}},
 		},
 		"cached TCC block fails with the settings deep link": {
 			facts: holderFacts{
-				reachable: true, version: cur, daemonUp: true,
+				reachable: true, version: cur,
 				cached: &daemon.HolderStatus{TCCError: "grant Network Volumes access", TCCBlockedBackend: fkoverlay.BackendNFS},
 			},
 			fuseRows: 1,
@@ -90,17 +88,6 @@ func TestReportHolder(t *testing.T) {
 				// both ride the one detail line; the pane/URL come from
 				// Backend.Enablement, not a cc-pool literal.
 				{"mount holder grant", false, "grant Network Volumes access — " + fuseGrantHint(fkoverlay.BackendNFS) + " (cc-pool falls back to symlink automatically if the grant never lands)"},
-			},
-		},
-		"cached spawn failure fails": {
-			facts: holderFacts{
-				reachable: false, daemonUp: true,
-				cached: &daemon.HolderStatus{SpawnError: "spawn mount holder: exec format error"},
-			},
-			fuseRows: 1,
-			want: []reportCall{
-				{"mount holder", false, "the daemon respawns it automatically"},
-				{"mount holder spawn", false, "exec format error"},
 			},
 		},
 	}
