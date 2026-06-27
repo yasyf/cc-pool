@@ -34,7 +34,6 @@ jobs:
     needs: verify-on-main
     outputs:
       pure_sha256: ${{ steps.shas.outputs.pure }}
-      fuse_sha256: ${{ steps.shas.outputs.fuse }}
       app_sha256: ${{ steps.shas.outputs.app }}
     steps:
       - uses: actions/checkout@v6
@@ -45,9 +44,6 @@ jobs:
         with:
           go-version: "1.26"
           cache: true
-
-      - name: Install fuse-t (build-time headers for the -tags fuse variant)
-        run: brew install macos-fuse-t/cask/fuse-t
 
       - name: Import Developer ID certificate
         env:
@@ -73,45 +69,31 @@ jobs:
           echo "MACOS_NOTARY_KEY_ID=$MACOS_NOTARY_KEY_ID" >> "$GITHUB_ENV"
           echo "MACOS_NOTARY_ISSUER=$MACOS_NOTARY_ISSUER_ID" >> "$GITHUB_ENV"
 
-      - name: Build universal binaries (pure Go + fuse, arm64 + amd64 via lipo)
+      - name: Build universal binary (pure Go, arm64 + amd64 via lipo)
         run: |
           VERSION="${GITHUB_REF_NAME}"
           COMMIT="$(git rev-parse --short HEAD)"
           LDFLAGS="-s -w -X github.com/yasyf/fusekit/version.Version=${VERSION} -X github.com/yasyf/fusekit/version.Commit=${COMMIT}"
-          mkdir -p dist/pure dist/fuse dist/arm64
+          mkdir -p dist/pure dist/arm64
 
           # Pure Go (symlink overlay; the default install).
           CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/pure-arm64 ./cmd/cc-pool
           CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/pure-amd64 ./cmd/cc-pool
           lipo -create -output dist/pure/cc-pool dist/pure-arm64 dist/pure-amd64
 
-          # Fuse variant (live-mirror overlay): cgo, dlopens libfuse-t at
-          # runtime. The amd64 slice cross-compiles — the macOS SDK is fat.
-          export CGO_CFLAGS="-mmacosx-version-min=12.0" CGO_LDFLAGS="-mmacosx-version-min=12.0"
-          CGO_ENABLED=1 GOARCH=arm64 go build -tags fuse -ldflags "$LDFLAGS" -o dist/fuse-arm64 ./cmd/cc-pool
-          CGO_ENABLED=1 GOARCH=amd64 CC="clang -arch x86_64" go build -tags fuse -ldflags "$LDFLAGS" -o dist/fuse-amd64 ./cmd/cc-pool
-          lipo -create -output dist/fuse/cc-pool dist/fuse-arm64 dist/fuse-amd64
-
           # Developer ID sign (hardened runtime) post-lipo, then smoke-test the native
-          # slices. macOS 15/26 SIGKILL ad-hoc/Team-less signatures, so the old
-          # `codesign -s -` is replaced. The fuse build dlopens libfuse-t (another team's
-          # dylib) so it needs disable-library-validation; the pure build doesn't.
-          printf '%s' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.cs.disable-library-validation</key><true/></dict></plist>' > "$RUNNER_TEMP/fuse-ents.plist"
+          # slice. macOS 15/26 SIGKILL ad-hoc/Team-less signatures, so the old
+          # `codesign -s -` is replaced.
           codesign --force --options runtime --timestamp -s "$MACOS_SIGN_IDENTITY" dist/pure/cc-pool
-          codesign --force --options runtime --timestamp --entitlements "$RUNNER_TEMP/fuse-ents.plist" -s "$MACOS_SIGN_IDENTITY" dist/fuse/cc-pool
-          codesign --verify --strict dist/pure/cc-pool dist/fuse/cc-pool
+          codesign --verify --strict dist/pure/cc-pool
           dist/pure/cc-pool --version | grep -q "${VERSION}"
-          dist/fuse/cc-pool --version | grep -q "${VERSION}"
-          # Notarize both universal binaries (bare Mach-O — recorded against cdhash, not stapled).
-          for b in dist/pure/cc-pool dist/fuse/cc-pool; do
-            z="$(mktemp -d)/cc-pool.zip"; ditto -c -k "$b" "$z"
-            xcrun notarytool submit "$z" --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" --wait --timeout 20m
-          done
+          # Notarize the universal binary (bare Mach-O — recorded against cdhash, not stapled).
+          z="$(mktemp -d)/cc-pool.zip"; ditto -c -k dist/pure/cc-pool "$z"
+          xcrun notarytool submit "$z" --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" --wait --timeout 20m
 
           # Every tarball contains a binary named exactly `cc-pool`.
           cp dist/pure-arm64 dist/arm64/cc-pool
           tar -czf "dist/cc-pool-${VERSION}-darwin-universal.tar.gz" -C dist/pure cc-pool
-          tar -czf "dist/cc-pool-${VERSION}-darwin-universal-fuse.tar.gz" -C dist/fuse cc-pool
           tar -czf "dist/cc-pool-${VERSION}-darwin-arm64.tar.gz" -C dist/arm64 cc-pool
 
       # The widget must link against the macOS 26 SDK. A binary built against an
@@ -199,11 +181,9 @@ jobs:
         run: |
           cd dist
           PURE="$(grep -E 'darwin-universal\.tar\.gz$' SHA256SUMS.txt | awk '{print $1}')"
-          FUSE="$(grep -E 'darwin-universal-fuse\.tar\.gz$' SHA256SUMS.txt | awk '{print $1}')"
           APP="$(grep -E 'cc-pool-status-.*-darwin\.zip$' SHA256SUMS.txt | awk '{print $1}')"
-          test -n "$PURE" && test -n "$FUSE" && test -n "$APP"
+          test -n "$PURE" && test -n "$APP"
           echo "pure=${PURE}" >> "$GITHUB_OUTPUT"
-          echo "fuse=${FUSE}" >> "$GITHUB_OUTPUT"
           echo "app=${APP}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v7
@@ -221,26 +201,9 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
 
-  smoke-no-fuse:
-    # The fuse binary dlopens libfuse-t.dylib lazily and must run cleanly on a
-    # Mac WITHOUT fuse-t. A fresh runner has none — prove it before release.
-    runs-on: macos-15
-    needs: build
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: tarballs
-
-      - name: Run the fuse binary without fuse-t installed
-        run: |
-          test ! -f /usr/local/lib/libfuse-t.dylib
-          tar -xzf "cc-pool-${GITHUB_REF_NAME}-darwin-universal-fuse.tar.gz"
-          ./cc-pool --version
-          ./cc-pool --help | grep -q "emptiest account"
-
   bump-formula:
     runs-on: ubuntu-latest
-    needs: [build, smoke-no-fuse]
+    needs: build
     # Prerelease tags (v1.2.3-rc.1) publish assets but never touch the tap.
     if: ${{ !contains(github.ref_name, '-') }}
     steps:
@@ -257,19 +220,18 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           PURE_SHA="${{ needs.build.outputs.pure_sha256 }}"
-          FUSE_SHA="${{ needs.build.outputs.fuse_sha256 }}"
           APP_SHA="${{ needs.build.outputs.app_sha256 }}"
-          test -n "$PURE_SHA" && test -n "$FUSE_SHA" && test -n "$APP_SHA"
+          test -n "$PURE_SHA" && test -n "$APP_SHA"
 
           mkdir -p tap-staging/Formula tap-staging/Casks
 
           # Formula: prebuilt universal binary from THIS repo's GitHub Releases,
           # with a `service` block for `brew services` (the reason cc-pool stays
-          # a formula rather than a cask) and runtime fuse-t autodetection. The
-          # download urls carry the /vX.Y.Z/ path segment brew reads as the
-          # version; the heredoc interpolates ${VERSION} / ${*_SHA} from the
-          # release just built above. Keep this in sync with the install logic
-          # the project documents — only the publish LOCATION moved to the tap.
+          # a formula rather than a cask). The download urls carry the /vX.Y.Z/
+          # path segment brew reads as the version; the heredoc interpolates
+          # ${VERSION} / ${*_SHA} from the release just built above. Keep this in
+          # sync with the install logic the project documents — only the publish
+          # LOCATION moved to the tap.
           cat > tap-staging/Formula/cc-pool.rb <<RUBY
           # Homebrew formula for cc-pool. Installs the prebuilt universal binary from
           # GitHub Releases — no Go toolchain needed. \`brew install --HEAD\` builds from
@@ -277,10 +239,7 @@ jobs:
           #
           #   brew install yasyf/tap/cc-pool
           #
-          # Two prebuilt variants ship per release: pure-Go (symlink overlay) and
-          # -tags fuse (live-mirror overlay; dlopens libfuse-t.dylib at runtime and
-          # falls back to symlinks without it). Install picks the fuse build iff fuse-t
-          # is present. To enable the live-mirror overlay after install: \`ccp fuse enable\`.
+          # One prebuilt pure-Go universal binary (arm64 + amd64) ships per release.
           #
           # This file is GENERATED by cc-pool's release.yml bump-formula job and
           # pushed here on every tagged release — do not hand-edit; change the
@@ -304,45 +263,23 @@ jobs:
 
             depends_on :macos
 
-            # fuse-t (the kext-less FUSE for the live-mirror overlay). Not a hard dep — a
-            # cask can't be a formula dep — so we detect it at install time instead.
-            FUSE_T_HEADER = "/usr/local/include/fuse/fuse.h".freeze
-            FUSE_T_DYLIB = "/usr/local/lib/libfuse-t.dylib".freeze
-
-            # The fuse-variant binary (cgo, -tags fuse). A resource keeps the second
-            # artifact checksummed; it is only downloaded when staged below.
-            resource "fuse" do
-              url "https://github.com/yasyf/cc-pool/releases/download/v${VERSION}/cc-pool-v${VERSION}-darwin-universal-fuse.tar.gz"
-              sha256 "${FUSE_SHA}" # fuse
-            end
-
             def install
               if build.head?
                 install_from_source
-              elsif File.exist?(FUSE_T_DYLIB)
-                ohai "fuse-t detected — installing the live-mirror (fuse) build"
-                resource("fuse").stage { bin.install "cc-pool" }
               else
                 bin.install "cc-pool"
               end
               bin.install_symlink "cc-pool" => "ccp"
             end
 
-            # HEAD builds compile from source with the build-time fuse autodetect: cgo +
-            # -tags fuse when fuse-t headers are present, pure Go otherwise.
+            # HEAD builds compile pure Go from source.
             def install_from_source
               ldflags = %W[
                 -s -w
                 -X github.com/yasyf/fusekit/version.Version=#{version}
               ]
               args = std_go_args(ldflags: ldflags.join(" "), output: bin/"cc-pool")
-              if File.exist?(FUSE_T_HEADER) && File.exist?(FUSE_T_DYLIB)
-                ohai "fuse-t detected — building the live-mirror overlay (-tags fuse)"
-                ENV["CGO_ENABLED"] = "1"
-                args += ["-tags", "fuse"]
-              else
-                ENV["CGO_ENABLED"] = "0"
-              end
+              ENV["CGO_ENABLED"] = "0"
               system "go", "build", *args, "./cmd/cc-pool"
             end
 
@@ -353,8 +290,7 @@ jobs:
               run [opt_bin/"cc-pool", "daemon"]
               keep_alive true
               run_at_load true
-              environment_variables PATH:                 std_service_path_env,
-                                    CGOFUSE_LIBFUSE_PATH: "/usr/local/lib/libfuse-t.dylib"
+              environment_variables PATH: std_service_path_env
               log_path "#{Dir.home}/.cc-pool/daemon.log"
               error_log_path "#{Dir.home}/.cc-pool/daemon.log"
             end
@@ -429,7 +365,6 @@ jobs:
           # idempotent re-runs (re-tagging the same version is a no-op push).
           grep -q "releases/download/v${VERSION}/" tap-staging/Formula/cc-pool.rb
           grep -q "${PURE_SHA}\" # pure" tap-staging/Formula/cc-pool.rb
-          grep -q "${FUSE_SHA}\" # fuse" tap-staging/Formula/cc-pool.rb
           grep -q "version \"${VERSION}\"" tap-staging/Casks/cc-pool-status.rb
           grep -q "${APP_SHA}\" # app" tap-staging/Casks/cc-pool-status.rb
 

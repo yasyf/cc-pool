@@ -15,7 +15,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/fuset"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/service"
@@ -62,8 +61,7 @@ func ccpAgent() service.Agent {
 		Args:    []string{"daemon"},
 		LogPath: pool.LogPath(),
 		Env: map[string]string{
-			"PATH":                 os.Getenv("PATH"),
-			"CGOFUSE_LIBFUSE_PATH": fuset.Dylib,
+			"PATH": os.Getenv("PATH"),
 		},
 	}
 }
