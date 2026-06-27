@@ -8,7 +8,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/descope/go-free-email-providers v0.0.0-20260427134210-d71f4c2c7632
 	github.com/spf13/cobra v1.10.2
-	github.com/yasyf/fusekit v0.20.0
+	github.com/yasyf/fusekit v0.21.0
 	golang.org/x/net v0.56.0
 	golang.org/x/sync v0.21.0
 	golang.org/x/sys v0.46.0

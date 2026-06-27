@@ -9,15 +9,6 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// CanHostFuse is pinned against the build tag itself — not against
-// fusekit.Built(), which would be tautological. The fuse-build counterpart
-// lives in overlay_fuse_test.go.
-func TestCanHostFusePureBuild(t *testing.T) {
-	if CanHostFuse() {
-		t.Fatal("CanHostFuse() = true in a pure (non-fuse) build, want false")
-	}
-}
-
 // TestDetectOverlayBackendPureBuild pins the pure-build short-circuit: the
 // verdict is symlink with a short reason, decided without touching the holder
 // socket — no spawn, no probe, and no adoption of a leftover holder this binary

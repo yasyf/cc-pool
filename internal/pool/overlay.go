@@ -77,13 +77,18 @@ func OverlayProviderFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
 	return fkoverlay.ProviderFor(b, overlaySpec())
 }
 
+// holderExe is the cask holder binary CanHostFuse stats; a var (not the const
+// mountd.HolderExe directly) so a hermetic test can point it at an absent/present
+// path instead of depending on /Applications on the test machine.
+var holderExe = mountd.HolderExe
+
 // CanHostFuse reports whether this machine can host fuse mounts via the shared
 // holder: the signed fusekit-holder cask is installed (mountd.HolderExe exists) or
 // a holder is already serving the shared socket. Capability is no longer a
 // build-tag property — a pure-Go cc-pool drives the cask holder, which is the fuse
 // build — so this gates on the cask, not fusekit.Built().
 func CanHostFuse() bool {
-	if _, err := os.Stat(mountd.HolderExe); err == nil {
+	if _, err := os.Stat(holderExe); err == nil {
 		return true
 	}
 	return mountd.NewClient(mountd.DefaultHolderSocket()).Available()

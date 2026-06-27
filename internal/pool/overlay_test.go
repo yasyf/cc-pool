@@ -1,12 +1,40 @@
 package pool
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
+
+// TestCanHostFuse pins CanHostFuse's real, build-tag-independent logic via the
+// holderExe seam (and a temp HOME so DefaultHolderSocket points at nothing
+// serving): no cask installed and no holder reachable → cannot host; the cask
+// binary present → can host without a running holder. This replaces the old
+// per-build-tag tests, which only passed when the test machine happened to match
+// the tag's assumed cask state.
+func TestCanHostFuse(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // DefaultHolderSocket → temp/.fusekit; nothing listening
+	orig := holderExe
+	t.Cleanup(func() { holderExe = orig })
+
+	holderExe = filepath.Join(t.TempDir(), "absent", "fusekit-holder")
+	if CanHostFuse() {
+		t.Fatal("CanHostFuse() = true with no cask and no holder, want false")
+	}
+
+	exe := filepath.Join(t.TempDir(), "fusekit-holder")
+	if err := os.WriteFile(exe, []byte("stub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	holderExe = exe
+	if !CanHostFuse() {
+		t.Fatal("CanHostFuse() = false with the cask installed, want true")
+	}
+}
 
 func TestOverlayProviderFor(t *testing.T) {
 	tests := []struct {
