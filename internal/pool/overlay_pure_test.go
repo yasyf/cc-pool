@@ -3,26 +3,30 @@
 package pool
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// TestDetectOverlayBackendPureBuild pins the pure-build short-circuit: the
-// verdict is symlink with a short reason, decided without touching the holder
-// socket — no spawn, no probe, and no adoption of a leftover holder this binary
-// could never respawn (the same policy SetDefaultOverlayKind enforces). A
-// regression that probes anyway surfaces as a different reason (or a fuse
-// verdict) here. The reason is fusekit's generic copy ("cannot host fuse
-// mounts") with no cc-pool CLI verb baked in.
-func TestDetectOverlayBackendPureBuild(t *testing.T) {
+// TestDetectOverlayBackendCaskAbsent pins the cask-absent verdict: with no
+// fusekit-holder cask installed (holderExe at an absent path), the binary cannot
+// host fuse mounts, so DetectOverlayBackend resolves to symlink — canHost fails
+// on the missing ExecPath before any holder spawn, never adopting a leftover
+// holder this binary could not respawn. Hermetic via the holderExe seam (which
+// overlaySpec threads into the probe ExecPath), so the verdict never depends on
+// whether this machine happens to have the cask installed.
+func TestDetectOverlayBackendCaskAbsent(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	orig := holderExe
+	t.Cleanup(func() { holderExe = orig })
+	holderExe = filepath.Join(t.TempDir(), "absent", "fusekit-holder")
 	backend, reason := DetectOverlayBackend()
 	if backend != fkoverlay.BackendSymlink {
-		t.Fatalf("backend = %q, want symlink in a pure build", backend)
+		t.Fatalf("backend = %q, want symlink with the cask absent", backend)
 	}
 	if !strings.Contains(reason, "cannot host fuse mounts") {
-		t.Fatalf("reason = %q, want it to say this build cannot host fuse mounts", reason)
+		t.Fatalf("reason = %q, want it to say this binary cannot host fuse mounts", reason)
 	}
 }

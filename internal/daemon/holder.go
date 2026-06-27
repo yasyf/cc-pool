@@ -60,6 +60,24 @@ const tccBreakerThreshold = 6
 // without real mounts. Production: overlay.ForceUnmount (bounded).
 var forceUnmount = overlay.ForceUnmount
 
+// liveSessionGate reports whether dir backs any live claude session — the
+// precondition fallbackToSymlink already enforces, hoisted so every autonomous
+// force-unmount shares it. It runs the same bounded ps-env scan (s.scan ->
+// procscan.Scan): a 3s decoupled deadline reading /bin/ps -Eww environments —
+// it never lsofs/stats the mount, so a wedged mirror cannot park it and it
+// cannot fork-bomb. A scan FAILURE returns busy=true: an unmount we cannot
+// prove safe must defer, because force-unmounting a busy NFS mount panics the
+// kernel (nfs_vinvalbuf2: ubc_msync failed).
+func (s *Server) liveSessionGate(ctx context.Context, dir string) (busy bool, n int) {
+	sessions, err := s.scan(ctx)
+	if err != nil {
+		s.log.Printf("live-session gate: scan for %s failed: %v; treating as busy (refusing to force-unmount)", dir, err)
+		return true, 0
+	}
+	n = procscan.CountByConfigDir(sessions, dir)
+	return n > 0, n
+}
+
 // rowRetryState is one fuse row's remount-backoff bookkeeping in s.rowRetry,
 // driving the steady-state heal loop's per-row backoff and circuit breakers.
 type rowRetryState struct {
@@ -230,12 +248,26 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 				if wedged {
 					desc = "wedged mirror (serves metadata but hangs reads)"
 				}
-				s.log.Printf("acct-%02d %s; remounting under %d live session(s) — relaunch them",
-					a.ID, desc, procscan.CountByConfigDir(sessions, a.ConfigDir))
+				// Describe the verdict, and when sessions are bound, surface the
+				// one action that resolves it either way: a remount orphans them,
+				// and a defer (healDeferredBusy, which explains the no-force reason)
+				// waits for them to exit — relaunching is right in both shapes.
+				n := procscan.CountByConfigDir(sessions, a.ConfigDir)
+				relaunch := ""
+				if n > 0 {
+					relaunch = " — relaunch them"
+				}
+				s.log.Printf("acct-%02d %s; %d live session(s) on it%s", a.ID, desc, n, relaunch)
 			}
 			switch s.healFuse(ctx, fresh) {
 			case healMounted:
 				delete(s.rowRetry, a.ID)
+			case healDeferredBusy:
+				// Backoff WITHOUT a hazard strike, so a busy mount NEVER accrues
+				// toward remountBreakerThreshold and the wedged breaker is
+				// unreachable while busy; advanceRowRetry(false) also resets hazard
+				// so a session launching mid-countdown disarms the breaker.
+				s.advanceRowRetry(a.ID, false)
 			case healTCCBlocked:
 				// A clean not-mounted state waiting on the macOS "Network
 				// Volumes" grant: back off and give the grant a bounded grace
@@ -245,14 +277,14 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 				// — so once the consecutive TCC-block count crosses
 				// tccBreakerThreshold, retreat the row to symlink.
 				if s.advanceTCCRetry(a.ID) >= tccBreakerThreshold {
-					s.escalateTCCBlockedRow(fresh)
+					s.escalateTCCBlockedRow(ctx, fresh)
 				}
 			default:
 				// healRetry/healFallback: the mirror is not up and we keep
 				// trying. Count it as a hazard; once the consecutive count hits
 				// the breaker threshold, stop churning and escalate.
 				if s.advanceRowRetry(a.ID, true) >= remountBreakerThreshold {
-					s.escalateWedgedRow(fresh)
+					s.escalateWedgedRow(ctx, fresh)
 				}
 			}
 		}
@@ -361,12 +393,17 @@ func (s *Server) advanceTCCRetry(id int) int {
 // unmount wedges, because ConvertOverlay's Teardown would then re-spawn the very
 // holder being retreated from (the wedged-carcass churn the kill-9 incident
 // exposed) — converts the row, drops the holder-cache vouch and any retry-ledger
-// entry, and logs announce. Returns whether the row ended up off fuse. The
-// idle/live-session gate is deliberately skipped, distinct from the idle-gated
-// fallbackToSymlink: every caller is remediating a hazard or a dead-end (a
-// never-recovering wedge, a grant that will not land, a machine that cannot
-// fuse), where relaunch — not deferral — is the fix.
-func (s *Server) convertRowToSymlink(a store.Account, announce string) bool {
+// entry, and logs announce. Returns whether the row ended up off fuse.
+//
+// Every retreat that force-unmounts a MOUNTED dir now enforces the same
+// live-session precondition fallbackToSymlink does (liveSessionGate): a busy
+// NFS mirror is LEFT mounted and surfaced rather than force-unmounted, because
+// force-unmounting a busy mount panics the kernel (nfs_vinvalbuf2: ubc_msync
+// failed) — the very panic this guard exists to prevent. The retreat re-fires
+// once the dir is idle (the breaker/grace re-arms next tick). A TCC-blocked or
+// never-mounted dir is NOT a mountpoint, so the gate is never reached and the
+// retreat proceeds — relaunch, not deferral, is the fix for those dead-ends.
+func (s *Server) convertRowToSymlink(ctx context.Context, a store.Account, announce string) bool {
 	fresh, err := s.m.Store.GetAccount(a.ID)
 	switch {
 	case err != nil:
@@ -378,6 +415,10 @@ func (s *Server) convertRowToSymlink(a store.Account, announce string) bool {
 	}
 	s.log.Printf("%s", announce)
 	if overlayMounted(fresh.ConfigDir) {
+		if busy, n := s.liveSessionGate(ctx, fresh.ConfigDir); busy {
+			s.log.Printf("acct-%02d symlink retreat deferred: %d live session(s) on %s — leaving fuse (force-unmounting a busy mirror panics the kernel)", a.ID, n, fresh.ConfigDir)
+			return false
+		}
 		if err := forceUnmount(fresh.ConfigDir); err != nil {
 			// The forced unmount wedged. Do NOT proceed into ConvertOverlay: its
 			// Teardown would see the dir still mounted and re-spawn the holder
@@ -401,13 +442,13 @@ func (s *Server) convertRowToSymlink(a store.Account, announce string) bool {
 // account's poll claim, so it takes the converting claim with
 // beginConvertUnderPoll — refused over a pending select, leaving the row armed
 // to re-fire next windowed tick. Returns whether the row converted.
-func (s *Server) escalateRowToSymlink(a store.Account, announce string) bool {
+func (s *Server) escalateRowToSymlink(ctx context.Context, a store.Account, announce string) bool {
 	if !s.beginConvertUnderPoll(a.ID) {
 		s.log.Printf("acct-%02d symlink retreat deferred: reserved by a pending select", a.ID)
 		return false
 	}
 	defer s.endConvert(a.ID)
-	return s.convertRowToSymlink(a, announce)
+	return s.convertRowToSymlink(ctx, a, announce)
 }
 
 // escalateWedgedRow is the wedged-mount circuit breaker (remountBreakerThreshold
@@ -415,10 +456,10 @@ func (s *Server) escalateRowToSymlink(a store.Account, announce string) bool {
 // carcass linger and re-wedge the kernel — the whole-machine hazard the kill-9
 // incident exposed — so it retreats the row to symlink via escalateRowToSymlink.
 // Caller holds the account's poll claim.
-func (s *Server) escalateWedgedRow(a store.Account) {
+func (s *Server) escalateWedgedRow(ctx context.Context, a store.Account) {
 	announce := fmt.Sprintf("acct-%02d fuse mount never recovered after %d consecutive attempts; force-unmounting and falling back to symlink — relaunch any sessions on it",
 		a.ID, remountBreakerThreshold)
-	if s.escalateRowToSymlink(a, announce) {
+	if s.escalateRowToSymlink(ctx, a, announce) {
 		s.log.Printf("acct-%02d fell back to symlink after exhausting fuse remount attempts", a.ID)
 	}
 }
@@ -430,10 +471,10 @@ func (s *Server) escalateWedgedRow(a store.Account) {
 // only on a real conversion (tccErr is one string — clearing it in the shared
 // body, or on a deferred/failed conversion, would wipe a concurrent wedged row's
 // still-valid guidance). Caller holds the account's poll claim.
-func (s *Server) escalateTCCBlockedRow(a store.Account) {
+func (s *Server) escalateTCCBlockedRow(ctx context.Context, a store.Account) {
 	announce := fmt.Sprintf("acct-%02d macOS volume-access grant never landed after %d attempts; falling back to symlink — `ccp migrate --to fuse` re-promotes once fuse-t can mount here",
 		a.ID, tccBreakerThreshold)
-	if s.escalateRowToSymlink(a, announce) {
+	if s.escalateRowToSymlink(ctx, a, announce) {
 		s.holder.recordTCC("", "")
 		s.log.Printf("acct-%02d fell back to symlink after the macOS volume-access grant did not land", a.ID)
 	}
@@ -461,7 +502,7 @@ func (s *Server) retreatAllFuseRows(ctx context.Context, fuse []store.Account, r
 			continue
 		}
 		announce := fmt.Sprintf("acct-%02d %s; falling back to symlink — relaunch any sessions on it", a.ID, reason)
-		if s.convertRowToSymlink(a, announce) {
+		if s.convertRowToSymlink(ctx, a, announce) {
 			s.log.Printf("acct-%02d fell back to symlink (%s)", a.ID, reason)
 		}
 		s.endConvert(a.ID)

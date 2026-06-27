@@ -124,10 +124,14 @@ func (s *Server) fuseGate() (fkoverlay.Backend, string) {
 }
 
 // convertAccount runs one gated conversion, mapping it to a wire outcome.
-// force skips the live-session gate only: the user vouches the sessions are
-// idle and accepts that one writing mid-conversion may briefly error. The
-// claim and reservation gates always hold — those mean another part of the
-// daemon owns the dir right now.
+// force skips the live-session gate only: the user vouches the dir is idle. It
+// is NOT a license to tear a busy mount down — force-unmounting a busy NFS
+// mirror panics the kernel (nfs_vinvalbuf2: ubc_msync failed), the exact hazard
+// the gate exists to prevent. The unmount runs through the holder's
+// graceful-only teardown, so a dir that is in fact busy fails closed
+// (ErrUnmountWedged -> MigrationFailed) rather than being forced. The claim and
+// reservation gates always hold — those mean another part of the daemon owns
+// the dir right now.
 func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverlay.Backend, force bool) MigrationResult {
 	res := MigrationResult{ID: a.ID, Label: a.Label, From: a.OverlayKind, To: string(to)}
 	if a.OverlayKind == string(to) {
@@ -159,8 +163,10 @@ func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverl
 
 	if !force {
 		// Never convert blind: a failed scan means we cannot know whether a
-		// live claude has this dir as its config dir.
-		sessions, err := procscan.Scan(ctx)
+		// live claude has this dir as its config dir. Routed through s.scan (the
+		// same seam fallbackToSymlink and liveSessionGate use) so the gate is
+		// exercisable; production resolves it to procscan.Scan unchanged.
+		sessions, err := s.scan(ctx)
 		if err != nil {
 			res.Outcome = MigrationFailed
 			res.Detail = fmt.Sprintf("session scan: %v", err)

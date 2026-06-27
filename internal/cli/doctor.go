@@ -91,13 +91,14 @@ func newDoctorCmd() *cobra.Command {
 				if reachable {
 					holderMounts = listHolderMounts()
 				}
-				reportWedges(accts, holderMounts, report)
 				var sessions []procscan.Session
 				if len(holderMounts) > 0 {
-					// A failed scan skips the stale check silently: it is
-					// advisory, and doctor degrades rather than aborts.
+					// A failed scan skips the session-aware checks silently: they
+					// are advisory, and doctor degrades rather than aborts. Shared
+					// by both the wedge and stale-session checks.
 					sessions, _ = scanSessions(cmd.Context())
 				}
+				reportWedges(accts, holderMounts, sessions, report)
 				reportStaleSessions(accts, holderMounts, sessions, report)
 
 				for _, a := range accts {
@@ -221,7 +222,7 @@ func listHolderMounts() []mountd.MountInfo {
 // wedge. nil mounts (holder unreachable) reports nothing. deepProbeAt is
 // bounded by design, like reportCarcasses' stat seams: nothing doctor runs
 // against a possibly wedged mirror may block unboundedly.
-func reportWedges(accts []store.Account, mounts []mountd.MountInfo, report func(string, bool, string)) {
+func reportWedges(accts []store.Account, mounts []mountd.MountInfo, sessions []procscan.Session, report func(string, bool, string)) {
 	byDir := make(map[string]mountd.MountInfo, len(mounts))
 	for _, mi := range mounts {
 		byDir[mi.Dir] = mi
@@ -235,8 +236,15 @@ func reportWedges(accts []store.Account, mounts []mountd.MountInfo, report func(
 			continue
 		}
 		if err := deepProbeAt(a.ConfigDir); err != nil && !errors.Is(err, overlay.ErrProbeMissing) {
-			report(fmt.Sprintf("acct-%02d mirror", a.ID), false,
-				"wedged (serves metadata but hangs reads) — daemon will remount; relaunch its sessions")
+			// A wedged mirror backing live sessions is LEFT mounted — the daemon
+			// never force-unmounts a busy mirror (it would panic the kernel), so
+			// the only fix is to relaunch those sessions. An idle wedge the daemon
+			// remounts on its own next tick.
+			detail := "wedged (serves metadata but hangs reads) — the daemon will remount it"
+			if n := procscan.CountByConfigDir(sessions, a.ConfigDir); n > 0 {
+				detail = fmt.Sprintf("wedged (serves metadata but hangs reads); left mounted under %d live session(s); relaunch them — the daemon will NOT force-unmount a busy mirror (would panic the kernel)", n)
+			}
+			report(fmt.Sprintf("acct-%02d mirror", a.ID), false, detail)
 		}
 	}
 }

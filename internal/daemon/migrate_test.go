@@ -627,7 +627,7 @@ func TestMountFuseSweepsUnderlay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.mountFuse(a); err != nil {
+	if err := s.mountFuse(t.Context(), a); err != nil {
 		t.Fatalf("mountFuse: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(fkoverlay.FusePrivateRoot(dirs[1]), ".claude.json"))
@@ -647,7 +647,7 @@ func TestMountFuseSweepsUnderlay(t *testing.T) {
 	s.m.OverlayFor = func(_ fkoverlay.Backend) (fkoverlay.Provider, error) {
 		return &fkoverlay.SymlinkProvider{Spec: s.m.OverlaySpec()}, nil
 	}
-	if err := s.mountFuse(a); err == nil || !strings.Contains(err.Error(), "no fuse provider") {
+	if err := s.mountFuse(t.Context(), a); err == nil || !strings.Contains(err.Error(), "no fuse provider") {
 		t.Fatalf("mountFuse with a wrong-backend provider = %v, want a backend refusal", err)
 	}
 }
@@ -758,6 +758,41 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	}
 	if got := outcomes(resp); got[1] != MigrationDone || got[2] != MigrationDone {
 		t.Fatalf("outcomes = %v, want both done", got)
+	}
+}
+
+// TestMigrateToSymlinkDefersUnderLiveSession pins the user-initiated retreat's
+// live-session gate: convertAccount(force=false) on a fuse row with a live
+// session refuses (MigrationBusy) and never tears the mirror down, while
+// force=true — the user vouching the session is idle — converts. This is the
+// migrate-path twin of the autonomous force-unmount gate; both refuse to yank a
+// busy NFS mirror out from under a live claude.
+func TestMigrateToSymlinkDefersUnderLiveSession(t *testing.T) {
+	s, dirs, fake := newMigrateServer(t)
+	a := flipToFuse(t, s, 1)
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+	}
+
+	// force=false: the live session defers the retreat untouched.
+	res := s.convertAccount(t.Context(), a, fkoverlay.BackendSymlink, false)
+	if res.Outcome != MigrationBusy {
+		t.Fatalf("outcome = %s (%s), want busy under a live session", res.Outcome, res.Detail)
+	}
+	if got := kindOf(t, s, 1); got != "nfs" {
+		t.Fatalf("row kind after a deferred migrate = %q, want fuse (unchanged)", got)
+	}
+	if fake.teardownCount() != 0 {
+		t.Fatalf("teardowns under a deferred migrate = %d, want 0", fake.teardownCount())
+	}
+
+	// force=true: the user vouches the session is idle; the retreat proceeds.
+	res = s.convertAccount(t.Context(), a, fkoverlay.BackendSymlink, true)
+	if res.Outcome != MigrationDone {
+		t.Fatalf("forced outcome = %s (%s), want done", res.Outcome, res.Detail)
+	}
+	if got := kindOf(t, s, 1); got != "symlink" {
+		t.Fatalf("row kind after a forced migrate = %q, want symlink", got)
 	}
 }
 
@@ -895,7 +930,7 @@ func TestMountFuseClearsDeadMountThenSweepsThenMounts(t *testing.T) {
 		return nil
 	}
 
-	if err := s.mountFuse(a); err != nil {
+	if err := s.mountFuse(t.Context(), a); err != nil {
 		t.Fatalf("mountFuse: %v", err)
 	}
 	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"teardown", "setup"}) {
@@ -926,7 +961,7 @@ func TestMountFuseWedgedPreClearAborts(t *testing.T) {
 	fake.healthErr = errors.New("mirror is dead")
 	fake.teardownErr = errors.New("umount: resource busy")
 
-	merr := s.mountFuse(a)
+	merr := s.mountFuse(t.Context(), a)
 	if merr == nil || !strings.Contains(merr.Error(), "clear dead mount") {
 		t.Fatalf("mountFuse over a wedged unmount = %v, want a clear-dead-mount error", merr)
 	}
@@ -962,7 +997,7 @@ func TestMountFuseForeignCarcassClearedAndRetriedOnce(t *testing.T) {
 	}
 	fake.teardownFn = func(string, string) error { foreign.Store(false); return nil }
 
-	if err := s.mountFuse(a); err != nil {
+	if err := s.mountFuse(t.Context(), a); err != nil {
 		t.Fatalf("mountFuse: %v", err)
 	}
 	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"setup", "teardown", "setup"}) {
@@ -995,7 +1030,7 @@ func TestMountFuseBaseMismatchClearedAndRetriedOnce(t *testing.T) {
 	}
 	fake.teardownFn = func(string, string) error { mismatched.Store(false); return nil }
 
-	if err := s.mountFuse(a); err != nil {
+	if err := s.mountFuse(t.Context(), a); err != nil {
 		t.Fatalf("mountFuse: %v", err)
 	}
 	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"setup", "teardown", "setup"}) {
@@ -1018,7 +1053,7 @@ func TestMountFusePersistentForeignFailsAfterOneRetry(t *testing.T) {
 	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
 	fake.setupErr = fmt.Errorf("mount %s: %w", dirs[1], mountd.ErrForeignMount)
 
-	merr := s.mountFuse(a)
+	merr := s.mountFuse(t.Context(), a)
 	if !errors.Is(merr, mountd.ErrForeignMount) {
 		t.Fatalf("mountFuse = %v, want errors.Is ErrForeignMount", merr)
 	}

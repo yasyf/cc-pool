@@ -372,8 +372,10 @@ func TestHealTickRemountsHeldDeadRow(t *testing.T) {
 			if strings.Contains(out, tc.notCopy) {
 				t.Fatalf("held-dead log line carries the wrong copy %q:\n%s", tc.notCopy, out)
 			}
-			if !strings.Contains(out, "live session") || !strings.Contains(out, "relaunch") {
-				t.Fatalf("held-dead log line missing the session count or relaunch guidance:\n%s", out)
+			// The held-dead line is now purely descriptive (the heal outcome owns
+			// the action line); it still carries the live-session count.
+			if !strings.Contains(out, "live session") {
+				t.Fatalf("held-dead log line missing the session count:\n%s", out)
 			}
 			if _, ok := s.rowRetry[1]; ok {
 				t.Fatal("successful remount left a rowRetry entry")
@@ -600,23 +602,25 @@ func TestRemountBreakerEscalates(t *testing.T) {
 	}
 }
 
-// TestRemountBreakerEscalatesUnderLiveSession pins that the breaker is UNGATED
-// by live sessions: a never-recovering mount is a whole-machine hazard, not a
-// healthy mount, so escalateWedgedRow force-unmounts the carcass and converts
-// the row to symlink even with a live session on the dir (relaunch is the
-// documented fix, exactly as the held-dead remount policy accepts). The
-// idle/session gate belongs only to fallbackToSymlink on the genuine-mount path;
-// a regression adding one here would reintroduce the freeze hazard the kill-9
-// incident exposed — with every other breaker test running an idle scan, this is
-// the only case that fails if it does.
-func TestRemountBreakerEscalatesUnderLiveSession(t *testing.T) {
+// TestHealDefersBreakerUnderLiveSession is the regression lock for the kernel
+// panic (nfs_vinvalbuf2: ubc_msync failed): a dead/wedged mirror that still
+// backs a live claude session must be LEFT MOUNTED, never force-unmounted —
+// force-unmounting a busy NFS mirror panics the whole machine. It inverts the
+// old "breaker is ungated by sessions" behavior: mountFuse refuses the
+// teardown-before-remount (errRemountBusy -> healDeferredBusy), which backs off
+// WITHOUT a hazard strike, so the wedged breaker can NEVER fire on a busy mount.
+// Drive well past the breaker threshold and assert nothing tears down: no
+// teardown, no force-unmount, the row stays fuse, the hazard count stays 0, and
+// the "NOT force-unmounting" surfacing fires.
+func TestHealDefersBreakerUnderLiveSession(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil) // healthy, vouches for nothing
-	fake.setupErr = mountTimeoutChain()        // healRetry forever — the wedged shape
+	// The mirror reads mounted-but-dead, so mountFuse's teardown-before-remount
+	// branch is entered — exactly the force-unmount the gate must refuse.
+	fake.healthErr = errors.New("mirror is dead")
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
-	// A live session on the very dir the breaker is about to force down: a
-	// session gate would consult it and bail; the breaker must not.
+	// A live session on the very dir: the gate must defer, never force down.
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 	}
@@ -631,23 +635,29 @@ func TestRemountBreakerEscalatesUnderLiveSession(t *testing.T) {
 		mu.Unlock()
 		return nil
 	})
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
 
-	driveRetryTicks(t, s, 1, remountBreakerThreshold)
+	// Drive WELL past the breaker threshold: a busy mount must never escalate.
+	driveRetryTicks(t, s, 1, remountBreakerThreshold+2)
 
+	if got := fake.teardownCount(); got != 0 {
+		t.Fatalf("teardowns under a live session = %d, want 0 (a busy mirror must never be torn down)", got)
+	}
 	mu.Lock()
 	gotUnmounted := append([]string(nil), unmounted...)
 	mu.Unlock()
-	if len(gotUnmounted) != 1 || gotUnmounted[0] != dirs[1] {
-		t.Fatalf("breaker force-unmounted %v under a live session, want exactly [%s] (it must stay ungated)", gotUnmounted, dirs[1])
+	if len(gotUnmounted) != 0 {
+		t.Fatalf("force-unmounted %v under a live session, want none (force-unmounting a busy NFS mirror panics the kernel)", gotUnmounted)
 	}
-	if got := kindOf(t, s, 1); got != "symlink" {
-		t.Fatalf("row kind after the breaker = %q, want symlink (a live session must not block escalation)", got)
+	if got := kindOf(t, s, 1); got != "nfs" {
+		t.Fatalf("row kind under a live session = %q, want fuse (it must stay mounted, never retreat)", got)
 	}
-	if _, ok := s.rowRetry[1]; ok {
-		t.Fatal("breaker left a rowRetry entry; the churn would continue")
+	if got := s.rowRetry[1].hazard; got != 0 {
+		t.Fatalf("hazard count under a busy mount = %d, want 0 (the wedged breaker must be unreachable while busy)", got)
 	}
-	if s.holder.ready(dirs[1]) {
-		t.Fatal("breaker did not drop the holder-cache vouch for the converted dir")
+	if !strings.Contains(buf.String(), "NOT force-unmounting") {
+		t.Fatalf("deferral not surfaced in the log:\n%s", buf.String())
 	}
 }
 
@@ -796,11 +806,14 @@ func TestTCCBreakerEscalates(t *testing.T) {
 	}
 }
 
-// TestTCCBreakerEscalatesUnderLiveSession pins that the TCC grace breaker, like
-// the wedged breaker, is UNGATED by live sessions: once the grace expires the row
-// retreats to symlink even with a session on the dir (escalateRowToSymlink skips
-// the idle gate; the mount never came up, so the retreat repairs the bare dir the
-// session is on).
+// TestTCCBreakerEscalatesUnderLiveSession pins that the TCC grace breaker
+// retreats to symlink even with a session on the dir. This proves the new
+// live-session gate keys on a busy MOUNT, not on "any retreat under sessions": a
+// TCC-blocked row NEVER mounted (overlayMounted=false), so convertRowToSymlink's
+// gate is not reached and the retreat proceeds — there is no busy NFS mirror to
+// force-unmount here, so no panic hazard, and the retreat repairs the bare dir
+// the session is on. (Contrast TestHealDefersBreakerUnderLiveSession, where the
+// dir IS a live mountpoint and the gate defers.)
 func TestTCCBreakerEscalatesUnderLiveSession(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -1061,5 +1074,179 @@ func TestSweepOrphanMountpointsClearsNonRowCarcass(t *testing.T) {
 
 	if len(unmounted) != 1 || unmounted[0] != orphan {
 		t.Fatalf("force-unmounted %v, want exactly the non-row orphan %q (the row dir must be left alone)", unmounted, orphan)
+	}
+}
+
+// TestLiveSessionGate pins the shared force-unmount precondition: a dir backing
+// a live claude session reads busy (with the count), a dir with no session reads
+// idle, and a SCAN FAILURE reads busy — an unmount we cannot prove safe must
+// defer, because force-unmounting a busy NFS mirror panics the kernel.
+func TestLiveSessionGate(t *testing.T) {
+	const dir = "/pool/acct-01"
+	tests := []struct {
+		name     string
+		sessions []procscan.Session
+		scanErr  error
+		wantBusy bool
+		wantN    int
+	}{
+		{name: "sessions on the dir are busy with their count", sessions: []procscan.Session{{PID: 1, ConfigDir: dir}, {PID: 2, ConfigDir: dir}}, wantBusy: true, wantN: 2},
+		{name: "a session elsewhere is idle", sessions: []procscan.Session{{PID: 1, ConfigDir: "/pool/acct-02"}}, wantBusy: false, wantN: 0},
+		{name: "no sessions is idle", sessions: nil, wantBusy: false, wantN: 0},
+		{name: "a scan failure fails closed to busy", scanErr: errors.New("ps exploded"), wantBusy: true, wantN: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _ := newHealServer(t)
+			s.scanSessions = func(context.Context) ([]procscan.Session, error) { return tc.sessions, tc.scanErr }
+			busy, n := s.liveSessionGate(t.Context(), dir)
+			if busy != tc.wantBusy || n != tc.wantN {
+				t.Fatalf("liveSessionGate = (%v, %d), want (%v, %d)", busy, n, tc.wantBusy, tc.wantN)
+			}
+		})
+	}
+}
+
+// TestHealLoopUnmountGate pins mountFuse's teardown-before-remount gate: a
+// mounted-but-dead mirror is torn down and remounted ONLY when idle; under a
+// live session — or a scan we cannot complete — it is left mounted (no teardown,
+// no setup, no hazard strike), because force-unmounting a busy NFS mirror panics
+// the kernel.
+func TestHealLoopUnmountGate(t *testing.T) {
+	tests := []struct {
+		name          string
+		scanKind      string // "idle" / "busy" / "err"
+		wantTeardowns int
+		wantSetups    int
+	}{
+		{name: "idle mirror is torn down and remounted", scanKind: "idle", wantTeardowns: 1, wantSetups: 1},
+		{name: "busy mirror is left mounted", scanKind: "busy", wantTeardowns: 0, wantSetups: 0},
+		{name: "scan failure leaves it mounted", scanKind: "err", wantTeardowns: 0, wantSetups: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, dirs, fake := newHealServer(t)
+			flipToFuse(t, s, 1)
+			s.holderSocket = startCannedHolder(t, nil)
+			// Mounted-but-dead: mountFuse enters the teardown-before-remount branch.
+			fake.healthErr = errors.New("mirror is dead")
+			fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+			switch tc.scanKind {
+			case "idle":
+				s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
+			case "busy":
+				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+					return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+				}
+			case "err":
+				s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, errors.New("ps exploded") }
+			}
+
+			driveRetryTicks(t, s, 1, 1)
+
+			if got := fake.teardownCount(); got != tc.wantTeardowns {
+				t.Fatalf("teardowns = %d, want %d", got, tc.wantTeardowns)
+			}
+			if got := fake.setupCount(); got != tc.wantSetups {
+				t.Fatalf("setups = %d, want %d", got, tc.wantSetups)
+			}
+			// Whether idle (mounted, ledger dropped) or deferred (healDeferredBusy
+			// backs off without a strike), the wedged-breaker hazard never accrues.
+			if got := s.rowRetry[1].hazard; got != 0 {
+				t.Fatalf("hazard = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// TestRetreatDefersUnderLiveSessionWhenMounted pins the breaker/retreat gate
+// (convertRowToSymlink): a fuse row whose dir is a LIVE mountpoint with a live
+// session is left fuse, never force-unmounted — the kernel-panic guard. The
+// whole-pool retreatAllFuseRows drives the same shared primitive.
+func TestRetreatDefersUnderLiveSessionWhenMounted(t *testing.T) {
+	s, dirs, _ := newHealServer(t)
+	flipToFuse(t, s, 1)
+	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+	}
+	var unmounts int
+	swapForceUnmount(t, func(string) error { unmounts++; return nil })
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+
+	fuse, err := s.fuseAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.retreatAllFuseRows(t.Context(), fuse, "child crash-looped")
+
+	if unmounts != 0 {
+		t.Fatalf("retreat force-unmounted a busy mounted mirror %d time(s), want 0 (would panic the kernel)", unmounts)
+	}
+	if got := kindOf(t, s, 1); got != "nfs" {
+		t.Fatalf("row kind after a deferred retreat = %q, want fuse (left mounted)", got)
+	}
+	if !strings.Contains(buf.String(), "symlink retreat deferred") {
+		t.Fatalf("deferral not surfaced in the log:\n%s", buf.String())
+	}
+}
+
+// TestSweepOrphanDefersUnderLiveSession pins Site D: a rowless mountpoint a live
+// claude is still bound to is NOT a carcass yet — sweeping (force-unmounting) any
+// busy NFS mirror panics the kernel, so the orphan sweep leaves it mounted.
+func TestSweepOrphanDefersUnderLiveSession(t *testing.T) {
+	s, _, _ := newMigrateServer(t) // hermetic HOME -> hermetic AccountsDir()
+	if err := os.MkdirAll(pool.AccountsDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(pool.AccountsDir(), "acct-07") // a pre-row add carcass: no row
+	if err := os.MkdirAll(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fakeOverlayMounted(t, func(string) bool { return true })
+	// A live claude bound to the orphan carcass.
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+		return []procscan.Session{{PID: 4242, ConfigDir: orphan}}, nil
+	}
+	var unmounted []string
+	swapForceUnmount(t, func(dir string) error {
+		unmounted = append(unmounted, dir)
+		return nil
+	})
+
+	s.sweepOrphanMountpoints(t.Context(), nil)
+
+	if len(unmounted) != 0 {
+		t.Fatalf("swept a busy orphan carcass %v, want none (force-unmounting a busy NFS mirror panics)", unmounted)
+	}
+}
+
+// TestReconcileStaleMountpointDefersUnderLiveSession pins Site C: a symlink row
+// whose dir is unexpectedly a live mountpoint (aborted-rollback wreckage) is
+// normally force-cleared, but when a live claude is still bound reconcileAccount
+// leaves it and returns early — force-unmounting a busy NFS mirror panics.
+func TestReconcileStaleMountpointDefersUnderLiveSession(t *testing.T) {
+	s, dirs, _ := newMigrateServer(t) // acct-1 is a symlink row
+	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+	}
+	var unmounts int
+	swapForceUnmount(t, func(string) error { unmounts++; return nil })
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reconcileAccount(t.Context(), a)
+
+	if unmounts != 0 {
+		t.Fatalf("reconcile force-unmounted a busy stale mountpoint %d time(s), want 0 (would panic the kernel)", unmounts)
+	}
+	if !strings.Contains(buf.String(), "stale mountpoint left under") {
+		t.Fatalf("deferral not surfaced in the log:\n%s", buf.String())
 	}
 }

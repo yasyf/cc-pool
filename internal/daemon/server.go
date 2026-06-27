@@ -1067,6 +1067,13 @@ func (s *Server) sweepOrphanMountpoints(ctx context.Context, accts []store.Accou
 		if rowDirs[dir] || !overlayMounted(dir) {
 			continue
 		}
+		// A carcass actively read by a live claude is not a carcass yet:
+		// force-unmounting ANY busy NFS mirror panics the kernel, so defer to a
+		// later sweep once the session relaunches. Leave it mounted and surface it.
+		if busy, n := s.liveSessionGate(ctx, dir); busy {
+			s.log.Printf("orphaned mountpoint %s left under %d live session(s) — NOT force-unmounting (would panic the kernel); relaunch them", dir, n)
+			continue
+		}
 		s.log.Printf("clearing orphaned mountpoint with no account row (pre-row add carcass?): %s", dir)
 		if err := forceUnmount(dir); err != nil {
 			s.log.Printf("orphan mount sweep: force-unmount %s: %v", dir, err)
@@ -1153,6 +1160,13 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 		// rollback's wedged unmount, or a conversion that died before its row
 		// flip). Force it down directly — backend-agnostic, no provider needed —
 		// so the symlink repair below (which refuses mountpoints) can proceed.
+		// But a live claude may still be reading this carcass, and
+		// force-unmounting a busy NFS mirror panics the kernel — so when a
+		// session is bound, leave it and re-check next reconcile/heal tick.
+		if busy, n := s.liveSessionGate(ctx, a.ConfigDir); busy {
+			s.log.Printf("acct-%02d: stale mountpoint left under %d live session(s) — NOT force-unmounting (would panic the kernel); relaunch them", a.ID, n)
+			return
+		}
 		if err := forceUnmount(a.ConfigDir); err != nil {
 			s.log.Printf("acct-%02d: unmount stale mountpoint: %v", a.ID, err)
 			return
@@ -1176,10 +1190,11 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 type healOutcome int
 
 const (
-	healMounted    healOutcome = iota // the mirror is up
-	healRetry                         // transient holder condition; retry next poll
-	healTCCBlocked                    // mount blocked pending the TCC grant; recorded; retry next poll
-	healFallback                      // genuine mount failure; gated symlink fallback attempted
+	healMounted      healOutcome = iota // the mirror is up
+	healRetry                           // transient holder condition; retry next poll
+	healTCCBlocked                      // mount blocked pending the TCC grant; recorded; retry next poll
+	healFallback                        // genuine mount failure; gated symlink fallback attempted
+	healDeferredBusy                    // dead/wedged mirror left mounted under a live session; force-unmount would panic the kernel, so defer
 )
 
 // errSweepStranded marks a failure in mountFuse's pre-Setup sweep of stranded
@@ -1191,6 +1206,14 @@ const (
 // collision that refuses the sweep would refuse the symlink retreat the same
 // way — so converting fixes nothing and only fails closed every poll.
 var errSweepStranded = errors.New("sweep stranded private files")
+
+// errRemountBusy marks mountFuse refusing to tear down a dead/wedged mirror
+// because a live claude session is still bound to it: force-unmounting a busy
+// NFS mirror panics the kernel (nfs_vinvalbuf2: ubc_msync failed), so the
+// remount defers instead. healFuse routes it to healDeferredBusy, which backs
+// off WITHOUT a hazard strike so the wedged breaker can never fire on a busy
+// mount.
+var errRemountBusy = errors.New("remount refused: live sessions on the mirror")
 
 // healFuse establishes a fuse account's mirror, classifying failures instead
 // of blindly converting: transient holder conditions (holder unreachable, the
@@ -1204,10 +1227,18 @@ var errSweepStranded = errors.New("sweep stranded private files")
 // reconcile, the scheduler's per-poll self-heal, and the heal loop; callers
 // hold the account's poll claim.
 func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
-	err := s.mountFuse(a)
+	err := s.mountFuse(ctx, a)
 	switch {
 	case err == nil:
 		return healMounted
+	case errors.Is(err, errRemountBusy):
+		// The mirror reads dead/wedged but a live claude is still bound to it.
+		// Force-unmounting a busy NFS mirror panics the kernel (nfs_vinvalbuf2:
+		// ubc_msync failed), so mountFuse left it mounted; defer the remount and
+		// surface it. The heal-loop switch books this WITHOUT a hazard strike, so
+		// a busy mount never accrues toward the wedged breaker.
+		s.log.Printf("acct-%02d dead/wedged mirror left mounted under live session(s) — NOT force-unmounting (would panic the kernel); relaunch them: %v", a.ID, err)
+		return healDeferredBusy
 	case errors.Is(err, mountd.ErrHolderUnavailable), errors.Is(err, mountd.ErrBusy):
 		// RemoteFuseProvider.Setup already attempts a lazy (re)spawn of the cask
 		// holder, and the cask's launchd owns its respawn policy, so there is
@@ -1288,7 +1319,7 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 // tears down by its registered base, and the retry remounts the canonical
 // one. The Kind fence guards against wrong-kind injected fakes — the real
 // resolver always yields a fuse provider.
-func (s *Server) mountFuse(a store.Account) error {
+func (s *Server) mountFuse(ctx context.Context, a store.Account) error {
 	prov := s.overlayForRow(a)
 	if prov == nil || !prov.Backend().IsFuse() {
 		return fmt.Errorf("no fuse provider resolved for acct-%02d; refusing to mount through it", a.ID)
@@ -1299,8 +1330,13 @@ func (s *Server) mountFuse(a store.Account) error {
 	// (shallow-alive, bulk reads hang) passes it; the daemon's own deep-probe
 	// verdict catches that case. Without this, the remount RPC would hit the
 	// holder's now-idempotent handleMount, which treats a shallow-live mirror
-	// as already mounted and never replaces the wedged one.
+	// as already mounted and never replaces the wedged one. But a teardown
+	// force-unmounts, and a busy NFS mirror panics the kernel — so when a live
+	// session is still bound, leave it mounted and defer (errRemountBusy).
 	if overlayMounted(dir) && (prov.Health(base, dir) != nil || s.holder.deepWedged(dir)) {
+		if busy, _ := s.liveSessionGate(ctx, dir); busy {
+			return errRemountBusy
+		}
 		if err := prov.Teardown(base, dir); err != nil {
 			return fmt.Errorf("clear dead mount before remounting: %w", err)
 		}
@@ -1308,6 +1344,12 @@ func (s *Server) mountFuse(a store.Account) error {
 	}
 	err := s.sweepAndMount(prov, a, base, dir)
 	if errors.Is(err, mountd.ErrForeignMount) || errors.Is(err, mountd.ErrBaseMismatch) {
+		// The foreign/mismatched carcass clear also force-unmounts; gate it the
+		// same way so a live session bound to the carcass never triggers the
+		// kernel-panicking force-unmount.
+		if busy, _ := s.liveSessionGate(ctx, dir); busy {
+			return errRemountBusy
+		}
 		if terr := prov.Teardown(base, dir); terr != nil {
 			return fmt.Errorf("clear foreign mount: %w", terr)
 		}

@@ -225,17 +225,29 @@ func TestReportWedges(t *testing.T) {
 		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendNFS)},
 		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(fkoverlay.BackendSymlink)},
 	}
-	wedgeDetail := "wedged (serves metadata but hangs reads) — daemon will remount; relaunch its sessions"
+	// An idle wedge the daemon remounts on its own; a wedge backing live sessions
+	// is LEFT mounted (the daemon never force-unmounts a busy mirror — it panics
+	// the kernel), so the only fix is to relaunch those sessions.
+	wedgeIdleDetail := "wedged (serves metadata but hangs reads) — the daemon will remount it"
+	wedgeBusyDetail := "left mounted under 1 live session(s); relaunch them — the daemon will NOT force-unmount a busy mirror"
 	cases := map[string]struct {
 		mounts     []mountd.MountInfo
+		sessions   []procscan.Session
 		probeErr   error // returned by deepProbeAt when probed
 		want       []reportCall
 		wantProbed []string // dirs deepProbeAt must be called with, in order
 	}{
-		"live row with failing deep probe reported": {
+		"live row with failing deep probe and no sessions reports the idle copy": {
 			mounts:     []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b", Live: true}},
 			probeErr:   fmt.Errorf("%w: hung", overlay.ErrProbeWedged),
-			want:       []reportCall{{"acct-01 mirror", false, wedgeDetail}},
+			want:       []reportCall{{"acct-01 mirror", false, wedgeIdleDetail}},
+			wantProbed: []string{"/p/acct-01"},
+		},
+		"wedged row backing a live session reports the relaunch copy": {
+			mounts:     []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b", Live: true}},
+			sessions:   []procscan.Session{{PID: 4242, ConfigDir: "/p/acct-01"}},
+			probeErr:   fmt.Errorf("%w: hung", overlay.ErrProbeWedged),
+			want:       []reportCall{{"acct-01 mirror", false, wedgeBusyDetail}},
 			wantProbed: []string{"/p/acct-01"},
 		},
 		"live row with missing probe file is silent": {
@@ -265,7 +277,7 @@ func TestReportWedges(t *testing.T) {
 				return tc.probeErr
 			})
 			report, calls := captureReports()
-			reportWedges(accts, tc.mounts, report)
+			reportWedges(accts, tc.mounts, tc.sessions, report)
 			if len(*calls) != len(tc.want) {
 				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
 			}

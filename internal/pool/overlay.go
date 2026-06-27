@@ -42,7 +42,7 @@ func overlaySpec() fkoverlay.Spec {
 			Socket:         socket,
 			LogPath:        MountHolderLogPath(),
 			Args:           []string{"--socket", socket},
-			ExecPath:       mountd.HolderExe,
+			ExecPath:       holderExe,
 			Owner:          HolderOwner,
 			CannotHostHint: cannotHostHint,
 			SpawnTimeout:   mountd.DefaultSpawnTimeout,
