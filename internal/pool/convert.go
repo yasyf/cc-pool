@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -21,12 +22,13 @@ func (m *Manager) overlayFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
 }
 
 // detectOverlay resolves overlay-backend detection through the Manager's
-// injectable seam.
+// injectable seam. The Init/add paths that reach it carry no context, so the
+// default detection runs unbounded — Select's own dial/spawn bounds still apply.
 func (m *Manager) detectOverlay() (fkoverlay.Backend, string) {
 	if m.DetectOverlay != nil {
 		return m.DetectOverlay()
 	}
-	return DetectOverlayBackend()
+	return DetectOverlayBackend(context.Background())
 }
 
 // canHostFuse resolves the fuse-hosting capability check through the

@@ -75,7 +75,7 @@ func newHealServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv) {
 // symlink) every fuse row the holder cannot vouch for. cc-pool's in-process
 // supervisor is gone — the shared holder's lifecycle is launchd's — so the tests
 // drive the two heal steps directly instead of through the former superviseTick.
-func healTick(s *Server, ctx context.Context) {
+func healTick(ctx context.Context, s *Server) {
 	s.holder.refresh(s.holderClient())
 	s.retryUnvouchedFuseRows(ctx)
 }
@@ -168,7 +168,7 @@ func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	fake.setupErr = mountTimeoutChain()
 
 	// First heal tick: one attempt, booked as one failure with a window.
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups after the first tick = %d, want 1", fake.setupCount())
 	}
@@ -177,7 +177,7 @@ func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	}
 
 	// Immediately ticking again sits inside the window: no attempt.
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups inside the backoff window = %d, want still 1", fake.setupCount())
 	}
@@ -186,7 +186,7 @@ func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	st := s.rowRetry[1]
 	st.retryAt = time.Now().Add(-time.Second)
 	s.rowRetry[1] = st
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if fake.setupCount() != 2 || s.rowRetry[1].failures != 2 {
 		t.Fatalf("after the rewound window: setups=%d failures=%d, want 2/2",
 			fake.setupCount(), s.rowRetry[1].failures)
@@ -198,7 +198,7 @@ func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	st = s.rowRetry[1]
 	st.retryAt = time.Now().Add(-time.Second)
 	s.rowRetry[1] = st
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if fake.setupCount() != 3 {
 		t.Fatalf("setups after clearing the failure = %d, want 3", fake.setupCount())
 	}
@@ -226,7 +226,7 @@ func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
 		t.Fatal("beginPoll failed on a free account")
 	}
 
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if fake.setupCount() != 0 {
 		t.Fatal("the heal loop raced the claim owner")
 	}
@@ -236,7 +236,7 @@ func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
 
 	// Released: the still-open window admits the next tick's attempt.
 	s.endPoll(1)
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups after release = %d, want 1", fake.setupCount())
 	}
@@ -257,7 +257,7 @@ func TestHealTickRetryLeavesConvertedRowAndPrunes(t *testing.T) {
 	// …then converted away.
 	flipToSymlink(t, s, 1)
 
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 
 	if fake.setupCount() != 0 {
 		t.Fatal("a converted row was healed as fuse")
@@ -277,7 +277,7 @@ func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	s.holderSocket = startCannedHolder(t, nil)
 	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
 
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if fake.setupCount() != 1 || s.rowRetry[1].failures != 1 {
 		t.Fatalf("after the first tick: setups=%d failures=%d, want 1/1",
 			fake.setupCount(), s.rowRetry[1].failures)
@@ -286,7 +286,7 @@ func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 		t.Fatal("TCC guidance not surfaced for the blocked row")
 	}
 	// Inside the window: bounded, not hot.
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups inside the backoff window = %d, want still 1", fake.setupCount())
 	}
@@ -297,7 +297,7 @@ func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	st := s.rowRetry[1]
 	st.retryAt = time.Now().Add(-time.Second)
 	s.rowRetry[1] = st
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("granted row not mounted and vouched for")
 	}
@@ -357,7 +357,7 @@ func TestHealTickRemountsHeldDeadRow(t *testing.T) {
 			var buf bytes.Buffer
 			s.log = log.New(&buf, "", 0)
 
-			healTick(s, t.Context())
+			healTick(t.Context(), s)
 
 			if fake.setupCount() != 1 {
 				t.Fatalf("setups = %d, want the held-dead mirror remounted", fake.setupCount())
@@ -544,7 +544,7 @@ func driveRetryTicks(t *testing.T, s *Server, id, n int) {
 			st.retryAt = time.Now().Add(-time.Second)
 			s.rowRetry[id] = st
 		}
-		healTick(s, t.Context())
+		healTick(t.Context(), s)
 	}
 }
 

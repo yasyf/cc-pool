@@ -154,7 +154,7 @@ func TestIdleMountsNeverPeriodicallyProbed(t *testing.T) {
 	swapDeepProbe(t, func(string) error { atomic.AddInt32(&probes, 1); return nil })
 
 	for i := 0; i < 5; i++ {
-		healTick(s, t.Context())
+		healTick(t.Context(), s)
 	}
 	if got := atomic.LoadInt32(&probes); got != 0 {
 		t.Fatalf("deep probes against an idle mount = %d, want 0 (idle mounts are never periodically probed)", got)
@@ -180,12 +180,12 @@ func TestInUseMountProbedAndHealedWithinInterval(t *testing.T) {
 	s.log = log.New(&buf, "", 0)
 
 	// Tick 1: one strike — still ready (debounce), no remount.
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if fake.setupCount() != 0 {
 		t.Fatalf("setups after one strike = %d, want 0 (a wedge needs two)", fake.setupCount())
 	}
 	// Tick 2: second strike wedges → not ready → remounted this pass.
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups after the wedge = %d, want the mirror remounted once", fake.setupCount())
 	}
@@ -231,7 +231,7 @@ func TestProbeOnAssignRefusesIdleWedge(t *testing.T) {
 	// verdict alone makes the row not-ready and drives the remount, which
 	// clears the verdict.
 	s.holderSocket = startCannedHolder(t, []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}})
-	healTick(s, t.Context())
+	healTick(t.Context(), s)
 	if fake.setupCount() == 0 {
 		t.Fatal("the heal loop did not remount the wedged mirror the select surfaced")
 	}

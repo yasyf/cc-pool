@@ -33,7 +33,7 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 		// "fuse" is the user's coarse word; the gate resolves the concrete
 		// backend (nfs/fskit) by running Select inside the daemon, so the CLI
 		// never names a concrete fuse backend.
-		backend, msg := s.fuseGate()
+		backend, msg := s.fuseGate(ctx)
 		if msg != "" {
 			return Response{OK: false, Error: msg}
 		}
@@ -106,7 +106,7 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 // and the macOS volume-access grant are per-process, and the holder is
 // the process that hosts the mounts — so a missing grant fails here, before
 // any account is disturbed.
-func (s *Server) fuseGate() (fkoverlay.Backend, string) {
+func (s *Server) fuseGate(ctx context.Context) (fkoverlay.Backend, string) {
 	if s.fuseGateFn != nil {
 		return s.fuseGateFn()
 	}
@@ -116,7 +116,7 @@ func (s *Server) fuseGate() (fkoverlay.Backend, string) {
 	// The reason leads verbatim: a declined probe carries its own fuse-t/TCC
 	// remedy, while holder spawn or probe-RPC failures name their real cause —
 	// advice that fits one would mislead for the others.
-	backend, reason := pool.DetectOverlayBackend()
+	backend, reason := pool.DetectOverlayBackend(ctx)
 	if !backend.IsFuse() {
 		return "", fmt.Sprintf("fuse unavailable: %s — fix this, then re-run `ccp migrate`", reason)
 	}

@@ -104,7 +104,7 @@ func CanHostFuse() bool {
 // A holder spawned here lingers after a symlink verdict: it keeps serving the
 // socket with zero mounts (`ccp doctor` flags it as an orphan), and a later fuse
 // Setup reuses it.
-func DetectOverlayBackend() (fkoverlay.Backend, string) {
-	_, backend, reason, _ := fkoverlay.Select(context.Background(), overlaySpec())
+func DetectOverlayBackend(ctx context.Context) (fkoverlay.Backend, string) {
+	_, backend, reason, _ := fkoverlay.Select(ctx, overlaySpec())
 	return backend, reason
 }

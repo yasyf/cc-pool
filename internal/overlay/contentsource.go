@@ -83,10 +83,11 @@ func (s *PoolContentSource) plansDir() string     { return filepath.Join(s.claud
 // local files whose (mtime,size) gate the holder's cached bytes, so a steady-state
 // Getattr costs a local stat, not a bridge RPC.
 func (s *PoolContentSource) Manifest(domain string) ([]content.Entry, error) {
-	entries := []content.Entry{
-		{Name: claudeJSONName, Kind: content.EntrySynth, Private: true, Freshness: []string{s.privClaudeJSON(domain), s.baseClaudeJSON}},
-		{Name: settingsName, Kind: content.EntrySynth, Freshness: []string{s.baseSettings()}},
-	}
+	entries := make([]content.Entry, 0, 2+len(SharedEntries)+len(ExcludedEntries))
+	entries = append(entries,
+		content.Entry{Name: claudeJSONName, Kind: content.EntrySynth, Private: true, Freshness: []string{s.privClaudeJSON(domain), s.baseClaudeJSON}},
+		content.Entry{Name: settingsName, Kind: content.EntrySynth, Freshness: []string{s.baseSettings()}},
+	)
 	for name := range SharedEntries {
 		entries = append(entries, content.Entry{Name: name, Kind: content.EntrySymlink, Target: filepath.Join(s.claudeDir, name)})
 	}
@@ -190,7 +191,7 @@ func (s *PoolContentSource) writeThroughClaudeJSON(payload []byte) error {
 
 func (s *PoolContentSource) writeThroughSettings(payload []byte) error {
 	target := s.baseSettings()
-	base, err := os.ReadFile(target)
+	base, err := os.ReadFile(target) //nolint:gosec // G304: target is the daemon's own base settings path, not external input
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -233,7 +234,7 @@ func (s *PoolContentSource) Classify(name string) content.EntryKind {
 func (s *PoolContentSource) HealthErrors() error {
 	s.errMu.Lock()
 	defer s.errMu.Unlock()
-	var errs []error
+	errs := make([]error, 0, len(s.readErr)+len(s.writeErr))
 	for _, e := range s.readErr {
 		errs = append(errs, e)
 	}

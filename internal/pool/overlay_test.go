@@ -27,7 +27,7 @@ func TestCanHostFuse(t *testing.T) {
 	}
 
 	exe := filepath.Join(t.TempDir(), "fusekit-holder")
-	if err := os.WriteFile(exe, []byte("stub"), 0o755); err != nil {
+	if err := os.WriteFile(exe, []byte("stub"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	holderExe = exe

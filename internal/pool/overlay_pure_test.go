@@ -22,7 +22,7 @@ func TestDetectOverlayBackendCaskAbsent(t *testing.T) {
 	orig := holderExe
 	t.Cleanup(func() { holderExe = orig })
 	holderExe = filepath.Join(t.TempDir(), "absent", "fusekit-holder")
-	backend, reason := DetectOverlayBackend()
+	backend, reason := DetectOverlayBackend(t.Context())
 	if backend != fkoverlay.BackendSymlink {
 		t.Fatalf("backend = %q, want symlink with the cask absent", backend)
 	}
