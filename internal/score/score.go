@@ -1,6 +1,5 @@
 // Package score implements cc-pool's account-selection scoring. Higher is
-// better; select picks argmax. There are no roles — the best account across the
-// whole pool wins.
+// better; select picks argmax across the whole pool — there are no roles.
 package score
 
 import (
@@ -8,69 +7,53 @@ import (
 	"time"
 )
 
-// Scoring coefficients and knobs. All are package vars so they can be tuned or
-// disabled in tests. Setting BarrierKnee=0 and RunwayWeight=0 reduces the score
-// to the exact baseline 0.70·rem5 + 0.25·rem7 − 2·sessions − 100·rl − 20·stale.
+// Scoring knobs; vars so tests can tune or disable them.
 var (
 	W5h          = 0.70
 	W7d          = 0.25
 	WSession     = 2.00
 	PenRateLimit = 100.0
-	// PenNeedsLogin matches PenRateLimit: a signed-out account also cannot serve.
-	// It is paired with Available=false (and PickFallback skipping it), so the
-	// penalty only orders needs-login accounts among themselves.
+	// PenNeedsLogin only orders needs-login accounts among themselves:
+	// Available=false and PickFallback already exclude them.
 	PenNeedsLogin = 100.0
 	PenStale      = 20.0
 
-	// StaleAfter is the sample age past which the selection penalty engages. It
-	// is deliberately short so select prefers the freshest-sampled account; it is
+	// StaleAfter is the sample age past which the selection penalty engages;
 	// uniform across the pool between polls, so it does not skew ranking.
 	StaleAfter = 90 * time.Second
 
-	// DisplayStaleAfter is the sample age past which status renders an account as
-	// "stale". It must exceed the daemon's worst-case normal poll gap
-	// (daemon.basePollInterval 180s + pollJitter 30s = 210s) so a healthy,
-	// regularly-polled account is never shown stale, while an account genuinely
-	// stuck in rate-limit backoff (whose data really is old) still surfaces.
+	// DisplayStaleAfter is the sample age past which status renders an account
+	// "stale"; must exceed the daemon's worst-case poll gap (basePollInterval
+	// 180s + pollJitter 30s) so a healthy account is never shown stale.
 	DisplayStaleAfter = 5 * time.Minute
 
-	// FiveHourWindow / SevenDayWindow are the window lengths used to credit an
-	// imminent reset: depletion is discounted by how much of the window is still
-	// ahead before it refills, but never further ahead than MaxResetCreditHorizon.
+	// FiveHourWindow / SevenDayWindow are the window lengths used to credit
+	// depletion against an imminent reset, capped at MaxResetCreditHorizon.
 	FiveHourWindow = 5 * time.Hour
 	SevenDayWindow = 7 * 24 * time.Hour
 
 	// MaxResetCreditHorizon caps how far ahead a reset earns credit, independent
-	// of window length. Without it the 7-day window credits depletion linearly
-	// across its 168h, so a reset 2.5 days out still forgives ~65% of weekly
-	// usage. Capping at one 5-hour session means a weekly reset only lifts
-	// headroom when it lands within the span of work about to start; the 5h
-	// window (already ≤ the cap) is unchanged.
+	// of window length: a weekly reset only lifts headroom when it lands within
+	// one 5h session; the 5h window (already ≤ the cap) is unchanged.
 	MaxResetCreditHorizon = 5 * time.Hour
 
 	// BarrierKnee is the remaining-% below which a convex low-headroom penalty
 	// kicks in (so a nearly-exhausted window can't be masked by the other).
 	BarrierKnee = 20.0
 
-	// ExhaustedAtUtil is the utilization (percent) at or above which a window is
-	// treated as fully exhausted while its reset is still in the future. An
-	// exhausted account is unavailable: launching on it either silently bills
-	// pay-as-you-go extra-usage credits or rate-limits immediately. The API
-	// reports plan-window utilization in integer percent, so only a reported 100
-	// trips this.
+	// ExhaustedAtUtil is the utilization percent at or above which a window is
+	// treated as fully exhausted while its reset is still future. The API reports
+	// plan-window utilization in integer percent, so only a reported 100 trips it.
 	ExhaustedAtUtil = 99.5
 
-	// RunwayWeight / RunwayHorizon shape the burn-rate term: an account whose
-	// effective 5h headroom would be drained within RunwayHorizon is downranked,
-	// up to RunwayWeight points.
+	// RunwayWeight / RunwayHorizon shape the burn-rate term: an account draining
+	// its 5h headroom within RunwayHorizon is downranked up to RunwayWeight points.
 	RunwayWeight  = 15.0
 	RunwayHorizon = 5 * time.Hour
 
 	// StickyMinRemaining5h is the raw-5h-remaining floor (percent) below which a
-	// sticky selection is abandoned: with this little headroom right now the
-	// resumed session would hit the limit anyway, so cache continuity is
-	// worthless. Raw, not reset-aware: an imminent reset must not keep a pin on
-	// an account that cannot serve until it actually resets.
+	// sticky selection is abandoned as worthless. Raw, not reset-aware: an
+	// imminent reset must not pin an account that cannot serve until it resets.
 	StickyMinRemaining5h = 10.0
 )
 
@@ -95,10 +78,8 @@ type Input struct {
 	NeedsLogin     bool // the daemon flagged the account: refresh token gone/revoked
 }
 
-// staleAfter reports whether this account's data is older than d, its refresh
-// failed, or it was never sampled. A failed refresh or never-sampled account is
-// stale under any threshold. Two thresholds use this: StaleAfter for the
-// selection penalty and DisplayStaleAfter for the status "stale" flag.
+// staleAfter reports stale if the sample is older than d, refresh failed, or the
+// account was never sampled; the latter two hold under any threshold.
 func (in Input) staleAfter(now time.Time, d time.Duration) bool {
 	if in.RefreshFailed {
 		return true
@@ -142,29 +123,21 @@ type Result struct {
 	Available      bool // false if rate-limited or exhausted (cannot serve right now)
 }
 
-// Score computes the score for one account. For a healthy account (windows far
-// from a reset and well above the barrier knee, no measured burn) it equals the
-// baseline 0.70·rem5 + 0.25·rem7 − penalties; the reset-aware, barrier, and
-// runway terms only engage near limits.
+// Score computes the score for one account: weighted 5h+7d remaining minus
+// penalties. The reset-aware, barrier, and runway terms only engage near limits.
 func Score(in Input, now time.Time) Result {
 	util5, util7 := in.Util5h, in.Util7d
 	if !in.HasUsage {
-		// Unknown usage: assume empty so a never-sampled account is still
-		// selectable, but the stale penalty keeps it behind known-good ones.
+		// Unknown usage: assume empty so it stays selectable; the stale penalty
+		// keeps it behind known-good accounts.
 		util5, util7 = 0, 0
 	}
 
-	// Reset-aware effective remaining: discount depletion by how much of the
-	// credit horizon is still ahead before the window refills. frac=1 (reset
-	// beyond the horizon or unknown) gives the plain remaining; frac→0 (imminent
-	// reset) gives ~100. The horizon is capped at MaxResetCreditHorizon, so a
-	// weekly reset days away earns no credit.
 	eff5 := 100 - windowFrac(in.Resets5h, now, FiveHourWindow)*util5
 	eff7 := 100 - windowFrac(in.Resets7d, now, SevenDayWindow)*util7
 
-	// Raw remaining self-lifts once the reset passes, like windowFrac and the
-	// exhausted gate below: a stale pegged sample from before the reset must not
-	// barrier or sticky-floor an account whose window already refilled.
+	// Raw remaining self-lifts once the reset passes: a stale pegged sample from
+	// before the reset must not barrier or sticky-floor a window that refilled.
 	raw5, raw7 := 100-util5, 100-util7
 	if resetPassed(in.Resets5h, now) {
 		raw5 = 100
@@ -173,18 +146,13 @@ func Score(in Input, now time.Time) Result {
 		raw7 = 100
 	}
 
-	// A pegged window with its reset still pending means the account cannot
-	// serve right now — reset credit is forward-looking and must not mask it.
-	// now.Before(zero) is false, so an unknown reset never gates; neither does a
-	// stale post-reset sample (the gate self-lifts at the reset even before the
-	// next poll). A stale pre-reset sample gating is sound: utilization cannot
-	// decrease within a window.
+	// A pegged window with a pending reset can't serve now, and forward-looking
+	// reset credit must not mask it. now.Before(zero) is false, so an unknown
+	// reset never gates; a stale post-reset sample self-lifts at the reset; a
+	// stale pre-reset sample gating is sound (util can't drop within a window).
 	exhausted5 := in.HasUsage && util5 >= ExhaustedAtUtil && now.Before(in.Resets5h)
 	exhausted7 := in.HasUsage && util7 >= ExhaustedAtUtil && now.Before(in.Resets7d)
 	exhausted := exhausted5 || exhausted7
-	// ExhaustedUntil is the binding recovery time: the latest reset among the
-	// windows that tripped the gate (a 7d-exhausted account does not recover at
-	// its 5h reset).
 	var exhaustedUntil time.Time
 	if exhausted5 {
 		exhaustedUntil = in.Resets5h
@@ -193,8 +161,6 @@ func Score(in Input, now time.Time) Result {
 		exhaustedUntil = in.Resets7d
 	}
 
-	// Barriers and runway use raw remaining, not eff: they answer "can a session
-	// start on this account right now", which an imminent reset doesn't change.
 	c := Components{
 		Eff5:           eff5,
 		Eff7:           eff7,
@@ -213,8 +179,6 @@ func Score(in Input, now time.Time) Result {
 	if in.NeedsLogin {
 		c.NeedsLoginPenalty = PenNeedsLogin
 	}
-	// The penalty engages at the short StaleAfter; the displayed Stale flag uses
-	// the longer DisplayStaleAfter so a normally-polled account isn't shown stale.
 	if in.staleAfter(now, StaleAfter) {
 		c.StalePenalty = PenStale
 	}
@@ -243,11 +207,10 @@ func resetPassed(resetsAt, now time.Time) bool {
 	return !resetsAt.IsZero() && !now.Before(resetsAt)
 }
 
-// windowFrac is the fraction of the credit horizon still ahead before the
-// window resets, in [0,1]. A zero/far reset returns 1 (the depletion counts
-// fully); an imminent reset returns ~0 (the depletion is about to be refilled).
-// The horizon is min(window, MaxResetCreditHorizon), so a reset beyond the cap —
-// e.g. a weekly window resetting days from now — earns no credit.
+// windowFrac is the fraction of the credit horizon still ahead before the reset,
+// in [0,1]: a zero/far reset returns 1 (depletion counts fully), an imminent one
+// ~0 (about to refill). The horizon is min(window, MaxResetCreditHorizon), so a
+// reset beyond the cap earns no credit.
 func windowFrac(resetsAt, now time.Time, window time.Duration) float64 {
 	if resetsAt.IsZero() || window <= 0 {
 		return 1
@@ -267,10 +230,9 @@ func windowFrac(resetsAt, now time.Time, window time.Duration) float64 {
 	}
 }
 
-// barrier is a convex low-headroom penalty: zero above BarrierKnee, rising
-// linearly to BarrierKnee as raw current remaining approaches zero. It takes
-// raw remaining, not the reset-credited eff — an imminent reset must not mask
-// a window that is nearly empty right now.
+// barrier is a low-headroom penalty: zero above BarrierKnee, rising linearly to
+// BarrierKnee as raw remaining approaches zero. Raw, not reset-credited eff — an
+// imminent reset must not mask a window nearly empty right now.
 func barrier(remaining float64) float64 {
 	if remaining >= BarrierKnee {
 		return 0
@@ -281,11 +243,10 @@ func barrier(remaining float64) float64 {
 	return BarrierKnee - remaining
 }
 
-// runwayPenalty downranks an account being actively drained: if its raw 5h
-// headroom would be exhausted within RunwayHorizon at the current burn rate,
-// penalize up to RunwayWeight points. Raw remaining, not eff: time-to-wall is
-// how much is actually left over how fast it burns. Zero/negative burn (idle
-// or unknown) → 0.
+// runwayPenalty downranks an account being drained: if its raw 5h headroom would
+// be exhausted within RunwayHorizon at the current burn rate, penalize up to
+// RunwayWeight points. Raw, not eff (time-to-wall is real remaining over burn).
+// Zero/negative burn (idle or unknown) → 0.
 func runwayPenalty(remaining5h, burnPerHour float64) float64 {
 	if burnPerHour <= 0 || RunwayWeight <= 0 || RunwayHorizon <= 0 {
 		return 0
@@ -302,16 +263,14 @@ func runwayPenalty(remaining5h, burnPerHour float64) float64 {
 	return RunwayWeight * frac
 }
 
-// UsableForSticky reports whether a previously-selected account can keep
-// serving a sticky session: it must be available (not rate-limited or
-// exhausted) and have at least StickyMinRemaining5h raw 5h headroom right now.
+// UsableForSticky reports whether a previously-selected account can keep serving
+// a sticky session: available and at least StickyMinRemaining5h raw 5h headroom.
 func UsableForSticky(r Result) bool {
 	return r.Available && r.Components.RawRemaining5h >= StickyMinRemaining5h
 }
 
-// Rank scores all inputs and returns results sorted best-first. Ties on score
-// break toward the soonest 5-hour reset (an account about to reset is freshest
-// to drain first); a zero Resets5h sorts last among ties.
+// Rank scores all inputs and returns results sorted best-first, breaking ties
+// toward the soonest 5h reset (freshest to drain first); zero Resets5h sorts last.
 func Rank(inputs []Input, now time.Time) []Result {
 	results := make([]Result, len(inputs))
 	for i, in := range inputs {
@@ -340,9 +299,8 @@ func resetsBefore(a, b time.Time) bool {
 	}
 }
 
-// Pick returns the best AVAILABLE account from ranked results. ok=false if no
-// account is currently available (all exhausted/rate-limited or the pool is
-// empty).
+// Pick returns the best available account from ranked results; ok=false if none
+// is available or the pool is empty.
 func Pick(ranked []Result) (Result, bool) {
 	for _, r := range ranked {
 		if r.Available {
@@ -352,11 +310,10 @@ func Pick(ranked []Result) (Result, bool) {
 	return Result{}, false
 }
 
-// PickFallback returns the best exhausted-but-not-rate-limited account, the
-// least-bad pick when Pick found nothing: an exhausted account can still serve
-// (billing extra-usage credits or waiting out its reset), a rate-limited one
-// cannot, and neither can a needs-login one (no valid token at all). ok=false if
-// every account is rate-limited / needs-login, or the pool is empty.
+// PickFallback returns the best account that is not rate-limited or needs-login —
+// the least-bad pick when Pick found nothing. An exhausted account can still
+// serve (billing extra-usage credits or waiting out its reset); rate-limited and
+// needs-login ones cannot. ok=false if all are rate-limited/needs-login or empty.
 func PickFallback(ranked []Result) (Result, bool) {
 	for _, r := range ranked {
 		if !r.RateLimited && !r.NeedsLogin {

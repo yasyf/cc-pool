@@ -1,10 +1,9 @@
 // Package procscan discovers live `claude` sessions and the account each is
-// bound to, by reading process environments. On macOS 26 `ps -Eww` prints the
-// environment of same-user processes (verified on the target machine), which
-// exposes CLAUDE_CONFIG_DIR.
+// bound to by reading process environments. On macOS 26 `ps -Eww` prints
+// same-user process environments, exposing CLAUDE_CONFIG_DIR.
 //
-// A claude process with no CLAUDE_CONFIG_DIR in its environment is plain
-// `claude` on ~/.claude — not a pool session; it maps to no pool account.
+// A claude process with no CLAUDE_CONFIG_DIR is plain `claude` on ~/.claude,
+// mapped to no pool account.
 package procscan
 
 import (
@@ -21,63 +20,45 @@ import (
 // Session is a discovered live claude process.
 type Session struct {
 	PID       int
-	ConfigDir string // value of CLAUDE_CONFIG_DIR, or "" for plain claude
-	// StartedAt is the process start time, derived from ps's etime column
-	// (scan time minus elapsed). The zero time means etime was unparseable —
-	// the one tolerated soft-fail in this package: staleness flagging is
-	// advisory, while session detection is load-bearing (uninstall gates and
-	// remount logs key on it), so a cosmetic parse failure must never drop a
-	// live session.
+	ConfigDir string // CLAUDE_CONFIG_DIR value, or "" for plain claude
+	// StartedAt is the process start time (scan time minus ps's etime). Zero
+	// means etime was unparseable — a soft-fail that keeps the session, since
+	// staleness is advisory but session detection is load-bearing.
 	StartedAt time.Time
 }
 
-// psBin and its args are overridable in tests. etime sits between pid and
-// command because its rendering ([[dd-]hh:]mm:ss) never contains spaces, so
-// parse's space-delimited field splits stay unambiguous; it is locale-proof,
+// etime sits between pid and command because its [[dd-]hh:]mm:ss rendering never
+// contains spaces (keeping parse's space splits unambiguous) and is locale-proof,
 // unlike lstart.
 var (
 	psBin  = "/bin/ps"
 	psArgs = []string{"-Eww", "-ax", "-o", "pid=,etime=,command="}
-	// psOutput is the process-table seam: the real ps in production, canned
-	// output in tests (which must never scan real processes).
+	// psOutput is the process-table seam, swapped for canned output in tests.
 	psOutput = func(ctx context.Context) ([]byte, error) {
 		cmd := exec.CommandContext(ctx, psBin, psArgs...)
-		// A ps blocked reading a D-state process (one wedged on a hung fuse-t
-		// mount) cannot be reaped by SIGKILL, so cmd.Wait stays parked in
-		// waitpid regardless of ctx — WaitDelay does NOT change that. What
-		// frees the CALLER is Scan's goroutine decoupling (see Scan). WaitDelay
-		// is still worth setting: once ps finally exits (the mount unwedged) it
-		// closes the orphaned stdout pipe and lets the abandoned goroutine
-		// drain instead of blocking forever on the output copy.
+		// WaitDelay can't free a caller blocked on a D-state ps (Scan's goroutine
+		// decoupling does); it only lets the orphaned copy goroutine drain once ps
+		// finally exits and closes stdout, instead of blocking forever.
 		cmd.WaitDelay = 1 * time.Second
 		return cmd.Output()
 	}
 )
 
-// scanTimeout bounds one Scan. A var so tests can shrink it.
 var scanTimeout = 3 * time.Second
 
 var configDirRE = regexp.MustCompile(`(?:^|\s)CLAUDE_CONFIG_DIR=(\S+)`)
 
-// Scan returns all live claude sessions. It bounds the underlying `ps` with
-// scanTimeout: a wedged fuse-t mount can drive a process into uninterruptible
-// D-state, and a `ps` reading that process blocks in-kernel forever, which
-// would hang every launch and daemon poll.
-//
-// Releasing the CALLER takes more than exec.CommandContext + WaitDelay: cmd.Wait
-// blocks in waitpid first, and neither ctx cancellation nor WaitDelay makes
-// waitpid return for an unkillable (D-state) ps. So Scan runs psOutput in a
-// goroutine and returns on the deadline regardless of whether ps ever dies. The
-// abandoned goroutine stays parked in waitpid until the mount unwedges and ps
-// finally exits; the buffered channel keeps it from leaking on send. A
-// DeadlineExceeded surfaces as a normal error, which callers treat as "no
-// sessions discovered".
+// Scan returns all live claude sessions, bounding ps with scanTimeout: a wedged
+// fuse-t mount can pin ps in uninterruptible D-state where neither ctx nor
+// WaitDelay frees the caller (cmd.Wait parks in waitpid), so Scan runs ps in a
+// goroutine and returns on the deadline. The buffered channel lets the abandoned
+// goroutine finish without leaking; DeadlineExceeded surfaces as an error callers
+// treat as "no sessions discovered".
 func Scan(ctx context.Context) ([]Session, error) {
 	cctx, cancel := context.WithTimeout(ctx, scanTimeout)
 	defer cancel()
-	// Capture the seam before spawning so the goroutine never reads the package
-	// var: a goroutine left parked on an unkillable ps would otherwise race a
-	// test swapping psOutput. Production never mutates it.
+	// Capture the seam before spawning: the goroutine may outlive Scan and race a
+	// test swapping psOutput.
 	run := psOutput
 	type result struct {
 		out []byte
@@ -99,8 +80,7 @@ func Scan(ctx context.Context) ([]Session, error) {
 	}
 }
 
-// parse extracts sessions from `ps -Eww -o pid=,etime=,command=` output. now
-// anchors StartedAt: etime is elapsed wall time, so start = now - elapsed.
+// parse extracts sessions from ps output, anchoring StartedAt at now-etime.
 func parse(out string, now time.Time) []Session {
 	var sessions []Session
 	for _, line := range strings.Split(out, "\n") {
@@ -108,8 +88,6 @@ func parse(out string, now time.Time) []Session {
 		if line == "" {
 			continue
 		}
-		// Fields: "pid etime command args ENV...". etime never contains
-		// spaces, so two space splits recover all three.
 		sp := strings.IndexByte(line, ' ')
 		if sp < 0 {
 			continue
@@ -133,8 +111,7 @@ func parse(out string, now time.Time) []Session {
 			cd = m[1]
 		}
 		var startedAt time.Time
-		// Soft-fail by design (see Session.StartedAt): a malformed etime
-		// zeroes StartedAt but keeps the session.
+		// Soft-fail: malformed etime keeps the session (see Session.StartedAt).
 		if d, perr := parseEtime(etime); perr == nil {
 			startedAt = now.Add(-d)
 		}
@@ -143,9 +120,8 @@ func parse(out string, now time.Time) []Session {
 	return sessions
 }
 
-// parseEtime parses ps's etime column — elapsed wall time since process
-// start, rendered [[dd-]hh:]mm:ss — into a duration. The minimum form is
-// mm:ss (ps never emits bare seconds).
+// parseEtime parses ps's etime ([[dd-]hh:]mm:ss elapsed since start) into a
+// duration. Minimum form is mm:ss; ps never emits bare seconds.
 func parseEtime(s string) (time.Duration, error) {
 	rest := s
 	var days uint64
@@ -190,9 +166,8 @@ func parseEtime(s string) (time.Duration, error) {
 		time.Duration(ss)*time.Second, nil
 }
 
-// etimeField parses one etime component: non-empty, digits only (ParseUint
-// rejects signs, so a stray '-' inside a field reads as garbage, not a
-// negative count).
+// etimeField parses one etime component: non-empty, digits only. ParseUint
+// rejects signs, so a stray '-' reads as garbage, not a negative count.
 func etimeField(s string) (uint64, error) {
 	if s == "" {
 		return 0, fmt.Errorf("empty field")
@@ -204,8 +179,8 @@ func etimeField(s string) (uint64, error) {
 	return n, nil
 }
 
-// isClaudeProcess reports whether a command line belongs to the claude CLI
-// itself (argv[0] basename == "claude"), excluding our own ccp/cc-pool.
+// isClaudeProcess reports whether argv[0]'s basename is "claude" (the CLI, not
+// ccp/cc-pool).
 func isClaudeProcess(cmd string) bool {
 	tok := cmd
 	if i := strings.IndexByte(cmd, ' '); i >= 0 {
@@ -216,8 +191,8 @@ func isClaudeProcess(cmd string) bool {
 }
 
 // CountByConfigDir counts sessions whose ConfigDir exactly matches configDir.
-// An empty configDir matches nothing: no pool account has an empty dir, and
-// plain-claude sessions (empty ConfigDir) belong to no pool account.
+// Empty configDir matches nothing: plain-claude sessions belong to no pool
+// account.
 func CountByConfigDir(sessions []Session, configDir string) int {
 	if configDir == "" {
 		return 0

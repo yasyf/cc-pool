@@ -22,9 +22,8 @@ func openTestManager(t *testing.T) *Manager {
 	return &Manager{Store: st, LockDir: t.TempDir()}
 }
 
-// seedSessionFor writes one tracked session for cwd on the given account.
-// Live fixtures use pid 0 so the select path's dead-session sweep (which only
-// knows claude pids) can never reap them.
+// seedSessionFor's live fixtures use pid 0 so the select-path dead-session sweep
+// (claude pids only) can never reap them.
 func seedSessionFor(t *testing.T, m *Manager, accountID int, cwd string, started time.Time, ended *time.Time) {
 	t.Helper()
 	id, err := m.Store.OpenSession(accountID, 0, "dir", cwd, started)
@@ -45,11 +44,10 @@ func seedSession(t *testing.T, m *Manager, cwd string, started time.Time, ended 
 }
 
 func TestStickyPick(t *testing.T) {
-	// Truncate to seconds: SelectedAt round-trips through the store as Unix
-	// seconds, and the TTL-boundary case needs an exact comparison.
+	// SelectedAt round-trips through the store as Unix seconds; the TTL-boundary
+	// case needs the exact comparison.
 	now := time.Now().Truncate(time.Second)
 	ts := func(d time.Duration) *time.Time { t := now.Add(d); return &t }
-	// acct-1 ranks first; acct-2 is the sticky target the record points at.
 	healthy := []score.Result{
 		{AccountID: 1, Score: 80, Available: true, Components: score.Components{RawRemaining5h: 90}},
 		{AccountID: 2, Score: 50, Available: true, Components: score.Components{RawRemaining5h: 50}},
@@ -65,8 +63,8 @@ func TestStickyPick(t *testing.T) {
 	}
 	cases := []struct {
 		name        string
-		cwd         string // cwd passed to StickyPick ("" disables)
-		record      bool   // whether to write a sticky row for /proj -> recordID
+		cwd         string // "" disables
+		record      bool
 		manual      bool
 		recordID    int
 		recordedAt  time.Time
@@ -74,9 +72,8 @@ func TestStickyPick(t *testing.T) {
 		ranked      []score.Result
 		wantOutcome StickyOutcome
 		wantID      int
-		wantRowGone bool // row 4 hygiene: expired records are deleted on read
+		wantRowGone bool // expired records are deleted on read
 	}{
-		// No-data fallback (row 10): selected_at freshness alone binds.
 		{
 			name: "fresh select binds with no sessions", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-30 * time.Minute), ranked: healthy, wantOutcome: StickyBind, wantID: 2,
@@ -90,7 +87,6 @@ func TestStickyPick(t *testing.T) {
 			recordedAt: now.Add(-StickyTTL - time.Minute), ranked: healthy, wantOutcome: StickyMiss, wantRowGone: true,
 		},
 
-		// Activity rules: live sessions hold, warm ends bind, cold ends expire.
 		{
 			name: "live-only session holds", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-10 * time.Minute),
@@ -99,13 +95,13 @@ func TestStickyPick(t *testing.T) {
 		},
 		{
 			name: "long session keeps stale pin alive", cwd: "/proj", record: true, recordID: 2,
-			recordedAt: now.Add(-3 * time.Hour), // selected long ago, session still running
+			recordedAt: now.Add(-3 * time.Hour),
 			sessions:   []session{{started: now.Add(-3 * time.Hour)}},
 			ranked:     healthy, wantOutcome: StickyHold, wantID: 2,
 		},
 		{
 			name: "warm ended session binds despite stale select", cwd: "/proj", record: true, recordID: 2,
-			recordedAt: now.Add(-3 * time.Hour), // the headline fix: >1h session, ended 10m ago
+			recordedAt: now.Add(-3 * time.Hour),
 			sessions:   []session{{started: now.Add(-3 * time.Hour), ended: ts(-10 * time.Minute)}},
 			ranked:     healthy, wantOutcome: StickyBind, wantID: 2,
 		},
@@ -114,7 +110,7 @@ func TestStickyPick(t *testing.T) {
 			recordedAt: now.Add(-3 * time.Hour),
 			sessions: []session{
 				{started: now.Add(-2 * time.Hour), ended: ts(-10 * time.Minute)},
-				{started: now.Add(-30 * time.Minute)}, // still live
+				{started: now.Add(-30 * time.Minute)},
 			},
 			ranked: healthy, wantOutcome: StickyBind, wantID: 2,
 		},
@@ -135,13 +131,13 @@ func TestStickyPick(t *testing.T) {
 		},
 		{
 			name: "cold history but fresh select binds", cwd: "/proj", record: true, recordID: 2,
-			recordedAt: now.Add(-5 * time.Minute), // e.g. a pid-0 select after old sessions
+			recordedAt: now.Add(-5 * time.Minute),
 			sessions:   []session{{started: now.Add(-3 * time.Hour), ended: ts(-2 * time.Hour)}},
 			ranked:     healthy, wantOutcome: StickyBind, wantID: 2,
 		},
 
-		// Activity is account-scoped: the cache a pin protects belongs to the
-		// pinned account, so another account's sessions neither warm nor hold.
+		// Activity is account-scoped: a pin protects the pinned account's cache,
+		// so another account's sessions neither warm nor hold.
 		{
 			name: "other account's warm end cannot warm the pin", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now.Add(-3 * time.Hour),
@@ -155,7 +151,6 @@ func TestStickyPick(t *testing.T) {
 			ranked:     healthy, wantOutcome: StickyMiss, wantRowGone: true,
 		},
 
-		// Manual pins: no warm-cache requirement, no live-session skip.
 		{
 			name: "manual binds with no sessions", cwd: "/proj", record: true, manual: true, recordID: 2,
 			recordedAt: now.Add(-30 * time.Minute), ranked: healthy, wantOutcome: StickyBind, wantID: 2,
@@ -175,7 +170,7 @@ func TestStickyPick(t *testing.T) {
 			recordedAt: now, ranked: pinUnusable, wantOutcome: StickyHoldManual, wantID: 2,
 		},
 
-		// Unusable auto pins are abandoned (2026-06-10 incident behavior).
+		// Unusable auto pins are abandoned (2026-06-10 incident).
 		{
 			name: "near-full auto pin abandoned", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now, ranked: pinUnusable, wantOutcome: StickyMiss,
@@ -187,8 +182,8 @@ func TestStickyPick(t *testing.T) {
 				{AccountID: 2, Score: -50, Available: false, Components: score.Components{RawRemaining5h: 50}},
 			}, wantOutcome: StickyMiss,
 		},
-		// The 2026-06-10 incident: the pinned account is exhausted but its
-		// imminent reset keeps eff5 high — the pin must still be abandoned.
+		// 2026-06-10 incident: the pinned account is exhausted but its imminent
+		// reset keeps eff5 high — the pin must still be abandoned.
 		{
 			name: "exhausted auto pin abandoned", cwd: "/proj", record: true, recordID: 2,
 			recordedAt: now, ranked: []score.Result{
@@ -197,7 +192,6 @@ func TestStickyPick(t *testing.T) {
 			}, wantOutcome: StickyMiss,
 		},
 
-		// Structural misses.
 		{
 			name: "account deleted", cwd: "/proj", record: true, recordID: 9,
 			recordedAt: now, ranked: healthy, wantOutcome: StickyMiss,
@@ -330,8 +324,8 @@ func TestPinAPI(t *testing.T) {
 		if err != nil || pinned {
 			t.Fatalf("auto unpin toggle: pinned=%v err=%v", pinned, err)
 		}
-		// An EXPIRED unpruned pin counts as absent: the press must pin, not
-		// silently release a pin the selector already misses.
+		// An expired unpruned pin counts as absent: the press must pin, not
+		// release a pin the selector already misses.
 		_ = m.Store.PinManual("/proj", 2, now.Add(-2*time.Hour))
 		pinned, err = m.TogglePin("/proj", 2, now)
 		if err != nil || !pinned {
@@ -385,9 +379,8 @@ func TestPinAPI(t *testing.T) {
 	})
 }
 
-// TestClassifyDegradesOnStoreError: an activity-read failure must degrade to
-// selected_at-only freshness (the pre-activity behavior), never escape — the
-// select path treats stickiness as best-effort.
+// TestClassifyDegradesOnStoreError: an activity-read failure degrades to
+// selected_at-only freshness (best-effort), never escaping.
 func TestClassifyDegradesOnStoreError(t *testing.T) {
 	m := openTestManager(t)
 	_ = m.Store.Close() // force GetCwdActivity to fail
@@ -405,10 +398,9 @@ func TestClassifyDegradesOnStoreError(t *testing.T) {
 	}
 }
 
-// TestSelectSweepReconcilesDeadSessions covers the select-path self-heal: with
-// no daemon running, a select must reap session rows whose pids are gone —
-// including when the scan finds ZERO claude processes (a nil slice from a
-// successful scan), the exact state after the last session exits.
+// TestSelectSweepReconcilesDeadSessions covers the select-path self-heal: with no
+// daemon, a select reaps session rows whose pids are gone — even when the scan
+// finds ZERO claude processes (a nil slice), the state after the last exit.
 func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
@@ -431,8 +423,8 @@ func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		// Pin /proj -> acct-2 long ago; its session (a dead pid no claude can
-		// own) was last seen alive 10 minutes ago.
+		// Pin /proj -> acct-2 long ago; its session uses a dead pid no claude can
+		// own, last seen alive 10 minutes ago.
 		if err := m.Store.UpsertSticky("/proj", 2, now.Add(-3*time.Hour)); err != nil {
 			t.Fatal(err)
 		}
@@ -465,8 +457,7 @@ func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Without a trustworthy scan the row must stay open (no fabricated
-		// end): the still-live pin holds and the free ranking wins.
+		// Without a trustworthy scan the row must stay open — no fabricated end.
 		if sr.Best.ID != 1 || sr.Sticky {
 			t.Fatalf("failed scan must not reap: got acct %d sticky=%v", sr.Best.ID, sr.Sticky)
 		}
@@ -626,9 +617,9 @@ func TestSelectHonorsSticky(t *testing.T) {
 	})
 }
 
-// TestSelectAllExhaustedFallback: when every account's 5h window is pegged with
-// a pending reset, Select must still return the least-bad one — flagged so the
-// caller warns — rather than erroring; only all-rate-limited errors.
+// TestSelectAllExhaustedFallback: when every account's 5h window is pegged with a
+// pending reset, Select returns the least-bad one flagged, not an error; only
+// all-rate-limited errors.
 func TestSelectAllExhaustedFallback(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()

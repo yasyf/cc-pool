@@ -74,8 +74,6 @@ func TestExecEnv(t *testing.T) {
 	})
 }
 
-// TestCcpAccountFromEnv pins the CCP_ACCOUNT override parsing: unset yields no
-// override, a non-integer is rejected, and a valid id parses through.
 func TestCcpAccountFromEnv(t *testing.T) {
 	t.Run("unset yields no override", func(t *testing.T) {
 		t.Setenv(ccpAccountEnv, "")
@@ -102,11 +100,7 @@ func TestCcpAccountFromEnv(t *testing.T) {
 	})
 }
 
-// TestResolveSelectionForcedUnknown covers the forced-account error path shared
-// by `ccp run` and `ccp select`, which returns before any overlay/Keychain
-// access. The valid-id path is exercised by manual verification (it reaches
-// SyncOverlay/PreflightRefresh, which need real state and must not be touched
-// here).
+// TestResolveSelectionForcedUnknown covers only the error path; the valid-id path hits SyncOverlay/PreflightRefresh, which tests must not touch.
 func TestResolveSelectionForcedUnknown(t *testing.T) {
 	m := &pool.Manager{Store: openTestStore(t)}
 	cmd := &cobra.Command{}

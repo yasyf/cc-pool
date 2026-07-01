@@ -8,9 +8,8 @@ import (
 	"testing"
 )
 
-// fakeWidgetTools installs fake `brew` and `open` executables on PATH that log
-// every invocation, and returns the log path. FAKE_TAPPED / FAKE_INSTALLED env
-// vars steer the fakes' answers.
+// fakeWidgetTools puts logging fake `brew`/`open` executables on PATH and
+// returns the call-log path; FAKE_TAPPED / FAKE_INSTALLED steer their answers.
 func fakeWidgetTools(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -44,10 +43,8 @@ exit 0
 	return logPath
 }
 
-// TestRunWidgetSequence pins the exact brew/open invocations: a fresh install
-// taps then installs, a re-run upgrades without re-tapping, and the quarantine
-// workaround is gone — no xattr and no --no-quarantine (the app is Developer ID
-// signed, notarized, and stapled).
+// TestRunWidgetSequence pins the exact brew/open argv; xattr / --no-quarantine
+// must never appear (the app is Developer ID signed, notarized, and stapled).
 func TestRunWidgetSequence(t *testing.T) {
 	cases := map[string]struct {
 		tapped, installed bool
@@ -118,8 +115,6 @@ func TestRunWidgetSequence(t *testing.T) {
 	}
 }
 
-// TestRunWidgetRequiresBrew: without brew on PATH the command fails loud with
-// a pointer at the from-source path, before attempting anything.
 func TestRunWidgetRequiresBrew(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	cmd := newWidgetCmd()

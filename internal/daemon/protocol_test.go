@@ -7,10 +7,6 @@ import (
 	"testing"
 )
 
-// TestHolderStatusWireAdditive pins the holder field's compatibility contract
-// (ProtocolVersion stays 1): a response without it marshals with no holder
-// key, old-shape bytes decode with Holder nil, and a populated field
-// round-trips.
 func TestHolderStatusWireAdditive(t *testing.T) {
 	b, err := json.Marshal(Response{OK: true})
 	if err != nil {
@@ -42,13 +38,9 @@ func TestHolderStatusWireAdditive(t *testing.T) {
 	}
 }
 
-// TestHandleStatusCarriesHolderState pins the population: status carries the
-// daemon's cached holder view, with Mounts counting live mirrors only (a
-// shallow-dead entry is excluded).
 func TestHandleStatusCarriesHolderState(t *testing.T) {
 	s, _ := newTestServer(t)
 
-	// The zero cache (holder never reached): present, version empty.
 	resp := s.handleStatus(t.Context())
 	if !resp.OK || resp.Holder == nil {
 		t.Fatalf("status = %+v, want a holder view", resp)

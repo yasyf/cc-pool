@@ -9,30 +9,13 @@ import (
 )
 
 // OAuthAccountKey is the top-level .claude.json key holding an account's
-// per-account login identity. It is the one key pool's add-time seeding strips
-// (seedClaudeJSON deliberately copies projects/userID for add-time continuity)
-// and is always in ClaudeJSONPrivateKeys, so it never crosses between the base
-// and an account in either merge direction.
+// login identity.
 const OAuthAccountKey = "oauthAccount"
 
-// ClaudeJSONPrivateKeys are the top-level .claude.json keys that never
-// propagate between the base ~/.claude.json and an account's private copy, in
-// either direction. Every other key — including ones claude invents later —
-// propagates automatically. Key names are best-effort: an absent key simply
-// never matches. Contrast with seedClaudeJSON, which strips ONLY
-// OAuthAccountKey at add time so a new account inherits projects/userID.
-//
-//   - oauthAccount:   per-account login identity, written by that account's
-//     own `claude /login`.
-//   - userID:         per-account telemetry identity derived at first start.
-//   - anonymousId:    per-account anonymous analytics identity.
-//   - projects:       per-account project state (history, allowed tools);
-//     sharing it would commingle session state across accounts — except the
-//     per-project trust/approval keys and local-scope MCP server definitions in
-//     ClaudeJSONSharedProjectKeys, which overlaySharedProjectKeys carves out and
-//     shares in both directions.
-//   - firstStartTime: per-account startup record.
-//   - numStartups:    per-account startup counter, bumped every launch.
+// ClaudeJSONPrivateKeys are the top-level .claude.json keys that never cross
+// between base ~/.claude.json and an account's private copy in either
+// direction (the ClaudeJSONSharedProjectKeys carve-out inside "projects"
+// excepted); every other key propagates.
 var ClaudeJSONPrivateKeys = map[string]bool{
 	OAuthAccountKey:  true,
 	"userID":         true,
@@ -43,21 +26,10 @@ var ClaudeJSONPrivateKeys = map[string]bool{
 }
 
 // ClaudeJSONSharedProjectKeys are the keys inside each projects["<path>"]
-// object that DO propagate between the base ~/.claude.json and an account's
-// private copy, in both directions — the per-project exception to the
-// "projects" entry in ClaudeJSONPrivateKeys. They record trust/approval
-// decisions, MCP server enablement, and the project's local-scope MCP server
-// definitions, which are properties of the project (and the single user's
-// machine), not of the account answering the prompt; without sharing them
-// every pool account re-asks every dialog and a `claude mcp add --scope local`
-// server is invisible to pooled sessions. Everything else inside a project
-// entry (history, allowed tools, session state) stays private.
-//
-//   - mcpServers: local-scope per-project server definitions written by
-//     `claude mcp add --scope local`. Unlike enabledMcpjsonServers (which only
-//     records approval of .mcp.json servers, themselves shared via the project
-//     tree), this carries the full server config, so sharing it is what gives a
-//     pooled session the same project MCP servers as plain claude.
+// entry that propagate both directions — the "projects" carve-out from
+// ClaudeJSONPrivateKeys. They are project/machine properties, not account:
+// unshared, every account re-asks trust dialogs and local-scope mcp servers
+// are invisible to pooled sessions.
 var ClaudeJSONSharedProjectKeys = map[string]bool{
 	"hasTrustDialogAccepted":                  true,
 	"hasClaudeMdExternalIncludesApproved":     true,
@@ -68,21 +40,12 @@ var ClaudeJSONSharedProjectKeys = map[string]bool{
 }
 
 // MergeClaudeJSON overlays base's shareable top-level keys onto private and
-// returns the merged document. Base wins on every key not in
-// ClaudeJSONPrivateKeys; private-only keys survive; base's blacklisted keys
-// never appear — except inside "projects", where the per-project
-// ClaudeJSONSharedProjectKeys cross too (base wins per key, entries minted for
-// projects the account never opened); every other per-project key (history,
-// allowed tools, session state) stays private. changed reports whether any
-// key actually differed, so callers can skip rewriting an already-merged
-// file. Base values are normalized to json.Marshal's encoding before both the
-// comparison and storage, so a pretty-printed base (claude's own writer)
-// reports unchanged once merged — the output bytes are unaffected,
-// json.Marshal re-encodes RawMessage anyway. A nil base returns private
-// verbatim. The output is json.Marshal of a map — key-sorted, hence
-// deterministic bytes for identical inputs (load-bearing for the fuse merged
-// view's Getattr/Read coherence). Unparseable or non-object private or base
-// is an error; the caller must never replace a file it could not parse.
+// returns the merged document: base wins outside ClaudeJSONPrivateKeys,
+// inside "projects" only ClaudeJSONSharedProjectKeys cross. changed gates
+// callers' rewrites; base values are normalized before comparison so a
+// pretty-printed base reports unchanged. Output is key-sorted json.Marshal —
+// deterministic bytes, load-bearing for the fuse merged view's Getattr/Read
+// coherence. Non-object input errors rather than replacing an unparseable file.
 func MergeClaudeJSON(private, base []byte) (merged []byte, changed bool, err error) {
 	if base == nil {
 		return private, false, nil
@@ -121,18 +84,11 @@ func MergeClaudeJSON(private, base []byte) (merged []byte, changed bool, err err
 	return merged, changed, nil
 }
 
-// SplitClaudeJSON returns new base bytes with payload's shareable top-level
-// keys overlaid onto base: every key not in ClaudeJSONPrivateKeys is copied
-// from payload, blacklisted keys are never copied (base's own oauthAccount
-// and startup counters stay verbatim), base-only keys are retained, and no
-// deletions propagate — a key absent from payload is left alone. Inside
-// "projects" the per-project ClaudeJSONSharedProjectKeys cross back to base
-// (payload wins per key, skeleton entries minted for base-unknown projects);
-// payload's history/allowed tools/session state never do, and base's projects
-// value keeps its original bytes when no shared key differed — load-bearing
-// for writeThroughBase's whole-file bytes.Equal short-circuit. Unparseable or
-// non-object payload or base is an error: never clobber a base you cannot
-// parse.
+// SplitClaudeJSON returns base with payload's shareable top-level keys
+// overlaid: ClaudeJSONPrivateKeys never cross, base-only keys are retained,
+// absence from payload deletes nothing, and inside "projects" the
+// ClaudeJSONSharedProjectKeys cross back. Non-object input errors rather than
+// clobbering an unparseable base.
 func SplitClaudeJSON(payload, base []byte) ([]byte, error) {
 	top, err := parseObject(payload, "claude.json payload")
 	if err != nil {
@@ -158,24 +114,11 @@ func SplitClaudeJSON(payload, base []byte) ([]byte, error) {
 	return b, nil
 }
 
-// overlaySharedProjectKeys copies src's ClaudeJSONSharedProjectKeys from each
-// projects["<path>"] entry onto dst's (src wins; the entry — and dst's
-// projects object — are created when absent, but an empty projects object is
-// never minted). No other per-project key is copied and no deletion
-// propagates: src lacking "projects" entirely is a no-op. Values are
-// normalized to json.Marshal's encoding before the equality probe, mirroring
-// the top-level merge loop. dst is mutated only after the full walk succeeds
-// and only when some shared key actually differed; otherwise dst["projects"]
-// keeps its original RawMessage bytes — entry key order included — and within
-// a rewritten projects object only changed entries are re-marshaled, so a dst
-// entry src shares nothing into passes through unparsed (even a non-object
-// one). Both no-rewrite guarantees are load-bearing: MergeClaudeJSON's
-// changed contract gates the symlink launch rewrite, and SplitClaudeJSON
-// feeds writeThroughBase's whole-file bytes.Equal short-circuit — a
-// gratuitous re-encode would bump base's mtime every cycle and thrash every
-// mount's merge cache. Errors: non-object projects on either side, a
-// non-object src entry, or a non-object dst entry src shares into (entry
-// errors name the project path).
+// overlaySharedProjectKeys copies src's ClaudeJSONSharedProjectKeys onto
+// dst's per-project entries. Unchanged entries pass through unparsed: a
+// gratuitous re-encode would defeat MergeClaudeJSON's changed gate and
+// writeThroughBase's bytes.Equal short-circuit, bumping base's mtime every
+// cycle.
 func overlaySharedProjectKeys(dst, src map[string]json.RawMessage) (changed bool, err error) {
 	srcRaw, ok := src["projects"]
 	if !ok {
@@ -247,10 +190,8 @@ func overlaySharedProjectKeys(dst, src map[string]json.RawMessage) (changed bool
 	return true, nil
 }
 
-// parseObject decodes b's top-level keys to raw values, rejecting any document
-// that is not a JSON object: json.Unmarshal accepts a bare `null` and leaves
-// the map nil, which would turn the merge loops into silent no-ops or nil-map
-// panics.
+// parseObject decodes b's top-level keys, rejecting non-objects:
+// json.Unmarshal accepts a bare `null` and leaves the map nil.
 func parseObject(b []byte, what string) (map[string]json.RawMessage, error) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(b, &m); err != nil {
@@ -262,15 +203,9 @@ func parseObject(b []byte, what string) (map[string]json.RawMessage, error) {
 	return m, nil
 }
 
-// normalizeValue re-encodes one raw JSON value to the exact bytes json.Marshal
-// emits for an embedded RawMessage: compacted, then HTML-escaped (Marshal's
-// encoder compacts WITH escaping; json.Compact alone leaves <, >, & raw and
-// would keep the comparison failing for values carrying them). Merged output
-// values always hold this form, so base values must be normalized identically
-// before the equality probe or a pretty-printed base makes every merge report
-// changed. A Compact failure on bytes json.Unmarshal already accepted cannot
-// happen short of a programmer error; it is returned, never silently passed
-// through.
+// normalizeValue re-encodes v to the exact bytes json.Marshal emits for an
+// embedded RawMessage: compacted then HTML-escaped — json.Compact alone
+// leaves <, >, & raw, breaking the equality probes for values carrying them.
 func normalizeValue(v json.RawMessage) (json.RawMessage, error) {
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, v); err != nil {
@@ -281,10 +216,8 @@ func normalizeValue(v json.RawMessage) (json.RawMessage, error) {
 	return escaped.Bytes(), nil
 }
 
-// WriteAtomic0600 writes data to dst via temp+rename in dst's directory, so a
-// concurrent reader never sees a partial file. Creates the directory if
-// missing. Thin 0600 wrapper over fusekit/state.AtomicWrite — the one place the
-// temp+rename mirror lives now.
+// WriteAtomic0600 writes data to dst via temp+rename with mode 0600, creating
+// dst's directory if missing, so a concurrent reader never sees a partial file.
 func WriteAtomic0600(dst string, data []byte) error {
 	return state.AtomicWrite(dst, data, 0o600)
 }

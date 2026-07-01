@@ -6,10 +6,9 @@ import (
 	"time"
 )
 
-// OAuth is the inner object Claude Code stores under the "claudeAiOauth" key.
-// Field names and the wrapper key are reverse-engineered from the v2.1.x
-// binary and MUST match exactly, byte-for-byte, or Claude will not recognize
-// the credential.
+// OAuth is the inner object Claude stores under "claudeAiOauth". Field and
+// wrapper-key names are reverse-engineered from the binary and MUST match
+// byte-for-byte or Claude rejects the credential.
 type OAuth struct {
 	AccessToken      string   `json:"accessToken"`
 	RefreshToken     string   `json:"refreshToken"`
@@ -43,8 +42,7 @@ func (c *Credential) Expired() bool {
 }
 
 // HasRefreshToken reports whether a usable refresh token is present. Claude
-// clears the refresh token to "" when it detects a dead token, so an empty
-// value means re-login is required.
+// blanks it on a dead token, so empty means re-login is required.
 func (c *Credential) HasRefreshToken() bool {
 	return c.ClaudeAiOauth.RefreshToken != ""
 }
@@ -58,7 +56,6 @@ func (c *Credential) Marshal() ([]byte, error) {
 	return b, nil
 }
 
-// parseCredential decodes the Keychain secret bytes into a Credential.
 func parseCredential(b []byte) (*Credential, error) {
 	var c Credential
 	if err := json.Unmarshal(b, &c); err != nil {

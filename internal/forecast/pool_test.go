@@ -68,9 +68,8 @@ func TestPoolOf(t *testing.T) {
 			true,
 		},
 		"relief no longer suppresses a later wall": {
-			// HEADLINE: remaining 30, burn 40, reset at +30m. The window
-			// refills to 100 at +30m crediting only the 20 it used, then drains
-			// 40%/h to dry at +3h — the old naive code suppressed this to zero.
+			// remaining 30, burn 40, reset at +30m. The window refills to 100 at
+			// +30m crediting only the 20 it used, then drains 40%/h to dry at +3h.
 			[]PoolAccount{{
 				HasUsage: true, Remaining5h: 30, Remaining7d: 30, Burn5hPerHour: 40,
 				Resets5h: now.Add(30 * time.Minute),

@@ -8,7 +8,6 @@ func TestLabelForEmail(t *testing.T) {
 		email string
 		want  string
 	}{
-		// Consumer providers keep the local part.
 		{"gmail keeps local", "yasyfm@gmail.com", "yasyfm"},
 		{"plus tag stripped", "user+tag@gmail.com", "user"},
 		{"plus tag only falls back", "+tag@gmail.com", "+tag@gmail.com"},
@@ -36,7 +35,6 @@ func TestLabelForEmail(t *testing.T) {
 		{"qq", "q@qq.com", "q"},
 		{"163", "n@163.com", "n"},
 
-		// Org domains become the registrable domain's org name.
 		{"org capitalized", "yasyf@aneta.company", "Aneta"},
 		{"short org all caps", "rebecca.fang@ucsf.edu", "UCSF"},
 		{"subdomain stripped to eTLD+1", "x@cs.stanford.edu", "Stanford"},
@@ -51,7 +49,6 @@ func TestLabelForEmail(t *testing.T) {
 		{"uppercase org domain", "X@CS.STANFORD.EDU", "Stanford"},
 		{"unlisted TLD default rule", "u@internal.corp", "Internal"},
 
-		// Unparseable inputs come back unchanged.
 		{"empty", "", ""},
 		{"no at sign", "not-an-email", "not-an-email"},
 		{"empty local", "@gmail.com", "@gmail.com"},

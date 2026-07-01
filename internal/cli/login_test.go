@@ -103,10 +103,7 @@ func TestNewIdentityProbe(t *testing.T) {
 	}
 }
 
-// TestTerminate drives terminate against real processes: a live child must be
-// signaled down within the grace period, and a child that already exited (the
-// awaitCred-after-exit race — select picks pseudo-randomly when both the tick
-// and the exit are ready) must not hang on the already-drained channel.
+// TestTerminate's already-exited case pins the awaitCred-after-exit race: Go's select picks pseudo-randomly when tick and exit are both ready.
 func TestTerminate(t *testing.T) {
 	t.Run("live process is terminated", func(t *testing.T) {
 		c := exec.Command("/bin/sleep", "60")
@@ -134,7 +131,7 @@ func TestTerminate(t *testing.T) {
 			t.Fatal(err)
 		}
 		procExit := make(chan error, 1)
-		procExit <- c.Wait() // child fully reaped before terminate runs
+		procExit <- c.Wait()
 
 		done := make(chan struct{})
 		go func() { terminate(c, procExit); close(done) }()

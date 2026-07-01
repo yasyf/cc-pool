@@ -21,13 +21,10 @@ var consumerSupplement = map[string]bool{
 	"skiff.com":    true,
 }
 
-// LabelForEmail derives a friendly default account label from a login email.
-// Consumer providers (gmail, yahoo, icloud, …) keep the local part minus any
-// +tag ("yasyfm@gmail.com" → "yasyfm"); org domains become the registrable
-// domain's org name ("rebecca.fang@ucsf.edu" → "UCSF", "yasyf@aneta.company"
-// → "Aneta"). Anything unparseable — no "@", an empty side, an IP-literal or
-// single-label domain — is returned unchanged. IDN punycode, gmail
-// dot-folding, and quoted local parts are not special-cased.
+// LabelForEmail derives a friendly default account label from a login email:
+// consumer providers keep the local part minus any +tag ("yasyfm@gmail.com" →
+// "yasyfm"); org domains become the registrable domain's org name
+// ("rebecca.fang@ucsf.edu" → "UCSF"). Anything unparseable is returned unchanged.
 func LabelForEmail(email string) string {
 	at := strings.LastIndex(email, "@")
 	if at <= 0 || at == len(email)-1 {
@@ -68,7 +65,6 @@ func orgLabel(base string) string {
 	return strings.Join(segs, "-")
 }
 
-// capitalizeFirst upper-cases the first rune of s, leaving the rest intact.
 func capitalizeFirst(s string) string {
 	r, size := utf8.DecodeRuneInString(s)
 	if r == utf8.RuneError {

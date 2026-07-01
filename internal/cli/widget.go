@@ -8,10 +8,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Widget app cask coordinates. The cask lives in the shared external tap
-// yasyf/homebrew-tap, so `brew install --cask yasyf/tap/cc-pool-status` would
-// auto-tap; we still tap explicitly (with the URL) up front so the install is
-// a single non-tapping step and works regardless of how cc-pool was installed.
 const (
 	widgetCask    = "cc-pool-status"
 	widgetTap     = "yasyf/homebrew-tap"
@@ -44,10 +40,7 @@ func runWidget(cmd *cobra.Command) error {
 	if err := brewInstallWidget(cmd); err != nil {
 		return err
 	}
-	// Launching once registers the embedded widget extension with macOS so it
-	// shows up in the widget gallery. -g keeps the agent app in the background.
-	// By path first: LaunchServices hasn't indexed a freshly installed app yet,
-	// so the by-name lookup fails on exactly the first (registering) launch.
+	// By path first: LaunchServices hasn't indexed a fresh install, so by-name fails on first launch.
 	step(out, "Launching it so macOS discovers the widget…")
 	if err := runStreamed(cmd, "open", "-g", widgetAppPath); err != nil {
 		if err := runStreamed(cmd, "open", "-g", "-a", widgetAppName); err != nil {
@@ -59,8 +52,7 @@ func runWidget(cmd *cobra.Command) error {
 	return nil
 }
 
-// ensureWidgetTap taps the cc-pool tap if it isn't already present, so the
-// cask resolves even when cc-pool itself was installed some other way.
+// ensureWidgetTap taps widgetTap so the cask resolves however cc-pool was installed.
 func ensureWidgetTap(cmd *cobra.Command) error {
 	outBytes, err := exec.Command("brew", "tap").Output()
 	if err != nil {
@@ -78,7 +70,6 @@ func ensureWidgetTap(cmd *cobra.Command) error {
 	return nil
 }
 
-// brewInstallWidget installs the cask, or upgrades it when already present.
 func brewInstallWidget(cmd *cobra.Command) error {
 	installed := exec.Command("brew", "list", "--cask", widgetCask).Run() == nil
 	if installed {
@@ -93,19 +84,14 @@ func brewInstallWidget(cmd *cobra.Command) error {
 	return nil
 }
 
-// brewCask runs a brew cask install/upgrade unattended. The widget app is
-// Developer ID signed, notarized, and stapled, so a normal quarantined install
-// validates — no quarantine handling needed.
 func brewCask(cmd *cobra.Command, args ...string) error {
-	// -y / --no-ask disables Homebrew's default ask-mode confirmation so the
-	// install runs unattended. It follows the subcommand: `brew install -y --cask …`.
+	// -y (--no-ask) skips Homebrew's confirmation; must follow the subcommand.
 	//nolint:gosec // G204: args are this CLI's own fixed `brew install --cask` argv, not user input
 	c := exec.Command("brew", append([]string{args[0], "-y"}, args[1:]...)...)
 	c.Stdout, c.Stderr = cmd.OutOrStdout(), cmd.ErrOrStderr()
 	return c.Run()
 }
 
-// runStreamed runs a command with its output streamed to the user.
 func runStreamed(cmd *cobra.Command, name string, args ...string) error {
 	//nolint:gosec // G204: name/args are this CLI's own fixed subprocess invocation, not user input
 	c := exec.Command(name, args...)
@@ -113,7 +99,6 @@ func runStreamed(cmd *cobra.Command, name string, args ...string) error {
 	return c.Run()
 }
 
-// widgetInstructions is the post-install walkthrough for enabling the widget.
 func widgetInstructions() string {
 	return `
 To add the widget:

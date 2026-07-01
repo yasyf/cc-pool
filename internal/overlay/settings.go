@@ -6,22 +6,15 @@ import (
 	"fmt"
 )
 
-// plansDirectoryKey is the settings.json key Claude Code reads to decide where
-// plan-mode plan files are written and reported. There is no env-var lever; this
-// key (absolute paths only, no ~ expansion) is the sole way to steer a pooled
-// session's plans at the canonical ~/.claude/plans. The fuse mirror injects it
-// into the bytes it serves so a pooled `claude` writes and reports the shared
-// path, without ever mutating the real base settings.json.
+// plansDirectoryKey is the settings.json key Claude Code reads for the plans
+// directory (absolute paths only, no ~ expansion).
 const plansDirectoryKey = "plansDirectory"
 
-// injectPlansDirectory returns the settings.json bytes to serve through the
-// mirror: base with plansDirectory set to plansDir when base lacks the key, or
-// base UNCHANGED when it already carries any plansDirectory (a user-set value is
-// never overridden). When injected, the result is json.Marshal of a map —
-// key-sorted, hence deterministic bytes for identical inputs (load-bearing for
-// the fuse merged view's Getattr/Read coherence). An unparseable or non-object
-// base is an error: the mirror must never serve garbage in place of the user's
-// settings.
+// injectPlansDirectory returns the settings.json bytes to serve: base with
+// plansDirectory=plansDir injected when base lacks the key, or base unchanged
+// when it already sets one (a user value is never overridden). Injected output is
+// key-sorted json.Marshal — deterministic bytes, load-bearing for the fuse merged
+// view's Getattr/Read coherence.
 func injectPlansDirectory(base []byte, plansDir string) (served []byte, err error) {
 	top, err := parseObject(base, "settings.json")
 	if err != nil {
@@ -42,13 +35,10 @@ func injectPlansDirectory(base []byte, plansDir string) (served []byte, err erro
 	return served, nil
 }
 
-// stripInjectedPlansDirectory returns new base bytes with plansDirectory removed
-// IFF its value equals the value we inject (plansDir) — the stateless inverse of
-// injectPlansDirectory. A user-set plansDirectory with any other value is left
-// untouched, and the one harmless edge (a user who coincidentally set our exact
-// path) is stripped, then re-injected identically on the next read. The result
-// is json.Marshal of a map (key-sorted, deterministic). An unparseable committed
-// document is an error: never clobber a base you cannot parse.
+// stripInjectedPlansDirectory removes plansDirectory from committed IFF its value
+// equals plansDir — the stateless inverse of injectPlansDirectory; any other user
+// value is left untouched. An unparseable document errors (never clobber a base
+// you cannot parse).
 func stripInjectedPlansDirectory(committed []byte, plansDir string) (newBase []byte, err error) {
 	top, err := parseObject(committed, "settings.json")
 	if err != nil {

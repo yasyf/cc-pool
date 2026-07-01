@@ -28,7 +28,6 @@ func TestFileCredentialRoundTrip(t *testing.T) {
 	if !FileCredentialExists(dir) {
 		t.Fatal("FileCredentialExists false after write")
 	}
-	// Written at the documented path, mode 0600 (matching claude's own write).
 	fi, err := os.Stat(FileCredentialPath(dir))
 	if err != nil {
 		t.Fatal(err)
@@ -48,8 +47,8 @@ func TestFileCredentialRoundTrip(t *testing.T) {
 	}
 }
 
-// TestReadFileCredentialRejectsBlankToken pins that a malformed file (the same
-// guard parseCredential applies to Keychain blobs) is not treated as a login.
+// TestReadFileCredentialRejectsBlankToken pins that a blank-token file is
+// rejected by the same parseCredential guard as Keychain blobs.
 func TestReadFileCredentialRejectsBlankToken(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(FileCredentialPath(dir), []byte(`{"claudeAiOauth":{"accessToken":""}}`), 0o600); err != nil {
@@ -60,9 +59,8 @@ func TestReadFileCredentialRejectsBlankToken(t *testing.T) {
 	}
 }
 
-// TestLocateCredential pins the backend resolution: Keychain first (claude's own
-// preference), the plaintext file as a fallback, ErrNotFound when neither holds
-// a credential. The Keychain is emulated by the fake `security` binary.
+// TestLocateCredential pins backend resolution: Keychain first (as claude
+// prefers), plaintext file fallback, ErrNotFound when neither holds one.
 func TestLocateCredential(t *testing.T) {
 	dir := t.TempDir()
 	storeDir := filepath.Join(dir, "items")
@@ -77,12 +75,10 @@ func TestLocateCredential(t *testing.T) {
 	const svc = "Claude Code-credentials-deadbeef"
 	cfg := t.TempDir()
 
-	// Neither backend holds a credential.
 	if _, _, err := LocateCredential(cfg, svc); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("LocateCredential with nothing = %v, want ErrNotFound", err)
 	}
 
-	// File only → SourceFile, with the computed -a label (the file carries none).
 	if err := WriteFileCredential(cfg, &Credential{ClaudeAiOauth: OAuth{AccessToken: "at"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +87,6 @@ func TestLocateCredential(t *testing.T) {
 		t.Fatalf("LocateCredential file-only = %q,%v,%v; want tester,SourceFile,nil", acct, src, err)
 	}
 
-	// Keychain wins even when the file also exists (claude reads it first).
 	if err := Write(svc, "claude-wrote", &Credential{ClaudeAiOauth: OAuth{AccessToken: "at"}}); err != nil {
 		t.Fatal(err)
 	}

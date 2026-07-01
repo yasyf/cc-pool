@@ -6,20 +6,13 @@ import (
 	"testing"
 )
 
-// plansDir is the exact absolute value the mirror injects (and strips by
-// value-equality). Fixtures pin against this constant so a drift in either
-// helper's notion of "our value" surfaces.
+// plansDir is the value the mirror injects and strips by value-equality.
 const plansDir = "/Users/test/.claude/plans"
 
-// TestInjectPlansDirectory pins injectPlansDirectory: the key is added only when
-// base lacks it, an already-present value (ours or a user's) is never touched
-// (byte-identical base returned), and an unparseable or non-object base is an
-// error rather than served garbage.
 func TestInjectPlansDirectory(t *testing.T) {
 	cases := map[string]struct {
 		base string
-		// want pins per-key raw JSON values in the served output. Empty when
-		// wantUnchanged or wantErr.
+		// want pins per-key raw JSON values in the served output.
 		want map[string]string
 		// wantUnchanged asserts served is byte-identical to base (no re-marshal).
 		wantUnchanged bool
@@ -92,10 +85,6 @@ func TestInjectPlansDirectory(t *testing.T) {
 	}
 }
 
-// TestStripInjectedPlansDirectory pins stripInjectedPlansDirectory: the key is
-// deleted ONLY when its value equals ours (value-equality, the stateless inverse
-// of inject), any other value is left untouched (byte-identical), an absent key
-// is a no-op, and an unparseable committed document is an error.
 func TestStripInjectedPlansDirectory(t *testing.T) {
 	cases := map[string]struct {
 		committed string
@@ -166,12 +155,9 @@ func TestStripInjectedPlansDirectory(t *testing.T) {
 	}
 }
 
-// TestInjectStripRoundTrip pins the write-through invariant: when base lacks the
-// key, stripInjectedPlansDirectory(injectPlansDirectory(base)) must reproduce
-// base byte-for-byte — that round trip is what keeps the real ~/.claude
-// settings.json pristine after a session's write-through. Bases are in
-// json.Marshal canonical form (key-sorted, compact) because both helpers emit
-// that form; a non-canonical base would re-flow on inject and never round-trip.
+// TestInjectStripRoundTrip pins strip(inject(base)) == base byte-for-byte. Bases
+// must be json.Marshal canonical form (key-sorted, compact): both helpers emit
+// that form, so a non-canonical base would re-flow on inject and never round-trip.
 func TestInjectStripRoundTrip(t *testing.T) {
 	bases := map[string]string{
 		"empty object":     `{}`,
@@ -185,7 +171,6 @@ func TestInjectStripRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// Injection must actually have happened (key added, value ours).
 			got := raw(t, served)
 			if string(got[plansDirectoryKey]) != `"`+plansDir+`"` {
 				t.Fatalf("served[%q] = %s, want our injected value", plansDirectoryKey, got[plansDirectoryKey])
@@ -201,10 +186,9 @@ func TestInjectStripRoundTrip(t *testing.T) {
 	}
 }
 
-// TestInjectStripNestedKeysUntouched pins that neither helper rewrites nested
-// values: a base whose nested objects carry deliberately UNSORTED keys passes
-// those RawMessage bytes through verbatim (only the top level is re-marshaled),
-// so injection/strip never re-flows a user's nested settings.
+// TestInjectStripNestedKeysUntouched pins that neither helper re-flows nested
+// values: the nested keys are deliberately UNSORTED, so a top-level re-marshal
+// that reordered them would be caught.
 func TestInjectStripNestedKeysUntouched(t *testing.T) {
 	const nested = `{"zKey":1,"aKey":2,"mKey":{"inner2":"b","inner1":"a"}}`
 	base := `{"theme":"dark","permissions":` + nested + `}`
@@ -217,7 +201,6 @@ func TestInjectStripNestedKeysUntouched(t *testing.T) {
 		t.Errorf("served permissions = %s, want nested bytes untouched %s", raw(t, served)["permissions"], nested)
 	}
 
-	// Strip back out and confirm the nested value still survives byte-identical.
 	newBase, err := stripInjectedPlansDirectory(served, plansDir)
 	if err != nil {
 		t.Fatal(err)
@@ -243,7 +226,6 @@ func TestInjectPlansDirectoryDeterministic(t *testing.T) {
 	if !bytes.Equal(a, b) {
 		t.Fatalf("two injections diverged:\n%s\n%s", a, b)
 	}
-	// The injected value must decode to exactly plansDir (no escaping surprise).
 	var got string
 	if err := json.Unmarshal(raw(t, a)[plansDirectoryKey], &got); err != nil {
 		t.Fatal(err)

@@ -13,8 +13,8 @@ func sample(now time.Time, age time.Duration, util5h float64) store.UsageSample 
 	return store.UsageSample{AccountID: 1, TS: now.Add(-age), Util5h: util5h}
 }
 
-// rlSample is sample with the rate-limited 429 placeholder shape: zeroed
-// utilization, RateLimited set — exactly what recordSample stores on a 429.
+// rlSample is the zeroed-utilization, RateLimited placeholder recordSample
+// stores on a 429.
 func rlSample(now time.Time, age time.Duration) store.UsageSample {
 	s := sample(now, age, 0)
 	s.RateLimited = true
@@ -180,7 +180,7 @@ func TestBurn7d(t *testing.T) {
 				},
 				sample(now, 1*hr, 5), sample(now, 3*hr, 90), sample(now, 6*hr, 1),
 			),
-			20, // asserted against Burn5h, not Burn7d (see below)
+			20, // asserted against Burn5h, not Burn7d
 		},
 	}
 	for name, tc := range cases {

@@ -3,19 +3,13 @@
 //
 // Two distinct trees exist and must not be confused:
 //
-//   - ~/.claude      The canonical Claude Code config dir: plain `claude`'s
-//     home and the shared overlay base. NEVER moved, never
-//     registered as a pool account — the pool never touches plain
-//     claude's credential or login identity. Its sibling state
-//     file ~/.claude.json IS read (seeding, every launch merge)
-//     and, under the fuse overlay, written through with shareable
-//     keys; overlay.ClaudeJSONPrivateKeys never cross either way,
-//     save the per-project overlay.ClaudeJSONSharedProjectKeys
-//     carved out of "projects".
-//   - ~/.cc-pool/    cc-pool's OWN state (sqlite db, daemon socket, logs),
-//     plus accounts/ holding the pool account dirs
-//     (acct-01, acct-02, ...). Each account dir is a real,
-//     unique path so it gets its own Keychain item.
+//   - ~/.claude      Canonical Claude Code config dir: plain `claude`'s home
+//     and the shared overlay base. NEVER moved or registered as a pool
+//     account; the pool never touches plain claude's credential or login
+//     identity.
+//   - ~/.cc-pool/    cc-pool's own state (sqlite db, daemon socket, logs) plus
+//     accounts/ holding the pool account dirs (acct-01, acct-02, ...). Each
+//     account dir is a unique path so it gets its own Keychain item.
 package pool
 
 import (
@@ -26,10 +20,6 @@ import (
 	"github.com/yasyf/fusekit/state"
 )
 
-// stateDir is cc-pool's private per-user state tree (~/.cc-pool). The layout
-// mechanics — home resolution, the dir join, idempotent creation, and the
-// atomic status-mirror write — live in fusekit/state; the leaf names below are
-// cc-pool's own.
 var stateDir = state.Dir{App: "cc-pool"}
 
 // Home returns the current user's home directory.
@@ -51,14 +41,8 @@ func ClaudeDir() string {
 	return filepath.Join(mustHome(), ".claude")
 }
 
-// ClaudeJSONPath is plain claude's primary state file (~/.claude.json — in
-// $HOME, NOT inside ~/.claude). With CLAUDE_CONFIG_DIR set, claude reads and
-// writes $CONFIG_DIR/.claude.json instead. The pool reads it at add time
-// (seedClaudeJSON, so new accounts inherit onboarding state and settings) and
-// at every symlink-arm launch (MergeBaseClaudeJSON, shareable keys in, base
-// wins); the fuse merged view writes shareable keys back through to it. Keys
-// in overlay.ClaudeJSONPrivateKeys never cross in either direction, except
-// the per-project overlay.ClaudeJSONSharedProjectKeys inside "projects".
+// ClaudeJSONPath is plain claude's primary state file ~/.claude.json — in
+// $HOME, NOT inside ~/.claude.
 func ClaudeJSONPath() string {
 	return filepath.Join(mustHome(), ".claude.json")
 }
@@ -89,17 +73,15 @@ func LogPath() string {
 }
 
 // BridgeSocketPath is the daemon's content.BridgeServer data socket
-// (~/.cc-pool/bridge.sock): the shared holder dials it to fetch cc-pool's
-// synthetic entries (the merged .claude.json, the injected settings.json) for
-// every mount whose ContentSocket is this path. The daemon binds it; the holder
-// connects to it.
+// (~/.cc-pool/bridge.sock): the daemon binds it, the shared holder dials it to
+// fetch cc-pool's synthetic entries (merged .claude.json, injected
+// settings.json).
 func BridgeSocketPath() string {
 	return stateDir.Path("bridge.sock")
 }
 
-// MountHolderLogPath is the dev-spawned holder's log path. Production launches the
-// signed fusekit-holder cask via launchd (which owns its own log); only a
-// daemon-spawned dev holder (mountd.Spawn) is directed here.
+// MountHolderLogPath is the dev-spawned holder's log path; the production
+// fusekit-holder cask owns its own.
 func MountHolderLogPath() string {
 	return stateDir.Path("mount-holder.log")
 }

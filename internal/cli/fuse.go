@@ -12,9 +12,8 @@ import (
 	"github.com/yasyf/fusekit/service"
 )
 
-// newFuseCmd groups the fuse-t live-mirror subcommands. cc-pool is pure-Go and
-// drives the shared fusekit-holder cask over RPC, so there is no build tag here —
-// `enable` installs the casks the holder needs and the daemon does the rest.
+// newFuseCmd groups the fuse-t subcommands. No fuse build tag: cc-pool is
+// pure-Go and drives the fusekit-holder over RPC.
 func newFuseCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "fuse",
@@ -42,11 +41,6 @@ already satisfied are skipped.`,
 	}
 }
 
-// runFuseEnable is the turnkey live-mirror setup. cc-pool is pure-Go and never
-// hosts mounts itself, so this installs the casks the shared holder needs (fuse-t
-// + fusekit-holder), ensures the daemon is up, and asks it — the real
-// fuse-capability authority — to migrate. Each step fails loud; nothing is left
-// half-done that a re-run can't converge.
 func runFuseEnable(cmd *cobra.Command) error {
 	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 
@@ -62,8 +56,6 @@ func runFuseEnable(cmd *cobra.Command) error {
 		}
 	}
 
-	// The signed, multi-tenant fusekit-holder cask hosts every consumer's mounts;
-	// cc-pool drives it over RPC and needs no fuse build of its own.
 	if _, err := os.Stat(mountd.HolderExe); err == nil {
 		step(out, "fusekit-holder already installed.")
 	} else {
@@ -76,12 +68,8 @@ func runFuseEnable(cmd *cobra.Command) error {
 		}
 	}
 
-	// Ensure the daemon is running; it binds the content bridge and drives the
-	// cask holder over RPC, migrating accounts onto the live mirror on request.
 	ensureDaemon(cmd, false)
 
-	// Flip the default to fuse and migrate existing accounts. The conversion runs
-	// in the daemon, which drives the cask holder over RPC; this CLI only kicks it off.
 	if err := withManager(func(m *pool.Manager) error {
 		if ok, err := m.Initialized(); err != nil {
 			return err

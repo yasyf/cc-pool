@@ -25,7 +25,6 @@ import (
 	"github.com/yasyf/fusekit/proc"
 )
 
-// flipToFuse flips an account row to the fuse kind, returning the fresh row.
 func flipToFuse(t *testing.T, s *Server, id int) store.Account {
 	t.Helper()
 	a, err := s.m.Store.GetAccount(id)
@@ -39,7 +38,6 @@ func flipToFuse(t *testing.T, s *Server, id int) store.Account {
 	return a
 }
 
-// flipToSymlink flips an account row back to the symlink kind.
 func flipToSymlink(t *testing.T, s *Server, id int) {
 	t.Helper()
 	a, err := s.m.Store.GetAccount(id)
@@ -52,11 +50,8 @@ func flipToSymlink(t *testing.T, s *Server, id int) {
 	}
 }
 
-// newHealServer wires newMigrateServer for the steady-state heal-loop tests: the
-// fake fuse provider behind the Manager seam, an idle session scan, and a holder
-// socket under a short /tmp dir (macOS caps sun_path at 104 bytes) that starts
-// dead — heal tests repoint it at a canned holder. cc-pool no longer owns the
-// holder lifecycle, so there is no spawn seam or supervisor to wire.
+// newHealServer's holder socket lives under a short /tmp dir (macOS caps
+// sun_path at 104 bytes) and starts dead.
 func newHealServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv) {
 	t.Helper()
 	s, dirs, fake := newMigrateServer(t)
@@ -70,20 +65,14 @@ func newHealServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv) {
 	return s, dirs, fake
 }
 
-// healTick runs one steady-state heal pass exactly as the healFuseRows ticker
-// body does: refresh the shared-holder cache, then re-register (or retreat to
-// symlink) every fuse row the holder cannot vouch for. cc-pool's in-process
-// supervisor is gone — the shared holder's lifecycle is launchd's — so the tests
-// drive the two heal steps directly instead of through the former superviseTick.
+// healTick runs one heal pass exactly as the healFuseRows ticker body does.
 func healTick(ctx context.Context, s *Server) {
 	s.holder.refresh(s.holderClient())
 	s.retryUnvouchedFuseRows(ctx)
 }
 
-// startDegradedHolder serves Health at ver but drops every List reply (closing
-// the connection) — the Client.Poll "Degraded" shape: a holder alive at a known
-// version whose mount set is unreadable. It lets a refresh land on the degraded
-// arm without a real holder. Returns the socket path.
+// startDegradedHolder serves Health at ver but drops every List reply —
+// Client.Poll's "Degraded" shape.
 func startDegradedHolder(t *testing.T, ver string) string {
 	t.Helper()
 	sockDir, err := os.MkdirTemp("/tmp", "ccp-degr")
@@ -101,7 +90,7 @@ func startDegradedHolder(t *testing.T, ver string) string {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				return // listener closed: defined exit
+				return
 			}
 			var req mountd.Request
 			if err := json.NewDecoder(conn).Decode(&req); err != nil {
@@ -109,7 +98,7 @@ func startDegradedHolder(t *testing.T, ver string) string {
 				continue
 			}
 			if req.Op == mountd.OpList {
-				_ = conn.Close() // drop the List reply: Health-ok + List-fail = Degraded
+				_ = conn.Close()
 				continue
 			}
 			_ = json.NewEncoder(conn).Encode(mountd.Response{OK: true, Version: ver})
@@ -119,36 +108,32 @@ func startDegradedHolder(t *testing.T, ver string) string {
 	return socket
 }
 
-// mountTimeoutChain is the exact error chain RemoteProvider.Setup produces
-// for a mount-up timeout under a proven "Network Volumes" grant: the
-// provider's wrap around overlayClass's dual-wrap of the wire sentinel.
+// mountTimeoutChain is the exact error chain RemoteProvider.Setup produces for a
+// mount-up timeout.
 func mountTimeoutChain() error {
 	return fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountTimeout, mountd.ErrMountTimeout))
 }
 
-// mountFailedChain is the error a hard mount(2) rejection crosses the wire as:
-// the provider's wrap around overlayClass's dual-wrap of the ClassMountFailed
-// wire sentinel. healFuse must route it to an immediate symlink fallback, never
-// the TCC wait.
+// mountFailedChain is the exact error chain a hard mount(2) rejection crosses
+// the wire as.
 func mountFailedChain() error {
 	return fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountFailed, mountd.ErrMountFailed))
 }
 
-// TestRemountBackoffDoublesAndCaps pins the per-row remount backoff (now
-// proc.Backoff with the remount constants): base-doubling per failure, capped at
-// 2 minutes — deliberately under the 180s scheduler period, so the heal loop is
-// never the slower recovery path.
+// TestRemountBackoffDoublesAndCaps pins the remount backoff: doubling per
+// failure, capped at 2m — under the 180s scheduler period so heal is never the
+// slower recovery path.
 func TestRemountBackoffDoublesAndCaps(t *testing.T) {
 	b := proc.Backoff{Base: remountBackoffBase, Cap: remountBackoffCap}
 	cases := map[int]time.Duration{
-		1:  remountBackoffBase, // first failure -> base
-		2:  20 * time.Second,   // doubled
-		3:  40 * time.Second,   // doubled again
-		4:  80 * time.Second,   // still under the cap
-		5:  remountBackoffCap,  // 160s capped to 2min
-		12: remountBackoffCap,  // stays capped
-		0:  remountBackoffBase, // degenerate input never shrinks below base
-		-1: remountBackoffBase, // negative input never shrinks below base
+		1:  remountBackoffBase,
+		2:  20 * time.Second,
+		3:  40 * time.Second,
+		4:  80 * time.Second,
+		5:  remountBackoffCap,
+		12: remountBackoffCap,
+		0:  remountBackoffBase,
+		-1: remountBackoffBase,
 	}
 	for failures, want := range cases {
 		if got := b.After(failures); got != want {
@@ -157,17 +142,14 @@ func TestRemountBackoffDoublesAndCaps(t *testing.T) {
 	}
 }
 
-// TestHealTickRetriesUnvouchedRowWithBackoff pins the steady-state heal loop: a
-// fuse row a healthy holder cannot vouch for is retried each tick under per-row
-// backoff — attempts advance the failure count, the window gates the next tick,
-// and a successful heal vouches and drops the ledger entry.
+// TestHealTickRetriesUnvouchedRowWithBackoff pins the heal loop's per-row
+// backoff: a window gates retries; a successful heal vouches and drops the entry.
 func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
-	s.holderSocket = startCannedHolder(t, nil) // healthy at our version, vouching for nothing
+	s.holderSocket = startCannedHolder(t, nil)
 	fake.setupErr = mountTimeoutChain()
 
-	// First heal tick: one attempt, booked as one failure with a window.
 	healTick(t.Context(), s)
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups after the first tick = %d, want 1", fake.setupCount())
@@ -176,13 +158,11 @@ func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 		t.Fatalf("rowRetry[1] = %+v, want one failure with a future retryAt", st)
 	}
 
-	// Immediately ticking again sits inside the window: no attempt.
 	healTick(t.Context(), s)
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups inside the backoff window = %d, want still 1", fake.setupCount())
 	}
 
-	// Window rewound: the retry runs and the failure count advances.
 	st := s.rowRetry[1]
 	st.retryAt = time.Now().Add(-time.Second)
 	s.rowRetry[1] = st
@@ -192,8 +172,6 @@ func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 			fake.setupCount(), s.rowRetry[1].failures)
 	}
 
-	// Failure cleared: the next windowed attempt mounts, vouches, and drops
-	// the ledger entry.
 	fake.setupErr = nil
 	st = s.rowRetry[1]
 	st.retryAt = time.Now().Add(-time.Second)
@@ -210,18 +188,14 @@ func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	}
 }
 
-// TestHealTickRetrySkipsClaimedAccount pins the skip-don't-race discipline on
-// the steady-state loop: an eligible row someone else owns is neither attempted
-// nor penalized — a skip is not a failure — and the next tick after release
-// retries it.
+// TestHealTickRetrySkipsClaimedAccount pins that a claimed row is neither
+// attempted nor penalized (a skip is not a failure) and is retried after release.
 func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
 	s, _, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
 	fake.setupErr = mountTimeoutChain()
-	// An eligible ledger entry whose window has passed…
 	s.rowRetry = map[int]rowRetryState{1: {failures: 2, retryAt: time.Now().Add(-time.Second)}}
-	// …on an account someone else owns.
 	if !s.beginPoll(1) {
 		t.Fatal("beginPoll failed on a free account")
 	}
@@ -234,7 +208,6 @@ func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
 		t.Fatalf("failures after a skip = %d, want 2 unchanged", got)
 	}
 
-	// Released: the still-open window admits the next tick's attempt.
 	s.endPoll(1)
 	healTick(t.Context(), s)
 	if fake.setupCount() != 1 {
@@ -245,16 +218,13 @@ func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
 	}
 }
 
-// TestHealTickRetryLeavesConvertedRowAndPrunes pins the ledger hygiene: a row
-// that earned a retry entry while fuse and then converted to symlink is never
-// healed as fuse, and its entry is pruned from the ledger.
+// TestHealTickRetryLeavesConvertedRowAndPrunes pins that a row converted to
+// symlink is never healed as fuse and its ledger entry is pruned.
 func TestHealTickRetryLeavesConvertedRowAndPrunes(t *testing.T) {
 	s, _, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	// The row earned a ledger entry while fuse…
 	s.rowRetry = map[int]rowRetryState{1: {failures: 1, retryAt: time.Now().Add(-time.Second)}}
-	// …then converted away.
 	flipToSymlink(t, s, 1)
 
 	healTick(t.Context(), s)
@@ -267,10 +237,8 @@ func TestHealTickRetryLeavesConvertedRowAndPrunes(t *testing.T) {
 	}
 }
 
-// TestHealTickRetriesTCCBlockedRowUnderBackoff pins the post-grant story: a
-// TCC-blocked row rides the same backoff — attempted, bounded, never hot — with
-// the guidance surfaced on the wire, and the first successful mount after the
-// grant clears it via noteMounted.
+// TestHealTickRetriesTCCBlockedRowUnderBackoff pins that a TCC-blocked row rides
+// the same backoff with guidance surfaced, and the first post-grant mount clears it.
 func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -285,14 +253,11 @@ func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	if got := s.holder.wireStatus().TCCError; got == "" {
 		t.Fatal("TCC guidance not surfaced for the blocked row")
 	}
-	// Inside the window: bounded, not hot.
 	healTick(t.Context(), s)
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups inside the backoff window = %d, want still 1", fake.setupCount())
 	}
 
-	// Grant landed: the next windowed attempt mounts, vouches, and clears the
-	// guidance through noteMounted.
 	fake.setupErr = nil
 	st := s.rowRetry[1]
 	st.retryAt = time.Now().Add(-time.Second)
@@ -310,11 +275,8 @@ func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 }
 
 // TestHealTickRemountsHeldDeadRow pins the held-dead heal: a dir the holder
-// NAMES in List but that is not servable is logged loudly — the daemon's
-// deep-probe verdict picks the copy (a deep wedge is shallow-live but hangs
-// reads; a plain-dead mirror fails its shallow liveness outright), the
-// live-session count and relaunch guidance appear in both shapes — and remounted
-// through the ordinary healFuse path.
+// lists but cannot serve is logged with the deep-probe-picked copy and
+// remounted through the ordinary healFuse path.
 func TestHealTickRemountsHeldDeadRow(t *testing.T) {
 	const (
 		wedgeCopy = "wedged mirror (serves metadata but hangs reads)"
@@ -339,19 +301,15 @@ func TestHealTickRemountsHeldDeadRow(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s, dirs, fake := newHealServer(t)
 			flipToFuse(t, s, 1)
-			// A deep wedge is shallow-Live=true (it answers shallow stats) but
-			// is marked wedged by the daemon's OWN deep probe; a plain-dead
-			// mirror fails its shallow liveness (Live=false).
+			// Deep wedge stays shallow-live (Live=true); plain-dead fails it (Live=false).
 			s.holderSocket = startCannedHolder(t, []mountd.MountInfo{
 				{Dir: dirs[1], Base: "/base", Live: tc.wedged},
 			})
 			if tc.wedged {
 				s.holder.markDeepWedged(dirs[1])
 			} else {
-				// A plain-dead mirror fails its shallow liveness OUTRIGHT, so the
-				// daemon's own corroboration (deferShallowDead) must read it
-				// definitively dead — not a liveness timeout — for the held-dead
-				// remount to fire without debounce.
+				// Definitive-dead (not a liveness timeout) so deferShallowDead
+				// proceeds without debounce.
 				fake.healthErr = errors.New("not a mountpoint")
 			}
 			var buf bytes.Buffer
@@ -372,8 +330,6 @@ func TestHealTickRemountsHeldDeadRow(t *testing.T) {
 			if strings.Contains(out, tc.notCopy) {
 				t.Fatalf("held-dead log line carries the wrong copy %q:\n%s", tc.notCopy, out)
 			}
-			// The held-dead line is now purely descriptive (the heal outcome owns
-			// the action line); it still carries the live-session count.
 			if !strings.Contains(out, "live session") {
 				t.Fatalf("held-dead log line missing the session count:\n%s", out)
 			}
@@ -384,12 +340,8 @@ func TestHealTickRemountsHeldDeadRow(t *testing.T) {
 	}
 }
 
-// TestDeferShallowDead pins the corroboration gate that suppresses false-positive
-// remounts: a holder-reported shallow-dead mirror (List Live=false) is re-probed
-// with the daemon's own Health before the heal loop tears it down. A live or
-// timed-out-but-peer-alive reading DEFERS (the holder's Live=false was a
-// transient under-load false negative or mere slowness); a definitive dead
-// reading, exhausted strikes, or a timeout with no live peer PROCEEDS (remount).
+// TestDeferShallowDead pins the corroboration gate: a holder-reported shallow-dead
+// mirror is re-probed with the daemon's own Health before teardown.
 func TestDeferShallowDead(t *testing.T) {
 	timeout := fmt.Errorf("%w: slow", overlay.ErrLivenessTimeout)
 	dead := errors.New("not a mountpoint")
@@ -423,10 +375,8 @@ func TestDeferShallowDead(t *testing.T) {
 	}
 }
 
-// TestHealFuseRowsLoopTicksAndExits pins the loop plumbing: ticks fire on the
-// (shrunken) interval, the per-account heal actually runs from the loop and
-// remounts the unvouched fuse row through the existing holder, and the goroutine
-// exits on ctx cancellation.
+// TestHealFuseRowsLoopTicksAndExits pins the loop plumbing: ticks run the
+// per-account heal, and the goroutine exits on ctx cancellation.
 func TestHealFuseRowsLoopTicksAndExits(t *testing.T) {
 	s, _, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -452,10 +402,9 @@ func TestHealFuseRowsLoopTicksAndExits(t *testing.T) {
 	}
 }
 
-// TestEvictionNeverDialsMountsSocket pins holder isolation on the daemon
-// startup path: evicting a version-skewed DAEMON from the daemon socket —
-// clean step-down or wedged-orphan kill — must never touch the mount-holder
-// socket. The canned mounts listener tattles on any connection.
+// TestEvictionNeverDialsMountsSocket pins holder isolation: evicting a
+// version-skewed daemon — clean step-down or wedged-orphan kill — must never
+// touch the mount-holder socket.
 func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 	tattle := func(t *testing.T) (string, *atomic.Int32) {
 		t.Helper()
@@ -475,7 +424,7 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 			for {
 				conn, err := ln.Accept()
 				if err != nil {
-					return // listener closed: defined exit
+					return
 				}
 				dials.Add(1)
 				_ = conn.Close()
@@ -525,8 +474,8 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 	})
 }
 
-// swapForceUnmount replaces the daemon's direct force-unmount seam for one
-// test, restoring it after. Tests using it must not run in parallel.
+// swapForceUnmount swaps the global force-unmount seam; callers must not run in
+// parallel.
 func swapForceUnmount(t *testing.T, fn func(string) error) {
 	t.Helper()
 	prev := forceUnmount
@@ -534,9 +483,8 @@ func swapForceUnmount(t *testing.T, fn func(string) error) {
 	t.Cleanup(func() { forceUnmount = prev })
 }
 
-// driveRetryTicks runs n steady-state heal ticks against a settled holder,
-// rewinding the per-row backoff window before each so every tick makes a real
-// heal attempt (mirroring the heal cadence without sleeping).
+// driveRetryTicks runs n heal ticks, rewinding the per-row backoff before each
+// so every tick makes a real attempt.
 func driveRetryTicks(t *testing.T, s *Server, id, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
@@ -548,23 +496,22 @@ func driveRetryTicks(t *testing.T, s *Server, id, n int) {
 	}
 }
 
-// TestRemountBreakerThreshold pins the breaker const guard: a single transient
-// mount failure must never escalate, so the threshold must be at least 2.
+// TestRemountBreakerThreshold pins the breaker const guard: the threshold must be
+// >= 2 so a single transient mount failure never escalates.
 func TestRemountBreakerThreshold(t *testing.T) {
 	if remountBreakerThreshold < 2 {
 		t.Fatalf("remountBreakerThreshold = %d, want >= 2 so a single transient mount failure never escalates", remountBreakerThreshold)
 	}
 }
 
-// TestRemountBreakerEscalates pins the wedged-mount circuit breaker: after
-// exactly remountBreakerThreshold consecutive wedged remounts the breaker fires
-// — force-unmounting the carcass, converting the row to symlink, dropping the
-// ledger entry, dropping the holder-cache vouch, and surfacing it loudly.
+// TestRemountBreakerEscalates pins the wedged-mount breaker: after
+// remountBreakerThreshold consecutive wedged remounts it force-unmounts the
+// carcass and converts the row to symlink.
 func TestRemountBreakerEscalates(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
-	s.holderSocket = startCannedHolder(t, nil) // healthy, vouches for nothing
-	fake.setupErr = mountTimeoutChain()        // healRetry forever — the wedged shape
+	s.holderSocket = startCannedHolder(t, nil)
+	fake.setupErr = mountTimeoutChain() // healRetry forever — the wedged shape
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
 	var (
@@ -603,24 +550,15 @@ func TestRemountBreakerEscalates(t *testing.T) {
 }
 
 // TestHealDefersBreakerUnderLiveSession is the regression lock for the kernel
-// panic (nfs_vinvalbuf2: ubc_msync failed): a dead/wedged mirror that still
-// backs a live claude session must be LEFT MOUNTED, never force-unmounted —
-// force-unmounting a busy NFS mirror panics the whole machine. It inverts the
-// old "breaker is ungated by sessions" behavior: mountFuse refuses the
-// teardown-before-remount (errRemountBusy -> healDeferredBusy), which backs off
-// WITHOUT a hazard strike, so the wedged breaker can NEVER fire on a busy mount.
-// Drive well past the breaker threshold and assert nothing tears down: no
-// teardown, no force-unmount, the row stays fuse, the hazard count stays 0, and
-// the "NOT force-unmounting" surfacing fires.
+// panic (nfs_vinvalbuf2: ubc_msync failed): a dead mirror still backing a live
+// session is left mounted and takes no hazard strike, so the wedged breaker can
+// never fire on a busy mount.
 func TestHealDefersBreakerUnderLiveSession(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
-	s.holderSocket = startCannedHolder(t, nil) // healthy, vouches for nothing
-	// The mirror reads mounted-but-dead, so mountFuse's teardown-before-remount
-	// branch is entered — exactly the force-unmount the gate must refuse.
+	s.holderSocket = startCannedHolder(t, nil)
 	fake.healthErr = errors.New("mirror is dead")
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
-	// A live session on the very dir: the gate must defer, never force down.
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 	}
@@ -638,7 +576,6 @@ func TestHealDefersBreakerUnderLiveSession(t *testing.T) {
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
-	// Drive WELL past the breaker threshold: a busy mount must never escalate.
 	driveRetryTicks(t, s, 1, remountBreakerThreshold+2)
 
 	if got := fake.teardownCount(); got != 0 {
@@ -661,9 +598,8 @@ func TestHealDefersBreakerUnderLiveSession(t *testing.T) {
 	}
 }
 
-// TestRemountBreakerHoldsUnderThreshold pins that fewer than the threshold
-// consecutive failures keep retrying — no escalation, the row stays fuse, and
-// the ledger keeps counting.
+// TestRemountBreakerHoldsUnderThreshold pins that fewer than threshold
+// consecutive failures keep retrying without escalation.
 func TestRemountBreakerHoldsUnderThreshold(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -687,9 +623,8 @@ func TestRemountBreakerHoldsUnderThreshold(t *testing.T) {
 	}
 }
 
-// TestRemountBreakerResetsOnMount pins that a successful mount before the
-// threshold clears the breaker's hazard count: a row that recovers never fires
-// the breaker, and a later failure restarts the count from one.
+// TestRemountBreakerResetsOnMount pins that a successful mount clears the
+// breaker's hazard count: a later failure restarts the count from one.
 func TestRemountBreakerResetsOnMount(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -700,13 +635,11 @@ func TestRemountBreakerResetsOnMount(t *testing.T) {
 	var unmounts int
 	swapForceUnmount(t, func(string) error { unmounts++; return nil })
 
-	// A few wedged attempts short of the breaker…
 	driveRetryTicks(t, s, 1, remountBreakerThreshold-2)
 	if got := s.rowRetry[1].hazard; got != remountBreakerThreshold-2 {
 		t.Fatalf("hazard before recovery = %d, want %d", got, remountBreakerThreshold-2)
 	}
 
-	// …then the mount comes up: the ledger entry is dropped entirely.
 	fake.setupErr = nil
 	driveRetryTicks(t, s, 1, 1)
 	if _, ok := s.rowRetry[1]; ok {
@@ -716,8 +649,6 @@ func TestRemountBreakerResetsOnMount(t *testing.T) {
 		t.Fatal("recovered row not vouched for")
 	}
 
-	// A fresh wedge starts the hazard count over from one — never near the
-	// threshold — so the recovered row never carries stale breaker progress.
 	fake.setupErr = mountTimeoutChain()
 	driveRetryTicks(t, s, 1, 1)
 	if got := s.rowRetry[1].hazard; got != 1 {
@@ -728,13 +659,9 @@ func TestRemountBreakerResetsOnMount(t *testing.T) {
 	}
 }
 
-// TestWedgeBreakerNeverEscalatesTCCRow pins the load-bearing exclusion: a
-// TCC-blocked row is a CLEAN not-mounted state, never a kernel wedge, so it must
-// never trip the WEDGED breaker (remountBreakerThreshold) — its hazard count
-// stays 0 no matter how many consecutive TCC blocks accrue. The grant instead
-// gets a bounded grace through the SEPARATE tccBreakerThreshold
-// (TestTCCBreakerEscalates); here we drive right up to but not across that grace
-// — already past the wedged threshold — to prove the wedge breaker stays silent.
+// TestWedgeBreakerNeverEscalatesTCCRow pins that a TCC-blocked row (a clean
+// not-mounted state, never a kernel wedge) never trips the wedged breaker: its
+// hazard count stays 0 however many TCC blocks accrue.
 func TestWedgeBreakerNeverEscalatesTCCRow(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -745,9 +672,8 @@ func TestWedgeBreakerNeverEscalatesTCCRow(t *testing.T) {
 	var unmounts int
 	swapForceUnmount(t, func(string) error { unmounts++; return nil })
 
-	// One short of the grant grace, and (since tccBreakerThreshold >
-	// remountBreakerThreshold) already well past the wedged breaker's threshold —
-	// which must NOT fire.
+	// One short of the grant grace — already past the wedged breaker's
+	// threshold (tccBreakerThreshold > remountBreakerThreshold).
 	ticks := tccBreakerThreshold - 1
 	driveRetryTicks(t, s, 1, ticks)
 
@@ -772,17 +698,15 @@ func TestWedgeBreakerNeverEscalatesTCCRow(t *testing.T) {
 	}
 }
 
-// TestTCCBreakerEscalates pins the bounded grant grace: after tccBreakerThreshold
-// consecutive TCC-blocked heals the daemon stops waiting and retreats the row to
-// symlink so the account is usable — dropping the ledger, the holder vouch, and
-// the stale TCC guidance, and surfacing it loudly. A TCC-blocked dir never came
-// up, so it is not a mountpoint and no force-unmount is needed.
+// TestTCCBreakerEscalates pins the bounded grant grace: after
+// tccBreakerThreshold consecutive TCC-blocked heals the row retreats to
+// symlink so the account is usable.
 func TestTCCBreakerEscalates(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive) // healTCCBlocked
-	fakeOverlayMounted(t, func(string) bool { return false })        // never came up
+	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
+	fakeOverlayMounted(t, func(string) bool { return false })
 
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
@@ -806,14 +730,9 @@ func TestTCCBreakerEscalates(t *testing.T) {
 	}
 }
 
-// TestTCCBreakerEscalatesUnderLiveSession pins that the TCC grace breaker
-// retreats to symlink even with a session on the dir. This proves the new
-// live-session gate keys on a busy MOUNT, not on "any retreat under sessions": a
-// TCC-blocked row NEVER mounted (overlayMounted=false), so convertRowToSymlink's
-// gate is not reached and the retreat proceeds — there is no busy NFS mirror to
-// force-unmount here, so no panic hazard, and the retreat repairs the bare dir
-// the session is on. (Contrast TestHealDefersBreakerUnderLiveSession, where the
-// dir IS a live mountpoint and the gate defers.)
+// TestTCCBreakerEscalatesUnderLiveSession pins that the live-session gate keys
+// on a busy mount, not on sessions: a TCC-blocked row never mounted, so the
+// retreat proceeds under a live session — no busy mirror, no panic hazard.
 func TestTCCBreakerEscalatesUnderLiveSession(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -834,9 +753,8 @@ func TestTCCBreakerEscalatesUnderLiveSession(t *testing.T) {
 	}
 }
 
-// TestTCCBreakerLateGrantPreventsFallback pins the desktop case: a grant that
-// lands before the grace expires mounts the row and prevents the retreat — the
-// row stays fuse, the ledger clears, and the TCC guidance clears.
+// TestTCCBreakerLateGrantPreventsFallback pins that a grant landing before the
+// grace expires mounts the row and prevents the retreat.
 func TestTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -847,7 +765,6 @@ func TestTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 	var unmounts int
 	swapForceUnmount(t, func(string) error { unmounts++; return nil })
 
-	// One short of the grace: still waiting, no retreat.
 	driveRetryTicks(t, s, 1, tccBreakerThreshold-1)
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind one short of the grace = %q, want fuse (still waiting on the grant)", got)
@@ -856,7 +773,6 @@ func TestTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 		t.Fatalf("tccBlocks = %d, want %d (one short of the grace)", got, tccBreakerThreshold-1)
 	}
 
-	// The human grants Network Volumes: the next heal mounts the row.
 	fake.setupErr = nil
 	driveRetryTicks(t, s, 1, 1)
 	if got := kindOf(t, s, 1); got != "nfs" {
@@ -876,9 +792,9 @@ func TestTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 	}
 }
 
-// TestTCCBreakerThreshold pins the TCC grace const guard: a pending grant must
-// get a LONGER grace than the wedged breaker (a benign wait, not a kernel
-// hazard), so the threshold must exceed remountBreakerThreshold.
+// TestTCCBreakerThreshold pins the TCC grace const guard: a pending grant (a
+// benign wait, not a kernel hazard) earns a longer grace, so tccBreakerThreshold
+// must exceed remountBreakerThreshold.
 func TestTCCBreakerThreshold(t *testing.T) {
 	if tccBreakerThreshold <= remountBreakerThreshold {
 		t.Fatalf("tccBreakerThreshold = %d, want > remountBreakerThreshold (%d): a pending grant earns a longer grace than a kernel wedge", tccBreakerThreshold, remountBreakerThreshold)
@@ -886,17 +802,16 @@ func TestTCCBreakerThreshold(t *testing.T) {
 }
 
 // TestHealFuseMountFailedRetreatsImmediately pins that a hard mount rejection
-// (ErrMountFailed — fuse-t cannot mount on this machine) retreats to symlink on
-// the FIRST heal, with no TCC wait and no breaker countdown: it is a dead-end,
-// not a pending grant.
+// (ErrMountFailed) retreats to symlink on the first heal — a dead-end, not a
+// pending grant.
 func TestHealFuseMountFailedRetreatsImmediately(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
 	fake.setupErr = mountFailedChain()
-	fakeOverlayMounted(t, func(string) bool { return false }) // never came up
+	fakeOverlayMounted(t, func(string) bool { return false })
 
-	driveRetryTicks(t, s, 1, 1) // ONE tick
+	driveRetryTicks(t, s, 1, 1)
 
 	if got := kindOf(t, s, 1); got != "symlink" {
 		t.Fatalf("row kind after one hard-failure heal = %q, want symlink (immediate retreat, no TCC wait, no breaker countdown)", got)
@@ -906,10 +821,8 @@ func TestHealFuseMountFailedRetreatsImmediately(t *testing.T) {
 	}
 }
 
-// TestRetreatAllFuseRowsConvertsPoolToSymlink pins the whole-pool symlink retreat
-// primitive: retreatAllFuseRows force-unmounts and converts every fuse row to the
-// always-available symlink overlay, logged loudly. It is the shared retreat the
-// startup capability gate drives when fuse is unusable for the whole pool.
+// TestRetreatAllFuseRowsConvertsPoolToSymlink pins the whole-pool retreat:
+// retreatAllFuseRows force-unmounts and converts every fuse row to symlink.
 func TestRetreatAllFuseRowsConvertsPoolToSymlink(t *testing.T) {
 	s, _, _ := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -934,17 +847,13 @@ func TestRetreatAllFuseRowsConvertsPoolToSymlink(t *testing.T) {
 	}
 }
 
-// TestRetreatBailsOnWedgedForceUnmount pins the wedged-unmount guard shared by
-// every symlink-retreat path (convertRowToSymlink): when the forced unmount never
-// completes, the row is left fuse rather than handed to ConvertOverlay — whose
-// Teardown would see the dir still mounted and re-spawn the very holder being
-// retreated from (the wedged-carcass churn the kill-9 incident exposed).
+// TestRetreatBailsOnWedgedForceUnmount pins the wedged-unmount guard
+// (convertRowToSymlink): a forced unmount that never completes leaves the row
+// fuse, since ConvertOverlay's Teardown would otherwise re-spawn the very holder
+// being retreated from.
 func TestRetreatBailsOnWedgedForceUnmount(t *testing.T) {
 	s, dirs, _ := newHealServer(t)
 	flipToFuse(t, s, 1)
-	// The dir reads as a (wedged) mountpoint whose forced unmount never
-	// completes — the exact edge where an un-guarded ConvertOverlay would
-	// re-spawn the holder through its Teardown.
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 	swapForceUnmount(t, func(string) error { return errors.New("force-unmount timed out") })
 
@@ -959,12 +868,10 @@ func TestRetreatBailsOnWedgedForceUnmount(t *testing.T) {
 	}
 }
 
-// hostFuseCapable makes canSpawnHolder()/pool.CanHostFuse() report that this
-// machine can host fuse, so the startup capability gate is reached at all. The
-// gate probes the shared DEFAULT holder socket (mountd.DefaultHolderSocket), not
-// the daemon's injected s.holderSocket — so this stands a canned holder there,
-// under a short HOME whose sun_path fits macOS's 104-byte cap. Without it the
-// gate short-circuits before ever consulting the probe verdict on s.holderSocket.
+// hostFuseCapable makes canSpawnHolder()/pool.CanHostFuse() pass. The capability
+// gate probes the shared default holder socket (mountd.DefaultHolderSocket), not
+// the injected s.holderSocket, so a canned holder is stood up there under a short
+// HOME (macOS sun_path cap).
 func hostFuseCapable(t *testing.T) {
 	t.Helper()
 	home, err := os.MkdirTemp("/tmp", "ccp-home")
@@ -985,19 +892,15 @@ func hostFuseCapable(t *testing.T) {
 }
 
 // TestReconcileCapabilityGateRetreatsPoolWhenFuseUnavailable pins the startup
-// capability gate: when the holder is reachable, serves no live mount, and a
-// capability probe is REJECTED OUTRIGHT (ErrMountFailed — fuse-t cannot mount
-// here), reconcileOverlays retreats EVERY fuse row to symlink in one pass and
-// records symlink as the new-account default — instead of churning a doomed mount
-// per account.
+// capability gate: a probe rejected outright (ErrMountFailed) retreats every fuse
+// row to symlink and records symlink as the new-account default.
 func TestReconcileCapabilityGateRetreatsPoolWhenFuseUnavailable(t *testing.T) {
 	s, _, _ := newHealServer(t)
 	flipToFuse(t, s, 1)
 	flipToFuse(t, s, 2)
 	hostFuseCapable(t)
-	// Holder reachable, no live mounts, probe hard-fails.
 	s.holderSocket = startCapabilityHolder(t, nil, mountd.ClassMountFailed, "fuse-t not loadable")
-	fakeOverlayMounted(t, func(string) bool { return false }) // nothing mounted
+	fakeOverlayMounted(t, func(string) bool { return false })
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
@@ -1018,17 +921,15 @@ func TestReconcileCapabilityGateRetreatsPoolWhenFuseUnavailable(t *testing.T) {
 	}
 }
 
-// TestReconcileCapabilityGateProceedsWhenProbePending pins that a probe merely
-// PENDING the Network Volumes grant (ErrTCCDenied, not ErrMountFailed) does NOT
-// trip the gate: the rows stay fuse for the per-account heal + bounded TCC grace
-// (a desktop user may still grant), and the new-account default is NOT flipped.
+// TestReconcileCapabilityGateProceedsWhenProbePending pins that a probe pending
+// the Network Volumes grant (ErrTCCDenied) does not trip the gate: rows stay fuse
+// for the per-row TCC grace and the new-account default is not flipped.
 func TestReconcileCapabilityGateProceedsWhenProbePending(t *testing.T) {
 	s, _, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
-	hostFuseCapable(t) // reach the gate so the PENDING probe verdict is actually consulted
+	hostFuseCapable(t)
 	s.holderSocket = startCapabilityHolder(t, nil, mountd.ClassTCC, "grant pending")
-	// Health fails so reconcileAccount heals rather than adopting; the heal then
-	// TCC-blocks, leaving the row fuse within its grace.
+	// Health fails so reconcileAccount heals rather than adopting; the heal then TCC-blocks.
 	fake.healthErr = errors.New("not a mountpoint")
 	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
 	fakeOverlayMounted(t, func(string) bool { return false })
@@ -1043,26 +944,21 @@ func TestReconcileCapabilityGateProceedsWhenProbePending(t *testing.T) {
 	}
 }
 
-// TestSweepOrphanMountpointsClearsNonRowCarcass pins the startup orphan sweep:
-// a mountpoint under the accounts dir that no account row owns — a pre-row
-// `ccp add` carcass whose holder died and whose add never finalized — is
-// force-unmounted, while a mountpoint that IS a current row's dir is left for
-// the row-driven reconcile/heal. Without this sweep nothing row-driven ever
-// names the orphan dir, so the wedged carcass would linger (a whole-machine
-// hazard).
+// TestSweepOrphanMountpointsClearsNonRowCarcass pins the startup orphan sweep: a
+// mountpoint under the accounts dir owned by no row (a pre-row `ccp add` carcass)
+// is force-unmounted, while a current row's dir is left to reconcile/heal.
 func TestSweepOrphanMountpointsClearsNonRowCarcass(t *testing.T) {
 	s, _, _ := newMigrateServer(t) // sets HOME to a temp dir, so AccountsDir() is hermetic
 	if err := os.MkdirAll(pool.AccountsDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	rowDir := filepath.Join(pool.AccountsDir(), "acct-01") // owned by a current row
-	orphan := filepath.Join(pool.AccountsDir(), "acct-07") // a pre-row add carcass: no row
+	rowDir := filepath.Join(pool.AccountsDir(), "acct-01")
+	orphan := filepath.Join(pool.AccountsDir(), "acct-07")
 	for _, d := range []string{rowDir, orphan} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Both dirs read as mountpoints; only the orphan (no row) may be cleared.
 	fakeOverlayMounted(t, func(string) bool { return true })
 	var unmounted []string
 	swapForceUnmount(t, func(dir string) error {
@@ -1077,10 +973,8 @@ func TestSweepOrphanMountpointsClearsNonRowCarcass(t *testing.T) {
 	}
 }
 
-// TestLiveSessionGate pins the shared force-unmount precondition: a dir backing
-// a live claude session reads busy (with the count), a dir with no session reads
-// idle, and a SCAN FAILURE reads busy — an unmount we cannot prove safe must
-// defer, because force-unmounting a busy NFS mirror panics the kernel.
+// TestLiveSessionGate pins the shared force-unmount precondition: sessions on
+// the dir read busy with their count, and a scan failure fails closed to busy.
 func TestLiveSessionGate(t *testing.T) {
 	const dir = "/pool/acct-01"
 	tests := []struct {
@@ -1108,14 +1002,12 @@ func TestLiveSessionGate(t *testing.T) {
 }
 
 // TestHealLoopUnmountGate pins mountFuse's teardown-before-remount gate: a
-// mounted-but-dead mirror is torn down and remounted ONLY when idle; under a
-// live session — or a scan we cannot complete — it is left mounted (no teardown,
-// no setup, no hazard strike), because force-unmounting a busy NFS mirror panics
-// the kernel.
+// mounted-but-dead mirror is torn down and remounted only when idle; under a
+// live session — or a failed scan — it is left mounted with no hazard strike.
 func TestHealLoopUnmountGate(t *testing.T) {
 	tests := []struct {
 		name          string
-		scanKind      string // "idle" / "busy" / "err"
+		scanKind      string
 		wantTeardowns int
 		wantSetups    int
 	}{
@@ -1150,8 +1042,8 @@ func TestHealLoopUnmountGate(t *testing.T) {
 			if got := fake.setupCount(); got != tc.wantSetups {
 				t.Fatalf("setups = %d, want %d", got, tc.wantSetups)
 			}
-			// Whether idle (mounted, ledger dropped) or deferred (healDeferredBusy
-			// backs off without a strike), the wedged-breaker hazard never accrues.
+			// Idle drops the ledger; deferred backs off without a strike — the
+			// hazard never accrues either way.
 			if got := s.rowRetry[1].hazard; got != 0 {
 				t.Fatalf("hazard = %d, want 0", got)
 			}
@@ -1159,10 +1051,9 @@ func TestHealLoopUnmountGate(t *testing.T) {
 	}
 }
 
-// TestRetreatDefersUnderLiveSessionWhenMounted pins the breaker/retreat gate
-// (convertRowToSymlink): a fuse row whose dir is a LIVE mountpoint with a live
-// session is left fuse, never force-unmounted — the kernel-panic guard. The
-// whole-pool retreatAllFuseRows drives the same shared primitive.
+// TestRetreatDefersUnderLiveSessionWhenMounted pins the retreat gate
+// (convertRowToSymlink, via retreatAllFuseRows): a live mountpoint with a live
+// session stays fuse, never force-unmounted.
 func TestRetreatDefersUnderLiveSessionWhenMounted(t *testing.T) {
 	s, dirs, _ := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -1192,20 +1083,18 @@ func TestRetreatDefersUnderLiveSessionWhenMounted(t *testing.T) {
 	}
 }
 
-// TestSweepOrphanDefersUnderLiveSession pins Site D: a rowless mountpoint a live
-// claude is still bound to is NOT a carcass yet — sweeping (force-unmounting) any
-// busy NFS mirror panics the kernel, so the orphan sweep leaves it mounted.
+// TestSweepOrphanDefersUnderLiveSession pins that a rowless mountpoint a live
+// claude is still bound to is not yet a carcass: the sweep leaves it mounted.
 func TestSweepOrphanDefersUnderLiveSession(t *testing.T) {
-	s, _, _ := newMigrateServer(t) // hermetic HOME -> hermetic AccountsDir()
+	s, _, _ := newMigrateServer(t)
 	if err := os.MkdirAll(pool.AccountsDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	orphan := filepath.Join(pool.AccountsDir(), "acct-07") // a pre-row add carcass: no row
+	orphan := filepath.Join(pool.AccountsDir(), "acct-07")
 	if err := os.MkdirAll(orphan, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	fakeOverlayMounted(t, func(string) bool { return true })
-	// A live claude bound to the orphan carcass.
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{PID: 4242, ConfigDir: orphan}}, nil
 	}
@@ -1222,10 +1111,9 @@ func TestSweepOrphanDefersUnderLiveSession(t *testing.T) {
 	}
 }
 
-// TestReconcileStaleMountpointDefersUnderLiveSession pins Site C: a symlink row
-// whose dir is unexpectedly a live mountpoint (aborted-rollback wreckage) is
-// normally force-cleared, but when a live claude is still bound reconcileAccount
-// leaves it and returns early — force-unmounting a busy NFS mirror panics.
+// TestReconcileStaleMountpointDefersUnderLiveSession pins that a symlink row whose
+// dir is unexpectedly a live mountpoint (aborted-rollback wreckage) is force-cleared
+// only when idle; with a live claude bound, reconcileAccount leaves it.
 func TestReconcileStaleMountpointDefersUnderLiveSession(t *testing.T) {
 	s, dirs, _ := newMigrateServer(t) // acct-1 is a symlink row
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })

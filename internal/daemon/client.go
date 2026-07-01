@@ -31,7 +31,6 @@ func (c *Client) Available() bool {
 	return true
 }
 
-// do sends one request and reads one response.
 func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
 	conn, err := net.DialTimeout("unix", c.socket, 500*time.Millisecond)
 	if err != nil {
@@ -53,9 +52,8 @@ func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
 }
 
 // Select asks the daemon for the best account dir. cwd keys best-effort
-// session stickiness; empty disables it. noFallback rejects a least-bad
-// exhausted pick (set by --wait callers, which would discard it). ok=false
-// means the caller should fall back to a live, daemonless selection.
+// session stickiness (empty disables); noFallback rejects a least-bad
+// exhausted pick; ok=false means fall back to a live, daemonless selection.
 func (c *Client) Select(account *int, pid int, noMark bool, cwd string, noFallback bool) (resp *Response, ok bool) {
 	r, err := c.do(Request{Op: OpSelect, Account: account, PID: pid, NoMark: noMark, Cwd: cwd, NoFallback: noFallback}, 3*time.Second)
 	if err != nil {
@@ -79,29 +77,24 @@ func (c *Client) Health() (*Response, error) {
 	return c.do(Request{Op: OpHealth}, 2*time.Second)
 }
 
-// migrateTimeout bounds one migrate request: a probe mount, then per account
-// up to an 8s mount wait plus a bounded rollback teardown, across a pool.
+// migrateTimeout covers a probe mount plus, per account, an 8s mount wait and rollback teardown.
 const migrateTimeout = 150 * time.Second
 
-// Migrate asks the daemon to convert accounts to the given overlay kind.
-// account nil means every account not already at the kind; busy accounts are
-// skipped and reported, so re-running sweeps the stragglers. force skips the
-// live-session gate (reservations still refuse).
+// Migrate asks the daemon to convert accounts to the given overlay kind:
+// nil account means all not already at it; busy accounts are skipped and
+// reported; force skips the live-session gate (reservations still refuse).
 func (c *Client) Migrate(account *int, to string, force bool) (*Response, error) {
 	return c.do(Request{Op: OpMigrate, Account: account, To: to, Force: force}, migrateTimeout)
 }
 
-// Shutdown asks the daemon to step down. An OK reply means it accepted and will
-// release the socket shortly; use WaitGone to confirm. This evicts a daemon
-// regardless of launchd tracking — the only way to clear an orphan a `brew
-// services stop` (launchctl bootout) cannot kill.
+// Shutdown asks the daemon to step down; OK means it will release the socket
+// shortly (confirm with WaitGone). Works even on an orphan launchctl bootout
+// cannot kill.
 func (c *Client) Shutdown() (*Response, error) {
 	return c.do(Request{Op: OpShutdown}, 2*time.Second)
 }
 
-// WaitGone polls until the socket stops accepting connections or timeout
-// elapses, reporting whether it went dead. Reused by the CLI upgrade path and a
-// successor daemon's bind-time eviction.
+// WaitGone reports whether the socket stopped accepting connections within timeout.
 func (c *Client) WaitGone(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

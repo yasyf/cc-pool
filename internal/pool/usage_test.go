@@ -11,12 +11,10 @@ import (
 )
 
 // TestPoolNeverTouchesDefaultKeychainItem pins the #1 safety invariant: no
-// CredentialStore op — read, write, or delete — ever names the canonical
-// unsuffixed item plain `claude` owns ("Claude Code-credentials"). With
-// adoption gone the pool has no code path that can even name it (ServiceName
-// always emits a hash suffix), but this drives the real credential ops anyway
-// — a pre-flight refresh, a rotated-token re-assert, and a remove — and asserts
-// every op names only the account's own suffixed service.
+// CredentialStore op ever names the canonical unsuffixed item plain `claude`
+// owns ("Claude Code-credentials"). It drives the real ops — pre-flight refresh,
+// rotated-token re-assert, remove — asserting each names only the account's own
+// suffixed service.
 func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("USER", "user")
@@ -75,10 +73,9 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 }
 
 // TestSampleUsagePersistsExtraUsage pins the oauth→store join in recordSample:
-// the usage windows AND the extra-usage block fetched from the API must land in
-// the latest stored sample verbatim — status and the exhausted-fallback billing
-// warning read them from there, and each layer's isolated tests would stay
-// green if this mapping were dropped.
+// the usage windows and extra-usage block must land in the latest stored sample
+// verbatim (status and the exhausted-fallback billing warning read them there) —
+// a mapping each layer's isolated tests would miss if dropped.
 func TestSampleUsagePersistsExtraUsage(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
 	if err != nil {

@@ -10,12 +10,9 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// TestCanHostFuse pins CanHostFuse's real, build-tag-independent logic via the
-// holderExe seam (and a temp HOME so DefaultHolderSocket points at nothing
-// serving): no cask installed and no holder reachable → cannot host; the cask
-// binary present → can host without a running holder. This replaces the old
-// per-build-tag tests, which only passed when the test machine happened to match
-// the tag's assumed cask state.
+// TestCanHostFuse pins CanHostFuse's build-tag-independent logic via the
+// holderExe seam: no cask and no holder reachable → cannot host; the cask
+// binary present → can host without a running holder.
 func TestCanHostFuse(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // DefaultHolderSocket → temp/.fusekit; nothing listening
 	orig := holderExe
@@ -61,9 +58,8 @@ func TestOverlayProviderFor(t *testing.T) {
 				}
 				return
 			}
-			// A fuse provider always reports its stored backend — even in a build
-			// that cannot host mounts itself — so stored-backend fences never
-			// silently flip.
+			// A fuse provider always reports its stored backend — even in a
+			// non-hosting build — so stored-backend fences never silently flip.
 			if got := p.Backend(); got != tc.backend {
 				t.Errorf("Backend() = %q, want %q", got, tc.backend)
 			}
@@ -82,12 +78,10 @@ func TestOverlayProviderForUnknownBackend(t *testing.T) {
 	}
 }
 
-// TestOverlaySpecHolderWiring pins that the Spec cc-pool hands fusekit drives the
-// SHARED holder over RPC: the cask socket/binary, cc-pool's Owner, and the content
-// wiring (bridge socket, source mode, probe path, private prefixes) that makes the
-// provider register a synth-serving AddMount. It must NOT self-exec (no
-// StableExecDir, no "mount-holder" argv) and must NOT version-replace the holder
-// (no Version).
+// TestOverlaySpecHolderWiring pins the Spec cc-pool hands fusekit: drive the
+// SHARED holder over RPC (cask socket/binary, Owner, content) to register a
+// synth-serving AddMount, never self-exec (no StableExecDir/argv) or
+// version-replace it (no Version).
 func TestOverlaySpecHolderWiring(t *testing.T) {
 	spec := overlaySpec()
 	if spec.PassthroughOnly {

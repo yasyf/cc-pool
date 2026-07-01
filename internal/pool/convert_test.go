@@ -13,14 +13,8 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// testSpec is the fusekit/overlay Spec the convert tests drive providers with —
-// the same classification cc-pool's production overlaySpec carries, but with a
-// nil Holder (these tests inject a fake fuse provider via the OverlayFor seam
-// and never construct a RemoteFuseProvider).
 func testSpec() fkoverlay.Spec { return overlaySpec() }
 
-// newSymlinkProvider builds a fusekit symlink provider wired with cc-pool's
-// classification — the real provider these tests stage and re-assert.
 func newSymlinkProvider() *fkoverlay.SymlinkProvider {
 	return &fkoverlay.SymlinkProvider{Spec: testSpec()}
 }
@@ -30,17 +24,12 @@ const (
 	wrongIdentityJSON = `{"oauthAccount":{"accountUuid":"u-IMPOSTOR","emailAddress":"x@example.com"}}`
 )
 
-// fakeFuse stands in for the fuse provider so conversion logic runs without a
-// live mount. Setup simulates the mirror by linking the account dir's
-// .claude.json to the private backing copy (or, when wrongIdentity is set, by
-// serving a different identity); Teardown removes whatever Setup created,
-// matching a real unmount making the mirrored view vanish.
 type fakeFuse struct {
 	ops           *[]string
 	setupErr      error
 	teardownErr   error
 	wrongIdentity bool
-	onSetup       func(dir string) // optional: runs inside Setup (e.g. to stage an orphan) before setupErr
+	onSetup       func(dir string) // runs inside Setup, before setupErr
 	created       string
 }
 
@@ -88,8 +77,6 @@ func (f *fakeFuse) Teardown(_, _ string) error {
 	return nil
 }
 
-// newConvertFixture builds a real symlink account over a seeded base and a
-// manager whose fuse provider is the fake.
 func newConvertFixture(t *testing.T, fake *fakeFuse) (*Manager, store.Account, string) {
 	t.Helper()
 	home := t.TempDir()
@@ -158,12 +145,7 @@ func TestConvertOverlayNoopWhenAlreadyTarget(t *testing.T) {
 	}
 }
 
-// TestConvertOverlayRejectsWrongKindFake pins the Backend() equality fences. The
-// real resolver can no longer hand back a wrong-backend provider (a fuse backend
-// maps to the holder-backed RemoteFuseProvider, which always reports its own
-// backend), so the fences guard against wrong-backend INJECTED fakes — a
-// conversion that thinks it is operating fuse-side while running symlink code
-// paths is exactly how account state gets destroyed.
+// TestConvertOverlayRejectsWrongKindFake pins the Backend() equality fences: a wrong-backend provider running the wrong code path destroys account state.
 func TestConvertOverlayRejectsWrongKindFake(t *testing.T) {
 	wrongKind := func(fkoverlay.Backend) (fkoverlay.Provider, error) { return newSymlinkProvider(), nil }
 
@@ -202,16 +184,10 @@ func TestConvertOverlayRejectsWrongKindFake(t *testing.T) {
 	})
 }
 
-// TestConvertOverlayRetreatWithoutLiveMount pins the escape hatch for a
-// machine whose fuse rows outlived their mounts (holder gone, or fuse-t
-// uninstalled entirely): the fuse→symlink retreat resolves the real
-// holder-backed RemoteProvider, whose Teardown is an immediate no-op with
-// zero holder contact when nothing is mounted — so the retreat is pure file
-// moves and works identically in every build.
+// TestConvertOverlayRetreatWithoutLiveMount pins the escape hatch when fuse rows outlive their mounts: with nothing mounted Teardown is a no-op, so the fuse→symlink retreat is pure file moves and works in every build.
 func TestConvertOverlayRetreatWithoutLiveMount(t *testing.T) {
-	m, a, dir := newConvertFixture(t, nil) // no seam: the real resolver
-	// Stage the fuse rest state: row says fuse, identity and backups live in
-	// the private backing dir, no links in the (unmounted) account dir.
+	m, a, dir := newConvertFixture(t, nil)
+	// Fuse rest state.
 	priv := fkoverlay.FusePrivateRoot(dir)
 	if err := os.MkdirAll(priv, 0o700); err != nil {
 		t.Fatal(err)
@@ -258,8 +234,7 @@ func TestConvertToFuseHappyPath(t *testing.T) {
 	if got.OverlayKind != "nfs" || storedKind(t, m, a.ID) != "nfs" {
 		t.Fatalf("row not flipped: returned=%s stored=%s", got.OverlayKind, storedKind(t, m, a.ID))
 	}
-	// Move happened BEFORE the mount: Setup must have seen the identity
-	// already in the private backing dir.
+	// Move precedes the mount: Setup saw the identity in the private dir.
 	if len(ops) != 1 || ops[0] != "fuse.setup(priv-identity=true)" {
 		t.Fatalf("ops = %v, want one setup with private identity in place", ops)
 	}
@@ -269,7 +244,6 @@ func TestConvertToFuseHappyPath(t *testing.T) {
 	if gotBak := readFileT(t, filepath.Join(priv, "backups", "b.bak")); gotBak != "bak" {
 		t.Fatalf("backups content lost: %q", gotBak)
 	}
-	// The old overlay's shared links are gone (teardown ran).
 	if _, err := os.Lstat(filepath.Join(dir, "projects")); !os.IsNotExist(err) {
 		t.Fatal("shared symlink survived conversion")
 	}
@@ -315,8 +289,7 @@ func TestConvertToFuseUnmountFailureAbortsRollback(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "mount timed out") || !strings.Contains(err.Error(), "still mounted") {
 		t.Fatalf("error = %v, want both faults reported", err)
 	}
-	// Rollback aborted: NO symlink re-setup over what may be a live mount, and
-	// the identity stays safe in the private backing dir.
+	// Rollback aborted: no symlink re-setup over a possibly-live mount; identity stays in the private dir.
 	if _, err := os.Lstat(filepath.Join(dir, "projects")); !os.IsNotExist(err) {
 		t.Fatal("symlinks were laid despite a failed unmount")
 	}
@@ -351,7 +324,6 @@ func TestConvertToSymlink(t *testing.T) {
 	m, a, dir := newConvertFixture(t, fake)
 	priv := fkoverlay.FusePrivateRoot(dir)
 
-	// Forward first, then reverse — the round trip the rollout rehearses.
 	fwd, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
 	if err != nil {
 		t.Fatalf("forward convert: %v", err)
@@ -395,19 +367,13 @@ func TestConvertToSymlinkAbortsOnFailedUnmount(t *testing.T) {
 	}
 }
 
-// TestConvertToSymlinkSweepsSharedOrphans reproduces the incident: a fuse account
-// whose mirror was force-unmounted while claude wrote to the bare mountpoint, so
-// real entries now sit at shared names (projects/, history.jsonl). Before the fix
-// the retreat failed at `lay symlinks: cannot link ".../projects": a non-symlink
-// already exists there`. The retreat must instead relocate the orphans into base
-// (merging with what base already holds), lay clean links, and never leak the
-// account's private identity into the shared base.
+// TestConvertToSymlinkSweepsSharedOrphans: a force-unmounted fuse mirror leaves real orphans at shared names (projects/, history.jsonl); the retreat must relocate them into base (merging), re-link, and never leak the account's private identity into base.
 func TestConvertToSymlinkSweepsSharedOrphans(t *testing.T) {
-	m, a, dir := newConvertFixture(t, nil) // real resolver
+	m, a, dir := newConvertFixture(t, nil)
 	base := ClaudeDir()
 	priv := fkoverlay.FusePrivateRoot(dir)
 
-	// Fuse rest state: private files live in the backing dir, no links in the dir.
+	// Fuse rest state.
 	if err := os.MkdirAll(priv, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -417,8 +383,6 @@ func TestConvertToSymlinkSweepsSharedOrphans(t *testing.T) {
 	if err := os.Rename(filepath.Join(dir, "backups"), filepath.Join(priv, "backups")); err != nil {
 		t.Fatal(err)
 	}
-	// Replace the projects link with a REAL orphan dir and add an orphan file at a
-	// shared name — exactly what claude writes into a bare, unmounted mountpoint.
 	if err := os.Remove(filepath.Join(dir, "projects")); err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +410,6 @@ func TestConvertToSymlinkSweepsSharedOrphans(t *testing.T) {
 	if back.OverlayKind != "symlink" || storedKind(t, m, a.ID) != "symlink" {
 		t.Fatal("row not flipped to symlink")
 	}
-	// Orphans relocated into base, merging with the pre-existing base child.
 	if got := readFileT(t, filepath.Join(base, "projects", "p.json")); got != "orphan-session" {
 		t.Fatalf("orphan project not swept into base: %q", got)
 	}
@@ -456,14 +419,12 @@ func TestConvertToSymlinkSweepsSharedOrphans(t *testing.T) {
 	if got := readFileT(t, filepath.Join(base, "history.jsonl")); got != "orphan-history" {
 		t.Fatalf("orphan history not swept into base: %q", got)
 	}
-	// Clean links re-laid at the shared names (this used to fail).
 	if target, err := os.Readlink(filepath.Join(dir, "projects")); err != nil || target != filepath.Join(base, "projects") {
 		t.Fatalf("projects not re-linked into base: target=%q err=%v", target, err)
 	}
 	if _, err := os.Readlink(filepath.Join(dir, "history.jsonl")); err != nil {
 		t.Fatalf("history.jsonl not re-linked into base: %v", err)
 	}
-	// Identity restored locally and NEVER leaked into the shared base.
 	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
 		t.Fatalf("identity not restored: %q", got)
 	}
@@ -478,9 +439,7 @@ func TestConvertToSymlinkSweepsSharedOrphans(t *testing.T) {
 	}
 }
 
-// TestRollbackToSymlinkSweepsSharedOrphans pins the second call site: a failed
-// fuse Setup that left a real orphan at a shared name in the bare dir must still
-// roll back cleanly — the orphan swept into base, the links re-laid.
+// TestRollbackToSymlinkSweepsSharedOrphans pins the rollback call site: a failed fuse Setup that left an orphan at a shared name must still roll back cleanly (orphan swept into base, links re-laid).
 func TestRollbackToSymlinkSweepsSharedOrphans(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{
@@ -516,14 +475,12 @@ func TestHealStrandedPrivate(t *testing.T) {
 	m, a, dir := newConvertFixture(t, nil)
 	priv := fkoverlay.FusePrivateRoot(dir)
 
-	// Nothing stranded: no-op.
 	healed, err := m.HealStrandedPrivate(a)
 	if err != nil || healed {
 		t.Fatalf("clean account: healed=%v err=%v, want false,nil", healed, err)
 	}
 
-	// Strand the identity (a conversion that died before rollback finished):
-	// the file is in the backing dir, not the account dir.
+	// Strand the identity: a conversion that died before rollback finished.
 	if err := os.MkdirAll(priv, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -544,7 +501,6 @@ func TestHealStrandedPrivate(t *testing.T) {
 		t.Fatal("emptied private root not removed")
 	}
 
-	// Second run: nothing left to heal.
 	healed, err = m.HealStrandedPrivate(a)
 	if err != nil || healed {
 		t.Fatalf("re-heal: healed=%v err=%v, want false,nil", healed, err)
@@ -557,11 +513,7 @@ func TestHealStrandedPrivate(t *testing.T) {
 	}
 }
 
-// TestConvertRetreatThenLaunchMergePropagatesBase pins the migrate↔merge
-// interplay across a fuse→symlink retreat: while the row says fuse the launch
-// merge stays out, and once the retreat moves the private file back and flips
-// the row, the launch merge propagates a fresh base key into the moved-back
-// file while the account's identity survives byte-identical.
+// TestConvertRetreatThenLaunchMergePropagatesBase pins the migrate↔merge interplay across a fuse→symlink retreat: the launch merge stays out while the row says fuse, then propagates a fresh base key into the moved-back file with the identity byte-identical.
 func TestConvertRetreatThenLaunchMergePropagatesBase(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{ops: &ops}
@@ -597,12 +549,7 @@ func TestConvertRetreatThenLaunchMergePropagatesBase(t *testing.T) {
 	}
 }
 
-// TestStrandedPrivateMergeRefusalKeepsHealable pins the no-collision interplay
-// between the launch merge's stranded-copy guard and HealStrandedPrivate: with
-// the account's .claude.json stranded in the fuse private backing dir
-// (interrupted conversion), the launch merge errors without minting a file, so
-// the subsequent heal's moveEntry meets no collision, the healed file carries
-// the stranded identity, and the next launch merge converges.
+// TestStrandedPrivateMergeRefusalKeepsHealable: with .claude.json stranded in the private backing dir, the launch merge errors without minting a file, so the later heal meets no collision and the next merge converges.
 func TestStrandedPrivateMergeRefusalKeepsHealable(t *testing.T) {
 	m, a, dir := newConvertFixture(t, nil)
 	priv := fkoverlay.FusePrivateRoot(dir)
@@ -644,19 +591,14 @@ func TestStrandedPrivateMergeRefusalKeepsHealable(t *testing.T) {
 	}
 }
 
-// TestHealResolvesDuplicatePrivateFile pins the crash-repair fix: when an
-// abnormal shutdown leaves the same private file in BOTH the account dir and
-// the fuse private backing dir, the heal's MovePrivateEntries used to hit a
-// file-file collision and refuse forever — dead-locking the account. It now
-// resolves last-write-wins (newer copy survives), the heal converges, and the
-// resolution is reported through the overlay seam.
+// TestHealResolvesDuplicatePrivateFile: the same private file in both the account dir and the private backing dir resolves last-write-wins (newer copy survives), the heal converges, and the resolution is reported through the overlay seam.
 func TestHealResolvesDuplicatePrivateFile(t *testing.T) {
 	m, a, dir := newConvertFixture(t, nil)
 	priv := fkoverlay.FusePrivateRoot(dir)
 	if err := os.MkdirAll(priv, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// Same private name in both roots: the stranded backing copy is newer.
+	// The stranded backing copy is newer.
 	base := time.Now()
 	if err := os.WriteFile(filepath.Join(dir, ".last-update-result.json"), []byte("stale-in-dir"), 0o600); err != nil {
 		t.Fatal(err)
@@ -713,9 +655,7 @@ func TestSetDefaultOverlayKind(t *testing.T) {
 		t.Fatal("unknown kind accepted")
 	}
 
-	// The fuse fence keys on hosting capability, not on the resolved
-	// provider's kind — the RemoteProvider always reports KindFuse, so a
-	// provider-kind fence would always pass.
+	// The fuse fence keys on hosting capability, not provider kind: RemoteProvider always reports KindFuse.
 	m.CanHostFuse = func() bool { return false }
 	if err := m.SetDefaultOverlayKind(fkoverlay.BackendNFS); !errors.Is(err, ErrConvertUnsupported) {
 		t.Fatalf("fuse default without fuse hosting = %v, want ErrConvertUnsupported", err)

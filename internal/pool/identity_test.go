@@ -9,11 +9,7 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// TestAccountIdentityPathMath pins that AccountIdentity is pure path math off
-// the recorded backend — no provider resolution: a fuse backend reads the
-// private backing dir beside the mountpoint, every other backend reads the
-// account dir itself. Each case plants a decoy identity at the other location
-// to prove which file was read.
+// TestAccountIdentityPathMath pins AccountIdentity as pure path math off the recorded backend — no provider resolution.
 func TestAccountIdentityPathMath(t *testing.T) {
 	const right = `{"oauthAccount":{"accountUuid":"u-right","emailAddress":"r@example.com"}}`
 	const decoy = `{"oauthAccount":{"accountUuid":"u-decoy","emailAddress":"d@example.com"}}`
@@ -21,7 +17,7 @@ func TestAccountIdentityPathMath(t *testing.T) {
 	tests := []struct {
 		name     string
 		backend  fkoverlay.Backend
-		fuseSide bool // the identity lives in FusePrivateRoot(dir)
+		fuseSide bool
 	}{
 		{name: "nfs reads the private backing dir", backend: fkoverlay.BackendNFS, fuseSide: true},
 		{name: "fskit reads the private backing dir", backend: fkoverlay.BackendFSKit, fuseSide: true},

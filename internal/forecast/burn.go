@@ -14,16 +14,13 @@ const (
 	// BurnWindow is how far back the 5h burn estimate looks.
 	BurnWindow = 45 * time.Minute
 	// BurnMinSpan is the minimum newest-to-oldest span; below it the API's
-	// integer-percent quantization dominates the slope (±1% over 10 min is
-	// already ±6%/hr of noise).
+	// integer-percent quantization dominates the slope.
 	BurnMinSpan = 10 * time.Minute
 	// BurnMinSamples is the minimum usable sample count, shared by both burns.
 	BurnMinSamples = 3
-	// Burn7dWindow is how far back the 7d burn estimate looks. The 7d window
-	// drains ~16× slower than the 5h (sustainable ≈ 100%/168h ≈ 0.6%/h per
-	// account), so over a 45-min lookback a single 1% API quantization step
-	// reads as 1.33%/h — over 2× the signal. Over 6h that same step is
-	// 0.17%/h (~28% of sustainable), so the slope is legible.
+	// Burn7dWindow is how far back the 7d burn estimate looks — wider than the 5h
+	// because the 7d window drains ~16× slower, so a wider lookback is needed to
+	// clear the API's integer-percent quantization noise.
 	Burn7dWindow = 6 * time.Hour
 	// Burn7dMinSpan is the minimum span for the 7d burn. Below half the window
 	// one quantization step exceeds half the sustainable rate.
@@ -36,16 +33,14 @@ func Util5h(s store.UsageSample) float64 { return s.Util5h }
 // Util7d selects the 7d-window utilization from a sample.
 func Util7d(s store.UsageSample) float64 { return s.Util7d }
 
-// secantBurn estimates the recent drain of a window in percent/hour from
-// samples (newest first), reading the window via util and looking back at most
-// window. 0 means idle or too-thin history — there is nothing to project.
-//
-// Rate-limited samples are dropped first: a 429 poll records a zeroed
-// placeholder whose utilization drop would otherwise read as a window reset.
-// A genuine reset (utilization higher in an older sample) truncates to the
-// post-reset segment. The estimate is the endpoint secant: utilization is
-// monotone within a window, so the secant is unbiased and maximally smooth
-// against the API's integer-percent quantization.
+// secantBurn estimates a window's recent drain in percent/hour from samples
+// (newest first), reading the window via util and looking back at most window.
+// 0 means idle or too-thin history. Rate-limited samples are dropped first: a
+// 429 records a zeroed placeholder whose drop would read as a window reset. A
+// genuine reset (higher utilization in an older sample) truncates to the
+// post-reset segment. The estimate is the endpoint secant — utilization is
+// monotone within a window, so it is unbiased and smooth against the API's
+// integer-percent quantization.
 func secantBurn(samples []store.UsageSample, util func(store.UsageSample) float64,
 	window, minSpan time.Duration, now time.Time,
 ) float64 {
@@ -72,17 +67,14 @@ func secantBurn(samples []store.UsageSample, util func(store.UsageSample) float6
 	return (util(usable[0]) - util(usable[len(usable)-1])) / span.Hours()
 }
 
-// Burn5h estimates the recent drain of the 5h window in percent/hour from
-// recent samples (newest first). 0 means idle or unknown — either way there
-// is nothing to project forward.
+// Burn5h estimates the 5h window's recent drain in percent/hour from samples
+// (newest first); 0 means idle or unknown.
 func Burn5h(samples []store.UsageSample, now time.Time) float64 {
 	return secantBurn(samples, Util5h, BurnWindow, BurnMinSpan, now)
 }
 
-// Burn7d estimates the recent drain of the 7d window in percent/hour from
-// recent samples (newest first), over a wider window so the much slower
-// sustainable rate clears the API's quantization noise. 0 means idle or
-// too-thin history — same contract as Burn5h, no knownness flags.
+// Burn7d estimates the 7d window's recent drain in percent/hour from samples
+// (newest first), over the wider Burn7dWindow; 0 means idle or too-thin history.
 func Burn7d(samples []store.UsageSample, now time.Time) float64 {
 	return secantBurn(samples, Util7d, Burn7dWindow, Burn7dMinSpan, now)
 }

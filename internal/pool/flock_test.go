@@ -14,9 +14,8 @@ import (
 	"time"
 )
 
-// bumpUnderLock takes the flock at lockPath, reads counterPath as an int,
-// increments it, and writes it back. The Gosched widens the read→write window so
-// a missing lock would surface as a lost update.
+// bumpUnderLock's Gosched widens the read-modify-write window so a missing lock
+// surfaces as a lost update.
 func bumpUnderLock(t *testing.T, lockPath, counterPath string) {
 	t.Helper()
 	h, err := flockAcquire(context.Background(), lockPath)
@@ -37,11 +36,9 @@ func bumpUnderLock(t *testing.T, lockPath, counterPath string) {
 	}
 }
 
-// TestFlockSerializesCriticalSection proves the advisory lock makes the
-// read→modify→write critical section mutually exclusive. flock excludes between
-// open file descriptions, so two goroutines each opening their own fd is the
-// same mechanism as two processes — a lost update here would mean the lock does
-// not serialize at all.
+// TestFlockSerializesCriticalSection proves the advisory lock serializes the
+// read→modify→write section. flock excludes between open file descriptions, so
+// two goroutines with their own fds exercise the same mechanism as two processes.
 func TestFlockSerializesCriticalSection(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "counter.lock")
@@ -101,9 +98,8 @@ const (
 	flockChildHold     = 700 * time.Millisecond
 )
 
-// TestFlockChildHolds is the child half of TestFlockCrossProcess: it acquires the
-// lock, signals readiness via a file, holds for flockChildHold, then releases.
-// Without the env handshake it is a no-op so a normal `go test` run skips it.
+// TestFlockChildHolds is the child half of TestFlockCrossProcess; without the
+// env handshake it is a no-op, so a normal `go test` run skips it.
 func TestFlockChildHolds(t *testing.T) {
 	lockPath := os.Getenv(flockChildLockEnv)
 	readyPath := os.Getenv(flockChildReadyEnv)
@@ -123,8 +119,8 @@ func TestFlockChildHolds(t *testing.T) {
 }
 
 // TestFlockCrossProcess is the real proof: a child PROCESS holds the lock while
-// this process tries to acquire it, and the acquire must block until the child
-// releases. Re-execs the test binary running only TestFlockChildHolds.
+// this process blocks to acquire it. Re-execs the test binary running only
+// TestFlockChildHolds.
 func TestFlockCrossProcess(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "x.lock")
@@ -142,7 +138,6 @@ func TestFlockCrossProcess(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = child.Wait() })
 
-	// Wait for the child to acquire and signal it holds the lock.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if _, err := os.Stat(readyPath); err == nil {

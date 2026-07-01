@@ -47,8 +47,7 @@ func newStatusCmd() *cobra.Command {
 	return cmd
 }
 
-// runStatusJSON prints the StatusSnapshot the widget reads — the daemon's
-// cached view when usable, else live sampling.
+// runStatusJSON prints the StatusSnapshot the widget reads.
 func runStatusJSON(cmd *cobra.Command, m *pool.Manager, forceLive bool) error {
 	snap, err := statusSnapshotJSON(cmd.Context(), m, forceLive)
 	if err != nil {
@@ -62,9 +61,8 @@ func runStatusJSON(cmd *cobra.Command, m *pool.Manager, forceLive bool) error {
 	return nil
 }
 
-// statusSnapshotJSON builds the StatusSnapshot for --json. It bypasses
-// gatherStatus/fromDaemon deliberately: that round-trip drops SampleAge, and a
-// re-conversion through ToStatuses would fabricate "sample_age":"0s".
+// statusSnapshotJSON bypasses gatherStatus/fromDaemon: that round-trip
+// drops SampleAge and fabricates "sample_age":"0s".
 func statusSnapshotJSON(ctx context.Context, m *pool.Manager, forceLive bool) (daemon.StatusSnapshot, error) {
 	if !forceLive {
 		resp, err := daemon.NewClient().Status()
@@ -79,10 +77,6 @@ func statusSnapshotJSON(ctx context.Context, m *pool.Manager, forceLive bool) (d
 	return daemon.NewStatusSnapshot(daemon.ToStatuses(snaps), time.Now()), nil
 }
 
-// runStatus shows account status. On an interactive terminal it launches the
-// TUI (which refreshes itself); piped or with --plain it prints the plain
-// table, once or continuously under --watch. Both `ccp status` and bare `ccp`
-// dispatch here.
 func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) error {
 	if isTTY() && !plain {
 		return runStatusTUI(cmd, m, live)
@@ -93,7 +87,6 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 		if err != nil {
 			return err
 		}
-		// Unlike the TUI's keep-last-view loop, the one-shot path fails fast.
 		pin, err := readDirPin(m, cwd)
 		if err != nil {
 			return err
@@ -123,9 +116,6 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 }
 
-// gatherStatus prefers the daemon's cached view, falling back to live
-// sampling. The second return is the daemon's mount-holder cache — nil on the
-// live path, where no daemon is running to cache holder state.
 func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, *daemon.HolderStatus, error) {
 	if !forceLive {
 		resp, err := daemon.NewClient().Status()
@@ -137,19 +127,13 @@ func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.
 	return snaps, nil, err
 }
 
-// holderFooter renders the one-line mount-holder alert under the plain status
-// table — only when something needs attention. A healthy holder at the
-// current version prints nothing, so status stays clean. Plain path only: the
-// TUI's gather closure plumbs statusData (snapshots + pin) and deliberately
-// drops the holder — `ccp doctor` and `ccp service status` carry the same
-// facts for interactive users.
+// holderFooter is plain-path only — the TUI drops holder state
+// (`ccp doctor` and `ccp service status` carry it).
 func holderFooter(h *daemon.HolderStatus) string {
 	if h == nil {
 		return ""
 	}
-	// Priority: a pending TCC grant blocks the holder entirely and needs the
-	// user; a wedge is narrower (N mirrors, the heal loop remounts them) and only
-	// asks for a doctor run.
+	// A TCC grant needs the user and blocks the holder entirely; wedges self-heal.
 	switch {
 	case h.TCCError != "":
 		return warnStyle.Render("mount holder: grant needed — " + h.TCCError + " — " + fuseGrantHint(h.TCCBlockedBackend) + " (cc-pool falls back to symlink automatically if the grant never lands)")
@@ -167,8 +151,6 @@ type dirPin struct {
 	ok   bool
 }
 
-// readDirPin reads cwd's pin straight from the store — a single-row local read
-// that needs neither the daemon's status cache nor a wire change.
 func readDirPin(m *pool.Manager, cwd string) (dirPin, error) {
 	if cwd == "" {
 		return dirPin{}, nil
@@ -180,7 +162,6 @@ func readDirPin(m *pool.Manager, cwd string) (dirPin, error) {
 	return dirPin{cwd: cwd, view: view, ok: ok}, nil
 }
 
-// pinToken is the row badge on the pinned account's line.
 func pinToken(manual bool) string {
 	if manual {
 		return pinStyle.Render("pinned")
@@ -188,10 +169,6 @@ func pinToken(manual bool) string {
 	return pinStyle.Render("pinned (auto)")
 }
 
-// renderPinLine renders the launch directory's pin summary ("" when none):
-// who it is pinned to, manual vs auto, and what the pin is doing — counting
-// down to expiry, held open by live sessions, or waiting for one to end.
-// Shared by the TUI and the plain table.
 func renderPinLine(pin dirPin, snaps []pool.Snapshot) string {
 	if !pin.ok {
 		return ""
@@ -228,7 +205,6 @@ func renderPinLine(pin dirPin, snaps []pool.Snapshot) string {
 		dimStyle.Render(" · "+kind+" · "+state+" · "+abbreviateHome(pin.cwd))
 }
 
-// abbreviateHome renders path with the user's home directory shortened to ~.
 func abbreviateHome(path string) string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" || !strings.HasPrefix(path, home) {
@@ -237,15 +213,12 @@ func abbreviateHome(path string) string {
 	return "~" + strings.TrimPrefix(path, home)
 }
 
-// daemonStatusUsable reports whether a status response can be rendered directly.
-// A transport error, a not-OK reply, or a version-skewed (pre-upgrade) daemon —
-// which omits newer wire fields like Components — must fall back to live
-// sampling so the render is never partial.
+// daemonStatusUsable rejects version skew: an older daemon omits newer wire
+// fields, so rendering its reply would be partial.
 func daemonStatusUsable(resp *daemon.Response, err error) bool {
 	return err == nil && resp != nil && resp.OK && resp.Version == version.String()
 }
 
-// fromDaemon converts daemon account statuses into Snapshots for rendering.
 func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 	out := make([]pool.Snapshot, 0, len(accs))
 	for _, a := range accs {
@@ -277,14 +250,12 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 	return out
 }
 
-// snapshotTier mirrors selection preference: Pick serves available accounts,
-// PickFallback falls back to exhausted-but-not-rate-limited, and a rate-limited
-// account cannot serve at all. Status must never show an unusable account above
-// a usable one, however high its forward-looking score.
+// snapshotTier mirrors Pick/PickFallback selection preference: an unusable
+// account must never sort above a usable one, however high its score.
 func snapshotTier(s pool.Snapshot) int {
 	switch {
 	case s.NeedsLogin:
-		return 3 // needs a human (`ccp login`); below even rate-limited
+		return 3
 	case s.RateLimited:
 		return 2
 	case s.Exhausted:
@@ -294,8 +265,7 @@ func snapshotTier(s pool.Snapshot) int {
 	}
 }
 
-// sortSnapshots orders snapshots for display: usability tier first, then score
-// desc — the same order select consults, so the ▸ next-pick marker stays honest.
+// sortSnapshots matches the order select consults, so the ▸ next-pick marker stays honest.
 func sortSnapshots(snaps []pool.Snapshot) {
 	sort.SliceStable(snaps, func(i, j int) bool {
 		if ti, tj := snapshotTier(snaps[i]), snapshotTier(snaps[j]); ti != tj {
@@ -305,8 +275,6 @@ func sortSnapshots(snaps []pool.Snapshot) {
 	})
 }
 
-// renderTable produces a styled fixed-width table, best account highlighted,
-// with the launch directory's pin badged on its account and summarized below.
 func renderTable(snaps []pool.Snapshot, pin dirPin) string {
 	if len(snaps) == 0 {
 		return "No accounts yet. Run `ccp add` to add one.\n"
@@ -351,13 +319,9 @@ func renderTable(snaps []pool.Snapshot, pin dirPin) string {
 	return b.String()
 }
 
-// snapshotFlags renders the colored status tokens (stale / rate-limited /
-// exhausted / overage / no-data) for one account, or "" when the account is
-// healthy. Shared by the plain table and the TUI.
 func snapshotFlags(s pool.Snapshot) string {
 	var flags []string
 	if s.NeedsLogin {
-		// Most actionable state — lead with it.
 		flags = append(flags, badStyle.Render("needs login"))
 	}
 	if s.Stale {
@@ -370,9 +334,8 @@ func snapshotFlags(s pool.Snapshot) string {
 		flags = append(flags, badStyle.Render("exhausted"))
 	}
 	if s.ExtraEnabled && s.ExtraUsed > 0 {
-		// Only actual spend earns the badge — overage merely being enabled is
-		// not an alert, and a permanent flag would train the eye to ignore it.
-		// API amounts are currency cents (e.g. 177 of 5000 == $1.77 of $50).
+		// Badge only on actual spend, not a permanent enabled-flag. API amounts
+		// are cents (177 == $1.77).
 		flags = append(flags, warnStyle.Render(fmt.Sprintf("overage $%.2f/$%.2f", s.ExtraUsed/100, s.ExtraLimit/100)))
 	}
 	if !s.HasUsage {
@@ -381,8 +344,7 @@ func snapshotFlags(s pool.Snapshot) string {
 	return strings.Join(flags, " ")
 }
 
-// accountName returns an account's display label, or a placeholder when it is
-// unnamed. The internal acct-NN id is shown only by `ccp list` and `ccp doctor`.
+// accountName never shows the acct-NN id; only `ccp list`/`ccp doctor` do.
 func accountName(label string) string {
 	if label == "" {
 		return "(unnamed)"
@@ -390,10 +352,8 @@ func accountName(label string) string {
 	return label
 }
 
-// usageSuffix renders raw 5h/7d percent-used as " · 5h X% used · 7d Y% used"
-// for the `select`/`run` diagnostic lines, each figure health-tinted. It returns
-// "" when usage is unknown — a never-sampled pick, or a daemon predating the wire
-// fields — so we never print a fabricated 0%.
+// usageSuffix returns "" for unknown usage (never-sampled or old daemon)
+// rather than a fabricated 0%.
 func usageSuffix(hasUsage bool, used5, used7 float64) string {
 	if !hasUsage {
 		return ""
@@ -403,8 +363,6 @@ func usageSuffix(hasUsage bool, used5, used7 float64) string {
 	return dimStyle.Render(" · 5h ") + pct5 + dimStyle.Render(" used · 7d ") + pct7 + dimStyle.Render(" used")
 }
 
-// daemonAccountName resolves a daemon SelectedID to a display name, degrading to
-// "account" when the id is nil or unknown.
 func daemonAccountName(m *pool.Manager, id *int) string {
 	if id != nil {
 		if a, err := m.Store.GetAccount(*id); err == nil {
@@ -414,22 +372,16 @@ func daemonAccountName(m *pool.Manager, id *int) string {
 	return "account"
 }
 
-// clockLayout is the shared spelling for every human-facing wall-clock time in
-// the status UI: 12-hour with AM/PM, e.g. "3:58 PM".
+// clockLayout is the one layout for every human-facing clock in the status UI.
 const clockLayout = "3:04 PM"
 
-// humanizeReset renders an absolute rate-limit reset time in the user's local
-// zone with smart day context — "3:58 PM" today, "tomorrow 3:58 PM", "Tue 3:58
-// PM" within the week, "Jun 10, 3:58 PM" beyond. The zero time (no active
-// window) renders "-".
+// humanizeReset renders a reset time; the zero time (no active window) is "-".
 func humanizeReset(t time.Time) string {
 	return humanizeResetAt(t, time.Now())
 }
 
-// humanizeResetAt is humanizeReset with an injectable now for deterministic
-// tests. Both ends are normalized to Local so the clock and day arithmetic match
-// the user's wall clock regardless of the zone the reset arrived in (the /usage
-// RFC3339 path and the daemon's JSON can carry a non-local offset).
+// humanizeResetAt is humanizeReset with an injectable now. Both ends normalize
+// to Local: the /usage RFC3339 path and daemon JSON can carry non-local offsets.
 func humanizeResetAt(t, now time.Time) string {
 	if t.IsZero() {
 		return "-"
@@ -447,9 +399,8 @@ func humanizeResetAt(t, now time.Time) string {
 	}
 }
 
-// calendarDaysFrom returns the count of whole local calendar days from now to t
-// (0 = same day, 1 = next day, negative = past). Anchoring both ends at local
-// midnight and rounding keeps it correct across DST (a 23h or 25h day).
+// calendarDaysFrom counts whole local calendar days from now to t (0 = same
+// day, negative = past). Midnight anchors + rounding stay correct across DST.
 func calendarDaysFrom(now, t time.Time) int {
 	y0, m0, d0 := now.Date()
 	y1, m1, d1 := t.Date()

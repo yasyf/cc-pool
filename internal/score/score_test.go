@@ -27,17 +27,14 @@ func TestRateLimitMakesUnavailable(t *testing.T) {
 
 func TestStaleWhenOld(t *testing.T) {
 	now := time.Now()
-	// Past DisplayStaleAfter (5m), so the displayed Stale flag engages.
 	r := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-10 * time.Minute), Util5h: 0}, now)
 	if !r.Stale {
 		t.Fatal("old sample must be stale")
 	}
 }
 
-// TestDisplayStaleDecoupledFromPenalty pins the decoupling: a sample older than
-// StaleAfter (90s) but younger than DisplayStaleAfter (5m) still takes the
-// scoring penalty yet is NOT shown stale — so a normally-polled account (the
-// daemon polls every ~180s) doesn't flash "stale" between polls.
+// Between StaleAfter (90s) and DisplayStaleAfter (5m) a sample is penalized but
+// not shown stale, so a ~180s daemon poll doesn't flash "stale".
 func TestDisplayStaleDecoupledFromPenalty(t *testing.T) {
 	now := time.Now()
 
@@ -72,7 +69,6 @@ func TestSessionPenalty(t *testing.T) {
 
 func TestRankTieBreakBySoonestReset(t *testing.T) {
 	now := time.Now()
-	// Equal score; account 2 resets sooner -> should rank first.
 	inputs := []Input{
 		{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 50, Util7d: 50, Resets5h: now.Add(2 * time.Hour)},
 		{AccountID: 2, HasUsage: true, SampleTS: now, Util5h: 50, Util7d: 50, Resets5h: now.Add(1 * time.Hour)},
@@ -118,13 +114,13 @@ func TestNeverSampledIsSelectableButPenalized(t *testing.T) {
 	}
 }
 
-// TestHealthyEqualsBaseline: a healthy account (windows far from reset, above
-// the barrier knee, no measured burn) scores exactly the baseline formula.
+// Healthy inputs (far from reset, above the barrier knee, no burn) trip no
+// guards, so the score is the exact baseline formula.
 func TestHealthyEqualsBaseline(t *testing.T) {
 	now := time.Now()
 	in := Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 40, Util7d: 30}
 	got := Score(in, now).Score
-	want := W5h*(100-40) + W7d*(100-30) // no penalties, no guards
+	want := W5h*(100-40) + W7d*(100-30)
 	if got != want {
 		t.Fatalf("healthy score = %.4f, want baseline %.4f", got, want)
 	}
@@ -142,10 +138,8 @@ func TestImminentResetRanksUp(t *testing.T) {
 	}
 }
 
-// TestSevenDayCreditCapped: a 7-day reset days away earns no credit — its
-// effective remaining equals the plain remaining — while a reset within
-// MaxResetCreditHorizon still lifts it. Before the cap, a reset 2.5 days out
-// forgave ~65% of weekly usage and inflated the rank.
+// Reset credit applies only within MaxResetCreditHorizon — a 7d reset days away
+// earns none.
 func TestSevenDayCreditCapped(t *testing.T) {
 	now := time.Now()
 	farReset := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util7d: 73, Resets7d: now.Add(59 * time.Hour)}, now)
@@ -158,8 +152,8 @@ func TestSevenDayCreditCapped(t *testing.T) {
 	}
 }
 
-// TestBarrierGuardsLowSevenDay: a 5h-rich account whose 7-day window is nearly
-// exhausted must rank below a balanced peer (the weighted sum alone would mask it).
+// Without the barrier, the weighted sum would mask a nearly-exhausted 7d window
+// behind 5h headroom.
 func TestBarrierGuardsLowSevenDay(t *testing.T) {
 	now := time.Now()
 	lowWeekly := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 10, Util7d: 92}, now)
@@ -184,8 +178,6 @@ func TestBurnRateRunwayDownranks(t *testing.T) {
 	}
 }
 
-// TestZeroKnobsReproduceBaseline: disabling the guards recovers the exact
-// baseline even for an account that would otherwise trip them.
 func TestZeroKnobsReproduceBaseline(t *testing.T) {
 	defer restoreKnobs(BarrierKnee, RunwayWeight)
 	BarrierKnee, RunwayWeight = 0, 0
@@ -210,8 +202,7 @@ func TestUsableForSticky(t *testing.T) {
 		{"rate-limited despite headroom", Result{Available: false, Components: Components{RawRemaining5h: 90}}, false},
 		{"just below floor", Result{Available: true, Components: Components{RawRemaining5h: StickyMinRemaining5h - 0.1}}, false},
 		{"exactly at floor", Result{Available: true, Components: Components{RawRemaining5h: StickyMinRemaining5h}}, true},
-		// The incident shape: exhausted with an imminent reset — eff5 is high but
-		// the pin must be abandoned. Raw remaining, not eff, drives the floor.
+		// The 2026-06-10 incident shape (see TestIncidentRegression20260610).
 		{"exhausted despite high eff5", Result{
 			Available: false, Exhausted: true,
 			Components: Components{Eff5: 93, RawRemaining5h: 0},
@@ -289,9 +280,7 @@ func TestExhaustedGate(t *testing.T) {
 	}
 }
 
-// TestExhaustedUntilBindingReset: recovery is the latest reset among the
-// windows that tripped the gate — a 7d-exhausted account does not recover at
-// its (sooner) 5h reset.
+// Recovery is the latest reset among the windows that tripped the gate.
 func TestExhaustedUntilBindingReset(t *testing.T) {
 	now := time.Now()
 	reset5, reset7 := now.Add(20*time.Minute), now.Add(3*24*time.Hour)
@@ -321,9 +310,8 @@ func TestExhaustedUntilBindingReset(t *testing.T) {
 	}
 }
 
-// TestRawRemainingSelfLiftsAtReset: a stale pegged sample whose reset has
-// passed must not barrier, runway-penalize, or sticky-floor the account — the
-// window already refilled, mirroring the gate's and windowFrac's self-lift.
+// A stale pegged sample past its reset has already refilled: raw remaining
+// self-lifts like the gate and windowFrac.
 func TestRawRemainingSelfLiftsAtReset(t *testing.T) {
 	now := time.Now()
 	r := Score(Input{
@@ -333,8 +321,7 @@ func TestRawRemainingSelfLiftsAtReset(t *testing.T) {
 	if r.Components.RawRemaining5h != 100 {
 		t.Fatalf("raw remaining must self-lift at the reset, got %.1f", r.Components.RawRemaining5h)
 	}
-	// The refilled window scores exactly like a genuinely-full one with the
-	// same burn (the burn-derived runway penalty legitimately remains).
+	// The burn-derived runway penalty legitimately remains — hence the same-burn control.
 	full := Score(Input{
 		AccountID: 1, HasUsage: true, SampleTS: now.Add(-2 * time.Minute),
 		Util5h: 0, Burn5hPerHour: 50,
@@ -346,7 +333,6 @@ func TestRawRemainingSelfLiftsAtReset(t *testing.T) {
 	if !UsableForSticky(r) {
 		t.Fatal("a sticky pin must survive the post-reset poll gap")
 	}
-	// Control: the same sample pre-reset keeps the full penalties.
 	pre := Score(Input{
 		AccountID: 2, HasUsage: true, SampleTS: now,
 		Util5h: 100, Resets5h: now.Add(time.Minute), Burn5hPerHour: 50,
@@ -356,9 +342,8 @@ func TestRawRemainingSelfLiftsAtReset(t *testing.T) {
 	}
 }
 
-// TestBarrierOnRawRemaining pins the fix: a pegged window with an imminent
-// reset takes the FULL barrier penalty — the reset credit (eff5≈93) must not
-// mask zero current headroom. The old eff-based barrier was exactly 0 here.
+// Reset credit (eff5≈93) must not mask zero current headroom: a pegged window
+// takes the full barrier despite an imminent reset.
 func TestBarrierOnRawRemaining(t *testing.T) {
 	now := time.Now()
 	pegged := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 100, Resets5h: now.Add(21 * time.Minute)}, now)
@@ -374,12 +359,10 @@ func TestBarrierOnRawRemaining(t *testing.T) {
 	}
 }
 
-// TestRunwayUsesRawRemaining: time-to-wall is raw remaining over burn; the
-// reset-credited eff5 understated the penalty for a nearly-pegged window.
+// Time-to-wall is raw remaining over burn, not the reset-credited eff5.
 func TestRunwayUsesRawRemaining(t *testing.T) {
 	now := time.Now()
 	r := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 95, Resets5h: now.Add(10 * time.Minute), Burn5hPerHour: 30}, now)
-	// raw5=5 → runway 5/30 h ≈ 0.167h → frac = 1 − 0.167/5 → penalty ≈ 14.5.
 	want := RunwayWeight * (1 - (5.0/30.0)/RunwayHorizon.Hours())
 	if got := r.Components.RunwayPenalty; got != want {
 		t.Fatalf("runway penalty = %.4f, want %.4f (raw-remaining based)", got, want)
@@ -416,9 +399,9 @@ func TestPickFallback(t *testing.T) {
 }
 
 // TestIncidentRegression20260610 replays the real 2026-06-10 05:18 selection
-// (from ~/.cc-pool/pool.db forensics) where acct-1 — 100% 5h-used, reset 21
-// minutes out — outranked acct-2 (31% used) via reset credit and was launched,
-// silently billing extra-usage credits. It must never be picked again.
+// (from ~/.cc-pool/pool.db) where acct-1 (100% 5h-used, reset 21m out) outranked
+// acct-2 (31% used) via reset credit and was launched, silently billing
+// extra-usage credits. It must never be picked again.
 func TestIncidentRegression20260610(t *testing.T) {
 	now := time.Now()
 	in21m, in2h42m, in4h41m := now.Add(21*time.Minute), now.Add(2*time.Hour+42*time.Minute), now.Add(4*time.Hour+41*time.Minute)
@@ -469,9 +452,9 @@ func TestIncidentRegression20260610(t *testing.T) {
 	}
 }
 
-// TestScoreNeedsLoginExcluded pins that a signed-out account is unavailable, is
-// skipped by both Pick and PickFallback (it has no valid token at all), and the
-// penalty is recorded — even when its raw headroom is full.
+// TestScoreNeedsLoginExcluded pins that a needs-login account has no valid
+// token, so it is unavailable and skipped by both Pick and PickFallback even at
+// full raw headroom.
 func TestScoreNeedsLoginExcluded(t *testing.T) {
 	now := time.Now()
 	r := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 0, NeedsLogin: true}, now)
@@ -482,8 +465,6 @@ func TestScoreNeedsLoginExcluded(t *testing.T) {
 		t.Fatalf("needs-login penalty not recorded: %+v", r)
 	}
 
-	// A needs-login account loses selection to a healthy one and is not even a
-	// fallback when it is the only non-rate-limited account.
 	inputs := []Input{
 		{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 0, NeedsLogin: true},
 		{AccountID: 2, HasUsage: true, SampleTS: now, Util5h: 50},

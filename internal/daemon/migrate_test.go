@@ -23,14 +23,10 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// fakeFuseProv stands in for the fuse provider so handler-level conversion
-// runs without a live mount. Mechanics (file moves, identity verification,
-// rollback ordering) are pinned by internal/pool's convert tests; these tests
-// pin the daemon's gating and wiring. The fn seams override the static errors
-// when set and run outside the fake's lock so they may inspect the fake.
+// fakeFuseProv: fn seams run outside the lock so they may inspect the fake.
 type fakeFuseProv struct {
 	mu          sync.Mutex
-	calls       []string // "setup"/"teardown" in invocation order
+	calls       []string
 	setups      int
 	teardowns   int
 	healths     int
@@ -101,8 +97,8 @@ func (f *fakeFuseProv) callOrder() []string {
 	return append([]string(nil), f.calls...)
 }
 
-// fakeOverlayMounted overrides the daemon's kernel-mountpoint seam for one
-// test, restoring it after. Tests using it must not run in parallel.
+// fakeOverlayMounted mutates a package global; callers must not run in
+// parallel.
 func fakeOverlayMounted(t *testing.T, fn func(dir string) bool) {
 	t.Helper()
 	prev := overlayMounted
@@ -110,9 +106,6 @@ func fakeOverlayMounted(t *testing.T, fn func(dir string) bool) {
 	t.Cleanup(func() { overlayMounted = prev })
 }
 
-// newMigrateServer wires newTestServer for migration: hermetic HOME, account
-// dirs that exist on disk, the fake fuse provider behind the Manager seam, and
-// an open fuse gate.
 func newMigrateServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
@@ -130,10 +123,8 @@ func newMigrateServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv) {
 		return &fkoverlay.SymlinkProvider{Spec: s.m.OverlaySpec()}, nil
 	}
 	s.fuseGateFn = func() (fkoverlay.Backend, string) { return fkoverlay.BackendNFS, "" }
-	// SetDefaultOverlayKind's fence keys on real fuse-hosting capability
-	// (pool.CanHostFuse); these conversions run on fakes, so vouch for
-	// hosting explicitly or the post-migrate default recording would fail in
-	// a pure-build test run.
+	// SetDefaultOverlayKind fences on pool.CanHostFuse; vouch explicitly or
+	// recording the post-migrate default fails in pure-build runs.
 	s.m.CanHostFuse = func() bool { return true }
 	return s, dirs, fake
 }
@@ -176,19 +167,15 @@ func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
 	if fake.setupCount() != 2 {
 		t.Fatalf("fuse setups = %d, want 2", fake.setupCount())
 	}
-	// The fresh mounts are visible to selection immediately — the next cache
-	// refresh is up to a full poll away, and an excluded freshly-converted
-	// account would refuse every `ccp run` until then.
+	// Fresh mounts must be selectable immediately, not a poll away.
 	if !s.holder.ready(dirs[1]) || !s.holder.ready(dirs[2]) {
 		t.Fatal("converted accounts not vouched for in the holder cache")
 	}
-	// The new-account default follows the migration.
 	v, ok, err := s.m.Store.GetMeta("overlay_kind")
 	if err != nil || !ok || v != "nfs" {
 		t.Fatalf("meta overlay_kind = %q ok=%v err=%v, want fuse", v, ok, err)
 	}
 
-	// Re-running is free and truthful.
 	resp = s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
 	if !resp.OK {
 		t.Fatalf("re-run failed: %s", resp.Error)
@@ -225,12 +212,9 @@ func TestHandleMigrateReverse(t *testing.T) {
 	if v, _, _ := s.m.Store.GetMeta("overlay_kind"); v != "symlink" {
 		t.Fatalf("meta overlay_kind = %q, want symlink after retreat", v)
 	}
-	// The retreat dropped the cache entries: HolderStatus.Mounts must not keep
-	// counting dismounted mirrors.
 	if got := s.holder.wireStatus().Mounts; got != 0 {
 		t.Fatalf("holder cache still counts %d mount(s) after the retreat", got)
 	}
-	// The dirs are usable symlink accounts again.
 	for _, dir := range dirs {
 		if _, err := os.Readlink(filepath.Join(dir, "plans")); err != nil {
 			t.Fatalf("symlink overlay not re-asserted in %s: %v", dir, err)
@@ -238,21 +222,15 @@ func TestHandleMigrateReverse(t *testing.T) {
 	}
 }
 
-// TestHandleMigrateToFuseRecordsDefaultWithoutConversions pins the
-// `ccp fuse enable` empty/already-fuse case: migrating toward fuse records fuse
-// as the new-account default even when no account needs converting, because the
-// fuse gate passing already proves this machine can mount. (A symlink retreat,
-// by contrast, only flips the default when an account actually converts back —
-// see TestHandleMigrateReverse.)
+// TestHandleMigrateToFuseRecordsDefaultWithoutConversions: the passing gate
+// proves the machine can mount, so zero conversions still records the default.
 func TestHandleMigrateToFuseRecordsDefaultWithoutConversions(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 
-	// First migrate converts both accounts and records fuse as the default.
 	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse")); !resp.OK {
 		t.Fatalf("initial migrate failed: %s", resp.Error)
 	}
-	// Drift the recorded default back to symlink while the accounts stay fuse —
-	// standing in for a fresh pool whose fuse migrate converts nothing.
+	// Stands in for a fresh pool whose fuse migrate converts nothing.
 	if err := s.m.Store.SetMeta("overlay_kind", "symlink"); err != nil {
 		t.Fatal(err)
 	}
@@ -293,8 +271,7 @@ func TestHandleMigrateValidation(t *testing.T) {
 	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "zfs")); resp.OK || !strings.Contains(resp.Error, "unknown overlay target") {
 		t.Fatalf("unknown backend: %+v", resp)
 	}
-	// The wire vocabulary is the user's coarse words (fuse/symlink); a concrete
-	// fuse backend name is never sent by the CLI and is rejected.
+	// The wire carries only coarse fuse/symlink; concrete backend names are rejected.
 	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "nfs")); resp.OK || !strings.Contains(resp.Error, "unknown overlay target") {
 		t.Fatalf(`concrete backend "nfs" must be rejected on the wire: %+v`, resp)
 	}
@@ -340,8 +317,6 @@ func TestHandleMigrateBusyWhenReserved(t *testing.T) {
 		t.Fatal("busy refusal leaked a converting claim")
 	}
 
-	// Reservation expired: the sweep picks up the straggler — the rollout's
-	// re-run-as-sessions-free-up loop.
 	s.mu.Lock()
 	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
 	s.mu.Unlock()
@@ -382,7 +357,7 @@ func TestConvertClaimExcludesReservations(t *testing.T) {
 func TestSelectSkipsConvertingAccount(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 
-	// acct-1 is the emptier (better) account; converting must hide it.
+	// acct-1 is the emptier account; converting must hide it.
 	if !s.beginConvert(1) {
 		t.Fatal("beginConvert failed")
 	}
@@ -410,7 +385,7 @@ func TestSelectExcludesUnmountedFuseAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "nfs" // row says fuse, but nothing is mounted at the dir
+	a.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -427,9 +402,8 @@ func TestSelectExcludesUnmountedFuseAccount(t *testing.T) {
 	}
 }
 
-// TestFallbackToSymlinkRestoresPrivateFiles is the regression test for the
-// stranding bug: the pre-fix fallback flipped the row to symlink but left the
-// account's .claude.json identity behind in the fuse private backing dir.
+// TestFallbackToSymlinkRestoresPrivateFiles: the row flip must not strand
+// .claude.json in the fuse private backing dir.
 func TestFallbackToSymlinkRestoresPrivateFiles(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	a, err := s.m.Store.GetAccount(1)
@@ -461,7 +435,6 @@ func TestFallbackToSymlinkRestoresPrivateFiles(t *testing.T) {
 		t.Fatal("emptied private root not removed")
 	}
 
-	// Twin negative: a wedged unmount must abort the fallback untouched.
 	a, _ = s.m.Store.GetAccount(2)
 	a.OverlayKind = "nfs"
 	if err := s.m.Store.UpsertAccount(a); err != nil {
@@ -489,11 +462,8 @@ func TestFallbackToSymlinkRestoresPrivateFiles(t *testing.T) {
 	}
 }
 
-// TestFallbackToSymlinkClaimAtomicAgainstSelect pins the fallback's claim
-// atomicity: the converting claim is taken BEFORE the idle scan (the migrate
-// path's claim-first order), so a select cannot reserve the account between
-// the gate and ConvertOverlay's force-unmount. The scan seam doubles as the
-// mid-fallback select: a tryReserve issued from inside it must be refused.
+// TestFallbackToSymlinkClaimAtomicAgainstSelect: the converting claim precedes
+// the idle scan, so no select can reserve between the gate and force-unmount.
 func TestFallbackToSymlinkClaimAtomicAgainstSelect(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 	a, err := s.m.Store.GetAccount(1)
@@ -529,8 +499,7 @@ func TestFallbackToSymlinkClaimAtomicAgainstSelect(t *testing.T) {
 func TestReconcileOverlaysHealsStrandedAndFallsBack(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 
-	// acct-1: symlink row with an identity stranded by an interrupted
-	// conversion — startup must restore it.
+	// acct-1: identity stranded by an interrupted conversion.
 	priv1 := fkoverlay.FusePrivateRoot(dirs[1])
 	if err := os.MkdirAll(priv1, 0o700); err != nil {
 		t.Fatal(err)
@@ -539,9 +508,8 @@ func TestReconcileOverlaysHealsStrandedAndFallsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// acct-2: fuse row whose mirror is down (Health fails) and whose mount
-	// cannot come up — startup must fall back to a fully usable symlink
-	// account rather than adopting.
+	// acct-2: mirror down and mount cannot come up — must fall back to a
+	// usable symlink account, not adopt.
 	a2, err := s.m.Store.GetAccount(2)
 	if err != nil {
 		t.Fatal(err)
@@ -573,9 +541,8 @@ func TestReconcileOverlaysHealsStrandedAndFallsBack(t *testing.T) {
 	}
 }
 
-// TestConvertClaimExcludesPolling pins the two-sided scheduler exclusion: a
-// poll iteration owns the dir against conversions, and vice versa — the
-// check-then-act hole a plain isConverting test left open.
+// TestConvertClaimExcludesPolling: poll and convert claims exclude each other
+// both ways — a bare isConverting check would be check-then-act racy.
 func TestConvertClaimExcludesPolling(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 
@@ -612,10 +579,8 @@ func TestConvertClaimExcludesPolling(t *testing.T) {
 	s.endPoll(2)
 }
 
-// TestMountFuseSweepsUnderlay pins crash recovery for a conversion killed
-// between its file moves and its row flip: private files left in the mount
-// underlay must be swept into the backing dir BEFORE mounting, or the mirror
-// would shadow the identity and a session would mint a divergent one.
+// TestMountFuseSweepsUnderlay: underlay private files (a conversion killed
+// pre-flip) must be swept before mounting or the mirror shadows the identity.
 func TestMountFuseSweepsUnderlay(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	a, err := s.m.Store.GetAccount(1)
@@ -641,9 +606,8 @@ func TestMountFuseSweepsUnderlay(t *testing.T) {
 		t.Fatalf("setups = %d, want 1", fake.setupCount())
 	}
 
-	// A wrong-backend injected fake must be refused loudly, never mounted
-	// through — the real resolver always yields a fuse provider, so the fence
-	// guards against fakes that would run symlink code on fuse paths.
+	// The real resolver always yields a fuse provider; the fence refuses
+	// injected fakes that would run symlink code on fuse paths.
 	s.m.OverlayFor = func(_ fkoverlay.Backend) (fkoverlay.Provider, error) {
 		return &fkoverlay.SymlinkProvider{Spec: s.m.OverlaySpec()}, nil
 	}
@@ -652,10 +616,9 @@ func TestMountFuseSweepsUnderlay(t *testing.T) {
 	}
 }
 
-// TestMountReady pins the readiness gate: a fuse row trusts ONLY the holder
-// cache (never a filesystem stat — an lstat through a dead fuse-t mount can
-// hang the select path), and a non-fuse row needs the absence of a mountpoint
-// (one under a symlink row is an aborted rollback's wreckage).
+// TestMountReady: a fuse row trusts ONLY the holder cache (an lstat through a
+// dead fuse-t mount can hang select); a non-fuse row needs no mountpoint (one
+// is aborted-rollback wreckage).
 func TestMountReady(t *testing.T) {
 	const dir = "/pool/acct-01"
 	fuse := store.Account{OverlayKind: "nfs", ConfigDir: dir}
@@ -676,9 +639,8 @@ func TestMountReady(t *testing.T) {
 		"fuse healthy but listed dead": {
 			a: fuse, healthy: true, mounts: map[string]bool{dir: false}, kernelMounted: true, want: false,
 		},
-		// THE carcass case: the dir is still a mountpoint per the kernel, but
-		// with the holder dead nothing serves it — selection must never trust
-		// it (the old overlay.Mounted check did).
+		// Carcass: still a mountpoint per the kernel but the dead holder serves
+		// nothing — selection must never trust it.
 		"fuse unhealthy cache ignores a live-looking mountpoint": {
 			a: fuse, healthy: false, mounts: map[string]bool{dir: true}, kernelMounted: true, want: false,
 		},
@@ -703,9 +665,8 @@ func TestMountReady(t *testing.T) {
 	}
 }
 
-// TestHandleMigrateBudgetExhausted pins the out-of-time path: a request whose
-// budget is spent reports the remaining accounts busy instead of overrunning
-// the conn deadline and leaving the client a dead socket.
+// TestHandleMigrateBudgetExhausted: a spent budget reports remaining accounts
+// busy instead of overrunning the conn deadline and dead-socketing the client.
 func TestHandleMigrateBudgetExhausted(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
 	s.migrateBudget = time.Nanosecond
@@ -727,9 +688,8 @@ func TestHandleMigrateBudgetExhausted(t *testing.T) {
 	}
 }
 
-// TestConvertAccountForceStillRespectsReservations pins --force's boundary:
-// it skips only the live-session gate. A reservation means a claude is
-// launching into the dir right now — force must not override it.
+// TestConvertAccountForceStillRespectsReservations: force skips only the
+// live-session gate — a reservation means a claude is launching right now.
 func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
 	if !s.tryReserve(1) {
@@ -747,8 +707,7 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 		t.Fatal("forced conversion ran over a live reservation")
 	}
 
-	// Force flows through the wire: with the reservation expired, a forced
-	// sweep converts both accounts.
+	// Force must flow through the wire path too.
 	s.mu.Lock()
 	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
 	s.mu.Unlock()
@@ -761,12 +720,8 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	}
 }
 
-// TestMigrateToSymlinkDefersUnderLiveSession pins the user-initiated retreat's
-// live-session gate: convertAccount(force=false) on a fuse row with a live
-// session refuses (MigrationBusy) and never tears the mirror down, while
-// force=true — the user vouching the session is idle — converts. This is the
-// migrate-path twin of the autonomous force-unmount gate; both refuse to yank a
-// busy NFS mirror out from under a live claude.
+// TestMigrateToSymlinkDefersUnderLiveSession: a retreat never yanks the mirror
+// from under a live claude; force means the user vouches the session is idle.
 func TestMigrateToSymlinkDefersUnderLiveSession(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	a := flipToFuse(t, s, 1)
@@ -774,7 +729,6 @@ func TestMigrateToSymlinkDefersUnderLiveSession(t *testing.T) {
 		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 	}
 
-	// force=false: the live session defers the retreat untouched.
 	res := s.convertAccount(t.Context(), a, fkoverlay.BackendSymlink, false)
 	if res.Outcome != MigrationBusy {
 		t.Fatalf("outcome = %s (%s), want busy under a live session", res.Outcome, res.Detail)
@@ -786,7 +740,6 @@ func TestMigrateToSymlinkDefersUnderLiveSession(t *testing.T) {
 		t.Fatalf("teardowns under a deferred migrate = %d, want 0", fake.teardownCount())
 	}
 
-	// force=true: the user vouches the session is idle; the retreat proceeds.
 	res = s.convertAccount(t.Context(), a, fkoverlay.BackendSymlink, true)
 	if res.Outcome != MigrationDone {
 		t.Fatalf("forced outcome = %s (%s), want done", res.Outcome, res.Detail)
@@ -796,9 +749,8 @@ func TestMigrateToSymlinkDefersUnderLiveSession(t *testing.T) {
 	}
 }
 
-// TestConvertAccountRefetchesRow pins the stale-snapshot fix: the row is
-// re-read under the claim, so a kind that changed since the caller's list is
-// honored instead of double-converting (or converting from a wrong source).
+// TestConvertAccountRefetchesRow: the row is re-read under the claim, so a
+// kind that changed since the caller's snapshot cannot double-convert.
 func TestConvertAccountRefetchesRow(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
 	stale, err := s.m.Store.GetAccount(1)
@@ -820,8 +772,7 @@ func TestConvertAccountRefetchesRow(t *testing.T) {
 	}
 }
 
-// TestPollOnceSkipsConvertingAccount mirrors the reserved-account refresh test:
-// an account mid-conversion must see no overlay sync, no refresh, no adoption.
+// TestPollOnceSkipsConvertingAccount: no sync, refresh, or adoption mid-conversion.
 func TestPollOnceSkipsConvertingAccount(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s, _ := newTestServer(t)
@@ -868,10 +819,8 @@ func TestPollOnceSkipsConvertingAccount(t *testing.T) {
 	}
 }
 
-// TestReconcileAdoptsLiveMount pins the daemon-restart common case: a fuse row
-// whose mirror is already live (the detached holder survived the restart) is
-// adopted untouched — no teardown, no sweep, no remount — and vouched for in
-// the holder cache directly, not left to the startup refresh's snapshot.
+// TestReconcileAdoptsLiveMount: a mirror the detached holder kept live across
+// a daemon restart is adopted untouched and vouched in the holder cache.
 func TestReconcileAdoptsLiveMount(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	var buf bytes.Buffer
@@ -894,25 +843,22 @@ func TestReconcileAdoptsLiveMount(t *testing.T) {
 	if !strings.Contains(buf.String(), fmt.Sprintf("acct-%02d adopted live mount", a.ID)) {
 		t.Fatalf("adoption not logged: %q", buf.String())
 	}
-	// The adopt path vouches in place: the startup refresh ran against a dead
-	// holder socket here (markUnhealthy), so only noteMounted can explain a
-	// ready dir — a live mirror implies the holder serving it.
+	// The startup refresh ran against a dead holder socket (markUnhealthy), so
+	// only the adopt path's noteMounted can explain a ready dir.
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("adopted mount not vouched for in the holder cache")
 	}
 }
 
-// TestMountFuseClearsDeadMountThenSweepsThenMounts pins mountFuse's fixed
-// order: a mounted-but-dead mirror comes down first, then the (now unmounted)
-// underlay is swept, then Setup — and the fresh mount lands in the holder
-// cache so a select before the next poll trusts it.
+// TestMountFuseClearsDeadMountThenSweepsThenMounts: the fixed order, plus the
+// fresh mount is vouched so a select before the next poll trusts it.
 func TestMountFuseClearsDeadMountThenSweepsThenMounts(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	a, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
+	a.OverlayKind = "nfs"
 	if err := os.WriteFile(filepath.Join(dirs[1], ".claude.json"), []byte("underlay-identity"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -922,8 +868,6 @@ func TestMountFuseClearsDeadMountThenSweepsThenMounts(t *testing.T) {
 	fake.healthErr = errors.New("mirror is dead")
 	fake.teardownFn = func(string, string) error { mounted.Store(false); return nil }
 	fake.setupFn = func(string, string) error {
-		// The sweep must complete before the mount: the identity must already
-		// be in the backing dir, or the mirror would shadow it.
 		if _, err := os.Stat(filepath.Join(fkoverlay.FusePrivateRoot(dirs[1]), ".claude.json")); err != nil {
 			return fmt.Errorf("setup ran before the sweep: %w", err)
 		}
@@ -944,16 +888,14 @@ func TestMountFuseClearsDeadMountThenSweepsThenMounts(t *testing.T) {
 	}
 }
 
-// TestMountFuseWedgedPreClearAborts pins the never-through-a-wedge rule: when
-// the dead mount will not come down, mountFuse returns the error without
-// sweeping or mounting.
+// TestMountFuseWedgedPreClearAborts: never sweep or mount through a wedged unmount.
 func TestMountFuseWedgedPreClearAborts(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	a, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
+	a.OverlayKind = "nfs"
 	if err := os.WriteFile(filepath.Join(dirs[1], ".claude.json"), []byte("underlay-identity"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -976,17 +918,15 @@ func TestMountFuseWedgedPreClearAborts(t *testing.T) {
 	}
 }
 
-// TestMountFuseForeignCarcassClearedAndRetriedOnce pins the dead-holder
-// carcass contract from step 4: Setup's foreign-mount refusal is answered with
-// a Teardown (whose registry-miss path clears the carcass) and exactly one
-// sweep+Setup retry.
+// TestMountFuseForeignCarcassClearedAndRetriedOnce: Teardown's registry-miss
+// path clears the carcass; exactly one sweep+Setup retry answers the refusal.
 func TestMountFuseForeignCarcassClearedAndRetriedOnce(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	a, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
+	a.OverlayKind = "nfs"
 	var foreign atomic.Bool
 	foreign.Store(true)
 	fake.setupFn = func(_, dir string) error {
@@ -1008,18 +948,16 @@ func TestMountFuseForeignCarcassClearedAndRetriedOnce(t *testing.T) {
 	}
 }
 
-// TestMountFuseBaseMismatchClearedAndRetriedOnce pins the ErrBaseMismatch
-// routing: a holder registry row pinning a different base is registry state,
-// not a mount verdict — it gets the same unmount-then-retry treatment as a
-// foreign carcass (the holder's handleUnmount tears down by its registered
-// base), never the gated symlink conversion.
+// TestMountFuseBaseMismatchClearedAndRetriedOnce: a mismatched base is registry
+// state, not a mount verdict — unmount-then-retry (the holder tears down by its
+// registered base), never the gated symlink conversion.
 func TestMountFuseBaseMismatchClearedAndRetriedOnce(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	a, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
+	a.OverlayKind = "nfs"
 	var mismatched atomic.Bool
 	mismatched.Store(true)
 	fake.setupFn = func(_, dir string) error {
@@ -1041,16 +979,14 @@ func TestMountFuseBaseMismatchClearedAndRetriedOnce(t *testing.T) {
 	}
 }
 
-// TestMountFusePersistentForeignFailsAfterOneRetry is the twin negative: a dir
-// that stays foreign after the teardown surfaces the error — exactly one
-// retry, never a loop.
+// TestMountFusePersistentForeignFailsAfterOneRetry: exactly one retry, never a loop.
 func TestMountFusePersistentForeignFailsAfterOneRetry(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	a, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.OverlayKind = "nfs" // mountFuse resolves the provider from the row's kind
+	a.OverlayKind = "nfs"
 	fake.setupErr = fmt.Errorf("mount %s: %w", dirs[1], mountd.ErrForeignMount)
 
 	merr := s.mountFuse(t.Context(), a)
@@ -1065,11 +1001,9 @@ func TestMountFusePersistentForeignFailsAfterOneRetry(t *testing.T) {
 	}
 }
 
-// TestHealFuseTaxonomy pins the mount-failure classification: transient holder
-// conditions (unreachable holder, busy dir) and a mount blocked pending the
-// TCC grant never convert — they retry next poll — and only a genuine mount
-// failure falls back to symlink, gated on the account being idle (no live
-// session, no reservation, and never on a failed scan).
+// TestHealFuseTaxonomy: transient holder conditions and TCC blocks retry next
+// poll; only a genuine mount failure converts, gated on provable idleness (a
+// failed scan fails closed).
 func TestHealFuseTaxonomy(t *testing.T) {
 	cases := map[string]struct {
 		setupErr    error
@@ -1083,9 +1017,8 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			setupErr:    fmt.Errorf("mount: %w", mountd.ErrHolderUnavailable),
 			wantOutcome: healRetry, wantKind: "nfs",
 		},
-		// The exact chain the production spawn leg produces (RemoteProvider.Setup
-		// wrapping EnsureRunning's come-up timeout): a holder spawn blip must
-		// land in the retry arm, never the conversion arm.
+		// The exact chain RemoteProvider.Setup wrapping EnsureRunning's timeout
+		// produces: a spawn blip retries, never converts.
 		"spawn timeout (holder unavailable chain) retries next poll": {
 			setupErr: fmt.Errorf("mount /pool/acct-01: %w",
 				fmt.Errorf("%w: mount holder did not come up on /tmp/m.sock within 5s; check /tmp/holder.log", mountd.ErrHolderUnavailable)),
@@ -1100,30 +1033,25 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			wantOutcome: healTCCBlocked, wantKind: "nfs", wantTCC: true,
 		},
 		// A wedged unmount is no more a mount verdict than ErrBusy — and the
-		// fallback's ConvertOverlay would hit the same wedge, so converting
-		// would fail closed every poll for nothing.
+		// fallback's ConvertOverlay would hit the same wedge.
 		"wedged unmount retries next poll": {
 			setupErr:    fmt.Errorf("mount: %w", overlay.ErrUnmountWedged),
 			wantOutcome: healRetry, wantKind: "nfs",
 		},
-		// The exact chain overlayClass produces for a mount-up timeout under a
-		// proven "Network Volumes" grant: transient fuse-t slowness, never the
-		// TCC condition. wantTCC false is the load-bearing negative — pre-fix,
-		// every timeout recorded TCC guidance and waited on the grant copy.
+		// The exact chain overlayClass produces for a timeout under a proven
+		// grant; wantTCC false is the load-bearing negative.
 		"mount timeout (proven grant) retries without recording TCC": {
 			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountTimeout, mountd.ErrMountTimeout)),
 			wantOutcome: healRetry, wantKind: "nfs", wantTCC: false,
 		},
-		// Forward skew: a newer holder's error class this daemon predates is
-		// unclassifiable — the protocol's sanctioned extension path must read
-		// as retry, never as the mount failure that converts.
+		// Forward skew: an unknown class from a newer holder must read as
+		// retry, never the mount failure that converts.
 		"unknown holder error class retries next poll": {
 			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w (quota-exceeded): per-account quota exhausted", mountd.ErrUnknownClass)),
 			wantOutcome: healRetry, wantKind: "nfs",
 		},
-		// The skew matrix's degrade path: a pre-fix daemon receiving the new
-		// "mount-timeout" class reads it as ErrUnknownClass — which the
-		// additive policy routes to retry, never to the conversion arm.
+		// Skew degrade: an older daemon reads the new "mount-timeout" class as
+		// ErrUnknownClass, which routes to retry.
 		"mount-timeout class on a pre-fix daemon degrades to retry": {
 			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w (mount-timeout): fuse mount did not come up in time", mountd.ErrUnknownClass)),
 			wantOutcome: healRetry, wantKind: "nfs",
@@ -1191,12 +1119,8 @@ func TestHealFuseTaxonomy(t *testing.T) {
 	}
 }
 
-// TestHealFuseSweepFailureRetries pins the errSweepStranded gate: a failure in
-// mountFuse's pre-Setup sweep of stranded private files is not a mount verdict,
-// so it retries next poll instead of irreversibly demoting the account to
-// symlink. A file-vs-directory private-entry collision — which
-// MovePrivateEntries refuses loudly, and which the symlink retreat would hit
-// the same way — is the deterministic trigger.
+// TestHealFuseSweepFailureRetries: a pre-Setup sweep failure (errSweepStranded)
+// is not a mount verdict — retry next poll, never demote to symlink.
 func TestHealFuseSweepFailureRetries(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	fake.setupErr = nil // Setup must never be reached; the sweep fails first.
@@ -1210,9 +1134,7 @@ func TestHealFuseSweepFailureRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A private file in the underlay collides with a private DIR of the same
-	// name in the backing root: moveEntry refuses the file-vs-dir clash, so the
-	// sweep fails before Setup is attempted.
+	// moveEntry refuses the file-vs-dir clash, so the sweep fails before Setup.
 	dir := dirs[1]
 	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte("identity"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1235,9 +1157,7 @@ func TestHealFuseSweepFailureRetries(t *testing.T) {
 	}
 }
 
-// TestSelectServesFuseAccountWhenHolderVouches is the positive arm of the
-// carcass fix: a fuse account is selectable exactly when the holder cache
-// vouches for its mirror.
+// TestSelectServesFuseAccountWhenHolderVouches: the carcass gate's positive arm.
 func TestSelectServesFuseAccountWhenHolderVouches(t *testing.T) {
 	s, dirs, _ := newMigrateServer(t)
 	a, err := s.m.Store.GetAccount(1)
@@ -1256,8 +1176,6 @@ func TestSelectServesFuseAccountWhenHolderVouches(t *testing.T) {
 	}
 }
 
-// fuseRowWithCannedHolder flips acct-1 to a fuse row and points the server's
-// holder socket at a canned holder that lists acct-1's mirror live.
 func fuseRowWithCannedHolder(t *testing.T, s *Server, dirs map[int]string) store.Account {
 	t.Helper()
 	a, err := s.m.Store.GetAccount(1)
@@ -1272,11 +1190,9 @@ func fuseRowWithCannedHolder(t *testing.T, s *Server, dirs map[int]string) store
 	return a
 }
 
-// TestSelectColdStartPrimesHolderCacheLazily pins the cold-start window: the
-// daemon socket binds before the startup goroutine primes the holder cache,
-// so a select landing in that window must lazily refresh (bounded socket RPC,
-// no filesystem touch) instead of refusing every fuse account while the
-// detached holder serves the mounts fine.
+// TestSelectColdStartPrimesHolderCacheLazily: the daemon socket binds before
+// the startup prime, so a select in that window lazily refreshes (bounded
+// socket RPC, no filesystem touch) instead of refusing every fuse account.
 func TestSelectColdStartPrimesHolderCacheLazily(t *testing.T) {
 	s, dirs, _ := newMigrateServer(t)
 	fuseRowWithCannedHolder(t, s, dirs)
@@ -1287,8 +1203,7 @@ func TestSelectColdStartPrimesHolderCacheLazily(t *testing.T) {
 		t.Fatalf("cold-start select = %+v, want lazily-primed acct-1 (the emptier account)", resp)
 	}
 
-	// The forced path flows through the same lazy prime — pre-fix it refused
-	// with "fuse mount is not up yet" while the mount served fine.
+	// The forced path flows through the same lazy prime.
 	s2, dirs2, _ := newMigrateServer(t)
 	fuseRowWithCannedHolder(t, s2, dirs2)
 	one := 1
@@ -1298,16 +1213,13 @@ func TestSelectColdStartPrimesHolderCacheLazily(t *testing.T) {
 	}
 }
 
-// TestMountReadyRefreshesOnCacheMiss pins the outside-the-daemon mount edge: a
-// fuse dir absent from a stale cache (a mirror `ccp add` just mounted from the
-// CLI process) triggers one refresh, while a fresh cache rate-limits the
-// round-trip — a genuinely down mount must not turn every select into holder
-// RPCs.
+// TestMountReadyRefreshesOnCacheMiss: a fuse dir mounted outside the daemon (a
+// mirror `ccp add`) misses the stale cache and triggers one refresh; a fresh
+// cache rate-limits so a down mount cannot turn every select into holder RPCs.
 func TestMountReadyRefreshesOnCacheMiss(t *testing.T) {
 	s, dirs, _ := newMigrateServer(t)
 	a := fuseRowWithCannedHolder(t, s, dirs)
 
-	// Fresh cache missing the dir: inside the floor, no refresh — not ready.
 	s.holder.mu.Lock()
 	s.holder.healthy, s.holder.mounts, s.holder.refreshedAt = true, map[string]bool{}, time.Now()
 	s.holder.mu.Unlock()
@@ -1315,7 +1227,6 @@ func TestMountReadyRefreshesOnCacheMiss(t *testing.T) {
 		t.Fatal("a refresh fired inside the rate-limit floor")
 	}
 
-	// Stale cache: the miss refreshes and the fresh mount is picked up.
 	s.holder.mu.Lock()
 	s.holder.refreshedAt = time.Now().Add(-holderRefreshFloor - time.Second)
 	s.holder.mu.Unlock()

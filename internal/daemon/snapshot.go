@@ -9,9 +9,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/overlay"
 )
 
-// writeStatusSnapshot mirrors the status op's view to s.snapshot via
-// temp+rename so a concurrent reader never sees a partial file. Callers log
-// the returned error and continue — a failed mirror must not stall polling.
+// writeStatusSnapshot failure must not stall polling.
 func (s *Server) writeStatusSnapshot(ctx context.Context) error {
 	accts, err := s.statuses(ctx)
 	if err != nil {

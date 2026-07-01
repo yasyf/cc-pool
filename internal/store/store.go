@@ -1,6 +1,5 @@
-// Package store is cc-pool's sole state layer: a modernc.org/sqlite
-// (pure-Go) database holding accounts, usage samples, sessions, and the
-// refresh log. It stores NO secrets — the Keychain is the only secret store.
+// Package store is cc-pool's sole state layer, a pure-Go (modernc.org/sqlite)
+// database. It stores NO secrets — the Keychain is the only secret store.
 package store
 
 import (
@@ -9,7 +8,7 @@ import (
 	"fmt"
 	"time"
 
-	_ "modernc.org/sqlite" // registers the pure-Go "sqlite" database/sql driver
+	_ "modernc.org/sqlite" // pure-Go "sqlite" driver
 )
 
 // Store wraps the sqlite connection.
@@ -84,7 +83,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	db.SetMaxOpenConns(1) // serialize writes; sqlite + WAL is fine for our load
+	db.SetMaxOpenConns(1) // serialize writes
 	s := &Store{db: db}
 	if err := s.applySchema(); err != nil {
 		_ = db.Close()
@@ -165,9 +164,8 @@ func (s *Store) SetAccountLabel(id int, label string) error {
 	return nil
 }
 
-// SetAccountOverlayKind records an account's overlay provider. A targeted
-// UPDATE, not an upsert: overlay conversions must not clobber concurrent row
-// updates (a rename, say) with their stale snapshot of the other columns.
+// SetAccountOverlayKind records an account's overlay provider; a targeted
+// UPDATE so it can't clobber concurrent updates to the row's other columns.
 func (s *Store) SetAccountOverlayKind(id int, kind string) error {
 	res, err := s.db.Exec(`UPDATE accounts SET overlay_kind=? WHERE id=?`, kind, id)
 	if err != nil {
@@ -183,8 +181,6 @@ func (s *Store) SetAccountOverlayKind(id int, kind string) error {
 	return nil
 }
 
-// scanAccount decodes one account row; the parameter is satisfied by both
-// *sql.Row and *sql.Rows.
 func scanAccount(rows interface{ Scan(...any) error }) (Account, error) {
 	var a Account
 	var created int64
@@ -297,8 +293,6 @@ func (s *Store) InsertUsageSample(u UsageSample) error {
 	return err
 }
 
-// scanUsageSample decodes one usage_samples row; the parameter is satisfied by
-// both *sql.Row and *sql.Rows.
 func scanUsageSample(row interface{ Scan(...any) error }) (UsageSample, error) {
 	var u UsageSample
 	var ts int64
@@ -336,10 +330,9 @@ func (s *Store) LatestUsageSample(accountID int) (UsageSample, bool, error) {
 	return u, true, nil
 }
 
-// LatestGoodUsageSample returns the most recent NON-rate-limited sample for an
-// account, or ok=false. A 429 records a zeroed rate_limited placeholder (which
-// the daemon's backoff keys on); display reads through to this last-known-good
-// utilization instead of showing that placeholder's 0%.
+// LatestGoodUsageSample returns the most recent non-rate-limited sample for an
+// account, or ok=false. A 429 stores a zeroed placeholder for the daemon's
+// backoff; this reads through to the last real utilization instead.
 func (s *Store) LatestGoodUsageSample(accountID int) (UsageSample, bool, error) {
 	row := s.db.QueryRow(
 		`SELECT `+usageSampleCols+`
@@ -355,10 +348,8 @@ func (s *Store) LatestGoodUsageSample(accountID int) (UsageSample, bool, error) 
 }
 
 // UsageSamplesSince returns an account's samples at or after since, newest
-// first. The inclusive lower bound is served by idx_usage_acct_ts. A time
-// bound (rather than a row limit) is what the burn estimators need: a fixed
-// limit either over-fetches on a tight cadence or silently under-covers the
-// window after a backoff gap.
+// first. A time bound (not a row limit) keeps burn estimators from
+// under-covering the window after a backoff gap.
 func (s *Store) UsageSamplesSince(accountID int, since time.Time) ([]UsageSample, error) {
 	rows, err := s.db.Query(
 		`SELECT `+usageSampleCols+`
@@ -380,8 +371,7 @@ func (s *Store) UsageSamplesSince(accountID int, since time.Time) ([]UsageSample
 }
 
 // OpenSession records a new checkout at time at and returns its id. cwd is the
-// session's launch directory ("" when unknown), feeding the sticky activity
-// rules.
+// launch directory ("" when unknown), feeding the sticky activity rules.
 func (s *Store) OpenSession(accountID, pid int, configDir, cwd string, at time.Time) (int64, error) {
 	res, err := s.db.Exec(
 		`INSERT INTO sessions(account_id,pid,config_dir,cwd,started_at) VALUES(?,?,?,?,?)`,
@@ -437,26 +427,22 @@ func (s *Store) ListActiveSessions() ([]Session, error) {
 }
 
 // SessionReapGrace is how long a freshly opened session is immune to
-// CloseDeadSessions. `ccp run` marks its checkout before exec'ing into
-// claude, so for a moment the row's pid belongs to a ccp process that no
-// claude-only scan can see; reaping it would instantly fabricate a "session
-// ended" signal for the sticky rules.
+// CloseDeadSessions: `ccp run` marks its checkout before exec'ing into claude,
+// so briefly the pid is a ccp process no claude-only scan sees, and reaping it
+// would fabricate a "session ended" signal for the sticky rules.
 const SessionReapGrace = time.Minute
 
-// touchSession stamps a live session's last observed liveness.
 func (s *Store) touchSession(id int64, at time.Time) error {
 	_, err := s.db.Exec(`UPDATE sessions SET last_seen_at=? WHERE id=? AND ended_at IS NULL`,
 		at.Unix(), id)
 	return err
 }
 
-// CloseDeadSessions reconciles active sessions against the live claude pids
-// in alive, observed at time at: live rows are stamped last-seen, and dead
-// rows older than SessionReapGrace are closed. A dead row's end is stamped at
-// its last observed liveness (falling back to its start) — never at
-// observation time, because a reap after a long observer gap (no daemon
-// polling, no selects) would otherwise fabricate a warm cache for the sticky
-// rules out of a session that died hours ago.
+// CloseDeadSessions reconciles active sessions against the live claude pids in
+// alive at time at: live rows are stamped last-seen, dead rows older than
+// SessionReapGrace are closed. A dead row's end is stamped at its last-seen (or
+// start), never observation time — else a reap after a long observer gap
+// fabricates a warm sticky cache from a session that died hours ago.
 func (s *Store) CloseDeadSessions(alive map[int]bool, at time.Time) (int, error) {
 	sessions, err := s.ListActiveSessions()
 	if err != nil {
@@ -489,10 +475,9 @@ func (s *Store) CloseDeadSessions(alive map[int]bool, at time.Time) (int, error)
 }
 
 // GetCwdActivity aggregates tracked session activity for cwd on one account —
-// the prompt cache a pin protects belongs to a single account, so sessions on
-// other accounts in the same directory neither warm nor hold it. It never
-// returns ErrNoRows: a cwd with no tracked sessions reads as the zero
-// CwdActivity. Only marked sessions count — see the CwdActivity godoc.
+// the prompt cache a pin protects is per-account, so sessions on other accounts
+// in the same directory don't count. Never ErrNoRows: an untracked cwd reads as
+// the zero CwdActivity.
 func (s *Store) GetCwdActivity(cwd string, accountID int) (CwdActivity, error) {
 	var act CwdActivity
 	var lastEnded int64
@@ -509,13 +494,11 @@ func (s *Store) GetCwdActivity(cwd string, accountID int) (CwdActivity, error) {
 	return act, nil
 }
 
-// UpsertSticky records (or refreshes) the account the select path picked for
-// cwd. It is the select-path write and can never downgrade or repoint a manual
-// pin: a conflict repoints/refreshes an auto pin, refreshes a manual pin when
-// the select landed on the pinned account (manual is absent from the SET
-// list), and is a deliberate no-op when a manual pin points elsewhere. One
-// atomic statement — the daemon and a live-path CLI are separate processes, so
-// read-modify-write would race.
+// UpsertSticky is the select-path write recording the account picked for cwd.
+// It never downgrades or repoints a manual pin: a conflict repoints/refreshes
+// an auto pin, refreshes a manual pin only when the select landed on the pinned
+// account, and is a no-op when a manual pin points elsewhere. One atomic
+// statement, since the daemon and a live-path CLI would race a read-modify-write.
 func (s *Store) UpsertSticky(cwd string, accountID int, at time.Time) error {
 	_, err := s.db.Exec(
 		`INSERT INTO sticky(cwd,account_id,selected_at,manual) VALUES(?,?,?,0)
@@ -555,11 +538,9 @@ func (s *Store) DeleteSticky(cwd string) error {
 	return nil
 }
 
-// DeleteStickyVersion removes cwd's pin only if it still matches the version
-// the caller read (selected_at + manual). StickyPick's expired-row hygiene
-// uses this so a concurrent writer (a manual pin from the TUI, a select in
-// another process) can never have its newer row erased on the basis of a
-// stale read.
+// DeleteStickyVersion removes cwd's pin only if it still matches the version the
+// caller read (selected_at + manual), so a concurrent writer's newer row is
+// never erased on a stale read.
 func (s *Store) DeleteStickyVersion(cwd string, selectedAt time.Time, manual bool) error {
 	if _, err := s.db.Exec(
 		`DELETE FROM sticky WHERE cwd=? AND selected_at=? AND manual=?`,
@@ -584,11 +565,10 @@ func (s *Store) GetSticky(cwd string) (Sticky, bool, error) {
 	return st, true, nil
 }
 
-// PruneSticky deletes sticky rows whose last activity predates cutoff,
-// returning the number deleted. Activity is max(selected_at, latest tracked
-// session end in the row's cwd), and a row with a live tracked session
-// survives regardless — the pin expires one TTL after the cache last saw
-// traffic, not after the last select.
+// PruneSticky deletes sticky rows whose last activity predates cutoff, returning
+// the count. Activity is max(selected_at, latest tracked session end in the cwd);
+// a row with a live tracked session always survives, so the pin expires one TTL
+// after the cache last saw traffic, not after the last select.
 func (s *Store) PruneSticky(cutoff time.Time) (int, error) {
 	res, err := s.db.Exec(
 		`DELETE FROM sticky WHERE
@@ -640,7 +620,7 @@ func (s *Store) LastRefresh(accountID int) (RefreshEntry, bool, error) {
 }
 
 // GetAuthHealth returns an account's auth health. An account with no row reads
-// as healthy (NeedsLogin false) — the common case.
+// as healthy (NeedsLogin false).
 func (s *Store) GetAuthHealth(accountID int) (AuthHealth, error) {
 	row := s.db.QueryRow(
 		`SELECT account_id,needs_login,since,last_err FROM auth_health WHERE account_id=?`, accountID)
@@ -660,8 +640,8 @@ func (s *Store) GetAuthHealth(accountID int) (AuthHealth, error) {
 	return h, nil
 }
 
-// ListAuthHealth returns the needs-login accounts keyed by id (healthy accounts
-// are omitted), for the status snapshot to fold over all accounts in one query.
+// ListAuthHealth returns the needs-login accounts keyed by id; healthy accounts
+// are omitted.
 func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
 	rows, err := s.db.Query(`SELECT account_id,needs_login,since,last_err FROM auth_health WHERE needs_login=1`)
 	if err != nil {
@@ -685,12 +665,11 @@ func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
 	return out, rows.Err()
 }
 
-// SetNeedsLogin flags an account as needing interactive re-login, recording the
-// error and stamping Since on the false→true transition only (a repeated flag
-// while already set preserves the original Since, so the timer measures the
-// whole outage). It returns changed=true only on that transition, so the daemon
-// logs the remediation hint exactly once. The daemon's poll loop is the sole
-// writer, so the read-then-write is race-free.
+// SetNeedsLogin flags an account as needing re-login, stamping Since only on the
+// false→true transition (a repeat preserves the original Since, so the timer
+// measures the whole outage) and returning changed=true only then, so the daemon
+// logs the hint once. The daemon poll loop is the sole writer, so the
+// read-then-write is race-free.
 func (s *Store) SetNeedsLogin(accountID int, at time.Time, errMsg string) (bool, error) {
 	prev, err := s.GetAuthHealth(accountID)
 	if err != nil {
@@ -709,8 +688,7 @@ func (s *Store) SetNeedsLogin(accountID int, at time.Time, errMsg string) (bool,
 }
 
 // ClearNeedsLogin clears an account's needs-login flag, returning changed=true
-// only on the true→false transition (a no-op clear of an already-healthy
-// account returns false), so the daemon logs recovery exactly once.
+// only on the true→false transition, so the daemon logs recovery exactly once.
 func (s *Store) ClearNeedsLogin(accountID int) (bool, error) {
 	res, err := s.db.Exec(
 		`UPDATE auth_health SET needs_login=0, since=NULL, last_err='' WHERE account_id=? AND needs_login=1`,

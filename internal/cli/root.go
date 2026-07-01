@@ -28,9 +28,8 @@ pool.`,
 		Version:       version.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		// Args deliberately left nil: cobra's legacyArgs already rejects
-		// unknown subcommands on a root that has children (with suggestions),
-		// so RunE only ever runs for bare `ccp`.
+		// Args deliberately nil: cobra's legacyArgs already rejects unknown
+		// subcommands on a root with children, so RunE only runs for bare `ccp`.
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
 				initialized, err := m.Initialized()
@@ -79,17 +78,14 @@ pool.`,
 	return root
 }
 
-// rootAction is what bare `ccp` does for a given pool state.
 type rootAction int
 
 const (
-	actionStatus rootAction = iota // pool has accounts → show status
-	actionAdd                      // empty pool on a TTY → interactive onboarding
-	actionErr                      // empty pool, no TTY → fail loud
+	actionStatus rootAction = iota
+	actionAdd
+	actionErr
 )
 
-// bareAction routes bare `ccp`: a populated pool shows status; an empty or
-// uninitialized one onboards interactively, or errors when no TTY is attached.
 func bareAction(initialized bool, accounts int, tty bool) rootAction {
 	switch {
 	case initialized && accounts > 0:
@@ -101,7 +97,6 @@ func bareAction(initialized bool, accounts int, tty bool) rootAction {
 	}
 }
 
-// withManager opens a Manager, runs fn, and closes it.
 func withManager(fn func(*pool.Manager) error) error {
 	m, err := pool.Open()
 	if err != nil {
@@ -111,7 +106,6 @@ func withManager(fn func(*pool.Manager) error) error {
 	return fn(m)
 }
 
-// requireInit returns an error if the pool has not been initialized.
 func requireInit(m *pool.Manager) error {
 	ok, err := m.Initialized()
 	if err != nil {

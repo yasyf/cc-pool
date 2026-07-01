@@ -12,8 +12,6 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// overlayFor resolves a backend to a fusekit/overlay provider through the
-// Manager's injectable seam.
 func (m *Manager) overlayFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
 	if m.OverlayFor != nil {
 		return m.OverlayFor(b)
@@ -21,9 +19,8 @@ func (m *Manager) overlayFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
 	return OverlayProviderFor(b)
 }
 
-// detectOverlay resolves overlay-backend detection through the Manager's
-// injectable seam. The Init/add paths that reach it carry no context, so the
-// default detection runs unbounded — Select's own dial/spawn bounds still apply.
+// detectOverlay defaults to unbounded detection: init/add paths carry no context
+// (Select bounds its own dial/spawn).
 func (m *Manager) detectOverlay() (fkoverlay.Backend, string) {
 	if m.DetectOverlay != nil {
 		return m.DetectOverlay()
@@ -31,8 +28,6 @@ func (m *Manager) detectOverlay() (fkoverlay.Backend, string) {
 	return DetectOverlayBackend(context.Background())
 }
 
-// canHostFuse resolves the fuse-hosting capability check through the
-// Manager's injectable seam.
 func (m *Manager) canHostFuse() bool {
 	if m.CanHostFuse != nil {
 		return m.CanHostFuse()
@@ -40,25 +35,14 @@ func (m *Manager) canHostFuse() bool {
 	return CanHostFuse()
 }
 
-// ErrConvertUnsupported means the provider resolved for a conversion's source
-// or target backend does not actually report that backend. The real resolver
-// cannot produce this (a fuse backend always maps to the holder-backed
-// RemoteFuseProvider, which always reports its own backend), so the Backend()
-// fences guard against wrong-backend INJECTED fakes — a conversion that *thinks*
-// it is operating fuse-side while running symlink code paths is exactly how
-// account state gets destroyed. It also fences fuse as the new-account default
-// in builds that cannot host mounts (SetDefaultOverlayKind).
+// ErrConvertUnsupported means a resolved provider does not report the backend it was
+// resolved for; the Backend() fences fail closed because a fuse-side conversion on
+// symlink paths destroys account state.
 var ErrConvertUnsupported = errors.New("overlay backend unavailable")
 
-// ConvertOverlay switches an account's overlay provider: it relocates the
-// account's private files between the providers' private roots, tears down the
-// old overlay, establishes the new one, and persists the row — in that order,
-// with the row flip last, so an interrupted conversion always leaves a re-run
-// that converges. The fuse direction mounts through the detached mount holder
-// but still MUST run inside the daemon, which alone gates the conversion
-// against live sessions and its own reservations. A failed fuse mount is
-// rolled back to a byte-identical symlink overlay before returning.
-// Converting to the backend the account already has is a no-op.
+// ConvertOverlay switches an account's overlay provider, persisting the row last so
+// an interrupted run re-converges. MUST run inside the daemon, which alone gates
+// against live sessions; a failed fuse mount rolls back to symlink.
 func (m *Manager) ConvertOverlay(a store.Account, to fkoverlay.Backend) (store.Account, error) {
 	from, err := fkoverlay.Parse(a.OverlayKind)
 	if err != nil {
@@ -87,9 +71,6 @@ func (m *Manager) ConvertOverlay(a store.Account, to fkoverlay.Backend) (store.A
 	return m.convertToSymlink(a, fromProv, toProv)
 }
 
-// convertToFuse turns a symlink account into a fuse one: private files move to
-// the sibling backing dir, the links come down, the mirror mounts over the
-// (now link-free) account dir, and only then does the row flip.
 func (m *Manager) convertToFuse(a store.Account, symProv, fuseProv fkoverlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
@@ -97,8 +78,7 @@ func (m *Manager) convertToFuse(a store.Account, symProv, fuseProv fkoverlay.Pro
 		return a, fmt.Errorf("convert acct-%02d: %s is already a mountpoint but the row says %s; refusing", a.ID, dir, a.OverlayKind)
 	}
 
-	// The identity to re-verify through the mount. An account that never
-	// completed a login legitimately has none.
+	// An account that never completed a login legitimately has no identity.
 	pre, preErr := readIdentity(filepath.Join(dir, ".claude.json"))
 	if preErr != nil && !errors.Is(preErr, ErrNoIdentity) {
 		return a, fmt.Errorf("convert acct-%02d: read identity before conversion: %w", a.ID, preErr)
@@ -108,17 +88,14 @@ func (m *Manager) convertToFuse(a store.Account, symProv, fuseProv fkoverlay.Pro
 		return a, fmt.Errorf("convert acct-%02d: move private files: %w", a.ID, err)
 	}
 	if err := symProv.Teardown(base, dir); err != nil {
-		// Links may be half-removed; private files are already safe in the
-		// backing dir. Heal/re-run converges from here.
+		// Links may be half-removed, but private files are safe in the backing dir, so a re-run converges.
 		return a, fmt.Errorf("convert acct-%02d: tear down symlinks: %w", a.ID, err)
 	}
 	if err := fuseProv.Setup(base, dir); err != nil {
 		return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("mount: %w", err))
 	}
 
-	// The mount is live — verify the account's identity survived the trip
-	// before committing the row. A mismatch means the mirror is not serving
-	// the backing dir we populated.
+	// A mismatch means the live mirror is not serving the backing dir we populated.
 	if preErr == nil {
 		post, err := readIdentity(filepath.Join(dir, ".claude.json"))
 		if err != nil {
@@ -137,11 +114,9 @@ func (m *Manager) convertToFuse(a store.Account, symProv, fuseProv fkoverlay.Pro
 	return a, nil
 }
 
-// rollbackToSymlink restores a working symlink overlay after a failed fuse
-// setup: unmount (verified), move private files back, re-link. If the unmount
-// did not take, it stops there — laying symlinks "into" a live mirror would
-// write them through to the real ~/.claude — and leaves recovery to the
-// daemon's startup reconcile. The returned error always carries cause.
+// rollbackToSymlink restores a symlink overlay after a failed fuse setup. If the
+// unmount does not take it stops — laying symlinks into a live mirror would write
+// through to the real ~/.claude — leaving recovery to the daemon's reconcile.
 func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay.Provider, cause error) error {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
@@ -149,9 +124,8 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay
 		return fmt.Errorf("convert acct-%02d: %w (and rollback unmount failed: %w; private files remain in %s until the daemon reconciles)",
 			a.ID, cause, err, priv)
 	}
-	// Restore private files into dir and sweep orphaned shared entries out to
-	// base before re-linking. Both moves run regardless (disjoint name sets), but
-	// Setup is sequenced AFTER them so it never lays links over an un-swept dir.
+	// Both moves run regardless (disjoint name sets); Setup is sequenced after them
+	// so it never lays links over an un-swept dir.
 	spec := m.overlaySpec()
 	if err := errors.Join(
 		fkoverlay.MovePrivateEntries(priv, dir, spec),
@@ -166,13 +140,9 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay
 	return fmt.Errorf("convert acct-%02d: %w (rolled back to symlink)", a.ID, cause)
 }
 
-// convertToSymlink turns a fuse account into a symlink one: unmount (verified
-// — never lay links into a live mirror), move private files back beside the
-// links, re-link, flip the row. With nothing mounted, the fuse provider's
-// Teardown is an immediate no-op (RemoteFuseProvider contacts no holder), which
-// is exactly the retreat path for a machine whose fuse rows outlived their
-// mounts: the dir is already link-free and unmounted, so the retreat is pure
-// file moves — in every build.
+// convertToSymlink turns a fuse account into a symlink one. With nothing mounted
+// Teardown is a no-op, so even a build that cannot host fuse can retreat from a
+// stale fuse row — pure file moves.
 func (m *Manager) convertToSymlink(a store.Account, fuseProv, symProv fkoverlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
@@ -187,10 +157,9 @@ func (m *Manager) convertToSymlink(a store.Account, fuseProv, symProv fkoverlay.
 	} else if !os.IsNotExist(err) {
 		return a, fmt.Errorf("convert acct-%02d: stat private root: %w", a.ID, err)
 	}
-	// Relocate any shared entries claude wrote as real dirs/files into the bare
-	// mountpoint while its mirror was force-unmounted: they sit at shared names
-	// that Setup is about to symlink into base, so move them into base first or
-	// assertSymlink refuses to clobber them and the retreat fails.
+	// claude may have written real shared entries into the bare mountpoint after a
+	// force-unmount; move them to base first or Setup's assertSymlink refuses to
+	// clobber them and the retreat fails.
 	if err := fkoverlay.MoveSharedOrphans(dir, base, spec); err != nil {
 		return a, fmt.Errorf("convert acct-%02d: relocate orphaned shared entries: %w", a.ID, err)
 	}
@@ -205,21 +174,16 @@ func (m *Manager) convertToSymlink(a store.Account, fuseProv, symProv fkoverlay.
 	return a, nil
 }
 
-// removePrivateRootIfEmpty removes a fuse private backing dir once its private
-// contents have been moved out. Anything still inside is data we did not
-// classify — deleting it could destroy real user state, so a non-empty dir is
-// deliberately left in place (inert; doctor does not flag it because it holds
-// no private entries).
+// removePrivateRootIfEmpty removes an emptied fuse private backing dir; a non-empty
+// dir is left in place — its contents are unclassified data deleting could destroy.
 func removePrivateRootIfEmpty(priv string) {
 	_ = os.Remove(filepath.Join(priv, ".DS_Store"))
 	_ = os.Remove(priv)
 }
 
-// HealStrandedPrivate recovers a symlink account whose private files are
-// stranded in a fuse private backing dir — the aftermath of a conversion
-// interrupted before its rollback completed (or of a pre-fix mount fallback).
-// It moves the files back into the account dir and re-asserts the symlink
-// overlay, reporting whether anything was healed.
+// HealStrandedPrivate recovers a symlink account whose private files are stranded in
+// a fuse private backing dir (an interrupted conversion), moving them back and
+// re-asserting the symlink overlay; reports whether anything was healed.
 func (m *Manager) HealStrandedPrivate(a store.Account) (bool, error) {
 	backend, err := fkoverlay.Parse(a.OverlayKind)
 	if err != nil {
@@ -255,12 +219,9 @@ func (m *Manager) HealStrandedPrivate(a store.Account) (bool, error) {
 	return true, nil
 }
 
-// SetDefaultOverlayKind records backend as the provider for accounts added
-// later (the meta key ensureOverlayKind consults). Fuse is refused when this
-// build cannot host fuse mounts (CanHostFuse): the RemoteFuseProvider always
-// reports its own backend, so a provider-backend fence would always pass, while
-// recording a default whose mount holder this machine cannot spawn would mint
-// accounts whose rows promise a mirror their dirs don't have.
+// SetDefaultOverlayKind records backend as the default for accounts added later. Fuse
+// is refused when this build cannot host mounts, else new accounts' rows would promise
+// a mirror their dirs cannot have.
 func (m *Manager) SetDefaultOverlayKind(backend fkoverlay.Backend) error {
 	switch {
 	case backend == fkoverlay.BackendSymlink:
@@ -277,11 +238,9 @@ func (m *Manager) SetDefaultOverlayKind(backend fkoverlay.Backend) error {
 	return nil
 }
 
-// ConfiguredOverlayKind returns the pool's recorded default overlay backend (the
-// provider new accounts are minted with and that `ccp migrate` converts toward)
-// and whether one has been recorded yet. Unlike ensureOverlayKind it is a pure
-// read — it never detects or persists — so callers like `doctor` can compare an
-// account's live backend against the configured default without side effects.
+// ConfiguredOverlayKind returns the pool's recorded default overlay backend and
+// whether one has been recorded. Pure read — never detects or persists — so callers
+// like doctor can compare without side effects.
 func (m *Manager) ConfiguredOverlayKind() (fkoverlay.Backend, bool, error) {
 	v, ok, err := m.Store.GetMeta(metaOverlayKind)
 	if err != nil {

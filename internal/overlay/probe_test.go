@@ -12,8 +12,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// swapDeepProbeTimeout seams deepProbeTimeout for one test, restoring it on
-// cleanup. Tests using it must not run in parallel.
+// swapDeepProbeTimeout overrides deepProbeTimeout for one test; callers must not
+// run in parallel (it mutates a package global).
 func swapDeepProbeTimeout(t *testing.T, d time.Duration) {
 	t.Helper()
 	prev := deepProbeTimeout
@@ -92,19 +92,16 @@ func TestDeepProbeWithinMissingFile(t *testing.T) {
 	}
 }
 
-// TestDeepProbeWithinPermissionDeniedIsMissing pins the cross-upgrade escape
-// hatch for a permission-class open refusal (EPERM/EACCES → os.ErrPermission):
-// a mirror hosted by a holder predating the probe-in-daemon move refuses the
-// daemon's external open, and that must read as ErrProbeMissing (no verdict),
-// never a wedge — otherwise a healthy old-holder mount false-wedges across an
-// upgrade and the daemon refuses every account.
+// TestDeepProbeWithinPermissionDeniedIsMissing pins that a permission-class open
+// refusal (EPERM/EACCES → os.ErrPermission) reads as ErrProbeMissing, never a
+// wedge: an old holder can refuse the daemon's external open, and a false wedge
+// would make the daemon refuse every account across an upgrade.
 func TestDeepProbeWithinPermissionDeniedIsMissing(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses file permission bits, so open(2) would not return EACCES")
 	}
 	dir := t.TempDir()
-	// A mode-0000 probe file: os.Open returns EACCES, which maps to
-	// os.ErrPermission — the same shape as the old holder's EPERM refusal.
+	// mode-0000 makes os.Open refuse with EACCES, an old holder's refusal shape.
 	if err := os.WriteFile(filepath.Join(dir, ProbeFileName), []byte("x"), 0o000); err != nil {
 		t.Fatal(err)
 	}
@@ -205,15 +202,12 @@ func TestDeepProbeWithinTimeoutWedged(t *testing.T) {
 		t.Errorf("Inflight = %d, want %d (one new parked probe goroutine)", got, before+1)
 	}
 
-	// Best-effort unwedge for a tidy exit: opening the FIFO for writing releases
-	// the parked open so the probe goroutine reads to completion and frees its
-	// fd, and serving bytes before the close makes the close's EOF reliable in
-	// the common case. We deliberately do NOT assert it drains: a real wedge
-	// leaks the goroutine by design (DeepProbeWithin bounds the caller, not the
-	// goroutine), and even with bytes served a macOS FIFO's blocking read can
-	// still miss the writer's EOF under load (~1 in 3000) and strand forever — so
-	// a drain assertion is inherently flaky. The Inflight check above is
-	// delta-based, so a rare straggler never fails this run or a later one.
+	// Best-effort unwedge for a tidy exit; we deliberately do NOT assert it
+	// drains. A real wedge leaks the goroutine by design (DeepProbeWithin bounds
+	// the caller, not the goroutine), and a macOS FIFO's blocking read can miss
+	// the writer's EOF under load (~1 in 3000) and strand forever, so a drain
+	// assertion is inherently flaky. The Inflight check above is delta-based, so
+	// a straggler never fails this run or a later one.
 	if w, werr := os.OpenFile(fifo, os.O_WRONLY, 0); werr == nil { //nolint:gosec // G304: fifo is under the test's own t.TempDir()
 		go func() {
 			_, _ = w.Write(make([]byte, 128<<10))

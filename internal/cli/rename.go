@@ -32,8 +32,7 @@ org domains become the org name ("rebecca.fang@ucsf.edu" → "UCSF") — and
 applies it to every account whose label is empty or still the raw email;
 --force overwrites custom labels too. Labels are display-only and need not be
 unique: status and list always disambiguate by acct-NN.`,
-		// Args deliberately ArbitraryArgs: the arity rules depend on --auto,
-		// so RunE validates.
+		// Args deliberately ArbitraryArgs: arity depends on --auto, so RunE validates.
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withManager(func(m *pool.Manager) error {
@@ -49,7 +48,6 @@ unique: status and list always disambiguate by acct-NN.`,
 	return cmd
 }
 
-// runRename dispatches between the manual and --auto forms.
 func runRename(cmd *cobra.Command, m *pool.Manager, args []string, opts renameOptions) error {
 	if opts.force && !opts.auto {
 		return fmt.Errorf("--force only applies to --auto")
@@ -123,9 +121,8 @@ func renameAuto(cmd *cobra.Command, m *pool.Manager, refs []string, force bool) 
 	return nil
 }
 
-// autoTargets resolves --auto's account set: the explicitly referenced
-// accounts, or every account when none are named. An unknown reference fails
-// before anything is renamed.
+// autoTargets resolves --auto's account set up front: an unknown reference
+// fails before anything is renamed.
 func autoTargets(m *pool.Manager, refs []string) ([]store.Account, error) {
 	if len(refs) == 0 {
 		return m.Store.ListAccounts()
@@ -145,8 +142,7 @@ func autoTargets(m *pool.Manager, refs []string) ([]store.Account, error) {
 	return accts, nil
 }
 
-// parseAccountRef parses an account reference: a numeric id ("3") or the
-// acct-NN spelling `ccp list` prints ("acct-03"). Ids start at 1.
+// parseAccountRef accepts a numeric id ("3") or the acct-NN spelling `ccp list` prints.
 func parseAccountRef(s string) (int, error) {
 	id, err := strconv.Atoi(strings.TrimPrefix(s, "acct-"))
 	if err != nil || id < 1 {

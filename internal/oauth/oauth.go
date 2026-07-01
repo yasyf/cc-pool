@@ -1,11 +1,6 @@
 // Package oauth talks to Anthropic's OAuth token-refresh and usage endpoints
 // using the stored subscription credential (never an API key — API keys force
 // per-request billing and disable subscription mode).
-//
-// Endpoints (reverse-engineered from Claude Code v2.1.x):
-//
-//	refresh: POST https://platform.claude.com/v1/oauth/token
-//	usage:   GET  https://api.anthropic.com/api/oauth/usage
 package oauth
 
 import (
@@ -34,19 +29,15 @@ const (
 	betaHeader = "oauth-2025-04-20"
 )
 
-// userAgentValue holds the User-Agent string, matching the Claude Code CLI's
-// own format (`claude-cli/<version> (external)`, from the binary's Io() builder)
-// so the OAuth endpoints treat our polling like the official client. The daemon
-// stamps the detected claude version via SetUserAgentVersion, which races with
-// in-flight request handlers (the version probe now runs in a startup
-// goroutine), so access goes through the mutex below.
+// userAgentValue mimics the Claude Code CLI's User-Agent so the OAuth endpoints
+// treat our polling like the official client; userAgentMu guards all access.
 var (
 	userAgentMu    sync.RWMutex
 	userAgentValue = "claude-cli/2.1.166 (external)"
 )
 
-// SetUserAgentVersion sets the User-Agent to claude-cli/<version> (external).
-// An empty version is a no-op, leaving the default in place.
+// SetUserAgentVersion sets the User-Agent to claude-cli/<version> (external);
+// an empty version is a no-op.
 func SetUserAgentVersion(version string) {
 	if version == "" {
 		return
@@ -56,7 +47,6 @@ func SetUserAgentVersion(version string) {
 	userAgentMu.Unlock()
 }
 
-// userAgent returns the current User-Agent string.
 func userAgent() string {
 	userAgentMu.RLock()
 	defer userAgentMu.RUnlock()
@@ -68,7 +58,7 @@ type Client struct {
 	http      *http.Client
 	tokenURL  string
 	usageURL  string
-	refreshSF singleflight.Group // de-dupes concurrent refreshes per key
+	refreshSF singleflight.Group
 }
 
 // New returns a Client with sane timeouts.
@@ -111,10 +101,9 @@ func (e *RefreshError) Revoked() bool {
 	return e.Status == http.StatusBadRequest || e.Status == http.StatusUnauthorized
 }
 
-// Refresh exchanges a refresh token for a fresh access token. Concurrent calls
-// sharing flightKey collapse to one in-flight request (single-flight), so the
-// daemon never races itself into a refresh-token rotation loop. Pass the
-// account id (or any stable per-account key) as flightKey.
+// Refresh exchanges a refresh token for a fresh access token. Calls sharing
+// flightKey collapse to one in-flight request, so the daemon never races
+// itself into a refresh-token rotation loop; pass a stable per-account key.
 func (c *Client) Refresh(ctx context.Context, flightKey, refreshToken string) (*TokenResponse, error) {
 	v, err, _ := c.refreshSF.Do(flightKey, func() (any, error) {
 		return c.refresh(ctx, refreshToken)
@@ -182,20 +171,18 @@ func (w Window) Remaining() float64 {
 	return r
 }
 
-// Usage is the parsed /api/oauth/usage response. The API returns many windows
-// (per-model 7-day limits, promo buckets); cc-pool consumes the 5-hour and
-// aggregate 7-day windows plus the extra-usage (credit overage) block, and the
-// decoder ignores the rest.
+// Usage is the parsed /api/oauth/usage response. The API returns many windows;
+// cc-pool consumes only the 5-hour, aggregate 7-day, and extra-usage (credit
+// overage) blocks and ignores the rest.
 type Usage struct {
 	FiveHour   Window
 	SevenDay   Window
 	ExtraUsage ExtraUsage
 }
 
-// ExtraUsage is the pay-as-you-go overage block: when enabled, an account whose
-// plan windows are exhausted keeps serving by billing credits instead of
-// returning 429s — which is why exhaustion is invisible to rate-limit checks.
-// The zero value means absent or disabled.
+// ExtraUsage is the pay-as-you-go overage block: when enabled, an exhausted
+// account keeps serving on billed credits instead of 429s, so exhaustion is
+// invisible to rate-limit checks. The zero value means absent or disabled.
 type ExtraUsage struct {
 	IsEnabled    bool
 	MonthlyLimit float64 // credit cap for the month, in Currency cents
@@ -204,11 +191,6 @@ type ExtraUsage struct {
 	Currency     string  // e.g. "USD"
 }
 
-// rawWindow matches the API JSON: utilization is a percent in [0,100] (e.g.
-// 13.0 == 13%) and resets_at is the reset time. The API has been observed to
-// encode resets_at three ways across versions — a JSON number of epoch seconds,
-// a numeric string of epoch seconds, or an RFC3339 string — so resetTime
-// tolerates all three.
 type rawWindow struct {
 	Utilization *float64  `json:"utilization"`
 	ResetsAt    resetTime `json:"resets_at"`
@@ -228,11 +210,9 @@ func (rw *rawWindow) toWindow() Window {
 	return w
 }
 
-// resetTime decodes the usage endpoint's resets_at field, which the API encodes
-// inconsistently: a JSON number (epoch seconds), a numeric string (epoch
-// seconds), or an RFC3339 timestamp string. An absent or null value leaves
-// present false. Anything else is a hard decode error — we do not silently
-// swallow a representation we have never seen.
+// resetTime decodes resets_at, which the API encodes inconsistently as a JSON
+// number, numeric string (both epoch seconds), or RFC3339 string. Null/absent
+// leaves present false; any other shape is a hard decode error, never swallowed.
 type resetTime struct {
 	t       time.Time
 	present bool

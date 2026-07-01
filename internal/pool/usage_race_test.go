@@ -14,10 +14,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// fakeKeychain is an in-memory CredentialStore. It is internally locked so any
-// race the detector reports is in the code under test, not the fake. Every
-// operation's service is recorded in touched, so tests can pin which Keychain
-// items the pool is willing to name.
+// fakeKeychain is an in-memory CredentialStore, internally locked so any race
+// the detector reports is in the code under test, not the fake. Each op's
+// service is recorded in touched to pin which Keychain items the pool names.
 type fakeKeychain struct {
 	mu      sync.Mutex
 	items   map[string]*keychain.Credential
@@ -61,8 +60,7 @@ func (f *fakeKeychain) Delete(service, account string) error {
 	return nil
 }
 
-// Discover mirrors keychain.DiscoverAccount: the stored account label for a
-// service, found by service alone.
+// Discover mirrors keychain.DiscoverAccount.
 func (f *fakeKeychain) Discover(service string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -88,9 +86,9 @@ func (f *fakeKeychain) deletedServices() []string {
 	return append([]string(nil), f.deleted...)
 }
 
-// fakeOAuth simulates the provider's single-use refresh-token rotation: only
-// the current token refreshes successfully; re-POSTing a consumed one is an
-// invalid_grant, exactly like the real endpoint.
+// fakeOAuth simulates the provider's single-use refresh-token rotation: only the
+// current token refreshes; re-POSTing a consumed one is invalid_grant, like the
+// real endpoint.
 type fakeOAuth struct {
 	mu            sync.Mutex
 	currentRT     string
@@ -124,18 +122,15 @@ func (f *fakeOAuth) Usage(context.Context, string) (*oauth.Usage, error) {
 }
 
 // TestPerAccountLockSerializesCredentialCycle hammers one account's credential
-// from concurrent SampleUsage (read→refresh→write) and AdoptRotatedToken
-// (read→write) cycles. The per-account lock must prevent both concrete
-// failure modes of the unsynchronized code:
+// with concurrent SampleUsage and AdoptRotatedToken cycles; the per-account lock
+// must prevent both failure modes of the unsynchronized code:
 //
-//   - double-spend: two concurrent refreshes POST the same single-use token;
-//     the loser gets invalid_grant → Revoked() → ErrNeedsLogin → account
-//     flagged dead (invalidGrants > 0);
-//   - lost update: an adopt reads cred X, a refresh writes Y (new RT), the
-//     adopt writes back X — clobbering Y with a consumed token (final
-//     keychain RT != provider's current RT).
+//   - double-spend: two concurrent refreshes POST the same single-use token; the
+//     loser gets invalid_grant → account flagged dead (invalidGrants > 0);
+//   - lost update: adopt reads cred X, a refresh writes Y, adopt writes back X,
+//     clobbering Y with a consumed token (final keychain RT != provider's).
 //
-// Run with -race; the iteration count is the amplifier, no sleeps.
+// Run with -race; iteration count is the amplifier, no sleeps.
 func TestPerAccountLockSerializesCredentialCycle(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
 	if err != nil {

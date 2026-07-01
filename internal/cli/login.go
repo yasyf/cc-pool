@@ -17,11 +17,8 @@ import (
 )
 
 const (
-	// loginPollInterval is how often the account's login identity is probed
-	// while a login is in flight.
 	loginPollInterval = 500 * time.Millisecond
-	// killGrace is how long a SIGTERMed claude gets before SIGKILL.
-	killGrace = 3 * time.Second
+	killGrace         = 3 * time.Second
 )
 
 // inputModeReset disables the terminal input modes claude may have enabled —
@@ -29,7 +26,6 @@ const (
 // the kitty keyboard protocol — so a force-killed claude can't leave them on.
 const inputModeReset = "\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[<u"
 
-// awaitOutcome is how a watched login ended.
 type awaitOutcome int
 
 const (
@@ -38,10 +34,8 @@ const (
 	awaitCanceled                     // the wait was aborted: context canceled or probe failure
 )
 
-// awaitLogin polls probe every interval until it reports done, the process
-// exits, or ctx is canceled. probe errors abort the wait — a broken probe must
-// not become a silent infinite retry loop. For awaitExited the process's exit
-// error (possibly nil) is passed through.
+// awaitLogin polls probe until it reports done, the process exits, or ctx is
+// canceled; a probe error aborts the wait rather than retrying silently.
 func awaitLogin(ctx context.Context, procExit <-chan error, probe func() (bool, error), interval time.Duration) (awaitOutcome, error) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -66,14 +60,10 @@ func awaitLogin(ctx context.Context, procExit <-chan error, probe func() (bool, 
 // identityFunc matches pool.AccountIdentity; injectable for tests.
 type identityFunc func(backend fkoverlay.Backend, configDir string) (*pool.Identity, error)
 
-// newIdentityProbe returns a probe reporting that the account's own .claude.json
-// now carries a fresh oauthAccount identity — the signal that a real
-// `claude /login` completed. The mere appearance of a credential is NOT the
-// signal: with a fresh CLAUDE_CONFIG_DIR claude adopts the global session's
-// secret into the account's Keychain item (or, headless over SSH, its plaintext
-// .credentials.json) at startup, before any login — but it writes no identity,
-// so this never fires on that adoption. ErrNoIdentity means "not yet"; any other
-// error aborts the wait (a broken read must not become a silent retry loop).
+// newIdentityProbe returns a probe for a fresh oauthAccount identity in the
+// account's own .claude.json — the only reliable login signal: at startup
+// claude pre-seeds a fresh CLAUDE_CONFIG_DIR with the global credential but
+// writes no identity.
 func newIdentityProbe(read identityFunc, backend fkoverlay.Backend, configDir string) func() (bool, error) {
 	return func() (bool, error) {
 		_, err := read(backend, configDir)
@@ -87,27 +77,17 @@ func newIdentityProbe(read identityFunc, backend fkoverlay.Backend, configDir st
 	}
 }
 
-// runWatchedLogin runs `claude /login` attached to the terminal and watches
-// for the account's own login identity to land; when it does, it closes claude
-// for the user. It delegates the spawn/poll/terminate to watchAndClose (the
-// single watched-login primitive) and owns only terminal setup/teardown. The
-// child stays in our foreground process group (a background pgrp touching the
-// tty would be stopped with SIGTTIN/SIGTTOU), so termination signals target
-// c.Process directly and the terminal is only restored after the child exited.
-//
-// On the kept-existing reuse path (the dir already holds a logged-in identity)
-// completion cannot be detected — the identity is already present, so an
-// identity probe would fire immediately — so the session runs with a never-fire
-// probe and the user exits claude themselves, exactly the pre-watcher behavior.
+// runWatchedLogin runs `claude /login` attached to the terminal and closes
+// claude once the account's own login identity lands. The child stays in our
+// foreground process group (a background pgrp touching the tty would stop on
+// SIGTTIN/SIGTTOU).
 func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd) error {
 	bin, err := exec.LookPath("claude")
 	if err != nil {
 		return fmt.Errorf("`claude` not found on PATH: %w", err)
 	}
-	// Watch for a fresh login unless the dir already holds a logged-in identity
-	// (SeedKeptExisting — the documented reuse path): there the identity is
-	// already present, so the identity probe would fire immediately. PrepareAdd
-	// already computed this, so no credential read is needed here.
+	// On SeedKeptExisting an identity is already present and a real probe would
+	// fire immediately; watch with a never-fire probe and let the user exit.
 	probe := func() (bool, error) { return false, nil }
 	if p.ClaudeJSONSeed != pool.SeedKeptExisting {
 		probe = newIdentityProbe(pool.AccountIdentity, p.OverlayKind, p.ConfigDir)
@@ -124,21 +104,16 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	outcome, werr := watchAndClose(ctx, c, probe)
 	restoreTerminal(cmd.OutOrStdout(), fd, state)
-	// awaitCred: a fresh account identity landed — a real login completed (a
-	// startup adoption of the global credential writes none); claude was closed.
-	// A cancellation while closing still stops the add here, not at finalize.
+	// On success return ctx.Err(): a cancellation while closing must stop the
+	// add here, not at finalize.
 	if outcome == awaitCred {
 		return ctx.Err()
 	}
-	// awaitExited (user quit claude) and awaitCanceled (ctx canceled or a probe
-	// error) both surface the watch error directly.
 	return werr
 }
 
-// watchAndClose starts c, polls probe every loginPollInterval, and closes c (via
-// terminate) once the probe fires or ctx cancels; on a manual exit it leaves c
-// alone. Returns the await outcome and its error. The caller owns terminal setup
-// and teardown.
+// watchAndClose starts c, waits via awaitLogin, and terminates c unless it
+// exited on its own. The caller owns terminal setup and teardown.
 func watchAndClose(ctx context.Context, c *exec.Cmd, probe func() (bool, error)) (awaitOutcome, error) {
 	if err := c.Start(); err != nil {
 		return awaitCanceled, fmt.Errorf("start claude /login: %w", err)
@@ -152,8 +127,7 @@ func watchAndClose(ctx context.Context, c *exec.Cmd, probe func() (bool, error))
 	return outcome, err
 }
 
-// terminate closes the child: SIGTERM, a grace period, then SIGKILL; always
-// drains procExit so the Wait goroutine finishes.
+// terminate closes c, always draining procExit so the Wait goroutine exits.
 func terminate(c *exec.Cmd, procExit <-chan error) {
 	_ = c.Process.Signal(syscall.SIGTERM)
 	select {
@@ -165,11 +139,9 @@ func terminate(c *exec.Cmd, procExit <-chan error) {
 	<-procExit
 }
 
-// restoreTerminal undoes whatever raw-mode state a (possibly SIGKILLed) claude
-// left behind: termios via the saved state, then explicit escape sequences to
-// leave the alternate screen, show the cursor, disable bracketed paste, mouse
-// and focus-event reporting, pop the kitty keyboard protocol, and reset SGR.
-// Escapes are only emitted on a real terminal.
+// restoreTerminal undoes terminal state a possibly-SIGKILLed claude left
+// behind: saved termios, then escapes to leave the alt screen, show the
+// cursor, and reset input modes and SGR.
 func restoreTerminal(out io.Writer, fd int, state *term.State) {
 	if state != nil {
 		_ = term.Restore(fd, state)
@@ -179,11 +151,9 @@ func restoreTerminal(out io.Writer, fd int, state *term.State) {
 	}
 }
 
-// waitForLogin polls until the account's own .claude.json shows a fresh
-// oauthAccount identity — a real `claude /login` completed — showing a one-line
-// spinner. Used by the manual login path; unbounded — the user may take
-// arbitrarily long in another terminal, and ^C cancels. A startup adoption of
-// the global credential writes no identity, so it never trips this.
+// waitForLogin polls until the account's own login identity lands.
+// Deliberately unbounded: the user may take arbitrarily long in another
+// terminal; ^C cancels.
 func waitForLogin(ctx context.Context, out io.Writer, backend fkoverlay.Backend, configDir string) error {
 	probe := newIdentityProbe(pool.AccountIdentity, backend, configDir)
 	ticker := time.NewTicker(loginPollInterval)

@@ -10,13 +10,10 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// TestDetectOverlayBackendCaskAbsent pins the cask-absent verdict: with no
-// fusekit-holder cask installed (holderExe at an absent path), the binary cannot
-// host fuse mounts, so DetectOverlayBackend resolves to symlink — canHost fails
-// on the missing ExecPath before any holder spawn, never adopting a leftover
-// holder this binary could not respawn. Hermetic via the holderExe seam (which
-// overlaySpec threads into the probe ExecPath), so the verdict never depends on
-// whether this machine happens to have the cask installed.
+// TestDetectOverlayBackendCaskAbsent pins that with no fusekit-holder cask
+// (holderExe at an absent path) DetectOverlayBackend resolves to symlink: canHost
+// fails on the missing ExecPath before any holder spawn, never adopting a holder
+// this binary could not respawn.
 func TestDetectOverlayBackendCaskAbsent(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	orig := holderExe

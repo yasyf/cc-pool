@@ -13,42 +13,27 @@ import (
 )
 
 const (
-	// The /usage and token endpoints rate-limit aggressively: polling every
-	// 30–60s can trip a 30+ minute 429 with no Retry-After. 180s + jitter keeps
-	// us well clear while still feeling live for start-of-session selection.
+	// The /usage and token endpoints rate-limit aggressively: 30–60s polling
+	// can trip a 30+ minute 429 with no Retry-After.
 	basePollInterval = 180 * time.Second
 	pollJitter       = 30 * time.Second
 
 	// Per-account spacing so N accounts don't hit the shared-IP bucket at once.
 	perAccountSpacing = 2 * time.Second
 
-	// Exponential rate-limit backoff: 3, 6, 12, … capped at 15 minutes.
 	rateLimitBackoffBase = 3 * time.Minute
 	rateLimitBackoffCap  = 15 * time.Minute
 
-	// needsLoginAfter is how many consecutive transient 401s back the account's
-	// poll off to needsLoginPollInterval. It does NOT flag needs-login — only a
-	// definitive ErrNeedsLogin (a confirmed revocation) flags. A plain 401 also
-	// surfaces a transient (5xx/network) refresh failure, so escalating on the
-	// streak would falsely sign out a recoverable account; instead the streak
-	// only throttles the 401 spam while the account stays selectable. At 180s+
-	// per poll, 3 is ~10 minutes of repeated failure before we throttle.
 	needsLoginAfter = 3
-	// needsLoginPollInterval is how often a flagged account is re-sampled: often
-	// enough to auto-recover within minutes of `ccp login`, rarely enough to
-	// stop the per-poll 401 spam.
+	// Balances per-poll 401 spam against auto-recovery latency after `ccp login`.
 	needsLoginPollInterval = 15 * time.Minute
 )
 
-// rlBackoff returns the backoff duration for a given consecutive-429 streak.
 func rlBackoff(streak int) time.Duration {
 	return proc.Backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap}.After(streak)
 }
 
-// scheduler runs the periodic usage poll + idle-only refresh + session
-// reconciliation until ctx is cancelled.
 func (s *Server) scheduler(ctx context.Context) {
-	// Prime immediately so status/select have data right away.
 	s.pollOnce(ctx)
 	for {
 		d := basePollInterval + jitter(pollJitter, time.Now().UnixNano())
@@ -61,17 +46,12 @@ func (s *Server) scheduler(ctx context.Context) {
 	}
 }
 
-// pollOnce reconciles sessions, then samples usage for every account,
-// refreshing the token only for idle accounts.
 func (s *Server) pollOnce(ctx context.Context) {
-	// Refresh the holder cache first: every select until the next poll keys
-	// fuse readiness on it. (The faster heal loop, healFuseRows, also refreshes
-	// and re-registers unvouched rows; this is just the per-poll prime.)
+	// Every select until the next poll keys fuse readiness on this cache.
 	s.holder.refresh(s.holderClient())
 
-	// Only reconcile sessions on a successful scan: AlivePIDs always returns a
-	// non-nil map, so reconciling off a failed (nil) scan would treat every PID
-	// as dead and close every active session.
+	// Reconcile only on a successful scan: AlivePIDs always returns a non-nil
+	// map, so a failed scan would close every live session.
 	sessions, err := procscan.Scan(ctx)
 	if err != nil {
 		s.log.Printf("procscan: %v", err)
@@ -84,10 +64,8 @@ func (s *Server) pollOnce(ctx context.Context) {
 		}
 	}
 
-	// Row hygiene only: StickyPick checks the activity rule on read, which also
-	// covers the daemonless path where no pruner runs. The prune itself is
-	// activity-based — a pin with a live tracked session survives, and an idle
-	// one dies a TTL after its last select or session end (see PruneSticky).
+	// Row hygiene only: StickyPick re-checks the activity rule on read (covers
+	// the daemonless path).
 	if _, err := s.m.Store.PruneSticky(time.Now().Add(-pool.StickyTTL)); err != nil {
 		s.log.Printf("prune sticky: %v", err)
 	}
@@ -98,12 +76,6 @@ func (s *Server) pollOnce(ctx context.Context) {
 		return
 	}
 	for i, a := range accts {
-		// Claim the account for this iteration. An overlay conversion owns
-		// the dir while it runs (Sync, the fuse self-heal, and a refresh
-		// would all race its move/teardown/mount sequence), and the claim
-		// makes that exclusion two-sided: beginConvert refuses while the
-		// scheduler holds the dir, closing the check-then-act window a plain
-		// isConverting test would leave open.
 		if !s.beginPoll(a.ID) {
 			continue
 		}
@@ -112,7 +84,6 @@ func (s *Server) pollOnce(ctx context.Context) {
 		}
 	}
 
-	// Mirror the freshly-sampled view for out-of-process readers (the widget).
 	// Deliberately skipped by the early returns above: generated_at means "time
 	// of the last completed poll" and must go stale when polling is broken.
 	if err := s.writeStatusSnapshot(ctx); err != nil {
@@ -120,24 +91,17 @@ func (s *Server) pollOnce(ctx context.Context) {
 	}
 }
 
-// pollAccount runs one account's per-poll body — overlay re-assert, idle
-// adopt/refresh, usage sample — under the poll claim taken by pollOnce, which
-// it releases. It reports whether polling should stop (ctx cancelled).
+// pollAccount polls one account under the claim taken by pollOnce, which it
+// releases.
 func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i int, a store.Account) (stop bool) {
 	defer s.endPoll(a.ID)
 
-	// Respect an exponential rate-limit backoff keyed on the consecutive-429
-	// streak for this account.
 	if last, ok, _ := s.m.Store.LatestUsageSample(a.ID); ok && last.RateLimited &&
 		time.Since(last.TS) < rlBackoff(s.rlStreak[a.ID]) {
 		return false
 	}
-	// A flagged (needs-login) account OR one riding a high transient-401 streak
-	// backs off to needsLoginPollInterval: a revoked account stops 401-spamming
-	// every poll but still auto-recovers within minutes of `ccp login`, and a
-	// transiently-failing one stops spamming while staying selectable (its
-	// AuthHealth.NeedsLogin is never set). A 401 inserts no usage sample, so this
-	// can't ride the rate-limit backoff above — it needs its own clock.
+	// The needs-login backoff needs its own clock: a 401 inserts no usage
+	// sample, so it can't ride the rate-limit backoff above.
 	if health, _ := s.m.Store.GetAuthHealth(a.ID); health.NeedsLogin || s.authStreak[a.ID] >= needsLoginAfter {
 		if last, ok := s.lastAuthAttempt[a.ID]; ok && time.Since(last) < needsLoginPollInterval {
 			return false
@@ -151,49 +115,34 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 		}
 	}
 	// Re-assert the overlay so long-lived setups pick up new top-level
-	// ~/.claude entries without an explicit sync (symlink relinks; fuse
-	// health-checks).
+	// ~/.claude entries without an explicit sync.
 	if err := s.m.SyncOverlay(a); err != nil {
 		s.log.Printf("acct-%02d overlay sync: %v", a.ID, err)
-		// An unhealthy fuse overlay here usually means the mount isn't up —
-		// the holder died, or the account was added while no holder was
-		// reachable — heal it now instead of leaving the dir dead until
-		// restart. healFuse classifies: transient holder conditions and a
-		// pending TCC grant retry next poll; only a genuine mount failure
-		// falls back to symlink, and only when the account is idle.
+		// A fuse sync failure usually means the mount is down — heal now
+		// instead of leaving the dir dead until restart.
 		if fuseBackedRow(a.OverlayKind) {
 			s.healFuse(ctx, a)
 		}
 	}
 
-	// A reserved account was just handed out by handleSelect but its claude
-	// is not yet visible to procscan — treat it as busy so we don't refresh
-	// the token out from under the launching session.
+	// A reserved account's claude may not be procscan-visible yet — treat it
+	// as busy so we don't refresh the token out from under the launch.
 	idle := procscan.CountByConfigDir(sessions, a.ConfigDir) == 0 &&
 		s.reservedCount(a.ID) == 0
 
-	// A previously checked-out account that is now idle may carry a token
-	// rotated by its live session — adopt it (re-asserting our ACL) before
-	// sampling.
+	// A just-idled account may carry a token rotated by its session — adopt
+	// before sampling.
 	if idle {
 		if err := s.m.AdoptRotatedToken(ctx, a); err != nil {
 			s.log.Printf("acct-%02d adopt rotated token: %v", a.ID, err)
 		}
 	}
 
-	// Busy-account refresh is permitted only when a procscan-visible session
-	// (never a bare reservation, whose claude is mid-launch) holds the account
-	// AND we have already seen a consecutive 401 — giving a lazily-waking
-	// session a full poll to refresh its own token before we touch the chain.
-	//
-	// Accepted gap: a busy account whose token is server-revoked while still
-	// clock-fresh keeps 401ing but is never refreshed (fetchUsage's busy guard
-	// requires an expired token), so the daemon never confirms revocation and
-	// never flags needs-login — the live session owns that recovery (it hits
-	// `/login` itself). It self-heals here once the token clock-expires:
-	// AllowBusyRefresh then refreshes, the invalid_grant surfaces, and the
-	// account is flagged. Forcing a refresh on a fresh busy token to detect this
-	// sooner would risk double-spending a refresh token the session still needs.
+	// The prior-401 gate gives a lazily-waking session one full poll to
+	// self-refresh first. Accepted gap: a busy, clock-fresh, server-revoked
+	// token keeps 401ing (fetchUsage's busy guard requires expiry) so
+	// needs-login waits for clock expiry — the live session owns recovery;
+	// refreshing sooner could double-spend a refresh token it still needs.
 	busyBySession := procscan.CountByConfigDir(sessions, a.ConfigDir) > 0
 	opts := pool.SampleOpts{
 		AllowRefresh:     idle,
@@ -203,7 +152,7 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	_, rateLimited, err := s.m.SampleUsage(cctx, a, opts)
 	cancel()
-	// rlStreak is scheduler-local (this goroutine only) — no lock needed.
+	// rlStreak is scheduler-goroutine-local — no lock.
 	if rateLimited {
 		s.rlStreak[a.ID]++
 	} else if err == nil {
@@ -213,13 +162,9 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 	return false
 }
 
-// handleAuthOutcome folds one sample's outcome into the account's auth health:
-// a success clears any needs-login flag and the 401 streak (logged once on the
-// transition); a definitive ErrNeedsLogin (a confirmed revocation) flags
-// immediately; a plain 401 — which a transient (5xx/network) refresh failure
-// also surfaces as — only increments the streak, driving the poll backoff
-// without ever flagging the account; any other error is logged as before.
-// Scheduler-goroutine-local — no lock.
+// Only a definitive ErrNeedsLogin flags needs-login: a plain 401 also
+// surfaces transient (5xx/network) refresh failures, so the streak only
+// throttles polling. Scheduler-goroutine-local — no lock.
 func (s *Server) handleAuthOutcome(a store.Account, err error) {
 	if err == nil {
 		s.authStreak[a.ID] = 0
@@ -244,8 +189,7 @@ func (s *Server) handleAuthOutcome(a store.Account, err error) {
 	s.log.Printf("acct-%02d sample: %v", a.ID, err)
 }
 
-// flagNeedsLogin marks an account needs-login, stamping the attempt clock so the
-// backoff engages, and logs the remediation command once (on the transition).
+// flagNeedsLogin stamps the attempt clock so the needs-login backoff engages.
 func (s *Server) flagNeedsLogin(a store.Account, err error) {
 	s.lastAuthAttempt[a.ID] = time.Now()
 	changed, serr := s.m.Store.SetNeedsLogin(a.ID, time.Now(), err.Error())
@@ -258,8 +202,8 @@ func (s *Server) flagNeedsLogin(a store.Account, err error) {
 	}
 }
 
-// jitter returns a deterministic-ish jitter in [0, span) derived from seed,
-// avoiding Math.random (unavailable / non-reproducible).
+// jitter is deterministic (seed-derived) rather than RNG-backed, for
+// reproducibility.
 func jitter(span time.Duration, seed int64) time.Duration {
 	if span <= 0 {
 		return 0

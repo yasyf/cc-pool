@@ -45,12 +45,7 @@ same setup automatically.`,
 	return cmd
 }
 
-// reportOverlayChoice tells the user how Init's overlay choice landed. A
-// fuse-capable machine (the fusekit-holder cask is installed) that had to settle
-// for symlinks warns with detection's reason — fuse was expected there. A machine
-// that cannot host fuse gets the curated install note instead: symlinks are its
-// expected default, not a failure, so the detection reason (always "this build
-// cannot host fuse mounts…") would be warn-toned noise on every first run.
+// reportOverlayChoice warns on a symlink fallback only where fuse was expected; where fuse can't be hosted, symlinks are the default, so it only notes.
 func reportOverlayChoice(cmd *cobra.Command, res *pool.InitResult) {
 	switch {
 	case res.OverlayFallbackReason != "" && pool.CanHostFuse():

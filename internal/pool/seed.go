@@ -16,32 +16,20 @@ type SeedOutcome string
 const (
 	// SeedCopied means ~/.claude.json was copied in with oauthAccount stripped.
 	SeedCopied SeedOutcome = "copied"
-	// SeedNoSource means no ~/.claude.json exists; claude onboards fresh (correct —
-	// there is nothing to inherit).
+	// SeedNoSource means no ~/.claude.json exists; claude onboards fresh.
 	SeedNoSource SeedOutcome = "no-source"
 	// SeedKeptExisting means the account already holds logged-in state (a prior add
-	// completed its login but was not finalized); it is left untouched.
+	// logged in but was not finalized); left untouched.
 	SeedKeptExisting SeedOutcome = "kept-existing"
 )
 
 // seedClaudeJSON seeds an account's private .claude.json from srcPath (plain
-// claude's ~/.claude.json — its primary state file, which claude relocates to
-// $CONFIG_DIR/.claude.json when CLAUDE_CONFIG_DIR is set). The copy is
-// verbatim except the top-level "oauthAccount" key is stripped: it is the
-// per-account identity, and `claude /login` writes the new account's own.
-// Everything else (hasCompletedOnboarding, mcpServers, per-project state, …)
-// carries over so a pooled session behaves like plain claude instead of
-// running the first-run wizard. Seeding deliberately strips ONLY
-// overlay.OAuthAccountKey, not the full overlay.ClaudeJSONPrivateKeys
-// blacklist the launch-time merge (mergeClaudeJSON) and the fuse merged view
-// honor: at add time, copying projects and userID gives the new account
-// continuity with plain claude.
-//
-// The file is written to the provider's private root (never through a fuse
-// mount, which may not be up in a CLI process) via temp+rename, so a
-// concurrently launched claude never sees a partial file. An existing
-// destination is overwritten only when it is a pre-login stub (no
-// oauthAccount); logged-in state is kept.
+// claude's ~/.claude.json) verbatim except the top-level oauthAccount identity,
+// which is stripped (`claude /login` writes the account's own). It strips ONLY
+// overlay.OAuthAccountKey, not the full overlay.ClaudeJSONPrivateKeys blacklist
+// that mergeClaudeJSON and the fuse view honor, so projects and userID carry
+// over. Written to the provider's private root, not a fuse mount that may be
+// down in a CLI process.
 func seedClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (SeedOutcome, error) {
 	dst := filepath.Join(prov.PrivateRoot(accountDir), ".claude.json")
 

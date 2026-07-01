@@ -8,13 +8,9 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// TestFuseGrantHintFlipsWithBackend is the headline blind-consumer proof: cc-pool
-// holds NO pane literal of its own, so handing fuseGrantHint a different backend
-// flips the rendered pane and deep link with zero cc-pool code change. The
-// expected pane/URL are derived from each backend's fkoverlay.Enablement — never
-// a hardcoded string in this test — so the assertion proves cc-pool sources its
-// guidance entirely from fusekit. NFS -> "Network Volumes", FSKit -> "Login
-// Items"; cc-pool ships neither.
+// TestFuseGrantHintFlipsWithBackend proves cc-pool holds no pane literal:
+// fuseGrantHint's pane and deep link come entirely from the backend's
+// fkoverlay.Enablement, so a different backend flips the output with zero cc-pool change.
 func TestFuseGrantHintFlipsWithBackend(t *testing.T) {
 	for _, backend := range []fkoverlay.Backend{fkoverlay.BackendNFS, fkoverlay.BackendFSKit} {
 		backend := backend
@@ -37,12 +33,8 @@ func TestFuseGrantHintFlipsWithBackend(t *testing.T) {
 	}
 }
 
-// TestFuseGrantHintIsNotPinnedToOneBackend proves the helper is not secretly
-// hardcoded to one backend's pane: the FSKit hint must NOT carry the NFS pane and
-// vice-versa. Both panes are read from fkoverlay.Enablement, so a regression that
-// reintroduced a cc-pool literal (or stopped consulting the passed backend) would
-// fail here. Each pane is a distinct, non-overlapping substring of the other, so
-// a true blind consumer keeps them apart.
+// TestFuseGrantHintIsNotPinnedToOneBackend proves the helper is not hardcoded to
+// one backend's pane: the FSKit hint must not carry the NFS pane, nor vice-versa.
 func TestFuseGrantHintIsNotPinnedToOneBackend(t *testing.T) {
 	nfsPane := fkoverlay.BackendNFS.Enablement().Pane
 	fskitPane := fkoverlay.BackendFSKit.Enablement().Pane
@@ -61,9 +53,8 @@ func TestFuseGrantHintIsNotPinnedToOneBackend(t *testing.T) {
 	}
 }
 
-// TestFuseGrantHintNoGrantBackend pins the symlink path: a backend that needs no
-// grant yields a bare permission line with no pane and no deep link, never a
-// fuse pane bled in from a hardcoded literal.
+// TestFuseGrantHintNoGrantBackend pins the symlink path: a grant-less backend
+// yields a bare permission line, no pane and no deep link.
 func TestFuseGrantHintNoGrantBackend(t *testing.T) {
 	hint := fuseGrantHint(fkoverlay.BackendSymlink)
 	if strings.Contains(hint, "Settings") {
@@ -75,10 +66,9 @@ func TestFuseGrantHintNoGrantBackend(t *testing.T) {
 }
 
 // TestOverlayKindPersistenceFailsLoud documents cc-pool's no-migration stance:
-// the legacy "fuse" overlay_kind no longer parses (it never named a concrete
-// backend), and fuseBackedRow reads it as NON-fuse — the safe degrade, so a
-// stranded legacy row falls onto the always-available symlink path rather than
-// being treated as a live mount. The valid backends round-trip through Parse.
+// the legacy "fuse" overlay_kind no longer parses and fuseBackedRow reads it as
+// non-fuse — the safe degrade onto the symlink path, never a live mount. Valid
+// backends round-trip through Parse.
 func TestOverlayKindPersistenceFailsLoud(t *testing.T) {
 	t.Run("legacy fuse fails Parse", func(t *testing.T) {
 		_, err := fkoverlay.Parse("fuse")

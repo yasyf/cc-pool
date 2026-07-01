@@ -11,69 +11,50 @@ import (
 	"time"
 )
 
-// This file holds the untagged deep-probe contract: the synthetic probe file's
-// name and size (served by the shared fusekit-holder's probe view, holderfs/
-// probe.go) plus DeepProbeWithin, the bounded full read the daemon runs through
-// the kernel mount to detect a partially wedged mirror. It compiles in every
-// build variant so the daemon and CLI can errors.Is against probe verdicts that
-// crossed a process boundary.
+// Deliberately untagged: every build variant must compile this so daemon and
+// CLI can errors.Is probe verdicts across process boundaries.
 
-// ProbeFileName is the synthetic read-only file the holder serves at the mount
-// root for deep wedge probing. It is the path cc-pool passes as the mount's
-// ProbePath. It is purely virtual: it never exists in the backing ~/.claude, is
-// hidden from Readdir, and rejects all writes.
+// ProbeFileName is the synthetic read-only probe file the holder serves at
+// the mount root; it never exists in the backing ~/.claude and is hidden from
+// Readdir.
 const ProbeFileName = ".ccp-probe"
 
-// ProbeFileSize is the probe file's fixed size: 2 MiB. The observed wedge
-// mechanism is multi-READ-RPC readahead — a wedged fuse-t mirror served small
-// stats and reads instantly while a 1.5 MB sequential read (the only
-// confirmed-bad data point) hung forever — so the probe must be comfortably
-// above that and span many NFS READ RPCs; small reads provably succeed on a
-// wedged mirror and would report it healthy. This is a WIRE CONTRACT with the
-// holder: it must equal holderfs's probeSize (the holder serves exactly this
-// many bytes and readProbeFile rejects any other count as wedged).
+// ProbeFileSize is the probe file's fixed size, 2 MiB. A wedged fuse-t mirror
+// answers small stats and reads instantly but hangs a multi-RPC sequential read
+// (1.5 MB was the confirmed-bad case), so the probe must span many NFS READ
+// RPCs to catch the wedge. WIRE CONTRACT: equals holderfs's probeSize —
+// readProbeFile rejects any other byte count as wedged.
 const ProbeFileSize = 2 << 20
 
 var (
-	// ErrProbeMissing means dir does not serve a readable probe file to an
-	// external opener: the open returned ENOENT, or a permission-class refusal
-	// (EPERM/EACCES). Both are the signature of a mirror mounted by a holder
-	// that predates the probe-in-daemon contract — the deep probe moved from the
-	// holder into the daemon, so a pre-move holder's mirror refuses the daemon's
-	// external open. Callers treat it as "no verdict" — never as a wedge — so
-	// old-holder mounts keep working across an upgrade until they are naturally
-	// remounted.
+	// ErrProbeMissing means the open returned ENOENT or a permission refusal
+	// (EPERM/EACCES): the mirror serves no probe to an external opener, the
+	// signature of an old holder predating the probe. Callers treat it as no
+	// verdict, never a wedge, so such mounts survive upgrades until remounted.
 	ErrProbeMissing = errors.New("probe file missing")
 
 	// ErrProbeWedged means the deep probe could not pull the full probe file
-	// through the kernel mount in time: the read (or its open) parked past the
-	// probe timeout, or EOF arrived short of ProbeFileSize. Either way the
-	// mirror is serving metadata but not bulk data — the partial-wedge
-	// signature — and callers must treat the mount as dead.
+	// through the kernel mount in time — parked past the timeout, or EOF short
+	// of ProbeFileSize. The mirror serves metadata but not bulk data; treat as
+	// dead.
 	ErrProbeWedged = errors.New("deep probe wedged")
 )
 
-// deepProbeTimeout bounds one DeepProbeWithin read. A var, not a const, so
-// tests can shrink it.
+// deepProbeTimeout is a var, not a const, so tests can shrink it.
 var deepProbeTimeout = 5 * time.Second
 
-// deepProbes joins concurrent deep probes per dir. Deliberately its OWN
-// StatProbes instance, never shared with the shallow stat probes (fusekit's
-// aliveProbes, mountd's liveProbes): a parked 2 MiB read against a wedged mirror
-// must never block a shallow liveness stat behind its join.
+// deepProbes joins concurrent deep probes per dir. Its OWN StatProbes, never
+// shared with the shallow stat probes: a parked 2 MiB read must never block a
+// shallow liveness stat behind its join.
 var deepProbes StatProbes[error]
 
-// DeepProbeWithin reads dir's probe file (dir/ProbeFileName) in full through
-// the kernel mount, bounded by the package's deep-probe timeout. nil means
-// the mirror moved ProbeFileSize bytes of FRESH bulk data: the full byte
-// count arrived AND the 8-byte header nonce differs from this process's
-// previous probe of the same file — the mirror mints a new nonce per open, so
-// a repeat means the read was served by a cache, not the mirror, and counts
-// as wedged. Sentinels: ErrProbeMissing (no verdict: pre-probe holder),
-// ErrProbeWedged (timed out, short read, or replayed nonce). Concurrent
-// callers for the same dir join one in-flight read; a wedged probe parks
-// exactly one goroutine and one fd until the kernel finally answers (see
-// StatProbes).
+// DeepProbeWithin reads dir's probe file in full through the kernel mount,
+// bounded by the deep-probe timeout. nil means the mirror moved ProbeFileSize
+// FRESH bytes: the full count arrived AND the header nonce differs from this
+// process's last probe of the file (a repeat is a cache replay, counted
+// wedged). Returns ErrProbeMissing (no verdict) or ErrProbeWedged (timeout,
+// short read, or replayed nonce). Concurrent callers for a dir join one
+// in-flight read; a wedged probe parks one goroutine and one fd.
 func DeepProbeWithin(dir string) error {
 	path := filepath.Join(dir, ProbeFileName)
 	err, ok := deepProbes.Do(dir, deepProbeTimeout, func() error { return readProbeFile(path) })
@@ -83,38 +64,28 @@ func DeepProbeWithin(dir string) error {
 	return err
 }
 
-// lastProbeNonce remembers, per probe-file path, the header nonce the last
-// successful full read observed, making the anti-cache defense self-verifying:
-// the mirror mints a fresh random nonce per open, so observing the same nonce
-// twice proves the bytes came from a cache replay, not the mirror. Guarded by
-// probeNonceMu; bounded by the number of probed account dirs.
+// lastProbeNonce holds, per probe-file path, the nonce the last full read saw;
+// a repeat proves a cache replay. Guarded by probeNonceMu.
 var (
 	probeNonceMu   sync.Mutex
 	lastProbeNonce = map[string]uint64{}
 )
 
-// readProbeFile is DeepProbeWithin's unbounded body: open, defeat the page
-// cache, read to EOF, verify the byte count, and verify the header nonce is
-// fresh (see lastProbeNonce). It runs inside a deepProbes goroutine; on a
-// wedged mirror it parks in open or read until the kernel answers.
+// readProbeFile is DeepProbeWithin's unbounded body; on a wedged mirror it
+// parks in open or read until the kernel answers.
 func readProbeFile(path string) error {
 	f, err := os.Open(path) //nolint:gosec // G304: path is a cc-pool-managed overlay mirror file under the state dir
 	if err != nil {
-		// ENOENT and a permission-class refusal (EPERM/EACCES → os.ErrPermission)
-		// both mean this mirror does not serve a readable probe to an external
-		// opener — a holder predating the probe-in-daemon move. No verdict (see
-		// ErrProbeMissing): never a wedge. A genuine partial wedge is the timeout
-		// or short/replayed read below, never an instant open refusal.
+		// ENOENT or permission refusal: no probe served, not a wedge (see
+		// ErrProbeMissing).
 		if os.IsNotExist(err) || errors.Is(err, os.ErrPermission) {
 			return fmt.Errorf("%w: %s", ErrProbeMissing, path)
 		}
 		return fmt.Errorf("deep probe open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
-	// disableReadCache: without it the NFS client's page cache can satisfy the
-	// whole read after the first probe, proving nothing about the mirror. The
-	// mirror's advancing-mtime Getattr is the second half of the same defense.
-	// It is a no-op off Darwin (the mount holder only runs on macOS/fuse-t).
+	// Without this the NFS page cache can satisfy the whole read after the first
+	// probe, proving nothing; no-op off Darwin (holder is macOS/fuse-t only).
 	if err := disableReadCache(f); err != nil {
 		return fmt.Errorf("deep probe %s: disable read cache: %w", path, err)
 	}
@@ -141,14 +112,10 @@ func readProbeFile(path string) error {
 	return nil
 }
 
-// FillProbe writes the probe file's deterministic pattern into buff, which
-// holds the file's bytes starting at offset ofst (ofst must be >= 0; callers
-// clamp at ProbeFileSize — the pattern itself is defined for every offset).
-// Bytes 0-7 of the file are the big-endian nonce, so a reader can recover
-// which open it is observing from the header alone; every later byte is a
-// cheap mix of (nonce, offset). The per-open nonce makes consecutive probes
-// byte-distinguishable: a page cache replaying a previous open's data is
-// caught by the header, not just by luck.
+// FillProbe writes the probe's deterministic pattern into buff, holding the
+// file's bytes from offset ofst (>= 0). Bytes 0-7 are the big-endian nonce;
+// every later byte is a cheap mix of (nonce, offset). The per-open nonce makes
+// consecutive probes byte-distinguishable so a cache replay is caught.
 func FillProbe(nonce uint64, ofst int64, buff []byte) {
 	var header [8]byte
 	binary.BigEndian.PutUint64(header[:], nonce)
@@ -162,9 +129,8 @@ func FillProbe(nonce uint64, ofst int64, buff []byte) {
 	}
 }
 
-// probeByte is one body byte of the probe pattern: a splitmix64-style mix of
-// the nonce and the byte's file offset. Cheap on purpose — the mirror
-// regenerates it for every NFS READ of the 2 MiB file.
+// probeByte is one body byte: a splitmix64-style mix of nonce and file offset,
+// cheap because the mirror regenerates it for every NFS READ.
 func probeByte(nonce uint64, off int64) byte {
 	x := nonce + uint64(off)*0x9E3779B97F4A7C15 //nolint:gosec // G115: off is a non-negative file offset; the wraparound is intended for the probe hash
 	x ^= x >> 30

@@ -7,12 +7,8 @@ import (
 	"path/filepath"
 )
 
-// credentialFile is the basename of claude's plaintext credential store. claude
-// writes the OAuth blob to $CONFIG_DIR/.credentials.json (the "plaintext"
-// backend) when the macOS Keychain is unavailable — e.g. a headless SSH session
-// with no usable login keychain. The file holds the identical
-// {"claudeAiOauth":{…}} JSON as the Keychain secret, written 0600, so the same
-// Credential type round-trips it.
+// credentialFile is claude's plaintext credential fallback, written when the
+// Keychain is unavailable. Same {"claudeAiOauth":…} JSON as the Keychain secret.
 const credentialFile = ".credentials.json"
 
 // Source identifies which backend currently holds an account's credential.
@@ -50,9 +46,8 @@ func ReadFileCredential(configDir string) (*Credential, error) {
 	return parseCredential(b)
 }
 
-// WriteFileCredential writes cred to configDir's plaintext credential file via
-// temp+rename at 0600, mirroring claude's own atomic write so a concurrent
-// reader never sees a partial file.
+// WriteFileCredential writes cred to configDir's plaintext credential file at
+// 0600, atomically so a concurrent reader never sees a partial file.
 func WriteFileCredential(configDir string, cred *Credential) error {
 	blob, err := cred.Marshal()
 	if err != nil {
@@ -61,11 +56,9 @@ func WriteFileCredential(configDir string, cred *Credential) error {
 	return writeCredentialFile(FileCredentialPath(configDir), blob)
 }
 
-// LocateCredential resolves where an account's live credential lives: the
-// Keychain first (claude's own preference whenever it is reachable), else the
-// plaintext file. It returns the Keychain account label claude stored (or the
-// computed label for the file source, which carries no -a attribute) and the
-// source, or ErrNotFound when neither backend holds it.
+// LocateCredential resolves an account's live credential, Keychain first (as
+// claude prefers) then the plaintext file. Returns the account label (computed
+// for the file, which has no -a), the source, or ErrNotFound if neither holds it.
 func LocateCredential(configDir, service string) (account string, src Source, err error) {
 	acct, err := DiscoverAccount(service)
 	if err == nil {
@@ -80,9 +73,8 @@ func LocateCredential(configDir, service string) (account string, src Source, er
 	return "", SourceKeychain, ErrNotFound
 }
 
-// writeCredentialFile writes data to path via temp+rename in path's directory
-// at 0600, creating the directory if missing. The temp name keeps the
-// .credentials.json. prefix so it too is held back by overlay.PrivateEntry.
+// writeCredentialFile writes via temp+rename at 0600. The temp keeps the
+// .credentials.json. prefix so overlay.PrivateEntry holds it back too.
 func writeCredentialFile(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {

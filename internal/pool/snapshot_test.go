@@ -8,7 +8,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// seedClimb inserts a steady +2%/3min usage climb ending at util at base.
+// seedClimb seeds a +2%/3min climb ending at util.
 func seedClimb(t *testing.T, st *store.Store, accountID int, base time.Time, util float64) {
 	t.Helper()
 	for i := 0; i < 5; i++ {
@@ -23,9 +23,7 @@ func seedClimb(t *testing.T, st *store.Store, accountID int, base time.Time, uti
 	}
 }
 
-// seed7dClimb inserts a steady 7d-window climb (2%/2h, dropping back in time)
-// spanning 6h and ending at util at base. The 5h field tracks too so the rows
-// are realistic, but only Util7d matters here.
+// seed7dClimb seeds a 7d-window climb; Util5h is set only for realism.
 func seed7dClimb(t *testing.T, st *store.Store, accountID int, base time.Time, util float64) {
 	t.Helper()
 	for i := 0; i < 4; i++ {
@@ -40,8 +38,7 @@ func seed7dClimb(t *testing.T, st *store.Store, accountID int, base time.Time, u
 	}
 }
 
-// TestSnapshotBurn7d pins the standalone gated 7d drain on Snapshot: a fresh
-// 6h climb yields the secant burn, while a stale latest sample gates it to 0.
+// TestSnapshotBurn7d pins Snapshot's gated 7d drain.
 func TestSnapshotBurn7d(t *testing.T) {
 	cases := map[string]struct {
 		sampleAge time.Duration
@@ -81,10 +78,9 @@ func TestSnapshotBurn7d(t *testing.T) {
 	}
 }
 
-// TestSnapshotsForecast pins the gated/ungated burn split: the scoring burn
-// stays live on a stale sample (reservation re-ranks need it), while the
-// display forecast zeroes out past DisplayStaleAfter. Reverting either half
-// of the split fails one of the two cases.
+// TestSnapshotsForecast pins the gated/ungated burn split: the scoring burn stays
+// live on a stale sample (reservation re-ranks need it) while the display forecast
+// zeroes out past DisplayStaleAfter.
 func TestSnapshotsForecast(t *testing.T) {
 	cases := map[string]struct {
 		sampleAge    time.Duration

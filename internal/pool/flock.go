@@ -11,27 +11,23 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// flockPollInterval is how often flockAcquire retries a contended lock while
-// waiting for the holder (in another process) to release.
 const flockPollInterval = 25 * time.Millisecond
 
-// flockHandle owns an acquired advisory lock; release drops it.
+// flockHandle owns an acquired advisory lock.
 type flockHandle struct {
 	f *os.File
 }
 
-// release drops the advisory lock and closes the file. The lock file itself is
-// left on disk on purpose: unlinking it under flock races other processes that
-// have it open.
+// release drops the lock; the lock file is left on disk on purpose: unlinking
+// under flock races other processes that have it open.
 func (h *flockHandle) release() {
 	_ = unix.Flock(int(h.f.Fd()), unix.LOCK_UN)
 	_ = h.f.Close()
 }
 
-// flockAcquire takes an exclusive cross-process advisory lock on path, creating
-// the file (and its parent dir) if needed. It blocks until the lock is held or
-// ctx is done, polling rather than blocking in the syscall so cancellation is
-// observed and no goroutine is leaked on a stuck holder.
+// flockAcquire takes an exclusive cross-process advisory lock on path. It polls
+// rather than blocking in the syscall so ctx cancellation is observed and no
+// goroutine leaks on a stuck holder.
 func flockAcquire(ctx context.Context, path string) (*flockHandle, error) {
 	//nolint:gosec // G703: path is a cc-pool-owned lock path under the state dir, not user-tainted input
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

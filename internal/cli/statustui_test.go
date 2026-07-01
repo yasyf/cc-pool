@@ -14,9 +14,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// fakeToggle records TogglePin calls and returns an injectable error.
 type fakeToggle struct {
-	calls []int // account ids, in order
+	calls []int
 	err   error
 }
 
@@ -25,8 +24,6 @@ func (f *fakeToggle) fn(accountID int) (bool, error) {
 	return f.err == nil, f.err
 }
 
-// pinTUI builds a model with two accounts (cursor on acct-2, the worse one),
-// an optional current pin, and a fake toggle.
 func pinTUI(cwd string, pin dirPin, ft *fakeToggle) statusTUI {
 	best := pool.Snapshot{Account: store.Account{ID: 1, Label: "alice@example.com"}, Score: 90, HasUsage: true}
 	busy := pool.Snapshot{Account: store.Account{ID: 2, Label: "bob@example.com"}, Score: 50, HasUsage: true}
@@ -49,9 +46,7 @@ func pressP(t *testing.T, tui statusTUI) (statusTUI, tea.Cmd) {
 	return out, cmd
 }
 
-// TestStatusTUIPinToggle drives the 'p' key end to end: the async toggle Cmd
-// fires against the cursor's account, the busy debounce drops repeats, and the
-// inert configurations issue nothing.
+// TestStatusTUIPinToggle drives the 'p' pin-toggle key end to end.
 func TestStatusTUIPinToggle(t *testing.T) {
 	t.Run("p toggles the cursor's account", func(t *testing.T) {
 		ft := &fakeToggle{}
@@ -59,7 +54,7 @@ func TestStatusTUIPinToggle(t *testing.T) {
 		if !tui.pinBusy || cmd == nil {
 			t.Fatalf("p must mark busy and return a Cmd, busy=%v cmd=%v", tui.pinBusy, cmd)
 		}
-		msg := cmd() // run the toggle synchronously
+		msg := cmd()
 		if len(ft.calls) != 1 || ft.calls[0] != 2 {
 			t.Fatalf("toggle calls = %v, want [2]", ft.calls)
 		}
@@ -104,8 +99,7 @@ func TestStatusTUIPinToggle(t *testing.T) {
 	})
 }
 
-// TestStatusTUIPinErrorSurfaced: a failed toggle surfaces in the footer, keeps
-// the model usable, and a subsequent success clears it.
+// TestStatusTUIPinErrorSurfaced: a failed toggle surfaces; success clears it.
 func TestStatusTUIPinErrorSurfaced(t *testing.T) {
 	ft := &fakeToggle{err: errors.New("database is locked")}
 	tui, cmd := pressP(t, pinTUI("/proj", dirPin{}, ft))
@@ -122,7 +116,6 @@ func TestStatusTUIPinErrorSurfaced(t *testing.T) {
 		t.Fatalf("error not surfaced:\n%s", view)
 	}
 
-	// Recovery: the next successful toggle clears the error.
 	ft.err = nil
 	tui, cmd = pressP(t, tui)
 	model, _ = tui.Update(cmd())
@@ -132,11 +125,9 @@ func TestStatusTUIPinErrorSurfaced(t *testing.T) {
 	}
 }
 
-// TestStatusTUIDetailNeedsLoginPenalty: the detail pane renders the needs-login
-// penalty row exactly when the scorer engaged it, matching the format of the
-// adjacent rate-limited row, and omits it when the penalty is zero.
+// TestStatusTUIDetailNeedsLoginPenalty: the detail pane shows the needs-login
+// row only when the penalty is engaged.
 func TestStatusTUIDetailNeedsLoginPenalty(t *testing.T) {
-	// The cursor sits on acct-2 (snaps[1]), so its Components drive renderDetail.
 	want := fmt.Sprintf("  %-18s %+5.1f", "needs-login", -score.PenNeedsLogin)
 
 	t.Run("rendered when the penalty is engaged", func(t *testing.T) {
@@ -157,9 +148,7 @@ func TestStatusTUIDetailNeedsLoginPenalty(t *testing.T) {
 	})
 }
 
-// TestStatusTUIViewShowsPin: the pinned account's row is badged, the detail
-// pane names the pin when the cursor sits on it, the summary line renders, and
-// the footer advertises 'p' only when a cwd exists.
+// TestStatusTUIViewShowsPin covers pin badges, summary, detail, and footer hints.
 func TestStatusTUIViewShowsPin(t *testing.T) {
 	pin := dirPin{cwd: "/proj", ok: true, view: pool.PinView{
 		AccountID: 2, Manual: true, Binding: true, ExpiresAt: time.Now().Add(30 * time.Minute),
@@ -168,11 +157,9 @@ func TestStatusTUIViewShowsPin(t *testing.T) {
 	tui.width = 120
 	view := stripANSI(tui.View())
 
-	// Cursor sits on bob, the pinned account: the footer names the release.
 	if !strings.Contains(view, "p unpin") {
 		t.Fatalf("footer must advertise unpinning the pinned account:\n%s", view)
 	}
-	// On an unpinned account the same key reads as a pin.
 	other := tui
 	other.cursorID = 1
 	if v := stripANSI(other.View()); !strings.Contains(v, "p pin ") || strings.Contains(v, "p unpin") {
@@ -193,12 +180,10 @@ func TestStatusTUIViewShowsPin(t *testing.T) {
 	if !strings.Contains(bobRow, "pinned") {
 		t.Fatalf("pinned row must be badged: %q", bobRow)
 	}
-	// Cursor sits on bob (the pinned account): the detail pane names the pin.
 	if !strings.Contains(view, "pinned to this directory (manual)") {
 		t.Fatalf("detail pane must name the pin:\n%s", view)
 	}
 
-	// Without a cwd the key is hidden and no pin line renders.
 	bare := pinTUI("", dirPin{}, &fakeToggle{})
 	bare.width = 120
 	view = stripANSI(bare.View())
@@ -207,10 +192,9 @@ func TestStatusTUIViewShowsPin(t *testing.T) {
 	}
 }
 
-// fakeLogin records buildLogin/finishLogin calls and returns injectable results.
 type fakeLogin struct {
-	built     []int // account ids passed to buildLogin
-	finished  []int // account ids passed to finishLogin
+	built     []int
+	finished  []int
 	buildErr  error
 	finishErr error
 }
@@ -220,8 +204,7 @@ func (f *fakeLogin) build(a store.Account) (*exec.Cmd, error) {
 	if f.buildErr != nil {
 		return nil, f.buildErr
 	}
-	// A valid *exec.Cmd that is never started — tests drive the messages the
-	// ExecProcess callback would emit rather than running the process.
+	// Never started: tests drive the ExecProcess messages directly.
 	return exec.Command("true"), nil
 }
 
@@ -230,8 +213,6 @@ func (f *fakeLogin) finish(a store.Account) error {
 	return f.finishErr
 }
 
-// reloginTUI builds a model with a healthy acct-1 and a needs-login acct-2, the
-// cursor on acct-2, and a fake login.
 func reloginTUI(fl *fakeLogin) statusTUI {
 	healthy := pool.Snapshot{Account: store.Account{ID: 1, Label: "alice@example.com"}, Score: 90, HasUsage: true}
 	stale := pool.Snapshot{Account: store.Account{ID: 2, Label: "bob@example.com"}, Score: 50, HasUsage: true, NeedsLogin: true}
@@ -253,9 +234,7 @@ func pressA(t *testing.T, tui statusTUI) (statusTUI, tea.Cmd) {
 	return out, cmd
 }
 
-// TestStatusTUIReloginAction drives the 'a' key: it builds a login for the
-// needs-login account, the post-exit finish runs off the UI goroutine, the busy
-// debounce drops repeats, and inert configurations issue nothing.
+// TestStatusTUIReloginAction drives the 'a' re-login key end to end.
 func TestStatusTUIReloginAction(t *testing.T) {
 	bob := store.Account{ID: 2, Label: "bob@example.com"}
 
@@ -268,8 +247,6 @@ func TestStatusTUIReloginAction(t *testing.T) {
 		if len(fl.built) != 1 || fl.built[0] != 2 {
 			t.Fatalf("buildLogin calls = %v, want [2]", fl.built)
 		}
-		// Simulate claude exiting cleanly; driving the message directly avoids
-		// running the real ExecProcess child.
 		model, finish := tui.Update(reloginExitedMsg{account: bob})
 		tui = model.(statusTUI)
 		if finish == nil {
@@ -308,7 +285,7 @@ func TestStatusTUIReloginAction(t *testing.T) {
 	t.Run("inert on a healthy account", func(t *testing.T) {
 		fl := &fakeLogin{}
 		tui := reloginTUI(fl)
-		tui.cursorID = 1 // alice, not flagged
+		tui.cursorID = 1
 		got, cmd := pressA(t, tui)
 		if cmd != nil || got.reloginBusy || len(fl.built) != 0 {
 			t.Fatalf("a on a healthy account must be inert: cmd=%v busy=%v built=%v", cmd, got.reloginBusy, fl.built)
@@ -350,8 +327,7 @@ func TestStatusTUIReloginAction(t *testing.T) {
 	})
 }
 
-// TestStatusTUIReloginErrorSurfaced: a failed finish surfaces in the footer and
-// keeps the model usable, and a process error short-circuits the finish step.
+// TestStatusTUIReloginErrorSurfaced: a failed finish surfaces; success clears it.
 func TestStatusTUIReloginErrorSurfaced(t *testing.T) {
 	bob := store.Account{ID: 2, Label: "bob@example.com"}
 
@@ -375,7 +351,6 @@ func TestStatusTUIReloginErrorSurfaced(t *testing.T) {
 		t.Fatalf("error not surfaced:\n%s", view)
 	}
 
-	// Recovery: the next successful re-login clears the error and refreshes.
 	fl.finishErr = nil
 	tui, _ = pressA(t, tui)
 	model, finish = tui.Update(reloginExitedMsg{account: bob})
@@ -390,15 +365,14 @@ func TestStatusTUIReloginErrorSurfaced(t *testing.T) {
 	}
 }
 
-// TestStatusTUIReloginFooter: the 'a re-login' hint shows only when the cursor
-// sits on a needs-login account.
+// TestStatusTUIReloginFooter: 'a re-login' shows only on a needs-login account.
 func TestStatusTUIReloginFooter(t *testing.T) {
 	tui := reloginTUI(&fakeLogin{})
 	tui.width = 120
 	if v := stripANSI(tui.View()); !strings.Contains(v, "a re-login") {
 		t.Fatalf("footer must advertise re-login on a needs-login account:\n%s", v)
 	}
-	tui.cursorID = 1 // alice, healthy
+	tui.cursorID = 1
 	if v := stripANSI(tui.View()); strings.Contains(v, "a re-login") {
 		t.Fatalf("footer must hide re-login on a healthy account:\n%s", v)
 	}

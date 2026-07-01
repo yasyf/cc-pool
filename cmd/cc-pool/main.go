@@ -18,11 +18,9 @@ func main() {
 	defer stop()
 
 	root := cli.NewRootCmd()
-	// Present the invoked name (ccp or cc-pool) in help/usage.
 	if base := filepath.Base(os.Args[0]); base == "ccp" {
 		root.Use = "ccp"
 	}
-	// Treat a flag-leading bare invocation (`ccp --resume`) as `ccp run …`.
 	root.SetArgs(cli.InjectRun(os.Args[1:]))
 
 	if err := root.ExecuteContext(ctx); err != nil {

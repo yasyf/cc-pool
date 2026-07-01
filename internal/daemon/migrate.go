@@ -11,28 +11,16 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// defaultMigrateBudget bounds one migrate request's conversion work so the
-// response always lands inside handle()'s extended conn deadline (140s) and
-// the client's 150s timeout — the server, not a dead socket, must report the
-// outcome. Each conversion can take ~16s worst case (8s mount wait, bounded
-// rollback teardown), so a big pool can exceed any fixed deadline; accounts
-// the budget cannot reach are reported busy and swept by a re-run, which the
-// rollout already requires for session-busy accounts.
+// defaultMigrateBudget keeps a migrate response inside handle()'s extended
+// 140s conn deadline and the client's 150s timeout.
 const defaultMigrateBudget = 120 * time.Second
 
-// handleMigrate converts accounts between overlay providers. Only the daemon
-// can do this: the mounts live in the detached holder, but the daemon alone
-// can gate the conversion against its own select reservations atomically.
-// Busy accounts
-// (live sessions or reservations) are skipped and reported so the client can
-// re-run later; per-account failures are rolled back by ConvertOverlay.
+// handleMigrate converts accounts between overlay providers; only the daemon
+// can gate conversions against its own select reservations.
 func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 	var to fkoverlay.Backend
 	switch req.To {
 	case "fuse":
-		// "fuse" is the user's coarse word; the gate resolves the concrete
-		// backend (nfs/fskit) by running Select inside the daemon, so the CLI
-		// never names a concrete fuse backend.
 		backend, msg := s.fuseGate(ctx)
 		if msg != "" {
 			return Response{OK: false, Error: msg}
@@ -87,11 +75,8 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 	}
 
 	resp := Response{OK: true, Migrations: results}
-	// Record the new-account default. Toward fuse, reaching here means the fuse
-	// gate already passed (the holder probe proved this machine mounts), so adopt
-	// fuse even when nothing needed converting — otherwise `ccp fuse enable` on a
-	// fresh or already-fuse pool would leave the default on symlink. The symlink
-	// retreat only flips the default when an account actually converted back.
+	// Fuse flips the new-account default even with zero conversions, so a fresh
+	// pool doesn't stay on symlink.
 	if to.IsFuse() || converted {
 		if err := s.m.SetDefaultOverlayKind(to); err != nil {
 			resp.OK = false
@@ -101,11 +86,9 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 	return resp
 }
 
-// fuseGate reports why fuse mirrors cannot be hosted right now, or "" when
-// they can. The probe runs in the mount holder deliberately: mount capability
-// and the macOS volume-access grant are per-process, and the holder is
-// the process that hosts the mounts — so a missing grant fails here, before
-// any account is disturbed.
+// fuseGate reports why fuse mirrors cannot be hosted, or "" when they can.
+// The probe runs in the mount holder: the macOS volume-access grant is
+// per-process, so a missing grant fails here before any account is disturbed.
 func (s *Server) fuseGate(ctx context.Context) (fkoverlay.Backend, string) {
 	if s.fuseGateFn != nil {
 		return s.fuseGateFn()
@@ -113,9 +96,6 @@ func (s *Server) fuseGate(ctx context.Context) (fkoverlay.Backend, string) {
 	if !pool.CanHostFuse() {
 		return "", "fuse is not available on this machine; run `ccp fuse enable` to install the fusekit-holder cask"
 	}
-	// The reason leads verbatim: a declined probe carries its own fuse-t/TCC
-	// remedy, while holder spawn or probe-RPC failures name their real cause —
-	// advice that fits one would mislead for the others.
 	backend, reason := pool.DetectOverlayBackend(ctx)
 	if !backend.IsFuse() {
 		return "", fmt.Sprintf("fuse unavailable: %s — fix this, then re-run `ccp migrate`", reason)
@@ -123,15 +103,10 @@ func (s *Server) fuseGate(ctx context.Context) (fkoverlay.Backend, string) {
 	return backend, ""
 }
 
-// convertAccount runs one gated conversion, mapping it to a wire outcome.
-// force skips the live-session gate only: the user vouches the dir is idle. It
-// is NOT a license to tear a busy mount down — force-unmounting a busy NFS
-// mirror panics the kernel (nfs_vinvalbuf2: ubc_msync failed), the exact hazard
-// the gate exists to prevent. The unmount runs through the holder's
-// graceful-only teardown, so a dir that is in fact busy fails closed
-// (ErrUnmountWedged -> MigrationFailed) rather than being forced. The claim and
-// reservation gates always hold — those mean another part of the daemon owns
-// the dir right now.
+// convertAccount runs one gated conversion. force skips only the live-session
+// gate; claim/reservation gates always hold, and teardown stays graceful-only
+// (a busy dir fails closed, ErrUnmountWedged) — force-unmounting a busy NFS
+// mirror panics the kernel (nfs_vinvalbuf2).
 func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverlay.Backend, force bool) MigrationResult {
 	res := MigrationResult{ID: a.ID, Label: a.Label, From: a.OverlayKind, To: string(to)}
 	if a.OverlayKind == string(to) {
@@ -145,10 +120,7 @@ func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverl
 	}
 	defer s.endConvert(a.ID)
 
-	// The caller's account list is a snapshot that ages while earlier
-	// conversions run (seconds each); re-read the row now that the claim
-	// makes it stable, so the kind decision and the conversion's writes are
-	// against current state, not the snapshot.
+	// Re-read under the claim: the caller's list is a stale snapshot.
 	a, err := s.m.Store.GetAccount(a.ID)
 	if err != nil {
 		res.Outcome = MigrationFailed
@@ -162,10 +134,7 @@ func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverl
 	}
 
 	if !force {
-		// Never convert blind: a failed scan means we cannot know whether a
-		// live claude has this dir as its config dir. Routed through s.scan (the
-		// same seam fallbackToSymlink and liveSessionGate use) so the gate is
-		// exercisable; production resolves it to procscan.Scan unchanged.
+		// Fail closed: a failed scan cannot rule out a live session in this dir.
 		sessions, err := s.scan(ctx)
 		if err != nil {
 			res.Outcome = MigrationFailed
@@ -185,11 +154,8 @@ func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverl
 		return res
 	}
 	res.Outcome = MigrationDone
-	// Make the conversion's mount state visible to selection immediately — the
-	// next cache refresh is up to a full poll away, and mountReady would
-	// otherwise exclude every freshly-converted fuse account until then (or
-	// keep counting a dismounted mirror in HolderStatus.Mounts after a
-	// retreat).
+	// Sync the mount cache now: mountReady would exclude the fresh conversion
+	// until the next poll.
 	if to.IsFuse() {
 		s.holder.noteMounted(a.ConfigDir)
 	} else {

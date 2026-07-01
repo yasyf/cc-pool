@@ -19,14 +19,12 @@ import (
 	"github.com/yasyf/fusekit/version"
 )
 
-// reportCall is one captured doctor report line.
 type reportCall struct {
 	label   string
 	healthy bool
 	detail  string
 }
 
-// captureReports returns a report func and the slice it appends to.
 func captureReports() (func(string, bool, string), *[]reportCall) {
 	var calls []reportCall
 	return func(label string, healthy bool, detail string) {
@@ -34,19 +32,12 @@ func captureReports() (func(string, bool, string), *[]reportCall) {
 	}, &calls
 }
 
-// TestReportHolder pins the doctor's mount-holder checks over every holderFacts
-// shape: unreachable-with-fuse-rows fails with the cask-install hint,
-// unreachable-without-rows says nothing, and a reachable holder just reports its
-// version — the holder is a separate, multi-tenant product, so there is no
-// "orphan" line for a holder serving no cc-pool mounts and no skew comparison
-// against cc-pool's own version. The daemon's cached TCC block still fails
-// loudly with the fusekit-sourced grant hint.
 func TestReportHolder(t *testing.T) {
 	cur := version.String()
 	cases := map[string]struct {
 		facts    holderFacts
 		fuseRows int
-		want     []reportCall // label + healthy must match; detail is a substring
+		want     []reportCall
 		none     bool
 	}{
 		"unreachable with fuse rows fails with the cask-install hint": {
@@ -84,9 +75,6 @@ func TestReportHolder(t *testing.T) {
 			fuseRows: 1,
 			want: []reportCall{
 				{"mount holder", true, cur},
-				// The raw fusekit error AND the fusekit-sourced grant hint must
-				// both ride the one detail line; the pane/URL come from
-				// Backend.Enablement, not a cc-pool literal.
 				{"mount holder grant", false, "grant Network Volumes access — " + fuseGrantHint(fkoverlay.BackendNFS) + " (cc-pool falls back to symlink automatically if the grant never lands)"},
 			},
 		},
@@ -114,15 +102,12 @@ func TestReportHolder(t *testing.T) {
 	}
 }
 
-// TestReportCarcasses pins the dead-mount check: only a fuse row whose dir is
-// a mountpoint with ~/.claude not visible through it is flagged; live mounts,
-// unmounted dirs, and symlink rows are silent.
 func TestReportCarcasses(t *testing.T) {
 	accts := []store.Account{
-		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendNFS)},     // carcass
-		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(fkoverlay.BackendNFS)},     // live
-		{ID: 3, ConfigDir: "/p/acct-03", OverlayKind: string(fkoverlay.BackendNFS)},     // unmounted
-		{ID: 4, ConfigDir: "/p/acct-04", OverlayKind: string(fkoverlay.BackendSymlink)}, // wrong kind
+		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendNFS)},
+		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(fkoverlay.BackendNFS)},
+		{ID: 3, ConfigDir: "/p/acct-03", OverlayKind: string(fkoverlay.BackendNFS)},
+		{ID: 4, ConfigDir: "/p/acct-04", OverlayKind: string(fkoverlay.BackendSymlink)},
 	}
 	swapVar(t, &dirMounted, func(dir string) bool {
 		return dir != "/p/acct-03"
@@ -143,18 +128,9 @@ func TestReportCarcasses(t *testing.T) {
 	}
 }
 
-// TestReportCarcassesBoundedOnParkedProbe pins doctor's behavior on the exact
-// failure the carcass check exists for: a wedged mirror whose kernel stats
-// park in uninterruptible sleep. The mountpoint arm (dirMounted) is now the
-// non-blocking overlay.Mounted — a cached Getfsstat read that cannot park — so
-// the only wedge-prone seam left is the aliveness arm (mountAliveAt). The bound
-// therefore comes solely from MountAliveWithin/aliveProbes; the harness runs
-// that real machinery (overlay.StatProbes, what the production seam is built
-// on) with the timeout shrunk and the parked row's aliveness stat stuck on a
-// channel, while dirMounted answers mounted instantly for both rows.
-// reportCarcasses must still return within the bound and flag the parked row
-// (an unanswered aliveness stat reads NOT alive, and a mountpoint that is not
-// alive is a carcass), while the healthy fast row stays silent.
+// TestReportCarcassesBoundedOnParkedProbe proves the carcass verdict stays bounded
+// when the aliveness stat (mountAliveAt, the only wedge-prone arm) parks in
+// uninterruptible sleep, running the real overlay.StatProbes behind it.
 func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 	const parkedDir, healthyDir = "/p/acct-01", "/p/acct-02"
 	accts := []store.Account{
@@ -164,9 +140,6 @@ func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 	const probeTimeout = 20 * time.Millisecond
 	var aliveProbes overlay.StatProbes[bool]
 	release := make(chan struct{})
-	// The mountpoint arm is the non-blocking overlay.Mounted: it reads the
-	// kernel mount table and cannot park, so both rows are seen mounted
-	// instantly. Only the aliveness arm reads base THROUGH the mount and wedges.
 	swapVar(t, &dirMounted, func(string) bool { return true })
 	swapVar(t, &mountAliveAt, func(_, dir string) bool {
 		alive, ok := aliveProbes.Do(dir, probeTimeout, func() bool {
@@ -178,8 +151,7 @@ func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 		// overlay.MountAliveWithin's fold: an unanswered stat reads NOT alive.
 		return ok && alive
 	})
-	// Unpark and drain the probe body before the seam restores run
-	// (cleanups run LIFO).
+	// Unpark and drain the probe body before the seam restores run (cleanups run LIFO).
 	t.Cleanup(func() {
 		close(release)
 		deadline := time.Now().Add(5 * time.Second)
@@ -197,9 +169,7 @@ func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 	reportCarcasses(accts, report)
 	elapsed := time.Since(start)
 
-	// Beating the 2s production statProbeTimeout proves the verdict is
-	// bounded, with a wide margin over the single 20ms fake timeout to keep the
-	// assertion unflaky.
+	// 2s is the production statProbeTimeout; the wide margin over the 20ms fake keeps this unflaky.
 	if elapsed >= 2*time.Second {
 		t.Fatalf("reportCarcasses took %v against a parked aliveness probe, want a bounded verdict", elapsed)
 	}
@@ -212,30 +182,20 @@ func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
 	}
 }
 
-// TestReportWedges pins the partial-wedge check: doctor deep-probes every
-// shallow-Live fuse row locally (the holder ships no verdict — the daemon owns
-// the probe, and doctor's independent probe surfaces a wedge even with the
-// daemon down) and reports it only when the probe fails with a real verdict
-// (ErrProbeMissing is no verdict); a not-Live row is left to reportCarcasses;
-// nil mounts (unreachable holder) and symlink rows report nothing and never
-// probe. The wedge copy must carry the metadata-vs-reads signature and the
-// relaunch guidance.
 func TestReportWedges(t *testing.T) {
 	accts := []store.Account{
 		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendNFS)},
 		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(fkoverlay.BackendSymlink)},
 	}
-	// An idle wedge the daemon remounts on its own; a wedge backing live sessions
-	// is LEFT mounted (the daemon never force-unmounts a busy mirror — it panics
-	// the kernel), so the only fix is to relaunch those sessions.
 	wedgeIdleDetail := "wedged (serves metadata but hangs reads) — the daemon will remount it"
+	// The daemon never force-unmounts a busy mirror: it panics the kernel.
 	wedgeBusyDetail := "left mounted under 1 live session(s); relaunch them — the daemon will NOT force-unmount a busy mirror"
 	cases := map[string]struct {
 		mounts     []mountd.MountInfo
 		sessions   []procscan.Session
-		probeErr   error // returned by deepProbeAt when probed
+		probeErr   error
 		want       []reportCall
-		wantProbed []string // dirs deepProbeAt must be called with, in order
+		wantProbed []string
 	}{
 		"live row with failing deep probe and no sessions reports the idle copy": {
 			mounts:     []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b", Live: true}},
@@ -299,11 +259,6 @@ func TestReportWedges(t *testing.T) {
 	}
 }
 
-// TestReportStaleSessions pins the yanked-mount session check: only a session
-// on a fuse row that started MORE than staleSessionSlack before the holder's
-// current mount of that dir is flagged (exactly the slack is not — the >
-// semantics); a zero MountedAt (old holder), a zero StartedAt (unparseable
-// etime), a symlink row, and a session born after the mount all stay silent.
 func TestReportStaleSessions(t *testing.T) {
 	mounted := time.Date(2026, 6, 12, 13, 32, 1, 0, time.Local)
 	fuse := store.Account{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendNFS)}
@@ -378,7 +333,6 @@ func TestReportStaleSessions(t *testing.T) {
 	}
 }
 
-// TestCountFuse pins the fuse-row counter both holder checks key on.
 func TestCountFuse(t *testing.T) {
 	accts := []store.Account{
 		{ID: 1, OverlayKind: string(fkoverlay.BackendNFS)},
@@ -394,15 +348,9 @@ func TestCountFuse(t *testing.T) {
 	}
 }
 
-// TestDoctorHealReportsDiscardedDuplicate pins the CLI-side observability of the
-// crash-repair conflict resolution: a daemon-less `doctor --fix` drives the
-// stranded-private heal itself, so when both roots hold the same private file
-// with differing content it must REPORT — not silently discard — the older
-// copy. The test installs NO ResolvedConflictLogf seam of its own; it relies on
-// checkStrandedPrivate wiring it, so it catches the production silence the
-// default no-op would leave (the daemon-only wiring this fix closed). It then
-// probes the seam to prove the wiring was restored, so it cannot leak into the
-// next command.
+// TestDoctorHealReportsDiscardedDuplicate pins that a daemon-less `doctor --fix`
+// reports rather than silently discards the losing duplicate; it installs no
+// ResolvedConflictLogf seam, so it catches the silence if checkStrandedPrivate stops wiring one.
 func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -423,10 +371,7 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The collision an abnormal shutdown leaves: the same private file in both
-	// the account dir and the stranded backing root, with differing content.
-	// The newer backing copy must survive; the older in-dir copy is discarded
-	// and that discard must be reported.
+	// The collision an abnormal shutdown leaves: same private file in both roots, differing content.
 	priv := fkoverlay.FusePrivateRoot(dir)
 	if err := os.MkdirAll(priv, 0o700); err != nil {
 		t.Fatal(err)
@@ -481,8 +426,6 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 		t.Errorf("healed file = %q, want the newer backing copy", got)
 	}
 
-	// The seam must be restored after the heal, never left pointed at this
-	// command's buffer: a later write through the seam must not reach out.
 	before := out.Len()
 	fkoverlay.ResolvedConflictLogf("leak probe")
 	if out.Len() != before {
@@ -490,10 +433,6 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 	}
 }
 
-// TestDoctorSurfacesFuseFallback pins the degraded-overlay surfacing: an account
-// demoted to symlink while the pool default is fuse (an automatic fallback) is
-// reported with the re-promote guidance — but only when this machine can host
-// fuse, and never for a symlink-default pool or a fuse account.
 func TestDoctorSurfacesFuseFallback(t *testing.T) {
 	cases := map[string]struct {
 		acctKind    string
@@ -514,8 +453,7 @@ func TestDoctorSurfacesFuseFallback(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = st.Close() })
-			// Record the default with fuse-hosting enabled (SetDefaultOverlayKind
-			// refuses a fuse default otherwise), then set the check-time capability.
+			// SetDefaultOverlayKind refuses a fuse default when CanHostFuse is false.
 			m := &pool.Manager{Store: st, CanHostFuse: func() bool { return true }}
 			if err := m.SetDefaultOverlayKind(tc.defaultKind); err != nil {
 				t.Fatal(err)

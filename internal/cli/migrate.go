@@ -65,15 +65,10 @@ migrated-to provider.`,
 	return cmd
 }
 
-// requestMigration runs the client side of an overlay migration, shared by
-// `ccp migrate` and `ccp fuse enable`: require an initialized pool and a healthy
-// daemon at exactly this version (the daemon owns the conversion gates, so a
-// stale-version one cannot be trusted to drive them), then ask it to migrate.
-// account==0 means every account. It deliberately does NOT check this process's
-// own fuse capability: the daemon — not this CLI — hosts the mounts, so
-// `ccp fuse enable` can drive a fuse daemon from a still-pure CLI whose binary
-// was just reinstalled. The daemon is NOT auto-restarted here; the version-skew
-// error recommends a restart plainly, and `ccp fuse enable` forces its own.
+// requestMigration asks the daemon (which owns the conversion gates) to migrate;
+// account==0 means every account. Requires an exact-version daemon, never
+// auto-restarted here. No local fuse-capability check: the daemon hosts the
+// mounts, so a still-pure, just-reinstalled CLI can drive a fuse daemon.
 func requestMigration(m *pool.Manager, to string, account int, force bool) (*daemon.Response, error) {
 	if err := requireInit(m); err != nil {
 		return nil, err
@@ -84,9 +79,7 @@ func requestMigration(m *pool.Manager, to string, account int, force bool) (*dae
 	case errors.Is(err, daemon.ErrDaemonUnavailable):
 		return nil, fmt.Errorf("migration runs inside the daemon (it owns the conversion gates), which is not running; start it with `ccp service install` and re-run: %w", err)
 	case err != nil:
-		// A daemon that accepted the dial but failed the probe is hung, not
-		// absent. Surface that as-is — a restart would be mount-safe, but
-		// prescribing one for a hang would mask the real failure.
+		// Dial ok, probe failed: hung not absent — don't prescribe a restart (masks the real failure).
 		return nil, fmt.Errorf("daemon health check: %w", err)
 	}
 	if health.Version != version.String() {
@@ -103,9 +96,6 @@ func requestMigration(m *pool.Manager, to string, account int, force bool) (*dae
 	return resp, nil
 }
 
-// renderMigrations prints per-account outcomes and the summary, returning an
-// error (nonzero exit) when anything failed — or, for an explicit --account,
-// when that account did not convert.
 func renderMigrations(cmd *cobra.Command, resp *daemon.Response, toWord string, explicit bool) error {
 	out := cmd.OutOrStdout()
 	var done, already, busy, failed int
@@ -135,8 +125,7 @@ func renderMigrations(cmd *cobra.Command, resp *daemon.Response, toWord string, 
 		note(out, "New accounts will use the %s overlay.", toWord)
 	}
 	if resp.Error != "" {
-		// Per-account outcomes above are truthful; this is the op-level
-		// failure (e.g. recording the new-account default).
+		// Op-level failure (e.g. recording the new-account default); the outcomes above stand.
 		return errors.New(resp.Error)
 	}
 	if failed > 0 {

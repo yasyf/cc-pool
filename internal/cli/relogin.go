@@ -38,13 +38,6 @@ func newLoginCmd() *cobra.Command {
 	}
 }
 
-// runRelogin runs `claude /login` for an existing account, watching for a fresh
-// usable credential to replace the account's stale one; when one lands it closes
-// claude (the user may also exit it manually), then verifies the credential,
-// re-asserts our Keychain ACL over it, and clears the needs-login flag. The
-// account already holds a stale identity, so an identity probe would fire
-// immediately — completion is keyed on the credential's access token changing to
-// a fresh, usable one (see newReloginProbe).
 func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	id, err := parseAccountRef(ref)
 	if err != nil {
@@ -85,11 +78,8 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	return nil
 }
 
-// loginCommand builds the `claude /login` command for an account's config dir,
-// with the credential-isolating env from execEnv. The caller owns the child's
-// stdio: runRelogin attaches it to the terminal directly, while the status TUI
-// hands it to a watched tea.Exec spawn. Shared so both paths spawn an identical
-// login.
+// loginCommand builds the `claude /login` command for an account's config dir;
+// the caller owns the child's stdio.
 func loginCommand(configDir string) (*exec.Cmd, error) {
 	bin, err := exec.LookPath("claude")
 	if err != nil {
@@ -101,19 +91,14 @@ func loginCommand(configDir string) (*exec.Cmd, error) {
 	return c, nil
 }
 
-// finishRelogin verifies a `claude /login` left a usable credential for the
-// account, re-asserts our Keychain ACL over it, and clears the needs-login flag.
-// Shared by the `ccp login` command and the status TUI's re-login action.
 func finishRelogin(ctx context.Context, m *pool.Manager, a store.Account) error {
-	// A real login leaves a fresh, usable credential in whichever backend the
-	// account uses. If it didn't, the daemon will re-flag on its next poll, so
-	// we refuse to clear the flag here.
+	// Fail closed: an unusable credential means the login didn't land; the
+	// daemon would re-flag on its next poll anyway.
 	cred, err := reloginCred(a)
 	if err != nil || !cred.HasRefreshToken() || cred.Expired() {
 		return fmt.Errorf("login left no usable credential for %s; run `ccp login %d` again", accountName(a.Label), a.ID)
 	}
-	// Re-assert our `security`-trusted ACL over the freshly written item (a
-	// no-op rewrite for the plaintext-file backend).
+	// Re-assert our `security`-trusted ACL; a no-op rewrite for the plaintext-file backend.
 	if err := m.AdoptRotatedToken(ctx, a); err != nil {
 		return fmt.Errorf("re-assert credential for %s: %w", accountName(a.Label), err)
 	}
@@ -123,31 +108,21 @@ func finishRelogin(ctx context.Context, m *pool.Manager, a store.Account) error 
 	return nil
 }
 
-// credReader reads an account's live credential; injectable for tests.
 type credReader func() (*keychain.Credential, error)
 
-// newReloginProbe reports that a fresh, usable credential has replaced the
-// account's pre-login one — the signal that an interactive re-login completed.
-// Identity presence can't be the signal (the account already carries its prior
-// identity), so completion is keyed on the credential changing to a usable one.
-// baseline is the access token read just before claude started.
+// newReloginProbe fires when a fresh, usable credential's access token differs
+// from the baseline read just before claude started — the re-login completion
+// signal.
 //
-// SAFETY: keying on the credential alone — with NO identity gate — is safe here.
-// Claude's startup "adoption" copies the global session's credential only into a
-// FRESH CLAUDE_CONFIG_DIR (the add flow's concern, which is exactly why
-// newIdentityProbe keys on identity, not credential). A re-login dir is NON-fresh:
-// it already holds its own (revoked) credential and identity, so claude does not
-// overwrite that existing credential with the global one at startup. The only
-// credential change during a re-login is therefore the user's own login.
+// SAFETY: no identity gate (unlike newIdentityProbe) is needed — claude adopts
+// the global credential only into a FRESH CLAUDE_CONFIG_DIR, so a re-login dir's
+// only credential change is the user's own login.
 func newReloginProbe(read credReader, baseline string) func() (bool, error) {
 	return func() (bool, error) {
 		cred, err := read()
 		if err != nil {
-			// A transient backend read (a security(1) spawn hiccup, a momentarily
-			// locked keychain, or simply "not written yet") tells us nothing — keep
-			// waiting rather than abort the watch and force-close the live login.
-			// The interactive user bounds the wait: they finish the login (the
-			// probe then fires) or exit claude themselves (awaitExited).
+			// A transient backend-read failure (security(1) hiccup, locked keychain, not
+			// yet written) is not a signal — keep waiting; the interactive user bounds the wait.
 			return false, nil
 		}
 		return cred.HasRefreshToken() && !cred.Expired() &&
@@ -155,9 +130,6 @@ func newReloginProbe(read credReader, baseline string) func() (bool, error) {
 	}
 }
 
-// reloginCred reads the account's credential from whichever backend holds it —
-// the Keychain first, then the plaintext file claude writes when the Keychain is
-// unavailable.
 func reloginCred(a store.Account) (*keychain.Credential, error) {
 	cred, err := keychain.Read(a.KeychainService, a.KeychainAccount)
 	if err == nil {

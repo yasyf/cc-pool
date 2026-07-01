@@ -7,10 +7,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// Estimate is one account's 5h-window display forecast. The zero value means
-// "no projection": the account is idle, stale, rate-limited, exhausted, or
-// has too little history — the snapshot omits the fields and the widget
-// renders nothing.
+// Estimate is one account's 5h-window display forecast; the zero value means
+// no projection (idle, stale, rate-limited, exhausted, or too little history).
 type Estimate struct {
 	// BurnPerHour is the smoothed drain of the 5h window, percent/hour.
 	BurnPerHour float64
@@ -25,8 +23,7 @@ type Estimate struct {
 
 // Estimate5h computes the display forecast from recent samples (newest
 // first). exhausted is score's exhausted gate: a pegged window whose reset is
-// pending. Projections anchor at the latest sample's timestamp — utilization
-// is known as of the sample, not as of now.
+// pending. Projections anchor at the latest sample's timestamp, not now.
 func Estimate5h(samples []store.UsageSample, exhausted bool, now time.Time) Estimate {
 	latest, ok := displayable(samples, exhausted, now)
 	if !ok {
@@ -51,9 +48,7 @@ func Estimate5h(samples []store.UsageSample, exhausted bool, now time.Time) Esti
 	return est
 }
 
-// displayable reports whether the latest sample is fit to drive a display
-// forecast — not exhausted, not the zeroed 429 placeholder, not stale — and
-// returns it. It is the gate shared by every gated display projection;
+// displayable reports whether the latest sample can drive a display forecast;
 // window-specific reset gates stay with their estimator.
 func displayable(samples []store.UsageSample, exhausted bool, now time.Time) (store.UsageSample, bool) {
 	if len(samples) == 0 || exhausted {
@@ -67,9 +62,8 @@ func displayable(samples []store.UsageSample, exhausted bool, now time.Time) (st
 }
 
 // Burn7dGated is the display-safe 7d drain in percent/hour: 0 unless the
-// latest sample is displayable. A passed 7d reset (Resets7d set and not after
-// now) additionally zeroes it — the sample predates the refill. A passed 5h
-// reset does NOT gate it; the windows are independent.
+// latest sample is displayable, and 0 on a passed 7d reset. A passed 5h reset
+// does NOT gate it; the windows are independent.
 func Burn7dGated(samples []store.UsageSample, exhausted bool, now time.Time) float64 {
 	latest, ok := displayable(samples, exhausted, now)
 	if !ok {

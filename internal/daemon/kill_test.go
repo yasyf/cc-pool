@@ -5,8 +5,7 @@ import (
 	"testing"
 )
 
-// setKillSocketPeer overrides killSocketPeer for the duration of a test,
-// restoring it afterward so no test ever signals a real process.
+// setKillSocketPeer swaps the seam so tests never signal a real process.
 func setKillSocketPeer(t *testing.T, fn func(string) (int, error)) {
 	t.Helper()
 	old := killSocketPeer
@@ -14,9 +13,6 @@ func setKillSocketPeer(t *testing.T, fn func(string) (int, error)) {
 	t.Cleanup(func() { killSocketPeer = old })
 }
 
-// TestKillSocketPeerDelegates pins the thin delegation: KillSocketPeer hands
-// the client's own socket path — the daemon socket, never the mount-holder's —
-// to peerpid.Kill and returns its result unchanged.
 func TestKillSocketPeerDelegates(t *testing.T) {
 	killErr := errors.New("peer kill failed")
 	for _, tc := range []struct {

@@ -12,14 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// TestEnvMergesBaseSettings pins `ccp env`'s launch-settings hook at its
-// integration point: env is a launch intent like select/run, so resolving an
-// account must propagate the base ~/.claude.json's shareable keys into that
-// account's private file before the exports are printed. Deleting the
-// mergeLaunchSettings call in newEnvCmd fails this test. The command runs over
-// the real withManager/pool.Open path, so the pool state lives under an
-// isolated HOME with the initialized meta pre-seeded ("initialized" is the
-// on-disk meta key `ccp init` writes).
+// TestEnvMergesBaseSettings pins that env merges base ~/.claude.json into the account file ("initialized" is the meta key ccp init writes).
 func TestEnvMergesBaseSettings(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

@@ -17,35 +17,27 @@ const (
 	// MergeApplied means base keys were merged in and the account file rewritten.
 	MergeApplied MergeOutcome = "applied"
 	// MergeUnchanged means the account file already held every shareable base key;
-	// nothing was written, so a live session's rewriter was never raced.
+	// nothing was written.
 	MergeUnchanged MergeOutcome = "unchanged"
-	// MergeNoBase means no ~/.claude.json exists; there is nothing to propagate.
+	// MergeNoBase means no ~/.claude.json exists to propagate.
 	MergeNoBase MergeOutcome = "no-base"
-	// MergeRecreated means the account file was missing and was recreated as
-	// base-minus-blacklist — no onboarding wizard, no inherited identity. The
-	// recreated file does mint a skeleton projects entry per base project
-	// carrying only overlay.ClaudeJSONSharedProjectKeys (desired: trust, MCP
-	// approvals, and local-scope MCP server definitions carry over, history and
-	// session state never do).
+	// MergeRecreated means a missing account file was recreated as
+	// base-minus-blacklist, minting a skeleton projects entry per base project
+	// carrying only overlay.ClaudeJSONSharedProjectKeys.
 	MergeRecreated MergeOutcome = "recreated"
 	// MergeSkippedOverlay means the account's recorded overlay kind is not symlink;
-	// the fuse arm owns its own merged view, so the launch merge stays out.
+	// the fuse arm serves its own merged view.
 	MergeSkippedOverlay MergeOutcome = "skipped-overlay"
 )
 
-// mergeClaudeJSON propagates ~/.claude.json's shareable top-level keys
-// (everything outside overlay.ClaudeJSONPrivateKeys, base wins) plus the
-// per-project overlay.ClaudeJSONSharedProjectKeys into an account's private
-// .claude.json at launch time. An unchanged merge skips the write entirely. The merge is only guaranteed visible to the session being
-// launched: a concurrently live session on the same account rewrites the file
-// from memory and later clobbers merged values — an accepted limitation, with
-// no machinery against it. A launch merging mid-conversion is the same
-// pre-existing accepted race as SyncOverlay re-laying links during a
-// conversion; the daemon gates its own selects, CLI-only launches were always
-// outside that fence.
+// mergeClaudeJSON propagates ~/.claude.json's shareable top-level keys (outside
+// overlay.ClaudeJSONPrivateKeys, base wins) plus per-project
+// overlay.ClaudeJSONSharedProjectKeys into an account's private .claude.json.
+// Only guaranteed visible to the launching session; a concurrent live session
+// rewrites from memory and clobbers merged values — accepted, like SyncOverlay
+// re-laying links mid-conversion.
 func mergeClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (MergeOutcome, error) {
-	// A live mirror over a dir whose row says symlink is the same anomaly
-	// convertToFuse refuses: writing "into" the mirror lands in the wrong root.
+	// Writing into a live mirror lands in the wrong root.
 	if overlay.Mounted(accountDir) {
 		return "", fmt.Errorf("%s is a live mountpoint; refusing to merge through a mirror", accountDir)
 	}
@@ -62,21 +54,16 @@ func mergeClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (Merge
 	recreate := false
 	private, err := os.ReadFile(dst) //nolint:gosec // G304: dst is the account's own .claude.json under the cc-pool-managed config dir
 	if os.IsNotExist(err) {
-		// A copy stranded in the fuse private backing dir is the fingerprint
-		// of an interrupted conversion. Minting a fresh file here would make
-		// the freshly-written (empty) copy the newer one, so when
-		// HealStrandedPrivate moves the stranded copy back its last-write-wins
-		// resolution would keep this mint and discard the real stranded
-		// identity. Point at doctor instead so the heal restores the stranded
-		// copy intact.
+		// A stranded copy in the fuse private backing dir is an interrupted
+		// conversion; minting a fresh file here would win HealStrandedPrivate's
+		// last-write-wins and discard the real identity, so point at doctor.
 		stranded := filepath.Join(fkoverlay.FusePrivateRoot(accountDir), ".claude.json")
 		if stranded != dst {
 			if _, serr := os.Lstat(stranded); serr == nil {
 				return "", fmt.Errorf("%s is missing but a copy is stranded at %s (interrupted overlay conversion); run `ccp doctor`", dst, stranded)
 			} else if !os.IsNotExist(serr) {
 				// An unprobeable stranded path must not fall through to
-				// recreate: minting a file here is the exact collision the
-				// guard exists to prevent.
+				// recreate — the same collision the guard prevents.
 				return "", fmt.Errorf("stat %q: %w", stranded, serr)
 			}
 		}
@@ -86,8 +73,8 @@ func mergeClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (Merge
 		return "", fmt.Errorf("read %s: %w", dst, err)
 	}
 
-	// Stricter than seeding: at launch the file may hold login identity, so an
-	// unparseable file is never replaced (MergeClaudeJSON errors on it).
+	// Stricter than seeding: the file may hold login identity, so an unparseable
+	// file errors rather than being replaced.
 	merged, changed, err := overlay.MergeClaudeJSON(private, base)
 	if err != nil {
 		return "", fmt.Errorf("merge %s into %s: %w", srcPath, dst, err)
@@ -105,11 +92,9 @@ func mergeClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (Merge
 }
 
 // MergeBaseClaudeJSON runs the launch-time shareable-settings merge for an
-// account. It gates on the RECORDED overlay backend: any non-symlink backend is
-// MergeSkippedOverlay, because the fuse arm serves its own live merged view —
-// the gate keys on the row, never on a resolved provider's backend, so no build
-// variant can silently un-gate a fuse account. The daemon's fuse fallback and
-// `ccp migrate`'s row flip keep the recorded backend truthful.
+// account, gating on the RECORDED overlay backend (non-symlink →
+// MergeSkippedOverlay). The gate keys on the row, never on a resolved provider's
+// backend, so no build variant can silently un-gate a fuse account.
 func (m *Manager) MergeBaseClaudeJSON(a store.Account) (MergeOutcome, error) {
 	backend, err := fkoverlay.Parse(a.OverlayKind)
 	if err != nil {

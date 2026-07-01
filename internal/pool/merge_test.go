@@ -13,8 +13,7 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// Fixture values are compact inside (json.Marshal compacts RawMessage values),
-// so blacklisted keys can be asserted byte-identical across a merge.
+// Compact fixture values let blacklisted keys be asserted byte-identical across a merge.
 const (
 	mergeAcctJSON = `{
 		"hasCompletedOnboarding": true,
@@ -219,8 +218,7 @@ func TestMergeClaudeJSON(t *testing.T) {
 	})
 
 	t.Run("null account file errors, never clobbered", func(t *testing.T) {
-		// A bare `null` parses but is not an object; before the nil-map guard
-		// this panicked inside MergeClaudeJSON instead of erroring.
+		// A bare `null` parses but is not an object.
 		acct := t.TempDir()
 		dst := writeDst(t, acct, `null`)
 		if _, err := mergeClaudeJSON(prov, acct, writeSrc(t, mergeBaseJSON)); err == nil {
@@ -232,9 +230,7 @@ func TestMergeClaudeJSON(t *testing.T) {
 	})
 
 	t.Run("pretty-printed base reports unchanged on the second merge", func(t *testing.T) {
-		// Production base files are pretty-printed (claude's own writer); the
-		// multi-line composite value is what made the pre-normalization compare
-		// fail forever and rewrite the account file on every launch.
+		// Pretty-printed base is claude's production shape; an un-normalized compare rewrites the account file every launch.
 		acct := t.TempDir()
 		writeDst(t, acct, `{"theme": "dark"}`)
 		src := writeSrc(t, `{
@@ -260,8 +256,7 @@ func TestMergeClaudeJSON(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(acct, 0o700) }) //nolint:gosec // G302: restoring a test dir to traversable perms in cleanup
-		// Any write attempt fails in a read-only dir, so MergeUnchanged with no
-		// error proves the write was skipped, not survived.
+		// Read-only dir: MergeUnchanged with no error proves the write was skipped, not survived.
 		out, err := mergeClaudeJSON(prov, acct, writeSrc(t, `{"theme": "light"}`))
 		if err != nil || out != MergeUnchanged {
 			t.Fatalf("outcome = %q err = %v, want unchanged with no write", out, err)
@@ -269,9 +264,7 @@ func TestMergeClaudeJSON(t *testing.T) {
 	})
 
 	t.Run("mounted account dir is refused", func(t *testing.T) {
-		// /dev is always a devfs mountpoint on macOS (same trick as the
-		// overlay Mounted test); the specific wording pins the guard itself,
-		// not a downstream write failure.
+		// /dev is always a devfs mountpoint on macOS; the "live mountpoint" string pins the guard, not a downstream write failure.
 		_, err := mergeClaudeJSON(prov, "/dev", writeSrc(t, mergeBaseJSON))
 		if err == nil || !strings.Contains(err.Error(), "live mountpoint") {
 			t.Fatalf("err = %v, want the live-mountpoint refusal", err)
@@ -317,8 +310,7 @@ func TestMergeClaudeJSON(t *testing.T) {
 	})
 
 	t.Run("base project approval lands once, then pins unchanged on re-run", func(t *testing.T) {
-		// The pretty-printed src is the production shape (claude's own writer);
-		// a second MergeApplied here is the launch-flap bug, not a tie-break.
+		// A second MergeApplied here is the launch-flap bug, not a tie-break.
 		acct := t.TempDir()
 		dst := writeDst(t, acct, `{"theme": "light", "projects": {"/p":{"history":["mine"]}}}`)
 		src := writeSrc(t, `{
@@ -356,19 +348,15 @@ func TestMergeClaudeJSON(t *testing.T) {
 			t.Fatalf("outcome = %q err = %v, want %q", out, err, MergeRecreated)
 		}
 		proj := rawTop(t, rawTop(t, readFile(t, filepath.Join(acct, ".claude.json")))["projects"])
-		// Byte-exact skeleton (json.Marshal key-sorts): the two shared keys and
-		// nothing else — base history and session state never land.
+		// Byte-exact skeleton (json.Marshal key-sorts): the two shared keys only, no base history or session state.
 		if string(proj["/p"]) != `{"enabledMcpjsonServers":["srv"],"hasTrustDialogAccepted":true}` {
 			t.Fatalf(`recreated projects["/p"] = %s, want the shared keys only`, proj["/p"])
 		}
 	})
 }
 
-// TestMergeBaseClaudeJSON pins the Manager-level gate: only accounts whose
-// RECORDED kind is symlink merge (the fuse arm serves its own merged view),
-// and the provider resolves through the injectable OverlayFor seam — a bare
-// OverlayProviderFor would ignore the fake and fail the resolved-kinds
-// assertion.
+// TestMergeBaseClaudeJSON pins the Manager gate: only symlink accounts merge
+// (fuse serves its own view), through the injectable OverlayFor seam the fake overrides.
 func TestMergeBaseClaudeJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -429,7 +417,6 @@ func TestMergeBaseClaudeJSON(t *testing.T) {
 		t.Fatalf("provider not resolved through the OverlayFor seam: %v", resolved)
 	}
 
-	// Errors from the merge layer are wrapped once with the account id.
 	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{not json`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -438,7 +425,6 @@ func TestMergeBaseClaudeJSON(t *testing.T) {
 	}
 }
 
-// rawTop decodes top-level keys to raw JSON values for byte-exact comparison.
 func rawTop(t *testing.T, b []byte) map[string]json.RawMessage {
 	t.Helper()
 	var rm map[string]json.RawMessage

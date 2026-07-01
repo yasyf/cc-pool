@@ -14,9 +14,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// fakeOAuth401 accepts only access tokens in validAT (everything else 401s) and
-// rotates the refresh token single-use like the real endpoint, marking each
-// freshly minted access token valid.
+// fakeOAuth401 accepts only access tokens in validAT (else 401) and rotates the
+// refresh token single-use like the real endpoint, marking each minted access
+// token valid.
 type fakeOAuth401 struct {
 	mu        sync.Mutex
 	currentRT string
@@ -54,10 +54,10 @@ func (f *fakeOAuth401) Refresh(_ context.Context, _, rt string) (*oauth.TokenRes
 	return &oauth.TokenResponse{AccessToken: at, RefreshToken: f.currentRT, ExpiresIn: 3600}, nil
 }
 
-// rotatingKeychain returns `current` until rotateAfter reads have elapsed, then
-// `rotated` — letting a test inject a live session rotating the chain between
-// the daemon's successive reads. A Write makes the written credential
-// authoritative (and cancels any pending rotation).
+// rotatingKeychain returns `current` until rotateAfter reads elapse, then
+// `rotated` — injecting a live session that rotates the chain between successive
+// reads. A Write makes the written credential authoritative and cancels the
+// pending rotation.
 type rotatingKeychain struct {
 	mu          sync.Mutex
 	reads       int
@@ -130,8 +130,8 @@ func newManager401(t *testing.T, kc CredentialStore, fo *fakeOAuth401) (*Manager
 	return &Manager{Store: st, OAuth: fo, Keychain: kc, LockDir: t.TempDir()}, a
 }
 
-// assertNeverCanonical pins the #1 safety rule across the new 401 arms: no op
-// ever names plain claude's canonical unsuffixed Keychain item.
+// assertNeverCanonical pins the safety rule that no op ever names plain claude's
+// canonical unsuffixed Keychain item.
 func assertNeverCanonical(t *testing.T, touched []string) {
 	t.Helper()
 	for i, s := range touched {
@@ -141,9 +141,9 @@ func assertNeverCanonical(t *testing.T, touched []string) {
 	}
 }
 
-// fakeOAuthRevoked reproduces the daemon mask: the pre-flight refresh confirms a
-// revocation (400 invalid_grant) while the usage endpoint returns a 429, so a
-// naive sampleUsage would surface rate-limited and swallow the needs-login.
+// fakeOAuthRevoked reproduces the daemon mask: pre-flight refresh confirms a
+// revocation (400 invalid_grant) while usage returns 429, so a naive sampleUsage
+// would surface rate-limited and swallow the needs-login.
 type fakeOAuthRevoked struct{}
 
 func (fakeOAuthRevoked) Refresh(_ context.Context, _, _ string) (*oauth.TokenResponse, error) {
@@ -155,8 +155,8 @@ func (fakeOAuthRevoked) Usage(_ context.Context, _ string) (*oauth.Usage, error)
 }
 
 // TestSampleUsageRevokedNotMaskedByRateLimit: a confirmed pre-flight revocation
-// must not be masked by a usage-endpoint 429. SampleUsage surfaces ErrNeedsLogin
-// (not rateLimited=true), and the error path records no usage sample.
+// must surface ErrNeedsLogin, not a usage-endpoint 429's rateLimited, and record
+// no usage sample.
 func TestSampleUsageRevokedNotMaskedByRateLimit(t *testing.T) {
 	kc := &rotatingKeychain{
 		current: cred401("at-0", "rt-stale", time.Now().Add(-time.Hour)),
@@ -187,9 +187,9 @@ func TestSampleUsageRevokedNotMaskedByRateLimit(t *testing.T) {
 	assertNeverCanonical(t, kc.touchedServices())
 }
 
-// TestFetchUsage401RereadRetriesRotatedToken: the pre-flight read gets the stale
-// token, a session rotates the chain, and rung 1 (a pure re-read) retries with
-// the rotated token — recovering WITHOUT spending a refresh token.
+// TestFetchUsage401RereadRetriesRotatedToken: after a session rotates the chain,
+// rung 1 (a pure re-read) retries with the rotated token, recovering without
+// spending a refresh token.
 func TestFetchUsage401RereadRetriesRotatedToken(t *testing.T) {
 	kc := &rotatingKeychain{
 		rotateAfter: 1, // read#1 (pre-flight) = current; read#2 (rung 1) = rotated
@@ -224,10 +224,10 @@ func TestSampleUsageClassifiesNeedsLogin(t *testing.T) {
 	}
 }
 
-// TestSampleUsageBusyRefreshGuard pins the guarded busy-refresh ladder, with the
-// load-bearing negatives: no refresh without the flag, none when the token is
-// not expired, none when a session rotated the chain mid-fetch, and a revoked
-// refresh with an unchanged credential is the only path to ErrNeedsLogin.
+// TestSampleUsageBusyRefreshGuard pins the busy-refresh ladder's load-bearing
+// negatives: no refresh without the flag, when unexpired, or after a mid-fetch
+// rotation; only a revoked refresh with an unchanged credential reaches
+// ErrNeedsLogin.
 func TestSampleUsageBusyRefreshGuard(t *testing.T) {
 	past := func() time.Time { return time.Now().Add(-time.Hour) }
 	future := func() time.Time { return time.Now().Add(time.Hour) }

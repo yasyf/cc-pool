@@ -14,9 +14,8 @@ type Account struct {
 }
 
 // UsageSample is one poll of an account's quota windows. Utilization fields are
-// stored as 0..100 "percent used" to feed scoring directly. The Extra* fields
-// mirror the API's extra_usage (pay-as-you-go overage) block, for status
-// display only — scoring ignores them.
+// 0..100 percent-used; Extra* mirrors the API's extra_usage overage block and is
+// display-only (scoring ignores it).
 type UsageSample struct {
 	AccountID    int
 	TS           time.Time
@@ -60,9 +59,8 @@ type Sticky struct {
 }
 
 // CwdActivity summarizes tracked session activity for one working directory,
-// feeding the sticky binding and expiry rules. It counts only sessions the
-// pool marked (sessions table) — pid-0 selects and externally launched claude
-// processes are invisible here even when procscan can see them.
+// feeding sticky binding and expiry. It counts only pool-marked sessions; pid-0
+// selects and external claude are invisible even when procscan sees them.
 type CwdActivity struct {
 	Live      int       // sessions still running in this cwd
 	LastEnded time.Time // most recent ended_at; zero when none ended
@@ -77,10 +75,9 @@ type RefreshEntry struct {
 }
 
 // AuthHealth is an account's authentication health. NeedsLogin is set by the
-// daemon once it concludes the stored refresh token is gone/revoked and only an
-// interactive `ccp login` can recover the account; Since marks the false→true
-// transition, and LastErr is the failure that triggered it. No secrets — only a
-// flag, a timestamp, and an error string.
+// daemon when the stored refresh token is gone/revoked and only an interactive
+// `ccp login` can recover; Since marks the false→true transition, LastErr the
+// triggering failure. No secrets — a flag, a timestamp, an error string.
 type AuthHealth struct {
 	AccountID  int
 	NeedsLogin bool

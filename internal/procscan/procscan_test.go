@@ -16,8 +16,6 @@ const sample = `  501 01:02:03 /Users/me/.local/bin/claude --session-id abc FOO=
 
 func TestParse(t *testing.T) {
 	got := parse(sample, time.Now())
-	// Expect: pid 501 (acct-01), pid 777 (default, no env), pid 1010 (~/.claude).
-	// pid 888 is `fish` (argv0 != claude). pid 999 is node. Both excluded.
 	if len(got) != 3 {
 		t.Fatalf("got %d sessions, want 3: %+v", len(got), got)
 	}
@@ -50,8 +48,8 @@ func TestCountByConfigDir(t *testing.T) {
 	}{
 		"exact match":           {"/Users/me/.cc-pool/accounts/acct-01", 1},
 		"no sessions for dir":   {"/Users/me/.cc-pool/accounts/acct-99", 0},
-		"explicit ~/.claude":    {"/Users/me/.claude", 1}, // pid 1010 only; never a pool account
-		"empty matches nothing": {"", 0},                  // plain claude (pid 777) maps to no pool account
+		"explicit ~/.claude":    {"/Users/me/.claude", 1},
+		"empty matches nothing": {"", 0},
 	}
 	for name, tc := range cases {
 		if n := CountByConfigDir(sessions, tc.configDir); n != tc.want {
@@ -60,9 +58,8 @@ func TestCountByConfigDir(t *testing.T) {
 	}
 }
 
-// TestParseStartedAt pins StartedAt = now - etime, and the deliberate
-// soft-fail: a malformed etime yields the zero StartedAt but the session is
-// still returned — session detection is load-bearing, staleness is advisory.
+// TestParseStartedAt pins StartedAt = now - etime and the soft-fail: a
+// malformed etime zeroes StartedAt but keeps the session.
 func TestParseStartedAt(t *testing.T) {
 	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	got := parse(sample, now)
@@ -126,9 +123,9 @@ func TestParseEtime(t *testing.T) {
 	}
 }
 
-// TestScanPopulatesStartedAt drives Scan through the psOutput seam: parsed
-// etimes anchor StartedAt near scan time, a malformed etime keeps its session
-// with a zero StartedAt, and a ps failure is Scan's error, not a silent nil.
+// TestScanPopulatesStartedAt drives Scan through the psOutput seam: StartedAt is
+// anchored near scan time and a ps failure surfaces as Scan's error, not a
+// silent nil.
 func TestScanPopulatesStartedAt(t *testing.T) {
 	orig := psOutput
 	t.Cleanup(func() { psOutput = orig })
@@ -162,18 +159,14 @@ func TestScanPopulatesStartedAt(t *testing.T) {
 	}
 }
 
-// TestScanBoundsWedgedPS proves the timeout releases the CALLER even when ps is
-// truly unkillable: the stub ignores its ctx entirely — a real ps wedged on a
-// D-state read off a hung fuse-t mount does not cooperatively unblock on
-// cancellation, which is the whole problem — yet Scan returns DeadlineExceeded
-// within a generous bound. Only a goroutine-decoupled Scan passes this; a
-// synchronous psOutput call (even with WaitDelay) would hang here, since
-// cmd.Wait parks in waitpid and SIGKILL cannot reap a D-state ps.
+// TestScanBoundsWedgedPS proves the timeout releases the caller even when ps is
+// unkillable (the stub ignores ctx). Only a goroutine-decoupled Scan passes; a
+// synchronous call would hang.
 func TestScanBoundsWedgedPS(t *testing.T) {
 	origOut, origTimeout := psOutput, scanTimeout
 	release := make(chan struct{})
 	t.Cleanup(func() {
-		close(release) // free the parked stub goroutine before restoring the seams
+		close(release) // free the parked stub goroutine
 		psOutput, scanTimeout = origOut, origTimeout
 	})
 

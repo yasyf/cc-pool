@@ -29,7 +29,6 @@ func TestAccountCRUD(t *testing.T) {
 	if got.ConfigDir != a.ConfigDir || got.Label != "work" {
 		t.Fatalf("got %+v", got)
 	}
-	// Update label.
 	a.Label = "renamed"
 	if err := s.UpsertAccount(a); err != nil {
 		t.Fatal(err)
@@ -61,18 +60,15 @@ func TestSetAccountLabel(t *testing.T) {
 	if got.Label != "Example" {
 		t.Fatalf("label = %q, want %q", got.Label, "Example")
 	}
-	// Only the label changed.
 	if got.ConfigDir != a.ConfigDir || got.KeychainService != a.KeychainService ||
 		got.KeychainAccount != a.KeychainAccount || got.OverlayKind != a.OverlayKind {
 		t.Fatalf("non-label fields changed: %+v", got)
 	}
 
-	// Idempotent re-set is fine.
 	if err := s.SetAccountLabel(1, "Example"); err != nil {
 		t.Fatalf("idempotent set: %v", err)
 	}
 
-	// Unknown id fails loudly and materializes nothing.
 	if err := s.SetAccountLabel(99, "Ghost"); err == nil {
 		t.Fatal("want error for unknown account, got nil")
 	}
@@ -91,7 +87,6 @@ func TestNextAccountIndex(t *testing.T) {
 	if n, _ := s.NextAccountIndex(); n != 3 {
 		t.Fatalf("next index = %d, want 3", n)
 	}
-	// Remove 1 -> reused.
 	_ = s.DeleteAccount(1)
 	if n, _ := s.NextAccountIndex(); n != 1 {
 		t.Fatalf("reused index = %d, want 1", n)
@@ -110,7 +105,6 @@ func TestMetaRoundTrip(t *testing.T) {
 	if err != nil || !ok || v != "1" {
 		t.Fatalf("get after set: v=%q ok=%v err=%v", v, ok, err)
 	}
-	// Upsert overwrites.
 	if err := s.SetMeta("initialized", "2"); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +135,6 @@ func TestUsageSampleLatest(t *testing.T) {
 
 func TestLatestGoodUsageSample(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
-	// A sample spec: age before now, util_7d, and whether it is a 429 marker.
 	type spec struct {
 		age         time.Duration
 		util7d      float64
@@ -151,7 +144,7 @@ func TestLatestGoodUsageSample(t *testing.T) {
 		samples   []spec
 		wantOK    bool
 		wantUtil  float64
-		wantAgeTS time.Duration // expected good sample's age before now
+		wantAgeTS time.Duration
 	}{
 		"reads through a newer rate_limited marker to the last good sample": {
 			samples: []spec{
@@ -243,7 +236,6 @@ func TestUsageSamplesSince(t *testing.T) {
 	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 	_ = s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s2", KeychainAccount: "u2"})
 	now := time.Now().Truncate(time.Second)
-	// acct 1: three samples spanning 90 minutes plus one older than the cutoff.
 	for _, sp := range []struct {
 		age  time.Duration
 		util float64
@@ -252,17 +244,15 @@ func TestUsageSamplesSince(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// acct 2 inside the window must never leak into acct 1's result.
 	if err := s.InsertUsageSample(UsageSample{AccountID: 2, TS: now, Util5h: 99}); err != nil {
 		t.Fatal(err)
 	}
 
-	since := now.Add(-90 * time.Minute) // cutoff sits exactly on the 60-min sample? no — on nothing; boundary tested below
+	since := now.Add(-90 * time.Minute)
 	got, err := s.UsageSamplesSince(1, since)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The 120-min-old sample is older than the cutoff; the acct-2 row is excluded.
 	if len(got) != 3 {
 		t.Fatalf("got %d samples, want 3: %+v", len(got), got)
 	}
@@ -276,7 +266,6 @@ func TestUsageSamplesSince(t *testing.T) {
 		}
 	}
 
-	// Inclusive boundary: a cutoff landing exactly on a sample's ts includes it.
 	exact := now.Add(-60 * time.Minute)
 	got2, err := s.UsageSamplesSince(1, exact)
 	if err != nil {
@@ -285,7 +274,6 @@ func TestUsageSamplesSince(t *testing.T) {
 	if len(got2) != 3 || got2[2].Util5h != 10 {
 		t.Fatalf("inclusive boundary dropped the on-cutoff sample: %+v", got2)
 	}
-	// One second later excludes it.
 	got3, err := s.UsageSamplesSince(1, exact.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
@@ -298,7 +286,7 @@ func TestUsageSamplesSince(t *testing.T) {
 func TestSessionsReconcile(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
-	started := now.Add(-2 * SessionReapGrace) // old enough to reap
+	started := now.Add(-2 * SessionReapGrace)
 	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 	id1, _ := s.OpenSession(1, 111, "b", "/proj", started)
 	_, _ = s.OpenSession(1, 222, "b", "/proj", started)
@@ -310,7 +298,6 @@ func TestSessionsReconcile(t *testing.T) {
 	if err != nil || len(live) != 3 || live[0].Cwd != "/proj" {
 		t.Fatalf("active sessions = %+v err=%v", live, err)
 	}
-	// Only 222 is alive -> 111 closed; 333 is dead but too young to reap.
 	closed, err := s.CloseDeadSessions(map[int]bool{222: true}, now)
 	if err != nil || closed != 1 {
 		t.Fatalf("closed = %d err=%v", closed, err)
@@ -318,8 +305,6 @@ func TestSessionsReconcile(t *testing.T) {
 	if n, _ := s.ActiveSessionCount(1); n != 2 {
 		t.Fatalf("active after reconcile = %d, want 2", n)
 	}
-	// The alive row was stamped last-seen; the never-observed dead row was
-	// closed at its start (no liveness was ever witnessed), not at reap time.
 	for _, se := range mustActive(t, s) {
 		if se.PID == 222 && (se.LastSeenAt == nil || !se.LastSeenAt.Equal(now)) {
 			t.Fatalf("alive row not stamped last-seen: %+v", se)
@@ -342,10 +327,8 @@ func mustActive(t *testing.T, s *Store) []Session {
 	return live
 }
 
-// TestCloseDeadSessionsEndsAtLastSeen pins the honest-end rule: a row whose
-// pid was observed alive by an earlier reconcile is closed at that
-// observation, never at reap time — a long observer gap must not fabricate a
-// warm cache.
+// TestCloseDeadSessionsEndsAtLastSeen: a pid seen alive by an earlier reconcile
+// is closed at that observation, not reap time.
 func TestCloseDeadSessionsEndsAtLastSeen(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
@@ -380,8 +363,6 @@ func TestGetCwdActivity(t *testing.T) {
 		t.Fatalf("empty table: %+v err=%v", act, err)
 	}
 
-	// One live, two ended (the later end must win), one unattributed
-	// (cwd-less) row, and one row on a DIFFERENT account in the same directory.
 	_, _ = s.OpenSession(1, 100, "b", "/proj", now.Add(-3*time.Hour))
 	early, _ := s.OpenSession(1, 200, "b", "/proj", now.Add(-2*time.Hour))
 	late, _ := s.OpenSession(1, 300, "b", "/proj", now.Add(-90*time.Minute))
@@ -403,21 +384,18 @@ func TestGetCwdActivity(t *testing.T) {
 		t.Fatalf("lastEnded = %v, want %v", act.LastEnded, now.Add(-10*time.Minute))
 	}
 
-	// The empty-cwd row is invisible to any real directory, and a different
-	// directory sees nothing.
 	if act, _ := s.GetCwdActivity("/other", 1); act.Live != 0 || !act.LastEnded.IsZero() {
 		t.Fatalf("unrelated cwd sees activity: %+v", act)
 	}
 }
 
-// TestDeleteStickyVersion: the version-guarded delete removes only the exact
-// row version it was given — a refreshed or repinned row survives.
+// TestDeleteStickyVersion: version-guarded delete removes only the exact row
+// version; a refreshed or repinned row survives.
 func TestDeleteStickyVersion(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
 
 	_ = s.UpsertSticky("/proj", 1, now.Add(-2*time.Hour))
-	// Concurrent writer repins before the stale delete lands.
 	_ = s.PinManual("/proj", 2, now)
 	if err := s.DeleteStickyVersion("/proj", now.Add(-2*time.Hour), false); err != nil {
 		t.Fatal(err)
@@ -426,7 +404,6 @@ func TestDeleteStickyVersion(t *testing.T) {
 		t.Fatalf("newer manual pin must survive a stale-versioned delete: %+v ok=%v", st, ok)
 	}
 
-	// The matching version is deleted.
 	if err := s.DeleteStickyVersion("/proj", now, true); err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +433,6 @@ func TestSticky(t *testing.T) {
 		t.Fatalf("round-trip mismatch: %+v", got)
 	}
 
-	// Re-upsert (the sliding-TTL write path) overwrites both fields.
 	t1 := t0.Add(time.Minute)
 	if err := s.UpsertSticky("/proj", 2, t1); err != nil {
 		t.Fatal(err)
@@ -474,7 +450,6 @@ func TestUpsertStickyNeverRepointsManualPin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A select that landed elsewhere must not touch the manual pin.
 	if err := s.UpsertSticky("/proj", 2, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +458,6 @@ func TestUpsertStickyNeverRepointsManualPin(t *testing.T) {
 		t.Fatalf("manual pin repointed: %+v", got)
 	}
 
-	// A select that landed on the pinned account refreshes it, keeping manual.
 	t2 := now.Add(2 * time.Minute)
 	if err := s.UpsertSticky("/proj", 1, t2); err != nil {
 		t.Fatal(err)
@@ -498,7 +472,6 @@ func TestPinManualAndDeleteSticky(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
 
-	// PinManual overrides an existing auto pin.
 	_ = s.UpsertSticky("/proj", 1, now.Add(-time.Minute))
 	if err := s.PinManual("/proj", 2, now); err != nil {
 		t.Fatal(err)
@@ -508,7 +481,6 @@ func TestPinManualAndDeleteSticky(t *testing.T) {
 		t.Fatalf("manual pin: %+v", got)
 	}
 
-	// PinManual also overrides another manual pin (re-pin to a new account).
 	if err := s.PinManual("/proj", 1, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
@@ -522,7 +494,6 @@ func TestPinManualAndDeleteSticky(t *testing.T) {
 	if _, ok, _ := s.GetSticky("/proj"); ok {
 		t.Fatal("pin should be deleted")
 	}
-	// Idempotent on a missing row.
 	if err := s.DeleteSticky("/proj"); err != nil {
 		t.Fatalf("second delete: %v", err)
 	}
@@ -534,7 +505,7 @@ func TestPruneSticky(t *testing.T) {
 	cutoff := now.Add(-time.Hour)
 	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 
-	// /old: selected long ago, no sessions -> pruned (today's rule preserved).
+	// /old: selected long ago, no sessions -> pruned.
 	_ = s.UpsertSticky("/old", 1, now.Add(-2*time.Hour))
 	// /fresh: recent select -> survives.
 	_ = s.UpsertSticky("/fresh", 1, now)
@@ -602,12 +573,10 @@ func TestAuthHealthTransitions(t *testing.T) {
 	s := openTest(t)
 	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 
-	// No row → healthy.
 	if h, err := s.GetAuthHealth(1); err != nil || h.NeedsLogin {
 		t.Fatalf("fresh account = %+v err=%v, want healthy", h, err)
 	}
 
-	// false→true: changed, Since stamped, err recorded.
 	t0 := time.Unix(1_000_000, 0)
 	changed, err := s.SetNeedsLogin(1, t0, "401 revoked")
 	if err != nil || !changed {
@@ -618,7 +587,6 @@ func TestAuthHealthTransitions(t *testing.T) {
 		t.Fatalf("after flag = %+v", h)
 	}
 
-	// true→true: not changed; Since preserved even with a later timestamp; err updates.
 	changed, _ = s.SetNeedsLogin(1, t0.Add(time.Hour), "401 again")
 	if changed {
 		t.Fatal("repeat SetNeedsLogin must report changed=false")
@@ -631,12 +599,10 @@ func TestAuthHealthTransitions(t *testing.T) {
 		t.Fatalf("LastErr should update; got %q", h.LastErr)
 	}
 
-	// ListAuthHealth surfaces only flagged accounts.
 	if m, err := s.ListAuthHealth(); err != nil || len(m) != 1 || !m[1].NeedsLogin {
 		t.Fatalf("ListAuthHealth = %+v err=%v", m, err)
 	}
 
-	// true→false: changed once, then a no-op clear reports unchanged.
 	changed, err = s.ClearNeedsLogin(1)
 	if err != nil || !changed {
 		t.Fatalf("ClearNeedsLogin changed=%v err=%v, want true", changed, err)

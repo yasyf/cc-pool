@@ -8,12 +8,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// TestScoreInputRateLimitedReadsLastGood pins the display fix: a 429 records a
-// zeroed rate_limited placeholder as the newest sample (load-bearing for the
-// daemon backoff), but scoreInput must source utilization, resets, and the
-// sample timestamp from the last known-good sample — never that placeholder's
-// 0%. RateLimited still tracks the newest row. With no good sample ever, util
-// stays 0 and SampleTS zero (honest "rate-limited, utilization unknown").
+// TestScoreInputRateLimitedReadsLastGood pins that scoreInput sources utilization,
+// resets, and timestamp from the last known-good sample — never a newer zeroed
+// rate_limited placeholder — while RateLimited still tracks the newest row.
 func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	goodTS := now.Add(-2 * time.Minute)
@@ -32,8 +29,8 @@ func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 		wantUtil7d      float64
 		wantRateLimited bool
 		wantSampleTS    time.Time // zero means "expect SampleTS to be zero"
-		wantExtraUsed   float64   // overage carried by the returned good sample
-		wantGoodNil     bool      // the returned good sample must be nil
+		wantExtraUsed   float64
+		wantGoodNil     bool
 	}{
 		"good reading then a newer rate_limited marker reads through to the good util": {
 			samples: []spec{
@@ -83,8 +80,6 @@ func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 			if !in.HasUsage {
 				t.Fatal("HasUsage = false, want true (the account was sampled)")
 			}
-			// Extra-usage must come from the good sample too, never the zeroed
-			// rate_limited placeholder.
 			if tc.wantGoodNil {
 				if good != nil {
 					t.Errorf("good sample = %+v, want nil (no clean sample ever)", *good)

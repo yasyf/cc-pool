@@ -12,44 +12,34 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// claudeJSONName and settingsName are the two top-level entries cc-pool serves as
-// SYNTHetic documents over the bridge: .claude.json as the live merged view (base
-// shareable keys over the account's private copy, shareable writes split back to
-// base) and settings.json as the base with plansDirectory injected (stripped on
-// write-through). Every other top-level entry is a passthrough mirror, a shared
-// live symlink, or a private redirect — none of which the consumer computes.
+// claudeJSONName and settingsName are the two top-level entries served as
+// synthetic documents; every other entry is a passthrough mirror, shared symlink,
+// or private redirect.
 const (
 	claudeJSONName = ".claude.json"
 	settingsName   = "settings.json"
 )
 
-// writeThroughMu serializes every base read→split→write cycle across ALL account
-// domains: each domain's mount writes through to the same shared base files
-// (~/.claude.json, ~/.claude/settings.json), and the read-modify-write must be
-// atomic against other in-process write-throughs. The shared holder issues these
-// over the bridge, but they all land in this one BridgeServer process, so this
-// lock is the complete story. Held across the cycle's I/O — a documented exception
-// to the lock-scope rule — but the holder runs every WriteThrough on a background
-// worker OFF its fuse handler path, so a contended lock or a slow base rewrite can
-// never park a fuse-t worker and stall a mount's NFS server. Against a
-// concurrently-running vanilla claude we accept last-writer-wins within the
-// window; blacklisted keys are structurally protected because base is re-read each
-// cycle and they are never copied.
+// writeThroughMu serializes the base read→split→write cycle across ALL account
+// domains (every domain writes through to the same ~/.claude.json and
+// ~/.claude/settings.json), all landing in this one BridgeServer process. Held
+// across the cycle's I/O — a lock-scope exception, safe because the holder runs
+// every WriteThrough on a background worker off its fuse handler path, so it can
+// never stall a mount's NFS server. Against a concurrent vanilla claude,
+// last-writer-wins within the window; blacklisted keys stay safe because base is
+// re-read each cycle and never copied.
 var writeThroughMu sync.Mutex
 
-// PoolContentSource implements content.Source for cc-pool's overlay: it serves the
-// merged .claude.json and the plansDirectory-injected settings.json as synthetic
-// entries over the shared holder's bridge, classifies shared/private/excluded
-// entries from the same predicates the symlink overlay uses, and writes shareable
-// keys back through to the shared base files. ONE instance serves every account
-// domain (a domain is the account ConfigDir): the per-domain private root is
-// derived from the domain, and the shared bases are fixed for the process.
-// Implementations of content.Source must be safe for concurrent calls; every field
-// here is either immutable after construction or guarded (writeThroughMu, errMu).
+// PoolContentSource implements content.Source for cc-pool's overlay: serving the
+// merged .claude.json and plansDirectory-injected settings.json as synthetic
+// entries, classifying shared/private/excluded entries, and writing shareable keys
+// back to the shared base files. One instance serves every account domain (a domain
+// is the account ConfigDir); safe for concurrent calls, with every field immutable
+// or guarded (writeThroughMu, errMu).
 type PoolContentSource struct {
 	// claudeDir is the shared overlay base (~/.claude); baseClaudeJSON is plain
-	// claude's state file (~/.claude.json, base's SIBLING, not inside it). Injected
-	// at construction so this package never imports pool (which would cycle).
+	// claude's ~/.claude.json (base's sibling, not inside it). Injected at
+	// construction to avoid importing pool (import cycle).
 	claudeDir      string
 	baseClaudeJSON string
 
@@ -58,8 +48,8 @@ type PoolContentSource struct {
 	writeErr map[string]error // "<domain>/<name>" -> last base write-through failure
 }
 
-// NewPoolContentSource builds the source from the shared base paths: claudeDir is
-// ~/.claude and baseClaudeJSON is ~/.claude.json.
+// NewPoolContentSource builds the source from the shared base paths (claudeDir
+// ~/.claude, baseClaudeJSON ~/.claude.json).
 func NewPoolContentSource(claudeDir, baseClaudeJSON string) *PoolContentSource {
 	return &PoolContentSource{
 		claudeDir:      claudeDir,
@@ -75,12 +65,11 @@ func (s *PoolContentSource) privClaudeJSON(domain string) string {
 func (s *PoolContentSource) baseSettings() string { return filepath.Join(s.claudeDir, settingsName) }
 func (s *PoolContentSource) plansDir() string     { return filepath.Join(s.claudeDir, "plans") }
 
-// Manifest classifies the top-level entries the holder must treat specially for an
-// account domain: the shared entries as live symlinks into the base (bulk I/O
-// stays off the synth path), the excluded entries as private empty dirs, and the
-// two synthetic documents. Every other base entry is a plain passthrough the
-// holder mirrors without consulting the source. The synth Freshness lists the
-// local files whose (mtime,size) gate the holder's cached bytes, so a steady-state
+// Manifest classifies the top-level entries the holder treats specially for a
+// domain: shared entries as live symlinks into base (bulk I/O off the synth path),
+// excluded entries as private empty dirs, and the two synthetic documents;
+// everything else is a plain passthrough. Each synth's Freshness lists the local
+// files whose (mtime,size) gate the holder's cached bytes, so a steady-state
 // Getattr costs a local stat, not a bridge RPC.
 func (s *PoolContentSource) Manifest(domain string) ([]content.Entry, error) {
 	entries := make([]content.Entry, 0, 2+len(SharedEntries)+len(ExcludedEntries))
@@ -97,28 +86,28 @@ func (s *PoolContentSource) Manifest(domain string) ([]content.Entry, error) {
 	return entries, nil
 }
 
-// ReadSynth computes a synthetic entry's bytes. .claude.json is base's shareable
-// keys merged onto the account's private copy; settings.json is the base file with
+// ReadSynth computes a synthetic entry's bytes: .claude.json is base's shareable
+// keys merged onto the account's private copy; settings.json is base with
 // plansDirectory injected. A parse failure falls back to the raw private/base bytes
 // (recording the error for HealthErrors) so a session never sees EIO over a corrupt
-// file — the same contract the in-process mirror held.
+// file.
 func (s *PoolContentSource) ReadSynth(domain, name string) ([]byte, error) {
 	switch name {
 	case claudeJSONName:
 		priv, err := os.ReadFile(s.privClaudeJSON(domain))
 		if err != nil {
-			// A missing private file is genuine: a seeded fuse account always has
-			// one (it is swept in before the mount). Surface it, never fabricate a
-			// view from base alone.
+			// A seeded fuse account always has a private file (swept in before the
+			// mount), so a missing one is genuine: surface it, never fabricate a view
+			// from base alone.
 			return nil, fmt.Errorf("read private claude.json for %s: %w", domain, err)
 		}
 		base, err := os.ReadFile(s.baseClaudeJSON)
 		if err != nil {
 			if !os.IsNotExist(err) {
 				s.recordRead(domain, name, fmt.Errorf("read base claude.json: %w", err))
-				return priv, nil // base unreadable but the private copy serves — never EIO
+				return priv, nil // base unreadable; serve private, never EIO
 			}
-			base = nil // no base yet: MergeClaudeJSON returns the private copy verbatim
+			base = nil // no base yet; merge returns the private copy verbatim
 		}
 		merged, _, err := MergeClaudeJSON(priv, base)
 		if err != nil {
@@ -144,12 +133,10 @@ func (s *PoolContentSource) ReadSynth(domain, name string) ([]byte, error) {
 	}
 }
 
-// WriteThrough persists a committed synthetic document back to the shared base.
+// WriteThrough persists a committed synthetic document back to the shared base:
 // .claude.json's shareable keys split into ~/.claude.json (blacklisted keys never
-// cross; the private file keeps the full payload, which the holder already wrote
-// durably); settings.json's injected plansDirectory is stripped back out so the
-// base stays pristine. Both run under writeThroughMu for cross-domain base
-// atomicity, and both skip the rewrite when nothing shareable changed (writing
+// cross); settings.json's injected plansDirectory is stripped back out. Both run
+// under writeThroughMu and skip the rewrite when nothing shareable changed (writing
 // identical bytes would bump base's mtime and thrash every mount's merge cache). A
 // missing base is a deliberate no-op: cc-pool must never mint plain claude's files.
 func (s *PoolContentSource) WriteThrough(domain, name string, data []byte) error {
@@ -212,8 +199,8 @@ func (s *PoolContentSource) writeThroughSettings(payload []byte) error {
 }
 
 // Classify reports a top-level entry's kind for a fully-remote (Tree) consumer.
-// cc-pool drives the holder through Manifest, so the holder never calls this; it
-// completes the content.Source contract and keeps the classification in one place.
+// cc-pool drives the holder through Manifest and never calls this; it completes the
+// content.Source contract.
 func (s *PoolContentSource) Classify(name string) content.EntryKind {
 	switch {
 	case name == claudeJSONName || name == settingsName:
@@ -223,14 +210,13 @@ func (s *PoolContentSource) Classify(name string) content.EntryKind {
 	case PrivateEntry(name):
 		return content.EntryPrivate
 	default:
-		return "" // a plain passthrough entry
+		return "" // passthrough entry
 	}
 }
 
-// HealthErrors joins every domain's last merged/served-read failure and last base
-// write-through failure, for the daemon's status/doctor surface (the in-process
-// mirror's healthErr, now over the bridge). A read failure is cleared by the next
-// successful read; a write failure by the next successful write-through.
+// HealthErrors joins every domain's last read failure and last write-through
+// failure for the daemon's status/doctor surface. A read failure is cleared by the
+// next successful read; a write failure by the next successful write-through.
 func (s *PoolContentSource) HealthErrors() error {
 	s.errMu.Lock()
 	defer s.errMu.Unlock()

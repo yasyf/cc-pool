@@ -22,18 +22,15 @@ import (
 	"github.com/yasyf/fusekit/version"
 )
 
-// tccHint is the fusekit-sourced grant hint holderFooter appends to a
-// grant-needed alert so users can jump to the backend's enablement pane. The
-// pane/URL come from Backend.Enablement (fuseGrantHint), never a cc-pool literal.
+// The pane/URL come from fusekit's Backend.Enablement, never a cc-pool literal.
 var tccHint = " — " + fuseGrantHint(fkoverlay.BackendNFS) + " (cc-pool falls back to symlink automatically if the grant never lands)"
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 func stripANSI(s string) string { return ansiRE.ReplaceAllString(s, "") }
 
-// TestRenderTablePlain pins the plain (non-TTY) status table: it must phrase the
-// 5h/7d columns as % USED (not remaining), use the clearer headers, mark the
-// next pick, flag a stale account, and carry the legend.
+// TestRenderTablePlain pins the plain (non-TTY) status table; columns are
+// % used, never % remaining.
 func TestRenderTablePlain(t *testing.T) {
 	snaps := []pool.Snapshot{
 		{
@@ -42,7 +39,6 @@ func TestRenderTablePlain(t *testing.T) {
 			HasUsage: true,
 			Util5h:   0,
 			Util7d:   13,
-			// Zero Resets5h → "-" (no active window), not a bogus duration.
 		},
 		{
 			Account:  store.Account{ID: 2, Label: "busy@example.com"},
@@ -56,7 +52,6 @@ func TestRenderTablePlain(t *testing.T) {
 	}
 	out := stripANSI(renderTable(snaps, dirPin{}))
 
-	// No pin context → no pin artifacts.
 	if strings.Contains(out, "pinned") {
 		t.Errorf("output must not show pin tokens without a pin\n%s", out)
 	}
@@ -66,15 +61,12 @@ func TestRenderTablePlain(t *testing.T) {
 			t.Errorf("header missing %q\n%s", want, out)
 		}
 	}
-	// The old, ambiguous headers must be gone.
 	for _, bad := range []string{"SESS", "FLAGS"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("output still shows retired label %q\n%s", bad, out)
 		}
 	}
 
-	// Columns show utilization (used), so a 58%-used window reads "58%", never
-	// the remaining "42%".
 	if !strings.Contains(out, "58%") || !strings.Contains(out, "61%") {
 		t.Errorf("rows should show used%% (58/61)\n%s", out)
 	}
@@ -90,12 +82,9 @@ func TestRenderTablePlain(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
-	// lines[0] header, lines[1] best account (zero reset → "-").
 	if !strings.Contains(lines[1], "best@example.com") || !strings.HasSuffix(strings.TrimRight(lines[1], " "), "-") {
 		t.Errorf("best row should end with '-' for an unknown reset\n%q", lines[1])
 	}
-	// The busy row's known reset now renders as an absolute clock (AM/PM), not a
-	// relative "2h03m" duration.
 	if !strings.Contains(lines[2], "AM") && !strings.Contains(lines[2], "PM") {
 		t.Errorf("busy row should show an absolute reset clock, got %q", lines[2])
 	}
@@ -123,9 +112,8 @@ func TestAbbreviateHome(t *testing.T) {
 	}
 }
 
-// TestHumanizeResetAt pins the absolute-reset formatter against a fixed now
-// (Monday 2026-06-08 10:00 local). Inputs are built in time.Local so the
-// formatter's .Local() is a no-op and the expected strings hold in any zone.
+// TestHumanizeResetAt pins humanizeResetAt against a fixed now; inputs are in
+// time.Local so .Local() is a no-op and the expectations hold in any zone.
 func TestHumanizeResetAt(t *testing.T) {
 	now := time.Date(2026, 6, 8, 10, 0, 0, 0, time.Local) // Monday
 	at := func(mo, d, h, minute int) time.Time {
@@ -161,8 +149,7 @@ func TestRenderTableEmpty(t *testing.T) {
 	}
 }
 
-// TestRenderTablePin: with the launch dir pinned, the pinned account's row is
-// badged and the pin summary line names the account, kind, and deadline.
+// TestRenderTablePin pins the pinned-row badge and the pin summary line.
 func TestRenderTablePin(t *testing.T) {
 	snaps := []pool.Snapshot{
 		{Account: store.Account{ID: 1, Label: "best@example.com"}, Score: 90, HasUsage: true},
@@ -190,9 +177,8 @@ func TestRenderTablePin(t *testing.T) {
 	}
 }
 
-// TestRenderPinLine pins each pin-state phrasing, including the fallback name
-// for an account missing from snaps and the no-promise wording when the pinned
-// account cannot serve — each arm of the UsableForSticky mirror independently.
+// TestRenderPinLine pins each pin-state phrasing — every arm of the
+// UsableForSticky mirror independently.
 func TestRenderPinLine(t *testing.T) {
 	healthySnap := func(raw5 float64) []pool.Snapshot {
 		return []pool.Snapshot{{
@@ -261,12 +247,9 @@ func TestRenderPinLine(t *testing.T) {
 	}
 }
 
-// TestSortSnapshots pins the display ordering shared by the plain table and the
-// TUI: usability tier first (available, then exhausted, then rate-limited —
-// mirroring Pick/PickFallback), score desc within a tier. A raw-score sort here
-// floats unusable accounts above usable ones: reset credit legitimately keeps an
-// exhausted account's forward-looking score high (observed 31.5 vs a healthy
-// 13.3), but select would never pick it.
+// TestSortSnapshots pins the display order mirrored from Pick/PickFallback;
+// reset credit can leave an exhausted account out-scoring a healthy one
+// (observed 31.5 vs 13.3).
 func TestSortSnapshots(t *testing.T) {
 	snap := func(id int, score float64, exhausted, rateLimited bool) pool.Snapshot {
 		s := pool.Snapshot{Score: score, Exhausted: exhausted, RateLimited: rateLimited}
@@ -308,9 +291,8 @@ func TestSortSnapshots(t *testing.T) {
 	}
 }
 
-// TestRenderTableUnusableSinks: in the rendered table, a usable account must
-// take the first row and the ▸ next-pick marker even when an exhausted account
-// out-scores it — the marker claims "next pick", and select skips exhausted.
+// TestRenderTableUnusableSinks pins that the usable account takes row 1 and
+// the ▸ marker even when out-scored by an exhausted one.
 func TestRenderTableUnusableSinks(t *testing.T) {
 	snaps := []pool.Snapshot{
 		{
@@ -339,9 +321,8 @@ func TestRenderTableUnusableSinks(t *testing.T) {
 	}
 }
 
-// TestStatusTUISortsTiered pins that the TUI refresh path uses the shared
-// tiered sort, not a raw-score sort: the detail pane's "next pick" line keys
-// off row 0, so an exhausted account floating to the top would lie.
+// TestStatusTUISortsTiered pins the TUI refresh to the shared tiered sort; the
+// detail pane's "next pick" line keys off row 0.
 func TestStatusTUISortsTiered(t *testing.T) {
 	exhausted := pool.Snapshot{Score: 31.5, Exhausted: true}
 	exhausted.Account.ID = 1
@@ -358,9 +339,8 @@ func TestStatusTUISortsTiered(t *testing.T) {
 	}
 }
 
-// TestFromDaemonHasUsageIndependentOfStale: "no-data" means never-sampled, not
-// stale. A stale account that still has usage must not be mislabeled no-data
-// (the bug where every stale account showed both flags despite real util%).
+// TestFromDaemonHasUsageIndependentOfStale pins that "no-data" means
+// never-sampled, not stale.
 func TestFromDaemonHasUsageIndependentOfStale(t *testing.T) {
 	snaps := fromDaemon([]daemon.AccountStatus{
 		{ID: 1, Label: "stale-with-data", Stale: true, HasUsage: true, Remaining7d: 87},
@@ -381,10 +361,8 @@ func TestFromDaemonHasUsageIndependentOfStale(t *testing.T) {
 	}
 }
 
-// TestSnapshotFlagsExhaustedAndOverage: an exhausted account is badged, overage
-// spend renders in dollars (the API reports currency cents), and overage merely
-// being enabled — with $0 spent — earns no badge (a permanent flag would train
-// the eye to ignore the alert color).
+// TestSnapshotFlagsExhaustedAndOverage pins the badges: overage renders in
+// dollars (the API reports cents), and enabled-but-$0 overage earns none.
 func TestSnapshotFlagsExhaustedAndOverage(t *testing.T) {
 	snaps := fromDaemon([]daemon.AccountStatus{
 		{ID: 1, Label: "pegged", HasUsage: true, Exhausted: true, ExtraEnabled: true, ExtraUsed: 177, ExtraLimit: 5000},
@@ -406,10 +384,8 @@ func TestSnapshotFlagsExhaustedAndOverage(t *testing.T) {
 	}
 }
 
-// TestDaemonStatusUsable pins the version gate: only an OK response from a
-// daemon at the exact current binary version is rendered directly; anything
-// else (error, not-OK, empty/mismatched version) falls back to live sampling so
-// a pre-upgrade daemon can't feed the TUI a partial view.
+// TestDaemonStatusUsable pins the exact-version gate so a pre-upgrade daemon
+// never feeds a partial view.
 func TestDaemonStatusUsable(t *testing.T) {
 	cur := version.String()
 	cases := map[string]struct {
@@ -432,10 +408,7 @@ func TestDaemonStatusUsable(t *testing.T) {
 	}
 }
 
-// TestUsageSuffix pins the usage suffix: known usage renders rounded 5h/7d
-// percent-used; unknown usage renders nothing so callers never print a fabricated
-// 0% for a never-sampled (or pre-upgrade-daemon) pick. ANSI is stripped so the
-// assertions hold regardless of TTY.
+// TestUsageSuffix pins that unknown usage renders nothing, never a fabricated 0%.
 func TestUsageSuffix(t *testing.T) {
 	cases := map[string]struct {
 		hasUsage     bool
@@ -456,11 +429,10 @@ func TestUsageSuffix(t *testing.T) {
 	}
 }
 
-// TestStatusSnapshotJSONLiveFallback covers --json with no daemon: the client
-// dial fails and the snapshot is assembled from live (cached-fresh) samples.
+// TestStatusSnapshotJSONLiveFallback pins --json with no daemon: the snapshot
+// assembles from cached-fresh live samples.
 func TestStatusSnapshotJSONLiveFallback(t *testing.T) {
-	// HOME isolation FIRST: statusSnapshotJSON dials pool.SocketPath(), and
-	// without this a live daemon on the dev machine would hijack the test.
+	// Isolate HOME first: a live daemon at pool.SocketPath() would otherwise hijack the test.
 	t.Setenv("HOME", t.TempDir())
 
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
@@ -500,11 +472,8 @@ func TestStatusSnapshotJSONLiveFallback(t *testing.T) {
 	}
 }
 
-// TestStatusSnapshotJSONDaemonBranch pins statusSnapshotJSON's primary branch
-// against a fixture daemon socket: a usable daemon's accounts pass through
-// verbatim — preserving sample_age, which a gatherStatus/fromDaemon round-trip
-// would fabricate as "0s" — while a version-skewed daemon falls back to live
-// sampling from the store.
+// TestStatusSnapshotJSONDaemonBranch pins that a usable daemon's accounts pass
+// through verbatim; a fromDaemon round-trip would fabricate sample_age "0s".
 func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 	cases := map[string]struct {
 		daemonVersion string
@@ -520,8 +489,7 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			// Short HOME under /tmp: macOS caps sun_path at 104 bytes, and
-			// t.TempDir's /var/folders path plus the test name exceeds it.
+			// Short HOME under /tmp: macOS caps sun_path at 104 bytes.
 			home, err := os.MkdirTemp("/tmp", "ccp-home")
 			if err != nil {
 				t.Fatal(err)
@@ -592,11 +560,8 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 	}
 }
 
-// TestHolderFooter pins the plain-table holder alert: nothing for a nil or
-// healthy-current holder (status stays clean), and the TCC-blocked line carries
-// the fusekit-sourced settings deep link. Skew and spawn failures are no longer
-// surfaced here — the holder is a separate, multi-tenant product whose version
-// and process lifecycle are not cc-pool's to police.
+// TestHolderFooter pins the holder alert; holder skew/spawn failures are
+// intentionally unsurfaced (the multi-tenant holder isn't cc-pool's to police).
 func TestHolderFooter(t *testing.T) {
 	cases := map[string]struct {
 		h    *daemon.HolderStatus
@@ -620,9 +585,7 @@ func TestHolderFooter(t *testing.T) {
 	}
 }
 
-// TestHolderFooterWedged pins the wedged-mirror footer: silent at zero,
-// singular at one, plural beyond, printed regardless of the holder's version,
-// and ranked below the holder-blocking TCC grant.
+// TestHolderFooterWedged pins the wedged-mirror footer.
 func TestHolderFooterWedged(t *testing.T) {
 	cases := map[string]struct {
 		h    *daemon.HolderStatus
@@ -657,9 +620,8 @@ func TestHolderFooterWedged(t *testing.T) {
 	}
 }
 
-// TestRunStatusPlainHolderFooter drives the plain status path against a fake
-// daemon socket: an alerting holder adds exactly one footer line under the
-// table, and a healthy holder leaves the output free of any holder mention.
+// TestRunStatusPlainHolderFooter pins the holder footer end-to-end through
+// runStatus against a fake daemon socket.
 func TestRunStatusPlainHolderFooter(t *testing.T) {
 	cases := map[string]struct {
 		holder *daemon.HolderStatus

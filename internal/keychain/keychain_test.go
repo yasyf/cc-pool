@@ -22,18 +22,16 @@ func TestServiceNameGoldenVectors(t *testing.T) {
 	}
 }
 
-// TestServiceNameAlwaysSuffixed pins the structural enforcement of safety
-// rule 1: every service name this package can produce carries a hash suffix,
-// so no caller can ever name the canonical unsuffixed item plain `claude`
-// owns ("Claude Code-credentials").
+// TestServiceNameAlwaysSuffixed pins safety rule 1: every service name carries a
+// hash suffix, so no caller can name the canonical unsuffixed "Claude Code-credentials".
 func TestServiceNameAlwaysSuffixed(t *testing.T) {
 	re := regexp.MustCompile(`^Claude Code-credentials-[0-9a-f]{8}$`)
 	for _, dir := range []string{
 		"",
 		"/Users/x/.claude",
 		"/Users/x/.cc-pool/accounts/acct-01",
-		"/Users/x/.claude/", // trailing slash hashes differently but still suffixed
-		"/Users/é/.claude",  // non-ASCII path (NFC-normalized before hashing)
+		"/Users/x/.claude/", // trailing slash → different hash, still suffixed
+		"/Users/é/.claude",  // non-ASCII, NFC-normalized before hashing
 	} {
 		got := ServiceName(dir)
 		if got == "Claude Code-credentials" {
@@ -56,9 +54,8 @@ func TestAccountLabelFromEnv(t *testing.T) {
 	}
 }
 
-// TestSecurityRoundTrip drives the real wrapper against a fake `security`
-// binary that emulates add/find/delete, proving the exact argv contract and the
-// -X hex round-trip.
+// TestSecurityRoundTrip drives the wrapper against a fake security(1) emulating
+// add/find/delete, proving the argv contract and -X hex round-trip.
 func TestSecurityRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	storeDir := filepath.Join(dir, "items")
@@ -112,8 +109,7 @@ func TestSecurityRoundTrip(t *testing.T) {
 	}
 }
 
-// writeFakeSecurity writes a shell script emulating /usr/bin/security using a
-// directory of files keyed by service+account.
+// writeFakeSecurity writes a shell stub emulating security(1) via files keyed by service+account.
 func writeFakeSecurity(t *testing.T, dir, storeDir string) string {
 	t.Helper()
 	script := `#!/bin/bash

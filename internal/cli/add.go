@@ -12,8 +12,6 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// addOptions carries `ccp add`'s flags; bare `ccp` reuses the flow with the
-// zero value.
 type addOptions struct {
 	label   string
 	runNow  bool
@@ -22,8 +20,7 @@ type addOptions struct {
 	noAlias bool
 }
 
-// errAddSkipped signals that an addOne was cleanly skipped (the user declined to
-// pool a subscription that is already in the pool). It is not a failure.
+// errAddSkipped: the user declined to add an already-pooled subscription; not a failure.
 var errAddSkipped = errors.New("add skipped")
 
 func newAddCmd() *cobra.Command {
@@ -58,8 +55,7 @@ away.`,
 	return cmd
 }
 
-// runAdd is the full add flow: auto-init, then the addOne loop. Both `ccp add`
-// and bare `ccp` (on an empty pool) dispatch here.
+// runAdd serves both `ccp add` and bare `ccp` on an empty pool (zero-value opts).
 func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 	if err := ensureReady(cmd, m); err != nil {
 		return err
@@ -68,15 +64,15 @@ func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 	for i := 0; ; i++ {
 		lbl := ""
 		if i == 0 {
-			lbl = opts.label // --label applies to the first account
+			lbl = opts.label
 		}
 		acct, err := addOne(cmd, m, lbl, opts)
 		if err != nil {
 			if errors.Is(err, errAddSkipped) {
-				break // user declined a duplicate; not a failure
+				break
 			}
 			if len(added) == 0 {
-				return err // nothing added yet → propagate (nonzero exit)
+				return err
 			}
 			warn(cmd.ErrOrStderr(), "stopping after %s: %v", plural(len(added), "account"), err)
 			break
@@ -93,8 +89,6 @@ func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 	return nil
 }
 
-// ensureReady auto-initializes the pool and starts the daemon, so `ccp add`
-// works from a fresh machine with no prior `ccp init`.
 func ensureReady(cmd *cobra.Command, m *pool.Manager) error {
 	ok, err := m.Initialized()
 	if err != nil {
@@ -112,7 +106,6 @@ func ensureReady(cmd *cobra.Command, m *pool.Manager) error {
 	return nil
 }
 
-// addOne runs the full prepare → login → finalize flow for a single account.
 func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) (*store.Account, error) {
 	out := cmd.OutOrStdout()
 	var pending *pool.PendingAdd
@@ -146,7 +139,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 		_ = huh.NewInput().
 			Title("Name for this account (optional)").
 			Placeholder("e.g. Work, or an email").
-			Value(&label). // prefilled with a name derived from the account email when known
+			Value(&label).
 			WithTheme(ccpTheme()).
 			Run()
 	}
@@ -154,9 +147,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	acct, err := m.FinalizeAdd(cmd.Context(), pending, label)
 	if err != nil {
 		if acct != nil {
-			// The row is registered and the credential is live — only the
-			// best-effort usage check failed (e.g. a network blip). Keep the
-			// account and surface a soft warning rather than orphan the row.
+			// Row and credential are live; only the best-effort usage check failed.
 			warn(cmd.ErrOrStderr(), "added the account, but its first usage check failed; run `ccp doctor` to retry")
 		} else {
 			fail(cmd.ErrOrStderr(), "couldn't finish adding the account: %v", err)
@@ -178,12 +169,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	return acct, nil
 }
 
-// noteFuseFirstMount warns about macOS's one-time volume-access grant prompt the
-// account's first fuse mount triggers. The pane name is sourced from the
-// backend's Enablement, never a cc-pool literal. It fires only when this machine
-// can host fuse (the fusekit-holder cask is installed) and the account is
-// fuse-backed — a symlink overlay never mounts, so it never prompts. Migrate
-// already says this in its own flow, so this covers the add/init path only.
+// noteFuseFirstMount warns about macOS's one-time volume-access grant prompt on an account's first fuse mount.
 func noteFuseFirstMount(out io.Writer, backend fkoverlay.Backend) {
 	if !pool.CanHostFuse() || !backend.IsFuse() {
 		return
@@ -195,10 +181,8 @@ func noteFuseFirstMount(out io.Writer, backend fkoverlay.Backend) {
 	note(out, "macOS will show a one-time grant prompt for cc-pool (%s) — click Allow.", en.Pane)
 }
 
-// defaultLabel resolves a new account's label: an explicit --label wins;
-// otherwise a friendly name derived from the account's logged-in email when
-// readable, else empty (the prefill is decorative — identity-read failures
-// stay silent).
+// defaultLabel's email-derived prefill is decorative — identity-read failures
+// stay silent.
 func defaultLabel(explicit string, backend fkoverlay.Backend, configDir string) string {
 	if explicit != "" {
 		return explicit
@@ -210,10 +194,8 @@ func defaultLabel(explicit string, backend fkoverlay.Backend, configDir string) 
 	return pool.LabelForEmail(id.EmailAddress)
 }
 
-// checkDuplicate reports whether the just-logged-in account should be skipped
-// because its subscription is already pooled. Interactive runs ask and default
-// to skipping; non-interactive runs warn and keep it so automation is never
-// blocked. A missing identity (login didn't capture one) disables the check.
+// checkDuplicate reports whether to skip an already-pooled subscription.
+// Non-interactive runs keep it (never block automation); no identity, no check.
 func checkDuplicate(cmd *cobra.Command, m *pool.Manager, p *pool.PendingAdd, opts addOptions) bool {
 	id, err := pool.AccountIdentity(p.OverlayKind, p.ConfigDir)
 	if err != nil {
@@ -241,9 +223,6 @@ func checkDuplicate(cmd *cobra.Command, m *pool.Manager, p *pool.PendingAdd, opt
 	return !keep
 }
 
-// loginFlow walks the user through the interactive login: either a watched
-// `claude /login` in this terminal (closed automatically once the credential
-// lands) or a manual command in another terminal (polled until it lands).
 func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) error {
 	out := cmd.OutOrStdout()
 	doRun := opts.runNow || opts.autoYes
@@ -265,9 +244,9 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 		if err := runWatchedLogin(cmd.Context(), cmd, pending); err != nil {
 			var exitErr *exec.ExitError
 			if !errors.As(err, &exitErr) {
-				return err // cancellation or infrastructure failure
+				return err
 			}
-			// claude exiting nonzero is not fatal; finalize decides, as before.
+			// A nonzero claude exit isn't fatal; finalize decides.
 			warn(cmd.ErrOrStderr(), "the login command exited with an error: %v", err)
 		}
 		return nil
@@ -278,8 +257,7 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 		return nil
 	}
 	if pending.ClaudeJSONSeed == pool.SeedKeptExisting {
-		// The dir already holds a logged-in identity (the reuse path): polling
-		// cannot tell reuse from a fresh login, so keep the explicit confirm.
+		// Polling can't tell a reused dir's pre-existing login from a fresh one.
 		cont := true
 		_ = huh.NewConfirm().
 			Title("Press enter when the login is done").
@@ -291,7 +269,6 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 	return waitForLogin(cmd.Context(), out, pending.OverlayKind, pending.ConfigDir)
 }
 
-// addAnother decides whether the loop continues after a successful add.
 func addAnother(cmd *cobra.Command, done, count int, autoYes bool) bool {
 	if count > 0 {
 		return done < count
@@ -299,8 +276,7 @@ func addAnother(cmd *cobra.Command, done, count int, autoYes bool) bool {
 	if autoYes || !isTTY() {
 		return false
 	}
-	// Most people pool more than one subscription, so nudge toward a second
-	// account after the first; stop nudging once they have a few.
+	// Default yes only after the first add — most people pool 2+ subscriptions.
 	again := done == 1
 	if err := huh.NewConfirm().Title("Add another account?").Value(&again).WithTheme(ccpTheme()).Run(); err != nil {
 		warn(cmd.ErrOrStderr(), "prompt failed: %v", err)
@@ -309,8 +285,6 @@ func addAnother(cmd *cobra.Command, done, count int, autoYes bool) bool {
 	return again
 }
 
-// summarizeAdds prints the running pool total once the add loop ends. Each
-// account was already confirmed individually, so this only reports the total.
 func summarizeAdds(cmd *cobra.Command, m *pool.Manager, added []store.Account) {
 	if len(added) == 0 {
 		return

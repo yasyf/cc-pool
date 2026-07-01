@@ -6,15 +6,11 @@ import (
 	"regexp"
 )
 
-// acctAttrRE matches the account attribute line in `security
-// find-generic-password` attribute output:  "acct"<blob>="yasyf"
+// acctAttrRE matches the account line in security(1) attribute output: "acct"<blob>="yasyf".
 var acctAttrRE = regexp.MustCompile(`"acct"<blob>="([^"]*)"`)
 
-// DiscoverAccount returns the Keychain account (-a) label actually stored on
-// the item for the given service, by parsing the item's attribute dump (no
-// secret is read). This is more robust than recomputing the label, because it
-// reflects exactly what Claude wrote at /login time. Returns ErrNotFound if no
-// item exists for the service.
+// DiscoverAccount returns the account (-a) label stored on the service's item by
+// parsing its attribute dump (no secret read). Returns ErrNotFound if absent.
 func DiscoverAccount(service string) (string, error) {
 	//nolint:gosec // G204: securityBin is the fixed /usr/bin/security path; service is a cc-pool-derived keychain service name
 	cmd := exec.Command(securityBin, "find-generic-password", "-s", service)
@@ -30,6 +26,5 @@ func DiscoverAccount(service string) (string, error) {
 	if m := acctAttrRE.FindStringSubmatch(out.String()); m != nil {
 		return m[1], nil
 	}
-	// Fall back to the computed label if the attribute is absent.
 	return AccountLabel(), nil
 }

@@ -10,9 +10,6 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// csFixture builds a PoolContentSource over temp dirs and returns it plus the
-// per-domain paths a test writes to: the shared base ~/.claude.json, the base
-// ~/.claude/settings.json, and the account's private .claude.json.
 type csFixture struct {
 	src      *PoolContentSource
 	domain   string
@@ -75,18 +72,14 @@ func TestPoolContentSourceManifest(t *testing.T) {
 	for _, e := range entries {
 		byName[e.Name] = e
 	}
-	// plans is a live symlink into the shared base.
 	if e := byName["plans"]; e.Kind != content.EntrySymlink || e.Target != f.plansDir {
 		t.Errorf("plans entry = %+v, want symlink → %s", e, f.plansDir)
 	}
-	// The excluded dirs are per-account private.
 	for _, name := range []string{"daemon", "ide", "backups"} {
 		if e := byName[name]; e.Kind != content.EntryPrivate {
 			t.Errorf("%s entry = %+v, want EntryPrivate", name, e)
 		}
 	}
-	// .claude.json is a private synth whose freshness gates on the private copy
-	// and the shared base sibling.
 	cj := byName[".claude.json"]
 	if cj.Kind != content.EntrySynth || !cj.Private {
 		t.Errorf(".claude.json entry = %+v, want private synth", cj)
@@ -94,7 +87,6 @@ func TestPoolContentSourceManifest(t *testing.T) {
 	if len(cj.Freshness) != 2 || cj.Freshness[0] != f.privCJ || cj.Freshness[1] != f.baseCJ {
 		t.Errorf(".claude.json freshness = %v, want [%s %s]", cj.Freshness, f.privCJ, f.baseCJ)
 	}
-	// settings.json is a SHARED synth (Private false) gated on the base file.
 	set := byName["settings.json"]
 	if set.Kind != content.EntrySynth || set.Private {
 		t.Errorf("settings.json entry = %+v, want shared synth", set)
@@ -106,8 +98,6 @@ func TestPoolContentSourceManifest(t *testing.T) {
 
 func TestPoolContentSourceReadSynthClaudeJSON(t *testing.T) {
 	f := newCSFixture(t)
-	// oauthAccount is blacklisted (never crosses); foo is private-only; bar is a
-	// shareable base key that must merge into the served view.
 	writeJSON(t, f.privCJ, map[string]any{"oauthAccount": "acct", "foo": 1})
 	writeJSON(t, f.baseCJ, map[string]any{"oauthAccount": "base", "bar": 2})
 	got, err := f.src.ReadSynth(f.domain, ".claude.json")
@@ -128,8 +118,7 @@ func TestPoolContentSourceReadSynthClaudeJSON(t *testing.T) {
 
 func TestPoolContentSourceReadSynthMissingPrivateErrors(t *testing.T) {
 	f := newCSFixture(t)
-	// No private .claude.json: a seeded fuse account always has one, so this is a
-	// genuine error — never fabricate a view from base alone.
+	// Seeded fuse accounts always have a private .claude.json; never fabricate from base alone.
 	writeJSON(t, f.baseCJ, map[string]any{"bar": 2})
 	if _, err := f.src.ReadSynth(f.domain, ".claude.json"); err == nil {
 		t.Fatal("ReadSynth(.claude.json) with no private file = nil error, want a failure")
@@ -139,8 +128,7 @@ func TestPoolContentSourceReadSynthMissingPrivateErrors(t *testing.T) {
 func TestPoolContentSourceReadSynthMissingBaseServesPrivate(t *testing.T) {
 	f := newCSFixture(t)
 	writeJSON(t, f.privCJ, map[string]any{"oauthAccount": "acct", "foo": 1})
-	// No base ~/.claude.json yet (onboarding): the merge returns the private copy
-	// verbatim, never EIO.
+	// Missing base (onboarding): serve the private copy verbatim, never EIO.
 	got, err := f.src.ReadSynth(f.domain, ".claude.json")
 	if err != nil {
 		t.Fatalf("ReadSynth: %v", err)
@@ -169,8 +157,6 @@ func TestPoolContentSourceReadSynthSettingsInjects(t *testing.T) {
 func TestPoolContentSourceWriteThroughClaudeJSONSplits(t *testing.T) {
 	f := newCSFixture(t)
 	writeJSON(t, f.baseCJ, map[string]any{"oauthAccount": "base", "bar": 1})
-	// The user committed a merged document; its shareable keys split back to base,
-	// blacklisted keys never cross, base-only keys survive.
 	payload, _ := json.Marshal(map[string]any{"oauthAccount": "acct", "bar": 2, "newShared": 3})
 	if err := f.src.WriteThrough(f.domain, ".claude.json", payload); err != nil {
 		t.Fatalf("WriteThrough: %v", err)
@@ -190,8 +176,7 @@ func TestPoolContentSourceWriteThroughClaudeJSONSplits(t *testing.T) {
 
 func TestPoolContentSourceWriteThroughSettingsStrips(t *testing.T) {
 	f := newCSFixture(t)
-	// The base already carries our injected plansDirectory (as if a prior served
-	// view was written straight back); write-through must strip it.
+	// Base already carries the injected key, as if a served view was committed back.
 	writeJSON(t, f.baseSet, map[string]any{"theme": "dark", "plansDirectory": f.plansDir})
 	payload, _ := json.Marshal(map[string]any{"theme": "dark", "plansDirectory": f.plansDir})
 	if err := f.src.WriteThrough(f.domain, "settings.json", payload); err != nil {
@@ -209,7 +194,6 @@ func TestPoolContentSourceWriteThroughSettingsStrips(t *testing.T) {
 func TestPoolContentSourceWriteThroughMissingBaseIsNoop(t *testing.T) {
 	f := newCSFixture(t)
 	payload, _ := json.Marshal(map[string]any{"bar": 2})
-	// No base ~/.claude.json: cc-pool must never mint plain claude's file.
 	if err := f.src.WriteThrough(f.domain, ".claude.json", payload); err != nil {
 		t.Fatalf("WriteThrough on missing base = %v, want a silent no-op", err)
 	}
@@ -226,7 +210,7 @@ func TestPoolContentSourceClassify(t *testing.T) {
 		"plans":             content.EntrySymlink,
 		"daemon":            content.EntryPrivate,
 		".credentials.json": content.EntryPrivate,
-		"history.jsonl":     "", // a plain passthrough entry
+		"history.jsonl":     "", // passthrough
 	}
 	for name, want := range cases {
 		if got := f.src.Classify(name); got != want {
@@ -237,8 +221,6 @@ func TestPoolContentSourceClassify(t *testing.T) {
 
 func TestPoolContentSourceHealthErrors(t *testing.T) {
 	f := newCSFixture(t)
-	// A corrupt base settings.json makes inject fail; ReadSynth falls back to the
-	// raw bytes (never EIO) but records the error for HealthErrors.
 	if err := os.WriteFile(f.baseSet, []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +230,6 @@ func TestPoolContentSourceHealthErrors(t *testing.T) {
 	if f.src.HealthErrors() == nil {
 		t.Fatal("HealthErrors() = nil after a parse failure, want a recorded error")
 	}
-	// Fixing the file and re-reading clears the recorded error.
 	writeJSON(t, f.baseSet, map[string]any{"theme": "dark"})
 	if _, err := f.src.ReadSynth(f.domain, "settings.json"); err != nil {
 		t.Fatalf("ReadSynth after fix: %v", err)

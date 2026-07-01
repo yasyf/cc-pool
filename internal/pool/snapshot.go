@@ -28,28 +28,25 @@ type Snapshot struct {
 	Stale          bool
 	Resets5h       time.Time
 	Resets7d       time.Time
-	// Burn5hPerHour is the ungated scoring burn: it feeds score.Input
-	// rebuilds (the daemon's reservation re-rank) even when the sample is
-	// stale. Display consumers use Forecast instead.
+	// Burn5hPerHour is the ungated scoring burn: feeds score.Input even when the
+	// sample is stale. Display consumers use Forecast instead.
 	Burn5hPerHour float64
-	// Forecast is the gated display forecast — zero when the account is
-	// idle, stale, rate-limited, or exhausted. Only it reaches the status
-	// wire's prediction fields.
+	// Forecast is the gated display forecast — zero when idle, stale,
+	// rate-limited, or exhausted; only it reaches the status wire's prediction
+	// fields.
 	Forecast forecast.Estimate
-	// Burn7dPerHour is the gated display drain of the 7d window in
-	// percent/hour — a standalone signal (deliberately not folded into the
-	// 5h-only Forecast) that feeds only the pool pace rollup. Zero when the
-	// account is idle, stale, rate-limited, exhausted, or past its 7d reset.
+	// Burn7dPerHour is the gated 7d display drain (percent/hour), separate from
+	// the 5h Forecast; feeds only the pool pace rollup. Zero when idle, stale,
+	// rate-limited, exhausted, or past its 7d reset.
 	Burn7dPerHour float64
 	SampleAge     time.Duration
-	// Extra-usage (pay-as-you-go overage) state from the latest sample, for
-	// status display: an exhausted account with ExtraEnabled bills credits
-	// instead of rate-limiting.
+	// Extra-usage (pay-as-you-go overage) from the latest sample: an exhausted
+	// account with ExtraEnabled bills credits instead of rate-limiting.
 	ExtraEnabled bool
 	ExtraUsed    float64 // credits consumed this month (currency cents)
 	ExtraLimit   float64 // credit cap (currency cents)
-	// Components is the per-term score breakdown, so status can explain why an
-	// account scored what it did without recomputing.
+	// Components is the per-term score breakdown, so status can explain a score
+	// without recomputing.
 	Components score.Components
 }
 
@@ -87,8 +84,8 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 	for i, a := range accts {
 		in := inputs[i]
 		r := results[a.ID]
-		// Extra-usage (overage) reads through to the last known-good sample for
-		// the same reason as utilization: a rate-limit placeholder zeroes it.
+		// Extra-usage reads through to the last known-good sample: a rate-limit
+		// placeholder zeroes it.
 		var good store.UsageSample
 		if goods[i] != nil {
 			good = *goods[i]

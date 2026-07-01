@@ -7,9 +7,8 @@ import (
 	"testing"
 )
 
-// Fixture values are deliberately compact (no whitespace inside values):
-// json.Marshal compacts json.RawMessage values, so only compact inputs can be
-// asserted byte-identical across a merge or split.
+// Fixture values are deliberately compact: json.Marshal compacts json.RawMessage,
+// so only compact inputs can be asserted byte-identical across a merge or split.
 const (
 	mergePrivate = `{
 		"hasCompletedOnboarding": true,
@@ -35,9 +34,8 @@ const (
 	}`
 )
 
-// Project-key fixtures: every entry mixes shared approval keys with private
-// session state, so each assertion proves the carve-out splits a single
-// entry, never whole entries.
+// Project-key fixtures mix shared approval keys with private session state, so
+// assertions prove the carve-out splits a single entry, not whole entries.
 const (
 	projPrivate = `{
 		"theme": "dark",
@@ -52,8 +50,7 @@ const (
 	}`
 )
 
-// raw decodes b into top-level raw messages so per-key values can be compared
-// byte-exactly (the merge/split contract is byte-exact round-tripping).
+// raw decodes b into top-level raw messages for byte-exact per-key comparison.
 func raw(t *testing.T, b []byte) map[string]json.RawMessage {
 	t.Helper()
 	var m map[string]json.RawMessage
@@ -148,14 +145,13 @@ func TestMergeClaudeJSONNilBase(t *testing.T) {
 	}
 }
 
-// TestMergeClaudeJSONIdempotentAgainstPrettyBase pins the production shape of
-// the no-write short-circuit: ~/.claude.json is pretty-printed (claude's own
-// writer), while merged output holds json.Marshal-compact values. Merging the
-// output again against the SAME indented base must report changed=false with
-// byte-identical output — otherwise every launch rewrites the account file and
-// the MergeUnchanged race guard is dead code. The fixture deliberately carries
-// a multi-line composite value (whitespace divergence) and a string with raw
-// <, & (HTML-escape divergence — json.Marshal escapes, json.Compact does not).
+// TestMergeClaudeJSONIdempotentAgainstPrettyBase pins the no-write short-circuit
+// against a pretty-printed base (claude's own writer) while merged output holds
+// compact values: re-merging the output against the same indented base must report
+// changed=false with byte-identical output, otherwise every launch rewrites the
+// account file and the MergeUnchanged race guard is dead code. The fixture carries a
+// multi-line composite value and a string with raw <, & (json.Marshal escapes,
+// json.Compact does not).
 func TestMergeClaudeJSONIdempotentAgainstPrettyBase(t *testing.T) {
 	prettyBase := []byte(`{
   "theme": "light",
@@ -187,9 +183,9 @@ func TestMergeClaudeJSONIdempotentAgainstPrettyBase(t *testing.T) {
 	}
 }
 
-// TestMergeClaudeJSONDeterministic pins byte-determinism: two merges of the
-// same inputs must be byte-equal (json.Marshal key-sorts maps). The fuse
-// merged view's Getattr size and Read content depend on it.
+// TestMergeClaudeJSONDeterministic pins byte-determinism: two merges of the same
+// inputs must be byte-equal (json.Marshal key-sorts maps). The fuse merged view's
+// Getattr size and Read depend on it.
 func TestMergeClaudeJSONDeterministic(t *testing.T) {
 	a, _, err := MergeClaudeJSON([]byte(mergePrivate), []byte(mergeBase))
 	if err != nil {
@@ -204,9 +200,9 @@ func TestMergeClaudeJSONDeterministic(t *testing.T) {
 	}
 }
 
-// assertProjects checks doc's projects object: wantProj pins per-project raw
-// values byte-exactly, absent pins per-project keys that must not exist, and
-// projectsAbsent pins that no projects object was minted at all.
+// assertProjects checks doc's projects object: wantProj pins per-project raw values
+// byte-exactly, absent pins per-project keys that must not exist, projectsAbsent
+// pins that no projects object was minted.
 func assertProjects(t *testing.T, doc []byte, wantProj map[string]map[string]string, absent map[string][]string, projectsAbsent bool) {
 	t.Helper()
 	projRaw, ok := raw(t, doc)["projects"]
@@ -343,12 +339,10 @@ func TestMergeClaudeJSONSharedProjectKeys(t *testing.T) {
 	}
 }
 
-// TestMergeClaudeJSONSharedProjectKeysIdempotent extends the pretty-base
-// no-flap pin to the project carve-out: shared project values are normalized
-// before the equality probe, so re-merging the output against the same
-// indented base must report changed=false with byte-identical output —
-// otherwise every launch rewrites the account file even after the approvals
-// already landed.
+// TestMergeClaudeJSONSharedProjectKeysIdempotent extends the pretty-base no-flap
+// pin to the project carve-out: re-merging the output against the same indented
+// base must report changed=false with byte-identical output, otherwise every launch
+// rewrites the account file even after approvals landed.
 func TestMergeClaudeJSONSharedProjectKeysIdempotent(t *testing.T) {
 	prettyBase := []byte(`{
   "theme": "dark",
@@ -421,8 +415,8 @@ func TestMergeClaudeJSONSharedProjectKeysLazyDstParse(t *testing.T) {
 }
 
 func TestSplitClaudeJSON(t *testing.T) {
-	// payload is what claude committed through a pooled session: shareable
-	// changes plus its own per-account state, which must never reach base.
+	// payload is what claude committed through a pooled session: shareable changes
+	// plus per-account state that must never reach base.
 	payload := `{
 		"theme": "solarized",
 		"newSetting": 42,
@@ -518,11 +512,10 @@ func TestSplitClaudeJSONSharedProjectKeys(t *testing.T) {
 			wantProj:     map[string]map[string]string{"/new": {"hasTrustDialogAccepted": `true`}},
 			absentInProj: map[string][]string{"/new": {"history"}},
 		},
-		// The byte-equal fixtures are in json.Marshal form (top-level keys
-		// sorted, compact values) with entry keys deliberately UNSORTED:
-		// byte-equality across the split proves the projects RawMessage passed
-		// through untouched — a re-marshal would sort the entry keys. The
-		// whole-file equality is what feeds writeThroughBase's bytes.Equal
+		// The byte-equal fixtures are json.Marshal form (top-level keys sorted,
+		// compact) with entry keys deliberately UNSORTED: byte-equality across the
+		// split proves the projects RawMessage passed through untouched (a re-marshal
+		// would sort the keys), which feeds writeThroughBase's bytes.Equal
 		// short-circuit.
 		"payload without projects leaves base byte-identical": {
 			payload:       `{"theme":"light"}`,
@@ -586,12 +579,11 @@ func TestSplitClaudeJSONSharedProjectKeys(t *testing.T) {
 	}
 }
 
-// TestMergeSplitRoundTrip rehearses the fuse write-through cycle: merge base
-// over private, let the session change a shareable key and accept a project's
-// trust dialog, split the commit back. The new base must carry both changes
-// while every other blacklisted base key stays byte-identical — and inside
-// projects only the shared approval crosses: base's own entry survives
-// untouched and the session's history never lands.
+// TestMergeSplitRoundTrip rehearses the fuse write-through cycle: merge base over
+// private, change a shareable key and accept a project's trust dialog, split the
+// commit back. The new base must carry both changes while every other blacklisted
+// key stays byte-identical, and inside projects only the shared approval crosses:
+// base's own entry survives and the session's history never lands.
 func TestMergeSplitRoundTrip(t *testing.T) {
 	merged, _, err := MergeClaudeJSON([]byte(mergePrivate), []byte(mergeBase))
 	if err != nil {

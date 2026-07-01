@@ -19,16 +19,8 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// newTestServer builds a Server over a temp-dir store with two accounts:
-// acct-1 emptier (util 10) than acct-2 (util 50), both freshly sampled. The
-// empty fake keychain makes any best-effort preflight refresh a harmless miss.
-//
-// scanSessions is stubbed to report no live sessions so the daemon tests never
-// shell out to the real `ps`: a live claude could never be attributed to these
-// temp config dirs anyway (so the result is identical), and the real ps is an
-// external the suite must not depend on — doubly so here, where a wedged mount
-// on the dev box would hang it (the very failure this package's scan bound
-// guards against). Tests that need live pids set their own s.scanSessions.
+// newTestServer builds a Server with acct-1 emptier than acct-2. scanSessions
+// is stubbed: real `ps` can hang on a wedged mount.
 func newTestServer(t *testing.T) (*Server, map[int]string) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
@@ -79,7 +71,6 @@ func TestReservedCountExpiresAfterTTL(t *testing.T) {
 		t.Fatalf("reservedCount after reserve = %d, want 1", got)
 	}
 
-	// Backdate past the TTL: the reservation must read as expired AND be pruned.
 	s.mu.Lock()
 	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
 	s.mu.Unlock()
@@ -103,7 +94,6 @@ func TestHandleSelectRecordsSticky(t *testing.T) {
 	if resp.Sticky {
 		t.Fatal("first select must not report sticky")
 	}
-	// A sampled pick carries its raw 5h/7d remaining back for the diagnostic line.
 	if !resp.HasUsage || resp.Remaining5h <= 0 || resp.Remaining7d <= 0 {
 		t.Fatalf("expected remaining headroom on a sampled pick, got HasUsage=%v Remaining5h=%.1f Remaining7d=%.1f", resp.HasUsage, resp.Remaining5h, resp.Remaining7d)
 	}
@@ -115,7 +105,7 @@ func TestHandleSelectRecordsSticky(t *testing.T) {
 
 func TestHandleSelectHonorsSticky(t *testing.T) {
 	s, dirs := newTestServer(t)
-	// Sticky points at the WORSE account; it must still win.
+	// Sticky points at the WORSE account.
 	if err := s.m.Store.UpsertSticky("/proj", 2, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -125,10 +115,8 @@ func TestHandleSelectHonorsSticky(t *testing.T) {
 	}
 }
 
-// TestHandleSelectSkipsExhaustedStickyPin replays the 2026-06-10 incident: the
-// cwd is pinned to an account whose 5h window is pegged with the reset ~21
-// minutes out (reset credit keeps its eff5 ≈ 93). The pin must be abandoned,
-// the pick must be a healthy account, and the sticky row rewritten.
+// TestHandleSelectSkipsExhaustedStickyPin replays the 2026-06-10 incident:
+// reset credit (eff5 ≈ 93, reset ~21m out) must not keep a pegged pin alive.
 func TestHandleSelectSkipsExhaustedStickyPin(t *testing.T) {
 	s, dirs := newTestServer(t)
 	now := time.Now().Add(time.Minute) // newer than the harness samples
@@ -154,8 +142,8 @@ func TestHandleSelectSkipsExhaustedStickyPin(t *testing.T) {
 	}
 }
 
-// TestHandleSelectMarksSessionWithCwd: a select carrying a pid opens a session
-// row attributed to the caller's cwd, feeding the sticky activity rules.
+// TestHandleSelectMarksSessionWithCwd: marked sessions feed the sticky
+// activity rules.
 func TestHandleSelectMarksSessionWithCwd(t *testing.T) {
 	s, _ := newTestServer(t)
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, Cwd: "/proj"})
@@ -170,7 +158,6 @@ func TestHandleSelectMarksSessionWithCwd(t *testing.T) {
 		t.Fatalf("session row = %+v, want pid 4242 cwd /proj acct %d", live[0], *resp.SelectedID)
 	}
 
-	// Negative: NoMark must not open a row.
 	s2, _ := newTestServer(t)
 	if resp := s2.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, NoMark: true, Cwd: "/proj"}); !resp.OK {
 		t.Fatalf("select failed: %+v", resp)
@@ -180,9 +167,8 @@ func TestHandleSelectMarksSessionWithCwd(t *testing.T) {
 	}
 }
 
-// TestHandleSelectBindsWarmEndedSession is the headline activity-rule fix: a
-// session that outlived the old selected_at TTL ended minutes ago, so the pin
-// must still bind — the warm cache is exactly what stickiness protects.
+// TestHandleSelectBindsWarmEndedSession: a pin whose session ended minutes
+// ago must still bind — the warm cache is what stickiness protects.
 func TestHandleSelectBindsWarmEndedSession(t *testing.T) {
 	s, dirs := newTestServer(t)
 	now := time.Now()
@@ -202,9 +188,8 @@ func TestHandleSelectBindsWarmEndedSession(t *testing.T) {
 	}
 }
 
-// TestHandleSelectHoldsLiveOnlyPin: when the pinned dir's only session is
-// still live, a new session cannot resume it — rank freely, but never repoint
-// the pin (it binds for a TTL once the session ends).
+// TestHandleSelectHoldsLiveOnlyPin: a still-live session cannot be resumed,
+// so ranking runs free — but the pin is never repointed.
 func TestHandleSelectHoldsLiveOnlyPin(t *testing.T) {
 	s, dirs := newTestServer(t)
 	var buf bytes.Buffer
@@ -234,19 +219,16 @@ func TestHandleSelectHoldsLiveOnlyPin(t *testing.T) {
 	}
 }
 
-// TestHandleSelectQuickResumeBindsAfterReap: a session whose claude just died
-// must not hold the pin until the next ~3.5-minute poll — handleSelect
-// reconciles before deciding, so the dead row reads as a warm end and the pin
-// binds.
+// TestHandleSelectQuickResumeBindsAfterReap: handleSelect reconciles before
+// deciding, so a just-died session reads as a warm end and the pin binds.
 func TestHandleSelectQuickResumeBindsAfterReap(t *testing.T) {
 	s, dirs := newTestServer(t)
 	now := time.Now()
 	if err := s.m.Store.UpsertSticky("/proj", 2, now.Add(-3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	// pid 4000000 can never belong to a live claude (macOS pids are 5-digit),
-	// so handleSelect's procscan-backed sweep reaps the row. A reconcile saw
-	// it alive 10 minutes ago, so the reap stamps a warm end.
+	// pid 4000000 is impossible (macOS pids are 5-digit), so handleSelect's
+	// sweep reaps the row; the -10m reconcile below makes the reap a warm end.
 	if _, err := s.m.Store.OpenSession(2, 4000000, dirs[2], "/proj", now.Add(-3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -259,8 +241,6 @@ func TestHandleSelectQuickResumeBindsAfterReap(t *testing.T) {
 	}
 }
 
-// TestHandleSelectForcedMarksSession: a forced select carrying a pid marks the
-// checkout like a ranked one, so forced sessions feed the activity rules.
 func TestHandleSelectForcedMarksSession(t *testing.T) {
 	s, _ := newTestServer(t)
 	forced := 2
@@ -276,7 +256,6 @@ func TestHandleSelectForcedMarksSession(t *testing.T) {
 		t.Fatalf("session row = %+v, want pid 4242 cwd /proj acct 2", live[0])
 	}
 
-	// Negative: NoMark suppresses the row on the forced path too.
 	s2, _ := newTestServer(t)
 	if resp := s2.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, PID: 4242, NoMark: true, Cwd: "/proj"}); !resp.OK {
 		t.Fatalf("forced select failed: %+v", resp)
@@ -286,11 +265,9 @@ func TestHandleSelectForcedMarksSession(t *testing.T) {
 	}
 }
 
-// TestHandleSelectHoldsUnusableManualPin: a manual pin to an account that
-// cannot serve is bypassed loudly (PinHeldAccount) but never repointed.
 func TestHandleSelectHoldsUnusableManualPin(t *testing.T) {
 	s, dirs := newTestServer(t)
-	now := time.Now().Add(time.Minute) // newer than the harness samples
+	now := time.Now().Add(time.Minute)
 	if err := s.m.Store.PinManual("/proj", 2, now); err != nil {
 		t.Fatal(err)
 	}
@@ -313,8 +290,6 @@ func TestHandleSelectHoldsUnusableManualPin(t *testing.T) {
 	}
 }
 
-// TestHandleSelectForcedKeepsManualPin: a one-shot forced select must not
-// silently destroy an explicit manual pin to a different account.
 func TestHandleSelectForcedKeepsManualPin(t *testing.T) {
 	s, dirs := newTestServer(t)
 	now := time.Now()
@@ -332,10 +307,8 @@ func TestHandleSelectForcedKeepsManualPin(t *testing.T) {
 	}
 }
 
-// TestHandleSelectExhaustedFallback: with every account exhausted, select must
-// return the least-bad one flagged ExhaustedFallback (never an error), carrying
-// the pick's extra-usage flag and recovery time for the client warning, and the
-// log must name the exhausted runner-up (no Available candidates exist).
+// TestHandleSelectExhaustedFallback: an exhausted pool yields the least-bad
+// pick flagged ExhaustedFallback — never an error.
 func TestHandleSelectExhaustedFallback(t *testing.T) {
 	s, dirs := newTestServer(t)
 	var buf bytes.Buffer
@@ -360,7 +333,6 @@ func TestHandleSelectExhaustedFallback(t *testing.T) {
 	if resp.SoonestReset == nil || !resp.SoonestReset.Equal(reset.Truncate(time.Second)) {
 		t.Fatalf("fallback must carry the pick's recovery time %v for the warning, got %v", reset, resp.SoonestReset)
 	}
-	// Drain the preflight goroutine before reading the shared log buffer.
 	s.wg.Wait()
 	logged := buf.String()
 	if !strings.Contains(logged, "select (exhausted-fallback): /proj -> acct-02") {
@@ -371,9 +343,8 @@ func TestHandleSelectExhaustedFallback(t *testing.T) {
 	}
 }
 
-// TestHandleSelectNoFallback: a --wait client (NoFallback) refuses the
-// least-bad exhausted pick, and the daemon must not commit the discarded
-// pick's side effects — no sticky rewrite, no reservation.
+// TestHandleSelectNoFallback: --wait (NoFallback) must not commit the
+// discarded pick's sticky or reservation.
 func TestHandleSelectNoFallback(t *testing.T) {
 	s, _ := newTestServer(t)
 	now := time.Now().Add(time.Minute)
@@ -398,9 +369,6 @@ func TestHandleSelectNoFallback(t *testing.T) {
 	}
 }
 
-// TestHandleStatusPropagatesExhaustionAndOverage pins the status pipeline both
-// the pool layer (sample → Snapshot) and the wire layer (Snapshot → toStatuses)
-// — the operator-facing signal for exactly the state this fix gates on.
 func TestHandleStatusPropagatesExhaustionAndOverage(t *testing.T) {
 	s, _ := newTestServer(t)
 	now := time.Now().Add(time.Minute)
@@ -435,10 +403,8 @@ func TestHandleStatusPropagatesExhaustionAndOverage(t *testing.T) {
 }
 
 // TestHandleSelectNoneAvailable: all rate-limited → structured NoneAvailable
-// (not just an error string) plus the soonest reset for --wait. The soonest
-// reset reads through to each account's last known-good sample: a live 429
-// records a zeroed placeholder (no reset), so the window reset that --wait
-// reports comes from the prior good reading, not the rate-limit marker.
+// plus the soonest reset for --wait, read through to each account's last
+// known-good sample.
 func TestHandleSelectNoneAvailable(t *testing.T) {
 	s, _ := newTestServer(t)
 	now := time.Now().Add(time.Minute)
@@ -475,7 +441,6 @@ func TestHandleSelectLogsPick(t *testing.T) {
 	if resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"}); !resp.OK {
 		t.Fatalf("select failed: %+v", resp)
 	}
-	// Drain the preflight goroutine before reading the shared log buffer.
 	s.wg.Wait()
 	logged := buf.String()
 	if !strings.Contains(logged, "select: /proj -> acct-01") {
@@ -502,24 +467,15 @@ func TestHandleSelectForcedRecordsSticky(t *testing.T) {
 	}
 }
 
-// TestServeDrainsInFlightHandlerOnShutdown pins the shutdown ordering: serve
-// must wait for in-flight request handlers before returning (after which Run's
-// deferred m.Close() closes the database under them).
-//
-// Synchronization is structural, not sleep-based: a first connection is parked
-// mid-request (its handler is wg-tracked the moment the accept loop dequeues
-// it), then a second connection completes a full health round-trip. The accept
-// loop is sequential and unix sockets accept FIFO, so the health response
-// proves the parked connection was already accepted and tracked — only then is
-// the ctx cancelled.
+// TestServeDrainsInFlightHandlerOnShutdown: serve must drain in-flight
+// handlers before returning — Run's deferred m.Close() follows immediately.
 func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "pool.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// macOS caps sun_path at 104 bytes; t.TempDir's /var/folders/... path plus
-	// the long test name exceeds it, so the socket gets its own short dir.
+	// macOS caps sun_path at 104 bytes; the socket gets its own short dir.
 	sockDir, err := os.MkdirTemp("/tmp", "ccp-test")
 	if err != nil {
 		t.Fatal(err)
@@ -543,7 +499,7 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	var serveErr, closeErr error
 	done := make(chan struct{})
 	go func() {
-		// Mirror Run's defer ordering: the DB closes as soon as serve returns.
+		// Mirror Run's defer ordering.
 		serveErr = s.serve(ctx)
 		closeErr = st.Close()
 		close(done)
@@ -571,8 +527,8 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A full round-trip on a second connection orders the parked connection's
-	// accept (and wg tracking) before the cancellation below.
+	// This round-trip proves the parked connection is already accepted and
+	// wg-tracked: the accept loop is sequential and unix sockets accept FIFO.
 	probe := dial()
 	defer func() { _ = probe.Close() }()
 	if _, err := probe.Write([]byte(`{"op":"health"}` + "\n")); err != nil {
@@ -585,17 +541,14 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 
 	cancel()
 
-	// The structural drain assertion: with a handler still parked, serve must
-	// not return. Without handler tracking, wg.Wait sees only the (instantly
-	// exiting) scheduler and serve returns within this window deterministically.
+	// Without handler tracking, wg.Wait sees only the scheduler and serve
+	// returns within this window.
 	select {
 	case <-done:
 		t.Fatal("serve returned while a handler was still in flight")
 	case <-time.After(300 * time.Millisecond):
 	}
 
-	// Finish the parked request after shutdown began; the drain must let it
-	// complete against a still-open DB.
 	if _, err := parked.Write([]byte("}\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -620,13 +573,9 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	}
 }
 
-// TestServeShutdownLeavesMountsUntouched pins step 6's core fix: daemon
-// shutdown leaves the fuse mirrors to the detached holder — no Teardown, local
-// or over the holder socket, on any shutdown path. Every provider resolution
-// in the daemon flows through the injected fake, so an empty call recording
-// proves no unmount (and no remount) was attempted anywhere between startup
-// and exit, while a fuse account sat mounted the whole time — exactly the
-// state the deleted teardownMounts used to sweep.
+// TestServeShutdownLeavesMountsUntouched: daemon shutdown leaves fuse mirrors
+// to the detached holder — no Teardown on any path. All provider resolution
+// flows through the injected fake, so zero recorded calls proves it.
 func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s, dirs := newTestServer(t)
@@ -647,7 +596,6 @@ func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
 	}
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
-	// macOS caps sun_path at 104 bytes; the socket gets its own short dir.
 	sockDir, err := os.MkdirTemp("/tmp", "ccp-test")
 	if err != nil {
 		t.Fatal(err)
@@ -663,10 +611,9 @@ func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.serve(ctx) }()
 
-	// The socket binds before the startup reconcile goroutine runs, so wait
-	// for the reconcile to reach acct-1's adopt decision (its Health probe)
-	// before shutting down — otherwise the cancelled ctx skips the reconcile
-	// and the adopt assertion below would race startup.
+	// Wait for the startup reconcile to reach acct-1's Health probe before
+	// shutting down; otherwise the cancelled ctx skips the reconcile and the
+	// adopt assertion races startup.
 	deadline := time.Now().Add(10 * time.Second)
 	for fake.healthCount() == 0 {
 		if time.Now().After(deadline) {

@@ -12,18 +12,16 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// Refresher is the slice of *oauth.Client the Manager needs: token refresh and
-// usage sampling. Consumer-defined so tests can fake provider behavior.
+// Refresher is the slice of *oauth.Client the Manager needs.
 type Refresher interface {
 	Refresh(ctx context.Context, flightKey, refreshToken string) (*oauth.TokenResponse, error)
 	Usage(ctx context.Context, accessToken string) (*oauth.Usage, error)
 }
 
-// CredentialStore is the slice of package keychain the Manager needs for
-// credential reads, writes, and deletes. Discover resolves the account (-a)
-// label actually stored on a service's item — items written by `claude /login`
-// carry whatever label claude derived at the time, which may not match a label
-// recomputed later, so deletions of claude-written items must discover first.
+// CredentialStore is the slice of package keychain the Manager needs. Discover
+// resolves the account (-a) label actually stored on a service's item:
+// `claude /login` items carry whatever label claude derived then, which a later
+// recompute may not match, so deleting a claude-written item must Discover first.
 type CredentialStore interface {
 	Read(service, account string) (*keychain.Credential, error)
 	Write(service, account string, cred *keychain.Credential) error
@@ -31,8 +29,6 @@ type CredentialStore interface {
 	Discover(service string) (string, error)
 }
 
-// sysKeychain adapts package keychain's process-global functions to
-// CredentialStore.
 type sysKeychain struct{}
 
 func (sysKeychain) Read(service, account string) (*keychain.Credential, error) {
@@ -52,49 +48,40 @@ func (sysKeychain) Discover(service string) (string, error) {
 }
 
 // Manager is the high-level façade over the store, the OAuth client, and the
-// Keychain/overlay machinery. CLI commands, the TUI wizards, and the daemon all
-// go through it.
+// Keychain/overlay machinery.
 type Manager struct {
 	Store    *store.Store
 	OAuth    Refresher
 	Keychain CredentialStore
 
 	// OverlayFor resolves an overlay backend to a fusekit/overlay provider; nil
-	// means pool.OverlayProviderFor. Tests inject fakes here so conversion logic
-	// runs without a live mount.
+	// means pool.OverlayProviderFor.
 	OverlayFor func(fkoverlay.Backend) (fkoverlay.Provider, error)
 
 	// DetectOverlay resolves the overlay backend for new accounts when none is
-	// recorded yet; nil means pool.DetectOverlayBackend. Tests inject verdicts so
-	// Init never spawns a mount holder.
+	// recorded yet; nil means pool.DetectOverlayBackend.
 	DetectOverlay func() (fkoverlay.Backend, string)
 
 	// CanHostFuse reports whether fuse may be recorded as the new-account
-	// default; nil means pool.CanHostFuse. Tests inject true so conversion
-	// flows run on fake providers in builds that cannot host mounts.
+	// default; nil means pool.CanHostFuse.
 	CanHostFuse func() bool
 
-	// LockDir holds the per-account cross-process refresh lock files. Open sets
-	// it under the state dir; tests point it at a temp dir so they never touch
-	// real state.
+	// LockDir holds the per-account cross-process refresh lock files; tests point
+	// it at a temp dir so they never touch real state.
 	LockDir string
 
-	// muMap guards locks; locks holds one mutex per account ID serializing that
-	// account's credential read→refresh→write cycle WITHIN this process. These
-	// per-account mutexes are DELIBERATELY held across Keychain and OAuth I/O — a
-	// documented exception to the no-locks-across-I/O rule: concurrent mutation
-	// of one account's single-use refresh token is never safe (double-spend gets
-	// invalid_grant; a stale write-back clobbers the rotated token), so
-	// serializing the whole cycle is the point. muMap itself is only ever held
-	// for the map access, never across an op. Cross-process serialization (the
-	// daemon vs a concurrent `ccp` invocation) is layered on top by lockAccount's
-	// per-account flock — the mutex alone cannot span processes.
+	// muMap guards locks (held only for the map access); locks holds one mutex per
+	// account ID serializing that account's credential read→refresh→write cycle
+	// in-process. That mutex is DELIBERATELY held across Keychain and OAuth I/O —
+	// the sanctioned exception to the no-locks-across-I/O rule — because
+	// double-spending an account's single-use refresh token gets invalid_grant and
+	// a stale write-back clobbers the rotated token. Cross-process serialization
+	// (daemon vs a concurrent `ccp`) is layered on by lockAccount's per-account
+	// flock; the mutex alone cannot span processes.
 	muMap sync.Mutex
 	locks map[int]*sync.Mutex
 }
 
-// acctLock returns the mutex serializing credential operations for an account
-// within this process.
 func (m *Manager) acctLock(id int) *sync.Mutex {
 	m.muMap.Lock()
 	defer m.muMap.Unlock()
@@ -107,14 +94,11 @@ func (m *Manager) acctLock(id int) *sync.Mutex {
 	return m.locks[id]
 }
 
-// lockAccount serializes an account's credential read→refresh→write cycle both
-// in-process (the per-account mutex) and across processes (a per-account flock),
-// so the daemon and a concurrent `ccp` invocation can never both refresh one
-// account and double-spend its single-use refresh token. Acquire order is mutex
-// then flock; the returned release reverses it and must be called exactly once.
-// A flock that cannot be taken before ctx is done is returned as an error; the
-// caller falls back to the existing (possibly stale) credential rather than
-// racing a refresh.
+// lockAccount serializes an account's credential cycle by taking its in-process
+// mutex then its cross-process flock; the returned release reverses that order
+// and must be called exactly once. If the flock isn't taken before ctx is done
+// it returns an error, and the caller falls back to the existing (possibly
+// stale) credential rather than racing a refresh.
 func (m *Manager) lockAccount(ctx context.Context, id int) (func(), error) {
 	mu := m.acctLock(id)
 	mu.Lock()
@@ -157,8 +141,8 @@ func (m *Manager) Close() error {
 // Meta keys recording pool-level state in the store's meta table.
 const (
 	// metaInitialized marks that the pool was set up via `ccp init` (or add's
-	// auto-init) — deliberately distinct from "the DB file exists", which any
-	// read-only command creates as a side effect of opening the Manager.
+	// auto-init) — distinct from "the DB file exists", which any read-only command
+	// creates just by opening the Manager.
 	metaInitialized = "initialized"
 	// metaOverlayKind records the overlay provider chosen at init, so new
 	// accounts keep using it and a re-init never flips providers under live

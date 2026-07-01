@@ -9,10 +9,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// StickyTTL is how long a pin stays alive past its last activity — the later
-// of its last recorded select and the last tracked session end in its
-// directory. Claude's prompt cache expires well within an hour, so older
-// records carry no continuity value. Var so tests can tune it.
+// StickyTTL is how long a pin outlives its last activity. One hour tracks
+// Claude's prompt-cache lifetime. Var so tests can tune it.
 var StickyTTL = time.Hour
 
 // StickyOutcome is how a select must treat the cwd's pin.
@@ -23,9 +21,8 @@ const (
 	StickyMiss StickyOutcome = iota
 	// StickyBind means launch on the pinned account.
 	StickyBind
-	// StickyHold means the pin is alive but only live sessions carry it — a new
-	// session cannot resume one, so rank freely without repointing the pin;
-	// it binds for a TTL once a session ends.
+	// StickyHold means the pin is alive but only a live session carries it; a new
+	// session ranks freely (no repoint), and it binds for a TTL after the session ends.
 	StickyHold
 	// StickyHoldManual is a manual pin whose account is temporarily unusable —
 	// rank freely, keep the pin, and surface the bypass to the user.
@@ -36,10 +33,9 @@ const (
 // selects must not record the winner over the pin.
 func (o StickyOutcome) Held() bool { return o == StickyHold || o == StickyHoldManual }
 
-// pinState classifies a pin's activity-based lifecycle, independent of
-// account usability (which needs live rankings). All signals are scoped to
-// sessions on the pinned account in the pinned cwd — the prompt cache the pin
-// protects belongs to that account alone.
+// pinState classifies a pin's activity-based lifecycle, independent of account
+// usability. All signals are scoped to the pinned account in the pinned cwd —
+// the prompt cache belongs to that account alone.
 type pinState struct {
 	live         bool      // a tracked session is running on the pinned account in the cwd
 	warm         bool      // such a session ended within StickyTTL
@@ -52,9 +48,8 @@ func (p pinState) alive(now time.Time) bool {
 
 // binding reports whether the activity rules bind a new session to the pin:
 // manual pins bind whenever alive; auto pins bind on a warm ended session
-// (something resumable exists), or on a fresh select when no tracked session
-// carries the directory at all — the no-data fallback that keeps pid-0
-// `ccp select` flows on the pre-activity sliding-TTL behavior.
+// (something resumable exists) or when no tracked session carries the directory
+// at all — the no-data fallback for pid-0 `ccp select` flows.
 func (p pinState) binding(manual bool, now time.Time) bool {
 	switch {
 	case !p.alive(now):
@@ -67,8 +62,8 @@ func (p pinState) binding(manual bool, now time.Time) bool {
 }
 
 // classify reads the pin's account-scoped cwd activity. Best-effort: a store
-// error degrades to zero activity (selected_at-only freshness, the
-// pre-activity behavior), never a failed select.
+// error degrades to zero activity (selected_at-only freshness), never a failed
+// select.
 func (m *Manager) classify(st store.Sticky, now time.Time) pinState {
 	act, err := m.Store.GetCwdActivity(st.Cwd, st.AccountID)
 	if err != nil {
@@ -98,10 +93,9 @@ func (m *Manager) StickyPick(cwd string, ranked []score.Result, now time.Time) (
 	}
 	ps := m.classify(st, now)
 	if !ps.alive(now) {
-		// Expired but not yet pruned — the daemonless path has no pruner, and
-		// an expired manual row would otherwise block UpsertSticky forever.
-		// Version-guarded so a concurrent writer's newer pin is never erased
-		// on the basis of this stale read. Best-effort, like the read.
+		// Expired but unpruned — the daemonless path has no pruner, and an expired
+		// manual row would block UpsertSticky forever. Version-guarded so a newer
+		// concurrent pin is never erased on this stale read. Best-effort.
 		_ = m.Store.DeleteStickyVersion(cwd, st.SelectedAt, st.Manual)
 		return score.Result{}, StickyMiss
 	}
@@ -114,8 +108,6 @@ func (m *Manager) StickyPick(cwd string, ranked []score.Result, now time.Time) (
 			if st.Manual {
 				return r, StickyHoldManual
 			}
-			// Auto pins to unusable accounts are abandoned outright; the
-			// freely-ranked winner overwrites the record.
 			return score.Result{}, StickyMiss
 		case ps.binding(st.Manual, now):
 			return r, StickyBind
@@ -137,10 +129,9 @@ func (m *Manager) RecordSticky(cwd string, accountID int, now time.Time) error {
 	return m.Store.UpsertSticky(cwd, accountID, now)
 }
 
-// PinManual pins cwd to accountID so every select in that directory binds to
-// it (while the account can serve) until the pin expires one StickyTTL after
-// its last activity. Unlike the best-effort select path, explicit pin edits
-// fail loudly.
+// PinManual pins cwd to accountID so every select there binds to it (while the
+// account can serve) until one StickyTTL past its last activity. Unlike the
+// best-effort select path, explicit pin edits fail loudly.
 func (m *Manager) PinManual(cwd string, accountID int, now time.Time) error {
 	if cwd == "" {
 		return errors.New("pin: empty working directory")
@@ -159,11 +150,10 @@ func (m *Manager) Unpin(cwd string) error {
 	return m.Store.DeleteSticky(cwd)
 }
 
-// TogglePin pins cwd to accountID, or unpins the directory when it is already
-// pinned to that account (manual or auto — either way the user asked for it
-// to be released). An expired-but-unpruned pin counts as absent, mirroring
-// StickyPick: pressing pin on a dead pin must pin, not silently unpin. It
-// returns the resulting pinned state.
+// TogglePin pins cwd to accountID, or unpins when already pinned to that account
+// (manual or auto). An expired-but-unpruned pin counts as absent, mirroring
+// StickyPick: pressing pin on a dead pin must pin, not silently unpin. Returns
+// the resulting pinned state.
 func (m *Manager) TogglePin(cwd string, accountID int, now time.Time) (bool, error) {
 	if cwd == "" {
 		return false, errors.New("pin: empty working directory")
@@ -187,10 +177,9 @@ type PinView struct {
 	// live tracked session holds it open.
 	ExpiresAt time.Time
 	Live      bool // a tracked session is running in the pinned directory
-	// Binding reports whether the activity rules would bind a new session to
-	// the pin right now. Activity-only: account usability is evaluated at
-	// select time against live rankings, so an exhausted account can read as
-	// Binding here yet still be held or abandoned by the next select.
+	// Binding reports whether the activity rules would bind a new session to the
+	// pin now. Activity-only: usability is judged at select time, so an exhausted
+	// account can read Binding here yet still be held or abandoned by the select.
 	Binding bool
 }
 

@@ -36,12 +36,6 @@ func selectTestManager(t *testing.T) *pool.Manager {
 	return &pool.Manager{Store: st}
 }
 
-// TestSelectionLine pins the wording of the shared selection diagnostic and its
-// degraded fallbacks. The daemon's SelectedID resolves to the account label; a
-// sticky pick is labelled "Reusing … (pinned)"; an unknown/absent id degrades to
-// a generic "account"; and a sampled pick (HasUsage) gets its raw 5h/7d usage
-// appended (100−remaining), while an unsampled one stays usage-free (no
-// fabricated 0%). ANSI is stripped so the assertions hold regardless of TTY.
 func TestSelectionLine(t *testing.T) {
 	m := selectTestManager(t)
 	id := 5
@@ -68,9 +62,7 @@ func TestSelectionLine(t *testing.T) {
 	}
 }
 
-// TestDaemonSelectOutcome pins the daemon-reply dispatch, in particular that a
-// none-available reply with --wait reaches the wait loop: the daemon sets BOTH
-// NoneAvailable and Error, and the old Error-first match made --wait dead code.
+// NoneAvailable must win over a co-set Error so --wait reaches the wait loop.
 func TestDaemonSelectOutcome(t *testing.T) {
 	cases := map[string]struct {
 		resp daemon.Response
@@ -98,8 +90,6 @@ func TestDaemonSelectOutcome(t *testing.T) {
 	}
 }
 
-// TestWarnExhaustedFallback pins the billing warning wording: credits when
-// overage is enabled, rate-limit otherwise, reset time when known.
 func TestWarnExhaustedFallback(t *testing.T) {
 	run := func(extraEnabled bool) string {
 		var stderr bytes.Buffer
@@ -123,10 +113,8 @@ func TestWarnExhaustedFallback(t *testing.T) {
 	}
 }
 
-// exhaustedPoolManager builds a Manager over a temp store whose two accounts
-// are both 5h-pegged with pending resets and fresh samples — the all-exhausted
-// state — with acct-2 the least-bad (emptier 7d, overage enabled). The fake
-// keychain is empty, so any preflight refresh is a harmless needs-login miss.
+// exhaustedPoolManager builds an all-exhausted pool where acct-2 is the
+// least-bad fallback (emptier 7d, overage enabled).
 func exhaustedPoolManager(t *testing.T) *pool.Manager {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir()) // SyncOverlay resolves ~/.claude from HOME
@@ -150,8 +138,7 @@ func exhaustedPoolManager(t *testing.T) *pool.Manager {
 	return &pool.Manager{Store: st, Keychain: emptyKeychain{}, LockDir: t.TempDir()}
 }
 
-// emptyKeychain satisfies pool.CredentialStore with no items, turning the
-// preflight refresh into the needs-login warning path.
+// emptyKeychain makes any preflight refresh a harmless needs-login miss.
 type emptyKeychain struct{}
 
 func (emptyKeychain) Read(string, string) (*keychain.Credential, error) {
@@ -161,10 +148,7 @@ func (emptyKeychain) Write(string, string, *keychain.Credential) error { return 
 func (emptyKeychain) Delete(string, string) error                      { return nil }
 func (emptyKeychain) Discover(string) (string, error)                  { return "", keychain.ErrNotFound }
 
-// TestResolveSelectionWarnsOnExhaustedFallback pins the warning at the
-// integration point: a live all-exhausted selection must emit the billing
-// warning on stderr and still hand back the least-bad dir. Deleting the
-// warnExhaustedFallback call site fails this test.
+// Pins the billing warning at its call site: removing warnExhaustedFallback fails this.
 func TestResolveSelectionWarnsOnExhaustedFallback(t *testing.T) {
 	m := exhaustedPoolManager(t)
 	var stderr bytes.Buffer
@@ -185,11 +169,9 @@ func TestResolveSelectionWarnsOnExhaustedFallback(t *testing.T) {
 	}
 }
 
-// TestWarnPinHeld pins the bypass notice's gating: silent without a held pin
-// and when the pick IS the held account (the pin was honored in effect), loud
-// — with the pin-kept reassurance — when an explicit pin was bypassed.
+// The bypass notice is loud only when a held pin was actually bypassed.
 func TestWarnPinHeld(t *testing.T) {
-	m := exhaustedPoolManager(t) // any manager with account rows for names
+	m := exhaustedPoolManager(t)
 	held, selected := 2, 1
 	cases := map[string]struct {
 		held, selected *int
@@ -220,15 +202,11 @@ func TestWarnPinHeld(t *testing.T) {
 	}
 }
 
-// TestResolveSelectionWarnsOnHeldManualPin pins the notice at the integration
-// point: a live selection over a dir manually pinned to an exhausted account
-// must pick the healthy one AND say the pin was bypassed. Deleting the
-// warnPinHeld call site fails this test.
+// Pins the bypass notice at its call site: removing warnPinHeld fails this.
 func TestResolveSelectionWarnsOnHeldManualPin(t *testing.T) {
 	m := exhaustedPoolManager(t)
 	now := time.Now()
-	// Heal acct-1 so the pool is no longer all-exhausted; pin to acct-2, which
-	// stays pegged (unusable for stickiness).
+	// Heal acct-1 so selection bypasses the pin on still-pegged acct-2.
 	if err := m.Store.InsertUsageSample(store.UsageSample{
 		AccountID: 1, TS: now.Add(time.Second), Util5h: 10, Util7d: 10,
 	}); err != nil {
@@ -250,14 +228,12 @@ func TestResolveSelectionWarnsOnHeldManualPin(t *testing.T) {
 	if !strings.Contains(out, "manual pin to") || !strings.Contains(out, "pin kept") {
 		t.Fatalf("bypass notice missing from stderr: %q", out)
 	}
-	// The pin must survive the bypass untouched.
 	st, ok, _ := m.Store.GetSticky("/proj")
 	if !ok || st.AccountID != 2 || !st.Manual {
 		t.Fatalf("manual pin lost on bypass: %+v ok=%v", st, ok)
 	}
 
-	// Negative: when the fallback pick IS the held account (all exhausted,
-	// pin on the least-bad), the pin was honored in effect — no notice.
+	// Negative: a pin on the least-bad fallback pick is honored in effect — no notice.
 	m2 := exhaustedPoolManager(t)
 	if err := m2.Store.PinManual("/proj", 2, now); err != nil {
 		t.Fatal(err)
@@ -274,9 +250,7 @@ func TestResolveSelectionWarnsOnHeldManualPin(t *testing.T) {
 	}
 }
 
-// TestResolveSelectionWaitRefusesExhaustedFallback pins --wait's contract:
-// over an all-exhausted pool it must wait (here: until the context cancels),
-// never hand back the exhausted pick that a non-wait call accepts.
+// --wait over an all-exhausted pool waits instead of accepting the fallback pick.
 func TestResolveSelectionWaitRefusesExhaustedFallback(t *testing.T) {
 	m := exhaustedPoolManager(t)
 	var stderr bytes.Buffer
@@ -299,11 +273,8 @@ func TestResolveSelectionWaitRefusesExhaustedFallback(t *testing.T) {
 	}
 }
 
-// TestResolveSelectionMergesBaseSettings pins the launch-time settings merge at
-// its integration points: both the forced arm and the live no-daemon arm of
-// resolveSelection must land a shareable ~/.claude.json key in the selected
-// account's private .claude.json. Deleting the mergeLaunchSettings call in
-// prepareAccount fails both arms.
+// Pins the settings merge on both no-daemon arms: removing mergeLaunchSettings
+// in prepareAccount fails both.
 func TestResolveSelectionMergesBaseSettings(t *testing.T) {
 	cases := map[string]func(id int) selectReq{
 		"forced arm": func(id int) selectReq { return selectReq{noDaemon: true, account: &id, cwd: "/proj"} },
@@ -341,17 +312,10 @@ func TestResolveSelectionMergesBaseSettings(t *testing.T) {
 	}
 }
 
-// TestResolveSelectionDaemonPickMergesBaseSettings pins the daemon fast path's
-// launch-settings hook at its integration point: an outcomePicked reply must
-// trigger the shared-settings merge for the picked account before the dir is
-// handed back — the merge runs client-side, after the daemon replies. The
-// daemon is faked on pool.SocketPath() under an isolated HOME (the
-// status_test.go fixture pattern): EnsureRunning's ping is satisfied by the
-// live listener, daemonAt by an OK health reply at version.String(). Deleting
-// the mergeDaemonPick call in resolveSelection fails this test.
+// Pins the client-side shared-settings merge after a daemon pick: removing
+// mergeDaemonPick in resolveSelection fails this.
 func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
-	// Short HOME under /tmp: macOS caps sun_path at 104 bytes, and t.TempDir's
-	// /var/folders path plus the test name exceeds it.
+	// Short HOME under /tmp: macOS caps sun_path at 104 bytes; t.TempDir's /var/folders path exceeds it.
 	home, err := os.MkdirTemp("/tmp", "ccp-home")
 	if err != nil {
 		t.Fatal(err)
@@ -414,12 +378,7 @@ func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
 	}
 }
 
-// TestResolveSelectionMountsNotReadyError pins the honest-error split at the
-// daemon fast path: a none-available reply tagged MountsNotReady (every account
-// has capacity but no mirror is mounted/healthy — the holder is mid-replacement)
-// must surface ErrMountsNotReady, while a plain none-available reply keeps
-// ErrNoneAvailable. The two sentinels are distinct so the user is never told
-// "exhausted or rate-limited" for a mount-layer problem.
+// A mount-layer problem must never surface as "exhausted or rate-limited".
 func TestResolveSelectionMountsNotReadyError(t *testing.T) {
 	cases := map[string]struct {
 		resp    daemon.Response
@@ -438,7 +397,6 @@ func TestResolveSelectionMountsNotReadyError(t *testing.T) {
 	for name, tc := range cases {
 		tc := tc
 		t.Run(name, func(t *testing.T) {
-			// Short HOME under /tmp: macOS caps the unix socket path at 104 bytes.
 			home, err := os.MkdirTemp("/tmp", "ccp-home")
 			if err != nil {
 				t.Fatal(err)
@@ -491,9 +449,7 @@ func TestResolveSelectionMountsNotReadyError(t *testing.T) {
 	}
 }
 
-// TestMergeDaemonPick pins the daemon-pick merge hook's degradation contract:
-// a nil or unknown SelectedID warns and skips (a daemon hiccup must not block
-// the launch), while a valid id merges the base's shareable settings.
+// A nil or unknown SelectedID warns and skips — a daemon hiccup must not block the launch.
 func TestMergeDaemonPick(t *testing.T) {
 	known, unknown := 5, 999
 	cases := map[string]struct {
@@ -552,7 +508,6 @@ func TestMergeDaemonPick(t *testing.T) {
 	}
 }
 
-// readSelectTestFile reads a file or fails the test.
 func readSelectTestFile(t *testing.T, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path) //nolint:gosec // G304: path is a cc-pool-managed/test-owned file, not external input
@@ -562,9 +517,7 @@ func readSelectTestFile(t *testing.T, path string) []byte {
 	return b
 }
 
-// TestAnnounceLineSilentWhenNotTTY is the core of the noise fix: when stdout is
-// not an interactive terminal (as in tests, and under $(ccp select)), the success
-// line is suppressed entirely — only the dir reaches stdout elsewhere.
+// announceLine stays silent on non-TTY stdout (as under $(ccp select)).
 func TestAnnounceLineSilentWhenNotTTY(t *testing.T) {
 	var stderr bytes.Buffer
 	cmd := &cobra.Command{}

@@ -5,7 +5,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 )
 
-// newDaemonCmd is the hidden entry point launched by the LaunchAgent.
 func newDaemonCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:    "daemon",

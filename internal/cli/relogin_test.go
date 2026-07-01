@@ -10,8 +10,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/keychain"
 )
 
-// cred builds a credential with the given access/refresh tokens and an
-// expiry in Unix milliseconds (ExpiresAt is millis, per keychain.OAuth).
 func cred(token, refresh string, expiresAtMillis int64) *keychain.Credential {
 	return &keychain.Credential{ClaudeAiOauth: keychain.OAuth{
 		AccessToken:  token,
@@ -20,10 +18,9 @@ func cred(token, refresh string, expiresAtMillis int64) *keychain.Credential {
 	}}
 }
 
-// TestNewReloginProbe drives the credential-change probe against an injected
-// read: completion is keyed on the credential changing to a fresh, usable
-// (refresh-token-bearing, unexpired) one — not on mere identity/credential
-// presence, which the account already carries before re-login.
+// TestNewReloginProbe: completion keys on the credential turning fresh and usable
+// (refresh-token-bearing, unexpired), not on mere presence the account already
+// carries before re-login.
 func TestNewReloginProbe(t *testing.T) {
 	future := time.Now().Add(time.Hour).UnixMilli()
 	past := time.Now().Add(-time.Hour).UnixMilli()
@@ -60,15 +57,13 @@ func TestNewReloginProbe(t *testing.T) {
 			baseline: "tok-old",
 			read:     func() (*keychain.Credential, error) { return cred("tok-new", "rt", past), nil },
 		},
-		// ErrNotFound means "not yet" — a startup adoption may not have written
-		// anything; the wait continues without erroring.
+		// ErrNotFound means "not yet": the wait continues without erroring.
 		"no credential yet": {
 			baseline: "tok-old",
 			read:     func() (*keychain.Credential, error) { return nil, keychain.ErrNotFound },
 		},
-		// Any read error means "not yet" — a transient backend hiccup must not
-		// abort the watch and force-close the live login. The interactive user
-		// bounds the wait.
+		// Any read error means "not yet": a transient backend hiccup must not
+		// abort the watch and force-close the live login.
 		"transient read error keeps waiting": {
 			baseline: "tok-old",
 			read:     func() (*keychain.Credential, error) { return nil, brokenErr },
@@ -86,16 +81,14 @@ func TestNewReloginProbe(t *testing.T) {
 }
 
 // TestWatchedLoginRun drives watchedLogin.Run() against real child processes
-// (no claude), mirroring TestTerminate: a fresh credential mid-flight must
-// close a live claude, and a manual exit must return without a force-kill. The
-// injected read never touches the real reloginCred/Keychain.
+// (no claude): a fresh credential mid-flight closes claude, a manual exit
+// returns without a force-kill. The injected read never touches the real reloginCred/Keychain.
 func TestWatchedLoginRun(t *testing.T) {
 	future := time.Now().Add(time.Hour).UnixMilli()
 
 	t.Run("fresh credential closes claude", func(t *testing.T) {
 		c := exec.Command("/bin/sleep", "60")
-		// The baseline read (Run's first call) sees the revoked credential; a
-		// later poll sees a fresh, usable one — that's the close signal.
+		// Baseline read (Run's first call) is revoked; a later poll turns fresh — the close signal.
 		var calls int
 		read := func() (*keychain.Credential, error) {
 			calls++
@@ -116,8 +109,7 @@ func TestWatchedLoginRun(t *testing.T) {
 		case <-time.After(killGrace + 2*time.Second):
 			t.Fatal("Run did not return after a fresh credential landed")
 		}
-		// A fresh credential must have closed claude via terminate (signaled or
-		// killed), not let it run to a clean success exit.
+		// A fresh credential must close claude (signaled or killed), not run to a clean exit.
 		if c.ProcessState == nil || c.ProcessState.Exited() && c.ProcessState.Success() {
 			t.Fatalf("process state = %v, want signaled/killed", c.ProcessState)
 		}
@@ -125,9 +117,8 @@ func TestWatchedLoginRun(t *testing.T) {
 
 	t.Run("transient read errors then a fresh credential still closes claude", func(t *testing.T) {
 		c := exec.Command("/bin/sleep", "60")
-		// The baseline read succeeds (revoked); the next polls fail transiently;
-		// then a fresh, usable credential lands. A transient error must not abort
-		// the watch — claude must still be closed once the credential lands.
+		// A transient read error must not abort the watch — claude must still
+		// close once the credential lands.
 		brokenErr := errors.New("security: keychain locked")
 		var calls int
 		read := func() (*keychain.Credential, error) {
@@ -160,8 +151,7 @@ func TestWatchedLoginRun(t *testing.T) {
 
 	t.Run("manual exit needs no kill", func(t *testing.T) {
 		c := exec.Command("/usr/bin/true")
-		// Always revoked: the probe never fires, so Run returns only when the
-		// process exits on its own (the awaitExited path), no force-kill.
+		// Always revoked: the probe never fires, so Run returns on the child's own exit (awaitExited), no force-kill.
 		read := func() (*keychain.Credential, error) { return cred("tok-old", "", future), nil }
 		wl := &watchedLogin{ctx: context.Background(), cmd: c, read: read}
 

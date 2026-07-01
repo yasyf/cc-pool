@@ -98,10 +98,6 @@ func TestUsageHeadersAndParsing(t *testing.T) {
 	}
 }
 
-// TestUsageIgnoresUnknownWindows feeds a realistic current /api/oauth/usage
-// payload — with the many per-model, promo, and credit windows the API now
-// emits — and asserts cc-pool reads only five_hour and seven_day and decodes the
-// rest without error. utilization is a percent in [0,100] (e.g. 13.0 == 13%).
 func TestUsageIgnoresUnknownWindows(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{
@@ -137,8 +133,6 @@ func TestUsageIgnoresUnknownWindows(t *testing.T) {
 	}
 }
 
-// TestUsageExtraUsageAbsent: payloads without an extra_usage block (or with
-// null) decode to the zero value, which reads as disabled.
 func TestUsageExtraUsageAbsent(t *testing.T) {
 	for name, body := range map[string]string{
 		"omitted": `{"five_hour":{"utilization":10.0,"resets_at":null},"seven_day":{"utilization":5.0,"resets_at":null}}`,
@@ -162,8 +156,7 @@ func TestUsageExtraUsageAbsent(t *testing.T) {
 	}
 }
 
-// TestResetTimeDecoding covers every resets_at encoding the usage endpoint has
-// been seen to emit. 1700000000 epoch seconds == 2023-11-14T22:13:20Z.
+// 1700000000 epoch seconds == 2023-11-14T22:13:20Z.
 func TestResetTimeDecoding(t *testing.T) {
 	const epoch int64 = 1700000000
 	cases := []struct {
@@ -202,8 +195,6 @@ func TestResetTimeDecoding(t *testing.T) {
 	})
 }
 
-// TestUsageStringResetsAt reproduces the reported crash: the API returned
-// resets_at as a string, which the old *float64 field could not decode.
 func TestUsageStringResetsAt(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"five_hour":{"utilization":40.0,"resets_at":"1700000000"}}`)

@@ -22,9 +22,6 @@ func renameTestManager(t *testing.T) *pool.Manager {
 	return &pool.Manager{Store: st}
 }
 
-// addRenameAccount registers an account whose config dir holds a .claude.json
-// with the given email ("" omits the identity file; "-" writes an identity
-// without an email). The symlink overlay's private root is the dir itself.
 func addRenameAccount(t *testing.T, m *pool.Manager, id int, label, email string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -51,7 +48,6 @@ func writeClaudeJSON(t *testing.T, dir, oauthJSON string) {
 	}
 }
 
-// renameCmd runs runRename with captured output, returning (stdout, stderr, err).
 func renameCmd(t *testing.T, m *pool.Manager, args []string, opts renameOptions) (string, string, error) {
 	t.Helper()
 	var out, errOut bytes.Buffer

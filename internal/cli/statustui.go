@@ -20,38 +20,27 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// statusRefreshInterval is how often the TUI re-polls the daemon (or live
-// samples) for fresh account state.
 const statusRefreshInterval = 5 * time.Second
 
 var (
-	// selectedStyle marks the row under the cursor and the detail it drives.
 	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	panelStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
 	panelTitle    = lipgloss.NewStyle().Bold(true)
 )
 
-// runStatusTUI runs the interactive status dashboard until the user quits or
-// the context is cancelled. It is only reached on an interactive terminal; the
-// piped/`--plain` path stays on renderTable.
+// runStatusTUI runs only on an interactive terminal; the piped/`--plain` path uses renderTable.
 func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 	ctx := cmd.Context()
-	// Restart a pre-upgrade daemon onto the current binary so the cached view it
-	// serves carries the newer wire fields the detail pane renders. Best-effort;
-	// gatherStatus version-gates and falls back to live regardless. Skipped under
-	// --live (the user already opted out of the daemon). The alt-screen clears any
-	// "restarting…" line on entry.
+	// Restart a version-skewed daemon so its cached view carries the detail pane's wire fields; gatherStatus falls back to live.
 	if !live {
 		ensureDaemon(cmd, false)
 	}
-	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just hides pin controls
+	cwd, _ := os.Getwd() // unreadable cwd just hides pin controls
 	model := statusTUI{
 		ctx: ctx,
 		cwd: cwd,
 		gather: func(c context.Context) (statusData, error) {
-			// The holder alert is dropped here on purpose: statusData carries
-			// only snapshots + pin, and the TUI footer already multiplexes
-			// refresh/pin errors — holderFooter stays a plain-path concern.
+			// Holder alert dropped on purpose; holderFooter stays a plain-path concern.
 			snaps, _, err := gatherStatus(c, m, live)
 			if err != nil {
 				return statusData{}, err
@@ -83,25 +72,19 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 	return nil
 }
 
-// statusData is one gather's worth of TUI state: the account snapshots plus
-// the launch directory's pin.
 type statusData struct {
 	snaps []pool.Snapshot
 	pin   dirPin
 }
 
-// statusTUI is the Bubble Tea model for `ccp status`. It owns a sorted snapshot
-// list, a cursor tracked by account id (so a re-sort on refresh never moves the
-// selection), a gather closure that re-fetches state off the UI goroutine, and
-// a toggle closure that pins/unpins the launch directory to the cursor's
-// account.
+// statusTUI is the Bubble Tea model for `ccp status`; the cursor tracks account id so a refresh re-sort never moves the selection.
 type statusTUI struct {
 	ctx         context.Context
 	cwd         string // launch directory; "" hides pin controls
 	gather      func(context.Context) (statusData, error)
 	toggle      func(accountID int) (bool, error)
-	buildLogin  func(a store.Account) (*exec.Cmd, error) // build the interactive `claude /login`
-	finishLogin func(a store.Account) error              // verify + adopt + clear, off the UI goroutine
+	buildLogin  func(a store.Account) (*exec.Cmd, error)
+	finishLogin func(a store.Account) error
 	snaps       []pool.Snapshot
 	pin         dirPin
 	cursorID    int
@@ -109,14 +92,13 @@ type statusTUI struct {
 	height      int
 	err         error
 	pinErr      error
-	pinBusy     bool // a toggle is in flight; drop repeat presses
+	pinBusy     bool
 	reloginErr  error
-	reloginBusy bool // a re-login is in flight; drop repeat presses
+	reloginBusy bool
 	lastUpdate  time.Time
 	quitting    bool
 }
 
-// Bubble Tea messages.
 type (
 	snapsMsg struct {
 		data statusData
@@ -124,25 +106,19 @@ type (
 	}
 	errMsg     struct{ err error }
 	pinDoneMsg struct{ err error }
-	// reloginExitedMsg fires once claude /login exited — whether cc-pool
-	// auto-closed it on a fresh credential or the user quit it — and the watched
-	// tea.Exec spawn handed the terminal back; the verify+adopt+clear still has to
-	// run, and finishLogin stays the sole credential gate.
+	// reloginExitedMsg fires after claude /login exits and the terminal is back under the TUI.
 	reloginExitedMsg struct{ account store.Account }
 	reloginDoneMsg   struct{ err error }
 	tickMsg          time.Time
 )
 
-// watchedLogin runs `claude /login` for the status TUI while polling for a fresh
-// credential; when one lands it closes claude, so re-login auto-closes exactly
-// like `ccp login`. Implements tea.ExecCommand: Bubble Tea calls Run with the
-// renderer paused and the terminal released, so the poll+terminate run off the UI
-// goroutine without fighting claude for the tty.
+// watchedLogin runs `claude /login` as a tea.ExecCommand and auto-closes claude
+// once a fresh credential lands; Bubble Tea releases the tty for Run, so poll+terminate never fight claude for it.
 type watchedLogin struct {
 	ctx  context.Context
 	cmd  *exec.Cmd
 	read credReader
-	out  io.Writer // claude's (and the TUI's) output; where the input-mode reset is emitted
+	out  io.Writer // where the input-mode reset is emitted
 }
 
 func (w *watchedLogin) SetStdin(r io.Reader)  { w.cmd.Stdin = r }
@@ -155,23 +131,18 @@ func (w *watchedLogin) Run() error {
 		baseline = cred.ClaudeAiOauth.AccessToken
 	}
 	outcome, _ := watchAndClose(w.ctx, w.cmd, newReloginProbe(w.read, baseline))
-	// Bubble Tea's post-Exec restore re-enters the alt screen, shows the cursor,
-	// and restores raw mode, but does not disable the input modes claude turned on
-	// that the TUI doesn't use. When we force-killed claude (anything but a clean
-	// self-exit), reset only those input modes — Bubble Tea owns alt-screen/cursor
-	// and will re-enter and repaint them itself.
+	// Bubble Tea's post-Exec restore leaves claude's input modes on, so after a
+	// force-kill (not a clean self-exit) reset only those; Bubble Tea owns alt-screen/cursor.
 	if outcome != awaitExited && isTTY() {
 		_, _ = fmt.Fprint(w.out, inputModeReset)
 	}
-	return nil // finishRelogin (post-exit, via reloginExitedMsg) stays the sole credential gate
+	return nil // finishRelogin (via reloginExitedMsg) is the sole credential gate
 }
 
 func (t statusTUI) Init() tea.Cmd {
 	return tea.Batch(t.refreshCmd(), tickCmd())
 }
 
-// refreshCmd fetches fresh status off the UI goroutine; live sampling never
-// blocks key input.
 func (t statusTUI) refreshCmd() tea.Cmd {
 	return func() tea.Msg {
 		data, err := t.gather(t.ctx)
@@ -182,10 +153,7 @@ func (t statusTUI) refreshCmd() tea.Cmd {
 	}
 }
 
-// togglePinCmd flips the launch directory's pin against the given account off
-// the UI goroutine. The decision intentionally uses the displayed (≤5s stale)
-// pin state: the action always matches what the user saw, and the post-toggle
-// refresh reconciles the view.
+// togglePinCmd toggles from the displayed (≤5s stale) pin state so the action matches what the user saw; the refresh reconciles.
 func (t statusTUI) togglePinCmd(accountID int) tea.Cmd {
 	return func() tea.Msg {
 		_, err := t.toggle(accountID)
@@ -193,9 +161,6 @@ func (t statusTUI) togglePinCmd(accountID int) tea.Cmd {
 	}
 }
 
-// finishReloginCmd runs the post-login verify+adopt+clear off the UI goroutine
-// after claude /login exited, keeping the Keychain/network I/O off the render
-// loop.
 func (t statusTUI) finishReloginCmd(a store.Account) tea.Cmd {
 	return func() tea.Msg {
 		return reloginDoneMsg{err: t.finishLogin(a)}
@@ -206,9 +171,7 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(statusRefreshInterval, func(tm time.Time) tea.Msg { return tickMsg(tm) })
 }
 
-// reloginable reports whether the status TUI should offer its 'a' re-login action:
-// any non-serving state a manual `claude /login` can clear. Mirrors `ccp login`,
-// which has no health gate.
+// reloginable reports whether a manual `claude /login` could clear s's state (no health gate).
 func reloginable(s pool.Snapshot) bool {
 	return s.NeedsLogin || s.Stale || s.RateLimited || s.Exhausted
 }
@@ -239,10 +202,6 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			t.pinErr = nil
 			return t, t.togglePinCmd(t.current().Account.ID)
 		case "a":
-			// Re-login any account a login can recover — the remedy the badge
-			// advertises. claude /login takes over the terminal via a watched
-			// tea.Exec spawn that auto-closes claude once a fresh credential lands
-			// (the user may also exit it manually).
 			s := t.current()
 			if len(t.snaps) == 0 || t.reloginBusy || t.buildLogin == nil || !reloginable(s) {
 				return t, nil
@@ -258,9 +217,6 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			wl := &watchedLogin{ctx: t.ctx, cmd: c, read: func() (*keychain.Credential, error) {
 				return reloginCred(a)
 			}}
-			// The exit status is not the signal: a real login is confirmed only by
-			// the usable credential it leaves behind, exactly as `ccp login`
-			// checks. finishLogin is the sole gate.
 			return t, tea.Exec(wl, func(error) tea.Msg { return reloginExitedMsg{account: a} })
 		}
 		return t, nil
@@ -283,8 +239,6 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return t, t.refreshCmd()
 	case reloginExitedMsg:
-		// claude exited and the terminal is back under our control; finish the
-		// verify+adopt+clear off the UI goroutine.
 		return t, t.finishReloginCmd(msg.account)
 	case reloginDoneMsg:
 		t.reloginBusy = false
@@ -292,14 +246,13 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			return t, nil
 		}
-		return t, t.refreshCmd() // pick up the cleared flag / fresh sample
+		return t, t.refreshCmd()
 	case tickMsg:
 		return t, tea.Batch(t.refreshCmd(), tickCmd())
 	}
 	return t, nil
 }
 
-// sortedIndex returns the display row of the cursor's account, or 0.
 func (t statusTUI) sortedIndex() int {
 	for i, s := range t.snaps {
 		if s.Account.ID == t.cursorID {
@@ -309,8 +262,6 @@ func (t statusTUI) sortedIndex() int {
 	return 0
 }
 
-// ensureCursor keeps the cursor on a real account after a refresh, defaulting
-// to the best (top) account when its previous target is gone.
 func (t *statusTUI) ensureCursor() {
 	if len(t.snaps) == 0 {
 		t.cursorID = 0
@@ -366,8 +317,6 @@ func (t statusTUI) View() string {
 	}
 	listBox := panelStyle.Width(contentW).Render(t.renderList())
 	detailBox := panelStyle.Width(contentW).Render(t.renderDetail())
-	// Each binding is advertised only where it actually works on the cursor's
-	// account, and names the effect the press will have.
 	helpParts := []string{"↑/↓ navigate"}
 	if reloginable(t.current()) {
 		helpParts = append(helpParts, "a re-login")
@@ -398,8 +347,7 @@ func (t statusTUI) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, parts...) + "\n"
 }
 
-// renderList draws the account table. A 3-cell gutter carries two independent
-// markers: ▸ (green) = the account `select` would pick next, ❯ = the cursor.
+// renderList draws the account table; ▸ marks the account `select` picks next, ❯ the cursor.
 func (t statusTUI) renderList() string {
 	hdr := hdrStyle.Render(fmt.Sprintf("   %-22s %8s %8s %8s %5s",
 		"ACCOUNT", "SCORE", "5h used", "7d used", "LIVE"))
@@ -433,8 +381,7 @@ func (t statusTUI) renderList() string {
 	return strings.Join(lines, "\n")
 }
 
-// renderDetail explains the selected account's score factor-by-factor, sourced
-// from the score Components so it reconciles exactly with the SCORE column.
+// renderDetail breaks down the selected account's score from its Components, so it reconciles exactly with the SCORE column.
 func (t statusTUI) renderDetail() string {
 	s := t.current()
 	c := s.Components
@@ -448,15 +395,12 @@ func (t statusTUI) renderDetail() string {
 	b.WriteByte('\n')
 	_, _ = fmt.Fprintf(&b, "score %.1f\n", s.Score)
 
-	// Positive contributions: reset-aware effective headroom × its weight. Labeled
-	// "effective" (not "free") because the reset credit can lift it above the raw
-	// remaining shown by the usage bars below; tinted by how depleted it is.
+	// "effective", not "free": reset credit can lift headroom above the raw remaining the bars below show.
 	eff5Str := usageStyle(100 - c.Eff5).Render(fmt.Sprintf("%3.0f%%", c.Eff5))
 	eff7Str := usageStyle(100 - c.Eff7).Render(fmt.Sprintf("%3.0f%%", c.Eff7))
 	_, _ = fmt.Fprintf(&b, "  5h  %s effective  ×%.2f  = %+5.1f\n", eff5Str, score.W5h, c.Remaining5h)
 	_, _ = fmt.Fprintf(&b, "  7d  %s effective  ×%.2f  = %+5.1f\n", eff7Str, score.W7d, c.Remaining7d)
 
-	// Penalties, only the ones actually engaged.
 	var pen []string
 	if c.SessionPenalty > 0 {
 		pen = append(pen, fmt.Sprintf("  %-18s %+5.1f", fmt.Sprintf("sessions %d", s.ActiveSessions), -c.SessionPenalty))
@@ -486,7 +430,6 @@ func (t statusTUI) renderDetail() string {
 		b.WriteByte('\n')
 	}
 
-	// Raw usage bars (what's consumed) with reset timing.
 	b.WriteString(usageRow("5h", s.Util5h, s.Resets5h))
 	b.WriteByte('\n')
 	b.WriteString(usageRow("7d", s.Util7d, s.Resets7d))
@@ -511,7 +454,6 @@ func (t statusTUI) renderDetail() string {
 	return b.String()
 }
 
-// usageRow renders one "5h ▕████░░░▏ 58% used · resets 2h03m" line.
 func usageRow(label string, usedPct float64, resets time.Time) string {
 	when := "no active window"
 	if !resets.IsZero() {
@@ -520,8 +462,6 @@ func usageRow(label string, usedPct float64, resets time.Time) string {
 	return fmt.Sprintf("%-2s %s %3.0f%% used · %s", label, usageBar(usedPct, 16), usedPct, when)
 }
 
-// usageBar renders a fixed-width filled bar for a 0..100 used percentage, tinted
-// green/yellow/red as it fills.
 func usageBar(usedPct float64, width int) string {
 	if usedPct < 0 {
 		usedPct = 0

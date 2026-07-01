@@ -42,20 +42,17 @@ func newDoctorCmd() *cobra.Command {
 					}
 				}
 
-				// claude binary present (auto-update can move it).
+				// Auto-update can move claude off PATH.
 				if _, err := exec.LookPath("claude"); err != nil {
 					report("claude on PATH", false, err.Error())
 				} else {
 					report("claude on PATH", true, "")
 				}
 
-				// Daemon.
 				var cachedHolder *daemon.HolderStatus
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
 					report("daemon", true, resp.Version)
-					// The holder's pending-TCC guidance lives in the daemon's
-					// cache (the heal loop records it on a blocked mount); fetch
-					// it while the daemon is up.
+					// Pending-TCC guidance lives only in the daemon's cache.
 					if sresp, serr := daemon.NewClient().Status(); serr == nil && sresp.OK {
 						cachedHolder = sresp.Holder
 					}
@@ -68,9 +65,6 @@ func newDoctorCmd() *cobra.Command {
 					return err
 				}
 
-				// Mount holder: reachability vs. the fuse rows that need one, the
-				// cached pending-TCC guidance, and a kernel-truth carcass check
-				// per fuse row.
 				reachable, holderVer := probeHolder()
 				reportHolder(holderFacts{
 					reachable: reachable,
@@ -79,23 +73,14 @@ func newDoctorCmd() *cobra.Command {
 				}, countFuse(accts), report)
 				reportCarcasses(accts, report)
 
-				// The wedge and stale-session checks read the holder's List
-				// rows directly over its socket — the same direct dial
-				// probeHolder uses, because these are holder facts and the
-				// holder outlives daemons; the daemon cache above carries
-				// only daemon-owned state (TCC/spawn failures). An
-				// unreachable holder (or a failed List) yields nil rows and
-				// both checks stay quiet, matching the other holder checks'
-				// degrade.
+				// Mount truth lives in the holder, which outlives daemons — not the daemon cache.
 				var holderMounts []mountd.MountInfo
 				if reachable {
 					holderMounts = listHolderMounts()
 				}
 				var sessions []procscan.Session
 				if len(holderMounts) > 0 {
-					// A failed scan skips the session-aware checks silently: they
-					// are advisory, and doctor degrades rather than aborts. Shared
-					// by both the wedge and stale-session checks.
+					// Advisory checks: a failed scan degrades silently.
 					sessions, _ = scanSessions(cmd.Context())
 				}
 				reportWedges(accts, holderMounts, sessions, report)
@@ -115,12 +100,7 @@ func newDoctorCmd() *cobra.Command {
 					_, _ = fmt.Fprintln(out, "\nAll checks passed.")
 				}
 
-				// --open-settings jumps straight to the fuse backend's enablement
-				// pane when the holder is TCC-blocked. The pane and the deep links
-				// come from fusekit (Backend.OpenSettings), never a cc-pool literal.
-				// Best-effort: a failure to launch it is a warning, never a command
-				// failure — the detail line above already carries the copy-pasteable
-				// deep link.
+				// The report detail above already carries the deep link.
 				if openSettings && cachedHolder != nil && cachedHolder.TCCError != "" {
 					backend := cachedHolder.TCCBlockedBackend
 					if err := backend.OpenSettings(cmd.Context()); err != nil {
@@ -136,13 +116,7 @@ func newDoctorCmd() *cobra.Command {
 	return cmd
 }
 
-// fuseGrantHint renders the open-Settings hint for a fuse backend's one-time
-// macOS grant, sourced entirely from fusekit (backend.Enablement) — cc-pool
-// holds no pane literal of its own. It names the pane and offers the first deep
-// link as a copy-pasteable `open` command. Production callers pass the daemon's
-// TCCBlockedBackend; taking the backend as a parameter keeps cc-pool a blind
-// consumer (a test can hand it any backend and watch the pane flip). A backend
-// that needs no grant yields a bare "grant the required macOS permission".
+// fuseGrantHint renders the hint from the backend's Enablement — no cc-pool pane literal.
 func fuseGrantHint(backend fkoverlay.Backend) string {
 	en := backend.Enablement()
 	if !en.Needed {
@@ -154,18 +128,12 @@ func fuseGrantHint(backend fkoverlay.Backend) string {
 	return "open Settings: " + en.Pane
 }
 
-// holderFacts is reportHolder's gathered input: holder reachability and
-// version from a direct socket dial, plus the daemon's cached holder view
-// (nil when the daemon is down or predates the field).
 type holderFacts struct {
 	reachable bool
 	version   string
 	cached    *daemon.HolderStatus
 }
 
-// probeHolder dials the mount-holder socket directly for reachability and
-// version. A socket that accepts but fails the health probe counts as
-// unreachable — a held-but-unresponsive socket serves nothing.
 func probeHolder() (reachable bool, ver string) {
 	cl := holderClient()
 	if !cl.Available() {
@@ -178,12 +146,8 @@ func probeHolder() (reachable bool, ver string) {
 	return true, v
 }
 
-// reportHolder renders the shared-holder doctor checks from pre-gathered facts.
-// An unreachable holder is only a failure when fuse rows need one (the daemon's
-// heal loop lazily respawns the cask holder; the check catches that not
-// happening). The holder is a separate, multi-tenant product, so its version is
-// just reported (no skew comparison against cc-pool's own version), and a holder
-// serving no cc-pool mounts is not an "orphan" — another tenant may use it.
+// The holder is a separate multi-tenant product: no version-skew check, and
+// serving no cc-pool mounts is not an orphan.
 func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)) {
 	switch {
 	case !f.reachable && fuseRows > 0:
@@ -200,10 +164,7 @@ func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)
 	}
 }
 
-// listHolderMounts fetches the holder's mount registry over its socket. nil
-// on any failure: the wedge and stale-session checks read missing rows as "no
-// facts" and report nothing — reportHolder already covers an unreachable
-// holder.
+// listHolderMounts returns nil on failure; reportHolder already covers an unreachable holder.
 func listHolderMounts() []mountd.MountInfo {
 	mounts, err := holderClient().List()
 	if err != nil {
@@ -212,16 +173,9 @@ func listHolderMounts() []mountd.MountInfo {
 	return mounts
 }
 
-// reportWedges flags partial-wedge mirrors on fuse rows: mounts that answer
-// shallow metadata stats but hang bulk reads. The holder ships no deep
-// verdict (the daemon owns the probe), so doctor runs its OWN bounded local
-// deep probe of every fuse row the holder still reports Live — independent of
-// the daemon, so it surfaces a wedge even when the daemon is down (a key
-// doctor case the daemon's cached count cannot cover). ErrProbeMissing is no
-// verdict (a pre-upgrade holder's mount predating the probe file), never a
-// wedge. nil mounts (holder unreachable) reports nothing. deepProbeAt is
-// bounded by design, like reportCarcasses' stat seams: nothing doctor runs
-// against a possibly wedged mirror may block unboundedly.
+// reportWedges deep-probes Live fuse rows itself (works with the daemon down).
+// ErrProbeMissing is no verdict, not a wedge. Nothing run against a possibly
+// wedged mirror may block unboundedly.
 func reportWedges(accts []store.Account, mounts []mountd.MountInfo, sessions []procscan.Session, report func(string, bool, string)) {
 	byDir := make(map[string]mountd.MountInfo, len(mounts))
 	for _, mi := range mounts {
@@ -236,10 +190,6 @@ func reportWedges(accts []store.Account, mounts []mountd.MountInfo, sessions []p
 			continue
 		}
 		if err := deepProbeAt(a.ConfigDir); err != nil && !errors.Is(err, overlay.ErrProbeMissing) {
-			// A wedged mirror backing live sessions is LEFT mounted — the daemon
-			// never force-unmounts a busy mirror (it would panic the kernel), so
-			// the only fix is to relaunch those sessions. An idle wedge the daemon
-			// remounts on its own next tick.
 			detail := "wedged (serves metadata but hangs reads) — the daemon will remount it"
 			if n := procscan.CountByConfigDir(sessions, a.ConfigDir); n > 0 {
 				detail = fmt.Sprintf("wedged (serves metadata but hangs reads); left mounted under %d live session(s); relaunch them — the daemon will NOT force-unmount a busy mirror (would panic the kernel)", n)
@@ -249,19 +199,12 @@ func reportWedges(accts []store.Account, mounts []mountd.MountInfo, sessions []p
 	}
 }
 
-// staleSessionSlack absorbs the second-granularity rounding on both sides of
-// the stale-session comparison (ps etime and the holder's MountedAt stamp)
-// plus scan-vs-List clock jitter. Strictly MORE than the slack flags; exactly
-// the slack does not.
+// staleSessionSlack absorbs second-granularity rounding on both sides (ps
+// etime, the holder's MountedAt) plus scan-vs-List clock jitter.
 const staleSessionSlack = 5 * time.Second
 
-// reportStaleSessions flags live sessions bound to a mount that no longer
-// exists: a session on a fuse row whose start predates the holder's current
-// mount of that dir (by more than staleSessionSlack) was launched against a
-// previous mount epoch — its open fds point at the yanked mirror and every
-// read hangs or fails until relaunch. A zero MountedAt (a holder predating
-// the field) or a zero StartedAt (unparseable ps etime) is silently skipped:
-// no fact, no flag.
+// reportStaleSessions flags sessions started before the holder's current mount
+// of their dir. A zero MountedAt or StartedAt is no fact and is skipped.
 func reportStaleSessions(accts []store.Account, mounts []mountd.MountInfo, sessions []procscan.Session, report func(string, bool, string)) {
 	mountedAt := make(map[string]time.Time, len(mounts))
 	for _, mi := range mounts {
@@ -290,17 +233,10 @@ func reportStaleSessions(accts []store.Account, mounts []mountd.MountInfo, sessi
 	}
 }
 
-// reportCarcasses flags dead mounts on fuse rows: the dir is a mountpoint but
-// ~/.claude is not visible through it — a carcass left by a holder that died.
-// The daemon's heal loop remounts these within its tick; doctor seeing one
-// means that has not happened yet (or the daemon is down). The mountpoint seam
-// (dirMounted) is now overlay.Mounted — a non-blocking cached Getfsstat read
-// that cannot park, with no still-mounted fold; only the aliveness seam
-// (mountAliveAt) is a bounded stat-probe whose unanswered read folds to
-// NOT-alive. A carcass-suspect that cannot answer a 2s aliveness stat is
-// exactly what this check exists to flag, so the row is reported within that
-// single bound instead of parking doctor in the very uninterruptible sleep it
-// is checking for.
+// reportCarcasses flags fuse rows whose dir is a mountpoint no longer showing
+// ~/.claude. Both seams are bounded (non-blocking cached Getfsstat; an
+// unanswered stat folds to NOT-alive) — doctor must never park in the D-state
+// it checks for.
 func reportCarcasses(accts []store.Account, report func(string, bool, string)) {
 	for _, a := range accts {
 		if !fuseBackedRow(a.OverlayKind) {
@@ -316,22 +252,19 @@ func reportCarcasses(accts []store.Account, report func(string, bool, string)) {
 func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool, report func(string, bool, string)) {
 	prefix := fmt.Sprintf("acct-%02d", a.ID)
 
-	// Credential usable: the Keychain item (readable under our ACL) or, when the
-	// Keychain is unavailable (e.g. headless), claude's plaintext
-	// .credentials.json fallback.
 	_, kerr := keychain.Read(a.KeychainService, a.KeychainAccount)
 	switch {
 	case kerr == nil:
 		report(prefix+" keychain", true, "")
 	case errors.Is(kerr, keychain.ErrNotFound):
-		// No Keychain item; accept the plaintext file backend if claude wrote one.
+		// Keychain unavailable (e.g. headless): claude writes plaintext .credentials.json.
 		if _, ferr := keychain.ReadFileCredential(a.ConfigDir); ferr == nil {
 			report(prefix+" credential", true, "file")
 		} else {
 			report(prefix+" credential", false, kerr.Error())
 		}
 	case fix:
-		// Item exists but our ACL can't read it (-w denied): re-assert ownership.
+		// Item exists but our ACL can't read it (-w denied).
 		if _, rerr := keychain.Reassert(a.KeychainService, a.KeychainAccount); rerr == nil {
 			report(prefix+" keychain", true, "re-asserted")
 		} else {
@@ -341,13 +274,11 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 		report(prefix+" keychain", false, kerr.Error())
 	}
 
-	// Auth health: the daemon flags an account when its refresh token is gone or
-	// revoked, so its Keychain item may be present and readable yet useless.
+	// NeedsLogin: the Keychain item can be readable yet useless.
 	if h, herr := m.Store.GetAuthHealth(a.ID); herr == nil && h.NeedsLogin {
 		report(prefix+" auth", false, fmt.Sprintf("needs re-login — run `ccp login %d`", a.ID))
 	}
 
-	// Overlay health.
 	backend, perr := fkoverlay.Parse(a.OverlayKind)
 	if perr != nil {
 		report(prefix+" overlay", false, perr.Error())
@@ -376,13 +307,8 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 	checkStrandedPrivate(m, a, fix, cmd.OutOrStdout(), report)
 }
 
-// checkFuseFallback surfaces an account on the symlink overlay while the pool's
-// recorded default is fuse and this machine can host fuse — almost always the
-// aftermath of an automatic fuse→symlink fallback (a mount never recovered or
-// fuse-t went unavailable). That fallback is permanent until re-promoted, so
-// doctor is where the user learns to undo it: `ccp migrate` converts symlink
-// accounts back to fuse once fuse-t is healthy. The fuse-hosting check honors
-// the Manager's CanHostFuse seam so it is exercisable without a fuse build.
+// checkFuseFallback flags a symlink account under a fuse pool default — the
+// automatic fuse→symlink fallback is permanent until `ccp migrate` re-promotes.
 func checkFuseFallback(m *pool.Manager, a store.Account, report func(string, bool, string)) {
 	backend, err := fkoverlay.Parse(a.OverlayKind)
 	if err != nil || backend != fkoverlay.BackendSymlink {
@@ -403,16 +329,9 @@ func checkFuseFallback(m *pool.Manager, a store.Account, report func(string, boo
 		"on symlink but the pool default is fuse — likely an automatic fallback after the mount holder failed; re-run `ccp migrate` once fuse-t is healthy")
 }
 
-// checkStrandedPrivate reports — and, under --fix with no running daemon, heals
-// — private files stranded in a fuse backing dir by an interrupted migration: a
-// non-fuse account must hold its .claude.json (and friends) in the account dir
-// itself. When this CLI process drives the heal it wires
-// overlay.ResolvedConflictLogf at out for the duration of the move, so a
-// last-write-wins discard of a duplicate stranded copy is reported rather than
-// lost silently. The daemon sets the same seam at startup, but a daemon-less
-// `doctor --fix` is its own actor and must surface the recovery itself; the
-// wiring is scoped to the single synchronous heal call (this process runs no
-// concurrent move) and restored after, so it never leaks across commands.
+// checkStrandedPrivate reports (and under --fix, heals) private files stranded
+// by an interrupted migration. The heal is a single synchronous call, so the
+// ResolvedConflictLogf global swap is safe.
 func checkStrandedPrivate(m *pool.Manager, a store.Account, fix bool, out io.Writer, report func(string, bool, string)) {
 	if fuseBackedRow(a.OverlayKind) {
 		return
@@ -430,11 +349,8 @@ func checkStrandedPrivate(m *pool.Manager, a store.Account, fix bool, out io.Wri
 		report(prefix+" private files", false, "stranded in "+priv+" by an interrupted migration")
 		return
 	}
-	// Only heal when no daemon holds the pool: a CLI-side heal cannot see the
-	// daemon's converting claim, and racing an in-flight conversion would move
-	// files under its teardown sequence. With a daemon up, the same recovery
-	// runs under the claim via `ccp migrate` (or the daemon's own startup
-	// reconcile).
+	// A CLI-side heal cannot see the daemon's converting claim; racing an
+	// in-flight conversion would move files under its teardown.
 	if daemon.NewClient().Available() {
 		report(prefix+" private files", false, "stranded in "+priv+"; the daemon is running — re-run `ccp migrate`, or stop the daemon and re-run doctor --fix")
 		return

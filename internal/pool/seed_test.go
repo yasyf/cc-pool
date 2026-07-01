@@ -10,8 +10,6 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// privateRootProvider stubs a fuse-shaped provider: private files live in a
-// sibling backing dir, not the account dir. Only PrivateRoot matters here.
 type privateRootProvider struct{ fkoverlay.SymlinkProvider }
 
 func (*privateRootProvider) PrivateRoot(accountDir string) string { return accountDir + ".private" }

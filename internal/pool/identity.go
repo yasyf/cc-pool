@@ -10,23 +10,18 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// ErrNoIdentity means a .claude.json has no usable top-level "oauthAccount"
-// identity (file missing, key absent, or accountUuid empty).
+// ErrNoIdentity means a .claude.json has no usable "oauthAccount" identity.
 var ErrNoIdentity = errors.New("no oauthAccount identity in .claude.json")
 
-// Identity is the top-level "oauthAccount" object claude writes into its
-// .claude.json after /login.
+// Identity is the "oauthAccount" object claude writes into .claude.json at /login.
 type Identity struct {
 	AccountUUID  string
 	EmailAddress string
 }
 
 // AccountIdentity returns a pool account's identity from its private
-// .claude.json, written by that account's own login. The private path is pure
-// path math off the recorded backend — no provider is resolved, because reading
-// the file must work whether or not a mount or holder is up: fuse keeps it in
-// the private backing dir beside the mountpoint, every other backend in the
-// account dir itself.
+// .claude.json. The path is pure math off the backend, so a read works whether
+// or not a mount or holder is up.
 func AccountIdentity(backend fkoverlay.Backend, configDir string) (*Identity, error) {
 	priv := configDir
 	if backend.IsFuse() {
@@ -35,9 +30,6 @@ func AccountIdentity(backend fkoverlay.Backend, configDir string) (*Identity, er
 	return readIdentity(filepath.Join(priv, ".claude.json"))
 }
 
-// readIdentity parses the top-level "oauthAccount" object out of a
-// .claude.json. Missing file or missing/empty identity → ErrNoIdentity;
-// unparseable JSON is a real error.
 func readIdentity(path string) (*Identity, error) {
 	src, err := os.ReadFile(path) //nolint:gosec // G304: path is a cc-pool-managed account .claude.json under the state dir
 	if os.IsNotExist(err) {

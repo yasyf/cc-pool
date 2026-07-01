@@ -62,7 +62,6 @@ func newRemoveCmd() *cobra.Command {
 	return cmd
 }
 
-// newEnvCmd prints shell export lines to launch a chosen account.
 func newEnvCmd() *cobra.Command {
 	var account int
 	cmd := &cobra.Command{
@@ -95,13 +94,9 @@ func newEnvCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				// env is a launch intent like select/run: propagate the base's
-				// shareable .claude.json settings before the user execs claude.
 				mergeLaunchSettings(cmd, m, a)
 				out := cmd.OutOrStdout()
 				_, _ = fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(a.ConfigDir))
-				// Pin claude's plugin root to the shared base so the session
-				// writes canonical ~/.claude plugin paths; see execEnv.
 				_, _ = fmt.Fprintf(out, "export CLAUDE_CODE_PLUGIN_CACHE_DIR=%s\n", shellQuote(filepath.Join(pool.ClaudeDir(), "plugins")))
 				return nil
 			})
@@ -111,8 +106,6 @@ func newEnvCmd() *cobra.Command {
 	return cmd
 }
 
-// shellQuote single-quotes s for POSIX shells; an embedded quote becomes the
-// classic close-quote/escaped-quote/reopen-quote sequence '\”.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

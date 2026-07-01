@@ -21,7 +21,6 @@ import (
 	"github.com/yasyf/fusekit/version"
 )
 
-// swapVar swaps a package-level seam for the test's lifetime.
 func swapVar[T any](t *testing.T, target *T, val T) {
 	t.Helper()
 	old := *target
@@ -42,7 +41,6 @@ func tempHome(t *testing.T) string {
 	return home
 }
 
-// seedAccounts writes account rows into the pool db under the current HOME.
 func seedAccounts(t *testing.T, accts ...store.Account) {
 	t.Helper()
 	if err := pool.EnsureStateDir(); err != nil {
@@ -66,8 +64,8 @@ func seedAccounts(t *testing.T, accts ...store.Account) {
 	}
 }
 
-// stubStopDaemon replaces the daemon-stop seam, recording whether it ran. The
-// real one drives launchctl/brew, which tests must never touch.
+// stubStopDaemon stubs the daemon-stop seam so tests never drive the real
+// launchctl/brew.
 func stubStopDaemon(t *testing.T) *bool {
 	t.Helper()
 	called := false
@@ -78,7 +76,6 @@ func stubStopDaemon(t *testing.T) *bool {
 	return &called
 }
 
-// uninstallCmd builds a throwaway command with captured stdout/stderr.
 func uninstallCmd() (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
 	cmd := &cobra.Command{}
 	var out, errOut bytes.Buffer
@@ -87,8 +84,6 @@ func uninstallCmd() (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
 	return cmd, &out, &errOut
 }
 
-// fakeHolder is a minimal mount-holder socket speaking the mountd JSON
-// protocol: it records the ops it serves and answers from fixed fixtures.
 type fakeHolder struct {
 	t  *testing.T
 	ln net.Listener
@@ -97,13 +92,11 @@ type fakeHolder struct {
 	ops []string
 
 	version       string
-	mounts        []mountd.MountInfo // list response
-	reclaimFailed []mountd.MountInfo // reclaim response (dirs that failed to unmount)
-	failHealth    bool               // answer health ops with OK:false
+	mounts        []mountd.MountInfo
+	reclaimFailed []mountd.MountInfo
+	failHealth    bool
 }
 
-// startFakeHolder serves the shared mount-holder socket
-// (~/.fusekit/holder.sock under the current HOME).
 func startFakeHolder(t *testing.T, fh *fakeHolder) *fakeHolder {
 	t.Helper()
 	fh.t = t
@@ -163,19 +156,16 @@ func (f *fakeHolder) sawOp(op mountd.Op) bool {
 	return false
 }
 
-// TestUninstallSessionGate pins the gate-before-destruction contract: live
-// sessions on dirs the uninstall would destroy refuse it (fuse rows always;
-// every row under --purge), the refusal names accounts and pids, --force
-// bypasses the scan entirely, and a failed scan aborts rather than proceeding
-// blind.
+// TestUninstallSessionGate pins the uninstall session gate: fuse rows always
+// gate, every row under --purge, --force skips the scan, a failed scan aborts.
 func TestUninstallSessionGate(t *testing.T) {
 	type tc struct {
 		purge, force bool
 		sessions     []procscan.Session
 		scanErr      error
-		wantErr      []string // substrings; empty means the gate passes
+		wantErr      []string
 		notInErr     []string
-		wantStop     bool // the daemon-stop step was reached
+		wantStop     bool
 	}
 	home := func(t *testing.T) (fuseDir, symDir string) {
 		h := tempHome(t)
@@ -216,9 +206,8 @@ func TestUninstallSessionGate(t *testing.T) {
 				}
 			},
 		},
-		// purge=false here even though the gate-per-kind question is about
-		// --purge: a passing purge run would reach m.Remove and the Keychain,
-		// which tests never touch. The empty-ConfigDir match is kind-agnostic.
+		// purge=false: a passing purge would reach m.Remove and the Keychain,
+		// which tests never touch.
 		"plain-claude sessions (no config dir) never block": {
 			build: func(_, _ string) tc {
 				return tc{
@@ -265,8 +254,7 @@ func TestUninstallSessionGate(t *testing.T) {
 			})
 			swapVar(t, &dirMounted, func(string) bool { return false })
 			stopped := stubStopDaemon(t)
-			// No fake holder: the socket is absent, so the holder leg is a
-			// silent skip in every case here.
+			// No fake holder: the absent socket makes the holder leg a silent skip.
 			cmd, _, _ := uninstallCmd()
 			err := runServiceUninstall(cmd, tc.purge, tc.force)
 
@@ -302,10 +290,8 @@ func TestUninstallSessionGate(t *testing.T) {
 	}
 }
 
-// TestUninstallReclaimsHolderMounts: a reachable shared holder gets the reclaim
-// op (releasing only cc-pool's own mounts), any dirs it couldn't unmount are
-// warned, and the success line confirms the release. The holder process itself
-// is never shut down — it is multi-tenant and another consumer may still use it.
+// TestUninstallReclaimsHolderMounts pins that uninstall reclaims cc-pool's own
+// mounts but never shuts down the shared multi-tenant holder.
 func TestUninstallReclaimsHolderMounts(t *testing.T) {
 	tempHome(t)
 	swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) { return nil, nil })
@@ -334,11 +320,9 @@ func TestUninstallReclaimsHolderMounts(t *testing.T) {
 	}
 }
 
-// TestUninstallSurvivorMount pins the post-shutdown verification: an account
-// dir still mounted hard-aborts a purge (nothing is deleted) and exits
-// nonzero without one. --force vouches only for the session gate — the
-// survivor verify is unconditional, so a forced purge through a live mirror
-// still aborts with all state (rows included) intact.
+// TestUninstallSurvivorMount pins the unconditional post-stop survivor verify:
+// a still-mounted account dir hard-aborts a purge and exits nonzero otherwise;
+// --force vouches only for the session gate.
 func TestUninstallSurvivorMount(t *testing.T) {
 	cases := map[string]struct {
 		purge, force bool
@@ -375,8 +359,6 @@ func TestUninstallSurvivorMount(t *testing.T) {
 			if _, serr := os.Stat(pool.DBPath()); serr != nil {
 				t.Errorf("pool state must survive an aborted run: %v", serr)
 			}
-			// The abort must land before purgeAll's per-account m.Remove: the
-			// row (and its dir) survive untouched.
 			st, serr := store.Open(pool.DBPath())
 			if serr != nil {
 				t.Fatalf("reopen store: %v", serr)
@@ -396,11 +378,9 @@ func TestUninstallSurvivorMount(t *testing.T) {
 	}
 }
 
-// TestStopDaemonServiceBrewStopFailureIsFatal pins the uninstall safety fix: a
-// failed `brew services stop` aborts the run instead of warning and claiming
-// success — everything downstream (the holder sweep, the purge) is only safe
-// once the daemon is actually down, since a live one respawns the holder and
-// remounts fuse rows on its next heal tick.
+// TestStopDaemonServiceBrewStopFailureIsFatal: a failed `brew services stop`
+// aborts the uninstall — teardown is only safe once the daemon is down, since
+// a live one respawns the holder and remounts fuse rows on its next heal tick.
 func TestStopDaemonServiceBrewStopFailureIsFatal(t *testing.T) {
 	swapVar(t, &brewManaged, func() bool { return true })
 	swapVar(t, &brewStop, func() error { return errors.New("brew exploded") })
@@ -418,10 +398,9 @@ func TestStopDaemonServiceBrewStopFailureIsFatal(t *testing.T) {
 	}
 }
 
-// TestPurgeAllDefensiveMountRecheck: even with the account rows gone (nothing
-// for the caller's row-based verification to see), a mounted dir under
-// ~/.cc-pool/accounts aborts purgeAll immediately before the RemoveAll — the
-// belt-and-braces guard on the catastrophic delete-into-~/.claude path.
+// TestPurgeAllDefensiveMountRecheck: a mounted dir with no account row still
+// aborts purgeAll before its RemoveAll — the guard on the catastrophic
+// delete-into-~/.claude path.
 func TestPurgeAllDefensiveMountRecheck(t *testing.T) {
 	tempHome(t)
 	carcass := filepath.Join(pool.AccountsDir(), "acct-99")
@@ -440,9 +419,8 @@ func TestPurgeAllDefensiveMountRecheck(t *testing.T) {
 	}
 }
 
-// TestPurgeAllRemovesStateWhenClean: with nothing mounted, purgeAll removes
-// the state dir and says so. Zero accounts on purpose — row removal goes
-// through the Keychain, which tests never touch.
+// TestPurgeAllRemovesStateWhenClean seeds zero accounts on purpose — row
+// removal goes through the Keychain, which tests never touch.
 func TestPurgeAllRemovesStateWhenClean(t *testing.T) {
 	tempHome(t)
 	if err := pool.EnsureAccountsDir(); err != nil {
@@ -462,13 +440,12 @@ func TestPurgeAllRemovesStateWhenClean(t *testing.T) {
 	}
 }
 
-// TestHolderStatusLine pins the `ccp service status` holder line: silent only
-// when there is no holder AND no fuse rows, "not running" when fuse rows need
-// one, and a running line with mount count plus a skew warning when the
-// holder's build differs.
+// TestHolderStatusLine pins the `ccp service status` holder line: silent when
+// there is no holder and no fuse rows, "not running" when fuse rows need one,
+// a running line with mount count otherwise.
 func TestHolderStatusLine(t *testing.T) {
 	cases := map[string]struct {
-		holder   *fakeHolder // nil = no socket
+		holder   *fakeHolder
 		fuseRows int
 		want     []string
 		notWant  []string
@@ -491,8 +468,8 @@ func TestHolderStatusLine(t *testing.T) {
 			want:     []string{"Mount holder: running (" + version.String() + ", 0 mounts)"},
 		},
 		"holder version is reported as-is, never as skew": {
-			// The holder is a separate product (the fusekit-holder cask); its version
-			// is unrelated to cc-pool's, so it is reported with no skew verdict.
+			// The holder is a separate product (the fusekit-holder cask), so its
+			// version never reads as skew.
 			holder:   &fakeHolder{version: "0.0.1-old", mounts: []mountd.MountInfo{{Dir: "/a"}}},
 			fuseRows: 1,
 			want:     []string{"running (0.0.1-old, 1 mount)"},
@@ -532,7 +509,7 @@ func TestHolderStatusLine(t *testing.T) {
 }
 
 // TestUninstallHelpMentionsGateAndPurge keeps the command help honest about
-// the new semantics.
+// the gate and purge semantics.
 func TestUninstallHelpMentionsGateAndPurge(t *testing.T) {
 	cmd := newServiceUninstallCmd()
 	for _, want := range []string{"mount", "live claude sessions", "--force", "~/.claude is\nnever touched"} {

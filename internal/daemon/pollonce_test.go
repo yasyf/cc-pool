@@ -18,9 +18,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// fakeKeychain / fakeOAuth mirror the fakes in internal/pool's tests (test
-// helpers aren't importable across packages). Both are internally locked so
-// any -race report points at code under test.
+// fakeKeychain and fakeOAuth are internally locked so -race points at code
+// under test.
 
 type fakeKeychain struct {
 	mu     sync.Mutex
@@ -83,17 +82,16 @@ type fakeOAuth struct {
 	mu         sync.Mutex
 	currentRT  string
 	refreshes  int
-	usageCalls int  // total Usage() invocations (lets a test assert poll backoff)
-	usage401   bool // when set, Usage returns a 401 UsageError
-	refresh5xx bool // when set, Refresh fails transiently (503, non-Revoked)
+	usageCalls int
+	usage401   bool
+	refresh5xx bool
 }
 
 func (f *fakeOAuth) Refresh(_ context.Context, _, refreshToken string) (*oauth.TokenResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.refresh5xx {
-		// A 5xx is not Revoked(), so the sample surfaces the original 401 — the
-		// recoverable blip Fix 2 must not escalate to needs-login.
+		// 503 is not Revoked(): a recoverable blip, not needs-login.
 		return nil, &oauth.RefreshError{Status: 503, Body: "service unavailable"}
 	}
 	if refreshToken != f.currentRT {
@@ -136,11 +134,9 @@ func (f *fakeOAuth) setUsage401(v bool) {
 	f.usage401 = v
 }
 
-// TestPollOnceSkipsReservedAccountRefresh pins the reservation-aware idle
-// decision: an account just handed out by handleSelect (reserved, claude not
-// yet visible to procscan) must not have its near-expiry token POST-refreshed
-// or adopted out from under the launching session; once the reservation
-// expires, the scheduler refreshes as usual.
+// TestPollOnceSkipsReservedAccountRefresh pins that a reserved account (just
+// selected, claude not yet scannable) is never refreshed or adopted out from
+// under the launching session; an expired reservation refreshes as usual.
 func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	// Redirect ClaudeDir/StateDir off the real ~/.claude and ~/.cc-pool.
 	t.Setenv("HOME", t.TempDir())
@@ -181,7 +177,6 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 		lastAuthAttempt: map[int]time.Time{},
 	}
 
-	// Reserved: the poll must neither refresh nor adopt (no credential writes).
 	s.tryReserve(a.ID)
 	s.pollOnce(t.Context())
 	if got := fo.refreshCount(); got != 0 {
@@ -191,7 +186,6 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 		t.Fatalf("reserved account's credential was written %d time(s)", got-seedWrites)
 	}
 
-	// Reservation expired: the account reads idle again and refreshes as usual.
 	s.mu.Lock()
 	s.reservations[a.ID] = time.Now().Add(-reservationTTL - time.Second)
 	s.mu.Unlock()
@@ -201,10 +195,8 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	}
 }
 
-// TestPollOnceFlagsAndRecoversNeedsLogin pins the end-to-end auth-health flow: a
-// definitive 401 (no refresh token) flags the account needs-login in the store,
-// the flag backs sampling off, and a recovered credential clears it on the next
-// due poll.
+// TestPollOnceFlagsAndRecoversNeedsLogin pins that a definitive 401 flags
+// needs-login and a recovered credential clears it on the next due poll.
 func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
@@ -240,7 +232,6 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 		lastAuthAttempt: map[int]time.Time{},
 	}
 
-	// Poll 1: a 401 with no refresh token flags needs-login immediately.
 	s.pollOnce(t.Context())
 	if h, _ := st.GetAuthHealth(1); !h.NeedsLogin {
 		t.Fatal("definitive 401 should flag needs-login")
@@ -249,8 +240,6 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 		t.Fatalf("no refresh token to spend, but refreshed %d time(s)", got)
 	}
 
-	// Recover the credential and clear the API 401, then advance past the
-	// needs-login backoff so the account is due for another sample.
 	cred.ClaudeAiOauth.RefreshToken = "rt-0"
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
 	if err := fk.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
@@ -259,19 +248,15 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 	fo.setUsage401(false)
 	s.lastAuthAttempt[1] = time.Now().Add(-needsLoginPollInterval - time.Second)
 
-	// Poll 2: a clean sample clears the flag.
 	s.pollOnce(t.Context())
 	if h, _ := st.GetAuthHealth(1); h.NeedsLogin {
 		t.Fatal("a recovered account should clear needs-login")
 	}
 }
 
-// TestPollOnceTransient401StaysSelectable pins Fix 2: an account whose refresh
-// keeps failing transiently (5xx → not Revoked, so the sample surfaces the
-// original plain 401) is NEVER flagged needs-login. The 401 streak only backs
-// the poll off to needsLoginPollInterval; AuthHealth.NeedsLogin stays false and
-// the account stays selectable. After the streak arms the backoff, the next due
-// poll skips sampling entirely so the 401 spam stops.
+// TestPollOnceTransient401StaysSelectable pins that transient refresh failures
+// (non-Revoked 5xx) never flag needs-login: the 401 streak only arms the poll
+// backoff and the account stays selectable throughout.
 func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
@@ -295,8 +280,6 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 	if err := fk.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
 		t.Fatal(err)
 	}
-	// Usage 401s and every refresh fails transiently (503, not Revoked) with the
-	// credential unchanged: the sample surfaces the original 401.
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true, refresh5xx: true}
 
 	s := &Server{
@@ -309,8 +292,6 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 		lastAuthAttempt: map[int]time.Time{},
 	}
 
-	// needsLoginAfter consecutive transient 401s: the streak climbs but the
-	// account is never flagged and stays selectable on every poll.
 	for i := 1; i <= needsLoginAfter; i++ {
 		s.pollOnce(t.Context())
 		if got := s.authStreak[1]; got != i {
@@ -325,9 +306,7 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 		}
 	}
 
-	// The needsLoginAfter-th failure armed the poll backoff: the next poll within
-	// needsLoginPollInterval skips sampling — no new Usage call — so the 401 spam
-	// stops while AuthHealth.NeedsLogin remains false.
+	// The needsLoginAfter-th failure arms the backoff: the next poll skips sampling.
 	before := fo.usageCallCount()
 	s.pollOnce(t.Context())
 	if got := fo.usageCallCount(); got != before {
@@ -338,11 +317,9 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 	}
 }
 
-// TestPollOnceFlagsConfirmedRevocation pins that a CONFIRMED revocation — the
-// refresh POST returns 400 invalid_grant (Revoked) with the on-disk credential
-// unchanged — flags needs-login immediately on the first poll, before (and
-// independent of) the transient-401 streak. This is the genuine "run ccp login"
-// case Fix 2 keeps distinct from a recoverable blip.
+// TestPollOnceFlagsConfirmedRevocation pins that a confirmed revocation (400
+// invalid_grant, credential unchanged on re-read) flags needs-login on the
+// first poll, independent of the transient-401 streak.
 func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
@@ -366,8 +343,6 @@ func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 	if err := fk.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
 		t.Fatal(err)
 	}
-	// Usage 401s; the stale refresh token yields 400 invalid_grant (Revoked) and
-	// the credential never rotates (unchanged on re-read) → genuine revocation.
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true}
 
 	s := &Server{
@@ -380,8 +355,6 @@ func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 		lastAuthAttempt: map[int]time.Time{},
 	}
 
-	// One poll is enough: a definitive ErrNeedsLogin flags immediately, never
-	// touching the 401 streak.
 	s.pollOnce(t.Context())
 	if h, _ := st.GetAuthHealth(1); !h.NeedsLogin {
 		t.Fatal("a confirmed 400 invalid_grant revocation must flag needs-login")

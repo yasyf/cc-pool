@@ -9,7 +9,7 @@ import (
 )
 
 // climb builds n newest-first samples ending at util at age before now,
-// dropping stepPct per step going back in time, each step minutes apart.
+// dropping stepPct per step going back in time.
 func climb(now time.Time, age time.Duration, util, stepPct float64, step time.Duration, n int) []store.UsageSample {
 	out := make([]store.UsageSample, n)
 	for i := range out {
@@ -18,7 +18,6 @@ func climb(now time.Time, age time.Duration, util, stepPct float64, step time.Du
 	return out
 }
 
-// withReset stamps Resets5h on every sample.
 func withReset(samples []store.UsageSample, reset time.Time) []store.UsageSample {
 	for i := range samples {
 		samples[i].Resets5h = reset
@@ -26,7 +25,6 @@ func withReset(samples []store.UsageSample, reset time.Time) []store.UsageSample
 	return samples
 }
 
-// withReset7d stamps Resets7d on every sample.
 func withReset7d(samples []store.UsageSample, reset time.Time) []store.UsageSample {
 	for i := range samples {
 		samples[i].Resets7d = reset
@@ -121,7 +119,6 @@ func TestBurn7dGated(t *testing.T) {
 		"stale latest is gated":        {burning7d(6 * time.Minute), false, 0},
 		"passed 7d reset is gated":     {withReset7d(burning7d(0), now.Add(-time.Minute)), false, 0},
 		"passed 5h reset does not gate": {
-			// A passed 5h reset is irrelevant to the 7d window: burn survives.
 			withReset(burning7d(0), now.Add(-time.Minute)), false, 2,
 		},
 	}

@@ -13,24 +13,21 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// ErrNotInitialized means the pool has not been set up yet (`ccp init` or
-// `ccp add`'s auto-init).
+// ErrNotInitialized means the pool has not been set up yet.
 var ErrNotInitialized = errors.New("pool not initialized")
 
 // InitResult summarizes what `ccp init` did.
 type InitResult struct {
 	OverlayKind fkoverlay.Backend
-	// OverlayFallbackReason says why detection settled on symlink when THIS
-	// Init ran the detection; "" when fuse was chosen or a kind was already
-	// recorded.
+	// OverlayFallbackReason says why detection settled on symlink; non-empty only
+	// when THIS Init ran detection and ruled fuse out.
 	OverlayFallbackReason string
-	Already               bool // the pool was already initialized
+	Already               bool
 }
 
-// Init prepares the pool: ~/.cc-pool state dirs, the overlay provider choice
-// for new accounts, and the initialized marker. It never touches ~/.claude or
-// the Keychain — accounts (including the user's main subscription) join via
-// Add, each with its own independent `claude /login`. Idempotent.
+// Init prepares the pool's ~/.cc-pool state dirs, overlay choice, and initialized
+// marker. Never touches ~/.claude or the Keychain — accounts join via Add, each
+// with its own `claude /login`. Idempotent.
 func (m *Manager) Init() (*InitResult, error) {
 	if err := EnsureStateDir(); err != nil {
 		return nil, err
@@ -58,20 +55,17 @@ type PendingAdd struct {
 	ConfigDir       string
 	KeychainService string
 	OverlayKind     fkoverlay.Backend
-	// FallbackReason says why fuse was ruled out for this account: a requested
-	// fuse overlay fell back to symlinks at Setup time, or detection ran inside
-	// this PrepareAdd (legacy pools with no recorded kind) and ruled fuse out.
-	// OverlayKind then records symlink. "" when fuse was established or never
-	// in play.
+	// FallbackReason says why fuse was ruled out: Setup fell back to symlinks, or
+	// detection did. OverlayKind then records symlink; "" when fuse held or was
+	// never in play.
 	FallbackReason string
 	LoginCommand   string
 	ClaudeJSONSeed SeedOutcome
 }
 
-// DuplicateIdentity returns an existing pool account that shares want's
-// accountUuid (the same Claude subscription), or nil if none does. Accounts
-// whose identity cannot be read are skipped, so one broken account dir never
-// blocks the check.
+// DuplicateIdentity returns an existing pool account sharing want's accountUuid
+// (the same Claude subscription), or nil. Unreadable accounts are skipped so one
+// broken dir never blocks the check.
 func (m *Manager) DuplicateIdentity(want Identity) (*store.Account, error) {
 	accounts, err := m.Store.ListAccounts()
 	if err != nil {
@@ -94,14 +88,11 @@ func (m *Manager) DuplicateIdentity(want Identity) (*store.Account, error) {
 	return nil, nil
 }
 
-// PrepareAdd allocates the next account dir, establishes its overlay, and
-// seeds its private .claude.json from plain claude's (~/.claude.json) so the
-// login session inherits onboarding state and settings instead of running the
-// first-run wizard. It returns the login command the user must run. Unless the
-// dir is being reused (SeedKeptExisting), any stale Keychain item left under
-// the dir's service by an earlier dead attempt is deleted. No account row or
-// new Keychain item is created yet — FinalizeAdd does that once the login
-// lands.
+// PrepareAdd allocates the next account dir, establishes its overlay, and seeds
+// its private .claude.json from ~/.claude.json so login inherits onboarding
+// state instead of the first-run wizard. Returns the login command to run.
+// Unless the dir is reused (SeedKeptExisting), a stale Keychain item under its
+// service is deleted. No account row or Keychain item exists until FinalizeAdd.
 func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 	ok, err := m.Initialized()
 	if err != nil {
@@ -123,32 +114,25 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve overlay provider for %s: %w", acctDir, err)
 	}
-	// A detection that just ran here (legacy pool with no recorded backend) and
-	// ruled fuse out is surfaced exactly like a Setup-time fallback.
 	fallbackReason := detectReason
 	if setupErr := prov.Setup(ClaudeDir(), acctDir); setupErr != nil {
 		if !backend.IsFuse() {
 			return nil, fmt.Errorf("set up overlay for %s: %w", acctDir, setupErr)
 		}
-		// A fuse Setup failure means the mount holder is unavailable right
-		// now, not that the add must die: fall back to symlinks EXPLICITLY.
-		// The backend actually established is recorded below and the reason
-		// rides along so `ccp add` says the substitution out loud.
+		// Fuse Setup failure = holder unavailable, not fatal: fall back to
+		// symlinks; the reason rides along so `ccp add` names it.
 		fallbackReason = setupErr.Error()
 		prov, err = m.overlayFor(fkoverlay.BackendSymlink)
 		if err != nil {
 			return nil, fmt.Errorf("resolve fallback symlink provider for %s (after fuse setup failed: %w): %w", acctDir, setupErr, err)
 		}
 		if err := prov.Setup(ClaudeDir(), acctDir); err != nil {
-			// Both causes ride the chain: the symlink complaint alone would
-			// mask the fuse failure that started this (e.g. ErrForeignMount),
-			// and callers match on either with errors.Is.
+			// Wrap both causes: callers match either with errors.Is, and the
+			// symlink error alone would mask the fuse failure (e.g. ErrForeignMount).
 			return nil, fmt.Errorf("set up fallback symlink overlay for %s (after fuse setup failed: %w): %w", acctDir, setupErr, err)
 		}
-		// The fuse attempt may have left an empty backing dir behind (the
-		// holder creates it before mounting); drop it so the symlink account
-		// doesn't accrete an inert acct-NN.private. Only-if-empty: anything
-		// inside is unclassified state that must not be destroyed.
+		// Fuse may leave an empty backing dir (holder creates it pre-mount); drop
+		// it only if empty — contents are unclassified state, never destroy them.
 		removePrivateRootIfEmpty(fkoverlay.FusePrivateRoot(acctDir))
 	}
 	seed, err := seedClaudeJSON(prov, acctDir, ClaudeJSONPath())
@@ -157,16 +141,12 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 	}
 	svc := keychain.ServiceName(acctDir)
 	if seed != SeedKeptExisting {
-		// A leftover item under this service is garbage from a dead attempt
-		// (an abandoned add, or `ccp remove --keep-credential` followed by
-		// index reuse); left in place, FinalizeAdd would register the stale
-		// credential. Probe by service alone (Discover), not a recomputed
-		// account label — the item carries whatever -a label claude stored at
-		// its login. SeedKeptExisting keeps it — the documented reuse path.
+		// A leftover item is garbage from a dead attempt that FinalizeAdd would
+		// register. Discover by service, not a recomputed label — the item carries
+		// whatever -a label claude stored at login.
 		account, err := m.Keychain.Discover(svc)
 		switch {
 		case errors.Is(err, keychain.ErrNotFound):
-			// nothing to purge
 		case err != nil:
 			return nil, fmt.Errorf("probe stale credential for %s: %w", acctDir, err)
 		default:
@@ -179,33 +159,28 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		Index:           n,
 		ConfigDir:       acctDir,
 		KeychainService: svc,
-		// The provider actually established, not the requested backend: a failed
-		// fuse Setup fell back to symlinks above, and recording the request
-		// would mint a row promising a mirror the dir doesn't have.
+		// The provider actually established, not the requested backend: recording
+		// the request would promise a mirror a fallen-back dir doesn't have.
 		OverlayKind:    prov.Backend(),
 		FallbackReason: fallbackReason,
-		// The plugin var pins claude's plugin root to the shared base so the
-		// login session (where first-launch marketplace auto-install can run)
-		// writes canonical ~/.claude plugin paths, not acct-anchored ones that
-		// claude's marketplace validator later rejects; see cli.execEnv.
+		// Pin claude's plugin root to the shared base so login writes canonical
+		// ~/.claude plugin paths, not acct-anchored ones claude's marketplace
+		// validator later rejects; see cli.execEnv.
 		LoginCommand: fmt.Sprintf("CLAUDE_CODE_PLUGIN_CACHE_DIR=%s CLAUDE_CONFIG_DIR=%s claude /login",
 			filepath.Join(ClaudeDir(), "plugins"), acctDir),
 		ClaudeJSONSeed: seed,
 	}, nil
 }
 
-// FinalizeAdd is called after the user completes the interactive login. It
-// confirms the credential landed, re-asserts ACL ownership, validates with one
-// usage call, and records the account. label is an optional human note.
+// FinalizeAdd, called after the interactive login, confirms the credential
+// landed, re-asserts ACL ownership, validates with one usage call, and records
+// the account. label is an optional human note.
 func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) (*store.Account, error) {
-	// A completed `claude /login` writes the account's own oauthAccount identity.
-	// A startup adoption of the global credential copies the secret (the Keychain
-	// item, or the plaintext .credentials.json headless over SSH) but writes NO
-	// identity — a missing identity here means the login never completed. Refuse
-	// to register what would be a copy of plain claude's session (invariant: the
-	// pool never adopts plain claude's credential). cc-pool pools Max/Pro OAuth
-	// logins only; a Console/3rd-party login writes no oauthAccount and is
-	// likewise (correctly) refused. The check precedes any credential read.
+	// A completed `claude /login` writes the account's own oauthAccount identity; a
+	// copied credential writes none. Missing identity means login never completed —
+	// refuse it, so the pool never registers a copy of plain claude's session
+	// (Max/Pro OAuth only; Console/3rd-party logins write none and are likewise
+	// refused). Precedes any credential read.
 	if _, err := AccountIdentity(p.OverlayKind, p.ConfigDir); err != nil {
 		if errors.Is(err, ErrNoIdentity) {
 			return nil, fmt.Errorf("login didn't complete for %s — cc-pool pools Max/Pro (OAuth) logins only and won't register an unverified copy of your main login: %w", p.ConfigDir, ErrNoIdentity)
@@ -220,9 +195,9 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 		return nil, err
 	}
 
-	// Re-assert: read the item Claude wrote and write it straight back so our
-	// tooling owns the ACL for prompt-free refresh thereafter. Only the Keychain
-	// item has an ACL; the plaintext file backend is read directly.
+	// Read the item claude wrote and write it back so our tooling owns the ACL
+	// for prompt-free refresh. Only the Keychain backend has an ACL; the plaintext
+	// file is read directly.
 	if src == keychain.SourceKeychain {
 		if _, err := keychain.Reassert(p.KeychainService, account); err != nil {
 			return nil, fmt.Errorf("re-assert keychain item: %w", err)
@@ -242,25 +217,22 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 		return nil, err
 	}
 
-	// Validate end-to-end with a single usage fetch (best-effort; a transient
-	// failure here does not unwind the add).
+	// Best-effort usage check: a failure returns the added account with the error,
+	// it does not unwind the add.
 	if _, _, err := m.SampleUsage(ctx, acct, SampleOpts{AllowRefresh: true}); err != nil {
 		return &acct, fmt.Errorf("account added but usage validation failed: %w", err)
 	}
 	return &acct, nil
 }
 
-// AbandonAdd cleans up a prepared-but-not-finalized account dir (no store row
-// exists at this stage), including any credential a completed-but-unfinalized
-// login wrote to its Keychain item. The item's account label is discovered,
-// not recomputed — claude wrote it. p must be a non-nil PendingAdd returned by
+// AbandonAdd cleans up a prepared-but-not-finalized account dir (no store row yet)
+// and any credential its login wrote to the Keychain. p must be non-nil, from
 // PrepareAdd.
 func (m *Manager) AbandonAdd(p *PendingAdd) error {
 	var credErr error
 	account, err := m.Keychain.Discover(p.KeychainService)
 	switch {
 	case errors.Is(err, keychain.ErrNotFound):
-		// no credential to roll back
 	case err != nil:
 		credErr = fmt.Errorf("probe credential for %s: %w", p.ConfigDir, err)
 	default:
@@ -300,10 +272,9 @@ func (m *Manager) Remove(id int, deleteCredential bool) error {
 	return m.Store.DeleteAccount(id)
 }
 
-// removeAccountDir tears down an account dir's overlay and removes the dir and
-// its private backing (when the provider keeps one beside the dir, as fuse
-// does). Teardown refusing to operate (e.g. a wedged unmount) aborts the
-// removal so we never RemoveAll through a live mount into the base.
+// removeAccountDir tears down the overlay, then removes the dir and its private
+// backing. A refused Teardown (e.g. a wedged unmount) aborts removal so we never
+// RemoveAll through a live mount into the base.
 func (m *Manager) removeAccountDir(prov fkoverlay.Provider, configDir string) error {
 	if err := prov.Teardown(ClaudeDir(), configDir); err != nil {
 		return fmt.Errorf("teardown overlay: %w", err)
@@ -319,11 +290,9 @@ func (m *Manager) removeAccountDir(prov fkoverlay.Provider, configDir string) er
 	return nil
 }
 
-// SyncOverlay re-asserts an account's overlay so it reflects the current
-// ~/.claude (the symlink provider links any new top-level entry; the fuse
-// provider is a live mirror, so this just health-checks). Called at launch
-// time and periodically by the daemon, which is why explicit `ccp sync` is
-// unnecessary.
+// SyncOverlay re-asserts an account's overlay against the current ~/.claude: the
+// symlink provider links any new top-level entry, the fuse provider (a live
+// mirror) just health-checks. Run at launch and periodically by the daemon.
 func (m *Manager) SyncOverlay(a store.Account) error {
 	backend, err := fkoverlay.Parse(a.OverlayKind)
 	if err != nil {
@@ -336,10 +305,9 @@ func (m *Manager) SyncOverlay(a store.Account) error {
 	return prov.Sync(ClaudeDir(), a.ConfigDir)
 }
 
-// ensureOverlayKind returns the overlay provider backend for new accounts: the
-// backend recorded at init, detecting and recording one first if absent. The
-// returned reason is non-empty only when detection just ran and ruled out
-// fuse; it says why, so callers can surface the substitution to the user.
+// ensureOverlayKind returns the new-account overlay backend: the one recorded at
+// init, else detects and records one. The reason string is non-empty only when
+// detection just ran and ruled fuse out, so callers can surface it.
 func (m *Manager) ensureOverlayKind() (fkoverlay.Backend, string, error) {
 	if v, ok, err := m.Store.GetMeta(metaOverlayKind); err != nil {
 		return "", "", err

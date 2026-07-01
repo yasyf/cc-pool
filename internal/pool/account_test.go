@@ -25,8 +25,7 @@ func openTestStore(t *testing.T) *store.Store {
 	return st
 }
 
-// detectSymlink is the DetectOverlay injection for tests whose semantics are
-// provider-independent: a deterministic symlink verdict, so Init never probes
+// detectSymlink injects a deterministic symlink verdict so Init never probes
 // (or, in a fuse build, spawns) a mount holder.
 func detectSymlink() (fkoverlay.Backend, string) { return fkoverlay.BackendSymlink, "" }
 
@@ -74,7 +73,7 @@ func TestDuplicateIdentity(t *testing.T) {
 	})
 
 	t.Run("an account with no readable identity is skipped, not matched", func(t *testing.T) {
-		mkAccount(t, 3, "", "") // no .claude.json
+		mkAccount(t, 3, "", "")
 		dup, err := m.DuplicateIdentity(Identity{AccountUUID: "u-1"})
 		if err != nil {
 			t.Fatal(err)
@@ -119,15 +118,13 @@ func TestInitIdempotentAndMarker(t *testing.T) {
 	}
 }
 
-// TestPrepareAddRepairsHalfAddedDir reconstructs the forensic state of an add
-// that died at the onboarding wizard (overlay symlinks, private daemon/ide/backups
-// dirs, a pre-login .claude.json stub) and proves the normal PrepareAdd flow
-// repairs it in place: index reused, stub overwritten with the seeded config.
+// TestPrepareAddRepairsHalfAddedDir proves PrepareAdd repairs a dir left by an
+// add that died mid-onboarding: index reused, stub overwritten with the seeded
+// config.
 func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	// Plain claude's state: ~/.claude with shared entries, ~/.claude.json.
 	base := ClaudeDir()
 	for _, d := range []string{"projects", "backups"} {
 		if err := os.MkdirAll(filepath.Join(base, d), 0o750); err != nil {
@@ -141,7 +138,6 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The half-added acct-01 dir from a previous broken run.
 	acct := AccountDir(1)
 	if err := os.MkdirAll(acct, 0o700); err != nil {
 		t.Fatal(err)
@@ -160,10 +156,6 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	}
 
 	st := openTestStore(t)
-	// The repair semantics pinned here are provider-independent; inject a
-	// symlink verdict so PrepareAdd never routes through a mount holder this
-	// test can't host (a real fuse detection would move the private root to
-	// acct-01.private).
 	m := &Manager{Store: st, Keychain: newFakeKeychain(), DetectOverlay: detectSymlink}
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
@@ -179,14 +171,13 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	if pending.ClaudeJSONSeed != SeedCopied {
 		t.Fatalf("seed outcome = %q, want %q (stub must be overwritten)", pending.ClaudeJSONSeed, SeedCopied)
 	}
-	// The login command must pin claude's plugin root to the shared base, or
-	// the login session stamps acct-anchored paths into shared plugin state.
+	// Login must pin the plugin root to the shared base, else it stamps
+	// acct-anchored paths into shared plugin state.
 	wantLogin := fmt.Sprintf("CLAUDE_CODE_PLUGIN_CACHE_DIR=%s CLAUDE_CONFIG_DIR=%s claude /login",
 		filepath.Join(base, "plugins"), acct)
 	if pending.LoginCommand != wantLogin {
 		t.Fatalf("LoginCommand = %q, want %q", pending.LoginCommand, wantLogin)
 	}
-	// backups: the existing private dir is left intact; base is never touched.
 	fi, err := os.Lstat(filepath.Join(acct, "backups"))
 	if err != nil {
 		t.Fatal(err)
@@ -197,7 +188,6 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(base, "backups", ".claude.json.backup.1")); err != nil {
 		t.Fatalf("base backups damaged: %v", err)
 	}
-	// Seeded config: onboarding inherited, identity stripped.
 	var seeded map[string]any
 	if err := json.Unmarshal(readFile(t, filepath.Join(acct, ".claude.json")), &seeded); err != nil {
 		t.Fatal(err)
@@ -221,11 +211,9 @@ func TestPrepareAddRequiresInit(t *testing.T) {
 	}
 }
 
-// TestPrepareAddPurgesStaleKeychainItem pins the stale-item fix: an abandoned
-// add (or `ccp remove --keep-credential`) can leave a credential under a
-// service name a later add at the same index reuses; PrepareAdd must purge it
-// (else the login watcher false-positives and FinalizeAdd registers a stale
-// credential) — EXCEPT for SeedKeptExisting, the documented reuse path.
+// TestPrepareAddPurgesStaleKeychainItem pins that PrepareAdd purges a stale
+// credential under a reused index's service name (else the login watcher
+// false-positives), except on the SeedKeptExisting path.
 func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 	setup := func(t *testing.T) (*Manager, *fakeKeychain, string) {
 		t.Helper()
@@ -235,8 +223,6 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 			t.Fatal(err)
 		}
 		fk := newFakeKeychain()
-		// Provider-independent purge semantics; inject symlink for the same
-		// reason as TestPrepareAddRepairsHalfAddedDir (no mounts in tests).
 		m := &Manager{Store: openTestStore(t), Keychain: fk, DetectOverlay: detectSymlink}
 		if _, err := m.Init(); err != nil {
 			t.Fatal(err)
@@ -264,9 +250,8 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 	})
 
 	t.Run("purges an item stored under a different -a label", func(t *testing.T) {
-		// The stale item carries whatever label claude derived at ITS login
-		// (USER drift, fallback label); the purge must discover it by service,
-		// like every consumer does, not recompute today's label.
+		// The stale item's label is whatever claude wrote at login; the purge must
+		// find it by service, not today's label.
 		m, fk, svc := setup(t)
 		if err := fk.Delete(svc, "tester"); err != nil {
 			t.Fatal(err)
@@ -286,7 +271,6 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 
 	t.Run("kept-existing dir keeps the credential", func(t *testing.T) {
 		m, fk, svc := setup(t)
-		// A logged-in .claude.json from a prior attempt → SeedKeptExisting.
 		acct := AccountDir(1)
 		if err := os.MkdirAll(acct, 0o700); err != nil {
 			t.Fatal(err)
@@ -308,13 +292,9 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 	})
 }
 
-// TestFinalizeAddRequiresIdentity pins the anti-adoption gate: a credential can
-// land in an account dir without a real login — with a fresh CLAUDE_CONFIG_DIR
-// claude adopts the global session's secret into the suffixed Keychain item (or
-// the plaintext .credentials.json headless over SSH) at startup, writing no
-// oauthAccount. FinalizeAdd must refuse to register such an account rather than
-// pool a copy of plain claude's login. The gate precedes any credential read,
-// so this is hermetic (no Keychain, no network).
+// TestFinalizeAddRequiresIdentity pins the anti-adoption gate: FinalizeAdd
+// refuses to register an account whose login wrote no oauthAccount rather than
+// pool a copy of plain claude's adopted secret.
 func TestFinalizeAddRequiresIdentity(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if err := os.MkdirAll(ClaudeDir(), 0o700); err != nil {
@@ -354,8 +334,8 @@ func TestAbandonAddDeletesKeychainItem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Simulate the interactive login landing a credential — under a label that
-	// differs from today's AccountLabel(), which the rollback must discover.
+	// The login lands a credential under a label differing from today's
+	// AccountLabel(); the rollback must discover it by service.
 	cred := &keychain.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-login"
 	if err := fk.Write(pending.KeychainService, "claude-wrote-this", cred); err != nil {
@@ -373,11 +353,9 @@ func TestAbandonAddDeletesKeychainItem(t *testing.T) {
 	}
 }
 
-// TestConcurrentPrepareAddIndexRace documents the known index-reservation gap:
-// two concurrent PrepareAdds (no row until FinalizeAdd) are handed the same
-// index and thus the same dir + derived Keychain service. Fixing it needs a
-// pending-row reservation; until then this pins the current behavior so the
-// decision stays explicit.
+// TestConcurrentPrepareAddIndexRace pins the known index-reservation gap: two
+// concurrent PrepareAdds (no row until FinalizeAdd) get the same index, dir, and
+// Keychain service; the fix needs a pending-row reservation.
 func TestConcurrentPrepareAddIndexRace(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if err := os.MkdirAll(ClaudeDir(), 0o700); err != nil {
@@ -401,8 +379,8 @@ func TestConcurrentPrepareAddIndexRace(t *testing.T) {
 	}
 }
 
-// stubOverlay is a minimal injectable provider for PrepareAdd's fuse-fallback
-// tests: a fuse-kind provider whose Setup can be forced to fail.
+// stubOverlay is an injectable fuse-kind provider whose Setup can be forced to
+// fail.
 type stubOverlay struct {
 	backend  fkoverlay.Backend
 	setupErr error
@@ -425,19 +403,18 @@ func (s *stubOverlay) Setup(_, dir string) error {
 	if s.setupErr != nil {
 		return s.setupErr
 	}
-	// Mimic the real fuse provider's footprint: a mountpoint dir plus the
-	// private backing dir beside it.
+	// Mimic the real fuse provider's footprint: mountpoint dir plus the private
+	// backing dir beside it.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	return os.MkdirAll(fkoverlay.FusePrivateRoot(dir), 0o700)
 }
 
-// TestPrepareAddFuseFallback pins the explicit fuse→symlink fallback: when the
-// recorded kind is fuse but the provider cannot establish the overlay (holder
-// unavailable), PrepareAdd records the symlink overlay it actually established
-// and carries the reason for the CLI to print — never a silent substitution,
-// never a row promising a mirror the dir doesn't have.
+// TestPrepareAddFuseFallback pins the fuse→symlink fallback: when the recorded
+// kind is fuse but the provider can't establish it, PrepareAdd records the
+// symlink overlay it actually established and carries the reason — never a silent
+// substitution.
 func TestPrepareAddFuseFallback(t *testing.T) {
 	setup := func(t *testing.T, fuse fkoverlay.Provider) *Manager {
 		t.Helper()
@@ -464,8 +441,8 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 
 	t.Run("fuse setup failure falls back to symlinks and says why", func(t *testing.T) {
 		m := setup(t, &stubOverlay{backend: fkoverlay.BackendNFS, setupErr: errors.New("mount holder did not start: boom")})
-		// Simulate the holder getting as far as creating the backing dir
-		// before Setup failed: the fallback must not leave it behind.
+		// The holder created the backing dir before Setup failed; the fallback must
+		// not leave it behind.
 		if err := os.MkdirAll(fkoverlay.FusePrivateRoot(AccountDir(1)), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -482,8 +459,6 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		if pending.FallbackReason != "mount holder did not start: boom" {
 			t.Fatalf("FallbackReason = %q, want the fuse setup error", pending.FallbackReason)
 		}
-		// The dir really is a symlink overlay: shared entries are linked and
-		// the seed landed in the dir itself, not in a fuse private root.
 		if _, err := os.Readlink(filepath.Join(pending.ConfigDir, "projects")); err != nil {
 			t.Fatalf("symlink overlay not established: %v", err)
 		}
@@ -496,8 +471,6 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		if _, err := os.Lstat(filepath.Join(fkoverlay.FusePrivateRoot(pending.ConfigDir), ".claude.json")); !os.IsNotExist(err) {
 			t.Fatal("seed leaked into the fuse private root despite the fallback")
 		}
-		// The empty backing dir the fuse attempt left behind was cleaned up —
-		// a symlink account must not accrete an inert acct-NN.private.
 		if _, err := os.Lstat(fkoverlay.FusePrivateRoot(pending.ConfigDir)); !os.IsNotExist(err) {
 			t.Fatalf("empty fuse private root left behind after the fallback (lstat err = %v)", err)
 		}
@@ -520,9 +493,8 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		if err == nil {
 			t.Fatal("PrepareAdd succeeded, want a both-setups failure")
 		}
-		// Both causes ride the chain: the symlink complaint alone would mask
-		// the fuse failure that started the fallback, and callers must be able
-		// to match either with errors.Is.
+		// Both causes must ride the chain (errors.Is), else the symlink complaint
+		// masks the fuse failure that started the fallback.
 		if !errors.Is(err, fuseErr) {
 			t.Errorf("errors.Is(err, fuseErr) = false; err = %v", err)
 		}
@@ -550,7 +522,6 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		if stub.setups != 1 {
 			t.Fatalf("fuse setups = %d, want 1", stub.setups)
 		}
-		// The seed lands in the fuse private root, never through a mount.
 		if _, err := os.Stat(filepath.Join(fkoverlay.FusePrivateRoot(pending.ConfigDir), ".claude.json")); err != nil {
 			t.Fatalf("seed not in the private root: %v", err)
 		}
@@ -571,10 +542,9 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 	})
 }
 
-// TestPrepareAddSurfacesDetectReason pins the legacy-pool path where no
-// overlay kind was recorded at init (initialized marker only — Init normally
-// writes the kind first): detection runs inside PrepareAdd, and a symlink
-// verdict's reason must ride out on PendingAdd.FallbackReason, not vanish.
+// TestPrepareAddSurfacesDetectReason pins the legacy-pool path (initialized
+// marker but no recorded kind): detection runs inside PrepareAdd and a symlink
+// verdict's reason rides out on PendingAdd.FallbackReason.
 func TestPrepareAddSurfacesDetectReason(t *testing.T) {
 	const reason = "this build cannot host fuse mounts; install fuse-t"
 	t.Setenv("HOME", t.TempDir())
@@ -608,9 +578,9 @@ func TestPrepareAddSurfacesDetectReason(t *testing.T) {
 	}
 }
 
-// TestInitSurfacesOverlayFallbackReason pins the detect-reason plumbing: the
-// Init that runs detection reports why fuse was ruled out; later Inits (kind
-// already recorded) re-detect nothing and report nothing.
+// TestInitSurfacesOverlayFallbackReason pins that the Init running detection
+// reports why fuse was ruled out, while later Inits (kind already recorded) skip
+// detection and report nothing.
 func TestInitSurfacesOverlayFallbackReason(t *testing.T) {
 	const reason = "probe mount declined (fuse-t missing or Network Volumes access denied)"
 	t.Setenv("HOME", t.TempDir())
@@ -628,7 +598,6 @@ func TestInitSurfacesOverlayFallbackReason(t *testing.T) {
 		t.Fatalf("OverlayFallbackReason = %q, want %q", res.OverlayFallbackReason, reason)
 	}
 
-	// Re-init must not re-detect: the recorded kind wins and no reason leaks.
 	m.DetectOverlay = func() (fkoverlay.Backend, string) {
 		t.Error("re-init re-ran detection")
 		return "", ""
@@ -642,8 +611,7 @@ func TestInitSurfacesOverlayFallbackReason(t *testing.T) {
 	}
 }
 
-// TestInitFuseVerdictCarriesNoReason is the negative twin: a fuse verdict has
-// nothing to explain.
+// TestInitFuseVerdictCarriesNoReason pins that a fuse verdict carries no reason.
 func TestInitFuseVerdictCarriesNoReason(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	m := &Manager{Store: openTestStore(t)}

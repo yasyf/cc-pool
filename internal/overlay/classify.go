@@ -1,89 +1,57 @@
-// Package overlay holds cc-pool's mirror-specific overlay code: the
-// per-consumer CLASSIFICATION (ExcludedEntries, SharedEntries, SkipEntries,
-// PrivateEntry) that builds the fusekit/overlay Spec, plus the fuse MIRROR and
-// the detached mount-holder host (fuse-tagged) that fusekit/overlay's
-// RemoteFuseProvider drives over its socket. The overlay ABSTRACTION — the
-// Backend type, the symlink/fuse Provider interface, provider selection, and
-// the conversion/migration primitives — now lives in
-// github.com/yasyf/fusekit/overlay; cc-pool is a blind consumer of it.
-//
-// A small set of ~/.claude entries is held back from sharing because they are
-// instance-local runtime state that would conflict across concurrent sessions;
-// see ExcludedEntries and PrivateEntry. Held-back files stay per-account, but
-// .claude.json's shareable top-level keys (everything outside
-// ClaudeJSONPrivateKeys, plus the per-project approval keys
-// ClaudeJSONSharedProjectKeys carves out of "projects") still propagate: one-way
-// base→account at launch under symlink (pool.MergeBaseClaudeJSON), two-way under
-// fuse (live merged read view plus shareable-key write-through to ~/.claude.json).
+// Package overlay holds cc-pool's mirror-specific overlay code: the ~/.claude
+// entry classification (ExcludedEntries, SharedEntries, SkipEntries,
+// PrivateEntry) that builds the fusekit/overlay Spec, the fuse mirror, and the
+// detached mount-holder host (fuse-tagged) driven by fusekit/overlay's
+// RemoteFuseProvider. The overlay abstraction (Backend, Provider, selection,
+// migration) lives in github.com/yasyf/fusekit/overlay.
 package overlay
 
 import "strings"
 
-// ExcludedEntries are top-level ~/.claude entries that must NOT be shared
-// across accounts. Each excluded entry becomes a private, empty per-account
-// directory instead.
+// ExcludedEntries are top-level ~/.claude entries that must NOT be shared across
+// accounts; each becomes a private, empty per-account directory instead:
 //
-//   - daemon:  Claude Code's own PID-keyed worker supervisor (daemon/roster.json
-//     records a supervisorPid + worker registry). Sharing it makes two sessions
+//   - daemon:  claude's PID-keyed worker supervisor; sharing makes two sessions
 //     fight over one supervisor.
 //   - ide:     per-process IDE lock/socket files; a pooled session must not
-//     advertise itself on another account's IDE registry.
-//   - backups: claude's rotating backups of $CONFIG_DIR/.claude.json. Sharing
-//     it surfaces one account's config backups inside another's restore prompt
-//     (cross-account contamination) and commingles every account's backups.
+//     advertise on another account's IDE registry.
+//   - backups: claude's rotating .claude.json backups; sharing leaks one
+//     account's backups into another's restore prompt.
 var ExcludedEntries = map[string]bool{
 	"daemon":  true,
 	"ide":     true,
 	"backups": true,
 }
 
-// SharedEntries are top-level entries that must be shared across all accounts
-// even when ~/.claude does not contain them yet. claude writes these lazily into
-// $CLAUDE_CONFIG_DIR (the account dir itself), so without proactively creating
-// them in the base and linking them they would be born as real per-account dirs
-// and scatter. plans (plan-mode plans) is the motivating case. Disjoint from
-// ExcludedEntries / PrivateEntry.
+// SharedEntries are top-level entries shared across all accounts even when
+// ~/.claude lacks them yet: claude writes them lazily into $CLAUDE_CONFIG_DIR, so
+// without pre-creating them in the base and linking they would scatter as real
+// per-account dirs. plans is the motivating case. Disjoint from ExcludedEntries
+// and PrivateEntry.
 //
-// SharedEntries["plans"] is the underlying physical share — the symlink-account
-// mechanism (acct-NN/plans → ~/.claude/plans) and the fuse base-absent fallback
-// both rely on it, so it must stay. On top of it, fuse accounts ADDITIONALLY get
-// the canonical ~/.claude/plans path REPORTED to the session via an injected
-// settings.json plansDirectory (settingsView, fuse_settings.go), so a pooled
-// claude writes and reports the shared path directly rather than its per-account
-// $CONFIG_DIR/plans. The injection is an additive reporting layer, not a
-// replacement for this physical share.
+// plans is the physical share both the symlink mechanism (acct-NN/plans →
+// ~/.claude/plans) and the fuse base-absent fallback rely on, so it must stay.
+// Fuse accounts additionally report the canonical path via an injected
+// settings.json plansDirectory (fuse_settings.go) — an additive reporting layer,
+// not a replacement for this share.
 var SharedEntries = map[string]bool{
 	"plans": true,
 }
 
-// SkipEntries are never linked or mirrored (noise / OS cruft). Exported so the
-// pool can read it when building the fusekit/overlay Spec.
+// SkipEntries are top-level entries never linked or mirrored (OS cruft).
 var SkipEntries = map[string]bool{
 	".DS_Store": true,
 }
 
 // PrivateEntry reports whether a top-level entry name is per-account private:
-// the excluded dirs above, plus claude's primary state file .claude.json and
-// its atomic-write temp files (.claude.json.tmp.XXXX) — the file itself is
-// never linked or mirrored, but only its ClaudeJSONPrivateKeys (identity like
-// oauthAccount, per-account state) are truly private — and even there,
-// "projects" carves out the per-project ClaudeJSONSharedProjectKeys, which
-// cross both ways; every other key propagates between base and account
-// (symlink: one-way base-wins launch merge, pool.MergeBaseClaudeJSON; fuse:
-// live merged view with shareable keys written through to ~/.claude.json). Plus .credentials.json (and its
-// temp/lock siblings), claude's plaintext credential
-// store — the OAuth token blob it writes to $CONFIG_DIR/.credentials.json when
-// the macOS Keychain is unavailable (e.g. a headless SSH session). Sharing it
-// would symlink plain claude's live credential into a pool account, so
-// `claude /login` would adopt plain claude's login and a refresh would mutate
-// it — the exact thing the pool must never do. Plus .last-update-result.json
-// (claude's auto-update result, instance-local), which claude rewrites
-// atomically — replacing the overlay's symlink with a real file that Sync would
-// otherwise refuse to relink on every poll. Plus remote-settings.json (and its
-// atomic-write temp siblings), claude's cached per-subscription settings
-// fetched from claude.ai — per-account state claude writes directly into
-// $CONFIG_DIR with the same atomic-rewrite symlink-clobbering mode as
-// .last-update-result.json.
+//
+//   - the ExcludedEntries dirs;
+//   - .claude.json and its atomic-write temp siblings (.claude.json.tmp.XXXX);
+//   - .credentials.json and siblings: sharing would let a pool account adopt and
+//     rotate plain claude's login, which the pool must never do;
+//   - .last-update-result.json and remote-settings.json (and temp siblings):
+//     claude rewrites these atomically, clobbering the overlay symlink Sync would
+//     otherwise refuse to relink.
 func PrivateEntry(name string) bool {
 	return ExcludedEntries[name] ||
 		name == ".claude.json" || strings.HasPrefix(name, ".claude.json.") ||
@@ -93,14 +61,11 @@ func PrivateEntry(name string) bool {
 }
 
 // PrivatePrefixes are the top-level name prefixes the shared holder routes to the
-// per-account private root rather than the shared base ("source" mode): cc-pool's
-// private/synth files AND their atomic-write temp siblings, so claude's tmp→rename
-// commit of, say, .claude.json (.claude.json.tmp.XXXX → .claude.json) stays on one
-// filesystem. They are cc-pool's MountSpec.PrivatePrefixes. The holder matches them
-// with HasPrefix, so each entry covers the exact name and every temp/lock sibling;
-// the excluded private DIRS (daemon/ide/backups) cross separately as the manifest's
-// EntryPrivate entries. These MUST stay in sync with PrivateEntry's file-family
-// arms above — together they are the one private-name policy.
+// per-account private root rather than the shared base ("source" mode), matched by
+// HasPrefix so each covers its exact name and every atomic-write temp/lock sibling
+// — keeping claude's tmp→rename commit (.claude.json.tmp.XXXX → .claude.json) on
+// one filesystem. MUST stay in sync with PrivateEntry's file-family arms: together
+// they are the one private-name policy.
 var PrivatePrefixes = []string{
 	".claude.json",
 	".credentials.json",

@@ -40,7 +40,7 @@ scores; otherwise it samples usage live.`,
 				if err := requireInit(m); err != nil {
 					return err
 				}
-				// Best-effort: an unreadable cwd just disables stickiness.
+				// Unreadable cwd just disables stickiness.
 				cwd, _ := os.Getwd()
 				req := selectReq{wait: wait, fresh: fresh, noDaemon: noDaemon, cwd: cwd}
 				if cmd.Flags().Changed("account") {
@@ -63,43 +63,28 @@ scores; otherwise it samples usage live.`,
 	return cmd
 }
 
-// selectReq carries the per-invocation knobs that differ between `ccp run` and
-// `ccp select`; the pipeline (forced → daemon → live) is identical.
 type selectReq struct {
 	account  *int          // forced pick (CCP_ACCOUNT / --account); nil = auto-score
 	wait     bool          // wait for availability instead of failing (--wait)
 	fresh    time.Duration // live-mode cache window (--fresh)
 	noDaemon bool          // skip the daemon, sample live (--no-daemon)
 	cwd      string        // keys select stickiness; empty disables it
-	// pid marks the pick with a session checkout. `ccp run` passes its own
-	// pid — exec replaces it with claude in place, so the row tracks the real
-	// session and feeds the sticky activity rules. `ccp select` leaves it 0:
-	// the process printing the dir exits before claude starts.
+	// pid tags the session row: `ccp run` passes its own (exec replaces it in
+	// place), `ccp select` passes 0 so procscan attributes the live process.
 	pid int
 }
 
-// resolveSelection runs the full account-selection pipeline shared by `ccp run`
-// and `ccp select` and returns the chosen config dir plus a formatted diagnostic
-// line. A forced account resolves directly; otherwise it takes the daemon's
-// reserved pick, falling back to live scoring (optionally waiting) when the
-// daemon is unreachable or every account is busy. Picks it makes itself
-// (forced/live) get an overlay sync + preflight refresh; a daemon-served pick is
-// already prepared by the daemon (its poller syncs overlays and it preflights its
-// own pick). Only warnings reach stderr — the caller owns dir output and printing
-// the diagnostic line.
+// resolveSelection runs the shared `ccp run`/`ccp select` pipeline (forced →
+// daemon → live); the caller owns stdout and the diagnostic line.
 func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, line string, err error) {
-	// Forced account: resolve directly, no scoring (hence no headroom to report).
 	if req.account != nil {
 		a, err := m.Store.GetAccount(*req.account)
 		if err != nil {
 			return "", "", err
 		}
-		// Route the pick through the daemon when one is up at-version: its
-		// forced path holds gates a client cannot see — an overlay conversion
-		// mid-flight on the dir, mount state, reservations — and refusing
-		// there beats landing a claude in a dir being remade under it. With
-		// no daemon, no conversion can be running either (conversions are
-		// daemon-only), so the local path below is safe.
+		// An at-version daemon holds gates a client can't see (overlay conversion,
+		// mounts, reservations); prefer it over launching claude into a dir being
+		// remade. Daemonless, conversions can't run, so local prep is safe.
 		viaDaemon := false
 		if !req.noDaemon {
 			cl := daemon.NewClient()
@@ -113,31 +98,26 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 			}
 		}
 		if !viaDaemon {
-			_ = m.RecordSticky(req.cwd, a.ID, time.Now()) // anchor future selects here
+			_ = m.RecordSticky(req.cwd, a.ID, time.Now())
 			if req.pid > 0 {
-				// Best-effort bookkeeping, like RecordSticky: the session row
-				// feeds the sticky activity rules.
+				// Best-effort like RecordSticky; the row feeds sticky activity rules.
 				_, _ = m.Store.OpenSession(a.ID, req.pid, a.ConfigDir, req.cwd, time.Now())
 			}
 		}
 		dir, err := prepareAccount(cmd, m, a)
-		// Forced pick: no scoring, so no usage to report (hasUsage=false → bare name).
+		// Forced pick: no scoring, so no usage to report.
 		return dir, selectionLine(accountName(a.Label), false, false, 0, 0), err
 	}
 
-	// Fast path: the daemon's cached, reserved pick. EnsureRunning keeps a daemon
-	// alive to adopt any token claude rotates after we exec away; a version-skewed
-	// daemon scores with stale logic, so ignore it until status/add/init restarts
-	// it onto the current binary.
+	// EnsureRunning so a daemon outlives the exec to adopt tokens claude
+	// rotates; a version-skewed daemon (stale scoring) is ignored until
+	// status/add/init restarts it.
 	if !req.noDaemon {
 		cl := daemon.NewClient()
 		if cl.EnsureRunning(2*time.Second) && daemonAt(version.String()) {
-			// req.pid is `ccp run`'s own pid (the future claude pid, see
-			// selectReq) or 0 for `ccp select`, whose pid-0 picks lean on
-			// procscan to attribute the live process. We still reserve
-			// (anti-thundering-herd). --wait refuses exhausted fallback picks
-			// (it would discard them, and the daemon must not commit their
-			// sticky/reservation side effects).
+			// Reserve even pid-0 picks (anti-thundering-herd). --wait sends
+			// NoFallback: the daemon must not commit sticky/reservation side
+			// effects for a pick the client would discard.
 			if resp, ok := cl.Select(nil, req.pid, false, req.cwd, req.wait); ok {
 				switch daemonSelectOutcome(resp, req.wait) {
 				case outcomePicked:
@@ -153,7 +133,6 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 					if resp.SoonestReset != nil {
 						step(cmd.ErrOrStderr(), "All accounts are busy; waiting until %s.", humanizeReset(*resp.SoonestReset))
 					}
-					// fall through to the live waiting loop
 				case outcomeFail:
 					if resp.MountsNotReady {
 						return "", "", pool.ErrMountsNotReady
@@ -164,8 +143,7 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 		}
 	}
 
-	// Live path (no daemon, or waiting): sample + score synchronously. Select
-	// records stickiness (and the session row) itself.
+	// m.Select records stickiness and the session row itself.
 	opts := pool.SelectOptions{Live: true, FreshFor: req.fresh, Cwd: req.cwd, PID: req.pid, NoFallback: req.wait}
 	for {
 		sr, err := m.Select(cmd.Context(), opts)
@@ -201,10 +179,6 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 	}
 }
 
-// warnPinHeld prints the bypass notice for a held manual pin: the user
-// explicitly pinned this directory, so silently launching elsewhere would
-// violate their expectation. No notice when the free ranking landed on the
-// pinned account anyway — the pin was honored in effect.
 func warnPinHeld(cmd *cobra.Command, m *pool.Manager, held, selected *int) {
 	if held == nil || (selected != nil && *selected == *held) {
 		return
@@ -213,7 +187,6 @@ func warnPinHeld(cmd *cobra.Command, m *pool.Manager, held, selected *int) {
 		daemonAccountName(m, held), daemonAccountName(m, selected))
 }
 
-// selectOutcome classifies a daemon select reply for resolveSelection.
 type selectOutcome int
 
 const (
@@ -223,12 +196,9 @@ const (
 	outcomeError                       // a real daemon error
 )
 
-// daemonSelectOutcome classifies a daemon select reply. NoneAvailable is
-// checked before Error — the daemon sets both for a none-available result, and
-// matching on Error first made the --wait arm unreachable. The first arm is a
-// backstop: a --wait request sends NoFallback so the daemon should never offer
-// an exhausted fallback pick, but if one arrives anyway the caller's explicit
-// choice of waiting over billing extra-usage credits must win.
+// daemonSelectOutcome classifies a daemon select reply: check NoneAvailable
+// before Error (the daemon sets both); an exhausted fallback arriving despite
+// NoFallback must wait, not bill credits.
 func daemonSelectOutcome(resp *daemon.Response, wait bool) selectOutcome {
 	switch {
 	case resp.OK && resp.Dir != "" && resp.ExhaustedFallback && wait:
@@ -248,12 +218,8 @@ func daemonSelectOutcome(resp *daemon.Response, wait bool) selectOutcome {
 	}
 }
 
-// warnExhaustedFallback prints the loud warning for an all-exhausted fallback
-// pick: the launched session bills pay-as-you-go credits (extra usage enabled)
-// or just rate-limits until the account recovers. recoversAt is the binding
-// reset — the latest among the pegged windows, not necessarily the 5h one.
-// Always written to stderr — this is the one selection outcome that can
-// silently cost money.
+// warnExhaustedFallback flags the one outcome that can silently cost money.
+// recoversAt is the binding reset: the latest pegged window, not necessarily 5h.
 func warnExhaustedFallback(cmd *cobra.Command, name string, extraEnabled bool, recoversAt time.Time) {
 	until := ""
 	if !recoversAt.IsZero() {
@@ -266,7 +232,6 @@ func warnExhaustedFallback(cmd *cobra.Command, name string, extraEnabled bool, r
 	warn(cmd.ErrOrStderr(), "all accounts have exhausted their plan limits — using %s; it will be rate-limited until its window resets%s", name, until)
 }
 
-// derefTime returns the pointed-to time, or the zero time for nil.
 func derefTime(t *time.Time) time.Time {
 	if t == nil {
 		return time.Time{}
@@ -274,10 +239,7 @@ func derefTime(t *time.Time) time.Time {
 	return *t
 }
 
-// prepareAccount re-asserts the account's overlay, merges the base's shareable
-// .claude.json settings, and preflight-refreshes its token — the daemonless
-// equivalent of what the daemon does for its own picks — then returns the
-// config dir. Warnings go to stderr; the caller prints the success line.
+// prepareAccount is the daemonless equivalent of the daemon's own pick prep.
 func prepareAccount(cmd *cobra.Command, m *pool.Manager, a store.Account) (string, error) {
 	if err := m.SyncOverlay(a); err != nil {
 		warn(cmd.ErrOrStderr(), "couldn't sync this account's settings: %v", err)
@@ -293,19 +255,15 @@ func prepareAccount(cmd *cobra.Command, m *pool.Manager, a store.Account) (strin
 	return a.ConfigDir, nil
 }
 
-// mergeLaunchSettings propagates ~/.claude.json's shareable settings into the
-// account about to be launched, warning and continuing on failure — the same
-// warn-and-launch contract as SyncOverlay and PreflightRefresh: a malformed
-// ~/.claude.json must not brick every pooled launch.
+// mergeLaunchSettings warns rather than fails: a malformed ~/.claude.json must
+// not brick every pooled launch.
 func mergeLaunchSettings(cmd *cobra.Command, m *pool.Manager, a store.Account) {
 	if _, err := m.MergeBaseClaudeJSON(a); err != nil {
 		warn(cmd.ErrOrStderr(), "couldn't propagate shared settings from ~/.claude.json: %v", err)
 	}
 }
 
-// mergeDaemonPick runs the launch-settings merge for a daemon-served pick,
-// which returns before prepareAccount runs. A nil or unknown SelectedID warns
-// and skips, degrading like daemonAccountName.
+// mergeDaemonPick covers daemon-served picks, which never reach prepareAccount.
 func mergeDaemonPick(cmd *cobra.Command, m *pool.Manager, id *int) {
 	if id == nil {
 		warn(cmd.ErrOrStderr(), "daemon pick carried no account id; skipping the shared-settings merge")
@@ -319,9 +277,8 @@ func mergeDaemonPick(cmd *cobra.Command, m *pool.Manager, id *int) {
 	mergeLaunchSettings(cmd, m, a)
 }
 
-// announceLine prints the selection diagnostic to stderr, but only when stdout is
-// an interactive terminal — captured/piped callers ($(ccp select)) get the bare
-// dir on stdout and nothing else.
+// announceLine prints the diagnostic to stderr only when stdout is a TTY:
+// captured $(ccp select) callers get the bare dir and nothing else.
 func announceLine(cmd *cobra.Command, line string) {
 	if !stdoutIsTTY() {
 		return
@@ -329,9 +286,6 @@ func announceLine(cmd *cobra.Command, line string) {
 	step(cmd.ErrOrStderr(), "%s", line)
 }
 
-// selectionLine formats the selection diagnostic: "Selected <name>", or
-// "Reusing <name> (pinned)" for a sticky pick, plus raw 5h/7d percent-used when
-// known. The account name is accented and the usage figures health-tinted.
 func selectionLine(name string, sticky, hasUsage bool, used5, used7 float64) string {
 	verb := "Selected"
 	styledName := bestStyle.Render(name)
@@ -342,13 +296,10 @@ func selectionLine(name string, sticky, hasUsage bool, used5, used7 float64) str
 	return fmt.Sprintf("%s %s%s", verb, styledName, usageSuffix(hasUsage, used5, used7))
 }
 
-// daemonSelectionLine builds the diagnostic from a daemon select reply: the name
-// resolved from SelectedID (degrading to "account") plus its raw 5h/7d usage.
 func daemonSelectionLine(m *pool.Manager, resp *daemon.Response) string {
 	return selectionLine(daemonAccountName(m, resp.SelectedID), resp.Sticky, resp.HasUsage, 100-resp.Remaining5h, 100-resp.Remaining7d)
 }
 
-// liveSelectionLine builds the diagnostic from a live scoring result.
 func liveSelectionLine(sr *pool.SelectResult) string {
 	return selectionLine(accountName(sr.Best.Label), sr.Sticky, sr.HasUsage, sr.Util5h, sr.Util7d)
 }

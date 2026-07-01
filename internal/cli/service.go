@@ -21,39 +21,28 @@ import (
 	"github.com/yasyf/fusekit/version"
 )
 
-// Test seams. CLI tests must never scan real processes, stat real
-// mountpoints, signal real pids, or drive launchctl/brew; each var is the
-// real implementation in production and a fake in tests.
+// Test seams: tests must never touch real processes, mounts, or launchctl/brew.
 var (
 	scanSessions = procscan.Scan
-	// dirMounted is a non-blocking Getfsstat read of the kernel mount table
-	// (overlay.Mounted): it answers membership without touching the mirror, so
-	// it can never hang doctor's carcass check or the uninstall sweeps on a
-	// partially wedged mount. mountAliveAt stays the bounded liveness probe
-	// (overlay's 2s stat-probe harness): it reads base THROUGH the mount, where
-	// a parked mirror is read as dead and flagged.
+	// dirMounted reads the kernel mount table (never hangs on a wedged mount);
+	// mountAliveAt probes THROUGH the mount (2s bound), so a parked mirror reads dead.
 	dirMounted   = overlay.Mounted
 	mountAliveAt = overlay.MountAliveWithin
-	// deepProbeAt is doctor's bounded wedge probe (a 2 MiB read with a 5s
-	// bound) — like the stat seams above, it can never hang doctor on a
-	// wedged mirror.
+	// deepProbeAt is doctor's wedge probe: a 2 MiB read with a 5s bound.
 	deepProbeAt = overlay.DeepProbeWithin
 	stopDaemon  = stopDaemonService
 	brewManaged = func() bool { return ccpAgent().IsBrewManaged() }
 	brewStop    = func() error { return ccpAgent().BrewStop() }
 )
 
-// holderClient returns an Owner-scoped client for the shared fusekit-holder, so
-// every List/Reclaim sees only cc-pool's own mounts and never another tenant's.
+// holderClient is Owner-scoped: List/Reclaim see only cc-pool's own mounts,
+// never another tenant's.
 func holderClient() *mountd.Client {
 	return &mountd.Client{Socket: mountd.DefaultHolderSocket(), Owner: pool.HolderOwner}
 }
 
-// ccpAgent is cc-pool's daemon LaunchAgent / brew-services descriptor: the
-// generic launchctl + Homebrew lifecycle (fusekit/service) configured with
-// cc-pool's label, formula, daemon args, log path, and fuse-t library env. The
-// program defaults to the running binary (os.Executable), so a Homebrew symlink
-// stays a stable launchd program path across upgrades.
+// Program defaults to os.Executable, so a Homebrew symlink stays a stable
+// launchd program path across upgrades.
 func ccpAgent() service.Agent {
 	return service.Agent{
 		Label:   "com.yasyf.cc-pool",
@@ -108,12 +97,8 @@ func newServiceCmd() *cobra.Command {
 	return cmd
 }
 
-// holderStatusLine renders the mount-holder line for `ccp service status`, or
-// "" when there is nothing truthful to say (no holder running and no fuse
-// rows that would need one). It dials the holder directly rather than asking
-// the daemon's cache: the holder outlives daemons by design, and service
-// status is exactly where the user looks when the two disagree. Same trust as
-// the daemon dial above it — a local 0600 socket.
+// holderStatusLine dials the holder directly, not the daemon's cache: the
+// holder outlives daemons, and status must reflect them when they disagree.
 func holderStatusLine(cl *mountd.Client, fuseRows int) string {
 	if !cl.Available() {
 		if fuseRows > 0 {
@@ -129,15 +114,10 @@ func holderStatusLine(cl *mountd.Client, fuseRows int) string {
 	if err != nil {
 		return fmt.Sprintf("Mount holder: running (%s, mounts unknown: %v)", ver, err)
 	}
-	// The holder is a separate, multi-tenant product (the fusekit-holder cask):
-	// its version is unrelated to cc-pool's, and cc-pool never replaces it, so the
-	// version is reported as-is with no skew verdict. `mounts` is Owner-scoped to
-	// cc-pool's own mounts.
+	// Holder version is unrelated to cc-pool's, so no skew verdict.
 	return fmt.Sprintf("Mount holder: running (%s, %s)", ver, plural(len(mounts), "mount"))
 }
 
-// fuseAccountRows counts the fuse-kind account rows; `ccp service status`
-// needs it to decide whether an absent holder is worth a line.
 func fuseAccountRows() (int, error) {
 	n := 0
 	err := withManager(func(m *pool.Manager) error {
@@ -151,10 +131,8 @@ func fuseAccountRows() (int, error) {
 	return n, err
 }
 
-// fuseBackedRow reports whether a stored overlay_kind names a fuse backend.
-// An unparseable value (only ever written by cc-pool, so corruption) reads as
-// non-fuse so the safe symlink path handles the dir. It is the cli package's
-// one place that parses the stored backend string.
+// fuseBackedRow treats an unparseable overlay_kind as non-fuse, failing safe
+// to the symlink path.
 func fuseBackedRow(overlayKind string) bool {
 	b, err := fkoverlay.Parse(overlayKind)
 	if err != nil {
@@ -163,7 +141,6 @@ func fuseBackedRow(overlayKind string) bool {
 	return b.IsFuse()
 }
 
-// countFuse counts the fuse-backed rows in an account list.
 func countFuse(accts []store.Account) int {
 	n := 0
 	for _, a := range accts {
@@ -197,12 +174,7 @@ never touched.`,
 	return cmd
 }
 
-// runServiceUninstall is the uninstall flow, strictly gate-before-destruction:
-// (a) refuse while live sessions depend on dirs this run would destroy,
-// (b) stop the daemon (mount-safe: it never touches the holder's mounts),
-// (c) reclaim cc-pool's own mounts from the shared holder (never a holder
-// shutdown), (d) re-verify against kernel truth that no account dir is still a
-// mountpoint, and only then (e) purge if asked.
+// runServiceUninstall is strictly gate-before-destruction.
 func runServiceUninstall(cmd *cobra.Command, purge, force bool) error {
 	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 
@@ -223,8 +195,6 @@ func runServiceUninstall(cmd *cobra.Command, purge, force bool) error {
 
 	reclaimHolderMounts(cmd)
 
-	// Kernel-truth sweep verification. A purge must hard-abort on any
-	// survivor: RemoveAll through a live mirror deletes inside ~/.claude.
 	if survivors := mountedAccounts(accts); len(survivors) > 0 {
 		names := make([]string, len(survivors))
 		for i, a := range survivors {
@@ -244,11 +214,9 @@ func runServiceUninstall(cmd *cobra.Command, purge, force bool) error {
 	return purgeAll(cmd)
 }
 
-// gateUninstallSessions refuses the uninstall while live claude sessions sit
-// on dirs it is about to destroy: a plain uninstall sweeps only the fuse
-// mounts (symlink dirs survive untouched), while --purge removes every
-// account dir. A failed scan aborts — proceeding blind could yank a dir out
-// from under a session we could not see.
+// gateUninstallSessions refuses while live sessions sit on dirs the uninstall
+// would destroy: fuse rows for a plain uninstall, every row for --purge. A
+// failed scan aborts rather than yank a dir from under an unseen session.
 func gateUninstallSessions(accts []store.Account, purge bool) error {
 	sessions, err := scanSessions(context.Background())
 	if err != nil {
@@ -275,13 +243,9 @@ func gateUninstallSessions(accts []store.Account, purge bool) error {
 	return nil
 }
 
-// stopDaemonService stops the daemon: via `brew services` when
-// Homebrew-managed (also clearing any stale self-rolled agent), else the
-// self-rolled LaunchAgent. Mount-safe by design — the daemon never touches
-// the holder's mounts on shutdown. A failed stop is fatal, never a warning:
-// everything after this step (the holder sweep, the purge) is only safe once
-// the daemon is actually down — a still-live daemon respawns the holder and
-// remounts fuse rows on its next heal tick.
+// stopDaemonService is mount-safe (daemon shutdown never touches the holder's
+// mounts). A failed stop is fatal: a still-live daemon respawns the holder
+// and remounts fuse rows on its next heal tick.
 func stopDaemonService(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	if brewManaged() {
@@ -300,14 +264,9 @@ func stopDaemonService(cmd *cobra.Command) error {
 	return nil
 }
 
-// reclaimHolderMounts releases cc-pool's mounts on the SHARED fusekit-holder when
-// the service is uninstalled: it unmounts only cc-pool-owned mounts (Reclaim) and
-// leaves the holder running. It NEVER shuts the holder down or kills its process —
-// the holder is multi-tenant and launchd/cask-managed, and another consumer (e.g.
-// cc-notes) may still be using it; stopping the holder itself is `brew uninstall
-// --cask fusekit-holder`. A holder that was never reachable is skipped silently,
-// but the caller still re-verifies kernel truth afterwards: a reclaim that wedged
-// can leave mount carcasses.
+// reclaimHolderMounts unmounts only cc-pool-owned mounts and NEVER stops the
+// shared multi-tenant holder. An unreachable holder is skipped silently; the
+// caller re-verifies kernel truth, since a wedged reclaim can leave carcasses.
 func reclaimHolderMounts(cmd *cobra.Command) {
 	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	cl := holderClient()
@@ -325,7 +284,6 @@ func reclaimHolderMounts(cmd *cobra.Command) {
 	success(out, "Released cc-pool's mounts from the shared holder.")
 }
 
-// poolAccounts lists every account row (empty when the pool has none).
 func poolAccounts() ([]store.Account, error) {
 	var accts []store.Account
 	err := withManager(func(m *pool.Manager) error {
@@ -336,8 +294,6 @@ func poolAccounts() ([]store.Account, error) {
 	return accts, err
 }
 
-// mountedAccounts returns the accounts whose config dirs are still
-// mountpoints — kernel truth, independent of what the holder reported.
 func mountedAccounts(accts []store.Account) []store.Account {
 	var still []store.Account
 	for _, a := range accts {
@@ -348,9 +304,8 @@ func mountedAccounts(accts []store.Account) []store.Account {
 	return still
 }
 
-// mountedStateDirs returns any dir under ~/.cc-pool/accounts that is still a
-// mountpoint, independent of the (possibly already deleted) account rows. A
-// missing accounts dir means nothing can be mounted under it.
+// mountedStateDirs scans on-disk dirs, not the (possibly already-deleted)
+// account rows.
 func mountedStateDirs() []string {
 	entries, err := os.ReadDir(pool.AccountsDir())
 	if err != nil {
@@ -366,12 +321,9 @@ func mountedStateDirs() []string {
 	return still
 }
 
-// purgeAll removes every pool account (overlay + Keychain items) and the
-// state dir (which contains the account dirs). ~/.claude and plain claude's
-// canonical credential are never touched. Callers must already have verified
-// no account dir is a live mountpoint; the re-check immediately before the
-// recursive delete is belt and braces for the catastrophic path — RemoveAll
-// through a live mirror deletes inside ~/.claude.
+// purgeAll never touches ~/.claude or plain claude's canonical credential.
+// The mountpoint re-check before RemoveAll is load-bearing: deleting through
+// a live mirror deletes inside ~/.claude.
 func purgeAll(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	err := withManager(func(m *pool.Manager) error {
@@ -399,15 +351,11 @@ func purgeAll(cmd *cobra.Command) error {
 	return nil
 }
 
-// runServiceInstall starts the daemon: via `brew services` when Homebrew-managed
-// (booting out any stale self-rolled agent first), else the self-rolled
-// LaunchAgent.
 func runServiceInstall(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	if ccpAgent().IsBrewManaged() {
-		// A source-build `ccp service install` leaves a self-rolled
-		// com.yasyf.cc-pool agent that would run alongside the brew one.
-		// Boot it out before delegating.
+		// A source build leaves a self-rolled agent that would run alongside
+		// the brew one; boot it out first.
 		_ = ccpAgent().Uninstall()
 		if err := ccpAgent().BrewStart(); err != nil {
 			return fmt.Errorf("brew services start: %w", err)
@@ -427,20 +375,11 @@ func runServiceInstall(cmd *cobra.Command) error {
 	return nil
 }
 
-// evictTimeout bounds the wait for a version-skewed daemon to release the
-// socket after being asked to step down.
 const evictTimeout = 5 * time.Second
 
-// ensureDaemon makes sure a daemon at the current version is responding,
-// silently starting (or restarting, after an upgrade) it as needed.
-// Best-effort: failures are warnings, never fatal — no calling flow requires
-// the daemon (selection and add validation fall back to direct sampling).
-//
-// force restarts even when a current-version daemon is already responding —
-// for a same-version binary swap (a pure→fuse `brew reinstall`), where the
-// running daemon's on-disk image just changed under it but its version string
-// is unchanged, so the daemonAt short-circuit would otherwise leave the stale
-// image running.
+// ensureDaemon is best-effort: failures warn, callers fall back to direct
+// sampling. force restarts even a responding same-version daemon (a pure→fuse
+// binary swap the daemonAt short-circuit would miss).
 func ensureDaemon(cmd *cobra.Command, force bool) {
 	want := version.String()
 	if !force && daemonAt(want) {
@@ -448,23 +387,18 @@ func ensureDaemon(cmd *cobra.Command, force bool) {
 	}
 	cl := daemon.NewClient()
 	if resp, err := cl.Health(); err == nil && resp.OK {
-		// A version-skewed daemon answers here (launchd's KeepAlive holding a
-		// pre-upgrade image, or a detached EnsureRunning spawn launchd never
-		// tracked); under force, so does a current-version daemon whose on-disk
-		// binary just changed under it (a pure→fuse reinstall).
+		// A skewed daemon can answer here: a KeepAlive pre-upgrade image, or a
+		// detached spawn launchd never tracked.
 		step(cmd.OutOrStdout(), "Restarting the cc-pool daemon…")
-		// Bootout first: this terminates a launchd-tracked daemon — mount-safe,
-		// since the detached holder keeps serving any fuse mirrors across it —
-		// and disables KeepAlive so launchd can't respawn the pre-upgrade image
-		// under us. A no-op for an orphan launchd never tracked.
+		// Bootout first: disables KeepAlive so launchd can't respawn the
+		// pre-upgrade image; mount-safe (the detached holder keeps serving);
+		// a no-op for an orphan.
 		if ccpAgent().IsBrewManaged() {
 			_ = ccpAgent().BrewStop()
 		} else {
 			_ = ccpAgent().Uninstall()
 		}
-		// An orphan survives bootout. Ask it to step down over the socket (its one
-		// clean-teardown path); if it still won't let go, kill the exact process on
-		// the other end of the socket — what the old `pkill` hint did by hand.
+		// An orphan survives bootout.
 		if !cl.WaitGone(evictTimeout) {
 			_, _ = cl.Shutdown()
 			if !cl.WaitGone(evictTimeout) {
@@ -481,9 +415,8 @@ func ensureDaemon(cmd *cobra.Command, force bool) {
 		step(cmd.OutOrStdout(), "Starting the cc-pool daemon…")
 	}
 	if err := runServiceInstall(cmd); err != nil {
-		// Re-check at the wanted version: a concurrent start or an
-		// already-bootstrapped agent can fail the install while leaving a
-		// healthy current daemon behind.
+		// A concurrent start or an already-bootstrapped agent can fail the
+		// install while leaving a healthy current daemon behind.
 		if daemonAt(want) {
 			return
 		}
@@ -501,14 +434,12 @@ func ensureDaemon(cmd *cobra.Command, force bool) {
 	}
 }
 
-// daemonAt reports whether a healthy daemon at exactly wantVersion responds.
-// Version-checked so a stale pre-upgrade daemon never counts as success.
+// daemonAt is exact-version: a stale pre-upgrade daemon never counts.
 func daemonAt(wantVersion string) bool {
 	resp, err := daemon.NewClient().Health()
 	return err == nil && resp.OK && resp.Version == wantVersion
 }
 
-// waitDaemon polls until a daemon at wantVersion responds or timeout elapses.
 func waitDaemon(wantVersion string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
