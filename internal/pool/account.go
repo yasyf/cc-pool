@@ -133,7 +133,7 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		}
 		// Fuse may leave an empty backing dir (holder creates it pre-mount); drop
 		// it only if empty — contents are unclassified state, never destroy them.
-		removePrivateRootIfEmpty(fkoverlay.FusePrivateRoot(acctDir))
+		removePrivateRootIfEmpty(fkoverlay.FusePrivateRoot(acctDir), m.overlaySpec())
 	}
 	seed, err := seedClaudeJSON(prov, acctDir, ClaudeJSONPath())
 	if err != nil {

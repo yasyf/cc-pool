@@ -1105,11 +1105,12 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 type healOutcome int
 
 const (
-	healMounted      healOutcome = iota // the mirror is up
-	healRetry                           // transient holder condition; retry next poll
-	healTCCBlocked                      // mount blocked pending the TCC grant; recorded; retry next poll
-	healFallback                        // genuine mount failure; gated symlink fallback attempted
-	healDeferredBusy                    // dead/wedged mirror left mounted under a live session; force-unmount would panic the kernel, so defer
+	healMounted             healOutcome = iota // the mirror is up
+	healRetry                                  // transient holder condition; retry next poll
+	healTCCBlocked                             // mount blocked pending the TCC grant; recorded; retry next poll
+	healFallback                               // genuine mount failure; gated symlink fallback attempted
+	healDeferredBusy                           // dead/wedged mirror left mounted under a live session; force-unmount would panic the kernel, so defer
+	healDeferredUnmitigated                    // holder predates the NFS kernel-panic mitigations; wait for the cask upgrade, no breaker strike
 )
 
 // errSweepStranded marks a failure in mountFuse's pre-Setup sweep of stranded
@@ -1143,6 +1144,14 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 		// (see errRemountBusy). Defer WITHOUT a hazard strike.
 		s.log.Printf("acct-%02d dead/wedged mirror left mounted under live session(s) — NOT force-unmounting (would panic the kernel); relaunch them: %v", a.ID, err)
 		return healDeferredBusy
+	case errors.Is(err, pool.ErrHolderUnmitigated):
+		// The provider's mitigation gate refused to host a mirror on a
+		// pre-mitigation holder (the nfs_vinvalbuf2 panic vector). A benign wait
+		// for the cask upgrade, not a kernel hazard: defer without a breaker
+		// strike, and never demote the row — the remount resumes on its own once
+		// the holder is upgraded.
+		s.log.Printf("acct-%02d remount refused, retrying next poll: %v", a.ID, err)
+		return healDeferredUnmitigated
 	case errors.Is(err, mountd.ErrHolderUnavailable), errors.Is(err, mountd.ErrBusy):
 		// Setup already attempts a lazy (re)spawn and launchd owns the respawn
 		// policy, so there is nothing more to do this poll.
@@ -1295,7 +1304,7 @@ func (s *Server) fallbackToSymlink(ctx context.Context, a store.Account) {
 		s.log.Printf("acct-%02d deferring fuse→symlink fallback: %d live session(s)", a.ID, n)
 		return
 	}
-	if _, err := s.m.ConvertOverlay(a, fkoverlay.BackendSymlink); err != nil {
+	if _, err := s.m.ConvertOverlay(ctx, a, fkoverlay.BackendSymlink); err != nil {
 		s.log.Printf("acct-%02d symlink fallback: %v", a.ID, err)
 		return
 	}

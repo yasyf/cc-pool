@@ -66,11 +66,13 @@ func newDoctorCmd() *cobra.Command {
 				}
 
 				reachable, holderVer := probeHolder()
-				reportHolder(holderFacts{
+				facts := holderFacts{
 					reachable: reachable,
 					version:   holderVer,
 					cached:    cachedHolder,
-				}, countFuse(accts), report)
+				}
+				reportHolder(facts, countFuse(accts), report)
+				reportHolderMitigations(facts, report)
 				reportCarcasses(accts, report)
 
 				// Mount truth lives in the holder, which outlives daemons — not the daemon cache.
@@ -146,8 +148,12 @@ func probeHolder() (reachable bool, ver string) {
 	return true, v
 }
 
-// The holder is a separate multi-tenant product: no version-skew check, and
-// serving no cc-pool mounts is not an orphan.
+// The holder is a separate multi-tenant product: cc-pool never compares the
+// holder's version against its own or replaces the holder over skew (the
+// cask's launchd owns upgrades; a version-replacement would tear down other
+// tenants' mounts), and serving no cc-pool mounts is not an orphan. The one
+// version constraint that does exist — the MinHolderVersion mitigation floor,
+// a refusal, never a replacement — is reportHolderMitigations' job.
 func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)) {
 	switch {
 	case !f.reachable && fuseRows > 0:
@@ -162,6 +168,21 @@ func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)
 	if f.cached.TCCError != "" {
 		report("mount holder grant", false, f.cached.TCCError+" — "+fuseGrantHint(f.cached.TCCBlockedBackend)+" (cc-pool falls back to symlink automatically if the grant never lands)")
 	}
+}
+
+// reportHolderMitigations flags a reachable holder that predates the NFS
+// kernel-panic mitigations (pool.MinHolderVersion). An unreachable holder is
+// silent — reportHolder already covers that.
+func reportHolderMitigations(f holderFacts, report func(string, bool, string)) {
+	if !f.reachable {
+		return
+	}
+	if pool.HolderVersionMitigated(f.version) {
+		report("holder panic mitigations", true, "")
+		return
+	}
+	report("holder panic mitigations", false, fmt.Sprintf("holder %s predates the NFS kernel-panic mitigations (need %s or newer) — run `brew upgrade --cask fusekit-holder`",
+		f.version, pool.MinHolderVersion))
 }
 
 // listHolderMounts returns nil on failure; reportHolder already covers an unreachable holder.

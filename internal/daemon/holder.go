@@ -183,9 +183,12 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 			switch s.healFuse(ctx, fresh) {
 			case healMounted:
 				delete(s.rowRetry, a.ID)
-			case healDeferredBusy:
+			case healDeferredBusy, healDeferredUnmitigated:
 				// No hazard strike: a busy mount must never reach the wedged
-				// breaker, and the reset disarms a mid-countdown breaker.
+				// breaker (and the reset disarms a mid-countdown breaker), and an
+				// unmitigated holder is a benign wait for the cask upgrade — the
+				// row keeps deferring until `brew upgrade --cask fusekit-holder`
+				// lands, never retreating to symlink.
 				s.advanceRowRetry(a.ID, false)
 			case healTCCBlocked:
 				if s.advanceTCCRetry(a.ID) >= tccBreakerThreshold {
@@ -290,7 +293,7 @@ func (s *Server) convertRowToSymlink(ctx context.Context, a store.Account, annou
 			return false
 		}
 	}
-	if _, err := s.m.ConvertOverlay(fresh, fkoverlay.BackendSymlink); err != nil {
+	if _, err := s.m.ConvertOverlay(ctx, fresh, fkoverlay.BackendSymlink); err != nil {
 		s.log.Printf("acct-%02d symlink retreat: convert to symlink: %v", a.ID, err)
 		return false
 	}

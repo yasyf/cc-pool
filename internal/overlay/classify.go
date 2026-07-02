@@ -1,7 +1,8 @@
 // Package overlay holds cc-pool's mirror-specific overlay code: the ~/.claude
 // entry classification (ExcludedEntries, SharedEntries, SkipEntries,
-// PrivateEntry) that builds the fusekit/overlay Spec, the fuse mirror, and the
-// detached mount-holder host (fuse-tagged) driven by fusekit/overlay's
+// SkipPrefixes, PrivateEntry) that builds the fusekit/overlay Spec, the fuse
+// mirror, and the detached mount-holder host (fuse-tagged) driven by
+// fusekit/overlay's
 // RemoteFuseProvider. The overlay abstraction (Backend, Provider, selection,
 // migration) lives in github.com/yasyf/fusekit/overlay.
 package overlay
@@ -42,6 +43,12 @@ var SharedEntries = map[string]bool{
 var SkipEntries = map[string]bool{
 	".DS_Store": true,
 }
+
+// SkipPrefixes are top-level name prefixes skipped exactly like SkipEntries
+// (fkoverlay.Spec.Skipped matches by HasPrefix): AppleDouble "._*" sidecar
+// litter from pre-mitigation fuse mounts — ignored and cleaned by conversion
+// and sweeps, never linked or moved into ~/.claude.
+var SkipPrefixes = []string{"._"}
 
 // PrivateEntry reports whether a top-level entry name is per-account private:
 //

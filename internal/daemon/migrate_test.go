@@ -3,9 +3,11 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/keychain"
 	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/mountd"
@@ -1056,6 +1059,14 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w (mount-timeout): fuse mount did not come up in time", mountd.ErrUnknownClass)),
 			wantOutcome: healRetry, wantKind: "nfs",
 		},
+		// The exact chain the provider's mitigation gate produces for a
+		// pre-mitigation holder: defer for the cask upgrade, never demote —
+		// remounting on that holder is the nfs_vinvalbuf2 panic vector.
+		"unmitigated holder defers without demoting": {
+			setupErr: fmt.Errorf("%w: holder v0.22.1 needs %s or newer; run `brew upgrade --cask fusekit-holder`",
+				pool.ErrHolderUnmitigated, pool.MinHolderVersion),
+			wantOutcome: healDeferredUnmitigated, wantKind: "nfs",
+		},
 		"genuine failure on an idle account converts": {
 			setupErr:    errors.New("mount exploded"),
 			wantOutcome: healFallback, wantKind: "symlink",
@@ -1210,6 +1221,292 @@ func TestSelectColdStartPrimesHolderCacheLazily(t *testing.T) {
 	resp = s2.handleSelect(t.Context(), Request{Op: OpSelect, Account: &one, NoMark: true})
 	if !resp.OK || resp.Dir != dirs2[1] {
 		t.Fatalf("cold-start forced select = %+v, want acct-1's dir", resp)
+	}
+}
+
+// startVersionedHolder binds a canned mountd holder at socket answering every
+// op OK: Probe succeeds (FuseOK) and Health reports version. It is listening
+// before it returns, so any Select/EnsureRunning against the socket
+// short-circuits on Available and never spawns a real holder.
+func startVersionedHolder(t *testing.T, socket, version string) {
+	t.Helper()
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go serveVersionedHolder(ln, version)
+}
+
+func serveVersionedHolder(ln net.Listener, version string) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		var req mountd.Request
+		resp := mountd.Response{OK: true, Version: version}
+		if err := json.NewDecoder(conn).Decode(&req); err == nil && req.Op == mountd.OpProbe {
+			resp.FuseOK = true
+		}
+		_ = json.NewEncoder(conn).Encode(resp)
+		_ = conn.Close()
+	}
+}
+
+// gateHome points HOME at a short /tmp dir (macOS caps sun_path at 104 bytes;
+// t.TempDir paths overflow it) and returns the shared holder socket path under
+// it, parent dir created.
+func gateHome(t *testing.T) string {
+	t.Helper()
+	home, err := os.MkdirTemp("/tmp", "ccp-gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	socket := mountd.DefaultHolderSocket()
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return socket
+}
+
+// TestFuseGateHolderMitigationMatrix drives the PRODUCTION fuseGate (no
+// fuseGateFn seam) against a canned holder serving the shared socket under a
+// test HOME: only a release older than pool.MinHolderVersion refuses fuse,
+// with the observed version, the floor, and the brew-upgrade hint in the
+// reason; dev/empty/garbage versions are current-source and pass.
+func TestFuseGateHolderMitigationMatrix(t *testing.T) {
+	cases := map[string]struct {
+		version  string
+		wantPass bool
+	}{
+		"pre-mitigation v0.22.9 refused":     {"v0.22.9", false},
+		"boundary v0.23.0 passes":            {"v0.23.0", true},
+		"v0.24.0 passes":                     {"v0.24.0", true},
+		"v0.25.0 passes":                     {"v0.25.0", true},
+		"dev holder passes (current source)": {"dev", true},
+		"empty version passes":               {"", true},
+		"garbage version passes":             {"not-a-version", true},
+		"commit-suffixed old holder refused": {"v0.22.9 (abc1234)", false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			socket := gateHome(t)
+			startVersionedHolder(t, socket, tc.version)
+			s := &Server{holderSocket: socket}
+
+			backend, reason := s.fuseGate(t.Context())
+			if tc.wantPass {
+				if reason != "" || !backend.IsFuse() {
+					t.Fatalf("fuseGate = (%q, %q), want a fuse pass", backend, reason)
+				}
+				return
+			}
+			if backend != "" || reason == "" {
+				t.Fatalf("fuseGate = (%q, %q), want a refusal", backend, reason)
+			}
+			for _, frag := range []string{tc.version, pool.MinHolderVersion, "brew upgrade --cask fusekit-holder", "ccp migrate"} {
+				if !strings.Contains(reason, frag) {
+					t.Fatalf("refusal %q missing %q", reason, frag)
+				}
+			}
+		})
+	}
+}
+
+// TestFuseGateHealthFailureFailsSafe: a holder whose version cannot be
+// observed is never assumed mitigated — the gate refuses with the probe fault
+// rather than passing (or minting a version verdict). The cancelled ctx bounds
+// awaitHolderHealth's retry loop to one attempt.
+func TestFuseGateHealthFailureFailsSafe(t *testing.T) {
+	socket := gateHome(t)
+	startVersionedHolder(t, socket, "v0.25.0") // Select's probe arm passes
+	deadDir, err := os.MkdirTemp("/tmp", "ccp-dead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(deadDir) })
+	// The holder died between the probe and the health read.
+	s := &Server{holderSocket: filepath.Join(deadDir, "gone.sock")}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	backend, reason := s.fuseGate(ctx)
+	if backend != "" || !strings.Contains(reason, "mount holder health probe failed") {
+		t.Fatalf("fuseGate = (%q, %q), want a fail-safe health-probe refusal", backend, reason)
+	}
+	if strings.Contains(reason, "predates") {
+		t.Fatalf("refusal %q claims a version verdict for an unobservable holder", reason)
+	}
+}
+
+// TestAwaitHolderHealth pins the migrate warm-up: a freshly spawned holder
+// still binding its socket is ridden out (bounded by the holder's own spawn
+// allowance), and a cancelled wait surfaces the real Health fault.
+func TestAwaitHolderHealth(t *testing.T) {
+	t.Run("rides out a holder still binding its socket", func(t *testing.T) {
+		sockDir, err := os.MkdirTemp("/tmp", "ccp-warm")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+		socket := filepath.Join(sockDir, "m.sock")
+		s := &Server{holderSocket: socket}
+		lnCh := make(chan net.Listener, 1)
+		timer := time.AfterFunc(300*time.Millisecond, func() {
+			ln, err := net.Listen("unix", socket)
+			if err != nil {
+				return
+			}
+			lnCh <- ln
+			go serveVersionedHolder(ln, "v0.25.0")
+		})
+		t.Cleanup(func() {
+			timer.Stop()
+			select {
+			case ln := <-lnCh:
+				_ = ln.Close()
+			default:
+			}
+		})
+
+		ver, err := s.awaitHolderHealth(t.Context())
+		if err != nil {
+			t.Fatalf("awaitHolderHealth over a late-binding holder: %v", err)
+		}
+		if ver != "v0.25.0" {
+			t.Fatalf("version = %q, want v0.25.0", ver)
+		}
+	})
+
+	t.Run("cancelled wait surfaces the last health error", func(t *testing.T) {
+		deadDir, err := os.MkdirTemp("/tmp", "ccp-nosock")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(deadDir) })
+		s := &Server{holderSocket: filepath.Join(deadDir, "gone.sock")}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		start := time.Now()
+		ver, err := s.awaitHolderHealth(ctx)
+		if !errors.Is(err, mountd.ErrHolderUnavailable) {
+			t.Fatalf("error = %v, want errors.Is ErrHolderUnavailable (the real fault, not a bare ctx error)", err)
+		}
+		if ver != "" {
+			t.Fatalf("version = %q on failure, want empty", ver)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("cancelled wait took %v; it must not sit out the spawn allowance", elapsed)
+		}
+	})
+}
+
+// TestHandleMigrateBudgetStartsAfterFuseGate: the gate's warm-up (holder
+// cold-start absorbed in awaitHolderHealth) must not be paid out of the
+// conversion budget — handleMigrate computes the budget deadline only after
+// fuseGate returns.
+func TestHandleMigrateBudgetStartsAfterFuseGate(t *testing.T) {
+	s, _, _ := newMigrateServer(t)
+	s.migrateBudget = time.Second
+	s.fuseGateFn = func() (fkoverlay.Backend, string) {
+		time.Sleep(2 * time.Second) // a holder cold-start ridden out inside the gate
+		return fkoverlay.BackendNFS, ""
+	}
+
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
+	if !resp.OK {
+		t.Fatalf("migrate failed: %s", resp.Error)
+	}
+	got := outcomes(resp)
+	if got[1] != MigrationDone || got[2] != MigrationDone {
+		t.Fatalf("outcomes = %v, want both done — the gate's wait consumed the conversion budget (deadline computed before fuseGate?)", got)
+	}
+}
+
+// TestHandleMigrateToSymlinkSkipsFuseGate: the mitigation gate guards HOSTING
+// fuse; the symlink retreat must run without consulting it — an old holder is
+// exactly when users need to retreat.
+func TestHandleMigrateToSymlinkSkipsFuseGate(t *testing.T) {
+	s, _, _ := newMigrateServer(t)
+	if resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse")); !resp.OK {
+		t.Fatalf("forward migrate failed: %s", resp.Error)
+	}
+	gateCalls := 0
+	s.fuseGateFn = func() (fkoverlay.Backend, string) {
+		gateCalls++
+		return "", "fuse unavailable: mount holder v0.22.9 predates the NFS kernel-panic mitigations"
+	}
+
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "symlink"))
+	if !resp.OK {
+		t.Fatalf("symlink retreat blocked: %s", resp.Error)
+	}
+	got := outcomes(resp)
+	if got[1] != MigrationDone || got[2] != MigrationDone {
+		t.Fatalf("outcomes = %v, want both done", got)
+	}
+	if kindOf(t, s, 1) != "symlink" || kindOf(t, s, 2) != "symlink" {
+		t.Fatal("rows not flipped back to symlink")
+	}
+	if gateCalls != 0 {
+		t.Fatalf("fuse gate consulted %d time(s) on a symlink migrate, want 0", gateCalls)
+	}
+}
+
+// cancellingSymlinkProv cancels a context at the top of Teardown — inside
+// convertToFuse's strand window — then runs the real symlink teardown.
+type cancellingSymlinkProv struct {
+	*fkoverlay.SymlinkProvider
+	cancel context.CancelFunc
+}
+
+func (p *cancellingSymlinkProv) Teardown(base, dir string) error {
+	p.cancel()
+	return p.SymlinkProvider.Teardown(base, dir)
+}
+
+// TestHandleMigrateShutdownMidConversionCompletesInFlight: convertAccount
+// detaches the conversion from the request ctx (context.WithoutCancel), so a
+// daemon shutdown landing inside the strand window finishes the in-flight
+// account instead of abandoning it half-converted; the migrate loop still
+// stops before the next account.
+func TestHandleMigrateShutdownMidConversionCompletesInFlight(t *testing.T) {
+	s, dirs, fake := newMigrateServer(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	// The shutdown lands mid-window: private files moved, row still symlink.
+	s.m.OverlayFor = func(backend fkoverlay.Backend) (fkoverlay.Provider, error) {
+		if backend.IsFuse() {
+			return fake, nil
+		}
+		return &cancellingSymlinkProv{
+			SymlinkProvider: &fkoverlay.SymlinkProvider{Spec: s.m.OverlaySpec()},
+			cancel:          cancel,
+		}, nil
+	}
+
+	resp := s.handleMigrate(ctx, migrateReq(nil, "fuse"))
+	if !resp.OK {
+		t.Fatalf("migrate failed: %s", resp.Error)
+	}
+	if len(resp.Migrations) != 1 || resp.Migrations[0].ID != 1 || resp.Migrations[0].Outcome != MigrationDone {
+		t.Fatalf("migrations = %+v, want exactly acct-1 done (finished despite the shutdown)", resp.Migrations)
+	}
+	if kindOf(t, s, 1) != "nfs" {
+		t.Fatal("in-flight conversion abandoned inside the strand window (row not flipped)")
+	}
+	if fake.setupCount() != 1 {
+		t.Fatalf("setups = %d, want acct-1's mount only", fake.setupCount())
+	}
+	if kindOf(t, s, 2) != "symlink" {
+		t.Fatal("migrate loop continued past a cancelled ctx")
+	}
+	if _, err := os.Lstat(fkoverlay.FusePrivateRoot(dirs[2])); !os.IsNotExist(err) {
+		t.Fatal("untouched account grew a private root")
 	}
 }
 

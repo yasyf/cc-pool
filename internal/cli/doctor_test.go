@@ -102,6 +102,76 @@ func TestReportHolder(t *testing.T) {
 	}
 }
 
+// TestReportHolderMitigations pins doctor's NFS kernel-panic mitigation check:
+// ✓ at exactly pool.MinHolderVersion, ✗ with the brew-upgrade hint below it,
+// and silent when the holder is unreachable (reportHolder owns that failure).
+func TestReportHolderMitigations(t *testing.T) {
+	if pool.MinHolderVersion != "v0.23.0" {
+		t.Fatalf("pool.MinHolderVersion = %q; the mitigation floor moved — re-derive this matrix", pool.MinHolderVersion)
+	}
+	cases := map[string]struct {
+		facts       holderFacts
+		none        bool
+		wantHealthy bool
+		wantDetail  []string // every fragment must appear in the detail
+	}{
+		"holder at exactly the minimum version passes": {
+			facts:       holderFacts{reachable: true, version: "v0.23.0"},
+			wantHealthy: true,
+		},
+		"newer holder passes": {
+			facts:       holderFacts{reachable: true, version: "v0.25.0"},
+			wantHealthy: true,
+		},
+		"dev holder (locally built, current source) passes": {
+			facts:       holderFacts{reachable: true, version: "dev"},
+			wantHealthy: true,
+		},
+		"pre-mitigation holder fails with observed, required, and the brew hint": {
+			facts:      holderFacts{reachable: true, version: "v0.22.9"},
+			wantDetail: []string{"v0.22.9", "v0.23.0", "brew upgrade --cask fusekit-holder"},
+		},
+		"commit-suffixed pre-mitigation holder still fails": {
+			facts:      holderFacts{reachable: true, version: "v0.22.9 (abc1234)"},
+			wantDetail: []string{"v0.22.9 (abc1234)", "v0.23.0", "brew upgrade --cask fusekit-holder"},
+		},
+		"unreachable holder says nothing": {
+			facts: holderFacts{reachable: false},
+			none:  true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			report, calls := captureReports()
+			reportHolderMitigations(tc.facts, report)
+			if tc.none {
+				if len(*calls) != 0 {
+					t.Fatalf("want no reports, got %+v", *calls)
+				}
+				return
+			}
+			if len(*calls) != 1 {
+				t.Fatalf("got %d reports %+v, want exactly one", len(*calls), *calls)
+			}
+			got := (*calls)[0]
+			if got.label != "holder panic mitigations" {
+				t.Errorf("label = %q, want %q", got.label, "holder panic mitigations")
+			}
+			if got.healthy != tc.wantHealthy {
+				t.Errorf("healthy = %v, want %v (detail %q)", got.healthy, tc.wantHealthy, got.detail)
+			}
+			if tc.wantHealthy && got.detail != "" {
+				t.Errorf("passing check carries detail %q, want none", got.detail)
+			}
+			for _, frag := range tc.wantDetail {
+				if !strings.Contains(got.detail, frag) {
+					t.Errorf("detail %q missing %q", got.detail, frag)
+				}
+			}
+		})
+	}
+}
+
 func TestReportCarcasses(t *testing.T) {
 	accts := []store.Account{
 		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendNFS)},

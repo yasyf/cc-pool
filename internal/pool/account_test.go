@@ -506,6 +506,31 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		}
 	})
 
+	t.Run("an unmitigated holder falls back to symlinks before any mount", func(t *testing.T) {
+		// The gated provider is exactly what OverlayProviderFor hands every real
+		// `ccp add`: a v0.36.0 pool whose recorded default is fuse but whose
+		// cask still serves a pre-mitigation holder must fall back to symlink —
+		// never mount on the nfs_vinvalbuf2 panic vector.
+		stub := &stubOverlay{backend: fkoverlay.BackendNFS}
+		m := setup(t, mitigationGate{Provider: stub, health: func() (string, error) { return "v0.22.1", nil }})
+		pending, err := m.PrepareAdd()
+		if err != nil {
+			t.Fatalf("PrepareAdd: %v", err)
+		}
+		if stub.setups != 0 {
+			t.Fatalf("fuse setups = %d, want 0 (no mount may be attempted on an unmitigated holder)", stub.setups)
+		}
+		if pending.OverlayKind != fkoverlay.BackendSymlink {
+			t.Fatalf("OverlayKind = %q, want symlink", pending.OverlayKind)
+		}
+		if !strings.Contains(pending.FallbackReason, "brew upgrade --cask fusekit-holder") {
+			t.Fatalf("FallbackReason = %q, want the cask-upgrade hint", pending.FallbackReason)
+		}
+		if _, err := os.Readlink(filepath.Join(pending.ConfigDir, "projects")); err != nil {
+			t.Fatalf("symlink overlay not established: %v", err)
+		}
+	})
+
 	t.Run("fuse setup success keeps fuse and carries no reason", func(t *testing.T) {
 		stub := &stubOverlay{backend: fkoverlay.BackendNFS}
 		m := setup(t, stub)

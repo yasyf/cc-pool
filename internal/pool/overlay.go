@@ -2,11 +2,15 @@ package pool
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
+	"strings"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"golang.org/x/mod/semver"
 )
 
 // HolderOwner tags cc-pool's mounts on the shared fusekit-holder so the daemon
@@ -15,6 +19,82 @@ const HolderOwner = "cc-pool"
 
 // cannotHostHint is appended to mountd.ErrCannotHost when the holder cask is absent.
 const cannotHostHint = "run `ccp fuse enable` to install the fusekit-holder cask"
+
+// MinHolderVersion is the oldest fusekit-holder release carrying the NFS
+// kernel-panic mitigations (no namedattr, AppleDouble "._" blocking, attribute
+// stabilization). Hosting fuse mirrors on an older holder can panic macOS
+// (nfs_vinvalbuf2), so fuse is refused until the cask is upgraded.
+const MinHolderVersion = "v0.23.0"
+
+// HolderVersionMitigated reports whether a holder's reported version carries
+// the kernel-panic mitigations (>= MinHolderVersion). The holder reports
+// fusekit's version.String(), which may append a commit ("v0.23.0 (abc1234)");
+// only the first field is compared. "dev", empty, or otherwise unparseable
+// versions pass: a locally-built holder is current-source, therefore mitigated.
+func HolderVersionMitigated(version string) bool {
+	v, _, _ := strings.Cut(strings.TrimSpace(version), " ")
+	if !semver.IsValid(v) {
+		return true
+	}
+	return semver.Compare(v, MinHolderVersion) >= 0
+}
+
+// ErrHolderUnmitigated means the shared mount holder predates MinHolderVersion:
+// hosting fuse mirrors on it can panic macOS (nfs_vinvalbuf2), so every fuse
+// mount entry point refuses it until the cask is upgraded.
+var ErrHolderUnmitigated = errors.New("mount holder predates the NFS kernel-panic mitigations")
+
+// holderHealth reports the shared holder's version via its Health RPC; a var so
+// tests can fake an old, current, or absent holder.
+var holderHealth = func() (string, error) {
+	return mountd.NewClient(mountd.DefaultHolderSocket()).Health()
+}
+
+// mitigationGate wraps the remote fuse provider so every fuse mount entry point
+// (`ccp add`/`ccp init`, migrate's conversion, the daemon's heal loop) refuses
+// to host mirrors on a holder that predates the NFS kernel-panic mitigations —
+// not just handleMigrate's fuseGate. Only Setup is gated: Teardown, Health, and
+// Sync must keep working against any holder.
+type mitigationGate struct {
+	fkoverlay.Provider
+	health func() (string, error)
+}
+
+// Setup refuses before mounting when a serving holder reports an unmitigated
+// version, and re-verifies after mounting — Setup may have just spawned the
+// holder from an old cask binary, and its first Health answer is the earliest
+// the version is observable. A mount that cannot be vouched mitigated is torn
+// down (gracefully; it is seconds old, nothing rides it yet) before anything
+// writes through it.
+func (g mitigationGate) Setup(base, dir string) error {
+	if ver, err := g.health(); err == nil && !HolderVersionMitigated(ver) {
+		return unmitigatedHolderError(ver)
+	}
+	if err := g.Provider.Setup(base, dir); err != nil {
+		return err
+	}
+	var cause error
+	switch ver, err := g.health(); {
+	case err != nil:
+		// The holder answered the mount RPC moments ago; an unanswerable Health
+		// now means it died — the fresh mount cannot be vouched mitigated.
+		cause = fmt.Errorf("verify holder mitigations after mount: %w", err)
+	case HolderVersionMitigated(ver):
+		return nil
+	default:
+		cause = unmitigatedHolderError(ver)
+	}
+	if terr := g.Provider.Teardown(base, dir); terr != nil {
+		// terr rides as text, not %w: the failure class callers match on
+		// (errors.Is) must stay the cause, never the teardown's wire error.
+		return fmt.Errorf("%w (and tearing the unverified fresh mount down failed: %v)", cause, terr)
+	}
+	return cause
+}
+
+func unmitigatedHolderError(ver string) error {
+	return fmt.Errorf("%w: holder %s needs %s or newer; run `brew upgrade --cask fusekit-holder`", ErrHolderUnmitigated, ver, MinHolderVersion)
+}
 
 // overlaySpec builds cc-pool's fusekit/overlay Spec. PassthroughOnly is false
 // because cc-pool serves synthetic content (the merged /.claude.json), forcing
@@ -26,6 +106,7 @@ func overlaySpec() fkoverlay.Spec {
 		Excluded:        overlay.ExcludedEntries,
 		Shared:          overlay.SharedEntries,
 		Skip:            overlay.SkipEntries,
+		SkipPrefixes:    overlay.SkipPrefixes,
 		PassthroughOnly: false,
 		Holder: &fkoverlay.HolderSpec{
 			Socket:         socket,
@@ -53,9 +134,18 @@ func (m *Manager) overlaySpec() fkoverlay.Spec { return overlaySpec() }
 func (m *Manager) OverlaySpec() fkoverlay.Spec { return overlaySpec() }
 
 // OverlayProviderFor returns the fusekit/overlay provider for a stored backend,
-// wired with cc-pool's Spec; a bad backend fails loud.
+// wired with cc-pool's Spec; a bad backend fails loud. Fuse providers come
+// wrapped in the mitigation gate — this is the one choke point every real
+// mount rides through.
 func OverlayProviderFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
-	return fkoverlay.ProviderFor(b, overlaySpec())
+	prov, err := fkoverlay.ProviderFor(b, overlaySpec())
+	if err != nil {
+		return nil, err
+	}
+	if b.IsFuse() {
+		return mitigationGate{Provider: prov, health: holderHealth}, nil
+	}
+	return prov, nil
 }
 
 // holderExe is the cask holder binary CanHostFuse stats; a var so tests can point

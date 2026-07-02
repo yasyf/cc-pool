@@ -598,6 +598,51 @@ func TestHealDefersBreakerUnderLiveSession(t *testing.T) {
 	}
 }
 
+// TestHealUnmitigatedHolderDefersWithoutBreaker pins the heal loop's side of
+// the mitigation gate: a holder predating the NFS kernel-panic mitigations
+// defers the remount indefinitely — no hazard strikes, no symlink retreat —
+// and the row mounts on its own once the cask upgrade lands.
+func TestHealUnmitigatedHolderDefersWithoutBreaker(t *testing.T) {
+	s, dirs, fake := newHealServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	fake.setupErr = fmt.Errorf("%w: holder v0.22.1 needs %s or newer; run `brew upgrade --cask fusekit-holder`",
+		pool.ErrHolderUnmitigated, pool.MinHolderVersion)
+
+	var unmounts int
+	swapForceUnmount(t, func(string) error { unmounts++; return nil })
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+
+	driveRetryTicks(t, s, 1, remountBreakerThreshold+2)
+
+	if got := kindOf(t, s, 1); got != "nfs" {
+		t.Fatalf("row kind = %q, want fuse (an unmitigated holder must never demote the row)", got)
+	}
+	if got := s.rowRetry[1].hazard; got != 0 {
+		t.Fatalf("hazard count = %d, want 0 (the wedged breaker must be unreachable while waiting on the cask upgrade)", got)
+	}
+	if got := fake.teardownCount(); got != 0 {
+		t.Fatalf("teardowns = %d, want 0", got)
+	}
+	if unmounts != 0 {
+		t.Fatalf("force-unmounts = %d, want 0", unmounts)
+	}
+	if !strings.Contains(buf.String(), "brew upgrade --cask fusekit-holder") {
+		t.Fatalf("cask-upgrade hint not surfaced in the log:\n%s", buf.String())
+	}
+
+	// The upgrade lands: the very next tick remounts without operator action.
+	fake.setupErr = nil
+	driveRetryTicks(t, s, 1, 1)
+	if !s.holder.ready(dirs[1]) {
+		t.Fatal("row not remounted after the holder upgrade")
+	}
+	if _, ok := s.rowRetry[1]; ok {
+		t.Fatal("recovered row left a rowRetry entry")
+	}
+}
+
 // TestRemountBreakerHoldsUnderThreshold pins that fewer than threshold
 // consecutive failures keep retrying without escalation.
 func TestRemountBreakerHoldsUnderThreshold(t *testing.T) {

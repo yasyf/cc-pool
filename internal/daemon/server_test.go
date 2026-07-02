@@ -44,7 +44,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 			t.Fatal(err)
 		}
 	}
-	return &Server{
+	s := &Server{
 		m: &pool.Manager{
 			Store: st, OAuth: &fakeOAuth{}, Keychain: newFakeKeychain(), LockDir: t.TempDir(),
 		},
@@ -56,7 +56,14 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
-	}, dirs
+	}
+	// Production serve() Waits on s.wg before Run's deferred Close; tests must
+	// too. handleSelect's preflight goroutine creates the winner's LockDir lock
+	// file — unwaited, it races t.TempDir's RemoveAll ("directory not empty")
+	// and the store Close. Registered after the t.TempDir calls above, so this
+	// cleanup runs before theirs (LIFO), after t.Context() is cancelled.
+	t.Cleanup(func() { s.wg.Wait() })
+	return s, dirs
 }
 
 func TestReservedCountExpiresAfterTTL(t *testing.T) {

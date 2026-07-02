@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -133,7 +134,7 @@ func TestConvertOverlayNoopWhenAlreadyTarget(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{ops: &ops}
 	m, a, dir := newConvertFixture(t, fake)
-	got, err := m.ConvertOverlay(a, fkoverlay.BackendSymlink)
+	got, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendSymlink)
 	if err != nil {
 		t.Fatalf("ConvertOverlay: %v", err)
 	}
@@ -152,7 +153,7 @@ func TestConvertOverlayRejectsWrongKindFake(t *testing.T) {
 	t.Run("target fence", func(t *testing.T) {
 		m, a, dir := newConvertFixture(t, nil)
 		m.OverlayFor = wrongKind
-		_, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
+		_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
 		if !errors.Is(err, ErrConvertUnsupported) {
 			t.Fatalf("ConvertOverlay error = %v, want ErrConvertUnsupported", err)
 		}
@@ -171,7 +172,7 @@ func TestConvertOverlayRejectsWrongKindFake(t *testing.T) {
 		if err := m.Store.UpsertAccount(a); err != nil {
 			t.Fatal(err)
 		}
-		_, err := m.ConvertOverlay(a, fkoverlay.BackendSymlink)
+		_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendSymlink)
 		if !errors.Is(err, ErrConvertUnsupported) {
 			t.Fatalf("ConvertOverlay error = %v, want ErrConvertUnsupported", err)
 		}
@@ -203,7 +204,7 @@ func TestConvertOverlayRetreatWithoutLiveMount(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	back, err := m.ConvertOverlay(a, fkoverlay.BackendSymlink)
+	back, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendSymlink)
 	if err != nil {
 		t.Fatalf("retreat without a live mount: %v", err)
 	}
@@ -227,7 +228,7 @@ func TestConvertToFuseHappyPath(t *testing.T) {
 	m, a, dir := newConvertFixture(t, fake)
 	priv := fkoverlay.FusePrivateRoot(dir)
 
-	got, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
+	got, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
 	if err != nil {
 		t.Fatalf("ConvertOverlay: %v", err)
 	}
@@ -255,7 +256,7 @@ func TestConvertToFuseSetupFailureRollsBack(t *testing.T) {
 	m, a, dir := newConvertFixture(t, fake)
 	priv := fkoverlay.FusePrivateRoot(dir)
 
-	_, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
+	_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
 	if err == nil || !strings.Contains(err.Error(), "rolled back to symlink") {
 		t.Fatalf("error = %v, want rollback report", err)
 	}
@@ -285,7 +286,7 @@ func TestConvertToFuseUnmountFailureAbortsRollback(t *testing.T) {
 	m, a, dir := newConvertFixture(t, fake)
 	priv := fkoverlay.FusePrivateRoot(dir)
 
-	_, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
+	_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
 	if err == nil || !strings.Contains(err.Error(), "mount timed out") || !strings.Contains(err.Error(), "still mounted") {
 		t.Fatalf("error = %v, want both faults reported", err)
 	}
@@ -306,7 +307,7 @@ func TestConvertToFuseIdentityMismatchRollsBack(t *testing.T) {
 	fake := &fakeFuse{ops: &ops, wrongIdentity: true}
 	m, a, dir := newConvertFixture(t, fake)
 
-	_, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
+	_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
 	if err == nil || !strings.Contains(err.Error(), "identity through mount") {
 		t.Fatalf("error = %v, want identity mismatch", err)
 	}
@@ -324,11 +325,11 @@ func TestConvertToSymlink(t *testing.T) {
 	m, a, dir := newConvertFixture(t, fake)
 	priv := fkoverlay.FusePrivateRoot(dir)
 
-	fwd, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
+	fwd, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
 	if err != nil {
 		t.Fatalf("forward convert: %v", err)
 	}
-	back, err := m.ConvertOverlay(fwd, fkoverlay.BackendSymlink)
+	back, err := m.ConvertOverlay(t.Context(), fwd, fkoverlay.BackendSymlink)
 	if err != nil {
 		t.Fatalf("reverse convert: %v", err)
 	}
@@ -353,12 +354,12 @@ func TestConvertToSymlinkAbortsOnFailedUnmount(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{ops: &ops}
 	m, a, _ := newConvertFixture(t, fake)
-	fwd, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
+	fwd, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
 	if err != nil {
 		t.Fatalf("forward convert: %v", err)
 	}
 	fake.teardownErr = errors.New("still mounted")
-	_, err = m.ConvertOverlay(fwd, fkoverlay.BackendSymlink)
+	_, err = m.ConvertOverlay(t.Context(), fwd, fkoverlay.BackendSymlink)
 	if err == nil || !strings.Contains(err.Error(), "still mounted") {
 		t.Fatalf("error = %v, want unmount failure", err)
 	}
@@ -403,7 +404,7 @@ func TestConvertToSymlinkSweepsSharedOrphans(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	back, err := m.ConvertOverlay(a, fkoverlay.BackendSymlink)
+	back, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendSymlink)
 	if err != nil {
 		t.Fatalf("retreat with shared orphans: %v", err)
 	}
@@ -453,7 +454,7 @@ func TestRollbackToSymlinkSweepsSharedOrphans(t *testing.T) {
 	m, a, dir := newConvertFixture(t, fake)
 	base := ClaudeDir()
 
-	_, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
+	_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
 	if err == nil || !strings.Contains(err.Error(), "rolled back to symlink") {
 		t.Fatalf("error = %v, want rollback report", err)
 	}
@@ -523,7 +524,7 @@ func TestConvertRetreatThenLaunchMergePropagatesBase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fwd, err := m.ConvertOverlay(a, fkoverlay.BackendNFS)
+	fwd, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
 	if err != nil {
 		t.Fatalf("forward convert: %v", err)
 	}
@@ -532,7 +533,7 @@ func TestConvertRetreatThenLaunchMergePropagatesBase(t *testing.T) {
 		t.Fatalf("merge against the fuse row: outcome=%q err=%v, want %q", out, err, MergeSkippedOverlay)
 	}
 
-	back, err := m.ConvertOverlay(fwd, fkoverlay.BackendSymlink)
+	back, err := m.ConvertOverlay(t.Context(), fwd, fkoverlay.BackendSymlink)
 	if err != nil {
 		t.Fatalf("retreat: %v", err)
 	}
@@ -681,6 +682,289 @@ func TestSetDefaultOverlayKind(t *testing.T) {
 		}
 	} else if !errors.Is(err, ErrConvertUnsupported) {
 		t.Fatalf("fuse default in pure build = %v, want ErrConvertUnsupported", err)
+	}
+}
+
+// hookedSymlink wraps the real symlink provider, running preTeardown before
+// Teardown; a non-nil hook error replaces the real teardown. It injects faults
+// (or a mid-window cancellation) into the strand window between
+// MovePrivateEntries and SetAccountOverlayKind.
+type hookedSymlink struct {
+	*fkoverlay.SymlinkProvider
+	preTeardown func() error
+}
+
+func (h *hookedSymlink) Teardown(base, dir string) error {
+	if h.preTeardown != nil {
+		if err := h.preTeardown(); err != nil {
+			return err
+		}
+	}
+	return h.SymlinkProvider.Teardown(base, dir)
+}
+
+// TestConvertToFuseCancelledBeforeMoveAbortsCleanly: a spent budget observed
+// before anything moved is a clean abort — no rollback machinery, no provider
+// calls, account untouched.
+func TestConvertToFuseCancelledBeforeMoveAbortsCleanly(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops}
+	m, a, dir := newConvertFixture(t, fake)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := m.ConvertOverlay(ctx, a, fkoverlay.BackendNFS)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("clean pre-move abort took the rollback path: %v", err)
+	}
+	if len(ops) != 0 {
+		t.Fatalf("providers touched on a pre-move abort: ops = %v", ops)
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity disturbed by a pre-move abort: %q", got)
+	}
+	if _, err := os.Readlink(filepath.Join(dir, "projects")); err != nil {
+		t.Fatalf("symlink overlay disturbed: %v", err)
+	}
+	if _, err := os.Lstat(fkoverlay.FusePrivateRoot(dir)); !os.IsNotExist(err) {
+		t.Fatal("a pre-move abort minted a private root")
+	}
+	if storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row changed by a pre-move abort")
+	}
+}
+
+// TestConvertToFuseCancelledMidWindowRollsBackWithoutMounting: a cancellation
+// landing inside the strand window (private files already in priv) must roll
+// back to symlink and must NOT start a mount it has no time to verify.
+func TestConvertToFuseCancelledMidWindowRollsBackWithoutMounting(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops}
+	m, a, dir := newConvertFixture(t, fake)
+	priv := fkoverlay.FusePrivateRoot(dir)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.OverlayFor = func(b fkoverlay.Backend) (fkoverlay.Provider, error) {
+		if b.IsFuse() {
+			return fake, nil
+		}
+		// The daemon shuts down while the symlink teardown runs.
+		return &hookedSymlink{SymlinkProvider: newSymlinkProvider(), preTeardown: func() error { cancel(); return nil }}, nil
+	}
+
+	_, err := m.ConvertOverlay(ctx, a, fkoverlay.BackendNFS)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled as the cause", err)
+	}
+	if !strings.Contains(err.Error(), "rolled back to symlink") {
+		t.Fatalf("error = %v, want rollback report", err)
+	}
+	for _, op := range ops {
+		if strings.HasPrefix(op, "fuse.setup") {
+			t.Fatalf("a spent budget started a mount anyway: ops = %v", ops)
+		}
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored: %q", got)
+	}
+	if _, err := os.Readlink(filepath.Join(dir, "projects")); err != nil {
+		t.Fatalf("symlink overlay not re-asserted: %v", err)
+	}
+	if _, err := os.Lstat(priv); !os.IsNotExist(err) {
+		t.Fatal("private root stranded after the rollback")
+	}
+	if storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row flipped despite the cancelled conversion")
+	}
+}
+
+// TestConvertToFuseTeardownFailureRollsBack pins the strand window's teardown
+// arm: a failed symlink teardown used to return with private files stranded in
+// priv (row still symlink, recovery only via HealStrandedPrivate); it must now
+// roll back in place.
+func TestConvertToFuseTeardownFailureRollsBack(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops}
+	m, a, dir := newConvertFixture(t, fake)
+	priv := fkoverlay.FusePrivateRoot(dir)
+	m.OverlayFor = func(b fkoverlay.Backend) (fkoverlay.Provider, error) {
+		if b.IsFuse() {
+			return fake, nil
+		}
+		return &hookedSymlink{SymlinkProvider: newSymlinkProvider(), preTeardown: func() error { return errors.New("unlink exploded") }}, nil
+	}
+
+	_, err := m.ConvertOverlay(context.Background(), a, fkoverlay.BackendNFS)
+	if err == nil || !strings.Contains(err.Error(), "tear down symlinks") || !strings.Contains(err.Error(), "unlink exploded") {
+		t.Fatalf("error = %v, want the teardown cause", err)
+	}
+	if !strings.Contains(err.Error(), "rolled back to symlink") {
+		t.Fatalf("error = %v, want rollback report — a teardown failure must not strand", err)
+	}
+	for _, op := range ops {
+		if strings.HasPrefix(op, "fuse.setup") {
+			t.Fatalf("mounted despite a failed symlink teardown: ops = %v", ops)
+		}
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored: %q", got)
+	}
+	if has, herr := fkoverlay.HasPrivateEntries(priv, testSpec()); herr != nil || has {
+		t.Fatalf("private files stranded in %s after rollback (has=%v err=%v)", priv, has, herr)
+	}
+	if _, err := os.Readlink(filepath.Join(dir, "projects")); err != nil {
+		t.Fatalf("symlink overlay not re-asserted: %v", err)
+	}
+	if storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row flipped despite the failed conversion")
+	}
+}
+
+// TestConvertToSymlinkIgnoresAndCleansAppleDoubleLitter: "._*" AppleDouble
+// sidecars (pre-mitigation fuse litter) are never linked, moved, or swept into
+// the shared base, and litter in the private root no longer blocks its
+// removal; an unclassified ".foo" and a real shared orphan behave exactly as
+// before.
+func TestConvertToSymlinkIgnoresAndCleansAppleDoubleLitter(t *testing.T) {
+	m, a, dir := newConvertFixture(t, nil)
+	base := ClaudeDir()
+	priv := fkoverlay.FusePrivateRoot(dir)
+
+	// Fuse rest state with litter everywhere a pre-mitigation mount left it.
+	if err := os.MkdirAll(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, ".claude.json"), filepath.Join(priv, ".claude.json")); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		filepath.Join(priv, "._.claude.json"): "sidecar-priv",
+		filepath.Join(dir, "._history.jsonl"): "sidecar-dir",
+		filepath.Join(dir, "history.jsonl"):   "orphan-history", // real shared orphan (no link at this name)
+		filepath.Join(dir, ".foo"):            "unclassified",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.OverlayKind = "nfs"
+	if err := m.Store.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+
+	back, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendSymlink)
+	if err != nil {
+		t.Fatalf("retreat with AppleDouble litter: %v", err)
+	}
+	if back.OverlayKind != "symlink" || storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row not flipped to symlink")
+	}
+	// Litter never reaches the shared base.
+	for _, name := range []string{"._history.jsonl", "._.claude.json"} {
+		if _, err := os.Lstat(filepath.Join(base, name)); !os.IsNotExist(err) {
+			t.Fatalf("AppleDouble litter %q swept into the shared base", name)
+		}
+	}
+	// The '._'-littered private root no longer survives conversion.
+	if _, err := os.Lstat(priv); !os.IsNotExist(err) {
+		t.Fatal("littered private root survived the conversion")
+	}
+	// Litter in the account dir is ignored: still the plain file, never linked.
+	if fi, err := os.Lstat(filepath.Join(dir, "._history.jsonl")); err != nil || fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("dir litter disturbed: fi=%v err=%v, want the untouched plain file", fi, err)
+	}
+	// Real orphans and unclassified dotfiles keep their old behavior.
+	if got := readFileT(t, filepath.Join(base, "history.jsonl")); got != "orphan-history" {
+		t.Fatalf("real orphan not swept into base: %q", got)
+	}
+	if got := readFileT(t, filepath.Join(base, ".foo")); got != "unclassified" {
+		t.Fatalf(".foo (non-matching prefix) no longer sweeps as a shared orphan: %q", got)
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored: %q", got)
+	}
+}
+
+// TestConvertToSymlinkLeavesUnclassifiedPrivateRootEntries: only skip litter
+// is cleared from the private root; anything unclassified (".foo") keeps the
+// dir alive — its contents are data deletion could destroy.
+func TestConvertToSymlinkLeavesUnclassifiedPrivateRootEntries(t *testing.T) {
+	m, a, dir := newConvertFixture(t, nil)
+	priv := fkoverlay.FusePrivateRoot(dir)
+	if err := os.MkdirAll(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, ".claude.json"), filepath.Join(priv, ".claude.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(priv, ".foo"), []byte("keep-me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.OverlayKind = "nfs"
+	if err := m.Store.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendSymlink); err != nil {
+		t.Fatalf("retreat: %v", err)
+	}
+	if got := readFileT(t, filepath.Join(priv, ".foo")); got != "keep-me" {
+		t.Fatalf("unclassified private-root entry destroyed: %q", got)
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored: %q", got)
+	}
+}
+
+// TestRollbackToSymlinkClearsAppleDoubleLitter: a failed mount whose fuse
+// setup littered the backing dir with skip litter still rolls back to a clean
+// symlink account — litter cleared with the private root, never moved into the
+// shared base or the account dir. The .DS_Store is load-bearing: macOS
+// rmdir(2) silently deletes orphaned AppleDouble "._*" entries, so a lone
+// sidecar would vanish with the dir even if the spec-driven clearing in
+// removePrivateRootIfEmpty were deleted; .DS_Store gets no such kernel help,
+// so priv only goes away when the clearing runs. (The SkipPrefixes
+// classification itself is pinned by TestOverlaySpecSkipsAppleDoubleLitter
+// and TestConvertToSymlinkIgnoresAndCleansAppleDoubleLitter.)
+func TestRollbackToSymlinkClearsAppleDoubleLitter(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{
+		ops:      &ops,
+		setupErr: errors.New("mount timed out"),
+		onSetup: func(dir string) {
+			// A pre-mitigation holder wrote an AppleDouble sidecar and Finder's
+			// .DS_Store into the backing dir.
+			priv := fkoverlay.FusePrivateRoot(dir)
+			_ = os.WriteFile(filepath.Join(priv, "._.claude.json"), []byte("sidecar"), 0o600)
+			_ = os.WriteFile(filepath.Join(priv, ".DS_Store"), []byte("finder"), 0o600)
+		},
+	}
+	m, a, dir := newConvertFixture(t, fake)
+	base := ClaudeDir()
+	priv := fkoverlay.FusePrivateRoot(dir)
+
+	_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
+	if err == nil || !strings.Contains(err.Error(), "rolled back to symlink") {
+		t.Fatalf("error = %v, want rollback report", err)
+	}
+	if _, err := os.Lstat(priv); !os.IsNotExist(err) {
+		t.Fatal("littered private root survived the rollback")
+	}
+	for _, name := range []string{"._.claude.json", ".DS_Store"} {
+		if _, err := os.Lstat(filepath.Join(base, name)); !os.IsNotExist(err) {
+			t.Fatalf("skip litter %q swept into the shared base during rollback", name)
+		}
+		if _, err := os.Lstat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("skip litter %q moved back into the account dir during rollback", name)
+		}
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored: %q", got)
+	}
+	if storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row flipped despite failed mount")
 	}
 }
 

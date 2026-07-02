@@ -42,8 +42,11 @@ var ErrConvertUnsupported = errors.New("overlay backend unavailable")
 
 // ConvertOverlay switches an account's overlay provider, persisting the row last so
 // an interrupted run re-converges. MUST run inside the daemon, which alone gates
-// against live sessions; a failed fuse mount rolls back to symlink.
-func (m *Manager) ConvertOverlay(a store.Account, to fkoverlay.Backend) (store.Account, error) {
+// against live sessions; a failed fuse mount rolls back to symlink. ctx bounds the
+// fuse-side conversion: callers detach it from request cancellation
+// (context.WithoutCancel) so a daemon shutdown mid-conversion finishes or rolls
+// back instead of abandoning a half-converted account.
+func (m *Manager) ConvertOverlay(ctx context.Context, a store.Account, to fkoverlay.Backend) (store.Account, error) {
 	from, err := fkoverlay.Parse(a.OverlayKind)
 	if err != nil {
 		return a, fmt.Errorf("convert acct-%02d: parse stored backend: %w", a.ID, err)
@@ -66,12 +69,12 @@ func (m *Manager) ConvertOverlay(a store.Account, to fkoverlay.Backend) (store.A
 		return a, fmt.Errorf("convert acct-%02d: target %q: %w", a.ID, to, ErrConvertUnsupported)
 	}
 	if to.IsFuse() {
-		return m.convertToFuse(a, fromProv, toProv)
+		return m.convertToFuse(ctx, a, fromProv, toProv)
 	}
 	return m.convertToSymlink(a, fromProv, toProv)
 }
 
-func (m *Manager) convertToFuse(a store.Account, symProv, fuseProv fkoverlay.Provider) (store.Account, error) {
+func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, fuseProv fkoverlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
 	if overlay.Mounted(dir) {
@@ -83,13 +86,24 @@ func (m *Manager) convertToFuse(a store.Account, symProv, fuseProv fkoverlay.Pro
 	if preErr != nil && !errors.Is(preErr, ErrNoIdentity) {
 		return a, fmt.Errorf("convert acct-%02d: read identity before conversion: %w", a.ID, preErr)
 	}
+	// Nothing moved yet: a spent budget aborts cleanly, no rollback needed.
+	if err := ctx.Err(); err != nil {
+		return a, fmt.Errorf("convert acct-%02d: %w", a.ID, err)
+	}
 
+	// STRAND WINDOW: from here until SetAccountOverlayKind the private files
+	// live in priv while the row still says symlink; every error return below
+	// must go through rollbackToSymlink, or the account is stranded until
+	// HealStrandedPrivate — the recovery of last resort — finds it.
 	if err := fkoverlay.MovePrivateEntries(dir, priv, m.overlaySpec()); err != nil {
-		return a, fmt.Errorf("convert acct-%02d: move private files: %w", a.ID, err)
+		return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("move private files: %w", err))
 	}
 	if err := symProv.Teardown(base, dir); err != nil {
-		// Links may be half-removed, but private files are safe in the backing dir, so a re-run converges.
-		return a, fmt.Errorf("convert acct-%02d: tear down symlinks: %w", a.ID, err)
+		return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("tear down symlinks: %w", err))
+	}
+	// A spent budget must not start a mount it has no time to verify.
+	if err := ctx.Err(); err != nil {
+		return a, m.rollbackToSymlink(a, symProv, fuseProv, err)
 	}
 	if err := fuseProv.Setup(base, dir); err != nil {
 		return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("mount: %w", err))
@@ -136,7 +150,7 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay
 	if err := symProv.Setup(base, dir); err != nil {
 		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
 	}
-	removePrivateRootIfEmpty(priv)
+	removePrivateRootIfEmpty(priv, spec)
 	return fmt.Errorf("convert acct-%02d: %w (rolled back to symlink)", a.ID, cause)
 }
 
@@ -170,14 +184,24 @@ func (m *Manager) convertToSymlink(a store.Account, fuseProv, symProv fkoverlay.
 		return a, fmt.Errorf("convert acct-%02d: persist row: %w", a.ID, err)
 	}
 	a.OverlayKind = string(fkoverlay.BackendSymlink)
-	removePrivateRootIfEmpty(priv)
+	removePrivateRootIfEmpty(priv, spec)
 	return a, nil
 }
 
-// removePrivateRootIfEmpty removes an emptied fuse private backing dir; a non-empty
-// dir is left in place — its contents are unclassified data deleting could destroy.
-func removePrivateRootIfEmpty(priv string) {
-	_ = os.Remove(filepath.Join(priv, ".DS_Store"))
+// removePrivateRootIfEmpty removes an emptied fuse private backing dir, first
+// clearing entries the spec classifies as skip litter (.DS_Store, AppleDouble
+// "._*" sidecars from pre-mitigation fuse mounts). A dir holding anything else
+// is left in place — its contents are unclassified data deleting could destroy.
+func removePrivateRootIfEmpty(priv string, spec fkoverlay.Spec) {
+	entries, err := os.ReadDir(priv)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if spec.Skipped(e.Name()) {
+			_ = os.Remove(filepath.Join(priv, e.Name()))
+		}
+	}
 	_ = os.Remove(priv)
 }
 
@@ -215,7 +239,7 @@ func (m *Manager) HealStrandedPrivate(a store.Account) (bool, error) {
 	); err != nil {
 		return false, fmt.Errorf("heal acct-%02d: %w", a.ID, err)
 	}
-	removePrivateRootIfEmpty(priv)
+	removePrivateRootIfEmpty(priv, spec)
 	return true, nil
 }
 

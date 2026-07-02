@@ -8,12 +8,19 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // defaultMigrateBudget keeps a migrate response inside handle()'s extended
 // 140s conn deadline and the client's 150s timeout.
 const defaultMigrateBudget = 120 * time.Second
+
+// convertTimeout bounds one account's conversion, detached from the request
+// ctx (context.WithoutCancel): mountd's per-op deadlines (25s mount, 17s
+// unmount) already bound each holder RPC, so 60s covers a conversion plus a
+// worst-case rollback while never letting one account hang the migrate loop.
+const convertTimeout = 60 * time.Second
 
 // handleMigrate converts accounts between overlay providers; only the daemon
 // can gate conversions against its own select reservations.
@@ -50,6 +57,9 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 		}
 	}
 
+	// The budget clock starts here, AFTER fuseGate: the gate's awaitHolderHealth
+	// already absorbed holder cold-start, so the first account's mount doesn't
+	// pay it out of its conversion budget.
 	budget := s.migrateBudget
 	if budget <= 0 {
 		budget = defaultMigrateBudget
@@ -89,6 +99,8 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 // fuseGate reports why fuse mirrors cannot be hosted, or "" when they can.
 // The probe runs in the mount holder: the macOS volume-access grant is
 // per-process, so a missing grant fails here before any account is disturbed.
+// A holder older than pool.MinHolderVersion is refused — it predates the NFS
+// kernel-panic mitigations, and hosting mirrors on it can panic macOS.
 func (s *Server) fuseGate(ctx context.Context) (fkoverlay.Backend, string) {
 	if s.fuseGateFn != nil {
 		return s.fuseGateFn()
@@ -100,7 +112,44 @@ func (s *Server) fuseGate(ctx context.Context) (fkoverlay.Backend, string) {
 	if !backend.IsFuse() {
 		return "", fmt.Sprintf("fuse unavailable: %s — fix this, then re-run `ccp migrate`", reason)
 	}
+	// Fail safe: a holder whose version cannot be observed must not be assumed
+	// to carry the kernel-panic mitigations, so a Health failure refuses fuse.
+	// The bounded wait doubles as the migrate warm-up: Select may have just
+	// spawned the holder, and riding out its socket bind here keeps cold-start
+	// off the first account's conversion budget (handleMigrate computes the
+	// budget deadline after this gate).
+	ver, err := s.awaitHolderHealth(ctx)
+	if err != nil {
+		return "", fmt.Sprintf("fuse unavailable: mount holder health probe failed: %v — fix this, then re-run `ccp migrate`", err)
+	}
+	if !pool.HolderVersionMitigated(ver) {
+		return "", fmt.Sprintf("fuse unavailable: mount holder %s predates the NFS kernel-panic mitigations (need %s or newer); run `brew upgrade --cask fusekit-holder`, then re-run `ccp migrate`", ver, pool.MinHolderVersion)
+	}
 	return backend, ""
+}
+
+// awaitHolderHealth waits for the shared mount holder to answer Health,
+// returning its reported version. Select normally leaves the holder serving
+// (EnsureRunning + probe), so the first try answers; the retry loop, bounded
+// by the holder's own spawn allowance, rides out a freshly spawned holder
+// still binding its socket. The last Health error is returned on timeout or
+// cancellation so the caller's refusal names the real fault.
+func (s *Server) awaitHolderHealth(ctx context.Context) (string, error) {
+	deadline := time.Now().Add(mountd.DefaultSpawnTimeout)
+	for {
+		ver, err := s.holderClient().Health()
+		if err == nil {
+			return ver, nil
+		}
+		if time.Now().After(deadline) {
+			return "", err
+		}
+		select {
+		case <-ctx.Done():
+			return "", err
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 // convertAccount runs one gated conversion. force skips only the live-session
@@ -148,7 +197,13 @@ func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverl
 		}
 	}
 
-	if _, err := s.m.ConvertOverlay(a, to); err != nil {
+	// Detached from the request ctx: a daemon shutdown mid-conversion must not
+	// abandon a half-converted account inside the strand window (private files
+	// moved, row still symlink); the conversion finishes or rolls back under
+	// its own bounded timeout instead.
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), convertTimeout)
+	defer cancel()
+	if _, err := s.m.ConvertOverlay(cctx, a, to); err != nil {
 		res.Outcome = MigrationFailed
 		res.Detail = err.Error()
 		return res
