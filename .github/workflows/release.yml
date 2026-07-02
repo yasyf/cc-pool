@@ -8,33 +8,17 @@ permissions:
   contents: write
 
 jobs:
-  verify-on-main:
-    # Only commits that live on main may be released. A vX.Y.Z tag is built and
-    # published from its own commit, so if that commit isn't reachable from main
-    # (e.g. a `git push` of main lost a race and the tag went out anyway, or the
-    # tag was cut from a side branch) the release would not reflect main's
-    # history. Fail fast — before any macOS runner spins up — and make the rest
-    # of the pipeline depend on this.
+  verify-tag-on-main:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0 # full history so merge-base can reach the common ancestor
-      - name: Require the tagged commit to be on main
-        run: |
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
-            echo "::error::tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main — only commits on main can be released. Push the commit to main first, then re-tag."
-            exit 1
-          fi
-          echo "ok: ${GITHUB_SHA} is contained in main"
+          fetch-depth: 0
+      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@v1
 
-  build:
+  release:
+    needs: verify-tag-on-main
     runs-on: macos-15
-    needs: verify-on-main
-    outputs:
-      pure_sha256: ${{ steps.shas.outputs.pure }}
-      app_sha256: ${{ steps.shas.outputs.app }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -42,59 +26,39 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          go-version-file: go.mod
           cache: true
 
       - name: Import Developer ID certificate
-        env:
-          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-        run: |
-          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
-          KP="$(openssl rand -base64 24)"
-          security create-keychain -p "$KP" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KP" "$KEYCHAIN"
-          echo -n "$MACOS_SIGN_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_SIGN_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KP" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/[\" ]//g')
-          rm -f "$RUNNER_TEMP/cert.p12"
-          echo "MACOS_SIGN_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/{print $2; exit}')" >> "$GITHUB_ENV"
-          echo -n "$MACOS_NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
-          echo "MACOS_NOTARY_KEY_FILE=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
-          echo "MACOS_NOTARY_KEY_ID=$MACOS_NOTARY_KEY_ID" >> "$GITHUB_ENV"
-          echo "MACOS_NOTARY_ISSUER=$MACOS_NOTARY_ISSUER_ID" >> "$GITHUB_ENV"
+        uses: yasyf/homebrew-tap/.github/actions/import-developer-id@v1
+        with:
+          p12: ${{ secrets.MACOS_SIGN_P12 }}
+          p12-password: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          notary-key: ${{ secrets.MACOS_NOTARY_KEY }}
+          notary-key-id: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          notary-issuer-id: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
 
       - name: Build universal binary (pure Go, arm64 + amd64 via lipo)
         run: |
           VERSION="${GITHUB_REF_NAME}"
           COMMIT="$(git rev-parse --short HEAD)"
           LDFLAGS="-s -w -X github.com/yasyf/fusekit/version.Version=${VERSION} -X github.com/yasyf/fusekit/version.Commit=${COMMIT}"
-          mkdir -p dist/pure dist/arm64
+          mkdir -p dist/pure
 
           # Pure Go (symlink overlay; the default install).
           CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/pure-arm64 ./cmd/cc-pool
           CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/pure-amd64 ./cmd/cc-pool
           lipo -create -output dist/pure/cc-pool dist/pure-arm64 dist/pure-amd64
 
-          # Developer ID sign (hardened runtime) post-lipo, then smoke-test the native
-          # slice. macOS 15/26 SIGKILL ad-hoc/Team-less signatures, so the old
-          # `codesign -s -` is replaced.
-          codesign --force --options runtime --timestamp -s "$MACOS_SIGN_IDENTITY" dist/pure/cc-pool
-          codesign --verify --strict dist/pure/cc-pool
+          # Developer ID sign (hardened runtime) + notarize the bare Mach-O
+          # (recorded against its cdhash — a bare binary can't be stapled) via the
+          # shared script import-developer-id exported. macOS 15/26 SIGKILL
+          # ad-hoc/Team-less signatures, so unsigned is not an option.
+          bash "$MACOS_CODESIGN_SCRIPT" dist/pure/cc-pool darwin_universal
           dist/pure/cc-pool --version | grep -q "${VERSION}"
-          # Notarize the universal binary (bare Mach-O — recorded against cdhash, not stapled).
-          z="$(mktemp -d)/cc-pool.zip"; ditto -c -k dist/pure/cc-pool "$z"
-          xcrun notarytool submit "$z" --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" --wait --timeout 20m
 
-          # Every tarball contains a binary named exactly `cc-pool`.
-          cp dist/pure-arm64 dist/arm64/cc-pool
+          # The tarball contains a binary named exactly `cc-pool`.
           tar -czf "dist/cc-pool-${VERSION}-darwin-universal.tar.gz" -C dist/pure cc-pool
-          tar -czf "dist/cc-pool-${VERSION}-darwin-arm64.tar.gz" -C dist/arm64 cc-pool
 
       # The widget must link against the macOS 26 SDK. A binary built against an
       # older SDK (the macos-15 runner defaults to Xcode 16.4 → macosx15.5)
@@ -110,17 +74,14 @@ jobs:
           brew install xcodegen
           cd widget
           xcodegen generate
-          # The Developer ID team is embedded in the signing identity
-          # ("Developer ID Application: … (TEAMID)"); derive it instead of
-          # hard-coding so a cert/team rotation can't silently drift.
-          TEAM_ID="$(printf '%s' "$MACOS_SIGN_IDENTITY" | sed -n 's/.*(\([A-Z0-9]*\))$/\1/p')"
-          test -n "$TEAM_ID"
           # chronod caches widget metadata (supported size families) keyed by
           # bundle version — stamp a real, monotonic version per release or the
           # gallery keeps a stale descriptor and never gains new widget sizes.
           # Developer ID + hardened runtime so a quarantined cask install launches
           # without Gatekeeper blocking it; xcodebuild signs inside-out (appex,
           # then app), applying each target's entitlements from project.yml.
+          # TEAM_ID comes from import-developer-id's env export (derived from the
+          # signing identity, never hardcoded).
           # CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO: a plain `xcodebuild build`
           # (unlike archive + -exportArchive) injects get-task-allow=YES even in a
           # Release build, which notarization rejects on every executable. Disabling
@@ -148,48 +109,33 @@ jobs:
           # stale-gallery bug. The appex is the bundle chronod inspects.
           test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" != 1
           test "$(plutil -extract CFBundleVersion raw "$APP/Contents/PlugIns/CCPoolStatusWidget.appex/Contents/Info.plist")" != 1
-          # Notarize the whole bundle, then staple the ticket so a quarantined
-          # install validates offline (an app can be stapled; a bare binary can't).
-          # notarytool submit --wait exits 0 even when the result is Invalid, so
-          # capture the JSON, fail loud on any non-Accepted status, and print the
-          # per-issue log — the only place the rejection reason appears.
-          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/CCPoolStatus-notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/CCPoolStatus-notarize.zip" \
-            --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" \
-            --wait --timeout 20m --output-format json > "$RUNNER_TEMP/notary-submit.json"
-          cat "$RUNNER_TEMP/notary-submit.json"
-          SUBMIT_ID="$(plutil -extract id raw -o - "$RUNNER_TEMP/notary-submit.json")"
-          if [ "$(plutil -extract status raw -o - "$RUNNER_TEMP/notary-submit.json")" != "Accepted" ]; then
-            xcrun notarytool log "$SUBMIT_ID" \
-              --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" || true
-            echo "::error::notarization not Accepted for CCPoolStatus.app (submission $SUBMIT_ID)"; exit 1
-          fi
-          xcrun stapler staple "$APP"
-          xcrun stapler validate "$APP"
-          # ditto -c -k preserves the bundle metadata a plain zip would drop;
-          # zip the STAPLED app so the cask payload validates offline.
-          ditto -c -k --keepParent "$APP" "../dist/cc-pool-status-${GITHUB_REF_NAME}-darwin.zip"
+
+      - name: Notarize, staple, zip CCPoolStatus.app
+        id: app
+        uses: yasyf/homebrew-tap/.github/actions/sign-notarize-app@v1
+        with:
+          app: widget/build/Build/Products/Release/CCPoolStatus.app
+          name: cc-pool-status
+          # xcodebuild already signed inside-out with per-target entitlements
+          # (the appex sandbox + ~/.cc-pool read exception); re-signing here
+          # would flatten them and brick the appex.
+          sign: "false"
+          # The single release step below attaches every asset and generates
+          # notes exactly once.
+          attach-to-release: "false"
 
       - name: Checksum the release assets
+        id: shas
+        env:
+          APP_SHA: ${{ steps.app.outputs.sha256 }}
         run: |
           cd dist
           shasum -a 256 -- *.tar.gz *.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
-
-      - name: Export checksums for the formula and cask bumps
-        id: shas
-        run: |
-          cd dist
-          PURE="$(grep -E 'darwin-universal\.tar\.gz$' SHA256SUMS.txt | awk '{print $1}')"
-          APP="$(grep -E 'cc-pool-status-.*-darwin\.zip$' SHA256SUMS.txt | awk '{print $1}')"
-          test -n "$PURE" && test -n "$APP"
-          echo "pure=${PURE}" >> "$GITHUB_OUTPUT"
-          echo "app=${APP}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: tarballs
-          path: dist/*.tar.gz
+          PURE_SHA="$(grep -E 'darwin-universal\.tar\.gz$' SHA256SUMS.txt | awk '{print $1}')"
+          test -n "$PURE_SHA" && test -n "$APP_SHA"
+          echo "pure=${PURE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "app=${APP_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -201,178 +147,31 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
 
-  bump-formula:
-    runs-on: ubuntu-latest
-    needs: build
-    # Prerelease tags (v1.2.3-rc.1) publish assets but never touch the tap.
-    if: ${{ !contains(github.ref_name, '-') }}
-    steps:
+      # Prerelease tags (v1.2.3-rc.1) publish assets but never touch the tap.
       # The formula and cask live in the shared external tap yasyf/homebrew-tap,
-      # not in this repo — so `brew install yasyf/tap/cc-pool` works without a
-      # bespoke tap URL. Release assets still come from THIS repo's GitHub
-      # Releases (the url lines below point at github.com/yasyf/cc-pool/...).
-      # We render the files into a local staging dir and hand it to the shared
-      # publish composite action, which checks out the tap, copies the staging
-      # contents in, and commits/pushes. HOMEBREW_TAP_TOKEN must be a PAT (or
-      # fine-grained token) with push access to yasyf/homebrew-tap; the default
-      # GITHUB_TOKEN cannot push cross-repo.
-      - name: Write the bumped Formula and Cask into the staging dir
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          PURE_SHA="${{ needs.build.outputs.pure_sha256 }}"
-          APP_SHA="${{ needs.build.outputs.app_sha256 }}"
-          test -n "$PURE_SHA" && test -n "$APP_SHA"
+      # so `brew install yasyf/tap/cc-pool` works without a bespoke tap URL;
+      # release assets still come from THIS repo's GitHub Releases.
+      - name: Render the formula
+        if: ${{ !contains(github.ref_name, '-') }}
+        uses: yasyf/homebrew-tap/.github/actions/render-formula@v1
+        with:
+          template: .github/formula/cc-pool.rb.tmpl
+          output: Formula/cc-pool.rb
+          substitutions: |
+            __SHA_PURE__=${{ steps.shas.outputs.pure }}
 
-          mkdir -p tap-staging/Formula tap-staging/Casks
+      - name: Render the cask
+        if: ${{ !contains(github.ref_name, '-') }}
+        uses: yasyf/homebrew-tap/.github/actions/render-formula@v1
+        with:
+          template: .github/cask/cc-pool-status.rb.tmpl
+          output: Casks/cc-pool-status.rb
+          substitutions: |
+            __SHA_APP__=${{ steps.shas.outputs.app }}
 
-          # Formula: prebuilt universal binary from THIS repo's GitHub Releases,
-          # with a `service` block for `brew services` (the reason cc-pool stays
-          # a formula rather than a cask). The download urls carry the /vX.Y.Z/
-          # path segment brew reads as the version; the heredoc interpolates
-          # ${VERSION} / ${*_SHA} from the release just built above. Keep this in
-          # sync with the install logic the project documents — only the publish
-          # LOCATION moved to the tap.
-          cat > tap-staging/Formula/cc-pool.rb <<RUBY
-          # Homebrew formula for cc-pool. Installs the prebuilt universal binary from
-          # GitHub Releases — no Go toolchain needed. \`brew install --HEAD\` builds from
-          # source instead.
-          #
-          #   brew install yasyf/tap/cc-pool
-          #
-          # One prebuilt pure-Go universal binary (arm64 + amd64) ships per release.
-          #
-          # This file is GENERATED by cc-pool's release.yml bump-formula job and
-          # pushed here on every tagged release — do not hand-edit; change the
-          # template in cc-pool's .github/workflows/release.yml instead.
-          class CcPool < Formula
-            desc "Predictive multi-account load-balancing for Claude Code"
-            homepage "https://github.com/yasyf/cc-pool"
-            url "https://github.com/yasyf/cc-pool/releases/download/v${VERSION}/cc-pool-v${VERSION}-darwin-universal.tar.gz"
-            sha256 "${PURE_SHA}" # pure
-            license "PolyForm-Noncommercial-1.0.0"
-
-            livecheck do
-              url :stable
-              strategy :github_latest
-            end
-
-            head do
-              url "https://github.com/yasyf/cc-pool.git", branch: "main"
-              depends_on "go" => :build
-            end
-
-            depends_on :macos
-
-            def install
-              if build.head?
-                install_from_source
-              else
-                bin.install "cc-pool"
-              end
-              bin.install_symlink "cc-pool" => "ccp"
-            end
-
-            # HEAD builds compile pure Go from source.
-            def install_from_source
-              ldflags = %W[
-                -s -w
-                -X github.com/yasyf/fusekit/version.Version=#{version}
-              ]
-              args = std_go_args(ldflags: ldflags.join(" "), output: bin/"cc-pool")
-              ENV["CGO_ENABLED"] = "0"
-              system "go", "build", *args, "./cmd/cc-pool"
-            end
-
-            # Run the daemon as a USER LaunchAgent (no sudo): it needs the user's login
-            # Keychain, which a root daemon cannot read. \`brew services start cc-pool\`
-            # installs ~/Library/LaunchAgents/homebrew.mxcl.cc-pool.plist.
-            service do
-              run [opt_bin/"cc-pool", "daemon"]
-              keep_alive true
-              run_at_load true
-              environment_variables PATH: std_service_path_env
-              log_path "#{Dir.home}/.cc-pool/daemon.log"
-              error_log_path "#{Dir.home}/.cc-pool/daemon.log"
-            end
-
-            def caveats
-              <<~EOS
-                Get started:
-                  ccp             # walks you through pooling your subscriptions
-                  ccp run         # launch claude on the emptiest account
-
-                For the live-mirror overlay (fuse-t):
-                  ccp fuse enable
-
-                Plain \`claude\` on ~/.claude keeps working untouched.
-
-                Before \`brew uninstall\`, run \`ccp service uninstall\` to stop the daemon
-                and mount holder and unmount pool accounts.
-              EOS
-            end
-
-            test do
-              assert_match version.to_s, shell_output("#{bin}/cc-pool --version")
-              assert_match "emptiest account", shell_output("#{bin}/ccp --help")
-            end
-          end
-          RUBY
-
-          # Cask: the Notification Center widget app. cc-pool remains a formula,
-          # so the dependency stays `depends_on formula: "cc-pool"`. The url
-          # interpolates #{version}, so only the version line + the `# app` sha
-          # change per release.
-          cat > tap-staging/Casks/cc-pool-status.rb <<RUBY
-          # Homebrew cask for the cc-pool Notification Center widget (CCPoolStatus.app).
-          #
-          # The app is Developer ID signed, notarized, and stapled, so a normal
-          # quarantined install works. Install with \`ccp widget\`, or by hand:
-          #
-          #   brew install --cask yasyf/tap/cc-pool-status
-          #
-          # This file is GENERATED by cc-pool's release.yml bump-formula job and
-          # pushed here on every tagged release — do not hand-edit; change the
-          # template in cc-pool's .github/workflows/release.yml instead.
-          cask "cc-pool-status" do
-            version "${VERSION}"
-            sha256 "${APP_SHA}" # app
-
-            url "https://github.com/yasyf/cc-pool/releases/download/v#{version}/cc-pool-status-v#{version}-darwin.zip"
-            name "cc-pool Status"
-            desc "Notification Center widget showing cc-pool account status"
-            homepage "https://github.com/yasyf/cc-pool"
-
-            depends_on macos: :sonoma # parsed with a ">=" comparator: sonoma or newer
-            depends_on formula: "cc-pool"
-
-            app "CCPoolStatus.app"
-
-            uninstall quit: "com.yasyf.cc-pool.status"
-
-            zap trash: [
-              "~/Library/Containers/com.yasyf.cc-pool.status.widget",
-            ]
-
-            caveats <<~EOS
-              Launch the app once so macOS discovers the widget:
-                open -ga CCPoolStatus
-              Then: Notification Center (click the menu-bar clock) → Edit Widgets → "cc-pool".
-            EOS
-          end
-          RUBY
-
-          # Fail loud if the interpolation produced something unexpected; allow
-          # idempotent re-runs (re-tagging the same version is a no-op push).
-          grep -q "releases/download/v${VERSION}/" tap-staging/Formula/cc-pool.rb
-          grep -q "${PURE_SHA}\" # pure" tap-staging/Formula/cc-pool.rb
-          grep -q "version \"${VERSION}\"" tap-staging/Casks/cc-pool-status.rb
-          grep -q "${APP_SHA}\" # app" tap-staging/Casks/cc-pool-status.rb
-
-      # The shared composite action checks out yasyf/homebrew-tap, merges the
-      # staging dir's contents into the tap root, and commits/pushes (it no-ops
-      # when nothing changed — re-tagging the same version is idempotent).
-      - name: Publish the bumped files to the tap
-        uses: yasyf/homebrew-tap/.github/actions/publish@main
+      - name: Publish the formula and cask to the tap
+        if: ${{ !contains(github.ref_name, '-') }}
+        uses: yasyf/homebrew-tap/.github/actions/publish@v1
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging
