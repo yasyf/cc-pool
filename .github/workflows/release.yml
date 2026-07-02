@@ -11,7 +11,7 @@ jobs:
   verify-tag-on-main:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@v1
@@ -20,7 +20,7 @@ jobs:
     needs: verify-tag-on-main
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # full history — the widget's CURRENT_PROJECT_VERSION is the commit count
 
