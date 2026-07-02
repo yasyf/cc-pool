@@ -250,6 +250,84 @@ func TestConvertToFuseHappyPath(t *testing.T) {
 	}
 }
 
+// TestConvertToFuseMovesMcpNeedsAuthCacheToPrivate pins the anti-silent-data-loss
+// arm of the mcp-needs-auth-cache.json private classification. Unclassified, the
+// name defaulted to shared, and claude's atomic rewrite (temp+rename) turned the
+// overlay symlink into a real per-account file; on symlink→fuse conversion
+// MovePrivateEntries relocates only private entries, so that real file was
+// neither moved nor merged — it got shadowed under the mount and the account
+// silently reverted to ~/.claude's shared copy. Classified private, the file
+// must land in the private backing root byte-identical and leave the account
+// dir (moved, not copied).
+func TestConvertToFuseMovesMcpNeedsAuthCacheToPrivate(t *testing.T) {
+	const authCacheJSON = `{"duckbill":{"timestamp":123}}`
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops}
+	m, a, dir := newConvertFixture(t, fake)
+	priv := fkoverlay.FusePrivateRoot(dir)
+	if err := os.WriteFile(filepath.Join(dir, "mcp-needs-auth-cache.json"), []byte(authCacheJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
+	if err != nil {
+		t.Fatalf("ConvertOverlay: %v", err)
+	}
+	if got.OverlayKind != "nfs" || storedKind(t, m, a.ID) != "nfs" {
+		t.Fatalf("row not flipped: returned=%s stored=%s", got.OverlayKind, storedKind(t, m, a.ID))
+	}
+	if gotCache := readFileT(t, filepath.Join(priv, "mcp-needs-auth-cache.json")); gotCache != authCacheJSON {
+		t.Fatalf("mcp-needs-auth-cache.json in private root = %q, want %q", gotCache, authCacheJSON)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "mcp-needs-auth-cache.json")); !os.IsNotExist(err) {
+		t.Fatal("mcp-needs-auth-cache.json left in the account dir: copied (or shadowed under the mount), not moved")
+	}
+}
+
+// TestConvertToFuseRemovesStaleMcpNeedsAuthCacheSymlink pins the not-yet-drifted
+// common case: an account overlaid before mcp-needs-auth-cache.json was
+// classified private holds a shared symlink at the name (the base owns the real
+// file). The symlink→fuse conversion must succeed, remove the stale link
+// outright — never leave it to dangle or shadow under the mountpoint — and
+// leave the shared base copy in place, never pulled into the account's private
+// root.
+func TestConvertToFuseRemovesStaleMcpNeedsAuthCacheSymlink(t *testing.T) {
+	const baseCacheJSON = `{"shared-server":{"timestamp":456}}`
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops}
+	m, a, dir := newConvertFixture(t, fake)
+	base := ClaudeDir()
+	priv := fkoverlay.FusePrivateRoot(dir)
+	if err := os.WriteFile(filepath.Join(base, "mcp-needs-auth-cache.json"), []byte(baseCacheJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-classification accounts linked the name like any shared entry; today's
+	// Sync refuses to lay this link, so seed the legacy state by hand.
+	if err := os.Symlink(filepath.Join(base, "mcp-needs-auth-cache.json"), filepath.Join(dir, "mcp-needs-auth-cache.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
+	if err != nil {
+		t.Fatalf("ConvertOverlay with a stale shared link: %v", err)
+	}
+	if got.OverlayKind != "nfs" || storedKind(t, m, a.ID) != "nfs" {
+		t.Fatalf("row not flipped: returned=%s stored=%s", got.OverlayKind, storedKind(t, m, a.ID))
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "mcp-needs-auth-cache.json")); !os.IsNotExist(err) {
+		t.Fatal("stale shared link survived the conversion")
+	}
+	if _, err := os.Lstat(filepath.Join(priv, "mcp-needs-auth-cache.json")); !os.IsNotExist(err) {
+		t.Fatal("the base's shared copy was pulled into the private root")
+	}
+	if gotBase := readFileT(t, filepath.Join(base, "mcp-needs-auth-cache.json")); gotBase != baseCacheJSON {
+		t.Fatalf("shared base copy disturbed: %q", gotBase)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "projects")); !os.IsNotExist(err) {
+		t.Fatal("shared symlink survived conversion")
+	}
+}
+
 func TestConvertToFuseSetupFailureRollsBack(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{ops: &ops, setupErr: errors.New("grant Network Volumes access")}

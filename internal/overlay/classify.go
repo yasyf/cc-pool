@@ -56,15 +56,18 @@ var SkipPrefixes = []string{"._"}
 //   - .claude.json and its atomic-write temp siblings (.claude.json.tmp.XXXX);
 //   - .credentials.json and siblings: sharing would let a pool account adopt and
 //     rotate plain claude's login, which the pool must never do;
-//   - .last-update-result.json and remote-settings.json (and temp siblings):
-//     claude rewrites these atomically, clobbering the overlay symlink Sync would
-//     otherwise refuse to relink.
+//   - .last-update-result.json, remote-settings.json, and mcp-needs-auth-cache.json
+//     (and temp siblings): claude rewrites these atomically, clobbering the overlay
+//     symlink Sync would otherwise refuse to relink. mcp-needs-auth-cache.json is
+//     per-account MCP auth state — sharing it would cross one account's server
+//     auth prompts into another's.
 func PrivateEntry(name string) bool {
 	return ExcludedEntries[name] ||
 		name == ".claude.json" || strings.HasPrefix(name, ".claude.json.") ||
 		name == ".credentials.json" || strings.HasPrefix(name, ".credentials.json.") ||
 		strings.HasPrefix(name, ".last-update-result") ||
-		name == "remote-settings.json" || strings.HasPrefix(name, "remote-settings.json.")
+		name == "remote-settings.json" || strings.HasPrefix(name, "remote-settings.json.") ||
+		name == "mcp-needs-auth-cache.json" || strings.HasPrefix(name, "mcp-needs-auth-cache.json.")
 }
 
 // PrivatePrefixes are the top-level name prefixes the shared holder routes to the
@@ -78,4 +81,5 @@ var PrivatePrefixes = []string{
 	".credentials.json",
 	".last-update-result",
 	"remote-settings.json",
+	"mcp-needs-auth-cache.json",
 }

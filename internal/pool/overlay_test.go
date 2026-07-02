@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -252,6 +253,42 @@ func TestOverlaySpecSkipsAppleDoubleLitter(t *testing.T) {
 	// litter between roots instead of clearing it.
 	if spec.IsPrivate("._.claude.json") {
 		t.Error(`IsPrivate("._.claude.json") = true; sidecar litter must stay in the skip class`)
+	}
+}
+
+// TestOverlaySpecMcpNeedsAuthCachePrivate pins mcp-needs-auth-cache.json's
+// private classification end to end: PrivateEntry — and therefore the built
+// Spec's IsPrivate — claims the file and its atomic-write temp siblings,
+// look-alike names keep their shared default, and the holder's PrivatePrefixes
+// route the family to the per-account private root. Unclassified, both
+// overlays shared the name, so claude's atomic rewrite clobbered the symlink
+// into a real per-account file that a symlink→fuse conversion then shadowed
+// under the mount (silent data loss).
+func TestOverlaySpecMcpNeedsAuthCachePrivate(t *testing.T) {
+	spec := overlaySpec()
+	cases := map[string]bool{
+		"mcp-needs-auth-cache.json":          true,
+		"mcp-needs-auth-cache.json.tmp.abcd": true,
+		"mcp-needs-auth-cache.json.lock":     true,
+		"mcp-needs-auth.json":                false, // look-alike, not the cache file
+		"mcp-needs-auth-cache.jsonx":         false, // exact name or dot-sibling only
+		"mcp-needs-auth-cache":               false,
+	}
+	for name, want := range cases {
+		if got := overlay.PrivateEntry(name); got != want {
+			t.Errorf("PrivateEntry(%q) = %v, want %v", name, got, want)
+		}
+		if got := spec.IsPrivate(name); got != want {
+			t.Errorf("spec.IsPrivate(%q) = %v, want %v", name, got, want)
+		}
+	}
+	// The shared holder routes by prefix; without this entry a fuse account's
+	// MCP auth cache would write through to the shared base.
+	if !slices.Contains(overlay.PrivatePrefixes, "mcp-needs-auth-cache.json") {
+		t.Errorf("overlay.PrivatePrefixes = %v, missing %q", overlay.PrivatePrefixes, "mcp-needs-auth-cache.json")
+	}
+	if !slices.Contains(spec.Holder.PrivatePrefixes, "mcp-needs-auth-cache.json") {
+		t.Errorf("Holder.PrivatePrefixes = %v, missing %q", spec.Holder.PrivatePrefixes, "mcp-needs-auth-cache.json")
 	}
 }
 
