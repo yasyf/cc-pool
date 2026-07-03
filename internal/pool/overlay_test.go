@@ -256,6 +256,26 @@ func TestOverlaySpecSkipsAppleDoubleLitter(t *testing.T) {
 	}
 }
 
+// TestOverlaySpecNeverOptsIntoAttrCache pins the VM-proven contraindication:
+// a mount serving synthetic documents whose size changes and are promptly
+// re-read (cc-pool's merged /.claude.json) tears at ANY go-nfsv4 attrcache
+// TTL — stale-small clamps a grown document mid-JSON, stale-large over-reads
+// a shrunk one into NUL padding — and attr stabilization cannot help because
+// the size legitimately changes on every rewrite. cc-pool must never opt in
+// (fusekit `ccn doc show 130274e`; the gate is validate-attrcache.sh).
+func TestOverlaySpecNeverOptsIntoAttrCache(t *testing.T) {
+	spec := overlaySpec()
+	if spec.Holder == nil {
+		t.Fatal("overlaySpec().Holder = nil; want a holder spec")
+	}
+	if spec.Holder.AttrCache {
+		t.Fatal("overlaySpec() opts into the go-nfsv4 attr cache; VM-proven torn reads for synth-document mounts — must stay off")
+	}
+	if spec.Holder.AttrCacheTimeout != 0 {
+		t.Fatalf("overlaySpec().Holder.AttrCacheTimeout = %v, want 0 (attrcache must stay off)", spec.Holder.AttrCacheTimeout)
+	}
+}
+
 // TestOverlaySpecMcpNeedsAuthCachePrivate pins mcp-needs-auth-cache.json's
 // private classification end to end: PrivateEntry — and therefore the built
 // Spec's IsPrivate — claims the file and its atomic-write temp siblings,
