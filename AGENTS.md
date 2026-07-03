@@ -15,12 +15,14 @@ cc-pool (`ccp`) pools several Claude Max/Pro subscriptions and launches each Cla
 Releases are **tag-triggered** — there is no version file to edit. `Version`/`Commit` in
 `internal/version` default to `dev` locally and are injected at build time via `-ldflags`.
 
-Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which (1) builds universal
-(arm64+amd64) binaries on macOS — both the pure-Go default and the `-tags fuse` variant, (2)
-creates a GitHub Release with auto-generated notes + tarballs, and (3) auto-bumps
-`Formula/cc-pool.rb` (download urls + both sha256s) on `main`. **Never hand-edit the formula
-version/shas** — the `bump-formula` job owns them. A tag containing `-` (e.g. `v1.2.3-rc.1`)
-publishes assets but skips the formula bump (prerelease).
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which (1) builds the universal
+(arm64+amd64) pure-Go binary on macOS, (2) builds, Developer ID-signs, notarizes, and staples
+the `CCPoolStatus.app` widget (the `cc-pool-status` cask payload), (3) creates a GitHub Release
+with auto-generated notes + the binary tarball, widget zip, and SHA256SUMS, and (4) renders the
+formula and cask from in-repo templates and publishes them to the shared external tap
+[`yasyf/homebrew-tap`](https://github.com/yasyf/homebrew-tap) (`brew install yasyf/tap/cc-pool`).
+There is no in-repo `Formula/` — **never hand-edit the tap**; the release job owns it. A tag
+containing `-` (e.g. `v1.2.3-rc.1`) publishes assets but never touches the tap (prerelease).
 
 Versioning is semver: `feat` → minor, `fix`/`chore`/`refactor` → patch. Latest released version:
 `git tag --sort=-creatordate | head`.
@@ -54,7 +56,7 @@ cc-pool/
 │   ├── store/          # SQLite state (no secrets — Keychain only)
 │   └── version/        # build metadata injected via -ldflags
 ├── launchd/            # LaunchAgent plist template
-├── Formula/            # Homebrew formula
+├── widget/             # CCPoolStatus.app Notification Center widget (SwiftUI, cc-pool-status cask)
 ├── docs/               # public design doc (ARCHITECTURE.md) + README assets
 ├── AGENTS.md           # This file — shared conventions
 └── STYLEGUIDE.md       # Full style guide
