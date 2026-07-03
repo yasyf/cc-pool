@@ -124,7 +124,7 @@ Reach for **`Grep`** only for material neither tool indexes: literal *content* o
 
 - **Fail fast, fail loud.** No silent fallbacks, sentinels, or defensive coding. No back-compat shims — delete dead code.
 - **Errors**: wrap once per layer with `%w`; sentinels + `errors.Is/As`; never log-and-return; fallible call adjacent to its `if err != nil`.
-- **Comments**: godoc on every exported symbol; inside bodies only TODOs, non-obvious workarounds/invariants, disabled code.
+- **Comments**: terse and sparing — the code documents itself through names, types, and organization. The one exception is godoc on exported symbols (each starting with the identifier's name); inside bodies, only TODOs, non-obvious workarounds, or disabled code.
 - **Flat over nested**: early returns; nesting >3 is a smell.
 - **Concurrency**: `ctx` first param; every goroutine has a defined exit; locks never held across I/O.
 - **Tests must catch bugs**: strong assertions, table-driven with named cases, mock externals only, negative tests required, never degrade a test to make it pass.
