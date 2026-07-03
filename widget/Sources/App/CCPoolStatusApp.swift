@@ -31,25 +31,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// one-shot flag — not the current status — gates re-registration, so
     /// disabling the item in System Settings sticks. .enabled/.requiresApproval
     /// set the flag without registering (the user already added it by hand
-    /// under the old instructions); .notFound and a register() failure leave
-    /// it unset so the next launch retries.
+    /// under the old instructions); a register() failure leaves it unset so
+    /// the next launch retries.
     private func registerLoginItemOnce() {
         let defaults = UserDefaults.standard
         guard !defaults.bool(forKey: Self.didRegisterKey) else { return }
         switch SMAppService.mainApp.status {
-        case .notRegistered:
+        case .enabled, .requiresApproval:
+            defaults.set(true, forKey: Self.didRegisterKey)
+        default:
+            // .notRegistered or .notFound: mainApp reports .notFound until its
+            // first-ever register() (not just for dev builds), so both mean
+            // "try now" — register() itself is the only reliable probe.
             do {
                 try SMAppService.mainApp.register()
                 defaults.set(true, forKey: Self.didRegisterKey)
             } catch {
                 NSLog("CCPoolStatus: login item registration failed: %@", String(describing: error))
             }
-        case .enabled, .requiresApproval:
-            defaults.set(true, forKey: Self.didRegisterKey)
-        case .notFound:
-            break // not somewhere launchd can see it (e.g. a dev build); retry next launch
-        @unknown default:
-            break
         }
     }
 }
