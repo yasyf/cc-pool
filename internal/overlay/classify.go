@@ -46,9 +46,11 @@ var SkipEntries = map[string]bool{
 
 // SkipPrefixes are top-level name prefixes skipped exactly like SkipEntries
 // (fkoverlay.Spec.Skipped matches by HasPrefix): AppleDouble "._*" sidecar
-// litter from pre-mitigation fuse mounts — ignored and cleaned by conversion
-// and sweeps, never linked or moved into ~/.claude.
-var SkipPrefixes = []string{"._"}
+// litter, plus ".fuse_hidden*" and ".nfs.*" silly-rename litter left by crashed
+// old-provider fuse-t/NFS mounts — ignored and cleaned by conversion and sweeps,
+// never linked, moved, or carved out into ~/.claude, but NOT blocked from
+// creation through the mount.
+var SkipPrefixes = []string{"._", ".fuse_hidden", ".nfs."}
 
 // PrivateEntry reports whether a top-level entry name is per-account private:
 //
@@ -70,6 +72,27 @@ func PrivateEntry(name string) bool {
 		name == "mcp-needs-auth-cache.json" || strings.HasPrefix(name, "mcp-needs-auth-cache.json.")
 }
 
+// sharedTopLevel reports whether a top-level base entry is carved out as a live
+// symlink into ~/.claude: everything except private names, skipped litter, the two
+// synthetic documents, and the probe. Mirrors the symlink provider's link loop
+// (fkoverlay.Spec.Skipped/IsPrivate), except the private rejection is strictly
+// wider: carveOutPrivate re-applies the holder's own bare-prefix private-redirect
+// match, keeping the manifest's symlink set provably disjoint from the set the
+// holder routes to the per-account private root. A name in both would serve the
+// symlink — the holder consults the manifest before the private redirect — handing
+// a pool session plain claude's file.
+func sharedTopLevel(name string) bool {
+	if PrivateEntry(name) || carveOutPrivate(name) || SkipEntries[name] || name == claudeJSONName || name == settingsName || name == ProbeFileName {
+		return false
+	}
+	for _, p := range SkipPrefixes {
+		if strings.HasPrefix(name, p) {
+			return false
+		}
+	}
+	return true
+}
+
 // PrivatePrefixes are the top-level name prefixes the shared holder routes to the
 // per-account private root rather than the shared base ("source" mode), matched by
 // HasPrefix so each covers its exact name and every atomic-write temp/lock sibling
@@ -82,4 +105,28 @@ var PrivatePrefixes = []string{
 	".last-update-result",
 	"remote-settings.json",
 	"mcp-needs-auth-cache.json",
+}
+
+// carveOutPrivate reports whether a top-level name is barred from the shared
+// carve-out beyond PrivateEntry's dot-anchored families:
+//
+//   - any bare PrivatePrefixes match — the holder's own private-redirect test —
+//     so a gap-class sibling like ".credentials.json~" (an editor backup of plain
+//     claude's credential file) can never be both private-routed and symlinked;
+//   - any case variant of a private family or excluded dir, because the default
+//     APFS base resolves names case-insensitively: ".Credentials.json" there IS
+//     plain claude's live credential file.
+//
+// Barring a name here is always safe — it falls back to a per-account
+// passthrough or private entry, never a symlink into base.
+func carveOutPrivate(name string) bool {
+	if ExcludedEntries[strings.ToLower(name)] {
+		return true
+	}
+	for _, p := range PrivatePrefixes {
+		if len(name) >= len(p) && strings.EqualFold(name[:len(p)], p) {
+			return true
+		}
+	}
+	return false
 }

@@ -205,17 +205,181 @@ func TestPoolContentSourceWriteThroughMissingBaseIsNoop(t *testing.T) {
 func TestPoolContentSourceClassify(t *testing.T) {
 	f := newCSFixture(t)
 	cases := map[string]content.EntryKind{
-		".claude.json":      content.EntrySynth,
-		"settings.json":     content.EntrySynth,
-		"plans":             content.EntrySymlink,
-		"daemon":            content.EntryPrivate,
-		".credentials.json": content.EntryPrivate,
-		"history.jsonl":     "", // passthrough
+		".claude.json":              content.EntrySynth,
+		"settings.json":             content.EntrySynth,
+		"plans":                     content.EntrySymlink,
+		"daemon":                    content.EntryPrivate,
+		".credentials.json":         content.EntryPrivate,
+		"mcp-needs-auth-cache.json": content.EntryPrivate,
+		"remote-settings.json":      content.EntryPrivate,
+		".claude.json.tmp.abcd":     content.EntryPrivate,
+		// CARDINAL gap class: dot-anchored PrivateEntry misses these, but the
+		// holder's bare-HasPrefix PrivatePrefixes claims them — they must never
+		// be symlinked into base (the symlink would win over the private redirect).
+		".credentials.json~":         content.EntryPrivate,
+		".claude.json-old":           content.EntryPrivate,
+		"remote-settings.json_bak":   content.EntryPrivate,
+		"mcp-needs-auth-cache.json2": content.EntryPrivate,
+		// Case variants: the default APFS base resolves names case-insensitively,
+		// so these ARE plain claude's live credential file / backups dir.
+		".Credentials.json": content.EntryPrivate,
+		"Backups":           content.EntryPrivate,
+		// Near-miss, genuinely different file: stays a shared carve-out.
+		"mcp-needs-auth.json": content.EntrySymlink,
+		// Bulk-I/O names are carve-out symlinks now, agreeing with Manifest.
+		"history.jsonl": content.EntrySymlink,
+		"projects":      content.EntrySymlink,
+		"statsig":       content.EntrySymlink,
+		// Silly-rename / AppleDouble / OS litter and the probe stay passthrough.
+		"._sidecar":           "",
+		".fuse_hidden0000abc": "",
+		".nfs.20051234":       "",
+		".DS_Store":           "",
+		ProbeFileName:         "",
 	}
 	for name, want := range cases {
 		if got := f.src.Classify(name); got != want {
 			t.Errorf("Classify(%q) = %q, want %q", name, got, want)
 		}
+	}
+}
+
+// manifestByName indexes a manifest slice and records duplicate emissions so a
+// name emitted twice (e.g. once forced, once carved) is caught.
+func manifestByName(t *testing.T, entries []content.Entry) (map[string]content.Entry, map[string]int) {
+	t.Helper()
+	byName := map[string]content.Entry{}
+	count := map[string]int{}
+	for _, e := range entries {
+		byName[e.Name] = e
+		count[e.Name]++
+	}
+	return byName, count
+}
+
+func TestPoolContentSourceManifestCarveOut(t *testing.T) {
+	f := newCSFixture(t)
+	base := f.src.claudeDir
+
+	// Bulk-I/O entries that MUST become live symlinks into base (the regression).
+	sharedDirs := []string{"projects", "statsig", "todos", "session-env", "shell-snapshots"}
+	sharedFiles := []string{"history.jsonl"}
+	// CARDINAL negative: identity/credentials/excluded names that must NEVER be
+	// symlinked into base — the pool must never see plain claude's identity.
+	privateDirs := []string{"daemon"}
+	privateFiles := []string{
+		".credentials.json", "mcp-needs-auth-cache.json", ".claude.json.tmp.abcd", "remote-settings.json",
+		// Gap-class family siblings: dot-anchored PrivateEntry misses these but the
+		// holder's bare-HasPrefix PrivatePrefixes private-routes them; emitting them
+		// as symlinks would put them in the forbidden both-symlinked-and-private
+		// state, where the symlink wins and exposes plain claude's file.
+		".credentials.json~", ".claude.json-old", "remote-settings.json_bak", "mcp-needs-auth-cache.json2",
+		// Case variant: on the default case-insensitive APFS base this resolves to
+		// plain claude's live file family.
+		".Last-Update-Result.json",
+	}
+	// Silly-rename / AppleDouble / OS litter that must not appear in the manifest at all.
+	litter := []string{".fuse_hidden0000abc", ".nfs.20051234", "._sidecar", ".DS_Store"}
+
+	for _, n := range append(append([]string{}, sharedDirs...), privateDirs...) {
+		if err := os.MkdirAll(filepath.Join(base, n), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := append(append(append([]string{}, sharedFiles...), privateFiles...), litter...)
+	for _, n := range files {
+		if err := os.WriteFile(filepath.Join(base, n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// settings.json + .claude.json living inside base: must stay synth-only, never
+	// duplicated as a symlink/passthrough carve-out.
+	writeJSON(t, f.baseSet, map[string]any{"theme": "dark"})
+	if err := os.WriteFile(filepath.Join(base, ".claude.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// plans exists physically in base: the forced SharedEntries emission and the
+	// carve-out scan must dedup to exactly one entry (the manifest is a wire
+	// contract; Tree consumers enumerate it). Forced-when-absent is pinned by
+	// TestPoolContentSourceManifest, whose base is empty.
+	if err := os.MkdirAll(f.plansDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := f.src.Manifest(f.domain)
+	if err != nil {
+		t.Fatalf("Manifest: %v", err)
+	}
+	byName, count := manifestByName(t, entries)
+
+	// Bulk I/O → live symlink into base, agreeing with Classify.
+	for _, name := range append(append([]string{}, sharedDirs...), sharedFiles...) {
+		e := byName[name]
+		wantTarget := filepath.Join(base, name)
+		if e.Kind != content.EntrySymlink || e.Target != wantTarget {
+			t.Errorf("%s entry = %+v, want symlink → %s", name, e, wantTarget)
+		}
+		if got := f.src.Classify(name); got != content.EntrySymlink {
+			t.Errorf("Classify(%q) = %q, want EntrySymlink (must agree with Manifest)", name, got)
+		}
+	}
+
+	// plans: forced SharedEntries entry, emitted exactly once despite also being
+	// present in base (the carve-out scan must not re-emit it).
+	if e := byName["plans"]; e.Kind != content.EntrySymlink || e.Target != f.plansDir {
+		t.Errorf("plans entry = %+v, want symlink → %s (forced SharedEntries)", e, f.plansDir)
+	}
+	if count["plans"] != 1 {
+		t.Errorf("plans emitted %d times, want exactly 1 (forced + carved must dedup)", count["plans"])
+	}
+
+	// CARDINAL: excluded dir is a private empty dir; the identity/credentials
+	// files are never emitted — and neither is EVER an EntrySymlink.
+	if e := byName["daemon"]; e.Kind != content.EntryPrivate {
+		t.Errorf("daemon entry = %+v, want EntryPrivate", e)
+	}
+	for _, name := range privateFiles {
+		if e, ok := byName[name]; ok {
+			t.Errorf("%s emitted as %+v; a private name must never appear in the manifest", name, e)
+		}
+	}
+	for _, name := range append(append([]string{}, privateDirs...), privateFiles...) {
+		if byName[name].Kind == content.EntrySymlink {
+			t.Errorf("CARDINAL VIOLATION: %s emitted as EntrySymlink into base", name)
+		}
+		if got := f.src.Classify(name); got == content.EntrySymlink {
+			t.Errorf("CARDINAL VIOLATION: Classify(%q) = EntrySymlink", name)
+		}
+	}
+
+	// Litter: never emitted at all.
+	for _, name := range litter {
+		if e, ok := byName[name]; ok {
+			t.Errorf("%s emitted as %+v; silly-rename/AppleDouble litter must be skipped", name, e)
+		}
+	}
+
+	// The two synth documents stay synth-only, exactly once each — no duplicate
+	// symlink/passthrough entry even though .claude.json/settings.json exist in base.
+	for _, name := range []string{claudeJSONName, settingsName} {
+		if e := byName[name]; e.Kind != content.EntrySynth {
+			t.Errorf("%s entry = %+v, want EntrySynth", name, e)
+		}
+		if count[name] != 1 {
+			t.Errorf("%s emitted %d times, want exactly 1 (synth-only, no carve-out duplicate)", name, count[name])
+		}
+	}
+}
+
+func TestPoolContentSourceManifestUnreadableBaseErrors(t *testing.T) {
+	f := newCSFixture(t)
+	// Base missing → Manifest must fail loud (the holder Build fails, the daemon heals);
+	// it must never silently drop the carve-out snapshot.
+	if err := os.RemoveAll(f.src.claudeDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.src.Manifest(f.domain); err == nil {
+		t.Fatal("Manifest with missing base = nil error, want a failure (fail loud)")
 	}
 }
 

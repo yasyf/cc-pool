@@ -67,12 +67,23 @@ func (s *PoolContentSource) plansDir() string     { return filepath.Join(s.claud
 
 // Manifest classifies the top-level entries the holder treats specially for a
 // domain: shared entries as live symlinks into base (bulk I/O off the synth path),
-// excluded entries as private empty dirs, and the two synthetic documents;
-// everything else is a plain passthrough. Each synth's Freshness lists the local
-// files whose (mtime,size) gate the holder's cached bytes, so a steady-state
-// Getattr costs a local stat, not a bridge RPC.
+// excluded entries as private empty dirs, and the two synthetic documents; every
+// remaining top-level name present in base that sharedTopLevel accepts is carved
+// out as a live symlink too, so claude's bulk transcript/history/statsig I/O
+// resolves outside the mount instead of riding through NFS. Each synth's Freshness
+// lists the local files whose (mtime,size) gate the holder's cached bytes, so a
+// steady-state Getattr costs a local stat, not a bridge RPC.
+//
+// The base snapshot is per-Build: a top-level entry born in base after the mount
+// stays a plain passthrough until the next remount. Deliberate — flipping a name
+// to a symlink the instant a CREATE lands it in base would race the kernel's
+// post-CREATE Getattr into a symlink and fail the in-flight write EIO.
 func (s *PoolContentSource) Manifest(domain string) ([]content.Entry, error) {
-	entries := make([]content.Entry, 0, 2+len(SharedEntries)+len(ExcludedEntries))
+	baseEntries, err := os.ReadDir(s.claudeDir)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: read base %s: %w", s.claudeDir, err)
+	}
+	entries := make([]content.Entry, 0, 2+len(SharedEntries)+len(ExcludedEntries)+len(baseEntries))
 	entries = append(entries,
 		content.Entry{Name: claudeJSONName, Kind: content.EntrySynth, Private: true, Freshness: []string{s.privClaudeJSON(domain), s.baseClaudeJSON}},
 		content.Entry{Name: settingsName, Kind: content.EntrySynth, Freshness: []string{s.baseSettings()}},
@@ -82,6 +93,13 @@ func (s *PoolContentSource) Manifest(domain string) ([]content.Entry, error) {
 	}
 	for name := range ExcludedEntries {
 		entries = append(entries, content.Entry{Name: name, Kind: content.EntryPrivate})
+	}
+	for _, e := range baseEntries {
+		name := e.Name()
+		if !sharedTopLevel(name) || SharedEntries[name] {
+			continue // litter, private, synth, probe, or already emitted (forced-even-if-absent)
+		}
+		entries = append(entries, content.Entry{Name: name, Kind: content.EntrySymlink, Target: filepath.Join(s.claudeDir, name)})
 	}
 	return entries, nil
 }
@@ -200,7 +218,10 @@ func (s *PoolContentSource) writeThroughSettings(payload []byte) error {
 
 // Classify reports a top-level entry's kind for a fully-remote (Tree) consumer.
 // cc-pool drives the holder through Manifest and never calls this; it completes the
-// content.Source contract.
+// content.Source contract, so it must agree with Manifest: the synth documents and
+// private/excluded names keep their kinds, and every sharedTopLevel name — SharedEntries
+// or any other carve-out — is a live symlink. Only names sharedTopLevel rejects that are
+// not otherwise classified (skipped litter, the probe) stay passthrough.
 func (s *PoolContentSource) Classify(name string) content.EntryKind {
 	switch {
 	case name == claudeJSONName || name == settingsName:
@@ -209,8 +230,14 @@ func (s *PoolContentSource) Classify(name string) content.EntryKind {
 		return content.EntrySymlink
 	case PrivateEntry(name):
 		return content.EntryPrivate
+	case carveOutPrivate(name):
+		// Gap-class private siblings (bare-prefix or case-variant family names):
+		// the holder private-routes these, never symlinks them.
+		return content.EntryPrivate
+	case sharedTopLevel(name):
+		return content.EntrySymlink
 	default:
-		return "" // passthrough entry
+		return "" // passthrough entry (skipped litter, the probe)
 	}
 }
 
