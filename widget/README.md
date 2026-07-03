@@ -15,10 +15,12 @@ widget extension reads that file via a read-only sandbox exception for
 `~/.cc-pool/`; it never touches the socket, the database, or the Keychain.
 
 The host app (`CCPoolStatus.app`) is a Dock-less agent whose only jobs are to
-register the widget with the system and — while running — watch `~/.cc-pool`
-and reload the widget when the snapshot changes. Without the app running, the
-widget still works on WidgetKit's lazier schedule. Add the app to
-System Settings → Login Items for always-fresh updates.
+register the widget with the system, keep itself launching at login, and —
+while running — watch `~/.cc-pool` and reload the widget when the snapshot
+changes. Without the app running, the widget still works on WidgetKit's lazier
+schedule. On first launch the app adds itself to Login Items; it registers
+itself only once, so disabling it under System Settings → General → Login Items
+sticks.
 
 ## Install
 

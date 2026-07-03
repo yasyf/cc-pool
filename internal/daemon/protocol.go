@@ -105,7 +105,7 @@ type AccountStatus struct {
 	RateLimited    bool      `json:"rate_limited"`
 	Exhausted      bool      `json:"exhausted,omitempty"`   // a window is pegged with its reset pending
 	NeedsLogin     bool      `json:"needs_login,omitempty"` // refresh token gone/revoked; run `ccp login N`
-	HasUsage       bool      `json:"has_usage"`             // false only if the account was never sampled
+	HasUsage       bool      `json:"has_usage"`             // false when there is no known-good sample (never sampled, or only 429 placeholders)
 	Stale          bool      `json:"stale"`
 	Resets5h       time.Time `json:"resets_5h"`
 	Resets7d       time.Time `json:"resets_7d"`
@@ -147,7 +147,7 @@ type StatusSnapshot struct {
 	GeneratedAt time.Time       `json:"generated_at"`
 	Accounts    []AccountStatus `json:"accounts"`
 	// Pool is nil (key absent — the widget decodes it as optional) when no
-	// account has ever been sampled.
+	// account has a known-good sample (never sampled, or only 429 placeholders).
 	Pool *PoolOutlook `json:"pool,omitempty"`
 }
 
@@ -221,7 +221,7 @@ type Response struct {
 	Sticky      bool    `json:"sticky,omitempty"`       // select honored a sticky record
 	Remaining5h float64 `json:"remaining_5h,omitempty"` // select: raw 5h remaining (100−used) of the pick
 	Remaining7d float64 `json:"remaining_7d,omitempty"` // select: raw 7d remaining (100−used) of the pick
-	HasUsage    bool    `json:"has_usage,omitempty"`    // select: false if the pick was never sampled
+	HasUsage    bool    `json:"has_usage,omitempty"`    // select: false when the pick has no known-good sample (never sampled, or only 429 placeholders)
 	// ExhaustedFallback: every account was exhausted and the pick is the
 	// least-bad one — the client must warn that it bills credits or rate-limits.
 	ExhaustedFallback bool `json:"exhausted_fallback,omitempty"`

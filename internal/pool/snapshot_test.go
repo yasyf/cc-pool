@@ -118,6 +118,59 @@ func TestSnapshotScopedFields(t *testing.T) {
 	}
 }
 
+// TestSnapshotOnly429IsNoData pins that an account whose only samples are 429
+// placeholders serializes as no-data (HasUsage=false) with zeroed utilization —
+// never "0% used" — while RateLimited still surfaces from the newest row.
+func TestSnapshotOnly429IsNoData(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.UpsertAccount(store.Account{
+		ID: 1, ConfigDir: t.TempDir(),
+		KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Truncate(time.Second)
+	// Two 429 placeholders and no clean reading: the newest carries a non-zero
+	// util the placeholder path must never expose as real usage.
+	for i := 0; i < 2; i++ {
+		if err := st.InsertUsageSample(store.UsageSample{
+			AccountID: 1, TS: now.Add(-time.Duration(i) * time.Minute),
+			Util5h: 100, Util7d: 100, RateLimited: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := &Manager{Store: st, LockDir: t.TempDir()}
+	snaps, err := m.Snapshots(t.Context(), false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 1 {
+		t.Fatalf("snapshots = %d, want 1", len(snaps))
+	}
+	sn := snaps[0]
+	if sn.HasUsage {
+		t.Error("HasUsage = true, want false (only 429 placeholders, no known-good sample)")
+	}
+	if !sn.RateLimited {
+		t.Error("RateLimited = false, want true (newest sample is a 429 marker)")
+	}
+	if sn.Util5h != 0 || sn.Util7d != 0 {
+		t.Errorf("Util5h/Util7d = %v/%v, want 0/0 (placeholder util must not leak)", sn.Util5h, sn.Util7d)
+	}
+	if sn.Remaining5h != 100 || sn.Remaining7d != 100 {
+		t.Errorf("Remaining5h/7d = %v/%v, want 100/100", sn.Remaining5h, sn.Remaining7d)
+	}
+	if sn.SampleAge != 0 {
+		t.Errorf("SampleAge = %v, want 0 (no known-good sample timestamp)", sn.SampleAge)
+	}
+}
+
 // TestSnapshotBurn7d pins Snapshot's gated 7d drain.
 func TestSnapshotBurn7d(t *testing.T) {
 	cases := map[string]struct {

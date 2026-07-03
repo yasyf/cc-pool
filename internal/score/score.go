@@ -61,7 +61,7 @@ var (
 type Input struct {
 	AccountID int
 
-	HasUsage bool      // false if we have never sampled this account
+	HasUsage bool      // false when there is no known-good sample (never sampled, or only 429 placeholders)
 	SampleTS time.Time // when the latest usage sample was taken
 	Util5h   float64   // percent used 0..100 of the 5-hour window
 	Util7d   float64   // percent used 0..100 of the 7-day window
@@ -88,7 +88,7 @@ type Input struct {
 }
 
 // staleAfter reports stale if the sample is older than d, refresh failed, or the
-// account was never sampled; the latter two hold under any threshold.
+// account has no known-good sample; the latter two hold under any threshold.
 func (in Input) staleAfter(now time.Time, d time.Duration) bool {
 	if in.RefreshFailed {
 		return true

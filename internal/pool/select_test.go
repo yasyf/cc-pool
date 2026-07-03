@@ -10,7 +10,9 @@ import (
 
 // TestScoreInputRateLimitedReadsLastGood pins that scoreInput sources utilization,
 // resets, and timestamp from the last known-good sample — never a newer zeroed
-// rate_limited placeholder — while RateLimited still tracks the newest row.
+// rate_limited placeholder — while RateLimited still tracks the newest row, and
+// that HasUsage gates on a known-good sample: an account whose only rows are 429
+// placeholders reads as no-data (HasUsage=false), not "0% used".
 func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	goodTS := now.Add(-2 * time.Minute)
@@ -25,9 +27,11 @@ func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 	}
 	cases := map[string]struct {
 		samples         []spec
+		wantHasUsage    bool
 		wantUtil5h      float64
 		wantUtil7d      float64
 		wantRateLimited bool
+		wantBurn        float64
 		wantSampleTS    time.Time // zero means "expect SampleTS to be zero"
 		wantExtraUsed   float64
 		wantGoodNil     bool
@@ -37,14 +41,21 @@ func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 				{ts: goodTS, util5h: 41, util7d: 73, rateLimited: false, extraEnabled: true, extraUsed: 177},
 				{ts: now, util5h: 0, util7d: 0, rateLimited: true},
 			},
-			wantUtil5h: 41, wantUtil7d: 73, wantRateLimited: true, wantSampleTS: goodTS, wantExtraUsed: 177,
+			wantHasUsage: true, wantUtil5h: 41, wantUtil7d: 73, wantRateLimited: true,
+			wantSampleTS: goodTS, wantExtraUsed: 177,
 		},
-		"only rate_limited markers yields zero util but still flags rate-limited": {
+		"only rate_limited markers reads as no-data but still flags rate-limited": {
 			samples: []spec{
 				{ts: now.Add(-time.Minute), util5h: 0, util7d: 0, rateLimited: true},
 				{ts: now, util5h: 0, util7d: 0, rateLimited: true},
 			},
-			wantUtil5h: 0, wantUtil7d: 0, wantRateLimited: true, wantSampleTS: time.Time{}, wantGoodNil: true,
+			wantHasUsage: false, wantUtil5h: 0, wantUtil7d: 0, wantRateLimited: true,
+			wantBurn: 0, wantSampleTS: time.Time{}, wantGoodNil: true,
+		},
+		"never sampled reads as no-data and is not rate-limited": {
+			samples:      nil,
+			wantHasUsage: false, wantUtil5h: 0, wantUtil7d: 0, wantRateLimited: false,
+			wantBurn: 0, wantSampleTS: time.Time{}, wantGoodNil: true,
 		},
 	}
 	for name, tc := range cases {
@@ -77,8 +88,8 @@ func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 			if err != nil {
 				t.Fatalf("scoreInput: %v", err)
 			}
-			if !in.HasUsage {
-				t.Fatal("HasUsage = false, want true (the account was sampled)")
+			if in.HasUsage != tc.wantHasUsage {
+				t.Errorf("HasUsage = %v, want %v", in.HasUsage, tc.wantHasUsage)
 			}
 			if tc.wantGoodNil {
 				if good != nil {
@@ -91,6 +102,9 @@ func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 			}
 			if in.RateLimited != tc.wantRateLimited {
 				t.Errorf("RateLimited = %v, want %v", in.RateLimited, tc.wantRateLimited)
+			}
+			if in.Burn5hPerHour != tc.wantBurn {
+				t.Errorf("Burn5hPerHour = %v, want %v", in.Burn5hPerHour, tc.wantBurn)
 			}
 			if in.Util5h != tc.wantUtil5h {
 				t.Errorf("Util5h = %v, want %v", in.Util5h, tc.wantUtil5h)

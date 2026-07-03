@@ -36,7 +36,7 @@ extension PoolStatus {
     /// independently, so skew windows are real — and a neutral mascot smiling
     /// at a dry pool would be actively misleading). Burn and dry-out need
     /// daemon-side history, so the fallback simply omits them. nil means no
-    /// account has ever been sampled.
+    /// account has a known-good sample yet.
     var outlook: PoolOutlook? {
         if let pool {
             // A daemon that ships the pool block but predates pace: re-derive

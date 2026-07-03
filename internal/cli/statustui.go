@@ -371,7 +371,7 @@ func (t statusTUI) renderList() string {
 		}
 		cells := fmt.Sprintf("%-22s %8.1f %8s %8s %5d",
 			truncate(accountName(s.Account.Label), 22), s.Score,
-			fmt.Sprintf("%.0f%%", s.Util5h), fmt.Sprintf("%.0f%%", s.Util7d), s.ActiveSessions)
+			usedCell(s.HasUsage, s.Util5h), usedCell(s.HasUsage, s.Util7d), s.ActiveSessions)
 		if i == cursor {
 			cells = selectedStyle.Render(cells)
 		}
@@ -436,18 +436,26 @@ func (t statusTUI) renderDetail() string {
 		b.WriteByte('\n')
 	}
 
-	labelWidth := len("7d")
-	if n := utf8.RuneCountInString(s.Scoped7dModel); n > labelWidth {
-		labelWidth = n
-	}
-	b.WriteString(usageRow("5h", labelWidth, s.Util5h, s.Resets5h))
-	b.WriteByte('\n')
-	b.WriteString(usageRow("7d", labelWidth, s.Util7d, s.Resets7d))
-	b.WriteByte('\n')
-	if s.Scoped7dModel != "" {
-		// The binding model-scoped weekly bucket (e.g. Fable 5); label from the API.
-		b.WriteString(usageRow(s.Scoped7dModel, labelWidth, s.Scoped7dUtil, s.Scoped7dResets))
+	if !s.HasUsage {
+		// No known-good sample (never sampled, or only 429 placeholders): the score
+		// breakdown above still explains the score, but there is no measured
+		// utilization to draw — an empty bar reading "0% used" would be a lie.
+		b.WriteString(dimStyle.Render("no usage data yet"))
 		b.WriteByte('\n')
+	} else {
+		labelWidth := len("7d")
+		if n := utf8.RuneCountInString(s.Scoped7dModel); n > labelWidth {
+			labelWidth = n
+		}
+		b.WriteString(usageRow("5h", labelWidth, s.Util5h, s.Resets5h))
+		b.WriteByte('\n')
+		b.WriteString(usageRow("7d", labelWidth, s.Util7d, s.Resets7d))
+		b.WriteByte('\n')
+		if s.Scoped7dModel != "" {
+			// The binding model-scoped weekly bucket (e.g. Fable 5); label from the API.
+			b.WriteString(usageRow(s.Scoped7dModel, labelWidth, s.Scoped7dUtil, s.Scoped7dResets))
+			b.WriteByte('\n')
+		}
 	}
 
 	overlay := s.Account.OverlayKind

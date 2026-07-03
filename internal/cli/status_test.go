@@ -94,6 +94,36 @@ func TestRenderTablePlain(t *testing.T) {
 	}
 }
 
+// TestRenderTableNoDataDash pins that an account with no known-good sample renders
+// "-" in the used columns (never a fabricated 0%) and a no-data flag, while a
+// genuinely-sampled empty account still shows an honest 0%.
+func TestRenderTableNoDataDash(t *testing.T) {
+	snaps := []pool.Snapshot{
+		{Account: store.Account{ID: 1, Label: "sampled@example.com"}, Score: 90, HasUsage: true},
+		{Account: store.Account{ID: 2, Label: "nodata@example.com"}, Score: 50, HasUsage: false, RateLimited: true},
+	}
+	out := stripANSI(renderTable(snaps, dirPin{}))
+	row := func(label string) string {
+		for _, l := range strings.Split(out, "\n") {
+			if strings.Contains(l, label) {
+				return l
+			}
+		}
+		t.Fatalf("row %q not found in\n%s", label, out)
+		return ""
+	}
+	if sampled := row("sampled@example.com"); !strings.Contains(sampled, "0%") {
+		t.Errorf("genuinely-sampled empty account should show 0%% used\n%q", sampled)
+	}
+	nodata := row("nodata@example.com")
+	if strings.Contains(nodata, "0%") {
+		t.Errorf("no-data account must not show a fabricated 0%% used\n%q", nodata)
+	}
+	if !strings.Contains(nodata, "no-data") {
+		t.Errorf("no-data account must carry the no-data flag\n%q", nodata)
+	}
+}
+
 // TestAbbreviateHome pins the ~-abbreviation used by the pin summary line.
 func TestAbbreviateHome(t *testing.T) {
 	home := t.TempDir()

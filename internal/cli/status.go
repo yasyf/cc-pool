@@ -279,6 +279,15 @@ func sortSnapshots(snaps []pool.Snapshot) {
 	})
 }
 
+// usedCell renders a "% used" column, or "-" when the account has no known-good
+// sample (never sampled, or only 429 placeholders) — never a fabricated 0%.
+func usedCell(hasUsage bool, util float64) string {
+	if !hasUsage {
+		return "-"
+	}
+	return fmt.Sprintf("%.0f%%", util)
+}
+
 func renderTable(snaps []pool.Snapshot, pin dirPin) string {
 	if len(snaps) == 0 {
 		return "No accounts yet. Run `ccp add` to add one.\n"
@@ -294,8 +303,8 @@ func renderTable(snaps []pool.Snapshot, pin dirPin) string {
 
 	for i, s := range snaps {
 		label := truncate(accountName(s.Account.Label), 24)
-		used5 := fmt.Sprintf("%.0f%%", s.Util5h)
-		used7 := fmt.Sprintf("%.0f%%", s.Util7d)
+		used5 := usedCell(s.HasUsage, s.Util5h)
+		used7 := usedCell(s.HasUsage, s.Util7d)
 		reset := humanizeReset(s.Resets5h)
 		row := fmt.Sprintf("%-24s %8.1f %8s %8s %5d %-17s",
 			label, s.Score, used5, used7, s.ActiveSessions, reset)

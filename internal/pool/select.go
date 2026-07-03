@@ -54,7 +54,7 @@ type SelectResult struct {
 	Result   score.Result
 	Ranked   []score.Result
 	Sticky   bool    // the pick honored a sticky record rather than the ranking
-	HasUsage bool    // the pick has at least one usage sample (false = never sampled)
+	HasUsage bool    // the pick has a known-good usage sample (false = never sampled, or only 429 placeholders)
 	Util5h   float64 // the pick's raw 5h percent used (0 when never sampled)
 	Util7d   float64 // the pick's raw 7d percent used (0 when never sampled)
 	// ExhaustedFallback means every account was exhausted and Best is the least-bad
@@ -193,18 +193,21 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 	var good *store.UsageSample
 	if len(samples) > 0 {
 		s := samples[0]
-		in.HasUsage = true
 		in.RateLimited = s.RateLimited
 		in.Burn5hPerHour = forecast.Burn5h(samples, now)
 		// Utilization, resets, timestamp, and overage source from the last good
 		// sample, not samples[0]: a 429 poll records a zeroed rate_limited
 		// placeholder as the newest row (load-bearing for daemon backoff), so
 		// samples[0] would read 0%/no-overage for a rate-limited account.
-		// ok=false leaves them honestly zero.
+		// HasUsage gates on that known-good sample too, not on any sample: an
+		// account whose only rows are 429 placeholders has no real utilization, so
+		// ok=false is no-data (HasUsage stays false → status renders "no data", not
+		// "0% used"). RateLimited above still tracks the newest row.
 		if g, ok, gerr := m.Store.LatestGoodUsageSample(a.ID); gerr != nil {
 			return in, nil, nil, fmt.Errorf("latest good usage sample for account %d: %w", a.ID, gerr)
 		} else if ok {
 			good = &g
+			in.HasUsage = true
 			in.SampleTS = g.TS
 			in.Util5h = g.Util5h
 			in.Util7d = g.Util7d

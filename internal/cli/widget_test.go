@@ -111,6 +111,14 @@ func TestRunWidgetSequence(t *testing.T) {
 			if !strings.Contains(out.String(), "Edit Widgets") {
 				t.Errorf("output missing enable instructions:\n%s", out.String())
 			}
+			if !strings.Contains(out.String(), "adds itself to Login Items") {
+				t.Errorf("output missing the login-item self-registration note:\n%s", out.String())
+			}
+			// Regression pin: the app self-registers at first launch; the
+			// instructions must not resurrect the manual Login Items step.
+			if strings.Contains(out.String(), "Login Items → add") {
+				t.Errorf("output must not tell the user to add the Login Item manually:\n%s", out.String())
+			}
 		})
 	}
 }

@@ -107,8 +107,9 @@ To add the widget:
   3. Search "cc-pool" and add the small, medium, or large widget.
      (Desktop widgets work too: right-click the desktop → Edit Widgets.)
 
-The widget refreshes every ~3 minutes while CCPoolStatus is running. To keep
-that across logins: System Settings → General → Login Items → add CCPoolStatus.
+The widget refreshes every ~3 minutes while CCPoolStatus is running. On first
+launch the app adds itself to Login Items, so that survives reboots; manage or
+disable it under System Settings → General → Login Items (turning it off sticks).
 
 Not showing up in the gallery? Run:
   killall NotificationCenter && open -ga ` + widgetAppName + `

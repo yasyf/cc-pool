@@ -75,11 +75,11 @@ type Pool struct {
 	Mood  Mood
 }
 
-// PoolOf rolls up account states; ok=false means no account has ever been
-// sampled (the snapshot omits the pool block). Usable = sampled and not
-// rate-limited: a 429 sample is a zeroed placeholder, so its remaining is
-// fabricated. Stale accounts still count toward remaining; their burn is gated
-// to 0.
+// PoolOf rolls up account states; ok=false means no account has a known-good
+// sample — never sampled, or only 429 placeholders — (the snapshot omits the
+// pool block). Usable = has a good sample and not rate-limited: a 429 sample
+// is a zeroed placeholder, so its remaining is fabricated. Stale accounts
+// still count toward remaining; their burn is gated to 0.
 func PoolOf(accts []PoolAccount, now time.Time) (Pool, bool) {
 	sampled := false
 	for _, a := range accts {

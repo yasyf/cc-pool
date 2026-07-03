@@ -1,8 +1,10 @@
+import ServiceManagement
 import SwiftUI
 import WidgetKit
 
 // LSUIElement host app for the widget extension. Its only jobs: exist so the
-// widget appears in the gallery after first launch, and (while running) watch
+// widget appears in the gallery after first launch, keep itself launching at
+// login (one-shot Login Item registration), and (while running) watch
 // ~/.cc-pool for the daemon's status.json rewrites so the widget tracks the
 // 3-minute poll cadence instead of WidgetKit's lazy refresh budget. The widget
 // still works without the app running — just less fresh.
@@ -17,10 +19,38 @@ struct CCPoolStatusApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let didRegisterKey = "didRegisterLoginItem"
     private let watcher = StatusWatcher()
 
     func applicationDidFinishLaunching(_: Notification) {
         watcher.start() // fires an immediate reload once the watch is armed
+        registerLoginItemOnce()
+    }
+
+    /// Adds the app to Login Items exactly once, then defers to the user: the
+    /// one-shot flag — not the current status — gates re-registration, so
+    /// disabling the item in System Settings sticks. .enabled/.requiresApproval
+    /// set the flag without registering (the user already added it by hand
+    /// under the old instructions); .notFound and a register() failure leave
+    /// it unset so the next launch retries.
+    private func registerLoginItemOnce() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Self.didRegisterKey) else { return }
+        switch SMAppService.mainApp.status {
+        case .notRegistered:
+            do {
+                try SMAppService.mainApp.register()
+                defaults.set(true, forKey: Self.didRegisterKey)
+            } catch {
+                NSLog("CCPoolStatus: login item registration failed: %@", String(describing: error))
+            }
+        case .enabled, .requiresApproval:
+            defaults.set(true, forKey: Self.didRegisterKey)
+        case .notFound:
+            break // not somewhere launchd can see it (e.g. a dev build); retry next launch
+        @unknown default:
+            break
+        }
     }
 }
 

@@ -6,7 +6,7 @@ struct StatusEntry: TimelineEntry {
     let state: State
 
     enum State {
-        case ok(PoolStatus, stale: Bool) // stale: generated_at is past staleAfter
+        case ok(PoolStatus, stale: Bool) // stale: entry's display date is > staleAfter past generated_at
         case noFile // daemon not running / never ran
         case denied // read refused — sandbox/entitlement problem, not the daemon
         case unreadable // decode failure or proto skew — surface it, never guess
@@ -29,23 +29,27 @@ struct StatusProvider: TimelineProvider {
 
     func getTimeline(in _: Context, completion: @escaping (Timeline<StatusEntry>) -> Void) {
         let now = Date()
-        // One load, staleness judged at build time. Deliberately NO
-        // future-dated pre-dimmed entry: reloads are budget-throttled
-        // (reloadAllTimelines included), so a synthetic stale flip at
-        // generated_at+staleAfter false-positives between throttled reloads —
-        // the widget spent most of its life dimmed over a perfectly fresh
-        // file. Stale dimming is therefore best-effort (next rebuild). The
-        // footer's "updated Nm ago" is static text, so the same state is
-        // paginated as future-dated entries — each rendering a fresher
-        // entry.date against the same generated_at — to keep the age honest:
+        // One load, paginated as future-dated entries: the footer's "updated
+        // Nm ago" is static text, so the same state is re-emitted with fresher
+        // entry.dates against the same generated_at to keep the age honest —
         // minute-spaced across the requested refresh window, then 5-minute
-        // steps out to an hour because the .after(5m) ask sits below the same
+        // steps out to an hour because the .after(5m) ask sits below the
         // reload throttle; without the tail the age would freeze at "4m ago"
-        // for however long WidgetKit defers the reload.
+        // for however long WidgetKit defers the reload. Staleness is likewise
+        // judged per entry against its own display date: dimming claims
+        // "these numbers are ≥7 min old", which entry.date − generated_at
+        // makes true by construction no matter how throttled reloads get. On
+        // a fresh snapshot the first dimmable entry is the +10 offset, which
+        // a healthy watcher-driven ~3 min reload cadence never displays —
+        // only a pipeline that has genuinely stopped reloading ages into the
+        // dimmed tail.
         let state = load(at: now).state
         let minuteOffsets = Array(0 ..< 5) + Array(stride(from: 5, through: 60, by: 5))
-        let entries = minuteOffsets.map { minute in
-            StatusEntry(date: now.addingTimeInterval(Double(minute) * 60), state: state)
+        let entries = minuteOffsets.map { minute -> StatusEntry in
+            let date = now.addingTimeInterval(Double(minute) * 60)
+            guard case .ok(let status, _) = state else { return StatusEntry(date: date, state: state) }
+            let stale = date.timeIntervalSince(status.generatedAt) > Self.staleAfter
+            return StatusEntry(date: date, state: .ok(status, stale: stale))
         }
         completion(Timeline(entries: entries, policy: .after(now.addingTimeInterval(5 * 60))))
     }

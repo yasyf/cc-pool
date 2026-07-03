@@ -16,7 +16,7 @@ import (
 type Snapshot struct {
 	Account        store.Account
 	Score          float64
-	HasUsage       bool
+	HasUsage       bool    // a known-good sample exists (false = never sampled, or only 429 placeholders)
 	Util5h         float64 // percent used 0..100
 	Util7d         float64
 	Remaining5h    float64

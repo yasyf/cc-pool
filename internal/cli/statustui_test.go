@@ -405,6 +405,91 @@ func TestStatusTUIReloginErrorSurfaced(t *testing.T) {
 	}
 }
 
+// TestStatusTUIListNoDataDash pins that renderList prints "-" (never a
+// fabricated 0%) in the used columns for an account with no known-good sample,
+// while a genuinely-sampled account still shows real percentages.
+func TestStatusTUIListNoDataDash(t *testing.T) {
+	sampled := pool.Snapshot{
+		Account: store.Account{ID: 1, Label: "sampled@example.com"},
+		Score:   90, HasUsage: true, Util5h: 58, Util7d: 61,
+	}
+	nodata := pool.Snapshot{
+		Account: store.Account{ID: 2, Label: "nodata@example.com"},
+		Score:   50, HasUsage: false, RateLimited: true,
+	}
+	tui := statusTUI{snaps: []pool.Snapshot{sampled, nodata}, cursorID: 1}
+	out := stripANSI(tui.renderList())
+
+	row := func(label string) string {
+		t.Helper()
+		for _, l := range strings.Split(out, "\n") {
+			if strings.Contains(l, label) {
+				return l
+			}
+		}
+		t.Fatalf("row %q not found in\n%s", label, out)
+		return ""
+	}
+
+	if sampledRow := row("sampled@example.com"); !strings.Contains(sampledRow, "58%") || !strings.Contains(sampledRow, "61%") {
+		t.Errorf("genuinely-sampled account must show real percentages (58/61)\n%q", sampledRow)
+	}
+
+	nodataRow := row("nodata@example.com")
+	if strings.Contains(nodataRow, "0%") {
+		t.Errorf("no-data account must not show a fabricated 0%% used\n%q", nodataRow)
+	}
+	if strings.Contains(nodataRow, "%") {
+		t.Errorf("no-data account must not show any fabricated %% used\n%q", nodataRow)
+	}
+	// Both used columns render the right-aligned "-" cell (reusing the code's own
+	// %8s width so the token can't be confused with the hyphen in the flags).
+	if want := fmt.Sprintf("%8s %8s", "-", "-"); !strings.Contains(nodataRow, want) {
+		t.Errorf("no-data account must render the dash cells %q\n%q", want, nodataRow)
+	}
+	if !strings.Contains(nodataRow, "no-data") {
+		t.Errorf("no-data account must carry the no-data flag\n%q", nodataRow)
+	}
+}
+
+// TestStatusTUIDetailNoUsageData pins that renderDetail prints "no usage data
+// yet" (never a fabricated usage bar) for an account with no known-good sample,
+// while a genuinely-sampled account renders real usage rows.
+func TestStatusTUIDetailNoUsageData(t *testing.T) {
+	sampled := pool.Snapshot{
+		Account: store.Account{ID: 1, Label: "sampled@example.com"},
+		Score:   90, HasUsage: true, Util5h: 58, Util7d: 61,
+	}
+	nodata := pool.Snapshot{
+		Account: store.Account{ID: 2, Label: "nodata@example.com"},
+		Score:   50, HasUsage: false, RateLimited: true,
+	}
+
+	t.Run("no-data account shows the no-usage note, not a fabricated bar", func(t *testing.T) {
+		tui := statusTUI{snaps: []pool.Snapshot{sampled, nodata}, cursorID: 2}
+		detail := stripANSI(tui.renderDetail())
+		if !strings.Contains(detail, "no usage data yet") {
+			t.Fatalf("detail must show the no-usage note:\n%s", detail)
+		}
+		// The eff5/eff7 breakdown lines above legitimately carry "% effective";
+		// a fabricated usage row is the "% used" phrasing, which must be absent.
+		if strings.Contains(detail, "% used") {
+			t.Fatalf("no-data detail must not fabricate a usage row:\n%s", detail)
+		}
+	})
+
+	t.Run("genuinely-sampled account renders real usage rows", func(t *testing.T) {
+		tui := statusTUI{snaps: []pool.Snapshot{sampled, nodata}, cursorID: 1}
+		detail := stripANSI(tui.renderDetail())
+		if strings.Contains(detail, "no usage data yet") {
+			t.Fatalf("sampled detail must not show the no-usage note:\n%s", detail)
+		}
+		if !strings.Contains(detail, "58% used") || !strings.Contains(detail, "61% used") {
+			t.Fatalf("sampled detail must render real usage rows (58/61):\n%s", detail)
+		}
+	})
+}
+
 // TestStatusTUIReloginFooter: 'a re-login' shows only on a needs-login account.
 func TestStatusTUIReloginFooter(t *testing.T) {
 	tui := reloginTUI(&fakeLogin{})
