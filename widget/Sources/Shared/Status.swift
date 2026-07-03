@@ -159,6 +159,9 @@ struct AccountStatus: Decodable, Identifiable {
     let extraEnabled: Bool? // omitempty
     let extraUsed: Double? // omitempty, currency cents
     let extraLimit: Double? // omitempty, currency cents
+    let scoped7dUtil: Double? // omitempty, utilization 0–100 of the model-scoped weekly cap
+    let scoped7dResets: Date? // omitzero, reset time of the scoped weekly window
+    let scoped7dModel: String? // omitempty, wire display name of the scoped model (presence signal)
 
     // Explicit keys, not .convertFromSnakeCase: digit-leading components like
     // remaining_5h convert ambiguously. Keys the widget ignores (sample_age,
@@ -180,12 +183,25 @@ struct AccountStatus: Decodable, Identifiable {
         case extraEnabled = "extra_enabled"
         case extraUsed = "extra_used"
         case extraLimit = "extra_limit"
+        case scoped7dUtil = "scoped_7d_util"
+        case scoped7dResets = "scoped_7d_resets"
+        case scoped7dModel = "scoped_7d_model"
     }
 
     var isExhausted: Bool { exhausted ?? false }
     var needsLogin: Bool { needsLoginRaw ?? false }
     var hasOverage: Bool { (extraEnabled ?? false) && (extraUsed ?? 0) > 0 }
     var depleted5hAt: Date? { depleted5hAtRaw?.nonZero }
+
+    /// The model-scoped weekly bucket (e.g. Fable's separate weekly cap), or
+    /// nil when the daemon didn't report one. The model name is the presence
+    /// signal — an absent or empty name means nothing to render, so both skew
+    /// directions are safe: an old daemon omits the keys, an old widget ignores
+    /// them. Mirrors `hasOverage`'s gate-on-presence shape.
+    var scoped7d: (model: String, used: Double, resets: Date?)? {
+        guard let model = scoped7dModel, !model.isEmpty else { return nil }
+        return (model, scoped7dUtil ?? 0, scoped7dResets?.nonZero)
+    }
 
     /// Display label; empty labels fall back to the acct-NN dir basename.
     var displayName: String {
@@ -289,7 +305,9 @@ extension PoolStatus {
                 resets7d: Date().addingTimeInterval(4 * 86400),
                 burn5hPerHour: 22, projected5hAtReset: nil,
                 depleted5hAtRaw: Date().addingTimeInterval(2.6 * 3600),
-                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil,
+                scoped7dUtil: 92, scoped7dResets: Date().addingTimeInterval(4 * 86400),
+                scoped7dModel: "Fable"),
             AccountStatus(
                 id: 2, configDir: "/Users/you/.cc-pool/accounts/acct-02",
                 label: "rebecca.fallon.engineering@example-corp.com", score: 64.0,
@@ -298,7 +316,8 @@ extension PoolStatus {
                 resets5h: Date().addingTimeInterval(2 * 3600),
                 resets7d: Date().addingTimeInterval(3 * 86400),
                 burn5hPerHour: 6, projected5hAtReset: 48, depleted5hAtRaw: nil,
-                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil,
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
             AccountStatus(
                 id: 3, configDir: "/Users/you/.cc-pool/accounts/acct-03",
                 label: "personal@example.com", score: 41.0,
@@ -307,7 +326,8 @@ extension PoolStatus {
                 resets5h: Date().addingTimeInterval(90 * 60),
                 resets7d: Date().addingTimeInterval(2 * 86400),
                 burn5hPerHour: 2, projected5hAtReset: 19, depleted5hAtRaw: nil,
-                extraEnabled: true, extraUsed: 5073, extraLimit: 10000),
+                extraEnabled: true, extraUsed: 5073, extraLimit: 10000,
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
             AccountStatus(
                 id: 4, configDir: "/Users/you/.cc-pool/accounts/acct-04",
                 label: "side@example.com", score: 18.0,
@@ -316,7 +336,8 @@ extension PoolStatus {
                 resets5h: Date().addingTimeInterval(3600),
                 resets7d: Date().addingTimeInterval(5 * 86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
-                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil,
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
             AccountStatus(
                 id: 5, configDir: "/Users/you/.cc-pool/accounts/acct-05",
                 label: "fresh@example.com", score: 0.0,
@@ -324,7 +345,8 @@ extension PoolStatus {
                 rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: false, stale: false,
                 resets5h: nil, resets7d: nil,
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
-                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil,
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
             AccountStatus(
                 id: 6, configDir: "/Users/you/.cc-pool/accounts/acct-06",
                 label: "", score: -40.2,
@@ -333,7 +355,8 @@ extension PoolStatus {
                 resets5h: Date().addingTimeInterval(40 * 60),
                 resets7d: Date().addingTimeInterval(86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
-                extraEnabled: true, extraUsed: 177, extraLimit: 5000),
+                extraEnabled: true, extraUsed: 177, extraLimit: 5000,
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
         ],
         pool: PoolOutlook(
             remaining5hPct: 38, remaining7dPct: 56,
@@ -384,7 +407,8 @@ extension PoolStatus {
                 resets5h: Date().addingTimeInterval(3 * 3600),
                 resets7d: Date().addingTimeInterval(4 * 86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
-                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil,
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
             AccountStatus(
                 id: 2, configDir: "/Users/you/.cc-pool/accounts/acct-02",
                 label: "personal@example.com", score: 55.0,
@@ -393,7 +417,8 @@ extension PoolStatus {
                 resets5h: Date().addingTimeInterval(2 * 3600),
                 resets7d: Date().addingTimeInterval(2 * 86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
-                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil,
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
             AccountStatus(
                 id: 3, configDir: "/Users/you/.cc-pool/accounts/acct-03",
                 label: "", score: 12.0,
@@ -402,7 +427,8 @@ extension PoolStatus {
                 resets5h: Date().addingTimeInterval(3600),
                 resets7d: Date().addingTimeInterval(86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
-                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil,
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
         ],
         pool: nil)
 }

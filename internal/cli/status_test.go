@@ -384,6 +384,22 @@ func TestSnapshotFlagsExhaustedAndOverage(t *testing.T) {
 	}
 }
 
+// TestSnapshotFlagsScoped pins the model-scoped weekly badge: present with the
+// API label and util when a scoped bucket exists, absent otherwise.
+func TestSnapshotFlagsScoped(t *testing.T) {
+	snaps := fromDaemon([]daemon.AccountStatus{
+		{ID: 1, Label: "fable-pegged", HasUsage: true, Remaining5h: 60, Remaining7d: 40, Scoped7dModel: "Fable", Scoped7dUtil: 100},
+		{ID: 2, Label: "no-scope", HasUsage: true, Remaining5h: 60, Remaining7d: 90},
+	})
+	f := stripANSI(snapshotFlags(snaps[0]))
+	if !strings.Contains(f, "Fable 100%") {
+		t.Fatalf("scoped bucket must be badged with its API label and util, got %q", f)
+	}
+	if f := stripANSI(snapshotFlags(snaps[1])); f != "" {
+		t.Fatalf("account without a scoped bucket must not carry the badge, got %q", f)
+	}
+}
+
 // TestDaemonStatusUsable pins the exact-version gate so a pre-upgrade daemon
 // never feeds a partial view.
 func TestDaemonStatusUsable(t *testing.T) {
@@ -413,16 +429,22 @@ func TestUsageSuffix(t *testing.T) {
 	cases := map[string]struct {
 		hasUsage     bool
 		used5, used7 float64
+		scopedModel  string
+		scopedUsed   float64
 		want         string
 	}{
-		"unknown usage":        {false, 13, 8, ""},
-		"unknown ignores used": {false, 0, 0, ""},
-		"rounds to whole":      {true, 13.3, 8.6, " · 5h 13% used · 7d 9% used"},
-		"drained pick":         {true, 100, 100, " · 5h 100% used · 7d 100% used"},
+		"unknown usage":         {false, 13, 8, "", 0, ""},
+		"unknown ignores used":  {false, 0, 0, "", 0, ""},
+		"unknown ignores scope": {false, 13, 8, "Fable", 100, ""},
+		"rounds to whole":       {true, 13.3, 8.6, "", 0, " · 5h 13% used · 7d 9% used"},
+		"drained pick":          {true, 100, 100, "", 0, " · 5h 100% used · 7d 100% used"},
+		"scoped present":        {true, 40, 60, "Fable", 100, " · 5h 40% used · 7d 60% used · Fable 100% used"},
+		"scoped rounds":         {true, 40, 60, "Fable", 99.6, " · 5h 40% used · 7d 60% used · Fable 100% used"},
+		"absent scope omitted":  {true, 40, 60, "", 100, " · 5h 40% used · 7d 60% used"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if got := stripANSI(usageSuffix(tc.hasUsage, tc.used5, tc.used7)); got != tc.want {
+			if got := stripANSI(usageSuffix(tc.hasUsage, tc.used5, tc.used7, tc.scopedModel, tc.scopedUsed)); got != tc.want {
 				t.Errorf("usageSuffix = %q, want %q", got, tc.want)
 			}
 		})

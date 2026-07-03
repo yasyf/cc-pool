@@ -1,9 +1,12 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite" // pure-Go "sqlite" driver, for the old-schema migration test
 )
 
 func openTest(t *testing.T) *Store {
@@ -228,6 +231,112 @@ func TestUsageSampleExtraUsageRoundTrip(t *testing.T) {
 	recent, err := s.UsageSamplesSince(1, time.Time{})
 	if err != nil || len(recent) != 1 || !recent[0].ExtraEnabled {
 		t.Fatalf("recent samples missing extra usage: %+v err=%v", recent, err)
+	}
+}
+
+func TestUsageSampleScopedRoundTrip(t *testing.T) {
+	reset := time.Now().Add(3 * 24 * time.Hour).Truncate(time.Second)
+	cases := map[string]struct {
+		in         UsageSample
+		wantModel  string
+		wantUtil   float64
+		wantReset  time.Time
+		wantAbsent bool
+	}{
+		"full scoped bucket round-trips": {
+			in: UsageSample{
+				AccountID: 1, TS: time.Now(),
+				Scoped7dModel: "Fable", Scoped7dUtil: 100, Scoped7dResets: reset,
+			},
+			wantModel: "Fable", wantUtil: 100, wantReset: reset,
+		},
+		"absent bucket (empty model) round-trips as zero values": {
+			in:         UsageSample{AccountID: 1, TS: time.Now(), Util7d: 60},
+			wantAbsent: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := openTest(t)
+			_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+			if err := s.InsertUsageSample(tc.in); err != nil {
+				t.Fatal(err)
+			}
+			got, ok, err := s.LatestUsageSample(1)
+			if err != nil || !ok {
+				t.Fatalf("latest: ok=%v err=%v", ok, err)
+			}
+			if tc.wantAbsent {
+				if got.Scoped7dModel != "" || got.Scoped7dUtil != 0 || !got.Scoped7dResets.IsZero() {
+					t.Fatalf("absent bucket did not round-trip as zero: %+v", got)
+				}
+				return
+			}
+			if got.Scoped7dModel != tc.wantModel || got.Scoped7dUtil != tc.wantUtil {
+				t.Fatalf("scoped model/util = %q/%v, want %q/%v", got.Scoped7dModel, got.Scoped7dUtil, tc.wantModel, tc.wantUtil)
+			}
+			if !got.Scoped7dResets.Equal(tc.wantReset) {
+				t.Fatalf("scoped resets = %v, want %v", got.Scoped7dResets, tc.wantReset)
+			}
+		})
+	}
+}
+
+// TestEnsureColumnMigratesOldSchema hand-creates a pool.db carrying the
+// pre-scoped usage_samples schema, reopens it via store.Open (which runs the
+// in-place ensureColumn migration — no wipe), and proves a scoped INSERT then
+// succeeds and scans back.
+func TestEnsureColumnMigratesOldSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+
+	// The old usage_samples schema, verbatim, before the scoped_7d_* columns.
+	const oldSchema = `
+CREATE TABLE usage_samples (
+  account_id    INTEGER NOT NULL,
+  ts            INTEGER NOT NULL,
+  util_5h       REAL,
+  util_7d       REAL,
+  resets_5h     INTEGER,
+  resets_7d     INTEGER,
+  rate_limited  INTEGER NOT NULL DEFAULT 0,
+  extra_enabled INTEGER NOT NULL DEFAULT 0,
+  extra_used    REAL NOT NULL DEFAULT 0,
+  extra_limit   REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, ts)
+);`
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(oldSchema); err != nil {
+		t.Fatalf("create old schema: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO usage_samples(account_id,ts,util_7d) VALUES(1,?,42)`,
+		time.Now().Add(-time.Hour).Unix()); err != nil {
+		t.Fatalf("seed old row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen migrates in place: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	reset := time.Now().Add(2 * 24 * time.Hour).Truncate(time.Second)
+	in := UsageSample{AccountID: 1, TS: time.Now(), Scoped7dModel: "Fable", Scoped7dUtil: 88, Scoped7dResets: reset}
+	if err := s.InsertUsageSample(in); err != nil {
+		t.Fatalf("insert after migration: %v", err)
+	}
+	got, ok, err := s.LatestUsageSample(1)
+	if err != nil || !ok {
+		t.Fatalf("latest: ok=%v err=%v", ok, err)
+	}
+	if got.Scoped7dModel != "Fable" || got.Scoped7dUtil != 88 || !got.Scoped7dResets.Equal(reset) {
+		t.Fatalf("scoped fields lost across migration: %+v", got)
 	}
 }
 

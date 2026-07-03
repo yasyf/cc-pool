@@ -45,9 +45,20 @@ type Snapshot struct {
 	ExtraEnabled bool
 	ExtraUsed    float64 // credits consumed this month (currency cents)
 	ExtraLimit   float64 // credit cap (currency cents)
+	// Scoped7dUtil/Scoped7dResets/Scoped7dModel carry the account's binding
+	// model-scoped weekly bucket (e.g. the Fable 5 weekly cap) from the last
+	// known-good sample, like ExtraEnabled. Scoped7dModel is "" when no scoped
+	// bucket was sampled — the presence signal.
+	Scoped7dUtil   float64 // percent used 0..100 of the scoped weekly bucket
+	Scoped7dResets time.Time
+	Scoped7dModel  string
 	// Components is the per-term score breakdown, so status can explain a score
 	// without recomputing.
 	Components score.Components
+	// WeeklyExhausted reports that a weekly window — aggregate or model-scoped —
+	// is pegged with its reset pending (from the ranked score.Result); feeds the
+	// pool mood.
+	WeeklyExhausted bool
 }
 
 // Snapshots returns a scored view of every account. When live is true, stale
@@ -91,27 +102,31 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 			good = *goods[i]
 		}
 		s := Snapshot{
-			Account:        a,
-			Score:          r.Score,
-			HasUsage:       in.HasUsage,
-			Util5h:         in.Util5h,
-			Util7d:         in.Util7d,
-			Remaining5h:    100 - in.Util5h,
-			Remaining7d:    100 - in.Util7d,
-			ActiveSessions: in.ActiveSessions,
-			RateLimited:    in.RateLimited,
-			Exhausted:      r.Exhausted,
-			NeedsLogin:     r.NeedsLogin,
-			Stale:          r.Stale,
-			Resets5h:       in.Resets5h,
-			Resets7d:       in.Resets7d,
-			Burn5hPerHour:  in.Burn5hPerHour,
-			Forecast:       forecast.Estimate5h(samples[i], r.Exhausted, now),
-			Burn7dPerHour:  forecast.Burn7dGated(samples[i], r.Exhausted, now),
-			ExtraEnabled:   good.ExtraEnabled,
-			ExtraUsed:      good.ExtraUsed,
-			ExtraLimit:     good.ExtraLimit,
-			Components:     r.Components,
+			Account:         a,
+			Score:           r.Score,
+			HasUsage:        in.HasUsage,
+			Util5h:          in.Util5h,
+			Util7d:          in.Util7d,
+			Remaining5h:     100 - in.Util5h,
+			Remaining7d:     100 - in.Util7d,
+			ActiveSessions:  in.ActiveSessions,
+			RateLimited:     in.RateLimited,
+			Exhausted:       r.Exhausted,
+			NeedsLogin:      r.NeedsLogin,
+			Stale:           r.Stale,
+			Resets5h:        in.Resets5h,
+			Resets7d:        in.Resets7d,
+			Burn5hPerHour:   in.Burn5hPerHour,
+			Forecast:        forecast.Estimate5h(samples[i], r.Exhausted, now),
+			Burn7dPerHour:   forecast.Burn7dGated(samples[i], r.Exhausted, now),
+			ExtraEnabled:    good.ExtraEnabled,
+			ExtraUsed:       good.ExtraUsed,
+			ExtraLimit:      good.ExtraLimit,
+			Scoped7dUtil:    good.Scoped7dUtil,
+			Scoped7dResets:  good.Scoped7dResets,
+			Scoped7dModel:   good.Scoped7dModel,
+			Components:      r.Components,
+			WeeklyExhausted: r.WeeklyExhausted,
 		}
 		if in.HasUsage {
 			s.SampleAge = now.Sub(in.SampleTS)

@@ -169,6 +169,7 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			Resets5h: now, Resets7d: now, SampleAge: "30s",
 			Burn5hPerHour: 12, Burn7dPerHour: 8, Projected5hAtReset: 62, Depleted5hAt: now,
 			ExtraEnabled: true, ExtraUsed: 177, ExtraLimit: 5000,
+			Scoped7dUtil: 100, Scoped7dResets: now, Scoped7dModel: "Fable", WeeklyExhausted: true,
 		}
 		// A second usable burning account with no known reset, so the rollup
 		// emits every PoolOutlook key for the pin below.
@@ -206,7 +207,9 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			"exhausted", "has_usage", "stale", "resets_5h", "resets_7d",
 			"sample_age", "burn_5h_per_hour", "burn_7d_per_hour",
 			"projected_5h_at_reset", "depleted_5h_at",
-			"extra_enabled", "extra_used", "extra_limit", "components",
+			"extra_enabled", "extra_used", "extra_limit",
+			"scoped_7d_util", "scoped_7d_resets", "scoped_7d_model", "weekly_exhausted",
+			"components",
 		})
 
 		var poolBlock map[string]json.RawMessage
@@ -263,6 +266,7 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		for _, absent := range []string{
 			"exhausted", "extra_enabled", "extra_used", "extra_limit",
 			"burn_5h_per_hour", "projected_5h_at_reset", "depleted_5h_at",
+			"scoped_7d_util", "scoped_7d_resets", "scoped_7d_model", "weekly_exhausted",
 		} {
 			if _, ok := accounts[0][absent]; ok {
 				t.Errorf("zero-value account must omit %q (the widget models it as optional)", absent)
@@ -353,6 +357,73 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestStatusSnapshotScopedRoundTrip proves a populated AccountStatus survives a
+// JSON encode/decode with its model-scoped weekly trio and the weekly-exhausted
+// flag intact.
+func TestStatusSnapshotScopedRoundTrip(t *testing.T) {
+	now := time.Date(2026, 7, 3, 16, 59, 59, 0, time.UTC) // whole second: RFC3339 round-trips exactly
+	want := AccountStatus{
+		ID: 1, ConfigDir: "/x/acct-01", Label: "a@b.c", OverlayKind: "symlink",
+		HasUsage: true, Remaining5h: 40, Remaining7d: 40,
+		Scoped7dUtil: 100, Scoped7dResets: now, Scoped7dModel: "Fable", WeeklyExhausted: true,
+	}
+
+	data, err := json.Marshal(NewStatusSnapshot([]AccountStatus{want}, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap StatusSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatalf("decode snapshot: %v\n%s", err, data)
+	}
+	if len(snap.Accounts) != 1 {
+		t.Fatalf("accounts = %d, want 1: %+v", len(snap.Accounts), snap.Accounts)
+	}
+	got := snap.Accounts[0]
+	if got.Scoped7dModel != want.Scoped7dModel {
+		t.Errorf("scoped_7d_model = %q, want %q", got.Scoped7dModel, want.Scoped7dModel)
+	}
+	if got.Scoped7dUtil != want.Scoped7dUtil {
+		t.Errorf("scoped_7d_util = %v, want %v", got.Scoped7dUtil, want.Scoped7dUtil)
+	}
+	if !got.Scoped7dResets.Equal(want.Scoped7dResets) {
+		t.Errorf("scoped_7d_resets = %v, want %v", got.Scoped7dResets, want.Scoped7dResets)
+	}
+	if !got.WeeklyExhausted {
+		t.Errorf("weekly_exhausted = %v, want true", got.WeeklyExhausted)
+	}
+}
+
+// TestStatusSnapshotWeeklyExhaustedMood proves AccountStatus.WeeklyExhausted
+// flows through NewStatusSnapshot into the forecast rollup: a pool whose every
+// usable account is weekly-exhausted floors the mascot at alarmed even with
+// pristine 5h windows.
+func TestStatusSnapshotWeeklyExhaustedMood(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	accts := []AccountStatus{
+		{ID: 1, HasUsage: true, Remaining5h: 100, Remaining7d: 100, WeeklyExhausted: true},
+		{ID: 2, HasUsage: true, Remaining5h: 100, Remaining7d: 100, WeeklyExhausted: true},
+	}
+	snap := NewStatusSnapshot(accts, now)
+	if snap.Pool == nil {
+		t.Fatal("pool block missing from a sampled snapshot")
+	}
+	if snap.Pool.Mood != forecast.MoodAlarmed {
+		t.Errorf("pool mood = %q, want %q for an all-weekly-exhausted pool", snap.Pool.Mood, forecast.MoodAlarmed)
+	}
+
+	// Clearing the flag on one account drops the pool back below the floor,
+	// proving the rollup keys off the per-account WeeklyExhausted, not a constant.
+	accts[1].WeeklyExhausted = false
+	relaxed := NewStatusSnapshot(accts, now)
+	if relaxed.Pool == nil {
+		t.Fatal("pool block missing from a sampled snapshot")
+	}
+	if relaxed.Pool.Mood == forecast.MoodAlarmed {
+		t.Errorf("pool mood = %q; partial exhaustion must not floor at alarmed", relaxed.Pool.Mood)
+	}
 }
 
 func TestWriteStatusSnapshotForecast(t *testing.T) {

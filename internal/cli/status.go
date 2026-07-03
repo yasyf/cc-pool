@@ -223,23 +223,27 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 	out := make([]pool.Snapshot, 0, len(accs))
 	for _, a := range accs {
 		s := pool.Snapshot{
-			Score:          a.Score,
-			HasUsage:       a.HasUsage,
-			Remaining5h:    a.Remaining5h,
-			Remaining7d:    a.Remaining7d,
-			Util5h:         100 - a.Remaining5h,
-			Util7d:         100 - a.Remaining7d,
-			ActiveSessions: a.ActiveSessions,
-			RateLimited:    a.RateLimited,
-			Exhausted:      a.Exhausted,
-			NeedsLogin:     a.NeedsLogin,
-			Stale:          a.Stale,
-			Resets5h:       a.Resets5h,
-			Resets7d:       a.Resets7d,
-			ExtraEnabled:   a.ExtraEnabled,
-			ExtraUsed:      a.ExtraUsed,
-			ExtraLimit:     a.ExtraLimit,
-			Components:     a.Components,
+			Score:           a.Score,
+			HasUsage:        a.HasUsage,
+			Remaining5h:     a.Remaining5h,
+			Remaining7d:     a.Remaining7d,
+			Util5h:          100 - a.Remaining5h,
+			Util7d:          100 - a.Remaining7d,
+			ActiveSessions:  a.ActiveSessions,
+			RateLimited:     a.RateLimited,
+			Exhausted:       a.Exhausted,
+			NeedsLogin:      a.NeedsLogin,
+			Stale:           a.Stale,
+			Resets5h:        a.Resets5h,
+			Resets7d:        a.Resets7d,
+			ExtraEnabled:    a.ExtraEnabled,
+			ExtraUsed:       a.ExtraUsed,
+			ExtraLimit:      a.ExtraLimit,
+			Scoped7dUtil:    a.Scoped7dUtil,
+			Scoped7dResets:  a.Scoped7dResets,
+			Scoped7dModel:   a.Scoped7dModel,
+			WeeklyExhausted: a.WeeklyExhausted,
+			Components:      a.Components,
 		}
 		s.Account.ID = a.ID
 		s.Account.ConfigDir = a.ConfigDir
@@ -338,6 +342,12 @@ func snapshotFlags(s pool.Snapshot) string {
 		// are cents (177 == $1.77).
 		flags = append(flags, warnStyle.Render(fmt.Sprintf("overage $%.2f/$%.2f", s.ExtraUsed/100, s.ExtraLimit/100)))
 	}
+	if s.Scoped7dModel != "" {
+		// The plain table has no per-account column, so the binding model-scoped
+		// weekly bucket (e.g. Fable 5) rides here as a heat-colored badge; label
+		// comes from the API, never hardcoded.
+		flags = append(flags, usageStyle(s.Scoped7dUtil).Render(fmt.Sprintf("%s %.0f%%", s.Scoped7dModel, s.Scoped7dUtil)))
+	}
 	if !s.HasUsage {
 		flags = append(flags, dimStyle.Render("no-data"))
 	}
@@ -353,14 +363,20 @@ func accountName(label string) string {
 }
 
 // usageSuffix returns "" for unknown usage (never-sampled or old daemon)
-// rather than a fabricated 0%.
-func usageSuffix(hasUsage bool, used5, used7 float64) string {
+// rather than a fabricated 0%. When the pick carries a binding model-scoped
+// weekly bucket (scopedModel != ""), its usage is appended too.
+func usageSuffix(hasUsage bool, used5, used7 float64, scopedModel string, scopedUsed float64) string {
 	if !hasUsage {
 		return ""
 	}
 	pct5 := usageStyle(used5).Render(fmt.Sprintf("%.0f%%", used5))
 	pct7 := usageStyle(used7).Render(fmt.Sprintf("%.0f%%", used7))
-	return dimStyle.Render(" · 5h ") + pct5 + dimStyle.Render(" used · 7d ") + pct7 + dimStyle.Render(" used")
+	out := dimStyle.Render(" · 5h ") + pct5 + dimStyle.Render(" used · 7d ") + pct7 + dimStyle.Render(" used")
+	if scopedModel != "" {
+		pctScoped := usageStyle(scopedUsed).Render(fmt.Sprintf("%.0f%%", scopedUsed))
+		out += dimStyle.Render(" · "+scopedModel+" ") + pctScoped + dimStyle.Render(" used")
+	}
+	return out
 }
 
 func daemonAccountName(m *pool.Manager, id *int) string {

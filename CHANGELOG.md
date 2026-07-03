@@ -22,6 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A missing libfuse-t now surfaces as a graceful mount failure instead of
   crashing the mount holder (cgofuse-load panic recovery → `ErrFuseUnavailable`),
   and dead/wedged NFS carcasses are cleared before a remount (`ClearCarcass`).
+- Claude's new per-model weekly usage limit is now tracked end-to-end. Fable 5,
+  for example, gets its own weekly bucket capped at a share of the plan's
+  limit, so an account can be pegged there while its aggregate window looks
+  half-empty. The widget shows the bucket as a third labeled bar (large) and a
+  heat-colored `<model> N%` badge (medium); `ccp status` gains a TUI detail
+  bar, a table badge, and `scoped_7d_*` keys in `--json`; and selection folds
+  the bucket in as the binding weekly constraint, so sessions stop landing on
+  scoped-exhausted accounts. The model label always comes from the API, never
+  a hardcoded string. Wire fields are additive (`omitempty`, no protocol bump)
+  and the new `pool.db` columns are added in place at open (no wipe).
+- Behavior change: a pool whose every usable account is weekly-exhausted, on
+  the aggregate or the model-scoped window, now floors the mascot mood at
+  alarmed. Previously weekly exhaustion never reached the mood, so a pool that
+  could not serve default-model work within plan limits still showed a calm
+  mascot.
 
 ## [0.28.0] - 2026-06-16
 

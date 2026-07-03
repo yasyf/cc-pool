@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS usage_samples (
   extra_enabled INTEGER NOT NULL DEFAULT 0,
   extra_used    REAL NOT NULL DEFAULT 0,
   extra_limit   REAL NOT NULL DEFAULT 0,
+  scoped_7d_util   REAL,
+  scoped_7d_resets INTEGER,
+  scoped_7d_model  TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (account_id, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_acct_ts ON usage_samples(account_id, ts DESC);
@@ -95,6 +98,46 @@ func Open(path string) (*Store, error) {
 func (s *Store) applySchema() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
+	}
+	// Columns added after usage_samples first shipped: CREATE TABLE IF NOT
+	// EXISTS never alters an existing table, so pre-existing databases need
+	// these added in place (no pool.db wipe).
+	if err := s.ensureColumn("usage_samples", "scoped_7d_util", "REAL"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("usage_samples", "scoped_7d_resets", "INTEGER"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("usage_samples", "scoped_7d_model", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureColumn adds column (with declaration decl) to table when it is absent.
+// Errors fail Open — running against a half-migrated schema is never
+// acceptable.
+func (s *Store) ensureColumn(table, column, decl string) error {
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
+		return fmt.Errorf("inspect %s.%s: %w", table, column, err)
+	}
+	if n > 0 {
+		return nil
+	}
+	// table/column/decl are compile-time constants; nothing user-controlled.
+	if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, decl)); err != nil {
+		// Two processes can race the check-then-ALTER on the first open after
+		// an upgrade (sqlite has no ADD COLUMN IF NOT EXISTS). The
+		// postcondition is "column exists" — re-check before failing so the
+		// duplicate-column loser swallows its error.
+		var again int
+		if err2 := s.db.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&again); err2 == nil && again > 0 {
+			return nil
+		}
+		return fmt.Errorf("add column %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -273,7 +316,7 @@ func tsOrNil(t time.Time) any {
 	return t.Unix()
 }
 
-const usageSampleCols = `account_id,ts,util_5h,util_7d,resets_5h,resets_7d,rate_limited,extra_enabled,extra_used,extra_limit`
+const usageSampleCols = `account_id,ts,util_5h,util_7d,resets_5h,resets_7d,rate_limited,extra_enabled,extra_used,extra_limit,scoped_7d_util,scoped_7d_resets,scoped_7d_model`
 
 // InsertUsageSample records one usage poll.
 func (s *Store) InsertUsageSample(u UsageSample) error {
@@ -286,20 +329,22 @@ func (s *Store) InsertUsageSample(u UsageSample) error {
 	}
 	_, err := s.db.Exec(
 		`INSERT INTO usage_samples(`+usageSampleCols+`)
-		 VALUES(?,?,?,?,?,?,?,?,?,?)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(account_id,ts) DO NOTHING`,
 		u.AccountID, u.TS.Unix(), u.Util5h, u.Util7d,
-		tsOrNil(u.Resets5h), tsOrNil(u.Resets7d), rl, xe, u.ExtraUsed, u.ExtraLimit)
+		tsOrNil(u.Resets5h), tsOrNil(u.Resets7d), rl, xe, u.ExtraUsed, u.ExtraLimit,
+		u.Scoped7dUtil, tsOrNil(u.Scoped7dResets), u.Scoped7dModel)
 	return err
 }
 
 func scanUsageSample(row interface{ Scan(...any) error }) (UsageSample, error) {
 	var u UsageSample
 	var ts int64
-	var u5, u7 sql.NullFloat64
-	var r5, r7 sql.NullInt64
+	var u5, u7, us sql.NullFloat64
+	var r5, r7, rs sql.NullInt64
 	var rl, xe int
-	if err := row.Scan(&u.AccountID, &ts, &u5, &u7, &r5, &r7, &rl, &xe, &u.ExtraUsed, &u.ExtraLimit); err != nil {
+	if err := row.Scan(&u.AccountID, &ts, &u5, &u7, &r5, &r7, &rl, &xe, &u.ExtraUsed, &u.ExtraLimit,
+		&us, &rs, &u.Scoped7dModel); err != nil {
 		return u, err
 	}
 	u.TS = time.Unix(ts, 0)
@@ -312,6 +357,10 @@ func scanUsageSample(row interface{ Scan(...any) error }) (UsageSample, error) {
 	}
 	u.RateLimited = rl != 0
 	u.ExtraEnabled = xe != 0
+	u.Scoped7dUtil = us.Float64
+	if rs.Valid {
+		u.Scoped7dResets = time.Unix(rs.Int64, 0)
+	}
 	return u, nil
 }
 

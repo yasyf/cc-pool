@@ -125,6 +125,15 @@ type AccountStatus struct {
 	ExtraEnabled bool    `json:"extra_enabled,omitempty"`
 	ExtraUsed    float64 `json:"extra_used,omitempty"`  // currency cents
 	ExtraLimit   float64 `json:"extra_limit,omitempty"` // currency cents
+	// Scoped7dUtil/Scoped7dResets/Scoped7dModel carry the account's binding
+	// model-scoped weekly bucket (e.g. the Fable 5 weekly cap). The presence
+	// signal is Scoped7dModel non-empty, so omitempty on a 0 util is safe.
+	Scoped7dUtil   float64   `json:"scoped_7d_util,omitempty"`  // percent used 0..100 of the scoped weekly bucket
+	Scoped7dResets time.Time `json:"scoped_7d_resets,omitzero"` // when the scoped weekly bucket resets
+	Scoped7dModel  string    `json:"scoped_7d_model,omitempty"` // API display name of the scoped model ("" when none)
+	// WeeklyExhausted reports that a weekly window — aggregate or model-scoped —
+	// is pegged with its reset pending; feeds the daemon-side pool mood.
+	WeeklyExhausted bool `json:"weekly_exhausted,omitempty"`
 	// Components is the per-term score breakdown.
 	Components score.Components `json:"components"`
 }
@@ -177,13 +186,14 @@ func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 	pa := make([]forecast.PoolAccount, 0, len(accounts))
 	for _, a := range accounts {
 		pa = append(pa, forecast.PoolAccount{
-			HasUsage:      a.HasUsage,
-			RateLimited:   a.RateLimited,
-			Remaining5h:   a.Remaining5h,
-			Remaining7d:   a.Remaining7d,
-			Burn5hPerHour: a.Burn5hPerHour,
-			Burn7dPerHour: a.Burn7dPerHour,
-			Resets5h:      a.Resets5h,
+			HasUsage:        a.HasUsage,
+			RateLimited:     a.RateLimited,
+			WeeklyExhausted: a.WeeklyExhausted,
+			Remaining5h:     a.Remaining5h,
+			Remaining7d:     a.Remaining7d,
+			Burn5hPerHour:   a.Burn5hPerHour,
+			Burn7dPerHour:   a.Burn7dPerHour,
+			Resets5h:        a.Resets5h,
 		})
 	}
 	if p, ok := forecast.PoolOf(pa, now); ok {
@@ -217,6 +227,11 @@ type Response struct {
 	ExhaustedFallback bool `json:"exhausted_fallback,omitempty"`
 	// ExtraEnabled: the pick has overage billing enabled (fallback warning).
 	ExtraEnabled bool `json:"extra_enabled,omitempty"`
+	// Scoped7dUtil/Scoped7dModel describe the pick's binding model-scoped weekly
+	// bucket for the select announce line; Scoped7dModel is "" when the pick has
+	// none (the presence signal, so omitempty on a 0 util is safe).
+	Scoped7dUtil  float64 `json:"scoped_7d_util,omitempty"`
+	Scoped7dModel string  `json:"scoped_7d_model,omitempty"`
 	// PinHeldAccount: the cwd's manual pin could not serve (rate-limited,
 	// exhausted, or below the sticky headroom floor). The pin was kept; the
 	// client must surface the bypass.

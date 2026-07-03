@@ -37,13 +37,16 @@ func (m Mood) worse() Mood {
 
 // PoolAccount is one account's contribution to the pool rollup.
 type PoolAccount struct {
-	HasUsage      bool
-	RateLimited   bool
-	Remaining5h   float64 // percent 0..100
-	Remaining7d   float64 // percent 0..100
-	Burn5hPerHour float64 // gated display 5h burn (Estimate.BurnPerHour)
-	Burn7dPerHour float64 // gated display 7d burn (Burn7dGated)
-	Resets5h      time.Time
+	HasUsage    bool
+	RateLimited bool
+	// WeeklyExhausted marks a weekly window — aggregate or model-scoped — pegged
+	// with its reset pending; such an account can serve only by billing overage.
+	WeeklyExhausted bool
+	Remaining5h     float64 // percent 0..100
+	Remaining7d     float64 // percent 0..100
+	Burn5hPerHour   float64 // gated display 5h burn (Estimate.BurnPerHour)
+	Burn7dPerHour   float64 // gated display 7d burn (Burn7dGated)
+	Resets5h        time.Time
 }
 
 // Pool is the pool-wide rollup behind the widget's headline and mascot.
@@ -91,6 +94,7 @@ func PoolOf(accts []PoolAccount, now time.Time) (Pool, bool) {
 
 	var usableAccts []PoolAccount
 	var sum5, sum7, burn, burn7, drop float64
+	allWeeklyExhausted := true
 	for _, a := range accts {
 		if !a.HasUsage || a.RateLimited {
 			continue
@@ -101,6 +105,9 @@ func PoolOf(accts []PoolAccount, now time.Time) (Pool, bool) {
 		burn += a.Burn5hPerHour
 		burn7 += a.Burn7dPerHour
 		drop += netDrop(a, now)
+		if !a.WeeklyExhausted {
+			allWeeklyExhausted = false
+		}
 	}
 	usable := len(usableAccts)
 	var p Pool
@@ -113,7 +120,7 @@ func PoolOf(accts []PoolAccount, now time.Time) (Pool, bool) {
 		p.NetBurnPerHour = drop / float64(usable) / netBurnHorizon.Hours()
 		p.DryAt = dryAt(usableAccts, sum5, burn, now)
 	}
-	p.Mood = moodOf(usable, p.Remaining5h, !p.DryAt.IsZero())
+	p.Mood = moodOf(usable, p.Remaining5h, !p.DryAt.IsZero(), usable > 0 && allWeeklyExhausted)
 	return p, true
 }
 
@@ -181,9 +188,32 @@ func dryAt(usableAccts []PoolAccount, sum5, burn float64, now time.Time) time.Ti
 	return time.Time{}
 }
 
-// moodOf maps mean remaining to an alarm level, bumped one level worse when a
-// dry-out is projected within dryHorizon.
-func moodOf(usable int, remaining5h float64, dryProjected bool) Mood {
+// moodRank orders the mood levels for floor comparisons; higher is more
+// alarmed. worse() steps exactly one level, atLeast compares arbitrary pairs.
+var moodRank = map[Mood]int{
+	MoodChill:   0,
+	MoodEasy:    1,
+	MoodUneasy:  2,
+	MoodWorried: 3,
+	MoodAlarmed: 4,
+	MoodPanic:   5,
+}
+
+// atLeast returns whichever of m or floor is the more-alarmed level, raising m
+// up to floor but never lowering it.
+func atLeast(m, floor Mood) Mood {
+	if moodRank[floor] > moodRank[m] {
+		return floor
+	}
+	return m
+}
+
+// moodOf maps mean remaining to an alarm level. When every usable account is
+// weekly-exhausted the pool cannot serve its default-model work within plan
+// limits however fresh the 5h windows, so the mood floors at MoodAlarmed; the
+// dry-out bump then applies on top, so a floored-alarmed pool can still reach
+// panic.
+func moodOf(usable int, remaining5h float64, dryProjected, allWeeklyExhausted bool) Mood {
 	if usable == 0 {
 		return MoodPanic
 	}
@@ -199,6 +229,9 @@ func moodOf(usable int, remaining5h float64, dryProjected bool) Mood {
 		m = MoodWorried
 	default:
 		m = MoodAlarmed
+	}
+	if allWeeklyExhausted {
+		m = atLeast(m, MoodAlarmed)
 	}
 	if dryProjected {
 		m = m.worse()

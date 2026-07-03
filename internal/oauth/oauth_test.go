@@ -108,7 +108,11 @@ func TestUsageIgnoresUnknownWindows(t *testing.T) {
 			"seven_day_sonnet":{"utilization":0.0,"resets_at":null},
 			"seven_day_omelette":{"utilization":0.0,"resets_at":null},
 			"tangelo":null,
-			"extra_usage":{"is_enabled":true,"monthly_limit":5000,"used_credits":177.0,"utilization":3.54,"currency":"USD","disabled_reason":null}
+			"extra_usage":{"is_enabled":true,"monthly_limit":5000,"used_credits":177.0,"utilization":3.54,"currency":"USD","disabled_reason":null},
+			"limits":[
+				{"kind":"session","group":"session","percent":12,"severity":"normal","resets_at":"2026-07-03T11:49:59.564928+00:00","scope":null,"is_active":false},
+				{"kind":"weekly_all","group":"weekly","percent":60,"severity":"normal","resets_at":"2026-07-08T16:59:59.564947+00:00","scope":null,"is_active":false}
+			]
 		}`)
 	}))
 	defer srv.Close()
@@ -130,6 +134,126 @@ func TestUsageIgnoresUnknownWindows(t *testing.T) {
 	want := ExtraUsage{IsEnabled: true, MonthlyLimit: 5000, UsedCredits: 177.0, Utilization: 3.54, Currency: "USD"}
 	if u.ExtraUsage != want {
 		t.Errorf("extra_usage = %+v, want %+v", u.ExtraUsage, want)
+	}
+}
+
+func TestUsageParsesScopedWeeklyLimits(t *testing.T) {
+	// Live-captured 2026-07-03 payload: session/weekly_all carry no scope and
+	// duplicate the five_hour/seven_day windows; only weekly_scoped is kept.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{
+			"five_hour":{"utilization":40.0,"resets_at":1700000000},
+			"seven_day":{"utilization":60.0,"resets_at":1700600000},
+			"limits":[
+				{"kind":"session","group":"session","percent":12,"severity":"normal","resets_at":"2026-07-03T11:49:59.564928+00:00","scope":null,"is_active":false},
+				{"kind":"weekly_all","group":"weekly","percent":60,"severity":"normal","resets_at":"2026-07-08T16:59:59.564947+00:00","scope":null,"is_active":false},
+				{"kind":"weekly_scoped","group":"weekly","percent":100,"severity":"critical","resets_at":"2026-07-08T16:59:59.565167+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":true}
+			]
+		}`)
+	}))
+	defer srv.Close()
+	c := New()
+	c.usageURL = srv.URL
+	u, err := c.Usage(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if len(u.ScopedWeekly) != 1 {
+		t.Fatalf("ScopedWeekly len = %d, want 1: %+v", len(u.ScopedWeekly), u.ScopedWeekly)
+	}
+	sw := u.ScopedWeekly[0]
+	if sw.ModelName != "Fable" {
+		t.Errorf("ModelName = %q, want %q", sw.ModelName, "Fable")
+	}
+	if sw.Used() != 100 {
+		t.Errorf("Used = %.1f, want 100", sw.Used())
+	}
+	wantReset, err := time.Parse(time.RFC3339, "2026-07-08T16:59:59.565167+00:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sw.ResetsAt.Equal(wantReset) {
+		t.Errorf("ResetsAt = %v, want %v", sw.ResetsAt, wantReset)
+	}
+}
+
+func TestUsageScopedWeeklyMalformedSkipped(t *testing.T) {
+	// nil scope, nil model, empty/whitespace display_name, and a
+	// weekly_all-with-model entry must all be dropped, leaving nothing.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{
+			"five_hour":{"utilization":10.0,"resets_at":null},
+			"seven_day":{"utilization":5.0,"resets_at":null},
+			"limits":[
+				{"kind":"weekly_scoped","percent":90,"resets_at":null,"scope":null},
+				{"kind":"weekly_scoped","percent":90,"resets_at":null,"scope":{"model":null,"surface":null}},
+				{"kind":"weekly_scoped","percent":90,"resets_at":null,"scope":{"model":{"id":null,"display_name":""}}},
+				{"kind":"weekly_scoped","percent":90,"resets_at":null,"scope":{"model":{"id":null,"display_name":"   "}}},
+				{"kind":"weekly_all","percent":80,"resets_at":null,"scope":{"model":{"id":null,"display_name":"Fable"}}}
+			]
+		}`)
+	}))
+	defer srv.Close()
+	c := New()
+	c.usageURL = srv.URL
+	u, err := c.Usage(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if len(u.ScopedWeekly) != 0 {
+		t.Fatalf("ScopedWeekly = %+v, want empty", u.ScopedWeekly)
+	}
+	if _, ok := u.BindingScoped(); ok {
+		t.Error("BindingScoped ok = true, want false for empty scoped weekly")
+	}
+}
+
+func TestUsageBindingScoped(t *testing.T) {
+	reset := time.Unix(1700600000, 0)
+	cases := []struct {
+		name      string
+		scoped    []ScopedWindow
+		wantOK    bool
+		wantModel string
+		wantUsed  float64
+	}{
+		{name: "empty", scoped: nil, wantOK: false},
+		{
+			name:      "single",
+			scoped:    []ScopedWindow{{ModelName: "Fable", Window: Window{Utilization: 42, ResetsAt: reset}}},
+			wantOK:    true,
+			wantModel: "Fable",
+			wantUsed:  42,
+		},
+		{
+			name: "max utilization wins",
+			scoped: []ScopedWindow{
+				{ModelName: "Opus", Window: Window{Utilization: 30}},
+				{ModelName: "Fable", Window: Window{Utilization: 100}},
+				{ModelName: "Sonnet", Window: Window{Utilization: 70}},
+			},
+			wantOK:    true,
+			wantModel: "Fable",
+			wantUsed:  100,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := &Usage{ScopedWeekly: tc.scoped}
+			sw, ok := u.BindingScoped()
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				return
+			}
+			if sw.ModelName != tc.wantModel {
+				t.Errorf("ModelName = %q, want %q", sw.ModelName, tc.wantModel)
+			}
+			if sw.Used() != tc.wantUsed {
+				t.Errorf("Used = %.1f, want %.1f", sw.Used(), tc.wantUsed)
+			}
+		})
 	}
 }
 

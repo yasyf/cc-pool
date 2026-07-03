@@ -221,30 +221,128 @@ func TestMoodOf(t *testing.T) {
 		usable    int
 		remaining float64
 		dry       bool
+		weekly    bool
 		want      Mood
 	}{
-		"no usable accounts is panic":  {0, 0, false, MoodPanic},
-		"60 is chill":                  {1, 60, false, MoodChill},
-		"just below 60 is easy":        {1, 59.9, false, MoodEasy},
-		"40 is easy":                   {1, 40, false, MoodEasy},
-		"just below 40 is uneasy":      {1, 39.9, false, MoodUneasy},
-		"25 is uneasy":                 {1, 25, false, MoodUneasy},
-		"just below 25 is worried":     {1, 24.9, false, MoodWorried},
-		"10 is worried":                {1, 10, false, MoodWorried},
-		"just below 10 is alarmed":     {1, 9.9, false, MoodAlarmed},
-		"dry bumps chill to easy":      {1, 80, true, MoodEasy},
-		"dry bumps easy to uneasy":     {1, 50, true, MoodUneasy},
-		"dry bumps uneasy to worried":  {1, 30, true, MoodWorried},
-		"dry bumps worried to alarmed": {1, 15, true, MoodAlarmed},
-		"dry bumps alarmed to panic":   {1, 5, true, MoodPanic},
-		"panic stays panic under bump": {0, 0, true, MoodPanic},
+		"no usable accounts is panic":  {0, 0, false, false, MoodPanic},
+		"60 is chill":                  {1, 60, false, false, MoodChill},
+		"just below 60 is easy":        {1, 59.9, false, false, MoodEasy},
+		"40 is easy":                   {1, 40, false, false, MoodEasy},
+		"just below 40 is uneasy":      {1, 39.9, false, false, MoodUneasy},
+		"25 is uneasy":                 {1, 25, false, false, MoodUneasy},
+		"just below 25 is worried":     {1, 24.9, false, false, MoodWorried},
+		"10 is worried":                {1, 10, false, false, MoodWorried},
+		"just below 10 is alarmed":     {1, 9.9, false, false, MoodAlarmed},
+		"dry bumps chill to easy":      {1, 80, true, false, MoodEasy},
+		"dry bumps easy to uneasy":     {1, 50, true, false, MoodUneasy},
+		"dry bumps uneasy to worried":  {1, 30, true, false, MoodWorried},
+		"dry bumps worried to alarmed": {1, 15, true, false, MoodAlarmed},
+		"dry bumps alarmed to panic":   {1, 5, true, false, MoodPanic},
+		"panic stays panic under bump": {0, 0, true, false, MoodPanic},
+		// Weekly exhaustion floors the mood at alarmed however fresh the 5h mean.
+		"weekly floors chill at alarmed":   {1, 100, false, true, MoodAlarmed},
+		"weekly floors easy at alarmed":    {1, 50, false, true, MoodAlarmed},
+		"weekly no-op once already alarmed": {1, 5, false, true, MoodAlarmed},
+		// The dry bump applies on top of the weekly floor, reaching panic.
+		"weekly floor then dry is panic": {1, 100, true, true, MoodPanic},
+		// Floor off leaves the base mapping untouched (partial exhaustion path).
+		"weekly off leaves chill": {1, 100, false, false, MoodChill},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if got := moodOf(tc.usable, tc.remaining, tc.dry); got != tc.want {
-				t.Errorf("moodOf(%d, %v, %v) = %q, want %q",
-					tc.usable, tc.remaining, tc.dry, got, tc.want)
+			if got := moodOf(tc.usable, tc.remaining, tc.dry, tc.weekly); got != tc.want {
+				t.Errorf("moodOf(%d, %v, %v, %v) = %q, want %q",
+					tc.usable, tc.remaining, tc.dry, tc.weekly, got, tc.want)
 			}
 		})
 	}
+}
+
+// TestPoolMoodWeeklyExhaustion pins the mood floor a fully weekly-exhausted pool
+// raises through PoolOf: the mascot must alarm however fresh the 5h windows,
+// while partial exhaustion changes nothing.
+func TestPoolMoodWeeklyExhaustion(t *testing.T) {
+	now := time.Date(2026, 6, 11, 12, 0, 0, 0, time.UTC)
+	cases := map[string]struct {
+		accts []PoolAccount
+		want  Mood
+	}{
+		"all usable weekly-exhausted floors at alarmed": {
+			// Fresh 5h windows (Remaining 100) but every usable account is weekly
+			// pegged: the pool can't serve default-model work, so the mood floors.
+			[]PoolAccount{
+				{HasUsage: true, WeeklyExhausted: true, Remaining5h: 100, Remaining7d: 100},
+				{HasUsage: true, WeeklyExhausted: true, Remaining5h: 100, Remaining7d: 100},
+			},
+			MoodAlarmed,
+		},
+		"all exhausted plus a projected dry-out reaches panic": {
+			// The weekly floor lands alarmed, then the dry-out bump takes it to panic.
+			[]PoolAccount{
+				{HasUsage: true, WeeklyExhausted: true, Remaining5h: 100, Remaining7d: 100, Burn5hPerHour: 100},
+			},
+			MoodPanic,
+		},
+		"one of two exhausted changes nothing": {
+			// Partial exhaustion: selection routes around the pegged account, so the
+			// mood stays the fresh-5h baseline (chill), never floored.
+			[]PoolAccount{
+				{HasUsage: true, WeeklyExhausted: true, Remaining5h: 100, Remaining7d: 100},
+				{HasUsage: true, Remaining5h: 100, Remaining7d: 100},
+			},
+			MoodChill,
+		},
+		"a rate-limited straggler cannot veto the floor": {
+			// The fold runs over usable accounts only: a non-usable
+			// (rate-limited) account with a clear flag must not lift the floor
+			// off a pool whose every usable account is weekly-pegged.
+			[]PoolAccount{
+				{HasUsage: true, WeeklyExhausted: true, Remaining5h: 100, Remaining7d: 100},
+				{HasUsage: true, WeeklyExhausted: true, Remaining5h: 100, Remaining7d: 100},
+				{HasUsage: true, RateLimited: true, Remaining5h: 100},
+			},
+			MoodAlarmed,
+		},
+		"zero usable is panic despite the exhausted flag": {
+			// Rate-limited accounts are excluded from usable, so usable is 0 and the
+			// panic verdict wins regardless of the weekly flag.
+			[]PoolAccount{
+				{HasUsage: true, RateLimited: true, WeeklyExhausted: true, Remaining5h: 100},
+				{HasUsage: true, RateLimited: true, WeeklyExhausted: true, Remaining5h: 100},
+			},
+			MoodPanic,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, ok := PoolOf(tc.accts, now)
+			if !ok {
+				t.Fatalf("PoolOf ok = false, want true")
+			}
+			if got.Mood != tc.want {
+				t.Errorf("Mood = %q, want %q", got.Mood, tc.want)
+			}
+		})
+	}
+
+	// The floor fires only when ALL usable accounts are pegged: a partially
+	// exhausted pool must land on the exact mood the flag-cleared pool does.
+	t.Run("partial exhaustion matches the flag-cleared baseline", func(t *testing.T) {
+		partial := []PoolAccount{
+			{HasUsage: true, WeeklyExhausted: true, Remaining5h: 30, Remaining7d: 40},
+			{HasUsage: true, Remaining5h: 30, Remaining7d: 40},
+		}
+		baseline := []PoolAccount{
+			{HasUsage: true, Remaining5h: 30, Remaining7d: 40},
+			{HasUsage: true, Remaining5h: 30, Remaining7d: 40},
+		}
+		gotPartial, _ := PoolOf(partial, now)
+		gotBaseline, _ := PoolOf(baseline, now)
+		if gotPartial.Mood != gotBaseline.Mood {
+			t.Errorf("partial mood %q != baseline mood %q", gotPartial.Mood, gotBaseline.Mood)
+		}
+		if gotPartial.Mood == MoodAlarmed {
+			t.Error("partial exhaustion floored the mood at alarmed; the floor must not fire")
+		}
+	})
 }

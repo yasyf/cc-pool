@@ -27,6 +27,15 @@ type UsageSample struct {
 	ExtraEnabled bool
 	ExtraUsed    float64 // overage credits consumed this month (currency cents)
 	ExtraLimit   float64 // overage credit cap (currency cents)
+	// Scoped7dUtil is the model-scoped weekly bucket's utilization (0..100
+	// percent-used); meaningful only when Scoped7dModel is non-empty.
+	Scoped7dUtil float64
+	// Scoped7dResets is when the model-scoped weekly bucket resets; zero when
+	// the bucket is absent.
+	Scoped7dResets time.Time
+	// Scoped7dModel is the API's display name for the model-scoped weekly
+	// bucket (e.g. "Fable"). Empty means the response carried no such bucket.
+	Scoped7dModel string
 }
 
 // Session is a checkout of an account to a live claude process.

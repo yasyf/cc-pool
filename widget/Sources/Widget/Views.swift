@@ -179,6 +179,13 @@ struct AccountRow: View {
                                       alert: account.unusable, kind: .fiveHour)
                             UsageCell(window: "7d", remaining: account.remaining7d,
                                       alert: account.unusable, kind: .sevenDay)
+                            // Large only: the per-model weekly cap as a third
+                            // labeled bar, named by the wire (never hardcoded).
+                            if style == .detailed, let scoped = account.scoped7d {
+                                UsageCell(window: scoped.model, remaining: 100 - scoped.used,
+                                          alert: account.unusable, kind: .scopedWeekly,
+                                          labelWidth: 40)
+                            }
                         }
                     } else {
                         Text("no data")
@@ -360,6 +367,8 @@ struct UsageCell: View {
     let remaining: Double
     let alert: Bool
     let kind: WindowKind
+    /// Widened for the scoped bucket's model-name label; 5h/7d keep 16.
+    var labelWidth: CGFloat = 16
 
     var body: some View {
         let clamped = min(max(remaining, 0), 100)
@@ -367,7 +376,9 @@ struct UsageCell: View {
             Text(window)
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
-                .frame(width: 16, alignment: .leading)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(width: labelWidth, alignment: .leading)
             HeadroomBar(remaining: clamped, alert: alert, kind: kind)
             Text("\(Int((100 - clamped).rounded()))%")
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
@@ -431,6 +442,15 @@ struct BadgeRow: View {
             // Detailed rows carry overage, reset times, and the projection on
             // their own detail line; repeating them here would double-print.
             if style == .compact {
+                // The per-model weekly cap: one heat-colored "<model> N%"
+                // token whenever the bucket exists — the ask is to see the
+                // limit, so it is not threshold-gated. Named by the wire.
+                if let scoped = account.scoped7d {
+                    Text("\(scoped.model) \(Int(scoped.used.rounded()))%")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(scopedBadgeColor(used: scoped.used))
+                        .lineLimit(1)
+                }
                 if account.hasOverage {
                     Text(String(format: "$%.2f", (account.extraUsed ?? 0) / 100))
                         .font(.system(size: 10, design: .monospaced))

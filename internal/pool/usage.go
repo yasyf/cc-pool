@@ -256,6 +256,13 @@ func (m *Manager) recordSample(accountID int, u *oauth.Usage, rateLimited bool) 
 		ExtraUsed:    u.ExtraUsage.UsedCredits,
 		ExtraLimit:   u.ExtraUsage.MonthlyLimit,
 	}
+	// Collapse the per-model weekly limits to the single binding (max-util) bucket;
+	// oauth keeps the full slice, only the binding one is carried downstream.
+	if sw, ok := u.BindingScoped(); ok {
+		s.Scoped7dModel = sw.ModelName
+		s.Scoped7dUtil = sw.Used()
+		s.Scoped7dResets = sw.ResetsAt
+	}
 	// Best-effort: a failed insert self-heals on the next poll (account goes stale),
 	// so the error is intentionally not escalated.
 	_ = m.Store.InsertUsageSample(s)

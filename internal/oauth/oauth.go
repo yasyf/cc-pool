@@ -171,13 +171,40 @@ func (w Window) Remaining() float64 {
 	return r
 }
 
+// ScopedWindow is a per-model weekly usage limit (e.g. the Fable 5 weekly cap):
+// a Window whose ModelName carries the API's display name for the scoped model.
+type ScopedWindow struct {
+	// ModelName is the API-provided display name of the scoped model (never hardcoded).
+	ModelName string
+	Window
+}
+
 // Usage is the parsed /api/oauth/usage response. The API returns many windows;
-// cc-pool consumes only the 5-hour, aggregate 7-day, and extra-usage (credit
-// overage) blocks and ignores the rest.
+// cc-pool consumes only the 5-hour, aggregate 7-day, extra-usage (credit
+// overage), and per-model weekly-scoped blocks and ignores the rest.
 type Usage struct {
 	FiveHour   Window
 	SevenDay   Window
 	ExtraUsage ExtraUsage
+	// ScopedWeekly holds the per-model weekly limits from the top-level "limits"
+	// array, in wire order. Empty when no weekly_scoped entry is present.
+	ScopedWeekly []ScopedWindow
+}
+
+// BindingScoped returns the scoped weekly window with the highest utilization —
+// the single binding per-model constraint carried downstream. ok is false when
+// no scoped weekly window is present.
+func (u *Usage) BindingScoped() (ScopedWindow, bool) {
+	if len(u.ScopedWeekly) == 0 {
+		return ScopedWindow{}, false
+	}
+	binding := u.ScopedWeekly[0]
+	for _, sw := range u.ScopedWeekly[1:] {
+		if sw.Used() > binding.Used() {
+			binding = sw
+		}
+	}
+	return binding, true
 }
 
 // ExtraUsage is the pay-as-you-go overage block: when enabled, an exhausted
@@ -254,6 +281,26 @@ type rawUsage struct {
 	FiveHour   *rawWindow     `json:"five_hour"`
 	SevenDay   *rawWindow     `json:"seven_day"`
 	ExtraUsage *rawExtraUsage `json:"extra_usage"`
+	Limits     []rawLimit     `json:"limits"`
+}
+
+// rawLimit is one entry of the top-level "limits" array. Unlike the window
+// blocks it reports utilization as "percent" (not "utilization"), so it needs
+// its own decoder. severity/is_active are ignored — cc-pool derives its own.
+type rawLimit struct {
+	Kind     string    `json:"kind"`
+	Percent  *float64  `json:"percent"`
+	ResetsAt resetTime `json:"resets_at"`
+	Scope    *rawScope `json:"scope"`
+}
+
+type rawScope struct {
+	Model *rawScopeModel `json:"model"`
+}
+
+type rawScopeModel struct {
+	ID          *string `json:"id"`
+	DisplayName string  `json:"display_name"`
 }
 
 type rawExtraUsage struct {
@@ -324,10 +371,38 @@ func (c *Client) Usage(ctx context.Context, accessToken string) (*Usage, error) 
 		return nil, fmt.Errorf("decode usage response: %w", err)
 	}
 	return &Usage{
-		FiveHour:   ru.FiveHour.toWindow(),
-		SevenDay:   ru.SevenDay.toWindow(),
-		ExtraUsage: ru.ExtraUsage.toExtraUsage(),
+		FiveHour:     ru.FiveHour.toWindow(),
+		SevenDay:     ru.SevenDay.toWindow(),
+		ExtraUsage:   ru.ExtraUsage.toExtraUsage(),
+		ScopedWeekly: ru.scopedWeekly(),
 	}, nil
+}
+
+// scopedWeekly keeps only well-formed weekly_scoped limits (a named scoped
+// model), in wire order. Malformed entries are skipped silently, matching the
+// package's ignore-unknowns stance. session/weekly_all entries duplicate the
+// five_hour/seven_day windows and are excluded by the kind filter.
+func (ru *rawUsage) scopedWeekly() []ScopedWindow {
+	var out []ScopedWindow
+	for i := range ru.Limits {
+		l := &ru.Limits[i]
+		if l.Kind != "weekly_scoped" || l.Scope == nil || l.Scope.Model == nil {
+			continue
+		}
+		name := strings.TrimSpace(l.Scope.Model.DisplayName)
+		if name == "" {
+			continue
+		}
+		var w Window
+		if l.Percent != nil {
+			w.Utilization = *l.Percent
+		}
+		if l.ResetsAt.present {
+			w.ResetsAt = l.ResetsAt.t
+		}
+		out = append(out, ScopedWindow{ModelName: name, Window: w})
+	}
+	return out
 }
 
 func truncate(s string, n int) string {

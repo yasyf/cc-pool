@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -435,10 +436,19 @@ func (t statusTUI) renderDetail() string {
 		b.WriteByte('\n')
 	}
 
-	b.WriteString(usageRow("5h", s.Util5h, s.Resets5h))
+	labelWidth := len("7d")
+	if n := utf8.RuneCountInString(s.Scoped7dModel); n > labelWidth {
+		labelWidth = n
+	}
+	b.WriteString(usageRow("5h", labelWidth, s.Util5h, s.Resets5h))
 	b.WriteByte('\n')
-	b.WriteString(usageRow("7d", s.Util7d, s.Resets7d))
+	b.WriteString(usageRow("7d", labelWidth, s.Util7d, s.Resets7d))
 	b.WriteByte('\n')
+	if s.Scoped7dModel != "" {
+		// The binding model-scoped weekly bucket (e.g. Fable 5); label from the API.
+		b.WriteString(usageRow(s.Scoped7dModel, labelWidth, s.Scoped7dUtil, s.Scoped7dResets))
+		b.WriteByte('\n')
+	}
 
 	overlay := s.Account.OverlayKind
 	if overlay == "" {
@@ -459,12 +469,15 @@ func (t statusTUI) renderDetail() string {
 	return b.String()
 }
 
-func usageRow(label string, usedPct float64, resets time.Time) string {
+// usageRow renders one aligned usage line. labelWidth is the pane-wide label
+// column (the widest of 5h/7d/model) so the bars line up; the label — for the
+// scoped row, the API-provided model name — is never truncated.
+func usageRow(label string, labelWidth int, usedPct float64, resets time.Time) string {
 	when := "no active window"
 	if !resets.IsZero() {
 		when = "resets " + humanizeReset(resets)
 	}
-	return fmt.Sprintf("%-2s %s %3.0f%% used · %s", label, usageBar(usedPct, 16), usedPct, when)
+	return fmt.Sprintf("%-*s %s %3.0f%% used · %s", labelWidth, label, usageBar(usedPct, 16), usedPct, when)
 }
 
 func usageBar(usedPct float64, width int) string {

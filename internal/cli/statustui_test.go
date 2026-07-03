@@ -148,6 +148,46 @@ func TestStatusTUIDetailNeedsLoginPenalty(t *testing.T) {
 	})
 }
 
+// TestStatusTUIDetailScopedRow: the detail pane renders the model-scoped weekly
+// usage row (labeled by the API model name) only when the account carries a
+// scoped bucket.
+func TestStatusTUIDetailScopedRow(t *testing.T) {
+	t.Run("rendered when a scoped model is set", func(t *testing.T) {
+		tui := pinTUI("/proj", dirPin{}, &fakeToggle{})
+		tui.snaps[1].Scoped7dModel = "Fable"
+		tui.snaps[1].Scoped7dUtil = 100
+		tui.snaps[1].Scoped7dResets = time.Now().Add(48 * time.Hour)
+		detail := stripANSI(tui.renderDetail())
+		if !strings.Contains(detail, "Fable") || !strings.Contains(detail, "100% used") {
+			t.Fatalf("detail must show the scoped model row when a model is set:\n%s", detail)
+		}
+	})
+
+	t.Run("absent when no scoped model", func(t *testing.T) {
+		tui := pinTUI("/proj", dirPin{}, &fakeToggle{})
+		detail := stripANSI(tui.renderDetail())
+		if strings.Contains(detail, "Fable") {
+			t.Fatalf("detail must omit the scoped row when no model is set:\n%s", detail)
+		}
+	})
+
+	t.Run("long model label renders verbatim", func(t *testing.T) {
+		// The label is API-provided; a name wider than the static 5h/7d labels
+		// must never be truncated to fit the column.
+		tui := pinTUI("/proj", dirPin{}, &fakeToggle{})
+		tui.snaps[1].Scoped7dModel = "Opus 4.8"
+		tui.snaps[1].Scoped7dUtil = 50
+		tui.snaps[1].Scoped7dResets = time.Now().Add(48 * time.Hour)
+		detail := stripANSI(tui.renderDetail())
+		if !strings.Contains(detail, "Opus 4.8") {
+			t.Fatalf("detail must show the full API model name:\n%s", detail)
+		}
+		if strings.Contains(detail, "…") {
+			t.Fatalf("scoped model label must not be truncated:\n%s", detail)
+		}
+	})
+}
+
 // TestStatusTUIViewShowsPin covers pin badges, summary, detail, and footer hints.
 func TestStatusTUIViewShowsPin(t *testing.T) {
 	pin := dirPin{cwd: "/proj", ok: true, view: pool.PinView{

@@ -38,6 +38,86 @@ func seed7dClimb(t *testing.T, st *store.Store, accountID int, base time.Time, u
 	}
 }
 
+// TestSnapshotScopedFields pins that Snapshot surfaces the binding model-scoped
+// weekly bucket from the last known-good sample (like ExtraEnabled) and that a
+// pegged scoped bucket flips WeeklyExhausted — the pool-mood signal — even while
+// the aggregate 7d window is nowhere near its cap.
+func TestSnapshotScopedFields(t *testing.T) {
+	cases := map[string]struct {
+		scopedModel   string
+		scopedUtil    float64
+		scopedFuture  time.Duration // scoped reset relative to now; 0 ⇒ no scoped bucket
+		wantModel     string
+		wantUtil      float64
+		wantWeeklyExh bool
+	}{
+		"pegged scoped bucket surfaces and exhausts the weekly signal": {
+			scopedModel: "Fable", scopedUtil: 100, scopedFuture: 48 * time.Hour,
+			wantModel: "Fable", wantUtil: 100, wantWeeklyExh: true,
+		},
+		"no scoped bucket leaves the fields empty and weekly unexhausted": {
+			scopedModel: "", scopedUtil: 0, scopedFuture: 0,
+			wantModel: "", wantUtil: 0, wantWeeklyExh: false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = st.Close() })
+			if err := st.UpsertAccount(store.Account{
+				ID: 1, ConfigDir: t.TempDir(),
+				KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().Truncate(time.Second)
+			sample := store.UsageSample{
+				AccountID:     1,
+				TS:            now,
+				Util5h:        10,
+				Util7d:        60, // aggregate nowhere near exhausted
+				Scoped7dModel: tc.scopedModel,
+				Scoped7dUtil:  tc.scopedUtil,
+			}
+			if tc.scopedFuture > 0 {
+				sample.Scoped7dResets = now.Add(tc.scopedFuture)
+			}
+			if err := st.InsertUsageSample(sample); err != nil {
+				t.Fatal(err)
+			}
+
+			m := &Manager{Store: st, LockDir: t.TempDir()}
+			snaps, err := m.Snapshots(t.Context(), false, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snaps) != 1 {
+				t.Fatalf("snapshots = %d, want 1", len(snaps))
+			}
+			sn := snaps[0]
+			if sn.Scoped7dModel != tc.wantModel {
+				t.Errorf("Scoped7dModel = %q, want %q", sn.Scoped7dModel, tc.wantModel)
+			}
+			if sn.Scoped7dUtil != tc.wantUtil {
+				t.Errorf("Scoped7dUtil = %v, want %v", sn.Scoped7dUtil, tc.wantUtil)
+			}
+			if sn.WeeklyExhausted != tc.wantWeeklyExh {
+				t.Errorf("WeeklyExhausted = %v, want %v", sn.WeeklyExhausted, tc.wantWeeklyExh)
+			}
+			if tc.scopedFuture > 0 {
+				if !sn.Scoped7dResets.Equal(now.Add(tc.scopedFuture)) {
+					t.Errorf("Scoped7dResets = %v, want %v", sn.Scoped7dResets, now.Add(tc.scopedFuture))
+				}
+			} else if !sn.Scoped7dResets.IsZero() {
+				t.Errorf("Scoped7dResets = %v, want zero", sn.Scoped7dResets)
+			}
+		})
+	}
+}
+
 // TestSnapshotBurn7d pins Snapshot's gated 7d drain.
 func TestSnapshotBurn7d(t *testing.T) {
 	cases := map[string]struct {

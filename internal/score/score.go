@@ -68,6 +68,15 @@ type Input struct {
 	Resets5h time.Time // when the 5-hour window resets (also the tie-break)
 	Resets7d time.Time // when the 7-day window resets
 
+	// HasScoped7d reports whether a model-scoped weekly bucket was sampled for
+	// this account; false leaves the 7d term untouched (the scoped fields below
+	// are ignored).
+	HasScoped7d bool
+	// Util7dScoped is the percent used 0..100 of the model-scoped weekly bucket.
+	Util7dScoped float64
+	// Resets7dScoped is when the model-scoped weekly bucket resets.
+	Resets7dScoped time.Time
+
 	// Burn5hPerHour is the recent rate of change of util_5h in percent/hour,
 	// from usage history. Zero means unknown or idle (no runway penalty).
 	Burn5hPerHour float64
@@ -120,7 +129,11 @@ type Result struct {
 	// ExhaustedUntil is when the account actually recovers: the latest reset
 	// among the windows that tripped the gate. Zero unless Exhausted.
 	ExhaustedUntil time.Time
-	Available      bool // false if rate-limited or exhausted (cannot serve right now)
+	// WeeklyExhausted reports that a weekly window — aggregate or model-scoped —
+	// is pegged with its reset pending; the single source for the pool-mood
+	// signal.
+	WeeklyExhausted bool
+	Available       bool // false if rate-limited or exhausted (cannot serve right now)
 }
 
 // Score computes the score for one account: weighted 5h+7d remaining minus
@@ -146,19 +159,46 @@ func Score(in Input, now time.Time) Result {
 		raw7 = 100
 	}
 
+	// A model-scoped weekly bucket is a second cap on the same 7d horizon: the
+	// binding (lower-headroom) one drives the term, so eff7/raw7 min-fold before
+	// they feed Components and the barrier. Each window uses its own reset for
+	// credit, self-lift, and exhaustion.
+	exhausted7Scoped := false
+	if in.HasScoped7d {
+		utilS := in.Util7dScoped
+		if !in.HasUsage {
+			utilS = 0
+		}
+		effS := 100 - windowFrac(in.Resets7dScoped, now, SevenDayWindow)*utilS
+		rawS := 100 - utilS
+		if resetPassed(in.Resets7dScoped, now) {
+			rawS = 100
+		}
+		if effS < eff7 {
+			eff7 = effS
+		}
+		if rawS < raw7 {
+			raw7 = rawS
+		}
+		exhausted7Scoped = in.HasUsage && utilS >= ExhaustedAtUtil && now.Before(in.Resets7dScoped)
+	}
+
 	// A pegged window with a pending reset can't serve now, and forward-looking
 	// reset credit must not mask it. now.Before(zero) is false, so an unknown
 	// reset never gates; a stale post-reset sample self-lifts at the reset; a
 	// stale pre-reset sample gating is sound (util can't drop within a window).
 	exhausted5 := in.HasUsage && util5 >= ExhaustedAtUtil && now.Before(in.Resets5h)
 	exhausted7 := in.HasUsage && util7 >= ExhaustedAtUtil && now.Before(in.Resets7d)
-	exhausted := exhausted5 || exhausted7
+	exhausted := exhausted5 || exhausted7 || exhausted7Scoped
 	var exhaustedUntil time.Time
 	if exhausted5 {
 		exhaustedUntil = in.Resets5h
 	}
 	if exhausted7 && in.Resets7d.After(exhaustedUntil) {
 		exhaustedUntil = in.Resets7d
+	}
+	if exhausted7Scoped && in.Resets7dScoped.After(exhaustedUntil) {
+		exhaustedUntil = in.Resets7dScoped
 	}
 
 	c := Components{
@@ -188,16 +228,17 @@ func Score(in Input, now time.Time) Result {
 		c.SessionPenalty - c.RateLimitPenalty - c.NeedsLoginPenalty - c.StalePenalty -
 		c.Barrier5h - c.Barrier7d - c.RunwayPenalty
 	return Result{
-		AccountID:      in.AccountID,
-		Score:          score,
-		Components:     c,
-		Resets5h:       in.Resets5h,
-		Stale:          stale,
-		RateLimited:    in.RateLimited,
-		NeedsLogin:     in.NeedsLogin,
-		Exhausted:      exhausted,
-		ExhaustedUntil: exhaustedUntil,
-		Available:      !in.RateLimited && !exhausted && !in.NeedsLogin,
+		AccountID:       in.AccountID,
+		Score:           score,
+		Components:      c,
+		Resets5h:        in.Resets5h,
+		Stale:           stale,
+		RateLimited:     in.RateLimited,
+		NeedsLogin:      in.NeedsLogin,
+		Exhausted:       exhausted,
+		ExhaustedUntil:  exhaustedUntil,
+		WeeklyExhausted: exhausted7 || exhausted7Scoped,
+		Available:       !in.RateLimited && !exhausted && !in.NeedsLogin,
 	}
 }
 

@@ -1,6 +1,7 @@
 package score
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -481,5 +482,202 @@ func TestScoreNeedsLoginExcluded(t *testing.T) {
 	}
 	if _, ok := PickFallback(onlyFlagged); ok {
 		t.Fatal("PickFallback must skip a needs-login account")
+	}
+}
+
+// The model-scoped weekly bucket min-folds into the 7d term: a scoped bucket
+// emptier than the aggregate binds Eff7/RawRemaining7d/Barrier7d; a fuller one
+// is inert.
+func TestScopedWeeklyBindsSevenDayTerm(t *testing.T) {
+	now := time.Now()
+	base := Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 10, Util7d: 50}
+	baseline := Score(base, now)
+
+	cases := []struct {
+		name       string
+		scopedUtil float64
+		wantBinds  bool
+	}{
+		{"scoped above aggregate binds", 90, true},
+		{"scoped below aggregate is inert", 20, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := base
+			in.HasScoped7d = true
+			in.Util7dScoped = tc.scopedUtil
+			got := Score(in, now)
+			if !tc.wantBinds {
+				if !reflect.DeepEqual(got, baseline) {
+					t.Fatalf("a non-binding scoped bucket must not change the result:\ngot  %+v\nwant %+v", got, baseline)
+				}
+				return
+			}
+			// Zero resets ⇒ no credit or self-lift: eff == raw == 100 − util.
+			want := 100 - tc.scopedUtil
+			if got.Components.Eff7 != want {
+				t.Fatalf("Eff7 = %.1f, want scoped-bound %.1f", got.Components.Eff7, want)
+			}
+			if got.Components.RawRemaining7d != want {
+				t.Fatalf("RawRemaining7d = %.1f, want scoped-bound %.1f", got.Components.RawRemaining7d, want)
+			}
+			if got.Components.Barrier7d <= baseline.Components.Barrier7d {
+				t.Fatalf("scoped bucket below the knee must raise Barrier7d: got %.1f, baseline %.1f",
+					got.Components.Barrier7d, baseline.Components.Barrier7d)
+			}
+			if got.Score >= baseline.Score {
+				t.Fatalf("binding scoped bucket must downrank: got %.2f, baseline %.2f", got.Score, baseline.Score)
+			}
+		})
+	}
+}
+
+// HasScoped7d alone guards the fold: stale garbage in the scoped fields is
+// ignored when the flag is false.
+func TestScopedAbsentIsIdentity(t *testing.T) {
+	now := time.Now()
+	base := Input{
+		AccountID: 1, HasUsage: true, SampleTS: now,
+		Util5h: 30, Util7d: 40, Resets5h: now.Add(2 * time.Hour), Resets7d: now.Add(3 * 24 * time.Hour),
+	}
+	garbage := base
+	garbage.Util7dScoped = 100
+	garbage.Resets7dScoped = now.Add(24 * time.Hour)
+	got, want := Score(garbage, now), Score(base, now)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("HasScoped7d=false must be identity:\ngot  %+v\nwant %+v", got, want)
+	}
+	if got.WeeklyExhausted {
+		t.Fatal("garbage scoped fields must not trip WeeklyExhausted when HasScoped7d=false")
+	}
+}
+
+func TestScopedWeeklyExhaustionGate(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name          string
+		util          float64
+		reset         time.Time
+		wantExhausted bool
+	}{
+		{"pegged scoped, future reset", 100, now.Add(2 * 24 * time.Hour), true},
+		{"pegged scoped, past reset self-lifts", 100, now.Add(-time.Minute), false},
+		{"scoped util 99 below threshold", 99, now.Add(2 * 24 * time.Hour), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := Score(Input{
+				AccountID: 1, HasUsage: true, SampleTS: now,
+				HasScoped7d: true, Util7dScoped: tc.util, Resets7dScoped: tc.reset,
+			}, now)
+			if r.Exhausted != tc.wantExhausted || r.Available == tc.wantExhausted {
+				t.Fatalf("exhausted=%v available=%v, want exhausted=%v available=%v",
+					r.Exhausted, r.Available, tc.wantExhausted, !tc.wantExhausted)
+			}
+			if r.WeeklyExhausted != tc.wantExhausted {
+				t.Fatalf("WeeklyExhausted = %v, want %v", r.WeeklyExhausted, tc.wantExhausted)
+			}
+			if tc.wantExhausted && !r.ExhaustedUntil.Equal(tc.reset) {
+				t.Fatalf("ExhaustedUntil = %v, want the scoped reset %v", r.ExhaustedUntil, tc.reset)
+			}
+			if !tc.wantExhausted && !r.ExhaustedUntil.IsZero() {
+				t.Fatalf("ExhaustedUntil must stay zero when not exhausted, got %v", r.ExhaustedUntil)
+			}
+			if !tc.reset.After(now) {
+				// The raw term must self-lift once the scoped reset passes: a
+				// stale pegged sample may not impose a phantom barrier on a
+				// bucket that has actually refilled.
+				if r.Components.RawRemaining7d != 100 {
+					t.Fatalf("RawRemaining7d = %v, want 100 after the scoped reset passed", r.Components.RawRemaining7d)
+				}
+				if r.Components.Barrier7d != 0 {
+					t.Fatalf("Barrier7d = %v, want 0 after the scoped reset passed", r.Components.Barrier7d)
+				}
+			}
+		})
+	}
+}
+
+// Recovery is the latest reset among the tripping windows, now including the
+// scoped bucket's own reset.
+func TestScopedExhaustedUntilLatest(t *testing.T) {
+	now := time.Now()
+	reset5, reset7, resetScoped := now.Add(20*time.Minute), now.Add(2*24*time.Hour), now.Add(5*24*time.Hour)
+	r := Score(Input{
+		AccountID: 1, HasUsage: true, SampleTS: now,
+		Util5h: 100, Util7d: 100, Resets5h: reset5, Resets7d: reset7,
+		HasScoped7d: true, Util7dScoped: 100, Resets7dScoped: resetScoped,
+	}, now)
+	if !r.Exhausted {
+		t.Fatal("precondition: all three windows must trip the gate")
+	}
+	if !r.ExhaustedUntil.Equal(resetScoped) {
+		t.Fatalf("ExhaustedUntil = %v, want the latest (scoped) reset %v", r.ExhaustedUntil, resetScoped)
+	}
+}
+
+// A scoped reset within MaxResetCreditHorizon earns windowFrac credit against
+// the scoped drag; one beyond the horizon earns none (plain remaining).
+func TestScopedImminentResetLifts(t *testing.T) {
+	now := time.Now()
+	scoped := func(reset time.Time) Input {
+		return Input{
+			AccountID: 1, HasUsage: true, SampleTS: now,
+			HasScoped7d: true, Util7dScoped: 80, Resets7dScoped: reset,
+		}
+	}
+	far := Score(scoped(now.Add(59*time.Hour)), now)
+	if got := far.Components.Eff7; got != 100-80 {
+		t.Fatalf("scoped reset beyond the horizon must earn no credit: Eff7 = %.1f, want 20", got)
+	}
+	near := Score(scoped(now.Add(time.Hour)), now)
+	if near.Components.Eff7 <= far.Components.Eff7 {
+		t.Fatalf("imminent scoped reset must lift Eff7: near=%.1f far=%.1f",
+			near.Components.Eff7, far.Components.Eff7)
+	}
+	if near.Score <= far.Score {
+		t.Fatalf("imminent scoped reset must rank up: near=%.2f far=%.2f", near.Score, far.Score)
+	}
+}
+
+// WeeklyExhausted fires only for weekly windows — aggregate or model-scoped —
+// never for the 5h window alone.
+func TestWeeklyExhausted(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name          string
+		in            Input
+		wantWeekly    bool
+		wantExhausted bool
+	}{
+		{
+			"aggregate weekly trip",
+			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util7d: 100, Resets7d: now.Add(2 * 24 * time.Hour)},
+			true, true,
+		},
+		{
+			"scoped-only trip",
+			Input{AccountID: 1, HasUsage: true, SampleTS: now, HasScoped7d: true, Util7dScoped: 100, Resets7dScoped: now.Add(2 * 24 * time.Hour)},
+			true, true,
+		},
+		{
+			"5h-only trip",
+			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 100, Resets5h: now.Add(20 * time.Minute)},
+			false, true,
+		},
+		{
+			"healthy",
+			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 40, Util7d: 30},
+			false, false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := Score(tc.in, now)
+			if r.WeeklyExhausted != tc.wantWeekly || r.Exhausted != tc.wantExhausted {
+				t.Fatalf("WeeklyExhausted=%v Exhausted=%v, want WeeklyExhausted=%v Exhausted=%v",
+					r.WeeklyExhausted, r.Exhausted, tc.wantWeekly, tc.wantExhausted)
+			}
+		})
 	}
 }

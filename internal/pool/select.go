@@ -62,6 +62,11 @@ type SelectResult struct {
 	ExhaustedFallback bool
 	// ExtraEnabled reports whether the pick has pay-as-you-go overage billing enabled.
 	ExtraEnabled bool
+	// Scoped7dModel is the API display name of the pick's binding model-scoped
+	// weekly bucket ("" when the pick has no scoped bucket); Scoped7dUtil is that
+	// bucket's raw percent used. Both feed the select announce line.
+	Scoped7dModel string
+	Scoped7dUtil  float64
 	// PinHeldAccount is the id of a manual pin whose account could not serve this
 	// select (rate-limited, exhausted, or below the sticky headroom floor), nil
 	// otherwise; callers must surface the bypass when Best differs from it.
@@ -96,6 +101,7 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	byID := make(map[int]store.Account, len(accts))
 	inByID := make(map[int]score.Input, len(accts))
 	extraByID := make(map[int]bool, len(accts))
+	scopedModelByID := make(map[int]string, len(accts))
 	for _, a := range accts {
 		byID[a.ID] = a
 		in, _, good, err := m.scoreInput(a, sessions, now)
@@ -104,6 +110,9 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 		}
 		inByID[a.ID] = in
 		extraByID[a.ID] = good != nil && good.ExtraEnabled
+		if good != nil {
+			scopedModelByID[a.ID] = good.Scoped7dModel
+		}
 		inputs = append(inputs, in)
 	}
 
@@ -136,6 +145,7 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 		Best: byID[best.AccountID], Result: best, Ranked: ranked,
 		Sticky: outcome == StickyBind, HasUsage: bi.HasUsage, Util5h: bi.Util5h, Util7d: bi.Util7d,
 		ExhaustedFallback: fallback, ExtraEnabled: extraByID[best.AccountID], byID: byID,
+		Scoped7dModel: scopedModelByID[best.AccountID], Scoped7dUtil: bi.Util7dScoped,
 	}
 	if outcome == StickyHoldManual {
 		held := pin.AccountID
@@ -200,6 +210,9 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 			in.Util7d = g.Util7d
 			in.Resets5h = g.Resets5h
 			in.Resets7d = g.Resets7d
+			in.HasScoped7d = g.Scoped7dModel != ""
+			in.Util7dScoped = g.Scoped7dUtil
+			in.Resets7dScoped = g.Scoped7dResets
 		}
 	}
 	in.ActiveSessions = procscan.CountByConfigDir(sessions, a.ConfigDir)

@@ -419,6 +419,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 				return Response{
 					OK: true, Dir: sn.Account.ConfigDir, SelectedID: &id,
 					Remaining5h: sn.Remaining5h, Remaining7d: sn.Remaining7d, HasUsage: sn.HasUsage,
+					Scoped7dUtil: sn.Scoped7dUtil, Scoped7dModel: sn.Scoped7dModel,
 				}
 			}
 		}
@@ -523,6 +524,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		Sticky:      outcome == pool.StickyBind,
 		Remaining5h: best.Remaining5h, Remaining7d: best.Remaining7d, HasUsage: best.HasUsage,
 		ExhaustedFallback: fallback, ExtraEnabled: best.ExtraEnabled,
+		Scoped7dUtil: best.Scoped7dUtil, Scoped7dModel: best.Scoped7dModel,
 	}
 	if outcome == pool.StickyHoldManual {
 		held := pin.AccountID
@@ -872,6 +874,9 @@ func (s *Server) rankWithReservations(snaps []pool.Snapshot) ([]score.Result, ma
 			RateLimited:    sn.RateLimited,
 			RefreshFailed:  sn.Stale && !sn.HasUsage,
 			NeedsLogin:     sn.NeedsLogin,
+			HasScoped7d:    sn.Scoped7dModel != "",
+			Util7dScoped:   sn.Scoped7dUtil,
+			Resets7dScoped: sn.Scoped7dResets,
 		})
 	}
 	return score.Rank(inputs, time.Now()), bySnap
@@ -920,6 +925,10 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 			ExtraEnabled:       sn.ExtraEnabled,
 			ExtraUsed:          sn.ExtraUsed,
 			ExtraLimit:         sn.ExtraLimit,
+			Scoped7dUtil:       sn.Scoped7dUtil,
+			Scoped7dResets:     sn.Scoped7dResets,
+			Scoped7dModel:      sn.Scoped7dModel,
+			WeeklyExhausted:    sn.WeeklyExhausted,
 			Components:         sn.Components,
 		})
 	}

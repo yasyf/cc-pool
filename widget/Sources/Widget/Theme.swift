@@ -35,6 +35,7 @@ enum Palette {
 enum WindowKind {
     case fiveHour // teal → blue
     case sevenDay // purple → pink
+    case scopedWeekly // gold → amber, heating toward red — the per-model weekly cap
 }
 
 /// Gradient bar fill: pure identity hues at comfortable headroom, blending
@@ -46,10 +47,24 @@ func usageGradient(kind: WindowKind, remaining: Double, alert: Bool) -> LinearGr
                               startPoint: .leading, endPoint: .trailing)
     }
     let heat = min(max((40 - remaining) / 40, 0), 1)
-    let (a, b) = kind == .fiveHour ? (Palette.teal, Palette.blue) : (Palette.purple, Palette.pink)
+    let (a, b): (RGB, RGB) = switch kind {
+    case .fiveHour: (Palette.teal, Palette.blue)
+    case .sevenDay: (Palette.purple, Palette.pink)
+    case .scopedWeekly: (Palette.gold, Palette.amber)
+    }
     return LinearGradient(colors: [a.mixed(with: Palette.amber, heat).color,
                                    b.mixed(with: Palette.red, heat).color],
                           startPoint: .leading, endPoint: .trailing)
+}
+
+/// Solid heat color for the medium widget's scoped-bucket badge: the gold
+/// scoped identity while there's slack, blending through to red as the
+/// per-model weekly cap fills. Takes utilization (0–100) directly, since the
+/// badge shows a used %; starts heating past 60% used to match the bar's
+/// 40-remaining threshold.
+func scopedBadgeColor(used: Double) -> Color {
+    let heat = min(max((used - 60) / 40, 0), 1)
+    return Palette.gold.mixed(with: Palette.red, heat).color
 }
 
 extension Mood {

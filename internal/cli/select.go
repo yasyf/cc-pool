@@ -106,7 +106,7 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 		}
 		dir, err := prepareAccount(cmd, m, a)
 		// Forced pick: no scoring, so no usage to report.
-		return dir, selectionLine(accountName(a.Label), false, false, 0, 0), err
+		return dir, selectionLine(accountName(a.Label), false, false, 0, 0, "", 0), err
 	}
 
 	// EnsureRunning so a daemon outlives the exec to adopt tokens claude
@@ -286,20 +286,20 @@ func announceLine(cmd *cobra.Command, line string) {
 	step(cmd.ErrOrStderr(), "%s", line)
 }
 
-func selectionLine(name string, sticky, hasUsage bool, used5, used7 float64) string {
+func selectionLine(name string, sticky, hasUsage bool, used5, used7 float64, scopedModel string, scopedUsed float64) string {
 	verb := "Selected"
 	styledName := bestStyle.Render(name)
 	if sticky {
 		verb = "Reusing"
 		styledName += dimStyle.Render(" (pinned)")
 	}
-	return fmt.Sprintf("%s %s%s", verb, styledName, usageSuffix(hasUsage, used5, used7))
+	return fmt.Sprintf("%s %s%s", verb, styledName, usageSuffix(hasUsage, used5, used7, scopedModel, scopedUsed))
 }
 
 func daemonSelectionLine(m *pool.Manager, resp *daemon.Response) string {
-	return selectionLine(daemonAccountName(m, resp.SelectedID), resp.Sticky, resp.HasUsage, 100-resp.Remaining5h, 100-resp.Remaining7d)
+	return selectionLine(daemonAccountName(m, resp.SelectedID), resp.Sticky, resp.HasUsage, 100-resp.Remaining5h, 100-resp.Remaining7d, resp.Scoped7dModel, resp.Scoped7dUtil)
 }
 
 func liveSelectionLine(sr *pool.SelectResult) string {
-	return selectionLine(accountName(sr.Best.Label), sr.Sticky, sr.HasUsage, sr.Util5h, sr.Util7d)
+	return selectionLine(accountName(sr.Best.Label), sr.Sticky, sr.HasUsage, sr.Util5h, sr.Util7d, sr.Scoped7dModel, sr.Scoped7dUtil)
 }
