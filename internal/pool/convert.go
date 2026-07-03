@@ -80,6 +80,12 @@ func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, f
 	if overlay.Mounted(dir) {
 		return a, fmt.Errorf("convert acct-%02d: %s is already a mountpoint but the row says %s; refusing", a.ID, dir, a.OverlayKind)
 	}
+	// A mux bridge symlink resolves INTO the shared mirror; moving private files
+	// through it (MovePrivateEntries below) would write into the live mount, not
+	// the account dir. The row says symlink, so a bridge here is wreckage — refuse.
+	if IsBridgeSymlink(dir) {
+		return a, fmt.Errorf("convert acct-%02d: %s is a mux bridge symlink into %s but the row says %s; refusing to move files through the mirror", a.ID, dir, MuxRootDir(), a.OverlayKind)
+	}
 
 	// An account that never completed a login legitimately has no identity.
 	pre, preErr := readIdentity(filepath.Join(dir, ".claude.json"))
@@ -236,6 +242,12 @@ func (m *Manager) HealStrandedPrivate(a store.Account) (bool, error) {
 	}
 	if overlay.Mounted(dir) {
 		return false, fmt.Errorf("heal acct-%02d: %s is a live mountpoint but the row says symlink; refusing to move files under a mirror", a.ID, dir)
+	}
+	// A mux bridge symlink is a live-mirror stand-in the row must not carry: moving
+	// the stranded files back through it (MovePrivateEntries) would write into the
+	// mount. Refuse loudly for `ccp doctor` rather than corrupt the mirror.
+	if IsBridgeSymlink(dir) {
+		return false, fmt.Errorf("heal acct-%02d: %s is a mux bridge symlink but the row says symlink; refusing to move files through the mirror — run `ccp doctor`", a.ID, dir)
 	}
 	symProv, err := m.overlayFor(fkoverlay.BackendSymlink)
 	if err != nil {

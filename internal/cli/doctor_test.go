@@ -109,7 +109,7 @@ func TestReportHolder(t *testing.T) {
 // ✓ at exactly pool.MinHolderVersion, ✗ with the brew-upgrade hint below it,
 // and silent when the holder is unreachable (reportHolder owns that failure).
 func TestReportHolderMitigations(t *testing.T) {
-	if pool.MinHolderVersion != "v0.23.0" {
+	if pool.MinHolderVersion != "v0.29.0" {
 		t.Fatalf("pool.MinHolderVersion = %q; the mitigation floor moved — re-derive this matrix", pool.MinHolderVersion)
 	}
 	cases := map[string]struct {
@@ -119,24 +119,24 @@ func TestReportHolderMitigations(t *testing.T) {
 		wantDetail  []string // every fragment must appear in the detail
 	}{
 		"holder at exactly the minimum version passes": {
-			facts:       holderFacts{reachable: true, version: "v0.23.0"},
+			facts:       holderFacts{reachable: true, version: "v0.29.0"},
 			wantHealthy: true,
 		},
 		"newer holder passes": {
-			facts:       holderFacts{reachable: true, version: "v0.25.0"},
+			facts:       holderFacts{reachable: true, version: "v0.30.0"},
 			wantHealthy: true,
 		},
 		"dev holder (locally built, current source) passes": {
 			facts:       holderFacts{reachable: true, version: "dev"},
 			wantHealthy: true,
 		},
-		"pre-mitigation holder fails with observed, required, and the brew hint": {
-			facts:      holderFacts{reachable: true, version: "v0.22.9"},
-			wantDetail: []string{"v0.22.9", "v0.23.0", "brew upgrade --cask fusekit-holder"},
+		"pre-mux holder fails with observed, required, and the brew hint": {
+			facts:      holderFacts{reachable: true, version: "v0.28.0"},
+			wantDetail: []string{"v0.28.0", "v0.29.0", "brew upgrade --cask fusekit-holder"},
 		},
-		"commit-suffixed pre-mitigation holder still fails": {
-			facts:      holderFacts{reachable: true, version: "v0.22.9 (abc1234)"},
-			wantDetail: []string{"v0.22.9 (abc1234)", "v0.23.0", "brew upgrade --cask fusekit-holder"},
+		"commit-suffixed pre-mux holder still fails": {
+			facts:      holderFacts{reachable: true, version: "v0.28.0 (abc1234)"},
+			wantDetail: []string{"v0.28.0 (abc1234)", "v0.29.0", "brew upgrade --cask fusekit-holder"},
 		},
 		"unreachable holder says nothing": {
 			facts: holderFacts{reachable: false},

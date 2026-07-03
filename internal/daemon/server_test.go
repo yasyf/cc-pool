@@ -602,6 +602,9 @@ func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
+	// A migrated fuse account's dir is a mux bridge symlink; the startup reconcile
+	// adopts the live mirror (fake Health nil) rather than migrating it.
+	makeBridge(t, dirs[1])
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
 	sockDir, err := os.MkdirTemp("/tmp", "ccp-test")

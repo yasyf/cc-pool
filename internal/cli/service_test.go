@@ -440,6 +440,67 @@ func TestPurgeAllRemovesStateWhenClean(t *testing.T) {
 	}
 }
 
+// TestUninstallSurvivorMuxRoot pins the mux-root survivor check: account dirs are
+// bridge symlinks into ~/.cc-pool/mnt, so a still-mounted shared root is invisible
+// to mountedAccounts — the uninstall must treat the mounted mux root itself as a
+// survivor (else purgeAll's RemoveAll walks the live mirror into ~/.claude).
+func TestUninstallSurvivorMuxRoot(t *testing.T) {
+	cases := map[string]struct {
+		purge   bool
+		wantErr string
+	}{
+		"plain uninstall is nonzero": {purge: false, wantErr: "still mounted"},
+		"purge hard-aborts":          {purge: true, wantErr: "refusing to purge"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			home := tempHome(t)
+			// A fuse account whose dir is a bridge symlink — never a mountpoint itself.
+			acctDir := filepath.Join(home, ".cc-pool", "accounts", "acct-01")
+			seedAccounts(t, store.Account{ID: 1, ConfigDir: acctDir, OverlayKind: string(fkoverlay.BackendNFS)})
+			swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) { return nil, nil })
+			// Only the shared mux root reads mounted; the bridge-symlink account dir does not.
+			swapVar(t, &dirMounted, func(dir string) bool { return dir == pool.MuxRootDir() })
+			stubStopDaemon(t)
+
+			cmd, _, errOut := uninstallCmd()
+			err := runServiceUninstall(cmd, tc.purge, false)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want substring %q", err, tc.wantErr)
+			}
+			if tc.purge && !strings.Contains(err.Error(), pool.MuxRootDir()) {
+				t.Errorf("purge abort must name the live mux root, got %v", err)
+			}
+			if got := stripANSI(errOut.String()); !strings.Contains(got, "still a live mountpoint") {
+				t.Errorf("mux-root survivor not warned:\n%s", got)
+			}
+			if _, serr := os.Stat(pool.DBPath()); serr != nil {
+				t.Errorf("pool state must survive an aborted run: %v", serr)
+			}
+		})
+	}
+}
+
+// TestPurgeAllRefusesLiveMuxRoot pins the second guard on the catastrophic
+// delete-into-~/.claude path: purgeAll refuses its RemoveAll while the shared mux
+// root (outside accounts/, so mountedStateDirs never sees it) is a live mountpoint.
+func TestPurgeAllRefusesLiveMuxRoot(t *testing.T) {
+	tempHome(t)
+	if err := pool.EnsureAccountsDir(); err != nil {
+		t.Fatal(err)
+	}
+	swapVar(t, &dirMounted, func(dir string) bool { return dir == pool.MuxRootDir() })
+
+	cmd, _, _ := uninstallCmd()
+	err := purgeAll(cmd)
+	if err == nil || !strings.Contains(err.Error(), "refusing to purge") || !strings.Contains(err.Error(), pool.MuxRootDir()) {
+		t.Fatalf("error = %v, want a refusal naming the mux root", err)
+	}
+	if _, serr := os.Stat(pool.StateDir()); serr != nil {
+		t.Fatalf("state dir must survive the aborted purge: %v", serr)
+	}
+}
+
 // TestHolderStatusLine pins the `ccp service status` holder line: silent when
 // there is no holder and no fuse rows, "not running" when fuse rows need one,
 // a running line with mount count otherwise.

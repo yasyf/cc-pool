@@ -189,7 +189,13 @@ func TestConvertOverlayRejectsWrongKindFake(t *testing.T) {
 
 // TestConvertOverlayRetreatWithoutLiveMount pins the escape hatch when fuse rows outlive their mounts: with nothing mounted Teardown is a no-op, so the fuse→symlink retreat is pure file moves and works in every build.
 func TestConvertOverlayRetreatWithoutLiveMount(t *testing.T) {
-	m, a, dir := newConvertFixture(t, nil)
+	// A fake fuse provider: the real mux provider's Teardown would refuse the
+	// real-dir rest state this test models (the mux world's rest state is a bridge
+	// symlink; TestConvertRoundTripWithBridgeSymlinks covers that). Here the fuse
+	// teardown is a no-op, exactly the "nothing mounted" case, so the retreat is
+	// pure file moves — what this test pins.
+	ops := []string{}
+	m, a, dir := newConvertFixture(t, &fakeFuse{ops: &ops})
 	// Fuse rest state.
 	priv := fkoverlay.FusePrivateRoot(dir)
 	if err := os.MkdirAll(priv, 0o700); err != nil {
@@ -512,7 +518,8 @@ func TestConvertToSymlinkAbortsOnFailedUnmount(t *testing.T) {
 
 // TestConvertToSymlinkSweepsSharedOrphans: a force-unmounted fuse mirror leaves real orphans at shared names (projects/, history.jsonl); the retreat must relocate them into base (merging), re-link, and never leak the account's private identity into base.
 func TestConvertToSymlinkSweepsSharedOrphans(t *testing.T) {
-	m, a, dir := newConvertFixture(t, nil)
+	ops := []string{}
+	m, a, dir := newConvertFixture(t, &fakeFuse{ops: &ops})
 	base := ClaudeDir()
 	priv := fkoverlay.FusePrivateRoot(dir)
 
@@ -970,7 +977,8 @@ func TestConvertToFuseTeardownFailureRollsBack(t *testing.T) {
 // removal; an unclassified ".foo" and a real shared orphan behave exactly as
 // before.
 func TestConvertToSymlinkIgnoresAndCleansAppleDoubleLitter(t *testing.T) {
-	m, a, dir := newConvertFixture(t, nil)
+	ops := []string{}
+	m, a, dir := newConvertFixture(t, &fakeFuse{ops: &ops})
 	base := ClaudeDir()
 	priv := fkoverlay.FusePrivateRoot(dir)
 
@@ -1033,7 +1041,8 @@ func TestConvertToSymlinkIgnoresAndCleansAppleDoubleLitter(t *testing.T) {
 // is cleared from the private root; anything unclassified (".foo") keeps the
 // dir alive — its contents are data deletion could destroy.
 func TestConvertToSymlinkLeavesUnclassifiedPrivateRootEntries(t *testing.T) {
-	m, a, dir := newConvertFixture(t, nil)
+	ops := []string{}
+	m, a, dir := newConvertFixture(t, &fakeFuse{ops: &ops})
 	priv := fkoverlay.FusePrivateRoot(dir)
 	if err := os.MkdirAll(priv, 0o700); err != nil {
 		t.Fatal(err)
@@ -1117,4 +1126,165 @@ func readFileT(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// replaceWithBridge swaps an account dir for a mux bridge symlink into the shared
+// mux root — the on-disk shape of a fuse-mux account (IsBridgeSymlink reads true).
+func replaceWithBridge(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(MuxRootDir(), filepath.Base(dir)), dir); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// muxSetupSim mirrors the fuse provider's setupMux: an empty account dir is
+// replaced by the bridge symlink, a non-empty one is refused (ErrAccountDirOccupied),
+// and an existing symlink is left in place.
+func muxSetupSim(_, dir string) error {
+	fi, err := os.Lstat(dir)
+	switch {
+	case os.IsNotExist(err):
+	case err != nil:
+		return err
+	case fi.Mode()&os.ModeSymlink != 0:
+		return nil
+	case !fi.IsDir():
+		return fmt.Errorf("%w: %s is a file", fkoverlay.ErrAccountDirOccupied, dir)
+	default:
+		entries, rerr := os.ReadDir(dir)
+		if rerr != nil {
+			return rerr
+		}
+		if len(entries) > 0 {
+			return fmt.Errorf("%w: %s holds %d entries", fkoverlay.ErrAccountDirOccupied, dir, len(entries))
+		}
+		if err := os.Remove(dir); err != nil {
+			return err
+		}
+	}
+	return os.Symlink(filepath.Join(MuxRootDir(), filepath.Base(dir)), dir)
+}
+
+// bridgeFuse is a fuse provider fake that models the mux bridge on disk: Setup
+// lays the bridge symlink (muxSetupSim), Teardown removes it. It lets the
+// convert round-trip run through the real file-move orchestration without a holder.
+type bridgeFuse struct{ ops *[]string }
+
+func (b *bridgeFuse) Backend() fkoverlay.Backend    { return fkoverlay.BackendNFS }
+func (b *bridgeFuse) Sync(_, _ string) error        { return nil }
+func (b *bridgeFuse) Health(_, _ string) error      { return nil }
+func (b *bridgeFuse) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
+
+func (b *bridgeFuse) Setup(base, dir string) error {
+	*b.ops = append(*b.ops, "setup")
+	return muxSetupSim(base, dir)
+}
+
+func (b *bridgeFuse) Teardown(_, dir string) error {
+	*b.ops = append(*b.ops, "teardown")
+	fi, err := os.Lstat(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("refusing to remove %s: not a symlink", dir)
+	}
+	return os.Remove(dir)
+}
+
+// TestConvertToFuseRefusesBridgeSymlink pins the bridge-symlink guard: a symlink
+// row whose dir is unexpectedly a mux bridge symlink must not convert to fuse —
+// moving files through it (MovePrivateEntries) writes into the live mirror.
+func TestConvertToFuseRefusesBridgeSymlink(t *testing.T) {
+	ops := []string{}
+	m, a, dir := newConvertFixture(t, &fakeFuse{ops: &ops})
+	replaceWithBridge(t, dir)
+
+	_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
+	if err == nil || !strings.Contains(err.Error(), "bridge symlink") {
+		t.Fatalf("convertToFuse over a bridge symlink = %v, want a bridge-symlink refusal", err)
+	}
+	if len(ops) != 0 {
+		t.Fatalf("refused convert still touched the fuse provider: %v", ops)
+	}
+	if storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row flipped despite a refused convert")
+	}
+}
+
+// TestHealStrandedPrivateRefusesBridgeSymlink pins the heal-side guard: a symlink
+// row with stranded private files whose dir is a bridge symlink must refuse —
+// moving the files back through it corrupts the mirror; the stranded copy is left
+// intact for `ccp doctor`.
+func TestHealStrandedPrivateRefusesBridgeSymlink(t *testing.T) {
+	m, a, dir := newConvertFixture(t, nil)
+	priv := fkoverlay.FusePrivateRoot(dir)
+	if err := os.MkdirAll(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, ".claude.json"), filepath.Join(priv, ".claude.json")); err != nil {
+		t.Fatal(err)
+	}
+	replaceWithBridge(t, dir)
+
+	healed, err := m.HealStrandedPrivate(a)
+	if healed || err == nil || !strings.Contains(err.Error(), "bridge symlink") {
+		t.Fatalf("HealStrandedPrivate over a bridge symlink = (%v, %v), want a bridge-symlink refusal", healed, err)
+	}
+	if got := readFileT(t, filepath.Join(priv, ".claude.json")); got != identityJSON {
+		t.Fatalf("stranded identity moved through the mirror: %q", got)
+	}
+}
+
+// TestConvertRoundTripBridgeSymlink pins the mux round-trip: symlink→fuse lays the
+// bridge symlink and moves private files to the backing root; fuse→symlink removes
+// the bridge and restores a clean symlink account with its identity intact.
+func TestConvertRoundTripBridgeSymlink(t *testing.T) {
+	ops := []string{}
+	fake := &bridgeFuse{ops: &ops}
+	m, a, dir := newConvertFixture(t, nil)
+	m.OverlayFor = func(backend fkoverlay.Backend) (fkoverlay.Provider, error) {
+		if backend.IsFuse() {
+			return fake, nil
+		}
+		return newSymlinkProvider(), nil
+	}
+	priv := fkoverlay.FusePrivateRoot(dir)
+
+	fwd, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
+	if err != nil {
+		t.Fatalf("symlink→fuse: %v", err)
+	}
+	if fwd.OverlayKind != "nfs" || storedKind(t, m, a.ID) != "nfs" {
+		t.Fatalf("row not flipped to fuse: returned=%s stored=%s", fwd.OverlayKind, storedKind(t, m, a.ID))
+	}
+	if !IsBridgeSymlink(dir) {
+		t.Fatal("symlink→fuse did not lay the bridge symlink")
+	}
+	if got := readFileT(t, filepath.Join(priv, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not moved to the backing root: %q", got)
+	}
+
+	back, err := m.ConvertOverlay(t.Context(), fwd, fkoverlay.BackendSymlink)
+	if err != nil {
+		t.Fatalf("fuse→symlink: %v", err)
+	}
+	if back.OverlayKind != "symlink" || storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row not flipped back to symlink")
+	}
+	if IsBridgeSymlink(dir) {
+		t.Fatal("fuse→symlink left the bridge symlink in place")
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored after retreat: %q", got)
+	}
+	if _, err := os.Readlink(filepath.Join(dir, "projects")); err != nil {
+		t.Fatalf("symlink overlay not re-asserted after retreat: %v", err)
+	}
 }

@@ -866,6 +866,43 @@ func TestHealFuseMountFailedRetreatsImmediately(t *testing.T) {
 	}
 }
 
+// TestHealFuseForeignRootSweepsAndRetries pins finding 7b: a mux subtree whose
+// Setup hits a foreign carcass at the SHARED ROOT is classified as a retry that
+// triggers the pool-idle-gated root sweep — never the fallbackToSymlink default
+// (which would irreversibly demote the whole pool over a registry-state error).
+func TestHealFuseForeignRootSweepsAndRetries(t *testing.T) {
+	s, dirs, fake := newHealServer(t)
+	a := flipToFuse(t, s, 1)
+	makeBridge(t, dirs[1])
+	root := pool.MuxRootDir()
+	fake.setupErr = fmt.Errorf("mount %s: %w", dirs[1], mountd.ErrForeignMount)
+	// The shared root reads mounted (the foreign carcass); the account dir is a bridge.
+	fakeOverlayMounted(t, func(d string) bool { return d == root })
+	var unmounted []string
+	swapForceUnmount(t, func(d string) error { unmounted = append(unmounted, d); return nil })
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+
+	if got := s.healFuse(t.Context(), a); got != healRetry {
+		t.Fatalf("healFuse outcome = %d, want healRetry (%d): a foreign root is registry state, never a demotion", got, healRetry)
+	}
+	if kindOf(t, s, 1) != "nfs" {
+		t.Fatal("row demoted to symlink over a foreign-root carcass")
+	}
+	swept := false
+	for _, d := range unmounted {
+		if d == root {
+			swept = true
+		}
+	}
+	if !swept {
+		t.Fatalf("foreign-root carcass not swept: force-unmount calls %v", unmounted)
+	}
+	if !strings.Contains(buf.String(), "foreign carcass at the shared mux root") {
+		t.Fatalf("foreign-root sweep not surfaced:\n%s", buf.String())
+	}
+}
+
 // TestRetreatAllFuseRowsConvertsPoolToSymlink pins the whole-pool retreat:
 // retreatAllFuseRows force-unmounts and converts every fuse row to symlink.
 func TestRetreatAllFuseRowsConvertsPoolToSymlink(t *testing.T) {
@@ -1004,7 +1041,9 @@ func TestSweepOrphanMountpointsClearsNonRowCarcass(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	fakeOverlayMounted(t, func(string) bool { return true })
+	// Every accounts/ dir reads mounted, but not the shared mux root — this test
+	// pins the per-dir carcass sweep, not the mux-root sweep.
+	fakeOverlayMounted(t, func(dir string) bool { return dir != pool.MuxRootDir() })
 	var unmounted []string
 	swapForceUnmount(t, func(dir string) error {
 		unmounted = append(unmounted, dir)
@@ -1139,7 +1178,9 @@ func TestSweepOrphanDefersUnderLiveSession(t *testing.T) {
 	if err := os.MkdirAll(orphan, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	fakeOverlayMounted(t, func(string) bool { return true })
+	// The per-dir carcass reads mounted, but not the shared mux root — this test
+	// pins the per-dir sweep's live-session deferral.
+	fakeOverlayMounted(t, func(dir string) bool { return dir != pool.MuxRootDir() })
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{PID: 4242, ConfigDir: orphan}}, nil
 	}

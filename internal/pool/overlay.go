@@ -20,11 +20,14 @@ const HolderOwner = "cc-pool"
 // cannotHostHint is appended to mountd.ErrCannotHost when the holder cask is absent.
 const cannotHostHint = "run `ccp fuse enable` to install the fusekit-holder cask"
 
-// MinHolderVersion is the oldest fusekit-holder release carrying the NFS
-// kernel-panic mitigations (no namedattr, AppleDouble "._" blocking, attribute
-// stabilization). Hosting fuse mirrors on an older holder can panic macOS
-// (nfs_vinvalbuf2), so fuse is refused until the cask is upgraded.
-const MinHolderVersion = "v0.23.0"
+// MinHolderVersion is the oldest fusekit-holder release cc-pool will host on.
+// It carries the NFS kernel-panic mitigations (no namedattr, AppleDouble "._"
+// blocking, attribute stabilization) AND the single-mount mux surface
+// (HolderSpec.MuxRoot / Request.mux_root): an older holder silently ignores
+// mux_root and would mount each account dir per-dir, so it is the fail-loud gate
+// against a pre-mux holder. Hosting on an older holder is refused (routed to
+// healDeferredUnmitigated) until `brew upgrade --cask fusekit-holder`.
+const MinHolderVersion = "v0.29.0"
 
 // HolderVersionMitigated reports whether a holder's reported version carries
 // the kernel-panic mitigations (>= MinHolderVersion). The holder reports
@@ -123,6 +126,10 @@ func overlaySpec() fkoverlay.Spec {
 			ContentMode:     "source",
 			ProbePath:       "/" + overlay.ProbeFileName,
 			PrivatePrefixes: overlay.PrivatePrefixes,
+			// MuxRoot makes the provider serve every account as a subtree of ONE
+			// native mount at ~/.cc-pool/mnt and bridge each account dir to its
+			// subtree with a fail-closed symlink — one go-nfsv4 for the whole pool.
+			MuxRoot: MuxRootDir(),
 		},
 	}
 }

@@ -92,25 +92,24 @@ func TestOverlayProviderFor(t *testing.T) {
 // current-source holder — only a real release older than MinHolderVersion is
 // refused.
 func TestHolderVersionMitigated(t *testing.T) {
-	if MinHolderVersion != "v0.23.0" {
+	if MinHolderVersion != "v0.29.0" {
 		t.Fatalf("MinHolderVersion = %q; the mitigation floor moved — re-derive this matrix", MinHolderVersion)
 	}
 	cases := map[string]struct {
 		version string
 		want    bool
 	}{
-		"last pre-mitigation release refused":     {"v0.22.9", false},
+		"last pre-mux release refused":            {"v0.28.0", false},
 		"older release refused":                   {"v0.20.0", false},
-		"boundary v0.23.0 mitigated":              {"v0.23.0", true},
-		"v0.24.0 mitigated":                       {"v0.24.0", true},
-		"v0.25.0 mitigated":                       {"v0.25.0", true},
+		"boundary v0.29.0 mitigated":              {"v0.29.0", true},
+		"v0.30.0 mitigated":                       {"v0.30.0", true},
 		"future major mitigated":                  {"v1.0.0", true},
 		"dev build is current source":             {"dev", true},
 		"empty version fails open":                {"", true},
 		"unparseable version fails open":          {"not-a-version", true},
-		"commit-suffixed wire version passes":     {"v0.23.0 (abc1234)", true},
-		"commit-suffixed old version still fails": {"v0.22.9 (abc1234)", false},
-		"surrounding whitespace is trimmed":       {"  v0.22.9  ", false},
+		"commit-suffixed wire version passes":     {"v0.29.0 (abc1234)", true},
+		"commit-suffixed old version still fails": {"v0.28.0 (abc1234)", false},
+		"surrounding whitespace is trimmed":       {"  v0.28.0  ", false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -143,7 +142,7 @@ func (s *gateStub) Teardown(_, _ string) error    { s.teardowns++; return s.tear
 // serving, and torn down when Setup itself just spawned one from an old cask
 // binary.
 func TestMitigationGateSetup(t *testing.T) {
-	const oldVer, curVer = "v0.22.1", "v0.25.0"
+	const oldVer, curVer = "v0.28.0", "v0.29.0"
 	absent := errors.New("dial holder socket: no such file")
 	type probe struct {
 		ver string

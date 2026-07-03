@@ -49,15 +49,19 @@ providers:
 - **symlink** (default, zero-dependency): symlinks each top-level entry of `~/.claude` into
   the account dir. New top-level entries are picked up automatically at launch, by the
   daemon, and by `ccp doctor --fix`.
-- **fuse** (optional, live mirror): a passthrough mirror mounted via
+- **fuse** (optional, live mirror): a passthrough mirror served via
   [fuse-t](https://github.com/macos-fuse-t/fuse-t) — kext-less, mounted as you, no root —
-  and hosted by a detached cc-pool **mount-holder** process, so daemon restarts and upgrades
-  never disturb live sessions' mounts. Requires a `-tags fuse` build (cgo) and a one-time
-  *Network Volumes* privacy grant. macOS tccd keys that grant on the holder's resolved
-  executable path, so cc-pool spawns the holder from a stable copy at `~/.cc-pool/bin`
-  (fusekit `mountd.Spawn.StableExecDir`) — a fixed path whose embedded Developer-ID
-  requirement survives the byte copy — and the grant persists across `brew upgrade` instead
-  of re-prompting at each new Cellar path.
+  and hosted by the shared, signed **fusekit-holder** daemon (its own Homebrew cask), so
+  daemon restarts and upgrades never disturb live sessions' mounts, and one *Network
+  Volumes* privacy grant covers every consumer. The pool rides **one native mount** at
+  `~/.cc-pool/mnt`: each account is a subtree (`mnt/acct-NN`) of that single mount — one
+  fuse-t NFS server process (`go-nfsv4`) total, not one per account — and each
+  `accounts/acct-NN` dir is a fail-closed symlink onto its subtree, so account-dir paths
+  (which feed Keychain service-name hashing and session detection) never change. Attaching
+  or detaching an account is a holder-side map operation with no kernel unmount; the only
+  whole-mount operations are holder replacement and wedge recovery, both gated on a
+  pool-wide zero-session window. Requires fusekit-holder ≥ v0.29.0 (`ccp` refuses older
+  holders loudly and keeps accounts on symlink until upgraded).
 
 A few entries stay per-account instead of shared: `daemon/` and `ide/` (Claude's PID-keyed
 supervisor and IDE lock/socket files, which would collide across concurrent sessions),

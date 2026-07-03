@@ -110,6 +110,22 @@ func fakeOverlayMounted(t *testing.T, fn func(dir string) bool) {
 	t.Cleanup(func() { overlayMounted = prev })
 }
 
+// makeBridge replaces an account dir with the mux bridge symlink into the shared
+// mux root — the on-disk shape of a migrated fuse account (pool.IsBridgeSymlink
+// reads true), so reconcileAccount adopts/heals it instead of migrating it.
+func makeBridge(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(pool.MuxRootDir(), filepath.Base(dir)), dir); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newMigrateServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
@@ -835,7 +851,10 @@ func TestReconcileAdoptsLiveMount(t *testing.T) {
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	// healthErr nil (the default): the mirror reads mounted and live.
+	// A migrated fuse account's dir is a mux bridge symlink; with healthErr nil
+	// (the default) the mirror reads live, so reconcile adopts it untouched rather
+	// than running the one-time legacy migration.
+	makeBridge(t, dirs[1])
 
 	s.reconcileOverlays(t.Context())
 
@@ -887,6 +906,37 @@ func TestMountFuseClearsDeadMountThenSweepsThenMounts(t *testing.T) {
 	}
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("fresh mount not recorded in the holder cache")
+	}
+}
+
+// TestMountFuseDetachesWedgedBridgeSubtree pins finding 3: a deep-wedged but
+// shallow-live mux subtree (a bridge symlink) is DETACHED (Teardown) before the
+// re-attach, so the holder's idempotent AddMount genuinely re-establishes the child
+// and noteMounted's verdict-clear reflects a real re-attach — not a masked wedge.
+func TestMountFuseDetachesWedgedBridgeSubtree(t *testing.T) {
+	s, dirs, fake := newMigrateServer(t)
+	a := flipToFuse(t, s, 1)
+	makeBridge(t, dirs[1]) // the account dir is a bridge symlink, not a real mountpoint
+	fake.setupFn = muxSetupSim
+	// Shallow-live (Health passes) but deep-wedged: the branch must still detach.
+	s.holder.markDeepWedged(dirs[1])
+	fakeOverlayMounted(t, func(string) bool { return false })
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
+
+	if err := s.mountFuse(t.Context(), a); err != nil {
+		t.Fatalf("mountFuse: %v", err)
+	}
+	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"teardown", "setup"}) {
+		t.Fatalf("call order = %v, want [teardown setup] — a deep-wedged bridge subtree must be detached before re-attach", got)
+	}
+	if !pool.IsBridgeSymlink(dirs[1]) {
+		t.Fatal("bridge symlink not intact after the re-attach")
+	}
+	if !s.holder.ready(dirs[1]) {
+		t.Fatal("re-attached subtree not vouched in the holder cache")
+	}
+	if s.holder.deepWedged(dirs[1]) {
+		t.Fatal("deep-wedge verdict not cleared by a real detach/re-attach")
 	}
 }
 
@@ -1062,9 +1112,21 @@ func TestHealFuseTaxonomy(t *testing.T) {
 		// pre-mitigation holder: defer for the cask upgrade, never demote —
 		// remounting on that holder is the nfs_vinvalbuf2 panic vector.
 		"unmitigated holder defers without demoting": {
-			setupErr: fmt.Errorf("%w: holder v0.22.1 needs %s or newer; run `brew upgrade --cask fusekit-holder`",
+			setupErr: fmt.Errorf("%w: holder v0.28.0 needs %s or newer; run `brew upgrade --cask fusekit-holder`",
 				pool.ErrHolderUnmitigated, pool.MinHolderVersion),
 			wantOutcome: healDeferredUnmitigated, wantKind: "nfs",
+		},
+		// Mux registry state: a subtree could not join its shared root
+		// (unmount-then-retry). Never a mount verdict — retry, never demote.
+		"mux mismatch retries without demoting": {
+			setupErr:    fmt.Errorf("fuse mux setup: %w", mountd.ErrMuxMismatch),
+			wantOutcome: healRetry, wantKind: "nfs",
+		},
+		// A half-drained legacy account dir still holds unclassified state where
+		// the bridge symlink must go: refuse to clobber it, retry, never demote.
+		"occupied account dir retries without demoting": {
+			setupErr:    fmt.Errorf("fuse mux setup: %w", fkoverlay.ErrAccountDirOccupied),
+			wantOutcome: healRetry, wantKind: "nfs",
 		},
 		"genuine failure on an idle account converts": {
 			setupErr:    errors.New("mount exploded"),
@@ -1281,14 +1343,14 @@ func TestFuseGateHolderMitigationMatrix(t *testing.T) {
 		version  string
 		wantPass bool
 	}{
-		"pre-mitigation v0.22.9 refused":     {"v0.22.9", false},
-		"boundary v0.23.0 passes":            {"v0.23.0", true},
-		"v0.24.0 passes":                     {"v0.24.0", true},
-		"v0.25.0 passes":                     {"v0.25.0", true},
+		"pre-mux v0.28.0 refused":            {"v0.28.0", false},
+		"boundary v0.29.0 passes":            {"v0.29.0", true},
+		"v0.30.0 passes":                     {"v0.30.0", true},
+		"v1.0.0 passes":                      {"v1.0.0", true},
 		"dev holder passes (current source)": {"dev", true},
 		"empty version passes":               {"", true},
 		"garbage version passes":             {"not-a-version", true},
-		"commit-suffixed old holder refused": {"v0.22.9 (abc1234)", false},
+		"commit-suffixed old holder refused": {"v0.28.0 (abc1234)", false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

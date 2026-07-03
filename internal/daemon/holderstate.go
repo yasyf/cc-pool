@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
@@ -78,7 +79,10 @@ func (h *holderState) refresh(c *mountd.Client) {
 	}
 	m := make(map[string]bool, len(res.Mounts))
 	for _, mi := range res.Mounts {
-		m[mi.Dir] = mi.Live
+		// The holder reports the served path (a mux subtree ~/.cc-pool/mnt/acct-NN);
+		// the daemon keys the cache on the account ConfigDir. This is the ONE place
+		// the wire dir is translated — everything downstream stays ConfigDir-keyed.
+		m[pool.ConfigDirForMount(mi.Dir)] = mi.Live
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()

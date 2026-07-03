@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/yasyf/fusekit/state"
 )
@@ -55,6 +56,45 @@ func AccountsDir() string {
 // StateDir is cc-pool's own private state directory (~/.cc-pool).
 func StateDir() string {
 	return stateDir.Root()
+}
+
+// MuxRootDir is the single native fuse-t mount (~/.cc-pool/mnt) that serves
+// every fuse account as a logical subtree MuxRootDir()/<acct-NN>. One native
+// mount, one go-nfsv4 helper for the whole pool. Each account dir is a
+// fail-closed bridge symlink into its subtree; the account dir string itself
+// never changes (it is still hashed byte-for-byte into the Keychain service name
+// and matched exactly by procscan's CLAUDE_CONFIG_DIR scan).
+func MuxRootDir() string {
+	return stateDir.Path("mnt")
+}
+
+// ConfigDirForMount translates a holder-reported mount dir back to the account
+// ConfigDir the daemon keys everything on — the SINGLE wire→ConfigDir
+// translation. A mux subtree (a direct child of MuxRootDir()) maps to
+// AccountsDir()/<basename>; any other dir — a legacy per-account mount whose
+// served path IS the ConfigDir — passes through unchanged. Pure string function:
+// it never touches the filesystem, so it is safe on the holder cache hot path.
+func ConfigDirForMount(mountDir string) string {
+	if filepath.Dir(mountDir) == MuxRootDir() {
+		return filepath.Join(AccountsDir(), filepath.Base(mountDir))
+	}
+	return mountDir
+}
+
+// IsBridgeSymlink reports whether dir is a mux bridge symlink pointing into the
+// shared mux root — the fuse-mux overlay's account-dir stand-in. It reads the
+// link with os.Readlink (which never traverses INTO the target, so it cannot
+// hang on a wedged mount) and checks the target is a child of MuxRootDir(). A
+// symlink-row file operation must never follow it — moving files through it
+// writes into the live mirror — so convertToFuse and HealStrandedPrivate refuse
+// when it is present, and the daemon uses it to tell a migrated mux account (a
+// bridge symlink) from a legacy per-dir mount (a real dir).
+func IsBridgeSymlink(dir string) bool {
+	target, err := os.Readlink(dir)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(target, MuxRootDir()+string(os.PathSeparator))
 }
 
 // DBPath is the sqlite database path.

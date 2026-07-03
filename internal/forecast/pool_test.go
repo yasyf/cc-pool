@@ -240,8 +240,8 @@ func TestMoodOf(t *testing.T) {
 		"dry bumps alarmed to panic":   {1, 5, true, false, MoodPanic},
 		"panic stays panic under bump": {0, 0, true, false, MoodPanic},
 		// Weekly exhaustion floors the mood at alarmed however fresh the 5h mean.
-		"weekly floors chill at alarmed":   {1, 100, false, true, MoodAlarmed},
-		"weekly floors easy at alarmed":    {1, 50, false, true, MoodAlarmed},
+		"weekly floors chill at alarmed":    {1, 100, false, true, MoodAlarmed},
+		"weekly floors easy at alarmed":     {1, 50, false, true, MoodAlarmed},
 		"weekly no-op once already alarmed": {1, 5, false, true, MoodAlarmed},
 		// The dry bump applies on top of the weekly floor, reaching panic.
 		"weekly floor then dry is panic": {1, 100, true, true, MoodPanic},

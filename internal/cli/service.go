@@ -195,16 +195,27 @@ func runServiceUninstall(cmd *cobra.Command, purge, force bool) error {
 
 	reclaimHolderMounts(cmd)
 
-	if survivors := mountedAccounts(accts); len(survivors) > 0 {
-		names := make([]string, len(survivors))
-		for i, a := range survivors {
-			names[i] = fmt.Sprintf("acct-%02d", a.ID)
+	survivors := mountedAccounts(accts)
+	// Account dirs are bridge symlinks into the shared mux mount, so a live
+	// ~/.cc-pool/mnt is invisible to mountedAccounts — check it explicitly. It is
+	// the load-bearing survivor now: purgeAll's RemoveAll(~/.cc-pool) would walk a
+	// still-mounted mux root straight into the merged mirror and delete inside
+	// ~/.claude.
+	muxMounted := dirMounted(pool.MuxRootDir())
+	if len(survivors) > 0 || muxMounted {
+		names := make([]string, 0, len(survivors)+1)
+		for _, a := range survivors {
+			names = append(names, fmt.Sprintf("acct-%02d", a.ID))
 			warn(errOut, "acct-%02d (%s) is still a live mountpoint", a.ID, a.ConfigDir)
+		}
+		if muxMounted {
+			names = append(names, pool.MuxRootDir())
+			warn(errOut, "the shared mount %s is still a live mountpoint", pool.MuxRootDir())
 		}
 		if purge {
 			return fmt.Errorf("refusing to purge: %s is still a live mountpoint; unmount it first (purging through a live mirror would delete inside ~/.claude)", strings.Join(names, ", "))
 		}
-		return fmt.Errorf("%s still mounted after the holder shutdown; check %s", plural(len(survivors), "account dir"), abbreviateHome(pool.MountHolderLogPath()))
+		return fmt.Errorf("%s still mounted after the holder shutdown; check %s", plural(len(names), "pool mount"), abbreviateHome(pool.MountHolderLogPath()))
 	}
 
 	if !purge {
@@ -341,7 +352,14 @@ func purgeAll(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	if still := mountedStateDirs(); len(still) > 0 {
+	still := mountedStateDirs()
+	// The shared mux mount lives at ~/.cc-pool/mnt, outside accounts/, so
+	// mountedStateDirs never sees it — but RemoveAll walks straight through it into
+	// the merged mirror. Refuse while it is a kernel mountpoint.
+	if dirMounted(pool.MuxRootDir()) {
+		still = append(still, pool.MuxRootDir())
+	}
+	if len(still) > 0 {
 		return fmt.Errorf("refusing to purge: %s is still a live mountpoint; unmount it first (purging through a live mirror would delete inside ~/.claude)", strings.Join(still, ", "))
 	}
 	if err := os.RemoveAll(pool.StateDir()); err != nil {
