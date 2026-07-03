@@ -1,5 +1,7 @@
-// Package keychain derives the per-config-dir Keychain service name exactly as
-// Claude Code does and reads/writes the credential item via /usr/bin/security.
+// Package creds owns Claude Code credentials: the Credential blob format, the
+// per-config-dir Keychain service-name derivation (exactly as Claude Code
+// does), and both storage backends — the macOS Keychain item accessed via
+// /usr/bin/security, and claude's plaintext .credentials.json fallback.
 //
 // Shelling out to Apple's signed security(1) keeps items prompt-free on later
 // reads: the item ACL trusts that binary, not ours, sidestepping ad-hoc-signing
@@ -7,7 +9,7 @@
 //
 // ServiceName always emits a hash-suffixed name, so no code path here can name
 // the canonical unsuffixed item plain claude owns.
-package keychain
+package creds
 
 import (
 	"bytes"
@@ -146,19 +148,6 @@ func Delete(service, account string) error {
 		return fmt.Errorf("security delete-generic-password: %w: %s", err, strings.TrimSpace(errb.String()))
 	}
 	return nil
-}
-
-// Reassert reads then rewrites the item through our security(1) so our later
-// access is prompt-free whatever process created it.
-func Reassert(service, account string) (*Credential, error) {
-	cred, err := Read(service, account)
-	if err != nil {
-		return nil, err
-	}
-	if err := Write(service, account, cred); err != nil {
-		return nil, err
-	}
-	return cred, nil
 }
 
 // isNotFound recognizes security(1)'s errSecItemNotFound ("could not be found") text.

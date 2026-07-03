@@ -14,7 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -60,6 +60,10 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 		finishLogin: func(a store.Account) error {
 			return finishRelogin(ctx, m, a)
 		},
+		readCred: func(a store.Account) (*creds.Credential, error) {
+			cred, _, err := m.ReadCredential(a)
+			return cred, err
+		},
 	}
 	p := tea.NewProgram(model,
 		tea.WithContext(ctx),
@@ -85,6 +89,7 @@ type statusTUI struct {
 	toggle      func(accountID int) (bool, error)
 	buildLogin  func(a store.Account) (*exec.Cmd, error)
 	finishLogin func(a store.Account) error
+	readCred    func(a store.Account) (*creds.Credential, error) // credential resolution for the re-login probe (both backends)
 	snaps       []pool.Snapshot
 	pin         dirPin
 	cursorID    int
@@ -214,8 +219,8 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			t.reloginBusy = true
 			t.reloginErr = nil
 			a := s.Account
-			wl := &watchedLogin{ctx: t.ctx, cmd: c, read: func() (*keychain.Credential, error) {
-				return reloginCred(a)
+			wl := &watchedLogin{ctx: t.ctx, cmd: c, read: func() (*creds.Credential, error) {
+				return t.readCred(a)
 			}}
 			return t, tea.Exec(wl, func(error) tea.Msg { return reloginExitedMsg{account: a} })
 		}

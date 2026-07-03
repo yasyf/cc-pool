@@ -1,4 +1,4 @@
-package keychain
+package creds
 
 import (
 	"errors"
@@ -20,6 +20,17 @@ const (
 	// SourceFile is claude's plaintext $CONFIG_DIR/.credentials.json fallback.
 	SourceFile
 )
+
+// String names the backend for display and the daemon wire.
+func (s Source) String() string {
+	switch s {
+	case SourceKeychain:
+		return "keychain"
+	case SourceFile:
+		return "file"
+	}
+	return fmt.Sprintf("source(%d)", int(s))
+}
 
 // FileCredentialPath returns the plaintext credential path for a config dir.
 func FileCredentialPath(configDir string) string {
@@ -54,23 +65,6 @@ func WriteFileCredential(configDir string, cred *Credential) error {
 		return err
 	}
 	return writeCredentialFile(FileCredentialPath(configDir), blob)
-}
-
-// LocateCredential resolves an account's live credential, Keychain first (as
-// claude prefers) then the plaintext file. Returns the account label (computed
-// for the file, which has no -a), the source, or ErrNotFound if neither holds it.
-func LocateCredential(configDir, service string) (account string, src Source, err error) {
-	acct, err := DiscoverAccount(service)
-	if err == nil {
-		return acct, SourceKeychain, nil
-	}
-	if !errors.Is(err, ErrNotFound) {
-		return "", SourceKeychain, err
-	}
-	if FileCredentialExists(configDir) {
-		return AccountLabel(), SourceFile, nil
-	}
-	return "", SourceKeychain, ErrNotFound
 }
 
 // writeCredentialFile writes via temp+rename at 0600. The temp keeps the

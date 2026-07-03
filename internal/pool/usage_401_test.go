@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -54,69 +54,91 @@ func (f *fakeOAuth401) Refresh(_ context.Context, _, rt string) (*oauth.TokenRes
 	return &oauth.TokenResponse{AccessToken: at, RefreshToken: f.currentRT, ExpiresIn: 3600}, nil
 }
 
-// rotatingKeychain returns `current` until rotateAfter reads elapse, then
-// `rotated` — injecting a live session that rotates the chain between successive
-// reads. A Write makes the written credential authoritative and cancels the
-// pending rotation.
-type rotatingKeychain struct {
+// rotatingCreds is a Credentials seam whose Keychain store returns `current`
+// until rotateAfter reads elapse, then `rotated` — injecting a live session
+// that rotates the chain between successive reads. A Write makes the written
+// credential authoritative and cancels the pending rotation. The file backend
+// is the real (empty) FileStore under the account's temp ConfigDir.
+type rotatingCreds struct {
 	mu          sync.Mutex
 	reads       int
 	rotateAfter int // 0 = never rotate
-	current     *keychain.Credential
-	rotated     *keychain.Credential
+	current     *creds.Credential
+	rotated     *creds.Credential
 	touched     []string
 }
 
-func (k *rotatingKeychain) Read(service, _ string) (*keychain.Credential, error) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.touched = append(k.touched, service)
-	k.reads++
-	c := k.current
-	if k.rotated != nil && k.rotateAfter > 0 && k.reads > k.rotateAfter {
-		c = k.rotated
+func (k *rotatingCreds) Store(a store.Account, src creds.Source) creds.Store {
+	if src == creds.SourceFile {
+		return creds.FileStore{ConfigDir: a.ConfigDir}
 	}
-	if c == nil {
-		return nil, keychain.ErrNotFound
-	}
-	cp := *c
-	return &cp, nil
+	return rotatingItem{k: k, service: a.KeychainService}
 }
 
-func (k *rotatingKeychain) Write(service, _ string, cred *keychain.Credential) error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.touched = append(k.touched, service)
-	cp := *cred
-	k.current = &cp
-	k.rotated = nil
-	return nil
+func (k *rotatingCreds) Stores(a store.Account) []creds.Store {
+	return []creds.Store{k.Store(a, creds.SourceKeychain), k.Store(a, creds.SourceFile)}
 }
 
-func (k *rotatingKeychain) Delete(service, _ string) error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.touched = append(k.touched, service)
-	return nil
-}
+func (k *rotatingCreds) Discover(string) (string, error) { return "user", nil }
 
-func (k *rotatingKeychain) Discover(string) (string, error) { return "user", nil }
-
-func (k *rotatingKeychain) touchedServices() []string {
+func (k *rotatingCreds) touchedServices() []string {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	return append([]string(nil), k.touched...)
 }
 
-func cred401(at, rt string, expiresAt time.Time) *keychain.Credential {
-	c := &keychain.Credential{}
+// rotatingItem is rotatingCreds' Keychain store bound to one service.
+type rotatingItem struct {
+	k       *rotatingCreds
+	service string
+}
+
+func (i rotatingItem) Source() creds.Source { return creds.SourceKeychain }
+
+func (i rotatingItem) Read() (*creds.Credential, error) {
+	i.k.mu.Lock()
+	defer i.k.mu.Unlock()
+	i.k.touched = append(i.k.touched, i.service)
+	i.k.reads++
+	c := i.k.current
+	if i.k.rotated != nil && i.k.rotateAfter > 0 && i.k.reads > i.k.rotateAfter {
+		c = i.k.rotated
+	}
+	if c == nil {
+		return nil, creds.ErrNotFound
+	}
+	cp := *c
+	return &cp, nil
+}
+
+func (i rotatingItem) Write(cred *creds.Credential) error {
+	i.k.mu.Lock()
+	defer i.k.mu.Unlock()
+	i.k.touched = append(i.k.touched, i.service)
+	cp := *cred
+	i.k.current = &cp
+	i.k.rotated = nil
+	return nil
+}
+
+func (i rotatingItem) Delete() error {
+	i.k.mu.Lock()
+	defer i.k.mu.Unlock()
+	i.k.touched = append(i.k.touched, i.service)
+	return nil
+}
+
+func (i rotatingItem) String() string { return fmt.Sprintf("rotating keychain item %q", i.service) }
+
+func cred401(at, rt string, expiresAt time.Time) *creds.Credential {
+	c := &creds.Credential{}
 	c.ClaudeAiOauth.AccessToken = at
 	c.ClaudeAiOauth.RefreshToken = rt
 	c.ClaudeAiOauth.ExpiresAt = expiresAt.UnixMilli()
 	return c
 }
 
-func newManager401(t *testing.T, kc CredentialStore, fo *fakeOAuth401) (*Manager, store.Account) {
+func newManager401(t *testing.T, kc Credentials, fo *fakeOAuth401) (*Manager, store.Account) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
 	if err != nil {
@@ -127,7 +149,7 @@ func newManager401(t *testing.T, kc CredentialStore, fo *fakeOAuth401) (*Manager
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	return &Manager{Store: st, OAuth: fo, Keychain: kc, LockDir: t.TempDir()}, a
+	return &Manager{Store: st, OAuth: fo, Creds: kc, LockDir: t.TempDir()}, a
 }
 
 // assertNeverCanonical pins the safety rule that no op ever names plain claude's
@@ -158,7 +180,7 @@ func (fakeOAuthRevoked) Usage(_ context.Context, _ string) (*oauth.Usage, error)
 // must surface ErrNeedsLogin, not a usage-endpoint 429's rateLimited, and record
 // no usage sample.
 func TestSampleUsageRevokedNotMaskedByRateLimit(t *testing.T) {
-	kc := &rotatingKeychain{
+	kc := &rotatingCreds{
 		current: cred401("at-0", "rt-stale", time.Now().Add(-time.Hour)),
 	}
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
@@ -170,7 +192,7 @@ func TestSampleUsageRevokedNotMaskedByRateLimit(t *testing.T) {
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{Store: st, OAuth: fakeOAuthRevoked{}, Keychain: kc, LockDir: t.TempDir()}
+	m := &Manager{Store: st, OAuth: fakeOAuthRevoked{}, Creds: kc, LockDir: t.TempDir()}
 
 	_, rateLimited, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
 	if !errors.Is(err, ErrNeedsLogin) {
@@ -191,7 +213,7 @@ func TestSampleUsageRevokedNotMaskedByRateLimit(t *testing.T) {
 // rung 1 (a pure re-read) retries with the rotated token, recovering without
 // spending a refresh token.
 func TestFetchUsage401RereadRetriesRotatedToken(t *testing.T) {
-	kc := &rotatingKeychain{
+	kc := &rotatingCreds{
 		rotateAfter: 1, // read#1 (pre-flight) = current; read#2 (rung 1) = rotated
 		current:     cred401("at-0", "rt-0", time.Now().Add(-time.Hour)),
 		rotated:     cred401("at-9", "rt-9", time.Now().Add(time.Hour)),
@@ -211,7 +233,7 @@ func TestFetchUsage401RereadRetriesRotatedToken(t *testing.T) {
 // TestSampleUsageClassifiesNeedsLogin: with no refresh token a 401 is definitive
 // — the error wraps ErrNeedsLogin and no refresh is attempted.
 func TestSampleUsageClassifiesNeedsLogin(t *testing.T) {
-	kc := &rotatingKeychain{current: cred401("at-0", "", time.Now().Add(-time.Hour))}
+	kc := &rotatingCreds{current: cred401("at-0", "", time.Now().Add(-time.Hour))}
 	fo := newFakeOAuth401("") // nothing valid → at-0 401s
 	m, a := newManager401(t, kc, fo)
 
@@ -272,7 +294,7 @@ func TestSampleUsageBusyRefreshGuard(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			kc := &rotatingKeychain{
+			kc := &rotatingCreds{
 				current:     cred401("at-0", tc.rt, tc.expiresAt),
 				rotateAfter: tc.rotateAfter,
 				rotated:     cred401("at-9", "rt-9", time.Now().Add(time.Hour)),

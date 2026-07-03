@@ -6,12 +6,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
 // TestPoolNeverTouchesDefaultKeychainItem pins the #1 safety invariant: no
-// CredentialStore op ever names the canonical unsuffixed item plain `claude`
+// credential-seam op ever names the canonical unsuffixed item plain `claude`
 // owns ("Claude Code-credentials"). It drives the real ops — pre-flight refresh,
 // rotated-token re-assert, remove — asserting each names only the account's own
 // suffixed service.
@@ -24,23 +25,21 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	svc := keychain.ServiceName("/tmp/ccp-test/acct-01")
+	svc := creds.ServiceName("/tmp/ccp-test/acct-01")
 	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: svc, KeychainAccount: "user", OverlayKind: "symlink"}
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
 
-	fk := newFakeKeychain()
-	cred := &keychain.Credential{}
+	fk := credstest.NewFake()
+	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-0"
 	cred.ClaudeAiOauth.RefreshToken = "rt-0"
 	// Near-expiry so SampleUsage's pre-flight must POST-refresh.
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Minute).UnixMilli()
-	if err := fk.Write(svc, a.KeychainAccount, cred); err != nil {
-		t.Fatal(err)
-	}
+	fk.Put(svc, a.KeychainAccount, cred)
 	fo := &fakeOAuth{currentRT: "rt-0"}
-	m := &Manager{Store: st, OAuth: fo, Keychain: fk, LockDir: t.TempDir()}
+	m := &Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()}
 
 	if _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true}); err != nil {
 		t.Fatalf("SampleUsage: %v", err)
@@ -55,7 +54,7 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 		t.Fatalf("Remove: %v", err)
 	}
 
-	touched := fk.touchedServices()
+	touched := fk.TouchedServices()
 	if len(touched) == 0 {
 		t.Fatal("no keychain ops recorded; the test exercised nothing")
 	}
@@ -67,7 +66,7 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 			t.Errorf("op %d named service %q, want %q", i, s, svc)
 		}
 	}
-	if del := fk.deletedServices(); len(del) != 1 || del[0] != svc {
+	if del := fk.DeletedServices(); len(del) != 1 || del[0] != svc {
 		t.Errorf("deletes = %v, want exactly [%q]", del, svc)
 	}
 }
@@ -87,15 +86,13 @@ func TestSampleUsagePersistsExtraUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fk := newFakeKeychain()
-	cred := &keychain.Credential{}
+	fk := credstest.NewFake()
+	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-0"
 	cred.ClaudeAiOauth.RefreshToken = "rt-0"
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli() // fresh: no refresh needed
-	if err := fk.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
-		t.Fatal(err)
-	}
-	m := &Manager{Store: st, OAuth: &fakeOAuth{currentRT: "rt-0"}, Keychain: fk, LockDir: t.TempDir()}
+	fk.Put(a.KeychainService, a.KeychainAccount, cred)
+	m := &Manager{Store: st, OAuth: &fakeOAuth{currentRT: "rt-0"}, Creds: fk, LockDir: t.TempDir()}
 
 	if _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: false}); err != nil {
 		t.Fatalf("SampleUsage: %v", err)

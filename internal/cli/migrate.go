@@ -7,7 +7,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/fusekit/version"
 )
 
 func newMigrateCmd() *cobra.Command {
@@ -66,24 +65,12 @@ migrated-to provider.`,
 }
 
 // requestMigration asks the daemon (which owns the conversion gates) to migrate;
-// account==0 means every account. Requires an exact-version daemon, never
-// auto-restarted here. No local fuse-capability check: the daemon hosts the
-// mounts, so a still-pure, just-reinstalled CLI can drive a fuse daemon.
+// account==0 means every account. No local fuse-capability check: the daemon
+// hosts the mounts, so a still-pure, just-reinstalled CLI can drive a fuse daemon.
 func requestMigration(m *pool.Manager, to string, account int, force bool) (*daemon.Response, error) {
-	if err := requireInit(m); err != nil {
+	cl, err := requireDaemon(m, "migration runs inside the daemon (it owns the conversion gates)")
+	if err != nil {
 		return nil, err
-	}
-	cl := daemon.NewClient()
-	health, err := cl.Health()
-	switch {
-	case errors.Is(err, daemon.ErrDaemonUnavailable):
-		return nil, fmt.Errorf("migration runs inside the daemon (it owns the conversion gates), which is not running; start it with `ccp service install` and re-run: %w", err)
-	case err != nil:
-		// Dial ok, probe failed: hung not absent — don't prescribe a restart (masks the real failure).
-		return nil, fmt.Errorf("daemon health check: %w", err)
-	}
-	if health.Version != version.String() {
-		return nil, fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) and re-run — mounts and live sessions are unaffected", health.Version, version.String())
 	}
 	var acct *int
 	if account > 0 {

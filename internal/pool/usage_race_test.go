@@ -4,87 +4,18 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// fakeKeychain is an in-memory CredentialStore, internally locked so any race
-// the detector reports is in the code under test, not the fake. Each op's
-// service is recorded in touched to pin which Keychain items the pool names.
-type fakeKeychain struct {
-	mu      sync.Mutex
-	items   map[string]*keychain.Credential
-	touched []string // service of every Read/Write/Delete, in order
-	deleted []string // service of every Delete, in order
-}
-
-func newFakeKeychain() *fakeKeychain {
-	return &fakeKeychain{items: map[string]*keychain.Credential{}}
-}
-
-func (f *fakeKeychain) key(service, account string) string { return service + "\x00" + account }
-
-func (f *fakeKeychain) Read(service, account string) (*keychain.Credential, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.touched = append(f.touched, service)
-	c, ok := f.items[f.key(service, account)]
-	if !ok {
-		return nil, keychain.ErrNotFound
-	}
-	cp := *c
-	return &cp, nil
-}
-
-func (f *fakeKeychain) Write(service, account string, cred *keychain.Credential) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.touched = append(f.touched, service)
-	cp := *cred
-	f.items[f.key(service, account)] = &cp
-	return nil
-}
-
-func (f *fakeKeychain) Delete(service, account string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.touched = append(f.touched, service)
-	f.deleted = append(f.deleted, service)
-	delete(f.items, f.key(service, account))
-	return nil
-}
-
-// Discover mirrors keychain.DiscoverAccount.
-func (f *fakeKeychain) Discover(service string) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.touched = append(f.touched, service)
-	prefix := service + "\x00"
-	for k := range f.items {
-		if strings.HasPrefix(k, prefix) {
-			return strings.TrimPrefix(k, prefix), nil
-		}
-	}
-	return "", keychain.ErrNotFound
-}
-
-func (f *fakeKeychain) touchedServices() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.touched...)
-}
-
-func (f *fakeKeychain) deletedServices() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.deleted...)
-}
+// The shared in-memory seam fake must satisfy the Manager's Credentials port.
+var _ Credentials = (*credstest.Fake)(nil)
 
 // fakeOAuth simulates the provider's single-use refresh-token rotation: only the
 // current token refreshes; re-POSTing a consumed one is invalid_grant, like the
@@ -138,18 +69,16 @@ func TestPerAccountLockSerializesCredentialCycle(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	a := store.Account{ID: 1, KeychainService: "svc", KeychainAccount: "user"}
-	fk := newFakeKeychain()
-	seed := &keychain.Credential{}
+	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user"}
+	fk := credstest.NewFake()
+	seed := &creds.Credential{}
 	seed.ClaudeAiOauth.AccessToken = "at-0"
 	seed.ClaudeAiOauth.RefreshToken = "rt-0"
 	// Near-expiry (< RefreshLeadTime) so the first SampleUsage must refresh.
 	seed.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Minute).UnixMilli()
-	if err := fk.Write(a.KeychainService, a.KeychainAccount, seed); err != nil {
-		t.Fatal(err)
-	}
+	fk.Put(a.KeychainService, a.KeychainAccount, seed)
 	fo := &fakeOAuth{currentRT: "rt-0"}
-	m := &Manager{Store: st, OAuth: fo, Keychain: fk, LockDir: t.TempDir()}
+	m := &Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()}
 
 	const goroutines = 16
 	const iterations = 25
@@ -187,9 +116,9 @@ func TestPerAccountLockSerializesCredentialCycle(t *testing.T) {
 	if refreshes != 1 {
 		t.Errorf("refreshes = %d, want exactly 1 (the first refresh yields a 1h-fresh token every serialized successor reuses)", refreshes)
 	}
-	final, err := fk.Read(a.KeychainService, a.KeychainAccount)
-	if err != nil {
-		t.Fatal(err)
+	final, ok := fk.Get(a.KeychainService, a.KeychainAccount)
+	if !ok {
+		t.Fatal("credential missing from the fake keychain after the hammer")
 	}
 	if got := final.ClaudeAiOauth.RefreshToken; got != currentRT {
 		t.Errorf("stale clobber: keychain holds refresh token %q, provider's current is %q", got, currentRT)

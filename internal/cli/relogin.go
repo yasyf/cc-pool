@@ -2,13 +2,12 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"golang.org/x/term"
@@ -57,7 +56,10 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 
 	fd := int(os.Stdin.Fd())
 	state, _ := term.GetState(fd) // nil on non-TTY; restore is nil-safe
-	read := func() (*keychain.Credential, error) { return reloginCred(a) }
+	read := func() (*creds.Credential, error) {
+		cred, _, rerr := m.ReadCredential(a)
+		return cred, rerr
+	}
 	baseline := ""
 	if cred, err := read(); err == nil {
 		baseline = cred.ClaudeAiOauth.AccessToken
@@ -73,6 +75,14 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	}
 	if err := finishRelogin(cmd.Context(), m, a); err != nil {
 		return err
+	}
+	// A cross-session re-login (e.g. an SSH login of a Keychain-backed account
+	// lands the fresh credential in the file backend) can leave a stale copy on
+	// the other backend. Resolution already prefers the fresher copy, so this is
+	// hygiene, not correctness — a failure (or an unreachable headless Keychain)
+	// must not fail the completed login.
+	if err := m.DropDivergentCopy(cmd.Context(), a); err != nil {
+		note(out, "couldn't remove a stale credential copy on the other backend: %v — run `ccp doctor`.", err)
 	}
 	success(out, "%s re-logged in.", accountName(a.Label))
 	return nil
@@ -93,9 +103,14 @@ func loginCommand(configDir string) (*exec.Cmd, error) {
 
 func finishRelogin(ctx context.Context, m *pool.Manager, a store.Account) error {
 	// Fail closed: an unusable credential means the login didn't land; the
-	// daemon would re-flag on its next poll anyway.
-	cred, err := reloginCred(a)
-	if err != nil || !cred.HasRefreshToken() || cred.Expired() {
+	// daemon would re-flag on its next poll anyway. A read failure keeps its
+	// cause: an unsearchable Keychain (creds.ErrUnavailable) is unknown state,
+	// not a failed login.
+	cred, _, err := m.ReadCredential(a)
+	if err != nil {
+		return fmt.Errorf("read %s's credential after login: %w — run `ccp login %d` again", accountName(a.Label), err, a.ID)
+	}
+	if !cred.HasRefreshToken() || cred.Expired() {
 		return fmt.Errorf("login left no usable credential for %s; run `ccp login %d` again", accountName(a.Label), a.ID)
 	}
 	// Re-assert our `security`-trusted ACL; a no-op rewrite for the plaintext-file backend.
@@ -108,7 +123,7 @@ func finishRelogin(ctx context.Context, m *pool.Manager, a store.Account) error 
 	return nil
 }
 
-type credReader func() (*keychain.Credential, error)
+type credReader func() (*creds.Credential, error)
 
 // newReloginProbe fires when a fresh, usable credential's access token differs
 // from the baseline read just before claude started — the re-login completion
@@ -128,15 +143,4 @@ func newReloginProbe(read credReader, baseline string) func() (bool, error) {
 		return cred.HasRefreshToken() && !cred.Expired() &&
 			cred.ClaudeAiOauth.AccessToken != baseline, nil
 	}
-}
-
-func reloginCred(a store.Account) (*keychain.Credential, error) {
-	cred, err := keychain.Read(a.KeychainService, a.KeychainAccount)
-	if err == nil {
-		return cred, nil
-	}
-	if !errors.Is(err, keychain.ErrNotFound) {
-		return nil, err
-	}
-	return keychain.ReadFileCredential(a.ConfigDir)
 }

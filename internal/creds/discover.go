@@ -1,4 +1,4 @@
-package keychain
+package creds
 
 import (
 	"bytes"

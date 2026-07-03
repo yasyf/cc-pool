@@ -6,77 +6,21 @@ import (
 	"io"
 	"log"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// fakeKeychain and fakeOAuth are internally locked so -race points at code
-// under test.
-
-type fakeKeychain struct {
-	mu     sync.Mutex
-	items  map[string]*keychain.Credential
-	writes int
-}
-
-func newFakeKeychain() *fakeKeychain {
-	return &fakeKeychain{items: map[string]*keychain.Credential{}}
-}
-
-func (f *fakeKeychain) key(service, account string) string { return service + "\x00" + account }
-
-func (f *fakeKeychain) Read(service, account string) (*keychain.Credential, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	c, ok := f.items[f.key(service, account)]
-	if !ok {
-		return nil, keychain.ErrNotFound
-	}
-	cp := *c
-	return &cp, nil
-}
-
-func (f *fakeKeychain) Write(service, account string, cred *keychain.Credential) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	cp := *cred
-	f.items[f.key(service, account)] = &cp
-	f.writes++
-	return nil
-}
-
-func (f *fakeKeychain) Delete(service, account string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.items, f.key(service, account))
-	return nil
-}
-
-func (f *fakeKeychain) Discover(service string) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	prefix := service + "\x00"
-	for k := range f.items {
-		if strings.HasPrefix(k, prefix) {
-			return strings.TrimPrefix(k, prefix), nil
-		}
-	}
-	return "", keychain.ErrNotFound
-}
-
-func (f *fakeKeychain) writeCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.writes
-}
+// The daemon's Manager is fed the shared credstest seam fake; fakeOAuth is
+// internally locked so -race points at code under test.
+var _ pool.Credentials = (*credstest.Fake)(nil)
 
 type fakeOAuth struct {
 	mu         sync.Mutex
@@ -155,20 +99,18 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fk := newFakeKeychain()
-	cred := &keychain.Credential{}
+	fk := credstest.NewFake()
+	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-0"
 	cred.ClaudeAiOauth.RefreshToken = "rt-0"
 	// Near-expiry (< RefreshLeadTime) so an idle poll must refresh.
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Minute).UnixMilli()
-	if err := fk.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
-		t.Fatal(err)
-	}
-	seedWrites := fk.writeCount()
+	fk.Put(a.KeychainService, a.KeychainAccount, cred)
+	seedWrites := fk.WriteCount()
 	fo := &fakeOAuth{currentRT: "rt-0"}
 
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: fo, Keychain: fk, LockDir: t.TempDir()},
+		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		reservations:    map[int]time.Time{},
@@ -182,7 +124,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	if got := fo.refreshCount(); got != 0 {
 		t.Fatalf("reserved account was POST-refreshed %d time(s)", got)
 	}
-	if got := fk.writeCount(); got != seedWrites {
+	if got := fk.WriteCount(); got != seedWrites {
 		t.Fatalf("reserved account's credential was written %d time(s)", got-seedWrites)
 	}
 
@@ -212,18 +154,16 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	fk := newFakeKeychain()
-	cred := &keychain.Credential{}
+	fk := credstest.NewFake()
+	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-0"
 	cred.ClaudeAiOauth.RefreshToken = "" // no refresh token → a 401 is definitive
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
-	if err := fk.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
-		t.Fatal(err)
-	}
+	fk.Put(a.KeychainService, a.KeychainAccount, cred)
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true}
 
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: fo, Keychain: fk, LockDir: t.TempDir()},
+		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		reservations:    map[int]time.Time{},
@@ -242,9 +182,7 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 
 	cred.ClaudeAiOauth.RefreshToken = "rt-0"
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
-	if err := fk.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
-		t.Fatal(err)
-	}
+	fk.Put(a.KeychainService, a.KeychainAccount, cred)
 	fo.setUsage401(false)
 	s.lastAuthAttempt[1] = time.Now().Add(-needsLoginPollInterval - time.Second)
 
@@ -272,18 +210,16 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	fk := newFakeKeychain()
-	cred := &keychain.Credential{}
+	fk := credstest.NewFake()
+	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-0"
 	cred.ClaudeAiOauth.RefreshToken = "rt-0" // present → a 401 is recoverable, not definitive
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
-	if err := fk.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
-		t.Fatal(err)
-	}
+	fk.Put(a.KeychainService, a.KeychainAccount, cred)
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true, refresh5xx: true}
 
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: fo, Keychain: fk, LockDir: t.TempDir()},
+		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		reservations:    map[int]time.Time{},
@@ -335,18 +271,16 @@ func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	fk := newFakeKeychain()
-	cred := &keychain.Credential{}
+	fk := credstest.NewFake()
+	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-0"
 	cred.ClaudeAiOauth.RefreshToken = "rt-stale" // ≠ server's currentRT → invalid_grant
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
-	if err := fk.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
-		t.Fatal(err)
-	}
+	fk.Put(a.KeychainService, a.KeychainAccount, cred)
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true}
 
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: fo, Keychain: fk, LockDir: t.TempDir()},
+		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		reservations:    map[int]time.Time{},

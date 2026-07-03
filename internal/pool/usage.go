@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -21,7 +21,7 @@ var ErrNeedsLogin = errors.New("account needs re-login (refresh token missing or
 // EnsureFreshToken returns the account's credential, refreshing it when the access
 // token expires within `within` and allowRefresh is true. allowRefresh must be
 // false for an account with a live session (that session owns refresh).
-func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*keychain.Credential, bool, error) {
+func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*creds.Credential, bool, error) {
 	release, err := m.lockAccount(ctx, a.ID)
 	if err != nil {
 		return nil, false, err
@@ -31,33 +31,36 @@ func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within 
 	return cred, refreshed, err
 }
 
-// readCred returns a's credential and its backend — Keychain if reachable, else the
-// plaintext .credentials.json claude falls back to when the Keychain is unavailable
-// (headless SSH). Source is returned so the paired write stays on one backend.
-func (m *Manager) readCred(a store.Account) (*keychain.Credential, keychain.Source, error) {
-	cred, err := m.Keychain.Read(a.KeychainService, a.KeychainAccount)
-	if err == nil {
-		return cred, keychain.SourceKeychain, nil
+// ReadCredential resolves a's credential from whichever backend holds it,
+// reading every candidate store — the Keychain claude prefers and the plaintext
+// .credentials.json it falls back to when the Keychain is unavailable (headless
+// SSH). When more than one backend holds a credential (transient drift), the
+// fresher one wins (see probeCredentialStores) so a stale shadow never
+// shadows a fresh login; the winning store's Source is returned so the paired
+// write stays on one backend. When every store misses, creds.ErrUnavailable
+// (item state unknowable) outranks creds.ErrNotFound: absence is reported only
+// when every backend proved it. Any other read error fails fast.
+func (m *Manager) ReadCredential(a store.Account) (*creds.Credential, creds.Source, error) {
+	probes, win, err := m.probeCredentialStores(a)
+	if err != nil {
+		return nil, creds.SourceKeychain, err
 	}
-	if !errors.Is(err, keychain.ErrNotFound) {
-		return nil, keychain.SourceKeychain, err
+	if win != nil {
+		return win.cred, win.store.Source(), nil
 	}
-	fcred, ferr := keychain.ReadFileCredential(a.ConfigDir)
-	if ferr != nil {
-		return nil, keychain.SourceKeychain, ferr
+	for _, p := range probes {
+		if errors.Is(p.err, creds.ErrUnavailable) {
+			return nil, creds.SourceKeychain, p.err
+		}
 	}
-	return fcred, keychain.SourceFile, nil
+	return nil, creds.SourceKeychain, creds.ErrNotFound
 }
 
-func (m *Manager) writeCred(a store.Account, src keychain.Source, cred *keychain.Credential) error {
-	if src == keychain.SourceFile {
-		if err := keychain.WriteFileCredential(a.ConfigDir, cred); err != nil {
-			return fmt.Errorf("write credential to %s: %w", keychain.FileCredentialPath(a.ConfigDir), err)
-		}
-		return nil
-	}
-	if err := m.Keychain.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
-		return fmt.Errorf("write credential to %q: %w", a.KeychainService, err)
+// writeCred upserts cred on the backend src names.
+func (m *Manager) writeCred(a store.Account, src creds.Source, cred *creds.Credential) error {
+	s := m.Creds.Store(a, src)
+	if err := s.Write(cred); err != nil {
+		return fmt.Errorf("write credential to %s: %w", s, err)
 	}
 	return nil
 }
@@ -66,8 +69,8 @@ func (m *Manager) writeCred(a store.Account, src keychain.Source, cred *keychain
 // lock-free so SampleUsage composes it with fetchUsage's 401-retry in one critical
 // section (sync.Mutex is not reentrant). Re-reading the credential under the lock lets
 // a waiter that lost the race skip a redundant refresh POST.
-func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*keychain.Credential, keychain.Source, bool, error) {
-	cred, src, err := m.readCred(a)
+func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*creds.Credential, creds.Source, bool, error) {
+	cred, src, err := m.ReadCredential(a)
 	if err != nil {
 		return nil, src, false, err
 	}
@@ -94,12 +97,12 @@ func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within 
 // refresh performs the OAuth refresh and persists the new blob, preserving the prior
 // credential's non-token fields. Caller must hold the per-account lock. Each account
 // runs its own token chain, so refreshing a pool account never touches plain claude.
-func (m *Manager) refresh(ctx context.Context, a store.Account, src keychain.Source, prev *keychain.Credential) (*keychain.Credential, error) {
+func (m *Manager) refresh(ctx context.Context, a store.Account, src creds.Source, prev *creds.Credential) (*creds.Credential, error) {
 	tr, err := m.OAuth.Refresh(ctx, fmt.Sprintf("acct-%d", a.ID), prev.ClaudeAiOauth.RefreshToken)
 	if err != nil {
 		return nil, err
 	}
-	next := &keychain.Credential{ClaudeAiOauth: prev.ClaudeAiOauth}
+	next := &creds.Credential{ClaudeAiOauth: prev.ClaudeAiOauth}
 	next.ClaudeAiOauth.AccessToken = tr.AccessToken
 	if tr.RefreshToken != "" { // rotated
 		next.ClaudeAiOauth.RefreshToken = tr.RefreshToken
@@ -120,7 +123,7 @@ func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error 
 		return err
 	}
 	defer release()
-	cred, src, err := m.readCred(a)
+	cred, src, err := m.ReadCredential(a)
 	if err != nil {
 		return err
 	}
@@ -171,7 +174,7 @@ func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleO
 
 // sameTokens reports whether both access and refresh tokens match — no session rotated
 // the chain.
-func sameTokens(a, b *keychain.Credential) bool {
+func sameTokens(a, b *creds.Credential) bool {
 	return a.ClaudeAiOauth.AccessToken == b.ClaudeAiOauth.AccessToken &&
 		a.ClaudeAiOauth.RefreshToken == b.ClaudeAiOauth.RefreshToken
 }
@@ -179,7 +182,7 @@ func sameTokens(a, b *keychain.Credential) bool {
 // fetchUsage fetches usage and, on a 401, walks a recovery ladder: re-read for a
 // session-rotated token, else signed-out (ErrNeedsLogin), else refresh+retry when
 // permitted. Caller must hold the per-account lock.
-func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src keychain.Source, cred *keychain.Credential, opts SampleOpts) (*oauth.Usage, bool, error) {
+func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src creds.Source, cred *creds.Credential, opts SampleOpts) (*oauth.Usage, bool, error) {
 	usage, err := m.OAuth.Usage(ctx, cred.ClaudeAiOauth.AccessToken)
 	if err == nil {
 		return usage, false, nil
@@ -195,7 +198,7 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src keychain.
 		return nil, false, err
 	}
 
-	if reread, _, rerr := m.readCred(a); rerr == nil && reread.ClaudeAiOauth.AccessToken != cred.ClaudeAiOauth.AccessToken {
+	if reread, _, rerr := m.ReadCredential(a); rerr == nil && reread.ClaudeAiOauth.AccessToken != cred.ClaudeAiOauth.AccessToken {
 		if usage, err2 := m.OAuth.Usage(ctx, reread.ClaudeAiOauth.AccessToken); err2 == nil {
 			return usage, false, nil
 		}
@@ -210,7 +213,7 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src keychain.
 	// on a fresh re-read.
 	mayRefresh := opts.AllowRefresh
 	if !mayRefresh && opts.AllowBusyRefresh && cred.Expired() {
-		if reread, _, rerr := m.readCred(a); rerr == nil && sameTokens(reread, cred) {
+		if reread, _, rerr := m.ReadCredential(a); rerr == nil && sameTokens(reread, cred) {
 			mayRefresh = true
 		}
 	}
@@ -225,7 +228,7 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src keychain.
 		if errors.As(rfErr, &re) && re.Revoked() {
 			// Revoked: a differing on-disk credential means a session rotated the chain
 			// (transient); unchanged means genuine server-side revocation.
-			if reread, _, rerr := m.readCred(a); rerr == nil && !sameTokens(reread, cred) {
+			if reread, _, rerr := m.ReadCredential(a); rerr == nil && !sameTokens(reread, cred) {
 				return nil, false, err
 			}
 			return nil, false, fmt.Errorf("%w: %w", ErrNeedsLogin, rfErr)

@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/store"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
@@ -91,8 +91,9 @@ func (m *Manager) DuplicateIdentity(want Identity) (*store.Account, error) {
 // PrepareAdd allocates the next account dir, establishes its overlay, and seeds
 // its private .claude.json from ~/.claude.json so login inherits onboarding
 // state instead of the first-run wizard. Returns the login command to run.
-// Unless the dir is reused (SeedKeptExisting), a stale Keychain item under its
-// service is deleted. No account row or Keychain item exists until FinalizeAdd.
+// Unless the dir is reused (SeedKeptExisting), stale credentials from a dead
+// attempt — the Keychain item under its service and the plaintext file — are
+// deleted. No account row or Keychain item exists until FinalizeAdd.
 func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 	ok, err := m.Initialized()
 	if err != nil {
@@ -139,20 +140,27 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 	if err != nil {
 		return nil, fmt.Errorf("seed .claude.json for %s: %w", acctDir, err)
 	}
-	svc := keychain.ServiceName(acctDir)
+	svc := creds.ServiceName(acctDir)
 	if seed != SeedKeptExisting {
 		// A leftover item is garbage from a dead attempt that FinalizeAdd would
 		// register. Discover by service, not a recomputed label — the item carries
 		// whatever -a label claude stored at login.
-		account, err := m.Keychain.Discover(svc)
+		stale := store.Account{ConfigDir: acctDir, KeychainService: svc}
+		account, err := m.Creds.Discover(svc)
 		switch {
-		case errors.Is(err, keychain.ErrNotFound):
+		case errors.Is(err, creds.ErrNotFound):
 		case err != nil:
 			return nil, fmt.Errorf("probe stale credential for %s: %w", acctDir, err)
 		default:
-			if derr := m.Keychain.Delete(svc, account); derr != nil {
+			stale.KeychainAccount = account
+			if derr := m.Creds.Store(stale, creds.SourceKeychain).Delete(); derr != nil {
 				return nil, fmt.Errorf("purge stale credential for %s: %w", acctDir, derr)
 			}
+		}
+		// A dead headless attempt leaves an identity-less .credentials.json the
+		// fresh login would later diverge from; purge it too.
+		if err := m.Creds.Store(stale, creds.SourceFile).Delete(); err != nil {
+			return nil, fmt.Errorf("purge stale file credential for %s: %w", acctDir, err)
 		}
 	}
 	return &PendingAdd{
@@ -188,31 +196,51 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 		return nil, fmt.Errorf("read account identity for %s: %w", p.ConfigDir, err)
 	}
 
-	account, src, err := keychain.LocateCredential(p.ConfigDir, p.KeychainService)
-	if errors.Is(err, keychain.ErrNotFound) {
-		return nil, fmt.Errorf("no credential found for %s — was the login completed?", p.ConfigDir)
-	} else if err != nil {
+	// The row FinalizeAdd is about to persist; the credential backend is
+	// resolved onto it (KeychainAccount) before any row exists, so store ops
+	// below run through the seam against this value.
+	acct := store.Account{
+		ID:              p.Index,
+		ConfigDir:       p.ConfigDir,
+		KeychainService: p.KeychainService,
+		Label:           label,
+		OverlayKind:     string(p.OverlayKind),
+		CreatedAt:       time.Now(),
+	}
+	src := creds.SourceKeychain
+	account, err := m.Creds.Discover(p.KeychainService)
+	switch {
+	case err == nil:
+		acct.KeychainAccount = account
+	case errors.Is(err, creds.ErrNotFound):
+		// No Keychain item: a headless login wrote the plaintext fallback. The
+		// file carries no -a label, so record today's computed one.
+		if _, ferr := m.Creds.Store(acct, creds.SourceFile).Read(); ferr != nil {
+			if errors.Is(ferr, creds.ErrNotFound) {
+				return nil, fmt.Errorf("no credential found for %s — was the login completed?", p.ConfigDir)
+			}
+			return nil, ferr
+		}
+		acct.KeychainAccount = creds.AccountLabel()
+		src = creds.SourceFile
+	default:
 		return nil, err
 	}
 
 	// Read the item claude wrote and write it back so our tooling owns the ACL
 	// for prompt-free refresh. Only the Keychain backend has an ACL; the plaintext
 	// file is read directly.
-	if src == keychain.SourceKeychain {
-		if _, err := keychain.Reassert(p.KeychainService, account); err != nil {
+	if src == creds.SourceKeychain {
+		item := m.Creds.Store(acct, creds.SourceKeychain)
+		cred, err := item.Read()
+		if err != nil {
+			return nil, fmt.Errorf("re-assert keychain item: %w", err)
+		}
+		if err := item.Write(cred); err != nil {
 			return nil, fmt.Errorf("re-assert keychain item: %w", err)
 		}
 	}
 
-	acct := store.Account{
-		ID:              p.Index,
-		ConfigDir:       p.ConfigDir,
-		KeychainService: p.KeychainService,
-		KeychainAccount: account,
-		Label:           label,
-		OverlayKind:     string(p.OverlayKind),
-		CreatedAt:       time.Now(),
-	}
 	if err := m.Store.UpsertAccount(acct); err != nil {
 		return nil, err
 	}
@@ -225,19 +253,23 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 	return &acct, nil
 }
 
-// AbandonAdd cleans up a prepared-but-not-finalized account dir (no store row yet)
-// and any credential its login wrote to the Keychain. p must be non-nil, from
-// PrepareAdd.
+// AbandonAdd cleans up a prepared-but-not-finalized account dir (no store row
+// yet) and any credential its login wrote — the Keychain item and the plaintext
+// file, each deleted explicitly so the rollback never depends on the dir
+// removal succeeding. p must be non-nil, from PrepareAdd.
 func (m *Manager) AbandonAdd(p *PendingAdd) error {
 	var credErr error
-	account, err := m.Keychain.Discover(p.KeychainService)
+	pend := store.Account{ConfigDir: p.ConfigDir, KeychainService: p.KeychainService}
+	account, err := m.Creds.Discover(p.KeychainService)
 	switch {
-	case errors.Is(err, keychain.ErrNotFound):
+	case errors.Is(err, creds.ErrNotFound):
 	case err != nil:
 		credErr = fmt.Errorf("probe credential for %s: %w", p.ConfigDir, err)
 	default:
-		credErr = m.Keychain.Delete(p.KeychainService, account)
+		pend.KeychainAccount = account
+		credErr = m.Creds.Store(pend, creds.SourceKeychain).Delete()
 	}
+	credErr = errors.Join(credErr, m.Creds.Store(pend, creds.SourceFile).Delete())
 	prov, err := m.overlayFor(p.OverlayKind)
 	if err != nil {
 		return errors.Join(credErr, fmt.Errorf("resolve overlay provider for %s: %w", p.ConfigDir, err))
@@ -247,11 +279,25 @@ func (m *Manager) AbandonAdd(p *PendingAdd) error {
 
 // Remove deletes an account from the pool: tears down its overlay, removes its
 // Keychain item, and deletes its rows. ~/.claude is never touched (it is not
-// an account).
+// an account). Keeping the credential (deleteCredential=false) is refused when
+// it is file-backed — the file lives inside the account dir being removed.
 func (m *Manager) Remove(id int, deleteCredential bool) error {
 	a, err := m.Store.GetAccount(id)
 	if err != nil {
 		return err
+	}
+	if !deleteCredential {
+		_, src, err := m.ReadCredential(a)
+		switch {
+		case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrUnavailable):
+			// Nothing found to keep (or the Keychain — which removal won't touch —
+			// is unsearchable): proceed, removal loses nothing.
+		case err != nil:
+			return fmt.Errorf("resolve acct-%02d's credential backend: %w", id, err)
+		case src == creds.SourceFile:
+			return fmt.Errorf("cannot keep acct-%02d's credential: it is file-backed (%s), which lives inside the account dir being removed; run `ccp cred move --to keychain --account %d` first",
+				id, m.Creds.Store(a, creds.SourceFile), id)
+		}
 	}
 	backend, err := fkoverlay.Parse(a.OverlayKind)
 	if err != nil {
@@ -265,7 +311,7 @@ func (m *Manager) Remove(id int, deleteCredential bool) error {
 		return err
 	}
 	if deleteCredential {
-		if err := m.Keychain.Delete(a.KeychainService, a.KeychainAccount); err != nil {
+		if err := m.Creds.Store(a, creds.SourceKeychain).Delete(); err != nil {
 			return fmt.Errorf("delete keychain item %q: %w", a.KeychainService, err)
 		}
 	}

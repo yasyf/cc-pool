@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -46,7 +47,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 	}
 	s := &Server{
 		m: &pool.Manager{
-			Store: st, OAuth: &fakeOAuth{}, Keychain: newFakeKeychain(), LockDir: t.TempDir(),
+			Store: st, OAuth: &fakeOAuth{}, Creds: credstest.NewFake(), LockDir: t.TempDir(),
 		},
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),

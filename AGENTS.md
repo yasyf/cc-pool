@@ -42,8 +42,8 @@ cc-pool/
 ├── cmd/cc-pool/        # main: CLI entrypoint (installs as cc-pool, ccp symlink)
 ├── internal/
 │   ├── cli/            # ccp subcommands (init, add, select, run, status, doctor, …)
+│   ├── creds/          # Claude Code credentials: blob format + Keychain and plaintext-file stores
 │   ├── daemon/         # background poller: usage polling, idle token refresh, socket protocol; supervises the detached mount-holder process
-│   ├── keychain/       # macOS Keychain access for Claude Code credentials
 │   ├── oauth/          # Claude OAuth refresh + /api/oauth/usage client
 │   ├── overlay/        # shared ~/.claude overlay providers (symlink, fuse-t mirror)
 │   ├── peerpid/        # identify/kill the exact process holding a unix socket

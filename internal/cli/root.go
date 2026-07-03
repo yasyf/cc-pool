@@ -3,9 +3,11 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/fusekit/version"
 )
@@ -69,6 +71,7 @@ pool.`,
 		newDoctorCmd(),
 		newMigrateCmd(),
 		newFuseCmd(),
+		newCredCmd(),
 		newRemoveCmd(),
 		newRenameCmd(),
 		newServiceCmd(),
@@ -115,4 +118,27 @@ func requireInit(m *pool.Manager) error {
 		return fmt.Errorf("pool not initialized; run `ccp add` to set it up and add your first account")
 	}
 	return nil
+}
+
+// requireDaemon vets an op that must run inside the daemon: pool initialized,
+// daemon reachable, and an exact version match — a skewed daemon is refused,
+// never auto-restarted here. purpose opens the not-running error, e.g.
+// "migration runs inside the daemon (it owns the conversion gates)".
+func requireDaemon(m *pool.Manager, purpose string) (*daemon.Client, error) {
+	if err := requireInit(m); err != nil {
+		return nil, err
+	}
+	cl := daemon.NewClient()
+	health, err := cl.Health()
+	switch {
+	case errors.Is(err, daemon.ErrDaemonUnavailable):
+		return nil, fmt.Errorf("%s, which is not running; start it with `ccp service install` and re-run: %w", purpose, err)
+	case err != nil:
+		// Dial ok, probe failed: hung not absent — don't prescribe a restart (masks the real failure).
+		return nil, fmt.Errorf("daemon health check: %w", err)
+	}
+	if health.Version != version.String() {
+		return nil, fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) and re-run — mounts and live sessions are unaffected", health.Version, version.String())
+	}
+	return cl, nil
 }

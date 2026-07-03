@@ -1,4 +1,4 @@
-package keychain
+package creds
 
 import (
 	"errors"
@@ -165,6 +165,10 @@ case "$op" in
       exit 44
     fi
     rm -f "$STORE/$key.hex" "$STORE/$key.acct" "$STORE/svc_$keysvc.acct"
+    exit 0;;
+  list-keychains)
+    # search list under test control: each test writes $STORE/keychains.txt
+    cat "$STORE/keychains.txt"
     exit 0;;
 esac
 exit 1

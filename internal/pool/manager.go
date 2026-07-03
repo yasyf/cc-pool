@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
@@ -18,41 +18,49 @@ type Refresher interface {
 	Usage(ctx context.Context, accessToken string) (*oauth.Usage, error)
 }
 
-// CredentialStore is the slice of package keychain the Manager needs. Discover
-// resolves the account (-a) label actually stored on a service's item:
-// `claude /login` items carry whatever label claude derived then, which a later
-// recompute may not match, so deleting a claude-written item must Discover first.
-type CredentialStore interface {
-	Read(service, account string) (*keychain.Credential, error)
-	Write(service, account string, cred *keychain.Credential) error
-	Delete(service, account string) error
+// Credentials resolves an account's candidate credential stores; injectable
+// for tests.
+type Credentials interface {
+	// Store returns a's store for the backend src names.
+	Store(a store.Account, src creds.Source) creds.Store
+	// Stores returns a's candidate stores in resolution order: Keychain first
+	// (as claude prefers), then the plaintext file fallback.
+	Stores(a store.Account) []creds.Store
+	// Discover resolves the account (-a) label actually stored on a service's
+	// Keychain item, or creds.ErrNotFound: `claude /login` items carry whatever
+	// label claude derived then, which a later recompute may not match, so
+	// deleting or adopting a claude-written item must Discover first.
 	Discover(service string) (string, error)
 }
 
-type sysKeychain struct{}
+// sysCredentials is the production Credentials: the account's own Keychain
+// item and the plaintext .credentials.json inside its config dir.
+type sysCredentials struct{}
 
-func (sysKeychain) Read(service, account string) (*keychain.Credential, error) {
-	return keychain.Read(service, account)
+func (sysCredentials) Store(a store.Account, src creds.Source) creds.Store {
+	switch src {
+	case creds.SourceKeychain:
+		return creds.KeychainItem{Service: a.KeychainService, Account: a.KeychainAccount}
+	case creds.SourceFile:
+		return creds.FileStore{ConfigDir: a.ConfigDir}
+	}
+	panic(fmt.Sprintf("unknown credential source %d", src))
 }
 
-func (sysKeychain) Write(service, account string, cred *keychain.Credential) error {
-	return keychain.Write(service, account, cred)
+func (c sysCredentials) Stores(a store.Account) []creds.Store {
+	return []creds.Store{c.Store(a, creds.SourceKeychain), c.Store(a, creds.SourceFile)}
 }
 
-func (sysKeychain) Delete(service, account string) error {
-	return keychain.Delete(service, account)
-}
-
-func (sysKeychain) Discover(service string) (string, error) {
-	return keychain.DiscoverAccount(service)
+func (sysCredentials) Discover(service string) (string, error) {
+	return creds.DiscoverAccount(service)
 }
 
 // Manager is the high-level façade over the store, the OAuth client, and the
 // Keychain/overlay machinery.
 type Manager struct {
-	Store    *store.Store
-	OAuth    Refresher
-	Keychain CredentialStore
+	Store *store.Store
+	OAuth Refresher
+	Creds Credentials
 
 	// OverlayFor resolves an overlay backend to a fusekit/overlay provider; nil
 	// means pool.OverlayProviderFor.
@@ -123,10 +131,10 @@ func Open() (*Manager, error) {
 		return nil, err
 	}
 	return &Manager{
-		Store:    st,
-		OAuth:    oauth.New(),
-		Keychain: sysKeychain{},
-		LockDir:  filepath.Join(StateDir(), "locks"),
+		Store:   st,
+		OAuth:   oauth.New(),
+		Creds:   sysCredentials{},
+		LockDir: filepath.Join(StateDir(), "locks"),
 	}, nil
 }
 

@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/daemon"
-	"github.com/yasyf/cc-pool/internal/keychain"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
@@ -273,27 +273,7 @@ func reportCarcasses(accts []store.Account, report func(string, bool, string)) {
 func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool, report func(string, bool, string)) {
 	prefix := fmt.Sprintf("acct-%02d", a.ID)
 
-	_, kerr := keychain.Read(a.KeychainService, a.KeychainAccount)
-	switch {
-	case kerr == nil:
-		report(prefix+" keychain", true, "")
-	case errors.Is(kerr, keychain.ErrNotFound):
-		// Keychain unavailable (e.g. headless): claude writes plaintext .credentials.json.
-		if _, ferr := keychain.ReadFileCredential(a.ConfigDir); ferr == nil {
-			report(prefix+" credential", true, "file")
-		} else {
-			report(prefix+" credential", false, kerr.Error())
-		}
-	case fix:
-		// Item exists but our ACL can't read it (-w denied).
-		if _, rerr := keychain.Reassert(a.KeychainService, a.KeychainAccount); rerr == nil {
-			report(prefix+" keychain", true, "re-asserted")
-		} else {
-			report(prefix+" keychain", false, rerr.Error())
-		}
-	default:
-		report(prefix+" keychain", false, kerr.Error())
-	}
+	checkCredential(m, a, fix, report)
 
 	// NeedsLogin: the Keychain item can be readable yet useless.
 	if h, herr := m.Store.GetAuthHealth(a.ID); herr == nil && h.NeedsLogin {
@@ -326,6 +306,64 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 
 	checkFuseFallback(m, a, report)
 	checkStrandedPrivate(m, a, fix, cmd.OutOrStdout(), report)
+}
+
+// checkCredential reports one account's credential state, each backend probed
+// through the Manager seam in runtime resolution order (Keychain first, then
+// the plaintext file). A file copy — parseable or corrupt — behind a readable
+// Keychain item is drift (Claude refresh tokens are single-use, so two live
+// copies diverge); --fix deletes the file copy, since resolution makes the
+// Keychain authoritative. An unsearchable Keychain (headless session) with no
+// file credential is reported as unknown state, never as absence.
+func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(string, bool, string)) {
+	prefix := fmt.Sprintf("acct-%02d", a.ID)
+	keychain := m.Creds.Store(a, creds.SourceKeychain)
+	file := m.Creds.Store(a, creds.SourceFile)
+	_, kerr := keychain.Read()
+	_, ferr := file.Read()
+
+	switch {
+	case kerr == nil:
+		if errors.Is(ferr, creds.ErrNotFound) {
+			report(prefix+" credential", true, "keychain")
+			return
+		}
+		// Both backends hold a credential — drift (Claude refresh tokens are
+		// single-use, so two live copies diverge). doctor stays advisory even
+		// under --fix: consolidating must be gated against live sessions and
+		// daemon moves and must keep the FRESHER copy, all of which
+		// `ccp cred move` does (the daemon owns those gates). A blind delete
+		// here could destroy a fresh headless re-login and sign the account out.
+		report(prefix+" credential", false, "credential in BOTH the Keychain and .credentials.json — copies diverge (Claude refresh tokens are single-use); consolidate with `ccp cred move --to keychain` (moves the fresher copy; the daemon gates it against live sessions)")
+	case !errors.Is(kerr, creds.ErrNotFound) && !errors.Is(kerr, creds.ErrUnavailable):
+		if !fix {
+			report(prefix+" keychain", false, kerr.Error())
+			return
+		}
+		// Item exists but our ACL can't read it (-w denied): read then write back
+		// through our security(1) to re-assert ownership, as FinalizeAdd does.
+		cred, rerr := keychain.Read()
+		if rerr == nil {
+			rerr = keychain.Write(cred)
+		}
+		if rerr != nil {
+			report(prefix+" keychain", false, rerr.Error())
+			return
+		}
+		report(prefix+" keychain", true, "re-asserted")
+	case ferr == nil:
+		report(prefix+" credential", true, "file")
+	case !errors.Is(ferr, creds.ErrNotFound):
+		report(prefix+" credential", false, ferr.Error())
+	case errors.Is(kerr, creds.ErrUnavailable):
+		detail := "keychain unreachable in this session (login keychain not in the security search list) — credential state unknown; run doctor from a GUI session, or move the account to the file backend: `ccp cred move --to file`"
+		if fix {
+			detail += "; nothing for --fix to do locally"
+		}
+		report(prefix+" credential", false, detail)
+	default:
+		report(prefix+" credential", false, fmt.Sprintf("no credential in either backend — run `ccp login %d`", a.ID))
+	}
 }
 
 // checkFuseFallback flags a symlink account under a fuse pool default — the

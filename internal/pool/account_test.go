@@ -9,8 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
@@ -42,7 +44,7 @@ func TestDuplicateIdentity(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		a := store.Account{ID: id, ConfigDir: dir, KeychainService: keychain.ServiceName(dir), KeychainAccount: "user", OverlayKind: "symlink"}
+		a := store.Account{ID: id, ConfigDir: dir, KeychainService: creds.ServiceName(dir), KeychainAccount: "user", OverlayKind: "symlink"}
 		if err := st.UpsertAccount(a); err != nil {
 			t.Fatal(err)
 		}
@@ -156,7 +158,7 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	}
 
 	st := openTestStore(t)
-	m := &Manager{Store: st, Keychain: newFakeKeychain(), DetectOverlay: detectSymlink}
+	m := &Manager{Store: st, Creds: credstest.NewFake(), DetectOverlay: detectSymlink}
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}
@@ -211,28 +213,27 @@ func TestPrepareAddRequiresInit(t *testing.T) {
 	}
 }
 
-// TestPrepareAddPurgesStaleKeychainItem pins that PrepareAdd purges a stale
-// credential under a reused index's service name (else the login watcher
-// false-positives), except on the SeedKeptExisting path.
-func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
-	setup := func(t *testing.T) (*Manager, *fakeKeychain, string) {
+// TestPrepareAddPurgesStaleCredentials pins that PrepareAdd purges stale
+// credentials under a reused index — the Keychain item under its service name
+// (else the login watcher false-positives) and the plaintext file a dead
+// headless attempt left behind — except on the SeedKeptExisting path.
+func TestPrepareAddPurgesStaleCredentials(t *testing.T) {
+	setup := func(t *testing.T) (*Manager, *credstest.Fake, string) {
 		t.Helper()
 		t.Setenv("HOME", t.TempDir())
 		t.Setenv("USER", "tester")
 		if err := os.MkdirAll(ClaudeDir(), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		fk := newFakeKeychain()
-		m := &Manager{Store: openTestStore(t), Keychain: fk, DetectOverlay: detectSymlink}
+		fk := credstest.NewFake()
+		m := &Manager{Store: openTestStore(t), Creds: fk, DetectOverlay: detectSymlink}
 		if _, err := m.Init(); err != nil {
 			t.Fatal(err)
 		}
-		svc := keychain.ServiceName(AccountDir(1))
-		stale := &keychain.Credential{}
+		svc := creds.ServiceName(AccountDir(1))
+		stale := &creds.Credential{}
 		stale.ClaudeAiOauth.AccessToken = "at-stale"
-		if err := fk.Write(svc, "tester", stale); err != nil {
-			t.Fatal(err)
-		}
+		fk.Put(svc, "tester", stale)
 		return m, fk, svc
 	}
 
@@ -241,10 +242,10 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 		if _, err := m.PrepareAdd(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fk.Read(svc, "tester"); !errors.Is(err, keychain.ErrNotFound) {
-			t.Errorf("stale item survived: %v", err)
+		if _, ok := fk.Get(svc, "tester"); ok {
+			t.Error("stale item survived")
 		}
-		if del := fk.deletedServices(); len(del) != 1 || del[0] != svc {
+		if del := fk.DeletedServices(); len(del) != 1 || del[0] != svc {
 			t.Errorf("deletes = %v, want exactly [%q]", del, svc)
 		}
 	})
@@ -253,23 +254,40 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 		// The stale item's label is whatever claude wrote at login; the purge must
 		// find it by service, not today's label.
 		m, fk, svc := setup(t)
-		if err := fk.Delete(svc, "tester"); err != nil {
+		fk.Remove(svc, "tester")
+		stale := &creds.Credential{}
+		stale.ClaudeAiOauth.AccessToken = "at-stale"
+		fk.Put(svc, "someone-else", stale)
+		if _, err := m.PrepareAdd(); err != nil {
 			t.Fatal(err)
 		}
-		stale := &keychain.Credential{}
-		stale.ClaudeAiOauth.AccessToken = "at-stale"
-		if err := fk.Write(svc, "someone-else", stale); err != nil {
+		if _, ok := fk.Get(svc, "someone-else"); ok {
+			t.Error("label-mismatched stale item survived")
+		}
+	})
+
+	t.Run("fresh dir purges a stale file credential", func(t *testing.T) {
+		// A dead headless attempt leaves .credentials.json instead of a Keychain
+		// item; a reused index must not inherit it.
+		m, _, _ := setup(t)
+		acct := AccountDir(1)
+		if err := os.MkdirAll(acct, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		stale := &creds.Credential{}
+		stale.ClaudeAiOauth.AccessToken = "at-stale-file"
+		if err := creds.WriteFileCredential(acct, stale); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := m.PrepareAdd(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fk.Read(svc, "someone-else"); !errors.Is(err, keychain.ErrNotFound) {
-			t.Errorf("label-mismatched stale item survived: %v", err)
+		if creds.FileCredentialExists(acct) {
+			t.Error("stale file credential survived")
 		}
 	})
 
-	t.Run("kept-existing dir keeps the credential", func(t *testing.T) {
+	t.Run("kept-existing dir keeps both credentials", func(t *testing.T) {
 		m, fk, svc := setup(t)
 		acct := AccountDir(1)
 		if err := os.MkdirAll(acct, 0o700); err != nil {
@@ -279,6 +297,11 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(acct, ".claude.json"), []byte(loggedIn), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		kept := &creds.Credential{}
+		kept.ClaudeAiOauth.AccessToken = "at-kept-file"
+		if err := creds.WriteFileCredential(acct, kept); err != nil {
+			t.Fatal(err)
+		}
 		pending, err := m.PrepareAdd()
 		if err != nil {
 			t.Fatal(err)
@@ -286,8 +309,11 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 		if pending.ClaudeJSONSeed != SeedKeptExisting {
 			t.Fatalf("seed outcome = %q, want %q", pending.ClaudeJSONSeed, SeedKeptExisting)
 		}
-		if _, err := fk.Read(svc, "tester"); err != nil {
-			t.Errorf("kept credential was purged: %v", err)
+		if _, ok := fk.Get(svc, "tester"); !ok {
+			t.Error("kept keychain credential was purged")
+		}
+		if !creds.FileCredentialExists(acct) {
+			t.Error("kept file credential was purged")
 		}
 	})
 }
@@ -300,7 +326,7 @@ func TestFinalizeAddRequiresIdentity(t *testing.T) {
 	if err := os.MkdirAll(ClaudeDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{Store: openTestStore(t), Keychain: newFakeKeychain(), DetectOverlay: detectSymlink}
+	m := &Manager{Store: openTestStore(t), Creds: credstest.NewFake(), DetectOverlay: detectSymlink}
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}
@@ -317,39 +343,223 @@ func TestFinalizeAddRequiresIdentity(t *testing.T) {
 	}
 }
 
-// TestAbandonAddDeletesKeychainItem pins that rolling back a half-added
-// account also rolls back the credential its login wrote.
-func TestAbandonAddDeletesKeychainItem(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("USER", "tester")
-	if err := os.MkdirAll(ClaudeDir(), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	fk := newFakeKeychain()
-	m := &Manager{Store: openTestStore(t), Keychain: fk, DetectOverlay: detectSymlink}
-	if _, err := m.Init(); err != nil {
-		t.Fatal(err)
-	}
-	pending, err := m.PrepareAdd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The login lands a credential under a label differing from today's
-	// AccountLabel(); the rollback must discover it by service.
-	cred := &keychain.Credential{}
-	cred.ClaudeAiOauth.AccessToken = "at-login"
-	if err := fk.Write(pending.KeychainService, "claude-wrote-this", cred); err != nil {
-		t.Fatal(err)
+// TestAbandonAddDeletesBothStores pins that rolling back a half-added account
+// rolls back whatever credential its login wrote — the Keychain item AND the
+// plaintext file — explicitly, not as a side effect of dir removal.
+func TestAbandonAddDeletesBothStores(t *testing.T) {
+	setup := func(t *testing.T) (*Manager, *credstest.Fake, *PendingAdd) {
+		t.Helper()
+		t.Setenv("HOME", t.TempDir())
+		t.Setenv("USER", "tester")
+		if err := os.MkdirAll(ClaudeDir(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		fk := credstest.NewFake()
+		m := &Manager{Store: openTestStore(t), Creds: fk, DetectOverlay: detectSymlink}
+		if _, err := m.Init(); err != nil {
+			t.Fatal(err)
+		}
+		pending, err := m.PrepareAdd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The login lands a Keychain credential under a label differing from
+		// today's AccountLabel() (the rollback must discover it by service) and,
+		// headless, a plaintext file too.
+		cred := &creds.Credential{}
+		cred.ClaudeAiOauth.AccessToken = "at-login"
+		fk.Put(pending.KeychainService, "claude-wrote-this", cred)
+		if err := creds.WriteFileCredential(pending.ConfigDir, cred); err != nil {
+			t.Fatal(err)
+		}
+		return m, fk, pending
 	}
 
-	if err := m.AbandonAdd(pending); err != nil {
-		t.Fatalf("AbandonAdd: %v", err)
+	t.Run("rollback deletes both stores and the dir", func(t *testing.T) {
+		m, fk, pending := setup(t)
+		if err := m.AbandonAdd(pending); err != nil {
+			t.Fatalf("AbandonAdd: %v", err)
+		}
+		if _, ok := fk.Get(pending.KeychainService, "claude-wrote-this"); ok {
+			t.Error("keychain credential survived the rollback")
+		}
+		if creds.FileCredentialExists(pending.ConfigDir) {
+			t.Error("file credential survived the rollback")
+		}
+		if _, err := os.Stat(pending.ConfigDir); !os.IsNotExist(err) {
+			t.Errorf("account dir survived the rollback: %v", err)
+		}
+	})
+
+	t.Run("credentials are purged even when dir removal cannot run", func(t *testing.T) {
+		m, fk, pending := setup(t)
+		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
+			return nil, errors.New("holder gone")
+		}
+		if err := m.AbandonAdd(pending); err == nil {
+			t.Fatal("AbandonAdd succeeded despite the overlay provider failing")
+		}
+		if _, ok := fk.Get(pending.KeychainService, "claude-wrote-this"); ok {
+			t.Error("keychain credential survived")
+		}
+		if creds.FileCredentialExists(pending.ConfigDir) {
+			t.Error("file credential survived (rollback depended on dir removal)")
+		}
+		if _, err := os.Stat(pending.ConfigDir); err != nil {
+			t.Errorf("account dir unexpectedly gone despite the failed teardown: %v", err)
+		}
+	})
+}
+
+// TestFinalizeAddResolvesBackend pins backend resolution at registration:
+// Keychain first (with the ACL-owning write-back), else the plaintext file
+// under the computed label, else a refusal naming the incomplete login.
+func TestFinalizeAddResolvesBackend(t *testing.T) {
+	cases := []struct {
+		name        string
+		keychain    bool // login wrote a Keychain item (under its own label)
+		file        bool // login wrote .credentials.json
+		wantErr     string
+		wantAccount string
+		wantWrites  int // keychain writes: exactly the ACL re-assert
+	}{
+		{name: "keychain credential wins and is re-asserted", keychain: true, file: true, wantAccount: "claude-wrote", wantWrites: 1},
+		{name: "file credential registers with the computed label", file: true, wantAccount: "tester", wantWrites: 0},
+		{name: "no credential refuses", wantErr: "no credential found"},
 	}
-	if _, err := fk.Read(pending.KeychainService, "claude-wrote-this"); !errors.Is(err, keychain.ErrNotFound) {
-		t.Errorf("credential survived the rollback: %v", err)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("USER", "tester")
+			if err := os.MkdirAll(ClaudeDir(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			fk := credstest.NewFake()
+			m := &Manager{Store: openTestStore(t), Creds: fk, OAuth: &fakeOAuth{currentRT: "rt-0"}, DetectOverlay: detectSymlink, LockDir: t.TempDir()}
+			if _, err := m.Init(); err != nil {
+				t.Fatal(err)
+			}
+			pending, err := m.PrepareAdd()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Simulate the interactive login: identity lands in .claude.json plus a
+			// credential in one (or both) backends.
+			identity := `{"oauthAccount": {"accountUuid": "u-new", "emailAddress": "new@example.com"}}`
+			if err := os.WriteFile(filepath.Join(pending.ConfigDir, ".claude.json"), []byte(identity), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cred := &creds.Credential{}
+			cred.ClaudeAiOauth.AccessToken = "at-0"
+			cred.ClaudeAiOauth.RefreshToken = "rt-0"
+			cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli() // fresh: no refresh write
+			if tc.keychain {
+				fk.Put(pending.KeychainService, "claude-wrote", cred)
+			}
+			if tc.file {
+				if err := creds.WriteFileCredential(pending.ConfigDir, cred); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			acct, err := m.FinalizeAdd(context.Background(), pending, "note")
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("FinalizeAdd = %v, want error containing %q", err, tc.wantErr)
+				}
+				if acct != nil {
+					t.Fatalf("FinalizeAdd returned acct %+v with the refusal", acct)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if acct.KeychainAccount != tc.wantAccount {
+				t.Errorf("KeychainAccount = %q, want %q", acct.KeychainAccount, tc.wantAccount)
+			}
+			if got := fk.WriteCount(); got != tc.wantWrites {
+				t.Errorf("keychain writes = %d, want %d (exactly the ACL write-back)", got, tc.wantWrites)
+			}
+			row, gerr := m.Store.GetAccount(pending.Index)
+			if gerr != nil {
+				t.Fatalf("registered row missing: %v", gerr)
+			}
+			if row.KeychainAccount != tc.wantAccount {
+				t.Errorf("row KeychainAccount = %q, want %q", row.KeychainAccount, tc.wantAccount)
+			}
+		})
 	}
-	if _, err := os.Stat(pending.ConfigDir); !os.IsNotExist(err) {
-		t.Errorf("account dir survived the rollback: %v", err)
+}
+
+// TestRemoveKeepCredential pins the --keep-credential guard: a file-backed
+// credential lives inside the account dir and cannot survive removal, so
+// Remove must refuse (naming the cred-move escape hatch); a keychain-backed or
+// absent credential proceeds, keeping the Keychain item untouched.
+func TestRemoveKeepCredential(t *testing.T) {
+	errHard := errors.New("keychain exploded")
+	cases := []struct {
+		name        string
+		keychain    bool
+		file        bool
+		keychainErr error  // injected keychain read fault
+		wantErr     string // substring; empty means the removal proceeds
+		wantKept    bool   // keychain item still present afterwards
+	}{
+		{name: "file-backed refuses with the move hint", file: true, wantErr: "ccp cred move --to keychain --account 1"},
+		{name: "keychain-backed removes and keeps the item", keychain: true, wantKept: true},
+		{name: "no credential anywhere proceeds"},
+		{name: "unavailable keychain proceeds", keychainErr: creds.ErrUnavailable},
+		{name: "hard keychain error refuses", keychainErr: errHard, wantErr: "keychain exploded"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			st := openTestStore(t)
+			dir := t.TempDir()
+			a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc", KeychainAccount: "user", OverlayKind: "symlink"}
+			if err := st.UpsertAccount(a); err != nil {
+				t.Fatal(err)
+			}
+			fk := credstest.NewFake()
+			fk.KeychainFaults = credstest.Faults{Read: tc.keychainErr}
+			cred := &creds.Credential{}
+			cred.ClaudeAiOauth.AccessToken = "at-1"
+			if tc.keychain {
+				fk.Put(a.KeychainService, a.KeychainAccount, cred)
+			}
+			if tc.file {
+				if err := creds.WriteFileCredential(dir, cred); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m := &Manager{Store: st, Creds: fk}
+
+			err := m.Remove(a.ID, false)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Remove = %v, want error containing %q", err, tc.wantErr)
+				}
+				if _, gerr := st.GetAccount(a.ID); gerr != nil {
+					t.Fatalf("refused Remove deleted the row: %v", gerr)
+				}
+				if _, serr := os.Stat(dir); serr != nil {
+					t.Fatalf("refused Remove damaged the account dir: %v", serr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, gerr := st.GetAccount(a.ID); gerr == nil {
+				t.Fatal("row survived Remove")
+			}
+			if _, ok := fk.Get(a.KeychainService, a.KeychainAccount); ok != tc.wantKept {
+				t.Errorf("keychain item present = %v, want %v", ok, tc.wantKept)
+			}
+		})
 	}
 }
 
@@ -362,7 +572,7 @@ func TestConcurrentPrepareAddIndexRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := openTestStore(t)
-	m := &Manager{Store: st, Keychain: newFakeKeychain(), DetectOverlay: detectSymlink}
+	m := &Manager{Store: st, Creds: credstest.NewFake(), DetectOverlay: detectSymlink}
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +635,7 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		if err := os.WriteFile(ClaudeJSONPath(), []byte(`{"hasCompletedOnboarding":true}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		m := &Manager{Store: openTestStore(t), Keychain: newFakeKeychain()}
+		m := &Manager{Store: openTestStore(t), Creds: credstest.NewFake()}
 		m.DetectOverlay = func() (fkoverlay.Backend, string) { return fkoverlay.BackendNFS, "" }
 		m.OverlayFor = func(kind fkoverlay.Backend) (fkoverlay.Provider, error) {
 			if kind.IsFuse() {
@@ -585,7 +795,7 @@ func TestPrepareAddSurfacesDetectReason(t *testing.T) {
 	if err := EnsureAccountsDir(); err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{Store: openTestStore(t), Keychain: newFakeKeychain()}
+	m := &Manager{Store: openTestStore(t), Creds: credstest.NewFake()}
 	m.DetectOverlay = func() (fkoverlay.Backend, string) { return fkoverlay.BackendSymlink, reason }
 	if err := m.Store.SetMeta(metaInitialized, "1"); err != nil {
 		t.Fatal(err)

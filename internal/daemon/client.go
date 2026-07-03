@@ -87,6 +87,14 @@ func (c *Client) Migrate(account *int, to string, force bool) (*Response, error)
 	return c.do(Request{Op: OpMigrate, Account: account, To: to, Force: force}, migrateTimeout)
 }
 
+// CredMove asks the daemon to move account credentials to the given backend
+// ("keychain" or "file"): nil account means all accounts; busy accounts are
+// skipped and reported per account. It shares migrateTimeout because both ops
+// answer under the server's extended 140s conn deadline.
+func (c *Client) CredMove(account *int, to string) (*Response, error) {
+	return c.do(Request{Op: OpCredMove, Account: account, To: to}, migrateTimeout)
+}
+
 // Shutdown asks the daemon to step down; OK means it will release the socket
 // shortly (confirm with WaitGone). Works even on an orphan launchctl bootout
 // cannot kill.

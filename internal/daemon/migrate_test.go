@@ -17,7 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
@@ -783,7 +784,7 @@ func TestPollOnceSkipsConvertingAccount(t *testing.T) {
 	fo.mu.Lock()
 	fo.currentRT = "rt-0"
 	fo.mu.Unlock()
-	fk := s.m.Keychain.(*fakeKeychain)
+	fk := s.m.Creds.(*credstest.Fake)
 	a, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
@@ -794,15 +795,13 @@ func TestPollOnceSkipsConvertingAccount(t *testing.T) {
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	cred := &keychain.Credential{}
+	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-0"
 	cred.ClaudeAiOauth.RefreshToken = "rt-0"
 	// Near-expiry (< RefreshLeadTime) so an idle poll must refresh.
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Minute).UnixMilli()
-	if err := fk.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
-		t.Fatal(err)
-	}
-	seedWrites := fk.writeCount()
+	fk.Put(a.KeychainService, a.KeychainAccount, cred)
+	seedWrites := fk.WriteCount()
 
 	if !s.beginConvert(a.ID) {
 		t.Fatal("beginConvert failed")
@@ -811,7 +810,7 @@ func TestPollOnceSkipsConvertingAccount(t *testing.T) {
 	if got := fo.refreshCount(); got != 0 {
 		t.Fatalf("converting account was refreshed %d time(s)", got)
 	}
-	if got := fk.writeCount(); got != seedWrites {
+	if got := fk.WriteCount(); got != seedWrites {
 		t.Fatalf("converting account's credential was written %d time(s)", got-seedWrites)
 	}
 

@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/daemon"
-	"github.com/yasyf/cc-pool/internal/keychain"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/version"
@@ -135,18 +135,9 @@ func exhaustedPoolManager(t *testing.T) *pool.Manager {
 			t.Fatal(err)
 		}
 	}
-	return &pool.Manager{Store: st, Keychain: emptyKeychain{}, LockDir: t.TempDir()}
+	// An empty seam fake makes any preflight refresh a harmless needs-login miss.
+	return &pool.Manager{Store: st, Creds: credstest.NewFake(), LockDir: t.TempDir()}
 }
-
-// emptyKeychain makes any preflight refresh a harmless needs-login miss.
-type emptyKeychain struct{}
-
-func (emptyKeychain) Read(string, string) (*keychain.Credential, error) {
-	return nil, keychain.ErrNotFound
-}
-func (emptyKeychain) Write(string, string, *keychain.Credential) error { return nil }
-func (emptyKeychain) Delete(string, string) error                      { return nil }
-func (emptyKeychain) Discover(string) (string, error)                  { return "", keychain.ErrNotFound }
 
 // Pins the billing warning at its call site: removing warnExhaustedFallback fails this.
 func TestResolveSelectionWarnsOnExhaustedFallback(t *testing.T) {

@@ -314,10 +314,11 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		writeResp(conn, Response{OK: false, Error: "bad request: " + err.Error()})
 		return
 	}
-	if req.Op == OpMigrate {
-		// A migrate legitimately outlives the 10s deadline (a probe mount plus
-		// up to an 8s wait and a bounded rollback per account); stay under the
-		// client's 150s so the server, not a dead socket, reports the outcome.
+	if req.Op == OpMigrate || req.Op == OpCredMove {
+		// These ops legitimately outlive the 10s deadline (migrate: a probe
+		// mount plus up to an 8s wait and a bounded rollback per account;
+		// credmove: a bounded per-account lock wait); stay under the client's
+		// 150s so the server, not a dead socket, reports the outcome.
 		_ = conn.SetDeadline(time.Now().Add(140 * time.Second))
 	}
 	resp := s.dispatch(ctx, req)
@@ -342,6 +343,8 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 		return s.handleCheckin(ctx, req)
 	case OpMigrate:
 		return s.handleMigrate(ctx, req)
+	case OpCredMove:
+		return s.handleCredMove(ctx, req)
 	case OpShutdown:
 		return s.handleShutdown()
 	default:

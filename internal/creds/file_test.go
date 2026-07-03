@@ -1,9 +1,8 @@
-package keychain
+package creds
 
 import (
 	"errors"
 	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -56,42 +55,5 @@ func TestReadFileCredentialRejectsBlankToken(t *testing.T) {
 	}
 	if _, err := ReadFileCredential(dir); err == nil {
 		t.Fatal("ReadFileCredential accepted a blank accessToken")
-	}
-}
-
-// TestLocateCredential pins backend resolution: Keychain first (as claude
-// prefers), plaintext file fallback, ErrNotFound when neither holds one.
-func TestLocateCredential(t *testing.T) {
-	dir := t.TempDir()
-	storeDir := filepath.Join(dir, "items")
-	if err := os.MkdirAll(storeDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	old := securityBin
-	securityBin = writeFakeSecurity(t, dir, storeDir)
-	t.Cleanup(func() { securityBin = old })
-	t.Setenv("USER", "tester")
-
-	const svc = "Claude Code-credentials-deadbeef"
-	cfg := t.TempDir()
-
-	if _, _, err := LocateCredential(cfg, svc); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("LocateCredential with nothing = %v, want ErrNotFound", err)
-	}
-
-	if err := WriteFileCredential(cfg, &Credential{ClaudeAiOauth: OAuth{AccessToken: "at"}}); err != nil {
-		t.Fatal(err)
-	}
-	acct, src, err := LocateCredential(cfg, svc)
-	if err != nil || src != SourceFile || acct != "tester" {
-		t.Fatalf("LocateCredential file-only = %q,%v,%v; want tester,SourceFile,nil", acct, src, err)
-	}
-
-	if err := Write(svc, "claude-wrote", &Credential{ClaudeAiOauth: OAuth{AccessToken: "at"}}); err != nil {
-		t.Fatal(err)
-	}
-	acct, src, err = LocateCredential(cfg, svc)
-	if err != nil || src != SourceKeychain || acct != "claude-wrote" {
-		t.Fatalf("LocateCredential keychain-first = %q,%v,%v; want claude-wrote,SourceKeychain,nil", acct, src, err)
 	}
 }

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
@@ -500,6 +503,219 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 	fkoverlay.ResolvedConflictLogf("leak probe")
 	if out.Len() != before {
 		t.Errorf("seam leaked past the heal: a write after checkStrandedPrivate still hit the doctor buffer")
+	}
+}
+
+// TestCheckCredential pins doctor's per-backend credential truth table over the
+// Manager seam: healthy verdicts name the live backend, a file copy behind a
+// readable Keychain item is divergence (--fix stays advisory and points at
+// `ccp cred move` — never deletes, so a fresh headless re-login is never lost),
+// and an unsearchable Keychain is unknown state — never reported as absence.
+func TestCheckCredential(t *testing.T) {
+	usable := &creds.Credential{}
+	usable.ClaudeAiOauth.AccessToken = "at"
+	usable.ClaudeAiOauth.RefreshToken = "rt"
+	usable.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
+	hardErr := errors.New("security find-generic-password: exit status 51")
+
+	cases := map[string]struct {
+		seedKeychain bool
+		file         string // "", "valid", "corrupt"
+		keychainRead error  // injected keychain Read fault
+		fileDelete   error  // injected file Delete fault
+		fix          bool
+		wantLabel    string
+		wantHealthy  bool
+		wantDetail   string // exact match when non-empty
+		wantContains []string
+		wantOmits    []string
+		wantFileGone bool
+	}{
+		"keychain only is healthy and names its backend": {
+			seedKeychain: true,
+			wantLabel:    "acct-01 credential", wantHealthy: true, wantDetail: "keychain",
+		},
+		"file only is healthy and names its backend": {
+			file:      "valid",
+			wantLabel: "acct-01 credential", wantHealthy: true, wantDetail: "file",
+		},
+		"unsearchable keychain with a file credential is healthy, not flagged": {
+			file:         "valid",
+			keychainRead: creds.ErrUnavailable,
+			wantLabel:    "acct-01 credential", wantHealthy: true, wantDetail: "file",
+		},
+		"copies in both backends are divergence": {
+			seedKeychain: true, file: "valid",
+			wantLabel:    "acct-01 credential",
+			wantContains: []string{"BOTH", "diverge", "single-use"},
+		},
+		"a corrupt file behind the keychain still counts as both": {
+			seedKeychain: true, file: "corrupt",
+			wantLabel:    "acct-01 credential",
+			wantContains: []string{"BOTH", "diverge"},
+		},
+		"unsearchable keychain and no file is unknown state, never absence": {
+			keychainRead: creds.ErrUnavailable,
+			wantLabel:    "acct-01 credential",
+			wantContains: []string{"unreachable", "unknown", "ccp cred move --to file"},
+			wantOmits:    []string{"not found"},
+		},
+		"no credential in either backend names the login fix": {
+			wantLabel:    "acct-01 credential",
+			wantContains: []string{"no credential in either backend", "ccp login 1"},
+		},
+		"a corrupt file with an empty keychain surfaces the parse error": {
+			file:         "corrupt",
+			wantLabel:    "acct-01 credential",
+			wantContains: []string{"parse credential blob"},
+		},
+		"a hard keychain error is reported verbatim": {
+			keychainRead: hardErr,
+			wantLabel:    "acct-01 keychain",
+			wantContains: []string{hardErr.Error()},
+		},
+		"fix stays advisory and points at cred move, never deleting": {
+			seedKeychain: true, file: "valid", fix: true,
+			wantLabel: "acct-01 credential", wantHealthy: false,
+			wantContains: []string{"BOTH", "diverge", "ccp cred move", "fresher"},
+			wantFileGone: false,
+		},
+		"fix on an unreachable keychain says there is nothing to do locally": {
+			keychainRead: creds.ErrUnavailable, fix: true,
+			wantLabel:    "acct-01 credential",
+			wantContains: []string{"unreachable", "unknown", "nothing for --fix to do locally"},
+			wantOmits:    []string{"not found"},
+		},
+		"fix reports a reassert that keeps failing": {
+			keychainRead: hardErr, fix: true,
+			wantLabel:    "acct-01 keychain",
+			wantContains: []string{hardErr.Error()},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc-01", KeychainAccount: "user"}
+			fk := credstest.NewFake()
+			fk.KeychainFaults = credstest.Faults{Read: tc.keychainRead}
+			fk.FileFaults = credstest.Faults{Delete: tc.fileDelete}
+			if tc.seedKeychain {
+				fk.Put(a.KeychainService, a.KeychainAccount, usable)
+			}
+			switch tc.file {
+			case "valid":
+				if err := creds.WriteFileCredential(a.ConfigDir, usable); err != nil {
+					t.Fatal(err)
+				}
+			case "corrupt":
+				if err := os.WriteFile(creds.FileCredentialPath(a.ConfigDir), []byte("{not json"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m := &pool.Manager{Creds: fk}
+
+			report, calls := captureReports()
+			checkCredential(m, a, tc.fix, report)
+
+			if len(*calls) != 1 {
+				t.Fatalf("got %d reports %+v, want exactly one", len(*calls), *calls)
+			}
+			got := (*calls)[0]
+			if got.label != tc.wantLabel {
+				t.Errorf("label = %q, want %q", got.label, tc.wantLabel)
+			}
+			if got.healthy != tc.wantHealthy {
+				t.Errorf("healthy = %v, want %v (detail %q)", got.healthy, tc.wantHealthy, got.detail)
+			}
+			if tc.wantDetail != "" && got.detail != tc.wantDetail {
+				t.Errorf("detail = %q, want exactly %q", got.detail, tc.wantDetail)
+			}
+			for _, frag := range tc.wantContains {
+				if !strings.Contains(got.detail, frag) {
+					t.Errorf("detail %q missing %q", got.detail, frag)
+				}
+			}
+			for _, frag := range tc.wantOmits {
+				if strings.Contains(got.detail, frag) {
+					t.Errorf("detail %q must not contain %q", got.detail, frag)
+				}
+			}
+			if tc.file != "" {
+				if gone := !creds.FileCredentialExists(a.ConfigDir); gone != tc.wantFileGone {
+					t.Errorf("file credential gone = %v, want %v", gone, tc.wantFileGone)
+				}
+			}
+			if tc.seedKeychain {
+				if _, ok := fk.Get(a.KeychainService, a.KeychainAccount); !ok {
+					t.Error("keychain copy deleted; doctor must never remove the authoritative credential")
+				}
+			}
+			if got := fk.WriteCount(); got != 0 {
+				t.Errorf("keychain writes = %d, want 0 (only a successful reassert writes)", got)
+			}
+		})
+	}
+}
+
+// oneShotReadFault fails only the first keychain Read — the ACL denial doctor
+// classifies on — so the --fix reassert's re-read (the GUI-prompt recovery)
+// reaches the underlying store.
+type oneShotReadFault struct {
+	creds.Store
+	err   error
+	reads int
+}
+
+func (s *oneShotReadFault) Read() (*creds.Credential, error) {
+	s.reads++
+	if s.reads == 1 {
+		return nil, s.err
+	}
+	return s.Store.Read()
+}
+
+// keychainOverride hands out kc for the Keychain backend and delegates the
+// rest to the embedded Credentials.
+type keychainOverride struct {
+	pool.Credentials
+	kc creds.Store
+}
+
+func (c keychainOverride) Store(a store.Account, src creds.Source) creds.Store {
+	if src == creds.SourceKeychain {
+		return c.kc
+	}
+	return c.Credentials.Store(a, src)
+}
+
+// TestCheckCredentialFixReassertsKeychain pins the --fix recovery for a
+// keychain item our ACL cannot read: reassert re-reads then writes the item
+// back through the seam (FinalizeAdd's ownership re-assertion), reporting
+// re-asserted on success.
+func TestCheckCredentialFixReassertsKeychain(t *testing.T) {
+	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc-01", KeychainAccount: "user"}
+	usable := &creds.Credential{}
+	usable.ClaudeAiOauth.AccessToken = "at"
+	usable.ClaudeAiOauth.RefreshToken = "rt"
+	fk := credstest.NewFake()
+	fk.Put(a.KeychainService, a.KeychainAccount, usable)
+	kc := &oneShotReadFault{Store: fk.Store(a, creds.SourceKeychain), err: errors.New("security: write access denied")}
+	m := &pool.Manager{Creds: keychainOverride{Credentials: fk, kc: kc}}
+
+	report, calls := captureReports()
+	checkCredential(m, a, true, report)
+
+	if len(*calls) != 1 {
+		t.Fatalf("got %d reports %+v, want exactly one", len(*calls), *calls)
+	}
+	got := (*calls)[0]
+	if got.label != "acct-01 keychain" || !got.healthy || got.detail != "re-asserted" {
+		t.Fatalf("report = %+v, want healthy %q re-asserted", got, "acct-01 keychain")
+	}
+	if writes := fk.WriteCount(); writes != 1 {
+		t.Errorf("keychain writes = %d, want exactly 1 (the ACL re-assertion)", writes)
+	}
+	if kc.reads != 2 {
+		t.Errorf("keychain reads = %d, want 2 (classify + reassert)", kc.reads)
 	}
 }
 

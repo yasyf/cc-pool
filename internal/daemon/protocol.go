@@ -26,6 +26,7 @@ const (
 	OpHealth   Op = "health"   // liveness + version probe
 	OpShutdown Op = "shutdown" // step down gracefully and release the socket
 	OpMigrate  Op = "migrate"  // convert accounts between overlay providers
+	OpCredMove Op = "credmove" // move account credentials between backends
 )
 
 // Request is one client request (one JSON object per line).
@@ -39,15 +40,18 @@ type Request struct {
 	// NoFallback: report none-available instead of a least-bad exhausted pick;
 	// discarding a pick doesn't undo its sticky/reservation/preflight side effects.
 	NoFallback bool `json:"no_fallback,omitempty"`
-	// To: target overlay kind for migrate ("fuse" or "symlink"). Only the daemon
-	// converts: it owns the reservations and poll claims the conversion gates on.
+	// To: target overlay kind for migrate ("fuse" or "symlink") or credential
+	// backend for credmove ("keychain" or "file"). Only the daemon converts or
+	// moves: it owns the reservations and poll claims those ops gate on.
 	To string `json:"to,omitempty"`
 	// Force: migrate despite live sessions. Reservations still refuse — a
-	// reserved account has a claude launching into it right now.
+	// reserved account has a claude launching into it right now. Ignored by
+	// credmove: moving a credential under a live session forks its
+	// refresh-token chain, so that gate has no override.
 	Force bool `json:"force,omitempty"`
 }
 
-// MigrationOutcome classifies one account's migrate result.
+// MigrationOutcome classifies one account's migrate or credmove result.
 type MigrationOutcome string
 
 const (
@@ -57,7 +61,10 @@ const (
 	MigrationFailed  MigrationOutcome = "failed"  // conversion errored (detail says why)
 )
 
-// MigrationResult is one account's outcome in a migrate response.
+// MigrationResult is one account's outcome in a migrate or credmove response.
+// From/To carry overlay kinds for migrate and credential backend names
+// ("keychain"/"file") for credmove; From is empty when the move never probed
+// the source (busy/failed).
 type MigrationResult struct {
 	ID      int              `json:"id"`
 	Label   string           `json:"label,omitempty"`
@@ -224,6 +231,6 @@ type Response struct {
 	Accounts       []AccountStatus   `json:"accounts,omitempty"`   // status
 	Holder         *HolderStatus     `json:"holder,omitempty"`     // status: mount-holder cache
 	Version        string            `json:"version,omitempty"`    // health
-	Migrations     []MigrationResult `json:"migrations,omitempty"` // migrate
+	Migrations     []MigrationResult `json:"migrations,omitempty"` // migrate/credmove
 	SoonestReset   *time.Time        `json:"soonest_reset,omitempty"`
 }
