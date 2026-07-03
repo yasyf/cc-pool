@@ -109,15 +109,23 @@ func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, f
 		return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("mount: %w", err))
 	}
 
-	// A mismatch means the live mirror is not serving the backing dir we populated.
+	// Verify the identity we moved into the private root survived the move intact.
+	// We read the backing file, NOT back through the fresh mount: a through-mount
+	// os.ReadFile is unbounded and stalls at the macOS-NFS/fuse-t transport layer
+	// when --force converts a dir a live session still holds — hanging the migrate
+	// and stranding the account. The mirror serves this exact file (ReadSynth merges
+	// priv/.claude.json with base), and mirror liveness is already vouched by Setup's
+	// bounded MountAlive stat, the mitigation gate's post-mount health re-check, and
+	// the heal loop — so the backing-file read preserves the only invariant that
+	// matters (the moved identity is intact and unchanged) without the stall.
 	if preErr == nil {
-		post, err := readIdentity(filepath.Join(dir, ".claude.json"))
+		post, err := readIdentity(filepath.Join(priv, ".claude.json"))
 		if err != nil {
-			return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("identity not readable through mount: %w", err))
+			return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("identity not readable in private root after move: %w", err))
 		}
 		if post.AccountUUID != pre.AccountUUID {
 			return a, m.rollbackToSymlink(a, symProv, fuseProv,
-				fmt.Errorf("identity through mount is %s, expected %s", post.AccountUUID, pre.AccountUUID))
+				fmt.Errorf("identity in private root is %s, expected %s", post.AccountUUID, pre.AccountUUID))
 		}
 	}
 

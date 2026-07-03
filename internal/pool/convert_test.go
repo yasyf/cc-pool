@@ -30,6 +30,7 @@ type fakeFuse struct {
 	setupErr      error
 	teardownErr   error
 	wrongIdentity bool
+	noMountView   bool             // Setup materializes nothing at dir/.claude.json: through-mount reads are unavailable
 	onSetup       func(dir string) // runs inside Setup, before setupErr
 	created       string
 }
@@ -39,8 +40,9 @@ func (f *fakeFuse) Sync(_, _ string) error        { return nil }
 func (f *fakeFuse) Health(_, _ string) error      { return nil }
 func (f *fakeFuse) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
 func (f *fakeFuse) Setup(_, dir string) error {
+	priv := fkoverlay.FusePrivateRoot(dir)
 	privIdentity := false
-	if _, err := os.Stat(filepath.Join(fkoverlay.FusePrivateRoot(dir), ".claude.json")); err == nil {
+	if _, err := os.Stat(filepath.Join(priv, ".claude.json")); err == nil {
 		privIdentity = true
 	}
 	*f.ops = append(*f.ops, fmt.Sprintf("fuse.setup(priv-identity=%v)", privIdentity))
@@ -50,17 +52,17 @@ func (f *fakeFuse) Setup(_, dir string) error {
 	if f.setupErr != nil {
 		return f.setupErr
 	}
-	mounted := filepath.Join(dir, ".claude.json")
 	if f.wrongIdentity {
-		if err := os.WriteFile(mounted, []byte(wrongIdentityJSON), 0o600); err != nil {
-			return err
-		}
-	} else if privIdentity {
-		if err := os.Symlink(filepath.Join(fkoverlay.FusePrivateRoot(dir), ".claude.json"), mounted); err != nil {
-			return err
-		}
-	} else {
+		// The private root ends up holding an identity that is not the one the
+		// conversion moved — the state the post-mount verify must catch.
+		return os.WriteFile(filepath.Join(priv, ".claude.json"), []byte(wrongIdentityJSON), 0o600)
+	}
+	if f.noMountView || !privIdentity {
 		return nil
+	}
+	mounted := filepath.Join(dir, ".claude.json")
+	if err := os.Symlink(filepath.Join(priv, ".claude.json"), mounted); err != nil {
+		return err
 	}
 	f.created = mounted
 	return nil
@@ -250,6 +252,57 @@ func TestConvertToFuseHappyPath(t *testing.T) {
 	}
 }
 
+// TestConvertToFuseVerifiesIdentityInPrivateRootNotThroughMount pins the
+// post-mount identity verify to the private backing file. It reproduces the
+// live incident this guards against: `ccp migrate --to fuse --force` on a dir
+// a live claude session still held would stall in the old through-mount
+// readIdentity(dir/.claude.json) — an unbounded os.ReadFile at the
+// macOS-NFS/fuse-t transport layer — until the client timeout fired, and the
+// stalled read's eventual error rolled back onto the busy mount, leaving the
+// account mounted with a symlink row and its private files stranded. The
+// fake's noMountView mode materializes nothing at dir/.claude.json, exactly a
+// mirror whose through-mount reads are unavailable at verify time, so the
+// conversion must succeed purely off priv/.claude.json — the file ReadSynth
+// serves as the mount's content anyway. Reverted to read dir/.claude.json,
+// the verify misses, the conversion rolls back, and this test fails.
+func TestConvertToFuseVerifiesIdentityInPrivateRootNotThroughMount(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops, noMountView: true}
+	m, a, dir := newConvertFixture(t, fake)
+	priv := fkoverlay.FusePrivateRoot(dir)
+
+	got, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
+	if err != nil {
+		t.Fatalf("ConvertOverlay with no through-mount view: %v", err)
+	}
+	if got.OverlayKind != "nfs" || storedKind(t, m, a.ID) != "nfs" {
+		t.Fatalf("row not flipped: returned=%s stored=%s", got.OverlayKind, storedKind(t, m, a.ID))
+	}
+	// Exactly one setup and no teardown: the verify never tripped a rollback.
+	if len(ops) != 1 || ops[0] != "fuse.setup(priv-identity=true)" {
+		t.Fatalf("ops = %v, want exactly one setup with the private identity in place", ops)
+	}
+	if gotJSON := readFileT(t, filepath.Join(priv, ".claude.json")); gotJSON != identityJSON {
+		t.Fatalf("identity in private root = %q, want %q", gotJSON, identityJSON)
+	}
+	if gotBak := readFileT(t, filepath.Join(priv, "backups", "b.bak")); gotBak != "bak" {
+		t.Fatalf("backups content lost: %q", gotBak)
+	}
+	// Private files moved, shared links torn down, nothing minted at the
+	// mountpoint: the dir is a bare mountpoint with zero stranded state.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Fatalf("account dir not left as a bare mountpoint: %v", names)
+	}
+}
+
 // TestConvertToFuseMovesMcpNeedsAuthCacheToPrivate pins the anti-silent-data-loss
 // arm of the mcp-needs-auth-cache.json private classification. Unclassified, the
 // name defaulted to shared, and claude's atomic rewrite (temp+rename) turned the
@@ -380,17 +433,28 @@ func TestConvertToFuseUnmountFailureAbortsRollback(t *testing.T) {
 	}
 }
 
+// TestConvertToFuseIdentityMismatchRollsBack pins the verify's mismatch arm:
+// a private root holding an identity other than the one the conversion moved
+// rolls back to symlink, keeps the row on symlink, and preserves the divergent
+// bytes for inspection instead of destroying them.
 func TestConvertToFuseIdentityMismatchRollsBack(t *testing.T) {
 	ops := []string{}
 	fake := &fakeFuse{ops: &ops, wrongIdentity: true}
 	m, a, dir := newConvertFixture(t, fake)
 
 	_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
-	if err == nil || !strings.Contains(err.Error(), "identity through mount") {
-		t.Fatalf("error = %v, want identity mismatch", err)
+	if err == nil || !strings.Contains(err.Error(), "identity in private root is u-IMPOSTOR, expected u-1") {
+		t.Fatalf("error = %v, want the private-root identity mismatch", err)
 	}
-	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
-		t.Fatalf("identity not restored after mismatch: %q", got)
+	if !strings.Contains(err.Error(), "rolled back to symlink") {
+		t.Fatalf("error = %v, want rollback report", err)
+	}
+	// The rollback moves the divergent file back rather than deleting data.
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != wrongIdentityJSON {
+		t.Fatalf("divergent identity not preserved through rollback: %q", got)
+	}
+	if _, err := os.Readlink(filepath.Join(dir, "projects")); err != nil {
+		t.Fatalf("symlink overlay not re-asserted: %v", err)
 	}
 	if storedKind(t, m, a.ID) != "symlink" {
 		t.Fatal("row flipped despite identity mismatch")
