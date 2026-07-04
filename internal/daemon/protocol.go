@@ -242,10 +242,16 @@ type Response struct {
 	// MountsNotReady: the none-available verdict is a mount-layer fact — every
 	// account has headroom but none has a mounted, healthy mirror — so clients
 	// don't misreport it as exhausted/rate-limited.
-	MountsNotReady bool              `json:"mounts_not_ready,omitempty"`
-	Accounts       []AccountStatus   `json:"accounts,omitempty"`   // status
-	Holder         *HolderStatus     `json:"holder,omitempty"`     // status: mount-holder cache
-	Version        string            `json:"version,omitempty"`    // health
-	Migrations     []MigrationResult `json:"migrations,omitempty"` // migrate/credmove
-	SoonestReset   *time.Time        `json:"soonest_reset,omitempty"`
+	MountsNotReady bool            `json:"mounts_not_ready,omitempty"`
+	Accounts       []AccountStatus `json:"accounts,omitempty"` // status
+	Holder         *HolderStatus   `json:"holder,omitempty"`   // status: mount-holder cache
+	// ContentHealth joins the daemon content source's recorded read and
+	// write-through failures for the computed files (merged .claude.json,
+	// injected settings.json) it serves over the holder and File Provider
+	// bridges, "; "-separated; "" when every domain's content is healthy.
+	// Status only.
+	ContentHealth string            `json:"content_health,omitempty"`
+	Version       string            `json:"version,omitempty"`    // health
+	Migrations    []MigrationResult `json:"migrations,omitempty"` // migrate/credmove
+	SoonestReset  *time.Time        `json:"soonest_reset,omitempty"`
 }

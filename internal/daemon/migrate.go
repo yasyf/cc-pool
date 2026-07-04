@@ -8,6 +8,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
@@ -33,10 +34,16 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 			return Response{OK: false, Error: msg}
 		}
 		to = backend
+	case "fileprovider":
+		backend, msg := s.fpGate(ctx)
+		if msg != "" {
+			return Response{OK: false, Error: msg}
+		}
+		to = backend
 	case "symlink":
 		to = fkoverlay.BackendSymlink
 	default:
-		return Response{OK: false, Error: fmt.Sprintf("unknown overlay target %q (want fuse or symlink)", req.To)}
+		return Response{OK: false, Error: fmt.Sprintf("unknown overlay target %q (want fuse, symlink, or fileprovider)", req.To)}
 	}
 
 	accts, err := s.m.Store.ListAccounts()
@@ -57,9 +64,9 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 		}
 	}
 
-	// The budget clock starts here, AFTER fuseGate: the gate's awaitHolderHealth
-	// already absorbed holder cold-start, so the first account's mount doesn't
-	// pay it out of its conversion budget.
+	// The budget clock starts here, AFTER the capability gate: fuseGate's
+	// awaitHolderHealth already absorbed holder cold-start, so the first
+	// account's mount doesn't pay it out of its conversion budget.
 	budget := s.migrateBudget
 	if budget <= 0 {
 		budget = defaultMigrateBudget
@@ -85,9 +92,9 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 	}
 
 	resp := Response{OK: true, Migrations: results}
-	// Fuse flips the new-account default even with zero conversions, so a fresh
-	// pool doesn't stay on symlink.
-	if to.IsFuse() || converted {
+	// A passed fuse or fileprovider gate flips the new-account default even
+	// with zero conversions, so a fresh pool doesn't stay on symlink.
+	if to == fkoverlay.BackendFileProvider || to.IsFuse() || converted {
 		if err := s.m.SetDefaultOverlayKind(to); err != nil {
 			resp.OK = false
 			resp.Error = fmt.Sprintf("recording %s as the new-account default failed: %v", to, err)
@@ -108,7 +115,9 @@ func (s *Server) fuseGate(ctx context.Context) (fkoverlay.Backend, string) {
 	if !pool.CanHostFuse() {
 		return "", "fuse is not available on this machine; run `ccp fuse enable` to install the fusekit-holder cask"
 	}
-	backend, reason := pool.DetectOverlayBackend(ctx)
+	// Fuse-only detection: DetectOverlayBackend prefers File Provider when the
+	// extension is enabled, and an FP verdict here would wrongly refuse fuse.
+	backend, reason := pool.DetectFuseBackend(ctx)
 	if !backend.IsFuse() {
 		return "", fmt.Sprintf("fuse unavailable: %s — fix this, then re-run `ccp migrate`", reason)
 	}
@@ -150,6 +159,35 @@ func (s *Server) awaitHolderHealth(ctx context.Context) (string, error) {
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+}
+
+// fpAvailable is a test seam over fkoverlay.FileProviderAvailable, whose
+// pluginkit query cannot be scripted in tests.
+var fpAvailable = fkoverlay.FileProviderAvailable
+
+// fpControlHealth is a test seam over the companion app's control Health
+// probe; the production probe dials the app's control socket.
+var fpControlHealth = func(ctx context.Context, socket string) (string, error) {
+	return fileproviderd.NewAppClient(socket).Health(ctx)
+}
+
+// fpGate reports why File Provider domains cannot be hosted, or "" when they
+// can — fuseGate's analog for `ccp migrate --to fileprovider`. The extension
+// probe (pluginkit: installed AND enabled) fails before the app is even
+// dialed, and a control Health round-trip proves the companion app is serving:
+// an FP conversion retargets the account dir onto a domain root that only a
+// live, entitled app can register, so both must hold before any account is
+// disturbed.
+func (s *Server) fpGate(ctx context.Context) (fkoverlay.Backend, string) {
+	spec := s.m.OverlaySpec()
+	if !fpAvailable(spec) {
+		en := fkoverlay.BackendFileProvider.Enablement()
+		return "", fmt.Sprintf("fileprovider unavailable: the %s extension is not installed and enabled — %s Then re-run `ccp migrate`", pool.FPExtensionBundleID, en.Guidance)
+	}
+	if _, err := fpControlHealth(ctx, spec.FileProvider.ControlSocket); err != nil {
+		return "", fmt.Sprintf("fileprovider unavailable: companion app control probe failed: %v — start %s, then re-run `ccp migrate`", err, pool.WidgetAppPath())
+	}
+	return fkoverlay.BackendFileProvider, ""
 }
 
 // convertAccount runs one gated conversion. force skips only the live-session

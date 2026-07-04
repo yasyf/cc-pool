@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/pool"
 )
 
 const (
@@ -13,7 +14,6 @@ const (
 	widgetTap     = "yasyf/homebrew-tap"
 	widgetTapURL  = "https://github.com/yasyf/homebrew-tap"
 	widgetAppName = "CCPoolStatus"
-	widgetAppPath = "/Applications/CCPoolStatus.app" // the cask's default appdir
 )
 
 func newWidgetCmd() *cobra.Command {
@@ -42,7 +42,7 @@ func runWidget(cmd *cobra.Command) error {
 	}
 	// By path first: LaunchServices hasn't indexed a fresh install, so by-name fails on first launch.
 	step(out, "Launching it so macOS discovers the widget…")
-	if err := runStreamed(cmd, "open", "-g", widgetAppPath); err != nil {
+	if err := runStreamed(cmd, "open", "-g", pool.WidgetAppPath()); err != nil {
 		if err := runStreamed(cmd, "open", "-g", "-a", widgetAppName); err != nil {
 			return fmt.Errorf("launch %s (is the cask appdir customized?): %w", widgetAppName, err)
 		}

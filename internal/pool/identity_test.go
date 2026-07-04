@@ -17,10 +17,11 @@ func TestAccountIdentityPathMath(t *testing.T) {
 	tests := []struct {
 		name     string
 		backend  fkoverlay.Backend
-		fuseSide bool
+		privSide bool
 	}{
-		{name: "nfs reads the private backing dir", backend: fkoverlay.BackendNFS, fuseSide: true},
-		{name: "fskit reads the private backing dir", backend: fkoverlay.BackendFSKit, fuseSide: true},
+		{name: "nfs reads the private backing dir", backend: fkoverlay.BackendNFS, privSide: true},
+		{name: "fskit reads the private backing dir", backend: fkoverlay.BackendFSKit, privSide: true},
+		{name: "fileprovider reads the private backing dir, never through the domain", backend: fkoverlay.BackendFileProvider, privSide: true},
 		{name: "symlink reads the account dir", backend: fkoverlay.BackendSymlink},
 	}
 	for _, tc := range tests {
@@ -33,7 +34,7 @@ func TestAccountIdentityPathMath(t *testing.T) {
 				}
 			}
 			inDir, inPriv := right, decoy
-			if tc.fuseSide {
+			if tc.privSide {
 				inDir, inPriv = decoy, right
 			}
 			if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(inDir), 0o600); err != nil {

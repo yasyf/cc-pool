@@ -7,7 +7,12 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
+
+// fpAvailable is a test seam over fkoverlay.FileProviderAvailable, whose
+// pluginkit query cannot be scripted in tests.
+var fpAvailable = fkoverlay.FileProviderAvailable
 
 func newMigrateCmd() *cobra.Command {
 	var account int
@@ -15,10 +20,13 @@ func newMigrateCmd() *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "migrate",
-		Short: "Convert accounts to a different overlay provider (symlink ⇄ fuse)",
+		Short: "Convert accounts to a different overlay provider (symlink ⇄ fuse ⇄ fileprovider)",
 		Long: `migrate converts existing pool accounts to a different overlay provider —
 by default fuse, the live mirror preferred when fuse-t is installed. Accounts
-created before fuse-t was set up stay on symlinks until migrated.
+created before fuse-t was set up stay on symlinks until migrated. The
+fileprovider target hosts an account as an OS-managed File Provider domain
+instead; it needs the CCPoolStatus companion app installed with its File
+Provider extension enabled.
 
 The conversion runs inside the daemon, which owns the gates it needs (select
 reservations, poll claims); the mounts themselves live in the shared,
@@ -38,11 +46,15 @@ migrated-to provider.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
-				if to != "fuse" && to != "symlink" {
-					return fmt.Errorf("unknown overlay kind %q (want fuse or symlink)", to)
+				if to != "fuse" && to != "symlink" && to != "fileprovider" {
+					return fmt.Errorf("unknown overlay kind %q (want fuse, symlink, or fileprovider)", to)
 				}
 				if to == "fuse" && !pool.CanHostFuse() {
 					return errors.New("fuse is not available on this machine; run `ccp fuse enable` to install the fusekit-holder cask")
+				}
+				if to == "fileprovider" && !fpAvailable(m.OverlaySpec()) {
+					en := fkoverlay.BackendFileProvider.Enablement()
+					return fmt.Errorf("fileprovider is not available: the %s extension is not installed and enabled — install %s if missing, then: %s", pool.FPExtensionBundleID, pool.WidgetAppPath(), en.Guidance)
 				}
 				resp, err := requestMigration(m, to, account, force)
 				if err != nil {
@@ -59,7 +71,7 @@ migrated-to provider.`,
 		},
 	}
 	cmd.Flags().IntVar(&account, "account", 0, "convert only this account id")
-	cmd.Flags().StringVar(&to, "to", "fuse", "target overlay kind: fuse or symlink")
+	cmd.Flags().StringVar(&to, "to", "fuse", "target overlay kind: fuse, symlink, or fileprovider")
 	cmd.Flags().BoolVar(&force, "force", false, "migrate despite live sessions (idle ones may briefly error mid-flip; launching ones still refuse)")
 	return cmd
 }

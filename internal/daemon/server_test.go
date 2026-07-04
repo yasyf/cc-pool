@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
+	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -407,6 +408,80 @@ func TestHandleStatusPropagatesExhaustionAndOverage(t *testing.T) {
 	}
 	if !acct1.ExtraEnabled || acct1.ExtraUsed != 177 || acct1.ExtraLimit != 5000 {
 		t.Fatalf("overage state must survive the wire: %+v", acct1)
+	}
+}
+
+// TestHandleStatusSurfacesContentHealth pins the status wire's content-health
+// field: a nil or healthy content source reads empty, recorded degraded-read
+// failures surface with errors.Join's newlines folded to "; " (doctor renders
+// one line), and the next successful reads clear it.
+func TestHandleStatusSurfacesContentHealth(t *testing.T) {
+	s, _ := newTestServer(t)
+	if got := s.handleStatus(t.Context()).ContentHealth; got != "" {
+		t.Fatalf("nil content source must read healthy, got %q", got)
+	}
+
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	baseJSON := filepath.Join(home, ".claude.json")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	domain := filepath.Join(home, "acct-01")
+	priv := fkoverlay.FusePrivateRoot(domain)
+	if err := os.MkdirAll(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(priv, ".claude.json"), []byte(`{"userID":"u"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.contentSource = overlay.NewPoolContentSource(claudeDir, baseJSON)
+	if got := s.handleStatus(t.Context()).ContentHealth; got != "" {
+		t.Fatalf("healthy content source must read empty, got %q", got)
+	}
+
+	// Corrupt both shared bases: each ReadSynth degrades to raw bytes (no
+	// error to the session) while recording the failure for HealthErrors.
+	if err := os.WriteFile(baseJSON, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.contentSource.ReadSynth(domain, ".claude.json"); err != nil {
+		t.Fatalf("degraded claude.json read must not error: %v", err)
+	}
+	if _, err := s.contentSource.ReadSynth(domain, "settings.json"); err != nil {
+		t.Fatalf("degraded settings.json read must not error: %v", err)
+	}
+	got := s.handleStatus(t.Context()).ContentHealth
+	for _, frag := range []string{"merge claude.json for " + domain, "inject plansDirectory"} {
+		if !strings.Contains(got, frag) {
+			t.Errorf("content health %q missing %q", got, frag)
+		}
+	}
+	if strings.Contains(got, "\n") {
+		t.Errorf("content health must be newline-free on the wire, got %q", got)
+	}
+	if !strings.Contains(got, "; ") {
+		t.Errorf("joined failures must be %q-separated, got %q", "; ", got)
+	}
+
+	// The next successful read of each entry clears its recorded failure.
+	if err := os.WriteFile(baseJSON, []byte(`{"firstStartTime":"2026-01-01"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.contentSource.ReadSynth(domain, ".claude.json"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.contentSource.ReadSynth(domain, "settings.json"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.handleStatus(t.Context()).ContentHealth; got != "" {
+		t.Fatalf("cleared failures still on the wire: %q", got)
 	}
 }
 

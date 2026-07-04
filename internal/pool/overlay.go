@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/fusekit/mountd"
@@ -131,6 +132,14 @@ func overlaySpec() fkoverlay.Spec {
 			// subtree with a fail-closed symlink — one go-nfsv4 for the whole pool.
 			MuxRoot: MuxRootDir(),
 		},
+		FileProvider: &fkoverlay.FileProviderSpec{
+			AppPath:           WidgetAppPath(),
+			ControlSocket:     FPControlSocketPath(),
+			BridgeSocket:      FPBridgeSocketPath(),
+			ExtensionBundleID: FPExtensionBundleID,
+			AppGroup:          AppGroupID,
+			SpawnTimeout:      30 * time.Second,
+		},
 	}
 }
 
@@ -173,5 +182,18 @@ func CanHostFuse() bool {
 // macOS mount grant is per-process); a symlink verdict can leave an orphan holder.
 func DetectOverlayBackend(ctx context.Context) (fkoverlay.Backend, string) {
 	_, backend, reason, _ := fkoverlay.Select(ctx, overlaySpec())
+	return backend, reason
+}
+
+// DetectFuseBackend runs Select's fuse→symlink ladder with the File Provider
+// arm disabled. Gates asking "can this machine host fuse?" (the daemon's
+// fuseGate) must use this, not DetectOverlayBackend: Select prefers File
+// Provider whenever the extension is enabled, and an FP verdict says nothing
+// about fuse — folding it in would refuse `ccp migrate --to fuse` on every
+// FP-enabled machine.
+func DetectFuseBackend(ctx context.Context) (fkoverlay.Backend, string) {
+	spec := overlaySpec()
+	spec.FileProvider = nil
+	_, backend, reason, _ := fkoverlay.Select(ctx, spec)
 	return backend, reason
 }

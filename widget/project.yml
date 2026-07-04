@@ -5,6 +5,11 @@
 # Signing: ad-hoc by default (runs locally, no Apple ID). If chronod refuses to
 # load the ad-hoc-signed widget, switch to a free personal team:
 #   xcodebuild ... CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=<TEAMID> -allowProvisioningUpdates
+#
+# Two host-app flavors share the HostApp template: CCPoolStatus (ad-hoc, widget
+# appex only — the unchanged local build) and CCPoolStatusFP (adds the File
+# Provider appex + App Group entitlements; identity/team come from the
+# xcodebuild command line: CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=SXKCTF23Q2).
 name: CCPoolStatus
 options:
   bundleIdPrefix: com.yasyf.cc-pool
@@ -21,15 +26,14 @@ settings:
     CURRENT_PROJECT_VERSION: 1
     MARKETING_VERSION: 0.1.0
 
-targets:
-  CCPoolStatus:
+targetTemplates:
+  HostApp:
     type: application
     platform: macOS
     sources:
       - path: Sources/App
       - path: Sources/Shared
     info:
-      path: Generated/App-Info.plist
       properties:
         CFBundleDisplayName: cc-pool Status
         # XcodeGen writes literal values into the generated plist; without these
@@ -46,10 +50,37 @@ targets:
         # Sources/App/Assets.xcassets is auto-included by the Sources/App source
         # path; this names its appiconset as the app icon the widget gallery shows.
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        # The host app is deliberately NOT sandboxed (non-App-Store): its file
-        # watcher needs to observe ~/.cc-pool freely. No entitlements file.
     dependencies:
       - target: CCPoolStatusWidget
+        embed: true
+        codeSign: true
+
+targets:
+  CCPoolStatus:
+    templates: [HostApp]
+    info:
+      path: Generated/App-Info.plist
+    # The host app is deliberately NOT sandboxed (non-App-Store): its file
+    # watcher needs to observe ~/.cc-pool freely. No entitlements file.
+
+  CCPoolStatusFP:
+    # File-Provider-enabled host flavor: same bundle id, and PRODUCT_NAME pins
+    # the built product to CCPoolStatus.app (/Applications/CCPoolStatus.app is
+    # a fixed identifier in the Go code). Stays non-sandboxed — the App Group
+    # is its ONLY entitlement.
+    templates: [HostApp]
+    info:
+      path: Generated/AppFP-Info.plist
+    entitlements:
+      path: Generated/AppFP.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - $(TeamIdentifierPrefix)ccp
+    settings:
+      base:
+        PRODUCT_NAME: CCPoolStatus
+    dependencies:
+      - target: CCPoolFileProvider
         embed: true
         codeSign: true
 
@@ -87,11 +118,59 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.yasyf.cc-pool.status.widget
         SKIP_INSTALL: true
 
+  CCPoolFileProvider:
+    # NSFileProviderReplicatedExtension appex (PlugIns/), embedded only by the
+    # CCPoolStatusFP flavor. Reads the App Group at runtime from
+    # NSExtensionFileProviderDocumentGroup — never hardcoded in Swift.
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Sources/FileProvider
+      - path: Sources/Shared
+    info:
+      path: Generated/FileProvider-Info.plist
+      properties:
+        CFBundleDisplayName: cc-pool Status
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.fileprovider-nonui
+          NSExtensionPrincipalClass: CCPoolFileProvider.FileProviderExtension
+          NSExtensionFileProviderDocumentGroup: $(TeamIdentifierPrefix)ccp
+          NSExtensionFileProviderSupportsEnumeration: true
+    entitlements:
+      # Sandboxed (required for appexes); the read-write exception resolves
+      # against the REAL home (paired with getpwuid in Swift). NO
+      # fileprovider.testing-mode — restricted, would force a provisioning
+      # profile and break the no-profile Developer ID release.
+      path: Generated/FileProvider.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.application-groups:
+          - $(TeamIdentifierPrefix)ccp
+        com.apple.security.temporary-exception.files.home-relative-path.read-write:
+          - /.claude/
+          - /.claude.json
+          - /.cc-pool/
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yasyf.cc-pool.status.fileprovider
+        SKIP_INSTALL: true
+
 schemes:
   CCPoolStatus:
     build:
       targets:
         CCPoolStatus: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+
+  CCPoolStatusFP:
+    build:
+      targets:
+        CCPoolStatusFP: all
     run:
       config: Debug
     archive:

@@ -7,6 +7,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
+	"github.com/yasyf/cc-pool/internal/pool"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 func TestRenderMigrations(t *testing.T) {
@@ -95,5 +97,64 @@ func TestMigrateHelpIsMountSafe(t *testing.T) {
 		if strings.Contains(long, stale) {
 			t.Errorf("migrate help still carries the stale claim %q", stale)
 		}
+	}
+}
+
+// TestMigrateToValidation pins the CLI --to contract: junk is refused naming
+// all three arms, fileprovider is gated on the extension with install
+// guidance, and an available fileprovider passes validation (failing only at
+// the daemon dial in this test env). The flag default stays fuse — the pool's
+// fileprovider flip is an explicit Phase-5 step, never a silent default.
+func TestMigrateToValidation(t *testing.T) {
+	if def, err := newMigrateCmd().Flags().GetString("to"); err != nil || def != "fuse" {
+		t.Fatalf("--to default = %q (err=%v), want fuse", def, err)
+	}
+
+	cases := map[string]struct {
+		to      string
+		avail   bool
+		wantErr []string // substrings of the returned error
+		notErr  []string // substrings the error must NOT carry
+	}{
+		"junk refused naming all three arms": {
+			to:      "granite",
+			wantErr: []string{`unknown overlay kind "granite"`, "want fuse, symlink, or fileprovider"},
+		},
+		"fileprovider without the extension carries install guidance": {
+			to:      "fileprovider",
+			avail:   false,
+			wantErr: []string{"fileprovider is not available", pool.FPExtensionBundleID, pool.WidgetAppPath()},
+		},
+		"fileprovider accepted when the extension is enabled": {
+			to:     "fileprovider",
+			avail:  true,
+			notErr: []string{"unknown overlay kind", "fileprovider is not available"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			tempHome(t)
+			swapVar(t, &fpAvailable, func(fkoverlay.Spec) bool { return tc.avail })
+			cmd := newMigrateCmd()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs([]string{"--to", tc.to})
+
+			err := cmd.Execute()
+			if err == nil {
+				t.Fatal("migrate succeeded; want an error (no daemon in this test env)")
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing %q", err, want)
+				}
+			}
+			for _, not := range tc.notErr {
+				if strings.Contains(err.Error(), not) {
+					t.Errorf("error %q wrongly carries %q", err, not)
+				}
+			}
+		})
 	}
 }

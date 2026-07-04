@@ -41,6 +41,30 @@ func TestConfigDirForMount(t *testing.T) {
 	}
 }
 
+// TestFPBridgeSocketPathFitsSunPath pins the short-leaf choice: the FP bridge
+// socket in cc-pool's own state dir must fit AF_UNIX's 104-byte sun_path for
+// this home.
+func TestFPBridgeSocketPathFitsSunPath(t *testing.T) {
+	p := FPBridgeSocketPath()
+	if len(p) >= 104 {
+		t.Fatalf("FPBridgeSocketPath() = %q (%d bytes), exceeds the 104-byte sun_path limit", p, len(p))
+	}
+	home, err := Home()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(mustHome(), "Library", "Group Containers", AppGroupID, "b.sock"); p != want {
+		t.Fatalf("FPBridgeSocketPath() = %q, want %q", p, want)
+	}
+	// Home-independent budget: the fixed suffix below is the part
+	// cc-pool controls, so a fattened leaf fails on any runner, however short its
+	// home.
+	const suffixBudget = len("/Library/Group Containers/" + AppGroupID + "/b.sock")
+	if overhead := len(p) - len(home); overhead > suffixBudget {
+		t.Fatalf("FPBridgeSocketPath() fixed suffix = %d bytes, want <= %d (leaves %d bytes of sun_path for $HOME)", overhead, suffixBudget, 103-suffixBudget)
+	}
+}
+
 // TestIsBridgeSymlink pins bridge detection: only a symlink whose target is a
 // child of MuxRootDir() reads true. A real dir, a symlink elsewhere, and an
 // absent path all read false — nothing is traversed.

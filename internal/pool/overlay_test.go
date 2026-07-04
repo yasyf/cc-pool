@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/fusekit/mountd"
@@ -357,5 +358,32 @@ func TestOverlaySpecHolderWiring(t *testing.T) {
 	}
 	if len(h.PrivatePrefixes) != len(overlay.PrivatePrefixes) {
 		t.Fatalf("Holder.PrivatePrefixes = %v, want %v", h.PrivatePrefixes, overlay.PrivatePrefixes)
+	}
+}
+
+// TestOverlaySpecFileProviderWiring pins the File Provider arm of cc-pool's
+// Spec: companion app, both sockets under their proper roots, and the identity
+// constants release.yml asserts against the built appex's Info.plist.
+func TestOverlaySpecFileProviderWiring(t *testing.T) {
+	fp := overlaySpec().FileProvider
+	if fp == nil {
+		t.Fatal("overlaySpec().FileProvider = nil; File Provider selection would be disabled")
+	}
+	wantBridge := filepath.Join(mustHome(), "Library", "Group Containers", AppGroupID, "b.sock")
+	switch {
+	case fp.AppPath != "/Applications/CCPoolStatus.app":
+		t.Errorf("FileProvider.AppPath = %q, want %q", fp.AppPath, "/Applications/CCPoolStatus.app")
+	case fp.ControlSocket != filepath.Join(StateDir(), "domains.sock"):
+		t.Errorf("FileProvider.ControlSocket = %q, want %q", fp.ControlSocket, filepath.Join(StateDir(), "domains.sock"))
+	case fp.BridgeSocket != wantBridge:
+		t.Errorf("FileProvider.BridgeSocket = %q, want %q", fp.BridgeSocket, wantBridge)
+	case fp.BridgeSocket == BridgeSocketPath():
+		t.Errorf("FileProvider.BridgeSocket = %q collides with the holder bridge socket", fp.BridgeSocket)
+	case fp.ExtensionBundleID != "com.yasyf.cc-pool.status.fileprovider":
+		t.Errorf("FileProvider.ExtensionBundleID = %q, want %q", fp.ExtensionBundleID, "com.yasyf.cc-pool.status.fileprovider")
+	case fp.AppGroup != "SXKCTF23Q2.ccp":
+		t.Errorf("FileProvider.AppGroup = %q, want %q", fp.AppGroup, "SXKCTF23Q2.ccp")
+	case fp.SpawnTimeout != 30*time.Second:
+		t.Errorf("FileProvider.SpawnTimeout = %v, want %v", fp.SpawnTimeout, 30*time.Second)
 	}
 }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/content"
+	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
@@ -50,11 +53,14 @@ func newDoctorCmd() *cobra.Command {
 				}
 
 				var cachedHolder *daemon.HolderStatus
+				var contentHealth string
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
 					report("daemon", true, resp.Version)
-					// Pending-TCC guidance lives only in the daemon's cache.
+					// Pending-TCC guidance and content-source health live only
+					// in the daemon's cache.
 					if sresp, serr := daemon.NewClient().Status(); serr == nil && sresp.OK {
 						cachedHolder = sresp.Holder
+						contentHealth = sresp.ContentHealth
 					}
 				} else {
 					report("daemon", false, "not running; run `ccp service install`")
@@ -87,6 +93,9 @@ func newDoctorCmd() *cobra.Command {
 				}
 				reportWedges(accts, holderMounts, sessions, report)
 				reportStaleSessions(accts, holderMounts, sessions, report)
+
+				reportFileProvider(cmd.Context(), m, accts, report)
+				reportContentHealth(contentHealth, report)
 
 				for _, a := range accts {
 					checkAccount(cmd, m, a, fix, report)
@@ -254,6 +263,90 @@ func reportStaleSessions(accts []store.Account, mounts []mountd.MountInfo, sessi
 	}
 }
 
+// fpControlHealth probes the CCPoolStatus companion app's control socket for
+// its version — a seam so doctor tests fake the socket.
+var fpControlHealth = func(ctx context.Context) (string, error) {
+	return fileproviderd.NewAppClient(pool.FPControlSocketPath()).Health(ctx)
+}
+
+// fpBridgeReachable reports whether the daemon's File Provider data socket
+// accepts a connection — a seam so doctor tests fake the socket.
+var fpBridgeReachable = func() bool {
+	return content.NewBridgeClient(pool.FPBridgeSocketPath()).Available()
+}
+
+// fileProviderRow treats an unparseable overlay_kind as non-fileprovider,
+// failing safe to the symlink path (fuseBackedRow's sibling — File Provider
+// is a third backend category, never folded into fuse).
+func fileProviderRow(overlayKind string) bool {
+	b, err := fkoverlay.Parse(overlayKind)
+	if err != nil {
+		return false
+	}
+	return b == fkoverlay.BackendFileProvider
+}
+
+func countFileProvider(accts []store.Account) int {
+	n := 0
+	for _, a := range accts {
+		if fileProviderRow(a.OverlayKind) {
+			n++
+		}
+	}
+	return n
+}
+
+// reportFileProvider covers the File Provider stack: the extension's
+// pluginkit enablement, the companion app's control socket, and the daemon's
+// bridge data socket. A machine with the extension absent and no fileprovider
+// rows is silent — File Provider is opt-in, so an absent extension there is
+// the norm, not drift. With rows, an absent extension is the root fault and
+// the socket probes are skipped: they cannot say anything the enablement line
+// doesn't.
+func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Account, report func(string, bool, string)) {
+	fpRows := countFileProvider(accts)
+	if !fpAvailable(m.OverlaySpec()) {
+		if fpRows == 0 {
+			return
+		}
+		en := fkoverlay.BackendFileProvider.Enablement()
+		report("file provider extension", false, fmt.Sprintf(
+			"not enabled with %s — install %s if missing, then: %s",
+			plural(fpRows, "fileprovider account"), pool.WidgetAppPath(), en.Guidance,
+		))
+		return
+	}
+	report("file provider extension", true,
+		fmt.Sprintf("%s; %s", pool.FPExtensionBundleID, plural(fpRows, "fileprovider account")))
+	if ver, err := fpControlHealth(ctx); err != nil {
+		report("file provider app", false, fmt.Sprintf(
+			"control socket %s not answering: %v — launch %s so domains can be registered and signalled",
+			abbreviateHome(pool.FPControlSocketPath()), err, pool.WidgetAppPath(),
+		))
+	} else {
+		report("file provider app", true, ver)
+	}
+	if fpBridgeReachable() {
+		report("file provider bridge", true, "")
+	} else {
+		report("file provider bridge", false,
+			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); domains cannot fetch computed content until it is up")
+	}
+}
+
+// reportContentHealth surfaces the daemon content source's recorded read and
+// write-through failures for the computed files (merged .claude.json,
+// injected settings.json) served over the holder and File Provider bridges.
+// Healthy — or no daemon to ask — is silent: reads degrade to the raw copies
+// rather than EIO, so this line only ever adds a failure.
+func reportContentHealth(health string, report func(string, bool, string)) {
+	if health == "" {
+		return
+	}
+	report("content source", false,
+		health+" — reads of the computed files fall back to raw copies; check "+abbreviateHome(pool.LogPath()))
+}
+
 // reportCarcasses flags fuse rows whose dir is a mountpoint no longer showing
 // ~/.claude. Both seams are bounded (non-blocking cached Getfsstat; an
 // unanswered stat folds to NOT-alive) — doctor must never park in the D-state
@@ -305,6 +398,7 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 	}
 
 	checkFuseFallback(m, a, report)
+	checkFileProviderFallback(m, a, report)
 	checkStrandedPrivate(m, a, fix, cmd.OutOrStdout(), report)
 }
 
@@ -388,11 +482,33 @@ func checkFuseFallback(m *pool.Manager, a store.Account, report func(string, boo
 		"on symlink but the pool default is fuse — likely an automatic fallback after the mount holder failed; re-run `ccp migrate` once fuse-t is healthy")
 }
 
+// checkFileProviderFallback flags an account off File Provider while the pool
+// default is fileprovider and the extension is enabled — the automatic
+// fileprovider→symlink retreat is permanent until `ccp migrate` re-promotes
+// (checkFuseFallback's sibling).
+func checkFileProviderFallback(m *pool.Manager, a store.Account, report func(string, bool, string)) {
+	backend, err := fkoverlay.Parse(a.OverlayKind)
+	if err != nil || backend == fkoverlay.BackendFileProvider {
+		return
+	}
+	if !fpAvailable(m.OverlaySpec()) {
+		return
+	}
+	def, ok, derr := m.ConfiguredOverlayKind()
+	if derr != nil || !ok || def != fkoverlay.BackendFileProvider {
+		return
+	}
+	report(fmt.Sprintf("acct-%02d fileprovider fallback", a.ID), false,
+		fmt.Sprintf("on %s but the pool default is fileprovider — re-run `ccp migrate --to fileprovider` once the account is idle", backend))
+}
+
 // checkStrandedPrivate reports (and under --fix, heals) private files stranded
-// by an interrupted migration. The heal is a single synchronous call, so the
-// ResolvedConflictLogf global swap is safe.
+// by an interrupted migration. Only symlink rows can strand: a fuse or
+// fileprovider row's private root is its live backing store, not wreckage
+// (HealStrandedPrivate's fence, mirrored here). The heal is a single
+// synchronous call, so the ResolvedConflictLogf global swap is safe.
 func checkStrandedPrivate(m *pool.Manager, a store.Account, fix bool, out io.Writer, report func(string, bool, string)) {
-	if fuseBackedRow(a.OverlayKind) {
+	if fuseBackedRow(a.OverlayKind) || fileProviderRow(a.OverlayKind) {
 		return
 	}
 	prefix := fmt.Sprintf("acct-%02d", a.ID)

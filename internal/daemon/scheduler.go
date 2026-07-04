@@ -119,9 +119,14 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 	if err := s.m.SyncOverlay(a); err != nil {
 		s.log.Printf("acct-%02d overlay sync: %v", a.ID, err)
 		// A fuse sync failure usually means the mount is down — heal now
-		// instead of leaving the dir dead until restart.
-		if fuseBackedRow(a.OverlayKind) {
+		// instead of leaving the dir dead until restart. A File Provider sync
+		// failure reconciles through the domain host instead (Health, then an
+		// idempotent Setup); the two arms never mix.
+		switch {
+		case fuseBackedRow(a.OverlayKind):
 			s.healFuse(ctx, a)
+		case fpBackedRow(a.OverlayKind):
+			s.reconcileFileProvider(ctx, a)
 		}
 	}
 
@@ -133,8 +138,18 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 	// A just-idled account may carry a token rotated by its session — adopt
 	// before sampling.
 	if idle {
-		if err := s.m.AdoptRotatedToken(ctx, a); err != nil {
+		switch err := s.m.AdoptRotatedToken(ctx, a); {
+		case err != nil:
 			s.log.Printf("acct-%02d adopt rotated token: %v", a.ID, err)
+		case fpBackedRow(a.OverlayKind):
+			// The adoption rewrote the account's credential state; nudge the
+			// domain (re-Ensure + re-link + Signal) so the OS re-enumerates the
+			// rotated merged .claude.json instead of serving a stale replica.
+			if prov := s.overlayForRow(a); prov != nil {
+				if serr := prov.Sync(pool.ClaudeDir(), a.ConfigDir); serr != nil {
+					s.log.Printf("acct-%02d file provider sync after token adoption: %v", a.ID, serr)
+				}
+			}
 		}
 	}
 

@@ -1592,3 +1592,134 @@ func TestMountReadyRefreshesOnCacheMiss(t *testing.T) {
 		t.Fatal("a stale cache miss did not refresh")
 	}
 }
+
+// swapFPGateSeams points fpGate's two seams at canned verdicts and returns a
+// counter of control-health dials, restoring both on cleanup.
+func swapFPGateSeams(t *testing.T, available bool, healthErr error) *int {
+	t.Helper()
+	prevAvail, prevHealth := fpAvailable, fpControlHealth
+	t.Cleanup(func() { fpAvailable, fpControlHealth = prevAvail, prevHealth })
+	healths := new(int)
+	fpAvailable = func(fkoverlay.Spec) bool { return available }
+	fpControlHealth = func(context.Context, string) (string, error) {
+		*healths++
+		return "v-test", healthErr
+	}
+	return healths
+}
+
+// TestFPGate drives the production fpGate through its seams: an absent
+// extension is the root fault and refuses WITHOUT dialing the companion app,
+// a dead control socket refuses with a launch hint, and a healthy pair passes
+// as BackendFileProvider.
+func TestFPGate(t *testing.T) {
+	cases := map[string]struct {
+		available   bool
+		healthErr   error
+		wantBackend fkoverlay.Backend
+		wantFrags   []string
+		wantHealths int
+	}{
+		"extension absent refuses without dialing the app": {
+			available: false,
+			wantFrags: []string{"fileprovider unavailable", pool.FPExtensionBundleID, "re-run `ccp migrate`"},
+		},
+		"dead control socket refuses with a launch hint": {
+			available:   true,
+			healthErr:   errors.New("dial unix /tmp/x/domains.sock: connect: no such file or directory"),
+			wantFrags:   []string{"control probe failed", "domains.sock", pool.WidgetAppPath(), "re-run `ccp migrate`"},
+			wantHealths: 1,
+		},
+		"enabled and serving passes": {
+			available:   true,
+			wantBackend: fkoverlay.BackendFileProvider,
+			wantHealths: 1,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			healths := swapFPGateSeams(t, tc.available, tc.healthErr)
+			s := &Server{m: &pool.Manager{}}
+
+			backend, reason := s.fpGate(t.Context())
+			if tc.wantBackend != "" {
+				if backend != tc.wantBackend || reason != "" {
+					t.Fatalf("fpGate = (%q, %q), want a %s pass", backend, reason, tc.wantBackend)
+				}
+			} else if backend != "" || reason == "" {
+				t.Fatalf("fpGate = (%q, %q), want a refusal", backend, reason)
+			}
+			for _, frag := range tc.wantFrags {
+				if !strings.Contains(reason, frag) {
+					t.Errorf("refusal %q missing %q", reason, frag)
+				}
+			}
+			if *healths != tc.wantHealths {
+				t.Fatalf("control health dials = %d, want %d", *healths, tc.wantHealths)
+			}
+		})
+	}
+}
+
+// TestHandleMigrateFileProviderGateBlocked: a failed fpGate refuses the whole
+// op before any account row, conversion, or the recorded default is touched.
+func TestHandleMigrateFileProviderGateBlocked(t *testing.T) {
+	s, _, fake := newMigrateServer(t)
+	swapFPGateSeams(t, false, nil)
+
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fileprovider"))
+	if resp.OK {
+		t.Fatal("migrate passed with the extension absent")
+	}
+	if !strings.Contains(resp.Error, pool.FPExtensionBundleID) {
+		t.Fatalf("refusal %q does not name the extension", resp.Error)
+	}
+	if len(resp.Migrations) != 0 {
+		t.Fatalf("migrations attempted despite a failed gate: %v", resp.Migrations)
+	}
+	if kindOf(t, s, 1) != "symlink" || kindOf(t, s, 2) != "symlink" {
+		t.Fatal("rows changed despite a failed gate")
+	}
+	if fake.setupCount() != 0 {
+		t.Fatalf("overlay setups = %d despite a failed gate", fake.setupCount())
+	}
+	if _, ok, err := s.m.Store.GetMeta("overlay_kind"); err != nil || ok {
+		t.Fatalf("default recorded despite a failed gate (ok=%v err=%v)", ok, err)
+	}
+}
+
+// TestHandleMigrateFileProviderZeroConversionsFlipsDefault: rows already on
+// fileprovider convert nothing, but a passed gate still records the
+// new-account default — the fuse zero-conversion precedent.
+func TestHandleMigrateFileProviderZeroConversionsFlipsDefault(t *testing.T) {
+	s, _, _ := newMigrateServer(t)
+	swapFPGateSeams(t, true, nil)
+	for _, id := range []int{1, 2} {
+		if err := s.m.Store.SetAccountOverlayKind(id, "fileprovider"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fileprovider"))
+	if !resp.OK {
+		t.Fatalf("migrate failed: %s", resp.Error)
+	}
+	got := outcomes(resp)
+	if got[1] != MigrationAlready || got[2] != MigrationAlready {
+		t.Fatalf("outcomes = %v, want both already", got)
+	}
+	if v, ok, err := s.m.Store.GetMeta("overlay_kind"); err != nil || !ok || v != "fileprovider" {
+		t.Fatalf("meta overlay_kind = %q ok=%v err=%v, want fileprovider", v, ok, err)
+	}
+}
+
+// TestHandleMigrateUnknownTargetNamesAllThree pins the refusal for a junk
+// target naming every valid arm.
+func TestHandleMigrateUnknownTargetNamesAllThree(t *testing.T) {
+	s, _, _ := newMigrateServer(t)
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "granite"))
+	if resp.OK || !strings.Contains(resp.Error, "want fuse, symlink, or fileprovider") {
+		t.Fatalf("resp = %+v, want an unknown-target refusal naming all three arms", resp)
+	}
+}

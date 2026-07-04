@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -406,6 +407,277 @@ func TestReportStaleSessions(t *testing.T) {
 	}
 }
 
+// TestReportFileProvider pins doctor's File Provider stack section: silent on
+// machines that never opted in, the Enablement guidance (and no socket
+// probing behind the root fault) when fileprovider rows exist with the
+// extension absent, and per-socket verdicts once the extension is enabled.
+func TestReportFileProvider(t *testing.T) {
+	fpRow := func(id int) store.Account {
+		return store.Account{ID: id, ConfigDir: fmt.Sprintf("/p/acct-%02d", id), OverlayKind: string(fkoverlay.BackendFileProvider)}
+	}
+	symRow := store.Account{ID: 8, ConfigDir: "/p/acct-08", OverlayKind: string(fkoverlay.BackendSymlink)}
+	nfsRow := store.Account{ID: 9, ConfigDir: "/p/acct-09", OverlayKind: string(fkoverlay.BackendNFS)}
+	controlErr := errors.New("dial unix: connect: no such file or directory")
+
+	type wantReport struct {
+		label   string
+		healthy bool
+		frags   []string // every fragment must appear in the detail
+	}
+	cases := map[string]struct {
+		available  bool
+		accts      []store.Account
+		healthVer  string
+		healthErr  error
+		bridgeUp   bool
+		want       []wantReport
+		wantProbes bool // control and bridge each probed exactly once
+	}{
+		"extension absent with no fileprovider rows is silent": {
+			available: false,
+			accts:     []store.Account{symRow, nfsRow},
+		},
+		"extension absent with fileprovider rows fails with the enablement guidance and probes nothing": {
+			available: false,
+			accts:     []store.Account{fpRow(1), fpRow(2), symRow},
+			want: []wantReport{
+				{"file provider extension", false, []string{
+					"2 fileprovider accounts", pool.WidgetAppPath(), "Login Items & Extensions",
+				}},
+			},
+		},
+		"all green renders extension, app, and bridge healthy": {
+			available: true,
+			accts:     []store.Account{fpRow(1), symRow},
+			healthVer: "1.2.3",
+			bridgeUp:  true,
+			want: []wantReport{
+				{"file provider extension", true, []string{pool.FPExtensionBundleID, "1 fileprovider account"}},
+				{"file provider app", true, []string{"1.2.3"}},
+				{"file provider bridge", true, nil},
+			},
+			wantProbes: true,
+		},
+		"dead control socket fails the app line with the launch hint": {
+			available: true,
+			accts:     []store.Account{fpRow(1)},
+			healthErr: controlErr,
+			bridgeUp:  true,
+			want: []wantReport{
+				{"file provider extension", true, []string{"1 fileprovider account"}},
+				{"file provider app", false, []string{controlErr.Error(), pool.WidgetAppPath()}},
+				{"file provider bridge", true, nil},
+			},
+			wantProbes: true,
+		},
+		"unreachable bridge fails with the group-container hint": {
+			available: true,
+			accts:     []store.Account{fpRow(1)},
+			healthVer: "1.2.3",
+			bridgeUp:  false,
+			want: []wantReport{
+				{"file provider extension", true, nil},
+				{"file provider app", true, []string{"1.2.3"}},
+				{"file provider bridge", false, []string{"app group container", "restart the daemon"}},
+			},
+			wantProbes: true,
+		},
+		"extension enabled with zero fileprovider rows still reports and probes": {
+			available: true,
+			accts:     []store.Account{symRow, nfsRow},
+			healthVer: "1.2.3",
+			bridgeUp:  true,
+			want: []wantReport{
+				{"file provider extension", true, []string{"0 fileprovider accounts"}},
+				{"file provider app", true, []string{"1.2.3"}},
+				{"file provider bridge", true, nil},
+			},
+			wantProbes: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			controlProbes, bridgeProbes := 0, 0
+			swapVar(t, &fpAvailable, func(fkoverlay.Spec) bool { return tc.available })
+			swapVar(t, &fpControlHealth, func(context.Context) (string, error) {
+				controlProbes++
+				return tc.healthVer, tc.healthErr
+			})
+			swapVar(t, &fpBridgeReachable, func() bool {
+				bridgeProbes++
+				return tc.bridgeUp
+			})
+
+			report, calls := captureReports()
+			reportFileProvider(t.Context(), &pool.Manager{}, tc.accts, report)
+
+			if len(*calls) != len(tc.want) {
+				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
+			}
+			for i, want := range tc.want {
+				got := (*calls)[i]
+				if got.label != want.label || got.healthy != want.healthy {
+					t.Errorf("report[%d] = %+v, want label %q healthy %v", i, got, want.label, want.healthy)
+				}
+				for _, frag := range want.frags {
+					if !strings.Contains(got.detail, frag) {
+						t.Errorf("report[%d] detail %q missing %q", i, got.detail, frag)
+					}
+				}
+			}
+			wantProbes := 0
+			if tc.wantProbes {
+				wantProbes = 1
+			}
+			if controlProbes != wantProbes || bridgeProbes != wantProbes {
+				t.Errorf("control probed %d times, bridge %d, want %d each", controlProbes, bridgeProbes, wantProbes)
+			}
+		})
+	}
+}
+
+// TestReportContentHealth pins the daemon content-source line: silent when
+// healthy (or when there is no daemon to ask), a failure carrying the daemon's
+// verbatim message plus the log pointer otherwise.
+func TestReportContentHealth(t *testing.T) {
+	report, calls := captureReports()
+	reportContentHealth("", report)
+	if len(*calls) != 0 {
+		t.Fatalf("healthy content source must be silent, got %+v", *calls)
+	}
+
+	msg := "merge claude.json for /p/acct-01: unexpected end of JSON input"
+	reportContentHealth(msg, report)
+	if len(*calls) != 1 {
+		t.Fatalf("got %d reports %+v, want exactly one", len(*calls), *calls)
+	}
+	got := (*calls)[0]
+	if got.label != "content source" || got.healthy {
+		t.Errorf("report = %+v, want an unhealthy content source line", got)
+	}
+	for _, frag := range []string{msg, "daemon.log"} {
+		if !strings.Contains(got.detail, frag) {
+			t.Errorf("detail %q missing %q", got.detail, frag)
+		}
+	}
+}
+
+func TestCheckFileProviderFallback(t *testing.T) {
+	cases := map[string]struct {
+		acctKind    string
+		defaultKind fkoverlay.Backend // "" = no default recorded
+		available   bool
+		wantReport  bool
+		wantOn      string // fragment naming the current backend
+	}{
+		"symlink account, fileprovider default, extension enabled -> surfaced": {
+			acctKind: "symlink", defaultKind: fkoverlay.BackendFileProvider, available: true,
+			wantReport: true, wantOn: "on symlink",
+		},
+		"fuse account, fileprovider default, extension enabled -> surfaced": {
+			acctKind: "nfs", defaultKind: fkoverlay.BackendFileProvider, available: true,
+			wantReport: true, wantOn: "on nfs",
+		},
+		"fileprovider account -> quiet": {
+			acctKind: "fileprovider", defaultKind: fkoverlay.BackendFileProvider, available: true,
+		},
+		"symlink account, fuse default -> quiet (checkFuseFallback's beat)": {
+			acctKind: "symlink", defaultKind: fkoverlay.BackendNFS, available: true,
+		},
+		"symlink account, fileprovider default, extension absent -> quiet": {
+			acctKind: "symlink", defaultKind: fkoverlay.BackendFileProvider, available: false,
+		},
+		"unparseable kind -> quiet": {
+			acctKind: "garbage", defaultKind: fkoverlay.BackendFileProvider, available: true,
+		},
+		"no recorded default -> quiet": {
+			acctKind: "symlink", defaultKind: "", available: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			st, err := store.Open(filepath.Join(home, "test.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = st.Close() })
+			// SetDefaultOverlayKind refuses a fuse default when CanHostFuse is false.
+			m := &pool.Manager{Store: st, CanHostFuse: func() bool { return true }}
+			if tc.defaultKind != "" {
+				if err := m.SetDefaultOverlayKind(tc.defaultKind); err != nil {
+					t.Fatal(err)
+				}
+			}
+			swapVar(t, &fpAvailable, func(fkoverlay.Spec) bool { return tc.available })
+
+			a := store.Account{ID: 5, ConfigDir: filepath.Join(home, "acct-05"), OverlayKind: tc.acctKind}
+			report, calls := captureReports()
+			checkFileProviderFallback(m, a, report)
+
+			got := false
+			for _, c := range *calls {
+				if strings.Contains(c.label, "fileprovider fallback") {
+					got = true
+					if c.healthy {
+						t.Errorf("fileprovider-fallback report marked healthy; want a failure")
+					}
+					for _, frag := range []string{"ccp migrate --to fileprovider", tc.wantOn} {
+						if !strings.Contains(c.detail, frag) {
+							t.Errorf("detail %q missing %q", c.detail, frag)
+						}
+					}
+				}
+			}
+			if got != tc.wantReport {
+				t.Fatalf("surfaced = %v, want %v (calls=%+v)", got, tc.wantReport, *calls)
+			}
+		})
+	}
+}
+
+// TestCheckStrandedPrivateSkipsNonSymlinkRows pins that a fuse or fileprovider
+// row's private root — its live backing store, not migration wreckage — is
+// never reported as stranded (the doctor-side mirror of HealStrandedPrivate's
+// fence), while the same layout on a symlink row still is.
+func TestCheckStrandedPrivateSkipsNonSymlinkRows(t *testing.T) {
+	cases := map[string]struct {
+		kind       string
+		wantReport bool
+	}{
+		"fileprovider row's live private store is not stranded": {kind: "fileprovider"},
+		"fuse row's live private store is not stranded":         {kind: "nfs"},
+		"symlink row with private leftovers is stranded":        {kind: "symlink", wantReport: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "acct-01")
+			priv := fkoverlay.FusePrivateRoot(dir)
+			if err := os.MkdirAll(priv, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(priv, ".last-update-result.json"), []byte("{}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			a := store.Account{ID: 1, ConfigDir: dir, OverlayKind: tc.kind}
+
+			report, calls := captureReports()
+			var out bytes.Buffer
+			checkStrandedPrivate(&pool.Manager{}, a, false, &out, report)
+
+			if tc.wantReport {
+				if len(*calls) != 1 || (*calls)[0].healthy || !strings.Contains((*calls)[0].detail, "stranded in "+priv) {
+					t.Fatalf("got %+v, want one stranded report naming %s", *calls, priv)
+				}
+				return
+			}
+			if len(*calls) != 0 {
+				t.Fatalf("%s row reported %+v, want silence", tc.kind, *calls)
+			}
+		})
+	}
+}
+
 func TestCountFuse(t *testing.T) {
 	accts := []store.Account{
 		{ID: 1, OverlayKind: string(fkoverlay.BackendNFS)},
@@ -418,6 +690,23 @@ func TestCountFuse(t *testing.T) {
 	}
 	if got := countFuse(nil); got != 0 {
 		t.Errorf("countFuse(nil) = %d, want 0", got)
+	}
+}
+
+func TestCountFileProvider(t *testing.T) {
+	accts := []store.Account{
+		{ID: 1, OverlayKind: string(fkoverlay.BackendFileProvider)},
+		{ID: 2, OverlayKind: string(fkoverlay.BackendNFS)},
+		{ID: 3, OverlayKind: string(fkoverlay.BackendSymlink)},
+		{ID: 4, OverlayKind: ""},        // legacy rows default to symlink
+		{ID: 5, OverlayKind: "garbage"}, // corruption reads non-fileprovider
+		{ID: 6, OverlayKind: string(fkoverlay.BackendFileProvider)},
+	}
+	if got := countFileProvider(accts); got != 2 {
+		t.Errorf("countFileProvider = %d, want 2", got)
+	}
+	if got := countFileProvider(nil); got != 0 {
+		t.Errorf("countFileProvider(nil) = %d, want 0", got)
 	}
 }
 

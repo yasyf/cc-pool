@@ -7,7 +7,9 @@ import WidgetKit
 // login (one-shot Login Item registration), and (while running) watch
 // ~/.cc-pool for the daemon's status.json rewrites so the widget tracks the
 // 3-minute poll cadence instead of WidgetKit's lazy refresh budget. The widget
-// still works without the app running — just less fresh.
+// still works without the app running — just less fresh. It also hosts the
+// File Provider control plane (FileProviderController) the cc-pool daemon
+// drives to register per-account domains.
 
 @main
 struct CCPoolStatusApp: App {
@@ -21,9 +23,11 @@ struct CCPoolStatusApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let didRegisterKey = "didRegisterLoginItem"
     private let watcher = StatusWatcher()
+    private let fileProvider = FileProviderController()
 
     func applicationDidFinishLaunching(_: Notification) {
         watcher.start() // fires an immediate reload once the watch is armed
+        fileProvider.start()
         registerLoginItemOnce()
     }
 

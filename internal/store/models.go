@@ -9,7 +9,7 @@ type Account struct {
 	KeychainService string
 	KeychainAccount string
 	Label           string // human note, e.g. an email or alias
-	OverlayKind     string // overlay backend string: "symlink" | "nfs" | "fskit"
+	OverlayKind     string // overlay backend string: "symlink" | "nfs" | "fskit" | "fileprovider"
 	CreatedAt       time.Time
 }
 

@@ -42,10 +42,11 @@ var ErrConvertUnsupported = errors.New("overlay backend unavailable")
 
 // ConvertOverlay switches an account's overlay provider, persisting the row last so
 // an interrupted run re-converges. MUST run inside the daemon, which alone gates
-// against live sessions; a failed fuse mount rolls back to symlink. ctx bounds the
-// fuse-side conversion: callers detach it from request cancellation
-// (context.WithoutCancel) so a daemon shutdown mid-conversion finishes or rolls
-// back instead of abandoning a half-converted account.
+// against live sessions; a failed conversion rolls back to the source backend's
+// shape. ctx bounds the fuse- and file-provider-side conversions: callers detach
+// it from request cancellation (context.WithoutCancel) so a daemon shutdown
+// mid-conversion finishes or rolls back instead of abandoning a half-converted
+// account.
 func (m *Manager) ConvertOverlay(ctx context.Context, a store.Account, to fkoverlay.Backend) (store.Account, error) {
 	from, err := fkoverlay.Parse(a.OverlayKind)
 	if err != nil {
@@ -68,10 +69,22 @@ func (m *Manager) ConvertOverlay(ctx context.Context, a store.Account, to fkover
 	if toProv.Backend() != to {
 		return a, fmt.Errorf("convert acct-%02d: target %q: %w", a.ID, to, ErrConvertUnsupported)
 	}
-	if to.IsFuse() {
+	switch {
+	case to.IsFuse():
+		// A File Provider source never enters convertToFuse: its early steps
+		// (readIdentity, MovePrivateEntries) would traverse the account-dir
+		// symlink INTO the domain — an unbounded read through the appex.
+		if from == fkoverlay.BackendFileProvider {
+			return m.convertFileProviderToFuse(ctx, a, fromProv, toProv)
+		}
 		return m.convertToFuse(ctx, a, fromProv, toProv)
+	case to == fkoverlay.BackendSymlink:
+		return m.convertToSymlink(a, fromProv, toProv)
+	case to == fkoverlay.BackendFileProvider:
+		return m.convertToFileProvider(ctx, a, fromProv, toProv)
+	default:
+		return a, fmt.Errorf("convert acct-%02d: no conversion arm for target backend %q", a.ID, to)
 	}
-	return m.convertToSymlink(a, fromProv, toProv)
 }
 
 func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, fuseProv fkoverlay.Provider) (store.Account, error) {
@@ -168,15 +181,232 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay
 	return fmt.Errorf("convert acct-%02d: %w (rolled back to symlink)", a.ID, cause)
 }
 
-// convertToSymlink turns a fuse account into a symlink one. With nothing mounted
-// Teardown is a no-op, so even a build that cannot host fuse can retreat from a
-// stale fuse row — pure file moves.
-func (m *Manager) convertToSymlink(a store.Account, fuseProv, symProv fkoverlay.Provider) (store.Account, error) {
+// convertToFileProvider switches an account onto the File Provider overlay,
+// leaving the account dir a symlink into the OS-surfaced domain root. Two
+// source shapes, split by the mux cutover: a symlink row holds a REAL dir —
+// drain its private files into the shared backing root, tear the links down,
+// and remove the emptied dir so Setup's fail-closed AtomicSymlink can lay the
+// bridge (anything unclassified left inside fails that removal ENOTEMPTY and
+// rolls back, never clobbered — the same stance as the mux cutover's
+// clearAccountDirForBridge) — while a post-mux fuse row is ALREADY a bridge
+// symlink with its private files in the backing root, so the fuse Teardown
+// detaches the subtree and Setup retargets the symlink (a real dir on a fuse
+// row is legacy wreckage AtomicSymlink refuses). Identity is verified from the
+// private BACKING file, never through the fresh domain: a through-domain read
+// is unbounded while the appex materializes, and the domain serves that exact
+// backing file anyway. Every failure past the first move routes through a
+// rollback restoring the source shape; the row flips last.
+func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fromProv, fpProv fkoverlay.Provider) (store.Account, error) {
+	base, dir := ClaudeDir(), a.ConfigDir
+	priv := fkoverlay.FusePrivateRoot(dir)
+	if overlay.Mounted(dir) {
+		return a, fmt.Errorf("convert acct-%02d: %s is a live mountpoint; refusing to convert while anything is mounted there", a.ID, dir)
+	}
+	fromFuse := fromProv.Backend().IsFuse()
+	if !fromFuse && IsBridgeSymlink(dir) {
+		return a, fmt.Errorf("convert acct-%02d: %s is a mux bridge symlink into %s but the row says %s; refusing to move files through the mirror", a.ID, dir, MuxRootDir(), a.OverlayKind)
+	}
+
+	// The identity that must survive the conversion: a symlink row holds it in
+	// the account dir (about to move), a fuse row already in the backing root.
+	// An account that never completed a login legitimately has no identity.
+	identityAt := dir
+	if fromFuse {
+		identityAt = priv
+	}
+	pre, preErr := readIdentity(filepath.Join(identityAt, ".claude.json"))
+	if preErr != nil && !errors.Is(preErr, ErrNoIdentity) {
+		return a, fmt.Errorf("convert acct-%02d: read identity before conversion: %w", a.ID, preErr)
+	}
+	// Nothing changed yet: a spent budget aborts cleanly, no rollback needed.
+	if err := ctx.Err(); err != nil {
+		return a, fmt.Errorf("convert acct-%02d: %w", a.ID, err)
+	}
+
+	if fromFuse {
+		// Detach the subtree. The mux teardown retracts the bridge symlink
+		// fail-closed (RemoveSymlink refuses a real dir), so nothing is
+		// half-done on failure: plain error, no rollback, files never moved.
+		if err := fromProv.Teardown(base, dir); err != nil {
+			return a, fmt.Errorf("convert acct-%02d: tear down fuse overlay: %w", a.ID, err)
+		}
+	} else {
+		// STRAND WINDOW: from here until SetAccountOverlayKind the private files
+		// live in priv while the row still says symlink; every error return below
+		// must go through a rollback, or the account is stranded until
+		// HealStrandedPrivate — the recovery of last resort — finds it.
+		if err := fkoverlay.MovePrivateEntries(dir, priv, m.overlaySpec()); err != nil {
+			return a, m.rollbackFileProviderToSymlink(a, fromProv, fpProv, fmt.Errorf("move private files: %w", err))
+		}
+		if err := fromProv.Teardown(base, dir); err != nil {
+			return a, m.rollbackFileProviderToSymlink(a, fromProv, fpProv, fmt.Errorf("tear down symlinks: %w", err))
+		}
+		if err := os.Remove(dir); err != nil {
+			return a, m.rollbackFileProviderToSymlink(a, fromProv, fpProv, fmt.Errorf("remove drained account dir: %w", err))
+		}
+	}
+	rollback := func(cause error) error {
+		if fromFuse {
+			return m.rollbackFileProviderToFuse(a, fromProv, fpProv, cause)
+		}
+		return m.rollbackFileProviderToSymlink(a, fromProv, fpProv, cause)
+	}
+
+	// A spent budget must not register a domain it has no time to verify.
+	if err := ctx.Err(); err != nil {
+		return a, rollback(err)
+	}
+	if err := fpProv.Setup(base, dir); err != nil {
+		return a, rollback(fmt.Errorf("register domain: %w", err))
+	}
+
+	if preErr == nil {
+		post, err := readIdentity(filepath.Join(priv, ".claude.json"))
+		if err != nil {
+			return a, rollback(fmt.Errorf("identity not readable in private root after conversion: %w", err))
+		}
+		if post.AccountUUID != pre.AccountUUID {
+			return a, rollback(fmt.Errorf("identity in private root is %s, expected %s", post.AccountUUID, pre.AccountUUID))
+		}
+	}
+
+	if err := m.Store.SetAccountOverlayKind(a.ID, string(fkoverlay.BackendFileProvider)); err != nil {
+		return a, rollback(fmt.Errorf("persist row: %w", err))
+	}
+	a.OverlayKind = string(fkoverlay.BackendFileProvider)
+	return a, nil
+}
+
+// retractFileProviderIfLaid undoes whatever a failed File Provider Setup laid at
+// the account dir. A REAL dir there means Setup never swapped it in — nothing to
+// retract, and the provider's fail-closed RemoveSymlink would refuse it anyway;
+// an absent path or a symlink takes the full Teardown (retract the link,
+// deregister the domain — deregistering a never-registered domain is a no-op).
+func retractFileProviderIfLaid(base, dir string, fpProv fkoverlay.Provider) error {
+	if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink == 0 {
+		return nil
+	}
+	return fpProv.Teardown(base, dir)
+}
+
+// rollbackFileProviderToSymlink restores the symlink overlay after a failed
+// symlink→fileprovider conversion. If retracting what Setup laid fails it stops
+// — moving private files back through a live domain symlink would write into
+// the domain — leaving them in the backing root for HealStrandedPrivate.
+func (m *Manager) rollbackFileProviderToSymlink(a store.Account, symProv, fpProv fkoverlay.Provider, cause error) error {
+	base, dir := ClaudeDir(), a.ConfigDir
+	priv := fkoverlay.FusePrivateRoot(dir)
+	if err := retractFileProviderIfLaid(base, dir, fpProv); err != nil {
+		return fmt.Errorf("convert acct-%02d: %w (and rollback teardown failed: %w; private files remain in %s until the daemon reconciles)",
+			a.ID, cause, err, priv)
+	}
+	// Both moves run regardless (disjoint name sets); Setup is sequenced after them
+	// so it never lays links over an un-swept dir.
+	spec := m.overlaySpec()
+	if err := errors.Join(
+		fkoverlay.MovePrivateEntries(priv, dir, spec),
+		fkoverlay.MoveSharedOrphans(dir, base, spec),
+	); err != nil {
+		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
+	}
+	if err := symProv.Setup(base, dir); err != nil {
+		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
+	}
+	removePrivateRootIfEmpty(priv, spec)
+	return fmt.Errorf("convert acct-%02d: %w (rolled back to symlink)", a.ID, cause)
+}
+
+// rollbackFileProviderToFuse restores the fuse overlay after a failed
+// fuse→fileprovider conversion: retract whatever Setup laid, then let the fuse
+// Setup re-attach the subtree and re-lay its own bridge symlink. The private
+// files never moved (both backends share the backing root), so a failure here
+// leaves them intact for the daemon's fuse reconcile.
+func (m *Manager) rollbackFileProviderToFuse(a store.Account, fuseProv, fpProv fkoverlay.Provider, cause error) error {
+	base, dir := ClaudeDir(), a.ConfigDir
+	if err := retractFileProviderIfLaid(base, dir, fpProv); err != nil {
+		return fmt.Errorf("convert acct-%02d: %w (and rollback teardown failed: %w; the daemon's reconcile will remount the %s row)",
+			a.ID, cause, err, a.OverlayKind)
+	}
+	if err := fuseProv.Setup(base, dir); err != nil {
+		return fmt.Errorf("convert acct-%02d: %w (and fuse rollback failed: %w)", a.ID, cause, err)
+	}
+	return fmt.Errorf("convert acct-%02d: %w (rolled back to %s)", a.ID, cause, a.OverlayKind)
+}
+
+// convertFileProviderToFuse turns a File Provider account into a fuse one.
+// Nothing moves: both backends keep private files in the same backing root, so
+// the FP Teardown retracts the account-dir symlink and deregisters the domain,
+// the fuse Setup lays its own bridge symlink over the vacated path, and the
+// identity is verified untouched in the backing root — never through a mount —
+// before the row flips.
+func (m *Manager) convertFileProviderToFuse(ctx context.Context, a store.Account, fpProv, fuseProv fkoverlay.Provider) (store.Account, error) {
+	base, dir := ClaudeDir(), a.ConfigDir
+	priv := fkoverlay.FusePrivateRoot(dir)
+
+	pre, preErr := readIdentity(filepath.Join(priv, ".claude.json"))
+	if preErr != nil && !errors.Is(preErr, ErrNoIdentity) {
+		return a, fmt.Errorf("convert acct-%02d: read identity before conversion: %w", a.ID, preErr)
+	}
+	// Nothing changed yet: a spent budget aborts cleanly.
+	if err := ctx.Err(); err != nil {
+		return a, fmt.Errorf("convert acct-%02d: %w", a.ID, err)
+	}
+	// Fail-closed on both arms (RemoveSymlink refuses a real dir), so a failure
+	// here leaves the FP row consistent for the daemon's reconcile: plain error.
+	if err := fpProv.Teardown(base, dir); err != nil {
+		return a, fmt.Errorf("convert acct-%02d: retract file provider overlay: %w", a.ID, err)
+	}
+	// A spent budget must not start a mount it has no time to verify.
+	if err := ctx.Err(); err != nil {
+		return a, m.rollbackToFileProvider(a, fuseProv, fpProv, err)
+	}
+	if err := fuseProv.Setup(base, dir); err != nil {
+		return a, m.rollbackToFileProvider(a, fuseProv, fpProv, fmt.Errorf("mount: %w", err))
+	}
+	if preErr == nil {
+		post, err := readIdentity(filepath.Join(priv, ".claude.json"))
+		if err != nil {
+			return a, m.rollbackToFileProvider(a, fuseProv, fpProv, fmt.Errorf("identity not readable in private root after conversion: %w", err))
+		}
+		if post.AccountUUID != pre.AccountUUID {
+			return a, m.rollbackToFileProvider(a, fuseProv, fpProv,
+				fmt.Errorf("identity in private root is %s, expected %s", post.AccountUUID, pre.AccountUUID))
+		}
+	}
+	if err := m.Store.SetAccountOverlayKind(a.ID, string(fuseProv.Backend())); err != nil {
+		return a, m.rollbackToFileProvider(a, fuseProv, fpProv, fmt.Errorf("persist row: %w", err))
+	}
+	a.OverlayKind = string(fuseProv.Backend())
+	return a, nil
+}
+
+// rollbackToFileProvider restores the File Provider overlay after a failed
+// fileprovider→fuse conversion. The fuse teardown is fail-closed (it refuses a
+// real dir) and a no-op with nothing mounted; if it fails, it stops — re-laying
+// the domain symlink over live fuse state would divert the account — leaving
+// the fuse wreckage for the daemon to reconcile against the fileprovider row.
+func (m *Manager) rollbackToFileProvider(a store.Account, fuseProv, fpProv fkoverlay.Provider, cause error) error {
+	base, dir := ClaudeDir(), a.ConfigDir
+	if err := fuseProv.Teardown(base, dir); err != nil {
+		return fmt.Errorf("convert acct-%02d: %w (and rollback unmount failed: %w)", a.ID, cause, err)
+	}
+	if err := fpProv.Setup(base, dir); err != nil {
+		return fmt.Errorf("convert acct-%02d: %w (and file provider rollback failed: %w)", a.ID, cause, err)
+	}
+	return fmt.Errorf("convert acct-%02d: %w (rolled back to fileprovider)", a.ID, cause)
+}
+
+// convertToSymlink turns a fuse or File Provider account into a symlink one.
+// The source Teardown vacates the account dir without crossing it (with nothing
+// mounted the fuse teardown is a no-op; the FP teardown retracts the domain
+// symlink and deregisters the domain), so even a build that cannot host the
+// source backend can retreat from a stale row — pure file moves.
+func (m *Manager) convertToSymlink(a store.Account, fromProv, symProv fkoverlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
 	spec := m.overlaySpec()
-	if err := fuseProv.Teardown(base, dir); err != nil {
-		return a, fmt.Errorf("convert acct-%02d: unmount: %w", a.ID, err)
+	if err := fromProv.Teardown(base, dir); err != nil {
+		return a, fmt.Errorf("convert acct-%02d: tear down %s overlay: %w", a.ID, fromProv.Backend(), err)
 	}
 	if _, err := os.Stat(priv); err == nil {
 		if err := fkoverlay.MovePrivateEntries(priv, dir, spec); err != nil {
@@ -227,8 +457,10 @@ func (m *Manager) HealStrandedPrivate(a store.Account) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("heal acct-%02d: parse stored backend: %w", a.ID, err)
 	}
-	if backend.IsFuse() {
-		return false, fmt.Errorf("heal acct-%02d: account is fuse-backed; its private root is in use, not stranded", a.ID)
+	// Only a symlink row can strand: fuse AND fileprovider rows keep their
+	// private root in active use, and healing one would move live files.
+	if backend != fkoverlay.BackendSymlink {
+		return false, fmt.Errorf("heal acct-%02d: account is %s-backed; its private root is in use, not stranded", a.ID, backend)
 	}
 	dir := a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
@@ -265,10 +497,12 @@ func (m *Manager) HealStrandedPrivate(a store.Account) (bool, error) {
 
 // SetDefaultOverlayKind records backend as the default for accounts added later. Fuse
 // is refused when this build cannot host mounts, else new accounts' rows would promise
-// a mirror their dirs cannot have.
+// a mirror their dirs cannot have. File Provider is recorded as-is: its availability
+// (extension enabled, companion app reachable) is gated at the migrate entry points
+// (the daemon's fpGate, the CLI precheck), which run before this is reached.
 func (m *Manager) SetDefaultOverlayKind(backend fkoverlay.Backend) error {
 	switch {
-	case backend == fkoverlay.BackendSymlink:
+	case backend == fkoverlay.BackendSymlink, backend == fkoverlay.BackendFileProvider:
 	case backend.IsFuse():
 		if !m.canHostFuse() {
 			return fmt.Errorf("set default overlay %q: this build cannot host fuse mounts — run `ccp fuse enable`: %w", backend, ErrConvertUnsupported)

@@ -21,10 +21,15 @@ type Identity struct {
 
 // AccountIdentity returns a pool account's identity from its private
 // .claude.json. The path is pure math off the backend, so a read works whether
-// or not a mount or holder is up.
+// or not a mount, holder, or domain is up. Only a symlink row keeps its
+// identity in the account dir: fuse AND fileprovider rows hold it in the
+// shared private backing root, and their account dir is a bridge symlink a
+// read must never traverse (unbounded through a mirror or a materializing
+// domain, and the domain serves the MERGED .claude.json — base identity, not
+// the account's own).
 func AccountIdentity(backend fkoverlay.Backend, configDir string) (*Identity, error) {
 	priv := configDir
-	if backend.IsFuse() {
+	if backend != fkoverlay.BackendSymlink {
 		priv = fkoverlay.FusePrivateRoot(configDir)
 	}
 	return readIdentity(filepath.Join(priv, ".claude.json"))

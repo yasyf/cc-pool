@@ -62,6 +62,11 @@ type Server struct {
 	// evictTimeout bounds the wait for a skewed holder to release the socket.
 	evictTimeout time.Duration
 
+	// fpBridgeBackoff is the FP bridge serve-loop retry delay; zero means
+	// defaultFPBridgeBackoff. Tests shrink it to pin the retry-after-bind-failure
+	// path.
+	fpBridgeBackoff time.Duration
+
 	// triggerShutdown cancels serve's context. Set once before the accept loop
 	// starts; the spawning go-statement's happens-before lets handlers read it
 	// unlocked.
@@ -222,6 +227,9 @@ func (s *Server) serve(ctx context.Context) error {
 		// Bind the content bridge before any mount registers (holderfs.Build
 		// fails a mount if the bridge is unreachable).
 		s.startContentBridge(ctx)
+		// Bind the File Provider bridge before reconcileOverlays: an FP Setup
+		// triggers the extension's first enumeration, which dials this socket.
+		s.startFPBridge(ctx)
 		s.holder.refresh(s.holderClient())
 		oauth.SetUserAgentVersion(detectClaudeVersion(ctx))
 		s.reconcileOverlays(ctx)
@@ -374,7 +382,15 @@ func (s *Server) handleStatus(ctx context.Context) Response {
 	}
 	// Version lets the client detect a pre-upgrade daemon (which omits newer wire
 	// fields like Components) and fall back to live sampling.
-	return Response{OK: true, Version: version.String(), Accounts: accts, Holder: s.holder.wireStatus()}
+	resp := Response{OK: true, Version: version.String(), Accounts: accts, Holder: s.holder.wireStatus()}
+	// Content-source health lives only in this process; errors.Join's newlines
+	// fold to "; " so doctor renders one line.
+	if s.contentSource != nil {
+		if err := s.contentSource.HealthErrors(); err != nil {
+			resp.ContentHealth = strings.ReplaceAll(err.Error(), "\n", "; ")
+		}
+	}
+	return resp
 }
 
 // statuses assembles the wire view of every account from cached samples — the
@@ -741,7 +757,9 @@ func (s *Server) endPoll(id int) {
 // racing the startup prime, or a mirror `ccp add` just mounted). A non-fuse row
 // needs the dir NOT mounted — a mountpoint under a symlink row is aborted-
 // rollback wreckage serving a mirror whose backing no longer holds the
-// account's identity; lstat on a plain dir is safe.
+// account's identity; lstat on a plain dir is safe. A File Provider row rides
+// the same arm: its dir is the domain bridge symlink (never a mountpoint) and
+// domain health is owned by reconcileFileProvider, not the select path.
 func (s *Server) mountReady(a store.Account) bool {
 	if fuseBackedRow(a.OverlayKind) {
 		if !s.holder.ready(a.ConfigDir) {
@@ -1130,6 +1148,14 @@ func (s *Server) retreatPoolToSymlink(ctx context.Context, accts []store.Account
 // reconcileAccount brings one account's on-disk overlay in line with its row.
 // Caller holds the poll claim.
 func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
+	if fpBackedRow(a.OverlayKind) {
+		// File Provider rows reconcile through the domain host (Health, then an
+		// idempotent Setup) — never the non-fuse arm below: its
+		// HealStrandedPrivate would move the account's private files out of the
+		// FP private store, through the domain bridge symlink.
+		s.reconcileFileProvider(ctx, a)
+		return
+	}
 	if fuseBackedRow(a.OverlayKind) {
 		// One-time legacy→mux migration: a fuse row whose ConfigDir is still a real
 		// dir — a pre-cutover per-account mount, or a bare dir a half-done migration

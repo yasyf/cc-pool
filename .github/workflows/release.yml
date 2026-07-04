@@ -50,11 +50,35 @@ jobs:
           CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/pure-amd64 ./cmd/cc-pool
           lipo -create -output dist/pure/cc-pool dist/pure-arm64 dist/pure-amd64
 
-          # Developer ID sign (hardened runtime) + notarize the bare Mach-O
-          # (recorded against its cdhash — a bare binary can't be stapled) via the
-          # shared script import-developer-id exported. macOS 15/26 SIGKILL
-          # ad-hoc/Team-less signatures, so unsigned is not an option.
-          bash "$MACOS_CODESIGN_SCRIPT" dist/pure/cc-pool darwin_universal
+          # The daemon binds the File Provider bridge socket inside the App Group
+          # container (~/Library/Group Containers/<AppGroupID>/); on macOS 15+ a
+          # process without the application-groups entitlement touching a group
+          # container trips a TCC prompt. Derive the group from the Go constant so
+          # the signed entitlement can never drift from what the code expects, and
+          # pin it to the signing team (a group's prefix must be the Team ID).
+          APP_GROUP="$(sed -n 's/^const AppGroupID = "\(.*\)"$/\1/p' internal/pool/paths.go)"
+          test -n "$APP_GROUP"
+          test "$APP_GROUP" = "${TEAM_ID}.ccp"
+          cat > dist/cc-pool.entitlements <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.application-groups</key>
+            <array>
+              <string>${APP_GROUP}</string>
+            </array>
+          </dict>
+          </plist>
+          EOF
+
+          # Developer ID sign (hardened runtime + the app-group entitlement) and
+          # notarize the bare Mach-O (recorded against its cdhash — a bare binary
+          # can't be stapled) via the shared script import-developer-id exported.
+          # macOS 15/26 SIGKILL ad-hoc/Team-less signatures, so unsigned is not an
+          # option.
+          MACOS_CODESIGN_ENTITLEMENTS="$PWD/dist/cc-pool.entitlements" \
+            bash "$MACOS_CODESIGN_SCRIPT" dist/pure/cc-pool darwin_universal
           dist/pure/cc-pool --version | grep -q "${VERSION}"
 
           # The tarball contains a binary named exactly `cc-pool`.
@@ -78,17 +102,21 @@ jobs:
           # bundle version — stamp a real, monotonic version per release or the
           # gallery keeps a stale descriptor and never gains new widget sizes.
           # Developer ID + hardened runtime so a quarantined cask install launches
-          # without Gatekeeper blocking it; xcodebuild signs inside-out (appex,
+          # without Gatekeeper blocking it; xcodebuild signs inside-out (appexes,
           # then app), applying each target's entitlements from project.yml.
           # TEAM_ID comes from import-developer-id's env export (derived from the
           # signing identity, never hardcoded).
+          # CCPoolStatusFP is the File-Provider-enabled host flavor: it embeds
+          # CCPoolFileProvider.appex alongside the widget appex and carries the
+          # App Group entitlement; PRODUCT_NAME keeps the product CCPoolStatus.app.
+          # The ad-hoc CCPoolStatus scheme stays local-only.
           # CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO: a plain `xcodebuild build`
           # (unlike archive + -exportArchive) injects get-task-allow=YES even in a
           # Release build, which notarization rejects on every executable. Disabling
           # the injection drops it; the appex keeps its sandbox + ~/.cc-pool read
           # exception, which come from its own entitlements file (explicit, not
           # injected).
-          xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
+          xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatusFP \
             -configuration Release -derivedDataPath build build \
             MARKETING_VERSION="${GITHUB_REF_NAME#v}" \
             CURRENT_PROJECT_VERSION="$(git rev-list --count HEAD)" \
@@ -109,6 +137,28 @@ jobs:
           # stale-gallery bug. The appex is the bundle chronod inspects.
           test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" != 1
           test "$(plutil -extract CFBundleVersion raw "$APP/Contents/PlugIns/CCPoolStatusWidget.appex/Contents/Info.plist")" != 1
+          # File Provider appex asserts: present, correctly entitled, and bound to
+          # the same App Group the Go daemon compiled in — fail the release on any
+          # drift between widget/project.yml and internal/pool/paths.go.
+          FP_APPEX="$APP/Contents/PlugIns/CCPoolFileProvider.appex"
+          test -d "$FP_APPEX"
+          APP_GROUP="$(sed -n 's/^const AppGroupID = "\(.*\)"$/\1/p' ../internal/pool/paths.go)"
+          test -n "$APP_GROUP"
+          test "$APP_GROUP" = "${TEAM_ID}.ccp"
+          FP_ENTS="$(codesign -d --entitlements - "$FP_APPEX" 2>&1)"
+          echo "$FP_ENTS" | grep -q "com.apple.security.application-groups"
+          echo "$FP_ENTS" | grep -q "temporary-exception.files.home-relative-path.read-write"
+          # fileprovider.testing-mode is a restricted entitlement: it would force a
+          # provisioning profile and break the no-profile Developer ID release.
+          if echo "$FP_ENTS" | grep -q "fileprovider.testing-mode"; then
+            echo "::error::CCPoolFileProvider.appex carries fileprovider.testing-mode"
+            exit 1
+          fi
+          # $(TeamIdentifierPrefix) in project.yml expands only because this build
+          # sets DEVELOPMENT_TEAM, so assert the EXPANDED value in the built plist.
+          FP_PLIST="$FP_APPEX/Contents/Info.plist"
+          test "$(plutil -extract NSExtension.NSExtensionPointIdentifier raw "$FP_PLIST")" = "com.apple.fileprovider-nonui"
+          test "$(plutil -extract NSExtension.NSExtensionFileProviderDocumentGroup raw "$FP_PLIST")" = "$APP_GROUP"
 
       - name: Notarize, staple, zip CCPoolStatus.app
         id: app
@@ -117,8 +167,9 @@ jobs:
           app: widget/build/Build/Products/Release/CCPoolStatus.app
           name: cc-pool-status
           # xcodebuild already signed inside-out with per-target entitlements
-          # (the appex sandbox + ~/.cc-pool read exception); re-signing here
-          # would flatten them and brick the appex.
+          # (widget appex: sandbox + ~/.cc-pool read exception; FP appex: sandbox +
+          # App Group + home-relative read-write exception; host app: App Group);
+          # re-signing here would flatten them and brick the appexes.
           sign: "false"
           # The single release step below attaches every asset and generates
           # notes exactly once.

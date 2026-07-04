@@ -120,6 +120,42 @@ func BridgeSocketPath() string {
 	return stateDir.Path("bridge.sock")
 }
 
+// FPExtensionBundleID is the File Provider extension's bundle identifier,
+// handed to pluginkit by fusekit's FileProviderAvailable gate.
+const FPExtensionBundleID = "com.yasyf.cc-pool.status.fileprovider"
+
+// AppGroupID is the App Group container shared by the CCPoolStatus host app,
+// the File Provider extension, and the daemon. It must equal
+// $(TeamIdentifierPrefix)ccp in widget/project.yml; release.yml asserts the
+// built appex's NSExtensionFileProviderDocumentGroup matches this constant.
+const AppGroupID = "SXKCTF23Q2.ccp"
+
+// WidgetAppPath is the CCPoolStatus app bundle path (the cask's default
+// appdir): the Notification Center widget host and the File Provider
+// companion app.
+func WidgetAppPath() string {
+	return "/Applications/CCPoolStatus.app"
+}
+
+// FPControlSocketPath is the File Provider control socket
+// (~/.cc-pool/domains.sock): the CCPoolStatus app binds it, the daemon dials
+// it to register/remove/signal domains.
+func FPControlSocketPath() string {
+	return stateDir.Path("domains.sock")
+}
+
+// FPBridgeSocketPath is the File Provider data socket: the daemon binds it,
+// the sandboxed extension dials it for computed content. It lives in the App
+// Group container — the one location BOTH sides may touch: the sandboxed
+// appex gets blanket container access (file temp-exceptions do not cover
+// AF_UNIX connect, a network-outbound operation), and the daemon is an
+// entitled group member. Transient bind failures (daemon restart drain races)
+// self-heal via the FP bridge serve-retry loop. The short leaf keeps the path
+// under the 104-byte sun_path limit.
+func FPBridgeSocketPath() string {
+	return filepath.Join(mustHome(), "Library", "Group Containers", AppGroupID, "b.sock")
+}
+
 // MountHolderLogPath is the dev-spawned holder's log path; the production
 // fusekit-holder cask owns its own.
 func MountHolderLogPath() string {
