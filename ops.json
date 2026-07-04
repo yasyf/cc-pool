@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"ops":[{"kind":"set_title","title":"Deploy holder fixes at a zero-live-session window: brew upgrade fusekit-holder (v0.28.0: nice-5 + silly-rename diversion) + cc-pool (v0.37.3), then clean stale ~/.claude/.fuse_hidden* (age-check first)"}]}
+{"v":1,"lamport":3,"ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"f5f49b5908f0ca477657a11b6538e089fd9fb699"}]}
