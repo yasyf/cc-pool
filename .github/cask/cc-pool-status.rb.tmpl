@@ -24,14 +24,7 @@ cask "cc-pool-status" do
   app "CCPoolStatus.app"
 
   postflight do
-    # Notarized + stapled, so Gatekeeper validates offline — but Homebrew's
-    # download quarantine still triggers a one-time "downloaded from the
-    # internet" dialog on first launch (and again on every upgrade's re-download).
-    # Strip it recursively (covers the hosted widget + File Provider appexes) so
-    # the relaunch is silent, then relaunch: an upgrade quit the old copy, and
-    # reopening restores the widget and File Provider extension without a manual
-    # reopen. Best-effort throughout — a headless/no-GUI-session install must not
-    # fail the cask over these convenience steps.
+    # Strip Homebrew's download quarantine so first launch is silent (notarized+stapled).
     system_command "/usr/bin/xattr",
                    args: ["-dr", "com.apple.quarantine", "#{appdir}/CCPoolStatus.app"],
                    must_succeed: false
