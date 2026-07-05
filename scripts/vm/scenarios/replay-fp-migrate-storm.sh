@@ -35,6 +35,23 @@ require_seconds() {
   (($(vm_seconds_left) > 0)) || die "run window elapsed before $1 — raise VMCTL_RUN_TIMEOUT_MIN"
 }
 
+# fp_consent_die reports the File Provider user-consent blocker and dies. The
+# CCPoolFileProvider extension can be pluginkit-enabled ('+') yet still sit at
+# fileproviderd `enabled: no` — a one-time user-approval gate (System Settings >
+# General > Login Items & Extensions > File Provider) that pluginkit does NOT
+# flip and no CLI exposes (verified: editing Domains.plist + restarting
+# fileproviderd does not change it). Until it is approved, every domain registers
+# but never serves an enumeration, and the Phase 2b readiness gate correctly
+# rolls every account back to symlink. $* is the observed evidence.
+fp_consent_die() {
+  die "File Provider extension is NOT user-approved (fileproviderd reports enabled: no).
+pluginkit enablement ('+') is insufficient — this is the separate one-time Settings consent gate.
+Fix: boot once with VMCTL_GRAPHICS=1, open System Settings > General > Login Items &
+Extensions > File Provider, and turn ON the cc-pool (CCPoolStatus) extension. It
+persists for the VM's life; then re-run. (README: FP provisioning.)
+Evidence: $*"
+}
+
 # ---------------------------------------------------------------------------------
 # 1. Seed a synthetic 10-account pool: config dirs + fake .claude.json identities
 #    + matching sqlite rows on the symlink overlay. Migration never touches the
@@ -43,12 +60,25 @@ require_seconds() {
 vm_phase seed
 require_seconds "seed"
 
+# Reset for idempotency (no destroy/create cycle needed): stop any daemon / app /
+# readers left by a prior run so the seed can wipe pool state without racing a
+# live writer. The seed script then wipes ~/.cc-pool's pool state and recreates it.
+vm_ssh "touch '$GUEST_READERS_STOP' 2>/dev/null; pkill -x cc-pool 2>/dev/null; osascript -e 'quit app \"CCPoolStatus\"' 2>/dev/null; pkill -f CCPoolStatus 2>/dev/null; true"
+sleep 3
+
 cat >"$VMCTL_RESULTS_DIR/seed.sh" <<'SEED'
 set -euo pipefail
 N=10
 STATE="$HOME/.cc-pool"
 ACCTS="$STATE/accounts"
 DB="$STATE/pool.db"
+# Full reset for idempotency: wipe prior pool state — the DB and the account
+# dirs, which include the acct-NN.private fuse/FP backing roots
+# (fkoverlay.FusePrivateRoot = accountDir + ".private") — so a re-run starts from
+# a clean symlink pool. The daemon/app were stopped by the scenario's reset
+# preamble. OS-registered FP domains from a prior successful run persist in
+# fileproviderd and are re-registered (idempotent add) by the next migrate.
+rm -rf "$ACCTS" "$DB" "$DB-wal" "$DB-shm"
 mkdir -p "$ACCTS"
 chmod 700 "$STATE"
 # A base ~/.claude tree + ~/.claude.json so the symlink overlay has a base and
@@ -56,10 +86,9 @@ chmod 700 "$STATE"
 mkdir -p "$HOME/.claude"
 [ -f "$HOME/.claude.json" ] || printf '{}\n' >"$HOME/.claude.json"
 
-# Fresh DB each run. Schema mirrors internal/store/store.go — we create only the
-# accounts table (the one we seed); cc-pool's store.Open() creates every other
-# table via CREATE TABLE IF NOT EXISTS on first daemon start.
-rm -f "$DB" "$DB-wal" "$DB-shm"
+# Schema mirrors internal/store/store.go — we create the meta + accounts tables
+# (the ones we seed); cc-pool's store.Open() creates every other table via
+# CREATE TABLE IF NOT EXISTS on first daemon start.
 sqlite3 "$DB" <<'SQL'
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts (
@@ -72,6 +101,12 @@ CREATE TABLE IF NOT EXISTS accounts (
   created_at       INTEGER NOT NULL
 );
 SQL
+
+# The pool-initialized markers pool.Init writes (internal/pool/account.go): the
+# `initialized` meta row gates every daemon op (cli.requireInit), and
+# `overlay_kind`=symlink is the new-account default the pre-migrate pool starts
+# on. Without `initialized`, `ccp migrate` fails "pool not initialized".
+sqlite3 "$DB" "INSERT OR REPLACE INTO meta (key,value) VALUES ('initialized','1'),('overlay_kind','symlink');"
 
 now=$(date +%s)
 for i in $(seq 1 "$N"); do
@@ -128,6 +163,32 @@ This is the app-group-data TCC gate: re-run 'vmctl provision' with the grant, or
 Daemon log: $VMCTL_GUEST_DAEMON_LOG"
 log "daemon + companion app up; FP bridge bound"
 
+# Preflight the File Provider user-consent gate. pluginkit '+' does not imply
+# fileproviderd will launch the extension: it must also report the provider
+# `enabled: yes`. On a re-run the provider is already known to fileproviderd and
+# we fail fast here; on a first-ever run it may be absent from the dump (never
+# registered), reported "unknown", in which case we defer to the migrate (whose
+# rollback is detected below with the same remediation).
+cat >"$VMCTL_RESULTS_DIR/fpcheck.sh" <<'FPCHECK'
+# Prints the cc-pool FP provider's fileproviderd enabled state: yes | no | unknown.
+# `fileproviderctl dump` lists each provider's `enabled:` line just above its
+# bundle-id line, so record the most recent enabled value and print it at the id.
+fileproviderctl dump 2>/dev/null | awk '
+  /enabled:/ { e=$2 }
+  /^com\.yasyf\.cc-pool\.status\.fileprovider$/ { print (e==""?"unknown":e); found=1; exit }
+  END { if (!found) print "unknown" }
+'
+FPCHECK
+vm_scp_to "$VMCTL_RESULTS_DIR/fpcheck.sh" "/tmp/ccpool-fpcheck.sh" || die "could not stage the FP consent check"
+fp_enabled="$(vm_ssh "bash /tmp/ccpool-fpcheck.sh")" || die "FP consent preflight command failed in the guest (vm_ssh rc=$?) — not a consent verdict; check guest reachability and fileproviderctl"
+case "$fp_enabled" in yes|no|unknown) ;; *) die "FP consent preflight printed unexpected state '$fp_enabled'" ;; esac
+log "FP consent preflight: provider enabled=$fp_enabled"
+# 'enabled: no' with zero registered domains is fileproviderd's default and does
+# NOT gate serving (proven empirically: a conversion succeeds in that state), so
+# the dump state is recorded evidence only — the migrate itself is the consent
+# verdict, and the migrate-failure detector below carries the remediation.
+[[ "$fp_enabled" == "no" ]] && warn "provider enabled=no in the dump — advisory only; the migrate is the authoritative consent test"
+
 # ---------------------------------------------------------------------------------
 # 3. Synthetic live sessions: per account, a process holding an open fd on the
 #    account's .claude.json plus a 1s read loop through the account dir — the
@@ -178,8 +239,33 @@ migrate_rc=$?
 set -e
 sed 's/^/  migrate| /' "$migrate_out" >&2 # fold the CLI output into scenario.log
 if ((migrate_rc != 0)); then
+  # The signature of the un-approved FP extension (the preflight missed it only
+  # on a first-ever run): domains register but never serve, so every account
+  # rolls back with the readiness-gate error.
+  if grep -q "did not serve an enumeration in time" "$migrate_out"; then
+    fp_consent_die "every account rolled back with \"file provider domain did not serve an enumeration in time\" (see $migrate_out)"
+  fi
   die "ccp migrate exited $migrate_rc — the fleet migration did not succeed (see the CLI output above and $VMCTL_GUEST_DAEMON_LOG)"
 fi
+
+# A claim-held account (daemon poll / pending select) reports MigrationBusy with
+# the product's documented "retry shortly" contract — --force never skips claims.
+# Follow that contract with bounded retries until every row has flipped.
+for attempt in 2 3 4; do
+  fp_rows="$(vm_ssh "sqlite3 '$GUEST_DB' \"SELECT COUNT(*) FROM accounts WHERE overlay_kind='fileprovider';\"")" \
+    || die "could not count fileprovider rows before retry $attempt"
+  [[ "$fp_rows" == "$NACCTS" ]] && break
+  (($(vm_seconds_left) > 60)) || die "run window too small to retry busy-skipped accounts ($fp_rows/$NACCTS converted)"
+  log "retry $attempt: $fp_rows/$NACCTS rows on fileprovider — re-running the fleet migrate for the busy-skipped accounts"
+  sleep 5
+  retry_out="$VMCTL_RESULTS_DIR/migrate-retry$attempt.out"
+  set +e
+  vm_ssh "'$VMCTL_GUEST_CCP' migrate --to fileprovider --force" >"$retry_out" 2>&1
+  retry_rc=$?
+  set -e
+  sed "s/^/  migrate#$attempt| /" "$retry_out" >&2
+  ((retry_rc == 0)) || die "retry $attempt: ccp migrate exited $retry_rc (see $retry_out)"
+done
 
 # ---------------------------------------------------------------------------------
 # 5. Assertions — the incident regression checks. All evidence lands in the
@@ -228,16 +314,18 @@ for i in $(seq 1 "$NACCTS"); do
 done
 log "assert: all $NACCTS domains serve a non-empty .claude.json within 5s"
 
-# (d) Conversions settled account-by-account: the migrated lines appear in strict
-#     acct-01..NN order, non-interleaved — proof each domain served (readiness
-#     gate) before the next conversion started, instead of 10 domains
-#     materializing simultaneously.
+# (d) Every account converted exactly once and the migrated set is exactly
+#     acct-01..NN. Conversions are sequential by construction (each is one
+#     blocking RPC; the daemon's entrancy test pins max-in-flight == 1), and a
+#     busy-skipped account legitimately converts on a retry pass — so the id
+#     ORDER is recorded evidence, not an assertion.
 order="$(grep -oE 'acct-[0-9]{2} overlay migrated symlink -> fileprovider' "$log_txt" | grep -oE 'acct-[0-9]{2}')"
+sorted="$(printf '%s\n' "$order" | sort)"
 expected="$(for i in $(seq 1 "$NACCTS"); do printf 'acct-%02d\n' "$i"; done)"
-[[ "$order" == "$expected" ]] || die "migration lines are out of order / interleaved (conversions did not settle account-by-account):
-got:
+[[ "$sorted" == "$expected" ]] || die "migrated-account set is wrong (dup or missing conversion):
+got (in log order):
 $order"
-log "assert: conversions settled in strict acct-01..$(printf '%02d' "$NACCTS") order"
+log "assert: each of the $NACCTS accounts converted exactly once (order: $(printf '%s' "$order" | tr '\n' ' '))"
 
 # ---------------------------------------------------------------------------------
 # 6. Soak. The incident storm was self-sustaining for ~45 min AFTER the migrate
