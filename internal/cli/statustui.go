@@ -58,8 +58,8 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 		buildLogin: func(a store.Account) (*exec.Cmd, error) {
 			return loginCommand(a.ConfigDir)
 		},
-		finishLogin: func(a store.Account) error {
-			return finishRelogin(ctx, m, a)
+		finishLogin: func(a store.Account, baseline string) error {
+			return finishRelogin(ctx, m, a, baseline)
 		},
 		readCred: func(a store.Account) (*creds.Credential, error) {
 			cred, _, err := m.ReadCredential(a)
@@ -93,7 +93,7 @@ type statusTUI struct {
 	gather      func(context.Context) (statusData, error)
 	toggle      func(accountID int) (bool, error)
 	buildLogin  func(a store.Account) (*exec.Cmd, error)
-	finishLogin func(a store.Account) error
+	finishLogin func(a store.Account, baseline string) error
 	readCred    func(a store.Account) (*creds.Credential, error) // credential resolution for the re-login probe (both backends)
 	// resolveAccount re-loads the account from the store: wire snapshots carry
 	// no keychain fields, so credential operations must never use s.Account.
@@ -122,19 +122,25 @@ type (
 	pinDoneMsg struct{ err error }
 	// reloginStartMsg starts the interactive login after the short-circuit check passed on it.
 	reloginStartMsg struct{ account store.Account }
-	// reloginExitedMsg fires after claude /login exits and the terminal is back under the TUI.
-	reloginExitedMsg struct{ account store.Account }
-	reloginDoneMsg   struct{ err error }
-	tickMsg          time.Time
+	// reloginExitedMsg fires after claude /login exits and the terminal is back
+	// under the TUI; baseline is the pre-login access token finishRelogin
+	// compares against, so a quit-without-login never reads as success.
+	reloginExitedMsg struct {
+		account  store.Account
+		baseline string
+	}
+	reloginDoneMsg struct{ err error }
+	tickMsg        time.Time
 )
 
 // watchedLogin runs `claude /login` as a tea.ExecCommand and auto-closes claude
 // once a fresh credential lands; Bubble Tea releases the tty for Run, so poll+terminate never fight claude for it.
 type watchedLogin struct {
-	ctx  context.Context
-	cmd  *exec.Cmd
-	read credReader
-	out  io.Writer // where the input-mode reset is emitted
+	ctx      context.Context
+	cmd      *exec.Cmd
+	read     credReader
+	out      io.Writer // where the input-mode reset is emitted
+	baseline string    // pre-login access token, set by Run for the finish gate
 }
 
 func (w *watchedLogin) SetStdin(r io.Reader)  { w.cmd.Stdin = r }
@@ -142,11 +148,10 @@ func (w *watchedLogin) SetStdout(o io.Writer) { w.cmd.Stdout = o; w.out = o }
 func (w *watchedLogin) SetStderr(o io.Writer) { w.cmd.Stderr = o }
 
 func (w *watchedLogin) Run() error {
-	baseline := ""
 	if cred, err := w.read(); err == nil {
-		baseline = cred.ClaudeAiOauth.AccessToken
+		w.baseline = cred.ClaudeAiOauth.AccessToken
 	}
-	outcome, _ := watchAndClose(w.ctx, w.cmd, newReloginProbe(w.read, baseline))
+	outcome, _ := watchAndClose(w.ctx, w.cmd, newReloginProbe(w.read, w.baseline))
 	// Bubble Tea's post-Exec restore leaves claude's input modes on, so after a
 	// force-kill (not a clean self-exit) reset only those; Bubble Tea owns alt-screen/cursor.
 	if outcome != awaitExited && isTTY() {
@@ -177,9 +182,9 @@ func (t statusTUI) togglePinCmd(accountID int) tea.Cmd {
 	}
 }
 
-func (t statusTUI) finishReloginCmd(a store.Account) tea.Cmd {
+func (t statusTUI) finishReloginCmd(a store.Account, baseline string) tea.Cmd {
 	return func() tea.Msg {
-		return reloginDoneMsg{err: t.finishLogin(a)}
+		return reloginDoneMsg{err: t.finishLogin(a, baseline)}
 	}
 }
 
@@ -278,9 +283,10 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		wl := &watchedLogin{ctx: t.ctx, cmd: c, read: func() (*creds.Credential, error) {
 			return t.readCred(a)
 		}}
-		return t, tea.Exec(wl, func(error) tea.Msg { return reloginExitedMsg{account: a} })
+		// The callback runs after wl.Run, so wl.baseline is set by then.
+		return t, tea.Exec(wl, func(error) tea.Msg { return reloginExitedMsg{account: a, baseline: wl.baseline} })
 	case reloginExitedMsg:
-		return t, t.finishReloginCmd(msg.account)
+		return t, t.finishReloginCmd(msg.account, msg.baseline)
 	case reloginDoneMsg:
 		t.reloginBusy = false
 		t.reloginErr = msg.err

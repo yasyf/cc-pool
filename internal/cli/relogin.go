@@ -97,7 +97,7 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	if err := cmd.Context().Err(); err != nil {
 		return err
 	}
-	if err := finishRelogin(cmd.Context(), m, a); err != nil {
+	if err := finishRelogin(cmd.Context(), m, a, baseline); err != nil {
 		return err
 	}
 	// A cross-session re-login (e.g. an SSH login of a Keychain-backed account
@@ -156,17 +156,20 @@ func shortCircuitRelogin(ctx context.Context, m *pool.Manager, a store.Account) 
 	return true, nil
 }
 
-// awaitUsableCred re-probes read until a usable credential lands or grace
-// expires — claude's exit can beat its credential write by a poll tick. An
-// ErrUnavailable read is unknown state and fails immediately.
-func awaitUsableCred(ctx context.Context, read credReader, grace, interval time.Duration) (*creds.Credential, error) {
+// awaitFreshCred re-probes read until a usable credential differing from the
+// pre-login baseline lands or grace expires — claude's exit can beat its
+// credential write by a poll tick, and the pre-login credential can look
+// usable while that write is still in flight. An ErrUnavailable read is
+// unknown state and fails immediately; after the deadline the last read is
+// returned as-is for the caller to judge.
+func awaitFreshCred(ctx context.Context, read credReader, baseline string, grace, interval time.Duration) (*creds.Credential, error) {
 	deadline := time.Now().Add(grace)
 	for {
 		cred, err := read()
 		switch {
 		case errors.Is(err, creds.ErrUnavailable):
 			return nil, err
-		case err == nil && cred.HasRefreshToken() && !cred.Expired():
+		case err == nil && cred.HasRefreshToken() && !cred.Expired() && cred.ClaudeAiOauth.AccessToken != baseline:
 			return cred, nil
 		}
 		if time.Now().After(deadline) {
@@ -180,21 +183,25 @@ func awaitUsableCred(ctx context.Context, read credReader, grace, interval time.
 	}
 }
 
-func finishRelogin(ctx context.Context, m *pool.Manager, a store.Account) error {
-	// Fail closed: an unusable credential means the login didn't land; the
-	// daemon would re-flag on its next poll anyway. A read failure keeps its
-	// cause: an unsearchable Keychain (creds.ErrUnavailable) is unknown state,
-	// not a failed login.
+func finishRelogin(ctx context.Context, m *pool.Manager, a store.Account, baseline string) error {
+	// Fail closed: an unusable or baseline-unchanged credential means the login
+	// didn't land — quitting claude without logging in must not report success,
+	// nor clear a correct needs-login flag off a dead chain. A read failure
+	// keeps its cause: an unsearchable Keychain (creds.ErrUnavailable) is
+	// unknown state, not a failed login.
 	read := func() (*creds.Credential, error) {
 		cred, _, err := m.ReadCredential(a)
 		return cred, err
 	}
-	cred, err := awaitUsableCred(ctx, read, finishReloginGrace, loginPollInterval)
+	cred, err := awaitFreshCred(ctx, read, baseline, finishReloginGrace, loginPollInterval)
 	if err != nil {
 		return fmt.Errorf("read %s's credential after login: %w — run `ccp login %d` again", accountName(a.Label), err, a.ID)
 	}
 	if !cred.HasRefreshToken() || cred.Expired() {
 		return fmt.Errorf("login left no usable credential for %s; run `ccp login %d` again", accountName(a.Label), a.ID)
+	}
+	if cred.ClaudeAiOauth.AccessToken == baseline {
+		return fmt.Errorf("no new login landed for %s; credential unchanged — run `ccp login %d` to retry", accountName(a.Label), a.ID)
 	}
 	// Re-assert our `security`-trusted ACL; a no-op rewrite for the plaintext-file backend.
 	if err := m.AdoptRotatedToken(ctx, a); err != nil {

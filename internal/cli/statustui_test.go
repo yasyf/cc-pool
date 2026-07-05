@@ -235,6 +235,7 @@ func TestStatusTUIViewShowsPin(t *testing.T) {
 type fakeLogin struct {
 	built      []store.Account
 	finished   []int
+	baselines  []string
 	resolved   []int
 	fresh      []store.Account
 	buildErr   error
@@ -253,8 +254,9 @@ func (f *fakeLogin) build(a store.Account) (*exec.Cmd, error) {
 	return exec.Command("true"), nil
 }
 
-func (f *fakeLogin) finish(a store.Account) error {
+func (f *fakeLogin) finish(a store.Account, baseline string) error {
 	f.finished = append(f.finished, a.ID)
+	f.baselines = append(f.baselines, baseline)
 	return f.finishErr
 }
 
@@ -333,7 +335,7 @@ func TestStatusTUIReloginAction(t *testing.T) {
 		if fl.built[0].KeychainService != "svc-02" {
 			t.Fatalf("buildLogin got keychain service %q, want the store-resolved svc-02", fl.built[0].KeychainService)
 		}
-		model, finish := tui.Update(reloginExitedMsg{account: bob})
+		model, finish := tui.Update(reloginExitedMsg{account: bob, baseline: "tok-old"})
 		tui = model.(statusTUI)
 		if finish == nil {
 			t.Fatal("reloginExitedMsg must return the finish Cmd")
@@ -345,6 +347,11 @@ func TestStatusTUIReloginAction(t *testing.T) {
 		}
 		if len(fl.finished) != 1 || fl.finished[0] != 2 {
 			t.Fatalf("finishLogin calls = %v, want [2]", fl.finished)
+		}
+		// The pre-login baseline must reach the finish gate, so a quit without a
+		// login can never read as success off the unchanged credential.
+		if len(fl.baselines) != 1 || fl.baselines[0] != "tok-old" {
+			t.Fatalf("finishLogin baselines = %v, want [tok-old]", fl.baselines)
 		}
 		model, refresh := tui.Update(done)
 		tui = model.(statusTUI)

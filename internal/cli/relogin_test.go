@@ -92,7 +92,7 @@ func TestNewReloginProbe(t *testing.T) {
 // bogus not-found, and only a usable credential clears the needs-login flag.
 func TestFinishRelogin(t *testing.T) {
 	// Zero grace = the pre-grace single-read semantics; the grace loop itself
-	// is covered by TestAwaitUsableCred.
+	// is covered by TestAwaitFreshCred.
 	old := finishReloginGrace
 	finishReloginGrace = 0
 	t.Cleanup(func() { finishReloginGrace = old })
@@ -103,18 +103,30 @@ func TestFinishRelogin(t *testing.T) {
 	cases := map[string]struct {
 		keychain     *creds.Credential
 		file         *creds.Credential
-		keychainRead error // injected keychain Read fault
-		wantErr      error // errors.Is target; nil with empty wantContains = success
+		keychainRead error  // injected keychain Read fault
+		baseline     string // pre-login access token
+		wantErr      error  // errors.Is target; nil with empty wantContains = success
 		wantContains []string
 		wantOmits    []string
 		wantWrites   int // seam keychain writes (the ACL re-assertion)
 	}{
 		"keychain-backed login lands and re-asserts the ACL": {
 			keychain:   cred("at-new", "rt", future),
+			baseline:   "at-old",
 			wantWrites: 1,
 		},
-		"file-backed login lands": {
+		// No prior credential (first login after revocation cleared it): an
+		// empty baseline never matches a real token.
+		"file-backed login lands with no prior credential": {
 			file: cred("at-new", "rt", future),
+		},
+		// Quitting claude without logging in leaves the pre-login credential
+		// byte-identical; reporting success would clear a correct needs-login
+		// flag off a dead chain.
+		"unchanged credential after quit fails closed": {
+			keychain:     cred("at-old", "rt", future),
+			baseline:     "at-old",
+			wantContains: []string{"no new login landed", "credential unchanged", "ccp login 3"},
 		},
 		"headless unsearchable keychain surfaces unknown state, not absence": {
 			keychainRead: creds.ErrUnavailable,
@@ -162,7 +174,7 @@ func TestFinishRelogin(t *testing.T) {
 			}
 			m := &pool.Manager{Store: st, Creds: fk, LockDir: t.TempDir()}
 
-			ferr := finishRelogin(context.Background(), m, a)
+			ferr := finishRelogin(context.Background(), m, a, tc.baseline)
 
 			h, herr := st.GetAuthHealth(a.ID)
 			if herr != nil {
@@ -203,16 +215,17 @@ func TestFinishRelogin(t *testing.T) {
 	}
 }
 
-// TestAwaitUsableCred: the post-exit read tolerates the claude-exit/credential-
-// write race for the grace window, but unknown Keychain state and cancellation
-// abort immediately.
-func TestAwaitUsableCred(t *testing.T) {
+// TestAwaitFreshCred: the post-exit read tolerates the claude-exit/credential-
+// write race for the grace window — including a pre-login credential that
+// still looks usable while the fresh write is in flight — but unknown Keychain
+// state and cancellation abort immediately.
+func TestAwaitFreshCred(t *testing.T) {
 	future := time.Now().Add(time.Hour).UnixMilli()
 
-	t.Run("usable immediately", func(t *testing.T) {
-		got, err := awaitUsableCred(context.Background(), func() (*creds.Credential, error) {
+	t.Run("fresh and usable immediately", func(t *testing.T) {
+		got, err := awaitFreshCred(context.Background(), func() (*creds.Credential, error) {
 			return cred("at", "rt", future), nil
-		}, 0, time.Millisecond)
+		}, "at-old", 0, time.Millisecond)
 		if err != nil || got.ClaudeAiOauth.AccessToken != "at" {
 			t.Fatalf("= %v, %v; want the credential", got, err)
 		}
@@ -220,13 +233,13 @@ func TestAwaitUsableCred(t *testing.T) {
 
 	t.Run("lands within the grace window", func(t *testing.T) {
 		var calls int
-		got, err := awaitUsableCred(context.Background(), func() (*creds.Credential, error) {
+		got, err := awaitFreshCred(context.Background(), func() (*creds.Credential, error) {
 			calls++
 			if calls < 3 {
 				return nil, creds.ErrNotFound
 			}
 			return cred("at", "rt", future), nil
-		}, time.Second, time.Millisecond)
+		}, "at-old", time.Second, time.Millisecond)
 		if err != nil || got == nil {
 			t.Fatalf("= %v, %v; want the late credential", got, err)
 		}
@@ -235,10 +248,34 @@ func TestAwaitUsableCred(t *testing.T) {
 		}
 	})
 
+	t.Run("stale-but-usable baseline credential keeps waiting for the fresh one", func(t *testing.T) {
+		var calls int
+		got, err := awaitFreshCred(context.Background(), func() (*creds.Credential, error) {
+			calls++
+			if calls < 3 {
+				return cred("at-old", "rt", future), nil // pre-login credential, still usable
+			}
+			return cred("at-new", "rt", future), nil
+		}, "at-old", time.Second, time.Millisecond)
+		if err != nil || got.ClaudeAiOauth.AccessToken != "at-new" {
+			t.Fatalf("= %v, %v; want the fresh credential, not the baseline one", got, err)
+		}
+	})
+
+	t.Run("baseline-unchanged at the deadline returns it for the caller to judge", func(t *testing.T) {
+		stale := cred("at-old", "rt", future)
+		got, err := awaitFreshCred(context.Background(), func() (*creds.Credential, error) {
+			return stale, nil
+		}, "at-old", 10*time.Millisecond, time.Millisecond)
+		if err != nil || got != stale {
+			t.Fatalf("= %v, %v; want the unchanged credential back", got, err)
+		}
+	})
+
 	t.Run("never lands returns the last error", func(t *testing.T) {
-		_, err := awaitUsableCred(context.Background(), func() (*creds.Credential, error) {
+		_, err := awaitFreshCred(context.Background(), func() (*creds.Credential, error) {
 			return nil, creds.ErrNotFound
-		}, 10*time.Millisecond, time.Millisecond)
+		}, "", 10*time.Millisecond, time.Millisecond)
 		if !errors.Is(err, creds.ErrNotFound) {
 			t.Fatalf("err = %v, want ErrNotFound", err)
 		}
@@ -246,9 +283,9 @@ func TestAwaitUsableCred(t *testing.T) {
 
 	t.Run("unusable but readable returns the credential for the caller to judge", func(t *testing.T) {
 		revoked := cred("at", "", future)
-		got, err := awaitUsableCred(context.Background(), func() (*creds.Credential, error) {
+		got, err := awaitFreshCred(context.Background(), func() (*creds.Credential, error) {
 			return revoked, nil
-		}, 10*time.Millisecond, time.Millisecond)
+		}, "", 10*time.Millisecond, time.Millisecond)
 		if err != nil || got != revoked {
 			t.Fatalf("= %v, %v; want the revoked credential back", got, err)
 		}
@@ -256,10 +293,10 @@ func TestAwaitUsableCred(t *testing.T) {
 
 	t.Run("unknown keychain state aborts without retrying", func(t *testing.T) {
 		var calls int
-		_, err := awaitUsableCred(context.Background(), func() (*creds.Credential, error) {
+		_, err := awaitFreshCred(context.Background(), func() (*creds.Credential, error) {
 			calls++
 			return nil, creds.ErrUnavailable
-		}, time.Hour, time.Millisecond)
+		}, "", time.Hour, time.Millisecond)
 		if !errors.Is(err, creds.ErrUnavailable) || calls != 1 {
 			t.Fatalf("err = %v after %d reads, want immediate ErrUnavailable", err, calls)
 		}
@@ -268,9 +305,9 @@ func TestAwaitUsableCred(t *testing.T) {
 	t.Run("cancellation aborts the wait", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, err := awaitUsableCred(ctx, func() (*creds.Credential, error) {
+		_, err := awaitFreshCred(ctx, func() (*creds.Credential, error) {
 			return nil, creds.ErrNotFound
-		}, time.Hour, time.Millisecond)
+		}, "", time.Hour, time.Millisecond)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("err = %v, want context.Canceled", err)
 		}
@@ -427,6 +464,10 @@ func TestWatchedLoginRun(t *testing.T) {
 		// A fresh credential must close claude (signaled or killed), not run to a clean exit.
 		if c.ProcessState == nil || c.ProcessState.Exited() && c.ProcessState.Success() {
 			t.Fatalf("process state = %v, want signaled/killed", c.ProcessState)
+		}
+		// Run must capture the pre-login token for the finish gate.
+		if wl.baseline != "tok-old" {
+			t.Fatalf("baseline = %q, want the pre-login token", wl.baseline)
 		}
 	})
 
