@@ -246,6 +246,16 @@ func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverl
 		return res
 	}
 	res.Outcome = MigrationDone
+	// Forced past the live-session gate: record how many sessions the flip
+	// happened under, the forensic line this incident's diagnosis leaned on.
+	// Best-effort — a failed scan is not a gate here, so drop it silently.
+	if force {
+		if sessions, err := s.scan(ctx); err == nil {
+			if n := procscan.CountByConfigDir(sessions, a.ConfigDir); n > 0 {
+				res.Detail = fmt.Sprintf("converted under %d live session(s)", n)
+			}
+		}
+	}
 	// A conversion remakes the overlay, so any File Provider wedge/recovery state
 	// for this dir is now stale — forget it (the row may be leaving OR entering FP).
 	if s.fp != nil {

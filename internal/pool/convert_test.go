@@ -1361,7 +1361,19 @@ func (f *fakeFP) Setup(_, dir string) error {
 	if err := fileproviderd.AtomicSymlink(dir, root); err != nil {
 		return err
 	}
-	return os.MkdirAll(fkoverlay.FusePrivateRoot(dir), 0o700)
+	priv := fkoverlay.FusePrivateRoot(dir)
+	if err := os.MkdirAll(priv, 0o700); err != nil {
+		return err
+	}
+	// Model a materialized domain: the bridge serves the backing .claude.json at
+	// the domain root, so the convert probe (a through-domain read of dir, a
+	// symlink into root) verifies real content instead of a false miss.
+	if b, err := os.ReadFile(filepath.Join(priv, ".claude.json")); err == nil {
+		if err := os.WriteFile(filepath.Join(root, ".claude.json"), b, 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (f *fakeFP) Teardown(_, dir string) error {
@@ -1760,6 +1772,94 @@ func TestConvertToFileProviderCancelledBeforeMoveAbortsCleanly(t *testing.T) {
 	if storedKind(t, m, a.ID) != "symlink" {
 		t.Fatal("row changed by a pre-move abort")
 	}
+}
+
+// TestConvertToFileProviderProbeGate pins the post-Setup readiness gate (the
+// defect the FP-migrate-storm exposed): a domain that registers but does not
+// serve reads rolls back before the row flips, a serving domain flips it, and an
+// identity-less account skips the probe entirely — FPFS serves 0 bytes for a
+// no-identity domain, so a through-domain read there proves nothing.
+func TestConvertToFileProviderProbeGate(t *testing.T) {
+	t.Run("wedged domain rolls back before the row flips", func(t *testing.T) {
+		ops := []string{}
+		m, a, dir := newConvertFixture(t, nil)
+		fp := newFakeFP(t, &ops)
+		m.OverlayFor = fpOverlayFor(fp, &fakeFuse{ops: &ops})
+
+		prev := fpDomainProbe
+		fpDomainProbe = func(string) error { return errors.New("data plane wedged") }
+		defer func() { fpDomainProbe = prev }()
+
+		_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendFileProvider)
+		if err == nil || !strings.Contains(err.Error(), "domain registered but does not serve reads") {
+			t.Fatalf("error = %v, want the does-not-serve rollback", err)
+		}
+		if !strings.Contains(err.Error(), "rolled back to symlink") {
+			t.Fatalf("error = %v, want rollback report", err)
+		}
+		// Setup laid the domain; the failed probe drove a teardown before the flip.
+		want := []string{"fp.setup", "fp.teardown"}
+		if fmt.Sprintf("%v", ops) != fmt.Sprintf("%v", want) {
+			t.Fatalf("ops = %v, want %v", ops, want)
+		}
+		assertSymlinkRestored(t, m, a.ID, dir, identityJSON)
+		if len(fp.registered) != 0 {
+			t.Fatalf("domain still registered after the wedged-probe rollback: %v", fp.registered)
+		}
+	})
+
+	t.Run("serving domain flips the row after probing the flipped dir", func(t *testing.T) {
+		ops := []string{}
+		m, a, dir := newConvertFixture(t, nil)
+		fp := newFakeFP(t, &ops)
+		m.OverlayFor = fpOverlayFor(fp, &fakeFuse{ops: &ops})
+
+		probed := ""
+		prev := fpDomainProbe
+		fpDomainProbe = func(configDir string) error { probed = configDir; return nil }
+		defer func() { fpDomainProbe = prev }()
+
+		got, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendFileProvider)
+		if err != nil {
+			t.Fatalf("ConvertOverlay: %v", err)
+		}
+		if got.OverlayKind != "fileprovider" || storedKind(t, m, a.ID) != "fileprovider" {
+			t.Fatalf("row not flipped: returned=%s stored=%s", got.OverlayKind, storedKind(t, m, a.ID))
+		}
+		if probed != dir {
+			t.Fatalf("probe read %q, want the flipped account dir %q", probed, dir)
+		}
+	})
+
+	t.Run("identity-less account never probes", func(t *testing.T) {
+		ops := []string{}
+		m, a, dir := newConvertFixture(t, nil)
+		fp := newFakeFP(t, &ops)
+		m.OverlayFor = fpOverlayFor(fp, &fakeFuse{ops: &ops})
+		// An account that never completed a login has no identity to serve.
+		if err := os.Remove(filepath.Join(dir, ".claude.json")); err != nil {
+			t.Fatal(err)
+		}
+
+		calls := 0
+		prev := fpDomainProbe
+		fpDomainProbe = func(string) error {
+			calls++
+			return errors.New("probe must not run for an identity-less account")
+		}
+		defer func() { fpDomainProbe = prev }()
+
+		got, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendFileProvider)
+		if err != nil {
+			t.Fatalf("ConvertOverlay: %v", err)
+		}
+		if got.OverlayKind != "fileprovider" || storedKind(t, m, a.ID) != "fileprovider" {
+			t.Fatalf("row not flipped: returned=%s stored=%s", got.OverlayKind, storedKind(t, m, a.ID))
+		}
+		if calls != 0 {
+			t.Fatalf("probe ran %d time(s) for an identity-less account, want 0", calls)
+		}
+	})
 }
 
 func TestConvertFileProviderToSymlink(t *testing.T) {

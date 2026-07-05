@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
@@ -55,7 +56,7 @@ migrated-to provider.`,
 				if to == "fileprovider" && !fpAvailable(m.OverlaySpec()) {
 					return fmt.Errorf("fileprovider is not available: the %s extension is not installed and enabled — run `ccp fp onboard` to install %s, enable the extension, and migrate in one step", pool.FPExtensionBundleID, pool.WidgetAppPath())
 				}
-				resp, err := requestMigration(m, to, account, force)
+				resp, err := requestMigration(cmd, m, to, account, force)
 				if err != nil {
 					return err
 				}
@@ -65,7 +66,7 @@ migrated-to provider.`,
 					}
 					return errors.New("daemon returned no migration results")
 				}
-				return renderMigrations(cmd, resp, to, account > 0)
+				return renderMigrationSummary(cmd, resp, to, account > 0)
 			})
 		},
 	}
@@ -75,43 +76,108 @@ migrated-to provider.`,
 	return cmd
 }
 
-// requestMigration asks the daemon (which owns the conversion gates) to migrate;
-// account==0 means every account. No local fuse-capability check: the daemon
-// hosts the mounts, so a still-pure, just-reinstalled CLI can drive a fuse daemon.
-func requestMigration(m *pool.Manager, to string, account int, force bool) (*daemon.Response, error) {
+// requestMigration drives a migration through the daemon (which owns the
+// conversion gates), streaming each account's result as its RPC lands and
+// returning the aggregate response for the caller's summary and empty-pool
+// handling. A fleet request (account==0) fans out one Migrate RPC per account so
+// each gets the full per-account budget — a slow domain materialization cannot
+// starve later accounts of their window; account>0 issues a single RPC. No local
+// fuse-capability check: the daemon hosts the mounts, so a still-pure,
+// just-reinstalled CLI can drive a fuse daemon.
+func requestMigration(cmd *cobra.Command, m *pool.Manager, to string, account int, force bool) (*daemon.Response, error) {
 	cl, err := requireDaemon(m, "migration runs inside the daemon (it owns the conversion gates)")
 	if err != nil {
 		return nil, err
 	}
-	var acct *int
 	if account > 0 {
-		acct = &account
+		resp, err := cl.Migrate(&account, to, force)
+		if err != nil {
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
+		out := cmd.OutOrStdout()
+		for _, r := range resp.Migrations {
+			renderMigrationResult(out, r)
+		}
+		return resp, nil
 	}
-	resp, err := cl.Migrate(acct, to, force)
-	if err != nil {
-		return nil, fmt.Errorf("migrate: %w", err)
-	}
-	return resp, nil
+	return fleetMigrate(cmd, m, cl, to, force)
 }
 
-func renderMigrations(cmd *cobra.Command, resp *daemon.Response, toWord string, explicit bool) error {
+// fleetMigrate issues one Migrate RPC per account so each gets the full
+// per-account budget — the readiness gate inside each conversion is the settle
+// and the daemon loop stays sequential — streaming each result as it lands and
+// folding them into one aggregate response. An empty pool falls back to a single
+// all-accounts RPC so a passing gate still records the new-account default. A
+// machine-wide gate failure (an op-level error with no results) fails identically
+// for every account, so it surfaces once and stops the fan-out.
+func fleetMigrate(cmd *cobra.Command, m *pool.Manager, cl *daemon.Client, to string, force bool) (*daemon.Response, error) {
+	accts, err := m.Store.ListAccounts()
+	if err != nil {
+		return nil, fmt.Errorf("list accounts: %w", err)
+	}
+	if len(accts) == 0 {
+		return cl.Migrate(nil, to, force)
+	}
+	out := cmd.OutOrStdout()
+	agg := &daemon.Response{OK: true}
+	for _, a := range accts {
+		id := a.ID
+		resp, err := cl.Migrate(&id, to, force)
+		if err != nil {
+			return nil, fmt.Errorf("migrate acct-%02d: %w", id, err)
+		}
+		if !resp.OK && len(resp.Migrations) == 0 {
+			// Machine-wide gate failure — identical for every account, so surface
+			// it once and stop, keeping already-collected outcomes for the summary.
+			agg.OK = false
+			agg.Error = resp.Error
+			return agg, nil
+		}
+		for _, r := range resp.Migrations {
+			renderMigrationResult(out, r)
+			agg.Migrations = append(agg.Migrations, r)
+		}
+		if resp.Error != "" {
+			agg.OK = false
+			agg.Error = resp.Error
+		}
+	}
+	return agg, nil
+}
+
+// renderMigrationResult prints one account's outcome. Split from the summary so
+// the fleet fan-out can stream each result the moment its RPC lands.
+func renderMigrationResult(out io.Writer, r daemon.MigrationResult) {
+	name := fmt.Sprintf("acct-%02d (%s)", r.ID, accountName(r.Label))
+	switch r.Outcome {
+	case daemon.MigrationDone:
+		success(out, "%s %s → %s", name, r.From, r.To)
+	case daemon.MigrationAlready:
+		note(out, "%s already %s", name, r.To)
+	case daemon.MigrationBusy:
+		step(out, "%s skipped: %s", name, r.Detail)
+	case daemon.MigrationFailed:
+		step(out, "%s %s: %s", badStyle.Render("✗"), name, r.Detail)
+	}
+}
+
+// renderMigrationSummary tallies the (already-printed) results into the closing
+// lines and the exit-code error. resp.Error and per-account failures propagate;
+// an explicit single-account request that neither converted nor was already at
+// the target exits nonzero.
+func renderMigrationSummary(cmd *cobra.Command, resp *daemon.Response, toWord string, explicit bool) error {
 	out := cmd.OutOrStdout()
 	var done, already, busy, failed int
 	for _, r := range resp.Migrations {
-		name := fmt.Sprintf("acct-%02d (%s)", r.ID, accountName(r.Label))
 		switch r.Outcome {
 		case daemon.MigrationDone:
 			done++
-			success(out, "%s %s → %s", name, r.From, r.To)
 		case daemon.MigrationAlready:
 			already++
-			note(out, "%s already %s", name, r.To)
 		case daemon.MigrationBusy:
 			busy++
-			step(out, "%s skipped: %s", name, r.Detail)
 		case daemon.MigrationFailed:
 			failed++
-			step(out, "%s %s: %s", badStyle.Render("✗"), name, r.Detail)
 		}
 	}
 	if busy > 0 {

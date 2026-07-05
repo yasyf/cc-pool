@@ -481,7 +481,7 @@ func offerFPMigration(cmd *cobra.Command) error {
 			note(out, "Pool not set up yet — run `ccp add`, then `ccp migrate --to fileprovider`.")
 			return nil
 		}
-		resp, err := requestMigration(m, "fileprovider", 0, false)
+		resp, err := requestMigration(cmd, m, "fileprovider", 0, false)
 		if err != nil {
 			return err
 		}
@@ -492,6 +492,6 @@ func offerFPMigration(cmd *cobra.Command) error {
 			note(out, "No accounts to migrate; fileprovider is now the default for new accounts.")
 			return nil
 		}
-		return renderMigrations(cmd, resp, "fileprovider", false)
+		return renderMigrationSummary(cmd, resp, "fileprovider", false)
 	})
 }

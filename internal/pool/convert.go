@@ -40,6 +40,13 @@ func (m *Manager) canHostFuse() bool {
 // symlink paths destroys account state.
 var ErrConvertUnsupported = errors.New("overlay backend unavailable")
 
+// fpDomainProbe verifies a freshly registered File Provider domain actually
+// serves reads through the flipped account dir. Setup (fusekit) already blocks
+// until the domain enumerates; this proves the bridge data plane end to end
+// before the row flips — the readiness the FP-migrate-storm incident lacked. A
+// package var so convert tests can script the post-Setup data-plane verdict.
+var fpDomainProbe = overlay.FPDomainProbeWithin
+
 // ConvertOverlay switches an account's overlay provider, persisting the row last so
 // an interrupted run re-converges. MUST run inside the daemon, which alone gates
 // against live sessions; a failed conversion rolls back to the source backend's
@@ -260,7 +267,16 @@ func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fr
 		return a, rollback(fmt.Errorf("register domain: %w", err))
 	}
 
+	// An identity-bearing account: prove the domain serves reads and the moved
+	// identity is intact before the row flips. Identity-less accounts skip both —
+	// FPFS skips fetchContents at size 0, so a Missing/Empty domain read is
+	// expected and benign there, and there is no identity to verify.
 	if preErr == nil {
+		// Setup proved the appex enumerator; this proves the bridge data plane
+		// through the flipped dir — the readiness the wedge incident lacked.
+		if err := fpDomainProbe(dir); err != nil {
+			return a, rollback(fmt.Errorf("domain registered but does not serve reads: %w", err))
+		}
 		post, err := readIdentity(filepath.Join(priv, ".claude.json"))
 		if err != nil {
 			return a, rollback(fmt.Errorf("identity not readable in private root after conversion: %w", err))

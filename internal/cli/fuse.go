@@ -77,7 +77,7 @@ func runFuseEnable(cmd *cobra.Command) error {
 			note(out, "Pool not set up yet — run `ccp add`; new accounts will use the live mirror.")
 			return nil
 		}
-		resp, err := requestMigration(m, "fuse", 0, false)
+		resp, err := requestMigration(cmd, m, "fuse", 0, false)
 		if err != nil {
 			return err
 		}
@@ -88,7 +88,7 @@ func runFuseEnable(cmd *cobra.Command) error {
 			note(out, "No accounts to migrate; fuse is now the default for new accounts.")
 			return nil
 		}
-		return renderMigrations(cmd, resp, "fuse", false)
+		return renderMigrationSummary(cmd, resp, "fuse", false)
 	}); err != nil {
 		return err
 	}

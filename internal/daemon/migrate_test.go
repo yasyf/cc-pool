@@ -740,6 +740,88 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	}
 }
 
+// TestHandleMigrateConversionsNeverOverlap pins the sequential settle the fleet
+// fan-out relies on: handleMigrate converts one account at a time, so a slow
+// domain materialization never piles concurrent conversions onto the host — the
+// load that crushed fileproviderd in the migrate storm. An entrancy-recording
+// Setup (run outside the fake's lock) asserts the daemon never runs two
+// conversions at once, even with a widened window a real overlap would land in.
+func TestHandleMigrateConversionsNeverOverlap(t *testing.T) {
+	s, _, fake := newMigrateServer(t)
+	var inFlight, maxInFlight atomic.Int32
+	fake.setupFn = func(string, string) error {
+		n := inFlight.Add(1)
+		for {
+			old := maxInFlight.Load()
+			if n <= old || maxInFlight.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		inFlight.Add(-1)
+		return nil
+	}
+
+	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
+	if !resp.OK {
+		t.Fatalf("migrate failed: %s", resp.Error)
+	}
+	if got := outcomes(resp); got[1] != MigrationDone || got[2] != MigrationDone {
+		t.Fatalf("outcomes = %v, want both done", got)
+	}
+	if fake.setupCount() != 2 {
+		t.Fatalf("setups = %d, want 2 (both accounts converted)", fake.setupCount())
+	}
+	if got := maxInFlight.Load(); got != 1 {
+		t.Fatalf("max concurrent conversions = %d, want 1 — the fleet settle must stay sequential", got)
+	}
+}
+
+// TestConvertAccountForceStampsSessionCount pins the forced-migrate forensic
+// line: a conversion forced past the live-session gate records how many sessions
+// it happened under (the evidence this incident's diagnosis leaned on); an idle
+// forced conversion carries no line, and a failed scan is dropped silently
+// (observability, never a gate).
+func TestConvertAccountForceStampsSessionCount(t *testing.T) {
+	live := func(dir string) func(context.Context) ([]procscan.Session, error) {
+		return func(context.Context) ([]procscan.Session, error) {
+			return []procscan.Session{{PID: 4242, ConfigDir: dir}, {PID: 4243, ConfigDir: dir}}, nil
+		}
+	}
+	cases := map[string]struct {
+		scan       func(dir string) func(context.Context) ([]procscan.Session, error)
+		wantDetail string
+	}{
+		"live sessions stamp the count": {scan: live, wantDetail: "converted under 2 live session(s)"},
+		"idle carries no line": {
+			scan:       func(string) func(context.Context) ([]procscan.Session, error) { return func(context.Context) ([]procscan.Session, error) { return nil, nil } },
+			wantDetail: "",
+		},
+		"scan failure is silent": {
+			scan:       func(string) func(context.Context) ([]procscan.Session, error) { return func(context.Context) ([]procscan.Session, error) { return nil, errors.New("ps exploded") } },
+			wantDetail: "",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, dirs, _ := newMigrateServer(t)
+			a, err := s.m.Store.GetAccount(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.scanSessions = tc.scan(dirs[1])
+
+			res := s.convertAccount(t.Context(), a, fkoverlay.BackendNFS, true)
+			if res.Outcome != MigrationDone {
+				t.Fatalf("outcome = %s (%s), want done", res.Outcome, res.Detail)
+			}
+			if res.Detail != tc.wantDetail {
+				t.Fatalf("Detail = %q, want %q", res.Detail, tc.wantDetail)
+			}
+		})
+	}
+}
+
 // TestMigrateToSymlinkDefersUnderLiveSession: a retreat never yanks the mirror
 // from under a live claude; force means the user vouches the session is idle.
 func TestMigrateToSymlinkDefersUnderLiveSession(t *testing.T) {
