@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"8fa39716942d7fc5d078ff118554bf41ea61610c"}]}
+{"v":1,"lamport":4,"ops":[{"kind":"add_comment","body":"Replay CLEAN: 10/10 converted, zero storm lines, domains serving \u003c5s, 28-clean-recheck soak; chronology 13a7935e"}]}
