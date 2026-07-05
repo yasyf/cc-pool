@@ -330,7 +330,7 @@ func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Acco
 		report("file provider bridge", true, "")
 	} else {
 		report("file provider bridge", false,
-			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); domains cannot fetch computed content until it is up")
+			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); on first run macOS gates the app group container behind a one-time consent prompt: approve it, then restart the daemon; domains cannot fetch computed content until the socket is up")
 	}
 }
 

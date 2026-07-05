@@ -768,8 +768,15 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 	var out bytes.Buffer
 	checkStrandedPrivate(m, a, true, &out, report)
 
-	if !strings.Contains(out.String(), "discarded stale duplicate") {
-		t.Errorf("doctor heal output does not report the discarded duplicate: %q", out.String())
+	if !strings.Contains(out.String(), "quarantined at") {
+		t.Errorf("doctor heal output does not report the quarantined duplicate: %q", out.String())
+	}
+	quarantines, err := filepath.Glob(inDir + ".conflict-*")
+	if err != nil || len(quarantines) != 1 {
+		t.Fatalf("quarantine glob = %v, %v; want exactly one", quarantines, err)
+	}
+	if got, err := os.ReadFile(quarantines[0]); err != nil || string(got) != "stale-in-dir" {
+		t.Errorf("quarantined loser = %q, %v; want stale-in-dir", got, err)
 	}
 	healed := false
 	for _, c := range *calls {
