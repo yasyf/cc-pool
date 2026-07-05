@@ -41,8 +41,9 @@ var usernameRE = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
 const fallbackAccount = "claude-code-user"
 
-// ErrNotFound is returned when the requested Keychain item does not exist.
-var ErrNotFound = errors.New("keychain item not found")
+// ErrNotFound is returned when a store holds no credential; both the Keychain
+// and file backends share it, so its text names neither.
+var ErrNotFound = errors.New("credential not found")
 
 // ServiceName derives the Keychain service name Claude Code uses for a given
 // explicit CLAUDE_CONFIG_DIR value. The derivation, verbatim from the binary:

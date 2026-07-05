@@ -245,6 +245,8 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 			WeeklyExhausted: a.WeeklyExhausted,
 			Components:      a.Components,
 		}
+		// Display fields only: the wire carries no keychain fields, so credential
+		// operations must re-load the account from the store (statusTUI.resolveAccount).
 		s.Account.ID = a.ID
 		s.Account.ConfigDir = a.ConfigDir
 		s.Account.Label = a.Label

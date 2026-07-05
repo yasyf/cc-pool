@@ -53,7 +53,7 @@ func (m *Manager) ReadCredential(a store.Account) (*creds.Credential, creds.Sour
 			return nil, creds.SourceKeychain, p.err
 		}
 	}
-	return nil, creds.SourceKeychain, creds.ErrNotFound
+	return nil, creds.SourceKeychain, fmt.Errorf("no credential in the Keychain or credential file: %w", creds.ErrNotFound)
 }
 
 // writeCred upserts cred on the backend src names.

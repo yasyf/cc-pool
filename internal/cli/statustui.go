@@ -65,6 +65,10 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 			cred, _, err := m.ReadCredential(a)
 			return cred, err
 		},
+		resolveAccount: m.Store.GetAccount,
+		checkFresh: func(a store.Account) (bool, error) {
+			return shortCircuitRelogin(ctx, m, a)
+		},
 	}
 	p := tea.NewProgram(model,
 		tea.WithContext(ctx),
@@ -91,18 +95,22 @@ type statusTUI struct {
 	buildLogin  func(a store.Account) (*exec.Cmd, error)
 	finishLogin func(a store.Account) error
 	readCred    func(a store.Account) (*creds.Credential, error) // credential resolution for the re-login probe (both backends)
-	snaps       []pool.Snapshot
-	pin         dirPin
-	cursorID    int
-	width       int
-	height      int
-	err         error
-	pinErr      error
-	pinBusy     bool
-	reloginErr  error
-	reloginBusy bool
-	lastUpdate  time.Time
-	quitting    bool
+	// resolveAccount re-loads the account from the store: wire snapshots carry
+	// no keychain fields, so credential operations must never use s.Account.
+	resolveAccount func(id int) (store.Account, error)
+	checkFresh     func(a store.Account) (bool, error) // needs-login short-circuit: a login that already landed
+	snaps          []pool.Snapshot
+	pin            dirPin
+	cursorID       int
+	width          int
+	height         int
+	err            error
+	pinErr         error
+	pinBusy        bool
+	reloginErr     error
+	reloginBusy    bool
+	lastUpdate     time.Time
+	quitting       bool
 }
 
 type (
@@ -112,6 +120,8 @@ type (
 	}
 	errMsg     struct{ err error }
 	pinDoneMsg struct{ err error }
+	// reloginStartMsg starts the interactive login after the short-circuit check passed on it.
+	reloginStartMsg struct{ account store.Account }
 	// reloginExitedMsg fires after claude /login exits and the terminal is back under the TUI.
 	reloginExitedMsg struct{ account store.Account }
 	reloginDoneMsg   struct{ err error }
@@ -173,6 +183,28 @@ func (t statusTUI) finishReloginCmd(a store.Account) tea.Cmd {
 	}
 }
 
+// startReloginCmd resolves the store account off the event loop, then lets a
+// login that already landed clear the needs-login flag without spawning
+// claude; otherwise the interactive login starts.
+func (t statusTUI) startReloginCmd(id int) tea.Cmd {
+	return func() tea.Msg {
+		a, err := t.resolveAccount(id)
+		if err != nil {
+			return reloginDoneMsg{err: err}
+		}
+		if t.checkFresh != nil {
+			cleared, err := t.checkFresh(a)
+			if err != nil {
+				return reloginDoneMsg{err: err}
+			}
+			if cleared {
+				return reloginDoneMsg{}
+			}
+		}
+		return reloginStartMsg{account: a}
+	}
+}
+
 func tickCmd() tea.Cmd {
 	return tea.Tick(statusRefreshInterval, func(tm time.Time) tea.Msg { return tickMsg(tm) })
 }
@@ -209,21 +241,12 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return t, t.togglePinCmd(t.current().Account.ID)
 		case "a":
 			s := t.current()
-			if len(t.snaps) == 0 || t.reloginBusy || t.buildLogin == nil || !reloginable(s) {
-				return t, nil
-			}
-			c, err := t.buildLogin(s.Account)
-			if err != nil {
-				t.reloginErr = err
+			if len(t.snaps) == 0 || t.reloginBusy || t.buildLogin == nil || t.resolveAccount == nil || !reloginable(s) {
 				return t, nil
 			}
 			t.reloginBusy = true
 			t.reloginErr = nil
-			a := s.Account
-			wl := &watchedLogin{ctx: t.ctx, cmd: c, read: func() (*creds.Credential, error) {
-				return t.readCred(a)
-			}}
-			return t, tea.Exec(wl, func(error) tea.Msg { return reloginExitedMsg{account: a} })
+			return t, t.startReloginCmd(s.Account.ID)
 		}
 		return t, nil
 	case snapsMsg:
@@ -244,6 +267,18 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return t, nil
 		}
 		return t, t.refreshCmd()
+	case reloginStartMsg:
+		c, err := t.buildLogin(msg.account)
+		if err != nil {
+			t.reloginBusy = false
+			t.reloginErr = err
+			return t, nil
+		}
+		a := msg.account
+		wl := &watchedLogin{ctx: t.ctx, cmd: c, read: func() (*creds.Credential, error) {
+			return t.readCred(a)
+		}}
+		return t, tea.Exec(wl, func(error) tea.Msg { return reloginExitedMsg{account: a} })
 	case reloginExitedMsg:
 		return t, t.finishReloginCmd(msg.account)
 	case reloginDoneMsg:

@@ -233,14 +233,19 @@ func TestStatusTUIViewShowsPin(t *testing.T) {
 }
 
 type fakeLogin struct {
-	built     []int
-	finished  []int
-	buildErr  error
-	finishErr error
+	built      []store.Account
+	finished   []int
+	resolved   []int
+	fresh      []store.Account
+	buildErr   error
+	finishErr  error
+	resolveErr error
+	freshDone  bool
+	freshErr   error
 }
 
 func (f *fakeLogin) build(a store.Account) (*exec.Cmd, error) {
-	f.built = append(f.built, a.ID)
+	f.built = append(f.built, a)
 	if f.buildErr != nil {
 		return nil, f.buildErr
 	}
@@ -253,14 +258,30 @@ func (f *fakeLogin) finish(a store.Account) error {
 	return f.finishErr
 }
 
+// resolve returns the store-shaped account — keychain fields populated —
+// unlike the wire-derived snapshot accounts the TUI renders.
+func (f *fakeLogin) resolve(id int) (store.Account, error) {
+	f.resolved = append(f.resolved, id)
+	if f.resolveErr != nil {
+		return store.Account{}, f.resolveErr
+	}
+	return store.Account{ID: id, KeychainService: fmt.Sprintf("svc-%02d", id), KeychainAccount: "user"}, nil
+}
+
+func (f *fakeLogin) checkFresh(a store.Account) (bool, error) {
+	f.fresh = append(f.fresh, a)
+	return f.freshDone, f.freshErr
+}
+
 func reloginTUI(fl *fakeLogin) statusTUI {
 	healthy := pool.Snapshot{Account: store.Account{ID: 1, Label: "alice@example.com"}, Score: 90, HasUsage: true}
 	stale := pool.Snapshot{Account: store.Account{ID: 2, Label: "bob@example.com"}, Score: 50, HasUsage: true, NeedsLogin: true}
 	return statusTUI{
-		snaps:       []pool.Snapshot{healthy, stale},
-		cursorID:    2,
-		buildLogin:  fl.build,
-		finishLogin: fl.finish,
+		snaps:          []pool.Snapshot{healthy, stale},
+		cursorID:       2,
+		buildLogin:     fl.build,
+		finishLogin:    fl.finish,
+		resolveAccount: fl.resolve,
 	}
 }
 
@@ -274,6 +295,19 @@ func pressA(t *testing.T, tui statusTUI) (statusTUI, tea.Cmd) {
 	return out, cmd
 }
 
+// startLogin runs the async start Cmd pressA returned and feeds its
+// reloginStartMsg back through Update, returning the tea.Exec Cmd.
+func startLogin(t *testing.T, tui statusTUI, cmd tea.Cmd) (statusTUI, tea.Cmd) {
+	t.Helper()
+	msg := cmd()
+	start, ok := msg.(reloginStartMsg)
+	if !ok {
+		t.Fatalf("start msg = %#v, want reloginStartMsg", msg)
+	}
+	model, execCmd := tui.Update(start)
+	return model.(statusTUI), execCmd
+}
+
 // TestStatusTUIReloginAction drives the 'a' re-login key end to end.
 func TestStatusTUIReloginAction(t *testing.T) {
 	bob := store.Account{ID: 2, Label: "bob@example.com"}
@@ -284,8 +318,20 @@ func TestStatusTUIReloginAction(t *testing.T) {
 		if !tui.reloginBusy || cmd == nil {
 			t.Fatalf("a must mark busy and return a Cmd: busy=%v cmd=%v", tui.reloginBusy, cmd)
 		}
-		if len(fl.built) != 1 || fl.built[0] != 2 {
-			t.Fatalf("buildLogin calls = %v, want [2]", fl.built)
+		tui, execCmd := startLogin(t, tui, cmd)
+		if execCmd == nil {
+			t.Fatal("reloginStartMsg must return the exec Cmd")
+		}
+		if len(fl.resolved) != 1 || fl.resolved[0] != 2 {
+			t.Fatalf("resolveAccount calls = %v, want [2]", fl.resolved)
+		}
+		if len(fl.built) != 1 || fl.built[0].ID != 2 {
+			t.Fatalf("buildLogin calls = %v, want account 2", fl.built)
+		}
+		// The regression this flow pins: the login must run on the store-resolved
+		// account, never the wire snapshot (whose keychain fields are empty).
+		if fl.built[0].KeychainService != "svc-02" {
+			t.Fatalf("buildLogin got keychain service %q, want the store-resolved svc-02", fl.built[0].KeychainService)
 		}
 		model, finish := tui.Update(reloginExitedMsg{account: bob})
 		tui = model.(statusTUI)
@@ -342,27 +388,126 @@ func TestStatusTUIReloginAction(t *testing.T) {
 				Stale:       true,
 				RateLimited: true,
 			}},
-			cursorID:    7,
-			buildLogin:  fl.build,
-			finishLogin: fl.finish,
+			cursorID:       7,
+			buildLogin:     fl.build,
+			finishLogin:    fl.finish,
+			resolveAccount: fl.resolve,
 		}
 		got, cmd := pressA(t, tui)
 		if !got.reloginBusy || cmd == nil {
 			t.Fatalf("a on a stale rate-limited account must not be inert: busy=%v cmd=%v", got.reloginBusy, cmd)
 		}
-		if len(fl.built) != 1 || fl.built[0] != 7 {
-			t.Fatalf("buildLogin calls = %v, want [7]", fl.built)
+		_, execCmd := startLogin(t, got, cmd)
+		if execCmd == nil {
+			t.Fatal("reloginStartMsg must return the exec Cmd")
+		}
+		if len(fl.built) != 1 || fl.built[0].ID != 7 {
+			t.Fatalf("buildLogin calls = %v, want account 7", fl.built)
 		}
 	})
 
 	t.Run("build error surfaces without starting a login", func(t *testing.T) {
 		fl := &fakeLogin{buildErr: errors.New("`claude` not found on PATH")}
 		tui, cmd := pressA(t, reloginTUI(fl))
-		if cmd != nil {
+		if cmd == nil {
+			t.Fatal("a must return the start Cmd")
+		}
+		msg := cmd()
+		model, execCmd := tui.Update(msg)
+		tui = model.(statusTUI)
+		if execCmd != nil {
 			t.Fatal("a build error must not start a login")
 		}
 		if tui.reloginBusy || tui.reloginErr == nil {
 			t.Fatalf("build error must stay un-busy and record the error: busy=%v err=%v", tui.reloginBusy, tui.reloginErr)
+		}
+	})
+
+	t.Run("resolver error surfaces without starting a login", func(t *testing.T) {
+		fl := &fakeLogin{resolveErr: errors.New("database is locked")}
+		tui, cmd := pressA(t, reloginTUI(fl))
+		if !tui.reloginBusy || cmd == nil {
+			t.Fatalf("a must mark busy and return a Cmd: busy=%v cmd=%v", tui.reloginBusy, cmd)
+		}
+		msg := cmd()
+		done, ok := msg.(reloginDoneMsg)
+		if !ok || done.err == nil {
+			t.Fatalf("msg = %#v, want failed reloginDoneMsg", msg)
+		}
+		model, _ := tui.Update(done)
+		tui = model.(statusTUI)
+		if tui.reloginBusy || tui.reloginErr == nil {
+			t.Fatalf("resolver error must clear busy and record the error: busy=%v err=%v", tui.reloginBusy, tui.reloginErr)
+		}
+		if len(fl.built) != 0 {
+			t.Fatalf("resolver error must not build a login: %v", fl.built)
+		}
+	})
+
+	t.Run("nil resolver is inert", func(t *testing.T) {
+		fl := &fakeLogin{}
+		tui := reloginTUI(fl)
+		tui.resolveAccount = nil
+		if _, cmd := pressA(t, tui); cmd != nil {
+			t.Fatal("a without a resolver must be inert")
+		}
+	})
+}
+
+// TestStatusTUIReloginShortCircuit: a needs-login account whose credential
+// already landed clears without spawning claude; anything else logs in.
+func TestStatusTUIReloginShortCircuit(t *testing.T) {
+	t.Run("already-fresh credential skips the login", func(t *testing.T) {
+		fl := &fakeLogin{freshDone: true}
+		tui := reloginTUI(fl)
+		tui.checkFresh = fl.checkFresh
+		tui, cmd := pressA(t, tui)
+		msg := cmd()
+		done, ok := msg.(reloginDoneMsg)
+		if !ok || done.err != nil {
+			t.Fatalf("msg = %#v, want clean reloginDoneMsg", msg)
+		}
+		if len(fl.fresh) != 1 || fl.fresh[0].KeychainService != "svc-02" {
+			t.Fatalf("checkFresh calls = %v, want the store-resolved account", fl.fresh)
+		}
+		if len(fl.built) != 0 {
+			t.Fatalf("short-circuit must not build a login: %v", fl.built)
+		}
+		model, refresh := tui.Update(done)
+		tui = model.(statusTUI)
+		if tui.reloginBusy || tui.reloginErr != nil || refresh == nil {
+			t.Fatalf("short-circuit must clear busy and refresh: busy=%v err=%v refresh=%v", tui.reloginBusy, tui.reloginErr, refresh)
+		}
+	})
+
+	t.Run("not-fresh proceeds to the login", func(t *testing.T) {
+		fl := &fakeLogin{freshDone: false}
+		tui := reloginTUI(fl)
+		tui.checkFresh = fl.checkFresh
+		tui, cmd := pressA(t, tui)
+		_, execCmd := startLogin(t, tui, cmd)
+		if execCmd == nil || len(fl.built) != 1 {
+			t.Fatalf("not-fresh must start the login: exec=%v built=%v", execCmd, fl.built)
+		}
+	})
+
+	t.Run("check error surfaces without a login", func(t *testing.T) {
+		fl := &fakeLogin{freshErr: errors.New("database is locked")}
+		tui := reloginTUI(fl)
+		tui.checkFresh = fl.checkFresh
+		tui, cmd := pressA(t, tui)
+		msg := cmd()
+		done, ok := msg.(reloginDoneMsg)
+		if !ok || done.err == nil {
+			t.Fatalf("msg = %#v, want failed reloginDoneMsg", msg)
+		}
+		model, refresh := tui.Update(done)
+		tui = model.(statusTUI)
+		if tui.reloginBusy || tui.reloginErr == nil || refresh != nil {
+			t.Fatalf("check error must surface and not refresh: busy=%v err=%v refresh=%v", tui.reloginBusy, tui.reloginErr, refresh)
+		}
+		if len(fl.built) != 0 {
+			t.Fatalf("check error must not build a login: %v", fl.built)
 		}
 	})
 }

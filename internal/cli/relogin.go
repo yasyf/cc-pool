@@ -2,9 +2,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/creds"
@@ -12,6 +15,11 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"golang.org/x/term"
 )
+
+// finishReloginGrace bounds the post-exit credential re-probe: a user quitting
+// claude within a poll tick of the write must not read as a failed login. A
+// var so tests shrink it.
+var finishReloginGrace = 2 * time.Second
 
 func newLoginCmd() *cobra.Command {
 	return &cobra.Command{
@@ -46,12 +54,28 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	if err != nil {
 		return err
 	}
+
+	out := cmd.OutOrStdout()
+	cleared, err := shortCircuitRelogin(cmd.Context(), m, a)
+	if err != nil {
+		return err
+	}
+	if cleared {
+		// Same hygiene as the interactive path below: the cross-session login that
+		// makes the short-circuit fire is exactly what strands a stale copy on the
+		// other backend.
+		if err := m.DropDivergentCopy(cmd.Context(), a); err != nil {
+			note(out, "couldn't remove a stale credential copy on the other backend: %v — run `ccp doctor`.", err)
+		}
+		success(out, "%s already has a valid credential — cleared needs-login. Run `ccp login %d` again to switch subscriptions.", accountName(a.Label), a.ID)
+		return nil
+	}
+
 	c, err := loginCommand(a.ConfigDir)
 	if err != nil {
 		return err
 	}
 
-	out := cmd.OutOrStdout()
 	note(out, "Logging in %s — complete the login; cc-pool closes claude once it lands (or exit claude yourself).", accountName(a.Label))
 
 	fd := int(os.Stdin.Fd())
@@ -101,12 +125,71 @@ func loginCommand(configDir string) (*exec.Cmd, error) {
 	return c, nil
 }
 
+// forcedRefreshHorizon makes EnsureFreshToken treat any expiry as imminent, so
+// the short-circuit always exercises the refresh chain.
+const forcedRefreshHorizon = time.Duration(math.MaxInt64)
+
+// shortCircuitRelogin clears a stale needs-login flag when a login that already
+// landed left a live credential. Liveness is proven by a forced refresh through
+// the daemon-proven rotate-and-persist path — never by the access token, which
+// can carry hours of life on a revoked refresh chain (the daemon flags on
+// proactive refresh failure). Anything unproven reports false so the
+// interactive login proceeds.
+func shortCircuitRelogin(ctx context.Context, m *pool.Manager, a store.Account) (bool, error) {
+	h, err := m.Store.GetAuthHealth(a.ID)
+	if err != nil {
+		return false, fmt.Errorf("auth health for %s: %w", accountName(a.Label), err)
+	}
+	if !h.NeedsLogin {
+		return false, nil
+	}
+	// No AdoptRotatedToken here: the refresh's own persist already wrote the
+	// credential under our ACL — only claude-written credentials (via /login)
+	// need re-asserting.
+	_, refreshed, err := m.EnsureFreshToken(ctx, a, forcedRefreshHorizon, true)
+	if err != nil || !refreshed {
+		return false, nil
+	}
+	if _, err := m.Store.ClearNeedsLogin(a.ID); err != nil {
+		return false, fmt.Errorf("clear needs-login for %s: %w", accountName(a.Label), err)
+	}
+	return true, nil
+}
+
+// awaitUsableCred re-probes read until a usable credential lands or grace
+// expires — claude's exit can beat its credential write by a poll tick. An
+// ErrUnavailable read is unknown state and fails immediately.
+func awaitUsableCred(ctx context.Context, read credReader, grace, interval time.Duration) (*creds.Credential, error) {
+	deadline := time.Now().Add(grace)
+	for {
+		cred, err := read()
+		switch {
+		case errors.Is(err, creds.ErrUnavailable):
+			return nil, err
+		case err == nil && cred.HasRefreshToken() && !cred.Expired():
+			return cred, nil
+		}
+		if time.Now().After(deadline) {
+			return cred, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
 func finishRelogin(ctx context.Context, m *pool.Manager, a store.Account) error {
 	// Fail closed: an unusable credential means the login didn't land; the
 	// daemon would re-flag on its next poll anyway. A read failure keeps its
 	// cause: an unsearchable Keychain (creds.ErrUnavailable) is unknown state,
 	// not a failed login.
-	cred, _, err := m.ReadCredential(a)
+	read := func() (*creds.Credential, error) {
+		cred, _, err := m.ReadCredential(a)
+		return cred, err
+	}
+	cred, err := awaitUsableCred(ctx, read, finishReloginGrace, loginPollInterval)
 	if err != nil {
 		return fmt.Errorf("read %s's credential after login: %w — run `ccp login %d` again", accountName(a.Label), err, a.ID)
 	}
