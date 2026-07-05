@@ -22,6 +22,14 @@ cask "cc-pool-status" do
 
   app "CCPoolStatus.app"
 
+  postflight do
+    # An upgrade quits the running app while installing the fresh copy; relaunch
+    # it in the background so the widget and the File Provider extension come
+    # back without a manual reopen. Best-effort — a headless/no-GUI-session
+    # install must not fail the cask over a convenience relaunch.
+    system_command "/usr/bin/open", args: ["-g", "#{appdir}/CCPoolStatus.app"], must_succeed: false
+  end
+
   uninstall quit: "com.yasyf.cc-pool.status"
 
   zap trash: [
@@ -33,5 +41,9 @@ cask "cc-pool-status" do
     Launch the app once so macOS discovers the widget:
       open -ga CCPoolStatus
     Then: Notification Center (click the menu-bar clock) → Edit Widgets → "cc-pool".
+
+    For the File Provider overlay, run the guided setup:
+      ccp fp onboard
+    Health checks any time: ccp doctor
   EOS
 end

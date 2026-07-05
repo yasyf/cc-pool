@@ -55,6 +55,7 @@ func newDoctorCmd() *cobra.Command {
 
 				var cachedHolder *daemon.HolderStatus
 				var contentHealth string
+				var fpConsentPending bool
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
 					report("daemon", true, resp.Version)
 					// Pending-TCC guidance and content-source health live only
@@ -62,6 +63,7 @@ func newDoctorCmd() *cobra.Command {
 					if sresp, serr := daemon.NewClient().Status(); serr == nil && sresp.OK {
 						cachedHolder = sresp.Holder
 						contentHealth = sresp.ContentHealth
+						fpConsentPending = sresp.FPConsentPending
 					}
 				} else {
 					report("daemon", false, "not running; run `ccp service install`")
@@ -96,7 +98,7 @@ func newDoctorCmd() *cobra.Command {
 				reportStaleSessions(accts, holderMounts, sessions, report)
 				reportOrphanedHolder(cmd.Context(), reachable, accts, report)
 
-				reportFileProvider(cmd.Context(), m, accts, report)
+				reportFileProvider(cmd.Context(), m, accts, fpConsentPending, report)
 				reportContentHealth(contentHealth, report)
 
 				for _, a := range accts {
@@ -304,8 +306,10 @@ func countFileProvider(accts []store.Account) int {
 // rows is silent — File Provider is opt-in, so an absent extension there is
 // the norm, not drift. With rows, an absent extension is the root fault and
 // the socket probes are skipped: they cannot say anything the enablement line
-// doesn't.
-func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Account, report func(string, bool, string)) {
+// doesn't. consentPending is the daemon's precise "bridge bind parked on the
+// app-group-container TCC prompt" signal; when set, the bridge rung names that
+// exact fault instead of the generic dead-socket guidance.
+func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Account, consentPending bool, report func(string, bool, string)) {
 	fpRows := countFileProvider(accts)
 	if !fpAvailable(m.OverlaySpec()) {
 		if fpRows == 0 {
@@ -313,7 +317,7 @@ func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Acco
 		}
 		en := fkoverlay.BackendFileProvider.Enablement()
 		report("file provider extension", false, fmt.Sprintf(
-			"not enabled with %s — install %s if missing, then: %s",
+			"not enabled with %s — run `ccp fp onboard` for the guided setup (install %s if missing, then: %s)",
 			plural(fpRows, "fileprovider account"), pool.WidgetAppPath(), en.Guidance,
 		))
 		return
@@ -328,11 +332,15 @@ func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Acco
 	} else {
 		report("file provider app", true, ver)
 	}
-	if fpBridgeReachable() {
+	switch {
+	case fpBridgeReachable():
 		report("file provider bridge", true, "")
-	} else {
+	case consentPending:
 		report("file provider bridge", false,
-			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); on first run macOS gates the app group container behind a one-time consent prompt: approve it, then restart the daemon; domains cannot fetch computed content until the socket is up")
+			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon reports its bind parked on the one-time app group container consent prompt (macOS re-asks after every upgrade, and launchd never surfaces it): approve it, then restart the daemon (`brew services restart cc-pool`) — `ccp fp onboard` walks this end to end")
+	default:
+		report("file provider bridge", false,
+			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); on first run macOS gates the app group container behind a one-time consent prompt: approve it, then restart the daemon; domains cannot fetch computed content until the socket is up — run `ccp fp onboard` for the guided setup")
 	}
 }
 

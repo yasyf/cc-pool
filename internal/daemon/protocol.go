@@ -250,8 +250,14 @@ type Response struct {
 	// injected settings.json) it serves over the holder and File Provider
 	// bridges, "; "-separated; "" when every domain's content is healthy.
 	// Status only.
-	ContentHealth string            `json:"content_health,omitempty"`
-	Version       string            `json:"version,omitempty"`    // health
-	Migrations    []MigrationResult `json:"migrations,omitempty"` // migrate/credmove
-	SoonestReset  *time.Time        `json:"soonest_reset,omitempty"`
+	ContentHealth string `json:"content_health,omitempty"`
+	// FPConsentPending: the daemon's File Provider bridge bind has not
+	// completed while the daemon is alive — the signature of the app-group-
+	// container TCC consent (cdhash-keyed, so macOS re-prompts after every
+	// upgrade, and launchd never surfaces the prompt). Approve it, then
+	// restart the daemon. Additive; status only.
+	FPConsentPending bool              `json:"fp_consent_pending,omitempty"`
+	Version          string            `json:"version,omitempty"`    // health
+	Migrations       []MigrationResult `json:"migrations,omitempty"` // migrate/credmove
+	SoonestReset     *time.Time        `json:"soonest_reset,omitempty"`
 }

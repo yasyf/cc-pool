@@ -225,10 +225,12 @@ func TestFPBridgeSharesSourceAndSerializesWrites(t *testing.T) {
 	s.wg.Wait()
 }
 
-// TestStartFPBridgeBindsUnconditionally pins the dropped container gate: the FP
-// socket now lives in cc-pool's own state dir, so startFPBridge creates the dir
-// and binds without any group-container fixture, exactly as the holder bridge
-// binds bridge.sock.
+// TestStartFPBridgeBindsUnconditionally pins the ungated bind: the FP socket
+// lives in the App Group container (pool.FPBridgeSocketPath), and startFPBridge
+// creates that dir itself and binds with no pre-existing container fixture —
+// the TCC consent gating the real container is macOS state, never a code-level
+// precondition. A prompt-free bind must also leave the consent-pending flag
+// clear.
 func TestStartFPBridgeBindsUnconditionally(t *testing.T) {
 	shortHome(t)
 	s := &Server{
@@ -241,7 +243,102 @@ func TestStartFPBridgeBindsUnconditionally(t *testing.T) {
 	s.startFPBridge(ctx)
 
 	if !content.NewBridgeClient(pool.FPBridgeSocketPath()).Available() {
-		t.Fatalf("FP bridge not up after startFPBridge with no group container")
+		t.Fatalf("FP bridge not up after startFPBridge with no pre-existing group container dir")
+	}
+	if s.fpConsentPending.Load() {
+		t.Fatal("consent-pending flagged on a clean bind")
+	}
+	cancel()
+	s.wg.Wait()
+}
+
+// TestStartFPBridgeFlagsConsentPending pins the group-container-consent signal:
+// with the container MkdirAll failing with a PERMISSION error (the TCC
+// denied/parked signature — a non-writable parent stands in) while the daemon
+// stays alive, startFPBridge flags fpConsentPending and the status wire carries
+// the additive fp_consent_pending field; once the bind lands (write is restored
+// and the serve loop's retry binds), the watchdog clears the flag — and the
+// omitempty field disappears from the wire again.
+func TestStartFPBridgeFlagsConsentPending(t *testing.T) {
+	shortHome(t)
+	sock := pool.FPBridgeSocketPath()
+	groupContainers := filepath.Dir(filepath.Dir(sock))
+	if err := os.MkdirAll(groupContainers, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// No write bit: MkdirAll of the container subdir fails with EACCES, the
+	// permission signature the consent signal keys on.
+	if err := os.Chmod(groupContainers, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(groupContainers, 0o700) })
+	s := &Server{
+		log:             log.New(io.Discard, "", 0),
+		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
+		fpBridgeBackoff: 25 * time.Millisecond,
+		fpBridgeWait:    50 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.startFPBridge(ctx)
+
+	if !s.fpConsentPending.Load() {
+		t.Fatal("bind blocked on a permission error but consent-pending is not flagged")
+	}
+	wire, err := json.Marshal(Response{OK: true, FPConsentPending: s.fpConsentPending.Load()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wire), `"fp_consent_pending":true`) {
+		t.Fatalf("status wire missing the additive consent field: %s", wire)
+	}
+
+	// "Consent" lands: write is restored, the serve loop's next retry creates
+	// the container and binds, and the watchdog clears the flag.
+	if err := os.Chmod(groupContainers, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "the retry to bind once the container is creatable", content.NewBridgeClient(sock).Available)
+	waitFor(t, 2*time.Second, "the watchdog to clear consent-pending", func() bool { return !s.fpConsentPending.Load() })
+
+	wire, err = json.Marshal(Response{OK: true, FPConsentPending: s.fpConsentPending.Load()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(wire), "fp_consent_pending") {
+		t.Fatalf("cleared consent flag still on the wire: %s", wire)
+	}
+
+	cancel()
+	s.wg.Wait()
+}
+
+// TestStartFPBridgeGenuineErrorNotConsent pins that a NON-permission bind
+// failure (a plain file squatting where the container dir belongs → ENOTDIR)
+// is not mislabeled as the consent prompt: the serve loop logs the real cause
+// and fpConsentPending stays clear.
+func TestStartFPBridgeGenuineErrorNotConsent(t *testing.T) {
+	shortHome(t)
+	sock := pool.FPBridgeSocketPath()
+	if err := os.MkdirAll(filepath.Dir(filepath.Dir(sock)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Dir(sock), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{
+		log:             log.New(io.Discard, "", 0),
+		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
+		fpBridgeBackoff: 25 * time.Millisecond,
+		fpBridgeWait:    50 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.startFPBridge(ctx)
+
+	if s.fpConsentPending.Load() {
+		t.Fatal("a genuine (non-permission) bind failure was mislabeled as consent-pending")
 	}
 	cancel()
 	s.wg.Wait()

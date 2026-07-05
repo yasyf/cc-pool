@@ -120,10 +120,10 @@ func TestMigrateToValidation(t *testing.T) {
 			to:      "granite",
 			wantErr: []string{`unknown overlay kind "granite"`, "want fuse, symlink, or fileprovider"},
 		},
-		"fileprovider without the extension carries install guidance": {
+		"fileprovider without the extension points at the guided onboard": {
 			to:      "fileprovider",
 			avail:   false,
-			wantErr: []string{"fileprovider is not available", pool.FPExtensionBundleID, pool.WidgetAppPath()},
+			wantErr: []string{"fileprovider is not available", pool.FPExtensionBundleID, pool.WidgetAppPath(), "ccp fp onboard"},
 		},
 		"fileprovider accepted when the extension is enabled": {
 			to:     "fileprovider",

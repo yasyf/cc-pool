@@ -33,47 +33,83 @@ func fpBackedRow(overlayKind string) bool {
 // serve loop exits abnormally (a restart race with a stale peer, say).
 const defaultFPBridgeBackoff = 5 * time.Second
 
+// defaultFPBridgeWait bounds startFPBridge's synchronous wait for the socket to
+// accept before it flags the bind as parked on the group-container consent.
+const defaultFPBridgeWait = 3 * time.Second
+
+// fpConsentWatchInterval paces the consent watchdog's poll for a late bind.
+const fpConsentWatchInterval = 250 * time.Millisecond
+
 // startFPBridge binds the daemon's second content.BridgeServer on the File
 // Provider data socket the sandboxed extension dials for computed content — the
 // sibling of startContentBridge, sharing the SAME PoolContentSource instance
 // (the Source contract requires concurrency safety, and the write-through mutex
 // is package-level, so write-throughs serialize across both servers in this one
-// process). The socket now lives in ~/.cc-pool (see pool.FPBridgeSocketPath),
-// which the daemon owns and always exists, so — unlike a group-container socket
-// behind macOS 15+ TCC — the bind is unconditional, exactly as startContentBridge
-// binds the holder socket. Like its sibling it waits for the socket to accept,
-// so an FP Setup's first enumeration finds the bridge up; unlike its sibling the
-// serve loop RETRIES on abnormal exit (serveFPBridge), so a transient bind
-// failure self-heals instead of leaving every FP domain dead until a daemon
-// restart. The loop runs until ctx is cancelled, tracked by wg.
+// process). The socket lives in the App Group container (pool.FPBridgeSocketPath)
+// — the one location both the sandboxed appex and the daemon may touch — which
+// macOS gates behind a TCC consent keyed to the daemon's cdhash, so the first
+// bind after every install or upgrade can park on a prompt launchd never
+// surfaces. The container MkdirAll therefore runs inside the tracked serve loop
+// (serveFPBridge), which retries abnormal exits, and startFPBridge waits only a
+// bounded fpBridgeWait for the socket to accept (so an FP Setup's first
+// enumeration finds the bridge up); if it doesn't come up in time while the
+// daemon is alive, that consent-pending signature is flagged on fpConsentPending
+// for status/doctor and a watchdog clears it the moment the socket lands. All
+// goroutines run until ctx is cancelled, tracked by wg.
 func (s *Server) startFPBridge(ctx context.Context) {
 	sock := pool.FPBridgeSocketPath()
-	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
-		s.log.Printf("file provider bridge: create socket dir: %v", err)
-		return
-	}
 	bridge := &content.BridgeServer{Socket: sock, Source: s.contentSource, Version: version.String(), Log: s.log}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		s.serveFPBridge(ctx, bridge, sock)
 	}()
+	wait := s.fpBridgeWait
+	if wait <= 0 {
+		wait = defaultFPBridgeWait
+	}
 	cl := content.NewBridgeClient(sock)
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil || cl.Available() {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	s.log.Printf("file provider bridge: socket %s did not come up within 3s; enumerations may defer until it does", sock)
+	if s.fpBridgeHardErr.Load() {
+		// A genuine bind failure is already logged with its cause by
+		// serveFPBridge's retry loop; do not mislabel it as consent-pending.
+		return
+	}
+	s.log.Printf("file provider bridge: socket %s did not come up within %s — likely awaiting the one-time app-group-container consent (approve it, then restart the daemon); enumerations defer until it is up", sock, wait)
+	s.fpConsentPending.Store(true)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(fpConsentWatchInterval):
+			}
+			if cl.Available() {
+				s.fpConsentPending.Store(false)
+				s.log.Printf("file provider bridge: socket %s is up", sock)
+				return
+			}
+		}
+	}()
 }
 
 // serveFPBridge runs the FP bridge and, unlike the holder content bridge,
 // retries with a capped backoff: every FP domain's computed content depends on
-// this bridge, so a transient bind failure — a restart race, a stale peer
-// mid-teardown — must self-heal rather than wait out a daemon restart. It logs
-// the actual Run error on every abnormal exit. A clean ctx-cancel shutdown (Run
+// this bridge, so a transient failure — a restart race, a stale peer
+// mid-teardown, the group-container MkdirAll blocked pending TCC consent — must
+// self-heal rather than wait out a daemon restart. The MkdirAll lives inside
+// the loop because the container is the TCC-gated piece: it can hang on the
+// consent prompt (which is why it runs here, off startFPBridge's caller) or
+// fail while consent is denied, and retrying picks up a late approval. It logs
+// the actual error on every abnormal exit. A clean ctx-cancel shutdown (Run
 // returns nil) exits the loop, and ctx cancellation also cuts the backoff sleep
 // short so wg.Wait never blocks on a sleeping retry.
 func (s *Server) serveFPBridge(ctx context.Context, bridge *content.BridgeServer, sock string) {
@@ -82,10 +118,17 @@ func (s *Server) serveFPBridge(ctx context.Context, bridge *content.BridgeServer
 		backoff = defaultFPBridgeBackoff
 	}
 	for {
-		err := bridge.Run(ctx)
+		err := os.MkdirAll(filepath.Dir(sock), 0o700)
+		if err == nil {
+			err = bridge.Run(ctx)
+		}
 		if err == nil || ctx.Err() != nil {
 			return
 		}
+		// A permission error is the TCC denied/parked signature (keep it eligible
+		// for the consent-pending signal); anything else is a genuine bind
+		// failure that must not be reported to the user as a consent prompt.
+		s.fpBridgeHardErr.Store(!errors.Is(err, os.ErrPermission))
 		s.log.Printf("file provider bridge: serve %s exited abnormally; retrying in %s: %v", sock, backoff, err)
 		select {
 		case <-ctx.Done():

@@ -40,12 +40,9 @@ func runWidget(cmd *cobra.Command) error {
 	if err := brewInstallWidget(cmd); err != nil {
 		return err
 	}
-	// By path first: LaunchServices hasn't indexed a fresh install, so by-name fails on first launch.
 	step(out, "Launching it so macOS discovers the widget…")
-	if err := runStreamed(cmd, "open", "-g", pool.WidgetAppPath()); err != nil {
-		if err := runStreamed(cmd, "open", "-g", "-a", widgetAppName); err != nil {
-			return fmt.Errorf("launch %s (is the cask appdir customized?): %w", widgetAppName, err)
-		}
+	if err := launchWidgetApp(cmd); err != nil {
+		return err
 	}
 	success(out, "Widget installed.")
 	_, _ = fmt.Fprint(out, widgetInstructions())
@@ -80,6 +77,17 @@ func brewInstallWidget(cmd *cobra.Command) error {
 	}
 	if err := brewCask(cmd, "install", "--cask", widgetTap+"/"+widgetCask); err != nil {
 		return fmt.Errorf("brew install --cask %s: %w", widgetCask, err)
+	}
+	return nil
+}
+
+// launchWidgetApp opens the CCPoolStatus app in the background. By path first:
+// LaunchServices hasn't indexed a fresh install, so by-name fails on first launch.
+func launchWidgetApp(cmd *cobra.Command) error {
+	if err := runStreamed(cmd, "open", "-g", pool.WidgetAppPath()); err != nil {
+		if err := runStreamed(cmd, "open", "-g", "-a", widgetAppName); err != nil {
+			return fmt.Errorf("launch %s (is the cask appdir customized?): %w", widgetAppName, err)
+		}
 	}
 	return nil
 }

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -66,6 +67,21 @@ type Server struct {
 	// defaultFPBridgeBackoff. Tests shrink it to pin the retry-after-bind-failure
 	// path.
 	fpBridgeBackoff time.Duration
+
+	// fpBridgeWait bounds startFPBridge's synchronous wait for the FP socket to
+	// accept before flagging the bind consent-pending; zero means
+	// defaultFPBridgeWait. Tests shrink it.
+	fpBridgeWait time.Duration
+
+	// fpConsentPending: the FP bridge bind has not completed while the daemon is
+	// alive — the app-group-container TCC consent signature. Set and cleared by
+	// startFPBridge's watchdog, read by handleStatus.
+	fpConsentPending atomic.Bool
+
+	// fpBridgeHardErr latches a NON-permission serve-loop failure (a genuine
+	// bind error, not the TCC-parked/denied signature), so the consent-pending
+	// signal is not raised for an unrelated failure. Stored by serveFPBridge.
+	fpBridgeHardErr atomic.Bool
 
 	// triggerShutdown cancels serve's context. Set once before the accept loop
 	// starts; the spawning go-statement's happens-before lets handlers read it
@@ -393,7 +409,7 @@ func (s *Server) handleStatus(ctx context.Context) Response {
 	}
 	// Version lets the client detect a pre-upgrade daemon (which omits newer wire
 	// fields like Components) and fall back to live sampling.
-	resp := Response{OK: true, Version: version.String(), Accounts: accts, Holder: s.holder.wireStatus()}
+	resp := Response{OK: true, Version: version.String(), Accounts: accts, Holder: s.holder.wireStatus(), FPConsentPending: s.fpConsentPending.Load()}
 	// Content-source health lives only in this process; errors.Join's newlines
 	// fold to "; " so doctor renders one line.
 	if s.contentSource != nil {

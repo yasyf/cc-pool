@@ -1622,7 +1622,7 @@ func TestFPGate(t *testing.T) {
 	}{
 		"extension absent refuses without dialing the app": {
 			available: false,
-			wantFrags: []string{"fileprovider unavailable", pool.FPExtensionBundleID, "re-run `ccp migrate`"},
+			wantFrags: []string{"fileprovider unavailable", pool.FPExtensionBundleID, "ccp fp onboard", "re-run `ccp migrate`"},
 		},
 		"dead control socket refuses with a launch hint": {
 			available:   true,

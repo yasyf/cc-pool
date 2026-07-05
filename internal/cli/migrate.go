@@ -53,8 +53,7 @@ migrated-to provider.`,
 					return errors.New("fuse is not available on this machine; run `ccp fuse enable` to install the fusekit-holder cask")
 				}
 				if to == "fileprovider" && !fpAvailable(m.OverlaySpec()) {
-					en := fkoverlay.BackendFileProvider.Enablement()
-					return fmt.Errorf("fileprovider is not available: the %s extension is not installed and enabled — install %s if missing, then: %s", pool.FPExtensionBundleID, pool.WidgetAppPath(), en.Guidance)
+					return fmt.Errorf("fileprovider is not available: the %s extension is not installed and enabled — run `ccp fp onboard` to install %s, enable the extension, and migrate in one step", pool.FPExtensionBundleID, pool.WidgetAppPath())
 				}
 				resp, err := requestMigration(m, to, account, force)
 				if err != nil {

@@ -181,8 +181,7 @@ var fpControlHealth = func(ctx context.Context, socket string) (string, error) {
 func (s *Server) fpGate(ctx context.Context) (fkoverlay.Backend, string) {
 	spec := s.m.OverlaySpec()
 	if !fpAvailable(spec) {
-		en := fkoverlay.BackendFileProvider.Enablement()
-		return "", fmt.Sprintf("fileprovider unavailable: the %s extension is not installed and enabled — %s Then re-run `ccp migrate`", pool.FPExtensionBundleID, en.Guidance)
+		return "", fmt.Sprintf("fileprovider unavailable: the %s extension is not installed and enabled — run `ccp fp onboard` to set it up end to end, then re-run `ccp migrate`", pool.FPExtensionBundleID)
 	}
 	if _, err := fpControlHealth(ctx, spec.FileProvider.ControlSocket); err != nil {
 		return "", fmt.Sprintf("fileprovider unavailable: companion app control probe failed: %v — start %s, then re-run `ccp migrate`", err, pool.WidgetAppPath())

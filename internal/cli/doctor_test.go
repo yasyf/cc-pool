@@ -430,6 +430,7 @@ func TestReportFileProvider(t *testing.T) {
 		healthVer  string
 		healthErr  error
 		bridgeUp   bool
+		consent    bool // daemon's consent-pending signal
 		want       []wantReport
 		wantProbes bool // control and bridge each probed exactly once
 	}{
@@ -437,12 +438,12 @@ func TestReportFileProvider(t *testing.T) {
 			available: false,
 			accts:     []store.Account{symRow, nfsRow},
 		},
-		"extension absent with fileprovider rows fails with the enablement guidance and probes nothing": {
+		"extension absent with fileprovider rows fails with the onboard pointer and enablement guidance and probes nothing": {
 			available: false,
 			accts:     []store.Account{fpRow(1), fpRow(2), symRow},
 			want: []wantReport{
 				{"file provider extension", false, []string{
-					"2 fileprovider accounts", pool.WidgetAppPath(), "Login Items & Extensions",
+					"2 fileprovider accounts", "ccp fp onboard", pool.WidgetAppPath(), "Login Items & Extensions",
 				}},
 			},
 		},
@@ -478,7 +479,23 @@ func TestReportFileProvider(t *testing.T) {
 			want: []wantReport{
 				{"file provider extension", true, nil},
 				{"file provider app", true, []string{"1.2.3"}},
-				{"file provider bridge", false, []string{"app group container", "restart the daemon"}},
+				{"file provider bridge", false, []string{"app group container", "restart the daemon", "ccp fp onboard"}},
+			},
+			wantProbes: true,
+		},
+		"unreachable bridge with the daemon's consent-pending signal names the TCC rung precisely": {
+			available: true,
+			accts:     []store.Account{fpRow(1)},
+			healthVer: "1.2.3",
+			bridgeUp:  false,
+			consent:   true,
+			want: []wantReport{
+				{"file provider extension", true, nil},
+				{"file provider app", true, []string{"1.2.3"}},
+				{"file provider bridge", false, []string{
+					"parked on the one-time app group container consent prompt",
+					"re-asks after every upgrade", "restart the daemon", "ccp fp onboard",
+				}},
 			},
 			wantProbes: true,
 		},
@@ -509,7 +526,7 @@ func TestReportFileProvider(t *testing.T) {
 			})
 
 			report, calls := captureReports()
-			reportFileProvider(t.Context(), &pool.Manager{}, tc.accts, report)
+			reportFileProvider(t.Context(), &pool.Manager{}, tc.accts, tc.consent, report)
 
 			if len(*calls) != len(tc.want) {
 				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
