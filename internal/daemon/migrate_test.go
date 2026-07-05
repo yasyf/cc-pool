@@ -794,11 +794,15 @@ func TestConvertAccountForceStampsSessionCount(t *testing.T) {
 	}{
 		"live sessions stamp the count": {scan: live, wantDetail: "converted under 2 live session(s)"},
 		"idle carries no line": {
-			scan:       func(string) func(context.Context) ([]procscan.Session, error) { return func(context.Context) ([]procscan.Session, error) { return nil, nil } },
+			scan: func(string) func(context.Context) ([]procscan.Session, error) {
+				return func(context.Context) ([]procscan.Session, error) { return nil, nil }
+			},
 			wantDetail: "",
 		},
 		"scan failure is silent": {
-			scan:       func(string) func(context.Context) ([]procscan.Session, error) { return func(context.Context) ([]procscan.Session, error) { return nil, errors.New("ps exploded") } },
+			scan: func(string) func(context.Context) ([]procscan.Session, error) {
+				return func(context.Context) ([]procscan.Session, error) { return nil, errors.New("ps exploded") }
+			},
 			wantDetail: "",
 		},
 	}
