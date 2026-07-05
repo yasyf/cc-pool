@@ -27,6 +27,7 @@ const (
 	OpShutdown Op = "shutdown" // step down gracefully and release the socket
 	OpMigrate  Op = "migrate"  // convert accounts between overlay providers
 	OpCredMove Op = "credmove" // move account credentials between backends
+	OpFPRepair Op = "fprepair" // re-register wedged File Provider domains
 )
 
 // Request is one client request (one JSON object per line).
@@ -72,6 +73,41 @@ type MigrationResult struct {
 	To      string           `json:"to,omitempty"`
 	Outcome MigrationOutcome `json:"outcome"`
 	Detail  string           `json:"detail,omitempty"` // busy reason / failure text
+}
+
+// FPRepairOutcome classifies one domain's `ccp fp repair` result.
+type FPRepairOutcome string
+
+const (
+	FPRepairRepaired  FPRepairOutcome = "repaired"  // re-registered; the next probe verifies it
+	FPRepairRetreated FPRepairOutcome = "retreated" // File Provider cannot serve here; fell back to symlink
+	FPRepairBusy      FPRepairOutcome = "busy"      // held by a pending select; retry
+	FPRepairFailed    FPRepairOutcome = "failed"    // re-register errored (detail says why)
+)
+
+// FPRepairResult is one account's `ccp fp repair` outcome.
+type FPRepairResult struct {
+	ID      int             `json:"id"`
+	Label   string          `json:"label,omitempty"`
+	Outcome FPRepairOutcome `json:"outcome"`
+	Detail  string          `json:"detail,omitempty"` // failure text / retreat reason
+}
+
+// FPDomainState is the daemon's cached verdict for one wedged File Provider
+// domain: its control ops answer but its reads hang — the wedge cc-pool's
+// control-plane Health cannot see. Surfaced by status so `ccp doctor` renders it
+// (and its recovery progress) without re-probing. Additive; status only.
+type FPDomainState struct {
+	ID        int    `json:"id"`
+	Label     string `json:"label,omitempty"`
+	ConfigDir string `json:"config_dir"`
+	// RecoveryAttempts is how many recovery-ladder attempts the daemon has spent
+	// on this domain so far.
+	RecoveryAttempts int `json:"recovery_attempts,omitempty"`
+	// BreakerTripped: the recovery ladder exhausted its attempts and parked the
+	// domain — automated recovery is done; a manual `ccp fp repair` (or a
+	// fileproviderd restart) is needed.
+	BreakerTripped bool `json:"breaker_tripped,omitempty"`
 }
 
 // HolderStatus is the daemon's cached view of the detached mount holder.
@@ -256,8 +292,13 @@ type Response struct {
 	// container TCC consent (cdhash-keyed, so macOS re-prompts after every
 	// upgrade, and launchd never surfaces the prompt). Approve it, then
 	// restart the daemon. Additive; status only.
-	FPConsentPending bool              `json:"fp_consent_pending,omitempty"`
-	Version          string            `json:"version,omitempty"`    // health
-	Migrations       []MigrationResult `json:"migrations,omitempty"` // migrate/credmove
-	SoonestReset     *time.Time        `json:"soonest_reset,omitempty"`
+	FPConsentPending bool `json:"fp_consent_pending,omitempty"`
+	// FPWedged lists File Provider domains the daemon's data-plane probe found
+	// wedged (control ops answer, reads hang). Additive; status only.
+	FPWedged   []FPDomainState   `json:"fp_wedged,omitempty"`
+	Version    string            `json:"version,omitempty"`    // health
+	Migrations []MigrationResult `json:"migrations,omitempty"` // migrate/credmove
+	// FPRepairs carries per-account `ccp fp repair` outcomes.
+	FPRepairs    []FPRepairResult `json:"fp_repairs,omitempty"`
+	SoonestReset *time.Time       `json:"soonest_reset,omitempty"`
 }

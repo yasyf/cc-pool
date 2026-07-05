@@ -14,7 +14,10 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/fusekit/version"
 )
 
 // fpElection is the three-way pluginkit reading of the File Provider
@@ -102,7 +105,181 @@ func newFPCmd() *cobra.Command {
 		Short: "Manage the File Provider overlay",
 	}
 	cmd.AddCommand(newFPOnboardCmd())
+	cmd.AddCommand(newFPRepairCmd())
 	return cmd
+}
+
+func newFPRepairCmd() *cobra.Command {
+	var account int
+	cmd := &cobra.Command{
+		Use:   "repair",
+		Short: "Re-register wedged File Provider domains (control ops answer but reads hang)",
+		Long: `repair re-registers a File Provider domain whose data plane has wedged —
+control ops answer but every read hangs, the failure cc-pool's control-plane
+health check cannot see. Re-registration (remove + re-add) discards
+fileproviderd's poisoned replica state and forces a clean re-enumeration.
+
+Without --account it repairs every domain the daemon currently reports wedged;
+with --account it repairs that one regardless of its verdict. The daemon owns
+the select gate a CLI-side re-register would race, so this routes through the
+daemon when it is running and falls back to a direct provider repair only when
+it is down.
+
+Re-registration breaks any open file descriptors on the domain, so relaunch
+sessions on a repaired account.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return withManager(func(m *pool.Manager) error {
+				return runFPRepair(cmd, m, account)
+			})
+		},
+	}
+	cmd.Flags().IntVar(&account, "account", 0, "repair only this account id (default: every wedged domain)")
+	return cmd
+}
+
+// runFPRepair routes a repair through the daemon when it is up (it owns the
+// select gate a CLI-side re-register would race) and directly through the
+// provider when it is down.
+func runFPRepair(cmd *cobra.Command, m *pool.Manager, account int) error {
+	if err := requireInit(m); err != nil {
+		return err
+	}
+	var acct *int
+	if account > 0 {
+		acct = &account
+	}
+	cl := daemon.NewClient()
+	health, err := cl.Health()
+	switch {
+	case errors.Is(err, daemon.ErrDaemonUnavailable):
+		// Daemon down: no select to race, so repair the provider directly.
+		return repairFPDirect(cmd, m, account)
+	case err != nil:
+		return fmt.Errorf("daemon health check: %w", err)
+	case health.Version != version.String():
+		return fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) and re-run", health.Version, version.String())
+	}
+	resp, err := cl.FPRepair(acct)
+	if err != nil {
+		return fmt.Errorf("fp repair: %w", err)
+	}
+	return renderFPRepairs(cmd, resp, account > 0)
+}
+
+// renderFPRepairs prints the daemon's per-account repair outcomes.
+func renderFPRepairs(cmd *cobra.Command, resp *daemon.Response, explicit bool) error {
+	out := cmd.OutOrStdout()
+	if resp.Error != "" {
+		return errors.New(resp.Error)
+	}
+	if len(resp.FPRepairs) == 0 {
+		if explicit {
+			return errors.New("the requested account was not repaired")
+		}
+		note(out, "No wedged file provider domains to repair.")
+		return nil
+	}
+	var repaired, failed int
+	for _, r := range resp.FPRepairs {
+		name := fmt.Sprintf("acct-%02d (%s)", r.ID, accountName(r.Label))
+		switch r.Outcome {
+		case daemon.FPRepairRepaired:
+			repaired++
+			success(out, "%s re-registered — the daemon re-verifies it on the next probe", name)
+		case daemon.FPRepairRetreated:
+			note(out, "%s fell back to symlink: %s", name, r.Detail)
+		case daemon.FPRepairBusy:
+			step(out, "%s skipped: %s", name, r.Detail)
+		case daemon.FPRepairFailed:
+			failed++
+			step(out, "%s %s: %s", badStyle.Render("✗"), name, r.Detail)
+		}
+	}
+	if repaired > 0 {
+		step(out, "Re-registered %d domain(s); relaunch any sessions on them.", repaired)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d domain(s) failed to repair", failed)
+	}
+	return nil
+}
+
+// repairFPDirect re-registers File Provider domains without the daemon (it is
+// down, so there is no select to race). It resolves the provider itself and does
+// Teardown+Setup per target — the one named with --account, else every File
+// Provider row. Content stays unserved until the daemon (its content bridge) is
+// back, so it warns about that.
+func repairFPDirect(cmd *cobra.Command, m *pool.Manager, account int) error {
+	out := cmd.OutOrStdout()
+	accts, err := m.Store.ListAccounts()
+	if err != nil {
+		return err
+	}
+	targets, err := fpRepairTargets(accts, account)
+	if err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		note(out, "No file provider accounts to repair.")
+		return nil
+	}
+	warn(out, "The daemon is not running; re-registering directly. File Provider domains cannot serve content until the daemon's bridge is back — start it with `ccp service install`.")
+	prov, err := fpOverlayProvider(fkoverlay.BackendFileProvider)
+	if err != nil {
+		return fmt.Errorf("resolve file provider overlay: %w", err)
+	}
+	base := pool.ClaudeDir()
+	var failed int
+	for _, a := range targets {
+		name := fmt.Sprintf("acct-%02d (%s)", a.ID, accountName(a.Label))
+		if terr := prov.Teardown(base, a.ConfigDir); terr != nil {
+			// A wedged domain may refuse a clean Teardown; the idempotent Setup
+			// below re-adds regardless, so note and press on.
+			step(out, "%s teardown: %v (continuing to re-add)", name, terr)
+		}
+		switch serr := prov.Setup(base, a.ConfigDir); {
+		case serr == nil:
+			success(out, "%s re-registered", name)
+		case errors.Is(serr, fileproviderd.ErrCannotControl):
+			failed++
+			step(out, "%s %s: File Provider cannot serve on this machine — run `ccp migrate --account %d --to symlink`", badStyle.Render("✗"), name, a.ID)
+		default:
+			failed++
+			step(out, "%s %s: %v", badStyle.Render("✗"), name, serr)
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d domain(s) failed to re-register", failed)
+	}
+	step(out, "Re-registered %d domain(s); relaunch any sessions on them, and restart the daemon.", len(targets)-failed)
+	return nil
+}
+
+// fpRepairTargets picks the accounts a direct (daemon-down) repair re-registers:
+// the one named by account (error if it is not a File Provider row or is
+// unknown), else every File Provider row — the daemon-down path cannot tell a
+// wedged domain from a healthy one.
+func fpRepairTargets(accts []store.Account, account int) ([]store.Account, error) {
+	if account > 0 {
+		for _, a := range accts {
+			if a.ID != account {
+				continue
+			}
+			if !fileProviderRow(a.OverlayKind) {
+				return nil, fmt.Errorf("acct-%02d is on %s, not file provider", a.ID, a.OverlayKind)
+			}
+			return []store.Account{a}, nil
+		}
+		return nil, fmt.Errorf("account %d not found", account)
+	}
+	var fp []store.Account
+	for _, a := range accts {
+		if fileProviderRow(a.OverlayKind) {
+			fp = append(fp, a)
+		}
+	}
+	return fp, nil
 }
 
 func newFPOnboardCmd() *cobra.Command {

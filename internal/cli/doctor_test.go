@@ -553,6 +553,78 @@ func TestReportFileProvider(t *testing.T) {
 	}
 }
 
+// TestReportFPWedges pins doctor's File Provider wedge section: with the daemon
+// up it renders the daemon's cached verdicts (recovering vs breaker-exhausted)
+// and never probes; with the daemon down it probes each File Provider row itself
+// and reports only the ones that fail to serve.
+func TestReportFPWedges(t *testing.T) {
+	fpRow := func(id int) store.Account {
+		return store.Account{ID: id, ConfigDir: fmt.Sprintf("/p/acct-%02d", id), OverlayKind: string(fkoverlay.BackendFileProvider)}
+	}
+	symRow := store.Account{ID: 9, ConfigDir: "/p/acct-09", OverlayKind: string(fkoverlay.BackendSymlink)}
+
+	t.Run("daemon alive renders cached verdicts and never probes", func(t *testing.T) {
+		swapVar(t, &fpDomainProbeAt, func(string) error { t.Error("probed with the daemon alive"); return nil })
+		cached := []daemon.FPDomainState{
+			{ID: 1, ConfigDir: "/p/acct-01", RecoveryAttempts: 2},
+			{ID: 2, ConfigDir: "/p/acct-02", BreakerTripped: true},
+		}
+		report, calls := captureReports()
+		reportFPWedges([]store.Account{fpRow(1), fpRow(2), symRow}, cached, true, report)
+
+		if len(*calls) != 2 {
+			t.Fatalf("got %d reports %+v, want 2", len(*calls), *calls)
+		}
+		if (*calls)[0].label != "acct-01 file provider" || (*calls)[0].healthy || !strings.Contains((*calls)[0].detail, "ccp fp repair") {
+			t.Errorf("report[0] = %+v, want acct-01 flagged with the repair pointer", (*calls)[0])
+		}
+		if !strings.Contains((*calls)[1].detail, "automated recovery is exhausted") {
+			t.Errorf("breaker detail missing the exhausted note: %q", (*calls)[1].detail)
+		}
+	})
+
+	t.Run("daemon alive with no cached wedges is silent", func(t *testing.T) {
+		swapVar(t, &fpDomainProbeAt, func(string) error { t.Error("probed with the daemon alive"); return nil })
+		report, calls := captureReports()
+		reportFPWedges([]store.Account{fpRow(1)}, nil, true, report)
+		if len(*calls) != 0 {
+			t.Fatalf("want silence, got %+v", *calls)
+		}
+	})
+
+	t.Run("daemon down probes each fp row and reports only the wedged ones", func(t *testing.T) {
+		probed := map[string]bool{}
+		swapVar(t, &fpDomainProbeAt, func(dir string) error {
+			probed[dir] = true
+			switch dir {
+			case "/p/acct-01":
+				return fmt.Errorf("%w: hung", overlay.ErrFPProbeWedged)
+			case "/p/acct-03":
+				return fmt.Errorf("%w: no identity", overlay.ErrFPProbeMissing)
+			default:
+				return nil // acct-02 healthy
+			}
+		})
+		report, calls := captureReports()
+		reportFPWedges([]store.Account{fpRow(1), fpRow(2), fpRow(3), symRow}, nil, false, report)
+
+		for _, dir := range []string{"/p/acct-01", "/p/acct-02", "/p/acct-03"} {
+			if !probed[dir] {
+				t.Errorf("did not probe fp row %s", dir)
+			}
+		}
+		if probed["/p/acct-09"] {
+			t.Error("probed a symlink row")
+		}
+		if len(*calls) != 1 || (*calls)[0].label != "acct-01 file provider" || (*calls)[0].healthy {
+			t.Fatalf("got %+v, want exactly the wedged acct-01 flagged", *calls)
+		}
+		if !strings.Contains((*calls)[0].detail, "daemon is down") {
+			t.Errorf("daemon-down detail missing the attribution: %q", (*calls)[0].detail)
+		}
+	})
+}
+
 // TestReportContentHealth pins the daemon content-source line: silent when
 // healthy (or when there is no daemon to ask), a failure carrying the daemon's
 // verbatim message plus the log pointer otherwise.

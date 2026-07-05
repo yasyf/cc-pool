@@ -702,21 +702,22 @@ func TestPollAccountFileProviderSyncAfterAdoption(t *testing.T) {
 	})
 }
 
-// TestPollAccountSyncFailureRoutesFPToReconcile pins the poll escalation
-// branch: an FP row's overlay-sync failure goes to reconcileFileProvider (never
-// healFuse), and a healthy domain means no Setup and no row change.
-func TestPollAccountSyncFailureRoutesFPToReconcile(t *testing.T) {
+// TestPollAccountSyncFailureDoesNotReconcileFP pins defect-3's drop: an FP row's
+// overlay-sync failure in the poll is NOT reconciled inline (no Health, no Setup)
+// — the backoff-gated heal ticker owns FP recovery, so a failed poll never fires
+// the reconcile storm. The row is left unchanged.
+func TestPollAccountSyncFailureDoesNotReconcileFP(t *testing.T) {
 	s, a, fake := newFPPollServer(t, false)
 	fake.syncErr = errors.New("bridge symlink drifted")
 
 	pollOnceAccount(t, s, a)
 
 	healths, setups, _, _ := fake.counts()
-	if healths != 1 {
-		t.Fatalf("healths = %d, want 1 (sync failure must reconcile the domain)", healths)
+	if healths != 0 {
+		t.Fatalf("healths = %d, want 0 (poll sync failure must NOT reconcile FP — the heal ticker owns it)", healths)
 	}
 	if setups != 0 {
-		t.Fatalf("setups = %d, want 0 (healthy domain needs no re-register)", setups)
+		t.Fatalf("setups = %d, want 0", setups)
 	}
 	if kind := kindOf(t, s, a.ID); kind != "fileprovider" {
 		t.Fatalf("row changed to %q on a transient sync failure", kind)

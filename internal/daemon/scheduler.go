@@ -118,15 +118,13 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 	// ~/.claude entries without an explicit sync.
 	if err := s.m.SyncOverlay(a); err != nil {
 		s.log.Printf("acct-%02d overlay sync: %v", a.ID, err)
-		// A fuse sync failure usually means the mount is down — heal now
-		// instead of leaving the dir dead until restart. A File Provider sync
-		// failure reconciles through the domain host instead (Health, then an
-		// idempotent Setup); the two arms never mix.
-		switch {
-		case fuseBackedRow(a.OverlayKind):
+		// A fuse sync failure usually means the mount is down — heal now instead of
+		// leaving the dir dead until restart. A File Provider sync failure is NOT
+		// reconciled inline: the backoff-gated heal ticker (probe + recovery ladder)
+		// owns FP recovery, so a Health+Setup on every failed poll would be the
+		// reconcile storm (defect 3) this drop removes.
+		if fuseBackedRow(a.OverlayKind) {
 			s.healFuse(ctx, a)
-		case fpBackedRow(a.OverlayKind):
-			s.reconcileFileProvider(ctx, a)
 		}
 	}
 

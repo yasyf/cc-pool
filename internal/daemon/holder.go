@@ -94,6 +94,10 @@ func (s *Server) healFuseRows(ctx context.Context) {
 			// Refresh first: the ticker outpaces the scheduler poll's cache refresh.
 			s.holder.refresh(s.holderClient())
 			s.retryUnvouchedFuseRows(ctx)
+			// File Provider rows are probed (2-strike debounced) and healed up the
+			// recovery ladder here too — never through retryUnvouchedFuseRows, since
+			// FP is a third backend, not a fuse mount.
+			s.healFPRows(ctx)
 			s.logContentHealth()
 		}
 	}

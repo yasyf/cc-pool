@@ -95,6 +95,16 @@ func (c *Client) CredMove(account *int, to string) (*Response, error) {
 	return c.do(Request{Op: OpCredMove, Account: account, To: to}, migrateTimeout)
 }
 
+// FPRepair asks the daemon to re-register wedged File Provider domains: nil
+// account repairs every currently-wedged domain, a set account repairs that one
+// regardless of its verdict. The daemon owns the select gate a CLI-side
+// re-register would race, so this routes through it; the CLI falls back to a
+// direct provider repair only when the daemon is down. It shares migrateTimeout:
+// each re-register is a Teardown+Setup that can take seconds to materialize.
+func (c *Client) FPRepair(account *int) (*Response, error) {
+	return c.do(Request{Op: OpFPRepair, Account: account}, migrateTimeout)
+}
+
 // Shutdown asks the daemon to step down; OK means it will release the socket
 // shortly (confirm with WaitGone). Works even on an orphan launchctl bootout
 // cannot kill.

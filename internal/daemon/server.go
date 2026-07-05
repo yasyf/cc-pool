@@ -156,6 +156,16 @@ type Server struct {
 	// holder cannot vouch for (see retryUnvouchedFuseRows). Lazily initialized;
 	// only the heal goroutine touches it — no lock.
 	rowRetry map[int]rowRetryState
+
+	// fp tracks per-File-Provider-domain data-plane health: a debounced wedge
+	// verdict (the wedge cc-pool's control-plane Health cannot see) plus a
+	// backoff/breaker recovery ladder. Concurrency-safe; nil in bare test servers
+	// that never exercise FP heal, so every reader guards it (fpWedged, healFPRows).
+	fp *fpState
+
+	// fpBridgeReadyFn is a test seam over the FP-bridge-up precondition for probing
+	// FP domains; nil means the real check (consent settled + data socket up).
+	fpBridgeReadyFn func() bool
 }
 
 // Run is the entry point for `cc-pool daemon`. It blocks until the process
@@ -184,6 +194,10 @@ func Run(ctx context.Context) error {
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
 	}
+	// The FP wedge detector strikes a 0-byte served .claude.json only when the
+	// account genuinely has an identity (its synth is non-empty) — resolved through
+	// the same content source the bridge serves.
+	s.fp = newFPState(s.contentSource.SynthNonEmpty)
 	// Route fusekit/overlay's conflict-resolution log through s.log. A package
 	// global, so assigned once before serve spawns any worker.
 	fkoverlay.ResolvedConflictLogf = s.log.Printf
@@ -354,11 +368,12 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		writeResp(conn, Response{OK: false, Error: "bad request: " + err.Error()})
 		return
 	}
-	if req.Op == OpMigrate || req.Op == OpCredMove {
+	if req.Op == OpMigrate || req.Op == OpCredMove || req.Op == OpFPRepair {
 		// These ops legitimately outlive the 10s deadline (migrate: a probe
 		// mount plus up to an 8s wait and a bounded rollback per account;
-		// credmove: a bounded per-account lock wait); stay under the client's
-		// 150s so the server, not a dead socket, reports the outcome.
+		// credmove: a bounded per-account lock wait; fprepair: a Teardown+Setup
+		// per domain, each of which can take seconds to materialize); stay under
+		// the client's 150s so the server, not a dead socket, reports the outcome.
 		_ = conn.SetDeadline(time.Now().Add(140 * time.Second))
 	}
 	resp := s.dispatch(ctx, req)
@@ -385,6 +400,8 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 		return s.handleMigrate(ctx, req)
 	case OpCredMove:
 		return s.handleCredMove(ctx, req)
+	case OpFPRepair:
+		return s.handleFPRepair(ctx, req)
 	case OpShutdown:
 		return s.handleShutdown()
 	default:
@@ -417,7 +434,35 @@ func (s *Server) handleStatus(ctx context.Context) Response {
 			resp.ContentHealth = strings.ReplaceAll(err.Error(), "\n", "; ")
 		}
 	}
+	resp.FPWedged = s.fpWedgedStates(accts)
 	return resp
+}
+
+// fpWedgedStates lists the currently-wedged File Provider domains for the status
+// wire, joining the fp state's dir-keyed verdicts to account IDs and labels. nil
+// when no domain is wedged or fp state is absent (bare test servers).
+func (s *Server) fpWedgedStates(accts []AccountStatus) []FPDomainState {
+	if s.fp == nil {
+		return nil
+	}
+	wedges := s.fp.wedgedSnapshot()
+	if len(wedges) == 0 {
+		return nil
+	}
+	byDir := make(map[string]AccountStatus, len(accts))
+	for _, a := range accts {
+		byDir[a.ConfigDir] = a
+	}
+	out := make([]FPDomainState, 0, len(wedges))
+	for _, w := range wedges {
+		st := FPDomainState{ConfigDir: w.Dir, RecoveryAttempts: w.Attempts, BreakerTripped: w.Tripped}
+		if a, ok := byDir[w.Dir]; ok {
+			st.ID = a.ID
+			st.Label = a.Label
+		}
+		out = append(out, st)
+	}
+	return out
 }
 
 // statuses assembles the wire view of every account from cached samples — the
@@ -446,13 +491,17 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		for _, sn := range snaps {
 			if sn.Account.ID == *req.Account {
 				if !s.mountReady(sn.Account) {
-					if fuseBackedRow(sn.Account.OverlayKind) {
+					switch {
+					case fuseBackedRow(sn.Account.OverlayKind):
 						return Response{OK: false, Error: fmt.Sprintf("acct-%02d's fuse mount is not up yet; retry shortly", sn.Account.ID)}
+					case fpBackedRow(sn.Account.OverlayKind):
+						return Response{OK: false, Error: fmt.Sprintf("acct-%02d's file provider domain is wedged; the daemon is recovering it — retry shortly", sn.Account.ID)}
+					default:
+						return Response{OK: false, Error: fmt.Sprintf("acct-%02d's dir is unexpectedly a mountpoint (wedged unmount?); see `ccp doctor` and the daemon log", sn.Account.ID)}
 					}
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d's dir is unexpectedly a mountpoint (wedged unmount?); see `ccp doctor` and the daemon log", sn.Account.ID)}
 				}
 				if !s.probeWinnerReady(sn.Account) {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d's fuse mirror is wedged; the daemon is remounting it — retry shortly", sn.Account.ID)}
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d's overlay is wedged; the daemon is recovering it — retry shortly", sn.Account.ID)}
 				}
 				if !s.tryReserve(sn.Account.ID) {
 					return Response{OK: false, Error: fmt.Sprintf("acct-%02d is migrating overlays; retry shortly", sn.Account.ID)}
@@ -532,7 +581,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	// Deep-probe the winner before handing it to a session — a wedge refuses
 	// and the client retries onto a healthy account.
 	if !s.probeWinnerReady(best.Account) {
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d's fuse mirror is wedged; the daemon is remounting it — retry shortly", best.Account.ID)}
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d's overlay is wedged; the daemon is recovering it — retry shortly", best.Account.ID)}
 	}
 	if !req.NoMark {
 		if !s.tryReserve(best.Account.ID) {
@@ -791,9 +840,10 @@ func (s *Server) endPoll(id int) {
 // racing the startup prime, or a mirror `ccp add` just mounted). A non-fuse row
 // needs the dir NOT mounted — a mountpoint under a symlink row is aborted-
 // rollback wreckage serving a mirror whose backing no longer holds the
-// account's identity; lstat on a plain dir is safe. A File Provider row rides
-// the same arm: its dir is the domain bridge symlink (never a mountpoint) and
-// domain health is owned by reconcileFileProvider, not the select path.
+// account's identity; lstat on a plain dir is safe. A File Provider row also needs
+// its dir un-mounted (the domain bridge symlink is never a mountpoint) AND its
+// domain not wedged — a data-plane-wedged domain (control ops pass, reads hang) is
+// kept out of a launching session until the heal loop recovers it.
 func (s *Server) mountReady(a store.Account) bool {
 	if fuseBackedRow(a.OverlayKind) {
 		if !s.holder.ready(a.ConfigDir) {
@@ -801,7 +851,16 @@ func (s *Server) mountReady(a store.Account) bool {
 		}
 		return s.holder.ready(a.ConfigDir)
 	}
+	if fpBackedRow(a.OverlayKind) {
+		return !overlayMounted(a.ConfigDir) && !s.fpWedged(a.ConfigDir)
+	}
 	return !overlayMounted(a.ConfigDir)
+}
+
+// fpWedged reports whether dir's File Provider domain is marked wedged; nil-safe
+// so bare test servers (no fp state) read not-wedged.
+func (s *Server) fpWedged(dir string) bool {
+	return s.fp != nil && s.fp.wedged(dir)
 }
 
 // probeWinnerReady deep-probes a chosen fuse mirror at select time, reporting
@@ -815,6 +874,9 @@ func (s *Server) mountReady(a store.Account) bool {
 // and pre-probe (ErrProbeMissing) mirrors read ready. One wedge is enough (no
 // debounce): a NEW session has no live session a false positive could orphan.
 func (s *Server) probeWinnerReady(a store.Account) bool {
+	if fpBackedRow(a.OverlayKind) {
+		return s.probeFPWinnerReady(a)
+	}
 	if !fuseBackedRow(a.OverlayKind) {
 		return true
 	}
@@ -828,6 +890,33 @@ func (s *Server) probeWinnerReady(a store.Account) bool {
 		s.log.Printf("%s", msg)
 	}
 	return true
+}
+
+// probeFPWinnerReady live-probes a chosen File Provider domain's data plane at
+// select time, reporting whether it is safe to assign. A hard failure (timeout,
+// EDEADLK, EPERM, or a 0-byte read for an account that has an identity) force-marks
+// the domain wedged with NO debounce — a launching session has no live reads a
+// false positive could orphan — so it is excluded now and the heal loop recovers
+// it. A missing or empty-by-design .claude.json reads ready. nil fp state (bare
+// test servers) reads ready.
+func (s *Server) probeFPWinnerReady(a store.Account) bool {
+	if s.fp == nil {
+		return true
+	}
+	if s.fp.wedged(a.ConfigDir) {
+		return false // already known wedged (mountReady also excludes it)
+	}
+	err := fpDomainProbe(a.ConfigDir)
+	switch {
+	case err == nil, errors.Is(err, overlay.ErrFPProbeMissing):
+		return true
+	case errors.Is(err, overlay.ErrFPProbeEmpty) && !s.fp.synthNonEmpty(a.ConfigDir):
+		return true // 0 bytes served for an account with no identity yet
+	default:
+		s.fp.forceWedge(a.ConfigDir)
+		s.log.Printf("acct-%02d file provider domain wedged at select (serves control ops but hangs reads); excluding it and letting the heal loop recover it — relaunch once it recovers: %v", a.ID, err)
+		return false
+	}
 }
 
 // holderClient returns an Owner-scoped client for the shared mount-holder socket:

@@ -1,0 +1,212 @@
+package daemon
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/yasyf/fusekit/fileproviderd"
+)
+
+// TestHandleFPRepairTargetSelection pins which accounts a repair touches: an
+// explicit account is repaired regardless of its verdict, a non-File-Provider or
+// unknown account is an op-level error, and a bulk repair (no account) touches
+// only currently-wedged domains.
+func TestHandleFPRepairTargetSelection(t *testing.T) {
+	t.Run("explicit fileprovider account re-registers regardless of verdict", func(t *testing.T) {
+		s, a, _, fake := newFPHealServer(t)
+		one := a.ID
+		resp := s.handleFPRepair(t.Context(), Request{Op: OpFPRepair, Account: &one})
+		if !resp.OK || len(resp.FPRepairs) != 1 {
+			t.Fatalf("resp = %+v, want OK with one repair result", resp)
+		}
+		if resp.FPRepairs[0].Outcome != FPRepairRepaired {
+			t.Fatalf("outcome = %q, want repaired", resp.FPRepairs[0].Outcome)
+		}
+		if _, setups, _, teardowns := fake.counts(); setups != 1 || teardowns != 1 {
+			t.Fatalf("setups=%d teardowns=%d, want 1/1 (one re-register)", setups, teardowns)
+		}
+		if kindOf(t, s, 1) != "fileprovider" {
+			t.Fatal("a re-register must not change the row")
+		}
+	})
+
+	t.Run("explicit non-fileprovider account is an op error", func(t *testing.T) {
+		s, _, _, _ := newFPHealServer(t)
+		two := 2 // acct-2 is a symlink row
+		resp := s.handleFPRepair(t.Context(), Request{Op: OpFPRepair, Account: &two})
+		if resp.OK || !strings.Contains(resp.Error, "not a file provider account") {
+			t.Fatalf("resp = %+v, want an op error naming the wrong backend", resp)
+		}
+	})
+
+	t.Run("explicit unknown account is an op error", func(t *testing.T) {
+		s, _, _, _ := newFPHealServer(t)
+		missing := 99
+		resp := s.handleFPRepair(t.Context(), Request{Op: OpFPRepair, Account: &missing})
+		if resp.OK || !strings.Contains(resp.Error, "not found") {
+			t.Fatalf("resp = %+v, want an account-not-found op error", resp)
+		}
+	})
+
+	t.Run("bulk repair touches only wedged domains", func(t *testing.T) {
+		s, _, dirs, fake := newFPHealServer(t)
+		wedgeIt(t, s.fp, dirs[1])
+		resp := s.handleFPRepair(t.Context(), Request{Op: OpFPRepair})
+		if !resp.OK || len(resp.FPRepairs) != 1 || resp.FPRepairs[0].ID != 1 {
+			t.Fatalf("resp = %+v, want exactly the wedged acct-1 repaired", resp)
+		}
+		if resp.FPRepairs[0].Outcome != FPRepairRepaired {
+			t.Fatalf("outcome = %q, want repaired", resp.FPRepairs[0].Outcome)
+		}
+		if _, setups, _, _ := fake.counts(); setups != 1 {
+			t.Fatalf("setups=%d, want 1 (only the wedged domain)", setups)
+		}
+		if s.fp.wedged(dirs[1]) {
+			t.Fatal("a clean re-register must reset the wedge state")
+		}
+	})
+
+	t.Run("bulk repair with no wedged domains is a no-op", func(t *testing.T) {
+		s, _, _, fake := newFPHealServer(t)
+		resp := s.handleFPRepair(t.Context(), Request{Op: OpFPRepair})
+		if !resp.OK || len(resp.FPRepairs) != 0 {
+			t.Fatalf("resp = %+v, want OK with no repairs", resp)
+		}
+		if _, setups, _, teardowns := fake.counts(); setups != 0 || teardowns != 0 {
+			t.Fatalf("setups=%d teardowns=%d, want 0/0 (nothing wedged)", setups, teardowns)
+		}
+	})
+}
+
+// TestRepairFPDomainOutcomes pins the per-account outcome classification: a clean
+// Setup repairs, a claimed account is busy, ErrCannotControl retreats to symlink,
+// and a transient Setup failure is reported as failed (never silently repaired).
+func TestRepairFPDomainOutcomes(t *testing.T) {
+	t.Run("clean re-register repairs and resets state", func(t *testing.T) {
+		s, a, dirs, _ := newFPHealServer(t)
+		wedgeIt(t, s.fp, dirs[1])
+		res := s.repairFPDomain(t.Context(), a)
+		if res.Outcome != FPRepairRepaired {
+			t.Fatalf("outcome = %q, want repaired", res.Outcome)
+		}
+		if s.fp.wedged(dirs[1]) {
+			t.Fatal("repair must reset the wedge verdict")
+		}
+	})
+
+	t.Run("a claimed account is busy", func(t *testing.T) {
+		s, a, _, fake := newFPHealServer(t)
+		if !s.tryReserve(a.ID) {
+			t.Fatal("could not reserve acct-1")
+		}
+		res := s.repairFPDomain(t.Context(), a)
+		if res.Outcome != FPRepairBusy {
+			t.Fatalf("outcome = %q, want busy under a reservation", res.Outcome)
+		}
+		if _, setups, _, teardowns := fake.counts(); setups != 0 || teardowns != 0 {
+			t.Fatalf("setups=%d teardowns=%d, want 0/0 (never re-registered a claimed dir)", setups, teardowns)
+		}
+	})
+
+	t.Run("ErrCannotControl retreats to symlink", func(t *testing.T) {
+		s, a, _, fake := newFPHealServer(t)
+		fake.setupErr = fmt.Errorf("file provider setup: %w", fileproviderd.ErrCannotControl)
+		res := s.repairFPDomain(t.Context(), a)
+		if res.Outcome != FPRepairRetreated {
+			t.Fatalf("outcome = %q, want retreated", res.Outcome)
+		}
+		if kindOf(t, s, 1) != "symlink" {
+			t.Fatal("ErrCannotControl repair must retreat the row to symlink")
+		}
+	})
+
+	t.Run("a transient Setup failure is reported failed, not repaired", func(t *testing.T) {
+		s, a, dirs, fake := newFPHealServer(t)
+		s.fp.forceWedge(dirs[1])
+		fake.setupErr = fmt.Errorf("register domain: %w", fileproviderd.ErrBusy)
+		res := s.repairFPDomain(t.Context(), a)
+		if res.Outcome != FPRepairFailed {
+			t.Fatalf("outcome = %q, want failed on a transient Setup error", res.Outcome)
+		}
+		if !s.fp.wedged(dirs[1]) {
+			t.Fatal("a failed repair must not clear the wedge verdict")
+		}
+		if kindOf(t, s, 1) != "fileprovider" {
+			t.Fatal("a failed (non-cannot-control) repair must not change the row")
+		}
+	})
+}
+
+// TestFPRepairEndToEndOverSocket drives OpFPRepair through the real wire:
+// Client.FPRepair -> unix socket -> handle -> dispatch -> handleFPRepair. A
+// missing dispatch case or client op would fail here, not in the handler unit.
+func TestFPRepairEndToEndOverSocket(t *testing.T) {
+	s, a, _, fake := newFPHealServer(t)
+	cl := &Client{socket: serveHandlerOnSocket(t, s)}
+	one := a.ID
+	resp, err := cl.FPRepair(&one)
+	if err != nil {
+		t.Fatalf("FPRepair: %v", err)
+	}
+	if !resp.OK || resp.Proto != ProtocolVersion {
+		t.Fatalf("resp = %+v, want OK at proto %d", resp, ProtocolVersion)
+	}
+	if len(resp.FPRepairs) != 1 || resp.FPRepairs[0].Outcome != FPRepairRepaired {
+		t.Fatalf("FPRepairs = %+v, want one repaired result", resp.FPRepairs)
+	}
+	if _, setups, _, _ := fake.counts(); setups != 1 {
+		t.Fatalf("setups = %d over the wire, want 1", setups)
+	}
+}
+
+// TestHandleStatusSurfacesFPWedged pins the status wire: a wedged domain appears
+// in Response.FPWedged joined to its account id, with recovery progress, and a
+// healthy pool reports none.
+func TestHandleStatusSurfacesFPWedged(t *testing.T) {
+	s, _, dirs, _ := newFPHealServer(t)
+
+	if resp := s.handleStatus(t.Context()); len(resp.FPWedged) != 0 {
+		t.Fatalf("FPWedged = %+v on a healthy pool, want none", resp.FPWedged)
+	}
+
+	wedgeIt(t, s.fp, dirs[1])
+	s.fp.recordAttempt(dirs[1], time.Unix(0, 0))
+	resp := s.handleStatus(t.Context())
+	if len(resp.FPWedged) != 1 {
+		t.Fatalf("FPWedged = %+v, want exactly the wedged acct-1", resp.FPWedged)
+	}
+	w := resp.FPWedged[0]
+	if w.ID != 1 || w.ConfigDir != dirs[1] {
+		t.Fatalf("wedged state = %+v, want acct-1 at %s", w, dirs[1])
+	}
+	if w.RecoveryAttempts != 1 || w.BreakerTripped {
+		t.Fatalf("recovery = (attempts %d, tripped %v), want (1, false)", w.RecoveryAttempts, w.BreakerTripped)
+	}
+}
+
+// TestFPWedgedSnapshotReportsBreaker pins that wedgedSnapshot flags a
+// breaker-parked domain (attempts past fpRecoveryBreaker) and drops a recovered
+// domain entirely.
+func TestFPWedgedSnapshotReportsBreaker(t *testing.T) {
+	fp := newFPState(alwaysNonEmpty)
+	wedgeIt(t, fp, fpTestDir)
+	for i := 0; i < fpRecoveryBreaker; i++ {
+		fp.recordAttempt(fpTestDir, time.Unix(0, 0))
+	}
+	snap := fp.wedgedSnapshot()
+	if len(snap) != 1 {
+		t.Fatalf("snapshot = %+v, want one wedged domain", snap)
+	}
+	if !snap[0].Tripped || snap[0].Attempts != fpRecoveryBreaker {
+		t.Fatalf("snapshot[0] = %+v, want tripped with %d attempts", snap[0], fpRecoveryBreaker)
+	}
+
+	if msg := fp.recordProbe(fpTestDir, nil); !strings.Contains(msg, "recovered") {
+		t.Fatalf("recovery log = %q, want a recovered line", msg)
+	}
+	if got := fp.wedgedSnapshot(); len(got) != 0 {
+		t.Fatalf("snapshot after recovery = %+v, want empty", got)
+	}
+}

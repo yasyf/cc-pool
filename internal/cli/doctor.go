@@ -56,14 +56,18 @@ func newDoctorCmd() *cobra.Command {
 				var cachedHolder *daemon.HolderStatus
 				var contentHealth string
 				var fpConsentPending bool
+				var fpWedged []daemon.FPDomainState
+				var daemonAlive bool
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
+					daemonAlive = true
 					report("daemon", true, resp.Version)
-					// Pending-TCC guidance and content-source health live only
-					// in the daemon's cache.
+					// Pending-TCC guidance, content-source health, and the File
+					// Provider wedge verdicts live only in the daemon's cache.
 					if sresp, serr := daemon.NewClient().Status(); serr == nil && sresp.OK {
 						cachedHolder = sresp.Holder
 						contentHealth = sresp.ContentHealth
 						fpConsentPending = sresp.FPConsentPending
+						fpWedged = sresp.FPWedged
 					}
 				} else {
 					report("daemon", false, "not running; run `ccp service install`")
@@ -99,6 +103,7 @@ func newDoctorCmd() *cobra.Command {
 				reportOrphanedHolder(cmd.Context(), reachable, accts, report)
 
 				reportFileProvider(cmd.Context(), m, accts, fpConsentPending, report)
+				reportFPWedges(accts, fpWedged, daemonAlive, report)
 				reportContentHealth(contentHealth, report)
 
 				for _, a := range accts {
@@ -335,6 +340,39 @@ func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Acco
 	default:
 		report("file provider bridge", false,
 			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); on first run macOS gates the app group container behind a one-time consent prompt: approve it, then restart the daemon; domains cannot fetch computed content until the socket is up — run `ccp fp onboard` for the guided setup")
+	}
+}
+
+// reportFPWedges surfaces wedged File Provider domains — control ops answer but
+// reads hang, the wedge the control-plane health check misses. When the daemon is
+// up it renders the daemon's authoritative verdicts (it is actively recovering
+// them); with the daemon down it probes each File Provider domain itself through
+// the fpDomainProbeAt seam so the wedge is still visible. Advisory: it points at
+// `ccp fp repair` (the re-register breaks open fds, so it is never run inline from
+// the doctor loop). A missing or empty-by-design .claude.json is no verdict.
+func reportFPWedges(accts []store.Account, cached []daemon.FPDomainState, daemonAlive bool, report func(string, bool, string)) {
+	if daemonAlive {
+		for _, w := range cached {
+			detail := "domain wedged (serves control ops but hangs reads); the daemon is recovering it — run `ccp fp repair` to re-register it now, then relaunch any sessions on it"
+			if w.BreakerTripped {
+				detail = "domain wedged; the daemon's automated recovery is exhausted — run `ccp fp repair` (it re-registers the domain), then relaunch any sessions on it; a stuck fileproviderd needs a manual restart (see " + abbreviateHome(pool.LogPath()) + ")"
+			}
+			report(fmt.Sprintf("acct-%02d file provider", w.ID), false, detail)
+		}
+		return
+	}
+	// Daemon down: probe each File Provider domain ourselves (its content bridge
+	// is down with the daemon, so a domain with an identity reads not-serving).
+	for _, a := range accts {
+		if !fileProviderRow(a.OverlayKind) {
+			continue
+		}
+		err := fpDomainProbeAt(a.ConfigDir)
+		if err == nil || errors.Is(err, overlay.ErrFPProbeMissing) || errors.Is(err, overlay.ErrFPProbeEmpty) {
+			continue
+		}
+		report(fmt.Sprintf("acct-%02d file provider", a.ID), false,
+			"domain not serving reads (probed directly; the daemon is down, so its content bridge is too) — start the daemon (`ccp service install`); if it stays wedged after that, run `ccp fp repair`")
 	}
 }
 

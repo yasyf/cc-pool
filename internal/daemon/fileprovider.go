@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -125,7 +126,7 @@ const (
 	fpRepaired                   // Health failed; the idempotent Setup re-registered + re-linked
 	fpRetry                      // transient control condition; retry next cycle
 	fpRetreated                  // ErrCannotControl: permanently retreated to symlink
-	fpDeferred                   // retreat refused (pending select or live session); retry next cycle
+	fpDeferred                   // retreat refused, or the self-heal ladder owns the wedged domain; retry next cycle
 )
 
 // reconcileFileProvider brings one File Provider row in line with its domain:
@@ -139,6 +140,13 @@ func (s *Server) reconcileFileProvider(ctx context.Context, a store.Account) fpO
 		return fpRetry
 	}
 	base, dir := pool.ClaudeDir(), a.ConfigDir
+	// Defer to the self-heal ladder while it holds this domain wedged and is backing
+	// off between recovery attempts: reconcile's Health+Setup would pile control ops
+	// on a domain the ladder is already recovering — the reconcile storm (defect 3)
+	// this gate removes.
+	if s.fp != nil && s.fp.wedged(dir) && !s.fp.due(dir, time.Now()) {
+		return fpDeferred
+	}
 	healthErr := prov.Health(base, dir)
 	if healthErr == nil {
 		return fpHealthy
@@ -168,6 +176,20 @@ func (s *Server) retreatFPToSymlink(ctx context.Context, a store.Account) bool {
 		return false
 	}
 	defer s.endConvert(a.ID)
+	if !s.convertFPToSymlinkHeld(ctx, a) {
+		return false
+	}
+	s.log.Printf("acct-%02d fell back to symlink: File Provider cannot serve on this machine", a.ID)
+	return true
+}
+
+// convertFPToSymlinkHeld is the shared File-Provider→symlink retreat body,
+// live-session-gated (a live session's open fds break on the domain removal, and a
+// failed scan cannot rule one out — defer in both cases) and clearing the row's
+// wedge/recovery state on success (fp.forget on retreat). Caller holds the convert
+// claim; the caller logs the success reason (the retreat is invoked for distinct
+// reasons — ErrCannotControl vs breaker exhaustion).
+func (s *Server) convertFPToSymlinkHeld(ctx context.Context, a store.Account) bool {
 	sessions, err := s.scan(ctx)
 	if err != nil {
 		s.log.Printf("acct-%02d deferring file-provider→symlink retreat: session scan: %v", a.ID, err)
@@ -181,6 +203,129 @@ func (s *Server) retreatFPToSymlink(ctx context.Context, a store.Account) bool {
 		s.log.Printf("acct-%02d file-provider→symlink retreat: %v", a.ID, err)
 		return false
 	}
-	s.log.Printf("acct-%02d fell back to symlink: File Provider cannot serve on this machine", a.ID)
+	if s.fp != nil {
+		s.fp.reset(a.ConfigDir)
+	}
 	return true
+}
+
+// handleFPRepair re-registers wedged File Provider domains on demand — the manual
+// lever for a domain the auto-heal ladder has parked (breaker tripped) or that an
+// operator wants reset now. With req.Account set it repairs that one account
+// regardless of its wedge verdict; without, it repairs every currently-wedged FP
+// domain. It routes through the daemon rather than the CLI so no select hands a
+// dir to a launching session mid-re-register (each repair runs under the convert
+// claim). A non-File-Provider or unknown account is an op-level error.
+func (s *Server) handleFPRepair(ctx context.Context, req Request) Response {
+	fp, err := s.fpAccounts()
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	var targets []store.Account
+	if req.Account != nil {
+		var found *store.Account
+		for i := range fp {
+			if fp[i].ID == *req.Account {
+				found = &fp[i]
+				break
+			}
+		}
+		if found == nil {
+			if _, gerr := s.m.Store.GetAccount(*req.Account); gerr != nil {
+				return Response{OK: false, Error: fmt.Sprintf("account %d not found", *req.Account)}
+			}
+			return Response{OK: false, Error: fmt.Sprintf("account %d is not a file provider account", *req.Account)}
+		}
+		targets = []store.Account{*found}
+	} else {
+		for _, a := range fp {
+			if s.fpWedged(a.ConfigDir) {
+				targets = append(targets, a)
+			}
+		}
+	}
+	results := make([]FPRepairResult, 0, len(targets))
+	for _, a := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		results = append(results, s.repairFPDomain(ctx, a))
+	}
+	return Response{OK: true, FPRepairs: results}
+}
+
+// repairFPDomain re-registers one File Provider domain (Teardown+Setup, the reset
+// that discards fileproviderd's poisoned replica state) under a standalone convert
+// claim, so no select hands the dir to a launching session mid-re-register. On a
+// clean re-register it resets the domain's wedge/recovery state so the next probe
+// re-verifies; ErrCannotControl retreats the row to symlink. Re-registration
+// proceeds even under live sessions (a wedged domain already fails their reads). It
+// does its own Teardown+Setup rather than reRegisterFP so a transient Setup failure
+// is reported as FPRepairFailed, not silently as repaired.
+func (s *Server) repairFPDomain(ctx context.Context, a store.Account) FPRepairResult {
+	res := FPRepairResult{ID: a.ID, Label: a.Label}
+	if !s.beginConvert(a.ID) {
+		res.Outcome = FPRepairBusy
+		res.Detail = "held by a pending select, a daemon poll, or a conversion; retry shortly"
+		return res
+	}
+	defer s.endConvert(a.ID)
+
+	// Re-read under the claim: the caller's list is a stale snapshot.
+	fresh, err := s.m.Store.GetAccount(a.ID)
+	if err != nil {
+		res.Outcome = FPRepairFailed
+		res.Detail = fmt.Sprintf("re-read account row: %v", err)
+		return res
+	}
+	res.Label = fresh.Label
+	if !fpBackedRow(fresh.OverlayKind) {
+		res.Outcome = FPRepairFailed
+		res.Detail = fmt.Sprintf("converted off file provider (now %s) in the claim gap", fresh.OverlayKind)
+		return res
+	}
+	prov := s.fpProvider(fresh)
+	if prov == nil {
+		res.Outcome = FPRepairFailed
+		res.Detail = "no file provider resolved for this account"
+		return res
+	}
+	base, dir := pool.ClaudeDir(), fresh.ConfigDir
+	if terr := prov.Teardown(base, dir); terr != nil {
+		// A wedged domain may refuse a clean Teardown; the idempotent Setup below
+		// re-adds regardless, so log and press on rather than failing the repair.
+		s.log.Printf("acct-%02d file provider repair: teardown: %v", fresh.ID, terr)
+	}
+	switch serr := prov.Setup(base, dir); {
+	case serr == nil:
+		if s.fp != nil {
+			s.fp.reset(dir)
+		}
+		s.log.Printf("acct-%02d file provider domain re-registered by `ccp fp repair`; the next probe verifies it — relaunch any sessions on it", fresh.ID)
+		res.Outcome = FPRepairRepaired
+		res.Detail = "re-registered; the next probe verifies it"
+	case errors.Is(serr, fileproviderd.ErrCannotControl):
+		if s.convertFPToSymlinkHeld(ctx, fresh) {
+			res.Outcome = FPRepairRetreated
+			res.Detail = "File Provider cannot serve on this machine; fell back to symlink"
+		} else {
+			res.Outcome = FPRepairFailed
+			res.Detail = "File Provider cannot serve here and the symlink retreat is blocked by a live session — relaunch it, then re-run"
+		}
+	default:
+		res.Outcome = FPRepairFailed
+		res.Detail = fmt.Sprintf("re-register failed: %v", serr)
+	}
+	return res
+}
+
+// fpBridgeReady reports whether the File Provider data bridge is up and the
+// one-time group-container consent has settled — the precondition for probing FP
+// domains, since a probe through a down bridge reads every domain as wedged.
+// fpBridgeReadyFn is a test seam.
+func (s *Server) fpBridgeReady() bool {
+	if s.fpBridgeReadyFn != nil {
+		return s.fpBridgeReadyFn()
+	}
+	return !s.fpConsentPending.Load() && content.NewBridgeClient(pool.FPBridgeSocketPath()).Available()
 }

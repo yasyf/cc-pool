@@ -30,9 +30,17 @@ var (
 	mountAliveAt = overlay.MountAliveWithin
 	// deepProbeAt is doctor's wedge probe: a 2 MiB read with a 5s bound.
 	deepProbeAt = overlay.DeepProbeWithin
-	stopDaemon  = stopDaemonService
-	brewManaged = func() bool { return ccpAgent().IsBrewManaged() }
-	brewStop    = func() error { return ccpAgent().BrewStop() }
+	// fpDomainProbeAt is doctor's File Provider data-plane wedge probe: a bounded
+	// read of the served .claude.json through the domain, so a wedge is visible
+	// even with the daemon down.
+	fpDomainProbeAt = overlay.FPDomainProbeWithin
+	// fpOverlayProvider resolves the File Provider overlay provider for the
+	// daemon-down direct `ccp fp repair` path; a seam so tests never register a
+	// real domain.
+	fpOverlayProvider = pool.OverlayProviderFor
+	stopDaemon        = stopDaemonService
+	brewManaged       = func() bool { return ccpAgent().IsBrewManaged() }
+	brewStop          = func() error { return ccpAgent().BrewStop() }
 )
 
 // holderClient is Owner-scoped: List/Reclaim see only cc-pool's own mounts,

@@ -4,9 +4,17 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/fileproviderd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // TestClassifyFPElection pins the trichotomy parse of pluginkit -m output:
@@ -250,4 +258,133 @@ func TestFPOnboardRegistered(t *testing.T) {
 	if err := fp.Args(fp, []string{"extra"}); err == nil {
 		t.Fatal("onboard accepted positional args; want cobra.NoArgs")
 	}
+}
+
+// TestFPRepairRegistered pins the command wiring: `ccp fp repair` exists under
+// the fp group, accepts no positional args, and carries the --account flag.
+func TestFPRepairRegistered(t *testing.T) {
+	root := NewRootCmd()
+	fp, _, err := root.Find([]string{"fp", "repair"})
+	if err != nil || fp.Name() != "repair" {
+		t.Fatalf("Find(fp repair) = (%v, %v), want the repair command", fp, err)
+	}
+	if err := fp.Args(fp, []string{"extra"}); err == nil {
+		t.Fatal("repair accepted positional args; want cobra.NoArgs")
+	}
+	if fp.Flags().Lookup("account") == nil {
+		t.Fatal("repair missing the --account flag")
+	}
+}
+
+// TestFPRepairTargets pins the daemon-down target selection: --account picks that
+// one File Provider row (error for a non-FP or unknown id), and no --account
+// picks every File Provider row (the daemon-down path cannot tell wedged from
+// healthy).
+func TestFPRepairTargets(t *testing.T) {
+	accts := []store.Account{
+		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendFileProvider)},
+		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(fkoverlay.BackendSymlink)},
+		{ID: 3, ConfigDir: "/p/acct-03", OverlayKind: string(fkoverlay.BackendFileProvider)},
+	}
+	cases := map[string]struct {
+		account int
+		wantIDs []int
+		wantErr string
+	}{
+		"no account picks every fp row":   {account: 0, wantIDs: []int{1, 3}},
+		"explicit fp account picks it":    {account: 1, wantIDs: []int{1}},
+		"explicit symlink account errors": {account: 2, wantErr: "not file provider"},
+		"explicit unknown account errors": {account: 9, wantErr: "not found"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := fpRepairTargets(accts, tc.account)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want one containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("fpRepairTargets: %v", err)
+			}
+			var ids []int
+			for _, a := range got {
+				ids = append(ids, a.ID)
+			}
+			if fmt.Sprint(ids) != fmt.Sprint(tc.wantIDs) {
+				t.Fatalf("target ids = %v, want %v", ids, tc.wantIDs)
+			}
+		})
+	}
+}
+
+// fakeFPProvider records Teardown/Setup for the daemon-down direct repair path,
+// so the test never registers a real File Provider domain.
+type fakeFPProvider struct {
+	setups, teardowns int
+	setupErr          error
+}
+
+func (f *fakeFPProvider) Backend() fkoverlay.Backend    { return fkoverlay.BackendFileProvider }
+func (f *fakeFPProvider) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
+func (f *fakeFPProvider) Health(_, _ string) error      { return nil }
+func (f *fakeFPProvider) Sync(_, _ string) error        { return nil }
+func (f *fakeFPProvider) Teardown(_, _ string) error    { f.teardowns++; return nil }
+func (f *fakeFPProvider) Setup(_, _ string) error       { f.setups++; return f.setupErr }
+
+// TestRepairFPDirect pins the daemon-down direct repair: it re-registers every
+// File Provider row (Teardown+Setup) through the injected provider, warns that
+// the daemon is down, and surfaces a per-domain failure without stranding the row.
+func TestRepairFPDirect(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	for _, a := range []store.Account{
+		{ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct-01"), OverlayKind: string(fkoverlay.BackendFileProvider), KeychainService: "s1", KeychainAccount: "u"},
+		{ID: 2, ConfigDir: filepath.Join(t.TempDir(), "acct-02"), OverlayKind: string(fkoverlay.BackendSymlink), KeychainService: "s2", KeychainAccount: "u"},
+	} {
+		if err := st.UpsertAccount(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &pool.Manager{Store: st}
+
+	t.Run("re-registers every fp row and warns the daemon is down", func(t *testing.T) {
+		fake := &fakeFPProvider{}
+		swapVar(t, &fpOverlayProvider, func(fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil })
+		cmd := &cobra.Command{}
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+
+		if err := repairFPDirect(cmd, m, 0); err != nil {
+			t.Fatalf("repairFPDirect: %v", err)
+		}
+		if fake.setups != 1 || fake.teardowns != 1 {
+			t.Fatalf("setups=%d teardowns=%d, want 1/1 (only the one fp row)", fake.setups, fake.teardowns)
+		}
+		for _, frag := range []string{"daemon is not running", "re-registered"} {
+			if !strings.Contains(out.String(), frag) {
+				t.Errorf("output %q missing %q", out.String(), frag)
+			}
+		}
+	})
+
+	t.Run("a cannot-control Setup surfaces a failure with the symlink hint", func(t *testing.T) {
+		fake := &fakeFPProvider{setupErr: fmt.Errorf("register: %w", fileproviderd.ErrCannotControl)}
+		swapVar(t, &fpOverlayProvider, func(fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil })
+		cmd := &cobra.Command{}
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+
+		if err := repairFPDirect(cmd, m, 1); err == nil || !strings.Contains(err.Error(), "failed to re-register") {
+			t.Fatalf("repairFPDirect err = %v, want a re-register failure", err)
+		}
+		if !strings.Contains(out.String(), "cannot serve") {
+			t.Errorf("output %q missing the cannot-serve guidance", out.String())
+		}
+	})
 }

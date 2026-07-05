@@ -138,6 +138,16 @@ func (s *PoolContentSource) ReadSynth(domain, name string) ([]byte, error) {
 	}
 }
 
+// SynthNonEmpty reports whether the synthetic .claude.json this source serves for
+// domain (an account ConfigDir) has content. The File Provider wedge detector uses
+// it to tell a genuine data-plane wedge — 0 bytes served for an account that has an
+// identity — from an empty-by-design account whose synth is legitimately empty (no
+// private .claude.json yet).
+func (s *PoolContentSource) SynthNonEmpty(domain string) bool {
+	b, err := s.ReadSynth(domain, claudeJSONName)
+	return err == nil && len(b) > 0
+}
+
 // WriteThrough persists a committed synthetic document's shareable parts back to
 // the shared base under writeThroughMu; identical-byte rewrites are skipped (they
 // would bump base's mtime and thrash every mount's merge cache), and a missing
