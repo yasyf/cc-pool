@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"8fa39716942d7fc5d078ff118554bf41ea61610c"}]}
+{"v":1,"lamport":4,"ops":[{"kind":"add_comment","body":"Shipped: fusekit v0.31.0 WaitDomainServes in Setup; cc-pool v0.43.0 Swift DomainClaims, convert probe gate, CLI per-account fan-out, force Detail"}]}
