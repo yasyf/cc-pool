@@ -84,10 +84,18 @@ final class FileProviderController {
 
     private let acceptQueue = DispatchQueue(label: "cc-pool.fp.accept")
     private let connQueue = DispatchQueue(label: "cc-pool.fp.conn", attributes: .concurrent)
-    private let domainQueue = DispatchQueue(label: "cc-pool.fp.domain", qos: .utility)
-    /// Single-flight gate for domain ops, try-acquired on the connection
-    /// thread so an overlapping op replies "busy" immediately.
-    private let domainGate = DispatchSemaphore(value: 1)
+    /// Concurrent: different domains' NSFileProviderManager calls run in
+    /// parallel (XPC bounds each domain at one op). Mutual exclusion is
+    /// per-domain via `claims`, not queue serialization.
+    private let domainQueue = DispatchQueue(
+        label: "cc-pool.fp.domain", qos: .utility, attributes: .concurrent)
+    /// Per-domain in-flight claims: same-domain ops serialize, different
+    /// domains proceed concurrently. Health-ish reads (path/signal) run
+    /// unclaimed so they can never bounce busy.
+    private let claims = DomainClaims()
+    /// Throwaway domain id the probe op registers; per-process stable so a
+    /// probe claims a key disjoint from every real account domain.
+    private let probeDomainID = "ccp-probe-\(getpid())"
     private var listenFD: Int32 = -1
     private lazy var baseWatcher = ClaudeBaseWatcher { [weak self] in self?.signalAllDomains() }
     private var loggedSignalError = false
@@ -187,12 +195,18 @@ final class FileProviderController {
                 reply(fd, .failure("domain required for op \(req.op)", nil))
                 return
             }
-            guard domainGate.wait(timeout: .now()) == .success else {
-                reply(fd, .failure("another domain operation is in flight", .busy))
+            guard let key = DomainClaims.key(op: req.op, domain: domain, probeID: probeDomainID) else {
+                // Unclaimed (path/signal): a health-ish read that must never
+                // bounce busy — dispatch straight onto the concurrent queue.
+                domainQueue.async { self.reply(fd, self.perform(req.op, domain: domain)) }
+                return
+            }
+            guard claims.claim(key) else {
+                reply(fd, .failure("domain \(key) is busy with another operation", .busy))
                 return
             }
             domainQueue.async {
-                defer { self.domainGate.signal() }
+                defer { self.claims.release(key) }
                 self.reply(fd, self.perform(req.op, domain: domain))
             }
         default:
@@ -226,7 +240,7 @@ final class FileProviderController {
         return (try? JSONDecoder().decode(Peer.self, from: line)) != nil
     }
 
-    // MARK: - Domain ops (serial on domainQueue)
+    // MARK: - Domain ops (per-domain serialized via claims, concurrent across domains)
 
     private func perform(_ op: String, domain: String) -> ControlResponse {
         switch op {
@@ -307,7 +321,7 @@ final class FileProviderController {
     /// retreat); every other failure is transient. Raw NSErrors are logged on
     /// every failure path to pin macOS-26 codes before the mapping is trusted.
     private func probe() -> ControlResponse {
-        let id = "ccp-probe-\(getpid())"
+        let id = probeDomainID
         let d = NSFileProviderDomain(
             identifier: NSFileProviderDomainIdentifier(rawValue: id), displayName: id)
         defer {

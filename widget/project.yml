@@ -157,11 +157,34 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.yasyf.cc-pool.status.fileprovider
         SKIP_INSTALL: true
 
+  CCPoolStatusTests:
+    # Host-less unit-test bundle for the app's PURE logic only. It compiles the
+    # code under test (DomainClaims) straight into the bundle — no TEST_HOST, no
+    # app launch, no signed appex — so it runs standalone in CI. Keep it pure:
+    # anything needing AppKit/NSFileProviderManager belongs in the VM e2e, not
+    # here.
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+      - path: Sources/App/DomainClaims.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yasyf.cc-pool.status.tests
+        GENERATE_INFOPLIST_FILE: "YES"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+
 schemes:
   CCPoolStatus:
     build:
       targets:
         CCPoolStatus: all
+        CCPoolStatusTests: [test]
+    test:
+      config: Debug
+      targets:
+        - CCPoolStatusTests
     run:
       config: Debug
     archive:
