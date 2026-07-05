@@ -1,0 +1,632 @@
+#!/usr/bin/env bash
+# scripts/vm/vmctl — disposable tart VM harness for cc-pool File Provider
+# incident replay (fleet `ccp migrate --to fileprovider --force`). See
+# scripts/vm/README.md.
+#
+# ALL harness state lives under $VM_ROOT (default /tmp/ccpool-vm): VM disk, ssh
+# key, results, and — unless VMCTL_TART_HOME repoints it to a shared cache — the
+# pulled image cache; `vmctl destroy` removes $VM_ROOT wholesale. The only host
+# mutation outside $VM_ROOT is `brew install cirruslabs/cli/tart`, announced
+# loudly before it happens.
+#
+# Adapted from fusekit/scripts/vm/vmctl (see scripts/vm/README.md § Provenance).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+# The cc-notes log every run archives into. cc-pool has no pinned log id yet, so
+# by default it is resolved by NAME at archive time (created on first use);
+# pin a specific log via the VMCTL_CHRONOLOGY_LOG env override. See
+# vmctl_chronology_log.
+VMCTL_CHRONOLOGY_LOG="${VMCTL_CHRONOLOGY_LOG:-}"
+VMCTL_CHRONOLOGY_NAME="${VMCTL_CHRONOLOGY_NAME:-cc-pool vm-repro chronology}"
+
+usage() {
+  cat <<'EOF'
+usage: scripts/vm/vmctl <command> [args]
+
+Disposable tart VM harness for cc-pool File Provider incident replay.
+All harness state lives under $VM_ROOT (default /tmp/ccpool-vm).
+Details: scripts/vm/README.md.
+
+commands:
+  create           install tart if missing (loud), clone the image, set cpu/mem/disk
+  provision        boot, ssh-key bootstrap, no-sleep, App-Group TCC, enable the FP extension
+  push             build cc-pool + the Developer ID-signed CCPoolStatus.app, install into the guest
+  run <scenario>   execute a scenario under the panic watcher
+  shell [cmd...]   ssh into the guest (interactive without args)
+  collect          scrape panic reports and guest facts into a results dir
+  archive <dir>    append a run's results dir to the cc-notes vm-repro chronology
+  status           show harness, VM, and guest state (always exits 0)
+  destroy          delete the VM via tart, then remove $VM_ROOT wholesale
+
+run exit codes: 0 expectation met, 1 infra failure, 2 panicked under
+EXPECT=clean, 3 no repro under EXPECT=panic. Other commands exit 0 on success,
+1 on failure; usage errors exit 64.
+EOF
+}
+
+# cmd_create installs tart if missing (the one host mutation outside
+# $VM_ROOT), clones the image into TART_HOME, and applies sizing.
+# Idempotent; provision calls it first.
+cmd_create() {
+  [[ "$(uname -m)" == "arm64" ]] || die "tart requires Apple Silicon (host is $(uname -m))"
+  vm_ensure_dirs
+  if ! command -v tart >/dev/null 2>&1; then
+    require_cmd brew "install Homebrew first"
+    log "HOST MUTATION: installing tart via 'brew install cirruslabs/cli/tart'"
+    log "this is the ONLY host change vmctl makes outside $VM_ROOT"
+    brew install cirruslabs/cli/tart
+  fi
+  local avail_gb
+  avail_gb="$(df -g /private/tmp 2>/dev/null | awk 'NR==2 {print $4}')" || avail_gb=""
+  if [[ -n "$avail_gb" && "$avail_gb" -lt 100 ]]; then
+    warn "/tmp has ${avail_gb}G free; the harness peaks around 90G (image cache + VM disk)"
+  fi
+  if vm_exists; then
+    log "VM $VMCTL_NAME already exists; keeping it (vmctl destroy to re-clone)"
+  else
+    log "cloning $VMCTL_IMAGE -> $VMCTL_NAME under TART_HOME=$VM_TART_HOME"
+    log "a first-time image pull downloads tens of GB: expect 20-60 min"
+    vm_tart clone "$VMCTL_IMAGE" "$VMCTL_NAME"
+  fi
+  vm_tart set "$VMCTL_NAME" --cpu "$VMCTL_CPUS" --memory "$VMCTL_MEMORY_MB" --disk-size "$VMCTL_DISK_GB"
+  log "created; next: vmctl provision"
+}
+
+# cmd_provision boots the guest and makes it replay-ready: ssh key, sudo, sleep
+# off, the App-Group-data TCC grant the daemon's File Provider bridge needs, and
+# — once the app has been pushed — the File Provider extension enabled. No
+# fuse-t or holder: the incident replay exercises only the File Provider path.
+cmd_provision() {
+  cmd_create
+  if ! vm_is_running; then
+    vm_start auto
+  else
+    log "VM $VMCTL_NAME already running"
+  fi
+  log "waiting for the guest to open ssh (a fresh image's first boot can take minutes)"
+  vm_wait_port22 900 || die "guest never opened port 22 (logs: $VM_ROOT/logs)"
+  vm_authorize_ssh_key
+  vm_wait_ssh 120 || die "key-based ssh not working after bootstrap"
+  vm_ensure_sudo
+  vm_assert_guest
+  log "disabling guest sleep"
+  vm_sudo "pmset -a sleep 0 displaysleep 0 disksleep 0"
+  provision_tcc
+  # The FP extension can only be enabled once its host app is installed. If a
+  # prior push already put it there, enable it now; otherwise push does it.
+  if vm_ssh "test -d '$VMCTL_GUEST_APP'" >/dev/null 2>&1; then
+    fp_register_and_enable || warn "FP extension not yet enabled — see the click-Allow fallback (README: FP provisioning)"
+  else
+    log "FP extension enable deferred to 'vmctl push' (needs the app installed first)"
+  fi
+  log "provisioned; next: vmctl push"
+}
+
+# provision_tcc grants App-Group-data TCC (kTCCServiceSystemPolicyAppData) to
+# VMCTL_TCC_APPDATA_CLIENTS by writing the guest's system TCC.db directly —
+# possible only when the image ships with SIP disabled (cirruslabs images do).
+# It pre-authorizes the daemon's first bind of the File Provider bridge socket
+# inside the CCPoolStatus App Group container, which macOS otherwise gates behind
+# a one-time GUI prompt a headless guest cannot answer. The service is a best
+# guess (the app-group-data prompt is undocumented); if it does not take, the
+# daemon logs "awaiting the one-time app-group-container consent" and the fix is
+# the VMCTL_GRAPHICS=1 click-Allow path (README: FP provisioning). The replay
+# scenario proves the grant end-to-end when its through-domain reads succeed.
+provision_tcc() {
+  local status client ctype
+  status="$(vm_ssh csrutil status 2>/dev/null)" || status=""
+  if [[ "$status" != *disabled* ]]; then
+    warn "guest SIP is enabled — cannot write the App-Group-data TCC grant directly"
+    warn "fallback: VMCTL_GRAPHICS=1 vmctl provision, then click Allow when the daemon first binds (README: FP provisioning)"
+    return 0
+  fi
+  # shellcheck disable=SC2086 # VMCTL_TCC_APPDATA_CLIENTS is a space-separated list by contract
+  for client in $VMCTL_TCC_APPDATA_CLIENTS; do
+    ctype=0
+    [[ "$client" == /* ]] && ctype=1
+    log "granting App-Group-data (kTCCServiceSystemPolicyAppData) TCC to $client (client_type=$ctype)"
+    if ! printf "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier,flags) VALUES ('kTCCServiceSystemPolicyAppData','%s',%d,2,4,1,'UNUSED',0);\n" "$client" "$ctype" |
+      vm_ssh "sudo -n -- sqlite3 '/Library/Application Support/com.apple.TCC/TCC.db'"; then
+      warn "TCC insert failed for $client — use the VMCTL_GRAPHICS=1 click-Allow path (README: FP provisioning)"
+      return 0
+    fi
+  done
+  # tccd caches the db; a respawn re-reads it.
+  vm_sudo "pkill tccd || true"
+  log "App-Group-data TCC grants written"
+}
+
+# cmd_push delegates to the repo-specific build+install seam.
+cmd_push() { exec "$SCRIPT_DIR/push.sh" "$@"; }
+
+# resolve_scenario prints the scenario file for a run argument, trying it as
+# given, relative to scripts/vm/, and under scenarios/, with and without .sh.
+resolve_scenario() {
+  local arg="$1" c
+  for c in "$arg" "$arg.sh" "$SCRIPT_DIR/$arg" "$SCRIPT_DIR/$arg.sh" \
+    "$SCRIPT_DIR/scenarios/$arg" "$SCRIPT_DIR/scenarios/$arg.sh"; do
+    if [[ -f "$c" ]]; then
+      printf '%s\n' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# run_die writes an "error: <msg>" verdict file into the run's results dir,
+# then dies. cmd_run failure paths that fire after the results dir exists but
+# before meta.json is written use it, so no results dir is ever verdict-less.
+run_die() {
+  printf 'error: %s\n' "$*" >"$VMCTL_RESULTS_DIR/verdict"
+  die "$*"
+}
+
+# cmd_run executes one scenario under the panic watcher. vmctl owns the
+# timeout, panic detection, tart relaunch, evidence collection, meta.json, and
+# the exit-code mapping; the scenario only drives guest load via lib.sh.
+cmd_run() {
+  [[ $# -eq 1 ]] || {
+    usage >&2
+    exit 64
+  }
+  local scenario_file scenario expect
+  scenario_file="$(resolve_scenario "$1")" || die "scenario not found: $1 (tried as given, under scripts/vm/, and under scripts/vm/scenarios/)"
+  scenario="$(basename "$scenario_file" .sh)"
+  expect="$(sed -n 's/^EXPECT=\([a-z]*\).*$/\1/p' "$scenario_file" | head -n 1)"
+  [[ "$expect" == "panic" || "$expect" == "clean" ]] ||
+    die "scenario must declare EXPECT=panic or EXPECT=clean on its own line: $scenario_file"
+
+  vm_require_tart
+  vm_ensure_dirs
+  vm_ensure_running 600 || die "VM unreachable — run vmctl provision first"
+  vm_assert_guest
+  local build_rev
+  build_rev="$(vm_ssh cat "$VMCTL_GUEST_DIR/BUILD_REV" 2>/dev/null)" || die "no BUILD_REV in the guest — run vmctl push first"
+
+  local ts results
+  ts="$(date +%Y%m%d-%H%M%S)"
+  results="$VM_RESULTS_ROOT/$ts-$scenario"
+  mkdir -p "$results"
+  export VMCTL_SCENARIO="$scenario"
+  export VMCTL_RESULTS_DIR="$results"
+  export VMCTL_PHASE_FILE="$results/phase"
+  printf 'init\n' >"$VMCTL_PHASE_FILE"
+
+  local timeout_s start_epoch started_at deadline
+  timeout_s=$((VMCTL_RUN_TIMEOUT_MIN * 60))
+  start_epoch="$(date +%s)"
+  deadline=$((start_epoch + timeout_s))
+  export VMCTL_DEADLINE_EPOCH="$deadline"
+  started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+  vm_mark_run_start || run_die "cannot write the run-start marker in the guest"
+  local boot_start boot_ref
+  boot_start="$(vm_boottime)" || run_die "cannot read guest boottime"
+  boot_ref="$boot_start"
+
+  log "run $scenario: EXPECT=$expect BUILD_REV=$build_rev timeout=${VMCTL_RUN_TIMEOUT_MIN}m"
+  log "results: $results"
+
+  # Kill the scenario's whole process group (lingering vm_ssh churn included)
+  # if vmctl exits any way other than the normal verdict path.
+  trap 'if [[ -n "${SCENARIO_PGID:-}" ]]; then kill -TERM -- "-$SCENARIO_PGID" 2>/dev/null || true; fi' EXIT
+
+  # Job control gives the scenario subshell its own process group.
+  set -m
+  # shellcheck disable=SC1090 # scenario path is dynamic by design
+  (source "$scenario_file") >"$results/scenario.log" 2>&1 &
+  SCENARIO_PGID=$!
+  set +m
+
+  local panicked=0 tart_relaunches=0 scenario_rc="" end_reason="" unreach=0 bt nb np
+  while :; do
+    if (($(date +%s) >= deadline)); then
+      end_reason="timeout"
+      break
+    fi
+    if ! kill -0 "$SCENARIO_PGID" 2>/dev/null; then
+      set +e
+      wait "$SCENARIO_PGID"
+      scenario_rc=$?
+      set -e
+      end_reason="scenario-exit"
+      break
+    fi
+    # The VM going down is not itself a guest verdict: relaunch headless and let
+    # the .panic probe decide whether the guest actually panicked. Keyed off
+    # tart's own run-state, never the pidfile (which a lost-race relaunch can
+    # leave pointing at a dead PID while the true owner keeps the VM up).
+    if ! vm_is_running; then
+      warn "VM is down; relaunching headless"
+      tart_relaunches=$((tart_relaunches + 1))
+      vm_ip_forget
+      vm_start headless
+      if vm_wait_ssh 600; then
+        # A relaunch always yields a fresh boottime; rebase the reference and
+        # rely on fresh .panic reports for the panic verdict.
+        if nb="$(vm_boottime)"; then
+          boot_ref="$nb"
+        fi
+        # An unreadable probe is treated as no evidence — never a false positive.
+        np="$(vm_new_panic_count)" || np=0
+        if [[ "$np" != "0" ]]; then
+          log "found $np new panic report(s) after the tart relaunch: the guest panicked"
+          panicked=1
+          end_reason="panic"
+          break
+        fi
+      else
+        warn "guest did not come back after the tart relaunch"
+        end_reason="unreachable"
+        break
+      fi
+      continue
+    fi
+    if bt="$(vm_boottime)"; then
+      unreach=0
+      if [[ "$bt" != "$boot_ref" ]]; then
+        log "guest boottime changed ($boot_ref -> $bt): kernel panic (reboot in place)"
+        panicked=1
+        end_reason="panic"
+        break
+      fi
+    else
+      unreach=$((unreach + 1))
+      vm_ip_forget
+      if ((unreach % 6 == 1)); then
+        log "guest ssh unreachable (poll $unreach) — watching for a reboot"
+      fi
+    fi
+    sleep 10
+  done
+
+  # Stop the scenario's process group; harmless when it already exited.
+  if [[ -z "$scenario_rc" ]]; then
+    kill -TERM -- "-$SCENARIO_PGID" 2>/dev/null || true
+    set +e
+    wait "$SCENARIO_PGID" 2>/dev/null
+    scenario_rc=$?
+    set -e
+  fi
+
+  # Final verdict pass: a panic in flight when the workload stopped still
+  # surfaces as a changed boottime or a fresh .panic report. The wait also
+  # covers a guest that is mid-reboot right now.
+  local boot_end=""
+  if [[ "$end_reason" != "unreachable" ]]; then
+    vm_ip_forget
+    if vm_wait_ssh 300; then
+      boot_end="$(vm_boottime)" || boot_end=""
+      if [[ "$panicked" == "0" && -n "$boot_end" ]]; then
+        np="$(vm_new_panic_count)" || np=0
+        if [[ "$boot_end" != "$boot_ref" || "$np" != "0" ]]; then
+          log "post-run check found panic evidence (boottime $boot_ref -> $boot_end, new reports: $np)"
+          panicked=1
+        fi
+      fi
+    fi
+  fi
+
+  if ((panicked)); then
+    log "collecting panic evidence"
+    vm_scrape_panics "$results" || warn "panic scrape failed — reports remain in the guest"
+  fi
+  np="$(vm_new_panic_count)" || np=0
+
+  local exit_code note
+  if ((panicked)); then
+    if [[ "$expect" == "panic" ]]; then
+      exit_code=0
+      note="repro: guest panicked"
+    else
+      exit_code=2
+      note="guest panicked under EXPECT=clean"
+    fi
+  elif [[ "$end_reason" == "unreachable" || -z "$boot_end" ]]; then
+    exit_code=1
+    note="guest unreachable at end of run — cannot certify a verdict"
+  elif [[ "$expect" == "clean" ]]; then
+    if [[ "$end_reason" == "timeout" || "$scenario_rc" == "0" ]]; then
+      exit_code=0
+      note="clean for the full window"
+    else
+      exit_code=1
+      note="scenario failed (rc=$scenario_rc) without a panic — infra/workload failure"
+    fi
+  else # EXPECT=panic without a panic
+    if [[ "$end_reason" == "scenario-exit" && "$scenario_rc" != "0" ]]; then
+      exit_code=1
+      note="scenario failed (rc=$scenario_rc) before any panic — infra/workload failure"
+    else
+      exit_code=3
+      note="no repro within ${VMCTL_RUN_TIMEOUT_MIN}m"
+    fi
+  fi
+
+  local phase ended_at end_epoch panicked_json boot_end_json
+  phase="$(cat "$VMCTL_PHASE_FILE" 2>/dev/null)" || phase="unknown"
+  ended_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  end_epoch="$(date +%s)"
+  panicked_json=false
+  ((panicked)) && panicked_json=true
+  boot_end_json="${boot_end:-null}"
+  cat >"$results/meta.json" <<EOF
+{
+  "scenario": "$scenario",
+  "expect": "$expect",
+  "build_rev": "$build_rev",
+  "phase": "$phase",
+  "started_at": "$started_at",
+  "ended_at": "$ended_at",
+  "duration_s": $((end_epoch - start_epoch)),
+  "timeout_min": $VMCTL_RUN_TIMEOUT_MIN,
+  "panicked": $panicked_json,
+  "panic_reports_new": $np,
+  "boottime_start": $boot_start,
+  "boottime_end": $boot_end_json,
+  "tart_relaunches": $tart_relaunches,
+  "end_reason": "$end_reason",
+  "scenario_exit": $scenario_rc,
+  "exit_code": $exit_code,
+  "note": "$note"
+}
+EOF
+
+  log "verdict: $note (exit $exit_code)"
+  log "meta: $results/meta.json"
+  # Subshell so any archive death lands here with the recovery instructions;
+  # an archive failure never loses evidence — the results dir persists.
+  (cmd_archive "$results") ||
+    die "archive failed — evidence is intact under $results; retry with: scripts/vm/vmctl archive $results"
+  return "$exit_code"
+}
+
+# cmd_shell opens an interactive guest shell, or runs one guest command.
+cmd_shell() {
+  vm_require_tart
+  if [[ $# -gt 0 ]]; then
+    vm_ssh "$@"
+    return
+  fi
+  local ip
+  ip="$(vm_ip)" || die "cannot resolve the guest IP — is the VM running? (vmctl status)"
+  exec ssh -i "$VM_SSH_KEY" \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+    "$VM_GUEST_USER@$ip"
+}
+
+# cmd_collect scrapes panic reports and guest facts into a fresh results dir,
+# for ad-hoc evidence gathering outside a run.
+cmd_collect() {
+  vm_require_tart
+  vm_ensure_dirs
+  vm_ssh_ok || die "guest unreachable — is the VM running? (vmctl status)"
+  local ts results started_at
+  ts="$(date +%Y%m%d-%H%M%S)"
+  results="$VM_RESULTS_ROOT/$ts-collect"
+  mkdir -p "$results"
+  started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  vm_scrape_panics "$results" || warn "panic scrape failed"
+  # shellcheck disable=SC2029 # host-side interpolation of the guest paths is intended
+  vm_ssh "sw_vers; echo; uname -a; echo; sysctl kern.boottime kern.hv_vmm_present; echo; mount; echo; df -h /; echo; echo '== FP extension =='; pluginkit -m -i '$VMCTL_FP_BUNDLE_ID' 2>/dev/null; echo; echo '== cc-pool =='; '$VMCTL_GUEST_CCP' --version 2>/dev/null; ls -la '$VMCTL_GUEST_DIR' 2>/dev/null; cat '$VMCTL_GUEST_DIR/BUILD_REV' 2>/dev/null" \
+    >"$results/guest-facts.txt" 2>&1 || warn "guest facts incomplete"
+  cat >"$results/meta.json" <<EOF
+{
+  "scenario": "collect",
+  "started_at": "$started_at",
+  "ended_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "exit_code": 0
+}
+EOF
+  log "collected into $results"
+}
+
+# meta_field prints one scalar field from a run's meta.json. cmd_run writes
+# meta.json itself with a fixed one-field-per-line layout, so a line match is
+# reliable without a JSON parser on the host.
+meta_field() {
+  sed -nE "s/^  \"$2\": \"?([^\",]*)\"?,?\$/\1/p" "$1" | head -n 1
+}
+
+# cmd_archive appends one results dir to the cc-notes vm-repro chronology log:
+# the entry message is a one-line verdict summary plus the full meta.json, with
+# scenario.log and every scraped panics/*.panic attached (content reaches the
+# remote via git-lfs on `cc-notes sync`). cmd_run calls this after every
+# verdict; run it by hand to save a dir the auto-archive never covered.
+cmd_archive() {
+  [[ $# -eq 1 ]] || {
+    usage >&2
+    exit 64
+  }
+  require_cmd cc-notes "brew install yasyf/tap/cc-notes"
+  require_cmd python3 "the chronology-log lookup parses cc-notes JSON with python3"
+  local results run
+  results="$(cd "$1" 2>/dev/null && pwd)" || die "archive: results dir not found: $1"
+  run="$(basename "$results")"
+  [[ -f "$results/scenario.log" ]] || die "archive: no scenario.log in $results — not a run results dir"
+
+  local message
+  if [[ -f "$results/meta.json" ]]; then
+    local meta="$results/meta.json"
+    message="$(printf '%s: scenario=%s phase=%s build_rev=%s end_reason=%s panicked=%s duration_s=%s panic_reports_new=%s\n\n%s' \
+      "$run" "$(meta_field "$meta" scenario)" "$(meta_field "$meta" phase)" \
+      "$(meta_field "$meta" build_rev)" "$(meta_field "$meta" end_reason)" \
+      "$(meta_field "$meta" panicked)" "$(meta_field "$meta" duration_s)" \
+      "$(meta_field "$meta" panic_reports_new)" "$(cat "$meta")")"
+  else
+    message="$run: meta.json missing — the run aborted before a verdict was written"
+    if [[ -f "$results/verdict" ]]; then
+      message="$message ($(cat "$results/verdict"))"
+    fi
+  fi
+
+  # Attachment names are log-global in cc-notes, so stage run-prefixed
+  # symlinks: every run attaches its own "scenario.log" without colliding.
+  local stage p attach
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/vmctl-archive.XXXXXX")"
+  ln -s "$results/scenario.log" "$stage/$run-scenario.log"
+  attach=(--attach "$stage/$run-scenario.log")
+  for p in "$results"/panics/*.panic; do
+    [[ -e "$p" ]] || continue # no scraped panics: the glob stayed literal
+    ln -s "$p" "$stage/$run-$(basename "$p")"
+    attach+=(--attach "$stage/$run-$(basename "$p")")
+  done
+
+  local logid
+  logid="$(vmctl_chronology_log)" || {
+    rm -rf "$stage"
+    die "archive: cannot resolve/create the cc-notes chronology log; evidence is intact under $results"
+  }
+  # cc-notes resolves the repo from the cwd; vmctl may run from anywhere.
+  if ! (cd "$SCRIPT_DIR" && cc-notes log append "$logid" -m "$message" "${attach[@]}" >/dev/null); then
+    rm -rf "$stage"
+    die "archive failed — evidence is intact under $results; retry with: scripts/vm/vmctl archive $results"
+  fi
+  rm -rf "$stage"
+  log "archived $run to the vm-repro chronology (cc-notes log show $logid)"
+}
+
+# vmctl_chronology_log prints the cc-notes log id to archive into. It honors a
+# pinned VMCTL_CHRONOLOGY_LOG, else resolves VMCTL_CHRONOLOGY_NAME to an existing
+# log id via `cc-notes log list --json`, creating the log on first use. Unlike
+# fusekit (which pins a fixed id), cc-pool has no chronology log yet, so the
+# first archive mints one — a cc-notes ref write, done only when a real run
+# archives, never at author time.
+vmctl_chronology_log() {
+  if [[ -n "$VMCTL_CHRONOLOGY_LOG" ]]; then
+    printf '%s\n' "$VMCTL_CHRONOLOGY_LOG"
+    return 0
+  fi
+  local id
+  id="$(chronology_lookup)"
+  if [[ -n "$id" ]]; then
+    printf '%s\n' "$id"
+    return 0
+  fi
+  log "creating cc-notes log \"$VMCTL_CHRONOLOGY_NAME\" (first archive)"
+  (cd "$SCRIPT_DIR" && cc-notes log add "$VMCTL_CHRONOLOGY_NAME" --dir scripts/vm >/dev/null) || return 1
+  id="$(chronology_lookup)"
+  [[ -n "$id" ]] || return 1
+  printf '%s\n' "$id"
+}
+
+# chronology_lookup prints the id of the log titled VMCTL_CHRONOLOGY_NAME, or
+# nothing. `cc-notes log list --json` emits [{"id","title",...}]; a title match
+# is exact.
+chronology_lookup() {
+  (cd "$SCRIPT_DIR" && cc-notes log list --json 2>/dev/null) |
+    VMCTL_CHRONOLOGY_NAME="$VMCTL_CHRONOLOGY_NAME" python3 -c '
+import json, os, sys
+want = os.environ["VMCTL_CHRONOLOGY_NAME"]
+try:
+    logs = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for lg in logs or []:
+    if lg.get("title") == want:
+        print(lg.get("id", ""))
+        break
+'
+}
+
+# cmd_status reports harness/VM/guest state read-only and always exits 0 —
+# safe with no tart, no VM, and no $VM_ROOT.
+cmd_status() {
+  echo "vmctl status"
+  if command -v tart >/dev/null 2>&1; then
+    echo "  tart:       $(command -v tart) ($(vm_tart --version 2>/dev/null || echo 'version unknown'))"
+  else
+    echo "  tart:       not installed (vmctl create installs it)"
+  fi
+  echo "  TART_HOME:  $VM_TART_HOME"
+  if [[ -d "$VM_ROOT" ]]; then
+    echo "  state root: $VM_ROOT ($(du -sh "$VM_ROOT" 2>/dev/null | awk '{print $1}' || true))"
+  else
+    echo "  state root: $VM_ROOT (absent)"
+  fi
+  if command -v tart >/dev/null 2>&1 && vm_exists; then
+    echo "  vm:         $VMCTL_NAME (exists)"
+    if vm_is_running; then
+      echo "  vm state:   running"
+    else
+      echo "  vm state:   stopped"
+    fi
+    if [[ -f "$VM_SSH_KEY" ]] && vm_ssh_ok; then
+      echo "  guest ssh:  reachable (ip $(vm_ip 2>/dev/null || echo '?'), boottime $(vm_boottime 2>/dev/null || echo '?'))"
+      echo "  build rev:  $(vm_ssh cat "$VMCTL_GUEST_DIR/BUILD_REV" 2>/dev/null || echo 'not pushed')"
+    else
+      echo "  guest ssh:  unreachable"
+    fi
+  else
+    echo "  vm:         $VMCTL_NAME (absent)"
+  fi
+  if [[ -d "$VM_RESULTS_ROOT" ]]; then
+    echo "  results:"
+    # Dir names lead with the run timestamp, so a reverse name sort is newest-first.
+    find "$VM_RESULTS_ROOT" -mindepth 1 -maxdepth 1 -exec basename {} ';' 2>/dev/null | sort -r | sed 's/^/    /' || true
+  else
+    echo "  results:    none"
+  fi
+  return 0
+}
+
+# cmd_destroy deletes the VM via tart, kills a lingering tart process, and
+# removes $VM_ROOT wholesale — image cache and results included. Runs
+# auto-archive to the cc-notes vm-repro chronology; save any dir that never
+# archived (pre-rewire runs, aborted archives) with `vmctl archive <dir>`
+# BEFORE running this.
+cmd_destroy() {
+  if [[ ! -d "$VM_ROOT" ]]; then
+    log "nothing to destroy ($VM_ROOT absent)"
+    return 0
+  fi
+  if [[ -d "$VM_RESULTS_ROOT" && -n "$(ls -A "$VM_RESULTS_ROOT" 2>/dev/null)" ]]; then
+    warn "deleting ALL results under $VM_RESULTS_ROOT (runs auto-archive to the cc-notes chronology):"
+    ls -1 "$VM_RESULTS_ROOT" >&2 || true
+    warn "any dir above that never archived (pre-rewire run, aborted archive) is gone — save it first: scripts/vm/vmctl archive <dir>"
+  fi
+  if command -v tart >/dev/null 2>&1 && vm_exists; then
+    log "stopping and deleting VM $VMCTL_NAME"
+    vm_tart stop "$VMCTL_NAME" --timeout 30 2>/dev/null || true # already stopped is fine
+    vm_tart delete "$VMCTL_NAME" || warn "tart delete failed; the rm below removes its disk anyway"
+  fi
+  # Reap any tart process still holding the VM (stop by name should have ended
+  # it; pkill by the exact run command covers a leaked owner regardless).
+  pkill -f "tart run $VMCTL_NAME" 2>/dev/null || true # racing its own exit is fine
+  log "removing $VM_ROOT wholesale (VM disk, image cache, ssh key, results)"
+  rm -rf "$VM_ROOT"
+  log "destroyed; the next create re-pulls the image (20-60 min)"
+}
+
+main() {
+  local cmd="${1:-}"
+  if [[ -z "$cmd" ]]; then
+    usage >&2
+    exit 64
+  fi
+  shift
+  case "$cmd" in
+  create) cmd_create "$@" ;;
+  provision) cmd_provision "$@" ;;
+  push) cmd_push "$@" ;;
+  run) cmd_run "$@" ;;
+  shell) cmd_shell "$@" ;;
+  collect) cmd_collect "$@" ;;
+  archive) cmd_archive "$@" ;;
+  status) cmd_status "$@" ;;
+  destroy) cmd_destroy "$@" ;;
+  help | -h | --help) usage ;;
+  *)
+    usage >&2
+    printf 'vmctl: unknown command: %s\n' "$cmd" >&2
+    exit 64
+    ;;
+  esac
+}
+
+main "$@"
