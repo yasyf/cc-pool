@@ -1022,10 +1022,8 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 // at startup, off the accept path; ctx is checked between accounts so a
 // boot-time shutdown doesn't block wg.Wait on a slow account's mount timeout.
 func (s *Server) reconcileOverlays(ctx context.Context) {
-	// Reap dead-holder orphans FIRST, unconditionally: a cold daemon start over
-	// an already-dead holder sees no healthy→unreachable transition, so the
-	// loss hook can never cover it. Carcass-gated in fusekit — a live holder's
-	// servers stat healthy and are never touched — so every startup may run it.
+	// Reap dead-holder orphans first: a cold start over an already-dead holder
+	// never fires the loss hook, and the reap is carcass-gated so it is always safe.
 	s.reapPoolOrphans()
 	// Prime the holder cache before any per-account decision: mountReady (and
 	// so every select racing this reconcile) keys fuse readiness on it.
@@ -1063,13 +1061,8 @@ func (s *Server) reconcileOverlays(ctx context.Context) {
 }
 
 // sweepOrphanMountpoints force-unmounts any mountpoint under the accounts dir
-// that no account row owns. `ccp add` mounts before its row exists (the row
-// lands at FinalizeAdd, after the through-mount identity read); a
-// hard-interrupted add leaves a row-less wedged-NFS carcass that can freeze the
-// machine, and nothing row-driven ever names its dir — this startup sweep is
-// its only cleaner. forceUnmount is bounded and never touches base; ReadDir and
-// overlayMounted (Getfsstat) are non-blocking, so a wedged child cannot park
-// the sweep.
+// that no account row owns (a hard-interrupted pre-row `ccp add` leaves a wedged
+// carcass nothing row-driven names); every check here is non-blocking.
 func (s *Server) sweepOrphanMountpoints(ctx context.Context, accts []store.Account) {
 	rowDirs := make(map[string]bool, len(accts))
 	for _, a := range accts {
@@ -1109,24 +1102,18 @@ func (s *Server) sweepOrphanMountpoints(ctx context.Context, accts []store.Accou
 }
 
 // sweepOrphanMuxRoot force-unmounts the shared native mux mount at MuxRootDir()
-// iff it is a carcass — mounted but no holder is reachable to own it (the holder
-// died leaving the kernel mount behind). A live holder legitimately serves the
-// root for the pool, so the peer-alive check is what tells an orphan from a live
-// mount. Force-unmounting the shared mount drops EVERY subtree, so it is gated on
-// zero live fuse sessions pool-wide; a bound session defers it to a later sweep.
-// After the unmount each row's next idempotent Mount RPC re-mounts and re-attaches.
+// iff it is a carcass no live holder owns; gated on zero live fuse sessions
+// pool-wide, since dropping the shared mount drops EVERY subtree.
 func (s *Server) sweepOrphanMuxRoot(ctx context.Context, accts []store.Account) {
 	root := pool.MuxRootDir()
 	if !overlayMounted(root) {
 		return
 	}
-	// A live peer is not enough: a freshly respawned empty-registry holder is
-	// alive but does NOT own a root a dead predecessor left mounted, and that
-	// carcass makes the fresh holder refuse every mux Setup as ClassForeignMount.
-	// holderOwnsMuxRoot separates a genuinely-owned root (leave it) from a carcass
-	// under a dead OR a live-but-empty holder (sweep it, pool-idle-gated).
+	// A live peer is not enough: a freshly respawned empty-registry holder does
+	// not own a dead predecessor's root, and that carcass makes it refuse every
+	// mux Setup as ClassForeignMount.
 	if s.holderOwnsMuxRoot() {
-		return // a live holder actually serves the root for the pool; not a carcass
+		return
 	}
 	fuse := make([]store.Account, 0, len(accts))
 	for _, a := range accts {
@@ -1156,16 +1143,9 @@ func (s *Server) scheduleHolderLostSweep() {
 	}()
 }
 
-// sweepHolderOrphans is the holder-death recovery (2026-07 incident): a crashed
-// holder leaves its go-nfsv4 servers orphaned and answering EPERM through every
-// mount, and no successor can reap them (the holder's own reaper is
-// direct-children-only). It short-circuits the per-row remount breaker's
-// five-strike wait: reap the orphans — carcass-gated in fusekit, so a healthy
-// server is never touched; unconditional because a dead holder cannot own a live
-// mount — then run the existing idle-gated sweep to force-unmount the shared mux
-// root when no live session rides it (a session defers the unmount, kernel-panic
-// class, but never the reap). Roots cover both the mux go-nfsv4 (bound to the mux
-// root) and any legacy per-dir servers (bound under the accounts dir).
+// sweepHolderOrphans is the holder-death recovery: reap the orphaned go-nfsv4
+// servers (carcass-gated, safe unconditionally), then the idle-gated mux-root
+// sweep. Short-circuits the per-row remount breaker — see ccn doc 1668381.
 func (s *Server) sweepHolderOrphans(ctx context.Context) {
 	s.reapPoolOrphans()
 	accts, err := s.m.Store.ListAccounts()
@@ -1186,12 +1166,9 @@ func (s *Server) reapPoolOrphans() {
 	}
 }
 
-// fuseHardUnavailable reports a reason iff a single capability probe proves this
-// machine cannot host fuse mounts right now: the holder is reachable, serves no
-// live mount, and a throwaway probe mount is REJECTED OUTRIGHT (ErrMountFailed —
-// fuse-t missing/unloadable). Every other case returns "" to leave the
-// per-account heal in charge (see the returns below). One probe here replaces a
-// doomed mount per account when fuse genuinely cannot work.
+// fuseHardUnavailable reports a reason iff one capability probe proves this
+// machine cannot host fuse mounts right now (ErrMountFailed on a throwaway
+// probe mount); every "" return leaves the per-account heal in charge.
 func (s *Server) fuseHardUnavailable() string {
 	if !s.canSpawnHolder() {
 		return "" // no cask holder to probe; per-account heal converts each fuse row as it fails
@@ -1208,11 +1185,8 @@ func (s *Server) fuseHardUnavailable() string {
 	return ""
 }
 
-// retreatPoolToSymlink retreats every fuse row to symlink and records symlink as
-// the new-account default — the whole-pool response to a machine that cannot
-// host fuse mounts. Setting the default keeps a later `ccp add` from minting a
-// fuse account whose dir this machine can never mount; `ccp migrate --to fuse`
-// re-promotes the pool once fuse-t can mount here again.
+// retreatPoolToSymlink retreats every fuse row to symlink and records symlink
+// as the new-account default; `ccp migrate --to fuse` re-promotes later.
 func (s *Server) retreatPoolToSymlink(ctx context.Context, accts []store.Account, reason string) {
 	fuse := make([]store.Account, 0, len(accts))
 	for _, a := range accts {

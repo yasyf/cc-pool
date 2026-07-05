@@ -51,13 +51,9 @@ var deepProbeTimeout = 5 * time.Second
 // shallow liveness stat behind its join.
 var deepProbes StatProbes[error]
 
-// DeepProbeWithin reads dir's probe file in full through the kernel mount,
-// bounded by the deep-probe timeout. nil means the mirror moved ProbeFileSize
-// FRESH bytes: the full count arrived AND the header nonce differs from this
-// process's last probe of the file (a repeat is a cache replay, counted
-// wedged). Returns ErrProbeMissing (no verdict) or ErrProbeWedged (timeout,
-// short read, or replayed nonce). Concurrent callers for a dir join one
-// in-flight read; a wedged probe parks one goroutine and one fd.
+// DeepProbeWithin reads dir's probe file in full through the kernel mount within
+// deepProbeTimeout; nil means ProbeFileSize FRESH bytes moved (full count + a new
+// nonce). Concurrent callers join one read; a wedged probe parks one goroutine and fd.
 func DeepProbeWithin(dir string) error {
 	path := filepath.Join(dir, ProbeFileName)
 	err, ok := deepProbes.Do(dir, deepProbeTimeout, func() error { return readProbeFile(path) })

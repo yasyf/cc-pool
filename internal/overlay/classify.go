@@ -73,14 +73,8 @@ func PrivateEntry(name string) bool {
 }
 
 // sharedTopLevel reports whether a top-level base entry is carved out as a live
-// symlink into ~/.claude: everything except private names, skipped litter, the two
-// synthetic documents, and the probe. Mirrors the symlink provider's link loop
-// (fkoverlay.Spec.Skipped/IsPrivate), except the private rejection is strictly
-// wider: carveOutPrivate re-applies the holder's own bare-prefix private-redirect
-// match, keeping the manifest's symlink set provably disjoint from the set the
-// holder routes to the per-account private root. A name in both would serve the
-// symlink — the holder consults the manifest before the private redirect — handing
-// a pool session plain claude's file.
+// symlink into ~/.claude. carveOutPrivate keeps the symlink set disjoint from the
+// holder's private-redirect set — a name in both would serve plain claude's file.
 func sharedTopLevel(name string) bool {
 	if PrivateEntry(name) || carveOutPrivate(name) || SkipEntries[name] || name == claudeJSONName || name == settingsName || name == ProbeFileName {
 		return false
@@ -107,18 +101,10 @@ var PrivatePrefixes = []string{
 	"mcp-needs-auth-cache.json",
 }
 
-// carveOutPrivate reports whether a top-level name is barred from the shared
-// carve-out beyond PrivateEntry's dot-anchored families:
-//
-//   - any bare PrivatePrefixes match — the holder's own private-redirect test —
-//     so a gap-class sibling like ".credentials.json~" (an editor backup of plain
-//     claude's credential file) can never be both private-routed and symlinked;
-//   - any case variant of a private family or excluded dir, because the default
-//     APFS base resolves names case-insensitively: ".Credentials.json" there IS
-//     plain claude's live credential file.
-//
-// Barring a name here is always safe — it falls back to a per-account
-// passthrough or private entry, never a symlink into base.
+// carveOutPrivate bars a name from the shared carve-out beyond PrivateEntry:
+// bare PrivatePrefixes matches (the holder's own private-redirect test) and case
+// variants (the default APFS base is case-insensitive, so ".Credentials.json" IS
+// the live credential file). Barring is always safe — never a symlink into base.
 func carveOutPrivate(name string) bool {
 	if ExcludedEntries[strings.ToLower(name)] {
 		return true

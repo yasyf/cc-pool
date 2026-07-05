@@ -203,12 +203,9 @@ func TestDeepProbeWithinTimeoutWedged(t *testing.T) {
 		t.Errorf("Inflight = %d, want %d (one new parked probe goroutine)", got, before+1)
 	}
 
-	// Best-effort unwedge for a tidy exit; we deliberately do NOT assert it
-	// drains. A real wedge leaks the goroutine by design (DeepProbeWithin bounds
-	// the caller, not the goroutine), and a macOS FIFO's blocking read can miss
-	// the writer's EOF under load (~1 in 3000) and strand forever, so a drain
-	// assertion is inherently flaky. The Inflight check above is delta-based, so
-	// a straggler never fails this run or a later one.
+	// Best-effort unwedge; deliberately no drain assertion — a real wedge leaks
+	// the goroutine by design, and a macOS FIFO read can miss the writer's EOF
+	// under load (~1 in 3000), so asserting drain is inherently flaky.
 	if w, werr := os.OpenFile(fifo, os.O_WRONLY, 0); werr == nil { //nolint:gosec // G304: fifo is under the test's own t.TempDir()
 		go func() {
 			_, _ = w.Write(make([]byte, 128<<10))

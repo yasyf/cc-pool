@@ -21,13 +21,8 @@ const (
 )
 
 // writeThroughMu serializes the base read→split→write cycle across ALL account
-// domains (every domain writes through to the same ~/.claude.json and
-// ~/.claude/settings.json), all landing in this one BridgeServer process. Held
-// across the cycle's I/O — a lock-scope exception, safe because the holder runs
-// every WriteThrough on a background worker off its fuse handler path, so it can
-// never stall a mount's NFS server. Against a concurrent vanilla claude,
-// last-writer-wins within the window; blacklisted keys stay safe because base is
-// re-read each cycle and never copied.
+// domains. Held across I/O — a lock-scope exception, safe because the holder
+// runs WriteThrough off its fuse handler path, so it never stalls an NFS server.
 var writeThroughMu sync.Mutex
 
 // PoolContentSource implements content.Source for cc-pool's overlay: serving the
@@ -65,19 +60,11 @@ func (s *PoolContentSource) privClaudeJSON(domain string) string {
 func (s *PoolContentSource) baseSettings() string { return filepath.Join(s.claudeDir, settingsName) }
 func (s *PoolContentSource) plansDir() string     { return filepath.Join(s.claudeDir, "plans") }
 
-// Manifest classifies the top-level entries the holder treats specially for a
-// domain: shared entries as live symlinks into base (bulk I/O off the synth path),
-// excluded entries as private empty dirs, and the two synthetic documents; every
-// remaining top-level name present in base that sharedTopLevel accepts is carved
-// out as a live symlink too, so claude's bulk transcript/history/statsig I/O
-// resolves outside the mount instead of riding through NFS. Each synth's Freshness
-// lists the local files whose (mtime,size) gate the holder's cached bytes, so a
-// steady-state Getattr costs a local stat, not a bridge RPC.
-//
-// The base snapshot is per-Build: a top-level entry born in base after the mount
-// stays a plain passthrough until the next remount. Deliberate — flipping a name
-// to a symlink the instant a CREATE lands it in base would race the kernel's
-// post-CREATE Getattr into a symlink and fail the in-flight write EIO.
+// Manifest classifies a domain's specially-treated top-level entries: synths,
+// private dirs, and live symlinks into base (bulk I/O off the synth path). The
+// base snapshot is deliberately per-Build: promoting a just-born base entry to a
+// symlink mid-mount would race the kernel's post-CREATE Getattr and EIO the
+// in-flight write.
 func (s *PoolContentSource) Manifest(domain string) ([]content.Entry, error) {
 	baseEntries, err := os.ReadDir(s.claudeDir)
 	if err != nil {
@@ -151,12 +138,10 @@ func (s *PoolContentSource) ReadSynth(domain, name string) ([]byte, error) {
 	}
 }
 
-// WriteThrough persists a committed synthetic document back to the shared base:
-// .claude.json's shareable keys split into ~/.claude.json (blacklisted keys never
-// cross); settings.json's injected plansDirectory is stripped back out. Both run
-// under writeThroughMu and skip the rewrite when nothing shareable changed (writing
-// identical bytes would bump base's mtime and thrash every mount's merge cache). A
-// missing base is a deliberate no-op: cc-pool must never mint plain claude's files.
+// WriteThrough persists a committed synthetic document's shareable parts back to
+// the shared base under writeThroughMu; identical-byte rewrites are skipped (they
+// would bump base's mtime and thrash every mount's merge cache), and a missing
+// base is a deliberate no-op — cc-pool never mints plain claude's files.
 func (s *PoolContentSource) WriteThrough(domain, name string, data []byte) error {
 	writeThroughMu.Lock()
 	defer writeThroughMu.Unlock()

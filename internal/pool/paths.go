@@ -58,22 +58,16 @@ func StateDir() string {
 	return stateDir.Root()
 }
 
-// MuxRootDir is the single native fuse-t mount (~/.cc-pool/mnt) that serves
-// every fuse account as a logical subtree MuxRootDir()/<acct-NN>. One native
-// mount, one go-nfsv4 helper for the whole pool. Each account dir is a
-// fail-closed bridge symlink into its subtree; the account dir string itself
-// never changes (it is still hashed byte-for-byte into the Keychain service name
-// and matched exactly by procscan's CLAUDE_CONFIG_DIR scan).
+// MuxRootDir is the single native fuse-t mount (~/.cc-pool/mnt) serving every
+// fuse account as a logical subtree MuxRootDir()/<acct-NN>; each account dir is
+// a fail-closed bridge symlink into its subtree.
 func MuxRootDir() string {
 	return stateDir.Path("mnt")
 }
 
 // ConfigDirForMount translates a holder-reported mount dir back to the account
-// ConfigDir the daemon keys everything on — the SINGLE wire→ConfigDir
-// translation. A mux subtree (a direct child of MuxRootDir()) maps to
-// AccountsDir()/<basename>; any other dir — a legacy per-account mount whose
-// served path IS the ConfigDir — passes through unchanged. Pure string function:
-// it never touches the filesystem, so it is safe on the holder cache hot path.
+// ConfigDir the daemon keys on — the SINGLE wire→ConfigDir translation. Pure
+// string function; never touches the filesystem.
 func ConfigDirForMount(mountDir string) string {
 	if filepath.Dir(mountDir) == MuxRootDir() {
 		return filepath.Join(AccountsDir(), filepath.Base(mountDir))
@@ -81,14 +75,9 @@ func ConfigDirForMount(mountDir string) string {
 	return mountDir
 }
 
-// IsBridgeSymlink reports whether dir is a mux bridge symlink pointing into the
-// shared mux root — the fuse-mux overlay's account-dir stand-in. It reads the
-// link with os.Readlink (which never traverses INTO the target, so it cannot
-// hang on a wedged mount) and checks the target is a child of MuxRootDir(). A
-// symlink-row file operation must never follow it — moving files through it
-// writes into the live mirror — so convertToFuse and HealStrandedPrivate refuse
-// when it is present, and the daemon uses it to tell a migrated mux account (a
-// bridge symlink) from a legacy per-dir mount (a real dir).
+// IsBridgeSymlink reports whether dir is a mux bridge symlink into MuxRootDir().
+// Readlink never traverses INTO the target, so it cannot hang on a wedged mount;
+// callers must never follow the link — moving files through it writes into the live mirror.
 func IsBridgeSymlink(dir string) bool {
 	target, err := os.Readlink(dir)
 	if err != nil {
@@ -144,14 +133,9 @@ func FPControlSocketPath() string {
 	return stateDir.Path("domains.sock")
 }
 
-// FPBridgeSocketPath is the File Provider data socket: the daemon binds it,
-// the sandboxed extension dials it for computed content. It lives in the App
-// Group container — the one location BOTH sides may touch: the sandboxed
-// appex gets blanket container access (file temp-exceptions do not cover
-// AF_UNIX connect, a network-outbound operation), and the daemon is an
-// entitled group member. Transient bind failures (daemon restart drain races)
-// self-heal via the FP bridge serve-retry loop. The short leaf keeps the path
-// under the 104-byte sun_path limit.
+// FPBridgeSocketPath is the File Provider data socket: the daemon binds it, the
+// sandboxed extension dials it for computed content. It must live in the App Group
+// container, with a leaf short enough for sun_path — see ccn doc f71e9b1.
 func FPBridgeSocketPath() string {
 	return filepath.Join(mustHome(), "Library", "Group Containers", AppGroupID, "b.sock")
 }

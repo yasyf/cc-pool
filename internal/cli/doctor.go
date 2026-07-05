@@ -300,15 +300,9 @@ func countFileProvider(accts []store.Account) int {
 	return n
 }
 
-// reportFileProvider covers the File Provider stack: the extension's
-// pluginkit enablement, the companion app's control socket, and the daemon's
-// bridge data socket. A machine with the extension absent and no fileprovider
-// rows is silent — File Provider is opt-in, so an absent extension there is
-// the norm, not drift. With rows, an absent extension is the root fault and
-// the socket probes are skipped: they cannot say anything the enablement line
-// doesn't. consentPending is the daemon's precise "bridge bind parked on the
-// app-group-container TCC prompt" signal; when set, the bridge rung names that
-// exact fault instead of the generic dead-socket guidance.
+// reportFileProvider covers the File Provider rungs: extension enablement, app
+// control socket, daemon bridge socket. Silent when the opt-in stack is unused;
+// with rows, an absent extension is the root fault and skips the socket probes.
 func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Account, consentPending bool, report func(string, bool, string)) {
 	fpRows := countFileProvider(accts)
 	if !fpAvailable(m.OverlaySpec()) {
@@ -373,13 +367,9 @@ func reportCarcasses(accts []store.Account, report func(string, bool, string)) {
 	}
 }
 
-// reportOrphanedHolder flags the dead-holder-with-orphans incident (2026-07): the
-// holder is unreachable yet its mounts are still in the kernel mount table, so the
-// go-nfsv4 servers it spawned answer EPERM through every one. The daemon reaps and
-// remounts them once idle; a live session on an orphan defers the force-unmount
-// (force-unmounting a busy NFS mirror panics the kernel), so name the blocking
-// sessions the operator must relaunch. A reachable holder is reportHolder's beat
-// and stays silent here.
+// reportOrphanedHolder flags a dead holder whose mounts are still in the kernel
+// mount table (see ccn doc 1668381), naming the live sessions the operator must
+// relaunch before the daemon can reap. A reachable holder is reportHolder's beat.
 func reportOrphanedHolder(ctx context.Context, reachable bool, accts []store.Account, report func(string, bool, string)) {
 	if reachable {
 		return
@@ -475,11 +465,7 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 
 // checkCredential reports one account's credential state, each backend probed
 // through the Manager seam in runtime resolution order (Keychain first, then
-// the plaintext file). A file copy — parseable or corrupt — behind a readable
-// Keychain item is drift (Claude refresh tokens are single-use, so two live
-// copies diverge); --fix deletes the file copy, since resolution makes the
-// Keychain authoritative. An unsearchable Keychain (headless session) with no
-// file credential is reported as unknown state, never as absence.
+// the plaintext file).
 func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(string, bool, string)) {
 	prefix := fmt.Sprintf("acct-%02d", a.ID)
 	keychain := m.Creds.Store(a, creds.SourceKeychain)
@@ -493,12 +479,9 @@ func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(str
 			report(prefix+" credential", true, "keychain")
 			return
 		}
-		// Both backends hold a credential — drift (Claude refresh tokens are
-		// single-use, so two live copies diverge). doctor stays advisory even
-		// under --fix: consolidating must be gated against live sessions and
-		// daemon moves and must keep the FRESHER copy, all of which
-		// `ccp cred move` does (the daemon owns those gates). A blind delete
-		// here could destroy a fresh headless re-login and sign the account out.
+		// Drift: both backends hold a credential (refresh tokens are single-use,
+		// so copies diverge). Advisory even under --fix — only `ccp cred move`
+		// gates against live sessions and keeps the fresher copy.
 		report(prefix+" credential", false, "credential in BOTH the Keychain and .credentials.json — copies diverge (Claude refresh tokens are single-use); consolidate with `ccp cred move --to keychain` (moves the fresher copy; the daemon gates it against live sessions)")
 	case !errors.Is(kerr, creds.ErrNotFound) && !errors.Is(kerr, creds.ErrUnavailable):
 		if !fix {
@@ -553,10 +536,8 @@ func checkFuseFallback(m *pool.Manager, a store.Account, report func(string, boo
 		"on symlink but the pool default is fuse — likely an automatic fallback after the mount holder failed; re-run `ccp migrate` once fuse-t is healthy")
 }
 
-// checkFileProviderFallback flags an account off File Provider while the pool
-// default is fileprovider and the extension is enabled — the automatic
-// fileprovider→symlink retreat is permanent until `ccp migrate` re-promotes
-// (checkFuseFallback's sibling).
+// checkFileProviderFallback is checkFuseFallback's sibling for the permanent
+// fileprovider→symlink retreat.
 func checkFileProviderFallback(m *pool.Manager, a store.Account, report func(string, bool, string)) {
 	backend, err := fkoverlay.Parse(a.OverlayKind)
 	if err != nil || backend == fkoverlay.BackendFileProvider {
@@ -574,10 +555,8 @@ func checkFileProviderFallback(m *pool.Manager, a store.Account, report func(str
 }
 
 // checkStrandedPrivate reports (and under --fix, heals) private files stranded
-// by an interrupted migration. Only symlink rows can strand: a fuse or
-// fileprovider row's private root is its live backing store, not wreckage
-// (HealStrandedPrivate's fence, mirrored here). The heal is a single
-// synchronous call, so the ResolvedConflictLogf global swap is safe.
+// by an interrupted migration. Only symlink rows can strand (HealStrandedPrivate's
+// fence, mirrored here); the heal is synchronous, so the ResolvedConflictLogf swap is safe.
 func checkStrandedPrivate(m *pool.Manager, a store.Account, fix bool, out io.Writer, report func(string, bool, string)) {
 	if fuseBackedRow(a.OverlayKind) || fileProviderRow(a.OverlayKind) {
 		return

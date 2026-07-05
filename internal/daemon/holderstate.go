@@ -67,10 +67,9 @@ type holderState struct {
 	// gen moved mid-flight — an in-place update is newer truth than the List.
 	gen uint64
 
-	// onLostWithMounts, when set, fires once the instant a healthy holder that
-	// was serving mounts becomes unreachable — the dead-holder-with-orphans
-	// signature. The Server wires it to the idle-gated orphan sweep so recovery
-	// never waits on the per-row remount breaker. Nil in tests that don't care.
+	// onLostWithMounts, when set, fires once when a holder last seen serving
+	// mounts becomes unreachable — the dead-holder-with-orphans signature (see
+	// ccn doc 1668381). Nil in tests that don't care.
 	onLostWithMounts func()
 }
 
@@ -144,11 +143,8 @@ func (h *holderState) refreshIfStale(c *mountd.Client) {
 	h.refresh(c)
 }
 
-// markUnhealthy records an unreachable holder; version "" is the wire signal.
-// When it wipes a holder last observed serving mounts — directly healthy, or
-// through a degraded step that kept servedMounts — it fires onLostWithMounts
-// once (the transition, off the lock): a crashed holder leaves its go-nfsv4
-// servers orphaned and answering EPERM through every mount.
+// markUnhealthy records an unreachable holder (version "" is the wire signal),
+// firing onLostWithMounts once per death, off the lock.
 func (h *holderState) markUnhealthy() {
 	h.mu.Lock()
 	lost := h.servedMounts || (h.healthy && len(h.mounts) > 0)

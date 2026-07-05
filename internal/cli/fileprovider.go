@@ -17,10 +17,8 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// fpElection is the three-way pluginkit reading of the File Provider extension —
-// richer than fpAvailable's boolean because onboarding must tell "wait for
-// registration" (not registered) from "flip the Settings toggle" (registered
-// but not elected, the user-disabled state no CLI, API, or MDM can clear).
+// fpElection is the three-way pluginkit reading of the File Provider
+// extension: not registered, registered-but-unelected, or elected.
 type fpElection int
 
 const (
@@ -29,11 +27,8 @@ const (
 	fpElected                         // '+': fpAvailable's true
 )
 
-// classifyFPElection parses `pluginkit -m -i <id>` output. pluginkit prints one
-// line per registered copy, first field a status flag ('+' elected, '-'
-// disabled, '?'/'!' undecided/problem); no output means not registered. Any
-// elected copy counts — stale duplicates (a copy in the Trash, say) must not
-// mask a live election.
+// classifyFPElection parses `pluginkit -m -i <id>` output (one line per copy).
+// Any elected copy counts — a stale duplicate in the Trash must not mask a live election.
 func classifyFPElection(out string) fpElection {
 	trimmed := strings.TrimSpace(out)
 	if trimmed == "" {
@@ -47,11 +42,8 @@ func classifyFPElection(out string) fpElection {
 	return fpNotElected
 }
 
-// fpElectionState is the pluginkit seam behind the onboarding trichotomy.
-// `pluginkit -m` answers a clean no-match with exit 1 and no diagnostics — that
-// is "not registered". A nonzero exit that DID write to stderr (bad args, db
-// error, missing binary, context cut) is a real failure, surfaced so onboarding
-// fails loud instead of parking on the wrong "wait for registration" guidance.
+// fpElectionState is the pluginkit seam behind the onboarding trichotomy:
+// exit 1 with no stderr is a clean "not registered"; stderr means a real failure.
 var fpElectionState = func(ctx context.Context) (fpElection, error) {
 	out, err := exec.CommandContext(ctx, "pluginkit", "-m", "-i", pool.FPExtensionBundleID).Output()
 	var exitErr *exec.ExitError
@@ -163,12 +155,8 @@ func runFPOnboard(cmd *cobra.Command) error {
 	return offerFPMigration(cmd)
 }
 
-// awaitFPElection drives the pluginkit election to elected: on the first
-// registered-but-unelected reading it elects headlessly, and if macOS still
-// holds the extension unelected — user-disabled, which only the Settings
-// toggle clears — it opens the File Providers pane and polls until the user
-// flips it. Unbounded like waitForLogin: the user may take arbitrarily long in
-// Settings; ^C cancels.
+// awaitFPElection drives the pluginkit election to elected (a user-disabled
+// election only the Settings toggle clears). Unbounded like waitForLogin; ^C cancels.
 func awaitFPElection(ctx context.Context, out io.Writer, interval time.Duration) error {
 	en := fkoverlay.BackendFileProvider.Enablement()
 	triedElect, openedSettings := false, false
@@ -219,12 +207,8 @@ func awaitFPElection(ctx context.Context, out io.Writer, interval time.Duration)
 	}
 }
 
-// checkFPRungs walks doctor's remaining File Provider rungs — the app's
-// control socket, then the daemon's bridge data socket — after the election
-// rung has passed, naming the exact fix for whichever rung stays down. The
-// bridge verdict consults the daemon's consent-pending signal so a bind parked
-// on the group-container TCC prompt is named precisely, never as a generic
-// dead socket.
+// checkFPRungs walks the remaining File Provider rungs (app control socket,
+// then daemon bridge socket), naming the exact fix for whichever rung stays down.
 func checkFPRungs(ctx context.Context, out io.Writer, interval time.Duration) error {
 	ver, err := pollFPRung(ctx, out, interval, "waiting for the CCPoolStatus control socket…", func() (string, error) {
 		return fpControlHealth(ctx)
