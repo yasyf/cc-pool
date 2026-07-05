@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -93,6 +94,7 @@ func newDoctorCmd() *cobra.Command {
 				}
 				reportWedges(accts, holderMounts, sessions, report)
 				reportStaleSessions(accts, holderMounts, sessions, report)
+				reportOrphanedHolder(cmd.Context(), reachable, accts, report)
 
 				reportFileProvider(cmd.Context(), m, accts, report)
 				reportContentHealth(contentHealth, report)
@@ -361,6 +363,67 @@ func reportCarcasses(accts []store.Account, report func(string, bool, string)) {
 				"dead mount (carcass): ~/.claude is not visible through it; the daemon remounts it automatically — check "+abbreviateHome(pool.MountHolderLogPath()))
 		}
 	}
+}
+
+// reportOrphanedHolder flags the dead-holder-with-orphans incident (2026-07): the
+// holder is unreachable yet its mounts are still in the kernel mount table, so the
+// go-nfsv4 servers it spawned answer EPERM through every one. The daemon reaps and
+// remounts them once idle; a live session on an orphan defers the force-unmount
+// (force-unmounting a busy NFS mirror panics the kernel), so name the blocking
+// sessions the operator must relaunch. A reachable holder is reportHolder's beat
+// and stays silent here.
+func reportOrphanedHolder(ctx context.Context, reachable bool, accts []store.Account, report func(string, bool, string)) {
+	if reachable {
+		return
+	}
+	orphans := orphanedFuseDirs(accts)
+	if len(orphans) == 0 {
+		return
+	}
+	// Advisory: a failed scan just omits the blocker list.
+	sessions, _ := scanSessions(ctx)
+	detail := fmt.Sprintf("holder dead, %s", plural(len(orphans), "orphaned mount"))
+	if blockers := sessionsOnDirs(orphans, sessions); blockers != "" {
+		detail += ", waiting on sessions " + blockers + " — relaunch them so the daemon can reap the orphaned go-nfsv4 and remount"
+	} else {
+		detail += " — the daemon reaps the orphaned go-nfsv4 and remounts automatically once idle"
+	}
+	report("mount holder orphans", false, detail)
+}
+
+// orphanedFuseDirs returns every fuse account dir orphaned by an unreachable
+// holder: a still-mounted shared mux root orphans EVERY fuse account (each is a
+// bridge symlink into it), and a still-mounted legacy per-dir mount orphans just
+// its own. dirMounted is a non-blocking Getfsstat read, so a wedged carcass cannot
+// park it.
+func orphanedFuseDirs(accts []store.Account) []string {
+	muxHeld := dirMounted(pool.MuxRootDir())
+	var dirs []string
+	for _, a := range accts {
+		if !fuseBackedRow(a.OverlayKind) {
+			continue
+		}
+		if muxHeld || dirMounted(a.ConfigDir) {
+			dirs = append(dirs, a.ConfigDir)
+		}
+	}
+	return dirs
+}
+
+// sessionsOnDirs formats the live claude sessions bound to any of dirs as
+// "pid N, pid M", or "" if none.
+func sessionsOnDirs(dirs []string, sessions []procscan.Session) string {
+	want := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		want[d] = true
+	}
+	var pids []string
+	for _, se := range sessions {
+		if want[se.ConfigDir] {
+			pids = append(pids, fmt.Sprintf("pid %d", se.PID))
+		}
+	}
+	return strings.Join(pids, ", ")
 }
 
 func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool, report func(string, bool, string)) {

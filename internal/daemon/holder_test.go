@@ -25,6 +25,14 @@ import (
 	"github.com/yasyf/fusekit/proc"
 )
 
+// TestMain defaults the orphan reaper to a no-op for the whole package: no daemon
+// test may SIGKILL a real process. Tests asserting a reap swap in a recording stub
+// (swapReapOrphans).
+func TestMain(m *testing.M) {
+	reapOrphanedServers = func([]string) []int { return nil }
+	os.Exit(m.Run())
+}
+
 func flipToFuse(t *testing.T, s *Server, id int) store.Account {
 	t.Helper()
 	a, err := s.m.Store.GetAccount(id)
@@ -481,6 +489,15 @@ func swapForceUnmount(t *testing.T, fn func(string) error) {
 	prev := forceUnmount
 	forceUnmount = fn
 	t.Cleanup(func() { forceUnmount = prev })
+}
+
+// swapReapOrphans replaces the fusekit.ReapOrphanedServers seam so no test ever
+// signals a real process; the default (unstubbed) sweep tests get a no-op.
+func swapReapOrphans(t *testing.T, fn func([]string) []int) {
+	t.Helper()
+	prev := reapOrphanedServers
+	reapOrphanedServers = fn
+	t.Cleanup(func() { reapOrphanedServers = prev })
 }
 
 // driveRetryTicks runs n heal ticks, rewinding the per-row backoff before each

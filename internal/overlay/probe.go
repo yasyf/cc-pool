@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/yasyf/fusekit"
 )
 
 // Deliberately untagged: every build variant must compile this so daemon and
@@ -27,10 +29,11 @@ const ProbeFileName = ".ccp-probe"
 const ProbeFileSize = 2 << 20
 
 var (
-	// ErrProbeMissing means the open returned ENOENT or a permission refusal
-	// (EPERM/EACCES): the mirror serves no probe to an external opener, the
-	// signature of an old holder predating the probe. Callers treat it as no
-	// verdict, never a wedge, so such mounts survive upgrades until remounted.
+	// ErrProbeMissing means the open returned ENOENT: the mirror serves no probe
+	// file, the signature of an old holder predating the probe. Callers treat it
+	// as no verdict, never a wedge, so such mounts survive upgrades until
+	// remounted. A permission refusal (EPERM/EACCES) is NOT this class — it is the
+	// orphaned-dead-server signature and reads as ErrProbeWedged.
 	ErrProbeMissing = errors.New("probe file missing")
 
 	// ErrProbeWedged means the deep probe could not pull the full probe file
@@ -76,10 +79,14 @@ var (
 func readProbeFile(path string) error {
 	f, err := os.Open(path) //nolint:gosec // G304: path is a cc-pool-managed overlay mirror file under the state dir
 	if err != nil {
-		// ENOENT or permission refusal: no probe served, not a wedge (see
-		// ErrProbeMissing).
-		if os.IsNotExist(err) || errors.Is(err, os.ErrPermission) {
+		// Only genuine ENOENT is "no verdict". EPERM/EACCES is a dead-holder
+		// orphan answering every op with a permission error, so it reads as a
+		// wedged verdict onto the remount path (the 2026-07 incident's misread).
+		switch verdict := fusekit.ProbeOpenVerdict(err); {
+		case errors.Is(verdict, fusekit.ErrProbeMissing):
 			return fmt.Errorf("%w: %s", ErrProbeMissing, path)
+		case errors.Is(verdict, fusekit.ErrProbeDenied):
+			return fmt.Errorf("%w: %s: mount denied the probe (dead-holder orphan): %v", ErrProbeWedged, path, err)
 		}
 		return fmt.Errorf("deep probe open %s: %w", path, err)
 	}

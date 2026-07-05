@@ -47,6 +47,10 @@ type holderState struct {
 	healthy bool
 	version string
 	mounts  map[string]bool // Live (shallow), per the holder's last List
+	// servedMounts remembers the holder was last observed healthy with mounts;
+	// it survives the degraded step (reachable, List failing mid-crash) so the
+	// crash still reads lost-with-mounts once the holder goes unreachable.
+	servedMounts bool
 	// deep is daemon-local, not holder-sourced; it survives refresh (a poll
 	// does not re-probe).
 	deep        map[string]*deepVerdict
@@ -62,6 +66,12 @@ type holderState struct {
 	// gen counts in-place cache mutations; refresh drops a polled snapshot when
 	// gen moved mid-flight — an in-place update is newer truth than the List.
 	gen uint64
+
+	// onLostWithMounts, when set, fires once the instant a healthy holder that
+	// was serving mounts becomes unreachable — the dead-holder-with-orphans
+	// signature. The Server wires it to the idle-gated orphan sweep so recovery
+	// never waits on the per-row remount breaker. Nil in tests that don't care.
+	onLostWithMounts func()
 }
 
 func (h *holderState) refresh(c *mountd.Client) {
@@ -92,6 +102,9 @@ func (h *holderState) refresh(c *mountd.Client) {
 		return
 	}
 	h.healthy, h.version, h.mounts, h.refreshedAt = true, res.Version, m, time.Now()
+	// A clean reachable observation is truth either way: with mounts it arms
+	// the lost-with-mounts memory, empty it disarms it.
+	h.servedMounts = len(m) > 0
 	h.pruneAbsentVerdictsLocked(m)
 }
 
@@ -132,19 +145,34 @@ func (h *holderState) refreshIfStale(c *mountd.Client) {
 }
 
 // markUnhealthy records an unreachable holder; version "" is the wire signal.
+// When it wipes a holder last observed serving mounts — directly healthy, or
+// through a degraded step that kept servedMounts — it fires onLostWithMounts
+// once (the transition, off the lock): a crashed holder leaves its go-nfsv4
+// servers orphaned and answering EPERM through every mount.
 func (h *holderState) markUnhealthy() {
 	h.mu.Lock()
+	lost := h.servedMounts || (h.healthy && len(h.mounts) > 0)
 	h.gen++
 	h.healthy, h.version, h.mounts, h.refreshedAt = false, "", nil, time.Now()
+	h.servedMounts = false // the sweep is scheduled; one fire per death
 	// A respawned holder starts clean.
 	h.deep, h.lastProbed, h.shallow = nil, nil, nil
+	hook := h.onLostWithMounts
 	h.mu.Unlock()
+	if lost && hook != nil {
+		hook()
+	}
 }
 
 // markDegraded records Health-ok/List-failed: mounts fail closed, version
-// kept for status.
+// kept for status. The holder is still REACHABLE, so no loss hook fires here —
+// but a crash often tears down through this state, so latch servedMounts for
+// markUnhealthy instead of losing the memory with the mounts map.
 func (h *holderState) markDegraded(ver string) {
 	h.mu.Lock()
+	if h.healthy && len(h.mounts) > 0 {
+		h.servedMounts = true
+	}
 	h.gen++
 	h.healthy, h.version, h.mounts, h.refreshedAt = false, ver, nil, time.Now()
 	h.deep, h.lastProbed, h.shallow = nil, nil, nil
@@ -284,6 +312,7 @@ func (h *holderState) noteMounted(dir string) {
 		h.mounts = map[string]bool{}
 	}
 	h.mounts[dir] = true
+	h.servedMounts = true
 	delete(h.deep, dir)
 	delete(h.lastProbed, dir)
 	delete(h.shallow, dir)
@@ -291,11 +320,18 @@ func (h *holderState) noteMounted(dir string) {
 	h.tccBackend = ""
 }
 
-// noteUnmounted drops a just-dismounted dir ahead of the next refresh.
+// noteUnmounted drops a just-dismounted dir ahead of the next refresh; a
+// deliberate drain of the last mount while the holder is HEALTHY disarms the
+// lost-with-mounts memory. The healthy gate matters: after markDegraded wipes
+// h.mounts to nil, an empty map is a stale cache, not a drain — disarming then
+// would lose the crash memory the degraded→unreachable path depends on.
 func (h *holderState) noteUnmounted(dir string) {
 	h.mu.Lock()
 	h.gen++
 	delete(h.mounts, dir)
+	if h.healthy && len(h.mounts) == 0 {
+		h.servedMounts = false
+	}
 	delete(h.deep, dir)
 	delete(h.lastProbed, dir)
 	delete(h.shallow, dir)

@@ -92,25 +92,26 @@ func TestDeepProbeWithinMissingFile(t *testing.T) {
 	}
 }
 
-// TestDeepProbeWithinPermissionDeniedIsMissing pins that a permission-class open
-// refusal (EPERM/EACCES → os.ErrPermission) reads as ErrProbeMissing, never a
-// wedge: an old holder can refuse the daemon's external open, and a false wedge
-// would make the daemon refuse every account across an upgrade.
-func TestDeepProbeWithinPermissionDeniedIsMissing(t *testing.T) {
+// TestDeepProbeWithinPermissionDeniedIsWedged pins the 2026-07 incident fix: a
+// permission-class open refusal (EPERM/EACCES → os.ErrPermission) is the
+// orphaned-dead-server signature and reads as ErrProbeWedged (remount path),
+// NOT ErrProbeMissing's no-verdict — the old fold let every broken mount read
+// healthy while a crashed holder's go-nfsv4 answered EPERM to everything.
+func TestDeepProbeWithinPermissionDeniedIsWedged(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses file permission bits, so open(2) would not return EACCES")
 	}
 	dir := t.TempDir()
-	// mode-0000 makes os.Open refuse with EACCES, an old holder's refusal shape.
+	// mode-0000 makes os.Open refuse with EACCES, the dead-holder orphan's shape.
 	if err := os.WriteFile(filepath.Join(dir, ProbeFileName), []byte("x"), 0o000); err != nil {
 		t.Fatal(err)
 	}
 	err := DeepProbeWithin(dir)
-	if !errors.Is(err, ErrProbeMissing) {
-		t.Errorf("errors.Is(err, ErrProbeMissing) = false for a permission-denied open; err = %v", err)
+	if !errors.Is(err, ErrProbeWedged) {
+		t.Errorf("errors.Is(err, ErrProbeWedged) = false for a permission-denied open; err = %v", err)
 	}
-	if errors.Is(err, ErrProbeWedged) {
-		t.Errorf("a permission-denied open must be \"no verdict\", never a wedge; err = %v", err)
+	if errors.Is(err, ErrProbeMissing) {
+		t.Errorf("a permission-denied open must be a dead verdict, never no-verdict (the incident's misread); err = %v", err)
 	}
 }
 

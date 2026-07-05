@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -92,6 +94,31 @@ func TestRecordDeepMissingIsNoVerdict(t *testing.T) {
 	h.recordDeep(dir, wedgeErr())
 	if !h.deepWedged(dir) {
 		t.Error("fail/missing/fail did not wedge; a missing probe must not reset strikes")
+	}
+}
+
+// TestRecordDeepStrikesOnPermissionDeniedProbe bridges the overlay probe seam to
+// the daemon verdict for the 2026-07 incident: a permission-denied probe open (a
+// dead-holder orphan answering EPERM) must STRIKE toward the wedged verdict, never
+// fold into ErrProbeMissing's no-verdict class that let every broken mount read
+// healthy.
+func TestRecordDeepStrikesOnPermissionDeniedProbe(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits, so open(2) would not return EACCES")
+	}
+	dir := t.TempDir()
+	// mode-0000 makes the probe open refuse with EACCES — the dead-holder orphan's shape.
+	if err := os.WriteFile(filepath.Join(dir, overlay.ProbeFileName), []byte("x"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	var h holderState
+	for i := 0; i < deepWedgeStrikes; i++ {
+		if msg := h.recordDeep(dir, overlay.DeepProbeWithin(dir)); i == deepWedgeStrikes-1 && msg == "" {
+			t.Fatal("the wedge-threshold strike did not log the transition; a denied probe read as no-verdict")
+		}
+	}
+	if !h.deepWedged(dir) {
+		t.Fatalf("a permission-denied probe did not wedge after %d strikes; the EPERM orphan reads healthy", deepWedgeStrikes)
 	}
 }
 

@@ -72,6 +72,12 @@ type Server struct {
 	// unlocked.
 	triggerShutdown context.CancelFunc
 
+	// serveCtx is serve's cancellable context, captured before any worker spawns
+	// so the async holder-loss sweep (scheduleHolderLostSweep) runs under the
+	// daemon's lifetime and unwinds on shutdown. Read unlocked, same as
+	// triggerShutdown.
+	serveCtx context.Context
+
 	// wg tracks every daemon goroutine; serve Waits on it before Run's deferred
 	// m.Close() closes the database under them.
 	wg sync.WaitGroup
@@ -206,6 +212,11 @@ func (s *Server) serve(ctx context.Context) error {
 	// stop cancels ctx, so it doubles as the over-the-socket shutdown trigger
 	// (OpShutdown). Set before the accept loop spawns any handler.
 	s.triggerShutdown = stop
+	// Capture ctx and arm the holder-loss sweep before any worker refreshes the
+	// holder cache: markUnhealthy fires the hook the instant a crashed holder is
+	// first observed unreachable while its mounts are still held.
+	s.serveCtx = ctx
+	s.holder.onLostWithMounts = s.scheduleHolderLostSweep
 
 	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
 
@@ -639,7 +650,8 @@ func (s *Server) tryReserve(id int) bool {
 }
 
 // beginNativeRecovery claims the pool for a shared native mux-root force-unmount:
-// it refuses if any listed fuse account holds a live reservation (a select is
+// it refuses if another recovery already holds the claim or any listed fuse
+// account holds a live reservation (a select is
 // launching onto a subtree of the root right now), else sets nativeRecovering so
 // tryReserve refuses new reservations for the whole force-unmount span. The
 // reservation scan and the flag set are one critical section — the same
@@ -648,6 +660,12 @@ func (s *Server) tryReserve(id int) bool {
 func (s *Server) beginNativeRecovery(fuse []store.Account) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.nativeRecovering {
+		// An overlapping sweep (holder-loss vs startup/periodic) coalesces: the
+		// in-flight one owns the span, and its endNativeRecovery must not be
+		// undercut by a second claimant releasing early.
+		return false
+	}
 	for _, a := range fuse {
 		if t, ok := s.reservations[a.ID]; ok && time.Since(t) <= reservationTTL {
 			return false
@@ -988,6 +1006,11 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 // at startup, off the accept path; ctx is checked between accounts so a
 // boot-time shutdown doesn't block wg.Wait on a slow account's mount timeout.
 func (s *Server) reconcileOverlays(ctx context.Context) {
+	// Reap dead-holder orphans FIRST, unconditionally: a cold daemon start over
+	// an already-dead holder sees no healthy→unreachable transition, so the
+	// loss hook can never cover it. Carcass-gated in fusekit — a live holder's
+	// servers stat healthy and are never touched — so every startup may run it.
+	s.reapPoolOrphans()
 	// Prime the holder cache before any per-account decision: mountReady (and
 	// so every select racing this reconcile) keys fuse readiness on it.
 	s.holder.refresh(s.holderClient())
@@ -1097,6 +1120,53 @@ func (s *Server) sweepOrphanMuxRoot(ctx context.Context, accts []store.Account) 
 	}
 	if s.sweepMuxRootIdle(ctx, fuse) {
 		s.log.Printf("cleared orphaned native mux mount (no live holder owns it): %s", root)
+	}
+}
+
+// scheduleHolderLostSweep runs sweepHolderOrphans off the refresh caller when a
+// healthy holder serving mounts becomes unreachable (markUnhealthy's transition
+// gate fires it once per death). Async so a select's lazy refresh never blocks on
+// the sweep; tracked by s.wg — every refresh caller already holds a wg token, so
+// the Add never races the shutdown Wait.
+func (s *Server) scheduleHolderLostSweep() {
+	ctx := s.serveCtx
+	if ctx == nil {
+		return // no serve context yet (pre-serve wiring); nothing to sweep under
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.sweepHolderOrphans(ctx)
+	}()
+}
+
+// sweepHolderOrphans is the holder-death recovery (2026-07 incident): a crashed
+// holder leaves its go-nfsv4 servers orphaned and answering EPERM through every
+// mount, and no successor can reap them (the holder's own reaper is
+// direct-children-only). It short-circuits the per-row remount breaker's
+// five-strike wait: reap the orphans — carcass-gated in fusekit, so a healthy
+// server is never touched; unconditional because a dead holder cannot own a live
+// mount — then run the existing idle-gated sweep to force-unmount the shared mux
+// root when no live session rides it (a session defers the unmount, kernel-panic
+// class, but never the reap). Roots cover both the mux go-nfsv4 (bound to the mux
+// root) and any legacy per-dir servers (bound under the accounts dir).
+func (s *Server) sweepHolderOrphans(ctx context.Context) {
+	s.reapPoolOrphans()
+	accts, err := s.m.Store.ListAccounts()
+	if err != nil {
+		s.log.Printf("holder-loss orphan sweep: list accounts: %v", err)
+		return
+	}
+	s.sweepOrphanMuxRoot(ctx, accts)
+}
+
+// reapPoolOrphans kills any-generation go-nfsv4 orphans bound under the pool's
+// mount roots — the mux go-nfsv4 (bound to the mux root) and legacy per-dir
+// servers (under accounts/). Carcass-gated AND kill-time-reconfirmed in
+// fusekit, so a live holder's healthy servers are never candidates.
+func (s *Server) reapPoolOrphans() {
+	if pids := reapOrphanedServers([]string{pool.MuxRootDir(), pool.AccountsDir()}); len(pids) > 0 {
+		s.log.Printf("reaped %d orphaned go-nfsv4 server(s) a crashed holder left bound to cc-pool mounts: %v", len(pids), pids)
 	}
 }
 

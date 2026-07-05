@@ -1064,3 +1064,67 @@ func TestDoctorSurfacesFuseFallback(t *testing.T) {
 		})
 	}
 }
+
+// TestReportOrphanedHolder pins the dead-holder-with-orphans doctor line (2026-07
+// incident): an unreachable holder still holding mounts is surfaced with the count
+// and the blocking sessions to relaunch, while a reachable holder or one holding no
+// mounts stays silent.
+func TestReportOrphanedHolder(t *testing.T) {
+	accts := []store.Account{
+		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendNFS)},
+		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(fkoverlay.BackendNFS)},
+		{ID: 3, ConfigDir: "/p/acct-03", OverlayKind: string(fkoverlay.BackendSymlink)},
+	}
+	cases := map[string]struct {
+		reachable bool
+		mounted   func(string) bool
+		sessions  []procscan.Session
+		want      []reportCall
+	}{
+		"reachable holder is silent": {
+			reachable: true,
+			mounted:   func(string) bool { return true },
+		},
+		"unreachable holder holding no mounts is silent": {
+			mounted: func(string) bool { return false },
+		},
+		"dead holder holding the mux root, idle: reap-and-remount copy": {
+			mounted: func(d string) bool { return d == pool.MuxRootDir() },
+			want: []reportCall{{"mount holder orphans", false,
+				"holder dead, 2 orphaned mounts — the daemon reaps the orphaned go-nfsv4 and remounts automatically once idle"}},
+		},
+		"dead holder holding the mux root, sessions block the unmount": {
+			mounted: func(d string) bool { return d == pool.MuxRootDir() },
+			sessions: []procscan.Session{
+				{PID: 4242, ConfigDir: "/p/acct-01"},
+				{PID: 77, ConfigDir: "/p/acct-02"},
+				{PID: 9, ConfigDir: "/p/acct-03"}, // a symlink account: never a fuse blocker
+			},
+			want: []reportCall{{"mount holder orphans", false,
+				"holder dead, 2 orphaned mounts, waiting on sessions pid 4242, pid 77 — relaunch them so the daemon can reap the orphaned go-nfsv4 and remount"}},
+		},
+		"dead holder holding a legacy per-dir mount only": {
+			mounted: func(d string) bool { return d == "/p/acct-01" }, // not the mux root
+			want: []reportCall{{"mount holder orphans", false,
+				"holder dead, 1 orphaned mount — the daemon reaps the orphaned go-nfsv4 and remounts automatically once idle"}},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			swapVar(t, &dirMounted, tc.mounted)
+			swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) { return tc.sessions, nil })
+			report, calls := captureReports()
+
+			reportOrphanedHolder(context.Background(), tc.reachable, accts, report)
+
+			if len(*calls) != len(tc.want) {
+				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
+			}
+			for i, w := range tc.want {
+				if (*calls)[i] != w {
+					t.Fatalf("report[%d] = %+v, want %+v", i, (*calls)[i], w)
+				}
+			}
+		})
+	}
+}

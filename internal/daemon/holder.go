@@ -12,6 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/proc"
@@ -43,6 +44,12 @@ const tccBreakerThreshold = 6
 // forceUnmount force-unmounts a fuse carcass without routing through the
 // (possibly dead) holder; test seam.
 var forceUnmount = overlay.ForceUnmount
+
+// reapOrphanedServers SIGKILLs the go-nfsv4 servers a crashed holder orphaned
+// under the given roots — each killed only after its mountpoint is independently
+// confirmed a carcass, so a healthy server is never touched. Test seam so unit
+// tests never signal a real process.
+var reapOrphanedServers = fusekit.ReapOrphanedServers
 
 // liveSessionGate reports whether dir backs any live claude session, via the
 // bounded ps-env scan — never lsof/stat on the mount, so a wedged mirror

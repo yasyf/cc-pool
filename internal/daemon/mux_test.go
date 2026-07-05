@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -633,5 +634,174 @@ func TestEscalateWedgedRowRouting(t *testing.T) {
 				t.Fatalf("root force-unmounted = %v (calls %v), want %v", rootUnmounted, unmounted, tc.wantRootUnmount)
 			}
 		})
+	}
+}
+
+// TestSweepHolderOrphans pins the dead-holder recovery (2026-07 incident): the
+// sweep reaps the orphaned go-nfsv4 a crashed holder left bound to cc-pool mounts
+// (always, carcass-gated in fusekit) and force-unmounts the mux root only when no
+// live session rides it — a session defers the unmount (kernel-panic class) but
+// never the reap.
+func TestSweepHolderOrphans(t *testing.T) {
+	cases := map[string]struct {
+		session       bool
+		wantUnmounted bool
+	}{
+		"idle: reap the orphan and force-unmount the mux root":                {session: false, wantUnmounted: true},
+		"live session: reap but defer the force-unmount (kernel-panic class)": {session: true, wantUnmounted: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, dirs, _ := newMigrateServer(t)
+			flipFuseRows(t, s, 1)
+			makeBridge(t, dirs[1])
+			root := pool.MuxRootDir()
+			s.peerAlive = func(string) bool { return false } // dead holder → orphan carcass
+			fakeOverlayMounted(t, func(d string) bool { return d == root })
+			if tc.session {
+				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+					return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+				}
+			}
+			var reapedRoots [][]string
+			swapReapOrphans(t, func(roots []string) []int {
+				reapedRoots = append(reapedRoots, roots)
+				return []int{909}
+			})
+			var unmounted []string
+			swapForceUnmount(t, func(d string) error { unmounted = append(unmounted, d); return nil })
+
+			s.sweepHolderOrphans(t.Context())
+
+			// The reap is unconditional (carcass-gated in fusekit); roots cover the mux
+			// go-nfsv4 (bound to the mux root) and legacy per-dir servers (under accounts/).
+			wantRoots := []string{root, pool.AccountsDir()}
+			if len(reapedRoots) != 1 || !reflect.DeepEqual(reapedRoots[0], wantRoots) {
+				t.Fatalf("reaped roots = %v, want exactly one call with %v", reapedRoots, wantRoots)
+			}
+			gotUnmount := len(unmounted) == 1 && unmounted[0] == root
+			if gotUnmount != tc.wantUnmounted {
+				t.Fatalf("force-unmounted %v (mux-root unmount = %v), want unmount = %v", unmounted, gotUnmount, tc.wantUnmounted)
+			}
+		})
+	}
+}
+
+// TestHolderDeathSchedulesOrphanSweep pins the full item-1 wiring: markUnhealthy's
+// transition, wired as serve() wires it, schedules the async orphan sweep the
+// instant a healthy holder serving mounts goes unreachable — no 5-strike wait.
+func TestHolderDeathSchedulesOrphanSweep(t *testing.T) {
+	s, dirs, _ := newMigrateServer(t)
+	flipFuseRows(t, s, 1)
+	makeBridge(t, dirs[1])
+	root := pool.MuxRootDir()
+	s.peerAlive = func(string) bool { return false }
+	fakeOverlayMounted(t, func(d string) bool { return d == root })
+
+	var reaped int
+	swapReapOrphans(t, func([]string) []int { reaped++; return nil })
+	var unmounted []string
+	swapForceUnmount(t, func(d string) error { unmounted = append(unmounted, d); return nil })
+
+	// Wire the hook and serve context exactly as serve() does.
+	s.serveCtx = t.Context()
+	s.holder.onLostWithMounts = s.scheduleHolderLostSweep
+
+	// The holder was healthy and serving a mount, then its socket goes dead.
+	s.holder.mu.Lock()
+	s.holder.healthy = true
+	s.holder.mounts = map[string]bool{dirs[1]: true}
+	s.holder.mu.Unlock()
+	s.holder.markUnhealthy() // schedules the tracked sweep goroutine (Add ran synchronously)
+
+	s.wg.Wait() // the sweep goroutine is tracked; Wait synchronizes with its Done
+
+	if reaped != 1 {
+		t.Fatalf("holder death reaped %d time(s), want exactly one orphan sweep", reaped)
+	}
+	if len(unmounted) != 1 || unmounted[0] != root {
+		t.Fatalf("holder death force-unmounted %v, want exactly [%s]", unmounted, root)
+	}
+}
+
+// TestHolderDeathThroughDegradedSchedulesOrphanSweep pins the incident-shaped
+// crash at the server level: the holder degrades first (Health up, List failing
+// mid-teardown), THEN goes unreachable. The degraded poll must neither swallow
+// the loss memory nor trigger any sweep while the holder is still reachable.
+func TestHolderDeathThroughDegradedSchedulesOrphanSweep(t *testing.T) {
+	s, dirs, _ := newMigrateServer(t)
+	flipFuseRows(t, s, 1)
+	makeBridge(t, dirs[1])
+	root := pool.MuxRootDir()
+	s.peerAlive = func(string) bool { return false }
+	fakeOverlayMounted(t, func(d string) bool { return d == root })
+
+	var reaped int
+	swapReapOrphans(t, func([]string) []int { reaped++; return nil })
+	var unmounted []string
+	swapForceUnmount(t, func(d string) error { unmounted = append(unmounted, d); return nil })
+
+	s.serveCtx = t.Context()
+	s.holder.onLostWithMounts = s.scheduleHolderLostSweep
+
+	s.holder.mu.Lock()
+	s.holder.healthy = true
+	s.holder.mounts = map[string]bool{dirs[1]: true}
+	s.holder.mu.Unlock()
+
+	s.holder.markDegraded("v9") // Health answers, List fails: still reachable
+	s.wg.Wait()
+	if reaped != 0 || len(unmounted) != 0 {
+		t.Fatalf("degraded holder triggered reap=%d unmount=%v; a reachable holder may still own its mounts", reaped, unmounted)
+	}
+
+	s.holder.markUnhealthy() // the socket goes dead
+	s.wg.Wait()
+	if reaped != 1 {
+		t.Fatalf("death through the degraded step reaped %d time(s), want exactly 1", reaped)
+	}
+	if len(unmounted) != 1 || unmounted[0] != root {
+		t.Fatalf("death through the degraded step force-unmounted %v, want exactly [%s]", unmounted, root)
+	}
+}
+
+// TestReconcileOverlaysReapsOrphansAtStartup pins the cold-start recovery: a
+// fresh daemon over an already-dead holder sees no healthy→unreachable
+// transition, so the startup reconcile itself must reap — unconditionally,
+// before any per-account decision (carcass-gated in fusekit, so a live
+// holder's servers are never touched).
+func TestReconcileOverlaysReapsOrphansAtStartup(t *testing.T) {
+	s, _, _ := newHealServer(t) // holder socket starts dead: the cold-start shape
+	fakeOverlayMounted(t, func(string) bool { return false })
+
+	var reapedRoots [][]string
+	swapReapOrphans(t, func(roots []string) []int {
+		reapedRoots = append(reapedRoots, roots)
+		return []int{909}
+	})
+
+	s.reconcileOverlays(t.Context())
+
+	wantRoots := []string{pool.MuxRootDir(), pool.AccountsDir()}
+	if len(reapedRoots) != 1 || !reflect.DeepEqual(reapedRoots[0], wantRoots) {
+		t.Fatalf("startup reconcile reaped roots %v, want exactly one call with %v", reapedRoots, wantRoots)
+	}
+}
+
+// TestBeginNativeRecoveryExcludesOverlappingSweeps pins sweep coalescing: a
+// holder-loss sweep and a startup/periodic sweep of the same mux root must not
+// interleave — the second claimant defers instead of double-unmounting and
+// releasing the first one's claim early.
+func TestBeginNativeRecoveryExcludesOverlappingSweeps(t *testing.T) {
+	s := &Server{}
+	if !s.beginNativeRecovery(nil) {
+		t.Fatal("first native-recovery claim refused on an idle pool")
+	}
+	if s.beginNativeRecovery(nil) {
+		t.Fatal("second claim granted while a native recovery is in flight")
+	}
+	s.endNativeRecovery()
+	if !s.beginNativeRecovery(nil) {
+		t.Fatal("claim refused after the in-flight recovery released")
 	}
 }
