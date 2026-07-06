@@ -83,7 +83,7 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just hides pin state
 	render := func() error {
-		snaps, holder, err := gatherStatus(cmd.Context(), m, live)
+		snaps, holder, fpWedged, err := gatherStatus(cmd.Context(), m, live)
 		if err != nil {
 			return err
 		}
@@ -97,6 +97,9 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 		}
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), out)
 		if line := holderFooter(holder); line != "" {
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
+		}
+		if line := fpWedgedFooter(fpWedged); line != "" {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 		}
 		return nil
@@ -116,15 +119,35 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 }
 
-func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, *daemon.HolderStatus, error) {
+func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, *daemon.HolderStatus, []daemon.FPDomainState, error) {
 	if !forceLive {
 		resp, err := daemon.NewClient().Status()
 		if daemonStatusUsable(resp, err) {
-			return fromDaemon(resp.Accounts), resp.Holder, nil
+			return fromDaemon(resp.Accounts), resp.Holder, resp.FPWedged, nil
 		}
 	}
 	snaps, err := m.Snapshots(ctx, true, pool.DefaultFreshFor)
-	return snaps, nil, err
+	return snaps, nil, nil, err
+}
+
+// fpWedgedFooter renders the daemon's wedged File Provider domains — plain-path
+// only, like holderFooter (the TUI drops daemon-cache alerts on purpose). A
+// breaker-parked domain reads "parked (wedged)"; one the daemon is still
+// recovering reads "wedged (recovering)". "" when none are wedged (or the live
+// path, which has no daemon verdict).
+func fpWedgedFooter(wedged []daemon.FPDomainState) string {
+	if len(wedged) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(wedged))
+	for _, w := range wedged {
+		state := "wedged (recovering)"
+		if w.BreakerTripped {
+			state = "parked (wedged)"
+		}
+		lines = append(lines, badStyle.Render(fmt.Sprintf("✗ acct-%02d file provider %s", w.ID, state)))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // holderFooter is plain-path only — the TUI drops holder state

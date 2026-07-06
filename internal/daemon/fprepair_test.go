@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/fusekit/fileproviderd"
 )
 
@@ -87,7 +89,7 @@ func TestRepairFPDomainOutcomes(t *testing.T) {
 	t.Run("clean re-register repairs and resets state", func(t *testing.T) {
 		s, a, dirs, _ := newFPHealServer(t)
 		wedgeIt(t, s.fp, dirs[1])
-		res := s.repairFPDomain(t.Context(), a)
+		res := s.repairFPDomain(t.Context(), a, false)
 		if res.Outcome != FPRepairRepaired {
 			t.Fatalf("outcome = %q, want repaired", res.Outcome)
 		}
@@ -101,7 +103,7 @@ func TestRepairFPDomainOutcomes(t *testing.T) {
 		if !s.tryReserve(a.ID) {
 			t.Fatal("could not reserve acct-1")
 		}
-		res := s.repairFPDomain(t.Context(), a)
+		res := s.repairFPDomain(t.Context(), a, false)
 		if res.Outcome != FPRepairBusy {
 			t.Fatalf("outcome = %q, want busy under a reservation", res.Outcome)
 		}
@@ -113,7 +115,7 @@ func TestRepairFPDomainOutcomes(t *testing.T) {
 	t.Run("ErrCannotControl retreats to symlink", func(t *testing.T) {
 		s, a, _, fake := newFPHealServer(t)
 		fake.setupErr = fmt.Errorf("file provider setup: %w", fileproviderd.ErrCannotControl)
-		res := s.repairFPDomain(t.Context(), a)
+		res := s.repairFPDomain(t.Context(), a, false)
 		if res.Outcome != FPRepairRetreated {
 			t.Fatalf("outcome = %q, want retreated", res.Outcome)
 		}
@@ -126,7 +128,7 @@ func TestRepairFPDomainOutcomes(t *testing.T) {
 		s, a, dirs, fake := newFPHealServer(t)
 		s.fp.forceWedge(dirs[1])
 		fake.setupErr = fmt.Errorf("register domain: %w", fileproviderd.ErrBusy)
-		res := s.repairFPDomain(t.Context(), a)
+		res := s.repairFPDomain(t.Context(), a, false)
 		if res.Outcome != FPRepairFailed {
 			t.Fatalf("outcome = %q, want failed on a transient Setup error", res.Outcome)
 		}
@@ -139,6 +141,83 @@ func TestRepairFPDomainOutcomes(t *testing.T) {
 	})
 }
 
+// TestFPRepairRetreatWire pins the operator-only retreat path (`ccp fp repair
+// --retreat`): Request.Retreat routes to convertFPToSymlinkHeld instead of a
+// re-register — the ONLY caller left now that the heal breaker parks. Idle it
+// retreats and forgets the wedge; under a live session it defers loudly rather than
+// tear a domain out from under it. Neither path ever calls the FP provider's Setup
+// (a retreat is not a re-register).
+func TestFPRepairRetreatWire(t *testing.T) {
+	t.Run("explicit retreat converts to symlink without re-registering", func(t *testing.T) {
+		s, a, dirs, fake := newFPHealServer(t)
+		s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
+		wedgeIt(t, s.fp, dirs[1])
+		one := a.ID
+
+		resp := s.handleFPRepair(t.Context(), Request{Op: OpFPRepair, Account: &one, Retreat: true})
+		if !resp.OK || len(resp.FPRepairs) != 1 {
+			t.Fatalf("resp = %+v, want OK with one result", resp)
+		}
+		if resp.FPRepairs[0].Outcome != FPRepairRetreated {
+			t.Fatalf("outcome = %q, want retreated", resp.FPRepairs[0].Outcome)
+		}
+		if kindOf(t, s, 1) != "symlink" {
+			t.Fatal("explicit retreat must convert the row to symlink")
+		}
+		if s.fp.wedged(dirs[1]) {
+			t.Fatal("a retreat must forget the wedge state")
+		}
+		if _, setups, _, _ := fake.counts(); setups != 0 {
+			t.Fatalf("retreat re-registered the domain (setups=%d), want 0 — retreat is not a re-register", setups)
+		}
+	})
+
+	t.Run("retreat under a live session defers, row stays fileprovider", func(t *testing.T) {
+		s, a, dirs, _ := newFPHealServer(t)
+		s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+			return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+		}
+		wedgeIt(t, s.fp, dirs[1])
+		one := a.ID
+
+		resp := s.handleFPRepair(t.Context(), Request{Op: OpFPRepair, Account: &one, Retreat: true})
+		if !resp.OK || len(resp.FPRepairs) != 1 {
+			t.Fatalf("resp = %+v, want OK with one result", resp)
+		}
+		if resp.FPRepairs[0].Outcome != FPRepairFailed {
+			t.Fatalf("outcome = %q, want failed (retreat blocked by a live session)", resp.FPRepairs[0].Outcome)
+		}
+		if !strings.Contains(resp.FPRepairs[0].Detail, "live session") {
+			t.Fatalf("detail = %q, want the live-session blocked guidance", resp.FPRepairs[0].Detail)
+		}
+		if kindOf(t, s, 1) != "fileprovider" {
+			t.Fatal("a blocked retreat must not change the row")
+		}
+	})
+
+	t.Run("retreat rides the socket wire", func(t *testing.T) {
+		s, a, dirs, fake := newFPHealServer(t)
+		s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
+		wedgeIt(t, s.fp, dirs[1])
+		cl := &Client{socket: serveHandlerOnSocket(t, s)}
+		one := a.ID
+
+		resp, err := cl.FPRepair(&one, true)
+		if err != nil {
+			t.Fatalf("FPRepair --retreat: %v", err)
+		}
+		if len(resp.FPRepairs) != 1 || resp.FPRepairs[0].Outcome != FPRepairRetreated {
+			t.Fatalf("FPRepairs = %+v, want one retreated result", resp.FPRepairs)
+		}
+		if kindOf(t, s, 1) != "symlink" {
+			t.Fatal("retreat over the wire must convert the row to symlink")
+		}
+		if _, setups, _, _ := fake.counts(); setups != 0 {
+			t.Fatalf("retreat over the wire re-registered (setups=%d), want 0", setups)
+		}
+	})
+}
+
 // TestFPRepairEndToEndOverSocket drives OpFPRepair through the real wire:
 // Client.FPRepair -> unix socket -> handle -> dispatch -> handleFPRepair. A
 // missing dispatch case or client op would fail here, not in the handler unit.
@@ -146,7 +225,7 @@ func TestFPRepairEndToEndOverSocket(t *testing.T) {
 	s, a, _, fake := newFPHealServer(t)
 	cl := &Client{socket: serveHandlerOnSocket(t, s)}
 	one := a.ID
-	resp, err := cl.FPRepair(&one)
+	resp, err := cl.FPRepair(&one, false)
 	if err != nil {
 		t.Fatalf("FPRepair: %v", err)
 	}

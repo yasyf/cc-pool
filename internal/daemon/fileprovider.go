@@ -249,7 +249,7 @@ func (s *Server) handleFPRepair(ctx context.Context, req Request) Response {
 		if ctx.Err() != nil {
 			break
 		}
-		results = append(results, s.repairFPDomain(ctx, a))
+		results = append(results, s.repairFPDomain(ctx, a, req.Retreat))
 	}
 	return Response{OK: true, FPRepairs: results}
 }
@@ -261,8 +261,10 @@ func (s *Server) handleFPRepair(ctx context.Context, req Request) Response {
 // re-verifies; ErrCannotControl retreats the row to symlink. Re-registration
 // proceeds even under live sessions (a wedged domain already fails their reads). It
 // does its own Teardown+Setup rather than reRegisterFP so a transient Setup failure
-// is reported as FPRepairFailed, not silently as repaired.
-func (s *Server) repairFPDomain(ctx context.Context, a store.Account) FPRepairResult {
+// is reported as FPRepairFailed, not silently as repaired. When retreat is true it
+// takes the explicit-retreat path instead: the ONLY caller of convertFPToSymlinkHeld
+// left, now that the heal breaker parks rather than auto-retreats.
+func (s *Server) repairFPDomain(ctx context.Context, a store.Account, retreat bool) FPRepairResult {
 	res := FPRepairResult{ID: a.ID, Label: a.Label}
 	if !s.beginConvert(a.ID) {
 		res.Outcome = FPRepairBusy
@@ -283,6 +285,9 @@ func (s *Server) repairFPDomain(ctx context.Context, a store.Account) FPRepairRe
 		res.Outcome = FPRepairFailed
 		res.Detail = fmt.Sprintf("converted off file provider (now %s) in the claim gap", fresh.OverlayKind)
 		return res
+	}
+	if retreat {
+		return s.retreatFPDomainHeld(ctx, fresh, res)
 	}
 	prov := s.fpProvider(fresh)
 	if prov == nil {
@@ -316,6 +321,25 @@ func (s *Server) repairFPDomain(ctx context.Context, a store.Account) FPRepairRe
 		res.Outcome = FPRepairFailed
 		res.Detail = fmt.Sprintf("re-register failed: %v", serr)
 	}
+	return res
+}
+
+// retreatFPDomainHeld is the explicit-retreat arm of `ccp fp repair --retreat`:
+// it converts a File Provider row to the symlink floor at operator request — the
+// ONLY path that reaches convertFPToSymlinkHeld now the heal breaker parks rather
+// than auto-retreats a wedged-but-controllable domain. The caller holds the
+// convert claim; the retreat stays live-session-gated (a live session's open fds
+// break on the domain removal), so a blocked retreat reports FPRepairFailed with
+// the relaunch guidance rather than tearing a domain out from under a session.
+func (s *Server) retreatFPDomainHeld(ctx context.Context, fresh store.Account, res FPRepairResult) FPRepairResult {
+	if s.convertFPToSymlinkHeld(ctx, fresh) {
+		s.log.Printf("acct-%02d retreated to the symlink floor by `ccp fp repair --retreat`", fresh.ID)
+		res.Outcome = FPRepairRetreated
+		res.Detail = "retreated to the symlink floor at operator request"
+		return res
+	}
+	res.Outcome = FPRepairFailed
+	res.Detail = "symlink retreat is blocked by a live session (or a failed session scan) — relaunch any sessions on it, then re-run"
 	return res
 }
 

@@ -209,6 +209,46 @@ func TestSampleUsageRevokedNotMaskedByRateLimit(t *testing.T) {
 	assertNeverCanonical(t, kc.touchedServices())
 }
 
+// fakeOAuthNet fails every request with a network-class error, standing in for a
+// connectivity outage.
+type fakeOAuthNet struct{}
+
+func (fakeOAuthNet) Refresh(context.Context, string, string) (*oauth.TokenResponse, error) {
+	return nil, fmt.Errorf("dial tcp: %w", oauth.ErrNetwork)
+}
+
+func (fakeOAuthNet) Usage(context.Context, string) (*oauth.Usage, error) {
+	return nil, fmt.Errorf("dial tcp: %w", oauth.ErrNetwork)
+}
+
+// TestSampleUsageNetworkErrorPropagates: a transport failure surfaces as
+// oauth.ErrNetwork (never rate-limited or needs-login) and records no sample, so
+// the daemon's outage detector — not the auth or rate-limit ladders — owns it.
+func TestSampleUsageNetworkErrorPropagates(t *testing.T) {
+	// Unexpired so ensureFreshToken performs no preflight refresh: the network
+	// error must come from the usage fetch itself.
+	kc := &rotatingCreds{current: cred401("at-0", "rt-0", time.Now().Add(time.Hour))}
+	m, a := newManager401(t, kc, newFakeOAuth401("rt-0"))
+	m.OAuth = fakeOAuthNet{}
+
+	_, rateLimited, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
+	if !errors.Is(err, oauth.ErrNetwork) {
+		t.Fatalf("err = %v, want oauth.ErrNetwork", err)
+	}
+	if errors.Is(err, ErrNeedsLogin) {
+		t.Fatalf("a network outage must not classify as needs-login: %v", err)
+	}
+	if rateLimited {
+		t.Fatal("a network outage must not classify as rate-limited")
+	}
+	if _, ok, serr := m.Store.LatestUsageSample(a.ID); serr != nil {
+		t.Fatalf("LatestUsageSample: %v", serr)
+	} else if ok {
+		t.Fatal("a network-failed sample must record no usage sample")
+	}
+	assertNeverCanonical(t, kc.touchedServices())
+}
+
 // TestFetchUsage401RereadRetriesRotatedToken: after a session rotates the chain,
 // rung 1 (a pure re-read) retries with the rotated token, recovering without
 // spending a refresh token.

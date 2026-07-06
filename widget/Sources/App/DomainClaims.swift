@@ -26,13 +26,13 @@ final class DomainClaims {
     }
 
     /// Routes a control op to the resource key it must claim, or nil when the op
-    /// is unclaimed and must never bounce busy: register/remove serialize on the
-    /// domain identifier, probe serializes on its throwaway probe id, and
-    /// path/signal (and every other health-ish read op) run unclaimed. Pure —
-    /// no state, safe to call off any thread.
+    /// is unclaimed and must never bounce busy: register/remove/probe-domain
+    /// serialize on the domain identifier, probe serializes on its throwaway
+    /// probe id, and path/signal (and every other health-ish read op) run
+    /// unclaimed. Pure — no state, safe to call off any thread.
     static func key(op: String, domain: String, probeID: String) -> String? {
         switch op {
-        case "register", "remove": return domain
+        case "register", "remove", "probe-domain": return domain
         case "probe": return probeID
         default: return nil
         }

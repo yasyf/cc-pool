@@ -15,8 +15,10 @@ import (
 	"github.com/yasyf/fusekit/fileproviderd"
 )
 
-// swapFPDomainProbe overrides the package-level FP probe seam for one test.
-func swapFPDomainProbe(t *testing.T, fn func(string) error) {
+// swapFPDomainProbe overrides the package-level FP probe seam for one test. The
+// seam takes a ctx (the control-op probe is a bounded socket round-trip); test
+// closures ignore it.
+func swapFPDomainProbe(t *testing.T, fn func(context.Context, string) error) {
 	t.Helper()
 	prev := fpDomainProbe
 	fpDomainProbe = fn
@@ -94,11 +96,19 @@ func TestFPHealLadderEscalation(t *testing.T) {
 	}
 }
 
-// TestFPHealBreakerRetreatsWhenIdle pins the breaker (attempt 5): it bounces the
-// extension, re-registers once more, then — with no live session — retreats the
-// row to symlink and forgets its wedge state.
-func TestFPHealBreakerRetreatsWhenIdle(t *testing.T) {
-	s, a, dirs, _ := newFPHealServer(t)
+// TestFPHealBreakerParksWhenIdle is the R1 regression pin: the breaker (attempt 5)
+// bounces the extension and re-registers once more, then PARKS a
+// wedged-but-controllable domain — it must NOT auto-retreat to symlink even when
+// idle. A false wedge silently stranding an account on the symlink floor is the
+// regression this rewrite closes; retreat is now operator-only (`ccp fp repair
+// --retreat`). The row stays on fileprovider, stays wedged, and the park log names
+// both repair levers and the fileproviderd kickstart.
+func TestFPHealBreakerParksWhenIdle(t *testing.T) {
+	s, a, dirs, fake := newFPHealServer(t)
+	buf := &syncBuffer{}
+	s.log = log.New(buf, "", 0)
+	// No live session: the OLD breaker would have retreated to symlink here.
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
 	wedgeIt(t, s.fp, dirs[1])
 	now := time.Unix(0, 0)
 	for i := 0; i < fpRecoveryBreaker-1; i++ { // advance to attempts==4 (next is the breaker)
@@ -112,17 +122,27 @@ func TestFPHealBreakerRetreatsWhenIdle(t *testing.T) {
 	if bounced != 1 {
 		t.Fatalf("extension bounce fired %d times, want exactly 1 at the breaker", bounced)
 	}
-	if kind := kindOf(t, s, 1); kind != "symlink" {
-		t.Fatalf("breaker did not retreat to symlink: kind = %q", kind)
+	if _, setups, _, teardowns := fake.counts(); setups < 1 || teardowns < 1 {
+		t.Fatalf("breaker must run one final re-register: setups=%d teardowns=%d, want >=1/>=1", setups, teardowns)
 	}
-	if s.fp.wedged(dirs[1]) {
-		t.Fatal("a successful retreat must forget the wedge state (fp.reset)")
+	if kind := kindOf(t, s, 1); kind != "fileprovider" {
+		t.Fatalf("breaker auto-retreated a controllable domain (the R1 regression): kind = %q, want fileprovider (parked)", kind)
+	}
+	if !s.fp.wedged(dirs[1]) {
+		t.Fatal("a parked domain must stay wedged so select keeps excluding it")
+	}
+	log := buf.String()
+	for _, frag := range []string{"ccp fp repair --account", "ccp fp repair --retreat --account", "launchctl kickstart"} {
+		if !strings.Contains(log, frag) {
+			t.Fatalf("breaker park log must name %q; got:\n%s", frag, log)
+		}
 	}
 }
 
-// TestFPHealBreakerParksUnderLiveSessions pins that the breaker's symlink retreat
-// DEFERS under a live session (existing retreatFPToSymlink semantics): the row
-// stays on fileprovider, stays wedged, and the manual-recovery guidance is logged.
+// TestFPHealBreakerParksUnderLiveSessions pins that the breaker parks (not
+// retreats) with a live session bound to the dir too — same outcome as idle now
+// that auto-retreat is gone, so a live session can never be the thing that
+// distinguishes park from retreat.
 func TestFPHealBreakerParksUnderLiveSessions(t *testing.T) {
 	s, a, dirs, _ := newFPHealServer(t)
 	buf := &syncBuffer{}
@@ -140,10 +160,10 @@ func TestFPHealBreakerParksUnderLiveSessions(t *testing.T) {
 	healFPStep(t, s, a, now)
 
 	if kind := kindOf(t, s, 1); kind != "fileprovider" {
-		t.Fatalf("breaker retreated under a live session: kind = %q, want fileprovider (deferred)", kind)
+		t.Fatalf("breaker changed the row under a live session: kind = %q, want fileprovider (parked)", kind)
 	}
 	if !s.fp.wedged(dirs[1]) {
-		t.Fatal("a parked (deferred-retreat) domain must stay wedged so select keeps excluding it")
+		t.Fatal("a parked domain must stay wedged so select keeps excluding it")
 	}
 	if !strings.Contains(buf.String(), "launchctl kickstart") {
 		t.Fatalf("breaker park must log the manual fileproviderd-restart guidance; got:\n%s", buf.String())
@@ -222,7 +242,7 @@ func TestHealFPRowsDetectsWedgeThenRecovers(t *testing.T) {
 	swapFPDirLinked(t, func(string) bool { return true })
 
 	var probed int
-	swapFPDomainProbe(t, func(string) error { probed++; return overlay.ErrFPProbeWedged })
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { probed++; return overlay.ErrFPProbeWedged })
 
 	s.healFPRows(t.Context()) // strike 1: not wedged yet, no heal
 	if s.fp.wedged(dirs[1]) {
@@ -241,7 +261,7 @@ func TestHealFPRowsDetectsWedgeThenRecovers(t *testing.T) {
 	}
 
 	// The domain recovers: a healthy probe clears the verdict and the ladder.
-	swapFPDomainProbe(t, func(string) error { return nil })
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return nil })
 	s.healFPRows(t.Context())
 	if s.fp.wedged(dirs[1]) {
 		t.Fatal("a healthy probe must clear the wedge verdict")
@@ -258,7 +278,7 @@ func TestHealFPRowsBridgeDownSkipsProbing(t *testing.T) {
 	s.fpBridgeReadyFn = func() bool { return false }
 	swapFPDirLinked(t, func(string) bool { return true })
 	var probed int
-	swapFPDomainProbe(t, func(string) error { probed++; return nil })
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { probed++; return nil })
 
 	s.healFPRows(t.Context())
 
@@ -274,7 +294,7 @@ func TestHealFPRowsSkipsNonSymlinkDir(t *testing.T) {
 	s, _, _, _ := newFPHealServer(t) // acct-1's dir is a real dir, never a symlink
 	s.fpBridgeReadyFn = func() bool { return true }
 	var probed int
-	swapFPDomainProbe(t, func(string) error { probed++; return nil })
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { probed++; return nil })
 
 	s.healFPRows(t.Context())
 
@@ -314,7 +334,7 @@ func TestSelectExcludesWedgedFPDomain(t *testing.T) {
 func TestProbeFPWinnerForceWedges(t *testing.T) {
 	s, a, dirs, _ := newFPHealServer(t)
 
-	swapFPDomainProbe(t, func(string) error { return overlay.ErrFPProbeWedged })
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeWedged })
 	if s.probeWinnerReady(a) {
 		t.Fatal("probeWinnerReady must refuse a domain whose live probe hangs")
 	}
@@ -323,12 +343,51 @@ func TestProbeFPWinnerForceWedges(t *testing.T) {
 	}
 
 	s.fp.reset(dirs[1])
-	swapFPDomainProbe(t, func(string) error { return nil })
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return nil })
 	if !s.probeWinnerReady(a) {
 		t.Fatal("probeWinnerReady must accept a domain whose live probe succeeds")
 	}
 	if s.fp.wedged(dirs[1]) {
 		t.Fatal("a healthy probe must not wedge the domain")
+	}
+}
+
+// TestProbeFPWinnerNoVerdictStaysReady pins that a NoVerdict select-time probe (the
+// companion app is busy, unreachable, restarting, or too old to answer the control
+// op) reads READY without force-wedging: an app restart must never fleet-wedge every
+// select, the exact failure the through-domain read caused.
+func TestProbeFPWinnerNoVerdictStaysReady(t *testing.T) {
+	s, a, dirs, _ := newFPHealServer(t)
+
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeNoVerdict })
+	if !s.probeWinnerReady(a) {
+		t.Fatal("a NoVerdict select-time probe must read ready (never fleet-wedge a select)")
+	}
+	if s.fp.wedged(dirs[1]) {
+		t.Fatal("a NoVerdict probe must NOT force-wedge the domain")
+	}
+}
+
+// TestHealFPRowsNoVerdictSkipsTick pins that a NoVerdict heal probe is neither a
+// strike nor a clear and never escalates the ladder: a previously-wedged domain
+// stays wedged with no new recovery attempt, and no Sync/re-register fires.
+func TestHealFPRowsNoVerdictSkipsTick(t *testing.T) {
+	s, _, dirs, fake := newFPHealServer(t)
+	s.fpBridgeReadyFn = func() bool { return true }
+	swapFPDirLinked(t, func(string) bool { return true })
+	wedgeIt(t, s.fp, dirs[1]) // already wedged and due
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeNoVerdict })
+
+	s.healFPRows(t.Context())
+
+	if !s.fp.wedged(dirs[1]) {
+		t.Fatal("a NoVerdict tick must not clear an established wedge")
+	}
+	if s.fp.attemptsSoFar(dirs[1]) != 0 {
+		t.Fatalf("a NoVerdict tick must not book a recovery attempt: attemptsSoFar=%d, want 0", s.fp.attemptsSoFar(dirs[1]))
+	}
+	if _, setups, syncs, teardowns := fake.counts(); setups != 0 || syncs != 0 || teardowns != 0 {
+		t.Fatalf("a NoVerdict tick must not escalate the ladder: setups=%d syncs=%d teardowns=%d, want 0/0/0", setups, syncs, teardowns)
 	}
 }
 
@@ -465,7 +524,7 @@ func TestHealFPRowsMissingRoutesToControlPlaneHeal(t *testing.T) {
 	s.fpBridgeReadyFn = func() bool { return true }
 	swapFPDirLinked(t, func(string) bool { return true })
 	fake.healthErr = errors.New("no domain registered")
-	swapFPDomainProbe(t, func(string) error { return overlay.ErrFPProbeMissing })
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeMissing })
 
 	s.healFPRows(t.Context())
 

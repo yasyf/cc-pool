@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"time"
@@ -14,11 +15,29 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// fpDomainProbe reads an account's .claude.json through its File Provider domain
-// under a bounded deadline, classifying the verdict. A package var so heal and
-// select tests drive the recovery ladder without a live domain — see
-// overlay.FPDomainProbeWithin.
-var fpDomainProbe = overlay.FPDomainProbeWithin
+// fpControlProbeTimeout bounds one control-op FP domain probe. The op is a
+// socket round-trip to the companion app (never a through-domain read that mints
+// TCC prompts): a serving or unregistered domain answers fast; only a
+// materializing appex parks, and that must read NoVerdict, not a false wedge.
+const fpControlProbeTimeout = 3 * time.Second
+
+// fpDomainProbe classifies an account's File Provider domain data-plane verdict
+// through the signed companion app's control op (never a through-domain
+// filesystem read), returning nil (healthy) or one of
+// overlay.ErrFPProbe{Missing,Empty,Wedged,NoVerdict}. A package var so heal and
+// select tests drive the recovery ladder without a live domain; the default
+// resolves the FP provider and probes over the app socket under ctx.
+var fpDomainProbe = func(ctx context.Context, dir string) error {
+	prov, err := pool.OverlayProviderFor(fkoverlay.BackendFileProvider)
+	if err != nil {
+		return fmt.Errorf("%w: resolve file provider: %v", overlay.ErrFPProbeNoVerdict, err)
+	}
+	prober, ok := prov.(overlay.FPDomainProber)
+	if !ok {
+		return fmt.Errorf("%w: provider %T lacks the app control-op probe", overlay.ErrFPProbeNoVerdict, prov)
+	}
+	return overlay.FPDomainProbe(ctx, prober, dir)
+}
 
 // fpDirLinked reports whether an FP account dir is currently its live domain
 // bridge symlink (Setup makes accountDir a symlink INTO the domain root). A
@@ -32,7 +51,7 @@ var fpDirLinked = func(dir string) bool {
 
 // fpAppexBounce SIGKILLs the File Provider extension process (CCPoolFileProvider)
 // so fileproviderd respawns it against a fresh replica DB — the breaker's last
-// lever before a symlink retreat. It NEVER touches fileproviderd itself: a global
+// automated lever before it parks the domain. It NEVER touches fileproviderd itself: a global
 // File Provider daemon restart is a user action, never automated. pkill exits 1
 // when nothing matched, which is not an error here. Test seam.
 var fpAppexBounce = func(ctx context.Context) error {
@@ -84,9 +103,17 @@ func (s *Server) healFPRows(ctx context.Context) {
 		if s.isConverting(a.ID) || !fpDirLinked(a.ConfigDir) {
 			continue
 		}
-		probeErr := fpDomainProbe(a.ConfigDir)
+		probeCtx, cancel := context.WithTimeout(ctx, fpControlProbeTimeout)
+		probeErr := fpDomainProbe(probeCtx, a.ConfigDir)
+		cancel()
 		if msg := s.fp.recordProbe(a.ConfigDir, probeErr); msg != "" {
 			s.log.Printf("%s", msg)
+		}
+		// A no-verdict tick (app busy/unreachable/too old, or an app restart) is
+		// neither a strike nor a clear: skip it entirely so a transient control
+		// blip never escalates a previously-wedged domain's ladder.
+		if errors.Is(probeErr, overlay.ErrFPProbeNoVerdict) {
+			continue
 		}
 		// ENOENT never strikes the wedge ladder (an identity-less account is
 		// benign), so a domain deregistered out from under the daemon — its bridge
@@ -148,7 +175,8 @@ func (s *Server) healFPMissing(ctx context.Context, a store.Account, now time.Ti
 // escalating with the attempt count: attempt 1 re-asserts the overlay (Sync,
 // non-destructive); attempts 2–4 re-register the domain (Teardown+Setup, which
 // discards fileproviderd's poisoned replica state); attempt 5 trips the breaker
-// (appex bounce, one final re-register, then symlink retreat + park). Each step is
+// (appex bounce, one final re-register, then park — retreat only if the widget is
+// genuinely gone). Each step is
 // idempotent and verified by the next tick's probe — no inline sleeps. The caller
 // holds the account's poll claim. Re-registration proceeds even under live sessions
 // (a wedged domain already fails their reads); a pending select reservation defers
@@ -247,19 +275,26 @@ func (s *Server) reRegisterFP(a store.Account, prov fkoverlay.Provider) (cannotC
 
 // breakerFP is the recovery ladder's terminal step once fpRecoveryBreaker attempts
 // have not cleared the wedge: bounce the extension process (never fileproviderd),
-// one final re-register, then retreat to symlink. If the retreat defers (live
-// sessions bound to the dir), the domain parks wedged and the log carries the
-// manual-recovery guidance — a global fileproviderd restart is never automated.
-// Caller holds the convert claim.
+// one final re-register, then PARK. It NEVER retreats a wedged-but-controllable
+// domain to symlink behind the operator's back — a false wedge (an app restart, a
+// materializing appex) would silently strand the account on the symlink floor, the
+// exact regression this breaker rewrite closes. Automatic retreat survives ONLY
+// ErrCannotControl (reRegisterFP reports the widget is genuinely gone: no
+// entitlement or extension disabled); otherwise the domain parks wedged and the log
+// names the two operator levers plus the fileproviderd kickstart. Caller holds the
+// convert claim.
 func (s *Server) breakerFP(ctx context.Context, a store.Account, prov fkoverlay.Provider) {
-	s.log.Printf("acct-%02d file provider domain wedged past %d recovery attempts; breaker: bouncing the extension, one final re-register, then retreating to symlink — relaunch any sessions on it", a.ID, fpRecoveryBreaker)
+	s.log.Printf("acct-%02d file provider domain wedged past %d recovery attempts; breaker: bouncing the extension, one final re-register, then parking — relaunch any sessions on it", a.ID, fpRecoveryBreaker)
 	if err := fpAppexBounce(ctx); err != nil {
 		s.log.Printf("acct-%02d file provider extension bounce: %v", a.ID, err)
 	}
-	s.reRegisterFP(a, prov)
-	if s.convertFPToSymlinkHeld(ctx, a) {
-		s.log.Printf("acct-%02d fell back to symlink after exhausting file provider recovery", a.ID)
-		return
+	if s.reRegisterFP(a, prov) {
+		// ErrCannotControl: the widget is genuinely gone, so the domain can never
+		// serve here — the one condition an automatic symlink retreat survives.
+		if s.convertFPToSymlinkHeld(ctx, a) {
+			s.log.Printf("acct-%02d fell back to symlink: File Provider cannot serve on this machine", a.ID)
+			return
+		}
 	}
-	s.log.Printf("acct-%02d file provider domain parked wedged: automated recovery is exhausted and live sessions block the symlink retreat. A stuck fileproviderd needs a manual restart — run `launchctl kickstart -k gui/$(id -u)/com.apple.fileproviderd` (or reboot), then relaunch sessions on it", a.ID)
+	s.log.Printf("acct-%02d file provider domain parked wedged: automated recovery is exhausted. Re-register it now with `ccp fp repair --account %d`, or force it back to the symlink floor with `ccp fp repair --retreat --account %d`. A stuck fileproviderd needs a manual restart — run `launchctl kickstart -k gui/$(id -u)/com.apple.fileproviderd` (or reboot), then relaunch sessions on it", a.ID, a.ID, a.ID)
 }

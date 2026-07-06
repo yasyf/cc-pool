@@ -165,26 +165,33 @@ func (s *Server) awaitHolderHealth(ctx context.Context) (string, error) {
 // pluginkit query cannot be scripted in tests.
 var fpAvailable = fkoverlay.FileProviderAvailable
 
-// fpControlHealth is a test seam over the companion app's control Health
-// probe; the production probe dials the app's control socket.
-var fpControlHealth = func(ctx context.Context, socket string) (string, error) {
-	return fileproviderd.NewAppClient(socket).Health(ctx)
+// fpCapabilityProbe is a test seam over the companion app's throwaway-domain
+// capability probe (register+enumerate+remove a throwaway domain) — the truthful
+// "can File Provider serve on this machine?" verdict, which a control Health
+// ok:true ping is NOT. The production probe dials the app's control socket.
+var fpCapabilityProbe = func(ctx context.Context, socket string) (bool, error) {
+	return fileproviderd.NewAppClient(socket).Probe(ctx)
 }
 
 // fpGate reports why File Provider domains cannot be hosted, or "" when they
-// can — fuseGate's analog for `ccp migrate --to fileprovider`. The extension
-// probe (pluginkit: installed AND enabled) fails before the app is even
-// dialed, and a control Health round-trip proves the companion app is serving:
-// an FP conversion retargets the account dir onto a domain root that only a
-// live, entitled app can register, so both must hold before any account is
-// disturbed.
+// can — fuseGate's analog for `ccp migrate --to fileprovider`. The pluginkit
+// election (installed AND enabled) is the fast pre-check, but it only proves the
+// extension is registered, not that it can serve: a control Health round-trip is a
+// hard-coded ok:true socket ping an installed-but-unconsented provider also passes,
+// so every conversion then fails slowly through Setup's readiness poll. The second
+// rung is therefore the truthful throwaway-domain capability probe — register,
+// enumerate, and remove a throwaway domain — which alone distinguishes "serving"
+// from "enabled but not serving". Both must hold before any account is disturbed.
 func (s *Server) fpGate(ctx context.Context) (fkoverlay.Backend, string) {
 	spec := s.m.OverlaySpec()
 	if !fpAvailable(spec) {
 		return "", fmt.Sprintf("fileprovider unavailable: the %s extension is not installed and enabled — run `ccp fp onboard` to set it up end to end, then re-run `ccp migrate`", pool.FPExtensionBundleID)
 	}
-	if _, err := fpControlHealth(ctx, spec.FileProvider.ControlSocket); err != nil {
+	switch ok, err := fpCapabilityProbe(ctx, spec.FileProvider.ControlSocket); {
+	case err != nil:
 		return "", fmt.Sprintf("fileprovider unavailable: companion app control probe failed: %v — start %s, then re-run `ccp migrate`", err, pool.WidgetAppPath())
+	case !ok:
+		return "", "fileprovider unavailable: extension enabled but not serving — approve it in System Settings or run `ccp fp onboard`"
 	}
 	return fkoverlay.BackendFileProvider, ""
 }

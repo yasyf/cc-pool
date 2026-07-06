@@ -41,8 +41,8 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 		ctx: ctx,
 		cwd: cwd,
 		gather: func(c context.Context) (statusData, error) {
-			// Holder alert dropped on purpose; holderFooter stays a plain-path concern.
-			snaps, _, err := gatherStatus(c, m, live)
+			// Holder and FP-wedge alerts dropped on purpose; their footers stay a plain-path concern.
+			snaps, _, _, err := gatherStatus(c, m, live)
 			if err != nil {
 				return statusData{}, err
 			}

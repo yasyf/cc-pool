@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,6 +52,24 @@ func userAgent() string {
 	userAgentMu.RLock()
 	defer userAgentMu.RUnlock()
 	return userAgentValue
+}
+
+// ErrNetwork classifies a transport-layer failure of a token or usage request
+// (connection refused, DNS failure, TLS error, timeout) as distinct from an
+// HTTP-status error, so the daemon's poller can tell an outage from an auth or
+// rate-limit response and detect the moment connectivity returns. A deliberate
+// context.Canceled (daemon shutdown) is excluded; context.DeadlineExceeded is
+// network-class. Callers classify with errors.Is.
+var ErrNetwork = errors.New("network transport failure")
+
+// transportErr wraps an http.Client.Do failure. It tags the error ErrNetwork
+// unless the cause is context.Canceled — a caller cancelling the request (e.g.
+// daemon shutdown) is not an outage. The underlying cause is always preserved.
+func transportErr(op string, err error) error {
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	return fmt.Errorf("%s: %w: %w", op, ErrNetwork, err)
 }
 
 // Client is a thin OAuth client. The zero value is not usable; use New.
@@ -130,13 +149,19 @@ func (c *Client) refresh(ctx context.Context, refreshToken string) (*TokenRespon
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("oauth refresh request: %w", err)
+		return nil, transportErr("oauth refresh request", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, &RefreshError{Status: resp.StatusCode, Body: truncate(string(raw), 300)}
+	}
+	// A status line arrived, so a non-200 above is a proven API answer; a read
+	// error only past that point is a transport failure mid-body — classify it
+	// network-class (unless a deliberate cancellation) so it isn't a false canary.
+	if rerr != nil {
+		return nil, transportErr("oauth refresh response body", rerr)
 	}
 	var tr TokenResponse
 	if err := json.Unmarshal(raw, &tr); err != nil {
@@ -358,13 +383,19 @@ func (c *Client) Usage(ctx context.Context, accessToken string) (*Usage, error) 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("oauth usage request: %w", err)
+		return nil, transportErr("oauth usage request", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, &UsageError{Status: resp.StatusCode, Body: truncate(string(raw), 300)}
+	}
+	// A status line arrived, so a non-200 above is a proven API answer; a read
+	// error only past that point is a transport failure mid-body — classify it
+	// network-class (unless a deliberate cancellation) so it isn't a false canary.
+	if rerr != nil {
+		return nil, transportErr("oauth usage response body", rerr)
 	}
 	var ru rawUsage
 	if err := json.Unmarshal(raw, &ru); err != nil {

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,18 +31,75 @@ var (
 	mountAliveAt = overlay.MountAliveWithin
 	// deepProbeAt is doctor's wedge probe: a 2 MiB read with a 5s bound.
 	deepProbeAt = overlay.DeepProbeWithin
-	// fpDomainProbeAt is doctor's File Provider data-plane wedge probe: a bounded
-	// read of the served .claude.json through the domain, so a wedge is visible
-	// even with the daemon down.
-	fpDomainProbeAt = overlay.FPDomainProbeWithin
+	// fpDomainProbeAt is doctor's File Provider data-plane wedge probe (daemon-down
+	// path): it asks the companion app over its control op to enumerate the domain
+	// and report the .claude.json byte count — never a through-domain filesystem read
+	// (which would mint a per-account TCC prompt). A domain whose bridge is down
+	// (daemon down) answers domain-not-serving → ErrFPProbeWedged; an app that is
+	// also down answers ErrFPProbeNoVerdict (unprobeable, reported as no wedge). A
+	// seam so tests never dial a real app.
+	fpDomainProbeAt = func(dir string) error {
+		prov, err := fpOverlayProvider(fkoverlay.BackendFileProvider)
+		if err != nil {
+			return fmt.Errorf("%w: resolve file provider: %v", overlay.ErrFPProbeNoVerdict, err)
+		}
+		prober, ok := prov.(overlay.FPDomainProber)
+		if !ok {
+			return fmt.Errorf("%w: provider %T lacks the app control-op probe", overlay.ErrFPProbeNoVerdict, prov)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), fpDomainProbeTimeout)
+		defer cancel()
+		return overlay.FPDomainProbe(ctx, prober, dir)
+	}
 	// fpOverlayProvider resolves the File Provider overlay provider for the
 	// daemon-down direct `ccp fp repair` path; a seam so tests never register a
 	// real domain.
 	fpOverlayProvider = pool.OverlayProviderFor
-	stopDaemon        = stopDaemonService
-	brewManaged       = func() bool { return ccpAgent().IsBrewManaged() }
-	brewStop          = func() error { return ccpAgent().BrewStop() }
+	// fpRawProbeAt is doctor's OPT-IN raw File Provider probe (`--fp-raw-probe`):
+	// it reads the account dir's .claude.json THROUGH the domain with a bound —
+	// the materializing read the control-op probe exists to avoid, which can trip a
+	// per-account macOS permission prompt, hence the flag gate. The result maps onto
+	// the FP probe sentinels so reportFPWedges classifies it like the control op: a
+	// bounded read that never answers (a genuinely wedged domain) is a wedge; ENOENT
+	// is the benign no-identity Missing. A seam so tests never read a real domain.
+	fpRawProbeAt = func(dir string) error {
+		path := filepath.Join(dir, ".claude.json")
+		done := make(chan error, 1)
+		go func() {
+			_, err := os.ReadFile(path) //nolint:gosec // G304: dir is a pool account dir, not external input
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			switch {
+			case err == nil:
+				return nil
+			case errors.Is(err, os.ErrNotExist):
+				return fmt.Errorf("%w: %s", overlay.ErrFPProbeMissing, path)
+			default:
+				return fmt.Errorf("%w: raw read of %s: %v", overlay.ErrFPProbeWedged, path, err)
+			}
+		case <-time.After(fpRawProbeTimeout):
+			return fmt.Errorf("%w: raw read of %s did not answer within %s", overlay.ErrFPProbeWedged, path, fpRawProbeTimeout)
+		}
+	}
+	stopDaemon  = stopDaemonService
+	brewManaged = func() bool { return ccpAgent().IsBrewManaged() }
+	brewStop    = func() error { return ccpAgent().BrewStop() }
 )
+
+// fpRawProbeTimeout bounds the opt-in raw File Provider read so `ccp doctor`
+// never parks on a wedged domain (the reader goroutine may leak on a genuinely
+// wedged descriptor — unavoidable with os.ReadFile — but doctor is short-lived).
+const fpRawProbeTimeout = 3 * time.Second
+
+// fpDomainProbeTimeout bounds the one-shot File Provider domain verifications
+// (`ccp doctor` daemon-down; post-migrate renderFPServeVerdicts) where a real
+// verdict is the whole point. Sized above the app's ~13s worst-case reply and
+// fusekit's 16s per-op client timeout so a slow-but-serving domain yields a
+// verdict, not a false "cannot verify" — unlike the daemon's cheap 3s heal tick
+// (daemon.fpControlProbeTimeout), which is NoVerdict-tolerant by design.
+const fpDomainProbeTimeout = 20 * time.Second
 
 // holderClient is Owner-scoped: List/Reclaim see only cc-pool's own mounts,
 // never another tenant's.

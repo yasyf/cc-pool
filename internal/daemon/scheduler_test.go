@@ -21,6 +21,32 @@ func TestRLBackoffExponentialCapped(t *testing.T) {
 	}
 }
 
+func TestNextPollDelay(t *testing.T) {
+	cases := []struct {
+		name     string
+		outage   bool
+		min, max time.Duration // delay must land in [min, max)
+	}{
+		{"normal", false, basePollInterval, basePollInterval + pollJitter},
+		{"outage", true, outagePollInterval - outageJitter, outagePollInterval + outageJitter},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, seed := range []int64{0, 1, 1 << 40, -7, 2_026_000_000} {
+				d := nextPollDelay(tc.outage, seed)
+				if d < tc.min || d >= tc.max {
+					t.Errorf("nextPollDelay(%v, %d) = %v, out of [%v, %v)", tc.outage, seed, d, tc.min, tc.max)
+				}
+			}
+		})
+	}
+	// The outage cadence must be dramatically shorter than steady-state — the
+	// whole point is a ~1-minute heal, not a ~3-minute wait.
+	if outagePollInterval+outageJitter >= basePollInterval {
+		t.Fatalf("outage cadence (max %v) is not shorter than base %v", outagePollInterval+outageJitter, basePollInterval)
+	}
+}
+
 func TestJitterBounded(t *testing.T) {
 	for _, seed := range []int64{0, 1, 1 << 40, -7, 2_026_000_000} {
 		j := jitter(pollJitter, seed)

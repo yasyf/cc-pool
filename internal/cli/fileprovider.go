@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
+	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/fileproviderd"
@@ -90,6 +92,24 @@ var fpDaemonProbe = func() (alive, consentPending bool) {
 	return true, false
 }
 
+// fpCapabilityProbe reports whether the just-launched companion app can actually
+// serve File Provider on this machine, over the app's throwaway-domain probe —
+// the truthful consent gate that a pluginkit election is NOT. It NEVER spawns:
+// onboard already launched the app, so a dead control socket must read as
+// "app coming up", never mask a stall behind a spawn. A seam so onboarding tests
+// never dial a real app.
+var fpCapabilityProbe = func(ctx context.Context) (bool, error) {
+	return fileproviderd.NewAppClient(pool.FPControlSocketPath()).Probe(ctx)
+}
+
+// widgetAppInstalled reports whether the CCPoolStatus app bundle is present. A
+// seam so onboarding tests exercise both the install and already-present paths
+// without touching Homebrew.
+var widgetAppInstalled = func() bool {
+	fi, err := os.Stat(pool.WidgetAppPath())
+	return err == nil && fi.IsDir()
+}
+
 const (
 	// fpOnboardPollInterval paces the election wait and the health-rung polls.
 	fpOnboardPollInterval = 500 * time.Millisecond
@@ -111,6 +131,7 @@ func newFPCmd() *cobra.Command {
 
 func newFPRepairCmd() *cobra.Command {
 	var account int
+	var retreat bool
 	cmd := &cobra.Command{
 		Use:   "repair",
 		Short: "Re-register wedged File Provider domains (control ops answer but reads hang)",
@@ -125,23 +146,29 @@ the select gate a CLI-side re-register would race, so this routes through the
 daemon when it is running and falls back to a direct provider repair only when
 it is down.
 
-Re-registration breaks any open file descriptors on the domain, so relaunch
-sessions on a repaired account.`,
+--retreat forces the target domain(s) back to the symlink floor instead of
+re-registering — the escape hatch for a domain File Provider can never serve
+here (the daemon's auto-heal now parks a wedged-but-controllable domain rather
+than retreating it behind your back). Pair it with --account.
+
+Both re-registration and the retreat break any open file descriptors on the
+domain, so relaunch sessions on a repaired account.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
-				return runFPRepair(cmd, m, account)
+				return runFPRepair(cmd, m, account, retreat)
 			})
 		},
 	}
 	cmd.Flags().IntVar(&account, "account", 0, "repair only this account id (default: every wedged domain)")
+	cmd.Flags().BoolVar(&retreat, "retreat", false, "force the target domain(s) back to the symlink floor instead of re-registering")
 	return cmd
 }
 
 // runFPRepair routes a repair through the daemon when it is up (it owns the
 // select gate a CLI-side re-register would race) and directly through the
 // provider when it is down.
-func runFPRepair(cmd *cobra.Command, m *pool.Manager, account int) error {
+func runFPRepair(cmd *cobra.Command, m *pool.Manager, account int, retreat bool) error {
 	if err := requireInit(m); err != nil {
 		return err
 	}
@@ -153,14 +180,14 @@ func runFPRepair(cmd *cobra.Command, m *pool.Manager, account int) error {
 	health, err := cl.Health()
 	switch {
 	case errors.Is(err, daemon.ErrDaemonUnavailable):
-		// Daemon down: no select to race, so repair the provider directly.
-		return repairFPDirect(cmd, m, account)
+		// Daemon down: no select to race, so act on the provider directly.
+		return repairFPDirect(cmd, m, account, retreat)
 	case err != nil:
 		return fmt.Errorf("daemon health check: %w", err)
 	case health.Version != version.String():
 		return fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) and re-run", health.Version, version.String())
 	}
-	resp, err := cl.FPRepair(acct)
+	resp, err := cl.FPRepair(acct, retreat)
 	if err != nil {
 		return fmt.Errorf("fp repair: %w", err)
 	}
@@ -210,8 +237,15 @@ func renderFPRepairs(cmd *cobra.Command, resp *daemon.Response, explicit bool) e
 // Teardown+Setup per target — the one named with --account, else every File
 // Provider row. Content stays unserved until the daemon (its content bridge) is
 // back, so it warns about that.
-func repairFPDirect(cmd *cobra.Command, m *pool.Manager, account int) error {
+func repairFPDirect(cmd *cobra.Command, m *pool.Manager, account int, retreat bool) error {
 	out := cmd.OutOrStdout()
+	if retreat {
+		// The File-Provider→symlink retreat deregisters the domain, breaking any
+		// live session's open fds; only the daemon gates that cutover against live
+		// sessions (ConvertOverlay itself does not). Refuse to retreat blind with the
+		// daemon down rather than yank a domain out from under a running session.
+		return errors.New("`--retreat` needs the daemon: it gates the File-Provider→symlink cutover against live sessions (whose open descriptors break on the domain removal) — start it with `ccp service install`, then re-run `ccp fp repair --retreat`")
+	}
 	accts, err := m.Store.ListAccounts()
 	if err != nil {
 		return err
@@ -288,11 +322,13 @@ func newFPOnboardCmd() *cobra.Command {
 		Use:   "onboard",
 		Short: "Install, enable, and adopt the File Provider overlay end to end",
 		Long: `onboard walks the File Provider overlay from zero to serving: it installs
-(or upgrades) the CCPoolStatus app — the extension's host — launches it,
-elects the extension with pluginkit, and if macOS still holds it disabled,
-opens System Settings ▸ ` + pane + `
-(the one toggle no CLI can flip) and waits for you. Once enabled it verifies
-the health ladder — extension → app control socket → daemon bridge socket —
+the CCPoolStatus app — the extension's host — if it is missing (an existing
+install is left as-is; the version check flags a stale one), launches it,
+elects the extension with pluginkit, then probes whether it can actually serve.
+Election is registration, not consent, so if macOS still holds the extension
+disabled it opens System Settings ▸ ` + pane + `
+(the one toggle no CLI can flip) and waits until the probe passes. Once serving
+it verifies the rest of the ladder — control socket → daemon bridge socket —
 naming the exact fix for whichever rung is stuck, then offers to migrate
 your accounts onto File Provider.
 
@@ -304,14 +340,7 @@ Idempotent: steps already satisfied are skipped.`,
 
 func runFPOnboard(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
-	if _, err := exec.LookPath("brew"); err != nil {
-		return fmt.Errorf("the CCPoolStatus app installs via Homebrew, which isn't on PATH (to build from source instead, see widget/README.md): %w", err)
-	}
-	if err := ensureWidgetTap(cmd); err != nil {
-		return err
-	}
-	step(out, "Installing the CCPoolStatus app (it hosts the File Provider extension)…")
-	if err := brewInstallWidget(cmd); err != nil {
+	if err := ensureWidgetInstalled(cmd); err != nil {
 		return err
 	}
 	step(out, "Launching it so macOS registers the extension…")
@@ -319,10 +348,15 @@ func runFPOnboard(cmd *cobra.Command) error {
 		return err
 	}
 
+	// Election first (the extension must be registered + elected), then the
+	// data-plane capability probe — election is registration, NOT consent, so it
+	// must never be reported as "enabled".
 	if err := awaitFPElection(cmd.Context(), out, fpOnboardPollInterval); err != nil {
 		return err
 	}
-	success(out, "File Provider extension enabled.")
+	if err := awaitFPCapability(cmd.Context(), out, fpOnboardPollInterval); err != nil {
+		return err
+	}
 
 	if err := checkFPRungs(cmd.Context(), out, fpOnboardPollInterval); err != nil {
 		return err
@@ -330,6 +364,27 @@ func runFPOnboard(cmd *cobra.Command) error {
 	success(out, "File Provider stack healthy.")
 
 	return offerFPMigration(cmd)
+}
+
+// ensureWidgetInstalled installs the CCPoolStatus app (the extension's host) via
+// Homebrew when it is absent. An already-installed app is left as-is — skipping
+// the tap add and the slow `brew install`/`brew upgrade` entirely; checkFPRungs'
+// widget-version floor catches a genuinely stale copy and points at the upgrade,
+// so the common (already-current) case stays fast and needs no `brew` on PATH.
+func ensureWidgetInstalled(cmd *cobra.Command) error {
+	out := cmd.OutOrStdout()
+	if widgetAppInstalled() {
+		step(out, "CCPoolStatus is already installed (%s); skipping the Homebrew install.", abbreviateHome(pool.WidgetAppPath()))
+		return nil
+	}
+	if _, err := exec.LookPath("brew"); err != nil {
+		return fmt.Errorf("the CCPoolStatus app installs via Homebrew, which isn't on PATH (to build from source instead, see widget/README.md): %w", err)
+	}
+	if err := ensureWidgetTap(cmd); err != nil {
+		return err
+	}
+	step(out, "Installing the CCPoolStatus app (it hosts the File Provider extension)…")
+	return brewInstallWidget(cmd)
 }
 
 // awaitFPElection drives the pluginkit election to elected (a user-disabled
@@ -384,6 +439,56 @@ func awaitFPElection(ctx context.Context, out io.Writer, interval time.Duration)
 	}
 }
 
+// awaitFPCapability polls the companion app's throwaway-domain probe — the
+// truthful consent gate that a pluginkit election is NOT — until File Provider
+// can actually serve on this machine. Election puts the extension on the list;
+// only macOS's System Settings toggle grants it, and no CLI can flip it, so the
+// first time the app answers "can't serve" this narrates that lever, opens the
+// pane, and then spins on the probe until it passes. A dead control socket is
+// treated as "app still coming up" (quiet wait), never a false consent prompt.
+// Unbounded like awaitFPElection; ^C cancels.
+func awaitFPCapability(ctx context.Context, out io.Writer, interval time.Duration) error {
+	en := fkoverlay.BackendFileProvider.Enablement()
+	explained := false
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for i := 0; ; i++ {
+		ok, err := fpCapabilityProbe(ctx)
+		if ok && err == nil {
+			_, _ = fmt.Fprint(out, "\r\x1b[K")
+			success(out, "File Provider extension enabled and serving.")
+			return nil
+		}
+		// Open Settings ONLY on a definitive can't-serve verdict: a clean ok=false
+		// (err==nil here implies ok==false) or ErrCannotControl (extension disabled /
+		// no entitlement — the one lever the Settings toggle flips). Every other error
+		// is a no-verdict transient (ErrAppUnavailable, ErrBusy, ErrRegisterFailed, or
+		// any other shape) → quiet-wait, never a spurious deep-link. ErrOpUnsupported
+		// can't reach here (ProbeDomain-only; checkFPRungs' version floor names it).
+		cantServe := err == nil || errors.Is(err, fileproviderd.ErrCannotControl)
+		msg := "waiting for the CCPoolStatus app to come up… press ctrl-c to abort"
+		if cantServe {
+			msg = "waiting for the File Provider extension to serve… press ctrl-c to abort"
+			if !explained {
+				explained = true
+				_, _ = fmt.Fprint(out, "\r\x1b[K")
+				step(out, "The extension is registered but macOS has not cleared it to serve — election is not consent.")
+				step(out, "Turn CCPoolStatus ON under System Settings ▸ %s; only that toggle grants it.", en.Pane)
+				if serr := fpOpenSettings(ctx); serr != nil {
+					warn(out, "couldn't open System Settings (%v) — navigate there yourself", serr)
+				}
+			}
+		}
+		_, _ = fmt.Fprintf(out, "\r%s %s", spinnerFrames[i%len(spinnerFrames)], dimStyle.Render(msg))
+		select {
+		case <-ctx.Done():
+			_, _ = fmt.Fprint(out, "\r\x1b[K")
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // checkFPRungs walks the remaining File Provider rungs (app control socket,
 // then daemon bridge socket), naming the exact fix for whichever rung stays down.
 func checkFPRungs(ctx context.Context, out io.Writer, interval time.Duration) error {
@@ -397,7 +502,11 @@ func checkFPRungs(ctx context.Context, out io.Writer, interval time.Duration) er
 		return fmt.Errorf("the CCPoolStatus control socket %s never answered (%w) — launch %s and re-run `ccp fp onboard`",
 			abbreviateHome(pool.FPControlSocketPath()), err, pool.WidgetAppPath())
 	}
-	step(out, "CCPoolStatus app serving (%s).", ver)
+	if !pool.WidgetVersionSupported(ver) {
+		return fmt.Errorf("the CCPoolStatus app is %s but File Provider needs %s or newer to answer the probe-domain control op the wedge detector and migrate gate rely on — run `brew upgrade --cask %s`, relaunch it, then re-run `ccp fp onboard`",
+			ver, pool.MinWidgetVersion, widgetCask)
+	}
+	step(out, "CCPoolStatus control socket answering (%s).", ver)
 
 	_, err = pollFPRung(ctx, out, interval, "waiting for the daemon's bridge socket…", func() (string, error) {
 		if fpBridgeReachable() {
@@ -492,6 +601,53 @@ func offerFPMigration(cmd *cobra.Command) error {
 			note(out, "No accounts to migrate; fileprovider is now the default for new accounts.")
 			return nil
 		}
-		return renderMigrationSummary(cmd, resp, "fileprovider", false)
+		summaryErr := renderMigrationSummary(cmd, resp, "fileprovider", false)
+		// Prove each freshly-migrated domain actually serves reads over the app
+		// control op — the truthful close a "converted" tally alone can't give.
+		renderFPServeVerdicts(cmd, m, resp)
+		if names := busyMigrationNames(resp); len(names) > 0 {
+			note(out, "Still busy, not migrated: %s — close those sessions, then re-run `ccp fp onboard`.", strings.Join(names, ", "))
+		}
+		return summaryErr
 	})
+}
+
+// renderFPServeVerdicts probes each freshly-migrated File Provider domain over
+// the app control op (never a materializing filesystem read) and prints a
+// per-account serve verdict: the migrate gate already proved identity-bearing
+// domains before flipping the row, so this is the user-facing confirmation. A
+// NoVerdict (companion app busy/unreachable/too old) prints "unverified" rather
+// than a false ✗.
+func renderFPServeVerdicts(cmd *cobra.Command, m *pool.Manager, resp *daemon.Response) {
+	out := cmd.OutOrStdout()
+	for _, r := range resp.Migrations {
+		if r.Outcome != daemon.MigrationDone {
+			continue
+		}
+		a, err := m.Store.GetAccount(r.ID)
+		if err != nil {
+			continue
+		}
+		name := fmt.Sprintf("acct-%02d (%s)", r.ID, accountName(r.Label))
+		switch err := fpDomainProbeAt(a.ConfigDir); {
+		case err == nil, errors.Is(err, overlay.ErrFPProbeMissing), errors.Is(err, overlay.ErrFPProbeEmpty):
+			success(out, "%s domain serving", name)
+		case errors.Is(err, overlay.ErrFPProbeNoVerdict):
+			step(out, "%s domain unverified (companion app busy or unreachable): %v", name, err)
+		default:
+			step(out, "%s %s domain does not serve reads: %v", badStyle.Render("✗"), name, err)
+		}
+	}
+}
+
+// busyMigrationNames lists the accounts a migrate skipped as busy (live session
+// or reservation), for the "close those sessions, then re-run" guidance.
+func busyMigrationNames(resp *daemon.Response) []string {
+	var names []string
+	for _, r := range resp.Migrations {
+		if r.Outcome == daemon.MigrationBusy {
+			names = append(names, fmt.Sprintf("acct-%02d (%s)", r.ID, accountName(r.Label)))
+		}
+	}
+	return names
 }

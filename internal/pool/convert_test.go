@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
@@ -1157,6 +1158,24 @@ func replaceWithBridge(t *testing.T, dir string) {
 	}
 }
 
+// replaceWithFPBridge swaps an account dir for a File Provider domain bridge
+// symlink — a symlink into an OS-surfaced domain root, NOT the mux root, so
+// IsBridgeSymlink reads FALSE. This is the exact wreckage a crashed
+// symlink→fileprovider convert left behind (row=symlink, dir=FP bridge) that
+// IsBridgeSymlink missed and the broader requireRealDir guard must catch. Returns
+// the link target.
+func replaceWithFPBridge(t *testing.T, dir string) string {
+	t.Helper()
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "CCPoolStatus-"+filepath.Base(dir))
+	if err := os.Symlink(target, dir); err != nil {
+		t.Fatal(err)
+	}
+	return target
+}
+
 // muxSetupSim mirrors the fuse provider's setupMux: an empty account dir is
 // replaced by the bridge symlink, a non-empty one is refused (ErrAccountDirOccupied),
 // and an existing symlink is left in place.
@@ -1225,47 +1244,76 @@ func (b *bridgeFuse) Teardown(_, dir string) error {
 	return os.Remove(dir)
 }
 
-// TestConvertToFuseRefusesBridgeSymlink pins the bridge-symlink guard: a symlink
-// row whose dir is unexpectedly a mux bridge symlink must not convert to fuse —
-// moving files through it (MovePrivateEntries) writes into the live mirror.
-func TestConvertToFuseRefusesBridgeSymlink(t *testing.T) {
-	ops := []string{}
-	m, a, dir := newConvertFixture(t, &fakeFuse{ops: &ops})
-	replaceWithBridge(t, dir)
+// TestConvertToFuseRefusesOverlaySymlink is the R2 regression pin for convertToFuse:
+// a symlink row whose dir is unexpectedly a symlink — a mux bridge OR the
+// FP-bridge shape IsBridgeSymlink missed — must refuse with ErrDirIsOverlaySymlink,
+// name the link target, and touch no provider; moving files through it
+// (MovePrivateEntries) would write into the live mirror/domain.
+func TestConvertToFuseRefusesOverlaySymlink(t *testing.T) {
+	for _, shape := range []string{"mux-bridge", "fp-bridge"} {
+		t.Run(shape, func(t *testing.T) {
+			ops := []string{}
+			m, a, dir := newConvertFixture(t, &fakeFuse{ops: &ops})
+			var target string
+			if shape == "mux-bridge" {
+				replaceWithBridge(t, dir)
+				target = filepath.Join(MuxRootDir(), filepath.Base(dir))
+			} else {
+				target = replaceWithFPBridge(t, dir)
+			}
 
-	_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
-	if err == nil || !strings.Contains(err.Error(), "bridge symlink") {
-		t.Fatalf("convertToFuse over a bridge symlink = %v, want a bridge-symlink refusal", err)
-	}
-	if len(ops) != 0 {
-		t.Fatalf("refused convert still touched the fuse provider: %v", ops)
-	}
-	if storedKind(t, m, a.ID) != "symlink" {
-		t.Fatal("row flipped despite a refused convert")
+			_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendNFS)
+			if !errors.Is(err, ErrDirIsOverlaySymlink) {
+				t.Fatalf("convertToFuse over a %s = %v, want errors.Is ErrDirIsOverlaySymlink", shape, err)
+			}
+			if !strings.Contains(err.Error(), target) {
+				t.Fatalf("refusal %q does not name the link target %q", err, target)
+			}
+			if len(ops) != 0 {
+				t.Fatalf("refused convert still touched the fuse provider: %v", ops)
+			}
+			if storedKind(t, m, a.ID) != "symlink" {
+				t.Fatal("row flipped despite a refused convert")
+			}
+		})
 	}
 }
 
-// TestHealStrandedPrivateRefusesBridgeSymlink pins the heal-side guard: a symlink
-// row with stranded private files whose dir is a bridge symlink must refuse —
-// moving the files back through it corrupts the mirror; the stranded copy is left
-// intact for `ccp doctor`.
-func TestHealStrandedPrivateRefusesBridgeSymlink(t *testing.T) {
-	m, a, dir := newConvertFixture(t, nil)
-	priv := fkoverlay.FusePrivateRoot(dir)
-	if err := os.MkdirAll(priv, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(filepath.Join(dir, ".claude.json"), filepath.Join(priv, ".claude.json")); err != nil {
-		t.Fatal(err)
-	}
-	replaceWithBridge(t, dir)
+// TestHealStrandedPrivateRefusesOverlaySymlink is the R2 regression pin for the
+// heal path: a symlink row with stranded private files whose dir is a symlink — a
+// mux bridge OR the FP-bridge shape IsBridgeSymlink missed — must refuse with
+// ErrDirIsOverlaySymlink and leave the stranded copy intact for `ccp doctor`;
+// moving the files back through it would corrupt the mirror/domain.
+func TestHealStrandedPrivateRefusesOverlaySymlink(t *testing.T) {
+	for _, shape := range []string{"mux-bridge", "fp-bridge"} {
+		t.Run(shape, func(t *testing.T) {
+			m, a, dir := newConvertFixture(t, nil)
+			priv := fkoverlay.FusePrivateRoot(dir)
+			if err := os.MkdirAll(priv, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(filepath.Join(dir, ".claude.json"), filepath.Join(priv, ".claude.json")); err != nil {
+				t.Fatal(err)
+			}
+			var target string
+			if shape == "mux-bridge" {
+				replaceWithBridge(t, dir)
+				target = filepath.Join(MuxRootDir(), filepath.Base(dir))
+			} else {
+				target = replaceWithFPBridge(t, dir)
+			}
 
-	healed, err := m.HealStrandedPrivate(a)
-	if healed || err == nil || !strings.Contains(err.Error(), "bridge symlink") {
-		t.Fatalf("HealStrandedPrivate over a bridge symlink = (%v, %v), want a bridge-symlink refusal", healed, err)
-	}
-	if got := readFileT(t, filepath.Join(priv, ".claude.json")); got != identityJSON {
-		t.Fatalf("stranded identity moved through the mirror: %q", got)
+			healed, err := m.HealStrandedPrivate(a)
+			if healed || !errors.Is(err, ErrDirIsOverlaySymlink) {
+				t.Fatalf("HealStrandedPrivate over a %s = (%v, %v), want errors.Is ErrDirIsOverlaySymlink", shape, healed, err)
+			}
+			if !strings.Contains(err.Error(), target) || !strings.Contains(err.Error(), "ccp doctor") {
+				t.Fatalf("refusal %q must name the target %q and `ccp doctor`", err, target)
+			}
+			if got := readFileT(t, filepath.Join(priv, ".claude.json")); got != identityJSON {
+				t.Fatalf("stranded identity moved through the mirror: %q", got)
+			}
+		})
 	}
 }
 
@@ -1328,6 +1376,7 @@ type fakeFP struct {
 	registered  map[string]bool
 	setupErr    error
 	teardownErr error
+	probeErr    error            // scripted ProbeDomain verdict; nil reads the domain root
 	onSetup     func(dir string) // runs after the domain is minted, before the symlink
 }
 
@@ -1340,6 +1389,26 @@ func (f *fakeFP) Backend() fkoverlay.Backend    { return fkoverlay.BackendFilePr
 func (f *fakeFP) Sync(_, _ string) error        { return nil }
 func (f *fakeFP) Health(_, _ string) error      { return nil }
 func (f *fakeFP) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
+
+// ProbeDomain models the companion app's control-op verdict: it reads the
+// backing .claude.json the bridge serves at the domain root (never a
+// through-domain filesystem read) and reports its byte count — nil (absent), a
+// pointer to 0 (empty), or a pointer to the size. It is what the derive-path
+// convert gate calls when Manager.FPProbe is unset.
+func (f *fakeFP) ProbeDomain(_ context.Context, dir string) (*int64, error) {
+	if f.probeErr != nil {
+		return nil, f.probeErr
+	}
+	b, err := os.ReadFile(filepath.Join(f.domainRoot(dir), ".claude.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	n := int64(len(b))
+	return &n, nil
+}
 
 func (f *fakeFP) domainRoot(dir string) string {
 	return filepath.Join(f.domainsRoot, "CCPoolStatus-"+filepath.Base(dir))
@@ -1366,8 +1435,8 @@ func (f *fakeFP) Setup(_, dir string) error {
 		return err
 	}
 	// Model a materialized domain: the bridge serves the backing .claude.json at
-	// the domain root, so the convert probe (a through-domain read of dir, a
-	// symlink into root) verifies real content instead of a false miss.
+	// the domain root, so ProbeDomain (the control-op verdict) reports real
+	// content instead of a false miss.
 	if b, err := os.ReadFile(filepath.Join(priv, ".claude.json")); err == nil {
 		if err := os.WriteFile(filepath.Join(root, ".claude.json"), b, 0o600); err != nil {
 			return err
@@ -1386,6 +1455,23 @@ func (f *fakeFP) Teardown(_, dir string) error {
 	}
 	delete(f.registered, filepath.Base(dir))
 	return nil
+}
+
+// RemoveDomain deregisters WITHOUT retracting the bridge symlink (unlike Teardown),
+// mirroring fusekit's RemoveDomain: removing a never-registered domain is a no-op.
+func (f *fakeFP) RemoveDomain(dir string) error {
+	*f.ops = append(*f.ops, "fp.removedomain")
+	delete(f.registered, filepath.Base(dir))
+	return nil
+}
+
+// DomainRoot models the host's zero-spawn State query: a registered domain returns
+// its root, an unregistered one is fileproviderd.ErrNoDomain.
+func (f *fakeFP) DomainRoot(_ context.Context, dir string) (string, error) {
+	if !f.registered[filepath.Base(dir)] {
+		return "", fmt.Errorf("state domain %s: %w", filepath.Base(dir), fileproviderd.ErrNoDomain)
+	}
+	return f.domainRoot(dir), nil
 }
 
 // fpOverlayFor dispatches provider resolution to the fake FP provider, the
@@ -1539,6 +1625,22 @@ func TestConvertFuseToFileProviderFailClosedOnRealDir(t *testing.T) {
 	}
 	if storedKind(t, m, a.ID) != "nfs" {
 		t.Fatal("row flipped despite refused conversion")
+	}
+	// LEAK FIX: fusekit registers the domain BEFORE it lays the bridge symlink, so
+	// the AtomicSymlink refusal left a registered domain. The rollback's
+	// retractFileProviderIfLaid real-dir arm must deregister it (RemoveDomain) rather
+	// than return nil and leak the registration forever.
+	if len(fp.registered) != 0 {
+		t.Fatalf("leaked domain not deregistered by the rollback's real-dir arm: %v", fp.registered)
+	}
+	sawRemove := false
+	for _, op := range ops {
+		if op == "fp.removedomain" {
+			sawRemove = true
+		}
+	}
+	if !sawRemove {
+		t.Fatalf("rollback did not call RemoveDomain on the real-dir arm: ops = %v", ops)
 	}
 }
 
@@ -1709,6 +1811,9 @@ func TestConvertToFileProviderMoveFailureRoutesRollback(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "move private files") {
 		t.Fatalf("error = %v, want the move cause", err)
 	}
+	// The drain died before Setup, so no domain was ever registered: the rollback's
+	// real-dir retract sees no registration (zero-spawn DomainRoot) and deregisters
+	// nothing, touching no provider mutation.
 	if len(ops) != 0 {
 		t.Fatalf("providers touched despite a dead-on-arrival move: ops = %v", ops)
 	}
@@ -1720,25 +1825,42 @@ func TestConvertToFileProviderMoveFailureRoutesRollback(t *testing.T) {
 	}
 }
 
-// TestConvertToFileProviderRefusesBridgeSymlink pins the reused mux guard: a
-// symlink row whose dir is unexpectedly a bridge symlink must not convert —
-// draining files through it would write into the live mirror.
-func TestConvertToFileProviderRefusesBridgeSymlink(t *testing.T) {
-	ops := []string{}
-	m, a, dir := newConvertFixture(t, nil)
-	fp := newFakeFP(t, &ops)
-	m.OverlayFor = fpOverlayFor(fp, &fakeFuse{ops: &ops})
-	replaceWithBridge(t, dir)
+// TestConvertToFileProviderRefusesOverlaySymlink is the R2 regression pin for the
+// symlink→fileprovider arm — and the exact traced-loss shape: a crashed convert
+// leaves the dir an FP-bridge symlink (row still symlink) that IsBridgeSymlink
+// missed, so the retry convert drained MovePrivateEntries THROUGH the live domain
+// and the fresher-wins resolver destroyed the identity. The broader requireRealDir
+// guard must refuse both the mux-bridge and FP-bridge shapes with
+// ErrDirIsOverlaySymlink and touch no provider.
+func TestConvertToFileProviderRefusesOverlaySymlink(t *testing.T) {
+	for _, shape := range []string{"mux-bridge", "fp-bridge"} {
+		t.Run(shape, func(t *testing.T) {
+			ops := []string{}
+			m, a, dir := newConvertFixture(t, nil)
+			fp := newFakeFP(t, &ops)
+			m.OverlayFor = fpOverlayFor(fp, &fakeFuse{ops: &ops})
+			var target string
+			if shape == "mux-bridge" {
+				replaceWithBridge(t, dir)
+				target = filepath.Join(MuxRootDir(), filepath.Base(dir))
+			} else {
+				target = replaceWithFPBridge(t, dir)
+			}
 
-	_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendFileProvider)
-	if err == nil || !strings.Contains(err.Error(), "bridge symlink") {
-		t.Fatalf("convert over a bridge symlink = %v, want a bridge-symlink refusal", err)
-	}
-	if len(ops) != 0 {
-		t.Fatalf("refused convert still touched a provider: %v", ops)
-	}
-	if storedKind(t, m, a.ID) != "symlink" {
-		t.Fatal("row flipped despite a refused convert")
+			_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendFileProvider)
+			if !errors.Is(err, ErrDirIsOverlaySymlink) {
+				t.Fatalf("convert over a %s = %v, want errors.Is ErrDirIsOverlaySymlink", shape, err)
+			}
+			if !strings.Contains(err.Error(), target) {
+				t.Fatalf("refusal %q does not name the link target %q", err, target)
+			}
+			if len(ops) != 0 {
+				t.Fatalf("refused convert still touched a provider: %v", ops)
+			}
+			if storedKind(t, m, a.ID) != "symlink" {
+				t.Fatal("row flipped despite a refused convert")
+			}
+		})
 	}
 }
 
@@ -1786,9 +1908,7 @@ func TestConvertToFileProviderProbeGate(t *testing.T) {
 		fp := newFakeFP(t, &ops)
 		m.OverlayFor = fpOverlayFor(fp, &fakeFuse{ops: &ops})
 
-		prev := fpDomainProbe
-		fpDomainProbe = func(string) error { return errors.New("data plane wedged") }
-		defer func() { fpDomainProbe = prev }()
+		m.FPProbe = func(context.Context, string) error { return overlay.ErrFPProbeWedged }
 
 		_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendFileProvider)
 		if err == nil || !strings.Contains(err.Error(), "domain registered but does not serve reads") {
@@ -1815,9 +1935,7 @@ func TestConvertToFileProviderProbeGate(t *testing.T) {
 		m.OverlayFor = fpOverlayFor(fp, &fakeFuse{ops: &ops})
 
 		probed := ""
-		prev := fpDomainProbe
-		fpDomainProbe = func(configDir string) error { probed = configDir; return nil }
-		defer func() { fpDomainProbe = prev }()
+		m.FPProbe = func(_ context.Context, configDir string) error { probed = configDir; return nil }
 
 		got, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendFileProvider)
 		if err != nil {
@@ -1842,12 +1960,10 @@ func TestConvertToFileProviderProbeGate(t *testing.T) {
 		}
 
 		calls := 0
-		prev := fpDomainProbe
-		fpDomainProbe = func(string) error {
+		m.FPProbe = func(context.Context, string) error {
 			calls++
 			return errors.New("probe must not run for an identity-less account")
 		}
-		defer func() { fpDomainProbe = prev }()
 
 		got, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendFileProvider)
 		if err != nil {
@@ -2000,6 +2116,183 @@ func TestConvertFileProviderToFuseRollsBack(t *testing.T) {
 			}
 			if gotJSON := readFileT(t, filepath.Join(priv, ".claude.json")); gotJSON != tc.wantPriv {
 				t.Fatalf("private identity after rollback = %q, want %q", gotJSON, tc.wantPriv)
+			}
+		})
+	}
+}
+
+// TestRollbackIdentityVerifySurfacesRecoverySources pins the identity invariant:
+// when a rollback's restore move leaves the identity unreadable at dir/.claude.json
+// (the fresher-wins EXDEV loss — modeled here by the backing identity vanishing
+// with no replacement), the returned error is ErrIdentityLost and names the
+// recovery sources in order (the account-dir and private-root conflict siblings,
+// the private-root backups, then a fresh login), and the row never flips.
+func TestRollbackIdentityVerifySurfacesRecoverySources(t *testing.T) {
+	ops := []string{}
+	m, a, dir := newConvertFixture(t, nil)
+	fp := newFakeFP(t, &ops)
+	m.OverlayFor = fpOverlayFor(fp, &fakeFuse{ops: &ops})
+	priv := fkoverlay.FusePrivateRoot(dir)
+	// The convert drains dir→priv; Setup's hook then deletes priv/.claude.json with
+	// no surviving replacement, so the failed probe's rollback finds nothing to move
+	// back and dir/.claude.json is unreadable afterward.
+	fp.onSetup = func(dir string) {
+		if err := os.Remove(filepath.Join(fkoverlay.FusePrivateRoot(dir), ".claude.json")); err != nil {
+			t.Error(err)
+		}
+	}
+
+	_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendFileProvider)
+	if !errors.Is(err, ErrIdentityLost) {
+		t.Fatalf("error = %v, want errors.Is ErrIdentityLost", err)
+	}
+	for _, frag := range []string{
+		filepath.Join(dir, ".claude.json.conflict-"),
+		filepath.Join(priv, ".claude.json.conflict-"),
+		filepath.Join(priv, "backups", ".claude.json.backup."),
+		"claude /login",
+	} {
+		if !strings.Contains(err.Error(), frag) {
+			t.Errorf("ErrIdentityLost %q missing recovery source %q", err, frag)
+		}
+	}
+	if storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row flipped despite the lost identity")
+	}
+}
+
+// TestConvertCrashInjectionPreservesIdentity is the transactionality pin: for a
+// failure injected at each step of a symlink→fileprovider conversion — a
+// dead-on-arrival move, a teardown fault mid-window, a registration failure, a
+// post-Setup probe failure, an interrupted rollback, and the FP-bridge wreckage a
+// prior crash left — the account's identity is never lost. It is readable at its
+// recoverable location after every outcome (dir once the rollback completes, the
+// private backing root while a rollback is interrupted mid-restore), or the flow
+// refused to move anything with ErrDirIsOverlaySymlink. The row never flips.
+func TestConvertCrashInjectionPreservesIdentity(t *testing.T) {
+	type where int
+	const (
+		atDir where = iota
+		atPriv
+		refused
+	)
+	cases := []struct {
+		name string
+		prep func(t *testing.T, m *Manager, fp *fakeFP, dir string)
+		want where
+	}{
+		{
+			name: "move dead on arrival moves nothing",
+			prep: func(t *testing.T, _ *Manager, _ *fakeFP, dir string) {
+				t.Helper()
+				// The private-root path is a FILE: the drain's MkdirAll fails before
+				// any entry moves.
+				if err := os.WriteFile(fkoverlay.FusePrivateRoot(dir), []byte("squat"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: atDir,
+		},
+		{
+			name: "symlink teardown fault mid-window rolls back",
+			prep: func(t *testing.T, m *Manager, _ *fakeFP, _ string) {
+				t.Helper()
+				prev := m.OverlayFor
+				m.OverlayFor = func(b fkoverlay.Backend) (fkoverlay.Provider, error) {
+					if b == fkoverlay.BackendSymlink {
+						return &hookedSymlink{SymlinkProvider: newSymlinkProvider(), preTeardown: func() error { return errors.New("unlink exploded") }}, nil
+					}
+					return prev(b)
+				}
+			},
+			want: atDir,
+		},
+		{
+			name: "registration failure rolls back",
+			prep: func(t *testing.T, _ *Manager, fp *fakeFP, _ string) {
+				t.Helper()
+				fp.setupErr = errors.New("no entitlement")
+			},
+			want: atDir,
+		},
+		{
+			name: "post-Setup probe failure rolls back",
+			prep: func(t *testing.T, m *Manager, _ *fakeFP, _ string) {
+				t.Helper()
+				m.FPProbe = func(context.Context, string) error { return overlay.ErrFPProbeWedged }
+			},
+			want: atDir,
+		},
+		{
+			name: "interrupted rollback strands the identity recoverably in the private root",
+			prep: func(t *testing.T, _ *Manager, fp *fakeFP, _ string) {
+				t.Helper()
+				// Setup registers + lays the symlink; the probe fails, so a rollback
+				// starts — but the FP retract's Teardown errors, so the rollback stops
+				// with the private files (identity included) intact in the backing
+				// root for the daemon's HealStrandedPrivate.
+				fp.probeErr = errors.New("does not serve")
+				fp.teardownErr = errors.New("domain wedged")
+			},
+			want: atPriv,
+		},
+		{
+			name: "FP-bridge wreckage refuses, moving nothing",
+			prep: func(t *testing.T, _ *Manager, _ *fakeFP, dir string) {
+				t.Helper()
+				// The traced-loss shape: a crash drained dir→priv then laid the domain
+				// bridge, leaving the row on symlink. The identity lives in priv; the
+				// retry convert must refuse rather than drain THROUGH the live domain.
+				priv := fkoverlay.FusePrivateRoot(dir)
+				if err := os.MkdirAll(priv, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(filepath.Join(dir, ".claude.json"), filepath.Join(priv, ".claude.json")); err != nil {
+					t.Fatal(err)
+				}
+				replaceWithFPBridge(t, dir)
+			},
+			want: refused,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := []string{}
+			m, a, dir := newConvertFixture(t, nil)
+			fp := newFakeFP(t, &ops)
+			m.OverlayFor = fpOverlayFor(fp, &fakeFuse{ops: &ops})
+			priv := fkoverlay.FusePrivateRoot(dir)
+			tc.prep(t, m, fp, dir)
+
+			_, err := m.ConvertOverlay(t.Context(), a, fkoverlay.BackendFileProvider)
+			if err == nil {
+				t.Fatal("conversion succeeded despite the injected failure")
+			}
+			switch tc.want {
+			case atDir:
+				if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+					t.Fatalf("identity not restored to the account dir: %q", got)
+				}
+			case atPriv:
+				if got := readFileT(t, filepath.Join(priv, ".claude.json")); got != identityJSON {
+					t.Fatalf("identity not stranded recoverably in the private root: %q", got)
+				}
+			case refused:
+				if !errors.Is(err, ErrDirIsOverlaySymlink) {
+					t.Fatalf("error = %v, want errors.Is ErrDirIsOverlaySymlink (moved nothing)", err)
+				}
+				if len(ops) != 0 {
+					t.Fatalf("refused convert still touched a provider: %v", ops)
+				}
+			}
+			// Never lost: a valid identity must survive at dir OR priv.
+			_, dirErr := readIdentity(filepath.Join(dir, ".claude.json"))
+			_, privErr := readIdentity(filepath.Join(priv, ".claude.json"))
+			if dirErr != nil && privErr != nil {
+				t.Fatalf("identity lost from every read path: dir=%v priv=%v", dirErr, privErr)
+			}
+			if storedKind(t, m, a.ID) != "symlink" {
+				t.Fatalf("row flipped despite the injected failure: %q", storedKind(t, m, a.ID))
 			}
 		})
 	}

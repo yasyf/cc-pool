@@ -121,6 +121,39 @@ func TestHolderVersionMitigated(t *testing.T) {
 	}
 }
 
+// TestWidgetVersionSupported pins the companion-app floor for the probe-domain
+// op. The wire carries a bare "0.44.0" (CFBundleShortVersionString, no leading
+// "v"), so the "v" is prepended before the semver compare; fail-open arms mean a
+// locally-built (dev/empty/garbage) app is current-source.
+func TestWidgetVersionSupported(t *testing.T) {
+	if MinWidgetVersion != "v0.44.0" {
+		t.Fatalf("MinWidgetVersion = %q; the floor moved — re-derive this matrix", MinWidgetVersion)
+	}
+	cases := map[string]struct {
+		version string
+		want    bool
+	}{
+		"bare wire version at the floor supported":  {"0.44.0", true},
+		"bare wire version below the floor refused": {"0.43.9", false},
+		"older bare version refused":                {"0.1.0", false},
+		"future bare version supported":             {"1.2.3", true},
+		"v-prefixed floor supported":                {"v0.44.0", true},
+		"v-prefixed old version refused":            {"v0.43.0", false},
+		"dev build is current source":               {"dev", true},
+		"empty version fails open":                  {"", true},
+		"unparseable version fails open":            {"not-a-version", true},
+		"commit-suffixed wire version passes":       {"0.44.0 (abc1234)", true},
+		"commit-suffixed old version still fails":   {"0.43.0 (abc1234)", false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := WidgetVersionSupported(tc.version); got != tc.want {
+				t.Fatalf("WidgetVersionSupported(%q) = %v, want %v", tc.version, got, tc.want)
+			}
+		})
+	}
+}
+
 // gateStub is a fuse-kind provider for mitigationGate tests, tracking Setup
 // and Teardown calls.
 type gateStub struct {

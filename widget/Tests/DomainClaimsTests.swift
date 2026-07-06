@@ -47,6 +47,7 @@ final class DomainClaimsTests: XCTestCase {
         let cases: [(name: String, op: String, domain: String, want: String?)] = [
             ("register routes to domain", "register", "acct-01", "acct-01"),
             ("remove routes to domain", "remove", "acct-02", "acct-02"),
+            ("probe-domain routes to domain", "probe-domain", "acct-06", "acct-06"),
             ("probe routes to probeID", "probe", "", probeID),
             ("path is unclaimed", "path", "acct-03", nil),
             ("signal is unclaimed", "signal", "acct-04", nil),
@@ -58,6 +59,27 @@ final class DomainClaimsTests: XCTestCase {
                 DomainClaims.key(op: c.op, domain: c.domain, probeID: probeID),
                 c.want, c.name)
         }
+    }
+
+    /// probe-domain shares register/remove's per-domain key: same domain →
+    /// mutual exclusion (busy on contention), different domains → none.
+    func testProbeDomainSharesRegisterKey() {
+        let probeID = "ccp-probe-4242"
+        let probeKey = DomainClaims.key(op: "probe-domain", domain: "acct-01", probeID: probeID)
+        let registerKey = DomainClaims.key(op: "register", domain: "acct-01", probeID: probeID)
+        XCTAssertEqual(probeKey, "acct-01")
+        XCTAssertEqual(probeKey, registerKey, "probe-domain must claim the same key as register")
+        XCTAssertNotEqual(probeKey, probeID, "probe-domain claims the domain, not the throwaway probe id")
+
+        let claims = DomainClaims()
+        XCTAssertTrue(claims.claim(registerKey!))
+        XCTAssertFalse(claims.claim(probeKey!),
+                       "probe-domain on a domain busy with register must bounce busy")
+
+        let otherKey = DomainClaims.key(op: "probe-domain", domain: "acct-02", probeID: probeID)
+        XCTAssertEqual(otherKey, "acct-02")
+        XCTAssertTrue(claims.claim(otherKey!),
+                      "probe-domain on a different domain must not contend")
     }
 }
 

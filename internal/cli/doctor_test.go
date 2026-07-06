@@ -570,7 +570,7 @@ func TestReportFPWedges(t *testing.T) {
 			{ID: 2, ConfigDir: "/p/acct-02", BreakerTripped: true},
 		}
 		report, calls := captureReports()
-		reportFPWedges([]store.Account{fpRow(1), fpRow(2), symRow}, cached, true, report)
+		reportFPWedges([]store.Account{fpRow(1), fpRow(2), symRow}, cached, true, false, report)
 
 		if len(*calls) != 2 {
 			t.Fatalf("got %d reports %+v, want 2", len(*calls), *calls)
@@ -578,21 +578,24 @@ func TestReportFPWedges(t *testing.T) {
 		if (*calls)[0].label != "acct-01 file provider" || (*calls)[0].healthy || !strings.Contains((*calls)[0].detail, "ccp fp repair") {
 			t.Errorf("report[0] = %+v, want acct-01 flagged with the repair pointer", (*calls)[0])
 		}
-		if !strings.Contains((*calls)[1].detail, "automated recovery is exhausted") {
-			t.Errorf("breaker detail missing the exhausted note: %q", (*calls)[1].detail)
+		if !strings.Contains((*calls)[1].detail, "parked") || !strings.Contains((*calls)[1].detail, "automated recovery is exhausted") {
+			t.Errorf("breaker detail must read 'parked' + the exhausted note: %q", (*calls)[1].detail)
+		}
+		if !strings.Contains((*calls)[1].detail, "--retreat") {
+			t.Errorf("breaker detail missing the --retreat lever: %q", (*calls)[1].detail)
 		}
 	})
 
 	t.Run("daemon alive with no cached wedges is silent", func(t *testing.T) {
 		swapVar(t, &fpDomainProbeAt, func(string) error { t.Error("probed with the daemon alive"); return nil })
 		report, calls := captureReports()
-		reportFPWedges([]store.Account{fpRow(1)}, nil, true, report)
+		reportFPWedges([]store.Account{fpRow(1)}, nil, true, false, report)
 		if len(*calls) != 0 {
 			t.Fatalf("want silence, got %+v", *calls)
 		}
 	})
 
-	t.Run("daemon down probes each fp row and reports only the wedged ones", func(t *testing.T) {
+	t.Run("daemon down control-op probe: wedged flags, no-verdict says cannot verify, healthy/missing stay silent", func(t *testing.T) {
 		probed := map[string]bool{}
 		swapVar(t, &fpDomainProbeAt, func(dir string) error {
 			probed[dir] = true
@@ -601,14 +604,17 @@ func TestReportFPWedges(t *testing.T) {
 				return fmt.Errorf("%w: hung", overlay.ErrFPProbeWedged)
 			case "/p/acct-03":
 				return fmt.Errorf("%w: no identity", overlay.ErrFPProbeMissing)
+			case "/p/acct-04":
+				return fmt.Errorf("%w: app down", overlay.ErrFPProbeNoVerdict)
 			default:
 				return nil // acct-02 healthy
 			}
 		})
+		swapVar(t, &fpRawProbeAt, func(string) error { t.Error("raw probe ran without --fp-raw-probe"); return nil })
 		report, calls := captureReports()
-		reportFPWedges([]store.Account{fpRow(1), fpRow(2), fpRow(3), symRow}, nil, false, report)
+		reportFPWedges([]store.Account{fpRow(1), fpRow(2), fpRow(3), fpRow(4), symRow}, nil, false, false, report)
 
-		for _, dir := range []string{"/p/acct-01", "/p/acct-02", "/p/acct-03"} {
+		for _, dir := range []string{"/p/acct-01", "/p/acct-02", "/p/acct-03", "/p/acct-04"} {
 			if !probed[dir] {
 				t.Errorf("did not probe fp row %s", dir)
 			}
@@ -616,11 +622,35 @@ func TestReportFPWedges(t *testing.T) {
 		if probed["/p/acct-09"] {
 			t.Error("probed a symlink row")
 		}
-		if len(*calls) != 1 || (*calls)[0].label != "acct-01 file provider" || (*calls)[0].healthy {
-			t.Fatalf("got %+v, want exactly the wedged acct-01 flagged", *calls)
+		if len(*calls) != 2 {
+			t.Fatalf("got %d reports %+v, want 2 (wedged acct-01 + unverifiable acct-04)", len(*calls), *calls)
 		}
-		if !strings.Contains((*calls)[0].detail, "daemon is down") {
-			t.Errorf("daemon-down detail missing the attribution: %q", (*calls)[0].detail)
+		if (*calls)[0].label != "acct-01 file provider" || (*calls)[0].healthy || !strings.Contains((*calls)[0].detail, "daemon is down") {
+			t.Errorf("report[0] = %+v, want wedged acct-01 with the daemon-down attribution", (*calls)[0])
+		}
+		if (*calls)[1].label != "acct-04 file provider" || (*calls)[1].healthy || !strings.Contains((*calls)[1].detail, "cannot verify") {
+			t.Errorf("report[1] = %+v, want acct-04 flagged 'cannot verify'", (*calls)[1])
+		}
+	})
+
+	t.Run("daemon down with --fp-raw-probe swaps in the raw filesystem read", func(t *testing.T) {
+		swapVar(t, &fpDomainProbeAt, func(string) error { t.Error("control-op probe ran under --fp-raw-probe"); return nil })
+		raw := map[string]bool{}
+		swapVar(t, &fpRawProbeAt, func(dir string) error {
+			raw[dir] = true
+			if dir == "/p/acct-01" {
+				return fmt.Errorf("%w: read did not answer", overlay.ErrFPProbeWedged)
+			}
+			return nil
+		})
+		report, calls := captureReports()
+		reportFPWedges([]store.Account{fpRow(1), fpRow(2)}, nil, false, true, report)
+
+		if !raw["/p/acct-01"] || !raw["/p/acct-02"] {
+			t.Fatalf("raw probe skipped a row: %v", raw)
+		}
+		if len(*calls) != 1 || (*calls)[0].label != "acct-01 file provider" || (*calls)[0].healthy {
+			t.Fatalf("got %+v, want exactly the raw-wedged acct-01 flagged", *calls)
 		}
 	})
 }

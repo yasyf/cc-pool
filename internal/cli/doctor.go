@@ -25,6 +25,7 @@ import (
 func newDoctorCmd() *cobra.Command {
 	var fix bool
 	var openSettings bool
+	var fpRawProbe bool
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check accounts' Keychain items and overlays; --fix repairs drift",
@@ -103,7 +104,7 @@ func newDoctorCmd() *cobra.Command {
 				reportOrphanedHolder(cmd.Context(), reachable, accts, report)
 
 				reportFileProvider(cmd.Context(), m, accts, fpConsentPending, report)
-				reportFPWedges(accts, fpWedged, daemonAlive, report)
+				reportFPWedges(accts, fpWedged, daemonAlive, fpRawProbe, report)
 				reportContentHealth(contentHealth, report)
 
 				for _, a := range accts {
@@ -133,6 +134,7 @@ func newDoctorCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&fix, "fix", false, "attempt to repair detected drift")
 	cmd.Flags().BoolVar(&openSettings, "open-settings", false, "if the mount holder needs a macOS grant, open its System Settings pane")
+	cmd.Flags().BoolVar(&fpRawProbe, "fp-raw-probe", false, "probe File Provider domains with a direct filesystem read instead of the app control op (may trigger a macOS permission prompt)")
 	return cmd
 }
 
@@ -350,29 +352,41 @@ func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Acco
 // the fpDomainProbeAt seam so the wedge is still visible. Advisory: it points at
 // `ccp fp repair` (the re-register breaks open fds, so it is never run inline from
 // the doctor loop). A missing or empty-by-design .claude.json is no verdict.
-func reportFPWedges(accts []store.Account, cached []daemon.FPDomainState, daemonAlive bool, report func(string, bool, string)) {
+func reportFPWedges(accts []store.Account, cached []daemon.FPDomainState, daemonAlive, rawProbe bool, report func(string, bool, string)) {
 	if daemonAlive {
 		for _, w := range cached {
 			detail := "domain wedged (serves control ops but hangs reads); the daemon is recovering it — run `ccp fp repair` to re-register it now, then relaunch any sessions on it"
 			if w.BreakerTripped {
-				detail = "domain wedged; the daemon's automated recovery is exhausted — run `ccp fp repair` (it re-registers the domain), then relaunch any sessions on it; a stuck fileproviderd needs a manual restart (see " + abbreviateHome(pool.LogPath()) + ")"
+				detail = fmt.Sprintf("domain parked (wedged): the daemon's automated recovery is exhausted — run `ccp fp repair --account %d` to re-register it (or `ccp fp repair --retreat --account %d` to fall back to symlink), then relaunch any sessions on it; a stuck fileproviderd needs a manual restart (see %s)", w.ID, w.ID, abbreviateHome(pool.LogPath()))
 			}
 			report(fmt.Sprintf("acct-%02d file provider", w.ID), false, detail)
 		}
 		return
 	}
-	// Daemon down: probe each File Provider domain ourselves (its content bridge
-	// is down with the daemon, so a domain with an identity reads not-serving).
+	// Daemon down: probe each File Provider domain ourselves. By default this is
+	// the app control op (never a materializing read); --fp-raw-probe swaps in a
+	// direct filesystem read that can trip a per-account macOS permission prompt.
+	probe := fpDomainProbeAt
+	if rawProbe {
+		probe = fpRawProbeAt
+	}
 	for _, a := range accts {
 		if !fileProviderRow(a.OverlayKind) {
 			continue
 		}
-		err := fpDomainProbeAt(a.ConfigDir)
-		if err == nil || errors.Is(err, overlay.ErrFPProbeMissing) || errors.Is(err, overlay.ErrFPProbeEmpty) {
-			continue
+		switch err := probe(a.ConfigDir); {
+		case err == nil, errors.Is(err, overlay.ErrFPProbeMissing), errors.Is(err, overlay.ErrFPProbeEmpty):
+			// Serving, or a benign no-identity/empty-by-design .claude.json.
+		case errors.Is(err, overlay.ErrFPProbeNoVerdict):
+			// The companion app is down too, or too old to answer the control op:
+			// unprobeable, not a confirmed wedge. Say so rather than flag a false
+			// wedge or silently pass — `ccp doctor` must not vouch for what it can't see.
+			report(fmt.Sprintf("acct-%02d file provider", a.ID), false,
+				"cannot verify whether the domain serves — the CCPoolStatus companion app isn't answering its control socket; launch "+abbreviateHome(pool.WidgetAppPath())+" (or start the daemon with `ccp service install`), then re-run `ccp doctor` (or add --fp-raw-probe to read through the domain directly)")
+		default:
+			report(fmt.Sprintf("acct-%02d file provider", a.ID), false,
+				"domain not serving reads (probed directly; the daemon is down, so its content bridge is too) — start the daemon (`ccp service install`); if it stays wedged after that, run `ccp fp repair`")
 		}
-		report(fmt.Sprintf("acct-%02d file provider", a.ID), false,
-			"domain not serving reads (probed directly; the daemon is down, so its content bridge is too) — start the daemon (`ccp service install`); if it stays wedged after that, run `ccp fp repair`")
 	}
 }
 

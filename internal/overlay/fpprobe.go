@@ -1,12 +1,11 @@
 package overlay
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"time"
+
+	"github.com/yasyf/fusekit/fileproviderd"
 )
 
 // Deliberately untagged, like probe.go: every build variant must compile these
@@ -14,68 +13,94 @@ import (
 // process boundaries.
 
 var (
-	// ErrFPProbeWedged means the served .claude.json could not be read through
-	// the File Provider domain in time: the read parked past the timeout or the
-	// open/read itself failed (EDEADLK, EPERM, EIO, …). The domain answers
-	// control ops but hangs the data plane — the wedge cc-pool's control-plane
-	// Health cannot see. Treat as dead.
+	// ErrFPProbeWedged means the domain answers control ops but does not serve an
+	// enumeration/read of its .claude.json — the data-plane wedge cc-pool's
+	// control-plane Health cannot see (ProbeDomain reported ErrDomainNotServing).
+	// Treat as dead.
 	ErrFPProbeWedged = errors.New("file provider domain wedged")
 
-	// ErrFPProbeMissing means the open returned ENOENT: the domain serves no
-	// .claude.json (an account with no identity yet). Like ErrProbeMissing it is
-	// no verdict, never a wedge — such a domain survives until it has content to
-	// probe.
+	// ErrFPProbeMissing means the domain serves but has no .claude.json (an account
+	// with no identity yet), or the app has no registration for it (ErrNoDomain, a
+	// control-plane repair healFPMissing drives, never a data-plane wedge). Like
+	// ErrProbeMissing it is no verdict, never a wedge — such a domain survives until
+	// it has content to probe.
 	ErrFPProbeMissing = errors.New("file provider .claude.json missing")
 
-	// ErrFPProbeEmpty means the domain served a zero-byte .claude.json. FPFS
-	// skips fetchContents at size 0, so a 0-byte read proves nothing about the
-	// data plane; the caller strikes on it only when the content source's synth
-	// read is genuinely non-empty (empty-when-nonempty-expected).
+	// ErrFPProbeEmpty means the domain served a zero-byte .claude.json. FPFS skips
+	// fetchContents at size 0, so a 0-byte read proves nothing about the data plane;
+	// the caller strikes on it only when the content source's synth read is genuinely
+	// non-empty (empty-when-nonempty-expected).
 	ErrFPProbeEmpty = errors.New("file provider .claude.json empty")
+
+	// ErrFPProbeNoVerdict means the probe reached NO data-plane conclusion: the
+	// companion app was busy, unreachable, or too old to answer the control op
+	// (ErrBusy/ErrAppUnavailable/ErrOpUnsupported, or any unrecognized error). It is
+	// neither a strike nor a clear — a transient app restart must not un-vouch a
+	// domain nor fleet-wedge a select. Callers skip the tick / read ready.
+	ErrFPProbeNoVerdict = errors.New("file provider domain: no probe verdict")
 )
 
-// fpProbeTimeout bounds one FP domain read; a var so tests can shrink it.
-var fpProbeTimeout = 5 * time.Second
-
-// fpProbes joins concurrent FP domain probes per dir. Its OWN StatProbes,
-// never shared with the deep or alive probes: a parked FP read must never block
-// a probe of another class behind its join.
-var fpProbes StatProbes[error]
-
-// FPDomainProbeWithin reads configDir's served .claude.json in full through the
-// File Provider domain within fpProbeTimeout, returning a verdict: nil (a
-// non-empty read completed), ErrFPProbeMissing (ENOENT), ErrFPProbeEmpty (zero
-// bytes), or ErrFPProbeWedged (timeout or any other read failure). configDir is
-// a fail-closed symlink into the domain root, so the read traverses the domain's
-// data plane. Concurrent callers join one read; a wedged probe parks one
-// goroutine and fd, joined by later callers.
-func FPDomainProbeWithin(configDir string) error {
-	path := filepath.Join(configDir, claudeJSONName)
-	err, ok := fpProbes.Do(configDir, fpProbeTimeout, func() error { return readFPClaudeJSON(path) })
-	if !ok {
-		return fmt.Errorf("%w: read of %s did not answer within %s", ErrFPProbeWedged, path, fpProbeTimeout)
-	}
-	return err
+// FPDomainProber probes a File Provider domain's data plane through the signed
+// companion app's control op: the app enumerates the domain and reports its
+// .claude.json byte count WITHOUT a materializing (TCC-tripping) filesystem read.
+// Satisfied by *fusekit/overlay.FileProviderProvider.
+type FPDomainProber interface {
+	ProbeDomain(ctx context.Context, accountDir string) (*int64, error)
 }
 
-// readFPClaudeJSON is FPDomainProbeWithin's unbounded body; on a wedged domain
-// it parks in open or read until the kernel answers.
-func readFPClaudeJSON(path string) error {
-	f, err := os.Open(path) //nolint:gosec // G304: path is an account's overlay ConfigDir under cc-pool state
+// FPDomainRemover deregisters a File Provider domain WITHOUT retracting the
+// account-dir bridge symlink — the deregistration a failed convert or a symlink
+// retreat must perform to avoid leaking a domain registration. Satisfied by
+// *fusekit/overlay.FileProviderProvider.
+type FPDomainRemover interface {
+	RemoveDomain(accountDir string) error
+}
+
+// FPDomainRegistry reports whether a File Provider domain is currently registered
+// for an account dir, via the host's zero-spawn State query (never a spawn, never
+// a through-domain read). A registered domain returns its root; an unregistered
+// one surfaces fileproviderd.ErrNoDomain and a down app fileproviderd.ErrAppUnavailable
+// as non-nil errors. Used to detect a domain leaked onto a symlink row so it can be
+// deregistered. Satisfied by *fusekit/overlay.FileProviderProvider.
+type FPDomainRegistry interface {
+	DomainRoot(ctx context.Context, accountDir string) (string, error)
+}
+
+// FPDomainProbe classifies accountDir's File Provider domain verdict from the
+// app-side control op, mapping fileproviderd's error classes and its byte-count
+// verdict onto the cc-pool sentinels the fpstate/heal ladder keys on. It performs
+// ZERO through-domain filesystem I/O — the raw read that mints per-account macOS
+// TCC prompts, gets misclassified as a wedge, and drives the breaker's silent
+// symlink retreat.
+//
+// Byte-count verdict (no error): >0 bytes read -> nil (healthy); a nil pointer
+// (.claude.json absent) -> ErrFPProbeMissing; a pointer to 0 (present but empty) ->
+// ErrFPProbeEmpty.
+//
+// Error classes: ErrDomainNotServing -> ErrFPProbeWedged; ErrNoDomain ->
+// ErrFPProbeMissing (a control-plane repair, not a data-plane wedge);
+// ErrBusy/ErrAppUnavailable/ErrOpUnsupported, and any unrecognized error ->
+// ErrFPProbeNoVerdict.
+func FPDomainProbe(ctx context.Context, prober FPDomainProber, accountDir string) error {
+	n, err := prober.ProbeDomain(ctx, accountDir)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%w: %s", ErrFPProbeMissing, path)
+		switch {
+		case errors.Is(err, fileproviderd.ErrDomainNotServing):
+			return fmt.Errorf("%w: %v", ErrFPProbeWedged, err)
+		case errors.Is(err, fileproviderd.ErrNoDomain):
+			return fmt.Errorf("%w: %v", ErrFPProbeMissing, err)
+		default:
+			// Busy, app-unavailable, op-unsupported, or any unrecognized class: no
+			// data-plane conclusion — never strike, never clear.
+			return fmt.Errorf("%w: %v", ErrFPProbeNoVerdict, err)
 		}
-		// Only ENOENT is no-verdict; EDEADLK/EPERM/EIO are data-plane wedges.
-		return fmt.Errorf("%w: open %s: %v", ErrFPProbeWedged, path, err)
 	}
-	defer func() { _ = f.Close() }()
-	n, err := io.Copy(io.Discard, f)
-	if err != nil {
-		return fmt.Errorf("%w: read %s: %v", ErrFPProbeWedged, path, err)
+	switch {
+	case n == nil:
+		return fmt.Errorf("%w: %s serves no .claude.json", ErrFPProbeMissing, accountDir)
+	case *n == 0:
+		return fmt.Errorf("%w: %s served 0 bytes", ErrFPProbeEmpty, accountDir)
+	default:
+		return nil
 	}
-	if n == 0 {
-		return fmt.Errorf("%w: %s served 0 bytes", ErrFPProbeEmpty, path)
-	}
-	return nil
 }

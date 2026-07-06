@@ -81,8 +81,12 @@ func (f *fpState) wedged(dir string) bool {
 // outcome clears the verdict and the recovery ladder.
 func (f *fpState) recordProbe(dir string, err error) (logMsg string) {
 	// No verdict, evaluated off the lock (the synth seam may read a local file):
-	// a missing identity file, or a 0-byte read that matches an empty synth.
+	// a missing identity file, a 0-byte read that matches an empty synth, or a
+	// no-verdict probe (app busy/unreachable/too old). None strikes; none clears —
+	// a transient control blip must neither un-vouch nor re-vouch a domain.
 	switch {
+	case errors.Is(err, overlay.ErrFPProbeNoVerdict):
+		return ""
 	case errors.Is(err, overlay.ErrFPProbeMissing):
 		return ""
 	case errors.Is(err, overlay.ErrFPProbeEmpty) && !f.synthNonEmpty(dir):

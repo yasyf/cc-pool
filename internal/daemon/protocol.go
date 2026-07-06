@@ -50,6 +50,11 @@ type Request struct {
 	// credmove: moving a credential under a live session forks its
 	// refresh-token chain, so that gate has no override.
 	Force bool `json:"force,omitempty"`
+	// Retreat: on fprepair, retreat the target File Provider domain(s) to the
+	// symlink floor instead of re-registering. This is the ONLY path that reaches
+	// the (now automatic-retreat-removed) File-Provider→symlink conversion; the
+	// heal breaker parks a wedged-but-controllable domain rather than retreating it.
+	Retreat bool `json:"retreat,omitempty"`
 }
 
 // MigrationOutcome classifies one account's migrate or credmove result.

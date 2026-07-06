@@ -114,6 +114,16 @@ type Server struct {
 	// it stops 401-spamming. Both scheduler-goroutine-local — no lock.
 	authStreak      map[int]int
 	lastAuthAttempt map[int]time.Time
+	// netOutage is set when a full poll sweep found every attempted account
+	// failing network-class (an outage). While set, the scheduler drops to a
+	// short canary cadence (nextPollDelay) and pollOnce probes only one account
+	// until connectivity returns. Scheduler-goroutine-local — no lock.
+	netOutage bool
+	// netProbeLogSkip throttles the per-canary "network unreachable" log while an
+	// outage persists: only every netProbeLogEvery-th probe logs (the rest prove
+	// liveness silently) so a multi-hour outage does not spam the log. Reset to 0
+	// on each outage entry. Scheduler-goroutine-local — no lock.
+	netProbeLogSkip int
 
 	// fuseGateFn is a test seam over the migrate handler's fuse-capability
 	// gate; nil means the real check (CanHostFuse + probe mount).
@@ -125,6 +135,11 @@ type Server struct {
 
 	// scanSessions is a test seam over procscan.Scan; nil means the real scan.
 	scanSessions func(context.Context) ([]procscan.Session, error)
+
+	// pollSpacing overrides perAccountSpacing (the inter-sample delay); zero means
+	// the default. Tests shrink it so a multi-account sweep does not sleep for
+	// seconds per account.
+	pollSpacing time.Duration
 
 	// startedAt stamps daemon start. The skew-replace gate requires uptime ≥
 	// reservationTTL: a fresh daemon's reservation map is empty while a recent
@@ -198,6 +213,15 @@ func Run(ctx context.Context) error {
 	// account genuinely has an identity (its synth is non-empty) — resolved through
 	// the same content source the bridge serves.
 	s.fp = newFPState(s.contentSource.SynthNonEmpty)
+	// The convert gate proves a freshly registered domain serves before flipping the
+	// row, through the SAME bounded control-op probe the heal loop uses — never a
+	// through-domain read. A NoVerdict returns non-nil, so the gate rolls back rather
+	// than flip an unverified row.
+	m.FPProbe = func(ctx context.Context, accountDir string) error {
+		probeCtx, cancel := context.WithTimeout(ctx, fpControlProbeTimeout)
+		defer cancel()
+		return fpDomainProbe(probeCtx, accountDir)
+	}
 	// Route fusekit/overlay's conflict-resolution log through s.log. A package
 	// global, so assigned once before serve spawns any worker.
 	fkoverlay.ResolvedConflictLogf = s.log.Printf
@@ -893,12 +917,16 @@ func (s *Server) probeWinnerReady(a store.Account) bool {
 }
 
 // probeFPWinnerReady live-probes a chosen File Provider domain's data plane at
-// select time, reporting whether it is safe to assign. A hard failure (timeout,
-// EDEADLK, EPERM, or a 0-byte read for an account that has an identity) force-marks
-// the domain wedged with NO debounce — a launching session has no live reads a
-// false positive could orphan — so it is excluded now and the heal loop recovers
-// it. A missing or empty-by-design .claude.json reads ready. nil fp state (bare
-// test servers) reads ready.
+// select time (through the app control op, never a through-domain read), reporting
+// whether it is safe to assign. A hard wedge verdict (ErrDomainNotServing → the
+// domain answers control ops but not reads, or a 0-byte read for an account that
+// has an identity) force-marks the domain wedged with NO debounce — a launching
+// session has no live reads a false positive could orphan — so it is excluded now
+// and the heal loop recovers it. A missing or empty-by-design .claude.json reads
+// ready. A NoVerdict (app busy/unreachable/too old, or a restart) also reads ready
+// WITHOUT force-wedging: a companion-app restart must never fleet-wedge selects. nil
+// fp state (bare test servers) reads ready. Bounded to 3s so a slow probe never
+// stalls the pick.
 func (s *Server) probeFPWinnerReady(a store.Account) bool {
 	if s.fp == nil {
 		return true
@@ -906,12 +934,16 @@ func (s *Server) probeFPWinnerReady(a store.Account) bool {
 	if s.fp.wedged(a.ConfigDir) {
 		return false // already known wedged (mountReady also excludes it)
 	}
-	err := fpDomainProbe(a.ConfigDir)
+	ctx, cancel := context.WithTimeout(context.Background(), fpControlProbeTimeout)
+	defer cancel()
+	err := fpDomainProbe(ctx, a.ConfigDir)
 	switch {
 	case err == nil, errors.Is(err, overlay.ErrFPProbeMissing):
 		return true
 	case errors.Is(err, overlay.ErrFPProbeEmpty) && !s.fp.synthNonEmpty(a.ConfigDir):
 		return true // 0 bytes served for an account with no identity yet
+	case errors.Is(err, overlay.ErrFPProbeNoVerdict):
+		return true // app restart / busy / unreachable — never fleet-wedge a select
 	default:
 		s.fp.forceWedge(a.ConfigDir)
 		s.log.Printf("acct-%02d file provider domain wedged at select (serves control ops but hangs reads); excluding it and letting the heal loop recover it — relaunch once it recovers: %v", a.ID, err)
@@ -1326,6 +1358,40 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 		}
 		s.healFuse(ctx, a)
 		return
+	}
+	// CRASH-WINDOW CONVERGENCE: a symlink row whose dir is itself a symlink is
+	// convert wreckage — a symlink→fileprovider conversion laid the domain bridge
+	// symlink but crashed before flipping the row (Setup done, row not flipped, the
+	// identity-loss window). Retract the leaked domain (idempotent Teardown
+	// deregisters it and removes the bridge symlink) and recreate the real dir so
+	// HealStrandedPrivate below moves the private files back and re-lays the symlink
+	// overlay. Lstat never follows the link, so this precedes the mount check (which
+	// would traverse the live domain).
+	if s.dirIsOverlaySymlink(a.ConfigDir) {
+		// The listing that produced `a` can age: a symlink→fileprovider conversion
+		// may complete between it and this poll claim (the socket serves OpMigrate
+		// during the startup reconcile), leaving a legitimate File Provider row whose
+		// dir is a domain bridge symlink. Re-read under the held poll claim (which
+		// blocks any NEW conversion) so a stale symlink snapshot never drives the
+		// retract below against a live domain; the retract itself runs only under the
+		// convert claim and with no live session on the bridge, since beginPoll does
+		// not hide the dir from a select landing on it.
+		fresh, err := s.m.Store.GetAccount(a.ID)
+		if err != nil {
+			s.log.Printf("acct-%02d reconcile: re-read row before converge: %v", a.ID, err)
+			return
+		}
+		if fpBackedRow(fresh.OverlayKind) || fuseBackedRow(fresh.OverlayKind) {
+			return // converted off symlink under the aging listing; leave it to the fp/fuse arms
+		}
+		if !s.beginSymlinkHealHeld(ctx, fresh) {
+			return
+		}
+		defer s.endConvert(fresh.ID)
+		if !s.convergeSymlinkRowBridge(fresh) {
+			return
+		}
+		a = fresh
 	}
 	// A live mountpoint under a FUSE row is normal at startup (the holder
 	// survived the restart); under a NON-fuse row it is wreckage — an aborted

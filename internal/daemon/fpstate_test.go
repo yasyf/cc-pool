@@ -16,10 +16,11 @@ func alwaysEmpty(string) bool    { return false }
 
 func TestFPStateRecordProbe(t *testing.T) {
 	var (
-		wedged  = overlay.ErrFPProbeWedged
-		missing = overlay.ErrFPProbeMissing
-		empty   = overlay.ErrFPProbeEmpty
-		timeout = fmt.Errorf("%w: read did not answer within 5s", overlay.ErrFPProbeWedged)
+		wedged    = overlay.ErrFPProbeWedged
+		missing   = overlay.ErrFPProbeMissing
+		empty     = overlay.ErrFPProbeEmpty
+		noVerdict = overlay.ErrFPProbeNoVerdict
+		timeout   = fmt.Errorf("%w: read did not answer within 5s", overlay.ErrFPProbeWedged)
 	)
 	cases := []struct {
 		name          string
@@ -38,6 +39,9 @@ func TestFPStateRecordProbe(t *testing.T) {
 		{"empty strikes when synth non-empty", alwaysNonEmpty, []error{empty, empty}, true, true},
 		{"empty does not count toward strikes when synth empty", alwaysEmpty, []error{empty, wedged}, false, false},
 		{"transient strike then recovery leaves healthy", alwaysNonEmpty, []error{wedged, nil, wedged}, false, false},
+		{"no-verdict never strikes", alwaysNonEmpty, []error{noVerdict, noVerdict, noVerdict}, false, false},
+		{"no-verdict between strikes does not reset the debounce", alwaysNonEmpty, []error{wedged, noVerdict, wedged}, true, true},
+		{"no-verdict does not clear an established wedge", alwaysNonEmpty, []error{wedged, wedged, noVerdict}, true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

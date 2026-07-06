@@ -672,6 +672,93 @@ func TestHolderFooterWedged(t *testing.T) {
 	}
 }
 
+// TestFPWedgedFooter pins the File Provider wedge footer: a breaker-parked
+// domain reads "parked (wedged)", one still recovering reads "wedged
+// (recovering)", and an empty list is silent.
+func TestFPWedgedFooter(t *testing.T) {
+	cases := map[string]struct {
+		wedged []daemon.FPDomainState
+		want   string
+	}{
+		"none is silent":  {nil, ""},
+		"empty is silent": {[]daemon.FPDomainState{}, ""},
+		"parked domain": {
+			[]daemon.FPDomainState{{ID: 3, BreakerTripped: true}},
+			"✗ acct-03 file provider parked (wedged)",
+		},
+		"recovering domain": {
+			[]daemon.FPDomainState{{ID: 5}},
+			"✗ acct-05 file provider wedged (recovering)",
+		},
+		"multiple, one per line": {
+			[]daemon.FPDomainState{{ID: 1, BreakerTripped: true}, {ID: 2}},
+			"✗ acct-01 file provider parked (wedged)\n✗ acct-02 file provider wedged (recovering)",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := stripANSI(fpWedgedFooter(tc.wedged)); got != tc.want {
+				t.Errorf("fpWedgedFooter = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunStatusPlainFPWedgedFooter pins the FP-wedge footer end-to-end through
+// runStatus against a fake daemon socket.
+func TestRunStatusPlainFPWedgedFooter(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "ccp-home")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", pool.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req daemon.Request
+			_ = json.NewDecoder(conn).Decode(&req)
+			_ = json.NewEncoder(conn).Encode(daemon.Response{
+				Proto: daemon.ProtocolVersion, OK: true, Version: version.String(),
+				Accounts: []daemon.AccountStatus{{
+					ID: 1, Label: "work@example.com", HasUsage: true, Remaining5h: 50, Remaining7d: 50,
+				}},
+				FPWedged: []daemon.FPDomainState{{ID: 2, ConfigDir: "/p/acct-02", BreakerTripped: true}},
+			})
+			_ = conn.Close()
+		}
+	}()
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	var buf bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&buf)
+	cmd.SetContext(t.Context())
+	if err := runStatus(cmd, &pool.Manager{Store: st}, false, false, true); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stripANSI(buf.String())
+	if !strings.Contains(out, "acct-02 file provider parked (wedged)") {
+		t.Errorf("plain status missing the FP-wedge footer:\n%s", out)
+	}
+}
+
 // TestRunStatusPlainHolderFooter pins the holder footer end-to-end through
 // runStatus against a fake daemon socket.
 func TestRunStatusPlainHolderFooter(t *testing.T) {

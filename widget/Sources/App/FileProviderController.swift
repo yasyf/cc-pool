@@ -24,11 +24,16 @@ private struct ControlResponse: Encodable {
     var version: String?
     var fpOK: Bool?
     var path: String?
+    /// probe-domain only. Absent = domain serves but `.claude.json` is absent;
+    /// 0 = present and empty; >0 = bytes actually read. nil is omitted by the
+    /// synthesized encoder, which is exactly the "absent" wire shape.
+    var jsonBytes: Int64?
 
     enum CodingKeys: String, CodingKey {
         case proto, ok, error, version, path
         case errClass = "err_class"
         case fpOK = "fp_ok"
+        case jsonBytes = "json_bytes"
     }
 
     static func failure(_ message: String, _ cls: ErrClass?) -> ControlResponse {
@@ -46,6 +51,9 @@ private enum ErrClass: String {
     case registerFailed = "register-failed"
     case noDomain = "no-domain"
     case busy = "busy"
+    /// probe-domain: a registered domain whose URL, enumeration, or read fails
+    /// or times out — it is not actually serving.
+    case domainNotServing = "domain-not-serving"
 }
 
 private enum OpFailure: Error {
@@ -80,6 +88,7 @@ final class FileProviderController {
         static let probeURL: TimeInterval = 3
         static let probeEnum: TimeInterval = 5
         static let probeRemove: TimeInterval = 4 // probe total ≤19s
+        static let probeRead: TimeInterval = 4 // probe-domain total ≤13s (lookup+URL+enum+read)
     }
 
     private let acceptQueue = DispatchQueue(label: "cc-pool.fp.accept")
@@ -189,7 +198,7 @@ final class FileProviderController {
             var resp = ControlResponse(ok: true)
             resp.version = Self.appVersion
             reply(fd, resp)
-        case "probe", "register", "path", "signal", "remove":
+        case "probe", "register", "path", "signal", "remove", "probe-domain":
             let domain = req.domain ?? ""
             guard req.op == "probe" || !domain.isEmpty else {
                 reply(fd, .failure("domain required for op \(req.op)", nil))
@@ -249,6 +258,7 @@ final class FileProviderController {
         case "path": return visiblePath(domain)
         case "signal": return signal(domain)
         case "probe": return probe()
+        case "probe-domain": return probeDomain(domain)
         default: return .failure("unknown op \(op)", nil) // unreachable: handle() routed
         }
     }
@@ -381,6 +391,45 @@ final class FileProviderController {
         }
     }
 
+    /// Probes a registered account domain (the daemon's readiness gate),
+    /// reporting `.claude.json`'s byte length via json_bytes: absent = no file,
+    /// 0 = empty, >0 = real content read in full — never stat'd, since FPFS
+    /// reports size 0 for materialized items. A getDomains/URL/enumerate/read
+    /// failure or timeout is domain-not-serving; an unregistered id is no-domain.
+    private func probeDomain(_ domain: String) -> ControlResponse {
+        let mgr: NSFileProviderManager
+        switch manager(for: domain, bound: Bound.lookup, lookupFailClass: .domainNotServing) {
+        case .reply(let resp): return resp // unregistered → no-domain; lookup failure → domain-not-serving
+        case .manager(let m): mgr = m
+        }
+        let url: URL
+        switch waitURL(Bound.probeURL, { mgr.getUserVisibleURL(for: .rootContainer, completionHandler: $0) }) {
+        case .failure(let f):
+            return .failure("probe-domain URL for \(domain): \(f.message)", .domainNotServing)
+        case .success(let u):
+            url = u
+        }
+        let entries: [String]
+        switch waitBlocking(Bound.probeEnum, { try FileManager.default.contentsOfDirectory(atPath: url.path) }) {
+        case .failure(let f):
+            return .failure("probe-domain enumerate \(domain): \(f.message)", .domainNotServing)
+        case .success(let e):
+            entries = e
+        }
+        guard entries.contains(".claude.json") else {
+            return ControlResponse(ok: true) // serves, but no .claude.json → json_bytes absent
+        }
+        let file = url.appendingPathComponent(".claude.json").path
+        switch waitBlocking(Bound.probeRead, { try Self.byteCount(ofFileAt: file) }) {
+        case .failure(let f):
+            return .failure("probe-domain read \(domain): \(f.message)", .domainNotServing)
+        case .success(let n):
+            var resp = ControlResponse(ok: true)
+            resp.jsonBytes = Int64(n)
+            return resp
+        }
+    }
+
     // MARK: - Error mapping
 
     /// Conservative: ONLY errors that provably mean "File Provider cannot
@@ -414,18 +463,21 @@ final class FileProviderController {
         case reply(ControlResponse)
     }
 
-    /// Resolves a registered domain to its manager; an unregistered id is
-    /// no-domain (transient — the daemon re-registers).
-    private func manager(for domain: String, bound: TimeInterval) -> Lookup {
+    /// Resolves a registered domain to its manager. An unregistered id is always
+    /// no-domain (transient — the daemon re-registers); a getDomains error/timeout or
+    /// a nil manager surfaces as `lookupFailClass`. probe-domain passes
+    /// .domainNotServing (a lookup it can't complete = not serving = a real retryable
+    /// wedge on the Go side); other ops keep the default .registerFailed.
+    private func manager(for domain: String, bound: TimeInterval, lookupFailClass: ErrClass = .registerFailed) -> Lookup {
         switch registeredDomains(bound) {
         case .failure(let f):
-            return .reply(.failure("list domains: \(f.message)", .registerFailed))
+            return .reply(.failure("list domains: \(f.message)", lookupFailClass))
         case .success(let ds):
             guard let d = ds.first(where: { $0.identifier.rawValue == domain }) else {
                 return .reply(.failure("domain \(domain) is not registered", .noDomain))
             }
             guard let mgr = NSFileProviderManager(for: d) else {
-                return .reply(.failure("no manager for domain \(domain)", .registerFailed))
+                return .reply(.failure("no manager for domain \(domain)", lookupFailClass))
             }
             return .manager(mgr)
         }
@@ -478,6 +530,22 @@ final class FileProviderController {
         guard sem.wait(timeout: .now() + bound) == .success else { return .failure(.timeout) }
         if let failure { return .failure(.error(failure)) }
         return .success(domains)
+    }
+
+    /// Bounds a blocking filesystem closure on a utility queue. A closure that
+    /// outruns `bound` surfaces as .timeout, leaking one blocked thread until it
+    /// returns (acceptable inside the probe budget).
+    private func waitBlocking<T>(
+        _ bound: TimeInterval, _ work: @escaping () throws -> T
+    ) -> Result<T, OpFailure> {
+        let sem = DispatchSemaphore(value: 0)
+        var result: Result<T, OpFailure>?
+        DispatchQueue.global(qos: .utility).async {
+            do { result = .success(try work()) } catch { result = .failure(.error(error as NSError)) }
+            sem.signal()
+        }
+        guard sem.wait(timeout: .now() + bound) == .success else { return .failure(.timeout) }
+        return result ?? .failure(.timeout)
     }
 
     // MARK: - Base watcher + rehydrate
@@ -541,6 +609,31 @@ final class FileProviderController {
                 Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
             }
         }
+    }
+
+    /// Byte count of the whole file, from read(2) looped to EOF — never
+    /// st_size, which FPFS reports as 0 for materialized items.
+    private static func byteCount(ofFileAt path: String) throws -> Int {
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else { throw posixError("open", path) }
+        defer { close(fd) }
+        var total = 0
+        var buf = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let n = read(fd, &buf, buf.count)
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw posixError("read", path)
+            }
+            if n == 0 { return total }
+            total += n
+        }
+    }
+
+    private static func posixError(_ op: String, _ path: String) -> NSError {
+        let code = errno
+        return NSError(domain: NSPOSIXErrorDomain, code: Int(code),
+                       userInfo: [NSLocalizedDescriptionKey: "\(op) \(path): \(String(cString: strerror(code)))"])
     }
 
     private static func setTimeouts(_ fd: Int32, seconds: Int) {

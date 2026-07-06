@@ -43,6 +43,31 @@ func HolderVersionMitigated(version string) bool {
 	return semver.Compare(v, MinHolderVersion) >= 0
 }
 
+// MinWidgetVersion is the oldest CCPoolStatus companion app cc-pool trusts to
+// drive File Provider domains: the first release whose control server answers
+// the probe-domain op — the app-side, TCC-safe data-plane probe the daemon's
+// wedge ladder, the migrate readiness gate, onboarding, and doctor all key on.
+// An older app silently lacks it (its unknown-op arm reads as ErrOpUnsupported),
+// so onboarding refuses it and points at the cask upgrade.
+const MinWidgetVersion = "v0.44.0"
+
+// WidgetVersionSupported reports whether a companion app's reported version is
+// new enough to answer probe-domain (>= MinWidgetVersion). The app reports its
+// CFBundleShortVersionString, which the release strips to a bare "0.44.0" (no
+// leading "v"), so a "v" is prepended before the semver compare; a trailing
+// commit paren is dropped like HolderVersionMitigated. "dev", empty, or
+// otherwise unparseable versions pass: a locally-built app is current-source.
+func WidgetVersionSupported(version string) bool {
+	v, _, _ := strings.Cut(strings.TrimSpace(version), " ")
+	if v != "" && !strings.HasPrefix(v, "v") {
+		v = "v" + v
+	}
+	if !semver.IsValid(v) {
+		return true
+	}
+	return semver.Compare(v, MinWidgetVersion) >= 0
+}
+
 // ErrHolderUnmitigated means the shared mount holder predates MinHolderVersion:
 // hosting fuse mirrors on it can panic macOS (nfs_vinvalbuf2), so every fuse
 // mount entry point refuses it until the cask is upgraded.
@@ -139,6 +164,9 @@ func overlaySpec() fkoverlay.Spec {
 			ExtensionBundleID: FPExtensionBundleID,
 			AppGroup:          AppGroupID,
 			SpawnTimeout:      30 * time.Second,
+			// Setup fails loud (never a silent raw-read fallback) when the companion
+			// app is too old to answer probe-domain; the hint names the cask upgrade.
+			UpgradeHint: "upgrade the cc-pool-status cask (brew upgrade --cask cc-pool-status)",
 		},
 	}
 }

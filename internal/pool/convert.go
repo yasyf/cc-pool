@@ -40,12 +40,82 @@ func (m *Manager) canHostFuse() bool {
 // symlink paths destroys account state.
 var ErrConvertUnsupported = errors.New("overlay backend unavailable")
 
-// fpDomainProbe verifies a freshly registered File Provider domain actually
-// serves reads through the flipped account dir. Setup (fusekit) already blocks
-// until the domain enumerates; this proves the bridge data plane end to end
-// before the row flips — the readiness the FP-migrate-storm incident lacked. A
-// package var so convert tests can script the post-Setup data-plane verdict.
-var fpDomainProbe = overlay.FPDomainProbeWithin
+// ErrDirIsOverlaySymlink means a symlink-row file move found the account dir to be
+// a symlink (a mux bridge, a File Provider domain bridge, or any overlay stand-in)
+// rather than the real directory a symlink row must hold. Moving files through it
+// would traverse a live mirror or domain — the exact loss that destroyed three
+// accounts' identities when a crashed convert left an FP-bridge symlink behind. Every
+// guarded flow refuses it, naming the link target, and moves nothing.
+var ErrDirIsOverlaySymlink = errors.New("account dir is an overlay symlink, not a real directory")
+
+// ErrIdentityLost means a rollback's restore move completed but the account's
+// identity is not readable at its row-implied .claude.json afterward — the
+// divergence the fresher-wins resolver could cause. Its message names the recovery
+// sources in order so the identity can be restored by hand.
+var ErrIdentityLost = errors.New("account identity lost after rollback")
+
+// requireRealDir fails with ErrDirIsOverlaySymlink (naming the link target) when dir
+// is a symlink, so no symlink-row file move ever traverses a live domain or mirror.
+// Lstat never follows the link, so it cannot hang on a wedged mount. A real dir, an
+// absent dir, or a non-symlink stat error passes through — the caller's own move
+// surfaces a genuine fault.
+func requireRealDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return nil
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		target, rerr := os.Readlink(dir)
+		if rerr != nil {
+			target = fmt.Sprintf("<unreadable: %v>", rerr)
+		}
+		return fmt.Errorf("%w: %s -> %s", ErrDirIsOverlaySymlink, dir, target)
+	}
+	return nil
+}
+
+// verifyIdentityRestored confirms a rollback's restore move landed a readable
+// identity back at dir/.claude.json; pre is the identity read before the conversion
+// (nil when the account had none, so there is nothing to restore and nothing to
+// verify). It checks readability, NOT that the bytes match pre: the rollback
+// faithfully restores whatever the private root held, and a genuinely divergent
+// identity there is the convert's own reported cause, preserved for inspection —
+// never destroyed. An UNREADABLE identity (absent or corrupt) is the loss this
+// guards against — the fresher-wins EXDEV window that left the identity gone from
+// every read path — so the error names, in recovery order, where a surviving copy
+// may be found: the resolver's conflict siblings, the private-root backups, then a
+// fresh login.
+func verifyIdentityRestored(a store.Account, dir string, pre *Identity) error {
+	if pre == nil {
+		return nil
+	}
+	_, err := readIdentity(filepath.Join(dir, ".claude.json"))
+	if err == nil {
+		return nil
+	}
+	priv := fkoverlay.FusePrivateRoot(dir)
+	return fmt.Errorf("%w: acct-%02d %v; recover it, in order, from %s/.claude.json.conflict-* or %s/.claude.json.conflict-* → %s/.claude.json.backup.* → re-run `claude /login` for this account",
+		ErrIdentityLost, a.ID, err, dir, priv, filepath.Join(priv, "backups"))
+}
+
+// fpProbe classifies the account dir's File Provider domain verdict through the
+// companion app's control op (never a through-domain read). Setup (fusekit)
+// already blocks until the domain enumerates; this proves the bridge data plane
+// end to end before the row flips — the readiness the FP-migrate-storm incident
+// lacked. The daemon injects Manager.FPProbe; otherwise it derives the probe from
+// the freshly-registered target provider, which exposes ProbeDomain. A NoVerdict
+// (app busy/unreachable/too old) is a non-nil error, so the convert gate rolls
+// back rather than flipping an unverified row.
+func (m *Manager) fpProbe(ctx context.Context, fpProv fkoverlay.Provider, accountDir string) error {
+	if m.FPProbe != nil {
+		return m.FPProbe(ctx, accountDir)
+	}
+	prober, ok := fpProv.(overlay.FPDomainProber)
+	if !ok {
+		return fmt.Errorf("%w: provider %T lacks the app control-op probe", overlay.ErrFPProbeNoVerdict, fpProv)
+	}
+	return overlay.FPDomainProbe(ctx, prober, accountDir)
+}
 
 // ConvertOverlay switches an account's overlay provider, persisting the row last so
 // an interrupted run re-converges. MUST run inside the daemon, which alone gates
@@ -97,14 +167,17 @@ func (m *Manager) ConvertOverlay(ctx context.Context, a store.Account, to fkover
 func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, fuseProv fkoverlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
+	// ROOT GUARD: a symlink row must hold a REAL account dir. A symlink here (a mux
+	// bridge into the shared mirror, or a File Provider domain bridge a crashed
+	// convert left behind) would make MovePrivateEntries below write THROUGH the
+	// live mirror/domain — the identity-loss window this pass closes. Lstat never
+	// follows the link, so it precedes the mount check (which would). Refuse, naming
+	// the target, and move nothing.
+	if err := requireRealDir(dir); err != nil {
+		return a, fmt.Errorf("convert acct-%02d: row says %s: %w", a.ID, a.OverlayKind, err)
+	}
 	if overlay.Mounted(dir) {
 		return a, fmt.Errorf("convert acct-%02d: %s is already a mountpoint but the row says %s; refusing", a.ID, dir, a.OverlayKind)
-	}
-	// A mux bridge symlink resolves INTO the shared mirror; moving private files
-	// through it (MovePrivateEntries below) would write into the live mount, not
-	// the account dir. The row says symlink, so a bridge here is wreckage — refuse.
-	if IsBridgeSymlink(dir) {
-		return a, fmt.Errorf("convert acct-%02d: %s is a mux bridge symlink into %s but the row says %s; refusing to move files through the mirror", a.ID, dir, MuxRootDir(), a.OverlayKind)
 	}
 
 	// An account that never completed a login legitimately has no identity.
@@ -122,17 +195,17 @@ func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, f
 	// must go through rollbackToSymlink, or the account is stranded until
 	// HealStrandedPrivate — the recovery of last resort — finds it.
 	if err := fkoverlay.MovePrivateEntries(dir, priv, m.overlaySpec()); err != nil {
-		return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("move private files: %w", err))
+		return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, fmt.Errorf("move private files: %w", err))
 	}
 	if err := symProv.Teardown(base, dir); err != nil {
-		return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("tear down symlinks: %w", err))
+		return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, fmt.Errorf("tear down symlinks: %w", err))
 	}
 	// A spent budget must not start a mount it has no time to verify.
 	if err := ctx.Err(); err != nil {
-		return a, m.rollbackToSymlink(a, symProv, fuseProv, err)
+		return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, err)
 	}
 	if err := fuseProv.Setup(base, dir); err != nil {
-		return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("mount: %w", err))
+		return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, fmt.Errorf("mount: %w", err))
 	}
 
 	// Verify the identity we moved into the private root survived the move intact.
@@ -147,16 +220,16 @@ func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, f
 	if preErr == nil {
 		post, err := readIdentity(filepath.Join(priv, ".claude.json"))
 		if err != nil {
-			return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("identity not readable in private root after move: %w", err))
+			return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, fmt.Errorf("identity not readable in private root after move: %w", err))
 		}
 		if post.AccountUUID != pre.AccountUUID {
-			return a, m.rollbackToSymlink(a, symProv, fuseProv,
+			return a, m.rollbackToSymlink(a, symProv, fuseProv, pre,
 				fmt.Errorf("identity in private root is %s, expected %s", post.AccountUUID, pre.AccountUUID))
 		}
 	}
 
 	if err := m.Store.SetAccountOverlayKind(a.ID, string(fuseProv.Backend())); err != nil {
-		return a, m.rollbackToSymlink(a, symProv, fuseProv, fmt.Errorf("persist row: %w", err))
+		return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, fmt.Errorf("persist row: %w", err))
 	}
 	a.OverlayKind = string(fuseProv.Backend())
 	return a, nil
@@ -165,7 +238,7 @@ func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, f
 // rollbackToSymlink restores a symlink overlay after a failed fuse setup. If the
 // unmount does not take it stops — laying symlinks into a live mirror would write
 // through to the real ~/.claude — leaving recovery to the daemon's reconcile.
-func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay.Provider, cause error) error {
+func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay.Provider, pre *Identity, cause error) error {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
 	if err := fuseProv.Teardown(base, dir); err != nil {
@@ -185,6 +258,12 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay
 		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
 	}
 	removePrivateRootIfEmpty(priv, spec)
+	// IDENTITY INVARIANT: the restore moved the identity back to dir/.claude.json;
+	// verify it survived intact before reporting a clean rollback. A miss surfaces
+	// the recovery sources rather than a silent "rolled back".
+	if err := verifyIdentityRestored(a, dir, pre); err != nil {
+		return fmt.Errorf("convert acct-%02d: %w (rollback re-asserted the symlink overlay but %w)", a.ID, cause, err)
+	}
 	return fmt.Errorf("convert acct-%02d: %w (rolled back to symlink)", a.ID, cause)
 }
 
@@ -206,12 +285,21 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay
 func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fromProv, fpProv fkoverlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
+	fromFuse := fromProv.Backend().IsFuse()
+	// ROOT GUARD (symlink source only): a symlink row must hold a REAL account dir;
+	// a symlink there (a mux bridge, or a File Provider domain bridge a crashed
+	// convert left behind) would make MovePrivateEntries below drain files THROUGH
+	// the live mirror/domain — the identity-loss window this pass closes. Lstat
+	// never follows the link, so it precedes the mount check (which would). A fuse
+	// source's dir is legitimately a bridge symlink and its arm moves nothing, so it
+	// is exempt.
+	if !fromFuse {
+		if err := requireRealDir(dir); err != nil {
+			return a, fmt.Errorf("convert acct-%02d: row says %s: %w", a.ID, a.OverlayKind, err)
+		}
+	}
 	if overlay.Mounted(dir) {
 		return a, fmt.Errorf("convert acct-%02d: %s is a live mountpoint; refusing to convert while anything is mounted there", a.ID, dir)
-	}
-	fromFuse := fromProv.Backend().IsFuse()
-	if !fromFuse && IsBridgeSymlink(dir) {
-		return a, fmt.Errorf("convert acct-%02d: %s is a mux bridge symlink into %s but the row says %s; refusing to move files through the mirror", a.ID, dir, MuxRootDir(), a.OverlayKind)
 	}
 
 	// The identity that must survive the conversion: a symlink row holds it in
@@ -243,20 +331,20 @@ func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fr
 		// must go through a rollback, or the account is stranded until
 		// HealStrandedPrivate — the recovery of last resort — finds it.
 		if err := fkoverlay.MovePrivateEntries(dir, priv, m.overlaySpec()); err != nil {
-			return a, m.rollbackFileProviderToSymlink(a, fromProv, fpProv, fmt.Errorf("move private files: %w", err))
+			return a, m.rollbackFileProviderToSymlink(a, fromProv, fpProv, pre, fmt.Errorf("move private files: %w", err))
 		}
 		if err := fromProv.Teardown(base, dir); err != nil {
-			return a, m.rollbackFileProviderToSymlink(a, fromProv, fpProv, fmt.Errorf("tear down symlinks: %w", err))
+			return a, m.rollbackFileProviderToSymlink(a, fromProv, fpProv, pre, fmt.Errorf("tear down symlinks: %w", err))
 		}
 		if err := os.Remove(dir); err != nil {
-			return a, m.rollbackFileProviderToSymlink(a, fromProv, fpProv, fmt.Errorf("remove drained account dir: %w", err))
+			return a, m.rollbackFileProviderToSymlink(a, fromProv, fpProv, pre, fmt.Errorf("remove drained account dir: %w", err))
 		}
 	}
 	rollback := func(cause error) error {
 		if fromFuse {
 			return m.rollbackFileProviderToFuse(a, fromProv, fpProv, cause)
 		}
-		return m.rollbackFileProviderToSymlink(a, fromProv, fpProv, cause)
+		return m.rollbackFileProviderToSymlink(a, fromProv, fpProv, pre, cause)
 	}
 
 	// A spent budget must not register a domain it has no time to verify.
@@ -273,8 +361,10 @@ func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fr
 	// expected and benign there, and there is no identity to verify.
 	if preErr == nil {
 		// Setup proved the appex enumerator; this proves the bridge data plane
-		// through the flipped dir — the readiness the wedge incident lacked.
-		if err := fpDomainProbe(dir); err != nil {
+		// over the app control op — the readiness the wedge incident lacked. A
+		// NoVerdict (busy/unreachable/too old) rolls back too: never flip an
+		// unverified row.
+		if err := m.fpProbe(ctx, fpProv, dir); err != nil {
 			return a, rollback(fmt.Errorf("domain registered but does not serve reads: %w", err))
 		}
 		post, err := readIdentity(filepath.Join(priv, ".claude.json"))
@@ -294,22 +384,36 @@ func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fr
 }
 
 // retractFileProviderIfLaid undoes whatever a failed File Provider Setup laid at
-// the account dir. A REAL dir there means Setup never swapped it in — nothing to
-// retract, and the provider's fail-closed RemoveSymlink would refuse it anyway;
-// an absent path or a symlink takes the full Teardown (retract the link,
-// deregister the domain — deregistering a never-registered domain is a no-op).
+// the account dir. An absent path or a symlink takes the full Teardown (retract the
+// link AND deregister the domain — deregistering a never-registered domain is a
+// no-op). A REAL dir means Setup never swapped the bridge symlink in — Teardown's
+// fail-closed RemoveSymlink would refuse it — but Setup may still have registered
+// the domain before AtomicSymlink refused the real dir (the fuse→FP legacy shape),
+// which returning nil here leaked forever. So on a real dir it deregisters the
+// domain, but ONLY when the zero-spawn registration check finds one: a rollback
+// that never reached Setup (a drain/teardown fault) leaves no registration and must
+// touch nothing — never spawn the app to deregister a domain that was never laid.
 func retractFileProviderIfLaid(base, dir string, fpProv fkoverlay.Provider) error {
-	if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink == 0 {
-		return nil
+	fi, err := os.Lstat(dir)
+	if err != nil || fi.Mode()&os.ModeSymlink != 0 {
+		return fpProv.Teardown(base, dir)
 	}
-	return fpProv.Teardown(base, dir)
+	registry, ok := fpProv.(overlay.FPDomainRegistry)
+	remover, isRemover := fpProv.(overlay.FPDomainRemover)
+	if !ok || !isRemover {
+		return fmt.Errorf("convert: provider %T cannot deregister a leaked file provider domain: %w", fpProv, ErrConvertUnsupported)
+	}
+	if _, err := registry.DomainRoot(context.Background(), dir); err != nil {
+		return nil // no registration (ErrNoDomain) or app down (ErrAppUnavailable): nothing laid to retract
+	}
+	return remover.RemoveDomain(dir)
 }
 
 // rollbackFileProviderToSymlink restores the symlink overlay after a failed
 // symlink→fileprovider conversion. If retracting what Setup laid fails it stops
 // — moving private files back through a live domain symlink would write into
 // the domain — leaving them in the backing root for HealStrandedPrivate.
-func (m *Manager) rollbackFileProviderToSymlink(a store.Account, symProv, fpProv fkoverlay.Provider, cause error) error {
+func (m *Manager) rollbackFileProviderToSymlink(a store.Account, symProv, fpProv fkoverlay.Provider, pre *Identity, cause error) error {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
 	if err := retractFileProviderIfLaid(base, dir, fpProv); err != nil {
@@ -329,6 +433,12 @@ func (m *Manager) rollbackFileProviderToSymlink(a store.Account, symProv, fpProv
 		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
 	}
 	removePrivateRootIfEmpty(priv, spec)
+	// IDENTITY INVARIANT: the restore moved the identity back to dir/.claude.json;
+	// verify it survived before reporting a clean rollback, else name the recovery
+	// sources.
+	if err := verifyIdentityRestored(a, dir, pre); err != nil {
+		return fmt.Errorf("convert acct-%02d: %w (rollback re-asserted the symlink overlay but %w)", a.ID, cause, err)
+	}
 	return fmt.Errorf("convert acct-%02d: %w (rolled back to symlink)", a.ID, cause)
 }
 
@@ -488,14 +598,17 @@ func (m *Manager) HealStrandedPrivate(a store.Account) (bool, error) {
 	if !has {
 		return false, nil
 	}
+	// ROOT GUARD: the stranded files move back INTO dir, so dir must be the real
+	// account directory. A symlink there (a mux bridge, or a File Provider domain
+	// bridge a crashed convert left behind) would send MovePrivateEntries writing
+	// through the live mirror/domain. Lstat never follows the link, so this precedes
+	// the mount check (which would). Refuse loudly for `ccp doctor` rather than
+	// corrupt the mirror; the stranded copy stays intact.
+	if err := requireRealDir(dir); err != nil {
+		return false, fmt.Errorf("heal acct-%02d: %w — run `ccp doctor`", a.ID, err)
+	}
 	if overlay.Mounted(dir) {
 		return false, fmt.Errorf("heal acct-%02d: %s is a live mountpoint but the row says symlink; refusing to move files under a mirror", a.ID, dir)
-	}
-	// A mux bridge symlink is a live-mirror stand-in the row must not carry: moving
-	// the stranded files back through it (MovePrivateEntries) would write into the
-	// mount. Refuse loudly for `ccp doctor` rather than corrupt the mirror.
-	if IsBridgeSymlink(dir) {
-		return false, fmt.Errorf("heal acct-%02d: %s is a mux bridge symlink but the row says symlink; refusing to move files through the mirror — run `ccp doctor`", a.ID, dir)
 	}
 	symProv, err := m.overlayFor(fkoverlay.BackendSymlink)
 	if err != nil {

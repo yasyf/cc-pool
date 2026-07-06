@@ -666,7 +666,7 @@ func pollOnceAccount(t *testing.T, s *Server, a store.Account) {
 	if !s.beginPoll(a.ID) {
 		t.Fatalf("acct-%02d poll claim refused", a.ID)
 	}
-	s.pollAccount(t.Context(), nil, 0, a)
+	s.pollAccount(t.Context(), nil, a, false)
 }
 
 // TestPollAccountFileProviderSyncAfterAdoption pins the post-adoption nudge: an

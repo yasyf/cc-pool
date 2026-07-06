@@ -1,80 +1,107 @@
 package overlay
 
 import (
+	"context"
 	"errors"
-	"os"
-	"path/filepath"
+	"fmt"
 	"testing"
-	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/yasyf/fusekit/fileproviderd"
 )
 
-// swapFPProbeTimeout overrides fpProbeTimeout for one test; callers must not run
-// in parallel (it mutates a package global).
-func swapFPProbeTimeout(t *testing.T, d time.Duration) {
-	t.Helper()
-	prev := fpProbeTimeout
-	fpProbeTimeout = d
-	t.Cleanup(func() { fpProbeTimeout = prev })
+// fakeProber scripts one control-op verdict for FPDomainProbe: a byte count (via
+// bytes, nil-safe through hasBytes) or an error.
+type fakeProber struct {
+	bytes    *int64
+	err      error
+	gotDir   string
+	gotCalls int
 }
 
-func TestFPDomainProbeWithinClassifies(t *testing.T) {
+func (f *fakeProber) ProbeDomain(_ context.Context, accountDir string) (*int64, error) {
+	f.gotCalls++
+	f.gotDir = accountDir
+	return f.bytes, f.err
+}
+
+func ptr(n int64) *int64 { return &n }
+
+func TestFPDomainProbeClassifies(t *testing.T) {
 	cases := []struct {
-		name  string
-		setup func(t *testing.T, dir string)
-		want  error // nil means a healthy (non-empty) read
-		// forbidden verdicts a case must never be confused with.
-		notWant []error
+		name    string
+		bytes   *int64
+		err     error
+		want    error   // nil means a healthy (non-empty) read
+		notWant []error // forbidden verdicts a case must never be confused with
 	}{
 		{
-			name: "non-empty served file is healthy",
-			setup: func(t *testing.T, dir string) {
-				if err := os.WriteFile(filepath.Join(dir, claudeJSONName), []byte(`{"x":1}`), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			},
-			want: nil,
+			name:    "bytes read is healthy",
+			bytes:   ptr(7),
+			want:    nil,
+			notWant: []error{ErrFPProbeMissing, ErrFPProbeEmpty, ErrFPProbeWedged, ErrFPProbeNoVerdict},
 		},
 		{
-			name:    "absent file is missing, never wedged",
-			setup:   func(t *testing.T, dir string) {}, // no .claude.json
+			name:    "absent .claude.json is missing, never wedged or no-verdict",
+			bytes:   nil,
 			want:    ErrFPProbeMissing,
-			notWant: []error{ErrFPProbeWedged, ErrFPProbeEmpty},
+			notWant: []error{ErrFPProbeWedged, ErrFPProbeEmpty, ErrFPProbeNoVerdict},
 		},
 		{
-			name: "zero-byte served file is empty, never missing or wedged",
-			setup: func(t *testing.T, dir string) {
-				if err := os.WriteFile(filepath.Join(dir, claudeJSONName), nil, 0o600); err != nil {
-					t.Fatal(err)
-				}
-			},
+			name:    "zero-byte served file is empty, never missing or wedged",
+			bytes:   ptr(0),
 			want:    ErrFPProbeEmpty,
-			notWant: []error{ErrFPProbeMissing, ErrFPProbeWedged},
+			notWant: []error{ErrFPProbeMissing, ErrFPProbeWedged, ErrFPProbeNoVerdict},
 		},
 		{
-			name: "permission-denied open is wedged, never missing",
-			setup: func(t *testing.T, dir string) {
-				if os.Geteuid() == 0 {
-					t.Skip("root bypasses file permission bits, so open(2) would not return EACCES")
-				}
-				// mode-0000 makes os.Open refuse with EACCES, a data-plane wedge shape.
-				if err := os.WriteFile(filepath.Join(dir, claudeJSONName), []byte("x"), 0o000); err != nil {
-					t.Fatal(err)
-				}
-			},
+			name:    "domain-not-serving is wedged, never missing or no-verdict",
+			err:     fmt.Errorf("state domain acct-01: %w", fileproviderd.ErrDomainNotServing),
 			want:    ErrFPProbeWedged,
-			notWant: []error{ErrFPProbeMissing},
+			notWant: []error{ErrFPProbeMissing, ErrFPProbeEmpty, ErrFPProbeNoVerdict},
+		},
+		{
+			name:    "no-domain is missing (control-plane repair), never wedged",
+			err:     fmt.Errorf("state domain acct-01: %w", fileproviderd.ErrNoDomain),
+			want:    ErrFPProbeMissing,
+			notWant: []error{ErrFPProbeWedged, ErrFPProbeEmpty, ErrFPProbeNoVerdict},
+		},
+		{
+			name:    "busy is no-verdict, never wedged or missing",
+			err:     fmt.Errorf("probe: %w", fileproviderd.ErrBusy),
+			want:    ErrFPProbeNoVerdict,
+			notWant: []error{ErrFPProbeWedged, ErrFPProbeMissing, ErrFPProbeEmpty},
+		},
+		{
+			name:    "app-unavailable is no-verdict, never wedged",
+			err:     fmt.Errorf("probe: %w", fileproviderd.ErrAppUnavailable),
+			want:    ErrFPProbeNoVerdict,
+			notWant: []error{ErrFPProbeWedged, ErrFPProbeMissing, ErrFPProbeEmpty},
+		},
+		{
+			name:    "op-unsupported (old app) is no-verdict, never wedged",
+			err:     fmt.Errorf("probe: %w", fileproviderd.ErrOpUnsupported),
+			want:    ErrFPProbeNoVerdict,
+			notWant: []error{ErrFPProbeWedged, ErrFPProbeMissing, ErrFPProbeEmpty},
+		},
+		{
+			name:    "unrecognized error is no-verdict, never a strike",
+			err:     errors.New("some transport hiccup"),
+			want:    ErrFPProbeNoVerdict,
+			notWant: []error{ErrFPProbeWedged, ErrFPProbeMissing, ErrFPProbeEmpty},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			tc.setup(t, dir)
-			err := FPDomainProbeWithin(dir)
+			p := &fakeProber{bytes: tc.bytes, err: tc.err}
+			err := FPDomainProbe(context.Background(), p, "/p/acct-01")
+			if p.gotCalls != 1 {
+				t.Fatalf("ProbeDomain calls = %d, want 1", p.gotCalls)
+			}
+			if p.gotDir != "/p/acct-01" {
+				t.Fatalf("ProbeDomain dir = %q, want /p/acct-01", p.gotDir)
+			}
 			if tc.want == nil {
 				if err != nil {
-					t.Fatalf("FPDomainProbeWithin = %v, want nil (healthy)", err)
+					t.Fatalf("FPDomainProbe = %v, want nil (healthy)", err)
 				}
 				return
 			}
@@ -87,42 +114,5 @@ func TestFPDomainProbeWithinClassifies(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// TestFPDomainProbeWithinTimeoutWedged: a read that never answers is classified
-// wedged, and its probe goroutine is deliberately left parked (fuse-t/FP have no
-// timeout mount option), joined by later callers.
-func TestFPDomainProbeWithinTimeoutWedged(t *testing.T) {
-	swapFPProbeTimeout(t, 50*time.Millisecond)
-	dir := t.TempDir()
-	fifo := filepath.Join(dir, claudeJSONName)
-	// A FIFO with no writer parks open(2) indefinitely — a wedged domain's shape.
-	if err := unix.Mkfifo(fifo, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	before := fpProbes.Inflight()
-	err := FPDomainProbeWithin(dir)
-	if !errors.Is(err, ErrFPProbeWedged) {
-		t.Fatalf("errors.Is(err, ErrFPProbeWedged) = false against a parked open; err = %v", err)
-	}
-	if errors.Is(err, ErrFPProbeMissing) || errors.Is(err, ErrFPProbeEmpty) {
-		t.Errorf("a timed-out probe must not read as missing or empty; err = %v", err)
-	}
-	if got := fpProbes.Inflight(); got != before+1 {
-		t.Errorf("Inflight = %d, want %d (one new parked probe goroutine)", got, before+1)
-	}
-
-	// Best-effort unwedge; no drain assertion — a real wedge leaks the goroutine
-	// by design, and a macOS FIFO read can miss the writer's EOF under load.
-	if w, werr := os.OpenFile(fifo, os.O_WRONLY, 0); werr == nil { //nolint:gosec // G304: fifo is under the test's own t.TempDir()
-		go func() {
-			_, _ = w.Write([]byte("x"))
-			_ = w.Close()
-		}()
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for fpProbes.Inflight() > before && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
 	}
 }

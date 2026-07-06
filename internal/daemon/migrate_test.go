@@ -1680,52 +1680,63 @@ func TestMountReadyRefreshesOnCacheMiss(t *testing.T) {
 }
 
 // swapFPGateSeams points fpGate's two seams at canned verdicts and returns a
-// counter of control-health dials, restoring both on cleanup.
-func swapFPGateSeams(t *testing.T, available bool, healthErr error) *int {
+// counter of capability-probe dials, restoring both on cleanup. capable is the
+// throwaway-domain verdict returned when probeErr is nil.
+func swapFPGateSeams(t *testing.T, available, capable bool, probeErr error) *int {
 	t.Helper()
-	prevAvail, prevHealth := fpAvailable, fpControlHealth
-	t.Cleanup(func() { fpAvailable, fpControlHealth = prevAvail, prevHealth })
-	healths := new(int)
+	prevAvail, prevProbe := fpAvailable, fpCapabilityProbe
+	t.Cleanup(func() { fpAvailable, fpCapabilityProbe = prevAvail, prevProbe })
+	probes := new(int)
 	fpAvailable = func(fkoverlay.Spec) bool { return available }
-	fpControlHealth = func(context.Context, string) (string, error) {
-		*healths++
-		return "v-test", healthErr
+	fpCapabilityProbe = func(context.Context, string) (bool, error) {
+		*probes++
+		return capable, probeErr
 	}
-	return healths
+	return probes
 }
 
-// TestFPGate drives the production fpGate through its seams: an absent
-// extension is the root fault and refuses WITHOUT dialing the companion app,
-// a dead control socket refuses with a launch hint, and a healthy pair passes
-// as BackendFileProvider.
+// TestFPGate drives the production fpGate through its seams: an absent extension
+// is the root fault and refuses WITHOUT dialing the companion app; a dead control
+// socket refuses with a launch hint; an enabled-but-not-serving capability verdict
+// refuses with the System Settings hint (the reworded rung — an installed but
+// unconsented provider that a Health ok:true ping would have passed); and a serving
+// pair passes as BackendFileProvider.
 func TestFPGate(t *testing.T) {
 	cases := map[string]struct {
 		available   bool
-		healthErr   error
+		capable     bool
+		probeErr    error
 		wantBackend fkoverlay.Backend
 		wantFrags   []string
-		wantHealths int
+		wantProbes  int
 	}{
 		"extension absent refuses without dialing the app": {
 			available: false,
 			wantFrags: []string{"fileprovider unavailable", pool.FPExtensionBundleID, "ccp fp onboard", "re-run `ccp migrate`"},
 		},
 		"dead control socket refuses with a launch hint": {
-			available:   true,
-			healthErr:   errors.New("dial unix /tmp/x/domains.sock: connect: no such file or directory"),
-			wantFrags:   []string{"control probe failed", "domains.sock", pool.WidgetAppPath(), "re-run `ccp migrate`"},
-			wantHealths: 1,
+			available:  true,
+			probeErr:   errors.New("dial unix /tmp/x/domains.sock: connect: no such file or directory"),
+			wantFrags:  []string{"control probe failed", "domains.sock", pool.WidgetAppPath(), "re-run `ccp migrate`"},
+			wantProbes: 1,
+		},
+		"enabled but not serving refuses with the System Settings hint": {
+			available:  true,
+			capable:    false,
+			wantFrags:  []string{"fileprovider unavailable", "enabled but not serving", "System Settings", "ccp fp onboard"},
+			wantProbes: 1,
 		},
 		"enabled and serving passes": {
 			available:   true,
+			capable:     true,
 			wantBackend: fkoverlay.BackendFileProvider,
-			wantHealths: 1,
+			wantProbes:  1,
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
-			healths := swapFPGateSeams(t, tc.available, tc.healthErr)
+			probes := swapFPGateSeams(t, tc.available, tc.capable, tc.probeErr)
 			s := &Server{m: &pool.Manager{}}
 
 			backend, reason := s.fpGate(t.Context())
@@ -1741,8 +1752,8 @@ func TestFPGate(t *testing.T) {
 					t.Errorf("refusal %q missing %q", reason, frag)
 				}
 			}
-			if *healths != tc.wantHealths {
-				t.Fatalf("control health dials = %d, want %d", *healths, tc.wantHealths)
+			if *probes != tc.wantProbes {
+				t.Fatalf("capability probe dials = %d, want %d", *probes, tc.wantProbes)
 			}
 		})
 	}
@@ -1752,7 +1763,7 @@ func TestFPGate(t *testing.T) {
 // op before any account row, conversion, or the recorded default is touched.
 func TestHandleMigrateFileProviderGateBlocked(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
-	swapFPGateSeams(t, false, nil)
+	swapFPGateSeams(t, false, false, nil)
 
 	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fileprovider"))
 	if resp.OK {
@@ -1780,7 +1791,7 @@ func TestHandleMigrateFileProviderGateBlocked(t *testing.T) {
 // new-account default — the fuse zero-conversion precedent.
 func TestHandleMigrateFileProviderZeroConversionsFlipsDefault(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
-	swapFPGateSeams(t, true, nil)
+	swapFPGateSeams(t, true, true, nil)
 	for _, id := range []int{1, 2} {
 		if err := s.m.Store.SetAccountOverlayKind(id, "fileprovider"); err != nil {
 			t.Fatal(err)

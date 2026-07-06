@@ -74,6 +74,14 @@ type Manager struct {
 	// default; nil means pool.CanHostFuse.
 	CanHostFuse func() bool
 
+	// FPProbe classifies an account dir's File Provider domain data-plane verdict
+	// through the signed companion app's control op (never a through-domain read),
+	// returning nil (healthy) or one of overlay.ErrFPProbe{Missing,Empty,Wedged,
+	// NoVerdict}. The daemon injects it so the convert gate rides the same bounded
+	// probe as the heal loop; nil derives the probe from the freshly-registered
+	// target provider at the convert gate.
+	FPProbe func(ctx context.Context, accountDir string) error
+
 	// LockDir holds the per-account cross-process refresh lock files; tests point
 	// it at a temp dir so they never touch real state.
 	LockDir string

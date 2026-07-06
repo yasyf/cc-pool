@@ -18,8 +18,25 @@ const (
 	basePollInterval = 180 * time.Second
 	pollJitter       = 30 * time.Second
 
+	// While a network outage is being probed, the scheduler drops to a cheap
+	// short cadence so the fleet heals within ~1 minute of connectivity
+	// returning, instead of waiting out a full basePollInterval.
+	outagePollInterval = 20 * time.Second
+	outageJitter       = 5 * time.Second
+
 	// Per-account spacing so N accounts don't hit the shared-IP bucket at once.
 	perAccountSpacing = 2 * time.Second
+
+	// While an outage persists, log only every netProbeLogEvery-th canary network
+	// error (~one line per 5 min at the short cadence) so a multi-hour outage
+	// proves liveness without spamming the log.
+	netProbeLogEvery = 15
+
+	// recoveryAbandonThreshold cuts a recovery sweep short once this many
+	// consecutive network-class failures accumulate with no account reached yet:
+	// connectivity dropped again mid-sweep, so the remaining accounts are left to
+	// heal on the next canary probe instead of each burning a sample timeout.
+	recoveryAbandonThreshold = 3
 
 	rateLimitBackoffBase = 3 * time.Minute
 	rateLimitBackoffCap  = 15 * time.Minute
@@ -33,10 +50,50 @@ func rlBackoff(streak int) time.Duration {
 	return proc.Backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap}.After(streak)
 }
 
+// sampleOutcome classifies one account's poll for network-outage detection.
+type sampleOutcome int
+
+const (
+	// outcomeSuccess: the usage endpoint answered — connectivity is proven.
+	outcomeSuccess sampleOutcome = iota
+	// outcomeNonNetwork: an auth, rate-limit, decode, or cancelled error. The
+	// API still answered (or the caller stopped), so connectivity is proven.
+	outcomeNonNetwork
+	// outcomeNetwork: a transport-layer failure (oauth.ErrNetwork) — the only
+	// outage signal.
+	outcomeNetwork
+)
+
+// classifyOutcome maps a SampleUsage error to an outage-accounting outcome. A
+// nil error is a proven-live sample; an oauth.ErrNetwork transport failure is
+// the only outage signal; every other error still proves the API responded.
+func classifyOutcome(err error) sampleOutcome {
+	switch {
+	case err == nil:
+		return outcomeSuccess
+	case errors.Is(err, oauth.ErrNetwork):
+		return outcomeNetwork
+	default:
+		return outcomeNonNetwork
+	}
+}
+
+// nextPollDelay returns the delay before the next poll: the short outage cadence
+// (~20s ±5s) while a network outage is being probed, else the steady interval
+// (basePollInterval + [0, pollJitter)). seed derives the deterministic jitter.
+func nextPollDelay(outage bool, seed int64) time.Duration {
+	if outage {
+		return outagePollInterval - outageJitter + jitter(2*outageJitter, seed)
+	}
+	return basePollInterval + jitter(pollJitter, seed)
+}
+
 func (s *Server) scheduler(ctx context.Context) {
 	s.pollOnce(ctx)
 	for {
-		d := basePollInterval + jitter(pollJitter, time.Now().UnixNano())
+		// netOutage is scheduler-goroutine-local: pollOnce is the only writer and
+		// runs in this goroutine, so reading it here needs no lock.
+		d := nextPollDelay(s.netOutage, time.Now().UnixNano())
 		select {
 		case <-ctx.Done():
 			return
@@ -52,7 +109,7 @@ func (s *Server) pollOnce(ctx context.Context) {
 
 	// Reconcile only on a successful scan: AlivePIDs always returns a non-nil
 	// map, so a failed scan would close every live session.
-	sessions, err := procscan.Scan(ctx)
+	sessions, err := s.scan(ctx)
 	if err != nil {
 		s.log.Printf("procscan: %v", err)
 	} else {
@@ -75,45 +132,124 @@ func (s *Server) pollOnce(ctx context.Context) {
 		s.log.Printf("list accounts: %v", err)
 		return
 	}
-	for i, a := range accts {
+
+	// While a network outage is in effect, poll only a single canary — the first
+	// account not gated by backoff. A network-failing canary keeps the outage;
+	// any non-network answer proves connectivity, flips recovery, and runs a full
+	// recovery sweep of the remaining accounts in this same invocation. Recovery-
+	// sweep samples are accounted too: if connectivity drops again mid-sweep the
+	// sweep abandons early and re-enters outage below.
+	spacing := s.pollSpacing
+	if spacing == 0 {
+		spacing = perAccountSpacing
+	}
+	recovery := false
+	var attempts, netFails, sampled int
+	for _, a := range accts {
+		if ctx.Err() != nil {
+			return
+		}
 		if !s.beginPoll(a.ID) {
 			continue
 		}
-		if s.pollAccount(ctx, sessions, i, a) {
-			return
+		if s.pollGated(a) {
+			s.endPoll(a.ID)
+			continue
+		}
+		// Space consecutive samples so N accounts don't burst the shared-IP
+		// bucket; the sweep's first sample goes immediately.
+		if sampled > 0 {
+			select {
+			case <-ctx.Done():
+				s.endPoll(a.ID)
+				return
+			case <-time.After(spacing):
+			}
+		}
+		canary := s.netOutage && !recovery
+		outcome := s.pollAccount(ctx, sessions, a, recovery || canary)
+		s.endPoll(a.ID)
+		sampled++
+
+		if canary {
+			if outcome == outcomeNetwork {
+				// Still down: one cheap failing request this short tick. Leave the
+				// snapshot stale (polling is broken) and wait for the next canary.
+				return
+			}
+			// Connectivity returned: leave outage mode and heal the whole fleet in
+			// this same sweep. The canary is already sampled; the loop continues
+			// through the remaining accounts under recovery semantics.
+			s.netOutage = false
+			s.log.Printf("network recovered; running a full recovery sweep of %d account(s)", len(accts))
+			recovery = true
+			continue
+		}
+
+		attempts++
+		if outcome == outcomeNetwork {
+			netFails++
+		}
+		// A recovery sweep failing network-class end to end means connectivity
+		// dropped again after the canary briefly reached the API: stop burning a
+		// sample timeout per remaining account and re-enter outage below.
+		if recovery && netFails == attempts && netFails >= recoveryAbandonThreshold {
+			break
 		}
 	}
 
-	// Deliberately skipped by the early returns above: generated_at means "time
-	// of the last completed poll" and must go stale when polling is broken.
+	// Enter (or re-enter) outage when every attempted account this sweep failed
+	// network-class: a normal sweep proves the outage, a recovery sweep proves
+	// connectivity dropped again after the canary reached the API. Either way the
+	// next tick is a cheap short-cadence canary probe.
+	if attempts > 0 && netFails == attempts {
+		s.netOutage = true
+		s.netProbeLogSkip = 0
+		if recovery {
+			s.log.Printf("network dropped again mid-recovery: all %d re-polled account(s) failed to reach the API; resuming short-tick canary polling", attempts)
+		} else {
+			s.log.Printf("network outage: all %d polled account(s) failed to reach the API; short-tick canary polling until it returns", attempts)
+		}
+	}
+
+	// Deliberately skipped while polling is broken (an outage or an early return
+	// above): generated_at means "time of the last completed poll" and must go
+	// stale when the fleet cannot be reached.
+	if s.netOutage {
+		return
+	}
 	if err := s.writeStatusSnapshot(ctx); err != nil {
 		s.log.Printf("status snapshot: %v", err)
 	}
 }
 
-// pollAccount polls one account under the claim taken by pollOnce, which it
-// releases.
-func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i int, a store.Account) (stop bool) {
-	defer s.endPoll(a.ID)
-
+// pollGated reports whether an account is currently backed off — a recent
+// rate-limit sample still inside its exponential backoff, or a needs-login /
+// exhausted-auth-streak account inside the needs-login interval — so pollOnce
+// skips it with no network attempt (and it never serves as the outage canary).
+// The needs-login backoff needs its own clock: a 401 inserts no usage sample,
+// so it can't ride the rate-limit backoff. Scheduler-goroutine-local — no lock.
+func (s *Server) pollGated(a store.Account) bool {
 	if last, ok, _ := s.m.Store.LatestUsageSample(a.ID); ok && last.RateLimited &&
 		time.Since(last.TS) < rlBackoff(s.rlStreak[a.ID]) {
-		return false
+		return true
 	}
-	// The needs-login backoff needs its own clock: a 401 inserts no usage
-	// sample, so it can't ride the rate-limit backoff above.
 	if health, _ := s.m.Store.GetAuthHealth(a.ID); health.NeedsLogin || s.authStreak[a.ID] >= needsLoginAfter {
 		if last, ok := s.lastAuthAttempt[a.ID]; ok && time.Since(last) < needsLoginPollInterval {
-			return false
-		}
-	}
-	if i > 0 {
-		select {
-		case <-ctx.Done():
 			return true
-		case <-time.After(perAccountSpacing):
 		}
 	}
+	return false
+}
+
+// pollAccount samples one account and reports the outcome for outage detection.
+// The caller holds the poll claim, has cleared the backoff gates (pollGated),
+// and owns inter-account spacing. recovery forces AllowBusyRefresh for a busy
+// account regardless of the auth streak — the post-outage heal — which stays
+// safe because fetchUsage's deep guard (post-401 + provably-expired +
+// credential-unchanged re-read) still prevents a refresh-token double-spend; the
+// streak gate is only a heuristic layer.
+func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a store.Account, recovery bool) sampleOutcome {
 	// Re-assert the overlay so long-lived setups pick up new top-level
 	// ~/.claude entries without an explicit sync.
 	if err := s.m.SyncOverlay(a); err != nil {
@@ -155,11 +291,13 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 	// self-refresh first. Accepted gap: a busy, clock-fresh, server-revoked
 	// token keeps 401ing (fetchUsage's busy guard requires expiry) so
 	// needs-login waits for clock expiry — the live session owns recovery;
-	// refreshing sooner could double-spend a refresh token it still needs.
+	// refreshing sooner could double-spend a refresh token it still needs. A
+	// recovery sweep bypasses the streak gate (fetchUsage's deep guard still
+	// holds) so a busy account whose token expired during the outage heals now.
 	busyBySession := procscan.CountByConfigDir(sessions, a.ConfigDir) > 0
 	opts := pool.SampleOpts{
 		AllowRefresh:     idle,
-		AllowBusyRefresh: busyBySession && s.authStreak[a.ID] >= 1,
+		AllowBusyRefresh: busyBySession && (recovery || s.authStreak[a.ID] >= 1),
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -172,12 +310,14 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 		s.rlStreak[a.ID] = 0
 	}
 	s.handleAuthOutcome(a, err)
-	return false
+	return classifyOutcome(err)
 }
 
-// Only a definitive ErrNeedsLogin flags needs-login: a plain 401 also
-// surfaces transient (5xx/network) refresh failures, so the streak only
-// throttles polling. Scheduler-goroutine-local — no lock.
+// handleAuthOutcome reacts to a sample's error. Only a definitive ErrNeedsLogin
+// flags needs-login: a plain 401 also surfaces transient (5xx) refresh failures,
+// so the streak only throttles polling. A network-class failure is an outage
+// signal, not an auth event — pollOnce's outage detector owns the reaction here,
+// so it touches no auth state. Scheduler-goroutine-local — no lock.
 func (s *Server) handleAuthOutcome(a store.Account, err error) {
 	if err == nil {
 		s.authStreak[a.ID] = 0
@@ -192,6 +332,13 @@ func (s *Server) handleAuthOutcome(a store.Account, err error) {
 		s.flagNeedsLogin(a, err)
 		return
 	}
+	if errors.Is(err, oauth.ErrNetwork) {
+		// An outage keeps today's non-behavior everywhere else: no authStreak
+		// bump, no needs-login flag, rlStreak untouched. Only the outage detector
+		// (via classifyOutcome) reacts.
+		s.logNetUnreachable(a, err)
+		return
+	}
 	var ue *oauth.UsageError
 	if errors.As(err, &ue) && ue.Unauthorized() {
 		s.authStreak[a.ID]++
@@ -200,6 +347,20 @@ func (s *Server) handleAuthOutcome(a store.Account, err error) {
 		return
 	}
 	s.log.Printf("acct-%02d sample: %v", a.ID, err)
+}
+
+// logNetUnreachable logs a probe's network-unreachable error. While an outage is
+// established (netOutage set) it throttles to one line per netProbeLogEvery
+// probes so a multi-hour canary loop doesn't spam ~3 lines/min; the surviving
+// lines still prove the canary is alive. Scheduler-goroutine-local — no lock.
+func (s *Server) logNetUnreachable(a store.Account, err error) {
+	if s.netOutage {
+		defer func() { s.netProbeLogSkip++ }()
+		if s.netProbeLogSkip%netProbeLogEvery != 0 {
+			return
+		}
+	}
+	s.log.Printf("acct-%02d sample: network unreachable: %v", a.ID, err)
 }
 
 // flagNeedsLogin stamps the attempt clock so the needs-login backoff engages.

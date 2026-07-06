@@ -7,10 +7,196 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestTransportErrClassification pins the source-of-truth classifier: a generic
+// transport error and a deadline are network-class; a deliberate cancellation is
+// not; the underlying cause is always preserved.
+func TestTransportErrClassification(t *testing.T) {
+	cases := []struct {
+		name        string
+		err         error
+		wantNetwork bool
+	}{
+		{"connection refused", errors.New("dial tcp 127.0.0.1:1: connect: connection refused"), true},
+		{"deadline exceeded", context.DeadlineExceeded, true},
+		{"deadline in url.Error", &url.Error{Op: "Get", URL: "http://x", Err: context.DeadlineExceeded}, true},
+		{"context canceled", context.Canceled, false},
+		{"canceled in url.Error", &url.Error{Op: "Get", URL: "http://x", Err: context.Canceled}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transportErr("oauth op", tc.err)
+			if errors.Is(got, ErrNetwork) != tc.wantNetwork {
+				t.Fatalf("Is(ErrNetwork) = %v, want %v (err=%v)", errors.Is(got, ErrNetwork), tc.wantNetwork, got)
+			}
+			if !errors.Is(got, tc.err) {
+				t.Fatalf("underlying cause not preserved in %v", got)
+			}
+		})
+	}
+}
+
+// TestUsageErrorClassification pins the wiring at the Usage call site: a 401/429
+// HTTP response is never network-class, a real transport failure is, and a
+// cancelled request is classed as the cancellation, not an outage.
+func TestUsageErrorClassification(t *testing.T) {
+	t.Run("401 is not network-class", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		}))
+		defer srv.Close()
+		c := New()
+		c.usageURL = srv.URL
+		_, err := c.Usage(context.Background(), "x")
+		var ue *UsageError
+		if !errors.As(err, &ue) || !ue.Unauthorized() {
+			t.Fatalf("want a 401 UsageError, got %v", err)
+		}
+		if errors.Is(err, ErrNetwork) {
+			t.Fatalf("a 401 must not classify as ErrNetwork: %v", err)
+		}
+	})
+
+	t.Run("429 is not network-class", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+		}))
+		defer srv.Close()
+		c := New()
+		c.usageURL = srv.URL
+		_, err := c.Usage(context.Background(), "x")
+		if errors.Is(err, ErrNetwork) {
+			t.Fatalf("a 429 must not classify as ErrNetwork: %v", err)
+		}
+	})
+
+	t.Run("transport failure is network-class", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		u := srv.URL
+		srv.Close() // no listener → connection refused
+		c := New()
+		c.usageURL = u
+		_, err := c.Usage(context.Background(), "x")
+		if !errors.Is(err, ErrNetwork) {
+			t.Fatalf("a transport failure must classify as ErrNetwork, got %v", err)
+		}
+	})
+
+	t.Run("cancelled request is not network-class", func(t *testing.T) {
+		block := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-block }))
+		defer srv.Close()
+		defer close(block)
+		c := New()
+		c.usageURL = srv.URL
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := c.Usage(ctx, "x")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("want context.Canceled, got %v", err)
+		}
+		if errors.Is(err, ErrNetwork) {
+			t.Fatalf("a cancelled request must not classify as ErrNetwork: %v", err)
+		}
+	})
+}
+
+// TestUsageBodyReadClassification pins the response-body read sites: a transport
+// failure mid-body (headers received, connection broken before the body
+// completes) is network-class, so a partial 200 never masquerades as a proven
+// API answer; a cancellation mid-body is not network-class.
+func TestUsageBodyReadClassification(t *testing.T) {
+	t.Run("mid-body transport failure is network-class", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("test server does not support hijack")
+				return
+			}
+			conn, buf, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			// Promise 4096 body bytes, send one, then break the connection so the
+			// client's body read fails only after a valid 200 status line.
+			_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n{")
+			_ = buf.Flush()
+			_ = conn.Close()
+		}))
+		defer srv.Close()
+		c := New()
+		c.usageURL = srv.URL
+		_, err := c.Usage(context.Background(), "x")
+		if !errors.Is(err, ErrNetwork) {
+			t.Fatalf("a mid-body transport failure must classify as ErrNetwork, got %v", err)
+		}
+	})
+
+	t.Run("cancelled body read is not network-class", func(t *testing.T) {
+		bodyStarted := make(chan struct{})
+		release := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", "4096")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			close(bodyStarted)
+			<-release // hang with the body unfinished
+		}))
+		defer srv.Close()
+		defer close(release)
+		c := New()
+		c.usageURL = srv.URL
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-bodyStarted
+			cancel()
+		}()
+		_, err := c.Usage(ctx, "x")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("want context.Canceled from a cancelled body read, got %v", err)
+		}
+		if errors.Is(err, ErrNetwork) {
+			t.Fatalf("a cancelled body read must not classify as ErrNetwork: %v", err)
+		}
+	})
+}
+
+// TestRefreshErrorClassification pins the same wiring at the Refresh call site.
+func TestRefreshErrorClassification(t *testing.T) {
+	t.Run("revoked 400 is not network-class", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+		}))
+		defer srv.Close()
+		c := New()
+		c.tokenURL = srv.URL
+		_, err := c.Refresh(context.Background(), "k", "rt")
+		if errors.Is(err, ErrNetwork) {
+			t.Fatalf("a 400 revoked refresh must not classify as ErrNetwork: %v", err)
+		}
+	})
+
+	t.Run("transport failure is network-class", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		u := srv.URL
+		srv.Close()
+		c := New()
+		c.tokenURL = u
+		_, err := c.Refresh(context.Background(), "k", "rt")
+		if !errors.Is(err, ErrNetwork) {
+			t.Fatalf("a transport failure must classify as ErrNetwork, got %v", err)
+		}
+	})
+}
 
 func TestRefreshRequestAndResponse(t *testing.T) {
 	var gotBody map[string]string

@@ -98,6 +98,10 @@ func (s *Server) healFuseRows(ctx context.Context) {
 			// recovery ladder here too — never through retryUnvouchedFuseRows, since
 			// FP is a third backend, not a fuse mount.
 			s.healFPRows(ctx)
+			// Symlink rows carrying crash-window wreckage (a leaked overlay bridge,
+			// stranded private files, or a leaked File Provider domain registration)
+			// converge here, promoting the startup-only reconcile onto the ticker.
+			s.healStrandedRows(ctx)
 			s.logContentHealth()
 		}
 	}
