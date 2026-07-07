@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"ops":[{"kind":"add_comment","body":"Fixed in 68974e2a (chore(lint)); prek/golangci green, shipped in v0.45.0"}]}
+{"v":1,"lamport":3,"ops":[{"kind":"set_criterion_status","id":"89983b4d867f4d170f7e8cfd2f9798bd","status":"met"}]}
