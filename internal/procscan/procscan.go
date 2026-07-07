@@ -74,22 +74,51 @@ var ccdPrefix = []byte("CLAUDE_CONFIG_DIR=")
 // wedged fuse-t mount can pin a process in uninterruptible D-state where a
 // KERN_PROCARGS2 copyin from its address space never returns and no ctx frees
 // the caller, so Scan runs the walk in a goroutine and returns on the deadline.
-// The buffered channel lets the abandoned goroutine finish without leaking;
 // DeadlineExceeded surfaces as an error callers treat as "no sessions discovered".
 func Scan(ctx context.Context) ([]Session, error) {
-	cctx, cancel := context.WithTimeout(ctx, scanTimeout)
-	defer cancel()
 	// Capture the seams before spawning: the goroutine may outlive Scan and race
 	// a test swapping them.
 	list, args := listProcs, procArgs
+	return runBounded(ctx, func(cctx context.Context) ([]Session, error) {
+		return scan(cctx, list, args)
+	})
+}
+
+// Proc is a live process's identity: pid and absolute start time. StartedAt
+// doubles as the PID-generation fingerprint kill-time reconfirms key on.
+type Proc struct {
+	PID       int
+	StartedAt time.Time
+}
+
+// ProcsByExecutable returns this user's live processes whose executable path
+// equals execPath. The match is against the exec(2) path the kernel captured
+// in KERN_PROCARGS2, so a process whose on-disk binary was since replaced or
+// unlinked still matches. An empty execPath matches nothing. The walk is
+// bounded like Scan's.
+func ProcsByExecutable(ctx context.Context, execPath string) ([]Proc, error) {
+	if execPath == "" {
+		return nil, nil
+	}
+	list, args := listProcs, procArgs
+	return runBounded(ctx, func(cctx context.Context) ([]Proc, error) {
+		return byExecutable(cctx, execPath, list, args)
+	})
+}
+
+// runBounded runs walk in its own goroutine and returns on scanTimeout; the
+// buffered channel lets the abandoned goroutine finish without leaking.
+func runBounded[T any](ctx context.Context, walk func(context.Context) ([]T, error)) ([]T, error) {
+	cctx, cancel := context.WithTimeout(ctx, scanTimeout)
+	defer cancel()
 	type result struct {
-		sessions []Session
-		err      error
+		items []T
+		err   error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		s, err := scan(cctx, list, args)
-		ch <- result{s, err}
+		items, err := walk(cctx)
+		ch <- result{items, err}
 	}()
 	select {
 	case <-cctx.Done():
@@ -98,7 +127,7 @@ func Scan(ctx context.Context) ([]Session, error) {
 		if r.err != nil {
 			return nil, fmt.Errorf("procscan: %w", r.err)
 		}
-		return r.sessions, nil
+		return r.items, nil
 	}
 }
 
@@ -128,6 +157,46 @@ func scan(ctx context.Context, list func(context.Context) ([]proc, error), args 
 		sessions = append(sessions, Session{PID: p.pid, ConfigDir: configDir, StartedAt: p.startedAt})
 	}
 	return sessions, nil
+}
+
+// byExecutable walks this user's processes keeping those whose exec path
+// equals execPath. Error semantics match scan: a failed list fails closed,
+// ESRCH/EINVAL skips that process, any other per-PID error fails the walk.
+func byExecutable(ctx context.Context, execPath string, list func(context.Context) ([]proc, error), args func(context.Context, int) ([]byte, error)) ([]Proc, error) {
+	procs, err := list(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list processes: %w", err)
+	}
+	var out []Proc
+	for _, p := range procs {
+		buf, err := args(ctx, p.pid)
+		if err != nil {
+			if errors.Is(err, unix.ESRCH) || errors.Is(err, unix.EINVAL) {
+				continue
+			}
+			return nil, fmt.Errorf("read args for pid %d: %w", p.pid, err)
+		}
+		if parseExecPath(buf) != execPath {
+			continue
+		}
+		out = append(out, Proc{PID: p.pid, StartedAt: p.startedAt})
+	}
+	return out, nil
+}
+
+// parseExecPath returns the executable path from a KERN_PROCARGS2 buffer — the
+// first NUL-terminated string after argc — or "" for a buffer too short to
+// hold one.
+func parseExecPath(buf []byte) string {
+	if len(buf) < 4 {
+		return ""
+	}
+	rest := buf[4:]
+	i := bytes.IndexByte(rest, 0)
+	if i < 0 {
+		return ""
+	}
+	return string(rest[:i])
 }
 
 // parseProcArgs extracts argv[0] and the CLAUDE_CONFIG_DIR value from a

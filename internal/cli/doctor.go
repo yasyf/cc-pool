@@ -101,6 +101,7 @@ func newDoctorCmd() *cobra.Command {
 				}
 				reportWedges(accts, holderMounts, sessions, report)
 				reportStaleSessions(accts, holderMounts, sessions, report)
+				reportStaleWidgetAppex(cmd.Context(), report)
 				reportOrphanedHolder(cmd.Context(), reachable, accts, report)
 
 				reportFileProvider(cmd.Context(), m, accts, fpConsentPending, report)
@@ -271,6 +272,26 @@ func reportStaleSessions(accts []store.Account, mounts []mountd.MountInfo, sessi
 						s.PID, at.Format("15:04:05")))
 			}
 		}
+	}
+}
+
+// staleWidgetAppexes is a seam over the shared detector so doctor tests feed
+// canned appexes without live processes.
+var staleWidgetAppexes = daemon.StaleWidgetAppexes
+
+// reportStaleWidgetAppex flags a Notification Center widget appex left running
+// a binary a cask upgrade replaced — its render is frozen until the process
+// dies. Advisory: the daemon reaps it on its next poll, and a failed scan
+// degrades silently like the other proc-scan checks.
+func reportStaleWidgetAppex(ctx context.Context, report func(string, bool, string)) {
+	stale, err := staleWidgetAppexes(ctx, pool.WidgetAppexBinaryPath())
+	if err != nil {
+		return
+	}
+	for _, p := range stale {
+		report("widget appex", false, fmt.Sprintf(
+			"pid %d (started %s) is running a widget binary an upgrade replaced; its render is frozen — the daemon kills it on its next poll, or now: kill -9 %d",
+			p.PID, p.StartedAt.Format("15:04:05"), p.PID))
 	}
 }
 

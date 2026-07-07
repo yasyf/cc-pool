@@ -126,6 +126,15 @@ func WidgetAppPath() string {
 	return "/Applications/CCPoolStatus.app"
 }
 
+// WidgetAppexBinaryPath is the Mach-O inside the Notification Center widget
+// appex in the CCPoolStatus bundle. The daemon and doctor match live
+// processes' exec paths against it to find an appex a cask upgrade left
+// running a replaced binary.
+func WidgetAppexBinaryPath() string {
+	return filepath.Join(WidgetAppPath(),
+		"Contents", "PlugIns", "CCPoolStatusWidget.appex", "Contents", "MacOS", "CCPoolStatusWidget")
+}
+
 // FPControlSocketPath is the File Provider control socket
 // (~/.cc-pool/domains.sock): the CCPoolStatus app binds it, the daemon dials
 // it to register/remove/signal domains.

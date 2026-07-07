@@ -121,6 +121,11 @@ func (s *Server) pollOnce(ctx context.Context) {
 		}
 	}
 
+	// A cask upgrade replaces the widget bundle but never recycles a live appex,
+	// leaving a frozen render. Reaped every poll, not just at startup: a formula
+	// upgrade can restart the daemon before the cask swap lands.
+	s.reconcileStaleWidget(ctx)
+
 	// Row hygiene only: StickyPick re-checks the activity rule on read (covers
 	// the daemonless path).
 	if _, err := s.m.Store.PruneSticky(time.Now().Add(-pool.StickyTTL)); err != nil {

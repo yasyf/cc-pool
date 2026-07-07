@@ -310,3 +310,89 @@ func TestScanBoundsWedgedProcArgs(t *testing.T) {
 		t.Fatal("Scan did not return within the bound — the timeout did not release the caller")
 	}
 }
+
+func TestParseExecPath(t *testing.T) {
+	cases := map[string]struct {
+		buf  []byte
+		want string
+	}{
+		"normal buffer": {
+			buf:  procargs2(1, "/Applications/A.app/Contents/MacOS/A", []string{"A"}, nil),
+			want: "/Applications/A.app/Contents/MacOS/A",
+		},
+		"too short for argc":         {buf: []byte{1, 0}, want: ""},
+		"exec path never terminates": {buf: append([]byte{1, 0, 0, 0}, []byte("/no/nul")...), want: ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := parseExecPath(tc.buf); got != tc.want {
+				t.Fatalf("parseExecPath = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProcsByExecutable(t *testing.T) {
+	start := time.Date(2026, 7, 4, 16, 18, 9, 0, time.UTC)
+	widget := "/Applications/CCPoolStatus.app/Contents/PlugIns/CCPoolStatusWidget.appex/Contents/MacOS/CCPoolStatusWidget"
+	procs := []proc{{pid: 100, startedAt: start}, {pid: 200, startedAt: start.Add(time.Hour)}}
+	args := map[int][]byte{
+		100: procargs2(1, widget, []string{"CCPoolStatusWidget"}, nil),
+		200: procargs2(1, "/opt/homebrew/bin/claude", []string{"claude"}, nil),
+	}
+	canScan(t, procs, args, nil)
+
+	got, err := ProcsByExecutable(context.Background(), widget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].PID != 100 || !got[0].StartedAt.Equal(start) {
+		t.Fatalf("got %+v, want only pid 100 @ %s", got, start)
+	}
+}
+
+// TestProcsByExecutableEmptyPath proves an empty path matches nothing — not
+// every process whose PROCARGS2 buffer fails to parse into an exec path.
+func TestProcsByExecutableEmptyPath(t *testing.T) {
+	canScan(t, []proc{{pid: 100}}, map[int][]byte{100: {1, 0}}, nil)
+
+	got, err := ProcsByExecutable(context.Background(), "")
+	if err != nil || len(got) != 0 {
+		t.Fatalf("got %+v, %v; want none, nil", got, err)
+	}
+}
+
+func TestProcsByExecutableSkipsGoneProcs(t *testing.T) {
+	widget := "/w"
+	procs := []proc{{pid: 100}, {pid: 200}, {pid: 300}}
+	args := map[int][]byte{100: procargs2(1, widget, []string{"w"}, nil)}
+	argErr := map[int]error{200: unix.ESRCH, 300: unix.EINVAL}
+	canScan(t, procs, args, argErr)
+
+	got, err := ProcsByExecutable(context.Background(), widget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].PID != 100 {
+		t.Fatalf("got %+v, want only pid 100", got)
+	}
+}
+
+func TestProcsByExecutableFailsClosed(t *testing.T) {
+	t.Run("list error", func(t *testing.T) {
+		origList := listProcs
+		t.Cleanup(func() { listProcs = origList })
+		listProcs = func(context.Context) ([]proc, error) { return nil, errors.New("sysctl exploded") }
+
+		if _, err := ProcsByExecutable(context.Background(), "/w"); err == nil {
+			t.Fatal("ProcsByExecutable must propagate a process-list failure (fail closed)")
+		}
+	})
+	t.Run("unexpected arg error", func(t *testing.T) {
+		canScan(t, []proc{{pid: 100}}, nil, map[int]error{100: unix.EPERM})
+
+		if _, err := ProcsByExecutable(context.Background(), "/w"); err == nil {
+			t.Fatal("an unexpected procargs error must fail the walk closed")
+		}
+	})
+}

@@ -27,9 +27,14 @@ import (
 
 // TestMain defaults the orphan reaper to a no-op for the whole package: no daemon
 // test may SIGKILL a real process. Tests asserting a reap swap in a recording stub
-// (swapReapOrphans).
+// (swapReapOrphans). For the same reason it points the widget appex binary at a
+// missing path — so pollOnce's reconcile short-circuits in StaleWidgetAppexes
+// before scanning a single real process — and no-ops the widget kill; widgetheal
+// tests swap in per-case stubs.
 func TestMain(m *testing.M) {
 	reapOrphanedServers = func([]string) []int { return nil }
+	widgetBinaryPath = func() string { return filepath.Join(os.TempDir(), "cc-pool-absent-widget-appex") }
+	killPID = func(int) error { return nil }
 	os.Exit(m.Run())
 }
 

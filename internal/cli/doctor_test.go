@@ -1254,3 +1254,38 @@ func TestReportOrphanedHolder(t *testing.T) {
 		})
 	}
 }
+
+func TestReportStaleWidgetAppex(t *testing.T) {
+	started := time.Date(2026, 7, 4, 16, 18, 9, 0, time.Local)
+	cases := map[string]struct {
+		appexes []daemon.WidgetAppex
+		err     error
+		want    int
+	}{
+		"stale appex reported": {appexes: []daemon.WidgetAppex{{PID: 4242, StartedAt: started}}, want: 1},
+		"none is silent":       {want: 0},
+		"scan error is silent": {err: errors.New("boom"), want: 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			orig := staleWidgetAppexes
+			t.Cleanup(func() { staleWidgetAppexes = orig })
+			staleWidgetAppexes = func(context.Context, string) ([]daemon.WidgetAppex, error) { return tc.appexes, tc.err }
+			report, calls := captureReports()
+
+			reportStaleWidgetAppex(context.Background(), report)
+
+			if len(*calls) != tc.want {
+				t.Fatalf("got %d report(s) %+v, want %d", len(*calls), *calls, tc.want)
+			}
+			if tc.want == 0 {
+				return
+			}
+			c := (*calls)[0]
+			if c.label != "widget appex" || c.healthy ||
+				!strings.Contains(c.detail, "pid 4242") || !strings.Contains(c.detail, "kill -9 4242") {
+				t.Fatalf("report = %+v, want unhealthy widget appex naming pid 4242 and its kill command", c)
+			}
+		})
+	}
+}
