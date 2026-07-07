@@ -20,7 +20,7 @@ import (
 func widgetBinary(t *testing.T) (string, time.Time) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "CCPoolStatusWidget")
-	if err := os.WriteFile(path, []byte("mach-o"), 0o755); err != nil {
+	if err := os.WriteFile(path, []byte("mach-o"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(path)
