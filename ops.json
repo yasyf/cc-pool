@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"ops":[{"kind":"add_comment","body":"Already fixed pre-v0.45.0: ensureWidgetInstalled checks widgetAppInstalled() before the brew gate (pinned by TestEnsureWidgetInstalledSkipsWhenPresent); v0.45.0 fp onboard --post-install exercises the same helper"}]}
+{"v":1,"lamport":3,"ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"8d018a70c667944f2d9d0421161e83329ccf3fe6"}]}
