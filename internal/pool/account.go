@@ -180,9 +180,9 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 	}, nil
 }
 
-// FinalizeAdd, called after the interactive login, confirms the credential
-// landed, re-asserts ACL ownership, validates with one usage call, and records
-// the account. label is an optional human note.
+// FinalizeAdd confirms the credential landed after the interactive login,
+// re-asserts ACL ownership, validates with one usage call, and records the
+// account. label is an optional human note.
 func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) (*store.Account, error) {
 	// A completed `claude /login` writes the account's own oauthAccount identity; a
 	// copied credential writes none. Missing identity means login never completed —

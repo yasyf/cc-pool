@@ -82,7 +82,7 @@ func readProbeFile(path string) error {
 		case errors.Is(verdict, fusekit.ErrProbeMissing):
 			return fmt.Errorf("%w: %s", ErrProbeMissing, path)
 		case errors.Is(verdict, fusekit.ErrProbeDenied):
-			return fmt.Errorf("%w: %s: mount denied the probe (dead-holder orphan): %v", ErrProbeWedged, path, err)
+			return fmt.Errorf("%w: %s: mount denied the probe (dead-holder orphan): %w", ErrProbeWedged, path, err)
 		}
 		return fmt.Errorf("deep probe open %s: %w", path, err)
 	}

@@ -41,7 +41,7 @@ var (
 	fpDomainProbeAt = func(dir string) error {
 		prov, err := fpOverlayProvider(fkoverlay.BackendFileProvider)
 		if err != nil {
-			return fmt.Errorf("%w: resolve file provider: %v", overlay.ErrFPProbeNoVerdict, err)
+			return fmt.Errorf("%w: resolve file provider: %w", overlay.ErrFPProbeNoVerdict, err)
 		}
 		prober, ok := prov.(overlay.FPDomainProber)
 		if !ok {
@@ -77,7 +77,7 @@ var (
 			case errors.Is(err, os.ErrNotExist):
 				return fmt.Errorf("%w: %s", overlay.ErrFPProbeMissing, path)
 			default:
-				return fmt.Errorf("%w: raw read of %s: %v", overlay.ErrFPProbeWedged, path, err)
+				return fmt.Errorf("%w: raw read of %s: %w", overlay.ErrFPProbeWedged, path, err)
 			}
 		case <-time.After(fpRawProbeTimeout):
 			return fmt.Errorf("%w: raw read of %s did not answer within %s", overlay.ErrFPProbeWedged, path, fpRawProbeTimeout)

@@ -86,13 +86,13 @@ func FPDomainProbe(ctx context.Context, prober FPDomainProber, accountDir string
 	if err != nil {
 		switch {
 		case errors.Is(err, fileproviderd.ErrDomainNotServing):
-			return fmt.Errorf("%w: %v", ErrFPProbeWedged, err)
+			return fmt.Errorf("%w: %w", ErrFPProbeWedged, err)
 		case errors.Is(err, fileproviderd.ErrNoDomain):
-			return fmt.Errorf("%w: %v", ErrFPProbeMissing, err)
+			return fmt.Errorf("%w: %w", ErrFPProbeMissing, err)
 		default:
 			// Busy, app-unavailable, op-unsupported, or any unrecognized class: no
 			// data-plane conclusion — never strike, never clear.
-			return fmt.Errorf("%w: %v", ErrFPProbeNoVerdict, err)
+			return fmt.Errorf("%w: %w", ErrFPProbeNoVerdict, err)
 		}
 	}
 	switch {

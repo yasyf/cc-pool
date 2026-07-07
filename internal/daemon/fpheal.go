@@ -30,7 +30,7 @@ const fpControlProbeTimeout = 3 * time.Second
 var fpDomainProbe = func(ctx context.Context, dir string) error {
 	prov, err := pool.OverlayProviderFor(fkoverlay.BackendFileProvider)
 	if err != nil {
-		return fmt.Errorf("%w: resolve file provider: %v", overlay.ErrFPProbeNoVerdict, err)
+		return fmt.Errorf("%w: resolve file provider: %w", overlay.ErrFPProbeNoVerdict, err)
 	}
 	prober, ok := prov.(overlay.FPDomainProber)
 	if !ok {

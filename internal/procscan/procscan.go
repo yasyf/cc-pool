@@ -131,7 +131,7 @@ func scan(ctx context.Context, list func(context.Context) ([]proc, error), args 
 }
 
 // parseProcArgs extracts argv[0] and the CLAUDE_CONFIG_DIR value from a
-// KERN_PROCARGS2 buffer. Layout: int32 argc; the NUL-terminated executable path;
+// KERN_PROCARGS2 buffer. Layout: uint32 argc; the NUL-terminated executable path;
 // NUL alignment padding; argc NUL-terminated argv strings; then NUL-terminated
 // environment strings ended by an empty string. A buffer too short to hold argc
 // or the executable path yields an empty argv0, so its process is treated as
@@ -140,7 +140,10 @@ func parseProcArgs(buf []byte) (argv0, configDir string) {
 	if len(buf) < 4 {
 		return "", ""
 	}
-	argc := int32(binary.NativeEndian.Uint32(buf[:4]))
+	// argc is a non-negative count, decoded and iterated as uint32 (the kernel's
+	// C int is never negative); the argv loop below is bounded by the buffer's
+	// actual NUL runs, so a corrupt argc self-limits.
+	argc := binary.NativeEndian.Uint32(buf[:4])
 	rest := buf[4:]
 	// Skip the executable path.
 	i := bytes.IndexByte(rest, 0)
@@ -153,7 +156,7 @@ func parseProcArgs(buf []byte) (argv0, configDir string) {
 		rest = rest[1:]
 	}
 	// argv: argc NUL-terminated strings.
-	for n := int32(0); n < argc; n++ {
+	for n := uint32(0); n < argc; n++ {
 		j := bytes.IndexByte(rest, 0)
 		if j < 0 {
 			break // truncated argv

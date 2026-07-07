@@ -524,7 +524,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 						return Response{OK: false, Error: fmt.Sprintf("acct-%02d's dir is unexpectedly a mountpoint (wedged unmount?); see `ccp doctor` and the daemon log", sn.Account.ID)}
 					}
 				}
-				if !s.probeWinnerReady(sn.Account) {
+				if !s.probeWinnerReady(ctx, sn.Account) {
 					return Response{OK: false, Error: fmt.Sprintf("acct-%02d's overlay is wedged; the daemon is recovering it — retry shortly", sn.Account.ID)}
 				}
 				if !s.tryReserve(sn.Account.ID) {
@@ -604,7 +604,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	best := bySnap[r.AccountID]
 	// Deep-probe the winner before handing it to a session — a wedge refuses
 	// and the client retries onto a healthy account.
-	if !s.probeWinnerReady(best.Account) {
+	if !s.probeWinnerReady(ctx, best.Account) {
 		return Response{OK: false, Error: fmt.Sprintf("acct-%02d's overlay is wedged; the daemon is recovering it — retry shortly", best.Account.ID)}
 	}
 	if !req.NoMark {
@@ -897,9 +897,9 @@ func (s *Server) fpWedged(dir string) bool {
 // it never remounts inline — the heal loop owns the remount. Non-fuse, healthy,
 // and pre-probe (ErrProbeMissing) mirrors read ready. One wedge is enough (no
 // debounce): a NEW session has no live session a false positive could orphan.
-func (s *Server) probeWinnerReady(a store.Account) bool {
+func (s *Server) probeWinnerReady(ctx context.Context, a store.Account) bool {
 	if fpBackedRow(a.OverlayKind) {
-		return s.probeFPWinnerReady(a)
+		return s.probeFPWinnerReady(ctx, a)
 	}
 	if !fuseBackedRow(a.OverlayKind) {
 		return true
@@ -927,16 +927,16 @@ func (s *Server) probeWinnerReady(a store.Account) bool {
 // WITHOUT force-wedging: a companion-app restart must never fleet-wedge selects. nil
 // fp state (bare test servers) reads ready. Bounded to 3s so a slow probe never
 // stalls the pick.
-func (s *Server) probeFPWinnerReady(a store.Account) bool {
+func (s *Server) probeFPWinnerReady(ctx context.Context, a store.Account) bool {
 	if s.fp == nil {
 		return true
 	}
 	if s.fp.wedged(a.ConfigDir) {
 		return false // already known wedged (mountReady also excludes it)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), fpControlProbeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, fpControlProbeTimeout)
 	defer cancel()
-	err := fpDomainProbe(ctx, a.ConfigDir)
+	err := fpDomainProbe(probeCtx, a.ConfigDir)
 	switch {
 	case err == nil, errors.Is(err, overlay.ErrFPProbeMissing):
 		return true

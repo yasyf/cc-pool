@@ -1437,8 +1437,8 @@ func (f *fakeFP) Setup(_, dir string) error {
 	// Model a materialized domain: the bridge serves the backing .claude.json at
 	// the domain root, so ProbeDomain (the control-op verdict) reports real
 	// content instead of a false miss.
-	if b, err := os.ReadFile(filepath.Join(priv, ".claude.json")); err == nil {
-		if err := os.WriteFile(filepath.Join(root, ".claude.json"), b, 0o600); err != nil {
+	if b, err := os.ReadFile(filepath.Join(priv, ".claude.json")); err == nil { //nolint:gosec // G304: priv is a test-owned temp dir, not user input.
+		if err := os.WriteFile(filepath.Join(root, ".claude.json"), b, 0o600); err != nil { //nolint:gosec // G703: root is a test-owned temp dir, not user input.
 			return err
 		}
 	}

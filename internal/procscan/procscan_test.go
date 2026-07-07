@@ -10,13 +10,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// procargs2 builds a KERN_PROCARGS2 buffer: int32 argc, the NUL-terminated
+// procargs2 builds a KERN_PROCARGS2 buffer: uint32 argc, the NUL-terminated
 // executable path, alignment padding, argc NUL-terminated argv strings, then
 // NUL-terminated env strings ended by an empty string — the exact shape the
 // kernel hands back and parseProcArgs decodes.
-func procargs2(argc int32, execPath string, argv, env []string) []byte {
+func procargs2(argc uint32, execPath string, argv, env []string) []byte {
 	b := make([]byte, 4)
-	binary.NativeEndian.PutUint32(b, uint32(argc))
+	binary.NativeEndian.PutUint32(b, argc)
 	b = append(b, execPath...)
 	b = append(b, 0)
 	b = append(b, 0, 0) // alignment padding

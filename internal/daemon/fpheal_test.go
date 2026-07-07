@@ -335,7 +335,7 @@ func TestProbeFPWinnerForceWedges(t *testing.T) {
 	s, a, dirs, _ := newFPHealServer(t)
 
 	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeWedged })
-	if s.probeWinnerReady(a) {
+	if s.probeWinnerReady(t.Context(), a) {
 		t.Fatal("probeWinnerReady must refuse a domain whose live probe hangs")
 	}
 	if !s.fp.wedged(dirs[1]) {
@@ -344,7 +344,7 @@ func TestProbeFPWinnerForceWedges(t *testing.T) {
 
 	s.fp.reset(dirs[1])
 	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return nil })
-	if !s.probeWinnerReady(a) {
+	if !s.probeWinnerReady(t.Context(), a) {
 		t.Fatal("probeWinnerReady must accept a domain whose live probe succeeds")
 	}
 	if s.fp.wedged(dirs[1]) {
@@ -360,7 +360,7 @@ func TestProbeFPWinnerNoVerdictStaysReady(t *testing.T) {
 	s, a, dirs, _ := newFPHealServer(t)
 
 	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeNoVerdict })
-	if !s.probeWinnerReady(a) {
+	if !s.probeWinnerReady(t.Context(), a) {
 		t.Fatal("a NoVerdict select-time probe must read ready (never fleet-wedge a select)")
 	}
 	if s.fp.wedged(dirs[1]) {

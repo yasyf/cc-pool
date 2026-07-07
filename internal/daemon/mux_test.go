@@ -124,7 +124,7 @@ func TestReconcileMigratesLegacyFuseRowToBridge(t *testing.T) {
 	if !pool.IsBridgeSymlink(dir) {
 		t.Fatal("migration did not lay the bridge symlink")
 	}
-	if got, err := os.ReadFile(filepath.Join(base, "history.jsonl")); err != nil || string(got) != "orphan" {
+	if got, err := os.ReadFile(filepath.Join(base, "history.jsonl")); err != nil || string(got) != "orphan" { //nolint:gosec // G304: base is a test-owned temp dir, not user input.
 		t.Fatalf("shared orphan not swept to base: %q err=%v", got, err)
 	}
 	if got, err := os.ReadFile(filepath.Join(priv, ".claude.json")); err != nil || string(got) != "identity" { //nolint:gosec // G304: priv is under the test's temp home
@@ -181,7 +181,7 @@ func TestReconcileMigrationRefusesUnmovableContent(t *testing.T) {
 	if fake.setupCount() != 0 {
 		t.Fatal("Setup ran despite a failed drain")
 	}
-	if got, err := os.ReadFile(filepath.Join(dir, "clash")); err != nil || string(got) != "acct-data" {
+	if got, err := os.ReadFile(filepath.Join(dir, "clash")); err != nil || string(got) != "acct-data" { //nolint:gosec // G304: dir is a test-owned temp dir, not user input.
 		t.Fatalf("unmovable content clobbered: %q err=%v", got, err)
 	}
 	if got := kindOf(t, s, 1); got != "nfs" {

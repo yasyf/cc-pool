@@ -116,7 +116,7 @@ func TestKeychainItemRead(t *testing.T) {
 				if got.ClaudeAiOauth.AccessToken != tc.seedToken {
 					t.Fatalf("Read token = %q, want %q", got.ClaudeAiOauth.AccessToken, tc.seedToken)
 				}
-				log, lerr := os.ReadFile(filepath.Join(storeDir, "calls.log"))
+				log, lerr := os.ReadFile(filepath.Join(storeDir, "calls.log")) //nolint:gosec // G304: storeDir is a test-owned temp dir, not user input.
 				if lerr != nil {
 					t.Fatal(lerr)
 				}
@@ -148,7 +148,7 @@ func TestKeychainItemReassert(t *testing.T) {
 	if got.ClaudeAiOauth.AccessToken != "at-1" || got.ClaudeAiOauth.RefreshToken != "rt-1" {
 		t.Fatalf("Reassert returned wrong credential: %+v", got.ClaudeAiOauth)
 	}
-	log, err := os.ReadFile(filepath.Join(storeDir, "calls.log"))
+	log, err := os.ReadFile(filepath.Join(storeDir, "calls.log")) //nolint:gosec // G304: storeDir is a test-owned temp dir, not user input.
 	if err != nil {
 		t.Fatal(err)
 	}

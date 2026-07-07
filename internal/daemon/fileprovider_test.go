@@ -268,10 +268,10 @@ func TestStartFPBridgeFlagsConsentPending(t *testing.T) {
 	}
 	// No write bit: MkdirAll of the container subdir fails with EACCES, the
 	// permission signature the consent signal keys on.
-	if err := os.Chmod(groupContainers, 0o500); err != nil {
+	if err := os.Chmod(groupContainers, 0o500); err != nil { //nolint:gosec // G302: a directory needs its execute bit; 0o500 deliberately drops only write to inject EACCES.
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(groupContainers, 0o700) })
+	t.Cleanup(func() { _ = os.Chmod(groupContainers, 0o700) }) //nolint:gosec // G302: restoring directory rwx perms in test cleanup.
 	s := &Server{
 		log:             log.New(io.Discard, "", 0),
 		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
@@ -296,7 +296,7 @@ func TestStartFPBridgeFlagsConsentPending(t *testing.T) {
 
 	// "Consent" lands: write is restored, the serve loop's next retry creates
 	// the container and binds, and the watchdog clears the flag.
-	if err := os.Chmod(groupContainers, 0o700); err != nil {
+	if err := os.Chmod(groupContainers, 0o700); err != nil { //nolint:gosec // G302: a directory needs rwx for the owner to create the container subdir.
 		t.Fatal(err)
 	}
 	waitFor(t, 2*time.Second, "the retry to bind once the container is creatable", content.NewBridgeClient(sock).Available)
