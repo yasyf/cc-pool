@@ -39,6 +39,13 @@ jobs:
           notary-issuer-id: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
 
       - name: Build universal binary (pure Go, arm64 + amd64 via lipo)
+        env:
+          # Sign under a stable, dotted identifier (not the undotted "cc-pool"
+          # default). tccd keys the Network Volumes deep-probe grant and the
+          # macOS-15 app-group-container consent to the signing identifier, so a
+          # dotted identifier survives upgrades instead of re-prompting at every
+          # new versioned Cellar path.
+          MACOS_CODESIGN_IDENTIFIER: com.yasyf.cc-pool
         run: |
           VERSION="${GITHUB_REF_NAME}"
           COMMIT="$(git rev-parse --short HEAD)"

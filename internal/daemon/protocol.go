@@ -20,14 +20,22 @@ const ProtocolVersion = 1
 type Op string
 
 const (
-	OpSelect   Op = "select"   // pick the best account; optionally mark a checkout
-	OpStatus   Op = "status"   // return scored status for all accounts
-	OpCheckin  Op = "checkin"  // release a checkout and adopt a rotated token
-	OpHealth   Op = "health"   // liveness + version probe
-	OpShutdown Op = "shutdown" // step down gracefully and release the socket
-	OpMigrate  Op = "migrate"  // convert accounts between overlay providers
-	OpCredMove Op = "credmove" // move account credentials between backends
-	OpFPRepair Op = "fprepair" // re-register wedged File Provider domains
+	// OpSelect picks the best account; optionally marks a checkout.
+	OpSelect Op = "select"
+	// OpStatus returns scored status for all accounts.
+	OpStatus Op = "status"
+	// OpCheckin releases a checkout and adopts a rotated token.
+	OpCheckin Op = "checkin"
+	// OpHealth is the liveness + version probe.
+	OpHealth Op = "health"
+	// OpShutdown steps down gracefully and releases the socket.
+	OpShutdown Op = "shutdown"
+	// OpMigrate converts accounts between overlay providers.
+	OpMigrate Op = "migrate"
+	// OpCredMove moves account credentials between backends.
+	OpCredMove Op = "credmove"
+	// OpFPRepair re-registers wedged File Provider domains.
+	OpFPRepair Op = "fprepair"
 )
 
 // Request is one client request (one JSON object per line).
@@ -61,10 +69,14 @@ type Request struct {
 type MigrationOutcome string
 
 const (
-	MigrationDone    MigrationOutcome = "done"    // converted
-	MigrationAlready MigrationOutcome = "already" // was already the target kind
-	MigrationBusy    MigrationOutcome = "busy"    // live session or reservation; re-run later
-	MigrationFailed  MigrationOutcome = "failed"  // conversion errored (detail says why)
+	// MigrationDone means the account converted.
+	MigrationDone MigrationOutcome = "done"
+	// MigrationAlready means the account was already the target kind.
+	MigrationAlready MigrationOutcome = "already"
+	// MigrationBusy means a live session or reservation blocked it; re-run later.
+	MigrationBusy MigrationOutcome = "busy"
+	// MigrationFailed means the conversion errored (detail says why).
+	MigrationFailed MigrationOutcome = "failed"
 )
 
 // MigrationResult is one account's outcome in a migrate or credmove response.
@@ -84,10 +96,14 @@ type MigrationResult struct {
 type FPRepairOutcome string
 
 const (
-	FPRepairRepaired  FPRepairOutcome = "repaired"  // re-registered; the next probe verifies it
-	FPRepairRetreated FPRepairOutcome = "retreated" // File Provider cannot serve here; fell back to symlink
-	FPRepairBusy      FPRepairOutcome = "busy"      // held by a pending select; retry
-	FPRepairFailed    FPRepairOutcome = "failed"    // re-register errored (detail says why)
+	// FPRepairRepaired means the domain re-registered; the next probe verifies it.
+	FPRepairRepaired FPRepairOutcome = "repaired"
+	// FPRepairRetreated means File Provider cannot serve here; the account fell back to symlink.
+	FPRepairRetreated FPRepairOutcome = "retreated"
+	// FPRepairBusy means the domain is held by a pending select; retry.
+	FPRepairBusy FPRepairOutcome = "busy"
+	// FPRepairFailed means the re-register errored (detail says why).
+	FPRepairFailed FPRepairOutcome = "failed"
 )
 
 // FPRepairResult is one account's `ccp fp repair` outcome.
@@ -294,9 +310,11 @@ type Response struct {
 	ContentHealth string `json:"content_health,omitempty"`
 	// FPConsentPending: the daemon's File Provider bridge bind has not
 	// completed while the daemon is alive — the signature of the app-group-
-	// container TCC consent (cdhash-keyed, so macOS re-prompts after every
-	// upgrade, and launchd never surfaces the prompt). Approve it, then
-	// restart the daemon. Additive; status only.
+	// container TCC consent (keyed on the binary's code-signing identity: the
+	// release build's stable dotted identifier makes it one-time, and only
+	// identity churn — e.g. an unsigned dev build — re-prompts; launchd never
+	// surfaces the prompt). Approve it, then restart the daemon. Additive;
+	// status only.
 	FPConsentPending bool `json:"fp_consent_pending,omitempty"`
 	// FPWedged lists File Provider domains the daemon's data-plane probe found
 	// wedged (control ops answer, reads hang). Additive; status only.

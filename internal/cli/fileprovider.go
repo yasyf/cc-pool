@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -22,54 +21,47 @@ import (
 	"github.com/yasyf/fusekit/version"
 )
 
-// fpElection is the three-way pluginkit reading of the File Provider
-// extension: not registered, registered-but-unelected, or elected.
-type fpElection int
+// tryEnableFP is fusekit's headless File Provider election (`pluginkit -e use`
+// plus an enablement re-check), bound to a var so onboarding tests script it
+// without a real extension. A nil error means the extension is now elected and
+// enabled; ErrFileProviderElectionIneffective means the election command
+// succeeded yet macOS still holds the extension disabled — the System
+// Settings-managed case whose only lever is the File Providers toggle. Any other
+// error is a real pluginkit failure.
+var tryEnableFP = fkoverlay.TryEnableFileProvider
 
-const (
-	fpNotRegistered fpElection = iota // pluginkit has never seen the appex
-	fpNotElected                      // registered but not elected ('-', '?', '!')
-	fpElected                         // '+': fpAvailable's true
+// fpElectSettleBudget and fpElectSettleInterval bound settleFPElection's retry
+// window. On a fresh install pluginkit registers the just-launched appex
+// asynchronously, so the first `pluginkit -e use` can fail — or the enablement
+// re-check can read still-disabled — purely because registration hasn't landed
+// yet. Vars so tests shrink them; the wait is always bounded, never a spin.
+var (
+	fpElectSettleBudget   = 15 * time.Second
+	fpElectSettleInterval = 500 * time.Millisecond
 )
 
-// classifyFPElection parses `pluginkit -m -i <id>` output (one line per copy).
-// Any elected copy counts — a stale duplicate in the Trash must not mask a live election.
-func classifyFPElection(out string) fpElection {
-	trimmed := strings.TrimSpace(out)
-	if trimmed == "" {
-		return fpNotRegistered
-	}
-	for _, line := range strings.Split(trimmed, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "+") {
-			return fpElected
+// settleFPElection retries the headless election until it succeeds or the
+// settle budget closes, absorbing the post-launch pluginkit registration race.
+// It returns nil on the first success, ctx's error on cancellation, or the LAST
+// election error once the budget is spent — callers classify that final error
+// (ErrFileProviderElectionIneffective → Settings guidance, anything else →
+// loud), exactly as they would a single attempt's.
+func settleFPElection(ctx context.Context) error {
+	deadline := time.Now().Add(fpElectSettleBudget)
+	for {
+		err := tryEnableFP(pool.FPExtensionBundleID)
+		if err == nil {
+			return nil
+		}
+		if time.Now().Add(fpElectSettleInterval).After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(fpElectSettleInterval):
 		}
 	}
-	return fpNotElected
-}
-
-// fpElectionState is the pluginkit seam behind the onboarding trichotomy:
-// exit 1 with no stderr is a clean "not registered"; stderr means a real failure.
-var fpElectionState = func(ctx context.Context) (fpElection, error) {
-	out, err := exec.CommandContext(ctx, "pluginkit", "-m", "-i", pool.FPExtensionBundleID).Output()
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && len(bytes.TrimSpace(exitErr.Stderr)) == 0 {
-		return fpNotRegistered, nil
-	}
-	if err != nil {
-		return fpNotRegistered, fmt.Errorf("pluginkit -m -i %s: %w", pool.FPExtensionBundleID, err)
-	}
-	return classifyFPElection(string(out)), nil
-}
-
-// fpElect elects the appex headlessly (`pluginkit -e use`). It cannot clear a
-// user-disabled election — only the Settings toggle can — so callers treat a
-// still-unelected reading afterwards as "send the user to Settings".
-var fpElect = func(ctx context.Context) error {
-	out, err := exec.CommandContext(ctx, "pluginkit", "-e", "use", "-i", pool.FPExtensionBundleID).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("pluginkit -e use -i %s: %w (%s)", pool.FPExtensionBundleID, err, strings.TrimSpace(string(out)))
-	}
-	return nil
 }
 
 // fpOpenSettings deep-links the System Settings File Providers pane — a seam
@@ -111,7 +103,7 @@ var widgetAppInstalled = func() bool {
 }
 
 const (
-	// fpOnboardPollInterval paces the election wait and the health-rung polls.
+	// fpOnboardPollInterval paces the capability wait and the health-rung polls.
 	fpOnboardPollInterval = 500 * time.Millisecond
 	// fpRungAttempts bounds each health-rung poll: the app just launched and the
 	// daemon binds with retry, so a healthy stack answers within seconds — a
@@ -318,24 +310,37 @@ func fpRepairTargets(accts []store.Account, account int) ([]store.Account, error
 
 func newFPOnboardCmd() *cobra.Command {
 	pane := fkoverlay.BackendFileProvider.Enablement().Pane
-	return &cobra.Command{
+	var postInstall bool
+	cmd := &cobra.Command{
 		Use:   "onboard",
 		Short: "Install, enable, and adopt the File Provider overlay end to end",
 		Long: `onboard walks the File Provider overlay from zero to serving: it installs
 the CCPoolStatus app — the extension's host — if it is missing (an existing
 install is left as-is; the version check flags a stale one), launches it,
-elects the extension with pluginkit, then probes whether it can actually serve.
-Election is registration, not consent, so if macOS still holds the extension
-disabled it opens System Settings ▸ ` + pane + `
+elects the extension headlessly (` + "`pluginkit -e use`" + `), then probes whether it
+can actually serve. Election is registration, not consent, so if macOS still
+holds the extension disabled it opens System Settings ▸ ` + pane + `
 (the one toggle no CLI can flip) and waits until the probe passes. Once serving
 it verifies the rest of the ladder — control socket → daemon bridge socket —
 naming the exact fix for whichever rung is stuck, then offers to migrate
 your accounts onto File Provider.
 
-Idempotent: steps already satisfied are skipped.`,
+Idempotent: steps already satisfied are skipped.
+
+--post-install is the non-interactive mode the Homebrew formula's post_install
+runs: it installs the host app (if brew is available) and elects the extension,
+then stops — no daemon, no domains, no prompts, and never a nonzero exit. A
+later ` + "`ccp init`" + ` picks File Provider up.`,
 		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error { return runFPOnboard(cmd) },
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if postInstall {
+				return runFPPostInstall(cmd)
+			}
+			return runFPOnboard(cmd)
+		},
 	}
+	cmd.Flags().BoolVar(&postInstall, "post-install", false, "non-interactive brew post_install mode: install the host app and elect the extension, then stop (no daemon, no domains, no prompts, always exit 0)")
+	return cmd
 }
 
 func runFPOnboard(cmd *cobra.Command) error {
@@ -351,7 +356,7 @@ func runFPOnboard(cmd *cobra.Command) error {
 	// Election first (the extension must be registered + elected), then the
 	// data-plane capability probe — election is registration, NOT consent, so it
 	// must never be reported as "enabled".
-	if err := awaitFPElection(cmd.Context(), out, fpOnboardPollInterval); err != nil {
+	if err := electFPForOnboard(cmd.Context(), out); err != nil {
 		return err
 	}
 	if err := awaitFPCapability(cmd.Context(), out, fpOnboardPollInterval); err != nil {
@@ -364,6 +369,80 @@ func runFPOnboard(cmd *cobra.Command) error {
 	success(out, "File Provider stack healthy.")
 
 	return offerFPMigration(cmd)
+}
+
+// electFPForOnboard drives the headless election for interactive onboarding
+// through the bounded settle wait (the just-launched appex may not be
+// pluginkit-registered yet), then classifies the outcome. Success says so
+// briefly and returns nil so onboard proceeds to the truthful consent gate
+// (awaitFPCapability). When macOS holds election behind the System Settings
+// File Providers pane (ErrFileProviderElectionIneffective) it prints the loud
+// manual-toggle guidance and opens the pane — the ONLY fallback — then returns
+// nil: awaitFPCapability polls until the toggle actually grants the extension.
+// Any other election failure fails onboard loudly.
+func electFPForOnboard(ctx context.Context, out io.Writer) error {
+	switch err := settleFPElection(ctx); {
+	case err == nil:
+		success(out, "File Provider extension enabled; verifying it serves…")
+		return nil
+	case errors.Is(err, fkoverlay.ErrFileProviderElectionIneffective):
+		en := fkoverlay.BackendFileProvider.Enablement()
+		step(out, "macOS is holding the extension disabled; only the Settings toggle can enable it.")
+		step(out, "Flip CCPoolStatus ON under System Settings ▸ %s.", en.Pane)
+		if serr := fpOpenSettings(ctx); serr != nil {
+			warn(out, "couldn't open System Settings (%v) — navigate there yourself", serr)
+		}
+		return nil
+	default:
+		return fmt.Errorf("enable file provider extension: %w", err)
+	}
+}
+
+// runFPPostInstall is the non-interactive `--post-install` mode the Homebrew
+// formula's post_install runs. It is idempotent, fast, and NEVER returns an error
+// (a post_install must not fail the formula): every branch prints what to do and
+// exits 0. It (a) no-ops when the extension is already enabled; (b) installs the
+// host app when it is missing and brew is available, else prints the manual
+// command; (c) elects the appex headlessly; then STOPS — no app launch, no
+// daemon, no domains, no prompts. A later `ccp init` picks File Provider up.
+func runFPPostInstall(cmd *cobra.Command) error {
+	out := cmd.OutOrStdout()
+
+	// (a) Already enabled — the extension serves, so there is nothing to install or
+	// elect. This is the common brew-upgrade / re-run path; exit fast.
+	if fpAvailable(pool.OverlaySpec()) {
+		note(out, "File Provider extension already enabled; nothing to do.")
+		return nil
+	}
+
+	// (b) Ensure the host app (the extension's bundle) is present. An already-present
+	// app skips brew entirely (durable task 2805fc4); missing-and-no-brew prints the
+	// manual install command and still exits 0.
+	if !widgetAppInstalled() {
+		if _, err := exec.LookPath("brew"); err != nil {
+			note(out, "Install the CCPoolStatus app (it hosts the File Provider extension), then run `ccp fp onboard`: brew install --cask %s/%s", widgetTap, widgetCask)
+			return nil
+		}
+		if err := ensureWidgetInstalled(cmd); err != nil {
+			note(out, "Couldn't install the CCPoolStatus app automatically — run `ccp fp onboard` to finish (%v).", err)
+			return nil
+		}
+	}
+
+	// (c) Elect the appex headlessly through the same bounded settle wait as
+	// interactive onboard (the cask postflight usually pre-registered the appex,
+	// so this settles on the first attempt). Unlike interactive onboard this never
+	// opens System Settings or prompts — it prints the manual command instead.
+	switch err := settleFPElection(cmd.Context()); {
+	case err == nil:
+		note(out, "File Provider extension enabled. Run `ccp init` to start pooling on it, or `ccp fp onboard` to migrate existing accounts.")
+	case errors.Is(err, fkoverlay.ErrFileProviderElectionIneffective):
+		en := fkoverlay.BackendFileProvider.Enablement()
+		note(out, "Enable CCPoolStatus under System Settings ▸ %s, then run `ccp fp onboard` to finish.", en.Pane)
+	default:
+		note(out, "Run `ccp fp onboard` to finish enabling the File Provider extension (%v).", err)
+	}
+	return nil
 }
 
 // ensureWidgetInstalled installs the CCPoolStatus app (the extension's host) via
@@ -385,58 +464,6 @@ func ensureWidgetInstalled(cmd *cobra.Command) error {
 	}
 	step(out, "Installing the CCPoolStatus app (it hosts the File Provider extension)…")
 	return brewInstallWidget(cmd)
-}
-
-// awaitFPElection drives the pluginkit election to elected (a user-disabled
-// election only the Settings toggle clears). Unbounded like waitForLogin; ^C cancels.
-func awaitFPElection(ctx context.Context, out io.Writer, interval time.Duration) error {
-	en := fkoverlay.BackendFileProvider.Enablement()
-	triedElect, openedSettings := false, false
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for i := 0; ; i++ {
-		state, err := fpElectionState(ctx)
-		if err != nil {
-			_, _ = fmt.Fprint(out, "\r\x1b[K")
-			return err
-		}
-		switch state {
-		case fpElected:
-			_, _ = fmt.Fprint(out, "\r\x1b[K")
-			return nil
-		case fpNotElected:
-			if !triedElect {
-				triedElect = true
-				if err := fpElect(ctx); err != nil {
-					_, _ = fmt.Fprint(out, "\r\x1b[K")
-					warn(out, "headless election failed: %v", err)
-				}
-				continue // re-read at once: a working `pluginkit -e use` lands synchronously
-			}
-			if !openedSettings {
-				openedSettings = true
-				_, _ = fmt.Fprint(out, "\r\x1b[K")
-				step(out, "macOS is holding the extension disabled; only the Settings toggle can enable it.")
-				step(out, "Flip CCPoolStatus ON under System Settings ▸ %s.", en.Pane)
-				if err := fpOpenSettings(ctx); err != nil {
-					warn(out, "couldn't open System Settings (%v) — navigate there yourself", err)
-				}
-			}
-		case fpNotRegistered:
-			// The just-launched app registers within seconds; nothing to do but wait.
-		}
-		msg := "waiting for macOS to register the extension… press ctrl-c to abort"
-		if state == fpNotElected {
-			msg = "waiting for the File Providers toggle… press ctrl-c to abort"
-		}
-		_, _ = fmt.Fprintf(out, "\r%s %s", spinnerFrames[i%len(spinnerFrames)], dimStyle.Render(msg))
-		select {
-		case <-ctx.Done():
-			_, _ = fmt.Fprint(out, "\r\x1b[K")
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
 }
 
 // awaitFPCapability polls the companion app's throwaway-domain probe — the
@@ -524,7 +551,7 @@ func checkFPRungs(ctx context.Context, out io.Writer, interval time.Duration) er
 			return fmt.Errorf("the daemon isn't running, so its bridge socket %s can't come up — start it with `ccp service install`, then re-run `ccp fp onboard`",
 				abbreviateHome(pool.FPBridgeSocketPath()))
 		case pending:
-			return errors.New("the daemon is up but its bridge bind is parked on the one-time app group container consent prompt (macOS re-asks after every upgrade, and launchd never surfaces it) — approve the prompt, then restart the daemon (`brew services restart cc-pool`) and re-run `ccp fp onboard`")
+			return errors.New("the daemon is up but its bridge bind is parked on the one-time app group container consent prompt (macOS re-asks only if the binary's signing identity changes — e.g. an unsigned local build — and launchd never surfaces it) — approve the prompt, then restart the daemon (`brew services restart cc-pool`) and re-run `ccp fp onboard`")
 		default:
 			return errors.New("the daemon is up but its bridge socket " + abbreviateHome(pool.FPBridgeSocketPath()) +
 				" isn't accepting — approve the app group container consent prompt if one is pending, restart the daemon (`brew services restart cc-pool`), and re-run `ccp fp onboard`; check " + abbreviateHome(pool.LogPath()))

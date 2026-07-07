@@ -494,7 +494,8 @@ func TestReportFileProvider(t *testing.T) {
 				{"file provider app", true, []string{"1.2.3"}},
 				{"file provider bridge", false, []string{
 					"parked on the one-time app group container consent prompt",
-					"re-asks after every upgrade", "restart the daemon", "ccp fp onboard",
+					"re-asks only if the binary's signing identity changes", "unsigned local build",
+					"restart the daemon", "ccp fp onboard",
 				}},
 			},
 			wantProbes: true,
@@ -1209,8 +1210,10 @@ func TestReportOrphanedHolder(t *testing.T) {
 		},
 		"dead holder holding the mux root, idle: reap-and-remount copy": {
 			mounted: func(d string) bool { return d == pool.MuxRootDir() },
-			want: []reportCall{{"mount holder orphans", false,
-				"holder dead, 2 orphaned mounts — the daemon reaps the orphaned go-nfsv4 and remounts automatically once idle"}},
+			want: []reportCall{{
+				"mount holder orphans", false,
+				"holder dead, 2 orphaned mounts — the daemon reaps the orphaned go-nfsv4 and remounts automatically once idle",
+			}},
 		},
 		"dead holder holding the mux root, sessions block the unmount": {
 			mounted: func(d string) bool { return d == pool.MuxRootDir() },
@@ -1219,13 +1222,17 @@ func TestReportOrphanedHolder(t *testing.T) {
 				{PID: 77, ConfigDir: "/p/acct-02"},
 				{PID: 9, ConfigDir: "/p/acct-03"}, // a symlink account: never a fuse blocker
 			},
-			want: []reportCall{{"mount holder orphans", false,
-				"holder dead, 2 orphaned mounts, waiting on sessions pid 4242, pid 77 — relaunch them so the daemon can reap the orphaned go-nfsv4 and remount"}},
+			want: []reportCall{{
+				"mount holder orphans", false,
+				"holder dead, 2 orphaned mounts, waiting on sessions pid 4242, pid 77 — relaunch them so the daemon can reap the orphaned go-nfsv4 and remount",
+			}},
 		},
 		"dead holder holding a legacy per-dir mount only": {
 			mounted: func(d string) bool { return d == "/p/acct-01" }, // not the mux root
-			want: []reportCall{{"mount holder orphans", false,
-				"holder dead, 1 orphaned mount — the daemon reaps the orphaned go-nfsv4 and remounts automatically once idle"}},
+			want: []reportCall{{
+				"mount holder orphans", false,
+				"holder dead, 1 orphaned mount — the daemon reaps the orphaned go-nfsv4 and remounts automatically once idle",
+			}},
 		},
 	}
 	for name, tc := range cases {

@@ -13,12 +13,15 @@ cc-pool (`ccp`) pools several Claude Max/Pro subscriptions and launches each Cla
 ## Releasing
 
 Releases are **tag-triggered** — there is no version file to edit. `Version`/`Commit` in
-`internal/version` default to `dev` locally and are injected at build time via `-ldflags`.
+fusekit's shared `version` package default to `dev` locally and are injected at build time
+via `-ldflags`.
 
 Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which (1) builds the universal
-(arm64+amd64) pure-Go binary on macOS, (2) builds, Developer ID-signs, notarizes, and staples
-the `CCPoolStatus.app` widget (the `cc-pool-status` cask payload), (3) creates a GitHub Release
-with auto-generated notes + the binary tarball, widget zip, and SHA256SUMS, and (4) renders the
+(arm64+amd64) pure-Go binary on macOS and Developer ID-signs + notarizes it (a bare Mach-O,
+identifier `com.yasyf.cc-pool`, app-group entitlement), (2) builds, Developer ID-signs,
+notarizes, and staples the `CCPoolStatus.app` widget (the `cc-pool-status` cask payload),
+(3) creates a GitHub Release with auto-generated notes + the binary tarball, widget zip, and
+SHA256SUMS, and (4) renders the
 formula and cask from in-repo templates and publishes them to the shared external tap
 [`yasyf/homebrew-tap`](https://github.com/yasyf/homebrew-tap) (`brew install yasyf/tap/cc-pool`).
 There is no in-repo `Formula/` — **never hand-edit the tap**; the release job owns it. A tag
@@ -45,17 +48,14 @@ cc-pool/
 ├── internal/
 │   ├── cli/            # ccp subcommands (init, add, select, run, status, doctor, …)
 │   ├── creds/          # Claude Code credentials: blob format + Keychain and plaintext-file stores
-│   ├── daemon/         # background poller: usage polling, idle token refresh, socket protocol; supervises the detached mount-holder process
+│   ├── daemon/         # background poller: usage polling, idle token refresh, socket protocol; drives the external fusekit-holder app and the FP bridge
+│   ├── forecast/       # per-account burn rates + depletion estimates; pool-wide rollup shipped to the widget
 │   ├── oauth/          # Claude OAuth refresh + /api/oauth/usage client
-│   ├── overlay/        # shared ~/.claude overlay providers (symlink, fuse-t mirror)
-│   ├── peerpid/        # identify/kill the exact process holding a unix socket
-│   ├── pool/           # account dirs, paths, pool manager
+│   ├── overlay/        # shared ~/.claude overlay probing (symlink, fuse-t mirror, File Provider)
+│   ├── pool/           # account dirs, paths, pool manager, overlay selection
 │   ├── procscan/       # detect live claude sessions per config dir
 │   ├── score/          # account scoring (5h/7d headroom, reset credit, burn rate)
-│   ├── service/        # LaunchAgent install / brew services delegation
-│   ├── store/          # SQLite state (no secrets — Keychain only)
-│   └── version/        # build metadata injected via -ldflags
-├── launchd/            # LaunchAgent plist template
+│   └── store/          # SQLite state (no secrets — Keychain only)
 ├── widget/             # CCPoolStatus.app Notification Center widget (SwiftUI, cc-pool-status cask)
 ├── docs/               # public design doc (ARCHITECTURE.md) + README assets
 ├── AGENTS.md           # This file — shared conventions

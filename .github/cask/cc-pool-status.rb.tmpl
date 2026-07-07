@@ -29,6 +29,11 @@ cask "cc-pool-status" do
                    args: ["-dr", "com.apple.quarantine", "#{appdir}/CCPoolStatus.app"],
                    must_succeed: false
     system_command "/usr/bin/open", args: ["-g", "#{appdir}/CCPoolStatus.app"], must_succeed: false
+    # Register + elect the File Provider appex so ccp can default to the FP
+    # backend with no System Settings visit; best-effort — `ccp fp onboard`
+    # re-attempts and `ccp doctor` names the Settings fallback.
+    system_command "/usr/bin/pluginkit", args: ["-a", "#{appdir}/CCPoolStatus.app/Contents/PlugIns/CCPoolFileProvider.appex"], must_succeed: false
+    system_command "/usr/bin/pluginkit", args: ["-e", "use", "-i", "com.yasyf.cc-pool.status.fileprovider"], must_succeed: false
   end
 
   uninstall quit: "com.yasyf.cc-pool.status"

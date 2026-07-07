@@ -338,7 +338,7 @@ func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Acco
 		report("file provider bridge", true, "")
 	case consentPending:
 		report("file provider bridge", false,
-			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon reports its bind parked on the one-time app group container consent prompt (macOS re-asks after every upgrade, and launchd never surfaces it): approve it, then restart the daemon (`brew services restart cc-pool`) — `ccp fp onboard` walks this end to end")
+			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon reports its bind parked on the one-time app group container consent prompt (macOS re-asks only if the binary's signing identity changes — e.g. an unsigned local build — and launchd never surfaces it): approve it, then restart the daemon (`brew services restart cc-pool`) — `ccp fp onboard` walks this end to end")
 	default:
 		report("file provider bridge", false,
 			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); on first run macOS gates the app group container behind a one-time consent prompt: approve it, then restart the daemon; domains cannot fetch computed content until the socket is up — run `ccp fp onboard` for the guided setup")

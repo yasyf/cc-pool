@@ -113,10 +113,10 @@ func (g mitigationGate) Setup(base, dir string) error {
 	default:
 		cause = unmitigatedHolderError(ver)
 	}
-	if terr := g.Provider.Teardown(base, dir); terr != nil {
-		// terr rides as text, not %w: the failure class callers match on
-		// (errors.Is) must stay the cause, never the teardown's wire error.
-		return fmt.Errorf("%w (and tearing the unverified fresh mount down failed: %v)", cause, terr)
+	if terr := g.Teardown(base, dir); terr != nil {
+		// terr rides as text (terr.Error(), not %w): the failure class callers
+		// match on (errors.Is) must stay the cause, never the teardown's wire error.
+		return fmt.Errorf("%w (and tearing the unverified fresh mount down failed: %s)", cause, terr.Error())
 	}
 	return cause
 }
@@ -176,6 +176,11 @@ func (m *Manager) overlaySpec() fkoverlay.Spec { return overlaySpec() }
 // OverlaySpec exposes cc-pool's fusekit/overlay Spec to packages that drive the
 // migration primitives directly.
 func (m *Manager) OverlaySpec() fkoverlay.Spec { return overlaySpec() }
+
+// OverlaySpec exposes cc-pool's fusekit/overlay Spec without a Manager, for
+// callers that need the File Provider enablement gate before any pool exists —
+// e.g. `ccp fp onboard --post-install`, which must not open or create pool state.
+func OverlaySpec() fkoverlay.Spec { return overlaySpec() }
 
 // OverlayProviderFor returns the fusekit/overlay provider for a stored backend,
 // wired with cc-pool's Spec; a bad backend fails loud. Fuse providers come

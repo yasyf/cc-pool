@@ -19,128 +19,231 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// TestClassifyFPElection pins the trichotomy parse of pluginkit -m output:
-// empty means never registered, any '+' line means elected (stale duplicates
-// must not mask a live election), anything else registered-but-unelected.
-func TestClassifyFPElection(t *testing.T) {
-	cases := map[string]struct {
-		out  string
-		want fpElection
-	}{
-		"empty output means not registered":    {"", fpNotRegistered},
-		"whitespace only means not registered": {"\n  \n", fpNotRegistered},
-		"plus is elected":                      {"+    com.yasyf.cc-pool.status.fileprovider(1.2.3)\n", fpElected},
-		"minus is registered but not elected":  {"-    com.yasyf.cc-pool.status.fileprovider(1.2.3)\n", fpNotElected},
-		"question mark is not elected":         {"?    com.yasyf.cc-pool.status.fileprovider(1.2.3)\n", fpNotElected},
-		"bang is not elected":                  {"!    com.yasyf.cc-pool.status.fileprovider(1.2.3)\n", fpNotElected},
-		"elected copy among stale duplicates wins": {
-			"?    com.yasyf.cc-pool.status.fileprovider(1.2.2)\n+    com.yasyf.cc-pool.status.fileprovider(1.2.3)\n",
-			fpElected,
-		},
-		"duplicates with no elected copy stay unelected": {
-			"?    com.yasyf.cc-pool.status.fileprovider(1.2.2)\n-    com.yasyf.cc-pool.status.fileprovider(1.2.3)\n",
-			fpNotElected,
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			if got := classifyFPElection(tc.out); got != tc.want {
-				t.Fatalf("classifyFPElection(%q) = %v, want %v", tc.out, got, tc.want)
-			}
-		})
-	}
-}
-
-// scriptElections returns states in order, holding the last one once exhausted.
-func scriptElections(t *testing.T, states []fpElection) *int {
+// scriptFPElections shrinks the settle window to test scale and scripts
+// tryEnableFP answers in order, holding the last once exhausted; it returns the
+// call counter so tests pin exactly how far the bounded retry ran.
+func scriptFPElections(t *testing.T, errs []error) *int {
 	t.Helper()
-	reads := new(int)
-	swapVar(t, &fpElectionState, func(context.Context) (fpElection, error) {
-		i := *reads
-		*reads++
-		if i >= len(states) {
-			i = len(states) - 1
+	swapVar(t, &fpElectSettleBudget, 250*time.Millisecond)
+	swapVar(t, &fpElectSettleInterval, time.Millisecond)
+	calls := new(int)
+	swapVar(t, &tryEnableFP, func(id string) error {
+		if id != pool.FPExtensionBundleID {
+			t.Errorf("elected bundle %q, want %q", id, pool.FPExtensionBundleID)
 		}
-		return states[i], nil
+		i := *calls
+		*calls++
+		if i >= len(errs) {
+			i = len(errs) - 1
+		}
+		return errs[i]
 	})
-	return reads
+	return calls
 }
 
-// TestAwaitFPElection drives the election state machine: already-elected is a
-// no-op, an unelected reading gets exactly one headless election, a persistent
-// user-disabled hold opens Settings exactly once with the pane named, and
-// errors/cancellation unwind cleanly.
-func TestAwaitFPElection(t *testing.T) {
+// TestElectFPForOnboard pins the interactive onboard election: the bounded
+// settle wait retries through the post-launch pluginkit registration race and
+// stops on the first success (no Settings guidance for a transient blip); once
+// the budget closes the LAST error is classified — the Settings-managed
+// sentinel prints the loud manual-toggle guidance and opens the pane exactly
+// once, any other failure is returned to fail onboard loudly with no spurious
+// Settings deep-link.
+func TestElectFPForOnboard(t *testing.T) {
+	ineffective := fmt.Errorf("elect: %w", fkoverlay.ErrFileProviderElectionIneffective)
+	otherErr := errors.New("pluginkit: executable file not found")
 	cases := map[string]struct {
-		states       []fpElection
-		wantElects   int
-		wantSettings int
-		wantFrags    []string // must appear in output
+		electErrs      []error
+		wantErr        bool
+		wantSettings   int
+		wantCallsExact int  // >0: retry must stop after exactly this many attempts
+		wantRetried    bool // a persistent failure must be retried within the budget
+		wantFrags      []string
+		notFrags       []string
 	}{
-		"already elected does nothing": {
-			states: []fpElection{fpElected},
+		"first-attempt success: brief note, no settings": {
+			electErrs:      []error{nil},
+			wantCallsExact: 1,
+			wantFrags:      []string{"enabled"},
+			notFrags:       []string{"Settings toggle", "File Providers"},
 		},
-		"headless election succeeds without settings": {
-			states:     []fpElection{fpNotElected, fpElected},
-			wantElects: 1,
+		"registration race settles: transient failures then success, no guidance": {
+			electErrs:      []error{otherErr, ineffective, nil},
+			wantCallsExact: 3,
+			wantFrags:      []string{"enabled"},
+			notFrags:       []string{"Settings toggle"},
 		},
-		"user-disabled opens settings once and waits for the toggle": {
-			states:       []fpElection{fpNotElected, fpNotElected, fpNotElected, fpElected},
-			wantElects:   1,
+		"persistent sentinel after the budget: guidance shown, pane opened once": {
+			electErrs:    []error{ineffective},
+			wantRetried:  true,
 			wantSettings: 1,
-			wantFrags:    []string{"File Providers", "Settings toggle"},
+			wantFrags:    []string{"Settings toggle", "File Providers"},
 		},
-		"not registered then registered then elected": {
-			states:     []fpElection{fpNotRegistered, fpNotElected, fpElected},
-			wantElects: 1,
+		"persistent pluginkit failure fails loud with no settings": {
+			electErrs:   []error{otherErr},
+			wantRetried: true,
+			wantErr:     true,
+			notFrags:    []string{"Settings toggle"},
+		},
+		"the LAST error is classified: exec failure then persistent sentinel is guidance, not loud": {
+			electErrs:    []error{otherErr, ineffective},
+			wantRetried:  true,
+			wantSettings: 1,
+			wantFrags:    []string{"Settings toggle"},
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			reads := scriptElections(t, tc.states)
-			elects, settings := 0, 0
-			swapVar(t, &fpElect, func(context.Context) error { elects++; return nil })
+			calls := scriptFPElections(t, tc.electErrs)
+			settings := 0
 			swapVar(t, &fpOpenSettings, func(context.Context) error { settings++; return nil })
 
 			var out bytes.Buffer
-			if err := awaitFPElection(t.Context(), &out, time.Millisecond); err != nil {
-				t.Fatalf("awaitFPElection: %v", err)
+			err := electFPForOnboard(t.Context(), &out)
+
+			if tc.wantErr && err == nil {
+				t.Fatal("electFPForOnboard succeeded; want an error")
 			}
-			if elects != tc.wantElects || settings != tc.wantSettings {
-				t.Errorf("elects=%d settings=%d, want %d/%d", elects, settings, tc.wantElects, tc.wantSettings)
+			if !tc.wantErr && err != nil {
+				t.Fatalf("electFPForOnboard: %v", err)
 			}
-			if *reads < len(tc.states) {
-				t.Errorf("only %d probe reads for %d scripted states", *reads, len(tc.states))
+			if tc.wantCallsExact > 0 && *calls != tc.wantCallsExact {
+				t.Errorf("tryEnableFP called %d times, want exactly %d (retry must stop on success)", *calls, tc.wantCallsExact)
+			}
+			if tc.wantRetried && *calls < 2 {
+				t.Errorf("tryEnableFP called %d times; a persistent failure must be retried within the settle budget", *calls)
+			}
+			if settings != tc.wantSettings {
+				t.Errorf("opened settings %d times, want %d", settings, tc.wantSettings)
 			}
 			for _, frag := range tc.wantFrags {
 				if !strings.Contains(out.String(), frag) {
 					t.Errorf("output %q missing %q", out.String(), frag)
 				}
 			}
+			for _, frag := range tc.notFrags {
+				if strings.Contains(out.String(), frag) {
+					t.Errorf("output %q unexpectedly contains %q", out.String(), frag)
+				}
+			}
 		})
 	}
 }
 
-func TestAwaitFPElectionProbeErrorAborts(t *testing.T) {
-	probeErr := errors.New("pluginkit: executable file not found")
-	swapVar(t, &fpElectionState, func(context.Context) (fpElection, error) { return fpNotRegistered, probeErr })
-	swapVar(t, &fpElect, func(context.Context) error { t.Error("elect ran after a probe failure"); return nil })
-
-	var out bytes.Buffer
-	if err := awaitFPElection(t.Context(), &out, time.Millisecond); !errors.Is(err, probeErr) {
-		t.Fatalf("awaitFPElection = %v, want %v", err, probeErr)
-	}
-}
-
-func TestAwaitFPElectionCancelUnwinds(t *testing.T) {
-	scriptElections(t, []fpElection{fpNotRegistered})
-	swapVar(t, &fpElect, func(context.Context) error { return nil })
+// TestSettleFPElectionCancelUnwinds pins that the settle wait honors ^C: a
+// canceled context unwinds after the in-flight attempt instead of burning the
+// rest of the budget.
+func TestSettleFPElectionCancelUnwinds(t *testing.T) {
+	calls := scriptFPElections(t, []error{errors.New("appex not registered yet")})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	var out bytes.Buffer
-	if err := awaitFPElection(ctx, &out, time.Millisecond); !errors.Is(err, context.Canceled) {
-		t.Fatalf("awaitFPElection = %v, want context.Canceled", err)
+	if err := settleFPElection(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("settleFPElection = %v, want context.Canceled", err)
+	}
+	if *calls != 1 {
+		t.Errorf("tryEnableFP called %d times after cancel, want exactly 1", *calls)
+	}
+}
+
+// TestRunFPPostInstall pins the non-interactive brew post_install mode: it never
+// returns an error (a post_install must not fail the formula), no-ops fast when
+// the extension is already enabled, prints the manual install command when the
+// host app is missing and brew is absent, elects the appex through the bounded
+// settle wait when the app is present (a transient registration-race failure
+// settles into success, a budget-exhausted failure prints manual guidance), and
+// — unlike interactive onboard — never opens System Settings even on the
+// Settings-managed sentinel.
+func TestRunFPPostInstall(t *testing.T) {
+	ineffective := fmt.Errorf("elect: %w", fkoverlay.ErrFileProviderElectionIneffective)
+	otherErr := errors.New("pluginkit: executable file not found")
+	cases := map[string]struct {
+		fpEnabled    bool // extension already enabled
+		appInstalled bool
+		brewOnPath   bool
+		electErrs    []error
+		wantElect    bool // tryEnableFP must be called
+		wantFrags    []string
+		notFrags     []string
+	}{
+		"already enabled is a fast no-op": {
+			fpEnabled: true,
+			electErrs: []error{errors.New("elect must not run when already enabled")},
+			wantFrags: []string{"already enabled"},
+			notFrags:  []string{"ccp init", "brew install"},
+		},
+		"app missing and no brew prints the manual command and exits 0": {
+			electErrs: []error{errors.New("elect must not run without the host app")},
+			wantFrags: []string{"brew install --cask", "ccp fp onboard"},
+		},
+		"app present and election succeeds needs no settings": {
+			appInstalled: true,
+			electErrs:    []error{nil},
+			wantElect:    true,
+			wantFrags:    []string{"enabled", "ccp init"},
+		},
+		"registration race settles: transient failure then success": {
+			appInstalled: true,
+			electErrs:    []error{otherErr, nil},
+			wantElect:    true,
+			wantFrags:    []string{"enabled", "ccp init"},
+			notFrags:     []string{"System Settings"},
+		},
+		"persistent settings-managed sentinel prints the manual command, no settings": {
+			appInstalled: true,
+			electErrs:    []error{ineffective},
+			wantElect:    true,
+			wantFrags:    []string{"System Settings", "ccp fp onboard"},
+		},
+		"persistent pluginkit failure still exits 0 with the manual command": {
+			appInstalled: true,
+			electErrs:    []error{otherErr},
+			wantElect:    true,
+			wantFrags:    []string{"ccp fp onboard"},
+			notFrags:     []string{"System Settings"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			if !tc.brewOnPath {
+				// Empty PATH so exec.LookPath("brew") fails deterministically on any
+				// host — a post_install must never actually shell out to brew here.
+				t.Setenv("PATH", "")
+			}
+			swapVar(t, &fpAvailable, func(fkoverlay.Spec) bool { return tc.fpEnabled })
+			swapVar(t, &widgetAppInstalled, func() bool { return tc.appInstalled })
+			electCalls := scriptFPElections(t, tc.electErrs)
+			settings := 0
+			swapVar(t, &fpOpenSettings, func(context.Context) error { settings++; return nil })
+
+			cmd := &cobra.Command{}
+			cmd.SetContext(t.Context())
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+
+			if err := runFPPostInstall(cmd); err != nil {
+				t.Fatalf("runFPPostInstall returned %v; post_install must always exit 0", err)
+			}
+			if (*electCalls > 0) != tc.wantElect {
+				t.Errorf("tryEnableFP called %d times, wantElect=%v", *electCalls, tc.wantElect)
+			}
+			if tc.wantElect && *electCalls < len(tc.electErrs) {
+				t.Errorf("only %d election attempts for %d scripted results — the settle retry never ran", *electCalls, len(tc.electErrs))
+			}
+			if settings != 0 {
+				t.Errorf("post_install opened System Settings %d times; it must never prompt", settings)
+			}
+			for _, frag := range tc.wantFrags {
+				if !strings.Contains(out.String(), frag) {
+					t.Errorf("output %q missing %q", out.String(), frag)
+				}
+			}
+			for _, frag := range tc.notFrags {
+				if strings.Contains(out.String(), frag) {
+					t.Errorf("output %q unexpectedly contains %q", out.String(), frag)
+				}
+			}
+		})
 	}
 }
 
@@ -259,6 +362,9 @@ func TestFPOnboardRegistered(t *testing.T) {
 	}
 	if err := fp.Args(fp, []string{"extra"}); err == nil {
 		t.Fatal("onboard accepted positional args; want cobra.NoArgs")
+	}
+	if fp.Flags().Lookup("post-install") == nil {
+		t.Fatal("onboard missing the --post-install flag")
 	}
 }
 

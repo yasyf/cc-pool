@@ -37,6 +37,16 @@ class CcPool < Formula
     bin.install_symlink "cc-pool" => "ccp"
   end
 
+  # Best-effort zero-touch File Provider onboarding (installs the widget cask,
+  # elects the appex, sets FP as the default backend). `ccp fp onboard` owns its
+  # own messaging, so let it print; never fail or block the install if it errors
+  # — an older installed binary may not even know the flag.
+  def post_install
+    system bin/"cc-pool", "fp", "onboard", "--post-install"
+  rescue
+    opoo "File Provider onboarding did not complete; run `ccp fp onboard` to finish."
+  end
+
   # HEAD builds compile pure Go from source.
   def install_from_source
     ldflags = %W[
@@ -46,6 +56,54 @@ class CcPool < Formula
     args = std_go_args(ldflags: ldflags.join(" "), output: bin/"cc-pool")
     ENV["CGO_ENABLED"] = "0"
     system "go", "build", *args, "./cmd/cc-pool"
+    codesign_head_build
+  end
+
+  # An adhoc HEAD build gets its TCC grants (Network Volumes deep-probe,
+  # app-group container) path-keyed to this versioned Cellar path, so every
+  # upgrade re-prompts. A maintainer machine has a "Developer ID Application"
+  # identity, so sign under the release's identifier to share its
+  # identifier-keyed grant. No `--options runtime` (TCC keys on the designated
+  # requirement = identifier + Dev ID leaf; hardened runtime only hurts debugger
+  # attach on dev builds) and no notarization (local, unquarantined). A public
+  # user with no identity falls through unsigned — this must never fail install.
+  def codesign_head_build
+    # popen_read, not safe_popen_read: probing for a signing identity must never
+    # fail the install — no identity (a public machine) just skips signing.
+    # rubocop:disable Homebrew/SafePopenCommands
+    identities = Utils.popen_read("/usr/bin/security", "find-identity", "-v", "-p", "codesigning")
+    # rubocop:enable Homebrew/SafePopenCommands
+    candidates = identities.scan(/Developer ID Application: .+? \([A-Z0-9]+\)/)
+    return if candidates.empty?
+
+    # Parse the App Group from source so the entitlement can never drift from the
+    # code (same reason release.yml derives it with sed). The app-groups
+    # entitlement only works when the signing identity owns the group — the
+    # group's prefix is the owning Team ID — so among several identities prefer
+    # that team's; any other team signs identifier-only.
+    app_group = (buildpath/"internal/pool/paths.go").read[/^const AppGroupID = "(.+)"$/, 1]
+    group_team = app_group&.slice(/\A[A-Z0-9]+(?=\.)/)
+    identity = candidates.find { |c| group_team && c.end_with?("(#{group_team})") } || candidates.first
+    codesign_args = ["--force", "--identifier", "com.yasyf.cc-pool", "-s", identity]
+
+    if group_team && identity.end_with?("(#{group_team})")
+      entitlements = buildpath/"cc-pool-head.entitlements"
+      entitlements.write <<~XML
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>com.apple.security.application-groups</key>
+          <array>
+            <string>#{app_group}</string>
+          </array>
+        </dict>
+        </plist>
+      XML
+      codesign_args += ["--entitlements", entitlements]
+    end
+
+    system "/usr/bin/codesign", *codesign_args, bin/"cc-pool"
   end
 
   # Run the daemon as a USER LaunchAgent (no sudo): it needs the user's login

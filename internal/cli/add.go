@@ -169,7 +169,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	return acct, nil
 }
 
-// noteFuseFirstMount warns about macOS's one-time volume-access grant prompt on an account's first fuse mount.
+// noteFuseFirstMount warns about macOS's one-time volume-access grant prompts on an account's first fuse mount.
 func noteFuseFirstMount(out io.Writer, backend fkoverlay.Backend) {
 	if !pool.CanHostFuse() || !backend.IsFuse() {
 		return
@@ -178,7 +178,7 @@ func noteFuseFirstMount(out io.Writer, backend fkoverlay.Backend) {
 	if !en.Needed {
 		return
 	}
-	note(out, "macOS will show a one-time grant prompt for cc-pool (%s) — click Allow.", en.Pane)
+	note(out, "macOS will show one-time grant prompts for both the fusekit-holder app and cc-pool itself (%s) — click Allow on each.", en.Pane)
 }
 
 // defaultLabel's email-derived prefill is decorative — identity-read failures

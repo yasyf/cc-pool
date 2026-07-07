@@ -51,9 +51,9 @@ providers:
   daemon, and by `ccp doctor --fix`.
 - **fuse** (optional, live mirror): a passthrough mirror served via
   [fuse-t](https://github.com/macos-fuse-t/fuse-t) — kext-less, mounted as you, no root —
-  and hosted by the shared, signed **fusekit-holder** daemon (its own Homebrew cask), so
-  daemon restarts and upgrades never disturb live sessions' mounts, and one *Network
-  Volumes* privacy grant covers every consumer. The pool rides **one native mount** at
+  and hosted by the external **fusekit-holder** cask app, a Developer ID-signed bundle at a
+  fixed `/Applications` path, so daemon restarts and cc-pool upgrades never disturb live
+  sessions' mounts (cc-pool itself stays pure Go). The pool rides **one native mount** at
   `~/.cc-pool/mnt`: each account is a subtree (`mnt/acct-NN`) of that single mount — one
   fuse-t NFS server process (`go-nfsv4`) total, not one per account — and each
   `accounts/acct-NN` dir is a fail-closed symlink onto its subtree, so account-dir paths
@@ -62,6 +62,14 @@ providers:
   whole-mount operations are holder replacement and wedge recovery, both gated on a
   pool-wide zero-session window. Requires fusekit-holder ≥ v0.29.0 (`ccp` refuses older
   holders loudly and keeps accounts on symlink until upgraded).
+
+Privacy (TCC) grants across this stack are one-time. **fusekit-holder**
+(`com.yasyf.fusekit-holder`) performs the NFS mounts, so a single *Network Volumes* grant to
+it covers every consumer. cc-pool itself — which macOS keys on its stable dotted signing
+identifier, `com.yasyf.cc-pool` — needs its own *Network Volumes* grant for the deep-probe
+reads it makes through fuse mounts, and the app group container consent for the File
+Provider bridge. Each is granted once and survives upgrades; macOS re-asks only if the
+binary's signing identity changes (e.g. an unsigned local build).
 
 A few entries stay per-account instead of shared: `daemon/` and `ide/` (Claude's PID-keyed
 supervisor and IDE lock/socket files, which would collide across concurrent sessions),
@@ -102,8 +110,8 @@ runs a **user LaunchAgent** — a root daemon couldn't read your login Keychain.
 usage every ~3 min with exponential backoff, refreshes **idle** accounts' tokens before they
 expire (a checked-out session owns its own refresh; the daemon adopts whatever token it
 rotated to on check-in), caches scores, and — with the fuse overlay — supervises the
-detached mount holder, which owns the mounts so daemon restarts and upgrades never disturb
-them. `ccp add` and `ccp init` start it automatically; if it isn't running, `ccp select`
+external **fusekit-holder** app, which owns the mounts so daemon restarts and upgrades never
+disturb them. `ccp add` and `ccp init` start it automatically; if it isn't running, `ccp select`
 auto-spawns it or samples live.
 
 No secrets are ever stored in cc-pool's database — the macOS Keychain is the only secret
