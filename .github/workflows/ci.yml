@@ -64,8 +64,14 @@ jobs:
           /tmp/cc-pool --help | grep -q "emptiest account"
           /tmp/cc-pool list || true   # exits cleanly with "no accounts" before init
 
+  # lint and vuln only ANALYZE source, so they run on cheap ubuntu runners —
+  # but cc-pool is darwin-only (procscan's unix.SysctlKinfoProcSlice etc. don't
+  # exist on linux), so both must typecheck as GOOS=darwin or they fail on
+  # undefined darwin-only symbols.
   lint:
     runs-on: ubuntu-latest
+    env:
+      GOOS: darwin
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -79,6 +85,8 @@ jobs:
 
   vuln:
     runs-on: ubuntu-latest
+    env:
+      GOOS: darwin
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
