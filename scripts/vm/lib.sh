@@ -450,3 +450,64 @@ fp_register_and_enable() {
   warn "fp: the Settings File-Provider toggle is a SEPARATE gate from pluginkit — if headless enable did not stick, boot with VMCTL_GRAPHICS=1 and enable it in System Settings > General > Login Items & Extensions (README: FP provisioning)"
   return 1
 }
+
+# fp_grant_consent flips fileproviderd's per-provider consent boolean ON for the
+# CCPoolFileProvider extension. This is a SEPARATE gate from pluginkit enablement
+# (fp_register_and_enable): the tart base image ships residual File Provider state
+# that defaults every provider to DISABLED, so fileproviderd treats the provider as
+# user-disabled and every probe/serve fails FP -2011 (domainDisabled) — the migrate's
+# capability gate then refuses ("extension enabled but not serving") before any
+# account converts. On a real machine the user grants this in System Settings >
+# General > Login Items & Extensions > File Provider; that consumer path has no CLI,
+# so this is a TEST-HARNESS-ONLY lever (never a substitute for the Settings toggle
+# on a real install). fileproviderd's consent is a single boolean in the provider's
+# Domains.plist (NSFileProviderDomainDefaultIdentifier:Enabled); flipping it true and
+# kickstarting fileproviderd makes the provider serve, with every future domain
+# auto-enabled. Requires the appex already registered (fp_register_and_enable). Dies
+# loudly unless the PlistBuddy read-back is true.
+fp_grant_consent() {
+  log "fp: granting provider consent (Domains.plist default-identifier Enabled)…"
+  # $VMCTL_FP_BUNDLE_ID is baked in host-side; everything else (\$HOME, \$(id -u),
+  # the PlistBuddy calls) runs guest-side. `set -eu` makes the guest recipe fail
+  # fast; the SIGKILL-before-Set ordering matters (see the inline WHY).
+  local remote
+  remote=$(cat <<REMOTE
+set -eu
+PL="\$HOME/Library/Application Support/FileProvider/$VMCTL_FP_BUNDLE_ID/Domains.plist"
+SVC="gui/\$(id -u)/com.apple.FileProvider"
+PB=/usr/libexec/PlistBuddy
+# Seed the state dir + default-identifier Enabled key when absent. fileproviderd
+# creates these once the appex has been elected + launched; on a pristine clone the
+# Add arm seeds them (mkdir first — PlistBuddy cannot create the parent directory).
+mkdir -p "\$(dirname "\$PL")"
+"\$PB" -c "Print :NSFileProviderDomainDefaultIdentifier:Enabled" "\$PL" >/dev/null 2>&1 \
+  || "\$PB" -c "Add :NSFileProviderDomainDefaultIdentifier:Enabled bool true" "\$PL"
+# SIGKILL fileproviderd BEFORE the Set: on a clean shutdown it rewrites Domains.plist
+# from its in-memory (disabled) state and would clobber the flip. Tolerate a
+# not-running service (kill returns nonzero), then wait — bounded — for it to exit.
+launchctl kill KILL "\$SVC" 2>/dev/null || true
+for _ in \$(seq 1 50); do
+  pgrep -x fileproviderd >/dev/null 2>&1 || break
+  sleep 0.2
+done
+"\$PB" -c "Set :NSFileProviderDomainDefaultIdentifier:Enabled true" "\$PL"
+# Kickstart so fileproviderd re-reads the now-enabled plist (a wrong service label
+# fails here and fails the whole grant — the read-back below is the real gate).
+launchctl kickstart "\$SVC"
+REMOTE
+)
+  vm_ssh "$remote" || die "fp: could not grant provider consent (Domains.plist edit / fileproviderd kickstart failed) — see the guest output above"
+  # Give fileproviderd a beat to re-read, then verify by authoritative read-back.
+  # Push-time verification is plist-only by design: the full serving probe needs the
+  # daemon's bridge socket, which is not bound until the replay's daemon-start phase.
+  sleep 3
+  local pl state
+  # shellcheck disable=SC2016 # $HOME is deliberately literal — it expands guest-side, not here
+  pl='$HOME/Library/Application Support/FileProvider/'"$VMCTL_FP_BUNDLE_ID"'/Domains.plist'
+  # shellcheck disable=SC2029 # guest-side $HOME expansion into the PlistBuddy arg is intended
+  state="$(vm_ssh "/usr/libexec/PlistBuddy -c 'Print :NSFileProviderDomainDefaultIdentifier:Enabled' \"$pl\" 2>/dev/null")" || true
+  state="$(printf '%s' "$state" | tr -d '[:space:]')"
+  [[ "$state" == "true" ]] ||
+    die "fp: provider consent read-back is '${state:-<absent>}', not 'true' — the Domains.plist flip did not stick (fileproviderd rewrote it, or the state dir is absent on a pristine clone; README: FP provisioning)"
+  log "fp: provider consent granted (Domains.plist default-identifier Enabled=true)"
+}

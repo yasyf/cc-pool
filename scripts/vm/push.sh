@@ -158,6 +158,13 @@ main() {
   fp_register_and_enable ||
     warn "FP extension not enabled headlessly — the selftest below confirms; if it fails, use the VMCTL_GRAPHICS=1 click-Allow path (README: FP provisioning)"
 
+  # Grant fileproviderd's per-provider consent (a SEPARATE gate from pluginkit): the
+  # base image defaults providers to user-disabled, which makes the replay's migrate
+  # capability gate refuse. Fatal on failure — a disabled provider silently fails the
+  # replay downstream, so fail loud here (fp_grant_consent dies unless the read-back
+  # confirms Enabled=true).
+  fp_grant_consent
+
   # --- Selftest ----------------------------------------------------------------
   # Verify the extension the SAME way the enable step and cc-pool's FP gate do:
   # `pluginkit -m -i <bundleid>` must lead with '+'. Do NOT `pluginkit -m | grep

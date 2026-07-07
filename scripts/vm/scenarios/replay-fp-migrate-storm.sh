@@ -35,20 +35,22 @@ require_seconds() {
   (($(vm_seconds_left) > 0)) || die "run window elapsed before $1 — raise VMCTL_RUN_TIMEOUT_MIN"
 }
 
-# fp_consent_die reports the File Provider user-consent blocker and dies. The
-# CCPoolFileProvider extension can be pluginkit-enabled ('+') yet still sit at
-# fileproviderd `enabled: no` — a one-time user-approval gate (System Settings >
-# General > Login Items & Extensions > File Provider) that pluginkit does NOT
-# flip and no CLI exposes (verified: editing Domains.plist + restarting
-# fileproviderd does not change it). Until it is approved, every domain registers
-# but never serves an enumeration, and the Phase 2b readiness gate correctly
-# rolls every account back to symlink. $* is the observed evidence.
+# fp_consent_die reports the File Provider provider-consent blocker and dies. The
+# CCPoolFileProvider extension can be pluginkit-enabled ('+') yet still sit
+# user-disabled in fileproviderd — its Domains.plist NSFileProviderDomainDefaultIdentifier:Enabled
+# is false, the per-provider consent gate that pluginkit does NOT flip. Until it is
+# granted every domain registers but never serves (FP -2011 domainDisabled), so the
+# daemon's File Provider capability gate refuses ("extension enabled but not serving")
+# before any account converts. On a real machine the user grants it in System
+# Settings; in this harness the push-time fp_grant_consent step (lib.sh) flips the
+# plist boolean directly. $* is the observed evidence.
 fp_consent_die() {
-  die "File Provider extension is NOT user-approved (fileproviderd reports enabled: no).
-pluginkit enablement ('+') is insufficient — this is the separate one-time Settings consent gate.
-Fix: boot once with VMCTL_GRAPHICS=1, open System Settings > General > Login Items &
-Extensions > File Provider, and turn ON the cc-pool (CCPoolStatus) extension. It
-persists for the VM's life; then re-run. (README: FP provisioning.)
+  die "File Provider provider consent is NOT granted (fileproviderd has the provider user-disabled).
+pluginkit enablement ('+') is insufficient — this is the separate per-provider consent gate.
+Fix (harness): re-run 'scripts/vm/vmctl push' — its fp_grant_consent step flips the
+Domains.plist NSFileProviderDomainDefaultIdentifier:Enabled boolean and kickstarts
+fileproviderd. (On a real machine: System Settings > General > Login Items &
+Extensions > File Provider, turn ON the cc-pool (CCPoolStatus) extension.)
 Evidence: $*"
 }
 
@@ -163,31 +165,47 @@ This is the app-group-data TCC gate: re-run 'vmctl provision' with the grant, or
 Daemon log: $VMCTL_GUEST_DAEMON_LOG"
 log "daemon + companion app up; FP bridge bound"
 
-# Preflight the File Provider user-consent gate. pluginkit '+' does not imply
-# fileproviderd will launch the extension: it must also report the provider
-# `enabled: yes`. On a re-run the provider is already known to fileproviderd and
-# we fail fast here; on a first-ever run it may be absent from the dump (never
-# registered), reported "unknown", in which case we defer to the migrate (whose
-# rollback is detected below with the same remediation).
+# Preflight the File Provider provider-consent gate. The AUTHORITATIVE signal is
+# fileproviderd's per-provider consent boolean in the provider's Domains.plist
+# (NSFileProviderDomainDefaultIdentifier:Enabled) — the same bit the push-time
+# fp_grant_consent step (lib.sh) flips. `fileproviderctl dump`'s `enabled:` line is
+# a known-unreliable zero-domain default (it reads `no` even when the provider will
+# serve), kept here as secondary color only. A disabled provider fails every probe
+# with FP -2011 (domainDisabled), so the migrate's capability gate refuses before any
+# account converts: fail fast here with the fp_grant_consent remediation. `unknown`
+# (no plist yet — a first-ever run before the appex was elected) defers to the
+# migrate, whose gate-failure detector below carries the same remediation.
 cat >"$VMCTL_RESULTS_DIR/fpcheck.sh" <<'FPCHECK'
-# Prints the cc-pool FP provider's fileproviderd enabled state: yes | no | unknown.
-# `fileproviderctl dump` lists each provider's `enabled:` line just above its
-# bundle-id line, so record the most recent enabled value and print it at the id.
-fileproviderctl dump 2>/dev/null | awk '
+set -u
+BUNDLE=com.yasyf.cc-pool.status.fileprovider
+PL="$HOME/Library/Application Support/FileProvider/$BUNDLE/Domains.plist"
+# Authoritative: the provider-consent boolean. true=yes, false=no, absent=unknown.
+v="$(/usr/libexec/PlistBuddy -c 'Print :NSFileProviderDomainDefaultIdentifier:Enabled' "$PL" 2>/dev/null | tr -d '[:space:]')"
+case "$v" in
+  true)  plist=yes ;;
+  false) plist=no ;;
+  *)     plist=unknown ;;
+esac
+# Secondary color: fileproviderd's own dump reads the provider's `enabled:` line just
+# above its bundle-id line (unreliable — recorded, never gating).
+dump="$(fileproviderctl dump 2>/dev/null | awk '
   /enabled:/ { e=$2 }
   /^com\.yasyf\.cc-pool\.status\.fileprovider$/ { print (e==""?"unknown":e); found=1; exit }
-  END { if (!found) print "unknown" }
-'
+  END { if (!found) print "unknown" }')"
+printf 'plist=%s dump=%s\n' "$plist" "${dump:-unknown}"
 FPCHECK
 vm_scp_to "$VMCTL_RESULTS_DIR/fpcheck.sh" "/tmp/ccpool-fpcheck.sh" || die "could not stage the FP consent check"
-fp_enabled="$(vm_ssh "bash /tmp/ccpool-fpcheck.sh")" || die "FP consent preflight command failed in the guest (vm_ssh rc=$?) — not a consent verdict; check guest reachability and fileproviderctl"
-case "$fp_enabled" in yes|no|unknown) ;; *) die "FP consent preflight printed unexpected state '$fp_enabled'" ;; esac
-log "FP consent preflight: provider enabled=$fp_enabled"
-# 'enabled: no' with zero registered domains is fileproviderd's default and does
-# NOT gate serving (proven empirically: a conversion succeeds in that state), so
-# the dump state is recorded evidence only — the migrate itself is the consent
-# verdict, and the migrate-failure detector below carries the remediation.
-[[ "$fp_enabled" == "no" ]] && warn "provider enabled=no in the dump — advisory only; the migrate is the authoritative consent test"
+fp_preflight="$(vm_ssh "bash /tmp/ccpool-fpcheck.sh")" || die "FP consent preflight command failed in the guest (vm_ssh rc=$?) — not a consent verdict; check guest reachability and PlistBuddy/fileproviderctl"
+# Parse "plist=<x> dump=<y>".
+fp_plist="${fp_preflight#plist=}"; fp_plist="${fp_plist%% *}"
+fp_dump="${fp_preflight#*dump=}"
+case "$fp_plist" in yes|no|unknown) ;; *) die "FP consent preflight printed unexpected output: '$fp_preflight'" ;; esac
+log "FP consent preflight: provider Domains.plist=$fp_plist (fileproviderctl dump=$fp_dump, advisory)"
+# plist=no is the authoritative disabled verdict — stop now with the remediation
+# rather than let the migrate fail slowly through the capability gate. plist=unknown
+# defers: on a first-ever run the plist may not exist until the appex is elected.
+[[ "$fp_plist" == "no" ]] &&
+  fp_consent_die "Domains.plist NSFileProviderDomainDefaultIdentifier:Enabled=false (provider user-disabled; fileproviderctl dump=$fp_dump)"
 
 # ---------------------------------------------------------------------------------
 # 3. Synthetic live sessions: per account, a process holding an open fd on the
@@ -239,11 +257,17 @@ migrate_rc=$?
 set -e
 sed 's/^/  migrate| /' "$migrate_out" >&2 # fold the CLI output into scenario.log
 if ((migrate_rc != 0)); then
-  # The signature of the un-approved FP extension (the preflight missed it only
-  # on a first-ever run): domains register but never serve, so every account
-  # rolls back with the readiness-gate error.
-  if grep -q "did not serve an enumeration in time" "$migrate_out"; then
-    fp_consent_die "every account rolled back with \"file provider domain did not serve an enumeration in time\" (see $migrate_out)"
+  # The signature of an un-granted provider consent (the preflight caught only the
+  # plist=no case; a first-ever run reaches here 'unknown'). The daemon's File
+  # Provider capability gate — a throwaway register+enumerate+remove probe — refuses
+  # UPFRONT, so handleMigrate fails with no account touched. The gate emits one of two
+  # cc-pool-owned reasons (internal/daemon/migrate.go fpGate): "extension enabled but
+  # not serving" (probe RPC ok, throwaway domain did not serve) or "companion app
+  # control probe failed: <class>" (probe RPC errored, e.g. FP -2011 domainDisabled).
+  # This scenario already confirmed the companion app's control socket is up before
+  # the migrate, so either reason here is the consent blocker.
+  if grep -qE 'extension enabled but not serving|companion app control probe failed' "$migrate_out"; then
+    fp_consent_die "the fleet migrate's File Provider capability gate refused (\"extension enabled but not serving\" / \"companion app control probe failed\"); no account converted (see $migrate_out)"
   fi
   die "ccp migrate exited $migrate_rc — the fleet migration did not succeed (see the CLI output above and $VMCTL_GUEST_DAEMON_LOG)"
 fi
