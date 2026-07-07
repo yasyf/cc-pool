@@ -85,15 +85,16 @@ jobs:
 
   vuln:
     runs-on: ubuntu-latest
-    env:
-      GOOS: darwin
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
+      # GOOS scopes to the analysis only: set on the whole job it would make
+      # `go install` cross-compile govulncheck itself into a darwin_* subdir
+      # the runner can't exec (exit 127).
       - name: govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+          GOOS=darwin govulncheck ./...
