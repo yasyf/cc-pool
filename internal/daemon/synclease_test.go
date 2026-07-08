@@ -213,7 +213,7 @@ func TestPeerLeasePenalizesRanking(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			s := &Server{reservations: map[int]time.Time{}}
+			s := &Server{cl: newClaims()}
 			_, _ = attachGate(s, "host-a", regWith(entry("u1", nil), entry("u2", tc.lease)))
 			s.sync.now = func() time.Time { return fixed }
 
@@ -261,7 +261,7 @@ func TestSynclessNilGate(t *testing.T) {
 	})
 
 	t.Run("ranking applies no peer penalty", func(t *testing.T) {
-		s := &Server{reservations: map[int]time.Time{}}
+		s := &Server{cl: newClaims()}
 		snaps := []pool.Snapshot{
 			{Account: store.Account{ID: 1, AccountUUID: "u1"}, HasUsage: true, Util5h: 40, Util7d: 40},
 			{Account: store.Account{ID: 2, AccountUUID: "u2"}, HasUsage: true, Util5h: 40, Util7d: 40},

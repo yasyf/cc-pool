@@ -63,21 +63,21 @@ func (s *Server) handleCredMove(ctx context.Context, req Request) Response {
 // so moving under it would fork the refresh-token chain and kill one side.
 func (s *Server) moveAccountCred(ctx context.Context, a store.Account, target creds.Source, to string) MigrationResult {
 	res := MigrationResult{ID: a.ID, Label: a.Label, To: to}
-	if !s.beginConvert(a.ID) {
+	// Claim and re-read the row under it — the caller's list is a stale snapshot
+	// and the row names the stores (keychain service, config dir) the move acts on.
+	fresh, ok, err := s.ownFresh(a.ID)
+	if !ok {
 		res.Outcome = MigrationBusy
 		res.Detail = "held by a pending select, a daemon poll, or another conversion; retry shortly"
 		return res
 	}
-	defer s.endConvert(a.ID)
-
-	// Re-read under the claim: the caller's list is a stale snapshot and the
-	// row names the stores (keychain service, config dir) the move acts on.
-	a, err := s.m.Store.GetAccount(a.ID)
+	defer s.cl.disownConvert(a.ID)
 	if err != nil {
 		res.Outcome = MigrationFailed
 		res.Detail = fmt.Sprintf("re-read account row: %v", err)
 		return res
 	}
+	a = fresh
 	res.Label = a.Label
 
 	// Fail closed: a failed scan cannot rule out a live session in this dir.

@@ -107,7 +107,7 @@ func TestReconcileStaleWidgetKills(t *testing.T) {
 	stale := []procscan.Proc{{PID: 42, StartedAt: installedAt.Add(-time.Hour)}}
 	killed, _ := swapWidgetSeams(t, bin, [][]procscan.Proc{stale, stale})
 	var buf bytes.Buffer
-	s := &Server{log: log.New(&buf, "", 0)}
+	s := &Server{cl: newClaims(), log: log.New(&buf, "", 0)}
 
 	s.reconcileStaleWidget(context.Background())
 
@@ -128,7 +128,7 @@ func TestReconcileStaleWidgetPIDReuseGuard(t *testing.T) {
 		{{PID: 42, StartedAt: installedAt.Add(-time.Hour)}},
 		{{PID: 42, StartedAt: installedAt.Add(-30 * time.Minute)}},
 	})
-	s := &Server{log: log.New(io.Discard, "", 0)}
+	s := &Server{cl: newClaims(), log: log.New(io.Discard, "", 0)}
 
 	s.reconcileStaleWidget(context.Background())
 
@@ -143,7 +143,7 @@ func TestReconcileStaleWidgetGoneOnReconfirm(t *testing.T) {
 		{{PID: 42, StartedAt: installedAt.Add(-time.Hour)}},
 		{},
 	})
-	s := &Server{log: log.New(io.Discard, "", 0)}
+	s := &Server{cl: newClaims(), log: log.New(io.Discard, "", 0)}
 
 	s.reconcileStaleWidget(context.Background())
 
@@ -157,7 +157,7 @@ func TestReconcileStaleWidgetNoStale(t *testing.T) {
 	killed, scanCalls := swapWidgetSeams(t, bin, [][]procscan.Proc{
 		{{PID: 7, StartedAt: installedAt.Add(time.Second)}},
 	})
-	s := &Server{log: log.New(io.Discard, "", 0)}
+	s := &Server{cl: newClaims(), log: log.New(io.Discard, "", 0)}
 
 	s.reconcileStaleWidget(context.Background())
 

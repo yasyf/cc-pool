@@ -18,28 +18,10 @@ import (
 	"github.com/yasyf/fusekit/proc"
 )
 
-const (
-	// defaultHealInterval is the steady-state heal cadence, far under the
-	// scheduler's ~3.5-minute poll.
-	defaultHealInterval = 10 * time.Second
-
-	// remountBackoffBase/remountBackoffCap bound the per-row remount backoff;
-	// the cap stays under the 180s scheduler period so the heal is never the
-	// slower recovery path.
-	remountBackoffBase = 10 * time.Second
-	remountBackoffCap  = 2 * time.Minute
-)
-
-// remountBreakerThreshold is the consecutive wedged/never-recovering heal
-// failures before the row stops retrying and retreats to symlink — endless
-// remount churn can re-wedge the kernel (the kill-9 holder incident).
-const remountBreakerThreshold = 5
-
-// tccBreakerThreshold is the consecutive TCC-blocked heals (waiting on the
-// macOS "Network Volumes" grant) before the row retreats to symlink; above
-// remountBreakerThreshold since a TCC block is a benign wait, not a kernel
-// hazard.
-const tccBreakerThreshold = 6
+// defaultHealInterval is the steady-state heal cadence, far under the
+// scheduler's ~3.5-minute poll. (Per-row remount backoff/breaker constants live
+// in policies.go — the self-heal policy substrate.)
+const defaultHealInterval = 10 * time.Second
 
 // forceUnmount force-unmounts a fuse carcass without routing through the
 // (possibly dead) holder; test seam.
@@ -63,6 +45,24 @@ func (s *Server) liveSessionGate(ctx context.Context, dir string) (busy bool, n 
 	}
 	n = procscan.CountByConfigDir(sessions, dir)
 	return n > 0, n
+}
+
+// unmountIdle is the sole per-dir force-unmount chokepoint: it force-unmounts dir
+// only after a fresh liveSessionGate proves nothing rides it. busy=true (with the
+// live-session count n) means dir was left mounted — a live session, or a scan
+// failure treated as busy (fail-closed) — since force-unmounting a busy NFS
+// mirror panics the kernel (nfs_vinvalbuf2). busy=false means dir was idle and
+// the force-unmount was attempted; err carries its result. Callers own their
+// context logging off (busy, n, err).
+//
+// A shared native mux root is NOT force-unmounted here: a per-dir scan cannot see
+// a session on a subtree, so that path keeps its own pool-wide gate
+// (sweepMuxRootIdle → anyLiveFuseSession) before its force-unmount.
+func (s *Server) unmountIdle(ctx context.Context, dir string) (busy bool, n int, err error) {
+	if busy, n = s.liveSessionGate(ctx, dir); busy {
+		return true, n, nil
+	}
+	return false, n, forceUnmount(dir)
 }
 
 type rowRetryState struct {
@@ -154,7 +154,7 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 		if s.holder.shallowLive(a.ConfigDir) &&
 			procscan.CountByConfigDir(sessions, a.ConfigDir) > 0 &&
 			s.holder.dueForDeepProbe(a.ConfigDir, now, deepProbeInterval) &&
-			!s.isConverting(a.ID) {
+			!s.cl.held(a.ID) {
 			if msg := s.holder.recordDeep(a.ConfigDir, deepProbe(a.ConfigDir)); msg != "" {
 				s.log.Printf("%s", msg)
 			}
@@ -172,7 +172,7 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 		if dead, wedged := s.holder.heldDead(a.ConfigDir); dead && !wedged && s.deferShallowDead(a) {
 			continue
 		}
-		if !s.beginPoll(a.ID) {
+		if !s.cl.hold(a.ID) {
 			continue // skip-don't-race; the owner leaves it consistent
 		}
 		fresh, err := s.m.Store.GetAccount(a.ID)
@@ -218,7 +218,7 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 				}
 			}
 		}
-		s.endPoll(a.ID)
+		s.cl.disownHold(a.ID)
 	}
 	for id := range s.rowRetry {
 		if !inPass[id] {
@@ -304,19 +304,27 @@ func (s *Server) convertRowToSymlink(ctx context.Context, a store.Account, annou
 	// by ConvertOverlay's mux Teardown, but the detach still yields EIO/ENOENT on a
 	// live session's open files, so it keeps the same gate — session-breaking, not
 	// kernel-hazardous.
+	// A legacy per-dir mount comes down through the idle chokepoint; a mux bridge
+	// (mutually exclusive with a real mountpoint) is detached kernel-free by
+	// ConvertOverlay below but still needs the same idle gate, since the detach
+	// breaks a live session's open files.
 	legacy := overlayMounted(fresh.ConfigDir)
-	if legacy || pool.IsBridgeSymlink(fresh.ConfigDir) {
-		if busy, n := s.liveSessionGate(ctx, fresh.ConfigDir); busy {
+	if legacy {
+		busy, n, err := s.unmountIdle(ctx, fresh.ConfigDir)
+		if busy {
 			s.log.Printf("acct-%02d symlink retreat deferred: %d live session(s) on %s — leaving fuse", a.ID, n, fresh.ConfigDir)
 			return false
 		}
-	}
-	if legacy {
-		if err := forceUnmount(fresh.ConfigDir); err != nil {
+		if err != nil {
 			// Do not proceed into ConvertOverlay: its Teardown would re-spawn the
 			// holder being retreated from. A dir the kernel refuses to unmount
 			// cannot be safely symlinked anyway.
 			s.log.Printf("acct-%02d symlink retreat: force-unmount %s wedged; leaving fuse: %v", a.ID, fresh.ConfigDir, err)
+			return false
+		}
+	} else if pool.IsBridgeSymlink(fresh.ConfigDir) {
+		if busy, n := s.liveSessionGate(ctx, fresh.ConfigDir); busy {
+			s.log.Printf("acct-%02d symlink retreat deferred: %d live session(s) on %s — leaving fuse", a.ID, n, fresh.ConfigDir)
 			return false
 		}
 	}
@@ -332,11 +340,11 @@ func (s *Server) convertRowToSymlink(ctx context.Context, a store.Account, annou
 // escalateRowToSymlink is the poll-held entry to convertRowToSymlink; a claim
 // refusal (pending select) leaves the breaker armed to re-fire.
 func (s *Server) escalateRowToSymlink(ctx context.Context, a store.Account, announce string) bool {
-	if !s.beginConvertUnderPoll(a.ID) {
+	if !s.cl.ownHeld(a.ID) {
 		s.log.Printf("acct-%02d symlink retreat deferred: reserved by a pending select", a.ID)
 		return false
 	}
-	defer s.endConvert(a.ID)
+	defer s.cl.disownConvert(a.ID)
 	return s.convertRowToSymlink(ctx, a, announce)
 }
 
@@ -421,11 +429,11 @@ func (s *Server) recoverNativeMount(ctx context.Context) {
 // carcass (dead or foreign holder) or pool-wide wedge. After the unmount noteUnmounted
 // drops every stale vouch so no select trusts the torn-down mount before the re-mount.
 func (s *Server) sweepMuxRootIdle(ctx context.Context, fuse []store.Account) bool {
-	if !s.beginNativeRecovery(fuse) {
+	if !s.cl.ownPool(fuse) {
 		s.log.Printf("native mux force-unmount deferred: a select holds a reservation on a fuse account")
 		return false
 	}
-	defer s.endNativeRecovery()
+	defer s.cl.disownPool()
 	if busy, dir, n := s.anyLiveFuseSession(ctx, fuse); busy {
 		s.log.Printf("native mux mount left under %d live session(s) on %s — deferring force-unmount (drops every pooled session); relaunch them", n, dir)
 		return false
@@ -518,7 +526,7 @@ func (s *Server) retreatAllFuseRows(ctx context.Context, fuse []store.Account, r
 		if ctx.Err() != nil {
 			return
 		}
-		if !s.beginConvert(a.ID) {
+		if !s.cl.own(a.ID) {
 			s.log.Printf("acct-%02d symlink retreat deferred: reserved, polling, or converting", a.ID)
 			continue
 		}
@@ -526,7 +534,7 @@ func (s *Server) retreatAllFuseRows(ctx context.Context, fuse []store.Account, r
 		if s.convertRowToSymlink(ctx, a, announce) {
 			s.log.Printf("acct-%02d fell back to symlink (%s)", a.ID, reason)
 		}
-		s.endConvert(a.ID)
+		s.cl.disownConvert(a.ID)
 	}
 }
 

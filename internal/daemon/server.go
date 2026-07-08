@@ -99,16 +99,11 @@ type Server struct {
 	// m.Close() closes the database under them.
 	wg sync.WaitGroup
 
-	mu           sync.Mutex
-	reservations map[int]time.Time // accountID -> reserved-at
-	converting   map[int]bool      // accountID -> overlay conversion in flight
-	polling      map[int]bool      // accountID -> scheduler/reconcile owns the dir this iteration
-	// nativeRecovering is a pool-wide claim: a force-unmount of the shared native
-	// mux root is in flight, so tryReserve refuses EVERY account for its span (the
-	// unmount drops every subtree). Set under mu across the scan→unmount→cache-
-	// invalidate span, the same window-close as a per-account convert claim.
-	nativeRecovering bool
-	rlStreak         map[int]int // accountID -> consecutive 429 count
+	// cl is the account-claim discipline: select reservations plus poll, convert,
+	// and pool-wide claims (see claims.go). It owns its own mutex.
+	cl *claims
+
+	rlStreak map[int]int // accountID -> consecutive 429 count
 	// Pool-wide 429 gate: /usage rate-limits per shared-IP bucket, so one 429
 	// predicts the rest. Scheduler-goroutine-local — no lock.
 	rlStreakPool      int           // consecutive sweeps that tripped a 429
@@ -224,9 +219,7 @@ func Run(ctx context.Context) error {
 		evictTimeout:    defaultEvictTimeout,
 		startedAt:       time.Now(),
 		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
-		reservations:    map[int]time.Time{},
-		converting:      map[int]bool{},
-		polling:         map[int]bool{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
@@ -556,7 +549,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 				if !s.probeWinnerReady(ctx, sn.Account) {
 					return Response{OK: false, Error: fmt.Sprintf("acct-%02d's overlay is wedged; the daemon is recovering it — retry shortly", sn.Account.ID)}
 				}
-				if !s.tryReserve(sn.Account.ID) {
+				if !s.cl.reserve(sn.Account.ID) {
 					return Response{OK: false, Error: fmt.Sprintf("acct-%02d is migrating overlays; retry shortly", sn.Account.ID)}
 				}
 				if !req.NoMark && req.PID > 0 {
@@ -592,7 +585,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	// penalize.
 	usable := make([]pool.Snapshot, 0, len(snaps))
 	for _, sn := range snaps {
-		if s.isConverting(sn.Account.ID) || !s.mountReady(sn.Account) {
+		if s.cl.held(sn.Account.ID) || !s.mountReady(sn.Account) {
 			continue
 		}
 		usable = append(usable, sn)
@@ -639,7 +632,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		return Response{OK: false, Error: fmt.Sprintf("acct-%02d's overlay is wedged; the daemon is recovering it — retry shortly", best.Account.ID)}
 	}
 	if !req.NoMark {
-		if !s.tryReserve(best.Account.ID) {
+		if !s.cl.reserve(best.Account.ID) {
 			// A conversion claimed the winner between the filter above and
 			// here — vanishingly rare; the client just retries.
 			return Response{OK: false, Error: fmt.Sprintf("acct-%02d began migrating overlays mid-select; retry shortly", best.Account.ID)}
@@ -783,136 +776,6 @@ func (s *Server) releaseIdleLeases(ctx context.Context, closed map[int]store.Acc
 			s.sync.releaseLease(ctx, a)
 		}
 	}
-}
-
-// tryReserve records a short-lived reservation for an account, refusing while
-// an overlay conversion holds it (the conversion is about to remake the dir a
-// launching claude would land in).
-func (s *Server) tryReserve(id int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.converting[id] || s.nativeRecovering {
-		return false
-	}
-	s.reservations[id] = time.Now()
-	return true
-}
-
-// beginNativeRecovery claims the pool for a shared native mux-root force-unmount:
-// it refuses if another recovery already holds the claim or any listed fuse
-// account holds a live reservation (a select is
-// launching onto a subtree of the root right now), else sets nativeRecovering so
-// tryReserve refuses new reservations for the whole force-unmount span. The
-// reservation scan and the flag set are one critical section — the same
-// window-close beginConvert uses against a racing select. Caller pairs it with
-// endNativeRecovery.
-func (s *Server) beginNativeRecovery(fuse []store.Account) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.nativeRecovering {
-		// An overlapping sweep (holder-loss vs startup/periodic) coalesces: the
-		// in-flight one owns the span, and its endNativeRecovery must not be
-		// undercut by a second claimant releasing early.
-		return false
-	}
-	for _, a := range fuse {
-		if t, ok := s.reservations[a.ID]; ok && time.Since(t) <= reservationTTL {
-			return false
-		}
-	}
-	s.nativeRecovering = true
-	return true
-}
-
-// endNativeRecovery releases the pool-wide native-recovery claim.
-func (s *Server) endNativeRecovery() {
-	s.mu.Lock()
-	s.nativeRecovering = false
-	s.mu.Unlock()
-}
-
-// beginConvert claims an account for overlay conversion iff it has no live
-// reservation, no conversion in flight, and no poll mid-iteration on its dir.
-// The check-and-claim is one critical section (closing the race against
-// tryReserve and beginPoll); the converting flag — not the mutex — then owns
-// the account across the conversion's I/O.
-func (s *Server) beginConvert(id int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if t, ok := s.reservations[id]; ok && time.Since(t) <= reservationTTL {
-		return false
-	}
-	if s.converting[id] || s.polling[id] {
-		return false
-	}
-	if s.converting == nil {
-		s.converting = map[int]bool{}
-	}
-	s.converting[id] = true
-	return true
-}
-
-// beginConvertUnderPoll claims an account for a conversion run from inside a
-// poll iteration (the fuse→symlink fallback) iff it has no live reservation and
-// no conversion in flight. Unlike beginConvert it tolerates the caller's own
-// poll claim (healFuse runs under one); once converting is set, tryReserve
-// refuses for the whole ConvertOverlay, closing the gate→convert window against
-// select. Callers must hold the account's poll claim so two conversions never
-// interleave.
-func (s *Server) beginConvertUnderPoll(id int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if t, ok := s.reservations[id]; ok && time.Since(t) <= reservationTTL {
-		return false
-	}
-	if s.converting[id] {
-		return false
-	}
-	if s.converting == nil {
-		s.converting = map[int]bool{}
-	}
-	s.converting[id] = true
-	return true
-}
-
-// endConvert releases a conversion claim.
-func (s *Server) endConvert(id int) {
-	s.mu.Lock()
-	delete(s.converting, id)
-	s.mu.Unlock()
-}
-
-// isConverting reports whether an overlay conversion holds the account.
-func (s *Server) isConverting(id int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.converting[id]
-}
-
-// beginPoll claims an account for one scheduler/reconcile iteration — the
-// Sync/Setup/fallback/refresh work that must never interleave with a
-// conversion's move/teardown/mount. Unlike converting, a poll claim does not
-// hide the account from select (sessions can land on a dir being
-// health-checked); it only excludes conversions, two-sidedly with beginConvert.
-// The claim — not the mutex — owns the account across the iteration's I/O.
-func (s *Server) beginPoll(id int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.converting[id] || s.polling[id] {
-		return false
-	}
-	if s.polling == nil {
-		s.polling = map[int]bool{}
-	}
-	s.polling[id] = true
-	return true
-}
-
-// endPoll releases a poll claim.
-func (s *Server) endPoll(id int) {
-	s.mu.Lock()
-	delete(s.polling, id)
-	s.mu.Unlock()
 }
 
 // mountReady reports whether an account's overlay can serve a session now. A
@@ -1103,21 +966,6 @@ func fuseBackedRow(overlayKind string) bool {
 	return b.IsFuse()
 }
 
-// reservedCount returns the number of live reservations for an account.
-func (s *Server) reservedCount(id int) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t, ok := s.reservations[id]
-	if !ok {
-		return 0
-	}
-	if time.Since(t) > reservationTTL {
-		delete(s.reservations, id)
-		return 0
-	}
-	return 1
-}
-
 // rankWithReservations re-ranks snapshots with reservation and peer-lease
 // penalties applied, returning the ranking plus a snapshot lookup by account
 // id. A live peer lease counts as one extra active session — a penalty, never
@@ -1137,7 +985,7 @@ func (s *Server) rankWithReservations(snaps []pool.Snapshot) ([]score.Result, ma
 			Resets5h:       sn.Resets5h,
 			Resets7d:       sn.Resets7d,
 			Burn5hPerHour:  sn.Burn5hPerHour,
-			ActiveSessions: sn.ActiveSessions + s.reservedCount(sn.Account.ID) + peerLeases[sn.Account.ID],
+			ActiveSessions: sn.ActiveSessions + s.cl.reservedCount(sn.Account.ID) + peerLeases[sn.Account.ID],
 			RateLimited:    sn.RateLimited,
 			RefreshFailed:  sn.Stale && !sn.HasUsage,
 			NeedsLogin:     sn.NeedsLogin,
@@ -1230,14 +1078,14 @@ func (s *Server) reconcileOverlays(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if !s.beginPoll(a.ID) {
+		if !s.cl.hold(a.ID) {
 			// An OpMigrate landed before startup reconcile reached this
 			// account; the conversion leaves it consistent on its own.
 			s.log.Printf("acct-%02d busy converting; skipping startup reconcile", a.ID)
 			continue
 		}
 		s.reconcileAccount(ctx, a)
-		s.endPoll(a.ID)
+		s.cl.disownHold(a.ID)
 	}
 	// Clear any wedged carcass under accounts/ that no row owns (a pre-row `ccp
 	// add` mount whose holder died); this startup sweep is its only cleaner.
@@ -1273,12 +1121,13 @@ func (s *Server) sweepOrphanMountpoints(ctx context.Context, accts []store.Accou
 		// A carcass actively read by a live claude is not a carcass yet:
 		// force-unmounting ANY busy NFS mirror panics the kernel, so defer to a
 		// later sweep once the session relaunches. Leave it mounted and surface it.
-		if busy, n := s.liveSessionGate(ctx, dir); busy {
+		busy, n, err := s.unmountIdle(ctx, dir)
+		if busy {
 			s.log.Printf("orphaned mountpoint %s left under %d live session(s) — NOT force-unmounting (would panic the kernel); relaunch them", dir, n)
 			continue
 		}
-		s.log.Printf("clearing orphaned mountpoint with no account row (pre-row add carcass?): %s", dir)
-		if err := forceUnmount(dir); err != nil {
+		s.log.Printf("cleared orphaned mountpoint with no account row (pre-row add carcass?): %s", dir)
+		if err != nil {
 			s.log.Printf("orphan mount sweep: force-unmount %s: %v", dir, err)
 		}
 	}
@@ -1450,7 +1299,7 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 		if !s.beginSymlinkHealHeld(ctx, fresh) {
 			return
 		}
-		defer s.endConvert(fresh.ID)
+		defer s.cl.disownConvert(fresh.ID)
 		if !s.convergeSymlinkRowBridge(fresh) {
 			return
 		}
@@ -1466,11 +1315,12 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 		// repair below can proceed. But a live claude may still be reading this
 		// carcass, and force-unmounting a busy NFS mirror panics the kernel — so
 		// when a session is bound, leave it and re-check next tick.
-		if busy, n := s.liveSessionGate(ctx, a.ConfigDir); busy {
+		busy, n, err := s.unmountIdle(ctx, a.ConfigDir)
+		if busy {
 			s.log.Printf("acct-%02d: stale mountpoint left under %d live session(s) — NOT force-unmounting (would panic the kernel); relaunch them", a.ID, n)
 			return
 		}
-		if err := forceUnmount(a.ConfigDir); err != nil {
+		if err != nil {
 			s.log.Printf("acct-%02d: unmount stale mountpoint: %v", a.ID, err)
 			return
 		}
@@ -1524,12 +1374,12 @@ func (s *Server) migrateLegacyFuseRow(ctx context.Context, a store.Account) {
 	// converting is set tryReserve refuses for the whole span, and a live
 	// reservation defers the migration. Released before healFuse re-attaches — its
 	// own fallback path takes the claim afresh.
-	if !s.beginConvertUnderPoll(a.ID) {
+	if !s.cl.ownHeld(a.ID) {
 		s.log.Printf("acct-%02d deferring legacy→mux migration: reserved by a pending select", a.ID)
 		return
 	}
 	drained := s.drainLegacyFuseDir(ctx, a, base, dir)
-	s.endConvert(a.ID)
+	s.cl.disownConvert(a.ID)
 	if !drained {
 		return
 	}
@@ -1543,12 +1393,17 @@ func (s *Server) migrateLegacyFuseRow(ctx context.Context, a store.Account) {
 // re-run on a bare, half-migrated dir still swaps the account's CLAUDE_CONFIG_DIR
 // out from under any live claude, so it must defer just like a mounted one.
 func (s *Server) drainLegacyFuseDir(ctx context.Context, a store.Account, base, dir string) bool {
-	if busy, n := s.liveSessionGate(ctx, dir); busy {
-		s.log.Printf("acct-%02d deferring legacy→mux migration: %d live session(s) on %s; relaunch them", a.ID, n, dir)
-		return false
-	}
+	// The idle gate is unconditional — it guards the drain (which swaps
+	// CLAUDE_CONFIG_DIR even on a bare, half-migrated dir), not only the unmount.
+	// A live mount comes down through the idle chokepoint; a bare dir takes the
+	// same gate without unmounting.
 	if overlayMounted(dir) {
-		if err := forceUnmount(dir); err != nil {
+		busy, n, err := s.unmountIdle(ctx, dir)
+		if busy {
+			s.log.Printf("acct-%02d deferring legacy→mux migration: %d live session(s) on %s; relaunch them", a.ID, n, dir)
+			return false
+		}
+		if err != nil {
 			s.log.Printf("acct-%02d mux migration: force-unmount legacy mount %s: %v", a.ID, dir, err)
 			return false
 		}
@@ -1556,6 +1411,9 @@ func (s *Server) drainLegacyFuseDir(ctx context.Context, a store.Account, base, 
 		// racing the drain must never launch onto the torn-down dir.
 		s.holder.noteUnmounted(dir)
 		s.log.Printf("acct-%02d tore down legacy per-dir mount for mux migration", a.ID)
+	} else if busy, n := s.liveSessionGate(ctx, dir); busy {
+		s.log.Printf("acct-%02d deferring legacy→mux migration: %d live session(s) on %s; relaunch them", a.ID, n, dir)
+		return false
 	}
 	if err := s.drainDirForBridge(a, base, dir); err != nil {
 		s.log.Printf("acct-%02d mux migration: %v", a.ID, err)
@@ -1842,11 +1700,11 @@ func (s *Server) sweepAndMount(prov fkoverlay.Provider, a store.Account, base, d
 // out of the fuse backing dir, restoring the account's .claude.json identity.
 // Callers must hold the account's poll claim.
 func (s *Server) fallbackToSymlink(ctx context.Context, a store.Account) {
-	if !s.beginConvertUnderPoll(a.ID) {
+	if !s.cl.ownHeld(a.ID) {
 		s.log.Printf("acct-%02d deferring fuse→symlink fallback: reserved by a pending select or already converting", a.ID)
 		return
 	}
-	defer s.endConvert(a.ID)
+	defer s.cl.disownConvert(a.ID)
 	sessions, err := s.scan(ctx)
 	if err != nil {
 		s.log.Printf("acct-%02d deferring fuse→symlink fallback: session scan: %v", a.ID, err)

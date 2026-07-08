@@ -209,7 +209,7 @@ func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
 	s.holderSocket = startCannedHolder(t, nil)
 	fake.setupErr = mountTimeoutChain()
 	s.rowRetry = map[int]rowRetryState{1: {failures: 2, retryAt: time.Now().Add(-time.Second)}}
-	if !s.beginPoll(1) {
+	if !s.cl.hold(1) {
 		t.Fatal("beginPoll failed on a free account")
 	}
 
@@ -221,7 +221,7 @@ func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
 		t.Fatalf("failures after a skip = %d, want 2 unchanged", got)
 	}
 
-	s.endPoll(1)
+	s.cl.disownHold(1)
 	healTick(t.Context(), s)
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups after release = %d, want 1", fake.setupCount())

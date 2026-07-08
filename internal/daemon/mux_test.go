@@ -315,7 +315,7 @@ func TestMigrateLegacyClaimAtomicAgainstSelect(t *testing.T) {
 	s.holder.noteMounted(dir)
 	reservedMidMigration := false
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		reservedMidMigration = s.tryReserve(1)
+		reservedMidMigration = s.cl.reserve(1)
 		return nil, nil
 	}
 	var unmounted []string
@@ -332,7 +332,7 @@ func TestMigrateLegacyClaimAtomicAgainstSelect(t *testing.T) {
 	if !pool.IsBridgeSymlink(dir) {
 		t.Fatal("bridge symlink not laid after the migration")
 	}
-	if s.isConverting(1) {
+	if s.cl.held(1) {
 		t.Fatal("migration leaked its converting claim")
 	}
 }
@@ -500,20 +500,20 @@ func TestAnyLiveFuseSessionCountsRowlessBridge(t *testing.T) {
 func TestNativeRecoveryBlocksReservations(t *testing.T) {
 	s, dirs, _ := newMigrateServer(t)
 	fuse := []store.Account{{ID: 1, ConfigDir: dirs[1], OverlayKind: "nfs"}}
-	if !s.beginNativeRecovery(fuse) {
+	if !s.cl.ownPool(fuse) {
 		t.Fatal("beginNativeRecovery failed on a free pool")
 	}
-	if s.tryReserve(1) {
+	if s.cl.reserve(1) {
 		t.Fatal("tryReserve succeeded during native recovery")
 	}
-	if s.tryReserve(2) {
+	if s.cl.reserve(2) {
 		t.Fatal("tryReserve succeeded for a sibling during native recovery")
 	}
-	s.endNativeRecovery()
-	if !s.tryReserve(1) {
+	s.cl.disownPool()
+	if !s.cl.reserve(1) {
 		t.Fatal("tryReserve failed after native recovery ended")
 	}
-	if s.beginNativeRecovery(fuse) {
+	if s.cl.ownPool(fuse) {
 		t.Fatal("beginNativeRecovery succeeded over a live reservation")
 	}
 }
@@ -530,7 +530,7 @@ func TestSweepOrphanMuxRootClaimAtomicAgainstSelect(t *testing.T) {
 	fakeOverlayMounted(t, func(d string) bool { return d == root })
 	reservedMidSweep := false
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		reservedMidSweep = s.tryReserve(1)
+		reservedMidSweep = s.cl.reserve(1)
 		return nil, nil
 	}
 	swapForceUnmount(t, func(string) error { return nil })
@@ -793,15 +793,15 @@ func TestReconcileOverlaysReapsOrphansAtStartup(t *testing.T) {
 // interleave — the second claimant defers instead of double-unmounting and
 // releasing the first one's claim early.
 func TestBeginNativeRecoveryExcludesOverlappingSweeps(t *testing.T) {
-	s := &Server{}
-	if !s.beginNativeRecovery(nil) {
+	s := &Server{cl: newClaims()}
+	if !s.cl.ownPool(nil) {
 		t.Fatal("first native-recovery claim refused on an idle pool")
 	}
-	if s.beginNativeRecovery(nil) {
+	if s.cl.ownPool(nil) {
 		t.Fatal("second claim granted while a native recovery is in flight")
 	}
-	s.endNativeRecovery()
-	if !s.beginNativeRecovery(nil) {
+	s.cl.disownPool()
+	if !s.cl.ownPool(nil) {
 		t.Fatal("claim refused after the in-flight recovery released")
 	}
 }

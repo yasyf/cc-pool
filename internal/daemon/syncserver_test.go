@@ -121,7 +121,7 @@ func TestSyncSocketServesConsumer(t *testing.T) {
 // erroring lookup refuses, a known uuid claims via beginConvert (blocking a second
 // claim) and releases via endConvert.
 func TestServerClaimsAdapter(t *testing.T) {
-	s := &Server{reservations: map[int]time.Time{}}
+	s := &Server{cl: newClaims()}
 	sc := serverClaims{s: s, byUUID: func(uuid string) (store.Account, bool, error) {
 		switch uuid {
 		case "known":
@@ -144,14 +144,14 @@ func TestServerClaimsAdapter(t *testing.T) {
 	if !ok {
 		t.Fatal("known uuid not claimed")
 	}
-	if !s.isConverting(3) {
+	if !s.cl.held(3) {
 		t.Error("account 3 not marked converting after claim")
 	}
 	if _, ok2 := sc.TryClaim("known"); ok2 {
 		t.Error("a second claim on a held account succeeded")
 	}
 	release()
-	if s.isConverting(3) {
+	if s.cl.held(3) {
 		t.Error("account 3 still converting after release")
 	}
 }
@@ -164,7 +164,7 @@ func TestSyncEnabledMeta(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	s := &Server{m: &pool.Manager{Store: st}}
+	s := &Server{cl: newClaims(), m: &pool.Manager{Store: st}}
 
 	if on, err := s.syncEnabled(); err != nil || on {
 		t.Fatalf("syncEnabled with no meta = %v (err %v), want false", on, err)

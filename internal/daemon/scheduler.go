@@ -37,15 +37,11 @@ const (
 	// connectivity dropped again mid-sweep, so the remaining accounts are left to
 	// heal on the next canary probe instead of each burning a sample timeout.
 	recoveryAbandonThreshold = 3
-
-	rateLimitBackoffBase = 3 * time.Minute
-	// Shared-IP /usage 429 penalties run 30+ min; don't re-probe a live 429 bucket.
-	rateLimitBackoffCap = 30 * time.Minute
-
-	needsLoginAfter = 3
-	// Balances per-poll 401 spam against auto-recovery latency after `ccp login`.
-	needsLoginPollInterval = 15 * time.Minute
 )
+
+// rateLimitBackoffBase/Cap and needsLoginAfter/needsLoginPollInterval (the 429
+// streak backoff and the needs-login streak/throttle) live in policies.go — the
+// self-heal policy substrate.
 
 func rlBackoff(streak int) time.Duration {
 	return proc.Backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap}.After(streak)
@@ -164,11 +160,11 @@ func (s *Server) pollOnce(ctx context.Context) {
 		if !canary && s.poolRateLimited() {
 			break
 		}
-		if !s.beginPoll(a.ID) {
+		if !s.cl.hold(a.ID) {
 			continue
 		}
 		if s.pollGated(a) {
-			s.endPoll(a.ID)
+			s.cl.disownHold(a.ID)
 			continue
 		}
 		// Space consecutive samples so N accounts don't burst the shared-IP
@@ -176,13 +172,13 @@ func (s *Server) pollOnce(ctx context.Context) {
 		if sampled > 0 {
 			select {
 			case <-ctx.Done():
-				s.endPoll(a.ID)
+				s.cl.disownHold(a.ID)
 				return
 			case <-time.After(spacing):
 			}
 		}
 		outcome := s.pollAccount(ctx, sessions, a, scanOK, recovery || canary)
-		s.endPoll(a.ID)
+		s.cl.disownHold(a.ID)
 		sampled++
 
 		if canary {
@@ -294,7 +290,7 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a
 	// A reserved account's claude may not be procscan-visible yet — treat it as
 	// busy so we don't refresh under the launch. A failed scan also reads busy.
 	idle := scanOK && procscan.CountByConfigDir(sessions, a.ConfigDir) == 0 &&
-		s.reservedCount(a.ID) == 0
+		s.cl.reservedCount(a.ID) == 0
 
 	// A just-idled account may carry a token rotated by its session — adopt
 	// before sampling.

@@ -58,11 +58,11 @@ func newFPHealServer(t *testing.T) (*Server, store.Account, map[int]string, *fak
 // ticker does. now controls the attempt clock.
 func healFPStep(t *testing.T, s *Server, a store.Account, now time.Time) {
 	t.Helper()
-	if !s.beginPoll(a.ID) {
+	if !s.cl.hold(a.ID) {
 		t.Fatalf("acct-%02d poll claim refused", a.ID)
 	}
 	s.healFP(t.Context(), a, now)
-	s.endPoll(a.ID)
+	s.cl.disownHold(a.ID)
 }
 
 // TestFPHealLadderEscalation pins the escalation order: attempt 1 is a
@@ -179,7 +179,7 @@ func TestFPHealReservationDefersReRegister(t *testing.T) {
 	now := time.Unix(0, 0)
 
 	healFPStep(t, s, a, now) // attempt 1: Sync; attemptsSoFar -> 1
-	if !s.tryReserve(1) {
+	if !s.cl.reserve(1) {
 		t.Fatal("could not reserve acct-1")
 	}
 	healFPStep(t, s, a, now) // attempt 2 would re-register, but the reservation defers it

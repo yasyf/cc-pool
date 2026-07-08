@@ -33,9 +33,9 @@ func (ss serverSessions) Busy(ctx context.Context, uuid string) (bool, string, e
 	}
 	for _, a := range rows {
 		switch {
-		case ss.s.isConverting(a.ID):
+		case ss.s.cl.held(a.ID):
 			return true, fmt.Sprintf("acct-%02d overlay conversion in flight", a.ID), nil
-		case ss.s.reservedCount(a.ID) > 0:
+		case ss.s.cl.reservedCount(a.ID) > 0:
 			return true, fmt.Sprintf("acct-%02d reserved by a launching select", a.ID), nil
 		}
 		if n := procscan.CountByConfigDir(sessions, a.ConfigDir); n > 0 {

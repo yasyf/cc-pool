@@ -315,7 +315,7 @@ func TestHandleMigrateSingleAccount(t *testing.T) {
 
 func TestHandleMigrateBusyWhenReserved(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
-	if !s.tryReserve(1) {
+	if !s.cl.reserve(1) {
 		t.Fatal("tryReserve failed on a free account")
 	}
 
@@ -333,13 +333,13 @@ func TestHandleMigrateBusyWhenReserved(t *testing.T) {
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups = %d, want 1", fake.setupCount())
 	}
-	if s.isConverting(1) {
+	if s.cl.held(1) {
 		t.Fatal("busy refusal leaked a converting claim")
 	}
 
-	s.mu.Lock()
-	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
-	s.mu.Unlock()
+	s.cl.mu.Lock()
+	s.cl.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
+	s.cl.mu.Unlock()
 	resp = s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
 	got = outcomes(resp)
 	if got[1] != MigrationDone || got[2] != MigrationAlready {
@@ -350,26 +350,26 @@ func TestHandleMigrateBusyWhenReserved(t *testing.T) {
 func TestConvertClaimExcludesReservations(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 
-	if !s.beginConvert(1) {
+	if !s.cl.own(1) {
 		t.Fatal("beginConvert failed on a free account")
 	}
-	if s.tryReserve(1) {
+	if s.cl.reserve(1) {
 		t.Fatal("tryReserve succeeded on a converting account")
 	}
-	if s.beginConvert(1) {
+	if s.cl.own(1) {
 		t.Fatal("double beginConvert succeeded")
 	}
-	s.endConvert(1)
-	if !s.tryReserve(1) {
+	s.cl.disownConvert(1)
+	if !s.cl.reserve(1) {
 		t.Fatal("tryReserve failed after endConvert")
 	}
-	if s.beginConvert(1) {
+	if s.cl.own(1) {
 		t.Fatal("beginConvert succeeded over a live reservation")
 	}
-	s.mu.Lock()
-	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
-	s.mu.Unlock()
-	if !s.beginConvert(1) {
+	s.cl.mu.Lock()
+	s.cl.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
+	s.cl.mu.Unlock()
+	if !s.cl.own(1) {
 		t.Fatal("beginConvert failed over an expired reservation")
 	}
 }
@@ -378,7 +378,7 @@ func TestSelectSkipsConvertingAccount(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 
 	// acct-1 is the emptier account; converting must hide it.
-	if !s.beginConvert(1) {
+	if !s.cl.own(1) {
 		t.Fatal("beginConvert failed")
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true})
@@ -392,7 +392,7 @@ func TestSelectSkipsConvertingAccount(t *testing.T) {
 		t.Fatalf("forced select = %+v, want migrating refusal", resp)
 	}
 
-	s.endConvert(1)
+	s.cl.disownConvert(1)
 	resp = s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true})
 	if !resp.OK || *resp.SelectedID != 1 {
 		t.Fatalf("select after endConvert = %+v, want acct-1", resp)
@@ -496,7 +496,7 @@ func TestFallbackToSymlinkClaimAtomicAgainstSelect(t *testing.T) {
 	}
 	reservedMidFallback := false
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		reservedMidFallback = s.tryReserve(1)
+		reservedMidFallback = s.cl.reserve(1)
 		return nil, nil
 	}
 
@@ -508,10 +508,10 @@ func TestFallbackToSymlinkClaimAtomicAgainstSelect(t *testing.T) {
 	if kindOf(t, s, 1) != "symlink" {
 		t.Fatal("idle fallback did not convert")
 	}
-	if s.isConverting(1) {
+	if s.cl.held(1) {
 		t.Fatal("fallback leaked its converting claim")
 	}
-	if !s.tryReserve(1) {
+	if !s.cl.reserve(1) {
 		t.Fatal("account not reservable after the fallback completed")
 	}
 }
@@ -566,37 +566,37 @@ func TestReconcileOverlaysHealsStrandedAndFallsBack(t *testing.T) {
 func TestConvertClaimExcludesPolling(t *testing.T) {
 	s, _, _ := newMigrateServer(t)
 
-	if !s.beginPoll(1) {
+	if !s.cl.hold(1) {
 		t.Fatal("beginPoll failed on a free account")
 	}
-	if s.beginConvert(1) {
+	if s.cl.own(1) {
 		t.Fatal("beginConvert succeeded while the scheduler holds the account")
 	}
-	if s.beginPoll(1) {
+	if s.cl.hold(1) {
 		t.Fatal("double beginPoll succeeded")
 	}
-	s.endPoll(1)
-	if !s.beginConvert(1) {
+	s.cl.disownHold(1)
+	if !s.cl.own(1) {
 		t.Fatal("beginConvert failed after endPoll")
 	}
-	if s.beginPoll(1) {
+	if s.cl.hold(1) {
 		t.Fatal("beginPoll succeeded while a conversion holds the account")
 	}
-	s.endConvert(1)
-	if !s.beginPoll(1) {
+	s.cl.disownConvert(1)
+	if !s.cl.hold(1) {
 		t.Fatal("beginPoll failed after endConvert")
 	}
-	s.endPoll(1)
+	s.cl.disownHold(1)
 
 	// A poll claim must NOT hide the account from select — sessions can land
 	// on a dir that is merely being health-checked.
-	if !s.beginPoll(2) {
+	if !s.cl.hold(2) {
 		t.Fatal("beginPoll failed")
 	}
-	if !s.tryReserve(2) {
+	if !s.cl.reserve(2) {
 		t.Fatal("tryReserve refused a merely-polling account")
 	}
-	s.endPoll(2)
+	s.cl.disownHold(2)
 }
 
 // TestMountFuseSweepsUnderlay: underlay private files (a conversion killed
@@ -712,7 +712,7 @@ func TestHandleMigrateBudgetExhausted(t *testing.T) {
 // live-session gate — a reservation means a claude is launching right now.
 func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
-	if !s.tryReserve(1) {
+	if !s.cl.reserve(1) {
 		t.Fatal("tryReserve failed on a free account")
 	}
 	a, err := s.m.Store.GetAccount(1)
@@ -728,9 +728,9 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	}
 
 	// Force must flow through the wire path too.
-	s.mu.Lock()
-	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
-	s.mu.Unlock()
+	s.cl.mu.Lock()
+	s.cl.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
+	s.cl.mu.Unlock()
 	resp := s.handleMigrate(t.Context(), Request{Op: OpMigrate, To: "fuse", Force: true})
 	if !resp.OK {
 		t.Fatalf("forced migrate failed: %s", resp.Error)
@@ -905,7 +905,7 @@ func TestPollOnceSkipsConvertingAccount(t *testing.T) {
 	fk.Put(a.KeychainService, a.KeychainAccount, cred)
 	seedWrites := fk.WriteCount()
 
-	if !s.beginConvert(a.ID) {
+	if !s.cl.own(a.ID) {
 		t.Fatal("beginConvert failed")
 	}
 	s.pollOnce(t.Context())
@@ -916,7 +916,7 @@ func TestPollOnceSkipsConvertingAccount(t *testing.T) {
 		t.Fatalf("converting account's credential was written %d time(s)", got-seedWrites)
 	}
 
-	s.endConvert(a.ID)
+	s.cl.disownConvert(a.ID)
 	s.pollOnce(t.Context())
 	if got := fo.refreshCount(); got != 1 {
 		t.Fatalf("idle near-expiry account refreshed %d time(s), want 1", got)
@@ -1254,7 +1254,7 @@ func TestHealFuseTaxonomy(t *testing.T) {
 					return nil, errors.New("ps exploded")
 				}
 			}
-			if tc.reserve && !s.tryReserve(1) {
+			if tc.reserve && !s.cl.reserve(1) {
 				t.Fatal("tryReserve failed on a free account")
 			}
 
@@ -1264,7 +1264,7 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			if got := kindOf(t, s, 1); got != tc.wantKind {
 				t.Fatalf("row kind = %q, want %q", got, tc.wantKind)
 			}
-			if s.isConverting(1) {
+			if s.cl.held(1) {
 				t.Fatal("heal leaked a converting claim")
 			}
 			if gotTCC := s.holder.wireStatus().TCCError != ""; gotTCC != tc.wantTCC {
@@ -1307,7 +1307,7 @@ func TestHealFuseSweepFailureRetries(t *testing.T) {
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind = %q, want \"fuse\": a sweep failure must not demote to symlink", got)
 	}
-	if s.isConverting(1) {
+	if s.cl.held(1) {
 		t.Fatal("a sweep failure leaked a converting claim")
 	}
 	if s.holder.wireStatus().TCCError != "" {
@@ -1442,7 +1442,7 @@ func TestFuseGateHolderMitigationMatrix(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			socket := gateHome(t)
 			startVersionedHolder(t, socket, tc.version)
-			s := &Server{holderSocket: socket}
+			s := &Server{cl: newClaims(), holderSocket: socket}
 
 			backend, reason := s.fuseGate(t.Context())
 			if tc.wantPass {
@@ -1476,7 +1476,7 @@ func TestFuseGateHealthFailureFailsSafe(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(deadDir) })
 	// The holder died between the probe and the health read.
-	s := &Server{holderSocket: filepath.Join(deadDir, "gone.sock")}
+	s := &Server{cl: newClaims(), holderSocket: filepath.Join(deadDir, "gone.sock")}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -1500,7 +1500,7 @@ func TestAwaitHolderHealth(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 		socket := filepath.Join(sockDir, "m.sock")
-		s := &Server{holderSocket: socket}
+		s := &Server{cl: newClaims(), holderSocket: socket}
 		lnCh := make(chan net.Listener, 1)
 		timer := time.AfterFunc(300*time.Millisecond, func() {
 			ln, err := net.Listen("unix", socket)
@@ -1534,7 +1534,7 @@ func TestAwaitHolderHealth(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.RemoveAll(deadDir) })
-		s := &Server{holderSocket: filepath.Join(deadDir, "gone.sock")}
+		s := &Server{cl: newClaims(), holderSocket: filepath.Join(deadDir, "gone.sock")}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
@@ -1737,7 +1737,7 @@ func TestFPGate(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
 			probes := swapFPGateSeams(t, tc.available, tc.capable, tc.probeErr)
-			s := &Server{m: &pool.Manager{}}
+			s := &Server{cl: newClaims(), m: &pool.Manager{}}
 
 			backend, reason := s.fpGate(t.Context())
 			if tc.wantBackend != "" {

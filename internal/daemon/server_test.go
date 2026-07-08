@@ -53,8 +53,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		reservations:    map[int]time.Time{},
-		converting:      map[int]bool{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
@@ -69,26 +68,26 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 }
 
 func TestReservedCountExpiresAfterTTL(t *testing.T) {
-	s := &Server{reservations: map[int]time.Time{}}
+	s := &Server{cl: newClaims()}
 
-	if got := s.reservedCount(1); got != 0 {
+	if got := s.cl.reservedCount(1); got != 0 {
 		t.Fatalf("reservedCount before reserve = %d, want 0", got)
 	}
 
-	s.tryReserve(1)
-	if got := s.reservedCount(1); got != 1 {
+	s.cl.reserve(1)
+	if got := s.cl.reservedCount(1); got != 1 {
 		t.Fatalf("reservedCount after reserve = %d, want 1", got)
 	}
 
-	s.mu.Lock()
-	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
-	s.mu.Unlock()
-	if got := s.reservedCount(1); got != 0 {
+	s.cl.mu.Lock()
+	s.cl.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
+	s.cl.mu.Unlock()
+	if got := s.cl.reservedCount(1); got != 0 {
 		t.Fatalf("reservedCount after TTL = %d, want 0", got)
 	}
-	s.mu.Lock()
-	_, ok := s.reservations[1]
-	s.mu.Unlock()
+	s.cl.mu.Lock()
+	_, ok := s.cl.reservations[1]
+	s.cl.mu.Unlock()
 	if ok {
 		t.Fatal("expired reservation was not deleted")
 	}
@@ -372,7 +371,7 @@ func TestHandleSelectNoFallback(t *testing.T) {
 		t.Fatal("a refused fallback pick must not rewrite the sticky record")
 	}
 	for id := 1; id <= 2; id++ {
-		if s.reservedCount(id) != 0 {
+		if s.cl.reservedCount(id) != 0 {
 			t.Fatalf("a refused fallback pick must not reserve acct-%d", id)
 		}
 	}
@@ -571,7 +570,7 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 		socket:          filepath.Join(sockDir, "d.sock"),
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(&logBuf, "", 0),
-		reservations:    map[int]time.Time{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},

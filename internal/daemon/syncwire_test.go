@@ -45,7 +45,7 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 		snapshot:        filepath.Join(home, "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		reservations:    map[int]time.Time{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
@@ -210,7 +210,7 @@ func TestServerSessionsBusy(t *testing.T) {
 			m:            &pool.Manager{Store: st},
 			log:          log.New(io.Discard, "", 0),
 			scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
-			reservations: map[int]time.Time{},
+			cl:           newClaims(),
 		}
 		return s, serverSessions{s: s}
 	}
@@ -235,7 +235,7 @@ func TestServerSessionsBusy(t *testing.T) {
 		},
 		"reservation reads busy": {
 			arrange: func(t *testing.T, s *Server) {
-				if !s.tryReserve(1) {
+				if !s.cl.reserve(1) {
 					t.Fatal("tryReserve failed")
 				}
 			},
@@ -243,7 +243,7 @@ func TestServerSessionsBusy(t *testing.T) {
 		},
 		"conversion reads busy": {
 			arrange: func(t *testing.T, s *Server) {
-				if !s.beginConvert(1) {
+				if !s.cl.own(1) {
 					t.Fatal("beginConvert failed")
 				}
 			},

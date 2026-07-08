@@ -100,7 +100,7 @@ func TestRepairFPDomainOutcomes(t *testing.T) {
 
 	t.Run("a claimed account is busy", func(t *testing.T) {
 		s, a, _, fake := newFPHealServer(t)
-		if !s.tryReserve(a.ID) {
+		if !s.cl.reserve(a.ID) {
 			t.Fatal("could not reserve acct-1")
 		}
 		res := s.repairFPDomain(t.Context(), a, false)

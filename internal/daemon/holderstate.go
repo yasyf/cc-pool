@@ -24,13 +24,8 @@ var deepProbe = overlay.DeepProbeWithin
 // select-time probe is deliberately unthrottled — it is a correctness gate.
 var deepProbeInterval = 30 * time.Second
 
-// deepWedgeStrikes debounces the wedged verdict: one transient slow read under
-// load must not un-vouch a mirror serving live sessions.
-const deepWedgeStrikes = 2
-
-// shallowDeadStrikes debounces remount: the holder's List liveness is a
-// bounded 2s stat that false-negatives under load.
-const shallowDeadStrikes = 2
+// deepWedgeStrikes and shallowDeadStrikes (the deep-probe wedge and List-liveness
+// remount debounces) live in policies.go — the self-heal policy substrate.
 
 // deepVerdict is one dir's deep-probe state (wedged: serves metadata, hangs
 // bulk reads); guarded by holderState.mu.

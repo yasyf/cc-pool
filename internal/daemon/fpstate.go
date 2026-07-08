@@ -10,18 +10,9 @@ import (
 	"github.com/yasyf/fusekit/proc"
 )
 
-// fpWedgeStrikes debounces the File Provider wedged verdict: one transient slow
-// read under materialization load must not un-vouch a domain serving live
-// sessions.
-const fpWedgeStrikes = 2
-
-// fpRecoveryBreaker caps recovery attempts on one wedged domain; past it the
-// breaker trips and heal parks the domain until reset.
-const fpRecoveryBreaker = 5
-
-// fpRecoveryBackoff spaces a wedged domain's recovery attempts: 30s after the
-// first attempt, doubling to a 10m cap.
-var fpRecoveryBackoff = proc.Backoff{Base: 30 * time.Second, Cap: 10 * time.Minute}
+// fpWedgeStrikes, fpRecoveryBreaker, and fpRecoveryBackoff (the FP wedge
+// debounce, recovery breaker, and recovery backoff) live in policies.go — the
+// self-heal policy substrate.
 
 // fpVerdict is one domain's debounced wedge verdict (serves control ops, hangs
 // reads); guarded by fpState.mu.

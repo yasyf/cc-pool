@@ -109,7 +109,7 @@ func (f *fakeDaemon) serve() {
 }
 
 func testServer(socket string, evict time.Duration) *Server {
-	return &Server{
+	return &Server{cl: newClaims(),
 		socket:       socket,
 		log:          log.New(io.Discard, "", 0),
 		evictTimeout: evict,
@@ -169,7 +169,7 @@ func TestHandleShutdownEndsServe(t *testing.T) {
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		evictTimeout:    defaultEvictTimeout,
-		reservations:    map[int]time.Time{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},

@@ -40,10 +40,10 @@ func (c serverClaims) TryClaim(uuid string) (func(), bool) {
 	if err != nil || !ok {
 		return func() {}, false
 	}
-	if !c.s.beginConvert(a.ID) {
+	if !c.s.cl.own(a.ID) {
 		return func() {}, false
 	}
-	return func() { c.s.endConvert(a.ID) }, true
+	return func() { c.s.cl.disownConvert(a.ID) }, true
 }
 
 var _ hostsync.Claims = serverClaims{}

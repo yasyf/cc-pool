@@ -121,7 +121,7 @@ func newGateServerUUID(t *testing.T, cred *creds.Credential, sessions []procscan
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		scanSessions:    func(context.Context) ([]procscan.Session, error) { return sessions, nil },
-		reservations:    map[int]time.Time{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},

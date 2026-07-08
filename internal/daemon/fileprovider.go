@@ -171,11 +171,11 @@ func (s *Server) reconcileFileProvider(ctx context.Context, a store.Account) fpO
 // ErrCannotControl, with fallbackToSymlink's claim-first gating: never blind,
 // never under a live session — defers instead. Callers hold the poll claim.
 func (s *Server) retreatFPToSymlink(ctx context.Context, a store.Account) bool {
-	if !s.beginConvertUnderPoll(a.ID) {
+	if !s.cl.ownHeld(a.ID) {
 		s.log.Printf("acct-%02d deferring file-provider→symlink retreat: reserved by a pending select or already converting", a.ID)
 		return false
 	}
-	defer s.endConvert(a.ID)
+	defer s.cl.disownConvert(a.ID)
 	if !s.convertFPToSymlinkHeld(ctx, a) {
 		return false
 	}
@@ -266,12 +266,12 @@ func (s *Server) handleFPRepair(ctx context.Context, req Request) Response {
 // left, now that the heal breaker parks rather than auto-retreats.
 func (s *Server) repairFPDomain(ctx context.Context, a store.Account, retreat bool) FPRepairResult {
 	res := FPRepairResult{ID: a.ID, Label: a.Label}
-	if !s.beginConvert(a.ID) {
+	if !s.cl.own(a.ID) {
 		res.Outcome = FPRepairBusy
 		res.Detail = "held by a pending select, a daemon poll, or a conversion; retry shortly"
 		return res
 	}
-	defer s.endConvert(a.ID)
+	defer s.cl.disownConvert(a.ID)
 
 	// Re-read under the claim: the caller's list is a stale snapshot.
 	fresh, err := s.m.Store.GetAccount(a.ID)

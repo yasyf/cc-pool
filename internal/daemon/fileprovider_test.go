@@ -159,7 +159,7 @@ func TestFPBridgeSharesSourceAndSerializesWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := &Server{
+	s := &Server{cl: newClaims(),
 		log:           log.New(io.Discard, "", 0),
 		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 	}
@@ -233,7 +233,7 @@ func TestFPBridgeSharesSourceAndSerializesWrites(t *testing.T) {
 // clear.
 func TestStartFPBridgeBindsUnconditionally(t *testing.T) {
 	shortHome(t)
-	s := &Server{
+	s := &Server{cl: newClaims(),
 		log:           log.New(io.Discard, "", 0),
 		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 	}
@@ -272,7 +272,7 @@ func TestStartFPBridgeFlagsConsentPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(groupContainers, 0o700) }) //nolint:gosec // G302: restoring directory rwx perms in test cleanup.
-	s := &Server{
+	s := &Server{cl: newClaims(),
 		log:             log.New(io.Discard, "", 0),
 		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 		fpBridgeBackoff: 25 * time.Millisecond,
@@ -327,7 +327,7 @@ func TestStartFPBridgeGenuineErrorNotConsent(t *testing.T) {
 	if err := os.WriteFile(filepath.Dir(sock), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{
+	s := &Server{cl: newClaims(),
 		log:             log.New(io.Discard, "", 0),
 		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 		fpBridgeBackoff: 25 * time.Millisecond,
@@ -400,7 +400,7 @@ func TestStartFPBridgeRetriesAfterBindFailure(t *testing.T) {
 	waitFor(t, 2*time.Second, "blocker to bind", content.NewBridgeClient(sock).Available)
 
 	buf := &syncBuffer{}
-	s := &Server{
+	s := &Server{cl: newClaims(),
 		log:             log.New(buf, "", 0),
 		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 		fpBridgeBackoff: 25 * time.Millisecond,
@@ -503,14 +503,14 @@ func TestReconcileFileProviderErrorDispatch(t *testing.T) {
 				if _, err := os.Lstat(filepath.Join(dirs[1], "plans")); err != nil {
 					t.Fatalf("retreat did not lay the symlink overlay: %v", err)
 				}
-				if s.isConverting(1) {
+				if s.cl.held(1) {
 					t.Fatal("retreat leaked its converting claim")
 				}
 			default:
 				if teardowns != 0 {
 					t.Fatalf("teardowns = %d on a non-retreat outcome, want 0", teardowns)
 				}
-				if !s.tryReserve(1) {
+				if !s.cl.reserve(1) {
 					t.Fatal("account not reservable after a non-retreat outcome")
 				}
 			}
@@ -540,7 +540,7 @@ func TestReconcileFileProviderRetreatGates(t *testing.T) {
 		if kind := kindOf(t, s, 1); kind != "fileprovider" {
 			t.Fatalf("row converted under a live session: kind = %q", kind)
 		}
-		if s.isConverting(1) {
+		if s.cl.held(1) {
 			t.Fatal("deferred retreat leaked its converting claim")
 		}
 	})
@@ -548,7 +548,7 @@ func TestReconcileFileProviderRetreatGates(t *testing.T) {
 	t.Run("pending select reservation defers", func(t *testing.T) {
 		s, _, fake := newFPServer(t)
 		fake.healthErr, fake.setupErr = errors.New("no domain"), cannotControl
-		if !s.tryReserve(1) {
+		if !s.cl.reserve(1) {
 			t.Fatal("could not reserve acct-1")
 		}
 		a, err := s.m.Store.GetAccount(1)
@@ -644,8 +644,7 @@ func newFPPollServer(t *testing.T, seedCred bool) (*Server, store.Account, *fake
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		reservations:    map[int]time.Time{},
-		converting:      map[int]bool{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
@@ -663,7 +662,7 @@ func newFPPollServer(t *testing.T, seedCred bool) (*Server, store.Account, *fake
 // pollOnce does.
 func pollOnceAccount(t *testing.T, s *Server, a store.Account) {
 	t.Helper()
-	if !s.beginPoll(a.ID) {
+	if !s.cl.hold(a.ID) {
 		t.Fatalf("acct-%02d poll claim refused", a.ID)
 	}
 	// scanOK=true: nil sessions is a clean scan, not a failure.
@@ -685,7 +684,7 @@ func TestPollAccountFileProviderSyncAfterAdoption(t *testing.T) {
 
 	t.Run("reserved account skips adoption and the extra sync", func(t *testing.T) {
 		s, a, fake := newFPPollServer(t, true)
-		if !s.tryReserve(a.ID) {
+		if !s.cl.reserve(a.ID) {
 			t.Fatal("could not reserve")
 		}
 		pollOnceAccount(t, s, a)

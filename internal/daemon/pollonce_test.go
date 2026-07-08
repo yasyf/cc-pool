@@ -147,13 +147,13 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		reservations:    map[int]time.Time{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
 	}
 
-	s.tryReserve(a.ID)
+	s.cl.reserve(a.ID)
 	s.pollOnce(t.Context())
 	if got := fo.refreshCount(); got != 0 {
 		t.Fatalf("reserved account was POST-refreshed %d time(s)", got)
@@ -162,9 +162,9 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 		t.Fatalf("reserved account's credential was written %d time(s)", got-seedWrites)
 	}
 
-	s.mu.Lock()
-	s.reservations[a.ID] = time.Now().Add(-reservationTTL - time.Second)
-	s.mu.Unlock()
+	s.cl.mu.Lock()
+	s.cl.reservations[a.ID] = time.Now().Add(-reservationTTL - time.Second)
+	s.cl.mu.Unlock()
 	s.pollOnce(t.Context())
 	if got := fo.refreshCount(); got != 1 {
 		t.Fatalf("idle near-expiry account refreshed %d time(s), want 1", got)
@@ -201,7 +201,7 @@ func TestPollOnceFailsClosedOnScanError(t *testing.T) {
 			snapshot:        filepath.Join(t.TempDir(), "status.json"),
 			log:             log.New(io.Discard, "", 0),
 			scanSessions:    scan,
-			reservations:    map[int]time.Time{},
+			cl:              newClaims(),
 			rlStreak:        map[int]int{},
 			authStreak:      map[int]int{},
 			lastAuthAttempt: map[int]time.Time{},
@@ -262,7 +262,7 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		reservations:    map[int]time.Time{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
@@ -319,7 +319,7 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		reservations:    map[int]time.Time{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
@@ -381,7 +381,7 @@ func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
 		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		reservations:    map[int]time.Time{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
@@ -430,7 +430,7 @@ func newOutageServer(t *testing.T, n int) (*Server, *fakeOAuth) {
 		log:             log.New(io.Discard, "", 0),
 		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		pollSpacing:     time.Millisecond, // keep multi-account sweeps out of real-time sleeps
-		reservations:    map[int]time.Time{},
+		cl:              newClaims(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
@@ -603,7 +603,7 @@ func TestPollOnceRecoverySweepHealsBusy401(t *testing.T) {
 			scanSessions: func(context.Context) ([]procscan.Session, error) { // a live session → busy
 				return []procscan.Session{{PID: 4242, ConfigDir: a.ConfigDir, StartedAt: time.Now()}}, nil
 			},
-			reservations:    map[int]time.Time{},
+			cl:              newClaims(),
 			rlStreak:        map[int]int{},
 			authStreak:      map[int]int{},
 			lastAuthAttempt: map[int]time.Time{},

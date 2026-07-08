@@ -239,18 +239,18 @@ func TestHandleCredMoveBusyClaims(t *testing.T) {
 		release   func(s *Server)
 	}{
 		"live select reservation": {
-			hold:      func(s *Server) bool { return s.tryReserve(1) },
-			stillHeld: func(s *Server) bool { return s.reservedCount(1) == 1 },
+			hold:      func(s *Server) bool { return s.cl.reserve(1) },
+			stillHeld: func(s *Server) bool { return s.cl.reservedCount(1) == 1 },
 		},
 		"daemon poll claim": {
-			hold:      func(s *Server) bool { return s.beginPoll(1) },
-			stillHeld: func(s *Server) bool { return !s.beginPoll(1) },
-			release:   func(s *Server) { s.endPoll(1) },
+			hold:      func(s *Server) bool { return s.cl.hold(1) },
+			stillHeld: func(s *Server) bool { return !s.cl.hold(1) },
+			release:   func(s *Server) { s.cl.disownHold(1) },
 		},
 		"another conversion": {
-			hold:      func(s *Server) bool { return s.beginConvert(1) },
-			stillHeld: func(s *Server) bool { return s.isConverting(1) },
-			release:   func(s *Server) { s.endConvert(1) },
+			hold:      func(s *Server) bool { return s.cl.own(1) },
+			stillHeld: func(s *Server) bool { return s.cl.held(1) },
+			release:   func(s *Server) { s.cl.disownConvert(1) },
 		},
 	}
 	for name, tc := range cases {
@@ -324,7 +324,7 @@ func TestHandleCredMoveLiveSessionGate(t *testing.T) {
 			if r.Outcome != tc.wantOutcome || !strings.Contains(r.Detail, tc.wantDetail) {
 				t.Fatalf("result = %+v, want %s with %q", r, tc.wantOutcome, tc.wantDetail)
 			}
-			if s.isConverting(1) {
+			if s.cl.held(1) {
 				t.Fatal("gate refusal leaked a converting claim")
 			}
 			if got := fk.TouchedServices(); len(got) != 0 {

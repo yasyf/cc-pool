@@ -100,7 +100,7 @@ func (s *Server) healFPRows(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if s.isConverting(a.ID) || !fpDirLinked(a.ConfigDir) {
+		if s.cl.held(a.ID) || !fpDirLinked(a.ConfigDir) {
 			continue
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, fpControlProbeTimeout)
@@ -126,11 +126,11 @@ func (s *Server) healFPRows(ctx context.Context) {
 		if !s.fp.wedged(a.ConfigDir) || !s.fp.due(a.ConfigDir, now) {
 			continue
 		}
-		if !s.beginPoll(a.ID) {
+		if !s.cl.hold(a.ID) {
 			continue // scheduler/reconcile owns the dir this iteration
 		}
 		s.healFP(ctx, a, now)
-		s.endPoll(a.ID)
+		s.cl.disownHold(a.ID)
 	}
 }
 
@@ -148,10 +148,10 @@ func (s *Server) healFPRows(ctx context.Context) {
 // scheduler; reconcile's own wedged-and-backing-off gate never blocks here because
 // a Missing probe leaves the domain un-wedged.
 func (s *Server) healFPMissing(ctx context.Context, a store.Account, now time.Time) {
-	if !s.beginPoll(a.ID) {
+	if !s.cl.hold(a.ID) {
 		return // scheduler/reconcile owns the dir this iteration
 	}
-	defer s.endPoll(a.ID)
+	defer s.cl.disownHold(a.ID)
 	prov := s.fpProvider(a)
 	if prov == nil {
 		return
@@ -200,11 +200,11 @@ func (s *Server) healFP(ctx context.Context, a store.Account, now time.Time) {
 	// Attempts 2+ remake the domain registration: take the convert claim so no
 	// select hands the dir to a new session mid-re-register. A live reservation
 	// defers (attempt NOT consumed); a live session does not.
-	if !s.beginConvertUnderPoll(a.ID) {
+	if !s.cl.ownHeld(a.ID) {
 		s.log.Printf("acct-%02d file provider recovery deferred: reserved by a pending select", a.ID)
 		return
 	}
-	defer s.endConvert(a.ID)
+	defer s.cl.disownConvert(a.ID)
 	fresh, err := s.m.Store.GetAccount(a.ID)
 	if err != nil {
 		s.log.Printf("acct-%02d file provider recovery: re-read row: %v", a.ID, err)

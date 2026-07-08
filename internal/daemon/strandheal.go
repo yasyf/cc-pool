@@ -77,11 +77,11 @@ func (s *Server) healStrandedRows(ctx context.Context) {
 		if fpBackedRow(a.OverlayKind) || fuseBackedRow(a.OverlayKind) {
 			continue
 		}
-		if !s.beginPoll(a.ID) {
+		if !s.cl.hold(a.ID) {
 			continue // the scheduler or a conversion owns this dir this tick
 		}
 		s.healStrandedSymlinkRow(ctx, a)
-		s.endPoll(a.ID)
+		s.cl.disownHold(a.ID)
 	}
 }
 
@@ -107,7 +107,7 @@ func (s *Server) healStrandedSymlinkRow(ctx context.Context, a store.Account) {
 	if !s.beginSymlinkHealHeld(ctx, fresh) {
 		return
 	}
-	defer s.endConvert(fresh.ID)
+	defer s.cl.disownConvert(fresh.ID)
 
 	if s.dirIsOverlaySymlink(fresh.ConfigDir) {
 		if !s.convergeSymlinkRowBridge(fresh) {
@@ -135,7 +135,7 @@ func (s *Server) healStrandedSymlinkRow(ctx context.Context, a store.Account) {
 // skip this tick — a pending select, a live session, or a scan failure (which
 // cannot rule a session out).
 func (s *Server) beginSymlinkHealHeld(ctx context.Context, a store.Account) bool {
-	if !s.beginConvertUnderPoll(a.ID) {
+	if !s.cl.ownHeld(a.ID) {
 		s.log.Printf("acct-%02d deferring stranded-bridge heal: reserved by a pending select", a.ID)
 		return false
 	}
@@ -143,7 +143,7 @@ func (s *Server) beginSymlinkHealHeld(ctx context.Context, a store.Account) bool
 		if n > 0 {
 			s.log.Printf("acct-%02d deferring stranded-bridge heal: %d live session(s)", a.ID, n)
 		}
-		s.endConvert(a.ID)
+		s.cl.disownConvert(a.ID)
 		return false
 	}
 	return true

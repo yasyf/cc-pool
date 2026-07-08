@@ -206,20 +206,20 @@ func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverl
 		res.Outcome = MigrationAlready
 		return res
 	}
-	if !s.beginConvert(a.ID) {
+	// Claim and re-read the row under it — the caller's list is a stale snapshot.
+	fresh, ok, err := s.ownFresh(a.ID)
+	if !ok {
 		res.Outcome = MigrationBusy
 		res.Detail = "held by a pending select, a daemon poll, or a holder replacement; retry shortly"
 		return res
 	}
-	defer s.endConvert(a.ID)
-
-	// Re-read under the claim: the caller's list is a stale snapshot.
-	a, err := s.m.Store.GetAccount(a.ID)
+	defer s.cl.disownConvert(a.ID)
 	if err != nil {
 		res.Outcome = MigrationFailed
 		res.Detail = fmt.Sprintf("re-read account row: %v", err)
 		return res
 	}
+	a = fresh
 	res.Label, res.From = a.Label, a.OverlayKind
 	if a.OverlayKind == string(to) {
 		res.Outcome = MigrationAlready
