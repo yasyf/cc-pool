@@ -148,9 +148,11 @@ func overlaySpec() fkoverlay.Spec {
 			// No Version: cc-pool must NEVER version-replace the shared holder — that
 			// tears down another tenant's mounts (the cask's launchd owns holder
 			// upgrades).
-			BridgeSocket:    BridgeSocketPath(),
-			ContentMode:     "source",
-			ProbePath:       "/" + overlay.ProbeFileName,
+			BridgeSocket: BridgeSocketPath(),
+			ContentMode:  "source",
+			ProbePath:    "/" + overlay.ProbeFileName,
+			// Only the prefix set rides the wire; overlay.PrivatePatterns (glob
+			// private, e.g. *.lock) intentionally stays off it — see its doc.
 			PrivatePrefixes: overlay.PrivatePrefixes,
 			// MuxRoot makes the provider serve every account as a subtree of ONE
 			// native mount at ~/.cc-pool/mnt and bridge each account dir to its

@@ -230,8 +230,15 @@ func TestPoolContentSourceClassify(t *testing.T) {
 		".Storage-Write.lock": content.EntryPrivate,
 		// Near-miss, genuinely different file: stays a shared carve-out.
 		"mcp-needs-auth.json": content.EntrySymlink,
-		// A .lock name that is NOT one of claude's locks stays shared.
-		"session.lock": content.EntrySymlink,
+		// PrivatePatterns "*.lock" now claims every top-level .lock name: session.lock
+		// flips shared→private, and foo.lock joins it. The case-alias SESSION.LOCK is
+		// missed by PrivateEntry's case-sensitive match but caught by carveOutPrivate's
+		// case-insensitive arm (the APFS leak guard), so it is private too. "lockfile"
+		// has no .lock suffix, so it stays a shared carve-out.
+		"session.lock": content.EntryPrivate,
+		"foo.lock":     content.EntryPrivate,
+		"SESSION.LOCK": content.EntryPrivate,
+		"lockfile":     content.EntrySymlink,
 		// Bulk-I/O names are carve-out symlinks now, agreeing with Manifest.
 		"history.jsonl": content.EntrySymlink,
 		"projects":      content.EntrySymlink,
@@ -285,6 +292,10 @@ func TestPoolContentSourceManifestCarveOut(t *testing.T) {
 		// plain claude's live file family.
 		".Last-Update-Result.json",
 	}
+	// Glob-private (PrivatePatterns "*.lock"): not in any PrivatePrefix, so off the
+	// fusekit wire — but a base snapshot still classifies it private, so Manifest
+	// must never symlink it into the shared base.
+	globPrivateFiles := []string{"foo.lock"}
 	// Silly-rename / AppleDouble / OS litter that must not appear in the manifest at all.
 	litter := []string{".fuse_hidden0000abc", ".nfs.20051234", "._sidecar", ".DS_Store"}
 
@@ -293,7 +304,7 @@ func TestPoolContentSourceManifestCarveOut(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	files := append(append(append([]string{}, sharedFiles...), privateFiles...), litter...)
+	files := append(append(append(append([]string{}, sharedFiles...), privateFiles...), globPrivateFiles...), litter...)
 	for _, n := range files {
 		if err := os.WriteFile(filepath.Join(base, n), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
@@ -353,6 +364,16 @@ func TestPoolContentSourceManifestCarveOut(t *testing.T) {
 	for _, name := range append(append([]string{}, privateDirs...), privateFiles...) {
 		if byName[name].Kind == content.EntrySymlink {
 			t.Errorf("CARDINAL VIOLATION: %s emitted as EntrySymlink into base", name)
+		}
+		if got := f.src.Classify(name); got == content.EntrySymlink {
+			t.Errorf("CARDINAL VIOLATION: Classify(%q) = EntrySymlink", name)
+		}
+	}
+
+	// Glob-private base entries are never symlinked into base (and never emitted).
+	for _, name := range globPrivateFiles {
+		if e, ok := byName[name]; ok {
+			t.Errorf("%s emitted as %+v; a glob-private name must never appear in the manifest", name, e)
 		}
 		if got := f.src.Classify(name); got == content.EntrySymlink {
 			t.Errorf("CARDINAL VIOLATION: Classify(%q) = EntrySymlink", name)

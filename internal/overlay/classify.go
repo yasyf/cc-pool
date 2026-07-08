@@ -7,7 +7,10 @@
 // migration) lives in github.com/yasyf/fusekit/overlay.
 package overlay
 
-import "strings"
+import (
+	"path"
+	"strings"
+)
 
 // ExcludedEntries are top-level ~/.claude entries that must NOT be shared across
 // accounts; each becomes a private, empty per-account directory instead:
@@ -52,6 +55,14 @@ var SkipEntries = map[string]bool{
 // creation through the mount.
 var SkipPrefixes = []string{"._", ".fuse_hidden", ".nfs."}
 
+// PrivatePatterns are top-level (path.Match, no Separator) glob patterns whose
+// matches are per-account private — case-sensitive in PrivateEntry, case-
+// insensitive in the carveOutPrivate leak guard. Unlike PrivatePrefixes they are
+// deliberately NOT on the fusekit wire, so a glob-only match created live through
+// a FUSE mount keeps prefix-only routing in holderfs (a divergence from the FP and
+// symlink backends).
+var PrivatePatterns = []string{"*.lock"}
+
 // PrivateEntry reports whether a top-level entry name is per-account private:
 //
 //   - the ExcludedEntries dirs;
@@ -66,15 +77,24 @@ var SkipPrefixes = []string{"._", ".fuse_hidden", ".nfs."}
 //   - .storage-write.lock, .oauth_refresh.lock: claude's mkdir/rmdir lock dirs; a
 //     shared symlink makes claude's rmdir-release fail ENOTDIR and silently drops
 //     the OAuth-token save. Kept per-account so claude locks a real local dir.
+//   - any case-sensitive PrivatePatterns glob match (e.g. *.lock).
 func PrivateEntry(name string) bool {
-	return ExcludedEntries[name] ||
+	if ExcludedEntries[name] ||
 		name == ".claude.json" || strings.HasPrefix(name, ".claude.json.") ||
 		name == ".credentials.json" || strings.HasPrefix(name, ".credentials.json.") ||
 		strings.HasPrefix(name, ".last-update-result") ||
 		name == "remote-settings.json" || strings.HasPrefix(name, "remote-settings.json.") ||
 		name == "mcp-needs-auth-cache.json" || strings.HasPrefix(name, "mcp-needs-auth-cache.json.") ||
 		strings.HasPrefix(name, ".storage-write.lock") ||
-		strings.HasPrefix(name, ".oauth_refresh.lock")
+		strings.HasPrefix(name, ".oauth_refresh.lock") {
+		return true
+	}
+	for _, p := range PrivatePatterns {
+		if ok, _ := path.Match(p, name); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // sharedTopLevel reports whether a top-level base entry is carved out as a live
@@ -109,15 +129,23 @@ var PrivatePrefixes = []string{
 }
 
 // carveOutPrivate bars a name from the shared carve-out beyond PrivateEntry:
-// bare PrivatePrefixes matches (the holder's own private-redirect test) and case
+// bare PrivatePrefixes matches (the holder's own private-redirect test), case
 // variants (the default APFS base is case-insensitive, so ".Credentials.json" IS
-// the live credential file). Barring is always safe — never a symlink into base.
+// the live credential file), and case-insensitive PrivatePatterns matches (so
+// SESSION.LOCK never symlinks into the shared base). Barring is always safe —
+// never a symlink into base.
 func carveOutPrivate(name string) bool {
-	if ExcludedEntries[strings.ToLower(name)] {
+	lower := strings.ToLower(name)
+	if ExcludedEntries[lower] {
 		return true
 	}
 	for _, p := range PrivatePrefixes {
 		if len(name) >= len(p) && strings.EqualFold(name[:len(p)], p) {
+			return true
+		}
+	}
+	for _, p := range PrivatePatterns {
+		if ok, _ := path.Match(p, lower); ok {
 			return true
 		}
 	}
