@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# fake-security stands in for /usr/bin/security in the two-host sync sim so the
+# sim NEVER reads, writes, or even names an item in the real login Keychain.
+# cc-pool selects the credential backend from this binary's answers:
+#
+#   * find-generic-password  -> "item could not be found" (errSecItemNotFound):
+#     no Keychain item exists, so a fresh credential lands in the file store.
+#   * list-keychains -d user -> empty: the login keychain is NOT in the search
+#     list, so creds treats item absence as unprovable (ErrUnavailable) and
+#     falls back to the plaintext .credentials.json file store.
+#   * add-generic-password   -> hard error: a tripwire. The file-backed sim must
+#     never write the Keychain; failing loud beats silently mutating real state.
+#   * delete-generic-password-> success (nothing to delete).
+#
+# Point CLAUDE_POOL_SECURITY_BIN at this script.
+set -u
+
+sub="${1:-}"
+case "$sub" in
+  find-generic-password)
+    echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." 1>&2
+    exit 44
+    ;;
+  list-keychains)
+    # Emit nothing: no "login.keychain" in the user search list.
+    exit 0
+    ;;
+  add-generic-password)
+    echo "fake-security: refusing add-generic-password — the sim is file-backed and must never touch the real Keychain" 1>&2
+    exit 1
+    ;;
+  delete-generic-password)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac

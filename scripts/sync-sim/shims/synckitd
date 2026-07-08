@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# synckitd is a no-op stand-in for the real synckit daemon in the two-host sync
+# sim. cc-pool's `sync enable` requires synckitd on PATH and best-effort execs
+# `synckitd register <manifest>` / `synckitd unregister cc-pool` as reload
+# nudges. The sim drives converge explicitly (`ccp sync converge`), so the real
+# mesh daemon, its fsnotify watch, and its notify fan-out are unnecessary; this
+# shim just satisfies the PATH probe and the nudge calls.
+set -u
+exit 0
