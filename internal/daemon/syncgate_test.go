@@ -117,14 +117,12 @@ func newGateServerUUID(t *testing.T, cred *creds.Credential, sessions []procscan
 	fk.Put(a.KeychainService, a.KeychainAccount, cred)
 	fo := &fakeOAuth{currentRT: cred.ClaudeAiOauth.RefreshToken}
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
-		snapshot:        filepath.Join(t.TempDir(), "status.json"),
-		log:             log.New(io.Discard, "", 0),
-		scanSessions:    func(context.Context) ([]procscan.Session, error) { return sessions, nil },
-		cl:              newClaims(),
-		rlStreak:        map[int]int{},
-		authStreak:      map[int]int{},
-		lastAuthAttempt: map[int]time.Time{},
+		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
+		log:          log.New(io.Discard, "", 0),
+		scanSessions: func(context.Context) ([]procscan.Session, error) { return sessions, nil },
+		cl:           newClaims(),
+		led:          newLedgers(),
 	}
 	return s, fo, a
 }
@@ -187,7 +185,7 @@ func TestRefreshGateSuppressesBusyRefreshToo(t *testing.T) {
 		s, fo, a := newGateServer(t, cred, nil)
 		s.scanSessions = func(context.Context) ([]procscan.Session, error) { return busyOn(a.ConfigDir), nil }
 		fo.setUsage401(true)
-		s.authStreak[a.ID] = 1 // busy-refresh heuristic armed
+		s.led.row(authStreakPolicy, a.ConfigDir).strikes = 1 // busy-refresh heuristic armed
 		attachGate(s, "host-a", regWith(hostsync.AccountValue{
 			UUID: "u1",
 			// The peer already rotated: its chain is fresher and unexpired.
@@ -205,7 +203,7 @@ func TestRefreshGateSuppressesBusyRefreshToo(t *testing.T) {
 		s, fo, a := newGateServer(t, cred, nil)
 		s.scanSessions = func(context.Context) ([]procscan.Session, error) { return busyOn(a.ConfigDir), nil }
 		fo.setUsage401(true)
-		s.authStreak[a.ID] = 1
+		s.led.row(authStreakPolicy, a.ConfigDir).strikes = 1
 		attachGate(s, "host-a", regWith(hostsync.AccountValue{
 			UUID:  "u1",
 			Chain: hostsync.ChainStamp{Holder: "host-a", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), RotatedAt: time.Now().UnixMilli()},

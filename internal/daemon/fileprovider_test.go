@@ -640,14 +640,12 @@ func newFPPollServer(t *testing.T, seedCred bool) (*Server, store.Account, *fake
 	}
 	fake := &fakeFPProv{}
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: &fakeOAuth{currentRT: "rt-0"}, Creds: fk, LockDir: t.TempDir()},
-		snapshot:        filepath.Join(t.TempDir(), "status.json"),
-		log:             log.New(io.Discard, "", 0),
-		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		cl:              newClaims(),
-		rlStreak:        map[int]int{},
-		authStreak:      map[int]int{},
-		lastAuthAttempt: map[int]time.Time{},
+		m:            &pool.Manager{Store: st, OAuth: &fakeOAuth{currentRT: "rt-0"}, Creds: fk, LockDir: t.TempDir()},
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
+		log:          log.New(io.Discard, "", 0),
+		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
+		cl:           newClaims(),
+		led:          newLedgers(),
 	}
 	s.m.OverlayFor = func(backend fkoverlay.Backend) (fkoverlay.Provider, error) {
 		if backend != fkoverlay.BackendFileProvider {

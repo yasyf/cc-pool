@@ -87,6 +87,14 @@ func (l *ledger) forceFault(now time.Time, err error) {
 	l.lastErr, l.lastAt = err, now
 }
 
+// stamp records the attempt clock and error without advancing the debounce or
+// the recovery ladder — a definitive needs-login flags the persisted store
+// verdict, not the transient-401 streak, yet its 15-minute poll cadence still
+// engages off this clock.
+func (l *ledger) stamp(now time.Time, err error) {
+	l.lastErr, l.lastAt = err, now
+}
+
 // attempt books one recovery attempt: it advances the shared backoff clock
 // (spacing the next attempt) and stamps lastAt, returning whether the attempt
 // parked a breaker. On a two-lane policy it also charges the selected breaker
@@ -110,6 +118,10 @@ func (l *ledger) attempt(p policy, kind attemptKind, now time.Time) (parked bool
 	l.lastAt = now
 	return l.parked(p)
 }
+
+// setNextDue overrides the backoff clock so the gate holds until t — the 429
+// Retry-After hint replacing the computed exponential window.
+func (l *ledger) setNextDue(t time.Time) { l.nextDue = t }
 
 // clear resets the ledger to healthy — the resource recovered. Both the
 // debounce verdict and the recovery ladder are dropped.
@@ -211,10 +223,21 @@ func (ls *ledgers) forceFault(p policy, resource string, now time.Time, err erro
 	ls.row(p, resource).forceFault(now, err)
 }
 
+// stamp records (p, resource)'s attempt clock without advancing it; see
+// ledger.stamp.
+func (ls *ledgers) stamp(p policy, resource string, now time.Time, err error) {
+	ls.row(p, resource).stamp(now, err)
+}
+
 // attempt books one recovery attempt for (p, resource), returning whether it
 // parked a breaker; see ledger.attempt.
 func (ls *ledgers) attempt(p policy, resource string, kind attemptKind, now time.Time) bool {
 	return ls.row(p, resource).attempt(p, kind, now)
+}
+
+// setNextDue overrides (p, resource)'s backoff clock; see ledger.setNextDue.
+func (ls *ledgers) setNextDue(p policy, resource string, t time.Time) {
+	ls.row(p, resource).setNextDue(t)
 }
 
 // clear drops (p, resource): the resource recovered.

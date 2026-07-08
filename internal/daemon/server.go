@@ -103,18 +103,6 @@ type Server struct {
 	// and pool-wide claims (see claims.go). It owns its own mutex.
 	cl *claims
 
-	rlStreak map[int]int // accountID -> consecutive 429 count
-	// Pool-wide 429 gate: /usage rate-limits per shared-IP bucket, so one 429
-	// predicts the rest. Scheduler-goroutine-local — no lock.
-	rlStreakPool      int           // consecutive sweeps that tripped a 429
-	lastPool429       time.Time     // most recent pool 429
-	pool429RetryAfter time.Duration // server Retry-After hint (0 = use rlBackoff)
-	// authStreak counts consecutive unrecovered 401s; at needsLoginAfter the
-	// poll backs off (NOT flagged — only a definitive ErrNeedsLogin flags).
-	// lastAuthAttempt stamps a backed-off or flagged account's last sample so
-	// it stops 401-spamming. Both scheduler-goroutine-local — no lock.
-	authStreak      map[int]int
-	lastAuthAttempt map[int]time.Time
 	// netOutage is set when a full poll sweep found every attempted account
 	// failing network-class (an outage). While set, the scheduler drops to a
 	// short canary cadence (nextPollDelay) and pollOnce probes only one account
@@ -169,13 +157,16 @@ type Server struct {
 	lastContentHealth string
 
 	// led is the self-heal ledger store shared by every ported Server-owned
-	// family (the fp.domain and fuse.remount rows; the holder cache's
-	// fuse.deepwedge / fuse.shallowdead rows live in holderState.led under its
-	// mu). ledMu is the enclosing serialization the ledgers type documents:
-	// rows are touched from the heal tick, the select/status/repair RPC
-	// handlers, and migrate/strand/convert, so every s.led access takes ledMu —
-	// never held across mount/Sync/re-register/bounce I/O (bookkeeping in, I/O
-	// out).
+	// family: the fp.domain and fuse.remount rows, plus the auth.streak and
+	// ratelimit.acct / ratelimit.pool streaks (the holder cache's fuse.deepwedge
+	// / fuse.shallowdead rows live in holderState.led under its mu). ledMu is the
+	// enclosing serialization the ledgers type documents: rows are touched from
+	// the heal tick, the scheduler poll loop, and the select/status/repair RPC
+	// handlers plus migrate/strand/convert, so every s.led access takes ledMu —
+	// never held across mount/Sync/re-register/bounce or usage-fetch/refresh I/O
+	// (bookkeeping in, I/O out). The streaks were scheduler-goroutine-local (no
+	// lock) before the fold; sharing one map with the concurrently-touched
+	// heal-family rows makes ledMu mandatory on every streak access too.
 	led   *ledgers
 	ledMu sync.Mutex
 
@@ -215,21 +206,18 @@ func Run(ctx context.Context) error {
 	}
 
 	s := &Server{
-		m:               m,
-		socket:          pool.SocketPath(),
-		holderSocket:    mountd.DefaultHolderSocket(),
-		syncSocket:      pool.SyncSocketPath(),
-		holderLog:       pool.MountHolderLogPath(),
-		snapshot:        pool.StatusSnapshotPath(),
-		log:             log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
-		evictTimeout:    defaultEvictTimeout,
-		startedAt:       time.Now(),
-		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
-		cl:              newClaims(),
-		led:             newLedgers(),
-		rlStreak:        map[int]int{},
-		authStreak:      map[int]int{},
-		lastAuthAttempt: map[int]time.Time{},
+		m:             m,
+		socket:        pool.SocketPath(),
+		holderSocket:  mountd.DefaultHolderSocket(),
+		syncSocket:    pool.SyncSocketPath(),
+		holderLog:     pool.MountHolderLogPath(),
+		snapshot:      pool.StatusSnapshotPath(),
+		log:           log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
+		evictTimeout:  defaultEvictTimeout,
+		startedAt:     time.Now(),
+		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
+		cl:            newClaims(),
+		led:           newLedgers(),
 	}
 	// The FP wedge detector strikes a 0-byte served .claude.json only when the
 	// account genuinely has an identity (its synth is non-empty) — resolved through

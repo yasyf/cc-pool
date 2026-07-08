@@ -43,6 +43,19 @@ const (
 // streak backoff and the needs-login streak/throttle) live in policies.go — the
 // self-heal policy substrate.
 
+// authStreakPolicy, acctRateLimitPolicy, and poolRateLimitPolicy are the streak
+// self-heal rows: the debounced needs-login gate (auth.streak) and the
+// per-account / pool-wide 429 backoff gates. Each account folds onto one row
+// keyed by its ConfigDir; the single pool-wide streak uses poolResource.
+var (
+	authStreakPolicy    = policies["auth.streak"]
+	acctRateLimitPolicy = policies["ratelimit.acct"]
+	poolRateLimitPolicy = policies["ratelimit.pool"]
+)
+
+// poolResource is the sentinel resource for the one pool-wide 429 streak row.
+const poolResource = "pool"
+
 func rlBackoff(streak int) time.Duration {
 	return proc.Backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap}.After(streak)
 }
@@ -234,16 +247,12 @@ func (s *Server) pollOnce(ctx context.Context) {
 }
 
 // poolRateLimited reports whether the pool-wide 429 gate is still inside its
-// window: the 429's Retry-After hint if present, else rlBackoff, clamped to the cap.
+// window: the ratelimit.pool row's backoff clock, armed by a 429 from the
+// Retry-After hint if present, else the exponential backoff (see recordRateLimit).
 func (s *Server) poolRateLimited() bool {
-	if s.rlStreakPool == 0 {
-		return false
-	}
-	window := rlBackoff(s.rlStreakPool)
-	if s.pool429RetryAfter > 0 {
-		window = min(s.pool429RetryAfter, rateLimitBackoffCap)
-	}
-	return time.Since(s.lastPool429) < window
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	return !s.led.backoffElapsed(poolRateLimitPolicy, poolResource, time.Now())
 }
 
 // pollGated reports whether an account is currently backed off — a recent
@@ -251,18 +260,41 @@ func (s *Server) poolRateLimited() bool {
 // exhausted-auth-streak account inside the needs-login interval — so pollOnce
 // skips it with no network attempt (and it never serves as the outage canary).
 // The needs-login backoff needs its own clock: a 401 inserts no usage sample,
-// so it can't ride the rate-limit backoff. Scheduler-goroutine-local — no lock.
+// so it can't ride the rate-limit backoff. Store I/O runs outside ledMu; the
+// streak reads take it around the bookkeeping only.
 func (s *Server) pollGated(a store.Account) bool {
+	dir := a.ConfigDir
 	if last, ok, _ := s.m.Store.LatestUsageSample(a.ID); ok && last.RateLimited &&
-		time.Since(last.TS) < rlBackoff(s.rlStreak[a.ID]) {
+		time.Since(last.TS) < rlBackoff(s.acctRateLimitStreak(dir)) {
 		return true
 	}
-	if health, _ := s.m.Store.GetAuthHealth(a.ID); health.NeedsLogin || s.authStreak[a.ID] >= needsLoginAfter {
-		if last, ok := s.lastAuthAttempt[a.ID]; ok && time.Since(last) < needsLoginPollInterval {
-			return true
-		}
+	health, _ := s.m.Store.GetAuthHealth(a.ID)
+	return s.authThrottled(dir, health.NeedsLogin)
+}
+
+// acctRateLimitStreak reports dir's consecutive-429 count — the exponent for the
+// per-account backoff window; 0 when the account is not rate-limited.
+func (s *Server) acctRateLimitStreak(dir string) int {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	if l := s.led.peek(acctRateLimitPolicy, dir); l != nil {
+		return l.attempts
 	}
-	return false
+	return 0
+}
+
+// authThrottled reports whether dir's poll is inside the needs-login throttle:
+// the persisted store verdict (needsLogin) or the transient-401 streak's fault
+// has tripped AND the last auth attempt is within needsLoginPollInterval. The
+// 15-minute cadence is the consumer-applied throttle the auth.streak gate trips.
+func (s *Server) authThrottled(dir string, needsLogin bool) bool {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	l := s.led.peek(authStreakPolicy, dir)
+	if !needsLogin && !(l != nil && l.faulted) {
+		return false
+	}
+	return l != nil && !l.lastAt.IsZero() && time.Since(l.lastAt) < needsLoginPollInterval
 }
 
 // pollAccount samples one account and reports the outcome for outage detection.
@@ -326,7 +358,7 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a
 	// Both refresh opts AND with the holder gate — a non-holder refresh is the
 	// double-spend that forks a chain; evaluated only when a refresh is on the table.
 	wantIdle := idle
-	wantBusy := busyBySession && (recovery || s.authStreak[a.ID] >= 1)
+	wantBusy := busyBySession && (recovery || s.authStreakActive(a.ConfigDir))
 	allowRefresh := false
 	if wantIdle || wantBusy {
 		allowRefresh = s.sync.mayRefresh(ctx, a)
@@ -339,30 +371,50 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	_, rateLimited, retryAfter, err := s.m.SampleUsage(cctx, a, opts)
 	cancel()
-	// rlStreak and the pool gate are scheduler-goroutine-local — no lock. A 429
-	// arms the pool gate (prefers Retry-After over backoff); a clean sample clears it.
+	// A 429 books a backoff step on the per-account and pool-wide streaks (the
+	// pool step prefers Retry-After over the computed backoff); a clean sample
+	// clears both. A non-429 error leaves them untouched. Bookkeeping only under
+	// ledMu — the SampleUsage I/O above already returned.
 	if rateLimited {
-		s.rlStreak[a.ID]++
-		s.rlStreakPool++
-		s.lastPool429 = time.Now()
-		s.pool429RetryAfter = retryAfter
+		s.recordRateLimit(a.ConfigDir, retryAfter, time.Now())
 	} else if err == nil {
-		s.rlStreak[a.ID] = 0
-		s.rlStreakPool = 0
-		s.pool429RetryAfter = 0
+		s.clearRateLimit(a.ConfigDir)
 	}
 	s.handleAuthOutcome(ctx, a, err)
 	return classifyOutcome(err)
+}
+
+// recordRateLimit books one 429 for dir: it advances the per-account and
+// pool-wide 429 backoff streaks, arming each gate's window. The pool window
+// prefers the server's Retry-After hint (clamped to rateLimitBackoffCap) over the
+// computed exponential backoff. Bookkeeping only — no I/O under ledMu.
+func (s *Server) recordRateLimit(dir string, retryAfter time.Duration, now time.Time) {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	s.led.attempt(acctRateLimitPolicy, dir, attemptPrimary, now)
+	s.led.attempt(poolRateLimitPolicy, poolResource, attemptPrimary, now)
+	if retryAfter > 0 {
+		s.led.setNextDue(poolRateLimitPolicy, poolResource, now.Add(min(retryAfter, rateLimitBackoffCap)))
+	}
+}
+
+// clearRateLimit drops dir's per-account 429 streak and the pool-wide streak — a
+// clean sample proves the shared-IP bucket recovered.
+func (s *Server) clearRateLimit(dir string) {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	s.led.clear(acctRateLimitPolicy, dir)
+	s.led.clear(poolRateLimitPolicy, poolResource)
 }
 
 // handleAuthOutcome reacts to a sample's error. Only a definitive ErrNeedsLogin
 // flags needs-login: a plain 401 also surfaces transient (5xx) refresh failures,
 // so the streak only throttles polling. A network-class failure is an outage
 // signal, not an auth event — pollOnce's outage detector owns the reaction here,
-// so it touches no auth state. Scheduler-goroutine-local — no lock.
+// so it touches no auth state.
 func (s *Server) handleAuthOutcome(ctx context.Context, a store.Account, err error) {
 	if err == nil {
-		s.authStreak[a.ID] = 0
+		s.authClearStreak(a.ConfigDir)
 		if changed, cerr := s.m.Store.ClearNeedsLogin(a.ID); cerr != nil {
 			s.log.Printf("acct-%02d clear needs-login: %v", a.ID, cerr)
 		} else if changed {
@@ -375,20 +427,54 @@ func (s *Server) handleAuthOutcome(ctx context.Context, a store.Account, err err
 		return
 	}
 	if errors.Is(err, oauth.ErrNetwork) {
-		// An outage keeps today's non-behavior everywhere else: no authStreak
-		// bump, no needs-login flag, rlStreak untouched. Only the outage detector
-		// (via classifyOutcome) reacts.
+		// An outage keeps today's non-behavior everywhere else: no auth-streak
+		// strike, no needs-login flag, the 429 streaks untouched. Only the outage
+		// detector (via classifyOutcome) reacts.
 		s.logNetUnreachable(a, err)
 		return
 	}
 	var ue *oauth.UsageError
 	if errors.As(err, &ue) && ue.Unauthorized() {
-		s.authStreak[a.ID]++
-		s.lastAuthAttempt[a.ID] = time.Now()
+		s.authStrike(a.ConfigDir, err)
 		s.log.Printf("acct-%02d sample: %v", a.ID, err)
 		return
 	}
 	s.log.Printf("acct-%02d sample: %v", a.ID, err)
+}
+
+// authClearStreak drops dir's transient-401 streak and its throttle clock on a
+// clean sample — the account's auth recovered.
+func (s *Server) authClearStreak(dir string) {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	s.led.clear(authStreakPolicy, dir)
+}
+
+// authStrike advances dir's transient-401 streak toward the needs-login gate,
+// latching faulted at needsLoginAfter, and stamps the throttle clock.
+func (s *Server) authStrike(dir string, err error) {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	s.led.strike(authStreakPolicy, dir, time.Now(), err)
+}
+
+// authStamp stamps dir's needs-login throttle clock without advancing the
+// transient-401 streak — a definitive ErrNeedsLogin flags the persisted store
+// verdict, not the streak, yet the 15-minute poll cadence still engages.
+func (s *Server) authStamp(dir string, err error) {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	s.led.stamp(authStreakPolicy, dir, time.Now(), err)
+}
+
+// authStreakActive reports whether dir carries at least one unrecovered
+// transient 401 (the busy-refresh heuristic: a live session's expired token is
+// worth a refresh attempt) — true from the first strike through the latched fault.
+func (s *Server) authStreakActive(dir string) bool {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	l := s.led.peek(authStreakPolicy, dir)
+	return l != nil && (l.strikes >= 1 || l.faulted)
 }
 
 // logNetUnreachable logs a probe's network-unreachable error. While an outage is
@@ -406,9 +492,10 @@ func (s *Server) logNetUnreachable(a store.Account, err error) {
 }
 
 // flagNeedsLogin stamps the attempt clock, then flags needs-login — unless the
-// sync self-heal pulled a fresher chain, which skips the set (never clears).
+// sync self-heal pulled a fresher chain, which skips the set (never clears). The
+// clock stamp precedes syncHeal so ledMu is never held across the pull I/O.
 func (s *Server) flagNeedsLogin(ctx context.Context, a store.Account, err error) {
-	s.lastAuthAttempt[a.ID] = time.Now()
+	s.authStamp(a.ConfigDir, err)
 	if s.syncHeal(ctx, a) {
 		s.log.Printf("acct-%02d auth failed but sync pulled a fresher chain; retrying before flagging needs-login", a.ID)
 		return

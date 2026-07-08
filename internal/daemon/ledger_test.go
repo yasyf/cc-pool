@@ -110,6 +110,37 @@ func TestLedgerForceFault(t *testing.T) {
 	}
 }
 
+// TestLedgerStampAndSetNextDue pins the two additive streak-port ops: stamp
+// records the clock without touching the debounce or the recovery ladder (the
+// definitive-needs-login throttle stamp, which flags the store not the streak),
+// and setNextDue overrides the backoff window (the 429 Retry-After hint).
+func TestLedgerStampAndSetNextDue(t *testing.T) {
+	auth := pol(t, "auth.streak")
+	l := &ledger{}
+	l.stamp(t0, errors.New("needs login"))
+	if l.strikes != 0 || l.faulted || l.attempts != 0 {
+		t.Fatalf("stamp advanced the ledger: %+v", *l)
+	}
+	if l.lastAt != t0 || l.lastErr == nil {
+		t.Fatalf("stamp did not record the clock/err: %+v", *l)
+	}
+	if !l.gateOpen(auth, t0) {
+		t.Fatal("stamp alone must not close the auth gate — only a latched fault does")
+	}
+
+	rl := pol(t, "ratelimit.pool")
+	l2 := &ledger{}
+	l2.attempt(rl, attemptPrimary, t0) // nextDue = t0 + rlBackoff(1)
+	override := t0.Add(2 * time.Second)
+	l2.setNextDue(override)
+	if l2.nextDue != override {
+		t.Fatalf("setNextDue = %v, want %v", l2.nextDue, override)
+	}
+	if l2.attempts != 1 {
+		t.Fatalf("setNextDue disturbed the streak count: attempts = %d, want 1", l2.attempts)
+	}
+}
+
 // TestLedgerBackoffDue walks the recovery ladder: each attempt advances the
 // shared clock and spaces the next attempt by proc.Backoff.After(attempts); due
 // is false inside the window and true once it elapses.

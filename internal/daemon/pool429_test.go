@@ -21,11 +21,12 @@ func TestPollOncePool429GatesRestOfSweep(t *testing.T) {
 			t.Fatalf("%s sampled %d time(s), want 0 — a 429 on acct1 must gate the rest of the sweep", at, got)
 		}
 	}
-	if s.rlStreakPool != 1 {
-		t.Fatalf("rlStreakPool = %d, want 1 after one 429 sweep", s.rlStreakPool)
+	l := s.led.peek(poolRateLimitPolicy, poolResource)
+	if l == nil || l.attempts != 1 {
+		t.Fatalf("pool 429 streak = %+v, want attempts 1 after one 429 sweep", l)
 	}
-	if s.lastPool429.IsZero() {
-		t.Fatal("lastPool429 must be stamped on a 429")
+	if l.lastAt.IsZero() {
+		t.Fatal("the pool 429 clock (lastAt) must be stamped on a 429")
 	}
 	if s.netOutage {
 		t.Fatal("a 429 is outcomeNonNetwork (the API answered) and must NOT enter outage mode")
@@ -38,8 +39,8 @@ func TestPollOnceCleanSweepArmsNoPoolGate(t *testing.T) {
 
 	s.pollOnce(t.Context())
 
-	if s.rlStreakPool != 0 {
-		t.Fatalf("rlStreakPool = %d after a clean sweep, want 0", s.rlStreakPool)
+	if l := s.led.peek(poolRateLimitPolicy, poolResource); l != nil {
+		t.Fatalf("a clean sweep must not arm the pool 429 streak: %+v", l)
 	}
 	if s.poolRateLimited() {
 		t.Fatal("a clean sweep must not arm the pool gate")
@@ -55,9 +56,8 @@ func TestPollOnceCleanSweepArmsNoPoolGate(t *testing.T) {
 // once the window elapses a clean sample resumes polling and clears the gate.
 func TestPollOncePool429GateExpiresAndResumes(t *testing.T) {
 	t.Run("active gate skips the whole sweep", func(t *testing.T) {
-		s, fo := newOutageServer(t, 2) // both accounts would answer cleanly
-		s.rlStreakPool = 1
-		s.lastPool429 = time.Now() // fresh → inside rlBackoff(1)=3m
+		s, fo := newOutageServer(t, 2)                                               // both accounts would answer cleanly
+		s.led.attempt(poolRateLimitPolicy, poolResource, attemptPrimary, time.Now()) // fresh → inside rlBackoff(1)=3m
 
 		s.pollOnce(t.Context())
 
@@ -68,8 +68,9 @@ func TestPollOncePool429GateExpiresAndResumes(t *testing.T) {
 
 	t.Run("expired gate resumes polling and clears", func(t *testing.T) {
 		s, fo := newOutageServer(t, 2)
-		s.rlStreakPool = 1
-		s.lastPool429 = time.Now().Add(-rlBackoff(1) - time.Second) // window elapsed
+		l := s.led.row(poolRateLimitPolicy, poolResource)
+		l.attempts = 1
+		l.nextDue = time.Now().Add(-time.Second) // window elapsed
 
 		s.pollOnce(t.Context())
 
@@ -79,8 +80,8 @@ func TestPollOncePool429GateExpiresAndResumes(t *testing.T) {
 		if got := fo.usageCountFor("at-2"); got != 1 {
 			t.Fatalf("acct2 sampled %d time(s), want 1 — a clean acct1 clears the pool gate", got)
 		}
-		if s.rlStreakPool != 0 {
-			t.Fatalf("rlStreakPool = %d, want 0 after a clean sweep clears the gate", s.rlStreakPool)
+		if l := s.led.peek(poolRateLimitPolicy, poolResource); l != nil {
+			t.Fatalf("a clean sweep must clear the pool 429 streak: %+v", l)
 		}
 	})
 }
@@ -94,16 +95,21 @@ func TestPollOncePool429RetryAfterOverridesBackoff(t *testing.T) {
 
 	s.pollOnce(t.Context()) // acct1 429s and arms the gate with the Retry-After hint
 
-	if s.pool429RetryAfter != time.Second {
-		t.Fatalf("pool429RetryAfter = %v, want 1s (the 429's Retry-After must reach the scheduler)", s.pool429RetryAfter)
+	l := s.led.peek(poolRateLimitPolicy, poolResource)
+	if l == nil {
+		t.Fatal("the 429 must arm the pool gate")
+	}
+	if got := l.nextDue.Sub(l.lastAt); got != time.Second {
+		t.Fatalf("pool gate window = %v, want 1s (the 429's Retry-After must override the computed backoff)", got)
 	}
 	// 2s after the 429: past the 1s Retry-After but inside the 3m backoff.
-	s.lastPool429 = time.Now().Add(-2 * time.Second)
+	l.lastAt = time.Now().Add(-2 * time.Second)
+	l.nextDue = l.lastAt.Add(time.Second)
 	if s.poolRateLimited() {
 		t.Fatalf("Retry-After (1s) must override the computed backoff (%v): the gate should be expired 2s later", rlBackoff(1))
 	}
 	// Without the hint, the same elapsed time is still inside the computed backoff.
-	s.pool429RetryAfter = 0
+	l.nextDue = l.lastAt.Add(rlBackoff(1))
 	if !s.poolRateLimited() {
 		t.Fatal("without a Retry-After hint the computed 3m backoff must still gate 2s after the 429")
 	}
@@ -113,13 +119,16 @@ func TestPollOncePool429RetryAfterOverridesBackoff(t *testing.T) {
 // full 30m cap end to end: still gated at 29m, lifted past 31m.
 func TestPollOncePool429Uses30mCapWindow(t *testing.T) {
 	s, _ := newOutageServer(t, 2)
-	s.rlStreakPool = 8 // deep streak → window clamped to the 30m cap
+	l := s.led.row(poolRateLimitPolicy, poolResource)
+	l.attempts = 8 // deep streak → window clamped to the 30m cap
 
-	s.lastPool429 = time.Now().Add(-29 * time.Minute) // inside the cap
+	l.lastAt = time.Now().Add(-29 * time.Minute) // inside the cap
+	l.nextDue = l.lastAt.Add(rlBackoff(8))
 	if !s.poolRateLimited() {
 		t.Fatalf("a deep 429 streak must gate for the full %v cap; 29m in should still be gated", rateLimitBackoffCap)
 	}
-	s.lastPool429 = time.Now().Add(-31 * time.Minute) // past the cap
+	l.lastAt = time.Now().Add(-31 * time.Minute) // past the cap
+	l.nextDue = l.lastAt.Add(rlBackoff(8))
 	if s.poolRateLimited() {
 		t.Fatal("31m after the 429 — past the 30m cap — the gate must lift")
 	}
@@ -129,14 +138,23 @@ func TestPollOncePool429Uses30mCapWindow(t *testing.T) {
 // suspend the fleet for 24h — it is clamped to the 30m cap, so the gate lifts.
 func TestPollOncePool429RetryAfterClampedToCap(t *testing.T) {
 	s, _ := newOutageServer(t, 2)
-	s.rlStreakPool = 1
-	s.pool429RetryAfter = 24 * time.Hour // absurd server hint
+	now := time.Now()
+	s.recordRateLimit("acct", 24*time.Hour, now) // absurd server hint
 
-	s.lastPool429 = time.Now().Add(-29 * time.Minute) // inside the 30m cap
+	l := s.led.peek(poolRateLimitPolicy, poolResource)
+	if l == nil {
+		t.Fatal("recordRateLimit did not arm the pool streak")
+	}
+	if got := l.nextDue.Sub(l.lastAt); got != rateLimitBackoffCap {
+		t.Fatalf("a 24h Retry-After must be clamped to the %v cap; window = %v", rateLimitBackoffCap, got)
+	}
+	l.lastAt = now.Add(-29 * time.Minute) // inside the 30m cap
+	l.nextDue = l.lastAt.Add(rateLimitBackoffCap)
 	if !s.poolRateLimited() {
 		t.Fatal("29m in, the clamped gate must still hold")
 	}
-	s.lastPool429 = time.Now().Add(-31 * time.Minute) // past the cap
+	l.lastAt = now.Add(-31 * time.Minute) // past the cap
+	l.nextDue = l.lastAt.Add(rateLimitBackoffCap)
 	if s.poolRateLimited() {
 		t.Fatalf("a 24h Retry-After must be clamped to the %v cap; 31m in, the gate must lift", rateLimitBackoffCap)
 	}

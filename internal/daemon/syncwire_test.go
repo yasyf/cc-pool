@@ -40,15 +40,13 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: &fakeOAuth{}, Creds: credstest.NewFake(), LockDir: filepath.Join(home, "locks")},
-		syncSocket:      filepath.Join(home, "sync.sock"),
-		snapshot:        filepath.Join(home, "status.json"),
-		log:             log.New(io.Discard, "", 0),
-		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		cl:              newClaims(),
-		rlStreak:        map[int]int{},
-		authStreak:      map[int]int{},
-		lastAuthAttempt: map[int]time.Time{},
+		m:            &pool.Manager{Store: st, OAuth: &fakeOAuth{}, Creds: credstest.NewFake(), LockDir: filepath.Join(home, "locks")},
+		syncSocket:   filepath.Join(home, "sync.sock"),
+		snapshot:     filepath.Join(home, "status.json"),
+		log:          log.New(io.Discard, "", 0),
+		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
+		cl:           newClaims(),
+		led:          newLedgers(),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); s.wg.Wait() })

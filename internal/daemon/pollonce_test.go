@@ -143,14 +143,12 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	fo := &fakeOAuth{currentRT: "rt-0"}
 
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
-		snapshot:        filepath.Join(t.TempDir(), "status.json"),
-		log:             log.New(io.Discard, "", 0),
-		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		cl:              newClaims(),
-		rlStreak:        map[int]int{},
-		authStreak:      map[int]int{},
-		lastAuthAttempt: map[int]time.Time{},
+		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
+		log:          log.New(io.Discard, "", 0),
+		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
+		cl:           newClaims(),
+		led:          newLedgers(),
 	}
 
 	s.cl.reserve(a.ID)
@@ -197,14 +195,12 @@ func TestPollOnceFailsClosedOnScanError(t *testing.T) {
 		fk.Put(a.KeychainService, a.KeychainAccount, cred)
 		fo := &fakeOAuth{currentRT: "rt-0"}
 		s := &Server{
-			m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
-			snapshot:        filepath.Join(t.TempDir(), "status.json"),
-			log:             log.New(io.Discard, "", 0),
-			scanSessions:    scan,
-			cl:              newClaims(),
-			rlStreak:        map[int]int{},
-			authStreak:      map[int]int{},
-			lastAuthAttempt: map[int]time.Time{},
+			m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+			snapshot:     filepath.Join(t.TempDir(), "status.json"),
+			log:          log.New(io.Discard, "", 0),
+			scanSessions: scan,
+			cl:           newClaims(),
+			led:          newLedgers(),
 		}
 		return s, fo, fk
 	}
@@ -258,14 +254,12 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true}
 
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
-		snapshot:        filepath.Join(t.TempDir(), "status.json"),
-		log:             log.New(io.Discard, "", 0),
-		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		cl:              newClaims(),
-		rlStreak:        map[int]int{},
-		authStreak:      map[int]int{},
-		lastAuthAttempt: map[int]time.Time{},
+		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
+		log:          log.New(io.Discard, "", 0),
+		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
+		cl:           newClaims(),
+		led:          newLedgers(),
 	}
 
 	s.pollOnce(t.Context())
@@ -280,7 +274,8 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
 	fk.Put(a.KeychainService, a.KeychainAccount, cred)
 	fo.setUsage401(false)
-	s.lastAuthAttempt[1] = time.Now().Add(-needsLoginPollInterval - time.Second)
+	// Move the throttle clock past the 15m window so the recovery poll is due.
+	s.led.row(authStreakPolicy, a.ConfigDir).lastAt = time.Now().Add(-needsLoginPollInterval - time.Second)
 
 	s.pollOnce(t.Context())
 	if h, _ := st.GetAuthHealth(1); h.NeedsLogin {
@@ -315,20 +310,27 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true, refresh5xx: true}
 
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
-		snapshot:        filepath.Join(t.TempDir(), "status.json"),
-		log:             log.New(io.Discard, "", 0),
-		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		cl:              newClaims(),
-		rlStreak:        map[int]int{},
-		authStreak:      map[int]int{},
-		lastAuthAttempt: map[int]time.Time{},
+		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
+		log:          log.New(io.Discard, "", 0),
+		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
+		cl:           newClaims(),
+		led:          newLedgers(),
 	}
 
 	for i := 1; i <= needsLoginAfter; i++ {
 		s.pollOnce(t.Context())
-		if got := s.authStreak[1]; got != i {
-			t.Fatalf("after %d transient 401(s), authStreak = %d, want %d", i, got, i)
+		// The 401 streak advances by one per transient failure and latches the
+		// needs-login gate (faulted) on the needsLoginAfter-th, where the debounce
+		// resets strikes to 0.
+		l := s.led.peek(authStreakPolicy, a.ConfigDir)
+		switch {
+		case i < needsLoginAfter:
+			if l == nil || l.strikes != i || l.faulted {
+				t.Fatalf("after %d transient 401(s), auth streak = %+v, want strikes %d unfaulted", i, l, i)
+			}
+		case l == nil || !l.faulted:
+			t.Fatalf("the %dth transient 401 must latch the needs-login gate (faulted): %+v", i, l)
 		}
 		h, _ := st.GetAuthHealth(1)
 		if h.NeedsLogin {
@@ -377,22 +379,20 @@ func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true}
 
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
-		snapshot:        filepath.Join(t.TempDir(), "status.json"),
-		log:             log.New(io.Discard, "", 0),
-		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		cl:              newClaims(),
-		rlStreak:        map[int]int{},
-		authStreak:      map[int]int{},
-		lastAuthAttempt: map[int]time.Time{},
+		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
+		log:          log.New(io.Discard, "", 0),
+		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
+		cl:           newClaims(),
+		led:          newLedgers(),
 	}
 
 	s.pollOnce(t.Context())
 	if h, _ := st.GetAuthHealth(1); !h.NeedsLogin {
 		t.Fatal("a confirmed 400 invalid_grant revocation must flag needs-login")
 	}
-	if got := s.authStreak[1]; got != 0 {
-		t.Fatalf("a confirmed revocation flags via ErrNeedsLogin and must not touch the 401 streak; authStreak = %d, want 0", got)
+	if l := s.led.peek(authStreakPolicy, a.ConfigDir); l != nil && (l.strikes != 0 || l.faulted) {
+		t.Fatalf("a confirmed revocation flags via ErrNeedsLogin and must not touch the 401 streak; strikes=%d faulted=%v", l.strikes, l.faulted)
 	}
 }
 
@@ -425,15 +425,13 @@ func newOutageServer(t *testing.T, n int) (*Server, *fakeOAuth) {
 	}
 	fo := &fakeOAuth{currentRT: "rt-0"}
 	s := &Server{
-		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
-		snapshot:        filepath.Join(t.TempDir(), "status.json"),
-		log:             log.New(io.Discard, "", 0),
-		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		pollSpacing:     time.Millisecond, // keep multi-account sweeps out of real-time sleeps
-		cl:              newClaims(),
-		rlStreak:        map[int]int{},
-		authStreak:      map[int]int{},
-		lastAuthAttempt: map[int]time.Time{},
+		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
+		log:          log.New(io.Discard, "", 0),
+		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
+		pollSpacing:  time.Millisecond, // keep multi-account sweeps out of real-time sleeps
+		cl:           newClaims(),
+		led:          newLedgers(),
 	}
 	return s, fo
 }
@@ -450,11 +448,16 @@ func TestPollOnceEntersNetOutage(t *testing.T) {
 	if !s.netOutage {
 		t.Fatal("an all-network-fail sweep must enter outage mode")
 	}
-	if got := s.authStreak[1]; got != 0 {
-		t.Fatalf("authStreak = %d, want 0 (a network error is not an auth event)", got)
+	accts, err := s.m.Store.ListAccounts()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := s.rlStreak[1]; got != 0 {
-		t.Fatalf("rlStreak = %d, want 0 (a network error is not a rate-limit)", got)
+	dir := accts[0].ConfigDir
+	if l := s.led.peek(authStreakPolicy, dir); l != nil {
+		t.Fatalf("a network error must not touch the auth streak: %+v", l)
+	}
+	if l := s.led.peek(acctRateLimitPolicy, dir); l != nil {
+		t.Fatalf("a network error must not arm the per-account 429 streak: %+v", l)
 	}
 	if h, _ := s.m.Store.GetAuthHealth(1); h.NeedsLogin {
 		t.Fatal("a network error must not flag needs-login")
@@ -603,10 +606,8 @@ func TestPollOnceRecoverySweepHealsBusy401(t *testing.T) {
 			scanSessions: func(context.Context) ([]procscan.Session, error) { // a live session → busy
 				return []procscan.Session{{PID: 4242, ConfigDir: a.ConfigDir, StartedAt: time.Now()}}, nil
 			},
-			cl:              newClaims(),
-			rlStreak:        map[int]int{},
-			authStreak:      map[int]int{},
-			lastAuthAttempt: map[int]time.Time{},
+			cl:  newClaims(),
+			led: newLedgers(),
 		}
 		return s, fo
 	}
@@ -633,8 +634,12 @@ func TestPollOnceRecoverySweepHealsBusy401(t *testing.T) {
 		if got := fo.refreshCount(); got != 0 {
 			t.Fatalf("a normal first-401 busy account refreshed %d time(s), want 0 (streak gate preserved)", got)
 		}
-		if got := s.authStreak[1]; got != 1 {
-			t.Fatalf("authStreak = %d, want 1 (a busy 401 arms the streak)", got)
+		accts, err := s.m.Store.ListAccounts()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if l := s.led.peek(authStreakPolicy, accts[0].ConfigDir); l == nil || l.strikes != 1 || l.faulted {
+			t.Fatalf("auth streak = %+v, want strikes 1 (a busy 401 arms the streak)", l)
 		}
 	})
 }

@@ -428,7 +428,7 @@ func TestReconcileFileProviderBackoffGate(t *testing.T) {
 func TestHealFPMissingRepairsDeregisteredDomain(t *testing.T) {
 	s, a, dirs, fake := newFPHealServer(t)
 	fake.healthErr = errors.New("no domain registered") // control plane broken
-	s.fpRecordAttempt(dirs[1], time.Unix(0, 0))        // a prior attempt the successful repair must clear
+	s.fpRecordAttempt(dirs[1], time.Unix(0, 0))         // a prior attempt the successful repair must clear
 	now := time.Unix(0, 0).Add(time.Hour)               // well past the seeded backoff -> due
 
 	s.healFPMissing(t.Context(), a, now)

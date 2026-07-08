@@ -50,7 +50,7 @@ func TestInvalidGrantSyncHealSkipsNeedsLogin(t *testing.T) {
 		if h, _ := s.m.Store.GetAuthHealth(a.ID); h.NeedsLogin {
 			t.Fatal("a strictly-fresher pulled chain must skip needs-login")
 		}
-		if _, ok := s.lastAuthAttempt[a.ID]; !ok {
+		if l := s.led.peek(authStreakPolicy, a.ConfigDir); l == nil || l.lastAt.IsZero() {
 			t.Fatal("the attempt clock must still be stamped so the backoff engages")
 		}
 	})
@@ -113,7 +113,7 @@ func TestSyncHealAbsentFlagsAsBefore(t *testing.T) {
 	if h, _ := s.m.Store.GetAuthHealth(a.ID); !h.NeedsLogin {
 		t.Fatal("nil syncPull must leave the needs-login flagging byte-identical to today")
 	}
-	if got := s.authStreak[a.ID]; got != 0 {
-		t.Fatalf("confirmed revocation flags via ErrNeedsLogin, not the 401 streak; authStreak = %d", got)
+	if l := s.led.peek(authStreakPolicy, a.ConfigDir); l != nil && (l.strikes != 0 || l.faulted) {
+		t.Fatalf("confirmed revocation flags via ErrNeedsLogin, not the 401 streak; strikes=%d faulted=%v", l.strikes, l.faulted)
 	}
 }

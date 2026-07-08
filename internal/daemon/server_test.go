@@ -50,14 +50,11 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		m: &pool.Manager{
 			Store: st, OAuth: &fakeOAuth{}, Creds: credstest.NewFake(), LockDir: t.TempDir(),
 		},
-		snapshot:        filepath.Join(t.TempDir(), "status.json"),
-		log:             log.New(io.Discard, "", 0),
-		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		cl:              newClaims(),
-		led:             newLedgers(),
-		rlStreak:        map[int]int{},
-		authStreak:      map[int]int{},
-		lastAuthAttempt: map[int]time.Time{},
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
+		log:          log.New(io.Discard, "", 0),
+		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
+		cl:           newClaims(),
+		led:          newLedgers(),
 	}
 	// Production serve() Waits on s.wg before Run's deferred Close; tests must
 	// too. handleSelect's preflight goroutine creates the winner's LockDir lock
@@ -567,14 +564,12 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	s := &Server{
-		m:               &pool.Manager{Store: st},
-		socket:          filepath.Join(sockDir, "d.sock"),
-		snapshot:        filepath.Join(t.TempDir(), "status.json"),
-		log:             log.New(&logBuf, "", 0),
-		cl:              newClaims(),
-		rlStreak:        map[int]int{},
-		authStreak:      map[int]int{},
-		lastAuthAttempt: map[int]time.Time{},
+		m:        &pool.Manager{Store: st},
+		socket:   filepath.Join(sockDir, "d.sock"),
+		snapshot: filepath.Join(t.TempDir(), "status.json"),
+		log:      log.New(&logBuf, "", 0),
+		cl:       newClaims(),
+		led:      newLedgers(),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
