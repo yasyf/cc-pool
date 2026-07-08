@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"ops":[{"kind":"add_comment","body":"Completed in v0.49.0 (77f03928): plain ccp status now prints an fpConsentFooter naming the parked app-group consent + approve-then-restart remediation (TUI excluded per the footers-stay-plain-path convention, statustui.go:44); ccp add FP failures print the rung diagnosis incl. the consent rung via fpDiagnose. Doctor copy had landed in v0.45.0."}]}
+{"v":1,"lamport":4,"ops":[{"kind":"set_criterion_status","id":"eee2427e086dd55529a18e862470145c","status":"met"}]}
