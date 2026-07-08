@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,92 @@ func cred(token, refresh string, expiresAtMillis int64) *creds.Credential {
 		RefreshToken: refresh,
 		ExpiresAt:    expiresAtMillis,
 	}}
+}
+
+// TestLoginCommand pins the re-login argv: `claude auth login`, with --email
+// appended only when the account's address is known.
+func TestLoginCommand(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "claude")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	cases := map[string]struct {
+		email    string
+		wantArgs []string
+	}{
+		"no email omits the flag": {
+			email:    "",
+			wantArgs: []string{"auth", "login"},
+		},
+		"a known address is prefilled via --email": {
+			email:    "me@example.com",
+			wantArgs: []string{"auth", "login", "--email", "me@example.com"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c, err := loginCommand("/cfg", tc.email)
+			if err != nil {
+				t.Fatalf("loginCommand: %v", err)
+			}
+			if got := c.Args[1:]; !slices.Equal(got, tc.wantArgs) {
+				t.Errorf("argv = %v, want %v", got, tc.wantArgs)
+			}
+			// The child must target the account dir, not the caller's own config.
+			if !slices.Contains(c.Env, "CLAUDE_CONFIG_DIR=/cfg") {
+				t.Errorf("env missing CLAUDE_CONFIG_DIR=/cfg: %v", c.Env)
+			}
+		})
+	}
+}
+
+// TestAccountLoginEmail: the prefill resolves through the account's own
+// .claude.json identity and degrades to "" — never an error — when the identity
+// or the overlay backend is unreadable.
+func TestAccountLoginEmail(t *testing.T) {
+	cases := map[string]struct {
+		overlay string
+		oauth   string // oauthAccount JSON, "" writes no .claude.json
+		want    string
+	}{
+		"identity email is returned": {
+			overlay: "symlink",
+			oauth:   `{"accountUuid": "u-1", "emailAddress": "me@example.com"}`,
+			want:    "me@example.com",
+		},
+		"identity without an email yields empty": {
+			overlay: "symlink",
+			oauth:   `{"accountUuid": "u-1"}`,
+			want:    "",
+		},
+		"missing identity yields empty": {
+			overlay: "symlink",
+			want:    "",
+		},
+		"unparseable overlay backend yields empty": {
+			overlay: "bogus",
+			oauth:   `{"accountUuid": "u-1", "emailAddress": "me@example.com"}`,
+			want:    "",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.oauth != "" {
+				body := `{"oauthAccount": ` + tc.oauth + `}`
+				if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			a := store.Account{ConfigDir: dir, OverlayKind: tc.overlay}
+			if got := accountLoginEmail(a); got != tc.want {
+				t.Errorf("accountLoginEmail = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 // TestNewReloginProbe: completion keys on the credential turning fresh and usable

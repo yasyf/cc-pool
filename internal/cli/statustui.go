@@ -56,7 +56,7 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 			return m.TogglePin(cwd, accountID, time.Now())
 		},
 		buildLogin: func(a store.Account) (*exec.Cmd, error) {
-			return loginCommand(a.ConfigDir)
+			return loginCommand(a.ConfigDir, accountLoginEmail(a))
 		},
 		finishLogin: func(a store.Account, baseline string) error {
 			return tuiFinishRelogin(ctx, m, a, baseline)
@@ -122,7 +122,7 @@ type (
 	pinDoneMsg struct{ err error }
 	// reloginStartMsg starts the interactive login after the short-circuit check passed on it.
 	reloginStartMsg struct{ account store.Account }
-	// reloginExitedMsg fires after claude /login exits and the terminal is back
+	// reloginExitedMsg fires after claude auth login exits and the terminal is back
 	// under the TUI; baseline is the pre-login access token finishRelogin
 	// compares against, so a quit-without-login never reads as success.
 	reloginExitedMsg struct {
@@ -133,7 +133,7 @@ type (
 	tickMsg        time.Time
 )
 
-// watchedLogin runs `claude /login` as a tea.ExecCommand and auto-closes claude
+// watchedLogin runs `claude auth login` as a tea.ExecCommand and auto-closes claude
 // once a fresh credential lands; Bubble Tea releases the tty for Run, so poll+terminate never fight claude for it.
 type watchedLogin struct {
 	ctx      context.Context
@@ -234,7 +234,7 @@ func tuiCheckFresh(ctx context.Context, m *pool.Manager, a store.Account) (bool,
 	return cleared, err
 }
 
-// reloginable reports whether a manual `claude /login` could clear s's state (no health gate).
+// reloginable reports whether a manual `claude auth login` could clear s's state (no health gate).
 func reloginable(s pool.Snapshot) bool {
 	return s.NeedsLogin || s.Stale || s.RateLimited || s.Exhausted
 }

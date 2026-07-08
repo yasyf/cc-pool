@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"golang.org/x/term"
 )
 
@@ -25,7 +26,7 @@ func newLoginCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "login <account>",
 		Short: "Re-login a pool account whose token was revoked",
-		Long: "login runs `claude /login` for one pool account, attached to your\n" +
+		Long: "login runs `claude auth login` for one pool account, attached to your\n" +
 			"terminal, so you can re-authenticate an account the daemon flagged as\n" +
 			"needing login (its refresh token was revoked or cleared). Complete the\n" +
 			"login; cc-pool closes claude once it lands (or exit claude yourself), then\n" +
@@ -67,7 +68,7 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 		return nil
 	}
 
-	c, err := loginCommand(a.ConfigDir)
+	c, err := loginCommand(a.ConfigDir, accountLoginEmail(a))
 	if err != nil {
 		return err
 	}
@@ -127,17 +128,37 @@ func afterReloginIO(ctx context.Context, out, errw io.Writer, m *pool.Manager, a
 	}
 }
 
-// loginCommand builds the `claude /login` command for an account's config dir;
-// the caller owns the child's stdio.
-func loginCommand(configDir string) (*exec.Cmd, error) {
+// loginCommand builds the `claude auth login` command for an account's config
+// dir, prefilling --email when the address is known so re-login skips the email
+// prompt; the caller owns the child's stdio.
+func loginCommand(configDir, email string) (*exec.Cmd, error) {
 	bin, err := exec.LookPath("claude")
 	if err != nil {
 		return nil, fmt.Errorf("`claude` not found on PATH: %w", err)
 	}
-	//nolint:gosec // G204: bin is the resolved claude executable path; "/login" is a fixed argument
-	c := exec.Command(bin, "/login")
+	args := []string{"auth", "login"}
+	if email != "" {
+		args = append(args, "--email", email)
+	}
+	//nolint:gosec // G204: bin is the resolved claude executable; args are fixed subcommands plus the account's own login email
+	c := exec.Command(bin, args...)
 	c.Env = execEnv(os.Environ(), configDir)
 	return c, nil
+}
+
+// accountLoginEmail returns a's login email from its own .claude.json identity,
+// or "" when the identity is unreadable — a prefill hint that must never block a
+// re-login.
+func accountLoginEmail(a store.Account) string {
+	backend, err := fkoverlay.Parse(a.OverlayKind)
+	if err != nil {
+		return ""
+	}
+	id, err := pool.AccountIdentity(backend, a.ConfigDir)
+	if err != nil {
+		return ""
+	}
+	return id.EmailAddress
 }
 
 // forcedRefreshHorizon makes EnsureFreshToken treat any expiry as imminent, so
