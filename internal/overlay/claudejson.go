@@ -12,6 +12,10 @@ import (
 // login identity.
 const OAuthAccountKey = "oauthAccount"
 
+// OnboardingCompletedKey is the top-level .claude.json flag claude checks to
+// skip the first-run onboarding wizard.
+const OnboardingCompletedKey = "hasCompletedOnboarding"
+
 // ClaudeJSONPrivateKeys are the top-level .claude.json keys that never cross
 // between base ~/.claude.json and an account's private copy in either
 // direction (the ClaudeJSONSharedProjectKeys carve-out inside "projects"

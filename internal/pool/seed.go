@@ -16,16 +16,22 @@ type SeedOutcome string
 const (
 	// SeedCopied means ~/.claude.json was copied in with oauthAccount stripped.
 	SeedCopied SeedOutcome = "copied"
-	// SeedNoSource means no ~/.claude.json exists; claude onboards fresh.
+	// SeedNoSource means no ~/.claude.json existed to copy; a minimal doc
+	// carrying only the onboarding flag is seeded instead.
 	SeedNoSource SeedOutcome = "no-source"
 	// SeedKeptExisting means the account already holds logged-in state (a prior add
 	// logged in but was not finalized); left untouched.
 	SeedKeptExisting SeedOutcome = "kept-existing"
 )
 
-// seedClaudeJSON seeds an account's private .claude.json from srcPath (plain
-// claude's ~/.claude.json) verbatim except the top-level oauthAccount identity,
-// which is stripped (`claude /login` writes the account's own). It strips ONLY
+// seedClaudeJSON seeds an account's private .claude.json before login so the
+// account inherits onboarding state instead of the first-run wizard. It copies
+// srcPath (plain claude's ~/.claude.json) verbatim except the top-level
+// oauthAccount identity, which is stripped (login writes the account's own),
+// and always stamps hasCompletedOnboarding:true — `claude auth login` never
+// writes that flag, so without the pre-seed the account's first interactive
+// session re-runs the wizard; login preserves the pre-seeded key. With no
+// source it seeds a minimal doc carrying just the flag. It strips ONLY
 // overlay.OAuthAccountKey, not the full overlay.ClaudeJSONPrivateKeys blacklist
 // that mergeClaudeJSON and the fuse view honor, so projects and userID carry
 // over. Written to the provider's private root, not a fuse mount that may be
@@ -45,25 +51,30 @@ func seedClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (SeedOu
 		return "", fmt.Errorf("read existing %s: %w", dst, err)
 	}
 
-	src, err := os.ReadFile(srcPath) //nolint:gosec // G304: srcPath is the user's own ~/.claude.json resolved by cc-pool
-	if os.IsNotExist(err) {
-		return SeedNoSource, nil
-	}
-	if err != nil {
+	top := map[string]json.RawMessage{}
+	outcome := SeedNoSource
+	switch src, err := os.ReadFile(srcPath); { //nolint:gosec // G304: srcPath is the user's own ~/.claude.json resolved by cc-pool
+	case os.IsNotExist(err):
+	case err != nil:
 		return "", fmt.Errorf("read %s: %w", srcPath, err)
+	default:
+		if err := json.Unmarshal(src, &top); err != nil {
+			return "", fmt.Errorf("parse %s: %w", srcPath, err)
+		}
+		if top == nil {
+			return "", fmt.Errorf("parse %s: not a JSON object", srcPath)
+		}
+		delete(top, overlay.OAuthAccountKey)
+		outcome = SeedCopied
 	}
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal(src, &top); err != nil {
-		return "", fmt.Errorf("parse %s: %w", srcPath, err)
-	}
-	delete(top, overlay.OAuthAccountKey)
+	top[overlay.OnboardingCompletedKey] = json.RawMessage("true")
+
 	out, err := json.Marshal(top)
 	if err != nil {
 		return "", fmt.Errorf("encode seeded config: %w", err)
 	}
-
 	if err := overlay.WriteAtomic0600(dst, out); err != nil {
 		return "", fmt.Errorf("install seeded config: %w", err)
 	}
-	return SeedCopied, nil
+	return outcome, nil
 }

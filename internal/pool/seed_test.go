@@ -84,14 +84,18 @@ func TestSeedClaudeJSON(t *testing.T) {
 		}
 	})
 
-	t.Run("missing source skips with no file", func(t *testing.T) {
+	t.Run("missing source seeds only the onboarding flag", func(t *testing.T) {
 		acct := t.TempDir()
 		out, err := seedClaudeJSON(prov, acct, filepath.Join(t.TempDir(), "nope.json"))
 		if err != nil || out != SeedNoSource {
 			t.Fatalf("outcome = %q err = %v", out, err)
 		}
-		if _, err := os.Stat(filepath.Join(acct, ".claude.json")); !os.IsNotExist(err) {
-			t.Fatal("no destination file should be created")
+		got := decode(t, readFile(t, filepath.Join(acct, ".claude.json")))
+		if got["hasCompletedOnboarding"] != true {
+			t.Fatalf("onboarding flag not seeded with no source: %v", got)
+		}
+		if len(got) != 1 {
+			t.Fatalf("no-source seed must carry only the onboarding flag, got %v", got)
 		}
 	})
 
@@ -171,6 +175,66 @@ func TestSeedClaudeJSON(t *testing.T) {
 			t.Fatal("seed must not land in the mountpoint dir")
 		}
 	})
+}
+
+// TestSeedClaudeJSONSeedsOnboardingFlag asserts the pre-login seed always leaves
+// hasCompletedOnboarding:true in the account's private .claude.json — the flag
+// `claude auth login` never writes — across every backend and source shape,
+// forcing it on even when the source omits or disables it, while preserving the
+// source's other keys and never pre-seeding the login identity.
+func TestSeedClaudeJSONSeedsOnboardingFlag(t *testing.T) {
+	backends := []struct {
+		name string
+		prov fkoverlay.Provider
+	}{
+		{"symlink", newSymlinkProvider()},
+		// A private-root provider models both the fuse and File Provider backends.
+		{"private-root", &privateRootProvider{}},
+	}
+	sources := []struct {
+		name       string
+		src        string // empty => no source file at all
+		outcome    SeedOutcome
+		wantUserID string // "" => no userID expected in the seed
+	}{
+		{"no source", "", SeedNoSource, ""},
+		{"source already true", `{"hasCompletedOnboarding": true, "userID": "u"}`, SeedCopied, "u"},
+		{"source explicitly false", `{"hasCompletedOnboarding": false, "userID": "u"}`, SeedCopied, "u"},
+		{"source lacks the flag", `{"userID": "u", "numStartups": 3}`, SeedCopied, "u"},
+		{"source with login identity", seedSrc, SeedCopied, "deadbeef"},
+	}
+
+	for _, be := range backends {
+		for _, sc := range sources {
+			t.Run(be.name+"/"+sc.name, func(t *testing.T) {
+				acct := t.TempDir()
+				srcPath := filepath.Join(t.TempDir(), "absent.json")
+				if sc.src != "" {
+					srcPath = filepath.Join(t.TempDir(), ".claude.json")
+					if err := os.WriteFile(srcPath, []byte(sc.src), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				out, err := seedClaudeJSON(be.prov, acct, srcPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if out != sc.outcome {
+					t.Fatalf("outcome = %q, want %q", out, sc.outcome)
+				}
+				got := decode(t, readFile(t, filepath.Join(be.prov.PrivateRoot(acct), ".claude.json")))
+				if got["hasCompletedOnboarding"] != true {
+					t.Fatalf("onboarding flag not forced true: %v", got)
+				}
+				if _, ok := got["oauthAccount"]; ok {
+					t.Fatalf("login identity leaked into the pre-login seed: %v", got)
+				}
+				if sc.wantUserID != "" && got["userID"] != sc.wantUserID {
+					t.Fatalf("source key clobbered: userID = %v, want %q", got["userID"], sc.wantUserID)
+				}
+			})
+		}
+	}
 }
 
 func readFile(t *testing.T, path string) []byte {

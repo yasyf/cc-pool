@@ -175,7 +175,7 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	}
 	// Login must pin the plugin root to the shared base, else it stamps
 	// acct-anchored paths into shared plugin state.
-	wantLogin := fmt.Sprintf("CLAUDE_CODE_PLUGIN_CACHE_DIR=%s CLAUDE_CONFIG_DIR=%s claude /login",
+	wantLogin := fmt.Sprintf("CLAUDE_CODE_PLUGIN_CACHE_DIR=%s CLAUDE_CONFIG_DIR=%s claude auth login",
 		filepath.Join(base, "plugins"), acct)
 	if pending.LoginCommand != wantLogin {
 		t.Fatalf("LoginCommand = %q, want %q", pending.LoginCommand, wantLogin)

@@ -77,14 +77,15 @@ func newIdentityProbe(read identityFunc, backend fkoverlay.Backend, configDir st
 	}
 }
 
-// runWatchedLogin runs `claude /login` attached to the terminal and closes
+// runWatchedLogin runs `claude auth login` attached to the terminal and closes
 // claude once the account's own login identity lands. The child stays in our
 // foreground process group (a background pgrp touching the tty would stop on
 // SIGTTIN/SIGTTOU).
 func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd) error {
-	bin, err := exec.LookPath("claude")
+	// A fresh add has no known email yet, so no --email prefill.
+	c, err := loginCommand(p.ConfigDir, "")
 	if err != nil {
-		return fmt.Errorf("`claude` not found on PATH: %w", err)
+		return err
 	}
 	// On SeedKeptExisting an identity is already present and a real probe would
 	// fire immediately; watch with a never-fire probe and let the user exit.
@@ -98,9 +99,6 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 	fd := int(os.Stdin.Fd())
 	state, _ := term.GetState(fd) // nil on non-TTY; restore is nil-safe
 
-	//nolint:gosec // G204: bin is the resolved claude executable path; "/login" is a fixed argument
-	c := exec.Command(bin, "/login")
-	c.Env = execEnv(os.Environ(), p.ConfigDir)
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	outcome, werr := watchAndClose(ctx, c, probe)
 	restoreTerminal(cmd.OutOrStdout(), fd, state)
@@ -116,7 +114,7 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 // exited on its own. The caller owns terminal setup and teardown.
 func watchAndClose(ctx context.Context, c *exec.Cmd, probe func() (bool, error)) (awaitOutcome, error) {
 	if err := c.Start(); err != nil {
-		return awaitCanceled, fmt.Errorf("start claude /login: %w", err)
+		return awaitCanceled, fmt.Errorf("start claude auth login: %w", err)
 	}
 	procExit := make(chan error, 1)
 	go func() { procExit <- c.Wait() }()

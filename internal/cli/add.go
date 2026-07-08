@@ -31,7 +31,7 @@ func newAddCmd() *cobra.Command {
 		Long: `add pools a Claude subscription. It sets up a new account, logs it in, and
 records it so ccp can route sessions to it.
 
-Each account logs in with its own ` + "`claude /login`" + `, so it gets its own token
+Each account logs in with its own ` + "`claude auth login`" + `, so it gets its own token
 chain. Plain claude stays logged in and untouched.
 
 On a fresh machine, add also sets up the pool and starts the background daemon,

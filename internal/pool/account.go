@@ -27,7 +27,7 @@ type InitResult struct {
 
 // Init prepares the pool's ~/.cc-pool state dirs, overlay choice, and initialized
 // marker. Never touches ~/.claude or the Keychain — accounts join via Add, each
-// with its own `claude /login`. Idempotent.
+// with its own `claude auth login`. Idempotent.
 func (m *Manager) Init() (*InitResult, error) {
 	if err := EnsureStateDir(); err != nil {
 		return nil, err
@@ -193,7 +193,7 @@ func (m *Manager) PrepareAdd() (pending *PendingAdd, err error) {
 		// Pin claude's plugin root to the shared base so login writes canonical
 		// ~/.claude plugin paths, not acct-anchored ones claude's marketplace
 		// validator later rejects; see cli.execEnv.
-		LoginCommand: fmt.Sprintf("CLAUDE_CODE_PLUGIN_CACHE_DIR=%s CLAUDE_CONFIG_DIR=%s claude /login",
+		LoginCommand: fmt.Sprintf("CLAUDE_CODE_PLUGIN_CACHE_DIR=%s CLAUDE_CONFIG_DIR=%s claude auth login",
 			filepath.Join(ClaudeDir(), "plugins"), acctDir),
 		ClaudeJSONSeed: seed,
 	}, nil
@@ -203,7 +203,7 @@ func (m *Manager) PrepareAdd() (pending *PendingAdd, err error) {
 // re-asserts ACL ownership, validates with one usage call, and records the
 // account. label is an optional human note.
 func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) (*store.Account, error) {
-	// A completed `claude /login` writes the account's own oauthAccount identity; a
+	// A completed `claude auth login` writes the account's own oauthAccount identity; a
 	// copied credential writes none. Missing identity means login never completed —
 	// refuse it, so the pool never registers a copy of plain claude's session
 	// (Max/Pro OAuth only; Console/3rd-party logins write none and are likewise
