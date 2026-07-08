@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"ops":[{"kind":"add_comment","body":"Shipped in v0.49.0 (77f03928): reportOrphanFPDomains scans ~/Library/CloudStorage for CCPoolStatus-acct-NN folders with no accounts row; --fix deregisters only after the full predicate (row absent, account dir + private root absent, DomainRoot-confirmed) passes twice — at scan and again immediately before removal. Unreadable state / unreachable app / mid-confirm change = advisory only."}]}
+{"v":1,"lamport":3,"ops":[{"kind":"set_criterion_status","id":"329f756d8454fd1f4bfdb8f209b69216","status":"met"}]}
