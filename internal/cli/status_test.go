@@ -704,6 +704,49 @@ func TestFPWedgedFooter(t *testing.T) {
 	}
 }
 
+// TestLedgerFooter pins the compact self-heal rollup: silent unless a row is
+// faulted or parked (a parked row counts once, as parked), then counts plus the
+// doctor pointer — per-row detail stays `ccp doctor`'s job.
+func TestLedgerFooter(t *testing.T) {
+	cases := map[string]struct {
+		ledgers []daemon.LedgerState
+		want    string
+	}{
+		"none is silent":  {nil, ""},
+		"empty is silent": {[]daemon.LedgerState{}, ""},
+		"healthy rows are silent": {
+			[]daemon.LedgerState{
+				{Policy: "auth.streak", Resource: "/p/acct-01", Strikes: 2},
+				{Policy: "ratelimit.pool", Resource: "pool", Attempts: 1},
+			},
+			"",
+		},
+		"faulted row": {
+			[]daemon.LedgerState{{Policy: "fuse.deepwedge", Resource: "/p/acct-01", Faulted: true}},
+			"self-heal: 1 faulted — run `ccp doctor` for detail",
+		},
+		"parked row counts once, as parked": {
+			[]daemon.LedgerState{{Policy: "fp.domain", Resource: "/p/acct-02", Faulted: true, Parked: true}},
+			"self-heal: 1 parked — run `ccp doctor` for detail",
+		},
+		"faulted and parked together": {
+			[]daemon.LedgerState{
+				{Policy: "fuse.deepwedge", Resource: "/p/acct-01", Faulted: true},
+				{Policy: "auth.streak", Resource: "/p/acct-03", Faulted: true},
+				{Policy: "fp.domain", Resource: "/p/acct-02", Faulted: true, Parked: true},
+			},
+			"self-heal: 2 faulted, 1 parked — run `ccp doctor` for detail",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := stripANSI(ledgerFooter(tc.ledgers)); got != tc.want {
+				t.Errorf("ledgerFooter = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRunStatusPlainFPWedgedFooter pins the FP-wedge footer end-to-end through
 // runStatus against a fake daemon socket.
 func TestRunStatusPlainFPWedgedFooter(t *testing.T) {

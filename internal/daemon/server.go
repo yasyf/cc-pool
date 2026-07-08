@@ -469,6 +469,7 @@ func (s *Server) handleStatus(ctx context.Context) Response {
 		}
 	}
 	resp.FPWedged = s.fpWedgedStates(accts)
+	resp.Ledgers = s.ledgersWire()
 	return resp
 }
 

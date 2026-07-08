@@ -15,7 +15,9 @@ func (s *Server) writeStatusSnapshot(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("assemble status snapshot: %w", err)
 	}
-	data, err := json.Marshal(NewStatusSnapshot(accts, time.Now()))
+	snap := NewStatusSnapshot(accts, time.Now())
+	snap.Ledgers = s.ledgersWire()
+	data, err := json.Marshal(snap)
 	if err != nil {
 		return fmt.Errorf("encode status snapshot: %w", err)
 	}

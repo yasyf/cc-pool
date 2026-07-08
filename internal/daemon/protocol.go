@@ -131,6 +131,23 @@ type FPDomainState struct {
 	BreakerTripped bool `json:"breaker_tripped,omitempty"`
 }
 
+// LedgerState is one self-heal ledger row on the status wire: the composed
+// observability view over both ledger stores (the Server-owned store and the
+// holder cache's fuse verdict rows — composed at snapshot time, never merged).
+// Parked is computed against the row's policy. Additive; status only.
+type LedgerState struct {
+	Policy   string    `json:"policy"`
+	Resource string    `json:"resource"`
+	Strikes  int       `json:"strikes,omitempty"`
+	Faulted  bool      `json:"faulted,omitempty"`
+	Attempts int       `json:"attempts,omitempty"`
+	AltHits  int       `json:"alt_hits,omitempty"`
+	Parked   bool      `json:"parked,omitempty"`
+	NextDue  time.Time `json:"next_due,omitzero"`
+	LastErr  string    `json:"last_err,omitempty"`
+	LastAt   time.Time `json:"last_at,omitzero"`
+}
+
 // HolderStatus is the daemon's cached view of the detached mount holder.
 type HolderStatus struct {
 	// Version is the holder's reported build version; "" means the holder was
@@ -206,6 +223,9 @@ type StatusSnapshot struct {
 	// Pool is nil (key absent — the widget decodes it as optional) when no
 	// account has a known-good sample (never sampled, or only 429 placeholders).
 	Pool *PoolOutlook `json:"pool,omitempty"`
+	// Ledgers mirrors the status op's composed self-heal ledger block so doctor
+	// and the widget can read it with the daemon down. Additive.
+	Ledgers []LedgerState `json:"ledgers,omitempty"`
 }
 
 // PoolOutlook is the wire form of the forecast pool rollup. Mood is computed
@@ -318,7 +338,11 @@ type Response struct {
 	FPConsentPending bool `json:"fp_consent_pending,omitempty"`
 	// FPWedged lists File Provider domains the daemon's data-plane probe found
 	// wedged (control ops answer, reads hang). Additive; status only.
-	FPWedged   []FPDomainState   `json:"fp_wedged,omitempty"`
+	FPWedged []FPDomainState `json:"fp_wedged,omitempty"`
+	// Ledgers is the composed self-heal ledger block: every live ledger row from
+	// both stores (Server-owned and holder-cache), sorted by policy then
+	// resource. Additive; status only.
+	Ledgers    []LedgerState     `json:"ledgers,omitempty"`
 	Version    string            `json:"version,omitempty"`    // health
 	Migrations []MigrationResult `json:"migrations,omitempty"` // migrate/credmove
 	// FPRepairs carries per-account `ccp fp repair` outcomes.

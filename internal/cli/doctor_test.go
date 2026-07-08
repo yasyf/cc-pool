@@ -71,17 +71,6 @@ func TestReportHolder(t *testing.T) {
 			fuseRows: 1,
 			want:     []reportCall{{"mount holder", true, cur}},
 		},
-		"cached TCC block fails with the settings deep link": {
-			facts: holderFacts{
-				reachable: true, version: cur,
-				cached: &daemon.HolderStatus{TCCError: "grant Network Volumes access", TCCBlockedBackend: fkoverlay.BackendNFS},
-			},
-			fuseRows: 1,
-			want: []reportCall{
-				{"mount holder", true, cur},
-				{"mount holder grant", false, "grant Network Volumes access — " + fuseGrantHint(fkoverlay.BackendNFS) + " (cc-pool falls back to symlink automatically if the grant never lands)"},
-			},
-		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -170,6 +159,128 @@ func TestReportHolderMitigations(t *testing.T) {
 			for _, frag := range tc.wantDetail {
 				if !strings.Contains(got.detail, frag) {
 					t.Errorf("detail %q missing %q", got.detail, frag)
+				}
+			}
+		})
+	}
+}
+
+// TestReportLedgers pins the one daemon-up self-heal surface: the composed
+// Ledgers block rendered in the findings style, with the holder cache's TCC
+// grant walkthrough verbatim. Healthy rows are silent; a parked fuse.remount
+// row reads as a DEFERRED retreat (the escalation clears the row when the
+// retreat actually fires), never as done.
+func TestReportLedgers(t *testing.T) {
+	accts := []store.Account{
+		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendNFS)},
+		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(fkoverlay.BackendFileProvider)},
+	}
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	type wantCall struct {
+		label    string
+		frags    []string
+		notFrags []string
+	}
+	cases := map[string]struct {
+		ledgers []daemon.LedgerState
+		holder  *daemon.HolderStatus
+		want    []wantCall
+	}{
+		"healthy pool (no rows, no grant) is silent": {},
+		"healthy rows are silent (mid-debounce, benign deferral, elapsed backoff)": {
+			ledgers: []daemon.LedgerState{
+				{Policy: "auth.streak", Resource: "/p/acct-01", Strikes: 2},
+				{Policy: "fp.domain", Resource: "/p/acct-02", Strikes: 1},
+				{Policy: "fuse.deepwedge", Resource: "/p/acct-01", Strikes: 1},
+				{Policy: "fuse.remount", Resource: "/p/acct-01", Attempts: 3},
+				{Policy: "ratelimit.acct", Resource: "/p/acct-01", Attempts: 2, NextDue: now.Add(-time.Second)},
+			},
+		},
+		"wedged mirror (fuse.deepwedge faulted)": {
+			ledgers: []daemon.LedgerState{{Policy: "fuse.deepwedge", Resource: "/p/acct-01", Faulted: true}},
+			want:    []wantCall{{label: "acct-01 mirror", frags: []string{"wedged (serves metadata but hangs reads)", "remount"}}},
+		},
+		"dead mirror (fuse.shallowdead faulted)": {
+			ledgers: []daemon.LedgerState{{Policy: "fuse.shallowdead", Resource: "/p/acct-01", Faulted: true}},
+			want:    []wantCall{{label: "acct-01 mirror", frags: []string{"dead mirror (fails reads outright"}}},
+		},
+		"parked hazard remount reads as a deferred retreat, never done": {
+			ledgers: []daemon.LedgerState{{Policy: "fuse.remount", Resource: "/p/acct-01", Strikes: 5, Attempts: 7, Parked: true}},
+			want: []wantCall{{
+				label:    "acct-01 remount",
+				frags:    []string{"remount breaker tripped", "5 failed attempts", "retreat to symlink pending", "re-fires", "next elapsed backoff window"},
+				notFrags: []string{"fell back to symlink"},
+			}},
+		},
+		"parked TCC lane reads as a deferred retreat too": {
+			ledgers: []daemon.LedgerState{{Policy: "fuse.remount", Resource: "/p/acct-01", AltHits: 6, Attempts: 9, Parked: true}},
+			want: []wantCall{{
+				label:    "acct-01 remount",
+				frags:    []string{"TCC breaker tripped", "retreat to symlink pending"},
+				notFrags: []string{"fell back to symlink"},
+			}},
+		},
+		"TCC grace counting pairs the verbatim grant walkthrough": {
+			holder:  &daemon.HolderStatus{TCCError: "grant Network Volumes access", TCCBlockedBackend: fkoverlay.BackendNFS},
+			ledgers: []daemon.LedgerState{{Policy: "fuse.remount", Resource: "/p/acct-01", AltHits: 2, Attempts: 2}},
+			want: []wantCall{
+				{label: "mount holder grant", frags: []string{"grant Network Volumes access — " + fuseGrantHint(fkoverlay.BackendNFS) + " (cc-pool falls back to symlink automatically if the grant never lands)"}},
+				{label: "acct-01 remount", frags: []string{"macOS grant", "2 waits", "mount holder grant line"}},
+			},
+		},
+		"grant walkthrough renders even with no ledger rows": {
+			holder: &daemon.HolderStatus{TCCError: "grant Network Volumes access", TCCBlockedBackend: fkoverlay.BackendNFS},
+			want:   []wantCall{{label: "mount holder grant", frags: []string{"grant Network Volumes access"}}},
+		},
+		"remount hazard mid-ladder carries its last error": {
+			ledgers: []daemon.LedgerState{{Policy: "fuse.remount", Resource: "/p/acct-01", Strikes: 2, Attempts: 2, LastErr: "mount: EIO"}},
+			want:    []wantCall{{label: "acct-01 remount", frags: []string{"remount failing", "2 attempts", "mount: EIO"}}},
+		},
+		"wedged fp domain points at ccp fp repair": {
+			ledgers: []daemon.LedgerState{{Policy: "fp.domain", Resource: "/p/acct-02", Faulted: true, Attempts: 2}},
+			want:    []wantCall{{label: "acct-02 file provider", frags: []string{"domain wedged (serves control ops but hangs reads)", "ccp fp repair"}}},
+		},
+		"parked fp domain carries the repair and retreat levers": {
+			ledgers: []daemon.LedgerState{{Policy: "fp.domain", Resource: "/p/acct-02", Faulted: true, Attempts: 5, Parked: true}},
+			want: []wantCall{{
+				label: "acct-02 file provider",
+				frags: []string{"parked", "automated recovery is exhausted", "ccp fp repair --account 2", "--retreat"},
+			}},
+		},
+		"auth streak fault carries the login hint": {
+			ledgers: []daemon.LedgerState{{Policy: "auth.streak", Resource: "/p/acct-01", Faulted: true, LastErr: "401 unauthorized"}},
+			want:    []wantCall{{label: "acct-01 auth", frags: []string{"needs re-login", "ccp login 1", "401 unauthorized"}}},
+		},
+		"account rate limit backing off": {
+			ledgers: []daemon.LedgerState{{Policy: "ratelimit.acct", Resource: "/p/acct-01", Attempts: 3, NextDue: now.Add(90 * time.Second)}},
+			want:    []wantCall{{label: "acct-01 rate limit", frags: []string{"429 backoff", "1m30s", "3 hits"}}},
+		},
+		"pool rate limit backing off": {
+			ledgers: []daemon.LedgerState{{Policy: "ratelimit.pool", Resource: "pool", Attempts: 1, NextDue: now.Add(3 * time.Minute)}},
+			want:    []wantCall{{label: "pool rate limit", frags: []string{"429 backoff", "3m0s", "1 hit"}}},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			report, calls := captureReports()
+			reportLedgers(accts, tc.ledgers, tc.holder, now, report)
+			if len(*calls) != len(tc.want) {
+				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
+			}
+			for i, want := range tc.want {
+				got := (*calls)[i]
+				if got.label != want.label || got.healthy {
+					t.Errorf("report[%d] = %+v, want unhealthy %q", i, got, want.label)
+				}
+				for _, frag := range want.frags {
+					if !strings.Contains(got.detail, frag) {
+						t.Errorf("report[%d] detail %q missing %q", i, got.detail, frag)
+					}
+				}
+				for _, frag := range want.notFrags {
+					if strings.Contains(got.detail, frag) {
+						t.Errorf("report[%d] detail %q must not claim %q", i, got.detail, frag)
+					}
 				}
 			}
 		})
@@ -265,12 +376,18 @@ func TestReportWedges(t *testing.T) {
 	// The daemon never force-unmounts a busy mirror: it panics the kernel.
 	wedgeBusyDetail := "left mounted under 1 live session(s); relaunch them — the daemon will NOT force-unmount a busy mirror"
 	cases := map[string]struct {
-		mounts     []mountd.MountInfo
-		sessions   []procscan.Session
-		probeErr   error
-		want       []reportCall
-		wantProbed []string
+		mounts      []mountd.MountInfo
+		sessions    []procscan.Session
+		probeErr    error
+		daemonAlive bool
+		want        []reportCall
+		wantProbed  []string
 	}{
+		"daemon alive never probes and stays silent (reportLedgers owns the verdicts)": {
+			mounts:      []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b", Live: true}},
+			probeErr:    fmt.Errorf("%w: hung", overlay.ErrProbeWedged),
+			daemonAlive: true,
+		},
 		"live row with failing deep probe and no sessions reports the idle copy": {
 			mounts:     []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b", Live: true}},
 			probeErr:   fmt.Errorf("%w: hung", overlay.ErrProbeWedged),
@@ -311,7 +428,7 @@ func TestReportWedges(t *testing.T) {
 				return tc.probeErr
 			})
 			report, calls := captureReports()
-			reportWedges(accts, tc.mounts, tc.sessions, report)
+			reportWedges(accts, tc.mounts, tc.sessions, tc.daemonAlive, report)
 			if len(*calls) != len(tc.want) {
 				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
 			}
@@ -564,33 +681,11 @@ func TestReportFPWedges(t *testing.T) {
 	}
 	symRow := store.Account{ID: 9, ConfigDir: "/p/acct-09", OverlayKind: string(fkoverlay.BackendSymlink)}
 
-	t.Run("daemon alive renders cached verdicts and never probes", func(t *testing.T) {
+	t.Run("daemon alive never probes and stays silent (reportLedgers owns the verdicts)", func(t *testing.T) {
 		swapVar(t, &fpDomainProbeAt, func(string) error { t.Error("probed with the daemon alive"); return nil })
-		cached := []daemon.FPDomainState{
-			{ID: 1, ConfigDir: "/p/acct-01", RecoveryAttempts: 2},
-			{ID: 2, ConfigDir: "/p/acct-02", BreakerTripped: true},
-		}
+		swapVar(t, &fpRawProbeAt, func(string) error { t.Error("raw-probed with the daemon alive"); return nil })
 		report, calls := captureReports()
-		reportFPWedges([]store.Account{fpRow(1), fpRow(2), symRow}, cached, true, false, report)
-
-		if len(*calls) != 2 {
-			t.Fatalf("got %d reports %+v, want 2", len(*calls), *calls)
-		}
-		if (*calls)[0].label != "acct-01 file provider" || (*calls)[0].healthy || !strings.Contains((*calls)[0].detail, "ccp fp repair") {
-			t.Errorf("report[0] = %+v, want acct-01 flagged with the repair pointer", (*calls)[0])
-		}
-		if !strings.Contains((*calls)[1].detail, "parked") || !strings.Contains((*calls)[1].detail, "automated recovery is exhausted") {
-			t.Errorf("breaker detail must read 'parked' + the exhausted note: %q", (*calls)[1].detail)
-		}
-		if !strings.Contains((*calls)[1].detail, "--retreat") {
-			t.Errorf("breaker detail missing the --retreat lever: %q", (*calls)[1].detail)
-		}
-	})
-
-	t.Run("daemon alive with no cached wedges is silent", func(t *testing.T) {
-		swapVar(t, &fpDomainProbeAt, func(string) error { t.Error("probed with the daemon alive"); return nil })
-		report, calls := captureReports()
-		reportFPWedges([]store.Account{fpRow(1)}, nil, true, false, report)
+		reportFPWedges([]store.Account{fpRow(1), fpRow(2), symRow}, true, false, report)
 		if len(*calls) != 0 {
 			t.Fatalf("want silence, got %+v", *calls)
 		}
@@ -613,7 +708,7 @@ func TestReportFPWedges(t *testing.T) {
 		})
 		swapVar(t, &fpRawProbeAt, func(string) error { t.Error("raw probe ran without --fp-raw-probe"); return nil })
 		report, calls := captureReports()
-		reportFPWedges([]store.Account{fpRow(1), fpRow(2), fpRow(3), fpRow(4), symRow}, nil, false, false, report)
+		reportFPWedges([]store.Account{fpRow(1), fpRow(2), fpRow(3), fpRow(4), symRow}, false, false, report)
 
 		for _, dir := range []string{"/p/acct-01", "/p/acct-02", "/p/acct-03", "/p/acct-04"} {
 			if !probed[dir] {
@@ -645,7 +740,7 @@ func TestReportFPWedges(t *testing.T) {
 			return nil
 		})
 		report, calls := captureReports()
-		reportFPWedges([]store.Account{fpRow(1), fpRow(2)}, nil, false, true, report)
+		reportFPWedges([]store.Account{fpRow(1), fpRow(2)}, false, true, report)
 
 		if !raw["/p/acct-01"] || !raw["/p/acct-02"] {
 			t.Fatalf("raw probe skipped a row: %v", raw)

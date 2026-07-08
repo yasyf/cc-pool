@@ -335,6 +335,18 @@ func (h *holderState) recordTCC(msg string, backend fkoverlay.Backend) {
 	h.mu.Unlock()
 }
 
+// ledgersSnapshot lists the holder cache's ledger rows (fuse.deepwedge /
+// fuse.shallowdead) for the composed status wire — bookkeeping only, under
+// h.mu.
+func (h *holderState) ledgersSnapshot() []ledgerSnapshot {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.led == nil {
+		return nil
+	}
+	return h.led.snapshot()
+}
+
 // wireStatus snapshots the cache. Version "" means unreachable — or a mount
 // trusted via noteMounted before any refresh.
 func (h *holderState) wireStatus() *HolderStatus {

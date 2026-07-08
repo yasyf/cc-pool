@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -104,6 +105,32 @@ func TestWriteStatusSnapshotOverwrites(t *testing.T) {
 		if a.ID == 1 && a.Remaining5h != 30 {
 			t.Errorf("acct-01 remaining_5h = %.1f after newer sample, want 30", a.Remaining5h)
 		}
+	}
+}
+
+// TestWriteStatusSnapshotCarriesLedgers pins that the on-disk snapshot carries
+// the same composed Ledgers block the status op serves — both stores, sorted —
+// so doctor and the widget can read the self-heal state with the daemon down.
+func TestWriteStatusSnapshotCarriesLedgers(t *testing.T) {
+	s, dirs := newTestServer(t)
+	s.snapshot = filepath.Join(t.TempDir(), "status.json")
+	s.ledMu.Lock()
+	s.led.forceFault(fpDomainPolicy, dirs[1], time.Now(), errors.New("fp wedged"))
+	s.ledMu.Unlock()
+	s.holder.markDeepWedged(dirs[2])
+
+	if err := s.writeStatusSnapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	snap := readSnapshot(t, s.snapshot)
+	if len(snap.Ledgers) != 2 {
+		t.Fatalf("snapshot ledgers = %+v, want the fp.domain and fuse.deepwedge rows", snap.Ledgers)
+	}
+	if snap.Ledgers[0].Policy != "fp.domain" || snap.Ledgers[0].Resource != dirs[1] || !snap.Ledgers[0].Faulted || snap.Ledgers[0].LastErr != "fp wedged" {
+		t.Errorf("ledgers[0] = %+v, want the faulted fp.domain row with its error", snap.Ledgers[0])
+	}
+	if snap.Ledgers[1].Policy != "fuse.deepwedge" || snap.Ledgers[1].Resource != dirs[2] || !snap.Ledgers[1].Faulted {
+		t.Errorf("ledgers[1] = %+v, want the holder-store fuse.deepwedge row", snap.Ledgers[1])
 	}
 }
 
@@ -356,6 +383,53 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 				t.Errorf("%s: empty pool must omit the pool block, got %s", name, data)
 			}
 		}
+	})
+
+	// Additive: the Ledgers block. The "fully populated" case above proves the
+	// pre-existing key sets stay byte-identical when no ledger row exists
+	// (assertKeys is exact — an extra key would fail it).
+	t.Run("ledgers block", func(t *testing.T) {
+		snap := NewStatusSnapshot(nil, now)
+		snap.Ledgers = []LedgerState{{
+			Policy: "fp.domain", Resource: "/x/acct-01",
+			Strikes: 1, Faulted: true, Attempts: 2, AltHits: 3, Parked: true,
+			NextDue: now.Truncate(time.Second), LastErr: "boom", LastAt: now.Truncate(time.Second),
+		}}
+		data, err := json.Marshal(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(data, &top); err != nil {
+			t.Fatal(err)
+		}
+		assertKeys(t, "top-level with ledgers", top, []string{"proto", "version", "generated_at", "accounts", "ledgers"})
+		var rows []map[string]json.RawMessage
+		if err := json.Unmarshal(top["ledgers"], &rows); err != nil {
+			t.Fatal(err)
+		}
+		assertKeys(t, "ledger row", rows[0], []string{
+			"policy", "resource", "strikes", "faulted", "attempts", "alt_hits",
+			"parked", "next_due", "last_err", "last_at",
+		})
+	})
+
+	t.Run("healthy ledger row omits its zero fields", func(t *testing.T) {
+		snap := NewStatusSnapshot(nil, now)
+		snap.Ledgers = []LedgerState{{Policy: "auth.streak", Resource: "/x/acct-01"}}
+		data, err := json.Marshal(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(data, &top); err != nil {
+			t.Fatal(err)
+		}
+		var rows []map[string]json.RawMessage
+		if err := json.Unmarshal(top["ledgers"], &rows); err != nil {
+			t.Fatal(err)
+		}
+		assertKeys(t, "zero ledger row", rows[0], []string{"policy", "resource"})
 	})
 }
 

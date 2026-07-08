@@ -67,7 +67,9 @@ func statusSnapshotJSON(ctx context.Context, m *pool.Manager, forceLive bool) (d
 	if !forceLive {
 		resp, err := daemon.NewClient().Status()
 		if daemonStatusUsable(resp, err) {
-			return daemon.NewStatusSnapshot(resp.Accounts, time.Now()), nil
+			snap := daemon.NewStatusSnapshot(resp.Accounts, time.Now())
+			snap.Ledgers = resp.Ledgers
+			return snap, nil
 		}
 	}
 	snaps, err := m.Snapshots(ctx, true, pool.DefaultFreshFor)
@@ -83,7 +85,7 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just hides pin state
 	render := func() error {
-		snaps, holder, fpWedged, fpConsentPending, err := gatherStatus(cmd.Context(), m, live)
+		snaps, holder, fpWedged, ledgers, fpConsentPending, err := gatherStatus(cmd.Context(), m, live)
 		if err != nil {
 			return err
 		}
@@ -105,6 +107,9 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 		if line := fpConsentFooter(fpConsentPending); line != "" {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 		}
+		if line := ledgerFooter(ledgers); line != "" {
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
+		}
 		return nil
 	}
 	if !watch {
@@ -122,15 +127,15 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 }
 
-func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, *daemon.HolderStatus, []daemon.FPDomainState, bool, error) {
+func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, *daemon.HolderStatus, []daemon.FPDomainState, []daemon.LedgerState, bool, error) {
 	if !forceLive {
 		resp, err := daemon.NewClient().Status()
 		if daemonStatusUsable(resp, err) {
-			return fromDaemon(resp.Accounts), resp.Holder, resp.FPWedged, resp.FPConsentPending, nil
+			return fromDaemon(resp.Accounts), resp.Holder, resp.FPWedged, resp.Ledgers, resp.FPConsentPending, nil
 		}
 	}
 	snaps, err := m.Snapshots(ctx, true, pool.DefaultFreshFor)
-	return snaps, nil, nil, false, err
+	return snaps, nil, nil, nil, false, err
 }
 
 // fpWedgedFooter renders the daemon's wedged File Provider domains — plain-path
@@ -151,6 +156,34 @@ func fpWedgedFooter(wedged []daemon.FPDomainState) string {
 		lines = append(lines, badStyle.Render(fmt.Sprintf("✗ acct-%02d file provider %s", w.ID, state)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// ledgerFooter is the compact self-heal rollup — plain-path only, like the
+// other footers. It renders only when a ledger row is faulted or parked (the
+// situations the holder/FP footers already alert on); a healthy pool prints
+// nothing new. `ccp doctor` carries the per-row detail.
+func ledgerFooter(ledgers []daemon.LedgerState) string {
+	faulted, parked := 0, 0
+	for _, l := range ledgers {
+		if l.Parked {
+			parked++
+			continue
+		}
+		if l.Faulted {
+			faulted++
+		}
+	}
+	if faulted == 0 && parked == 0 {
+		return ""
+	}
+	var parts []string
+	if faulted > 0 {
+		parts = append(parts, fmt.Sprintf("%d faulted", faulted))
+	}
+	if parked > 0 {
+		parts = append(parts, fmt.Sprintf("%d parked", parked))
+	}
+	return warnStyle.Render("self-heal: " + strings.Join(parts, ", ") + " — run `ccp doctor` for detail")
 }
 
 // fpConsentFooter warns that the daemon's File Provider data bridge is parked on
