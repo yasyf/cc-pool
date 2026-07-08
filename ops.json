@@ -1,1 +1,1 @@
-{"v":1,"lamport":1,"ops":[{"kind":"create_task","nonce":"22fc12e5ce0909973b2c438efcd5945f","title":"Release fusekit v0.35.0 (bounded app launch, RemoveConfirmed rollback, Setup phase timing)","description":"","type":"task","priority":2,"branch":"","parent":"","labels":null},{"kind":"add_criterion","id":"bcf5c029285cfb61b08530d40a5019b1","text":"v0.35.0 tag pushed to yasyf/fusekit; CI green; go get resolves it","script":""}]}
+{"v":1,"lamport":2,"ops":[{"kind":"set_criterion_status","id":"bcf5c029285cfb61b08530d40a5019b1","status":"met"}]}
