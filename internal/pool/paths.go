@@ -76,15 +76,61 @@ func ConfigDirForMount(mountDir string) string {
 	return mountDir
 }
 
-// IsBridgeSymlink reports whether dir is a mux bridge symlink into MuxRootDir().
+// DirKind classifies what occupies an account config-dir path, judged by
+// Lstat/Readlink alone so it never traverses a possibly-dead mount or a
+// materializing domain.
+type DirKind int
+
+const (
+	// DirReal is a real directory (any non-symlink Lstat result).
+	DirReal DirKind = iota
+	// DirAbsent is a path that does not exist, or is otherwise unstattable.
+	DirAbsent
+	// DirMuxBridge is a symlink into the shared fuse mux root (MuxRootDir).
+	DirMuxBridge
+	// DirFPBridge is a symlink into the File Provider CloudStorage root
+	// (FPCloudStorageDir).
+	DirFPBridge
+	// DirForeignLink is any other symlink, including one whose target is
+	// unreadable.
+	DirForeignLink
+)
+
+// ClassifyAccountDir reports what occupies an account config dir path, by
+// Lstat/Readlink ONLY — never a stat through a possibly-dead mount. The second
+// result is the symlink target ("" unless dir is a link with a readable target).
 // Readlink never traverses INTO the target, so it cannot hang on a wedged mount;
-// callers must never follow the link — moving files through it writes into the live mirror.
-func IsBridgeSymlink(dir string) bool {
+// callers must never follow a bridge link — moving files through it writes into
+// the live mirror or domain.
+func ClassifyAccountDir(dir string) (DirKind, string) {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return DirAbsent, ""
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return DirReal, ""
+	}
 	target, err := os.Readlink(dir)
 	if err != nil {
-		return false
+		return DirForeignLink, ""
 	}
-	return strings.HasPrefix(target, MuxRootDir()+string(os.PathSeparator))
+	switch {
+	case strings.HasPrefix(target, MuxRootDir()+string(os.PathSeparator)):
+		return DirMuxBridge, target
+	case strings.HasPrefix(target, FPCloudStorageDir()+string(os.PathSeparator)):
+		return DirFPBridge, target
+	default:
+		return DirForeignLink, target
+	}
+}
+
+// IsBridgeSymlink reports whether dir is a mux bridge symlink into MuxRootDir().
+// It is deliberately blind to a File Provider domain bridge (that reads false);
+// see ClassifyAccountDir for the full set. Callers must never follow the link —
+// moving files through it writes into the live mirror.
+func IsBridgeSymlink(dir string) bool {
+	kind, _ := ClassifyAccountDir(dir)
+	return kind == DirMuxBridge
 }
 
 // DBPath is the sqlite database path.

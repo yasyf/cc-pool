@@ -146,8 +146,11 @@ func overlaySpec() fkoverlay.Spec {
 			CannotHostHint: cannotHostHint,
 			SpawnTimeout:   mountd.DefaultSpawnTimeout,
 			// No Version: cc-pool must NEVER version-replace the shared holder — that
-			// tears down another tenant's mounts (the cask's launchd owns holder
-			// upgrades).
+			// tears down another tenant's mounts. Nothing converges a version-skewed
+			// holder automatically; a holder older than MinHolderVersion is refused
+			// loud by the mitigation gate until the operator upgrades the cask by hand
+			// (`brew upgrade --cask fusekit-holder`), and it is replaced only while no
+			// session rides it.
 			BridgeSocket: BridgeSocketPath(),
 			ContentMode:  "source",
 			ProbePath:    "/" + overlay.ProbeFileName,

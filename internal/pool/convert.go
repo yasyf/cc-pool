@@ -61,18 +61,12 @@ var ErrIdentityLost = errors.New("account identity lost after rollback")
 // absent dir, or a non-symlink stat error passes through — the caller's own move
 // surfaces a genuine fault.
 func requireRealDir(dir string) error {
-	fi, err := os.Lstat(dir)
-	if err != nil {
+	switch kind, target := ClassifyAccountDir(dir); kind {
+	case DirReal, DirAbsent:
 		return nil
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		target, rerr := os.Readlink(dir)
-		if rerr != nil {
-			target = fmt.Sprintf("<unreadable: %v>", rerr)
-		}
+	default:
 		return fmt.Errorf("%w: %s -> %s", ErrDirIsOverlaySymlink, dir, target)
 	}
-	return nil
 }
 
 // verifyIdentityRestored confirms a rollback's restore move landed a readable
@@ -395,8 +389,7 @@ func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fr
 // that never reached Setup (a drain/teardown fault) leaves no registration and must
 // touch nothing — never spawn the app to deregister a domain that was never laid.
 func retractFileProviderIfLaid(ctx context.Context, base, dir string, fpProv fkoverlay.Provider) error {
-	fi, err := os.Lstat(dir)
-	if err != nil || fi.Mode()&os.ModeSymlink != 0 {
+	if kind, _ := ClassifyAccountDir(dir); kind != DirReal {
 		return fpProv.Teardown(base, dir)
 	}
 	registry, ok := fpProv.(overlay.FPDomainRegistry)

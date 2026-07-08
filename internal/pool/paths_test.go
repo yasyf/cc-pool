@@ -65,6 +65,57 @@ func TestFPBridgeSocketPathFitsSunPath(t *testing.T) {
 	}
 }
 
+// TestClassifyAccountDir pins the Lstat/Readlink-only classification: a real
+// dir, an absent path, a mux bridge, an FP domain bridge, and any other symlink
+// each land in their DirKind, with the target riding back only for links.
+// Classification is by the raw stored target, so a relative target never matches
+// the absolute bridge-root prefixes — it reads foreign even when it resolves into
+// the mux root.
+func TestClassifyAccountDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(AccountsDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	realDir := filepath.Join(AccountsDir(), "acct-01")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := func(name, target string) string {
+		p := filepath.Join(AccountsDir(), name)
+		if err := os.Symlink(target, p); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	muxTarget := filepath.Join(MuxRootDir(), "acct-02")
+	fpTarget := filepath.Join(FPCloudStorageDir(), FPDomainFolderPrefix+"acct-03")
+	foreignTarget := filepath.Join(home, "somewhere-else")
+	relTarget := filepath.Join("..", "mnt", "acct-05") // resolves into the mux root, but is not absolute
+
+	cases := map[string]struct {
+		path       string
+		wantKind   DirKind
+		wantTarget string
+	}{
+		"a real directory":                  {realDir, DirReal, ""},
+		"an absent path":                    {filepath.Join(AccountsDir(), "acct-99"), DirAbsent, ""},
+		"a mux bridge symlink":              {link("acct-02", muxTarget), DirMuxBridge, muxTarget},
+		"a file provider domain bridge":     {link("acct-03", fpTarget), DirFPBridge, fpTarget},
+		"a foreign symlink":                 {link("acct-04", foreignTarget), DirForeignLink, foreignTarget},
+		"a relative target is not a bridge": {link("acct-05", relTarget), DirForeignLink, relTarget},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			kind, target := ClassifyAccountDir(tc.path)
+			if kind != tc.wantKind || target != tc.wantTarget {
+				t.Fatalf("ClassifyAccountDir(%q) = (%v, %q), want (%v, %q)", tc.path, kind, target, tc.wantKind, tc.wantTarget)
+			}
+		})
+	}
+}
+
 // TestIsBridgeSymlink pins bridge detection: only a symlink whose target is a
 // child of MuxRootDir() reads true. A real dir, a symlink elsewhere, and an
 // absent path all read false — nothing is traversed.

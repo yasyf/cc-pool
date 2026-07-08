@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"time"
 
@@ -187,8 +186,8 @@ var fpDomainProbe = func(ctx context.Context, dir string) error {
 // misclassify a benign transient as a wedge. A package var so heal tests drive the
 // ladder without laying a real symlink.
 var fpDirLinked = func(dir string) bool {
-	fi, err := os.Lstat(dir)
-	return err == nil && fi.Mode()&os.ModeSymlink != 0
+	kind, _ := pool.ClassifyAccountDir(dir)
+	return kind != pool.DirReal && kind != pool.DirAbsent
 }
 
 // fpAppexBounce SIGKILLs the File Provider extension process (CCPoolFileProvider)

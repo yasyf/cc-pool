@@ -21,8 +21,8 @@ const fpLeakSweepTimeout = 3 * time.Second
 // Provider domain bridge, or any overlay stand-in) via Lstat, which never follows
 // the link and so cannot hang on a wedged mount or a materializing domain.
 func (s *Server) dirIsOverlaySymlink(dir string) bool {
-	fi, err := os.Lstat(dir)
-	return err == nil && fi.Mode()&os.ModeSymlink != 0
+	kind, _ := pool.ClassifyAccountDir(dir)
+	return kind != pool.DirReal && kind != pool.DirAbsent
 }
 
 // convergeSymlinkRowBridge retracts a File Provider domain a crashed
