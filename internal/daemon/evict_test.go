@@ -109,7 +109,8 @@ func (f *fakeDaemon) serve() {
 }
 
 func testServer(socket string, evict time.Duration) *Server {
-	return &Server{cl: newClaims(),
+	return &Server{
+		cl:           newClaims(),
 		socket:       socket,
 		log:          log.New(io.Discard, "", 0),
 		evictTimeout: evict,

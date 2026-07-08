@@ -291,7 +291,7 @@ func (s *Server) authThrottled(dir string, needsLogin bool) bool {
 	s.ledMu.Lock()
 	defer s.ledMu.Unlock()
 	l := s.led.peek(authStreakPolicy, dir)
-	if !needsLogin && !(l != nil && l.faulted) {
+	if !needsLogin && (l == nil || !l.faulted) {
 		return false
 	}
 	return l != nil && !l.lastAt.IsZero() && time.Since(l.lastAt) < needsLoginPollInterval

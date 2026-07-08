@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 	"log"
+	"math"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/hostsync"
@@ -140,7 +141,10 @@ func hostJitter(host string) time.Duration {
 	}
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(host))
-	return time.Duration(h.Sum64() % uint64(takeoverJitterSpan))
+	// Mask the sign bit so the hash is a non-negative int64; the modulo then
+	// bounds it to [0, takeoverJitterSpan).
+	sum := int64(h.Sum64() & uint64(math.MaxInt64))
+	return time.Duration(sum % int64(takeoverJitterSpan))
 }
 
 // claimForSelect claims holdership plus a lease before the select's async

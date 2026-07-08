@@ -48,7 +48,7 @@ func TestWriteIdentityRoundTrip(t *testing.T) {
 				t.Fatalf("AccountIdentity = %+v, want uuid-123 / pooled@example.com", id)
 			}
 
-			raw, err := os.ReadFile(path)
+			raw, err := os.ReadFile(path) //nolint:gosec // G304: path is a test-owned file under t.TempDir(), not external input
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -131,7 +131,7 @@ func TestWriteIdentityFailsLoud(t *testing.T) {
 					t.Fatalf("a fresh .claude.json was minted (stat err = %v); WriteIdentity must never seed one", statErr)
 				}
 			} else {
-				got, readErr := os.ReadFile(path)
+				got, readErr := os.ReadFile(path) //nolint:gosec // G304: path is a test-owned file under t.TempDir(), not external input
 				if readErr != nil {
 					t.Fatal(readErr)
 				}

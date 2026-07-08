@@ -163,7 +163,7 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}
-	pending, err := m.PrepareAdd()
+	pending, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestPrepareAddRequiresInit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st := openTestStore(t)
 	m := &Manager{Store: st}
-	if _, err := m.PrepareAdd(); err == nil || !errors.Is(err, ErrNotInitialized) {
+	if _, err := m.PrepareAdd(t.Context()); err == nil || !errors.Is(err, ErrNotInitialized) {
 		t.Fatalf("PrepareAdd on fresh pool = %v, want ErrNotInitialized", err)
 	}
 }
@@ -240,7 +240,7 @@ func TestPrepareAddPurgesStaleCredentials(t *testing.T) {
 
 	t.Run("fresh dir purges the leftover", func(t *testing.T) {
 		m, fk, svc := setup(t)
-		if _, err := m.PrepareAdd(); err != nil {
+		if _, err := m.PrepareAdd(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 		if _, ok := fk.Get(svc, "tester"); ok {
@@ -259,7 +259,7 @@ func TestPrepareAddPurgesStaleCredentials(t *testing.T) {
 		stale := &creds.Credential{}
 		stale.ClaudeAiOauth.AccessToken = "at-stale"
 		fk.Put(svc, "someone-else", stale)
-		if _, err := m.PrepareAdd(); err != nil {
+		if _, err := m.PrepareAdd(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 		if _, ok := fk.Get(svc, "someone-else"); ok {
@@ -280,7 +280,7 @@ func TestPrepareAddPurgesStaleCredentials(t *testing.T) {
 		if err := creds.WriteFileCredential(acct, stale); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := m.PrepareAdd(); err != nil {
+		if _, err := m.PrepareAdd(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 		if creds.FileCredentialExists(acct) {
@@ -303,7 +303,7 @@ func TestPrepareAddPurgesStaleCredentials(t *testing.T) {
 		if err := creds.WriteFileCredential(acct, kept); err != nil {
 			t.Fatal(err)
 		}
-		pending, err := m.PrepareAdd()
+		pending, err := m.PrepareAdd(t.Context())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -331,7 +331,7 @@ func TestFinalizeAddRequiresIdentity(t *testing.T) {
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}
-	pending, err := m.PrepareAdd() // no ~/.claude.json to seed → no identity
+	pending, err := m.PrepareAdd(t.Context()) // no ~/.claude.json to seed → no identity
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +360,7 @@ func TestAbandonAddDeletesBothStores(t *testing.T) {
 		if _, err := m.Init(); err != nil {
 			t.Fatal(err)
 		}
-		pending, err := m.PrepareAdd()
+		pending, err := m.PrepareAdd(t.Context())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -441,7 +441,7 @@ func TestFinalizeAddResolvesBackend(t *testing.T) {
 			if _, err := m.Init(); err != nil {
 				t.Fatal(err)
 			}
-			pending, err := m.PrepareAdd()
+			pending, err := m.PrepareAdd(t.Context())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -588,12 +588,12 @@ func TestConcurrentPrepareAddIndexRace(t *testing.T) {
 	for range 2 {
 		go func() {
 			<-start
-			p, err := m.PrepareAdd()
+			p, err := m.PrepareAdd(t.Context())
 			results <- result{p, err}
 		}()
 	}
 	close(start)
-	var got []*PendingAdd
+	got := make([]*PendingAdd, 0, 2)
 	for range 2 {
 		r := <-results
 		if r.err != nil {
@@ -666,7 +666,7 @@ func TestPrepareAddFileProviderSeedsBeforeSetup(t *testing.T) {
 	}
 	fp.probesClaudeJSON = true // arm the readiness probe only for the add under test
 
-	pending, err := m.PrepareAdd()
+	pending, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatalf("PrepareAdd for File Provider failed — private .claude.json not seeded before Setup's readiness probe: %v", err)
 	}
@@ -713,7 +713,7 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		if err := os.MkdirAll(fkoverlay.FusePrivateRoot(AccountDir(1)), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		pending, err := m.PrepareAdd()
+		pending, err := m.PrepareAdd(t.Context())
 		if err != nil {
 			t.Fatalf("PrepareAdd: %v", err)
 		}
@@ -753,7 +753,7 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 			}
 			return &stubOverlay{backend: fkoverlay.BackendSymlink, setupErr: symErr}, nil
 		}
-		pending, err := m.PrepareAdd()
+		pending, err := m.PrepareAdd(t.Context())
 		if pending != nil {
 			t.Fatalf("PrepareAdd returned %+v despite both setups failing", pending)
 		}
@@ -780,7 +780,7 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		// never mount on the nfs_vinvalbuf2 panic vector.
 		stub := &stubOverlay{backend: fkoverlay.BackendNFS}
 		m := setup(t, mitigationGate{Provider: stub, health: func() (string, error) { return "v0.22.1", nil }})
-		pending, err := m.PrepareAdd()
+		pending, err := m.PrepareAdd(t.Context())
 		if err != nil {
 			t.Fatalf("PrepareAdd: %v", err)
 		}
@@ -801,7 +801,7 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 	t.Run("fuse setup success keeps fuse and carries no reason", func(t *testing.T) {
 		stub := &stubOverlay{backend: fkoverlay.BackendNFS}
 		m := setup(t, stub)
-		pending, err := m.PrepareAdd()
+		pending, err := m.PrepareAdd(t.Context())
 		if err != nil {
 			t.Fatalf("PrepareAdd: %v", err)
 		}
@@ -827,7 +827,7 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
 			return &stubOverlay{backend: fkoverlay.BackendSymlink, setupErr: errors.New("disk full")}, nil
 		}
-		_, err := m.PrepareAdd()
+		_, err := m.PrepareAdd(t.Context())
 		if err == nil || !strings.Contains(err.Error(), "disk full") {
 			t.Fatalf("PrepareAdd = %v, want the symlink setup failure propagated", err)
 		}
@@ -858,7 +858,7 @@ func TestPrepareAddSurfacesDetectReason(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pending, err := m.PrepareAdd()
+	pending, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatalf("PrepareAdd: %v", err)
 	}
@@ -961,7 +961,7 @@ func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return &fpFailStub{setupErr: serveErr}, nil }
 
 		priv := fkoverlay.FusePrivateRoot(AccountDir(1))
-		_, err := m.PrepareAdd()
+		_, err := m.PrepareAdd(t.Context())
 		if err == nil {
 			t.Fatal("PrepareAdd succeeded, want the File Provider setup failure")
 		}
@@ -975,7 +975,7 @@ func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
 			return &stubOverlay{backend: fkoverlay.BackendFileProvider}, nil
 		}
-		p2, err := m.PrepareAdd()
+		p2, err := m.PrepareAdd(t.Context())
 		if err != nil {
 			t.Fatalf("retry PrepareAdd: %v", err)
 		}
@@ -999,7 +999,7 @@ func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 		if err := os.WriteFile(kept, []byte(`{"oauthAccount":{"accountUuid":"u"},"hasCompletedOnboarding":true}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := m.PrepareAdd(); err == nil {
+		if _, err := m.PrepareAdd(t.Context()); err == nil {
 			t.Fatal("PrepareAdd succeeded, want the setup failure")
 		}
 		if _, err := os.Stat(kept); err != nil {
@@ -1020,7 +1020,7 @@ func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 		if err := os.MkdirAll(priv, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := m.PrepareAdd(); err == nil {
+		if _, err := m.PrepareAdd(t.Context()); err == nil {
 			t.Fatal("PrepareAdd succeeded, want the setup failure")
 		}
 		if _, err := os.Stat(priv); err != nil {
@@ -1032,7 +1032,7 @@ func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 		m := setupFP(t)
 		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return &fpFailStub{}, nil }
 		priv := fkoverlay.FusePrivateRoot(AccountDir(1))
-		if _, err := m.PrepareAdd(); err != nil {
+		if _, err := m.PrepareAdd(t.Context()); err != nil {
 			t.Fatalf("PrepareAdd: %v", err)
 		}
 		if _, err := os.Stat(priv); err != nil {
@@ -1061,7 +1061,7 @@ func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 		}
 		// A fuse setup failure falls back to symlink and SUCCEEDS — it must never take
 		// the non-fuse cleanup-and-return branch (which would surface an error).
-		pending, err := m.PrepareAdd()
+		pending, err := m.PrepareAdd(t.Context())
 		if err != nil {
 			t.Fatalf("fuse fallback should succeed, not hit the FP fresh-dir cleanup: %v", err)
 		}

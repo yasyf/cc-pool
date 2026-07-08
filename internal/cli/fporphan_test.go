@@ -262,7 +262,7 @@ func TestReportOrphanFPDomains(t *testing.T) {
 		if err := os.Chmod(parent, 0o000); err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { os.Chmod(parent, 0o700) })
+		t.Cleanup(func() { _ = os.Chmod(parent, 0o700) }) //nolint:gosec // G302: restoring a test dir to traversable perms in cleanup
 		fake := &orphanFP{root: "/cloud/acct-14"}
 		swapVar(t, &fpOverlayProvider, func(fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil })
 

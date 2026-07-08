@@ -294,10 +294,10 @@ func TestTeardownIsolatesFailedRemove(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sub, "f"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(sub, 0o500); err != nil {
+	if err := os.Chmod(sub, 0o500); err != nil { //nolint:gosec // G302: deliberately makes the dir read-only to exercise the write-failure path
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(sub, 0o700) })
+	t.Cleanup(func() { _ = os.Chmod(sub, 0o700) }) //nolint:gosec // G302: restoring a test dir to traversable perms in cleanup
 
 	s.Sessions = fakeSessions{busy: map[string]bool{}}
 	claims := &fakeClaims{}

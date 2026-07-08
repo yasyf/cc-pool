@@ -32,7 +32,7 @@ func setupReservePool(t *testing.T) *Manager {
 // reservation, so the next PrepareAdd reuses it instead of counting up.
 func TestAbandonAddFreesReservedIndex(t *testing.T) {
 	m := setupReservePool(t)
-	p1, err := m.PrepareAdd()
+	p1, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestAbandonAddFreesReservedIndex(t *testing.T) {
 	if err := m.AbandonAdd(p1); err != nil {
 		t.Fatal(err)
 	}
-	p2, err := m.PrepareAdd()
+	p2, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestAbandonAddFreesReservedIndex(t *testing.T) {
 // live attempt still forces a different one.
 func TestReleaseAddResumesSameIndex(t *testing.T) {
 	m := setupReservePool(t)
-	p1, err := m.PrepareAdd()
+	p1, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestReleaseAddResumesSameIndex(t *testing.T) {
 	}
 
 	// A live reservation holds the index against concurrent adds.
-	live, err := m.PrepareAdd()
+	live, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestReleaseAddResumesSameIndex(t *testing.T) {
 		t.Fatalf("ReleaseAdd must keep the dir: %v", err)
 	}
 
-	p2, err := m.PrepareAdd()
+	p2, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,11 +109,11 @@ func TestPrepareAddFailureReleasesReservation(t *testing.T) {
 	m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
 		return &stubOverlay{backend: fkoverlay.BackendSymlink, setupErr: boom}, nil
 	}
-	if _, err := m.PrepareAdd(); !errors.Is(err, boom) {
+	if _, err := m.PrepareAdd(t.Context()); !errors.Is(err, boom) {
 		t.Fatalf("PrepareAdd = %v, want the setup failure", err)
 	}
 	m.OverlayFor = nil
-	p, err := m.PrepareAdd()
+	p, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestPrepareAddFailureReleasesReservation(t *testing.T) {
 // SweepPendingAdds reclaims it — and a fresh reservation survives the sweep.
 func TestStaleReservationSweep(t *testing.T) {
 	m := setupReservePool(t)
-	p1, err := m.PrepareAdd()
+	p1, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestStaleReservationSweep(t *testing.T) {
 	if swept != 0 {
 		t.Fatalf("swept %d fresh reservations, want 0", swept)
 	}
-	p2, err := m.PrepareAdd()
+	p2, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestStaleReservationSweep(t *testing.T) {
 	if swept != 1 {
 		t.Fatalf("swept = %d, want exactly the orphan", swept)
 	}
-	p3, err := m.PrepareAdd()
+	p3, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func (p *teardownProbe) Teardown(_, _ string) error {
 // is held while the dir is torn down and freed once AbandonAdd completes.
 func TestAbandonAddReleasesAfterTeardown(t *testing.T) {
 	m := setupReservePool(t)
-	p, err := m.PrepareAdd()
+	p, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestAbandonAddReleasesAfterTeardown(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.OverlayFor = nil
-	next, err := m.PrepareAdd()
+	next, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestFinalizeAddRefusesSpentReservation(t *testing.T) {
 	m := setupReservePool(t)
 	m.OAuth = &fakeOAuth{currentRT: "rt-0"}
 	m.LockDir = t.TempDir()
-	p, err := m.PrepareAdd()
+	p, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestFinalizeAddPromotesReservation(t *testing.T) {
 	m := setupReservePool(t)
 	m.OAuth = &fakeOAuth{currentRT: "rt-0"}
 	m.LockDir = t.TempDir()
-	p, err := m.PrepareAdd()
+	p, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +301,7 @@ func TestFinalizeAddPromotesReservation(t *testing.T) {
 	if swept != 0 {
 		t.Fatalf("swept = %d, want 0 (FinalizeAdd must have spent the reservation)", swept)
 	}
-	next, err := m.PrepareAdd()
+	next, err := m.PrepareAdd(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}

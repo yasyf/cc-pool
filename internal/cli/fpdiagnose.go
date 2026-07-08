@@ -36,8 +36,10 @@ func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, consentPen
 			plural(fpRows, "fileprovider account"), pool.WidgetAppPath(), en.Guidance,
 		)}}
 	}
-	findings := []fpFinding{{"file provider extension", true,
-		fmt.Sprintf("%s; %s", pool.FPExtensionBundleID, plural(fpRows, "fileprovider account"))}}
+	findings := []fpFinding{{
+		"file provider extension", true,
+		fmt.Sprintf("%s; %s", pool.FPExtensionBundleID, plural(fpRows, "fileprovider account")),
+	}}
 	if ver, err := fpControlHealth(ctx); err != nil {
 		findings = append(findings, fpFinding{"file provider app", false, fmt.Sprintf(
 			"control socket %s not answering: %v — launch %s so domains can be registered and signalled",
@@ -50,11 +52,15 @@ func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, consentPen
 	case fpBridgeReachable():
 		findings = append(findings, fpFinding{"file provider bridge", true, ""})
 	case consentPending:
-		findings = append(findings, fpFinding{"file provider bridge", false,
-			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon reports its bind parked on the one-time app group container consent prompt (macOS re-asks only if the binary's signing identity changes — e.g. an unsigned local build — and launchd never surfaces it): approve it, then restart the daemon (`brew services restart cc-pool`) — `ccp fp onboard` walks this end to end"})
+		findings = append(findings, fpFinding{
+			"file provider bridge", false,
+			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon reports its bind parked on the one-time app group container consent prompt (macOS re-asks only if the binary's signing identity changes — e.g. an unsigned local build — and launchd never surfaces it): approve it, then restart the daemon (`brew services restart cc-pool`) — `ccp fp onboard` walks this end to end",
+		})
 	default:
-		findings = append(findings, fpFinding{"file provider bridge", false,
-			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); on first run macOS gates the app group container behind a one-time consent prompt: approve it, then restart the daemon; domains cannot fetch computed content until the socket is up — run `ccp fp onboard` for the guided setup"})
+		findings = append(findings, fpFinding{
+			"file provider bridge", false,
+			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); on first run macOS gates the app group container behind a one-time consent prompt: approve it, then restart the daemon; domains cannot fetch computed content until the socket is up — run `ccp fp onboard` for the guided setup",
+		})
 	}
 	return findings
 }

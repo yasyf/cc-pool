@@ -351,7 +351,7 @@ func (s *Service) run(ctx context.Context, name string, args ...string) error {
 	if s.Run != nil {
 		return s.Run(ctx, name, args...)
 	}
-	return exec.CommandContext(ctx, name, args...).Run()
+	return exec.CommandContext(ctx, name, args...).Run() //nolint:gosec // G204: name/args are cc-pool-managed sync subprocess invocations, not external input
 }
 
 // Converge runs one convergence pass — pull peers (skipping origin, the

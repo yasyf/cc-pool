@@ -237,20 +237,20 @@ func TestRefreshGateNilAllowsAll(t *testing.T) {
 	}
 	cases := map[string]struct {
 		uuid    string
-		arrange func(t *testing.T, s *Server)
+		arrange func(s *Server)
 	}{
-		"nil gate": {uuid: "u1", arrange: func(t *testing.T, s *Server) {}},
-		"gate disabled by enabled func": {uuid: "u1", arrange: func(t *testing.T, s *Server) {
+		"nil gate": {uuid: "u1", arrange: func(_ *Server) {}},
+		"gate disabled by enabled func": {uuid: "u1", arrange: func(s *Server) {
 			attachGate(s, "host-a", peerHeld())
 			s.sync.enabled = func() bool { return false }
 		}},
-		"account without uuid": {uuid: "", arrange: func(t *testing.T, s *Server) {
+		"account without uuid": {uuid: "", arrange: func(s *Server) {
 			attachGate(s, "host-a", peerHeld())
 		}},
-		"no registry entry": {uuid: "u1", arrange: func(t *testing.T, s *Server) {
+		"no registry entry": {uuid: "u1", arrange: func(s *Server) {
 			attachGate(s, "host-a", regWith())
 		}},
-		"tombstoned entry": {uuid: "u1", arrange: func(t *testing.T, s *Server) {
+		"tombstoned entry": {uuid: "u1", arrange: func(s *Server) {
 			attachGate(s, "host-a", tombstoned())
 		}},
 	}
@@ -258,7 +258,7 @@ func TestRefreshGateNilAllowsAll(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			s, fo, _ := newGateServerUUID(t, nearExpiryCred(), nil, tc.uuid)
-			tc.arrange(t, s)
+			tc.arrange(s)
 			s.pollOnce(t.Context())
 			if got := fo.refreshCount(); got != 1 {
 				t.Fatalf("idle near-expiry account refreshed %d time(s), want 1", got)

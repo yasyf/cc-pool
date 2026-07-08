@@ -50,7 +50,7 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		return MaterializeResult{UUID: v.UUID, Deferred: true}, nil
 	}
 
-	p, err := s.M.PrepareAdd()
+	p, err := s.M.PrepareAdd(ctx)
 	if err != nil {
 		return MaterializeResult{}, fmt.Errorf("materialize %s: prepare add: %w", v.UUID, err)
 	}

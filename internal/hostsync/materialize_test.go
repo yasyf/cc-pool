@@ -137,7 +137,7 @@ func TestMaterializeHappyPath(t *testing.T) {
 	if id.AccountUUID != "u-happy" || id.EmailAddress != "happy@example.com" {
 		t.Fatalf("identity = %+v, want u-happy / happy@example.com", id)
 	}
-	raw, err := os.ReadFile(filepath.Join(configDir, ".claude.json"))
+	raw, err := os.ReadFile(filepath.Join(configDir, ".claude.json")) //nolint:gosec // G304: configDir is a cc-pool-managed/test-owned dir, not external input
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestMaterializeSeedNoSourceBootstraps(t *testing.T) {
 		t.Fatalf("identity uuid = %q, want u-nosrc", id.AccountUUID)
 	}
 	// The bootstrapped document held only the injected identity (started as "{}").
-	raw, err := os.ReadFile(filepath.Join(configDir, ".claude.json"))
+	raw, err := os.ReadFile(filepath.Join(configDir, ".claude.json")) //nolint:gosec // G304: configDir is a cc-pool-managed/test-owned dir, not external input
 	if err != nil {
 		t.Fatal(err)
 	}

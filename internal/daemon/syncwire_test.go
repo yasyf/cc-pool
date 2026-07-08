@@ -58,14 +58,14 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 func writeWireMeshState(t *testing.T, self string, hosts []string) {
 	t.Helper()
 	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "synckit")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // G703: dir is under the test's own XDG_CONFIG_HOME (t.TempDir), not external input
 		t.Fatal(err)
 	}
 	body, err := json.Marshal(map[string]any{"self": self, "hosts": hosts})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "state.json"), body, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), body, 0o600); err != nil { //nolint:gosec // G703: dir is under the test's own XDG_CONFIG_HOME (t.TempDir), not external input
 		t.Fatal(err)
 	}
 }

@@ -19,13 +19,14 @@ func (m *Manager) overlayFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
 	return OverlayProviderFor(b)
 }
 
-// detectOverlay defaults to unbounded detection: init/add paths carry no context
-// (Select bounds its own dial/spawn).
-func (m *Manager) detectOverlay() (fkoverlay.Backend, string) {
+// detectOverlay resolves the new-account overlay backend, honoring the caller's
+// ctx for the probe; Init passes context.Background() (no ambient deadline), Add
+// threads the command's own. Select bounds its own dial/spawn separately.
+func (m *Manager) detectOverlay(ctx context.Context) (fkoverlay.Backend, string) {
 	if m.DetectOverlay != nil {
 		return m.DetectOverlay()
 	}
-	return DetectOverlayBackend(context.Background())
+	return DetectOverlayBackend(ctx)
 }
 
 func (m *Manager) canHostFuse() bool {

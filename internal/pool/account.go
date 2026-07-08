@@ -40,7 +40,7 @@ func (m *Manager) Init() (*InitResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	kind, reason, err := m.ensureOverlayKind()
+	kind, reason, err := m.ensureOverlayKind(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +98,7 @@ func (m *Manager) DuplicateIdentity(want Identity) (*store.Account, error) {
 // concurrent PrepareAdds can never collide) that FinalizeAdd promotes and
 // AbandonAdd/ReleaseAdd release; no account row or Keychain item exists until
 // FinalizeAdd.
-func (m *Manager) PrepareAdd() (pending *PendingAdd, err error) {
+func (m *Manager) PrepareAdd(ctx context.Context) (pending *PendingAdd, err error) {
 	ok, err := m.Initialized()
 	if err != nil {
 		return nil, err
@@ -118,7 +118,7 @@ func (m *Manager) PrepareAdd() (pending *PendingAdd, err error) {
 		}
 	}()
 	acctDir := AccountDir(n)
-	backend, detectReason, err := m.ensureOverlayKind()
+	backend, detectReason, err := m.ensureOverlayKind(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -418,7 +418,7 @@ func (m *Manager) SyncOverlay(a store.Account) error {
 // ensureOverlayKind returns the new-account overlay backend: the one recorded at
 // init, else detects and records one. The reason string is non-empty only when
 // detection just ran and ruled fuse out, so callers can surface it.
-func (m *Manager) ensureOverlayKind() (fkoverlay.Backend, string, error) {
+func (m *Manager) ensureOverlayKind(ctx context.Context) (fkoverlay.Backend, string, error) {
 	if v, ok, err := m.Store.GetMeta(metaOverlayKind); err != nil {
 		return "", "", err
 	} else if ok {
@@ -428,7 +428,7 @@ func (m *Manager) ensureOverlayKind() (fkoverlay.Backend, string, error) {
 		}
 		return b, "", nil
 	}
-	backend, reason := m.detectOverlay()
+	backend, reason := m.detectOverlay(ctx)
 	if err := m.Store.SetMeta(metaOverlayKind, string(backend)); err != nil {
 		return "", "", err
 	}

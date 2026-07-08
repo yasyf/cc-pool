@@ -111,7 +111,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	var pending *pool.PendingAdd
 	if err := withSpinner(out, "preparing the account…", func() error {
 		var e error
-		pending, e = m.PrepareAdd()
+		pending, e = m.PrepareAdd(cmd.Context())
 		return e
 	}); err != nil {
 		diagnoseFPAddFailure(cmd, m, err)

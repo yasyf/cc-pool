@@ -32,7 +32,7 @@ func cred(token, refresh string, expiresAtMillis int64) *creds.Credential {
 func TestLoginCommand(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "claude")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec // G306: executable claude stub on PATH must be 0755
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)

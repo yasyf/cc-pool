@@ -47,7 +47,7 @@ var synckitdLookPath = func() (string, error) { return exec.LookPath("synckitd")
 
 // synckitdRun best-effort execs synckitd; a var so tests record instead of exec.
 var synckitdRun = func(ctx context.Context, args ...string) error {
-	return exec.CommandContext(ctx, "synckitd", args...).Run()
+	return exec.CommandContext(ctx, "synckitd", args...).Run() //nolint:gosec // G204: synckitd is a fixed cc-pool-managed binary; args are fixed subcommands
 }
 
 // syncEnsureDaemon reports the daemon reachable, spawning it if needed; a var

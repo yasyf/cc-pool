@@ -113,7 +113,7 @@ func (c *Consumer) Sync(ctx context.Context, origin string) (syncservice.SyncRes
 	if err != nil {
 		return syncservice.SyncResult{}, err
 	}
-	return syncservice.SyncResult{Converged: res.Converged, SkippedBusy: res.SkippedBusy}, nil
+	return syncservice.SyncResult(res), nil
 }
 
 // GetState returns the registry's raw JSON — secretless — read verbatim so the

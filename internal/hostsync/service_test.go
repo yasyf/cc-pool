@@ -59,7 +59,7 @@ func loadEntry(t *testing.T, s *Service, uuid string) (cregistry.Entry[AccountVa
 // signature the no-op-vs-touch assertions compare.
 func stampSig(t *testing.T, s *Service, uuid string) (string, bool) {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(s.StampDir, uuid, "stamp"))
+	b, err := os.ReadFile(filepath.Join(s.StampDir, uuid, "stamp")) //nolint:gosec // G304: s.StampDir is a test-owned temp dir, not external input
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", false
 	}

@@ -159,7 +159,8 @@ func TestFPBridgeSharesSourceAndSerializesWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := &Server{cl: newClaims(),
+	s := &Server{
+		cl:            newClaims(),
 		log:           log.New(io.Discard, "", 0),
 		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 	}
@@ -233,7 +234,8 @@ func TestFPBridgeSharesSourceAndSerializesWrites(t *testing.T) {
 // clear.
 func TestStartFPBridgeBindsUnconditionally(t *testing.T) {
 	shortHome(t)
-	s := &Server{cl: newClaims(),
+	s := &Server{
+		cl:            newClaims(),
 		log:           log.New(io.Discard, "", 0),
 		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 	}
@@ -272,7 +274,8 @@ func TestStartFPBridgeFlagsConsentPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(groupContainers, 0o700) }) //nolint:gosec // G302: restoring directory rwx perms in test cleanup.
-	s := &Server{cl: newClaims(),
+	s := &Server{
+		cl:              newClaims(),
 		log:             log.New(io.Discard, "", 0),
 		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 		fpBridgeBackoff: 25 * time.Millisecond,
@@ -327,7 +330,8 @@ func TestStartFPBridgeGenuineErrorNotConsent(t *testing.T) {
 	if err := os.WriteFile(filepath.Dir(sock), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{cl: newClaims(),
+	s := &Server{
+		cl:              newClaims(),
 		log:             log.New(io.Discard, "", 0),
 		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 		fpBridgeBackoff: 25 * time.Millisecond,
@@ -400,7 +404,8 @@ func TestStartFPBridgeRetriesAfterBindFailure(t *testing.T) {
 	waitFor(t, 2*time.Second, "blocker to bind", content.NewBridgeClient(sock).Available)
 
 	buf := &syncBuffer{}
-	s := &Server{cl: newClaims(),
+	s := &Server{
+		cl:              newClaims(),
 		log:             log.New(buf, "", 0),
 		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 		fpBridgeBackoff: 25 * time.Millisecond,
