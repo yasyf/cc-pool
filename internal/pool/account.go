@@ -125,6 +125,15 @@ func (m *Manager) PrepareAdd() (pending *PendingAdd, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve overlay provider for %s: %w", acctDir, err)
 	}
+	// Seed before Setup: File Provider's readiness probe reads .claude.json.
+	if backend == fkoverlay.BackendFileProvider {
+		if err := os.MkdirAll(prov.PrivateRoot(acctDir), 0o700); err != nil {
+			return nil, fmt.Errorf("prepare private store for %s: %w", acctDir, err)
+		}
+		if _, err := seedClaudeJSON(prov, acctDir, ClaudeJSONPath()); err != nil {
+			return nil, fmt.Errorf("seed .claude.json for %s: %w", acctDir, err)
+		}
+	}
 	fallbackReason := detectReason
 	if setupErr := prov.Setup(ClaudeDir(), acctDir); setupErr != nil {
 		if !backend.IsFuse() {

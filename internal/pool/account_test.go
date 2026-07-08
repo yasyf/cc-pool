@@ -618,6 +618,8 @@ type stubOverlay struct {
 	backend  fkoverlay.Backend
 	setupErr error
 	setups   int
+	// probesClaudeJSON makes Setup fail unless the private .claude.json exists.
+	probesClaudeJSON bool
 }
 
 func (s *stubOverlay) Backend() fkoverlay.Backend { return s.backend }
@@ -636,12 +638,43 @@ func (s *stubOverlay) Setup(_, dir string) error {
 	if s.setupErr != nil {
 		return s.setupErr
 	}
+	if s.probesClaudeJSON {
+		if _, err := os.Stat(filepath.Join(s.PrivateRoot(dir), ".claude.json")); err != nil {
+			return fmt.Errorf("domain did not serve: %w", err)
+		}
+	}
 	// Mimic the real fuse provider's footprint: mountpoint dir plus the private
 	// backing dir beside it.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	return os.MkdirAll(fkoverlay.FusePrivateRoot(dir), 0o700)
+}
+
+func TestPrepareAddFileProviderSeedsBeforeSetup(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := os.WriteFile(ClaudeJSONPath(), []byte(`{"hasCompletedOnboarding":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fp := &stubOverlay{backend: fkoverlay.BackendFileProvider}
+	m := &Manager{Store: openTestStore(t), Creds: credstest.NewFake()}
+	m.DetectOverlay = func() (fkoverlay.Backend, string) { return fkoverlay.BackendFileProvider, "" }
+	m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return fp, nil }
+	if _, err := m.Init(); err != nil {
+		t.Fatal(err)
+	}
+	fp.probesClaudeJSON = true // arm the readiness probe only for the add under test
+
+	pending, err := m.PrepareAdd()
+	if err != nil {
+		t.Fatalf("PrepareAdd for File Provider failed — private .claude.json not seeded before Setup's readiness probe: %v", err)
+	}
+	if pending.OverlayKind != fkoverlay.BackendFileProvider {
+		t.Fatalf("OverlayKind = %q, want fileprovider (no fallback)", pending.OverlayKind)
+	}
+	if _, err := os.Stat(filepath.Join(fp.PrivateRoot(pending.ConfigDir), ".claude.json")); err != nil {
+		t.Fatalf("private .claude.json missing after add: %v", err)
+	}
 }
 
 // TestPrepareAddFuseFallback pins the fuse→symlink fallback: when the recorded
