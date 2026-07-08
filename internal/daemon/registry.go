@@ -151,11 +151,20 @@ var pollTable = []maintainer{
 }
 
 // healTable is the per-account mount-health net (the heal ticker body). holder
-// cache first (the ticker outpaces the poll's refresh), then the three self-heal
-// families, then content-source health logging (gated on a configured source).
+// cache first (the ticker outpaces the poll's refresh); then fp.app.ensure
+// relaunches the companion app whose death would otherwise park every FP probe
+// on NoVerdict forever, at tick start so probe coverage resumes the tick after a
+// respawn; then the fuse/FP self-heal families; then fp.orphan.reap deregisters
+// rowless leaked domains (after fp.heal so a legit domain's own recovery runs
+// first, before strand.heal's row-driven leak sweep); then content-source health
+// logging (gated on a configured source).
 var healTable = []maintainer{
 	{"holder.refresh", claimNone, nil, func(s *Server, _ context.Context, _ *tick) bool {
 		s.holder.refresh(s.holderClient())
+		return true
+	}},
+	{"fp.app.ensure", claimNone, (*Server).shouldEnsureFPApp, func(s *Server, ctx context.Context, _ *tick) bool {
+		s.ensureFPAppAsync(ctx)
 		return true
 	}},
 	{"fuse.remount", claimPerAccount, nil, func(s *Server, ctx context.Context, t *tick) bool {
@@ -164,6 +173,10 @@ var healTable = []maintainer{
 	}},
 	{"fp.heal", claimPerAccount, nil, func(s *Server, ctx context.Context, _ *tick) bool {
 		s.healFPRows(ctx)
+		return true
+	}},
+	{"fp.orphan.reap", claimNone, (*Server).fpEnabled, func(s *Server, ctx context.Context, _ *tick) bool {
+		s.sweepOrphanFPDomains(ctx)
 		return true
 	}},
 	{"strand.heal", claimPerAccount, nil, func(s *Server, ctx context.Context, t *tick) bool {
@@ -179,7 +192,10 @@ var healTable = []maintainer{
 // startupTable is the ordered one-shot the serve goroutine runs before the heal
 // loop and scheduler start. bridge.content and bridge.fp bind before any mount or
 // FP enumeration registers; holder.refresh primes the mount cache before selects
-// key on it; ua.detect only stamps the OAuth UA; overlays.reconcile must finish
+// key on it; ua.detect only stamps the OAuth UA; fp.app.ensure (non-blocking,
+// after bridge.fp settles consent) warms the companion app in parallel so the
+// first FP account's reconcile finds it up rather than eating the cold ~30s
+// spawn serially; overlays.reconcile must finish
 // first (it and the loops both touch fuse Setup) — and it carries today's startup
 // sweeps (reapPoolOrphans, sweepOrphanMountpoints, sweepOrphanMuxRoot) at their
 // current positions inside its body. bridge.fp wraps today's in-daemon FP-bridge
@@ -199,6 +215,10 @@ var startupTable = []maintainer{
 	}},
 	{"ua.detect", claimNone, nil, func(s *Server, ctx context.Context, _ *tick) bool {
 		s.detectAndSetUserAgent(ctx)
+		return true
+	}},
+	{"fp.app.ensure", claimNone, (*Server).shouldEnsureFPApp, func(s *Server, ctx context.Context, _ *tick) bool {
+		s.ensureFPAppAsync(ctx)
 		return true
 	}},
 	{"overlays.reconcile", claimPerAccount, nil, func(s *Server, ctx context.Context, _ *tick) bool {

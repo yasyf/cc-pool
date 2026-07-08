@@ -34,8 +34,10 @@ func TestMaintainerTableOrder(t *testing.T) {
 		}},
 		{"heal", healTable, []row{
 			{"holder.refresh", claimNone},
+			{"fp.app.ensure", claimNone},
 			{"fuse.remount", claimPerAccount},
 			{"fp.heal", claimPerAccount},
+			{"fp.orphan.reap", claimNone},
 			{"strand.heal", claimPerAccount},
 			{"content.health", claimNone},
 		}},
@@ -44,6 +46,7 @@ func TestMaintainerTableOrder(t *testing.T) {
 			{"bridge.fp", claimNone},
 			{"holder.refresh", claimNone},
 			{"ua.detect", claimNone},
+			{"fp.app.ensure", claimNone},
 			{"overlays.reconcile", claimPerAccount},
 		}},
 	}

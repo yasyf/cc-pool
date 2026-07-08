@@ -123,12 +123,12 @@ func (s *Server) healFuseRows(ctx context.Context) {
 			return
 		case <-ticker.C:
 			// The heal tick body is the healTable: holder cache first (the ticker
-			// outpaces the poll's refresh), then the fuse/FP/strand self-heal
-			// families, then content-source health. FP rows are probed and healed up
-			// the recovery ladder here too — never through fuse.remount, since FP is
-			// a third backend, not a fuse mount. Strand rows carrying crash-window
-			// wreckage converge here, promoting the startup-only reconcile onto the
-			// ticker.
+			// outpaces the poll's refresh), then the companion-app ensure, the
+			// fuse/FP/strand self-heal families, the orphaned-domain reap, and
+			// content-source health. FP rows are probed and healed up the recovery
+			// ladder here too — never through fuse.remount, since FP is a third
+			// backend, not a fuse mount. Strand rows carrying crash-window wreckage
+			// converge here, promoting the startup-only reconcile onto the ticker.
 			s.runTable(ctx, s.newTick(ctx), healTable)
 		}
 	}

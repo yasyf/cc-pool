@@ -56,6 +56,30 @@ func (s *Store) ConsumeAccountIndex(id int) error {
 	return nil
 }
 
+// PendingAddIndexes lists every live account-index reservation, ascending. It
+// is the daemon orphan reap's mid-add guard: a domain whose account row has not
+// yet been promoted (PrepareAdd registers the domain before FinalizeAdd upserts
+// the row) is reserved here, so it is never mistaken for an orphan.
+func (s *Store) PendingAddIndexes() ([]int, error) {
+	rows, err := s.db.Query(`SELECT id FROM pending_adds ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending adds: %w", err)
+	}
+	defer rows.Close()
+	var ids []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("list pending adds: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list pending adds: %w", err)
+	}
+	return ids, nil
+}
+
 // SweepPendingAdds reclaims reservations created before cutoff (adds whose
 // process died mid-add); returns the number reclaimed.
 func (s *Store) SweepPendingAdds(cutoff time.Time) (int, error) {

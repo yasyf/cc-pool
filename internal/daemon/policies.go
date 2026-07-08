@@ -70,6 +70,22 @@ const (
 	rateLimitBackoffCap  = 30 * time.Minute
 )
 
+// fpAppEnsureBackoff is the fixed window between companion-app launch attempts:
+// a crash-looping CCPoolStatus.app costs at most one loud `open -g` per window
+// (never a spawn storm), and the booked next-due also fences a second launch out
+// while a ~30s spawn is still in flight.
+const fpAppEnsureBackoff = time.Minute
+
+// fpOrphanReapStrikes is the consecutive confirmed sweeps a rowless registered
+// File Provider domain must survive before it is deregistered (~30s at the heal
+// cadence) — a debounce so a mid-add domain glimpsed between its reservation and
+// its promoted row is never reaped.
+const fpOrphanReapStrikes = 3
+
+// fpOrphanReapBackoff is the fixed window spacing RemoveDomain retries after a
+// failed reap; the strike verdict is kept across the wait.
+var fpOrphanReapBackoff = proc.Backoff{Base: 5 * time.Minute, Cap: 5 * time.Minute}
+
 // tripAction names what a consumer does when a ledger's breaker trips.
 type tripAction int
 
@@ -145,5 +161,22 @@ var policies = map[string]policy{
 		name:    "ratelimit.pool",
 		backoff: proc.Backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap},
 		onTrip:  tripGate,
+	},
+	// fp.app: companion-app ensure. No debounce (a down control socket is an
+	// immediate fault) and no breaker (a File-Provider host must keep retrying a
+	// dead app); the fixed backoff alone bounds a crash-loop to one launch per
+	// window and, booked before each spawn, spaces overlapping ensure calls apart.
+	"fp.app": {
+		name:    "fp.app",
+		backoff: proc.Backoff{Base: fpAppEnsureBackoff, Cap: fpAppEnsureBackoff},
+	},
+	// fp.orphan: orphaned-domain reap. The debounce is the confirmation ladder —
+	// fpOrphanReapStrikes consecutive confirmed sweeps before the reap fires; no
+	// breaker (a failed RemoveDomain retries forever, spaced by the backoff). The
+	// row acts on the debounced fault directly, so onTrip is unused.
+	"fp.orphan": {
+		name:     "fp.orphan",
+		debounce: fpOrphanReapStrikes,
+		backoff:  fpOrphanReapBackoff,
 	},
 }

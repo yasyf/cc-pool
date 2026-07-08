@@ -49,6 +49,16 @@ func TestPolicyConstantsPinned(t *testing.T) {
 		{"fp.domain/recoveryBackoffCap", fpRecoveryBackoff.Cap, 10 * time.Minute},
 		{"fp.domain/recoveryBreaker", fpRecoveryBreaker, 5},
 
+		// fp.app — companion-app ensure: the fixed launch backoff window (no
+		// debounce, no breaker; structural, owned by the fpapp behavior suite).
+		{"fp.app/ensureBackoff", fpAppEnsureBackoff, time.Minute},
+
+		// fp.orphan — orphaned-domain reap: the confirmation debounce and the fixed
+		// failed-remove retry backoff.
+		{"fp.orphan/reapStrikes", fpOrphanReapStrikes, 3},
+		{"fp.orphan/reapBackoffBase", fpOrphanReapBackoff.Base, 5 * time.Minute},
+		{"fp.orphan/reapBackoffCap", fpOrphanReapBackoff.Cap, 5 * time.Minute},
+
 		// auth.streak — definitive needs-login verdicts before polls throttle.
 		{"auth.streak/needsLoginAfter", needsLoginAfter, 3},
 		{"auth.streak/needsLoginPollInterval", needsLoginPollInterval, 15 * time.Minute},

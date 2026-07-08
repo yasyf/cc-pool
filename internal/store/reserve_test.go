@@ -160,6 +160,41 @@ func TestConsumeAccountIndex(t *testing.T) {
 	})
 }
 
+func TestPendingAddIndexes(t *testing.T) {
+	s := openReserveTest(t)
+
+	if ids, err := s.PendingAddIndexes(); err != nil || len(ids) != 0 {
+		t.Fatalf("fresh store PendingAddIndexes = %v, %v; want empty, nil", ids, err)
+	}
+
+	a := mustReserve(t, s)
+	b := mustReserve(t, s)
+	ids, err := s.PendingAddIndexes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Ints(ids)
+	if len(ids) != 2 || ids[0] != a || ids[1] != b {
+		t.Fatalf("PendingAddIndexes = %v, want the two live reservations %d,%d", ids, a, b)
+	}
+
+	// Consume promotes a to a row; the reservation must drop from the list.
+	if err := s.ConsumeAccountIndex(a); err != nil {
+		t.Fatal(err)
+	}
+	if ids, err := s.PendingAddIndexes(); err != nil || len(ids) != 1 || ids[0] != b {
+		t.Fatalf("after consume PendingAddIndexes = %v, %v; want only %d", ids, err, b)
+	}
+
+	// Release drops the last reservation.
+	if err := s.ReleaseAccountIndex(b); err != nil {
+		t.Fatal(err)
+	}
+	if ids, err := s.PendingAddIndexes(); err != nil || len(ids) != 0 {
+		t.Fatalf("after release PendingAddIndexes = %v, %v; want empty", ids, err)
+	}
+}
+
 func TestSweepPendingAdds(t *testing.T) {
 	s := openReserveTest(t)
 	n := mustReserve(t, s)
