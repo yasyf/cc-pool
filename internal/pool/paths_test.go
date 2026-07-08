@@ -106,3 +106,34 @@ func TestIsBridgeSymlink(t *testing.T) {
 		})
 	}
 }
+
+// TestParseFPDomainFolder pins the ~/Library/CloudStorage folder parse: only a
+// name whose suffix round-trips AccountDirName(n) exactly is a pool domain; an
+// unpadded index, junk, a foreign app's folder, or the empty string is rejected.
+func TestParseFPDomainFolder(t *testing.T) {
+	cases := map[string]struct {
+		name   string
+		wantID int
+		wantOK bool
+	}{
+		"two-digit index":      {"CCPoolStatus-acct-14", 14, true},
+		"padded single-digit":  {"CCPoolStatus-acct-01", 1, true},
+		"unpadded index":       {"CCPoolStatus-acct-1", 0, false},
+		"over-padded index":    {"CCPoolStatus-acct-014", 0, false},
+		"non-numeric suffix":   {"CCPoolStatus-foo", 0, false},
+		"zero index":           {"CCPoolStatus-acct-00", 0, false},
+		"foreign app prefix":   {"OtherApp-acct-2", 0, false},
+		"empty string":         {"", 0, false},
+		"prefix only":          {"CCPoolStatus-", 0, false},
+		"missing acct segment": {"CCPoolStatus-14", 0, false},
+		"trailing junk":        {"CCPoolStatus-acct-14x", 0, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			id, ok := ParseFPDomainFolder(tc.name)
+			if id != tc.wantID || ok != tc.wantOK {
+				t.Fatalf("ParseFPDomainFolder(%q) = (%d, %v), want (%d, %v)", tc.name, id, ok, tc.wantID, tc.wantOK)
+			}
+		})
+	}
+}

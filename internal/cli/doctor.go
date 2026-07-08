@@ -110,6 +110,7 @@ func newDoctorCmd() *cobra.Command {
 
 				reportFileProvider(cmd.Context(), m, accts, fpConsentPending, report)
 				reportFPWedges(accts, fpWedged, daemonAlive, fpRawProbe, report)
+				reportOrphanFPDomains(cmd.Context(), m, accts, fix, report)
 				reportContentHealth(contentHealth, report)
 
 				if err := reportSync(cmd.Context(), m, accts, report, reportWarn); err != nil {
@@ -340,37 +341,8 @@ func countFileProvider(accts []store.Account) int {
 // control socket, daemon bridge socket. Silent when the opt-in stack is unused;
 // with rows, an absent extension is the root fault and skips the socket probes.
 func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Account, consentPending bool, report func(string, bool, string)) {
-	fpRows := countFileProvider(accts)
-	if !fpAvailable(m.OverlaySpec()) {
-		if fpRows == 0 {
-			return
-		}
-		en := fkoverlay.BackendFileProvider.Enablement()
-		report("file provider extension", false, fmt.Sprintf(
-			"not enabled with %s — run `ccp fp onboard` for the guided setup (install %s if missing, then: %s)",
-			plural(fpRows, "fileprovider account"), pool.WidgetAppPath(), en.Guidance,
-		))
-		return
-	}
-	report("file provider extension", true,
-		fmt.Sprintf("%s; %s", pool.FPExtensionBundleID, plural(fpRows, "fileprovider account")))
-	if ver, err := fpControlHealth(ctx); err != nil {
-		report("file provider app", false, fmt.Sprintf(
-			"control socket %s not answering: %v — launch %s so domains can be registered and signalled",
-			abbreviateHome(pool.FPControlSocketPath()), err, pool.WidgetAppPath(),
-		))
-	} else {
-		report("file provider app", true, ver)
-	}
-	switch {
-	case fpBridgeReachable():
-		report("file provider bridge", true, "")
-	case consentPending:
-		report("file provider bridge", false,
-			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon reports its bind parked on the one-time app group container consent prompt (macOS re-asks only if the binary's signing identity changes — e.g. an unsigned local build — and launchd never surfaces it): approve it, then restart the daemon (`brew services restart cc-pool`) — `ccp fp onboard` walks this end to end")
-	default:
-		report("file provider bridge", false,
-			"data socket "+abbreviateHome(pool.FPBridgeSocketPath())+" not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); on first run macOS gates the app group container behind a one-time consent prompt: approve it, then restart the daemon; domains cannot fetch computed content until the socket is up — run `ccp fp onboard` for the guided setup")
+	for _, f := range fpDiagnose(ctx, m.OverlaySpec(), countFileProvider(accts), consentPending) {
+		report(f.label, f.healthy, f.detail)
 	}
 }
 

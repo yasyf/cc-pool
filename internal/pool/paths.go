@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/yasyf/fusekit/state"
@@ -207,6 +208,36 @@ func AccountDir(n int) string {
 		panic(fmt.Sprintf("AccountDir(%d): account indexes start at 1", n))
 	}
 	return filepath.Join(AccountsDir(), AccountDirName(n))
+}
+
+// FPDomainFolderPrefix is the ~/Library/CloudStorage folder-name prefix macOS
+// gives a cc-pool File Provider domain. It must match widget/project.yml
+// PRODUCT_NAME (the domain display name derives from the app's product name).
+const FPDomainFolderPrefix = "CCPoolStatus-"
+
+// FPCloudStorageDir is macOS's per-user File Provider mount parent
+// (~/Library/CloudStorage); each registered domain surfaces there as
+// FPDomainFolderPrefix + the domain's account dir name.
+func FPCloudStorageDir() string {
+	return filepath.Join(mustHome(), "Library", "CloudStorage")
+}
+
+// ParseFPDomainFolder extracts the account index from a ~/Library/CloudStorage
+// File Provider folder name (FPDomainFolderPrefix + AccountDirName). ok is false
+// for any name whose suffix does not round-trip AccountDirName(n) exactly — an
+// unpadded "acct-1", junk, or a foreign app's folder — so a non-pool folder is
+// never mistaken for a pool domain.
+func ParseFPDomainFolder(name string) (int, bool) {
+	rest, ok := strings.CutPrefix(name, FPDomainFolderPrefix)
+	if !ok {
+		return 0, false
+	}
+	digits := strings.TrimPrefix(rest, "acct-")
+	n, err := strconv.Atoi(digits)
+	if err != nil || n < 1 || AccountDirName(n) != rest {
+		return 0, false
+	}
+	return n, true
 }
 
 // EnsureStateDir creates ~/.cc-pool with 0700 perms if missing.

@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
@@ -914,4 +915,158 @@ func TestInitFuseVerdictCarriesNoReason(t *testing.T) {
 	if !res.OverlayKind.IsFuse() || res.OverlayFallbackReason != "" {
 		t.Fatalf("res = %+v, want fuse with no reason", res)
 	}
+}
+
+// fpFailStub is an injectable File Provider provider whose Setup can be forced to
+// fail and whose PrivateRoot is the real (distinct-from-account-dir) backing dir,
+// so PrepareAdd's fresh-failure cleanup is observable removing exactly it.
+type fpFailStub struct {
+	setupErr error
+	setups   int
+}
+
+func (s *fpFailStub) Backend() fkoverlay.Backend    { return fkoverlay.BackendFileProvider }
+func (s *fpFailStub) Sync(_, _ string) error        { return nil }
+func (s *fpFailStub) Health(_, _ string) error      { return nil }
+func (s *fpFailStub) Teardown(_, _ string) error    { return nil }
+func (s *fpFailStub) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
+func (s *fpFailStub) Setup(_, _ string) error {
+	s.setups++
+	return s.setupErr
+}
+
+// TestPrepareAddFileProviderFreshFailureCleanup pins the PrepareAdd fresh-failure
+// hygiene: a File Provider Setup failure removes the private backing dir THIS add
+// created, frees the index reservation, and keeps the fusekit sentinel matchable
+// through the wrap — while a pre-existing kept dir survives and a successful Setup
+// retains its dir. The fuse-fallback path never runs this cleanup.
+func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
+	setupFP := func(t *testing.T) *Manager {
+		t.Helper()
+		t.Setenv("HOME", t.TempDir())
+		if err := os.WriteFile(ClaudeJSONPath(), []byte(`{"hasCompletedOnboarding":true}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{Store: openTestStore(t), Creds: credstest.NewFake()}
+		m.DetectOverlay = func() (fkoverlay.Backend, string) { return fkoverlay.BackendFileProvider, "" }
+		if _, err := m.Init(); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+
+	t.Run("fresh private dir removed, reservation freed, sentinel preserved", func(t *testing.T) {
+		m := setupFP(t)
+		serveErr := fmt.Errorf("register domain: %w", fileproviderd.ErrDomainNotServing)
+		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return &fpFailStub{setupErr: serveErr}, nil }
+
+		priv := fkoverlay.FusePrivateRoot(AccountDir(1))
+		_, err := m.PrepareAdd()
+		if err == nil {
+			t.Fatal("PrepareAdd succeeded, want the File Provider setup failure")
+		}
+		if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
+			t.Fatalf("errors.Is(err, ErrDomainNotServing) = false; err = %v", err)
+		}
+		if _, statErr := os.Lstat(priv); !os.IsNotExist(statErr) {
+			t.Fatalf("fresh private backing dir left behind after cleanup (lstat err = %v)", statErr)
+		}
+		// The reservation must be freed: the next add reclaims index 1.
+		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
+			return &stubOverlay{backend: fkoverlay.BackendFileProvider}, nil
+		}
+		p2, err := m.PrepareAdd()
+		if err != nil {
+			t.Fatalf("retry PrepareAdd: %v", err)
+		}
+		if p2.Index != 1 {
+			t.Fatalf("index after failed FP add = %d, want 1 (the failure must free its reservation)", p2.Index)
+		}
+	})
+
+	t.Run("pre-existing kept dir is left intact", func(t *testing.T) {
+		m := setupFP(t)
+		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
+			return &fpFailStub{setupErr: fmt.Errorf("register domain: %w", fileproviderd.ErrDomainNotServing)}, nil
+		}
+		// A prior add logged in but never finalized: the backing dir already holds an
+		// identity-bearing .claude.json, so it must survive a later setup failure.
+		priv := fkoverlay.FusePrivateRoot(AccountDir(1))
+		if err := os.MkdirAll(priv, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		kept := filepath.Join(priv, ".claude.json")
+		if err := os.WriteFile(kept, []byte(`{"oauthAccount":{"accountUuid":"u"},"hasCompletedOnboarding":true}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.PrepareAdd(); err == nil {
+			t.Fatal("PrepareAdd succeeded, want the setup failure")
+		}
+		if _, err := os.Stat(kept); err != nil {
+			t.Fatalf("pre-existing kept .claude.json removed by cleanup: %v", err)
+		}
+	})
+
+	t.Run("pre-existing empty dir is left intact on setup failure", func(t *testing.T) {
+		m := setupFP(t)
+		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
+			return &fpFailStub{setupErr: fmt.Errorf("register domain: %w", fileproviderd.ErrDomainNotServing)}, nil
+		}
+		// A racing add (or interrupted resume) created the backing dir before this add's
+		// atomic Mkdir claim, so the EEXIST claim marks it not-ours; a later setup failure
+		// must never RemoveAll a dir we didn't create — even an empty one the old
+		// stat-then-MkdirAll would have misattributed as freshly created.
+		priv := fkoverlay.FusePrivateRoot(AccountDir(1))
+		if err := os.MkdirAll(priv, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.PrepareAdd(); err == nil {
+			t.Fatal("PrepareAdd succeeded, want the setup failure")
+		}
+		if _, err := os.Stat(priv); err != nil {
+			t.Fatalf("pre-existing empty backing dir removed by cleanup: %v", err)
+		}
+	})
+
+	t.Run("successful setup retains the private dir", func(t *testing.T) {
+		m := setupFP(t)
+		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return &fpFailStub{}, nil }
+		priv := fkoverlay.FusePrivateRoot(AccountDir(1))
+		if _, err := m.PrepareAdd(); err != nil {
+			t.Fatalf("PrepareAdd: %v", err)
+		}
+		if _, err := os.Stat(priv); err != nil {
+			t.Fatalf("private dir missing after a successful FP add: %v", err)
+		}
+	})
+
+	t.Run("fuse fallback never runs the fresh-dir cleanup", func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		if err := os.MkdirAll(filepath.Join(ClaudeDir(), "projects"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(ClaudeJSONPath(), []byte(`{"hasCompletedOnboarding":true}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{Store: openTestStore(t), Creds: credstest.NewFake()}
+		m.DetectOverlay = func() (fkoverlay.Backend, string) { return fkoverlay.BackendNFS, "" }
+		m.OverlayFor = func(kind fkoverlay.Backend) (fkoverlay.Provider, error) {
+			if kind.IsFuse() {
+				return &stubOverlay{backend: fkoverlay.BackendNFS, setupErr: errors.New("holder down")}, nil
+			}
+			return newSymlinkProvider(), nil
+		}
+		if _, err := m.Init(); err != nil {
+			t.Fatal(err)
+		}
+		// A fuse setup failure falls back to symlink and SUCCEEDS — it must never take
+		// the non-fuse cleanup-and-return branch (which would surface an error).
+		pending, err := m.PrepareAdd()
+		if err != nil {
+			t.Fatalf("fuse fallback should succeed, not hit the FP fresh-dir cleanup: %v", err)
+		}
+		if pending.OverlayKind != fkoverlay.BackendSymlink {
+			t.Fatalf("OverlayKind = %q, want symlink (fell back)", pending.OverlayKind)
+		}
+	})
 }

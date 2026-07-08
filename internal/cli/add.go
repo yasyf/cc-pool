@@ -114,6 +114,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 		pending, e = m.PrepareAdd()
 		return e
 	}); err != nil {
+		diagnoseFPAddFailure(cmd, m, err)
 		return nil, err
 	}
 	if pending.FallbackReason != "" {

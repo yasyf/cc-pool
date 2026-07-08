@@ -83,7 +83,7 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just hides pin state
 	render := func() error {
-		snaps, holder, fpWedged, err := gatherStatus(cmd.Context(), m, live)
+		snaps, holder, fpWedged, fpConsentPending, err := gatherStatus(cmd.Context(), m, live)
 		if err != nil {
 			return err
 		}
@@ -100,6 +100,9 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 		}
 		if line := fpWedgedFooter(fpWedged); line != "" {
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
+		}
+		if line := fpConsentFooter(fpConsentPending); line != "" {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 		}
 		return nil
@@ -119,15 +122,15 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 }
 
-func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, *daemon.HolderStatus, []daemon.FPDomainState, error) {
+func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, *daemon.HolderStatus, []daemon.FPDomainState, bool, error) {
 	if !forceLive {
 		resp, err := daemon.NewClient().Status()
 		if daemonStatusUsable(resp, err) {
-			return fromDaemon(resp.Accounts), resp.Holder, resp.FPWedged, nil
+			return fromDaemon(resp.Accounts), resp.Holder, resp.FPWedged, resp.FPConsentPending, nil
 		}
 	}
 	snaps, err := m.Snapshots(ctx, true, pool.DefaultFreshFor)
-	return snaps, nil, nil, err
+	return snaps, nil, nil, false, err
 }
 
 // fpWedgedFooter renders the daemon's wedged File Provider domains — plain-path
@@ -148,6 +151,16 @@ func fpWedgedFooter(wedged []daemon.FPDomainState) string {
 		lines = append(lines, badStyle.Render(fmt.Sprintf("✗ acct-%02d file provider %s", w.ID, state)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// fpConsentFooter warns that the daemon's File Provider data bridge is parked on
+// the app-group consent prompt — plain-path only, like the other footers (the
+// TUI drops daemon-cache alerts on purpose). "" when not pending.
+func fpConsentFooter(pending bool) string {
+	if !pending {
+		return ""
+	}
+	return warnStyle.Render("file provider: the daemon's data bridge is parked on the macOS app-group consent prompt — approve it, then restart the daemon (`brew services restart cc-pool`); run `ccp doctor` for detail")
 }
 
 // holderFooter is plain-path only — the TUI drops holder state

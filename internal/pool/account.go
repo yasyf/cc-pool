@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -126,8 +127,20 @@ func (m *Manager) PrepareAdd() (pending *PendingAdd, err error) {
 		return nil, fmt.Errorf("resolve overlay provider for %s: %w", acctDir, err)
 	}
 	// Seed before Setup: File Provider's readiness probe reads .claude.json.
+	// privFreshlyCreated is true only when THIS call's atomic Mkdir claimed the
+	// backing dir, so a Setup failure below can clean up its own mess without
+	// touching a kept/resume dir. A stat-then-MkdirAll would misread a dir born in
+	// that gap (a concurrent add) as ours and RemoveAll it. The parent (AccountsDir)
+	// is guaranteed by Init's EnsureAccountsDir, which the Initialized gate above proves ran.
+	privFreshlyCreated := false
 	if backend == fkoverlay.BackendFileProvider {
-		if err := os.MkdirAll(prov.PrivateRoot(acctDir), 0o700); err != nil {
+		priv := prov.PrivateRoot(acctDir)
+		switch err := os.Mkdir(priv, 0o700); {
+		case err == nil:
+			privFreshlyCreated = true
+		case errors.Is(err, fs.ErrExist):
+			// A pre-existing dir (kept/resume attempt, or a racing add) — proceed, never claim it.
+		default:
 			return nil, fmt.Errorf("prepare private store for %s: %w", acctDir, err)
 		}
 		if _, err := seedClaudeJSON(prov, acctDir, ClaudeJSONPath()); err != nil {
@@ -137,6 +150,15 @@ func (m *Manager) PrepareAdd() (pending *PendingAdd, err error) {
 	fallbackReason := detectReason
 	if setupErr := prov.Setup(ClaudeDir(), acctDir); setupErr != nil {
 		if !backend.IsFuse() {
+			// A File Provider domain that never came up leaves the private backing dir
+			// we just created (seedClaudeJSON always fills it), which a retry would then
+			// adopt as SeedKeptExisting. Drop it — but only when we created it, never a
+			// pre-existing kept/resume dir.
+			if privFreshlyCreated {
+				if rmErr := os.RemoveAll(prov.PrivateRoot(acctDir)); rmErr != nil {
+					setupErr = errors.Join(setupErr, fmt.Errorf("clean up fresh private store for %s: %w", acctDir, rmErr))
+				}
+			}
 			return nil, fmt.Errorf("set up overlay for %s: %w", acctDir, setupErr)
 		}
 		// Fuse Setup failure = holder unavailable, not fatal: fall back to

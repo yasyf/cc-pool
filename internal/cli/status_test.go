@@ -840,3 +840,88 @@ func TestRunStatusPlainHolderFooter(t *testing.T) {
 		})
 	}
 }
+
+// TestFPConsentFooter pins the consent footer text and its empty case.
+func TestFPConsentFooter(t *testing.T) {
+	if got := fpConsentFooter(false); got != "" {
+		t.Errorf("fpConsentFooter(false) = %q, want empty", got)
+	}
+	got := stripANSI(fpConsentFooter(true))
+	for _, frag := range []string{"app-group consent prompt", "restart the daemon", "ccp doctor"} {
+		if !strings.Contains(got, frag) {
+			t.Errorf("fpConsentFooter(true) = %q, missing %q", got, frag)
+		}
+	}
+}
+
+// TestRunStatusPlainFPConsentFooter pins the consent footer end-to-end through
+// runStatus against a fake daemon socket: shown when the daemon reports its bridge
+// bind parked on the consent prompt, hidden otherwise.
+func TestRunStatusPlainFPConsentFooter(t *testing.T) {
+	cases := map[string]struct {
+		consent   bool
+		wantShown bool
+	}{
+		"pending shows the banner": {true, true},
+		"not pending hides it":     {false, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// Short HOME under /tmp: macOS caps sun_path at 104 bytes.
+			home, err := os.MkdirTemp("/tmp", "ccp-home")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(home) })
+			t.Setenv("HOME", home)
+			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ln, err := net.Listen("unix", pool.SocketPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = ln.Close() })
+			go func() {
+				for {
+					conn, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					var req daemon.Request
+					_ = json.NewDecoder(conn).Decode(&req)
+					_ = json.NewEncoder(conn).Encode(daemon.Response{
+						Proto: daemon.ProtocolVersion, OK: true, Version: version.String(),
+						Accounts: []daemon.AccountStatus{{
+							ID: 1, Label: "work@example.com", HasUsage: true, Remaining5h: 50, Remaining7d: 50,
+						}},
+						FPConsentPending: tc.consent,
+					})
+					_ = conn.Close()
+				}
+			}()
+
+			st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = st.Close() })
+
+			var buf bytes.Buffer
+			cmd := &cobra.Command{}
+			cmd.SetOut(&buf)
+			cmd.SetContext(t.Context())
+			if err := runStatus(cmd, &pool.Manager{Store: st}, false, false, true); err != nil {
+				t.Fatalf("runStatus: %v", err)
+			}
+			out := stripANSI(buf.String())
+			if !strings.Contains(out, "work@example.com") {
+				t.Fatalf("table missing the daemon's account:\n%s", out)
+			}
+			shown := strings.Contains(out, "app-group consent prompt")
+			if shown != tc.wantShown {
+				t.Errorf("consent footer shown=%v, want %v:\n%s", shown, tc.wantShown, out)
+			}
+		})
+	}
+}
