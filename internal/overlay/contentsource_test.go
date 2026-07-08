@@ -224,8 +224,14 @@ func TestPoolContentSourceClassify(t *testing.T) {
 		// so these ARE plain claude's live credential file / backups dir.
 		".Credentials.json": content.EntryPrivate,
 		"Backups":           content.EntryPrivate,
+		// claude's lock dirs (and a case variant): private, never symlinked.
+		".storage-write.lock": content.EntryPrivate,
+		".oauth_refresh.lock":  content.EntryPrivate,
+		".Storage-Write.lock":  content.EntryPrivate,
 		// Near-miss, genuinely different file: stays a shared carve-out.
 		"mcp-needs-auth.json": content.EntrySymlink,
+		// A .lock name that is NOT one of claude's locks stays shared.
+		"session.lock": content.EntrySymlink,
 		// Bulk-I/O names are carve-out symlinks now, agreeing with Manifest.
 		"history.jsonl": content.EntrySymlink,
 		"projects":      content.EntrySymlink,
@@ -265,8 +271,9 @@ func TestPoolContentSourceManifestCarveOut(t *testing.T) {
 	sharedDirs := []string{"projects", "statsig", "todos", "session-env", "shell-snapshots"}
 	sharedFiles := []string{"history.jsonl"}
 	// CARDINAL negative: identity/credentials/excluded names that must NEVER be
-	// symlinked into base — the pool must never see plain claude's identity.
-	privateDirs := []string{"daemon"}
+	// symlinked into base — the pool must never see plain claude's identity. The
+	// .lock dirs are the credential-save regression.
+	privateDirs := []string{"daemon", ".storage-write.lock", ".oauth_refresh.lock"}
 	privateFiles := []string{
 		".credentials.json", "mcp-needs-auth-cache.json", ".claude.json.tmp.abcd", "remote-settings.json",
 		// Gap-class family siblings: dot-anchored PrivateEntry misses these but the

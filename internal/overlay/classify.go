@@ -63,13 +63,18 @@ var SkipPrefixes = []string{"._", ".fuse_hidden", ".nfs."}
 //     symlink Sync would otherwise refuse to relink. mcp-needs-auth-cache.json is
 //     per-account MCP auth state — sharing it would cross one account's server
 //     auth prompts into another's.
+//   - .storage-write.lock, .oauth_refresh.lock: claude's mkdir/rmdir lock dirs; a
+//     shared symlink makes claude's rmdir-release fail ENOTDIR and silently drops
+//     the OAuth-token save. Kept per-account so claude locks a real local dir.
 func PrivateEntry(name string) bool {
 	return ExcludedEntries[name] ||
 		name == ".claude.json" || strings.HasPrefix(name, ".claude.json.") ||
 		name == ".credentials.json" || strings.HasPrefix(name, ".credentials.json.") ||
 		strings.HasPrefix(name, ".last-update-result") ||
 		name == "remote-settings.json" || strings.HasPrefix(name, "remote-settings.json.") ||
-		name == "mcp-needs-auth-cache.json" || strings.HasPrefix(name, "mcp-needs-auth-cache.json.")
+		name == "mcp-needs-auth-cache.json" || strings.HasPrefix(name, "mcp-needs-auth-cache.json.") ||
+		strings.HasPrefix(name, ".storage-write.lock") ||
+		strings.HasPrefix(name, ".oauth_refresh.lock")
 }
 
 // sharedTopLevel reports whether a top-level base entry is carved out as a live
@@ -99,6 +104,8 @@ var PrivatePrefixes = []string{
 	".last-update-result",
 	"remote-settings.json",
 	"mcp-needs-auth-cache.json",
+	".storage-write.lock",
+	".oauth_refresh.lock",
 }
 
 // carveOutPrivate bars a name from the shared carve-out beyond PrivateEntry:
