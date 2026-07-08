@@ -37,10 +37,8 @@ func AccountIdentity(backend fkoverlay.Backend, configDir string) (*Identity, er
 }
 
 // WriteIdentity injects oauthAccount verbatim into a pool account's private
-// .claude.json, the inverse of AccountIdentity: same private-root path math,
-// merged into the existing document (seeded by PrepareAdd) preserving every
-// sibling key, written atomically. A missing or unparseable file fails loud —
-// it never seeds a fresh document.
+// .claude.json, preserving sibling keys; a missing or unparseable file fails
+// loud — it never seeds a fresh document.
 func WriteIdentity(backend fkoverlay.Backend, configDir string, oauthAccount json.RawMessage) error {
 	priv := configDir
 	if backend != fkoverlay.BackendSymlink {

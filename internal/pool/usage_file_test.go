@@ -111,11 +111,15 @@ func TestWriteCredRoutesBySource(t *testing.T) {
 			dir := t.TempDir()
 			a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc", KeychainAccount: "user"}
 			fk := credstest.NewFake()
-			m := &Manager{Creds: fk}
+			st := openTestStore(t)
+			if err := st.UpsertAccount(a); err != nil {
+				t.Fatal(err)
+			}
+			m := &Manager{Store: st, Creds: fk}
 			cred := &creds.Credential{}
 			cred.ClaudeAiOauth.AccessToken = "at-1"
 
-			if err := m.writeCred(a, tc.src, cred); err != nil {
+			if err := m.writeCred(a, tc.src, cred, ""); err != nil {
 				t.Fatal(err)
 			}
 			if got := creds.FileCredentialExists(dir); got != tc.wantFile {

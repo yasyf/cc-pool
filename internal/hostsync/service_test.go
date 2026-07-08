@@ -293,6 +293,102 @@ func TestNoteCredWriteNoopOnEqualChain(t *testing.T) {
 	})
 }
 
+// TestNoteCredWriteChildLineage pins the lineage arm of the freshness guard: a
+// child of the advertised chain lands even with an equal-or-earlier expiry,
+// while an unlinked ParentHash still falls back to the expiry rule.
+func TestNoteCredWriteChildLineage(t *testing.T) {
+	ctx := context.Background()
+
+	seed := func(t *testing.T) (*Service, *fakeClock) {
+		t.Helper()
+		s, clk := newTestService(t)
+		v := acctVal("u1", "e", "l", "hostA", 2000)
+		v.Chain.Hash = "H2"
+		if err := s.PublishAccount(ctx, v); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		clk.advance(time.Second)
+		return s, clk
+	}
+
+	t.Run("child lands despite skewed-earlier expiry", func(t *testing.T) {
+		s, _ := seed(t)
+		child := ChainStamp{ExpiresAt: 1500, Hash: "H3", Holder: "hostB", ParentHash: "H2", RotatedAt: 1400}
+		if err := s.NoteCredWrite(ctx, "u1", child); err != nil {
+			t.Fatalf("NoteCredWrite: %v", err)
+		}
+		e, _ := loadEntry(t, s, "u1")
+		if e.Value.Chain != child {
+			t.Fatalf("child chain did not land: %+v", e.Value.Chain)
+		}
+	})
+
+	t.Run("unlinked parent falls back to the expiry rule", func(t *testing.T) {
+		s, _ := seed(t)
+		stranger := ChainStamp{ExpiresAt: 1500, Hash: "H9", Holder: "hostB", ParentHash: "H8"}
+		if err := s.NoteCredWrite(ctx, "u1", stranger); err != nil {
+			t.Fatalf("NoteCredWrite: %v", err)
+		}
+		e, _ := loadEntry(t, s, "u1")
+		if e.Value.Chain.Hash != "H2" {
+			t.Fatalf("an unlinked staler chain landed: %+v", e.Value.Chain)
+		}
+	})
+}
+
+// TestScanPublishChainLineage pins the lineage arms of the scan fold: an ahead
+// local chain folds in despite a skewed-earlier expiry, and a chain whose
+// child the registry advertises never regresses it.
+func TestScanPublishChainLineage(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("local ahead folds despite skewed-earlier expiry", func(t *testing.T) {
+		s, _ := newTestService(t)
+		s.Locals = func(context.Context) ([]LocalAccount, error) {
+			return []LocalAccount{{
+				UUID:  "u1",
+				Chain: ChainStamp{ExpiresAt: 1500, Hash: "H3", Holder: "hostB", ParentHash: "H2"},
+			}}, nil
+		}
+		reg := cregistry.New[AccountValue]()
+		regVal := acctVal("u1", "e", "l", "hostA", 2000)
+		regVal.Chain.Hash = "H2"
+		reg.Add("u1", regVal, cregistry.Micros(1000))
+
+		changed, err := s.ScanPublish(ctx, reg)
+		if err != nil {
+			t.Fatalf("ScanPublish: %v", err)
+		}
+		if !changed || reg["u1"].Value.Chain.Hash != "H3" {
+			t.Fatalf("child fold did not land: changed=%v chain=%+v", changed, reg["u1"].Value.Chain)
+		}
+	})
+
+	t.Run("registry advertising our child is never regressed", func(t *testing.T) {
+		s, _ := newTestService(t)
+		s.Locals = func(context.Context) ([]LocalAccount, error) {
+			return []LocalAccount{{
+				UUID:  "u1",
+				Chain: ChainStamp{ExpiresAt: 2000, Hash: "H2", Holder: "hostB", ParentHash: "H1"},
+			}}, nil
+		}
+		reg := cregistry.New[AccountValue]()
+		regVal := acctVal("u1", "e", "l", "hostA", 1500)
+		regVal.Chain.Hash = "H3"
+		regVal.Chain.ParentHash = "H2"
+		reg.Add("u1", regVal, cregistry.Micros(1000))
+		before := reg["u1"].Added
+
+		changed, err := s.ScanPublish(ctx, reg)
+		if err != nil {
+			t.Fatalf("ScanPublish: %v", err)
+		}
+		if changed || reg["u1"].Value.Chain.Hash != "H3" || reg["u1"].Added != before {
+			t.Fatalf("scan regressed the registry onto our parent chain: changed=%v chain=%+v", changed, reg["u1"].Value.Chain)
+		}
+	})
+}
+
 func TestClaimHolderAndLeaseRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s, clk := newTestService(t)
@@ -562,12 +658,9 @@ func TestTouchStampCreatesTree(t *testing.T) {
 // would silently no-op.
 const skewAhead = cregistry.Micros(9_000_000_000_000_000)
 
-// TestLocalMutationForcesPastSkewedAdd seeds every mutate-based local write with
-// an entry whose add/remove stamp is AHEAD of the fake clock and proves the
-// mutation still lands (present, value applied, add stamp forced past the skew,
-// stamp touched). Removing forceStamp from any one method's Add regresses its
-// case: the bare wall-clock stamp is behind the seeded stamp, so cregistry.Add
-// no-ops. This is the exact shape findings 1-3 turn on.
+// TestLocalMutationForcesPastSkewedAdd pins forceStamp: every mutate-based
+// local write lands even when the entry's stamp is ahead of the clock —
+// removing forceStamp from any one method regresses its case.
 func TestLocalMutationForcesPastSkewedAdd(t *testing.T) {
 	ctx := context.Background()
 
@@ -694,10 +787,121 @@ func TestLocalMutationForcesPastSkewedAdd(t *testing.T) {
 	}
 }
 
-// TestScanPublishForcesPastSkewedAdd is the ScanPublish arm of the skew coverage:
-// it mutates a registry in place (no stamp touch, by contract), so it lives apart
-// from the mutate-based table. Removing forceStamp from the present branch fails
-// the fresher-chain case.
+// TestRecordRemovalForcesPastSkewedAdd pins the removal arm of the skew
+// coverage: an explicit remove lands even under a skew-ahead Added, where a
+// bare wall-clock stamp would leave the entry Present.
+func TestRecordRemovalForcesPastSkewedAdd(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestService(t)
+	reg := cregistry.New[AccountValue]()
+	reg.Add("u1", acctVal("u1", "e", "l", "hostA", 1000), skewAhead)
+	if err := s.Registry.Save(reg); err != nil {
+		t.Fatalf("seed skewed entry: %v", err)
+	}
+
+	if err := s.RecordRemoval(ctx, "u1"); err != nil {
+		t.Fatalf("RecordRemoval: %v", err)
+	}
+
+	e, ok := loadEntry(t, s, "u1")
+	if !ok {
+		t.Fatal("entry vanished from the registry")
+	}
+	if e.Present() {
+		t.Fatalf("tombstone no-oped under skew: added=%d removed=%d", e.Added, e.Removed)
+	}
+	if e.Removed <= skewAhead {
+		t.Errorf("removed stamp not forced past the skewed add: %d <= %d", e.Removed, skewAhead)
+	}
+	if _, ok := stampSig(t, s, "u1"); !ok {
+		t.Error("landed removal did not touch the stamp")
+	}
+}
+
+// TestAutomaticMutationNeverCancelsUnmergedTombstone pins bumpStamp: routine
+// mutations on an entry whose unmerged removal was recorded earlier in real
+// time never cancel that removal, in either merge order.
+func TestAutomaticMutationNeverCancelsUnmergedTombstone(t *testing.T) {
+	ctx := context.Background()
+	const base = cregistry.Micros(1000)
+
+	cases := map[string]func(t *testing.T, b *Service){
+		"RenewLease": func(t *testing.T, b *Service) {
+			if err := b.RenewLease(ctx, "u1", "hostB", 6000); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"ClaimHolder": func(t *testing.T, b *Service) {
+			if err := b.ClaimHolder(ctx, "u1", "hostB"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"NoteCredWrite fresher chain": func(t *testing.T, b *Service) {
+			if err := b.NoteCredWrite(ctx, "u1", ChainStamp{ExpiresAt: 2000, Hash: "fresh", Holder: "hostB", RotatedAt: 1900}); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"ScanPublish fresher fold": func(t *testing.T, b *Service) {
+			b.Locals = func(context.Context) ([]LocalAccount, error) {
+				return []LocalAccount{{UUID: "u1", Chain: ChainStamp{ExpiresAt: 2000, Hash: "fresh", Holder: "hostB"}}}, nil
+			}
+			reg, err := b.Registry.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.ScanPublish(ctx, reg); err != nil {
+				t.Fatal(err)
+			}
+			if err := b.Registry.Save(reg); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			seed := acctVal("u1", "e", "l", "hostA", 1000)
+			a, _ := newTestService(t) // the remover
+			b, _ := newTestService(t) // the busy peer, tombstone not yet merged
+			for _, s := range []*Service{a, b} {
+				reg := cregistry.New[AccountValue]()
+				reg.Add("u1", seed, base)
+				if err := s.Registry.Save(reg); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := a.RecordRemoval(ctx, "u1"); err != nil {
+				t.Fatalf("RecordRemoval: %v", err)
+			}
+			mutate(t, b)
+
+			// The mutation must have landed locally on B (bump beats the seed
+			// stamp) — otherwise the merge assertion below passes vacuously.
+			if e, ok := loadEntry(t, b, "u1"); !ok || !e.Present() || e.Added <= base {
+				t.Fatalf("mutation did not land on B: ok=%v added=%d removed=%d", ok, e.Added, e.Removed)
+			}
+
+			load := func(s *Service) Registry {
+				t.Helper()
+				reg, err := s.Registry.Load()
+				if err != nil {
+					t.Fatal(err)
+				}
+				return reg
+			}
+			if e := cregistry.Merge(load(a), load(b))["u1"]; e.Present() {
+				t.Errorf("B into A: removal cancelled: added=%d removed=%d", e.Added, e.Removed)
+			}
+			if e := cregistry.Merge(load(b), load(a))["u1"]; e.Present() {
+				t.Errorf("A into B: removal cancelled: added=%d removed=%d", e.Added, e.Removed)
+			}
+		})
+	}
+}
+
+// TestScanPublishForcesPastSkewedAdd pins forceStamp in ScanPublish, which
+// mutates a registry in place (no stamp touch) and so lives apart from the
+// mutate-based table.
 func TestScanPublishForcesPastSkewedAdd(t *testing.T) {
 	ctx := context.Background()
 
@@ -852,10 +1056,8 @@ func TestScanPublishBackfillsOAuthAccount(t *testing.T) {
 	})
 }
 
-// TestRecordLabelCrossHostLWW proves the forced local stamp does not disturb
-// cross-host convergence: two hosts relabel a shared account from a common
-// ancestor, and the strictly-later write wins the merge regardless of merge
-// order (the LWW max-join is commutative).
+// TestRecordLabelCrossHostLWW pins that the forced local stamp preserves
+// cross-host convergence: the strictly-later relabel wins the merge in either order.
 func TestRecordLabelCrossHostLWW(t *testing.T) {
 	ctx := context.Background()
 

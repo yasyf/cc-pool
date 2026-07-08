@@ -13,13 +13,11 @@ import (
 	"github.com/yasyf/synckit/cregistry"
 )
 
-// registryPerm is the mode of the secretless registry file. 0600 by intent —
-// the registry carries no tokens, but the pool's whole state dir is private.
+// registryPerm keeps the registry file private, like the rest of the state dir.
 const registryPerm = 0o600
 
-// RegistryFile is the on-disk home of the account Registry plus the flock that
-// serializes read-modify-write cycles across processes. Both fields are plain
-// paths, so the zero-plus-paths value is safe to copy.
+// RegistryFile is the on-disk account Registry plus the flock that serializes
+// read-modify-write cycles across processes.
 type RegistryFile struct {
 	// Path is the secretless registry.json.
 	Path string
@@ -27,13 +25,9 @@ type RegistryFile struct {
 	LockPath string
 }
 
-// Load reads the registry off disk. A missing file yields a fresh empty
-// registry — the first-run case, not an error. A file that exists but does not
-// parse is a loud error: the registry is never silently reset, since that would
-// resurrect tombstoned accounts and lose removals.
-//
-// It decodes into the typed registry (never map[string]any) so the int64 Micros
-// stamps survive byte-exact — a float64 detour would corrupt stamps past 2^53.
+// Load reads the registry: a missing file is a fresh empty registry, a
+// malformed one a loud error — never a silent reset. It decodes into the typed
+// registry so the int64 Micros stamps survive byte-exact.
 func (rf RegistryFile) Load() (Registry, error) {
 	data, err := os.ReadFile(rf.Path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -49,10 +43,8 @@ func (rf RegistryFile) Load() (Registry, error) {
 	return reg, nil
 }
 
-// Save writes the registry atomically (temp + rename via fusekit state). It is a
-// no-op when the marshaled bytes equal what is already on disk: the file — its
-// bytes AND its inode/mtime — is left untouched, so a converge pass that changes
-// nothing does not churn the watched file and re-trigger the mesh.
+// Save writes the registry atomically, as a no-op when the marshaled bytes
+// match disk — a pass that changes nothing never churns the watched file.
 func (rf RegistryFile) Save(reg Registry) error {
 	data, err := json.MarshalIndent(reg, "", "  ")
 	if err != nil {
@@ -73,9 +65,8 @@ func (rf RegistryFile) Save(reg Registry) error {
 	return nil
 }
 
-// WithLock runs fn while holding the exclusive registry flock, releasing it on
-// return. Its signature matches converge.Reconcile's lock parameter, so a
-// RegistryFile doubles as the reconcile serializer.
+// WithLock runs fn under the exclusive registry flock; the signature matches
+// converge.Reconcile's lock parameter.
 func (rf RegistryFile) WithLock(ctx context.Context, fn func() error) error {
 	h, err := flockAcquire(ctx, rf.LockPath)
 	if err != nil {
@@ -85,9 +76,8 @@ func (rf RegistryFile) WithLock(ctx context.Context, fn func() error) error {
 	return fn()
 }
 
-// Update is the atomic read-modify-write cycle: under the flock it loads the
-// registry, applies fn, and saves. fn mutates the passed registry in place
-// (cregistry Add/Remove); an error from fn aborts before any write.
+// Update is the atomic read-modify-write cycle: load, apply fn in place, save,
+// all under the flock; an error from fn aborts before any write.
 func (rf RegistryFile) Update(ctx context.Context, fn func(Registry) error) error {
 	return rf.WithLock(ctx, func() error {
 		reg, err := rf.Load()

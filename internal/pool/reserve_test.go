@@ -51,10 +51,9 @@ func TestAbandonAddFreesReservedIndex(t *testing.T) {
 	}
 }
 
-// TestReleaseAddResumesSameIndex pins the resume-by-rerunning-`ccp add` flow: a
-// keep-dir exit releases only the reservation, so the retry re-reserves the
-// same index and SeedKeptExisting adopts the kept login — while a live
-// (unreleased) attempt still forces a different index.
+// TestReleaseAddResumesSameIndex pins the resume flow: a keep-dir exit
+// releases only the reservation, so a retry re-reserves the same index while a
+// live attempt still forces a different one.
 func TestReleaseAddResumesSameIndex(t *testing.T) {
 	m := setupReservePool(t)
 	p1, err := m.PrepareAdd()
@@ -182,10 +181,8 @@ func (p *teardownProbe) Teardown(_, _ string) error {
 	return nil
 }
 
-// TestAbandonAddReleasesAfterTeardown pins release ordering: the reservation is
-// still held while the dir is being torn down, so a concurrent PrepareAdd can
-// never be handed the index mid-deletion — and it is freed once AbandonAdd
-// completes.
+// TestAbandonAddReleasesAfterTeardown pins release ordering: the reservation
+// is held while the dir is torn down and freed once AbandonAdd completes.
 func TestAbandonAddReleasesAfterTeardown(t *testing.T) {
 	m := setupReservePool(t)
 	p, err := m.PrepareAdd()

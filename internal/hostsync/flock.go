@@ -25,9 +25,8 @@ func (h *flockHandle) release() {
 	_ = h.f.Close()
 }
 
-// flockAcquire takes an exclusive cross-process advisory lock on path. It polls
-// rather than blocking in the syscall so ctx cancellation is observed and no
-// goroutine leaks on a stuck holder.
+// flockAcquire takes an exclusive cross-process advisory lock on path, polling
+// rather than blocking in the syscall so ctx cancellation is observed.
 func flockAcquire(ctx context.Context, path string) (*flockHandle, error) {
 	//nolint:gosec // G703: path is a cc-pool-owned lock path under the state dir, not user-tainted input
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

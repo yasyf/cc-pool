@@ -17,18 +17,14 @@ import (
 	"github.com/yasyf/synckit/syncservice"
 )
 
-// stampDirPerm and stampFilePerm keep the fsnotify stamp tree private — it names
-// account UUIDs, so 0700/0600 even though it carries no secrets.
+// stampDirPerm and stampFilePerm keep the stamp tree private — it names account UUIDs.
 const (
 	stampDirPerm  = 0o700
 	stampFilePerm = 0o600
 )
 
 // LocalAccount is the narrow view of a pool account the publish and scan hooks
-// need: its stable identity and current chain, with no dependency on the
-// *pool.Manager account-enumeration API (which lands in P2). It is a first-class
-// seam, not a shim: the Manager-backed adapter that produces these is wired in P2
-// through Service.Locals, and tests inject a fake.
+// consume, injected through Service.Locals.
 type LocalAccount struct {
 	// UUID is the account's stable identity and the registry key.
 	UUID string
@@ -36,67 +32,51 @@ type LocalAccount struct {
 	Email string
 	// Label is the account's current user-assigned label.
 	Label string
-	// OAuthAccount is Claude's opaque oauthAccount object for the account, folded
-	// into the registry so a peer's materializer can write it verbatim. It is empty
-	// until a local scan reads it; ScanPublish sets it on a new add and backfills it
-	// fill-if-empty onto a present entry that has none yet.
+	// OAuthAccount is Claude's opaque oauthAccount object; empty until a local
+	// scan reads it.
 	OAuthAccount json.RawMessage
 	// Chain is the account's current secretless chain stamp.
 	Chain ChainStamp
 }
 
-// Mesh resolves this host's identity and the peer hosts a converge pass pulls
-// from. Declared for the P2 converge/driver wiring; the P1 publish hooks never
-// call it.
+// Mesh resolves this host's identity and the peer hosts a converge pass pulls from.
 type Mesh interface {
 	// Resolve returns this host's name and the peer hosts to pull from.
 	Resolve(ctx context.Context) (self string, peers []string, err error)
 }
 
-// Sessions reports whether a local live Claude session (or an in-flight convert)
-// holds an account, so a converge pass can mark the item busy and defer acting on
-// it. Declared for P2; unused by the P1 hooks.
+// Sessions reports whether a live local session or in-flight convert holds an
+// account, so a converge pass defers acting on it.
 type Sessions interface {
 	// Busy reports whether uuid is held locally and a human-readable reason.
 	Busy(ctx context.Context, uuid string) (busy bool, reason string, err error)
 }
 
-// Claims is the daemon's convert-claim seam a converge teardown acquires before
-// removing a locally-materialized account; *daemon.Server satisfies it in P2 via
-// its beginConvert/endConvert methods. Declared for P2; unused by the P1 hooks.
+// Claims is the convert-claim seam a converge teardown acquires before
+// removing a locally-materialized account; *daemon.Server satisfies it.
 type Claims interface {
 	// TryClaim reserves uuid for a teardown, returning a release func and whether
 	// the claim succeeded (false when a live session already holds it).
 	TryClaim(uuid string) (release func(), ok bool)
 }
 
-// Service owns cc-pool's convergent account registry and the write hooks that
-// mutate it: every mutation is a load-modify-save under the registry flock, then
-// a stamp touch so the host's synckitd fsnotify watch notifies peers. It carries
-// no secrets — the registry is metadata plus a chain stamp only.
+// Service owns the convergent account registry and its write hooks: every
+// mutation is load-modify-save under the flock, then a stamp touch that notifies peers.
 type Service struct {
-	// M is the pool manager the P2 materializer and cred-pull drive; unused by the
-	// P1 publish hooks.
+	// M is the pool manager the materializer and cred-pull drive.
 	M *pool.Manager
 	// Registry is the on-disk convergent registry plus its flock.
 	Registry *RegistryFile
-	// StampDir is the root of the per-account fsnotify stamp tree
-	// (StampDir/<uuid>/stamp); a touch here fires synckitd's watch.
+	// StampDir is the per-account fsnotify stamp tree (StampDir/<uuid>/stamp).
 	StampDir string
 	// Log receives advisory diagnostics; nil discards them.
 	Log *log.Logger
-	// Now supplies the wall clock feeding cregistry stamps; nil means time.Now.
-	// Injected so tests drive a deterministic clock.
+	// Now supplies the stamp clock; nil means time.Now.
 	Now func() time.Time
-	// Locals enumerates this host's local pool accounts for the scan-publish fold.
-	// The Manager-backed adapter is wired in P2; tests inject a fake.
+	// Locals enumerates this host's local accounts for the scan-publish fold.
 	Locals func(ctx context.Context) ([]LocalAccount, error)
-	// Run execs an external command; nil means os/exec. Injected so tests never
-	// spawn a real synckitd.
+	// Run execs an external command; nil means os/exec.
 	Run func(ctx context.Context, name string, args ...string) error
-
-	// The remaining fields are declared for the P2 converge/driver wiring and are
-	// unexercised by the P1 publish hooks.
 
 	// Mesh resolves this host and its peers for a converge pass.
 	Mesh Mesh
@@ -106,9 +86,13 @@ type Service struct {
 	Sessions Sessions
 	// Claims reserves an account for a teardown.
 	Claims Claims
-	// Status is the process-lifetime peer up/down tracker converge.Reconcile
-	// threads through; one per Service.
+	// Status is the process-lifetime peer up/down tracker; one per Service.
 	Status *converge.PeerStatus
+	// Driver is the converge.Driver the reconcile pass drives; the daemon wires
+	// NewDriver, tests inject a fake.
+	Driver converge.Driver[AccountValue]
+	// Fetcher reads each peer's registry for the pull-merge.
+	Fetcher converge.Fetcher[AccountValue]
 }
 
 // now returns the injected clock, or the wall clock when none is injected.
@@ -124,17 +108,8 @@ func (s *Service) stamp() cregistry.Micros {
 	return cregistry.UnixMicros(s.now())
 }
 
-// forceStamp returns the add stamp a local mutation must use so its
-// cregistry.Registry.Add actually lands. Add is monotone — it adopts the new
-// value only when the stamp is strictly newer than the entry's current Added —
-// so a bare wall-clock stamp silently no-ops whenever the entry was last stamped
-// by a peer whose clock ran ahead of ours (mesh clock skew). Every local mutation
-// here has already passed its own precondition (present account, fresher chain,
-// owned lease, …) and so MUST take effect; flooring the stamp strictly past both
-// the entry's Added and Removed guarantees the add lands and, over a tombstone,
-// flips it Present. Per-entry stamps stay strictly monotone, so cross-host
-// concurrency still resolves by the LWW max-join in cregistry.Merge — forcing
-// only breaks a local-vs-self skew tie, never a genuine cross-host order.
+// forceStamp stamps an explicit local mutation strictly past the entry's Added
+// and Removed so it always lands, even under peer clock skew — see ccn 10bf17d.
 func (s *Service) forceStamp(entry cregistry.Entry[AccountValue]) cregistry.Micros {
 	at := s.stamp()
 	for _, floor := range [...]cregistry.Micros{entry.Added, entry.Removed} {
@@ -145,6 +120,16 @@ func (s *Service) forceStamp(entry cregistry.Entry[AccountValue]) cregistry.Micr
 	return at
 }
 
+// bumpStamp stamps an automatic field update one past the entry's own stamps —
+// never the wall clock, so it can't cancel an unmerged removal — see ccn 10bf17d.
+func (s *Service) bumpStamp(entry cregistry.Entry[AccountValue]) cregistry.Micros {
+	at := entry.Added
+	if entry.Removed > at {
+		at = entry.Removed
+	}
+	return at + 1
+}
+
 // logf writes an advisory line when a logger is attached.
 func (s *Service) logf(format string, args ...any) {
 	if s.Log != nil {
@@ -152,10 +137,8 @@ func (s *Service) logf(format string, args ...any) {
 	}
 }
 
-// TouchStamp writes the account's stamp file under StampDir/<uuid>/, creating the
-// directory on demand, so the host's synckitd fsnotify watch fires and notifies
-// peers. It always writes (the payload is the touch time), so even a same-content
-// re-touch produces a write event; callers skip it when nothing changed.
+// TouchStamp writes the account's stamp file under StampDir/<uuid>/ so the
+// host's synckitd fsnotify watch fires; it always writes, so a re-touch notifies too.
 func (s *Service) TouchStamp(uuid string) error {
 	dir := filepath.Join(s.StampDir, uuid)
 	if err := os.MkdirAll(dir, stampDirPerm); err != nil {
@@ -169,11 +152,8 @@ func (s *Service) TouchStamp(uuid string) error {
 	return nil
 }
 
-// mutate runs a single-account registry edit under the flock: load, apply mut,
-// and — only if mut actually changed that account's entry — save and touch the
-// stamp so synckitd notifies peers. A mut that changes nothing leaves the file
-// (its bytes, inode, and mtime) and the stamp untouched. It reports whether
-// anything changed.
+// mutate runs a single-account registry edit under the flock, saving and
+// touching the stamp only when the entry changed; reports whether it did.
 func (s *Service) mutate(ctx context.Context, uuid string, mut func(Registry) error) (bool, error) {
 	var changed bool
 	err := s.Registry.Update(ctx, func(reg Registry) error {
@@ -195,11 +175,9 @@ func (s *Service) mutate(ctx context.Context, uuid string, mut func(Registry) er
 	return changed, nil
 }
 
-// PublishAccount publishes v into the registry. It is an explicit re-add whose
-// forced stamp (see forceStamp) lands past both a prior tombstone AND a prior
-// present add, so a re-login publish always applies: it flips a skewed-clock
-// tombstone back to Present and overrides a present entry whose add was
-// peer-stamped ahead of the local clock. Touches the account stamp on any change.
+// PublishAccount force-stamps v into the registry: an explicit add/relogin
+// that lands past any tombstone or skewed add. It resurrects tombstones by
+// design, so bulk callers (enable backfill, scans) MUST use ScanPublish.
 func (s *Service) PublishAccount(ctx context.Context, v AccountValue) error {
 	if v.UUID == "" {
 		return fmt.Errorf("hostsync: PublishAccount requires a UUID")
@@ -211,22 +189,18 @@ func (s *Service) PublishAccount(ctx context.Context, v AccountValue) error {
 	return err
 }
 
-// RecordRemoval tombstones uuid at the current stamp. Removing an id absent from
-// the registry still records the tombstone (cregistry.Remove's property), so a
-// peer that has the account learns of the removal.
+// RecordRemoval tombstones uuid (an absent id still records the tombstone),
+// force-stamped so the remove lands under peer clock skew — see ccn 10bf17d.
 func (s *Service) RecordRemoval(ctx context.Context, uuid string) error {
 	_, err := s.mutate(ctx, uuid, func(reg Registry) error {
-		reg.Remove(uuid, s.stamp())
+		reg.Remove(uuid, s.forceStamp(reg[uuid]))
 		return nil
 	})
 	return err
 }
 
-// RecordLabel re-adds uuid with label so a later local rename always lands (via
-// forceStamp), preserving every other value field; cross-host concurrency still
-// resolves by the registry's LWW max-join. It fails loud for an account not
-// present in the registry — a rename of an unknown or removed account is a caller
-// bug, and re-adding would resurrect a tombstone.
+// RecordLabel re-adds uuid with label under a forced stamp so a local rename
+// always lands; unknown or removed accounts fail loud rather than resurrect.
 func (s *Service) RecordLabel(ctx context.Context, uuid, label string) error {
 	_, err := s.mutate(ctx, uuid, func(reg Registry) error {
 		entry, ok := reg[uuid]
@@ -242,10 +216,7 @@ func (s *Service) RecordLabel(ctx context.Context, uuid, label string) error {
 }
 
 // ClaimHolder sets host as uuid's chain holder — the one host allowed to
-// preemptively refresh the chain — preserving every other value field. The claim
-// is forced to land (see forceStamp), so a skewed-ahead add can never leave the
-// registry naming a stale holder and let two hosts refresh one single-use chain.
-// It fails loud for an account not present in the registry.
+// preemptively refresh — bump-stamped; unknown or removed accounts fail loud.
 func (s *Service) ClaimHolder(ctx context.Context, uuid, host string) error {
 	_, err := s.mutate(ctx, uuid, func(reg Registry) error {
 		entry, ok := reg[uuid]
@@ -254,15 +225,14 @@ func (s *Service) ClaimHolder(ctx context.Context, uuid, host string) error {
 		}
 		v := entry.Value
 		v.Chain.Holder = host
-		reg.Add(uuid, v, s.forceStamp(entry))
+		reg.Add(uuid, v, s.bumpStamp(entry))
 		return nil
 	})
 	return err
 }
 
 // RenewLease sets uuid's refresh lease to host until the given Unix-millis
-// expiry, preserving every other value field. It fails loud for an account not
-// present in the registry.
+// expiry; unknown or removed accounts fail loud.
 func (s *Service) RenewLease(ctx context.Context, uuid, host string, until int64) error {
 	_, err := s.mutate(ctx, uuid, func(reg Registry) error {
 		entry, ok := reg[uuid]
@@ -271,15 +241,14 @@ func (s *Service) RenewLease(ctx context.Context, uuid, host string, until int64
 		}
 		v := entry.Value
 		v.Lease = &Lease{Host: host, Until: until}
-		reg.Add(uuid, v, s.forceStamp(entry))
+		reg.Add(uuid, v, s.bumpStamp(entry))
 		return nil
 	})
 	return err
 }
 
-// ReleaseLease clears uuid's lease only when host owns it. A lease held by a
-// different host, an unleased account, or an absent account is left untouched (a
-// no-op, so no save and no stamp touch): a host can only release its own lease.
+// ReleaseLease clears uuid's lease only when host owns it; anything else is a
+// no-op — a host can only release its own lease.
 func (s *Service) ReleaseLease(ctx context.Context, uuid, host string) error {
 	_, err := s.mutate(ctx, uuid, func(reg Registry) error {
 		entry, ok := reg[uuid]
@@ -291,45 +260,36 @@ func (s *Service) ReleaseLease(ctx context.Context, uuid, host string) error {
 		}
 		v := entry.Value
 		v.Lease = nil
-		reg.Add(uuid, v, s.forceStamp(entry))
+		reg.Add(uuid, v, s.bumpStamp(entry))
 		return nil
 	})
 	return err
 }
 
-// NoteCredWrite updates uuid's chain stamp only when chain is strictly fresher
-// (a later server-issued ExpiresAt) than what the registry already carries. Equal
-// or staler chains are a no-op — no save, no stamp touch — the guard that stops
-// the merge-install ping-pong where two hosts trade the same chain forever. An
-// absent or tombstoned account is a no-op: a stray local refresh must never
-// resurrect a removed account. The freshness verdict is skew-immune (ExpiresAt),
-// so once it passes the add is forced to land (see forceStamp): a holder's
-// rotation can never silently vanish behind a skewed-ahead add and leave the
-// registry advertising the dead chain.
+// NoteCredWrite records chain only when it is fresher than the registry's —
+// child lineage first, strictly-later expiry as the fallback; staler chains
+// and absent or tombstoned accounts are no-ops — see ccn 10bf17d.
 func (s *Service) NoteCredWrite(ctx context.Context, uuid string, chain ChainStamp) error {
 	_, err := s.mutate(ctx, uuid, func(reg Registry) error {
 		entry, ok := reg[uuid]
 		if !ok || !entry.Present() {
 			return nil
 		}
-		if chain.ExpiresAt <= entry.Value.Chain.ExpiresAt {
+		child := chain.ParentHash != "" && chain.ParentHash == entry.Value.Chain.Hash
+		if !child && chain.ExpiresAt <= entry.Value.Chain.ExpiresAt {
 			return nil
 		}
 		v := entry.Value
 		v.Chain = chain
-		reg.Add(uuid, v, s.forceStamp(entry))
+		reg.Add(uuid, v, s.bumpStamp(entry))
 		return nil
 	})
 	return err
 }
 
-// ScanPublish folds this host's local accounts (from Locals) into reg: it adds an
-// account the registry has never seen, refreshes an existing present account's
-// chain when the local chain is strictly fresher, and backfills a present
-// account's oauthAccount when the registry has none yet — but it NEVER resurrects
-// a tombstone and NEVER overwrites a non-empty peer-set oauthAccount. It mutates
-// reg in place and reports whether anything changed; it performs no I/O and
-// touches no stamps (the P2 driver persists the merged registry and notifies).
+// ScanPublish folds this host's local accounts into reg in place (no I/O, no
+// stamp touches) and reports whether anything changed; it never resurrects a
+// tombstone and never overwrites a peer-set oauthAccount.
 func (s *Service) ScanPublish(ctx context.Context, reg Registry) (bool, error) {
 	locals, err := s.Locals(ctx)
 	if err != nil {
@@ -354,20 +314,20 @@ func (s *Service) ScanPublish(ctx context.Context, reg Registry) (bool, error) {
 		default:
 			v := entry.Value
 			dirty := false
-			// Chain: the freshness verdict is ExpiresAt-based and skew-immune, so
-			// move it only when strictly fresher.
-			if l.Chain.ExpiresAt > entry.Value.Chain.ExpiresAt {
+			// Fold only an ahead local chain; never regress onto our own child — see ccn 10bf17d.
+			ahead := l.Chain.ParentHash != "" && l.Chain.ParentHash == entry.Value.Chain.Hash
+			behind := entry.Value.Chain.ParentHash != "" && entry.Value.Chain.ParentHash == l.Chain.Hash
+			if ahead || (!behind && l.Chain.ExpiresAt > entry.Value.Chain.ExpiresAt) {
 				v.Chain = l.Chain
 				dirty = true
 			}
-			// oauthAccount: fill-if-empty only — backfill a scan-published account
-			// that still has none, but never clobber a value a peer already set.
+			// Fill-if-empty only: never clobber a peer-set oauthAccount.
 			if emptyOAuth(entry.Value.OAuthAccount) && !emptyOAuth(l.OAuthAccount) {
 				v.OAuthAccount = l.OAuthAccount
 				dirty = true
 			}
 			if dirty {
-				reg.Add(l.UUID, v, s.forceStamp(entry))
+				reg.Add(l.UUID, v, s.bumpStamp(entry))
 				changed = true
 			}
 		}
@@ -375,28 +335,148 @@ func (s *Service) ScanPublish(ctx context.Context, reg Registry) (bool, error) {
 	return changed, nil
 }
 
-// emptyOAuth reports whether a raw oauthAccount is absent — unset or the JSON
-// literal null (its round-tripped form) — and so eligible for a fill-if-empty
-// backfill.
+// emptyOAuth reports whether a raw oauthAccount is unset or the JSON literal null.
 func emptyOAuth(raw json.RawMessage) bool {
 	return len(raw) == 0 || string(raw) == "null"
 }
 
-// NudgeSynckitd best-effort nudges the local synckitd to re-read cc-pool's
-// manifest by exec'ing `synckitd register <manifestPath>`. It never fails the
-// caller: a missing or erroring synckitd is logged and swallowed, because the
-// nudge is advisory — the 900s reconcile tick is the floor.
+// NudgeSynckitd best-effort asks the local synckitd to re-read cc-pool's
+// manifest; a missing or erroring synckitd is logged and swallowed.
 func (s *Service) NudgeSynckitd(ctx context.Context, manifestPath string) {
 	if err := s.run(ctx, "synckitd", "register", manifestPath); err != nil {
 		s.logf("hostsync: synckitd register nudge failed (advisory): %v", err)
 	}
 }
 
-// run execs name with args through the injected runner, or os/exec when none is
-// injected.
+// run execs name through the injected runner, or os/exec when none is injected.
 func (s *Service) run(ctx context.Context, name string, args ...string) error {
 	if s.Run != nil {
 		return s.Run(ctx, name, args...)
 	}
 	return exec.CommandContext(ctx, name, args...).Run()
+}
+
+// Converge runs one convergence pass — pull peers (skipping origin, the
+// anti-echo), merge, reconcile each present entry, then the teardown pass —
+// and reports what changed. Per-peer and per-item failures never abort a pass.
+func (s *Service) Converge(ctx context.Context, origin string) (syncservice.ReconcileResult, error) {
+	if s.Mesh == nil {
+		return syncservice.ReconcileResult{}, fmt.Errorf("hostsync: Converge requires a Mesh")
+	}
+	_, peers, err := s.Mesh.Resolve(ctx)
+	if err != nil {
+		return syncservice.ReconcileResult{}, fmt.Errorf("hostsync: resolve mesh: %w", err)
+	}
+	results, err := converge.Reconcile(ctx, s.Registry.WithLock, s.Driver, s.Fetcher, s.Status, peers, origin)
+	if err != nil {
+		return syncservice.ReconcileResult{}, fmt.Errorf("hostsync: converge: %w", err)
+	}
+	converged := 0
+	for _, r := range results {
+		if r.Err != nil {
+			s.logf("hostsync: reconcile %s: %v", r.ID, r.Err)
+			continue
+		}
+		if convergedOutcome(r.Outcome) {
+			converged++
+		}
+	}
+	tornDown, skippedBusy, err := s.teardown(ctx)
+	if err != nil {
+		return syncservice.ReconcileResult{}, err
+	}
+	return syncservice.ReconcileResult{Converged: converged + tornDown, SkippedBusy: skippedBusy}, nil
+}
+
+// convergedOutcome reports whether an outcome changed local state, so the
+// Converged count reflects real work only.
+func convergedOutcome(o converge.Outcome) bool {
+	switch o {
+	case OutcomeMaterialized, OutcomeLabeled, OutcomeCredInstalled:
+		return true
+	default:
+		return false
+	}
+}
+
+// teardown removes every locally-materialized account a peer has tombstoned.
+// Busy, unprovably idle, unclaimed, ambiguous, and per-item failures all defer
+// to a later pass; only a registry load failure is fatal.
+func (s *Service) teardown(ctx context.Context) (tornDown, skippedBusy int, err error) {
+	reg, err := s.Registry.Load()
+	if err != nil {
+		return 0, 0, fmt.Errorf("hostsync: teardown load registry: %w", err)
+	}
+	for uuid, entry := range reg {
+		if entry.Present() {
+			continue
+		}
+		rows, err := s.M.Store.AccountsByUUID(uuid)
+		if err != nil {
+			s.logf("hostsync: teardown resolve %s: %v — deferred to a later pass", uuid, err)
+			continue
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		if len(rows) > 1 {
+			// A tombstone must never serially destroy every row sharing a uuid — see ccn 10bf17d.
+			s.logf("hostsync: teardown of %s deferred: %d local accounts share the uuid — refusing an ambiguous teardown; see `ccp doctor`", uuid, len(rows))
+			skippedBusy++
+			continue
+		}
+		a := rows[0]
+		if s.teardownBusy(ctx, a.ID, uuid) {
+			skippedBusy++
+			continue
+		}
+		if s.Claims == nil {
+			s.logf("hostsync: teardown of acct-%d (%s) deferred: no claim seam wired", a.ID, uuid)
+			skippedBusy++
+			continue
+		}
+		release, claimed := s.Claims.TryClaim(uuid)
+		if !claimed {
+			s.logf("hostsync: teardown of acct-%d (%s) deferred: convert claim refused", a.ID, uuid)
+			skippedBusy++
+			continue
+		}
+		// Re-check under the claim: a re-add since the pass snapshot is spared — see ccn 10bf17d.
+		if cur, err := s.Registry.Load(); err != nil || cur[uuid].Present() {
+			if err != nil {
+				s.logf("hostsync: teardown of acct-%d (%s) deferred: re-check load: %v", a.ID, uuid, err)
+			} else {
+				s.logf("hostsync: teardown of acct-%d (%s) cancelled: re-added since the pass snapshot", a.ID, uuid)
+			}
+			release()
+			continue
+		}
+		rerr := s.M.Remove(a.ID, true)
+		release()
+		if rerr != nil {
+			s.logf("hostsync: teardown remove acct-%d (%s): %v — deferred to a later pass", a.ID, uuid, rerr)
+			continue
+		}
+		s.logf("hostsync: tore down acct-%d (%s) per peer tombstone", a.ID, uuid)
+		tornDown++
+	}
+	return tornDown, skippedBusy, nil
+}
+
+// teardownBusy reports whether uuid must defer; it fails CLOSED — a nil
+// Sessions seam or a Busy error both read busy.
+func (s *Service) teardownBusy(ctx context.Context, id int, uuid string) bool {
+	if s.Sessions == nil {
+		s.logf("hostsync: teardown of acct-%d (%s) deferred: no sessions seam wired", id, uuid)
+		return true
+	}
+	busy, reason, err := s.Sessions.Busy(ctx, uuid)
+	if err != nil {
+		s.logf("hostsync: teardown of acct-%d (%s) deferred: busy check: %v", id, uuid, err)
+		return true
+	}
+	if busy {
+		s.logf("hostsync: teardown of acct-%d (%s) deferred: %s", id, uuid, reason)
+	}
+	return busy
 }

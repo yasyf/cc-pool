@@ -186,6 +186,14 @@ type Server struct {
 	// fpBridgeReadyFn is a test seam over the FP-bridge-up precondition for probing
 	// FP domains; nil means the real check (consent settled + data socket up).
 	fpBridgeReadyFn func() bool
+
+	// sync gates preemptive refreshes to the chain holder and carries the lease
+	// lifecycle; nil ⇒ host sync disabled, byte-identical to a syncless build.
+	sync *syncGate
+
+	// syncPull runs one converge pull for the invalid_grant self-heal (syncHeal);
+	// nil ⇒ sync disabled.
+	syncPull func(ctx context.Context) error
 }
 
 // Run is the entry point for `cc-pool daemon`. It blocks until the process
@@ -548,6 +556,8 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 					}
 				}
 				s.recordSticky(req.Cwd, sn.Account.ID)
+				// A launch here makes this host the chain's refresher.
+				s.sync.claimForSelect(ctx, sn.Account)
 				id := sn.Account.ID
 				return Response{
 					OK: true, Dir: sn.Account.ConfigDir, SelectedID: &id,
@@ -641,6 +651,9 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		selectKind(outcome, fallback), req.Cwd, best.Account.ID,
 		r.Score, best.Util5h, best.Util7d, runnerUp(ranked, r.AccountID, fallback))
 	id := best.Account.ID
+	// Claim holdership + a lease BEFORE the async preflight refresh below: the
+	// claim is what legitimizes it under the one-holder rule.
+	s.sync.claimForSelect(ctx, best.Account)
 	// Best-effort preflight refresh of the winner. The Add(1) is inside an
 	// already-tracked goroutine, so it cannot race a zero-counter Wait.
 	s.wg.Add(1)
@@ -713,12 +726,14 @@ func (s *Server) recordSticky(cwd string, accountID int) {
 	}
 }
 
-// handleCheckin closes sessions for a pid and adopts any rotated token.
+// handleCheckin closes sessions for a pid, adopts any rotated token, and
+// releases this host's sync lease on each account whose last session closed.
 func (s *Server) handleCheckin(ctx context.Context, req Request) Response {
 	sessions, err := s.m.Store.ListActiveSessions()
 	if err != nil {
 		return Response{OK: false, Error: err.Error()}
 	}
+	closed := map[int]store.Account{}
 	for _, se := range sessions {
 		if se.PID != req.PID {
 			continue
@@ -732,9 +747,33 @@ func (s *Server) handleCheckin(ctx context.Context, req Request) Response {
 				s.log.Printf("acct-%02d adopt rotated token on checkin: %v", a.ID, err)
 			}
 			cancel()
+			closed[a.ID] = a
 		}
 	}
+	s.releaseIdleLeases(ctx, closed)
 	return Response{OK: true}
+}
+
+// releaseIdleLeases releases this host's sync lease on each closed account
+// with no remaining live local session.
+func (s *Server) releaseIdleLeases(ctx context.Context, closed map[int]store.Account) {
+	if !s.sync.active() || len(closed) == 0 {
+		return
+	}
+	live, err := s.m.Store.ListActiveSessions()
+	if err != nil {
+		s.log.Printf("sync lease release: list sessions: %v", err)
+		return
+	}
+	open := map[int]int{}
+	for _, se := range live {
+		open[se.AccountID]++
+	}
+	for id, a := range closed {
+		if open[id] == 0 {
+			s.sync.releaseLease(ctx, a)
+		}
+	}
 }
 
 // tryReserve records a short-lived reservation for an account, refusing while
@@ -1070,9 +1109,12 @@ func (s *Server) reservedCount(id int) int {
 	return 1
 }
 
-// rankWithReservations re-ranks snapshots with reservation penalties applied,
-// returning the ranking plus a snapshot lookup by account id.
+// rankWithReservations re-ranks snapshots with reservation and peer-lease
+// penalties applied, returning the ranking plus a snapshot lookup by account
+// id. A live peer lease counts as one extra active session — a penalty, never
+// an exclusion, per the cross-host select rule.
 func (s *Server) rankWithReservations(snaps []pool.Snapshot) ([]score.Result, map[int]pool.Snapshot) {
+	peerLeases := s.sync.peerLeaseCounts(snaps)
 	bySnap := map[int]pool.Snapshot{}
 	inputs := make([]score.Input, 0, len(snaps))
 	for _, sn := range snaps {
@@ -1086,7 +1128,7 @@ func (s *Server) rankWithReservations(snaps []pool.Snapshot) ([]score.Result, ma
 			Resets5h:       sn.Resets5h,
 			Resets7d:       sn.Resets7d,
 			Burn5hPerHour:  sn.Burn5hPerHour,
-			ActiveSessions: sn.ActiveSessions + s.reservedCount(sn.Account.ID),
+			ActiveSessions: sn.ActiveSessions + s.reservedCount(sn.Account.ID) + peerLeases[sn.Account.ID],
 			RateLimited:    sn.RateLimited,
 			RefreshFailed:  sn.Stale && !sn.HasUsage,
 			NeedsLogin:     sn.NeedsLogin,

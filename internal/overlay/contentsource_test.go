@@ -226,8 +226,8 @@ func TestPoolContentSourceClassify(t *testing.T) {
 		"Backups":           content.EntryPrivate,
 		// claude's lock dirs (and a case variant): private, never symlinked.
 		".storage-write.lock": content.EntryPrivate,
-		".oauth_refresh.lock":  content.EntryPrivate,
-		".Storage-Write.lock":  content.EntryPrivate,
+		".oauth_refresh.lock": content.EntryPrivate,
+		".Storage-Write.lock": content.EntryPrivate,
 		// Near-miss, genuinely different file: stays a shared carve-out.
 		"mcp-needs-auth.json": content.EntrySymlink,
 		// A .lock name that is NOT one of claude's locks stays shared.

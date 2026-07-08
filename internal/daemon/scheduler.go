@@ -322,9 +322,22 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a
 	// recovery sweep bypasses the streak gate (fetchUsage's deep guard still
 	// holds) so a busy account whose token expired during the outage heals now.
 	busyBySession := procscan.CountByConfigDir(sessions, a.ConfigDir) > 0
+	if busyBySession {
+		// A live session keeps this host's lease alive so peers keep penalizing.
+		s.sync.renewWhileBusy(ctx, a)
+	}
+
+	// Both refresh opts AND with the holder gate — a non-holder refresh is the
+	// double-spend that forks a chain; evaluated only when a refresh is on the table.
+	wantIdle := idle
+	wantBusy := busyBySession && (recovery || s.authStreak[a.ID] >= 1)
+	allowRefresh := false
+	if wantIdle || wantBusy {
+		allowRefresh = s.sync.mayRefresh(ctx, a)
+	}
 	opts := pool.SampleOpts{
-		AllowRefresh:     idle,
-		AllowBusyRefresh: busyBySession && (recovery || s.authStreak[a.ID] >= 1),
+		AllowRefresh:     wantIdle && allowRefresh,
+		AllowBusyRefresh: wantBusy && allowRefresh,
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -342,7 +355,7 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a
 		s.rlStreakPool = 0
 		s.pool429RetryAfter = 0
 	}
-	s.handleAuthOutcome(a, err)
+	s.handleAuthOutcome(ctx, a, err)
 	return classifyOutcome(err)
 }
 
@@ -351,7 +364,7 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a
 // so the streak only throttles polling. A network-class failure is an outage
 // signal, not an auth event — pollOnce's outage detector owns the reaction here,
 // so it touches no auth state. Scheduler-goroutine-local — no lock.
-func (s *Server) handleAuthOutcome(a store.Account, err error) {
+func (s *Server) handleAuthOutcome(ctx context.Context, a store.Account, err error) {
 	if err == nil {
 		s.authStreak[a.ID] = 0
 		if changed, cerr := s.m.Store.ClearNeedsLogin(a.ID); cerr != nil {
@@ -362,7 +375,7 @@ func (s *Server) handleAuthOutcome(a store.Account, err error) {
 		return
 	}
 	if errors.Is(err, pool.ErrNeedsLogin) {
-		s.flagNeedsLogin(a, err)
+		s.flagNeedsLogin(ctx, a, err)
 		return
 	}
 	if errors.Is(err, oauth.ErrNetwork) {
@@ -396,9 +409,14 @@ func (s *Server) logNetUnreachable(a store.Account, err error) {
 	s.log.Printf("acct-%02d sample: network unreachable: %v", a.ID, err)
 }
 
-// flagNeedsLogin stamps the attempt clock so the needs-login backoff engages.
-func (s *Server) flagNeedsLogin(a store.Account, err error) {
+// flagNeedsLogin stamps the attempt clock, then flags needs-login — unless the
+// sync self-heal pulled a fresher chain, which skips the set (never clears).
+func (s *Server) flagNeedsLogin(ctx context.Context, a store.Account, err error) {
 	s.lastAuthAttempt[a.ID] = time.Now()
+	if s.syncHeal(ctx, a) {
+		s.log.Printf("acct-%02d auth failed but sync pulled a fresher chain; retrying before flagging needs-login", a.ID)
+		return
+	}
 	changed, serr := s.m.Store.SetNeedsLogin(a.ID, time.Now(), err.Error())
 	if serr != nil {
 		s.log.Printf("acct-%02d set needs-login: %v", a.ID, serr)
@@ -407,6 +425,33 @@ func (s *Server) flagNeedsLogin(a store.Account, err error) {
 	if changed {
 		s.log.Printf("acct-%02d needs re-login — run `ccp login %d`: %v", a.ID, a.ID, err)
 	}
+}
+
+// syncHealTimeout bounds the self-heal's converge pull; a var so tests shrink it.
+var syncHealTimeout = 15 * time.Second
+
+// syncHeal runs one converge pull and reports whether a strictly fresher chain
+// arrived from a peer; nil syncPull (sync disabled) reports false.
+func (s *Server) syncHeal(ctx context.Context, a store.Account) bool {
+	if s.syncPull == nil {
+		return false
+	}
+	// A missing credential baselines at zero, so any pulled chain counts as fresher.
+	var before int64
+	if cred, _, err := s.m.ReadCredential(a); err == nil {
+		before = cred.ClaudeAiOauth.ExpiresAt
+	}
+	hctx, cancel := context.WithTimeout(ctx, syncHealTimeout)
+	defer cancel()
+	if err := s.syncPull(hctx); err != nil {
+		s.log.Printf("acct-%02d sync heal pull: %v", a.ID, err)
+		return false
+	}
+	cred, _, err := s.m.ReadCredential(a)
+	if err != nil {
+		return false
+	}
+	return cred.ClaudeAiOauth.ExpiresAt > before
 }
 
 // jitter is deterministic (seed-derived) rather than RNG-backed, for

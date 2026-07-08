@@ -61,31 +61,53 @@ func (m *Manager) ReadCredential(a store.Account) (*creds.Credential, creds.Sour
 	return nil, creds.SourceKeychain, fmt.Errorf("no credential in the Keychain or credential file: %w", creds.ErrNotFound)
 }
 
-// writeCred upserts cred on the backend src names, then fires OnCredWrite. A
-// hook error is logged and swallowed: a registry write must never fail a
-// refresh.
-func (m *Manager) writeCred(a store.Account, src creds.Source, cred *creds.Credential) error {
+// writeCred upserts cred on src, persists the chain-hash columns, then fires
+// OnCredWrite; parentHash "" resolves from the stored columns. Hash and hook
+// errors are logged and swallowed — neither may fail a refresh.
+func (m *Manager) writeCred(a store.Account, src creds.Source, cred *creds.Credential, parentHash string) error {
 	s := m.Creds.Store(a, src)
 	if err := s.Write(cred); err != nil {
 		return fmt.Errorf("write credential to %s: %w", s, err)
 	}
+	parent, perr := m.resolveParentHash(a, creds.CredentialHash(cred), parentHash)
+	if perr != nil {
+		log.Printf("acct-%d resolve chain parent: %v", a.ID, perr)
+	} else if err := m.Store.SetChainHashes(a.ID, creds.CredentialHash(cred), parent); err != nil {
+		log.Printf("acct-%d persist chain hashes: %v", a.ID, err)
+	}
 	if m.OnCredWrite != nil {
-		if err := m.OnCredWrite(a, cred); err != nil {
+		if err := m.OnCredWrite(a, cred, parent); err != nil {
 			log.Printf("acct-%d OnCredWrite hook: %v", a.ID, err)
 		}
 	}
 	return nil
 }
 
+// resolveParentHash resolves an empty parentHash from the stored chain
+// columns: a changed cred_hash is the parent; unchanged keeps the recorded parent.
+func (m *Manager) resolveParentHash(a store.Account, credHash, parentHash string) (string, error) {
+	if parentHash != "" {
+		return parentHash, nil
+	}
+	row, err := m.Store.GetAccount(a.ID)
+	if err != nil {
+		return "", err
+	}
+	if row.CredHash != credHash {
+		return row.CredHash, nil
+	}
+	return row.CredParentHash, nil
+}
+
 // writeCredCAS aborts with ErrCredentialChangedUnderfoot if the backend's access
 // token no longer matches prevAccess (a concurrent writer landed a newer cred);
 // an absent/unreadable backend writes through. Caller must hold the account lock.
-func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prevAccess string, next *creds.Credential) error {
+func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prevAccess string, next *creds.Credential, parentHash string) error {
 	s := m.Creds.Store(a, src)
 	if cur, err := s.Read(); err == nil && cur.ClaudeAiOauth.AccessToken != prevAccess {
 		return fmt.Errorf("%w: %s (a concurrent writer owns the newer credential)", ErrCredentialChangedUnderfoot, s)
 	}
-	return m.writeCred(a, src, next)
+	return m.writeCred(a, src, next, parentHash)
 }
 
 // ensureFreshToken requires the caller hold the per-account lock and is itself
@@ -131,7 +153,7 @@ func (m *Manager) refresh(ctx context.Context, a store.Account, src creds.Source
 		next.ClaudeAiOauth.RefreshToken = tr.RefreshToken
 	}
 	next.ClaudeAiOauth.ExpiresAt = tr.Expiry(time.Now()).UnixMilli()
-	if err := m.writeCredCAS(a, src, prev.ClaudeAiOauth.AccessToken, next); err != nil {
+	if err := m.writeCredCAS(a, src, prev.ClaudeAiOauth.AccessToken, next, creds.CredentialHash(prev)); err != nil {
 		return nil, err
 	}
 	return next, nil
@@ -151,7 +173,7 @@ func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error 
 	if err != nil {
 		return err
 	}
-	return m.writeCredCAS(a, src, cred.ClaudeAiOauth.AccessToken, cred)
+	return m.writeCredCAS(a, src, cred.ClaudeAiOauth.AccessToken, cred, "")
 }
 
 // SampleOpts controls how SampleUsage may recover a 401. AllowRefresh permits the
