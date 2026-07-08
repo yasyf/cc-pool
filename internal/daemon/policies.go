@@ -87,10 +87,12 @@ const (
 
 // policy is one self-heal family's tuning: a debounced fault verdict (via
 // strikes reaching debounce, or a forced fault) followed by a backoff-spaced,
-// breaker-capped recovery ladder (via attempts). breaker caps the primary lane;
-// alt caps a second, mutually-resetting lane (e.g. TCC). A zero field means the
+// breaker-capped recovery ladder (via attempts). With alt set, breaker caps the
+// primary lane and alt caps a second, mutually-resetting lane (e.g. TCC);
+// without alt, breaker caps the attempts clock itself, so strikes stays a pure
+// debounce counter pre-fault attempts can never erode. A zero field means the
 // family does not use that phase: debounce 0 ⇒ no debounce, breaker 0 ⇒ no
-// primary breaker, alt 0 ⇒ no alt lane, zero backoff ⇒ no spacing.
+// breaker, alt 0 ⇒ no alt lane, zero backoff ⇒ no spacing.
 type policy struct {
 	name     string
 	debounce int

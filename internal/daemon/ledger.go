@@ -10,22 +10,28 @@ import "time"
 //     forceFault latches it immediately). The lane resets on the latch so the
 //     recovery ladder counts from zero.
 //   - Phase 2 (recovery ladder): attempt advances the shared backoff clock
-//     (attempts) and charges one of two mutually-resetting breaker lanes —
-//     strikes (primary) or altHits (alt). A lane reaching its threshold parks
-//     the ledger (onTrip). attempts alone spaces the next attempt (nextDue).
+//     (attempts); attempts alone spaces the next attempt (nextDue). A two-lane
+//     policy (alt > 0) additionally charges one of two mutually-resetting
+//     breaker lanes — strikes (primary) or altHits (alt) — and a lane reaching
+//     its threshold parks the ledger (onTrip). A single-lane policy (alt == 0)
+//     parks when the attempts clock reaches breaker; its strikes stays a pure
+//     debounce counter, so pre-fault recovery attempts (the FP Missing
+//     control-plane heal) can never erode the fault debounce.
 //
 // The two-lane, shared-clock shape is fuse.remount's incident contract: hazard
 // and TCC outcomes each reset the other's lane, so an alternating row trips
 // neither breaker while the shared attempts clock still spaces every remount.
 type ledger struct {
-	// strikes is the primary lane: the debounce count before the fault latches,
-	// then the primary breaker lane during recovery.
+	// strikes is the debounce count before the fault latches; on a two-lane
+	// policy it doubles as the primary breaker lane during recovery. Single-lane
+	// policies never charge it from attempt — their breaker measures attempts.
 	strikes int
 	// faulted latches the debounce verdict (wedged / needs-login / forced). It
 	// persists across recovery attempts — a parked resource stays faulted.
 	faulted bool
 	// attempts is the shared backoff clock: every recovery attempt, whatever its
-	// lane, so the backoff spacing never resets on alternating outcome kinds.
+	// lane, so the backoff spacing never resets on alternating outcome kinds. It
+	// is also the breaker measure for single-lane policies.
 	attempts int
 	// altHits is the alt breaker lane (e.g. TCC), mutually-resetting with strikes.
 	altHits int
@@ -35,8 +41,11 @@ type ledger struct {
 	lastAt  time.Time
 }
 
-// attemptKind selects which breaker lane a recovery attempt charges. The primary
-// and alt lanes mutually reset, so alternating kinds trip neither.
+// attemptKind selects which breaker lane a recovery attempt charges on a
+// two-lane policy (alt > 0); the primary and alt lanes mutually reset, so
+// alternating kinds trip neither. Single-lane policies ignore the kind — their
+// breaker measures the shared attempts clock, so pre-fault recovery attempts
+// (the FP Missing heal) never touch the strikes debounce.
 type attemptKind int
 
 const (
@@ -78,20 +87,24 @@ func (l *ledger) forceFault(now time.Time, err error) {
 	l.lastErr, l.lastAt = err, now
 }
 
-// attempt books one recovery attempt: it advances the shared backoff clock (and
-// spaces the next attempt), charges the selected breaker lane while resetting the
-// other, and stamps lastAt. It returns whether the attempt parked a breaker.
+// attempt books one recovery attempt: it advances the shared backoff clock
+// (spacing the next attempt) and stamps lastAt, returning whether the attempt
+// parked a breaker. On a two-lane policy it also charges the selected breaker
+// lane while resetting the other; a single-lane policy ignores kind — its
+// breaker measures the attempts clock.
 func (l *ledger) attempt(p policy, kind attemptKind, now time.Time) (parked bool) {
 	l.attempts++
-	switch kind {
-	case attemptPrimary:
-		l.strikes++
-		l.altHits = 0
-	case attemptAlt:
-		l.altHits++
-		l.strikes = 0
-	case attemptNeutral:
-		l.strikes, l.altHits = 0, 0
+	if p.alt > 0 {
+		switch kind {
+		case attemptPrimary:
+			l.strikes++
+			l.altHits = 0
+		case attemptAlt:
+			l.altHits++
+			l.strikes = 0
+		case attemptNeutral:
+			l.strikes, l.altHits = 0, 0
+		}
 	}
 	l.nextDue = now.Add(p.backoff.After(l.attempts))
 	l.lastAt = now
@@ -102,11 +115,16 @@ func (l *ledger) attempt(p policy, kind attemptKind, now time.Time) (parked bool
 // debounce verdict and the recovery ladder are dropped.
 func (l *ledger) clear() { *l = ledger{} }
 
-// parked reports whether a breaker has tripped: the primary lane reached the
-// policy's breaker, or the alt lane reached alt. onTrip names what the consumer
-// then does (gate / park / retreat).
+// parked reports whether a breaker has tripped. A two-lane policy trips when
+// the primary lane reaches breaker or the alt lane reaches alt; a single-lane
+// policy trips when the shared attempts clock reaches breaker — strikes stays a
+// pure debounce counter there. onTrip names what the consumer then does
+// (gate / park / retreat).
 func (l *ledger) parked(p policy) bool {
-	return (p.breaker > 0 && l.strikes >= p.breaker) || (p.alt > 0 && l.altHits >= p.alt)
+	if p.alt > 0 {
+		return (p.breaker > 0 && l.strikes >= p.breaker) || l.altHits >= p.alt
+	}
+	return p.breaker > 0 && l.attempts >= p.breaker
 }
 
 // due reports whether another recovery attempt is warranted now: no breaker has

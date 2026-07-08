@@ -138,9 +138,9 @@ func TestLedgerBackoffDue(t *testing.T) {
 	}
 }
 
-// TestLedgerBreakerTrip covers the primary breaker: consecutive primary attempts
-// park the ledger exactly at the policy's breaker, both when the ledger reached
-// recovery via a debounce (fp.domain) and when it has no debounce (fuse.remount).
+// TestLedgerBreakerTrip covers the breaker: consecutive primary attempts park
+// the ledger exactly at the policy's breaker — via the attempts clock for the
+// single-lane fp.domain, via the primary lane for the two-lane fuse.remount.
 func TestLedgerBreakerTrip(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -172,6 +172,54 @@ func TestLedgerBreakerTrip(t *testing.T) {
 				t.Fatal("a parked ledger must never be due")
 			}
 		})
+	}
+}
+
+// TestLedgerSingleLanePreFaultAttemptsNeverErodeDebounce pins the single-lane
+// contract: recovery attempts on an un-faulted row (the FP Missing control-plane
+// heal riding the backoff schedule) never touch the strikes debounce — the wedge
+// verdict still takes the full pinned debounce (2) to latch. The old fpState kept
+// these counters in separate maps; the fold must not merge them.
+func TestLedgerSingleLanePreFaultAttemptsNeverErodeDebounce(t *testing.T) {
+	p := pol(t, "fp.domain") // single-lane: alt 0, debounce 2, breaker 5
+	l := &ledger{}
+	for i := 0; i < 3; i++ {
+		l.attempt(p, attemptPrimary, t0) // pre-fault control-plane repair attempts
+	}
+	if l.faulted || l.strikes != 0 {
+		t.Fatalf("pre-fault attempts touched the debounce: faulted=%v strikes=%d, want false/0", l.faulted, l.strikes)
+	}
+	l.strike(p, t0, errors.New("wedged"))
+	if l.faulted {
+		t.Fatal("one strike after pre-fault attempts latched the fault — the debounce eroded to 1")
+	}
+	l.strike(p, t0, errors.New("wedged"))
+	if !l.faulted {
+		t.Fatal("second strike did not latch the fault (debounce 2)")
+	}
+}
+
+// TestLedgerSingleLaneParksOnAttemptsAtBreaker pins that a single-lane policy's
+// breaker measures the shared attempts clock — the old fpState recovery ladder's
+// park-at-5-attempts contract — with strikes never charged along the way.
+func TestLedgerSingleLaneParksOnAttemptsAtBreaker(t *testing.T) {
+	p := pol(t, "fp.domain") // breaker 5 on attempts
+	l := &ledger{}
+	l.forceFault(t0, errors.New("wedged"))
+	for n := 1; n <= fpRecoveryBreaker; n++ {
+		parked := l.attempt(p, attemptPrimary, t0)
+		if want := n >= fpRecoveryBreaker; parked != want {
+			t.Fatalf("attempt %d parked = %v, want %v", n, parked, want)
+		}
+		if l.strikes != 0 {
+			t.Fatalf("attempt %d charged the strikes lane on a single-lane policy: strikes=%d", n, l.strikes)
+		}
+	}
+	if !l.parked(p) {
+		t.Fatal("breaker did not trip at fpRecoveryBreaker attempts")
+	}
+	if l.due(p, t0.Add(24*time.Hour)) {
+		t.Fatal("a parked ledger must never be due")
 	}
 }
 
