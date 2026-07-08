@@ -46,7 +46,7 @@ func swapFPAppexBounce(t *testing.T, fn func(context.Context) error) {
 func newFPHealServer(t *testing.T) (*Server, store.Account, map[int]string, *fakeFPProv) {
 	t.Helper()
 	s, dirs, fake := newFPServer(t)
-	s.fp = newFPState(alwaysNonEmpty)
+	s.fpSynth = alwaysNonEmpty
 	a, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
@@ -69,15 +69,15 @@ func healFPStep(t *testing.T, s *Server, a store.Account, now time.Time) {
 // non-destructive Sync, attempts 2–4 re-register the domain (Teardown+Setup).
 func TestFPHealLadderEscalation(t *testing.T) {
 	s, a, dirs, fake := newFPHealServer(t)
-	wedgeIt(t, s.fp, dirs[1])
+	wedgeIt(t, s, dirs[1])
 	now := time.Unix(0, 0)
 
 	healFPStep(t, s, a, now)
 	if _, setups, syncs, teardowns := fake.counts(); syncs != 1 || setups != 0 || teardowns != 0 {
 		t.Fatalf("attempt 1: syncs=%d setups=%d teardowns=%d, want 1/0/0 (Sync only)", syncs, setups, teardowns)
 	}
-	if s.fp.attemptsSoFar(dirs[1]) != 1 {
-		t.Fatalf("attempt 1 not booked: attemptsSoFar=%d", s.fp.attemptsSoFar(dirs[1]))
+	if s.fpAttemptsSoFar(dirs[1]) != 1 {
+		t.Fatalf("attempt 1 not booked: attemptsSoFar=%d", s.fpAttemptsSoFar(dirs[1]))
 	}
 
 	for attempt := 2; attempt <= 4; attempt++ {
@@ -91,7 +91,7 @@ func TestFPHealLadderEscalation(t *testing.T) {
 	if kind := kindOf(t, s, 1); kind != "fileprovider" {
 		t.Fatalf("row changed to %q before the breaker", kind)
 	}
-	if !s.fp.wedged(dirs[1]) {
+	if !s.fpWedged(dirs[1]) {
 		t.Fatal("domain must stay wedged across attempts 1-4 (only a probe success clears it)")
 	}
 }
@@ -109,10 +109,10 @@ func TestFPHealBreakerParksWhenIdle(t *testing.T) {
 	s.log = log.New(buf, "", 0)
 	// No live session: the OLD breaker would have retreated to symlink here.
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
-	wedgeIt(t, s.fp, dirs[1])
+	wedgeIt(t, s, dirs[1])
 	now := time.Unix(0, 0)
 	for i := 0; i < fpRecoveryBreaker-1; i++ { // advance to attempts==4 (next is the breaker)
-		s.fp.recordAttempt(dirs[1], now)
+		s.fpRecordAttempt(dirs[1], now)
 	}
 	var bounced int
 	swapFPAppexBounce(t, func(context.Context) error { bounced++; return nil })
@@ -128,7 +128,7 @@ func TestFPHealBreakerParksWhenIdle(t *testing.T) {
 	if kind := kindOf(t, s, 1); kind != "fileprovider" {
 		t.Fatalf("breaker auto-retreated a controllable domain (the R1 regression): kind = %q, want fileprovider (parked)", kind)
 	}
-	if !s.fp.wedged(dirs[1]) {
+	if !s.fpWedged(dirs[1]) {
 		t.Fatal("a parked domain must stay wedged so select keeps excluding it")
 	}
 	log := buf.String()
@@ -150,10 +150,10 @@ func TestFPHealBreakerParksUnderLiveSessions(t *testing.T) {
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 	}
-	wedgeIt(t, s.fp, dirs[1])
+	wedgeIt(t, s, dirs[1])
 	now := time.Unix(0, 0)
 	for i := 0; i < fpRecoveryBreaker-1; i++ {
-		s.fp.recordAttempt(dirs[1], now)
+		s.fpRecordAttempt(dirs[1], now)
 	}
 	swapFPAppexBounce(t, func(context.Context) error { return nil })
 
@@ -162,7 +162,7 @@ func TestFPHealBreakerParksUnderLiveSessions(t *testing.T) {
 	if kind := kindOf(t, s, 1); kind != "fileprovider" {
 		t.Fatalf("breaker changed the row under a live session: kind = %q, want fileprovider (parked)", kind)
 	}
-	if !s.fp.wedged(dirs[1]) {
+	if !s.fpWedged(dirs[1]) {
 		t.Fatal("a parked domain must stay wedged so select keeps excluding it")
 	}
 	if !strings.Contains(buf.String(), "launchctl kickstart") {
@@ -175,7 +175,7 @@ func TestFPHealBreakerParksUnderLiveSessions(t *testing.T) {
 // session's dir must not be remade under it).
 func TestFPHealReservationDefersReRegister(t *testing.T) {
 	s, a, dirs, fake := newFPHealServer(t)
-	wedgeIt(t, s.fp, dirs[1])
+	wedgeIt(t, s, dirs[1])
 	now := time.Unix(0, 0)
 
 	healFPStep(t, s, a, now) // attempt 1: Sync; attemptsSoFar -> 1
@@ -187,7 +187,7 @@ func TestFPHealReservationDefersReRegister(t *testing.T) {
 	if _, setups, _, teardowns := fake.counts(); setups != 0 || teardowns != 0 {
 		t.Fatalf("re-register ran under a reservation: setups=%d teardowns=%d, want 0/0", setups, teardowns)
 	}
-	if got := s.fp.attemptsSoFar(dirs[1]); got != 1 {
+	if got := s.fpAttemptsSoFar(dirs[1]); got != 1 {
 		t.Fatalf("a deferred step consumed an attempt: attemptsSoFar=%d, want 1", got)
 	}
 }
@@ -200,7 +200,7 @@ func TestFPHealReRegisterProceedsUnderLiveSessions(t *testing.T) {
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 	}
-	wedgeIt(t, s.fp, dirs[1])
+	wedgeIt(t, s, dirs[1])
 	now := time.Unix(0, 0)
 
 	healFPStep(t, s, a, now) // attempt 1: Sync
@@ -219,7 +219,7 @@ func TestFPHealReRegisterProceedsUnderLiveSessions(t *testing.T) {
 func TestFPHealReRegisterRetreatsOnCannotControl(t *testing.T) {
 	s, a, dirs, fake := newFPHealServer(t)
 	fake.setupErr = fmt.Errorf("file provider setup: %w", fileproviderd.ErrCannotControl)
-	wedgeIt(t, s.fp, dirs[1])
+	wedgeIt(t, s, dirs[1])
 	now := time.Unix(0, 0)
 
 	healFPStep(t, s, a, now) // attempt 1: Sync
@@ -228,7 +228,7 @@ func TestFPHealReRegisterRetreatsOnCannotControl(t *testing.T) {
 	if kind := kindOf(t, s, 1); kind != "symlink" {
 		t.Fatalf("ErrCannotControl re-register did not retreat to symlink: kind = %q", kind)
 	}
-	if s.fp.wedged(dirs[1]) {
+	if s.fpWedged(dirs[1]) {
 		t.Fatal("retreat must forget the wedge state")
 	}
 }
@@ -245,12 +245,12 @@ func TestHealFPRowsDetectsWedgeThenRecovers(t *testing.T) {
 	swapFPDomainProbe(t, func(_ context.Context, _ string) error { probed++; return overlay.ErrFPProbeWedged })
 
 	s.healFPRows(t.Context()) // strike 1: not wedged yet, no heal
-	if s.fp.wedged(dirs[1]) {
+	if s.fpWedged(dirs[1]) {
 		t.Fatal("one strike must not wedge (2-strike debounce)")
 	}
 	s.healFPRows(t.Context()) // strike 2: wedged + due -> attempt 1 (Sync)
 
-	if !s.fp.wedged(dirs[1]) {
+	if !s.fpWedged(dirs[1]) {
 		t.Fatal("two consecutive wedged probes must mark the domain wedged")
 	}
 	if _, _, syncs, _ := fake.counts(); syncs != 1 {
@@ -263,11 +263,11 @@ func TestHealFPRowsDetectsWedgeThenRecovers(t *testing.T) {
 	// The domain recovers: a healthy probe clears the verdict and the ladder.
 	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return nil })
 	s.healFPRows(t.Context())
-	if s.fp.wedged(dirs[1]) {
+	if s.fpWedged(dirs[1]) {
 		t.Fatal("a healthy probe must clear the wedge verdict")
 	}
-	if s.fp.attemptsSoFar(dirs[1]) != 0 {
-		t.Fatalf("recovery must reset the ladder: attemptsSoFar=%d, want 0", s.fp.attemptsSoFar(dirs[1]))
+	if s.fpAttemptsSoFar(dirs[1]) != 0 {
+		t.Fatalf("recovery must reset the ladder: attemptsSoFar=%d, want 0", s.fpAttemptsSoFar(dirs[1]))
 	}
 }
 
@@ -308,7 +308,7 @@ func TestHealFPRowsSkipsNonSymlinkDir(t *testing.T) {
 // account, and an explicit request for the wedged account is refused.
 func TestSelectExcludesWedgedFPDomain(t *testing.T) {
 	s, _, dirs, _ := newFPHealServer(t) // acct-1 FP (emptier), acct-2 symlink
-	s.fp.forceWedge(dirs[1])
+	s.fpForceWedge(dirs[1], overlay.ErrFPProbeWedged)
 
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
 	if !resp.OK {
@@ -338,16 +338,16 @@ func TestProbeFPWinnerForceWedges(t *testing.T) {
 	if s.probeWinnerReady(t.Context(), a) {
 		t.Fatal("probeWinnerReady must refuse a domain whose live probe hangs")
 	}
-	if !s.fp.wedged(dirs[1]) {
+	if !s.fpWedged(dirs[1]) {
 		t.Fatal("a single hard select-time probe failure must force-mark the domain wedged")
 	}
 
-	s.fp.reset(dirs[1])
+	s.fpReset(dirs[1])
 	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return nil })
 	if !s.probeWinnerReady(t.Context(), a) {
 		t.Fatal("probeWinnerReady must accept a domain whose live probe succeeds")
 	}
-	if s.fp.wedged(dirs[1]) {
+	if s.fpWedged(dirs[1]) {
 		t.Fatal("a healthy probe must not wedge the domain")
 	}
 }
@@ -363,7 +363,7 @@ func TestProbeFPWinnerNoVerdictStaysReady(t *testing.T) {
 	if !s.probeWinnerReady(t.Context(), a) {
 		t.Fatal("a NoVerdict select-time probe must read ready (never fleet-wedge a select)")
 	}
-	if s.fp.wedged(dirs[1]) {
+	if s.fpWedged(dirs[1]) {
 		t.Fatal("a NoVerdict probe must NOT force-wedge the domain")
 	}
 }
@@ -375,16 +375,16 @@ func TestHealFPRowsNoVerdictSkipsTick(t *testing.T) {
 	s, _, dirs, fake := newFPHealServer(t)
 	s.fpBridgeReadyFn = func() bool { return true }
 	swapFPDirLinked(t, func(string) bool { return true })
-	wedgeIt(t, s.fp, dirs[1]) // already wedged and due
+	wedgeIt(t, s, dirs[1]) // already wedged and due
 	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeNoVerdict })
 
 	s.healFPRows(t.Context())
 
-	if !s.fp.wedged(dirs[1]) {
+	if !s.fpWedged(dirs[1]) {
 		t.Fatal("a NoVerdict tick must not clear an established wedge")
 	}
-	if s.fp.attemptsSoFar(dirs[1]) != 0 {
-		t.Fatalf("a NoVerdict tick must not book a recovery attempt: attemptsSoFar=%d, want 0", s.fp.attemptsSoFar(dirs[1]))
+	if s.fpAttemptsSoFar(dirs[1]) != 0 {
+		t.Fatalf("a NoVerdict tick must not book a recovery attempt: attemptsSoFar=%d, want 0", s.fpAttemptsSoFar(dirs[1]))
 	}
 	if _, setups, syncs, teardowns := fake.counts(); setups != 0 || syncs != 0 || teardowns != 0 {
 		t.Fatalf("a NoVerdict tick must not escalate the ladder: setups=%d syncs=%d teardowns=%d, want 0/0/0", setups, syncs, teardowns)
@@ -397,8 +397,8 @@ func TestHealFPRowsNoVerdictSkipsTick(t *testing.T) {
 func TestReconcileFileProviderBackoffGate(t *testing.T) {
 	t.Run("backing off defers reconcile", func(t *testing.T) {
 		s, a, dirs, fake := newFPHealServer(t)
-		wedgeIt(t, s.fp, dirs[1])
-		s.fp.recordAttempt(dirs[1], time.Now()) // schedules nextDue ~30s out: not due
+		wedgeIt(t, s, dirs[1])
+		s.fpRecordAttempt(dirs[1], time.Now()) // schedules nextDue ~30s out: not due
 
 		if got := s.reconcileFileProvider(t.Context(), a); got != fpDeferred {
 			t.Fatalf("reconcile outcome = %d, want fpDeferred (heal ladder owns the wedged domain)", got)
@@ -410,7 +410,7 @@ func TestReconcileFileProviderBackoffGate(t *testing.T) {
 
 	t.Run("a due domain still reconciles", func(t *testing.T) {
 		s, a, dirs, fake := newFPHealServer(t)
-		wedgeIt(t, s.fp, dirs[1]) // wedged but never attempted -> immediately due
+		wedgeIt(t, s, dirs[1]) // wedged but never attempted -> immediately due
 
 		if got := s.reconcileFileProvider(t.Context(), a); got != fpHealthy {
 			t.Fatalf("reconcile outcome = %d, want fpHealthy (a due domain is not gated)", got)
@@ -428,7 +428,7 @@ func TestReconcileFileProviderBackoffGate(t *testing.T) {
 func TestHealFPMissingRepairsDeregisteredDomain(t *testing.T) {
 	s, a, dirs, fake := newFPHealServer(t)
 	fake.healthErr = errors.New("no domain registered") // control plane broken
-	s.fp.recordAttempt(dirs[1], time.Unix(0, 0))        // a prior attempt the successful repair must clear
+	s.fpRecordAttempt(dirs[1], time.Unix(0, 0))        // a prior attempt the successful repair must clear
 	now := time.Unix(0, 0).Add(time.Hour)               // well past the seeded backoff -> due
 
 	s.healFPMissing(t.Context(), a, now)
@@ -439,8 +439,8 @@ func TestHealFPMissingRepairsDeregisteredDomain(t *testing.T) {
 	if kind := kindOf(t, s, 1); kind != "fileprovider" {
 		t.Fatalf("repaired domain must stay on file provider: kind=%q", kind)
 	}
-	if s.fp.attemptsSoFar(dirs[1]) != 0 {
-		t.Fatalf("a successful repair must reset the ladder: attemptsSoFar=%d, want 0", s.fp.attemptsSoFar(dirs[1]))
+	if s.fpAttemptsSoFar(dirs[1]) != 0 {
+		t.Fatalf("a successful repair must reset the ladder: attemptsSoFar=%d, want 0", s.fpAttemptsSoFar(dirs[1]))
 	}
 }
 
@@ -459,7 +459,7 @@ func TestHealFPMissingCannotControlRetreatsToSymlink(t *testing.T) {
 	if kind := kindOf(t, s, 1); kind != "symlink" {
 		t.Fatalf("ErrCannotControl did not retreat to symlink: kind=%q", kind)
 	}
-	if s.fp.wedged(dirs[1]) {
+	if s.fpWedged(dirs[1]) {
 		t.Fatal("a retreat must forget the ladder state")
 	}
 }
@@ -476,8 +476,8 @@ func TestHealFPMissingHealthyDoesNothing(t *testing.T) {
 	if _, setups, syncs, teardowns := fake.counts(); setups != 0 || syncs != 0 || teardowns != 0 {
 		t.Fatalf("benign Missing must not reconcile: setups=%d syncs=%d teardowns=%d, want 0/0/0", setups, syncs, teardowns)
 	}
-	if s.fp.attemptsSoFar(dirs[1]) != 0 {
-		t.Fatalf("benign Missing must consume no attempt: attemptsSoFar=%d, want 0", s.fp.attemptsSoFar(dirs[1]))
+	if s.fpAttemptsSoFar(dirs[1]) != 0 {
+		t.Fatalf("benign Missing must consume no attempt: attemptsSoFar=%d, want 0", s.fpAttemptsSoFar(dirs[1]))
 	}
 	if kind := kindOf(t, s, 1); kind != "fileprovider" {
 		t.Fatalf("benign Missing must not change the row: kind=%q", kind)
@@ -498,16 +498,16 @@ func TestHealFPMissingBacksOff(t *testing.T) {
 	if _, setups, _, _ := fake.counts(); setups != 1 {
 		t.Fatalf("first Missing-triggered reconcile must run: setups=%d, want 1", setups)
 	}
-	if s.fp.attemptsSoFar(dirs[1]) != 1 {
-		t.Fatalf("first attempt not booked: attemptsSoFar=%d, want 1", s.fp.attemptsSoFar(dirs[1]))
+	if s.fpAttemptsSoFar(dirs[1]) != 1 {
+		t.Fatalf("first attempt not booked: attemptsSoFar=%d, want 1", s.fpAttemptsSoFar(dirs[1]))
 	}
 
 	s.healFPMissing(t.Context(), a, now) // inside the backoff window: must NOT reconcile again
 	if _, setups, _, _ := fake.counts(); setups != 1 {
 		t.Fatalf("second reconcile ran inside the backoff window: setups=%d, want 1", setups)
 	}
-	if s.fp.attemptsSoFar(dirs[1]) != 1 {
-		t.Fatalf("a backoff-skipped tick consumed an attempt: attemptsSoFar=%d, want 1", s.fp.attemptsSoFar(dirs[1]))
+	if s.fpAttemptsSoFar(dirs[1]) != 1 {
+		t.Fatalf("a backoff-skipped tick consumed an attempt: attemptsSoFar=%d, want 1", s.fpAttemptsSoFar(dirs[1]))
 	}
 
 	s.healFPMissing(t.Context(), a, now.Add(fpRecoveryBackoff.Cap+time.Second)) // past the backoff -> resumes
@@ -531,7 +531,7 @@ func TestHealFPRowsMissingRoutesToControlPlaneHeal(t *testing.T) {
 	if _, setups, _, _ := fake.counts(); setups != 1 {
 		t.Fatalf("a Missing probe with a failing Health must reconcile via the control-plane heal: setups=%d, want 1", setups)
 	}
-	if s.fp.wedged(dirs[1]) {
+	if s.fpWedged(dirs[1]) {
 		t.Fatal("a Missing probe must never mark the domain wedged")
 	}
 }

@@ -265,9 +265,7 @@ func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverl
 	}
 	// A conversion remakes the overlay, so any File Provider wedge/recovery state
 	// for this dir is now stale — forget it (the row may be leaving OR entering FP).
-	if s.fp != nil {
-		s.fp.reset(a.ConfigDir)
-	}
+	s.fpReset(a.ConfigDir)
 	// Sync the mount cache now: mountReady would exclude the fresh conversion
 	// until the next poll.
 	if to.IsFuse() {

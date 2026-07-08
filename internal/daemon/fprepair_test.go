@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/fusekit/fileproviderd"
 )
@@ -54,7 +55,7 @@ func TestHandleFPRepairTargetSelection(t *testing.T) {
 
 	t.Run("bulk repair touches only wedged domains", func(t *testing.T) {
 		s, _, dirs, fake := newFPHealServer(t)
-		wedgeIt(t, s.fp, dirs[1])
+		wedgeIt(t, s, dirs[1])
 		resp := s.handleFPRepair(t.Context(), Request{Op: OpFPRepair})
 		if !resp.OK || len(resp.FPRepairs) != 1 || resp.FPRepairs[0].ID != 1 {
 			t.Fatalf("resp = %+v, want exactly the wedged acct-1 repaired", resp)
@@ -65,7 +66,7 @@ func TestHandleFPRepairTargetSelection(t *testing.T) {
 		if _, setups, _, _ := fake.counts(); setups != 1 {
 			t.Fatalf("setups=%d, want 1 (only the wedged domain)", setups)
 		}
-		if s.fp.wedged(dirs[1]) {
+		if s.fpWedged(dirs[1]) {
 			t.Fatal("a clean re-register must reset the wedge state")
 		}
 	})
@@ -88,12 +89,12 @@ func TestHandleFPRepairTargetSelection(t *testing.T) {
 func TestRepairFPDomainOutcomes(t *testing.T) {
 	t.Run("clean re-register repairs and resets state", func(t *testing.T) {
 		s, a, dirs, _ := newFPHealServer(t)
-		wedgeIt(t, s.fp, dirs[1])
+		wedgeIt(t, s, dirs[1])
 		res := s.repairFPDomain(t.Context(), a, false)
 		if res.Outcome != FPRepairRepaired {
 			t.Fatalf("outcome = %q, want repaired", res.Outcome)
 		}
-		if s.fp.wedged(dirs[1]) {
+		if s.fpWedged(dirs[1]) {
 			t.Fatal("repair must reset the wedge verdict")
 		}
 	})
@@ -126,13 +127,13 @@ func TestRepairFPDomainOutcomes(t *testing.T) {
 
 	t.Run("a transient Setup failure is reported failed, not repaired", func(t *testing.T) {
 		s, a, dirs, fake := newFPHealServer(t)
-		s.fp.forceWedge(dirs[1])
+		s.fpForceWedge(dirs[1], overlay.ErrFPProbeWedged)
 		fake.setupErr = fmt.Errorf("register domain: %w", fileproviderd.ErrBusy)
 		res := s.repairFPDomain(t.Context(), a, false)
 		if res.Outcome != FPRepairFailed {
 			t.Fatalf("outcome = %q, want failed on a transient Setup error", res.Outcome)
 		}
-		if !s.fp.wedged(dirs[1]) {
+		if !s.fpWedged(dirs[1]) {
 			t.Fatal("a failed repair must not clear the wedge verdict")
 		}
 		if kindOf(t, s, 1) != "fileprovider" {
@@ -151,7 +152,7 @@ func TestFPRepairRetreatWire(t *testing.T) {
 	t.Run("explicit retreat converts to symlink without re-registering", func(t *testing.T) {
 		s, a, dirs, fake := newFPHealServer(t)
 		s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
-		wedgeIt(t, s.fp, dirs[1])
+		wedgeIt(t, s, dirs[1])
 		one := a.ID
 
 		resp := s.handleFPRepair(t.Context(), Request{Op: OpFPRepair, Account: &one, Retreat: true})
@@ -164,7 +165,7 @@ func TestFPRepairRetreatWire(t *testing.T) {
 		if kindOf(t, s, 1) != "symlink" {
 			t.Fatal("explicit retreat must convert the row to symlink")
 		}
-		if s.fp.wedged(dirs[1]) {
+		if s.fpWedged(dirs[1]) {
 			t.Fatal("a retreat must forget the wedge state")
 		}
 		if _, setups, _, _ := fake.counts(); setups != 0 {
@@ -177,7 +178,7 @@ func TestFPRepairRetreatWire(t *testing.T) {
 		s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 			return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 		}
-		wedgeIt(t, s.fp, dirs[1])
+		wedgeIt(t, s, dirs[1])
 		one := a.ID
 
 		resp := s.handleFPRepair(t.Context(), Request{Op: OpFPRepair, Account: &one, Retreat: true})
@@ -198,7 +199,7 @@ func TestFPRepairRetreatWire(t *testing.T) {
 	t.Run("retreat rides the socket wire", func(t *testing.T) {
 		s, a, dirs, fake := newFPHealServer(t)
 		s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
-		wedgeIt(t, s.fp, dirs[1])
+		wedgeIt(t, s, dirs[1])
 		cl := &Client{socket: serveHandlerOnSocket(t, s)}
 		one := a.ID
 
@@ -250,8 +251,8 @@ func TestHandleStatusSurfacesFPWedged(t *testing.T) {
 		t.Fatalf("FPWedged = %+v on a healthy pool, want none", resp.FPWedged)
 	}
 
-	wedgeIt(t, s.fp, dirs[1])
-	s.fp.recordAttempt(dirs[1], time.Unix(0, 0))
+	wedgeIt(t, s, dirs[1])
+	s.fpRecordAttempt(dirs[1], time.Unix(0, 0))
 	resp := s.handleStatus(t.Context())
 	if len(resp.FPWedged) != 1 {
 		t.Fatalf("FPWedged = %+v, want exactly the wedged acct-1", resp.FPWedged)
@@ -265,16 +266,16 @@ func TestHandleStatusSurfacesFPWedged(t *testing.T) {
 	}
 }
 
-// TestFPWedgedSnapshotReportsBreaker pins that wedgedSnapshot flags a
+// TestFPWedgedSnapshotReportsBreaker pins that fpWedgedSnapshot flags a
 // breaker-parked domain (attempts past fpRecoveryBreaker) and drops a recovered
 // domain entirely.
 func TestFPWedgedSnapshotReportsBreaker(t *testing.T) {
-	fp := newFPState(alwaysNonEmpty)
-	wedgeIt(t, fp, fpTestDir)
+	s := newFPLedgerServer(alwaysNonEmpty)
+	wedgeIt(t, s, fpTestDir)
 	for i := 0; i < fpRecoveryBreaker; i++ {
-		fp.recordAttempt(fpTestDir, time.Unix(0, 0))
+		s.fpRecordAttempt(fpTestDir, time.Unix(0, 0))
 	}
-	snap := fp.wedgedSnapshot()
+	snap := s.fpWedgedSnapshot()
 	if len(snap) != 1 {
 		t.Fatalf("snapshot = %+v, want one wedged domain", snap)
 	}
@@ -282,10 +283,10 @@ func TestFPWedgedSnapshotReportsBreaker(t *testing.T) {
 		t.Fatalf("snapshot[0] = %+v, want tripped with %d attempts", snap[0], fpRecoveryBreaker)
 	}
 
-	if msg := fp.recordProbe(fpTestDir, nil); !strings.Contains(msg, "recovered") {
+	if msg := s.recordFPProbe(fpTestDir, nil); !strings.Contains(msg, "recovered") {
 		t.Fatalf("recovery log = %q, want a recovered line", msg)
 	}
-	if got := fp.wedgedSnapshot(); len(got) != 0 {
+	if got := s.fpWedgedSnapshot(); len(got) != 0 {
 		t.Fatalf("snapshot after recovery = %+v, want empty", got)
 	}
 }

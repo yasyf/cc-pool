@@ -173,11 +173,19 @@ type Server struct {
 	// only the heal goroutine touches it — no lock.
 	rowRetry map[int]rowRetryState
 
-	// fp tracks per-File-Provider-domain data-plane health: a debounced wedge
-	// verdict (the wedge cc-pool's control-plane Health cannot see) plus a
-	// backoff/breaker recovery ladder. Concurrency-safe; nil in bare test servers
-	// that never exercise FP heal, so every reader guards it (fpWedged, healFPRows).
-	fp *fpState
+	// led is the self-heal ledger store shared by every ported family (this phase:
+	// the fp.domain rows). ledMu is the enclosing serialization the ledgers type
+	// documents: FP rows are touched from the heal tick, the select/status/repair
+	// RPC handlers, and migrate/strand, so every s.led access takes ledMu — never
+	// held across Sync/re-register/bounce I/O (bookkeeping in, I/O out).
+	led   *ledgers
+	ledMu sync.Mutex
+
+	// fpSynth reports whether an account's synthetic .claude.json is non-empty, so
+	// the wedge detector strikes a 0-byte served file only for an account that
+	// genuinely has an identity. It doubles as the "FP self-heal wired" marker: nil
+	// in bare test servers, so every FP reader guards on fpEnabled.
+	fpSynth func(dir string) bool
 
 	// fpBridgeReadyFn is a test seam over the FP-bridge-up precondition for probing
 	// FP domains; nil means the real check (consent settled + data socket up).
@@ -220,14 +228,15 @@ func Run(ctx context.Context) error {
 		startedAt:       time.Now(),
 		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
 		cl:              newClaims(),
+		led:             newLedgers(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
 	}
 	// The FP wedge detector strikes a 0-byte served .claude.json only when the
 	// account genuinely has an identity (its synth is non-empty) — resolved through
-	// the same content source the bridge serves.
-	s.fp = newFPState(s.contentSource.SynthNonEmpty)
+	// the same content source the bridge serves. Wiring the seam arms FP self-heal.
+	s.fpSynth = s.contentSource.SynthNonEmpty
 	// The convert gate proves a freshly registered domain serves before flipping the
 	// row, through the SAME bounded control-op probe the heal loop uses — never a
 	// through-domain read. A NoVerdict returns non-nil, so the gate rolls back rather
@@ -488,10 +497,10 @@ func (s *Server) handleStatus(ctx context.Context) Response {
 // wire, joining the fp state's dir-keyed verdicts to account IDs and labels. nil
 // when no domain is wedged or fp state is absent (bare test servers).
 func (s *Server) fpWedgedStates(accts []AccountStatus) []FPDomainState {
-	if s.fp == nil {
+	if !s.fpEnabled() {
 		return nil
 	}
-	wedges := s.fp.wedgedSnapshot()
+	wedges := s.fpWedgedSnapshot()
 	if len(wedges) == 0 {
 		return nil
 	}
@@ -804,10 +813,16 @@ func (s *Server) mountReady(a store.Account) bool {
 	return !overlayMounted(a.ConfigDir)
 }
 
-// fpWedged reports whether dir's File Provider domain is marked wedged; nil-safe
-// so bare test servers (no fp state) read not-wedged.
+// fpWedged reports whether dir's File Provider domain has latched its wedge
+// verdict on the fp.domain ledger; false when FP self-heal is not wired (bare
+// test servers).
 func (s *Server) fpWedged(dir string) bool {
-	return s.fp != nil && s.fp.wedged(dir)
+	if !s.fpEnabled() {
+		return false
+	}
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	return s.led.faulted(fpDomainPolicy, dir)
 }
 
 // probeWinnerReady deep-probes a chosen fuse mirror at select time, reporting
@@ -851,10 +866,10 @@ func (s *Server) probeWinnerReady(ctx context.Context, a store.Account) bool {
 // fp state (bare test servers) reads ready. Bounded to 3s so a slow probe never
 // stalls the pick.
 func (s *Server) probeFPWinnerReady(ctx context.Context, a store.Account) bool {
-	if s.fp == nil {
+	if !s.fpEnabled() {
 		return true
 	}
-	if s.fp.wedged(a.ConfigDir) {
+	if s.fpWedged(a.ConfigDir) {
 		return false // already known wedged (mountReady also excludes it)
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, fpControlProbeTimeout)
@@ -863,12 +878,12 @@ func (s *Server) probeFPWinnerReady(ctx context.Context, a store.Account) bool {
 	switch {
 	case err == nil, errors.Is(err, overlay.ErrFPProbeMissing):
 		return true
-	case errors.Is(err, overlay.ErrFPProbeEmpty) && !s.fp.synthNonEmpty(a.ConfigDir):
+	case errors.Is(err, overlay.ErrFPProbeEmpty) && !s.fpSynth(a.ConfigDir):
 		return true // 0 bytes served for an account with no identity yet
 	case errors.Is(err, overlay.ErrFPProbeNoVerdict):
 		return true // app restart / busy / unreachable — never fleet-wedge a select
 	default:
-		s.fp.forceWedge(a.ConfigDir)
+		s.fpForceWedge(a.ConfigDir, err)
 		s.log.Printf("acct-%02d file provider domain wedged at select (serves control ops but hangs reads); excluding it and letting the heal loop recover it — relaunch once it recovers: %v", a.ID, err)
 		return false
 	}

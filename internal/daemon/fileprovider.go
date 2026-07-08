@@ -144,7 +144,7 @@ func (s *Server) reconcileFileProvider(ctx context.Context, a store.Account) fpO
 	// off between recovery attempts: reconcile's Health+Setup would pile control ops
 	// on a domain the ladder is already recovering — the reconcile storm (defect 3)
 	// this gate removes.
-	if s.fp != nil && s.fp.wedged(dir) && !s.fp.due(dir, time.Now()) {
+	if s.fpWedged(dir) && !s.fpRecoveryDue(dir, time.Now()) {
 		return fpDeferred
 	}
 	healthErr := prov.Health(base, dir)
@@ -203,9 +203,7 @@ func (s *Server) convertFPToSymlinkHeld(ctx context.Context, a store.Account) bo
 		s.log.Printf("acct-%02d file-provider→symlink retreat: %v", a.ID, err)
 		return false
 	}
-	if s.fp != nil {
-		s.fp.reset(a.ConfigDir)
-	}
+	s.fpReset(a.ConfigDir)
 	return true
 }
 
@@ -303,9 +301,7 @@ func (s *Server) repairFPDomain(ctx context.Context, a store.Account, retreat bo
 	}
 	switch serr := prov.Setup(base, dir); {
 	case serr == nil:
-		if s.fp != nil {
-			s.fp.reset(dir)
-		}
+		s.fpReset(dir)
 		s.log.Printf("acct-%02d file provider domain re-registered by `ccp fp repair`; the next probe verifies it — relaunch any sessions on it", fresh.ID)
 		res.Outcome = FPRepairRepaired
 		res.Detail = "re-registered; the next probe verifies it"

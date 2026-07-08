@@ -49,9 +49,7 @@ func (s *Server) convergeSymlinkRowBridge(a store.Account) bool {
 		s.log.Printf("acct-%02d: recreate account dir after retracting the leaked bridge: %v", a.ID, err)
 		return false
 	}
-	if s.fp != nil {
-		s.fp.reset(a.ConfigDir)
-	}
+	s.fpReset(a.ConfigDir)
 	return true
 }
 
@@ -158,7 +156,7 @@ func (s *Server) beginSymlinkHealHeld(ctx context.Context, a store.Account) bool
 // up (the same precondition the FP heal loop guards on). Caller holds the account's
 // poll claim.
 func (s *Server) sweepLeakedFPDomain(ctx context.Context, a store.Account) {
-	if s.fp == nil || !s.fpBridgeReady() {
+	if !s.fpEnabled() || !s.fpBridgeReady() {
 		return
 	}
 	prov := s.overlayFor(fkoverlay.BackendFileProvider)

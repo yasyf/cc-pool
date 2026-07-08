@@ -21,6 +21,148 @@ import (
 // materializing appex parks, and that must read NoVerdict, not a false wedge.
 const fpControlProbeTimeout = 3 * time.Second
 
+// fpDomainPolicy is the File Provider self-heal policy row: a 2-strike wedge
+// debounce, then the backoff-spaced, breaker-capped recovery ladder that parks a
+// domain. Each domain folds onto one ledger row keyed by its account ConfigDir.
+var fpDomainPolicy = policies["fp.domain"]
+
+// fpEnabled reports whether FP self-heal is wired (the synth seam is injected).
+// It replaces the fp-state nil guard: bare test servers leave it off, so every FP
+// reader below is a no-op / healthy default there.
+func (s *Server) fpEnabled() bool { return s.fpSynth != nil }
+
+// fpWedge is a snapshot of one wedged domain's recovery bookkeeping for the
+// status wire: its dir, the recovery attempts spent, and whether the breaker has
+// tripped.
+type fpWedge struct {
+	Dir      string
+	Attempts int
+	Tripped  bool
+}
+
+// recordFPProbe folds one FP data-plane probe outcome for dir into its debounced
+// wedge verdict on the fp.domain ledger, returning a one-shot log line on a wedge
+// or recovery transition. ErrFPProbeNoVerdict and ErrFPProbeMissing never strike
+// (a transient control blip / an identity-less account); ErrFPProbeEmpty strikes
+// only when the synth genuinely has content. A nil outcome clears the verdict and
+// the recovery ladder.
+func (s *Server) recordFPProbe(dir string, err error) (logMsg string) {
+	if !s.fpEnabled() {
+		return ""
+	}
+	// Classify off the ledger lock (the synth seam may read a local file): a
+	// no-verdict, a missing identity file, or a 0-byte read matching an empty synth
+	// neither strikes nor clears — a transient control blip must not un-vouch or
+	// re-vouch a domain.
+	switch {
+	case errors.Is(err, overlay.ErrFPProbeNoVerdict), errors.Is(err, overlay.ErrFPProbeMissing):
+		return ""
+	case errors.Is(err, overlay.ErrFPProbeEmpty) && !s.fpSynth(dir):
+		return ""
+	}
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	if err == nil {
+		if s.led.faulted(fpDomainPolicy, dir) {
+			logMsg = fmt.Sprintf("file provider domain %s: recovered; the domain serves reads again", dir)
+		}
+		s.led.clear(fpDomainPolicy, dir)
+		return logMsg
+	}
+	before := s.led.faulted(fpDomainPolicy, dir)
+	s.led.strike(fpDomainPolicy, dir, time.Now(), err)
+	if !before && s.led.faulted(fpDomainPolicy, dir) {
+		logMsg = fmt.Sprintf("file provider domain %s: %d consecutive probe failures; marking wedged (serves control ops but hangs reads): %v", dir, fpWedgeStrikes, err)
+	}
+	return logMsg
+}
+
+// fpForceWedge latches dir's wedge verdict immediately, bypassing the strike
+// debounce — the select path: a hard data-plane probe failure at select time must
+// exclude the domain now (a launching session has no live reads a false positive
+// could orphan).
+func (s *Server) fpForceWedge(dir string, err error) {
+	if !s.fpEnabled() {
+		return
+	}
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	s.led.forceFault(fpDomainPolicy, dir, time.Now(), err)
+}
+
+// fpRecordAttempt books one recovery attempt against dir's ladder, returning the
+// new attempt count and whether the park breaker (attempts ≥ fpRecoveryBreaker)
+// has now tripped. fp.domain is single-lane, so the attempt kind is ignored and
+// pre-fault attempts (the Missing control-plane heal) never touch the wedge
+// debounce.
+func (s *Server) fpRecordAttempt(dir string, now time.Time) (attempt int, tripped bool) {
+	if !s.fpEnabled() {
+		return 0, false
+	}
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	tripped = s.led.attempt(fpDomainPolicy, dir, attemptPrimary, now)
+	return s.led.peek(fpDomainPolicy, dir).attempts, tripped
+}
+
+// fpAttemptsSoFar reports how many recovery attempts dir has consumed; 0 if the
+// domain is healthy or never attempted. The heal ladder reads it to pick the next
+// step (Sync vs re-register vs breaker).
+func (s *Server) fpAttemptsSoFar(dir string) int {
+	if !s.fpEnabled() {
+		return 0
+	}
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	if l := s.led.peek(fpDomainPolicy, dir); l != nil {
+		return l.attempts
+	}
+	return 0
+}
+
+// fpRecoveryDue reports whether dir's recovery schedule permits another attempt —
+// the breaker has not parked it and any prior attempt's backoff has elapsed —
+// independent of the wedge verdict (the Missing control-plane heal rides the same
+// schedule without the wedge gate). A never-attempted domain is immediately due.
+func (s *Server) fpRecoveryDue(dir string, now time.Time) bool {
+	if !s.fpEnabled() {
+		return false
+	}
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	return s.led.due(fpDomainPolicy, dir, now)
+}
+
+// fpReset drops dir's wedge and recovery state: the domain recovered, was
+// converted off File Provider, or was manually repaired.
+func (s *Server) fpReset(dir string) {
+	if !s.fpEnabled() {
+		return
+	}
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	s.led.clear(fpDomainPolicy, dir)
+}
+
+// fpWedgedSnapshot lists every currently-wedged domain with its recovery attempt
+// count and breaker state, taken under one lock so the status wire sees a
+// consistent view.
+func (s *Server) fpWedgedSnapshot() []fpWedge {
+	if !s.fpEnabled() {
+		return nil
+	}
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	var out []fpWedge
+	for _, snap := range s.led.snapshot() {
+		if snap.Policy != fpDomainPolicy.name || !snap.Faulted {
+			continue
+		}
+		out = append(out, fpWedge{Dir: snap.Resource, Attempts: snap.Attempts, Tripped: snap.Parked})
+	}
+	return out
+}
+
 // fpDomainProbe classifies an account's File Provider domain data-plane verdict
 // through the signed companion app's control op (never a through-domain
 // filesystem read), returning nil (healthy) or one of
@@ -87,7 +229,7 @@ func (s *Server) fpAccounts() ([]store.Account, error) {
 // every domain as wedged), and per-row while a conversion owns the dir or the dir
 // is not its live bridge symlink.
 func (s *Server) healFPRows(ctx context.Context) {
-	if s.fp == nil || !s.fpBridgeReady() {
+	if !s.fpEnabled() || !s.fpBridgeReady() {
 		return
 	}
 	fp, err := s.fpAccounts()
@@ -106,7 +248,7 @@ func (s *Server) healFPRows(ctx context.Context) {
 		probeCtx, cancel := context.WithTimeout(ctx, fpControlProbeTimeout)
 		probeErr := fpDomainProbe(probeCtx, a.ConfigDir)
 		cancel()
-		if msg := s.fp.recordProbe(a.ConfigDir, probeErr); msg != "" {
+		if msg := s.recordFPProbe(a.ConfigDir, probeErr); msg != "" {
 			s.log.Printf("%s", msg)
 		}
 		// A no-verdict tick (app busy/unreachable/too old, or an app restart) is
@@ -123,7 +265,7 @@ func (s *Server) healFPRows(ctx context.Context) {
 			s.healFPMissing(ctx, a, now)
 			continue
 		}
-		if !s.fp.wedged(a.ConfigDir) || !s.fp.due(a.ConfigDir, now) {
+		if !s.fpWedged(a.ConfigDir) || !s.fpRecoveryDue(a.ConfigDir, now) {
 			continue
 		}
 		if !s.cl.hold(a.ID) {
@@ -159,15 +301,15 @@ func (s *Server) healFPMissing(ctx context.Context, a store.Account, now time.Ti
 	if prov.Health(pool.ClaudeDir(), a.ConfigDir) == nil {
 		return // benign: the control plane is healthy, the account just has no identity yet
 	}
-	if !s.fp.recoveryDue(a.ConfigDir, now) {
+	if !s.fpRecoveryDue(a.ConfigDir, now) {
 		return // a prior control-plane repair is still backing off
 	}
 	s.log.Printf("acct-%02d file provider domain serves no .claude.json and its control plane is unhealthy (deregistered externally?); reconciling", a.ID)
 	switch s.reconcileFileProvider(ctx, a) {
 	case fpHealthy, fpRepaired, fpRetreated:
-		s.fp.reset(a.ConfigDir) // control plane repaired (or retreated); clear the ladder
+		s.fpReset(a.ConfigDir) // control plane repaired (or retreated); clear the ladder
 	default: // fpRetry, fpDeferred: keep the attempt booked so the backoff spaces the retry
-		s.fp.recordAttempt(a.ConfigDir, now)
+		s.fpRecordAttempt(a.ConfigDir, now)
 	}
 }
 
@@ -185,12 +327,12 @@ func (s *Server) healFP(ctx context.Context, a store.Account, now time.Time) {
 	dir := a.ConfigDir
 	// Attempt 1 is a non-destructive re-assert (safe under a live reservation), so
 	// it runs directly under the held poll claim.
-	if s.fp.attemptsSoFar(dir) == 0 {
+	if s.fpAttemptsSoFar(dir) == 0 {
 		prov := s.fpProvider(a)
 		if prov == nil {
 			return
 		}
-		s.fp.recordAttempt(dir, now)
+		s.fpRecordAttempt(dir, now)
 		s.log.Printf("acct-%02d file provider domain wedged; recovery attempt 1: re-asserting the overlay (non-destructive) — relaunch any sessions on it", a.ID)
 		if err := prov.Sync(pool.ClaudeDir(), dir); err != nil {
 			s.log.Printf("acct-%02d file provider recovery attempt 1 (sync): %v", a.ID, err)
@@ -211,17 +353,17 @@ func (s *Server) healFP(ctx context.Context, a store.Account, now time.Time) {
 		return
 	}
 	if !fpBackedRow(fresh.OverlayKind) {
-		s.fp.reset(dir) // converted off File Provider in the claim gap
+		s.fpReset(dir) // converted off File Provider in the claim gap
 		return
 	}
-	if !s.fp.wedged(dir) {
+	if !s.fpWedged(dir) {
 		return // recovered between the probe and the claim
 	}
 	prov := s.fpProvider(fresh)
 	if prov == nil {
 		return
 	}
-	attempt, tripped := s.fp.recordAttempt(dir, now)
+	attempt, tripped := s.fpRecordAttempt(dir, now)
 	if tripped {
 		s.breakerFP(ctx, fresh, prov)
 		return

@@ -156,7 +156,7 @@ func TestHealStrandedRowsSweepsLeakedDomains(t *testing.T) {
 	}
 	fp := newFakeStrandFP(filepath.Base(dirs[1]), filepath.Base(dirs[2]))
 	s.m.OverlayFor = fpAndSymlinkOverlay(fp, s.m.OverlaySpec())
-	s.fp = newFPState(alwaysNonEmpty)
+	s.fpSynth = alwaysNonEmpty
 	s.fpBridgeReadyFn = func() bool { return true }
 
 	s.healStrandedRows(t.Context())
@@ -181,7 +181,7 @@ func TestHealStrandedRowsSkipsSweepWhenBridgeDown(t *testing.T) {
 	distinctAccountDirs(t, s, dirs)
 	fp := newFakeStrandFP(filepath.Base(dirs[1]), filepath.Base(dirs[2]))
 	s.m.OverlayFor = fpAndSymlinkOverlay(fp, s.m.OverlaySpec())
-	s.fp = newFPState(alwaysNonEmpty)
+	s.fpSynth = alwaysNonEmpty
 	s.fpBridgeReadyFn = func() bool { return false }
 
 	s.healStrandedRows(t.Context())
@@ -260,7 +260,7 @@ func TestHealStrandedSymlinkRowSkipsRowFlippedToFileProvider(t *testing.T) {
 
 	fp := newFakeStrandFP(filepath.Base(dir))
 	s.m.OverlayFor = fpAndSymlinkOverlay(fp, s.m.OverlaySpec())
-	s.fp = newFPState(alwaysNonEmpty)
+	s.fpSynth = alwaysNonEmpty
 	s.fpBridgeReadyFn = func() bool { return true }
 
 	// The stale snapshot: captured while the row was still symlink.
@@ -306,7 +306,7 @@ func TestHealStrandedRowsSkipsSweepUnderLiveSession(t *testing.T) {
 	distinctAccountDirs(t, s, dirs)
 	fp := newFakeStrandFP(filepath.Base(dirs[1])) // only acct-1 has a leaked domain
 	s.m.OverlayFor = fpAndSymlinkOverlay(fp, s.m.OverlaySpec())
-	s.fp = newFPState(alwaysNonEmpty)
+	s.fpSynth = alwaysNonEmpty
 	s.fpBridgeReadyFn = func() bool { return true }
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil

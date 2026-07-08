@@ -54,6 +54,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		log:             log.New(io.Discard, "", 0),
 		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		cl:              newClaims(),
+		led:             newLedgers(),
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
 		lastAuthAttempt: map[int]time.Time{},
