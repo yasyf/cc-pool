@@ -90,11 +90,10 @@ func scanLocalAccounts(m *pool.Manager) ([]localRow, error) {
 	return out, nil
 }
 
-// localChainStamp reads a's credential without refreshing and stamps its
-// chain: lineage from the stored columns (a drifted cred_hash is the live
-// chain's parent — the same resolution writeCred applies), holder = self. No
-// readable credential is a zero chain — the scan fold's strictly-ahead gates
-// keep a zero chain from ever regressing the registry.
+// localChainStamp stamps a's chain from a refresh-free credential read:
+// lineage from the stored columns (a drifted cred_hash is the live chain's
+// parent, writeCred's resolution), holder = self; no readable credential is a
+// zero chain, which the fold's strictly-ahead gates never adopt — see ccn 10bf17d.
 func localChainStamp(m *pool.Manager, a store.Account, self string, now func() time.Time) (ChainStamp, error) {
 	cred, _, err := m.ReadCredential(a)
 	switch {

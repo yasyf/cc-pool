@@ -15,8 +15,7 @@ import (
 )
 
 // reportSync runs the host-sync doctor section; silent unless sync is enabled.
-// Warnings (warnf) never flip the doctor verdict — mesh reachability is
-// best-effort, and uuid dupes wedge only removals.
+// Warnings (warnf) never flip the doctor verdict.
 func reportSync(ctx context.Context, m *pool.Manager, accts []store.Account, report func(string, bool, string), warnf func(string, string)) error {
 	v, ok, err := m.Store.GetMeta(syncMetaKey)
 	if err != nil {
@@ -32,10 +31,8 @@ func reportSync(ctx context.Context, m *pool.Manager, accts []store.Account, rep
 	return nil
 }
 
-// reportSyncUUIDDupes warns on pool accounts sharing one Claude accountUuid:
-// sync teardown refuses ambiguous uuids by design (a tombstone must never
-// serially destroy every row sharing a uuid — ccn 10bf17d), so a pool-wide
-// removal wedges until the duplicates are resolved.
+// reportSyncUUIDDupes warns on pool accounts sharing one Claude accountUuid —
+// teardown refuses ambiguous uuids, so a pool-wide removal wedges until resolved.
 func reportSyncUUIDDupes(accts []store.Account, byUUID func(string) ([]store.Account, error), report func(string, bool, string), warnf func(string, string)) {
 	seen := make(map[string]bool, len(accts))
 	for _, a := range accts {
@@ -105,9 +102,8 @@ var synckitdLive = func(ctx context.Context) bool {
 	return err == nil && resp.OK
 }
 
-// reportSyncMesh checks the synckit mesh best-effort: an absent or stalled
-// synckitd is a warning, never a doctor failure — notify fan-out and the
-// reconcile tick live there, but single-host operation stays healthy.
+// reportSyncMesh checks the synckit mesh best-effort: every degraded state is
+// a warning, never a doctor failure — single-host operation stays healthy.
 func reportSyncMesh(ctx context.Context, report func(string, bool, string), warnf func(string, string)) {
 	if _, err := synckitdLookPath(); err != nil {
 		warnf("sync mesh", "synckitd is not installed — peer changes cannot propagate; brew install yasyf/tap/synckit")
@@ -130,8 +126,8 @@ func reportSyncMesh(ctx context.Context, report func(string, bool, string), warn
 }
 
 // reportSyncRegistry loads the registry: a corrupt file is loud — the refresh
-// gate reads a load failure as "no entry" and fails open, so every host may
-// refresh this pool's chains (token double-spend) until it is fixed — ccn 10bf17d.
+// gate reads a load failure as "no entry" and fails open, double-spending
+// chains across hosts until fixed — see ccn 10bf17d.
 func reportSyncRegistry(rf hostsync.RegistryFile, report func(string, bool, string)) {
 	reg, err := rf.Load()
 	if err != nil {

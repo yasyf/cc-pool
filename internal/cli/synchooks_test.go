@@ -44,9 +44,8 @@ func mustNoSyncDir(t *testing.T) {
 }
 
 // TestSyncPublishAccount pins the `ccp add`/`ccp login` publish hook: the full
-// AccountValue lands (identity verbatim, lineage-aware chain, holder), the row
-// is uuid-tagged strictly after the publish, tombstones are overridden (the
-// explicit re-add intent), and a disabled pool sees zero registry traffic.
+// AccountValue lands, the row is uuid-tagged strictly after the publish,
+// tombstones are overridden, and a disabled pool sees zero registry traffic.
 func TestSyncPublishAccount(t *testing.T) {
 	future := time.Now().Add(time.Hour).UnixMilli()
 

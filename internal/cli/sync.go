@@ -309,8 +309,8 @@ func syncBackfillUUIDs(out io.Writer, m *pool.Manager) error {
 }
 
 // syncSelf names this host as chain holder: the mesh ssh target when joined
-// (peers dial the holder by that name), else the hostname — the same
-// resolution the daemon applies, so scan and mirror publish one identity.
+// (peers dial the holder by it), else the hostname — the daemon's
+// resolveSyncSelf must resolve identically.
 func syncSelf(out io.Writer, mesh *hostregistry.Registry) string {
 	if mesh.Self != "" {
 		return mesh.Self
@@ -332,9 +332,9 @@ func syncRegistryFile() hostsync.RegistryFile {
 	}
 }
 
-// syncScanPublish folds local accounts into the shared registry via
-// Service.ScanPublish — never PublishAccount: a bulk publish would resurrect
-// peers' removals (see ccn 10bf17d) — then touches the stamps of changed entries.
+// syncScanPublish folds local accounts into the shared registry, then touches
+// the changed stamps. ScanPublish, never PublishAccount — a bulk publish would
+// resurrect peers' removals — see ccn 10bf17d.
 func syncScanPublish(ctx context.Context, m *pool.Manager, self string) (int, error) {
 	rf := syncRegistryFile()
 	svc := &hostsync.Service{
@@ -370,9 +370,8 @@ func syncScanPublish(ctx context.Context, m *pool.Manager, self string) (int, er
 }
 
 // ccpoolManifest is the synckit manifest synckitd drives cc-pool with: fsnotify
-// on the stamp dirs, the typed service contract on the daemon's sync socket,
-// and the rpc-serve stdio bridge for ssh peers. No launchd/helper blocks —
-// cc-pool's daemon owns its own lifecycle.
+// on the stamp dirs, the typed service on the sync socket, the rpc-serve stdio
+// bridge. No launchd/helper blocks — cc-pool's daemon owns its own lifecycle.
 func ccpoolManifest() manifest.Manifest {
 	return manifest.Manifest{
 		Name:   "cc-pool",

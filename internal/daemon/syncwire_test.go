@@ -82,10 +82,9 @@ func wiredService(t *testing.T, s *Server) *hostsync.Service {
 	return svc
 }
 
-// TestSetupSyncWiresEverything pins the amendment-4 wiring: one setupSync call
-// constructs the full engine — gate (mesh-resolved self), heal pull, cred
-// mirror hook, Sessions AND Claims on the service, driver, fetcher — and binds
-// the consumer socket end to end.
+// TestSetupSyncWiresEverything pins that one setupSync call constructs the
+// full engine — gate (mesh-resolved self), heal pull, cred mirror hook,
+// Sessions AND Claims, driver, fetcher — and binds the consumer socket.
 func TestSetupSyncWiresEverything(t *testing.T) {
 	s, ctx := newWireServer(t)
 	writeWireMeshState(t, "host-mesh", []string{"peer-b"})
@@ -288,8 +287,7 @@ func TestServerSessionsBusy(t *testing.T) {
 
 // TestExecPeerRoundTripThroughWiredFetcher proves the exec: peer convention
 // end to end through the PRODUCTION dial path: a second wired daemon serves
-// its registry and credential over its sync socket, and this host's fetcher
-// and credential pull reach it via `exec:nc -U <sock>`.
+// its registry and credential, reached via `exec:nc -U <sock>`.
 func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
 	// Peer B: a fully wired server with one synced account and its credential.
 	b, ctxB := newWireServer(t)

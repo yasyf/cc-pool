@@ -17,9 +17,8 @@ import (
 	"golang.org/x/term"
 )
 
-// finishReloginGrace bounds the post-exit credential re-probe: a user quitting
-// claude within a poll tick of the write must not read as a failed login. A
-// var so tests shrink it.
+// finishReloginGrace bounds the post-exit credential re-probe — claude's exit
+// can beat its credential write; a var so tests shrink it.
 var finishReloginGrace = 2 * time.Second
 
 func newLoginCmd() *cobra.Command {
@@ -62,8 +61,7 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 		return err
 	}
 	if cleared {
-		// The short-circuit's forced refresh is its own liveness proof, so the
-		// post-success tail (hygiene + sync publish) applies here too.
+		// The forced refresh is its own liveness proof: run the same post-success tail.
 		afterRelogin(cmd, m, a)
 		success(out, "%s already has a valid credential — cleared needs-login. Run `ccp login %d` again to switch subscriptions.", accountName(a.Label), a.ID)
 		return nil
@@ -102,9 +100,8 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	return nil
 }
 
-// finishReloginAndPublish gates the sync publish on finishRelogin's
-// fail-closed token-changed check: a login that never landed publishes
-// nothing — a failed relogin must not advertise a stale chain.
+// finishReloginAndPublish gates the sync publish on finishRelogin's fail-closed
+// check: a login that never landed must not advertise a stale chain.
 func finishReloginAndPublish(cmd *cobra.Command, m *pool.Manager, a store.Account, baseline string) error {
 	if err := finishRelogin(cmd.Context(), m, a, baseline); err != nil {
 		return err
@@ -113,16 +110,14 @@ func finishReloginAndPublish(cmd *cobra.Command, m *pool.Manager, a store.Accoun
 	return nil
 }
 
-// afterRelogin is the shared post-success tail. A cross-session re-login
-// (e.g. an SSH login of a Keychain-backed account lands the fresh credential
-// in the file backend) can leave a stale copy on the other backend; resolution
-// already prefers the fresher copy, so that drop is hygiene. Neither it nor
-// the sync publish may fail a completed login.
+// afterRelogin is the shared post-success tail: divergent-copy hygiene plus
+// the sync publish; neither may fail a completed login.
 func afterRelogin(cmd *cobra.Command, m *pool.Manager, a store.Account) {
 	afterReloginIO(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), m, a)
 }
 
-// afterReloginIO is the cmd-free relogin tail shared with the status TUI.
+// afterReloginIO is the cmd-free relogin tail; every re-login path — CLI and
+// status TUI seams alike — must run this publish tail — see ccn 10bf17d.
 func afterReloginIO(ctx context.Context, out, errw io.Writer, m *pool.Manager, a store.Account) {
 	if err := m.DropDivergentCopy(ctx, a); err != nil {
 		note(out, "couldn't remove a stale credential copy on the other backend: %v — run `ccp doctor`.", err)
@@ -149,12 +144,9 @@ func loginCommand(configDir string) (*exec.Cmd, error) {
 // the short-circuit always exercises the refresh chain.
 const forcedRefreshHorizon = time.Duration(math.MaxInt64)
 
-// shortCircuitRelogin clears a stale needs-login flag when a login that already
-// landed left a live credential. Liveness is proven by a forced refresh through
-// the daemon-proven rotate-and-persist path — never by the access token, which
-// can carry hours of life on a revoked refresh chain (the daemon flags on
-// proactive refresh failure). Anything unproven reports false so the
-// interactive login proceeds.
+// shortCircuitRelogin clears a stale needs-login flag only when a forced
+// refresh proves the chain live — an unexpired access token proves nothing on
+// a revoked refresh chain. Anything unproven reports false so the login proceeds.
 func shortCircuitRelogin(ctx context.Context, m *pool.Manager, a store.Account) (bool, error) {
 	h, err := m.Store.GetAuthHealth(a.ID)
 	if err != nil {
@@ -163,9 +155,7 @@ func shortCircuitRelogin(ctx context.Context, m *pool.Manager, a store.Account) 
 	if !h.NeedsLogin {
 		return false, nil
 	}
-	// No AdoptRotatedToken here: the refresh's own persist already wrote the
-	// credential under our ACL — only claude-written credentials (via /login)
-	// need re-asserting.
+	// No AdoptRotatedToken: the refresh's own persist already wrote under our ACL.
 	_, refreshed, err := m.EnsureFreshToken(ctx, a, forcedRefreshHorizon, true)
 	if err != nil || !refreshed {
 		return false, nil
@@ -176,12 +166,10 @@ func shortCircuitRelogin(ctx context.Context, m *pool.Manager, a store.Account) 
 	return true, nil
 }
 
-// awaitFreshCred re-probes read until a usable credential differing from the
-// pre-login baseline lands or grace expires — claude's exit can beat its
-// credential write by a poll tick, and the pre-login credential can look
-// usable while that write is still in flight. An ErrUnavailable read is
-// unknown state and fails immediately; after the deadline the last read is
-// returned as-is for the caller to judge.
+// awaitFreshCred re-probes read until a usable credential differing from
+// baseline lands or grace expires — claude's exit can beat its credential
+// write. ErrUnavailable fails immediately; at the deadline the last read
+// returns as-is for the caller to judge.
 func awaitFreshCred(ctx context.Context, read credReader, baseline string, grace, interval time.Duration) (*creds.Credential, error) {
 	deadline := time.Now().Add(grace)
 	for {
@@ -205,10 +193,7 @@ func awaitFreshCred(ctx context.Context, read credReader, baseline string, grace
 
 func finishRelogin(ctx context.Context, m *pool.Manager, a store.Account, baseline string) error {
 	// Fail closed: an unusable or baseline-unchanged credential means the login
-	// didn't land — quitting claude without logging in must not report success,
-	// nor clear a correct needs-login flag off a dead chain. A read failure
-	// keeps its cause: an unsearchable Keychain (creds.ErrUnavailable) is
-	// unknown state, not a failed login.
+	// didn't land. ErrUnavailable keeps its cause — unknown state, not a failed login.
 	read := func() (*creds.Credential, error) {
 		cred, _, err := m.ReadCredential(a)
 		return cred, err
@@ -236,18 +221,13 @@ func finishRelogin(ctx context.Context, m *pool.Manager, a store.Account, baseli
 type credReader func() (*creds.Credential, error)
 
 // newReloginProbe fires when a fresh, usable credential's access token differs
-// from the baseline read just before claude started — the re-login completion
-// signal.
-//
-// SAFETY: no identity gate (unlike newIdentityProbe) is needed — claude adopts
-// the global credential only into a FRESH CLAUDE_CONFIG_DIR, so a re-login dir's
-// only credential change is the user's own login.
+// from the pre-login baseline. No identity gate (unlike newIdentityProbe):
+// claude adopts the global credential only into a FRESH CLAUDE_CONFIG_DIR.
 func newReloginProbe(read credReader, baseline string) func() (bool, error) {
 	return func() (bool, error) {
 		cred, err := read()
 		if err != nil {
-			// A transient backend-read failure (security(1) hiccup, locked keychain, not
-			// yet written) is not a signal — keep waiting; the interactive user bounds the wait.
+			// A transient backend-read failure is not a signal — keep waiting.
 			return false, nil
 		}
 		return cred.HasRefreshToken() && !cred.Expired() &&

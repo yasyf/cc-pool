@@ -14,9 +14,8 @@ import (
 )
 
 // serverSessions answers the hostsync Sessions seam from daemon truth: a live
-// procscan session, a live select reservation, or an in-flight overlay
-// conversion on any row sharing the uuid reads busy. Errors propagate so the
-// teardown's fail-closed contract holds.
+// session, select reservation, or in-flight conversion on any row sharing the
+// uuid reads busy; errors propagate — teardown fails closed — see ccn 10bf17d.
 type serverSessions struct{ s *Server }
 
 // Busy implements hostsync.Sessions.
@@ -48,11 +47,10 @@ func (ss serverSessions) Busy(ctx context.Context, uuid string) (bool, string, e
 
 var _ hostsync.Sessions = serverSessions{}
 
-// setupSync constructs the host-sync engine and wires it onto the daemon:
-// registry service, converge driver, refresh gate, heal pull, cred mirror, and
-// the consumer socket. Always constructed; every acting path re-reads the
-// sync_enabled meta so `ccp sync enable` needs no daemon restart. Must run
-// before serve spawns any worker or handler — they read s.sync unlocked.
+// setupSync constructs the host-sync engine and wires it onto the daemon.
+// Always constructed — every acting path re-reads the sync_enabled meta, so
+// enable needs no daemon restart — and it must run before serve spawns any
+// worker or handler: they read s.sync unlocked.
 func (s *Server) setupSync(ctx context.Context) error {
 	if s.syncSocket == "" {
 		return fmt.Errorf("no sync socket path configured")

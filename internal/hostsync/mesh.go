@@ -8,11 +8,9 @@ import (
 	"github.com/yasyf/synckit/hostregistry"
 )
 
-// SynckitMesh resolves the host mesh from the shared synckit host registry
-// (state.json under the synckit config dir): self is this host's ssh target —
-// the name peers dial, so it doubles as the chain-holder identity — and peers
-// are the other registered hosts. An unjoined host is a hard error, never an
-// empty mesh that silently syncs nothing.
+// SynckitMesh resolves the mesh from the shared synckit host registry: self is
+// this host's ssh target — the name peers dial, so it doubles as the chain-holder
+// identity. An unjoined host is a hard error, never an empty mesh.
 type SynckitMesh struct{}
 
 // Resolve implements Mesh from the shared synckit host registry.

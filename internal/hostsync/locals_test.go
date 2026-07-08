@@ -76,9 +76,9 @@ func credWith(access, refresh string, expiresAt int64) *creds.Credential {
 	return c
 }
 
-// TestManagerLocalsCarriesLineage pins the amendment-9 contract: identity from
-// the private .claude.json, Chain.Hash/ExpiresAt from a read-only credential
-// read, Chain.ParentHash from the stored lineage columns, holder = self.
+// TestManagerLocalsCarriesLineage pins ManagerLocals: identity from the private
+// .claude.json, Chain.Hash/ExpiresAt from a read-only credential read,
+// Chain.ParentHash from the stored lineage columns, holder = self.
 func TestManagerLocalsCarriesLineage(t *testing.T) {
 	fixed := time.Now()
 	now := func() time.Time { return fixed }

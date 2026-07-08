@@ -88,10 +88,9 @@ func TestNewReloginProbe(t *testing.T) {
 	}
 }
 
-// TestFinishRelogin pins that the post-login credential gate resolves through
-// m.ReadCredential — both backends in resolution order — so a headless session
-// surfaces the Keychain's unknown state (creds.ErrUnavailable) instead of a
-// bogus not-found, and only a usable credential clears the needs-login flag.
+// TestFinishRelogin pins the post-login gate resolving through m.ReadCredential
+// — both backends in order — so a headless session surfaces the Keychain's
+// unknown state, and only a usable credential clears the needs-login flag.
 func TestFinishRelogin(t *testing.T) {
 	// Zero grace = the pre-grace single-read semantics; the grace loop itself
 	// is covered by TestAwaitFreshCred.
@@ -218,9 +217,8 @@ func TestFinishRelogin(t *testing.T) {
 }
 
 // TestAwaitFreshCred: the post-exit read tolerates the claude-exit/credential-
-// write race for the grace window — including a pre-login credential that
-// still looks usable while the fresh write is in flight — but unknown Keychain
-// state and cancellation abort immediately.
+// write race for the grace window, but unknown Keychain state and cancellation
+// abort immediately.
 func TestAwaitFreshCred(t *testing.T) {
 	future := time.Now().Add(time.Hour).UnixMilli()
 
@@ -334,9 +332,8 @@ func (f *fakeOAuth) Usage(context.Context, string) (*oauth.Usage, error) {
 }
 
 // TestShortCircuitRelogin: only a store-flagged account whose refresh chain
-// survives a forced rotate-and-persist clears without a login. Access-token
-// life proves nothing — the daemon flags on proactive refresh failure, so an
-// unexpired token can sit on a dead chain.
+// survives a forced rotate-and-persist clears without a login — access-token
+// life proves nothing on a chain the daemon already proved dead.
 func TestShortCircuitRelogin(t *testing.T) {
 	future := time.Now().Add(time.Hour).UnixMilli()
 	past := time.Now().Add(-time.Hour).UnixMilli()
@@ -435,9 +432,8 @@ func TestShortCircuitRelogin(t *testing.T) {
 }
 
 // TestFinishReloginAndPublish pins the relogin sync hook to the fail-closed
-// token-changed discipline: only a landed login (credential differing from the
-// pre-login baseline) publishes to the shared registry; a login that never
-// landed generates zero registry traffic.
+// discipline: only a landed login publishes to the shared registry; one that
+// never landed generates zero registry traffic.
 func TestFinishReloginAndPublish(t *testing.T) {
 	old := finishReloginGrace
 	finishReloginGrace = 0

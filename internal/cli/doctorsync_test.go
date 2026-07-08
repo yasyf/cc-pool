@@ -108,9 +108,8 @@ func TestReportSyncGatedOnEnabled(t *testing.T) {
 }
 
 // TestReportSyncUUIDDupes pins the ambiguous-uuid scan: one AccountsByUUID
-// query per distinct non-empty uuid, a warning naming every duplicate row
-// (teardown refuses ambiguous uuids by design, so removals wedge), and a
-// loud failure on a store error.
+// query per distinct non-empty uuid, a warning naming every duplicate row,
+// and a loud failure on a store error.
 func TestReportSyncUUIDDupes(t *testing.T) {
 	acct := func(id int, uuid string) store.Account {
 		return store.Account{ID: id, AccountUUID: uuid}
@@ -386,8 +385,7 @@ func TestReportSyncMesh(t *testing.T) {
 
 // TestReportSyncRegistry pins the registry load-health check: absent reads as
 // a fresh empty pool, tombstones are excluded from the healthy count, and a
-// corrupt file is a loud failure explaining the chronic fail-open refresh
-// gate (ccn 10bf17d).
+// corrupt file is a loud failure explaining the fail-open refresh gate.
 func TestReportSyncRegistry(t *testing.T) {
 	tempRF := func(t *testing.T) hostsync.RegistryFile {
 		t.Helper()

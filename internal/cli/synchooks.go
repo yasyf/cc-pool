@@ -36,9 +36,8 @@ func lifecycleSyncService(m *pool.Manager) *hostsync.Service {
 	}
 }
 
-// syncHookSelf resolves this host's holder identity for a lifecycle publish:
-// the mesh self, else the hostname — the same resolution `ccp sync enable`
-// applies (syncSelf), so every publish path names one identity.
+// syncHookSelf resolves this host's holder identity for a lifecycle publish —
+// the same resolution `ccp sync enable` applies (syncSelf).
 func syncHookSelf(w io.Writer) string {
 	mesh, err := hostregistry.Mesh.Load()
 	if err != nil {
@@ -48,9 +47,8 @@ func syncHookSelf(w io.Writer) string {
 	return syncSelf(w, mesh)
 }
 
-// syncNudge best-effort asks synckitd to re-read cc-pool's manifest so a new
-// account's stamp dir gets watched; a failure warns — the reconcile tick still
-// propagates the change.
+// syncNudge best-effort asks synckitd to re-watch a new account's stamp dir; a
+// failure warns — the reconcile tick still propagates the change.
 func syncNudge(ctx context.Context, w io.Writer) {
 	path, err := hostsync.ManifestPath()
 	if err != nil {
@@ -63,7 +61,7 @@ func syncNudge(ctx context.Context, w io.Writer) {
 }
 
 // accountSyncUUID resolves a's registry key: the tagged row uuid, else the
-// on-disk identity — which is why removal hooks run before any teardown.
+// on-disk identity.
 func accountSyncUUID(a store.Account) string {
 	if a.AccountUUID != "" {
 		return a.AccountUUID
@@ -188,10 +186,9 @@ func syncPublishAccountIO(ctx context.Context, errw io.Writer, m *pool.Manager, 
 	return nil
 }
 
-// syncRecordRemoval tombstones account id pool-wide. It runs BEFORE the local
-// teardown: the identity is still readable, and a peer converging mid-removal
-// sees the tombstone, not a live entry it would re-materialize. A recording
-// failure aborts the removal; --keep-credential still tombstones.
+// syncRecordRemoval tombstones account id pool-wide, BEFORE the local teardown
+// (the identity is still readable; a peer converging mid-removal sees the
+// tombstone). A recording failure aborts the removal — see ccn 10bf17d.
 func syncRecordRemoval(cmd *cobra.Command, m *pool.Manager, id int) error {
 	on, err := syncHooksEnabled(m)
 	if err != nil || !on {
