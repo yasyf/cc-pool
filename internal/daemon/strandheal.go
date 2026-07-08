@@ -60,27 +60,13 @@ func (s *Server) convergeSymlinkRowBridge(a store.Account) bool {
 // File Provider domain still registered against a symlink row, deregistering the
 // leaks retractFileProviderIfLaid's old real-dir arm and pre-fix retreats left
 // behind (this clears yasyf-home's leaked domains automatically once it is back).
-func (s *Server) healStrandedRows(ctx context.Context) {
-	accts, err := s.m.Store.ListAccounts()
-	if err != nil {
-		s.log.Printf("stranded-row heal: list accounts: %v", err)
-		return
-	}
-	for _, a := range accts {
-		if ctx.Err() != nil {
-			return
-		}
-		// Fuse and File Provider rows keep their private root in active use and
-		// reconcile through their own arms; only a symlink row can strand.
-		if fpBackedRow(a.OverlayKind) || fuseBackedRow(a.OverlayKind) {
-			continue
-		}
-		if !s.cl.hold(a.ID) {
-			continue // the scheduler or a conversion owns this dir this tick
-		}
-		s.healStrandedSymlinkRow(ctx, a)
-		s.cl.disownHold(a.ID)
-	}
+func (s *Server) healStrandedRows(ctx context.Context, t *tick) {
+	// claim=true: forEach yields only symlink rows (fuse/FP rows keep their private
+	// root in active use and reconcile through their own arms) and wraps each in the
+	// poll claim — skip-don't-race if the scheduler or a conversion owns the dir.
+	s.forEach(ctx, symlinkRows, true, func(a store.Account) {
+		s.healStrandedSymlinkRow(ctx, t, a)
+	})
 }
 
 // healStrandedSymlinkRow gives one symlink row the crash-window treatment (retract
@@ -93,7 +79,7 @@ func (s *Server) healStrandedRows(ctx context.Context) {
 // destructive retract/sweep. The heal then runs only under the convert claim and
 // with no live session on the dir (beginSymlinkHealHeld), since beginPoll does not
 // hide the dir from a select landing on the crash-window bridge.
-func (s *Server) healStrandedSymlinkRow(ctx context.Context, a store.Account) {
+func (s *Server) healStrandedSymlinkRow(ctx context.Context, t *tick, a store.Account) {
 	fresh, err := s.m.Store.GetAccount(a.ID)
 	if err != nil {
 		s.log.Printf("acct-%02d stranded-row heal: re-read row: %v", a.ID, err)
@@ -102,7 +88,7 @@ func (s *Server) healStrandedSymlinkRow(ctx context.Context, a store.Account) {
 	if fpBackedRow(fresh.OverlayKind) || fuseBackedRow(fresh.OverlayKind) {
 		return // converted off symlink under the aging listing; its dir is a legit bridge/mount
 	}
-	if !s.beginSymlinkHealHeld(ctx, fresh) {
+	if !s.beginSymlinkHealHeld(t, fresh) {
 		return
 	}
 	defer s.cl.disownConvert(fresh.ID)
@@ -131,14 +117,19 @@ func (s *Server) healStrandedSymlinkRow(ctx context.Context, a store.Account) {
 // convertFPToSymlinkHeld uses. Caller holds the account's poll claim. Returns true
 // with the convert claim HELD (caller must endConvert); false, claim released, to
 // skip this tick — a pending select, a live session, or a scan failure (which
-// cannot rule a session out).
-func (s *Server) beginSymlinkHealHeld(ctx context.Context, a store.Account) bool {
+// cannot rule a session out). Live-session liveness reads the shared heal tick,
+// whose scan-fail-means-busy rule (tick.idle) defers exactly as the old
+// liveSessionGate did; a stranded symlink row carries no NFS mount, so the tick's
+// pass-shared scan (vs a per-call fresh one) never risks the force-unmount panic
+// liveSessionGate guards, and the ownHeld/reserve gate remains the primary race
+// close.
+func (s *Server) beginSymlinkHealHeld(t *tick, a store.Account) bool {
 	if !s.cl.ownHeld(a.ID) {
 		s.log.Printf("acct-%02d deferring stranded-bridge heal: reserved by a pending select", a.ID)
 		return false
 	}
-	if busy, n := s.liveSessionGate(ctx, a.ConfigDir); busy {
-		if n > 0 {
+	if !t.idle(a.ConfigDir) {
+		if n := t.sessionCount(a.ConfigDir); n > 0 {
 			s.log.Printf("acct-%02d deferring stranded-bridge heal: %d live session(s)", a.ID, n)
 		}
 		s.cl.disownConvert(a.ID)

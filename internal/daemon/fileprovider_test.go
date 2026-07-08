@@ -668,8 +668,9 @@ func pollOnceAccount(t *testing.T, s *Server, a store.Account) {
 	if !s.cl.hold(a.ID) {
 		t.Fatalf("acct-%02d poll claim refused", a.ID)
 	}
-	// scanOK=true: nil sessions is a clean scan, not a failure.
-	s.pollAccount(t.Context(), nil, a, true, false)
+	// A fresh tick over the server's clean nil-sessions scan seam: scanOK=true,
+	// so the account reads idle.
+	s.pollAccount(t.Context(), s.newTick(t.Context()), a, false)
 }
 
 // TestPollAccountFileProviderSyncAfterAdoption pins the post-adoption nudge: an

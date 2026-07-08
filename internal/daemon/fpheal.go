@@ -232,18 +232,13 @@ func (s *Server) healFPRows(ctx context.Context) {
 	if !s.fpEnabled() || !s.fpBridgeReady() {
 		return
 	}
-	fp, err := s.fpAccounts()
-	if err != nil {
-		s.log.Printf("file provider heal loop: list accounts: %v", err)
-		return
-	}
 	now := time.Now()
-	for _, a := range fp {
-		if ctx.Err() != nil {
-			return
-		}
+	// claim=false: the control-plane probe is a bounded read that runs UNCLAIMED
+	// (claiming first would skip probing a domain the scheduler is concurrently
+	// polling); only the ladder step below takes the poll claim, via claimed.
+	s.forEach(ctx, fpRows, false, func(a store.Account) {
 		if s.cl.held(a.ID) || !fpDirLinked(a.ConfigDir) {
-			continue
+			return
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, fpControlProbeTimeout)
 		probeErr := fpDomainProbe(probeCtx, a.ConfigDir)
@@ -255,7 +250,7 @@ func (s *Server) healFPRows(ctx context.Context) {
 		// neither a strike nor a clear: skip it entirely so a transient control
 		// blip never escalates a previously-wedged domain's ladder.
 		if errors.Is(probeErr, overlay.ErrFPProbeNoVerdict) {
-			continue
+			return
 		}
 		// ENOENT never strikes the wedge ladder (an identity-less account is
 		// benign), so a domain deregistered out from under the daemon — its bridge
@@ -263,17 +258,13 @@ func (s *Server) healFPRows(ctx context.Context) {
 		// control-plane heal tells the two apart and repairs the broken one.
 		if errors.Is(probeErr, overlay.ErrFPProbeMissing) {
 			s.healFPMissing(ctx, a, now)
-			continue
+			return
 		}
 		if !s.fpWedged(a.ConfigDir) || !s.fpRecoveryDue(a.ConfigDir, now) {
-			continue
+			return
 		}
-		if !s.cl.hold(a.ID) {
-			continue // scheduler/reconcile owns the dir this iteration
-		}
-		s.healFP(ctx, a, now)
-		s.cl.disownHold(a.ID)
-	}
+		s.claimed(a, func() { s.healFP(ctx, a, now) })
+	})
 }
 
 // healFPMissing handles an FP row whose data-plane probe returned ENOENT

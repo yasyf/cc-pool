@@ -78,10 +78,11 @@ func newHealServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv) {
 	return s, dirs, fake
 }
 
-// healTick runs one heal pass exactly as the healFuseRows ticker body does.
+// healTick runs the fuse.remount heal pass with a fresh tick, as the healFuseRows
+// ticker body does (the FP/strand/content rows are exercised by their own suites).
 func healTick(ctx context.Context, s *Server) {
 	s.holder.refresh(s.holderClient())
-	s.retryUnvouchedFuseRows(ctx)
+	s.retryUnvouchedFuseRows(ctx, s.newTick(ctx))
 }
 
 // remountRow returns dir's fuse.remount ledger row, nil when absent.

@@ -114,41 +114,43 @@ func (s *Server) scheduler(ctx context.Context) {
 }
 
 func (s *Server) pollOnce(ctx context.Context) {
-	// Every select until the next poll keys fuse readiness on this cache.
-	s.holder.refresh(s.holderClient())
+	s.runTable(ctx, s.newTick(ctx), pollTable)
+}
 
-	// Reconcile only on a successful scan: AlivePIDs always returns a non-nil
-	// map, so a failed scan would close every live session.
-	sessions, err := s.scan(ctx)
-	scanOK := err == nil
-	if err != nil {
-		// Fail closed: a failed scan can't prove any account idle, so this tick
-		// treats every account as busy — no idle refresh, no adopt.
-		s.log.Printf("procscan failed; treating all accounts as busy this tick: %v", err)
-	} else {
-		switch n, err := s.m.Store.CloseDeadSessions(procscan.AlivePIDs(sessions), time.Now()); {
-		case err != nil:
-			s.log.Printf("close dead sessions: %v", err)
-		case n > 0:
-			s.log.Printf("reconciled %d ended session(s)", n)
-		}
+// reconcileDeadSessions closes sessions whose pids are gone — only on a
+// successful scan, since AlivePIDs always returns a non-nil map and a failed scan
+// would close every live session. A failed scan is a no-op (fail closed).
+func (s *Server) reconcileDeadSessions(t *tick) {
+	if !t.scanOK() {
+		return
 	}
+	switch n, err := s.m.Store.CloseDeadSessions(procscan.AlivePIDs(t.sessions()), time.Now()); {
+	case err != nil:
+		s.log.Printf("close dead sessions: %v", err)
+	case n > 0:
+		s.log.Printf("reconciled %d ended session(s)", n)
+	}
+}
 
-	// A cask upgrade replaces the widget bundle but never recycles a live appex,
-	// leaving a frozen render. Reaped every poll, not just at startup: a formula
-	// upgrade can restart the daemon before the cask swap lands.
-	s.reconcileStaleWidget(ctx)
-
-	// Row hygiene only: StickyPick re-checks the activity rule on read (covers
-	// the daemonless path).
+// pruneStickyRows drops expired sticky-pin rows (hygiene only: StickyPick
+// re-checks the activity rule on read, covering the daemonless path).
+func (s *Server) pruneStickyRows() {
 	if _, err := s.m.Store.PruneSticky(time.Now().Add(-pool.StickyTTL)); err != nil {
 		s.log.Printf("prune sticky: %v", err)
 	}
+}
 
+// pollAccounts is the per-account sweep (the account.poll row). It reports whether
+// the poll completed cleanly so a status snapshot should be written: false on
+// every skip-the-snapshot condition (ctx cancellation, list-accounts failure, a
+// still-down outage canary, or entering/re-entering outage) — each was a bare
+// return in the old pollOnce, and the status.snapshot row is the last poll row, so
+// stopping the table there is exactly the old snapshot skip.
+func (s *Server) pollAccounts(ctx context.Context, t *tick) bool {
 	accts, err := s.m.Store.ListAccounts()
 	if err != nil {
 		s.log.Printf("list accounts: %v", err)
-		return
+		return false
 	}
 
 	// While a network outage is in effect, poll only a single canary — the first
@@ -165,7 +167,7 @@ func (s *Server) pollOnce(ctx context.Context) {
 	var attempts, netFails, sampled int
 	for _, a := range accts {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		// A 429 anywhere gates the rest of the sweep (shared-IP /usage bucket); the
 		// outage canary is exempt — a 429 still proves reachability.
@@ -186,11 +188,11 @@ func (s *Server) pollOnce(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				s.cl.disownHold(a.ID)
-				return
+				return false
 			case <-time.After(spacing):
 			}
 		}
-		outcome := s.pollAccount(ctx, sessions, a, scanOK, recovery || canary)
+		outcome := s.pollAccount(ctx, t, a, recovery || canary)
 		s.cl.disownHold(a.ID)
 		sampled++
 
@@ -198,7 +200,7 @@ func (s *Server) pollOnce(ctx context.Context) {
 			if outcome == outcomeNetwork {
 				// Still down: one cheap failing request this short tick. Leave the
 				// snapshot stale (polling is broken) and wait for the next canary.
-				return
+				return false
 			}
 			// Connectivity returned: leave outage mode and heal the whole fleet in
 			// this same sweep. The canary is already sampled; the loop continues
@@ -238,12 +240,7 @@ func (s *Server) pollOnce(ctx context.Context) {
 	// Deliberately skipped while polling is broken (an outage or an early return
 	// above): generated_at means "time of the last completed poll" and must go
 	// stale when the fleet cannot be reached.
-	if s.netOutage {
-		return
-	}
-	if err := s.writeStatusSnapshot(ctx); err != nil {
-		s.log.Printf("status snapshot: %v", err)
-	}
+	return !s.netOutage
 }
 
 // poolRateLimited reports whether the pool-wide 429 gate is still inside its
@@ -304,7 +301,7 @@ func (s *Server) authThrottled(dir string, needsLogin bool) bool {
 // safe because fetchUsage's deep guard (post-401 + provably-expired +
 // credential-unchanged re-read) still prevents a refresh-token double-spend; the
 // streak gate is only a heuristic layer.
-func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a store.Account, scanOK, recovery bool) sampleOutcome {
+func (s *Server) pollAccount(ctx context.Context, t *tick, a store.Account, recovery bool) sampleOutcome {
 	// Re-assert the overlay so long-lived setups pick up new top-level
 	// ~/.claude entries without an explicit sync.
 	if err := s.m.SyncOverlay(a); err != nil {
@@ -320,9 +317,9 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a
 	}
 
 	// A reserved account's claude may not be procscan-visible yet — treat it as
-	// busy so we don't refresh under the launch. A failed scan also reads busy.
-	idle := scanOK && procscan.CountByConfigDir(sessions, a.ConfigDir) == 0 &&
-		s.cl.reservedCount(a.ID) == 0
+	// busy so we don't refresh under the launch. A failed scan also reads busy
+	// (t.idle is false for every dir when the tick's scan failed).
+	idle := t.idle(a.ConfigDir) && s.cl.reservedCount(a.ID) == 0
 
 	// A just-idled account may carry a token rotated by its session — adopt
 	// before sampling.
@@ -349,7 +346,7 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a
 	// refreshing sooner could double-spend a refresh token it still needs. A
 	// recovery sweep bypasses the streak gate (fetchUsage's deep guard still
 	// holds) so a busy account whose token expired during the outage heals now.
-	busyBySession := procscan.CountByConfigDir(sessions, a.ConfigDir) > 0
+	busyBySession := t.sessionCount(a.ConfigDir) > 0
 	if busyBySession {
 		// A live session keeps this host's lease alive so peers keep penalizing.
 		s.sync.renewWhileBusy(ctx, a)

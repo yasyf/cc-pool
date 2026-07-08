@@ -159,7 +159,7 @@ func TestHealStrandedRowsSweepsLeakedDomains(t *testing.T) {
 	s.fpSynth = alwaysNonEmpty
 	s.fpBridgeReadyFn = func() bool { return true }
 
-	s.healStrandedRows(t.Context())
+	s.healStrandedRows(t.Context(), s.newTick(t.Context()))
 
 	if len(fp.removes) != 1 || fp.removes[0] != dirs[1] {
 		t.Fatalf("leak sweep removes = %v, want exactly [%s] (the symlink row's leaked domain)", fp.removes, dirs[1])
@@ -184,7 +184,7 @@ func TestHealStrandedRowsSkipsSweepWhenBridgeDown(t *testing.T) {
 	s.fpSynth = alwaysNonEmpty
 	s.fpBridgeReadyFn = func() bool { return false }
 
-	s.healStrandedRows(t.Context())
+	s.healStrandedRows(t.Context(), s.newTick(t.Context()))
 
 	if len(fp.removes) != 0 {
 		t.Fatalf("leak sweep ran with the bridge down: removes = %v", fp.removes)
@@ -274,7 +274,7 @@ func TestHealStrandedSymlinkRowSkipsRowFlippedToFileProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.healStrandedSymlinkRow(t.Context(), stale)
+	s.healStrandedSymlinkRow(t.Context(), s.newTick(t.Context()), stale)
 
 	if len(fp.teardowns) != 0 {
 		t.Fatalf("stale symlink snapshot retracted a live fileprovider domain: teardowns = %v", fp.teardowns)
@@ -312,7 +312,7 @@ func TestHealStrandedRowsSkipsSweepUnderLiveSession(t *testing.T) {
 		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 	}
 
-	s.healStrandedRows(t.Context())
+	s.healStrandedRows(t.Context(), s.newTick(t.Context()))
 
 	if len(fp.removes) != 0 {
 		t.Fatalf("leak sweep deregistered a domain under a live session: removes = %v", fp.removes)

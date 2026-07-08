@@ -122,26 +122,21 @@ func (s *Server) healFuseRows(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Refresh first: the ticker outpaces the scheduler poll's cache refresh.
-			s.holder.refresh(s.holderClient())
-			s.retryUnvouchedFuseRows(ctx)
-			// File Provider rows are probed (2-strike debounced) and healed up the
-			// recovery ladder here too — never through retryUnvouchedFuseRows, since
-			// FP is a third backend, not a fuse mount.
-			s.healFPRows(ctx)
-			// Symlink rows carrying crash-window wreckage (a leaked overlay bridge,
-			// stranded private files, or a leaked File Provider domain registration)
-			// converge here, promoting the startup-only reconcile onto the ticker.
-			s.healStrandedRows(ctx)
-			s.logContentHealth()
+			// The heal tick body is the healTable: holder cache first (the ticker
+			// outpaces the poll's refresh), then the fuse/FP/strand self-heal
+			// families, then content-source health. FP rows are probed and healed up
+			// the recovery ladder here too — never through fuse.remount, since FP is
+			// a third backend, not a fuse mount. Strand rows carrying crash-window
+			// wreckage converge here, promoting the startup-only reconcile onto the
+			// ticker.
+			s.runTable(ctx, s.newTick(ctx), healTable)
 		}
 	}
 }
 
+// logContentHealth logs a content-source health transition. The content.health
+// row gates on s.contentSource != nil, so this never runs on a nil source.
 func (s *Server) logContentHealth() {
-	if s.contentSource == nil {
-		return
-	}
 	msg := ""
 	if err := s.contentSource.HealthErrors(); err != nil {
 		msg = err.Error()
@@ -155,35 +150,19 @@ func (s *Server) logContentHealth() {
 }
 
 // retryUnvouchedFuseRows retries every fuse row the holder cache cannot vouch
-// for, under per-row backoff and the scheduler's poll-claim discipline.
-func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
-	fuse, err := s.fuseAccounts()
-	if err != nil {
-		s.log.Printf("heal loop: list accounts: %v", err)
-		return
-	}
-	// A failed scan reads as zero sessions, which skips probing — the cautious
-	// direction.
-	var sessions []procscan.Session
-	if len(fuse) > 0 {
-		ses, serr := s.scan(ctx)
-		if serr != nil {
-			s.log.Printf("heal loop: session scan: %v", serr)
-		}
-		sessions = ses
-	}
+// for, under per-row backoff and the scheduler's poll-claim discipline. Session
+// liveness comes from the shared tick (a failed scan reads as zero sessions,
+// which skips probing — the cautious direction).
+func (s *Server) retryUnvouchedFuseRows(ctx context.Context, t *tick) {
 	now := time.Now()
-	inPass := make(map[string]bool, len(fuse))
-	for _, a := range fuse {
+	inPass := map[string]bool{}
+	completed := s.forEach(ctx, fuseRows, false, func(a store.Account) {
 		inPass[a.ConfigDir] = true
-		if ctx.Err() != nil {
-			return
-		}
 		// Deep-probe in-use vouched mounts only — an idle mount's wedge is
 		// caught at select time (handleSelect). The probe is a bounded read,
 		// so it needs no poll claim.
 		if s.holder.shallowLive(a.ConfigDir) &&
-			procscan.CountByConfigDir(sessions, a.ConfigDir) > 0 &&
+			t.sessionCount(a.ConfigDir) > 0 &&
 			s.holder.dueForDeepProbe(a.ConfigDir, now, deepProbeInterval) &&
 			!s.cl.held(a.ID) {
 			if msg := s.holder.recordDeep(a.ConfigDir, deepProbe(a.ConfigDir)); msg != "" {
@@ -193,65 +172,68 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 		if s.holder.ready(a.ConfigDir) {
 			s.remountClear(a.ConfigDir)
 			s.holder.resetShallowDead(a.ConfigDir)
-			continue
+			return
 		}
 		if !s.remountBackoffElapsed(a.ConfigDir, now) {
-			continue
+			return
 		}
 		// deferShallowDead sits after the backoff gate: a backed-off row must
 		// not spend a Health probe nor re-arm its shallow-dead strikes.
 		if dead, wedged := s.holder.heldDead(a.ConfigDir); dead && !wedged && s.deferShallowDead(a) {
-			continue
+			return
 		}
-		if !s.cl.hold(a.ID) {
-			continue // skip-don't-race; the owner leaves it consistent
-		}
-		fresh, err := s.m.Store.GetAccount(a.ID)
-		switch {
-		case err != nil:
-			s.log.Printf("acct-%02d re-read row before remount: %v", a.ID, err)
-			// Not a mount hazard: back off without a breaker strike.
-			s.remountAttempt(a.ConfigDir, attemptNeutral)
-		case !fuseBackedRow(fresh.OverlayKind):
-			// Converted while the listing aged; no ledger for a non-fuse row.
-			s.remountClear(a.ConfigDir)
-		default:
-			if dead, wedged := s.holder.heldDead(a.ConfigDir); dead {
-				desc := "dead mirror (fails reads outright; unmounted out of band or its fuse worker died?)"
-				if wedged {
-					desc = "wedged mirror (serves metadata but hangs reads)"
-				}
-				n := procscan.CountByConfigDir(sessions, a.ConfigDir)
-				relaunch := ""
-				if n > 0 {
-					relaunch = " — relaunch them"
-				}
-				s.log.Printf("acct-%02d %s; %d live session(s) on it%s", a.ID, desc, n, relaunch)
-			}
-			switch s.healFuse(ctx, fresh) {
-			case healMounted:
-				s.remountClear(a.ConfigDir)
-			case healDeferredBusy, healDeferredUnmitigated:
-				// attemptNeutral, no hazard strike: a busy mount must never reach
-				// the wedged breaker (and the lane reset disarms a mid-countdown
-				// breaker), and an unmitigated holder is a benign wait for the cask
-				// upgrade — the row keeps deferring until `brew upgrade --cask
-				// fusekit-holder` lands, never retreating to symlink.
+		s.claimed(a, func() {
+			fresh, err := s.m.Store.GetAccount(a.ID)
+			switch {
+			case err != nil:
+				s.log.Printf("acct-%02d re-read row before remount: %v", a.ID, err)
+				// Not a mount hazard: back off without a breaker strike.
 				s.remountAttempt(a.ConfigDir, attemptNeutral)
-			case healTCCBlocked:
-				if s.remountAttempt(a.ConfigDir, attemptAlt) {
-					s.escalateTCCBlockedRow(ctx, fresh)
-				}
+			case !fuseBackedRow(fresh.OverlayKind):
+				// Converted while the listing aged; no ledger for a non-fuse row.
+				s.remountClear(a.ConfigDir)
 			default:
-				// healRetry/healFallback: hazard outcomes.
-				if s.remountAttempt(a.ConfigDir, attemptPrimary) {
-					s.escalateWedgedRow(ctx, fresh)
+				if dead, wedged := s.holder.heldDead(a.ConfigDir); dead {
+					desc := "dead mirror (fails reads outright; unmounted out of band or its fuse worker died?)"
+					if wedged {
+						desc = "wedged mirror (serves metadata but hangs reads)"
+					}
+					n := t.sessionCount(a.ConfigDir)
+					relaunch := ""
+					if n > 0 {
+						relaunch = " — relaunch them"
+					}
+					s.log.Printf("acct-%02d %s; %d live session(s) on it%s", a.ID, desc, n, relaunch)
+				}
+				switch s.healFuse(ctx, fresh) {
+				case healMounted:
+					s.remountClear(a.ConfigDir)
+				case healDeferredBusy, healDeferredUnmitigated:
+					// attemptNeutral, no hazard strike: a busy mount must never reach
+					// the wedged breaker (and the lane reset disarms a mid-countdown
+					// breaker), and an unmitigated holder is a benign wait for the cask
+					// upgrade — the row keeps deferring until `brew upgrade --cask
+					// fusekit-holder` lands, never retreating to symlink.
+					s.remountAttempt(a.ConfigDir, attemptNeutral)
+				case healTCCBlocked:
+					if s.remountAttempt(a.ConfigDir, attemptAlt) {
+						s.escalateTCCBlockedRow(ctx, fresh)
+					}
+				default:
+					// healRetry/healFallback: hazard outcomes.
+					if s.remountAttempt(a.ConfigDir, attemptPrimary) {
+						s.escalateWedgedRow(ctx, fresh)
+					}
 				}
 			}
-		}
-		s.cl.disownHold(a.ID)
+		})
+	})
+	// Prune absent rows only after a full pass — a list-accounts failure or a
+	// mid-iteration ctx cancellation leaves inPass partial, and the old loop
+	// returned before pruning in both cases (preserving every row's ledger state).
+	if completed {
+		s.remountPrune(func(dir string) bool { return inPass[dir] })
 	}
-	s.remountPrune(func(dir string) bool { return inPass[dir] })
 }
 
 // deferShallowDead reports whether to defer remounting a holder-reported

@@ -254,6 +254,12 @@ func detectClaudeVersion(ctx context.Context) string {
 	return ""
 }
 
+// detectAndSetUserAgent stamps the OAuth user-agent with the detected claude
+// version (the ua.detect startup row).
+func (s *Server) detectAndSetUserAgent(ctx context.Context) {
+	oauth.SetUserAgentVersion(detectClaudeVersion(ctx))
+}
+
 func (s *Server) serve(ctx context.Context) error {
 	ln, lock, err := s.listen()
 	if err != nil {
@@ -291,30 +297,17 @@ func (s *Server) serve(ctx context.Context) error {
 
 	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
 
-	// One startup goroutine, off the accept path so Health answers from the
-	// first instant, runs strictly in order:
-	//  1. Prime the holder cache: the socket already accepts selects and fuse
-	//     readiness keys on the cache, so a select-vs-prime race would refuse
-	//     every fuse account while the holder serves the mounts fine.
-	//     (mountReady's lazy refresh covers the residual bind→prime gap.)
-	//  2. Detect the claude version — a heavy Node CLI (up to 3s), kept off the
-	//     pre-bind path so a slow probe can't make the daemon look "not
-	//     responding" to a waiting `ccp add`. It only stamps the OAuth UA.
-	//  3. Reconcile overlays before the heal loop and scheduler start: both can
-	//     touch fuse Setup (check-then-act on the same mountpoint), so
-	//     reconcileOverlays must finish first.
+	// One startup goroutine, off the accept path so Health answers from the first
+	// instant, runs the ordered startupTable strictly in order (bridges bind before
+	// any mount/FP enumeration registers; holder.refresh primes the mount cache
+	// before selects key on it — mountReady's lazy refresh covers the residual
+	// bind→prime gap; ua.detect only stamps the OAuth UA off the pre-bind path;
+	// overlays.reconcile finishes before the heal loop and scheduler, which both
+	// touch fuse Setup), then starts the loops.
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		// Bind the content bridge before any mount registers (holderfs.Build
-		// fails a mount if the bridge is unreachable).
-		s.startContentBridge(ctx)
-		// Bind the File Provider bridge before reconcileOverlays: an FP Setup
-		// triggers the extension's first enumeration, which dials this socket.
-		s.startFPBridge(ctx)
-		s.holder.refresh(s.holderClient())
-		oauth.SetUserAgentVersion(detectClaudeVersion(ctx))
-		s.reconcileOverlays(ctx)
+		s.runTable(ctx, s.newTick(ctx), startupTable)
 		// The heal loop is only the per-account mount-health net. The Add(1)
 		// runs inside this already-tracked goroutine, so the counter is ≥1 and
 		// cannot race a zero-counter Wait.
@@ -1297,7 +1290,11 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 		if fpBackedRow(fresh.OverlayKind) || fuseBackedRow(fresh.OverlayKind) {
 			return // converted off symlink under the aging listing; leave it to the fp/fuse arms
 		}
-		if !s.beginSymlinkHealHeld(ctx, fresh) {
+		// A fresh per-account tick, not the startup table's shared one: this
+		// crash-window retract is destructive, so its liveness check must be as
+		// fresh as the old per-call liveSessionGate — one scan per reconciled
+		// account, exactly as before.
+		if !s.beginSymlinkHealHeld(s.newTick(ctx), fresh) {
 			return
 		}
 		defer s.cl.disownConvert(fresh.ID)
