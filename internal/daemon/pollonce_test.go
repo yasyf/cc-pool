@@ -34,7 +34,10 @@ type fakeOAuth struct {
 	refresh5xx bool
 
 	// usageNet makes every Usage return a network-class (oauth.ErrNetwork) error.
-	usageNet bool
+	usageNet   bool
+	usage429   bool            // every Usage returns a 429 UsageError
+	rlByAT     map[string]bool // scope the 429 to specific access tokens
+	retryAfter time.Duration   // Retry-After stamped onto the 429
 	// netByAT overrides the response for a specific access token so a
 	// multi-account sweep can diverge per account; usageByAT counts calls per
 	// access token so a test can assert exactly which accounts were probed.
@@ -80,6 +83,9 @@ func (f *fakeOAuth) Usage(_ context.Context, at string) (*oauth.Usage, error) {
 	f.usageByAT[at]++
 	if f.usageNet || f.netByAT[at] {
 		return nil, netError()
+	}
+	if f.usage429 || f.rlByAT[at] {
+		return nil, &oauth.UsageError{Status: 429, Body: "rate limited", RetryAfter: f.retryAfter}
 	}
 	if f.usage401 {
 		return nil, &oauth.UsageError{Status: 401, Body: `{"type":"error"}`}
@@ -140,6 +146,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
+		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		reservations:    map[int]time.Time{},
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
@@ -162,6 +169,67 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	if got := fo.refreshCount(); got != 1 {
 		t.Fatalf("idle near-expiry account refreshed %d time(s), want 1", got)
 	}
+}
+
+// TestPollOnceFailsClosedOnScanError pins that a failed scan makes pollOnce treat
+// every account as busy (no idle refresh, no adopt); a clean scan still refreshes.
+func TestPollOnceFailsClosedOnScanError(t *testing.T) {
+	setup := func(t *testing.T, scan func(context.Context) ([]procscan.Session, error)) (*Server, *fakeOAuth, *credstest.Fake) {
+		t.Helper()
+		t.Setenv("HOME", t.TempDir())
+		st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		a := store.Account{
+			ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
+			KeychainService: "svc", KeychainAccount: "user",
+		}
+		if err := st.UpsertAccount(a); err != nil {
+			t.Fatal(err)
+		}
+		fk := credstest.NewFake()
+		cred := &creds.Credential{}
+		cred.ClaudeAiOauth.AccessToken = "at-0"
+		cred.ClaudeAiOauth.RefreshToken = "rt-0"
+		cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Minute).UnixMilli() // near-expiry
+		fk.Put(a.KeychainService, a.KeychainAccount, cred)
+		fo := &fakeOAuth{currentRT: "rt-0"}
+		s := &Server{
+			m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+			snapshot:        filepath.Join(t.TempDir(), "status.json"),
+			log:             log.New(io.Discard, "", 0),
+			scanSessions:    scan,
+			reservations:    map[int]time.Time{},
+			rlStreak:        map[int]int{},
+			authStreak:      map[int]int{},
+			lastAuthAttempt: map[int]time.Time{},
+		}
+		return s, fo, fk
+	}
+
+	t.Run("scan error refreshes and adopts nothing", func(t *testing.T) {
+		s, fo, fk := setup(t, func(context.Context) ([]procscan.Session, error) {
+			return nil, fmt.Errorf("procscan: simulated EIO")
+		})
+		before := fk.WriteCount()
+		s.pollOnce(t.Context())
+		if got := fo.refreshCount(); got != 0 {
+			t.Fatalf("scan-failed poll refreshed %d time(s), want 0", got)
+		}
+		if got := fk.WriteCount(); got != before {
+			t.Fatalf("scan-failed poll wrote the credential %d time(s) (adopt must be skipped), want 0", got-before)
+		}
+	})
+
+	t.Run("clean scan refreshes the idle near-expiry account", func(t *testing.T) {
+		s, fo, _ := setup(t, func(context.Context) ([]procscan.Session, error) { return nil, nil })
+		s.pollOnce(t.Context())
+		if got := fo.refreshCount(); got != 1 {
+			t.Fatalf("clean idle poll refreshed %d time(s), want 1", got)
+		}
+	})
 }
 
 // TestPollOnceFlagsAndRecoversNeedsLogin pins that a definitive 401 flags
@@ -193,6 +261,7 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
+		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		reservations:    map[int]time.Time{},
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
@@ -249,6 +318,7 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
+		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		reservations:    map[int]time.Time{},
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},
@@ -310,6 +380,7 @@ func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 		m:               &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
 		snapshot:        filepath.Join(t.TempDir(), "status.json"),
 		log:             log.New(io.Discard, "", 0),
+		scanSessions:    func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		reservations:    map[int]time.Time{},
 		rlStreak:        map[int]int{},
 		authStreak:      map[int]int{},

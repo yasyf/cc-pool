@@ -60,6 +60,9 @@ func ReadFileCredential(configDir string) (*Credential, error) {
 // WriteFileCredential writes cred to configDir's plaintext credential file at
 // 0600, atomically so a concurrent reader never sees a partial file.
 func WriteFileCredential(configDir string, cred *Credential) error {
+	if err := cred.validateForWrite(); err != nil {
+		return err
+	}
 	blob, err := cred.Marshal()
 	if err != nil {
 		return err

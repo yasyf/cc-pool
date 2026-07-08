@@ -19,6 +19,10 @@ const RefreshLeadTime = 10 * time.Minute
 // account must be re-logged-in interactively.
 var ErrNeedsLogin = errors.New("account needs re-login (refresh token missing or revoked)")
 
+// ErrCredentialChangedUnderfoot aborts a write-back when a concurrent writer
+// (usually `claude /login`) minted a newer credential we must not clobber.
+var ErrCredentialChangedUnderfoot = errors.New("stored credential changed under us before write-back")
+
 // EnsureFreshToken returns the account's credential, refreshing it when the access
 // token expires within `within` and allowRefresh is true. allowRefresh must be
 // false for an account with a live session (that session owns refresh).
@@ -73,6 +77,17 @@ func (m *Manager) writeCred(a store.Account, src creds.Source, cred *creds.Crede
 	return nil
 }
 
+// writeCredCAS aborts with ErrCredentialChangedUnderfoot if the backend's access
+// token no longer matches prevAccess (a concurrent writer landed a newer cred);
+// an absent/unreadable backend writes through. Caller must hold the account lock.
+func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prevAccess string, next *creds.Credential) error {
+	s := m.Creds.Store(a, src)
+	if cur, err := s.Read(); err == nil && cur.ClaudeAiOauth.AccessToken != prevAccess {
+		return fmt.Errorf("%w: %s (a concurrent writer owns the newer credential)", ErrCredentialChangedUnderfoot, s)
+	}
+	return m.writeCred(a, src, next)
+}
+
 // ensureFreshToken requires the caller hold the per-account lock and is itself
 // lock-free so SampleUsage composes it with fetchUsage's 401-retry in one critical
 // section (sync.Mutex is not reentrant). Re-reading the credential under the lock lets
@@ -116,7 +131,7 @@ func (m *Manager) refresh(ctx context.Context, a store.Account, src creds.Source
 		next.ClaudeAiOauth.RefreshToken = tr.RefreshToken
 	}
 	next.ClaudeAiOauth.ExpiresAt = tr.Expiry(time.Now()).UnixMilli()
-	if err := m.writeCred(a, src, next); err != nil {
+	if err := m.writeCredCAS(a, src, prev.ClaudeAiOauth.AccessToken, next); err != nil {
 		return nil, err
 	}
 	return next, nil
@@ -124,7 +139,8 @@ func (m *Manager) refresh(ctx context.Context, a store.Account, src creds.Source
 
 // AdoptRotatedToken re-reads an account's credential (a live session may have rotated
 // it) and writes it back to re-assert our `security`-trusted ACL over the rotated
-// Keychain item; on the file backend it is a harmless no-ACL rewrite.
+// Keychain item; on the file backend it is a harmless no-ACL rewrite. The write-back
+// is CAS-guarded against a concurrent `claude /login`.
 func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error {
 	release, err := m.lockAccount(ctx, a.ID)
 	if err != nil {
@@ -135,7 +151,7 @@ func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error 
 	if err != nil {
 		return err
 	}
-	return m.writeCred(a, src, cred)
+	return m.writeCredCAS(a, src, cred.ClaudeAiOauth.AccessToken, cred)
 }
 
 // SampleOpts controls how SampleUsage may recover a 401. AllowRefresh permits the
@@ -148,36 +164,37 @@ type SampleOpts struct {
 }
 
 // SampleUsage fetches the account's usage windows (recovering a 401 per opts),
-// records a usage_sample, and reports whether the account is rate-limited.
-func (m *Manager) SampleUsage(ctx context.Context, a store.Account, opts SampleOpts) (*oauth.Usage, bool, error) {
-	usage, rateLimited, err := m.sampleUsage(ctx, a, opts)
+// records a usage_sample, and reports whether the account is rate-limited along
+// with the server's Retry-After hint from a 429 (0 when absent or not a 429).
+func (m *Manager) SampleUsage(ctx context.Context, a store.Account, opts SampleOpts) (*oauth.Usage, bool, time.Duration, error) {
+	usage, rateLimited, retryAfter, err := m.sampleUsage(ctx, a, opts)
 	if err != nil {
-		return nil, rateLimited, err
+		return nil, rateLimited, retryAfter, err
 	}
 	m.recordSample(a.ID, usage, rateLimited)
-	return usage, rateLimited, nil
+	return usage, rateLimited, retryAfter, nil
 }
 
 // sampleUsage holds acctLock across the whole credential span so the pre-flight refresh
 // and fetchUsage's 401-retry form one atomic cycle; else a peer could rotate the token
 // between them and the retry would re-POST a consumed single-use refresh token.
-func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleOpts) (*oauth.Usage, bool, error) {
+func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleOpts) (*oauth.Usage, bool, time.Duration, error) {
 	release, err := m.lockAccount(ctx, a.ID)
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 	defer release()
 	cred, src, _, freshErr := m.ensureFreshToken(ctx, a, RefreshLeadTime, opts.AllowRefresh)
 	if freshErr != nil && !errors.Is(freshErr, ErrNeedsLogin) && cred == nil {
-		return nil, false, freshErr
+		return nil, false, 0, freshErr
 	}
-	usage, rateLimited, err := m.fetchUsage(ctx, a, src, cred, opts)
+	usage, rateLimited, retryAfter, err := m.fetchUsage(ctx, a, src, cred, opts)
 	// A confirmed pre-flight revocation must not be masked by a usage-endpoint 429 or
 	// transient 401; a clean fetchUsage recovery suppresses it.
 	if errors.Is(freshErr, ErrNeedsLogin) && (err != nil || rateLimited) {
-		return nil, false, freshErr
+		return nil, false, 0, freshErr
 	}
-	return usage, rateLimited, err
+	return usage, rateLimited, retryAfter, err
 }
 
 // sameTokens reports whether both access and refresh tokens match — no session rotated
@@ -190,31 +207,31 @@ func sameTokens(a, b *creds.Credential) bool {
 // fetchUsage fetches usage and, on a 401, walks a recovery ladder: re-read for a
 // session-rotated token, else signed-out (ErrNeedsLogin), else refresh+retry when
 // permitted. Caller must hold the per-account lock.
-func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src creds.Source, cred *creds.Credential, opts SampleOpts) (*oauth.Usage, bool, error) {
+func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src creds.Source, cred *creds.Credential, opts SampleOpts) (*oauth.Usage, bool, time.Duration, error) {
 	usage, err := m.OAuth.Usage(ctx, cred.ClaudeAiOauth.AccessToken)
 	if err == nil {
-		return usage, false, nil
+		return usage, false, 0, nil
 	}
 	var ue *oauth.UsageError
 	if !errors.As(err, &ue) {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 	if ue.RateLimited() {
-		return &oauth.Usage{}, true, nil
+		return &oauth.Usage{}, true, ue.RetryAfter, nil
 	}
 	if !ue.Unauthorized() {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 
 	if reread, _, rerr := m.ReadCredential(a); rerr == nil && reread.ClaudeAiOauth.AccessToken != cred.ClaudeAiOauth.AccessToken {
 		if usage, err2 := m.OAuth.Usage(ctx, reread.ClaudeAiOauth.AccessToken); err2 == nil {
-			return usage, false, nil
+			return usage, false, 0, nil
 		}
 		cred = reread // the rotated token also 401s; refresh from it below
 	}
 
 	if !cred.HasRefreshToken() {
-		return nil, false, fmt.Errorf("%w: %w", ErrNeedsLogin, err)
+		return nil, false, 0, fmt.Errorf("%w: %w", ErrNeedsLogin, err)
 	}
 
 	// A busy account may refresh only under the guard: provably expired and unchanged
@@ -226,7 +243,7 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src creds.Sou
 		}
 	}
 	if !mayRefresh {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 
 	refreshed, rfErr := m.refresh(ctx, a, src, cred)
@@ -237,17 +254,17 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src creds.Sou
 			// Revoked: a differing on-disk credential means a session rotated the chain
 			// (transient); unchanged means genuine server-side revocation.
 			if reread, _, rerr := m.ReadCredential(a); rerr == nil && !sameTokens(reread, cred) {
-				return nil, false, err
+				return nil, false, 0, err
 			}
-			return nil, false, fmt.Errorf("%w: %w", ErrNeedsLogin, rfErr)
+			return nil, false, 0, fmt.Errorf("%w: %w", ErrNeedsLogin, rfErr)
 		}
-		return nil, false, err
+		return nil, false, 0, err
 	}
 	_ = m.Store.LogRefresh(a.ID, true, "")
 	if usage, err2 := m.OAuth.Usage(ctx, refreshed.ClaudeAiOauth.AccessToken); err2 == nil {
-		return usage, false, nil
+		return usage, false, 0, nil
 	}
-	return nil, false, err
+	return nil, false, 0, err
 }
 
 // recordSample persists a usage sample (utilization stored as 0..100 percent).

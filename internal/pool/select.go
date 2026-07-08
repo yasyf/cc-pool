@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -87,7 +88,7 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	sessions, scanErr := scanSessions(ctx) // best-effort; nil sessions on error
 
 	if opts.Live {
-		m.sampleStale(ctx, accts, sessions, opts.FreshFor)
+		m.sampleStale(ctx, accts, sessions, scanErr == nil, opts.FreshFor)
 	}
 
 	now := time.Now()
@@ -156,9 +157,13 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 
 // sampleStale concurrently refreshes usage for accounts staler than freshFor.
 // Accounts with a live session skip the token refresh — that session owns it.
-func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessions []procscan.Session, freshFor time.Duration) {
+// A failed scan (scanOK false) samples usage but refreshes nothing.
+func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessions []procscan.Session, scanOK bool, freshFor time.Duration) {
 	if freshFor <= 0 {
 		freshFor = DefaultFreshFor
+	}
+	if !scanOK {
+		log.Printf("pool: procscan failed; sampling usage without any token refresh this pass")
 	}
 	now := time.Now()
 	var wg sync.WaitGroup
@@ -167,7 +172,7 @@ func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessio
 			continue
 		}
 		a := a
-		allowRefresh := procscan.CountByConfigDir(sessions, a.ConfigDir) == 0
+		allowRefresh := scanOK && procscan.CountByConfigDir(sessions, a.ConfigDir) == 0
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -175,7 +180,7 @@ func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessio
 			defer cancel()
 			// Daemonless path never busy-refreshes: only the daemon owns the
 			// consecutive-401 streak that gates it.
-			_, _, _ = m.SampleUsage(cctx, a, SampleOpts{AllowRefresh: allowRefresh})
+			_, _, _, _ = m.SampleUsage(cctx, a, SampleOpts{AllowRefresh: allowRefresh})
 		}()
 	}
 	wg.Wait()
@@ -231,16 +236,20 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 // PreflightRefresh refreshes the chosen account's token when it expires within
 // RefreshLeadTime and the account is idle. Errors are returned but non-fatal.
 func (m *Manager) PreflightRefresh(ctx context.Context, a store.Account) error {
-	sessions, _ := procscan.Scan(ctx)
-	idle := procscan.CountByConfigDir(sessions, a.ConfigDir) == 0
-	if !idle {
+	sessions, err := scanSessions(ctx)
+	if err != nil {
+		// Fail closed: a failed scan can't prove idle — skip the refresh.
+		log.Printf("acct-%d preflight refresh: procscan failed; skipping refresh: %v", a.ID, err)
 		return nil
 	}
-	_, _, err := m.EnsureFreshToken(ctx, a, RefreshLeadTime, true)
-	if err != nil && !errors.Is(err, ErrNeedsLogin) {
-		return fmt.Errorf("preflight refresh: %w", err)
+	if procscan.CountByConfigDir(sessions, a.ConfigDir) != 0 {
+		return nil
 	}
-	return err
+	_, _, ferr := m.EnsureFreshToken(ctx, a, RefreshLeadTime, true)
+	if ferr != nil && !errors.Is(ferr, ErrNeedsLogin) {
+		return fmt.Errorf("preflight refresh: %w", ferr)
+	}
+	return ferr
 }
 
 // SoonestReset returns the earliest 5h reset across the pool, for `--wait`.

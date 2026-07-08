@@ -265,7 +265,7 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 
 	// Best-effort usage check: a failure returns the added account with the error,
 	// it does not unwind the add.
-	if _, _, err := m.SampleUsage(ctx, acct, SampleOpts{AllowRefresh: true}); err != nil {
+	if _, _, _, err := m.SampleUsage(ctx, acct, SampleOpts{AllowRefresh: true}); err != nil {
 		return &acct, fmt.Errorf("account added but usage validation failed: %w", err)
 	}
 	return &acct, nil

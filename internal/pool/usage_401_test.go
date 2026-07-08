@@ -194,7 +194,7 @@ func TestSampleUsageRevokedNotMaskedByRateLimit(t *testing.T) {
 	}
 	m := &Manager{Store: st, OAuth: fakeOAuthRevoked{}, Creds: kc, LockDir: t.TempDir()}
 
-	_, rateLimited, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
+	_, rateLimited, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
 	if !errors.Is(err, ErrNeedsLogin) {
 		t.Fatalf("err = %v, want ErrNeedsLogin (revocation masked by 429)", err)
 	}
@@ -231,7 +231,7 @@ func TestSampleUsageNetworkErrorPropagates(t *testing.T) {
 	m, a := newManager401(t, kc, newFakeOAuth401("rt-0"))
 	m.OAuth = fakeOAuthNet{}
 
-	_, rateLimited, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
+	_, rateLimited, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
 	if !errors.Is(err, oauth.ErrNetwork) {
 		t.Fatalf("err = %v, want oauth.ErrNetwork", err)
 	}
@@ -261,7 +261,7 @@ func TestFetchUsage401RereadRetriesRotatedToken(t *testing.T) {
 	fo := newFakeOAuth401("rt-9", "at-9") // at-9 valid; at-0 401s
 	m, a := newManager401(t, kc, fo)
 
-	if _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: false}); err != nil {
+	if _, _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: false}); err != nil {
 		t.Fatalf("SampleUsage: %v", err)
 	}
 	if fo.refreshes != 0 {
@@ -277,7 +277,7 @@ func TestSampleUsageClassifiesNeedsLogin(t *testing.T) {
 	fo := newFakeOAuth401("") // nothing valid → at-0 401s
 	m, a := newManager401(t, kc, fo)
 
-	_, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
+	_, _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
 	if !errors.Is(err, ErrNeedsLogin) {
 		t.Fatalf("err = %v, want ErrNeedsLogin", err)
 	}
@@ -342,7 +342,7 @@ func TestSampleUsageBusyRefreshGuard(t *testing.T) {
 			fo := newFakeOAuth401(tc.fakeRT) // at-0 (and at-9) 401; only refreshed tokens become valid
 			m, a := newManager401(t, kc, fo)
 
-			_, _, err := m.SampleUsage(context.Background(), a, tc.opts)
+			_, _, _, err := m.SampleUsage(context.Background(), a, tc.opts)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
 			}

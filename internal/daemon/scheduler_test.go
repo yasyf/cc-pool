@@ -6,13 +6,18 @@ import (
 )
 
 func TestRLBackoffExponentialCapped(t *testing.T) {
+	// Cap raised 15m -> 30m; with a 3m base, clamping now begins at streak 5.
+	if rateLimitBackoffCap != 30*time.Minute {
+		t.Fatalf("rateLimitBackoffCap = %v, want 30m (raised from 15m)", rateLimitBackoffCap)
+	}
 	cases := map[int]time.Duration{
 		0: rateLimitBackoffBase, // streak 0 -> base
 		1: rateLimitBackoffBase, // first 429 -> base
 		2: 6 * time.Minute,      // 3 -> 6
 		3: 12 * time.Minute,     // 6 -> 12
-		4: rateLimitBackoffCap,  // 24 capped to 15
-		9: rateLimitBackoffCap,  // stays capped
+		4: 24 * time.Minute,     // 12 -> 24 (still under the 30m cap)
+		5: 30 * time.Minute,     // 48 capped to 30
+		9: 30 * time.Minute,     // stays capped
 	}
 	for streak, want := range cases {
 		if got := rlBackoff(streak); got != want {

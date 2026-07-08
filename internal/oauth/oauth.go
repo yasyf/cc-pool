@@ -357,6 +357,8 @@ func (re *rawExtraUsage) toExtraUsage() ExtraUsage {
 type UsageError struct {
 	Status int
 	Body   string
+	// RetryAfter is the server's Retry-After hint (0 when absent or unparseable).
+	RetryAfter time.Duration
 }
 
 func (e *UsageError) Error() string {
@@ -389,7 +391,11 @@ func (c *Client) Usage(ctx context.Context, accessToken string) (*Usage, error) 
 	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, &UsageError{Status: resp.StatusCode, Body: truncate(string(raw), 300)}
+		return nil, &UsageError{
+			Status:     resp.StatusCode,
+			Body:       truncate(string(raw), 300),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
 	}
 	// A status line arrived, so a non-200 above is a proven API answer; a read
 	// error only past that point is a transport failure mid-body — classify it
@@ -434,6 +440,27 @@ func (ru *rawUsage) scopedWeekly() []ScopedWindow {
 		out = append(out, ScopedWindow{ModelName: name, Window: w})
 	}
 	return out
+}
+
+// parseRetryAfter parses a Retry-After header (delta-seconds or HTTP-date) as a
+// positive duration from now, returning 0 when absent, malformed, or elapsed.
+func parseRetryAfter(v string, now time.Time) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func truncate(s string, n int) string {

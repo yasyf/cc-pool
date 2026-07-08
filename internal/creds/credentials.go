@@ -2,9 +2,13 @@ package creds
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
+
+// ErrNoAccessToken rejects persisting a credential with an empty accessToken.
+var ErrNoAccessToken = errors.New("refusing to persist a credential with no accessToken")
 
 // OAuth is the inner object Claude stores under "claudeAiOauth". Field and
 // wrapper-key names are reverse-engineered from the binary and MUST match
@@ -54,6 +58,13 @@ func (c *Credential) Marshal() ([]byte, error) {
 		return nil, fmt.Errorf("marshal credential: %w", err)
 	}
 	return b, nil
+}
+
+func (c *Credential) validateForWrite() error {
+	if c.ClaudeAiOauth.AccessToken == "" {
+		return ErrNoAccessToken
+	}
+	return nil
 }
 
 func parseCredential(b []byte) (*Credential, error) {

@@ -39,7 +39,8 @@ const (
 	recoveryAbandonThreshold = 3
 
 	rateLimitBackoffBase = 3 * time.Minute
-	rateLimitBackoffCap  = 15 * time.Minute
+	// Shared-IP /usage 429 penalties run 30+ min; don't re-probe a live 429 bucket.
+	rateLimitBackoffCap = 30 * time.Minute
 
 	needsLoginAfter = 3
 	// Balances per-poll 401 spam against auto-recovery latency after `ccp login`.
@@ -110,8 +111,11 @@ func (s *Server) pollOnce(ctx context.Context) {
 	// Reconcile only on a successful scan: AlivePIDs always returns a non-nil
 	// map, so a failed scan would close every live session.
 	sessions, err := s.scan(ctx)
+	scanOK := err == nil
 	if err != nil {
-		s.log.Printf("procscan: %v", err)
+		// Fail closed: a failed scan can't prove any account idle, so this tick
+		// treats every account as busy — no idle refresh, no adopt.
+		s.log.Printf("procscan failed; treating all accounts as busy this tick: %v", err)
 	} else {
 		switch n, err := s.m.Store.CloseDeadSessions(procscan.AlivePIDs(sessions), time.Now()); {
 		case err != nil:
@@ -154,6 +158,12 @@ func (s *Server) pollOnce(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// A 429 anywhere gates the rest of the sweep (shared-IP /usage bucket); the
+		// outage canary is exempt — a 429 still proves reachability.
+		canary := s.netOutage && !recovery
+		if !canary && s.poolRateLimited() {
+			break
+		}
 		if !s.beginPoll(a.ID) {
 			continue
 		}
@@ -171,8 +181,7 @@ func (s *Server) pollOnce(ctx context.Context) {
 			case <-time.After(spacing):
 			}
 		}
-		canary := s.netOutage && !recovery
-		outcome := s.pollAccount(ctx, sessions, a, recovery || canary)
+		outcome := s.pollAccount(ctx, sessions, a, scanOK, recovery || canary)
 		s.endPoll(a.ID)
 		sampled++
 
@@ -228,6 +237,19 @@ func (s *Server) pollOnce(ctx context.Context) {
 	}
 }
 
+// poolRateLimited reports whether the pool-wide 429 gate is still inside its
+// window: the 429's Retry-After hint if present, else rlBackoff, clamped to the cap.
+func (s *Server) poolRateLimited() bool {
+	if s.rlStreakPool == 0 {
+		return false
+	}
+	window := rlBackoff(s.rlStreakPool)
+	if s.pool429RetryAfter > 0 {
+		window = min(s.pool429RetryAfter, rateLimitBackoffCap)
+	}
+	return time.Since(s.lastPool429) < window
+}
+
 // pollGated reports whether an account is currently backed off — a recent
 // rate-limit sample still inside its exponential backoff, or a needs-login /
 // exhausted-auth-streak account inside the needs-login interval — so pollOnce
@@ -254,7 +276,7 @@ func (s *Server) pollGated(a store.Account) bool {
 // safe because fetchUsage's deep guard (post-401 + provably-expired +
 // credential-unchanged re-read) still prevents a refresh-token double-spend; the
 // streak gate is only a heuristic layer.
-func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a store.Account, recovery bool) sampleOutcome {
+func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a store.Account, scanOK, recovery bool) sampleOutcome {
 	// Re-assert the overlay so long-lived setups pick up new top-level
 	// ~/.claude entries without an explicit sync.
 	if err := s.m.SyncOverlay(a); err != nil {
@@ -269,9 +291,9 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a
 		}
 	}
 
-	// A reserved account's claude may not be procscan-visible yet — treat it
-	// as busy so we don't refresh the token out from under the launch.
-	idle := procscan.CountByConfigDir(sessions, a.ConfigDir) == 0 &&
+	// A reserved account's claude may not be procscan-visible yet — treat it as
+	// busy so we don't refresh under the launch. A failed scan also reads busy.
+	idle := scanOK && procscan.CountByConfigDir(sessions, a.ConfigDir) == 0 &&
 		s.reservedCount(a.ID) == 0
 
 	// A just-idled account may carry a token rotated by its session — adopt
@@ -306,13 +328,19 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, a
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	_, rateLimited, err := s.m.SampleUsage(cctx, a, opts)
+	_, rateLimited, retryAfter, err := s.m.SampleUsage(cctx, a, opts)
 	cancel()
-	// rlStreak is scheduler-goroutine-local — no lock.
+	// rlStreak and the pool gate are scheduler-goroutine-local — no lock. A 429
+	// arms the pool gate (prefers Retry-After over backoff); a clean sample clears it.
 	if rateLimited {
 		s.rlStreak[a.ID]++
+		s.rlStreakPool++
+		s.lastPool429 = time.Now()
+		s.pool429RetryAfter = retryAfter
 	} else if err == nil {
 		s.rlStreak[a.ID] = 0
+		s.rlStreakPool = 0
+		s.pool429RetryAfter = 0
 	}
 	s.handleAuthOutcome(a, err)
 	return classifyOutcome(err)

@@ -108,6 +108,11 @@ type Server struct {
 	// invalidate span, the same window-close as a per-account convert claim.
 	nativeRecovering bool
 	rlStreak         map[int]int // accountID -> consecutive 429 count
+	// Pool-wide 429 gate: /usage rate-limits per shared-IP bucket, so one 429
+	// predicts the rest. Scheduler-goroutine-local — no lock.
+	rlStreakPool      int           // consecutive sweeps that tripped a 429
+	lastPool429       time.Time     // most recent pool 429
+	pool429RetryAfter time.Duration // server Retry-After hint (0 = use rlBackoff)
 	// authStreak counts consecutive unrecovered 401s; at needsLoginAfter the
 	// poll backs off (NOT flagged — only a definitive ErrNeedsLogin flags).
 	// lastAuthAttempt stamps a backed-off or flagged account's last sample so

@@ -109,6 +109,9 @@ func readRaw(service, account string) ([]byte, error) {
 // hex-encoded through -X. -X leaves the value in same-user-ps-visible argv by
 // design (matches claude's trust model), not a leak to eliminate.
 func Write(service, account string, cred *Credential) error {
+	if err := cred.validateForWrite(); err != nil {
+		return err
+	}
 	if account == "" {
 		account = AccountLabel()
 	}
