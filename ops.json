@@ -1,1 +1,1 @@
-{"v":1,"lamport":5,"ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"3013ae2afd737ab1a07a9f7fcecc28b6cb34c090"}]}
+{"v":1,"lamport":6,"ops":[{"kind":"add_comment","body":"Doctor line landed v0.45.0; v0.49.0 (77f03928) adds the plain ccp status fpConsentFooter (approve + brew services restart cc-pool) and the ccp add rung diagnosis that names the consent rung on FP setup failures. TUI excluded by the footers-stay-plain-path convention."}]}
