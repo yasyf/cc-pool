@@ -133,6 +133,13 @@ func (l *ledger) due(p policy, now time.Time) bool {
 	return !l.parked(p) && !now.Before(l.nextDue)
 }
 
+// backoffElapsed reports whether the backoff window since the last attempt has
+// elapsed, ignoring breakers — a breaker whose escalation was deferred (a claim
+// refusal) stays armed to re-fire on its next elapsed window, unlike due.
+func (l *ledger) backoffElapsed(now time.Time) bool {
+	return !now.Before(l.nextDue)
+}
+
 // gateOpen reports whether a gated operation may proceed: the ledger is neither
 // faulted nor parked and its backoff window has elapsed. Rate-limit streaks gate
 // on the backoff window; auth streaks gate on the fault.
@@ -227,6 +234,14 @@ func (ls *ledgers) faulted(p policy, resource string) bool {
 func (ls *ledgers) due(p policy, resource string, now time.Time) bool {
 	l := ls.peek(p, resource)
 	return l == nil || l.due(p, now)
+}
+
+// backoffElapsed reports whether (p, resource)'s backoff window has elapsed,
+// ignoring breakers; see ledger.backoffElapsed. An absent ledger is immediately
+// elapsed.
+func (ls *ledgers) backoffElapsed(p policy, resource string, now time.Time) bool {
+	l := ls.peek(p, resource)
+	return l == nil || l.backoffElapsed(now)
 }
 
 // parked reports whether (p, resource) has tripped a breaker. An absent ledger

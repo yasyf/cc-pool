@@ -403,19 +403,19 @@ func TestRefreshPrunesDepartedVerdicts(t *testing.T) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if _, ok := h.deep[gone]; ok {
+	if h.led.peek(fuseDeepWedgePolicy, gone) != nil {
 		t.Error("refresh kept the departed dir's deep verdict")
 	}
-	if _, ok := h.shallow[gone]; ok {
+	if h.led.peek(fuseShallowDeadPolicy, gone) != nil {
 		t.Error("refresh kept the departed dir's shallow strike")
 	}
 	if _, ok := h.lastProbed[gone]; ok {
 		t.Error("refresh kept the departed dir's probe clock")
 	}
-	if _, ok := h.deep[kept]; !ok {
+	if h.led.peek(fuseDeepWedgePolicy, kept) == nil {
 		t.Error("refresh pruned the still-listed dir's deep verdict")
 	}
-	if _, ok := h.shallow[kept]; !ok {
+	if h.led.peek(fuseShallowDeadPolicy, kept) == nil {
 		t.Error("refresh pruned the still-listed dir's shallow strike")
 	}
 	if _, ok := h.lastProbed[kept]; !ok {

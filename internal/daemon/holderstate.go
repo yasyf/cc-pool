@@ -27,12 +27,13 @@ var deepProbeInterval = 30 * time.Second
 // deepWedgeStrikes and shallowDeadStrikes (the deep-probe wedge and List-liveness
 // remount debounces) live in policies.go — the self-heal policy substrate.
 
-// deepVerdict is one dir's deep-probe state (wedged: serves metadata, hangs
-// bulk reads); guarded by holderState.mu.
-type deepVerdict struct {
-	strikes int
-	wedged  bool
-}
+// fuseDeepWedgePolicy debounces the deep-probe wedged verdict (wedged: serves
+// metadata, hangs bulk reads); fuseShallowDeadPolicy debounces the holder
+// List-liveness remount. Their rows live in holderState.led, keyed by ConfigDir.
+var (
+	fuseDeepWedgePolicy   = policies["fuse.deepwedge"]
+	fuseShallowDeadPolicy = policies["fuse.shallowdead"]
+)
 
 // holderState caches holder truth: reachability, version, per-dir mount
 // liveness. The select path keys fuse readiness on it — an lstat through a
@@ -46,11 +47,13 @@ type holderState struct {
 	// it survives the degraded step (reachable, List failing mid-crash) so the
 	// crash still reads lost-with-mounts once the holder goes unreachable.
 	servedMounts bool
-	// deep is daemon-local, not holder-sourced; it survives refresh (a poll
-	// does not re-probe).
-	deep        map[string]*deepVerdict
+	// led holds the fuse.deepwedge / fuse.shallowdead ledger rows — daemon-local,
+	// not holder-sourced; it survives refresh (a poll does not re-probe). Guarded
+	// by h.mu, never the Server's ledMu: the verdicts reset in atomic lockstep
+	// with the mount cache (refresh, noteMounted/noteUnmounted, holder death) and
+	// fold into the select path's liveness reads.
+	led         *ledgers
 	lastProbed  map[string]time.Time
-	shallow     map[string]int
 	refreshedAt time.Time
 	// tccErr is the latest TCC-blocked mount guidance for status/doctor; any
 	// successful mount clears it — the TCC grant is per holder process.
@@ -103,19 +106,14 @@ func (h *holderState) refresh(c *mountd.Client) {
 }
 
 func (h *holderState) pruneAbsentVerdictsLocked(listed map[string]bool) {
-	for dir := range h.deep {
-		if _, ok := listed[dir]; !ok {
-			delete(h.deep, dir)
-		}
+	keep := func(dir string) bool { _, ok := listed[dir]; return ok }
+	if h.led != nil {
+		h.led.prune(fuseDeepWedgePolicy, keep)
+		h.led.prune(fuseShallowDeadPolicy, keep)
 	}
 	for dir := range h.lastProbed {
 		if _, ok := listed[dir]; !ok {
 			delete(h.lastProbed, dir)
-		}
-	}
-	for dir := range h.shallow {
-		if _, ok := listed[dir]; !ok {
-			delete(h.shallow, dir)
 		}
 	}
 }
@@ -147,7 +145,7 @@ func (h *holderState) markUnhealthy() {
 	h.healthy, h.version, h.mounts, h.refreshedAt = false, "", nil, time.Now()
 	h.servedMounts = false // the sweep is scheduled; one fire per death
 	// A respawned holder starts clean.
-	h.deep, h.lastProbed, h.shallow = nil, nil, nil
+	h.led, h.lastProbed = nil, nil
 	hook := h.onLostWithMounts
 	h.mu.Unlock()
 	if lost && hook != nil {
@@ -166,13 +164,21 @@ func (h *holderState) markDegraded(ver string) {
 	}
 	h.gen++
 	h.healthy, h.version, h.mounts, h.refreshedAt = false, ver, nil, time.Now()
-	h.deep, h.lastProbed, h.shallow = nil, nil, nil
+	h.led, h.lastProbed = nil, nil
 	h.mu.Unlock()
 }
 
+// ledLocked returns the ledger store, allocating on first touch (holderState
+// is used as a zero value); callers hold h.mu.
+func (h *holderState) ledLocked() *ledgers {
+	if h.led == nil {
+		h.led = newLedgers()
+	}
+	return h.led
+}
+
 func (h *holderState) wedgedLocked(dir string) bool {
-	v := h.deep[dir]
-	return v != nil && v.wedged
+	return h.led != nil && h.led.faulted(fuseDeepWedgePolicy, dir)
 }
 
 // ready reports a servable mirror at dir; a deep-wedged mirror stays
@@ -226,26 +232,18 @@ func (h *holderState) recordDeep(dir string, err error) (logMsg string) {
 	if errors.Is(err, overlay.ErrProbeMissing) {
 		return ""
 	}
-	v := h.deep[dir]
-	if v == nil {
-		v = &deepVerdict{}
-		if h.deep == nil {
-			h.deep = map[string]*deepVerdict{}
-		}
-		h.deep[dir] = v
-	}
-	switch err {
-	case nil:
-		if v.wedged {
+	led := h.ledLocked()
+	if err == nil {
+		if led.faulted(fuseDeepWedgePolicy, dir) {
 			logMsg = fmt.Sprintf("deep probe %s: recovered; the mirror reads live again", dir)
 		}
-		v.strikes, v.wedged = 0, false
-	default:
-		v.strikes++
-		if v.strikes == deepWedgeStrikes {
-			v.wedged = true
-			logMsg = fmt.Sprintf("deep probe %s: %d consecutive failures; marking the mirror wedged (serves metadata but hangs bulk reads): %v", dir, v.strikes, err)
-		}
+		led.clear(fuseDeepWedgePolicy, dir)
+		return logMsg
+	}
+	before := led.faulted(fuseDeepWedgePolicy, dir)
+	led.strike(fuseDeepWedgePolicy, dir, time.Now(), err)
+	if !before && led.faulted(fuseDeepWedgePolicy, dir) {
+		logMsg = fmt.Sprintf("deep probe %s: %d consecutive failures; marking the mirror wedged (serves metadata but hangs bulk reads): %v", dir, deepWedgeStrikes, err)
 	}
 	return logMsg
 }
@@ -256,15 +254,7 @@ func (h *holderState) markDeepWedged(dir string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.stampProbedLocked(dir)
-	v := h.deep[dir]
-	if v == nil {
-		v = &deepVerdict{}
-		if h.deep == nil {
-			h.deep = map[string]*deepVerdict{}
-		}
-		h.deep[dir] = v
-	}
-	v.strikes, v.wedged = deepWedgeStrikes, true
+	h.ledLocked().forceFault(fuseDeepWedgePolicy, dir, time.Now(), nil)
 }
 
 // recordShallowDead bumps dir's strike count; callers count only corroborated
@@ -272,17 +262,20 @@ func (h *holderState) markDeepWedged(dir string) {
 func (h *holderState) recordShallowDead(dir string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.shallow == nil {
-		h.shallow = map[string]int{}
+	led := h.ledLocked()
+	led.strike(fuseShallowDeadPolicy, dir, time.Now(), nil)
+	if led.faulted(fuseShallowDeadPolicy, dir) {
+		return shallowDeadStrikes
 	}
-	h.shallow[dir]++
-	return h.shallow[dir]
+	return led.peek(fuseShallowDeadPolicy, dir).strikes
 }
 
 func (h *holderState) resetShallowDead(dir string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	delete(h.shallow, dir)
+	if h.led != nil {
+		h.led.clear(fuseShallowDeadPolicy, dir)
+	}
 }
 
 func (h *holderState) stampProbedLocked(dir string) {
@@ -304,9 +297,7 @@ func (h *holderState) noteMounted(dir string) {
 	}
 	h.mounts[dir] = true
 	h.servedMounts = true
-	delete(h.deep, dir)
-	delete(h.lastProbed, dir)
-	delete(h.shallow, dir)
+	h.clearVerdictsLocked(dir)
 	h.tccErr = ""
 	h.tccBackend = ""
 }
@@ -323,10 +314,18 @@ func (h *holderState) noteUnmounted(dir string) {
 	if h.healthy && len(h.mounts) == 0 {
 		h.servedMounts = false
 	}
-	delete(h.deep, dir)
-	delete(h.lastProbed, dir)
-	delete(h.shallow, dir)
+	h.clearVerdictsLocked(dir)
 	h.mu.Unlock()
+}
+
+// clearVerdictsLocked drops dir's wedge/shallow-dead verdicts and probe clock —
+// a fresh (un)mount resets its self-heal history; callers hold h.mu.
+func (h *holderState) clearVerdictsLocked(dir string) {
+	if h.led != nil {
+		h.led.clear(fuseDeepWedgePolicy, dir)
+		h.led.clear(fuseShallowDeadPolicy, dir)
+	}
+	delete(h.lastProbed, dir)
 }
 
 func (h *holderState) recordTCC(msg string, backend fkoverlay.Backend) {
@@ -349,9 +348,11 @@ func (h *holderState) wireStatus() *HolderStatus {
 		}
 	}
 	wedged := 0
-	for _, v := range h.deep {
-		if v.wedged {
-			wedged++
+	if h.led != nil {
+		for _, snap := range h.led.snapshot() {
+			if snap.Policy == fuseDeepWedgePolicy.name && snap.Faulted {
+				wedged++
+			}
 		}
 	}
 	return &HolderStatus{

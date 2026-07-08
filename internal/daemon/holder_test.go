@@ -84,6 +84,47 @@ func healTick(ctx context.Context, s *Server) {
 	s.retryUnvouchedFuseRows(ctx)
 }
 
+// remountRow returns dir's fuse.remount ledger row, nil when absent.
+func remountRow(s *Server, dir string) *ledger { return s.led.peek(fuseRemountPolicy, dir) }
+
+// remountAttempts / remountHazard / remountTCC read one counter off dir's
+// remount row, 0 when absent — the shared clock, the hazard lane (strikes),
+// and the TCC lane (altHits).
+func remountAttempts(s *Server, dir string) int {
+	if l := remountRow(s, dir); l != nil {
+		return l.attempts
+	}
+	return 0
+}
+
+func remountHazard(s *Server, dir string) int {
+	if l := remountRow(s, dir); l != nil {
+		return l.strikes
+	}
+	return 0
+}
+
+func remountTCC(s *Server, dir string) int {
+	if l := remountRow(s, dir); l != nil {
+		return l.altHits
+	}
+	return 0
+}
+
+// rewindRemount expires dir's remount backoff so the next tick attempts.
+func rewindRemount(s *Server, dir string) {
+	if l := remountRow(s, dir); l != nil {
+		l.nextDue = time.Now().Add(-time.Second)
+	}
+}
+
+// seedRemount plants a remount row with n booked attempts and an expired window.
+func seedRemount(s *Server, dir string, attempts int) {
+	l := s.led.row(fuseRemountPolicy, dir)
+	l.attempts = attempts
+	l.nextDue = time.Now().Add(-time.Second)
+}
+
 // startDegradedHolder serves Health at ver but drops every List reply —
 // Client.Poll's "Degraded" shape.
 func startDegradedHolder(t *testing.T, ver string) string {
@@ -167,8 +208,8 @@ func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups after the first tick = %d, want 1", fake.setupCount())
 	}
-	if st := s.rowRetry[1]; st.failures != 1 || !st.retryAt.After(time.Now()) {
-		t.Fatalf("rowRetry[1] = %+v, want one failure with a future retryAt", st)
+	if l := remountRow(s, dirs[1]); l == nil || l.attempts != 1 || !l.nextDue.After(time.Now()) {
+		t.Fatalf("remount row = %+v, want one attempt with a future nextDue", l)
 	}
 
 	healTick(t.Context(), s)
@@ -176,19 +217,15 @@ func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 		t.Fatalf("setups inside the backoff window = %d, want still 1", fake.setupCount())
 	}
 
-	st := s.rowRetry[1]
-	st.retryAt = time.Now().Add(-time.Second)
-	s.rowRetry[1] = st
+	rewindRemount(s, dirs[1])
 	healTick(t.Context(), s)
-	if fake.setupCount() != 2 || s.rowRetry[1].failures != 2 {
-		t.Fatalf("after the rewound window: setups=%d failures=%d, want 2/2",
-			fake.setupCount(), s.rowRetry[1].failures)
+	if fake.setupCount() != 2 || remountAttempts(s, dirs[1]) != 2 {
+		t.Fatalf("after the rewound window: setups=%d attempts=%d, want 2/2",
+			fake.setupCount(), remountAttempts(s, dirs[1]))
 	}
 
 	fake.setupErr = nil
-	st = s.rowRetry[1]
-	st.retryAt = time.Now().Add(-time.Second)
-	s.rowRetry[1] = st
+	rewindRemount(s, dirs[1])
 	healTick(t.Context(), s)
 	if fake.setupCount() != 3 {
 		t.Fatalf("setups after clearing the failure = %d, want 3", fake.setupCount())
@@ -196,19 +233,19 @@ func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("healed row not vouched for in the holder cache")
 	}
-	if _, ok := s.rowRetry[1]; ok {
-		t.Fatal("successful heal left a rowRetry entry")
+	if remountRow(s, dirs[1]) != nil {
+		t.Fatal("successful heal left a remount ledger row")
 	}
 }
 
 // TestHealTickRetrySkipsClaimedAccount pins that a claimed row is neither
 // attempted nor penalized (a skip is not a failure) and is retried after release.
 func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
-	s, _, fake := newHealServer(t)
+	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
 	fake.setupErr = mountTimeoutChain()
-	s.rowRetry = map[int]rowRetryState{1: {failures: 2, retryAt: time.Now().Add(-time.Second)}}
+	seedRemount(s, dirs[1], 2)
 	if !s.cl.hold(1) {
 		t.Fatal("beginPoll failed on a free account")
 	}
@@ -217,8 +254,8 @@ func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
 	if fake.setupCount() != 0 {
 		t.Fatal("the heal loop raced the claim owner")
 	}
-	if got := s.rowRetry[1].failures; got != 2 {
-		t.Fatalf("failures after a skip = %d, want 2 unchanged", got)
+	if got := remountAttempts(s, dirs[1]); got != 2 {
+		t.Fatalf("attempts after a skip = %d, want 2 unchanged", got)
 	}
 
 	s.cl.disownHold(1)
@@ -226,18 +263,18 @@ func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups after release = %d, want 1", fake.setupCount())
 	}
-	if got := s.rowRetry[1].failures; got != 3 {
-		t.Fatalf("failures after a real attempt = %d, want 3", got)
+	if got := remountAttempts(s, dirs[1]); got != 3 {
+		t.Fatalf("attempts after a real attempt = %d, want 3", got)
 	}
 }
 
 // TestHealTickRetryLeavesConvertedRowAndPrunes pins that a row converted to
 // symlink is never healed as fuse and its ledger entry is pruned.
 func TestHealTickRetryLeavesConvertedRowAndPrunes(t *testing.T) {
-	s, _, fake := newHealServer(t)
+	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	s.rowRetry = map[int]rowRetryState{1: {failures: 1, retryAt: time.Now().Add(-time.Second)}}
+	seedRemount(s, dirs[1], 1)
 	flipToSymlink(t, s, 1)
 
 	healTick(t.Context(), s)
@@ -245,8 +282,8 @@ func TestHealTickRetryLeavesConvertedRowAndPrunes(t *testing.T) {
 	if fake.setupCount() != 0 {
 		t.Fatal("a converted row was healed as fuse")
 	}
-	if len(s.rowRetry) != 0 {
-		t.Fatalf("rowRetry = %v, want the converted row's entry pruned", s.rowRetry)
+	if remountRow(s, dirs[1]) != nil {
+		t.Fatal("remount ledger kept the converted row's entry, want it pruned")
 	}
 }
 
@@ -259,9 +296,9 @@ func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
 
 	healTick(t.Context(), s)
-	if fake.setupCount() != 1 || s.rowRetry[1].failures != 1 {
-		t.Fatalf("after the first tick: setups=%d failures=%d, want 1/1",
-			fake.setupCount(), s.rowRetry[1].failures)
+	if fake.setupCount() != 1 || remountAttempts(s, dirs[1]) != 1 {
+		t.Fatalf("after the first tick: setups=%d attempts=%d, want 1/1",
+			fake.setupCount(), remountAttempts(s, dirs[1]))
 	}
 	if got := s.holder.wireStatus().TCCError; got == "" {
 		t.Fatal("TCC guidance not surfaced for the blocked row")
@@ -272,9 +309,7 @@ func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	}
 
 	fake.setupErr = nil
-	st := s.rowRetry[1]
-	st.retryAt = time.Now().Add(-time.Second)
-	s.rowRetry[1] = st
+	rewindRemount(s, dirs[1])
 	healTick(t.Context(), s)
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("granted row not mounted and vouched for")
@@ -282,8 +317,8 @@ func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	if got := s.holder.wireStatus().TCCError; got != "" {
 		t.Fatalf("TCCError after the successful mount = %q, want cleared via noteMounted", got)
 	}
-	if _, ok := s.rowRetry[1]; ok {
-		t.Fatal("successful heal left a rowRetry entry")
+	if remountRow(s, dirs[1]) != nil {
+		t.Fatal("successful heal left a remount ledger row")
 	}
 }
 
@@ -346,8 +381,8 @@ func TestHealTickRemountsHeldDeadRow(t *testing.T) {
 			if !strings.Contains(out, "live session") {
 				t.Fatalf("held-dead log line missing the session count:\n%s", out)
 			}
-			if _, ok := s.rowRetry[1]; ok {
-				t.Fatal("successful remount left a rowRetry entry")
+			if remountRow(s, dirs[1]) != nil {
+				t.Fatal("successful remount left a remount ledger row")
 			}
 		})
 	}
@@ -505,15 +540,12 @@ func swapReapOrphans(t *testing.T, fn func([]string) []int) {
 	t.Cleanup(func() { reapOrphanedServers = prev })
 }
 
-// driveRetryTicks runs n heal ticks, rewinding the per-row backoff before each
-// so every tick makes a real attempt.
-func driveRetryTicks(t *testing.T, s *Server, id, n int) {
+// driveRetryTicks runs n heal ticks, rewinding dir's backoff before each so
+// every tick makes a real attempt.
+func driveRetryTicks(t *testing.T, s *Server, dir string, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
-		if st, ok := s.rowRetry[id]; ok {
-			st.retryAt = time.Now().Add(-time.Second)
-			s.rowRetry[id] = st
-		}
+		rewindRemount(s, dir)
 		healTick(t.Context(), s)
 	}
 }
@@ -549,7 +581,7 @@ func TestRemountBreakerEscalates(t *testing.T) {
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
-	driveRetryTicks(t, s, 1, remountBreakerThreshold)
+	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold)
 
 	mu.Lock()
 	gotUnmounted := append([]string(nil), unmounted...)
@@ -560,8 +592,8 @@ func TestRemountBreakerEscalates(t *testing.T) {
 	if got := kindOf(t, s, 1); got != "symlink" {
 		t.Fatalf("row kind after the breaker = %q, want symlink", got)
 	}
-	if _, ok := s.rowRetry[1]; ok {
-		t.Fatal("breaker left a rowRetry entry; the churn would continue")
+	if remountRow(s, dirs[1]) != nil {
+		t.Fatal("breaker left a remount ledger row; the churn would continue")
 	}
 	if s.holder.ready(dirs[1]) {
 		t.Fatal("breaker did not drop the holder-cache vouch for the converted dir")
@@ -598,7 +630,7 @@ func TestHealDefersBreakerUnderLiveSession(t *testing.T) {
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
-	driveRetryTicks(t, s, 1, remountBreakerThreshold+2)
+	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold+2)
 
 	if got := fake.teardownCount(); got != 0 {
 		t.Fatalf("teardowns under a live session = %d, want 0 (a busy mirror must never be torn down)", got)
@@ -612,7 +644,7 @@ func TestHealDefersBreakerUnderLiveSession(t *testing.T) {
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind under a live session = %q, want fuse (it must stay mounted, never retreat)", got)
 	}
-	if got := s.rowRetry[1].hazard; got != 0 {
+	if got := remountHazard(s, dirs[1]); got != 0 {
 		t.Fatalf("hazard count under a busy mount = %d, want 0 (the wedged breaker must be unreachable while busy)", got)
 	}
 	if !strings.Contains(buf.String(), "NOT force-unmounting") {
@@ -636,12 +668,12 @@ func TestHealUnmitigatedHolderDefersWithoutBreaker(t *testing.T) {
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
-	driveRetryTicks(t, s, 1, remountBreakerThreshold+2)
+	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold+2)
 
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind = %q, want fuse (an unmitigated holder must never demote the row)", got)
 	}
-	if got := s.rowRetry[1].hazard; got != 0 {
+	if got := remountHazard(s, dirs[1]); got != 0 {
 		t.Fatalf("hazard count = %d, want 0 (the wedged breaker must be unreachable while waiting on the cask upgrade)", got)
 	}
 	if got := fake.teardownCount(); got != 0 {
@@ -656,12 +688,12 @@ func TestHealUnmitigatedHolderDefersWithoutBreaker(t *testing.T) {
 
 	// The upgrade lands: the very next tick remounts without operator action.
 	fake.setupErr = nil
-	driveRetryTicks(t, s, 1, 1)
+	driveRetryTicks(t, s, dirs[1], 1)
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("row not remounted after the holder upgrade")
 	}
-	if _, ok := s.rowRetry[1]; ok {
-		t.Fatal("recovered row left a rowRetry entry")
+	if remountRow(s, dirs[1]) != nil {
+		t.Fatal("recovered row left a remount ledger row")
 	}
 }
 
@@ -677,7 +709,7 @@ func TestRemountBreakerHoldsUnderThreshold(t *testing.T) {
 	var unmounts int
 	swapForceUnmount(t, func(string) error { unmounts++; return nil })
 
-	driveRetryTicks(t, s, 1, remountBreakerThreshold-1)
+	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold-1)
 
 	if unmounts != 0 {
 		t.Fatalf("force-unmounts under the threshold = %d, want 0", unmounts)
@@ -685,7 +717,7 @@ func TestRemountBreakerHoldsUnderThreshold(t *testing.T) {
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind under the threshold = %q, want fuse (still retrying)", got)
 	}
-	if got := s.rowRetry[1].hazard; got != remountBreakerThreshold-1 {
+	if got := remountHazard(s, dirs[1]); got != remountBreakerThreshold-1 {
 		t.Fatalf("hazard count = %d, want %d (one short of the breaker)", got, remountBreakerThreshold-1)
 	}
 }
@@ -702,23 +734,23 @@ func TestRemountBreakerResetsOnMount(t *testing.T) {
 	var unmounts int
 	swapForceUnmount(t, func(string) error { unmounts++; return nil })
 
-	driveRetryTicks(t, s, 1, remountBreakerThreshold-2)
-	if got := s.rowRetry[1].hazard; got != remountBreakerThreshold-2 {
+	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold-2)
+	if got := remountHazard(s, dirs[1]); got != remountBreakerThreshold-2 {
 		t.Fatalf("hazard before recovery = %d, want %d", got, remountBreakerThreshold-2)
 	}
 
 	fake.setupErr = nil
-	driveRetryTicks(t, s, 1, 1)
-	if _, ok := s.rowRetry[1]; ok {
-		t.Fatal("a successful mount left a rowRetry entry")
+	driveRetryTicks(t, s, dirs[1], 1)
+	if remountRow(s, dirs[1]) != nil {
+		t.Fatal("a successful mount left a remount ledger row")
 	}
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("recovered row not vouched for")
 	}
 
 	fake.setupErr = mountTimeoutChain()
-	driveRetryTicks(t, s, 1, 1)
-	if got := s.rowRetry[1].hazard; got != 1 {
+	driveRetryTicks(t, s, dirs[1], 1)
+	if got := remountHazard(s, dirs[1]); got != 1 {
 		t.Fatalf("hazard after a fresh failure = %d, want 1 (reset by the recovery)", got)
 	}
 	if unmounts != 0 {
@@ -742,7 +774,7 @@ func TestWedgeBreakerNeverEscalatesTCCRow(t *testing.T) {
 	// One short of the grant grace — already past the wedged breaker's
 	// threshold (tccBreakerThreshold > remountBreakerThreshold).
 	ticks := tccBreakerThreshold - 1
-	driveRetryTicks(t, s, 1, ticks)
+	driveRetryTicks(t, s, dirs[1], ticks)
 
 	if unmounts != 0 {
 		t.Fatalf("TCC-blocked row force-unmounted %d time(s); the wedged breaker must never fire on it", unmounts)
@@ -750,18 +782,18 @@ func TestWedgeBreakerNeverEscalatesTCCRow(t *testing.T) {
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("TCC-blocked row kind = %q, want fuse (still within the grant grace)", got)
 	}
-	st, ok := s.rowRetry[1]
-	if !ok {
+	l := remountRow(s, dirs[1])
+	if l == nil {
 		t.Fatal("TCC-blocked row dropped its retry ledger before the grace expired")
 	}
-	if st.hazard != 0 {
-		t.Fatalf("TCC hazard = %d, want 0 (never counts toward the wedged breaker even past its threshold)", st.hazard)
+	if l.strikes != 0 {
+		t.Fatalf("TCC hazard = %d, want 0 (never counts toward the wedged breaker even past its threshold)", l.strikes)
 	}
-	if st.tccBlocks != ticks {
-		t.Fatalf("TCC blocks = %d, want %d (the grant grace counts these)", st.tccBlocks, ticks)
+	if l.altHits != ticks {
+		t.Fatalf("TCC blocks = %d, want %d (the grant grace counts these)", l.altHits, ticks)
 	}
-	if st.failures != ticks {
-		t.Fatalf("TCC failures = %d, want %d (kept backing off)", st.failures, ticks)
+	if l.attempts != ticks {
+		t.Fatalf("TCC attempts = %d, want %d (kept backing off)", l.attempts, ticks)
 	}
 }
 
@@ -778,13 +810,13 @@ func TestTCCBreakerEscalates(t *testing.T) {
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
-	driveRetryTicks(t, s, 1, tccBreakerThreshold)
+	driveRetryTicks(t, s, dirs[1], tccBreakerThreshold)
 
 	if got := kindOf(t, s, 1); got != "symlink" {
 		t.Fatalf("row kind after the TCC grace = %q, want symlink", got)
 	}
-	if _, ok := s.rowRetry[1]; ok {
-		t.Fatal("TCC breaker left a rowRetry entry; the churn would continue")
+	if remountRow(s, dirs[1]) != nil {
+		t.Fatal("TCC breaker left a remount ledger row; the churn would continue")
 	}
 	if s.holder.ready(dirs[1]) {
 		t.Fatal("TCC breaker did not drop the holder-cache vouch for the converted dir")
@@ -810,13 +842,13 @@ func TestTCCBreakerEscalatesUnderLiveSession(t *testing.T) {
 		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
 	}
 
-	driveRetryTicks(t, s, 1, tccBreakerThreshold)
+	driveRetryTicks(t, s, dirs[1], tccBreakerThreshold)
 
 	if got := kindOf(t, s, 1); got != "symlink" {
 		t.Fatalf("row kind after the TCC grace = %q, want symlink (a live session must not block the retreat)", got)
 	}
-	if _, ok := s.rowRetry[1]; ok {
-		t.Fatal("TCC breaker left a rowRetry entry under a live session")
+	if remountRow(s, dirs[1]) != nil {
+		t.Fatal("TCC breaker left a remount ledger row under a live session")
 	}
 }
 
@@ -832,21 +864,21 @@ func TestTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 	var unmounts int
 	swapForceUnmount(t, func(string) error { unmounts++; return nil })
 
-	driveRetryTicks(t, s, 1, tccBreakerThreshold-1)
+	driveRetryTicks(t, s, dirs[1], tccBreakerThreshold-1)
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind one short of the grace = %q, want fuse (still waiting on the grant)", got)
 	}
-	if got := s.rowRetry[1].tccBlocks; got != tccBreakerThreshold-1 {
+	if got := remountTCC(s, dirs[1]); got != tccBreakerThreshold-1 {
 		t.Fatalf("tccBlocks = %d, want %d (one short of the grace)", got, tccBreakerThreshold-1)
 	}
 
 	fake.setupErr = nil
-	driveRetryTicks(t, s, 1, 1)
+	driveRetryTicks(t, s, dirs[1], 1)
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind after a late grant = %q, want fuse (it mounted, never retreated)", got)
 	}
-	if _, ok := s.rowRetry[1]; ok {
-		t.Fatal("a successful mount left a rowRetry entry")
+	if remountRow(s, dirs[1]) != nil {
+		t.Fatal("a successful mount left a remount ledger row")
 	}
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("granted row not vouched for")
@@ -868,6 +900,105 @@ func TestTCCBreakerThreshold(t *testing.T) {
 	}
 }
 
+// TestAlternatingHazardTCCTripsNeitherBreaker pins fuse.remount's two-lane
+// mutual reset: strictly alternating wedge/TCC outcomes continued past BOTH
+// thresholds never escalate — each lane resets the other — while the shared
+// attempts clock still books every attempt for backoff spacing.
+func TestAlternatingHazardTCCTripsNeitherBreaker(t *testing.T) {
+	s, dirs, fake := newHealServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+	var unmounts int
+	swapForceUnmount(t, func(string) error { unmounts++; return nil })
+
+	ticks := 2 * (remountBreakerThreshold + tccBreakerThreshold)
+	for i := 0; i < ticks; i++ {
+		if i%2 == 0 {
+			fake.setupErr = mountTimeoutChain() // healRetry — the hazard lane
+		} else {
+			fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive) // healTCCBlocked — the TCC lane
+		}
+		rewindRemount(s, dirs[1])
+		healTick(t.Context(), s)
+	}
+
+	if unmounts != 0 {
+		t.Fatalf("force-unmounts on an alternating row = %d, want 0 (neither breaker may trip)", unmounts)
+	}
+	if got := kindOf(t, s, 1); got != "nfs" {
+		t.Fatalf("row kind after alternating outcomes = %q, want fuse (no escalation)", got)
+	}
+	l := remountRow(s, dirs[1])
+	if l == nil {
+		t.Fatal("alternating row dropped its remount ledger")
+	}
+	if l.attempts != ticks {
+		t.Fatalf("shared attempts clock = %d, want %d (every attempt books backoff)", l.attempts, ticks)
+	}
+	if l.strikes >= remountBreakerThreshold || l.altHits >= tccBreakerThreshold {
+		t.Fatalf("lanes = hazard %d / tcc %d, want both under their thresholds (mutual reset)", l.strikes, l.altHits)
+	}
+}
+
+// TestConsecutiveLaneOutcomesEscalateAtExactThreshold pins each lane's exact
+// breaker point: attempt N-1 leaves the row on fuse, attempt N retreats it to
+// symlink through its lane's own escalation (escalateWedgedRow /
+// escalateTCCBlockedRow).
+func TestConsecutiveLaneOutcomesEscalateAtExactThreshold(t *testing.T) {
+	cases := map[string]struct {
+		setupErr  error
+		mounted   bool
+		threshold int
+		wantLog   string
+	}{
+		"hazard lane escalates on the 5th wedged heal": {
+			setupErr:  mountTimeoutChain(),
+			mounted:   true,
+			threshold: remountBreakerThreshold,
+			wantLog:   "never recovered",
+		},
+		"TCC lane escalates on the 6th blocked heal": {
+			setupErr:  fmt.Errorf("mount: %w", overlay.ErrMountNotLive),
+			mounted:   false,
+			threshold: tccBreakerThreshold,
+			wantLog:   "volume-access grant never landed",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, dirs, fake := newHealServer(t)
+			flipToFuse(t, s, 1)
+			s.holderSocket = startCannedHolder(t, nil)
+			fake.setupErr = tc.setupErr
+			mounted := tc.mounted
+			fakeOverlayMounted(t, func(dir string) bool { return mounted && dir == dirs[1] })
+			swapForceUnmount(t, func(string) error { return nil })
+			var buf bytes.Buffer
+			s.log = log.New(&buf, "", 0)
+
+			driveRetryTicks(t, s, dirs[1], tc.threshold-1)
+			if got := kindOf(t, s, 1); got != "nfs" {
+				t.Fatalf("row kind one short of the threshold = %q, want fuse", got)
+			}
+			if strings.Contains(buf.String(), tc.wantLog) {
+				t.Fatalf("escalation fired before the threshold:\n%s", buf.String())
+			}
+
+			driveRetryTicks(t, s, dirs[1], 1)
+			if got := kindOf(t, s, 1); got != "symlink" {
+				t.Fatalf("row kind at the threshold = %q, want symlink (the lane's breaker escalates exactly here)", got)
+			}
+			if !strings.Contains(buf.String(), tc.wantLog) {
+				t.Fatalf("escalation log %q missing:\n%s", tc.wantLog, buf.String())
+			}
+			if remountRow(s, dirs[1]) != nil {
+				t.Fatal("escalated row left a remount ledger row")
+			}
+		})
+	}
+}
+
 // TestHealFuseMountFailedRetreatsImmediately pins that a hard mount rejection
 // (ErrMountFailed) retreats to symlink on the first heal — a dead-end, not a
 // pending grant.
@@ -878,7 +1009,7 @@ func TestHealFuseMountFailedRetreatsImmediately(t *testing.T) {
 	fake.setupErr = mountFailedChain()
 	fakeOverlayMounted(t, func(string) bool { return false })
 
-	driveRetryTicks(t, s, 1, 1)
+	driveRetryTicks(t, s, dirs[1], 1)
 
 	if got := kindOf(t, s, 1); got != "symlink" {
 		t.Fatalf("row kind after one hard-failure heal = %q, want symlink (immediate retreat, no TCC wait, no breaker countdown)", got)
@@ -1140,7 +1271,7 @@ func TestHealLoopUnmountGate(t *testing.T) {
 				s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, errors.New("ps exploded") }
 			}
 
-			driveRetryTicks(t, s, 1, 1)
+			driveRetryTicks(t, s, dirs[1], 1)
 
 			if got := fake.teardownCount(); got != tc.wantTeardowns {
 				t.Fatalf("teardowns = %d, want %d", got, tc.wantTeardowns)
@@ -1150,7 +1281,7 @@ func TestHealLoopUnmountGate(t *testing.T) {
 			}
 			// Idle drops the ledger; deferred backs off without a strike — the
 			// hazard never accrues either way.
-			if got := s.rowRetry[1].hazard; got != 0 {
+			if got := remountHazard(s, dirs[1]); got != 0 {
 				t.Fatalf("hazard = %d, want 0", got)
 			}
 		})

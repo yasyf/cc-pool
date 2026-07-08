@@ -15,7 +15,6 @@ import (
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/proc"
 )
 
 // defaultHealInterval is the steady-state heal cadence, far under the
@@ -65,14 +64,46 @@ func (s *Server) unmountIdle(ctx context.Context, dir string) (busy bool, n int,
 	return false, n, forceUnmount(dir)
 }
 
-type rowRetryState struct {
-	failures int
-	retryAt  time.Time
-	// hazard/tccBlocks count consecutive wedged / TCC-blocked heals toward
-	// their breakers; each resets the other, so an alternating TCC/wedge row
-	// trips neither.
-	hazard    int
-	tccBlocks int
+// fuseRemountPolicy is the fuse-row remount policy: one shared backoff clock
+// under two mutually-resetting breaker lanes — hazard (strikes, escalating via
+// escalateWedgedRow) and TCC (altHits, escalating via escalateTCCBlockedRow) —
+// so an alternating TCC/wedge row trips neither. Rows are keyed by account
+// ConfigDir.
+var fuseRemountPolicy = policies["fuse.remount"]
+
+// remountClear drops dir's fuse.remount row: the mirror recovered, left the
+// fuse backend, or finished its retreat.
+func (s *Server) remountClear(dir string) {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	s.led.clear(fuseRemountPolicy, dir)
+}
+
+// remountAttempt books one remount attempt for dir on the selected breaker
+// lane, returning whether a breaker has tripped. Benign deferrals (busy,
+// unmitigated, a failed row re-read) book attemptNeutral: the shared clock
+// keeps backing off while both lanes reset, so no breaker is reachable.
+func (s *Server) remountAttempt(dir string, kind attemptKind) bool {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	return s.led.attempt(fuseRemountPolicy, dir, kind, time.Now())
+}
+
+// remountBackoffElapsed gates the next remount attempt on the backoff window
+// alone, never the breakers — a breaker whose escalation was deferred (claim
+// refusal, live sessions) stays armed to re-fire on the next elapsed window.
+func (s *Server) remountBackoffElapsed(dir string, now time.Time) bool {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	return s.led.backoffElapsed(fuseRemountPolicy, dir, now)
+}
+
+// remountPrune drops fuse.remount rows keep rejects — accounts that left the
+// fuse set while the listing aged.
+func (s *Server) remountPrune(keep func(dir string) bool) {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	s.led.prune(fuseRemountPolicy, keep)
 }
 
 // healFuseRows heals unvouched fuse rows until ctx is cancelled. Holder
@@ -142,9 +173,9 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 		sessions = ses
 	}
 	now := time.Now()
-	inPass := make(map[int]bool, len(fuse))
+	inPass := make(map[string]bool, len(fuse))
 	for _, a := range fuse {
-		inPass[a.ID] = true
+		inPass[a.ConfigDir] = true
 		if ctx.Err() != nil {
 			return
 		}
@@ -160,11 +191,11 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 			}
 		}
 		if s.holder.ready(a.ConfigDir) {
-			delete(s.rowRetry, a.ID)
+			s.remountClear(a.ConfigDir)
 			s.holder.resetShallowDead(a.ConfigDir)
 			continue
 		}
-		if now.Before(s.rowRetry[a.ID].retryAt) {
+		if !s.remountBackoffElapsed(a.ConfigDir, now) {
 			continue
 		}
 		// deferShallowDead sits after the backoff gate: a backed-off row must
@@ -180,10 +211,10 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 		case err != nil:
 			s.log.Printf("acct-%02d re-read row before remount: %v", a.ID, err)
 			// Not a mount hazard: back off without a breaker strike.
-			s.advanceRowRetry(a.ID, false)
+			s.remountAttempt(a.ConfigDir, attemptNeutral)
 		case !fuseBackedRow(fresh.OverlayKind):
 			// Converted while the listing aged; no ledger for a non-fuse row.
-			delete(s.rowRetry, a.ID)
+			s.remountClear(a.ConfigDir)
 		default:
 			if dead, wedged := s.holder.heldDead(a.ConfigDir); dead {
 				desc := "dead mirror (fails reads outright; unmounted out of band or its fuse worker died?)"
@@ -199,32 +230,28 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
 			}
 			switch s.healFuse(ctx, fresh) {
 			case healMounted:
-				delete(s.rowRetry, a.ID)
+				s.remountClear(a.ConfigDir)
 			case healDeferredBusy, healDeferredUnmitigated:
-				// No hazard strike: a busy mount must never reach the wedged
-				// breaker (and the reset disarms a mid-countdown breaker), and an
-				// unmitigated holder is a benign wait for the cask upgrade — the
-				// row keeps deferring until `brew upgrade --cask fusekit-holder`
-				// lands, never retreating to symlink.
-				s.advanceRowRetry(a.ID, false)
+				// attemptNeutral, no hazard strike: a busy mount must never reach
+				// the wedged breaker (and the lane reset disarms a mid-countdown
+				// breaker), and an unmitigated holder is a benign wait for the cask
+				// upgrade — the row keeps deferring until `brew upgrade --cask
+				// fusekit-holder` lands, never retreating to symlink.
+				s.remountAttempt(a.ConfigDir, attemptNeutral)
 			case healTCCBlocked:
-				if s.advanceTCCRetry(a.ID) >= tccBreakerThreshold {
+				if s.remountAttempt(a.ConfigDir, attemptAlt) {
 					s.escalateTCCBlockedRow(ctx, fresh)
 				}
 			default:
 				// healRetry/healFallback: hazard outcomes.
-				if s.advanceRowRetry(a.ID, true) >= remountBreakerThreshold {
+				if s.remountAttempt(a.ConfigDir, attemptPrimary) {
 					s.escalateWedgedRow(ctx, fresh)
 				}
 			}
 		}
 		s.cl.disownHold(a.ID)
 	}
-	for id := range s.rowRetry {
-		if !inPass[id] {
-			delete(s.rowRetry, id)
-		}
-	}
+	s.remountPrune(func(dir string) bool { return inPass[dir] })
 }
 
 // deferShallowDead reports whether to defer remounting a holder-reported
@@ -254,36 +281,6 @@ func (s *Server) deferShallowDead(a store.Account) bool {
 	}
 }
 
-func (s *Server) advanceRowRetry(id int, hazard bool) int {
-	if s.rowRetry == nil {
-		s.rowRetry = make(map[int]rowRetryState)
-	}
-	st := s.rowRetry[id]
-	st.failures++
-	if hazard {
-		st.hazard++
-	} else {
-		st.hazard = 0
-	}
-	st.tccBlocks = 0
-	st.retryAt = time.Now().Add(proc.Backoff{Base: remountBackoffBase, Cap: remountBackoffCap}.After(st.failures))
-	s.rowRetry[id] = st
-	return st.hazard
-}
-
-func (s *Server) advanceTCCRetry(id int) int {
-	if s.rowRetry == nil {
-		s.rowRetry = make(map[int]rowRetryState)
-	}
-	st := s.rowRetry[id]
-	st.failures++
-	st.hazard = 0
-	st.tccBlocks++
-	st.retryAt = time.Now().Add(proc.Backoff{Base: remountBackoffBase, Cap: remountBackoffCap}.After(st.failures))
-	s.rowRetry[id] = st
-	return st.tccBlocks
-}
-
 // convertRowToSymlink is the shared fuse→symlink retreat primitive; the caller
 // holds a convert claim. Returns whether the row ended up off fuse.
 func (s *Server) convertRowToSymlink(ctx context.Context, a store.Account, announce string) bool {
@@ -293,7 +290,7 @@ func (s *Server) convertRowToSymlink(ctx context.Context, a store.Account, annou
 		s.log.Printf("acct-%02d symlink retreat: re-read row: %v", a.ID, err)
 		return false
 	case !fuseBackedRow(fresh.OverlayKind):
-		delete(s.rowRetry, a.ID) // converted in the claim gap
+		s.remountClear(fresh.ConfigDir) // converted in the claim gap
 		return true
 	}
 	s.log.Printf("%s", announce)
@@ -333,7 +330,7 @@ func (s *Server) convertRowToSymlink(ctx context.Context, a store.Account, annou
 		return false
 	}
 	s.holder.noteUnmounted(fresh.ConfigDir)
-	delete(s.rowRetry, a.ID)
+	s.remountClear(fresh.ConfigDir)
 	return true
 }
 

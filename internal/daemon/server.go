@@ -168,16 +168,14 @@ type Server struct {
 	// goroutine touches it — no lock.
 	lastContentHealth string
 
-	// rowRetry is the per-account remount backoff ledger for fuse rows the
-	// holder cannot vouch for (see retryUnvouchedFuseRows). Lazily initialized;
-	// only the heal goroutine touches it — no lock.
-	rowRetry map[int]rowRetryState
-
-	// led is the self-heal ledger store shared by every ported family (this phase:
-	// the fp.domain rows). ledMu is the enclosing serialization the ledgers type
-	// documents: FP rows are touched from the heal tick, the select/status/repair
-	// RPC handlers, and migrate/strand, so every s.led access takes ledMu — never
-	// held across Sync/re-register/bounce I/O (bookkeeping in, I/O out).
+	// led is the self-heal ledger store shared by every ported Server-owned
+	// family (the fp.domain and fuse.remount rows; the holder cache's
+	// fuse.deepwedge / fuse.shallowdead rows live in holderState.led under its
+	// mu). ledMu is the enclosing serialization the ledgers type documents:
+	// rows are touched from the heal tick, the select/status/repair RPC
+	// handlers, and migrate/strand/convert, so every s.led access takes ledMu —
+	// never held across mount/Sync/re-register/bounce I/O (bookkeeping in, I/O
+	// out).
 	led   *ledgers
 	ledMu sync.Mutex
 
