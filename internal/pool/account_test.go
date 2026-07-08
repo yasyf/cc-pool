@@ -563,9 +563,10 @@ func TestRemoveKeepCredential(t *testing.T) {
 	}
 }
 
-// TestConcurrentPrepareAddIndexRace pins the known index-reservation gap: two
-// concurrent PrepareAdds (no row until FinalizeAdd) get the same index, dir, and
-// Keychain service; the fix needs a pending-row reservation.
+// TestConcurrentPrepareAddIndexRace pins the pending-row reservation fix:
+// concurrent PrepareAdds (still no accounts row until FinalizeAdd) must be
+// handed distinct indices — and so distinct dirs and Keychain services —
+// because ReserveAccountIndex allocates atomically.
 func TestConcurrentPrepareAddIndexRace(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if err := os.MkdirAll(ClaudeDir(), 0o700); err != nil {
@@ -576,16 +577,38 @@ func TestConcurrentPrepareAddIndexRace(t *testing.T) {
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}
-	p1, err := m.PrepareAdd()
-	if err != nil {
-		t.Fatal(err)
+
+	type result struct {
+		p   *PendingAdd
+		err error
 	}
-	p2, err := m.PrepareAdd()
-	if err != nil {
-		t.Fatal(err)
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			p, err := m.PrepareAdd()
+			results <- result{p, err}
+		}()
 	}
-	if p1.Index != p2.Index {
-		t.Fatalf("indexes %d vs %d — the reservation gap closed; update this test and the AGENTS.md follow-up note", p1.Index, p2.Index)
+	close(start)
+	var got []*PendingAdd
+	for range 2 {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("PrepareAdd: %v", r.err)
+		}
+		got = append(got, r.p)
+	}
+
+	if got[0].Index == got[1].Index {
+		t.Fatalf("both PrepareAdds were handed index %d — the reservation must allocate distinct indices", got[0].Index)
+	}
+	if got[0].ConfigDir == got[1].ConfigDir {
+		t.Fatalf("both PrepareAdds share config dir %s", got[0].ConfigDir)
+	}
+	if got[0].KeychainService == got[1].KeychainService {
+		t.Fatalf("both PrepareAdds share Keychain service %s", got[0].KeychainService)
 	}
 }
 

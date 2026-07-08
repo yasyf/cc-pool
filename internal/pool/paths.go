@@ -109,6 +109,24 @@ func BridgeSocketPath() string {
 	return stateDir.Path("bridge.sock")
 }
 
+// SyncDir is cc-pool's host-sync state dir (~/.cc-pool/sync): the secretless
+// CRDT registry plus the per-account fsnotify stamp dirs.
+func SyncDir() string {
+	return stateDir.Path("sync")
+}
+
+// SyncSocketPath is the daemon's synckit consumer socket
+// (~/.cc-pool/sync.sock), a second socket beside daemon.sock.
+func SyncSocketPath() string {
+	return stateDir.Path("sync.sock")
+}
+
+// SyncStampsDir is the parent of the per-account stamp dirs synckitd watches
+// (~/.cc-pool/sync/stamps).
+func SyncStampsDir() string {
+	return filepath.Join(SyncDir(), "stamps")
+}
+
 // FPExtensionBundleID is the File Provider extension's bundle identifier,
 // handed to pluginkit by fusekit's FileProviderAvailable gate.
 const FPExtensionBundleID = "com.yasyf.cc-pool.status.fileprovider"

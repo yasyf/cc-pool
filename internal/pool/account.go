@@ -93,8 +93,11 @@ func (m *Manager) DuplicateIdentity(want Identity) (*store.Account, error) {
 // state instead of the first-run wizard. Returns the login command to run.
 // Unless the dir is reused (SeedKeptExisting), stale credentials from a dead
 // attempt — the Keychain item under its service and the plaintext file — are
-// deleted. No account row or Keychain item exists until FinalizeAdd.
-func (m *Manager) PrepareAdd() (*PendingAdd, error) {
+// deleted. The index is held by an atomic pending_adds reservation (two
+// concurrent PrepareAdds can never collide) that FinalizeAdd promotes and
+// AbandonAdd/ReleaseAdd release; no account row or Keychain item exists until
+// FinalizeAdd.
+func (m *Manager) PrepareAdd() (pending *PendingAdd, err error) {
 	ok, err := m.Initialized()
 	if err != nil {
 		return nil, err
@@ -102,10 +105,17 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 	if !ok {
 		return nil, ErrNotInitialized
 	}
-	n, err := m.Store.NextAccountIndex()
+	n, err := m.Store.ReserveAccountIndex()
 	if err != nil {
 		return nil, err
 	}
+	// Every failure below must free the reservation, else the index stays
+	// blocked until the daemon's TTL sweep.
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, m.Store.ReleaseAccountIndex(n))
+		}
+	}()
 	acctDir := AccountDir(n)
 	backend, detectReason, err := m.ensureOverlayKind()
 	if err != nil {
@@ -241,6 +251,14 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 		}
 	}
 
+	// Consume the reservation before registering: once a sweep or release
+	// re-opened the index, a concurrent add may hold it, and a blind upsert
+	// would silently collide on the same index/dir/Keychain service. A crash
+	// between consume and upsert briefly frees the index while the dir remains
+	// — the pre-reservation semantics — and fail-loud beats silent collision.
+	if err := m.Store.ConsumeAccountIndex(p.Index); err != nil {
+		return nil, fmt.Errorf("finalize %s: %w", p.ConfigDir, err)
+	}
 	if err := m.Store.UpsertAccount(acct); err != nil {
 		return nil, err
 	}
@@ -253,28 +271,43 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 	return &acct, nil
 }
 
+// ReleaseAdd frees a pending add's index reservation while keeping its dir and
+// any login state it captured, so rerunning `ccp add` resumes the attempt:
+// PrepareAdd re-reserves the same lowest-free index and SeedKeptExisting adopts
+// the kept login. Call it on every keep-dir exit; AbandonAdd is the tear-down
+// counterpart, and the daemon's TTL sweep remains the crash-only backstop.
+func (m *Manager) ReleaseAdd(p *PendingAdd) error {
+	return m.Store.ReleaseAccountIndex(p.Index)
+}
+
 // AbandonAdd cleans up a prepared-but-not-finalized account dir (no store row
 // yet) and any credential its login wrote — the Keychain item and the plaintext
 // file, each deleted explicitly so the rollback never depends on the dir
-// removal succeeding. p must be non-nil, from PrepareAdd.
+// removal succeeding. The index reservation is released last but
+// unconditionally (even when cleanup partly fails): a concurrent PrepareAdd
+// must never be handed the index while its dir is mid-teardown, and a
+// lingering reservation would block the index until the daemon's TTL sweep.
+// p must be non-nil, from PrepareAdd. Idempotent.
 func (m *Manager) AbandonAdd(p *PendingAdd) error {
-	var credErr error
+	var errs error
 	pend := store.Account{ConfigDir: p.ConfigDir, KeychainService: p.KeychainService}
 	account, err := m.Creds.Discover(p.KeychainService)
 	switch {
 	case errors.Is(err, creds.ErrNotFound):
 	case err != nil:
-		credErr = fmt.Errorf("probe credential for %s: %w", p.ConfigDir, err)
+		errs = fmt.Errorf("probe credential for %s: %w", p.ConfigDir, err)
 	default:
 		pend.KeychainAccount = account
-		credErr = m.Creds.Store(pend, creds.SourceKeychain).Delete()
+		errs = m.Creds.Store(pend, creds.SourceKeychain).Delete()
 	}
-	credErr = errors.Join(credErr, m.Creds.Store(pend, creds.SourceFile).Delete())
+	errs = errors.Join(errs, m.Creds.Store(pend, creds.SourceFile).Delete())
 	prov, err := m.overlayFor(p.OverlayKind)
 	if err != nil {
-		return errors.Join(credErr, fmt.Errorf("resolve overlay provider for %s: %w", p.ConfigDir, err))
+		errs = errors.Join(errs, fmt.Errorf("resolve overlay provider for %s: %w", p.ConfigDir, err))
+	} else {
+		errs = errors.Join(errs, m.removeAccountDir(prov, p.ConfigDir))
 	}
-	return errors.Join(credErr, m.removeAccountDir(prov, p.ConfigDir))
+	return errors.Join(errs, m.Store.ReleaseAccountIndex(p.Index))
 }
 
 // Remove deletes an account from the pool: tears down its overlay, removes its

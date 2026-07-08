@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/fusekit/state"
 )
 
 // ErrNoIdentity means a .claude.json has no usable "oauthAccount" identity.
@@ -33,6 +34,39 @@ func AccountIdentity(backend fkoverlay.Backend, configDir string) (*Identity, er
 		priv = fkoverlay.FusePrivateRoot(configDir)
 	}
 	return readIdentity(filepath.Join(priv, ".claude.json"))
+}
+
+// WriteIdentity injects oauthAccount verbatim into a pool account's private
+// .claude.json, the inverse of AccountIdentity: same private-root path math,
+// merged into the existing document (seeded by PrepareAdd) preserving every
+// sibling key, written atomically. A missing or unparseable file fails loud —
+// it never seeds a fresh document.
+func WriteIdentity(backend fkoverlay.Backend, configDir string, oauthAccount json.RawMessage) error {
+	priv := configDir
+	if backend != fkoverlay.BackendSymlink {
+		priv = fkoverlay.FusePrivateRoot(configDir)
+	}
+	path := filepath.Join(priv, ".claude.json")
+	src, err := os.ReadFile(path) //nolint:gosec // G304: path is a cc-pool-managed account .claude.json under the state dir
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(src, &top); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+	if top == nil {
+		return fmt.Errorf("parse %s: not a JSON object", path)
+	}
+	top["oauthAccount"] = oauthAccount
+	out, err := json.Marshal(top)
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", path, err)
+	}
+	if err := state.AtomicWrite(path, out, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
 }
 
 func readIdentity(path string) (*Identity, error) {

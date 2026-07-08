@@ -80,22 +80,6 @@ func TestSetAccountLabel(t *testing.T) {
 	}
 }
 
-func TestNextAccountIndex(t *testing.T) {
-	s := openTest(t)
-	if n, _ := s.NextAccountIndex(); n != 1 {
-		t.Fatalf("first index = %d, want 1", n)
-	}
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-	_ = s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
-	if n, _ := s.NextAccountIndex(); n != 3 {
-		t.Fatalf("next index = %d, want 3", n)
-	}
-	_ = s.DeleteAccount(1)
-	if n, _ := s.NextAccountIndex(); n != 1 {
-		t.Fatalf("reused index = %d, want 1", n)
-	}
-}
-
 func TestMetaRoundTrip(t *testing.T) {
 	s := openTest(t)
 	if _, ok, err := s.GetMeta("initialized"); ok || err != nil {

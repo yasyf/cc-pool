@@ -122,6 +122,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	noteFuseFirstMount(out, pending.OverlayKind)
 
 	if err := loginFlow(cmd, pending, opts); err != nil {
+		releaseKeptAdd(cmd, m, pending)
 		return nil, err
 	}
 
@@ -157,6 +158,8 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 				} else {
 					step(out, "Rolled back the account.")
 				}
+			} else {
+				releaseKeptAdd(cmd, m, pending)
 			}
 			return nil, err
 		}
@@ -167,6 +170,15 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	}
 	success(out, "Added %s.", name)
 	return acct, nil
+}
+
+// releaseKeptAdd frees a kept-dir attempt's index reservation so rerunning
+// `ccp add` resumes it on the same index (SeedKeptExisting adopts the login);
+// without it a retry would count up until the daemon's TTL sweep.
+func releaseKeptAdd(cmd *cobra.Command, m *pool.Manager, p *pool.PendingAdd) {
+	if err := m.ReleaseAdd(p); err != nil {
+		warn(cmd.ErrOrStderr(), "couldn't release the account's index reservation: %v", err)
+	}
 }
 
 // noteFuseFirstMount warns about macOS's one-time volume-access grant prompts on an account's first fuse mount.

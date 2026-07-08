@@ -86,6 +86,16 @@ type Manager struct {
 	// it at a temp dir so they never touch real state.
 	LockDir string
 
+	// OnCredWrite, when non-nil, fires after every successful credential store
+	// write (both refresh and AdoptRotatedToken flow through writeCred), letting
+	// the host-sync registry mirror a rotation. Its error is logged and
+	// swallowed — a registry write must never fail a refresh. It runs with the
+	// per-account lock held, so implementations must not block and must not
+	// acquire any lock that is ever held while an account lock is being
+	// acquired (converge locks registry→account; a registry lock here inverts
+	// that order) — dispatch real work asynchronously.
+	OnCredWrite func(store.Account, *creds.Credential) error
+
 	// muMap guards locks (held only for the map access); locks holds one mutex per
 	// account ID serializing that account's credential read→refresh→write cycle
 	// in-process. That mutex is DELIBERATELY held across Keychain and OAuth I/O —

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
@@ -56,11 +57,18 @@ func (m *Manager) ReadCredential(a store.Account) (*creds.Credential, creds.Sour
 	return nil, creds.SourceKeychain, fmt.Errorf("no credential in the Keychain or credential file: %w", creds.ErrNotFound)
 }
 
-// writeCred upserts cred on the backend src names.
+// writeCred upserts cred on the backend src names, then fires OnCredWrite. A
+// hook error is logged and swallowed: a registry write must never fail a
+// refresh.
 func (m *Manager) writeCred(a store.Account, src creds.Source, cred *creds.Credential) error {
 	s := m.Creds.Store(a, src)
 	if err := s.Write(cred); err != nil {
 		return fmt.Errorf("write credential to %s: %w", s, err)
+	}
+	if m.OnCredWrite != nil {
+		if err := m.OnCredWrite(a, cred); err != nil {
+			log.Printf("acct-%d OnCredWrite hook: %v", a.ID, err)
+		}
 	}
 	return nil
 }

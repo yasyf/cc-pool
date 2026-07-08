@@ -28,7 +28,12 @@ CREATE TABLE IF NOT EXISTS accounts (
   keychain_account TEXT NOT NULL,
   label            TEXT NOT NULL DEFAULT '',
   overlay_kind     TEXT NOT NULL DEFAULT 'symlink',
+  account_uuid     TEXT NOT NULL DEFAULT '',
   created_at       INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_adds (
+  id         INTEGER PRIMARY KEY,
+  created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS usage_samples (
   account_id    INTEGER NOT NULL,
@@ -111,6 +116,15 @@ func (s *Store) applySchema() error {
 	if err := s.ensureColumn("usage_samples", "scoped_7d_model", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn("accounts", "account_uuid", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// The index must follow the ensureColumn: on a pre-existing db the column is
+	// added above, so it cannot live in the CREATE TABLE schema block (which runs
+	// before the migration and would reference a not-yet-added column).
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_accounts_uuid ON accounts(account_uuid)`); err != nil {
+		return fmt.Errorf("create idx_accounts_uuid: %w", err)
+	}
 	return nil
 }
 
@@ -169,22 +183,25 @@ func (s *Store) SetMeta(key, value string) error {
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
-// UpsertAccount inserts or replaces an account row by id.
+// UpsertAccount inserts or replaces an account row by id. account_uuid is
+// insert-only — deliberately absent from the ON CONFLICT update set so a
+// re-upsert with a zero-value uuid can't wipe a backfilled one; updates go
+// through SetAccountUUID.
 func (s *Store) UpsertAccount(a Account) error {
 	created := a.CreatedAt
 	if created.IsZero() {
 		created = time.Now()
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO accounts(id,config_dir,keychain_service,keychain_account,label,overlay_kind,created_at)
-		 VALUES(?,?,?,?,?,?,?)
+		`INSERT INTO accounts(id,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at)
+		 VALUES(?,?,?,?,?,?,?,?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   config_dir=excluded.config_dir,
 		   keychain_service=excluded.keychain_service,
 		   keychain_account=excluded.keychain_account,
 		   label=excluded.label,
 		   overlay_kind=excluded.overlay_kind`,
-		a.ID, a.ConfigDir, a.KeychainService, a.KeychainAccount, a.Label, a.OverlayKind, created.Unix())
+		a.ID, a.ConfigDir, a.KeychainService, a.KeychainAccount, a.Label, a.OverlayKind, a.AccountUUID, created.Unix())
 	if err != nil {
 		return fmt.Errorf("upsert account %d: %w", a.ID, err)
 	}
@@ -228,14 +245,14 @@ func scanAccount(rows interface{ Scan(...any) error }) (Account, error) {
 	var a Account
 	var created int64
 	if err := rows.Scan(&a.ID, &a.ConfigDir, &a.KeychainService, &a.KeychainAccount,
-		&a.Label, &a.OverlayKind, &created); err != nil {
+		&a.Label, &a.OverlayKind, &a.AccountUUID, &created); err != nil {
 		return a, err
 	}
 	a.CreatedAt = time.Unix(created, 0)
 	return a, nil
 }
 
-const accountCols = `id,config_dir,keychain_service,keychain_account,label,overlay_kind,created_at`
+const accountCols = `id,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at`
 
 // ListAccounts returns all accounts ordered by id.
 func (s *Store) ListAccounts() ([]Account, error) {
@@ -265,6 +282,44 @@ func (s *Store) GetAccount(id int) (Account, error) {
 	return a, err
 }
 
+// SetAccountUUID records an account's Claude accountUuid; a targeted UPDATE so it
+// can't clobber concurrent updates to the row's other columns. Callers backfill
+// lazily — a fresh row starts with the empty-string default.
+func (s *Store) SetAccountUUID(id int, uuid string) error {
+	res, err := s.db.Exec(`UPDATE accounts SET account_uuid=? WHERE id=?`, uuid, id)
+	if err != nil {
+		return fmt.Errorf("set account_uuid for account %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("account %d not found", id)
+	}
+	return nil
+}
+
+// GetAccountByUUID returns the account whose Claude accountUuid is uuid, ok=false
+// if none matches. An empty uuid never matches: the column default is ”, so an
+// empty query would otherwise hit every un-backfilled row — it short-circuits to
+// not-found before touching the db. Duplicate uuids (the schema allows them;
+// doctor flags them) resolve to the lowest id, so repeated calls never flap.
+func (s *Store) GetAccountByUUID(uuid string) (Account, bool, error) {
+	if uuid == "" {
+		return Account{}, false, nil
+	}
+	row := s.db.QueryRow(`SELECT `+accountCols+` FROM accounts WHERE account_uuid=? ORDER BY id LIMIT 1`, uuid)
+	a, err := scanAccount(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Account{}, false, nil
+	}
+	if err != nil {
+		return Account{}, false, fmt.Errorf("get account by uuid %q: %w", uuid, err)
+	}
+	return a, true, nil
+}
+
 // DeleteAccount removes an account and its dependent rows.
 func (s *Store) DeleteAccount(id int) error {
 	tx, err := s.db.Begin()
@@ -285,28 +340,6 @@ func (s *Store) DeleteAccount(id int) error {
 		}
 	}
 	return tx.Commit()
-}
-
-// NextAccountIndex returns the smallest unused account index >= 1.
-func (s *Store) NextAccountIndex() (int, error) {
-	rows, err := s.db.Query(`SELECT id FROM accounts ORDER BY id`)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = rows.Close() }()
-	used := map[int]bool{}
-	for rows.Next() {
-		var id int
-		if err := rows.Scan(&id); err != nil {
-			return 0, err
-		}
-		used[id] = true
-	}
-	for n := 1; ; n++ {
-		if !used[n] {
-			return n, nil
-		}
-	}
 }
 
 func tsOrNil(t time.Time) any {

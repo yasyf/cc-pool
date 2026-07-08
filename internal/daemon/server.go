@@ -192,6 +192,13 @@ func Run(ctx context.Context) error {
 	}
 	defer func() { _ = m.Close() }()
 
+	// Reclaim account-index reservations whose `ccp add` died before
+	// FinalizeAdd/AbandonAdd could run; one sweep per daemon start is the TTL
+	// backstop for the pending-row allocator.
+	if _, err := m.Store.SweepPendingAdds(time.Now().Add(-store.PendingAddTTL)); err != nil {
+		return fmt.Errorf("sweep stale pending adds: %w", err)
+	}
+
 	s := &Server{
 		m:               m,
 		socket:          pool.SocketPath(),

@@ -10,6 +10,7 @@ type Account struct {
 	KeychainAccount string
 	Label           string // human note, e.g. an email or alias
 	OverlayKind     string // overlay backend string: "symlink" | "nfs" | "fskit" | "fileprovider"
+	AccountUUID     string // Claude accountUuid; "" until lazily backfilled
 	CreatedAt       time.Time
 }
 

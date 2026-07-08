@@ -76,8 +76,6 @@ Safety rules baked into the architecture — do not regress them:
 3. **Account dir strings are hashed for Keychain service names** — the path string `ccp` emits and the string hashed must stay byte-identical. No realpath/normalization divergence.
 4. **Fuse mounts are hosted by a detached cc-pool mount-holder process** (socket `~/.cc-pool/mounts.sock`); daemon restarts/upgrades never disturb mounts. The holder is only replaced when no live sessions exist (or `ccp service uninstall --force`).
 
-Known follow-up (documented, test-pinned in `TestConcurrentPrepareAddIndexRace`): two concurrent `ccp add`s can be handed the same account index because no row exists until FinalizeAdd; fixing it needs a pending-row reservation.
-
 ## Ask Before Assuming
 
 When a request is ambiguous — unclear scope, multiple plausible interpretations, undefined edge cases — stop and ask. Propose 2–4 concrete options, or list the assumptions you'd otherwise make. One wrong implementation costs more than ten clarifying exchanges.
