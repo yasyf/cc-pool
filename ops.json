@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"8e31b11c414dc896fa0d03c8732f60b88261d415"}]}
+{"v":1,"lamport":4,"ops":[{"kind":"add_comment","body":"v0.35.0 tagged and pushed (bda559e0); Release workflow success; CI green on rerun (first run hit the tracked mountd holder-spawn flake, fusekit task 550f8d6); cc-pool go.mod resolves v0.35.0."}]}
