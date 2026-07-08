@@ -133,9 +133,9 @@ func runBounded[T any](ctx context.Context, walk func(context.Context) ([]T, err
 
 // scan lists this user's processes and attributes the claude ones. A failed list
 // fails closed (callers read that as "cannot prove idle"); a per-PID read that
-// says the process is gone (ESRCH) or has no readable args (EINVAL: zombie or
-// kernel proc) skips just that process, while any other per-PID error fails the
-// whole scan closed.
+// says the process is gone (ESRCH), was reused by another uid (EPERM), or has no
+// readable args (EINVAL: zombie or kernel proc) skips just that process, while
+// any other per-PID error fails the whole scan closed.
 func scan(ctx context.Context, list func(context.Context) ([]proc, error), args func(context.Context, int) ([]byte, error)) ([]Session, error) {
 	procs, err := list(ctx)
 	if err != nil {
@@ -145,7 +145,11 @@ func scan(ctx context.Context, list func(context.Context) ([]proc, error), args 
 	for _, p := range procs {
 		buf, err := args(ctx, p.pid)
 		if err != nil {
-			if errors.Is(err, unix.ESRCH) || errors.Is(err, unix.EINVAL) {
+			// EPERM is a "gone" signal like ESRCH: enumeration is own-uid-scoped
+			// (kern.proc.uid), so an inspection-time EPERM means the pid died and was
+			// reused by another uid's process. A live own-uid process cannot become
+			// procargs2-EPERM without a setuid exec, which claude never does.
+			if errors.Is(err, unix.ESRCH) || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EPERM) {
 				continue
 			}
 			return nil, fmt.Errorf("read args for pid %d: %w", p.pid, err)
@@ -161,7 +165,7 @@ func scan(ctx context.Context, list func(context.Context) ([]proc, error), args 
 
 // byExecutable walks this user's processes keeping those whose exec path
 // equals execPath. Error semantics match scan: a failed list fails closed,
-// ESRCH/EINVAL skips that process, any other per-PID error fails the walk.
+// ESRCH/EINVAL/EPERM skips that process, any other per-PID error fails the walk.
 func byExecutable(ctx context.Context, execPath string, list func(context.Context) ([]proc, error), args func(context.Context, int) ([]byte, error)) ([]Proc, error) {
 	procs, err := list(ctx)
 	if err != nil {
@@ -171,7 +175,7 @@ func byExecutable(ctx context.Context, execPath string, list func(context.Contex
 	for _, p := range procs {
 		buf, err := args(ctx, p.pid)
 		if err != nil {
-			if errors.Is(err, unix.ESRCH) || errors.Is(err, unix.EINVAL) {
+			if errors.Is(err, unix.ESRCH) || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EPERM) {
 				continue
 			}
 			return nil, fmt.Errorf("read args for pid %d: %w", p.pid, err)
