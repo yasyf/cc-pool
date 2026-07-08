@@ -574,7 +574,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	// Reconcile session rows against reality before consulting the pin: a
 	// claude that just exited must read as warm (bind), not live (hold), and
 	// pollOnce's ~3.5-minute cadence is too coarse for a quick resume.
-	if sessions, err := procscan.Scan(ctx); err == nil {
+	if sessions, err := s.scan(ctx); err == nil {
 		if _, cerr := s.m.Store.CloseDeadSessions(procscan.AlivePIDs(sessions), time.Now()); cerr != nil {
 			s.log.Printf("close dead sessions: %v", cerr)
 		}
