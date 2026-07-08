@@ -16,9 +16,11 @@ func TestSyncPaths(t *testing.T) {
 		got  string
 		want string
 	}{
-		"SyncDir":        {SyncDir(), filepath.Join(root, "sync")},
-		"SyncSocketPath": {SyncSocketPath(), filepath.Join(root, "sync.sock")},
-		"SyncStampsDir":  {SyncStampsDir(), filepath.Join(root, "sync", "stamps")},
+		"SyncDir":              {SyncDir(), filepath.Join(root, "sync")},
+		"SyncSocketPath":       {SyncSocketPath(), filepath.Join(root, "sync.sock")},
+		"SyncStampsDir":        {SyncStampsDir(), filepath.Join(root, "sync", "stamps")},
+		"SyncRegistryPath":     {SyncRegistryPath(), filepath.Join(root, "sync", "registry.json")},
+		"SyncRegistryLockPath": {SyncRegistryLockPath(), filepath.Join(root, "sync", "registry.lock")},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -76,6 +76,7 @@ func renameManual(cmd *cobra.Command, m *pool.Manager, ref, label string) error 
 	if err := m.Store.SetAccountLabel(id, label); err != nil {
 		return err
 	}
+	syncRecordLabel(cmd, m, old, label)
 	success(cmd.OutOrStdout(), "Renamed acct-%02d: %s → %s.", id, accountName(old.Label), label)
 	return nil
 }
@@ -115,6 +116,7 @@ func renameAuto(cmd *cobra.Command, m *pool.Manager, refs []string, force bool) 
 			if err := m.Store.SetAccountLabel(a.ID, derived); err != nil {
 				return err
 			}
+			syncRecordLabel(cmd, m, a, derived)
 			success(out, "acct-%02d: %s → %s", a.ID, accountName(a.Label), derived)
 		}
 	}

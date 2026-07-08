@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 
 	"github.com/yasyf/fusekit/state"
 	"github.com/yasyf/synckit/cregistry"
@@ -23,6 +24,15 @@ type RegistryFile struct {
 	Path string
 	// LockPath is the advisory-lock file guarding Update cycles.
 	LockPath string
+}
+
+// NewRegistryFile is the registry layout under dir — registry.json beside its
+// registry.lock — shared by the daemon and the ccp sync CLI.
+func NewRegistryFile(dir string) *RegistryFile {
+	return &RegistryFile{
+		Path:     filepath.Join(dir, "registry.json"),
+		LockPath: filepath.Join(dir, "registry.lock"),
+	}
 }
 
 // Load reads the registry: a missing file is a fresh empty registry, a

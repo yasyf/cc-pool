@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
+	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -430,6 +432,179 @@ func TestShortCircuitRelogin(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestFinishReloginAndPublish pins the relogin sync hook to the fail-closed
+// token-changed discipline: only a landed login (credential differing from the
+// pre-login baseline) publishes to the shared registry; a login that never
+// landed generates zero registry traffic.
+func TestFinishReloginAndPublish(t *testing.T) {
+	old := finishReloginGrace
+	finishReloginGrace = 0
+	t.Cleanup(func() { finishReloginGrace = old })
+	future := time.Now().Add(time.Hour).UnixMilli()
+
+	t.Run("unchanged credential fails closed and publishes nothing", func(t *testing.T) {
+		m, fk := syncTestEnv(t)
+		m.LockDir = t.TempDir()
+		calls := stubSynckitdRun(t)
+		if err := m.Store.SetMeta(syncMetaKey, "1"); err != nil {
+			t.Fatal(err)
+		}
+		a := addSyncTestAccount(t, m, fk, 3, "u-3", "bob@x.y", "bob", cred("at-old", "rt", future))
+		cmd, _ := syncCmdBuf(t)
+
+		if err := finishReloginAndPublish(cmd, m, a, "at-old"); err == nil {
+			t.Fatal("want the fail-closed error for an unchanged credential")
+		}
+		if _, err := os.Stat(pool.SyncDir()); !os.IsNotExist(err) {
+			t.Fatalf("sync dir exists (stat err %v); a failed relogin must not advertise a chain", err)
+		}
+		if len(*calls) != 0 {
+			t.Errorf("synckitd calls = %v, want none", *calls)
+		}
+	})
+
+	t.Run("landed login publishes the fresh chain and tags the row", func(t *testing.T) {
+		m, fk := syncTestEnv(t)
+		m.LockDir = t.TempDir()
+		stubSynckitdRun(t)
+		writeMeshState(t, `{"self": "me@host-a"}`)
+		if err := m.Store.SetMeta(syncMetaKey, "1"); err != nil {
+			t.Fatal(err)
+		}
+		fresh := cred("at-new", "rt-new", future)
+		a := addSyncTestAccount(t, m, fk, 3, "u-3", "bob@x.y", "bob", fresh)
+		cmd, _ := syncCmdBuf(t)
+
+		if err := finishReloginAndPublish(cmd, m, a, "at-old"); err != nil {
+			t.Fatalf("finishReloginAndPublish: %v", err)
+		}
+		reg, err := syncRegistryFile().Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry, ok := reg["u-3"]
+		if !ok || !entry.Present() {
+			t.Fatalf("entry = %+v, want the re-login published", entry)
+		}
+		if want := hostsync.CredentialHash(fresh); entry.Value.Chain.Hash != want {
+			t.Errorf("chain hash = %q, want %q (the landed credential)", entry.Value.Chain.Hash, want)
+		}
+		if entry.Value.Chain.Holder != "me@host-a" {
+			t.Errorf("holder = %q, want the mesh self", entry.Value.Chain.Holder)
+		}
+		row, err := m.Store.GetAccount(a.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.AccountUUID != "u-3" {
+			t.Errorf("row uuid = %q, want u-3", row.AccountUUID)
+		}
+	})
+}
+
+// TestRunReloginShortCircuitPublishes pins runRelogin's cleared branch to the
+// publish tail — dropping the afterRelogin call would strand peers on a stale
+// chain with no test failing.
+func TestRunReloginShortCircuitPublishes(t *testing.T) {
+	future := time.Now().Add(time.Hour).UnixMilli()
+	m, fk := syncTestEnv(t)
+	m.LockDir = t.TempDir()
+	m.OAuth = &fakeOAuth{}
+	stubSynckitdRun(t)
+	writeMeshState(t, `{"self": "me@host-a"}`)
+	if err := m.Store.SetMeta(syncMetaKey, "1"); err != nil {
+		t.Fatal(err)
+	}
+	a := addSyncTestAccount(t, m, fk, 3, "u-3", "bob@x.y", "bob", cred("at", "rt", future))
+	if _, err := m.Store.SetNeedsLogin(a.ID, time.Now(), "revoked"); err != nil {
+		t.Fatal(err)
+	}
+	cmd, _ := syncCmdBuf(t)
+
+	if err := runRelogin(cmd, m, "3"); err != nil {
+		t.Fatalf("runRelogin: %v", err)
+	}
+	reg, err := syncRegistryFile().Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := reg["u-3"]
+	if !ok || !entry.Present() {
+		t.Fatalf("entry = %+v, want the short-circuit clear published", entry)
+	}
+	// The published chain is the forced refresh's rotated successor.
+	stored, ok := fk.Get(a.KeychainService, a.KeychainAccount)
+	if !ok {
+		t.Fatal("rotated credential missing from the keychain fake")
+	}
+	if want := hostsync.CredentialHash(stored); entry.Value.Chain.Hash != want {
+		t.Errorf("chain hash = %q, want %q (the rotated chain)", entry.Value.Chain.Hash, want)
+	}
+}
+
+// TestTUIReloginSeamsPublish pins the status TUI's re-login paths to the same
+// publish tail as `ccp login` — a TUI-cleared account must not stay flagged
+// dead on every peer.
+func TestTUIReloginSeamsPublish(t *testing.T) {
+	future := time.Now().Add(time.Hour).UnixMilli()
+	setup := func(t *testing.T) (*pool.Manager, store.Account) {
+		t.Helper()
+		m, fk := syncTestEnv(t)
+		m.LockDir = t.TempDir()
+		m.OAuth = &fakeOAuth{}
+		stubSynckitdRun(t)
+		writeMeshState(t, `{"self": "me@host-a"}`)
+		if err := m.Store.SetMeta(syncMetaKey, "1"); err != nil {
+			t.Fatal(err)
+		}
+		return m, addSyncTestAccount(t, m, fk, 3, "u-3", "bob@x.y", "bob", cred("at", "rt", future))
+	}
+	assertPublished := func(t *testing.T) {
+		t.Helper()
+		reg, err := syncRegistryFile().Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e, ok := reg["u-3"]; !ok || !e.Present() {
+			t.Fatalf("entry = %+v, want published", e)
+		}
+	}
+
+	t.Run("checkFresh clear publishes", func(t *testing.T) {
+		m, a := setup(t)
+		if _, err := m.Store.SetNeedsLogin(a.ID, time.Now(), "revoked"); err != nil {
+			t.Fatal(err)
+		}
+		cleared, err := tuiCheckFresh(context.Background(), m, a)
+		if err != nil || !cleared {
+			t.Fatalf("cleared = %v, err = %v; want a clean clear", cleared, err)
+		}
+		assertPublished(t)
+	})
+
+	t.Run("finish login publishes", func(t *testing.T) {
+		old := finishReloginGrace
+		finishReloginGrace = 0
+		t.Cleanup(func() { finishReloginGrace = old })
+		m, a := setup(t)
+		if err := tuiFinishRelogin(context.Background(), m, a, "at-old"); err != nil {
+			t.Fatalf("tuiFinishRelogin: %v", err)
+		}
+		assertPublished(t)
+	})
+
+	t.Run("uncleared checkFresh publishes nothing", func(t *testing.T) {
+		m, a := setup(t) // not flagged: never short-circuits
+		cleared, err := tuiCheckFresh(context.Background(), m, a)
+		if err != nil || cleared {
+			t.Fatalf("cleared = %v, err = %v; want no clear", cleared, err)
+		}
+		if _, err := os.Stat(pool.SyncDir()); !os.IsNotExist(err) {
+			t.Fatalf("sync dir exists (stat err %v); an uncleared account must publish nothing", err)
+		}
+	})
 }
 
 // TestWatchedLoginRun drives watchedLogin.Run() against real child processes

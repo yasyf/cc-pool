@@ -80,8 +80,6 @@ type Service struct {
 
 	// Mesh resolves this host and its peers for a converge pass.
 	Mesh Mesh
-	// DialPeer opens a typed sync client to a peer for the pull fetch.
-	DialPeer func(peer string) *syncservice.Client
 	// Sessions reports local liveness so busy items defer.
 	Sessions Sessions
 	// Claims reserves an account for a teardown.

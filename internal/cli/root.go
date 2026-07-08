@@ -78,6 +78,7 @@ pool.`,
 		newServiceCmd(),
 		newWidgetCmd(),
 		newDaemonCmd(),
+		newSyncCmd(),
 	)
 	return root
 }

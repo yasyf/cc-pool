@@ -52,6 +52,7 @@ type Server struct {
 	m            *pool.Manager
 	socket       string
 	holderSocket string // mount-holder socket; tests point it at a fake holder
+	syncSocket   string // synckit consumer socket; tests point it into a short temp dir
 	snapshot     string // status mirror path; tests point it into a temp dir
 	log          *log.Logger
 
@@ -216,6 +217,7 @@ func Run(ctx context.Context) error {
 		m:               m,
 		socket:          pool.SocketPath(),
 		holderSocket:    mountd.DefaultHolderSocket(),
+		syncSocket:      pool.SyncSocketPath(),
 		holderLog:       pool.MountHolderLogPath(),
 		snapshot:        pool.StatusSnapshotPath(),
 		log:             log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
@@ -291,6 +293,13 @@ func (s *Server) serve(ctx context.Context) error {
 	// first observed unreachable while its mounts are still held.
 	s.serveCtx = ctx
 	s.holder.onLostWithMounts = s.scheduleHolderLostSweep
+
+	// Host sync wires before any worker or handler can read s.sync (per-call
+	// gated on the sync_enabled meta); a failure leaves this run syncless —
+	// sync must never take down single-host pooling.
+	if err := s.setupSync(ctx); err != nil {
+		s.log.Printf("host sync disabled for this run: %v", err)
+	}
 
 	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
 

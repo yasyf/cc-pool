@@ -9,7 +9,6 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/hostsync"
-	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
@@ -56,7 +55,7 @@ func (s *Server) startSyncServer(ctx context.Context, svc *hostsync.Service) err
 	svc.Claims = newServerClaims(s)
 	consumer := hostsync.NewConsumer(svc, s.syncEnabled)
 	fetch := hostsync.NewFetchCredentialHandler(s.m.Store.GetAccountByUUID, s.readCredentialForFetch)
-	return serveSyncSocket(ctx, &s.wg, pool.SyncSocketPath(), consumer, fetch, s.log)
+	return serveSyncSocket(ctx, &s.wg, s.syncSocket, consumer, fetch, s.log)
 }
 
 // syncEnabled reports whether host sync is on, from the store's sync_enabled meta.

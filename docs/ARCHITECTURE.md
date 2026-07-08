@@ -116,3 +116,53 @@ auto-spawns it or samples live.
 
 No secrets are ever stored in cc-pool's database — the macOS Keychain is the only secret
 store.
+
+## Host sync
+
+`ccp sync enable` makes the pool span several Macs over a
+[synckit](https://github.com/yasyf/synckit) mesh: accounts, labels, removals, and
+credential freshness converge across every enabled host, so `ccp add` on one Mac
+materializes the account on the rest with no extra login.
+
+**The shared registry is secretless.** Hosts converge on
+`~/.cc-pool/sync/registry.json`, a last-writer-wins CRDT keyed by each account's Claude
+`accountUuid`. An entry carries metadata plus a chain stamp — token expiry, a one-way
+hash of the token pair, the parent chain's hash, the holder host, a lease — never a
+token. Merging is pull-only and order-independent, and a removal is a tombstone that
+outlives the entry, so `ccp remove` on any host tears the account down everywhere.
+synckitd watches per-account stamp files and nudges peers on change; its periodic
+reconcile tick is the floor when a notify is missed.
+
+**One secret path.** The daemon serves synckit's consumer contract on a second socket,
+`~/.cc-pool/sync.sock`, and that dispatcher carries exactly one custom method:
+`ccp.fetch_credential`. Credentials transit peer RPC — over SSH via the hidden
+`ccp sync rpc-serve` stdio bridge — only during a pull, and land directly in the
+receiving host's Keychain. A host whose login Keychain is unsearchable (headless SSH)
+falls back to the plaintext file store; `ccp sync status` flags the exposure.
+
+**Refresh discipline: one holder, leased.** Claude refresh tokens are single-use, so two
+hosts refreshing one chain fork it and the loser gets signed out. Each chain therefore
+names one **holder**, the only host whose daemon refreshes it preemptively; every other
+host suppresses its refresh. `ccp select` claims holdership and a 45-minute lease before
+launching, renews the lease while the session runs, and releases it on check-in. A live
+peer lease counts as one extra active session in scoring — penalized, never excluded —
+and a dead holder's chain is taken over only once it is expired, unleased, and
+rotation-stale past a jittered 35-minute threshold. On `invalid_grant`, the daemon pulls
+once from peers before flagging the account signed-out, in case a fresher chain already
+exists elsewhere.
+
+**Freshness is lineage-first.** Token expiry timestamps are minted from each host's
+local clock, so clock skew can make a spent chain look fresher than its live child.
+Every freshness decision therefore compares lineage before expiry: a chain stamp carries
+its parent's hash, a child of the currently known chain wins regardless of timestamps,
+and installs refuse anything matching the recorded parent outright. The full rationale,
+including the adversarial-review record behind it, is in the design note
+(`ccn doc show 10bf17d`).
+
+**Teardown fails closed.** A tombstoned account is removed locally only when the host
+can prove it idle — no live session, no launch reservation, no overlay conversion in
+flight; anything unprovable defers to the next pass. After claiming the removal, the
+registry is re-checked so an account re-added in the window is spared, and a uuid shared
+by several local rows is refused outright, never guessed at. `ccp doctor` reports the
+resulting wedge, along with sync-socket health, mesh reachability, and registry
+corruption — which would otherwise fail the refresh gate open.

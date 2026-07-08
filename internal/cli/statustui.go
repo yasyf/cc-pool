@@ -59,7 +59,7 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 			return loginCommand(a.ConfigDir)
 		},
 		finishLogin: func(a store.Account, baseline string) error {
-			return finishRelogin(ctx, m, a, baseline)
+			return tuiFinishRelogin(ctx, m, a, baseline)
 		},
 		readCred: func(a store.Account) (*creds.Credential, error) {
 			cred, _, err := m.ReadCredential(a)
@@ -67,7 +67,7 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 		},
 		resolveAccount: m.Store.GetAccount,
 		checkFresh: func(a store.Account) (bool, error) {
-			return shortCircuitRelogin(ctx, m, a)
+			return tuiCheckFresh(ctx, m, a)
 		},
 	}
 	p := tea.NewProgram(model,
@@ -212,6 +212,26 @@ func (t statusTUI) startReloginCmd(id int) tea.Cmd {
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(statusRefreshInterval, func(tm time.Time) tea.Msg { return tickMsg(tm) })
+}
+
+// tuiFinishRelogin is the TUI's finishLogin seam: the CLI relogin tail with
+// warnings discarded — the alt-screen owns the terminal.
+func tuiFinishRelogin(ctx context.Context, m *pool.Manager, a store.Account, baseline string) error {
+	if err := finishRelogin(ctx, m, a, baseline); err != nil {
+		return err
+	}
+	afterReloginIO(ctx, io.Discard, io.Discard, m, a)
+	return nil
+}
+
+// tuiCheckFresh is the TUI's short-circuit seam; a cleared flag runs the same
+// publish tail as `ccp login`.
+func tuiCheckFresh(ctx context.Context, m *pool.Manager, a store.Account) (bool, error) {
+	cleared, err := shortCircuitRelogin(ctx, m, a)
+	if cleared {
+		afterReloginIO(ctx, io.Discard, io.Discard, m, a)
+	}
+	return cleared, err
 }
 
 // reloginable reports whether a manual `claude /login` could clear s's state (no health gate).

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -61,12 +62,9 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 		return err
 	}
 	if cleared {
-		// Same hygiene as the interactive path below: the cross-session login that
-		// makes the short-circuit fire is exactly what strands a stale copy on the
-		// other backend.
-		if err := m.DropDivergentCopy(cmd.Context(), a); err != nil {
-			note(out, "couldn't remove a stale credential copy on the other backend: %v — run `ccp doctor`.", err)
-		}
+		// The short-circuit's forced refresh is its own liveness proof, so the
+		// post-success tail (hygiene + sync publish) applies here too.
+		afterRelogin(cmd, m, a)
 		success(out, "%s already has a valid credential — cleared needs-login. Run `ccp login %d` again to switch subscriptions.", accountName(a.Label), a.ID)
 		return nil
 	}
@@ -97,19 +95,41 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	if err := cmd.Context().Err(); err != nil {
 		return err
 	}
-	if err := finishRelogin(cmd.Context(), m, a, baseline); err != nil {
+	if err := finishReloginAndPublish(cmd, m, a, baseline); err != nil {
 		return err
-	}
-	// A cross-session re-login (e.g. an SSH login of a Keychain-backed account
-	// lands the fresh credential in the file backend) can leave a stale copy on
-	// the other backend. Resolution already prefers the fresher copy, so this is
-	// hygiene, not correctness — a failure (or an unreachable headless Keychain)
-	// must not fail the completed login.
-	if err := m.DropDivergentCopy(cmd.Context(), a); err != nil {
-		note(out, "couldn't remove a stale credential copy on the other backend: %v — run `ccp doctor`.", err)
 	}
 	success(out, "%s re-logged in.", accountName(a.Label))
 	return nil
+}
+
+// finishReloginAndPublish gates the sync publish on finishRelogin's
+// fail-closed token-changed check: a login that never landed publishes
+// nothing — a failed relogin must not advertise a stale chain.
+func finishReloginAndPublish(cmd *cobra.Command, m *pool.Manager, a store.Account, baseline string) error {
+	if err := finishRelogin(cmd.Context(), m, a, baseline); err != nil {
+		return err
+	}
+	afterRelogin(cmd, m, a)
+	return nil
+}
+
+// afterRelogin is the shared post-success tail. A cross-session re-login
+// (e.g. an SSH login of a Keychain-backed account lands the fresh credential
+// in the file backend) can leave a stale copy on the other backend; resolution
+// already prefers the fresher copy, so that drop is hygiene. Neither it nor
+// the sync publish may fail a completed login.
+func afterRelogin(cmd *cobra.Command, m *pool.Manager, a store.Account) {
+	afterReloginIO(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), m, a)
+}
+
+// afterReloginIO is the cmd-free relogin tail shared with the status TUI.
+func afterReloginIO(ctx context.Context, out, errw io.Writer, m *pool.Manager, a store.Account) {
+	if err := m.DropDivergentCopy(ctx, a); err != nil {
+		note(out, "couldn't remove a stale credential copy on the other backend: %v — run `ccp doctor`.", err)
+	}
+	if err := syncPublishAccountIO(ctx, errw, m, a.ID); err != nil {
+		warn(errw, "re-logged in, but couldn't publish the refreshed account to the sync registry: %v — peers may hold a stale chain until the next converge", err)
+	}
 }
 
 // loginCommand builds the `claude /login` command for an account's config dir;

@@ -164,6 +164,11 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 			return nil, err
 		}
 	}
+	// Explicit add intent: publish past any tombstone so a re-add survives a
+	// peer's earlier removal; the account is live locally either way.
+	if perr := syncPublishAccount(cmd, m, acct.ID); perr != nil {
+		warn(cmd.ErrOrStderr(), "added the account, but couldn't publish it to the sync registry: %v — peer hosts won't see it; check `ccp sync status`", perr)
+	}
 	name := acct.Label
 	if name == "" {
 		name = "the account"

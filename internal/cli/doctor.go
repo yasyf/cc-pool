@@ -46,6 +46,10 @@ func newDoctorCmd() *cobra.Command {
 						_, _ = fmt.Fprintf(out, "%s %s\n", mark, label)
 					}
 				}
+				// Warnings render in the report column but never flip the verdict.
+				reportWarn := func(label, detail string) {
+					_, _ = fmt.Fprintf(out, "%s %s: %s\n", warnStyle.Render("!"), label, detail)
+				}
 
 				// Auto-update can move claude off PATH.
 				if _, err := exec.LookPath("claude"); err != nil {
@@ -107,6 +111,10 @@ func newDoctorCmd() *cobra.Command {
 				reportFileProvider(cmd.Context(), m, accts, fpConsentPending, report)
 				reportFPWedges(accts, fpWedged, daemonAlive, fpRawProbe, report)
 				reportContentHealth(contentHealth, report)
+
+				if err := reportSync(cmd.Context(), m, accts, report, reportWarn); err != nil {
+					return err
+				}
 
 				for _, a := range accts {
 					checkAccount(cmd, m, a, fix, report)

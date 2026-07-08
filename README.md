@@ -72,6 +72,18 @@ ccp status   # highlight an account, press p to pin the current directory
 
 Every launch from that directory then announces `Reusing work@example.com (pinned)` instead of `Selected`, whatever the scores say.
 
+### Run one pool across all your Macs
+
+A second Mac normally means re-running `claude /login` for every subscription, and then the two pools drift apart. Sync mirrors the pool instead:
+
+```sh
+brew install yasyf/tap/synckit      # both Macs
+synckitd host add user@other-mac    # point each Mac at the other
+ccp sync enable                     # both Macs
+```
+
+Accounts and credentials now converge fresher-wins: `ccp add` on one Mac materializes the account on the others with no extra login, `ccp remove` propagates pool-wide, and selection counts a peer's live session against an account's score. Only one host at a time — the chain holder — refreshes an account's token, so the single-use refresh chain never forks. One caveat: on a headless host whose login Keychain is unreachable, a synced credential lands in a plaintext file store instead; `ccp sync status` flags it.
+
 ### Glance at the pool without opening a terminal
 
 Headroom you check only at launch time is headroom you discover too late. Put it in Notification Center:
@@ -93,6 +105,7 @@ The widget ships as its own cask, `yasyf/tap/cc-pool-status`, and shows per-acco
 | `ccp run [claude args…]` | Select the emptiest account and exec `claude`, forwarding every arg |
 | `ccp status` | Per-account usage, score, and sessions; TUI on a terminal, plain table when piped |
 | `ccp select` | Print the chosen account's config dir on stdout, the composable hot path |
+| `ccp sync` | Mirror the pool — accounts, credentials, removals — across Macs on a synckit mesh |
 | `ccp doctor` | Check accounts' Keychain items and overlays; `--fix` repairs drift |
 | `ccp service` | Manage the daemon and mount holder via `install`, `uninstall`, and `status` |
 

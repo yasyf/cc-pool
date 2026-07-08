@@ -127,6 +127,18 @@ func SyncStampsDir() string {
 	return filepath.Join(SyncDir(), "stamps")
 }
 
+// SyncRegistryPath is the secretless host-sync CRDT registry
+// (~/.cc-pool/sync/registry.json).
+func SyncRegistryPath() string {
+	return filepath.Join(SyncDir(), "registry.json")
+}
+
+// SyncRegistryLockPath is the flock serializing registry read-modify-write
+// cycles across the daemon and CLI lifecycle hooks.
+func SyncRegistryLockPath() string {
+	return filepath.Join(SyncDir(), "registry.lock")
+}
+
 // FPExtensionBundleID is the File Provider extension's bundle identifier,
 // handed to pluginkit by fusekit's FileProviderAvailable gate.
 const FPExtensionBundleID = "com.yasyf.cc-pool.status.fileprovider"

@@ -43,13 +43,24 @@ func newRemoveCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "remove <account-id>",
 		Short: "Remove an account from the pool",
-		Args:  cobra.ExactArgs(1),
+		Long: `remove tears down an account: its overlay, config dir, Keychain item, and rows.
+
+With host sync enabled the removal is pool-wide: the account is tombstoned in
+the shared registry before any local teardown, and peer hosts tear down their
+copies on their next converge. --keep-credential preserves only this host's
+Keychain item — the account is still tombstoned and removed everywhere.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, err := parseAccountRef(args[0])
 			if err != nil {
 				return err
 			}
 			return withManager(func(m *pool.Manager) error {
+				// Tombstone first: after teardown the identity is unreadable and a
+				// peer converge would re-materialize the account.
+				if err := syncRecordRemoval(cmd, m, id); err != nil {
+					return err
+				}
 				if err := m.Remove(id, !keepCred); err != nil {
 					return err
 				}
@@ -58,7 +69,7 @@ func newRemoveCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&keepCred, "keep-credential", false, "do not delete the account's Keychain item")
+	cmd.Flags().BoolVar(&keepCred, "keep-credential", false, "keep this host's Keychain item (the account is still removed pool-wide when sync is enabled)")
 	return cmd
 }
 
