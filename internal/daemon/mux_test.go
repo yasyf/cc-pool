@@ -149,6 +149,43 @@ func TestReconcileMigratesLegacyFuseRowToBridge(t *testing.T) {
 	}
 }
 
+// TestReconcileAccountRaceSkipsFuseArmForConvertedRow is the finding-2 regression: an
+// OpSelect/OpMigrate converts an account fuse->symlink during startup reconcile,
+// between the shared account listing and this account's poll claim. reconcileAccount
+// must re-read the row under the claim and branch on the fresh backend — never run the
+// destructive fuse arm (migrateLegacyFuseRow: drainDirForBridge + a fuse mount) on a
+// row that is now symlink in SQLite.
+func TestReconcileAccountRaceSkipsFuseArmForConvertedRow(t *testing.T) {
+	s, dirs, fake := newMigrateServer(t)
+	dir := dirs[1]
+
+	// The stale snapshot the shared listing handed reconcileAccount says nfs — a legacy
+	// per-dir mount needing the mux migration (its dir is still a real dir).
+	stale, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.OverlayKind = "nfs"
+
+	// The race: the row is symlink in SQLite by the time the poll claim lands.
+	setRowKind(t, s, 1, fkoverlay.BackendSymlink)
+
+	s.reconcileAccount(t.Context(), stale)
+
+	if got := fake.setupCount(); got != 0 {
+		t.Fatalf("reconcile ran the fuse arm (mount) on a row converted to symlink: fuse setups=%d, want 0", got)
+	}
+	if got := fake.teardownCount(); got != 0 {
+		t.Fatalf("reconcile ran the fuse arm (teardown) on a converted row: fuse teardowns=%d, want 0", got)
+	}
+	if pool.IsBridgeSymlink(dir) {
+		t.Fatal("reconcile migrated a converted row: a mux bridge symlink was laid")
+	}
+	if got := kindOf(t, s, 1); got != "symlink" {
+		t.Fatalf("reconcile disturbed the converted row: kind=%q, want symlink", got)
+	}
+}
+
 // TestReconcileMigrationRefusesUnmovableContent pins the fail-closed refusal: when
 // the drain cannot classify-and-move the account dir clean (a file colliding with
 // a directory in base), the migration refuses loudly — content intact, no bridge

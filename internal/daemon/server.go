@@ -1237,6 +1237,18 @@ func (s *Server) retreatPoolToSymlink(ctx context.Context, accts []store.Account
 // reconcileAccount brings one account's on-disk overlay in line with its row.
 // Caller holds the poll claim.
 func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
+	// The startup listing that produced `a` can age: the socket serves OpSelect /
+	// OpMigrate during the reconcile, so a conversion can flip the row between the
+	// listing and this poll claim. Re-read once under the held claim (which blocks any
+	// NEW conversion) and branch every arm on the fresh row, so a stale fuse/fp
+	// snapshot never drives a destructive heal (migrateLegacyFuseRow / healFuse) against
+	// a row that is now symlink in SQLite. A vanished account has nothing to reconcile.
+	fresh, err := s.m.Store.GetAccount(a.ID)
+	if err != nil {
+		s.log.Printf("acct-%02d reconcile: re-read row under the poll claim: %v", a.ID, err)
+		return
+	}
+	a = fresh
 	if fpBackedRow(a.OverlayKind) {
 		// File Provider rows reconcile through the domain host (Health, then an
 		// idempotent Setup) — never the non-fuse arm below: its
@@ -1276,34 +1288,18 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 	// overlay. Lstat never follows the link, so this precedes the mount check (which
 	// would traverse the live domain).
 	if s.dirIsOverlaySymlink(a.ConfigDir) {
-		// The listing that produced `a` can age: a symlink→fileprovider conversion
-		// may complete between it and this poll claim (the socket serves OpMigrate
-		// during the startup reconcile), leaving a legitimate File Provider row whose
-		// dir is a domain bridge symlink. Re-read under the held poll claim (which
-		// blocks any NEW conversion) so a stale symlink snapshot never drives the
-		// retract below against a live domain; the retract itself runs only under the
-		// convert claim and with no live session on the bridge, since beginPoll does
-		// not hide the dir from a select landing on it.
-		fresh, err := s.m.Store.GetAccount(a.ID)
-		if err != nil {
-			s.log.Printf("acct-%02d reconcile: re-read row before converge: %v", a.ID, err)
-			return
-		}
-		if fpBackedRow(fresh.OverlayKind) || fuseBackedRow(fresh.OverlayKind) {
-			return // converted off symlink under the aging listing; leave it to the fp/fuse arms
-		}
 		// A fresh per-account tick, not the startup table's shared one: this
-		// crash-window retract is destructive, so its liveness check must be as
-		// fresh as the old per-call liveSessionGate — one scan per reconciled
-		// account, exactly as before.
-		if !s.beginSymlinkHealHeld(s.newTick(ctx), fresh) {
+		// crash-window retract is destructive, so its liveness check must be as fresh
+		// as the old per-call liveSessionGate — one scan per reconciled account. The
+		// retract runs only under the convert claim and with no live session on the
+		// bridge, since beginPoll does not hide the dir from a select landing on it.
+		if !s.beginSymlinkHealHeld(s.newTick(ctx), a) {
 			return
 		}
-		defer s.cl.disownConvert(fresh.ID)
-		if !s.convergeSymlinkRowBridge(fresh) {
+		defer s.cl.disownConvert(a.ID)
+		if !s.convergeSymlinkRowBridge(a) {
 			return
 		}
-		a = fresh
 	}
 	// A live mountpoint under a FUSE row is normal at startup (the holder
 	// survived the restart); under a NON-fuse row it is wreckage — an aborted
