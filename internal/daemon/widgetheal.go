@@ -76,18 +76,18 @@ func (s *Server) reconcileStaleWidget(ctx context.Context) {
 	if len(stale) == 0 {
 		return
 	}
-	confirm, err := StaleWidgetAppexes(ctx, widgetBinaryPath())
-	if err != nil {
-		s.log.Printf("stale widget reconfirm: %v", err)
-		return
-	}
-	current := make(map[int]time.Time, len(confirm))
-	for _, p := range confirm {
-		current[p.PID] = p.StartedAt
-	}
 	for _, p := range stale {
-		at, ok := current[p.PID]
-		if !ok || !at.Equal(p.StartedAt) {
+		// Reconfirm THIS candidate against a fresh scan immediately before its kill —
+		// per candidate, not one batch confirm reused across the loop — so a later
+		// candidate is never killed on staler evidence: a pid reused since an earlier
+		// kill, or an appex already respawned from the new binary, is spared. The same
+		// kill-time reconfirm the FP orphan reap does.
+		confirm, err := StaleWidgetAppexes(ctx, widgetBinaryPath())
+		if err != nil {
+			s.log.Printf("stale widget reconfirm: %v", err)
+			return
+		}
+		if !widgetStillStale(confirm, p) {
 			continue
 		}
 		if err := killPID(p.PID); err != nil {
@@ -97,4 +97,16 @@ func (s *Server) reconcileStaleWidget(ctx context.Context) {
 		s.log.Printf("killed stale widget appex pid %d (started %s): an upgrade replaced its binary; chronod respawns the current one on the next reload",
 			p.PID, p.StartedAt.Format("15:04:05"))
 	}
+}
+
+// widgetStillStale reports whether p is still present in a fresh scan at the SAME
+// (pid, start time) — the per-candidate kill-time reconfirm that spares a reused pid
+// or an appex already respawned from the new binary.
+func widgetStillStale(confirm []WidgetAppex, p WidgetAppex) bool {
+	for _, c := range confirm {
+		if c.PID == p.PID && c.StartedAt.Equal(p.StartedAt) {
+			return true
+		}
+	}
+	return false
 }

@@ -152,6 +152,30 @@ func TestReconcileStaleWidgetGoneOnReconfirm(t *testing.T) {
 	}
 }
 
+// TestReconcileStaleWidgetReconfirmsPerCandidate is the finding-5 regression: each
+// candidate is reconfirmed against a FRESH scan immediately before its own kill, so a
+// later candidate whose pid was reused (start time changed) since an earlier kill is
+// spared. A single batch confirm reused across the loop would kill it on stale evidence.
+func TestReconcileStaleWidgetReconfirmsPerCandidate(t *testing.T) {
+	bin, installedAt := widgetBinary(t)
+	old := installedAt.Add(-time.Hour)
+	killed, scanCalls := swapWidgetSeams(t, bin, [][]procscan.Proc{
+		{{PID: 42, StartedAt: old}, {PID: 43, StartedAt: old}}, // initial scan: both stale
+		{{PID: 42, StartedAt: old}, {PID: 43, StartedAt: old}}, // reconfirm before killing 42: still stale
+		{{PID: 42, StartedAt: old}, {PID: 43, StartedAt: installedAt.Add(-30 * time.Minute)}}, // before killing 43: 43's pid reused
+	})
+	s := &Server{cl: newClaims(), log: log.New(io.Discard, "", 0)}
+
+	s.reconcileStaleWidget(context.Background())
+
+	if len(*killed) != 1 || (*killed)[0] != 42 {
+		t.Fatalf("killed %v, want exactly [42]: 43's pid was reused before its own kill and must be spared", *killed)
+	}
+	if *scanCalls != 3 {
+		t.Fatalf("scanned %d times, want 3 (initial + one reconfirm per candidate): a batch confirm reused across the loop would kill a later candidate on stale evidence", *scanCalls)
+	}
+}
+
 func TestReconcileStaleWidgetNoStale(t *testing.T) {
 	bin, installedAt := widgetBinary(t)
 	killed, scanCalls := swapWidgetSeams(t, bin, [][]procscan.Proc{
