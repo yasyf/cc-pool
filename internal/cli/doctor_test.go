@@ -247,6 +247,18 @@ func TestReportLedgers(t *testing.T) {
 				frags: []string{"parked", "automated recovery is exhausted", "ccp fp repair --account 2", "--retreat"},
 			}},
 		},
+		// A control-plane heal (Missing → deregistered/uncontrollable) can exhaust the
+		// recovery attempts and park the domain WITHOUT the data plane ever wedging, so
+		// the row is parked but never faulted. ledgerFooter/self-heal banner counts it,
+		// so reportLedgers must explain it too — never render a banner with no detail.
+		"parked fp domain that never faulted still explains itself": {
+			ledgers: []daemon.LedgerState{{Policy: "fp.domain", Resource: "/p/acct-02", Attempts: 5, Parked: true}},
+			want: []wantCall{{
+				label:    "acct-02 file provider",
+				frags:    []string{"parked", "automated recovery is exhausted", "ccp fp repair --account 2", "--retreat"},
+				notFrags: []string{"wedged"},
+			}},
+		},
 		"auth streak fault carries the login hint": {
 			ledgers: []daemon.LedgerState{{Policy: "auth.streak", Resource: "/p/acct-01", Faulted: true, LastErr: "401 unauthorized"}},
 			want:    []wantCall{{label: "acct-01 auth", frags: []string{"needs re-login", "ccp login 1", "401 unauthorized"}}},

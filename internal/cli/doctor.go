@@ -278,15 +278,22 @@ func reportLedgers(accts []store.Account, ledgers []daemon.LedgerState, holder *
 			// awaiting its cask upgrade — reportHolderMitigations owns that
 			// guidance), so the row stays silent here.
 		case "fp.domain":
-			if !l.Faulted {
-				continue
-			}
-			detail := "domain wedged (serves control ops but hangs reads); the daemon is recovering it — run `ccp fp repair` to re-register it now, then relaunch any sessions on it"
-			if l.Parked {
+			switch {
+			case l.Faulted:
+				detail := "domain wedged (serves control ops but hangs reads); the daemon is recovering it — run `ccp fp repair` to re-register it now, then relaunch any sessions on it"
+				if l.Parked {
+					id := byDir[l.Resource].ID
+					detail = fmt.Sprintf("domain parked (wedged): the daemon's automated recovery is exhausted — run `ccp fp repair --account %d` to re-register it (or `ccp fp repair --retreat --account %d` to fall back to symlink), then relaunch any sessions on it; a stuck fileproviderd needs a manual restart (see %s)", id, id, abbreviateHome(pool.LogPath()))
+				}
+				report(label(l, "file provider"), false, detail)
+			case l.Parked:
+				// Parked without ever faulting: the Missing control-plane heal (a domain
+				// deregistered externally or gone uncontrollable) exhausts its recovery
+				// attempts without the data plane ever wedging. ledgerFooter counts it
+				// parked, so it needs a doctor explanation too — every banner state does.
 				id := byDir[l.Resource].ID
-				detail = fmt.Sprintf("domain parked (wedged): the daemon's automated recovery is exhausted — run `ccp fp repair --account %d` to re-register it (or `ccp fp repair --retreat --account %d` to fall back to symlink), then relaunch any sessions on it; a stuck fileproviderd needs a manual restart (see %s)", id, id, abbreviateHome(pool.LogPath()))
+				report(label(l, "file provider"), false, fmt.Sprintf("domain parked: the daemon's automated recovery is exhausted (the domain was deregistered or its extension is uncontrollable) — run `ccp fp repair --account %d` to re-register it (or `ccp fp repair --retreat --account %d` to fall back to symlink), then relaunch any sessions on it; a stuck fileproviderd needs a manual restart (see %s)", id, id, abbreviateHome(pool.LogPath())))
 			}
-			report(label(l, "file provider"), false, detail)
 		case "auth.streak":
 			if !l.Faulted {
 				continue
