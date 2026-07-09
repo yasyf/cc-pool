@@ -63,13 +63,21 @@ providers:
   pool-wide zero-session window. Requires fusekit-holder ≥ v0.29.0 (`ccp` refuses older
   holders loudly and keeps accounts on symlink until upgraded).
 
-Privacy (TCC) grants across this stack are one-time. **fusekit-holder**
-(`com.yasyf.fusekit-holder`) performs the NFS mounts, so a single *Network Volumes* grant to
-it covers every consumer. cc-pool itself — which macOS keys on its stable dotted signing
-identifier, `com.yasyf.cc-pool` — needs its own *Network Volumes* grant for the deep-probe
-reads it makes through fuse mounts, and the app group container consent for the File
-Provider bridge. Each is granted once and survives upgrades; macOS re-asks only if the
-binary's signing identity changes (e.g. an unsigned local build).
+Privacy (TCC) grants across this stack are engineered to be one-time, and durability
+depends on how tccd keys each grant. **fusekit-holder** (`com.yasyf.fusekit-holder`)
+performs the NFS mounts, so a single *Network Volumes* grant covers every consumer; it
+survives upgrades because the holder is an app bundle at a fixed `/Applications` path,
+which tccd keys by identifier. cc-pool is a bare executable, and tccd keys a bare
+executable's grants by its **resolved path** — the dotted signing identifier lands in the
+grant's code requirement (any Developer ID release satisfies it) but not in the lookup
+key — so a grant made against a per-version Homebrew keg path dies on every upgrade. The
+daemon therefore re-execs itself from the stable `~/.cc-pool/bin/cc-pool` before touching
+anything TCC-gated: the app group container consent for the File Provider bridge is
+granted once against that path and survives upgrades. The daemon is the only process that
+touches the group container — the CLI reads bridge health from the daemon. Two residuals
+still re-prompt: the interactive CLI runs from the keg path, so *Network Volumes* grants
+for its deep-probe reads through fuse mounts stay per-version, and unsigned local builds
+carry a per-build cdhash requirement.
 
 A few entries stay per-account instead of shared: `daemon/` and `ide/` (Claude's PID-keyed
 supervisor and IDE lock/socket files, which would collide across concurrent sessions),
