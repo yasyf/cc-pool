@@ -13,7 +13,22 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/fileproviderd"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
+
+// setRowKind flips an account's stored overlay backend — the store half of a
+// select/migrate conversion a test races against a heal that already read the row.
+func setRowKind(t *testing.T, s *Server, id int, kind fkoverlay.Backend) {
+	t.Helper()
+	a, err := s.m.Store.GetAccount(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.OverlayKind = string(kind)
+	if err := s.m.Store.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // swapFPDomainProbe overrides the package-level FP probe seam for one test. The
 // seam takes a ctx (the control-op probe is a bounded socket round-trip); test
@@ -534,4 +549,54 @@ func TestHealFPRowsMissingRoutesToControlPlaneHeal(t *testing.T) {
 	if s.fpWedged(dirs[1]) {
 		t.Fatal("a Missing probe must never mark the domain wedged")
 	}
+}
+
+// TestHealFPRaceSkipsRowConvertedOffFP is the finding-1 regression: a select/migrate
+// converts the row off File Provider between the UNCLAIMED probe that produced the
+// heal's stale snapshot and the poll claim. The re-read under the claim must catch the
+// flip and skip — never reconcile the domain (healFPMissing) or re-assert FP state via
+// Sync (healFP attempt 1) for a row that is no longer File Provider — and clear the
+// now-stale ladder.
+func TestHealFPRaceSkipsRowConvertedOffFP(t *testing.T) {
+	t.Run("healFPMissing skips a row converted off FP under the claim", func(t *testing.T) {
+		s, a, dirs, fake := newFPHealServer(t)
+		fake.healthErr = errors.New("no domain registered") // a stale FP row would reconcile here
+		s.fpRecordAttempt(dirs[1], time.Unix(0, 0))          // a prior attempt the skip must clear
+		now := time.Unix(0, 0).Add(time.Hour)                // past the backoff -> due
+
+		// The race: the row is symlink in SQLite; `a` is the pre-probe FP snapshot.
+		setRowKind(t, s, 1, fkoverlay.BackendSymlink)
+
+		s.healFPMissing(t.Context(), a, now)
+
+		if h, se, _, _ := fake.counts(); h != 0 || se != 0 {
+			t.Fatalf("healFPMissing acted through a converted row: healths=%d setups=%d, want 0/0", h, se)
+		}
+		if kind := kindOf(t, s, 1); kind != "symlink" {
+			t.Fatalf("healFPMissing disturbed a converted row: kind=%q, want symlink", kind)
+		}
+		if got := s.fpAttemptsSoFar(dirs[1]); got != 0 {
+			t.Fatalf("healFPMissing left stale FP ladder state on a converted row: attemptsSoFar=%d, want 0", got)
+		}
+	})
+
+	t.Run("healFP attempt 1 skips a row converted off FP under the claim", func(t *testing.T) {
+		s, a, dirs, fake := newFPHealServer(t)
+		wedgeIt(t, s, dirs[1]) // a genuine wedge, so a stale FP row would run attempt 1 (Sync)
+		now := time.Unix(0, 0)
+
+		setRowKind(t, s, 1, fkoverlay.BackendSymlink) // converted in the claim gap
+
+		healFPStep(t, s, a, now) // holds the poll claim, as the heal ticker does
+
+		if _, _, syncs, _ := fake.counts(); syncs != 0 {
+			t.Fatalf("healFP attempt 1 re-asserted FP state (Sync) through a converted row: syncs=%d, want 0", syncs)
+		}
+		if kind := kindOf(t, s, 1); kind != "symlink" {
+			t.Fatalf("healFP disturbed a converted row: kind=%q, want symlink", kind)
+		}
+		if s.fpWedged(dirs[1]) {
+			t.Fatal("healFP must clear the stale wedge ladder for a converted row")
+		}
+	})
 }

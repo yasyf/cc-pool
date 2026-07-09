@@ -284,6 +284,19 @@ func (s *Server) healFPMissing(ctx context.Context, a store.Account, now time.Ti
 		return // scheduler/reconcile owns the dir this iteration
 	}
 	defer s.cl.disownHold(a.ID)
+	// Claim-then-re-read (see ownFresh): the poll claim blocks any new conversion, so
+	// the row read under it is authoritative. A conversion that landed between the
+	// unclaimed probe and this hold leaves a non-FP row the repair must not act on.
+	fresh, err := s.m.Store.GetAccount(a.ID)
+	if err != nil {
+		s.log.Printf("acct-%02d file provider missing-heal: re-read row under the claim: %v", a.ID, err)
+		return
+	}
+	if !fpBackedRow(fresh.OverlayKind) {
+		s.fpReset(fresh.ConfigDir) // converted off File Provider in the claim gap
+		return
+	}
+	a = fresh
 	prov := s.fpProvider(a)
 	if prov == nil {
 		return
@@ -314,7 +327,21 @@ func (s *Server) healFPMissing(ctx context.Context, a store.Account, now time.Ti
 // (a wedged domain already fails their reads); a pending select reservation defers
 // it, without consuming the attempt.
 func (s *Server) healFP(ctx context.Context, a store.Account, now time.Time) {
+	// The probe that scheduled this heal ran unclaimed; the caller's poll claim now
+	// blocks any new conversion, so re-read once under it (claim-then-re-read, see
+	// ownFresh) and use the fresh row throughout — attempt 1's Sync must not re-assert
+	// FP state for a row a conversion flipped in the claim gap.
+	fresh, err := s.m.Store.GetAccount(a.ID)
+	if err != nil {
+		s.log.Printf("acct-%02d file provider recovery: re-read row under the claim: %v", a.ID, err)
+		return
+	}
+	a = fresh
 	dir := a.ConfigDir
+	if !fpBackedRow(a.OverlayKind) {
+		s.fpReset(dir) // converted off File Provider in the claim gap
+		return
+	}
 	// Attempt 1 is a non-destructive re-assert (safe under a live reservation), so
 	// it runs directly under the held poll claim.
 	if s.fpAttemptsSoFar(dir) == 0 {
@@ -337,33 +364,24 @@ func (s *Server) healFP(ctx context.Context, a store.Account, now time.Time) {
 		return
 	}
 	defer s.cl.disownConvert(a.ID)
-	fresh, err := s.m.Store.GetAccount(a.ID)
-	if err != nil {
-		s.log.Printf("acct-%02d file provider recovery: re-read row: %v", a.ID, err)
-		return
-	}
-	if !fpBackedRow(fresh.OverlayKind) {
-		s.fpReset(dir) // converted off File Provider in the claim gap
-		return
-	}
 	if !s.fpWedged(dir) {
 		return // recovered between the probe and the claim
 	}
-	prov := s.fpProvider(fresh)
+	prov := s.fpProvider(a)
 	if prov == nil {
 		return
 	}
 	attempt, tripped := s.fpRecordAttempt(dir, now)
 	if tripped {
-		s.breakerFP(ctx, fresh, prov)
+		s.breakerFP(ctx, a, prov)
 		return
 	}
-	s.log.Printf("acct-%02d file provider domain still wedged; recovery attempt %d: re-registering the domain (discards its replica state) — relaunch any sessions on it", fresh.ID, attempt)
-	if s.reRegisterFP(fresh, prov) {
+	s.log.Printf("acct-%02d file provider domain still wedged; recovery attempt %d: re-registering the domain (discards its replica state) — relaunch any sessions on it", a.ID, attempt)
+	if s.reRegisterFP(a, prov) {
 		// Setup reported the domain cannot serve here at all; retreat now (we hold
 		// the convert claim), live-session-gated.
-		if s.convertFPToSymlinkHeld(ctx, fresh) {
-			s.log.Printf("acct-%02d fell back to symlink: File Provider cannot serve on this machine", fresh.ID)
+		if s.convertFPToSymlinkHeld(ctx, a) {
+			s.log.Printf("acct-%02d fell back to symlink: File Provider cannot serve on this machine", a.ID)
 		}
 	}
 }
