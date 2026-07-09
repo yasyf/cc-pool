@@ -151,9 +151,17 @@ func (s *Server) fpWedgedSnapshot() []fpWedge {
 		return nil
 	}
 	s.ledMu.Lock()
-	defer s.ledMu.Unlock()
+	rows := s.led.snapshot()
+	s.ledMu.Unlock()
+	return fpWedgesFrom(rows)
+}
+
+// fpWedgesFrom distills the wedged File Provider domains from a ledger snapshot — the
+// pure half of fpWedgedSnapshot, shared with statusLedgers so one status response
+// derives both FPWedged and Ledgers from a single s.led snapshot.
+func fpWedgesFrom(rows []ledgerSnapshot) []fpWedge {
 	var out []fpWedge
-	for _, snap := range s.led.snapshot() {
+	for _, snap := range rows {
 		if snap.Policy != fpDomainPolicy.name || !snap.Faulted {
 			continue
 		}

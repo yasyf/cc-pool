@@ -469,8 +469,10 @@ func (s *Server) handleStatus(ctx context.Context) Response {
 			resp.ContentHealth = strings.ReplaceAll(err.Error(), "\n", "; ")
 		}
 	}
-	resp.FPWedged = s.fpWedgedStates(accts)
-	resp.Ledgers = s.ledgersWire()
+	// One s.led snapshot feeds both FPWedged and the Server-owned half of Ledgers, so
+	// a single status response can't contradict itself about the same fp.domain row
+	// (the two derivations previously took ledMu in separate epochs).
+	resp.FPWedged, resp.Ledgers = s.statusLedgers(accts)
 	return resp
 }
 
@@ -481,7 +483,13 @@ func (s *Server) fpWedgedStates(accts []AccountStatus) []FPDomainState {
 	if !s.fpEnabled() {
 		return nil
 	}
-	wedges := s.fpWedgedSnapshot()
+	return fpDomainStates(accts, s.fpWedgedSnapshot())
+}
+
+// fpDomainStates joins wedged File Provider domains to account IDs and labels for the
+// status wire — the pure half of fpWedgedStates, shared with statusLedgers so both
+// FPWedged and Ledgers derive from one s.led snapshot. nil when no domain is wedged.
+func fpDomainStates(accts []AccountStatus, wedges []fpWedge) []FPDomainState {
 	if len(wedges) == 0 {
 		return nil
 	}
