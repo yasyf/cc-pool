@@ -255,7 +255,7 @@ func TestCheckFPRungs(t *testing.T) {
 	controlErr := errors.New("dial unix: connect: no such file or directory")
 	cases := map[string]struct {
 		controlUpAfter int // probe calls that fail before Health answers; -1 = never
-		bridgeUp       bool
+		bridgeUp       *bool
 		daemonAlive    bool
 		consentPending bool
 		wantErr        []string // substrings of the error; empty = success
@@ -263,11 +263,11 @@ func TestCheckFPRungs(t *testing.T) {
 	}{
 		"all green first try": {
 			controlUpAfter: 0,
-			bridgeUp:       true,
+			bridgeUp:       ptr(true),
 		},
 		"control slow then up still passes": {
 			controlUpAfter: 3,
-			bridgeUp:       true,
+			bridgeUp:       ptr(true),
 		},
 		"control never answers names the app rung and skips the bridge": {
 			controlUpAfter: -1,
@@ -276,22 +276,28 @@ func TestCheckFPRungs(t *testing.T) {
 		},
 		"bridge down with the daemon dead points at service install": {
 			controlUpAfter: 0,
-			bridgeUp:       false,
+			bridgeUp:       ptr(false),
 			daemonAlive:    false,
 			wantErr:        []string{"daemon isn't running", "ccp service install"},
 		},
 		"bridge down with consent pending names the TCC prompt": {
 			controlUpAfter: 0,
-			bridgeUp:       false,
+			bridgeUp:       ptr(false),
 			daemonAlive:    true,
 			consentPending: true,
 			wantErr:        []string{"app group container consent prompt", "restart the daemon"},
 		},
 		"bridge down without the signal keeps the generic consent guidance": {
 			controlUpAfter: 0,
-			bridgeUp:       false,
+			bridgeUp:       ptr(false),
 			daemonAlive:    true,
 			wantErr:        []string{"isn't accepting", "consent prompt", "restart the daemon"},
+		},
+		"nil bridge state from a pre-upgrade daemon prescribes a restart": {
+			controlUpAfter: 0,
+			bridgeUp:       nil,
+			daemonAlive:    true,
+			wantErr:        []string{"predates bridge-health reporting", "brew services restart cc-pool"},
 		},
 	}
 	for name, tc := range cases {
@@ -304,11 +310,13 @@ func TestCheckFPRungs(t *testing.T) {
 				}
 				return "9.9.9", nil
 			})
-			swapVar(t, &fpBridgeReachable, func() bool {
+			// The bridge rung and its stuck-diagnosis both read the daemon's
+			// status probe (bridgeUp is its third return) — the CLI never dials
+			// the group-container socket.
+			swapVar(t, &fpDaemonProbe, func() (bool, bool, *bool) {
 				bridgeCalls++
-				return tc.bridgeUp
+				return tc.daemonAlive, tc.consentPending, tc.bridgeUp
 			})
-			swapVar(t, &fpDaemonProbe, func() (bool, bool) { return tc.daemonAlive, tc.consentPending })
 
 			var out bytes.Buffer
 			err := checkFPRungs(t.Context(), &out, time.Millisecond)
@@ -341,8 +349,7 @@ func TestCheckFPRungs(t *testing.T) {
 
 func TestCheckFPRungsCancelUnwinds(t *testing.T) {
 	swapVar(t, &fpControlHealth, func(context.Context) (string, error) { return "", errors.New("down") })
-	swapVar(t, &fpBridgeReachable, func() bool { t.Error("bridge probed after cancel"); return false })
-	swapVar(t, &fpDaemonProbe, func() (bool, bool) { t.Error("daemon probed after cancel"); return false, false })
+	swapVar(t, &fpDaemonProbe, func() (bool, bool, *bool) { t.Error("daemon probed after cancel"); return false, false, nil })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -605,8 +612,10 @@ func TestAwaitFPCapabilityCancelUnwinds(t *testing.T) {
 // with the cask-upgrade guidance and never probes the bridge.
 func TestCheckFPRungsWidgetTooOld(t *testing.T) {
 	swapVar(t, &fpControlHealth, func(context.Context) (string, error) { return "0.1.0", nil })
-	swapVar(t, &fpBridgeReachable, func() bool { t.Error("bridge probed behind a too-old widget"); return false })
-	swapVar(t, &fpDaemonProbe, func() (bool, bool) { return true, false })
+	swapVar(t, &fpDaemonProbe, func() (bool, bool, *bool) {
+		t.Error("bridge probed behind a too-old widget")
+		return false, false, nil
+	})
 
 	var out bytes.Buffer
 	err := checkFPRungs(t.Context(), &out, time.Millisecond)

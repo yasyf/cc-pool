@@ -44,7 +44,9 @@ const fpConsentWatchInterval = 250 * time.Millisecond
 // startFPBridge binds the File Provider data-socket content.BridgeServer
 // (startContentBridge's sibling, same PoolContentSource), waits a bounded
 // fpBridgeWait, and flags fpConsentPending when the bind parks on the
-// app-group-container TCC consent — see ccn doc f71e9b1.
+// app-group-container TCC consent. The consent row keys on the daemon's
+// resolved executable path, held stable by the daemon command's re-exec from
+// pool.StableBinDir() — see ccn doc f71e9b1.
 func (s *Server) startFPBridge(ctx context.Context) {
 	sock := pool.FPBridgeSocketPath()
 	bridge := &content.BridgeServer{Socket: sock, Source: s.contentSource, Version: version.String(), Log: s.log}
@@ -348,4 +350,13 @@ func (s *Server) fpBridgeReady() bool {
 		return s.fpBridgeReadyFn()
 	}
 	return !s.fpConsentPending.Load() && content.NewBridgeClient(pool.FPBridgeSocketPath()).Available()
+}
+
+// fpBridgeUp reports whether the File Provider data socket accepts a connection,
+// for the status wire's FPBridgeUp field. The daemon is the only process that
+// dials the group-container bridge, so the CLI reads this off status instead of
+// touching the socket. Unlike fpBridgeReady it ignores the consent flag — it is
+// the raw socket-liveness fact the CLI renders.
+func (s *Server) fpBridgeUp() bool {
+	return content.NewBridgeClient(pool.FPBridgeSocketPath()).Available()
 }

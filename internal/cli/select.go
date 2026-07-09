@@ -247,7 +247,7 @@ func prepareAccount(cmd *cobra.Command, m *pool.Manager, a store.Account) (strin
 	mergeLaunchSettings(cmd, m, a)
 	if err := m.PreflightRefresh(cmd.Context(), a); err != nil {
 		if errors.Is(err, pool.ErrNeedsLogin) {
-			warn(cmd.ErrOrStderr(), "%s needs to log in again; run `ccp add` or `claude auth login`", accountName(a.Label))
+			warn(cmd.ErrOrStderr(), "%s needs to log in again; run `ccp login %d`", accountName(a.Label), a.ID)
 		} else {
 			warn(cmd.ErrOrStderr(), "%v", err)
 		}

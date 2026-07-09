@@ -21,11 +21,13 @@ type fpFinding struct {
 
 // fpDiagnose produces the File Provider health rungs (extension enablement, app
 // control socket, daemon data bridge) as renderer-agnostic findings. fpRows is
-// the number of fileprovider account rows; consentPending is the daemon's
-// group-container consent signal. With no rows and the extension unavailable it
-// returns nil — the opt-in stack is unused. An absent extension is the root
-// fault and skips the socket probes.
-func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, consentPending bool) []fpFinding {
+// the number of fileprovider account rows; consentPending and bridgeUp are the
+// daemon's group-container consent signal and its data-bridge liveness, supplied
+// by the caller from the daemon's status response — the daemon is the sole
+// dialer of the group-container bridge. With no rows and the extension
+// unavailable it returns nil — the opt-in stack is unused. An absent extension
+// is the root fault and skips the socket probes.
+func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, consentPending bool, bridgeUp *bool) []fpFinding {
 	if !fpAvailable(spec) {
 		if fpRows == 0 {
 			return nil
@@ -49,12 +51,17 @@ func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, consentPen
 		findings = append(findings, fpFinding{"file provider app", true, ver})
 	}
 	switch {
-	case fpBridgeReachable():
+	case bridgeUp != nil && *bridgeUp:
 		findings = append(findings, fpFinding{"file provider bridge", true, ""})
 	case consentPending:
 		findings = append(findings, fpFinding{
 			"file provider bridge", false,
-			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon reports its bind parked on the one-time app group container consent prompt (macOS re-asks only if the binary's signing identity changes — e.g. an unsigned local build — and launchd never surfaces it): approve it, then restart the daemon (`brew services restart cc-pool`) — `ccp fp onboard` walks this end to end",
+			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon reports its bind parked on the app group container consent prompt (a one-time grant to the daemon's stable path ~/.cc-pool/bin/cc-pool; unsigned local builds re-prompt per build): approve it, then restart the daemon (`brew services restart cc-pool`) — `ccp fp onboard` walks this end to end",
+		})
+	case bridgeUp == nil:
+		findings = append(findings, fpFinding{
+			"file provider bridge", false,
+			"bridge health unknown — the running daemon predates bridge reporting: restart it (`brew services restart cc-pool`) so the upgraded daemon takes over, then re-run `ccp doctor`",
 		})
 	default:
 		findings = append(findings, fpFinding{
@@ -100,14 +107,16 @@ func diagnoseFPAddFailure(cmd *cobra.Command, m *pool.Manager, err error) {
 		return
 	}
 	errOut := cmd.ErrOrStderr()
-	alive, consentPending := fpDaemonProbe()
+	alive, consentPending, bridgeUp := fpDaemonProbe()
 	if !alive {
 		warn(errOut, "the cc-pool daemon isn't running, so the File Provider content bridge is down — start it with `ccp service install`, then retry `ccp add`")
+		down := false
+		bridgeUp = &down // a dead daemon's bridge is definitively down, not unreported
 	}
 	// fpRows=1 forces the extension rung to evaluate even before any fileprovider
 	// row exists (the failed add would have been the first).
 	first := true
-	for _, f := range fpDiagnose(cmd.Context(), m.OverlaySpec(), 1, consentPending) {
+	for _, f := range fpDiagnose(cmd.Context(), m.OverlaySpec(), 1, consentPending, bridgeUp) {
 		if f.healthy {
 			continue
 		}

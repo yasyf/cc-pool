@@ -250,6 +250,19 @@ func TestStartFPBridgeBindsUnconditionally(t *testing.T) {
 	if s.fpConsentPending.Load() {
 		t.Fatal("consent-pending flagged on a clean bind")
 	}
+	// handleStatus stamps FPBridgeUp off this dial; the CLI reads it off the wire
+	// rather than touching the group-container socket itself.
+	if !s.fpBridgeUp() {
+		t.Fatal("fpBridgeUp() false after a clean bind")
+	}
+	up := s.fpBridgeUp()
+	wire, err := json.Marshal(Response{OK: true, FPBridgeUp: &up})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wire), `"fp_bridge_up":true`) {
+		t.Fatalf("status wire missing the additive bridge-up field: %s", wire)
+	}
 	cancel()
 	s.wg.Wait()
 }
@@ -289,12 +302,21 @@ func TestStartFPBridgeFlagsConsentPending(t *testing.T) {
 	if !s.fpConsentPending.Load() {
 		t.Fatal("bind blocked on a permission error but consent-pending is not flagged")
 	}
-	wire, err := json.Marshal(Response{OK: true, FPConsentPending: s.fpConsentPending.Load()})
+	if s.fpBridgeUp() {
+		t.Fatal("fpBridgeUp() true while the bind is blocked on the permission error")
+	}
+	up := s.fpBridgeUp()
+	wire, err := json.Marshal(Response{OK: true, FPBridgeUp: &up, FPConsentPending: s.fpConsentPending.Load()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(wire), `"fp_consent_pending":true`) {
 		t.Fatalf("status wire missing the additive consent field: %s", wire)
+	}
+	// Explicit false, never omitted: absence is reserved for pre-v0.49.1 daemons
+	// so the CLI can tell "bridge down" from "daemon doesn't report".
+	if !strings.Contains(string(wire), `"fp_bridge_up":false`) {
+		t.Fatalf("bridge-down wire must carry an explicit fp_bridge_up:false: %s", wire)
 	}
 
 	// "Consent" lands: write is restored, the serve loop's next retry creates
@@ -305,12 +327,19 @@ func TestStartFPBridgeFlagsConsentPending(t *testing.T) {
 	waitFor(t, 2*time.Second, "the retry to bind once the container is creatable", content.NewBridgeClient(sock).Available)
 	waitFor(t, 2*time.Second, "the watchdog to clear consent-pending", func() bool { return !s.fpConsentPending.Load() })
 
-	wire, err = json.Marshal(Response{OK: true, FPConsentPending: s.fpConsentPending.Load()})
+	if !s.fpBridgeUp() {
+		t.Fatal("fpBridgeUp() false after the retry bound the socket")
+	}
+	up = s.fpBridgeUp()
+	wire, err = json.Marshal(Response{OK: true, FPBridgeUp: &up, FPConsentPending: s.fpConsentPending.Load()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(wire), "fp_consent_pending") {
 		t.Fatalf("cleared consent flag still on the wire: %s", wire)
+	}
+	if !strings.Contains(string(wire), `"fp_bridge_up":true`) {
+		t.Fatalf("bound socket must stamp fp_bridge_up on the wire: %s", wire)
 	}
 
 	cancel()

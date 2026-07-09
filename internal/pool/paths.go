@@ -59,6 +59,14 @@ func StateDir() string {
 	return stateDir.Root()
 }
 
+// StableBinDir is the version-independent directory the daemon re-execs itself
+// from (~/.cc-pool/bin). TCC keys a bare executable's app-group-container grants
+// by resolved path, so re-execing from here keeps grants alive across the
+// per-version Homebrew keg paths a `brew upgrade` churns through.
+func StableBinDir() string {
+	return filepath.Join(StateDir(), "bin")
+}
+
 // MuxRootDir is the single native fuse-t mount (~/.cc-pool/mnt) serving every
 // fuse account as a logical subtree MuxRootDir()/<acct-NN>; each account dir is
 // a fail-closed bridge symlink into its subtree.

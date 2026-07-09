@@ -16,10 +16,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/fusekit/version"
 )
 
 func newDoctorCmd() *cobra.Command {
@@ -61,21 +61,29 @@ func newDoctorCmd() *cobra.Command {
 				var cachedHolder *daemon.HolderStatus
 				var contentHealth string
 				var fpConsentPending bool
+				var fpBridgeUp *bool
 				var ledgers []daemon.LedgerState
 				var daemonAlive bool
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
 					daemonAlive = true
-					report("daemon", true, resp.Version)
-					// Pending-TCC guidance, content-source health, and the
-					// self-heal ledger block live only in the daemon's cache.
+					if resp.Version == version.String() {
+						report("daemon", true, resp.Version)
+					} else {
+						report("daemon", false, fmt.Sprintf("running %s but the cli is %s — the upgraded daemon hasn't taken over: `brew services restart cc-pool`", resp.Version, version.String()))
+					}
+					// Pending-TCC guidance, bridge liveness, content-source health,
+					// and the self-heal ledger block live only in the daemon's cache.
 					if sresp, serr := daemon.NewClient().Status(); serr == nil && sresp.OK {
 						cachedHolder = sresp.Holder
 						contentHealth = sresp.ContentHealth
 						fpConsentPending = sresp.FPConsentPending
+						fpBridgeUp = sresp.FPBridgeUp
 						ledgers = sresp.Ledgers
 					}
 				} else {
 					report("daemon", false, "not running; run `ccp service install`")
+					down := false
+					fpBridgeUp = &down // a dead daemon's bridge is definitively down, not unreported
 				}
 
 				accts, err := m.Store.ListAccounts()
@@ -108,7 +116,7 @@ func newDoctorCmd() *cobra.Command {
 				reportStaleWidgetAppex(cmd.Context(), report)
 				reportOrphanedHolder(cmd.Context(), reachable, accts, report)
 
-				reportFileProvider(cmd.Context(), m, accts, fpConsentPending, report)
+				reportFileProvider(cmd.Context(), m, accts, fpConsentPending, fpBridgeUp, report)
 				reportFPWedges(accts, daemonAlive, fpRawProbe, report)
 				reportOrphanFPDomains(cmd.Context(), m, accts, fix, report)
 				reportContentHealth(contentHealth, report)
@@ -400,12 +408,6 @@ var fpControlHealth = func(ctx context.Context) (string, error) {
 	return fileproviderd.NewAppClient(pool.FPControlSocketPath()).Health(ctx)
 }
 
-// fpBridgeReachable reports whether the daemon's File Provider data socket
-// accepts a connection — a seam so doctor tests fake the socket.
-var fpBridgeReachable = func() bool {
-	return content.NewBridgeClient(pool.FPBridgeSocketPath()).Available()
-}
-
 // fileProviderRow treats an unparseable overlay_kind as non-fileprovider,
 // failing safe to the symlink path (fuseBackedRow's sibling — File Provider
 // is a third backend category, never folded into fuse).
@@ -430,8 +432,8 @@ func countFileProvider(accts []store.Account) int {
 // reportFileProvider covers the File Provider rungs: extension enablement, app
 // control socket, daemon bridge socket. Silent when the opt-in stack is unused;
 // with rows, an absent extension is the root fault and skips the socket probes.
-func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Account, consentPending bool, report func(string, bool, string)) {
-	for _, f := range fpDiagnose(ctx, m.OverlaySpec(), countFileProvider(accts), consentPending) {
+func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Account, consentPending bool, bridgeUp *bool, report func(string, bool, string)) {
+	for _, f := range fpDiagnose(ctx, m.OverlaySpec(), countFileProvider(accts), consentPending, bridgeUp) {
 		report(f.label, f.healthy, f.detail)
 	}
 }
@@ -607,12 +609,16 @@ func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(str
 	prefix := fmt.Sprintf("acct-%02d", a.ID)
 	keychain := m.Creds.Store(a, creds.SourceKeychain)
 	file := m.Creds.Store(a, creds.SourceFile)
-	_, kerr := keychain.Read()
+	kcred, kerr := keychain.Read()
 	_, ferr := file.Read()
 
 	switch {
 	case kerr == nil:
 		if errors.Is(ferr, creds.ErrNotFound) {
+			if kcred.ClaudeAiOauth.AccessToken == "" {
+				report(prefix+" credential", true, "keychain (access token empty — the daemon refreshes it on its next poll)")
+				return
+			}
 			report(prefix+" credential", true, "keychain")
 			return
 		}
@@ -620,6 +626,8 @@ func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(str
 		// so copies diverge). Advisory even under --fix — only `ccp cred move`
 		// gates against live sessions and keeps the fresher copy.
 		report(prefix+" credential", false, "credential in BOTH the Keychain and .credentials.json — copies diverge (Claude refresh tokens are single-use); consolidate with `ccp cred move --to keychain` (moves the fresher copy; the daemon gates it against live sessions)")
+	case errors.Is(kerr, creds.ErrNoTokens):
+		report(prefix+" credential", false, fmt.Sprintf("credential holds no tokens — re-login required: run `ccp login %d`", a.ID))
 	case !errors.Is(kerr, creds.ErrNotFound) && !errors.Is(kerr, creds.ErrUnavailable):
 		if !fix {
 			report(prefix+" keychain", false, kerr.Error())
@@ -638,6 +646,8 @@ func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(str
 		report(prefix+" keychain", true, "re-asserted")
 	case ferr == nil:
 		report(prefix+" credential", true, "file")
+	case errors.Is(ferr, creds.ErrNoTokens):
+		report(prefix+" credential", false, fmt.Sprintf("credential holds no tokens — re-login required: run `ccp login %d`", a.ID))
 	case !errors.Is(ferr, creds.ErrNotFound):
 		report(prefix+" credential", false, ferr.Error())
 	case errors.Is(kerr, creds.ErrUnavailable):

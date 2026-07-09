@@ -460,7 +460,8 @@ func (s *Server) handleStatus(ctx context.Context) Response {
 	}
 	// Version lets the client detect a pre-upgrade daemon (which omits newer wire
 	// fields like Components) and fall back to live sampling.
-	resp := Response{OK: true, Version: version.String(), Accounts: accts, Holder: s.holder.wireStatus(), FPConsentPending: s.fpConsentPending.Load()}
+	bridgeUp := s.fpBridgeUp()
+	resp := Response{OK: true, Version: version.String(), Accounts: accts, Holder: s.holder.wireStatus(), FPConsentPending: s.fpConsentPending.Load(), FPBridgeUp: &bridgeUp}
 	// Content-source health lives only in this process; errors.Join's newlines
 	// fold to "; " so doctor renders one line.
 	if s.contentSource != nil {

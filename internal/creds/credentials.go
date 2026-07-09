@@ -10,6 +10,9 @@ import (
 // ErrNoAccessToken rejects persisting a credential with an empty accessToken.
 var ErrNoAccessToken = errors.New("refusing to persist a credential with no accessToken")
 
+// ErrNoTokens rejects a credential blob that holds neither an access nor a refresh token — nothing to use and nothing to refresh, so re-login is required.
+var ErrNoTokens = errors.New("credential blob has no access or refresh token")
+
 // OAuth is the inner object Claude stores under "claudeAiOauth". Field and
 // wrapper-key names are reverse-engineered from the binary and MUST match
 // byte-for-byte or Claude rejects the credential.
@@ -35,8 +38,11 @@ func (c *Credential) Expiry() time.Time {
 	return time.UnixMilli(c.ClaudeAiOauth.ExpiresAt)
 }
 
-// ExpiresWithin reports whether the access token expires within d from now.
+// ExpiresWithin reports whether the access token expires within d from now; an empty access token always counts as expiring, forcing the refresh path.
 func (c *Credential) ExpiresWithin(d time.Duration) bool {
+	if c.ClaudeAiOauth.AccessToken == "" {
+		return true
+	}
 	return time.Until(c.Expiry()) <= d
 }
 
@@ -72,8 +78,8 @@ func parseCredential(b []byte) (*Credential, error) {
 	if err := json.Unmarshal(b, &c); err != nil {
 		return nil, fmt.Errorf("parse credential blob: %w", err)
 	}
-	if c.ClaudeAiOauth.AccessToken == "" {
-		return nil, fmt.Errorf("credential blob has no accessToken")
+	if c.ClaudeAiOauth.AccessToken == "" && c.ClaudeAiOauth.RefreshToken == "" {
+		return nil, ErrNoTokens
 	}
 	return &c, nil
 }

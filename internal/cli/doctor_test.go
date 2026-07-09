@@ -546,7 +546,7 @@ func TestReportFileProvider(t *testing.T) {
 		accts      []store.Account
 		healthVer  string
 		healthErr  error
-		bridgeUp   bool
+		bridgeUp   *bool
 		consent    bool // daemon's consent-pending signal
 		want       []wantReport
 		wantProbes bool // control and bridge each probed exactly once
@@ -568,7 +568,7 @@ func TestReportFileProvider(t *testing.T) {
 			available: true,
 			accts:     []store.Account{fpRow(1), symRow},
 			healthVer: "1.2.3",
-			bridgeUp:  true,
+			bridgeUp:  ptr(true),
 			want: []wantReport{
 				{"file provider extension", true, []string{pool.FPExtensionBundleID, "1 fileprovider account"}},
 				{"file provider app", true, []string{"1.2.3"}},
@@ -580,7 +580,7 @@ func TestReportFileProvider(t *testing.T) {
 			available: true,
 			accts:     []store.Account{fpRow(1)},
 			healthErr: controlErr,
-			bridgeUp:  true,
+			bridgeUp:  ptr(true),
 			want: []wantReport{
 				{"file provider extension", true, []string{"1 fileprovider account"}},
 				{"file provider app", false, []string{controlErr.Error(), pool.WidgetAppPath()}},
@@ -592,7 +592,7 @@ func TestReportFileProvider(t *testing.T) {
 			available: true,
 			accts:     []store.Account{fpRow(1)},
 			healthVer: "1.2.3",
-			bridgeUp:  false,
+			bridgeUp:  ptr(false),
 			want: []wantReport{
 				{"file provider extension", true, nil},
 				{"file provider app", true, []string{"1.2.3"}},
@@ -604,15 +604,30 @@ func TestReportFileProvider(t *testing.T) {
 			available: true,
 			accts:     []store.Account{fpRow(1)},
 			healthVer: "1.2.3",
-			bridgeUp:  false,
+			bridgeUp:  ptr(false),
 			consent:   true,
 			want: []wantReport{
 				{"file provider extension", true, nil},
 				{"file provider app", true, []string{"1.2.3"}},
 				{"file provider bridge", false, []string{
-					"parked on the one-time app group container consent prompt",
-					"re-asks only if the binary's signing identity changes", "unsigned local build",
+					"parked on the app group container consent prompt",
+					"one-time grant to the daemon's stable path ~/.cc-pool/bin/cc-pool",
+					"unsigned local builds re-prompt per build",
 					"restart the daemon", "ccp fp onboard",
+				}},
+			},
+			wantProbes: true,
+		},
+		"nil bridge state from a pre-upgrade daemon prescribes a restart, not a false failure": {
+			available: true,
+			accts:     []store.Account{fpRow(1)},
+			healthVer: "1.2.3",
+			bridgeUp:  nil,
+			want: []wantReport{
+				{"file provider extension", true, nil},
+				{"file provider app", true, []string{"1.2.3"}},
+				{"file provider bridge", false, []string{
+					"bridge health unknown", "predates bridge reporting", "brew services restart cc-pool",
 				}},
 			},
 			wantProbes: true,
@@ -621,7 +636,7 @@ func TestReportFileProvider(t *testing.T) {
 			available: true,
 			accts:     []store.Account{symRow, nfsRow},
 			healthVer: "1.2.3",
-			bridgeUp:  true,
+			bridgeUp:  ptr(true),
 			want: []wantReport{
 				{"file provider extension", true, []string{"0 fileprovider accounts"}},
 				{"file provider app", true, []string{"1.2.3"}},
@@ -632,19 +647,15 @@ func TestReportFileProvider(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			controlProbes, bridgeProbes := 0, 0
+			controlProbes := 0
 			swapVar(t, &fpAvailable, func(fkoverlay.Spec) bool { return tc.available })
 			swapVar(t, &fpControlHealth, func(context.Context) (string, error) {
 				controlProbes++
 				return tc.healthVer, tc.healthErr
 			})
-			swapVar(t, &fpBridgeReachable, func() bool {
-				bridgeProbes++
-				return tc.bridgeUp
-			})
 
 			report, calls := captureReports()
-			reportFileProvider(t.Context(), &pool.Manager{}, tc.accts, tc.consent, report)
+			reportFileProvider(t.Context(), &pool.Manager{}, tc.accts, tc.consent, tc.bridgeUp, report)
 
 			if len(*calls) != len(tc.want) {
 				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
@@ -664,8 +675,8 @@ func TestReportFileProvider(t *testing.T) {
 			if tc.wantProbes {
 				wantProbes = 1
 			}
-			if controlProbes != wantProbes || bridgeProbes != wantProbes {
-				t.Errorf("control probed %d times, bridge %d, want %d each", controlProbes, bridgeProbes, wantProbes)
+			if controlProbes != wantProbes {
+				t.Errorf("control probed %d times, want %d", controlProbes, wantProbes)
 			}
 		})
 	}
@@ -1027,13 +1038,17 @@ func TestCheckCredential(t *testing.T) {
 	usable.ClaudeAiOauth.AccessToken = "at"
 	usable.ClaudeAiOauth.RefreshToken = "rt"
 	usable.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
+	refreshOnlyCred := &creds.Credential{}
+	refreshOnlyCred.ClaudeAiOauth.RefreshToken = "rt"
+	refreshOnlyCred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
 	hardErr := errors.New("security find-generic-password: exit status 51")
 
 	cases := map[string]struct {
 		seedKeychain bool
-		file         string // "", "valid", "corrupt"
-		keychainRead error  // injected keychain Read fault
-		fileDelete   error  // injected file Delete fault
+		keychainCred *creds.Credential // overrides the seeded keychain cred (defaults to usable)
+		file         string            // "", "valid", "corrupt", "deadblob"
+		keychainRead error             // injected keychain Read fault
+		fileDelete   error             // injected file Delete fault
 		fix          bool
 		wantLabel    string
 		wantHealthy  bool
@@ -1080,6 +1095,21 @@ func TestCheckCredential(t *testing.T) {
 			wantLabel:    "acct-01 credential",
 			wantContains: []string{"parse credential blob"},
 		},
+		"a refresh-only keychain blob is heal-pending, not an error": {
+			seedKeychain: true, keychainCred: refreshOnlyCred,
+			wantLabel: "acct-01 credential", wantHealthy: true,
+			wantContains: []string{"access token empty", "daemon"},
+		},
+		"a tokenless keychain blob demands re-login and skips the --fix reassert": {
+			keychainRead: creds.ErrNoTokens, fix: true,
+			wantLabel:    "acct-01 credential",
+			wantContains: []string{"no tokens", "ccp login 1"},
+		},
+		"a tokenless file blob demands re-login": {
+			file:         "deadblob",
+			wantLabel:    "acct-01 credential",
+			wantContains: []string{"no tokens", "ccp login 1"},
+		},
 		"a hard keychain error is reported verbatim": {
 			keychainRead: hardErr,
 			wantLabel:    "acct-01 keychain",
@@ -1110,7 +1140,11 @@ func TestCheckCredential(t *testing.T) {
 			fk.KeychainFaults = credstest.Faults{Read: tc.keychainRead}
 			fk.FileFaults = credstest.Faults{Delete: tc.fileDelete}
 			if tc.seedKeychain {
-				fk.Put(a.KeychainService, a.KeychainAccount, usable)
+				seed := usable
+				if tc.keychainCred != nil {
+					seed = tc.keychainCred
+				}
+				fk.Put(a.KeychainService, a.KeychainAccount, seed)
 			}
 			switch tc.file {
 			case "valid":
@@ -1119,6 +1153,10 @@ func TestCheckCredential(t *testing.T) {
 				}
 			case "corrupt":
 				if err := os.WriteFile(creds.FileCredentialPath(a.ConfigDir), []byte("{not json"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "deadblob":
+				if err := os.WriteFile(creds.FileCredentialPath(a.ConfigDir), []byte(`{"claudeAiOauth":{}}`), 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}

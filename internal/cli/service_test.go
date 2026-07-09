@@ -21,6 +21,8 @@ import (
 	"github.com/yasyf/fusekit/version"
 )
 
+func ptr[T any](v T) *T { return &v }
+
 func swapVar[T any](t *testing.T, target *T, val T) {
 	t.Helper()
 	old := *target

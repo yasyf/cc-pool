@@ -70,18 +70,21 @@ var fpOpenSettings = func(ctx context.Context) error {
 	return fkoverlay.BackendFileProvider.OpenSettings(ctx)
 }
 
-// fpDaemonProbe reports the daemon's liveness and its consent-pending signal —
-// the precise "bridge bind parked on the group-container TCC prompt" fact only
-// the daemon can observe. A seam for tests.
-var fpDaemonProbe = func() (alive, consentPending bool) {
+// fpDaemonProbe reports the daemon's liveness, its consent-pending signal, and
+// whether its File Provider data bridge is up — facts only the daemon can
+// observe (it alone dials the group-container bridge). bridgeUp is nil when the
+// daemon predates bridge reporting (pre-v0.49.1) or status is unavailable, so
+// callers can prescribe a restart instead of misreporting a down bridge. A seam
+// for tests.
+var fpDaemonProbe = func() (alive, consentPending bool, bridgeUp *bool) {
 	cl := daemon.NewClient()
 	if h, err := cl.Health(); err != nil || !h.OK {
-		return false, false
+		return false, false, nil
 	}
 	if st, err := cl.Status(); err == nil && st.OK {
-		return true, st.FPConsentPending
+		return true, st.FPConsentPending, st.FPBridgeUp
 	}
-	return true, false
+	return true, false, nil
 }
 
 // fpCapabilityProbe reports whether the just-launched companion app can actually
@@ -536,7 +539,7 @@ func checkFPRungs(ctx context.Context, out io.Writer, interval time.Duration) er
 	step(out, "CCPoolStatus control socket answering (%s).", ver)
 
 	_, err = pollFPRung(ctx, out, interval, "waiting for the daemon's bridge socket…", func() (string, error) {
-		if fpBridgeReachable() {
+		if _, _, bridgeUp := fpDaemonProbe(); bridgeUp != nil && *bridgeUp {
 			return "", nil
 		}
 		return "", errors.New("not accepting")
@@ -545,13 +548,15 @@ func checkFPRungs(ctx context.Context, out io.Writer, interval time.Duration) er
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
-		alive, pending := fpDaemonProbe()
+		alive, pending, bridgeUp := fpDaemonProbe()
 		switch {
 		case !alive:
 			return fmt.Errorf("the daemon isn't running, so its bridge socket %s can't come up — start it with `ccp service install`, then re-run `ccp fp onboard`",
 				abbreviateHome(pool.FPBridgeSocketPath()))
 		case pending:
-			return errors.New("the daemon is up but its bridge bind is parked on the one-time app group container consent prompt (macOS re-asks only if the binary's signing identity changes — e.g. an unsigned local build — and launchd never surfaces it) — approve the prompt, then restart the daemon (`brew services restart cc-pool`) and re-run `ccp fp onboard`")
+			return errors.New("the daemon is up but its bridge bind is parked on the app group container consent prompt (a one-time grant to the daemon's stable path ~/.cc-pool/bin/cc-pool; unsigned local builds re-prompt per build) — approve the prompt, then restart the daemon (`brew services restart cc-pool`) and re-run `ccp fp onboard`")
+		case bridgeUp == nil:
+			return errors.New("the daemon is up but predates bridge-health reporting — restart it (`brew services restart cc-pool`) so the upgraded daemon takes over, then re-run `ccp fp onboard`")
 		default:
 			return errors.New("the daemon is up but its bridge socket " + abbreviateHome(pool.FPBridgeSocketPath()) +
 				" isn't accepting — approve the app group container consent prompt if one is pending, restart the daemon (`brew services restart cc-pool`), and re-run `ccp fp onboard`; check " + abbreviateHome(pool.LogPath()))

@@ -117,6 +117,9 @@ func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prevAccess str
 func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*creds.Credential, creds.Source, bool, error) {
 	cred, src, err := m.ReadCredential(a)
 	if err != nil {
+		if errors.Is(err, creds.ErrNoTokens) {
+			return nil, src, false, fmt.Errorf("%w: %w", ErrNeedsLogin, err)
+		}
 		return nil, src, false, err
 	}
 	if !cred.ExpiresWithin(within) || !allowRefresh {

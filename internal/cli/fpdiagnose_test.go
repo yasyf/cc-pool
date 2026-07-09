@@ -31,7 +31,7 @@ func TestFPDiagnose(t *testing.T) {
 		fpRows     int
 		healthVer  string
 		healthErr  error
-		bridgeUp   bool
+		bridgeUp   *bool
 		consent    bool
 		want       []wantFinding
 		wantProbes bool
@@ -53,7 +53,7 @@ func TestFPDiagnose(t *testing.T) {
 			available: true,
 			fpRows:    1,
 			healthVer: "1.2.3",
-			bridgeUp:  true,
+			bridgeUp:  ptr(true),
 			want: []wantFinding{
 				{"file provider extension", true, []string{pool.FPExtensionBundleID, "1 fileprovider account"}},
 				{"file provider app", true, []string{"1.2.3"}},
@@ -65,7 +65,7 @@ func TestFPDiagnose(t *testing.T) {
 			available: true,
 			fpRows:    1,
 			healthErr: controlErr,
-			bridgeUp:  true,
+			bridgeUp:  ptr(true),
 			want: []wantFinding{
 				{"file provider extension", true, []string{"1 fileprovider account"}},
 				{"file provider app", false, []string{controlErr.Error(), pool.WidgetAppPath()}},
@@ -77,7 +77,7 @@ func TestFPDiagnose(t *testing.T) {
 			available: true,
 			fpRows:    1,
 			healthVer: "1.2.3",
-			bridgeUp:  false,
+			bridgeUp:  ptr(false),
 			want: []wantFinding{
 				{"file provider extension", true, nil},
 				{"file provider app", true, []string{"1.2.3"}},
@@ -89,15 +89,30 @@ func TestFPDiagnose(t *testing.T) {
 			available: true,
 			fpRows:    1,
 			healthVer: "1.2.3",
-			bridgeUp:  false,
+			bridgeUp:  ptr(false),
 			consent:   true,
 			want: []wantFinding{
 				{"file provider extension", true, nil},
 				{"file provider app", true, []string{"1.2.3"}},
 				{"file provider bridge", false, []string{
-					"parked on the one-time app group container consent prompt",
-					"re-asks only if the binary's signing identity changes", "unsigned local build",
+					"parked on the app group container consent prompt",
+					"one-time grant to the daemon's stable path ~/.cc-pool/bin/cc-pool",
+					"unsigned local builds re-prompt per build",
 					"restart the daemon", "ccp fp onboard",
+				}},
+			},
+			wantProbes: true,
+		},
+		"nil bridge state from a pre-upgrade daemon prescribes a restart, not a false failure": {
+			available: true,
+			fpRows:    1,
+			healthVer: "1.2.3",
+			bridgeUp:  nil,
+			want: []wantFinding{
+				{"file provider extension", true, nil},
+				{"file provider app", true, []string{"1.2.3"}},
+				{"file provider bridge", false, []string{
+					"bridge health unknown", "predates bridge reporting", "brew services restart cc-pool",
 				}},
 			},
 			wantProbes: true,
@@ -106,7 +121,7 @@ func TestFPDiagnose(t *testing.T) {
 			available: true,
 			fpRows:    0,
 			healthVer: "1.2.3",
-			bridgeUp:  true,
+			bridgeUp:  ptr(true),
 			want: []wantFinding{
 				{"file provider extension", true, []string{"0 fileprovider accounts"}},
 				{"file provider app", true, []string{"1.2.3"}},
@@ -117,18 +132,14 @@ func TestFPDiagnose(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			controlProbes, bridgeProbes := 0, 0
+			controlProbes := 0
 			swapVar(t, &fpAvailable, func(fkoverlay.Spec) bool { return tc.available })
 			swapVar(t, &fpControlHealth, func(context.Context) (string, error) {
 				controlProbes++
 				return tc.healthVer, tc.healthErr
 			})
-			swapVar(t, &fpBridgeReachable, func() bool {
-				bridgeProbes++
-				return tc.bridgeUp
-			})
 
-			got := fpDiagnose(t.Context(), fkoverlay.Spec{}, tc.fpRows, tc.consent)
+			got := fpDiagnose(t.Context(), fkoverlay.Spec{}, tc.fpRows, tc.consent, tc.bridgeUp)
 			if len(got) != len(tc.want) {
 				t.Fatalf("got %d findings %+v, want %d", len(got), got, len(tc.want))
 			}
@@ -146,8 +157,8 @@ func TestFPDiagnose(t *testing.T) {
 			if tc.wantProbes {
 				wantProbes = 1
 			}
-			if controlProbes != wantProbes || bridgeProbes != wantProbes {
-				t.Errorf("control probed %d times, bridge %d, want %d each", controlProbes, bridgeProbes, wantProbes)
+			if controlProbes != wantProbes {
+				t.Errorf("control probed %d times, want %d", controlProbes, wantProbes)
 			}
 		})
 	}
@@ -192,11 +203,10 @@ func TestIsFPSetupFailure(t *testing.T) {
 // produces zero output and never touches a probe seam.
 func TestDiagnoseFPAddFailure(t *testing.T) {
 	t.Run("fp sentinel with daemon down warns and renders the unhealthy rungs", func(t *testing.T) {
-		swapVar(t, &fpDaemonProbe, func() (bool, bool) { return false, false })
+		swapVar(t, &fpDaemonProbe, func() (bool, bool, *bool) { return false, false, nil })
 		swapVar(t, &fpAvailable, func(fkoverlay.Spec) bool { return true })
 		controlErr := errors.New("connect: no such file or directory")
 		swapVar(t, &fpControlHealth, func(context.Context) (string, error) { return "", controlErr })
-		swapVar(t, &fpBridgeReachable, func() bool { return false })
 
 		var buf bytes.Buffer
 		cmd := &cobra.Command{}
@@ -223,10 +233,9 @@ func TestDiagnoseFPAddFailure(t *testing.T) {
 	})
 
 	t.Run("orphan-materialization note gates on the deferred-creation sentinels", func(t *testing.T) {
-		swapVar(t, &fpDaemonProbe, func() (bool, bool) { return true, false })
+		swapVar(t, &fpDaemonProbe, func() (bool, bool, *bool) { return true, false, ptr(true) })
 		swapVar(t, &fpAvailable, func(fkoverlay.Spec) bool { return true })
 		swapVar(t, &fpControlHealth, func(context.Context) (string, error) { return "1.2.3", nil })
-		swapVar(t, &fpBridgeReachable, func() bool { return true })
 
 		const orphanNote = "materialize this account's File Provider domain later as an orphan"
 		cases := map[string]struct {
@@ -259,9 +268,9 @@ func TestDiagnoseFPAddFailure(t *testing.T) {
 			"bare error":               errors.New("disk full"),
 		} {
 			t.Run(name, func(t *testing.T) {
-				swapVar(t, &fpDaemonProbe, func() (bool, bool) {
+				swapVar(t, &fpDaemonProbe, func() (bool, bool, *bool) {
 					t.Error("fpDaemonProbe called for a non-FP failure")
-					return false, false
+					return false, false, nil
 				})
 				swapVar(t, &fpAvailable, func(fkoverlay.Spec) bool {
 					t.Error("fpAvailable probed for a non-FP failure")

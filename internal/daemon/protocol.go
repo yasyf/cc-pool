@@ -330,12 +330,18 @@ type Response struct {
 	ContentHealth string `json:"content_health,omitempty"`
 	// FPConsentPending: the daemon's File Provider bridge bind has not
 	// completed while the daemon is alive — the signature of the app-group-
-	// container TCC consent (keyed on the binary's code-signing identity: the
-	// release build's stable dotted identifier makes it one-time, and only
-	// identity churn — e.g. an unsigned dev build — re-prompts; launchd never
-	// surfaces the prompt). Approve it, then restart the daemon. Additive;
-	// status only.
+	// container TCC consent (keyed on the daemon's resolved executable path,
+	// held stable by the daemon command's re-exec from pool.StableBinDir(), so
+	// the grant is one-time; unsigned dev builds re-prompt per build). Approve
+	// it, then restart the daemon. Additive; status only.
 	FPConsentPending bool `json:"fp_consent_pending,omitempty"`
+	// FPBridgeUp: the daemon's File Provider data socket is accepting — the
+	// daemon is the only process that dials the group-container bridge, so the
+	// CLI (doctor, onboard, add-failure diagnosis) reads this fact off the status
+	// wire instead of touching the socket itself. A pointer so absence (a
+	// pre-v0.49.1 daemon that predates bridge reporting) is distinguishable from
+	// a down bridge; the daemon always stamps it. Additive; status only.
+	FPBridgeUp *bool `json:"fp_bridge_up,omitempty"`
 	// FPWedged lists File Provider domains the daemon's data-plane probe found
 	// wedged (control ops answer, reads hang). Additive; status only.
 	FPWedged []FPDomainState `json:"fp_wedged,omitempty"`

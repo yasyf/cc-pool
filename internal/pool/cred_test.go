@@ -404,6 +404,38 @@ func TestMoveCredentialFresherWins(t *testing.T) {
 	}
 }
 
+// TestReadCredentialRefreshOnlyKeychainWinsByExpiry pins that a refresh-only
+// keychain blob (empty access token, live refresh token) still competes in the
+// fresher-wins probe on its raw expiry: a LATER-expiring refresh-only keychain
+// copy beats an EARLIER-expiring complete file copy and resolution returns the
+// keychain — proof the ExpiresWithin empty-token fold never leaked into Expiry().
+func TestReadCredentialRefreshOnlyKeychainWinsByExpiry(t *testing.T) {
+	dir := t.TempDir()
+	a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc-heal", KeychainAccount: "user"}
+	fk := credstest.NewFake()
+	kcOnly := refreshOnly("rt-kc", time.Now().Add(4*time.Hour)) // later, but access-token-less
+	fk.Put(a.KeychainService, a.KeychainAccount, kcOnly)
+	fileCred := &creds.Credential{}
+	fileCred.ClaudeAiOauth.AccessToken = "at-file"
+	fileCred.ClaudeAiOauth.RefreshToken = "rt-file"
+	fileCred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli() // earlier
+	if err := creds.WriteFileCredential(dir, fileCred); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Creds: fk, LockDir: t.TempDir()}
+
+	cred, src, err := m.ReadCredential(a)
+	if err != nil {
+		t.Fatalf("ReadCredential: %v", err)
+	}
+	if src != creds.SourceKeychain {
+		t.Errorf("source = %v, want keychain (the later-expiring refresh-only copy wins)", src)
+	}
+	if cred.ClaudeAiOauth.AccessToken != "" || cred.ClaudeAiOauth.RefreshToken != "rt-kc" {
+		t.Errorf("resolved cred = %+v, want the refresh-only keychain copy", cred.ClaudeAiOauth)
+	}
+}
+
 // TestDropDivergentCopy pins relogin's consolidation: the backend other than the
 // one resolution prefers (the fresher) is dropped, an unreachable headless
 // keychain is left alone, and a single-backend or empty account is a no-op.
