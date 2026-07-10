@@ -65,7 +65,7 @@ func (s *Store) PendingAddIndexes() ([]int, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list pending adds: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var ids []int
 	for rows.Next() {
 		var id int

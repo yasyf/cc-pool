@@ -57,7 +57,7 @@ func TestEnsureFPAppSpawnsWhenWanted(t *testing.T) {
 				func(context.Context) error { spawns.Add(1); return nil },
 				func() ([]int, error) { return nil, nil })
 		}},
-		{"artifact only, app down", func(t *testing.T, s *Server, spawns *atomic.Int32) {
+		{"artifact only, app down", func(t *testing.T, _ *Server, spawns *atomic.Int32) {
 			// No FP rows; a lone orphan CloudStorage artifact still warrants the app
 			// (the incident shape, and the reap needs a live app to confirm against).
 			stubFPAppSeams(t, func() bool { return false },
@@ -100,7 +100,7 @@ func TestEnsureFPAppNegatives(t *testing.T) {
 			name:      "no rows and no artifacts",
 			available: func() bool { return false },
 			domains:   func() ([]int, error) { return nil, nil },
-			prep:      func(t *testing.T, s *Server) {},
+			prep:      func(_ *testing.T, _ *Server) {},
 		},
 		{
 			name:      "app already serving the socket",
@@ -130,7 +130,7 @@ func TestEnsureFPAppNegatives(t *testing.T) {
 			name:      "list rows error never guesses",
 			available: func() bool { return false },
 			domains:   func() ([]int, error) { return []int{13}, nil },
-			prep:      func(t *testing.T, s *Server) { _ = s.m.Store.Close() },
+			prep:      func(_ *testing.T, s *Server) { _ = s.m.Store.Close() },
 		},
 	}
 	for _, tc := range tests {

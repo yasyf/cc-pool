@@ -561,8 +561,8 @@ func TestHealFPRaceSkipsRowConvertedOffFP(t *testing.T) {
 	t.Run("healFPMissing skips a row converted off FP under the claim", func(t *testing.T) {
 		s, a, dirs, fake := newFPHealServer(t)
 		fake.healthErr = errors.New("no domain registered") // a stale FP row would reconcile here
-		s.fpRecordAttempt(dirs[1], time.Unix(0, 0))          // a prior attempt the skip must clear
-		now := time.Unix(0, 0).Add(time.Hour)                // past the backoff -> due
+		s.fpRecordAttempt(dirs[1], time.Unix(0, 0))         // a prior attempt the skip must clear
+		now := time.Unix(0, 0).Add(time.Hour)               // past the backoff -> due
 
 		// The race: the row is symlink in SQLite; `a` is the pre-probe FP snapshot.
 		setRowKind(t, s, 1, fkoverlay.BackendSymlink)

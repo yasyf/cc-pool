@@ -160,8 +160,8 @@ func TestReconcileStaleWidgetReconfirmsPerCandidate(t *testing.T) {
 	bin, installedAt := widgetBinary(t)
 	old := installedAt.Add(-time.Hour)
 	killed, scanCalls := swapWidgetSeams(t, bin, [][]procscan.Proc{
-		{{PID: 42, StartedAt: old}, {PID: 43, StartedAt: old}}, // initial scan: both stale
-		{{PID: 42, StartedAt: old}, {PID: 43, StartedAt: old}}, // reconfirm before killing 42: still stale
+		{{PID: 42, StartedAt: old}, {PID: 43, StartedAt: old}},                                // initial scan: both stale
+		{{PID: 42, StartedAt: old}, {PID: 43, StartedAt: old}},                                // reconfirm before killing 42: still stale
 		{{PID: 42, StartedAt: old}, {PID: 43, StartedAt: installedAt.Add(-30 * time.Minute)}}, // before killing 43: 43's pid reused
 	})
 	s := &Server{cl: newClaims(), log: log.New(io.Discard, "", 0)}

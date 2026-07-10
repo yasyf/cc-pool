@@ -108,7 +108,7 @@ func TestOrphanReapNegatives(t *testing.T) {
 		name  string
 		setup func(t *testing.T, s *Server, fp *fakeReapFP, candidates *[]int)
 	}{
-		{"live account row", func(t *testing.T, s *Server, fp *fakeReapFP, candidates *[]int) {
+		{"live account row", func(_ *testing.T, _ *Server, fp *fakeReapFP, candidates *[]int) {
 			// acct-1 is a live row (newTestServer). Register + list it as a candidate.
 			fp.registered[pool.AccountDirName(1)] = true
 			*candidates = []int{1}
@@ -121,23 +121,23 @@ func TestOrphanReapNegatives(t *testing.T) {
 			fp.registered[pool.AccountDirName(id)] = true
 			*candidates = []int{id}
 		}},
-		{"kept account dir", func(t *testing.T, s *Server, fp *fakeReapFP, candidates *[]int) {
+		{"kept account dir", func(t *testing.T, _ *Server, _ *fakeReapFP, _ *[]int) {
 			if err := os.MkdirAll(pool.AccountDir(13), 0o700); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{"kept private root", func(t *testing.T, s *Server, fp *fakeReapFP, candidates *[]int) {
+		{"kept private root", func(t *testing.T, _ *Server, _ *fakeReapFP, _ *[]int) {
 			if err := os.MkdirAll(fkoverlay.FusePrivateRoot(pool.AccountDir(13)), 0o700); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{"no domain registered", func(t *testing.T, s *Server, fp *fakeReapFP, candidates *[]int) {
+		{"no domain registered", func(_ *testing.T, _ *Server, fp *fakeReapFP, _ *[]int) {
 			delete(fp.registered, pool.AccountDirName(13)) // DomainRoot -> ErrNoDomain
 		}},
-		{"app unavailable no verdict", func(t *testing.T, s *Server, fp *fakeReapFP, candidates *[]int) {
+		{"app unavailable no verdict", func(_ *testing.T, _ *Server, fp *fakeReapFP, _ *[]int) {
 			fp.domainRootErr[pool.AccountDirName(13)] = fmt.Errorf("state: %w", fileproviderd.ErrAppUnavailable)
 		}},
-		{"bridge not ready", func(t *testing.T, s *Server, fp *fakeReapFP, candidates *[]int) {
+		{"bridge not ready", func(_ *testing.T, s *Server, _ *fakeReapFP, _ *[]int) {
 			s.fpBridgeReadyFn = func() bool { return false }
 		}},
 	}
