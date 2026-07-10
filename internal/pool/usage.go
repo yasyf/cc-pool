@@ -210,7 +210,7 @@ func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleO
 	}
 	defer release()
 	cred, src, _, freshErr := m.ensureFreshToken(ctx, a, RefreshLeadTime, opts.AllowRefresh)
-	if freshErr != nil && !errors.Is(freshErr, ErrNeedsLogin) && cred == nil {
+	if cred == nil {
 		return nil, false, 0, freshErr
 	}
 	usage, rateLimited, retryAfter, err := m.fetchUsage(ctx, a, src, cred, opts)

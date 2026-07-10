@@ -90,6 +90,30 @@ func TestEnsureFreshTokenRefreshOnlyRevoked(t *testing.T) {
 	}
 }
 
+// TestSampleUsageTokenlessFlagsNeedsLogin pins the tombstone path end to end:
+// a blob claude blanked entirely (no access or refresh token) must surface
+// ErrNeedsLogin from SampleUsage rather than panic in fetchUsage on the nil
+// credential ensureFreshToken returns for it (the v0.50.1 regression).
+func TestSampleUsageTokenlessFlagsNeedsLogin(t *testing.T) {
+	fk := credstest.NewFake()
+	m, a := newHealManager(t, fk, &fakeOAuth{})
+	tombstone := `{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"scopes":["user:inference"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}}`
+	if err := os.WriteFile(creds.FileCredentialPath(a.ConfigDir), []byte(tombstone), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, rateLimited, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
+	if !errors.Is(err, ErrNeedsLogin) {
+		t.Fatalf("err = %v, want ErrNeedsLogin", err)
+	}
+	if !errors.Is(err, creds.ErrNoTokens) {
+		t.Fatalf("err = %v, want it to also name creds.ErrNoTokens", err)
+	}
+	if rateLimited {
+		t.Error("rateLimited = true, want false")
+	}
+}
+
 // TestEnsureFreshTokenClassification pins the narrowness of the needs-login
 // mapping: only a tokenless blob (ErrNoTokens) flags the account — a locked or
 // opaque keychain and a fully-absent credential must never be classified as
