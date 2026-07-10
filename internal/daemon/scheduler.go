@@ -141,11 +141,9 @@ func (s *Server) pruneStickyRows() {
 }
 
 // pollAccounts is the per-account sweep (the account.poll row). It reports whether
-// the poll completed cleanly so a status snapshot should be written: false on
-// every skip-the-snapshot condition (ctx cancellation, list-accounts failure, a
-// still-down outage canary, or entering/re-entering outage) — each was a bare
-// return in the old pollOnce, and the status.snapshot row is the last poll row, so
-// stopping the table there is exactly the old snapshot skip.
+// the poll completed cleanly so a status snapshot should be written — false on any
+// skip condition (ctx cancel, list-accounts failure, a still-down outage canary,
+// or entering/re-entering outage). See ccn doc 36b05ef.
 func (s *Server) pollAccounts(ctx context.Context, t *tick) bool {
 	accts, err := s.m.Store.ListAccounts()
 	if err != nil {
@@ -252,13 +250,11 @@ func (s *Server) poolRateLimited() bool {
 	return !s.led.backoffElapsed(poolRateLimitPolicy, poolResource, time.Now())
 }
 
-// pollGated reports whether an account is currently backed off — a recent
-// rate-limit sample still inside its exponential backoff, or a needs-login /
-// exhausted-auth-streak account inside the needs-login interval — so pollOnce
-// skips it with no network attempt (and it never serves as the outage canary).
-// The needs-login backoff needs its own clock: a 401 inserts no usage sample,
-// so it can't ride the rate-limit backoff. Store I/O runs outside ledMu; the
-// streak reads take it around the bookkeeping only.
+// pollGated reports whether an account is currently backed off — inside its
+// rate-limit exponential backoff, or a needs-login / exhausted-auth-streak account
+// inside the needs-login interval — so pollOnce skips it with no network attempt
+// (and it never serves as the outage canary). Store I/O runs outside ledMu; the
+// streak reads take it only around the bookkeeping. See ccn doc 36b05ef.
 func (s *Server) pollGated(a store.Account) bool {
 	dir := a.ConfigDir
 	if last, ok, _ := s.m.Store.LatestUsageSample(a.ID); ok && last.RateLimited &&
@@ -295,12 +291,10 @@ func (s *Server) authThrottled(dir string, needsLogin bool) bool {
 }
 
 // pollAccount samples one account and reports the outcome for outage detection.
-// The caller holds the poll claim, has cleared the backoff gates (pollGated),
-// and owns inter-account spacing. recovery forces AllowBusyRefresh for a busy
-// account regardless of the auth streak — the post-outage heal — which stays
-// safe because fetchUsage's deep guard (post-401 + provably-expired +
-// credential-unchanged re-read) still prevents a refresh-token double-spend; the
-// streak gate is only a heuristic layer.
+// The caller holds the poll claim, has cleared the backoff gates (pollGated), and
+// owns inter-account spacing. recovery forces AllowBusyRefresh for a busy account
+// regardless of the auth streak (the post-outage heal); fetchUsage's deep guard
+// still prevents a refresh-token double-spend. See ccn doc 36b05ef.
 func (s *Server) pollAccount(ctx context.Context, t *tick, a store.Account, recovery bool) sampleOutcome {
 	// Re-assert the overlay so long-lived setups pick up new top-level
 	// ~/.claude entries without an explicit sync.
@@ -340,12 +334,8 @@ func (s *Server) pollAccount(ctx context.Context, t *tick, a store.Account, reco
 	}
 
 	// The prior-401 gate gives a lazily-waking session one full poll to
-	// self-refresh first. Accepted gap: a busy, clock-fresh, server-revoked
-	// token keeps 401ing (fetchUsage's busy guard requires expiry) so
-	// needs-login waits for clock expiry — the live session owns recovery;
-	// refreshing sooner could double-spend a refresh token it still needs. A
-	// recovery sweep bypasses the streak gate (fetchUsage's deep guard still
-	// holds) so a busy account whose token expired during the outage heals now.
+	// self-refresh first; a recovery sweep bypasses the streak gate (fetchUsage's
+	// deep guard still holds). See ccn doc 36b05ef for the accepted gap.
 	busyBySession := t.sessionCount(a.ConfigDir) > 0
 	if busyBySession {
 		// A live session keeps this host's lease alive so peers keep penalizing.

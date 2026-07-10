@@ -69,17 +69,11 @@ func requireRealDir(dir string) error {
 	}
 }
 
-// verifyIdentityRestored confirms a rollback's restore move landed a readable
-// identity back at dir/.claude.json; pre is the identity read before the conversion
-// (nil when the account had none, so there is nothing to restore and nothing to
-// verify). It checks readability, NOT that the bytes match pre: the rollback
-// faithfully restores whatever the private root held, and a genuinely divergent
-// identity there is the convert's own reported cause, preserved for inspection —
-// never destroyed. An UNREADABLE identity (absent or corrupt) is the loss this
-// guards against — the fresher-wins EXDEV window that left the identity gone from
-// every read path — so the error names, in recovery order, where a surviving copy
-// may be found: the resolver's conflict siblings, the private-root backups, then a
-// fresh login.
+// verifyIdentityRestored confirms a rollback's restore move landed a READABLE
+// identity back at dir/.claude.json (pre is the pre-conversion identity, nil when
+// the account had none). It checks readability, not byte-equality with pre; an
+// unreadable identity is the loss it guards against, and the error names, in
+// recovery order, where a surviving copy may be found. See ccn doc d1ab40f.
 func verifyIdentityRestored(a store.Account, dir string, pre *Identity) error {
 	if pre == nil {
 		return nil
@@ -94,13 +88,10 @@ func verifyIdentityRestored(a store.Account, dir string, pre *Identity) error {
 }
 
 // fpProbe classifies the account dir's File Provider domain verdict through the
-// companion app's control op (never a through-domain read). Setup (fusekit)
-// already blocks until the domain enumerates; this proves the bridge data plane
-// end to end before the row flips — the readiness the FP-migrate-storm incident
-// lacked. The daemon injects Manager.FPProbe; otherwise it derives the probe from
-// the freshly-registered target provider, which exposes ProbeDomain. A NoVerdict
-// (app busy/unreachable/too old) is a non-nil error, so the convert gate rolls
-// back rather than flipping an unverified row.
+// companion app's control op (never a through-domain read), proving the bridge data
+// plane end to end before the row flips. A NoVerdict (app busy/unreachable/too old)
+// is a non-nil error, so the convert gate rolls back rather than flipping an
+// unverified row. See ccn doc d1ab40f.
 func (m *Manager) fpProbe(ctx context.Context, fpProv fkoverlay.Provider, accountDir string) error {
 	if m.FPProbe != nil {
 		return m.FPProbe(ctx, accountDir)
@@ -203,15 +194,11 @@ func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, f
 		return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, fmt.Errorf("mount: %w", err))
 	}
 
-	// Verify the identity we moved into the private root survived the move intact.
-	// We read the backing file, NOT back through the fresh mount: a through-mount
-	// os.ReadFile is unbounded and stalls at the macOS-NFS/fuse-t transport layer
-	// when --force converts a dir a live session still holds — hanging the migrate
-	// and stranding the account. The mirror serves this exact file (ReadSynth merges
-	// priv/.claude.json with base), and mirror liveness is already vouched by Setup's
-	// bounded MountAlive stat, the mitigation gate's post-mount health re-check, and
-	// the heal loop — so the backing-file read preserves the only invariant that
-	// matters (the moved identity is intact and unchanged) without the stall.
+	// Verify the moved identity survived by reading the BACKING file, not back
+	// through the fresh mount: a through-mount read is unbounded and stalls at the
+	// fuse-t transport layer when --force converts a dir a live session holds. The
+	// mirror serves this exact file, and its liveness is already vouched elsewhere.
+	// See ccn doc d1ab40f.
 	if preErr == nil {
 		post, err := readIdentity(filepath.Join(priv, ".claude.json"))
 		if err != nil {
@@ -262,21 +249,12 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay
 	return fmt.Errorf("convert acct-%02d: %w (rolled back to symlink)", a.ID, cause)
 }
 
-// convertToFileProvider switches an account onto the File Provider overlay,
-// leaving the account dir a symlink into the OS-surfaced domain root. Two
-// source shapes, split by the mux cutover: a symlink row holds a REAL dir —
-// drain its private files into the shared backing root, tear the links down,
-// and remove the emptied dir so Setup's fail-closed AtomicSymlink can lay the
-// bridge (anything unclassified left inside fails that removal ENOTEMPTY and
-// rolls back, never clobbered — the same stance as the mux cutover's
-// clearAccountDirForBridge) — while a post-mux fuse row is ALREADY a bridge
-// symlink with its private files in the backing root, so the fuse Teardown
-// detaches the subtree and Setup retargets the symlink (a real dir on a fuse
-// row is legacy wreckage AtomicSymlink refuses). Identity is verified from the
-// private BACKING file, never through the fresh domain: a through-domain read
-// is unbounded while the appex materializes, and the domain serves that exact
-// backing file anyway. Every failure past the first move routes through a
-// rollback restoring the source shape; the row flips last.
+// convertToFileProvider switches an account onto the File Provider overlay, leaving
+// the account dir a symlink into the OS-surfaced domain root. Two source shapes
+// (symlink row: a REAL dir drained then removed; post-mux fuse row: already a bridge
+// symlink). Identity is verified from the private BACKING file, never through the
+// fresh domain. Every failure past the first move rolls back the source shape; the
+// row flips last. See ccn doc d1ab40f.
 func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fromProv, fpProv fkoverlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
@@ -378,16 +356,11 @@ func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fr
 	return a, nil
 }
 
-// retractFileProviderIfLaid undoes whatever a failed File Provider Setup laid at
-// the account dir. An absent path or a symlink takes the full Teardown (retract the
-// link AND deregister the domain — deregistering a never-registered domain is a
-// no-op). A REAL dir means Setup never swapped the bridge symlink in — Teardown's
-// fail-closed RemoveSymlink would refuse it — but Setup may still have registered
-// the domain before AtomicSymlink refused the real dir (the fuse→FP legacy shape),
-// which returning nil here leaked forever. So on a real dir it deregisters the
-// domain, but ONLY when the zero-spawn registration check finds one: a rollback
-// that never reached Setup (a drain/teardown fault) leaves no registration and must
-// touch nothing — never spawn the app to deregister a domain that was never laid.
+// retractFileProviderIfLaid undoes whatever a failed File Provider Setup laid at the
+// account dir: an absent path or symlink takes the full Teardown; a REAL dir (Setup
+// never swapped the bridge in) deregisters the domain ONLY when the zero-spawn
+// registration check finds one — never spawn the app to deregister a domain that was
+// never laid. See ccn doc d1ab40f.
 func retractFileProviderIfLaid(ctx context.Context, base, dir string, fpProv fkoverlay.Provider) error {
 	if kind, _ := ClassifyAccountDir(dir); kind != DirReal {
 		return fpProv.Teardown(base, dir)

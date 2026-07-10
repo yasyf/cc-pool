@@ -89,15 +89,12 @@ func (m *Manager) DuplicateIdentity(want Identity) (*store.Account, error) {
 	return nil, nil
 }
 
-// PrepareAdd allocates the next account dir, establishes its overlay, and seeds
-// its private .claude.json from ~/.claude.json so login inherits onboarding
-// state instead of the first-run wizard. Returns the login command to run.
-// Unless the dir is reused (SeedKeptExisting), stale credentials from a dead
-// attempt — the Keychain item under its service and the plaintext file — are
-// deleted. The index is held by an atomic pending_adds reservation (two
-// concurrent PrepareAdds can never collide) that FinalizeAdd promotes and
-// AbandonAdd/ReleaseAdd release; no account row or Keychain item exists until
-// FinalizeAdd.
+// PrepareAdd allocates the next account dir, establishes its overlay, and seeds its
+// private .claude.json from ~/.claude.json so login inherits onboarding state.
+// Returns the login command to run. Stale credentials from a dead attempt are
+// deleted unless the dir is reused (SeedKeptExisting). The index is held by an
+// atomic pending_adds reservation FinalizeAdd promotes; no account row or Keychain
+// item exists until then. See ccn doc 935d323.
 func (m *Manager) PrepareAdd(ctx context.Context) (pending *PendingAdd, err error) {
 	ok, err := m.Initialized()
 	if err != nil {
@@ -311,14 +308,10 @@ func (m *Manager) ReleaseAdd(p *PendingAdd) error {
 	return m.Store.ReleaseAccountIndex(p.Index)
 }
 
-// AbandonAdd cleans up a prepared-but-not-finalized account dir (no store row
-// yet) and any credential its login wrote — the Keychain item and the plaintext
-// file, each deleted explicitly so the rollback never depends on the dir
-// removal succeeding. The index reservation is released last but
-// unconditionally (even when cleanup partly fails): a concurrent PrepareAdd
-// must never be handed the index while its dir is mid-teardown, and a
-// lingering reservation would block the index until the daemon's TTL sweep.
-// p must be non-nil, from PrepareAdd. Idempotent.
+// AbandonAdd cleans up a prepared-but-not-finalized account dir and any credential
+// its login wrote (the Keychain item and the plaintext file, each deleted
+// explicitly). The index reservation is released last but unconditionally. p must be
+// non-nil, from PrepareAdd. Idempotent. See ccn doc 935d323.
 func (m *Manager) AbandonAdd(p *PendingAdd) error {
 	var errs error
 	pend := store.Account{ConfigDir: p.ConfigDir, KeychainService: p.KeychainService}

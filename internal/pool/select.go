@@ -200,14 +200,11 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 		s := samples[0]
 		in.RateLimited = s.RateLimited
 		in.Burn5hPerHour = forecast.Burn5h(samples, now)
-		// Utilization, resets, timestamp, and overage source from the last good
-		// sample, not samples[0]: a 429 poll records a zeroed rate_limited
-		// placeholder as the newest row (load-bearing for daemon backoff), so
-		// samples[0] would read 0%/no-overage for a rate-limited account.
-		// HasUsage gates on that known-good sample too, not on any sample: an
-		// account whose only rows are 429 placeholders has no real utilization, so
-		// ok=false is no-data (HasUsage stays false → status renders "no data", not
-		// "0% used"). RateLimited above still tracks the newest row.
+		// Utilization, resets, timestamp, and overage source from the last GOOD
+		// sample, not samples[0]: a 429 poll records a zeroed rate_limited placeholder
+		// as the newest row (load-bearing for daemon backoff), so samples[0] would read
+		// 0% for a rate-limited account. HasUsage gates on the good sample too. See ccn
+		// doc 36b05ef.
 		if g, ok, gerr := m.Store.LatestGoodUsageSample(a.ID); gerr != nil {
 			return in, nil, nil, fmt.Errorf("latest good usage sample for account %d: %w", a.ID, gerr)
 		} else if ok {

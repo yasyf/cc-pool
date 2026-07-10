@@ -156,17 +156,11 @@ type Server struct {
 	// goroutine touches it — no lock.
 	lastContentHealth string
 
-	// led is the self-heal ledger store shared by every ported Server-owned
-	// family: the fp.domain and fuse.remount rows, plus the auth.streak and
-	// ratelimit.acct / ratelimit.pool streaks (the holder cache's fuse.deepwedge
-	// / fuse.shallowdead rows live in holderState.led under its mu). ledMu is the
-	// enclosing serialization the ledgers type documents: rows are touched from
-	// the heal tick, the scheduler poll loop, and the select/status/repair RPC
-	// handlers plus migrate/strand/convert, so every s.led access takes ledMu —
-	// never held across mount/Sync/re-register/bounce or usage-fetch/refresh I/O
-	// (bookkeeping in, I/O out). The streaks were scheduler-goroutine-local (no
-	// lock) before the fold; sharing one map with the concurrently-touched
-	// heal-family rows makes ledMu mandatory on every streak access too.
+	// led is the shared self-heal ledger (fp.domain and fuse.remount rows, plus the
+	// auth.streak and ratelimit.acct / ratelimit.pool streaks). ledMu is its
+	// serialization: every s.led access takes ledMu, never held across
+	// mount/Sync/re-register/bounce or usage-fetch/refresh I/O (bookkeeping in, I/O
+	// out). See ccn doc 36b05ef.
 	led   *ledgers
 	ledMu sync.Mutex
 
@@ -298,12 +292,8 @@ func (s *Server) serve(ctx context.Context) error {
 	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
 
 	// One startup goroutine, off the accept path so Health answers from the first
-	// instant, runs the ordered startupTable strictly in order (bridges bind before
-	// any mount/FP enumeration registers; holder.refresh primes the mount cache
-	// before selects key on it — mountReady's lazy refresh covers the residual
-	// bind→prime gap; ua.detect only stamps the OAuth UA off the pre-bind path;
-	// overlays.reconcile finishes before the heal loop and scheduler, which both
-	// touch fuse Setup), then starts the loops.
+	// instant, runs the ordered startupTable strictly in order, then starts the
+	// loops. See ccn doc 7b7a53f for the ordering constraints.
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -344,13 +334,11 @@ func (s *Server) serve(ctx context.Context) error {
 	return nil
 }
 
-// listen binds the unix socket (0600) under an exclusive flock on
-// socket+".lock" that makes the stale-check/remove/bind sequence single-entrant
-// across processes: a live same-version peer is refused, a version-skewed one
-// evicted. The flock — held by serve for the daemon's lifetime — is never
-// removed: unlinking a held lock file would let a third daemon flock a fresh
-// inode and reopen the race. proc.SingleEntrant owns the sequence; the Evict
-// closure, which speaks the daemon wire, is the only cc-pool-specific policy.
+// listen binds the unix socket (0600) under an exclusive flock that makes the
+// stale-check/remove/bind sequence single-entrant across processes: a live
+// same-version peer is refused, a version-skewed one evicted. proc.SingleEntrant
+// owns the sequence; the Evict closure, which speaks the daemon wire, is the only
+// cc-pool-specific policy. See ccn doc 7b7a53f.
 func (s *Server) listen() (net.Listener, *os.File, error) {
 	return proc.SingleEntrant{
 		Socket:  s.socket,
@@ -776,19 +764,12 @@ func (s *Server) releaseIdleLeases(ctx context.Context, closed map[int]store.Acc
 	}
 }
 
-// mountReady reports whether an account's overlay can serve a session now. A
-// fuse row is ready iff the holder cache vouches for a live mirror at its dir —
-// cached kernel truth with no filesystem touch, because an lstat through a dead
-// fuse-t NFS mount can hang the select path; a dead holder's carcass (still a
-// local mountpoint) is never trusted. On a cache-miss, one rate-limited refresh
-// (bounded RPC, no fs touch) picks up truth the poll cadence misses (a select
-// racing the startup prime, or a mirror `ccp add` just mounted). A non-fuse row
-// needs the dir NOT mounted — a mountpoint under a symlink row is aborted-
-// rollback wreckage serving a mirror whose backing no longer holds the
-// account's identity; lstat on a plain dir is safe. A File Provider row also needs
-// its dir un-mounted (the domain bridge symlink is never a mountpoint) AND its
-// domain not wedged — a data-plane-wedged domain (control ops pass, reads hang) is
-// kept out of a launching session until the heal loop recovers it.
+// mountReady reports whether an account's overlay can serve a session now. A fuse
+// row is ready iff the holder cache vouches for a live mirror at its dir (cached
+// kernel truth, no filesystem touch — an lstat through a dead fuse-t mount can hang
+// select), with one rate-limited refresh on a cache-miss. A non-fuse row needs its
+// dir NOT mounted; a File Provider row also needs its domain not wedged. See ccn
+// doc 4f56e54.
 func (s *Server) mountReady(a store.Account) bool {
 	if fuseBackedRow(a.OverlayKind) {
 		if !s.holder.ready(a.ConfigDir) {
@@ -815,15 +796,11 @@ func (s *Server) fpWedged(dir string) bool {
 }
 
 // probeWinnerReady deep-probes a chosen fuse mirror at select time, reporting
-// whether it is safe to assign. This is the ONLY probe of an IDLE mirror (the
-// heal probe skips session-less mounts), so a partial wedge (shallow-alive,
-// bulk reads hang) would otherwise go undetected until a session hung on it. A
-// wedge is force-marked (excluding it from selection AND triggering a heal-loop
-// remount) and reads not-ready; the caller refuses and the client retries. It
-// is bounded by the 5s deep-probe timeout (under the handler's 10s deadline) so
-// it never remounts inline — the heal loop owns the remount. Non-fuse, healthy,
-// and pre-probe (ErrProbeMissing) mirrors read ready. One wedge is enough (no
-// debounce): a NEW session has no live session a false positive could orphan.
+// whether it is safe to assign — the ONLY probe of an idle mirror, so a partial
+// wedge (shallow-alive, bulk reads hang) would otherwise go undetected until a
+// session hung on it. A wedge is force-marked (no debounce) and reads not-ready;
+// bounded by the 5s deep-probe timeout, never remounting inline. Non-fuse and
+// pre-probe (ErrProbeMissing) mirrors read ready. See ccn doc 4f56e54.
 func (s *Server) probeWinnerReady(ctx context.Context, a store.Account) bool {
 	if fpBackedRow(a.OverlayKind) {
 		return s.probeFPWinnerReady(ctx, a)
@@ -845,15 +822,10 @@ func (s *Server) probeWinnerReady(ctx context.Context, a store.Account) bool {
 
 // probeFPWinnerReady live-probes a chosen File Provider domain's data plane at
 // select time (through the app control op, never a through-domain read), reporting
-// whether it is safe to assign. A hard wedge verdict (ErrDomainNotServing → the
-// domain answers control ops but not reads, or a 0-byte read for an account that
-// has an identity) force-marks the domain wedged with NO debounce — a launching
-// session has no live reads a false positive could orphan — so it is excluded now
-// and the heal loop recovers it. A missing or empty-by-design .claude.json reads
-// ready. A NoVerdict (app busy/unreachable/too old, or a restart) also reads ready
-// WITHOUT force-wedging: a companion-app restart must never fleet-wedge selects. nil
-// fp state (bare test servers) reads ready. Bounded to 3s so a slow probe never
-// stalls the pick.
+// whether it is safe to assign. A hard wedge verdict force-marks the domain wedged
+// (no debounce) and reads not-ready; a NoVerdict (app busy/unreachable/restart)
+// reads ready WITHOUT force-wedging, so an app restart never fleet-wedges selects.
+// Bounded to 3s. See ccn doc 4f56e54.
 func (s *Server) probeFPWinnerReady(ctx context.Context, a store.Account) bool {
 	if !s.fpEnabled() {
 		return true
@@ -1288,13 +1260,10 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 		return
 	}
 	// CRASH-WINDOW CONVERGENCE: a symlink row whose dir is itself a symlink is
-	// convert wreckage — a symlink→fileprovider conversion laid the domain bridge
-	// symlink but crashed before flipping the row (Setup done, row not flipped, the
-	// identity-loss window). Retract the leaked domain (idempotent Teardown
-	// deregisters it and removes the bridge symlink) and recreate the real dir so
-	// HealStrandedPrivate below moves the private files back and re-lays the symlink
-	// overlay. Lstat never follows the link, so this precedes the mount check (which
-	// would traverse the live domain).
+	// convert wreckage (a symlink→fileprovider Setup done, the row not flipped).
+	// Retract the leaked domain and recreate the real dir so HealStrandedPrivate
+	// below restores the private files. Lstat never follows the link, so this
+	// precedes the mount check. See ccn doc d1ab40f.
 	if s.dirIsOverlaySymlink(a.ConfigDir) {
 		// A fresh per-account tick, not the startup table's shared one: this
 		// crash-window retract is destructive, so its liveness check must be as fresh
@@ -1353,22 +1322,15 @@ func (s *Server) needsMuxMigration(a store.Account) bool {
 
 // migrateLegacyFuseRow converts a pre-cutover per-account fuse mount into a
 // shared-mux subtree bridged by a symlink. Caller holds the account's poll claim.
-// A live legacy mountpoint comes down first (session-gated: force-unmounting a
-// busy NFS mirror panics the kernel); its dir is then drained (shared orphans to
-// base, stranded private files to the backing root) so the bridge symlink can
-// replace it. The attach itself is delegated to healFuse, so a mount failure is
-// classified (retry / TCC / gated symlink fallback) exactly as a steady-state
-// heal, and a success lays the bridge symlink over the emptied dir. Every step is
-// idempotent, so a crash mid-migration re-converges on the next reconcile.
+// The live legacy mountpoint comes down first (session-gated: force-unmounting a
+// busy NFS mirror panics the kernel), its dir is drained, and healFuse re-attaches
+// the subtree. Every step is idempotent. See ccn doc 7bf8406.
 func (s *Server) migrateLegacyFuseRow(ctx context.Context, a store.Account) {
 	base, dir := pool.ClaudeDir(), a.ConfigDir
-	// A holder predating MinHolderVersion silently ignores mux_root, so the
-	// migration cannot re-attach a subtree on it — and tearing the working legacy
-	// mount down before deferring the re-mount (healFuse's ErrHolderUnmitigated
-	// arm) would strand the account until the cask upgrade lands. Defer the whole
-	// migration loudly while the reachable holder is unmitigated; the legacy mount
-	// keeps serving. view() reports "" when the holder is unreachable, and
-	// HolderVersionMitigated("") is true, so an unreachable holder does not block.
+	// A holder predating MinHolderVersion silently ignores mux_root, so defer the
+	// whole migration loudly while a reachable holder is unmitigated — the legacy
+	// mount keeps serving. An unreachable holder (view() "") does not block. See
+	// ccn doc 7bf8406.
 	if _, ver := s.holder.view(); !pool.HolderVersionMitigated(ver) {
 		s.log.Printf("acct-%02d deferring legacy→mux migration: holder %s predates %s; leaving the working legacy mount until `brew upgrade --cask fusekit-holder` lands", a.ID, ver, pool.MinHolderVersion)
 		return
@@ -1604,45 +1566,32 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 	}
 }
 
-// mountFuse establishes a fuse account's mirror through the resolved provider
-// in a fixed order: a dead mount (fails Health) comes down first — never sweep
-// or mount through one; then private files stranded in the underlay by a
+// mountFuse establishes a fuse account's mirror through the resolved provider in a
+// fixed order: a dead mount comes down first, private files stranded by a
 // conversion killed before its row flip are swept into the backing dir (mounting
-// over them would shadow the account's identity); then the provider mounts. A
-// dead HOLDER's carcass registers as foreign on Setup, and a registry row
-// pinning a DIFFERENT base (ErrBaseMismatch) — both registry state, not mount
-// verdicts — get one unmount-then-retry. The Kind fence guards against
-// wrong-kind injected fakes.
+// over them would shadow the account's identity), then the provider mounts. A dead
+// holder's carcass or a base-mismatched registry row gets one unmount-then-retry.
+// See ccn doc 7bf8406.
 func (s *Server) mountFuse(ctx context.Context, a store.Account) error {
 	prov := s.overlayForRow(a)
 	if prov == nil || !prov.Backend().IsFuse() {
 		return fmt.Errorf("no fuse provider resolved for acct-%02d; refusing to mount through it", a.ID)
 	}
 	base, dir := pool.ClaudeDir(), a.ConfigDir
-	// Health is shallow (no deep read on the poll hot path), so a partial wedge
-	// (shallow-alive, bulk reads hang) passes it — the deep-probe verdict
-	// (deepWedged) catches that. A dead/wedged mirror must come down before
-	// re-establishing, and that is session-breaking either way, so gate on a live
-	// session first. A legacy per-dir mount (dir is a real kernel mountpoint) needs
-	// an explicit kernel teardown, and force-unmounting a busy NFS mirror panics
-	// the kernel. A mux subtree (dir is the bridge symlink) is re-established by the
-	// holder's idempotent AddMount (drain → detach → re-attach, no kernel unmount),
-	// so the Setup below suffices — but that still yields EIO/ENOENT on a live
-	// session's open files, so it keeps the same gate, now session-breaking rather
-	// than kernel-hazardous.
+	// Health is shallow, so a partial wedge passes it (the deepWedged verdict
+	// catches that). A dead/wedged mirror must come down before re-establishing,
+	// which is session-breaking, so gate on a live session first — a legacy per-dir
+	// mount needs a kernel force-unmount (force-unmounting a busy NFS mirror panics
+	// the kernel), a mux subtree a kernel-free re-attach. See ccn doc 7bf8406.
 	legacy := overlayMounted(dir)
 	if (legacy || pool.IsBridgeSymlink(dir)) && (prov.Health(base, dir) != nil || s.holder.deepWedged(dir)) {
 		if busy, _ := s.liveSessionGate(ctx, dir); busy {
 			return errRemountBusy
 		}
-		// Detach before re-establishing — for BOTH shapes. A legacy per-dir mount
-		// needs a kernel force-unmount; a mux subtree needs a kernel-free logical
-		// detach, and WITHOUT it the holder's idempotent AddMount sees the subtree
-		// still registered+shallow-live and returns OK without re-attaching, so a
-		// deep wedge would never clear (noteMounted would drop the verdict over an
-		// unchanged mount) and the breaker/native recovery could never fire. mux-mode
-		// Teardown is the kernel-free detach; a persisting wedge then surfaces as an
-		// error and advances the breaker toward escalateWedgedRow.
+		// Detach before re-establishing — for BOTH shapes: a legacy per-dir mount
+		// needs a kernel force-unmount, a mux subtree a kernel-free logical detach
+		// (without which AddMount sees it still live and skips the re-attach, so a
+		// deep wedge never clears). See ccn doc 7bf8406.
 		if err := prov.Teardown(base, dir); err != nil {
 			return fmt.Errorf("clear dead mount before remounting: %w", err)
 		}
@@ -1693,16 +1642,11 @@ func (s *Server) sweepAndMount(prov fkoverlay.Provider, a store.Account, base, d
 	return prov.Setup(base, dir)
 }
 
-// fallbackToSymlink converts an account to symlink after a genuine mount
-// failure so its dir is usable again. ConvertOverlay force-unmounts the dir
-// first, so the conversion is gated like a migrate — claim first, scan second:
-// beginConvertUnderPoll refuses over a pending select reservation, and once the
-// converting claim is set tryReserve refuses for the whole conversion, so no
-// select can land between the idle check and the force-unmount. Never convert
-// blind (a failed scan can't rule out a live claude on the dir) and never under
-// a live session — defer instead. ConvertOverlay also moves private files back
-// out of the fuse backing dir, restoring the account's .claude.json identity.
-// Callers must hold the account's poll claim.
+// fallbackToSymlink converts an account to symlink after a genuine mount failure
+// so its dir is usable again. ConvertOverlay force-unmounts the dir first, so it is
+// gated like a migrate — claim first, scan second (never convert blind or under a
+// live session; defer instead) — and moves private files back out of the fuse
+// backing dir. Callers must hold the account's poll claim. See ccn doc d1ab40f.
 func (s *Server) fallbackToSymlink(ctx context.Context, a store.Account) {
 	if !s.cl.ownHeld(a.ID) {
 		s.log.Printf("acct-%02d deferring fuse→symlink fallback: reserved by a pending select or already converting", a.ID)

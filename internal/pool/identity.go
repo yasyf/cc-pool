@@ -31,14 +31,11 @@ func privateClaudeJSONPath(backend fkoverlay.Backend, configDir string) string {
 	return filepath.Join(priv, ".claude.json")
 }
 
-// AccountIdentity returns a pool account's identity from its private
-// .claude.json. The path is pure math off the backend, so a read works whether
-// or not a mount, holder, or domain is up. Only a symlink row keeps its
-// identity in the account dir: fuse AND fileprovider rows hold it in the
-// shared private backing root, and their account dir is a bridge symlink a
-// read must never traverse (unbounded through a mirror or a materializing
-// domain, and the domain serves the MERGED .claude.json — base identity, not
-// the account's own).
+// AccountIdentity returns a pool account's identity from its private .claude.json.
+// The path is pure math off the backend, so a read works whether or not a mount,
+// holder, or domain is up. Only a symlink row keeps its identity in the account dir;
+// fuse and fileprovider rows hold it in the shared private backing root, and their
+// account dir is a bridge symlink a read must never traverse. See ccn doc d1ab40f.
 func AccountIdentity(backend fkoverlay.Backend, configDir string) (*Identity, error) {
 	_, id, err := readIdentityRaw(privateClaudeJSONPath(backend, configDir))
 	return id, err

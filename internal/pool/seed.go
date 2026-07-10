@@ -24,18 +24,12 @@ const (
 	SeedKeptExisting SeedOutcome = "kept-existing"
 )
 
-// seedClaudeJSON seeds an account's private .claude.json before login so the
-// account inherits onboarding state instead of the first-run wizard. It copies
-// srcPath (plain claude's ~/.claude.json) verbatim except the top-level
-// oauthAccount identity, which is stripped (login writes the account's own),
-// and always stamps hasCompletedOnboarding:true — `claude auth login` never
-// writes that flag, so without the pre-seed the account's first interactive
-// session re-runs the wizard; login preserves the pre-seeded key. With no
-// source it seeds a minimal doc carrying just the flag. It strips ONLY
-// overlay.OAuthAccountKey, not the full overlay.ClaudeJSONPrivateKeys blacklist
-// that mergeClaudeJSON and the fuse view honor, so projects and userID carry
-// over. Written to the provider's private root, not a fuse mount that may be
-// down in a CLI process.
+// seedClaudeJSON seeds an account's private .claude.json before login so the account
+// inherits onboarding state instead of the first-run wizard: it copies srcPath
+// verbatim except the stripped oauthAccount identity, and always stamps
+// hasCompletedOnboarding:true (login never writes that flag). It strips ONLY
+// overlay.OAuthAccountKey, so projects and userID carry over. Written to the
+// provider's private root, not a fuse mount. See ccn doc d1ab40f.
 func seedClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (SeedOutcome, error) {
 	dst := filepath.Join(prov.PrivateRoot(accountDir), ".claude.json")
 

@@ -55,11 +55,10 @@ func userAgent() string {
 }
 
 // ErrNetwork classifies a transport-layer failure of a token or usage request
-// (connection refused, DNS failure, TLS error, timeout) as distinct from an
-// HTTP-status error, so the daemon's poller can tell an outage from an auth or
-// rate-limit response and detect the moment connectivity returns. A deliberate
-// context.Canceled (daemon shutdown) is excluded; context.DeadlineExceeded is
-// network-class. Callers classify with errors.Is.
+// (connection refused, DNS, TLS, timeout) as distinct from an HTTP-status error, so
+// the poller can tell an outage from an auth/rate-limit response. A deliberate
+// context.Canceled (shutdown) is excluded; context.DeadlineExceeded is network-class.
+// Callers classify with errors.Is.
 var ErrNetwork = errors.New("network transport failure")
 
 // transportErr wraps an http.Client.Do failure. It tags the error ErrNetwork

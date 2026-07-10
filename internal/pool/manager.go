@@ -91,14 +91,11 @@ type Manager struct {
 	// under the per-account lock: never block, never take the registry lock — see ccn 10bf17d.
 	OnCredWrite func(a store.Account, cred *creds.Credential, parentHash string) error
 
-	// muMap guards locks (held only for the map access); locks holds one mutex per
-	// account ID serializing that account's credential read→refresh→write cycle
-	// in-process. That mutex is DELIBERATELY held across Keychain and OAuth I/O —
-	// the sanctioned exception to the no-locks-across-I/O rule — because
-	// double-spending an account's single-use refresh token gets invalid_grant and
-	// a stale write-back clobbers the rotated token. Cross-process serialization
-	// (daemon vs a concurrent `ccp`) is layered on by lockAccount's per-account
-	// flock; the mutex alone cannot span processes.
+	// muMap guards locks (map access only); locks holds one mutex per account ID
+	// serializing that account's credential read→refresh→write cycle in-process.
+	// That mutex is DELIBERATELY held across Keychain and OAuth I/O — the sanctioned
+	// exception to the no-locks-across-I/O rule, since a double-spent single-use
+	// refresh token gets invalid_grant. See ccn doc 935d323.
 	muMap sync.Mutex
 	locks map[int]*sync.Mutex
 }

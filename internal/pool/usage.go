@@ -36,15 +36,11 @@ func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within 
 	return cred, refreshed, err
 }
 
-// ReadCredential resolves a's credential from whichever backend holds it,
-// reading every candidate store — the Keychain claude prefers and the plaintext
-// .credentials.json it falls back to when the Keychain is unavailable (headless
-// SSH). When more than one backend holds a credential (transient drift), the
-// fresher one wins (see probeCredentialStores) so a stale shadow never
-// shadows a fresh login; the winning store's Source is returned so the paired
-// write stays on one backend. When every store misses, creds.ErrUnavailable
-// (item state unknowable) outranks creds.ErrNotFound: absence is reported only
-// when every backend proved it. Any other read error fails fast.
+// ReadCredential resolves a's credential from whichever backend holds it, reading
+// every candidate store (the Keychain claude prefers, then the plaintext
+// .credentials.json). On drift the fresher one wins (see probeCredentialStores) and
+// its Source is returned. When every store misses, creds.ErrUnavailable outranks
+// creds.ErrNotFound. See ccn doc 935d323.
 func (m *Manager) ReadCredential(a store.Account) (*creds.Credential, creds.Source, error) {
 	probes, win, err := m.probeCredentialStores(a)
 	if err != nil {

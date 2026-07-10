@@ -23,16 +23,11 @@ type credProbe struct {
 	err   error
 }
 
-// MoveCredential moves a's credential to target — a MOVE, never a mirror
-// (Claude refresh tokens are single-use; two live copies diverge and one chain
-// dies). The credential is transferred as-is, never refreshed mid-move: an
-// expired access token is fine, the refresh token is the asset. Any move that
-// would write while the Keychain's state is unknowable (creds.ErrUnavailable,
-// headless session) is refused; an already-on-target no-op writes nothing and
-// is always safe. At every exit at most one backend holds a live credential —
-// transiently two identical copies exist between the target write and the
-// source delete — except the double fault where the source delete and the
-// rollback both fail, which names both locations in the returned error.
+// MoveCredential moves a's credential to target — a MOVE, never a mirror (Claude
+// refresh tokens are single-use; two live copies diverge and one chain dies). The
+// credential is transferred as-is, never refreshed mid-move. A write while the
+// Keychain state is unknowable (creds.ErrUnavailable) is refused. At every exit at
+// most one backend holds a live credential. See ccn doc 935d323.
 func (m *Manager) MoveCredential(ctx context.Context, a store.Account, target creds.Source) (*CredMove, error) {
 	if target != creds.SourceKeychain && target != creds.SourceFile {
 		return nil, fmt.Errorf("unknown credential backend %d: move target must be the keychain or the plaintext file", target)
@@ -91,14 +86,10 @@ func (m *Manager) MoveCredential(ctx context.Context, a store.Account, target cr
 	return &CredMove{From: src, To: target, Moved: true}, nil
 }
 
-// probeCredentialStores reads every candidate store in ReadCredential's
-// resolution order (Keychain first), recording each outcome instead of
-// stopping at the first hit: MoveCredential also needs the losers' state (a
-// stray file copy, an unsearchable Keychain). win is the winning probe — the
-// freshest clean read (later token expiry, Keychain first on a tie) — or nil
-// when every store missed. A hard read error with no winner yet fails fast (the
-// authoritative backend is unknowable); after a winner it is recorded as a
-// presence signal for the caller to act on.
+// probeCredentialStores reads every candidate store in ReadCredential's resolution
+// order (Keychain first), recording each outcome instead of stopping at the first
+// hit — MoveCredential also needs the losers' state. win is the freshest clean read
+// (Keychain first on a tie), or nil when every store missed. See ccn doc 935d323.
 func (m *Manager) probeCredentialStores(a store.Account) ([]credProbe, *credProbe, error) {
 	stores := m.Creds.Stores(a)
 	probes := make([]credProbe, len(stores))
