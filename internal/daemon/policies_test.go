@@ -9,9 +9,9 @@ package daemon
 //
 // healFuse's sentinel→outcome classification is deliberately NOT pinned here: it
 // is an inline switch reachable only by driving mountFuse, with side-effectful
-// arms (sweepMuxRootIdle, fallbackToSymlink) and combined-sentinel cases, so its
-// membership can only be asserted through behavior — which deepprobe_test.go and
-// server_test.go own.
+// arms (fallbackToSymlink) and combined-sentinel cases, so its membership can
+// only be asserted through behavior — which deepprobe_test.go and server_test.go
+// own.
 
 import (
 	"testing"
@@ -85,10 +85,9 @@ func TestPolicyConstantsPinned(t *testing.T) {
 		{"sync-drift-guards/holderLeaseDuration", holderLeaseDuration, 45 * time.Minute},
 		{"sync-drift-guards/leaseRenewUnder", leaseRenewUnder, 20 * time.Minute},
 
-		// registry cutover (B2) — minimum companion versions gating fuse/FP
-		// hosting. Compile-visible from daemon (it already imports pool); pinned
-		// here so a bump is a deliberate edit to this contract.
-		{"registry/minHolderVersion", pool.MinHolderVersion, "v0.29.0"},
+		// registry cutover (B2) — minimum companion version gating FP hosting.
+		// Compile-visible from daemon (it already imports pool); pinned here so a
+		// bump is a deliberate edit to this contract.
 		{"registry/minWidgetVersion", pool.MinWidgetVersion, "v0.44.0"},
 	}
 	for _, tc := range cases {

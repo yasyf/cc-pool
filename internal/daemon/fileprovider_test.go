@@ -65,11 +65,11 @@ func (f *fakeFPProv) Sync(_, _ string) error {
 	return f.syncErr
 }
 
-func (f *fakeFPProv) Teardown(_, _ string) error {
+func (f *fakeFPProv) Teardown(_, _ string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.teardowns++
-	return nil
+	return "", nil
 }
 
 func (f *fakeFPProv) counts() (healths, setups, syncs, teardowns int) {
@@ -559,15 +559,16 @@ func TestReconcileFileProviderRetreatGates(t *testing.T) {
 	cannotControl := fmt.Errorf("file provider setup: %w", fileproviderd.ErrCannotControl)
 
 	t.Run("live session defers", func(t *testing.T) {
-		s, dirs, fake := newFPServer(t)
+		s, _, fake := newFPServer(t)
 		fake.healthErr, fake.setupErr = errors.New("no domain"), cannotControl
-		s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-			return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-		}
 		a, err := s.m.Store.GetAccount(1)
 		if err != nil {
 			t.Fatal(err)
 		}
+		// A held session lease (a live session or a select handout — a live session's
+		// open fds break on the domain removal) makes the retreat's exclusive seize
+		// bounce, so it defers.
+		holdSessionLease(t, s, a)
 		if got := s.reconcileFileProvider(t.Context(), a); got != fpDeferred {
 			t.Fatalf("outcome = %d, want fpDeferred", got)
 		}

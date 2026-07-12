@@ -85,6 +85,11 @@ CREATE TABLE IF NOT EXISTS auth_health (
   since       INTEGER,
   last_err    TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS journal_risks (
+  dir         TEXT PRIMARY KEY,
+  warning     TEXT NOT NULL DEFAULT '',
+  recorded_at INTEGER NOT NULL
+);
 `
 
 // Open opens (creating if needed) the database at path and applies the schema.
@@ -827,4 +832,45 @@ func (s *Store) ClearNeedsLogin(accountID int) (bool, error) {
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// RecordJournalRisk upserts a stale-journal risk for dir: cc-pool forgot the row while
+// the holder's Unmount still reported a persist-warning, so a holder restart may replay
+// dir. The latest warning and time overwrite any prior entry for the same dir.
+func (s *Store) RecordJournalRisk(dir, warning string, at time.Time) error {
+	if _, err := s.db.Exec(
+		`INSERT INTO journal_risks(dir,warning,recorded_at) VALUES(?,?,?)
+		 ON CONFLICT(dir) DO UPDATE SET warning=excluded.warning, recorded_at=excluded.recorded_at`,
+		dir, warning, at.Unix()); err != nil {
+		return fmt.Errorf("record journal risk for %s: %w", dir, err)
+	}
+	return nil
+}
+
+// ListJournalRisks returns every recorded stale-journal risk, oldest first.
+func (s *Store) ListJournalRisks() ([]JournalRisk, error) {
+	rows, err := s.db.Query(`SELECT dir,warning,recorded_at FROM journal_risks ORDER BY recorded_at`)
+	if err != nil {
+		return nil, fmt.Errorf("list journal risks: %w", err)
+	}
+	defer rows.Close()
+	var out []JournalRisk
+	for rows.Next() {
+		var r JournalRisk
+		var at int64
+		if err := rows.Scan(&r.Dir, &r.Warning, &at); err != nil {
+			return nil, fmt.Errorf("scan journal risk: %w", err)
+		}
+		r.RecordedAt = time.Unix(at, 0)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ClearJournalRisk drops the stale-journal risk for dir; a no-op when none is recorded.
+func (s *Store) ClearJournalRisk(dir string) error {
+	if _, err := s.db.Exec(`DELETE FROM journal_risks WHERE dir=?`, dir); err != nil {
+		return fmt.Errorf("clear journal risk for %s: %w", dir, err)
+	}
+	return nil
 }

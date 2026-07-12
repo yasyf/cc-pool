@@ -70,54 +70,30 @@ func TestOverlayProviderFor(t *testing.T) {
 			if got := p.PrivateRoot("/p/acct-01"); got != fkoverlay.FusePrivateRoot("/p/acct-01") {
 				t.Errorf("PrivateRoot = %q, want %q", got, fkoverlay.FusePrivateRoot("/p/acct-01"))
 			}
-			// Every real fuse mount rides through this resolution, so the
-			// mitigation gate must be wrapped here — a bare remote provider
-			// would let `ccp add` mount on a pre-mitigation holder.
-			gate, ok := p.(mitigationGate)
+			// Every real fuse mount rides through this resolution, so the feature
+			// gate must be wrapped here — a bare remote provider would let `ccp add`
+			// mount through a holder missing a required capability.
+			gate, ok := p.(featureGate)
 			if !ok {
-				t.Fatalf("OverlayProviderFor(%q) = %T, want the mitigation-gated fuse provider", tc.backend, p)
+				t.Fatalf("OverlayProviderFor(%q) = %T, want the feature-gated fuse provider", tc.backend, p)
 			}
 			if _, ok := gate.Provider.(*fkoverlay.RemoteFuseProvider); !ok {
 				t.Fatalf("gated inner provider = %T, want *fkoverlay.RemoteFuseProvider", gate.Provider)
 			}
-			if gate.health == nil {
-				t.Fatal("mitigation gate wired without a holder health probe")
+			if gate.hello == nil {
+				t.Fatal("feature gate wired without a holder hello probe")
 			}
 		})
 	}
 }
 
-// TestHolderVersionMitigated pins the one shared decision (daemon gate +
-// doctor) on whether a holder carries the NFS kernel-panic mitigations.
-// Fail-open arms are deliberate: "dev"/empty/garbage mean a locally-built,
-// current-source holder — only a real release older than MinHolderVersion is
-// refused.
-func TestHolderVersionMitigated(t *testing.T) {
-	if MinHolderVersion != "v0.29.0" {
-		t.Fatalf("MinHolderVersion = %q; the mitigation floor moved — re-derive this matrix", MinHolderVersion)
-	}
-	cases := map[string]struct {
-		version string
-		want    bool
-	}{
-		"last pre-mux release refused":            {"v0.28.0", false},
-		"older release refused":                   {"v0.20.0", false},
-		"boundary v0.29.0 mitigated":              {"v0.29.0", true},
-		"v0.30.0 mitigated":                       {"v0.30.0", true},
-		"future major mitigated":                  {"v1.0.0", true},
-		"dev build is current source":             {"dev", true},
-		"empty version fails open":                {"", true},
-		"unparseable version fails open":          {"not-a-version", true},
-		"commit-suffixed wire version passes":     {"v0.29.0 (abc1234)", true},
-		"commit-suffixed old version still fails": {"v0.28.0 (abc1234)", false},
-		"surrounding whitespace is trimmed":       {"  v0.28.0  ", false},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			if got := HolderVersionMitigated(tc.version); got != tc.want {
-				t.Fatalf("HolderVersionMitigated(%q) = %v, want %v", tc.version, got, tc.want)
-			}
-		})
+// TestHolderMountFeatures pins the capability set every fuse mount depends on —
+// the mux root, a hosted content bridge, and the lease-ladder teardown. The
+// feature handshake replaces version arithmetic, so this list IS the gate.
+func TestHolderMountFeatures(t *testing.T) {
+	want := []string{mountd.FeatureMux, mountd.FeatureBridge, mountd.FeatureLeaseGate, mountd.FeatureWarning}
+	if !slices.Equal(HolderMountFeatures, want) {
+		t.Fatalf("HolderMountFeatures = %v, want %v", HolderMountFeatures, want)
 	}
 }
 
@@ -154,13 +130,11 @@ func TestWidgetVersionSupported(t *testing.T) {
 	}
 }
 
-// gateStub is a fuse-kind provider for mitigationGate tests, tracking Setup
-// and Teardown calls.
+// gateStub is a fuse-kind provider for featureGate tests, tracking Setup calls.
 type gateStub struct {
-	setupErr    error
-	teardownErr error
-	setups      int
-	teardowns   int
+	setupErr  error
+	setups    int
+	teardowns int
 }
 
 func (s *gateStub) Backend() fkoverlay.Backend    { return fkoverlay.BackendNFS }
@@ -168,86 +142,157 @@ func (s *gateStub) Sync(_, _ string) error        { return nil }
 func (s *gateStub) Health(_, _ string) error      { return nil }
 func (s *gateStub) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
 func (s *gateStub) Setup(_, _ string) error       { s.setups++; return s.setupErr }
-func (s *gateStub) Teardown(_, _ string) error    { s.teardowns++; return s.teardownErr }
+func (s *gateStub) Teardown(_, _ string) (string, error) {
+	s.teardowns++
+	return "", nil
+}
 
-// TestMitigationGateSetup pins the choke point closing the nfs_vinvalbuf2
-// panic vector: no fuse mirror is left hosted on a holder that predates
-// MinHolderVersion — refused before mounting when the old holder is already
-// serving, and torn down when Setup itself just spawned one from an old cask
-// binary.
-func TestMitigationGateSetup(t *testing.T) {
-	const oldVer, curVer = "v0.28.0", "v0.29.0"
-	absent := errors.New("dial holder socket: no such file")
-	type probe struct {
-		ver string
-		err error
-	}
+// TestFeatureGateSetupPostMountRequire pins F8's post-mount re-negotiation: when
+// the holder that actually MOUNTED lacks a required feature — whether the pre-check
+// was unreachable (cold start) or reached a different holder that then exited — Setup
+// refuses. It does NOT tear the mount down (an unmount through a distrusted holder
+// could race a live session); the caller's rollback / the daemon reconcile removes
+// it through a supported holder.
+func TestFeatureGateSetupPostMountRequire(t *testing.T) {
+	missingWarn := &mountd.HelloInfo{Version: "v1.0.0", Features: []string{mountd.FeatureMux, mountd.FeatureBridge, mountd.FeatureLeaseGate}}
+	full := &mountd.HelloInfo{Version: "v1.0.0", Features: mountd.HolderFeatures}
 	cases := map[string]struct {
-		health        []probe // consumed in order; the last repeats
-		setupErr      error
-		teardownErr   error
-		wantUnmit     bool   // errors.Is(err, ErrHolderUnmitigated)
-		wantErrSubstr string // "" with wantUnmit=false means Setup must succeed
-		wantSetups    int
-		wantTeardowns int
+		first    *mountd.HelloInfo
+		firstErr error
 	}{
-		"an old holder already serving is refused before any mount": {
-			health:    []probe{{ver: oldVer}},
-			wantUnmit: true, wantErrSubstr: "brew upgrade --cask fusekit-holder",
-			wantSetups: 0, wantTeardowns: 0,
+		"cold start (pre-check unreachable), post-mount holder underfeatured": {nil, mountd.ErrHolderUnavailable},
+		"pre-check holder exits, Setup mounts an underfeatured successor":     {full, nil},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			hello := func() (*mountd.HelloInfo, error) {
+				calls++
+				if calls == 1 {
+					return tc.first, tc.firstErr
+				}
+				return missingWarn, nil // the holder that actually mounted lacks FeatureWarning
+			}
+			stub := &gateStub{}
+			gate := featureGate{Provider: stub, hello: hello}
+
+			err := gate.Setup("/base", "/pool/acct-01")
+			if !errors.Is(err, ErrHolderUnsupported) {
+				t.Fatalf("Setup post-mount require = %v, want ErrHolderUnsupported", err)
+			}
+			if stub.setups != 1 {
+				t.Fatalf("inner setups = %d, want 1 (Setup ran before the post-mount check)", stub.setups)
+			}
+			if stub.teardowns != 0 {
+				t.Fatalf("inner teardowns = %d, want 0 (a refusal must NOT unmount through a distrusted holder)", stub.teardowns)
+			}
+		})
+	}
+}
+
+// TestFeatureGateSetupPostMountRetry pins G6's bounded retry: the mount is already
+// live (its holder was reachable moments ago), so a momentarily-unreachable post-mount
+// holder is retried rather than failed on the first miss — Setup succeeds once the
+// holder answers within the window.
+func TestFeatureGateSetupPostMountRetry(t *testing.T) {
+	restore := holderVerifyTimeout
+	holderVerifyTimeout = 2 * time.Second
+	defer func() { holderVerifyTimeout = restore }()
+
+	full := &mountd.HelloInfo{Version: "v1.0.0", Features: mountd.HolderFeatures}
+	calls := 0
+	hello := func() (*mountd.HelloInfo, error) {
+		calls++
+		switch calls {
+		case 1:
+			return full, nil // pre-check: reachable and full
+		case 2, 3:
+			return nil, mountd.ErrHolderUnavailable // post-mount: momentarily unreachable
+		default:
+			return full, nil // recovered within the window
+		}
+	}
+	stub := &gateStub{}
+	gate := featureGate{Provider: stub, hello: hello}
+	if err := gate.Setup("/base", "/pool/acct-01"); err != nil {
+		t.Fatalf("Setup with a briefly-unreachable-then-recovered holder = %v, want nil (bounded retry recovers)", err)
+	}
+	if stub.setups != 1 {
+		t.Fatalf("inner setups = %d, want 1", stub.setups)
+	}
+	if calls < 4 {
+		t.Fatalf("hello calls = %d, want >= 4 (the post-mount check retried until the holder answered)", calls)
+	}
+}
+
+// TestFeatureGateTeardownUngated pins that Teardown is NEVER gated: even a holder
+// missing a required feature (or proto-mismatched) tears down, so a conversion's
+// rollback cleanup or a removal can always undo a mount and never strand identity.
+func TestFeatureGateTeardownUngated(t *testing.T) {
+	missingWarn := &mountd.HelloInfo{Version: "v1.0.0", Features: []string{mountd.FeatureMux, mountd.FeatureBridge}}
+	stub := &gateStub{}
+	gate := featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) { return missingWarn, nil }}
+	if _, err := gate.Teardown("/base", "/pool/acct-01"); err != nil {
+		t.Fatalf("Teardown through an underfeatured holder = %v, want nil (teardown is ungated)", err)
+	}
+	if stub.teardowns != 1 {
+		t.Fatalf("inner teardowns = %d, want 1 (Teardown must always call through)", stub.teardowns)
+	}
+}
+
+// TestFeatureGateSetup pins the choke point that replaces version arithmetic: a
+// reachable holder is required to serve HolderMountFeatures before any mount, a
+// proto-mismatched holder is refused, an unreachable holder falls through to the
+// mount (a cold start whose remedy is the spawn), and — because the post-mount check
+// is MANDATORY (G6) — a holder that never answers after mounting FAILS CLOSED.
+func TestFeatureGateSetup(t *testing.T) {
+	restore := holderVerifyTimeout
+	holderVerifyTimeout = 50 * time.Millisecond
+	defer func() { holderVerifyTimeout = restore }()
+
+	full := &mountd.HelloInfo{Version: "v1.0.0", Features: mountd.HolderFeatures}
+	missingMux := &mountd.HelloInfo{Version: "v0.9.0", Features: []string{mountd.FeatureBridge, mountd.FeatureLeaseGate}}
+	cases := map[string]struct {
+		info          *mountd.HelloInfo
+		helloErr      error
+		setupErr      error
+		wantUnsup     bool   // errors.Is(err, ErrHolderUnsupported)
+		wantErrSubstr string // "" with wantUnsup=false means Setup must succeed
+		wantSetups    int
+	}{
+		"a holder serving all features passes through": {
+			info: full, wantSetups: 1,
 		},
-		"a mitigated holder passes through": {
-			health:     []probe{{ver: curVer}},
-			wantSetups: 1, wantTeardowns: 0,
+		"a holder missing a required feature is refused before mounting": {
+			info: missingMux, wantUnsup: true,
+			wantErrSubstr: "brew upgrade --cask fusekit-holder", wantSetups: 0,
 		},
-		"a dev holder is current source and passes": {
-			health:     []probe{{ver: "dev"}},
-			wantSetups: 1, wantTeardowns: 0,
+		"a proto-mismatched holder is refused before mounting": {
+			helloErr: mountd.ErrProtoMismatch, wantUnsup: true, wantSetups: 0,
 		},
-		"an old holder spawned by Setup itself is torn down": {
-			health:    []probe{{err: absent}, {ver: oldVer}},
-			wantUnmit: true, wantErrSubstr: "brew upgrade --cask fusekit-holder",
-			wantSetups: 1, wantTeardowns: 1,
+		"a holder unreachable through the post-mount check fails closed": {
+			helloErr: mountd.ErrHolderUnavailable, wantUnsup: true,
+			wantErrSubstr: "unverified", wantSetups: 1,
 		},
-		"an absent holder spawning current passes": {
-			health:     []probe{{err: absent}, {ver: curVer}},
-			wantSetups: 1, wantTeardowns: 0,
-		},
-		"an unanswerable post-mount health fails closed": {
-			health:        []probe{{err: absent}},
-			wantErrSubstr: "verify holder mitigations after mount",
-			wantSetups:    1, wantTeardowns: 1,
-		},
-		"a mount failure propagates untouched, nothing to tear down": {
-			health:        []probe{{err: absent}},
-			setupErr:      errors.New("mount exploded"),
-			wantErrSubstr: "mount exploded",
-			wantSetups:    1, wantTeardowns: 0,
-		},
-		"a failed teardown keeps the unmitigated cause matchable": {
-			health:      []probe{{err: absent}, {ver: oldVer}},
-			teardownErr: errors.New("unmount wedged"),
-			wantUnmit:   true, wantErrSubstr: "unmount wedged",
-			wantSetups: 1, wantTeardowns: 1,
+		"a mount failure propagates untouched": {
+			info: full, setupErr: errors.New("mount exploded"),
+			wantErrSubstr: "mount exploded", wantSetups: 1,
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			stub := &gateStub{setupErr: tc.setupErr, teardownErr: tc.teardownErr}
-			calls := 0
-			gate := mitigationGate{Provider: stub, health: func() (string, error) {
-				p := tc.health[min(calls, len(tc.health)-1)]
-				calls++
-				return p.ver, p.err
+			stub := &gateStub{setupErr: tc.setupErr}
+			gate := featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
+				return tc.info, tc.helloErr
 			}}
 
 			err := gate.Setup("/base", "/pool/acct-01")
 
-			if wantErr := tc.wantUnmit || tc.wantErrSubstr != ""; (err != nil) != wantErr {
+			if wantErr := tc.wantUnsup || tc.wantErrSubstr != ""; (err != nil) != wantErr {
 				t.Fatalf("Setup error = %v, want error: %v", err, wantErr)
 			}
-			if got := errors.Is(err, ErrHolderUnmitigated); got != tc.wantUnmit {
-				t.Fatalf("errors.Is(err, ErrHolderUnmitigated) = %v, want %v (err = %v)", got, tc.wantUnmit, err)
+			if got := errors.Is(err, ErrHolderUnsupported); got != tc.wantUnsup {
+				t.Fatalf("errors.Is(err, ErrHolderUnsupported) = %v, want %v (err = %v)", got, tc.wantUnsup, err)
 			}
 			if tc.wantErrSubstr != "" && !strings.Contains(err.Error(), tc.wantErrSubstr) {
 				t.Fatalf("error %q missing %q", err, tc.wantErrSubstr)
@@ -255,11 +300,74 @@ func TestMitigationGateSetup(t *testing.T) {
 			if stub.setups != tc.wantSetups {
 				t.Fatalf("inner setups = %d, want %d", stub.setups, tc.wantSetups)
 			}
-			if stub.teardowns != tc.wantTeardowns {
-				t.Fatalf("inner teardowns = %d, want %d", stub.teardowns, tc.wantTeardowns)
-			}
 		})
 	}
+}
+
+// TestFeatureGateSetupMountedButUnverified pins J4c: when the inner Setup errors but
+// the holder's mount list shows dir IS mounted (a lost ack, or a mid-Setup protocol
+// mismatch), Setup wraps the failure ErrMountedUnverified so the caller reclaims the
+// live mount before any fallback. A dir NOT in the mount list stays a clean pre-mount
+// miss (the raw error, no wrap), so a cold-start fallback is never treated as a live
+// mount.
+func TestFeatureGateSetupMountedButUnverified(t *testing.T) {
+	full := &mountd.HelloInfo{Version: "v1.0.0", Features: mountd.HolderFeatures}
+	boom := errors.New("lost the mount ack")
+	const dir = "/pool/acct-01"
+
+	t.Run("mounted despite the error wraps ErrMountedUnverified", func(t *testing.T) {
+		gate := featureGate{
+			Provider: &gateStub{setupErr: boom},
+			hello:    func() (*mountd.HelloInfo, error) { return full, nil },
+			mounts:   func() ([]mountd.MountInfo, error) { return []mountd.MountInfo{{Dir: dir}}, nil },
+		}
+		err := gate.Setup("/base", dir)
+		if !errors.Is(err, ErrMountedUnverified) || !errors.Is(err, boom) {
+			t.Fatalf("Setup = %v, want ErrMountedUnverified wrapping the cause", err)
+		}
+	})
+
+	// A mux row's holder Dir is the subtree under MuxRootDir(), NOT the account
+	// ConfigDir Setup receives; the shape-aware translation must still flag it.
+	t.Run("mounted mux subtree matches its account ConfigDir", func(t *testing.T) {
+		acctDir := filepath.Join(AccountsDir(), "acct-07")
+		subtree := filepath.Join(MuxRootDir(), "acct-07") // the holder's Dir for a mux row
+		gate := featureGate{
+			Provider: &gateStub{setupErr: boom},
+			hello:    func() (*mountd.HelloInfo, error) { return full, nil },
+			mounts: func() ([]mountd.MountInfo, error) {
+				return []mountd.MountInfo{{Dir: subtree, MuxRoot: MuxRootDir()}}, nil
+			},
+		}
+		err := gate.Setup("/base", acctDir)
+		if !errors.Is(err, ErrMountedUnverified) || !errors.Is(err, boom) {
+			t.Fatalf("Setup on a mounted mux subtree = %v, want ErrMountedUnverified wrapping the cause (the lost-ack reclaim path)", err)
+		}
+	})
+
+	t.Run("never mounted returns the raw cause", func(t *testing.T) {
+		gate := featureGate{
+			Provider: &gateStub{setupErr: boom},
+			hello:    func() (*mountd.HelloInfo, error) { return full, nil },
+			mounts:   func() ([]mountd.MountInfo, error) { return nil, nil },
+		}
+		err := gate.Setup("/base", dir)
+		if errors.Is(err, ErrMountedUnverified) || !errors.Is(err, boom) {
+			t.Fatalf("Setup = %v, want the raw cause with no ErrMountedUnverified", err)
+		}
+	})
+
+	t.Run("an unreachable mount list is treated as not mounted", func(t *testing.T) {
+		gate := featureGate{
+			Provider: &gateStub{setupErr: boom},
+			hello:    func() (*mountd.HelloInfo, error) { return full, nil },
+			mounts:   func() ([]mountd.MountInfo, error) { return nil, errors.New("holder unreachable") },
+		}
+		err := gate.Setup("/base", dir)
+		if errors.Is(err, ErrMountedUnverified) || !errors.Is(err, boom) {
+			t.Fatalf("Setup = %v, want the raw cause (an unlistable holder holds no reclaimable mount)", err)
+		}
+	})
 }
 
 // TestOverlaySpecSkipsAppleDoubleLitter pins the SkipPrefixes wiring: "._*"
@@ -380,10 +488,6 @@ func TestOverlaySpecHolderWiring(t *testing.T) {
 		t.Errorf("Holder.ContentMode = %q, want \"source\"", h.ContentMode)
 	case h.ProbePath != "/"+overlay.ProbeFileName:
 		t.Errorf("Holder.ProbePath = %q, want %q", h.ProbePath, "/"+overlay.ProbeFileName)
-	case h.StableExecDir != "":
-		t.Errorf("Holder.StableExecDir = %q, want empty (no self-exec onto the shared holder)", h.StableExecDir)
-	case h.Version != "":
-		t.Errorf("Holder.Version = %q, want empty (cc-pool must not version-replace a shared holder)", h.Version)
 	}
 	wantArgs := []string{"--socket", socket}
 	if len(h.Args) != len(wantArgs) || h.Args[0] != wantArgs[0] || h.Args[1] != wantArgs[1] {

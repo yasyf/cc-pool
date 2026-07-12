@@ -10,6 +10,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/fusekit/fileproviderd"
+	"github.com/yasyf/fusekit/lease"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
@@ -40,15 +41,15 @@ func (f *fakeStrandFP) Health(_, _ string) error      { return nil }
 func (f *fakeStrandFP) Sync(_, _ string) error        { return nil }
 func (f *fakeStrandFP) Setup(_, _ string) error       { return nil }
 
-func (f *fakeStrandFP) Teardown(_, dir string) error {
+func (f *fakeStrandFP) Teardown(_, dir string) (string, error) {
 	f.teardowns = append(f.teardowns, dir)
 	if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		if err := os.Remove(dir); err != nil {
-			return err
+			return "", err
 		}
 	}
 	delete(f.registered, filepath.Base(dir))
-	return nil
+	return "", nil
 }
 
 func (f *fakeStrandFP) RemoveDomain(dir string) error {
@@ -169,6 +170,44 @@ func TestHealStrandedRowsSweepsLeakedDomains(t *testing.T) {
 	}
 	if fp.registered[filepath.Base(dirs[1])] {
 		t.Fatal("symlink row's leaked domain not deregistered")
+	}
+}
+
+// TestHealStrandedRowsDefersUnderHeldLease pins G5: the stranded-row heal is a local
+// destructive op fenced under the row's session-lease key, so a live handout holding
+// that lease defers the heal — the leaked domain is left registered until the session
+// ends, never removed underneath a live `ccp env`.
+func TestHealStrandedRowsDefersUnderHeldLease(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, dirs := newTestServer(t)
+	distinctAccountDirs(t, s, dirs)
+	fp := newFakeStrandFP(filepath.Base(dirs[1]))
+	s.m.OverlayFor = fpAndSymlinkOverlay(fp, s.m.OverlaySpec())
+	s.fpSynth = alwaysNonEmpty
+	s.fpBridgeReadyFn = func() bool { return true }
+
+	// A live `ccp env` holds acct-1's session lease.
+	root, err := s.m.LeaseRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := lease.Acquire(root, pool.SessionLeaseDir(a), pool.HolderOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = h.Close() }()
+
+	s.healStrandedRows(t.Context(), s.newTick(t.Context()))
+
+	if len(fp.removes) != 0 {
+		t.Fatalf("leak sweep ran under a held session lease: removes = %v, want none (deferred)", fp.removes)
+	}
+	if !fp.registered[filepath.Base(dirs[1])] {
+		t.Fatal("the leaked domain was removed under a live handout's lease; the heal must defer")
 	}
 }
 

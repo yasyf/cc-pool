@@ -11,6 +11,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
@@ -108,9 +109,12 @@ func (m *Manager) PrepareAdd(ctx context.Context) (pending *PendingAdd, err erro
 		return nil, err
 	}
 	// Every failure below must free the reservation, else the index stays
-	// blocked until the daemon's TTL sweep.
+	// blocked until the daemon's TTL sweep — UNLESS a live fuse mount could not be
+	// reclaimed (keepReservation): releasing then would leave the mount rowless and
+	// nameless, so the reservation is held to keep its name until `ccp add` retries.
+	keepReservation := false
 	defer func() {
-		if err != nil {
+		if err != nil && !keepReservation {
 			err = errors.Join(err, m.Store.ReleaseAccountIndex(n))
 		}
 	}()
@@ -161,6 +165,24 @@ func (m *Manager) PrepareAdd(ctx context.Context) (pending *PendingAdd, err erro
 		// Fuse Setup failure = holder unavailable, not fatal: fall back to
 		// symlinks; the reason rides along so `ccp add` names it.
 		fallbackReason = setupErr.Error()
+		// ANY post-mount Setup failure LEAVES the fresh mount up: a post-Setup capability
+		// refusal (ErrHolderUnsupported), or a lost ack / protocol mismatch after the
+		// holder mounted (ErrMountedUnverified — the feature gate probed the holder's
+		// mount list to tell it from a clean pre-mount miss). The symlink fallback below
+		// refuses a live mount and would strand a rowless mount that poisons later adds,
+		// so reclaim it through the holder first — teardownWithRetry is ungated,
+		// idempotent, and closes the journal-resurrection gap. A hard reclaim failure
+		// KEEPS the reservation so the live mount is never orphaned nameless; the user
+		// retries `ccp add`. A live-session ErrBusy is near-impossible on a fresh mount.
+		if errors.Is(setupErr, ErrHolderUnsupported) || errors.Is(setupErr, ErrMountedUnverified) {
+			if terr := m.teardownWithRetry(prov, ClaudeDir(), acctDir, n); terr != nil {
+				keepReservation = true
+				if errors.Is(terr, mountd.ErrBusy) {
+					return nil, fmt.Errorf("set up overlay for %s: the fresh fuse mount is busy and cannot be reclaimed for the symlink fallback (%w) — its reservation is kept; retry `ccp add` once the holding session ends", acctDir, terr)
+				}
+				return nil, fmt.Errorf("reclaim the unverified fuse mount for %s before the symlink fallback failed (after fuse setup failed: %w): %w — its reservation is kept; retry `ccp add`", acctDir, setupErr, terr)
+			}
+		}
 		prov, err = m.overlayFor(fkoverlay.BackendSymlink)
 		if err != nil {
 			return nil, fmt.Errorf("resolve fallback symlink provider for %s (after fuse setup failed: %w): %w", acctDir, setupErr, err)
@@ -329,7 +351,8 @@ func (m *Manager) AbandonAdd(p *PendingAdd) error {
 	if err != nil {
 		errs = errors.Join(errs, fmt.Errorf("resolve overlay provider for %s: %w", p.ConfigDir, err))
 	} else {
-		errs = errors.Join(errs, m.removeAccountDir(prov, p.ConfigDir))
+		pend.ID, pend.OverlayKind = p.Index, string(p.OverlayKind)
+		errs = errors.Join(errs, m.removeAccountDir(pend, prov))
 	}
 	return errors.Join(errs, m.Store.ReleaseAccountIndex(p.Index))
 }
@@ -364,7 +387,7 @@ func (m *Manager) Remove(id int, deleteCredential bool) error {
 	if err != nil {
 		return fmt.Errorf("remove acct-%02d: resolve overlay provider: %w", id, err)
 	}
-	if err := m.removeAccountDir(prov, a.ConfigDir); err != nil {
+	if err := m.removeAccountDir(a, prov); err != nil {
 		return err
 	}
 	if deleteCredential {
@@ -376,11 +399,38 @@ func (m *Manager) Remove(id int, deleteCredential bool) error {
 }
 
 // removeAccountDir tears down the overlay, then removes the dir and its private
-// backing. A refused Teardown (e.g. a wedged unmount) aborts removal so we never
-// RemoveAll through a live mount into the base.
-func (m *Manager) removeAccountDir(prov fkoverlay.Provider, configDir string) error {
-	if err := prov.Teardown(ClaudeDir(), configDir); err != nil {
-		return fmt.Errorf("teardown overlay: %w", err)
+// backing, sequenced per the lease contract by WHO performs the destructive step:
+//
+//   - A FUSE row's Teardown is holder-delegated (the holder's lease-ladder Seizes
+//     the key), so it runs FIRST — its mountd.ErrBusy is the gate, and a consumer
+//     seize of the same key would self-bounce forever. Only AFTER it confirms is
+//     the (now-plain) dir fenced for the local RemoveAll.
+//   - A symlink/File Provider row's Teardown is a LOCAL destructive op (delete
+//     links / deregister + unlink the domain), so it runs UNDER the fence — a held
+//     lease must defer it, not discover the overlay already destroyed afterward.
+func (m *Manager) removeAccountDir(a store.Account, prov fkoverlay.Provider) error {
+	configDir := a.ConfigDir
+	fuse := prov.Backend().IsFuse()
+	teardown := func() error {
+		if err := m.teardownWithRetry(prov, ClaudeDir(), configDir, a.ID); err != nil {
+			return fmt.Errorf("teardown overlay: %w", err)
+		}
+		return nil
+	}
+	if fuse {
+		if err := teardown(); err != nil {
+			return err
+		}
+	}
+	fence, err := m.SeizeSessionLease(a)
+	if err != nil {
+		return fmt.Errorf("acct-%02d dir is in use (a live session or launch holds it); relaunch or close it, then retry `ccp remove`: %w", a.ID, err)
+	}
+	defer func() { _ = fence.Release() }()
+	if !fuse {
+		if err := teardown(); err != nil {
+			return err
+		}
 	}
 	if err := os.RemoveAll(configDir); err != nil {
 		return fmt.Errorf("remove account dir: %w", err)

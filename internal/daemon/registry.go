@@ -58,10 +58,7 @@ func (t *tick) sessions() []procscan.Session { t.scan(); return t.sess }
 // idle reports whether dir backs no live claude session in this tick's scan. A
 // failed scan makes idle false for EVERY dir: this is the single home of the
 // daemon's scan-fail-means-all-busy fail-closed rule, and every ticker-pass
-// consumer inherits it here rather than re-deriving it. (The force-unmount
-// chokepoint liveSessionGate keeps its own per-call fresh scan — a distinct path:
-// a memoized snapshot would stale the liveness check the kernel-panic-risky NFS
-// force-unmount depends on.)
+// consumer inherits it here rather than re-deriving it.
 func (t *tick) idle(dir string) bool {
 	t.scan()
 	return t.ok && procscan.CountByConfigDir(t.sess, dir) == 0
@@ -196,10 +193,9 @@ var healTable = []maintainer{
 // after bridge.fp settles consent) warms the companion app in parallel so the
 // first FP account's reconcile finds it up rather than eating the cold ~30s
 // spawn serially; overlays.reconcile must finish
-// first (it and the loops both touch fuse Setup) — and it carries today's startup
-// sweeps (reapPoolOrphans, sweepOrphanMountpoints, sweepOrphanMuxRoot) at their
-// current positions inside its body. bridge.fp wraps today's in-daemon FP-bridge
-// bind unchanged.
+// first (it and the loops both touch fuse Setup). Carcass clearing is the shared
+// holder's job now, so the startup reconcile sweeps nothing. bridge.fp wraps
+// today's in-daemon FP-bridge bind unchanged.
 var startupTable = []maintainer{
 	{"bridge.content", claimNone, nil, func(s *Server, ctx context.Context, _ *tick) bool {
 		s.startContentBridge(ctx)

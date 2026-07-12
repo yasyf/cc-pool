@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
@@ -28,6 +29,10 @@ func (fakeHost) State(base, dir string) (mounted, alive bool) {
 	return overlay.Mounted(dir), overlay.MountAlive(base, dir)
 }
 
+// TeardownDone satisfies the required TeardownPender capability; this host never
+// pends a graceful unmount, so it returns nil.
+func (fakeHost) TeardownDone(string) <-chan struct{} { return nil }
+
 // startFakeHolder runs a real mountd.Server on a short /tmp socket (macOS
 // caps sun_path at 104 bytes).
 func startFakeHolder(t *testing.T) *mountd.Client {
@@ -38,10 +43,11 @@ func startFakeHolder(t *testing.T) *mountd.Client {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	srv := &mountd.Server{
-		Socket:  filepath.Join(sockDir, "m.sock"),
-		Host:    fakeHost{},
-		Version: version.String(),
-		Log:     log.New(io.Discard, "", 0),
+		Socket:   filepath.Join(sockDir, "m.sock"),
+		Host:     fakeHost{},
+		Version:  version.String(),
+		LeaseDir: filepath.Join(sockDir, "leases"),
+		Log:      log.New(io.Discard, "", 0),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -54,7 +60,7 @@ func startFakeHolder(t *testing.T) *mountd.Client {
 			t.Error("fake holder did not stop")
 		}
 	})
-	cl := mountd.NewClient(srv.Socket)
+	cl := &mountd.Client{Socket: srv.Socket, Owner: pool.HolderOwner}
 	deadline := time.Now().Add(5 * time.Second)
 	for !cl.Available() {
 		if time.Now().After(deadline) {
@@ -89,7 +95,7 @@ func serveCannedHolder(ln net.Listener, mounts []mountd.MountInfo) {
 			return
 		}
 		var req mountd.Request
-		resp := mountd.Response{OK: true, Version: version.String()}
+		resp := mountd.Response{OK: true, Proto: mountd.MountProtoVersion, Version: version.String(), Features: mountd.HolderFeatures}
 		if err := json.NewDecoder(conn).Decode(&req); err == nil && req.Op == mountd.OpList {
 			resp.Mounts = mounts
 		}
@@ -118,7 +124,7 @@ func startCapabilityHolder(t *testing.T, mounts []mountd.MountInfo, probeErrClas
 				return
 			}
 			var req mountd.Request
-			resp := mountd.Response{OK: true, Version: version.String()}
+			resp := mountd.Response{OK: true, Proto: mountd.MountProtoVersion, Version: version.String(), Features: mountd.HolderFeatures}
 			if err := json.NewDecoder(conn).Decode(&req); err == nil {
 				switch req.Op {
 				case mountd.OpList:
@@ -208,7 +214,7 @@ func startGatedListHolder(t *testing.T, mounts []mountd.MountInfo) (socket strin
 				_ = conn.Close()
 				continue
 			}
-			resp := mountd.Response{OK: true, Version: version.String()}
+			resp := mountd.Response{OK: true, Proto: mountd.MountProtoVersion, Version: version.String(), Features: mountd.HolderFeatures}
 			if req.Op == mountd.OpList {
 				enterOnce.Do(func() { close(entered) })
 				<-releaseCh
@@ -482,152 +488,14 @@ func TestHolderStateMarkDegraded(t *testing.T) {
 	}
 }
 
-// TestMarkUnhealthyFiresHolderLostHook pins the dead-holder-with-orphans trigger:
-// markUnhealthy fires onLostWithMounts exactly on the transition from a healthy
-// holder that was serving mounts to unreachable — never when it served nothing,
-// never when it was already down.
-func TestMarkUnhealthyFiresHolderLostHook(t *testing.T) {
-	cases := map[string]struct {
-		healthy  bool
-		mounts   map[string]bool
-		wantFire int
-	}{
-		"healthy holder serving a live mount fires the transition":       {healthy: true, mounts: map[string]bool{"/pool/acct-01": true}, wantFire: 1},
-		"healthy holder holding a dead-listed mount still fires":         {healthy: true, mounts: map[string]bool{"/pool/acct-01": false}, wantFire: 1},
-		"healthy holder serving no mounts does not fire":                 {healthy: true, mounts: nil, wantFire: 0},
-		"already-unreachable holder does not fire (no held mounts left)": {healthy: false, mounts: map[string]bool{"/pool/acct-01": true}, wantFire: 0},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			var fires int
-			h := &holderState{healthy: tc.healthy, mounts: tc.mounts}
-			h.onLostWithMounts = func() { fires++ }
-			h.markUnhealthy()
-			if fires != tc.wantFire {
-				t.Fatalf("hook fired %d time(s), want %d", fires, tc.wantFire)
-			}
-		})
-	}
-}
-
-// TestHolderLostHookSurvivesDegradedStep pins the incident-shaped teardown: a
-// crashing holder often passes healthy → degraded (Health answers, List fails
-// mid-crash) → unreachable. The degraded step wipes the mounts map but must NOT
-// swallow the lost-with-mounts memory — and must never fire the hook itself,
-// because a degraded holder is still reachable and may still own its mounts.
-func TestHolderLostHookSurvivesDegradedStep(t *testing.T) {
-	cases := map[string]struct {
-		mounts   map[string]bool
-		degrades int
-		wantFire int
-	}{
-		"healthy with mounts, one degraded step, then unreachable fires once": {
-			mounts: map[string]bool{"/pool/acct-01": true}, degrades: 1, wantFire: 1,
-		},
-		"repeated degraded polls before the death still fire exactly once": {
-			mounts: map[string]bool{"/pool/acct-01": true}, degrades: 3, wantFire: 1,
-		},
-		"a dead-listed mount still counts as served": {
-			mounts: map[string]bool{"/pool/acct-01": false}, degrades: 1, wantFire: 1,
-		},
-		"healthy with no mounts through degraded never fires": {
-			mounts: nil, degrades: 1, wantFire: 0,
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			var fires int
-			h := &holderState{healthy: true, mounts: tc.mounts}
-			h.onLostWithMounts = func() { fires++ }
-			for i := 0; i < tc.degrades; i++ {
-				h.markDegraded("v9")
-				if fires != 0 {
-					t.Fatal("markDegraded fired the loss hook; a degraded holder is still reachable")
-				}
-			}
-			h.markUnhealthy()
-			h.markUnhealthy() // still down: no re-fire
-			if fires != tc.wantFire {
-				t.Fatalf("hook fired %d time(s), want %d", fires, tc.wantFire)
-			}
-		})
-	}
-}
-
-// TestHolderLostMemoryDisarmedByCleanObservations pins the disarm paths: a clean
-// reachable-empty List and a deliberate drain of the last mount both clear the
-// served-mounts memory, so a later degraded → unreachable slide fires nothing.
-func TestHolderLostMemoryDisarmedByCleanObservations(t *testing.T) {
-	t.Run("reachable-empty List disarms", func(t *testing.T) {
-		var fires int
-		h := &holderState{}
-		h.onLostWithMounts = func() { fires++ }
-		h.noteMounted("/pool/acct-01")
-		h.refresh(mountd.NewClient(startCannedHolder(t, nil))) // holder cleanly serves nothing
-		h.markDegraded("v9")
-		h.markUnhealthy()
-		if fires != 0 {
-			t.Fatalf("hook fired %d time(s) after a clean empty observation, want 0", fires)
-		}
-	})
-	t.Run("draining the last mount disarms", func(t *testing.T) {
-		var fires int
-		h := &holderState{}
-		h.onLostWithMounts = func() { fires++ }
-		h.noteMounted("/pool/acct-01")
-		h.noteUnmounted("/pool/acct-01")
-		h.markDegraded("v9")
-		h.markUnhealthy()
-		if fires != 0 {
-			t.Fatalf("hook fired %d time(s) after a deliberate drain, want 0", fires)
-		}
-	})
-	t.Run("draining one of two mounts keeps the memory armed", func(t *testing.T) {
-		var fires int
-		h := &holderState{}
-		h.onLostWithMounts = func() { fires++ }
-		h.noteMounted("/pool/acct-01")
-		h.noteMounted("/pool/acct-02")
-		h.noteUnmounted("/pool/acct-01")
-		h.markDegraded("v9")
-		h.markUnhealthy()
-		if fires != 1 {
-			t.Fatalf("hook fired %d time(s) with a mount still held, want 1", fires)
-		}
-	})
-	t.Run("an unmount during the degraded window does not disarm the crash memory", func(t *testing.T) {
-		var fires int
-		h := &holderState{}
-		h.onLostWithMounts = func() { fires++ }
-		h.noteMounted("/pool/acct-01")
-		h.markDegraded("v9") // crash tears down through degraded: mounts wiped to nil
-		// A teardown unmount lands while degraded (not a healthy drain). The
-		// empty map is a stale cache, so servedMounts must stay latched.
-		h.noteUnmounted("/pool/acct-01")
-		h.markUnhealthy()
-		if fires != 1 {
-			t.Fatalf("hook fired %d time(s) after a degraded-window unmount, want 1 (crash memory must survive)", fires)
-		}
-	})
-}
-
-// TestMarkUnhealthyFiresHookOncePerDeath pins that a wedged cache does not re-fire
-// the sweep: the hook fires once per death (repeat refreshes see it already down),
-// and a recovery re-arms it.
-func TestMarkUnhealthyFiresHookOncePerDeath(t *testing.T) {
-	var fires int
-	h := &holderState{healthy: true, mounts: map[string]bool{"/pool/acct-01": true}}
-	h.onLostWithMounts = func() { fires++ }
-
-	h.markUnhealthy() // the death
-	h.markUnhealthy() // still down: a repeat refresh must not re-sweep
-	if fires != 1 {
-		t.Fatalf("hook fired %d time(s) across a death + a repeat refresh, want exactly 1", fires)
-	}
-
-	h.noteMounted("/pool/acct-01") // holder respawns and re-mounts
-	h.markUnhealthy()              // a second death
-	if fires != 2 {
-		t.Fatalf("hook fired %d time(s) across two deaths, want 2", fires)
+// TestMarkUnhealthyResetsCache pins that an unreachable holder wipes the cache:
+// healthy flips false, the version blanks (the wire "gone" signal), and the mounts
+// map and verdict ledgers are dropped so a respawned holder starts clean. Carcass
+// recovery is the shared holder's job now, so no consumer-side sweep is fired.
+func TestMarkUnhealthyResetsCache(t *testing.T) {
+	h := &holderState{healthy: true, version: "v1.0.0", mounts: map[string]bool{"/pool/acct-01": true}}
+	h.markUnhealthy()
+	if h.healthy || h.version != "" || len(h.mounts) != 0 {
+		t.Fatalf("markUnhealthy left cache = {healthy:%v version:%q mounts:%v}, want a wiped cache", h.healthy, h.version, h.mounts)
 	}
 }

@@ -3,8 +3,10 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,74 +97,368 @@ func TestReportHolder(t *testing.T) {
 	}
 }
 
-// TestReportHolderMitigations pins doctor's NFS kernel-panic mitigation check:
-// ✓ at exactly pool.MinHolderVersion, ✗ with the brew-upgrade hint below it,
-// and silent when the holder is unreachable (reportHolder owns that failure).
-func TestReportHolderMitigations(t *testing.T) {
-	if pool.MinHolderVersion != "v0.29.0" {
-		t.Fatalf("pool.MinHolderVersion = %q; the mitigation floor moved — re-derive this matrix", pool.MinHolderVersion)
+// TestReportCaskRelauncher pins doctor's verify-only check of the fusekit-holder
+// cask's KeepAlive LaunchAgent: silent with no fuse accounts, ✓ when the
+// relauncher is loaded, ✗ with the reinstall hint when it is not — always through
+// the read-only Loaded() seam, never installing anything.
+// TestReportJournalRisks pins J4a's doctor visibility: a recorded stale-journal risk
+// is surfaced loud; a dir still in the holder's mount list reads as a live resurrection;
+// an unreachable holder keeps the risk loud and unclearable; and --fix clears a risk the
+// reachable holder no longer lists.
+func TestReportJournalRisks(t *testing.T) {
+	const dir = "/cfg/acct-01"
+	newMgr := func(t *testing.T) *pool.Manager {
+		m := &pool.Manager{Store: openTestStore(t)}
+		if err := m.Store.RecordJournalRisk(dir, "journal save failed", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		return m
 	}
+
+	t.Run("a still-mounted dir reads as a live resurrection", func(t *testing.T) {
+		m := newMgr(t)
+		report, calls := captureReports()
+		reportJournalRisks(m, []mountd.MountInfo{{Dir: dir}}, true, true, report)
+		if len(*calls) != 1 || (*calls)[0].healthy || !strings.Contains((*calls)[0].detail, "resurrected") {
+			t.Fatalf("reports = %+v, want one loud resurrection report", *calls)
+		}
+		if risks, _ := m.Store.ListJournalRisks(); len(risks) != 1 {
+			t.Fatal("--fix cleared a still-mounted risk; only removal should")
+		}
+	})
+
+	t.Run("an unreachable holder keeps the risk loud and unclearable", func(t *testing.T) {
+		m := newMgr(t)
+		report, calls := captureReports()
+		reportJournalRisks(m, nil, false, true, report)
+		if len(*calls) != 1 || (*calls)[0].healthy || !strings.Contains((*calls)[0].detail, "unreachable") {
+			t.Fatalf("reports = %+v, want one loud unreachable report", *calls)
+		}
+		if risks, _ := m.Store.ListJournalRisks(); len(risks) != 1 {
+			t.Fatal("cleared a risk while the holder was unreachable; it can't be confirmed moot")
+		}
+	})
+
+	t.Run("--fix clears a risk the reachable holder no longer lists", func(t *testing.T) {
+		m := newMgr(t)
+		report, calls := captureReports()
+		reportJournalRisks(m, nil, true, true, report)
+		if len(*calls) != 1 || !(*calls)[0].healthy {
+			t.Fatalf("reports = %+v, want one healthy 'cleared' report", *calls)
+		}
+		if risks, _ := m.Store.ListJournalRisks(); len(risks) != 0 {
+			t.Fatal("--fix did not clear a moot risk")
+		}
+	})
+
+	t.Run("without --fix a moot risk is reported loud but kept", func(t *testing.T) {
+		m := newMgr(t)
+		report, calls := captureReports()
+		reportJournalRisks(m, nil, true, false, report)
+		if len(*calls) != 1 || (*calls)[0].healthy {
+			t.Fatalf("reports = %+v, want one loud report", *calls)
+		}
+		if risks, _ := m.Store.ListJournalRisks(); len(risks) != 1 {
+			t.Fatal("a read-only doctor run cleared the risk")
+		}
+	})
+}
+
+func TestReportCaskRelauncher(t *testing.T) {
 	cases := map[string]struct {
-		facts       holderFacts
-		none        bool
-		wantHealthy bool
-		wantDetail  []string // every fragment must appear in the detail
+		fuseRows int
+		loaded   bool
+		none     bool
+		want     []reportCall
 	}{
-		"holder at exactly the minimum version passes": {
-			facts:       holderFacts{reachable: true, version: "v0.29.0"},
-			wantHealthy: true,
+		"no fuse accounts is silent": {fuseRows: 0, none: true},
+		"a loaded relauncher passes": {
+			fuseRows: 1, loaded: true,
+			want: []reportCall{{label: "cask relauncher", healthy: true}},
 		},
-		"newer holder passes": {
-			facts:       holderFacts{reachable: true, version: "v0.30.0"},
-			wantHealthy: true,
-		},
-		"dev holder (locally built, current source) passes": {
-			facts:       holderFacts{reachable: true, version: "dev"},
-			wantHealthy: true,
-		},
-		"pre-mux holder fails with observed, required, and the brew hint": {
-			facts:      holderFacts{reachable: true, version: "v0.28.0"},
-			wantDetail: []string{"v0.28.0", "v0.29.0", "brew upgrade --cask fusekit-holder"},
-		},
-		"commit-suffixed pre-mux holder still fails": {
-			facts:      holderFacts{reachable: true, version: "v0.28.0 (abc1234)"},
-			wantDetail: []string{"v0.28.0 (abc1234)", "v0.29.0", "brew upgrade --cask fusekit-holder"},
-		},
-		"unreachable holder says nothing": {
-			facts: holderFacts{reachable: false},
-			none:  true,
+		"a missing relauncher fails with the reinstall hint": {
+			fuseRows: 2, loaded: false,
+			want: []reportCall{{label: "cask relauncher", healthy: false, detail: "brew reinstall --cask fusekit-holder"}},
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
+			called := false
+			swapVar(t, &holderRelauncherLoaded, func() bool { called = true; return tc.loaded })
 			report, calls := captureReports()
-			reportHolderMitigations(tc.facts, report)
+			reportCaskRelauncher(tc.fuseRows, report)
+
 			if tc.none {
 				if len(*calls) != 0 {
 					t.Fatalf("want no reports, got %+v", *calls)
 				}
 				return
 			}
-			if len(*calls) != 1 {
-				t.Fatalf("got %d reports %+v, want exactly one", len(*calls), *calls)
+			if !called {
+				t.Fatal("verify never consulted the read-only Loaded() seam")
 			}
-			got := (*calls)[0]
-			if got.label != "holder panic mitigations" {
-				t.Errorf("label = %q, want %q", got.label, "holder panic mitigations")
+			if len(*calls) != len(tc.want) {
+				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
 			}
-			if got.healthy != tc.wantHealthy {
-				t.Errorf("healthy = %v, want %v (detail %q)", got.healthy, tc.wantHealthy, got.detail)
-			}
-			if tc.wantHealthy && got.detail != "" {
-				t.Errorf("passing check carries detail %q, want none", got.detail)
-			}
-			for _, frag := range tc.wantDetail {
-				if !strings.Contains(got.detail, frag) {
-					t.Errorf("detail %q missing %q", got.detail, frag)
+			for i, want := range tc.want {
+				got := (*calls)[i]
+				if got.label != want.label || got.healthy != want.healthy || !strings.Contains(got.detail, want.detail) {
+					t.Errorf("report[%d] = %+v, want label %q healthy %v detail containing %q", i, got, want.label, want.healthy, want.detail)
 				}
 			}
 		})
 	}
+}
+
+// TestReportHolderWedges pins F10's fail-closed rendering: every FINAL WEDGE dir
+// reports LOUD (healthy=false), a contract-violation suffix escalates the detail
+// and is stripped from the label, and an unresolved journal persist-warning
+// reports LOUD too. A clean snapshot stays silent.
+func TestReportHolderWedges(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	t.Run("wedges and warning render loud", func(t *testing.T) {
+		report, calls := captureReports()
+		st := &mountd.HealthStatus{
+			WedgedDirs: []string{
+				"/pool/acct-01" + mountd.WedgeContractViolation,
+				"/pool/acct-02",
+			},
+			Warning: "journal save failed: no space left on device",
+		}
+		reportHolderWedges(st, report)
+		if len(*calls) != 3 {
+			t.Fatalf("reportHolderWedges emitted %d lines, want 3 (2 wedges + 1 warning): %+v", len(*calls), *calls)
+		}
+		for _, c := range *calls {
+			if c.healthy {
+				t.Fatalf("line %q reported healthy; every wedge/warning line must be LOUD", c.label)
+			}
+		}
+		cv := (*calls)[0]
+		if strings.Contains(cv.label, mountd.WedgeContractViolation) {
+			t.Fatalf("contract-violation suffix leaked into the label %q; it must be stripped", cv.label)
+		}
+		if !strings.Contains(cv.detail, "CONTRACT VIOLATION") {
+			t.Fatalf("contract-violation wedge detail %q missing the escalated severity", cv.detail)
+		}
+		if strings.Contains((*calls)[1].detail, "CONTRACT VIOLATION") {
+			t.Fatalf("a plain wedge got the contract-violation severity: %q", (*calls)[1].detail)
+		}
+		if !strings.Contains((*calls)[2].detail, "journal save failed: no space left on device") {
+			t.Fatalf("warning line %q dropped the holder's persist-warning text", (*calls)[2].detail)
+		}
+	})
+
+	t.Run("clean snapshot is silent", func(t *testing.T) {
+		report, calls := captureReports()
+		reportHolderWedges(&mountd.HealthStatus{}, report)
+		if len(*calls) != 0 {
+			t.Fatalf("a clean snapshot emitted %+v, want silence", *calls)
+		}
+	})
+}
+
+// TestReportLeasesSilentWhenHolderUnreachable pins the leases panel's fail-quiet:
+// with no holder on the socket it emits nothing (reportHolder owns that failure),
+// so a daemonless doctor run never blocks on a dead holder.
+func TestReportLeasesSilentWhenHolderUnreachable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".fusekit"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	report, calls := captureReports()
+	reportLeases(report)
+	if len(*calls) != 0 {
+		t.Fatalf("reportLeases with no holder emitted %+v, want silence", *calls)
+	}
+}
+
+// startDoctorHolder serves a canned proto-2 holder on this test HOME's default
+// socket (~/.fusekit/holder.sock): hello answers the full feature set, health
+// answers one wedged dir and a persist-warning with a 1-of-3 lease summary, the
+// own-scope leases op answers own, and the cross-tenant (All) leases op answers
+// a hard error so the LeasesAll-surfacing leg is pinned.
+func startDoctorHolder(t *testing.T, home string, own []mountd.LeaseInfo) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(home, ".fusekit"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", filepath.Join(home, ".fusekit", "holder.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req mountd.Request
+			if err := json.NewDecoder(conn).Decode(&req); err != nil {
+				_ = conn.Close() // Available()'s bare probe dial
+				continue
+			}
+			resp := mountd.Response{OK: true, Proto: mountd.MountProtoVersion, Version: version.String(), Features: mountd.HolderFeatures}
+			switch req.Op {
+			case mountd.OpHealth:
+				resp.LeasesTotal = 3
+				resp.LeasesHeld = 1
+				resp.WedgedDirs = []string{filepath.Join(home, "pool", "acct-08") + mountd.WedgeContractViolation}
+				resp.Warning = "save mounts.json: disk full"
+			case mountd.OpLeases:
+				if req.All {
+					resp.OK = false
+					resp.Error = "registry walk failed"
+				} else {
+					resp.Leases = own
+				}
+			}
+			_ = json.NewEncoder(conn).Encode(resp)
+			_ = conn.Close()
+		}
+	}()
+}
+
+// TestReportLeasesEndToEnd pins F10's reportLeases wire path against a canned
+// holder: the pool-wide summary, the health snapshot's wedge/warning wired into
+// reportHolderWedges, the held lease naming its live session, and a LeasesAll
+// failure SURFACED instead of ignored.
+func TestReportLeasesEndToEnd(t *testing.T) {
+	// A short /tmp home: the unix-socket path must fit AF_UNIX's 104-byte cap,
+	// which t.TempDir()'s /var/folders path overruns.
+	home, err := os.MkdirTemp("/tmp", "ccp-doc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	held := mountd.LeaseInfo{File: "ab.lease", Held: true, Dir: filepath.Join(home, "pool", "acct-01"), Owner: pool.HolderOwner, PID: 4242, Argv0: "claude"}
+	startDoctorHolder(t, home, []mountd.LeaseInfo{held, {File: "cd.lease", Held: false}})
+
+	report, calls := captureReports()
+	reportLeases(report)
+
+	find := func(wantLabel, wantDetail string) reportCall {
+		t.Helper()
+		for _, c := range *calls {
+			if strings.Contains(c.label, wantLabel) && strings.Contains(c.detail, wantDetail) {
+				return c
+			}
+		}
+		t.Fatalf("no report matching label~%q detail~%q in %+v", wantLabel, wantDetail, *calls)
+		return reportCall{}
+	}
+
+	if c := find("holder leases", "1 held of 3 lease files"); !c.healthy {
+		t.Fatalf("lease summary must be healthy: %+v", c)
+	}
+	if c := find("holder wedge", "FINAL WEDGE"); c.healthy || !strings.Contains(c.label, "acct-08") || !strings.Contains(c.detail, "CONTRACT VIOLATION") {
+		t.Fatalf("the health snapshot's wedge did not render through reportHolderWedges: %+v", c)
+	}
+	if c := find("holder journal", "save mounts.json: disk full"); c.healthy {
+		t.Fatalf("an unresolved journal persist-warning must not read healthy: %+v", c)
+	}
+	if c := find("lease", "pid 4242"); !strings.Contains(c.detail, "held by a live session") {
+		t.Fatalf("held-lease line wrong: %+v", c)
+	}
+	if c := find("holder leases", "read the cross-tenant lease view"); c.healthy || !strings.Contains(c.detail, "registry walk failed") {
+		t.Fatalf("a LeasesAll failure must surface, not be ignored: %+v", c)
+	}
+}
+
+// startLeaseDoctorHolder serves a canned proto-2 holder whose hello feature set and
+// OpHealth response the caller controls, for reportLeases ordering tests.
+func startLeaseDoctorHolder(t *testing.T, home string, features []string, health func(*mountd.Response)) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(home, ".fusekit"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", filepath.Join(home, ".fusekit", "holder.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req mountd.Request
+			if err := json.NewDecoder(conn).Decode(&req); err != nil {
+				_ = conn.Close()
+				continue
+			}
+			resp := mountd.Response{OK: true, Proto: mountd.MountProtoVersion, Version: version.String(), Features: features}
+			if req.Op == mountd.OpHealth && health != nil {
+				health(&resp)
+			}
+			_ = json.NewEncoder(conn).Encode(resp)
+			_ = conn.Close()
+		}
+	}()
+}
+
+// TestReportLeasesRendersStatusBeforeGate pins G11: holder-wide health (WedgedDirs,
+// journal warning) renders BEFORE any FeatureLeases gating — so a holder too old for
+// the leases op still surfaces its wedges and warnings — and a Status error is
+// surfaced, never silently swallowed.
+func TestReportLeasesRendersStatusBeforeGate(t *testing.T) {
+	shortHome := func(t *testing.T) string {
+		// A short /tmp home: the unix-socket path must fit AF_UNIX's 104-byte cap.
+		home, err := os.MkdirTemp("/tmp", "ccp-doc")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(home) })
+		t.Setenv("HOME", home)
+		return home
+	}
+	find := func(calls *[]reportCall, label, detail string) (reportCall, bool) {
+		for _, c := range *calls {
+			if strings.Contains(c.label, label) && strings.Contains(c.detail, detail) {
+				return c, true
+			}
+		}
+		return reportCall{}, false
+	}
+
+	t.Run("wedges and warnings surface without the leases capability", func(t *testing.T) {
+		home := shortHome(t)
+		startLeaseDoctorHolder(t, home,
+			[]string{mountd.FeatureMux, mountd.FeatureBridge, mountd.FeatureLeaseGate, mountd.FeatureWarning},
+			func(resp *mountd.Response) {
+				resp.WedgedDirs = []string{filepath.Join(home, "pool", "acct-04") + mountd.WedgeContractViolation}
+				resp.Warning = "save mounts.json: disk full"
+			})
+		report, calls := captureReports()
+		reportLeases(report)
+		if c, ok := find(calls, "holder wedge", "FINAL WEDGE"); !ok || c.healthy {
+			t.Fatalf("wedge must render before the leases gate (found=%v): %+v", ok, c)
+		}
+		if c, ok := find(calls, "holder journal", "disk full"); !ok || c.healthy {
+			t.Fatalf("journal warning must render before the leases gate (found=%v): %+v", ok, c)
+		}
+		if _, ok := find(calls, "holder leases", "held of"); ok {
+			t.Fatal("a lease summary rendered on a holder lacking the leases capability")
+		}
+	})
+
+	t.Run("a Status error is surfaced", func(t *testing.T) {
+		home := shortHome(t)
+		startLeaseDoctorHolder(t, home, mountd.HolderFeatures, func(resp *mountd.Response) {
+			resp.OK = false
+			resp.Error = "status probe failed"
+		})
+		report, calls := captureReports()
+		reportLeases(report)
+		if c, ok := find(calls, "holder leases", "read holder status"); !ok || c.healthy || !strings.Contains(c.detail, "status probe failed") {
+			t.Fatalf("a Status error must surface, not be swallowed (found=%v): %+v", ok, c)
+		}
+	})
 }
 
 // TestReportLedgers pins the one daemon-up self-heal surface: the composed
@@ -1353,11 +1649,11 @@ func TestReportOrphanedHolder(t *testing.T) {
 		"unreachable holder holding no mounts is silent": {
 			mounted: func(string) bool { return false },
 		},
-		"dead holder holding the mux root, idle: reap-and-remount copy": {
+		"dead holder holding the mux root, idle: carcass-clear-and-remount copy": {
 			mounted: func(d string) bool { return d == pool.MuxRootDir() },
 			want: []reportCall{{
 				"mount holder orphans", false,
-				"holder dead, 2 orphaned mounts — the daemon reaps the orphaned go-nfsv4 and remounts automatically once idle",
+				"holder dead, 2 orphaned mounts — a fresh mount-holder clears the orphaned mount on its next mount (the fenced pre-mount carcass clear) and remounts automatically",
 			}},
 		},
 		"dead holder holding the mux root, sessions block the unmount": {
@@ -1369,14 +1665,14 @@ func TestReportOrphanedHolder(t *testing.T) {
 			},
 			want: []reportCall{{
 				"mount holder orphans", false,
-				"holder dead, 2 orphaned mounts, waiting on sessions pid 4242, pid 77 — relaunch them so the daemon can reap the orphaned go-nfsv4 and remount",
+				"holder dead, 2 orphaned mounts, waiting on sessions pid 4242, pid 77 — relaunch them so a fresh mount-holder can clear the orphaned mount (its fenced pre-mount carcass clear) and remount",
 			}},
 		},
 		"dead holder holding a legacy per-dir mount only": {
 			mounted: func(d string) bool { return d == "/p/acct-01" }, // not the mux root
 			want: []reportCall{{
 				"mount holder orphans", false,
-				"holder dead, 1 orphaned mount — the daemon reaps the orphaned go-nfsv4 and remounts automatically once idle",
+				"holder dead, 1 orphaned mount — a fresh mount-holder clears the orphaned mount on its next mount (the fenced pre-mount carcass clear) and remounts automatically",
 			}},
 		},
 	}

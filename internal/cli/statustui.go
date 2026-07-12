@@ -19,6 +19,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/lease"
 )
 
 const statusRefreshInterval = 5 * time.Second
@@ -58,6 +59,7 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 		buildLogin: func(a store.Account) (*exec.Cmd, error) {
 			return loginCommand(a.ConfigDir, accountLoginEmail(a))
 		},
+		acquireLease: acquireAndProbeSessionLease,
 		finishLogin: func(a store.Account, baseline string) error {
 			return tuiFinishRelogin(ctx, m, a, baseline)
 		},
@@ -94,6 +96,9 @@ type statusTUI struct {
 	toggle      func(accountID int) (bool, error)
 	buildLogin  func(a store.Account) (*exec.Cmd, error)
 	finishLogin func(a store.Account, baseline string) error
+	// acquireLease holds the session lease across the interactive relogin so the
+	// holder never tears down the mount mid-login; nil uses acquireAndProbeSessionLease.
+	acquireLease func(a store.Account) (*lease.Handle, error)
 	readCred    func(a store.Account) (*creds.Credential, error) // credential resolution for the re-login probe (both backends)
 	// resolveAccount re-loads the account from the store: wire snapshots carry
 	// no keychain fields, so credential operations must never use s.Account.
@@ -109,6 +114,7 @@ type statusTUI struct {
 	pinBusy        bool
 	reloginErr     error
 	reloginBusy    bool
+	reloginLease   *lease.Handle // held for the interactive relogin flow; closed on reloginDoneMsg
 	lastUpdate     time.Time
 	quitting       bool
 }
@@ -120,8 +126,13 @@ type (
 	}
 	errMsg     struct{ err error }
 	pinDoneMsg struct{ err error }
-	// reloginStartMsg starts the interactive login after the short-circuit check passed on it.
-	reloginStartMsg struct{ account store.Account }
+	// reloginStartMsg starts the interactive login after the short-circuit check passed
+	// on it; lease is the session lease already acquired (before any credential
+	// read-modify-write) and held across the login, released on reloginDoneMsg.
+	reloginStartMsg struct {
+		account store.Account
+		lease   *lease.Handle
+	}
 	// reloginExitedMsg fires after claude auth login exits and the terminal is back
 	// under the TUI; baseline is the pre-login access token finishRelogin
 	// compares against, so a quit-without-login never reads as success.
@@ -188,25 +199,44 @@ func (t statusTUI) finishReloginCmd(a store.Account, baseline string) tea.Cmd {
 	}
 }
 
-// startReloginCmd resolves the store account off the event loop, then lets a
-// login that already landed clear the needs-login flag without spawning
-// claude; otherwise the interactive login starts.
+// startReloginCmd resolves the store account off the event loop, acquires+probes the
+// session lease BEFORE any credential read-modify-write (the needs-login
+// short-circuit persists credentials, so the holder must not tear the mount down
+// under it), then lets a login that already landed clear the needs-login flag
+// without spawning claude; otherwise the interactive login starts holding the lease.
 func (t statusTUI) startReloginCmd(id int) tea.Cmd {
 	return func() tea.Msg {
 		a, err := t.resolveAccount(id)
 		if err != nil {
 			return reloginDoneMsg{err: err}
 		}
+		acquire := t.acquireLease
+		if acquire == nil {
+			acquire = acquireAndProbeSessionLease
+		}
+		h, err := acquire(a)
+		if err != nil {
+			return reloginDoneMsg{err: err}
+		}
 		if t.checkFresh != nil {
 			cleared, err := t.checkFresh(a)
 			if err != nil {
+				closeLease(h)
 				return reloginDoneMsg{err: err}
 			}
 			if cleared {
+				closeLease(h)
 				return reloginDoneMsg{}
 			}
 		}
-		return reloginStartMsg{account: a}
+		return reloginStartMsg{account: a, lease: h}
+	}
+}
+
+// closeLease closes a session-lease handle when non-nil (a test seam may return nil).
+func closeLease(h *lease.Handle) {
+	if h != nil {
+		_ = h.Close()
 	}
 }
 
@@ -293,8 +323,17 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return t, t.refreshCmd()
 	case reloginStartMsg:
+		// The session lease was acquired+probed in startReloginCmd (before the
+		// credential-persisting short-circuit) and is held across the interactive login
+		// so the holder never tears down the account's mount while claude writes its new
+		// identity. Released on reloginDoneMsg. This is the leased equivalent of
+		// runRelogin, which the TUI cannot call directly (it owns the terminal via
+		// Bubble Tea).
+		t.reloginLease = msg.lease
 		c, err := t.buildLogin(msg.account)
 		if err != nil {
+			closeLease(msg.lease)
+			t.reloginLease = nil
 			t.reloginBusy = false
 			t.reloginErr = err
 			return t, nil
@@ -308,6 +347,10 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case reloginExitedMsg:
 		return t, t.finishReloginCmd(msg.account, msg.baseline)
 	case reloginDoneMsg:
+		if t.reloginLease != nil {
+			_ = t.reloginLease.Close()
+			t.reloginLease = nil
+		}
 		t.reloginBusy = false
 		t.reloginErr = msg.err
 		if msg.err != nil {

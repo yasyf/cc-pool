@@ -3,12 +3,14 @@ package pool
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/lease"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
@@ -91,6 +93,16 @@ type Manager struct {
 	// under the per-account lock: never block, never take the registry lock — see ccn 10bf17d.
 	OnCredWrite func(a store.Account, cred *creds.Credential, parentHash string) error
 
+	// Warnf surfaces a non-fatal warning (an overlay teardown's journal
+	// persist-warning) loudly instead of dropping it; the daemon wires it to its
+	// logger, the CLI to stderr. Nil discards.
+	Warnf func(format string, args ...any)
+
+	// LeaseRoot resolves the fleet session-lease root the destructive-op fence
+	// seizes under; nil uses lease.DefaultRoot (~/.fusekit). Tests point it at a
+	// temp dir so a Seize/Probe never touches real state.
+	LeaseRoot func() (string, error)
+
 	// muMap guards locks (map access only); locks holds one mutex per account ID
 	// serializing that account's credential read→refresh→write cycle in-process.
 	// That mutex is DELIBERATELY held across Keychain and OAuth I/O — the sanctioned
@@ -98,6 +110,22 @@ type Manager struct {
 	// refresh token gets invalid_grant. See ccn doc 935d323.
 	muMap sync.Mutex
 	locks map[int]*sync.Mutex
+}
+
+// warnf surfaces a non-fatal warning through the Warnf seam; a nil seam discards.
+func (m *Manager) warnf(format string, args ...any) {
+	if m.Warnf != nil {
+		m.Warnf(format, args...)
+	}
+}
+
+// leaseRoot resolves the session-lease root: the LeaseRoot seam when set, else
+// lease.DefaultRoot.
+func (m *Manager) leaseRoot() (string, error) {
+	if m.LeaseRoot != nil {
+		return m.LeaseRoot()
+	}
+	return lease.DefaultRoot()
 }
 
 func (m *Manager) acctLock(id int) *sync.Mutex {
@@ -145,6 +173,7 @@ func Open() (*Manager, error) {
 		OAuth:   oauth.New(),
 		Creds:   sysCredentials{},
 		LockDir: filepath.Join(StateDir(), "locks"),
+		Warnf:   func(format string, args ...any) { fmt.Fprintf(os.Stderr, "cc-pool: "+format+"\n", args...) },
 	}, nil
 }
 

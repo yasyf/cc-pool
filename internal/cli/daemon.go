@@ -7,7 +7,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/fusekit/proc"
 )
 
 // reexecStable and daemonRun are seams so the daemon RunE is testable without a
@@ -15,7 +14,7 @@ import (
 // unreachable from test binaries, so it lives here — not in daemon.Run, the
 // launchd entry point.
 var (
-	reexecStable = proc.ReexecStable
+	reexecStable = pool.ReexecStable
 	daemonRun    = daemon.Run
 )
 

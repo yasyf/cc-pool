@@ -21,27 +21,13 @@ const HolderOwner = "cc-pool"
 // cannotHostHint is appended to mountd.ErrCannotHost when the holder cask is absent.
 const cannotHostHint = "run `ccp fuse enable` to install the fusekit-holder cask"
 
-// MinHolderVersion is the oldest fusekit-holder release cc-pool will host on.
-// It carries the NFS kernel-panic mitigations (no namedattr, AppleDouble "._"
-// blocking, attribute stabilization) AND the single-mount mux surface
-// (HolderSpec.MuxRoot / Request.mux_root): an older holder silently ignores
-// mux_root and would mount each account dir per-dir, so it is the fail-loud gate
-// against a pre-mux holder. Hosting on an older holder is refused (routed to
-// healDeferredUnmitigated) until `brew upgrade --cask fusekit-holder`.
-const MinHolderVersion = "v0.29.0"
-
-// HolderVersionMitigated reports whether a holder's reported version carries
-// the kernel-panic mitigations (>= MinHolderVersion). The holder reports
-// fusekit's version.String(), which may append a commit ("v0.23.0 (abc1234)");
-// only the first field is compared. "dev", empty, or otherwise unparseable
-// versions pass: a locally-built holder is current-source, therefore mitigated.
-func HolderVersionMitigated(version string) bool {
-	v, _, _ := strings.Cut(strings.TrimSpace(version), " ")
-	if !semver.IsValid(v) {
-		return true
-	}
-	return semver.Compare(v, MinHolderVersion) >= 0
-}
+// HolderMountFeatures are the shared-holder capabilities every cc-pool fuse mount
+// depends on: the mux root, a hosted content bridge, the lease-ladder teardown
+// that gates every unmount on a live session lease, and the persist-warning an OK
+// reply carries so a journal-delete failure surfaces instead of reading as a clean
+// teardown. The feature handshake (OpHello) replaces version arithmetic — a holder
+// missing any of these is refused with a cask-upgrade error, never mounted through.
+var HolderMountFeatures = []string{mountd.FeatureMux, mountd.FeatureBridge, mountd.FeatureLeaseGate, mountd.FeatureWarning}
 
 // MinWidgetVersion is the oldest CCPoolStatus companion app cc-pool trusts to
 // drive File Provider domains: the first release whose control server answers
@@ -55,8 +41,8 @@ const MinWidgetVersion = "v0.44.0"
 // new enough to answer probe-domain (>= MinWidgetVersion). The app reports its
 // CFBundleShortVersionString, which the release strips to a bare "0.44.0" (no
 // leading "v"), so a "v" is prepended before the semver compare; a trailing
-// commit paren is dropped like HolderVersionMitigated. "dev", empty, or
-// otherwise unparseable versions pass: a locally-built app is current-source.
+// commit paren is dropped before the compare. "dev", empty, or otherwise
+// unparseable versions pass: a locally-built app is current-source.
 func WidgetVersionSupported(version string) bool {
 	v, _, _ := strings.Cut(strings.TrimSpace(version), " ")
 	if v != "" && !strings.HasPrefix(v, "v") {
@@ -68,61 +54,149 @@ func WidgetVersionSupported(version string) bool {
 	return semver.Compare(v, MinWidgetVersion) >= 0
 }
 
-// ErrHolderUnmitigated means the shared mount holder predates MinHolderVersion:
-// hosting fuse mirrors on it can panic macOS (nfs_vinvalbuf2), so every fuse
-// mount entry point refuses it until the cask is upgraded.
-var ErrHolderUnmitigated = errors.New("mount holder predates the NFS kernel-panic mitigations")
+// ErrHolderUnsupported means the shared mount holder lacks a capability cc-pool
+// depends on — a proto-1 holder, or a proto-2 holder missing a required feature.
+// The wrapped error names the cask upgrade; every fuse mount entry point refuses
+// until `brew upgrade --cask fusekit-holder`.
+var ErrHolderUnsupported = errors.New("mount holder lacks a required capability")
 
-// holderHealth reports the shared holder's version via its Health RPC; a var so
+// ErrMountedUnverified means a fuse Setup failed AFTER the holder reported the mount
+// live (a lost ack, or a mid-Setup protocol mismatch): the mount is up but unverified,
+// so the caller must reclaim it before any fallback rather than strand a rowless mount.
+var ErrMountedUnverified = errors.New("fuse mount is live but its setup did not complete")
+
+// holderHello negotiates the shared holder's capabilities via OpHello; a var so
 // tests can fake an old, current, or absent holder.
-var holderHealth = func() (string, error) {
-	return mountd.NewClient(mountd.DefaultHolderSocket()).Health()
+var holderHello = func() (*mountd.HelloInfo, error) {
+	return mountd.NewClient(mountd.DefaultHolderSocket()).Hello()
 }
 
-// mitigationGate wraps the remote fuse provider so every fuse mount entry point
-// (`ccp add`/`ccp init`, migrate's conversion, the daemon's heal loop) refuses
-// to host mirrors on a holder that predates the NFS kernel-panic mitigations —
-// not just handleMigrate's fuseGate. Only Setup is gated: Teardown, Health, and
-// Sync must keep working against any holder.
-type mitigationGate struct {
+// holderMounts lists cc-pool's OWN live mounts on the shared holder (its source of
+// truth for whether a dir actually mounted); a var so tests can fake it. Owner-scoped:
+// an ownerless List is refused ClassInvalidOwner, and a cross-tenant view could match a
+// foreign owner's subtree.
+var holderMounts = func() ([]mountd.MountInfo, error) {
+	c := mountd.NewClient(mountd.DefaultHolderSocket())
+	c.Owner = HolderOwner
+	return c.List()
+}
+
+// featureGate wraps the remote fuse provider so every mount entry point (`ccp
+// add`/`ccp init`, migrate's conversion, the daemon's heal loop) refuses to mount
+// through a holder missing a required capability — replacing version arithmetic
+// with the feature handshake. ONLY Setup is gated: Teardown, Health, and Sync must
+// keep working against ANY reachable holder — gating Teardown would strand a
+// conversion's identity when its rollback cleanup-teardown is refused, and could
+// unmount under a live session through a holder cc-pool distrusts.
+type featureGate struct {
 	fkoverlay.Provider
-	health func() (string, error)
+	hello func() (*mountd.HelloInfo, error)
+	// mounts lists the holder's live mounts, so Setup can tell a mount that came up
+	// then errored (a lost ack) from one that never mounted. Nil ⇒ dirMounted reads
+	// false, so a bare-provider test never spuriously reports a live mount.
+	mounts func() ([]mountd.MountInfo, error)
 }
 
-// Setup refuses before mounting when a serving holder reports an unmitigated
-// version, and re-verifies after mounting — Setup may have just spawned the
-// holder from an old cask binary, and its first Health answer is the earliest
-// the version is observable. A mount that cannot be vouched mitigated is torn
-// down (gracefully; it is seconds old, nothing rides it yet) before anything
-// writes through it.
-func (g mitigationGate) Setup(base, dir string) error {
-	if ver, err := g.health(); err == nil && !HolderVersionMitigated(ver) {
-		return unmitigatedHolderError(ver)
+// dirMounted reports whether the holder's mount list currently carries dir — the
+// source of truth for "did the inner Setup actually mount". False on a nil seam or any
+// list error (an unreachable holder can hold no mount cc-pool could reclaim anyway).
+func (g featureGate) dirMounted(dir string) bool {
+	if g.mounts == nil {
+		return false
 	}
-	if err := g.Provider.Setup(base, dir); err != nil {
-		return err
+	mounts, err := g.mounts()
+	if err != nil {
+		return false
 	}
-	var cause error
-	switch ver, err := g.health(); {
-	case err != nil:
-		// The holder answered the mount RPC moments ago; an unanswerable Health
-		// now means it died — the fresh mount cannot be vouched mitigated.
-		cause = fmt.Errorf("verify holder mitigations after mount: %w", err)
-	case HolderVersionMitigated(ver):
+	for _, mi := range mounts {
+		// A mux row's holder Dir is the subtree under MuxRootDir(), not the account
+		// ConfigDir; translate every reported Dir back to its ConfigDir (the single
+		// wire→ConfigDir mapping) so a mounted-but-unverified mux subtree matches, not
+		// just a legacy per-dir row.
+		if ConfigDirForMount(mi.Dir) == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// requireHolder negotiates HolderMountFeatures: a reachable holder missing one (or
+// a proto-mismatched one) is refused with ErrHolderUnsupported; an unreachable
+// holder (still spawning, or not running) returns nil so the caller falls through.
+// This is the PRE-Setup check — an unreachable holder here is a cold start whose
+// remedy IS the spawn Provider.Setup performs, so it fails open.
+func (g featureGate) requireHolder() error {
+	switch info, herr := g.hello(); {
+	case herr == nil:
+		if ferr := info.Require(HolderMountFeatures...); ferr != nil {
+			return fmt.Errorf("%w: %w", ErrHolderUnsupported, ferr)
+		}
 		return nil
+	case errors.Is(herr, mountd.ErrProtoMismatch):
+		return fmt.Errorf("%w: %w", ErrHolderUnsupported, herr)
 	default:
-		cause = unmitigatedHolderError(ver)
+		return nil
 	}
-	if terr := g.Teardown(base, dir); terr != nil {
-		// terr rides as text (terr.Error(), not %w): the failure class callers
-		// match on (errors.Is) must stay the cause, never the teardown's wire error.
-		return fmt.Errorf("%w (and tearing the unverified fresh mount down failed: %s)", cause, terr.Error())
-	}
-	return cause
 }
 
-func unmitigatedHolderError(ver string) error {
-	return fmt.Errorf("%w: holder %s needs %s or newer; run `brew upgrade --cask fusekit-holder`", ErrHolderUnmitigated, ver, MinHolderVersion)
+// holderVerifyTimeout bounds the post-Setup capability re-check's retry: the holder
+// that mounted was reachable moments ago, so a brief unavailability is a restart race
+// the cask relauncher closes; past this window an unverifiable holder fails closed. A
+// var so tests can shrink it.
+var holderVerifyTimeout = mountd.DefaultSpawnTimeout
+
+// holderVerifyPoll is the post-Setup re-check poll interval.
+const holderVerifyPoll = 100 * time.Millisecond
+
+// requireHolderVerified is the POST-Setup check: unlike requireHolder it is
+// MANDATORY. A reachable holder is negotiated as usual; a momentarily-unreachable one
+// is retried within holderVerifyTimeout (the mount is already live, so its holder was
+// reachable moments ago), and a holder that never answers within the window FAILS
+// CLOSED — the mount is unverified and left for the caller's rollback to tear down.
+func (g featureGate) requireHolderVerified() error {
+	deadline := time.Now().Add(holderVerifyTimeout)
+	for {
+		switch info, herr := g.hello(); {
+		case herr == nil:
+			if ferr := info.Require(HolderMountFeatures...); ferr != nil {
+				return fmt.Errorf("%w: %w", ErrHolderUnsupported, ferr)
+			}
+			return nil
+		case errors.Is(herr, mountd.ErrProtoMismatch):
+			return fmt.Errorf("%w: %w", ErrHolderUnsupported, herr)
+		default:
+			if time.Now().After(deadline) {
+				return fmt.Errorf("%w: the mount holder did not answer a capability handshake after mounting (%v) — the mount is unverified; run `ccp doctor`", ErrHolderUnsupported, herr)
+			}
+			time.Sleep(holderVerifyPoll)
+		}
+	}
+}
+
+// Setup refuses a reachable-but-underfeatured (or proto-mismatched) holder BEFORE
+// mounting, then — because the pre-check's holder may have exited and Setup
+// spawned/attached a DIFFERENT one, or the pre-check was unreachable (cold start) —
+// MANDATORILY re-negotiates against the holder that actually mounted (bounded retry,
+// then fail closed). A post-mount refusal returns ErrHolderUnsupported and LEAVES the
+// mount for the caller's rollback (or the daemon reconcile) to tear down through a
+// supported holder: an unmount here, through a holder cc-pool distrusts, could race a
+// live session onto the kernel force-unmount panic.
+func (g featureGate) Setup(base, dir string) error {
+	if err := g.requireHolder(); err != nil {
+		return err // PRE-mount refusal: nothing mounted
+	}
+	if setupErr := g.Provider.Setup(base, dir); setupErr != nil {
+		// The mount may be live despite the failure — a lost ack after the holder
+		// mounted, or a mid-Setup protocol mismatch. Consult the holder's mount list;
+		// if dir is mounted, mark the failure POST-mount so the caller reclaims it
+		// before any fallback rather than strand a rowless live mount. A dir that never
+		// mounted is a clean pre-mount miss the caller falls back from.
+		if g.dirMounted(dir) {
+			return fmt.Errorf("%w: %w", ErrMountedUnverified, setupErr)
+		}
+		return setupErr
+	}
+	return g.requireHolderVerified()
 }
 
 // overlaySpec builds cc-pool's fusekit/overlay Spec. PassthroughOnly is false
@@ -146,11 +220,10 @@ func overlaySpec() fkoverlay.Spec {
 			CannotHostHint: cannotHostHint,
 			SpawnTimeout:   mountd.DefaultSpawnTimeout,
 			// No Version: cc-pool must NEVER version-replace the shared holder — that
-			// tears down another tenant's mounts. Nothing converges a version-skewed
-			// holder automatically; a holder older than MinHolderVersion is refused
-			// loud by the mitigation gate until the operator upgrades the cask by hand
-			// (`brew upgrade --cask fusekit-holder`), and it is replaced only while no
-			// session rides it.
+			// tears down another tenant's mounts. The holder self-retires on version
+			// skew (lease-gated); a holder missing a required capability is refused loud
+			// by the feature gate until the operator upgrades the cask by hand
+			// (`brew upgrade --cask fusekit-holder`).
 			BridgeSocket: BridgeSocketPath(),
 			ContentMode:  "source",
 			ProbePath:    "/" + overlay.ProbeFileName,
@@ -189,15 +262,15 @@ func OverlaySpec() fkoverlay.Spec { return overlaySpec() }
 
 // OverlayProviderFor returns the fusekit/overlay provider for a stored backend,
 // wired with cc-pool's Spec; a bad backend fails loud. Fuse providers come
-// wrapped in the mitigation gate — this is the one choke point every real
-// mount rides through.
+// wrapped in the feature gate — this is the one choke point every real mount
+// rides through.
 func OverlayProviderFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
 	prov, err := fkoverlay.ProviderFor(b, overlaySpec())
 	if err != nil {
 		return nil, err
 	}
 	if b.IsFuse() {
-		return mitigationGate{Provider: prov, health: holderHealth}, nil
+		return featureGate{Provider: prov, hello: holderHello, mounts: holderMounts}, nil
 	}
 	return prov, nil
 }

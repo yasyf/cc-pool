@@ -46,6 +46,52 @@ func TestAccountCRUD(t *testing.T) {
 	}
 }
 
+func TestJournalRisks(t *testing.T) {
+	s := openTest(t)
+	if risks, err := s.ListJournalRisks(); err != nil || len(risks) != 0 {
+		t.Fatalf("empty ledger = (%v, %v), want ([], nil)", risks, err)
+	}
+
+	now := time.Unix(1_700_000_000, 0)
+	if err := s.RecordJournalRisk("/cfg/acct-01", "journal save failed", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordJournalRisk("/cfg/acct-02", "still warning", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	risks, err := s.ListJournalRisks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(risks) != 2 || risks[0].Dir != "/cfg/acct-01" || risks[1].Dir != "/cfg/acct-02" {
+		t.Fatalf("risks = %+v, want two entries oldest-first", risks)
+	}
+	if risks[0].Warning != "journal save failed" || !risks[0].RecordedAt.Equal(now) {
+		t.Fatalf("risk[0] = %+v, want the recorded warning and time", risks[0])
+	}
+
+	// A re-record overwrites the same dir's warning, never duplicates it.
+	if err := s.RecordJournalRisk("/cfg/acct-01", "newer warning", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	risks, _ = s.ListJournalRisks()
+	if len(risks) != 2 {
+		t.Fatalf("re-record duplicated the entry: %+v", risks)
+	}
+
+	if err := s.ClearJournalRisk("/cfg/acct-01"); err != nil {
+		t.Fatal(err)
+	}
+	risks, _ = s.ListJournalRisks()
+	if len(risks) != 1 || risks[0].Dir != "/cfg/acct-02" {
+		t.Fatalf("after clear = %+v, want only acct-02", risks)
+	}
+	// Clearing an absent dir is a no-op, not an error.
+	if err := s.ClearJournalRisk("/cfg/acct-absent"); err != nil {
+		t.Fatalf("clear of an absent risk = %v, want nil", err)
+	}
+}
+
 func TestSetAccountLabel(t *testing.T) {
 	s := openTest(t)
 	a := Account{ID: 1, ConfigDir: "/home/.cc-pool/accounts/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "me@example.com", OverlayKind: "symlink"}

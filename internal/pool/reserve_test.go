@@ -176,9 +176,9 @@ type teardownProbe struct {
 	onTeardown func()
 }
 
-func (p *teardownProbe) Teardown(_, _ string) error {
+func (p *teardownProbe) Teardown(_, _ string) (string, error) {
 	p.onTeardown()
-	return nil
+	return "", nil
 }
 
 // TestAbandonAddReleasesAfterTeardown pins release ordering: the reservation

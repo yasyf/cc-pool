@@ -19,6 +19,7 @@ import (
 	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/fusekit/service"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -97,7 +98,8 @@ func newDoctorCmd() *cobra.Command {
 					version:   holderVer,
 				}
 				reportHolder(facts, countFuse(accts), report)
-				reportHolderMitigations(facts, report)
+				reportCaskRelauncher(countFuse(accts), report)
+				reportLeases(report)
 				reportCarcasses(accts, report)
 				reportLedgers(accts, ledgers, cachedHolder, time.Now(), report)
 
@@ -112,6 +114,7 @@ func newDoctorCmd() *cobra.Command {
 					sessions, _ = scanSessions(cmd.Context())
 				}
 				reportWedges(accts, holderMounts, sessions, daemonAlive, report)
+				reportJournalRisks(m, holderMounts, reachable, fix, report)
 				reportStaleSessions(accts, holderMounts, sessions, report)
 				reportStaleWidgetAppex(cmd.Context(), report)
 				reportOrphanedHolder(cmd.Context(), reachable, accts, report)
@@ -186,11 +189,10 @@ func probeHolder() (reachable bool, ver string) {
 }
 
 // The holder is a separate multi-tenant product: cc-pool never compares the
-// holder's version against its own or replaces the holder over skew (the
-// cask's launchd owns upgrades; a version-replacement would tear down other
-// tenants' mounts), and serving no cc-pool mounts is not an orphan. The one
-// version constraint that does exist — the MinHolderVersion mitigation floor,
-// a refusal, never a replacement — is reportHolderMitigations' job.
+// holder's version against its own or replaces the holder over skew (the cask's
+// launchd owns upgrades; a version-replacement would tear down other tenants'
+// mounts), and serving no cc-pool mounts is not an orphan. A holder missing a
+// required capability is refused via the feature handshake, not a version floor.
 func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)) {
 	switch {
 	case !f.reachable && fuseRows > 0:
@@ -201,19 +203,113 @@ func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)
 	}
 }
 
-// reportHolderMitigations flags a reachable holder that predates the NFS
-// kernel-panic mitigations (pool.MinHolderVersion). An unreachable holder is
-// silent — reportHolder already covers that.
-func reportHolderMitigations(f holderFacts, report func(string, bool, string)) {
-	if !f.reachable {
+// caskRelauncherLabel is the LaunchAgent the fusekit-holder cask installs to
+// respawn the self-retiring holder. cc-pool only verifies it — the cask owns it.
+const caskRelauncherLabel = "com.yasyf.fusekit-holder"
+
+// holderRelauncherLoaded reports whether the cask's KeepAlive LaunchAgent is
+// registered with launchd — read-only (`launchctl print`), a test seam so doctor
+// never shells out to launchctl.
+var holderRelauncherLoaded = func() bool {
+	return service.Agent{Label: caskRelauncherLabel}.Loaded()
+}
+
+// reportCaskRelauncher verifies (never installs) the fusekit-holder cask's
+// KeepAlive LaunchAgent — the relauncher that respawns the self-retiring holder.
+// Silent with no fuse accounts: the shared holder is not cc-pool's concern then.
+func reportCaskRelauncher(fuseRows int, report func(string, bool, string)) {
+	if fuseRows == 0 {
 		return
 	}
-	if pool.HolderVersionMitigated(f.version) {
-		report("holder panic mitigations", true, "")
+	if holderRelauncherLoaded() {
+		report("cask relauncher", true, "")
 		return
 	}
-	report("holder panic mitigations", false, fmt.Sprintf("holder %s predates the NFS kernel-panic mitigations (need %s or newer) — run `brew upgrade --cask fusekit-holder`",
-		f.version, pool.MinHolderVersion))
+	report("cask relauncher", false, fmt.Sprintf("LaunchAgent %s not loaded — reinstall the fusekit-holder cask (`brew reinstall --cask fusekit-holder`)", caskRelauncherLabel))
+}
+
+// wedgeSeverity flags a contract-violation wedge — the permanent fail-closed kind
+// that needs operator action, not a transient one that clears on its own.
+func wedgeSeverity(wedgedDir string) string {
+	if strings.HasSuffix(wedgedDir, mountd.WedgeContractViolation) {
+		return " — a CONTRACT VIOLATION, permanent until an operator clears it"
+	}
+	return ""
+}
+
+// reportHolderWedges renders a holder health snapshot's fail-closed states LOUD:
+// each FINAL WEDGE dir (a contract-violation suffix is the permanent
+// operator-action kind), then any unresolved journal persist-warning (durable
+// state a successor could replay a removed row from until a later save resolves it).
+func reportHolderWedges(st *mountd.HealthStatus, report func(string, bool, string)) {
+	for _, wd := range st.WedgedDirs {
+		report("holder wedge "+abbreviateHome(strings.TrimSuffix(wd, mountd.WedgeContractViolation)), false,
+			fmt.Sprintf("mount held in a FINAL WEDGE (fenced until cleared or the holder exits)%s — see %s",
+				wedgeSeverity(wd), abbreviateHome(pool.MountHolderLogPath())))
+	}
+	if st.Warning != "" {
+		report("holder journal", false, "unresolved journal persist-warning: "+st.Warning+" — durable state is stale until the holder re-saves it")
+	}
+}
+
+// reportLeases renders the shared holder's session-lease panel: the pool-wide
+// health summary (leases_total/leases_held), cc-pool's own held leases, then the
+// read-only cross-tenant view. A held lease is the flock a launcher holds for a
+// live session — the holder's one busy/liveness decision — so it names the live
+// session pinning an account dir. Silent when the holder is unreachable; a holder
+// too old to serve the leases op is reported once, naming the cask upgrade.
+func reportLeases(report func(string, bool, string)) {
+	cl := holderClient()
+	if !cl.Available() {
+		return
+	}
+	info, err := cl.Hello()
+	if err != nil {
+		report("holder leases", false, fmt.Sprintf("capability handshake failed: %v", err))
+		return
+	}
+	// Read holder health BEFORE any leases-capability gating: WedgedDirs and the
+	// journal persist-warning are holder-wide safety diagnostics, not lease data, so a
+	// holder too old for the leases op must still surface its wedges and warnings — and
+	// a Status error must not be swallowed.
+	st, serr := cl.Status()
+	if serr != nil {
+		report("holder leases", false, fmt.Sprintf("read holder status: %v", serr))
+	} else {
+		reportHolderWedges(st, report)
+	}
+	if ferr := info.Require(mountd.FeatureLeases); ferr != nil {
+		report("holder leases", false, ferr.Error())
+		return
+	}
+	if st != nil {
+		report("holder leases", true, fmt.Sprintf("%d held of %s", st.LeasesHeld, plural(st.LeasesTotal, "lease file")))
+	}
+	own, err := cl.Leases()
+	if err != nil {
+		report("holder leases", false, fmt.Sprintf("read cc-pool leases: %v", err))
+		return
+	}
+	for _, li := range own {
+		if !li.Held {
+			continue
+		}
+		report("lease "+abbreviateHome(li.Dir), true, fmt.Sprintf("held by a live session (pid %d, %s)", li.PID, abbreviateHome(li.Argv0)))
+	}
+	if !info.Has(mountd.FeatureListAll) {
+		return
+	}
+	all, err := cl.LeasesAll()
+	if err != nil {
+		report("holder leases", false, fmt.Sprintf("read the cross-tenant lease view: %v", err))
+		return
+	}
+	for _, li := range all {
+		if !li.Held || li.Owner == pool.HolderOwner {
+			continue
+		}
+		report("lease "+abbreviateHome(li.Dir), true, fmt.Sprintf("held by another tenant %q (read-only)", li.Owner))
+	}
 }
 
 // reportLedgers renders the daemon's composed self-heal ledger block — the one
@@ -223,8 +319,8 @@ func reportHolderMitigations(f holderFacts, report func(string, bool, string)) {
 // tripped breakers, and active backoffs report. Two sources deliberately stay
 // outside it: the store-persisted needs-login verdict (checkAccount — the
 // auth.streak row here is the daemon's transient-401 streak, a different
-// source) and the holder-version mitigation floor (reportHolderMitigations —
-// holder version, not ledger state). The TCC grant walkthrough is holder-cache
+// source) and the holder capability handshake (reportHolder / the feature gate —
+// holder capabilities, not ledger state). The TCC grant walkthrough is holder-cache
 // guidance the ledger's alt lane only counts waits for, so it renders from
 // holder, verbatim, ahead of the per-row lines.
 func reportLedgers(accts []store.Account, ledgers []daemon.LedgerState, holder *daemon.HolderStatus, now time.Time, report func(string, bool, string)) {
@@ -275,8 +371,8 @@ func reportLedgers(accts []store.Account, ledgers []daemon.LedgerState, holder *
 				report(label(l, "remount"), false, detail)
 			}
 			// Both lanes clear: a benign deferral (busy mirror, or a holder
-			// awaiting its cask upgrade — reportHolderMitigations owns that
-			// guidance), so the row stays silent here.
+			// awaiting its cask upgrade — the feature gate owns that guidance), so
+			// the row stays silent here.
 		case "fp.domain":
 			switch {
 			case l.Faulted:
@@ -513,9 +609,51 @@ func reportCarcasses(accts []store.Account, report func(string, bool, string)) {
 	}
 }
 
+// reportJournalRisks surfaces recorded stale-journal risks: a forgotten fuse row whose
+// holder Unmount reported a persist-warning that survived retry, so a holder restart may
+// replay the dir. A dir still (or again) mounted is a live resurrection (loud, and only
+// `ccp remove`/`ccp add` clears the mount); a dir the reachable holder no longer lists
+// is moot and --fix clears the ledger entry. An UNREACHABLE holder cannot confirm the
+// mount is gone, so the risk stays loud and unclearable until the holder is up. A ledger
+// read error flips the verdict — a lost ledger could hide a real resurrection.
+func reportJournalRisks(m *pool.Manager, mounts []mountd.MountInfo, holderReachable, fix bool, report func(string, bool, string)) {
+	risks, err := m.Store.ListJournalRisks()
+	if err != nil {
+		report("journal-risk ledger", false, "couldn't read the stale-journal ledger: "+err.Error())
+		return
+	}
+	mounted := func(dir string) bool {
+		for _, mi := range mounts {
+			if mi.Dir == dir {
+				return true
+			}
+		}
+		return false
+	}
+	for _, r := range risks {
+		label := fmt.Sprintf("journal risk %s", abbreviateHome(r.Dir))
+		switch {
+		case mounted(r.Dir):
+			report(label, false, fmt.Sprintf("holder journal resurrected this forgotten mount (%s) — end any session on it, then `ccp remove` or re-`ccp add`", r.Warning))
+		case !holderReachable:
+			report(label, false, fmt.Sprintf("holder journal may resurrect this forgotten mount (%s); the holder is unreachable, so its mounts can't be checked — re-run `ccp doctor` once it's up", r.Warning))
+		case fix:
+			if cerr := m.Store.ClearJournalRisk(r.Dir); cerr != nil {
+				report(label, false, "couldn't clear the moot journal risk: "+cerr.Error())
+			} else {
+				report(label, true, "no longer mounted; cleared the stale-journal risk")
+			}
+		default:
+			report(label, false, fmt.Sprintf("holder journal may resurrect this forgotten mount on the next restart (%s); not currently mounted — run `ccp doctor --fix` to clear", r.Warning))
+		}
+	}
+}
+
 // reportOrphanedHolder flags a dead holder whose mounts are still in the kernel
 // mount table (see ccn doc 1668381), naming the live sessions the operator must
-// relaunch before the daemon can reap. A reachable holder is reportHolder's beat.
+// relaunch before a fresh mount-holder can clear the orphan (its fenced pre-mount
+// carcass clear — recovery is holder-owned now). A reachable holder is
+// reportHolder's beat.
 func reportOrphanedHolder(ctx context.Context, reachable bool, accts []store.Account, report func(string, bool, string)) {
 	if reachable {
 		return
@@ -528,9 +666,9 @@ func reportOrphanedHolder(ctx context.Context, reachable bool, accts []store.Acc
 	sessions, _ := scanSessions(ctx)
 	detail := fmt.Sprintf("holder dead, %s", plural(len(orphans), "orphaned mount"))
 	if blockers := sessionsOnDirs(orphans, sessions); blockers != "" {
-		detail += ", waiting on sessions " + blockers + " — relaunch them so the daemon can reap the orphaned go-nfsv4 and remount"
+		detail += ", waiting on sessions " + blockers + " — relaunch them so a fresh mount-holder can clear the orphaned mount (its fenced pre-mount carcass clear) and remount"
 	} else {
-		detail += " — the daemon reaps the orphaned go-nfsv4 and remounts automatically once idle"
+		detail += " — a fresh mount-holder clears the orphaned mount on its next mount (the fenced pre-mount carcass clear) and remounts automatically"
 	}
 	report("mount holder orphans", false, detail)
 }

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -106,8 +107,8 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 // fuseGate reports why fuse mirrors cannot be hosted, or "" when they can.
 // The probe runs in the mount holder: the macOS volume-access grant is
 // per-process, so a missing grant fails here before any account is disturbed.
-// A holder older than pool.MinHolderVersion is refused — it predates the NFS
-// kernel-panic mitigations, and hosting mirrors on it can panic macOS.
+// A holder missing a required capability (pool.HolderMountFeatures) is refused
+// via the feature handshake, naming the cask upgrade.
 func (s *Server) fuseGate(ctx context.Context) (fkoverlay.Backend, string) {
 	if s.fuseGateFn != nil {
 		return s.fuseGateFn()
@@ -121,8 +122,6 @@ func (s *Server) fuseGate(ctx context.Context) (fkoverlay.Backend, string) {
 	if !backend.IsFuse() {
 		return "", fmt.Sprintf("fuse unavailable: %s — fix this, then re-run `ccp migrate`", reason)
 	}
-	// Fail safe: a holder whose version cannot be observed must not be assumed
-	// to carry the kernel-panic mitigations, so a Health failure refuses fuse.
 	// The bounded wait doubles as the migrate warm-up: Select may have just
 	// spawned the holder, and riding out its socket bind here keeps cold-start
 	// off the first account's conversion budget (handleMigrate computes the
@@ -131,8 +130,15 @@ func (s *Server) fuseGate(ctx context.Context) (fkoverlay.Backend, string) {
 	if err != nil {
 		return "", fmt.Sprintf("fuse unavailable: mount holder health probe failed: %v — fix this, then re-run `ccp migrate`", err)
 	}
-	if !pool.HolderVersionMitigated(ver) {
-		return "", fmt.Sprintf("fuse unavailable: mount holder %s predates the NFS kernel-panic mitigations (need %s or newer); run `brew upgrade --cask fusekit-holder`, then re-run `ccp migrate`", ver, pool.MinHolderVersion)
+	// The feature handshake replaces version arithmetic: a holder missing a
+	// required capability (or a proto-mismatched one) is refused, naming the cask
+	// upgrade in Require's own message.
+	info, err := s.holderClient().Hello()
+	if err != nil {
+		return "", fmt.Sprintf("fuse unavailable: mount holder %s capability handshake failed: %v — run `brew upgrade --cask fusekit-holder`, then re-run `ccp migrate`", ver, err)
+	}
+	if ferr := info.Require(pool.HolderMountFeatures...); ferr != nil {
+		return "", fmt.Sprintf("fuse unavailable: %v — then re-run `ccp migrate`", ferr)
 	}
 	return backend, ""
 }
@@ -226,8 +232,32 @@ func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverl
 		return res
 	}
 
+	from, ferr := fkoverlay.Parse(a.OverlayKind)
+	if ferr != nil {
+		res.Outcome = MigrationFailed
+		res.Detail = fmt.Sprintf("parse source backend: %v", ferr)
+		return res
+	}
+	// A non-fuse source (symlink/File Provider) has no holder mount, so ConvertOverlay
+	// mutates the plain account dir directly — fence the whole conversion under an
+	// exclusive session-lease seize so a live session or a select handout (invisible
+	// to procscan before claude starts) defers it. A FUSE source is instead gated by
+	// its holder-delegated Teardown returning mountd.ErrBusy (mapped below): seizing
+	// the mux subtree here would self-bounce the holder's own Seize. --force keeps its
+	// forensic-only meaning; the lease gate is not force-skippable (a live session's
+	// mount cannot be safely torn down regardless).
+	if !from.IsFuse() {
+		fence, err := s.m.SeizeSessionLease(a)
+		if err != nil {
+			res.Outcome = MigrationBusy
+			res.Detail = "held by a live session or a select handout; relaunch or close it, then retry"
+			return res
+		}
+		defer func() { _ = fence.Release() }()
+	}
 	if !force {
-		// Fail closed: a failed scan cannot rule out a live session in this dir.
+		// Advisory forensics only (the lease seize / holder ErrBusy is the real
+		// gate): a failed scan cannot rule out a live session in this dir.
 		sessions, err := s.scan(ctx)
 		if err != nil {
 			res.Outcome = MigrationFailed
@@ -248,6 +278,13 @@ func (s *Server) convertAccount(ctx context.Context, a store.Account, to fkoverl
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), convertTimeout)
 	defer cancel()
 	if _, err := s.m.ConvertOverlay(cctx, a, to); err != nil {
+		// A fuse source's holder-delegated teardown answers ErrBusy under a live
+		// session's held lease: a graceful deferral, never a failure.
+		if errors.Is(err, mountd.ErrBusy) {
+			res.Outcome = MigrationBusy
+			res.Detail = "a live session holds the mount's lease; relaunch or close it, then retry"
+			return res
+		}
 		res.Outcome = MigrationFailed
 		res.Detail = err.Error()
 		return res

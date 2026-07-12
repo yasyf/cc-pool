@@ -41,7 +41,9 @@ func (s *Server) convergeSymlinkRowBridge(a store.Account) bool {
 	}
 	// Idempotent: Teardown removes the bridge symlink and deregisters the domain
 	// (deregistering a never-registered domain is a no-op).
-	if err := prov.Teardown(pool.ClaudeDir(), a.ConfigDir); err != nil {
+	warning, err := prov.Teardown(pool.ClaudeDir(), a.ConfigDir)
+	s.warnTeardown(a.ID, warning)
+	if err != nil {
 		s.log.Printf("acct-%02d: retract leaked overlay bridge: %v", a.ID, err)
 		return false
 	}
@@ -93,6 +95,19 @@ func (s *Server) healStrandedSymlinkRow(ctx context.Context, t *tick, a store.Ac
 	}
 	defer s.cl.disownConvert(fresh.ID)
 
+	// This heal retracts a leaked File Provider domain and recreates the account dir —
+	// a LOCAL destructive op cc-pool performs itself on the plain symlink dir (not a
+	// holder-delegated teardown), so fence it under the row's session-lease key. An
+	// `ccp env --account` that acquires the lease after the poll's advisory
+	// live-session scan would otherwise have its domain removed underneath it; a held
+	// lease defers the heal to a later tick.
+	fence, err := s.m.SeizeSessionLease(fresh)
+	if err != nil {
+		s.log.Printf("acct-%02d deferring stranded-row heal: session lease held by a live handout (%v)", fresh.ID, err)
+		return
+	}
+	defer func() { _ = fence.Release() }()
+
 	if s.dirIsOverlaySymlink(fresh.ConfigDir) {
 		if !s.convergeSymlinkRowBridge(fresh) {
 			return
@@ -118,11 +133,9 @@ func (s *Server) healStrandedSymlinkRow(ctx context.Context, t *tick, a store.Ac
 // with the convert claim HELD (caller must endConvert); false, claim released, to
 // skip this tick — a pending select, a live session, or a scan failure (which
 // cannot rule a session out). Live-session liveness reads the shared heal tick,
-// whose scan-fail-means-busy rule (tick.idle) defers exactly as the old
-// liveSessionGate did; a stranded symlink row carries no NFS mount, so the tick's
-// pass-shared scan (vs a per-call fresh one) never risks the force-unmount panic
-// liveSessionGate guards, and the ownHeld/reserve gate remains the primary race
-// close.
+// whose scan-fail-means-busy rule (tick.idle) defers a destructive retract; a
+// stranded symlink row carries no fuse mount, so the shared pass scan suffices,
+// and the ownHeld/reserve gate remains the primary race close.
 func (s *Server) beginSymlinkHealHeld(t *tick, a store.Account) bool {
 	if !s.cl.ownHeld(a.ID) {
 		s.log.Printf("acct-%02d deferring stranded-bridge heal: reserved by a pending select", a.ID)

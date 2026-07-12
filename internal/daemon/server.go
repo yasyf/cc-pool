@@ -89,12 +89,6 @@ type Server struct {
 	// unlocked.
 	triggerShutdown context.CancelFunc
 
-	// serveCtx is serve's cancellable context, captured before any worker spawns
-	// so the async holder-loss sweep (scheduleHolderLostSweep) runs under the
-	// daemon's lifetime and unwinds on shutdown. Read unlocked, same as
-	// triggerShutdown.
-	serveCtx context.Context
-
 	// wg tracks every daemon goroutine; serve Waits on it before Run's deferred
 	// m.Close() closes the database under them.
 	wg sync.WaitGroup
@@ -226,6 +220,9 @@ func Run(ctx context.Context) error {
 		defer cancel()
 		return fpDomainProbe(probeCtx, accountDir)
 	}
+	// Surface overlay teardown persist-warnings through the daemon log instead of
+	// dropping them; a package-independent seam set once before serve spawns workers.
+	m.Warnf = s.log.Printf
 	// Route fusekit/overlay's conflict-resolution log through s.log. A package
 	// global, so assigned once before serve spawns any worker.
 	fkoverlay.ResolvedConflictLogf = s.log.Printf
@@ -276,11 +273,6 @@ func (s *Server) serve(ctx context.Context) error {
 	// stop cancels ctx, so it doubles as the over-the-socket shutdown trigger
 	// (OpShutdown). Set before the accept loop spawns any handler.
 	s.triggerShutdown = stop
-	// Capture ctx and arm the holder-loss sweep before any worker refreshes the
-	// holder cache: markUnhealthy fires the hook the instant a crashed holder is
-	// first observed unreachable while its mounts are still held.
-	s.serveCtx = ctx
-	s.holder.onLostWithMounts = s.scheduleHolderLostSweep
 
 	// Host sync wires before any worker or handler can read s.sync (per-call
 	// gated on the sync_enabled meta); a failure leaves this run syncless —
@@ -1030,11 +1022,10 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 // at startup, off the accept path; ctx is checked between accounts so a
 // boot-time shutdown doesn't block wg.Wait on a slow account's mount timeout.
 func (s *Server) reconcileOverlays(ctx context.Context) {
-	// Reap dead-holder orphans first: a cold start over an already-dead holder
-	// never fires the loss hook, and the reap is carcass-gated so it is always safe.
-	s.reapPoolOrphans()
 	// Prime the holder cache before any per-account decision: mountReady (and
-	// so every select racing this reconcile) keys fuse readiness on it.
+	// so every select racing this reconcile) keys fuse readiness on it. Carcass
+	// clearing is the shared holder's job (proven-dead pre-mount clear), so the
+	// daemon reaps nothing here.
 	s.holder.refresh(s.holderClient())
 	accts, err := s.m.Store.ListAccounts()
 	if err != nil {
@@ -1062,116 +1053,6 @@ func (s *Server) reconcileOverlays(ctx context.Context) {
 		}
 		s.reconcileAccount(ctx, a)
 		s.cl.disownHold(a.ID)
-	}
-	// Clear any wedged carcass under accounts/ that no row owns (a pre-row `ccp
-	// add` mount whose holder died); this startup sweep is its only cleaner.
-	s.sweepOrphanMountpoints(ctx, accts)
-}
-
-// sweepOrphanMountpoints force-unmounts any mountpoint under the accounts dir
-// that no account row owns (a hard-interrupted pre-row `ccp add` leaves a wedged
-// carcass nothing row-driven names); every check here is non-blocking.
-func (s *Server) sweepOrphanMountpoints(ctx context.Context, accts []store.Account) {
-	rowDirs := make(map[string]bool, len(accts))
-	for _, a := range accts {
-		rowDirs[a.ConfigDir] = true
-	}
-	entries, err := os.ReadDir(pool.AccountsDir())
-	if err != nil {
-		if !os.IsNotExist(err) {
-			s.log.Printf("orphan mount sweep: read accounts dir: %v", err)
-		}
-		return
-	}
-	for _, e := range entries {
-		if ctx.Err() != nil {
-			return
-		}
-		if !e.IsDir() {
-			continue
-		}
-		dir := filepath.Join(pool.AccountsDir(), e.Name())
-		if rowDirs[dir] || !overlayMounted(dir) {
-			continue
-		}
-		// A carcass actively read by a live claude is not a carcass yet:
-		// force-unmounting ANY busy NFS mirror panics the kernel, so defer to a
-		// later sweep once the session relaunches. Leave it mounted and surface it.
-		busy, n, err := s.unmountIdle(ctx, dir)
-		if busy {
-			s.log.Printf("orphaned mountpoint %s left under %d live session(s) — NOT force-unmounting (would panic the kernel); relaunch them", dir, n)
-			continue
-		}
-		s.log.Printf("cleared orphaned mountpoint with no account row (pre-row add carcass?): %s", dir)
-		if err != nil {
-			s.log.Printf("orphan mount sweep: force-unmount %s: %v", dir, err)
-		}
-	}
-	s.sweepOrphanMuxRoot(ctx, accts)
-}
-
-// sweepOrphanMuxRoot force-unmounts the shared native mux mount at MuxRootDir()
-// iff it is a carcass no live holder owns; gated on zero live fuse sessions
-// pool-wide, since dropping the shared mount drops EVERY subtree.
-func (s *Server) sweepOrphanMuxRoot(ctx context.Context, accts []store.Account) {
-	root := pool.MuxRootDir()
-	if !overlayMounted(root) {
-		return
-	}
-	// A live peer is not enough: a freshly respawned empty-registry holder does
-	// not own a dead predecessor's root, and that carcass makes it refuse every
-	// mux Setup as ClassForeignMount.
-	if s.holderOwnsMuxRoot() {
-		return
-	}
-	fuse := make([]store.Account, 0, len(accts))
-	for _, a := range accts {
-		if fuseBackedRow(a.OverlayKind) {
-			fuse = append(fuse, a)
-		}
-	}
-	if s.sweepMuxRootIdle(ctx, fuse) {
-		s.log.Printf("cleared orphaned native mux mount (no live holder owns it): %s", root)
-	}
-}
-
-// scheduleHolderLostSweep runs sweepHolderOrphans off the refresh caller when a
-// healthy holder serving mounts becomes unreachable (markUnhealthy's transition
-// gate fires it once per death). Async so a select's lazy refresh never blocks on
-// the sweep; tracked by s.wg — every refresh caller already holds a wg token, so
-// the Add never races the shutdown Wait.
-func (s *Server) scheduleHolderLostSweep() {
-	ctx := s.serveCtx
-	if ctx == nil {
-		return // no serve context yet (pre-serve wiring); nothing to sweep under
-	}
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.sweepHolderOrphans(ctx)
-	}()
-}
-
-// sweepHolderOrphans is the holder-death recovery: reap the orphaned go-nfsv4
-// servers (carcass-gated, safe unconditionally), then the idle-gated mux-root
-// sweep. Short-circuits the per-row remount breaker — see ccn doc 1668381.
-func (s *Server) sweepHolderOrphans(ctx context.Context) {
-	s.reapPoolOrphans()
-	accts, err := s.m.Store.ListAccounts()
-	if err != nil {
-		s.log.Printf("holder-loss orphan sweep: list accounts: %v", err)
-		return
-	}
-	s.sweepOrphanMuxRoot(ctx, accts)
-}
-
-// reapPoolOrphans kills any-generation go-nfsv4 orphans bound under the pool's
-// mount roots — the mux go-nfsv4 (bound to the mux root) and legacy per-dir
-// servers (under accounts/). Carcass-gated AND kill-time-reconfirmed in
-// fusekit, so a live holder's healthy servers are never candidates.
-func (s *Server) reapPoolOrphans() {
-	if pids := reapOrphanedServers([]string{pool.MuxRootDir(), pool.AccountsDir()}); len(pids) > 0 {
-		s.log.Printf("reaped %d orphaned go-nfsv4 server(s) a crashed holder left bound to cc-pool mounts: %v", len(pids), pids)
 	}
 }
 
@@ -1266,10 +1147,10 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 	// precedes the mount check. See ccn doc d1ab40f.
 	if s.dirIsOverlaySymlink(a.ConfigDir) {
 		// A fresh per-account tick, not the startup table's shared one: this
-		// crash-window retract is destructive, so its liveness check must be as fresh
-		// as the old per-call liveSessionGate — one scan per reconciled account. The
-		// retract runs only under the convert claim and with no live session on the
-		// bridge, since beginPoll does not hide the dir from a select landing on it.
+		// crash-window retract is destructive, so its liveness check gets one scan
+		// per reconciled account. The retract runs only under the convert claim and
+		// with no live session on the bridge, since beginPoll does not hide the dir
+		// from a select landing on it.
 		if !s.beginSymlinkHealHeld(s.newTick(ctx), a) {
 			return
 		}
@@ -1282,18 +1163,20 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 	// survived the restart); under a NON-fuse row it is wreckage — an aborted
 	// rollback's wedged unmount, or a conversion that died before its row flip —
 	// serving a mirror whose backing no longer holds the account's identity. It
-	// blocks every symlink repair (they refuse mountpoints); force it down first.
+	// blocks every symlink repair (they refuse mountpoints); tear it down first.
 	if overlayMounted(a.ConfigDir) {
-		// Force it down directly (backend-agnostic, no provider) so the symlink
-		// repair below can proceed. But a live claude may still be reading this
-		// carcass, and force-unmounting a busy NFS mirror panics the kernel — so
-		// when a session is bound, leave it and re-check next tick.
-		busy, n, err := s.unmountIdle(ctx, a.ConfigDir)
-		if busy {
-			s.log.Printf("acct-%02d: stale mountpoint left under %d live session(s) — NOT force-unmounting (would panic the kernel); relaunch them", a.ID, n)
-			return
+		// Route the teardown through the shared holder's lease-ladder unmount
+		// (graceful, never a force): a held session lease or a busy mirror answers
+		// ErrBusy, so a live session defers this to a later tick instead of breaking.
+		warning, err := s.holderClient().Unmount(pool.ClaudeDir(), a.ConfigDir)
+		if warning != "" {
+			s.log.Printf("acct-%02d: stale-mountpoint unmount persist-warning: %s", a.ID, warning)
 		}
 		if err != nil {
+			if errors.Is(err, mountd.ErrBusy) {
+				s.log.Printf("acct-%02d: stale mountpoint at %s is busy (a live session holds its lease); leaving it, re-checking next tick", a.ID, a.ConfigDir)
+				return
+			}
 			s.log.Printf("acct-%02d: unmount stale mountpoint: %v", a.ID, err)
 			return
 		}
@@ -1322,29 +1205,20 @@ func (s *Server) needsMuxMigration(a store.Account) bool {
 
 // migrateLegacyFuseRow converts a pre-cutover per-account fuse mount into a
 // shared-mux subtree bridged by a symlink. Caller holds the account's poll claim.
-// The live legacy mountpoint comes down first (session-gated: force-unmounting a
-// busy NFS mirror panics the kernel), its dir is drained, and healFuse re-attaches
-// the subtree. Every step is idempotent. See ccn doc 7bf8406.
+// The live legacy mountpoint comes down first (through the holder's lease-gated
+// unmount), its dir is drained, and healFuse re-attaches the subtree. Every step
+// is idempotent. See ccn doc 7bf8406.
 func (s *Server) migrateLegacyFuseRow(ctx context.Context, a store.Account) {
 	base, dir := pool.ClaudeDir(), a.ConfigDir
-	// A holder predating MinHolderVersion silently ignores mux_root, so defer the
-	// whole migration loudly while a reachable holder is unmitigated — the legacy
-	// mount keeps serving. An unreachable holder (view() "") does not block. See
-	// ccn doc 7bf8406.
-	if _, ver := s.holder.view(); !pool.HolderVersionMitigated(ver) {
-		s.log.Printf("acct-%02d deferring legacy→mux migration: holder %s predates %s; leaving the working legacy mount until `brew upgrade --cask fusekit-holder` lands", a.ID, ver, pool.MinHolderVersion)
-		return
-	}
 	// The drain + teardown remake the dir a launching claude would land in, so
-	// claim the account first (claim-before-scan, like fallbackToSymlink): once
-	// converting is set tryReserve refuses for the whole span, and a live
-	// reservation defers the migration. Released before healFuse re-attaches — its
-	// own fallback path takes the claim afresh.
+	// claim the account first: once converting is set tryReserve refuses for the
+	// whole span, and a live reservation defers the migration. Released before
+	// healFuse re-attaches — its own fallback path takes the claim afresh.
 	if !s.cl.ownHeld(a.ID) {
 		s.log.Printf("acct-%02d deferring legacy→mux migration: reserved by a pending select", a.ID)
 		return
 	}
-	drained := s.drainLegacyFuseDir(ctx, a, base, dir)
+	drained := s.drainLegacyFuseDir(a, base, dir)
 	s.cl.disownConvert(a.ID)
 	if !drained {
 		return
@@ -1352,35 +1226,56 @@ func (s *Server) migrateLegacyFuseRow(ctx context.Context, a store.Account) {
 	s.healFuse(ctx, a)
 }
 
+// warnTeardown surfaces an overlay teardown's journal persist-warning loudly (the
+// kernel detach landed but a successor could replay the stale row); empty stays silent.
+func (s *Server) warnTeardown(id int, warning string) {
+	if warning != "" {
+		s.log.Printf("acct-%02d overlay teardown persist-warning: %s", id, warning)
+	}
+}
+
 // drainLegacyFuseDir tears down a legacy per-dir mount and empties the account dir
 // so a bridge symlink can replace it, returning whether the dir is ready for
 // healFuse to re-attach the mux subtree. Caller holds the convert claim. The
-// live-session gate is unconditional (not only when dir is still a mountpoint): a
-// re-run on a bare, half-migrated dir still swaps the account's CLAUDE_CONFIG_DIR
-// out from under any live claude, so it must defer just like a mounted one.
-func (s *Server) drainLegacyFuseDir(ctx context.Context, a store.Account, base, dir string) bool {
-	// The idle gate is unconditional — it guards the drain (which swaps
-	// CLAUDE_CONFIG_DIR even on a bare, half-migrated dir), not only the unmount.
-	// A live mount comes down through the idle chokepoint; a bare dir takes the
-	// same gate without unmounting.
+// teardown routes through the holder's lease-ladder unmount — a held session
+// lease or a busy mirror answers ErrBusy (graceful, never a force), deferring the
+// migration until the session exits.
+func (s *Server) drainLegacyFuseDir(a store.Account, base, dir string) bool {
 	if overlayMounted(dir) {
-		busy, n, err := s.unmountIdle(ctx, dir)
-		if busy {
-			s.log.Printf("acct-%02d deferring legacy→mux migration: %d live session(s) on %s; relaunch them", a.ID, n, dir)
+		prov := s.overlayForRow(a)
+		if prov == nil {
+			s.log.Printf("acct-%02d mux migration: no provider resolved to tear down legacy mount %s", a.ID, dir)
 			return false
 		}
+		// (b) Holder-delegated teardown of the live legacy mount: NO consumer seize
+		// (the holder is the seizer; a held EX would self-bounce its own Seize). Its
+		// mountd.ErrBusy — a live session holding the dir's lease — is the gate.
+		warning, err := prov.Teardown(base, dir)
+		s.warnTeardown(a.ID, warning)
 		if err != nil {
-			s.log.Printf("acct-%02d mux migration: force-unmount legacy mount %s: %v", a.ID, dir, err)
+			if errors.Is(err, mountd.ErrBusy) {
+				s.log.Printf("acct-%02d deferring legacy→mux migration: %s is busy (a live session holds its lease); relaunch it", a.ID, dir)
+				return false
+			}
+			s.log.Printf("acct-%02d mux migration: tear down legacy mount %s: %v", a.ID, dir, err)
 			return false
 		}
 		// Drop the holder-cache vouch the instant the mount is gone: a select
 		// racing the drain must never launch onto the torn-down dir.
 		s.holder.noteUnmounted(dir)
 		s.log.Printf("acct-%02d tore down legacy per-dir mount for mux migration", a.ID)
-	} else if busy, n := s.liveSessionGate(ctx, dir); busy {
-		s.log.Printf("acct-%02d deferring legacy→mux migration: %d live session(s) on %s; relaunch them", a.ID, n, dir)
+	}
+	// (a) The local drain remakes the now-plain dir cc-pool performs itself, so it
+	// runs under an exclusive session-lease fence: a live session or a select handout
+	// (invisible to procscan before claude starts) on the dir defers the drain rather
+	// than having its dir replaced underneath it. The seize follows the holder's
+	// confirmed teardown, closing the gap between it and the local mutation.
+	fence, err := s.m.SeizeSessionLease(a)
+	if err != nil {
+		s.log.Printf("acct-%02d deferring legacy→mux migration: %s is held by a live session or launch; relaunch it: %v", a.ID, dir, err)
 		return false
 	}
+	defer func() { _ = fence.Release() }()
 	if err := s.drainDirForBridge(a, base, dir); err != nil {
 		s.log.Printf("acct-%02d mux migration: %v", a.ID, err)
 		return false
@@ -1438,8 +1333,8 @@ const (
 	healRetry                                  // transient holder condition; retry next poll
 	healTCCBlocked                             // mount blocked pending the TCC grant; recorded; retry next poll
 	healFallback                               // genuine mount failure; gated symlink fallback attempted
-	healDeferredBusy                           // dead/wedged mirror left mounted under a live session; force-unmount would panic the kernel, so defer
-	healDeferredUnmitigated                    // holder predates the NFS kernel-panic mitigations; wait for the cask upgrade, no breaker strike
+	healDeferredBusy                           // the mirror is busy (a live session holds its lease, or a graceful unmount answered EBUSY); defer, no breaker strike
+	healDeferredUnsupported                    // the holder lacks a required capability; wait for the cask upgrade, no breaker strike
 )
 
 // errSweepStranded marks a failure in mountFuse's pre-Setup sweep of stranded
@@ -1449,13 +1344,6 @@ const (
 // only re-heals fuse rows), and the collision that refused the sweep would
 // refuse the symlink retreat the same way — so converting fixes nothing.
 var errSweepStranded = errors.New("sweep stranded private files")
-
-// errRemountBusy marks mountFuse refusing to tear down a dead/wedged mirror
-// while a live claude session is still bound: force-unmounting a busy NFS
-// mirror panics the kernel (nfs_vinvalbuf2: ubc_msync failed), so the remount
-// defers. healFuse routes it to healDeferredBusy, which backs off WITHOUT a
-// hazard strike so the wedged breaker can never fire on a busy mount.
-var errRemountBusy = errors.New("remount refused: live sessions on the mirror")
 
 // healFuse establishes a fuse account's mirror, classifying failures instead of
 // blindly converting (see the switch): transient conditions and a mount pending
@@ -1468,23 +1356,25 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 	switch {
 	case err == nil:
 		return healMounted
-	case errors.Is(err, errRemountBusy):
-		// Live session still bound; mountFuse left the dead/wedged mirror mounted
-		// (see errRemountBusy). Defer WITHOUT a hazard strike.
-		s.log.Printf("acct-%02d dead/wedged mirror left mounted under live session(s) — NOT force-unmounting (would panic the kernel); relaunch them: %v", a.ID, err)
+	case errors.Is(err, mountd.ErrBusy):
+		// The mirror is busy: a live session holds its lease (the holder refused to
+		// seize across a teardown), or a graceful unmount answered EBUSY. Defer
+		// WITHOUT a hazard strike so the wedged breaker never fires on a busy
+		// mirror — it clears on its own once the session exits.
+		s.log.Printf("acct-%02d remount deferred: the mirror is busy (a live session holds its lease); relaunch it: %v", a.ID, err)
 		return healDeferredBusy
-	case errors.Is(err, pool.ErrHolderUnmitigated):
-		// The provider's mitigation gate refused to host a mirror on a
-		// pre-mitigation holder (the nfs_vinvalbuf2 panic vector). A benign wait
-		// for the cask upgrade, not a kernel hazard: defer without a breaker
-		// strike, and never demote the row — the remount resumes on its own once
-		// the holder is upgraded.
-		s.log.Printf("acct-%02d remount refused, retrying next poll: %v", a.ID, err)
-		return healDeferredUnmitigated
-	case errors.Is(err, mountd.ErrHolderUnavailable), errors.Is(err, mountd.ErrBusy):
+	case errors.Is(err, pool.ErrHolderUnsupported), errors.Is(err, mountd.ErrProtoMismatch):
+		// The feature gate refused a holder missing a required capability, or the
+		// holder speaks an older protocol generation. A benign wait for the cask
+		// upgrade, not a mount hazard: defer without a breaker strike and never
+		// demote the row — the remount resumes once `brew upgrade --cask
+		// fusekit-holder` lands.
+		s.log.Printf("acct-%02d remount refused (holder lacks a required capability), retrying next poll: %v", a.ID, err)
+		return healDeferredUnsupported
+	case errors.Is(err, mountd.ErrHolderUnavailable):
 		// Setup already attempts a lazy (re)spawn and launchd owns the respawn
 		// policy, so there is nothing more to do this poll.
-		s.log.Printf("acct-%02d mount deferred (holder unavailable or dir busy), retrying next poll: %v", a.ID, err)
+		s.log.Printf("acct-%02d mount deferred (holder unavailable), retrying next poll: %v", a.ID, err)
 		return healRetry
 	case errors.Is(err, overlay.ErrUnmountWedged):
 		// A wedged unmount says nothing about whether a fresh mount would work,
@@ -1506,21 +1396,11 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 		s.log.Printf("acct-%02d mux subtree could not join the shared mount (registry state), retrying next poll: %v", a.ID, err)
 		return healRetry
 	case errors.Is(err, mountd.ErrForeignMount):
-		// A mux Setup hit a foreign mount at the SHARED ROOT — a carcass a dead
-		// holder left that the fresh, empty-registry holder does not own and mountFuse's
-		// per-dir Teardown cannot clear (MNT_FORCE is a root-only operation). Registry
-		// state, never a mount verdict: sweep the orphaned root (pool-idle-gated) so the
-		// next heal re-mounts and re-attaches — NEVER demote the whole pool to symlink.
-		fuse, ferr := s.fuseAccounts()
-		if ferr != nil {
-			s.log.Printf("acct-%02d foreign-root sweep: list accounts: %v; retrying next poll", a.ID, ferr)
-			return healRetry
-		}
-		if s.sweepMuxRootIdle(ctx, fuse) {
-			s.log.Printf("acct-%02d cleared a foreign carcass at the shared mux root; the heal loop will re-mount and re-attach", a.ID)
-		} else {
-			s.log.Printf("acct-%02d mux setup blocked by a foreign carcass at the shared root, retrying next poll: %v", a.ID, err)
-		}
+		// A foreign mount sits where a mux mount must go. The holder clears its own
+		// dead carcasses on mount (the fenced, proven-dead pre-mount clear), so a
+		// mount still refused foreign is genuine registry state, never a mount
+		// verdict — retry, never demote the pool to symlink.
+		s.log.Printf("acct-%02d mux setup blocked by a foreign mount at the shared root, retrying next poll: %v", a.ID, err)
 		return healRetry
 	case errors.Is(err, mountd.ErrUnknownClass):
 		// Forward skew: a newer holder sent an error class this daemon predates.
@@ -1579,33 +1459,26 @@ func (s *Server) mountFuse(ctx context.Context, a store.Account) error {
 	}
 	base, dir := pool.ClaudeDir(), a.ConfigDir
 	// Health is shallow, so a partial wedge passes it (the deepWedged verdict
-	// catches that). A dead/wedged mirror must come down before re-establishing,
-	// which is session-breaking, so gate on a live session first — a legacy per-dir
-	// mount needs a kernel force-unmount (force-unmounting a busy NFS mirror panics
-	// the kernel), a mux subtree a kernel-free re-attach. See ccn doc 7bf8406.
+	// catches that). A dead/wedged mirror must come down before re-establishing.
+	// The provider's Teardown routes through the holder's lease-ladder unmount
+	// (graceful, never a force): a live session holding the lease answers ErrBusy,
+	// so the remount defers instead of breaking the session. See ccn doc 7bf8406.
 	legacy := overlayMounted(dir)
 	if (legacy || pool.IsBridgeSymlink(dir)) && (prov.Health(base, dir) != nil || s.holder.deepWedged(dir)) {
-		if busy, _ := s.liveSessionGate(ctx, dir); busy {
-			return errRemountBusy
-		}
-		// Detach before re-establishing — for BOTH shapes: a legacy per-dir mount
-		// needs a kernel force-unmount, a mux subtree a kernel-free logical detach
-		// (without which AddMount sees it still live and skips the re-attach, so a
-		// deep wedge never clears). See ccn doc 7bf8406.
-		if err := prov.Teardown(base, dir); err != nil {
+		warning, err := prov.Teardown(base, dir)
+		s.warnTeardown(a.ID, warning)
+		if err != nil {
 			return fmt.Errorf("clear dead mount before remounting: %w", err)
 		}
 		s.log.Printf("acct-%02d cleared a dead mount before remounting", a.ID)
 	}
 	err := s.sweepAndMount(prov, a, base, dir)
 	if errors.Is(err, mountd.ErrForeignMount) || errors.Is(err, mountd.ErrBaseMismatch) {
-		// The foreign/mismatched carcass clear also force-unmounts; gate it the
-		// same way so a live session bound to the carcass never triggers the
-		// kernel-panicking force-unmount.
-		if busy, _ := s.liveSessionGate(ctx, dir); busy {
-			return errRemountBusy
-		}
-		if terr := prov.Teardown(base, dir); terr != nil {
+		// A foreign/mismatched registry row needs one unmount-then-retry; the
+		// holder's lease-gated teardown answers ErrBusy under a live session.
+		warning, terr := prov.Teardown(base, dir)
+		s.warnTeardown(a.ID, warning)
+		if terr != nil {
 			return fmt.Errorf("clear foreign mount: %w", terr)
 		}
 		err = s.sweepAndMount(prov, a, base, dir)
@@ -1643,26 +1516,22 @@ func (s *Server) sweepAndMount(prov fkoverlay.Provider, a store.Account, base, d
 }
 
 // fallbackToSymlink converts an account to symlink after a genuine mount failure
-// so its dir is usable again. ConvertOverlay force-unmounts the dir first, so it is
-// gated like a migrate — claim first, scan second (never convert blind or under a
-// live session; defer instead) — and moves private files back out of the fuse
-// backing dir. Callers must hold the account's poll claim. See ccn doc d1ab40f.
+// so its dir is usable again. ConvertOverlay's teardown routes through the
+// holder's lease-ladder unmount, so a live session holding the lease answers
+// ErrBusy and the fallback defers instead of breaking it; private files move back
+// out of the fuse backing dir. Callers must hold the account's poll claim. See ccn
+// doc d1ab40f.
 func (s *Server) fallbackToSymlink(ctx context.Context, a store.Account) {
 	if !s.cl.ownHeld(a.ID) {
 		s.log.Printf("acct-%02d deferring fuse→symlink fallback: reserved by a pending select or already converting", a.ID)
 		return
 	}
 	defer s.cl.disownConvert(a.ID)
-	sessions, err := s.scan(ctx)
-	if err != nil {
-		s.log.Printf("acct-%02d deferring fuse→symlink fallback: session scan: %v", a.ID, err)
-		return
-	}
-	if n := procscan.CountByConfigDir(sessions, a.ConfigDir); n > 0 {
-		s.log.Printf("acct-%02d deferring fuse→symlink fallback: %d live session(s)", a.ID, n)
-		return
-	}
 	if _, err := s.m.ConvertOverlay(ctx, a, fkoverlay.BackendSymlink); err != nil {
+		if errors.Is(err, mountd.ErrBusy) {
+			s.log.Printf("acct-%02d deferring fuse→symlink fallback: a live session holds the lease on %s", a.ID, a.ConfigDir)
+			return
+		}
 		s.log.Printf("acct-%02d symlink fallback: %v", a.ID, err)
 		return
 	}
