@@ -29,8 +29,6 @@ CREATE TABLE IF NOT EXISTS accounts (
   label            TEXT NOT NULL DEFAULT '',
   overlay_kind     TEXT NOT NULL DEFAULT 'symlink',
   account_uuid     TEXT NOT NULL DEFAULT '',
-  cred_hash        TEXT NOT NULL DEFAULT '',
-  cred_parent_hash TEXT NOT NULL DEFAULT '',
   created_at       INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS pending_adds (
@@ -121,10 +119,12 @@ func (s *Store) applySchema() error {
 	if err := s.ensureColumn("accounts", "account_uuid", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
-	if err := s.ensureColumn("accounts", "cred_hash", "TEXT NOT NULL DEFAULT ''"); err != nil {
+	// The chain-hash columns predate origin-owned chains (ownership now lives in
+	// the credential blob itself: refresh-token presence); drop them in place.
+	if err := s.dropColumn("accounts", "cred_hash"); err != nil {
 		return err
 	}
-	if err := s.ensureColumn("accounts", "cred_parent_hash", "TEXT NOT NULL DEFAULT ''"); err != nil {
+	if err := s.dropColumn("accounts", "cred_parent_hash"); err != nil {
 		return err
 	}
 	// The index must follow the ensureColumn: on a pre-existing db the column is
@@ -164,6 +164,32 @@ func (s *Store) ensureColumn(table, column, decl string) error {
 	return nil
 }
 
+// dropColumn removes column from table when present. Errors fail Open —
+// running against a half-migrated schema is never acceptable.
+func (s *Store) dropColumn(table, column string) error {
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
+		return fmt.Errorf("inspect %s.%s: %w", table, column, err)
+	}
+	if n == 0 {
+		return nil
+	}
+	// table/column are compile-time constants; nothing user-controlled.
+	if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s DROP COLUMN %s`, table, column)); err != nil {
+		// Two processes can race the check-then-ALTER on the first open after an
+		// upgrade. The postcondition is "column absent" — re-check before failing
+		// so the no-such-column loser swallows its error.
+		var again int
+		if err2 := s.db.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&again); err2 == nil && again == 0 {
+			return nil
+		}
+		return fmt.Errorf("drop column %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
 // GetMeta returns the meta value for key, ok=false if absent.
 func (s *Store) GetMeta(key string) (string, bool, error) {
 	var v string
@@ -191,23 +217,23 @@ func (s *Store) SetMeta(key, value string) error {
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
-// UpsertAccount inserts or replaces an account row by id; account_uuid and the
-// chain-hash columns are insert-only so a re-upsert can't wipe backfilled values.
+// UpsertAccount inserts or replaces an account row by id; account_uuid is
+// insert-only so a re-upsert can't wipe a backfilled value.
 func (s *Store) UpsertAccount(a Account) error {
 	created := a.CreatedAt
 	if created.IsZero() {
 		created = time.Now()
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO accounts(id,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,cred_hash,cred_parent_hash,created_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?)
+		`INSERT INTO accounts(id,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at)
+		 VALUES(?,?,?,?,?,?,?,?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   config_dir=excluded.config_dir,
 		   keychain_service=excluded.keychain_service,
 		   keychain_account=excluded.keychain_account,
 		   label=excluded.label,
 		   overlay_kind=excluded.overlay_kind`,
-		a.ID, a.ConfigDir, a.KeychainService, a.KeychainAccount, a.Label, a.OverlayKind, a.AccountUUID, a.CredHash, a.CredParentHash, created.Unix())
+		a.ID, a.ConfigDir, a.KeychainService, a.KeychainAccount, a.Label, a.OverlayKind, a.AccountUUID, created.Unix())
 	if err != nil {
 		return fmt.Errorf("upsert account %d: %w", a.ID, err)
 	}
@@ -251,14 +277,14 @@ func scanAccount(rows interface{ Scan(...any) error }) (Account, error) {
 	var a Account
 	var created int64
 	if err := rows.Scan(&a.ID, &a.ConfigDir, &a.KeychainService, &a.KeychainAccount,
-		&a.Label, &a.OverlayKind, &a.AccountUUID, &a.CredHash, &a.CredParentHash, &created); err != nil {
+		&a.Label, &a.OverlayKind, &a.AccountUUID, &created); err != nil {
 		return a, err
 	}
 	a.CreatedAt = time.Unix(created, 0)
 	return a, nil
 }
 
-const accountCols = `id,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,cred_hash,cred_parent_hash,created_at`
+const accountCols = `id,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at`
 
 // ListAccounts returns all accounts ordered by id.
 func (s *Store) ListAccounts() ([]Account, error) {
@@ -294,23 +320,6 @@ func (s *Store) SetAccountUUID(id int, uuid string) error {
 	res, err := s.db.Exec(`UPDATE accounts SET account_uuid=? WHERE id=?`, uuid, id)
 	if err != nil {
 		return fmt.Errorf("set account_uuid for account %d: %w", id, err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return fmt.Errorf("account %d not found", id)
-	}
-	return nil
-}
-
-// SetChainHashes records the last written credential's hash and its parent's;
-// a targeted UPDATE so it can't clobber concurrent updates to other columns.
-func (s *Store) SetChainHashes(id int, credHash, parentHash string) error {
-	res, err := s.db.Exec(`UPDATE accounts SET cred_hash=?, cred_parent_hash=? WHERE id=?`, credHash, parentHash, id)
-	if err != nil {
-		return fmt.Errorf("set chain hashes for account %d: %w", id, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {

@@ -203,9 +203,6 @@ func TestEnableBackfillsAndScanPublishes(t *testing.T) {
 
 	cred1 := testCred("at-1", 1893456000000)
 	addSyncTestAccount(t, m, fk, 1, "u-1", "one@example.com", "Work", cred1)
-	if err := m.Store.SetChainHashes(1, creds.CredentialHash(cred1), "parent-h"); err != nil {
-		t.Fatal(err)
-	}
 	cred2 := testCred("at-2", 1893456000000)
 	addSyncTestAccount(t, m, fk, 2, "u-2", "two@example.com", "Old", cred2)
 
@@ -250,9 +247,6 @@ func TestEnableBackfillsAndScanPublishes(t *testing.T) {
 	}
 	if v.Chain.Hash != creds.CredentialHash(cred1) {
 		t.Fatalf("u-1 chain hash = %q, want CredentialHash(cred1)", v.Chain.Hash)
-	}
-	if v.Chain.ParentHash != "parent-h" {
-		t.Fatalf("u-1 chain parentHash = %q, want the recorded cred_parent_hash", v.Chain.ParentHash)
 	}
 	if v.Chain.ExpiresAt != 1893456000000 || v.Chain.Holder != "me@hosta" {
 		t.Fatalf("u-1 chain = %+v", v.Chain)

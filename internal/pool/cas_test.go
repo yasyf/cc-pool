@@ -74,7 +74,7 @@ func TestWriteCredCAS(t *testing.T) {
 			m := &Manager{Store: st, Creds: fk, LockDir: t.TempDir()}
 			before := fk.WriteCount()
 
-			err := m.writeCredCAS(a, creds.SourceKeychain, tc.prevAccess, tc.next, "")
+			err := m.writeCredCAS(a, creds.SourceKeychain, tc.prevAccess, tc.next)
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("writeCredCAS err = %v, want %v", err, tc.wantErr)
 			}
@@ -118,57 +118,5 @@ func TestAdoptRotatedTokenReassertsUnchanged(t *testing.T) {
 	}
 	if got, _ := fk.Get(a.KeychainService, a.KeychainAccount); got.ClaudeAiOauth.AccessToken != "at-0" {
 		t.Fatalf("stored access token = %q, want at-0", got.ClaudeAiOauth.AccessToken)
-	}
-}
-
-// TestAdoptRotatedTokenRecordsLineage pins the ""-parent resolution: adopting a
-// session-rotated credential records the pre-rotation cred_hash as its parent,
-// and adopting an unchanged credential leaves both columns intact.
-func TestAdoptRotatedTokenRecordsLineage(t *testing.T) {
-	st := openTestStore(t)
-	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user"}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
-	fk := credstest.NewFake()
-	m := &Manager{Store: st, Creds: fk, LockDir: t.TempDir()}
-
-	c1 := casCred("at-1", "rt-1")
-	fk.Put(a.KeychainService, a.KeychainAccount, c1)
-	if err := m.AdoptRotatedToken(context.Background(), a); err != nil {
-		t.Fatal(err)
-	}
-	row, err := st.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if row.CredHash != creds.CredentialHash(c1) || row.CredParentHash != "" {
-		t.Fatalf("first adopt columns = (%q,%q), want (hash(c1),\"\")", row.CredHash, row.CredParentHash)
-	}
-
-	// A live session rotates the chain; the adopt records c1 as c2's parent.
-	c2 := casCred("at-2", "rt-2")
-	fk.Put(a.KeychainService, a.KeychainAccount, c2)
-	if err := m.AdoptRotatedToken(context.Background(), a); err != nil {
-		t.Fatal(err)
-	}
-	row, err = st.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if row.CredHash != creds.CredentialHash(c2) || row.CredParentHash != creds.CredentialHash(c1) {
-		t.Fatalf("rotation adopt columns = (%q,%q), want (hash(c2),hash(c1))", row.CredHash, row.CredParentHash)
-	}
-
-	// An adopt of the unchanged credential must not corrupt the lineage.
-	if err := m.AdoptRotatedToken(context.Background(), a); err != nil {
-		t.Fatal(err)
-	}
-	row, err = st.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if row.CredHash != creds.CredentialHash(c2) || row.CredParentHash != creds.CredentialHash(c1) {
-		t.Fatalf("unchanged adopt columns = (%q,%q), want (hash(c2),hash(c1)) intact", row.CredHash, row.CredParentHash)
 	}
 }

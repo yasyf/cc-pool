@@ -119,7 +119,7 @@ func TestWriteCredRoutesBySource(t *testing.T) {
 			cred := &creds.Credential{}
 			cred.ClaudeAiOauth.AccessToken = "at-1"
 
-			if err := m.writeCred(a, tc.src, cred, ""); err != nil {
+			if err := m.writeCred(a, tc.src, cred); err != nil {
 				t.Fatal(err)
 			}
 			if got := creds.FileCredentialExists(dir); got != tc.wantFile {

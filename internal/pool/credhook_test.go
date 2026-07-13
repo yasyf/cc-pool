@@ -21,10 +21,9 @@ func hookCred() *creds.Credential {
 }
 
 // TestOnCredWriteHook pins the writeCred seam: the hook fires exactly once per
-// successful store write with the written account, credential, and parent
-// hash, a nil hook is a no-op, and a failed store write fails loud without
-// ever reaching the hook. A successful write also persists the chain-hash
-// columns.
+// successful store write with the written account and credential, a nil hook
+// is a no-op, and a failed store write fails loud without ever reaching the
+// hook.
 func TestOnCredWriteHook(t *testing.T) {
 	writeFault := errors.New("keychain write exploded")
 	hookErr := errors.New("registry write failed")
@@ -53,23 +52,21 @@ func TestOnCredWriteHook(t *testing.T) {
 			m := &Manager{Store: st, Creds: fk, LockDir: t.TempDir()}
 
 			var (
-				gotCalls  int
-				gotAcct   store.Account
-				gotCred   *creds.Credential
-				gotParent string
+				gotCalls int
+				gotAcct  store.Account
+				gotCred  *creds.Credential
 			)
 			if tc.setHook {
-				m.OnCredWrite = func(acc store.Account, cr *creds.Credential, parentHash string) error {
+				m.OnCredWrite = func(acc store.Account, cr *creds.Credential) error {
 					gotCalls++
 					gotAcct = acc
 					gotCred = cr
-					gotParent = parentHash
 					return tc.hookErr
 				}
 			}
 
 			cred := hookCred()
-			err := m.writeCred(a, creds.SourceKeychain, cred, "h-parent")
+			err := m.writeCred(a, creds.SourceKeychain, cred)
 			if tc.wantErrIs != nil {
 				if !errors.Is(err, tc.wantErrIs) {
 					t.Fatalf("writeCred err = %v, want errors.Is %v", err, tc.wantErrIs)
@@ -89,18 +86,6 @@ func TestOnCredWriteHook(t *testing.T) {
 				}
 				if gotCred != cred {
 					t.Fatalf("hook received a different *Credential (%p) than was written (%p)", gotCred, cred)
-				}
-				if gotParent != "h-parent" {
-					t.Fatalf("hook parentHash = %q, want h-parent", gotParent)
-				}
-			}
-			if tc.wantWrites > 0 {
-				row, err := st.GetAccount(a.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if row.CredHash != creds.CredentialHash(cred) || row.CredParentHash != "h-parent" {
-					t.Fatalf("chain columns = (%q,%q), want (hash(cred),h-parent)", row.CredHash, row.CredParentHash)
 				}
 			}
 		})
@@ -123,9 +108,9 @@ func TestOnCredWriteErrorLoggedAndSwallowed(t *testing.T) {
 	}
 	m := &Manager{Store: st, Creds: fk, LockDir: t.TempDir()}
 	hookErr := errors.New("registry unreachable")
-	m.OnCredWrite = func(store.Account, *creds.Credential, string) error { return hookErr }
+	m.OnCredWrite = func(store.Account, *creds.Credential) error { return hookErr }
 
-	if err := m.writeCred(a, creds.SourceKeychain, hookCred(), ""); err != nil {
+	if err := m.writeCred(a, creds.SourceKeychain, hookCred()); err != nil {
 		t.Fatalf("writeCred err = %v, want nil (hook error must be swallowed)", err)
 	}
 	out := buf.String()

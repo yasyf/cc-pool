@@ -59,9 +59,6 @@ func TestSyncPublishAccount(t *testing.T) {
 		c := testCred("at-1", future)
 		a := addSyncTestAccount(t, m, fk, 1, "u-1", "e@x.y", "Work", c)
 		hash := hostsync.CredentialHash(c)
-		if err := m.Store.SetChainHashes(a.ID, hash, "h-parent"); err != nil {
-			t.Fatal(err)
-		}
 		cmd, _ := syncCmdBuf(t)
 
 		if err := syncPublishAccount(cmd, m, a.ID); err != nil {
@@ -88,9 +85,6 @@ func TestSyncPublishAccount(t *testing.T) {
 		}
 		if v.Chain.Holder != "me@host-a" {
 			t.Errorf("holder = %q, want the mesh self", v.Chain.Holder)
-		}
-		if v.Chain.ParentHash != "h-parent" {
-			t.Errorf("parentHash = %q, want the stored lineage h-parent", v.Chain.ParentHash)
 		}
 		if v.Chain.RotatedAt <= 0 {
 			t.Errorf("rotatedAt = %d, want set", v.Chain.RotatedAt)
@@ -181,28 +175,6 @@ func TestSyncPublishAccount(t *testing.T) {
 		got := loadSyncRegistry(t)["u-1"].Value.Lease
 		if got == nil || got.Host != "me@host-b" || got.Until != future {
 			t.Fatalf("lease = %+v, want the peer lease preserved", got)
-		}
-	})
-
-	t.Run("drifted cred_hash becomes the chain parent", func(t *testing.T) {
-		m, fk := syncTestEnv(t)
-		stubSynckitdRun(t)
-		if err := m.Store.SetMeta(syncMetaKey, "1"); err != nil {
-			t.Fatal(err)
-		}
-		a := addSyncTestAccount(t, m, fk, 1, "u-1", "e@x.y", "Work", testCred("at-1", future))
-		// claude rotated the chain since cc-pool last wrote: the stored hash is
-		// the live chain's parent — the writeCred resolution.
-		if err := m.Store.SetChainHashes(a.ID, "h-old", "h-old-parent"); err != nil {
-			t.Fatal(err)
-		}
-		cmd, _ := syncCmdBuf(t)
-
-		if err := syncPublishAccount(cmd, m, a.ID); err != nil {
-			t.Fatal(err)
-		}
-		if got := loadSyncRegistry(t)["u-1"].Value.Chain.ParentHash; got != "h-old" {
-			t.Errorf("parentHash = %q, want the drifted stored hash h-old", got)
 		}
 	})
 

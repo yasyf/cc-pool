@@ -164,9 +164,6 @@ func TestMaterializeHappyPath(t *testing.T) {
 	if row.AccountUUID != "u-happy" {
 		t.Fatalf("row AccountUUID = %q, want u-happy (backfill)", row.AccountUUID)
 	}
-	if row.CredHash != CredentialHash(env) || row.CredParentHash != "hp-u-happy" {
-		t.Fatalf("chain columns = (%q,%q), want (hash(env),hp-u-happy)", row.CredHash, row.CredParentHash)
-	}
 	byUUID, ok, err := m.Store.GetAccountByUUID("u-happy")
 	if err != nil || !ok {
 		t.Fatalf("GetAccountByUUID: ok=%v err=%v", ok, err)

@@ -90,10 +90,9 @@ func scanLocalAccounts(m *pool.Manager) ([]localRow, error) {
 	return out, nil
 }
 
-// localChainStamp stamps a's chain from a refresh-free credential read:
-// lineage from the stored columns (a drifted cred_hash is the live chain's
-// parent, writeCred's resolution), holder = self; no readable credential is a
-// zero chain, which the fold's strictly-ahead gates never adopt — see ccn 10bf17d.
+// localChainStamp stamps a's chain from a refresh-free credential read;
+// holder = self; no readable credential is a zero chain, which the fold's
+// strictly-ahead gates never adopt — see ccn 10bf17d.
 func localChainStamp(m *pool.Manager, a store.Account, self string, now func() time.Time) (ChainStamp, error) {
 	cred, _, err := m.ReadCredential(a)
 	switch {
@@ -102,16 +101,10 @@ func localChainStamp(m *pool.Manager, a store.Account, self string, now func() t
 	case err != nil:
 		return ChainStamp{}, fmt.Errorf("read acct-%d credential: %w", a.ID, err)
 	}
-	hash := CredentialHash(cred)
-	parent := a.CredParentHash
-	if a.CredHash != "" && a.CredHash != hash {
-		parent = a.CredHash
-	}
 	return ChainStamp{
-		ExpiresAt:  cred.ClaudeAiOauth.ExpiresAt,
-		Hash:       hash,
-		Holder:     self,
-		ParentHash: parent,
-		RotatedAt:  now().UnixMilli(),
+		ExpiresAt: cred.ClaudeAiOauth.ExpiresAt,
+		Hash:      CredentialHash(cred),
+		Holder:    self,
+		RotatedAt: now().UnixMilli(),
 	}, nil
 }

@@ -102,9 +102,6 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	if err := s.M.Store.SetAccountUUID(acct.ID, v.UUID); err != nil {
 		return MaterializeResult{}, fmt.Errorf("materialize %s: backfill account uuid on acct-%d: %w", v.UUID, acct.ID, err)
 	}
-	if err := s.M.Store.SetChainHashes(acct.ID, CredentialHash(env), v.Chain.ParentHash); err != nil {
-		s.logf("hostsync: materialize %s: record chain hashes on acct-%d: %v", v.UUID, acct.ID, err)
-	}
 
 	// The new stamp dir is not watched yet; the nudge re-reads the manifest.
 	s.NudgeSynckitd(ctx, manifestPath)

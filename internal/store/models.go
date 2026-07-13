@@ -11,8 +11,6 @@ type Account struct {
 	Label           string // human note, e.g. an email or alias
 	OverlayKind     string // overlay backend string: "symlink" | "nfs" | "fskit" | "fileprovider"
 	AccountUUID     string // Claude accountUuid; "" until lazily backfilled
-	CredHash        string // CredentialHash of the last credential cc-pool wrote; "" until recorded
-	CredParentHash  string // hash of the credential whose refresh token minted CredHash; "" when unknown
 	CreatedAt       time.Time
 }
 

@@ -21,8 +21,8 @@ type OAuth struct {
 	// RefreshToken's omitempty is load-bearing: claude treats a PRESENT empty
 	// refreshToken as a dead chain (tombstone) but an ABSENT one as a plain
 	// access-token-only blob, so stripped blobs must omit the field entirely.
-	RefreshToken string `json:"refreshToken,omitempty"`
-	ExpiresAt    int64  `json:"expiresAt"` // Unix epoch MILLISECONDS
+	RefreshToken     string   `json:"refreshToken,omitempty"`
+	ExpiresAt        int64    `json:"expiresAt"` // Unix epoch MILLISECONDS
 	Scopes           []string `json:"scopes,omitempty"`
 	SubscriptionType string   `json:"subscriptionType,omitempty"`
 	RateLimitTier    string   `json:"rateLimitTier,omitempty"`

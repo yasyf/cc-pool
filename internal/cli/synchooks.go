@@ -113,24 +113,16 @@ func (p *syncPublisher) Publish(ctx context.Context, a store.Account) error {
 	if err != nil {
 		return fmt.Errorf("read acct-%02d credential: %w", a.ID, err)
 	}
-	hash := hostsync.CredentialHash(cred)
-	// Lineage from the stored columns — the same resolution writeCred applies:
-	// a drifted cred_hash is the live chain's parent.
-	parent := a.CredParentHash
-	if a.CredHash != "" && a.CredHash != hash {
-		parent = a.CredHash
-	}
 	v := hostsync.AccountValue{
 		UUID:         ident.AccountUUID,
 		Email:        ident.EmailAddress,
 		Label:        a.Label,
 		OAuthAccount: raw,
 		Chain: hostsync.ChainStamp{
-			ExpiresAt:  cred.ClaudeAiOauth.ExpiresAt,
-			Hash:       hash,
-			Holder:     p.self,
-			ParentHash: parent,
-			RotatedAt:  p.now().UnixMilli(),
+			ExpiresAt: cred.ClaudeAiOauth.ExpiresAt,
+			Hash:      hostsync.CredentialHash(cred),
+			Holder:    p.self,
+			RotatedAt: p.now().UnixMilli(),
 		},
 		Lease: currentLease(p.svc, ident.AccountUUID),
 	}

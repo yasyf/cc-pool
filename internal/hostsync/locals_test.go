@@ -78,20 +78,17 @@ func credWith(access, refresh string, expiresAt int64) *creds.Credential {
 
 // TestManagerLocalsCarriesLineage pins ManagerLocals: identity from the private
 // .claude.json, Chain.Hash/ExpiresAt from a read-only credential read,
-// Chain.ParentHash from the stored lineage columns, holder = self.
+// holder = self.
 func TestManagerLocalsCarriesLineage(t *testing.T) {
 	fixed := time.Now()
 	now := func() time.Time { return fixed }
 	const oauthRaw = `{"accountUuid":"u1","emailAddress":"a@x.com","organizationRole":"admin"}`
 
-	t.Run("logged-in account carries identity, label, and lineage", func(t *testing.T) {
+	t.Run("logged-in account carries identity, label, and chain stamp", func(t *testing.T) {
 		fx := newLocalsFixture(t)
 		a := fx.addAccount(t, 1, "symlink", "work", `{"oauthAccount":`+oauthRaw+`,"other":true}`)
 		cred := credWith("at-1", "rt-1", 4_200_000)
 		fx.fk.Put(a.KeychainService, a.KeychainAccount, cred)
-		if err := fx.m.Store.SetChainHashes(a.ID, CredentialHash(cred), "parent-1"); err != nil {
-			t.Fatal(err)
-		}
 
 		locals, err := ManagerLocals(fx.m, "host-self", now)(context.Background())
 		if err != nil {
@@ -108,34 +105,13 @@ func TestManagerLocalsCarriesLineage(t *testing.T) {
 			t.Errorf("OAuthAccount not verbatim:\n got %s\nwant %s", l.OAuthAccount, oauthRaw)
 		}
 		want := ChainStamp{
-			ExpiresAt:  4_200_000,
-			Hash:       CredentialHash(cred),
-			Holder:     "host-self",
-			ParentHash: "parent-1",
-			RotatedAt:  fixed.UnixMilli(),
+			ExpiresAt: 4_200_000,
+			Hash:      CredentialHash(cred),
+			Holder:    "host-self",
+			RotatedAt: fixed.UnixMilli(),
 		}
 		if l.Chain != want {
 			t.Errorf("chain = %+v, want %+v", l.Chain, want)
-		}
-	})
-
-	t.Run("drifted cred_hash column resolves the stored hash as parent", func(t *testing.T) {
-		fx := newLocalsFixture(t)
-		a := fx.addAccount(t, 1, "symlink", "l", `{"oauthAccount":`+oauthRaw+`}`)
-		cred := credWith("at-rotated", "rt-rotated", 9_000_000)
-		fx.fk.Put(a.KeychainService, a.KeychainAccount, cred)
-		// The columns lag a session rotation: the recorded hash is the live
-		// chain's parent — the same resolution writeCred applies.
-		if err := fx.m.Store.SetChainHashes(a.ID, "recorded-hash", "grand-parent"); err != nil {
-			t.Fatal(err)
-		}
-
-		locals, err := ManagerLocals(fx.m, "host-self", now)(context.Background())
-		if err != nil {
-			t.Fatalf("ManagerLocals: %v", err)
-		}
-		if got := locals[0].Chain.ParentHash; got != "recorded-hash" {
-			t.Fatalf("ParentHash = %q, want the drifted column value %q", got, "recorded-hash")
 		}
 	})
 

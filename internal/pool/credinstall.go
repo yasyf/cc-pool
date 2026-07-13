@@ -48,7 +48,7 @@ func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, 
 	default:
 		return false, err
 	}
-	if err := m.writeCredCAS(a, src, prevAccess, cred, ""); err != nil {
+	if err := m.writeCredCAS(a, src, prevAccess, cred); err != nil {
 		if errors.Is(err, ErrCredentialChangedUnderfoot) {
 			return false, nil
 		}

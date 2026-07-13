@@ -10,7 +10,7 @@
 //
 //	seed init                     set the initialized + symlink-overlay meta, make ~/.claude base
 //	seed account --id N ...       fabricate a logged-in file-backend account (row uuid left empty)
-//	seed rotate  --id N ...       rotate the chain: new tokens, parent = hash(current)
+//	seed rotate  --id N ...       rotate the chain in place: new tokens/expiry
 //	seed publish --id N           force-publish (PublishAccount) — the tombstone-override re-add intent
 //	seed hash    --id N           print the current credential's CredentialHash
 //	seed rowuuid --id N           print the account row's stored account_uuid
@@ -173,9 +173,8 @@ func cmdAccount(args []string) error {
 	return nil
 }
 
-// cmdRotate rotates an account's chain in place: parent = hash(current cred),
-// new tokens/expiry written to the file store, and the chain-hash columns
-// updated — the same lineage bookkeeping writeCred does for a real refresh.
+// cmdRotate rotates an account's chain in place: new tokens/expiry written to
+// the file store — what a real refresh leaves on disk.
 func cmdRotate(args []string) error {
 	fs := flag.NewFlagSet("rotate", flag.ExitOnError)
 	id := fs.Int("id", 1, "account index")
@@ -187,28 +186,16 @@ func cmdRotate(args []string) error {
 		return fmt.Errorf("rotate needs --access, --refresh, --expires-ms")
 	}
 
-	m, err := pool.Open()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = m.Close() }()
-
 	configDir := pool.AccountDir(*id)
 	fstore := creds.FileStore{ConfigDir: configDir}
-	cur, err := fstore.Read()
-	if err != nil {
+	if _, err := fstore.Read(); err != nil {
 		return fmt.Errorf("read current credential: %w", err)
 	}
-	parent := creds.CredentialHash(cur)
-
 	next := makeCred(*access, *refresh, *expiresMS)
 	if err := fstore.Write(next); err != nil {
 		return fmt.Errorf("write rotated credential: %w", err)
 	}
-	if err := m.Store.SetChainHashes(*id, creds.CredentialHash(next), parent); err != nil {
-		return fmt.Errorf("record chain hashes: %w", err)
-	}
-	fmt.Printf("rotated acct-%02d hash=%s parent=%s\n", *id, creds.CredentialHash(next), parent)
+	fmt.Printf("rotated acct-%02d hash=%s\n", *id, creds.CredentialHash(next))
 	return nil
 }
 
@@ -243,11 +230,6 @@ func cmdPublish(args []string) error {
 	if err != nil {
 		return fmt.Errorf("read credential: %w", err)
 	}
-	hash := creds.CredentialHash(cred)
-	parent := a.CredParentHash
-	if a.CredHash != "" && a.CredHash != hash {
-		parent = a.CredHash
-	}
 
 	self, err := meshSelf()
 	if err != nil {
@@ -261,11 +243,10 @@ func cmdPublish(args []string) error {
 		Label:        a.Label,
 		OAuthAccount: raw,
 		Chain: hostsync.ChainStamp{
-			ExpiresAt:  cred.ClaudeAiOauth.ExpiresAt,
-			Hash:       hash,
-			Holder:     self,
-			ParentHash: parent,
-			RotatedAt:  time.Now().UnixMilli(),
+			ExpiresAt: cred.ClaudeAiOauth.ExpiresAt,
+			Hash:      creds.CredentialHash(cred),
+			Holder:    self,
+			RotatedAt: time.Now().UnixMilli(),
 		},
 	}
 	if err := svc.PublishAccount(context.Background(), v); err != nil {

@@ -86,10 +86,10 @@ type Manager struct {
 	// it at a temp dir so they never touch real state.
 	LockDir string
 
-	// OnCredWrite, when non-nil, fires after every successful credential write;
-	// parentHash is the written chain's resolved parent ("" when unknown). Runs
-	// under the per-account lock: never block, never take the registry lock — see ccn 10bf17d.
-	OnCredWrite func(a store.Account, cred *creds.Credential, parentHash string) error
+	// OnCredWrite, when non-nil, fires after every successful credential write.
+	// Runs under the per-account lock: never block, never take the registry
+	// lock — see ccn 10bf17d.
+	OnCredWrite func(a store.Account, cred *creds.Credential) error
 
 	// muMap guards locks (map access only); locks holds one mutex per account ID
 	// serializing that account's credential read→refresh→write cycle in-process.

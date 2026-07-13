@@ -56,7 +56,7 @@ func (f *fakeOAuth) Refresh(_ context.Context, _, refreshToken string) (*oauth.T
 		return nil, &oauth.RefreshError{Status: 503, Body: "service unavailable"}
 	}
 	if refreshToken != f.currentRT {
-		return nil, &oauth.RefreshError{Status: 400, Body: "invalid_grant"}
+		return nil, &oauth.RefreshError{Status: 400, Body: `{"error":"invalid_grant"}`, Code: "invalid_grant"}
 	}
 	f.refreshes++
 	f.currentRT = fmt.Sprintf("rt-%d", f.refreshes)
@@ -228,8 +228,9 @@ func TestPollOnceFailsClosedOnScanError(t *testing.T) {
 	})
 }
 
-// TestPollOnceFlagsAndRecoversNeedsLogin pins that a definitive 401 flags
-// needs-login and a recovered credential clears it on the next due poll.
+// TestPollOnceFlagsAndRecoversNeedsLogin pins that a confirmed revocation
+// (invalid_grant on the pre-flight refresh) flags needs-login and a recovered
+// credential clears it on the next due poll.
 func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
@@ -248,7 +249,7 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 	fk := credstest.NewFake()
 	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-0"
-	cred.ClaudeAiOauth.RefreshToken = "" // no refresh token → a 401 is definitive
+	cred.ClaudeAiOauth.RefreshToken = "rt-dead" // ≠ currentRT → invalid_grant, definitive
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
 	fk.Put(a.KeychainService, a.KeychainAccount, cred)
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true}
@@ -264,10 +265,14 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 
 	s.pollOnce(t.Context())
 	if h, _ := st.GetAuthHealth(1); !h.NeedsLogin {
-		t.Fatal("definitive 401 should flag needs-login")
+		t.Fatal("confirmed revocation should flag needs-login")
 	}
 	if got := fo.refreshCount(); got != 0 {
-		t.Fatalf("no refresh token to spend, but refreshed %d time(s)", got)
+		t.Fatalf("dead refresh token, but %d refresh(es) succeeded", got)
+	}
+	// The confirmed invalid_grant also stripped the spent refresh token.
+	if stored, ok := fk.Get(a.KeychainService, a.KeychainAccount); !ok || stored.HasRefreshToken() {
+		t.Fatalf("stored blob = %+v, want the refresh token stripped", stored)
 	}
 
 	cred.ClaudeAiOauth.RefreshToken = "rt-0"

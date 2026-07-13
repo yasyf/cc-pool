@@ -57,10 +57,6 @@ func TestCredMirrorRunsOutsideAccountLock(t *testing.T) {
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	// A pre-rotation chain on record: the adopt below resolves it as the parent.
-	if err := st.SetChainHashes(a.ID, "h-prev", "h-grand"); err != nil {
-		t.Fatal(err)
-	}
 	fk := credstest.NewFake()
 	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-1"
@@ -112,9 +108,6 @@ func TestCredMirrorRunsOutsideAccountLock(t *testing.T) {
 			}
 			if e.Value.Chain.Holder != "host-a" {
 				t.Fatalf("mirrored holder = %q, want the rotating host %q", e.Value.Chain.Holder, "host-a")
-			}
-			if e.Value.Chain.ParentHash != "h-prev" {
-				t.Fatalf("mirrored ParentHash = %q, want the resolved parent h-prev", e.Value.Chain.ParentHash)
 			}
 			if e.Value.Chain.RotatedAt <= 0 {
 				t.Fatalf("mirrored RotatedAt = %d, want a wall-clock stamp", e.Value.Chain.RotatedAt)
@@ -174,12 +167,12 @@ func TestCredMirrorQueueFullDropsLoudly(t *testing.T) {
 	cred.ClaudeAiOauth.RefreshToken = "rt"
 
 	// e1 is picked up by Run and blocks in note; e2+e3 fill the size-2 queue.
-	if err := mirror.Hook(acct(1), cred, "h-parent"); err != nil {
+	if err := mirror.Hook(acct(1), cred); err != nil {
 		t.Fatal(err)
 	}
 	<-started
 	for i := 2; i <= 3; i++ {
-		if err := mirror.Hook(acct(i), cred, "h-parent"); err != nil {
+		if err := mirror.Hook(acct(i), cred); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -191,7 +184,7 @@ func TestCredMirrorQueueFullDropsLoudly(t *testing.T) {
 	hookDone := make(chan struct{})
 	go func() {
 		defer close(hookDone)
-		_ = mirror.Hook(acct(4), cred, "h-parent")
+		_ = mirror.Hook(acct(4), cred)
 	}()
 	select {
 	case <-hookDone:
@@ -204,7 +197,7 @@ func TestCredMirrorQueueFullDropsLoudly(t *testing.T) {
 
 	// A uuid-less account never touches the queue (and never logs a drop).
 	before := buf.Len()
-	if err := mirror.Hook(store.Account{ID: 9}, cred, "h-parent"); err != nil {
+	if err := mirror.Hook(store.Account{ID: 9}, cred); err != nil {
 		t.Fatal(err)
 	}
 	if buf.Len() != before {

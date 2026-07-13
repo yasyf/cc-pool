@@ -15,9 +15,8 @@ var credMirrorQueueSize = 64
 
 // credEvent is one credential write awaiting its registry mirror.
 type credEvent struct {
-	acct       store.Account
-	cred       creds.Credential
-	parentHash string
+	acct store.Account
+	cred creds.Credential
 }
 
 // credMirror decouples Manager.OnCredWrite from the registry flock: the hook
@@ -48,13 +47,13 @@ func newCredMirror(note func(ctx context.Context, uuid string, chain hostsync.Ch
 // Hook is the Manager.OnCredWrite implementation. It runs under the
 // per-account lock and must never block: it enqueues and returns; a full
 // queue drops the event loudly — see ccn 10bf17d.
-func (c *credMirror) Hook(a store.Account, cred *creds.Credential, parentHash string) error {
+func (c *credMirror) Hook(a store.Account, cred *creds.Credential) error {
 	if a.AccountUUID == "" {
 		// No uuid means not in the registry yet; the scan-publish fold covers it.
 		return nil
 	}
 	select {
-	case c.ch <- credEvent{acct: a, cred: *cred, parentHash: parentHash}:
+	case c.ch <- credEvent{acct: a, cred: *cred}:
 	default:
 		c.log.Printf("acct-%02d cred-write mirror queue full; event DROPPED (scan-publish heals on the next converge)", a.ID)
 	}
@@ -70,11 +69,10 @@ func (c *credMirror) Run(ctx context.Context) {
 			return
 		case ev := <-c.ch:
 			chain := hostsync.ChainStamp{
-				ExpiresAt:  ev.cred.ClaudeAiOauth.ExpiresAt,
-				Hash:       hostsync.CredentialHash(&ev.cred),
-				Holder:     c.self,
-				ParentHash: ev.parentHash,
-				RotatedAt:  c.now().UnixMilli(),
+				ExpiresAt: ev.cred.ClaudeAiOauth.ExpiresAt,
+				Hash:      hostsync.CredentialHash(&ev.cred),
+				Holder:    c.self,
+				RotatedAt: c.now().UnixMilli(),
 			}
 			if err := c.note(ctx, ev.acct.AccountUUID, chain); err != nil {
 				c.log.Printf("acct-%02d cred-write mirror: %v", ev.acct.ID, err)

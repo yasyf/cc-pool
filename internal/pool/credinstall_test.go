@@ -49,7 +49,7 @@ func newInstallFixture(t *testing.T) *installFixture {
 		t.Fatal(err)
 	}
 	f.m = &Manager{Store: st, Creds: f.fk, LockDir: t.TempDir()}
-	f.m.OnCredWrite = func(_ store.Account, cr *creds.Credential, _ string) error {
+	f.m.OnCredWrite = func(_ store.Account, cr *creds.Credential) error {
 		f.hookCalls++
 		f.hookCred = cr
 		return nil
@@ -341,7 +341,7 @@ func TestWriteCredCASWritesThroughTombstone(t *testing.T) {
 	}
 
 	next := envCred("healed", 4_000)
-	if err := f.m.writeCredCAS(f.a, creds.SourceFile, "", next, ""); err != nil {
+	if err := f.m.writeCredCAS(f.a, creds.SourceFile, "", next); err != nil {
 		t.Fatalf("writeCredCAS over a tombstone = %v, want write-through", err)
 	}
 	got, err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Read()

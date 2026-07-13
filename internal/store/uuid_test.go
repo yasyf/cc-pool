@@ -81,13 +81,13 @@ CREATE TABLE accounts (
 	}
 }
 
-// TestChainHashColumnsMigration pins the in-place chain-hash column migration:
-// empty-string defaults, SetChainHashes round-trips, and a zero-value
-// re-upsert never wipes them.
-func TestChainHashColumnsMigration(t *testing.T) {
+// TestChainHashColumnsDropped pins the in-place drop of the retired chain-hash
+// columns: a database carrying them (with values) reopens cleanly, the columns
+// are gone, every other field survives, and a re-open is a no-op.
+func TestChainHashColumnsDropped(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.db")
 
-	// The old accounts schema, verbatim, before the chain-hash columns.
+	// The old accounts schema, verbatim, with the chain-hash columns.
 	const oldSchema = `
 CREATE TABLE accounts (
   id               INTEGER PRIMARY KEY,
@@ -97,6 +97,8 @@ CREATE TABLE accounts (
   label            TEXT NOT NULL DEFAULT '',
   overlay_kind     TEXT NOT NULL DEFAULT 'symlink',
   account_uuid     TEXT NOT NULL DEFAULT '',
+  cred_hash        TEXT NOT NULL DEFAULT '',
+  cred_parent_hash TEXT NOT NULL DEFAULT '',
   created_at       INTEGER NOT NULL
 );`
 	db, err := sql.Open("sqlite", path)
@@ -107,8 +109,8 @@ CREATE TABLE accounts (
 		t.Fatalf("create old schema: %v", err)
 	}
 	if _, err := db.Exec(
-		`INSERT INTO accounts(id,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at)
-		 VALUES(1,'/cfg/acct-01','svc1','me','work','symlink','u-1',?)`,
+		`INSERT INTO accounts(id,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,cred_hash,cred_parent_hash,created_at)
+		 VALUES(1,'/cfg/acct-01','svc1','me','work','symlink','u-1','h-cred','h-parent',?)`,
 		time.Now().Add(-time.Hour).Unix()); err != nil {
 		t.Fatalf("seed old row: %v", err)
 	}
@@ -116,54 +118,31 @@ CREATE TABLE accounts (
 		t.Fatal(err)
 	}
 
-	s, err := Open(path)
-	if err != nil {
-		t.Fatalf("reopen migrates in place: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
-
-	got, err := s.GetAccount(1)
-	if err != nil {
-		t.Fatalf("get migrated account: %v", err)
-	}
-	if got.CredHash != "" || got.CredParentHash != "" {
-		t.Fatalf("migrated chain columns = (%q,%q), want empty defaults", got.CredHash, got.CredParentHash)
-	}
-	if got.Label != "work" || got.AccountUUID != "u-1" {
-		t.Fatalf("non-chain fields lost across migration: %+v", got)
-	}
-
-	if err := s.SetChainHashes(1, "h-cred", "h-parent"); err != nil {
-		t.Fatalf("SetChainHashes after migration: %v", err)
-	}
-	got, err = s.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.CredHash != "h-cred" || got.CredParentHash != "h-parent" {
-		t.Fatalf("chain columns = (%q,%q), want (h-cred,h-parent)", got.CredHash, got.CredParentHash)
-	}
-
-	// A generic re-upsert with zero-value chain hashes must not wipe them.
-	got.CredHash, got.CredParentHash = "", ""
-	got.Label = "renamed"
-	if err := s.UpsertAccount(got); err != nil {
-		t.Fatalf("re-upsert: %v", err)
-	}
-	got, err = s.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.CredHash != "h-cred" || got.CredParentHash != "h-parent" {
-		t.Fatalf("re-upsert clobbered chain columns: (%q,%q)", got.CredHash, got.CredParentHash)
-	}
-	if got.Label != "renamed" {
-		t.Fatalf("re-upsert did not update label: %q", got.Label)
-	}
-
-	// Unknown id fails loud.
-	if err := s.SetChainHashes(99, "h", "p"); err == nil {
-		t.Fatal("SetChainHashes on unknown id: want error, got nil")
+	for _, pass := range []string{"drops the columns", "re-open is a no-op"} {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatalf("%s: reopen migrates in place: %v", pass, err)
+		}
+		for _, col := range []string{"cred_hash", "cred_parent_hash"} {
+			var n int
+			if err := s.db.QueryRow(
+				`SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = ?`, col).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if n != 0 {
+				t.Fatalf("%s: column %s still present", pass, col)
+			}
+		}
+		got, err := s.GetAccount(1)
+		if err != nil {
+			t.Fatalf("%s: get migrated account: %v", pass, err)
+		}
+		if got.Label != "work" || got.AccountUUID != "u-1" || got.ConfigDir != "/cfg/acct-01" {
+			t.Fatalf("%s: fields lost across the column drop: %+v", pass, got)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
