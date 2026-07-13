@@ -102,7 +102,7 @@ func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prev, next *cr
 	case prev == nil, !sameTokens(cur, prev):
 		return fmt.Errorf("%w: %s (a concurrent writer owns the newer credential)", ErrCredentialChangedUnderfoot, s)
 	}
-	// Residual re-read→write TOCTOU: bounded by claude's unshared per-account .oauth_refresh.lock; deferred by design (ccn task 4ed1146).
+	// Residual re-read→write TOCTOU vs an in-session claude (separate .oauth_refresh.lock); deferred by design — ccn task 4ed1146.
 	return m.writeCred(a, src, next)
 }
 
