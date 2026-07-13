@@ -118,16 +118,14 @@ func (p *syncPublisher) Publish(ctx context.Context, a store.Account) error {
 		Email:        ident.EmailAddress,
 		Label:        a.Label,
 		OAuthAccount: raw,
-		// TODO(phase-3): AccessHash — build the v2 stamp {Origin: p.self,
-		// ExpiresAt, Hash: creds.AccessHash(cred), RotatedAt} and delete
-		// currentLease (schema v2 has no holder/lease).
+		// This host's login minted the chain, so it is the origin. AccessHash
+		// identifies the chain without carrying the token.
 		Chain: hostsync.ChainStamp{
+			Origin:    p.self,
 			ExpiresAt: cred.ClaudeAiOauth.ExpiresAt,
-			Hash:      hostsync.CredentialHash(cred),
-			Holder:    p.self,
+			Hash:      creds.AccessHash(cred),
 			RotatedAt: p.now().UnixMilli(),
 		},
-		Lease: currentLease(p.svc, ident.AccountUUID),
 	}
 	if err := p.svc.PublishAccount(ctx, v); err != nil {
 		return fmt.Errorf("publish acct-%02d: %w", a.ID, err)
@@ -138,21 +136,6 @@ func (p *syncPublisher) Publish(ctx context.Context, a store.Account) error {
 		}
 	}
 	return nil
-}
-
-// currentLease preserves a live registry lease across a publish — the publish
-// rewrites the whole value and must not clear a peer's lease. A load failure
-// reads as no lease; PublishAccount itself fails loud on real corruption.
-func currentLease(svc *hostsync.Service, uuid string) *hostsync.Lease {
-	reg, err := svc.Registry.Load()
-	if err != nil {
-		return nil
-	}
-	e, ok := reg[uuid]
-	if !ok || !e.Present() {
-		return nil
-	}
-	return e.Value.Lease
 }
 
 // syncPublishAccount publishes account id to the shared registry when host

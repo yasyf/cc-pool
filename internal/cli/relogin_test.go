@@ -13,7 +13,6 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
-	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -247,7 +246,7 @@ func TestFinishRelogin(t *testing.T) {
 			if err := st.UpsertAccount(a); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := st.SetNeedsLogin(a.ID, time.Now(), "revoked"); err != nil {
+			if _, err := st.SetNeedsLogin(a.ID, time.Now(), "revoked", store.AuthKindOwned); err != nil {
 				t.Fatal(err)
 			}
 			fk := credstest.NewFake()
@@ -479,7 +478,7 @@ func TestShortCircuitRelogin(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.flagged {
-				if _, err := st.SetNeedsLogin(a.ID, time.Now(), "revoked"); err != nil {
+				if _, err := st.SetNeedsLogin(a.ID, time.Now(), "revoked", store.AuthKindOwned); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -574,11 +573,11 @@ func TestFinishReloginAndPublish(t *testing.T) {
 		if !ok || !entry.Present() {
 			t.Fatalf("entry = %+v, want the re-login published", entry)
 		}
-		if want := hostsync.CredentialHash(fresh); entry.Value.Chain.Hash != want {
+		if want := creds.AccessHash(fresh); entry.Value.Chain.Hash != want {
 			t.Errorf("chain hash = %q, want %q (the landed credential)", entry.Value.Chain.Hash, want)
 		}
-		if entry.Value.Chain.Holder != "me@host-a" {
-			t.Errorf("holder = %q, want the mesh self", entry.Value.Chain.Holder)
+		if entry.Value.Chain.Origin != "me@host-a" {
+			t.Errorf("origin = %q, want the mesh self", entry.Value.Chain.Origin)
 		}
 		row, err := m.Store.GetAccount(a.ID)
 		if err != nil {
@@ -604,7 +603,7 @@ func TestRunReloginShortCircuitPublishes(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := addSyncTestAccount(t, m, fk, 3, "u-3", "bob@x.y", "bob", cred("at", "rt", future))
-	if _, err := m.Store.SetNeedsLogin(a.ID, time.Now(), "revoked"); err != nil {
+	if _, err := m.Store.SetNeedsLogin(a.ID, time.Now(), "revoked", store.AuthKindOwned); err != nil {
 		t.Fatal(err)
 	}
 	cmd, _ := syncCmdBuf(t)
@@ -625,7 +624,7 @@ func TestRunReloginShortCircuitPublishes(t *testing.T) {
 	if !ok {
 		t.Fatal("rotated credential missing from the keychain fake")
 	}
-	if want := hostsync.CredentialHash(stored); entry.Value.Chain.Hash != want {
+	if want := creds.AccessHash(stored); entry.Value.Chain.Hash != want {
 		t.Errorf("chain hash = %q, want %q (the rotated chain)", entry.Value.Chain.Hash, want)
 	}
 }
@@ -660,7 +659,7 @@ func TestTUIReloginSeamsPublish(t *testing.T) {
 
 	t.Run("checkFresh clear publishes", func(t *testing.T) {
 		m, a := setup(t)
-		if _, err := m.Store.SetNeedsLogin(a.ID, time.Now(), "revoked"); err != nil {
+		if _, err := m.Store.SetNeedsLogin(a.ID, time.Now(), "revoked", store.AuthKindOwned); err != nil {
 			t.Fatal(err)
 		}
 		cleared, err := tuiCheckFresh(context.Background(), m, a)

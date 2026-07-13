@@ -245,10 +245,10 @@ func TestEnableBackfillsAndScanPublishes(t *testing.T) {
 	if !bytes.Contains(v.OAuthAccount, []byte("keep-me-1")) {
 		t.Fatalf("u-1 oauthAccount not passed through verbatim: %s", v.OAuthAccount)
 	}
-	if v.Chain.Hash != creds.CredentialHash(cred1) {
-		t.Fatalf("u-1 chain hash = %q, want CredentialHash(cred1)", v.Chain.Hash)
+	if v.Chain.Hash != creds.AccessHash(cred1) {
+		t.Fatalf("u-1 chain hash = %q, want AccessHash(cred1)", v.Chain.Hash)
 	}
-	if v.Chain.ExpiresAt != 1893456000000 || v.Chain.Holder != "me@hosta" {
+	if v.Chain.ExpiresAt != 1893456000000 || v.Chain.Origin != "me@hosta" {
 		t.Fatalf("u-1 chain = %+v", v.Chain)
 	}
 	if v.Chain.RotatedAt <= 0 {
@@ -403,8 +403,7 @@ func TestStatusRendersMesh(t *testing.T) {
 		reg.Add("u-1", hostsync.AccountValue{
 			UUID:  "u-1",
 			Label: "Work",
-			Chain: hostsync.ChainStamp{ExpiresAt: 1700000000000, Hash: "h1", Holder: "hosta"},
-			Lease: &hostsync.Lease{Host: "hostb", Until: 1700003600000},
+			Chain: hostsync.ChainStamp{ExpiresAt: 1700000000000, Hash: "h1", Origin: "hosta"},
 		}, cregistry.UnixMicros(time.Now()))
 		reg.Remove("u-9", cregistry.UnixMicros(time.Now()))
 		return nil
@@ -437,7 +436,9 @@ func TestStatusRendersMesh(t *testing.T) {
 		"u-1",
 		"Work",
 		"2023-11-14T22:13:20Z", // 1700000000000 ms
-		"hostb until",
+		"ORIGIN",                // the v2 registry table columns
+		"LOCAL",
+		"hosta", // u-1's chain origin
 		"removed", // the u-9 tombstone row
 		"plaintext file store",
 	} {

@@ -391,6 +391,24 @@ func TestFromDaemonHasUsageIndependentOfStale(t *testing.T) {
 	}
 }
 
+// TestSnapshotFlagsAwaitingOrigin pins the origin-owned needs-login rendering:
+// an awaiting-origin account (a synced peer copy whose token expired) shows the
+// softer "origin stale" warning through the daemon wire, while an owned dead
+// chain keeps the hard "needs login". The wire's AwaitingOrigin field must
+// thread through fromDaemon for the daemon-backed status path.
+func TestSnapshotFlagsAwaitingOrigin(t *testing.T) {
+	snaps := fromDaemon([]daemon.AccountStatus{
+		{ID: 1, Label: "awaiting", NeedsLogin: true, AwaitingOrigin: true},
+		{ID: 2, Label: "owned-dead", NeedsLogin: true},
+	})
+	if f := stripANSI(snapshotFlags(snaps[0])); !strings.Contains(f, "origin stale") || strings.Contains(f, "needs login") {
+		t.Fatalf("awaiting-origin must render \"origin stale\", not \"needs login\"; got %q", f)
+	}
+	if f := stripANSI(snapshotFlags(snaps[1])); !strings.Contains(f, "needs login") || strings.Contains(f, "origin stale") {
+		t.Fatalf("owned dead chain must render \"needs login\"; got %q", f)
+	}
+}
+
 // TestSnapshotFlagsExhaustedAndOverage pins the badges: overage renders in
 // dollars (the API reports cents), and enabled-but-$0 overage earns none.
 func TestSnapshotFlagsExhaustedAndOverage(t *testing.T) {

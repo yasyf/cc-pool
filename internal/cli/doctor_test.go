@@ -1053,6 +1053,12 @@ func TestCheckCredential(t *testing.T) {
 	refreshOnlyCred := &creds.Credential{}
 	refreshOnlyCred.ClaudeAiOauth.RefreshToken = "rt"
 	refreshOnlyCred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
+	syncedUnexpired := &creds.Credential{} // access token, no refresh token
+	syncedUnexpired.ClaudeAiOauth.AccessToken = "at"
+	syncedUnexpired.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
+	syncedExpired := &creds.Credential{}
+	syncedExpired.ClaudeAiOauth.AccessToken = "at"
+	syncedExpired.ClaudeAiOauth.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
 	hardErr := errors.New("security find-generic-password: exit status 51")
 
 	cases := map[string]struct {
@@ -1111,6 +1117,17 @@ func TestCheckCredential(t *testing.T) {
 			seedKeychain: true, keychainCred: refreshOnlyCred,
 			wantLabel: "acct-01 credential", wantHealthy: true,
 			wantContains: []string{"access token empty", "daemon"},
+		},
+		"an unexpired synced copy is a healthy read-only replica": {
+			seedKeychain: true, keychainCred: syncedUnexpired,
+			wantLabel: "acct-01 credential", wantHealthy: true,
+			wantContains: []string{"synced read-only copy"},
+			wantOmits:    []string{"needs", "ccp login"},
+		},
+		"an expired synced copy fails with an origin-aware re-login remedy": {
+			seedKeychain: true, keychainCred: syncedExpired,
+			wantLabel:    "acct-01 credential",
+			wantContains: []string{"synced copy expired", "hasn't rotated", "ccp login 1"},
 		},
 		"a tokenless keychain blob demands re-login and skips the --fix reassert": {
 			keychainRead: creds.ErrNoTokens, fix: true,

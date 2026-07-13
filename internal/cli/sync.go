@@ -245,7 +245,7 @@ func runSyncStatus(cmd *cobra.Command, m *pool.Manager) error {
 	if err != nil {
 		warn(out, "shared registry unreadable: %v (see `ccp doctor`)", err)
 	} else if len(reg) > 0 {
-		printRegistryTable(out, reg)
+		printRegistryTable(out, reg, m)
 	} else {
 		note(out, "Shared registry is empty.")
 	}
@@ -437,14 +437,15 @@ func probeSyncSocket(ctx context.Context, out io.Writer) {
 	success(out, "Sync socket healthy: %s (protocol %d, %s).", caps.Name, caps.ProtocolVersion, plural(len(caps.Methods), "method"))
 }
 
-func printRegistryTable(out io.Writer, reg hostsync.Registry) {
+func printRegistryTable(out io.Writer, reg hostsync.Registry, m *pool.Manager) {
 	uuids := make([]string, 0, len(reg))
 	for uuid := range reg {
 		uuids = append(uuids, uuid)
 	}
 	sort.Strings(uuids)
+	local := localOwnershipByUUID(m)
 	tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "UUID\tLABEL\tCHAIN EXPIRY\tHOLDER\tLEASE\tSTATE")
+	_, _ = fmt.Fprintln(tw, "UUID\tLABEL\tCHAIN EXPIRY\tORIGIN\tLOCAL\tSTATE")
 	for _, uuid := range uuids {
 		entry := reg[uuid]
 		v := entry.Value
@@ -452,14 +453,37 @@ func printRegistryTable(out io.Writer, reg hostsync.Registry) {
 		if !entry.Present() {
 			state = "removed"
 		}
-		lease := "-"
-		if v.Lease != nil {
-			lease = fmt.Sprintf("%s until %s", v.Lease.Host, formatMillis(v.Lease.Until))
-		}
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			uuid, orDash(v.Label), formatMillis(v.Chain.ExpiresAt), orDash(v.Chain.Holder), lease, state)
+			uuid, orDash(v.Label), formatMillis(v.Chain.ExpiresAt), orDash(v.Chain.Origin), orDash(local[uuid]), state)
 	}
 	_ = tw.Flush()
+}
+
+// localOwnershipByUUID classifies each locally-held account's credential as
+// "owned" (a refresh token present) or "synced" (a peer copy, none), keyed by
+// account UUID — a refresh-free read, so it never spends a refresh token.
+// Accounts with no local credential are simply absent (rendered "-").
+func localOwnershipByUUID(m *pool.Manager) map[string]string {
+	out := map[string]string{}
+	accts, err := m.Store.ListAccounts()
+	if err != nil {
+		return out
+	}
+	for _, a := range accts {
+		if a.AccountUUID == "" {
+			continue
+		}
+		cred, _, err := m.ReadCredential(a)
+		if err != nil {
+			continue
+		}
+		if cred.HasRefreshToken() {
+			out[a.AccountUUID] = "owned"
+		} else {
+			out[a.AccountUUID] = "synced"
+		}
+	}
+	return out
 }
 
 // syncFileFallbackWarnings flags accounts whose credential lives in the

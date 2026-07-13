@@ -617,16 +617,12 @@ func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(str
 	keychain := m.Creds.Store(a, creds.SourceKeychain)
 	file := m.Creds.Store(a, creds.SourceFile)
 	kcred, kerr := keychain.Read()
-	_, ferr := file.Read()
+	fcred, ferr := file.Read()
 
 	switch {
 	case kerr == nil:
 		if errors.Is(ferr, creds.ErrNotFound) {
-			if kcred.ClaudeAiOauth.AccessToken == "" {
-				report(prefix+" credential", true, "keychain (access token empty — the daemon refreshes it on its next poll)")
-				return
-			}
-			report(prefix+" credential", true, "keychain")
+			reportCredentialHealth(m, a, prefix, "keychain", kcred, report)
 			return
 		}
 		// Drift: both backends hold a credential (refresh tokens are single-use,
@@ -652,7 +648,7 @@ func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(str
 		}
 		report(prefix+" keychain", true, "re-asserted")
 	case ferr == nil:
-		report(prefix+" credential", true, "file")
+		reportCredentialHealth(m, a, prefix, "file", fcred, report)
 	case errors.Is(ferr, creds.ErrNoTokens):
 		report(prefix+" credential", false, fmt.Sprintf("credential holds no tokens — re-login required: run `ccp login %d`", a.ID))
 	case !errors.Is(ferr, creds.ErrNotFound):
@@ -666,6 +662,61 @@ func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(str
 	default:
 		report(prefix+" credential", false, fmt.Sprintf("no credential in either backend — run `ccp login %d`", a.ID))
 	}
+}
+
+// reportCredentialHealth reports one resolved credential's health, telling an
+// owned chain apart from a synced (refresh-token-free) peer copy — usable until
+// it expires, after which only the origin's rotation or a local `ccp login`
+// recovers it.
+func reportCredentialHealth(m *pool.Manager, a store.Account, prefix, backend string, cred *creds.Credential, report func(string, bool, string)) {
+	if cred.ClaudeAiOauth.AccessToken == "" {
+		report(prefix+" credential", true, backend+" (access token empty — the daemon refreshes it on its next poll)")
+		return
+	}
+	if cred.HasRefreshToken() {
+		report(prefix+" credential", true, backend)
+		return
+	}
+	origin := doctorSyncOrigin(m, a)
+	if !cred.Expired() {
+		report(prefix+" credential", true, syncedOKDetail(origin))
+		return
+	}
+	report(prefix+" credential", false, syncedExpiredDetail(origin, a.ID))
+}
+
+// doctorSyncOrigin returns the account's chain origin host from the shared
+// registry, or "" when unresolvable (no uuid, or the registry is unreadable),
+// which degrades the synced-copy messages to an origin-less form.
+func doctorSyncOrigin(m *pool.Manager, a store.Account) string {
+	uuid := accountSyncUUID(a)
+	if uuid == "" {
+		return ""
+	}
+	reg, err := syncRegistryFile().Load()
+	if err != nil {
+		return ""
+	}
+	e, ok := reg[uuid]
+	if !ok || !e.Present() {
+		return ""
+	}
+	return e.Value.Chain.Origin
+}
+
+func syncedOKDetail(origin string) string {
+	if origin == "" {
+		return "synced read-only copy"
+	}
+	return fmt.Sprintf("synced read-only copy (origin: %s)", origin)
+}
+
+func syncedExpiredDetail(origin string, id int) string {
+	who := "the origin host"
+	if origin != "" {
+		who = "origin " + origin
+	}
+	return fmt.Sprintf("synced copy expired — %s hasn't rotated; check that machine, or run `ccp login %d` here to make this host the origin", who, id)
 }
 
 // checkFuseFallback flags a symlink account under a fuse pool default — the

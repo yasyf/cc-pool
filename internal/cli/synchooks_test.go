@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -58,7 +59,7 @@ func TestSyncPublishAccount(t *testing.T) {
 		}
 		c := testCred("at-1", future)
 		a := addSyncTestAccount(t, m, fk, 1, "u-1", "e@x.y", "Work", c)
-		hash := hostsync.CredentialHash(c)
+		hash := creds.AccessHash(c)
 		cmd, _ := syncCmdBuf(t)
 
 		if err := syncPublishAccount(cmd, m, a.ID); err != nil {
@@ -83,8 +84,8 @@ func TestSyncPublishAccount(t *testing.T) {
 		if v.Chain.ExpiresAt != future || v.Chain.Hash != hash {
 			t.Errorf("chain = %+v, want expiry %d hash %s", v.Chain, future, hash)
 		}
-		if v.Chain.Holder != "me@host-a" {
-			t.Errorf("holder = %q, want the mesh self", v.Chain.Holder)
+		if v.Chain.Origin != "me@host-a" {
+			t.Errorf("origin = %q, want the mesh self", v.Chain.Origin)
 		}
 		if v.Chain.RotatedAt <= 0 {
 			t.Errorf("rotatedAt = %d, want set", v.Chain.RotatedAt)
@@ -153,28 +154,6 @@ func TestSyncPublishAccount(t *testing.T) {
 		}
 		if entry := loadSyncRegistry(t)["u-1"]; !entry.Present() {
 			t.Fatalf("entry = %+v, want the tombstone overridden by the explicit re-add", entry)
-		}
-	})
-
-	t.Run("preserves a live peer lease", func(t *testing.T) {
-		m, fk := syncTestEnv(t)
-		stubSynckitdRun(t)
-		if err := m.Store.SetMeta(syncMetaKey, "1"); err != nil {
-			t.Fatal(err)
-		}
-		a := addSyncTestAccount(t, m, fk, 1, "u-1", "e@x.y", "Work", testCred("at-1", future))
-		lease := &hostsync.Lease{Host: "me@host-b", Until: future}
-		seedSyncRegistry(t, func(reg hostsync.Registry) {
-			reg.Add("u-1", hostsync.AccountValue{UUID: "u-1", Lease: lease}, cregistry.Micros(1000))
-		})
-		cmd, _ := syncCmdBuf(t)
-
-		if err := syncPublishAccount(cmd, m, a.ID); err != nil {
-			t.Fatal(err)
-		}
-		got := loadSyncRegistry(t)["u-1"].Value.Lease
-		if got == nil || got.Host != "me@host-b" || got.Until != future {
-			t.Fatalf("lease = %+v, want the peer lease preserved", got)
 		}
 	})
 

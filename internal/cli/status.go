@@ -302,6 +302,7 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 			RateLimited:     a.RateLimited,
 			Exhausted:       a.Exhausted,
 			NeedsLogin:      a.NeedsLogin,
+			AwaitingOrigin:  a.AwaitingOrigin,
 			Stale:           a.Stale,
 			Resets5h:        a.Resets5h,
 			Resets7d:        a.Resets7d,
@@ -405,7 +406,12 @@ func renderTable(snaps []pool.Snapshot, pin dirPin) string {
 
 func snapshotFlags(s pool.Snapshot) string {
 	var flags []string
-	if s.NeedsLogin {
+	switch {
+	case s.AwaitingOrigin:
+		// A synced peer copy whose token expired: recovers on the origin's rotation
+		// or a local `ccp login` — a warning, not a dead account.
+		flags = append(flags, warnStyle.Render("origin stale"))
+	case s.NeedsLogin:
 		flags = append(flags, badStyle.Render("needs login"))
 	}
 	if s.Stale {
