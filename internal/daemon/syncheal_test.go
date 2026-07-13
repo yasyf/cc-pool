@@ -3,10 +3,12 @@ package daemon
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -44,6 +46,28 @@ func pullHealing(s *Server, a store.Account, expiresAt int64, healsUsage bool) f
 	}
 }
 
+// wireSyncRegistry attaches a minimal sync service whose registry names origin
+// as uuid's chain holder, so authKind classifies at persist time.
+func wireSyncRegistry(t *testing.T, s *Server, uuid, origin string) {
+	t.Helper()
+	svc := &hostsync.Service{
+		Registry: hostsync.NewRegistryFile(t.TempDir()),
+		StampDir: filepath.Join(t.TempDir(), "stamps"),
+	}
+	err := svc.PublishAccount(context.Background(), hostsync.AccountValue{
+		UUID:  uuid,
+		Chain: hostsync.ChainStamp{Origin: origin, ExpiresAt: 1, Hash: "h-" + uuid},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
+		t.Fatal(err)
+	}
+	s.syncSvc = svc
+	s.syncSelf = "host-self"
+}
+
 // TestSyncHealDecidesEachTick pins the reworked flagNeedsLogin: it heals, then
 // ALWAYS decides this tick. A fresher chain that samples clean clears the flag;
 // a fresher chain that still cannot sample persists it same tick (the anti-loop
@@ -75,6 +99,25 @@ func TestSyncHealDecidesEachTick(t *testing.T) {
 		}
 		if l := s.led.peek(authStreakPolicy, a.ConfigDir); l == nil || l.lastAt.IsZero() {
 			t.Fatal("the attempt clock must be stamped so the backoff engages")
+		}
+	})
+
+	t.Run("expired grace-served synced pull keeps the flag as awaiting-origin", func(t *testing.T) {
+		s, a, _ := revokedServer(t)
+		wireSyncRegistry(t, s, "u1", "peer-b")
+		// The pull lands a strictly-fresher but ALREADY-EXPIRED synced copy and
+		// /usage grace-serves it with a 200. This host still cannot refresh it,
+		// so the flag must persist (needs-login gates selection) as
+		// awaiting-origin, not clear until the next poll re-flags.
+		s.syncPull = pullHealing(s, a, time.Now().Add(-time.Minute).UnixMilli(), true)
+
+		s.pollOnce(t.Context())
+		h, _ := s.m.Store.GetAuthHealth(a.ID)
+		if !h.NeedsLogin {
+			t.Fatal("an expired synced pull must NOT clear needs-login even when /usage grace-serves it")
+		}
+		if h.Kind != store.AuthKindAwaitingOrigin {
+			t.Fatalf("kind = %q, want %q", h.Kind, store.AuthKindAwaitingOrigin)
 		}
 	})
 

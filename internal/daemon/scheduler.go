@@ -502,12 +502,17 @@ func (s *Server) flagNeedsLogin(ctx context.Context, a store.Account, err error)
 }
 
 // resampleAfterHeal re-samples once inline after a heal pulled a fresher chain:
-// no refresh (a synced copy holds no refresh token) and no second heal. A nil
-// error means the pulled credential is live, so the needs-login flag clears.
+// no refresh and no second heal. An expired synced pull is never healed —
+// /usage may grace-serve it with a 200, so ErrUnrefreshable is re-checked here
+// (SampleOpts{} skips the refresh classification that surfaces it).
 func (s *Server) resampleAfterHeal(ctx context.Context, a store.Account) bool {
+	cred, _, err := s.m.ReadCredential(a)
+	if err != nil || (cred.Synced() && cred.Expired()) {
+		return false
+	}
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	_, _, _, err := s.m.SampleUsage(cctx, a, pool.SampleOpts{})
+	_, _, _, err = s.m.SampleUsage(cctx, a, pool.SampleOpts{})
 	return err == nil
 }
 
