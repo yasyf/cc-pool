@@ -236,17 +236,70 @@ func TestRefreshRequestAndResponse(t *testing.T) {
 	}
 }
 
+// TestRefreshRevoked pins the RefreshError classification per status and OAuth
+// error-body code: Revoked is status-driven (400/401), InvalidGrant requires
+// the server-confirmed invalid_grant code — a plain 401 or a codeless body
+// must never read as a confirmed revocation.
 func TestRefreshRevoked(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
-	}))
-	defer srv.Close()
-	c := New()
-	c.tokenURL = srv.URL
-	_, err := c.Refresh(context.Background(), "k", "rt")
-	var re *RefreshError
-	if !errors.As(err, &re) || !re.Revoked() {
-		t.Fatalf("expected revoked RefreshError, got %v", err)
+	cases := []struct {
+		name             string
+		status           int
+		body             string
+		wantRevoked      bool
+		wantInvalidGrant bool
+	}{
+		{
+			name:   "400 invalid_grant is revoked and confirmed",
+			status: http.StatusBadRequest, body: `{"error":"invalid_grant"}`,
+			wantRevoked: true, wantInvalidGrant: true,
+		},
+		{
+			name:   "401 invalid_grant is revoked and confirmed",
+			status: http.StatusUnauthorized, body: `{"error":"invalid_grant"}`,
+			wantRevoked: true, wantInvalidGrant: true,
+		},
+		{
+			name:   "401 with another code is revoked but unconfirmed",
+			status: http.StatusUnauthorized, body: `{"error":"invalid_client"}`,
+			wantRevoked: true, wantInvalidGrant: false,
+		},
+		{
+			name:   "401 with a non-JSON body is revoked but unconfirmed",
+			status: http.StatusUnauthorized, body: `unauthorized`,
+			wantRevoked: true, wantInvalidGrant: false,
+		},
+		{
+			name:   "401 with an empty body is revoked but unconfirmed",
+			status: http.StatusUnauthorized, body: ``,
+			wantRevoked: true, wantInvalidGrant: false,
+		},
+		{
+			name:   "500 is neither revoked nor confirmed",
+			status: http.StatusInternalServerError, body: `{"error":"server_error"}`,
+			wantRevoked: false, wantInvalidGrant: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			c := New()
+			c.tokenURL = srv.URL
+			_, err := c.Refresh(context.Background(), "k", "rt")
+			var re *RefreshError
+			if !errors.As(err, &re) {
+				t.Fatalf("expected a RefreshError, got %v", err)
+			}
+			if re.Revoked() != tc.wantRevoked {
+				t.Errorf("Revoked() = %v, want %v", re.Revoked(), tc.wantRevoked)
+			}
+			if re.InvalidGrant() != tc.wantInvalidGrant {
+				t.Errorf("InvalidGrant() = %v, want %v (Code=%q)", re.InvalidGrant(), tc.wantInvalidGrant, re.Code)
+			}
+		})
 	}
 }
 

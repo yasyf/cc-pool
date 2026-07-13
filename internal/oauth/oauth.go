@@ -102,11 +102,15 @@ func (t *TokenResponse) Expiry(now time.Time) time.Time {
 	return now.Add(time.Duration(t.ExpiresIn) * time.Second)
 }
 
-// RefreshError carries the HTTP status so callers can distinguish a revoked
-// token (4xx -> re-login needed) from a transient failure (5xx/network).
+// RefreshError carries the HTTP status and the OAuth error code so callers can
+// distinguish a revoked token (4xx -> re-login needed) from a transient failure
+// (5xx/network), and a server-confirmed invalid_grant from any other 4xx.
 type RefreshError struct {
 	Status int
 	Body   string
+	// Code is the OAuth error code from the response body's {"error":"..."};
+	// "" when the body carried none.
+	Code string
 }
 
 func (e *RefreshError) Error() string {
@@ -117,6 +121,13 @@ func (e *RefreshError) Error() string {
 // valid (invalid_grant / 400 / 401), meaning the account must be re-logged-in.
 func (e *RefreshError) Revoked() bool {
 	return e.Status == http.StatusBadRequest || e.Status == http.StatusUnauthorized
+}
+
+// InvalidGrant reports whether the server confirmed the refresh token spent or
+// revoked (error code invalid_grant) — the only refresh outcome that may
+// destroy local state; a plain 401 might be transient.
+func (e *RefreshError) InvalidGrant() bool {
+	return e.Code == "invalid_grant"
 }
 
 // Refresh exchanges a refresh token for a fresh access token. Calls sharing
@@ -154,7 +165,7 @@ func (c *Client) refresh(ctx context.Context, refreshToken string) (*TokenRespon
 	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, &RefreshError{Status: resp.StatusCode, Body: truncate(string(raw), 300)}
+		return nil, &RefreshError{Status: resp.StatusCode, Body: truncate(string(raw), 300), Code: oauthErrorCode(raw)}
 	}
 	// A status line arrived, so a non-200 above is a proven API answer; a read
 	// error only past that point is a transport failure mid-body — classify it
@@ -460,6 +471,18 @@ func parseRetryAfter(v string, now time.Time) time.Duration {
 		}
 	}
 	return 0
+}
+
+// oauthErrorCode extracts the OAuth error code from an error-response body,
+// "" when the body isn't the standard {"error":"..."} shape.
+func oauthErrorCode(raw []byte) string {
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return ""
+	}
+	return body.Error
 }
 
 func truncate(s string, n int) string {
