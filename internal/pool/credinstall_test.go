@@ -204,25 +204,75 @@ func TestInstallSyncedCredentialFollowsBackendResolution(t *testing.T) {
 	}
 }
 
-// TestInstallSyncedCredentialRefusesUnknowableKeychain pins the fail-fast on
-// creds.ErrUnavailable: no write, no hook — a hidden fresher chain is never shadowed.
-func TestInstallSyncedCredentialRefusesUnknowableKeychain(t *testing.T) {
-	f := newInstallFixture(t)
-	f.fk.KeychainFaults = credstest.Faults{Read: creds.ErrUnavailable}
-	incoming := envCred("incoming", 5_000)
+// TestInstallSyncedCredentialHeadlessKeychainUnavailable pins the headless
+// rotation path: an unsearchable login keychain (creds.ErrUnavailable) is a
+// file-store fallback mirroring installEnvelope, never an ErrUnavailable
+// abort pullAndInstall would defer forever — a headless peer must keep
+// receiving rotations after the one-time materialize. Owned precedence and
+// the freshness gate still hold against the readable file store.
+func TestInstallSyncedCredentialHeadlessKeychainUnavailable(t *testing.T) {
+	tombstone := `{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}`
+	cases := map[string]struct {
+		file          *creds.Credential // nil: no file credential
+		fileTomb      bool
+		wantInstalled bool
+	}{
+		"rotation over synced file blob installs": {
+			file: envCred("old", 1_000), wantInstalled: true,
+		},
+		"empty file store installs":      {wantInstalled: true},
+		"tombstoned file store installs": {fileTomb: true, wantInstalled: true},
+		"stale rotation skips":           {file: envCred("old", 9_000)},
+		"owned file chain skips":         {file: syncCred("own", 1_000)},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newInstallFixture(t)
+			f.fk.KeychainFaults = credstest.Faults{Read: creds.ErrUnavailable}
+			fileStore := creds.FileStore{ConfigDir: f.a.ConfigDir}
+			if tc.file != nil {
+				if err := fileStore.Write(tc.file); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.fileTomb {
+				if err := os.WriteFile(creds.FileCredentialPath(f.a.ConfigDir), []byte(tombstone), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 
-	installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, incoming)
-	if installed {
-		t.Fatal("installed = true, want false")
-	}
-	if !errors.Is(err, creds.ErrUnavailable) {
-		t.Fatalf("err = %v, want errors.Is creds.ErrUnavailable", err)
-	}
-	if f.hookCalls != 0 {
-		t.Fatalf("OnCredWrite fired %d times, want 0", f.hookCalls)
-	}
-	if f.fk.WriteCount() != 0 {
-		t.Fatalf("keychain writes = %d, want 0", f.fk.WriteCount())
+			installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, envCred("incoming", 5_000))
+			if err != nil {
+				t.Fatalf("InstallSyncedCredential: %v (headless install must not abort)", err)
+			}
+			if installed != tc.wantInstalled {
+				t.Fatalf("installed = %v, want %v", installed, tc.wantInstalled)
+			}
+			if f.fk.WriteCount() != 0 {
+				t.Fatalf("keychain writes = %d, want 0 (headless install must stay on the file backend)", f.fk.WriteCount())
+			}
+			if !tc.wantInstalled {
+				if f.hookCalls != 0 {
+					t.Fatalf("OnCredWrite fired %d times on a skip, want 0", f.hookCalls)
+				}
+				got, rerr := fileStore.Read()
+				if rerr != nil || got.ClaudeAiOauth.AccessToken != tc.file.ClaudeAiOauth.AccessToken ||
+					got.ClaudeAiOauth.RefreshToken != tc.file.ClaudeAiOauth.RefreshToken {
+					t.Fatalf("file backend = (%+v, %v), want the local credential untouched", got, rerr)
+				}
+				return
+			}
+			got, rerr := fileStore.Read()
+			if rerr != nil || got.ClaudeAiOauth.AccessToken != "at-incoming" {
+				t.Fatalf("file backend = (%+v, %v), want the incoming rotation", got, rerr)
+			}
+			if got.HasRefreshToken() {
+				t.Fatal("installed blob carries a refresh token")
+			}
+			if f.hookCalls != 1 {
+				t.Fatalf("OnCredWrite fired %d times, want 1", f.hookCalls)
+			}
+		})
 	}
 }
 
@@ -409,27 +459,31 @@ func TestInstallSyncedCredentialSkipsOnOwnedOtherBackend(t *testing.T) {
 }
 
 // TestInstallSyncedCredentialFailsClosedOnUnverifiableBackend pins the
-// fail-closed owned re-check: a backend read outcome other than proven-absent
-// (ErrNotFound) or a tombstone (ErrNoTokens) may hide an owned chain, so the
-// install aborts with ErrCredentialUnverifiable — nothing written, the synced
-// local untouched. The proceed side (all backends proven not-owned) is pinned
-// by "absent local installs" and "tombstoned local installs" above.
+// fail-closed owned re-check: an opaque backend read error — not proven-absent
+// (ErrNotFound), a tombstone (ErrNoTokens), or an unsearchable backend
+// (ErrUnavailable, the headless file fallback) — may hide an owned chain, so
+// the install aborts with ErrCredentialUnverifiable and writes nothing.
 func TestInstallSyncedCredentialFailsClosedOnUnverifiableBackend(t *testing.T) {
-	errOpaque := errors.New("keychain query exploded")
+	errOpaque := errors.New("backend query exploded")
 	cases := map[string]struct {
-		probeErr, recheckErr error // keychain read outcomes: initial probe, owned re-check
+		opaqueFile bool // opaque re-check read on the file store instead of the keychain
 	}{
-		"unavailable keychain": {probeErr: creds.ErrUnavailable, recheckErr: creds.ErrUnavailable},
-		"keychain degrading after the probe": {probeErr: creds.ErrNotFound, recheckErr: errOpaque},
+		"keychain degrading after the probe": {},
+		"opaque file store":                  {opaqueFile: true},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			f := newInstallFixture(t)
-			if err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Write(envCred("synced", 1_000)); err != nil {
-				t.Fatal(err)
+			if tc.opaqueFile {
+				f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, envCred("synced", 1_000))
+				f.fk.FileFaults = credstest.Faults{Read: errOpaque}
+			} else {
+				if err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Write(envCred("synced", 1_000)); err != nil {
+					t.Fatal(err)
+				}
+				ks := &swapStore{Store: f.fk.Store(f.a, creds.SourceKeychain), oldErr: creds.ErrNotFound, swappedErr: errOpaque}
+				f.m.Creds = swapCreds{Fake: f.fk, ks: ks}
 			}
-			ks := &swapStore{Store: f.fk.Store(f.a, creds.SourceKeychain), oldErr: tc.probeErr, swappedErr: tc.recheckErr}
-			f.m.Creds = swapCreds{Fake: f.fk, ks: ks}
 
 			installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, envCred("incoming", 5_000))
 			if installed {
@@ -438,17 +492,11 @@ func TestInstallSyncedCredentialFailsClosedOnUnverifiableBackend(t *testing.T) {
 			if !errors.Is(err, ErrCredentialUnverifiable) {
 				t.Fatalf("err = %v, want errors.Is(ErrCredentialUnverifiable)", err)
 			}
-			if !errors.Is(err, tc.recheckErr) {
-				t.Fatalf("err = %v, want errors.Is(%v) so the caller can defer", err, tc.recheckErr)
-			}
-			if ks.reads < 2 {
-				t.Fatalf("owned re-check never happened (reads = %d)", ks.reads)
+			if !errors.Is(err, errOpaque) {
+				t.Fatalf("err = %v, want errors.Is(%v)", err, errOpaque)
 			}
 			if f.fk.WriteCount() != 0 || f.hookCalls != 0 {
 				t.Fatalf("aborted install acted (writes=%d hooks=%d), want none", f.fk.WriteCount(), f.hookCalls)
-			}
-			if got, rerr := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Read(); rerr != nil || got.ClaudeAiOauth.AccessToken != "at-synced" {
-				t.Fatalf("file backend = (%+v, %v), want the synced copy untouched", got, rerr)
 			}
 		})
 	}

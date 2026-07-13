@@ -24,8 +24,10 @@ var ErrEnvelopeNoAccessToken = errors.New("credential envelope carries no access
 // backend is never overwritten or shadowed, even when expired; an absent or
 // tombstoned local always installs; a synced local yields only to a strictly
 // fresher expiry. A backend whose owned-state cannot be proven (a read error
-// other than not-found/tombstone) aborts the install with
-// ErrCredentialUnverifiable. The write goes through writeCredCAS, so an
+// other than not-found/tombstone/unavailable) aborts the install with
+// ErrCredentialUnverifiable; an unsearchable backend (creds.ErrUnavailable —
+// the headless login keychain) falls back to the file store, mirroring
+// hostsync's installEnvelope. The write goes through writeCredCAS, so an
 // underfoot `claude /login` aborts as a clean skip. Reports whether it
 // installed; a precedence or freshness skip is a normal outcome.
 func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, cred *creds.Credential) (bool, error) {
@@ -55,17 +57,25 @@ func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, 
 	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
 		// No credential, or a claude tombstone: install to the resolved backend
 		// (writeCredCAS re-verifies the slot is still empty before writing).
+	case errors.Is(err, creds.ErrUnavailable):
+		// No readable credential and the keychain is unsearchable (headless
+		// host); the re-check below retargets the write at the file store.
 	default:
 		return false, err
 	}
 	// The CAS re-read guards only src, so re-check every backend: owned
-	// anywhere wins outright, and a backend not PROVEN not-owned (any read
-	// error but ErrNotFound/ErrNoTokens) fails closed — an unreadable slot
-	// may hold an owned chain.
+	// anywhere wins outright; a backend not PROVEN not-owned fails closed.
+	// ErrUnavailable is installEnvelope's headless file fallback, not an
+	// abort — owned-before-synced resolution (credOutranks) means an owned
+	// chain surfacing there later still outranks the synced copy.
 	for _, s := range m.Creds.Stores(a) {
 		cur, rerr := s.Read()
 		switch {
 		case errors.Is(rerr, creds.ErrNotFound), errors.Is(rerr, creds.ErrNoTokens):
+		case errors.Is(rerr, creds.ErrUnavailable):
+			if prev == nil && s.Source() == src {
+				src = creds.SourceFile
+			}
 		case rerr != nil:
 			return false, fmt.Errorf("%w: %s: %w", ErrCredentialUnverifiable, s, rerr)
 		case cur.HasRefreshToken():
