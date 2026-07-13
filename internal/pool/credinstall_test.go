@@ -266,18 +266,19 @@ func TestInstallSyncedCredentialConcurrentRotationWins(t *testing.T) {
 }
 
 // swapStore serves scripted keychain reads: the first read (the locked probe)
-// returns old, later reads return swapped — a `claude /login` landing between
-// the probe and the CAS re-read, outside every lock cc-pool holds.
+// returns old/oldErr, later reads return swapped — a `claude /login` landing
+// between the probe and the CAS re-read, outside every lock cc-pool holds.
 type swapStore struct {
 	creds.Store
 	old, swapped *creds.Credential
+	oldErr       error
 	reads        int
 }
 
 func (s *swapStore) Read() (*creds.Credential, error) {
 	s.reads++
 	if s.reads == 1 {
-		return s.old, nil
+		return s.old, s.oldErr
 	}
 	return s.swapped, nil
 }
@@ -330,6 +331,47 @@ func TestInstallSyncedCredentialCASAbortsOnUnderfootLogin(t *testing.T) {
 	}
 }
 
+// TestInstallSyncedCredentialAbortsOnLoginOverEmptySlot pins the empty-slot
+// install race: the precedence read proves the slot empty (absent, or a claude
+// tombstone), a `claude /login` lands an owned chain before the write, and the
+// CAS re-read must refuse to bury it — a clean skip, nothing written.
+func TestInstallSyncedCredentialAbortsOnLoginOverEmptySlot(t *testing.T) {
+	tombstone := `{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}`
+	cases := map[string]struct {
+		seedTombstone bool
+	}{
+		"absent slot":     {},
+		"tombstoned slot": {seedTombstone: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newInstallFixture(t)
+			if tc.seedTombstone {
+				if err := os.WriteFile(creds.FileCredentialPath(f.a.ConfigDir), []byte(tombstone), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			login := syncCred("login", 2_000)
+			ks := &swapStore{Store: f.fk.Store(f.a, creds.SourceKeychain), oldErr: creds.ErrNotFound, swapped: login}
+			f.m.Creds = swapCreds{Fake: f.fk, ks: ks}
+
+			installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, envCred("incoming", 5_000))
+			if err != nil {
+				t.Fatalf("a CAS abort must be a clean skip, got: %v", err)
+			}
+			if installed {
+				t.Fatal("installed = true; the underfoot login must win")
+			}
+			if ks.reads < 2 {
+				t.Fatalf("CAS re-read never happened (reads = %d)", ks.reads)
+			}
+			if f.fk.WriteCount() != 0 || f.hookCalls != 0 {
+				t.Fatalf("aborted install acted (writes=%d hooks=%d), want none", f.fk.WriteCount(), f.hookCalls)
+			}
+		})
+	}
+}
+
 // TestWriteCredCASWritesThroughTombstone pins the CAS behavior the
 // install-over-tombstone path depends on: a prior read that fails to parse
 // (claude tombstone) or misses entirely must not block the write.
@@ -341,7 +383,7 @@ func TestWriteCredCASWritesThroughTombstone(t *testing.T) {
 	}
 
 	next := envCred("healed", 4_000)
-	if err := f.m.writeCredCAS(f.a, creds.SourceFile, "", next); err != nil {
+	if err := f.m.writeCredCAS(f.a, creds.SourceFile, nil, next); err != nil {
 		t.Fatalf("writeCredCAS over a tombstone = %v, want write-through", err)
 	}
 	got, err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Read()

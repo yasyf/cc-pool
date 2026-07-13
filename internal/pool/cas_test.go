@@ -18,17 +18,19 @@ func casCred(access, refresh string) *creds.Credential {
 	return c
 }
 
-// TestWriteCredCAS pins the compare-and-swap guard: a matching snapshot writes
-// through, a changed-underfoot re-read aborts with ErrCredentialChangedUnderfoot
-// without clobbering, an absent backend proceeds, and a re-read that fails for
-// any reason other than a proven-empty slot aborts with ErrCredentialUnverifiable.
+// TestWriteCredCAS pins the compare-and-swap guard: a snapshot matching on
+// both tokens writes through, any divergence — access token, refresh token
+// alone, or a credential appearing over a slot decided empty — aborts with
+// ErrCredentialChangedUnderfoot without clobbering, an absent backend
+// proceeds, and a re-read that fails for any reason other than a proven-empty
+// slot aborts with ErrCredentialUnverifiable.
 func TestWriteCredCAS(t *testing.T) {
 	errOpaque := errors.New("keychain read exploded")
 	cases := []struct {
 		name        string
 		stored      *creds.Credential // seeded backend value; nil = absent
 		readFault   error             // injected re-read failure
-		prevAccess  string            // the snapshot next was derived from
+		prev        *creds.Credential // the snapshot next was derived from
 		next        *creds.Credential
 		wantErr     error
 		wantStored  string // access token expected in the backend afterward
@@ -37,7 +39,7 @@ func TestWriteCredCAS(t *testing.T) {
 		{
 			name:        "matching snapshot writes through",
 			stored:      casCred("at-0", "rt-0"),
-			prevAccess:  "at-0",
+			prev:        casCred("at-0", "rt-0"),
 			next:        casCred("at-1", "rt-1"),
 			wantErr:     nil,
 			wantStored:  "at-1",
@@ -46,16 +48,34 @@ func TestWriteCredCAS(t *testing.T) {
 		{
 			name:        "changed underfoot aborts and keeps the newer credential",
 			stored:      casCred("at-claude", "rt-claude"),
-			prevAccess:  "at-0",
+			prev:        casCred("at-0", "rt-0"),
 			next:        casCred("at-1", "rt-1"),
 			wantErr:     ErrCredentialChangedUnderfoot,
 			wantStored:  "at-claude",
 			wantWritten: false,
 		},
 		{
+			name:        "same access token with a rotated refresh token aborts",
+			stored:      casCred("at-0", "rt-rotated"),
+			prev:        casCred("at-0", "rt-0"),
+			next:        casCred("at-0", ""), // the strip shape
+			wantErr:     ErrCredentialChangedUnderfoot,
+			wantStored:  "at-0",
+			wantWritten: false,
+		},
+		{
+			name:        "credential appearing over a slot decided empty aborts",
+			stored:      casCred("at-login", "rt-login"),
+			prev:        nil,
+			next:        casCred("at-synced", ""),
+			wantErr:     ErrCredentialChangedUnderfoot,
+			wantStored:  "at-login",
+			wantWritten: false,
+		},
+		{
 			name:        "absent backend proceeds (no prior value to compare)",
 			stored:      nil,
-			prevAccess:  "at-0",
+			prev:        casCred("at-0", "rt-0"),
 			next:        casCred("at-1", "rt-1"),
 			wantErr:     nil,
 			wantStored:  "at-1",
@@ -65,7 +85,7 @@ func TestWriteCredCAS(t *testing.T) {
 			name:        "unsearchable keychain aborts (unverifiable, not empty)",
 			stored:      casCred("at-0", "rt-0"),
 			readFault:   creds.ErrUnavailable,
-			prevAccess:  "at-0",
+			prev:        casCred("at-0", "rt-0"),
 			next:        casCred("at-1", "rt-1"),
 			wantErr:     ErrCredentialUnverifiable,
 			wantStored:  "at-0",
@@ -75,7 +95,7 @@ func TestWriteCredCAS(t *testing.T) {
 			name:        "opaque re-read error aborts",
 			stored:      casCred("at-0", "rt-0"),
 			readFault:   errOpaque,
-			prevAccess:  "at-0",
+			prev:        casCred("at-0", "rt-0"),
 			next:        casCred("at-1", "rt-1"),
 			wantErr:     errOpaque,
 			wantStored:  "at-0",
@@ -98,7 +118,7 @@ func TestWriteCredCAS(t *testing.T) {
 			m := &Manager{Store: st, Creds: fk, LockDir: t.TempDir()}
 			before := fk.WriteCount()
 
-			err := m.writeCredCAS(a, creds.SourceKeychain, tc.prevAccess, tc.next)
+			err := m.writeCredCAS(a, creds.SourceKeychain, tc.prev, tc.next)
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("writeCredCAS err = %v, want %v", err, tc.wantErr)
 			}

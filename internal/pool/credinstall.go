@@ -32,7 +32,7 @@ func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, 
 	defer release()
 
 	current, src, err := m.ReadCredential(a)
-	prevAccess := ""
+	var prev *creds.Credential
 	switch {
 	case err == nil:
 		if current.HasRefreshToken() {
@@ -41,14 +41,14 @@ func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, 
 		if cred.ClaudeAiOauth.ExpiresAt <= current.ClaudeAiOauth.ExpiresAt {
 			return false, nil
 		}
-		prevAccess = current.ClaudeAiOauth.AccessToken
+		prev = current
 	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
 		// No credential, or a claude tombstone: install to the resolved backend
-		// (writeCredCAS writes through an unreadable prior blob).
+		// (writeCredCAS re-verifies the slot is still empty before writing).
 	default:
 		return false, err
 	}
-	if err := m.writeCredCAS(a, src, prevAccess, cred); err != nil {
+	if err := m.writeCredCAS(a, src, prev, cred); err != nil {
 		if errors.Is(err, ErrCredentialChangedUnderfoot) {
 			return false, nil
 		}

@@ -82,18 +82,20 @@ func (m *Manager) writeCred(a store.Account, src creds.Source, cred *creds.Crede
 	return nil
 }
 
-// writeCredCAS aborts with ErrCredentialChangedUnderfoot if the backend's access
-// token no longer matches prevAccess (a concurrent writer landed a newer cred).
-// A proven-empty slot (absent or tombstone) writes through; any other re-read
-// failure aborts with ErrCredentialUnverifiable. Caller must hold the account lock.
-func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prevAccess string, next *creds.Credential) error {
+// writeCredCAS writes next only when the backend still holds prev (both
+// tokens — a rotation can change the refresh token alone) or is a proven-empty
+// slot (absent or tombstone). A nil prev means the caller decided over an
+// empty slot, so any readable credential aborts. Mismatches abort with
+// ErrCredentialChangedUnderfoot, unverifiable re-reads with
+// ErrCredentialUnverifiable. Caller must hold the account lock.
+func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prev, next *creds.Credential) error {
 	s := m.Creds.Store(a, src)
 	cur, err := s.Read()
 	switch {
 	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
 	case err != nil:
 		return fmt.Errorf("%w: %s: %w", ErrCredentialUnverifiable, s, err)
-	case cur.ClaudeAiOauth.AccessToken != prevAccess:
+	case prev == nil, !sameTokens(cur, prev):
 		return fmt.Errorf("%w: %s (a concurrent writer owns the newer credential)", ErrCredentialChangedUnderfoot, s)
 	}
 	return m.writeCred(a, src, next)
@@ -141,7 +143,7 @@ func (m *Manager) stripSpentRefreshToken(a store.Account, src creds.Source, cred
 	if !re.InvalidGrant() || cred.ClaudeAiOauth.AccessToken == "" {
 		return
 	}
-	if err := m.writeCredCAS(a, src, cred.ClaudeAiOauth.AccessToken, cred.Strip()); err != nil {
+	if err := m.writeCredCAS(a, src, cred, cred.Strip()); err != nil {
 		log.Printf("acct-%d strip spent refresh token: %v", a.ID, err)
 	}
 }
@@ -160,7 +162,7 @@ func (m *Manager) refresh(ctx context.Context, a store.Account, src creds.Source
 		next.ClaudeAiOauth.RefreshToken = tr.RefreshToken
 	}
 	next.ClaudeAiOauth.ExpiresAt = tr.Expiry(time.Now()).UnixMilli()
-	if err := m.writeCredCAS(a, src, prev.ClaudeAiOauth.AccessToken, next); err != nil {
+	if err := m.writeCredCAS(a, src, prev, next); err != nil {
 		return nil, err
 	}
 	return next, nil
@@ -180,7 +182,7 @@ func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error 
 	if err != nil {
 		return err
 	}
-	return m.writeCredCAS(a, src, cred.ClaudeAiOauth.AccessToken, cred)
+	return m.writeCredCAS(a, src, cred, cred)
 }
 
 // SampleOpts controls how SampleUsage may recover a 401. AllowRefresh permits the

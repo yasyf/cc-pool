@@ -199,6 +199,37 @@ func TestPreflightInvalidGrantStripsRefreshToken(t *testing.T) {
 	assertNeverCanonical(t, fk.TouchedServices())
 }
 
+// TestStripAbortsOnRefreshTokenRotatedUnderfoot pins the full-credential CAS
+// ahead of the strip: a login rotating only the refresh token (same access
+// token) between the failed refresh and the write must abort the strip — an
+// access-token-only compare would destroy the live rotated chain.
+func TestStripAbortsOnRefreshTokenRotatedUnderfoot(t *testing.T) {
+	kc := &rotatingCreds{
+		// read#1 (pre-flight) sees the stale chain; read#2 (the strip's CAS
+		// re-read) sees the rotation: same access token, new refresh token.
+		rotateAfter: 1,
+		current:     cred401("at-0", "rt-stale", time.Now().Add(-time.Hour)),
+		rotated:     cred401("at-0", "rt-live", time.Now().Add(time.Hour)),
+	}
+	fo := newFakeOAuth401("rt-current") // rt-stale → invalid_grant
+	m, a := newManager401(t, kc, fo)
+
+	_, _, err := m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
+	if !errors.Is(err, ErrNeedsLogin) {
+		t.Fatalf("err = %v, want ErrNeedsLogin (the strip stays best-effort)", err)
+	}
+	kc.mu.Lock()
+	after, rotated := *kc.current, kc.rotated
+	kc.mu.Unlock()
+	if rotated == nil {
+		t.Fatal("a write landed (rotation cancelled); the strip must abort, not write")
+	}
+	if after.ClaudeAiOauth.RefreshToken != "rt-stale" || rotated.ClaudeAiOauth.RefreshToken != "rt-live" {
+		t.Fatalf("stored chains mutated (current=%q rotated=%q), want both untouched",
+			after.ClaudeAiOauth.RefreshToken, rotated.ClaudeAiOauth.RefreshToken)
+	}
+}
+
 // fakeOAuthPlain401 401s every refresh without an OAuth error code — the
 // transient-401 shape that must never destroy a refresh token.
 type fakeOAuthPlain401 struct{}
