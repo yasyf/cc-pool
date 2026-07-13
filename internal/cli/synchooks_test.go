@@ -136,6 +136,37 @@ func TestSyncPublishAccount(t *testing.T) {
 		}
 	})
 
+	t.Run("synced blob publishes a zero chain, never Origin:self", func(t *testing.T) {
+		m, fk := syncTestEnv(t)
+		stubSynckitdRun(t)
+		if err := m.Store.SetMeta(syncMetaKey, "1"); err != nil {
+			t.Fatal(err)
+		}
+		// An interrupted `ccp add` leaves a synced (refresh-token-free) blob:
+		// the real origin minted this chain, so a resumed publish must not
+		// claim originship of it.
+		synced := &creds.Credential{ClaudeAiOauth: creds.OAuth{AccessToken: "at-peer", ExpiresAt: future}}
+		a := addSyncTestAccount(t, m, fk, 1, "u-1", "e@x.y", "Work", synced)
+		seedSyncRegistry(t, func(reg hostsync.Registry) {
+			reg.Add("u-1", hostsync.AccountValue{
+				UUID:  "u-1",
+				Chain: hostsync.ChainStamp{Origin: "the-real-origin", ExpiresAt: future, Hash: "h"},
+			}, cregistry.Micros(1000))
+		})
+		cmd, _ := syncCmdBuf(t)
+
+		if err := syncPublishAccount(cmd, m, a.ID); err != nil {
+			t.Fatalf("syncPublishAccount: %v", err)
+		}
+		entry := loadSyncRegistry(t)["u-1"]
+		if !entry.Present() {
+			t.Fatalf("entry = %+v, want present", entry)
+		}
+		if entry.Value.Chain != (hostsync.ChainStamp{}) {
+			t.Fatalf("chain = %+v, want a zero chain for an unowned credential", entry.Value.Chain)
+		}
+	})
+
 	t.Run("re-add overrides a peer tombstone", func(t *testing.T) {
 		m, fk := syncTestEnv(t)
 		stubSynckitdRun(t)

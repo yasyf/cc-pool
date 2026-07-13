@@ -113,19 +113,24 @@ func (p *syncPublisher) Publish(ctx context.Context, a store.Account) error {
 	if err != nil {
 		return fmt.Errorf("read acct-%02d credential: %w", a.ID, err)
 	}
+	// Only an owned chain (refresh token present — this host's login minted
+	// it) stamps Origin: self; a synced blob left by an interrupted `ccp add`
+	// must not hijack the real origin's chain. Zero chain, as localChainStamp.
+	var chain hostsync.ChainStamp
+	if cred.HasRefreshToken() {
+		chain = hostsync.ChainStamp{
+			Origin:    p.self,
+			ExpiresAt: cred.ClaudeAiOauth.ExpiresAt,
+			Hash:      creds.AccessHash(cred),
+			RotatedAt: p.now().UnixMilli(),
+		}
+	}
 	v := hostsync.AccountValue{
 		UUID:         ident.AccountUUID,
 		Email:        ident.EmailAddress,
 		Label:        a.Label,
 		OAuthAccount: raw,
-		// This host's login minted the chain, so it is the origin. AccessHash
-		// identifies the chain without carrying the token.
-		Chain: hostsync.ChainStamp{
-			Origin:    p.self,
-			ExpiresAt: cred.ClaudeAiOauth.ExpiresAt,
-			Hash:      creds.AccessHash(cred),
-			RotatedAt: p.now().UnixMilli(),
-		},
+		Chain:        chain,
 	}
 	if err := p.svc.PublishAccount(ctx, v); err != nil {
 		return fmt.Errorf("publish acct-%02d: %w", a.ID, err)
