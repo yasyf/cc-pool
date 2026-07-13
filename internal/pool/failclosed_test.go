@@ -118,3 +118,38 @@ func TestPreflightRefreshFailsClosedOnScanError(t *testing.T) {
 		}
 	})
 }
+
+// TestPreflightRefreshUnrefreshablePassthrough pins the synced-copy surface:
+// an idle account holding an expiring synced blob returns ErrUnrefreshable
+// unwrapped (non-fatal, like ErrNeedsLogin) with zero refresh POSTs; a valid
+// synced blob is a clean nil.
+func TestPreflightRefreshUnrefreshablePassthrough(t *testing.T) {
+	orig := scanSessions
+	t.Cleanup(func() { scanSessions = orig })
+	scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
+
+	cases := map[string]struct {
+		expiry  time.Time
+		wantErr error
+	}{
+		"expiring synced blob passes ErrUnrefreshable through": {expiry: time.Now().Add(time.Minute), wantErr: ErrUnrefreshable},
+		"valid synced blob is a non-event":                     {expiry: time.Now().Add(time.Hour)},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, a, fo, fk := newFailClosedManager(t)
+			fk.Put(a.KeychainService, a.KeychainAccount, synced("at-synced", tc.expiry))
+
+			err := m.PreflightRefresh(context.Background(), a)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr != nil && err != tc.wantErr {
+				t.Fatalf("err = %v, want the bare sentinel for caller warns", err)
+			}
+			if got := refreshCount(fo); got != 0 {
+				t.Fatalf("synced blob refreshed %d time(s), want 0", got)
+			}
+		})
+	}
+}

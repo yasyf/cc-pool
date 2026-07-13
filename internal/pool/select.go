@@ -231,7 +231,8 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 }
 
 // PreflightRefresh refreshes the chosen account's token when it expires within
-// RefreshLeadTime and the account is idle. Errors are returned but non-fatal.
+// RefreshLeadTime and the account is idle. Errors are returned but non-fatal;
+// ErrNeedsLogin and ErrUnrefreshable pass through unwrapped for callers to warn on.
 func (m *Manager) PreflightRefresh(ctx context.Context, a store.Account) error {
 	sessions, err := scanSessions(ctx)
 	if err != nil {
@@ -243,7 +244,7 @@ func (m *Manager) PreflightRefresh(ctx context.Context, a store.Account) error {
 		return nil
 	}
 	_, _, ferr := m.EnsureFreshToken(ctx, a, RefreshLeadTime, true)
-	if ferr != nil && !errors.Is(ferr, ErrNeedsLogin) {
+	if ferr != nil && !errors.Is(ferr, ErrNeedsLogin) && !errors.Is(ferr, ErrUnrefreshable) {
 		return fmt.Errorf("preflight refresh: %w", ferr)
 	}
 	return ferr

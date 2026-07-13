@@ -438,11 +438,12 @@ func TestShortCircuitRelogin(t *testing.T) {
 			want: true, wantRefreshCalls: 1, wantWrites: 1, // the refresh's own rotate-persist
 		},
 		// The counterexample that killed the usage-probe design: hours of
-		// access-token life on a chain the daemon already proved dead.
+		// access-token life on a chain the daemon already proved dead. The
+		// confirmed invalid_grant also strips the spent refresh token (1 write).
 		"dead refresh chain behind an unexpired access token keeps the login": {
 			flagged: true, keychain: cred("at", "rt", future),
-			refreshErr:       &oauth.RefreshError{Status: 400, Body: `{"error": "invalid_grant"}`},
-			wantRefreshCalls: 1,
+			refreshErr:       &oauth.RefreshError{Status: 400, Body: `{"error": "invalid_grant"}`, Code: "invalid_grant"},
+			wantRefreshCalls: 1, wantWrites: 1,
 		},
 		"transient refresh failure keeps the login": {
 			flagged: true, keychain: cred("at", "rt", future),
@@ -453,7 +454,9 @@ func TestShortCircuitRelogin(t *testing.T) {
 			flagged: true, keychain: cred("at", "rt", past),
 			want: true, wantRefreshCalls: 1, wantWrites: 1,
 		},
-		"revoked credential (no refresh token) keeps the login": {
+		// ErrUnrefreshable falls through to a full login exactly like ErrNeedsLogin:
+		// a synced copy can never prove the chain live from this host.
+		"synced credential (no refresh token) keeps the login": {
 			flagged: true, keychain: cred("at", "", future),
 		},
 		"absent credential keeps the login": {

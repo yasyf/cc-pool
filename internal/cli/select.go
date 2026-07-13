@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -246,13 +247,22 @@ func prepareAccount(cmd *cobra.Command, m *pool.Manager, a store.Account) (strin
 	}
 	mergeLaunchSettings(cmd, m, a)
 	if err := m.PreflightRefresh(cmd.Context(), a); err != nil {
-		if errors.Is(err, pool.ErrNeedsLogin) {
-			warn(cmd.ErrOrStderr(), "%s needs to log in again; run `ccp login %d`", accountName(a.Label), a.ID)
-		} else {
-			warn(cmd.ErrOrStderr(), "%v", err)
-		}
+		warnPreflight(cmd.ErrOrStderr(), a, err)
 	}
 	return a.ConfigDir, nil
+}
+
+// warnPreflight translates a non-fatal preflight-refresh error into operator
+// guidance on stderr.
+func warnPreflight(w io.Writer, a store.Account, err error) {
+	switch {
+	case errors.Is(err, pool.ErrNeedsLogin):
+		warn(w, "%s needs to log in again; run `ccp login %d`", accountName(a.Label), a.ID)
+	case errors.Is(err, pool.ErrUnrefreshable):
+		warn(w, "%s's token is expiring and this machine holds a synced copy it can't refresh — the origin rotates it, or run `ccp login %d` here", accountName(a.Label), a.ID)
+	default:
+		warn(w, "%v", err)
+	}
 }
 
 // mergeLaunchSettings warns rather than fails: a malformed ~/.claude.json must

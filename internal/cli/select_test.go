@@ -264,6 +264,46 @@ func TestResolveSelectionWaitRefusesExhaustedFallback(t *testing.T) {
 	}
 }
 
+// TestWarnPreflight pins prepareAccount's non-fatal warn copy: needs-login and
+// unrefreshable get their operator guidance (naming `ccp login <id>`), any
+// other error passes through verbatim.
+func TestWarnPreflight(t *testing.T) {
+	a := store.Account{ID: 7, Label: "work@example.com"}
+	opaque := errors.New("preflight refresh: dial tcp: connection refused")
+	cases := map[string]struct {
+		err  error
+		want []string
+	}{
+		"needs-login names the login command": {
+			err:  pool.ErrNeedsLogin,
+			want: []string{"needs to log in again", "ccp login 7"},
+		},
+		"unrefreshable names the origin and the local login": {
+			err:  pool.ErrUnrefreshable,
+			want: []string{"synced copy it can't refresh", "the origin rotates it", "ccp login 7"},
+		},
+		"other errors pass through verbatim": {
+			err:  opaque,
+			want: []string{opaque.Error()},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			warnPreflight(&stderr, a, tc.err)
+			out := stripANSI(stderr.String())
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("warn = %q, want it to contain %q", out, want)
+				}
+			}
+			if tc.err == pool.ErrUnrefreshable && strings.Contains(out, "needs to log in again") {
+				t.Errorf("unrefreshable must not use the needs-login copy: %q", out)
+			}
+		})
+	}
+}
+
 // Pins the settings merge on both no-daemon arms: removing mergeLaunchSettings
 // in prepareAccount fails both.
 func TestResolveSelectionMergesBaseSettings(t *testing.T) {
