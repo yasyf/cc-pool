@@ -212,6 +212,7 @@ func newDriverHarness(t *testing.T) *driverHarness {
 	t.Helper()
 	svc, _ := newTestService(t)
 	svc.Locals = func(context.Context) ([]LocalAccount, error) { return nil, nil }
+	svc.Sessions = fakeSessions{busy: map[string]bool{}}
 	st := newFakeStore()
 	cr := newFakeCred()
 	h := &driverHarness{
@@ -316,6 +317,42 @@ func TestDriverReconcile(t *testing.T) {
 				}
 				if len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
 					t.Fatalf("a label-only reconcile pulled/installed: pulls=%+v installs=%+v", h.pull.calls, h.cred.installs)
+				}
+			},
+		},
+		{
+			name: "busy-account-install-deferred",
+			setup: func(h *driverHarness) {
+				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
+				h.cred.expiry[1] = 1000
+				h.pull.cred = credWithExpiry(2000)
+				h.svc.Sessions = fakeSessions{busy: map[string]bool{"u1": true}, reason: "live session"}
+			},
+			id:          "u1",
+			val:         acctValue("u1", "same", "hostA", 2000, freshOAuth("u1")),
+			peers:       []string{"hostB"},
+			wantOutcome: OutcomeDeferred,
+			check: func(t *testing.T, h *driverHarness) {
+				if len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("a busy account's credential was touched: pulls=%+v installs=%+v", h.pull.calls, h.cred.installs)
+				}
+			},
+		},
+		{
+			name: "busy-check-error-fails-item",
+			setup: func(h *driverHarness) {
+				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
+				h.cred.expiry[1] = 1000
+				h.pull.cred = credWithExpiry(2000)
+				h.svc.Sessions = fakeSessions{err: errors.New("scan failed")}
+			},
+			id:      "u1",
+			val:     acctValue("u1", "same", "hostA", 2000, freshOAuth("u1")),
+			peers:   []string{"hostB"},
+			wantErr: true,
+			check: func(t *testing.T, h *driverHarness) {
+				if len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("an unprovably-idle account's credential was touched: pulls=%+v installs=%+v", h.pull.calls, h.cred.installs)
 				}
 			},
 		},

@@ -230,6 +230,17 @@ func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountV
 	if v.Chain.ExpiresAt <= localExp {
 		return outcome, nil
 	}
+	// Never install under a busy account — a concurrent `ccp login`'s claude
+	// subprocess owns the slot (the writeCredCAS TOCTOU window, ccn 4ed1146).
+	// Same fail-closed discipline as teardownBusy: a nil seam reads busy.
+	busy, reason, err := d.installBusy(ctx, v.UUID)
+	if err != nil {
+		return "", fmt.Errorf("busy check for %s: %w", v.UUID, err)
+	}
+	if busy {
+		d.svc.logf("hostsync: acct-%d credential install deferred: %s", a.ID, reason)
+		return OutcomeDeferred, nil
+	}
 
 	installed, deferred, err := d.pullAndInstall(ctx, a, v, localExp, peers)
 	switch {
@@ -242,6 +253,15 @@ func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountV
 	default:
 		return outcome, nil
 	}
+}
+
+// installBusy reports whether uuid is locally held (live session, select
+// reservation, or in-flight convert); a nil Sessions seam reads busy.
+func (d *Driver) installBusy(ctx context.Context, uuid string) (bool, string, error) {
+	if d.svc.Sessions == nil {
+		return true, "no sessions seam wired", nil
+	}
+	return d.svc.Sessions.Busy(ctx, uuid)
 }
 
 // pullAndInstall pulls the fresher chain and installs it; ErrNoPeerCredential
