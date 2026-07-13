@@ -20,10 +20,11 @@ func casCred(access, refresh string) *creds.Credential {
 
 // TestWriteCredCAS pins the compare-and-swap guard: a snapshot matching on
 // both tokens writes through, any divergence — access token, refresh token
-// alone, or a credential appearing over a slot decided empty — aborts with
-// ErrCredentialChangedUnderfoot without clobbering, an absent backend
-// proceeds, and a re-read that fails for any reason other than a proven-empty
-// slot aborts with ErrCredentialUnverifiable.
+// alone, a credential appearing over a slot decided empty, or one vanishing
+// under a non-nil snapshot — aborts with ErrCredentialChangedUnderfoot
+// without clobbering, only a nil prev writes through an empty slot, and a
+// re-read that fails for any reason other than a proven-empty slot aborts
+// with ErrCredentialUnverifiable.
 func TestWriteCredCAS(t *testing.T) {
 	errOpaque := errors.New("keychain read exploded")
 	cases := []struct {
@@ -73,12 +74,21 @@ func TestWriteCredCAS(t *testing.T) {
 			wantWritten: false,
 		},
 		{
-			name:        "absent backend proceeds (no prior value to compare)",
+			name:        "credential vanishing under a non-nil snapshot aborts (logout underfoot)",
 			stored:      nil,
 			prev:        casCred("at-0", "rt-0"),
-			next:        casCred("at-1", "rt-1"),
+			next:        casCred("at-0", "rt-0"),
+			wantErr:     ErrCredentialChangedUnderfoot,
+			wantStored:  "",
+			wantWritten: false,
+		},
+		{
+			name:        "nil snapshot writes through an absent slot",
+			stored:      nil,
+			prev:        nil,
+			next:        casCred("at-synced", ""),
 			wantErr:     nil,
-			wantStored:  "at-1",
+			wantStored:  "at-synced",
 			wantWritten: true,
 		},
 		{
@@ -123,11 +133,17 @@ func TestWriteCredCAS(t *testing.T) {
 				t.Fatalf("writeCredCAS err = %v, want %v", err, tc.wantErr)
 			}
 			got, ok := fk.Get(a.KeychainService, a.KeychainAccount)
-			if !ok {
-				t.Fatal("no credential in the fake backend after writeCredCAS")
-			}
-			if got.ClaudeAiOauth.AccessToken != tc.wantStored {
-				t.Fatalf("stored access token = %q, want %q", got.ClaudeAiOauth.AccessToken, tc.wantStored)
+			if tc.wantStored == "" {
+				if ok {
+					t.Fatalf("backend holds %+v after writeCredCAS, want it left absent", got)
+				}
+			} else {
+				if !ok {
+					t.Fatal("no credential in the fake backend after writeCredCAS")
+				}
+				if got.ClaudeAiOauth.AccessToken != tc.wantStored {
+					t.Fatalf("stored access token = %q, want %q", got.ClaudeAiOauth.AccessToken, tc.wantStored)
+				}
 			}
 			if written := fk.WriteCount() > before; written != tc.wantWritten {
 				t.Fatalf("write performed = %v, want %v", written, tc.wantWritten)
@@ -162,5 +178,30 @@ func TestAdoptRotatedTokenReassertsUnchanged(t *testing.T) {
 	}
 	if got, _ := fk.Get(a.KeychainService, a.KeychainAccount); got.ClaudeAiOauth.AccessToken != "at-0" {
 		t.Fatalf("stored access token = %q, want at-0", got.ClaudeAiOauth.AccessToken)
+	}
+}
+
+// TestAdoptRotatedTokenAbortsOnLogoutUnderfoot pins the empty-re-read guard: a
+// `claude` logout deleting the blob between the adopt's read and its CAS
+// re-read must abort — writing the old owned blob back would undo the logout
+// and resurrect a possibly-dead chain.
+func TestAdoptRotatedTokenAbortsOnLogoutUnderfoot(t *testing.T) {
+	f := newInstallFixture(t)
+	owned := casCred("at-0", "rt-0")
+	ks := &swapStore{Store: f.fk.Store(f.a, creds.SourceKeychain), old: owned, swappedErr: creds.ErrNotFound}
+	f.m.Creds = swapCreds{Fake: f.fk, ks: ks}
+
+	err := f.m.AdoptRotatedToken(context.Background(), f.a)
+	if !errors.Is(err, ErrCredentialChangedUnderfoot) {
+		t.Fatalf("err = %v, want ErrCredentialChangedUnderfoot", err)
+	}
+	if ks.reads < 2 {
+		t.Fatalf("CAS re-read never happened (reads = %d)", ks.reads)
+	}
+	if f.fk.WriteCount() != 0 || f.hookCalls != 0 {
+		t.Fatalf("aborted adopt acted (writes=%d hooks=%d), want none", f.fk.WriteCount(), f.hookCalls)
+	}
+	if got, ok := f.fk.Get(f.a.KeychainService, f.a.KeychainAccount); ok {
+		t.Fatalf("backend holds %+v, want the logout's deletion left in place", got)
 	}
 }

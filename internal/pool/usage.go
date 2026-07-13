@@ -84,16 +84,19 @@ func (m *Manager) writeCred(a store.Account, src creds.Source, cred *creds.Crede
 }
 
 // writeCredCAS writes next only when the backend still holds prev (both
-// tokens — a rotation can change the refresh token alone) or is a proven-empty
-// slot (absent or tombstone). A nil prev means the caller decided over an
-// empty slot, so any readable credential aborts. Mismatches abort with
-// ErrCredentialChangedUnderfoot, unverifiable re-reads with
-// ErrCredentialUnverifiable. Caller must hold the account lock.
+// tokens) or, for a nil prev, is still the empty slot the caller decided
+// over. Any divergence — including the credential vanishing under a non-nil
+// prev (a concurrent logout) — aborts with ErrCredentialChangedUnderfoot;
+// unverifiable re-reads with ErrCredentialUnverifiable. Caller must hold the
+// account lock.
 func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prev, next *creds.Credential) error {
 	s := m.Creds.Store(a, src)
 	cur, err := s.Read()
 	switch {
 	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
+		if prev != nil {
+			return fmt.Errorf("%w: %s (credential deleted or tombstoned since the read)", ErrCredentialChangedUnderfoot, s)
+		}
 	case err != nil:
 		return fmt.Errorf("%w: %s: %w", ErrCredentialUnverifiable, s, err)
 	case prev == nil, !sameTokens(cur, prev):

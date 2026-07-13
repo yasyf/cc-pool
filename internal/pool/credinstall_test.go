@@ -266,13 +266,14 @@ func TestInstallSyncedCredentialConcurrentRotationWins(t *testing.T) {
 }
 
 // swapStore serves scripted keychain reads: the first read (the locked probe)
-// returns old/oldErr, later reads return swapped — a `claude /login` landing
-// between the probe and the CAS re-read, outside every lock cc-pool holds.
+// returns old/oldErr, later reads return swapped/swappedErr — a `claude`
+// login or logout landing between the probe and any later re-read, outside
+// every lock cc-pool holds.
 type swapStore struct {
 	creds.Store
-	old, swapped *creds.Credential
-	oldErr       error
-	reads        int
+	old, swapped       *creds.Credential
+	oldErr, swappedErr error
+	reads              int
 }
 
 func (s *swapStore) Read() (*creds.Credential, error) {
@@ -280,7 +281,7 @@ func (s *swapStore) Read() (*creds.Credential, error) {
 	if s.reads == 1 {
 		return s.old, s.oldErr
 	}
-	return s.swapped, nil
+	return s.swapped, s.swappedErr
 }
 
 // swapCreds routes the keychain source to one shared swapStore instance.
