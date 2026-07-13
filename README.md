@@ -82,7 +82,7 @@ synckitd host add user@other-mac    # point each Mac at the other
 ccp sync enable                     # both Macs
 ```
 
-Accounts and credentials now converge fresher-wins: `ccp add` on one Mac materializes the account on the others with no extra login, `ccp remove` propagates pool-wide, and selection counts a peer's live session against an account's score. Only one host at a time — the chain holder — refreshes an account's token, so the single-use refresh chain never forks. One caveat: on a headless host whose login Keychain is unreachable, a synced credential lands in a plaintext file store instead; `ccp sync status` flags it.
+Accounts and credentials now converge: `ccp add` on one Mac materializes the account on the others with no extra login, `ccp remove` propagates pool-wide, and selection counts a peer's live session against an account's score. Each account has one **origin** — the Mac that logged it in — and only the origin refreshes it; the other Macs hold a read-only copy (access token only, no refresh token), so the single-use refresh chain can never be double-spent. When a read-only copy expires, that Mac shows needs-login until the origin's next rotation lands — or run `ccp login` there to make it a second origin. One caveat: on a headless host whose login Keychain is unreachable, a synced credential lands in a plaintext file store instead; `ccp sync status` flags it.
 
 ### Glance at the pool without opening a terminal
 

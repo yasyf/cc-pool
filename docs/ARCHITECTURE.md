@@ -134,38 +134,46 @@ materializes the account on the rest with no extra login.
 
 **The shared registry is secretless.** Hosts converge on
 `~/.cc-pool/sync/registry.json`, a last-writer-wins CRDT keyed by each account's Claude
-`accountUuid`. An entry carries metadata plus a chain stamp — token expiry, a one-way
-hash of the token pair, the parent chain's hash, the holder host, a lease — never a
-token. Merging is pull-only and order-independent, and a removal is a tombstone that
-outlives the entry, so `ccp remove` on any host tears the account down everywhere.
-synckitd watches per-account stamp files and nudges peers on change; its periodic
-reconcile tick is the floor when a notify is missed.
+`accountUuid`. An entry carries metadata plus a chain stamp — the origin host, token
+expiry, a one-way hash of the access token, the rotation time — never a token. Merging
+is pull-only and order-independent, and a removal is a tombstone that outlives the
+entry, so `ccp remove` on any host tears the account down everywhere. synckitd watches
+per-account stamp files and nudges peers on change; its periodic reconcile tick is the
+floor when a notify is missed.
 
 **One secret path.** The daemon serves synckit's consumer contract on a second socket,
 `~/.cc-pool/sync.sock`, and that dispatcher carries exactly one custom method:
-`ccp.fetch_stripped_credential`. Credentials transit peer RPC — over SSH via the hidden
-`ccp sync rpc-serve` stdio bridge — only during a pull, and land directly in the
-receiving host's Keychain. A host whose login Keychain is unsearchable (headless SSH)
-falls back to the plaintext file store; `ccp sync status` flags the exposure.
+`ccp.fetch_stripped_credential`. It serves the credential **stripped** — the refresh
+token is removed at the origin, so that secret never leaves the origin process.
+Stripped credentials transit peer RPC — over SSH via the hidden `ccp sync rpc-serve`
+stdio bridge — only during a pull, and land directly in the receiving host's Keychain.
+A host whose login Keychain is unsearchable (headless SSH) falls back to the plaintext
+file store; `ccp sync status` flags the exposure.
 
-**Refresh discipline: one holder, leased.** Claude refresh tokens are single-use, so two
-hosts refreshing one chain fork it and the loser gets signed out. Each chain therefore
-names one **holder**, the only host whose daemon refreshes it preemptively; every other
-host suppresses its refresh. `ccp select` claims holdership and a 45-minute lease before
-launching, renews the lease while the session runs, and releases it on check-in. A live
-peer lease counts as one extra active session in scoring — penalized, never excluded —
-and a dead holder's chain is taken over only once it is expired, unleased, and
-rotation-stale past a jittered 35-minute threshold. On `invalid_grant`, the daemon pulls
-once from peers before flagging the account signed-out, in case a fresher chain already
-exists elsewhere.
+**Refresh discipline: one origin per chain.** Claude refresh tokens are single-use, so
+two hosts refreshing one chain double-spend it and the loser gets signed out. Each
+chain therefore has exactly one **origin** — the host whose login minted it — and only
+the origin refreshes. Origin is a static fact, not a leased role, and the enforcement
+is structural: a peer holds only the access token and its expiry, never the refresh
+token, so it has nothing to double-spend no matter how it races. The origin's idle
+refresh rotates the chain as usual, and each new access token propagates through the
+registry and pull machinery, keeping peers usable indefinitely while the origin is
+alive. A peer whose synced copy expires with nothing fresher available reports
+needs-login — log in there, or wait for the origin — and sinks in scoring; `ccp login`
+mints that host its own chain, making the account dual-origin. On `invalid_grant`, the
+daemon strips the spent refresh token from its own blob and pulls the winner's
+stripped chain, so a chain owned by two hosts self-heals into origin plus peer on the
+first double-spend.
 
-**Freshness is lineage-first.** Token expiry timestamps are minted from each host's
-local clock, so clock skew can make a spent chain look fresher than its live child.
-Every freshness decision therefore compares lineage before expiry: a chain stamp carries
-its parent's hash, a child of the currently known chain wins regardless of timestamps,
-and installs refuse anything matching the recorded parent outright. The full rationale,
-including the adversarial-review record behind it, is in the design note
-(`ccn doc show 10bf17d`).
+**Freshness is owned-first.** Ownership is refresh-token presence: a blob holding a
+refresh token is owned, one holding only an access token is synced. Sync never
+replaces an owned blob, and a synced blob advances only to a strictly later expiry. A
+host never publishes a chain stamp for an account it doesn't own, so an empty chain
+can never clobber a live origin's in the merge. The origin is authoritative for its
+own chain — a self-consistent answer ahead of the registry stamp is mirror lag, not
+corruption — while a relayed answer must match the registry's hash and expiry exactly,
+so a tampered stamp stays uninstallable. The full rationale, including the
+adversarial-review record behind it, is in the design note (`ccn doc show 4dce1ad`).
 
 **Teardown fails closed.** A tombstoned account is removed locally only when the host
 can prove it idle — no live session, no launch reservation, no overlay conversion in
