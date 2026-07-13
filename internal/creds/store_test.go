@@ -2,6 +2,7 @@ package creds
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -212,5 +213,31 @@ func TestFileStore(t *testing.T) {
 	}
 	if err := st.Delete(); err != nil {
 		t.Fatalf("second Delete = %v, want nil", err)
+	}
+}
+
+// TestClassifyRead pins the shared owned-precedence read taxonomy: nil is
+// present, the two empty sentinels collapse to ReadEmpty, ErrUnavailable is its
+// own unsearchable arm, and every other error (including wrapped sentinels)
+// fails closed as ReadFatal.
+func TestClassifyRead(t *testing.T) {
+	cases := map[string]struct {
+		err  error
+		want ReadState
+	}{
+		"nil is present":                   {nil, ReadPresent},
+		"not found is empty":               {ErrNotFound, ReadEmpty},
+		"no tokens is empty":               {ErrNoTokens, ReadEmpty},
+		"wrapped not found is empty":       {fmt.Errorf("read: %w", ErrNotFound), ReadEmpty},
+		"unavailable is unsearchable":      {ErrUnavailable, ReadUnsearchable},
+		"wrapped unavailable unsearchable": {fmt.Errorf("probe: %w", ErrUnavailable), ReadUnsearchable},
+		"other error fails closed":         {errors.New("security: user interaction not allowed"), ReadFatal},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := ClassifyRead(tc.err); got != tc.want {
+				t.Fatalf("ClassifyRead(%v) = %d, want %d", tc.err, got, tc.want)
+			}
+		})
 	}
 }

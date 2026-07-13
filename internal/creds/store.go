@@ -37,6 +37,38 @@ type Store interface {
 	String() string
 }
 
+// ReadState is the owned-precedence taxonomy of a Store.Read outcome, shared by
+// every credential install and CAS write so the sentinel handling never drifts.
+type ReadState int
+
+const (
+	// ReadPresent means Read returned a credential (err == nil).
+	ReadPresent ReadState = iota
+	// ReadEmpty means the slot is provably empty: absent (ErrNotFound) or a
+	// tombstone (ErrNoTokens).
+	ReadEmpty
+	// ReadUnsearchable means the login keychain is unsearchable (ErrUnavailable),
+	// so absence cannot be proven.
+	ReadUnsearchable
+	// ReadFatal means the read failed for any other reason; owned-state cannot be
+	// established, so callers fail closed.
+	ReadFatal
+)
+
+// ClassifyRead maps a Store.Read error to a ReadState.
+func ClassifyRead(err error) ReadState {
+	switch {
+	case err == nil:
+		return ReadPresent
+	case errors.Is(err, ErrNotFound), errors.Is(err, ErrNoTokens):
+		return ReadEmpty
+	case errors.Is(err, ErrUnavailable):
+		return ReadUnsearchable
+	default:
+		return ReadFatal
+	}
+}
+
 // KeychainItem is the Store for one macOS Keychain generic-password item,
 // addressed by service and account labels and accessed via security(1). An
 // empty Account means AccountLabel(), matching the package-level helpers.

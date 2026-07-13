@@ -20,16 +20,8 @@ var ErrEnvelopeCarriesSecret = errors.New("synced credential envelope carries a 
 var ErrEnvelopeNoAccessToken = errors.New("credential envelope carries no access token")
 
 // InstallSyncedCredential installs cred — a stripped copy pulled from a peer —
-// under owned precedence: an owned local blob (refresh token present) on ANY
-// backend is never overwritten or shadowed, even when expired; an absent or
-// tombstoned local always installs; a synced local yields only to a strictly
-// fresher expiry. A backend whose owned-state cannot be proven (a read error
-// other than not-found/tombstone/unavailable) aborts the install with
-// ErrCredentialUnverifiable; an unsearchable backend (creds.ErrUnavailable —
-// the headless login keychain) falls back to the file store, mirroring
-// hostsync's installEnvelope. The write goes through writeCredCAS, so an
-// underfoot `claude /login` aborts as a clean skip. Reports whether it
-// installed; a precedence or freshness skip is a normal outcome.
+// under owned precedence, reporting whether it installed (a precedence or
+// freshness skip is a normal outcome). Owned-precedence rationale: ccn note e30f860.
 func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, cred *creds.Credential) (bool, error) {
 	switch {
 	case cred.HasRefreshToken():
@@ -70,16 +62,18 @@ func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, 
 	// chain surfacing there later still outranks the synced copy.
 	for _, s := range m.Creds.Stores(a) {
 		cur, rerr := s.Read()
-		switch {
-		case errors.Is(rerr, creds.ErrNotFound), errors.Is(rerr, creds.ErrNoTokens):
-		case errors.Is(rerr, creds.ErrUnavailable):
+		switch creds.ClassifyRead(rerr) {
+		case creds.ReadEmpty:
+		case creds.ReadUnsearchable:
 			if prev == nil && s.Source() == src {
 				src = creds.SourceFile
 			}
-		case rerr != nil:
+		case creds.ReadFatal:
 			return false, fmt.Errorf("%w: %s: %w", ErrCredentialUnverifiable, s, rerr)
-		case cur.HasRefreshToken():
-			return false, nil
+		case creds.ReadPresent:
+			if cur.HasRefreshToken() {
+				return false, nil
+			}
 		}
 	}
 	if err := m.writeCredCAS(a, src, prev, cred); err != nil {

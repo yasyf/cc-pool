@@ -92,15 +92,17 @@ func (m *Manager) writeCred(a store.Account, src creds.Source, cred *creds.Crede
 func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prev, next *creds.Credential) error {
 	s := m.Creds.Store(a, src)
 	cur, err := s.Read()
-	switch {
-	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
+	switch creds.ClassifyRead(err) {
+	case creds.ReadEmpty:
 		if prev != nil {
 			return fmt.Errorf("%w: %s (credential deleted or tombstoned since the read)", ErrCredentialChangedUnderfoot, s)
 		}
-	case err != nil:
+	case creds.ReadUnsearchable, creds.ReadFatal:
 		return fmt.Errorf("%w: %s: %w", ErrCredentialUnverifiable, s, err)
-	case prev == nil, !sameTokens(cur, prev):
-		return fmt.Errorf("%w: %s (a concurrent writer owns the newer credential)", ErrCredentialChangedUnderfoot, s)
+	case creds.ReadPresent:
+		if prev == nil || !sameTokens(cur, prev) {
+			return fmt.Errorf("%w: %s (a concurrent writer owns the newer credential)", ErrCredentialChangedUnderfoot, s)
+		}
 	}
 	// Residual re-read→write TOCTOU vs an in-session claude (separate .oauth_refresh.lock); deferred by design — ccn task 4ed1146.
 	return m.writeCred(a, src, next)

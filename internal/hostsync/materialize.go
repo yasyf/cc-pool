@@ -188,11 +188,11 @@ func (s *Service) slotRetainsCredential(p *pool.PendingAdd) (bool, error) {
 	}
 	for _, st := range s.M.Creds.Stores(acct) {
 		_, err := st.Read()
-		switch {
-		case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
-		case err != nil:
+		switch creds.ClassifyRead(err) {
+		case creds.ReadEmpty:
+		case creds.ReadUnsearchable, creds.ReadFatal:
 			return false, fmt.Errorf("probe retained credential in %s: %w", st, err)
-		default:
+		case creds.ReadPresent:
 			return true, nil
 		}
 	}
@@ -201,13 +201,8 @@ func (s *Service) slotRetainsCredential(p *pool.PendingAdd) (bool, error) {
 
 // installEnvelope writes the pulled stripped credential to the Keychain,
 // falling back to the file store when the login keychain is unsearchable (the
-// returned bool flags the fallback). It writes directly — no row exists yet
-// for OnCredWrite — but under the account lock and only after re-proving both
-// backends empty at write time, the same owned-precedence guard as
-// pool.InstallSyncedCredential: a credential that landed since the pre-flight
-// check (a released `ccp add`'s still-running login) aborts with
-// ErrCredentialChangedUnderfoot, and a backend that cannot be proven empty
-// fails closed with ErrCredentialUnverifiable.
+// returned bool flags the fallback), under the same owned-precedence guard as
+// pool.InstallSyncedCredential — ccn note e30f860.
 func (s *Service) installEnvelope(ctx context.Context, p *pool.PendingAdd, env *creds.Credential) (bool, error) {
 	switch {
 	case env.HasRefreshToken():
@@ -230,22 +225,22 @@ func (s *Service) installEnvelope(ctx context.Context, p *pool.PendingAdd, env *
 	file := s.M.Creds.Store(acct, creds.SourceFile)
 	target, fileFallback := kc, false
 	_, kcErr := kc.Read()
-	switch {
-	case errors.Is(kcErr, creds.ErrNotFound), errors.Is(kcErr, creds.ErrNoTokens):
+	switch creds.ClassifyRead(kcErr) {
+	case creds.ReadEmpty:
 		// Provably empty (or a tombstone): install there.
-	case errors.Is(kcErr, creds.ErrUnavailable):
+	case creds.ReadUnsearchable:
 		target, fileFallback = file, true
-	case kcErr != nil:
+	case creds.ReadFatal:
 		return false, fmt.Errorf("%w: %s: %w", pool.ErrCredentialUnverifiable, kc, kcErr)
-	default:
+	case creds.ReadPresent:
 		return false, fmt.Errorf("%w: %s holds a credential", pool.ErrCredentialChangedUnderfoot, kc)
 	}
 	_, fErr := file.Read()
-	switch {
-	case errors.Is(fErr, creds.ErrNotFound), errors.Is(fErr, creds.ErrNoTokens):
-	case fErr != nil:
+	switch creds.ClassifyRead(fErr) {
+	case creds.ReadEmpty:
+	case creds.ReadUnsearchable, creds.ReadFatal:
 		return false, fmt.Errorf("%w: %s: %w", pool.ErrCredentialUnverifiable, file, fErr)
-	default:
+	case creds.ReadPresent:
 		return false, fmt.Errorf("%w: %s holds a credential", pool.ErrCredentialChangedUnderfoot, file)
 	}
 	if err := target.Write(env); err != nil {
