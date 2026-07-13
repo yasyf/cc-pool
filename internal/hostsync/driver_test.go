@@ -396,7 +396,7 @@ func TestDriverReconcile(t *testing.T) {
 			name: "same-chain-hash-never-pulls",
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
-				h.cred.cred[1] = strippedCred(1000) // same access token, expiry lagging the registry's
+				h.cred.cred[1] = strippedCred(2000) // the advertised chain, already installed
 			},
 			id: "u1",
 			val: AccountValue{
@@ -404,7 +404,7 @@ func TestDriverReconcile(t *testing.T) {
 				Email:        "u1@x.com",
 				Label:        "same",
 				OAuthAccount: json.RawMessage(freshOAuth("u1")),
-				Chain:        ChainStamp{Origin: "hostA", ExpiresAt: 2000, Hash: strippedHash()},
+				Chain:        ChainStamp{Origin: "hostA", ExpiresAt: 2000, Hash: creds.AccessHash(strippedCred(2000))},
 			},
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeUnchanged,
@@ -557,9 +557,6 @@ func strippedCred(exp int64) *creds.Credential {
 	c.ClaudeAiOauth.AccessToken = "at"
 	return c
 }
-
-// AccessHash ignores expiry, so this is expiry-independent.
-func strippedHash() string { return creds.AccessHash(strippedCred(0)) }
 
 // TestDriverUnifyBackfillsUUID pins the LoadRegistry backfill: a local account row
 // the store has not yet tagged with its accountUuid is unified with the matching

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"hash"
 )
 
@@ -16,11 +17,17 @@ func CredentialHash(c *Credential) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// AccessHash digests the access token alone (length-prefixed SHA-256): the
-// identity of a stripped (synced) blob, which never carries a refresh token.
+// AccessHash digests the canonical Marshal of Strip() (length-prefixed
+// SHA-256): the identity of a stripped (synced) blob. An owned blob and its
+// stripped form hash identically, while every field but the refresh token is
+// authenticated — token, expiry, and metadata alike.
 func AccessHash(c *Credential) string {
+	b, err := json.Marshal(c.Strip())
+	if err != nil {
+		panic("creds: marshal stripped credential: " + err.Error()) // plain struct; cannot fail
+	}
 	h := sha256.New()
-	hashField(h, c.ClaudeAiOauth.AccessToken)
+	hashField(h, string(b))
 	return hex.EncodeToString(h.Sum(nil))
 }
 

@@ -175,9 +175,9 @@ func fetchFromPeer(ctx context.Context, dial DialTransport, peer, uuid string, c
 	if !isOrigin && env.Hash != chain.Hash {
 		return nil, errors.New("relay answer does not match the registry chain (stale peer registry)")
 	}
-	// AccessHash covers only the access token, so a relay could otherwise
-	// inflate expiresAt under a still-valid hash; the origin published the
-	// expiry in the chain stamp, and a relay must present exactly it.
+	// The origin publishes hash and expiry as one stamp; a relay must present
+	// exactly that expiry, so a tampered stamp (fresh expiry beside an old
+	// hash) stays uninstallable.
 	if !isOrigin && cred.ClaudeAiOauth.ExpiresAt != chain.ExpiresAt {
 		return nil, fmt.Errorf("relay expiry %d does not match the registry chain's %d", cred.ClaudeAiOauth.ExpiresAt, chain.ExpiresAt)
 	}

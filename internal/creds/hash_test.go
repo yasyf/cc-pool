@@ -10,12 +10,16 @@ func hashCred(access, refresh string) *Credential {
 	c.ClaudeAiOauth.AccessToken = access
 	c.ClaudeAiOauth.RefreshToken = refresh
 	c.ClaudeAiOauth.ExpiresAt = 1_700_000_000_000
+	c.ClaudeAiOauth.Scopes = []string{"user:inference", "user:profile"}
+	c.ClaudeAiOauth.SubscriptionType = "max"
+	c.ClaudeAiOauth.RateLimitTier = "raven"
+	c.ClaudeAiOauth.ClientID = "client-1"
 	return c
 }
 
 // TestAccessHash pins AccessHash's identity semantics: stable across marshal
-// round-trips and refresh-token/metadata changes, changed exactly when the
-// access token changes, and equal between an owned blob and its stripped copy.
+// round-trips, invariant under Strip (the owned/stripped identity the sync
+// design relies on), and changed by every field except the refresh token.
 func TestAccessHash(t *testing.T) {
 	base := hashCred("at", "rt")
 	want := AccessHash(base)
@@ -34,12 +38,9 @@ func TestAccessHash(t *testing.T) {
 		}
 	})
 
-	t.Run("ignores refresh token and metadata", func(t *testing.T) {
-		c := hashCred("at", "rt-other")
-		c.ClaudeAiOauth.ExpiresAt = 42
-		c.ClaudeAiOauth.SubscriptionType = "max"
-		if got := AccessHash(c); got != want {
-			t.Fatalf("hash = %q, want %q (only the access token is hashed)", got, want)
+	t.Run("ignores the refresh token", func(t *testing.T) {
+		if got := AccessHash(hashCred("at", "rt-other")); got != want {
+			t.Fatalf("hash = %q, want %q (the refresh token must not be hashed)", got, want)
 		}
 	})
 
@@ -49,15 +50,27 @@ func TestAccessHash(t *testing.T) {
 		}
 	})
 
-	t.Run("access-token change changes the hash", func(t *testing.T) {
-		if got := AccessHash(hashCred("at-2", "rt")); got == want {
-			t.Fatal("hash unchanged after an access-token change")
+	t.Run("every non-refresh field changes the hash", func(t *testing.T) {
+		mutations := map[string]func(c *Credential){
+			"accessToken":      func(c *Credential) { c.ClaudeAiOauth.AccessToken = "at-2" },
+			"expiresAt":        func(c *Credential) { c.ClaudeAiOauth.ExpiresAt++ },
+			"scopes":           func(c *Credential) { c.ClaudeAiOauth.Scopes = []string{"user:inference"} },
+			"subscriptionType": func(c *Credential) { c.ClaudeAiOauth.SubscriptionType = "pro" },
+			"rateLimitTier":    func(c *Credential) { c.ClaudeAiOauth.RateLimitTier = "default" },
+			"clientId":         func(c *Credential) { c.ClaudeAiOauth.ClientID = "client-2" },
+		}
+		for name, mutate := range mutations {
+			t.Run(name, func(t *testing.T) {
+				c := hashCred("at", "rt")
+				mutate(c)
+				if got := AccessHash(c); got == want {
+					t.Fatalf("hash unchanged after a %s change — the field is not authenticated", name)
+				}
+			})
 		}
 	})
 
-	t.Run("length prefix disambiguates the field boundary from CredentialHash", func(t *testing.T) {
-		// CredentialHash("", "at") must not collide with AccessHash("at"): the
-		// pair hash prefixes both fields.
+	t.Run("no collision with CredentialHash", func(t *testing.T) {
 		if got := CredentialHash(hashCred("at", "")); got == want {
 			t.Fatal("CredentialHash of an RT-less pair collides with AccessHash")
 		}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -380,11 +381,10 @@ func TestFetchCredentialOriginAuthoritativeRelayMustMatch(t *testing.T) {
 	})
 }
 
-// TestFetchCredentialRejectsForgedExpiry pins the expiry pin: AccessHash covers
-// only the access token, so a relay holding the advertised AT could otherwise
-// inflate expiresAt (freezing the peer against every later real rotation). A
-// relay must present exactly the origin-published chain expiry, and every
-// envelope's ExpiresAt must agree with its enclosed credential.
+// TestFetchCredentialRejectsForgedExpiry pins the expiry validation: a relay
+// cannot inflate expiresAt (freezing the peer against every later real
+// rotation) — it must present exactly the origin-published chain expiry — and
+// every envelope's ExpiresAt must agree with its enclosed credential.
 func TestFetchCredentialRejectsForgedExpiry(t *testing.T) {
 	advertised := pullCred("t1", 5_000).Strip()
 	chain := ChainStamp{Origin: "hostA", ExpiresAt: 5_000, Hash: creds.AccessHash(advertised)}
@@ -438,6 +438,38 @@ func TestFetchCredentialRejectsForgedExpiry(t *testing.T) {
 			t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
 		}
 	})
+}
+
+// TestFetchFromPeerRejectsForgedMetadata pins metadata authentication: a relay
+// holding the advertised access token and expiry cannot swap credential
+// metadata — AccessHash covers the whole stripped credential, so a forged blob
+// fails the registry chain-hash match and is rejected.
+func TestFetchFromPeerRejectsForgedMetadata(t *testing.T) {
+	advertised := pullCred("t1", 5_000).Strip()
+	chain := ChainStamp{Origin: "hostA", ExpiresAt: 5_000, Hash: creds.AccessHash(advertised)}
+	forged := *advertised
+	forged.ClaudeAiOauth.SubscriptionType = "enterprise"
+
+	// The envelope is self-consistent — valid access token and expiry, hash
+	// recomputed over the forged blob — so only the registry stamp exposes it.
+	dial := func(peer string) syncservice.Transport {
+		if peer == "hostA" {
+			return failingTransport()
+		}
+		return envelopeTransport(t, &forged, creds.AccessHash(&forged))
+	}
+	_, err := fetchFromPeer(context.Background(), dial, "hostB", "u-1", chain, 0, false)
+	if err == nil || !strings.Contains(err.Error(), "does not match the registry chain") {
+		t.Fatalf("fetchFromPeer err = %v, want the registry-chain mismatch rejection", err)
+	}
+
+	got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB"})
+	if got != nil {
+		t.Fatalf("pulled forged-metadata credential: %+v", got)
+	}
+	if !errors.Is(err, ErrNoPeerCredential) {
+		t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
+	}
 }
 
 // TestFetchCredentialRequiresStrictlyLaterExpiry pins the freshness gate:
