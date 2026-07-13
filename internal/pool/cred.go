@@ -88,8 +88,9 @@ func (m *Manager) MoveCredential(ctx context.Context, a store.Account, target cr
 
 // probeCredentialStores reads every candidate store in ReadCredential's resolution
 // order (Keychain first), recording each outcome instead of stopping at the first
-// hit — MoveCredential also needs the losers' state. win is the freshest clean read
-// (Keychain first on a tie), or nil when every store missed. See ccn doc 935d323.
+// hit — MoveCredential also needs the losers' state. win is the highest-ranked
+// clean read per credOutranks (Keychain first on a tie), or nil when every store
+// missed. See ccn doc 935d323.
 func (m *Manager) probeCredentialStores(a store.Account) ([]credProbe, *credProbe, error) {
 	stores := m.Creds.Stores(a)
 	probes := make([]credProbe, len(stores))
@@ -99,14 +100,7 @@ func (m *Manager) probeCredentialStores(a store.Account) ([]credProbe, *credProb
 		probes[i] = credProbe{store: s, cred: cred, err: err}
 		switch {
 		case err == nil:
-			// Fresher-wins: when more than one backend holds a credential —
-			// transient drift from a cross-session re-login or an interrupted
-			// move — the later-expiring one is the live chain (a fresh login
-			// mints a later expiry; the other copy is the stale shadow). A
-			// blind keychain-first rule could keep the stale copy and, worse,
-			// let cleanup delete the fresh one, signing the account out. The
-			// resolution order (Keychain first) only breaks exact-expiry ties.
-			if winIdx == -1 || cred.Expiry().After(probes[winIdx].cred.Expiry()) {
+			if winIdx == -1 || credOutranks(cred, probes[winIdx].cred) {
 				winIdx = i
 			}
 		case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrUnavailable):
@@ -122,12 +116,24 @@ func (m *Manager) probeCredentialStores(a store.Account) ([]credProbe, *credProb
 	return probes, &probes[winIdx], nil
 }
 
-// alreadyOnTarget finishes a MoveCredential whose (fresher) credential already
-// resolves to the target backend. Nothing moves, but a staler copy on the OTHER
-// backend is deleted: it is the diverged shadow a later headless session would
-// resurrect. Any non-absent, reachable outcome — a parsed credential or a hard
-// read error (corrupt JSON) — counts as presence; content is never compared,
-// because the winner is already the fresher. A copy we cannot reach (an
+// credOutranks reports whether a wins resolution over the incumbent b: an
+// OWNED credential (refresh token present — the refreshable source of truth)
+// always beats a SYNCED replica, which must never win or DropDivergentCopy
+// would delete the live owned chain; within an ownership class the later
+// expiry wins, probe order (Keychain first) breaking exact ties.
+func credOutranks(a, b *creds.Credential) bool {
+	if a.HasRefreshToken() != b.HasRefreshToken() {
+		return a.HasRefreshToken()
+	}
+	return a.Expiry().After(b.Expiry())
+}
+
+// alreadyOnTarget finishes a MoveCredential whose winning credential already
+// resolves to the target backend. Nothing moves, but the losing copy on the
+// OTHER backend is deleted: it is the diverged shadow a later headless session
+// would resurrect. Any non-absent, reachable outcome — a parsed credential or a
+// hard read error (corrupt JSON) — counts as presence; content is never
+// compared, because the winner already outranks it. A copy we cannot reach (an
 // unsearchable Keychain, ErrUnavailable) is left untouched.
 func alreadyOnTarget(probes []credProbe, target creds.Source) (*CredMove, error) {
 	out := &CredMove{From: target, To: target}
@@ -144,10 +150,11 @@ func alreadyOnTarget(probes []credProbe, target creds.Source) (*CredMove, error)
 
 // DropDivergentCopy settles an account on one backend after a cross-session
 // re-login left a stale shadow: it removes any credential copy on the backend
-// OTHER than the one resolution prefers (the fresher). A copy on an unsearchable
-// Keychain (headless) is left untouched — resolution already prefers the fresher
-// copy, so the shadow is harmless until a GUI session can reach it. No credential
-// anywhere, or nothing on the other backend, is a no-op, not an error.
+// OTHER than the one resolution prefers (see credOutranks). A copy on an
+// unsearchable Keychain (headless) is left untouched — resolution already
+// prefers the winner, so the shadow is harmless until a GUI session can reach
+// it. No credential anywhere, or nothing on the other backend, is a no-op,
+// not an error.
 func (m *Manager) DropDivergentCopy(ctx context.Context, a store.Account) error {
 	release, err := m.lockAccount(ctx, a.ID)
 	if err != nil {

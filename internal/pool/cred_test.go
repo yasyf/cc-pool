@@ -436,9 +436,86 @@ func TestReadCredentialRefreshOnlyKeychainWinsByExpiry(t *testing.T) {
 	}
 }
 
+// syncedDatedCred builds a synced (refresh-token-free) credential whose token
+// names it and whose expiry is offset from now.
+func syncedDatedCred(token string, exp time.Duration) *creds.Credential {
+	c := &creds.Credential{}
+	c.ClaudeAiOauth.AccessToken = token
+	c.ClaudeAiOauth.ExpiresAt = time.Now().Add(exp).UnixMilli()
+	return c
+}
+
+// TestReadCredentialOwnershipFirst pins ownership-first resolution: an OWNED
+// credential beats a SYNCED replica regardless of expiry — a later-expiring
+// synced copy must never out-resolve the owned chain, or DropDivergentCopy
+// would delete it — while expiry still breaks ties within an ownership class.
+// A dead-but-owned blob transiently outranking a live synced copy self-heals
+// (the next refresh's invalid_grant tombstones it and the synced copy takes
+// over), so it is no permanent wedge and gets no special case.
+func TestReadCredentialOwnershipFirst(t *testing.T) {
+	cases := []struct {
+		name     string
+		kc, file *creds.Credential
+		wantSrc  creds.Source
+		wantAT   string
+	}{
+		{
+			name:    "owned keychain beats later-expiring synced file",
+			kc:      datedCred("own-kc", time.Hour),
+			file:    syncedDatedCred("sync-file", 4*time.Hour),
+			wantSrc: creds.SourceKeychain,
+			wantAT:  "own-kc",
+		},
+		{
+			name:    "owned file beats later-expiring synced keychain",
+			kc:      syncedDatedCred("sync-kc", 4*time.Hour),
+			file:    datedCred("own-file", time.Hour),
+			wantSrc: creds.SourceFile,
+			wantAT:  "own-file",
+		},
+		{
+			name:    "owned vs owned picks the later expiry",
+			kc:      datedCred("own-kc", time.Hour),
+			file:    datedCred("own-file", 4*time.Hour),
+			wantSrc: creds.SourceFile,
+			wantAT:  "own-file",
+		},
+		{
+			name:    "synced vs synced picks the later expiry",
+			kc:      syncedDatedCred("sync-kc", 4*time.Hour),
+			file:    syncedDatedCred("sync-file", time.Hour),
+			wantSrc: creds.SourceKeychain,
+			wantAT:  "sync-kc",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc-rank", KeychainAccount: "user"}
+			fk := credstest.NewFake()
+			fk.Put(a.KeychainService, a.KeychainAccount, tc.kc)
+			if err := creds.WriteFileCredential(dir, tc.file); err != nil {
+				t.Fatal(err)
+			}
+			m := &Manager{Creds: fk, LockDir: t.TempDir()}
+
+			cred, src, err := m.ReadCredential(a)
+			if err != nil {
+				t.Fatalf("ReadCredential: %v", err)
+			}
+			if src != tc.wantSrc {
+				t.Errorf("source = %v, want %v", src, tc.wantSrc)
+			}
+			if cred.ClaudeAiOauth.AccessToken != tc.wantAT {
+				t.Errorf("resolved access token = %q, want %q", cred.ClaudeAiOauth.AccessToken, tc.wantAT)
+			}
+		})
+	}
+}
+
 // TestDropDivergentCopy pins relogin's consolidation: the backend other than the
-// one resolution prefers (the fresher) is dropped, an unreachable headless
-// keychain is left alone, and a single-backend or empty account is a no-op.
+// one resolution prefers (owned first, then fresher) is dropped, an unreachable
+// headless keychain is left alone, and a single-backend or empty account is a no-op.
 func TestDropDivergentCopy(t *testing.T) {
 	errDelete := errors.New("file delete exploded")
 	cases := []struct {
@@ -461,6 +538,18 @@ func TestDropDivergentCopy(t *testing.T) {
 			name:     "fresher file drops the stale keychain",
 			seedKC:   datedCred("kc", time.Hour),
 			seedFile: datedCred("file", 4*time.Hour),
+			wantKC:   false, wantFile: true,
+		},
+		{
+			name:     "owned keychain survives a later-expiring synced file",
+			seedKC:   datedCred("kc", time.Hour),
+			seedFile: syncedDatedCred("file", 4*time.Hour),
+			wantKC:   true, wantFile: false,
+		},
+		{
+			name:     "owned file survives a later-expiring synced keychain",
+			seedKC:   syncedDatedCred("kc", 4*time.Hour),
+			seedFile: datedCred("file", time.Hour),
 			wantKC:   false, wantFile: true,
 		},
 		{

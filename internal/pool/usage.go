@@ -49,7 +49,7 @@ func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within 
 
 // ReadCredential resolves a's credential from whichever backend holds it, reading
 // every candidate store (the Keychain claude prefers, then the plaintext
-// .credentials.json). On drift the fresher one wins (see probeCredentialStores) and
+// .credentials.json). On drift ownership then freshness decides (see credOutranks) and
 // its Source is returned. When every store misses, creds.ErrUnavailable outranks
 // creds.ErrNotFound. See ccn doc 935d323.
 func (m *Manager) ReadCredential(a store.Account) (*creds.Credential, creds.Source, error) {
