@@ -7,7 +7,10 @@ import (
 	"time"
 )
 
-// ErrNoAccessToken rejects persisting a credential with an empty accessToken.
+// ErrNoAccessToken rejects persisting a refresh-only credential (blank
+// accessToken beside a live refreshToken) — the corruption shape claude cannot
+// serve from. A both-empty tombstone is claude's own dead-chain convention and
+// stays writable (the strip of a dead refresh-only blob produces one).
 var ErrNoAccessToken = errors.New("refusing to persist a credential with no accessToken")
 
 // ErrNoTokens rejects a credential blob that holds neither an access nor a refresh token — nothing to use and nothing to refresh, so re-login is required.
@@ -86,7 +89,7 @@ func (c *Credential) Marshal() ([]byte, error) {
 }
 
 func (c *Credential) validateForWrite() error {
-	if c.ClaudeAiOauth.AccessToken == "" {
+	if c.ClaudeAiOauth.AccessToken == "" && c.ClaudeAiOauth.RefreshToken != "" {
 		return ErrNoAccessToken
 	}
 	return nil

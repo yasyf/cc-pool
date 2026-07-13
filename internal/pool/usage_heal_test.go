@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,26 +79,46 @@ func TestEnsureFreshTokenHealsRefreshOnlyBlob(t *testing.T) {
 	}
 }
 
-// TestEnsureFreshTokenRefreshOnlyRevoked pins that a refresh-only blob whose
-// refresh token is revoked surfaces ErrNeedsLogin (there is nothing left to heal
-// from), rather than a bare transient error — and that the invalid_grant strip
-// never fires on it: stripping an access-token-less blob would write a
-// tombstone, which cc-pool must never do.
+// TestEnsureFreshTokenRefreshOnlyRevoked pins the demotion of a refresh-only
+// blob whose refresh token the server confirmed dead: needs-login surfaces and
+// the strip leaves a both-empty tombstone (ErrNoTokens → needs-login) — a dead
+// blob left "owned" would block peer-heal forever — which a subsequent
+// InstallSyncedCredential heals.
 func TestEnsureFreshTokenRefreshOnlyRevoked(t *testing.T) {
 	fk := credstest.NewFake()
 	m, a := newHealManager(t, fk, fakeOAuthRevoked{})
-	fk.Put(a.KeychainService, a.KeychainAccount, refreshOnly("rt-dead", time.Now().Add(time.Hour)))
+	blob := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"","refreshToken":"rt-dead","expiresAt":%d,"subscriptionType":"max"}}`,
+		time.Now().Add(time.Hour).UnixMilli())
+	if err := os.WriteFile(creds.FileCredentialPath(a.ConfigDir), []byte(blob), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	_, _, err := m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
 	if !errors.Is(err, ErrNeedsLogin) {
 		t.Fatalf("err = %v, want ErrNeedsLogin", err)
 	}
-	if fk.WriteCount() != 0 {
-		t.Fatalf("writes = %d, want 0 (stripping a refresh-only blob would tombstone it)", fk.WriteCount())
+	raw, err := os.ReadFile(creds.FileCredentialPath(a.ConfigDir))
+	if err != nil {
+		t.Fatal(err)
 	}
-	stored, ok := fk.Get(a.KeychainService, a.KeychainAccount)
-	if !ok || stored.ClaudeAiOauth.RefreshToken != "rt-dead" {
-		t.Fatalf("stored blob = %+v, want the refresh-only blob untouched", stored)
+	if strings.Contains(string(raw), "refreshToken") || strings.Contains(string(raw), "rt-dead") {
+		t.Fatalf("stored blob still carries the dead refresh token: %s", raw)
+	}
+	if _, rerr := (creds.FileStore{ConfigDir: a.ConfigDir}).Read(); !errors.Is(rerr, creds.ErrNoTokens) {
+		t.Fatalf("stripped blob reads back as %v, want the ErrNoTokens tombstone", rerr)
+	}
+	_, _, err = m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
+	if !errors.Is(err, ErrNeedsLogin) || !errors.Is(err, creds.ErrNoTokens) {
+		t.Fatalf("tombstone classifies as %v, want ErrNeedsLogin naming creds.ErrNoTokens", err)
+	}
+
+	installed, err := m.InstallSyncedCredential(context.Background(), a, synced("at-peer", time.Now().Add(time.Hour)))
+	if err != nil || !installed {
+		t.Fatalf("InstallSyncedCredential over the tombstone = (%v, %v), want a heal", installed, err)
+	}
+	healed, _, err := m.ReadCredential(a)
+	if err != nil || healed.ClaudeAiOauth.AccessToken != "at-peer" {
+		t.Fatalf("post-heal credential = (%+v, %v), want the peer's synced copy", healed, err)
 	}
 }
 

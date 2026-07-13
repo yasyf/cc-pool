@@ -12,9 +12,11 @@ func mkCred(access, refresh string) *Credential {
 	return c
 }
 
-// TestWriteFuncRejectsEmptyAccessToken pins the write-side guard: neither backend
-// persists a blank-accessToken blob. The Keychain funnel is only checked to reject
-// before any security(1) exec, so the test never touches the real Keychain.
+// TestWriteFuncRejectsEmptyAccessToken pins the write-side guard: neither
+// backend persists the refresh-only corruption shape (blank accessToken beside
+// a live refreshToken), while a deliberate both-empty tombstone — the strip of
+// a dead refresh-only chain — persists. The Keychain funnel is only checked to
+// reject before any security(1) exec, so the test never touches the real Keychain.
 func TestWriteFuncRejectsEmptyAccessToken(t *testing.T) {
 	empty := mkCred("", "rt-live") // refresh present, access blank — the account-1 failure shape
 	valid := mkCred("at-live", "rt-live")
@@ -29,7 +31,7 @@ func TestWriteFuncRejectsEmptyAccessToken(t *testing.T) {
 			{name: "empty access token rejected", cred: empty, wantErr: ErrNoAccessToken, wantStored: false},
 			{name: "populated access token persisted", cred: valid, wantErr: nil, wantStored: true},
 			{name: "synced (access-only) blob persisted", cred: mkCred("at-synced", ""), wantErr: nil, wantStored: true},
-			{name: "tombstone (both empty) rejected", cred: mkCred("", ""), wantErr: ErrNoAccessToken, wantStored: false},
+			{name: "tombstone (both empty) persisted", cred: mkCred("", ""), wantErr: nil, wantStored: true},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {

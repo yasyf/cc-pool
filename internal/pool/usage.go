@@ -134,13 +134,14 @@ func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within 
 	return refreshed, src, true, nil
 }
 
-// stripSpentRefreshToken demotes a server-confirmed dead chain to the synced
-// shape: the access token stays servable until expiry and a refresh-token-free
-// blob is pull-healable, where an owned one never is. Only invalid_grant
-// strips — a plain 401 may be transient. Best-effort: the CAS aborts if a
-// concurrent login/rotation landed, and needs-login covers any failure.
+// stripSpentRefreshToken demotes a server-confirmed dead chain to a
+// refresh-token-free blob, which is pull-healable where an owned one never is:
+// an access token stays servable until expiry; a refresh-only blob becomes a
+// tombstone (ErrNoTokens → needs-login). Only invalid_grant strips — a plain
+// 401 may be transient. Best-effort: the CAS aborts if a concurrent
+// login/rotation landed, and needs-login covers any failure.
 func (m *Manager) stripSpentRefreshToken(a store.Account, src creds.Source, cred *creds.Credential, re *oauth.RefreshError) {
-	if !re.InvalidGrant() || cred.ClaudeAiOauth.AccessToken == "" {
+	if !re.InvalidGrant() {
 		return
 	}
 	if err := m.writeCredCAS(a, src, cred, cred.Strip()); err != nil {
