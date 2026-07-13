@@ -46,8 +46,8 @@ type CredentialManager interface {
 	// creds.ErrNotFound when the account holds none.
 	ReadCredential(a store.Account) (*creds.Credential, creds.Source, error)
 	// InstallSyncedCredential installs a pulled credential under the account lock
-	// when it wins the lineage-aware re-check; reports whether it landed.
-	InstallSyncedCredential(ctx context.Context, a store.Account, cred *creds.Credential, chainParentHash string) (bool, error)
+	// when it wins the owned-precedence/freshness re-check; reports whether it landed.
+	InstallSyncedCredential(ctx context.Context, a store.Account, cred *creds.Credential) (bool, error)
 }
 
 // LocalIndex maps each local account's Claude accountUuid to its store row id,
@@ -240,7 +240,7 @@ func (d *Driver) pullAndInstall(ctx context.Context, a store.Account, v AccountV
 	case cred == nil:
 		return false, true, nil
 	}
-	ok, err := d.deps.Cred.InstallSyncedCredential(ctx, a, cred, v.Chain.ParentHash)
+	ok, err := d.deps.Cred.InstallSyncedCredential(ctx, a, cred)
 	if err != nil {
 		if errors.Is(err, creds.ErrUnavailable) {
 			return false, true, nil

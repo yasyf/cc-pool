@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/creds"
@@ -10,7 +11,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// syncCred builds a distinct credential per suffix with the given expiry.
+// syncCred builds a distinct owned credential per suffix with the given expiry.
 func syncCred(suffix string, expiresAt int64) *creds.Credential {
 	c := &creds.Credential{}
 	c.ClaudeAiOauth.AccessToken = "at-" + suffix
@@ -19,15 +20,22 @@ func syncCred(suffix string, expiresAt int64) *creds.Credential {
 	return c
 }
 
+// envCred builds a synced envelope (no refresh token) per suffix.
+func envCred(suffix string, expiresAt int64) *creds.Credential {
+	c := &creds.Credential{}
+	c.ClaudeAiOauth.AccessToken = "at-" + suffix
+	c.ClaudeAiOauth.ExpiresAt = expiresAt
+	return c
+}
+
 // installFixture is a Manager over a fake credential seam with a counting
 // OnCredWrite hook, plus the account under test.
 type installFixture struct {
-	m          *Manager
-	fk         *credstest.Fake
-	a          store.Account
-	hookCalls  int
-	hookCred   *creds.Credential
-	hookParent string
+	m         *Manager
+	fk        *credstest.Fake
+	a         store.Account
+	hookCalls int
+	hookCred  *creds.Credential
 }
 
 func newInstallFixture(t *testing.T) *installFixture {
@@ -41,40 +49,85 @@ func newInstallFixture(t *testing.T) *installFixture {
 		t.Fatal(err)
 	}
 	f.m = &Manager{Store: st, Creds: f.fk, LockDir: t.TempDir()}
-	f.m.OnCredWrite = func(_ store.Account, cr *creds.Credential, parentHash string) error {
+	f.m.OnCredWrite = func(_ store.Account, cr *creds.Credential, _ string) error {
 		f.hookCalls++
 		f.hookCred = cr
-		f.hookParent = parentHash
 		return nil
 	}
 	return f
 }
 
-// TestInstallSyncedCredentialFresherWins pins the locked fresher-wins
-// re-check: only strictly later expiries install, equal/earlier skip with no
-// write or hook, and a credential-less account installs to the Keychain.
-func TestInstallSyncedCredentialFresherWins(t *testing.T) {
+// TestInstallSyncedCredentialOwnedPrecedence pins the install gates: an owned
+// local blob is NEVER overwritten (even long expired), an absent or
+// tombstoned local always installs, a synced local yields only to a strictly
+// fresher expiry, and an envelope that still carries a refresh token is
+// refused outright.
+func TestInstallSyncedCredentialOwnedPrecedence(t *testing.T) {
+	const incomingExpiry = 5_000
+	tombstone := `{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"max"}}`
+
 	cases := map[string]struct {
-		localExpiry    int64 // 0: no local credential seeded
-		incomingExpiry int64
-		wantInstalled  bool
+		local         *creds.Credential // nil: no local credential
+		localTomb     bool              // seed a claude tombstone in the file store
+		incoming      *creds.Credential
+		wantInstalled bool
+		wantErrIs     error
 	}{
-		"strictly fresher installs":     {localExpiry: 1_000, incomingExpiry: 1_001, wantInstalled: true},
-		"equal expiry skips":            {localExpiry: 1_000, incomingExpiry: 1_000},
-		"staler skips":                  {localExpiry: 1_000, incomingExpiry: 999},
-		"no local credential installs":  {incomingExpiry: 1, wantInstalled: true},
-		"much fresher over stale local": {localExpiry: 1, incomingExpiry: 9_000_000, wantInstalled: true},
+		"absent local installs": {
+			incoming: envCred("in", incomingExpiry), wantInstalled: true,
+		},
+		"tombstoned local installs": {
+			localTomb: true,
+			incoming:  envCred("in", incomingExpiry), wantInstalled: true,
+		},
+		"owned fresher local skips": {
+			local:    syncCred("own", 9_000),
+			incoming: envCred("in", incomingExpiry),
+		},
+		"owned local skips even when long expired": {
+			local:    syncCred("own", 1), // 1970: provably expired
+			incoming: envCred("in", incomingExpiry),
+		},
+		"synced staler local yields": {
+			local:    envCred("old", 1_000),
+			incoming: envCred("in", incomingExpiry), wantInstalled: true,
+		},
+		"synced equal-expiry local skips": {
+			local:    envCred("old", incomingExpiry),
+			incoming: envCred("in", incomingExpiry),
+		},
+		"synced fresher local skips": {
+			local:    envCred("old", 9_000),
+			incoming: envCred("in", incomingExpiry),
+		},
+		"refresh-token-bearing envelope refused": {
+			local:     syncCred("own", 1_000),
+			incoming:  syncCred("in", incomingExpiry),
+			wantErrIs: ErrEnvelopeCarriesSecret,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			f := newInstallFixture(t)
-			local := syncCred("local", tc.localExpiry)
-			if tc.localExpiry != 0 {
-				f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, local)
+			if tc.local != nil {
+				f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, tc.local)
 			}
-			incoming := syncCred("incoming", tc.incomingExpiry)
+			if tc.localTomb {
+				if err := os.WriteFile(creds.FileCredentialPath(f.a.ConfigDir), []byte(tombstone), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 
-			installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, incoming, "")
+			installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, tc.incoming)
+			if tc.wantErrIs != nil {
+				if !errors.Is(err, tc.wantErrIs) {
+					t.Fatalf("err = %v, want errors.Is(%v)", err, tc.wantErrIs)
+				}
+				if installed || f.fk.WriteCount() != 0 || f.hookCalls != 0 {
+					t.Fatalf("refused install acted (installed=%v writes=%d hooks=%d)", installed, f.fk.WriteCount(), f.hookCalls)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("InstallSyncedCredential: %v", err)
 			}
@@ -84,101 +137,30 @@ func TestInstallSyncedCredentialFresherWins(t *testing.T) {
 
 			got, ok := f.fk.Get(f.a.KeychainService, f.a.KeychainAccount)
 			if tc.wantInstalled {
-				if !ok || got.ClaudeAiOauth.AccessToken != incoming.ClaudeAiOauth.AccessToken {
+				if !ok || got.ClaudeAiOauth.AccessToken != tc.incoming.ClaudeAiOauth.AccessToken {
 					t.Fatalf("keychain holds %+v, want the incoming credential", got)
 				}
-				if f.hookCalls != 1 {
-					t.Fatalf("OnCredWrite fired %d times, want 1", f.hookCalls)
+				if got.HasRefreshToken() {
+					t.Fatal("installed blob carries a refresh token")
 				}
-				if f.hookCred != incoming {
-					t.Fatalf("OnCredWrite got credential %p, want the installed one %p", f.hookCred, incoming)
+				if f.hookCalls != 1 || f.hookCred != tc.incoming {
+					t.Fatalf("OnCredWrite calls=%d cred=%p, want 1 with the installed credential", f.hookCalls, f.hookCred)
 				}
 				return
 			}
-			if f.hookCalls != 0 {
-				t.Fatalf("OnCredWrite fired %d times on a skip, want 0", f.hookCalls)
+			if f.hookCalls != 0 || f.fk.WriteCount() != 0 {
+				t.Fatalf("skip acted (writes=%d hooks=%d), want none", f.fk.WriteCount(), f.hookCalls)
 			}
-			if tc.localExpiry != 0 {
-				if f.fk.WriteCount() != 0 {
-					t.Fatalf("keychain writes = %d on a skip, want 0", f.fk.WriteCount())
-				}
-				if !ok || got.ClaudeAiOauth.AccessToken != local.ClaudeAiOauth.AccessToken {
+			if tc.local != nil {
+				if !ok || got.ClaudeAiOauth.AccessToken != tc.local.ClaudeAiOauth.AccessToken {
 					t.Fatalf("keychain holds %+v after a skip, want the local credential untouched", got)
+				}
+				if got.ClaudeAiOauth.RefreshToken != tc.local.ClaudeAiOauth.RefreshToken {
+					t.Fatalf("local refresh token = %q, want %q untouched", got.ClaudeAiOauth.RefreshToken, tc.local.ClaudeAiOauth.RefreshToken)
 				}
 			}
 		})
 	}
-}
-
-// TestInstallSyncedCredentialLineage pins the lineage arms under clock skew: a
-// pull matching the recorded parent is refused despite a later expiry, a child
-// installs despite an earlier one, and an identical chain is a clean skip.
-func TestInstallSyncedCredentialLineage(t *testing.T) {
-	c2 := syncCred("c2", 2_000) // the spent parent, expiry skewed AHEAD
-	c3 := syncCred("c3", 1_500) // the live child, expiry skewed behind
-
-	t.Run("refuses re-install of the recorded parent despite later expiry", func(t *testing.T) {
-		f := newInstallFixture(t)
-		f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, c3)
-		if err := f.m.Store.SetChainHashes(f.a.ID, creds.CredentialHash(c3), creds.CredentialHash(c2)); err != nil {
-			t.Fatal(err)
-		}
-
-		installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, c2, "")
-		if err != nil {
-			t.Fatalf("InstallSyncedCredential: %v", err)
-		}
-		if installed {
-			t.Fatal("installed = true; the pull is our own parent — expiry skew must not resurrect it")
-		}
-		if f.fk.WriteCount() != 0 || f.hookCalls != 0 {
-			t.Fatalf("refused install wrote (writes=%d hooks=%d), want none", f.fk.WriteCount(), f.hookCalls)
-		}
-		if got, _ := f.fk.Get(f.a.KeychainService, f.a.KeychainAccount); got.ClaudeAiOauth.AccessToken != c3.ClaudeAiOauth.AccessToken {
-			t.Fatalf("keychain holds %+v, want the live child untouched", got)
-		}
-	})
-
-	t.Run("installs a child of the current chain despite earlier expiry", func(t *testing.T) {
-		f := newInstallFixture(t)
-		f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, c2)
-
-		installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, c3, creds.CredentialHash(c2))
-		if err != nil {
-			t.Fatalf("InstallSyncedCredential: %v", err)
-		}
-		if !installed {
-			t.Fatal("installed = false; a child of the current chain must land despite expiry skew")
-		}
-		if got, _ := f.fk.Get(f.a.KeychainService, f.a.KeychainAccount); got.ClaudeAiOauth.AccessToken != c3.ClaudeAiOauth.AccessToken {
-			t.Fatalf("keychain holds %+v, want the child", got)
-		}
-		if f.hookCalls != 1 || f.hookParent != creds.CredentialHash(c2) {
-			t.Fatalf("hook calls=%d parent=%q, want 1 with hash(c2)", f.hookCalls, f.hookParent)
-		}
-		// The install recorded its own lineage.
-		row, err := f.m.Store.GetAccount(f.a.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if row.CredHash != creds.CredentialHash(c3) || row.CredParentHash != creds.CredentialHash(c2) {
-			t.Fatalf("chain columns = (%q,%q), want (hash(c3),hash(c2))", row.CredHash, row.CredParentHash)
-		}
-	})
-
-	t.Run("identical chain skips", func(t *testing.T) {
-		f := newInstallFixture(t)
-		f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, c3)
-
-		same := syncCred("c3", 1_500)
-		installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, same, creds.CredentialHash(c2))
-		if err != nil {
-			t.Fatalf("InstallSyncedCredential: %v", err)
-		}
-		if installed || f.fk.WriteCount() != 0 || f.hookCalls != 0 {
-			t.Fatalf("identical chain re-installed (installed=%v writes=%d hooks=%d)", installed, f.fk.WriteCount(), f.hookCalls)
-		}
-	})
 }
 
 // TestInstallSyncedCredentialFollowsBackendResolution pins that the install
@@ -186,13 +168,13 @@ func TestInstallSyncedCredentialLineage(t *testing.T) {
 // write and the Keychain is never touched.
 func TestInstallSyncedCredentialFollowsBackendResolution(t *testing.T) {
 	f := newInstallFixture(t)
-	local := syncCred("local", 1_000)
+	local := envCred("local", 1_000)
 	if err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Write(local); err != nil {
 		t.Fatalf("seed file credential: %v", err)
 	}
-	incoming := syncCred("incoming", 2_000)
+	incoming := envCred("incoming", 2_000)
 
-	installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, incoming, "")
+	installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, incoming)
 	if err != nil {
 		t.Fatalf("InstallSyncedCredential: %v", err)
 	}
@@ -222,9 +204,9 @@ func TestInstallSyncedCredentialFollowsBackendResolution(t *testing.T) {
 func TestInstallSyncedCredentialRefusesUnknowableKeychain(t *testing.T) {
 	f := newInstallFixture(t)
 	f.fk.KeychainFaults = credstest.Faults{Read: creds.ErrUnavailable}
-	incoming := syncCred("incoming", 5_000)
+	incoming := envCred("incoming", 5_000)
 
-	installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, incoming, "")
+	installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, incoming)
 	if installed {
 		t.Fatal("installed = true, want false")
 	}
@@ -239,14 +221,14 @@ func TestInstallSyncedCredentialRefusesUnknowableKeychain(t *testing.T) {
 	}
 }
 
-// TestInstallSyncedCredentialConcurrentRotationWins pins the never-write-staler
-// re-check across the lock-free window: a local rotation landing before the
-// install wins, and the now-staler pull is not written.
+// TestInstallSyncedCredentialConcurrentRotationWins pins the owned-precedence
+// re-check across the lock-free window: a local login landing before the
+// install wins outright — the local chain is owned, so the pull is skipped.
 func TestInstallSyncedCredentialConcurrentRotationWins(t *testing.T) {
 	f := newInstallFixture(t)
-	f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, syncCred("old", 1_000))
-	// Verified lock-free against expiry 1_000, so 2_000 looked strictly fresher.
-	incoming := syncCred("incoming", 2_000)
+	f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, envCred("old", 1_000))
+	// Verified lock-free against a synced expiry 1_000, so 2_000 looked strictly fresher.
+	incoming := envCred("incoming", 2_000)
 	rotated := syncCred("rotated", 3_000)
 
 	release, err := f.m.lockAccount(context.Background(), f.a.ID)
@@ -259,11 +241,11 @@ func TestInstallSyncedCredentialConcurrentRotationWins(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, incoming, "")
+		installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, incoming)
 		done <- result{installed, err}
 	}()
-	// While the install is (or will be) blocked on the account lock, a live
-	// session rotates the chain to something fresher than the incoming pull.
+	// While the install is (or will be) blocked on the account lock, a local
+	// login mints an owned chain.
 	f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, rotated)
 	release()
 
@@ -272,7 +254,7 @@ func TestInstallSyncedCredentialConcurrentRotationWins(t *testing.T) {
 		t.Fatalf("InstallSyncedCredential: %v", res.err)
 	}
 	if res.installed {
-		t.Fatal("installed = true; the concurrent rotation must win")
+		t.Fatal("installed = true; the concurrent login must win")
 	}
 	got, ok := f.fk.Get(f.a.KeychainService, f.a.KeychainAccount)
 	if !ok || got.ClaudeAiOauth.AccessToken != rotated.ClaudeAiOauth.AccessToken {
@@ -322,15 +304,15 @@ func (c swapCreds) Stores(a store.Account) []creds.Store {
 // install as a clean skip, the login's chain untouched.
 func TestInstallSyncedCredentialCASAbortsOnUnderfootLogin(t *testing.T) {
 	f := newInstallFixture(t)
-	old := syncCred("old", 1_000)
+	old := envCred("old", 1_000) // synced, so the gate reaches the CAS
 	login := syncCred("login", 2_000)
 	f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, old)
 	ks := &swapStore{Store: f.fk.Store(f.a, creds.SourceKeychain), old: old, swapped: login}
 	f.m.Creds = swapCreds{Fake: f.fk, ks: ks}
 
-	incoming := syncCred("incoming", 5_000) // strictly fresher than old: gate passes
+	incoming := envCred("incoming", 5_000) // strictly fresher than old: gate passes
 
-	installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, incoming, "")
+	installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, incoming)
 	if err != nil {
 		t.Fatalf("a CAS abort must be a clean skip, got: %v", err)
 	}
@@ -345,5 +327,28 @@ func TestInstallSyncedCredentialCASAbortsOnUnderfootLogin(t *testing.T) {
 	}
 	if f.hookCalls != 0 {
 		t.Fatalf("OnCredWrite fired %d times on an aborted install", f.hookCalls)
+	}
+}
+
+// TestWriteCredCASWritesThroughTombstone pins the CAS behavior the
+// install-over-tombstone path depends on: a prior read that fails to parse
+// (claude tombstone) or misses entirely must not block the write.
+func TestWriteCredCASWritesThroughTombstone(t *testing.T) {
+	f := newInstallFixture(t)
+	tombstone := `{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}`
+	if err := os.WriteFile(creds.FileCredentialPath(f.a.ConfigDir), []byte(tombstone), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	next := envCred("healed", 4_000)
+	if err := f.m.writeCredCAS(f.a, creds.SourceFile, "", next, ""); err != nil {
+		t.Fatalf("writeCredCAS over a tombstone = %v, want write-through", err)
+	}
+	got, err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Read()
+	if err != nil {
+		t.Fatalf("read back after tombstone overwrite: %v", err)
+	}
+	if got.ClaudeAiOauth.AccessToken != "at-healed" {
+		t.Fatalf("file backend holds %q, want at-healed", got.ClaudeAiOauth.AccessToken)
 	}
 }

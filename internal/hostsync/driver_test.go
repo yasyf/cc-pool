@@ -75,9 +75,8 @@ func (s *fakeDriverStore) SetAccountLabel(id int, label string) error {
 }
 
 type credInstall struct {
-	id         int
-	expiresAt  int64
-	parentHash string
+	id        int
+	expiresAt int64
 }
 
 // fakeCred is an in-memory CredentialManager: it reports a per-account current
@@ -112,8 +111,8 @@ func (c *fakeCred) ReadCredential(a store.Account) (*creds.Credential, creds.Sou
 	return cr, creds.SourceKeychain, nil
 }
 
-func (c *fakeCred) InstallSyncedCredential(_ context.Context, a store.Account, cred *creds.Credential, chainParentHash string) (bool, error) {
-	c.installs = append(c.installs, credInstall{a.ID, cred.ClaudeAiOauth.ExpiresAt, chainParentHash})
+func (c *fakeCred) InstallSyncedCredential(_ context.Context, a store.Account, cred *creds.Credential) (bool, error) {
+	c.installs = append(c.installs, credInstall{a.ID, cred.ClaudeAiOauth.ExpiresAt})
 	if c.installErr != nil {
 		return false, c.installErr
 	}
@@ -335,8 +334,8 @@ func TestDriverReconcile(t *testing.T) {
 				if len(h.pull.calls) != 1 || h.pull.calls[0].localExp != 1000 {
 					t.Fatalf("pull calls = %+v, want one with localExp 1000", h.pull.calls)
 				}
-				if len(h.cred.installs) != 1 || h.cred.installs[0] != (credInstall{1, 2000, ""}) {
-					t.Fatalf("installs = %+v, want one (1,2000,\"\")", h.cred.installs)
+				if len(h.cred.installs) != 1 || h.cred.installs[0] != (credInstall{1, 2000}) {
+					t.Fatalf("installs = %+v, want one (1,2000)", h.cred.installs)
 				}
 			},
 		},
@@ -361,8 +360,8 @@ func TestDriverReconcile(t *testing.T) {
 				if len(h.pull.calls) != 1 || h.pull.calls[0].localHash != localHash() {
 					t.Fatalf("pull calls = %+v, want one with localHash %q", h.pull.calls, localHash())
 				}
-				if len(h.cred.installs) != 1 || h.cred.installs[0] != (credInstall{1, 1500, localHash()}) {
-					t.Fatalf("installs = %+v, want one (1,1500,parent)", h.cred.installs)
+				if len(h.cred.installs) != 1 || h.cred.installs[0] != (credInstall{1, 1500}) {
+					t.Fatalf("installs = %+v, want one (1,1500)", h.cred.installs)
 				}
 			},
 		},
