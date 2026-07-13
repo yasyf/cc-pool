@@ -121,6 +121,32 @@ func TestSyncHealDecidesEachTick(t *testing.T) {
 		}
 	})
 
+	t.Run("resample 429 arms the rate-limit gates with Retry-After", func(t *testing.T) {
+		s, a, _ := revokedServer(t)
+		fo := s.m.OAuth.(*fakeOAuth)
+		fo.rlByAT = map[string]bool{"at-peer": true}
+		fo.retryAfter = 30 * time.Minute
+		s.syncPull = pullHealing(s, a, time.Now().Add(time.Hour).UnixMilli(), false)
+
+		s.pollOnce(t.Context())
+		l := s.led.peek(poolRateLimitPolicy, poolResource)
+		if l == nil {
+			t.Fatal("the healed token's 429 must arm the pool gate, not be swallowed by the resample")
+		}
+		if got := l.nextDue.Sub(l.lastAt); got != 30*time.Minute {
+			t.Fatalf("pool gate window = %v, want the 429's 30m Retry-After", got)
+		}
+		if !s.poolRateLimited() {
+			t.Fatal("the pool gate must hold immediately after the resample's 429")
+		}
+		if got := s.acctRateLimitStreak(a.ConfigDir); got != 1 {
+			t.Fatalf("acct 429 streak = %d, want 1", got)
+		}
+		if !s.pollGated(a) {
+			t.Fatal("the account must back off after the resample's 429")
+		}
+	})
+
 	t.Run("pull with nothing fresher flags", func(t *testing.T) {
 		s, a, _ := revokedServer(t)
 		pulled := false

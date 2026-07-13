@@ -512,7 +512,14 @@ func (s *Server) resampleAfterHeal(ctx context.Context, a store.Account) bool {
 	}
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	_, _, _, err = s.m.SampleUsage(cctx, a, pool.SampleOpts{})
+	_, rateLimited, retryAfter, err := s.m.SampleUsage(cctx, a, pool.SampleOpts{})
+	// The outer poll booked only the pre-heal auth error, so the resample must
+	// arm/clear the 429 gates itself — same bookkeeping as pollAccount.
+	if rateLimited {
+		s.recordRateLimit(a.ConfigDir, retryAfter, time.Now())
+	} else if err == nil {
+		s.clearRateLimit(a.ConfigDir)
+	}
 	return err == nil
 }
 
