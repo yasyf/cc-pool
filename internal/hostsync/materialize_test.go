@@ -474,6 +474,60 @@ func TestMaterializeRejectedEnvelopeThroughRealPullerReleases(t *testing.T) {
 	}
 }
 
+// TestMaterializeInstallNeverClobbersConcurrentLogin pins the write-time slot
+// guard: an owned login landing AFTER the pre-flight retained-slot check (here
+// mid-pull, when a valid envelope is about to install) is never overwritten —
+// the pass releases with ErrCredentialChangedUnderfoot and the login survives.
+func TestMaterializeInstallNeverClobbersConcurrentLogin(t *testing.T) {
+	s, m, fk, rec := newMaterializeService(t)
+	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	owned := cred("at-login", "rt-login")
+	owned.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
+	pull := func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
+		// The released add's still-running login completes mid-pull, after the
+		// pre-flight slot check but before the install write.
+		fk.Put(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel(), owned)
+		return freshEnvelope("at-peer"), nil
+	}
+	oauthAccount := json.RawMessage(`{"accountUuid":"u-race","emailAddress":"race@example.com"}`)
+
+	res, err := s.Materialize(context.Background(), materializeVal("u-race", "race@example.com", oauthAccount), []string{"hostB"}, pull, materializeManifest)
+	if !errors.Is(err, pool.ErrCredentialChangedUnderfoot) {
+		t.Fatalf("err = %v, want errors.Is ErrCredentialChangedUnderfoot", err)
+	}
+	if res != (MaterializeResult{}) {
+		t.Fatalf("result = %+v, want zero on abort", res)
+	}
+	// The owned login is intact — neither overwritten nor deleted by AbandonAdd.
+	got, ok := fk.Get(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel())
+	if !ok || got.ClaudeAiOauth.RefreshToken != "rt-login" || got.ClaudeAiOauth.AccessToken != "at-login" {
+		t.Fatalf("slot credential = %+v ok=%v, want the owned login intact", got, ok)
+	}
+	// Release, not abandon: dir kept, reservation freed, no row, no nudge.
+	if _, statErr := os.Stat(pool.AccountDir(1)); statErr != nil {
+		t.Fatalf("account dir stat err = %v, want kept", statErr)
+	}
+	n, rerr := m.Store.ReserveAccountIndex()
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if n != 1 {
+		t.Fatalf("next reserved index = %d, want the released 1", n)
+	}
+	accounts, lerr := m.Store.ListAccounts()
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if len(accounts) != 0 {
+		t.Fatalf("accounts = %+v, want none", accounts)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("nudge calls = %v, want none", rec.calls)
+	}
+}
+
 // TestMaterializeNeverOverwritesRetainedCredential pins the interrupted-add
 // guard: a kept dir whose slot retains a usable credential (from a prior
 // ReleaseAdd) aborts before writing identity or pulling — the retained

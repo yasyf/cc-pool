@@ -41,7 +41,8 @@ type MaterializeResult struct {
 // Materialize creates the local account for a peer-added entry without any
 // interactive login. An entry with no oauthAccount defers; failures after
 // PrepareAdd roll the dir and reservation back via AbandonAdd, except retained
-// slot state and rejected envelopes, which only release the reservation.
+// or unprovable slot state and rejected envelopes, which only release the
+// reservation.
 func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []string, pull PullCredential, manifestPath string) (MaterializeResult, error) {
 	if v.UUID == "" {
 		return MaterializeResult{}, fmt.Errorf("hostsync: Materialize requires a UUID")
@@ -115,7 +116,12 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	}
 
 	fileFallback, err := s.installEnvelope(p, env)
-	if err != nil {
+	switch {
+	// A credential landed (or a backend became unprovable) under the pull:
+	// AbandonAdd would delete it — release keeps it.
+	case errors.Is(err, pool.ErrCredentialChangedUnderfoot), errors.Is(err, pool.ErrCredentialUnverifiable):
+		return release(fmt.Errorf("materialize %s: install credential: %w", v.UUID, err))
+	case err != nil:
 		return abandon(fmt.Errorf("materialize %s: install credential: %w", v.UUID, err))
 	}
 
@@ -144,16 +150,27 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	}, nil
 }
 
-// slotRetainsCredential reports whether a kept dir's credential slot still
-// holds a credential (tombstones excluded); an unprovable backend fails closed.
-func (s *Service) slotRetainsCredential(p *pool.PendingAdd) (bool, error) {
-	acct := store.Account{ConfigDir: p.ConfigDir, KeychainService: p.KeychainService, KeychainAccount: creds.AccountLabel()}
+// slotAccount is the pending slot's credential coordinates; Discover adopts
+// whatever account label a prior login wrote, and an absent or unsearchable
+// Keychain keeps the default label (the store probes rule on it separately).
+func (s *Service) slotAccount(p *pool.PendingAdd) (store.Account, error) {
+	acct := store.Account{ID: p.Index, ConfigDir: p.ConfigDir, KeychainService: p.KeychainService, KeychainAccount: creds.AccountLabel()}
 	account, err := s.M.Creds.Discover(p.KeychainService)
 	switch {
 	case err == nil:
 		acct.KeychainAccount = account
-	case !errors.Is(err, creds.ErrNotFound):
-		return false, fmt.Errorf("probe retained credential for %s: %w", p.ConfigDir, err)
+	case !errors.Is(err, creds.ErrNotFound) && !errors.Is(err, creds.ErrUnavailable):
+		return store.Account{}, fmt.Errorf("probe credential slot for %s: %w", p.ConfigDir, err)
+	}
+	return acct, nil
+}
+
+// slotRetainsCredential reports whether a kept dir's credential slot still
+// holds a credential (tombstones excluded); an unprovable backend fails closed.
+func (s *Service) slotRetainsCredential(p *pool.PendingAdd) (bool, error) {
+	acct, err := s.slotAccount(p)
+	if err != nil {
+		return false, err
 	}
 	for _, st := range s.M.Creds.Stores(acct) {
 		_, err := st.Read()
@@ -171,7 +188,12 @@ func (s *Service) slotRetainsCredential(p *pool.PendingAdd) (bool, error) {
 // installEnvelope writes the pulled stripped credential to the Keychain,
 // falling back to the file store when the login keychain is unsearchable (the
 // returned bool flags the fallback). It writes directly — no row exists yet
-// for OnCredWrite.
+// for OnCredWrite — but only after re-proving both backends empty at write
+// time, the same owned-precedence guard as pool.InstallSyncedCredential: a
+// credential that landed since the pre-flight check (a released `ccp add`'s
+// still-running login) aborts with ErrCredentialChangedUnderfoot, and a
+// backend that cannot be proven empty fails closed with
+// ErrCredentialUnverifiable.
 func (s *Service) installEnvelope(p *pool.PendingAdd, env *creds.Credential) (bool, error) {
 	switch {
 	case env.HasRefreshToken():
@@ -179,23 +201,31 @@ func (s *Service) installEnvelope(p *pool.PendingAdd, env *creds.Credential) (bo
 	case !env.Synced():
 		return false, fmt.Errorf("install credential envelope: %w", pool.ErrEnvelopeNoAccessToken)
 	}
-	acct := store.Account{
-		ConfigDir:       p.ConfigDir,
-		KeychainService: p.KeychainService,
-		KeychainAccount: creds.AccountLabel(),
+	acct, err := s.slotAccount(p)
+	if err != nil {
+		return false, err
 	}
 	kc := s.M.Creds.Store(acct, creds.SourceKeychain)
-	_, probeErr := kc.Read()
-	target := kc
-	fileFallback := false
+	file := s.M.Creds.Store(acct, creds.SourceFile)
+	target, fileFallback := kc, false
+	_, kcErr := kc.Read()
 	switch {
-	case probeErr == nil, errors.Is(probeErr, creds.ErrNotFound):
-		// Keychain reachable (item already present or provably absent): install there.
-	case errors.Is(probeErr, creds.ErrUnavailable):
-		target = s.M.Creds.Store(acct, creds.SourceFile)
-		fileFallback = true
+	case errors.Is(kcErr, creds.ErrNotFound), errors.Is(kcErr, creds.ErrNoTokens):
+		// Provably empty (or a tombstone): install there.
+	case errors.Is(kcErr, creds.ErrUnavailable):
+		target, fileFallback = file, true
+	case kcErr != nil:
+		return false, fmt.Errorf("%w: %s: %w", pool.ErrCredentialUnverifiable, kc, kcErr)
 	default:
-		return false, fmt.Errorf("probe keychain %s: %w", p.KeychainService, probeErr)
+		return false, fmt.Errorf("%w: %s holds a credential", pool.ErrCredentialChangedUnderfoot, kc)
+	}
+	_, fErr := file.Read()
+	switch {
+	case errors.Is(fErr, creds.ErrNotFound), errors.Is(fErr, creds.ErrNoTokens):
+	case fErr != nil:
+		return false, fmt.Errorf("%w: %s: %w", pool.ErrCredentialUnverifiable, file, fErr)
+	default:
+		return false, fmt.Errorf("%w: %s holds a credential", pool.ErrCredentialChangedUnderfoot, file)
 	}
 	if err := target.Write(env); err != nil {
 		return false, fmt.Errorf("write credential to %s: %w", target, err)
