@@ -3,13 +3,11 @@
 package hostsync
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/yasyf/synckit/cregistry"
 )
@@ -53,21 +51,43 @@ type AccountValue struct {
 	Chain ChainStamp `json:"chain"`
 }
 
-// UnmarshalJSON fails fast on unknown fields, so a schema-v1 registry (its
-// holder/lease/parentHash keys carried semantics no v2 host enforces)
-// surfaces as ErrRegistrySchema instead of being silently half-read.
+// UnmarshalJSON fails fast on schema-v1 marker keys — holder/lease on the
+// account, holder/lease/parentHash on the chain stamp, whose semantics no v2
+// host enforces — as ErrRegistrySchema. Genuinely unknown fields from newer
+// schemas are ignored (forward compatibility).
 func (v *AccountValue) UnmarshalJSON(b []byte) error {
-	type plain AccountValue // methodless alias: avoids UnmarshalJSON recursion
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
-	var p plain
-	if err := dec.Decode(&p); err != nil {
-		if strings.Contains(err.Error(), "unknown field") {
-			return fmt.Errorf("%w: %s", ErrRegistrySchema, err)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	if err := rejectV1Keys(raw, "holder", "lease"); err != nil {
+		return err
+	}
+	if chain, ok := raw["chain"]; ok {
+		var craw map[string]json.RawMessage
+		if err := json.Unmarshal(chain, &craw); err != nil {
+			return err
 		}
+		if err := rejectV1Keys(craw, "holder", "lease", "parentHash"); err != nil {
+			return err
+		}
+	}
+	type plain AccountValue // methodless alias: avoids UnmarshalJSON recursion
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
 		return err
 	}
 	*v = AccountValue(p)
+	return nil
+}
+
+// rejectV1Keys returns ErrRegistrySchema when any schema-v1 marker key is present.
+func rejectV1Keys(raw map[string]json.RawMessage, keys ...string) error {
+	for _, k := range keys {
+		if _, ok := raw[k]; ok {
+			return fmt.Errorf("%w (schema-v1 field %q)", ErrRegistrySchema, k)
+		}
+	}
 	return nil
 }
 

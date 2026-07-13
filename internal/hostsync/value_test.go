@@ -183,6 +183,23 @@ func TestSchemaGateRejectsV1Registry(t *testing.T) {
 		}
 	})
 
+	t.Run("unknown forward-compat fields parse fine", func(t *testing.T) {
+		blob := `{
+			"uuid": "u1", "email": "a@x.com", "label": "work",
+			"oauthAccount": {"accountUuid": "u1"},
+			"chain": {"origin": "host-a", "expiresAt": 1, "hash": "h1", "rotatedAt": 2, "futureChainField": true},
+			"futureField": {"x": 1}
+		}`
+		var got AccountValue
+		if err := json.Unmarshal([]byte(blob), &got); err != nil {
+			t.Fatalf("v3-style unknown fields failed the gate: %v", err)
+		}
+		want := ChainStamp{Origin: "host-a", ExpiresAt: 1, Hash: "h1", RotatedAt: 2}
+		if got.UUID != "u1" || got.Chain != want {
+			t.Fatalf("parsed value = %+v, want uuid u1 with chain %+v", got, want)
+		}
+	})
+
 	t.Run("syntax error is not the schema sentinel", func(t *testing.T) {
 		var v AccountValue
 		err := json.Unmarshal([]byte(`{not json`), &v)
