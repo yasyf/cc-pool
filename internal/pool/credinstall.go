@@ -23,9 +23,11 @@ var ErrEnvelopeNoAccessToken = errors.New("credential envelope carries no access
 // under owned precedence: an owned local blob (refresh token present) on ANY
 // backend is never overwritten or shadowed, even when expired; an absent or
 // tombstoned local always installs; a synced local yields only to a strictly
-// fresher expiry. The write goes through writeCredCAS, so an underfoot
-// `claude /login` aborts as a clean skip. Reports whether it installed; a
-// precedence or freshness skip is a normal outcome.
+// fresher expiry. A backend whose owned-state cannot be proven (a read error
+// other than not-found/tombstone) aborts the install with
+// ErrCredentialUnverifiable. The write goes through writeCredCAS, so an
+// underfoot `claude /login` aborts as a clean skip. Reports whether it
+// installed; a precedence or freshness skip is a normal outcome.
 func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, cred *creds.Credential) (bool, error) {
 	switch {
 	case cred.HasRefreshToken():
@@ -56,11 +58,17 @@ func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, 
 	default:
 		return false, err
 	}
-	// The CAS re-read guards only src: an owned chain landing on the OTHER
-	// backend would be hidden by fresher-wins resolution and later deleted as
-	// a stray, so re-check every backend — owned anywhere wins outright.
+	// The CAS re-read guards only src, so re-check every backend: owned
+	// anywhere wins outright, and a backend not PROVEN not-owned (any read
+	// error but ErrNotFound/ErrNoTokens) fails closed — an unreadable slot
+	// may hold an owned chain.
 	for _, s := range m.Creds.Stores(a) {
-		if cur, rerr := s.Read(); rerr == nil && cur.HasRefreshToken() {
+		cur, rerr := s.Read()
+		switch {
+		case errors.Is(rerr, creds.ErrNotFound), errors.Is(rerr, creds.ErrNoTokens):
+		case rerr != nil:
+			return false, fmt.Errorf("%w: %s: %w", ErrCredentialUnverifiable, s, rerr)
+		case cur.HasRefreshToken():
 			return false, nil
 		}
 	}

@@ -408,6 +408,52 @@ func TestInstallSyncedCredentialSkipsOnOwnedOtherBackend(t *testing.T) {
 	}
 }
 
+// TestInstallSyncedCredentialFailsClosedOnUnverifiableBackend pins the
+// fail-closed owned re-check: a backend read outcome other than proven-absent
+// (ErrNotFound) or a tombstone (ErrNoTokens) may hide an owned chain, so the
+// install aborts with ErrCredentialUnverifiable — nothing written, the synced
+// local untouched. The proceed side (all backends proven not-owned) is pinned
+// by "absent local installs" and "tombstoned local installs" above.
+func TestInstallSyncedCredentialFailsClosedOnUnverifiableBackend(t *testing.T) {
+	errOpaque := errors.New("keychain query exploded")
+	cases := map[string]struct {
+		probeErr, recheckErr error // keychain read outcomes: initial probe, owned re-check
+	}{
+		"unavailable keychain": {probeErr: creds.ErrUnavailable, recheckErr: creds.ErrUnavailable},
+		"keychain degrading after the probe": {probeErr: creds.ErrNotFound, recheckErr: errOpaque},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newInstallFixture(t)
+			if err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Write(envCred("synced", 1_000)); err != nil {
+				t.Fatal(err)
+			}
+			ks := &swapStore{Store: f.fk.Store(f.a, creds.SourceKeychain), oldErr: tc.probeErr, swappedErr: tc.recheckErr}
+			f.m.Creds = swapCreds{Fake: f.fk, ks: ks}
+
+			installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, envCred("incoming", 5_000))
+			if installed {
+				t.Fatal("installed = true; an unverifiable backend must abort the install")
+			}
+			if !errors.Is(err, ErrCredentialUnverifiable) {
+				t.Fatalf("err = %v, want errors.Is(ErrCredentialUnverifiable)", err)
+			}
+			if !errors.Is(err, tc.recheckErr) {
+				t.Fatalf("err = %v, want errors.Is(%v) so the caller can defer", err, tc.recheckErr)
+			}
+			if ks.reads < 2 {
+				t.Fatalf("owned re-check never happened (reads = %d)", ks.reads)
+			}
+			if f.fk.WriteCount() != 0 || f.hookCalls != 0 {
+				t.Fatalf("aborted install acted (writes=%d hooks=%d), want none", f.fk.WriteCount(), f.hookCalls)
+			}
+			if got, rerr := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Read(); rerr != nil || got.ClaudeAiOauth.AccessToken != "at-synced" {
+				t.Fatalf("file backend = (%+v, %v), want the synced copy untouched", got, rerr)
+			}
+		})
+	}
+}
+
 // TestInstallSyncedCredentialAbortsOnLoginDuringInstall pins the pre-write
 // re-probe against the racing login: the precedence read proves the keychain
 // empty and picks the synced file copy, a `claude /login` lands an owned
