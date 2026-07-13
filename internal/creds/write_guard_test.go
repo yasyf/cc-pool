@@ -28,6 +28,8 @@ func TestWriteFuncRejectsEmptyAccessToken(t *testing.T) {
 		}{
 			{name: "empty access token rejected", cred: empty, wantErr: ErrNoAccessToken, wantStored: false},
 			{name: "populated access token persisted", cred: valid, wantErr: nil, wantStored: true},
+			{name: "synced (access-only) blob persisted", cred: mkCred("at-synced", ""), wantErr: nil, wantStored: true},
+			{name: "tombstone (both empty) rejected", cred: mkCred("", ""), wantErr: ErrNoAccessToken, wantStored: false},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {

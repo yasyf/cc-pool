@@ -17,9 +17,12 @@ var ErrNoTokens = errors.New("credential blob has no access or refresh token")
 // wrapper-key names are reverse-engineered from the binary and MUST match
 // byte-for-byte or Claude rejects the credential.
 type OAuth struct {
-	AccessToken      string   `json:"accessToken"`
-	RefreshToken     string   `json:"refreshToken"`
-	ExpiresAt        int64    `json:"expiresAt"` // Unix epoch MILLISECONDS
+	AccessToken string `json:"accessToken"`
+	// RefreshToken's omitempty is load-bearing: claude treats a PRESENT empty
+	// refreshToken as a dead chain (tombstone) but an ABSENT one as a plain
+	// access-token-only blob, so stripped blobs must omit the field entirely.
+	RefreshToken string `json:"refreshToken,omitempty"`
+	ExpiresAt    int64  `json:"expiresAt"` // Unix epoch MILLISECONDS
 	Scopes           []string `json:"scopes,omitempty"`
 	SubscriptionType string   `json:"subscriptionType,omitempty"`
 	RateLimitTier    string   `json:"rateLimitTier,omitempty"`
@@ -51,10 +54,26 @@ func (c *Credential) Expired() bool {
 	return c.ExpiresWithin(0)
 }
 
-// HasRefreshToken reports whether a usable refresh token is present. Claude
-// blanks it on a dead token, so empty means re-login is required.
+// HasRefreshToken reports whether a refresh token is present. Presence marks
+// an OWNED chain — this host minted it and only it may refresh; absence marks
+// a synced copy (or, with the access token also empty, a tombstone).
 func (c *Credential) HasRefreshToken() bool {
 	return c.ClaudeAiOauth.RefreshToken != ""
+}
+
+// Synced reports whether this is a synced (peer) copy: an access token to
+// serve with but no refresh token — usable until expiry, never refreshable here.
+func (c *Credential) Synced() bool {
+	return c.ClaudeAiOauth.AccessToken != "" && c.ClaudeAiOauth.RefreshToken == ""
+}
+
+// Strip returns a copy with the refresh token cleared — the shape synced to
+// peers, so the long-lived secret never leaves the origin host. Marshal omits
+// the cleared field entirely (see the OAuth.RefreshToken tag).
+func (c *Credential) Strip() *Credential {
+	out := *c
+	out.ClaudeAiOauth.RefreshToken = ""
+	return &out
 }
 
 // Marshal renders the credential as the exact JSON bytes Claude expects.

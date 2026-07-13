@@ -16,6 +16,14 @@ func CredentialHash(c *Credential) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// AccessHash digests the access token alone (length-prefixed SHA-256): the
+// identity of a stripped (synced) blob, which never carries a refresh token.
+func AccessHash(c *Credential) string {
+	h := sha256.New()
+	hashField(h, c.ClaudeAiOauth.AccessToken)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // hashField writes s length-prefixed into h so field boundaries are unambiguous.
 func hashField(h hash.Hash, s string) {
 	var n [8]byte
