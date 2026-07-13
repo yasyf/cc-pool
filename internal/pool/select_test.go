@@ -84,7 +84,7 @@ func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 			}
 
 			m := &Manager{Store: st, LockDir: t.TempDir()}
-			in, _, good, err := m.scoreInput(a, nil, now)
+			in, _, good, _, err := m.scoreInput(a, nil, now)
 			if err != nil {
 				t.Fatalf("scoreInput: %v", err)
 			}

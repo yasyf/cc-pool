@@ -105,7 +105,7 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	scopedModelByID := make(map[int]string, len(accts))
 	for _, a := range accts {
 		byID[a.ID] = a
-		in, _, good, err := m.scoreInput(a, sessions, now)
+		in, _, good, _, err := m.scoreInput(a, sessions, now)
 		if err != nil {
 			return nil, err
 		}
@@ -187,13 +187,14 @@ func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessio
 }
 
 // scoreInput assembles a score.Input for one account from cached state, the
-// recent samples (newest first) for forecasts, and the last known-good sample
-// (nil if never sampled cleanly).
-func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now time.Time) (score.Input, []store.UsageSample, *store.UsageSample, error) {
+// recent samples (newest first) for forecasts, the last known-good sample (nil
+// if never sampled cleanly), and whether a needs-login is an awaiting-origin
+// (synced peer copy) rather than an owned dead chain.
+func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now time.Time) (score.Input, []store.UsageSample, *store.UsageSample, bool, error) {
 	in := score.Input{AccountID: a.ID}
 	samples, err := m.Store.UsageSamplesSince(a.ID, now.Add(-forecast.Burn7dWindow))
 	if err != nil {
-		return in, nil, nil, err
+		return in, nil, nil, false, err
 	}
 	var good *store.UsageSample
 	if len(samples) > 0 {
@@ -206,7 +207,7 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 		// 0% for a rate-limited account. HasUsage gates on the good sample too. See ccn
 		// doc 36b05ef.
 		if g, ok, gerr := m.Store.LatestGoodUsageSample(a.ID); gerr != nil {
-			return in, nil, nil, fmt.Errorf("latest good usage sample for account %d: %w", a.ID, gerr)
+			return in, nil, nil, false, fmt.Errorf("latest good usage sample for account %d: %w", a.ID, gerr)
 		} else if ok {
 			good = &g
 			in.HasUsage = true
@@ -224,10 +225,12 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 	if r, ok, _ := m.Store.LastRefresh(a.ID); ok && !r.OK {
 		in.RefreshFailed = true
 	}
+	awaitingOrigin := false
 	if h, err := m.Store.GetAuthHealth(a.ID); err == nil && h.NeedsLogin {
 		in.NeedsLogin = true
+		awaitingOrigin = h.Kind == store.AuthKindAwaitingOrigin
 	}
-	return in, samples, good, nil
+	return in, samples, good, awaitingOrigin, nil
 }
 
 // PreflightRefresh refreshes the chosen account's token when it expires within

@@ -25,6 +25,10 @@ type Snapshot struct {
 	RateLimited    bool
 	Exhausted      bool // a window is fully used and its reset is still pending
 	NeedsLogin     bool // refresh token gone/revoked; only `ccp login` recovers it
+	// AwaitingOrigin narrows NeedsLogin: this is a synced peer copy whose token
+	// expired, so it recovers when the origin's rotation syncs over (or a local
+	// `ccp login`). Display-only — scoring treats it identically to NeedsLogin.
+	AwaitingOrigin bool
 	Stale          bool
 	Resets5h       time.Time
 	Resets7d       time.Time
@@ -77,14 +81,16 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 	inputs := make([]score.Input, len(accts))
 	samples := make([][]store.UsageSample, len(accts))
 	goods := make([]*store.UsageSample, len(accts))
+	awaiting := make([]bool, len(accts))
 	for i, a := range accts {
-		in, recent, good, err := m.scoreInput(a, sessions, now)
+		in, recent, good, awaitingOrigin, err := m.scoreInput(a, sessions, now)
 		if err != nil {
 			return nil, err
 		}
 		inputs[i] = in
 		samples[i] = recent
 		goods[i] = good
+		awaiting[i] = awaitingOrigin
 	}
 	results := make(map[int]score.Result)
 	for _, r := range score.Rank(inputs, now) {
@@ -113,6 +119,7 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 			RateLimited:     in.RateLimited,
 			Exhausted:       r.Exhausted,
 			NeedsLogin:      r.NeedsLogin,
+			AwaitingOrigin:  awaiting[i],
 			Stale:           r.Stale,
 			Resets5h:        in.Resets5h,
 			Resets7d:        in.Resets7d,
