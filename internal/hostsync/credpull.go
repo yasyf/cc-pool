@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
@@ -118,19 +119,41 @@ func FetchCredential(ctx context.Context, dial DialTransport, uuid string, chain
 	return nil, fmt.Errorf("fetch credential for %s: %w: %w", uuid, ErrNoPeerCredential, errors.Join(attempts...))
 }
 
-// fetchOrder returns the peers to try in order: the origin first, then the
-// remaining peers, with empties and duplicates dropped.
+// fetchOrder returns the dial targets in order. peers is the TRUSTED configured
+// mesh; origin rides the synced registry and is attacker-controllable, so it may
+// only PRIORITIZE a peer that is already a mesh member — it is never itself a new
+// dial target. A non-member origin (a registry-injected "exec:<cmd>", or any host
+// not in the configured mesh) is dropped, so a synced value can never introduce a
+// peer to dial. Empties, duplicates, and implausible identities are dropped.
 func fetchOrder(origin string, peers []string) []string {
-	order := make([]string, 0, len(peers)+1)
-	seen := map[string]bool{"": true}
-	for _, p := range append([]string{origin}, peers...) {
-		if seen[p] {
+	trusted := make(map[string]bool, len(peers))
+	for _, p := range peers {
+		if plausiblePeer(p) {
+			trusted[p] = true
+		}
+	}
+	order := make([]string, 0, len(peers))
+	seen := map[string]bool{}
+	if trusted[origin] {
+		order = append(order, origin)
+		seen[origin] = true
+	}
+	for _, p := range peers {
+		if seen[p] || !trusted[p] {
 			continue
 		}
 		seen[p] = true
 		order = append(order, p)
 	}
 	return order
+}
+
+// plausiblePeer rejects a peer/origin string that can't name a real dial target:
+// empty, or carrying a NUL or line break (a registry field is one line, and no
+// ssh target or sim exec: peer contains these). A cheap trust-boundary guard atop
+// the trusted-set intersection.
+func plausiblePeer(s string) bool {
+	return s != "" && !strings.ContainsAny(s, "\x00\r\n")
 }
 
 // fetchFromPeer runs one bounded attempt against peer, verifying the parsed

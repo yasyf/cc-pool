@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -17,8 +18,13 @@ import (
 const RemoteServeCmd = "cc-pool sync rpc-serve"
 
 // execPeerPrefix marks a peer served by a local shell command instead of ssh —
-// cc-pool's own convention, for the two-host sim harness.
+// cc-pool's own convention, enabled only for the two-host sim harness.
 const execPeerPrefix = "exec:"
+
+// envExecPeer gates the exec: transport (sim-only). Unset in production, so an
+// `exec:<cmd>` peer is treated as an ssh hostname, never `sh -c`; any non-empty
+// value enables it.
+const envExecPeer = "CCP_SYNC_EXEC_PEER"
 
 // getStateTimeout bounds one peer registry read; a slow peer is treated as
 // down for the pass. A var so tests shrink it.
@@ -31,14 +37,26 @@ type stateGetter interface {
 	Close() error
 }
 
-// PeerTransport opens a transport to peer — `exec:<cmd>` runs `sh -c <cmd>`
-// locally, anything else is ssh-stdio driving RemoteServeCmd; the shared dialer
-// for the registry fetch and the credential pull.
+// PeerTransport opens a transport to peer — an `exec:<cmd>` peer runs
+// `sh -c <cmd>` locally ONLY when envExecPeer is set (sim harness); otherwise,
+// and for every other peer, it is ssh-stdio driving RemoteServeCmd. The shared
+// dialer for the registry fetch and the credential pull.
 func PeerTransport(peer string) syncservice.Transport {
-	if cmd, ok := strings.CutPrefix(peer, execPeerPrefix); ok {
+	if cmd, ok := execPeerCommand(peer); ok {
 		return syncservice.Stdio("sh", "-c", cmd)
 	}
 	return syncservice.SSHStdio(peer, RemoteServeCmd)
+}
+
+// execPeerCommand reports the local shell command an exec: peer names, but only
+// when the sim-only exec: transport is enabled. In production (envExecPeer
+// unset) it always reports false, so a registry-injected `exec:<cmd>` never
+// reaches a shell.
+func execPeerCommand(peer string) (string, bool) {
+	if os.Getenv(envExecPeer) == "" {
+		return "", false
+	}
+	return strings.CutPrefix(peer, execPeerPrefix)
 }
 
 // SSHFetcher reads a peer's registry read-only for the pull-merge; a per-peer

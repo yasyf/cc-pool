@@ -148,10 +148,37 @@ func TestSSHFetcherDeadline(t *testing.T) {
 	}
 }
 
+// TestExecPeerCommandGate pins the sim-only exec: gate: only with envExecPeer set
+// does an exec: peer name a local shell command. Unset (production), an exec:
+// peer is never a shell command, so PeerTransport dials it as an ssh host —
+// never sh -c — and a registry-injected "exec:<cmd>" can't reach a shell.
+func TestExecPeerCommandGate(t *testing.T) {
+	t.Run("disabled in production", func(t *testing.T) {
+		t.Setenv(envExecPeer, "")
+		if cmd, ok := execPeerCommand("exec:touch /tmp/pwned"); ok {
+			t.Fatalf("execPeerCommand = (%q, true) with the gate unset; want no shell command", cmd)
+		}
+	})
+	t.Run("enabled for the sim", func(t *testing.T) {
+		t.Setenv(envExecPeer, "1")
+		cmd, ok := execPeerCommand("exec:touch /tmp/x")
+		if !ok || cmd != "touch /tmp/x" {
+			t.Fatalf(`execPeerCommand = (%q, %v), want ("touch /tmp/x", true)`, cmd, ok)
+		}
+	})
+	t.Run("non-exec peer is never a shell command", func(t *testing.T) {
+		t.Setenv(envExecPeer, "1")
+		if cmd, ok := execPeerCommand("you@desktop"); ok {
+			t.Fatalf("execPeerCommand = (%q, true) for an ssh host; want false", cmd)
+		}
+	})
+}
+
 // TestPeerTransportExecServesRegistry pins cc-pool's exec: peer convention
 // through the real dial: a local `sh -c` command serves the registry through
 // syncservice's real framing, int64 stamps intact.
 func TestPeerTransportExecServesRegistry(t *testing.T) {
+	t.Setenv(envExecPeer, "1") // exec: peers are sim-only; enable for this test
 	const big = int64(math.MaxInt64) - 5
 	reg := cregistry.New[AccountValue]()
 	reg.Add("u1", AccountValue{

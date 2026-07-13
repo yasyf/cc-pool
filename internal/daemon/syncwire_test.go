@@ -288,6 +288,7 @@ func TestServerSessionsBusy(t *testing.T) {
 // end to end through the PRODUCTION dial path: a second wired daemon serves
 // its registry and credential, reached via `exec:nc -U <sock>`.
 func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
+	t.Setenv("CCP_SYNC_EXEC_PEER", "1") // exec: peers are sim-only; enable for this test
 	// Peer B: a fully wired server with one synced account and its credential.
 	b, ctxB := newWireServer(t)
 	if err := b.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {

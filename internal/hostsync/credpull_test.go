@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -337,7 +339,7 @@ func TestFetchCredentialOriginAuthoritativeRelayMustMatch(t *testing.T) {
 			}
 			return serving(t, advertised)
 		}
-		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB"})
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostA", "hostB"})
 		if err != nil {
 			t.Fatalf("FetchCredential: %v", err)
 		}
@@ -351,7 +353,7 @@ func TestFetchCredentialOriginAuthoritativeRelayMustMatch(t *testing.T) {
 
 	t.Run("origin staler than local is rejected", func(t *testing.T) {
 		dial := func(peer string) syncservice.Transport { return serving(t, advertised) }
-		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 6_000, []string{"hostB"})
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 6_000, []string{"hostA", "hostB"})
 		if got != nil {
 			t.Fatalf("pulled %+v, want nil — origin authority never overrides freshness", got)
 		}
@@ -371,7 +373,7 @@ func TestFetchCredentialOriginAuthoritativeRelayMustMatch(t *testing.T) {
 				return serving(t, advertised)
 			}
 		}
-		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB", "hostC"})
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostA", "hostB", "hostC"})
 		if err != nil {
 			t.Fatalf("FetchCredential: %v", err)
 		}
@@ -398,7 +400,7 @@ func TestFetchCredentialRejectsForgedExpiry(t *testing.T) {
 			}
 			return envelopeTransport(t, &forged, creds.AccessHash(&forged))
 		}
-		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB"})
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostA", "hostB"})
 		if got != nil {
 			t.Fatalf("pulled forged-expiry credential: %+v", got)
 		}
@@ -414,7 +416,7 @@ func TestFetchCredentialRejectsForgedExpiry(t *testing.T) {
 			}
 			return envelopeTransport(t, advertised, creds.AccessHash(advertised))
 		}
-		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB"})
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostA", "hostB"})
 		if err != nil {
 			t.Fatalf("FetchCredential: %v", err)
 		}
@@ -463,7 +465,7 @@ func TestFetchFromPeerRejectsForgedMetadata(t *testing.T) {
 		t.Fatalf("fetchFromPeer err = %v, want the registry-chain mismatch rejection", err)
 	}
 
-	got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB"})
+	got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostA", "hostB"})
 	if got != nil {
 		t.Fatalf("pulled forged-metadata credential: %+v", got)
 	}
@@ -560,7 +562,7 @@ func TestFetchCredentialAllPeersUnreachable(t *testing.T) {
 			dialed = append(dialed, peer)
 			return failingTransport()
 		}
-		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB"})
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostA", "hostB"})
 		if got != nil {
 			t.Fatalf("pulled credential = %+v, want nil", got)
 		}
@@ -619,7 +621,7 @@ func TestFetchCredentialPerPeerTimeout(t *testing.T) {
 	}
 
 	start := time.Now()
-	got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"fast"})
+	got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"slow", "fast"})
 	if err != nil {
 		t.Fatalf("FetchCredential: %v", err)
 	}
@@ -631,5 +633,70 @@ func TestFetchCredentialPerPeerTimeout(t *testing.T) {
 	}
 	if !hang.closed {
 		t.Fatal("hung transport was not closed")
+	}
+}
+
+// TestFetchOrderTrustedSetOnly pins the RCE-class structural guard: fetchOrder
+// only ever yields dial targets drawn from the trusted configured peers. A
+// registry-controlled origin may PRIORITIZE a peer already in the mesh, but a
+// non-member origin — a "exec:<cmd>" injection or any unconfigured host — is
+// never a dial target, so a synced value can't introduce a new peer to dial.
+func TestFetchOrderTrustedSetOnly(t *testing.T) {
+	cases := map[string]struct {
+		origin string
+		peers  []string
+		want   []string
+	}{
+		"member origin is prioritized first": {origin: "hostA", peers: []string{"hostB", "hostA"}, want: []string{"hostA", "hostB"}},
+		"non-member origin is dropped":        {origin: "hostZ", peers: []string{"hostA", "hostB"}, want: []string{"hostA", "hostB"}},
+		"exec injection origin is dropped":    {origin: "exec:touch /tmp/pwned", peers: []string{"hostA"}, want: []string{"hostA"}},
+		"empty origin just orders peers":      {origin: "", peers: []string{"hostA", "hostB"}, want: []string{"hostA", "hostB"}},
+		"duplicate and empty peers dropped":   {origin: "hostA", peers: []string{"hostA", "", "hostA", "hostB"}, want: []string{"hostA", "hostB"}},
+		"no peers yields nothing to dial":     {origin: "exec:evil", peers: nil, want: []string{}},
+		"implausible newline peer dropped":    {origin: "hostA", peers: []string{"hostA", "host\nB"}, want: []string{"hostA"}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := fetchOrder(tc.origin, tc.peers)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("fetchOrder(%q, %v) = %v, want %v", tc.origin, tc.peers, got, tc.want)
+			}
+			trusted := map[string]bool{}
+			for _, p := range tc.peers {
+				trusted[p] = true
+			}
+			for _, p := range got {
+				if !trusted[p] {
+					t.Fatalf("fetchOrder yielded %q, not a trusted configured peer %v", p, tc.peers)
+				}
+			}
+		})
+	}
+}
+
+// TestRegistryOriginNeverShellExecuted is the RCE regression, end to end through
+// the REAL PeerTransport with the sim exec: transport ENABLED — so if the
+// registry-injected origin "exec:touch <sentinel>" were dialed, sh -c would run
+// and create the sentinel. It doesn't: fetchOrder drops the non-member origin,
+// so no sentinel appears. Reverting the fetchOrder trusted-set filter dials the
+// injected origin and the sentinel is created — the test fails.
+func TestRegistryOriginNeverShellExecuted(t *testing.T) {
+	t.Setenv(envExecPeer, "1")
+	prev := FetchTimeout
+	FetchTimeout = 2 * time.Second
+	t.Cleanup(func() { FetchTimeout = prev })
+
+	sentinel := filepath.Join(t.TempDir(), "pwned")
+	origin := execPeerPrefix + "touch " + sentinel // the registry-injected RCE payload
+	chain := ChainStamp{Origin: origin, ExpiresAt: 9_999, Hash: "h"}
+
+	// The trusted configured mesh is a single exec: peer that fails; the injected
+	// origin is NOT a member.
+	_, err := FetchCredential(context.Background(), PeerTransport, "u-1", chain, 0, []string{execPeerPrefix + "false"})
+	if !errors.Is(err, ErrNoPeerCredential) {
+		t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
+	}
+	if _, statErr := os.Stat(sentinel); statErr == nil {
+		t.Fatalf("sentinel %s was created — the registry-injected exec: origin was shell-executed", sentinel)
 	}
 }

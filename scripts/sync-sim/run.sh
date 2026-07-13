@@ -155,6 +155,7 @@ hrun() {
     CLAUDE_POOL_SECURITY_BIN="$BIN/fake-security" \
     CLAUDE_POOL_TOKEN_URL="$(oauth_token_url "$h")" \
     CLAUDE_POOL_USAGE_URL="$(oauth_usage_url "$h")" \
+    CCP_SYNC_EXEC_PEER=1 \
     HTTPS_PROXY="http://127.0.0.1:1" HTTP_PROXY="http://127.0.0.1:1" NO_PROXY="127.0.0.1,localhost" \
     PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" \
     USER="$SIMUSER" \
@@ -166,7 +167,7 @@ hrun() {
 # own fake-oauth) so the spawned bridge resolves HOST's world, not the caller's.
 exec_peer() {
   local h="$1"
-  printf 'exec:env -i HOME=%s XDG_CONFIG_HOME=%s TMPDIR=%s CLAUDE_POOL_SECURITY_BIN=%s CLAUDE_POOL_TOKEN_URL=%s CLAUDE_POOL_USAGE_URL=%s HTTPS_PROXY=http://127.0.0.1:1 HTTP_PROXY=http://127.0.0.1:1 NO_PROXY=127.0.0.1,localhost PATH=%s:/usr/bin:/bin:/usr/sbin:/sbin USER=%s %s sync rpc-serve' \
+  printf 'exec:env -i HOME=%s XDG_CONFIG_HOME=%s TMPDIR=%s CLAUDE_POOL_SECURITY_BIN=%s CLAUDE_POOL_TOKEN_URL=%s CLAUDE_POOL_USAGE_URL=%s CCP_SYNC_EXEC_PEER=1 HTTPS_PROXY=http://127.0.0.1:1 HTTP_PROXY=http://127.0.0.1:1 NO_PROXY=127.0.0.1,localhost PATH=%s:/usr/bin:/bin:/usr/sbin:/sbin USER=%s %s sync rpc-serve' \
     "$SIM/$h" "$SIM/$h/.config" "$SIM/$h/tmp" "$BIN/fake-security" \
     "$(oauth_token_url "$h")" "$(oauth_usage_url "$h")" "$BIN" "$SIMUSER" "$BIN/cc-pool"
 }
