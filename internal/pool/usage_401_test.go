@@ -45,7 +45,7 @@ func (f *fakeOAuth401) Refresh(_ context.Context, _, rt string) (*oauth.TokenRes
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if rt != f.currentRT {
-		return nil, &oauth.RefreshError{Status: 400, Body: "invalid_grant"}
+		return nil, &oauth.RefreshError{Status: 400, Body: `{"error":"invalid_grant"}`, Code: "invalid_grant"}
 	}
 	f.refreshes++
 	at := fmt.Sprintf("at-r%d", f.refreshes)
@@ -169,7 +169,7 @@ func assertNeverCanonical(t *testing.T, touched []string) {
 type fakeOAuthRevoked struct{}
 
 func (fakeOAuthRevoked) Refresh(_ context.Context, _, _ string) (*oauth.TokenResponse, error) {
-	return nil, &oauth.RefreshError{Status: 400, Body: "invalid_grant"}
+	return nil, &oauth.RefreshError{Status: 400, Body: `{"error":"invalid_grant"}`, Code: "invalid_grant"}
 }
 
 func (fakeOAuthRevoked) Usage(_ context.Context, _ string) (*oauth.Usage, error) {
@@ -270,20 +270,46 @@ func TestFetchUsage401RereadRetriesRotatedToken(t *testing.T) {
 	assertNeverCanonical(t, kc.touchedServices())
 }
 
-// TestSampleUsageClassifiesNeedsLogin: with no refresh token a 401 is definitive
-// — the error wraps ErrNeedsLogin and no refresh is attempted.
-func TestSampleUsageClassifiesNeedsLogin(t *testing.T) {
+// TestSampleUsageClassifiesUnrefreshable: an expired synced credential (no
+// refresh token) is ErrUnrefreshable — this host cannot refresh it and must
+// not classify it as needs-login (the origin's next rotation heals it) — and
+// no refresh is attempted.
+func TestSampleUsageClassifiesUnrefreshable(t *testing.T) {
 	kc := &rotatingCreds{current: cred401("at-0", "", time.Now().Add(-time.Hour))}
 	fo := newFakeOAuth401("") // nothing valid → at-0 401s
 	m, a := newManager401(t, kc, fo)
 
 	_, _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
-	if !errors.Is(err, ErrNeedsLogin) {
-		t.Fatalf("err = %v, want ErrNeedsLogin", err)
+	if !errors.Is(err, ErrUnrefreshable) {
+		t.Fatalf("err = %v, want ErrUnrefreshable", err)
+	}
+	if errors.Is(err, ErrNeedsLogin) {
+		t.Fatalf("err = %v; a synced credential must not classify as needs-login", err)
 	}
 	if fo.refreshes != 0 {
 		t.Fatalf("refreshes = %d, want 0 (no refresh token to spend)", fo.refreshes)
 	}
+}
+
+// TestFetchUsage401RereadWinsOverUnrefreshable: a fresher synced token pulled
+// underfoot between the pre-flight read and the 401 must be retried and win —
+// the ladder's re-read recovery runs before the unrefreshable classification.
+func TestFetchUsage401RereadWinsOverUnrefreshable(t *testing.T) {
+	kc := &rotatingCreds{
+		rotateAfter: 1, // read#1 (pre-flight) = current; read#2 (rung 1) = the fresher pull
+		current:     cred401("at-0", "", time.Now().Add(time.Hour)),
+		rotated:     cred401("at-9", "", time.Now().Add(2*time.Hour)),
+	}
+	fo := newFakeOAuth401("", "at-9") // at-9 valid; at-0 401s
+	m, a := newManager401(t, kc, fo)
+
+	if _, _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true}); err != nil {
+		t.Fatalf("SampleUsage = %v, want the re-read synced token to recover", err)
+	}
+	if fo.refreshes != 0 {
+		t.Fatalf("refreshes = %d, want 0 (synced tokens never refresh)", fo.refreshes)
+	}
+	assertNeverCanonical(t, kc.touchedServices())
 }
 
 // TestSampleUsageBusyRefreshGuard pins the busy-refresh ladder's load-bearing

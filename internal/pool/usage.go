@@ -19,6 +19,11 @@ const RefreshLeadTime = 10 * time.Minute
 // account must be re-logged-in interactively.
 var ErrNeedsLogin = errors.New("account needs re-login (refresh token missing or revoked)")
 
+// ErrUnrefreshable indicates a synced credential at or near expiry: only the
+// origin host holds the refresh token, so this host can only wait for the
+// origin's rotation to sync over, or mint its own chain via `ccp login`.
+var ErrUnrefreshable = errors.New("credential expired and holds no refresh token; this host cannot refresh it")
+
 // ErrCredentialChangedUnderfoot aborts a write-back when a concurrent writer
 // (usually `claude /login`) minted a newer credential we must not clobber.
 var ErrCredentialChangedUnderfoot = errors.New("stored credential changed under us before write-back")
@@ -121,14 +126,15 @@ func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within 
 	if !cred.ExpiresWithin(within) || !allowRefresh {
 		return cred, src, false, nil
 	}
-	if !cred.HasRefreshToken() {
-		return cred, src, false, ErrNeedsLogin
+	if cred.Synced() {
+		return cred, src, false, ErrUnrefreshable
 	}
 	refreshed, err := m.refresh(ctx, a, src, cred)
 	if err != nil {
 		_ = m.Store.LogRefresh(a.ID, false, err.Error())
 		var re *oauth.RefreshError
 		if errors.As(err, &re) && re.Revoked() {
+			m.stripSpentRefreshToken(a, src, cred, re)
 			return cred, src, false, ErrNeedsLogin
 		}
 		// Transient: fall back to the stale credential.
@@ -136,6 +142,20 @@ func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within 
 	}
 	_ = m.Store.LogRefresh(a.ID, true, "")
 	return refreshed, src, true, nil
+}
+
+// stripSpentRefreshToken demotes a server-confirmed dead chain to the synced
+// shape: the access token stays servable until expiry and a refresh-token-free
+// blob is pull-healable, where an owned one never is. Only invalid_grant
+// strips — a plain 401 may be transient. Best-effort: the CAS aborts if a
+// concurrent login/rotation landed, and needs-login covers any failure.
+func (m *Manager) stripSpentRefreshToken(a store.Account, src creds.Source, cred *creds.Credential, re *oauth.RefreshError) {
+	if !re.InvalidGrant() || cred.ClaudeAiOauth.AccessToken == "" {
+		return
+	}
+	if err := m.writeCredCAS(a, src, cred.ClaudeAiOauth.AccessToken, cred.Strip(), ""); err != nil {
+		log.Printf("acct-%d strip spent refresh token: %v", a.ID, err)
+	}
 }
 
 // refresh performs the OAuth refresh and persists the new blob, preserving the prior
@@ -252,7 +272,7 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src creds.Sou
 	}
 
 	if !cred.HasRefreshToken() {
-		return nil, false, 0, fmt.Errorf("%w: %w", ErrNeedsLogin, err)
+		return nil, false, 0, fmt.Errorf("%w: %w", ErrUnrefreshable, err)
 	}
 
 	// A busy account may refresh only under the guard: provably expired and unchanged
@@ -277,6 +297,7 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src creds.Sou
 			if reread, _, rerr := m.ReadCredential(a); rerr == nil && !sameTokens(reread, cred) {
 				return nil, false, 0, err
 			}
+			m.stripSpentRefreshToken(a, src, cred, re)
 			return nil, false, 0, fmt.Errorf("%w: %w", ErrNeedsLogin, rfErr)
 		}
 		return nil, false, 0, err

@@ -32,7 +32,7 @@ func (f *fakeOAuth) Refresh(_ context.Context, _, refreshToken string) (*oauth.T
 	defer f.mu.Unlock()
 	if refreshToken != f.currentRT {
 		f.invalidGrants++
-		return nil, &oauth.RefreshError{Status: 400, Body: "invalid_grant"}
+		return nil, &oauth.RefreshError{Status: 400, Body: `{"error":"invalid_grant"}`, Code: "invalid_grant"}
 	}
 	f.refreshes++
 	f.currentRT = fmt.Sprintf("rt-%d", f.refreshes)
