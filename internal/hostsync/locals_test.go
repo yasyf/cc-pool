@@ -76,15 +76,16 @@ func credWith(access, refresh string, expiresAt int64) *creds.Credential {
 	return c
 }
 
-// TestManagerLocalsCarriesLineage pins ManagerLocals: identity from the private
-// .claude.json, Chain.Hash/ExpiresAt from a read-only credential read,
-// holder = self.
-func TestManagerLocalsCarriesLineage(t *testing.T) {
+// TestManagerLocalsAdvertisesOnlyOwnedChains pins ManagerLocals: identity from
+// the private .claude.json; an OWNED credential stamps {Origin: self,
+// AccessHash}, while a SYNCED (stripped) copy is a zero stamp — a peer never
+// advertises a chain it doesn't own.
+func TestManagerLocalsAdvertisesOnlyOwnedChains(t *testing.T) {
 	fixed := time.Now()
 	now := func() time.Time { return fixed }
 	const oauthRaw = `{"accountUuid":"u1","emailAddress":"a@x.com","organizationRole":"admin"}`
 
-	t.Run("logged-in account carries identity, label, and chain stamp", func(t *testing.T) {
+	t.Run("owned account carries identity, label, and an origin chain stamp", func(t *testing.T) {
 		fx := newLocalsFixture(t)
 		a := fx.addAccount(t, 1, "symlink", "work", `{"oauthAccount":`+oauthRaw+`,"other":true}`)
 		cred := credWith("at-1", "rt-1", 4_200_000)
@@ -105,13 +106,44 @@ func TestManagerLocalsCarriesLineage(t *testing.T) {
 			t.Errorf("OAuthAccount not verbatim:\n got %s\nwant %s", l.OAuthAccount, oauthRaw)
 		}
 		want := ChainStamp{
+			Origin:    "host-self",
 			ExpiresAt: 4_200_000,
-			Hash:      CredentialHash(cred),
-			Holder:    "host-self",
+			Hash:      creds.AccessHash(cred),
 			RotatedAt: fixed.UnixMilli(),
 		}
 		if l.Chain != want {
 			t.Errorf("chain = %+v, want %+v", l.Chain, want)
+		}
+	})
+
+	t.Run("synced (stripped) credential is a zero stamp, never advertised", func(t *testing.T) {
+		fx := newLocalsFixture(t)
+		a := fx.addAccount(t, 1, "symlink", "l", `{"oauthAccount":`+oauthRaw+`}`)
+		fx.fk.Put(a.KeychainService, a.KeychainAccount, credWith("at-synced", "", 9_000_000))
+
+		locals, err := ManagerLocals(fx.m, "host-self", now)(context.Background())
+		if err != nil {
+			t.Fatalf("ManagerLocals: %v", err)
+		}
+		if len(locals) != 1 {
+			t.Fatalf("locals = %d entries, want 1", len(locals))
+		}
+		if locals[0].Chain != (ChainStamp{}) {
+			t.Fatalf("chain = %+v, want zero — a synced copy must never be advertised", locals[0].Chain)
+		}
+	})
+
+	t.Run("tombstoned credential is a zero stamp", func(t *testing.T) {
+		fx := newLocalsFixture(t)
+		a := fx.addAccount(t, 1, "symlink", "l", `{"oauthAccount":`+oauthRaw+`}`)
+		fx.fk.Put(a.KeychainService, a.KeychainAccount, credWith("", "", 0))
+
+		locals, err := ManagerLocals(fx.m, "host-self", now)(context.Background())
+		if err != nil {
+			t.Fatalf("ManagerLocals: %v", err)
+		}
+		if locals[0].Chain != (ChainStamp{}) {
+			t.Fatalf("chain = %+v, want zero for a tombstone", locals[0].Chain)
 		}
 	})
 

@@ -213,68 +213,15 @@ func (s *Service) RecordLabel(ctx context.Context, uuid, label string) error {
 	return err
 }
 
-// ClaimHolder sets host as uuid's chain holder — the one host allowed to
-// preemptively refresh — bump-stamped; unknown or removed accounts fail loud.
-func (s *Service) ClaimHolder(ctx context.Context, uuid, host string) error {
-	_, err := s.mutate(ctx, uuid, func(reg Registry) error {
-		entry, ok := reg[uuid]
-		if !ok || !entry.Present() {
-			return fmt.Errorf("hostsync: ClaimHolder for unknown account %s", uuid)
-		}
-		v := entry.Value
-		v.Chain.Holder = host
-		reg.Add(uuid, v, s.bumpStamp(entry))
-		return nil
-	})
-	return err
-}
-
-// RenewLease sets uuid's refresh lease to host until the given Unix-millis
-// expiry; unknown or removed accounts fail loud.
-func (s *Service) RenewLease(ctx context.Context, uuid, host string, until int64) error {
-	_, err := s.mutate(ctx, uuid, func(reg Registry) error {
-		entry, ok := reg[uuid]
-		if !ok || !entry.Present() {
-			return fmt.Errorf("hostsync: RenewLease for unknown account %s", uuid)
-		}
-		v := entry.Value
-		v.Lease = &Lease{Host: host, Until: until}
-		reg.Add(uuid, v, s.bumpStamp(entry))
-		return nil
-	})
-	return err
-}
-
-// ReleaseLease clears uuid's lease only when host owns it; anything else is a
-// no-op — a host can only release its own lease.
-func (s *Service) ReleaseLease(ctx context.Context, uuid, host string) error {
-	_, err := s.mutate(ctx, uuid, func(reg Registry) error {
-		entry, ok := reg[uuid]
-		if !ok || !entry.Present() {
-			return nil
-		}
-		if entry.Value.Lease == nil || entry.Value.Lease.Host != host {
-			return nil
-		}
-		v := entry.Value
-		v.Lease = nil
-		reg.Add(uuid, v, s.bumpStamp(entry))
-		return nil
-	})
-	return err
-}
-
-// NoteCredWrite records chain only when it is fresher than the registry's —
-// child lineage first, strictly-later expiry as the fallback; staler chains
-// and absent or tombstoned accounts are no-ops — see ccn 10bf17d.
+// NoteCredWrite records chain only when it expires strictly later than the
+// registry's; staler chains and absent or tombstoned accounts are no-ops.
 func (s *Service) NoteCredWrite(ctx context.Context, uuid string, chain ChainStamp) error {
 	_, err := s.mutate(ctx, uuid, func(reg Registry) error {
 		entry, ok := reg[uuid]
 		if !ok || !entry.Present() {
 			return nil
 		}
-		child := chain.ParentHash != "" && chain.ParentHash == entry.Value.Chain.Hash
-		if !child && chain.ExpiresAt <= entry.Value.Chain.ExpiresAt {
+		if chain.ExpiresAt <= entry.Value.Chain.ExpiresAt {
 			return nil
 		}
 		v := entry.Value
@@ -312,10 +259,7 @@ func (s *Service) ScanPublish(ctx context.Context, reg Registry) (bool, error) {
 		default:
 			v := entry.Value
 			dirty := false
-			// Fold only an ahead local chain; never regress onto our own child — see ccn 10bf17d.
-			ahead := l.Chain.ParentHash != "" && l.Chain.ParentHash == entry.Value.Chain.Hash
-			behind := entry.Value.Chain.ParentHash != "" && entry.Value.Chain.ParentHash == l.Chain.Hash
-			if ahead || (!behind && l.Chain.ExpiresAt > entry.Value.Chain.ExpiresAt) {
+			if l.Chain.ExpiresAt > entry.Value.Chain.ExpiresAt {
 				v.Chain = l.Chain
 				dirty = true
 			}

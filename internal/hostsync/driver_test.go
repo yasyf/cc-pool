@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -158,11 +159,10 @@ func (m *fakeMaterializer) materialize(_ context.Context, v AccountValue, peers 
 }
 
 type pullCall struct {
-	uuid      string
-	chain     ChainStamp
-	localExp  int64
-	localHash string
-	peers     []string
+	uuid     string
+	chain    ChainStamp
+	localExp int64
+	peers    []string
 }
 
 // fakePuller records each pull and returns a canned credential/error.
@@ -172,8 +172,8 @@ type fakePuller struct {
 	err   error
 }
 
-func (p *fakePuller) pull(_ context.Context, uuid string, chain ChainStamp, localExp int64, localHash string, peers []string) (*creds.Credential, error) {
-	p.calls = append(p.calls, pullCall{uuid, chain, localExp, localHash, peers})
+func (p *fakePuller) pull(_ context.Context, uuid string, chain ChainStamp, localExp int64, peers []string) (*creds.Credential, error) {
+	p.calls = append(p.calls, pullCall{uuid, chain, localExp, peers})
 	return p.cred, p.err
 }
 
@@ -232,13 +232,13 @@ func newDriverHarness(t *testing.T) *driverHarness {
 	return h
 }
 
-func acctValue(uuid, label, holder string, expiresAt int64, oauth string) AccountValue {
+func acctValue(uuid, label, origin string, expiresAt int64, oauth string) AccountValue {
 	return AccountValue{
 		UUID:         uuid,
 		Email:        uuid + "@x.com",
 		Label:        label,
 		OAuthAccount: json.RawMessage(oauth),
-		Chain:        ChainStamp{ExpiresAt: expiresAt, Hash: "h-" + uuid, Holder: holder, RotatedAt: expiresAt - 1},
+		Chain:        ChainStamp{Origin: origin, ExpiresAt: expiresAt, Hash: "h-" + uuid, RotatedAt: expiresAt - 1},
 	}
 }
 
@@ -340,28 +340,55 @@ func TestDriverReconcile(t *testing.T) {
 			},
 		},
 		{
-			name: "child-lineage-pulls-despite-skewed-expiry",
+			name: "owned-local-never-pulled", // the owned-precedence litmus
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
-				h.cred.cred[1] = credWithExpiry(2000) // local parent, expiry skewed AHEAD
-				h.pull.cred = childCred(1500)
+				h.cred.cred[1] = credWithExpiry(1000) // owned: refresh token present
+				h.pull.cred = strippedCred(2000)
 			},
-			id: "u1",
-			val: AccountValue{
-				UUID:         "u1",
-				Email:        "u1@x.com",
-				Label:        "same",
-				OAuthAccount: json.RawMessage(freshOAuth("u1")),
-				Chain:        ChainStamp{ExpiresAt: 1500, Hash: childHash(), Holder: "hostA", ParentHash: localHash()},
+			id:          "u1",
+			val:         acctValue("u1", "same", "hostA", 2000, freshOAuth("u1")), // registry strictly fresher
+			peers:       []string{"hostB"},
+			wantOutcome: OutcomeUnchanged,
+			check: func(t *testing.T, h *driverHarness) {
+				if len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("an owned local blob was pulled over: pulls=%+v installs=%+v", h.pull.calls, h.cred.installs)
+				}
 			},
+		},
+		{
+			name: "tombstone-local-pulls",
+			setup: func(h *driverHarness) {
+				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
+				h.cred.readErr = fmt.Errorf("read credential: %w", creds.ErrNoTokens)
+				h.pull.cred = strippedCred(2000)
+			},
+			id:          "u1",
+			val:         acctValue("u1", "same", "hostA", 2000, freshOAuth("u1")),
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeCredInstalled,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.pull.calls) != 1 || h.pull.calls[0].localHash != localHash() {
-					t.Fatalf("pull calls = %+v, want one with localHash %q", h.pull.calls, localHash())
+				if len(h.pull.calls) != 1 || h.pull.calls[0].localExp != 0 {
+					t.Fatalf("pull calls = %+v, want one with localExp 0 (tombstone reads as absent)", h.pull.calls)
 				}
-				if len(h.cred.installs) != 1 || h.cred.installs[0] != (credInstall{1, 1500}) {
-					t.Fatalf("installs = %+v, want one (1,1500)", h.cred.installs)
+				if len(h.cred.installs) != 1 || h.cred.installs[0] != (credInstall{1, 2000}) {
+					t.Fatalf("installs = %+v, want one (1,2000)", h.cred.installs)
+				}
+			},
+		},
+		{
+			name: "keychain-unavailable-read-deferred",
+			setup: func(h *driverHarness) {
+				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
+				h.cred.readErr = fmt.Errorf("read credential: %w", creds.ErrUnavailable)
+			},
+			id:          "u1",
+			val:         acctValue("u1", "same", "hostA", 2000, freshOAuth("u1")),
+			peers:       []string{"hostB"},
+			wantOutcome: OutcomeDeferred,
+			check: func(t *testing.T, h *driverHarness) {
+				if len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("an unreadable slot pulled/installed: pulls=%+v installs=%+v", h.pull.calls, h.cred.installs)
 				}
 			},
 		},
@@ -369,7 +396,7 @@ func TestDriverReconcile(t *testing.T) {
 			name: "same-chain-hash-never-pulls",
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
-				h.cred.cred[1] = credWithExpiry(1000) // same chain, expiry lagging the registry's
+				h.cred.cred[1] = strippedCred(1000) // same access token, expiry lagging the registry's
 			},
 			id: "u1",
 			val: AccountValue{
@@ -377,7 +404,7 @@ func TestDriverReconcile(t *testing.T) {
 				Email:        "u1@x.com",
 				Label:        "same",
 				OAuthAccount: json.RawMessage(freshOAuth("u1")),
-				Chain:        ChainStamp{ExpiresAt: 2000, Hash: localHash(), Holder: "hostA"},
+				Chain:        ChainStamp{Origin: "hostA", ExpiresAt: 2000, Hash: strippedHash()},
 			},
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeUnchanged,
@@ -428,11 +455,11 @@ func TestDriverReconcile(t *testing.T) {
 			},
 		},
 		{
-			name: "holder-unreachable-falls-back",
+			name: "origin-unreachable-falls-back",
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.expiry[1] = 1000
-				h.pull.cred = credWithExpiry(2000) // fallback to a non-holder peer succeeded
+				h.pull.cred = strippedCred(2000) // fallback to a relay peer succeeded
 			},
 			id:          "u1",
 			val:         acctValue("u1", "same", "hostA", 2000, freshOAuth("u1")),
@@ -443,8 +470,8 @@ func TestDriverReconcile(t *testing.T) {
 					t.Fatalf("pull calls = %+v, want one", h.pull.calls)
 				}
 				got := h.pull.calls[0]
-				if got.chain.Holder != "hostA" {
-					t.Fatalf("pull chain holder = %q, want hostA (the holder is tried first)", got.chain.Holder)
+				if got.chain.Origin != "hostA" {
+					t.Fatalf("pull chain origin = %q, want hostA (the origin is tried first)", got.chain.Origin)
 				}
 				if len(got.peers) != 2 || got.peers[0] != "hostB" || got.peers[1] != "hostA" {
 					t.Fatalf("pull peers = %v, want the full mesh for fallback", got.peers)
@@ -514,6 +541,7 @@ func TestDriverReconcile(t *testing.T) {
 	}
 }
 
+// credWithExpiry is an OWNED local blob: refresh token present.
 func credWithExpiry(exp int64) *creds.Credential {
 	c := &creds.Credential{}
 	c.ClaudeAiOauth.ExpiresAt = exp
@@ -522,18 +550,16 @@ func credWithExpiry(exp int64) *creds.Credential {
 	return c
 }
 
-// childCred is a distinct chain minted off credWithExpiry's token pair.
-func childCred(exp int64) *creds.Credential {
+// strippedCred is a SYNCED blob: access token only.
+func strippedCred(exp int64) *creds.Credential {
 	c := &creds.Credential{}
 	c.ClaudeAiOauth.ExpiresAt = exp
-	c.ClaudeAiOauth.AccessToken = "at-child"
-	c.ClaudeAiOauth.RefreshToken = "rt-child"
+	c.ClaudeAiOauth.AccessToken = "at"
 	return c
 }
 
-// CredentialHash ignores expiry, so these are expiry-independent.
-func localHash() string { return CredentialHash(credWithExpiry(0)) }
-func childHash() string { return CredentialHash(childCred(0)) }
+// AccessHash ignores expiry, so this is expiry-independent.
+func strippedHash() string { return creds.AccessHash(strippedCred(0)) }
 
 // TestDriverUnifyBackfillsUUID pins the LoadRegistry backfill: a local account row
 // the store has not yet tagged with its accountUuid is unified with the matching

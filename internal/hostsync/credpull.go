@@ -1,6 +1,7 @@
 package hostsync
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,13 +10,15 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
 
-// MethodFetchCredential is the credential fetch RPC — the only path a secret
-// ever crosses between hosts; namespaced under ccp. clear of the svc.* contract.
+// MethodFetchCredential is the credential fetch RPC — the only path a
+// credential ever crosses between hosts, always stripped of its refresh
+// token; namespaced under ccp. clear of the svc.* contract.
 const MethodFetchCredential = "ccp.fetch_credential" //nolint:gosec // G101: a JSON-RPC method name, not a credential
 
 // FetchTimeout bounds each per-peer fetch attempt; a var so tests shrink it.
@@ -25,18 +28,14 @@ var FetchTimeout = 15 * time.Second
 // acceptable credential; the caller retries on a later tick.
 var ErrNoPeerCredential = errors.New("no peer offered an acceptable credential")
 
-// errHolderAhead halts a pull when the holder's answer proves the registry
-// stale: falling back would install an already-spent chain — see ccn 10bf17d.
-var errHolderAhead = fmt.Errorf("holder chain is ahead of the registry (mirror lag): %w", ErrNoPeerCredential)
-
 // CredentialEnvelope is the wire result of MethodFetchCredential: the
-// credential blob byte-exact plus the stamp fields the client verifies.
+// stripped credential blob plus the stamp fields the client verifies.
 type CredentialEnvelope struct {
-	// Credential is the marshaled creds.Credential, byte-exact.
+	// Credential is the marshaled stripped creds.Credential.
 	Credential json.RawMessage `json:"credential"`
 	// ExpiresAt is the access-token expiry in Unix epoch milliseconds.
 	ExpiresAt int64 `json:"expiresAt"`
-	// Hash is CredentialHash of the enclosed credential.
+	// Hash is creds.AccessHash of the enclosed credential.
 	Hash string `json:"hash"`
 }
 
@@ -49,7 +48,8 @@ type AccountLookup func(uuid string) (store.Account, bool, error)
 type CredentialReader func(ctx context.Context, a store.Account) (*creds.Credential, error)
 
 // NewFetchCredentialHandler returns the daemon-side MethodFetchCredential
-// handler; it never writes — serving a fetch must not disturb the chain.
+// handler; it never writes, and it serves cred.Strip() — the refresh token
+// never leaves the origin process.
 func NewFetchCredentialHandler(lookup AccountLookup, read CredentialReader) rpc.Handler {
 	return func(ctx context.Context, params map[string]any) (any, error) {
 		uuid, _ := params["uuid"].(string)
@@ -67,14 +67,19 @@ func NewFetchCredentialHandler(lookup AccountLookup, read CredentialReader) rpc.
 		if err != nil {
 			return nil, fmt.Errorf("read acct-%d credential: %w", a.ID, err)
 		}
-		blob, err := cred.Marshal()
+		stripped := cred.Strip()
+		blob, err := stripped.Marshal()
 		if err != nil {
 			return nil, err
 		}
+		// The secret boundary, asserted on the exact wire bytes.
+		if rt := cred.ClaudeAiOauth.RefreshToken; rt != "" && bytes.Contains(blob, []byte(rt)) {
+			return nil, fmt.Errorf("%s: refusing to serve acct-%d: stripped envelope still carries the refresh token", MethodFetchCredential, a.ID)
+		}
 		return CredentialEnvelope{
 			Credential: blob,
-			ExpiresAt:  cred.ClaudeAiOauth.ExpiresAt,
-			Hash:       CredentialHash(cred),
+			ExpiresAt:  stripped.ClaudeAiOauth.ExpiresAt,
+			Hash:       creds.AccessHash(stripped),
 		}, nil
 	}
 }
@@ -83,21 +88,20 @@ func NewFetchCredentialHandler(lookup AccountLookup, read CredentialReader) rpc.
 // FetchCredential closes it when the attempt ends.
 type DialTransport func(peer string) syncservice.Transport
 
-// FetchCredential pulls uuid's credential — holder first, then peers — and
-// accepts only an envelope that recomputes to chain.Hash and beats the local
-// credential by lineage or strictly-later expiry; all peers failing is the
-// deferred outcome ErrNoPeerCredential.
-func FetchCredential(ctx context.Context, dial DialTransport, uuid string, chain ChainStamp, localExpiresAt int64, localHash string, peers []string) (*creds.Credential, error) {
+// FetchCredential pulls uuid's stripped credential — origin first, then the
+// relay peers — and accepts only a valid synced envelope strictly fresher than
+// the local credential: the origin is authoritative for its own chain (a
+// self-consistent answer ahead of the registry stamp is mirror lag, not
+// corruption), while a relay must match the registry hash exactly. All peers
+// failing is the deferred outcome ErrNoPeerCredential.
+func FetchCredential(ctx context.Context, dial DialTransport, uuid string, chain ChainStamp, localExpiresAt int64, peers []string) (*creds.Credential, error) {
 	var attempts []string
-	for _, peer := range fetchOrder(chain.Holder, peers) {
+	for _, peer := range fetchOrder(chain.Origin, peers) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		cred, err := fetchFromPeer(ctx, dial, peer, uuid, chain, localExpiresAt, localHash, peer == chain.Holder)
+		cred, err := fetchFromPeer(ctx, dial, peer, uuid, chain, localExpiresAt, peer == chain.Origin)
 		if err != nil {
-			if errors.Is(err, errHolderAhead) {
-				return nil, fmt.Errorf("fetch credential for %s: %w", uuid, err)
-			}
 			attempts = append(attempts, fmt.Sprintf("%s: %v", peer, err))
 			continue
 		}
@@ -109,12 +113,12 @@ func FetchCredential(ctx context.Context, dial DialTransport, uuid string, chain
 	return nil, fmt.Errorf("fetch credential for %s: %w (%s)", uuid, ErrNoPeerCredential, strings.Join(attempts, "; "))
 }
 
-// fetchOrder returns the peers to try in order: the holder first, then the
+// fetchOrder returns the peers to try in order: the origin first, then the
 // remaining peers, with empties and duplicates dropped.
-func fetchOrder(holder string, peers []string) []string {
+func fetchOrder(origin string, peers []string) []string {
 	order := make([]string, 0, len(peers)+1)
 	seen := map[string]bool{"": true}
-	for _, p := range append([]string{holder}, peers...) {
+	for _, p := range append([]string{origin}, peers...) {
 		if seen[p] {
 			continue
 		}
@@ -124,9 +128,11 @@ func fetchOrder(holder string, peers []string) []string {
 	return order
 }
 
-// fetchFromPeer runs one bounded attempt against peer: the advertised stamp
-// fields gate cheaply, then the parsed credential is re-verified by recomputation.
-func fetchFromPeer(ctx context.Context, dial DialTransport, peer, uuid string, chain ChainStamp, localExpiresAt int64, localHash string, isHolder bool) (*creds.Credential, error) {
+// fetchFromPeer runs one bounded attempt against peer, verifying the parsed
+// credential by recomputation: it must be a valid stripped synced credential,
+// hash-consistent with its envelope, registry-matching unless peer is the
+// origin, and strictly fresher than the local credential.
+func fetchFromPeer(ctx context.Context, dial DialTransport, peer, uuid string, chain ChainStamp, localExpiresAt int64, isOrigin bool) (*creds.Credential, error) {
 	ctx, cancel := context.WithTimeout(ctx, FetchTimeout)
 	defer cancel()
 	tx := dial(peer)
@@ -143,35 +149,25 @@ func fetchFromPeer(ctx context.Context, dial DialTransport, peer, uuid string, c
 	if err := json.Unmarshal(resp.Result, &env); err != nil {
 		return nil, fmt.Errorf("decode credential envelope: %w", err)
 	}
-	if env.Hash != chain.Hash {
-		if isHolder && holderAhead(env, chain) {
-			return nil, errHolderAhead
-		}
-		return nil, errors.New("advertised hash does not match the registry chain (stale peer registry)")
-	}
-	childOfLocal := chain.ParentHash != "" && chain.ParentHash == localHash
-	if env.ExpiresAt <= localExpiresAt && !childOfLocal {
-		return nil, fmt.Errorf("advertised expiry %d is not strictly later than local %d", env.ExpiresAt, localExpiresAt)
-	}
 	var cred creds.Credential
 	if err := json.Unmarshal(env.Credential, &cred); err != nil {
 		return nil, fmt.Errorf("parse credential: %w", err)
 	}
-	if CredentialHash(&cred) != chain.Hash {
-		return nil, errors.New("credential does not hash to the registry chain")
+	switch {
+	case cred.HasRefreshToken():
+		// A downrev peer serving unstripped envelopes: never installable.
+		return nil, pool.ErrEnvelopeCarriesSecret
+	case !cred.Synced():
+		return nil, pool.ErrEnvelopeNoAccessToken
 	}
-	if cred.ClaudeAiOauth.ExpiresAt <= localExpiresAt && !childOfLocal {
+	if creds.AccessHash(&cred) != env.Hash {
+		return nil, errors.New("credential does not hash to the advertised envelope hash")
+	}
+	if !isOrigin && env.Hash != chain.Hash {
+		return nil, errors.New("relay answer does not match the registry chain (stale peer registry)")
+	}
+	if cred.ClaudeAiOauth.ExpiresAt <= localExpiresAt {
 		return nil, fmt.Errorf("credential expiry %d is not strictly later than local %d", cred.ClaudeAiOauth.ExpiresAt, localExpiresAt)
 	}
 	return &cred, nil
-}
-
-// holderAhead reports a self-consistent holder answer strictly fresher than
-// the registry chain; an older or corrupt answer still falls back — see ccn 10bf17d.
-func holderAhead(env CredentialEnvelope, chain ChainStamp) bool {
-	var cred creds.Credential
-	if err := json.Unmarshal(env.Credential, &cred); err != nil {
-		return false
-	}
-	return CredentialHash(&cred) == env.Hash && cred.ClaudeAiOauth.ExpiresAt > chain.ExpiresAt
 }

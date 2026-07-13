@@ -90,21 +90,25 @@ func scanLocalAccounts(m *pool.Manager) ([]localRow, error) {
 	return out, nil
 }
 
-// localChainStamp stamps a's chain from a refresh-free credential read;
-// holder = self; no readable credential is a zero chain, which the fold's
-// strictly-ahead gates never adopt — see ccn 10bf17d.
+// localChainStamp stamps a's chain from a refresh-free credential read. Only
+// OWNED chains are advertised (origin = self); a synced copy, tombstone, or
+// unreadable slot is a zero chain, which the fold's strictly-fresher gates
+// never adopt — a peer must never republish a chain it doesn't own.
 func localChainStamp(m *pool.Manager, a store.Account, self string, now func() time.Time) (ChainStamp, error) {
 	cred, _, err := m.ReadCredential(a)
 	switch {
-	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrUnavailable):
+	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrUnavailable), errors.Is(err, creds.ErrNoTokens):
 		return ChainStamp{}, nil
 	case err != nil:
 		return ChainStamp{}, fmt.Errorf("read acct-%d credential: %w", a.ID, err)
 	}
+	if !cred.HasRefreshToken() {
+		return ChainStamp{}, nil
+	}
 	return ChainStamp{
+		Origin:    self,
 		ExpiresAt: cred.ClaudeAiOauth.ExpiresAt,
-		Hash:      CredentialHash(cred),
-		Holder:    self,
+		Hash:      creds.AccessHash(cred),
 		RotatedAt: now().UnixMilli(),
 	}, nil
 }

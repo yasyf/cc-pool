@@ -17,7 +17,7 @@ import (
 // held the credential envelope; the half-built account is rolled back first.
 var ErrMaterializeNoEnvelope = errors.New("hostsync: no credential envelope available from peers")
 
-// PullCredential fetches uuid's credential envelope from its chain holder,
+// PullCredential fetches uuid's credential envelope from its chain origin,
 // falling back to the other peers; a nil credential with a nil error means no envelope.
 type PullCredential func(ctx context.Context, uuid string, chain ChainStamp, peers []string) (*creds.Credential, error)
 
@@ -39,8 +39,9 @@ type MaterializeResult struct {
 }
 
 // Materialize creates the local account for a peer-added entry without any
-// interactive login. An entry with no oauthAccount defers; every failure after
-// PrepareAdd rolls the dir and reservation back via AbandonAdd.
+// interactive login. An entry with no oauthAccount defers; failures after
+// PrepareAdd roll the dir and reservation back via AbandonAdd, except retained
+// slot state and rejected envelopes, which only release the reservation.
 func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []string, pull PullCredential, manifestPath string) (MaterializeResult, error) {
 	if v.UUID == "" {
 		return MaterializeResult{}, fmt.Errorf("hostsync: Materialize requires a UUID")
@@ -55,12 +56,32 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		return MaterializeResult{}, fmt.Errorf("materialize %s: prepare add: %w", v.UUID, err)
 	}
 
-	// Every failure past PrepareAdd must roll the dir and reservation back.
+	// Every failure past PrepareAdd must roll the dir and reservation back —
+	// except a kept dir's retained login state, which release preserves.
 	abandon := func(cause error) (MaterializeResult, error) {
 		if aerr := s.M.AbandonAdd(p); aerr != nil {
 			return MaterializeResult{}, errors.Join(cause, fmt.Errorf("roll back %s: %w", v.UUID, aerr))
 		}
 		return MaterializeResult{}, cause
+	}
+	release := func(cause error) (MaterializeResult, error) {
+		if rerr := s.M.ReleaseAdd(p); rerr != nil {
+			return MaterializeResult{}, errors.Join(cause, fmt.Errorf("release %s: %w", v.UUID, rerr))
+		}
+		return MaterializeResult{}, cause
+	}
+
+	// A kept dir may retain a usable credential from an interrupted `ccp add`
+	// (ReleaseAdd keeps login state); materializing over it would destroy an
+	// owned chain, so abort before touching the dir.
+	if p.ClaudeJSONSeed == pool.SeedKeptExisting {
+		retained, err := s.slotRetainsCredential(p)
+		if err != nil {
+			return release(fmt.Errorf("materialize %s: %w", v.UUID, err))
+		}
+		if retained {
+			return release(fmt.Errorf("materialize %s: %s retains a credential from an interrupted add; resume it with `ccp add` or remove the dir", v.UUID, p.ConfigDir))
+		}
 	}
 
 	bootstrapped := false
@@ -82,6 +103,12 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		return abandon(fmt.Errorf("materialize %s: %w", v.UUID, errors.Join(ErrMaterializeNoEnvelope, err)))
 	case env == nil:
 		return abandon(fmt.Errorf("materialize %s: %w", v.UUID, ErrMaterializeNoEnvelope))
+	// A rejected envelope must never AbandonAdd: that deletes any retained
+	// slot credentials — release keeps them intact.
+	case env.HasRefreshToken():
+		return release(fmt.Errorf("materialize %s: %w", v.UUID, pool.ErrEnvelopeCarriesSecret))
+	case !env.Synced():
+		return release(fmt.Errorf("materialize %s: %w", v.UUID, pool.ErrEnvelopeNoAccessToken))
 	}
 
 	fileFallback, err := s.installEnvelope(p, env)
@@ -114,12 +141,39 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	}, nil
 }
 
-// installEnvelope writes the pulled credential to the Keychain, falling back
-// to the file store when the login keychain is unsearchable (the returned bool
-// flags the fallback). It writes directly — no row exists yet for OnCredWrite.
+// slotRetainsCredential reports whether a kept dir's credential slot still
+// holds a credential (tombstones excluded); an unprovable backend fails closed.
+func (s *Service) slotRetainsCredential(p *pool.PendingAdd) (bool, error) {
+	acct := store.Account{ConfigDir: p.ConfigDir, KeychainService: p.KeychainService, KeychainAccount: creds.AccountLabel()}
+	account, err := s.M.Creds.Discover(p.KeychainService)
+	switch {
+	case err == nil:
+		acct.KeychainAccount = account
+	case !errors.Is(err, creds.ErrNotFound):
+		return false, fmt.Errorf("probe retained credential for %s: %w", p.ConfigDir, err)
+	}
+	for _, st := range s.M.Creds.Stores(acct) {
+		_, err := st.Read()
+		switch {
+		case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
+		case err != nil:
+			return false, fmt.Errorf("probe retained credential in %s: %w", st, err)
+		default:
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// installEnvelope writes the pulled stripped credential to the Keychain,
+// falling back to the file store when the login keychain is unsearchable (the
+// returned bool flags the fallback). It writes directly — no row exists yet
+// for OnCredWrite.
 func (s *Service) installEnvelope(p *pool.PendingAdd, env *creds.Credential) (bool, error) {
-	// TODO(phase-2): tighten to env.Synced() once the fetch protocol ships stripped envelopes.
-	if env.ClaudeAiOauth.AccessToken == "" {
+	switch {
+	case env.HasRefreshToken():
+		return false, fmt.Errorf("install credential envelope: %w", pool.ErrEnvelopeCarriesSecret)
+	case !env.Synced():
 		return false, fmt.Errorf("install credential envelope: %w", pool.ErrEnvelopeNoAccessToken)
 	}
 	acct := store.Account{

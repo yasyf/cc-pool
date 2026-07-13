@@ -11,13 +11,14 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
 
-// pullCred builds a credential with every OAuth field populated so round-trip
-// assertions cover the optional fields too.
+// pullCred builds an OWNED credential with every OAuth field populated so
+// round-trip assertions cover the optional fields too.
 func pullCred(suffix string, expiresAt int64) *creds.Credential {
 	c := &creds.Credential{}
 	c.ClaudeAiOauth.AccessToken = "at-" + suffix
@@ -62,6 +63,18 @@ func handlerTransport(h rpc.Handler) *fakeTransport {
 	}}
 }
 
+// envelopeTransport serves a fixed raw envelope, simulating a downrev or
+// lying peer that bypasses the stripping handler.
+func envelopeTransport(t *testing.T, cred *creds.Credential, hash string) *fakeTransport {
+	t.Helper()
+	blob, err := cred.Marshal()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	env := CredentialEnvelope{Credential: blob, ExpiresAt: cred.ClaudeAiOauth.ExpiresAt, Hash: hash}
+	return handlerTransport(func(context.Context, map[string]any) (any, error) { return env, nil })
+}
+
 // failingTransport always errors on Do — an unreachable peer.
 func failingTransport() *fakeTransport {
 	return &fakeTransport{do: func(context.Context, *rpc.Request) (*syncservice.Response, error) {
@@ -89,17 +102,25 @@ func servingSeams(t *testing.T, uuid string, a store.Account, cred *creds.Creden
 	return lookup, read
 }
 
-// TestFetchCredentialEnvelopeRoundTripsByteExact pins that the envelope
-// carries the credential byte-exact plus its stamp fields, and the client
-// returns it deep-equal, optional fields included.
-func TestFetchCredentialEnvelopeRoundTripsByteExact(t *testing.T) {
+// serving wraps an owned credential in the real handler behind a transport.
+func serving(t *testing.T, cred *creds.Credential) *fakeTransport {
+	t.Helper()
+	reads := 0
+	lookup, read := servingSeams(t, "u-1", store.Account{ID: 1}, cred, &reads)
+	return handlerTransport(NewFetchCredentialHandler(lookup, read))
+}
+
+// TestFetchCredentialHandlerStripsSecret pins the secret boundary on the exact
+// wire bytes: the envelope is cred.Strip() with no refreshToken key and no
+// refresh-token value anywhere, its hash is the AccessHash, and the client
+// returns the stripped credential deep-equal, optional fields included.
+func TestFetchCredentialHandlerStripsSecret(t *testing.T) {
 	cred := pullCred("served", 2_000_000)
 	a := store.Account{ID: 7, ConfigDir: "/cfg/acct-07", KeychainService: "svc7", KeychainAccount: "me"}
 	reads := 0
 	lookup, read := servingSeams(t, "u-7", a, cred, &reads)
 	handler := NewFetchCredentialHandler(lookup, read)
 
-	// Server side: the envelope's blob is exactly cred.Marshal().
 	res, err := handler(context.Background(), map[string]any{"uuid": "u-7"})
 	if err != nil {
 		t.Fatalf("handler: %v", err)
@@ -108,21 +129,26 @@ func TestFetchCredentialEnvelopeRoundTripsByteExact(t *testing.T) {
 	if !ok {
 		t.Fatalf("handler result is %T, want CredentialEnvelope", res)
 	}
-	wantBlob, err := cred.Marshal()
+	wantBlob, err := cred.Strip().Marshal()
 	if err != nil {
-		t.Fatalf("marshal credential: %v", err)
+		t.Fatalf("marshal stripped credential: %v", err)
 	}
 	if !bytes.Equal(env.Credential, wantBlob) {
-		t.Fatalf("envelope credential = %s, want %s", env.Credential, wantBlob)
+		t.Fatalf("envelope credential = %s, want the stripped %s", env.Credential, wantBlob)
+	}
+	for _, leak := range [][]byte{[]byte("refreshToken"), []byte(cred.ClaudeAiOauth.RefreshToken)} {
+		if bytes.Contains(env.Credential, leak) {
+			t.Fatalf("envelope bytes leak %q: %s", leak, env.Credential)
+		}
 	}
 	if env.ExpiresAt != cred.ClaudeAiOauth.ExpiresAt {
 		t.Fatalf("envelope expiresAt = %d, want %d", env.ExpiresAt, cred.ClaudeAiOauth.ExpiresAt)
 	}
-	if env.Hash != CredentialHash(cred) {
-		t.Fatalf("envelope hash = %q, want %q", env.Hash, CredentialHash(cred))
+	if env.Hash != creds.AccessHash(cred) {
+		t.Fatalf("envelope hash = %q, want AccessHash %q", env.Hash, creds.AccessHash(cred))
 	}
 
-	// Client side: the pulled credential is deep-equal to what was served.
+	// Client side: the pulled credential is the stripped form, deep-equal.
 	var gotMethod string
 	var gotUUID any
 	tx := handlerTransport(handler)
@@ -132,13 +158,16 @@ func TestFetchCredentialEnvelopeRoundTripsByteExact(t *testing.T) {
 		gotUUID = req.Params["uuid"]
 		return inner(ctx, req)
 	}
-	chain := ChainStamp{ExpiresAt: cred.ClaudeAiOauth.ExpiresAt, Hash: CredentialHash(cred), Holder: "hostA"}
-	got, err := FetchCredential(context.Background(), func(string) syncservice.Transport { return tx }, "u-7", chain, 1_000_000, "", []string{"hostA"})
+	chain := ChainStamp{Origin: "hostA", ExpiresAt: cred.ClaudeAiOauth.ExpiresAt, Hash: creds.AccessHash(cred)}
+	got, err := FetchCredential(context.Background(), func(string) syncservice.Transport { return tx }, "u-7", chain, 1_000_000, []string{"hostA"})
 	if err != nil {
 		t.Fatalf("FetchCredential: %v", err)
 	}
-	if !reflect.DeepEqual(got, cred) {
-		t.Fatalf("pulled credential = %+v, want %+v", got, cred)
+	if !reflect.DeepEqual(got, cred.Strip()) {
+		t.Fatalf("pulled credential = %+v, want the stripped %+v", got, cred.Strip())
+	}
+	if got.HasRefreshToken() {
+		t.Fatal("pulled credential carries a refresh token")
 	}
 	if gotMethod != MethodFetchCredential {
 		t.Fatalf("request method = %q, want %q", gotMethod, MethodFetchCredential)
@@ -215,35 +244,41 @@ func TestFetchCredentialHandlerErrors(t *testing.T) {
 	}
 }
 
-// TestFetchCredentialRejectsHashMismatch pins the stale-peer-registry guard: a
-// credential that does not hash to the registry chain is rejected, whether the
-// envelope advertises honestly or lies (caught by local recomputation).
-func TestFetchCredentialRejectsHashMismatch(t *testing.T) {
-	served := pullCred("stale", 5_000_000)
-	chain := ChainStamp{ExpiresAt: 5_000_000, Hash: CredentialHash(pullCred("expected", 5_000_000))}
+// TestFetchFromPeerRejectsInvalidEnvelopes pins the client-side envelope
+// validation: an RT-bearing envelope (downrev peer) and a tokenless one are
+// rejected with their sentinels even when hash-consistent, and a credential
+// that does not hash to its own envelope is rejected by recomputation.
+func TestFetchFromPeerRejectsInvalidEnvelopes(t *testing.T) {
+	owned := pullCred("owned", 5_000)
+	tokenless := &creds.Credential{}
+	tokenless.ClaudeAiOauth.ExpiresAt = 5_000
 
-	honest := func() syncservice.Transport {
-		reads := 0
-		lookup, read := servingSeams(t, "u-1", store.Account{ID: 1}, served, &reads)
-		return handlerTransport(NewFetchCredentialHandler(lookup, read))
+	cases := map[string]struct {
+		tx        *fakeTransport
+		wantErrIs error
+	}{
+		"RT-bearing envelope rejected even when self-consistent": {
+			tx:        envelopeTransport(t, owned, creds.AccessHash(owned)),
+			wantErrIs: pool.ErrEnvelopeCarriesSecret,
+		},
+		"tokenless envelope rejected": {
+			tx:        envelopeTransport(t, tokenless, creds.AccessHash(tokenless)),
+			wantErrIs: pool.ErrEnvelopeNoAccessToken,
+		},
 	}
-	lying := func() syncservice.Transport {
-		blob, err := served.Marshal()
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
-		}
-		env := CredentialEnvelope{Credential: blob, ExpiresAt: served.ClaudeAiOauth.ExpiresAt, Hash: chain.Hash}
-		return handlerTransport(func(context.Context, map[string]any) (any, error) { return env, nil })
-	}
-
-	cases := map[string]func() syncservice.Transport{
-		"envelope advertises mismatched hash":      honest,
-		"envelope lies about a mismatched payload": lying,
-	}
-	for name, mk := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			tx := mk()
-			got, err := FetchCredential(context.Background(), func(string) syncservice.Transport { return tx }, "u-1", chain, 0, "", []string{"peerA"})
+			chain := ChainStamp{Origin: "hostA", ExpiresAt: 5_000, Hash: creds.AccessHash(owned)}
+			dial := func(string) syncservice.Transport { return tc.tx }
+			// The sentinel is visible per attempt (origin AND relay reject alike)...
+			for _, isOrigin := range []bool{true, false} {
+				_, err := fetchFromPeer(context.Background(), dial, "hostA", "u-1", chain, 0, isOrigin)
+				if !errors.Is(err, tc.wantErrIs) {
+					t.Fatalf("fetchFromPeer(isOrigin=%v) err = %v, want errors.Is %v", isOrigin, err, tc.wantErrIs)
+				}
+			}
+			// ...and the pull as a whole is the deferred outcome.
+			got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostA"})
 			if got != nil {
 				t.Fatalf("pulled credential = %+v, want nil", got)
 			}
@@ -252,6 +287,81 @@ func TestFetchCredentialRejectsHashMismatch(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("credential not hashing to its envelope is rejected", func(t *testing.T) {
+		stripped := pullCred("lying", 5_000).Strip()
+		tx := envelopeTransport(t, stripped, "garbage-hash")
+		chain := ChainStamp{Origin: "hostA", ExpiresAt: 5_000, Hash: "garbage-hash"}
+		got, err := FetchCredential(context.Background(), func(string) syncservice.Transport { return tx }, "u-1", chain, 0, []string{"hostA"})
+		if got != nil {
+			t.Fatalf("pulled credential = %+v, want nil", got)
+		}
+		if !errors.Is(err, ErrNoPeerCredential) {
+			t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
+		}
+	})
+}
+
+// TestFetchCredentialOriginAuthoritativeRelayMustMatch pins the trust split: a
+// relay whose answer does not match the registry hash is rejected, while the
+// origin's self-consistent, strictly-fresher answer is accepted even when it
+// is ahead of the registry stamp (mirror lag after a rotation).
+func TestFetchCredentialOriginAuthoritativeRelayMustMatch(t *testing.T) {
+	advertised := pullCred("t1", 5_000) // what the registry still advertises
+	rotated := pullCred("t2", 9_000)    // what the origin already rotated to
+	chain := ChainStamp{Origin: "hostA", ExpiresAt: 5_000, Hash: creds.AccessHash(advertised)}
+
+	t.Run("origin ahead of the registry is accepted", func(t *testing.T) {
+		var dialed []string
+		dial := func(peer string) syncservice.Transport {
+			dialed = append(dialed, peer)
+			if peer == "hostA" {
+				return serving(t, rotated)
+			}
+			return serving(t, advertised)
+		}
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB"})
+		if err != nil {
+			t.Fatalf("FetchCredential: %v", err)
+		}
+		if !reflect.DeepEqual(got, rotated.Strip()) {
+			t.Fatalf("pulled %+v, want the origin's rotated chain", got)
+		}
+		if want := []string{"hostA"}; !reflect.DeepEqual(dialed, want) {
+			t.Fatalf("dialed = %v, want %v — the origin answer is authoritative", dialed, want)
+		}
+	})
+
+	t.Run("origin staler than local is rejected", func(t *testing.T) {
+		dial := func(peer string) syncservice.Transport { return serving(t, advertised) }
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 6_000, []string{"hostB"})
+		if got != nil {
+			t.Fatalf("pulled %+v, want nil — origin authority never overrides freshness", got)
+		}
+		if !errors.Is(err, ErrNoPeerCredential) {
+			t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
+		}
+	})
+
+	t.Run("relay ahead of the registry is rejected, matching relay serves", func(t *testing.T) {
+		dial := func(peer string) syncservice.Transport {
+			switch peer {
+			case "hostA": // origin down
+				return failingTransport()
+			case "hostB": // stale-registry relay serving a chain the registry doesn't advertise
+				return serving(t, rotated)
+			default: // hostC matches the registry
+				return serving(t, advertised)
+			}
+		}
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB", "hostC"})
+		if err != nil {
+			t.Fatalf("FetchCredential: %v", err)
+		}
+		if !reflect.DeepEqual(got, advertised.Strip()) {
+			t.Fatalf("pulled %+v, want the registry-matching chain from hostC", got)
+		}
+	})
 }
 
 // TestFetchCredentialRequiresStrictlyLaterExpiry pins the freshness gate:
@@ -269,12 +379,10 @@ func TestFetchCredentialRequiresStrictlyLaterExpiry(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			served := pullCred("r", tc.remote)
-			reads := 0
-			lookup, read := servingSeams(t, "u-1", store.Account{ID: 1}, served, &reads)
-			tx := handlerTransport(NewFetchCredentialHandler(lookup, read))
-			chain := ChainStamp{ExpiresAt: tc.remote, Hash: CredentialHash(served)}
+			tx := serving(t, served)
+			chain := ChainStamp{ExpiresAt: tc.remote, Hash: creds.AccessHash(served)}
 
-			got, err := FetchCredential(context.Background(), func(string) syncservice.Transport { return tx }, "u-1", chain, tc.local, "", []string{"peerA"})
+			got, err := FetchCredential(context.Background(), func(string) syncservice.Transport { return tx }, "u-1", chain, tc.local, []string{"peerA"})
 			if tc.wantOK {
 				if err != nil {
 					t.Fatalf("FetchCredential: %v", err)
@@ -294,49 +402,12 @@ func TestFetchCredentialRequiresStrictlyLaterExpiry(t *testing.T) {
 	}
 }
 
-// TestFetchCredentialAcceptsChildDespiteSkewedExpiry pins the lineage OR-arm:
-// a chain descending from the local credential is accepted despite a
-// skewed-earlier expiry; an unlinked parent still hits the strictly-later rule.
-func TestFetchCredentialAcceptsChildDespiteSkewedExpiry(t *testing.T) {
-	parent := pullCred("parent", 2_000) // local credential, expiry skewed AHEAD
-	child := pullCred("child", 1_500)   // the live child a peer serves
-	localHash := CredentialHash(parent)
-	serve := func() syncservice.Transport {
-		reads := 0
-		lookup, read := servingSeams(t, "u-1", store.Account{ID: 1}, child, &reads)
-		return handlerTransport(NewFetchCredentialHandler(lookup, read))
-	}
-
-	t.Run("child of local accepted", func(t *testing.T) {
-		chain := ChainStamp{ExpiresAt: 1_500, Hash: CredentialHash(child), ParentHash: localHash}
-		got, err := FetchCredential(context.Background(), func(string) syncservice.Transport { return serve() }, "u-1", chain, 2_000, localHash, []string{"peerA"})
-		if err != nil {
-			t.Fatalf("FetchCredential: %v", err)
-		}
-		if !reflect.DeepEqual(got, child) {
-			t.Fatalf("pulled %+v, want the child", got)
-		}
-	})
-
-	t.Run("unlinked parent still requires strictly-later expiry", func(t *testing.T) {
-		chain := ChainStamp{ExpiresAt: 1_500, Hash: CredentialHash(child), ParentHash: "h-stranger"}
-		got, err := FetchCredential(context.Background(), func(string) syncservice.Transport { return serve() }, "u-1", chain, 2_000, localHash, []string{"peerA"})
-		if got != nil {
-			t.Fatalf("pulled %+v, want nil", got)
-		}
-		if !errors.Is(err, ErrNoPeerCredential) {
-			t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
-		}
-	})
-}
-
-// TestFetchCredentialHolderFirstThenPeers pins the peer order: holder first,
-// dialed once, falling back to the remaining peers; every transport is closed.
-func TestFetchCredentialHolderFirstThenPeers(t *testing.T) {
+// TestFetchCredentialOriginFirstThenPeers pins the peer order: the origin
+// first, dialed once, falling back to the remaining peers; every transport is
+// closed.
+func TestFetchCredentialOriginFirstThenPeers(t *testing.T) {
 	served := pullCred("good", 9_000)
-	reads := 0
-	lookup, read := servingSeams(t, "u-1", store.Account{ID: 1}, served, &reads)
-	chain := ChainStamp{ExpiresAt: 9_000, Hash: CredentialHash(served), Holder: "hostA"}
+	chain := ChainStamp{Origin: "hostA", ExpiresAt: 9_000, Hash: creds.AccessHash(served)}
 
 	var dialed []string
 	transports := map[string]*fakeTransport{}
@@ -346,18 +417,18 @@ func TestFetchCredentialHolderFirstThenPeers(t *testing.T) {
 		if peer == "hostA" {
 			tx = failingTransport()
 		} else {
-			tx = handlerTransport(NewFetchCredentialHandler(lookup, read))
+			tx = serving(t, served)
 		}
 		transports[peer] = tx
 		return tx
 	}
 
-	got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, "", []string{"hostB", "hostA"})
+	got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB", "hostA"})
 	if err != nil {
 		t.Fatalf("FetchCredential: %v", err)
 	}
-	if !reflect.DeepEqual(got, served) {
-		t.Fatalf("pulled credential = %+v, want %+v", got, served)
+	if !reflect.DeepEqual(got, served.Strip()) {
+		t.Fatalf("pulled credential = %+v, want %+v", got, served.Strip())
 	}
 	if want := []string{"hostA", "hostB"}; !reflect.DeepEqual(dialed, want) {
 		t.Fatalf("dial order = %v, want %v", dialed, want)
@@ -369,85 +440,11 @@ func TestFetchCredentialHolderFirstThenPeers(t *testing.T) {
 	}
 }
 
-// TestFetchCredentialHolderAheadHaltsFallback pins the mirror-lag guard: a
-// holder answering self-consistent and strictly fresher than the registry
-// chain defers the pull without falling back; an unhealthy holder still falls back.
-func TestFetchCredentialHolderAheadHaltsFallback(t *testing.T) {
-	advertised := pullCred("t1", 5_000) // what the registry still advertises
-	rotated := pullCred("t2", 9_000)    // what the holder already rotated to
-	chain := ChainStamp{ExpiresAt: 5_000, Hash: CredentialHash(advertised), Holder: "hostA"}
-
-	serving := func(cred *creds.Credential) *fakeTransport {
-		reads := 0
-		lookup, read := servingSeams(t, "u-1", store.Account{ID: 1}, cred, &reads)
-		return handlerTransport(NewFetchCredentialHandler(lookup, read))
-	}
-
-	t.Run("holder ahead defers without consulting laggards", func(t *testing.T) {
-		var dialed []string
-		dial := func(peer string) syncservice.Transport {
-			dialed = append(dialed, peer)
-			if peer == "hostA" {
-				return serving(rotated)
-			}
-			return serving(advertised)
-		}
-		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, "", []string{"hostB"})
-		if got != nil {
-			t.Fatalf("pulled %+v, want nil — the advertised chain is a spent dead end", got)
-		}
-		if !errors.Is(err, ErrNoPeerCredential) {
-			t.Fatalf("err = %v, want the deferred sentinel", err)
-		}
-		if want := []string{"hostA"}; !reflect.DeepEqual(dialed, want) {
-			t.Fatalf("dialed = %v, want %v — no laggard once the holder proves the registry stale", dialed, want)
-		}
-	})
-
-	t.Run("holder behind the registry still falls back", func(t *testing.T) {
-		older := pullCred("t0", 1_000)
-		dial := func(peer string) syncservice.Transport {
-			if peer == "hostA" {
-				return serving(older)
-			}
-			return serving(advertised)
-		}
-		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, "", []string{"hostB"})
-		if err != nil {
-			t.Fatalf("FetchCredential: %v", err)
-		}
-		if !reflect.DeepEqual(got, advertised) {
-			t.Fatalf("pulled %+v, want the advertised chain from the fallback peer", got)
-		}
-	})
-
-	t.Run("holder self-inconsistent answer still falls back", func(t *testing.T) {
-		blob, err := rotated.Marshal()
-		if err != nil {
-			t.Fatal(err)
-		}
-		lying := CredentialEnvelope{Credential: blob, ExpiresAt: rotated.ClaudeAiOauth.ExpiresAt, Hash: "garbage"}
-		dial := func(peer string) syncservice.Transport {
-			if peer == "hostA" {
-				return handlerTransport(func(context.Context, map[string]any) (any, error) { return lying, nil })
-			}
-			return serving(advertised)
-		}
-		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, "", []string{"hostB"})
-		if err != nil {
-			t.Fatalf("FetchCredential: %v", err)
-		}
-		if !reflect.DeepEqual(got, advertised) {
-			t.Fatalf("pulled %+v, want the advertised chain from the fallback peer", got)
-		}
-	})
-}
-
 // TestFetchCredentialAllPeersUnreachable pins the deferred outcome: every peer
 // failing — or there being no peers at all — returns the ErrNoPeerCredential
 // sentinel, while a canceled caller ctx surfaces as the ctx error instead.
 func TestFetchCredentialAllPeersUnreachable(t *testing.T) {
-	chain := ChainStamp{ExpiresAt: 1, Hash: "h", Holder: "hostA"}
+	chain := ChainStamp{Origin: "hostA", ExpiresAt: 1, Hash: "h"}
 
 	t.Run("all peers fail", func(t *testing.T) {
 		var dialed []string
@@ -455,7 +452,7 @@ func TestFetchCredentialAllPeersUnreachable(t *testing.T) {
 			dialed = append(dialed, peer)
 			return failingTransport()
 		}
-		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, "", []string{"hostB"})
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB"})
 		if got != nil {
 			t.Fatalf("pulled credential = %+v, want nil", got)
 		}
@@ -472,7 +469,7 @@ func TestFetchCredentialAllPeersUnreachable(t *testing.T) {
 			t.Fatal("dial must not be called with no candidates")
 			return nil
 		}
-		_, err := FetchCredential(context.Background(), dial, "u-1", ChainStamp{}, 0, "", nil)
+		_, err := FetchCredential(context.Background(), dial, "u-1", ChainStamp{}, 0, nil)
 		if !errors.Is(err, ErrNoPeerCredential) {
 			t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
 		}
@@ -481,7 +478,7 @@ func TestFetchCredentialAllPeersUnreachable(t *testing.T) {
 	t.Run("canceled ctx is not the deferred sentinel", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, err := FetchCredential(ctx, func(string) syncservice.Transport { return failingTransport() }, "u-1", chain, 0, "", []string{"hostB"})
+		_, err := FetchCredential(ctx, func(string) syncservice.Transport { return failingTransport() }, "u-1", chain, 0, []string{"hostB"})
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("err = %v, want errors.Is context.Canceled", err)
 		}
@@ -500,9 +497,7 @@ func TestFetchCredentialPerPeerTimeout(t *testing.T) {
 	t.Cleanup(func() { FetchTimeout = prev })
 
 	served := pullCred("good", 7_000)
-	reads := 0
-	lookup, read := servingSeams(t, "u-1", store.Account{ID: 1}, served, &reads)
-	chain := ChainStamp{ExpiresAt: 7_000, Hash: CredentialHash(served), Holder: "slow"}
+	chain := ChainStamp{Origin: "slow", ExpiresAt: 7_000, Hash: creds.AccessHash(served)}
 
 	hang := &fakeTransport{do: func(ctx context.Context, _ *rpc.Request) (*syncservice.Response, error) {
 		<-ctx.Done()
@@ -512,16 +507,16 @@ func TestFetchCredentialPerPeerTimeout(t *testing.T) {
 		if peer == "slow" {
 			return hang
 		}
-		return handlerTransport(NewFetchCredentialHandler(lookup, read))
+		return serving(t, served)
 	}
 
 	start := time.Now()
-	got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, "", []string{"fast"})
+	got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"fast"})
 	if err != nil {
 		t.Fatalf("FetchCredential: %v", err)
 	}
-	if !reflect.DeepEqual(got, served) {
-		t.Fatalf("pulled credential = %+v, want %+v", got, served)
+	if !reflect.DeepEqual(got, served.Strip()) {
+		t.Fatalf("pulled credential = %+v, want %+v", got, served.Strip())
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("fetch took %v; the hung peer was not bounded by FetchTimeout", elapsed)

@@ -73,8 +73,7 @@ func TestLoadSaveRoundTripInt64Stamps(t *testing.T) {
 		Email:        "e@x.com",
 		Label:        "label",
 		OAuthAccount: json.RawMessage(`{"accountUuid":"u1"}`),
-		Chain:        ChainStamp{ExpiresAt: big, Hash: "h", Holder: "H", RotatedAt: big - 1},
-		Lease:        &Lease{Host: "L", Until: big - 2},
+		Chain:        ChainStamp{Origin: "H", ExpiresAt: big, Hash: "h", RotatedAt: big - 1},
 	}
 	reg := cregistry.New[AccountValue]()
 	reg.Add("u1", val, cregistry.Micros(big-3))
@@ -107,14 +106,13 @@ func TestLoadSaveRoundTripInt64Stamps(t *testing.T) {
 		{"Removed", int64(e.Removed), big - 4},
 		{"Chain.ExpiresAt", e.Value.Chain.ExpiresAt, big},
 		{"Chain.RotatedAt", e.Value.Chain.RotatedAt, big - 1},
-		{"Lease.Until", e.Value.Lease.Until, big - 2},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
 			t.Errorf("%s = %d, want %d (int64 corrupted)", c.name, c.got, c.want)
 		}
 	}
-	if e.Value.UUID != "u1" || e.Value.Chain.Hash != "h" || e.Value.Chain.Holder != "H" || e.Value.Lease.Host != "L" {
+	if e.Value.UUID != "u1" || e.Value.Chain.Hash != "h" || e.Value.Chain.Origin != "H" {
 		t.Errorf("scalar fields not preserved: %+v", e.Value)
 	}
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,23 +76,23 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 	return s, m, fk, rec
 }
 
-// freshCred is a pulled envelope whose access token has not expired, so
-// FinalizeAdd's usage validation never triggers a refresh.
-func freshCred(access, refresh string) *creds.Credential {
-	c := cred(access, refresh)
+// freshEnvelope is a pulled STRIPPED envelope whose access token has not
+// expired, so FinalizeAdd's usage validation never triggers a refresh.
+func freshEnvelope(access string) *creds.Credential {
+	c := cred(access, "")
 	c.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
 	return c
 }
 
 // materializeVal builds a peer-added registry value with a full, verbatim
-// oauthAccount object and a holder-owned chain stamp.
+// oauthAccount object and an origin-owned chain stamp.
 func materializeVal(uuid, email string, oauthAccount json.RawMessage) AccountValue {
 	return AccountValue{
 		UUID:         uuid,
 		Email:        email,
 		Label:        "peer-" + uuid,
 		OAuthAccount: oauthAccount,
-		Chain:        ChainStamp{ExpiresAt: 1_800_000_000_000, Hash: "h-" + uuid, Holder: "hostA", ParentHash: "hp-" + uuid},
+		Chain:        ChainStamp{Origin: "hostA", ExpiresAt: 1_800_000_000_000, Hash: "h-" + uuid},
 	}
 }
 
@@ -111,7 +112,7 @@ func TestMaterializeHappyPath(t *testing.T) {
 	}
 
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-happy","emailAddress":"happy@example.com","organizationUuid":"org-1","nested":{"k":1},"flag":true}`)
-	env := freshCred("at-happy", "rt-happy")
+	env := freshEnvelope("at-happy")
 
 	res, err := s.Materialize(context.Background(), materializeVal("u-happy", "happy@example.com", oauthAccount), []string{"hostB"}, pullConst(env), materializeManifest)
 	if err != nil {
@@ -178,8 +179,8 @@ func TestMaterializeHappyPath(t *testing.T) {
 	if src != creds.SourceKeychain {
 		t.Fatalf("credential source = %v, want keychain", src)
 	}
-	if gotCred.ClaudeAiOauth.AccessToken != "at-happy" || gotCred.ClaudeAiOauth.RefreshToken != "rt-happy" {
-		t.Fatalf("installed credential = %+v, want the pulled at-happy/rt-happy", gotCred.ClaudeAiOauth)
+	if gotCred.ClaudeAiOauth.AccessToken != "at-happy" || gotCred.HasRefreshToken() {
+		t.Fatalf("installed credential = %+v, want the stripped at-happy with no refresh token", gotCred.ClaudeAiOauth)
 	}
 	if _, ok := fk.Get(row.KeychainService, creds.AccountLabel()); !ok {
 		t.Fatalf("keychain item %q/%q absent, want the installed envelope", row.KeychainService, creds.AccountLabel())
@@ -199,7 +200,7 @@ func TestMaterializeSeedNoSourceBootstraps(t *testing.T) {
 	// No ~/.claude.json written: PrepareAdd reports SeedNoSource.
 
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-nosrc","emailAddress":"nosrc@example.com"}`)
-	res, err := s.Materialize(context.Background(), materializeVal("u-nosrc", "nosrc@example.com", oauthAccount), []string{"hostB"}, pullConst(freshCred("at-n", "rt-n")), materializeManifest)
+	res, err := s.Materialize(context.Background(), materializeVal("u-nosrc", "nosrc@example.com", oauthAccount), []string{"hostB"}, pullConst(freshEnvelope("at-n")), materializeManifest)
 	if err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
@@ -252,7 +253,7 @@ func TestMaterializeKeychainUnavailableFallsBackToFile(t *testing.T) {
 	fk.KeychainFaults = credstest.Faults{Read: creds.ErrUnavailable}
 
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-file","emailAddress":"file@example.com"}`)
-	res, err := s.Materialize(context.Background(), materializeVal("u-file", "file@example.com", oauthAccount), []string{"hostB"}, pullConst(freshCred("at-f", "rt-f")), materializeManifest)
+	res, err := s.Materialize(context.Background(), materializeVal("u-file", "file@example.com", oauthAccount), []string{"hostB"}, pullConst(freshEnvelope("at-f")), materializeManifest)
 	if err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
@@ -347,38 +348,132 @@ func TestMaterializeNoEnvelopeAborts(t *testing.T) {
 	}
 }
 
-// TestMaterializeTokenlessEnvelopeAborts pins the credential-ingress gate: a
-// pulled envelope with no access token (self-consistent but unusable — a
-// malformed or downrev peer) must abort and roll back rather than materialize
-// a tombstoned account.
-func TestMaterializeTokenlessEnvelopeAborts(t *testing.T) {
-	s, m, _, rec := newMaterializeService(t)
+// TestMaterializeRejectedEnvelopeReleasesNotAbandons pins the rejection path:
+// a tokenless or RT-bearing envelope aborts WITHOUT AbandonAdd — the dir (and
+// any retained login state in it) survives, only the reservation is released,
+// and no row or nudge lands.
+func TestMaterializeRejectedEnvelopeReleasesNotAbandons(t *testing.T) {
+	tokenless := &creds.Credential{}
+	tokenless.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
+	rtBearing := cred("at-secret", "rt-secret")
+	rtBearing.ClaudeAiOauth.ExpiresAt = tokenless.ClaudeAiOauth.ExpiresAt
+
+	cases := map[string]struct {
+		env       *creds.Credential
+		wantErrIs error
+	}{
+		"tokenless envelope":  {tokenless, pool.ErrEnvelopeNoAccessToken},
+		"RT-bearing envelope": {rtBearing, pool.ErrEnvelopeCarriesSecret},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, m, fk, rec := newMaterializeService(t)
+			if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			oauthAccount := json.RawMessage(`{"accountUuid":"u-rej","emailAddress":"r@example.com"}`)
+
+			res, err := s.Materialize(context.Background(), materializeVal("u-rej", "r@example.com", oauthAccount), []string{"hostB"}, pullConst(tc.env), materializeManifest)
+			if !errors.Is(err, tc.wantErrIs) {
+				t.Fatalf("err = %v, want errors.Is %v", err, tc.wantErrIs)
+			}
+			if res != (MaterializeResult{}) {
+				t.Fatalf("result = %+v, want zero on rejection", res)
+			}
+			// The dir is kept (release, not abandon) and no credential was written.
+			if _, statErr := os.Stat(pool.AccountDir(1)); statErr != nil {
+				t.Fatalf("account dir stat err = %v, want kept on rejection", statErr)
+			}
+			if _, ok := fk.Get(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel()); ok {
+				t.Fatal("a rejected envelope landed in the keychain")
+			}
+			// Reservation released: the freed index is handed straight back.
+			n, rerr := m.Store.ReserveAccountIndex()
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			if n != 1 {
+				t.Fatalf("next reserved index = %d, want the released 1", n)
+			}
+			accounts, lerr := m.Store.ListAccounts()
+			if lerr != nil {
+				t.Fatal(lerr)
+			}
+			if len(accounts) != 0 {
+				t.Fatalf("accounts = %+v, want none after rejection", accounts)
+			}
+			if len(rec.calls) != 0 {
+				t.Fatalf("nudge calls = %v, want none on rejection", rec.calls)
+			}
+		})
+	}
+}
+
+// TestMaterializeNeverOverwritesRetainedCredential pins the interrupted-add
+// guard: a kept dir whose slot retains a usable credential (from a prior
+// ReleaseAdd) aborts before writing identity or pulling — the retained
+// credential and identity survive intact and the reservation is released.
+func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
+	s, m, fk, rec := newMaterializeService(t)
 	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	tokenless := &creds.Credential{}
-	tokenless.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
-	oauthAccount := json.RawMessage(`{"accountUuid":"u-tokenless","emailAddress":"t@example.com"}`)
 
-	res, err := s.Materialize(context.Background(), materializeVal("u-tokenless", "t@example.com", oauthAccount), []string{"hostB"}, pullConst(tokenless), materializeManifest)
-	if !errors.Is(err, pool.ErrEnvelopeNoAccessToken) {
-		t.Fatalf("err = %v, want errors.Is pool.ErrEnvelopeNoAccessToken", err)
+	// A kept dir from an interrupted `ccp add`: its own identity + owned credential.
+	keptDir := pool.AccountDir(1)
+	if err := os.MkdirAll(keptDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const keptIdentity = `{"oauthAccount":{"accountUuid":"u-kept","emailAddress":"kept@example.com"}}`
+	if err := os.WriteFile(filepath.Join(keptDir, ".claude.json"), []byte(keptIdentity), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	retained := cred("at-kept", "rt-kept")
+	retained.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
+	fk.Put(creds.ServiceName(keptDir), "claude-login-label", retained)
+
+	pullFatal := PullCredential(func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
+		t.Fatal("pull invoked despite a retained slot credential")
+		return nil, nil
+	})
+	oauthAccount := json.RawMessage(`{"accountUuid":"u-peer","emailAddress":"peer@example.com"}`)
+	res, err := s.Materialize(context.Background(), materializeVal("u-peer", "peer@example.com", oauthAccount), []string{"hostB"}, pullFatal, materializeManifest)
+	if err == nil || !strings.Contains(err.Error(), "retains a credential") {
+		t.Fatalf("err = %v, want the retained-credential abort", err)
 	}
 	if res != (MaterializeResult{}) {
 		t.Fatalf("result = %+v, want zero on abort", res)
 	}
-	if _, statErr := os.Stat(pool.AccountDir(1)); !os.IsNotExist(statErr) {
-		t.Fatalf("account dir stat err = %v, want not-exist (AbandonAdd must remove it)", statErr)
+
+	// Retained credential intact, identity untouched (WriteIdentity never ran).
+	got, ok := fk.Get(creds.ServiceName(keptDir), "claude-login-label")
+	if !ok || got.ClaudeAiOauth.RefreshToken != "rt-kept" {
+		t.Fatalf("retained credential = %+v ok=%v, want rt-kept intact", got, ok)
+	}
+	raw, err := os.ReadFile(filepath.Join(keptDir, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != keptIdentity {
+		t.Fatalf("kept identity mutated: %s", raw)
+	}
+	// Reservation released, no row, no nudge.
+	n, rerr := m.Store.ReserveAccountIndex()
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if n != 1 {
+		t.Fatalf("next reserved index = %d, want the released 1", n)
 	}
 	accounts, lerr := m.Store.ListAccounts()
 	if lerr != nil {
 		t.Fatal(lerr)
 	}
 	if len(accounts) != 0 {
-		t.Fatalf("accounts = %+v, want none after abort", accounts)
+		t.Fatalf("accounts = %+v, want none", accounts)
 	}
 	if len(rec.calls) != 0 {
-		t.Fatalf("nudge calls = %v, want none on abort", rec.calls)
+		t.Fatalf("nudge calls = %v, want none", rec.calls)
 	}
 }
 

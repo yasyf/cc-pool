@@ -50,8 +50,7 @@ func TestSSHFetcherRoundTripInt64Stamps(t *testing.T) {
 		Email:        "e@x.com",
 		Label:        "work",
 		OAuthAccount: json.RawMessage(`{"accountUuid":"u1"}`),
-		Chain:        ChainStamp{ExpiresAt: big, Hash: "h", Holder: "hostA", RotatedAt: big - 1},
-		Lease:        &Lease{Host: "hostA", Until: big - 2},
+		Chain:        ChainStamp{Origin: "hostA", ExpiresAt: big, Hash: "h", RotatedAt: big - 1},
 	}
 	reg.Add("u1", val, cregistry.Micros(big-4))
 
@@ -77,14 +76,13 @@ func TestSSHFetcherRoundTripInt64Stamps(t *testing.T) {
 		{"Added", int64(e.Added), big - 4},
 		{"Chain.ExpiresAt", e.Value.Chain.ExpiresAt, big},
 		{"Chain.RotatedAt", e.Value.Chain.RotatedAt, big - 1},
-		{"Lease.Until", e.Value.Lease.Until, big - 2},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
 			t.Errorf("%s = %d, want %d (int64 corrupted through decode)", c.name, c.got, c.want)
 		}
 	}
-	if e.Value.Chain.Holder != "hostA" || e.Value.Label != "work" {
+	if e.Value.Chain.Origin != "hostA" || e.Value.Label != "work" {
 		t.Errorf("scalar fields not preserved: %+v", e.Value)
 	}
 	if !getter.closed {
@@ -160,7 +158,7 @@ func TestPeerTransportExecServesRegistry(t *testing.T) {
 		UUID:         "u1",
 		Email:        "e@x.com",
 		OAuthAccount: json.RawMessage(`{"accountUuid":"u1"}`),
-		Chain:        ChainStamp{ExpiresAt: big, Hash: "h", Holder: "hostA", RotatedAt: big - 1},
+		Chain:        ChainStamp{Origin: "hostA", ExpiresAt: big, Hash: "h", RotatedAt: big - 1},
 	}, cregistry.Micros(big-2))
 	body, err := json.Marshal(reg)
 	if err != nil {
@@ -190,7 +188,7 @@ func TestPeerTransportExecServesRegistry(t *testing.T) {
 		t.Fatalf("int64 stamps corrupted through the real bridge: added=%d expiry=%d, want %d/%d",
 			int64(e.Added), e.Value.Chain.ExpiresAt, big-2, big)
 	}
-	if e.Value.Chain.Holder != "hostA" {
+	if e.Value.Chain.Origin != "hostA" {
 		t.Fatalf("value not round-tripped through the exec: bridge: %+v", e.Value)
 	}
 }

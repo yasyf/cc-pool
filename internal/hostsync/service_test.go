@@ -34,13 +34,13 @@ func newTestService(t *testing.T) (*Service, *fakeClock) {
 	return s, clk
 }
 
-func acctVal(uuid, email, label, holder string, expiresAt int64) AccountValue {
+func acctVal(uuid, email, label, origin string, expiresAt int64) AccountValue {
 	return AccountValue{
 		UUID:         uuid,
 		Email:        email,
 		Label:        label,
 		OAuthAccount: json.RawMessage(`{"accountUuid":"` + uuid + `"}`),
-		Chain:        ChainStamp{ExpiresAt: expiresAt, Hash: "h-" + uuid, Holder: holder, RotatedAt: expiresAt - 100},
+		Chain:        ChainStamp{Origin: origin, ExpiresAt: expiresAt, Hash: "h-" + uuid, RotatedAt: expiresAt - 100},
 	}
 }
 
@@ -82,7 +82,7 @@ func TestPublishAccountOverridesTombstone(t *testing.T) {
 		if !ok || !e.Present() {
 			t.Fatalf("account not present after publish: ok=%v entry=%+v", ok, e)
 		}
-		if e.Value.Chain.Holder != "hostA" || e.Value.Label != "work" {
+		if e.Value.Chain.Origin != "hostA" || e.Value.Label != "work" {
 			t.Errorf("value not stored: %+v", e.Value)
 		}
 		if _, ok := stampSig(t, s, "u1"); !ok {
@@ -110,7 +110,7 @@ func TestPublishAccountOverridesTombstone(t *testing.T) {
 		if !e.Present() {
 			t.Fatal("re-publish did not override the tombstone")
 		}
-		if e.Value.Label != "l2" || e.Value.Chain.Holder != "hostB" {
+		if e.Value.Label != "l2" || e.Value.Chain.Origin != "hostB" {
 			t.Errorf("re-published value not applied: %+v", e.Value)
 		}
 	})
@@ -233,8 +233,8 @@ func TestNoteCredWriteNoopOnEqualChain(t *testing.T) {
 		name  string
 		chain ChainStamp
 	}{
-		{"equal expiry", ChainStamp{ExpiresAt: 1000, Hash: "other", Holder: "hostB"}},
-		{"staler expiry", ChainStamp{ExpiresAt: 999, Hash: "other", Holder: "hostB"}},
+		{"equal expiry", ChainStamp{Origin: "hostB", ExpiresAt: 1000, Hash: "other"}},
+		{"staler expiry", ChainStamp{Origin: "hostB", ExpiresAt: 999, Hash: "other"}},
 	}
 	for _, tc := range noops {
 		t.Run(tc.name, func(t *testing.T) {
@@ -256,7 +256,7 @@ func TestNoteCredWriteNoopOnEqualChain(t *testing.T) {
 
 	t.Run("strictly fresher updates and touches", func(t *testing.T) {
 		clk.advance(time.Second)
-		fresh := ChainStamp{ExpiresAt: 2000, Hash: "fresh", Holder: "hostB", RotatedAt: 1900}
+		fresh := ChainStamp{Origin: "hostB", ExpiresAt: 2000, Hash: "fresh", RotatedAt: 1900}
 		if err := s.NoteCredWrite(ctx, "u1", fresh); err != nil {
 			t.Fatalf("NoteCredWrite fresher: %v", err)
 		}
@@ -293,178 +293,27 @@ func TestNoteCredWriteNoopOnEqualChain(t *testing.T) {
 	})
 }
 
-// TestNoteCredWriteChildLineage pins the lineage arm of the freshness guard: a
-// child of the advertised chain lands even with an equal-or-earlier expiry,
-// while an unlinked ParentHash still falls back to the expiry rule.
-func TestNoteCredWriteChildLineage(t *testing.T) {
-	ctx := context.Background()
-
-	seed := func(t *testing.T) (*Service, *fakeClock) {
-		t.Helper()
-		s, clk := newTestService(t)
-		v := acctVal("u1", "e", "l", "hostA", 2000)
-		v.Chain.Hash = "H2"
-		if err := s.PublishAccount(ctx, v); err != nil {
-			t.Fatalf("publish: %v", err)
-		}
-		clk.advance(time.Second)
-		return s, clk
-	}
-
-	t.Run("child lands despite skewed-earlier expiry", func(t *testing.T) {
-		s, _ := seed(t)
-		child := ChainStamp{ExpiresAt: 1500, Hash: "H3", Holder: "hostB", ParentHash: "H2", RotatedAt: 1400}
-		if err := s.NoteCredWrite(ctx, "u1", child); err != nil {
-			t.Fatalf("NoteCredWrite: %v", err)
-		}
-		e, _ := loadEntry(t, s, "u1")
-		if e.Value.Chain != child {
-			t.Fatalf("child chain did not land: %+v", e.Value.Chain)
-		}
-	})
-
-	t.Run("unlinked parent falls back to the expiry rule", func(t *testing.T) {
-		s, _ := seed(t)
-		stranger := ChainStamp{ExpiresAt: 1500, Hash: "H9", Holder: "hostB", ParentHash: "H8"}
-		if err := s.NoteCredWrite(ctx, "u1", stranger); err != nil {
-			t.Fatalf("NoteCredWrite: %v", err)
-		}
-		e, _ := loadEntry(t, s, "u1")
-		if e.Value.Chain.Hash != "H2" {
-			t.Fatalf("an unlinked staler chain landed: %+v", e.Value.Chain)
-		}
-	})
-}
-
-// TestScanPublishChainLineage pins the lineage arms of the scan fold: an ahead
-// local chain folds in despite a skewed-earlier expiry, and a chain whose
-// child the registry advertises never regresses it.
-func TestScanPublishChainLineage(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("local ahead folds despite skewed-earlier expiry", func(t *testing.T) {
-		s, _ := newTestService(t)
-		s.Locals = func(context.Context) ([]LocalAccount, error) {
-			return []LocalAccount{{
-				UUID:  "u1",
-				Chain: ChainStamp{ExpiresAt: 1500, Hash: "H3", Holder: "hostB", ParentHash: "H2"},
-			}}, nil
-		}
-		reg := cregistry.New[AccountValue]()
-		regVal := acctVal("u1", "e", "l", "hostA", 2000)
-		regVal.Chain.Hash = "H2"
-		reg.Add("u1", regVal, cregistry.Micros(1000))
-
-		changed, err := s.ScanPublish(ctx, reg)
-		if err != nil {
-			t.Fatalf("ScanPublish: %v", err)
-		}
-		if !changed || reg["u1"].Value.Chain.Hash != "H3" {
-			t.Fatalf("child fold did not land: changed=%v chain=%+v", changed, reg["u1"].Value.Chain)
-		}
-	})
-
-	t.Run("registry advertising our child is never regressed", func(t *testing.T) {
-		s, _ := newTestService(t)
-		s.Locals = func(context.Context) ([]LocalAccount, error) {
-			return []LocalAccount{{
-				UUID:  "u1",
-				Chain: ChainStamp{ExpiresAt: 2000, Hash: "H2", Holder: "hostB", ParentHash: "H1"},
-			}}, nil
-		}
-		reg := cregistry.New[AccountValue]()
-		regVal := acctVal("u1", "e", "l", "hostA", 1500)
-		regVal.Chain.Hash = "H3"
-		regVal.Chain.ParentHash = "H2"
-		reg.Add("u1", regVal, cregistry.Micros(1000))
-		before := reg["u1"].Added
-
-		changed, err := s.ScanPublish(ctx, reg)
-		if err != nil {
-			t.Fatalf("ScanPublish: %v", err)
-		}
-		if changed || reg["u1"].Value.Chain.Hash != "H3" || reg["u1"].Added != before {
-			t.Fatalf("scan regressed the registry onto our parent chain: changed=%v chain=%+v", changed, reg["u1"].Value.Chain)
-		}
-	})
-}
-
-func TestClaimHolderAndLeaseRoundTrip(t *testing.T) {
+// TestNoteCredWriteSkewedChildNeverLands pins the strictly-fresher-only rule:
+// an origin clock rollback can stamp a rotation child EARLIER than its parent,
+// and that child never lands — benign, the registry keeps the still-valid
+// parent until it expires and the next rotation overtakes it.
+func TestNoteCredWriteSkewedChildNeverLands(t *testing.T) {
 	ctx := context.Background()
 	s, clk := newTestService(t)
-	if err := s.PublishAccount(ctx, acctVal("u1", "e", "l", "", 1000)); err != nil {
+	v := acctVal("u1", "e", "l", "hostA", 2000)
+	v.Chain.Hash = "H2"
+	if err := s.PublishAccount(ctx, v); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-
 	clk.advance(time.Second)
-	if err := s.ClaimHolder(ctx, "u1", "hostA"); err != nil {
-		t.Fatalf("ClaimHolder: %v", err)
-	}
-	if e, _ := loadEntry(t, s, "u1"); e.Value.Chain.Holder != "hostA" {
-		t.Fatalf("holder = %q, want hostA", e.Value.Chain.Holder)
-	}
 
-	clk.advance(time.Second)
-	if err := s.RenewLease(ctx, "u1", "hostA", 5000); err != nil {
-		t.Fatalf("RenewLease: %v", err)
+	child := ChainStamp{Origin: "hostA", ExpiresAt: 1500, Hash: "H3", RotatedAt: 1400}
+	if err := s.NoteCredWrite(ctx, "u1", child); err != nil {
+		t.Fatalf("NoteCredWrite: %v", err)
 	}
 	e, _ := loadEntry(t, s, "u1")
-	if e.Value.Lease == nil || e.Value.Lease.Host != "hostA" || e.Value.Lease.Until != 5000 {
-		t.Fatalf("lease not set: %+v", e.Value.Lease)
-	}
-	if e.Value.Chain.Holder != "hostA" {
-		t.Errorf("holder lost across RenewLease: %+v", e.Value.Chain)
-	}
-
-	// Renew extends the same lease.
-	clk.advance(time.Second)
-	if err := s.RenewLease(ctx, "u1", "hostA", 6000); err != nil {
-		t.Fatalf("renew: %v", err)
-	}
-	if e, _ := loadEntry(t, s, "u1"); e.Value.Lease.Until != 6000 {
-		t.Errorf("lease not renewed: until = %d", e.Value.Lease.Until)
-	}
-
-	// A non-owner cannot release the lease: no-op, no stamp touch.
-	clk.advance(time.Second)
-	sig, _ := stampSig(t, s, "u1")
-	if err := s.ReleaseLease(ctx, "u1", "hostB"); err != nil {
-		t.Fatalf("ReleaseLease non-owner: %v", err)
-	}
-	e, _ = loadEntry(t, s, "u1")
-	if e.Value.Lease == nil || e.Value.Lease.Host != "hostA" {
-		t.Errorf("non-owner released the lease: %+v", e.Value.Lease)
-	}
-	if got, _ := stampSig(t, s, "u1"); got != sig {
-		t.Error("non-owner ReleaseLease touched the stamp")
-	}
-
-	// The owner releases the lease.
-	clk.advance(time.Second)
-	if err := s.ReleaseLease(ctx, "u1", "hostA"); err != nil {
-		t.Fatalf("ReleaseLease owner: %v", err)
-	}
-	e, _ = loadEntry(t, s, "u1")
-	if e.Value.Lease != nil {
-		t.Errorf("owner did not release the lease: %+v", e.Value.Lease)
-	}
-	if e.Value.Chain.Holder != "hostA" {
-		t.Errorf("holder lost across ReleaseLease: %+v", e.Value.Chain)
-	}
-	if got, _ := stampSig(t, s, "u1"); got == sig {
-		t.Error("owner ReleaseLease did not touch the stamp")
-	}
-
-	// Lease ops on an unknown account fail loud.
-	if err := s.ClaimHolder(ctx, "ghost", "hostA"); err == nil {
-		t.Error("ClaimHolder for unknown account returned nil error")
-	}
-	if err := s.RenewLease(ctx, "ghost", "hostA", 1); err == nil {
-		t.Error("RenewLease for unknown account returned nil error")
-	}
-	// Releasing a lease on an unknown account is a tolerant no-op.
-	if err := s.ReleaseLease(ctx, "ghost", "hostA"); err != nil {
-		t.Errorf("ReleaseLease for unknown account errored: %v", err)
+	if e.Value.Chain.Hash != "H2" {
+		t.Fatalf("an earlier-expiring chain landed: %+v", e.Value.Chain)
 	}
 }
 
@@ -473,8 +322,8 @@ func TestScanPublishNewLocalAccount(t *testing.T) {
 	s, _ := newTestService(t)
 	s.Locals = func(context.Context) ([]LocalAccount, error) {
 		return []LocalAccount{
-			{UUID: "u1", Email: "e1@x", Label: "one", Chain: ChainStamp{ExpiresAt: 1000, Hash: "h1", Holder: "hostA"}},
-			{UUID: "u2", Email: "e2@x", Label: "two", Chain: ChainStamp{ExpiresAt: 2000, Hash: "h2", Holder: "hostA"}},
+			{UUID: "u1", Email: "e1@x", Label: "one", Chain: ChainStamp{Origin: "hostA", ExpiresAt: 1000, Hash: "h1"}},
+			{UUID: "u2", Email: "e2@x", Label: "two", Chain: ChainStamp{Origin: "hostA", ExpiresAt: 2000, Hash: "h2"}},
 		}, nil
 	}
 	reg := cregistry.New[AccountValue]()
@@ -519,7 +368,7 @@ func TestScanPublishFresherChainOnly(t *testing.T) {
 		Email:        "registry@x",
 		Label:        "registry-label",
 		OAuthAccount: json.RawMessage(`{"registry":true}`),
-		Chain:        ChainStamp{ExpiresAt: 1000, Hash: "reg", Holder: "hostA"},
+		Chain:        ChainStamp{Origin: "hostA", ExpiresAt: 1000, Hash: "reg"},
 	}
 
 	cases := []struct {
@@ -540,7 +389,7 @@ func TestScanPublishFresherChainOnly(t *testing.T) {
 					UUID:  "u1",
 					Email: "local@x", // differs from the registry — must be ignored
 					Label: "local-label",
-					Chain: ChainStamp{ExpiresAt: tc.localExpiry, Hash: "local", Holder: "hostB"},
+					Chain: ChainStamp{Origin: "hostB", ExpiresAt: tc.localExpiry, Hash: "local"},
 				}}, nil
 			}
 			reg := cregistry.New[AccountValue]()
@@ -581,7 +430,7 @@ func TestScanPublishNeverResurrectsTombstone(t *testing.T) {
 			UUID:  "u1",
 			Email: "e",
 			Label: "l",
-			Chain: ChainStamp{ExpiresAt: 9_000_000_000_000, Hash: "superfresh", Holder: "hostB"},
+			Chain: ChainStamp{Origin: "hostB", ExpiresAt: 9_000_000_000_000, Hash: "superfresh"},
 		}}, nil
 	}
 	reg := cregistry.New[AccountValue]()
@@ -672,12 +521,6 @@ func TestLocalMutationForcesPastSkewedAdd(t *testing.T) {
 			t.Fatalf("seed present: %v", err)
 		}
 	}
-	leased := func(host string) AccountValue {
-		v := acctVal("u1", "e", "l", "hostA", 1000)
-		v.Lease = &Lease{Host: host, Until: 5000}
-		return v
-	}
-
 	cases := []struct {
 		name   string
 		seed   func(t *testing.T, s *Service)
@@ -688,7 +531,7 @@ func TestLocalMutationForcesPastSkewedAdd(t *testing.T) {
 			name: "NoteCredWrite fresher chain",
 			seed: func(t *testing.T, s *Service) { seedPresent(t, s, acctVal("u1", "e", "l", "hostA", 1000)) },
 			mutate: func(s *Service) error {
-				return s.NoteCredWrite(ctx, "u1", ChainStamp{ExpiresAt: 2000, Hash: "fresh", Holder: "hostA", RotatedAt: 1900})
+				return s.NoteCredWrite(ctx, "u1", ChainStamp{Origin: "hostA", ExpiresAt: 2000, Hash: "fresh", RotatedAt: 1900})
 			},
 			check: func(t *testing.T, e cregistry.Entry[AccountValue]) {
 				if e.Value.Chain.ExpiresAt != 2000 || e.Value.Chain.Hash != "fresh" {
@@ -701,7 +544,7 @@ func TestLocalMutationForcesPastSkewedAdd(t *testing.T) {
 			seed:   func(t *testing.T, s *Service) { seedPresent(t, s, acctVal("u1", "e", "old", "hostA", 1000)) },
 			mutate: func(s *Service) error { return s.PublishAccount(ctx, acctVal("u1", "e", "new", "hostB", 2000)) },
 			check: func(t *testing.T, e cregistry.Entry[AccountValue]) {
-				if e.Value.Label != "new" || e.Value.Chain.Holder != "hostB" {
+				if e.Value.Label != "new" || e.Value.Chain.Origin != "hostB" {
 					t.Errorf("relogin publish did not land: %+v", e.Value)
 				}
 			},
@@ -730,36 +573,6 @@ func TestLocalMutationForcesPastSkewedAdd(t *testing.T) {
 			check: func(t *testing.T, e cregistry.Entry[AccountValue]) {
 				if e.Value.Label != "renamed" {
 					t.Errorf("rename did not land: %q", e.Value.Label)
-				}
-			},
-		},
-		{
-			name:   "ClaimHolder",
-			seed:   func(t *testing.T, s *Service) { seedPresent(t, s, acctVal("u1", "e", "l", "", 1000)) },
-			mutate: func(s *Service) error { return s.ClaimHolder(ctx, "u1", "hostZ") },
-			check: func(t *testing.T, e cregistry.Entry[AccountValue]) {
-				if e.Value.Chain.Holder != "hostZ" {
-					t.Errorf("holder claim did not land: %q", e.Value.Chain.Holder)
-				}
-			},
-		},
-		{
-			name:   "RenewLease",
-			seed:   func(t *testing.T, s *Service) { seedPresent(t, s, acctVal("u1", "e", "l", "hostA", 1000)) },
-			mutate: func(s *Service) error { return s.RenewLease(ctx, "u1", "hostA", 6000) },
-			check: func(t *testing.T, e cregistry.Entry[AccountValue]) {
-				if e.Value.Lease == nil || e.Value.Lease.Until != 6000 {
-					t.Errorf("lease renew did not land: %+v", e.Value.Lease)
-				}
-			},
-		},
-		{
-			name:   "ReleaseLease",
-			seed:   func(t *testing.T, s *Service) { seedPresent(t, s, leased("hostA")) },
-			mutate: func(s *Service) error { return s.ReleaseLease(ctx, "u1", "hostA") },
-			check: func(t *testing.T, e cregistry.Entry[AccountValue]) {
-				if e.Value.Lease != nil {
-					t.Errorf("lease release did not land: %+v", e.Value.Lease)
 				}
 			},
 		},
@@ -826,24 +639,14 @@ func TestAutomaticMutationNeverCancelsUnmergedTombstone(t *testing.T) {
 	const base = cregistry.Micros(1000)
 
 	cases := map[string]func(t *testing.T, b *Service){
-		"RenewLease": func(t *testing.T, b *Service) {
-			if err := b.RenewLease(ctx, "u1", "hostB", 6000); err != nil {
-				t.Fatal(err)
-			}
-		},
-		"ClaimHolder": func(t *testing.T, b *Service) {
-			if err := b.ClaimHolder(ctx, "u1", "hostB"); err != nil {
-				t.Fatal(err)
-			}
-		},
 		"NoteCredWrite fresher chain": func(t *testing.T, b *Service) {
-			if err := b.NoteCredWrite(ctx, "u1", ChainStamp{ExpiresAt: 2000, Hash: "fresh", Holder: "hostB", RotatedAt: 1900}); err != nil {
+			if err := b.NoteCredWrite(ctx, "u1", ChainStamp{Origin: "hostB", ExpiresAt: 2000, Hash: "fresh", RotatedAt: 1900}); err != nil {
 				t.Fatal(err)
 			}
 		},
 		"ScanPublish fresher fold": func(t *testing.T, b *Service) {
 			b.Locals = func(context.Context) ([]LocalAccount, error) {
-				return []LocalAccount{{UUID: "u1", Chain: ChainStamp{ExpiresAt: 2000, Hash: "fresh", Holder: "hostB"}}}, nil
+				return []LocalAccount{{UUID: "u1", Chain: ChainStamp{Origin: "hostB", ExpiresAt: 2000, Hash: "fresh"}}}, nil
 			}
 			reg, err := b.Registry.Load()
 			if err != nil {
@@ -912,7 +715,7 @@ func TestScanPublishForcesPastSkewedAdd(t *testing.T) {
 				UUID:  "u1",
 				Email: "local@x",
 				Label: "local",
-				Chain: ChainStamp{ExpiresAt: 2000, Hash: "local", Holder: "hostB"},
+				Chain: ChainStamp{Origin: "hostB", ExpiresAt: 2000, Hash: "local"},
 			}}, nil
 		}
 		reg := cregistry.New[AccountValue]()
@@ -943,7 +746,7 @@ func TestScanPublishForcesPastSkewedAdd(t *testing.T) {
 				Email:        "e9@x",
 				Label:        "nine",
 				OAuthAccount: oauth,
-				Chain:        ChainStamp{ExpiresAt: 3000, Hash: "h9", Holder: "hostA"},
+				Chain:        ChainStamp{Origin: "hostA", ExpiresAt: 3000, Hash: "h9"},
 			}}, nil
 		}
 		reg := cregistry.New[AccountValue]()
@@ -974,7 +777,7 @@ func TestScanPublishBackfillsOAuthAccount(t *testing.T) {
 		Email:        "local@x",
 		Label:        "local",
 		OAuthAccount: json.RawMessage(`{"local":true}`),
-		Chain:        ChainStamp{ExpiresAt: 1000, Hash: "local", Holder: "hostB"}, // equal chain: only oauth may move
+		Chain:        ChainStamp{Origin: "hostB", ExpiresAt: 1000, Hash: "local"}, // equal chain: only oauth may move
 	}
 	withLocal := func(s *Service) {
 		s.Locals = func(context.Context) ([]LocalAccount, error) { return []LocalAccount{local}, nil }
@@ -988,7 +791,7 @@ func TestScanPublishBackfillsOAuthAccount(t *testing.T) {
 			UUID:  "u1",
 			Email: "reg@x",
 			Label: "reg",
-			Chain: ChainStamp{ExpiresAt: 1000, Hash: "reg", Holder: "hostA"},
+			Chain: ChainStamp{Origin: "hostA", ExpiresAt: 1000, Hash: "reg"},
 		}, cregistry.Micros(1000))
 
 		changed, err := s.ScanPublish(ctx, reg)
@@ -1016,7 +819,7 @@ func TestScanPublishBackfillsOAuthAccount(t *testing.T) {
 			Email:        "reg@x",
 			Label:        "reg",
 			OAuthAccount: json.RawMessage(`null`),
-			Chain:        ChainStamp{ExpiresAt: 1000, Hash: "reg", Holder: "hostA"},
+			Chain:        ChainStamp{Origin: "hostA", ExpiresAt: 1000, Hash: "reg"},
 		}, cregistry.Micros(1000))
 
 		changed, err := s.ScanPublish(ctx, reg)
@@ -1040,7 +843,7 @@ func TestScanPublishBackfillsOAuthAccount(t *testing.T) {
 			Email:        "reg@x",
 			Label:        "reg",
 			OAuthAccount: json.RawMessage(`{"peer":true}`),
-			Chain:        ChainStamp{ExpiresAt: 1000, Hash: "reg", Holder: "hostA"},
+			Chain:        ChainStamp{Origin: "hostA", ExpiresAt: 1000, Hash: "reg"},
 		}, cregistry.Micros(1000))
 
 		changed, err := s.ScanPublish(ctx, reg)

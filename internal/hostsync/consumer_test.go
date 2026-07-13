@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/synckit/syncservice"
 )
 
@@ -112,7 +113,7 @@ func TestGetStateSecretless(t *testing.T) {
 	}
 	secret := cred("ACCESS-TOKEN-SEKRIT-11111", "REFRESH-TOKEN-SEKRIT-22222")
 	secret.ClaudeAiOauth.ExpiresAt = 9_000_000_000_000
-	chain := ChainStamp{ExpiresAt: secret.ClaudeAiOauth.ExpiresAt, Hash: CredentialHash(secret), Holder: "hostA", RotatedAt: 42}
+	chain := ChainStamp{Origin: "hostA", ExpiresAt: secret.ClaudeAiOauth.ExpiresAt, Hash: creds.AccessHash(secret), RotatedAt: 42}
 	if err := s.NoteCredWrite(ctx, uuid, chain); err != nil {
 		t.Fatalf("NoteCredWrite: %v", err)
 	}

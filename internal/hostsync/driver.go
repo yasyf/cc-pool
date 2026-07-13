@@ -58,9 +58,9 @@ type LocalIndex func(ctx context.Context) (map[string]int, error)
 // missing locally; tests inject a fake.
 type AccountMaterializer func(ctx context.Context, v AccountValue, peers []string) (MaterializeResult, error)
 
-// FresherPuller pulls a fresher credential for uuid from its chain holder,
+// FresherPuller pulls a fresher credential for uuid from its chain origin,
 // falling back to the other peers; ErrNoPeerCredential is the deferred outcome.
-type FresherPuller func(ctx context.Context, uuid string, chain ChainStamp, localExpiresAt int64, localHash string, peers []string) (*creds.Credential, error)
+type FresherPuller func(ctx context.Context, uuid string, chain ChainStamp, localExpiresAt int64, peers []string) (*creds.Credential, error)
 
 // DriverDeps are the injected seams the Driver reconciles through.
 type DriverDeps struct {
@@ -191,8 +191,8 @@ func (d *Driver) materialize(ctx context.Context, v AccountValue, peers []string
 }
 
 // reconcileLocal applies the LWW label, then pulls a credential only when the
-// registry chain is ahead of the local one (child lineage, or strictly fresher
-// expiry); the definitive re-check runs in InstallSyncedCredential.
+// local one is unowned and the registry chain is strictly fresher; the
+// definitive re-check runs in InstallSyncedCredential.
 func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountValue, peers []string) (converge.Outcome, error) {
 	outcome := OutcomeUnchanged
 	if v.Label != a.Label {
@@ -203,19 +203,28 @@ func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountV
 		outcome = OutcomeLabeled
 	}
 
-	localExp, localHash, err := d.localChain(a)
+	localExp, localHash, owned, err := d.localChain(a)
+	if errors.Is(err, creds.ErrUnavailable) {
+		return OutcomeDeferred, nil
+	}
 	if err != nil {
 		return "", err
+	}
+	if owned {
+		// Owned blobs are never replaced by sync; only their origin refreshes them.
+		return outcome, nil
 	}
 	if v.Chain.Hash == localHash {
 		return outcome, nil
 	}
-	child := v.Chain.ParentHash != "" && v.Chain.ParentHash == localHash
-	if !child && v.Chain.ExpiresAt <= localExp {
+	// Strictly-later expiry, same ordering as InstallSyncedCredential's guard.
+	// Forward origin clock skew (a rollback child stamped earlier) is benign:
+	// the peer keeps the still-valid parent AT until expiry, then re-pulls.
+	if v.Chain.ExpiresAt <= localExp {
 		return outcome, nil
 	}
 
-	installed, deferred, err := d.pullAndInstall(ctx, a, v, localExp, localHash, peers)
+	installed, deferred, err := d.pullAndInstall(ctx, a, v, localExp, peers)
 	switch {
 	case err != nil:
 		return "", err
@@ -228,10 +237,10 @@ func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountV
 	}
 }
 
-// pullAndInstall pulls the ahead chain and installs it; ErrNoPeerCredential
+// pullAndInstall pulls the fresher chain and installs it; ErrNoPeerCredential
 // and creds.ErrUnavailable are deferred, not failures — the next tick retries.
-func (d *Driver) pullAndInstall(ctx context.Context, a store.Account, v AccountValue, localExp int64, localHash string, peers []string) (installed, deferred bool, err error) {
-	cred, err := d.deps.Pull(ctx, v.UUID, v.Chain, localExp, localHash, peers)
+func (d *Driver) pullAndInstall(ctx context.Context, a store.Account, v AccountValue, localExp int64, peers []string) (installed, deferred bool, err error) {
+	cred, err := d.deps.Pull(ctx, v.UUID, v.Chain, localExp, peers)
 	switch {
 	case errors.Is(err, ErrNoPeerCredential):
 		return false, true, nil
@@ -250,17 +259,17 @@ func (d *Driver) pullAndInstall(ctx context.Context, a store.Account, v AccountV
 	return ok, false, nil
 }
 
-// localChain returns a's credential expiry (Unix ms) and CredentialHash, or
-// (0, "") when the account holds none yet.
-func (d *Driver) localChain(a store.Account) (int64, string, error) {
+// localChain returns a's credential expiry (Unix ms), AccessHash, and whether
+// it is owned; absent and tombstoned both read (0, "", false) — pullable.
+func (d *Driver) localChain(a store.Account) (int64, string, bool, error) {
 	cred, _, err := d.deps.Cred.ReadCredential(a)
-	if errors.Is(err, creds.ErrNotFound) {
-		return 0, "", nil
+	switch {
+	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
+		return 0, "", false, nil
+	case err != nil:
+		return 0, "", false, fmt.Errorf("read acct-%d credential: %w", a.ID, err)
 	}
-	if err != nil {
-		return 0, "", fmt.Errorf("read acct-%d credential: %w", a.ID, err)
-	}
-	return cred.ClaudeAiOauth.ExpiresAt, CredentialHash(cred), nil
+	return cred.ClaudeAiOauth.ExpiresAt, creds.AccessHash(cred), cred.HasRefreshToken(), nil
 }
 
 // snapshot records each on-disk entry's fingerprint, before the scan fold so a

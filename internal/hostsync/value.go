@@ -3,11 +3,14 @@
 package hostsync
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 
-	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/synckit/cregistry"
 )
 
@@ -15,28 +18,24 @@ import (
 // account UUID, carrying metadata and chain stamps but never secrets.
 type Registry = cregistry.Registry[AccountValue]
 
-// ChainStamp describes an account's OAuth chain — freshness and holdership —
-// without ever carrying a token. No omitempty, per the AccountValue tiebreak rule.
+// ErrRegistrySchema rejects a registry written by a pre-origin (schema v1)
+// cc-pool, whose holder/lease/parentHash semantics no host enforces anymore.
+var ErrRegistrySchema = errors.New("pre-origin registry — upgrade both hosts and delete ~/.cc-pool/sync/registry.json (see runbook)")
+
+// ChainStamp describes an account's OAuth chain — its origin host and
+// access-token identity — without ever carrying a token. No omitempty, per
+// the AccountValue tiebreak rule.
 type ChainStamp struct {
+	// Origin is the host whose login minted this chain; only it ever refreshes.
+	Origin string `json:"origin"`
 	// ExpiresAt is the access-token expiry in Unix epoch milliseconds.
 	ExpiresAt int64 `json:"expiresAt"`
-	// Hash is CredentialHash of the chain's token pair.
+	// Hash is creds.AccessHash of the chain's access token — owned and
+	// stripped forms of the same chain hash identically.
 	Hash string `json:"hash"`
-	// Holder is the host allowed to preemptively refresh this chain.
-	Holder string `json:"holder"`
-	// ParentHash is CredentialHash of the spent parent; empty when unknown.
-	ParentHash string `json:"parentHash"`
-	// RotatedAt is the Unix-millis wall time of the holder's last published rotation.
+	// RotatedAt is the Unix-millis wall time of the origin's last published
+	// rotation; observability only, never a freshness input.
 	RotatedAt int64 `json:"rotatedAt"`
-}
-
-// Lease is a time-boxed refresh claim held by one host while it runs a live
-// session on the account. No omitempty, per the AccountValue tiebreak rule.
-type Lease struct {
-	// Host is the leaseholder.
-	Host string `json:"host"`
-	// Until is the lease expiry in Unix epoch milliseconds.
-	Until int64 `json:"until"`
 }
 
 // AccountValue is the per-account registry payload. cregistry breaks equal-add
@@ -50,14 +49,27 @@ type AccountValue struct {
 	Label string `json:"label"`
 	// OAuthAccount is Claude's opaque oauthAccount object, passed through byte-exact.
 	OAuthAccount json.RawMessage `json:"oauthAccount"`
-	// Chain is the secretless chain stamp (freshness, holder, rotation).
+	// Chain is the secretless chain stamp (origin, freshness, access-token identity).
 	Chain ChainStamp `json:"chain"`
-	// Lease is the current refresh lease, or nil when the chain is unleased.
-	Lease *Lease `json:"lease"`
 }
 
-// CredentialHash is creds.CredentialHash, re-exported for hostsync callers.
-func CredentialHash(c *creds.Credential) string { return creds.CredentialHash(c) }
+// UnmarshalJSON fails fast on unknown fields, so a schema-v1 registry (its
+// holder/lease/parentHash keys carried semantics no v2 host enforces)
+// surfaces as ErrRegistrySchema instead of being silently half-read.
+func (v *AccountValue) UnmarshalJSON(b []byte) error {
+	type plain AccountValue // methodless alias: avoids UnmarshalJSON recursion
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	var p plain
+	if err := dec.Decode(&p); err != nil {
+		if strings.Contains(err.Error(), "unknown field") {
+			return fmt.Errorf("%w: %s", ErrRegistrySchema, err)
+		}
+		return err
+	}
+	*v = AccountValue(p)
+	return nil
+}
 
 // Fingerprint is an apply-stable digest of a registry entry — SHA-256 over its
 // canonical JSON — so applying a peer's change reproduces the identical digest;
