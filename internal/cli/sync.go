@@ -447,7 +447,7 @@ func printRegistryTable(out io.Writer, reg hostsync.Registry, m *pool.Manager) {
 		uuids = append(uuids, uuid)
 	}
 	sort.Strings(uuids)
-	local := localOwnershipByUUID(m)
+	local := localOwnershipByUUID(out, m)
 	tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "UUID\tLABEL\tCHAIN EXPIRY\tORIGIN\tLOCAL\tSTATE")
 	for _, uuid := range uuids {
@@ -466,11 +466,13 @@ func printRegistryTable(out io.Writer, reg hostsync.Registry, m *pool.Manager) {
 // localOwnershipByUUID classifies each locally-held account's credential as
 // "owned" (a refresh token present) or "synced" (a peer copy, none), keyed by
 // account UUID — a refresh-free read, so it never spends a refresh token.
-// Accounts with no local credential are simply absent (rendered "-").
-func localOwnershipByUUID(m *pool.Manager) map[string]string {
+// Accounts with no local credential are simply absent (rendered "-"); a load
+// failure warns to w rather than silently blanking the column.
+func localOwnershipByUUID(w io.Writer, m *pool.Manager) map[string]string {
 	out := map[string]string{}
 	accts, err := m.Store.ListAccounts()
 	if err != nil {
+		warn(w, "listing accounts for the LOCAL column: %v", err)
 		return out
 	}
 	for _, a := range accts {
@@ -478,13 +480,15 @@ func localOwnershipByUUID(m *pool.Manager) map[string]string {
 			continue
 		}
 		cred, _, err := m.ReadCredential(a)
-		if err != nil {
-			continue
-		}
-		if cred.HasRefreshToken() {
-			out[a.AccountUUID] = "owned"
-		} else {
-			out[a.AccountUUID] = "synced"
+		switch creds.ClassifyRead(err) {
+		case creds.ReadPresent:
+			if cred.HasRefreshToken() {
+				out[a.AccountUUID] = "owned"
+			} else {
+				out[a.AccountUUID] = "synced"
+			}
+		case creds.ReadFatal:
+			warn(w, "acct-%02d reading credential for the LOCAL column: %v", a.ID, err)
 		}
 	}
 	return out

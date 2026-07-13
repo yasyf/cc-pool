@@ -51,7 +51,7 @@ var _ hostsync.Sessions = serverSessions{}
 // setupSync constructs the host-sync engine and wires it onto the daemon.
 // Always constructed — every acting path re-reads the sync_enabled meta, so
 // enable needs no daemon restart — and it must run before serve spawns any
-// worker or handler: they read s.syncPull / s.syncAuthKind unlocked.
+// worker or handler: they read s.syncPull / s.authKind unlocked.
 func (s *Server) setupSync(ctx context.Context) error {
 	if s.syncSocket == "" {
 		return fmt.Errorf("no sync socket path configured")

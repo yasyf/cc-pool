@@ -126,7 +126,7 @@ func newDoctorCmd() *cobra.Command {
 				}
 
 				for _, a := range accts {
-					checkAccount(cmd, m, a, fix, report)
+					checkAccount(cmd, m, a, fix, report, reportWarn)
 				}
 
 				if !ok {
@@ -570,10 +570,10 @@ func sessionsOnDirs(dirs []string, sessions []procscan.Session) string {
 	return strings.Join(pids, ", ")
 }
 
-func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool, report func(string, bool, string)) {
+func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool, report func(string, bool, string), warnf func(string, string)) {
 	prefix := fmt.Sprintf("acct-%02d", a.ID)
 
-	checkCredential(m, a, fix, report)
+	checkCredential(m, a, fix, report, warnf)
 
 	// NeedsLogin: the Keychain item can be readable yet useless.
 	if h, herr := m.Store.GetAuthHealth(a.ID); herr == nil && h.NeedsLogin {
@@ -612,7 +612,7 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 // checkCredential reports one account's credential state, each backend probed
 // through the Manager seam in runtime resolution order (Keychain first, then
 // the plaintext file).
-func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(string, bool, string)) {
+func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(string, bool, string), warnf func(string, string)) {
 	prefix := fmt.Sprintf("acct-%02d", a.ID)
 	keychain := m.Creds.Store(a, creds.SourceKeychain)
 	file := m.Creds.Store(a, creds.SourceFile)
@@ -622,7 +622,7 @@ func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(str
 	switch {
 	case kerr == nil:
 		if errors.Is(ferr, creds.ErrNotFound) {
-			reportCredentialHealth(m, a, prefix, "keychain", kcred, report)
+			reportCredentialHealth(a, prefix, "keychain", kcred, report, warnf)
 			return
 		}
 		// Drift: both backends hold a credential (refresh tokens are single-use,
@@ -648,7 +648,7 @@ func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(str
 		}
 		report(prefix+" keychain", true, "re-asserted")
 	case ferr == nil:
-		reportCredentialHealth(m, a, prefix, "file", fcred, report)
+		reportCredentialHealth(a, prefix, "file", fcred, report, warnf)
 	case errors.Is(ferr, creds.ErrNoTokens):
 		report(prefix+" credential", false, fmt.Sprintf("credential holds no tokens — re-login required: run `ccp login %d`", a.ID))
 	case !errors.Is(ferr, creds.ErrNotFound):
@@ -668,7 +668,7 @@ func checkCredential(m *pool.Manager, a store.Account, fix bool, report func(str
 // owned chain apart from a synced (refresh-token-free) peer copy — usable until
 // it expires, after which only the origin's rotation or a local `ccp login`
 // recovers it.
-func reportCredentialHealth(m *pool.Manager, a store.Account, prefix, backend string, cred *creds.Credential, report func(string, bool, string)) {
+func reportCredentialHealth(a store.Account, prefix, backend string, cred *creds.Credential, report func(string, bool, string), warnf func(string, string)) {
 	if cred.ClaudeAiOauth.AccessToken == "" {
 		report(prefix+" credential", true, backend+" (access token empty — the daemon refreshes it on its next poll)")
 		return
@@ -677,7 +677,10 @@ func reportCredentialHealth(m *pool.Manager, a store.Account, prefix, backend st
 		report(prefix+" credential", true, backend)
 		return
 	}
-	origin := doctorSyncOrigin(m, a)
+	origin, oerr := doctorSyncOrigin(a)
+	if oerr != nil {
+		warnf(prefix+" sync origin", fmt.Sprintf("%v — synced-copy messages degrade to origin-less", oerr))
+	}
 	if !cred.Expired() {
 		report(prefix+" credential", true, syncedOKDetail(origin))
 		return
@@ -686,22 +689,23 @@ func reportCredentialHealth(m *pool.Manager, a store.Account, prefix, backend st
 }
 
 // doctorSyncOrigin returns the account's chain origin host from the shared
-// registry, or "" when unresolvable (no uuid, or the registry is unreadable),
-// which degrades the synced-copy messages to an origin-less form.
-func doctorSyncOrigin(m *pool.Manager, a store.Account) string {
+// registry. A missing uuid or absent entry is a benign "" (origin-less
+// messages); a genuine registry-load failure is returned so the caller surfaces
+// it rather than silently degrading.
+func doctorSyncOrigin(a store.Account) (string, error) {
 	uuid := accountSyncUUID(a)
 	if uuid == "" {
-		return ""
+		return "", nil
 	}
 	reg, err := syncRegistryFile().Load()
 	if err != nil {
-		return ""
+		return "", err
 	}
 	e, ok := reg[uuid]
 	if !ok || !e.Present() {
-		return ""
+		return "", nil
 	}
-	return e.Value.Chain.Origin
+	return e.Value.Chain.Origin, nil
 }
 
 func syncedOKDetail(origin string) string {

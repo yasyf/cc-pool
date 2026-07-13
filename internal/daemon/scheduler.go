@@ -477,9 +477,8 @@ func (s *Server) logNetUnreachable(a store.Account, err error) {
 // flagNeedsLogin stamps the attempt clock, pulls once from a peer, and ALWAYS
 // decides this tick. A heal that improved the credential earns ONE inline
 // resample (same tick, no second heal): a clean resample clears the flag,
-// anything else persists it. The old skip-when-improved early return let a dead
-// account stay unflagged forever while SampleUsage never succeeded (defect 6).
-// The clock stamp precedes syncHeal so ledMu is never held across the pull I/O.
+// anything else persists it. The clock stamp precedes syncHeal so ledMu is
+// never held across the pull I/O.
 func (s *Server) flagNeedsLogin(ctx context.Context, a store.Account, err error) {
 	s.authStamp(a.ConfigDir, err)
 	if s.syncHeal(ctx, a) && s.resampleAfterHeal(ctx, a) {

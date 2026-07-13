@@ -1192,8 +1192,12 @@ func TestCheckCredential(t *testing.T) {
 			m := &pool.Manager{Creds: fk}
 
 			report, calls := captureReports()
-			checkCredential(m, a, tc.fix, report)
+			warnf, warns := captureWarns()
+			checkCredential(m, a, tc.fix, report, warnf)
 
+			if len(*warns) != 0 {
+				t.Fatalf("got %d unexpected warnings %+v", len(*warns), *warns)
+			}
 			if len(*calls) != 1 {
 				t.Fatalf("got %d reports %+v, want exactly one", len(*calls), *calls)
 			}
@@ -1280,7 +1284,8 @@ func TestCheckCredentialFixReassertsKeychain(t *testing.T) {
 	m := &pool.Manager{Creds: keychainOverride{Credentials: fk, kc: kc}}
 
 	report, calls := captureReports()
-	checkCredential(m, a, true, report)
+	warnf, _ := captureWarns()
+	checkCredential(m, a, true, report, warnf)
 
 	if len(*calls) != 1 {
 		t.Fatalf("got %d reports %+v, want exactly one", len(*calls), *calls)
