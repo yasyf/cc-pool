@@ -84,13 +84,41 @@ type RefreshEntry struct {
 	Err       string
 }
 
+// AuthKind classifies why an account needs re-login, so status can tell a truly
+// owned dead chain apart from a synced peer copy merely waiting on its origin's
+// rotation. The empty value is Owned, so a legacy (pre-kind-column) row and a
+// default backfill both read as Owned.
+type AuthKind string
+
+const (
+	// AuthKindOwned is a chain this host owns (or an account with no sync
+	// entry): only a local `ccp login` recovers it.
+	AuthKindOwned AuthKind = ""
+	// AuthKindAwaitingOrigin is a synced peer copy whose access token expired;
+	// it recovers when the origin host's rotation syncs over, or via a local
+	// `ccp login` that makes this host the origin.
+	AuthKindAwaitingOrigin AuthKind = "awaiting_origin"
+)
+
+// Valid reports whether k is a recognized AuthKind.
+func (k AuthKind) Valid() bool {
+	switch k {
+	case AuthKindOwned, AuthKindAwaitingOrigin:
+		return true
+	default:
+		return false
+	}
+}
+
 // AuthHealth is an account's authentication health. NeedsLogin is set by the
 // daemon when the stored refresh token is gone/revoked and only an interactive
 // `ccp login` can recover; Since marks the false→true transition, LastErr the
-// triggering failure. No secrets — a flag, a timestamp, an error string.
+// triggering failure, Kind why it needs login. No secrets — a flag, a
+// timestamp, an error string, a kind.
 type AuthHealth struct {
 	AccountID  int
 	NeedsLogin bool
 	Since      time.Time // zero when NeedsLogin is false
 	LastErr    string
+	Kind       AuthKind
 }

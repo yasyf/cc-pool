@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS auth_health (
   account_id  INTEGER PRIMARY KEY,
   needs_login INTEGER NOT NULL DEFAULT 0,
   since       INTEGER,
-  last_err    TEXT NOT NULL DEFAULT ''
+  last_err    TEXT NOT NULL DEFAULT '',
+  kind        TEXT NOT NULL DEFAULT ''
 );
 `
 
@@ -125,6 +126,11 @@ func (s *Store) applySchema() error {
 		return err
 	}
 	if err := s.dropColumn("accounts", "cred_parent_hash"); err != nil {
+		return err
+	}
+	// auth_health.kind classifies a needs-login (owned vs awaiting-origin); added
+	// after auth_health first shipped, so pre-existing databases need it in place.
+	if err := s.ensureColumn("auth_health", "kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	// The index must follow the ensureColumn: on a pre-existing db the column is
@@ -758,11 +764,12 @@ func (s *Store) LastRefresh(accountID int) (RefreshEntry, bool, error) {
 // as healthy (NeedsLogin false).
 func (s *Store) GetAuthHealth(accountID int) (AuthHealth, error) {
 	row := s.db.QueryRow(
-		`SELECT account_id,needs_login,since,last_err FROM auth_health WHERE account_id=?`, accountID)
+		`SELECT account_id,needs_login,since,last_err,kind FROM auth_health WHERE account_id=?`, accountID)
 	var h AuthHealth
 	var needs int
 	var since sql.NullInt64
-	if err := row.Scan(&h.AccountID, &needs, &since, &h.LastErr); err != nil {
+	var kind string
+	if err := row.Scan(&h.AccountID, &needs, &since, &h.LastErr, &kind); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AuthHealth{AccountID: accountID}, nil
 		}
@@ -772,13 +779,14 @@ func (s *Store) GetAuthHealth(accountID int) (AuthHealth, error) {
 	if since.Valid {
 		h.Since = time.Unix(since.Int64, 0)
 	}
+	h.Kind = AuthKind(kind)
 	return h, nil
 }
 
 // ListAuthHealth returns the needs-login accounts keyed by id; healthy accounts
 // are omitted.
 func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
-	rows, err := s.db.Query(`SELECT account_id,needs_login,since,last_err FROM auth_health WHERE needs_login=1`)
+	rows, err := s.db.Query(`SELECT account_id,needs_login,since,last_err,kind FROM auth_health WHERE needs_login=1`)
 	if err != nil {
 		return nil, err
 	}
@@ -788,35 +796,40 @@ func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
 		var h AuthHealth
 		var needs int
 		var since sql.NullInt64
-		if err := rows.Scan(&h.AccountID, &needs, &since, &h.LastErr); err != nil {
+		var kind string
+		if err := rows.Scan(&h.AccountID, &needs, &since, &h.LastErr, &kind); err != nil {
 			return nil, err
 		}
 		h.NeedsLogin = needs != 0
 		if since.Valid {
 			h.Since = time.Unix(since.Int64, 0)
 		}
+		h.Kind = AuthKind(kind)
 		out[h.AccountID] = h
 	}
 	return out, rows.Err()
 }
 
-// SetNeedsLogin flags an account as needing re-login, stamping Since only on the
-// false→true transition (a repeat preserves the original Since, so the timer
-// measures the whole outage) and returning changed=true only then, so the daemon
-// logs the hint once. The daemon poll loop is the sole writer, so the
-// read-then-write is race-free.
-func (s *Store) SetNeedsLogin(accountID int, at time.Time, errMsg string) (bool, error) {
+// SetNeedsLogin flags an account as needing re-login with its kind, stamping
+// Since only on the false→true transition and returning changed=true only then
+// (so the daemon logs the hint once). Kind is refreshed every call. The daemon
+// poll loop is the sole writer, so the read-then-write is race-free.
+func (s *Store) SetNeedsLogin(accountID int, at time.Time, errMsg string, kind AuthKind) (bool, error) {
+	if !kind.Valid() {
+		return false, fmt.Errorf("set needs-login for account %d: invalid auth kind %q", accountID, kind)
+	}
 	prev, err := s.GetAuthHealth(accountID)
 	if err != nil {
 		return false, err
 	}
 	if _, err := s.db.Exec(
-		`INSERT INTO auth_health(account_id,needs_login,since,last_err) VALUES(?,1,?,?)
+		`INSERT INTO auth_health(account_id,needs_login,since,last_err,kind) VALUES(?,1,?,?,?)
 		 ON CONFLICT(account_id) DO UPDATE SET
 		   needs_login=1,
 		   last_err=excluded.last_err,
+		   kind=excluded.kind,
 		   since=CASE WHEN auth_health.needs_login=1 THEN auth_health.since ELSE excluded.since END`,
-		accountID, at.Unix(), errMsg); err != nil {
+		accountID, at.Unix(), errMsg, string(kind)); err != nil {
 		return false, fmt.Errorf("set needs-login for account %d: %w", accountID, err)
 	}
 	return !prev.NeedsLogin, nil
@@ -826,7 +839,7 @@ func (s *Store) SetNeedsLogin(accountID int, at time.Time, errMsg string) (bool,
 // only on the true→false transition, so the daemon logs recovery exactly once.
 func (s *Store) ClearNeedsLogin(accountID int) (bool, error) {
 	res, err := s.db.Exec(
-		`UPDATE auth_health SET needs_login=0, since=NULL, last_err='' WHERE account_id=? AND needs_login=1`,
+		`UPDATE auth_health SET needs_login=0, since=NULL, last_err='', kind='' WHERE account_id=? AND needs_login=1`,
 		accountID)
 	if err != nil {
 		return false, fmt.Errorf("clear needs-login for account %d: %w", accountID, err)

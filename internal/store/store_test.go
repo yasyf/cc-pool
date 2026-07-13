@@ -671,16 +671,17 @@ func TestAuthHealthTransitions(t *testing.T) {
 	}
 
 	t0 := time.Unix(1_000_000, 0)
-	changed, err := s.SetNeedsLogin(1, t0, "401 revoked")
+	changed, err := s.SetNeedsLogin(1, t0, "401 revoked", AuthKindOwned)
 	if err != nil || !changed {
 		t.Fatalf("first SetNeedsLogin changed=%v err=%v, want true", changed, err)
 	}
 	h, _ := s.GetAuthHealth(1)
-	if !h.NeedsLogin || !h.Since.Equal(t0) || h.LastErr != "401 revoked" {
+	if !h.NeedsLogin || !h.Since.Equal(t0) || h.LastErr != "401 revoked" || h.Kind != AuthKindOwned {
 		t.Fatalf("after flag = %+v", h)
 	}
 
-	changed, _ = s.SetNeedsLogin(1, t0.Add(time.Hour), "401 again")
+	// A repeat preserves Since but refreshes LastErr AND Kind (owned→awaiting).
+	changed, _ = s.SetNeedsLogin(1, t0.Add(time.Hour), "401 again", AuthKindAwaitingOrigin)
 	if changed {
 		t.Fatal("repeat SetNeedsLogin must report changed=false")
 	}
@@ -691,9 +692,16 @@ func TestAuthHealthTransitions(t *testing.T) {
 	if h.LastErr != "401 again" {
 		t.Fatalf("LastErr should update; got %q", h.LastErr)
 	}
+	if h.Kind != AuthKindAwaitingOrigin {
+		t.Fatalf("Kind should refresh to awaiting-origin; got %q", h.Kind)
+	}
 
-	if m, err := s.ListAuthHealth(); err != nil || len(m) != 1 || !m[1].NeedsLogin {
+	if m, err := s.ListAuthHealth(); err != nil || len(m) != 1 || !m[1].NeedsLogin || m[1].Kind != AuthKindAwaitingOrigin {
 		t.Fatalf("ListAuthHealth = %+v err=%v", m, err)
+	}
+
+	if _, err := s.SetNeedsLogin(1, t0, "x", AuthKind("bogus")); err == nil {
+		t.Fatal("SetNeedsLogin with an invalid kind must error")
 	}
 
 	changed, err = s.ClearNeedsLogin(1)
@@ -703,7 +711,7 @@ func TestAuthHealthTransitions(t *testing.T) {
 	if changed, _ := s.ClearNeedsLogin(1); changed {
 		t.Fatal("clearing an already-healthy account must report changed=false")
 	}
-	if h, _ := s.GetAuthHealth(1); h.NeedsLogin || !h.Since.IsZero() || h.LastErr != "" {
+	if h, _ := s.GetAuthHealth(1); h.NeedsLogin || !h.Since.IsZero() || h.LastErr != "" || h.Kind != AuthKindOwned {
 		t.Fatalf("after clear = %+v, want healthy/zeroed", h)
 	}
 	if m, _ := s.ListAuthHealth(); len(m) != 0 {
@@ -711,10 +719,57 @@ func TestAuthHealthTransitions(t *testing.T) {
 	}
 }
 
+// TestAuthHealthKindBackfill proves a legacy auth_health row (written before the
+// kind column existed) opens, backfills kind='' as Owned, and round-trips a new
+// kind through the migrated schema.
+func TestAuthHealthKindBackfill(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pool.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE auth_health (
+	  account_id  INTEGER PRIMARY KEY,
+	  needs_login INTEGER NOT NULL DEFAULT 0,
+	  since       INTEGER,
+	  last_err    TEXT NOT NULL DEFAULT ''
+	);
+	INSERT INTO auth_health(account_id,needs_login,since,last_err) VALUES(7,1,123,'legacy 401');`); err != nil {
+		t.Fatalf("seed legacy auth_health: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open must migrate a kind-less auth_health: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	h, err := s.GetAuthHealth(7)
+	if err != nil {
+		t.Fatalf("GetAuthHealth after backfill: %v", err)
+	}
+	if !h.NeedsLogin || h.LastErr != "legacy 401" || h.Kind != AuthKindOwned {
+		t.Fatalf("backfilled row = %+v, want needs-login/legacy 401/owned", h)
+	}
+
+	if err := s.UpsertAccount(Account{ID: 7, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetNeedsLogin(7, time.Unix(456, 0), "awaiting", AuthKindAwaitingOrigin); err != nil {
+		t.Fatalf("SetNeedsLogin through migrated schema: %v", err)
+	}
+	if h, _ := s.GetAuthHealth(7); h.Kind != AuthKindAwaitingOrigin {
+		t.Fatalf("round-trip kind = %q, want awaiting-origin", h.Kind)
+	}
+}
+
 func TestDeleteAccountRemovesAuthHealth(t *testing.T) {
 	s := openTest(t)
 	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-	_, _ = s.SetNeedsLogin(1, time.Now(), "x")
+	_, _ = s.SetNeedsLogin(1, time.Now(), "x", AuthKindOwned)
 	if err := s.DeleteAccount(1); err != nil {
 		t.Fatal(err)
 	}
