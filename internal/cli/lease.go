@@ -280,7 +280,8 @@ func spawnLeaseAgentKey(id int, key, probeDir string, fuseRow bool) error {
 		"--start", strconv.FormatInt(start, 10),
 		"--id", strconv.Itoa(id),
 		"--dir", key,
-		"--probe", probeDir}
+		"--probe", probeDir,
+		"--ready-fd", strconv.Itoa(readyPipeFD)} // marks the fd-3 readiness pipe below
 	if fuseRow {
 		args = append(args, "--fuse")
 	}
@@ -340,24 +341,51 @@ func awaitAgentReady(r *os.File, child *exec.Cmd) error {
 // fd-3-preserving sweep for it instead of the full inherited-fd sweep.
 const leaseAgentSubcommand = "lease-agent"
 
-// readyPipeFD is the descriptor the launcher hands a detached lease agent its
-// readiness pipe on (ExtraFiles[0]); the agent keeps it across the inherited-fd sweep.
+// readyPipeFD is the descriptor the launcher hands a detached lease agent its readiness
+// pipe on (ExtraFiles[0]); the launcher marks its presence with --ready-fd and the agent
+// keeps it across the inherited-fd sweep. A manual `ccp lease-agent` passes no --ready-fd,
+// adopts no pipe, and runs the full sweep.
 const readyPipeFD = 3
 
-// LeaseAgentInvocation reports whether args launches the internal detached lease
-// agent, which must keep its inherited fd-3 readiness pipe and so runs the
-// fd-3-preserving sweep (SweepInheritedFDsExceptReadyPipe) rather than the full one.
+// LeaseAgentInvocation reports whether args launches the internal detached lease agent.
 func LeaseAgentInvocation(args []string) bool {
 	return len(args) > 0 && args[0] == leaseAgentSubcommand
 }
 
-// SweepInheritedFDsExceptReadyPipe closes every inherited non-CLOEXEC descriptor above
-// the fd-3 readiness pipe, preserving only fd 3. The lease agent runs this instead of
-// proc.CloseInheritedFDs (which would close fd 3 too): a manually- or claude-spawned
-// lease agent can inherit an unrelated non-CLOEXEC lease fd, and keeping it would pin
-// that lease for the whole watch. proc.CloseInheritedFDs has no skip-list, so the agent
-// path sweeps fds > readyPipeFD here.
-func SweepInheritedFDsExceptReadyPipe() error {
+// SpawnedLeaseAgentReadyFD reports the readiness-pipe fd a detached lease agent was
+// launched with (--ready-fd N) and whether the flag is present. main inspects os.Args
+// BEFORE cobra parses so the inherited-fd sweep preserves EXACTLY that fd; a manual
+// `ccp lease-agent` with no --ready-fd gets the full proc.CloseInheritedFDs sweep and
+// keeps no fd, so it can neither pin nor later clobber an unrelated inherited descriptor.
+func SpawnedLeaseAgentReadyFD(args []string) (int, bool) {
+	if !LeaseAgentInvocation(args) {
+		return 0, false
+	}
+	for i, a := range args {
+		var v string
+		switch {
+		case a == "--ready-fd" && i+1 < len(args):
+			v = args[i+1]
+		case strings.HasPrefix(a, "--ready-fd="):
+			v = strings.TrimPrefix(a, "--ready-fd=")
+		default:
+			continue
+		}
+		if fd, err := strconv.Atoi(v); err == nil && fd > 0 {
+			return fd, true
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+// SweepInheritedFDsExcept closes every inherited non-CLOEXEC descriptor except stdio
+// (0-2) and keep — the launcher's readiness pipe (--ready-fd). The lease agent runs this
+// instead of proc.CloseInheritedFDs (which would close the pipe too): a manually- or
+// claude-spawned agent can inherit an unrelated non-CLOEXEC lease fd, and keeping it
+// would pin that lease for the whole watch, so every non-CLOEXEC fd above stdio except
+// the readiness pipe is dropped.
+func SweepInheritedFDsExcept(keep int) error {
 	dir := "/dev/fd"
 	if runtime.GOOS == "linux" {
 		dir = "/proc/self/fd"
@@ -368,7 +396,7 @@ func SweepInheritedFDsExceptReadyPipe() error {
 	}
 	for _, e := range entries {
 		fd, err := strconv.Atoi(e.Name())
-		if err != nil || fd <= readyPipeFD {
+		if err != nil || fd <= 2 || fd == keep {
 			continue
 		}
 		// ReadDir's own transient fd reads EBADF here and is skipped.
@@ -382,7 +410,7 @@ func SweepInheritedFDsExceptReadyPipe() error {
 }
 
 func newLeaseAgentCmd() *cobra.Command {
-	var pid, id int
+	var pid, id, readyFd int
 	var start int64
 	var dir, probe string
 	var fuse bool
@@ -392,9 +420,13 @@ func newLeaseAgentCmd() *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			// The parent passes the readiness pipe as fd 3 (ExtraFiles[0]); nil-safe
-			// when absent (a manual invocation).
-			ready := os.NewFile(3, "lease-ready")
+			// Adopt the readiness pipe only when the launcher declared it (--ready-fd,
+			// ExtraFiles[0]=fd 3). A manual run passes no flag and skips the handshake, so
+			// it never writes to and closes an unrelated inherited fd 3.
+			var ready *os.File
+			if readyFd > 0 {
+				ready = os.NewFile(uintptr(readyFd), "lease-ready")
+			}
 			return runLeaseAgent(pid, start, id, dir, probe, fuse, ready)
 		},
 	}
@@ -404,6 +436,7 @@ func newLeaseAgentCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dir, "dir", "", "lease dir to hold")
 	cmd.Flags().StringVar(&probe, "probe", "", "config dir to probe after acquiring")
 	cmd.Flags().BoolVar(&fuse, "fuse", false, "the probe dir is a fuse mount (a missing probe file is fatal)")
+	cmd.Flags().IntVar(&readyFd, "ready-fd", 0, "readiness-pipe fd the launcher passes (ExtraFiles[0]); unset skips the handshake")
 	return cmd
 }
 

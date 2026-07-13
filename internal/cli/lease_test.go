@@ -639,14 +639,14 @@ func TestLeaseReadyTimeoutExceedsSequentialWorstCase(t *testing.T) {
 	}
 }
 
-// TestSweepInheritedFDsExceptReadyPipe pins J6: a lease agent spawned with an extra
-// inherited non-CLOEXEC fd drops it (fd 4 here) while keeping its fd-3 readiness pipe.
-// It runs in a helper subprocess so the sweep operates on a controlled fd table.
-func TestSweepInheritedFDsExceptReadyPipe(t *testing.T) {
+// TestSweepInheritedFDsExcept pins J6: a lease agent spawned with an extra inherited
+// non-CLOEXEC fd drops it (fd 4 here) while keeping its fd-3 readiness pipe. It runs in
+// a helper subprocess so the sweep operates on a controlled fd table.
+func TestSweepInheritedFDsExcept(t *testing.T) {
 	if os.Getenv("FDSWEEP_EXCEPT3_HELPER") == "1" {
 		// Child: fd 3 (readiness pipe) must survive; fd 4 (a stray inherited non-CLOEXEC
 		// fd standing in for an unrelated lease) must be swept.
-		if err := SweepInheritedFDsExceptReadyPipe(); err != nil {
+		if err := SweepInheritedFDsExcept(3); err != nil {
 			os.Exit(3)
 		}
 		if _, err := unix.FcntlInt(3, unix.F_GETFD, 0); err != nil {
@@ -671,10 +671,107 @@ func TestSweepInheritedFDsExceptReadyPipe(t *testing.T) {
 	defer func() { _ = r4.Close() }()
 	defer func() { _ = w4.Close() }()
 
-	cmd := exec.Command(os.Args[0], "-test.run", "^TestSweepInheritedFDsExceptReadyPipe$")
+	cmd := exec.Command(os.Args[0], "-test.run", "^TestSweepInheritedFDsExcept$")
 	cmd.Env = append(os.Environ(), "FDSWEEP_EXCEPT3_HELPER=1")
 	cmd.ExtraFiles = []*os.File{w3, r4} // non-CLOEXEC in the child at fd 3 and fd 4
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("helper exit = %v (want fd 3 kept, fd 4 swept)\n%s", err, out)
 	}
+}
+
+// TestSpawnedLeaseAgentReadyFD pins the sweep-gating predicate main reads from os.Args
+// before cobra parses: a --ready-fd on a lease-agent invocation is the ONLY signal that
+// preserves fd 3 across the inherited-fd sweep.
+func TestSpawnedLeaseAgentReadyFD(t *testing.T) {
+	cases := map[string]struct {
+		args   []string
+		wantFD int
+		wantOK bool
+	}{
+		"spawned, spaced flag": {[]string{"lease-agent", "--dir", "/x", "--ready-fd", "3"}, 3, true},
+		"spawned, equals flag": {[]string{"lease-agent", "--ready-fd=3"}, 3, true},
+		"manual, no flag":      {[]string{"lease-agent", "--pid", "0", "--dir", ""}, 0, false},
+		"not a lease agent":    {[]string{"status", "--ready-fd", "3"}, 0, false},
+		"zero fd is absent":    {[]string{"lease-agent", "--ready-fd", "0"}, 0, false},
+		"dangling flag":        {[]string{"lease-agent", "--ready-fd"}, 0, false},
+		"non-numeric fd":       {[]string{"lease-agent", "--ready-fd", "x"}, 0, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			fd, ok := SpawnedLeaseAgentReadyFD(tc.args)
+			if fd != tc.wantFD || ok != tc.wantOK {
+				t.Fatalf("SpawnedLeaseAgentReadyFD(%q) = (%d, %v), want (%d, %v)", tc.args, fd, ok, tc.wantFD, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestLeaseAgentReadyFDGate pins F-3: the fd-3 readiness handshake fires ONLY when the
+// launcher declares it with --ready-fd. A manual `ccp lease-agent` (no flag) must leave
+// its inherited fd 3 untouched — the crash the finding caught was signalReady writing to
+// and closing an unrelated inherited fd 3. Both arms use a degenerate leader so RunE
+// fails fast at the pid/dir guard (the signalReady call site) without any lease work.
+// The child runs in a helper subprocess so fd 3 is a controlled sentinel pipe.
+func TestLeaseAgentReadyFDGate(t *testing.T) {
+	switch os.Getenv("LEASEAGENT_FD3_HELPER") {
+	case "manual":
+		runLeaseAgentFD3Helper([]string{"--pid", "0", "--dir", ""})
+	case "wired":
+		runLeaseAgentFD3Helper([]string{"--pid", "0", "--dir", "", "--ready-fd", "3"})
+	}
+
+	cases := []struct {
+		name      string
+		mode      string
+		wantWrite bool
+	}{
+		{"manual invocation leaves fd 3 untouched", "manual", false},
+		{"wired invocation drives the fd-3 handshake", "wired", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r3, w3, err := os.Pipe() // sentinel readiness pipe at the child's fd 3
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = r3.Close() }()
+
+			cmd := exec.Command(os.Args[0], "-test.run", "^TestLeaseAgentReadyFDGate$")
+			cmd.Env = append(os.Environ(), "LEASEAGENT_FD3_HELPER="+tc.mode)
+			cmd.ExtraFiles = []*os.File{w3}
+			out, cerr := cmd.CombinedOutput()
+			_ = w3.Close() // drop the parent's writer so a silent child reads EOF, not a block
+
+			// Both arms fail the pid/dir guard, so the helper exits 7 (a clean error return).
+			// Anything else — notably a runtime-fatal signal — is the F-3 crash, not the guard.
+			var exit *exec.ExitError
+			if !errors.As(cerr, &exit) || exit.ExitCode() != 7 {
+				t.Fatalf("helper exit = %v (want clean guard-failure exit 7, not a crash)\n%s", cerr, out)
+			}
+
+			b, err := io.ReadAll(r3)
+			if err != nil {
+				t.Fatalf("read sentinel fd 3: %v", err)
+			}
+			switch {
+			case tc.wantWrite && !strings.HasPrefix(strings.TrimSpace(string(b)), "err:"):
+				t.Fatalf("wired lease-agent wrote %q to fd 3, want the handshake's err: verdict", b)
+			case !tc.wantWrite && len(b) != 0:
+				t.Fatalf("manual lease-agent wrote %q to fd 3; a no-flag invocation must never touch the readiness pipe", b)
+			}
+		})
+	}
+}
+
+// runLeaseAgentFD3Helper runs the real lease-agent command in a helper subprocess and
+// exits 7 on the expected guard failure so the parent can tell a clean error return from
+// a crash. It never returns.
+func runLeaseAgentFD3Helper(args []string) {
+	cmd := newLeaseAgentCmd()
+	cmd.SetArgs(args)
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+	if err := cmd.Execute(); err != nil {
+		os.Exit(7)
+	}
+	os.Exit(0)
 }
