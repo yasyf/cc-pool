@@ -136,6 +136,13 @@ func (d *Driver) Reconcile(ctx context.Context, id string, entry cregistry.Entry
 		return OutcomeNoop, nil
 	}
 	v := entry.Value
+	if v.UUID != id {
+		// The registry is keyed by account UUID; an entry whose value UUID
+		// disagrees with its key is a cross-account injection (pull/install the
+		// wrong account's credential into the key's local row). Never act on it.
+		d.svc.logf("hostsync: reconcile SKIPPED key %s: value UUID %q disagrees with the key — refusing a cross-account install", id, v.UUID)
+		return OutcomeNoop, nil
+	}
 	a, ok, err := d.deps.Store.GetAccountByUUID(id)
 	if err != nil {
 		return "", fmt.Errorf("resolve account %s: %w", id, err)

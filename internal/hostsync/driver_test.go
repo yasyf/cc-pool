@@ -340,6 +340,35 @@ func TestDriverReconcile(t *testing.T) {
 			},
 		},
 		{
+			name: "key-value-uuid-mismatch-skipped", // the cross-account-install guard
+			setup: func(h *driverHarness) {
+				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
+				h.cred.expiry[1] = 1000
+				h.pull.cred = strippedCred(2000) // a fresher credential the guard must NOT install
+			},
+			id:          "u1",
+			val:         acctValue("u-attacker", "same", "hostA", 2000, freshOAuth("u-attacker")), // value UUID != key
+			peers:       []string{"hostB"},
+			wantOutcome: OutcomeNoop,
+			check: func(t *testing.T, h *driverHarness) {
+				if len(h.mat.calls) != 0 || len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("a key/value-UUID mismatch acted: mat=%+v pulls=%+v installs=%+v", h.mat.calls, h.pull.calls, h.cred.installs)
+				}
+			},
+		},
+		{
+			name:        "key-value-uuid-mismatch-missing-local-skipped", // never materialize the wrong account
+			id:          "u-victim",
+			val:         acctValue("u-attacker", "l", "hostA", 5000, freshOAuth("u-attacker")), // value UUID != key
+			peers:       []string{"hostB"},
+			wantOutcome: OutcomeNoop,
+			check: func(t *testing.T, h *driverHarness) {
+				if len(h.mat.calls) != 0 {
+					t.Fatalf("a key/value-UUID mismatch materialized: %+v", h.mat.calls)
+				}
+			},
+		},
+		{
 			name: "owned-local-never-pulled", // the owned-precedence litmus
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
