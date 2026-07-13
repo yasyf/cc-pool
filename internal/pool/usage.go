@@ -230,9 +230,16 @@ func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleO
 	if cred == nil {
 		return nil, false, 0, freshErr
 	}
+	// An expired synced token cannot be refreshed on this host, so a grace-window
+	// 200 from the usage endpoint must not mask it: propagate ErrUnrefreshable so
+	// the daemon flags awaiting-origin. cred is non-nil here (the expired synced
+	// blob), so this never re-treads the nil-cred panic path.
+	if errors.Is(freshErr, ErrUnrefreshable) {
+		return nil, false, 0, freshErr
+	}
 	usage, rateLimited, retryAfter, err := m.fetchUsage(ctx, a, src, cred, opts)
 	// A confirmed pre-flight revocation must not be masked by a usage-endpoint 429 or
-	// transient 401; a clean fetchUsage recovery suppresses it.
+	// transient 401; a clean fetchUsage recovery suppresses it (a session may have rotated).
 	if errors.Is(freshErr, ErrNeedsLogin) && (err != nil || rateLimited) {
 		return nil, false, 0, freshErr
 	}

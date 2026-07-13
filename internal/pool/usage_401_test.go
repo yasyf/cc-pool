@@ -291,6 +291,32 @@ func TestSampleUsageClassifiesUnrefreshable(t *testing.T) {
 	}
 }
 
+// TestSampleUsagePropagatesUnrefreshableThroughGraceFetch pins the Phase-3
+// propagation fix (Stage-1 finding #5): an expired synced token whose access
+// token still grace-serves a 200 must STILL surface ErrUnrefreshable (the
+// origin's rotation is the only real recovery) instead of the grace 200
+// swallowing it. cred is the non-nil expired blob, so this exercises the guard
+// gated on cred==nil, never a nil-deref (the v0.50.2 tombstone incident).
+func TestSampleUsagePropagatesUnrefreshableThroughGraceFetch(t *testing.T) {
+	kc := &rotatingCreds{current: cred401("at-0", "", time.Now().Add(-time.Hour))}
+	fo := newFakeOAuth401("", "at-0") // at-0 grace-serves a 200
+	m, a := newManager401(t, kc, fo)
+
+	usage, rateLimited, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
+	if !errors.Is(err, ErrUnrefreshable) {
+		t.Fatalf("err = %v, want ErrUnrefreshable propagated despite the grace 200", err)
+	}
+	if errors.Is(err, ErrNeedsLogin) {
+		t.Fatalf("err = %v; a synced credential must not classify as needs-login", err)
+	}
+	if usage != nil || rateLimited {
+		t.Fatalf("usage = %+v rateLimited = %v, want a suppressed sample", usage, rateLimited)
+	}
+	if fo.refreshes != 0 {
+		t.Fatalf("refreshes = %d, want 0", fo.refreshes)
+	}
+}
+
 // TestFetchUsage401RereadWinsOverUnrefreshable: a fresher synced token pulled
 // underfoot between the pre-flight read and the 401 must be retried and win —
 // the ladder's re-read recovery runs before the unrefreshable classification.
