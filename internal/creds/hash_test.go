@@ -69,10 +69,4 @@ func TestAccessHash(t *testing.T) {
 			})
 		}
 	})
-
-	t.Run("no collision with CredentialHash", func(t *testing.T) {
-		if got := CredentialHash(hashCred("at", "")); got == want {
-			t.Fatal("CredentialHash of an RT-less pair collides with AccessHash")
-		}
-	})
 }

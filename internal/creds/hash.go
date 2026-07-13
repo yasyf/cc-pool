@@ -8,15 +8,6 @@ import (
 	"hash"
 )
 
-// CredentialHash digests the chain's token pair (length-prefixed SHA-256):
-// invariant under marshal round-trips, changed exactly when the chain rotates.
-func CredentialHash(c *Credential) string {
-	h := sha256.New()
-	hashField(h, c.ClaudeAiOauth.RefreshToken)
-	hashField(h, c.ClaudeAiOauth.AccessToken)
-	return hex.EncodeToString(h.Sum(nil))
-}
-
 // AccessHash digests the canonical Marshal of Strip() (length-prefixed
 // SHA-256): the identity of a stripped (synced) blob. An owned blob and its
 // stripped form hash identically, while every field but the refresh token is
