@@ -38,13 +38,13 @@ func lifecycleSyncService(m *pool.Manager) *hostsync.Service {
 
 // syncHookSelf resolves this host's holder identity for a lifecycle publish —
 // the same resolution `ccp sync enable` applies (syncSelf).
-func syncHookSelf(w io.Writer) string {
+func syncHookSelf(w io.Writer) (string, error) {
 	mesh, err := hostregistry.Mesh.Load()
 	if err != nil {
 		warn(w, "mesh state unreadable: %v", err)
 		mesh = &hostregistry.Registry{}
 	}
-	return syncSelf(w, mesh)
+	return syncSelf(mesh)
 }
 
 // syncNudge best-effort asks synckitd to re-watch a new account's stamp dir; a
@@ -156,7 +156,11 @@ func syncPublishAccountIO(ctx context.Context, errw io.Writer, m *pool.Manager, 
 	if err != nil {
 		return err
 	}
-	p := newSyncPublisher(m, syncHookSelf(errw))
+	self, err := syncHookSelf(errw)
+	if err != nil {
+		return err
+	}
+	p := newSyncPublisher(m, self)
 	if err := p.Publish(ctx, a); err != nil {
 		return err
 	}

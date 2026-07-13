@@ -176,9 +176,15 @@ func (s *Service) mutate(ctx context.Context, uuid string, mut func(Registry) er
 // PublishAccount force-stamps v into the registry: an explicit add/relogin
 // that lands past any tombstone or skewed add. It resurrects tombstones by
 // design, so bulk callers (enable backfill, scans) MUST use ScanPublish.
+// A non-zero chain must name its origin — an origin-less chain has no host to
+// pull from and would misclassify as owned everywhere; a zero chain (identity
+// only) is fine.
 func (s *Service) PublishAccount(ctx context.Context, v AccountValue) error {
 	if v.UUID == "" {
 		return fmt.Errorf("hostsync: PublishAccount requires a UUID")
+	}
+	if v.Chain.Origin == "" && v.Chain != (ChainStamp{}) {
+		return fmt.Errorf("hostsync: PublishAccount for %s: chain stamp names no origin", v.UUID)
 	}
 	_, err := s.mutate(ctx, v.UUID, func(reg Registry) error {
 		reg.Add(v.UUID, v, s.forceStamp(reg[v.UUID]))

@@ -130,7 +130,16 @@ func (s *Server) authKind(a store.Account) store.AuthKind {
 	if !ok || !e.Present() {
 		return store.AuthKindOwned
 	}
-	if e.Value.Chain.Origin != "" && e.Value.Chain.Origin != s.syncSelf {
+	if e.Value.Chain.Origin == "" {
+		// An origin-less entry (PublishAccount rejects these; legacy or foreign
+		// writers may not) names an unknown minting host: owned only when this
+		// host provably holds the refresh token.
+		if cred, _, err := s.m.ReadCredential(a); err == nil && cred.HasRefreshToken() {
+			return store.AuthKindOwned
+		}
+		return store.AuthKindAwaitingOrigin
+	}
+	if e.Value.Chain.Origin != s.syncSelf {
 		return store.AuthKindAwaitingOrigin
 	}
 	return store.AuthKindOwned

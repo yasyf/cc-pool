@@ -147,6 +147,29 @@ func TestPublishAccountOverridesTombstone(t *testing.T) {
 			t.Fatal("PublishAccount with empty UUID returned nil error")
 		}
 	})
+
+	t.Run("origin-less non-zero chain fails loud", func(t *testing.T) {
+		s, _ := newTestService(t)
+		v := acctVal("u1", "e@x.com", "work", "", 1000)
+		if err := s.PublishAccount(ctx, v); err == nil {
+			t.Fatal("PublishAccount with a non-zero chain naming no origin returned nil error")
+		}
+		if _, ok := loadEntry(t, s, "u1"); ok {
+			t.Fatal("rejected publish must leave no registry entry")
+		}
+	})
+
+	t.Run("zero chain (identity only) publishes", func(t *testing.T) {
+		s, _ := newTestService(t)
+		v := AccountValue{UUID: "u1", Email: "e@x.com", Label: "work"}
+		if err := s.PublishAccount(ctx, v); err != nil {
+			t.Fatalf("PublishAccount with a zero chain: %v", err)
+		}
+		e, ok := loadEntry(t, s, "u1")
+		if !ok || !e.Present() {
+			t.Fatalf("identity-only publish not present: ok=%v entry=%+v", ok, e)
+		}
+	})
 }
 
 func TestRecordLabelLWW(t *testing.T) {

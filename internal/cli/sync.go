@@ -180,7 +180,11 @@ func runSyncEnable(cmd *cobra.Command, m *pool.Manager) error {
 		warn(out, "mesh state unreadable: %v", err)
 		mesh = &hostregistry.Registry{}
 	}
-	published, err := syncScanPublish(cmd.Context(), m, syncSelf(out, mesh))
+	self, err := syncSelf(mesh)
+	if err != nil {
+		return err
+	}
+	published, err := syncScanPublish(cmd.Context(), m, self)
 	if err != nil {
 		return err
 	}
@@ -310,17 +314,17 @@ func syncBackfillUUIDs(out io.Writer, m *pool.Manager) error {
 
 // syncSelf names this host as chain holder: the mesh ssh target when joined
 // (peers dial the holder by it), else the hostname — the daemon's
-// resolveSyncSelf must resolve identically.
-func syncSelf(out io.Writer, mesh *hostregistry.Registry) string {
+// resolveSyncSelf must resolve identically. A host that cannot name itself
+// must not publish: an empty Origin would corrupt chain ownership.
+func syncSelf(mesh *hostregistry.Registry) (string, error) {
 	if mesh.Self != "" {
-		return mesh.Self
+		return mesh.Self, nil
 	}
 	host, err := os.Hostname()
 	if err != nil {
-		warn(out, "resolve hostname: %v; publishing without a holder host", err)
-		return ""
+		return "", fmt.Errorf("resolve sync self: %w", err)
 	}
-	return host
+	return host, nil
 }
 
 // syncRegistryFile is the shared-registry handle every CLI sync surface uses;

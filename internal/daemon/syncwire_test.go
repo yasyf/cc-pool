@@ -377,17 +377,33 @@ func TestAuthKindClassification(t *testing.T) {
 	}
 	pub("u-self", "host-self")
 	pub("u-peer", "peer-b")
+	// An origin-less entry can only predate the PublishAccount guard (or come
+	// from a foreign writer); seed one as an identity-only value.
+	if err := s.syncSvc.PublishAccount(ctx, hostsync.AccountValue{UUID: "u-noorigin"}); err != nil {
+		t.Fatal(err)
+	}
+	fk := s.m.Creds.(*credstest.Fake)
+	fk.Put("svc-owned", "u", &creds.Credential{ClaudeAiOauth: creds.OAuth{
+		AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1,
+	}})
+	fk.Put("svc-synced", "u", &creds.Credential{ClaudeAiOauth: creds.OAuth{
+		AccessToken: "at", ExpiresAt: 1,
+	}})
 
 	cases := map[string]struct {
 		uuid    string
+		svc     string
 		disable bool
 		want    store.AuthKind
 	}{
-		"origin is self → owned":      {uuid: "u-self", want: store.AuthKindOwned},
-		"origin is a peer → awaiting": {uuid: "u-peer", want: store.AuthKindAwaitingOrigin},
-		"no registry entry → owned":   {uuid: "u-absent", want: store.AuthKindOwned},
-		"no account uuid → owned":     {uuid: "", want: store.AuthKindOwned},
-		"sync disabled → owned":       {uuid: "u-peer", disable: true, want: store.AuthKindOwned},
+		"origin is self → owned":                     {uuid: "u-self", want: store.AuthKindOwned},
+		"origin is a peer → awaiting":                {uuid: "u-peer", want: store.AuthKindAwaitingOrigin},
+		"no registry entry → owned":                  {uuid: "u-absent", want: store.AuthKindOwned},
+		"no account uuid → owned":                    {uuid: "", want: store.AuthKindOwned},
+		"sync disabled → owned":                      {uuid: "u-peer", disable: true, want: store.AuthKindOwned},
+		"empty origin, owned local chain → owned":    {uuid: "u-noorigin", svc: "svc-owned", want: store.AuthKindOwned},
+		"empty origin, synced local copy → awaiting": {uuid: "u-noorigin", svc: "svc-synced", want: store.AuthKindAwaitingOrigin},
+		"empty origin, no local cred → awaiting":     {uuid: "u-noorigin", svc: "svc-absent", want: store.AuthKindAwaitingOrigin},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -397,7 +413,11 @@ func TestAuthKindClassification(t *testing.T) {
 				}
 				t.Cleanup(func() { _ = s.m.Store.SetMeta(metaSyncEnabled, "1") })
 			}
-			if got := s.authKind(store.Account{ID: 1, AccountUUID: tc.uuid}); got != tc.want {
+			a := store.Account{
+				ID: 1, AccountUUID: tc.uuid, ConfigDir: t.TempDir(),
+				KeychainService: tc.svc, KeychainAccount: "u",
+			}
+			if got := s.authKind(a); got != tc.want {
 				t.Fatalf("authKind(uuid=%q) = %q, want %q", tc.uuid, got, tc.want)
 			}
 		})
