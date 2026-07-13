@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,13 +80,23 @@ type Client struct {
 	refreshSF singleflight.Group
 }
 
-// New returns a Client with sane timeouts.
+// New returns a Client with sane timeouts. CLAUDE_POOL_TOKEN_URL and
+// CLAUDE_POOL_USAGE_URL override the endpoints (the CLAUDE_POOL_SECURITY_BIN
+// seam style); unset, the real claude endpoints stand.
 func New() *Client {
 	return &Client{
 		http:     &http.Client{Timeout: 15 * time.Second},
-		tokenURL: tokenEndpoint,
-		usageURL: usageEndpoint,
+		tokenURL: endpointOverride("CLAUDE_POOL_TOKEN_URL", tokenEndpoint),
+		usageURL: endpointOverride("CLAUDE_POOL_USAGE_URL", usageEndpoint),
 	}
+}
+
+// endpointOverride returns the env override when non-empty, else def.
+func endpointOverride(envVar, def string) string {
+	if v := os.Getenv(envVar); v != "" {
+		return v
+	}
+	return def
 }
 
 // TokenResponse is the refresh endpoint's reply.

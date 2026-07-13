@@ -13,6 +13,47 @@ import (
 	"time"
 )
 
+// TestNewEndpointOverrides pins the env seam: unset yields the real claude
+// defaults; CLAUDE_POOL_TOKEN_URL / CLAUDE_POOL_USAGE_URL override each in turn.
+func TestNewEndpointOverrides(t *testing.T) {
+	t.Run("unset uses claude defaults", func(t *testing.T) {
+		t.Setenv("CLAUDE_POOL_TOKEN_URL", "")
+		t.Setenv("CLAUDE_POOL_USAGE_URL", "")
+		c := New()
+		if c.tokenURL != tokenEndpoint {
+			t.Fatalf("tokenURL = %q, want default %q", c.tokenURL, tokenEndpoint)
+		}
+		if c.usageURL != usageEndpoint {
+			t.Fatalf("usageURL = %q, want default %q", c.usageURL, usageEndpoint)
+		}
+	})
+	t.Run("env overrides both endpoints", func(t *testing.T) {
+		const tokURL = "http://127.0.0.1:9931/v1/oauth/token"
+		const useURL = "http://127.0.0.1:9931/api/oauth/usage"
+		t.Setenv("CLAUDE_POOL_TOKEN_URL", tokURL)
+		t.Setenv("CLAUDE_POOL_USAGE_URL", useURL)
+		c := New()
+		if c.tokenURL != tokURL {
+			t.Fatalf("tokenURL = %q, want override %q", c.tokenURL, tokURL)
+		}
+		if c.usageURL != useURL {
+			t.Fatalf("usageURL = %q, want override %q", c.usageURL, useURL)
+		}
+	})
+	t.Run("token override leaves usage default", func(t *testing.T) {
+		const tokURL = "http://127.0.0.1:9931/v1/oauth/token"
+		t.Setenv("CLAUDE_POOL_TOKEN_URL", tokURL)
+		t.Setenv("CLAUDE_POOL_USAGE_URL", "")
+		c := New()
+		if c.tokenURL != tokURL {
+			t.Fatalf("tokenURL = %q, want override %q", c.tokenURL, tokURL)
+		}
+		if c.usageURL != usageEndpoint {
+			t.Fatalf("usageURL = %q, want default %q", c.usageURL, usageEndpoint)
+		}
+	})
+}
+
 // TestTransportErrClassification pins the source-of-truth classifier: a generic
 // transport error and a deadline are network-class; a deliberate cancellation is
 // not; the underlying cause is always preserved.
