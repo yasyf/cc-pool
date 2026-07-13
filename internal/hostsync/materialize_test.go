@@ -347,6 +347,41 @@ func TestMaterializeNoEnvelopeAborts(t *testing.T) {
 	}
 }
 
+// TestMaterializeTokenlessEnvelopeAborts pins the credential-ingress gate: a
+// pulled envelope with no access token (self-consistent but unusable — a
+// malformed or downrev peer) must abort and roll back rather than materialize
+// a tombstoned account.
+func TestMaterializeTokenlessEnvelopeAborts(t *testing.T) {
+	s, m, _, rec := newMaterializeService(t)
+	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tokenless := &creds.Credential{}
+	tokenless.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
+	oauthAccount := json.RawMessage(`{"accountUuid":"u-tokenless","emailAddress":"t@example.com"}`)
+
+	res, err := s.Materialize(context.Background(), materializeVal("u-tokenless", "t@example.com", oauthAccount), []string{"hostB"}, pullConst(tokenless), materializeManifest)
+	if !errors.Is(err, pool.ErrEnvelopeNoAccessToken) {
+		t.Fatalf("err = %v, want errors.Is pool.ErrEnvelopeNoAccessToken", err)
+	}
+	if res != (MaterializeResult{}) {
+		t.Fatalf("result = %+v, want zero on abort", res)
+	}
+	if _, statErr := os.Stat(pool.AccountDir(1)); !os.IsNotExist(statErr) {
+		t.Fatalf("account dir stat err = %v, want not-exist (AbandonAdd must remove it)", statErr)
+	}
+	accounts, lerr := m.Store.ListAccounts()
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if len(accounts) != 0 {
+		t.Fatalf("accounts = %+v, want none after abort", accounts)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("nudge calls = %v, want none on abort", rec.calls)
+	}
+}
+
 // TestMaterializeEmptyOAuthDefers pins carry-forward #3: an entry with no
 // oauthAccount is deferred — no dir, no reservation, no pull — never an error
 // loop, so a later scan-publish backfill can supply the identity.

@@ -105,6 +105,11 @@ func TestInstallSyncedCredentialOwnedPrecedence(t *testing.T) {
 			incoming:  syncCred("in", incomingExpiry),
 			wantErrIs: ErrEnvelopeCarriesSecret,
 		},
+		"tokenless envelope refused": {
+			local:     envCred("old", 1_000),
+			incoming:  &creds.Credential{ClaudeAiOauth: creds.OAuth{ExpiresAt: incomingExpiry}},
+			wantErrIs: ErrEnvelopeNoAccessToken,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

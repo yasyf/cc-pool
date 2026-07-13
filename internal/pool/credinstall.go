@@ -14,6 +14,11 @@ import (
 // RT-bearing envelope (e.g. from a downrev peer) is never installable.
 var ErrEnvelopeCarriesSecret = errors.New("synced credential envelope carries a refresh token")
 
+// ErrEnvelopeNoAccessToken rejects a credential envelope with no access
+// token: there is nothing to serve, and installing it would bury a usable
+// local copy under a tombstone.
+var ErrEnvelopeNoAccessToken = errors.New("credential envelope carries no access token")
+
 // InstallSyncedCredential installs cred — a stripped copy pulled from a peer —
 // under owned precedence: an owned local blob (refresh token present) on ANY
 // backend is never overwritten or shadowed, even when expired; an absent or
@@ -22,8 +27,11 @@ var ErrEnvelopeCarriesSecret = errors.New("synced credential envelope carries a 
 // `claude /login` aborts as a clean skip. Reports whether it installed; a
 // precedence or freshness skip is a normal outcome.
 func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, cred *creds.Credential) (bool, error) {
-	if cred.HasRefreshToken() {
+	switch {
+	case cred.HasRefreshToken():
 		return false, fmt.Errorf("refusing install for acct-%d: %w", a.ID, ErrEnvelopeCarriesSecret)
+	case !cred.Synced():
+		return false, fmt.Errorf("refusing install for acct-%d: %w", a.ID, ErrEnvelopeNoAccessToken)
 	}
 	release, err := m.lockAccount(ctx, a.ID)
 	if err != nil {

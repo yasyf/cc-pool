@@ -118,6 +118,10 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 // to the file store when the login keychain is unsearchable (the returned bool
 // flags the fallback). It writes directly — no row exists yet for OnCredWrite.
 func (s *Service) installEnvelope(p *pool.PendingAdd, env *creds.Credential) (bool, error) {
+	// TODO(phase-2): tighten to env.Synced() once the fetch protocol ships stripped envelopes.
+	if env.ClaudeAiOauth.AccessToken == "" {
+		return false, fmt.Errorf("install credential envelope: %w", pool.ErrEnvelopeNoAccessToken)
+	}
 	acct := store.Account{
 		ConfigDir:       p.ConfigDir,
 		KeychainService: p.KeychainService,
