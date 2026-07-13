@@ -28,6 +28,11 @@ var ErrUnrefreshable = errors.New("credential expired and holds no refresh token
 // (usually `claude /login`) minted a newer credential we must not clobber.
 var ErrCredentialChangedUnderfoot = errors.New("stored credential changed under us before write-back")
 
+// ErrCredentialUnverifiable aborts a write-back when the pre-write re-read
+// failed for anything but a proven-empty slot (absent, or a tombstone):
+// writing over an unverifiable state could destroy a credential we cannot see.
+var ErrCredentialUnverifiable = errors.New("stored credential unreadable before write-back")
+
 // EnsureFreshToken returns the account's credential, refreshing it when the access
 // token expires within `within` and allowRefresh is true. allowRefresh must be
 // false for an account with a live session (that session owns refresh).
@@ -78,11 +83,17 @@ func (m *Manager) writeCred(a store.Account, src creds.Source, cred *creds.Crede
 }
 
 // writeCredCAS aborts with ErrCredentialChangedUnderfoot if the backend's access
-// token no longer matches prevAccess (a concurrent writer landed a newer cred);
-// an absent/unreadable backend writes through. Caller must hold the account lock.
+// token no longer matches prevAccess (a concurrent writer landed a newer cred).
+// A proven-empty slot (absent or tombstone) writes through; any other re-read
+// failure aborts with ErrCredentialUnverifiable. Caller must hold the account lock.
 func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prevAccess string, next *creds.Credential) error {
 	s := m.Creds.Store(a, src)
-	if cur, err := s.Read(); err == nil && cur.ClaudeAiOauth.AccessToken != prevAccess {
+	cur, err := s.Read()
+	switch {
+	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
+	case err != nil:
+		return fmt.Errorf("%w: %s: %w", ErrCredentialUnverifiable, s, err)
+	case cur.ClaudeAiOauth.AccessToken != prevAccess:
 		return fmt.Errorf("%w: %s (a concurrent writer owns the newer credential)", ErrCredentialChangedUnderfoot, s)
 	}
 	return m.writeCred(a, src, next)

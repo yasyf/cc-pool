@@ -20,11 +20,14 @@ func casCred(access, refresh string) *creds.Credential {
 
 // TestWriteCredCAS pins the compare-and-swap guard: a matching snapshot writes
 // through, a changed-underfoot re-read aborts with ErrCredentialChangedUnderfoot
-// without clobbering, and an absent backend proceeds.
+// without clobbering, an absent backend proceeds, and a re-read that fails for
+// any reason other than a proven-empty slot aborts with ErrCredentialUnverifiable.
 func TestWriteCredCAS(t *testing.T) {
+	errOpaque := errors.New("keychain read exploded")
 	cases := []struct {
 		name        string
 		stored      *creds.Credential // seeded backend value; nil = absent
+		readFault   error             // injected re-read failure
 		prevAccess  string            // the snapshot next was derived from
 		next        *creds.Credential
 		wantErr     error
@@ -58,6 +61,26 @@ func TestWriteCredCAS(t *testing.T) {
 			wantStored:  "at-1",
 			wantWritten: true,
 		},
+		{
+			name:        "unsearchable keychain aborts (unverifiable, not empty)",
+			stored:      casCred("at-0", "rt-0"),
+			readFault:   creds.ErrUnavailable,
+			prevAccess:  "at-0",
+			next:        casCred("at-1", "rt-1"),
+			wantErr:     ErrCredentialUnverifiable,
+			wantStored:  "at-0",
+			wantWritten: false,
+		},
+		{
+			name:        "opaque re-read error aborts",
+			stored:      casCred("at-0", "rt-0"),
+			readFault:   errOpaque,
+			prevAccess:  "at-0",
+			next:        casCred("at-1", "rt-1"),
+			wantErr:     errOpaque,
+			wantStored:  "at-0",
+			wantWritten: false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -67,6 +90,7 @@ func TestWriteCredCAS(t *testing.T) {
 			if tc.stored != nil {
 				fk.Put(a.KeychainService, a.KeychainAccount, tc.stored)
 			}
+			fk.KeychainFaults = credstest.Faults{Read: tc.readFault}
 			st := openTestStore(t)
 			if err := st.UpsertAccount(a); err != nil {
 				t.Fatal(err)
