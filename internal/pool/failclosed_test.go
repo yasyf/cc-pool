@@ -120,9 +120,9 @@ func TestPreflightRefreshFailsClosedOnScanError(t *testing.T) {
 }
 
 // TestPreflightRefreshUnrefreshablePassthrough pins the synced-copy surface:
-// an idle account holding an expiring synced blob returns ErrUnrefreshable
-// unwrapped (non-fatal, like ErrNeedsLogin) with zero refresh POSTs; a valid
-// synced blob is a clean nil.
+// an idle account holding an expired synced blob returns ErrUnrefreshable
+// unwrapped (non-fatal, like ErrNeedsLogin) with zero refresh POSTs; a
+// still-valid synced blob — even inside the lead window — is a clean nil.
 func TestPreflightRefreshUnrefreshablePassthrough(t *testing.T) {
 	orig := scanSessions
 	t.Cleanup(func() { scanSessions = orig })
@@ -132,8 +132,9 @@ func TestPreflightRefreshUnrefreshablePassthrough(t *testing.T) {
 		expiry  time.Time
 		wantErr error
 	}{
-		"expiring synced blob passes ErrUnrefreshable through": {expiry: time.Now().Add(time.Minute), wantErr: ErrUnrefreshable},
-		"valid synced blob is a non-event":                     {expiry: time.Now().Add(time.Hour)},
+		"expired synced blob passes ErrUnrefreshable through": {expiry: time.Now().Add(-time.Minute), wantErr: ErrUnrefreshable},
+		"near-expiry synced blob is a non-event":              {expiry: time.Now().Add(time.Minute)},
+		"valid synced blob is a non-event":                    {expiry: time.Now().Add(time.Hour)},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

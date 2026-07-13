@@ -19,9 +19,10 @@ const RefreshLeadTime = 10 * time.Minute
 // account must be re-logged-in interactively.
 var ErrNeedsLogin = errors.New("account needs re-login (refresh token missing or revoked)")
 
-// ErrUnrefreshable indicates a synced credential at or near expiry: only the
-// origin host holds the refresh token, so this host can only wait for the
-// origin's rotation to sync over, or mint its own chain via `ccp login`.
+// ErrUnrefreshable indicates an expired (or server-rejected) synced
+// credential: only the origin host holds the refresh token, so this host can
+// only wait for the origin's rotation to sync over, or mint its own chain via
+// `ccp login`.
 var ErrUnrefreshable = errors.New("credential expired and holds no refresh token; this host cannot refresh it")
 
 // ErrCredentialChangedUnderfoot aborts a write-back when a concurrent writer
@@ -117,6 +118,11 @@ func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within 
 		return cred, src, false, nil
 	}
 	if cred.Synced() {
+		// Nothing to refresh: the lead window is meaningless — the token
+		// serves until actually expired.
+		if !cred.Expired() {
+			return cred, src, false, nil
+		}
 		return cred, src, false, ErrUnrefreshable
 	}
 	refreshed, err := m.refresh(ctx, a, src, cred)

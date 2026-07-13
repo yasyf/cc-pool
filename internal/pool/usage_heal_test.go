@@ -130,17 +130,18 @@ func synced(at string, exp time.Time) *creds.Credential {
 	return c
 }
 
-// TestEnsureFreshTokenSynced pins the synced-blob classification: a valid
-// synced token is a non-event, one inside the refresh window (or expired) is
-// ErrUnrefreshable — never ErrNeedsLogin — and no refresh is ever POSTed.
+// TestEnsureFreshTokenSynced pins the synced-blob classification: a synced
+// token serves until actually expired — the refresh lead window is meaningless
+// for a token with nothing to refresh — and only an expired one is
+// ErrUnrefreshable, never ErrNeedsLogin; no refresh is ever POSTed.
 func TestEnsureFreshTokenSynced(t *testing.T) {
 	cases := map[string]struct {
 		expiry  time.Time
 		wantErr error
 	}{
-		"unexpired synced is a non-event":              {expiry: time.Now().Add(time.Hour)},
-		"synced inside the lead window cannot refresh": {expiry: time.Now().Add(time.Minute), wantErr: ErrUnrefreshable},
-		"expired synced cannot refresh":                {expiry: time.Now().Add(-time.Hour), wantErr: ErrUnrefreshable},
+		"unexpired synced is a non-event":            {expiry: time.Now().Add(time.Hour)},
+		"synced inside the lead window still serves": {expiry: time.Now().Add(time.Minute)},
+		"expired synced cannot refresh":              {expiry: time.Now().Add(-time.Hour), wantErr: ErrUnrefreshable},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -173,6 +174,29 @@ func TestEnsureFreshTokenSynced(t *testing.T) {
 				t.Fatalf("writes = %d, want 0", fk.WriteCount())
 			}
 		})
+	}
+}
+
+// TestSampleUsageNearExpirySyncedStillSamples pins that a synced token inside
+// the refresh lead but still valid keeps sampling: it has nothing to refresh,
+// so the lead window must not stop the usage request for its final minutes.
+func TestSampleUsageNearExpirySyncedStillSamples(t *testing.T) {
+	kc := &rotatingCreds{current: cred401("at-0", "", time.Now().Add(30*time.Second))}
+	fo := newFakeOAuth401("", "at-0") // at-0 valid: the request must be sent and served
+	m, a := newManager401(t, kc, fo)
+
+	usage, rateLimited, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
+	if err != nil {
+		t.Fatalf("SampleUsage = %v, want the still-valid synced token to sample", err)
+	}
+	if rateLimited {
+		t.Fatal("rateLimited = true, want false")
+	}
+	if usage == nil || usage.FiveHour.Utilization != 31 {
+		t.Fatalf("usage = %+v, want the served windows (the usage request must actually fire)", usage)
+	}
+	if fo.refreshes != 0 {
+		t.Fatalf("refreshes = %d, want 0 (synced tokens never refresh)", fo.refreshes)
 	}
 }
 
