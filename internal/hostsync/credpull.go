@@ -133,8 +133,9 @@ func fetchOrder(origin string, peers []string) []string {
 
 // fetchFromPeer runs one bounded attempt against peer, verifying the parsed
 // credential by recomputation: it must be a valid stripped synced credential,
-// hash-consistent with its envelope, registry-matching unless peer is the
-// origin, and strictly fresher than the local credential.
+// hash- and expiry-consistent with its envelope, registry-matching (hash and
+// expiry both) unless peer is the origin, and strictly fresher than the local
+// credential.
 func fetchFromPeer(ctx context.Context, dial DialTransport, peer, uuid string, chain ChainStamp, localExpiresAt int64, isOrigin bool) (*creds.Credential, error) {
 	ctx, cancel := context.WithTimeout(ctx, FetchTimeout)
 	defer cancel()
@@ -166,8 +167,17 @@ func fetchFromPeer(ctx context.Context, dial DialTransport, peer, uuid string, c
 	if creds.AccessHash(&cred) != env.Hash {
 		return nil, errors.New("credential does not hash to the advertised envelope hash")
 	}
+	if env.ExpiresAt != cred.ClaudeAiOauth.ExpiresAt {
+		return nil, fmt.Errorf("envelope expiry %d disagrees with the credential's %d", env.ExpiresAt, cred.ClaudeAiOauth.ExpiresAt)
+	}
 	if !isOrigin && env.Hash != chain.Hash {
 		return nil, errors.New("relay answer does not match the registry chain (stale peer registry)")
+	}
+	// AccessHash covers only the access token, so a relay could otherwise
+	// inflate expiresAt under a still-valid hash; the origin published the
+	// expiry in the chain stamp, and a relay must present exactly it.
+	if !isOrigin && cred.ClaudeAiOauth.ExpiresAt != chain.ExpiresAt {
+		return nil, fmt.Errorf("relay expiry %d does not match the registry chain's %d", cred.ClaudeAiOauth.ExpiresAt, chain.ExpiresAt)
 	}
 	if cred.ClaudeAiOauth.ExpiresAt <= localExpiresAt {
 		return nil, fmt.Errorf("credential expiry %d is not strictly later than local %d", cred.ClaudeAiOauth.ExpiresAt, localExpiresAt)

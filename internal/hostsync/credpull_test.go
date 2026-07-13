@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -371,6 +372,66 @@ func TestFetchCredentialOriginAuthoritativeRelayMustMatch(t *testing.T) {
 		}
 		if !reflect.DeepEqual(got, advertised.Strip()) {
 			t.Fatalf("pulled %+v, want the registry-matching chain from hostC", got)
+		}
+	})
+}
+
+// TestFetchCredentialRejectsForgedExpiry pins the expiry pin: AccessHash covers
+// only the access token, so a relay holding the advertised AT could otherwise
+// inflate expiresAt (freezing the peer against every later real rotation). A
+// relay must present exactly the origin-published chain expiry, and every
+// envelope's ExpiresAt must agree with its enclosed credential.
+func TestFetchCredentialRejectsForgedExpiry(t *testing.T) {
+	advertised := pullCred("t1", 5_000).Strip()
+	chain := ChainStamp{Origin: "hostA", ExpiresAt: 5_000, Hash: creds.AccessHash(advertised)}
+
+	t.Run("relay inflating expiresAt under a valid hash is rejected", func(t *testing.T) {
+		forged := *advertised
+		forged.ClaudeAiOauth.ExpiresAt = math.MaxInt64
+		dial := func(peer string) syncservice.Transport {
+			if peer == "hostA" {
+				return failingTransport()
+			}
+			return envelopeTransport(t, &forged, creds.AccessHash(&forged))
+		}
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB"})
+		if got != nil {
+			t.Fatalf("pulled forged-expiry credential: %+v", got)
+		}
+		if !errors.Is(err, ErrNoPeerCredential) {
+			t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
+		}
+	})
+
+	t.Run("relay presenting the advertised expiry serves", func(t *testing.T) {
+		dial := func(peer string) syncservice.Transport {
+			if peer == "hostA" {
+				return failingTransport()
+			}
+			return envelopeTransport(t, advertised, creds.AccessHash(advertised))
+		}
+		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostB"})
+		if err != nil {
+			t.Fatalf("FetchCredential: %v", err)
+		}
+		if got.ClaudeAiOauth.ExpiresAt != 5_000 {
+			t.Fatalf("pulled expiry = %d, want the advertised 5000", got.ClaudeAiOauth.ExpiresAt)
+		}
+	})
+
+	t.Run("envelope expiry disagreeing with the credential is rejected even from the origin", func(t *testing.T) {
+		blob, err := advertised.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		env := CredentialEnvelope{Credential: blob, ExpiresAt: math.MaxInt64, Hash: creds.AccessHash(advertised)}
+		tx := handlerTransport(func(context.Context, map[string]any) (any, error) { return env, nil })
+		got, err := FetchCredential(context.Background(), func(string) syncservice.Transport { return tx }, "u-1", chain, 0, []string{"hostA"})
+		if got != nil {
+			t.Fatalf("pulled credential from an inconsistent envelope: %+v", got)
+		}
+		if !errors.Is(err, ErrNoPeerCredential) {
+			t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
 		}
 	})
 }
