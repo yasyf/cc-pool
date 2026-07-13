@@ -131,6 +131,13 @@ func (m *Manager) lockAccount(ctx context.Context, id int) (func(), error) {
 	}, nil
 }
 
+// LockAccount serializes an account's credential cycle for out-of-package
+// writers (hostsync's materialize install); the returned release must be
+// called exactly once.
+func (m *Manager) LockAccount(ctx context.Context, id int) (func(), error) {
+	return m.lockAccount(ctx, id)
+}
+
 // Open ensures the state dir exists, opens the database, and returns a Manager.
 func Open() (*Manager, error) {
 	if err := EnsureStateDir(); err != nil {

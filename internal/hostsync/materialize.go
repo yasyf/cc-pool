@@ -129,7 +129,7 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		return release(fmt.Errorf("materialize %s: %w", v.UUID, pool.ErrEnvelopeNoAccessToken))
 	}
 
-	fileFallback, err := s.installEnvelope(p, env)
+	fileFallback, err := s.installEnvelope(ctx, p, env)
 	switch {
 	// A credential landed (or a backend became unprovable) under the pull:
 	// AbandonAdd would delete it — release keeps it.
@@ -202,19 +202,26 @@ func (s *Service) slotRetainsCredential(p *pool.PendingAdd) (bool, error) {
 // installEnvelope writes the pulled stripped credential to the Keychain,
 // falling back to the file store when the login keychain is unsearchable (the
 // returned bool flags the fallback). It writes directly — no row exists yet
-// for OnCredWrite — but only after re-proving both backends empty at write
-// time, the same owned-precedence guard as pool.InstallSyncedCredential: a
-// credential that landed since the pre-flight check (a released `ccp add`'s
-// still-running login) aborts with ErrCredentialChangedUnderfoot, and a
-// backend that cannot be proven empty fails closed with
-// ErrCredentialUnverifiable.
-func (s *Service) installEnvelope(p *pool.PendingAdd, env *creds.Credential) (bool, error) {
+// for OnCredWrite — but under the account lock and only after re-proving both
+// backends empty at write time, the same owned-precedence guard as
+// pool.InstallSyncedCredential: a credential that landed since the pre-flight
+// check (a released `ccp add`'s still-running login) aborts with
+// ErrCredentialChangedUnderfoot, and a backend that cannot be proven empty
+// fails closed with ErrCredentialUnverifiable.
+func (s *Service) installEnvelope(ctx context.Context, p *pool.PendingAdd, env *creds.Credential) (bool, error) {
 	switch {
 	case env.HasRefreshToken():
 		return false, fmt.Errorf("install credential envelope: %w", pool.ErrEnvelopeCarriesSecret)
 	case !env.Synced():
 		return false, fmt.Errorf("install credential envelope: %w", pool.ErrEnvelopeNoAccessToken)
 	}
+	// Serializes the empty-proof→write against concurrent cc-pool-side writers;
+	// the in-session claude race stays tracked in ccn 4ed1146.
+	release, err := s.M.LockAccount(ctx, p.Index)
+	if err != nil {
+		return false, err
+	}
+	defer release()
 	acct, err := s.slotAccount(p)
 	if err != nil {
 		return false, err
