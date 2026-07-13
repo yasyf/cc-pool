@@ -118,6 +118,9 @@ func (p *syncPublisher) Publish(ctx context.Context, a store.Account) error {
 		Email:        ident.EmailAddress,
 		Label:        a.Label,
 		OAuthAccount: raw,
+		// TODO(phase-3): AccessHash — build the v2 stamp {Origin: p.self,
+		// ExpiresAt, Hash: creds.AccessHash(cred), RotatedAt} and delete
+		// currentLease (schema v2 has no holder/lease).
 		Chain: hostsync.ChainStamp{
 			ExpiresAt: cred.ClaudeAiOauth.ExpiresAt,
 			Hash:      hostsync.CredentialHash(cred),

@@ -24,7 +24,7 @@ type credEvent struct {
 type credMirror struct {
 	// note records a chain stamp; wired to hostsync.Service.NoteCredWrite.
 	note func(ctx context.Context, uuid string, chain hostsync.ChainStamp) error
-	// self is this host's name, published as the rotated chain's holder.
+	// self is this host's name, published as the rotated chain's origin.
 	self string
 	// now supplies the RotatedAt clock; tests inject a fake.
 	now func() time.Time
@@ -69,9 +69,9 @@ func (c *credMirror) Run(ctx context.Context) {
 			return
 		case ev := <-c.ch:
 			chain := hostsync.ChainStamp{
+				Origin:    c.self,
 				ExpiresAt: ev.cred.ClaudeAiOauth.ExpiresAt,
-				Hash:      hostsync.CredentialHash(&ev.cred),
-				Holder:    c.self,
+				Hash:      creds.AccessHash(&ev.cred),
 				RotatedAt: c.now().UnixMilli(),
 			}
 			if err := c.note(ctx, ev.acct.AccountUUID, chain); err != nil {
