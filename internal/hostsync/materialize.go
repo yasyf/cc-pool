@@ -71,6 +71,20 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		}
 		return MaterializeResult{}, cause
 	}
+	// Rollback after a failed pull is decided by what's in the slot, not the
+	// pull-error class: a concurrent `ccp add` login may have landed an owned
+	// credential mid-pull, which AbandonAdd would delete. Only a provably
+	// empty slot is torn down; a retained or unprovable one is released intact.
+	abandonUnlessRetained := func(cause error) (MaterializeResult, error) {
+		retained, err := s.slotRetainsCredential(p)
+		switch {
+		case err != nil:
+			return release(errors.Join(cause, err))
+		case retained:
+			return release(cause)
+		}
+		return abandon(cause)
+	}
 
 	// A kept dir may retain a usable credential from an interrupted `ccp add`
 	// (ReleaseAdd keeps login state); materializing over it would destroy an
@@ -106,9 +120,9 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	case errors.Is(err, pool.ErrEnvelopeCarriesSecret), errors.Is(err, pool.ErrEnvelopeNoAccessToken):
 		return release(fmt.Errorf("materialize %s: %w", v.UUID, err))
 	case err != nil:
-		return abandon(fmt.Errorf("materialize %s: %w", v.UUID, errors.Join(ErrMaterializeNoEnvelope, err)))
+		return abandonUnlessRetained(fmt.Errorf("materialize %s: %w", v.UUID, errors.Join(ErrMaterializeNoEnvelope, err)))
 	case env == nil:
-		return abandon(fmt.Errorf("materialize %s: %w", v.UUID, ErrMaterializeNoEnvelope))
+		return abandonUnlessRetained(fmt.Errorf("materialize %s: %w", v.UUID, ErrMaterializeNoEnvelope))
 	case env.HasRefreshToken():
 		return release(fmt.Errorf("materialize %s: %w", v.UUID, pool.ErrEnvelopeCarriesSecret))
 	case !env.Synced():

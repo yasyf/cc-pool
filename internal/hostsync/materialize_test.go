@@ -16,6 +16,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
 
@@ -471,6 +472,106 @@ func TestMaterializeRejectedEnvelopeThroughRealPullerReleases(t *testing.T) {
 				t.Fatalf("nudge calls = %v, want none on rejection", rec.calls)
 			}
 		})
+	}
+}
+
+// TestMaterializePullFailureNeverDestroysConcurrentLogin pins the slot-driven
+// rollback for non-sentinel pull failures, through the REAL puller: a hash
+// mismatch or an unknown-method peer must not AbandonAdd when a concurrent
+// `ccp add` login landed an owned credential mid-pull — the login survives
+// and only the reservation is released.
+func TestMaterializePullFailureNeverDestroysConcurrentLogin(t *testing.T) {
+	cases := map[string]func(t *testing.T) syncservice.Transport{
+		"hash-mismatch envelope": func(t *testing.T) syncservice.Transport {
+			return envelopeTransport(t, freshEnvelope("at-peer"), "garbage-hash")
+		},
+		"method not found": func(t *testing.T) syncservice.Transport {
+			return &fakeTransport{do: func(context.Context, *rpc.Request) (*syncservice.Response, error) {
+				return &syncservice.Response{OK: false, Error: `unknown method "ccp.fetch_stripped_credential"`}, nil
+			}}
+		},
+	}
+	for name, transport := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, m, fk, rec := newMaterializeService(t)
+			if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			owned := cred("at-login", "rt-login")
+			owned.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
+			pull := func(ctx context.Context, uuid string, chain ChainStamp, peers []string) (*creds.Credential, error) {
+				// The released add's still-running login lands mid-pull.
+				fk.Put(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel(), owned)
+				dial := func(string) syncservice.Transport { return transport(t) }
+				return FetchCredential(ctx, dial, uuid, chain, 0, peers)
+			}
+			oauthAccount := json.RawMessage(`{"accountUuid":"u-pf","emailAddress":"pf@example.com"}`)
+
+			res, err := s.Materialize(context.Background(), materializeVal("u-pf", "pf@example.com", oauthAccount), []string{"hostB"}, pull, materializeManifest)
+			if !errors.Is(err, ErrMaterializeNoEnvelope) {
+				t.Fatalf("err = %v, want errors.Is ErrMaterializeNoEnvelope", err)
+			}
+			if res != (MaterializeResult{}) {
+				t.Fatalf("result = %+v, want zero on abort", res)
+			}
+			// ReleaseAdd, not AbandonAdd: dir kept, the login's credential intact.
+			if _, statErr := os.Stat(pool.AccountDir(1)); statErr != nil {
+				t.Fatalf("account dir stat err = %v, want kept", statErr)
+			}
+			got, ok := fk.Get(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel())
+			if !ok || got.ClaudeAiOauth.RefreshToken != "rt-login" {
+				t.Fatalf("slot credential = %+v ok=%v, want the owned login intact", got, ok)
+			}
+			n, rerr := m.Store.ReserveAccountIndex()
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			if n != 1 {
+				t.Fatalf("next reserved index = %d, want the released 1", n)
+			}
+			accounts, lerr := m.Store.ListAccounts()
+			if lerr != nil {
+				t.Fatal(lerr)
+			}
+			if len(accounts) != 0 {
+				t.Fatalf("accounts = %+v, want none", accounts)
+			}
+			if len(rec.calls) != 0 {
+				t.Fatalf("nudge calls = %v, want none", rec.calls)
+			}
+		})
+	}
+}
+
+// TestMaterializePullFailureUnprovableSlotReleases pins the fail-safe: when a
+// pull fails and the slot cannot be proven empty (unsearchable Keychain), the
+// dir is released, never abandoned — nothing unprovable is deleted.
+func TestMaterializePullFailureUnprovableSlotReleases(t *testing.T) {
+	s, m, fk, _ := newMaterializeService(t)
+	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pullBoom := errors.New("all peers unreachable")
+	pull := func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
+		// The keychain becomes unsearchable mid-pull.
+		fk.KeychainFaults = credstest.Faults{Read: creds.ErrUnavailable}
+		return nil, pullBoom
+	}
+	oauthAccount := json.RawMessage(`{"accountUuid":"u-up","emailAddress":"up@example.com"}`)
+
+	_, err := s.Materialize(context.Background(), materializeVal("u-up", "up@example.com", oauthAccount), []string{"hostB"}, pull, materializeManifest)
+	if !errors.Is(err, ErrMaterializeNoEnvelope) {
+		t.Fatalf("err = %v, want errors.Is ErrMaterializeNoEnvelope", err)
+	}
+	if _, statErr := os.Stat(pool.AccountDir(1)); statErr != nil {
+		t.Fatalf("account dir stat err = %v, want kept on an unprovable slot", statErr)
+	}
+	n, rerr := m.Store.ReserveAccountIndex()
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if n != 1 {
+		t.Fatalf("next reserved index = %d, want the released 1", n)
 	}
 }
 
