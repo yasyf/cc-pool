@@ -373,6 +373,68 @@ func TestInstallSyncedCredentialAbortsOnLoginOverEmptySlot(t *testing.T) {
 	}
 }
 
+// TestInstallSyncedCredentialSkipsOnOwnedOtherBackend pins the all-backend
+// owned re-check: resolution picks the fresher synced file copy, but a staler
+// OWNED chain on the keychain means this host owns the account — installing
+// would hide the owned chain behind fresher-wins resolution and let cleanup
+// delete it.
+func TestInstallSyncedCredentialSkipsOnOwnedOtherBackend(t *testing.T) {
+	f := newInstallFixture(t)
+	f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, syncCred("owned", 1_000))
+	if err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Write(envCred("synced", 3_000)); err != nil {
+		t.Fatal(err)
+	}
+
+	installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, envCred("incoming", 5_000))
+	if err != nil {
+		t.Fatalf("InstallSyncedCredential: %v", err)
+	}
+	if installed {
+		t.Fatal("installed = true; an owned chain on any backend must win")
+	}
+	if f.fk.WriteCount() != 0 || f.hookCalls != 0 {
+		t.Fatalf("skip acted (writes=%d hooks=%d), want none", f.fk.WriteCount(), f.hookCalls)
+	}
+	if got, ok := f.fk.Get(f.a.KeychainService, f.a.KeychainAccount); !ok || got.ClaudeAiOauth.RefreshToken != "rt-owned" {
+		t.Fatalf("keychain holds %+v, want the owned chain untouched", got)
+	}
+	if got, err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Read(); err != nil || got.ClaudeAiOauth.AccessToken != "at-synced" {
+		t.Fatalf("file backend = (%+v, %v), want the synced copy untouched", got, err)
+	}
+}
+
+// TestInstallSyncedCredentialAbortsOnLoginDuringInstall pins the pre-write
+// re-probe against the racing login: the precedence read proves the keychain
+// empty and picks the synced file copy, a `claude /login` lands an owned
+// chain on the keychain before the write, and the file-store CAS alone would
+// never see it.
+func TestInstallSyncedCredentialAbortsOnLoginDuringInstall(t *testing.T) {
+	f := newInstallFixture(t)
+	if err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Write(envCred("synced", 1_000)); err != nil {
+		t.Fatal(err)
+	}
+	login := syncCred("login", 2_000)
+	ks := &swapStore{Store: f.fk.Store(f.a, creds.SourceKeychain), oldErr: creds.ErrNotFound, swapped: login}
+	f.m.Creds = swapCreds{Fake: f.fk, ks: ks}
+
+	installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, envCred("incoming", 5_000))
+	if err != nil {
+		t.Fatalf("an owned-underfoot skip must be clean, got: %v", err)
+	}
+	if installed {
+		t.Fatal("installed = true; the underfoot login must win")
+	}
+	if ks.reads < 2 {
+		t.Fatalf("owned re-probe never happened (reads = %d)", ks.reads)
+	}
+	if f.fk.WriteCount() != 0 || f.hookCalls != 0 {
+		t.Fatalf("aborted install acted (writes=%d hooks=%d), want none", f.fk.WriteCount(), f.hookCalls)
+	}
+	if got, err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Read(); err != nil || got.ClaudeAiOauth.AccessToken != "at-synced" {
+		t.Fatalf("file backend = (%+v, %v), want the synced copy untouched", got, err)
+	}
+}
+
 // TestWriteCredCASWritesThroughTombstone pins the CAS behavior the
 // install-over-tombstone path depends on: a prior read that fails to parse
 // (claude tombstone) or misses entirely must not block the write.

@@ -15,12 +15,12 @@ import (
 var ErrEnvelopeCarriesSecret = errors.New("synced credential envelope carries a refresh token")
 
 // InstallSyncedCredential installs cred — a stripped copy pulled from a peer —
-// under owned precedence: an owned local blob (refresh token present) is never
-// overwritten, even when expired; an absent or tombstoned local always
-// installs; a synced local yields only to a strictly fresher expiry. The write
-// goes through writeCredCAS, so an underfoot `claude /login` aborts as a clean
-// skip. Reports whether it installed; a precedence or freshness skip is a
-// normal outcome.
+// under owned precedence: an owned local blob (refresh token present) on ANY
+// backend is never overwritten or shadowed, even when expired; an absent or
+// tombstoned local always installs; a synced local yields only to a strictly
+// fresher expiry. The write goes through writeCredCAS, so an underfoot
+// `claude /login` aborts as a clean skip. Reports whether it installed; a
+// precedence or freshness skip is a normal outcome.
 func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, cred *creds.Credential) (bool, error) {
 	if cred.HasRefreshToken() {
 		return false, fmt.Errorf("refusing install for acct-%d: %w", a.ID, ErrEnvelopeCarriesSecret)
@@ -47,6 +47,14 @@ func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, 
 		// (writeCredCAS re-verifies the slot is still empty before writing).
 	default:
 		return false, err
+	}
+	// The CAS re-read guards only src: an owned chain landing on the OTHER
+	// backend would be hidden by fresher-wins resolution and later deleted as
+	// a stray, so re-check every backend — owned anywhere wins outright.
+	for _, s := range m.Creds.Stores(a) {
+		if cur, rerr := s.Read(); rerr == nil && cur.HasRefreshToken() {
+			return false, nil
+		}
 	}
 	if err := m.writeCredCAS(a, src, prev, cred); err != nil {
 		if errors.Is(err, ErrCredentialChangedUnderfoot) {
