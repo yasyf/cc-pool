@@ -16,6 +16,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 const materializeManifest = "/cfg/synckit/manifests/cc-pool.json"
@@ -401,6 +402,70 @@ func TestMaterializeRejectedEnvelopeReleasesNotAbandons(t *testing.T) {
 			}
 			if len(accounts) != 0 {
 				t.Fatalf("accounts = %+v, want none after rejection", accounts)
+			}
+			if len(rec.calls) != 0 {
+				t.Fatalf("nudge calls = %v, want none on rejection", rec.calls)
+			}
+		})
+	}
+}
+
+// TestMaterializeRejectedEnvelopeThroughRealPullerReleases pins the rejection
+// path END TO END: FetchCredential (the production puller) propagates the
+// per-peer rejection sentinel, so Materialize takes ReleaseAdd — a credential
+// a released `ccp add` login writes mid-pull survives (AbandonAdd would have
+// deleted it).
+func TestMaterializeRejectedEnvelopeThroughRealPullerReleases(t *testing.T) {
+	future := time.Now().Add(2 * time.Hour).UnixMilli()
+	tokenless := &creds.Credential{}
+	tokenless.ClaudeAiOauth.ExpiresAt = future
+	rtBearing := cred("at-secret", "rt-secret")
+	rtBearing.ClaudeAiOauth.ExpiresAt = future
+
+	cases := map[string]struct {
+		served    *creds.Credential
+		wantErrIs error
+	}{
+		"RT-bearing peer": {rtBearing, pool.ErrEnvelopeCarriesSecret},
+		"tokenless peer":  {tokenless, pool.ErrEnvelopeNoAccessToken},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, m, fk, rec := newMaterializeService(t)
+			if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			retained := cred("at-login", "rt-login")
+			retained.ClaudeAiOauth.ExpiresAt = future
+			pull := func(ctx context.Context, uuid string, chain ChainStamp, peers []string) (*creds.Credential, error) {
+				// The released add's still-running login lands mid-pull.
+				fk.Put(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel(), retained)
+				dial := func(string) syncservice.Transport { return envelopeTransport(t, tc.served, creds.AccessHash(tc.served)) }
+				return FetchCredential(ctx, dial, uuid, chain, 0, peers)
+			}
+			oauthAccount := json.RawMessage(`{"accountUuid":"u-real","emailAddress":"r@example.com"}`)
+
+			res, err := s.Materialize(context.Background(), materializeVal("u-real", "r@example.com", oauthAccount), []string{"hostB"}, pull, materializeManifest)
+			if !errors.Is(err, tc.wantErrIs) {
+				t.Fatalf("err = %v, want errors.Is %v", err, tc.wantErrIs)
+			}
+			if res != (MaterializeResult{}) {
+				t.Fatalf("result = %+v, want zero on rejection", res)
+			}
+			// ReleaseAdd, not AbandonAdd: dir kept, the login's credential intact.
+			if _, statErr := os.Stat(pool.AccountDir(1)); statErr != nil {
+				t.Fatalf("account dir stat err = %v, want kept on rejection", statErr)
+			}
+			got, ok := fk.Get(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel())
+			if !ok || got.ClaudeAiOauth.RefreshToken != "rt-login" {
+				t.Fatalf("retained credential = %+v ok=%v, want rt-login intact", got, ok)
+			}
+			n, rerr := m.Store.ReserveAccountIndex()
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			if n != 1 {
+				t.Fatalf("next reserved index = %d, want the released 1", n)
 			}
 			if len(rec.calls) != 0 {
 				t.Fatalf("nudge calls = %v, want none on rejection", rec.calls)

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
@@ -96,16 +95,19 @@ type DialTransport func(peer string) syncservice.Transport
 // the local credential: the origin is authoritative for its own chain (a
 // self-consistent answer ahead of the registry stamp is mirror lag, not
 // corruption), while a relay must match the registry hash exactly. All peers
-// failing is the deferred outcome ErrNoPeerCredential.
+// failing is the deferred outcome ErrNoPeerCredential; per-peer rejection
+// sentinels (pool.ErrEnvelopeCarriesSecret, pool.ErrEnvelopeNoAccessToken)
+// stay errors.Is-reachable so the materializer can pick the non-destructive
+// rollback.
 func FetchCredential(ctx context.Context, dial DialTransport, uuid string, chain ChainStamp, localExpiresAt int64, peers []string) (*creds.Credential, error) {
-	var attempts []string
+	var attempts []error
 	for _, peer := range fetchOrder(chain.Origin, peers) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		cred, err := fetchFromPeer(ctx, dial, peer, uuid, chain, localExpiresAt, peer == chain.Origin)
 		if err != nil {
-			attempts = append(attempts, fmt.Sprintf("%s: %v", peer, err))
+			attempts = append(attempts, fmt.Errorf("%s: %w", peer, err))
 			continue
 		}
 		return cred, nil
@@ -113,7 +115,7 @@ func FetchCredential(ctx context.Context, dial DialTransport, uuid string, chain
 	if len(attempts) == 0 {
 		return nil, fmt.Errorf("fetch credential for %s: no candidate peers: %w", uuid, ErrNoPeerCredential)
 	}
-	return nil, fmt.Errorf("fetch credential for %s: %w (%s)", uuid, ErrNoPeerCredential, strings.Join(attempts, "; "))
+	return nil, fmt.Errorf("fetch credential for %s: %w: %w", uuid, ErrNoPeerCredential, errors.Join(attempts...))
 }
 
 // fetchOrder returns the peers to try in order: the origin first, then the

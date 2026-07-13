@@ -99,12 +99,15 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 
 	env, err := pull(ctx, v.UUID, v.Chain, peers)
 	switch {
+	// A rejected envelope (the puller's per-peer sentinels included) must
+	// never AbandonAdd: that deletes any retained slot credentials — release
+	// keeps them intact.
+	case errors.Is(err, pool.ErrEnvelopeCarriesSecret), errors.Is(err, pool.ErrEnvelopeNoAccessToken):
+		return release(fmt.Errorf("materialize %s: %w", v.UUID, err))
 	case err != nil:
 		return abandon(fmt.Errorf("materialize %s: %w", v.UUID, errors.Join(ErrMaterializeNoEnvelope, err)))
 	case env == nil:
 		return abandon(fmt.Errorf("materialize %s: %w", v.UUID, ErrMaterializeNoEnvelope))
-	// A rejected envelope must never AbandonAdd: that deletes any retained
-	// slot credentials — release keeps them intact.
 	case env.HasRefreshToken():
 		return release(fmt.Errorf("materialize %s: %w", v.UUID, pool.ErrEnvelopeCarriesSecret))
 	case !env.Synced():

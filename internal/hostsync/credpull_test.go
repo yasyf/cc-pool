@@ -289,13 +289,17 @@ func TestFetchFromPeerRejectsInvalidEnvelopes(t *testing.T) {
 					t.Fatalf("fetchFromPeer(isOrigin=%v) err = %v, want errors.Is %v", isOrigin, err, tc.wantErrIs)
 				}
 			}
-			// ...and the pull as a whole is the deferred outcome.
+			// ...and the pull as a whole is the deferred outcome, with the
+			// rejection sentinel still errors.Is-reachable for the caller.
 			got, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"hostA"})
 			if got != nil {
 				t.Fatalf("pulled credential = %+v, want nil", got)
 			}
 			if !errors.Is(err, ErrNoPeerCredential) {
 				t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
+			}
+			if !errors.Is(err, tc.wantErrIs) {
+				t.Fatalf("err = %v, want the rejection sentinel %v to propagate", err, tc.wantErrIs)
 			}
 		})
 	}
