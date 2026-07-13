@@ -31,7 +31,7 @@ func TestCredMirrorRunsOutsideAccountLock(t *testing.T) {
 	svc := &hostsync.Service{Registry: rf, StampDir: filepath.Join(dir, "stamps")}
 	if err := svc.PublishAccount(t.Context(), hostsync.AccountValue{
 		UUID:  "u1",
-		Chain: hostsync.ChainStamp{ExpiresAt: 100, Holder: "host-b"},
+		Chain: hostsync.ChainStamp{ExpiresAt: 100, Origin: "host-b"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestCredMirrorRunsOutsideAccountLock(t *testing.T) {
 	if err := <-flockDone; err != nil {
 		t.Fatalf("WithLock: %v", err)
 	}
-	wantHash := hostsync.CredentialHash(cred)
+	wantHash := creds.AccessHash(cred)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		reg, err := rf.Load()
@@ -104,10 +104,10 @@ func TestCredMirrorRunsOutsideAccountLock(t *testing.T) {
 		}
 		if e, ok := reg["u1"]; ok && e.Present() && e.Value.Chain.ExpiresAt == 200 {
 			if e.Value.Chain.Hash != wantHash {
-				t.Fatalf("mirrored hash = %q, want CredentialHash of the written credential %q", e.Value.Chain.Hash, wantHash)
+				t.Fatalf("mirrored hash = %q, want AccessHash of the written credential %q", e.Value.Chain.Hash, wantHash)
 			}
-			if e.Value.Chain.Holder != "host-a" {
-				t.Fatalf("mirrored holder = %q, want the rotating host %q", e.Value.Chain.Holder, "host-a")
+			if e.Value.Chain.Origin != "host-a" {
+				t.Fatalf("mirrored origin = %q, want the rotating host %q", e.Value.Chain.Origin, "host-a")
 			}
 			if e.Value.Chain.RotatedAt <= 0 {
 				t.Fatalf("mirrored RotatedAt = %d, want a wall-clock stamp", e.Value.Chain.RotatedAt)
@@ -118,6 +118,69 @@ func TestCredMirrorRunsOutsideAccountLock(t *testing.T) {
 			t.Fatalf("mirror never landed the chain stamp; registry entry = %+v", reg["u1"])
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mirror Run did not exit on context cancellation")
+	}
+}
+
+// TestCredMirrorSkipsSyncedWrites pins the origin invariant: a synced
+// (refresh-token-free) credential write — a synced install or a stripped
+// double-spend loser — never publishes a stamp claiming this host as origin;
+// only an owned rotation does.
+func TestCredMirrorSkipsSyncedWrites(t *testing.T) {
+	var mu sync.Mutex
+	var noted []string
+	note := func(_ context.Context, uuid string, _ hostsync.ChainStamp) error {
+		mu.Lock()
+		defer mu.Unlock()
+		noted = append(noted, uuid)
+		return nil
+	}
+	mirror := newCredMirror(note, "host-a", log.New(io.Discard, "", 0))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		mirror.Run(ctx)
+	}()
+
+	synced := &creds.Credential{}
+	synced.ClaudeAiOauth.AccessToken = "at-synced" // no refresh token: a synced copy
+	owned := &creds.Credential{}
+	owned.ClaudeAiOauth.AccessToken = "at-owned"
+	owned.ClaudeAiOauth.RefreshToken = "rt-owned"
+
+	a := store.Account{ID: 1, AccountUUID: "u1"}
+	if err := mirror.Hook(a, synced); err != nil {
+		t.Fatal(err)
+	}
+	if err := mirror.Hook(a, owned); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only the owned write reaches the note seam; the synced write was never
+	// enqueued, so "u1" can appear at most once.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got := append([]string(nil), noted...)
+		mu.Unlock()
+		if len(got) >= 1 {
+			if len(got) != 1 || got[0] != "u1" {
+				t.Fatalf("noted = %v, want exactly [u1] (the owned write only)", got)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("owned write never reached the mirror")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	cancel()

@@ -75,15 +75,10 @@ func TestPolicyConstantsPinned(t *testing.T) {
 		{"tickers/outagePollInterval", outagePollInterval, 20 * time.Second},
 		{"tickers/outageJitter", outageJitter, 5 * time.Second},
 
-		// sync engine policy — NOT ported by the redesign; pinned only against
-		// accidental drift during the registry cutover (B2). The external synckitd
-		// mesh reconcile (~900s) lives outside the daemon and is not a daemon
-		// constant; takeoverStaleAfter must stay well above that tick.
+		// sync engine policy — the heal-pull timeout and mirror queue bound, pinned
+		// against accidental drift.
 		{"sync-drift-guards/syncHealTimeout", syncHealTimeout, 15 * time.Second},
 		{"sync-drift-guards/credMirrorQueueSize", credMirrorQueueSize, 64},
-		{"sync-drift-guards/takeoverStaleAfter", takeoverStaleAfter, 35 * time.Minute},
-		{"sync-drift-guards/holderLeaseDuration", holderLeaseDuration, 45 * time.Minute},
-		{"sync-drift-guards/leaseRenewUnder", leaseRenewUnder, 20 * time.Minute},
 
 		// registry cutover (B2) — minimum companion versions gating fuse/FP
 		// hosting. Compile-visible from daemon (it already imports pool); pinned

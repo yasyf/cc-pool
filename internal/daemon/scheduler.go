@@ -337,22 +337,14 @@ func (s *Server) pollAccount(ctx context.Context, t *tick, a store.Account, reco
 	// self-refresh first; a recovery sweep bypasses the streak gate (fetchUsage's
 	// deep guard still holds). See ccn doc 36b05ef for the accepted gap.
 	busyBySession := t.sessionCount(a.ConfigDir) > 0
-	if busyBySession {
-		// A live session keeps this host's lease alive so peers keep penalizing.
-		s.sync.renewWhileBusy(ctx, a)
-	}
 
-	// Both refresh opts AND with the holder gate — a non-holder refresh is the
-	// double-spend that forks a chain; evaluated only when a refresh is on the table.
-	wantIdle := idle
-	wantBusy := busyBySession && (recovery || s.authStreakActive(a.ConfigDir))
-	allowRefresh := false
-	if wantIdle || wantBusy {
-		allowRefresh = s.sync.mayRefresh(ctx, a)
-	}
+	// The refresh gate is structural, not a cross-host lease check: a synced
+	// (refresh-token-free) credential cannot refresh (ensureFreshToken returns
+	// ErrUnrefreshable), so only the origin — the one host holding the refresh
+	// token — ever spends it.
 	opts := pool.SampleOpts{
-		AllowRefresh:     wantIdle && allowRefresh,
-		AllowBusyRefresh: wantBusy && allowRefresh,
+		AllowRefresh:     idle,
+		AllowBusyRefresh: busyBySession && (recovery || s.authStreakActive(a.ConfigDir)),
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -409,7 +401,11 @@ func (s *Server) handleAuthOutcome(ctx context.Context, a store.Account, err err
 		}
 		return
 	}
-	if errors.Is(err, pool.ErrNeedsLogin) {
+	// An owned dead chain (ErrNeedsLogin) and an expired synced copy
+	// (ErrUnrefreshable) both route into flagNeedsLogin, which classifies the kind
+	// at persist time. ErrUnrefreshable may arrive wrapping a usage 401, so this
+	// must precede the UsageError.Unauthorized() strike below.
+	if errors.Is(err, pool.ErrNeedsLogin) || errors.Is(err, pool.ErrUnrefreshable) {
 		s.flagNeedsLogin(ctx, a, err)
 		return
 	}
@@ -478,16 +474,24 @@ func (s *Server) logNetUnreachable(a store.Account, err error) {
 	s.log.Printf("acct-%02d sample: network unreachable: %v", a.ID, err)
 }
 
-// flagNeedsLogin stamps the attempt clock, then flags needs-login — unless the
-// sync self-heal pulled a fresher chain, which skips the set (never clears). The
-// clock stamp precedes syncHeal so ledMu is never held across the pull I/O.
+// flagNeedsLogin stamps the attempt clock, pulls once from a peer, and ALWAYS
+// decides this tick. A heal that improved the credential earns ONE inline
+// resample (same tick, no second heal): a clean resample clears the flag,
+// anything else persists it. The old skip-when-improved early return let a dead
+// account stay unflagged forever while SampleUsage never succeeded (defect 6).
+// The clock stamp precedes syncHeal so ledMu is never held across the pull I/O.
 func (s *Server) flagNeedsLogin(ctx context.Context, a store.Account, err error) {
 	s.authStamp(a.ConfigDir, err)
-	if s.syncHeal(ctx, a) {
-		s.log.Printf("acct-%02d auth failed but sync pulled a fresher chain; retrying before flagging needs-login", a.ID)
+	if s.syncHeal(ctx, a) && s.resampleAfterHeal(ctx, a) {
+		s.authClearStreak(a.ConfigDir)
+		if _, cerr := s.m.Store.ClearNeedsLogin(a.ID); cerr != nil {
+			s.log.Printf("acct-%02d clear needs-login after heal: %v", a.ID, cerr)
+		} else {
+			s.log.Printf("acct-%02d sync pulled a fresher chain and it sampled clean; auth recovered", a.ID)
+		}
 		return
 	}
-	changed, serr := s.m.Store.SetNeedsLogin(a.ID, time.Now(), err.Error())
+	changed, serr := s.m.Store.SetNeedsLogin(a.ID, time.Now(), err.Error(), s.authKind(a))
 	if serr != nil {
 		s.log.Printf("acct-%02d set needs-login: %v", a.ID, serr)
 		return
@@ -495,6 +499,16 @@ func (s *Server) flagNeedsLogin(ctx context.Context, a store.Account, err error)
 	if changed {
 		s.log.Printf("acct-%02d needs re-login — run `ccp login %d`: %v", a.ID, a.ID, err)
 	}
+}
+
+// resampleAfterHeal re-samples once inline after a heal pulled a fresher chain:
+// no refresh (a synced copy holds no refresh token) and no second heal. A nil
+// error means the pulled credential is live, so the needs-login flag clears.
+func (s *Server) resampleAfterHeal(ctx context.Context, a store.Account) bool {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, _, _, err := s.m.SampleUsage(cctx, a, pool.SampleOpts{})
+	return err == nil
 }
 
 // syncHealTimeout bounds the self-heal's converge pull; a var so tests shrink it.

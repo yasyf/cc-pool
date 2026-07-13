@@ -70,14 +70,13 @@ func writeWireMeshState(t *testing.T, self string, hosts []string) {
 	}
 }
 
-// wiredService digs the *hostsync.Service back out of the gate.
+// wiredService returns the wired *hostsync.Service.
 func wiredService(t *testing.T, s *Server) *hostsync.Service {
 	t.Helper()
-	svc, ok := s.sync.svc.(*hostsync.Service)
-	if !ok {
-		t.Fatalf("gate svc is %T, want *hostsync.Service", s.sync.svc)
+	if s.syncSvc == nil {
+		t.Fatal("sync service not wired")
 	}
-	return svc
+	return s.syncSvc
 }
 
 // TestSetupSyncWiresEverything pins that one setupSync call constructs the
@@ -94,11 +93,11 @@ func TestSetupSyncWiresEverything(t *testing.T) {
 		t.Fatalf("setupSync: %v", err)
 	}
 
-	if s.sync == nil || !s.sync.active() {
-		t.Fatal("gate not wired or not active with sync_enabled=1")
+	if s.syncSvc == nil || !s.syncEnabledBool() {
+		t.Fatal("sync not wired or not active with sync_enabled=1")
 	}
-	if s.sync.self != "host-mesh" {
-		t.Errorf("gate self = %q, want the mesh-resolved host-mesh", s.sync.self)
+	if s.syncSelf != "host-mesh" {
+		t.Errorf("sync self = %q, want the mesh-resolved host-mesh", s.syncSelf)
 	}
 	if s.syncPull == nil {
 		t.Error("syncPull not wired")
@@ -144,15 +143,17 @@ func TestSetupSyncStaysInertWhenDisabled(t *testing.T) {
 	if err := s.setupSync(ctx); err != nil {
 		t.Fatalf("setupSync: %v", err)
 	}
-	if s.sync == nil || s.sync.self == "" {
-		t.Fatal("gate not wired, or self empty on the hostname fallback")
+	if s.syncSvc == nil || s.syncSelf == "" {
+		t.Fatal("sync not wired, or self empty on the hostname fallback")
 	}
 
-	if s.sync.active() {
-		t.Fatal("gate active with sync disabled")
+	if s.syncEnabledBool() {
+		t.Fatal("sync active with sync disabled")
 	}
-	if !s.sync.mayRefresh(ctx, store.Account{ID: 1, AccountUUID: "u1"}) {
-		t.Error("disabled gate must leave refresh behavior byte-identical to syncless")
+	// The refresh gate is now structural (a refresh-token-free synced credential
+	// cannot refresh), so a disabled pool needs no gate to stay syncless.
+	if kind := s.authKind(store.Account{ID: 1, AccountUUID: "u1"}); kind != store.AuthKindOwned {
+		t.Errorf("disabled authKind = %q, want owned (no registry classification)", kind)
 	}
 
 	if err := s.syncPull(ctx); err != nil {
@@ -178,8 +179,8 @@ func TestSetupSyncStaysInertWhenDisabled(t *testing.T) {
 	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
 		t.Fatal(err)
 	}
-	if !s.sync.active() {
-		t.Fatal("gate did not pick up sync_enabled=1 without a restart")
+	if !s.syncEnabledBool() {
+		t.Fatal("sync did not pick up sync_enabled=1 without a restart")
 	}
 	if _, err := client.Capabilities(ctx); err != nil {
 		t.Fatalf("Capabilities after enable = %v, want OK without a restart", err)
@@ -311,9 +312,9 @@ func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
 	// production transport without ever touching real ssh.
 	peer := "exec:nc -U " + b.syncSocket
 	chain := hostsync.ChainStamp{
+		Origin:    peer,
 		ExpiresAt: credB.ClaudeAiOauth.ExpiresAt,
-		Hash:      hostsync.CredentialHash(credB),
-		Holder:    peer,
+		Hash:      creds.AccessHash(credB),
 		RotatedAt: time.Now().UnixMilli(),
 	}
 	svcB := wiredService(t, b)
@@ -339,11 +340,65 @@ func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
 		t.Fatalf("fetched chain = %+v, want %+v", entry.Value.Chain, chain)
 	}
 
-	got, err := hostsync.FetchCredential(ctxA, hostsync.PeerTransport, "u9", chain, 0, "", []string{peer})
+	got, err := hostsync.FetchCredential(ctxA, hostsync.PeerTransport, "u9", chain, 0, []string{peer})
 	if err != nil {
 		t.Fatalf("FetchCredential via exec peer: %v", err)
 	}
-	if got.ClaudeAiOauth.AccessToken != "at-peer" || got.ClaudeAiOauth.RefreshToken != "rt-peer" {
-		t.Fatalf("pulled credential = %+v, want the peer's chain", got.ClaudeAiOauth)
+	// The origin strips the refresh token from the envelope: the peer gets an
+	// access-token-only synced copy, never the long-lived secret.
+	if got.ClaudeAiOauth.AccessToken != "at-peer" || got.ClaudeAiOauth.RefreshToken != "" {
+		t.Fatalf("pulled credential = %+v, want the peer's access token with the refresh token stripped", got.ClaudeAiOauth)
+	}
+}
+
+// TestAuthKindClassification pins the persist-time needs-login classification:
+// an entry whose chain origin is this host is owned; a different origin is
+// awaiting-origin; a missing entry, a uuid-less account, and sync-disabled all
+// fall back to owned.
+func TestAuthKindClassification(t *testing.T) {
+	s, ctx := newWireServer(t)
+	writeWireMeshState(t, "host-self", []string{"peer-b"})
+	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.setupSync(ctx); err != nil {
+		t.Fatalf("setupSync: %v", err)
+	}
+	if s.syncSelf != "host-self" {
+		t.Fatalf("syncSelf = %q, want host-self", s.syncSelf)
+	}
+	pub := func(uuid, origin string) {
+		if err := s.syncSvc.PublishAccount(ctx, hostsync.AccountValue{
+			UUID: uuid, Chain: hostsync.ChainStamp{Origin: origin, ExpiresAt: 1},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pub("u-self", "host-self")
+	pub("u-peer", "peer-b")
+
+	cases := map[string]struct {
+		uuid    string
+		disable bool
+		want    store.AuthKind
+	}{
+		"origin is self → owned":      {uuid: "u-self", want: store.AuthKindOwned},
+		"origin is a peer → awaiting": {uuid: "u-peer", want: store.AuthKindAwaitingOrigin},
+		"no registry entry → owned":   {uuid: "u-absent", want: store.AuthKindOwned},
+		"no account uuid → owned":     {uuid: "", want: store.AuthKindOwned},
+		"sync disabled → owned":       {uuid: "u-peer", disable: true, want: store.AuthKindOwned},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if tc.disable {
+				if err := s.m.Store.SetMeta(metaSyncEnabled, "0"); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = s.m.Store.SetMeta(metaSyncEnabled, "1") })
+			}
+			if got := s.authKind(store.Account{ID: 1, AccountUUID: tc.uuid}); got != tc.want {
+				t.Fatalf("authKind(uuid=%q) = %q, want %q", tc.uuid, got, tc.want)
+			}
+		})
 	}
 }

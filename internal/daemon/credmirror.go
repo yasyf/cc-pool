@@ -52,6 +52,11 @@ func (c *credMirror) Hook(a store.Account, cred *creds.Credential) error {
 		// No uuid means not in the registry yet; the scan-publish fold covers it.
 		return nil
 	}
+	if !cred.HasRefreshToken() {
+		// A synced install or a stripped double-spend loser must never publish a
+		// stamp claiming this host as origin; only owned rotations do.
+		return nil
+	}
 	select {
 	case c.ch <- credEvent{acct: a, cred: *cred}:
 	default:

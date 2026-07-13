@@ -10,6 +10,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
+	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/synckit/converge"
 )
 
@@ -50,7 +51,7 @@ var _ hostsync.Sessions = serverSessions{}
 // setupSync constructs the host-sync engine and wires it onto the daemon.
 // Always constructed — every acting path re-reads the sync_enabled meta, so
 // enable needs no daemon restart — and it must run before serve spawns any
-// worker or handler: they read s.sync unlocked.
+// worker or handler: they read s.syncPull / s.syncAuthKind unlocked.
 func (s *Server) setupSync(ctx context.Context) error {
 	if s.syncSocket == "" {
 		return fmt.Errorf("no sync socket path configured")
@@ -75,8 +76,8 @@ func (s *Server) setupSync(ctx context.Context) error {
 		Status:   converge.NewPeerStatus(),
 		Fetcher:  hostsync.NewSSHFetcher(),
 	}
-	pull := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, localExpiresAt int64, localHash string, peers []string) (*creds.Credential, error) {
-		return hostsync.FetchCredential(ctx, hostsync.PeerTransport, uuid, chain, localExpiresAt, localHash, peers)
+	pull := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, localExpiresAt int64, peers []string) (*creds.Credential, error) {
+		return hostsync.FetchCredential(ctx, hostsync.PeerTransport, uuid, chain, localExpiresAt, peers)
 	}
 	svc.Driver = hostsync.NewDriver(svc, hostsync.DriverDeps{
 		Store:      s.m.Store,
@@ -85,7 +86,7 @@ func (s *Server) setupSync(ctx context.Context) error {
 		Materialize: func(ctx context.Context, v hostsync.AccountValue, peers []string) (hostsync.MaterializeResult, error) {
 			// A materializing account has no local chain: any verified envelope wins.
 			noLocal := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, peers []string) (*creds.Credential, error) {
-				return pull(ctx, uuid, chain, 0, "", peers)
+				return pull(ctx, uuid, chain, 0, peers)
 			}
 			return svc.Materialize(ctx, v, peers, noLocal, manifestPath)
 		},
@@ -95,7 +96,8 @@ func (s *Server) setupSync(ctx context.Context) error {
 	if err := s.startSyncServer(ctx, svc); err != nil {
 		return err
 	}
-	s.sync = newSyncGate(svc, self, s.syncEnabledBool, s.log)
+	s.syncSvc = svc
+	s.syncSelf = self
 	s.syncPull = func(ctx context.Context) error {
 		if !s.syncEnabledBool() {
 			return nil
@@ -108,6 +110,30 @@ func (s *Server) setupSync(ctx context.Context) error {
 	s.wg.Add(1)
 	go func() { defer s.wg.Done(); mirror.Run(ctx) }()
 	return nil
+}
+
+// authKind classifies a needs-login at persist time via the sync registry: a
+// synced entry whose chain names a different origin is awaiting-origin (this
+// host only waits for the origin's rotation); everything else — sync off, no
+// uuid, no entry, or this host is the origin — is owned. A registry read failure
+// degrades to owned, never blocking the needs-login flag.
+func (s *Server) authKind(a store.Account) store.AuthKind {
+	if s.syncSvc == nil || !s.syncEnabledBool() || a.AccountUUID == "" {
+		return store.AuthKindOwned
+	}
+	reg, err := s.syncSvc.Registry.Load()
+	if err != nil {
+		s.log.Printf("acct-%02d auth-kind registry load: %v", a.ID, err)
+		return store.AuthKindOwned
+	}
+	e, ok := reg[a.AccountUUID]
+	if !ok || !e.Present() {
+		return store.AuthKindOwned
+	}
+	if e.Value.Chain.Origin != "" && e.Value.Chain.Origin != s.syncSelf {
+		return store.AuthKindAwaitingOrigin
+	}
+	return store.AuthKindOwned
 }
 
 // gatedNote wraps NoteCredWrite behind the per-call enable check, so a

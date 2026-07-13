@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
@@ -174,12 +175,14 @@ type Server struct {
 	// FP domains; nil means the real check (consent settled + data socket up).
 	fpBridgeReadyFn func() bool
 
-	// sync gates preemptive refreshes to the chain holder and carries the lease
-	// lifecycle; nil ⇒ host sync disabled, byte-identical to a syncless build.
-	sync *syncGate
+	// syncSvc is the wired host-sync engine (registry, driver, mesh); nil ⇒ host
+	// sync never wired this run. syncSelf is this host's registry origin name.
+	// Both feed authKind's persist-time needs-login classification.
+	syncSvc  *hostsync.Service
+	syncSelf string
 
-	// syncPull runs one converge pull for the invalid_grant self-heal (syncHeal);
-	// nil ⇒ sync disabled.
+	// syncPull runs one converge pull for the invalid_grant self-heal (syncHeal)
+	// and the on-demand preflight pull; nil ⇒ sync disabled.
 	syncPull func(ctx context.Context) error
 }
 
@@ -282,7 +285,7 @@ func (s *Server) serve(ctx context.Context) error {
 	s.serveCtx = ctx
 	s.holder.onLostWithMounts = s.scheduleHolderLostSweep
 
-	// Host sync wires before any worker or handler can read s.sync (per-call
+	// Host sync wires before any worker or handler can read its seams (per-call
 	// gated on the sync_enabled meta); a failure leaves this run syncless —
 	// sync must never take down single-host pooling.
 	if err := s.setupSync(ctx); err != nil {
@@ -544,8 +547,6 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 					}
 				}
 				s.recordSticky(req.Cwd, sn.Account.ID)
-				// A launch here makes this host the chain's refresher.
-				s.sync.claimForSelect(ctx, sn.Account)
 				id := sn.Account.ID
 				return Response{
 					OK: true, Dir: sn.Account.ConfigDir, SelectedID: &id,
@@ -639,9 +640,6 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		selectKind(outcome, fallback), req.Cwd, best.Account.ID,
 		r.Score, best.Util5h, best.Util7d, runnerUp(ranked, r.AccountID, fallback))
 	id := best.Account.ID
-	// Claim holdership + a lease BEFORE the async preflight refresh below: the
-	// claim is what legitimizes it under the one-holder rule.
-	s.sync.claimForSelect(ctx, best.Account)
 	// Best-effort preflight refresh of the winner. The Add(1) is inside an
 	// already-tracked goroutine, so it cannot race a zero-counter Wait.
 	s.wg.Add(1)
@@ -649,7 +647,18 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		defer s.wg.Done()
 		pctx, cancel := context.WithTimeout(ctx, preflightTimeout)
 		defer cancel()
-		if err := s.m.PreflightRefresh(pctx, best.Account); err != nil {
+		err := s.m.PreflightRefresh(pctx, best.Account)
+		// A synced token expired here: the origin's rotation may already be in the
+		// registry but not yet pulled locally (fsnotify is the fast path; this
+		// covers the 10-min-lead vs 900s-reconcile gap). Pull once, then re-evaluate.
+		if errors.Is(err, pool.ErrUnrefreshable) && s.syncPull != nil {
+			if perr := s.syncPull(pctx); perr != nil {
+				s.log.Printf("acct-%02d preflight sync pull: %v", best.Account.ID, perr)
+			} else {
+				err = s.m.PreflightRefresh(pctx, best.Account)
+			}
+		}
+		if err != nil {
 			s.log.Printf("acct-%02d preflight refresh: %v", best.Account.ID, err)
 		}
 	}()
@@ -714,14 +723,12 @@ func (s *Server) recordSticky(cwd string, accountID int) {
 	}
 }
 
-// handleCheckin closes sessions for a pid, adopts any rotated token, and
-// releases this host's sync lease on each account whose last session closed.
+// handleCheckin closes sessions for a pid and adopts any rotated token.
 func (s *Server) handleCheckin(ctx context.Context, req Request) Response {
 	sessions, err := s.m.Store.ListActiveSessions()
 	if err != nil {
 		return Response{OK: false, Error: err.Error()}
 	}
-	closed := map[int]store.Account{}
 	for _, se := range sessions {
 		if se.PID != req.PID {
 			continue
@@ -735,33 +742,9 @@ func (s *Server) handleCheckin(ctx context.Context, req Request) Response {
 				s.log.Printf("acct-%02d adopt rotated token on checkin: %v", a.ID, err)
 			}
 			cancel()
-			closed[a.ID] = a
 		}
 	}
-	s.releaseIdleLeases(ctx, closed)
 	return Response{OK: true}
-}
-
-// releaseIdleLeases releases this host's sync lease on each closed account
-// with no remaining live local session.
-func (s *Server) releaseIdleLeases(ctx context.Context, closed map[int]store.Account) {
-	if !s.sync.active() || len(closed) == 0 {
-		return
-	}
-	live, err := s.m.Store.ListActiveSessions()
-	if err != nil {
-		s.log.Printf("sync lease release: list sessions: %v", err)
-		return
-	}
-	open := map[int]int{}
-	for _, se := range live {
-		open[se.AccountID]++
-	}
-	for id, a := range closed {
-		if open[id] == 0 {
-			s.sync.releaseLease(ctx, a)
-		}
-	}
 }
 
 // mountReady reports whether an account's overlay can serve a session now. A fuse
@@ -942,12 +925,11 @@ func fuseBackedRow(overlayKind string) bool {
 	return b.IsFuse()
 }
 
-// rankWithReservations re-ranks snapshots with reservation and peer-lease
-// penalties applied, returning the ranking plus a snapshot lookup by account
-// id. A live peer lease counts as one extra active session — a penalty, never
-// an exclusion, per the cross-host select rule.
+// rankWithReservations re-ranks snapshots with the local reservation penalty
+// applied, returning the ranking plus a snapshot lookup by account id. The
+// cross-host live-session penalty is gone with the lease that carried it; usage
+// samples re-converge the ranking within ~one poll — see cc-notes.
 func (s *Server) rankWithReservations(snaps []pool.Snapshot) ([]score.Result, map[int]pool.Snapshot) {
-	peerLeases := s.sync.peerLeaseCounts(snaps)
 	bySnap := map[int]pool.Snapshot{}
 	inputs := make([]score.Input, 0, len(snaps))
 	for _, sn := range snaps {
@@ -961,7 +943,7 @@ func (s *Server) rankWithReservations(snaps []pool.Snapshot) ([]score.Result, ma
 			Resets5h:       sn.Resets5h,
 			Resets7d:       sn.Resets7d,
 			Burn5hPerHour:  sn.Burn5hPerHour,
-			ActiveSessions: sn.ActiveSessions + s.cl.reservedCount(sn.Account.ID) + peerLeases[sn.Account.ID],
+			ActiveSessions: sn.ActiveSessions + s.cl.reservedCount(sn.Account.ID),
 			RateLimited:    sn.RateLimited,
 			RefreshFailed:  sn.Stale && !sn.HasUsage,
 			NeedsLogin:     sn.NeedsLogin,
@@ -1002,6 +984,7 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 			RateLimited:    sn.RateLimited,
 			Exhausted:      sn.Exhausted,
 			NeedsLogin:     sn.NeedsLogin,
+			AwaitingOrigin: sn.AwaitingOrigin,
 			HasUsage:       sn.HasUsage,
 			Stale:          sn.Stale,
 			Resets5h:       sn.Resets5h,

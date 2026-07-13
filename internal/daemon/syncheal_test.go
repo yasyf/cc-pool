@@ -25,33 +25,56 @@ func revokedServer(t *testing.T) (*Server, store.Account, *creds.Credential) {
 	return s, a, cred
 }
 
-// pullInstalling returns a syncPull func that installs a rotated credential
-// with the given expiry into the account's store — the effect of a converge
-// pull that fetched a fresher chain from a peer.
-func pullInstalling(s *Server, a store.Account, expiresAt int64) func(context.Context) error {
+// pullHealing returns a syncPull that installs a synced (refresh-token-free)
+// credential at expiresAt into the account's store — the effect of a converge
+// pull of a peer's stripped chain. When healsUsage, it also flips the fake OAuth
+// usage endpoint to succeed, modeling an origin token that actually works.
+func pullHealing(s *Server, a store.Account, expiresAt int64, healsUsage bool) func(context.Context) error {
 	return func(context.Context) error {
 		fresh := &creds.Credential{}
 		fresh.ClaudeAiOauth.AccessToken = "at-peer"
-		fresh.ClaudeAiOauth.RefreshToken = "rt-peer"
 		fresh.ClaudeAiOauth.ExpiresAt = expiresAt
-		return s.m.Creds.Store(a, creds.SourceKeychain).Write(fresh)
+		if err := s.m.Creds.Store(a, creds.SourceKeychain).Write(fresh); err != nil {
+			return err
+		}
+		if healsUsage {
+			s.m.OAuth.(*fakeOAuth).setUsage401(false)
+		}
+		return nil
 	}
 }
 
-// TestInvalidGrantSyncHealSkipsNeedsLogin pins the invalid_grant self-heal: a
-// pull landing a fresher chain skips SetNeedsLogin; a no-op or failing pull
-// flags exactly as today.
-func TestInvalidGrantSyncHealSkipsNeedsLogin(t *testing.T) {
-	t.Run("fresher chain arrives, flag skipped", func(t *testing.T) {
+// TestSyncHealDecidesEachTick pins the reworked flagNeedsLogin: it heals, then
+// ALWAYS decides this tick. A fresher chain that samples clean clears the flag;
+// a fresher chain that still cannot sample persists it same tick (the anti-loop
+// litmus); a no-op, equal-expiry, or failing pull flags exactly as before.
+func TestSyncHealDecidesEachTick(t *testing.T) {
+	t.Run("fresher chain that samples clean clears the flag", func(t *testing.T) {
 		s, a, _ := revokedServer(t)
-		s.syncPull = pullInstalling(s, a, time.Now().Add(time.Hour).UnixMilli())
+		s.syncPull = pullHealing(s, a, time.Now().Add(time.Hour).UnixMilli(), true)
 
 		s.pollOnce(t.Context())
 		if h, _ := s.m.Store.GetAuthHealth(a.ID); h.NeedsLogin {
-			t.Fatal("a strictly-fresher pulled chain must skip needs-login")
+			t.Fatal("a fresher chain that samples clean must clear needs-login")
+		}
+		if l := s.led.peek(authStreakPolicy, a.ConfigDir); l != nil && l.faulted {
+			t.Fatal("a clean resample must clear the auth streak, not leave it faulted")
+		}
+	})
+
+	t.Run("fresher chain that still fails persists the flag same tick (anti-loop)", func(t *testing.T) {
+		s, a, _ := revokedServer(t)
+		// The pull lands a strictly-fresher chain, but usage still 401s: the one
+		// inline resample fails, so the flag MUST persist this tick rather than
+		// looping forever unflagged while SampleUsage never succeeds (defect 6).
+		s.syncPull = pullHealing(s, a, time.Now().Add(time.Hour).UnixMilli(), false)
+
+		s.pollOnce(t.Context())
+		if h, _ := s.m.Store.GetAuthHealth(a.ID); !h.NeedsLogin {
+			t.Fatal("a heal that improved expiry but still cannot sample must persist needs-login THIS tick")
 		}
 		if l := s.led.peek(authStreakPolicy, a.ConfigDir); l == nil || l.lastAt.IsZero() {
-			t.Fatal("the attempt clock must still be stamped so the backoff engages")
+			t.Fatal("the attempt clock must be stamped so the backoff engages")
 		}
 	})
 
@@ -71,7 +94,9 @@ func TestInvalidGrantSyncHealSkipsNeedsLogin(t *testing.T) {
 
 	t.Run("equal-expiry pull flags (strictly-fresher required)", func(t *testing.T) {
 		s, a, cred := revokedServer(t)
-		s.syncPull = pullInstalling(s, a, cred.ClaudeAiOauth.ExpiresAt)
+		// Even a would-succeed usage cannot rescue a non-fresher pull: syncHeal
+		// reports no improvement, so no resample runs and the flag persists.
+		s.syncPull = pullHealing(s, a, cred.ClaudeAiOauth.ExpiresAt, true)
 
 		s.pollOnce(t.Context())
 		if h, _ := s.m.Store.GetAuthHealth(a.ID); !h.NeedsLogin {
@@ -88,24 +113,11 @@ func TestInvalidGrantSyncHealSkipsNeedsLogin(t *testing.T) {
 			t.Fatal("a failing pull must fall through to flagging needs-login")
 		}
 	})
-
-	t.Run("heal skips setting but never clears an existing flag", func(t *testing.T) {
-		s, a, _ := revokedServer(t)
-		if _, err := s.m.Store.SetNeedsLogin(a.ID, time.Now(), "prior failure"); err != nil {
-			t.Fatal(err)
-		}
-		s.syncPull = pullInstalling(s, a, time.Now().Add(time.Hour).UnixMilli())
-
-		s.pollOnce(t.Context())
-		if h, _ := s.m.Store.GetAuthHealth(a.ID); !h.NeedsLogin {
-			t.Fatal("syncHeal must only SKIP setting the flag — clearing is owned elsewhere")
-		}
-	})
 }
 
 // TestSyncHealAbsentFlagsAsBefore pins the sync-disabled baseline: with a nil
-// syncPull seam a confirmed revocation flags needs-login exactly as a
-// syncless daemon does.
+// syncPull seam a confirmed revocation flags needs-login exactly as a syncless
+// daemon does, via ErrNeedsLogin rather than the 401 streak.
 func TestSyncHealAbsentFlagsAsBefore(t *testing.T) {
 	s, a, _ := revokedServer(t)
 

@@ -100,8 +100,8 @@ func TestSyncSocketServesConsumer(t *testing.T) {
 	if err := json.Unmarshal(resp.Result, &env); err != nil {
 		t.Fatalf("decode envelope: %v", err)
 	}
-	if env.Hash != hostsync.CredentialHash(served) {
-		t.Errorf("envelope hash = %q, want %q", env.Hash, hostsync.CredentialHash(served))
+	if env.Hash != creds.AccessHash(served) {
+		t.Errorf("envelope hash = %q, want %q", env.Hash, creds.AccessHash(served))
 	}
 	if env.ExpiresAt != served.ClaudeAiOauth.ExpiresAt {
 		t.Errorf("envelope ExpiresAt = %d, want %d", env.ExpiresAt, served.ClaudeAiOauth.ExpiresAt)
