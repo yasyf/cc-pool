@@ -58,7 +58,8 @@
       "source": {
         "source": "github",
         "repo": "yasyf/captain-hook"
-      }
+      },
+      "autoUpdate": true
     }
   },
   "enabledPlugins": {

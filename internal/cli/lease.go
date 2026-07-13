@@ -245,6 +245,23 @@ var spawnPendingLeaseAgent = func(p *pool.PendingAdd) error {
 	return spawnLeaseAgentKey(p.Index, pool.SessionLeaseDirFor(p.Index, p.ConfigDir, string(p.OverlayKind)), p.ConfigDir, p.OverlayKind.IsFuse())
 }
 
+// leaseAgentArgs is the detached lease-agent argv. --ready-fd names the readiness pipe
+// (readyPipeFD, ExtraFiles[0]); it must round-trip through SpawnedLeaseAgentReadyFD, the
+// single source the child adopts and main's sweep preserves.
+func leaseAgentArgs(leader int, start int64, id int, key, probeDir string, fuseRow bool) []string {
+	args := []string{leaseAgentSubcommand,
+		"--pid", strconv.Itoa(leader),
+		"--start", strconv.FormatInt(start, 10),
+		"--id", strconv.Itoa(id),
+		"--dir", key,
+		"--probe", probeDir,
+		"--ready-fd", strconv.Itoa(readyPipeFD)}
+	if fuseRow {
+		args = append(args, "--fuse")
+	}
+	return args
+}
+
 func spawnLeaseAgentKey(id int, key, probeDir string, fuseRow bool) error {
 	leader, err := procSessionLeader()
 	if err != nil {
@@ -275,16 +292,7 @@ func spawnLeaseAgentKey(id int, key, probeDir string, fuseRow bool) error {
 		return fmt.Errorf("create the lease-agent readiness pipe: %w", err)
 	}
 	defer func() { _ = r.Close() }()
-	args := []string{"lease-agent",
-		"--pid", strconv.Itoa(leader),
-		"--start", strconv.FormatInt(start, 10),
-		"--id", strconv.Itoa(id),
-		"--dir", key,
-		"--probe", probeDir,
-		"--ready-fd", strconv.Itoa(readyPipeFD)} // marks the fd-3 readiness pipe below
-	if fuseRow {
-		args = append(args, "--fuse")
-	}
+	args := leaseAgentArgs(leader, start, id, key, probeDir, fuseRow)
 	//nolint:gosec // G204: self is this CLI; args are fixed flags with numeric/path values.
 	c := exec.Command(self, args...)
 	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach into a new session so it outlives ccp
@@ -420,12 +428,12 @@ func newLeaseAgentCmd() *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			// Adopt the readiness pipe only when the launcher declared it (--ready-fd,
-			// ExtraFiles[0]=fd 3). A manual run passes no flag and skips the handshake, so
-			// it never writes to and closes an unrelated inherited fd 3.
+			// INVARIANT: adopt the fd from the SAME parse main's sweep used, never cobra's
+			// --ready-fd (pflag is base-0/last-occurrence, the sweep base-10/first) — the
+			// handshake must reuse the fd the sweep preserved, so the two cannot diverge.
 			var ready *os.File
-			if readyFd > 0 {
-				ready = os.NewFile(uintptr(readyFd), "lease-ready")
+			if fd, ok := SpawnedLeaseAgentReadyFD(os.Args[1:]); ok {
+				ready = os.NewFile(uintptr(fd), "lease-ready")
 			}
 			return runLeaseAgent(pid, start, id, dir, probe, fuse, ready)
 		},

@@ -695,6 +695,12 @@ func TestSpawnedLeaseAgentReadyFD(t *testing.T) {
 		"zero fd is absent":    {[]string{"lease-agent", "--ready-fd", "0"}, 0, false},
 		"dangling flag":        {[]string{"lease-agent", "--ready-fd"}, 0, false},
 		"non-numeric fd":       {[]string{"lease-agent", "--ready-fd", "x"}, 0, false},
+		// The single source is base-10, so a base-0 value cobra WOULD accept (0x3→3) is
+		// rejected — the sweep never preserved fd 3, so the child must not adopt it.
+		"base-0 fd rejected": {[]string{"lease-agent", "--ready-fd=0x3"}, 0, false},
+		// Repeated flags take the FIRST occurrence (cobra takes the last); adoption reuses
+		// this same result, so the two sites stay in lockstep whatever the value is.
+		"repeated flag takes first": {[]string{"lease-agent", "--ready-fd", "4", "--ready-fd", "3"}, 4, true},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -703,6 +709,18 @@ func TestSpawnedLeaseAgentReadyFD(t *testing.T) {
 				t.Fatalf("SpawnedLeaseAgentReadyFD(%q) = (%d, %v), want (%d, %v)", tc.args, fd, ok, tc.wantFD, tc.wantOK)
 			}
 		})
+	}
+}
+
+// TestLeaseAgentArgsReadyFD pins the spawn-side half of F-3 finding-2: the argv the real
+// spawn site emits round-trips through the SAME single source the child adopts and main's
+// sweep preserves, resolving to readyPipeFD. Drop --ready-fd from leaseAgentArgs and the
+// child would sweep fd 3 and the handshake would time out — this fails fast instead.
+func TestLeaseAgentArgsReadyFD(t *testing.T) {
+	args := leaseAgentArgs(4321, 99, 2, "/lease/key", "/cfg", true)
+	fd, ok := SpawnedLeaseAgentReadyFD(args)
+	if !ok || fd != readyPipeFD {
+		t.Fatalf("SpawnedLeaseAgentReadyFD(spawn argv) = (%d, %v), want (%d, true) — spawn site must emit --ready-fd %d", fd, ok, readyPipeFD, readyPipeFD)
 	}
 }
 
@@ -718,6 +736,10 @@ func TestLeaseAgentReadyFDGate(t *testing.T) {
 		runLeaseAgentFD3Helper([]string{"--pid", "0", "--dir", ""})
 	case "wired":
 		runLeaseAgentFD3Helper([]string{"--pid", "0", "--dir", "", "--ready-fd", "3"})
+	case "base0":
+		// cobra parses --ready-fd=0x3 as 3 (base-0), but the single source (base-10) rejects
+		// it, so the sweep never preserved fd 3 — adoption must skip the handshake, not write.
+		runLeaseAgentFD3Helper([]string{"--pid", "0", "--dir", "", "--ready-fd=0x3"})
 	}
 
 	cases := []struct {
@@ -727,6 +749,7 @@ func TestLeaseAgentReadyFDGate(t *testing.T) {
 	}{
 		{"manual invocation leaves fd 3 untouched", "manual", false},
 		{"wired invocation drives the fd-3 handshake", "wired", true},
+		{"base-0 ready-fd is not adopted (single-sourced with the sweep)", "base0", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -767,6 +790,10 @@ func TestLeaseAgentReadyFDGate(t *testing.T) {
 // exits 7 on the expected guard failure so the parent can tell a clean error return from
 // a crash. It never returns.
 func runLeaseAgentFD3Helper(args []string) {
+	// RunE adopts the readiness fd from SpawnedLeaseAgentReadyFD(os.Args[1:]) — the same
+	// single source main's sweep uses — so drive it through a real lease-agent os.Args, not
+	// just cobra's SetArgs copy (which carries no subcommand token for the parser to gate on).
+	os.Args = append([]string{"ccp", leaseAgentSubcommand}, args...)
 	cmd := newLeaseAgentCmd()
 	cmd.SetArgs(args)
 	cmd.SilenceErrors, cmd.SilenceUsage = true, true
