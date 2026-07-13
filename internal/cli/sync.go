@@ -324,6 +324,9 @@ func syncSelf(mesh *hostregistry.Registry) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve sync self: %w", err)
 	}
+	if host == "" {
+		return "", fmt.Errorf("resolve sync self: kernel hostname is empty")
+	}
 	return host, nil
 }
 

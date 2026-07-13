@@ -181,5 +181,8 @@ func (s *Server) resolveSyncSelf(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve sync self: %w", err)
 	}
+	if host == "" {
+		return "", fmt.Errorf("resolve sync self: kernel hostname is empty")
+	}
 	return host, nil
 }
