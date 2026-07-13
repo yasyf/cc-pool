@@ -17,7 +17,6 @@ import (
 //	hold/disownHold        — a scheduler/reconcile poll claim on the dir
 //	own/disownConvert      — a standalone overlay-conversion claim
 //	ownHeld                — a conversion claim taken under a held poll claim
-//	ownPool/disownPool     — the pool-wide native-mux-root force-unmount claim
 //	held / reservedCount   — the claim queries the select/poll paths read
 //
 // ownFresh (a Server method — it also touches the store) is the sanctioned
@@ -32,11 +31,6 @@ type claims struct {
 	reservations map[int]time.Time // accountID -> select reserved-at
 	converting   map[int]bool      // accountID -> overlay conversion in flight
 	polling      map[int]bool      // accountID -> scheduler/reconcile owns the dir this iteration
-	// nativeRecovering is a pool-wide claim: a force-unmount of the shared native
-	// mux root is in flight, so reserve refuses EVERY account for its span (the
-	// unmount drops every subtree). Set under mu across the scan→unmount→cache-
-	// invalidate span, the same window-close as a per-account convert claim.
-	nativeRecovering bool
 }
 
 // newClaims builds an empty claims store.
@@ -49,12 +43,12 @@ func newClaims() *claims {
 }
 
 // reserve records a short-lived reservation for an account, refusing while an
-// overlay conversion or a pool-wide recovery holds it (both are about to remake
-// the dir a launching claude would land in).
+// overlay conversion holds it (it is about to remake the dir a launching claude
+// would land in).
 func (c *claims) reserve(id int) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.converting[id] || c.nativeRecovering {
+	if c.converting[id] {
 		return false
 	}
 	c.reservations[id] = time.Now()
@@ -157,38 +151,6 @@ func (c *claims) held(id int) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.converting[id]
-}
-
-// ownPool claims the pool for a shared native mux-root force-unmount: it refuses
-// if another recovery already holds the claim or any listed fuse account holds a
-// live reservation (a select is launching onto a subtree of the root right now),
-// else sets nativeRecovering so reserve refuses new reservations for the whole
-// force-unmount span. The reservation scan and the flag set are one critical
-// section — the same window-close own uses against a racing select. Callers pair
-// it with disownPool.
-func (c *claims) ownPool(fuse []store.Account) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.nativeRecovering {
-		// An overlapping sweep (holder-loss vs startup/periodic) coalesces: the
-		// in-flight one owns the span, and its disownPool must not be undercut by a
-		// second claimant releasing early.
-		return false
-	}
-	for _, a := range fuse {
-		if t, ok := c.reservations[a.ID]; ok && time.Since(t) <= reservationTTL {
-			return false
-		}
-	}
-	c.nativeRecovering = true
-	return true
-}
-
-// disownPool releases the pool-wide native-recovery claim.
-func (c *claims) disownPool() {
-	c.mu.Lock()
-	c.nativeRecovering = false
-	c.mu.Unlock()
 }
 
 // ownFresh takes the standalone convert claim on id, then re-reads the row under

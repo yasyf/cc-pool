@@ -105,7 +105,7 @@ func TestResolveSelectionForcedUnknown(t *testing.T) {
 	m := &pool.Manager{Store: openTestStore(t)}
 	cmd := &cobra.Command{}
 	id := 999
-	_, _, err := resolveSelection(cmd, m, selectReq{account: &id})
+	_, _, _, err := resolveSelection(cmd, m, selectReq{account: &id})
 	if err == nil || !strings.Contains(err.Error(), "999") {
 		t.Fatalf("err = %v, want a not-found error mentioning account 999", err)
 	}

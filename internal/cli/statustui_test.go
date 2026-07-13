@@ -12,6 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/lease"
 )
 
 type fakeToggle struct {
@@ -284,6 +285,7 @@ func reloginTUI(fl *fakeLogin) statusTUI {
 		buildLogin:     fl.build,
 		finishLogin:    fl.finish,
 		resolveAccount: fl.resolve,
+		acquireLease:   func(store.Account) (*lease.Handle, error) { return nil, nil },
 	}
 }
 
@@ -399,6 +401,7 @@ func TestStatusTUIReloginAction(t *testing.T) {
 			buildLogin:     fl.build,
 			finishLogin:    fl.finish,
 			resolveAccount: fl.resolve,
+			acquireLease:   func(store.Account) (*lease.Handle, error) { return nil, nil },
 		}
 		got, cmd := pressA(t, tui)
 		if !got.reloginBusy || cmd == nil {
@@ -461,6 +464,40 @@ func TestStatusTUIReloginAction(t *testing.T) {
 	})
 }
 
+// TestStatusTUIReloginLeaseFailure pins F2's TUI-relogin lease coverage: a
+// failed acquire+probe surfaces the error and never builds or starts a login —
+// the leased equivalent of runRelogin's own refusal.
+func TestStatusTUIReloginLeaseFailure(t *testing.T) {
+	fl := &fakeLogin{}
+	tui := reloginTUI(fl)
+	tui.acquireLease = func(store.Account) (*lease.Handle, error) {
+		return nil, errors.New("acct dir is not answering (dead or absent mount?) — run `ccp doctor`")
+	}
+
+	tui, cmd := pressA(t, tui)
+	if cmd == nil {
+		t.Fatal("a must return the start Cmd")
+	}
+	msg := cmd()
+	model, execCmd := tui.Update(msg)
+	tui = model.(statusTUI)
+	if execCmd != nil {
+		t.Fatal("a failed lease acquire must not start a login")
+	}
+	if tui.reloginBusy {
+		t.Fatal("a failed lease acquire must clear busy")
+	}
+	if tui.reloginErr == nil || !strings.Contains(tui.reloginErr.Error(), "ccp doctor") {
+		t.Fatalf("reloginErr = %v, want the lease/probe failure naming ccp doctor", tui.reloginErr)
+	}
+	if len(fl.built) != 0 {
+		t.Fatalf("buildLogin ran despite a failed lease acquire: %v", fl.built)
+	}
+	if tui.reloginLease != nil {
+		t.Fatal("a failed acquire must leave no lease handle behind")
+	}
+}
+
 // TestStatusTUIReloginShortCircuit: a needs-login account whose credential
 // already landed clears without spawning claude; anything else logs in.
 func TestStatusTUIReloginShortCircuit(t *testing.T) {
@@ -515,6 +552,51 @@ func TestStatusTUIReloginShortCircuit(t *testing.T) {
 		}
 		if len(fl.built) != 0 {
 			t.Fatalf("check error must not build a login: %v", fl.built)
+		}
+	})
+}
+
+// TestStatusTUIReloginLeaseOrdering pins G1: the session lease is acquired+probed
+// BEFORE the needs-login short-circuit runs (the short-circuit reads-modifies-writes
+// credentials, so the holder must not be able to tear the mount down under it), and a
+// failed acquire never reaches that credential path.
+func TestStatusTUIReloginLeaseOrdering(t *testing.T) {
+	t.Run("acquire precedes checkFresh", func(t *testing.T) {
+		var order []string
+		fl := &fakeLogin{freshDone: true}
+		tui := reloginTUI(fl)
+		tui.acquireLease = func(store.Account) (*lease.Handle, error) {
+			order = append(order, "acquire")
+			return nil, nil
+		}
+		tui.checkFresh = func(a store.Account) (bool, error) {
+			order = append(order, "checkFresh")
+			return fl.checkFresh(a)
+		}
+		_, cmd := pressA(t, tui)
+		if msg := cmd(); func() bool { _, ok := msg.(reloginDoneMsg); return !ok }() {
+			t.Fatalf("msg = %#v, want a cleared reloginDoneMsg", msg)
+		}
+		if len(order) != 2 || order[0] != "acquire" || order[1] != "checkFresh" {
+			t.Fatalf("call order = %v, want [acquire checkFresh] — the lease must be held before any credential write", order)
+		}
+	})
+
+	t.Run("failed acquire never touches credentials", func(t *testing.T) {
+		fl := &fakeLogin{freshDone: true}
+		tui := reloginTUI(fl)
+		tui.acquireLease = func(store.Account) (*lease.Handle, error) {
+			return nil, errors.New("mount is not answering — run `ccp doctor`")
+		}
+		tui.checkFresh = fl.checkFresh
+		_, cmd := pressA(t, tui)
+		msg := cmd()
+		done, ok := msg.(reloginDoneMsg)
+		if !ok || done.err == nil {
+			t.Fatalf("msg = %#v, want a failed reloginDoneMsg", msg)
+		}
+		if len(fl.fresh) != 0 {
+			t.Fatalf("checkFresh ran despite a failed lease acquire: %v", fl.fresh)
 		}
 	})
 }

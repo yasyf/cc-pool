@@ -4,15 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"strings"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
@@ -21,48 +17,6 @@ import (
 // scheduler's ~3.5-minute poll. (Per-row remount backoff/breaker constants live
 // in policies.go — the self-heal policy substrate.)
 const defaultHealInterval = 10 * time.Second
-
-// forceUnmount force-unmounts a fuse carcass without routing through the
-// (possibly dead) holder; test seam.
-var forceUnmount = overlay.ForceUnmount
-
-// reapOrphanedServers SIGKILLs the go-nfsv4 servers a crashed holder orphaned
-// under the given roots — each killed only after its mountpoint is independently
-// confirmed a carcass, so a healthy server is never touched. Test seam so unit
-// tests never signal a real process.
-var reapOrphanedServers = fusekit.ReapOrphanedServers
-
-// liveSessionGate reports whether dir backs any live claude session, via the
-// bounded ps-env scan — never lsof/stat on the mount, so a wedged mirror
-// cannot park it. A scan failure returns busy=true: force-unmounting a busy
-// NFS mount panics the kernel (nfs_vinvalbuf2: ubc_msync failed).
-func (s *Server) liveSessionGate(ctx context.Context, dir string) (busy bool, n int) {
-	sessions, err := s.scan(ctx)
-	if err != nil {
-		s.log.Printf("live-session gate: scan for %s failed: %v; treating as busy (refusing to force-unmount)", dir, err)
-		return true, 0
-	}
-	n = procscan.CountByConfigDir(sessions, dir)
-	return n > 0, n
-}
-
-// unmountIdle is the sole per-dir force-unmount chokepoint: it force-unmounts dir
-// only after a fresh liveSessionGate proves nothing rides it. busy=true (with the
-// live-session count n) means dir was left mounted — a live session, or a scan
-// failure treated as busy (fail-closed) — since force-unmounting a busy NFS
-// mirror panics the kernel (nfs_vinvalbuf2). busy=false means dir was idle and
-// the force-unmount was attempted; err carries its result. Callers own their
-// context logging off (busy, n, err).
-//
-// A shared native mux root is NOT force-unmounted here: a per-dir scan cannot see
-// a session on a subtree, so that path keeps its own pool-wide gate
-// (sweepMuxRootIdle → anyLiveFuseSession) before its force-unmount.
-func (s *Server) unmountIdle(ctx context.Context, dir string) (busy bool, n int, err error) {
-	if busy, n = s.liveSessionGate(ctx, dir); busy {
-		return true, n, nil
-	}
-	return false, n, forceUnmount(dir)
-}
 
 // fuseRemountPolicy is the fuse-row remount policy: one shared backoff clock
 // under two mutually-resetting breaker lanes — hazard (strikes, escalating via
@@ -208,12 +162,11 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context, t *tick) {
 				switch s.healFuse(ctx, fresh) {
 				case healMounted:
 					s.remountClear(a.ConfigDir)
-				case healDeferredBusy, healDeferredUnmitigated:
-					// attemptNeutral, no hazard strike: a busy mount must never reach
-					// the wedged breaker (and the lane reset disarms a mid-countdown
-					// breaker), and an unmitigated holder is a benign wait for the cask
-					// upgrade — the row keeps deferring until `brew upgrade --cask
-					// fusekit-holder` lands, never retreating to symlink.
+				case healDeferredBusy, healDeferredUnsupported:
+					// attemptNeutral, no hazard strike: a busy mirror (a live session
+					// holds its lease, or a graceful unmount answered EBUSY) must never
+					// reach the wedged breaker, and neither must a benign wait for a cask
+					// upgrade — both keep deferring, never retreating to symlink.
 					s.remountAttempt(a.ConfigDir, attemptNeutral)
 				case healTCCBlocked:
 					if s.remountAttempt(a.ConfigDir, attemptAlt) {
@@ -276,38 +229,16 @@ func (s *Server) convertRowToSymlink(ctx context.Context, a store.Account, annou
 		return true
 	}
 	s.log.Printf("%s", announce)
-	// A per-account teardown breaks any live session bound to the mirror, so gate
-	// on it. A legacy per-dir mount (a real mountpoint) also needs a kernel
-	// force-unmount, and force-unmounting a busy NFS mirror panics — so it comes
-	// down only when idle. A mux subtree (a bridge symlink) is detached kernel-free
-	// by ConvertOverlay's mux Teardown, but the detach still yields EIO/ENOENT on a
-	// live session's open files, so it keeps the same gate — session-breaking, not
-	// kernel-hazardous.
-	// A legacy per-dir mount comes down through the idle chokepoint; a mux bridge
-	// (mutually exclusive with a real mountpoint) is detached kernel-free by
-	// ConvertOverlay below but still needs the same idle gate, since the detach
-	// breaks a live session's open files.
-	legacy := overlayMounted(fresh.ConfigDir)
-	if legacy {
-		busy, n, err := s.unmountIdle(ctx, fresh.ConfigDir)
-		if busy {
-			s.log.Printf("acct-%02d symlink retreat deferred: %d live session(s) on %s — leaving fuse", a.ID, n, fresh.ConfigDir)
-			return false
-		}
-		if err != nil {
-			// Do not proceed into ConvertOverlay: its Teardown would re-spawn the
-			// holder being retreated from. A dir the kernel refuses to unmount
-			// cannot be safely symlinked anyway.
-			s.log.Printf("acct-%02d symlink retreat: force-unmount %s wedged; leaving fuse: %v", a.ID, fresh.ConfigDir, err)
-			return false
-		}
-	} else if pool.IsBridgeSymlink(fresh.ConfigDir) {
-		if busy, n := s.liveSessionGate(ctx, fresh.ConfigDir); busy {
-			s.log.Printf("acct-%02d symlink retreat deferred: %d live session(s) on %s — leaving fuse", a.ID, n, fresh.ConfigDir)
-			return false
-		}
-	}
+	// ConvertOverlay's teardown routes through the shared holder's lease-ladder
+	// unmount: a held session lease answers ErrBusy (the launcher that leased the
+	// dir still owns it), so the retreat defers instead of breaking a live session
+	// — and a busy graceful unmount answers ErrBusy too, never a force. No
+	// consumer-side session scan or force-unmount.
 	if _, err := s.m.ConvertOverlay(ctx, fresh, fkoverlay.BackendSymlink); err != nil {
+		if errors.Is(err, mountd.ErrBusy) {
+			s.log.Printf("acct-%02d symlink retreat deferred: %s is busy (a live session holds its lease) — leaving fuse", a.ID, fresh.ConfigDir)
+			return false
+		}
 		s.log.Printf("acct-%02d symlink retreat: convert to symlink: %v", a.ID, err)
 		return false
 	}
@@ -329,157 +260,19 @@ func (s *Server) escalateRowToSymlink(ctx context.Context, a store.Account, anno
 
 // escalateWedgedRow handles a row that tripped remountBreakerThreshold after its
 // per-poll detach/re-attach cycles (mountFuse) failed. Caller holds the account's
-// poll claim. A legacy per-dir mount retreats to symlink with a per-row
-// force-unmount. For a mux subtree the choice is between native-level recovery and
-// an isolated per-row retreat: a wedged native mount fails every subtree, so when
-// siblings also fail (nativeMountWedged) the shared root is force-unmounted
-// (pool-wide-idle-gated) and the heal loop reassembles the pool; a lone wedged
-// subtree (siblings healthy) retreats just this row to symlink with a kernel-free
-// detach.
+// poll claim. It retreats the row to symlink; the pool-wide native-mount recovery
+// a wedge might need is the holder's job now (lease-gated, surfaced via health
+// WedgedDirs), so the daemon never force-unmounts the shared root itself.
 func (s *Server) escalateWedgedRow(ctx context.Context, a store.Account) {
+	shape := "mux subtree"
 	if overlayMounted(a.ConfigDir) {
-		announce := fmt.Sprintf("acct-%02d legacy fuse mount never recovered after %d consecutive attempts; force-unmounting and falling back to symlink — relaunch any sessions on it",
-			a.ID, remountBreakerThreshold)
-		if s.escalateRowToSymlink(ctx, a, announce) {
-			s.log.Printf("acct-%02d fell back to symlink after exhausting fuse remount attempts", a.ID)
-		}
-		return
+		shape = "legacy fuse mount"
 	}
-	if s.nativeMountWedged(a) {
-		s.recoverNativeMount(ctx)
-		return
-	}
-	announce := fmt.Sprintf("acct-%02d mux subtree never recovered after %d consecutive attempts; detaching and falling back to symlink — relaunch any sessions on it",
-		a.ID, remountBreakerThreshold)
+	announce := fmt.Sprintf("acct-%02d %s never recovered after %d consecutive attempts; falling back to symlink — relaunch any sessions on it",
+		a.ID, shape, remountBreakerThreshold)
 	if s.escalateRowToSymlink(ctx, a, announce) {
 		s.log.Printf("acct-%02d fell back to symlink after exhausting fuse remount attempts", a.ID)
 	}
-}
-
-// nativeMountWedged reports whether a's wedge is at the shared native mount, not
-// one subtree: a wedged native mount fails EVERY subtree, so if any sibling fuse
-// row is also deep-wedged or held-dead the fault is pool-wide. A lone wedged
-// subtree (siblings healthy, or no siblings) is isolated and retreats on its own.
-func (s *Server) nativeMountWedged(a store.Account) bool {
-	fuse, err := s.fuseAccounts()
-	if err != nil {
-		// Cannot enumerate siblings: prefer the milder per-row retreat over
-		// force-unmounting the whole pool on a guess.
-		s.log.Printf("native-wedge check: list accounts: %v", err)
-		return false
-	}
-	for _, sib := range fuse {
-		if sib.ID == a.ID {
-			continue
-		}
-		if s.holder.deepWedged(sib.ConfigDir) {
-			return true
-		}
-		if dead, _ := s.holder.heldDead(sib.ConfigDir); dead {
-			return true
-		}
-	}
-	return false
-}
-
-// recoverNativeMount force-unmounts the shared native mux mount to clear a
-// pool-wide wedge. After the unmount each row's next idempotent Mount RPC finds
-// the root dead, re-mounts once, and re-attaches — the heal loop self-reassembles
-// the pool.
-func (s *Server) recoverNativeMount(ctx context.Context) {
-	fuse, err := s.fuseAccounts()
-	if err != nil {
-		s.log.Printf("native mux recovery: list accounts: %v", err)
-		return
-	}
-	if s.sweepMuxRootIdle(ctx, fuse) {
-		s.log.Printf("force-unmounted the pool-wide wedged native mux mount %s; the heal loop will re-mount and re-attach every account", pool.MuxRootDir())
-	}
-}
-
-// sweepMuxRootIdle force-unmounts the shared native mux root under two gates that
-// close their races the way a per-account convert closes its own: the pool-wide
-// reservation gate (beginNativeRecovery refuses if any fuse account is reserved
-// and blocks new reservations for the span, so a select on a healthy sibling can
-// never land between the session scan and the force-unmount) and the pool-idle
-// session gate (a bound session — including a pre-FinalizeAdd `ccp add` on a bridge
-// symlink — defers it, since force-unmounting a busy NFS mirror panics the kernel).
-// Returns whether the root came down; callers establish that the mounted root is a
-// carcass (dead or foreign holder) or pool-wide wedge. After the unmount noteUnmounted
-// drops every stale vouch so no select trusts the torn-down mount before the re-mount.
-func (s *Server) sweepMuxRootIdle(ctx context.Context, fuse []store.Account) bool {
-	if !s.cl.ownPool(fuse) {
-		s.log.Printf("native mux force-unmount deferred: a select holds a reservation on a fuse account")
-		return false
-	}
-	defer s.cl.disownPool()
-	if busy, dir, n := s.anyLiveFuseSession(ctx, fuse); busy {
-		s.log.Printf("native mux mount left under %d live session(s) on %s — deferring force-unmount (drops every pooled session); relaunch them", n, dir)
-		return false
-	}
-	root := pool.MuxRootDir()
-	if !overlayMounted(root) {
-		return false
-	}
-	if err := forceUnmount(root); err != nil {
-		s.log.Printf("native mux force-unmount %s: %v", root, err)
-		return false
-	}
-	for _, a := range fuse {
-		s.holder.noteUnmounted(a.ConfigDir)
-	}
-	return true
-}
-
-// holderOwnsMuxRoot reports whether a reachable holder actually serves the shared
-// mux root — a live peer AND at least one listed subtree row whose MuxRoot is ours.
-// A dead peer, or a live-but-empty holder freshly respawned over a root a dead
-// predecessor left mounted, does NOT own the root, so that carcass reads unowned
-// and the orphan sweep clears it. A List error cannot disprove ownership, so it
-// reads owned — the cautious direction (never force-unmount a root a live holder
-// may still serve).
-func (s *Server) holderOwnsMuxRoot() bool {
-	if !s.peerAliveOn(s.holderSocket) {
-		return false
-	}
-	mounts, err := s.holderClient().List()
-	if err != nil {
-		return true
-	}
-	root := pool.MuxRootDir()
-	for _, mi := range mounts {
-		if mi.MuxRoot == root {
-			return true
-		}
-	}
-	return false
-}
-
-// anyLiveFuseSession reports whether any fuse account backs a live claude session,
-// via one bounded ps-env scan. A scan failure cannot rule a session out, so it
-// reads busy — the cautious direction for a pool-wide force-unmount. Busy is
-// derived from the scan itself, not just the row list: a pre-FinalizeAdd `ccp add`
-// session has no account row yet, but its CLAUDE_CONFIG_DIR is already a bridge
-// symlink into the shared mux root, so force-unmounting the root under it is the
-// same kernel-panic hazard — count any scanned session on such a bridge.
-func (s *Server) anyLiveFuseSession(ctx context.Context, fuse []store.Account) (busy bool, dir string, n int) {
-	sessions, err := s.scan(ctx)
-	if err != nil {
-		s.log.Printf("pool-wide session gate: scan failed: %v; treating as busy (refusing to force-unmount the shared mount)", err)
-		return true, "", 0
-	}
-	for _, a := range fuse {
-		if c := procscan.CountByConfigDir(sessions, a.ConfigDir); c > 0 {
-			return true, a.ConfigDir, c
-		}
-	}
-	accountsPrefix := pool.AccountsDir() + string(os.PathSeparator)
-	for _, se := range sessions {
-		if strings.HasPrefix(se.ConfigDir, accountsPrefix) && pool.IsBridgeSymlink(se.ConfigDir) {
-			return true, se.ConfigDir, procscan.CountByConfigDir(sessions, se.ConfigDir)
-		}
-	}
-	return false, "", 0
 }
 
 // escalateTCCBlockedRow retreats a row that tripped tccBreakerThreshold to

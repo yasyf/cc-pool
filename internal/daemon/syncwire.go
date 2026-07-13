@@ -42,6 +42,17 @@ func (ss serverSessions) Busy(ctx context.Context, uuid string) (bool, string, e
 		if n := procscan.CountByConfigDir(sessions, a.ConfigDir); n > 0 {
 			return true, fmt.Sprintf("acct-%02d has %d live session(s)", a.ID, n), nil
 		}
+		// A select handout holds the session lease before its claude is visible to
+		// procscan; a held lease reports busy so a peer-driven removal defers. An
+		// UNREADABLE lease root must fail CLOSED — read busy and surface the error — so
+		// destructive removal never proceeds on an indeterminate probe.
+		switch held, herr := ss.s.m.SessionLeaseHeld(a); {
+		case herr != nil:
+			return true, fmt.Sprintf("acct-%02d session-lease probe failed, assuming busy", a.ID),
+				fmt.Errorf("probe session lease for acct-%02d: %w", a.ID, herr)
+		case held:
+			return true, fmt.Sprintf("acct-%02d has a held session lease (a live session or launch)", a.ID), nil
+		}
 	}
 	return false, "", nil
 }

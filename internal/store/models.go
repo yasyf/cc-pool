@@ -122,3 +122,16 @@ type AuthHealth struct {
 	LastErr    string
 	Kind       AuthKind
 }
+
+// JournalRisk records that cc-pool forgot a fuse row (removal, fallback, or
+// conversion) after its holder Unmount confirmed the kernel detach but reported a
+// persist-warning that survived a bounded retry — so the holder's durable journal may
+// replay Dir as a live mount on its next restart. `ccp doctor` surfaces it so the user
+// reconciles after the next holder restart; a later warning-free teardown of Dir, or
+// doctor confirming Dir is no longer mounted, clears it. No secrets — a path, a warning
+// string, a timestamp.
+type JournalRisk struct {
+	Dir        string
+	Warning    string
+	RecordedAt time.Time
+}

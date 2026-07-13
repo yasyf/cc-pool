@@ -70,16 +70,16 @@ func (f *fakeFuse) Setup(_, dir string) error {
 	return nil
 }
 
-func (f *fakeFuse) Teardown(_, _ string) error {
+func (f *fakeFuse) Teardown(_, _ string) (string, error) {
 	*f.ops = append(*f.ops, "fuse.teardown")
 	if f.teardownErr != nil {
-		return f.teardownErr
+		return "", f.teardownErr
 	}
 	if f.created != "" {
 		_ = os.Remove(f.created)
 		f.created = ""
 	}
-	return nil
+	return "", nil
 }
 
 func newConvertFixture(t *testing.T, fake *fakeFuse) (*Manager, store.Account, string) {
@@ -861,10 +861,10 @@ type hookedSymlink struct {
 	preTeardown func() error
 }
 
-func (h *hookedSymlink) Teardown(base, dir string) error {
+func (h *hookedSymlink) Teardown(base, dir string) (string, error) {
 	if h.preTeardown != nil {
 		if err := h.preTeardown(); err != nil {
-			return err
+			return "", err
 		}
 	}
 	return h.SymlinkProvider.Teardown(base, dir)
@@ -1229,19 +1229,19 @@ func (b *bridgeFuse) Setup(base, dir string) error {
 	return muxSetupSim(base, dir)
 }
 
-func (b *bridgeFuse) Teardown(_, dir string) error {
+func (b *bridgeFuse) Teardown(_, dir string) (string, error) {
 	*b.ops = append(*b.ops, "teardown")
 	fi, err := os.Lstat(dir)
 	if os.IsNotExist(err) {
-		return nil
+		return "", nil
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	if fi.Mode()&os.ModeSymlink == 0 {
-		return fmt.Errorf("refusing to remove %s: not a symlink", dir)
+		return "", fmt.Errorf("refusing to remove %s: not a symlink", dir)
 	}
-	return os.Remove(dir)
+	return "", os.Remove(dir)
 }
 
 // TestConvertToFuseRefusesOverlaySymlink is the R2 regression pin for convertToFuse:
@@ -1445,16 +1445,16 @@ func (f *fakeFP) Setup(_, dir string) error {
 	return nil
 }
 
-func (f *fakeFP) Teardown(_, dir string) error {
+func (f *fakeFP) Teardown(_, dir string) (string, error) {
 	*f.ops = append(*f.ops, "fp.teardown")
 	if f.teardownErr != nil {
-		return f.teardownErr
+		return "", f.teardownErr
 	}
 	if err := fileproviderd.RemoveSymlink(dir); err != nil {
-		return err
+		return "", err
 	}
 	delete(f.registered, filepath.Base(dir))
-	return nil
+	return "", nil
 }
 
 // RemoveDomain deregisters WITHOUT retracting the bridge symlink (unlike Teardown),
@@ -2306,7 +2306,7 @@ func (s stubProvider) Backend() fkoverlay.Backend    { return s.backend }
 func (s stubProvider) Setup(_, _ string) error       { return nil }
 func (s stubProvider) Sync(_, _ string) error        { return nil }
 func (s stubProvider) Health(_, _ string) error      { return nil }
-func (s stubProvider) Teardown(_, _ string) error    { return nil }
+func (s stubProvider) Teardown(_, _ string) (string, error)    { return "", nil }
 func (s stubProvider) PrivateRoot(dir string) string { return dir }
 
 // TestConvertOverlayRefusesUnknownTargetArm pins the dispatch's loud default: a

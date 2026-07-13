@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/fileproviderd"
@@ -192,15 +191,16 @@ func (s *Server) retreatFPToSymlink(ctx context.Context, a store.Account) bool {
 // claim; the caller logs the success reason (the retreat is invoked for distinct
 // reasons — ErrCannotControl vs breaker exhaustion).
 func (s *Server) convertFPToSymlinkHeld(ctx context.Context, a store.Account) bool {
-	sessions, err := s.scan(ctx)
+	// A File Provider source has no holder mount, so ConvertOverlay mutates the plain
+	// account dir directly (a live session's open fds break on the domain removal):
+	// fence it under an exclusive session-lease seize so a live session or a select
+	// handout — invisible to procscan before claude starts — defers the retreat.
+	fence, err := s.m.SeizeSessionLease(a)
 	if err != nil {
-		s.log.Printf("acct-%02d deferring file-provider→symlink retreat: session scan: %v", a.ID, err)
+		s.log.Printf("acct-%02d deferring file-provider→symlink retreat: %s is held by a live session or a select handout: %v", a.ID, a.ConfigDir, err)
 		return false
 	}
-	if n := procscan.CountByConfigDir(sessions, a.ConfigDir); n > 0 {
-		s.log.Printf("acct-%02d deferring file-provider→symlink retreat: %d live session(s)", a.ID, n)
-		return false
-	}
+	defer func() { _ = fence.Release() }()
 	if _, err := s.m.ConvertOverlay(ctx, a, fkoverlay.BackendSymlink); err != nil {
 		s.log.Printf("acct-%02d file-provider→symlink retreat: %v", a.ID, err)
 		return false
@@ -296,7 +296,9 @@ func (s *Server) repairFPDomain(ctx context.Context, a store.Account, retreat bo
 		return res
 	}
 	base, dir := pool.ClaudeDir(), fresh.ConfigDir
-	if terr := prov.Teardown(base, dir); terr != nil {
+	warning, terr := prov.Teardown(base, dir)
+	s.warnTeardown(fresh.ID, warning)
+	if terr != nil {
 		// A wedged domain may refuse a clean Teardown; the idempotent Setup below
 		// re-adds regardless, so log and press on rather than failing the repair.
 		s.log.Printf("acct-%02d file provider repair: teardown: %v", fresh.ID, terr)
@@ -337,7 +339,7 @@ func (s *Server) retreatFPDomainHeld(ctx context.Context, fresh store.Account, r
 		return res
 	}
 	res.Outcome = FPRepairFailed
-	res.Detail = "symlink retreat is blocked by a live session (or a failed session scan) — relaunch any sessions on it, then re-run"
+	res.Detail = "symlink retreat is blocked by a live session or a select handout on it — relaunch or close it, then re-run"
 	return res
 }
 

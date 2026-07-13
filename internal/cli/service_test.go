@@ -311,9 +311,8 @@ func TestUninstallReclaimsHolderMounts(t *testing.T) {
 	if !fh.sawOp(mountd.OpReclaim) {
 		t.Error("the holder never received a reclaim op")
 	}
-	if fh.sawOp(mountd.OpShutdown) {
-		t.Error("uninstall must never shut down the shared multi-tenant holder")
-	}
+	// Proto 2 has no shutdown op — the holder self-retires, never on consumer
+	// command — so uninstall structurally cannot stop the shared holder.
 	if got := stripANSI(errOut.String()); !strings.Contains(got, "couldn't unmount /tmp/stuck-dir") {
 		t.Errorf("failed dir not reported:\n%s", got)
 	}

@@ -147,7 +147,7 @@ func TestResolveSelectionWarnsOnExhaustedFallback(t *testing.T) {
 	cmd.SetErr(&stderr)
 	cmd.SetContext(context.Background())
 
-	dir, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, cwd: "/proj"})
+	_, dir, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, cwd: "/proj"})
 	if err != nil || dir == "" {
 		t.Fatalf("fallback selection must succeed: dir=%q err=%v", dir, err)
 	}
@@ -211,7 +211,7 @@ func TestResolveSelectionWarnsOnHeldManualPin(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.SetErr(&stderr)
 	cmd.SetContext(context.Background())
-	dir, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, cwd: "/proj"})
+	_, dir, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, cwd: "/proj"})
 	if err != nil || dir == "" {
 		t.Fatalf("selection must succeed: dir=%q err=%v", dir, err)
 	}
@@ -233,7 +233,7 @@ func TestResolveSelectionWarnsOnHeldManualPin(t *testing.T) {
 	cmd2 := &cobra.Command{}
 	cmd2.SetErr(&stderr2)
 	cmd2.SetContext(context.Background())
-	if _, _, err := resolveSelection(cmd2, m2, selectReq{noDaemon: true, cwd: "/proj"}); err != nil {
+	if _, _, _, err := resolveSelection(cmd2, m2, selectReq{noDaemon: true, cwd: "/proj"}); err != nil {
 		t.Fatal(err)
 	}
 	if out := stripANSI(stderr2.String()); strings.Contains(out, "manual pin to") {
@@ -251,7 +251,7 @@ func TestResolveSelectionWaitRefusesExhaustedFallback(t *testing.T) {
 	cancel() // pre-cancelled: the wait loop must exit on its first sleep
 	cmd.SetContext(ctx)
 
-	_, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, wait: true, cwd: "/proj"})
+	_, _, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, wait: true, cwd: "/proj"})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("wait must block until cancelled, got %v", err)
 	}
@@ -324,7 +324,7 @@ func TestResolveSelectionMergesBaseSettings(t *testing.T) {
 			cmd.SetErr(&stderr)
 			cmd.SetContext(context.Background())
 
-			dir, _, err := resolveSelection(cmd, m, mkReq(1))
+			_, dir, _, err := resolveSelection(cmd, m, mkReq(1))
 			if err != nil || dir == "" {
 				t.Fatalf("selection must succeed: dir=%q err=%v", dir, err)
 			}
@@ -399,7 +399,7 @@ func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
 	cmd.SetErr(&stderr)
 	cmd.SetContext(context.Background())
 
-	gotDir, _, err := resolveSelection(cmd, m, selectReq{cwd: "/proj"})
+	_, gotDir, _, err := resolveSelection(cmd, m, selectReq{cwd: "/proj"})
 	if err != nil || gotDir != dir {
 		t.Fatalf("daemon pick must succeed: dir=%q err=%v (stderr=%q)", gotDir, err, stripANSI(stderr.String()))
 	}
@@ -469,7 +469,7 @@ func TestResolveSelectionMountsNotReadyError(t *testing.T) {
 			cmd.SetErr(&bytes.Buffer{})
 			cmd.SetContext(context.Background())
 
-			_, _, err = resolveSelection(cmd, m, selectReq{cwd: "/proj"})
+			_, _, _, err = resolveSelection(cmd, m, selectReq{cwd: "/proj"})
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("resolveSelection err = %v, want errors.Is %v", err, tc.wantErr)
 			}

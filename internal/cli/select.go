@@ -47,9 +47,17 @@ scores; otherwise it samples usage live.`,
 				if cmd.Flags().Changed("account") {
 					req.account = &account
 				}
-				dir, line, err := resolveSelection(cmd, m, req)
+				a, dir, line, err := resolveSelection(cmd, m, req)
 				if err != nil {
 					return err
+				}
+				// select prints the dir for the invoking shell to run claude, so the
+				// session lease must outlive ccp: a detached agent holds it until the
+				// terminal's session leader exits. Block on the agent's acquired+probed
+				// handshake BEFORE printing anything — a failure hands out nothing and
+				// exits non-zero rather than launching claude onto an unprotected dir.
+				if err := spawnLeaseAgent(a); err != nil {
+					return fmt.Errorf("couldn't hold the session lease for %s: %w", accountName(a.Label), err)
 				}
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), dir)
 				announceLine(cmd, line)
@@ -76,12 +84,13 @@ type selectReq struct {
 }
 
 // resolveSelection runs the shared `ccp run`/`ccp select` pipeline (forced →
-// daemon → live); the caller owns stdout and the diagnostic line.
-func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, line string, err error) {
+// daemon → live), returning the selected account so callers can take its session
+// lease; the caller owns stdout and the diagnostic line.
+func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (acct store.Account, dir, line string, err error) {
 	if req.account != nil {
 		a, err := m.Store.GetAccount(*req.account)
 		if err != nil {
-			return "", "", err
+			return store.Account{}, "", "", err
 		}
 		// An at-version daemon holds gates a client can't see (overlay conversion,
 		// mounts, reservations); prefer it over launching claude into a dir being
@@ -92,7 +101,7 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 			if cl.EnsureRunning(2*time.Second) && daemonAt(version.String()) {
 				if resp, ok := cl.Select(req.account, req.pid, false, req.cwd, false); ok {
 					if !resp.OK {
-						return "", "", errors.New(resp.Error)
+						return store.Account{}, "", "", errors.New(resp.Error)
 					}
 					viaDaemon = true // daemon recorded the session, sticky, and reservation
 				}
@@ -107,7 +116,7 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 		}
 		dir, err := prepareAccount(cmd, m, a)
 		// Forced pick: no scoring, so no usage to report.
-		return dir, selectionLine(accountName(a.Label), false, false, 0, 0, "", 0), err
+		return a, dir, selectionLine(accountName(a.Label), false, false, 0, 0, "", 0), err
 	}
 
 	// EnsureRunning so a daemon outlives the exec to adopt tokens claude
@@ -127,18 +136,22 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 					}
 					warnPinHeld(cmd, m, resp.PinHeldAccount, resp.SelectedID)
 					mergeDaemonPick(cmd, m, resp.SelectedID)
-					return resp.Dir, daemonSelectionLine(m, resp), nil
+					a, aerr := daemonPickAccount(m, resp.SelectedID)
+					if aerr != nil {
+						return store.Account{}, "", "", aerr
+					}
+					return a, resp.Dir, daemonSelectionLine(m, resp), nil
 				case outcomeError:
-					return "", "", errors.New(resp.Error)
+					return store.Account{}, "", "", errors.New(resp.Error)
 				case outcomeWait:
 					if resp.SoonestReset != nil {
 						step(cmd.ErrOrStderr(), "All accounts are busy; waiting until %s.", humanizeReset(*resp.SoonestReset))
 					}
 				case outcomeFail:
 					if resp.MountsNotReady {
-						return "", "", pool.ErrMountsNotReady
+						return store.Account{}, "", "", pool.ErrMountsNotReady
 					}
-					return "", "", pool.ErrNoneAvailable
+					return store.Account{}, "", "", pool.ErrNoneAvailable
 				}
 			}
 		}
@@ -151,7 +164,7 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 		if errors.Is(err, pool.ErrNoneAvailable) {
 			if !req.wait {
 				step(cmd.ErrOrStderr(), "No account is available right now; all are exhausted or rate-limited.")
-				return "", "", err
+				return store.Account{}, "", "", err
 			}
 			reset, ok := sr.SoonestReset()
 			d := 15 * time.Second
@@ -163,21 +176,30 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 			}
 			select {
 			case <-cmd.Context().Done():
-				return "", "", cmd.Context().Err()
+				return store.Account{}, "", "", cmd.Context().Err()
 			case <-time.After(d):
 				continue
 			}
 		}
 		if err != nil {
-			return "", "", err
+			return store.Account{}, "", "", err
 		}
 		if sr.ExhaustedFallback {
 			warnExhaustedFallback(cmd, accountName(sr.Best.Label), sr.ExtraEnabled, sr.Result.ExhaustedUntil)
 		}
 		warnPinHeld(cmd, m, sr.PinHeldAccount, &sr.Best.ID)
 		dir, err := prepareAccount(cmd, m, sr.Best)
-		return dir, liveSelectionLine(sr), err
+		return sr.Best, dir, liveSelectionLine(sr), err
 	}
+}
+
+// daemonPickAccount loads the account a daemon pick selected, so the launcher can
+// take its session lease. A pick always carries an id; a nil one is a daemon bug.
+func daemonPickAccount(m *pool.Manager, id *int) (store.Account, error) {
+	if id == nil {
+		return store.Account{}, errors.New("daemon pick carried no account id")
+	}
+	return m.Store.GetAccount(*id)
 }
 
 func warnPinHeld(cmd *cobra.Command, m *pool.Manager, held, selected *int) {

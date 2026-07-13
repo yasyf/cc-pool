@@ -18,8 +18,26 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/lease"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
+
+// holdSessionLease simulates a live select/env handout by taking account a's
+// session lease (its current-shape key) under the server's temp lease root; the
+// returned handle releases it, and a t.Cleanup closes it as a backstop.
+func holdSessionLease(t *testing.T, s *Server, a store.Account) *lease.Handle {
+	t.Helper()
+	root, err := s.m.LeaseRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := lease.Acquire(root, pool.SessionLeaseDir(a), pool.HolderOwner)
+	if err != nil {
+		t.Fatalf("hold session lease on %s: %v", pool.SessionLeaseDir(a), err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	return h
+}
 
 // newTestServer builds a Server with acct-1 emptier than acct-2. scanSessions
 // is stubbed: real `ps` can hang on a wedged mount.
@@ -29,6 +47,9 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Point the session-lease root at a temp dir so any Seize/Probe under test
+	// never touches real ~/.fusekit.
+	leaseRoot := filepath.Join(t.TempDir(), "leases")
 	t.Cleanup(func() { _ = st.Close() })
 
 	dirs := map[int]string{}
@@ -49,6 +70,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 	s := &Server{
 		m: &pool.Manager{
 			Store: st, OAuth: &fakeOAuth{}, Creds: credstest.NewFake(), LockDir: t.TempDir(),
+			LeaseRoot: func() (string, error) { return leaseRoot, nil },
 		},
 		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),

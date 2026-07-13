@@ -43,8 +43,13 @@ var (
 	ErrProbeWedged = errors.New("deep probe wedged")
 )
 
+// DeepProbeBound is the deep probe's worst-case wall-clock budget. Exported so a
+// caller (e.g. the lease-agent readiness deadline) can derive a timeout from the
+// real component bound rather than a hand-copied constant.
+const DeepProbeBound = 5 * time.Second
+
 // deepProbeTimeout is a var, not a const, so tests can shrink it.
-var deepProbeTimeout = 5 * time.Second
+var deepProbeTimeout = DeepProbeBound
 
 // deepProbes joins concurrent deep probes per dir. Its OWN StatProbes, never
 // shared with the shallow stat probes: a parked 2 MiB read must never block a

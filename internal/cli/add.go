@@ -2,6 +2,7 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os/exec"
 
@@ -39,7 +40,12 @@ so you do not need a separate ` + "`ccp init`" + `.
 
 Run it without flags to add accounts one at a time; it offers to add another
 after each. Use --count to add a set number, or -y to add one and log in right
-away.`,
+away.
+
+When the login prompt can't run here (a non-interactive shell), add prints a
+command to run elsewhere and holds the new account's overlay with a session lease
+tied to THIS terminal. Keep this terminal open until the login finishes: closing
+it releases the lease even if the login is still going in another terminal.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
@@ -243,6 +249,15 @@ func checkDuplicate(cmd *cobra.Command, m *pool.Manager, p *pool.PendingAdd, opt
 
 func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) error {
 	out := cmd.OutOrStdout()
+	// Hold the pending account's session lease across the whole login interaction so
+	// holder retirement/recovery never tears down its fresh mount while claude writes
+	// credentials; the supervising ccp parent releases it on return. Probe first —
+	// never log in through a dead or wedged mirror.
+	h, err := acquireAndProbePendingLease(pending)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = h.Close() }()
 	doRun := opts.runNow || opts.autoYes
 	if isTTY() && !doRun {
 		choice := "run"
@@ -270,10 +285,18 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 		return nil
 	}
 
-	step(out, "\nRun this in another terminal, finish the login, then come back:\n\n    %s\n", pending.LoginCommand)
 	if !isTTY() {
+		// Non-interactive: ccp exits after printing, so the synchronous lease above dies
+		// with it. Hand the pending dir's lease to a detached agent tied to the
+		// terminal's session leader BEFORE printing the command, so the printed login
+		// (run from any terminal in this session) never races the holder's teardown.
+		if err := spawnPendingLeaseAgent(pending); err != nil {
+			return fmt.Errorf("couldn't hold the session lease for the new account: %w", err)
+		}
+		step(out, "\nRun this in another terminal, finish the login, then come back (keep THIS terminal open until it's done — its session holds the new account's lease):\n\n    %s\n", pending.LoginCommand)
 		return nil
 	}
+	step(out, "\nRun this in another terminal, finish the login, then come back:\n\n    %s\n", pending.LoginCommand)
 	if pending.ClaudeJSONSeed == pool.SeedKeptExisting {
 		// Polling can't tell a reused dir's pre-existing login from a fresh one.
 		cont := true

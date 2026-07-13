@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/fileproviderd"
+	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
@@ -616,9 +617,11 @@ func TestConcurrentPrepareAddIndexRace(t *testing.T) {
 // stubOverlay is an injectable fuse-kind provider whose Setup can be forced to
 // fail.
 type stubOverlay struct {
-	backend  fkoverlay.Backend
-	setupErr error
-	setups   int
+	backend     fkoverlay.Backend
+	setupErr    error
+	teardownErr error
+	setups      int
+	teardowns   int
 	// probesClaudeJSON makes Setup fail unless the private .claude.json exists.
 	probesClaudeJSON bool
 }
@@ -626,7 +629,17 @@ type stubOverlay struct {
 func (s *stubOverlay) Backend() fkoverlay.Backend { return s.backend }
 func (s *stubOverlay) Sync(_, _ string) error     { return nil }
 func (s *stubOverlay) Health(_, _ string) error   { return nil }
-func (s *stubOverlay) Teardown(_, _ string) error { return nil }
+func (s *stubOverlay) Teardown(_, dir string) (string, error) {
+	s.teardowns++
+	if s.teardownErr != nil {
+		return "", s.teardownErr
+	}
+	// Mimic a real teardown reclaiming the mount footprint so a symlink fallback
+	// starts on a clean dir.
+	_ = os.RemoveAll(dir)
+	_ = os.RemoveAll(fkoverlay.FusePrivateRoot(dir))
+	return "", nil
+}
 func (s *stubOverlay) PrivateRoot(dir string) string {
 	if s.backend.IsFuse() {
 		return fkoverlay.FusePrivateRoot(dir)
@@ -773,19 +786,21 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("an unmitigated holder falls back to symlinks before any mount", func(t *testing.T) {
+	t.Run("a holder missing a required feature falls back to symlinks before any mount", func(t *testing.T) {
 		// The gated provider is exactly what OverlayProviderFor hands every real
-		// `ccp add`: a v0.36.0 pool whose recorded default is fuse but whose
-		// cask still serves a pre-mitigation holder must fall back to symlink —
-		// never mount on the nfs_vinvalbuf2 panic vector.
+		// `ccp add`: a pool whose recorded default is fuse but whose cask serves a
+		// holder missing a required capability must fall back to symlink — never
+		// mount through it — and surface the cask-upgrade hint.
 		stub := &stubOverlay{backend: fkoverlay.BackendNFS}
-		m := setup(t, mitigationGate{Provider: stub, health: func() (string, error) { return "v0.22.1", nil }})
+		m := setup(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
+			return &mountd.HelloInfo{Version: "v0.9.0", Features: []string{mountd.FeatureBridge}}, nil
+		}})
 		pending, err := m.PrepareAdd(t.Context())
 		if err != nil {
 			t.Fatalf("PrepareAdd: %v", err)
 		}
 		if stub.setups != 0 {
-			t.Fatalf("fuse setups = %d, want 0 (no mount may be attempted on an unmitigated holder)", stub.setups)
+			t.Fatalf("fuse setups = %d, want 0 (no mount may be attempted through an unsupported holder)", stub.setups)
 		}
 		if pending.OverlayKind != fkoverlay.BackendSymlink {
 			t.Fatalf("OverlayKind = %q, want symlink", pending.OverlayKind)
@@ -830,6 +845,243 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		_, err := m.PrepareAdd(t.Context())
 		if err == nil || !strings.Contains(err.Error(), "disk full") {
 			t.Fatalf("PrepareAdd = %v, want the symlink setup failure propagated", err)
+		}
+	})
+
+	// H6: requireHolderVerified refuses AFTER Setup mounted, so the fresh mount is
+	// live. PrepareAdd must reclaim it through the holder before the symlink fallback —
+	// else the fallback refuses the live mount and strands a rowless mount that poisons
+	// later adds.
+	t.Run("a post-setup capability failure reclaims the fresh mount before symlink fallback", func(t *testing.T) {
+		stub := &stubOverlay{backend: fkoverlay.BackendNFS}
+		var hellos int
+		m := setup(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
+			hellos++
+			if hellos == 1 {
+				return &mountd.HelloInfo{Version: "v1.0.0", Features: HolderMountFeatures}, nil // pre-check: full features, so Setup mounts
+			}
+			return &mountd.HelloInfo{Version: "v1.0.0", Features: []string{mountd.FeatureBridge}}, nil // post-check: the mounted holder lacks a required feature
+		}})
+		pending, err := m.PrepareAdd(t.Context())
+		if err != nil {
+			t.Fatalf("PrepareAdd: %v", err)
+		}
+		if stub.setups != 1 {
+			t.Fatalf("fuse setups = %d, want 1 (the mount was established before the post-check refused)", stub.setups)
+		}
+		if stub.teardowns != 1 {
+			t.Fatalf("fuse teardowns = %d, want 1 (the unverified fresh mount must be reclaimed before the symlink fallback)", stub.teardowns)
+		}
+		if pending.OverlayKind != fkoverlay.BackendSymlink {
+			t.Fatalf("OverlayKind = %q, want symlink (fell back after reclaiming the unverified mount)", pending.OverlayKind)
+		}
+		if _, err := os.Readlink(filepath.Join(pending.ConfigDir, "projects")); err != nil {
+			t.Fatalf("symlink overlay not established after the fallback: %v", err)
+		}
+		// A later add is clean: no rowless mount poisons it.
+		pending2, err := m.PrepareAdd(t.Context())
+		if err != nil {
+			t.Fatalf("second PrepareAdd after the capability-failure fallback: %v", err)
+		}
+		if pending2.OverlayKind != fkoverlay.BackendSymlink {
+			t.Fatalf("second add OverlayKind = %q, want symlink", pending2.OverlayKind)
+		}
+	})
+
+	t.Run("a busy fresh mount defers the add rather than poisoning it", func(t *testing.T) {
+		stub := &stubOverlay{backend: fkoverlay.BackendNFS, teardownErr: mountd.ErrBusy}
+		var hellos int
+		m := setup(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
+			hellos++
+			if hellos == 1 {
+				return &mountd.HelloInfo{Version: "v1.0.0", Features: HolderMountFeatures}, nil
+			}
+			return &mountd.HelloInfo{Version: "v1.0.0", Features: []string{mountd.FeatureBridge}}, nil
+		}})
+		_, err := m.PrepareAdd(t.Context())
+		if err == nil || !errors.Is(err, mountd.ErrBusy) {
+			t.Fatalf("PrepareAdd with a busy fresh mount = %v, want an ErrBusy deferral", err)
+		}
+		if !strings.Contains(err.Error(), "retry `ccp add`") {
+			t.Fatalf("error = %v, want a crisp deferral hint", err)
+		}
+	})
+
+	// J4c: a lost ack after the holder mounted leaves the mount LIVE while Setup reports
+	// failure. The feature gate probes the holder's mount list and marks it
+	// ErrMountedUnverified, so PrepareAdd reclaims it before the symlink fallback — the
+	// same breadth as the post-check refusal, not just ErrHolderUnsupported.
+	t.Run("a lost-ack mount is reclaimed via the mount-list probe before the fallback", func(t *testing.T) {
+		stub := &stubOverlay{backend: fkoverlay.BackendNFS, setupErr: errors.New("lost the mount ack")}
+		m := setup(t, featureGate{
+			Provider: stub,
+			hello: func() (*mountd.HelloInfo, error) {
+				return &mountd.HelloInfo{Version: "v1.0.0", Features: HolderMountFeatures}, nil
+			},
+			mounts: func() ([]mountd.MountInfo, error) { return []mountd.MountInfo{{Dir: AccountDir(1)}}, nil },
+		})
+		pending, err := m.PrepareAdd(t.Context())
+		if err != nil {
+			t.Fatalf("PrepareAdd: %v", err)
+		}
+		if stub.teardowns != 1 {
+			t.Fatalf("fuse teardowns = %d, want 1 (the lost-ack mount must be reclaimed before the fallback)", stub.teardowns)
+		}
+		if pending.OverlayKind != fkoverlay.BackendSymlink {
+			t.Fatalf("OverlayKind = %q, want symlink (fell back after reclaiming the lost-ack mount)", pending.OverlayKind)
+		}
+	})
+
+	// J4b: when the live fresh mount cannot be reclaimed (a hard teardown failure),
+	// PrepareAdd must NOT release the pending index into a rowless, nameless state —
+	// releasing then would orphan the live mount. The reservation is KEPT so the mount
+	// keeps its name, and the error names the `ccp add` retry.
+	t.Run("a hard reclaim failure keeps the pending reservation", func(t *testing.T) {
+		stub := &stubOverlay{backend: fkoverlay.BackendNFS, teardownErr: errors.New("holder rejected the unmount")}
+		var hellos int
+		m := setup(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
+			hellos++
+			if hellos == 1 {
+				return &mountd.HelloInfo{Version: "v1.0.0", Features: HolderMountFeatures}, nil // pre-check mounts
+			}
+			return &mountd.HelloInfo{Version: "v1.0.0", Features: []string{mountd.FeatureBridge}}, nil // post-check refuses → live mount
+		}})
+		_, err := m.PrepareAdd(t.Context())
+		if err == nil || !strings.Contains(err.Error(), "reservation is kept") {
+			t.Fatalf("PrepareAdd with a failed reclaim = %v, want a kept-reservation error naming `ccp add`", err)
+		}
+		if !strings.Contains(err.Error(), "retry `ccp add`") {
+			t.Fatalf("error = %v, want the retry hint", err)
+		}
+		// The index stays reserved: the next reservation gets a DIFFERENT index, so the
+		// live mount at acct-01 is never orphaned nameless.
+		next, rerr := m.Store.ReserveAccountIndex()
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		if next == 1 {
+			t.Fatal("index 1 was released after a failed reclaim; the live mount is orphaned nameless")
+		}
+	})
+}
+
+// teardownStub returns a scripted per-call warning and an optional hard error, for
+// exercising teardownWithRetry's journal-persist-warning handling.
+type teardownStub struct {
+	warnings    []string // returned per successive call; the last repeats once exhausted
+	teardownErr error
+	calls       int
+}
+
+func (s *teardownStub) Backend() fkoverlay.Backend    { return fkoverlay.BackendNFS }
+func (s *teardownStub) Setup(_, _ string) error       { return nil }
+func (s *teardownStub) Sync(_, _ string) error        { return nil }
+func (s *teardownStub) Health(_, _ string) error      { return nil }
+func (s *teardownStub) PrivateRoot(dir string) string { return dir }
+func (s *teardownStub) Teardown(_, _ string) (string, error) {
+	w := ""
+	switch {
+	case s.calls < len(s.warnings):
+		w = s.warnings[s.calls]
+	case len(s.warnings) > 0:
+		w = s.warnings[len(s.warnings)-1]
+	}
+	s.calls++
+	return w, s.teardownErr
+}
+
+// TestTeardownWithRetry pins J4a: a persist-warning is re-issued (each retry re-attempts
+// the holder journal save), a warning-free result clears any prior risk, a warning that
+// survives the retries is recorded as a doctor-visible journal-risk and surfaced loudly
+// (never silently dropped), and a hard teardown error returns immediately unwrapped.
+func TestTeardownWithRetry(t *testing.T) {
+	old := journalRetryBackoff
+	journalRetryBackoff = time.Millisecond
+	defer func() { journalRetryBackoff = old }()
+
+	newMgr := func(t *testing.T) (*Manager, *[]string) {
+		var warns []string
+		m := &Manager{Store: openTestStore(t), Warnf: func(f string, a ...any) { warns = append(warns, fmt.Sprintf(f, a...)) }}
+		return m, &warns
+	}
+	const dir = "/pool/acct-01"
+
+	t.Run("a clean teardown records no risk", func(t *testing.T) {
+		m, _ := newMgr(t)
+		stub := &teardownStub{}
+		if err := m.teardownWithRetry(stub, "/base", dir, 1); err != nil {
+			t.Fatalf("teardownWithRetry = %v, want nil", err)
+		}
+		if stub.calls != 1 {
+			t.Fatalf("teardown calls = %d, want 1", stub.calls)
+		}
+		if risks, _ := m.Store.ListJournalRisks(); len(risks) != 0 {
+			t.Fatalf("recorded %d risks on a clean teardown, want 0", len(risks))
+		}
+	})
+
+	t.Run("a persistent warning retries then records a doctor-visible risk", func(t *testing.T) {
+		m, warns := newMgr(t)
+		stub := &teardownStub{warnings: []string{"journal save failed"}}
+		if err := m.teardownWithRetry(stub, "/base", dir, 1); err != nil {
+			t.Fatalf("teardownWithRetry = %v, want nil (the detach itself succeeded)", err)
+		}
+		if stub.calls != journalRetryAttempts {
+			t.Fatalf("teardown calls = %d, want %d (re-issued on the warning)", stub.calls, journalRetryAttempts)
+		}
+		risks, _ := m.Store.ListJournalRisks()
+		if len(risks) != 1 || risks[0].Dir != dir || risks[0].Warning != "journal save failed" {
+			t.Fatalf("journal risks = %+v, want one entry for %s", risks, dir)
+		}
+		if !strings.Contains(strings.Join(*warns, "\n"), "ccp doctor") {
+			t.Fatalf("warnings = %v, want a loud doctor-visible warning", *warns)
+		}
+	})
+
+	t.Run("a warning that clears on retry records no risk and clears a prior one", func(t *testing.T) {
+		m, _ := newMgr(t)
+		if err := m.Store.RecordJournalRisk(dir, "old", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		stub := &teardownStub{warnings: []string{"transient", ""}}
+		if err := m.teardownWithRetry(stub, "/base", dir, 1); err != nil {
+			t.Fatalf("teardownWithRetry = %v, want nil", err)
+		}
+		if stub.calls != 2 {
+			t.Fatalf("teardown calls = %d, want 2 (retried once, then clean)", stub.calls)
+		}
+		if risks, _ := m.Store.ListJournalRisks(); len(risks) != 0 {
+			t.Fatalf("journal risks = %+v, want the prior entry cleared on the clean teardown", risks)
+		}
+	})
+
+	t.Run("a hard teardown error returns immediately, unwrapped", func(t *testing.T) {
+		m, _ := newMgr(t)
+		boom := errors.New("holder unreachable")
+		stub := &teardownStub{teardownErr: boom}
+		if err := m.teardownWithRetry(stub, "/base", dir, 1); !errors.Is(err, boom) {
+			t.Fatalf("teardownWithRetry hard error = %v, want the raw teardown error", err)
+		}
+		if stub.calls != 1 {
+			t.Fatalf("teardown calls = %d, want 1 (a hard error is not retried)", stub.calls)
+		}
+		if risks, _ := m.Store.ListJournalRisks(); len(risks) != 0 {
+			t.Fatalf("recorded a risk on a hard error, want 0")
+		}
+	})
+
+	t.Run("a failed ledger write fails loud so the caller keeps the row", func(t *testing.T) {
+		m, _ := newMgr(t)
+		if err := m.Store.Close(); err != nil { // force the journal-risk ledger write to fail
+			t.Fatal(err)
+		}
+		stub := &teardownStub{warnings: []string{"journal save failed"}}
+		err := m.teardownWithRetry(stub, "/base", dir, 1)
+		if err == nil || !strings.Contains(err.Error(), "journal-risk") {
+			t.Fatalf("teardownWithRetry with a failed ledger write = %v, want a loud journal-risk error (a lost resurrection marker must not read as success)", err)
+		}
+		if stub.calls != journalRetryAttempts {
+			t.Fatalf("teardown calls = %d, want %d (the detach still retried the warning)", stub.calls, journalRetryAttempts)
 		}
 	})
 }
@@ -925,11 +1177,11 @@ type fpFailStub struct {
 	setups   int
 }
 
-func (s *fpFailStub) Backend() fkoverlay.Backend    { return fkoverlay.BackendFileProvider }
-func (s *fpFailStub) Sync(_, _ string) error        { return nil }
-func (s *fpFailStub) Health(_, _ string) error      { return nil }
-func (s *fpFailStub) Teardown(_, _ string) error    { return nil }
-func (s *fpFailStub) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
+func (s *fpFailStub) Backend() fkoverlay.Backend           { return fkoverlay.BackendFileProvider }
+func (s *fpFailStub) Sync(_, _ string) error               { return nil }
+func (s *fpFailStub) Health(_, _ string) error             { return nil }
+func (s *fpFailStub) Teardown(_, _ string) (string, error) { return "", nil }
+func (s *fpFailStub) PrivateRoot(dir string) string        { return fkoverlay.FusePrivateRoot(dir) }
 func (s *fpFailStub) Setup(_, _ string) error {
 	s.setups++
 	return s.setupErr

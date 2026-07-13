@@ -23,6 +23,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/lease"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
@@ -71,16 +72,16 @@ func (f *fakeFuseProv) Setup(base, dir string) error {
 	return err
 }
 
-func (f *fakeFuseProv) Teardown(base, dir string) error {
+func (f *fakeFuseProv) Teardown(base, dir string) (string, error) {
 	f.mu.Lock()
 	f.teardowns++
 	f.calls = append(f.calls, "teardown")
 	fn, err := f.teardownFn, f.teardownErr
 	f.mu.Unlock()
 	if fn != nil {
-		return fn(base, dir)
+		return "", fn(base, dir)
 	}
-	return err
+	return "", err
 }
 
 func (f *fakeFuseProv) setupCount() int {
@@ -1162,9 +1163,9 @@ func TestHealFuseTaxonomy(t *testing.T) {
 				fmt.Errorf("%w: mount holder did not come up on /tmp/m.sock within 5s; check /tmp/holder.log", mountd.ErrHolderUnavailable)),
 			wantOutcome: healRetry, wantKind: "nfs",
 		},
-		"busy dir retries next poll": {
+		"busy mirror defers without a breaker strike": {
 			setupErr:    fmt.Errorf("mount: %w", mountd.ErrBusy),
-			wantOutcome: healRetry, wantKind: "nfs",
+			wantOutcome: healDeferredBusy, wantKind: "nfs",
 		},
 		"tcc block recorded and retried": {
 			setupErr:    fmt.Errorf("mount: %w", overlay.ErrMountNotLive),
@@ -1194,13 +1195,12 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w (mount-timeout): fuse mount did not come up in time", mountd.ErrUnknownClass)),
 			wantOutcome: healRetry, wantKind: "nfs",
 		},
-		// The exact chain the provider's mitigation gate produces for a
-		// pre-mitigation holder: defer for the cask upgrade, never demote —
-		// remounting on that holder is the nfs_vinvalbuf2 panic vector.
-		"unmitigated holder defers without demoting": {
-			setupErr: fmt.Errorf("%w: holder v0.28.0 needs %s or newer; run `brew upgrade --cask fusekit-holder`",
-				pool.ErrHolderUnmitigated, pool.MinHolderVersion),
-			wantOutcome: healDeferredUnmitigated, wantKind: "nfs",
+		// The chain the provider's feature gate produces for a holder missing a
+		// required capability: defer for the cask upgrade, never demote.
+		"unsupported holder defers without demoting": {
+			setupErr: fmt.Errorf("%w: holder v0.9.0 lacks feature \"mux\"; `brew upgrade --cask fusekit-holder`",
+				pool.ErrHolderUnsupported),
+			wantOutcome: healDeferredUnsupported, wantKind: "nfs",
 		},
 		// Mux registry state: a subtree could not join its shared root
 		// (unmount-then-retry). Never a mount verdict — retry, never demote.
@@ -1218,16 +1218,8 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			setupErr:    errors.New("mount exploded"),
 			wantOutcome: healFallback, wantKind: "symlink",
 		},
-		"genuine failure under a live session defers": {
-			setupErr: errors.New("mount exploded"), scanKind: "live",
-			wantOutcome: healFallback, wantKind: "nfs",
-		},
 		"genuine failure under a reservation defers": {
 			setupErr: errors.New("mount exploded"), reserve: true,
-			wantOutcome: healFallback, wantKind: "nfs",
-		},
-		"genuine failure with a failed scan fails closed": {
-			setupErr: errors.New("mount exploded"), scanKind: "err",
 			wantOutcome: healFallback, wantKind: "nfs",
 		},
 		"clean mount": {wantOutcome: healMounted, wantKind: "nfs"},
@@ -1392,7 +1384,7 @@ func serveVersionedHolder(ln net.Listener, version string) {
 			return
 		}
 		var req mountd.Request
-		resp := mountd.Response{OK: true, Version: version}
+		resp := mountd.Response{OK: true, Proto: mountd.MountProtoVersion, Version: version, Features: mountd.HolderFeatures}
 		if err := json.NewDecoder(conn).Decode(&req); err == nil && req.Op == mountd.OpProbe {
 			resp.FuseOK = true
 		}
@@ -1419,29 +1411,46 @@ func gateHome(t *testing.T) string {
 	return socket
 }
 
-// TestFuseGateHolderMitigationMatrix drives the PRODUCTION fuseGate (no
-// fuseGateFn seam) against a canned holder serving the shared socket under a
-// test HOME: only a release older than pool.MinHolderVersion refuses fuse,
-// with the observed version, the floor, and the brew-upgrade hint in the
-// reason; dev/empty/garbage versions are current-source and pass.
-func TestFuseGateHolderMitigationMatrix(t *testing.T) {
+// startFeaturedHolder serves a holder answering health/probe/hello with the given
+// feature set (proto 2) on socket, for the production fuseGate feature handshake.
+func startFeaturedHolder(t *testing.T, socket string, features []string) {
+	t.Helper()
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req mountd.Request
+			resp := mountd.Response{OK: true, Proto: mountd.MountProtoVersion, Version: "v1.0.0", Features: features, FuseOK: true}
+			_ = json.NewDecoder(conn).Decode(&req)
+			_ = json.NewEncoder(conn).Encode(resp)
+			_ = conn.Close()
+		}
+	}()
+}
+
+// TestFuseGateRequiresFeatures drives the PRODUCTION fuseGate (no fuseGateFn seam)
+// against a canned holder on the shared socket: a holder serving every required
+// capability passes, one missing a required feature is refused with the
+// cask-upgrade hint — the feature handshake, not version arithmetic.
+func TestFuseGateRequiresFeatures(t *testing.T) {
 	cases := map[string]struct {
-		version  string
+		features []string
 		wantPass bool
 	}{
-		"pre-mux v0.28.0 refused":            {"v0.28.0", false},
-		"boundary v0.29.0 passes":            {"v0.29.0", true},
-		"v0.30.0 passes":                     {"v0.30.0", true},
-		"v1.0.0 passes":                      {"v1.0.0", true},
-		"dev holder passes (current source)": {"dev", true},
-		"empty version passes":               {"", true},
-		"garbage version passes":             {"not-a-version", true},
-		"commit-suffixed old holder refused": {"v0.28.0 (abc1234)", false},
+		"a holder serving all required features passes": {features: mountd.HolderFeatures, wantPass: true},
+		"a holder missing the mux feature is refused":   {features: []string{mountd.FeatureBridge, mountd.FeatureLeaseGate}, wantPass: false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			socket := gateHome(t)
-			startVersionedHolder(t, socket, tc.version)
+			startFeaturedHolder(t, socket, tc.features)
 			s := &Server{cl: newClaims(), holderSocket: socket}
 
 			backend, reason := s.fuseGate(t.Context())
@@ -1454,7 +1463,7 @@ func TestFuseGateHolderMitigationMatrix(t *testing.T) {
 			if backend != "" || reason == "" {
 				t.Fatalf("fuseGate = (%q, %q), want a refusal", backend, reason)
 			}
-			for _, frag := range []string{tc.version, pool.MinHolderVersion, "brew upgrade --cask fusekit-holder", "ccp migrate"} {
+			for _, frag := range []string{"brew upgrade --cask fusekit-holder", "ccp migrate"} {
 				if !strings.Contains(reason, frag) {
 					t.Fatalf("refusal %q missing %q", reason, frag)
 				}
@@ -1611,7 +1620,7 @@ type cancellingSymlinkProv struct {
 	cancel context.CancelFunc
 }
 
-func (p *cancellingSymlinkProv) Teardown(base, dir string) error {
+func (p *cancellingSymlinkProv) Teardown(base, dir string) (string, error) {
 	p.cancel()
 	return p.SymlinkProvider.Teardown(base, dir)
 }
@@ -1809,6 +1818,96 @@ func TestHandleMigrateFileProviderZeroConversionsFlipsDefault(t *testing.T) {
 	if v, ok, err := s.m.Store.GetMeta("overlay_kind"); err != nil || !ok || v != "fileprovider" {
 		t.Fatalf("meta overlay_kind = %q ok=%v err=%v, want fileprovider", v, ok, err)
 	}
+}
+
+// countLeaseSeizes wraps the server's lease-root seam with a counter so a test can
+// prove whether a conversion took a consumer-held exclusive seize.
+func countLeaseSeizes(t *testing.T, s *Server) *int {
+	t.Helper()
+	root, err := s.m.LeaseRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	s.m.LeaseRoot = func() (string, error) {
+		n++
+		return root, nil
+	}
+	return &n
+}
+
+// TestConvertAccountLeaseFenceSplit pins the F7 who-performs-the-destructive-step
+// split, including the self-bounce-trap regression: a FUSE source's teardown is
+// delegated to the holder (the holder is the seizer), so cc-pool must NOT hold a
+// consumer exclusive fence WHILE that teardown runs — its own EX would bounce the
+// holder's Seize ClassBusy forever. The sequenced-op rule then fences the local
+// restore-and-relink that follows the CONFIRMED teardown (never around it). A
+// symlink source's whole plain-dir mutation cc-pool performs itself IS fenced.
+func TestConvertAccountLeaseFenceSplit(t *testing.T) {
+	t.Run("fuse-source teardown is not wrapped in a consumer seize", func(t *testing.T) {
+		s, _, fake := newMigrateServer(t)
+		if err := os.MkdirAll(pool.ClaudeDir(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		setRowKind(t, s, 1, fkoverlay.BackendNFS)
+
+		// Capture the real lease root BEFORE the seize counter wraps LeaseRoot, so
+		// the in-teardown probe below does not itself register as a consumer seize.
+		root, err := s.m.LeaseRoot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The fake holder-delegated teardown stands in for the holder's OWN Seize: it
+		// must be able to take the row's exclusive lease DURING teardown. If cc-pool
+		// wrapped the teardown in a consumer EX, this bounces ErrBusy — the self-bounce
+		// trap. A legacy/plain fuse row leases its ConfigDir, which is dir here.
+		var teardownRan bool
+		var teardownSeizeErr error
+		fake.teardownFn = func(_, dir string) error {
+			teardownRan = true
+			fence, ferr := lease.Seize(root, dir)
+			teardownSeizeErr = ferr
+			if ferr == nil {
+				_ = fence.Release() // release at once so the post-teardown local fence can take it
+			}
+			return nil
+		}
+
+		seizes := countLeaseSeizes(t, s)
+		one := 1
+		resp := s.handleMigrate(t.Context(), migrateReq(&one, "symlink"))
+		if !resp.OK {
+			t.Fatalf("migrate: %s", resp.Error)
+		}
+		if !teardownRan {
+			t.Fatal("the holder-delegated fuse teardown never ran")
+		}
+		if errors.Is(teardownSeizeErr, lease.ErrBusy) {
+			t.Fatal("the holder could not seize the lease during teardown: cc-pool wrapped a holder-delegated teardown in a consumer EX (the self-bounce trap)")
+		}
+		if teardownSeizeErr != nil {
+			t.Fatalf("in-teardown seize failed unexpectedly: %v", teardownSeizeErr)
+		}
+		// Sequenced-op rule: exactly ONE consumer seize, fencing the local
+		// restore-and-relink AFTER the confirmed teardown (never around it).
+		if *seizes != 1 {
+			t.Fatalf("fuse-source conversion took %d consumer seizes; want exactly 1 (the post-teardown local-drain fence)", *seizes)
+		}
+	})
+
+	t.Run("symlink source is fenced by a consumer seize", func(t *testing.T) {
+		s, _, _ := newMigrateServer(t)
+		seizes := countLeaseSeizes(t, s)
+
+		one := 1
+		resp := s.handleMigrate(t.Context(), migrateReq(&one, "fuse"))
+		if !resp.OK {
+			t.Fatalf("migrate: %s", resp.Error)
+		}
+		if *seizes == 0 {
+			t.Fatal("symlink-source conversion took no consumer seize; the local-mutation lease fence is missing")
+		}
+	})
 }
 
 // TestHandleMigrateUnknownTargetNamesAllThree pins the refusal for a junk

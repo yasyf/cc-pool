@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/fusekit/lease"
 )
 
 // ccpAccountEnv forces a specific account for `ccp run`, which parses no flags
@@ -49,12 +50,20 @@ off the fuse-t mirror, where the bulk write would wedge it. ` + "`ccp run`" + ` 
 				cwd, _ := os.Getwd() // best-effort: an unreadable cwd just disables stickiness
 				// exec replaces this process in place, so os.Getpid() IS the future
 				// claude pid — the pick registers as a real session checkout.
-				dir, line, err := resolveSelection(cmd, m, selectReq{account: account, cwd: cwd, pid: os.Getpid()})
+				acct, dir, line, err := resolveSelection(cmd, m, selectReq{account: account, cwd: cwd, pid: os.Getpid()})
 				if err != nil {
 					return err
 				}
 				step(cmd.ErrOrStderr(), "%s", line)
-				return execClaude(dir, args)
+				// Take the session lease BEFORE exec: its non-CLOEXEC fd rides through
+				// into claude, pinning the account's mount against holder teardown for
+				// the whole session, and the post-Acquire probe refuses to exec into a
+				// dead or partially-wedged mount.
+				h, err := acquireAndProbeSessionLease(acct)
+				if err != nil {
+					return err
+				}
+				return execClaude(h, dir, args)
 			})
 		},
 	}
@@ -73,14 +82,18 @@ func ccpAccountFromEnv() (*int, error) {
 	return &id, nil
 }
 
-func execClaude(configDir string, args []string) error {
+func execClaude(h *lease.Handle, configDir string, args []string) error {
 	bin, err := exec.LookPath("claude")
 	if err != nil {
 		return fmt.Errorf("`claude` not found on PATH: %w", err)
 	}
 	argv := append([]string{"claude"}, args...)
 	//nolint:gosec // G204: bin is the resolved claude executable; argv are this CLI's own passthrough args
-	if err := syscall.Exec(bin, argv, execEnv(os.Environ(), configDir)); err != nil {
+	err = syscall.Exec(bin, argv, execEnv(os.Environ(), configDir))
+	// The lease fd must stay open at exec time for the lock to survive into claude;
+	// KeepAlive holds h live across the (on success, non-returning) Exec call.
+	keepLeaseAlive(h)
+	if err != nil {
 		return fmt.Errorf("exec claude: %w", err)
 	}
 	return nil // unreachable: a successful Exec never returns

@@ -413,7 +413,9 @@ func (s *Server) fpProvider(a store.Account) fkoverlay.Provider {
 // convert claim.
 func (s *Server) reRegisterFP(a store.Account, prov fkoverlay.Provider) (cannotControl bool) {
 	base, dir := pool.ClaudeDir(), a.ConfigDir
-	if err := prov.Teardown(base, dir); err != nil {
+	warning, err := prov.Teardown(base, dir)
+	s.warnTeardown(a.ID, warning)
+	if err != nil {
 		// A wedged domain may refuse a clean Teardown; the idempotent Setup below
 		// re-adds regardless, so log and press on rather than stalling the ladder.
 		s.log.Printf("acct-%02d file provider re-register: teardown: %v", a.ID, err)

@@ -32,7 +32,7 @@ func (f *fakeReapFP) PrivateRoot(dir string) string { return fkoverlay.FusePriva
 func (f *fakeReapFP) Health(_, _ string) error      { return nil }
 func (f *fakeReapFP) Sync(_, _ string) error        { return nil }
 func (f *fakeReapFP) Setup(_, _ string) error       { return nil }
-func (f *fakeReapFP) Teardown(_, _ string) error    { return nil }
+func (f *fakeReapFP) Teardown(_, _ string) (string, error)    { return "", nil }
 
 func (f *fakeReapFP) DomainRoot(_ context.Context, dir string) (string, error) {
 	if f.beforeRoot != nil {

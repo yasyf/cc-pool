@@ -55,6 +55,15 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	if err != nil {
 		return err
 	}
+	// Hold the session lease for the whole login flow so the holder never tears
+	// down the account's mount while claude is writing its new identity; the
+	// supervising ccp parent releases it on exit (fd close). Probe first so a login
+	// never writes credentials into a dead or wedged mirror.
+	h, err := acquireAndProbeSessionLease(a)
+	if err != nil {
+		return err
+	}
+	defer h.Close()
 
 	out := cmd.OutOrStdout()
 	cleared, err := shortCircuitRelogin(cmd.Context(), m, a)

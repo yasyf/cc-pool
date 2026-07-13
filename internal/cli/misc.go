@@ -106,6 +106,14 @@ func newEnvCmd() *cobra.Command {
 					return err
 				}
 				mergeLaunchSettings(cmd, m, a)
+				// env prints exports for the invoking shell to run claude, so the
+				// session lease must outlive ccp: a detached agent holds it until the
+				// terminal's session leader exits. Block on the agent's acquired+probed
+				// handshake BEFORE printing any exports — a failure prints nothing and
+				// exits non-zero rather than handing out an unprotected dir.
+				if err := spawnLeaseAgent(a); err != nil {
+					return fmt.Errorf("couldn't hold the session lease for %s: %w", accountName(a.Label), err)
+				}
 				out := cmd.OutOrStdout()
 				_, _ = fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(a.ConfigDir))
 				_, _ = fmt.Fprintf(out, "export CLAUDE_CODE_PLUGIN_CACHE_DIR=%s\n", shellQuote(filepath.Join(pool.ClaudeDir(), "plugins")))

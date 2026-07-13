@@ -26,6 +26,33 @@ func cred(token, refresh string, expiresAtMillis int64) *creds.Credential {
 	}}
 }
 
+// TestRunReloginRefusesUnprobeableMount pins F2's login lease coverage: `ccp
+// login` acquires the session lease and PROBES the mount before any login
+// interaction, so an absent/dead account dir aborts loudly — credentials are
+// never written into a dead mirror.
+func TestRunReloginRefusesUnprobeableMount(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tempLeaseRoot(t)
+	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(pool.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	a := store.Account{ID: 3, ConfigDir: pool.AccountDir(3), OverlayKind: "nfs", KeychainService: "svc", KeychainAccount: "u"}
+	if err := st.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	m := &pool.Manager{Store: st}
+	cmd, _ := syncCmdBuf(t)
+
+	if err := runRelogin(cmd, m, "3"); err == nil || !strings.Contains(err.Error(), "ccp doctor") {
+		t.Fatalf("runRelogin on an unprobeable mount = %v, want a probe abort naming ccp doctor", err)
+	}
+}
+
 // TestLoginCommand pins the re-login argv: `claude auth login`, with --email
 // appended only when the account's address is known.
 func TestLoginCommand(t *testing.T) {

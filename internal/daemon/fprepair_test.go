@@ -175,9 +175,9 @@ func TestFPRepairRetreatWire(t *testing.T) {
 
 	t.Run("retreat under a live session defers, row stays fileprovider", func(t *testing.T) {
 		s, a, dirs, _ := newFPHealServer(t)
-		s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-			return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-		}
+		// A held session lease (a live session or a select handout — its open fds
+		// break on the domain removal) makes the retreat's exclusive seize bounce.
+		holdSessionLease(t, s, a)
 		wedgeIt(t, s, dirs[1])
 		one := a.ID
 

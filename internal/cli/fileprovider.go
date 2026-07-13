@@ -262,7 +262,11 @@ func repairFPDirect(cmd *cobra.Command, m *pool.Manager, account int, retreat bo
 	var failed int
 	for _, a := range targets {
 		name := fmt.Sprintf("acct-%02d (%s)", a.ID, accountName(a.Label))
-		if terr := prov.Teardown(base, a.ConfigDir); terr != nil {
+		warning, terr := prov.Teardown(base, a.ConfigDir)
+		if warning != "" {
+			warn(out, "%s teardown persist-warning: %s", name, warning)
+		}
+		if terr != nil {
 			// A wedged domain may refuse a clean Teardown; the idempotent Setup
 			// below re-adds regardless, so note and press on.
 			step(out, "%s teardown: %v (continuing to re-add)", name, terr)

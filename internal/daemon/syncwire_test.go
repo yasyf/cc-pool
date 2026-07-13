@@ -259,6 +259,14 @@ func TestServerSessionsBusy(t *testing.T) {
 			},
 			uuid: "u1", wantErr: true,
 		},
+		"unreadable lease root fails closed as busy": {
+			arrange: func(_ *testing.T, s *Server) {
+				// No live session, no reservation, no conversion — the probe reaches the
+				// session-lease check, whose root is unreadable.
+				s.m.LeaseRoot = func() (string, error) { return "", errors.New("lease root unreadable") }
+			},
+			uuid: "u1", wantBusy: true, wantErr: true,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -268,6 +276,9 @@ func TestServerSessionsBusy(t *testing.T) {
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("want an error so teardown defers, got nil")
+				}
+				if tc.wantBusy && !busy {
+					t.Fatal("want busy=true (fail closed) alongside the surfaced error")
 				}
 				return
 			}

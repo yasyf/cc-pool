@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -13,7 +12,6 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -291,48 +289,30 @@ func TestHandleCredMoveBusyClaims(t *testing.T) {
 // TestHandleCredMoveLiveSessionGate: a live session defers the move, and a
 // failed scan fails closed — there is no force override for cred moves.
 func TestHandleCredMoveLiveSessionGate(t *testing.T) {
-	cases := map[string]struct {
-		scanKind    string // "live" or "err"
-		wantOutcome MigrationOutcome
-		wantDetail  string
-	}{
-		"live session defers":       {scanKind: "live", wantOutcome: MigrationBusy, wantDetail: "1 live session(s)"},
-		"scan failure fails closed": {scanKind: "err", wantOutcome: MigrationFailed, wantDetail: "session scan"},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			s, dirs, fk := newCredMoveServer(t)
-			a := acct(t, s, 1)
-			fk.Put(a.KeychainService, a.KeychainAccount, credFixture())
-			switch tc.scanKind {
-			case "live":
-				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-					return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-				}
-			case "err":
-				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-					return nil, errors.New("ps exploded")
-				}
-			}
+	s, _, fk := newCredMoveServer(t)
+	a := acct(t, s, 1)
+	fk.Put(a.KeychainService, a.KeychainAccount, credFixture())
+	// A held session lease (a live session or a select handout — invisible to
+	// procscan before claude starts) makes the move's exclusive seize bounce, so the
+	// move defers rather than forking the refresh-token chain under a live claude.
+	holdSessionLease(t, s, a)
 
-			one := 1
-			resp := s.handleCredMove(t.Context(), credMoveReq(&one, "file"))
-			if !resp.OK {
-				t.Fatalf("credmove failed: %s", resp.Error)
-			}
-			r := resultByID(t, resp, 1)
-			if r.Outcome != tc.wantOutcome || !strings.Contains(r.Detail, tc.wantDetail) {
-				t.Fatalf("result = %+v, want %s with %q", r, tc.wantOutcome, tc.wantDetail)
-			}
-			if s.cl.held(1) {
-				t.Fatal("gate refusal leaked a converting claim")
-			}
-			if got := fk.TouchedServices(); len(got) != 0 {
-				t.Fatalf("a gated account's keychain was probed: %v", got)
-			}
-			credUntouched(t, fk, a)
-		})
+	one := 1
+	resp := s.handleCredMove(t.Context(), credMoveReq(&one, "file"))
+	if !resp.OK {
+		t.Fatalf("credmove failed: %s", resp.Error)
 	}
+	r := resultByID(t, resp, 1)
+	if r.Outcome != MigrationBusy || !strings.Contains(r.Detail, "held by a live session or a select handout") {
+		t.Fatalf("result = %+v, want MigrationBusy naming a held handout", r)
+	}
+	if s.cl.held(1) {
+		t.Fatal("gate refusal leaked a converting claim")
+	}
+	if got := fk.TouchedServices(); len(got) != 0 {
+		t.Fatalf("a gated account's keychain was probed: %v", got)
+	}
+	credUntouched(t, fk, a)
 }
 
 // TestHandleCredMoveValidation: an unknown target and an unknown account are

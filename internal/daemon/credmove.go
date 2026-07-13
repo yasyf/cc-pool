@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -80,18 +79,19 @@ func (s *Server) moveAccountCred(ctx context.Context, a store.Account, target cr
 	a = fresh
 	res.Label = a.Label
 
-	// Fail closed: a failed scan cannot rule out a live session in this dir.
-	sessions, err := s.scan(ctx)
+	// A cred move is a local mutation cc-pool performs itself (the store ops touch
+	// the account's Keychain item and its config-dir file copy), so fence it under an
+	// exclusive session-lease seize: a live session or a select handout — a live
+	// claude holds its credential in memory and writes rotations back to the backend
+	// it read from, and a handout is invisible to procscan before claude starts —
+	// defers the move rather than forking the refresh-token chain.
+	fence, err := s.m.SeizeSessionLease(a)
 	if err != nil {
-		res.Outcome = MigrationFailed
-		res.Detail = fmt.Sprintf("session scan: %v", err)
-		return res
-	}
-	if n := procscan.CountByConfigDir(sessions, a.ConfigDir); n > 0 {
 		res.Outcome = MigrationBusy
-		res.Detail = fmt.Sprintf("%d live session(s)", n)
+		res.Detail = "held by a live session or a select handout; relaunch or close it, then retry"
 		return res
 	}
+	defer func() { _ = fence.Release() }()
 
 	mctx, cancel := context.WithTimeout(ctx, credMoveTimeout)
 	defer cancel()

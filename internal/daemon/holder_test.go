@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,14 +24,12 @@ import (
 	"github.com/yasyf/fusekit/proc"
 )
 
-// TestMain defaults the orphan reaper to a no-op for the whole package: no daemon
-// test may SIGKILL a real process. Tests asserting a reap swap in a recording stub
-// (swapReapOrphans). For the same reason it points the widget appex binary at a
-// missing path — so pollOnce's reconcile short-circuits in StaleWidgetAppexes
-// before scanning a single real process — and no-ops the widget kill; widgetheal
-// tests swap in per-case stubs.
+// TestMain no-ops the widget appex reap for the whole package: no daemon test may
+// SIGKILL a real process. It points the widget appex binary at a missing path — so
+// pollOnce's reconcile short-circuits in StaleWidgetAppexes before scanning a single
+// real process — and no-ops the widget kill (killPID); widgetheal tests swap in
+// per-case stubs.
 func TestMain(m *testing.M) {
-	reapOrphanedServers = func([]string) []int { return nil }
 	widgetBinaryPath = func() string { return filepath.Join(os.TempDir(), "cc-pool-absent-widget-appex") }
 	killPID = func(int) error { return nil }
 	os.Exit(m.Run())
@@ -156,7 +153,7 @@ func startDegradedHolder(t *testing.T, ver string) string {
 				_ = conn.Close()
 				continue
 			}
-			_ = json.NewEncoder(conn).Encode(mountd.Response{OK: true, Version: ver})
+			_ = json.NewEncoder(conn).Encode(mountd.Response{OK: true, Proto: mountd.MountProtoVersion, Version: ver, Features: mountd.HolderFeatures})
 			_ = conn.Close()
 		}
 	}()
@@ -523,24 +520,6 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 	})
 }
 
-// swapForceUnmount swaps the global force-unmount seam; callers must not run in
-// parallel.
-func swapForceUnmount(t *testing.T, fn func(string) error) {
-	t.Helper()
-	prev := forceUnmount
-	forceUnmount = fn
-	t.Cleanup(func() { forceUnmount = prev })
-}
-
-// swapReapOrphans replaces the fusekit.ReapOrphanedServers seam so no test ever
-// signals a real process; the default (unstubbed) sweep tests get a no-op.
-func swapReapOrphans(t *testing.T, fn func([]string) []int) {
-	t.Helper()
-	prev := reapOrphanedServers
-	reapOrphanedServers = fn
-	t.Cleanup(func() { reapOrphanedServers = prev })
-}
-
 // driveRetryTicks runs n heal ticks, rewinding dir's backoff before each so
 // every tick makes a real attempt.
 func driveRetryTicks(t *testing.T, s *Server, dir string, n int) {
@@ -560,8 +539,8 @@ func TestRemountBreakerThreshold(t *testing.T) {
 }
 
 // TestRemountBreakerEscalates pins the wedged-mount breaker: after
-// remountBreakerThreshold consecutive wedged remounts it force-unmounts the
-// carcass and converts the row to symlink.
+// remountBreakerThreshold consecutive wedged remounts it retreats the row to
+// symlink (the holder owns any force path now).
 func TestRemountBreakerEscalates(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -569,27 +548,11 @@ func TestRemountBreakerEscalates(t *testing.T) {
 	fake.setupErr = mountTimeoutChain() // healRetry forever — the wedged shape
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
-	var (
-		mu        sync.Mutex
-		unmounted []string
-	)
-	swapForceUnmount(t, func(dir string) error {
-		mu.Lock()
-		unmounted = append(unmounted, dir)
-		mu.Unlock()
-		return nil
-	})
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
 	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold)
 
-	mu.Lock()
-	gotUnmounted := append([]string(nil), unmounted...)
-	mu.Unlock()
-	if len(gotUnmounted) != 1 || gotUnmounted[0] != dirs[1] {
-		t.Fatalf("breaker force-unmounted %v, want exactly [%s]", gotUnmounted, dirs[1])
-	}
 	if got := kindOf(t, s, 1); got != "symlink" {
 		t.Fatalf("row kind after the breaker = %q, want symlink", got)
 	}
@@ -604,84 +567,58 @@ func TestRemountBreakerEscalates(t *testing.T) {
 	}
 }
 
-// TestHealDefersBreakerUnderLiveSession is the regression lock for the kernel
-// panic (nfs_vinvalbuf2: ubc_msync failed): a dead mirror still backing a live
-// session is left mounted and takes no hazard strike, so the wedged breaker can
-// never fire on a busy mount.
-func TestHealDefersBreakerUnderLiveSession(t *testing.T) {
+// TestHealDefersBreakerUnderBusyMirror is the v2 regression lock: a dead mirror
+// whose holder teardown answers ErrBusy (a live session holds its lease) is left
+// alone and takes no hazard strike, so the wedged breaker can never fire on a
+// busy mount — the lease, not a ps scan, is the gate.
+func TestHealDefersBreakerUnderBusyMirror(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
 	fake.healthErr = errors.New("mirror is dead")
+	fake.teardownErr = mountd.ErrBusy // the holder refuses to seize the held lease
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-	}
 
-	var (
-		mu        sync.Mutex
-		unmounted []string
-	)
-	swapForceUnmount(t, func(dir string) error {
-		mu.Lock()
-		unmounted = append(unmounted, dir)
-		mu.Unlock()
-		return nil
-	})
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
 	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold+2)
 
-	if got := fake.teardownCount(); got != 0 {
-		t.Fatalf("teardowns under a live session = %d, want 0 (a busy mirror must never be torn down)", got)
-	}
-	mu.Lock()
-	gotUnmounted := append([]string(nil), unmounted...)
-	mu.Unlock()
-	if len(gotUnmounted) != 0 {
-		t.Fatalf("force-unmounted %v under a live session, want none (force-unmounting a busy NFS mirror panics the kernel)", gotUnmounted)
-	}
 	if got := kindOf(t, s, 1); got != "nfs" {
-		t.Fatalf("row kind under a live session = %q, want fuse (it must stay mounted, never retreat)", got)
+		t.Fatalf("row kind under a busy mirror = %q, want fuse (it must stay mounted, never retreat)", got)
 	}
 	if got := remountHazard(s, dirs[1]); got != 0 {
 		t.Fatalf("hazard count under a busy mount = %d, want 0 (the wedged breaker must be unreachable while busy)", got)
 	}
-	if !strings.Contains(buf.String(), "NOT force-unmounting") {
-		t.Fatalf("deferral not surfaced in the log:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "busy") {
+		t.Fatalf("busy deferral not surfaced in the log:\n%s", buf.String())
 	}
 }
 
-// TestHealUnmitigatedHolderDefersWithoutBreaker pins the heal loop's side of
-// the mitigation gate: a holder predating the NFS kernel-panic mitigations
-// defers the remount indefinitely — no hazard strikes, no symlink retreat —
-// and the row mounts on its own once the cask upgrade lands.
-func TestHealUnmitigatedHolderDefersWithoutBreaker(t *testing.T) {
+// TestHealUnsupportedHolderDefersWithoutBreaker pins the heal loop's side of the
+// feature gate: a holder missing a required capability defers the remount
+// indefinitely — no hazard strikes, no symlink retreat — and the row mounts on
+// its own once the cask upgrade lands.
+func TestHealUnsupportedHolderDefersWithoutBreaker(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = fmt.Errorf("%w: holder v0.22.1 needs %s or newer; run `brew upgrade --cask fusekit-holder`",
-		pool.ErrHolderUnmitigated, pool.MinHolderVersion)
+	fake.setupErr = fmt.Errorf("%w: holder v0.9.0 lacks feature \"mux\"; `brew upgrade --cask fusekit-holder`",
+		pool.ErrHolderUnsupported)
 
-	var unmounts int
-	swapForceUnmount(t, func(string) error { unmounts++; return nil })
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
 	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold+2)
 
 	if got := kindOf(t, s, 1); got != "nfs" {
-		t.Fatalf("row kind = %q, want fuse (an unmitigated holder must never demote the row)", got)
+		t.Fatalf("row kind = %q, want fuse (an unsupported holder must never demote the row)", got)
 	}
 	if got := remountHazard(s, dirs[1]); got != 0 {
 		t.Fatalf("hazard count = %d, want 0 (the wedged breaker must be unreachable while waiting on the cask upgrade)", got)
 	}
 	if got := fake.teardownCount(); got != 0 {
 		t.Fatalf("teardowns = %d, want 0", got)
-	}
-	if unmounts != 0 {
-		t.Fatalf("force-unmounts = %d, want 0", unmounts)
 	}
 	if !strings.Contains(buf.String(), "brew upgrade --cask fusekit-holder") {
 		t.Fatalf("cask-upgrade hint not surfaced in the log:\n%s", buf.String())
@@ -707,14 +644,8 @@ func TestRemountBreakerHoldsUnderThreshold(t *testing.T) {
 	fake.setupErr = mountTimeoutChain()
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
-	var unmounts int
-	swapForceUnmount(t, func(string) error { unmounts++; return nil })
-
 	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold-1)
 
-	if unmounts != 0 {
-		t.Fatalf("force-unmounts under the threshold = %d, want 0", unmounts)
-	}
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind under the threshold = %q, want fuse (still retrying)", got)
 	}
@@ -731,9 +662,6 @@ func TestRemountBreakerResetsOnMount(t *testing.T) {
 	s.holderSocket = startCannedHolder(t, nil)
 	fake.setupErr = mountTimeoutChain()
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
-
-	var unmounts int
-	swapForceUnmount(t, func(string) error { unmounts++; return nil })
 
 	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold-2)
 	if got := remountHazard(s, dirs[1]); got != remountBreakerThreshold-2 {
@@ -754,9 +682,6 @@ func TestRemountBreakerResetsOnMount(t *testing.T) {
 	if got := remountHazard(s, dirs[1]); got != 1 {
 		t.Fatalf("hazard after a fresh failure = %d, want 1 (reset by the recovery)", got)
 	}
-	if unmounts != 0 {
-		t.Fatalf("force-unmounts across a recovering row = %d, want 0", unmounts)
-	}
 }
 
 // TestWedgeBreakerNeverEscalatesTCCRow pins that a TCC-blocked row (a clean
@@ -769,17 +694,11 @@ func TestWedgeBreakerNeverEscalatesTCCRow(t *testing.T) {
 	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive) // healTCCBlocked
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
-	var unmounts int
-	swapForceUnmount(t, func(string) error { unmounts++; return nil })
-
 	// One short of the grant grace — already past the wedged breaker's
 	// threshold (tccBreakerThreshold > remountBreakerThreshold).
 	ticks := tccBreakerThreshold - 1
 	driveRetryTicks(t, s, dirs[1], ticks)
 
-	if unmounts != 0 {
-		t.Fatalf("TCC-blocked row force-unmounted %d time(s); the wedged breaker must never fire on it", unmounts)
-	}
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("TCC-blocked row kind = %q, want fuse (still within the grant grace)", got)
 	}
@@ -862,9 +781,6 @@ func TestTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
 	fakeOverlayMounted(t, func(string) bool { return false })
 
-	var unmounts int
-	swapForceUnmount(t, func(string) error { unmounts++; return nil })
-
 	driveRetryTicks(t, s, dirs[1], tccBreakerThreshold-1)
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind one short of the grace = %q, want fuse (still waiting on the grant)", got)
@@ -887,9 +803,6 @@ func TestTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 	if got := s.holder.wireStatus().TCCError; got != "" {
 		t.Fatalf("late grant left stale TCC guidance %q; a live mount must clear it", got)
 	}
-	if unmounts != 0 {
-		t.Fatalf("force-unmounts across a late-granted row = %d, want 0", unmounts)
-	}
 }
 
 // TestTCCBreakerThreshold pins the TCC grace const guard: a pending grant (a
@@ -910,8 +823,6 @@ func TestAlternatingHazardTCCTripsNeitherBreaker(t *testing.T) {
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
-	var unmounts int
-	swapForceUnmount(t, func(string) error { unmounts++; return nil })
 
 	ticks := 2 * (remountBreakerThreshold + tccBreakerThreshold)
 	for i := 0; i < ticks; i++ {
@@ -924,9 +835,6 @@ func TestAlternatingHazardTCCTripsNeitherBreaker(t *testing.T) {
 		healTick(t.Context(), s)
 	}
 
-	if unmounts != 0 {
-		t.Fatalf("force-unmounts on an alternating row = %d, want 0 (neither breaker may trip)", unmounts)
-	}
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind after alternating outcomes = %q, want fuse (no escalation)", got)
 	}
@@ -974,7 +882,6 @@ func TestConsecutiveLaneOutcomesEscalateAtExactThreshold(t *testing.T) {
 			fake.setupErr = tc.setupErr
 			mounted := tc.mounted
 			fakeOverlayMounted(t, func(dir string) bool { return mounted && dir == dirs[1] })
-			swapForceUnmount(t, func(string) error { return nil })
 			var buf bytes.Buffer
 			s.log = log.New(&buf, "", 0)
 
@@ -1020,20 +927,17 @@ func TestHealFuseMountFailedRetreatsImmediately(t *testing.T) {
 	}
 }
 
-// TestHealFuseForeignRootSweepsAndRetries pins finding 7b: a mux subtree whose
-// Setup hits a foreign carcass at the SHARED ROOT is classified as a retry that
-// triggers the pool-idle-gated root sweep — never the fallbackToSymlink default
-// (which would irreversibly demote the whole pool over a registry-state error).
-func TestHealFuseForeignRootSweepsAndRetries(t *testing.T) {
+// TestHealFuseForeignRootRetries pins that a mux subtree whose Setup hits a
+// foreign mount at the SHARED ROOT is classified as a retry (registry state),
+// never the fallbackToSymlink default — the holder clears its own dead carcasses
+// on mount, so the daemon never demotes the pool over a foreign-root error.
+func TestHealFuseForeignRootRetries(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	a := flipToFuse(t, s, 1)
 	makeBridge(t, dirs[1])
 	root := pool.MuxRootDir()
 	fake.setupErr = fmt.Errorf("mount %s: %w", dirs[1], mountd.ErrForeignMount)
-	// The shared root reads mounted (the foreign carcass); the account dir is a bridge.
 	fakeOverlayMounted(t, func(d string) bool { return d == root })
-	var unmounted []string
-	swapForceUnmount(t, func(d string) error { unmounted = append(unmounted, d); return nil })
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
@@ -1041,24 +945,15 @@ func TestHealFuseForeignRootSweepsAndRetries(t *testing.T) {
 		t.Fatalf("healFuse outcome = %d, want healRetry (%d): a foreign root is registry state, never a demotion", got, healRetry)
 	}
 	if kindOf(t, s, 1) != "nfs" {
-		t.Fatal("row demoted to symlink over a foreign-root carcass")
+		t.Fatal("row demoted to symlink over a foreign-root mount")
 	}
-	swept := false
-	for _, d := range unmounted {
-		if d == root {
-			swept = true
-		}
-	}
-	if !swept {
-		t.Fatalf("foreign-root carcass not swept: force-unmount calls %v", unmounted)
-	}
-	if !strings.Contains(buf.String(), "foreign carcass at the shared mux root") {
-		t.Fatalf("foreign-root sweep not surfaced:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "foreign mount at the shared root") {
+		t.Fatalf("foreign-root retry not surfaced:\n%s", buf.String())
 	}
 }
 
 // TestRetreatAllFuseRowsConvertsPoolToSymlink pins the whole-pool retreat:
-// retreatAllFuseRows force-unmounts and converts every fuse row to symlink.
+// retreatAllFuseRows converts every fuse row to symlink.
 func TestRetreatAllFuseRowsConvertsPoolToSymlink(t *testing.T) {
 	s, _, _ := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -1083,15 +978,14 @@ func TestRetreatAllFuseRowsConvertsPoolToSymlink(t *testing.T) {
 	}
 }
 
-// TestRetreatBailsOnWedgedForceUnmount pins the wedged-unmount guard
-// (convertRowToSymlink): a forced unmount that never completes leaves the row
-// fuse, since ConvertOverlay's Teardown would otherwise re-spawn the very holder
-// being retreated from.
-func TestRetreatBailsOnWedgedForceUnmount(t *testing.T) {
-	s, dirs, _ := newHealServer(t)
+// TestRetreatBailsOnWedgedTeardown pins the wedged-unmount guard
+// (convertRowToSymlink): a holder teardown that wedges leaves the row fuse rather
+// than converting through a mount that never came down.
+func TestRetreatBailsOnWedgedTeardown(t *testing.T) {
+	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
-	swapForceUnmount(t, func(string) error { return errors.New("force-unmount timed out") })
+	fake.teardownErr = errors.New("unmount wedged")
 
 	fuse, err := s.fuseAccounts()
 	if err != nil {
@@ -1100,7 +994,7 @@ func TestRetreatBailsOnWedgedForceUnmount(t *testing.T) {
 	s.retreatAllFuseRows(t.Context(), fuse, "child crash-looped")
 
 	if got := kindOf(t, s, 1); got != "nfs" {
-		t.Fatalf("acct-01 kind = %q, want fuse (a wedged force-unmount must NOT convert through a re-spawning Teardown)", got)
+		t.Fatalf("acct-01 kind = %q, want fuse (a wedged teardown must NOT convert)", got)
 	}
 }
 
@@ -1180,78 +1074,19 @@ func TestReconcileCapabilityGateProceedsWhenProbePending(t *testing.T) {
 	}
 }
 
-// TestSweepOrphanMountpointsClearsNonRowCarcass pins the startup orphan sweep: a
-// mountpoint under the accounts dir owned by no row (a pre-row `ccp add` carcass)
-// is force-unmounted, while a current row's dir is left to reconcile/heal.
-func TestSweepOrphanMountpointsClearsNonRowCarcass(t *testing.T) {
-	s, _, _ := newMigrateServer(t) // sets HOME to a temp dir, so AccountsDir() is hermetic
-	if err := os.MkdirAll(pool.AccountsDir(), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	rowDir := filepath.Join(pool.AccountsDir(), "acct-01")
-	orphan := filepath.Join(pool.AccountsDir(), "acct-07")
-	for _, d := range []string{rowDir, orphan} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Every accounts/ dir reads mounted, but not the shared mux root — this test
-	// pins the per-dir carcass sweep, not the mux-root sweep.
-	fakeOverlayMounted(t, func(dir string) bool { return dir != pool.MuxRootDir() })
-	var unmounted []string
-	swapForceUnmount(t, func(dir string) error {
-		unmounted = append(unmounted, dir)
-		return nil
-	})
-
-	s.sweepOrphanMountpoints(t.Context(), []store.Account{{ID: 1, ConfigDir: rowDir, OverlayKind: "nfs"}})
-
-	if len(unmounted) != 1 || unmounted[0] != orphan {
-		t.Fatalf("force-unmounted %v, want exactly the non-row orphan %q (the row dir must be left alone)", unmounted, orphan)
-	}
-}
-
-// TestLiveSessionGate pins the shared force-unmount precondition: sessions on
-// the dir read busy with their count, and a scan failure fails closed to busy.
-func TestLiveSessionGate(t *testing.T) {
-	const dir = "/pool/acct-01"
-	tests := []struct {
-		name     string
-		sessions []procscan.Session
-		scanErr  error
-		wantBusy bool
-		wantN    int
-	}{
-		{name: "sessions on the dir are busy with their count", sessions: []procscan.Session{{PID: 1, ConfigDir: dir}, {PID: 2, ConfigDir: dir}}, wantBusy: true, wantN: 2},
-		{name: "a session elsewhere is idle", sessions: []procscan.Session{{PID: 1, ConfigDir: "/pool/acct-02"}}, wantBusy: false, wantN: 0},
-		{name: "no sessions is idle", sessions: nil, wantBusy: false, wantN: 0},
-		{name: "a scan failure fails closed to busy", scanErr: errors.New("ps exploded"), wantBusy: true, wantN: 0},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			s, _, _ := newHealServer(t)
-			s.scanSessions = func(context.Context) ([]procscan.Session, error) { return tc.sessions, tc.scanErr }
-			busy, n := s.liveSessionGate(t.Context(), dir)
-			if busy != tc.wantBusy || n != tc.wantN {
-				t.Fatalf("liveSessionGate = (%v, %d), want (%v, %d)", busy, n, tc.wantBusy, tc.wantN)
-			}
-		})
-	}
-}
-
-// TestHealLoopUnmountGate pins mountFuse's teardown-before-remount gate: a
-// mounted-but-dead mirror is torn down and remounted only when idle; under a
-// live session — or a failed scan — it is left mounted with no hazard strike.
+// TestHealLoopUnmountGate pins mountFuse's teardown-before-remount step in v2: a
+// mounted-but-dead mirror is torn down and remounted when its lease is free, and
+// a held lease (the holder's teardown answers ErrBusy) leaves it mounted with no
+// hazard strike — the lease, not a ps scan, is the gate.
 func TestHealLoopUnmountGate(t *testing.T) {
 	tests := []struct {
 		name          string
-		scanKind      string
+		teardownErr   error
 		wantTeardowns int
 		wantSetups    int
 	}{
-		{name: "idle mirror is torn down and remounted", scanKind: "idle", wantTeardowns: 1, wantSetups: 1},
-		{name: "busy mirror is left mounted", scanKind: "busy", wantTeardowns: 0, wantSetups: 0},
-		{name: "scan failure leaves it mounted", scanKind: "err", wantTeardowns: 0, wantSetups: 0},
+		{name: "a free lease is torn down and remounted", teardownErr: nil, wantTeardowns: 1, wantSetups: 1},
+		{name: "a held lease answers ErrBusy and leaves it mounted", teardownErr: mountd.ErrBusy, wantTeardowns: 1, wantSetups: 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1260,17 +1095,8 @@ func TestHealLoopUnmountGate(t *testing.T) {
 			s.holderSocket = startCannedHolder(t, nil)
 			// Mounted-but-dead: mountFuse enters the teardown-before-remount branch.
 			fake.healthErr = errors.New("mirror is dead")
+			fake.teardownErr = tc.teardownErr
 			fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
-			switch tc.scanKind {
-			case "idle":
-				s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
-			case "busy":
-				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-					return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-				}
-			case "err":
-				s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, errors.New("ps exploded") }
-			}
 
 			driveRetryTicks(t, s, dirs[1], 1)
 
@@ -1280,8 +1106,6 @@ func TestHealLoopUnmountGate(t *testing.T) {
 			if got := fake.setupCount(); got != tc.wantSetups {
 				t.Fatalf("setups = %d, want %d", got, tc.wantSetups)
 			}
-			// Idle drops the ledger; deferred backs off without a strike — the
-			// hazard never accrues either way.
 			if got := remountHazard(s, dirs[1]); got != 0 {
 				t.Fatalf("hazard = %d, want 0", got)
 			}
@@ -1289,18 +1113,14 @@ func TestHealLoopUnmountGate(t *testing.T) {
 	}
 }
 
-// TestRetreatDefersUnderLiveSessionWhenMounted pins the retreat gate
-// (convertRowToSymlink, via retreatAllFuseRows): a live mountpoint with a live
-// session stays fuse, never force-unmounted.
-func TestRetreatDefersUnderLiveSessionWhenMounted(t *testing.T) {
-	s, dirs, _ := newHealServer(t)
+// TestRetreatDefersUnderBusyMirror pins the retreat gate (convertRowToSymlink,
+// via retreatAllFuseRows): a mirror whose holder teardown answers ErrBusy (a live
+// session holds its lease) stays fuse, never converted out from under the session.
+func TestRetreatDefersUnderBusyMirror(t *testing.T) {
+	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-	}
-	var unmounts int
-	swapForceUnmount(t, func(string) error { unmounts++; return nil })
+	fake.teardownErr = mountd.ErrBusy
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 
@@ -1310,71 +1130,10 @@ func TestRetreatDefersUnderLiveSessionWhenMounted(t *testing.T) {
 	}
 	s.retreatAllFuseRows(t.Context(), fuse, "child crash-looped")
 
-	if unmounts != 0 {
-		t.Fatalf("retreat force-unmounted a busy mounted mirror %d time(s), want 0 (would panic the kernel)", unmounts)
-	}
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind after a deferred retreat = %q, want fuse (left mounted)", got)
 	}
 	if !strings.Contains(buf.String(), "symlink retreat deferred") {
-		t.Fatalf("deferral not surfaced in the log:\n%s", buf.String())
-	}
-}
-
-// TestSweepOrphanDefersUnderLiveSession pins that a rowless mountpoint a live
-// claude is still bound to is not yet a carcass: the sweep leaves it mounted.
-func TestSweepOrphanDefersUnderLiveSession(t *testing.T) {
-	s, _, _ := newMigrateServer(t)
-	if err := os.MkdirAll(pool.AccountsDir(), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	orphan := filepath.Join(pool.AccountsDir(), "acct-07")
-	if err := os.MkdirAll(orphan, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	// The per-dir carcass reads mounted, but not the shared mux root — this test
-	// pins the per-dir sweep's live-session deferral.
-	fakeOverlayMounted(t, func(dir string) bool { return dir != pool.MuxRootDir() })
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: orphan}}, nil
-	}
-	var unmounted []string
-	swapForceUnmount(t, func(dir string) error {
-		unmounted = append(unmounted, dir)
-		return nil
-	})
-
-	s.sweepOrphanMountpoints(t.Context(), nil)
-
-	if len(unmounted) != 0 {
-		t.Fatalf("swept a busy orphan carcass %v, want none (force-unmounting a busy NFS mirror panics)", unmounted)
-	}
-}
-
-// TestReconcileStaleMountpointDefersUnderLiveSession pins that a symlink row whose
-// dir is unexpectedly a live mountpoint (aborted-rollback wreckage) is force-cleared
-// only when idle; with a live claude bound, reconcileAccount leaves it.
-func TestReconcileStaleMountpointDefersUnderLiveSession(t *testing.T) {
-	s, dirs, _ := newMigrateServer(t) // acct-1 is a symlink row
-	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-	}
-	var unmounts int
-	swapForceUnmount(t, func(string) error { unmounts++; return nil })
-	var buf bytes.Buffer
-	s.log = log.New(&buf, "", 0)
-
-	a, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.reconcileAccount(t.Context(), a)
-
-	if unmounts != 0 {
-		t.Fatalf("reconcile force-unmounted a busy stale mountpoint %d time(s), want 0 (would panic the kernel)", unmounts)
-	}
-	if !strings.Contains(buf.String(), "stale mountpoint left under") {
 		t.Fatalf("deferral not surfaced in the log:\n%s", buf.String())
 	}
 }

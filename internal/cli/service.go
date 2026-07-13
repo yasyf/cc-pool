@@ -350,10 +350,13 @@ func reclaimHolderMounts(cmd *cobra.Command) {
 	if !cl.Available() {
 		return
 	}
-	failed, err := cl.Reclaim()
+	failed, warning, err := cl.Reclaim()
 	if err != nil {
 		warn(errOut, "release mount-holder mounts: %v", err)
 		return
+	}
+	if warning != "" {
+		warn(errOut, "mount-holder reclaim persist-warning: %s", warning)
 	}
 	for _, mi := range failed {
 		warn(errOut, "the mount holder couldn't unmount %s", mi.Dir)
