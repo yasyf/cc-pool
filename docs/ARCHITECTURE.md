@@ -143,7 +143,7 @@ reconcile tick is the floor when a notify is missed.
 
 **One secret path.** The daemon serves synckit's consumer contract on a second socket,
 `~/.cc-pool/sync.sock`, and that dispatcher carries exactly one custom method:
-`ccp.fetch_credential`. Credentials transit peer RPC — over SSH via the hidden
+`ccp.fetch_stripped_credential`. Credentials transit peer RPC — over SSH via the hidden
 `ccp sync rpc-serve` stdio bridge — only during a pull, and land directly in the
 receiving host's Keychain. A host whose login Keychain is unsearchable (headless SSH)
 falls back to the plaintext file store; `ccp sync status` flags the exposure.

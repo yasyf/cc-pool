@@ -49,7 +49,7 @@ func (c serverClaims) TryClaim(uuid string) (func(), bool) {
 var _ hostsync.Claims = serverClaims{}
 
 // startSyncServer stands up the daemon's second socket — the SyncConsumer
-// contract plus ccp.fetch_credential — on a wg-tracked goroutine, returning
+// contract plus the credential fetch method — on a wg-tracked goroutine, returning
 // once the socket is bound; the broader sync setup wires the rest of the Service.
 func (s *Server) startSyncServer(ctx context.Context, svc *hostsync.Service) error {
 	svc.Claims = newServerClaims(s)

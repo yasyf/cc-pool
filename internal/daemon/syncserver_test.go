@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,7 +33,9 @@ func hasMethod(ms []string, want string) bool {
 
 // TestSyncSocketServesConsumer stands up the real second socket and round-trips
 // both a contract method (svc.capabilities) and the custom credential fetch
-// (ccp.fetch_credential) over a unix client, and pins the 0600 socket mode.
+// over a unix client, pins the 0600 socket mode, and pins that v1's
+// ccp.fetch_credential (which served the full refresh-token-bearing blob) is
+// NOT registered — a downrev peer gets unknown-method, never a credential.
 func TestSyncSocketServesConsumer(t *testing.T) {
 	// macOS caps sun_path at 104 bytes; t.TempDir paths overflow it.
 	sockDir, err := os.MkdirTemp("/tmp", "ccp-sync")
@@ -114,6 +117,22 @@ func TestSyncSocketServesConsumer(t *testing.T) {
 	}
 	if bad.OK {
 		t.Error("fetch_credential for an unknown uuid returned OK")
+	}
+
+	// The v1 method name must never be answered: a v1 peer calling it against
+	// this v2 server gets a clean unknown-method error and no payload.
+	legacy, err := tx.Do(ctx, &rpc.Request{Method: "ccp.fetch_credential", Params: map[string]any{"uuid": "u-sock"}})
+	if err != nil {
+		t.Fatalf("v1 fetch Do: %v", err)
+	}
+	if legacy.OK {
+		t.Fatal("the v2 server answered v1's ccp.fetch_credential")
+	}
+	if !strings.Contains(legacy.Error, "unknown method") {
+		t.Errorf("v1 fetch error = %q, want an unknown-method rejection", legacy.Error)
+	}
+	if payload := string(legacy.Result); payload != "" && payload != "null" {
+		t.Errorf("v1 fetch carried a result payload: %s", payload)
 	}
 }
 

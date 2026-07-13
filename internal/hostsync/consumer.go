@@ -47,7 +47,7 @@ func (c *Consumer) gate() error {
 	return nil
 }
 
-// Capabilities advertises the sync contract plus the ccp.fetch_credential method.
+// Capabilities advertises the sync contract plus the credential fetch method.
 func (c *Consumer) Capabilities(_ context.Context) (syncservice.Capabilities, error) {
 	if err := c.gate(); err != nil {
 		return syncservice.Capabilities{}, err

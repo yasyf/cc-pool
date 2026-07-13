@@ -18,8 +18,11 @@ import (
 
 // MethodFetchCredential is the credential fetch RPC — the only path a
 // credential ever crosses between hosts, always stripped of its refresh
-// token; namespaced under ccp. clear of the svc.* contract.
-const MethodFetchCredential = "ccp.fetch_credential" //nolint:gosec // G101: a JSON-RPC method name, not a credential
+// token; namespaced under ccp. clear of the svc.* contract. The name is
+// deliberately NOT v1's "ccp.fetch_credential", which served the full
+// refresh-token-bearing blob: a v2 client against a v1 origin (or vice versa)
+// gets unknown-method, so a secret can never cross a mixed-version pair.
+const MethodFetchCredential = "ccp.fetch_stripped_credential" //nolint:gosec // G101: a JSON-RPC method name, not a credential
 
 // FetchTimeout bounds each per-peer fetch attempt; a var so tests shrink it.
 var FetchTimeout = 15 * time.Second
