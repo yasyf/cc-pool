@@ -90,8 +90,8 @@ func run(busy bool) error {
 		Status:   converge.NewPeerStatus(),
 		Fetcher:  hostsync.NewSSHFetcher(),
 	}
-	pull := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, localExpiresAt int64, localHash string, peers []string) (*creds.Credential, error) {
-		return hostsync.FetchCredential(ctx, hostsync.PeerTransport, uuid, chain, localExpiresAt, localHash, peers)
+	pull := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, localExpiresAt int64, peers []string) (*creds.Credential, error) {
+		return hostsync.FetchCredential(ctx, hostsync.PeerTransport, uuid, chain, localExpiresAt, peers)
 	}
 	svc.Driver = hostsync.NewDriver(svc, hostsync.DriverDeps{
 		Store:      m.Store,
@@ -99,7 +99,7 @@ func run(busy bool) error {
 		LocalIndex: hostsync.ManagerLocalIndex(m),
 		Materialize: func(ctx context.Context, v hostsync.AccountValue, peers []string) (hostsync.MaterializeResult, error) {
 			noLocal := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, peers []string) (*creds.Credential, error) {
-				return pull(ctx, uuid, chain, 0, "", peers)
+				return pull(ctx, uuid, chain, 0, peers)
 			}
 			return svc.Materialize(ctx, v, peers, noLocal, manifestPath)
 		},

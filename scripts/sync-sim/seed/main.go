@@ -1,19 +1,20 @@
 // Command seed fabricates and mutates file-backend pool accounts for the
 // two-host sync sim (scripts/sync-sim/run.sh). It drives cc-pool's own
 // packages — store.Open, creds.FileStore, the pool identity writers, and
-// hostsync.Service — so the fabricated state matches what a real `ccp add`
-// plus `claude /login` would leave on disk, minus any real token or Keychain
-// item. Every path resolves off $HOME, so the caller points HOME at
-// /tmp/ccp-sim/{a,b}. It never talks to the network or the Keychain.
+// hostsync — so the fabricated state matches what a real `ccp add` plus
+// `claude /login` would leave on disk, minus any real token or Keychain item.
+// Every path resolves off $HOME, so the caller points HOME at /tmp/ccp-sim/{a,b}.
+// It never talks to the real network or the Keychain.
 //
 // Subcommands:
 //
 //	seed init                     set the initialized + symlink-overlay meta, make ~/.claude base
 //	seed account --id N ...       fabricate a logged-in file-backend account (row uuid left empty)
-//	seed rotate  --id N ...       rotate the chain in place: new tokens/expiry
-//	seed publish --id N           force-publish (PublishAccount) — the tombstone-override re-add intent
-//	seed hash    --id N           print the current credential's CredentialHash
+//	seed rotate  --id N ...       write a fresh OWNED chain in place (models a login/rotation on this host)
+//	seed setexp  --id N ...       rewrite the credential's expiresAt in place, tokens preserved
+//	seed hash    --id N           print the current credential's AccessHash
 //	seed rowuuid --id N           print the account row's stored account_uuid
+//	seed wirecap --peer P --uuid U  fetch U's stripped envelope from peer P and print the raw wire bytes
 package main
 
 import (
@@ -30,12 +31,12 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/synckit/hostregistry"
+	"github.com/yasyf/synckit/rpc"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal(fmt.Errorf("usage: seed <init|account|rotate|publish|hash|rowuuid> [flags]"))
+		fatal(fmt.Errorf("usage: seed <init|account|rotate|setexp|hash|rowuuid|wirecap> [flags]"))
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 	var err error
@@ -46,12 +47,14 @@ func main() {
 		err = cmdAccount(args)
 	case "rotate":
 		err = cmdRotate(args)
-	case "publish":
-		err = cmdPublish(args)
+	case "setexp":
+		err = cmdSetExp(args)
 	case "hash":
 		err = cmdHash(args)
 	case "rowuuid":
 		err = cmdRowUUID(args)
+	case "wirecap":
+		err = cmdWireCap(args)
 	default:
 		err = fmt.Errorf("unknown subcommand %q", cmd)
 	}
@@ -169,12 +172,14 @@ func cmdAccount(args []string) error {
 	if err := m.Store.UpsertAccount(acct); err != nil {
 		return fmt.Errorf("upsert account row: %w", err)
 	}
-	fmt.Printf("seeded acct-%02d uuid=%s hash=%s\n", *id, *uuid, creds.CredentialHash(cred))
+	fmt.Printf("seeded acct-%02d uuid=%s hash=%s\n", *id, *uuid, creds.AccessHash(cred))
 	return nil
 }
 
-// cmdRotate rotates an account's chain in place: new tokens/expiry written to
-// the file store — what a real refresh leaves on disk.
+// cmdRotate writes a fresh OWNED chain in place: new tokens/expiry to the file
+// store, refresh token present. On a host that currently holds a synced (peer)
+// copy this models `ccp login` minting the host its own origin chain; on the
+// origin it models an out-of-band rotation.
 func cmdRotate(args []string) error {
 	fs := flag.NewFlagSet("rotate", flag.ExitOnError)
 	id := fs.Int("id", 1, "account index")
@@ -195,69 +200,31 @@ func cmdRotate(args []string) error {
 	if err := fstore.Write(next); err != nil {
 		return fmt.Errorf("write rotated credential: %w", err)
 	}
-	fmt.Printf("rotated acct-%02d hash=%s\n", *id, creds.CredentialHash(next))
+	fmt.Printf("rotated acct-%02d hash=%s\n", *id, creds.AccessHash(next))
 	return nil
 }
 
-// cmdPublish force-publishes an account to the shared registry, mirroring
-// cli.syncPublisher.Publish: PublishAccount (the explicit re-add intent that
-// overrides a tombstone) then a stamp touch. Stands in for `ccp add`'s publish
-// hook, which the sim cannot reach without an interactive `claude /login`.
-func cmdPublish(args []string) error {
-	fs := flag.NewFlagSet("publish", flag.ExitOnError)
+// cmdSetExp rewrites the credential's expiresAt in place, preserving both
+// tokens: near-expiry to force the origin's refresh, or past to expire a
+// synced peer copy. A synced blob stays synced (no refresh token reappears).
+func cmdSetExp(args []string) error {
+	fs := flag.NewFlagSet("setexp", flag.ExitOnError)
 	id := fs.Int("id", 1, "account index")
+	expiresMS := fs.Int64("expires-ms", 0, "new expiresAt, unix millis")
 	_ = fs.Parse(args)
-
-	m, err := pool.Open()
+	if *expiresMS == 0 {
+		return fmt.Errorf("setexp needs --expires-ms")
+	}
+	fstore := creds.FileStore{ConfigDir: pool.AccountDir(*id)}
+	cur, err := fstore.Read()
 	if err != nil {
-		return err
+		return fmt.Errorf("read current credential: %w", err)
 	}
-	defer func() { _ = m.Close() }()
-
-	a, err := m.Store.GetAccount(*id)
-	if err != nil {
-		return err
+	cur.ClaudeAiOauth.ExpiresAt = *expiresMS
+	if err := fstore.Write(cur); err != nil {
+		return fmt.Errorf("write re-expired credential: %w", err)
 	}
-	backend, err := fkoverlay.Parse(a.OverlayKind)
-	if err != nil {
-		return err
-	}
-	raw, ident, err := pool.AccountOAuth(backend, a.ConfigDir)
-	if err != nil {
-		return fmt.Errorf("read identity: %w", err)
-	}
-	cred, _, err := m.ReadCredential(a)
-	if err != nil {
-		return fmt.Errorf("read credential: %w", err)
-	}
-
-	self, err := meshSelf()
-	if err != nil {
-		return err
-	}
-	rf := hostsync.NewRegistryFile(pool.SyncDir())
-	svc := &hostsync.Service{Registry: rf, StampDir: pool.SyncStampsDir()}
-	v := hostsync.AccountValue{
-		UUID:         ident.AccountUUID,
-		Email:        ident.EmailAddress,
-		Label:        a.Label,
-		OAuthAccount: raw,
-		Chain: hostsync.ChainStamp{
-			ExpiresAt: cred.ClaudeAiOauth.ExpiresAt,
-			Hash:      creds.CredentialHash(cred),
-			Holder:    self,
-			RotatedAt: time.Now().UnixMilli(),
-		},
-	}
-	if err := svc.PublishAccount(context.Background(), v); err != nil {
-		return fmt.Errorf("publish: %w", err)
-	}
-	if a.AccountUUID != ident.AccountUUID {
-		if err := m.Store.SetAccountUUID(a.ID, ident.AccountUUID); err != nil {
-			return fmt.Errorf("tag row uuid: %w", err)
-		}
-	}
-	fmt.Printf("published acct-%02d uuid=%s holder=%s\n", *id, ident.AccountUUID, self)
+	fmt.Printf("setexp acct-%02d expiresAt=%d hash=%s\n", *id, *expiresMS, creds.AccessHash(cur))
 	return nil
 }
 
@@ -269,7 +236,7 @@ func cmdHash(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Print(creds.CredentialHash(cred))
+	fmt.Print(creds.AccessHash(cred))
 	return nil
 }
 
@@ -290,6 +257,34 @@ func cmdRowUUID(args []string) error {
 	return nil
 }
 
+// cmdWireCap issues the raw credential-fetch RPC to a peer and prints the exact
+// envelope bytes that crossed the wire, so the harness can prove the origin's
+// stripped envelope carries no refresh token. It bypasses FetchCredential's
+// verification on purpose — the goal is the unfiltered wire payload.
+func cmdWireCap(args []string) error {
+	fs := flag.NewFlagSet("wirecap", flag.ExitOnError)
+	peer := fs.String("peer", "", "peer transport string (exec:... or ssh target)")
+	uuid := fs.String("uuid", "", "account uuid to fetch")
+	_ = fs.Parse(args)
+	if *peer == "" || *uuid == "" {
+		return fmt.Errorf("wirecap needs --peer and --uuid")
+	}
+	tx := hostsync.PeerTransport(*peer)
+	defer func() { _ = tx.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	resp, err := tx.Do(ctx, &rpc.Request{Method: hostsync.MethodFetchCredential, Params: map[string]any{"uuid": *uuid}})
+	if err != nil {
+		return fmt.Errorf("fetch %s from peer: %w", *uuid, err)
+	}
+	if !resp.OK {
+		return fmt.Errorf("peer refused fetch: %s", resp.Error)
+	}
+	_, _ = os.Stdout.Write(resp.Result)
+	fmt.Println()
+	return nil
+}
+
 func makeCred(access, refresh string, expiresMS int64) *creds.Credential {
 	return &creds.Credential{ClaudeAiOauth: creds.OAuth{
 		AccessToken:      access,
@@ -297,17 +292,4 @@ func makeCred(access, refresh string, expiresMS int64) *creds.Credential {
 		ExpiresAt:        expiresMS,
 		SubscriptionType: "max",
 	}}
-}
-
-// meshSelf resolves this host's registry identity from the hand-written synckit
-// state.json (self), the same string peers dial as the chain holder.
-func meshSelf() (string, error) {
-	reg, err := hostregistry.Mesh.Load()
-	if err != nil {
-		return "", fmt.Errorf("load mesh: %w", err)
-	}
-	if reg.Self == "" {
-		return "", fmt.Errorf("mesh self is empty (write state.json first)")
-	}
-	return reg.Self, nil
 }
