@@ -234,7 +234,8 @@ func (s *Service) NoteCredWrite(ctx context.Context, uuid string, chain ChainSta
 
 // ScanPublish folds this host's local accounts into reg in place (no I/O, no
 // stamp touches) and reports whether anything changed; it never resurrects a
-// tombstone and never overwrites a peer-set oauthAccount.
+// tombstone, never overwrites a peer-set oauthAccount, and never creates an
+// entry for an account this host doesn't own (a zero chain yields to peers).
 func (s *Service) ScanPublish(ctx context.Context, reg Registry) (bool, error) {
 	locals, err := s.Locals(ctx)
 	if err != nil {
@@ -244,6 +245,12 @@ func (s *Service) ScanPublish(ctx context.Context, reg Registry) (bool, error) {
 	for _, l := range locals {
 		entry, ok := reg[l.UUID]
 		switch {
+		case !ok && l.Chain.Origin == "":
+			// A synced-only account (zero chain — this host doesn't own it) with
+			// no registry entry is a cold start: seeding a fresh zero-chain entry
+			// would beat the origin's live chain in the whole-value LWW merge.
+			// The origin's entry arrives by merge instead.
+			continue
 		case !ok:
 			reg.Add(l.UUID, AccountValue{
 				UUID:         l.UUID,

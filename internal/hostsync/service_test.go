@@ -421,6 +421,38 @@ func TestScanPublishFresherChainOnly(t *testing.T) {
 	}
 }
 
+// TestScanPublishSyncedOnlyNeverSeedsZeroChain pins the cold-start guard: a
+// host holding only a synced copy (zero chain) creates no registry entry, so
+// its fresh add stamp can never erase a peer origin's live chain in the merge.
+func TestScanPublishSyncedOnlyNeverSeedsZeroChain(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestService(t)
+	s.Locals = func(context.Context) ([]LocalAccount, error) {
+		return []LocalAccount{{UUID: "u1", Email: "e", Label: "l", Chain: ChainStamp{}}}, nil
+	}
+	reg := cregistry.New[AccountValue]()
+
+	changed, err := s.ScanPublish(ctx, reg)
+	if err != nil {
+		t.Fatalf("ScanPublish: %v", err)
+	}
+	if changed {
+		t.Fatal("ScanPublish reported a change for a synced-only account")
+	}
+	if _, ok := reg["u1"]; ok {
+		t.Fatalf("ScanPublish seeded an entry for an unowned account: %+v", reg["u1"])
+	}
+
+	// The hazard this closes: the peer origin's older-stamped live chain must
+	// survive the merge, which a fresh zero-chain add would have erased.
+	peer := cregistry.New[AccountValue]()
+	peer.Add("u1", acctVal("u1", "e", "l", "hostA", 5000), cregistry.Micros(100))
+	merged := cregistry.Merge(reg, peer)
+	if got := merged["u1"].Value.Chain; got.Origin != "hostA" || got.ExpiresAt != 5000 {
+		t.Fatalf("merged chain = %+v, want the peer origin's live chain intact", got)
+	}
+}
+
 func TestScanPublishNeverResurrectsTombstone(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTestService(t)
