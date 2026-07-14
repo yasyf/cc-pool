@@ -69,7 +69,8 @@ var PrivatePatterns = []string{"*.lock"}
 //   - .claude.json and its atomic-write temp siblings (.claude.json.tmp.XXXX);
 //   - .credentials.json and siblings: sharing would let a pool account adopt and
 //     rotate plain claude's login, which the pool must never do;
-//   - .last-update-result.json, remote-settings.json, and mcp-needs-auth-cache.json
+//   - .last-update-result.json, remote-settings.json, mcp-needs-auth-cache.json,
+//     stats-cache.json, and policy-limits.json
 //     (and temp siblings): claude rewrites these atomically, clobbering the overlay
 //     symlink Sync would otherwise refuse to relink. mcp-needs-auth-cache.json is
 //     per-account MCP auth state — sharing it would cross one account's server
@@ -85,6 +86,8 @@ func PrivateEntry(name string) bool {
 		strings.HasPrefix(name, ".last-update-result") ||
 		name == "remote-settings.json" || strings.HasPrefix(name, "remote-settings.json.") ||
 		name == "mcp-needs-auth-cache.json" || strings.HasPrefix(name, "mcp-needs-auth-cache.json.") ||
+		name == "stats-cache.json" || strings.HasPrefix(name, "stats-cache.json.") ||
+		name == "policy-limits.json" || strings.HasPrefix(name, "policy-limits.json.") ||
 		strings.HasPrefix(name, ".storage-write.lock") ||
 		strings.HasPrefix(name, ".oauth_refresh.lock") {
 		return true
@@ -124,6 +127,8 @@ var PrivatePrefixes = []string{
 	".last-update-result",
 	"remote-settings.json",
 	"mcp-needs-auth-cache.json",
+	"stats-cache.json",
+	"policy-limits.json",
 	".storage-write.lock",
 	".oauth_refresh.lock",
 }

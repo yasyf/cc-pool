@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/lease"
 )
 
@@ -43,31 +44,35 @@ off the fuse-t mirror, where the bulk write would wedge it. ` + "`ccp run`" + ` 
 				if err := requireInit(m); err != nil {
 					return err
 				}
-				account, err := ccpAccountFromEnv()
-				if err != nil {
-					return err
-				}
-				cwd, _ := os.Getwd() // best-effort: an unreadable cwd just disables stickiness
-				// exec replaces this process in place, so os.Getpid() IS the future
-				// claude pid — the pick registers as a real session checkout.
-				acct, dir, line, err := resolveSelection(cmd, m, selectReq{account: account, cwd: cwd, pid: os.Getpid()})
-				if err != nil {
-					return err
-				}
-				step(cmd.ErrOrStderr(), "%s", line)
-				// Take the session lease BEFORE exec: its non-CLOEXEC fd rides through
-				// into claude, pinning the account's mount against holder teardown for
-				// the whole session, and the post-Acquire probe refuses to exec into a
-				// dead or partially-wedged mount.
-				h, err := acquireAndProbeSessionLease(acct)
-				if err != nil {
-					return err
-				}
-				return execClaude(h, dir, args)
+				return runClaude(cmd, m, args, acquireAndProbeSessionLease, execClaude)
 			})
 		},
 	}
 	return cmd
+}
+
+func runClaude(cmd *cobra.Command, m *pool.Manager, args []string, acquire func(store.Account) (*lease.Handle, error), execFn func(*lease.Handle, string, []string) error) error {
+	account, err := ccpAccountFromEnv()
+	if err != nil {
+		return err
+	}
+	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just disables stickiness
+	// exec replaces this process in place, so os.Getpid() IS the future
+	// claude pid — the pick registers as a real session checkout.
+	acct, dir, line, err := resolveSelection(cmd, m, selectReq{account: account, cwd: cwd, pid: os.Getpid()})
+	if err != nil {
+		return err
+	}
+	step(cmd.ErrOrStderr(), "%s", line)
+	// Take the session lease BEFORE exec: its non-CLOEXEC fd rides through
+	// into claude, pinning the account's mount against holder teardown for
+	// the whole session, and the post-Acquire probe refuses to exec into a
+	// dead or partially-wedged mount.
+	h, err := acquire(acct)
+	if err != nil {
+		return err
+	}
+	return execFn(h, dir, args)
 }
 
 func ccpAccountFromEnv() (*int, error) {

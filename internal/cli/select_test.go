@@ -344,7 +344,7 @@ func TestResolveSelectionMergesBaseSettings(t *testing.T) {
 }
 
 // Pins the client-side shared-settings merge after a daemon pick: removing
-// mergeDaemonPick in resolveSelection fails this.
+// mergeLaunchSettings in resolveSelection fails this.
 func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
 	// Short HOME under /tmp: macOS caps sun_path at 104 bytes; t.TempDir's /var/folders path exceeds it.
 	home, err := os.MkdirTemp("/tmp", "ccp-home")
@@ -480,60 +480,97 @@ func TestResolveSelectionMountsNotReadyError(t *testing.T) {
 	}
 }
 
-// A nil or unknown SelectedID warns and skips — a daemon hiccup must not block the launch.
-func TestMergeDaemonPick(t *testing.T) {
-	known, unknown := 5, 999
-	cases := map[string]struct {
-		id       *int
-		wantWarn bool
-		wantFile bool
-	}{
-		"nil id warns and skips":     {nil, true, false},
-		"unknown id warns and skips": {&unknown, true, false},
-		"valid id merges":            {&known, false, true},
+func TestValidateDaemonSelection(t *testing.T) {
+	st := openTestStore(t)
+	a := store.Account{
+		ID: 5, ConfigDir: filepath.Join(t.TempDir(), "acct-05"), Label: "work@example.com",
+		KeychainService: "svc-5", KeychainAccount: "u-5", OverlayKind: "symlink",
 	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			home := t.TempDir()
-			t.Setenv("HOME", home)
-			if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mergeMarker": "yes"}`), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			st := openTestStore(t)
-			dir := filepath.Join(home, "acct-05")
-			if err := st.UpsertAccount(store.Account{
-				ID: known, ConfigDir: dir, Label: "work@example.com",
-				KeychainService: "svc", KeychainAccount: "u", OverlayKind: "symlink",
-			}); err != nil {
-				t.Fatal(err)
-			}
-			m := &pool.Manager{Store: st}
-			var stderr bytes.Buffer
-			cmd := &cobra.Command{}
-			cmd.SetErr(&stderr)
-
-			mergeDaemonPick(cmd, m, tc.id)
-
-			out := stripANSI(stderr.String())
-			if tc.wantWarn && !strings.Contains(out, "shared-settings merge") {
-				t.Fatalf("expected a skip warning, got %q", out)
-			}
-			if !tc.wantWarn && out != "" {
-				t.Fatalf("expected silence, got %q", out)
-			}
-			_, err := os.Stat(filepath.Join(dir, ".claude.json"))
-			if tc.wantFile {
-				if err != nil {
-					t.Fatalf("merge did not write the account file: %v", err)
+	b := store.Account{
+		ID: 6, ConfigDir: filepath.Join(t.TempDir(), "acct-06"), Label: "other@example.com",
+		KeychainService: "svc-6", KeychainAccount: "u-6", OverlayKind: "symlink",
+	}
+	for _, acct := range []store.Account{a, b} {
+		if err := st.UpsertAccount(acct); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &pool.Manager{Store: st}
+	zero, unknown := 0, 999
+	cases := []struct {
+		name      string
+		resp      daemon.Response
+		forced    *store.Account
+		wantError []string
+		wantID    int
+	}{
+		{
+			name:      "nil selected id",
+			resp:      daemon.Response{Dir: "/returned/nil"},
+			wantError: []string{"id <nil>", "expected dir \"<unknown>\"", "returned dir \"/returned/nil\""},
+		},
+		{
+			name:      "empty selected id",
+			resp:      daemon.Response{SelectedID: &zero, Dir: "/returned/empty"},
+			wantError: []string{"id 0", "expected dir \"<unknown>\"", "returned dir \"/returned/empty\""},
+		},
+		{
+			name:      "unknown selected id",
+			resp:      daemon.Response{SelectedID: &unknown, Dir: "/returned/unknown"},
+			wantError: []string{"id 999", "expected dir \"<unknown>\"", "returned dir \"/returned/unknown\""},
+		},
+		{
+			name:      "wrong dir",
+			resp:      daemon.Response{SelectedID: &a.ID, Dir: "/wrong/dir"},
+			wantError: []string{"id 5", "expected dir \"" + a.ConfigDir + "\"", "returned dir \"/wrong/dir\""},
+		},
+		{
+			name:      "trailing slash alias fails",
+			resp:      daemon.Response{SelectedID: &a.ID, Dir: a.ConfigDir + "/"},
+			wantError: []string{"id 5", "expected dir \"" + a.ConfigDir + "\"", "returned dir \"" + a.ConfigDir + "/\""},
+		},
+		{
+			name:      "dot segment alias fails",
+			resp:      daemon.Response{SelectedID: &a.ID, Dir: a.ConfigDir + "/./"},
+			wantError: []string{"id 5", "expected dir \"" + a.ConfigDir + "\"", "returned dir \"" + a.ConfigDir + "/./\""},
+		},
+		{
+			name:      "forced account mismatch",
+			resp:      daemon.Response{SelectedID: &b.ID, Dir: b.ConfigDir},
+			forced:    &a,
+			wantError: []string{"id 6", "forced account 5", "expected dir \"" + a.ConfigDir + "\"", "returned dir \"" + b.ConfigDir + "\""},
+		},
+		{
+			name:   "exact automatic match succeeds",
+			resp:   daemon.Response{SelectedID: &a.ID, Dir: a.ConfigDir},
+			wantID: a.ID,
+		},
+		{
+			name:   "exact forced match succeeds",
+			resp:   daemon.Response{SelectedID: &a.ID, Dir: a.ConfigDir},
+			forced: &a,
+			wantID: a.ID,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := validateDaemonSelection(m, &tc.resp, tc.forced)
+			if len(tc.wantError) > 0 {
+				if err == nil {
+					t.Fatalf("validateDaemonSelection = %+v, nil; want error", got)
 				}
-				var got map[string]any
-				if err := json.Unmarshal(readSelectTestFile(t, filepath.Join(dir, ".claude.json")), &got); err != nil || got["mergeMarker"] != "yes" {
-					t.Fatalf("marker missing from merged file (err=%v): %v", err, got)
+				for _, want := range tc.wantError {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not contain %q", err, want)
+					}
 				}
 				return
 			}
-			if !os.IsNotExist(err) {
-				t.Fatalf("no account file should be written on a skipped merge (err=%v)", err)
+			if err != nil {
+				t.Fatalf("validateDaemonSelection: %v", err)
+			}
+			if got.ID != tc.wantID || got.ConfigDir != a.ConfigDir {
+				t.Errorf("validated account = %+v, want id=%d dir=%q", got, tc.wantID, a.ConfigDir)
 			}
 		})
 	}

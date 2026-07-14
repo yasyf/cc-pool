@@ -1,10 +1,13 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/pool"
@@ -281,6 +284,103 @@ func stageLeakedBridge(t *testing.T, dir string) {
 	domainRoot := filepath.Join(t.TempDir(), "CCPoolStatus-"+filepath.Base(dir))
 	if err := os.Symlink(domainRoot, dir); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHealStrandedRowsLogsOnlyPendingWork(t *testing.T) {
+	cases := []struct {
+		name         string
+		bridged      bool
+		busy         bool
+		wantScan     bool
+		wantDeferred bool
+		wantHealed   bool
+	}{
+		{name: "healthy busy row is silent", busy: true},
+		{name: "bridged busy row defers", bridged: true, busy: true, wantScan: true, wantDeferred: true},
+		{name: "bridged idle row heals", bridged: true, wantScan: true, wantHealed: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			base := pool.ClaudeDir()
+			if err := os.MkdirAll(filepath.Join(base, "projects"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte("{}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			s, dirs := newTestServer(t)
+			distinctAccountDirs(t, s, dirs)
+			dir := dirs[1]
+			fp := newFakeStrandFP()
+			if tc.bridged {
+				stageLeakedBridge(t, dir)
+				fp.registered[filepath.Base(dir)] = true
+			}
+			s.m.OverlayFor = fpAndSymlinkOverlay(fp, s.m.OverlaySpec())
+			s.fpSynth = alwaysNonEmpty
+			s.fpBridgeReadyFn = func() bool { return true }
+			scanCalls := 0
+			s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+				scanCalls++
+				if tc.busy {
+					return []procscan.Session{{PID: 4242, ConfigDir: dir}}, nil
+				}
+				return nil, nil
+			}
+			var logs bytes.Buffer
+			s.log = log.New(&logs, "", 0)
+
+			s.healStrandedRows(t.Context(), s.newTick(t.Context()))
+
+			if got := scanCalls > 0; got != tc.wantScan {
+				t.Errorf("session scan ran = %v, want %v (calls=%d)", got, tc.wantScan, scanCalls)
+			}
+			out := logs.String()
+			if !tc.wantDeferred && !tc.wantHealed && out != "" {
+				t.Fatalf("healthy row logged: %q", out)
+			}
+			if got := strings.Contains(out, "deferring stranded-bridge heal: 1 live session(s)"); got != tc.wantDeferred {
+				t.Errorf("defer log present = %v, want %v; logs=%q", got, tc.wantDeferred, out)
+			}
+			if got := strings.Contains(out, "restored private files stranded by an interrupted migration"); got != tc.wantHealed {
+				t.Errorf("heal log present = %v, want %v; logs=%q", got, tc.wantHealed, out)
+			}
+			if tc.wantDeferred {
+				if len(fp.teardowns) != 0 || len(fp.removes) != 0 {
+					t.Fatalf("busy heal took action: teardowns=%v removes=%v", fp.teardowns, fp.removes)
+				}
+				if fi, err := os.Lstat(dir); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+					t.Fatalf("busy bridge changed: fi=%v err=%v", fi, err)
+				}
+				if got := readFileString(t, filepath.Join(fkoverlay.FusePrivateRoot(dir), ".claude.json")); got != strandIdentityJSON {
+					t.Fatalf("busy heal moved private identity: %q", got)
+				}
+			}
+			if tc.wantHealed {
+				if len(fp.teardowns) != 1 || fp.teardowns[0] != dir {
+					t.Fatalf("healing teardowns = %v, want [%s]", fp.teardowns, dir)
+				}
+				if len(fp.removes) != 0 {
+					t.Fatalf("healing removed an already-torn-down domain: %v", fp.removes)
+				}
+				if fi, err := os.Lstat(dir); err != nil || fi.Mode()&os.ModeSymlink != 0 {
+					t.Fatalf("healed dir is not real: fi=%v err=%v", fi, err)
+				}
+				if got := readFileString(t, filepath.Join(dir, ".claude.json")); got != strandIdentityJSON {
+					t.Fatalf("identity not restored: %q", got)
+				}
+				if _, err := os.Lstat(fkoverlay.FusePrivateRoot(dir)); !os.IsNotExist(err) {
+					t.Fatalf("private root survived heal: %v", err)
+				}
+			}
+			if s.cl.held(1) {
+				t.Fatal("strand-heal claim remained held")
+			}
+		})
 	}
 }
 

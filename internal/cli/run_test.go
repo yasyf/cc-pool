@@ -1,13 +1,22 @@
 package cli
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
+	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/lease"
+	"github.com/yasyf/fusekit/version"
 )
 
 func TestExecEnv(t *testing.T) {
@@ -108,6 +117,115 @@ func TestResolveSelectionForcedUnknown(t *testing.T) {
 	_, _, _, err := resolveSelection(cmd, m, selectReq{account: &id})
 	if err == nil || !strings.Contains(err.Error(), "999") {
 		t.Fatalf("err = %v, want a not-found error mentioning account 999", err)
+	}
+}
+
+func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "ccp-run-home")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	t.Setenv(ccpAccountEnv, "1")
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mergeMarker":"yes"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st := openTestStore(t)
+	requested := store.Account{
+		ID: 1, ConfigDir: filepath.Join(home, "acct-01"), Label: "requested@example.com",
+		KeychainService: "svc-1", KeychainAccount: "u-1", OverlayKind: "symlink",
+	}
+	returned := store.Account{
+		ID: 2, ConfigDir: filepath.Join(home, "acct-02"), Label: "returned@example.com",
+		KeychainService: "svc-2", KeychainAccount: "u-2", OverlayKind: "symlink",
+	}
+	for _, acct := range []store.Account{requested, returned} {
+		if err := st.UpsertAccount(acct); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", pool.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req daemon.Request
+			if err := json.NewDecoder(conn).Decode(&req); err != nil {
+				_ = conn.Close()
+				continue
+			}
+			resp := daemon.Response{Proto: daemon.ProtocolVersion, OK: true, Version: version.String()}
+			if req.Op == daemon.OpSelect {
+				resp.SelectedID = &returned.ID
+				resp.Dir = returned.ConfigDir
+			}
+			_ = json.NewEncoder(conn).Encode(resp)
+			_ = conn.Close()
+		}
+	}()
+
+	m := &pool.Manager{Store: st, Creds: credstest.NewFake(), LockDir: t.TempDir()}
+	var stderr bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetErr(&stderr)
+	cmd.SetContext(context.Background())
+	acquireCalls, execCalls := 0, 0
+	err = runClaude(
+		cmd,
+		m,
+		[]string{"--version"},
+		func(store.Account) (*lease.Handle, error) {
+			acquireCalls++
+			return nil, nil
+		},
+		func(*lease.Handle, string, []string) error {
+			execCalls++
+			return nil
+		},
+	)
+	if err == nil {
+		t.Fatal("runClaude accepted a daemon response for the wrong forced account")
+	}
+	for _, want := range []string{
+		"id 2",
+		"expected dir \"" + requested.ConfigDir + "\"",
+		"returned dir \"" + returned.ConfigDir + "\"",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+	if out := stripANSI(stderr.String()); out != "" {
+		t.Errorf("malformed response printed a selection banner: %q", out)
+	}
+	if acquireCalls != 0 || execCalls != 0 {
+		t.Errorf("malformed response reached launch consequences: acquire=%d exec=%d", acquireCalls, execCalls)
+	}
+	for _, acct := range []store.Account{requested, returned} {
+		if _, err := os.Stat(filepath.Join(acct.ConfigDir, ".claude.json")); !os.IsNotExist(err) {
+			t.Errorf("settings merged into acct-%02d after malformed response: %v", acct.ID, err)
+		}
+		if n, err := st.ActiveSessionCount(acct.ID); err != nil || n != 0 {
+			t.Errorf("client session count for acct-%02d = %d, %v; want 0, nil", acct.ID, n, err)
+		}
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := st.GetSticky(cwd); err != nil || ok {
+		t.Errorf("client sticky after malformed response: ok=%v err=%v", ok, err)
 	}
 }
 
