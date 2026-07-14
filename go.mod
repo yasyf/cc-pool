@@ -8,7 +8,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/descope/go-free-email-providers v0.0.0-20260427134210-d71f4c2c7632
 	github.com/spf13/cobra v1.10.2
-	github.com/yasyf/fusekit v1.0.1
+	github.com/yasyf/fusekit v1.1.0
 	github.com/yasyf/synckit v0.8.0
 	golang.org/x/mod v0.36.0
 	golang.org/x/net v0.56.0
@@ -59,5 +59,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-replace github.com/yasyf/fusekit => /Users/yasyf/Code/fusekit/.claude/worktrees/lane-f
