@@ -8,8 +8,8 @@ import Foundation
 struct AnchorStore {
     private let dir: URL
 
-    init(domainID: String) {
-        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    init(domainID: String,
+         root: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]) {
         dir = root.appendingPathComponent("CCPoolFileProvider/anchors/" + domainID, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
@@ -42,12 +42,21 @@ struct AnchorStore {
     }
 }
 
+/// What the enumerators need from the extension. A seam so the fail-closed
+/// behavior is testable without a live bridge or FP host.
+protocol EnumerationSource: AnyObject {
+    var queue: DispatchQueue { get }
+    var anchors: AnchorStore { get }
+    func rootItems() throws -> [FPItem]
+    func dirItems(rel: String) throws -> [FPItem]
+}
+
 /// Diff the container's current listing against its persisted map, emit
 /// updates/deletes, persist, and finish at the new anchor.
-private func finishChanges(ext: FileProviderExtension, container: NSFileProviderItemIdentifier,
+private func finishChanges(source: EnumerationSource, container: NSFileProviderItemIdentifier,
                            current: [FPItem], observer: NSFileProviderChangeObserver,
                            from anchor: NSFileProviderSyncAnchor) {
-    let persisted = ext.anchors.load(container)
+    let persisted = source.anchors.load(container)
     guard AnchorStore.anchor(of: persisted) == anchor.rawValue else {
         observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired))
         return
@@ -59,12 +68,12 @@ private func finishChanges(ext: FileProviderExtension, container: NSFileProvider
         .map { NSFileProviderItemIdentifier($0) }
     if !changed.isEmpty { observer.didUpdate(changed) }
     if !deleted.isEmpty { observer.didDeleteItems(withIdentifiers: deleted) }
-    ext.anchors.save(container, currentMap)
+    source.anchors.save(container, currentMap)
     observer.finishEnumeratingChanges(
         upTo: NSFileProviderSyncAnchor(AnchorStore.anchor(of: currentMap)), moreComing: false)
 }
 
-private func finishCurrentAnchor(ext: FileProviderExtension,
+private func finishCurrentAnchor(source: EnumerationSource,
                                  container: NSFileProviderItemIdentifier, current: [FPItem]?,
                                  completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
     guard let current else {
@@ -73,19 +82,22 @@ private func finishCurrentAnchor(ext: FileProviderExtension,
     }
     var map: [String: String] = [:]
     for item in current { map[item.itemIdentifier.rawValue] = item.versionHex }
-    ext.anchors.save(container, map)
+    source.anchors.save(container, map)
     completionHandler(NSFileProviderSyncAnchor(AnchorStore.anchor(of: map)))
 }
 
 /// Serves .rootContainer and .workingSet: all top-level items plus both
 /// computed documents (the working set is the signalEnumerator target, so it
 /// must cover everything a base edit can change). Small listing — no paging.
+/// Fail-closed: a listing that can't be fully built fails the enumeration —
+/// a partial listing reads as "deleted remotely" and fileproviderd deletes
+/// launch-critical replicas.
 final class RootEnumerator: NSObject, NSFileProviderEnumerator {
-    private let ext: FileProviderExtension
+    private let source: EnumerationSource
     private let container: NSFileProviderItemIdentifier
 
-    init(ext: FileProviderExtension, container: NSFileProviderItemIdentifier) {
-        self.ext = ext
+    init(source: EnumerationSource, container: NSFileProviderItemIdentifier) {
+        self.source = source
         self.container = container
     }
 
@@ -93,9 +105,9 @@ final class RootEnumerator: NSObject, NSFileProviderEnumerator {
 
     func enumerateItems(for observer: NSFileProviderEnumerationObserver,
                         startingAt page: NSFileProviderPage) {
-        ext.queue.async {
+        source.queue.async {
             do {
-                observer.didEnumerate(try self.ext.rootItems())
+                observer.didEnumerate(try self.source.rootItems())
                 observer.finishEnumerating(upTo: nil)
             } catch {
                 NSLog("ccp-fp root enumerate failed: %@", error as NSError)
@@ -106,10 +118,10 @@ final class RootEnumerator: NSObject, NSFileProviderEnumerator {
 
     func enumerateChanges(for observer: NSFileProviderChangeObserver,
                           from anchor: NSFileProviderSyncAnchor) {
-        ext.queue.async {
+        source.queue.async {
             do {
-                finishChanges(ext: self.ext, container: self.container,
-                              current: try self.ext.rootItems(), observer: observer, from: anchor)
+                finishChanges(source: self.source, container: self.container,
+                              current: try self.source.rootItems(), observer: observer, from: anchor)
             } catch {
                 NSLog("ccp-fp root changes failed: %@", error as NSError)
                 observer.finishEnumeratingWithError(error)
@@ -118,9 +130,9 @@ final class RootEnumerator: NSObject, NSFileProviderEnumerator {
     }
 
     func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
-        ext.queue.async {
-            finishCurrentAnchor(ext: self.ext, container: self.container,
-                                current: try? self.ext.rootItems(),
+        source.queue.async {
+            finishCurrentAnchor(source: self.source, container: self.container,
+                                current: try? self.source.rootItems(),
                                 completionHandler: completionHandler)
         }
     }
@@ -128,35 +140,35 @@ final class RootEnumerator: NSObject, NSFileProviderEnumerator {
 
 /// Enumerates one private-store directory (shared dirs are symlink items and
 /// never enumerate). Pages of 256, cursor = the next index as decimal Data.
+/// Fail-closed like RootEnumerator.
 final class DirEnumerator: NSObject, NSFileProviderEnumerator {
     private static let pageSize = 256
 
-    private let ext: FileProviderExtension
+    private let source: EnumerationSource
     private let rel: String
     private var container: NSFileProviderItemIdentifier { ItemID.priv(rel).identifier }
 
-    init(ext: FileProviderExtension, rel: String) {
-        self.ext = ext
+    init(source: EnumerationSource, rel: String) {
+        self.source = source
         self.rel = rel
     }
 
     func invalidate() {}
 
-    private func listing() -> [FPItem] {
-        readdirNames(ext.paths.privateStore + "/" + rel).sorted()
-            .filter { !OverlaySkip.skips($0) }
-            .map { ext.privateItem(rel: rel + "/" + $0) }
-    }
-
     func enumerateItems(for observer: NSFileProviderEnumerationObserver,
                         startingAt page: NSFileProviderPage) {
-        ext.queue.async {
-            let items = self.listing()
-            let start = min(Self.index(of: page), items.count)
-            let end = min(start + Self.pageSize, items.count)
-            observer.didEnumerate(Array(items[start..<end]))
-            observer.finishEnumerating(
-                upTo: end < items.count ? NSFileProviderPage(Data("\(end)".utf8)) : nil)
+        source.queue.async {
+            do {
+                let items = try self.source.dirItems(rel: self.rel)
+                let start = min(Self.index(of: page), items.count)
+                let end = min(start + Self.pageSize, items.count)
+                observer.didEnumerate(Array(items[start..<end]))
+                observer.finishEnumerating(
+                    upTo: end < items.count ? NSFileProviderPage(Data("\(end)".utf8)) : nil)
+            } catch {
+                NSLog("ccp-fp dir enumerate %@ failed: %@", self.rel, error as NSError)
+                observer.finishEnumeratingWithError(error)
+            }
         }
     }
 
@@ -167,15 +179,22 @@ final class DirEnumerator: NSObject, NSFileProviderEnumerator {
 
     func enumerateChanges(for observer: NSFileProviderChangeObserver,
                           from anchor: NSFileProviderSyncAnchor) {
-        ext.queue.async {
-            finishChanges(ext: self.ext, container: self.container, current: self.listing(),
-                          observer: observer, from: anchor)
+        source.queue.async {
+            do {
+                finishChanges(source: self.source, container: self.container,
+                              current: try self.source.dirItems(rel: self.rel),
+                              observer: observer, from: anchor)
+            } catch {
+                NSLog("ccp-fp dir changes %@ failed: %@", self.rel, error as NSError)
+                observer.finishEnumeratingWithError(error)
+            }
         }
     }
 
     func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
-        ext.queue.async {
-            finishCurrentAnchor(ext: self.ext, container: self.container, current: self.listing(),
+        source.queue.async {
+            finishCurrentAnchor(source: self.source, container: self.container,
+                                current: try? self.source.dirItems(rel: self.rel),
                                 completionHandler: completionHandler)
         }
     }

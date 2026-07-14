@@ -92,7 +92,9 @@ enum OverlaySkip {
 }
 
 /// lstat snapshot of a backing path; absent files read as (-1, -1) — the
-/// holder's freshness convention for a missing gate file.
+/// holder's freshness convention for a missing gate file. ENOENT is the one
+/// valid "absent" state; any other errno throws so the failure is visible and
+/// the OS retries — never a silently frozen version.
 struct BackingStat {
     let exists: Bool
     let isDir: Bool
@@ -102,9 +104,15 @@ struct BackingStat {
 
     static let absent = BackingStat(exists: false, isDir: false, isSymlink: false, size: -1, mtimeNS: -1)
 
-    static func lstat(_ path: String) -> BackingStat {
+    static func lstat(_ path: String) throws -> BackingStat {
         var st = stat()
-        guard Darwin.lstat(path, &st) == 0 else { return .absent }
+        guard Darwin.lstat(path, &st) == 0 else {
+            let err = errno
+            if err == ENOENT { return .absent }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(err), userInfo: [
+                NSLocalizedDescriptionKey: "lstat \(path): \(String(cString: strerror(err)))",
+            ])
+        }
         let mode = st.st_mode & S_IFMT
         return BackingStat(
             exists: true, isDir: mode == S_IFDIR, isSymlink: mode == S_IFLNK,
@@ -132,10 +140,10 @@ enum ItemVersions {
     /// (path, mtime_ns, size), statted locally — the exact staleness gate the
     /// fuse holder applies, computed where the stat is cheap. Feeds the synth
     /// size cache key; the item version is computed(freshnessHex:size:).
-    static func synth(freshness: [String]) -> String {
+    static func synth(freshness: [String]) throws -> String {
         var s = ""
         for p in freshness {
-            let st = BackingStat.lstat(p)
+            let st = try BackingStat.lstat(p)
             s += "\(p)\0\(st.mtimeNS)\0\(st.size)\n"
         }
         return FNV.hex(s)
@@ -149,8 +157,23 @@ enum ItemVersions {
     }
 }
 
-func readdirNames(_ path: String) -> [String] {
-    (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []
+/// Content version of a synth entry: the daemon-computed manifest version
+/// (FreshnessVersion, statted unsandboxed) when present; the local stat hash
+/// only as the old-daemon fallback.
+func synthVersionHex(manifestVersion: String, freshness: [String]) throws -> String {
+    manifestVersion.isEmpty ? try ItemVersions.synth(freshness: freshness) : manifestVersion
+}
+
+/// Directory listing; a missing directory is a valid empty state (private
+/// dirs may predate their backing), any other failure throws.
+func readdirNames(_ path: String) throws -> [String] {
+    do {
+        return try FileManager.default.contentsOfDirectory(atPath: path)
+    } catch CocoaError.fileReadNoSuchFile {
+        return []
+    } catch let e as NSError where e.domain == NSPOSIXErrorDomain && e.code == Int(ENOENT) {
+        return []
+    }
 }
 
 func readlinkTarget(_ path: String) -> String? {

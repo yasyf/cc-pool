@@ -2,74 +2,20 @@ import FileProvider
 import Foundation
 import UniformTypeIdentifiers
 
-/// Immutable NSFileProviderItem snapshot. versionHex feeds both the item
-/// version and the enumerators' sync-anchor lines.
-final class FPItem: NSObject, NSFileProviderItem {
-    let itemIdentifier: NSFileProviderItemIdentifier
-    let parentItemIdentifier: NSFileProviderItemIdentifier
-    let filename: String
-    let contentType: UTType
-    let capabilities: NSFileProviderItemCapabilities
-    let documentSize: NSNumber?
-    let symlinkTargetPath: String?
-    let versionHex: String
-
-    var itemVersion: NSFileProviderItemVersion {
-        let v = Data(versionHex.utf8)
-        return NSFileProviderItemVersion(contentVersion: v, metadataVersion: v)
-    }
-
-    init(id: ItemID, filename: String, contentType: UTType,
-         capabilities: NSFileProviderItemCapabilities,
-         documentSize: NSNumber? = nil, symlinkTargetPath: String? = nil,
-         versionHex: String) {
-        itemIdentifier = id.identifier
-        parentItemIdentifier = id.parent
-        self.filename = filename
-        self.contentType = contentType
-        self.capabilities = capabilities
-        self.documentSize = documentSize
-        self.symlinkTargetPath = symlinkTargetPath
-        self.versionHex = versionHex
-    }
-}
-
-/// Synth read outcome per computed name, keyed by the manifest freshness
-/// hash: repeated item()/enumeration stats cost zero bridge reads until the
-/// content version changes. Locked — the extension queue is concurrent.
-final class SynthSizeCache {
-    enum Outcome {
-        case size(Int64)
-        case unreadable
-    }
-
-    private var slots: [String: (version: String, outcome: Outcome)] = [:]
-    private let lock = NSLock()
-
-    func lookup(name: String, version: String) -> Outcome? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let slot = slots[name], slot.version == version else { return nil }
-        return slot.outcome
-    }
-
-    func store(name: String, version: String, outcome: Outcome) {
-        lock.lock()
-        defer { lock.unlock() }
-        slots[name] = (version, outcome)
-    }
-}
-
 /// The principal class (NSExtensionPrincipalClass =
 /// CCPoolFileProvider.FileProviderExtension). One instance per domain; the
 /// domain identifier is the account basename (acct-NN). Shared and private
 /// items are served straight off the local backing trees; the two computed
 /// documents ride the daemon's FP bridge.
-final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
+final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, EnumerationSource {
     let domain: NSFileProviderDomain
     let paths: DomainPaths
     let bridge = BridgeClient()
     let synthSizes = SynthSizeCache()
+    /// Coalesce concurrent bridge reads of the same synth content version —
+    /// the concurrent stat+read double-fetch is the suspected EDEADLK trigger.
+    private let synthFlights = InFlight<String, Data>()
+    private let manifestFlights = InFlight<String, [BridgeEntry]>()
     let anchors: AnchorStore
     /// All work runs here — never on the extension's calling threads.
     let queue = DispatchQueue(label: "com.yasyf.cc-pool.fileprovider", qos: .userInitiated,
@@ -93,25 +39,25 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     /// entries become private-store directory items. The readdir union is the
     /// robustness floor for passthrough leftovers the manifest doesn't cover.
     func rootItems() throws -> [FPItem] {
-        let entries = try mapUnreachable { try bridge.manifest(domain: paths.configDir) }
+        let entries = try manifest()
         var items: [FPItem] = []
         var seen = Set<String>()
         for e in entries where !OverlaySkip.skips(e.name) && !seen.contains(e.name) {
             seen.insert(e.name)
             switch e.kind {
             case "synth":
-                items.append(computedItem(name: e.name, freshness: e.freshness ?? []))
+                items.append(try computedItem(entry: e))
             case "symlink":
                 items.append(symlinkItem(name: e.name, target: e.target ?? paths.base + "/" + e.name))
             case "private":
-                items.append(privateItem(rel: e.name))
+                items.append(try privateItem(rel: e.name))
             default:
                 break
             }
         }
         // Base leftovers. Go owns the classifier (internal/overlay/
         // contentsource.go Classify) — parity by RPC, never a Swift port.
-        for name in readdirNames(paths.base) where !seen.contains(name) && !OverlaySkip.skips(name) {
+        for name in try readdirNames(paths.base) where !seen.contains(name) && !OverlaySkip.skips(name) {
             seen.insert(name)
             switch try mapUnreachable({ try bridge.classify(name: name) }) {
             case "symlink":
@@ -119,7 +65,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             case "":
                 // Passthrough: dirs surface as symlink items too — shared dirs
                 // have no enumerator.
-                let st = BackingStat.lstat(paths.base + "/" + name)
+                let st = try BackingStat.lstat(paths.base + "/" + name)
                 if st.isDir {
                     items.append(symlinkItem(name: name, target: paths.base + "/" + name))
                 } else if st.exists {
@@ -131,11 +77,37 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         }
         // The account's own private files (e.g. .credentials.json).
         // .claude.json is shadowed by its computed item via `seen`.
-        for name in readdirNames(paths.privateStore)
+        for name in try readdirNames(paths.privateStore)
         where !seen.contains(name) && !OverlaySkip.skips(name) {
-            items.append(privateItem(rel: name))
+            items.append(try privateItem(rel: name))
         }
         return items
+    }
+
+    /// One private-store directory's listing (shared dirs never enumerate).
+    func dirItems(rel: String) throws -> [FPItem] {
+        try readdirNames(paths.privateStore + "/" + rel).sorted()
+            .filter { !OverlaySkip.skips($0) }
+            .map { try privateItem(rel: rel + "/" + $0) }
+    }
+
+    /// Coalesced bridge manifest: concurrent enumerations share one RPC.
+    func manifest() throws -> [BridgeEntry] {
+        try mapUnreachable {
+            try manifestFlights.run(paths.configDir) {
+                try self.bridge.manifest(domain: self.paths.configDir)
+            }
+        }
+    }
+
+    /// Coalesced bridge synth read, keyed name|version: a stat-driven size
+    /// read and a fetchContents read of the same content version share one RPC.
+    private func readSynthShared(name: String, version: String) throws -> Data {
+        try mapUnreachable {
+            try synthFlights.run(name + "|" + version) {
+                try self.bridge.readSynth(domain: self.paths.configDir, name: name)
+            }
+        }
     }
 
     func rootItem() -> FPItem {
@@ -146,40 +118,39 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
     /// FPFS satisfies a size-0 read without ever calling fetchContents, so a
     /// computed item must advertise the real synth byte length.
-    func computedItem(name: String, freshness: [String]) -> FPItem {
-        let freshnessHex = ItemVersions.synth(freshness: freshness)
-        let size = synthSize(name: name, version: freshnessHex)
+    func computedItem(entry: BridgeEntry) throws -> FPItem {
+        let name = entry.name
+        let versionHex = try synthVersionHex(
+            manifestVersion: entry.version, freshness: entry.freshness ?? [])
+        let outcome = try synthOutcome(name: name, version: versionHex)
+        let size = outcome.size
         return FPItem(id: .computed(name), filename: name,
                       contentType: UTType(filenameExtension: (name as NSString).pathExtension) ?? .json,
                       // Go owns the split-back: reading + writing only, no
                       // delete/rename/reparent.
                       capabilities: [.allowsReading, .allowsWriting],
                       documentSize: NSNumber(value: size),
-                      versionHex: ItemVersions.computed(freshnessHex: freshnessHex, size: size))
+                      versionHex: ItemVersions.computed(freshnessHex: versionHex, size: size))
     }
 
-    /// Real byte length of a computed document — one bridge read per content
-    /// version, never one per stat. A failed read never fails enumeration:
-    /// the item is served at size 0 and fetchContents surfaces the error.
-    /// Content-level failures (e.g. a domain with no private backing) are
-    /// cached because the freshness stats move when the backing appears;
-    /// transport failures are not, so a daemon restart retries.
-    private func synthSize(name: String, version: String) -> Int64 {
-        switch synthSizes.lookup(name: name, version: version) {
-        case .size(let n)?: return n
-        case .unreadable?: return 0
-        case nil: break
-        }
+    /// Cache hit, or one coalesced bridge read per content version. A
+    /// transport failure propagates (the enumeration must fail, never serve a
+    /// partial or frozen view); a content-level failure (e.g. no private
+    /// backing yet) is .unreadable — served size 0, never cached, so the next
+    /// stat retries and fetchContents surfaces the error.
+    private func synthOutcome(name: String, version: String) throws -> SynthSizeCache.Outcome {
+        if let hit = synthSizes.lookup(name: name, version: version) { return hit }
+        let data: Data
         do {
-            let size = Int64(try bridge.readSynth(domain: paths.configDir, name: name).count)
-            synthSizes.store(name: name, version: version, outcome: .size(size))
-            return size
-        } catch is BridgeClient.Failure {
-            return 0
+            data = try readSynthShared(name: name, version: version)
+        } catch let e as NSError where e.domain == NSFileProviderError.errorDomain {
+            throw e // transport: bridge unreachable
         } catch {
-            synthSizes.store(name: name, version: version, outcome: .unreadable)
-            return 0
+            return .unreadable
         }
+        let outcome = SynthSizeCache.Outcome.of(data)
+        synthSizes.store(name: name, version: version, outcome: outcome)
+        return outcome
     }
 
     func symlinkItem(name: String, target: String) -> FPItem {
@@ -205,9 +176,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                       versionHex: ItemVersions.backing(st))
     }
 
-    func privateItem(rel: String) -> FPItem {
+    func privateItem(rel: String) throws -> FPItem {
         let path = paths.privateStore + "/" + rel
-        let st = BackingStat.lstat(path)
+        let st = try BackingStat.lstat(path)
         let name = (rel as NSString).lastPathComponent
         let topLevel = !rel.contains("/")
         if st.isSymlink {
@@ -240,14 +211,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         case .root:
             return rootItem()
         case .computed(let name):
-            let entries = try mapUnreachable { try bridge.manifest(domain: paths.configDir) }
+            let entries = try manifest()
             guard let e = entries.first(where: { $0.name == name && $0.kind == "synth" }) else {
                 throw NSFileProviderError(.noSuchItem)
             }
-            return computedItem(name: name, freshness: e.freshness ?? [])
+            return try computedItem(entry: e)
         case .shared(let rel):
             let path = paths.base + "/" + rel
-            let st = BackingStat.lstat(path)
+            let st = try BackingStat.lstat(path)
             if !rel.contains("/") {
                 switch try mapUnreachable({ try bridge.classify(name: rel) }) {
                 case "symlink":
@@ -263,16 +234,16 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             guard st.exists, !st.isDir else { throw NSFileProviderError(.noSuchItem) }
             return sharedFileItem(name: rel, st: st)
         case .priv(let rel):
-            let st = BackingStat.lstat(paths.privateStore + "/" + rel)
+            let st = try BackingStat.lstat(paths.privateStore + "/" + rel)
             if !st.exists {
                 // Only manifest-listed structural dirs exist without backing.
                 guard !rel.contains("/") else { throw NSFileProviderError(.noSuchItem) }
-                let entries = try mapUnreachable { try bridge.manifest(domain: paths.configDir) }
+                let entries = try manifest()
                 guard entries.contains(where: { $0.name == rel && $0.kind == "private" }) else {
                     throw NSFileProviderError(.noSuchItem)
                 }
             }
-            return privateItem(rel: rel)
+            return try privateItem(rel: rel)
         }
     }
 
@@ -306,17 +277,30 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 switch id {
                 case .computed(let name):
-                    let data = try self.mapUnreachable {
-                        try self.bridge.readSynth(domain: self.paths.configDir, name: name)
+                    // Item first: computedItem fills the byte cache, so the
+                    // worst case per content version is one readSynth + one
+                    // manifest; .sized (over-cap) and .unreadable re-read.
+                    let entries = try self.manifest()
+                    guard let e = entries.first(where: { $0.name == name && $0.kind == "synth" }) else {
+                        throw NSFileProviderError(.noSuchItem)
+                    }
+                    let item = try self.computedItem(entry: e)
+                    let version = try synthVersionHex(
+                        manifestVersion: e.version, freshness: e.freshness ?? [])
+                    let data: Data
+                    if case .bytes(let cached)? = self.synthSizes.lookup(name: name, version: version) {
+                        data = cached
+                    } else {
+                        data = try self.readSynthShared(name: name, version: version)
                     }
                     let dest = dir.appendingPathComponent(name)
                     try data.write(to: dest)
-                    completionHandler(dest, try self.lookupItem(itemIdentifier), nil)
+                    completionHandler(dest, item, nil)
                 case .shared, .priv:
                     guard let src = self.paths.backing(id) else {
                         throw NSFileProviderError(.noSuchItem)
                     }
-                    let st = BackingStat.lstat(src)
+                    let st = try BackingStat.lstat(src)
                     guard st.exists, !st.isDir else { throw NSFileProviderError(.noSuchItem) }
                     let dest = dir.appendingPathComponent((src as NSString).lastPathComponent)
                     try self.cloneOrCopy(from: src, to: dest.path)
@@ -386,7 +370,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     private func createBacking(at path: String, id: ItemID, template: NSFileProviderItem,
                                contents url: URL?,
                                options: NSFileProviderCreateItemOptions) throws -> FPItem {
-        let st = BackingStat.lstat(path)
+        let st = try BackingStat.lstat(path)
         if options.contains(.mayAlreadyExist), st.exists {
             // Reimport dance: adopt the existing backing, never clobber it.
             return try lookupItem(id.identifier)
@@ -548,7 +532,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                     request: NSFileProviderRequest) throws -> NSFileProviderEnumerator {
         switch containerItemIdentifier {
         case .rootContainer, .workingSet:
-            return RootEnumerator(ext: self, container: containerItemIdentifier)
+            return RootEnumerator(source: self, container: containerItemIdentifier)
         case .trashContainer:
             throw NSFileProviderError(.noSuchItem)
         default:
@@ -557,7 +541,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             guard let id = ItemID(containerItemIdentifier), case .priv(let rel) = id else {
                 throw NSFileProviderError(.noSuchItem)
             }
-            return DirEnumerator(ext: self, rel: rel)
+            return DirEnumerator(source: self, rel: rel)
         }
     }
 
