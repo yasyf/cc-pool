@@ -42,14 +42,20 @@ const deepWedgeStrikes = 2
 // bounded 2s stat that false-negatives under load.
 const shallowDeadStrikes = 2
 
-// fpWedgeStrikes debounces the File Provider wedged verdict: one transient slow
-// read under materialization load must not un-vouch a domain serving live
-// sessions.
+// fpWedgeStrikes debounces the File Provider wedged verdict (both the shallow and
+// deep lanes): one transient slow read under materialization load must not un-vouch
+// a domain serving live sessions.
 const fpWedgeStrikes = 2
 
 // fpRecoveryBreaker caps recovery attempts on one wedged domain; past it the
 // breaker trips and heal parks the domain until reset.
 const fpRecoveryBreaker = 5
+
+// fpDeepProbeInterval spaces the slow deep re-probe of a HEALTHY File Provider row:
+// routine liveness rides the cheap shallow probe every tick, but only the deep
+// byte-count probe catches the serve-stale / 0-byte wedge (FPFS lies at size 0), so
+// it runs on this interval instead of every tick.
+const fpDeepProbeInterval = 5 * time.Minute
 
 // fpRecoveryBackoff spaces a wedged domain's recovery attempts: 30s after the
 // first attempt, doubling to a 10m cap.
@@ -138,8 +144,8 @@ var policies = map[string]policy{
 	"fuse.deepwedge": {name: "fuse.deepwedge", debounce: deepWedgeStrikes},
 	// fuse.shallowdead: holder List-liveness remount debounce.
 	"fuse.shallowdead": {name: "fuse.shallowdead", debounce: shallowDeadStrikes},
-	// fp.domain: File Provider wedge debounce, then a backoff-spaced recovery
-	// ladder parked at the breaker.
+	// fp.domain: the DEEP wedge lane — deep-probe debounce, then the recovery
+	// ladder parked at the breaker. Carries the shared wedge verdict fpWedged reads.
 	"fp.domain": {
 		name:     "fp.domain",
 		debounce: fpWedgeStrikes,
@@ -147,6 +153,9 @@ var policies = map[string]policy{
 		breaker:  fpRecoveryBreaker,
 		onTrip:   tripPark,
 	},
+	// fp.shallow: the SHALLOW wedge lane — a pure debounce kept apart from fp.domain so a
+	// clean shallow tick clears only shallow strikes. Its latch force-faults fp.domain.
+	"fp.shallow": {name: "fp.shallow", debounce: fpWedgeStrikes},
 	// auth.streak: consecutive definitive needs-login verdicts; the trip gates
 	// polling (the 15m needsLoginPollInterval is cadence the consumer applies).
 	"auth.streak": {name: "auth.streak", debounce: needsLoginAfter, onTrip: tripGate},

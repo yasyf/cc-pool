@@ -181,19 +181,17 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 	cmd.SetErr(&stderr)
 	cmd.SetContext(context.Background())
 	acquireCalls, execCalls := 0, 0
-	err = runClaude(
-		cmd,
-		m,
-		[]string{"--version"},
-		func(store.Account) (*lease.Handle, error) {
-			acquireCalls++
-			return nil, nil
-		},
-		func(*lease.Handle, string, []string) error {
-			execCalls++
-			return nil
-		},
-	)
+	prevLease, prevExec := runAcquireLease, runExecClaude
+	runAcquireLease = func(store.Account) (*lease.Handle, error) {
+		acquireCalls++
+		return nil, nil
+	}
+	runExecClaude = func(*lease.Handle, string, []string) error {
+		execCalls++
+		return nil
+	}
+	t.Cleanup(func() { runAcquireLease, runExecClaude = prevLease, prevExec })
+	err = runClaude(cmd, m, []string{"--version"})
 	if err == nil {
 		t.Fatal("runClaude accepted a daemon response for the wrong forced account")
 	}

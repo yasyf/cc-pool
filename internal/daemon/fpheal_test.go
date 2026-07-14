@@ -40,6 +40,27 @@ func swapFPDomainProbe(t *testing.T, fn func(context.Context, string) error) {
 	t.Cleanup(func() { fpDomainProbe = prev })
 }
 
+// swapFPDomainProbeShallow overrides the package-level SHALLOW FP probe seam (the
+// routine-liveness probe healthy/parked rows run) for one test.
+func swapFPDomainProbeShallow(t *testing.T, fn func(context.Context, string) error) {
+	t.Helper()
+	prev := fpDomainProbeShallow
+	fpDomainProbeShallow = fn
+	t.Cleanup(func() { fpDomainProbeShallow = prev })
+}
+
+// fpForceRecoveryDue zeroes a wedged dir's backoff clock so the next healFPRows tick
+// treats it as due for a recovery attempt (healFPRows reads wall-clock time.Now,
+// which a test cannot advance).
+func fpForceRecoveryDue(t *testing.T, s *Server, dir string) {
+	t.Helper()
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	if l := s.led.peek(fpDomainPolicy, dir); l != nil {
+		l.nextDue = time.Time{}
+	}
+}
+
 // swapFPDirLinked overrides the "is a live bridge symlink" seam for one test.
 func swapFPDirLinked(t *testing.T, fn func(string) bool) {
 	t.Helper()
@@ -248,38 +269,46 @@ func TestFPHealReRegisterRetreatsOnCannotControl(t *testing.T) {
 	}
 }
 
-// TestHealFPRowsDetectsWedgeThenRecovers pins the ticker-driven flow: two wedged
-// probes cross the strike threshold (attempt 1 fires), and a later healthy probe
-// clears the verdict and the ladder (idempotent stop-on-recovery).
+// TestHealFPRowsDetectsWedgeThenRecovers pins the ticker-driven flow: two shallow
+// wedged probes cross the strike threshold (attempt 1 fires), and a later deep
+// due-window probe (healthy) clears the verdict and the ladder.
 func TestHealFPRowsDetectsWedgeThenRecovers(t *testing.T) {
 	s, _, dirs, fake := newFPHealServer(t)
 	s.fpBridgeReadyFn = func() bool { return true }
 	swapFPDirLinked(t, func(string) bool { return true })
 
-	var probed int
-	swapFPDomainProbe(t, func(_ context.Context, _ string) error { probed++; return overlay.ErrFPProbeWedged })
+	// Healthy rows run the SHALLOW probe every tick; keep the deep seam a NoVerdict so
+	// a stray deep call cannot influence the verdict.
+	var shallow, deep int
+	swapFPDomainProbeShallow(t, func(_ context.Context, _ string) error { shallow++; return overlay.ErrFPProbeWedged })
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { deep++; return overlay.ErrFPProbeNoVerdict })
 
-	s.healFPRows(t.Context()) // strike 1: not wedged yet, no heal
+	s.healFPRows(t.Context()) // shallow strike 1: not wedged yet, no heal
 	if s.fpWedged(dirs[1]) {
 		t.Fatal("one strike must not wedge (2-strike debounce)")
 	}
-	s.healFPRows(t.Context()) // strike 2: wedged + due -> attempt 1 (Sync)
+	s.healFPRows(t.Context()) // shallow strike 2: wedged + due -> attempt 1 (Sync)
 
 	if !s.fpWedged(dirs[1]) {
-		t.Fatal("two consecutive wedged probes must mark the domain wedged")
+		t.Fatal("two consecutive shallow wedged probes must mark the domain wedged")
 	}
 	if _, _, syncs, _ := fake.counts(); syncs != 1 {
 		t.Fatalf("attempt 1 (Sync) did not run on the wedge tick: syncs=%d, want 1", syncs)
 	}
-	if probed != 2 {
-		t.Fatalf("probed %d times over two ticks, want 2", probed)
+	if shallow != 2 {
+		t.Fatalf("healthy rows shallow-probed %d times over two ticks, want 2", shallow)
+	}
+	if deep != 0 {
+		t.Fatalf("a healthy row deep-probed %d times, want 0 (deep only every %s)", deep, fpDeepProbeInterval)
 	}
 
-	// The domain recovers: a healthy probe clears the verdict and the ladder.
-	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return nil })
+	// The domain recovers. A wedged row is deep-probed only on the due window, so
+	// force it due, then a healthy DEEP probe clears the verdict and the ladder.
+	fpForceRecoveryDue(t, s, dirs[1])
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { deep++; return nil })
 	s.healFPRows(t.Context())
 	if s.fpWedged(dirs[1]) {
-		t.Fatal("a healthy probe must clear the wedge verdict")
+		t.Fatal("a healthy deep probe on the due window must clear the wedge verdict")
 	}
 	if s.fpAttemptsSoFar(dirs[1]) != 0 {
 		t.Fatalf("recovery must reset the ladder: attemptsSoFar=%d, want 0", s.fpAttemptsSoFar(dirs[1]))
@@ -539,7 +568,8 @@ func TestHealFPRowsMissingRoutesToControlPlaneHeal(t *testing.T) {
 	s.fpBridgeReadyFn = func() bool { return true }
 	swapFPDirLinked(t, func(string) bool { return true })
 	fake.healthErr = errors.New("no domain registered")
-	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeMissing })
+	// A healthy row's routine tick is the SHALLOW probe (listed=false -> Missing).
+	swapFPDomainProbeShallow(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeMissing })
 
 	s.healFPRows(t.Context())
 

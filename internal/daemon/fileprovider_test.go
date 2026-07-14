@@ -35,9 +35,11 @@ type fakeFPProv struct {
 	setups    int
 	syncs     int
 	teardowns int
+	signals   int
 	healthErr error
 	setupErr  error
 	syncErr   error
+	signalErr error
 }
 
 func (f *fakeFPProv) Backend() fkoverlay.Backend { return fkoverlay.BackendFileProvider }
@@ -72,10 +74,25 @@ func (f *fakeFPProv) Teardown(_, _ string) (string, error) {
 	return "", nil
 }
 
+// Signal satisfies overlay.FPSignaler — the UNCONDITIONAL enumerator nudge the
+// recovery ladder's attempt 1 fires (never fingerprint-gated).
+func (f *fakeFPProv) Signal(_ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.signals++
+	return f.signalErr
+}
+
 func (f *fakeFPProv) counts() (healths, setups, syncs, teardowns int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.healths, f.setups, f.syncs, f.teardowns
+}
+
+func (f *fakeFPProv) signalCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.signals
 }
 
 // newFPServer builds a test server whose acct-1 is a fileprovider row served by

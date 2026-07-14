@@ -435,3 +435,74 @@ func TestPoolContentSourceHealthErrors(t *testing.T) {
 		t.Errorf("HealthErrors() = %v after a successful re-read, want nil (cleared)", err)
 	}
 }
+
+// manifestVersion returns the Version of the named synth entry in domain's manifest.
+func manifestVersion(t *testing.T, f csFixture, name string) string {
+	t.Helper()
+	entries, err := f.src.Manifest(f.domain)
+	if err != nil {
+		t.Fatalf("Manifest: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name == name {
+			return e.Version
+		}
+	}
+	t.Fatalf("no manifest entry %q", name)
+	return ""
+}
+
+// TestManifestSynthVersionsTrackFreshness pins that each synth entry carries a
+// non-empty freshness version that is stable across Manifest calls, moves when its
+// own freshness file changes, and is unaffected by an unrelated file's change.
+func TestManifestSynthVersionsTrackFreshness(t *testing.T) {
+	f := newCSFixture(t)
+	writeJSON(t, f.privCJ, map[string]any{"a": 1})
+	writeJSON(t, f.baseCJ, map[string]any{"b": 2})
+	writeJSON(t, f.baseSet, map[string]any{"s": 1})
+
+	cj1 := manifestVersion(t, f, ".claude.json")
+	set1 := manifestVersion(t, f, "settings.json")
+	if cj1 == "" || set1 == "" {
+		t.Fatalf("synth entries must carry a non-empty freshness version: cj=%q set=%q", cj1, set1)
+	}
+
+	// Stable across Manifest calls when nothing changed (survives across calls).
+	if got := manifestVersion(t, f, ".claude.json"); got != cj1 {
+		t.Fatalf(".claude.json version changed with no file change: %q -> %q", cj1, got)
+	}
+	if got := manifestVersion(t, f, "settings.json"); got != set1 {
+		t.Fatalf("settings.json version changed with no file change: %q -> %q", set1, got)
+	}
+
+	// A private .claude.json change (bigger payload -> size differs) moves ONLY its version.
+	writeJSON(t, f.privCJ, map[string]any{"a": 1, "grown": "xxxxxxxxxxxxxxxx"})
+	cj2 := manifestVersion(t, f, ".claude.json")
+	if cj2 == cj1 {
+		t.Fatal(".claude.json version must change when the private file changes")
+	}
+	if got := manifestVersion(t, f, "settings.json"); got != set1 {
+		t.Fatalf("settings.json version must be unaffected by a .claude.json change: %q -> %q", set1, got)
+	}
+
+	// A base settings change moves settings.json's version.
+	writeJSON(t, f.baseSet, map[string]any{"s": 1, "grown": "yyyyyyyyyyyyyyyy"})
+	if got := manifestVersion(t, f, "settings.json"); got == set1 {
+		t.Fatal("settings.json version must change when base settings changes")
+	}
+}
+
+// TestManifestSynthVersionAbsentToPresent pins the ENOENT "absent" marker: a synth's
+// version is defined while its freshness file is absent and changes the moment it appears.
+func TestManifestSynthVersionAbsentToPresent(t *testing.T) {
+	f := newCSFixture(t)
+	// No private .claude.json yet: FreshnessVersion contributes the absent marker.
+	absentVer := manifestVersion(t, f, ".claude.json")
+	if absentVer == "" {
+		t.Fatal("an absent freshness file must still yield a defined version")
+	}
+	writeJSON(t, f.privCJ, map[string]any{"a": 1})
+	if got := manifestVersion(t, f, ".claude.json"); got == absentVer {
+		t.Fatal("version must change when an absent freshness file appears")
+	}
+}

@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,16 +10,78 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/execguard"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/lease"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // ccpAccountEnv forces a specific account for `ccp run`, which parses no flags
 // (every arg passes through to claude) — hence an env var, not a flag.
 const ccpAccountEnv = "CCP_ACCOUNT"
+
+// settingsJSONName is the per-account settings file the exec-time guard materializes.
+const settingsJSONName = "settings.json"
+
+// fpLaunchPrepareDeadline bounds the pre-launch File Provider materialization.
+const fpLaunchPrepareDeadline = 30 * time.Second
+
+// fpDomainPreparer is the launch-time materialization op the File Provider provider
+// exposes (satisfied by *fusekit/overlay.FileProviderProvider).
+type fpDomainPreparer interface {
+	PrepareDomain(ctx context.Context, accountDir string, deadline time.Duration) error
+}
+
+// fpLaunchPreparer resolves the File Provider domain preparer; a var so tests inject
+// a fake without a live companion app.
+var fpLaunchPreparer = func() (fpDomainPreparer, error) {
+	prov, err := pool.OverlayProviderFor(fkoverlay.BackendFileProvider)
+	if err != nil {
+		return nil, err
+	}
+	preparer, ok := prov.(fpDomainPreparer)
+	if !ok {
+		return nil, fmt.Errorf("file provider provider %T cannot prepare its domain", prov)
+	}
+	return preparer, nil
+}
+
+// prepareFPForLaunch force-materializes a File Provider account's computed
+// settings.json before a launch commits, so claude's first read never blocks on a
+// cold fetch. A non-FP account is a no-op. forced (CCP_ACCOUNT) names the account in
+// a not-serving failure for a retry; an auto pick fails the launch too (the daemon's
+// select-time probe already excludes genuinely-non-serving domains, so a retry picks
+// another). An ErrOpUnsupported app is a loud cask-upgrade error, never a silent
+// unready launch; a busy/unreachable app fails THIS launch without wedging the domain.
+func prepareFPForLaunch(ctx context.Context, a store.Account, forced bool) error {
+	if !isFPRow(a.OverlayKind) {
+		return nil
+	}
+	preparer, err := fpLaunchPreparer()
+	if err != nil {
+		return fmt.Errorf("acct-%02d resolve file provider: %w", a.ID, err)
+	}
+	switch err := preparer.PrepareDomain(ctx, a.ConfigDir, fpLaunchPrepareDeadline); {
+	case err == nil:
+		return nil
+	case errors.Is(err, fileproviderd.ErrOpUnsupported):
+		return err // the provider already prefixed the cask-upgrade hint
+	case errors.Is(err, fileproviderd.ErrDomainNotServing):
+		if forced {
+			return fmt.Errorf("acct-%02d's file provider domain is not serving; retry once it recovers: %w", a.ID, err)
+		}
+		return fmt.Errorf("acct-%02d's file provider domain is not serving; re-run to pick another account: %w", a.ID, err)
+	case errors.Is(err, fileproviderd.ErrBusy), errors.Is(err, fileproviderd.ErrAppUnavailable):
+		return fmt.Errorf("acct-%02d's companion app is busy or unreachable; retry this launch: %w", a.ID, err)
+	default:
+		return fmt.Errorf("acct-%02d's file provider domain is not ready; retry: %w", a.ID, err)
+	}
+}
 
 func newRunCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -44,14 +108,16 @@ off the fuse-t mirror, where the bulk write would wedge it. ` + "`ccp run`" + ` 
 				if err := requireInit(m); err != nil {
 					return err
 				}
-				return runClaude(cmd, m, args, acquireAndProbeSessionLease, execClaude)
+				return runClaude(cmd, m, args)
 			})
 		},
 	}
 	return cmd
 }
 
-func runClaude(cmd *cobra.Command, m *pool.Manager, args []string, acquire func(store.Account) (*lease.Handle, error), execFn func(*lease.Handle, string, []string) error) error {
+// runClaude resolves the account selection (resolveSelection runs the daemon-response
+// validator before any client-side effect), then commits the pick to a launch.
+func runClaude(cmd *cobra.Command, m *pool.Manager, args []string) error {
 	account, err := ccpAccountFromEnv()
 	if err != nil {
 		return err
@@ -63,16 +129,39 @@ func runClaude(cmd *cobra.Command, m *pool.Manager, args []string, acquire func(
 	if err != nil {
 		return err
 	}
-	step(cmd.ErrOrStderr(), "%s", line)
-	// Take the session lease BEFORE exec: its non-CLOEXEC fd rides through
-	// into claude, pinning the account's mount against holder teardown for
-	// the whole session, and the post-Acquire probe refuses to exec into a
-	// dead or partially-wedged mount.
-	h, err := acquire(acct)
+	return runLaunch(cmd, acct, dir, line, args, account != nil)
+}
+
+// runAcquireLease and runExecClaude are the run pipeline's lease-acquire and exec
+// seams — package vars so a pipeline test can assert the launch ordering (a failed
+// prepare gate leaves them uncalled) without a live holder or a real exec.
+var (
+	runAcquireLease = acquireAndProbeSessionLease
+	runExecClaude   = execClaude
+)
+
+// runLaunch commits a resolved selection to a claude exec. The order is load-bearing:
+// the FP prepare gate (P7) runs first, so a failure aborts with NO lease, NO banner,
+// and NO exec; only then the session lease, the settings.json prime (P8, FP only), the
+// pick banner, and exec. A non-FP account skips prepare and priming.
+func runLaunch(cmd *cobra.Command, acct store.Account, dir, line string, args []string, forced bool) error {
+	if err := prepareFPForLaunch(cmd.Context(), acct, forced); err != nil {
+		return err
+	}
+	// Session lease BEFORE exec: its non-CLOEXEC fd rides into claude, pinning the
+	// mount; the post-Acquire probe refuses a dead/wedged mount.
+	h, err := runAcquireLease(acct)
 	if err != nil {
 		return err
 	}
-	return execFn(h, dir, args)
+	if isFPRow(acct.OverlayKind) {
+		if err := execguard.PrimeForExec(filepath.Join(dir, settingsJSONName)); err != nil {
+			_ = h.Close()
+			return err
+		}
+	}
+	step(cmd.ErrOrStderr(), "%s", line)
+	return runExecClaude(h, dir, args)
 }
 
 func ccpAccountFromEnv() (*int, error) {

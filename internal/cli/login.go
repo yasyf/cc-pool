@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/execguard"
 	"github.com/yasyf/cc-pool/internal/pool"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"golang.org/x/term"
@@ -100,7 +101,7 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 	state, _ := term.GetState(fd) // nil on non-TTY; restore is nil-safe
 
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-	outcome, werr := watchAndClose(ctx, c, probe)
+	outcome, werr := watchAndClose(ctx, c, p.OverlayKind == fkoverlay.BackendFileProvider, probe)
 	restoreTerminal(cmd.OutOrStdout(), fd, state)
 	// On success return ctx.Err(): a cancellation while closing must stop the
 	// add here, not at finalize.
@@ -111,10 +112,29 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 }
 
 // watchAndClose starts c, waits via awaitLogin, and terminates c unless it
-// exited on its own. The caller owns terminal setup and teardown.
-func watchAndClose(ctx context.Context, c *exec.Cmd, probe func() (bool, error)) (awaitOutcome, error) {
-	if err := c.Start(); err != nil {
-		return awaitCanceled, fmt.Errorf("start claude auth login: %w", err)
+// exited on its own. The caller owns terminal setup and teardown. With fp set (a
+// File Provider account), dataless-file materialization is turned on before the
+// spawn so the claude child inherits it, then restored — this long-lived parent (the
+// status TUI) must never keep the process-wide policy on. A package var so the TUI
+// relogin flow's launch-failure surfacing is testable without a real spawn.
+var watchAndClose = func(ctx context.Context, c *exec.Cmd, fp bool, probe func() (bool, error)) (awaitOutcome, error) {
+	restore := func() error { return nil }
+	if fp {
+		r, err := execguard.EnableForSpawn()
+		if err != nil {
+			return awaitCanceled, fmt.Errorf("enable dataless-file materialization: %w", err)
+		}
+		restore = r
+	}
+	startErr := c.Start()
+	restoreErr := restore()
+	switch {
+	case startErr != nil:
+		return awaitCanceled, fmt.Errorf("start claude auth login: %w", startErr)
+	case restoreErr != nil:
+		_ = c.Process.Kill()
+		_, _ = c.Process.Wait()
+		return awaitCanceled, fmt.Errorf("restore dataless-file materialization after spawn: %w", restoreErr)
 	}
 	procExit := make(chan error, 1)
 	go func() { procExit <- c.Wait() }()
