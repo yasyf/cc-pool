@@ -441,7 +441,9 @@ func TestMaterializeRejectedEnvelopeThroughRealPullerReleases(t *testing.T) {
 			pull := func(ctx context.Context, uuid string, chain ChainStamp, peers []string) (*creds.Credential, error) {
 				// The released add's still-running login lands mid-pull.
 				fk.Put(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel(), retained)
-				dial := func(string) syncservice.Transport { return envelopeTransport(t, tc.served, creds.AccessHash(tc.served)) }
+				dial := func(string) syncservice.Transport {
+					return envelopeTransport(t, tc.served, creds.AccessHash(tc.served))
+				}
 				return FetchCredential(ctx, dial, uuid, chain, 0, peers)
 			}
 			oauthAccount := json.RawMessage(`{"accountUuid":"u-real","emailAddress":"r@example.com"}`)
@@ -485,7 +487,7 @@ func TestMaterializePullFailureNeverDestroysConcurrentLogin(t *testing.T) {
 		"hash-mismatch envelope": func(t *testing.T) syncservice.Transport {
 			return envelopeTransport(t, freshEnvelope("at-peer"), "garbage-hash")
 		},
-		"method not found": func(t *testing.T) syncservice.Transport {
+		"method not found": func(_ *testing.T) syncservice.Transport {
 			return &fakeTransport{do: func(context.Context, *rpc.Request) (*syncservice.Response, error) {
 				return &syncservice.Response{OK: false, Error: `unknown method "ccp.fetch_stripped_credential"`}, nil
 			}}
@@ -670,6 +672,7 @@ func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
 	if !ok || got.ClaudeAiOauth.RefreshToken != "rt-kept" {
 		t.Fatalf("retained credential = %+v ok=%v, want rt-kept intact", got, ok)
 	}
+	// #nosec G304 -- keptDir is a test-controlled temporary account directory.
 	raw, err := os.ReadFile(filepath.Join(keptDir, ".claude.json"))
 	if err != nil {
 		t.Fatal(err)

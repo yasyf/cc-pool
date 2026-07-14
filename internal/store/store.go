@@ -788,7 +788,7 @@ func (s *Store) ListJournalRisks() ([]JournalRisk, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list journal risks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []JournalRisk
 	for rows.Next() {
 		var r JournalRisk

@@ -436,9 +436,9 @@ func TestStatusRendersMesh(t *testing.T) {
 		"u-1",
 		"Work",
 		"2023-11-14T22:13:20Z", // 1700000000000 ms
-		"ORIGIN",                // the v2 registry table columns
+		"ORIGIN",               // the v2 registry table columns
 		"LOCAL",
-		"hosta", // u-1's chain origin
+		"hosta",   // u-1's chain origin
 		"removed", // the u-9 tombstone row
 		"plaintext file store",
 	} {

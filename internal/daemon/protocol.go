@@ -177,7 +177,7 @@ type AccountStatus struct {
 	Remaining7d    float64   `json:"remaining_7d"`
 	ActiveSessions int       `json:"active_sessions"`
 	RateLimited    bool      `json:"rate_limited"`
-	Exhausted      bool      `json:"exhausted,omitempty"`   // a window is pegged with its reset pending
+	Exhausted      bool      `json:"exhausted,omitempty"`       // a window is pegged with its reset pending
 	NeedsLogin     bool      `json:"needs_login,omitempty"`     // refresh token gone/revoked; run `ccp login N`
 	AwaitingOrigin bool      `json:"awaiting_origin,omitempty"` // synced peer copy expired; recovers on origin rotation or a local `ccp login`
 	HasUsage       bool      `json:"has_usage"`                 // false when there is no known-good sample (never sampled, or only 429 placeholders)

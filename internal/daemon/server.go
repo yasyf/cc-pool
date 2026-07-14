@@ -1182,7 +1182,6 @@ func (s *Server) warnTeardown(id int, warning string) {
 	}
 }
 
-
 // healOutcome classifies one healFuse attempt.
 type healOutcome int
 
@@ -1310,7 +1309,7 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 // over them would shadow the account's identity), then the provider mounts. A dead
 // holder's carcass or a base-mismatched registry row gets one unmount-then-retry.
 // See ccn doc 7bf8406.
-func (s *Server) mountFuse(ctx context.Context, a store.Account) error {
+func (s *Server) mountFuse(_ context.Context, a store.Account) error {
 	prov := s.overlayForRow(a)
 	if prov == nil || !prov.Backend().IsFuse() {
 		return fmt.Errorf("no fuse provider resolved for acct-%02d; refusing to mount through it", a.ID)

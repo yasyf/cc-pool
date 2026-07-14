@@ -145,7 +145,7 @@ func TestPreflightRefreshUnrefreshablePassthrough(t *testing.T) {
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("err = %v, want %v", err, tc.wantErr)
 			}
-			if tc.wantErr != nil && err != tc.wantErr {
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
 				t.Fatalf("err = %v, want the bare sentinel for caller warns", err)
 			}
 			if got := refreshCount(fo); got != 0 {

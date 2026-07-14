@@ -47,6 +47,7 @@ type iopolParam struct {
 
 func setiopolicy(iotype, scope, policy int32) error {
 	p := iopolParam{scope: scope, iotype: iotype, policy: policy}
+	// #nosec G103 -- iopolicysys requires a pointer to this fixed kernel parameter struct.
 	_, _, errno := syscall.Syscall(sysIopolicysys, iopolCmdSet, uintptr(unsafe.Pointer(&p)), 0)
 	runtime.KeepAlive(&p)
 	if errno != 0 {

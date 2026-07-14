@@ -120,6 +120,7 @@ func serving(t *testing.T, cred *creds.Credential) *fakeTransport {
 // (or a v1 client against a v2 server) gets unknown-method, and the secret
 // never crosses. Reusing the v1 string would silently reopen that leak.
 func TestFetchMethodIsNotTheV1Name(t *testing.T) {
+	// #nosec G101 -- this is an RPC method-name constant, not a credential.
 	if MethodFetchCredential != "ccp.fetch_stripped_credential" {
 		t.Fatalf("MethodFetchCredential = %q, want the pinned v2 name ccp.fetch_stripped_credential (never v1's ccp.fetch_credential)", MethodFetchCredential)
 	}
@@ -352,7 +353,7 @@ func TestFetchCredentialOriginAuthoritativeRelayMustMatch(t *testing.T) {
 	})
 
 	t.Run("origin staler than local is rejected", func(t *testing.T) {
-		dial := func(peer string) syncservice.Transport { return serving(t, advertised) }
+		dial := func(_ string) syncservice.Transport { return serving(t, advertised) }
 		got, err := FetchCredential(context.Background(), dial, "u-1", chain, 6_000, []string{"hostA", "hostB"})
 		if got != nil {
 			t.Fatalf("pulled %+v, want nil — origin authority never overrides freshness", got)
@@ -648,12 +649,12 @@ func TestFetchOrderTrustedSetOnly(t *testing.T) {
 		want   []string
 	}{
 		"member origin is prioritized first": {origin: "hostA", peers: []string{"hostB", "hostA"}, want: []string{"hostA", "hostB"}},
-		"non-member origin is dropped":        {origin: "hostZ", peers: []string{"hostA", "hostB"}, want: []string{"hostA", "hostB"}},
-		"exec injection origin is dropped":    {origin: "exec:touch /tmp/pwned", peers: []string{"hostA"}, want: []string{"hostA"}},
-		"empty origin just orders peers":      {origin: "", peers: []string{"hostA", "hostB"}, want: []string{"hostA", "hostB"}},
-		"duplicate and empty peers dropped":   {origin: "hostA", peers: []string{"hostA", "", "hostA", "hostB"}, want: []string{"hostA", "hostB"}},
-		"no peers yields nothing to dial":     {origin: "exec:evil", peers: nil, want: []string{}},
-		"implausible newline peer dropped":    {origin: "hostA", peers: []string{"hostA", "host\nB"}, want: []string{"hostA"}},
+		"non-member origin is dropped":       {origin: "hostZ", peers: []string{"hostA", "hostB"}, want: []string{"hostA", "hostB"}},
+		"exec injection origin is dropped":   {origin: "exec:touch /tmp/pwned", peers: []string{"hostA"}, want: []string{"hostA"}},
+		"empty origin just orders peers":     {origin: "", peers: []string{"hostA", "hostB"}, want: []string{"hostA", "hostB"}},
+		"duplicate and empty peers dropped":  {origin: "hostA", peers: []string{"hostA", "", "hostA", "hostB"}, want: []string{"hostA", "hostB"}},
+		"no peers yields nothing to dial":    {origin: "exec:evil", peers: nil, want: []string{}},
+		"implausible newline peer dropped":   {origin: "hostA", peers: []string{"hostA", "host\nB"}, want: []string{"hostA"}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

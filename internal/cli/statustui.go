@@ -99,7 +99,7 @@ type statusTUI struct {
 	// acquireLease holds the session lease across the interactive relogin so the
 	// holder never tears down the mount mid-login; nil uses acquireAndProbeSessionLease.
 	acquireLease func(a store.Account) (*lease.Handle, error)
-	readCred    func(a store.Account) (*creds.Credential, error) // credential resolution for the re-login probe (both backends)
+	readCred     func(a store.Account) (*creds.Credential, error) // credential resolution for the re-login probe (both backends)
 	// resolveAccount re-loads the account from the store: wire snapshots carry
 	// no keychain fields, so credential operations must never use s.Account.
 	resolveAccount func(id int) (store.Account, error)

@@ -297,7 +297,7 @@ func TestWarnPreflight(t *testing.T) {
 					t.Errorf("warn = %q, want it to contain %q", out, want)
 				}
 			}
-			if tc.err == pool.ErrUnrefreshable && strings.Contains(out, "needs to log in again") {
+			if errors.Is(tc.err, pool.ErrUnrefreshable) && strings.Contains(out, "needs to log in again") {
 				t.Errorf("unrefreshable must not use the needs-login copy: %q", out)
 			}
 		})

@@ -84,6 +84,7 @@ func realRegisterProcExit(pid int) (procWaiter, error) {
 		return nil, err
 	}
 	ev := unix.Kevent_t{
+		// #nosec G115 -- the caller validates pid is greater than one before registering the watch.
 		Ident:  uint64(pid),
 		Filter: unix.EVFILT_PROC,
 		Flags:  unix.EV_ADD | unix.EV_ONESHOT,

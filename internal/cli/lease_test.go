@@ -315,6 +315,7 @@ func TestSlotAdvisorySemantics(t *testing.T) {
 	_ = os.Remove(slotPath)
 
 	// A held-but-INITIALIZING slot (flock held, no ready marker) ⇒ doubt.
+	// #nosec G304 -- slotPath is a test-controlled temporary lease-agent slot.
 	initing, err := os.OpenFile(slotPath, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -617,6 +618,7 @@ func TestSweepInheritedFDsExcept(t *testing.T) {
 	defer func() { _ = r4.Close() }()
 	defer func() { _ = w4.Close() }()
 
+	// #nosec G204 G702 -- the test re-execs itself with a fixed -test.run helper flag.
 	cmd := exec.Command(os.Args[0], "-test.run", "^TestSweepInheritedFDsExcept$")
 	cmd.Env = append(os.Environ(), "FDSWEEP_EXCEPT3_HELPER=1")
 	cmd.ExtraFiles = []*os.File{w3, r4} // non-CLOEXEC in the child at fd 3 and fd 4
@@ -705,6 +707,7 @@ func TestLeaseAgentReadyFDGate(t *testing.T) {
 			}
 			defer func() { _ = r3.Close() }()
 
+			// #nosec G204 G702 -- the test re-execs itself with a fixed -test.run helper flag.
 			cmd := exec.Command(os.Args[0], "-test.run", "^TestLeaseAgentReadyFDGate$")
 			cmd.Env = append(os.Environ(), "LEASEAGENT_FD3_HELPER="+tc.mode)
 			cmd.ExtraFiles = []*os.File{w3}

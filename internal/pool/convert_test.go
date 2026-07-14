@@ -2318,12 +2318,12 @@ func TestConvertCrashInjectionPreservesIdentity(t *testing.T) {
 // dispatch's default arm is reachable behind the Backend() equality fences.
 type stubProvider struct{ backend fkoverlay.Backend }
 
-func (s stubProvider) Backend() fkoverlay.Backend    { return s.backend }
-func (s stubProvider) Setup(_, _ string) error       { return nil }
-func (s stubProvider) Sync(_, _ string) error        { return nil }
-func (s stubProvider) Health(_, _ string) error      { return nil }
-func (s stubProvider) Teardown(_, _ string) (string, error)    { return "", nil }
-func (s stubProvider) PrivateRoot(dir string) string { return dir }
+func (s stubProvider) Backend() fkoverlay.Backend           { return s.backend }
+func (s stubProvider) Setup(_, _ string) error              { return nil }
+func (s stubProvider) Sync(_, _ string) error               { return nil }
+func (s stubProvider) Health(_, _ string) error             { return nil }
+func (s stubProvider) Teardown(_, _ string) (string, error) { return "", nil }
+func (s stubProvider) PrivateRoot(dir string) string        { return dir }
 
 // TestConvertOverlayRefusesUnknownTargetArm pins the dispatch's loud default: a
 // target backend with no conversion arm errors without touching the account.

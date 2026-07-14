@@ -36,12 +36,12 @@ func TestHealFPRowsCadence(t *testing.T) {
 	}{
 		{
 			name:        "healthy, deep not due: shallow only",
-			setup:       func(t *testing.T, s *Server, dir string) { s.recordFPProbeClock(dir, time.Now()) },
+			setup:       func(_ *testing.T, s *Server, dir string) { s.recordFPProbeClock(dir, time.Now()) },
 			wantShallow: 1, wantDeep: 0,
 		},
 		{
 			name:        "healthy, deep due: shallow then deep",
-			setup:       func(t *testing.T, s *Server, dir string) {}, // never clocked -> deep due
+			setup:       func(_ *testing.T, _ *Server, _ string) {}, // never clocked -> deep due
 			wantShallow: 1, wantDeep: 1,
 		},
 		{
@@ -132,8 +132,8 @@ func TestHealFPRowsDeepOnlyFailureLatches(t *testing.T) {
 	s, _, dirs, _ := newFPHealServer(t)
 	s.fpBridgeReadyFn = func() bool { return true }
 	swapFPDirLinked(t, func(string) bool { return true })
-	swapFPDomainProbeShallow(t, func(_ context.Context, _ string) error { return nil })                     // shallow always OK
-	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeEmpty })        // deep serve-stale on a non-empty synth
+	swapFPDomainProbeShallow(t, func(_ context.Context, _ string) error { return nil })              // shallow always OK
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeEmpty }) // deep serve-stale on a non-empty synth
 
 	for i := 0; i < fpWedgeStrikes; i++ {
 		if s.fpWedged(dirs[1]) {

@@ -258,13 +258,7 @@ func (s *Service) ScanPublish(ctx context.Context, reg Registry) (bool, error) {
 			// The origin's entry arrives by merge instead.
 			continue
 		case !ok:
-			reg.Add(l.UUID, AccountValue{
-				UUID:         l.UUID,
-				Email:        l.Email,
-				Label:        l.Label,
-				OAuthAccount: l.OAuthAccount,
-				Chain:        l.Chain,
-			}, s.forceStamp(entry))
+			reg.Add(l.UUID, AccountValue(l), s.forceStamp(entry))
 			changed = true
 		case !entry.Present():
 			// Tombstoned: never resurrect from a local scan.

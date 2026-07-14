@@ -167,7 +167,7 @@ func (g featureGate) requireHolderVerified() error {
 			return fmt.Errorf("%w: %w", ErrHolderUnsupported, herr)
 		default:
 			if time.Now().After(deadline) {
-				return fmt.Errorf("%w: the mount holder did not answer a capability handshake after mounting (%v) — the mount is unverified; run `ccp doctor`", ErrHolderUnsupported, herr)
+				return fmt.Errorf("%w: the mount holder did not answer a capability handshake after mounting (%w) — the mount is unverified; run `ccp doctor`", ErrHolderUnsupported, herr)
 			}
 			time.Sleep(holderVerifyPoll)
 		}

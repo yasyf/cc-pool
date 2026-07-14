@@ -93,7 +93,7 @@ func TestSeizeSessionLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer h.Close()
+	defer func() { _ = h.Close() }()
 	if _, err := m.SeizeSessionLease(a); !errors.Is(err, lease.ErrBusy) {
 		t.Fatalf("SeizeSessionLease under a live handout = %v, want lease.ErrBusy", err)
 	}

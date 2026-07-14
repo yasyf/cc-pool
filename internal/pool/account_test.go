@@ -640,6 +640,7 @@ func (s *stubOverlay) Teardown(_, dir string) (string, error) {
 	_ = os.RemoveAll(fkoverlay.FusePrivateRoot(dir))
 	return "", nil
 }
+
 func (s *stubOverlay) PrivateRoot(dir string) string {
 	if s.backend.IsFuse() {
 		return fkoverlay.FusePrivateRoot(dir)

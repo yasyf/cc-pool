@@ -444,12 +444,12 @@ type fakeFPProvider struct {
 	setupErr          error
 }
 
-func (f *fakeFPProvider) Backend() fkoverlay.Backend    { return fkoverlay.BackendFileProvider }
-func (f *fakeFPProvider) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
-func (f *fakeFPProvider) Health(_, _ string) error      { return nil }
-func (f *fakeFPProvider) Sync(_, _ string) error        { return nil }
-func (f *fakeFPProvider) Teardown(_, _ string) (string, error)    { f.teardowns++; return "", nil }
-func (f *fakeFPProvider) Setup(_, _ string) error       { f.setups++; return f.setupErr }
+func (f *fakeFPProvider) Backend() fkoverlay.Backend           { return fkoverlay.BackendFileProvider }
+func (f *fakeFPProvider) PrivateRoot(dir string) string        { return fkoverlay.FusePrivateRoot(dir) }
+func (f *fakeFPProvider) Health(_, _ string) error             { return nil }
+func (f *fakeFPProvider) Sync(_, _ string) error               { return nil }
+func (f *fakeFPProvider) Teardown(_, _ string) (string, error) { f.teardowns++; return "", nil }
+func (f *fakeFPProvider) Setup(_, _ string) error              { f.setups++; return f.setupErr }
 
 // TestRepairFPDirect pins the daemon-down direct repair: it re-registers every
 // File Provider row (Teardown+Setup) through the injected provider, warns that

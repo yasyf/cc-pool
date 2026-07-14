@@ -18,6 +18,7 @@ const iopolCmdGet = 1 // IOPOL_CMD_GET
 // getMaterialize reads a scope's dataless-materialize policy via iopolicysys GET.
 func getMaterialize(scope int32) (int32, syscall.Errno) {
 	p := iopolParam{scope: scope, iotype: iopolTypeVFSMaterializeDatalessFiles}
+	// #nosec G103 -- iopolicysys requires a pointer to this fixed kernel parameter struct.
 	_, _, errno := syscall.Syscall(sysIopolicysys, iopolCmdGet, uintptr(unsafe.Pointer(&p)), 0)
 	return p.policy, errno
 }

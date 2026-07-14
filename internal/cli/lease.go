@@ -236,13 +236,15 @@ var spawnPendingLeaseAgent = func(p *pool.PendingAdd) error {
 // (readyPipeFD, ExtraFiles[0]); it must round-trip through SpawnedLeaseAgentReadyFD, the
 // single source the child adopts and main's sweep preserves.
 func leaseAgentArgs(leader int, start int64, id int, key, probeDir string, fuseRow bool) []string {
-	args := []string{leaseAgentSubcommand,
+	args := []string{
+		leaseAgentSubcommand,
 		"--pid", strconv.Itoa(leader),
 		"--start", strconv.FormatInt(start, 10),
 		"--id", strconv.Itoa(id),
 		"--dir", key,
 		"--probe", probeDir,
-		"--ready-fd", strconv.Itoa(readyPipeFD)}
+		"--ready-fd", strconv.Itoa(readyPipeFD),
+	}
 	if fuseRow {
 		args = append(args, "--fuse")
 	}
@@ -414,7 +416,7 @@ func newLeaseAgentCmd() *cobra.Command {
 		Short:  "Hold a session lease until a watched shell exits (internal)",
 		Hidden: true,
 		Args:   cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			// INVARIANT: adopt the fd from the SAME parse main's sweep used, never cobra's
 			// --ready-fd (pflag is base-0/last-occurrence, the sweep base-10/first) — the
 			// handshake must reuse the fd the sweep preserved, so the two cannot diverge.
@@ -498,7 +500,7 @@ func runLeaseAgent(leader int, wantStart int64, id int, dir, probe string, fuseR
 		signalReady(ready, nil)
 		return <-exited
 	}
-	defer waiter.Close()
+	defer func() { _ = waiter.Close() }()
 	if err := revalidateLeader(leader, wantStart); err != nil {
 		return signalFail(ready, err)
 	}
@@ -590,6 +592,7 @@ func slotCovered(leader int, start int64, key string) bool {
 		return false
 	}
 	p := filepath.Join(agentDir, leaseAgentSlotKey(leader, start, key))
+	// #nosec G304 -- p is a self-controlled lease-agent slot inside the private state directory.
 	f, err := os.OpenFile(p, os.O_RDONLY, 0)
 	if err != nil {
 		return false
@@ -630,6 +633,7 @@ func writeAdvisorySlot(leader int, start int64, key string) *os.File {
 		return nil
 	}
 	p := filepath.Join(agentDir, leaseAgentSlotKey(leader, start, key))
+	// #nosec G304 -- p is a self-controlled lease-agent slot inside the private state directory.
 	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil

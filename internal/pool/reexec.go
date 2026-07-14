@@ -66,7 +66,7 @@ func reexecStable(resolved, dir, name string) error {
 // when a byte-identical executable already sits there.
 func materializeStableExe(srcPath, dir, name string) error {
 	target := filepath.Join(dir, name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("create stable exec dir %s: %w", dir, err)
 	}
 	switch matched, err := stableExeMatches(srcPath, target); {
@@ -75,11 +75,12 @@ func materializeStableExe(srcPath, dir, name string) error {
 	case matched:
 		return nil
 	}
+	// #nosec G304 -- srcPath is the resolved path of the currently running executable.
 	in, err := os.Open(srcPath)
 	if err != nil {
 		return fmt.Errorf("open source %s: %w", srcPath, err)
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	tmp, err := os.CreateTemp(dir, name+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create stable temp in %s: %w", dir, err)
@@ -87,15 +88,15 @@ func materializeStableExe(srcPath, dir, name string) error {
 	renamed := false
 	defer func() {
 		if !renamed {
-			os.Remove(tmp.Name())
+			_ = os.Remove(tmp.Name())
 		}
 	}()
 	if _, err := io.Copy(tmp, in); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("copy to %s: %w", tmp.Name(), err)
 	}
 	if err := tmp.Chmod(0o755); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("chmod %s: %w", tmp.Name(), err)
 	}
 	if err := tmp.Close(); err != nil {
@@ -140,11 +141,12 @@ func stableExeMatches(srcPath, target string) (bool, error) {
 }
 
 func fileSHA256(path string) ([sha256.Size]byte, error) {
+	// #nosec G304 -- path is one of the self-controlled executable paths compared above.
 	f, err := os.Open(path)
 	if err != nil {
 		return [sha256.Size]byte{}, fmt.Errorf("open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return [sha256.Size]byte{}, fmt.Errorf("hash %s: %w", path, err)

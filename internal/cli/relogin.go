@@ -63,7 +63,7 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	if err != nil {
 		return err
 	}
-	defer h.Close()
+	defer func() { _ = h.Close() }()
 
 	out := cmd.OutOrStdout()
 	cleared, err := shortCircuitRelogin(cmd.Context(), m, a)

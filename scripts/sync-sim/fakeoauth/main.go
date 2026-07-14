@@ -106,6 +106,7 @@ func main() {
 		}
 	}
 	fmt.Fprintf(os.Stderr, "fakeoauth[%s]: listening on %s\n", *host, bound)
+	// #nosec G114 -- this local-only test simulator intentionally serves until terminated.
 	if err := http.Serve(ln, mux); err != nil {
 		fmt.Fprintf(os.Stderr, "fakeoauth: serve: %v\n", err)
 		os.Exit(1)
