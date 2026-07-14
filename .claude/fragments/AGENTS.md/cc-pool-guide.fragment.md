@@ -103,21 +103,6 @@ Sequential is the exception, not the default. Two steps that don't consume each 
 
 Single-step exception: one task, no parallel sibling, no follow-on → one subagent call is fine.
 
-## Code Search
-
-`semble` is wired up via `.mcp.json` (project-scoped MCP server, runs via `uvx` — nothing to install). It's the default tool for any "find code by intent or symbol" question:
-
-1. **"How do we do X?" / "Where is the code that does Y?"** → `semble.search("...")`
-2. **"Where is `Foo` defined?"** → `semble.search("Foo")` (or `search("type Foo")` for a relevance boost)
-3. **"Show me other code like this"** → `semble.find_related` on a prior hit
-4. **Cross-repo lookup** → pass an `https://...git` URL as `repo`
-
-`repo` defaults to the current project root for local searches. Semble is purely semantic — it ranks by meaning, not substring, so it won't find literal strings that don't appear in nearby code.
-
-Reach for the **LSP** when the answer must be *exhaustive* or *structural*: `findReferences`/`incomingCalls` for "who calls X", `goToImplementation` for "what implements interface I", `hover` for types.
-
-Reach for **`Grep`** only for material neither tool indexes: literal *content* of strings/comments (error messages, env-var names, Keychain service names, TODOs) and non-source files (plists, JSON, logs). File-pattern questions go through `Glob`.
-
 ## Style Rules (summary — see STYLEGUIDE.md)
 
 - **Fail fast, fail loud.** No silent fallbacks, sentinels, or defensive coding. No back-compat shims — delete dead code.

@@ -1,3 +1,7 @@
 fragments = [
   "cc-pool-guide",
+  "cc-skills:ccx",
 ]
+
+[sources.cc-skills]
+source = "github:yasyf/cc-skills@main"

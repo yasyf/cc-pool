@@ -17,7 +17,7 @@ Durable knowledge routes through `cc-notes`, never loose markdown in the tree: a
 
 Plans you author must specify, and plans you execute must enforce, that substantive work runs as **dynamic workflows** (`Workflow` tool): the script holds the loop, branching, and intermediate results; your context holds only final answers. This section is standing authorization to invoke `Workflow`. Multi-phase work runs as workflows in sequence (understand → implement → verify); read each result before dispatching the next.
 
-Exceptions: trivial single-file edits, single file reads, and single targeted `semble`/`LSP`/`Grep` lookups stay at the main-agent level; a lone ad-hoc investigation gets one subagent (fallbacks: AGENTS.md `## Parallelize Independent Work`).
+Exceptions: trivial single-file edits, single file reads, and single targeted `ccx`/`LSP`/`Grep` lookups stay at the main-agent level; a lone ad-hoc investigation gets one subagent (fallbacks: AGENTS.md `## Parallelize Independent Work`).
 
 **Sweeps are workflows, not teams.** A bounded N-unit sweep — test-module conversions, per-file migrations, mechanical refactor passes — runs as a `Workflow` fan-out, never as `Agent` calls nested under a teammate: a teammate's own subagents are foreground-only ([teams limitations](https://code.claude.com/docs/en/agent-teams#limitations)), so the teammate sits blocked while they run, and the official sizing puts teams at a handful of long-running peers vs workflows at dozens-to-hundreds of agents per run ([workflows](https://code.claude.com/docs/en/workflows#when-to-use-a-workflow)). A teammate that finds itself holding a sweep delegates it to a workflow.
 
