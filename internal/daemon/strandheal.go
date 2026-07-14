@@ -90,6 +90,12 @@ func (s *Server) healStrandedSymlinkRow(ctx context.Context, t *tick, a store.Ac
 	if fpBackedRow(fresh.OverlayKind) || fuseBackedRow(fresh.OverlayKind) {
 		return // converted off symlink under the aging listing; its dir is a legit bridge/mount
 	}
+	bridged := s.dirIsOverlaySymlink(fresh.ConfigDir)
+	stranded, strandedErr := fkoverlay.HasPrivateEntries(fkoverlay.FusePrivateRoot(fresh.ConfigDir), s.m.OverlaySpec())
+	_, _, leaked, leakedErr := s.probeLeakedFPDomain(ctx, fresh)
+	if !bridged && !stranded && strandedErr == nil && !leaked && leakedErr == nil {
+		return
+	}
 	if !s.beginSymlinkHealHeld(t, fresh) {
 		return
 	}
@@ -108,7 +114,7 @@ func (s *Server) healStrandedSymlinkRow(ctx context.Context, t *tick, a store.Ac
 	}
 	defer func() { _ = fence.Release() }()
 
-	if s.dirIsOverlaySymlink(fresh.ConfigDir) {
+	if bridged {
 		if !s.convergeSymlinkRowBridge(fresh) {
 			return
 		}
@@ -151,32 +157,44 @@ func (s *Server) beginSymlinkHealHeld(t *tick, a store.Account) bool {
 	return true
 }
 
-// sweepLeakedFPDomain deregisters a File Provider domain still registered against a
-// symlink row — a leak from retractFileProviderIfLaid's old real-dir arm or a
-// pre-fix retreat that never deregistered. The registration check is the host's
-// zero-spawn State (DomainRoot): an unregistered domain or a down app answers with
-// an error and is left alone, so a clean symlink pool never spawns the app or
-// removes anything. Runs only when File Provider is configured and its bridge is
-// up (the same precondition the FP heal loop guards on). Caller holds the account's
-// poll claim.
-func (s *Server) sweepLeakedFPDomain(ctx context.Context, a store.Account) {
+// probeLeakedFPDomain checks whether a File Provider domain is still registered
+// against a symlink row without spawning the companion app.
+func (s *Server) probeLeakedFPDomain(ctx context.Context, a store.Account) (overlay.FPDomainRemover, string, bool, error) {
 	if !s.fpEnabled() || !s.fpBridgeReady() {
-		return
+		return nil, "", false, nil
 	}
-	prov := s.overlayFor(fkoverlay.BackendFileProvider)
-	if prov == nil {
-		return
+	resolve := pool.OverlayProviderFor
+	if s.m.OverlayFor != nil {
+		resolve = s.m.OverlayFor
+	}
+	prov, err := resolve(fkoverlay.BackendFileProvider)
+	if err != nil {
+		return nil, "", false, err
 	}
 	registry, ok := prov.(overlay.FPDomainRegistry)
 	remover, isRemover := prov.(overlay.FPDomainRemover)
 	if !ok || !isRemover {
-		return
+		return nil, "", false, nil
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, fpLeakSweepTimeout)
 	root, err := registry.DomainRoot(probeCtx, a.ConfigDir)
 	cancel()
 	if err != nil {
-		return // ErrNoDomain (no leak) or ErrAppUnavailable (unknown): nothing to sweep
+		return nil, "", false, nil // ErrNoDomain (no leak) or ErrAppUnavailable (unknown): nothing to sweep
+	}
+	return remover, root, true, nil
+}
+
+// sweepLeakedFPDomain deregisters a File Provider domain still registered against
+// a symlink row. Caller holds the account's poll claim.
+func (s *Server) sweepLeakedFPDomain(ctx context.Context, a store.Account) {
+	remover, root, leaked, err := s.probeLeakedFPDomain(ctx, a)
+	if err != nil {
+		s.log.Printf("resolve overlay provider for backend %q: %v", fkoverlay.BackendFileProvider, err)
+		return
+	}
+	if !leaked {
+		return
 	}
 	s.log.Printf("acct-%02d symlink row still has a file provider domain registered (root %s); deregistering the leak", a.ID, root)
 	if err := remover.RemoveDomain(a.ConfigDir); err != nil {

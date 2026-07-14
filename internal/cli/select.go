@@ -103,6 +103,11 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (acct 
 					if !resp.OK {
 						return store.Account{}, "", "", errors.New(resp.Error)
 					}
+					picked, err := validateDaemonSelection(m, resp, &a)
+					if err != nil {
+						return store.Account{}, "", "", err
+					}
+					a = picked
 					viaDaemon = true // daemon recorded the session, sticky, and reservation
 				}
 			}
@@ -131,16 +136,16 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (acct 
 			if resp, ok := cl.Select(nil, req.pid, false, req.cwd, req.wait); ok {
 				switch daemonSelectOutcome(resp, req.wait) {
 				case outcomePicked:
+					a, err := validateDaemonSelection(m, resp, nil)
+					if err != nil {
+						return store.Account{}, "", "", err
+					}
 					if resp.ExhaustedFallback {
 						warnExhaustedFallback(cmd, daemonAccountName(m, resp.SelectedID), resp.ExtraEnabled, derefTime(resp.SoonestReset))
 					}
 					warnPinHeld(cmd, m, resp.PinHeldAccount, resp.SelectedID)
-					mergeDaemonPick(cmd, m, resp.SelectedID)
-					a, aerr := daemonPickAccount(m, resp.SelectedID)
-					if aerr != nil {
-						return store.Account{}, "", "", aerr
-					}
-					return a, resp.Dir, daemonSelectionLine(m, resp), nil
+					mergeLaunchSettings(cmd, m, a)
+					return a, a.ConfigDir, daemonSelectionLine(m, resp), nil
 				case outcomeError:
 					return store.Account{}, "", "", errors.New(resp.Error)
 				case outcomeWait:
@@ -193,13 +198,26 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (acct 
 	}
 }
 
-// daemonPickAccount loads the account a daemon pick selected, so the launcher can
-// take its session lease. A pick always carries an id; a nil one is a daemon bug.
-func daemonPickAccount(m *pool.Manager, id *int) (store.Account, error) {
-	if id == nil {
-		return store.Account{}, errors.New("daemon pick carried no account id")
+func validateDaemonSelection(m *pool.Manager, resp *daemon.Response, forced *store.Account) (store.Account, error) {
+	expectedDir := "<unknown>"
+	if forced != nil {
+		expectedDir = forced.ConfigDir
 	}
-	return m.Store.GetAccount(*id)
+	if resp.SelectedID == nil {
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id <nil>, expected dir %q, returned dir %q", expectedDir, resp.Dir)
+	}
+	id := *resp.SelectedID
+	a, err := m.Store.GetAccount(id)
+	if err != nil {
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d, expected dir %q, returned dir %q: %w", id, expectedDir, resp.Dir, err)
+	}
+	if resp.Dir != a.ConfigDir {
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d, expected dir %q, returned dir %q", id, a.ConfigDir, resp.Dir)
+	}
+	if forced != nil && id != forced.ID {
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d does not match forced account %d, expected dir %q, returned dir %q", id, forced.ID, forced.ConfigDir, resp.Dir)
+	}
+	return a, nil
 }
 
 func warnPinHeld(cmd *cobra.Command, m *pool.Manager, held, selected *int) {
@@ -293,20 +311,6 @@ func mergeLaunchSettings(cmd *cobra.Command, m *pool.Manager, a store.Account) {
 	if _, err := m.MergeBaseClaudeJSON(a); err != nil {
 		warn(cmd.ErrOrStderr(), "couldn't propagate shared settings from ~/.claude.json: %v", err)
 	}
-}
-
-// mergeDaemonPick covers daemon-served picks, which never reach prepareAccount.
-func mergeDaemonPick(cmd *cobra.Command, m *pool.Manager, id *int) {
-	if id == nil {
-		warn(cmd.ErrOrStderr(), "daemon pick carried no account id; skipping the shared-settings merge")
-		return
-	}
-	a, err := m.Store.GetAccount(*id)
-	if err != nil {
-		warn(cmd.ErrOrStderr(), "couldn't load account %d for the shared-settings merge: %v", *id, err)
-		return
-	}
-	mergeLaunchSettings(cmd, m, a)
 }
 
 // announceLine prints the diagnostic to stderr only when stdout is a TTY:

@@ -62,3 +62,30 @@ func TestPrivatePatternsValid(t *testing.T) {
 		}
 	}
 }
+
+func TestCacheFileClassification(t *testing.T) {
+	cases := []struct {
+		name        string
+		wantPrivate bool
+		wantShared  bool
+	}{
+		{name: "stats-cache.json", wantPrivate: true},
+		{name: "stats-cache.json.tmp.abcd", wantPrivate: true},
+		{name: "policy-limits.json", wantPrivate: true},
+		{name: "policy-limits.json.tmp.abcd", wantPrivate: true},
+		{name: "readout-cost-cache.json", wantShared: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PrivateEntry(tc.name); got != tc.wantPrivate {
+				t.Errorf("PrivateEntry(%q) = %v, want %v", tc.name, got, tc.wantPrivate)
+			}
+			if got := carveOutPrivate(tc.name); got != tc.wantPrivate {
+				t.Errorf("carveOutPrivate(%q) = %v, want %v", tc.name, got, tc.wantPrivate)
+			}
+			if got := sharedTopLevel(tc.name); got != tc.wantShared {
+				t.Errorf("sharedTopLevel(%q) = %v, want %v", tc.name, got, tc.wantShared)
+			}
+		})
+	}
+}

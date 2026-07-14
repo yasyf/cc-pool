@@ -205,14 +205,18 @@ func TestPoolContentSourceWriteThroughMissingBaseIsNoop(t *testing.T) {
 func TestPoolContentSourceClassify(t *testing.T) {
 	f := newCSFixture(t)
 	cases := map[string]content.EntryKind{
-		".claude.json":              content.EntrySynth,
-		"settings.json":             content.EntrySynth,
-		"plans":                     content.EntrySymlink,
-		"daemon":                    content.EntryPrivate,
-		".credentials.json":         content.EntryPrivate,
-		"mcp-needs-auth-cache.json": content.EntryPrivate,
-		"remote-settings.json":      content.EntryPrivate,
-		".claude.json.tmp.abcd":     content.EntryPrivate,
+		".claude.json":                content.EntrySynth,
+		"settings.json":               content.EntrySynth,
+		"plans":                       content.EntrySymlink,
+		"daemon":                      content.EntryPrivate,
+		".credentials.json":           content.EntryPrivate,
+		"mcp-needs-auth-cache.json":   content.EntryPrivate,
+		"remote-settings.json":        content.EntryPrivate,
+		"stats-cache.json":            content.EntryPrivate,
+		"stats-cache.json.tmp.abcd":   content.EntryPrivate,
+		"policy-limits.json":          content.EntryPrivate,
+		"policy-limits.json.tmp.abcd": content.EntryPrivate,
+		".claude.json.tmp.abcd":       content.EntryPrivate,
 		// CARDINAL gap class: dot-anchored PrivateEntry misses these, but the
 		// holder's bare-HasPrefix PrivatePrefixes claims them — they must never
 		// be symlinked into base (the symlink would win over the private redirect).
@@ -229,7 +233,8 @@ func TestPoolContentSourceClassify(t *testing.T) {
 		".oauth_refresh.lock": content.EntryPrivate,
 		".Storage-Write.lock": content.EntryPrivate,
 		// Near-miss, genuinely different file: stays a shared carve-out.
-		"mcp-needs-auth.json": content.EntrySymlink,
+		"mcp-needs-auth.json":     content.EntrySymlink,
+		"readout-cost-cache.json": content.EntrySymlink,
 		// PrivatePatterns "*.lock" now claims every top-level .lock name: session.lock
 		// flips shared→private, and foo.lock joins it. The case-alias SESSION.LOCK is
 		// missed by PrivateEntry's case-sensitive match but caught by carveOutPrivate's
