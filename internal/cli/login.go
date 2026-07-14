@@ -115,8 +115,9 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 // exited on its own. The caller owns terminal setup and teardown. With fp set (a
 // File Provider account), dataless-file materialization is turned on before the
 // spawn so the claude child inherits it, then restored — this long-lived parent (the
-// status TUI) must never keep the process-wide policy on.
-func watchAndClose(ctx context.Context, c *exec.Cmd, fp bool, probe func() (bool, error)) (awaitOutcome, error) {
+// status TUI) must never keep the process-wide policy on. A package var so the TUI
+// relogin flow's launch-failure surfacing is testable without a real spawn.
+var watchAndClose = func(ctx context.Context, c *exec.Cmd, fp bool, probe func() (bool, error)) (awaitOutcome, error) {
 	restore := func() error { return nil }
 	if fp {
 		r, err := execguard.EnableForSpawn()

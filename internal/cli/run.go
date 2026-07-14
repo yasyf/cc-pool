@@ -119,31 +119,43 @@ off the fuse-t mirror, where the bulk write would wedge it. ` + "`ccp run`" + ` 
 				if err != nil {
 					return err
 				}
-				// P7: materialize the File Provider domain before committing the launch;
-				// a definitive not-serving fails loud, never a silent unready launch.
-				if err := prepareFPForLaunch(cmd.Context(), acct, account != nil); err != nil {
-					return err
-				}
-				// Session lease BEFORE exec: its non-CLOEXEC fd rides into claude, pinning
-				// the mount; the post-Acquire probe refuses a dead/wedged mount.
-				h, err := acquireAndProbeSessionLease(acct)
-				if err != nil {
-					return err
-				}
-				// P8: turn on dataless-file materialization (inherited by claude) and read
-				// settings.json fully before exec; a failure aborts the launch.
-				if isFPRow(acct.OverlayKind) {
-					if err := execguard.PrimeForExec(filepath.Join(dir, settingsJSONName)); err != nil {
-						_ = h.Close()
-						return err
-					}
-				}
-				step(cmd.ErrOrStderr(), "%s", line)
-				return execClaude(h, dir, args)
+				return runLaunch(cmd, acct, dir, line, args, account != nil)
 			})
 		},
 	}
 	return cmd
+}
+
+// runAcquireLease and runExecClaude are the run pipeline's lease-acquire and exec
+// seams — package vars so a pipeline test can assert the launch ordering (a failed
+// prepare gate leaves them uncalled) without a live holder or a real exec.
+var (
+	runAcquireLease = acquireAndProbeSessionLease
+	runExecClaude   = execClaude
+)
+
+// runLaunch commits a resolved selection to a claude exec. The order is load-bearing:
+// the FP prepare gate (P7) runs first, so a failure aborts with NO lease, NO banner,
+// and NO exec; only then the session lease, the settings.json prime (P8, FP only), the
+// pick banner, and exec. A non-FP account skips prepare and priming.
+func runLaunch(cmd *cobra.Command, acct store.Account, dir, line string, args []string, forced bool) error {
+	if err := prepareFPForLaunch(cmd.Context(), acct, forced); err != nil {
+		return err
+	}
+	// Session lease BEFORE exec: its non-CLOEXEC fd rides into claude, pinning the
+	// mount; the post-Acquire probe refuses a dead/wedged mount.
+	h, err := runAcquireLease(acct)
+	if err != nil {
+		return err
+	}
+	if isFPRow(acct.OverlayKind) {
+		if err := execguard.PrimeForExec(filepath.Join(dir, settingsJSONName)); err != nil {
+			_ = h.Close()
+			return err
+		}
+	}
+	step(cmd.ErrOrStderr(), "%s", line)
+	return runExecClaude(h, dir, args)
 }
 
 func ccpAccountFromEnv() (*int, error) {

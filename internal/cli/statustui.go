@@ -163,13 +163,18 @@ func (w *watchedLogin) Run() error {
 	if cred, err := w.read(); err == nil {
 		w.baseline = cred.ClaudeAiOauth.AccessToken
 	}
-	outcome, _ := watchAndClose(w.ctx, w.cmd, w.fp, newReloginProbe(w.read, w.baseline))
+	outcome, err := watchAndClose(w.ctx, w.cmd, w.fp, newReloginProbe(w.read, w.baseline))
 	// Bubble Tea's post-Exec restore leaves claude's input modes on, so after a
 	// force-kill (not a clean self-exit) reset only those; Bubble Tea owns alt-screen/cursor.
 	if outcome != awaitExited && isTTY() {
 		_, _ = fmt.Fprint(w.out, inputModeReset)
 	}
-	return nil // finishRelogin (via reloginExitedMsg) is the sole credential gate
+	// A launch/execguard failure (awaitCanceled) fails loud; a clean exit or landed
+	// identity defers to finishRelogin's credential gate.
+	if outcome == awaitCanceled {
+		return err
+	}
+	return nil
 }
 
 func (t statusTUI) Init() tea.Cmd {
@@ -232,6 +237,17 @@ func (t statusTUI) startReloginCmd(id int) tea.Cmd {
 		}
 		return reloginStartMsg{account: a, lease: h}
 	}
+}
+
+// reloginExited maps a watchedLogin.Run result into the next relogin message: a
+// launch/execguard failure (non-nil err) surfaces immediately via reloginDoneMsg,
+// releasing the lease and skipping finishRelogin's misleading unchanged-credential
+// report; a clean run proceeds to that credential gate via reloginExitedMsg.
+func reloginExited(a store.Account, baseline string, err error) tea.Msg {
+	if err != nil {
+		return reloginDoneMsg{err: err}
+	}
+	return reloginExitedMsg{account: a, baseline: baseline}
 }
 
 // closeLease closes a session-lease handle when non-nil (a test seam may return nil).
@@ -343,8 +359,9 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		wl := &watchedLogin{ctx: t.ctx, cmd: c, fp: isFPRow(a.OverlayKind), read: func() (*creds.Credential, error) {
 			return t.readCred(a)
 		}}
-		// The callback runs after wl.Run, so wl.baseline is set by then.
-		return t, tea.Exec(wl, func(error) tea.Msg { return reloginExitedMsg{account: a, baseline: wl.baseline} })
+		// The callback runs after wl.Run, so wl.baseline is set by then; wl.Run's
+		// error (a launch/execguard failure) routes to reloginExited.
+		return t, tea.Exec(wl, func(err error) tea.Msg { return reloginExited(a, wl.baseline, err) })
 	case reloginExitedMsg:
 		return t, t.finishReloginCmd(msg.account, msg.baseline)
 	case reloginDoneMsg:

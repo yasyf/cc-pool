@@ -1,14 +1,17 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -720,6 +723,59 @@ func TestStatusTUIDetailNoUsageData(t *testing.T) {
 		}
 		if !strings.Contains(detail, "58% used") || !strings.Contains(detail, "61% used") {
 			t.Fatalf("sampled detail must render real usage rows (58/61):\n%s", detail)
+		}
+	})
+}
+
+// TestStatusTUIReloginLaunchFailureSurfaces is the G-X5 regression: a watchAndClose
+// failure (an execguard EnableForSpawn/restore failure, or the child killed) must
+// surface through watchedLogin.Run and the tea callback into the relogin flow — never
+// silently proceed to finishRelogin, which would misreport an unchanged credential.
+func TestStatusTUIReloginLaunchFailureSurfaces(t *testing.T) {
+	wantErr := errors.New("enable dataless-file materialization: operation not permitted")
+
+	t.Run("Run surfaces a launch failure but swallows a clean exit", func(t *testing.T) {
+		prev := watchAndClose
+		t.Cleanup(func() { watchAndClose = prev })
+		wl := &watchedLogin{ctx: context.Background(), cmd: exec.Command("true"), out: io.Discard, read: func() (*creds.Credential, error) { return nil, errors.New("no cred") }}
+
+		watchAndClose = func(context.Context, *exec.Cmd, bool, func() (bool, error)) (awaitOutcome, error) {
+			return awaitCanceled, wantErr
+		}
+		if err := wl.Run(); !errors.Is(err, wantErr) {
+			t.Fatalf("Run on a launch failure = %v, want %v", err, wantErr)
+		}
+
+		// A user-quit exit is not a launch failure: it defers to the credential gate.
+		watchAndClose = func(context.Context, *exec.Cmd, bool, func() (bool, error)) (awaitOutcome, error) {
+			return awaitExited, errors.New("claude exited 130")
+		}
+		if err := wl.Run(); err != nil {
+			t.Fatalf("Run on a clean exit = %v, want nil (finishRelogin owns the credential gate)", err)
+		}
+	})
+
+	t.Run("the callback routes the error to a surfaced reloginDoneMsg, never finishRelogin", func(t *testing.T) {
+		bob := store.Account{ID: 2}
+		ex, ok := reloginExited(bob, "tok-old", nil).(reloginExitedMsg)
+		if !ok || ex.account.ID != bob.ID || ex.baseline != "tok-old" {
+			t.Fatalf("clean run msg = %#v, want reloginExitedMsg proceeding to the finish gate", ex)
+		}
+		done, ok := reloginExited(bob, "tok-old", wantErr).(reloginDoneMsg)
+		if !ok || !errors.Is(done.err, wantErr) {
+			t.Fatalf("launch-failure msg = %#v, want a failed reloginDoneMsg carrying the launch error", done)
+		}
+
+		fl := &fakeLogin{}
+		tui := reloginTUI(fl)
+		tui.reloginBusy = true
+		model, _ := tui.Update(done)
+		got := model.(statusTUI)
+		if got.reloginErr == nil || got.reloginBusy {
+			t.Fatalf("a launch failure must surface and clear busy: err=%v busy=%v", got.reloginErr, got.reloginBusy)
+		}
+		if len(fl.finished) != 0 {
+			t.Fatalf("a launch failure must never reach finishLogin: %v", fl.finished)
 		}
 	})
 }
