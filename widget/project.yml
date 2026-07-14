@@ -158,16 +158,22 @@ targets:
         SKIP_INSTALL: true
 
   CCPoolStatusTests:
-    # Host-less unit-test bundle for the app's PURE logic only. It compiles the
-    # code under test (DomainClaims) straight into the bundle — no TEST_HOST, no
-    # app launch, no signed appex — so it runs standalone in CI. Keep it pure:
-    # anything needing AppKit/NSFileProviderManager belongs in the VM e2e, not
-    # here.
+    # Host-less unit-test bundle for PURE logic only. It compiles the code
+    # under test straight into the bundle — no TEST_HOST, no app launch, no
+    # signed appex — so it runs standalone in CI. Keep it pure: anything
+    # needing AppKit or a live NSFileProviderManager belongs in the VM e2e,
+    # not here (FileProvider TYPES are fine — nothing talks to fileproviderd).
     type: bundle.unit-test
     platform: macOS
     sources:
       - path: Tests
+      - path: Sources/App/Countdown.swift
       - path: Sources/App/DomainClaims.swift
+      - path: Sources/FileProvider/SynthCache.swift
+      - path: Sources/FileProvider/ItemID.swift
+      - path: Sources/FileProvider/FPItem.swift
+      - path: Sources/FileProvider/Enumerators.swift
+      - path: Sources/Shared/Status.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.yasyf.cc-pool.status.tests

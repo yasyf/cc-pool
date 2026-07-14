@@ -48,6 +48,7 @@ final class DomainClaimsTests: XCTestCase {
             ("register routes to domain", "register", "acct-01", "acct-01"),
             ("remove routes to domain", "remove", "acct-02", "acct-02"),
             ("probe-domain routes to domain", "probe-domain", "acct-06", "acct-06"),
+            ("prepare-domain routes to domain", "prepare-domain", "acct-07", "acct-07"),
             ("probe routes to probeID", "probe", "", probeID),
             ("path is unclaimed", "path", "acct-03", nil),
             ("signal is unclaimed", "signal", "acct-04", nil),

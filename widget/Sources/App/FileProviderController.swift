@@ -14,6 +14,16 @@ private struct ControlRequest: Decodable {
     let proto: Int
     let op: String
     let domain: String?
+    /// probe-domain only: true = shallow (lookup + URL + readdir, no byte
+    /// read). Absent/false keeps the deep byte-read path.
+    let shallow: Bool?
+    /// prepare-domain only: materialization wait bound; 0/absent = default.
+    let deadlineMS: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case proto, op, domain, shallow
+        case deadlineMS = "deadline_ms"
+    }
 }
 
 private struct ControlResponse: Encodable {
@@ -28,9 +38,13 @@ private struct ControlResponse: Encodable {
     /// 0 = present and empty; >0 = bytes actually read. nil is omitted by the
     /// synthesized encoder, which is exactly the "absent" wire shape.
     var jsonBytes: Int64?
+    /// Shallow probe-domain replies ONLY: whether `.claude.json` appeared in
+    /// the root listing. Never set on a deep reply — its presence is how the
+    /// Go client knows the app understood shallow.
+    var listed: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case proto, ok, error, version, path
+        case proto, ok, error, version, path, listed
         case errClass = "err_class"
         case fpOK = "fp_ok"
         case jsonBytes = "json_bytes"
@@ -198,7 +212,7 @@ final class FileProviderController {
             var resp = ControlResponse(ok: true)
             resp.version = Self.appVersion
             reply(fd, resp)
-        case "probe", "register", "path", "signal", "remove", "probe-domain":
+        case "probe", "register", "path", "signal", "remove", "probe-domain", "prepare-domain":
             let domain = req.domain ?? ""
             guard req.op == "probe" || !domain.isEmpty else {
                 reply(fd, .failure("domain required for op \(req.op)", nil))
@@ -207,7 +221,7 @@ final class FileProviderController {
             guard let key = DomainClaims.key(op: req.op, domain: domain, probeID: probeDomainID) else {
                 // Unclaimed (path/signal): a health-ish read that must never
                 // bounce busy — dispatch straight onto the concurrent queue.
-                domainQueue.async { self.reply(fd, self.perform(req.op, domain: domain)) }
+                domainQueue.async { self.reply(fd, self.perform(req, domain: domain, fd: fd)) }
                 return
             }
             guard claims.claim(key) else {
@@ -216,7 +230,7 @@ final class FileProviderController {
             }
             domainQueue.async {
                 defer { self.claims.release(key) }
-                self.reply(fd, self.perform(req.op, domain: domain))
+                self.reply(fd, self.perform(req, domain: domain, fd: fd))
             }
         default:
             reply(fd, .failure("unknown op \(req.op)", nil))
@@ -251,15 +265,17 @@ final class FileProviderController {
 
     // MARK: - Domain ops (per-domain serialized via claims, concurrent across domains)
 
-    private func perform(_ op: String, domain: String) -> ControlResponse {
-        switch op {
+    private func perform(_ req: ControlRequest, domain: String, fd: Int32) -> ControlResponse {
+        switch req.op {
         case "register": return register(domain)
         case "remove": return remove(domain)
         case "path": return visiblePath(domain)
         case "signal": return signal(domain)
         case "probe": return probe()
-        case "probe-domain": return probeDomain(domain)
-        default: return .failure("unknown op \(op)", nil) // unreachable: handle() routed
+        case "probe-domain": return probeDomain(domain, shallow: req.shallow ?? false)
+        case "prepare-domain":
+            return prepareDomain(domain, deadlineMS: req.deadlineMS ?? 0) { peerClosed(fd) }
+        default: return .failure("unknown op \(req.op)", nil) // unreachable: handle() routed
         }
     }
 
@@ -393,12 +409,12 @@ final class FileProviderController {
         }
     }
 
-    /// Probes a registered account domain (the daemon's readiness gate),
-    /// reporting `.claude.json`'s byte length via json_bytes: absent = no file,
-    /// 0 = empty, >0 = real content read in full — never stat'd, since FPFS
-    /// reports size 0 for materialized items. A getDomains/URL/enumerate/read
-    /// failure or timeout is domain-not-serving; an unregistered id is no-domain.
-    private func probeDomain(_ domain: String) -> ControlResponse {
+    /// Probes a registered account domain (the daemon's readiness gate):
+    /// deep reads `.claude.json` in full and reports json_bytes (never st_size
+    /// — FPFS lies for materialized items); shallow stops after the readdir
+    /// (no byte read, no materialization) and reports presence via `listed`.
+    /// Any URL/enumerate/read failure or timeout is domain-not-serving.
+    private func probeDomain(_ domain: String, shallow: Bool) -> ControlResponse {
         let mgr: NSFileProviderManager
         switch manager(for: domain, bound: Bound.lookup, lookupFailClass: .domainNotServing) {
         case .reply(let resp): return resp // unregistered → no-domain; lookup failure → domain-not-serving
@@ -418,6 +434,11 @@ final class FileProviderController {
         case .success(let e):
             entries = e
         }
+        if shallow {
+            var resp = ControlResponse(ok: true)
+            resp.listed = entries.contains(".claude.json")
+            return resp
+        }
         guard entries.contains(".claude.json") else {
             return ControlResponse(ok: true) // serves, but no .claude.json → json_bytes absent
         }
@@ -430,6 +451,77 @@ final class FileProviderController {
             resp.jsonBytes = Int64(n)
             return resp
         }
+    }
+
+    /// Forces materialization of the computed settings.json replica via
+    /// requestDownloadForItem — NEVER a raw read: this host app is marked
+    /// non-materializing, so its reads of dataless items EDEADLK by design.
+    /// ok only on materialization WITHIN the caller's deadline; every failure,
+    /// timeout, or expiry is domain-not-serving. One monotonic countdown
+    /// clamps every phase wait, so the reply never outlives the budget.
+    private func prepareDomain(_ domain: String, deadlineMS: Int64,
+                               peerClosed: () -> Bool) -> ControlResponse {
+        let budget = deadlineMS > 0 ? TimeInterval(deadlineMS) / 1000 : Self.prepareDefaultDeadline
+        let countdown = Countdown(budget)
+        func expired(_ stage: String) -> ControlResponse {
+            .failure("prepare-domain \(domain): deadline exhausted before \(stage)", .domainNotServing)
+        }
+        guard !countdown.expired else { return expired("lookup") }
+        let mgr: NSFileProviderManager
+        switch manager(for: domain, bound: countdown.bound(Bound.lookup),
+                       lookupFailClass: .domainNotServing) {
+        case .reply(let resp): return resp // unregistered → no-domain; lookup failure → domain-not-serving
+        case .manager(let m): mgr = m
+        }
+        guard !countdown.expired else { return expired("URL") }
+        let url: URL
+        switch waitURL(countdown.bound(Bound.probeURL),
+                       { mgr.getUserVisibleURL(for: .rootContainer, completionHandler: $0) }) {
+        case .failure(let f):
+            return .failure("prepare-domain URL for \(domain): \(f.message)", .domainNotServing)
+        case .success(let u):
+            url = u
+        }
+        guard !countdown.expired else { return expired("enumerate") }
+        switch waitBlocking(countdown.bound(Bound.probeEnum),
+                            { try FileManager.default.contentsOfDirectory(atPath: url.path) }) {
+        case .failure(let f):
+            return .failure("prepare-domain enumerate \(domain): \(f.message)", .domainNotServing)
+        case .success(let entries):
+            guard entries.contains("settings.json") else {
+                return .failure("prepare-domain \(domain): settings.json is not enumerated", .domainNotServing)
+            }
+        }
+        let item = NSFileProviderItemIdentifier("computed:settings.json")
+        guard !countdown.expired else { return expired("download") }
+        if let f = waitVoid(countdown.remaining, { mgr.requestDownloadForItem(withIdentifier: item, completionHandler: $0) }) {
+            return .failure("prepare-domain download settings.json for \(domain): \(f.message)", .domainNotServing)
+        }
+        // requestDownloadForItem can ack before bytes land; poll the replica's
+        // dataless flag (stat never materializes) until the deadline. Expiry
+        // precedes the materialization test (late bytes never read as ok);
+        // a hung-up caller releases the claim instead of polling on.
+        let file = url.appendingPathComponent("settings.json").path
+        while !countdown.expired {
+            if peerClosed() {
+                return .failure("prepare-domain \(domain): caller disconnected", .domainNotServing)
+            }
+            if Self.isMaterialized(file) { return ControlResponse(ok: true) }
+            usleep(200_000)
+        }
+        return .failure(
+            "prepare-domain \(domain): settings.json did not materialize within \(Int(budget))s",
+            .domainNotServing)
+    }
+
+    private static let prepareDefaultDeadline: TimeInterval = 30
+
+    /// True once the replica exists with SF_DATALESS clear — stat(2) is safe:
+    /// it never triggers materialization.
+    private static func isMaterialized(_ path: String) -> Bool {
+        var st = stat()
+        guard Darwin.lstat(path, &st) == 0 else { return false }
+        return st.st_flags & UInt32(SF_DATALESS) == 0
     }
 
     // MARK: - Error mapping
