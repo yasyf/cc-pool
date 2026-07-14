@@ -86,7 +86,7 @@ func TestPolicyConstantsPinned(t *testing.T) {
 		// registry cutover (B2) — minimum companion version gating FP hosting.
 		// Compile-visible from daemon (it already imports pool); pinned here so a
 		// bump is a deliberate edit to this contract.
-		{"registry/minWidgetVersion", pool.MinWidgetVersion, "v0.44.0"},
+		{"registry/minWidgetVersion", pool.MinWidgetVersion, "v0.55.0"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

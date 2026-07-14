@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
@@ -21,13 +22,12 @@ type fpFinding struct {
 
 // fpDiagnose produces the File Provider health rungs (extension enablement, app
 // control socket, daemon data bridge) as renderer-agnostic findings. fpRows is
-// the number of fileprovider account rows; consentPending and bridgeUp are the
-// daemon's group-container consent signal and its data-bridge liveness, supplied
-// by the caller from the daemon's status response — the daemon is the sole
-// dialer of the group-container bridge. With no rows and the extension
-// unavailable it returns nil — the opt-in stack is unused. An absent extension
-// is the root fault and skips the socket probes.
-func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, consentPending bool, bridgeUp *bool) []fpFinding {
+// the number of fileprovider account rows; bridge is the daemon's on-demand
+// data-plane verdict. A nil verdict (old daemon or failed check) falls back to
+// the status response's consentPending and dial-only bridgeUp facts. With no rows
+// and the extension unavailable it returns nil — the opt-in stack is unused. An
+// absent extension is the root fault and skips the socket probes.
+func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, bridge *daemon.FPBridgeStatus, consentPending bool, bridgeUp *bool) []fpFinding {
 	if !fpAvailable(spec) {
 		if fpRows == 0 {
 			return nil
@@ -51,12 +51,20 @@ func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, consentPen
 		findings = append(findings, fpFinding{"file provider app", true, ver})
 	}
 	switch {
+	case bridge != nil && bridge.Verdict == daemon.FPBridgeServing:
+		findings = append(findings, fpFinding{"file provider bridge", true, ""})
+	case bridge != nil:
+		detail := bridge.Detail
+		if detail == "" {
+			detail = fmt.Sprintf("daemon bridge self-test returned %s without a repair lever", bridge.Verdict)
+		}
+		findings = append(findings, fpFinding{"file provider bridge", false, detail})
 	case bridgeUp != nil && *bridgeUp:
 		findings = append(findings, fpFinding{"file provider bridge", true, ""})
 	case consentPending:
 		findings = append(findings, fpFinding{
 			"file provider bridge", false,
-			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon reports its bind parked on the app group container consent prompt (a one-time grant to the daemon's stable path ~/.cc-pool/bin/cc-pool; unsigned local builds re-prompt per build): approve it, then restart the daemon (`brew services restart cc-pool`) — `ccp fp onboard` walks this end to end",
+			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon reports its bind parked on the app group container consent prompt: run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart) — `ccp fp onboard` walks this end to end",
 		})
 	case bridgeUp == nil:
 		findings = append(findings, fpFinding{
@@ -66,7 +74,7 @@ func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, consentPen
 	default:
 		findings = append(findings, fpFinding{
 			"file provider bridge", false,
-			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); on first run macOS gates the app group container behind a one-time consent prompt: approve it, then restart the daemon; domains cannot fetch computed content until the socket is up — run `ccp fp onboard` for the guided setup",
+			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); on first run macOS gates the app group container behind a one-time consent prompt: run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart); domains cannot fetch computed content until the socket is up — run `ccp fp onboard` for the guided setup",
 		})
 	}
 	return findings
@@ -116,7 +124,7 @@ func diagnoseFPAddFailure(cmd *cobra.Command, m *pool.Manager, err error) {
 	// fpRows=1 forces the extension rung to evaluate even before any fileprovider
 	// row exists (the failed add would have been the first).
 	first := true
-	for _, f := range fpDiagnose(cmd.Context(), m.OverlaySpec(), 1, consentPending, bridgeUp) {
+	for _, f := range fpDiagnose(cmd.Context(), m.OverlaySpec(), 1, nil, consentPending, bridgeUp) {
 		if f.healthy {
 			continue
 		}

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
@@ -22,15 +23,17 @@ import (
 func TestFPDiagnose(t *testing.T) {
 	controlErr := errors.New("dial unix: connect: no such file or directory")
 	type wantFinding struct {
-		label   string
-		healthy bool
-		frags   []string
+		label    string
+		healthy  bool
+		frags    []string
+		notFrags []string
 	}
 	cases := map[string]struct {
 		available  bool
 		fpRows     int
 		healthVer  string
 		healthErr  error
+		bridge     *daemon.FPBridgeStatus
 		bridgeUp   *bool
 		consent    bool
 		want       []wantFinding
@@ -46,7 +49,7 @@ func TestFPDiagnose(t *testing.T) {
 			want: []wantFinding{
 				{"file provider extension", false, []string{
 					"2 fileprovider accounts", "ccp fp onboard", pool.WidgetAppPath(), "Login Items & Extensions",
-				}},
+				}, nil},
 			},
 		},
 		"all green renders extension, app, and bridge healthy": {
@@ -55,9 +58,9 @@ func TestFPDiagnose(t *testing.T) {
 			healthVer: "1.2.3",
 			bridgeUp:  ptr(true),
 			want: []wantFinding{
-				{"file provider extension", true, []string{pool.FPExtensionBundleID, "1 fileprovider account"}},
-				{"file provider app", true, []string{"1.2.3"}},
-				{"file provider bridge", true, nil},
+				{"file provider extension", true, []string{pool.FPExtensionBundleID, "1 fileprovider account"}, nil},
+				{"file provider app", true, []string{"1.2.3"}, nil},
+				{"file provider bridge", true, nil, nil},
 			},
 			wantProbes: true,
 		},
@@ -67,9 +70,9 @@ func TestFPDiagnose(t *testing.T) {
 			healthErr: controlErr,
 			bridgeUp:  ptr(true),
 			want: []wantFinding{
-				{"file provider extension", true, []string{"1 fileprovider account"}},
-				{"file provider app", false, []string{controlErr.Error(), pool.WidgetAppPath()}},
-				{"file provider bridge", true, nil},
+				{"file provider extension", true, []string{"1 fileprovider account"}, nil},
+				{"file provider app", false, []string{controlErr.Error(), pool.WidgetAppPath()}, nil},
+				{"file provider bridge", true, nil, nil},
 			},
 			wantProbes: true,
 		},
@@ -79,9 +82,9 @@ func TestFPDiagnose(t *testing.T) {
 			healthVer: "1.2.3",
 			bridgeUp:  ptr(false),
 			want: []wantFinding{
-				{"file provider extension", true, nil},
-				{"file provider app", true, []string{"1.2.3"}},
-				{"file provider bridge", false, []string{"app group container", "restart the daemon", "ccp fp onboard"}},
+				{"file provider extension", true, nil, nil},
+				{"file provider app", true, []string{"1.2.3"}, nil},
+				{"file provider bridge", false, []string{"app group container", "ccp fp consent", "no restart", "ccp fp onboard"}, []string{"restart the daemon"}},
 			},
 			wantProbes: true,
 		},
@@ -92,14 +95,12 @@ func TestFPDiagnose(t *testing.T) {
 			bridgeUp:  ptr(false),
 			consent:   true,
 			want: []wantFinding{
-				{"file provider extension", true, nil},
-				{"file provider app", true, []string{"1.2.3"}},
+				{"file provider extension", true, nil, nil},
+				{"file provider app", true, []string{"1.2.3"}, nil},
 				{"file provider bridge", false, []string{
 					"parked on the app group container consent prompt",
-					"one-time grant to the daemon's stable path ~/.cc-pool/bin/cc-pool",
-					"unsigned local builds re-prompt per build",
-					"restart the daemon", "ccp fp onboard",
-				}},
+					"ccp fp consent", "local terminal", "no restart", "ccp fp onboard",
+				}, []string{"restart the daemon"}},
 			},
 			wantProbes: true,
 		},
@@ -109,11 +110,53 @@ func TestFPDiagnose(t *testing.T) {
 			healthVer: "1.2.3",
 			bridgeUp:  nil,
 			want: []wantFinding{
-				{"file provider extension", true, nil},
-				{"file provider app", true, []string{"1.2.3"}},
+				{"file provider extension", true, nil, nil},
+				{"file provider app", true, []string{"1.2.3"}, nil},
 				{"file provider bridge", false, []string{
 					"bridge health unknown", "predates bridge reporting", "brew services restart cc-pool",
-				}},
+				}, nil},
+			},
+			wantProbes: true,
+		},
+		"bound-dead verdict overrides a healthy dial fact and carries the daemon lever": {
+			available: true,
+			fpRows:    1,
+			healthVer: "1.2.3",
+			bridge: &daemon.FPBridgeStatus{
+				Verdict: daemon.FPBridgeBoundDead,
+				Detail:  "the daemon's bridge is bound but not serving; restart the daemon (brew services restart cc-pool)",
+			},
+			bridgeUp: ptr(true),
+			want: []wantFinding{
+				{"file provider extension", true, nil, nil},
+				{"file provider app", true, []string{"1.2.3"}, nil},
+				{"file provider bridge", false, []string{"bound but not serving", "brew services restart cc-pool"}, nil},
+			},
+			wantProbes: true,
+		},
+		"serving verdict overrides a stale down dial fact": {
+			available: true,
+			fpRows:    1,
+			healthVer: "1.2.3",
+			bridge:    &daemon.FPBridgeStatus{Verdict: daemon.FPBridgeServing},
+			bridgeUp:  ptr(false),
+			want: []wantFinding{
+				{"file provider extension", true, nil, nil},
+				{"file provider app", true, []string{"1.2.3"}, nil},
+				{"file provider bridge", true, nil, nil},
+			},
+			wantProbes: true,
+		},
+		"non-serving verdict without a lever fails loud": {
+			available: true,
+			fpRows:    1,
+			healthVer: "1.2.3",
+			bridge:    &daemon.FPBridgeStatus{Verdict: daemon.FPBridgeDown},
+			bridgeUp:  ptr(true),
+			want: []wantFinding{
+				{"file provider extension", true, nil, nil},
+				{"file provider app", true, []string{"1.2.3"}, nil},
+				{"file provider bridge", false, []string{"down", "without a repair lever"}, nil},
 			},
 			wantProbes: true,
 		},
@@ -123,9 +166,9 @@ func TestFPDiagnose(t *testing.T) {
 			healthVer: "1.2.3",
 			bridgeUp:  ptr(true),
 			want: []wantFinding{
-				{"file provider extension", true, []string{"0 fileprovider accounts"}},
-				{"file provider app", true, []string{"1.2.3"}},
-				{"file provider bridge", true, nil},
+				{"file provider extension", true, []string{"0 fileprovider accounts"}, nil},
+				{"file provider app", true, []string{"1.2.3"}, nil},
+				{"file provider bridge", true, nil, nil},
 			},
 			wantProbes: true,
 		},
@@ -139,7 +182,7 @@ func TestFPDiagnose(t *testing.T) {
 				return tc.healthVer, tc.healthErr
 			})
 
-			got := fpDiagnose(t.Context(), fkoverlay.Spec{}, tc.fpRows, tc.consent, tc.bridgeUp)
+			got := fpDiagnose(t.Context(), fkoverlay.Spec{}, tc.fpRows, tc.bridge, tc.consent, tc.bridgeUp)
 			if len(got) != len(tc.want) {
 				t.Fatalf("got %d findings %+v, want %d", len(got), got, len(tc.want))
 			}
@@ -150,6 +193,11 @@ func TestFPDiagnose(t *testing.T) {
 				for _, frag := range want.frags {
 					if !strings.Contains(got[i].detail, frag) {
 						t.Errorf("finding[%d] detail %q missing %q", i, got[i].detail, frag)
+					}
+				}
+				for _, frag := range want.notFrags {
+					if strings.Contains(got[i].detail, frag) {
+						t.Errorf("finding[%d] detail %q unexpectedly contains %q", i, got[i].detail, frag)
 					}
 				}
 			}

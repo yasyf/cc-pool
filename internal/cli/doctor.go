@@ -25,7 +25,6 @@ import (
 
 func newDoctorCmd() *cobra.Command {
 	var fix bool
-	var openSettings bool
 	var fpRawProbe bool
 	cmd := &cobra.Command{
 		Use:   "doctor",
@@ -59,13 +58,14 @@ func newDoctorCmd() *cobra.Command {
 					report("claude on PATH", true, "")
 				}
 
-				var cachedHolder *daemon.HolderStatus
 				var contentHealth string
 				var fpConsentPending bool
 				var fpBridgeUp *bool
+				var fpBridge *daemon.FPBridgeStatus
 				var ledgers []daemon.LedgerState
 				var daemonAlive bool
-				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
+				cl := daemon.NewClient()
+				if resp, err := cl.Health(); err == nil && resp.OK {
 					daemonAlive = true
 					if resp.Version == version.String() {
 						report("daemon", true, resp.Version)
@@ -74,12 +74,14 @@ func newDoctorCmd() *cobra.Command {
 					}
 					// Pending-TCC guidance, bridge liveness, content-source health,
 					// and the self-heal ledger block live only in the daemon's cache.
-					if sresp, serr := daemon.NewClient().Status(); serr == nil && sresp.OK {
-						cachedHolder = sresp.Holder
+					if sresp, serr := cl.Status(); serr == nil && sresp.OK {
 						contentHealth = sresp.ContentHealth
 						fpConsentPending = sresp.FPConsentPending
 						fpBridgeUp = sresp.FPBridgeUp
 						ledgers = sresp.Ledgers
+					}
+					if bresp, berr := cl.FPBridgeCheck(); berr == nil && bresp.OK {
+						fpBridge = bresp.FPBridge
 					}
 				} else {
 					report("daemon", false, "not running; run `ccp service install`")
@@ -101,7 +103,7 @@ func newDoctorCmd() *cobra.Command {
 				reportCaskRelauncher(countFuse(accts), report)
 				reportLeases(report)
 				reportCarcasses(accts, report)
-				reportLedgers(accts, ledgers, cachedHolder, time.Now(), report)
+				reportLedgers(accts, ledgers, time.Now(), report)
 
 				// Mount truth lives in the holder, which outlives daemons — not the daemon cache.
 				var holderMounts []mountd.MountInfo
@@ -119,7 +121,7 @@ func newDoctorCmd() *cobra.Command {
 				reportStaleWidgetAppex(cmd.Context(), report)
 				reportOrphanedHolder(cmd.Context(), reachable, accts, report)
 
-				reportFileProvider(cmd.Context(), m, accts, fpConsentPending, fpBridgeUp, report)
+				reportFileProvider(cmd.Context(), m, accts, fpBridge, fpConsentPending, fpBridgeUp, report)
 				reportFPWedges(accts, daemonAlive, fpRawProbe, report)
 				reportOrphanFPDomains(cmd.Context(), m, accts, fix, report)
 				reportContentHealth(contentHealth, report)
@@ -142,19 +144,11 @@ func newDoctorCmd() *cobra.Command {
 					_, _ = fmt.Fprintln(out, "\nAll checks passed.")
 				}
 
-				// The report detail above already carries the deep link.
-				if openSettings && cachedHolder != nil && cachedHolder.TCCError != "" {
-					backend := cachedHolder.TCCBlockedBackend
-					if err := backend.OpenSettings(cmd.Context()); err != nil {
-						warn(cmd.ErrOrStderr(), "couldn't open the %s settings pane: %v", backend.Enablement().Pane, err)
-					}
-				}
 				return nil
 			})
 		},
 	}
 	cmd.Flags().BoolVar(&fix, "fix", false, "attempt to repair detected drift")
-	cmd.Flags().BoolVar(&openSettings, "open-settings", false, "if the mount holder needs a macOS grant, open its System Settings pane")
 	cmd.Flags().BoolVar(&fpRawProbe, "fp-raw-probe", false, "probe File Provider domains with a direct filesystem read instead of the app control op (may trigger a macOS permission prompt)")
 	return cmd
 }
@@ -320,13 +314,8 @@ func reportLeases(report func(string, bool, string)) {
 // outside it: the store-persisted needs-login verdict (checkAccount — the
 // auth.streak row here is the daemon's transient-401 streak, a different
 // source) and the holder capability handshake (reportHolder / the feature gate —
-// holder capabilities, not ledger state). The TCC grant walkthrough is holder-cache
-// guidance the ledger's alt lane only counts waits for, so it renders from
-// holder, verbatim, ahead of the per-row lines.
-func reportLedgers(accts []store.Account, ledgers []daemon.LedgerState, holder *daemon.HolderStatus, now time.Time, report func(string, bool, string)) {
-	if holder != nil && holder.TCCError != "" {
-		report("mount holder grant", false, holder.TCCError+" — "+fuseGrantHint(holder.TCCBlockedBackend)+" (cc-pool falls back to symlink automatically if the grant never lands)")
-	}
+// holder capabilities, not ledger state).
+func reportLedgers(accts []store.Account, ledgers []daemon.LedgerState, now time.Time, report func(string, bool, string)) {
 	byDir := make(map[string]store.Account, len(accts))
 	for _, a := range accts {
 		byDir[a.ConfigDir] = a
@@ -339,6 +328,17 @@ func reportLedgers(accts []store.Account, ledgers []daemon.LedgerState, holder *
 			return "pool " + kind
 		}
 		return abbreviateHome(l.Resource) + " " + kind
+	}
+	grantHint := func(l daemon.LedgerState) string {
+		a, ok := byDir[l.Resource]
+		if !ok {
+			return "grant the required macOS permission"
+		}
+		backend, err := fkoverlay.Parse(a.OverlayKind)
+		if err != nil {
+			return "grant the required macOS permission"
+		}
+		return fuseGrantHint(backend)
 	}
 	for _, l := range ledgers {
 		switch l.Policy {
@@ -358,11 +358,11 @@ func reportLedgers(accts []store.Account, ledgers []daemon.LedgerState, holder *
 			// the retreat actually fires, so a visible parked row is always pending.
 			switch {
 			case l.Parked && l.AltHits > 0:
-				report(label(l, "remount"), false, fmt.Sprintf("TCC breaker tripped after %d blocked mounts; retreat to symlink pending (deferred by live sessions or a held claim) — the daemon re-fires it on the next elapsed backoff window; granting the permission first keeps the account on fuse", l.AltHits))
+				report(label(l, "remount"), false, fmt.Sprintf("TCC breaker tripped after %d blocked mounts; retreat to symlink pending (deferred by live sessions or a held claim) — the daemon re-fires it on the next elapsed backoff window; granting the permission first keeps the account on fuse: %s", l.AltHits, grantHint(l)))
 			case l.Parked:
 				report(label(l, "remount"), false, fmt.Sprintf("remount breaker tripped after %s; retreat to symlink pending (deferred by live sessions or a held claim) — the daemon re-fires it on the next elapsed backoff window", plural(l.Strikes, "failed attempt")))
 			case l.AltHits > 0:
-				report(label(l, "remount"), false, fmt.Sprintf("mount blocked pending the macOS grant (%s so far) — see the mount holder grant line", plural(l.AltHits, "wait")))
+				report(label(l, "remount"), false, fmt.Sprintf("mount blocked pending the macOS grant (%s so far) — %s (cc-pool falls back to symlink automatically if the grant never lands)", plural(l.AltHits, "wait"), grantHint(l)))
 			case l.Strikes > 0:
 				detail := fmt.Sprintf("remount failing (%s so far); falls back to symlink if the breaker trips", plural(l.Strikes, "attempt"))
 				if l.LastErr != "" {
@@ -390,6 +390,24 @@ func reportLedgers(accts []store.Account, ledgers []daemon.LedgerState, holder *
 				id := byDir[l.Resource].ID
 				report(label(l, "file provider"), false, fmt.Sprintf("domain parked: the daemon's automated recovery is exhausted (the domain was deregistered or its extension is uncontrollable) — run `ccp fp repair --account %d` to re-register it (or `ccp fp repair --retreat --account %d` to fall back to symlink), then relaunch any sessions on it; a stuck fileproviderd needs a manual restart (see %s)", id, id, abbreviateHome(pool.LogPath())))
 			}
+		case "fp.shallow":
+			if !l.Faulted {
+				continue
+			}
+			detail := "domain no longer listable (shallow liveness probe failed); the daemon promoted it into the recovery ladder"
+			if l.LastErr != "" {
+				detail += " — last error: " + l.LastErr
+			}
+			report(label(l, "file provider shallow probe"), false, detail)
+		case "fp.bridge":
+			if !l.Faulted {
+				continue
+			}
+			detail := "content bridge is not serving"
+			if l.LastErr != "" {
+				detail += " — " + l.LastErr
+			}
+			report(label(l, "file provider bridge"), false, detail)
 		case "auth.streak":
 			if !l.Faulted {
 				continue
@@ -535,26 +553,25 @@ func countFileProvider(accts []store.Account) int {
 // reportFileProvider covers the File Provider rungs: extension enablement, app
 // control socket, daemon bridge socket. Silent when the opt-in stack is unused;
 // with rows, an absent extension is the root fault and skips the socket probes.
-func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Account, consentPending bool, bridgeUp *bool, report func(string, bool, string)) {
-	for _, f := range fpDiagnose(ctx, m.OverlaySpec(), countFileProvider(accts), consentPending, bridgeUp) {
+func reportFileProvider(ctx context.Context, m *pool.Manager, accts []store.Account, bridge *daemon.FPBridgeStatus, consentPending bool, bridgeUp *bool, report func(string, bool, string)) {
+	for _, f := range fpDiagnose(ctx, m.OverlaySpec(), countFileProvider(accts), bridge, consentPending, bridgeUp) {
 		report(f.label, f.healthy, f.detail)
 	}
 }
 
-// reportFPWedges surfaces wedged File Provider domains — control ops answer but
-// reads hang, the wedge the control-plane health check misses. The daemon-DOWN
+// reportFPWedges surfaces wedged File Provider domains. The daemon-DOWN
 // diagnosis: it probes each File Provider domain itself through the
 // fpDomainProbeAt seam so the wedge is still visible (with the daemon up,
 // reportLedgers renders the daemon's authoritative fp.domain verdicts instead —
 // it is actively recovering them). Advisory: it points at `ccp fp repair` (the
 // re-register breaks open fds, so it is never run inline from the doctor loop).
-// A missing or empty-by-design .claude.json is no verdict.
+// A missing .claude.json is no verdict.
 func reportFPWedges(accts []store.Account, daemonAlive, rawProbe bool, report func(string, bool, string)) {
 	if daemonAlive {
 		return
 	}
-	// Probe each File Provider domain ourselves. By default this is the app
-	// control op (never a materializing read); --fp-raw-probe swaps in a direct
+	// Probe each File Provider domain ourselves. By default this is the app's
+	// shallow control op (never a materializing read); --fp-raw-probe swaps in a direct
 	// filesystem read that can trip a per-account macOS permission prompt.
 	probe := fpDomainProbeAt
 	if rawProbe {
@@ -565,8 +582,11 @@ func reportFPWedges(accts []store.Account, daemonAlive, rawProbe bool, report fu
 			continue
 		}
 		switch err := probe(a.ConfigDir); {
-		case err == nil, errors.Is(err, overlay.ErrFPProbeMissing), errors.Is(err, overlay.ErrFPProbeEmpty):
-			// Serving, or a benign no-identity/empty-by-design .claude.json.
+		case err == nil, errors.Is(err, overlay.ErrFPProbeMissing):
+			// Serving, or a benign no-identity .claude.json.
+		case errors.Is(err, fileproviderd.ErrOpUnsupported):
+			report(fmt.Sprintf("acct-%02d file provider", a.ID), false,
+				"cannot verify whether the domain serves — the CCPoolStatus companion app is too old to answer the shallow probe: "+pool.OverlaySpec().FileProvider.UpgradeHint+", relaunch it, then re-run `ccp doctor`")
 		case errors.Is(err, overlay.ErrFPProbeNoVerdict):
 			// The companion app is down too, or too old to answer the control op:
 			// unprobeable, not a confirmed wedge. Say so rather than flag a false
@@ -575,7 +595,7 @@ func reportFPWedges(accts []store.Account, daemonAlive, rawProbe bool, report fu
 				"cannot verify whether the domain serves — the CCPoolStatus companion app isn't answering its control socket; launch "+abbreviateHome(pool.WidgetAppPath())+" (or start the daemon with `ccp service install`), then re-run `ccp doctor` (or add --fp-raw-probe to read through the domain directly)")
 		default:
 			report(fmt.Sprintf("acct-%02d file provider", a.ID), false,
-				"domain not serving reads (probed directly; the daemon is down, so its content bridge is too) — start the daemon (`ccp service install`); if it stays wedged after that, run `ccp fp repair`")
+				"domain not serving its shallow listing probe (the daemon is down, so its content bridge is too) — start the daemon (`ccp service install`); if it stays wedged after that, run `ccp fp repair`")
 		}
 	}
 }

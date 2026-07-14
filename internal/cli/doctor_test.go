@@ -20,6 +20,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
@@ -479,7 +480,6 @@ func TestReportLedgers(t *testing.T) {
 	}
 	cases := map[string]struct {
 		ledgers []daemon.LedgerState
-		holder  *daemon.HolderStatus
 		want    []wantCall
 	}{
 		"healthy pool (no rows, no grant) is silent": {},
@@ -487,6 +487,8 @@ func TestReportLedgers(t *testing.T) {
 			ledgers: []daemon.LedgerState{
 				{Policy: "auth.streak", Resource: "/p/acct-01", Strikes: 2},
 				{Policy: "fp.domain", Resource: "/p/acct-02", Strikes: 1},
+				{Policy: "fp.shallow", Resource: "/p/acct-02", Strikes: 1},
+				{Policy: "fp.bridge", Resource: "pool", Strikes: 1},
 				{Policy: "fuse.deepwedge", Resource: "/p/acct-01", Strikes: 1},
 				{Policy: "fuse.remount", Resource: "/p/acct-01", Attempts: 3},
 				{Policy: "ratelimit.acct", Resource: "/p/acct-01", Attempts: 2, NextDue: now.Add(-time.Second)},
@@ -516,17 +518,13 @@ func TestReportLedgers(t *testing.T) {
 				notFrags: []string{"fell back to symlink"},
 			}},
 		},
-		"TCC grace counting pairs the verbatim grant walkthrough": {
-			holder:  &daemon.HolderStatus{TCCError: "grant Network Volumes access", TCCBlockedBackend: fkoverlay.BackendNFS},
+		"TCC grace counting carries its settings guidance directly": {
 			ledgers: []daemon.LedgerState{{Policy: "fuse.remount", Resource: "/p/acct-01", AltHits: 2, Attempts: 2}},
-			want: []wantCall{
-				{label: "mount holder grant", frags: []string{"grant Network Volumes access — " + fuseGrantHint(fkoverlay.BackendNFS) + " (cc-pool falls back to symlink automatically if the grant never lands)"}},
-				{label: "acct-01 remount", frags: []string{"macOS grant", "2 waits", "mount holder grant line"}},
-			},
-		},
-		"grant walkthrough renders even with no ledger rows": {
-			holder: &daemon.HolderStatus{TCCError: "grant Network Volumes access", TCCBlockedBackend: fkoverlay.BackendNFS},
-			want:   []wantCall{{label: "mount holder grant", frags: []string{"grant Network Volumes access"}}},
+			want: []wantCall{{
+				label:    "acct-01 remount",
+				frags:    []string{"macOS grant", "2 waits", fuseGrantHint(fkoverlay.BackendNFS), "falls back to symlink"},
+				notFrags: []string{"mount holder grant line"},
+			}},
 		},
 		"remount hazard mid-ladder carries its last error": {
 			ledgers: []daemon.LedgerState{{Policy: "fuse.remount", Resource: "/p/acct-01", Strikes: 2, Attempts: 2, LastErr: "mount: EIO"}},
@@ -555,6 +553,20 @@ func TestReportLedgers(t *testing.T) {
 				notFrags: []string{"wedged"},
 			}},
 		},
+		"faulted fp shallow lane reports the listability failure and last error": {
+			ledgers: []daemon.LedgerState{{Policy: "fp.shallow", Resource: "/p/acct-02", Faulted: true, LastErr: "domain not serving"}},
+			want: []wantCall{{
+				label: "acct-02 file provider shallow probe",
+				frags: []string{"no longer listable", "shallow liveness probe failed", "domain not serving"},
+			}},
+		},
+		"faulted fp bridge reports the pool-wide verdict and lever": {
+			ledgers: []daemon.LedgerState{{Policy: "fp.bridge", Resource: "pool", Faulted: true, LastErr: "bound-dead: restart the daemon"}},
+			want: []wantCall{{
+				label: "pool file provider bridge",
+				frags: []string{"content bridge is not serving", "bound-dead", "restart the daemon"},
+			}},
+		},
 		"auth streak fault carries the login hint": {
 			ledgers: []daemon.LedgerState{{Policy: "auth.streak", Resource: "/p/acct-01", Faulted: true, LastErr: "401 unauthorized"}},
 			want:    []wantCall{{label: "acct-01 auth", frags: []string{"needs re-login", "ccp login 1", "401 unauthorized"}}},
@@ -571,7 +583,7 @@ func TestReportLedgers(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			report, calls := captureReports()
-			reportLedgers(accts, tc.ledgers, tc.holder, now, report)
+			reportLedgers(accts, tc.ledgers, now, report)
 			if len(*calls) != len(tc.want) {
 				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
 			}
@@ -854,6 +866,7 @@ func TestReportFileProvider(t *testing.T) {
 		accts      []store.Account
 		healthVer  string
 		healthErr  error
+		bridge     *daemon.FPBridgeStatus
 		bridgeUp   *bool
 		consent    bool // daemon's consent-pending signal
 		want       []wantReport
@@ -904,7 +917,7 @@ func TestReportFileProvider(t *testing.T) {
 			want: []wantReport{
 				{"file provider extension", true, nil},
 				{"file provider app", true, []string{"1.2.3"}},
-				{"file provider bridge", false, []string{"app group container", "restart the daemon", "ccp fp onboard"}},
+				{"file provider bridge", false, []string{"app group container", "ccp fp consent", "no restart", "ccp fp onboard"}},
 			},
 			wantProbes: true,
 		},
@@ -919,9 +932,7 @@ func TestReportFileProvider(t *testing.T) {
 				{"file provider app", true, []string{"1.2.3"}},
 				{"file provider bridge", false, []string{
 					"parked on the app group container consent prompt",
-					"one-time grant to the daemon's stable path ~/.cc-pool/bin/cc-pool",
-					"unsigned local builds re-prompt per build",
-					"restart the daemon", "ccp fp onboard",
+					"ccp fp consent", "local terminal", "no restart", "ccp fp onboard",
 				}},
 			},
 			wantProbes: true,
@@ -937,6 +948,22 @@ func TestReportFileProvider(t *testing.T) {
 				{"file provider bridge", false, []string{
 					"bridge health unknown", "predates bridge reporting", "brew services restart cc-pool",
 				}},
+			},
+			wantProbes: true,
+		},
+		"bound-dead bridge self-test overrides dial-only green": {
+			available: true,
+			accts:     []store.Account{fpRow(1)},
+			healthVer: "1.2.3",
+			bridge: &daemon.FPBridgeStatus{
+				Verdict: daemon.FPBridgeBoundDead,
+				Detail:  "the daemon's bridge is bound but not serving; restart the daemon (brew services restart cc-pool)",
+			},
+			bridgeUp: ptr(true),
+			want: []wantReport{
+				{"file provider extension", true, nil},
+				{"file provider app", true, []string{"1.2.3"}},
+				{"file provider bridge", false, []string{"bound but not serving", "brew services restart cc-pool"}},
 			},
 			wantProbes: true,
 		},
@@ -963,7 +990,7 @@ func TestReportFileProvider(t *testing.T) {
 			})
 
 			report, calls := captureReports()
-			reportFileProvider(t.Context(), &pool.Manager{}, tc.accts, tc.consent, tc.bridgeUp, report)
+			reportFileProvider(t.Context(), &pool.Manager{}, tc.accts, tc.bridge, tc.consent, tc.bridgeUp, report)
 
 			if len(*calls) != len(tc.want) {
 				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
@@ -1010,7 +1037,7 @@ func TestReportFPWedges(t *testing.T) {
 		}
 	})
 
-	t.Run("daemon down control-op probe: wedged flags, no-verdict says cannot verify, healthy/missing stay silent", func(t *testing.T) {
+	t.Run("daemon down shallow control-op probe: wedged flags, no-verdict says cannot verify, healthy/missing stay silent", func(t *testing.T) {
 		probed := map[string]bool{}
 		swapVar(t, &fpDomainProbeAt, func(dir string) error {
 			probed[dir] = true
@@ -1045,6 +1072,23 @@ func TestReportFPWedges(t *testing.T) {
 		}
 		if (*calls)[1].label != "acct-04 file provider" || (*calls)[1].healthy || !strings.Contains((*calls)[1].detail, "cannot verify") {
 			t.Errorf("report[1] = %+v, want acct-04 flagged 'cannot verify'", (*calls)[1])
+		}
+	})
+
+	t.Run("daemon down old app names the cask upgrade instead of generic unprobeable guidance", func(t *testing.T) {
+		swapVar(t, &fpDomainProbeAt, func(string) error {
+			return fmt.Errorf("%w: %w", overlay.ErrFPProbeNoVerdict, fileproviderd.ErrOpUnsupported)
+		})
+		swapVar(t, &fpRawProbeAt, func(string) error { t.Error("raw probe ran without --fp-raw-probe"); return nil })
+		report, calls := captureReports()
+		reportFPWedges([]store.Account{fpRow(1)}, false, false, report)
+
+		if len(*calls) != 1 {
+			t.Fatalf("got %d reports %+v, want one upgrade finding", len(*calls), *calls)
+		}
+		got := (*calls)[0]
+		if got.healthy || !strings.Contains(got.detail, "brew upgrade --cask cc-pool-status") || strings.Contains(got.detail, "isn't answering its control socket") {
+			t.Errorf("old-app finding = %+v, want specific cask upgrade guidance", got)
 		}
 	})
 

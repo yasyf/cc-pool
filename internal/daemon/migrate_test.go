@@ -1150,7 +1150,6 @@ func TestHealFuseTaxonomy(t *testing.T) {
 		reserve     bool
 		wantOutcome healOutcome
 		wantKind    string
-		wantTCC     bool
 	}{
 		"holder unavailable retries next poll": {
 			setupErr:    fmt.Errorf("mount: %w", mountd.ErrHolderUnavailable),
@@ -1167,9 +1166,9 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			setupErr:    fmt.Errorf("mount: %w", mountd.ErrBusy),
 			wantOutcome: healDeferredBusy, wantKind: "nfs",
 		},
-		"tcc block recorded and retried": {
+		"tcc block classified and retried": {
 			setupErr:    fmt.Errorf("mount: %w", overlay.ErrMountNotLive),
-			wantOutcome: healTCCBlocked, wantKind: "nfs", wantTCC: true,
+			wantOutcome: healTCCBlocked, wantKind: "nfs",
 		},
 		// A wedged unmount is no more a mount verdict than ErrBusy — and the
 		// fallback's ConvertOverlay would hit the same wedge.
@@ -1178,10 +1177,10 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			wantOutcome: healRetry, wantKind: "nfs",
 		},
 		// The exact chain overlayClass produces for a timeout under a proven
-		// grant; wantTCC false is the load-bearing negative.
+		// grant.
 		"mount timeout (proven grant) retries without recording TCC": {
 			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountTimeout, mountd.ErrMountTimeout)),
-			wantOutcome: healRetry, wantKind: "nfs", wantTCC: false,
+			wantOutcome: healRetry, wantKind: "nfs",
 		},
 		// Forward skew: an unknown class from a newer holder must read as
 		// retry, never the mount failure that converts.
@@ -1259,9 +1258,6 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			if s.cl.held(1) {
 				t.Fatal("heal leaked a converting claim")
 			}
-			if gotTCC := s.holder.wireStatus().TCCError != ""; gotTCC != tc.wantTCC {
-				t.Fatalf("TCC recorded = %v, want %v", gotTCC, tc.wantTCC)
-			}
 			if tc.wantOutcome == healMounted && !s.holder.ready(dirs[1]) {
 				t.Fatal("clean mount not recorded in the holder cache")
 			}
@@ -1301,9 +1297,6 @@ func TestHealFuseSweepFailureRetries(t *testing.T) {
 	}
 	if s.cl.held(1) {
 		t.Fatal("a sweep failure leaked a converting claim")
-	}
-	if s.holder.wireStatus().TCCError != "" {
-		t.Fatal("a sweep failure wrongly recorded a TCC block")
 	}
 }
 

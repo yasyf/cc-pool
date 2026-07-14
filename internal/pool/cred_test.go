@@ -12,6 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/proc"
 )
 
 // moveCred builds the credential the move tests seed and expect back. It is
@@ -337,11 +338,11 @@ func TestMoveCredentialReadbackMismatch(t *testing.T) {
 func TestMoveCredentialLockContention(t *testing.T) {
 	lockDir := t.TempDir()
 	a := store.Account{ID: 7, ConfigDir: t.TempDir(), KeychainService: "svc-move", KeychainAccount: "user"}
-	held, err := flockAcquire(context.Background(), filepath.Join(lockDir, AccountDirName(a.ID)+".lock"))
+	held, err := proc.Flock(context.Background(), filepath.Join(lockDir, AccountDirName(a.ID)+".lock"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.release()
+	defer held.Release()
 
 	fk := credstest.NewFake()
 	fk.Put(a.KeychainService, a.KeychainAccount, moveCred())

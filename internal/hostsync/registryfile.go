@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/yasyf/fusekit/proc"
 	"github.com/yasyf/fusekit/state"
 	"github.com/yasyf/synckit/cregistry"
 )
@@ -78,11 +79,11 @@ func (rf RegistryFile) Save(reg Registry) error {
 // WithLock runs fn under the exclusive registry flock; the signature matches
 // converge.Reconcile's lock parameter.
 func (rf RegistryFile) WithLock(ctx context.Context, fn func() error) error {
-	h, err := flockAcquire(ctx, rf.LockPath)
+	h, err := proc.Flock(ctx, rf.LockPath)
 	if err != nil {
 		return fmt.Errorf("acquire registry lock: %w", err)
 	}
-	defer h.release()
+	defer h.Release()
 	return fn()
 }
 

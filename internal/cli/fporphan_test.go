@@ -17,11 +17,20 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
+type orphanProviderBase struct{}
+
+func (*orphanProviderBase) Backend() fkoverlay.Backend           { return fkoverlay.BackendFileProvider }
+func (*orphanProviderBase) PrivateRoot(dir string) string        { return fkoverlay.FusePrivateRoot(dir) }
+func (*orphanProviderBase) Health(_, _ string) error             { return nil }
+func (*orphanProviderBase) Sync(_, _ string) error               { return nil }
+func (*orphanProviderBase) Teardown(_, _ string) (string, error) { return "", nil }
+func (*orphanProviderBase) Setup(_, _ string) error              { return nil }
+
 // orphanFP is a File Provider provider whose zero-spawn DomainRoot registration
 // query and RemoveDomain are scriptable, so orphan reconciliation never registers
 // or removes a real domain.
 type orphanFP struct {
-	fakeFPProvider
+	orphanProviderBase
 	rootErr    error // DomainRoot error; nil means registered
 	root       string
 	roots      int // DomainRoot call count

@@ -9,7 +9,6 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/forecast"
 	"github.com/yasyf/cc-pool/internal/score"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -116,23 +115,6 @@ type FPRepairResult struct {
 	Detail  string          `json:"detail,omitempty"` // failure text / retreat reason
 }
 
-// FPDomainState is the daemon's cached verdict for one wedged File Provider
-// domain: its control ops answer but its reads hang — the wedge cc-pool's
-// control-plane Health cannot see. Surfaced by status so `ccp doctor` renders it
-// (and its recovery progress) without re-probing. Additive; status only.
-type FPDomainState struct {
-	ID        int    `json:"id"`
-	Label     string `json:"label,omitempty"`
-	ConfigDir string `json:"config_dir"`
-	// RecoveryAttempts is how many recovery-ladder attempts the daemon has spent
-	// on this domain so far.
-	RecoveryAttempts int `json:"recovery_attempts,omitempty"`
-	// BreakerTripped: the recovery ladder exhausted its attempts and parked the
-	// domain — automated recovery is done; a manual `ccp fp repair` (or a
-	// fileproviderd restart) is needed.
-	BreakerTripped bool `json:"breaker_tripped,omitempty"`
-}
-
 // LedgerState is one self-heal ledger row on the status wire: the composed
 // observability view over both ledger stores (the Server-owned store and the
 // holder cache's fuse verdict rows — composed at snapshot time, never merged).
@@ -157,15 +139,6 @@ type HolderStatus struct {
 	Version string `json:"version"`
 	// Mounts counts the live mirrors in the holder's last List.
 	Mounts int `json:"mounts"`
-	// WedgedMounts counts mirrors the daemon's deep probe found wedged: shallow
-	// metadata stats answer but bulk reads hang.
-	WedgedMounts int `json:"wedged_mounts,omitempty"`
-	// TCCError carries the latest mount-blocked-pending-TCC guidance (the
-	// macOS volume-access grant walkthrough); "" when no mount is blocked.
-	TCCError string `json:"tcc_error,omitempty"`
-	// TCCBlockedBackend is the fuse backend whose one-time macOS grant the
-	// blocked mount needs; "" when no mount is TCC-blocked.
-	TCCBlockedBackend fkoverlay.Backend `json:"tcc_blocked_backend,omitempty"`
 }
 
 // AccountStatus is the per-account view returned by status/select.
@@ -346,9 +319,6 @@ type Response struct {
 	// pre-v0.49.1 daemon that predates bridge reporting) is distinguishable from
 	// a down bridge; the daemon always stamps it. Additive; status only.
 	FPBridgeUp *bool `json:"fp_bridge_up,omitempty"`
-	// FPWedged lists File Provider domains the daemon's data-plane probe found
-	// wedged (control ops answer, reads hang). Additive; status only.
-	FPWedged []FPDomainState `json:"fp_wedged,omitempty"`
 	// FPBridge is the on-demand File Provider content-bridge verdict — the
 	// OpFPBridgeCheck op payload, NOT a status projection (the dial-only FPBridgeUp
 	// stays untouched for wire skew).

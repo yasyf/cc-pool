@@ -276,14 +276,11 @@ func (s *Server) escalateWedgedRow(ctx context.Context, a store.Account) {
 }
 
 // escalateTCCBlockedRow retreats a row that tripped tccBreakerThreshold to
-// symlink; the process-wide TCC guidance is cleared only on a real conversion,
-// so a deferred retreat cannot wipe a concurrent row's guidance. Caller holds
-// the account's poll claim.
+// symlink. Caller holds the account's poll claim.
 func (s *Server) escalateTCCBlockedRow(ctx context.Context, a store.Account) {
 	announce := fmt.Sprintf("acct-%02d macOS volume-access grant never landed after %d attempts; falling back to symlink — `ccp migrate --to fuse` re-promotes once fuse-t can mount here",
 		a.ID, tccBreakerThreshold)
 	if s.escalateRowToSymlink(ctx, a, announce) {
-		s.holder.recordTCC("", "")
 		s.log.Printf("acct-%02d fell back to symlink after the macOS volume-access grant did not land", a.ID)
 	}
 }

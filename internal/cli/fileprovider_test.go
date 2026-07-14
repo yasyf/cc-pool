@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +19,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/fusekit/version"
 )
 
 // scriptFPElections shrinks the settle window to test scale and scripts
@@ -247,10 +250,8 @@ func TestRunFPPostInstall(t *testing.T) {
 	}
 }
 
-// TestCheckFPRungs pins the rung walk: control then bridge, each with a
-// bounded poll, rung-specific stuck messages, no bridge probe behind a dead
-// control socket, and the daemon's consent-pending signal upgrading the
-// bridge verdict from generic dead-socket to the precise TCC guidance.
+// TestCheckFPRungs pins the bounded control and dial-only bridge rungs. The
+// data-plane self-test is exercised separately once those two rungs pass.
 func TestCheckFPRungs(t *testing.T) {
 	controlErr := errors.New("dial unix: connect: no such file or directory")
 	cases := map[string]struct {
@@ -280,18 +281,11 @@ func TestCheckFPRungs(t *testing.T) {
 			daemonAlive:    false,
 			wantErr:        []string{"daemon isn't running", "ccp service install"},
 		},
-		"bridge down with consent pending names the TCC prompt": {
+		"bridge down with a live daemon points at the consent lever": {
 			controlUpAfter: 0,
 			bridgeUp:       ptr(false),
 			daemonAlive:    true,
-			consentPending: true,
-			wantErr:        []string{"app group container consent prompt", "restart the daemon"},
-		},
-		"bridge down without the signal keeps the generic consent guidance": {
-			controlUpAfter: 0,
-			bridgeUp:       ptr(false),
-			daemonAlive:    true,
-			wantErr:        []string{"isn't accepting", "consent prompt", "restart the daemon"},
+			wantErr:        []string{"isn't accepting", "ccp fp consent", "no restart"},
 		},
 		"nil bridge state from a pre-upgrade daemon prescribes a restart": {
 			controlUpAfter: 0,
@@ -302,7 +296,7 @@ func TestCheckFPRungs(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			controlCalls, bridgeCalls := 0, 0
+			controlCalls, bridgeCalls, healthCalls, checkCalls := 0, 0, 0, 0
 			swapVar(t, &fpControlHealth, func(context.Context) (string, error) {
 				controlCalls++
 				if tc.controlUpAfter < 0 || controlCalls <= tc.controlUpAfter {
@@ -317,18 +311,32 @@ func TestCheckFPRungs(t *testing.T) {
 				bridgeCalls++
 				return tc.daemonAlive, tc.consentPending, tc.bridgeUp
 			})
+			swapVar(t, &fpDaemonHealth, func() (*daemon.Response, error) {
+				healthCalls++
+				return &daemon.Response{OK: true, Version: version.String()}, nil
+			})
+			swapVar(t, &fpBridgeCheck, func() (*daemon.Response, error) {
+				checkCalls++
+				return &daemon.Response{OK: true, FPBridge: &daemon.FPBridgeStatus{Verdict: daemon.FPBridgeServing}}, nil
+			})
 
 			var out bytes.Buffer
-			err := checkFPRungs(t.Context(), &out, time.Millisecond)
+			cmd := &cobra.Command{}
+			cmd.SetContext(t.Context())
+			cmd.SetOut(&out)
+			err := checkFPRungs(cmd, time.Millisecond)
 
 			if len(tc.wantErr) == 0 {
 				if err != nil {
 					t.Fatalf("checkFPRungs: %v", err)
 				}
-				for _, frag := range []string{"9.9.9", "bridge socket up"} {
+				for _, frag := range []string{"9.9.9", "bridge socket up", "bridge serving"} {
 					if !strings.Contains(out.String(), frag) {
 						t.Errorf("output %q missing %q", out.String(), frag)
 					}
+				}
+				if healthCalls != 1 || checkCalls != 1 {
+					t.Errorf("health calls=%d bridge checks=%d, want 1/1", healthCalls, checkCalls)
 				}
 				return
 			}
@@ -343,6 +351,9 @@ func TestCheckFPRungs(t *testing.T) {
 			if tc.wantNoBridge && bridgeCalls != 0 {
 				t.Errorf("bridge probed %d times behind a dead control socket; the app rung is the root fault", bridgeCalls)
 			}
+			if healthCalls != 0 || checkCalls != 0 {
+				t.Errorf("ran data-plane self-test behind a failed rung: health=%d check=%d", healthCalls, checkCalls)
+			}
 		})
 	}
 }
@@ -354,8 +365,171 @@ func TestCheckFPRungsCancelUnwinds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var out bytes.Buffer
-	if err := checkFPRungs(ctx, &out, time.Millisecond); !errors.Is(err, context.Canceled) {
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+	cmd.SetOut(&out)
+	if err := checkFPRungs(cmd, time.Millisecond); !errors.Is(err, context.Canceled) {
 		t.Fatalf("checkFPRungs = %v, want context.Canceled", err)
+	}
+}
+
+func TestCheckFPRungsBridgeVerdict(t *testing.T) {
+	healthErr := errors.New("health failed")
+	checkErr := errors.New("self-test transport failed")
+	boundDead := "the daemon's bridge is bound but not serving; restart the daemon (brew services restart cc-pool)"
+	cases := map[string]struct {
+		healthVersion string
+		healthErr     error
+		response      *daemon.Response
+		checkErr      error
+		wantCheck     bool
+		wantErr       []string
+	}{
+		"serving passes": {
+			healthVersion: version.String(),
+			response:      &daemon.Response{OK: true, FPBridge: &daemon.FPBridgeStatus{Verdict: daemon.FPBridgeServing}},
+			wantCheck:     true,
+		},
+		"health failure stops before self-test": {
+			healthErr: healthErr,
+			wantErr:   []string{"health check before bridge self-test", "health failed"},
+		},
+		"old daemon version prescribes restart": {
+			healthVersion: "v0.55.0",
+			wantErr:       []string{"daemon is v0.55.0", "restart", "bridge self-test"},
+		},
+		"unknown op prescribes upgraded daemon takeover": {
+			healthVersion: version.String(),
+			response:      &daemon.Response{Error: "unknown op: fpbridgecheck"},
+			wantCheck:     true,
+			wantErr:       []string{"predates the bridge self-test", "restart"},
+		},
+		"transport failure is loud": {
+			healthVersion: version.String(),
+			checkErr:      checkErr,
+			wantCheck:     true,
+			wantErr:       []string{"daemon bridge self-test", "transport failed"},
+		},
+		"operation rejection is loud": {
+			healthVersion: version.String(),
+			response:      &daemon.Response{Error: "self-test rejected"},
+			wantCheck:     true,
+			wantErr:       []string{"daemon bridge self-test", "self-test rejected"},
+		},
+		"missing verdict prescribes restart": {
+			healthVersion: version.String(),
+			response:      &daemon.Response{OK: true},
+			wantCheck:     true,
+			wantErr:       []string{"no verdict", "restart"},
+		},
+		"bound-dead returns the daemon lever verbatim": {
+			healthVersion: version.String(),
+			response:      &daemon.Response{OK: true, FPBridge: &daemon.FPBridgeStatus{Verdict: daemon.FPBridgeBoundDead, Detail: boundDead}},
+			wantCheck:     true,
+			wantErr:       []string{boundDead},
+		},
+		"detail-free non-serving verdict is still loud": {
+			healthVersion: version.String(),
+			response:      &daemon.Response{OK: true, FPBridge: &daemon.FPBridgeStatus{Verdict: daemon.FPBridgeDown}},
+			wantCheck:     true,
+			wantErr:       []string{"daemon bridge self-test", "down"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			swapVar(t, &fpControlHealth, func(context.Context) (string, error) { return "9.9.9", nil })
+			swapVar(t, &fpDaemonProbe, func() (bool, bool, *bool) { return true, false, ptr(true) })
+			healthCalls, checkCalls := 0, 0
+			swapVar(t, &fpDaemonHealth, func() (*daemon.Response, error) {
+				healthCalls++
+				return &daemon.Response{OK: true, Version: tc.healthVersion}, tc.healthErr
+			})
+			swapVar(t, &fpBridgeCheck, func() (*daemon.Response, error) {
+				checkCalls++
+				return tc.response, tc.checkErr
+			})
+
+			var out bytes.Buffer
+			cmd := &cobra.Command{}
+			cmd.SetContext(t.Context())
+			cmd.SetOut(&out)
+			err := checkFPRungs(cmd, time.Millisecond)
+			if len(tc.wantErr) == 0 && err != nil {
+				t.Fatalf("checkFPRungs: %v", err)
+			}
+			if len(tc.wantErr) > 0 && err == nil {
+				t.Fatal("checkFPRungs succeeded; want an error")
+			}
+			for _, frag := range tc.wantErr {
+				if !strings.Contains(err.Error(), frag) {
+					t.Errorf("error %q missing %q", err, frag)
+				}
+			}
+			if healthCalls != 1 {
+				t.Errorf("health calls=%d, want 1", healthCalls)
+			}
+			wantChecks := 0
+			if tc.wantCheck {
+				wantChecks = 1
+			}
+			if checkCalls != wantChecks {
+				t.Errorf("bridge checks=%d, want %d", checkCalls, wantChecks)
+			}
+			if len(tc.wantErr) == 0 && !strings.Contains(out.String(), "Daemon bridge serving") {
+				t.Errorf("output %q missing serving verdict", out.String())
+			}
+		})
+	}
+}
+
+func TestCheckFPRungsRunsConsentInline(t *testing.T) {
+	tempHome(t)
+	stable := filepath.Join(pool.StableBinDir(), "cc-pool")
+	if err := os.MkdirAll(filepath.Dir(stable), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stable, []byte("test"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	swapVar(t, &fpControlHealth, func(context.Context) (string, error) { return "9.9.9", nil })
+	probeCalls := 0
+	swapVar(t, &fpDaemonProbe, func() (bool, bool, *bool) {
+		probeCalls++
+		if probeCalls == 1 {
+			return true, true, ptr(false)
+		}
+		return true, false, ptr(true)
+	})
+	execCalls := 0
+	swapVar(t, &fpConsentProbeExec, func(_ context.Context, path string, _ io.Reader, _, _ io.Writer) error {
+		execCalls++
+		if path != stable {
+			t.Errorf("probe path=%q, want %q", path, stable)
+		}
+		return nil
+	})
+	swapVar(t, &fpConsentNow, func() time.Time { return time.Unix(1_700_000_000, 0) })
+	swapVar(t, &fpDaemonHealth, func() (*daemon.Response, error) {
+		return &daemon.Response{OK: true, Version: version.String()}, nil
+	})
+	swapVar(t, &fpBridgeCheck, func() (*daemon.Response, error) {
+		return &daemon.Response{OK: true, FPBridge: &daemon.FPBridgeStatus{Verdict: daemon.FPBridgeServing}}, nil
+	})
+
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetContext(t.Context())
+	cmd.SetOut(&out)
+	if err := checkFPRungs(cmd, time.Nanosecond); err != nil {
+		t.Fatalf("checkFPRungs: %v", err)
+	}
+	if execCalls != 1 {
+		t.Errorf("consent probe exec calls=%d, want 1", execCalls)
+	}
+	for _, frag := range []string{"waiting for its one-time local consent grant", "bridge bound", "Daemon bridge serving"} {
+		if !strings.Contains(out.String(), frag) {
+			t.Errorf("output %q missing %q", out.String(), frag)
+		}
 	}
 }
 
@@ -394,117 +568,269 @@ func TestFPRepairRegistered(t *testing.T) {
 	}
 }
 
-// TestFPRepairTargets pins the daemon-down target selection: --account picks that
-// one File Provider row (error for a non-FP or unknown id), and no --account
-// picks every File Provider row (the daemon-down path cannot tell wedged from
-// healthy).
-func TestFPRepairTargets(t *testing.T) {
-	accts := []store.Account{
-		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(fkoverlay.BackendFileProvider)},
-		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(fkoverlay.BackendSymlink)},
-		{ID: 3, ConfigDir: "/p/acct-03", OverlayKind: string(fkoverlay.BackendFileProvider)},
-	}
+func TestFPConsentCommandsRegistered(t *testing.T) {
 	cases := map[string]struct {
-		account int
-		wantIDs []int
-		wantErr string
+		path   []string
+		hidden bool
 	}{
-		"no account picks every fp row":   {account: 0, wantIDs: []int{1, 3}},
-		"explicit fp account picks it":    {account: 1, wantIDs: []int{1}},
-		"explicit symlink account errors": {account: 2, wantErr: "not file provider"},
-		"explicit unknown account errors": {account: 9, wantErr: "not found"},
+		"operator command": {path: []string{"fp", "consent"}},
+		"probe command":    {path: []string{"fp", "consent-probe"}, hidden: true},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got, err := fpRepairTargets(accts, tc.account)
-			if tc.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("err = %v, want one containing %q", err, tc.wantErr)
-				}
-				return
+			root := NewRootCmd()
+			cmd, _, err := root.Find(tc.path)
+			if err != nil || cmd.Name() != tc.path[len(tc.path)-1] {
+				t.Fatalf("Find(%v) = (%v, %v)", tc.path, cmd, err)
 			}
-			if err != nil {
-				t.Fatalf("fpRepairTargets: %v", err)
+			if cmd.Hidden != tc.hidden {
+				t.Errorf("Hidden = %v, want %v", cmd.Hidden, tc.hidden)
 			}
-			var ids []int
-			for _, a := range got {
-				ids = append(ids, a.ID)
-			}
-			if fmt.Sprint(ids) != fmt.Sprint(tc.wantIDs) {
-				t.Fatalf("target ids = %v, want %v", ids, tc.wantIDs)
+			if err := cmd.Args(cmd, []string{"extra"}); err == nil {
+				t.Fatal("command accepted positional args; want cobra.NoArgs")
 			}
 		})
 	}
 }
 
-// fakeFPProvider records Teardown/Setup for the daemon-down direct repair path,
-// so the test never registers a real File Provider domain.
-type fakeFPProvider struct {
-	setups, teardowns int
-	setupErr          error
+func TestRunFPConsentProbe(t *testing.T) {
+	tempHome(t)
+	dir := filepath.Dir(pool.FPBridgeSocketPath())
+	probe := filepath.Join(dir, ".consent-probe")
+	if err := runFPConsentProbe(); err != nil {
+		t.Fatalf("runFPConsentProbe: %v", err)
+	}
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		t.Fatalf("bridge directory stat = (%v, %v), want a directory", fi, err)
+	}
+	if _, err := os.Stat(probe); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("consent probe remains after success: %v", err)
+	}
 }
 
-func (f *fakeFPProvider) Backend() fkoverlay.Backend           { return fkoverlay.BackendFileProvider }
-func (f *fakeFPProvider) PrivateRoot(dir string) string        { return fkoverlay.FusePrivateRoot(dir) }
-func (f *fakeFPProvider) Health(_, _ string) error             { return nil }
-func (f *fakeFPProvider) Sync(_, _ string) error               { return nil }
-func (f *fakeFPProvider) Teardown(_, _ string) (string, error) { f.teardowns++; return "", nil }
-func (f *fakeFPProvider) Setup(_, _ string) error              { f.setups++; return f.setupErr }
+type fpDaemonState struct {
+	alive, pending bool
+	bridgeUp       *bool
+}
 
-// TestRepairFPDirect pins the daemon-down direct repair: it re-registers every
-// File Provider row (Teardown+Setup) through the injected provider, warns that
-// the daemon is down, and surfaces a per-domain failure without stranding the row.
-func TestRepairFPDirect(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+func TestRunFPConsent(t *testing.T) {
+	probeErr := errors.New("probe failed")
+	hostErr := errors.New("hostname failed")
+	base := time.Unix(1_700_000_000, 0)
+	cases := map[string]struct {
+		sshConnection string
+		sshTTY        string
+		hostErr       error
+		stable        string
+		execErr       error
+		states        []fpDaemonState
+		times         []time.Time
+		cancel        bool
+		wantExec      int
+		wantProbe     int
+		wantErr       []string
+		wantOut       []string
+		wantIs        error
+	}{
+		"SSH_CONNECTION refuses with the local host": {
+			sshConnection: "client server",
+			wantErr:       []string{"local terminal on test-host"},
+		},
+		"SSH_TTY refuses with the local host": {
+			sshTTY:  "/dev/ttys001",
+			wantErr: []string{"local terminal on test-host"},
+		},
+		"hostname failure is loud": {
+			sshConnection: "client server",
+			hostErr:       hostErr,
+			wantErr:       []string{"resolve local hostname"},
+			wantIs:        hostErr,
+		},
+		"missing stable daemon binary points at service install": {
+			wantErr: []string{"stable daemon binary", "ccp service install"},
+		},
+		"a directory is not accepted as the stable daemon binary": {
+			stable:  "dir",
+			wantErr: []string{"not a regular file", "ccp service install"},
+		},
+		"probe failure preserves the stable-path identity": {
+			stable:   "file",
+			execErr:  probeErr,
+			wantExec: 1,
+			wantErr:  []string{"grant File Provider consent", "~/.cc-pool/bin/cc-pool"},
+			wantIs:   probeErr,
+		},
+		"bridge binds without a daemon restart": {
+			stable:    "file",
+			states:    []fpDaemonState{{alive: true, bridgeUp: ptr(false)}, {alive: true, bridgeUp: ptr(true)}},
+			wantExec:  1,
+			wantProbe: 2,
+			wantOut:   []string{"bridge bound", "no daemon restart needed"},
+		},
+		"live daemon expiry points at doctor": {
+			stable:    "file",
+			states:    []fpDaemonState{{alive: true, bridgeUp: ptr(false)}},
+			times:     []time.Time{base, base.Add(fpConsentBridgeWindow)},
+			wantExec:  1,
+			wantProbe: 1,
+			wantErr:   []string{"live daemon", "ccp doctor"},
+		},
+		"dead daemon expiry points at service install": {
+			stable:    "file",
+			states:    []fpDaemonState{{bridgeUp: ptr(false)}},
+			times:     []time.Time{base, base.Add(fpConsentBridgeWindow)},
+			wantExec:  1,
+			wantProbe: 1,
+			wantErr:   []string{"daemon is not running", "ccp service install"},
+		},
+		"cancellation unwinds the bridge wait": {
+			stable:    "file",
+			states:    []fpDaemonState{{alive: true, bridgeUp: ptr(false)}},
+			cancel:    true,
+			wantExec:  1,
+			wantProbe: 1,
+			wantIs:    context.Canceled,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			home := tempHome(t)
+			t.Setenv("SSH_CONNECTION", tc.sshConnection)
+			t.Setenv("SSH_TTY", tc.sshTTY)
+			stable := filepath.Join(pool.StableBinDir(), "cc-pool")
+			switch tc.stable {
+			case "file":
+				if err := os.MkdirAll(filepath.Dir(stable), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(stable, []byte("test"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "dir":
+				if err := os.MkdirAll(stable, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var out, errOut bytes.Buffer
+			in := strings.NewReader("input")
+			cmd := &cobra.Command{}
+			cmd.SetIn(in)
+			cmd.SetOut(&out)
+			cmd.SetErr(&errOut)
+			ctx := t.Context()
+			if tc.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			cmd.SetContext(ctx)
+
+			swapVar(t, &fpHostname, func() (string, error) { return "test-host", tc.hostErr })
+			execCalls := 0
+			swapVar(t, &fpConsentProbeExec, func(gotCtx context.Context, gotPath string, gotIn io.Reader, gotOut, gotErr io.Writer) error {
+				execCalls++
+				if gotCtx != ctx || gotPath != stable {
+					t.Errorf("probe exec context/path = (%v, %q), want (%v, %q)", gotCtx, gotPath, ctx, stable)
+				}
+				if gotIn != in || gotOut != &out || gotErr != &errOut {
+					t.Error("probe exec did not inherit command stdio")
+				}
+				return tc.execErr
+			})
+			probeCalls := 0
+			swapVar(t, &fpDaemonProbe, func() (bool, bool, *bool) {
+				probeCalls++
+				if len(tc.states) == 0 {
+					t.Error("daemon probed before consent probe succeeded")
+					return false, false, nil
+				}
+				i := probeCalls - 1
+				if i >= len(tc.states) {
+					i = len(tc.states) - 1
+				}
+				st := tc.states[i]
+				return st.alive, st.pending, st.bridgeUp
+			})
+			nowCalls := 0
+			swapVar(t, &fpConsentNow, func() time.Time {
+				nowCalls++
+				if len(tc.times) == 0 {
+					return base
+				}
+				i := nowCalls - 1
+				if i >= len(tc.times) {
+					i = len(tc.times) - 1
+				}
+				return tc.times[i]
+			})
+
+			interval := time.Nanosecond
+			if tc.cancel {
+				interval = time.Hour
+			}
+			err := runFPConsent(cmd, interval)
+			if len(tc.wantErr) == 0 && tc.wantIs == nil && err != nil {
+				t.Fatalf("runFPConsent: %v", err)
+			}
+			if (len(tc.wantErr) > 0 || tc.wantIs != nil) && err == nil {
+				t.Fatal("runFPConsent succeeded; want an error")
+			}
+			for _, frag := range tc.wantErr {
+				if !strings.Contains(err.Error(), frag) {
+					t.Errorf("error %q missing %q", err, frag)
+				}
+			}
+			if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
+				t.Errorf("error %v does not wrap %v", err, tc.wantIs)
+			}
+			for _, frag := range tc.wantOut {
+				if !strings.Contains(out.String(), frag) {
+					t.Errorf("output %q missing %q", out.String(), frag)
+				}
+			}
+			if execCalls != tc.wantExec || probeCalls != tc.wantProbe {
+				t.Errorf("exec calls=%d daemon probes=%d, want %d/%d", execCalls, probeCalls, tc.wantExec, tc.wantProbe)
+			}
+			if !strings.HasPrefix(stable, home) {
+				t.Fatalf("stable path %q escaped test home %q", stable, home)
+			}
+		})
+	}
+}
+
+func TestRunFPRepairDaemonDownRefuses(t *testing.T) {
+	tempHome(t)
+	if err := pool.EnsureStateDir(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(pool.DBPath())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	for _, a := range []store.Account{
-		{ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct-01"), OverlayKind: string(fkoverlay.BackendFileProvider), KeychainService: "s1", KeychainAccount: "u"},
-		{ID: 2, ConfigDir: filepath.Join(t.TempDir(), "acct-02"), OverlayKind: string(fkoverlay.BackendSymlink), KeychainService: "s2", KeychainAccount: "u"},
-	} {
-		if err := st.UpsertAccount(a); err != nil {
-			t.Fatal(err)
-		}
+	if err := st.UpsertAccount(store.Account{ID: 1, ConfigDir: filepath.Join(pool.AccountsDir(), "acct-01"), OverlayKind: string(fkoverlay.BackendFileProvider), KeychainService: "pool-test", KeychainAccount: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetMeta("initialized", "1"); err != nil {
+		t.Fatal(err)
 	}
 	m := &pool.Manager{Store: st}
-
-	t.Run("re-registers every fp row and warns the daemon is down", func(t *testing.T) {
-		fake := &fakeFPProvider{}
-		swapVar(t, &fpOverlayProvider, func(fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil })
-		cmd := &cobra.Command{}
-		var out bytes.Buffer
-		cmd.SetOut(&out)
-
-		if err := repairFPDirect(cmd, m, 0, false); err != nil {
-			t.Fatalf("repairFPDirect: %v", err)
-		}
-		if fake.setups != 1 || fake.teardowns != 1 {
-			t.Fatalf("setups=%d teardowns=%d, want 1/1 (only the one fp row)", fake.setups, fake.teardowns)
-		}
-		for _, frag := range []string{"daemon is not running", "re-registered"} {
-			if !strings.Contains(out.String(), frag) {
-				t.Errorf("output %q missing %q", out.String(), frag)
+	for _, retreat := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retreat=%v", retreat), func(t *testing.T) {
+			cmd := &cobra.Command{}
+			cmd.SetContext(t.Context())
+			err := runFPRepair(cmd, m, 1, retreat)
+			if err == nil {
+				t.Fatal("runFPRepair succeeded without the daemon")
 			}
-		}
-	})
-
-	t.Run("a cannot-control Setup surfaces a failure with the symlink hint", func(t *testing.T) {
-		fake := &fakeFPProvider{setupErr: fmt.Errorf("register: %w", fileproviderd.ErrCannotControl)}
-		swapVar(t, &fpOverlayProvider, func(fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil })
-		cmd := &cobra.Command{}
-		var out bytes.Buffer
-		cmd.SetOut(&out)
-
-		if err := repairFPDirect(cmd, m, 1, false); err == nil || !strings.Contains(err.Error(), "failed to re-register") {
-			t.Fatalf("repairFPDirect err = %v, want a re-register failure", err)
-		}
-		if !strings.Contains(out.String(), "cannot serve") {
-			t.Errorf("output %q missing the cannot-serve guidance", out.String())
-		}
-	})
+			for _, frag := range []string{"daemon isn't running", "ccp service install"} {
+				if !strings.Contains(err.Error(), frag) {
+					t.Errorf("error %q missing %q", err, frag)
+				}
+			}
+		})
+	}
 }
 
 // capResult scripts one fpCapabilityProbe answer.
@@ -527,11 +853,9 @@ func scriptCapability(t *testing.T, results []capResult) *int {
 	return reads
 }
 
-// TestAwaitFPCapability pins the truthful consent gate: election is not consent,
-// so a "+"-elected extension whose probe still fails REACHES the Settings branch
-// (consent explanation + deep link, exactly once) and success is gated on the
-// PROBE passing — never on the election. A control socket that is merely still
-// coming up (ErrAppUnavailable) is a quiet wait, not a false consent prompt.
+// TestAwaitFPCapability pins the three probe lanes: dial refusal means the app is
+// coming up, other errors mean its answering probe is failing, and a definitive
+// can't-serve verdict reaches the unbounded Settings-toggle lane.
 func TestAwaitFPCapability(t *testing.T) {
 	cantServe := fmt.Errorf("companion app cannot control File Provider: %w", fileproviderd.ErrCannotControl)
 	cases := map[string]struct {
@@ -545,13 +869,23 @@ func TestAwaitFPCapability(t *testing.T) {
 			wantFrags: []string{"enabled and serving"},
 		},
 		"app still coming up then serves stays quiet": {
-			results:   []capResult{{err: fileproviderd.ErrAppUnavailable}, {ok: true}},
+			results:   []capResult{{err: fileproviderd.ErrAppDialRefused}, {ok: true}},
 			wantFrags: []string{"enabled and serving"},
+			notFrags:  []string{"app answering", "election is not consent"},
 		},
-		"busy is transient — quiet wait, then serves, never a spurious settings prompt": {
-			results:   []capResult{{err: fileproviderd.ErrBusy}, {ok: true}},
-			wantFrags: []string{"enabled and serving"},
+		"plain app-unavailable is an answering failure, not dial refusal": {
+			results:   []capResult{{err: fileproviderd.ErrAppUnavailable}, {ok: true}},
+			wantFrags: []string{"app answering but capability probe failing", "enabled and serving"},
 			notFrags:  []string{"election is not consent"},
+		},
+		"busy is an answering failure then serves without a settings prompt": {
+			results:   []capResult{{err: fileproviderd.ErrBusy}, {ok: true}},
+			wantFrags: []string{"app answering but capability probe failing", "enabled and serving"},
+			notFrags:  []string{"election is not consent"},
+		},
+		"ok plus error is an error lane, never false success": {
+			results:   []capResult{{ok: true, err: fileproviderd.ErrBusy}, {ok: true}},
+			wantFrags: []string{"app answering but capability probe failing", "enabled and serving"},
 		},
 		"elected but not consented reaches settings then the probe gates success": {
 			results:      []capResult{{err: cantServe}, {err: cantServe}, {ok: true}},
@@ -594,6 +928,125 @@ func TestAwaitFPCapability(t *testing.T) {
 	}
 }
 
+func TestAwaitFPCapabilityStallLanes(t *testing.T) {
+	firstOther := errors.New("first capability failure")
+	lastOther := errors.New("last capability failure")
+	firstDial := fmt.Errorf("first dial: %w", fileproviderd.ErrAppDialRefused)
+	lastDial := fmt.Errorf("last dial: %w", fileproviderd.ErrAppDialRefused)
+	cases := map[string]struct {
+		results []capResult
+		wantIs  error
+		wantErr []string
+		wantOut []string
+	}{
+		"dial-refused startup lane expires with launch remediation and last error": {
+			results: []capResult{{err: firstDial}, {err: lastDial}},
+			wantIs:  fileproviderd.ErrAppDialRefused,
+			wantErr: []string{"did not come up within 1m0s", "last dial", "launch", "ccp fp onboard"},
+			wantOut: []string{"waiting for the CCPoolStatus app to come up"},
+		},
+		"answering failure lane expires with doctor remediation and last error": {
+			results: []capResult{{err: firstOther}, {err: lastOther}},
+			wantIs:  lastOther,
+			wantErr: []string{"answering", "kept failing for 1m0s", "last capability failure", "ccp doctor"},
+			wantOut: []string{"app answering but capability probe failing"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			scriptCapability(t, tc.results)
+			swapVar(t, &fpOpenSettings, func(context.Context) error {
+				t.Error("bounded no-verdict lane opened System Settings")
+				return nil
+			})
+			base := time.Unix(1_700_000_000, 0)
+			calls := 0
+			swapVar(t, &fpCapabilityNow, func() time.Time {
+				calls++
+				if calls == 1 {
+					return base
+				}
+				return base.Add(fpCapabilityStallWindow)
+			})
+			var out bytes.Buffer
+			err := awaitFPCapability(t.Context(), &out, time.Nanosecond)
+			if err == nil {
+				t.Fatal("awaitFPCapability succeeded after the stall window")
+			}
+			if !errors.Is(err, tc.wantIs) {
+				t.Errorf("error %v does not wrap last error %v", err, tc.wantIs)
+			}
+			for _, frag := range tc.wantErr {
+				if !strings.Contains(err.Error(), frag) {
+					t.Errorf("error %q missing %q", err, frag)
+				}
+			}
+			for _, frag := range tc.wantOut {
+				if !strings.Contains(out.String(), frag) {
+					t.Errorf("output %q missing %q", out.String(), frag)
+				}
+			}
+		})
+	}
+}
+
+func TestAwaitFPCapabilityDefinitiveLaneIsUnbounded(t *testing.T) {
+	cantServe := fmt.Errorf("cannot control: %w", fileproviderd.ErrCannotControl)
+	results := make([]capResult, 100, 101)
+	for i := range results {
+		results[i] = capResult{err: cantServe}
+	}
+	results = append(results, capResult{ok: true})
+	reads := scriptCapability(t, results)
+	settings := 0
+	swapVar(t, &fpOpenSettings, func(context.Context) error { settings++; return nil })
+	swapVar(t, &fpCapabilityNow, func() time.Time {
+		t.Fatal("definitive Settings lane consulted the bounded stall clock")
+		return time.Time{}
+	})
+
+	var out bytes.Buffer
+	if err := awaitFPCapability(t.Context(), &out, time.Nanosecond); err != nil {
+		t.Fatalf("awaitFPCapability: %v", err)
+	}
+	if *reads != len(results) {
+		t.Errorf("probe reads=%d, want %d; definitive lane did not remain unbounded", *reads, len(results))
+	}
+	if settings != 1 {
+		t.Errorf("opened settings %d times, want exactly 1", settings)
+	}
+}
+
+func TestAwaitFPCapabilityDefinitiveVerdictResetsStall(t *testing.T) {
+	firstErr := errors.New("first no-verdict")
+	secondErr := errors.New("second no-verdict")
+	scriptCapability(t, []capResult{
+		{err: firstErr},
+		{ok: false},
+		{err: secondErr},
+		{ok: true},
+	})
+	settings := 0
+	swapVar(t, &fpOpenSettings, func(context.Context) error { settings++; return nil })
+	base := time.Unix(1_700_000_000, 0)
+	calls := 0
+	swapVar(t, &fpCapabilityNow, func() time.Time {
+		calls++
+		if calls == 1 {
+			return base
+		}
+		return base.Add(fpCapabilityStallWindow)
+	})
+
+	var out bytes.Buffer
+	if err := awaitFPCapability(t.Context(), &out, time.Nanosecond); err != nil {
+		t.Fatalf("awaitFPCapability failed after definitive verdict reset the clock: %v", err)
+	}
+	if settings != 1 {
+		t.Errorf("opened settings %d times, want 1", settings)
+	}
+}
+
 func TestAwaitFPCapabilityCancelUnwinds(t *testing.T) {
 	scriptCapability(t, []capResult{{err: errors.New("not consented")}})
 	swapVar(t, &fpOpenSettings, func(context.Context) error { return nil })
@@ -618,7 +1071,10 @@ func TestCheckFPRungsWidgetTooOld(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	err := checkFPRungs(t.Context(), &out, time.Millisecond)
+	cmd := &cobra.Command{}
+	cmd.SetContext(t.Context())
+	cmd.SetOut(&out)
+	err := checkFPRungs(cmd, time.Millisecond)
 	if err == nil {
 		t.Fatal("checkFPRungs passed a widget too old for probe-domain")
 	}
@@ -641,42 +1097,6 @@ func TestEnsureWidgetInstalledSkipsWhenPresent(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "already installed") {
 		t.Errorf("output %q missing the already-installed skip note", out.String())
-	}
-}
-
-// TestRepairFPDirectRetreatErrors pins the daemon-down `--retreat` contract: the
-// symlink cutover's live-session gate lives in the daemon, so a daemon-down
-// retreat refuses (rather than yank a domain out from under a running session)
-// and points at starting the daemon. The account row is left untouched.
-func TestRepairFPDirectRetreatErrors(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	if err := st.UpsertAccount(store.Account{ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct-01"), OverlayKind: string(fkoverlay.BackendFileProvider), KeychainService: "s1", KeychainAccount: "u"}); err != nil {
-		t.Fatal(err)
-	}
-	m := &pool.Manager{Store: st, OverlayFor: func(fkoverlay.Backend) (fkoverlay.Provider, error) {
-		t.Error("daemon-down retreat resolved a provider instead of refusing")
-		return nil, nil
-	}}
-	cmd := &cobra.Command{}
-	cmd.SetContext(t.Context())
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-
-	err = repairFPDirect(cmd, m, 1, true)
-	if err == nil || !strings.Contains(err.Error(), "needs the daemon") {
-		t.Fatalf("repairFPDirect retreat err = %v, want a daemon-required refusal", err)
-	}
-	got, gerr := st.GetAccount(1)
-	if gerr != nil {
-		t.Fatal(gerr)
-	}
-	if got.OverlayKind != string(fkoverlay.BackendFileProvider) {
-		t.Errorf("row overlay = %q, want the untouched fileprovider row", got.OverlayKind)
 	}
 }
 

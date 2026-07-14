@@ -24,7 +24,7 @@ func TestHolderStatusWireAdditive(t *testing.T) {
 		t.Fatalf("old-shape response decoded a phantom holder: %+v", old.Holder)
 	}
 
-	in := Response{OK: true, Holder: &HolderStatus{Version: "9.9.9", Mounts: 2, TCCError: "grant pending"}}
+	in := Response{OK: true, Holder: &HolderStatus{Version: "9.9.9", Mounts: 2}}
 	b, err = json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -53,11 +53,10 @@ func TestHandleStatusCarriesHolderState(t *testing.T) {
 	s.holder.healthy = true
 	s.holder.version = "0.0.9-old"
 	s.holder.mounts = map[string]bool{"/a": true, "/b": false}
-	s.holder.tccErr = "grant pending"
 	s.holder.mu.Unlock()
 
 	resp = s.handleStatus(t.Context())
-	want := &HolderStatus{Version: "0.0.9-old", Mounts: 1, TCCError: "grant pending"}
+	want := &HolderStatus{Version: "0.0.9-old", Mounts: 1}
 	if !reflect.DeepEqual(resp.Holder, want) {
 		t.Fatalf("holder = %+v, want %+v", resp.Holder, want)
 	}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,7 +16,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
@@ -87,6 +87,25 @@ var fpDaemonProbe = func() (alive, consentPending bool, bridgeUp *bool) {
 	return true, false, nil
 }
 
+var (
+	fpDaemonHealth = func() (*daemon.Response, error) {
+		return daemon.NewClient().Health()
+	}
+	fpBridgeCheck = func() (*daemon.Response, error) {
+		return daemon.NewClient().FPBridgeCheck()
+	}
+	fpConsentProbeExec = func(ctx context.Context, path string, in io.Reader, out, errOut io.Writer) error {
+		probe := exec.CommandContext(ctx, path, "fp", "consent-probe")
+		probe.Stdin = in
+		probe.Stdout = out
+		probe.Stderr = errOut
+		return probe.Run()
+	}
+	fpHostname      = os.Hostname
+	fpCapabilityNow = time.Now
+	fpConsentNow    = time.Now
+)
+
 // fpCapabilityProbe reports whether the just-launched companion app can actually
 // serve File Provider on this machine, over the app's throwaway-domain probe —
 // the truthful consent gate that a pluginkit election is NOT. It NEVER spawns:
@@ -112,6 +131,11 @@ const (
 	// daemon binds with retry, so a healthy stack answers within seconds — a
 	// rung still down after the window is stuck, not slow.
 	fpRungAttempts = 20
+	// fpCapabilityStallWindow bounds no-verdict capability failures while leaving
+	// the definitive System Settings lane unbounded.
+	fpCapabilityStallWindow = 60 * time.Second
+	// fpConsentBridgeWindow covers three daemon bridge-bind retry intervals.
+	fpConsentBridgeWindow = 15 * time.Second
 )
 
 func newFPCmd() *cobra.Command {
@@ -121,7 +145,87 @@ func newFPCmd() *cobra.Command {
 	}
 	cmd.AddCommand(newFPOnboardCmd())
 	cmd.AddCommand(newFPRepairCmd())
+	cmd.AddCommand(newFPConsentCmd())
+	cmd.AddCommand(newFPConsentProbeCmd())
 	return cmd
+}
+
+func newFPConsentProbeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "consent-probe",
+		Hidden: true,
+		Args:   cobra.NoArgs,
+		RunE: func(*cobra.Command, []string) error {
+			return runFPConsentProbe()
+		},
+	}
+}
+
+func runFPConsentProbe() error {
+	dir := filepath.Dir(pool.FPBridgeSocketPath())
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create File Provider bridge directory: %w", err)
+	}
+	path := filepath.Join(dir, ".consent-probe")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		return fmt.Errorf("write File Provider consent probe: %w", err)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("remove File Provider consent probe: %w", err)
+	}
+	return nil
+}
+
+func newFPConsentCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "consent",
+		Short: "Grant the daemon access to its File Provider bridge container",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runFPConsent(cmd, fpOnboardPollInterval)
+		},
+	}
+}
+
+func runFPConsent(cmd *cobra.Command, interval time.Duration) error {
+	if os.Getenv("SSH_CONNECTION") != "" || os.Getenv("SSH_TTY") != "" {
+		host, err := fpHostname()
+		if err != nil {
+			return fmt.Errorf("resolve local hostname: %w", err)
+		}
+		return fmt.Errorf("File Provider consent cannot be granted over SSH; run this in a local terminal on %s", host)
+	}
+	stable := filepath.Join(pool.StableBinDir(), "cc-pool")
+	fi, err := os.Stat(stable)
+	if err != nil {
+		return fmt.Errorf("stable daemon binary %s is required for File Provider consent; run `ccp service install`: %w", abbreviateHome(stable), err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("stable daemon binary %s is not a regular file; run `ccp service install`", abbreviateHome(stable))
+	}
+	if err := fpConsentProbeExec(cmd.Context(), stable, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr()); err != nil {
+		return fmt.Errorf("grant File Provider consent to %s: %w", abbreviateHome(stable), err)
+	}
+
+	started := fpConsentNow()
+	for {
+		alive, _, bridgeUp := fpDaemonProbe()
+		if bridgeUp != nil && *bridgeUp {
+			success(cmd.OutOrStdout(), "bridge bound — no daemon restart needed")
+			return nil
+		}
+		if fpConsentNow().Sub(started) >= fpConsentBridgeWindow {
+			if alive {
+				return errors.New("File Provider consent was granted, but the live daemon's bridge did not bind within 15s — run `ccp doctor`")
+			}
+			return errors.New("File Provider consent was granted, but the daemon is not running — start it with `ccp service install`")
+		}
+		select {
+		case <-cmd.Context().Done():
+			return cmd.Context().Err()
+		case <-time.After(interval):
+		}
+	}
 }
 
 func newFPRepairCmd() *cobra.Command {
@@ -138,8 +242,7 @@ fileproviderd's poisoned replica state and forces a clean re-enumeration.
 Without --account it repairs every domain the daemon currently reports wedged;
 with --account it repairs that one regardless of its verdict. The daemon owns
 the select gate a CLI-side re-register would race, so this routes through the
-daemon when it is running and falls back to a direct provider repair only when
-it is down.
+daemon and refuses when it is down.
 
 --retreat forces the target domain(s) back to the symlink floor instead of
 re-registering — the escape hatch for a domain File Provider can never serve
@@ -160,9 +263,8 @@ domain, so relaunch sessions on a repaired account.`,
 	return cmd
 }
 
-// runFPRepair routes a repair through the daemon when it is up (it owns the
-// select gate a CLI-side re-register would race) and directly through the
-// provider when it is down.
+// runFPRepair routes a repair through the daemon, which owns the select gate a
+// CLI-side re-register would race.
 func runFPRepair(cmd *cobra.Command, m *pool.Manager, account int, retreat bool) error {
 	if err := requireInit(m); err != nil {
 		return err
@@ -175,8 +277,7 @@ func runFPRepair(cmd *cobra.Command, m *pool.Manager, account int, retreat bool)
 	health, err := cl.Health()
 	switch {
 	case errors.Is(err, daemon.ErrDaemonUnavailable):
-		// Daemon down: no select to race, so act on the provider directly.
-		return repairFPDirect(cmd, m, account, retreat)
+		return errors.New("the daemon isn't running; File Provider repair requires its select gate — start it with `ccp service install`, then re-run `ccp fp repair`")
 	case err != nil:
 		return fmt.Errorf("daemon health check: %w", err)
 	case health.Version != version.String():
@@ -225,94 +326,6 @@ func renderFPRepairs(cmd *cobra.Command, resp *daemon.Response, explicit bool) e
 		return fmt.Errorf("%d domain(s) failed to repair", failed)
 	}
 	return nil
-}
-
-// repairFPDirect re-registers File Provider domains without the daemon (it is
-// down, so there is no select to race). It resolves the provider itself and does
-// Teardown+Setup per target — the one named with --account, else every File
-// Provider row. Content stays unserved until the daemon (its content bridge) is
-// back, so it warns about that.
-func repairFPDirect(cmd *cobra.Command, m *pool.Manager, account int, retreat bool) error {
-	out := cmd.OutOrStdout()
-	if retreat {
-		// The File-Provider→symlink retreat deregisters the domain, breaking any
-		// live session's open fds; only the daemon gates that cutover against live
-		// sessions (ConvertOverlay itself does not). Refuse to retreat blind with the
-		// daemon down rather than yank a domain out from under a running session.
-		return errors.New("`--retreat` needs the daemon: it gates the File-Provider→symlink cutover against live sessions (whose open descriptors break on the domain removal) — start it with `ccp service install`, then re-run `ccp fp repair --retreat`")
-	}
-	accts, err := m.Store.ListAccounts()
-	if err != nil {
-		return err
-	}
-	targets, err := fpRepairTargets(accts, account)
-	if err != nil {
-		return err
-	}
-	if len(targets) == 0 {
-		note(out, "No file provider accounts to repair.")
-		return nil
-	}
-	warn(out, "The daemon is not running; re-registering directly. File Provider domains cannot serve content until the daemon's bridge is back — start it with `ccp service install`.")
-	prov, err := fpOverlayProvider(fkoverlay.BackendFileProvider)
-	if err != nil {
-		return fmt.Errorf("resolve file provider overlay: %w", err)
-	}
-	base := pool.ClaudeDir()
-	var failed int
-	for _, a := range targets {
-		name := fmt.Sprintf("acct-%02d (%s)", a.ID, accountName(a.Label))
-		warning, terr := prov.Teardown(base, a.ConfigDir)
-		if warning != "" {
-			warn(out, "%s teardown persist-warning: %s", name, warning)
-		}
-		if terr != nil {
-			// A wedged domain may refuse a clean Teardown; the idempotent Setup
-			// below re-adds regardless, so note and press on.
-			step(out, "%s teardown: %v (continuing to re-add)", name, terr)
-		}
-		switch serr := prov.Setup(base, a.ConfigDir); {
-		case serr == nil:
-			success(out, "%s re-registered", name)
-		case errors.Is(serr, fileproviderd.ErrCannotControl):
-			failed++
-			step(out, "%s %s: File Provider cannot serve on this machine — run `ccp migrate --account %d --to symlink`", badStyle.Render("✗"), name, a.ID)
-		default:
-			failed++
-			step(out, "%s %s: %v", badStyle.Render("✗"), name, serr)
-		}
-	}
-	if failed > 0 {
-		return fmt.Errorf("%d domain(s) failed to re-register", failed)
-	}
-	step(out, "Re-registered %d domain(s); relaunch any sessions on them, and restart the daemon.", len(targets)-failed)
-	return nil
-}
-
-// fpRepairTargets picks the accounts a direct (daemon-down) repair re-registers:
-// the one named by account (error if it is not a File Provider row or is
-// unknown), else every File Provider row — the daemon-down path cannot tell a
-// wedged domain from a healthy one.
-func fpRepairTargets(accts []store.Account, account int) ([]store.Account, error) {
-	if account > 0 {
-		for _, a := range accts {
-			if a.ID != account {
-				continue
-			}
-			if !fileProviderRow(a.OverlayKind) {
-				return nil, fmt.Errorf("acct-%02d is on %s, not file provider", a.ID, a.OverlayKind)
-			}
-			return []store.Account{a}, nil
-		}
-		return nil, fmt.Errorf("account %d not found", account)
-	}
-	var fp []store.Account
-	for _, a := range accts {
-		if fileProviderRow(a.OverlayKind) {
-			fp = append(fp, a)
-		}
-	}
-	return fp, nil
 }
 
 func newFPOnboardCmd() *cobra.Command {
@@ -370,7 +383,7 @@ func runFPOnboard(cmd *cobra.Command) error {
 		return err
 	}
 
-	if err := checkFPRungs(cmd.Context(), out, fpOnboardPollInterval); err != nil {
+	if err := checkFPRungs(cmd, fpOnboardPollInterval); err != nil {
 		return err
 	}
 	success(out, "File Provider stack healthy.")
@@ -478,12 +491,14 @@ func ensureWidgetInstalled(cmd *cobra.Command) error {
 // can actually serve on this machine. Election puts the extension on the list;
 // only macOS's System Settings toggle grants it, and no CLI can flip it, so the
 // first time the app answers "can't serve" this narrates that lever, opens the
-// pane, and then spins on the probe until it passes. A dead control socket is
-// treated as "app still coming up" (quiet wait), never a false consent prompt.
-// Unbounded like awaitFPElection; ^C cancels.
+// pane, and then spins on the probe until it passes. Dial refusal means the app
+// is still coming up; other errors mean the app answers but its probe is broken.
+// Those two no-verdict lanes are bounded; the definitive Settings lane is not.
 func awaitFPCapability(ctx context.Context, out io.Writer, interval time.Duration) error {
 	en := fkoverlay.BackendFileProvider.Enablement()
 	explained := false
+	var stallStarted time.Time
+	var lastErr error
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for i := 0; ; i++ {
@@ -493,15 +508,10 @@ func awaitFPCapability(ctx context.Context, out io.Writer, interval time.Duratio
 			success(out, "File Provider extension enabled and serving.")
 			return nil
 		}
-		// Open Settings ONLY on a definitive can't-serve verdict: a clean ok=false
-		// (err==nil here implies ok==false) or ErrCannotControl (extension disabled /
-		// no entitlement — the one lever the Settings toggle flips). Every other error
-		// is a no-verdict transient (ErrAppUnavailable, ErrBusy, ErrRegisterFailed, or
-		// any other shape) → quiet-wait, never a spurious deep-link. ErrOpUnsupported
-		// can't reach here (ProbeDomain-only; checkFPRungs' version floor names it).
 		cantServe := err == nil || errors.Is(err, fileproviderd.ErrCannotControl)
 		msg := "waiting for the CCPoolStatus app to come up… press ctrl-c to abort"
 		if cantServe {
+			stallStarted = time.Time{}
 			msg = "waiting for the File Provider extension to serve… press ctrl-c to abort"
 			if !explained {
 				explained = true
@@ -511,6 +521,23 @@ func awaitFPCapability(ctx context.Context, out io.Writer, interval time.Duratio
 				if serr := fpOpenSettings(ctx); serr != nil {
 					warn(out, "couldn't open System Settings (%v) — navigate there yourself", serr)
 				}
+			}
+		} else {
+			now := fpCapabilityNow()
+			if stallStarted.IsZero() {
+				stallStarted = now
+			}
+			lastErr = err
+			dialRefused := errors.Is(err, fileproviderd.ErrAppDialRefused)
+			if !dialRefused {
+				msg = "app answering but capability probe failing: " + err.Error() + "… press ctrl-c to abort"
+			}
+			if now.Sub(stallStarted) >= fpCapabilityStallWindow {
+				_, _ = fmt.Fprint(out, "\r\x1b[K")
+				if dialRefused {
+					return fmt.Errorf("the CCPoolStatus app did not come up within %s (last error: %w) — launch %s and re-run `ccp fp onboard`", fpCapabilityStallWindow, lastErr, pool.WidgetAppPath())
+				}
+				return fmt.Errorf("the CCPoolStatus app is answering but its capability probe kept failing for %s (last error: %w) — run `ccp doctor`, then re-run `ccp fp onboard`", fpCapabilityStallWindow, lastErr)
 			}
 		}
 		_, _ = fmt.Fprintf(out, "\r%s %s", spinnerFrames[i%len(spinnerFrames)], dimStyle.Render(msg))
@@ -525,7 +552,9 @@ func awaitFPCapability(ctx context.Context, out io.Writer, interval time.Duratio
 
 // checkFPRungs walks the remaining File Provider rungs (app control socket,
 // then daemon bridge socket), naming the exact fix for whichever rung stays down.
-func checkFPRungs(ctx context.Context, out io.Writer, interval time.Duration) error {
+func checkFPRungs(cmd *cobra.Command, interval time.Duration) error {
+	ctx := cmd.Context()
+	out := cmd.OutOrStdout()
 	ver, err := pollFPRung(ctx, out, interval, "waiting for the CCPoolStatus control socket…", func() (string, error) {
 		return fpControlHealth(ctx)
 	})
@@ -541,6 +570,12 @@ func checkFPRungs(ctx context.Context, out io.Writer, interval time.Duration) er
 			ver, pool.MinWidgetVersion, widgetCask)
 	}
 	step(out, "CCPoolStatus control socket answering (%s).", ver)
+	if alive, pending, _ := fpDaemonProbe(); alive && pending {
+		step(out, "The daemon bridge is waiting for its one-time local consent grant.")
+		if err := runFPConsent(cmd, interval); err != nil {
+			return err
+		}
+	}
 
 	_, err = pollFPRung(ctx, out, interval, "waiting for the daemon's bridge socket…", func() (string, error) {
 		if _, _, bridgeUp := fpDaemonProbe(); bridgeUp != nil && *bridgeUp {
@@ -558,15 +593,43 @@ func checkFPRungs(ctx context.Context, out io.Writer, interval time.Duration) er
 			return fmt.Errorf("the daemon isn't running, so its bridge socket %s can't come up — start it with `ccp service install`, then re-run `ccp fp onboard`",
 				abbreviateHome(pool.FPBridgeSocketPath()))
 		case pending:
-			return errors.New("the daemon is up but its bridge bind is parked on the app group container consent prompt (a one-time grant to the daemon's stable path ~/.cc-pool/bin/cc-pool; unsigned local builds re-prompt per build) — approve the prompt, then restart the daemon (`brew services restart cc-pool`) and re-run `ccp fp onboard`")
+			return errors.New("the daemon is up but its bridge bind is parked on the app group container consent prompt — run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart)")
 		case bridgeUp == nil:
 			return errors.New("the daemon is up but predates bridge-health reporting — restart it (`brew services restart cc-pool`) so the upgraded daemon takes over, then re-run `ccp fp onboard`")
 		default:
 			return errors.New("the daemon is up but its bridge socket " + abbreviateHome(pool.FPBridgeSocketPath()) +
-				" isn't accepting — approve the app group container consent prompt if one is pending, restart the daemon (`brew services restart cc-pool`), and re-run `ccp fp onboard`; check " + abbreviateHome(pool.LogPath()))
+				" isn't accepting — run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart); then re-run `ccp fp onboard` or check " + abbreviateHome(pool.LogPath()))
 		}
 	}
 	step(out, "Daemon bridge socket up.")
+
+	health, err := fpDaemonHealth()
+	if err != nil {
+		return fmt.Errorf("daemon health check before bridge self-test: %w", err)
+	}
+	if health.Version != version.String() {
+		return fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) so it can run the bridge self-test, then re-run `ccp fp onboard`", health.Version, version.String())
+	}
+	resp, err := fpBridgeCheck()
+	if err != nil {
+		return fmt.Errorf("daemon bridge self-test: %w", err)
+	}
+	if strings.HasPrefix(resp.Error, "unknown op:") {
+		return errors.New("the running daemon predates the bridge self-test — restart it (`brew services restart cc-pool`) so the upgraded daemon takes over, then re-run `ccp fp onboard`")
+	}
+	if !resp.OK {
+		return fmt.Errorf("daemon bridge self-test: %s", resp.Error)
+	}
+	if resp.FPBridge == nil {
+		return errors.New("daemon bridge self-test returned no verdict — restart the daemon (`brew services restart cc-pool`), then re-run `ccp fp onboard`")
+	}
+	if resp.FPBridge.Verdict != daemon.FPBridgeServing {
+		if resp.FPBridge.Detail != "" {
+			return errors.New(resp.FPBridge.Detail)
+		}
+		return fmt.Errorf("daemon bridge self-test: %s", resp.FPBridge.Verdict)
+	}
+	step(out, "Daemon bridge serving.")
 	return nil
 }
 

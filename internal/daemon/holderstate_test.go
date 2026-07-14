@@ -16,7 +16,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
 
@@ -341,30 +340,6 @@ func TestHolderStateHeldDead(t *testing.T) {
 	}
 }
 
-// TestWireStatusCountsWedged pins that WedgedMounts counts only the daemon's
-// own deep-probe verdicts, not anything from the holder's List.
-func TestWireStatusCountsWedged(t *testing.T) {
-	var h holderState
-	h.refresh(mountd.NewClient(startCannedHolder(t, []mountd.MountInfo{
-		{Dir: "/pool/a", Base: "/b", Live: true},
-		{Dir: "/pool/b", Base: "/b", Live: true},
-		{Dir: "/pool/c", Base: "/b", Live: true},
-	})))
-	h.markDeepWedged("/pool/a")
-	h.markDeepWedged("/pool/b")
-	if got := h.wireStatus().WedgedMounts; got != 2 {
-		t.Fatalf("WedgedMounts = %d, want 2 of 3", got)
-	}
-	h.noteMounted("/pool/a")
-	if got := h.wireStatus().WedgedMounts; got != 1 {
-		t.Fatalf("WedgedMounts after a remount of one = %d, want 1", got)
-	}
-	h.markUnhealthy()
-	if got := h.wireStatus().WedgedMounts; got != 0 {
-		t.Fatalf("WedgedMounts after markUnhealthy = %d, want 0", got)
-	}
-}
-
 // TestHolderStateShallowDeadStrikes pins the shallow-dead strike debounce:
 // noteMounted, resetShallowDead, and markUnhealthy each reset the count.
 func TestHolderStateShallowDeadStrikes(t *testing.T) {
@@ -430,19 +405,15 @@ func TestRefreshPrunesDepartedVerdicts(t *testing.T) {
 }
 
 // TestHolderStateNoteMounted pins the fresh-mount fast path: trusted before
-// any refresh; TCC guidance clears because the grant is per holder process.
+// any refresh.
 func TestHolderStateNoteMounted(t *testing.T) {
 	var h holderState
 	if h.ready("/d") {
 		t.Fatal("zero cache vouched for a dir")
 	}
-	h.recordTCC("grant pending", fkoverlay.BackendNFS)
 	h.noteMounted("/d")
 	if !h.ready("/d") {
 		t.Fatal("fresh mount not trusted before the first refresh")
-	}
-	if ws := h.wireStatus(); ws.TCCError != "" || ws.TCCBlockedBackend != "" {
-		t.Fatalf("TCC guidance survived a successful mount: %+v", ws)
 	}
 }
 

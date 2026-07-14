@@ -85,7 +85,7 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just hides pin state
 	render := func() error {
-		snaps, holder, fpWedged, ledgers, fpConsentPending, err := gatherStatus(cmd.Context(), m, live)
+		snaps, ledgers, fpConsentPending, err := gatherStatus(cmd.Context(), m, live)
 		if err != nil {
 			return err
 		}
@@ -98,12 +98,6 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 			_, _ = fmt.Fprint(cmd.OutOrStdout(), "\033[H\033[2J") // clear
 		}
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), out)
-		if line := holderFooter(holder); line != "" {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
-		}
-		if line := fpWedgedFooter(fpWedged); line != "" {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
-		}
 		if line := fpConsentFooter(fpConsentPending); line != "" {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 		}
@@ -127,41 +121,20 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 }
 
-func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, *daemon.HolderStatus, []daemon.FPDomainState, []daemon.LedgerState, bool, error) {
+func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, []daemon.LedgerState, bool, error) {
 	if !forceLive {
 		resp, err := daemon.NewClient().Status()
 		if daemonStatusUsable(resp, err) {
-			return fromDaemon(resp.Accounts), resp.Holder, resp.FPWedged, resp.Ledgers, resp.FPConsentPending, nil
+			return fromDaemon(resp.Accounts), resp.Ledgers, resp.FPConsentPending, nil
 		}
 	}
 	snaps, err := m.Snapshots(ctx, true, pool.DefaultFreshFor)
-	return snaps, nil, nil, nil, false, err
-}
-
-// fpWedgedFooter renders the daemon's wedged File Provider domains — plain-path
-// only, like holderFooter (the TUI drops daemon-cache alerts on purpose). A
-// breaker-parked domain reads "parked (wedged)"; one the daemon is still
-// recovering reads "wedged (recovering)". "" when none are wedged (or the live
-// path, which has no daemon verdict).
-func fpWedgedFooter(wedged []daemon.FPDomainState) string {
-	if len(wedged) == 0 {
-		return ""
-	}
-	lines := make([]string, 0, len(wedged))
-	for _, w := range wedged {
-		state := "wedged (recovering)"
-		if w.BreakerTripped {
-			state = "parked (wedged)"
-		}
-		lines = append(lines, badStyle.Render(fmt.Sprintf("✗ acct-%02d file provider %s", w.ID, state)))
-	}
-	return strings.Join(lines, "\n")
+	return snaps, nil, false, err
 }
 
 // ledgerFooter is the compact self-heal rollup — plain-path only, like the
-// other footers. It renders only when a ledger row is faulted or parked (the
-// situations the holder/FP footers already alert on); a healthy pool prints
-// nothing new. `ccp doctor` carries the per-row detail.
+// other footer. It renders only when a ledger row is faulted or parked; a
+// healthy pool prints nothing new. `ccp doctor` carries the per-row detail.
 func ledgerFooter(ledgers []daemon.LedgerState) string {
 	faulted, parked := 0, 0
 	for _, l := range ledgers {
@@ -193,24 +166,7 @@ func fpConsentFooter(pending bool) string {
 	if !pending {
 		return ""
 	}
-	return warnStyle.Render("file provider: the daemon's data bridge is parked on the macOS app-group consent prompt — approve it, then restart the daemon (`brew services restart cc-pool`); run `ccp doctor` for detail")
-}
-
-// holderFooter is plain-path only — the TUI drops holder state
-// (`ccp doctor` and `ccp service status` carry it).
-func holderFooter(h *daemon.HolderStatus) string {
-	if h == nil {
-		return ""
-	}
-	// A TCC grant needs the user and blocks the holder entirely; wedges self-heal.
-	switch {
-	case h.TCCError != "":
-		return warnStyle.Render("mount holder: grant needed — " + h.TCCError + " — " + fuseGrantHint(h.TCCBlockedBackend) + " (cc-pool falls back to symlink automatically if the grant never lands)")
-	case h.WedgedMounts > 0:
-		return warnStyle.Render(fmt.Sprintf("mount holder: %s — run `ccp doctor`", plural(h.WedgedMounts, "wedged mirror")))
-	default:
-		return ""
-	}
+	return warnStyle.Render("file provider: the daemon's data bridge is parked on the macOS app-group consent prompt — run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart); run `ccp doctor` for detail")
 }
 
 // dirPin is the launch directory's pin as render input (ok=false: no pin).

@@ -18,12 +18,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
-
-// The pane/URL come from fusekit's Backend.Enablement, never a cc-pool literal.
-var tccHint = " — " + fuseGrantHint(fkoverlay.BackendNFS) + " (cc-pool falls back to symlink automatically if the grant never lands)"
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
@@ -630,98 +626,6 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 	}
 }
 
-// TestHolderFooter pins the holder alert; holder skew/spawn failures are
-// intentionally unsurfaced (the multi-tenant holder isn't cc-pool's to police).
-func TestHolderFooter(t *testing.T) {
-	cases := map[string]struct {
-		h    *daemon.HolderStatus
-		want string
-	}{
-		"nil (live path / pre-holder daemon)": {nil, ""},
-		"healthy current holder is silent": {
-			&daemon.HolderStatus{Version: version.String(), Mounts: 3}, "",
-		},
-		"TCC blocked carries the settings deep link": {
-			&daemon.HolderStatus{TCCError: "grant Network Volumes access", TCCBlockedBackend: fkoverlay.BackendNFS},
-			"mount holder: grant needed — grant Network Volumes access" + tccHint,
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			if got := stripANSI(holderFooter(tc.h)); got != tc.want {
-				t.Errorf("holderFooter = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-// TestHolderFooterWedged pins the wedged-mirror footer.
-func TestHolderFooterWedged(t *testing.T) {
-	cases := map[string]struct {
-		h    *daemon.HolderStatus
-		want string
-	}{
-		"zero wedged mirrors is silent": {
-			&daemon.HolderStatus{Version: version.String(), Mounts: 2}, "",
-		},
-		"one wedged mirror is singular": {
-			&daemon.HolderStatus{Version: version.String(), Mounts: 2, WedgedMounts: 1},
-			"mount holder: 1 wedged mirror — run `ccp doctor`",
-		},
-		"three wedged mirrors is plural": {
-			&daemon.HolderStatus{Version: version.String(), Mounts: 3, WedgedMounts: 3},
-			"mount holder: 3 wedged mirrors — run `ccp doctor`",
-		},
-		"wedged prints regardless of holder version": {
-			&daemon.HolderStatus{Version: "0.0.1-old", WedgedMounts: 1},
-			"mount holder: 1 wedged mirror — run `ccp doctor`",
-		},
-		"TCC outranks wedged": {
-			&daemon.HolderStatus{TCCError: "tcc-msg", WedgedMounts: 1, TCCBlockedBackend: fkoverlay.BackendNFS},
-			"mount holder: grant needed — tcc-msg" + tccHint,
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			if got := stripANSI(holderFooter(tc.h)); got != tc.want {
-				t.Errorf("holderFooter = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-// TestFPWedgedFooter pins the File Provider wedge footer: a breaker-parked
-// domain reads "parked (wedged)", one still recovering reads "wedged
-// (recovering)", and an empty list is silent.
-func TestFPWedgedFooter(t *testing.T) {
-	cases := map[string]struct {
-		wedged []daemon.FPDomainState
-		want   string
-	}{
-		"none is silent":  {nil, ""},
-		"empty is silent": {[]daemon.FPDomainState{}, ""},
-		"parked domain": {
-			[]daemon.FPDomainState{{ID: 3, BreakerTripped: true}},
-			"✗ acct-03 file provider parked (wedged)",
-		},
-		"recovering domain": {
-			[]daemon.FPDomainState{{ID: 5}},
-			"✗ acct-05 file provider wedged (recovering)",
-		},
-		"multiple, one per line": {
-			[]daemon.FPDomainState{{ID: 1, BreakerTripped: true}, {ID: 2}},
-			"✗ acct-01 file provider parked (wedged)\n✗ acct-02 file provider wedged (recovering)",
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			if got := stripANSI(fpWedgedFooter(tc.wedged)); got != tc.want {
-				t.Errorf("fpWedgedFooter = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
 // TestLedgerFooter pins the compact self-heal rollup: silent unless a row is
 // faulted or parked (a parked row counts once, as parked), then counts plus the
 // doctor pointer — per-row detail stays `ccp doctor`'s job.
@@ -765,9 +669,9 @@ func TestLedgerFooter(t *testing.T) {
 	}
 }
 
-// TestRunStatusPlainFPWedgedFooter pins the FP-wedge footer end-to-end through
-// runStatus against a fake daemon socket.
-func TestRunStatusPlainFPWedgedFooter(t *testing.T) {
+// TestRunStatusPlainLedgerFooter pins the ledger replacement for the deleted
+// FP-wedge status projection end-to-end through runStatus.
+func TestRunStatusPlainLedgerFooter(t *testing.T) {
 	home, err := os.MkdirTemp("/tmp", "ccp-home")
 	if err != nil {
 		t.Fatal(err)
@@ -795,7 +699,7 @@ func TestRunStatusPlainFPWedgedFooter(t *testing.T) {
 				Accounts: []daemon.AccountStatus{{
 					ID: 1, Label: "work@example.com", HasUsage: true, Remaining5h: 50, Remaining7d: 50,
 				}},
-				FPWedged: []daemon.FPDomainState{{ID: 2, ConfigDir: "/p/acct-02", BreakerTripped: true}},
+				Ledgers: []daemon.LedgerState{{Policy: "fp.domain", Resource: "/p/acct-02", Faulted: true, Parked: true}},
 			})
 			_ = conn.Close()
 		}
@@ -815,90 +719,8 @@ func TestRunStatusPlainFPWedgedFooter(t *testing.T) {
 		t.Fatalf("runStatus: %v", err)
 	}
 	out := stripANSI(buf.String())
-	if !strings.Contains(out, "acct-02 file provider parked (wedged)") {
-		t.Errorf("plain status missing the FP-wedge footer:\n%s", out)
-	}
-}
-
-// TestRunStatusPlainHolderFooter pins the holder footer end-to-end through
-// runStatus against a fake daemon socket.
-func TestRunStatusPlainHolderFooter(t *testing.T) {
-	cases := map[string]struct {
-		holder *daemon.HolderStatus
-		want   string // "" = no holder mention at all
-	}{
-		"alerting holder prints the footer": {
-			holder: &daemon.HolderStatus{Version: version.String(), Mounts: 1, WedgedMounts: 1},
-			want:   "mount holder: 1 wedged mirror — run `ccp doctor`",
-		},
-		"healthy holder prints nothing": {
-			holder: &daemon.HolderStatus{Version: version.String(), Mounts: 2},
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			// Short HOME under /tmp: macOS caps sun_path at 104 bytes.
-			home, err := os.MkdirTemp("/tmp", "ccp-home")
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = os.RemoveAll(home) })
-			t.Setenv("HOME", home)
-			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			ln, err := net.Listen("unix", pool.SocketPath())
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = ln.Close() })
-			go func() {
-				for {
-					conn, err := ln.Accept()
-					if err != nil {
-						return
-					}
-					var req daemon.Request
-					_ = json.NewDecoder(conn).Decode(&req)
-					_ = json.NewEncoder(conn).Encode(daemon.Response{
-						Proto: daemon.ProtocolVersion, OK: true, Version: version.String(),
-						Accounts: []daemon.AccountStatus{{
-							ID: 1, Label: "work@example.com",
-							HasUsage: true, Remaining5h: 50, Remaining7d: 50,
-						}},
-						Holder: tc.holder,
-					})
-					_ = conn.Close()
-				}
-			}()
-
-			st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = st.Close() })
-
-			var buf bytes.Buffer
-			cmd := &cobra.Command{}
-			cmd.SetOut(&buf)
-			cmd.SetContext(t.Context())
-			if err := runStatus(cmd, &pool.Manager{Store: st}, false, false, true); err != nil {
-				t.Fatalf("runStatus: %v", err)
-			}
-			out := stripANSI(buf.String())
-			if !strings.Contains(out, "work@example.com") {
-				t.Fatalf("table missing the daemon's account:\n%s", out)
-			}
-			if tc.want == "" {
-				if strings.Contains(out, "mount holder") {
-					t.Errorf("healthy holder must print nothing:\n%s", out)
-				}
-				return
-			}
-			if !strings.Contains(out, tc.want) {
-				t.Errorf("output missing footer %q:\n%s", tc.want, out)
-			}
-		})
+	if !strings.Contains(out, "self-heal: 1 parked — run `ccp doctor` for detail") {
+		t.Errorf("plain status missing the ledger footer:\n%s", out)
 	}
 }
 
@@ -908,10 +730,13 @@ func TestFPConsentFooter(t *testing.T) {
 		t.Errorf("fpConsentFooter(false) = %q, want empty", got)
 	}
 	got := stripANSI(fpConsentFooter(true))
-	for _, frag := range []string{"app-group consent prompt", "restart the daemon", "ccp doctor"} {
+	for _, frag := range []string{"app-group consent prompt", "ccp fp consent", "local terminal", "no restart", "ccp doctor"} {
 		if !strings.Contains(got, frag) {
 			t.Errorf("fpConsentFooter(true) = %q, missing %q", got, frag)
 		}
+	}
+	if strings.Contains(got, "restart the daemon") {
+		t.Errorf("fpConsentFooter(true) = %q, retained stale restart guidance", got)
 	}
 }
 

@@ -35,15 +35,6 @@ var (
 // reader below is a no-op / healthy default there.
 func (s *Server) fpEnabled() bool { return s.fpSynth != nil }
 
-// fpWedge is a snapshot of one wedged domain's recovery bookkeeping for the
-// status wire: its dir, the recovery attempts spent, and whether the breaker has
-// tripped.
-type fpWedge struct {
-	Dir      string
-	Attempts int
-	Tripped  bool
-}
-
 // fpClassifiableStrike reports whether err is a probe outcome that strikes a wedge
 // lane for dir. ErrFPProbeNoVerdict and ErrFPProbeMissing never strike (a transient
 // control blip / an identity-less account); ErrFPProbeEmpty strikes only when the
@@ -233,33 +224,6 @@ func (s *Server) fpReset(dir string) {
 	s.fpProbeClockMu.Lock()
 	delete(s.fpProbeClock, dir)
 	s.fpProbeClockMu.Unlock()
-}
-
-// fpWedgedSnapshot lists every currently-wedged domain with its recovery attempt
-// count and breaker state, taken under one lock so the status wire sees a
-// consistent view.
-func (s *Server) fpWedgedSnapshot() []fpWedge {
-	if !s.fpEnabled() {
-		return nil
-	}
-	s.ledMu.Lock()
-	rows := s.led.snapshot()
-	s.ledMu.Unlock()
-	return fpWedgesFrom(rows)
-}
-
-// fpWedgesFrom distills the wedged File Provider domains from a ledger snapshot — the
-// pure half of fpWedgedSnapshot, shared with statusLedgers so one status response
-// derives both FPWedged and Ledgers from a single s.led snapshot.
-func fpWedgesFrom(rows []ledgerSnapshot) []fpWedge {
-	var out []fpWedge
-	for _, snap := range rows {
-		if snap.Policy != fpDomainPolicy.name || !snap.Faulted {
-			continue
-		}
-		out = append(out, fpWedge{Dir: snap.Resource, Attempts: snap.Attempts, Tripped: snap.Parked})
-	}
-	return out
 }
 
 // fpDomainProbe classifies an account's File Provider domain data-plane verdict

@@ -286,7 +286,7 @@ func TestHealTickRetryLeavesConvertedRowAndPrunes(t *testing.T) {
 }
 
 // TestHealTickRetriesTCCBlockedRowUnderBackoff pins that a TCC-blocked row rides
-// the same backoff with guidance surfaced, and the first post-grant mount clears it.
+// the same backoff and the first post-grant attempt mounts it.
 func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
@@ -298,9 +298,6 @@ func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 		t.Fatalf("after the first tick: setups=%d attempts=%d, want 1/1",
 			fake.setupCount(), remountAttempts(s, dirs[1]))
 	}
-	if got := s.holder.wireStatus().TCCError; got == "" {
-		t.Fatal("TCC guidance not surfaced for the blocked row")
-	}
 	healTick(t.Context(), s)
 	if fake.setupCount() != 1 {
 		t.Fatalf("setups inside the backoff window = %d, want still 1", fake.setupCount())
@@ -311,9 +308,6 @@ func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	healTick(t.Context(), s)
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("granted row not mounted and vouched for")
-	}
-	if got := s.holder.wireStatus().TCCError; got != "" {
-		t.Fatalf("TCCError after the successful mount = %q, want cleared via noteMounted", got)
 	}
 	if remountRow(s, dirs[1]) != nil {
 		t.Fatal("successful heal left a remount ledger row")
@@ -741,9 +735,6 @@ func TestTCCBreakerEscalates(t *testing.T) {
 	if s.holder.ready(dirs[1]) {
 		t.Fatal("TCC breaker did not drop the holder-cache vouch for the converted dir")
 	}
-	if got := s.holder.wireStatus().TCCError; got != "" {
-		t.Fatalf("TCC breaker left stale guidance %q; it must clear on retreat", got)
-	}
 	if !strings.Contains(buf.String(), "volume-access grant never landed") {
 		t.Fatalf("TCC retreat not surfaced in the log:\n%s", buf.String())
 	}
@@ -799,9 +790,6 @@ func TestTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 	}
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("granted row not vouched for")
-	}
-	if got := s.holder.wireStatus().TCCError; got != "" {
-		t.Fatalf("late grant left stale TCC guidance %q; a live mount must clear it", got)
 	}
 }
 

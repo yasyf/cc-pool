@@ -469,44 +469,8 @@ func (s *Server) handleStatus(ctx context.Context) Response {
 			resp.ContentHealth = strings.ReplaceAll(err.Error(), "\n", "; ")
 		}
 	}
-	// One s.led snapshot feeds both FPWedged and the Server-owned half of Ledgers, so
-	// a single status response can't contradict itself about the same fp.domain row
-	// (the two derivations previously took ledMu in separate epochs).
-	resp.FPWedged, resp.Ledgers = s.statusLedgers(accts)
+	resp.Ledgers = s.ledgersWire()
 	return resp
-}
-
-// fpWedgedStates lists the currently-wedged File Provider domains for the status
-// wire, joining the fp state's dir-keyed verdicts to account IDs and labels. nil
-// when no domain is wedged or fp state is absent (bare test servers).
-func (s *Server) fpWedgedStates(accts []AccountStatus) []FPDomainState {
-	if !s.fpEnabled() {
-		return nil
-	}
-	return fpDomainStates(accts, s.fpWedgedSnapshot())
-}
-
-// fpDomainStates joins wedged File Provider domains to account IDs and labels for the
-// status wire — the pure half of fpWedgedStates, shared with statusLedgers so both
-// FPWedged and Ledgers derive from one s.led snapshot. nil when no domain is wedged.
-func fpDomainStates(accts []AccountStatus, wedges []fpWedge) []FPDomainState {
-	if len(wedges) == 0 {
-		return nil
-	}
-	byDir := make(map[string]AccountStatus, len(accts))
-	for _, a := range accts {
-		byDir[a.ConfigDir] = a
-	}
-	out := make([]FPDomainState, 0, len(wedges))
-	for _, w := range wedges {
-		st := FPDomainState{ConfigDir: w.Dir, RecoveryAttempts: w.Attempts, BreakerTripped: w.Tripped}
-		if a, ok := byDir[w.Dir]; ok {
-			st.ID = a.ID
-			st.Label = a.Label
-		}
-		out = append(out, st)
-	}
-	return out
 }
 
 // statuses assembles the wire view of every account from cached samples — the
@@ -1286,11 +1250,6 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 		s.fallbackToSymlink(ctx, a)
 		return healFallback
 	case errors.Is(err, overlay.ErrMountNotLive):
-		// a is provably a valid fuse row (it reached healFuse via a fuse
-		// overlay_kind), so Parse cannot fail; carry the backend so status renders
-		// the right grant pane without cc-pool naming nfs/fskit.
-		backend, _ := fkoverlay.Parse(a.OverlayKind)
-		s.holder.recordTCC(err.Error(), backend)
 		s.log.Printf("acct-%02d fuse mount blocked pending the macOS volume-access grant, retrying next poll: %v", a.ID, err)
 		return healTCCBlocked
 	case errors.Is(err, errSweepStranded):

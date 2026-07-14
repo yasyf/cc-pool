@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"errors"
-	"reflect"
 	"testing"
 	"time"
 
@@ -12,15 +11,6 @@ import (
 func ledgerHasFaultedFP(rows []LedgerState, dir string) bool {
 	for _, r := range rows {
 		if r.Policy == "fp.domain" && r.Resource == dir && r.Faulted {
-			return true
-		}
-	}
-	return false
-}
-
-func fpWedgedHas(w []FPDomainState, dir string) bool {
-	for _, st := range w {
-		if st.ConfigDir == dir {
 			return true
 		}
 	}
@@ -37,52 +27,28 @@ func countPolicy(rows []LedgerState, policy string) int {
 	return n
 }
 
-// TestStatusLedgersSingleSnapshotIsConsistent is the finding-3 regression: FPWedged and
-// the Ledgers block derive from ONE s.led snapshot, so a status response can't disagree
-// with itself about an fp.domain row. Every wedged domain in FPWedged appears as an
-// fp.domain faulted row in Ledgers; an fp.domain row that struck but never faulted
-// appears in Ledgers yet never in FPWedged; and the combined reader matches the
-// standalone readers it replaced (the extraction preserves behavior exactly).
-func TestStatusLedgersSingleSnapshotIsConsistent(t *testing.T) {
+// TestLedgersWireCarriesFPDebounceState pins both phases of the fp.domain row:
+// a latched wedge is faulted while a single pre-debounce strike remains healthy.
+func TestLedgersWireCarriesFPDebounceState(t *testing.T) {
 	s, dirs := newTestServer(t)
-	s.fpSynth = alwaysNonEmpty // wire FP self-heal so FPWedged is populated
 	now := time.Unix(1750000000, 0)
 
 	// dirs[1]: a genuinely wedged fp.domain (faulted). dirs[2]: struck once, below the
-	// 2-strike debounce, so faulted stays false — present in Ledgers, absent from FPWedged.
+	// 2-strike debounce, so faulted stays false while the row stays observable.
 	s.ledMu.Lock()
 	s.led.forceFault(fpDomainPolicy, dirs[1], now, errors.New("fp wedged"))
 	s.led.strike(fpDomainPolicy, dirs[2], now, errors.New("one blip"))
 	s.ledMu.Unlock()
 
-	accts := []AccountStatus{
-		{ID: 1, ConfigDir: dirs[1], Label: "acct-1"},
-		{ID: 2, ConfigDir: dirs[2], Label: "acct-2"},
-	}
-	fpWedged, ledgers := s.statusLedgers(accts)
-
-	if len(fpWedged) != 1 || fpWedged[0].ConfigDir != dirs[1] || fpWedged[0].ID != 1 {
-		t.Fatalf("FPWedged = %+v, want exactly the faulted dirs[1] as acct-1", fpWedged)
-	}
+	ledgers := s.ledgersWire()
 	if !ledgerHasFaultedFP(ledgers, dirs[1]) {
-		t.Fatalf("FPWedged domain %s has no matching faulted fp.domain row in Ledgers %+v", dirs[1], ledgers)
+		t.Fatalf("faulted fp.domain %s missing from Ledgers %+v", dirs[1], ledgers)
 	}
 	if ledgerHasFaultedFP(ledgers, dirs[2]) {
 		t.Fatalf("struck-not-faulted fp.domain row read as faulted in Ledgers: %+v", ledgers)
 	}
-	if fpWedgedHas(fpWedged, dirs[2]) {
-		t.Fatalf("struck-not-faulted domain leaked into FPWedged: %+v", fpWedged)
-	}
 	if n := countPolicy(ledgers, "fp.domain"); n != 2 {
 		t.Fatalf("Ledgers carries %d fp.domain rows, want 2 (faulted + struck)", n)
-	}
-
-	// The combined reader must match the standalone readers it replaced, on the same state.
-	if wantFP := s.fpWedgedStates(accts); !reflect.DeepEqual(fpWedged, wantFP) {
-		t.Fatalf("statusLedgers FPWedged = %+v, standalone fpWedgedStates = %+v", fpWedged, wantFP)
-	}
-	if wantLedgers := s.ledgersWire(); !reflect.DeepEqual(ledgers, wantLedgers) {
-		t.Fatalf("statusLedgers Ledgers = %+v, standalone ledgersWire = %+v", ledgers, wantLedgers)
 	}
 }
 

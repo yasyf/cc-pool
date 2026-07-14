@@ -13,6 +13,7 @@ import (
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/lease"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/fusekit/proc"
 )
 
 // Refresher is the slice of *oauth.Client the Manager needs.
@@ -161,13 +162,13 @@ func (m *Manager) acctLock(id int) *sync.Mutex {
 func (m *Manager) lockAccount(ctx context.Context, id int) (func(), error) {
 	mu := m.acctLock(id)
 	mu.Lock()
-	h, err := flockAcquire(ctx, filepath.Join(m.LockDir, AccountDirName(id)+".lock"))
+	h, err := proc.Flock(ctx, filepath.Join(m.LockDir, AccountDirName(id)+".lock"))
 	if err != nil {
 		mu.Unlock()
 		return nil, fmt.Errorf("acct-%d refresh lock: %w", id, err)
 	}
 	return func() {
-		h.release()
+		h.Release()
 		mu.Unlock()
 	}, nil
 }

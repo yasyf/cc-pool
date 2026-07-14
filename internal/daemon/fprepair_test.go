@@ -241,52 +241,51 @@ func TestFPRepairEndToEndOverSocket(t *testing.T) {
 	}
 }
 
-// TestHandleStatusSurfacesFPWedged pins the status wire: a wedged domain appears
-// in Response.FPWedged joined to its account id, with recovery progress, and a
-// healthy pool reports none.
-func TestHandleStatusSurfacesFPWedged(t *testing.T) {
+// TestHandleStatusSurfacesFPLedger pins the status wire: a wedged domain appears
+// as a faulted fp.domain ledger with recovery progress, and a healthy pool
+// reports no rows.
+func TestHandleStatusSurfacesFPLedger(t *testing.T) {
 	s, _, dirs, _ := newFPHealServer(t)
 
-	if resp := s.handleStatus(t.Context()); len(resp.FPWedged) != 0 {
-		t.Fatalf("FPWedged = %+v on a healthy pool, want none", resp.FPWedged)
+	if resp := s.handleStatus(t.Context()); len(resp.Ledgers) != 0 {
+		t.Fatalf("Ledgers = %+v on a healthy pool, want none", resp.Ledgers)
 	}
 
 	wedgeIt(t, s, dirs[1])
 	s.fpRecordAttempt(dirs[1], time.Unix(0, 0))
 	resp := s.handleStatus(t.Context())
-	if len(resp.FPWedged) != 1 {
-		t.Fatalf("FPWedged = %+v, want exactly the wedged acct-1", resp.FPWedged)
+	if len(resp.Ledgers) != 1 {
+		t.Fatalf("Ledgers = %+v, want exactly the wedged acct-1 row", resp.Ledgers)
 	}
-	w := resp.FPWedged[0]
-	if w.ID != 1 || w.ConfigDir != dirs[1] {
-		t.Fatalf("wedged state = %+v, want acct-1 at %s", w, dirs[1])
+	l := resp.Ledgers[0]
+	if l.Policy != "fp.domain" || l.Resource != dirs[1] || !l.Faulted {
+		t.Fatalf("ledger state = %+v, want faulted fp.domain at %s", l, dirs[1])
 	}
-	if w.RecoveryAttempts != 1 || w.BreakerTripped {
-		t.Fatalf("recovery = (attempts %d, tripped %v), want (1, false)", w.RecoveryAttempts, w.BreakerTripped)
+	if l.Attempts != 1 || l.Parked {
+		t.Fatalf("recovery = (attempts %d, parked %v), want (1, false)", l.Attempts, l.Parked)
 	}
 }
 
-// TestFPWedgedSnapshotReportsBreaker pins that fpWedgedSnapshot flags a
-// breaker-parked domain (attempts past fpRecoveryBreaker) and drops a recovered
-// domain entirely.
-func TestFPWedgedSnapshotReportsBreaker(t *testing.T) {
+// TestFPLedgerReportsBreaker pins that the wire ledger flags a breaker-parked
+// domain and drops a recovered domain entirely.
+func TestFPLedgerReportsBreaker(t *testing.T) {
 	s := newFPLedgerServer(alwaysNonEmpty)
 	wedgeIt(t, s, fpTestDir)
 	for i := 0; i < fpRecoveryBreaker; i++ {
 		s.fpRecordAttempt(fpTestDir, time.Unix(0, 0))
 	}
-	snap := s.fpWedgedSnapshot()
+	snap := s.ledgersWire()
 	if len(snap) != 1 {
-		t.Fatalf("snapshot = %+v, want one wedged domain", snap)
+		t.Fatalf("ledger snapshot = %+v, want one wedged domain", snap)
 	}
-	if !snap[0].Tripped || snap[0].Attempts != fpRecoveryBreaker {
-		t.Fatalf("snapshot[0] = %+v, want tripped with %d attempts", snap[0], fpRecoveryBreaker)
+	if !snap[0].Parked || snap[0].Attempts != fpRecoveryBreaker {
+		t.Fatalf("snapshot[0] = %+v, want parked with %d attempts", snap[0], fpRecoveryBreaker)
 	}
 
 	if msg := s.recordFPProbe(fpTestDir, nil); !strings.Contains(msg, "recovered") {
 		t.Fatalf("recovery log = %q, want a recovered line", msg)
 	}
-	if got := s.fpWedgedSnapshot(); len(got) != 0 {
-		t.Fatalf("snapshot after recovery = %+v, want empty", got)
+	if got := s.ledgersWire(); len(got) != 0 {
+		t.Fatalf("ledger snapshot after recovery = %+v, want empty", got)
 	}
 }

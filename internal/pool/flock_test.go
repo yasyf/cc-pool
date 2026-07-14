@@ -12,18 +12,20 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yasyf/fusekit/proc"
 )
 
 // bumpUnderLock's Gosched widens the read-modify-write window so a missing lock
 // surfaces as a lost update.
 func bumpUnderLock(t *testing.T, lockPath, counterPath string) {
 	t.Helper()
-	h, err := flockAcquire(context.Background(), lockPath)
+	h, err := proc.Flock(context.Background(), lockPath)
 	if err != nil {
 		t.Errorf("acquire: %v", err)
 		return
 	}
-	defer h.release()
+	defer h.Release()
 	b, err := os.ReadFile(counterPath) //nolint:gosec // G304: counterPath is under the test's own t.TempDir()
 	if err != nil {
 		t.Errorf("read counter: %v", err)
@@ -75,20 +77,20 @@ func TestFlockSerializesCriticalSection(t *testing.T) {
 // cancellation promptly instead of blocking in the syscall forever.
 func TestFlockRespectsContext(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ctx.lock")
-	held, err := flockAcquire(context.Background(), path)
+	held, err := proc.Flock(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.release()
+	defer held.Release()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := flockAcquire(ctx, path); err == nil {
-		t.Fatal("flockAcquire succeeded while the lock was held; want a ctx error")
+	if _, err := proc.Flock(ctx, path); err == nil {
+		t.Fatal("proc.Flock succeeded while the lock was held; want a ctx error")
 	}
 	if waited := time.Since(start); waited > time.Second {
-		t.Fatalf("flockAcquire took %v to honor a 50ms deadline", waited)
+		t.Fatalf("proc.Flock took %v to honor a 50ms deadline", waited)
 	}
 }
 
@@ -106,7 +108,7 @@ func TestFlockChildHolds(t *testing.T) {
 	if lockPath == "" || readyPath == "" {
 		t.Skip("child-only helper; driven by TestFlockCrossProcess")
 	}
-	h, err := flockAcquire(context.Background(), lockPath)
+	h, err := proc.Flock(context.Background(), lockPath)
 	if err != nil {
 		t.Fatalf("child acquire: %v", err)
 	}
@@ -115,7 +117,7 @@ func TestFlockChildHolds(t *testing.T) {
 		t.Fatalf("child signal ready: %v", err)
 	}
 	time.Sleep(flockChildHold)
-	h.release()
+	h.Release()
 }
 
 // TestFlockCrossProcess is the real proof: a child PROCESS holds the lock while
@@ -150,12 +152,12 @@ func TestFlockCrossProcess(t *testing.T) {
 	}
 
 	start := time.Now()
-	h, err := flockAcquire(context.Background(), lockPath)
+	h, err := proc.Flock(context.Background(), lockPath)
 	if err != nil {
 		t.Fatalf("parent acquire: %v; child output:\n%s", err, out.String())
 	}
 	waited := time.Since(start)
-	h.release()
+	h.Release()
 	if waited < 300*time.Millisecond {
 		t.Fatalf("parent acquired in %v without blocking — flock is not excluding across processes; child output:\n%s", waited, out.String())
 	}

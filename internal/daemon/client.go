@@ -101,9 +101,9 @@ func (c *Client) CredMove(account *int, to string) (*Response, error) {
 // domain(s) to the symlink floor instead of re-registering — the ONLY path that
 // reaches the automatic-retreat-removed convertFPToSymlinkHeld, gated to explicit
 // operator request. The daemon owns the select gate a CLI-side re-register would
-// race, so this routes through it; the CLI falls back to a direct provider repair
-// only when the daemon is down. It shares migrateTimeout: each re-register is a
-// Teardown+Setup that can take seconds to materialize.
+// race, so this routes through it and refuses when it is down. It shares
+// migrateTimeout: each re-register is a Teardown+Setup that can take seconds to
+// materialize.
 func (c *Client) FPRepair(account *int, retreat bool) (*Response, error) {
 	return c.do(Request{Op: OpFPRepair, Account: account, Retreat: retreat}, migrateTimeout)
 }

@@ -32,18 +32,18 @@ var HolderMountFeatures = []string{mountd.FeatureMux, mountd.FeatureBridge, moun
 
 // MinWidgetVersion is the oldest CCPoolStatus companion app cc-pool trusts to
 // drive File Provider domains: the first release whose control server answers
-// the probe-domain op — the app-side, TCC-safe data-plane probe the daemon's
-// wedge ladder, the migrate readiness gate, onboarding, and doctor all key on.
+// shallow probe-domain and prepare-domain — the app-side, TCC-safe operations
+// the daemon's wedge ladder, readiness gates, onboarding, and doctor key on.
 // An older app silently lacks it (its unknown-op arm reads as ErrOpUnsupported),
 // so onboarding refuses it and points at the cask upgrade.
-const MinWidgetVersion = "v0.44.0"
+const MinWidgetVersion = "v0.55.0"
 
 // WidgetVersionSupported reports whether a companion app's reported version is
-// new enough to answer probe-domain (>= MinWidgetVersion). The app reports its
-// CFBundleShortVersionString, which the release strips to a bare "0.44.0" (no
-// leading "v"), so a "v" is prepended before the semver compare; a trailing
-// commit paren is dropped before the compare. "dev", empty, or otherwise
-// unparseable versions pass: a locally-built app is current-source.
+// new enough to answer the required control ops (>= MinWidgetVersion). The app
+// reports its CFBundleShortVersionString, which the release strips to a bare
+// "0.55.0" (no leading "v"), so a "v" is prepended before the semver compare; a
+// trailing commit paren is dropped before the compare. "dev", empty, or
+// otherwise unparseable versions pass: a locally-built app is current-source.
 func WidgetVersionSupported(version string) bool {
 	v, _, _ := strings.Cut(strings.TrimSpace(version), " ")
 	if v != "" && !strings.HasPrefix(v, "v") {

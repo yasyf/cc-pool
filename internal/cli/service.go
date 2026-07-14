@@ -32,8 +32,8 @@ var (
 	// deepProbeAt is doctor's wedge probe: a 2 MiB read with a 5s bound.
 	deepProbeAt = overlay.DeepProbeWithin
 	// fpDomainProbeAt is doctor's File Provider data-plane wedge probe (daemon-down
-	// path): it asks the companion app over its control op to enumerate the domain
-	// and report the .claude.json byte count — never a through-domain filesystem read
+	// path): it asks the companion app over its shallow control op to enumerate the
+	// domain root — never a through-domain filesystem read
 	// (which would mint a per-account TCC prompt). A domain whose bridge is down
 	// (daemon down) answers domain-not-serving → ErrFPProbeWedged; an app that is
 	// also down answers ErrFPProbeNoVerdict (unprobeable, reported as no wedge). A
@@ -49,11 +49,10 @@ var (
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), fpDomainProbeTimeout)
 		defer cancel()
-		return overlay.FPDomainProbe(ctx, prober, dir)
+		return overlay.FPDomainProbeShallow(ctx, prober, dir)
 	}
-	// fpOverlayProvider resolves the File Provider overlay provider for the
-	// daemon-down direct `ccp fp repair` path; a seam so tests never register a
-	// real domain.
+	// fpOverlayProvider resolves the File Provider overlay provider for orphan
+	// reconciliation; a seam so tests never remove a real domain.
 	fpOverlayProvider = pool.OverlayProviderFor
 	// fpRawProbeAt is doctor's OPT-IN raw File Provider probe (`--fp-raw-probe`):
 	// it reads the account dir's .claude.json THROUGH the domain with a bound —

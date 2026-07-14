@@ -9,7 +9,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/fusekit/mountd"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // holderRefreshFloor bounds select-path refreshes: a down mount must not turn
@@ -51,11 +50,6 @@ type holderState struct {
 	led         *ledgers
 	lastProbed  map[string]time.Time
 	refreshedAt time.Time
-	// tccErr is the latest TCC-blocked mount guidance for status/doctor; any
-	// successful mount clears it — the TCC grant is per holder process.
-	tccErr string
-	// tccBackend is the backend needing the grant; set and cleared with tccErr.
-	tccBackend fkoverlay.Backend
 
 	// gen counts in-place cache mutations; refresh drops a polled snapshot when
 	// gen moved mid-flight — an in-place update is newer truth than the List.
@@ -275,8 +269,6 @@ func (h *holderState) noteMounted(dir string) {
 	}
 	h.mounts[dir] = true
 	h.clearVerdictsLocked(dir)
-	h.tccErr = ""
-	h.tccBackend = ""
 }
 
 // noteUnmounted drops a just-dismounted dir ahead of the next refresh.
@@ -296,13 +288,6 @@ func (h *holderState) clearVerdictsLocked(dir string) {
 		h.led.clear(fuseShallowDeadPolicy, dir)
 	}
 	delete(h.lastProbed, dir)
-}
-
-func (h *holderState) recordTCC(msg string, backend fkoverlay.Backend) {
-	h.mu.Lock()
-	h.tccErr = msg
-	h.tccBackend = backend
-	h.mu.Unlock()
 }
 
 // ledgersSnapshot lists the holder cache's ledger rows (fuse.deepwedge /
@@ -329,19 +314,5 @@ func (h *holderState) wireStatus() *HolderStatus {
 			live++
 		}
 	}
-	wedged := 0
-	if h.led != nil {
-		for _, snap := range h.led.snapshot() {
-			if snap.Policy == fuseDeepWedgePolicy.name && snap.Faulted {
-				wedged++
-			}
-		}
-	}
-	return &HolderStatus{
-		Version:           h.version,
-		Mounts:            live,
-		WedgedMounts:      wedged,
-		TCCError:          h.tccErr,
-		TCCBlockedBackend: h.tccBackend,
-	}
+	return &HolderStatus{Version: h.version, Mounts: live}
 }
