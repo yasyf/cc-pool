@@ -1,1 +1,1 @@
-{"v":1,"lamport":1,"ops":[{"kind":"create_log","nonce":"3dc842cec880d2685570ea79d3bb1a5e","title":"papercuts","tags":["papercut"],"anchors":[]}]}
+{"v":1,"lamport":2,"ops":[{"kind":"append_entry","text":"cc-notes MCP task_comment and papercut tools reject natural body param names (text/comment/complaint) with 'unexpected additional properties' and no hint of the accepted field; errors should name expected properties. Fell back to the CLI."}]}
