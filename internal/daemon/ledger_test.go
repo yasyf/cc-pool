@@ -80,19 +80,6 @@ func TestLedgerStrikeAfterFaultDoesNotAdvanceLane(t *testing.T) {
 	}
 }
 
-// TestLedgerClear resets both phases.
-func TestLedgerClear(t *testing.T) {
-	p := pol(t, "fp.domain")
-	l := &ledger{}
-	l.strike(p, t0, errors.New("x"))
-	l.strike(p, t0, errors.New("x"))
-	l.attempt(p, attemptPrimary, t0)
-	l.clear()
-	if *l != (ledger{}) {
-		t.Fatalf("clear did not zero the ledger: %+v", *l)
-	}
-}
-
 // TestLedgerForceFault latches immediately, bypassing the debounce, and resets
 // the primary lane so recovery starts clean — the select-time forceWedge shape.
 func TestLedgerForceFault(t *testing.T) {
@@ -115,7 +102,6 @@ func TestLedgerForceFault(t *testing.T) {
 // definitive-needs-login throttle stamp, which flags the store not the streak),
 // and setNextDue overrides the backoff window (the 429 Retry-After hint).
 func TestLedgerStampAndSetNextDue(t *testing.T) {
-	auth := pol(t, "auth.streak")
 	l := &ledger{}
 	l.stamp(t0, errors.New("needs login"))
 	if l.strikes != 0 || l.faulted || l.attempts != 0 {
@@ -123,9 +109,6 @@ func TestLedgerStampAndSetNextDue(t *testing.T) {
 	}
 	if l.lastAt != t0 || l.lastErr == nil {
 		t.Fatalf("stamp did not record the clock/err: %+v", *l)
-	}
-	if !l.gateOpen(auth, t0) {
-		t.Fatal("stamp alone must not close the auth gate — only a latched fault does")
 	}
 
 	rl := pol(t, "ratelimit.pool")
@@ -326,41 +309,8 @@ func TestLedgerNeutralResetsBothLanes(t *testing.T) {
 	}
 }
 
-// TestLedgerGateOpen covers both gate flavors: rate-limit gates on the backoff
-// window (attempt closes it until nextDue), auth gates on the fault.
-func TestLedgerGateOpen(t *testing.T) {
-	t.Run("ratelimit_backoff_window", func(t *testing.T) {
-		p := pol(t, "ratelimit.acct") // backoff 3m..30m, no breaker/debounce
-		bo := proc.Backoff{Base: rateLimitBackoffBase, Cap: rateLimitBackoffCap}
-		l := &ledger{}
-		if !l.gateOpen(p, t0) {
-			t.Fatal("fresh rate-limit ledger should be open")
-		}
-		l.attempt(p, attemptPrimary, t0) // a 429
-		if l.gateOpen(p, t0) {
-			t.Fatal("gate open immediately after a 429 (inside backoff)")
-		}
-		if !l.gateOpen(p, t0.Add(bo.After(1))) {
-			t.Fatal("gate still closed after the backoff window elapsed")
-		}
-	})
-	t.Run("auth_streak_fault", func(t *testing.T) {
-		p := pol(t, "auth.streak") // debounce 3
-		l := &ledger{}
-		l.strike(p, t0, errors.New("401"))
-		l.strike(p, t0, errors.New("401"))
-		if !l.gateOpen(p, t0) {
-			t.Fatal("gate closed before the streak reached the threshold")
-		}
-		l.strike(p, t0, errors.New("401")) // faults
-		if l.gateOpen(p, t0) {
-			t.Fatal("gate still open after the needs-login streak faulted")
-		}
-	})
-}
-
 // TestLedgersStoreDefaults: absent (p, resource) rows answer the healthy default
-// — not faulted, not parked, due, gate open — with no allocation.
+// — not faulted, not parked, due — with no allocation.
 func TestLedgersStoreDefaults(t *testing.T) {
 	p := pol(t, "fp.domain")
 	ls := newLedgers()
@@ -372,9 +322,6 @@ func TestLedgersStoreDefaults(t *testing.T) {
 	}
 	if !ls.due(p, "acct-01", t0) {
 		t.Fatal("absent ledger not due (never attempted should be due)")
-	}
-	if !ls.gateOpen(p, "acct-01", t0) {
-		t.Fatal("absent ledger not gate-open")
 	}
 	if ls.peek(p, "acct-01") != nil {
 		t.Fatal("read path allocated a ledger for an absent resource")

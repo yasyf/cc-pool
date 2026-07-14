@@ -123,10 +123,6 @@ func (l *ledger) attempt(p policy, kind attemptKind, now time.Time) (parked bool
 // Retry-After hint replacing the computed exponential window.
 func (l *ledger) setNextDue(t time.Time) { l.nextDue = t }
 
-// clear resets the ledger to healthy — the resource recovered. Both the
-// debounce verdict and the recovery ladder are dropped.
-func (l *ledger) clear() { *l = ledger{} }
-
 // parked reports whether a breaker has tripped. A two-lane policy trips when
 // the primary lane reaches breaker or the alt lane reaches alt; a single-lane
 // policy trips when the shared attempts clock reaches breaker — strikes stays a
@@ -150,13 +146,6 @@ func (l *ledger) due(p policy, now time.Time) bool {
 // refusal) stays armed to re-fire on its next elapsed window, unlike due.
 func (l *ledger) backoffElapsed(now time.Time) bool {
 	return !now.Before(l.nextDue)
-}
-
-// gateOpen reports whether a gated operation may proceed: the ledger is neither
-// faulted nor parked and its backoff window has elapsed. Rate-limit streaks gate
-// on the backoff window; auth streaks gate on the fault.
-func (l *ledger) gateOpen(p policy, now time.Time) bool {
-	return !l.faulted && !l.parked(p) && !now.Before(l.nextDue)
 }
 
 // ledgerKey identifies one ledger: a policy name plus a resource (an account
@@ -272,13 +261,6 @@ func (ls *ledgers) backoffElapsed(p policy, resource string, now time.Time) bool
 func (ls *ledgers) parked(p policy, resource string) bool {
 	l := ls.peek(p, resource)
 	return l != nil && l.parked(p)
-}
-
-// gateOpen reports whether a gated operation on (p, resource) may proceed. An
-// absent ledger is open.
-func (ls *ledgers) gateOpen(p policy, resource string, now time.Time) bool {
-	l := ls.peek(p, resource)
-	return l == nil || l.gateOpen(p, now)
 }
 
 // snapshot lists every live ledger for the status wire, taken by the caller

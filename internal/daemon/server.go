@@ -76,8 +76,9 @@ type Server struct {
 	fpBridgeWait time.Duration
 
 	// fpConsentPending: the FP bridge bind has not completed while the daemon is
-	// alive — the app-group-container TCC consent signature. Set and cleared by
-	// startFPBridge's watchdog, read by handleStatus.
+	// alive — the app-group-container TCC consent signature. The watchdog binds
+	// automatically once consent is granted (no restart); set and cleared by
+	// startFPBridge, read by handleStatus.
 	fpConsentPending atomic.Bool
 
 	// fpBridgeHardErr latches a NON-permission serve-loop failure (a genuine
@@ -166,8 +167,13 @@ type Server struct {
 	fpSynth func(dir string) bool
 
 	// fpBridgeReadyFn is a test seam over the FP-bridge-up precondition for probing
-	// FP domains; nil means the real check (consent settled + data socket up).
+	// FP domains; nil means the real check (consent settled + not faulted + data
+	// socket up).
 	fpBridgeReadyFn func() bool
+
+	// fpBridgeCheckFn is a test seam over fpBridgeCheck (the bridge data-plane
+	// self-test); nil means the real dial + SelfTest classification.
+	fpBridgeCheckFn func(ctx context.Context) FPBridgeStatus
 
 	// fpProbeClock tracks the last periodic (deep or parked) FP re-probe per dir,
 	// gating the slow deep check on a healthy row (fpDeepProbeInterval) and the
@@ -428,6 +434,8 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 		return s.handleCredMove(ctx, req)
 	case OpFPRepair:
 		return s.handleFPRepair(ctx, req)
+	case OpFPBridgeCheck:
+		return s.handleFPBridgeCheck(ctx)
 	case OpShutdown:
 		return s.handleShutdown()
 	default:

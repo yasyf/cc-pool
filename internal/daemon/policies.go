@@ -47,6 +47,11 @@ const shallowDeadStrikes = 2
 // a domain serving live sessions.
 const fpWedgeStrikes = 2
 
+// fpBridgeStrikes debounces the fp.bridge bound-but-dead verdict: one transient
+// bound-but-dead read on a daemon restart race must not alert while serveFPBridge's
+// retry loop re-binds.
+const fpBridgeStrikes = 2
+
 // fpRecoveryBreaker caps recovery attempts on one wedged domain; past it the
 // breaker trips and heal parks the domain until reset.
 const fpRecoveryBreaker = 5
@@ -156,6 +161,9 @@ var policies = map[string]policy{
 	// fp.shallow: the SHALLOW wedge lane — a pure debounce kept apart from fp.domain so a
 	// clean shallow tick clears only shallow strikes. Its latch force-faults fp.domain.
 	"fp.shallow": {name: "fp.shallow", debounce: fpWedgeStrikes},
+	// fp.bridge: the FP content-bridge data-plane verdict — verdict-only like
+	// fuse.deepwedge (serveFPBridge's retry loop recovers; the row only explains).
+	"fp.bridge": {name: "fp.bridge", debounce: fpBridgeStrikes},
 	// auth.streak: consecutive definitive needs-login verdicts; the trip gates
 	// polling (the 15m needsLoginPollInterval is cadence the consumer applies).
 	"auth.streak": {name: "auth.streak", debounce: needsLoginAfter, onTrip: tripGate},

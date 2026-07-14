@@ -151,7 +151,8 @@ var pollTable = []maintainer{
 // cache first (the ticker outpaces the poll's refresh); then fp.app.ensure
 // relaunches the companion app whose death would otherwise park every FP probe
 // on NoVerdict forever, at tick start so probe coverage resumes the tick after a
-// respawn; then the fuse/FP self-heal families; then fp.orphan.reap deregisters
+// respawn; then the fuse/FP self-heal families (fp.bridge.health explains a stalled
+// bridge before fp.heal probes through it); then fp.orphan.reap deregisters
 // rowless leaked domains (after fp.heal so a legit domain's own recovery runs
 // first, before strand.heal's row-driven leak sweep); then content-source health
 // logging (gated on a configured source).
@@ -166,6 +167,10 @@ var healTable = []maintainer{
 	}},
 	{"fuse.remount", claimPerAccount, nil, func(s *Server, ctx context.Context, t *tick) bool {
 		s.retryUnvouchedFuseRows(ctx, t)
+		return true
+	}},
+	{"fp.bridge.health", claimNone, func(s *Server) bool { return s.contentSource != nil }, func(s *Server, ctx context.Context, _ *tick) bool {
+		s.recordFPBridgeHealth(ctx)
 		return true
 	}},
 	{"fp.heal", claimPerAccount, nil, func(s *Server, ctx context.Context, _ *tick) bool {

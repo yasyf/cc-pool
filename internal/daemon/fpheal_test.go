@@ -83,6 +83,9 @@ func newFPHealServer(t *testing.T) (*Server, store.Account, map[int]string, *fak
 	t.Helper()
 	s, dirs, fake := newFPServer(t)
 	s.fpSynth = alwaysNonEmpty
+	// Default the bridge self-test to serving so the non-retreat repair gate does
+	// not block the repair-logic tests; the bridge-gate test overrides it.
+	s.fpBridgeCheckFn = func(context.Context) FPBridgeStatus { return FPBridgeStatus{Verdict: FPBridgeServing} }
 	a, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)

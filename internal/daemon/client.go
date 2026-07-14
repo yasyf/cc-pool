@@ -108,6 +108,18 @@ func (c *Client) FPRepair(account *int, retreat bool) (*Response, error) {
 	return c.do(Request{Op: OpFPRepair, Account: account, Retreat: retreat}, migrateTimeout)
 }
 
+// fpBridgeCheckTimeout bounds the on-demand bridge self-test: a Manifest+Read
+// round-trip over the group-container socket.
+const fpBridgeCheckTimeout = 15 * time.Second
+
+// FPBridgeCheck asks the daemon to self-test the File Provider content bridge and
+// return its data-plane verdict — the bound-but-dead / consent-parked / down
+// distinction the dial-only FPBridgeUp cannot make. Also refreshes the daemon's
+// fp.bridge ledger row.
+func (c *Client) FPBridgeCheck() (*Response, error) {
+	return c.do(Request{Op: OpFPBridgeCheck}, fpBridgeCheckTimeout)
+}
+
 // Shutdown asks the daemon to step down; OK means it will release the socket
 // shortly (confirm with WaitGone). Works even on an orphan launchctl bootout
 // cannot kill.

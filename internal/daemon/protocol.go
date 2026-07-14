@@ -36,6 +36,8 @@ const (
 	OpCredMove Op = "credmove"
 	// OpFPRepair re-registers wedged File Provider domains.
 	OpFPRepair Op = "fprepair"
+	// OpFPBridgeCheck self-tests the File Provider content bridge on demand.
+	OpFPBridgeCheck Op = "fpbridgecheck"
 )
 
 // Request is one client request (one JSON object per line).
@@ -333,8 +335,9 @@ type Response struct {
 	// completed while the daemon is alive — the signature of the app-group-
 	// container TCC consent (keyed on the daemon's resolved executable path,
 	// held stable by the daemon command's re-exec from pool.StableBinDir(), so
-	// the grant is one-time; unsigned dev builds re-prompt per build). Approve
-	// it, then restart the daemon. Additive; status only.
+	// the grant is one-time; unsigned dev builds re-prompt per build). Run `ccp fp
+	// consent` in a local terminal; the daemon binds automatically once granted (no
+	// restart). Additive; status only.
 	FPConsentPending bool `json:"fp_consent_pending,omitempty"`
 	// FPBridgeUp: the daemon's File Provider data socket is accepting — the
 	// daemon is the only process that dials the group-container bridge, so the
@@ -346,6 +349,10 @@ type Response struct {
 	// FPWedged lists File Provider domains the daemon's data-plane probe found
 	// wedged (control ops answer, reads hang). Additive; status only.
 	FPWedged []FPDomainState `json:"fp_wedged,omitempty"`
+	// FPBridge is the on-demand File Provider content-bridge verdict — the
+	// OpFPBridgeCheck op payload, NOT a status projection (the dial-only FPBridgeUp
+	// stays untouched for wire skew).
+	FPBridge *FPBridgeStatus `json:"fp_bridge,omitempty"`
 	// Ledgers is the composed self-heal ledger block: every live ledger row from
 	// both stores (Server-owned and holder-cache), sorted by policy then
 	// resource. Additive; status only.

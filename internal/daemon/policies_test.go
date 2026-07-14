@@ -49,6 +49,9 @@ func TestPolicyConstantsPinned(t *testing.T) {
 		{"fp.domain/recoveryBackoffCap", fpRecoveryBackoff.Cap, 10 * time.Minute},
 		{"fp.domain/recoveryBreaker", fpRecoveryBreaker, 5},
 
+		// fp.bridge — content-bridge verdict debounce (verdict-only, no breaker).
+		{"fp.bridge/strikes", fpBridgeStrikes, 2},
+
 		// fp.app — companion-app ensure: the fixed launch backoff window (no
 		// debounce, no breaker; structural, owned by the fpapp behavior suite).
 		{"fp.app/ensureBackoff", fpAppEnsureBackoff, time.Minute},

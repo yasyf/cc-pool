@@ -71,7 +71,7 @@ func (s *Server) startFPBridge(ctx context.Context) {
 		// serveFPBridge's retry loop; do not mislabel it as consent-pending.
 		return
 	}
-	s.log.Printf("file provider bridge: socket %s did not come up within %s — likely awaiting the one-time app-group-container consent (approve it, then restart the daemon); enumerations defer until it is up", sock, wait)
+	s.log.Printf("file provider bridge: socket %s did not come up within %s — likely awaiting the one-time app-group-container consent (run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart)); enumerations defer until it is up", sock, wait)
 	s.fpConsentPending.Store(true)
 	s.wg.Add(1)
 	go func() {
@@ -223,6 +223,14 @@ func (s *Server) convertFPToSymlinkHeld(ctx context.Context, a store.Account) bo
 // dir to a launching session mid-re-register (each repair runs under the convert
 // claim). A non-File-Provider or unknown account is an op-level error.
 func (s *Server) handleFPRepair(ctx context.Context, req Request) Response {
+	// A non-retreat repair tears down live replica state; gate it on a serving
+	// bridge (make no domain claims and no Teardown otherwise). Retreat needs no
+	// bridge, so it stays un-gated.
+	if !req.Retreat {
+		if st := s.fpBridgeCheck(ctx); st.Verdict != FPBridgeServing {
+			return Response{OK: false, Error: "cannot repair: " + st.Detail}
+		}
+	}
 	fp, err := s.fpAccounts()
 	if err != nil {
 		return Response{OK: false, Error: err.Error()}
@@ -349,15 +357,15 @@ func (s *Server) retreatFPDomainHeld(ctx context.Context, fresh store.Account, r
 	return res
 }
 
-// fpBridgeReady reports whether the File Provider data bridge is up and the
-// one-time group-container consent has settled — the precondition for probing FP
-// domains, since a probe through a down bridge reads every domain as wedged.
-// fpBridgeReadyFn is a test seam.
+// fpBridgeReady reports whether the File Provider data bridge is up, the one-time
+// group-container consent has settled, and the fp.bridge row is not faulted — the
+// precondition for probing FP domains, since a probe through a down or
+// bound-but-dead bridge reads every domain as wedged. fpBridgeReadyFn is a test seam.
 func (s *Server) fpBridgeReady() bool {
 	if s.fpBridgeReadyFn != nil {
 		return s.fpBridgeReadyFn()
 	}
-	return !s.fpConsentPending.Load() && content.NewBridgeClient(pool.FPBridgeSocketPath()).Available()
+	return !s.fpConsentPending.Load() && !s.fpBridgeFaulted() && content.NewBridgeClient(pool.FPBridgeSocketPath()).Available()
 }
 
 // fpBridgeUp reports whether the File Provider data socket accepts a connection,
