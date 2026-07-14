@@ -95,7 +95,7 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 		baseline = cred.ClaudeAiOauth.AccessToken
 	}
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-	outcome, werr := watchAndClose(cmd.Context(), c, newReloginProbe(read, baseline))
+	outcome, werr := watchAndClose(cmd.Context(), c, isFPRow(a.OverlayKind), newReloginProbe(read, baseline))
 	restoreTerminal(out, fd, state)
 	if outcome == awaitCanceled {
 		return werr

@@ -76,7 +76,35 @@ func (m *Manager) overlayFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
 	if m.OverlayFor != nil {
 		return m.OverlayFor(b)
 	}
+	if b == fkoverlay.BackendFileProvider {
+		return m.fileProvider()
+	}
 	return OverlayProviderFor(b)
+}
+
+// OverlayProvider resolves an overlay backend to a provider, memoizing the File
+// Provider provider (its fingerprint-signal cache must survive across polls). The
+// exported entry the daemon routes through so its Sync/Health and heal paths share
+// the one memoized FP instance.
+func (m *Manager) OverlayProvider(b fkoverlay.Backend) (fkoverlay.Provider, error) {
+	return m.overlayFor(b)
+}
+
+// fileProvider lazily builds and memoizes the File Provider provider, wired with
+// m.ContentSource so its enumerator signal is fingerprint-gated and the lastSignal
+// cache survives across resolves. Not fuse, so no feature gate.
+func (m *Manager) fileProvider() (fkoverlay.Provider, error) {
+	m.fpProvMu.Lock()
+	defer m.fpProvMu.Unlock()
+	if m.fpProv != nil {
+		return m.fpProv, nil
+	}
+	prov, err := fkoverlay.ProviderFor(fkoverlay.BackendFileProvider, overlaySpecWithSource(m.ContentSource))
+	if err != nil {
+		return nil, err
+	}
+	m.fpProv = prov
+	return prov, nil
 }
 
 // detectOverlay resolves the new-account overlay backend, honoring the caller's

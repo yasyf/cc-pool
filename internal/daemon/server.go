@@ -169,6 +169,12 @@ type Server struct {
 	// FP domains; nil means the real check (consent settled + data socket up).
 	fpBridgeReadyFn func() bool
 
+	// fpProbeClock tracks the last periodic (deep or parked) FP re-probe per dir,
+	// gating the slow deep check on a healthy row (fpDeepProbeInterval) and the
+	// re-probe of a parked row (fpRecoveryBackoff.Cap). Guarded by fpProbeClockMu.
+	fpProbeClockMu sync.Mutex
+	fpProbeClock   map[string]time.Time
+
 	// syncSvc is the wired host-sync engine (registry, driver, mesh); nil ⇒ host
 	// sync never wired this run. syncSelf is this host's registry origin name.
 	// Both feed authKind's persist-time needs-login classification.
@@ -214,6 +220,9 @@ func Run(ctx context.Context) error {
 	// account genuinely has an identity (its synth is non-empty) — resolved through
 	// the same content source the bridge serves. Wiring the seam arms FP self-heal.
 	s.fpSynth = s.contentSource.SynthNonEmpty
+	// Wire the same content source into the memoized FP provider so its enumerator
+	// signal is fingerprint-gated (Sync/Health signal only on a real content change).
+	m.ContentSource = s.contentSource
 	// The convert gate proves a freshly registered domain serves before flipping the
 	// row, through the SAME bounded control-op probe the heal loop uses — never a
 	// through-domain read. A NoVerdict returns non-nil, so the gate rolls back rather
@@ -873,16 +882,12 @@ func (s *Server) scan(ctx context.Context) ([]procscan.Session, error) {
 	return procscan.Scan(ctx)
 }
 
-// overlayFor resolves a backend through the Manager's injectable seam (tests
-// fake the fuse provider); nil means pool.OverlayProviderFor. A resolution
-// failure is logged and yields nil — callers already fence on a wrong-backend
-// (or here, nil) provider, refusing to mount through it.
+// overlayFor resolves a backend through the Manager (the OverlayFor test seam,
+// else the memoized provider — so the File Provider instance's fingerprint-signal
+// cache survives across polls). A resolution failure is logged and yields nil —
+// callers already fence on a wrong-backend (or here, nil) provider.
 func (s *Server) overlayFor(backend fkoverlay.Backend) fkoverlay.Provider {
-	resolve := pool.OverlayProviderFor
-	if s.m.OverlayFor != nil {
-		resolve = s.m.OverlayFor
-	}
-	prov, err := resolve(backend)
+	prov, err := s.m.OverlayProvider(backend)
 	if err != nil {
 		s.log.Printf("resolve overlay provider for backend %q: %v", backend, err)
 		return nil

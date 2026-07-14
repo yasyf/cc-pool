@@ -137,6 +137,13 @@ func isFuseRow(overlayKind string) bool {
 	return err == nil && b.IsFuse()
 }
 
+// isFPRow reports whether a stored overlay kind is the File Provider backend — the
+// only backend whose files can be dataless and need the exec-time materialization guard.
+func isFPRow(overlayKind string) bool {
+	b, err := fkoverlay.Parse(overlayKind)
+	return err == nil && b == fkoverlay.BackendFileProvider
+}
+
 // acquireLease takes a session lease on key in the fleet lease root.
 func acquireLease(owner, key string) (*lease.Handle, error) {
 	root, err := leaseRoot()

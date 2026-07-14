@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"golang.org/x/mod/semver"
@@ -199,10 +200,15 @@ func (g featureGate) Setup(base, dir string) error {
 	return g.requireHolderVerified()
 }
 
-// overlaySpec builds cc-pool's fusekit/overlay Spec. PassthroughOnly is false
-// because cc-pool serves synthetic content (the merged /.claude.json), forcing
-// fuse-t's NFS backend.
-func overlaySpec() fkoverlay.Spec {
+// overlaySpec builds cc-pool's fusekit/overlay Spec with no content source (the
+// CLI default: an unconditional FP enumerator signal).
+func overlaySpec() fkoverlay.Spec { return overlaySpecWithSource(nil) }
+
+// overlaySpecWithSource builds cc-pool's fusekit/overlay Spec, wiring src into the
+// File Provider backend so its enumerator signal is fingerprint-gated (nil leaves it
+// unconditional). PassthroughOnly is false because cc-pool serves synthetic content
+// (the merged /.claude.json), forcing fuse-t's NFS backend.
+func overlaySpecWithSource(src content.Source) fkoverlay.Spec {
 	socket := mountd.DefaultHolderSocket()
 	return fkoverlay.Spec{
 		IsPrivate:       overlay.PrivateEntry,
@@ -245,6 +251,9 @@ func overlaySpec() fkoverlay.Spec {
 			// Setup fails loud (never a silent raw-read fallback) when the companion
 			// app is too old to answer probe-domain; the hint names the cask upgrade.
 			UpgradeHint: "upgrade the cc-pool-status cask (brew upgrade --cask cc-pool-status)",
+			// Source gates the enumerator signal on a content-fingerprint change; nil
+			// (the CLI) keeps the unconditional signal-every-Sync.
+			Source: src,
 		},
 	}
 }

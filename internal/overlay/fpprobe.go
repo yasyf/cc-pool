@@ -43,9 +43,20 @@ var (
 // FPDomainProber probes a File Provider domain's data plane through the signed
 // companion app's control op: the app enumerates the domain and reports its
 // .claude.json byte count WITHOUT a materializing (TCC-tripping) filesystem read.
-// Satisfied by *fusekit/overlay.FileProviderProvider.
+// ProbeDomainShallow is the cheaper routine-liveness variant (domain lookup +
+// readdir only, no byte count), reporting whether .claude.json is listed. Satisfied
+// by *fusekit/overlay.FileProviderProvider.
 type FPDomainProber interface {
 	ProbeDomain(ctx context.Context, accountDir string) (*int64, error)
+	ProbeDomainShallow(ctx context.Context, accountDir string) (bool, error)
+}
+
+// FPSignaler is the exported UNCONDITIONAL enumerator nudge (cache-bypassing): the
+// recovery ladder's attempt 1 uses it so the signalIfChanged fingerprint cache can
+// never neuter a nudge a wedged domain needs. Satisfied by
+// *fusekit/overlay.FileProviderProvider.
+type FPSignaler interface {
+	Signal(accountDir string) error
 }
 
 // FPDomainRemover deregisters a File Provider domain WITHOUT retracting the
@@ -103,4 +114,32 @@ func FPDomainProbe(ctx context.Context, prober FPDomainProber, accountDir string
 	default:
 		return nil
 	}
+}
+
+// FPDomainProbeShallow classifies accountDir's File Provider domain from the app's
+// cheap shallow control op (domain lookup + readdir, no byte read) — the routine
+// liveness probe. It performs ZERO through-domain I/O.
+//
+// Verdicts: listed=true -> nil (healthy); listed=false -> ErrFPProbeMissing.
+// Error classes: ErrDomainNotServing -> ErrFPProbeWedged; ErrNoDomain ->
+// ErrFPProbeMissing; ErrBusy/ErrAppUnavailable/ErrOpUnsupported and any unrecognized
+// error -> ErrFPProbeNoVerdict. An old app answering a deep probe to a shallow
+// request is resolved inside fusekit's client, so a listed bool always comes back.
+// Unlike the deep probe it never returns ErrFPProbeEmpty (no byte count).
+func FPDomainProbeShallow(ctx context.Context, prober FPDomainProber, accountDir string) error {
+	listed, err := prober.ProbeDomainShallow(ctx, accountDir)
+	if err != nil {
+		switch {
+		case errors.Is(err, fileproviderd.ErrDomainNotServing):
+			return fmt.Errorf("%w: %w", ErrFPProbeWedged, err)
+		case errors.Is(err, fileproviderd.ErrNoDomain):
+			return fmt.Errorf("%w: %w", ErrFPProbeMissing, err)
+		default:
+			return fmt.Errorf("%w: %w", ErrFPProbeNoVerdict, err)
+		}
+	}
+	if !listed {
+		return fmt.Errorf("%w: %s lists no .claude.json", ErrFPProbeMissing, accountDir)
+	}
+	return nil
 }

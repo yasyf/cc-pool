@@ -152,6 +152,12 @@ func (s *Server) reconcileFileProvider(ctx context.Context, a store.Account) fpO
 	if healthErr == nil {
 		return fpHealthy
 	}
+	if errors.Is(healthErr, fileproviderd.ErrAppUnavailable) {
+		// A down app is not an unhealthy domain (it survives the app's death): defer on
+		// it rather than pile a Setup onto a domain the app simply can't answer for now.
+		s.log.Printf("acct-%02d file provider reconcile deferred: companion app unavailable: %v", a.ID, healthErr)
+		return fpDeferred
+	}
 	switch err := prov.Setup(base, dir); {
 	case err == nil:
 		s.log.Printf("acct-%02d file provider domain repaired (health: %v)", a.ID, healthErr)

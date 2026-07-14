@@ -71,9 +71,21 @@ func (s *PoolContentSource) Manifest(domain string) ([]content.Entry, error) {
 		return nil, fmt.Errorf("manifest: read base %s: %w", s.claudeDir, err)
 	}
 	entries := make([]content.Entry, 0, 2+len(SharedEntries)+len(ExcludedEntries)+len(baseEntries))
+	claudeFresh := []string{s.privClaudeJSON(domain), s.baseClaudeJSON}
+	settingsFresh := []string{s.baseSettings()}
+	// Version each synth off its freshness files; empty makes the appex fall back to
+	// its own client stat.
+	claudeVer, err := content.FreshnessVersion(claudeFresh)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: version %s: %w", claudeJSONName, err)
+	}
+	settingsVer, err := content.FreshnessVersion(settingsFresh)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: version %s: %w", settingsName, err)
+	}
 	entries = append(entries,
-		content.Entry{Name: claudeJSONName, Kind: content.EntrySynth, Private: true, Freshness: []string{s.privClaudeJSON(domain), s.baseClaudeJSON}},
-		content.Entry{Name: settingsName, Kind: content.EntrySynth, Freshness: []string{s.baseSettings()}},
+		content.Entry{Name: claudeJSONName, Kind: content.EntrySynth, Private: true, Version: claudeVer, Freshness: claudeFresh},
+		content.Entry{Name: settingsName, Kind: content.EntrySynth, Version: settingsVer, Freshness: settingsFresh},
 	)
 	for name := range SharedEntries {
 		entries = append(entries, content.Entry{Name: name, Kind: content.EntrySymlink, Target: filepath.Join(s.claudeDir, name)})

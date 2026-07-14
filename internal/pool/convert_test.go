@@ -1410,6 +1410,22 @@ func (f *fakeFP) ProbeDomain(_ context.Context, dir string) (*int64, error) {
 	return &n, nil
 }
 
+// ProbeDomainShallow models the shallow control op: whether .claude.json is listed
+// in the domain root (no byte read). scripted probeErr overrides the listing.
+func (f *fakeFP) ProbeDomainShallow(_ context.Context, dir string) (bool, error) {
+	if f.probeErr != nil {
+		return false, f.probeErr
+	}
+	_, err := os.Stat(filepath.Join(f.domainRoot(dir), ".claude.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (f *fakeFP) domainRoot(dir string) string {
 	return filepath.Join(f.domainsRoot, "CCPoolStatus-"+filepath.Base(dir))
 }

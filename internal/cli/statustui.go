@@ -149,6 +149,7 @@ type (
 type watchedLogin struct {
 	ctx      context.Context
 	cmd      *exec.Cmd
+	fp       bool // File Provider account: turn on dataless-file materialization around the spawn
 	read     credReader
 	out      io.Writer // where the input-mode reset is emitted
 	baseline string    // pre-login access token, set by Run for the finish gate
@@ -162,7 +163,7 @@ func (w *watchedLogin) Run() error {
 	if cred, err := w.read(); err == nil {
 		w.baseline = cred.ClaudeAiOauth.AccessToken
 	}
-	outcome, _ := watchAndClose(w.ctx, w.cmd, newReloginProbe(w.read, w.baseline))
+	outcome, _ := watchAndClose(w.ctx, w.cmd, w.fp, newReloginProbe(w.read, w.baseline))
 	// Bubble Tea's post-Exec restore leaves claude's input modes on, so after a
 	// force-kill (not a clean self-exit) reset only those; Bubble Tea owns alt-screen/cursor.
 	if outcome != awaitExited && isTTY() {
@@ -339,7 +340,7 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return t, nil
 		}
 		a := msg.account
-		wl := &watchedLogin{ctx: t.ctx, cmd: c, read: func() (*creds.Credential, error) {
+		wl := &watchedLogin{ctx: t.ctx, cmd: c, fp: isFPRow(a.OverlayKind), read: func() (*creds.Credential, error) {
 			return t.readCred(a)
 		}}
 		// The callback runs after wl.Run, so wl.baseline is set by then.
