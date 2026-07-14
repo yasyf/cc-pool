@@ -82,7 +82,8 @@ CREATE TABLE IF NOT EXISTS auth_health (
   needs_login INTEGER NOT NULL DEFAULT 0,
   since       INTEGER,
   last_err    TEXT NOT NULL DEFAULT '',
-  kind        TEXT NOT NULL DEFAULT ''
+  kind        TEXT NOT NULL DEFAULT '',
+  gen         INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS journal_risks (
   dir         TEXT PRIMARY KEY,
@@ -110,6 +111,37 @@ func Open(path string) (*Store, error) {
 func (s *Store) applySchema() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
+	}
+	if err := s.ensureColumn("auth_health", "gen", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureColumn adds column (with declaration decl) to table when it is absent.
+// Errors fail Open — running against a half-migrated schema is never
+// acceptable.
+func (s *Store) ensureColumn(table, column, decl string) error {
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
+		return fmt.Errorf("inspect %s.%s: %w", table, column, err)
+	}
+	if n > 0 {
+		return nil
+	}
+	// table/column/decl are compile-time constants; nothing user-controlled.
+	if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, decl)); err != nil {
+		// Two processes can race the check-then-ALTER on the first open after
+		// an upgrade (sqlite has no ADD COLUMN IF NOT EXISTS). The
+		// postcondition is "column exists" — re-check before failing so the
+		// duplicate-column loser swallows its error.
+		var again int
+		if err2 := s.db.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&again); err2 == nil && again > 0 {
+			return nil
+		}
+		return fmt.Errorf("add column %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -682,12 +714,12 @@ func (s *Store) LastRefresh(accountID int) (RefreshEntry, bool, error) {
 // as healthy (NeedsLogin false).
 func (s *Store) GetAuthHealth(accountID int) (AuthHealth, error) {
 	row := s.db.QueryRow(
-		`SELECT account_id,needs_login,since,last_err,kind FROM auth_health WHERE account_id=?`, accountID)
+		`SELECT account_id,needs_login,since,last_err,kind,gen FROM auth_health WHERE account_id=?`, accountID)
 	var h AuthHealth
 	var needs int
 	var since sql.NullInt64
 	var kind string
-	if err := row.Scan(&h.AccountID, &needs, &since, &h.LastErr, &kind); err != nil {
+	if err := row.Scan(&h.AccountID, &needs, &since, &h.LastErr, &kind, &h.Gen); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AuthHealth{AccountID: accountID}, nil
 		}
@@ -704,7 +736,7 @@ func (s *Store) GetAuthHealth(accountID int) (AuthHealth, error) {
 // ListAuthHealth returns the needs-login accounts keyed by id; healthy accounts
 // are omitted.
 func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
-	rows, err := s.db.Query(`SELECT account_id,needs_login,since,last_err,kind FROM auth_health WHERE needs_login=1`)
+	rows, err := s.db.Query(`SELECT account_id,needs_login,since,last_err,kind,gen FROM auth_health WHERE needs_login=1`)
 	if err != nil {
 		return nil, err
 	}
@@ -715,7 +747,7 @@ func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
 		var needs int
 		var since sql.NullInt64
 		var kind string
-		if err := rows.Scan(&h.AccountID, &needs, &since, &h.LastErr, &kind); err != nil {
+		if err := rows.Scan(&h.AccountID, &needs, &since, &h.LastErr, &kind, &h.Gen); err != nil {
 			return nil, err
 		}
 		h.NeedsLogin = needs != 0
@@ -730,8 +762,9 @@ func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
 
 // SetNeedsLogin flags an account as needing re-login with its kind, stamping
 // Since only on the false→true transition and returning changed=true only then
-// (so the daemon logs the hint once). Kind is refreshed every call. The daemon
-// poll loop is the sole writer, so the read-then-write is race-free.
+// (so the daemon logs the hint once). Kind is refreshed and Gen increments on
+// every call. The scheduler goroutine is the sole setter of needs_login=1; CLI
+// clears use a generation CAS to preserve a fresher verdict.
 func (s *Store) SetNeedsLogin(accountID int, at time.Time, errMsg string, kind AuthKind) (bool, error) {
 	if !kind.Valid() {
 		return false, fmt.Errorf("set needs-login for account %d: invalid auth kind %q", accountID, kind)
@@ -741,12 +774,13 @@ func (s *Store) SetNeedsLogin(accountID int, at time.Time, errMsg string, kind A
 		return false, err
 	}
 	if _, err := s.db.Exec(
-		`INSERT INTO auth_health(account_id,needs_login,since,last_err,kind) VALUES(?,1,?,?,?)
+		`INSERT INTO auth_health(account_id,needs_login,since,last_err,kind,gen) VALUES(?,1,?,?,?,1)
 		 ON CONFLICT(account_id) DO UPDATE SET
 		   needs_login=1,
 		   last_err=excluded.last_err,
 		   kind=excluded.kind,
-		   since=CASE WHEN auth_health.needs_login=1 THEN auth_health.since ELSE excluded.since END`,
+		   since=CASE WHEN auth_health.needs_login=1 THEN auth_health.since ELSE excluded.since END,
+		   gen=auth_health.gen+1`,
 		accountID, at.Unix(), errMsg, string(kind)); err != nil {
 		return false, fmt.Errorf("set needs-login for account %d: %w", accountID, err)
 	}
@@ -759,6 +793,22 @@ func (s *Store) ClearNeedsLogin(accountID int) (bool, error) {
 	res, err := s.db.Exec(
 		`UPDATE auth_health SET needs_login=0, since=NULL, last_err='', kind='' WHERE account_id=? AND needs_login=1`,
 		accountID)
+	if err != nil {
+		return false, fmt.Errorf("clear needs-login for account %d: %w", accountID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ClearNeedsLoginIfGen clears an account's needs-login flag only when gen still
+// matches the caller's observed generation.
+func (s *Store) ClearNeedsLoginIfGen(accountID int, gen int64) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE auth_health SET needs_login=0, since=NULL, last_err='', kind='' WHERE account_id=? AND needs_login=1 AND gen=?`,
+		accountID, gen)
 	if err != nil {
 		return false, fmt.Errorf("clear needs-login for account %d: %w", accountID, err)
 	}

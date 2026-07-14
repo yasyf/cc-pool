@@ -113,14 +113,15 @@ func (k AuthKind) Valid() bool {
 // AuthHealth is an account's authentication health. NeedsLogin is set by the
 // daemon when the stored refresh token is gone/revoked and only an interactive
 // `ccp login` can recover; Since marks the false→true transition, LastErr the
-// triggering failure, Kind why it needs login. No secrets — a flag, a
-// timestamp, an error string, a kind.
+// triggering failure, Kind why it needs login, and Gen the monotonic verdict
+// generation. No secrets — a flag, a timestamp, an error string, a kind.
 type AuthHealth struct {
 	AccountID  int
 	NeedsLogin bool
 	Since      time.Time // zero when NeedsLogin is false
 	LastErr    string
 	Kind       AuthKind
+	Gen        int64
 }
 
 // JournalRisk records that cc-pool forgot a fuse row (removal, fallback, or

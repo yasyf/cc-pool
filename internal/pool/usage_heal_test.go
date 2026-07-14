@@ -387,10 +387,29 @@ func TestSampleUsageTokenlessFlagsNeedsLogin(t *testing.T) {
 	}
 }
 
+// TestSampleUsageAbsentFlagsNeedsLogin pins the fully-absent credential path:
+// SampleUsage must return the two classifications rather than reach fetchUsage
+// with a nil credential.
+func TestSampleUsageAbsentFlagsNeedsLogin(t *testing.T) {
+	fk := credstest.NewFake()
+	m, a := newHealManager(t, fk, &fakeOAuth{})
+
+	_, rateLimited, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
+	if !errors.Is(err, ErrNeedsLogin) {
+		t.Fatalf("err = %v, want ErrNeedsLogin", err)
+	}
+	if !errors.Is(err, creds.ErrNotFound) {
+		t.Fatalf("err = %v, want it to also name creds.ErrNotFound", err)
+	}
+	if rateLimited {
+		t.Error("rateLimited = true, want false")
+	}
+}
+
 // TestEnsureFreshTokenClassification pins the narrowness of the needs-login
-// mapping: only a tokenless blob (ErrNoTokens) flags the account — a locked or
-// opaque keychain and a fully-absent credential must never be classified as
-// needs-login, so a reboot-time Keychain wedge never signs healthy accounts out.
+// mapping: tokenless and fully absent credentials flag the account, while a
+// locked or opaque keychain must never be classified as needs-login, so a
+// reboot-time Keychain wedge never signs healthy accounts out.
 func TestEnsureFreshTokenClassification(t *testing.T) {
 	errBoom := errors.New("keychain read exploded")
 	cases := []struct {
@@ -418,9 +437,8 @@ func TestEnsureFreshTokenClassification(t *testing.T) {
 			wantNotErrIs: []error{ErrNeedsLogin},
 		},
 		{
-			name:         "absent everywhere is not needs-login",
-			wantErrIs:    []error{creds.ErrNotFound},
-			wantNotErrIs: []error{ErrNeedsLogin},
+			name:      "absent everywhere flags needs-login and names not-found",
+			wantErrIs: []error{ErrNeedsLogin, creds.ErrNotFound},
 		},
 	}
 	for _, tc := range cases {

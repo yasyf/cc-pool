@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
@@ -268,7 +269,15 @@ func TestResolveSelectionWaitRefusesExhaustedFallback(t *testing.T) {
 // unrefreshable get their operator guidance (naming `ccp login <id>`), any
 // other error passes through verbatim.
 func TestWarnPreflight(t *testing.T) {
-	a := store.Account{ID: 7, Label: "work@example.com"}
+	a := store.Account{
+		ID: 7, ConfigDir: t.TempDir(), Label: "work@example.com",
+		KeychainService: "svc-warn-preflight", KeychainAccount: "user",
+	}
+	m := &pool.Manager{Creds: credstest.NewFake(), LockDir: t.TempDir()}
+	_, _, absentErr := m.EnsureFreshToken(context.Background(), a, pool.RefreshLeadTime, true)
+	if !errors.Is(absentErr, pool.ErrNeedsLogin) || !errors.Is(absentErr, creds.ErrNotFound) {
+		t.Fatalf("absent credential error = %v, want ErrNeedsLogin and creds.ErrNotFound", absentErr)
+	}
 	opaque := errors.New("preflight refresh: dial tcp: connection refused")
 	cases := map[string]struct {
 		err  error
@@ -276,6 +285,10 @@ func TestWarnPreflight(t *testing.T) {
 	}{
 		"needs-login names the login command": {
 			err:  pool.ErrNeedsLogin,
+			want: []string{"needs to log in again", "ccp login 7"},
+		},
+		"absent credential names the login command": {
+			err:  absentErr,
 			want: []string{"needs to log in again", "ccp login 7"},
 		},
 		"unrefreshable names the origin and the local login": {

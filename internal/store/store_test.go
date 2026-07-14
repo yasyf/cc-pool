@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -14,6 +15,42 @@ func openTest(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+func TestOpenMigratesAuthHealthGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE auth_health (
+		account_id INTEGER PRIMARY KEY,
+		needs_login INTEGER NOT NULL DEFAULT 0,
+		since INTEGER,
+		last_err TEXT NOT NULL DEFAULT '',
+		kind TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if _, err := s.SetNeedsLogin(1, time.Unix(1_000_000, 0), "revoked", AuthKindOwned); err != nil {
+		t.Fatal(err)
+	}
+	h, err := s.GetAuthHealth(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Gen != 1 {
+		t.Fatalf("generation after migrating and flagging = %d, want 1", h.Gen)
+	}
 }
 
 func TestAccountCRUD(t *testing.T) {
@@ -701,6 +738,81 @@ func TestAuthHealthTransitions(t *testing.T) {
 	}
 	if m, _ := s.ListAuthHealth(); len(m) != 0 {
 		t.Fatalf("ListAuthHealth after clear = %+v, want empty", m)
+	}
+}
+
+func TestAuthHealthGenerationCAS(t *testing.T) {
+	s := openTest(t)
+	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"}); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := s.GetAuthHealth(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Gen != 0 {
+		t.Fatalf("never-flagged generation = %d, want 0", h.Gen)
+	}
+
+	t0 := time.Unix(1_000_000, 0)
+	if _, err := s.SetNeedsLogin(1, t0, "first", AuthKindOwned); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetNeedsLogin(1, t0.Add(time.Minute), "second", AuthKindAwaitingOrigin); err != nil {
+		t.Fatal(err)
+	}
+	h, err = s.GetAuthHealth(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Gen != 2 {
+		t.Fatalf("generation after two flags = %d, want 2", h.Gen)
+	}
+	health, err := s.ListAuthHealth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health[1].Gen != 2 {
+		t.Fatalf("listed generation = %d, want 2", health[1].Gen)
+	}
+
+	cleared, err := s.ClearNeedsLoginIfGen(1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared {
+		t.Fatal("stale generation cleared a fresher needs-login verdict")
+	}
+	h, err = s.GetAuthHealth(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.NeedsLogin || h.Gen != 2 {
+		t.Fatalf("after stale clear = %+v, want flagged at generation 2", h)
+	}
+
+	cleared, err = s.ClearNeedsLoginIfGen(1, 2)
+	if err != nil || !cleared {
+		t.Fatalf("current-generation clear changed=%v err=%v, want true", cleared, err)
+	}
+	h, err = s.GetAuthHealth(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.NeedsLogin || h.Gen != 2 || !h.Since.IsZero() || h.LastErr != "" || h.Kind != AuthKindOwned {
+		t.Fatalf("after current-generation clear = %+v, want healthy at generation 2", h)
+	}
+
+	if _, err := s.SetNeedsLogin(1, t0.Add(2*time.Minute), "third", AuthKindOwned); err != nil {
+		t.Fatal(err)
+	}
+	h, err = s.GetAuthHealth(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.NeedsLogin || h.Gen != 3 {
+		t.Fatalf("after reflag = %+v, want flagged at generation 3", h)
 	}
 }
 
