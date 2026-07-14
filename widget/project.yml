@@ -167,6 +167,7 @@ targets:
     platform: macOS
     sources:
       - path: Tests
+      - path: Sources/App/Countdown.swift
       - path: Sources/App/DomainClaims.swift
       - path: Sources/FileProvider/SynthCache.swift
       - path: Sources/FileProvider/ItemID.swift

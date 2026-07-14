@@ -133,24 +133,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                       versionHex: ItemVersions.computed(freshnessHex: versionHex, size: size))
     }
 
-    /// Cache hit, or one coalesced bridge read per content version. A
-    /// transport failure propagates (the enumeration must fail, never serve a
-    /// partial or frozen view); a content-level failure (e.g. no private
-    /// backing yet) is .unreadable — served size 0, never cached, so the next
-    /// stat retries and fetchContents surfaces the error.
+    /// Cache hit, or one coalesced bridge read per content version.
+    /// Fail-closed: ANY read failure — transport or content-level (ok:false
+    /// reply, malformed reply, missing synth) — propagates and fails the
+    /// listing build; under the eager content policy a size-0 lie becomes a
+    /// frozen replica. Errors are never cached, so the next build retries.
     private func synthOutcome(name: String, version: String) throws -> SynthSizeCache.Outcome {
-        if let hit = synthSizes.lookup(name: name, version: version) { return hit }
-        let data: Data
-        do {
-            data = try readSynthShared(name: name, version: version)
-        } catch let e as NSError where e.domain == NSFileProviderError.errorDomain {
-            throw e // transport: bridge unreachable
-        } catch {
-            return .unreadable
+        try synthSizes.outcome(name: name, version: version) {
+            try readSynthShared(name: name, version: version)
         }
-        let outcome = SynthSizeCache.Outcome.of(data)
-        synthSizes.store(name: name, version: version, outcome: outcome)
-        return outcome
     }
 
     func symlinkItem(name: String, target: String) -> FPItem {
@@ -279,7 +270,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 case .computed(let name):
                     // Item first: computedItem fills the byte cache, so the
                     // worst case per content version is one readSynth + one
-                    // manifest; .sized (over-cap) and .unreadable re-read.
+                    // manifest; .sized (over-cap) re-reads.
                     let entries = try self.manifest()
                     guard let e = entries.first(where: { $0.name == name && $0.kind == "synth" }) else {
                         throw NSFileProviderError(.noSuchItem)

@@ -30,14 +30,23 @@ final class EnumeratorFailClosedTests: XCTestCase {
 
     private enum Bridge: Error { case unreachable }
 
+    /// Every listing-build failure shape: the transport arm plus the
+    /// content-level bridge arms (ok:false, malformed reply, missing synth)
+    /// that fail a computed item — none may yield a partial or size-0 listing.
+    private static let failureArms: [(name: String, error: Error)] =
+        [("transport unreachable", Bridge.unreachable)] + BridgeFailureArms.all
+
     func testRootEnumerateErrorNeverPartial() {
-        let observer = RecordingEnumerationObserver()
-        RootEnumerator(source: source(root: .failure(Bridge.unreachable)), container: .rootContainer)
-            .enumerateItems(for: observer, startingAt: NSFileProviderPage("0".data(using: .utf8)!))
-        observer.waitFinished(self)
-        XCTAssertNotNil(observer.error, "a failed listing must fail the enumeration")
-        XCTAssertTrue(observer.enumerated.isEmpty, "no items may leak from a failed listing")
-        XCTAssertFalse(observer.finishedCleanly)
+        for arm in Self.failureArms {
+            let observer = RecordingEnumerationObserver()
+            RootEnumerator(source: source(root: .failure(arm.error)), container: .rootContainer)
+                .enumerateItems(for: observer, startingAt: NSFileProviderPage("0".data(using: .utf8)!))
+            observer.waitFinished(self)
+            XCTAssertNotNil(observer.error, "\(arm.name): a failed listing must fail the enumeration")
+            XCTAssertTrue(observer.enumerated.isEmpty,
+                          "\(arm.name): no items may leak from a failed listing")
+            XCTAssertFalse(observer.finishedCleanly, arm.name)
+        }
     }
 
     func testRootEnumerateSuccess() {
@@ -61,19 +70,21 @@ final class EnumeratorFailClosedTests: XCTestCase {
     }
 
     func testRootChangesErrorEmitsNoDeletes() {
-        let src = source(root: .failure(Bridge.unreachable))
-        // Persist a prior listing so a lying "empty" diff WOULD delete it.
-        src.anchors.save(.rootContainer, ["computed:.claude.json": "0a"])
-        let anchor = NSFileProviderSyncAnchor(
-            AnchorStore.anchor(of: ["computed:.claude.json": "0a"]))
-        let observer = RecordingChangeObserver()
-        RootEnumerator(source: src, container: .rootContainer)
-            .enumerateChanges(for: observer, from: anchor)
-        observer.waitFinished(self)
-        XCTAssertNotNil(observer.error)
-        XCTAssertTrue(observer.deleted.isEmpty,
-                      "a failed listing must never surface as remote deletes")
-        XCTAssertTrue(observer.updated.isEmpty)
+        for arm in Self.failureArms {
+            let src = source(root: .failure(arm.error))
+            // Persist a prior listing so a lying "empty" diff WOULD delete it.
+            src.anchors.save(.rootContainer, ["computed:.claude.json": "0a"])
+            let anchor = NSFileProviderSyncAnchor(
+                AnchorStore.anchor(of: ["computed:.claude.json": "0a"]))
+            let observer = RecordingChangeObserver()
+            RootEnumerator(source: src, container: .rootContainer)
+                .enumerateChanges(for: observer, from: anchor)
+            observer.waitFinished(self)
+            XCTAssertNotNil(observer.error, arm.name)
+            XCTAssertTrue(observer.deleted.isEmpty,
+                          "\(arm.name): a failed listing must never surface as remote deletes")
+            XCTAssertTrue(observer.updated.isEmpty, arm.name)
+        }
     }
 
     func testDirChangesErrorFailsEnumeration() {

@@ -221,7 +221,7 @@ final class FileProviderController {
             guard let key = DomainClaims.key(op: req.op, domain: domain, probeID: probeDomainID) else {
                 // Unclaimed (path/signal): a health-ish read that must never
                 // bounce busy — dispatch straight onto the concurrent queue.
-                domainQueue.async { self.reply(fd, self.perform(req, domain: domain)) }
+                domainQueue.async { self.reply(fd, self.perform(req, domain: domain, fd: fd)) }
                 return
             }
             guard claims.claim(key) else {
@@ -230,7 +230,7 @@ final class FileProviderController {
             }
             domainQueue.async {
                 defer { self.claims.release(key) }
-                self.reply(fd, self.perform(req, domain: domain))
+                self.reply(fd, self.perform(req, domain: domain, fd: fd))
             }
         default:
             reply(fd, .failure("unknown op \(req.op)", nil))
@@ -265,7 +265,7 @@ final class FileProviderController {
 
     // MARK: - Domain ops (per-domain serialized via claims, concurrent across domains)
 
-    private func perform(_ req: ControlRequest, domain: String) -> ControlResponse {
+    private func perform(_ req: ControlRequest, domain: String, fd: Int32) -> ControlResponse {
         switch req.op {
         case "register": return register(domain)
         case "remove": return remove(domain)
@@ -273,7 +273,8 @@ final class FileProviderController {
         case "signal": return signal(domain)
         case "probe": return probe()
         case "probe-domain": return probeDomain(domain, shallow: req.shallow ?? false)
-        case "prepare-domain": return prepareDomain(domain, deadlineMS: req.deadlineMS ?? 0)
+        case "prepare-domain":
+            return prepareDomain(domain, deadlineMS: req.deadlineMS ?? 0) { peerClosed(fd) }
         default: return .failure("unknown op \(req.op)", nil) // unreachable: handle() routed
         }
     }
@@ -454,25 +455,36 @@ final class FileProviderController {
 
     /// Forces materialization of the computed settings.json replica via
     /// requestDownloadForItem — NEVER a raw read: this host app is marked
-    /// non-materializing by getUserVisibleURL, so its reads of dataless items
-    /// EDEADLK by design. ok only on completed materialization; every failure
-    /// or timeout is domain-not-serving.
-    private func prepareDomain(_ domain: String, deadlineMS: Int64) -> ControlResponse {
+    /// non-materializing, so its reads of dataless items EDEADLK by design.
+    /// ok only on materialization WITHIN the caller's deadline; every failure,
+    /// timeout, or expiry is domain-not-serving. One monotonic countdown
+    /// clamps every phase wait, so the reply never outlives the budget.
+    private func prepareDomain(_ domain: String, deadlineMS: Int64,
+                               peerClosed: () -> Bool) -> ControlResponse {
         let budget = deadlineMS > 0 ? TimeInterval(deadlineMS) / 1000 : Self.prepareDefaultDeadline
-        let deadline = Date().addingTimeInterval(budget)
+        let countdown = Countdown(budget)
+        func expired(_ stage: String) -> ControlResponse {
+            .failure("prepare-domain \(domain): deadline exhausted before \(stage)", .domainNotServing)
+        }
+        guard !countdown.expired else { return expired("lookup") }
         let mgr: NSFileProviderManager
-        switch manager(for: domain, bound: Bound.lookup, lookupFailClass: .domainNotServing) {
+        switch manager(for: domain, bound: countdown.bound(Bound.lookup),
+                       lookupFailClass: .domainNotServing) {
         case .reply(let resp): return resp // unregistered → no-domain; lookup failure → domain-not-serving
         case .manager(let m): mgr = m
         }
+        guard !countdown.expired else { return expired("URL") }
         let url: URL
-        switch waitURL(Bound.probeURL, { mgr.getUserVisibleURL(for: .rootContainer, completionHandler: $0) }) {
+        switch waitURL(countdown.bound(Bound.probeURL),
+                       { mgr.getUserVisibleURL(for: .rootContainer, completionHandler: $0) }) {
         case .failure(let f):
             return .failure("prepare-domain URL for \(domain): \(f.message)", .domainNotServing)
         case .success(let u):
             url = u
         }
-        switch waitBlocking(Bound.probeEnum, { try FileManager.default.contentsOfDirectory(atPath: url.path) }) {
+        guard !countdown.expired else { return expired("enumerate") }
+        switch waitBlocking(countdown.bound(Bound.probeEnum),
+                            { try FileManager.default.contentsOfDirectory(atPath: url.path) }) {
         case .failure(let f):
             return .failure("prepare-domain enumerate \(domain): \(f.message)", .domainNotServing)
         case .success(let entries):
@@ -481,19 +493,20 @@ final class FileProviderController {
             }
         }
         let item = NSFileProviderItemIdentifier("computed:settings.json")
-        let remaining = deadline.timeIntervalSinceNow
-        guard remaining > 0 else {
-            return .failure("prepare-domain \(domain): deadline exhausted before download", .domainNotServing)
-        }
-        if let f = waitVoid(remaining, { mgr.requestDownloadForItem(withIdentifier: item, completionHandler: $0) }) {
+        guard !countdown.expired else { return expired("download") }
+        if let f = waitVoid(countdown.remaining, { mgr.requestDownloadForItem(withIdentifier: item, completionHandler: $0) }) {
             return .failure("prepare-domain download settings.json for \(domain): \(f.message)", .domainNotServing)
         }
         // requestDownloadForItem can ack before bytes land; poll the replica's
-        // dataless flag (stat never materializes) until the deadline.
+        // dataless flag (stat never materializes) until the deadline. Expiry
+        // precedes the materialization test (late bytes never read as ok);
+        // a hung-up caller releases the claim instead of polling on.
         let file = url.appendingPathComponent("settings.json").path
-        while true {
+        while !countdown.expired {
+            if peerClosed() {
+                return .failure("prepare-domain \(domain): caller disconnected", .domainNotServing)
+            }
             if Self.isMaterialized(file) { return ControlResponse(ok: true) }
-            guard Date() < deadline else { break }
             usleep(200_000)
         }
         return .failure(

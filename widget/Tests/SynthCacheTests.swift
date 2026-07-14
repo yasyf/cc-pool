@@ -32,8 +32,50 @@ final class SynthCacheTests: XCTestCase {
     func testOutcomeSizes() {
         XCTAssertEqual(SynthSizeCache.Outcome.bytes(Data("abcd".utf8)).size, 4)
         XCTAssertEqual(SynthSizeCache.Outcome.sized(77).size, 77)
-        XCTAssertEqual(SynthSizeCache.Outcome.unreadable.size, 0,
-                       "unreadable content is advertised at size 0")
+    }
+
+    func testOutcomeCachesSuccessPerVersion() throws {
+        let cache = SynthSizeCache()
+        var reads = 0
+        let read = { () -> Data in
+            reads += 1
+            return Data("abc".utf8)
+        }
+        XCTAssertEqual(try cache.outcome(name: "settings.json", version: "v1", read: read),
+                       .bytes(Data("abc".utf8)))
+        XCTAssertEqual(try cache.outcome(name: "settings.json", version: "v1", read: read),
+                       .bytes(Data("abc".utf8)))
+        XCTAssertEqual(reads, 1, "a cached content version must cost zero reads")
+    }
+
+    /// Fail-closed: every bridge-level read failure propagates — a listing
+    /// must fail, never advertise a size-0 item — and is never cached, so the
+    /// next metadata build retries the read.
+    func testOutcomeFailClosedPropagatesUncached() {
+        for arm in BridgeFailureArms.all {
+            let cache = SynthSizeCache()
+            var reads = 0
+            XCTAssertThrowsError(
+                try cache.outcome(name: ".claude.json", version: "v1") {
+                    reads += 1
+                    throw arm.error
+                }, arm.name
+            ) { thrown in
+                let got = thrown as NSError
+                let want = arm.error as NSError
+                XCTAssertEqual(got.domain, want.domain, arm.name)
+                XCTAssertEqual(got.code, want.code, arm.name)
+            }
+            XCTAssertNil(cache.lookup(name: ".claude.json", version: "v1"),
+                         "\(arm.name): a failure must never be cached")
+            XCTAssertEqual(
+                try? cache.outcome(name: ".claude.json", version: "v1") {
+                    reads += 1
+                    return Data("ok".utf8)
+                }, .bytes(Data("ok".utf8)),
+                "\(arm.name): the retry must re-read and succeed")
+            XCTAssertEqual(reads, 2, arm.name)
+        }
     }
 
     func testBoundedToTwoNames() {
@@ -52,10 +94,13 @@ final class InFlightTests: XCTestCase {
     private enum Boom: Error { case boom }
 
     /// N concurrent callers of one key share a single execution: the leader's
-    /// work is gated open only after every caller has had ample time to join.
+    /// work stays gated until every caller has checked in, so a late-scheduled
+    /// caller can never find the flight finished, become a second leader, and
+    /// deadlock on the exhausted gate.
     func testConcurrentCallersComputeOnce() {
         let flights = InFlight<String, Int>()
         let gate = DispatchSemaphore(value: 0)
+        let arrived = DispatchSemaphore(value: 0)
         let executions = ManagedAtomicCounter()
         let callers = 8
         let group = DispatchGroup()
@@ -64,6 +109,7 @@ final class InFlightTests: XCTestCase {
 
         for i in 0..<callers {
             DispatchQueue.global().async(group: group) {
+                arrived.signal()
                 let v = try? flights.run("k") { () -> Int in
                     executions.increment()
                     gate.wait()
@@ -74,8 +120,10 @@ final class InFlightTests: XCTestCase {
                 resultsLock.unlock()
             }
         }
-        // All callers reach run() and block on the leader before it finishes.
-        Thread.sleep(forTimeInterval: 0.5)
+        // Arrival barrier: release the leader only once all N are scheduled.
+        for i in 0..<callers {
+            XCTAssertEqual(arrived.wait(timeout: .now() + 5), .success, "caller \(i) never arrived")
+        }
         gate.signal()
         XCTAssertEqual(group.wait(timeout: .now() + 5), .success, "callers must all return")
         XCTAssertEqual(executions.value, 1, "coalesced callers must compute exactly once")
@@ -86,6 +134,7 @@ final class InFlightTests: XCTestCase {
     func testErrorPropagatesToWaitersAndIsNeverCached() {
         let flights = InFlight<String, Int>()
         let gate = DispatchSemaphore(value: 0)
+        let arrived = DispatchSemaphore(value: 0)
         let executions = ManagedAtomicCounter()
         let failures = ManagedAtomicCounter()
         let callers = 4
@@ -93,6 +142,7 @@ final class InFlightTests: XCTestCase {
 
         for _ in 0..<callers {
             DispatchQueue.global().async(group: group) {
+                arrived.signal()
                 do {
                     _ = try flights.run("k") { () -> Int in
                         executions.increment()
@@ -104,7 +154,10 @@ final class InFlightTests: XCTestCase {
                 }
             }
         }
-        Thread.sleep(forTimeInterval: 0.5)
+        // Same arrival barrier as testConcurrentCallersComputeOnce.
+        for i in 0..<callers {
+            XCTAssertEqual(arrived.wait(timeout: .now() + 5), .success, "caller \(i) never arrived")
+        }
         gate.signal()
         XCTAssertEqual(group.wait(timeout: .now() + 5), .success)
         XCTAssertEqual(executions.value, 1)

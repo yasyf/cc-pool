@@ -10,9 +10,6 @@ final class SynthSizeCache {
         case bytes(Data)
         /// Over byteCap: only the length is cached; fetchContents re-reads.
         case sized(Int64)
-        /// Content-level read failure — never stored (a retry must re-read);
-        /// exists so callers can size the item 0 without inventing a sentinel.
-        case unreadable
 
         /// Caching policy for a successful read: bytes up to `cap`, size only above.
         static func of(_ data: Data, cap: Int = SynthSizeCache.byteCap) -> Outcome {
@@ -23,7 +20,6 @@ final class SynthSizeCache {
             switch self {
             case .bytes(let d): Int64(d.count)
             case .sized(let n): n
-            case .unreadable: 0
             }
         }
     }
@@ -50,6 +46,16 @@ final class SynthSizeCache {
             slots.removeValue(forKey: evict)
         }
         slots[name] = (version, outcome)
+    }
+
+    /// Cache hit, or one `read` per content version. Fail-closed: every read
+    /// failure propagates uncached — a listing must fail rather than advertise
+    /// a size-0 lie, and the next call retries the read.
+    func outcome(name: String, version: String, read: () throws -> Data) throws -> Outcome {
+        if let hit = lookup(name: name, version: version) { return hit }
+        let outcome = Outcome.of(try read())
+        store(name: name, version: version, outcome: outcome)
+        return outcome
     }
 }
 
