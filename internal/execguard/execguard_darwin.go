@@ -12,6 +12,7 @@
 package execguard
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -89,6 +90,21 @@ func PrimeForExec(settingsPath string) error {
 		return err
 	}
 	return materializeRead(settingsPath, materializeReadTimeout)
+}
+
+// PrimeForExecContext primes settingsPath without beginning a bounded read that
+// cannot finish before ctx's deadline.
+func PrimeForExecContext(ctx context.Context, settingsPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < materializeReadTimeout {
+		return context.DeadlineExceeded
+	}
+	if err := PrimeForExec(settingsPath); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // EnableForSpawn enables dataless-file materialization so a child spawned

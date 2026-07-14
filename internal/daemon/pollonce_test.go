@@ -160,9 +160,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 		t.Fatalf("reserved account's credential was written %d time(s)", got-seedWrites)
 	}
 
-	s.cl.mu.Lock()
-	s.cl.reservations[a.ID] = time.Now().Add(-reservationTTL - time.Second)
-	s.cl.mu.Unlock()
+	expireCommittedReservations(s.cl, a.ID)
 	s.pollOnce(t.Context())
 	if got := fo.refreshCount(); got != 1 {
 		t.Fatalf("idle near-expiry account refreshed %d time(s), want 1", got)

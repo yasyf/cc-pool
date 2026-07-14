@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -181,6 +182,27 @@ func acquireAndProbeSessionLease(a store.Account) (*lease.Handle, error) {
 	return acquireAndProbe(pool.SessionLeaseDir(a), a.ConfigDir, isFuseRow(a.OverlayKind))
 }
 
+// acquireAndProbeSessionLeaseContext refuses to begin the sequential bounded
+// acquire and probes unless they can finish within ctx's remaining deadline.
+func acquireAndProbeSessionLeaseContext(ctx context.Context, a store.Account) (*lease.Handle, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	const bound = leaseAcquireBound + leaseProbeTimeout + overlay.DeepProbeBound
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < bound {
+		return nil, context.DeadlineExceeded
+	}
+	h, err := acquireAndProbeSessionLease(a)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = h.Close()
+		return nil, err
+	}
+	return h, nil
+}
+
 // acquireAndProbePendingLease is acquireAndProbeSessionLease for a fresh add,
 // whose account is not in the store yet: the key derives from the pending row's
 // index, dir, and backend.
@@ -216,7 +238,31 @@ func keepLeaseAlive(h *lease.Handle) { runtime.KeepAlive(h) }
 // covering (leader, key) skips the fork (an advisory-slot optimization — a redundant
 // agent would merely be one idle process, so a missed skip is harmless). A var seam so
 // command tests stub the real fork+handshake.
-var spawnLeaseAgent = func(a store.Account) error {
+type leaseAgentCleanup interface {
+	Stop() error
+}
+
+type spawnedLeaseAgent struct {
+	child *exec.Cmd
+}
+
+func (a *spawnedLeaseAgent) Stop() error {
+	if a == nil || a.child == nil || a.child.Process == nil {
+		return nil
+	}
+	killErr := a.child.Process.Kill()
+	waitErr := a.child.Wait()
+	if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+		return fmt.Errorf("stop lease agent: %w", killErr)
+	}
+	var exitErr *exec.ExitError
+	if waitErr != nil && !errors.As(waitErr, &exitErr) {
+		return fmt.Errorf("reap lease agent: %w", waitErr)
+	}
+	return nil
+}
+
+var spawnLeaseAgent = func(a store.Account) (leaseAgentCleanup, error) {
 	return spawnLeaseAgentKey(a.ID, pool.SessionLeaseDir(a), a.ConfigDir, isFuseRow(a.OverlayKind))
 }
 
@@ -229,7 +275,8 @@ var spawnLeaseAgent = func(a store.Account) error {
 // time, and an anchored lease beats none; the add command's help names this. A var so
 // add tests stub the fork.
 var spawnPendingLeaseAgent = func(p *pool.PendingAdd) error {
-	return spawnLeaseAgentKey(p.Index, pool.SessionLeaseDirFor(p.Index, p.ConfigDir, string(p.OverlayKind)), p.ConfigDir, p.OverlayKind.IsFuse())
+	_, err := spawnLeaseAgentKey(p.Index, pool.SessionLeaseDirFor(p.Index, p.ConfigDir, string(p.OverlayKind)), p.ConfigDir, p.OverlayKind.IsFuse())
+	return err
 }
 
 // leaseAgentArgs is the detached lease-agent argv. --ready-fd names the readiness pipe
@@ -251,34 +298,34 @@ func leaseAgentArgs(leader int, start int64, id int, key, probeDir string, fuseR
 	return args
 }
 
-func spawnLeaseAgentKey(id int, key, probeDir string, fuseRow bool) error {
+func spawnLeaseAgentKey(id int, key, probeDir string, fuseRow bool) (leaseAgentCleanup, error) {
 	leader, err := procSessionLeader()
 	if err != nil {
-		return fmt.Errorf("resolve the terminal session leader: %w", err)
+		return nil, fmt.Errorf("resolve the terminal session leader: %w", err)
 	}
 	// A degenerate or dead session leader means there is nothing to tie the lease to,
 	// so fail closed rather than hand out an unprotected dir — the user reruns from a
 	// live interactive shell.
 	if leader <= 1 {
-		return fmt.Errorf("cannot hold a session lease: no terminal session leader (getsid returned %d); rerun from an interactive shell", leader)
+		return nil, fmt.Errorf("cannot hold a session lease: no terminal session leader (getsid returned %d); rerun from an interactive shell", leader)
 	}
 	start, err := procStartTime(leader)
 	if err != nil {
 		if errors.Is(err, ErrNoProc) {
-			return fmt.Errorf("cannot hold a session lease: session leader %d is gone; rerun from a live shell", leader)
+			return nil, fmt.Errorf("cannot hold a session lease: session leader %d is gone; rerun from a live shell", leader)
 		}
-		return fmt.Errorf("read session leader %d start time: %w", leader, err)
+		return nil, fmt.Errorf("read session leader %d start time: %w", leader, err)
 	}
 	if slotCovered(leader, start, key) {
-		return nil // a live, ready agent already holds this session's lease
+		return nil, nil // a live, ready agent already holds this session's lease
 	}
 	self, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("resolve executable for the lease agent: %w", err)
+		return nil, fmt.Errorf("resolve executable for the lease agent: %w", err)
 	}
 	r, w, err := os.Pipe()
 	if err != nil {
-		return fmt.Errorf("create the lease-agent readiness pipe: %w", err)
+		return nil, fmt.Errorf("create the lease-agent readiness pipe: %w", err)
 	}
 	defer func() { _ = r.Close() }()
 	args := leaseAgentArgs(leader, start, id, key, probeDir, fuseRow)
@@ -289,10 +336,13 @@ func spawnLeaseAgentKey(id int, key, probeDir string, fuseRow bool) error {
 	c.ExtraFiles = []*os.File{w} // fd 3 in the child: the readiness pipe
 	if err := c.Start(); err != nil {
 		_ = w.Close()
-		return fmt.Errorf("spawn lease agent: %w", err)
+		return nil, fmt.Errorf("spawn lease agent: %w", err)
 	}
 	_ = w.Close() // the child holds the write end; our copy must close so EOF signals its death
-	return awaitAgentReady(r, c)
+	if err := awaitAgentReady(r, c); err != nil {
+		return nil, err
+	}
+	return &spawnedLeaseAgent{child: c}, nil
 }
 
 // awaitAgentReady blocks until the agent signals acquired+probed ("ok"), reports a

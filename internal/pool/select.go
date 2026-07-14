@@ -41,6 +41,10 @@ type SelectOptions struct {
 	// NoFallback returns ErrNoneAvailable instead of a least-bad exhausted pick;
 	// set by --wait callers, which would discard the pick to keep waiting.
 	NoFallback bool
+	// ExcludeIDs removes accounts that failed an account-local launch gate.
+	ExcludeIDs []int
+	// DeferCommit leaves stickiness and the session row untouched until CommitSelection.
+	DeferCommit bool
 }
 
 // DefaultFreshFor is the default cache window for live selection.
@@ -73,6 +77,7 @@ type SelectResult struct {
 	// otherwise; callers must surface the bypass when Best differs from it.
 	PinHeldAccount *int
 	byID           map[int]store.Account
+	recordSticky   bool
 }
 
 // Select scores all accounts and returns the best available one.
@@ -83,6 +88,22 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	}
 	if len(accts) == 0 {
 		return nil, ErrNoAccounts
+	}
+	excluded := make(map[int]bool, len(opts.ExcludeIDs))
+	for _, id := range opts.ExcludeIDs {
+		excluded[id] = true
+	}
+	if len(excluded) > 0 {
+		candidates := make([]store.Account, 0, len(accts))
+		for _, a := range accts {
+			if !excluded[a.ID] {
+				candidates = append(candidates, a)
+			}
+		}
+		accts = candidates
+		if len(accts) == 0 {
+			return &SelectResult{}, ErrNoneAvailable
+		}
 	}
 
 	sessions, scanErr := scanSessions(ctx) // best-effort; nil sessions on error
@@ -134,10 +155,11 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	}
 	// Don't re-record a held pin unless the ranking landed on it anyway. Best-effort:
 	// stickiness must never fail a select.
-	if !outcome.Held() || best.AccountID == pin.AccountID {
+	recordSticky := !outcome.Held() || best.AccountID == pin.AccountID
+	if !opts.DeferCommit && recordSticky {
 		_ = m.RecordSticky(opts.Cwd, best.AccountID, now)
 	}
-	if opts.PID > 0 {
+	if !opts.DeferCommit && opts.PID > 0 {
 		// Best-effort: a session row feeds the activity rules.
 		_, _ = m.Store.OpenSession(best.AccountID, opts.PID, byID[best.AccountID].ConfigDir, opts.Cwd, now)
 	}
@@ -147,12 +169,24 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 		Sticky: outcome == StickyBind, HasUsage: bi.HasUsage, Util5h: bi.Util5h, Util7d: bi.Util7d,
 		ExhaustedFallback: fallback, ExtraEnabled: extraByID[best.AccountID], byID: byID,
 		Scoped7dModel: scopedModelByID[best.AccountID], Scoped7dUtil: bi.Util7dScoped,
+		recordSticky: recordSticky,
 	}
 	if outcome == StickyHoldManual {
 		held := pin.AccountID
 		res.PinHeldAccount = &held
 	}
 	return res, nil
+}
+
+// CommitSelection records the delayed sticky and session effects of a provisional selection.
+func (m *Manager) CommitSelection(sr *SelectResult, cwd string, pid int) error {
+	if sr == nil {
+		return errors.New("commit selection: nil result")
+	}
+	if err := m.Store.CommitSelection(sr.Best.ID, pid, sr.Best.ConfigDir, cwd, time.Now(), sr.recordSticky); err != nil {
+		return fmt.Errorf("commit selection: %w", err)
+	}
+	return nil
 }
 
 // sampleStale concurrently refreshes usage for accounts staler than freshFor.

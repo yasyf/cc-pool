@@ -17,8 +17,83 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
+
+type fakeLeaseCleanup struct {
+	stops int
+}
+
+func (f *fakeLeaseCleanup) Stop() error {
+	f.stops++
+	return nil
+}
+
+func TestCommitSelectionWithLeaseStopsNewAgentOnCommitFailure(t *testing.T) {
+	agent := &fakeLeaseCleanup{}
+	swapVar(t, &spawnLeaseAgent, func(store.Account) (leaseAgentCleanup, error) { return agent, nil })
+	want := errors.New("persist selection")
+	selection := &selectionTxn{
+		acct:   store.Account{ID: 1, Label: "work@example.com"},
+		commit: func(context.Context) error { return want },
+		abort:  func() {},
+	}
+	err := commitSelectionWithLease(context.Background(), selection)
+	if !errors.Is(err, want) || agent.stops != 1 {
+		t.Fatalf("err=%v stops=%d, want commit error and one stop", err, agent.stops)
+	}
+}
+
+type contextBlockingOverlay struct {
+	started       chan struct{}
+	unboundedSync bool
+}
+
+func (f *contextBlockingOverlay) Backend() fkoverlay.Backend    { return fkoverlay.BackendSymlink }
+func (f *contextBlockingOverlay) PrivateRoot(dir string) string { return dir }
+func (f *contextBlockingOverlay) Setup(_, _ string) error       { return nil }
+func (f *contextBlockingOverlay) Health(_, _ string) error      { return nil }
+func (f *contextBlockingOverlay) Teardown(_, _ string) (string, error) {
+	return "", nil
+}
+func (f *contextBlockingOverlay) Sync(_, _ string) error {
+	f.unboundedSync = true
+	return errors.New("unbounded sync called")
+}
+func (f *contextBlockingOverlay) SyncContext(ctx context.Context, _, _ string) error {
+	close(f.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestResolveSelectionBoundsOverlaySyncByLaunchContext(t *testing.T) {
+	st := openTestStore(t)
+	id := 1
+	a := store.Account{ID: id, ConfigDir: filepath.Join(t.TempDir(), "acct-01"), OverlayKind: string(fkoverlay.BackendSymlink)}
+	if err := st.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	provider := &contextBlockingOverlay{started: make(chan struct{})}
+	m := &pool.Manager{Store: st, OverlayFor: func(fkoverlay.Backend) (fkoverlay.Provider, error) { return provider, nil }}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+
+	_, err := resolveSelectionTxn(cmd, m, selectReq{account: &id, noDaemon: true, ctx: ctx})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("resolveSelectionTxn err = %v, want launch deadline", err)
+	}
+	if provider.unboundedSync {
+		t.Fatal("resolution called the context-free overlay Sync")
+	}
+	select {
+	case <-provider.started:
+	default:
+		t.Fatal("context-aware overlay sync was not called")
+	}
+}
 
 func selectTestManager(t *testing.T) *pool.Manager {
 	t.Helper()
@@ -248,7 +323,7 @@ func TestResolveSelectionWaitRefusesExhaustedFallback(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.SetErr(&stderr)
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // pre-cancelled: the wait loop must exit on its first sleep
+	cancel() // pre-cancelled: selection must stop before scoring
 	cmd.SetContext(ctx)
 
 	_, _, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, wait: true, cwd: "/proj"})
@@ -256,9 +331,6 @@ func TestResolveSelectionWaitRefusesExhaustedFallback(t *testing.T) {
 		t.Fatalf("wait must block until cancelled, got %v", err)
 	}
 	out := stripANSI(stderr.String())
-	if !strings.Contains(out, "soonest reset at") {
-		t.Fatalf("wait message missing from stderr: %q", out)
-	}
 	if strings.Contains(out, "WILL bill") {
 		t.Fatalf("--wait must never accept (or warn about) a billing fallback: %q", out)
 	}
@@ -387,6 +459,7 @@ func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
 			if req.Op == daemon.OpSelect {
 				resp.SelectedID = &id
 				resp.Dir = dir
+				resp.ReservationToken = "test-reservation"
 			}
 			_ = json.NewEncoder(conn).Encode(resp)
 			_ = conn.Close()

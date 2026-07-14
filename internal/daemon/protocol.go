@@ -14,7 +14,7 @@ import (
 )
 
 // ProtocolVersion is bumped on incompatible wire changes.
-const ProtocolVersion = 1
+const ProtocolVersion = 2
 
 // Op is a request operation.
 type Op string
@@ -22,6 +22,10 @@ type Op string
 const (
 	// OpSelect picks the best account; optionally marks a checkout.
 	OpSelect Op = "select"
+	// OpSelectCommit commits a provisional selection immediately before launch.
+	OpSelectCommit Op = "select-commit"
+	// OpSelectAbort releases a provisional selection without side effects.
+	OpSelectAbort Op = "select-abort"
 	// OpStatus returns scored status for all accounts.
 	OpStatus Op = "status"
 	// OpCheckin releases a checkout and adopts a rotated token.
@@ -47,7 +51,7 @@ type Request struct {
 	NoMark  bool   `json:"no_mark,omitempty"` // select without recording a checkout
 	Cwd     string `json:"cwd,omitempty"`     // caller's working directory, keys select stickiness
 	// NoFallback: report none-available instead of a least-bad exhausted pick;
-	// discarding a pick doesn't undo its sticky/reservation/preflight side effects.
+	// no provisional selection is created when no account can serve.
 	NoFallback bool `json:"no_fallback,omitempty"`
 	// To: target overlay kind for migrate ("fuse" or "symlink") or credential
 	// backend for credmove ("keychain" or "file"). Only the daemon converts or
@@ -63,6 +67,10 @@ type Request struct {
 	// the (now automatic-retreat-removed) File-Provider→symlink conversion; the
 	// heal breaker parks a wedged-but-controllable domain rather than retreating it.
 	Retreat bool `json:"retreat,omitempty"`
+	// ExcludeIDs removes account-local preparation failures from a retry ranking.
+	ExcludeIDs []int `json:"exclude_ids,omitempty"`
+	// ReservationToken identifies a provisional select for commit or abort.
+	ReservationToken string `json:"reservation_token,omitempty"`
 }
 
 // MigrationOutcome classifies one account's migrate or credmove result.
@@ -291,15 +299,16 @@ func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 
 // Response is one server reply (one JSON object per line).
 type Response struct {
-	Proto       int     `json:"proto"`
-	OK          bool    `json:"ok"`
-	Error       string  `json:"error,omitempty"`
-	Dir         string  `json:"dir,omitempty"` // select: chosen config dir
-	SelectedID  *int    `json:"selected_id,omitempty"`
-	Sticky      bool    `json:"sticky,omitempty"`       // select honored a sticky record
-	Remaining5h float64 `json:"remaining_5h,omitempty"` // select: raw 5h remaining (100−used) of the pick
-	Remaining7d float64 `json:"remaining_7d,omitempty"` // select: raw 7d remaining (100−used) of the pick
-	HasUsage    bool    `json:"has_usage,omitempty"`    // select: false when the pick has no known-good sample (never sampled, or only 429 placeholders)
+	Proto            int     `json:"proto"`
+	OK               bool    `json:"ok"`
+	Error            string  `json:"error,omitempty"`
+	Dir              string  `json:"dir,omitempty"` // select: chosen config dir
+	SelectedID       *int    `json:"selected_id,omitempty"`
+	ReservationToken string  `json:"reservation_token,omitempty"`
+	Sticky           bool    `json:"sticky,omitempty"`       // select honored a sticky record
+	Remaining5h      float64 `json:"remaining_5h,omitempty"` // select: raw 5h remaining (100−used) of the pick
+	Remaining7d      float64 `json:"remaining_7d,omitempty"` // select: raw 7d remaining (100−used) of the pick
+	HasUsage         bool    `json:"has_usage,omitempty"`    // select: false when the pick has no known-good sample (never sampled, or only 429 placeholders)
 	// ExhaustedFallback: every account was exhausted and the pick is the
 	// least-bad one — the client must warn that it bills credits or rate-limits.
 	ExhaustedFallback bool `json:"exhausted_fallback,omitempty"`

@@ -207,6 +207,7 @@ func TestPoolContentSourceClassify(t *testing.T) {
 	cases := map[string]content.EntryKind{
 		".claude.json":                content.EntrySynth,
 		"settings.json":               content.EntrySynth,
+		"settings.json.tmp.123456":    content.EntryPrivate,
 		"plans":                       content.EntrySymlink,
 		"daemon":                      content.EntryPrivate,
 		".credentials.json":           content.EntryPrivate,

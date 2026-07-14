@@ -42,8 +42,8 @@ const deepWedgeStrikes = 2
 // bounded 2s stat that false-negatives under load.
 const shallowDeadStrikes = 2
 
-// fpWedgeStrikes debounces the File Provider wedged verdict (both the shallow and
-// deep lanes): one transient slow read under materialization load must not un-vouch
+// fpWedgeStrikes debounces the File Provider deep-probe wedged verdict: one
+// transient slow read under materialization load must not un-vouch
 // a domain serving live sessions.
 const fpWedgeStrikes = 2
 
@@ -52,9 +52,8 @@ const fpWedgeStrikes = 2
 const fpRecoveryBreaker = 5
 
 // fpDeepProbeInterval spaces the slow deep re-probe of a HEALTHY File Provider row:
-// routine liveness rides the cheap shallow probe every tick, but only the deep
-// byte-count probe catches the serve-stale / 0-byte wedge (FPFS lies at size 0), so
-// it runs on this interval instead of every tick.
+// the byte-count probe catches the serve-stale / 0-byte wedge (FPFS lies at size
+// 0), so it runs on this interval instead of every healer tick.
 const fpDeepProbeInterval = 5 * time.Minute
 
 // fpRecoveryBackoff spaces a wedged domain's recovery attempts: 30s after the
@@ -153,9 +152,6 @@ var policies = map[string]policy{
 		breaker:  fpRecoveryBreaker,
 		onTrip:   tripPark,
 	},
-	// fp.shallow: the SHALLOW wedge lane — a pure debounce kept apart from fp.domain so a
-	// clean shallow tick clears only shallow strikes. Its latch force-faults fp.domain.
-	"fp.shallow": {name: "fp.shallow", debounce: fpWedgeStrikes},
 	// auth.streak: consecutive definitive needs-login verdicts; the trip gates
 	// polling (the 15m needsLoginPollInterval is cadence the consumer applies).
 	"auth.streak": {name: "auth.streak", debounce: needsLoginAfter, onTrip: tripGate},

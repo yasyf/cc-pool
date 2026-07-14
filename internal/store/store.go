@@ -92,6 +92,12 @@ CREATE TABLE IF NOT EXISTS journal_risks (
 CREATE INDEX IF NOT EXISTS idx_accounts_uuid ON accounts(account_uuid);
 `
 
+const upsertStickySQL = `INSERT INTO sticky(cwd,account_id,selected_at,manual) VALUES(?,?,?,0)
+ ON CONFLICT(cwd) DO UPDATE SET
+   account_id=excluded.account_id,
+   selected_at=excluded.selected_at
+ WHERE manual = 0 OR account_id = excluded.account_id`
+
 // Open opens (creating if needed) the database at path and applies the schema.
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)")
@@ -441,6 +447,40 @@ func (s *Store) OpenSession(accountID, pid int, configDir, cwd string, at time.T
 	return res.LastInsertId()
 }
 
+// CommitSelection atomically records the delayed effects of a provisional
+// selection. A non-empty cwd is recorded only when recordSticky is true, and a
+// session is opened only when pid is positive.
+func (s *Store) CommitSelection(accountID, pid int, configDir, cwd string, at time.Time, recordSticky bool) (err error) {
+	if pid <= 0 && (!recordSticky || cwd == "") {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin selection commit: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	if recordSticky && cwd != "" {
+		if _, err = tx.Exec(upsertStickySQL, cwd, accountID, at.Unix()); err != nil {
+			return fmt.Errorf("commit selection sticky for %s: %w", cwd, err)
+		}
+	}
+	if pid > 0 {
+		if _, err = tx.Exec(
+			`INSERT INTO sessions(account_id,pid,config_dir,cwd,started_at) VALUES(?,?,?,?,?)`,
+			accountID, pid, configDir, cwd, at.Unix()); err != nil {
+			return fmt.Errorf("commit selection session for account %d: %w", accountID, err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit selection transaction: %w", err)
+	}
+	return nil
+}
+
 // CloseSession marks a session ended by id at time at.
 func (s *Store) CloseSession(id int64, at time.Time) error {
 	_, err := s.db.Exec(`UPDATE sessions SET ended_at=? WHERE id=? AND ended_at IS NULL`,
@@ -559,13 +599,7 @@ func (s *Store) GetCwdActivity(cwd string, accountID int) (CwdActivity, error) {
 // account, and is a no-op when a manual pin points elsewhere. One atomic
 // statement, since the daemon and a live-path CLI would race a read-modify-write.
 func (s *Store) UpsertSticky(cwd string, accountID int, at time.Time) error {
-	_, err := s.db.Exec(
-		`INSERT INTO sticky(cwd,account_id,selected_at,manual) VALUES(?,?,?,0)
-		 ON CONFLICT(cwd) DO UPDATE SET
-		   account_id=excluded.account_id,
-		   selected_at=excluded.selected_at
-		 WHERE manual = 0 OR account_id = excluded.account_id`,
-		cwd, accountID, at.Unix())
+	_, err := s.db.Exec(upsertStickySQL, cwd, accountID, at.Unix())
 	if err != nil {
 		return fmt.Errorf("upsert sticky for %s: %w", cwd, err)
 	}

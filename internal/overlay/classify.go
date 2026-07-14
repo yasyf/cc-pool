@@ -82,6 +82,7 @@ var PrivatePatterns = []string{"*.lock"}
 func PrivateEntry(name string) bool {
 	if ExcludedEntries[name] ||
 		name == ".claude.json" || strings.HasPrefix(name, ".claude.json.") ||
+		strings.HasPrefix(name, "settings.json.tmp.") ||
 		name == ".credentials.json" || strings.HasPrefix(name, ".credentials.json.") ||
 		strings.HasPrefix(name, ".last-update-result") ||
 		name == "remote-settings.json" || strings.HasPrefix(name, "remote-settings.json.") ||
@@ -123,6 +124,7 @@ func sharedTopLevel(name string) bool {
 // they are the one private-name policy.
 var PrivatePrefixes = []string{
 	".claude.json",
+	"settings.json.tmp.",
 	".credentials.json",
 	".last-update-result",
 	"remote-settings.json",

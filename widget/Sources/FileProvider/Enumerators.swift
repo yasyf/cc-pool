@@ -7,6 +7,7 @@ import Foundation
 /// an anchor the map can't reproduce is expired by construction.
 struct AnchorStore {
     private let dir: URL
+    private let lock = NSLock()
 
     init(domainID: String,
          root: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]) {
@@ -21,6 +22,12 @@ struct AnchorStore {
     }
 
     func load(_ container: NSFileProviderItemIdentifier) -> [String: String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return loadUnlocked(container)
+    }
+
+    private func loadUnlocked(_ container: NSFileProviderItemIdentifier) -> [String: String] {
         guard let data = try? Data(contentsOf: file(container)),
               let map = try? JSONDecoder().decode([String: String].self, from: data)
         else { return [:] }
@@ -28,8 +35,26 @@ struct AnchorStore {
     }
 
     func save(_ container: NSFileProviderItemIdentifier, _ map: [String: String]) {
-        guard let data = try? JSONEncoder().encode(map) else { return }
-        try? data.write(to: file(container), options: .atomic)
+        lock.lock()
+        defer { lock.unlock() }
+        try? saveUnlocked(container, map)
+    }
+
+    func remove(_ identifier: NSFileProviderItemIdentifier,
+                from containers: [NSFileProviderItemIdentifier]) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        for container in containers {
+            var map = loadUnlocked(container)
+            map.removeValue(forKey: identifier.rawValue)
+            try saveUnlocked(container, map)
+        }
+    }
+
+    private func saveUnlocked(_ container: NSFileProviderItemIdentifier,
+                              _ map: [String: String]) throws {
+        let data = try JSONEncoder().encode(map)
+        try data.write(to: file(container), options: .atomic)
     }
 
     /// SHA256 over sorted "id\t<contentVersionHex>" lines.

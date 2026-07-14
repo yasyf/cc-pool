@@ -220,8 +220,8 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		}
 		// Absolute pin, not == ProtocolVersion: deployed widgets hard-reject other
 		// values. A bump must update supportedProto in widget/Sources/Widget/Provider.swift.
-		if got := string(top["proto"]); got != "1" {
-			t.Errorf("snapshot proto = %s; the on-disk format is pinned at 1 for the widget", got)
+		if got := string(top["proto"]); got != "2" {
+			t.Errorf("snapshot proto = %s; the on-disk format is pinned at 2 for the widget", got)
 		}
 
 		var accounts []map[string]json.RawMessage

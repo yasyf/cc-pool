@@ -11,6 +11,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
@@ -456,6 +457,62 @@ func (m *Manager) SyncOverlay(a store.Account) error {
 		return fmt.Errorf("sync overlay for acct-%02d: resolve provider: %w", a.ID, err)
 	}
 	return prov.Sync(ClaudeDir(), a.ConfigDir)
+}
+
+type contextOverlaySyncer interface {
+	SyncContext(ctx context.Context, base, accountDir string) error
+}
+
+// SyncOverlayContext is the launch-bound form of SyncOverlay. File Provider
+// control calls receive ctx directly instead of the provider's background
+// context; injected providers may implement contextOverlaySyncer themselves.
+func (m *Manager) SyncOverlayContext(ctx context.Context, a store.Account) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	backend, err := fkoverlay.Parse(a.OverlayKind)
+	if err != nil {
+		return fmt.Errorf("sync overlay for acct-%02d: parse stored backend: %w", a.ID, err)
+	}
+	prov, err := m.overlayFor(backend)
+	if err != nil {
+		return fmt.Errorf("sync overlay for acct-%02d: resolve provider: %w", a.ID, err)
+	}
+	if syncer, ok := prov.(contextOverlaySyncer); ok {
+		return syncer.SyncContext(ctx, ClaudeDir(), a.ConfigDir)
+	}
+	if backend == fkoverlay.BackendFileProvider && m.OverlayFor == nil {
+		return m.syncFileProviderContext(ctx, a)
+	}
+	if err := prov.Sync(ClaudeDir(), a.ConfigDir); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+func (m *Manager) syncFileProviderContext(ctx context.Context, a store.Account) error {
+	spec := m.overlaySpec().FileProvider
+	host := &fileproviderd.RemoteDomainHost{
+		AppPath:       spec.AppPath,
+		ControlSocket: spec.ControlSocket,
+		SpawnTimeout:  spec.SpawnTimeout,
+		LaunchTimeout: spec.LaunchTimeout,
+	}
+	domain := filepath.Base(a.ConfigDir)
+	root, err := host.Ensure(ctx, domain)
+	if err != nil {
+		return fmt.Errorf("file provider sync %s: %w", a.ConfigDir, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := fileproviderd.AtomicSymlink(a.ConfigDir, root); err != nil {
+		return fmt.Errorf("file provider sync %s: %w", a.ConfigDir, err)
+	}
+	if err := host.Signal(ctx, domain); err != nil {
+		return fmt.Errorf("file provider sync %s: signal: %w", a.ConfigDir, err)
+	}
+	return ctx.Err()
 }
 
 // ensureOverlayKind returns the new-account overlay backend: the one recorded at

@@ -86,7 +86,7 @@ func (f *fakeDaemon) serve() {
 			_ = conn.Close() // probe dial (e.g. WaitGone) with no request body
 			continue
 		}
-		_ = json.NewEncoder(conn).Encode(Response{OK: true, Version: f.version})
+		_ = json.NewEncoder(conn).Encode(Response{Proto: ProtocolVersion, OK: true, Version: f.version})
 		_ = conn.Close()
 		if req.Op == OpShutdown && f.releaseOnStop {
 			if f.lockDelay > 0 {

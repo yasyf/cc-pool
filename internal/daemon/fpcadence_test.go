@@ -23,26 +23,25 @@ func parkFP(t *testing.T, s *Server, dir string) {
 }
 
 // TestHealFPRowsCadence pins the per-tick probe cadence by state class: healthy
-// rows shallow-probe every tick and deep-probe only on the fpDeepProbeInterval;
+// rows do no work until the fpDeepProbeInterval and then deep-probe once;
 // a wedged-not-due row is skipped entirely; a due wedge takes one deep verdict; a
 // parked row re-probes DEEP only on the backoff-cap window (shallow-listable is not
 // proof a serve-stale domain recovered).
 func TestHealFPRowsCadence(t *testing.T) {
 	cases := []struct {
-		name        string
-		setup       func(t *testing.T, s *Server, dir string)
-		wantShallow int
-		wantDeep    int
+		name     string
+		setup    func(t *testing.T, s *Server, dir string)
+		wantDeep int
 	}{
 		{
-			name:        "healthy, deep not due: shallow only",
-			setup:       func(_ *testing.T, s *Server, dir string) { s.recordFPProbeClock(dir, time.Now()) },
-			wantShallow: 1, wantDeep: 0,
+			name:     "healthy, deep not due: no probe",
+			setup:    func(_ *testing.T, s *Server, dir string) { s.recordFPProbeClock(dir, time.Now()) },
+			wantDeep: 0,
 		},
 		{
-			name:        "healthy, deep due: shallow then deep",
-			setup:       func(_ *testing.T, _ *Server, _ string) {}, // never clocked -> deep due
-			wantShallow: 1, wantDeep: 1,
+			name:     "healthy, deep due: deep only",
+			setup:    func(_ *testing.T, _ *Server, _ string) {}, // never clocked -> deep due
+			wantDeep: 1,
 		},
 		{
 			name: "wedged, not due: no probe (the ladder owns it)",
@@ -50,7 +49,7 @@ func TestHealFPRowsCadence(t *testing.T) {
 				wedgeIt(t, s, dir)
 				s.fpRecordAttempt(dir, time.Now()) // booked -> backing off, not due
 			},
-			wantShallow: 0, wantDeep: 0,
+			wantDeep: 0,
 		},
 		{
 			name: "wedged, recovery due: deep only",
@@ -58,7 +57,7 @@ func TestHealFPRowsCadence(t *testing.T) {
 				wedgeIt(t, s, dir)
 				fpForceRecoveryDue(t, s, dir)
 			},
-			wantShallow: 0, wantDeep: 1,
+			wantDeep: 1,
 		},
 		{
 			name: "parked, re-probe due: deep only",
@@ -66,7 +65,7 @@ func TestHealFPRowsCadence(t *testing.T) {
 				wedgeIt(t, s, dir)
 				parkFP(t, s, dir) // unclocked -> parked re-probe due
 			},
-			wantShallow: 0, wantDeep: 1,
+			wantDeep: 1,
 		},
 		{
 			name: "parked, re-probe not due: no probe",
@@ -75,7 +74,7 @@ func TestHealFPRowsCadence(t *testing.T) {
 				parkFP(t, s, dir)
 				s.recordFPProbeClock(dir, time.Now())
 			},
-			wantShallow: 0, wantDeep: 0,
+			wantDeep: 0,
 		},
 	}
 	for _, tc := range cases {
@@ -83,35 +82,35 @@ func TestHealFPRowsCadence(t *testing.T) {
 			s, _, dirs, _ := newFPHealServer(t)
 			s.fpBridgeReadyFn = func() bool { return true }
 			swapFPDirLinked(t, func(string) bool { return true })
-			var shallow, deep int
-			swapFPDomainProbeShallow(t, func(_ context.Context, _ string) error { shallow++; return nil })
+			var deep int
 			swapFPDomainProbe(t, func(_ context.Context, _ string) error { deep++; return nil })
 			tc.setup(t, s, dirs[1])
 
 			s.healFPRows(t.Context())
 
-			if shallow != tc.wantShallow || deep != tc.wantDeep {
-				t.Fatalf("shallow=%d deep=%d, want shallow=%d deep=%d", shallow, deep, tc.wantShallow, tc.wantDeep)
+			if deep != tc.wantDeep {
+				t.Fatalf("deep=%d, want %d", deep, tc.wantDeep)
 			}
 		})
 	}
 }
 
-// TestHealFPRowsShallowFailureStrikes pins that a shallow wedge verdict strikes
-// through the 2-strike debounce, exactly like a deep one.
-func TestHealFPRowsShallowFailureStrikes(t *testing.T) {
+// TestHealFPRowsDeepFailureStrikes pins that periodic deep failures still cross
+// the 2-strike debounce even though healthy ticks no longer enumerate domains.
+func TestHealFPRowsDeepFailureStrikes(t *testing.T) {
 	s, _, dirs, _ := newFPHealServer(t)
 	s.fpBridgeReadyFn = func() bool { return true }
 	swapFPDirLinked(t, func(string) bool { return true })
-	swapFPDomainProbeShallow(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeWedged })
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeWedged })
 
 	s.healFPRows(t.Context())
 	if s.fpWedged(dirs[1]) {
-		t.Fatal("one shallow strike must not wedge (2-strike debounce)")
+		t.Fatal("one deep strike must not wedge (2-strike debounce)")
 	}
+	forceFPDeepProbeDue(s, dirs[1])
 	s.healFPRows(t.Context())
 	if !s.fpWedged(dirs[1]) {
-		t.Fatalf("%d consecutive shallow wedge strikes must mark the domain wedged", fpWedgeStrikes)
+		t.Fatalf("%d consecutive deep wedge strikes must mark the domain wedged", fpWedgeStrikes)
 	}
 }
 
@@ -124,26 +123,23 @@ func forceFPDeepProbeDue(s *Server, dir string) {
 	s.fpProbeClockMu.Unlock()
 }
 
-// TestHealFPRowsDeepOnlyFailureLatches is the G-X3 regression: a persistent deep-only
-// wedge (shallow keeps succeeding, deep keeps failing) must still latch the wedge
-// after fpWedgeStrikes deep failures — the interleaved clean shallow ticks must not
-// erase the accumulating deep strike. A later clean deep probe then clears it.
+// TestHealFPRowsDeepOnlyFailureLatches pins that a persistent deep failure latches
+// after fpWedgeStrikes failures and a later clean deep probe clears it.
 func TestHealFPRowsDeepOnlyFailureLatches(t *testing.T) {
 	s, _, dirs, _ := newFPHealServer(t)
 	s.fpBridgeReadyFn = func() bool { return true }
 	swapFPDirLinked(t, func(string) bool { return true })
-	swapFPDomainProbeShallow(t, func(_ context.Context, _ string) error { return nil })              // shallow always OK
 	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeEmpty }) // deep serve-stale on a non-empty synth
 
 	for i := 0; i < fpWedgeStrikes; i++ {
 		if s.fpWedged(dirs[1]) {
 			t.Fatalf("wedged after %d deep strikes, want only after %d", i, fpWedgeStrikes)
 		}
-		forceFPDeepProbeDue(s, dirs[1]) // each tick both shallow-clears and deep-strikes
+		forceFPDeepProbeDue(s, dirs[1])
 		s.healFPRows(t.Context())
 	}
 	if !s.fpWedged(dirs[1]) {
-		t.Fatalf("%d consecutive deep failures interleaved with clean shallow ticks must latch the wedge", fpWedgeStrikes)
+		t.Fatalf("%d consecutive deep failures must latch the wedge", fpWedgeStrikes)
 	}
 
 	// A clean deep probe on the due window clears the deep wedge and its ladder.
@@ -155,24 +151,6 @@ func TestHealFPRowsDeepOnlyFailureLatches(t *testing.T) {
 	}
 	if s.fpAttemptsSoFar(dirs[1]) != 0 {
 		t.Fatalf("recovery must reset the ladder: attemptsSoFar=%d, want 0", s.fpAttemptsSoFar(dirs[1]))
-	}
-}
-
-// TestHealFPRowsShallowCleanKeepsDeepStrike is the narrow G-X3 unit: a clean shallow
-// tick between two deep failures must not reset the single accumulated deep strike.
-func TestHealFPRowsShallowCleanKeepsDeepStrike(t *testing.T) {
-	s := newFPLedgerServer(alwaysNonEmpty)
-	// One deep strike, below the debounce.
-	s.recordFPProbe(fpTestDir, overlay.ErrFPProbeEmpty)
-	if s.fpWedged(fpTestDir) {
-		t.Fatal("one deep strike must not wedge")
-	}
-	// A clean shallow tick must NOT erase it (the old shared-ledger clear did).
-	s.recordFPShallow(fpTestDir, nil)
-	// The second deep strike now latches.
-	s.recordFPProbe(fpTestDir, overlay.ErrFPProbeEmpty)
-	if !s.fpWedged(fpTestDir) {
-		t.Fatal("a clean shallow tick erased an accumulating deep strike: deep wedge never latched")
 	}
 }
 
@@ -192,14 +170,13 @@ func TestHealFPRowsParkedReprobesDeep(t *testing.T) {
 
 	t.Run("shallow-listable but deep-empty stays parked", func(t *testing.T) {
 		s, dirs := newParked(t)
-		var shallow, deep int
-		swapFPDomainProbeShallow(t, func(_ context.Context, _ string) error { shallow++; return nil })
+		var deep int
 		swapFPDomainProbe(t, func(_ context.Context, _ string) error { deep++; return overlay.ErrFPProbeEmpty })
 
 		s.healFPRows(t.Context())
 
-		if shallow != 0 || deep != 1 {
-			t.Fatalf("parked re-probe: shallow=%d deep=%d, want 0/1 (deep-only)", shallow, deep)
+		if deep != 1 {
+			t.Fatalf("parked re-probe: deep=%d, want 1", deep)
 		}
 		if !s.fpParked(dirs[1]) {
 			t.Fatal("a deep-empty parked re-probe must keep the domain parked (shallow-listable is not serving)")
@@ -245,7 +222,6 @@ func TestHealFPRowsPrunesVanishedRowLedger(t *testing.T) {
 	// first tick because its stale clock was pruned.
 	setRowKind(t, s, 1, fkoverlay.BackendFileProvider)
 	var deep int
-	swapFPDomainProbeShallow(t, func(_ context.Context, _ string) error { return nil })
 	swapFPDomainProbe(t, func(_ context.Context, _ string) error { deep++; return nil })
 
 	s.healFPRows(t.Context())

@@ -35,6 +35,10 @@ import (
 // visible to procscan.
 const reservationTTL = 30 * time.Second
 
+// provisionalSelectionTTL outlives the CLI's 60-second cross-account launch
+// budget; committed reservations still use reservationTTL only until procscan sees claude.
+const provisionalSelectionTTL = 90 * time.Second
+
 // preflightTimeout bounds a best-effort preflight refresh so shutdown is never
 // blocked on a slow network refresh.
 const preflightTimeout = 8 * time.Second
@@ -96,7 +100,10 @@ type Server struct {
 
 	// cl is the account-claim discipline: select reservations plus poll, convert,
 	// and pool-wide claims (see claims.go). It owns its own mutex.
-	cl *claims
+	cl             *claims
+	selectMu       sync.Mutex
+	selectPending  map[string]pendingSelect
+	selectTerminal map[string]terminalSelect
 
 	// netOutage is set when a full poll sweep found every attempted account
 	// failing network-class (an outage). While set, the scheduler drops to a
@@ -184,6 +191,22 @@ type Server struct {
 	// syncPull runs one converge pull for the invalid_grant self-heal (syncHeal)
 	// and the on-demand preflight pull; nil ⇒ sync disabled.
 	syncPull func(ctx context.Context) error
+}
+
+type pendingSelect struct {
+	accountID    int
+	pid          int
+	cwd          string
+	mark         bool
+	recordSticky bool
+	createdAt    time.Time
+	committing   bool
+	done         chan struct{}
+}
+
+type terminalSelect struct {
+	response  Response
+	createdAt time.Time
 }
 
 // Run is the entry point for `cc-pool daemon`. It blocks until the process
@@ -394,6 +417,10 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		writeResp(conn, Response{OK: false, Error: "bad request: " + err.Error()})
 		return
 	}
+	if req.Proto != ProtocolVersion {
+		writeResp(conn, Response{OK: false, Error: fmt.Sprintf("unsupported protocol %d; want %d", req.Proto, ProtocolVersion)})
+		return
+	}
 	if req.Op == OpMigrate || req.Op == OpCredMove || req.Op == OpFPRepair {
 		// These ops legitimately outlive the 10s deadline (migrate: a probe
 		// mount plus up to an 8s wait and a bounded rollback per account;
@@ -420,6 +447,10 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 		return s.handleStatus(ctx)
 	case OpSelect:
 		return s.handleSelect(ctx, req)
+	case OpSelectCommit:
+		return s.handleSelectCommit(ctx, req)
+	case OpSelectAbort:
+		return s.handleSelectAbort(ctx, req)
 	case OpCheckin:
 		return s.handleCheckin(ctx, req)
 	case OpMigrate:
@@ -512,9 +543,10 @@ func (s *Server) statuses(ctx context.Context) ([]AccountStatus, error) {
 }
 
 // handleSelect picks the best available account from cached scores, applying
-// short-lived reservations to avoid two selects colliding, and records a
-// reservation for the winner.
+// short-lived reservations to avoid two selects colliding. Session and sticky
+// effects remain provisional until handleSelectCommit consumes the token.
 func (s *Server) handleSelect(ctx context.Context, req Request) Response {
+	s.prunePendingSelects(time.Now())
 	snaps, err := s.m.Snapshots(ctx, false, 0)
 	if err != nil {
 		return Response{OK: false, Error: err.Error()}
@@ -523,7 +555,14 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		return Response{OK: false, Error: pool.ErrNoAccounts.Error()}
 	}
 
+	excluded := make(map[int]bool, len(req.ExcludeIDs))
+	for _, id := range req.ExcludeIDs {
+		excluded[id] = true
+	}
 	if req.Account != nil {
+		if excluded[*req.Account] {
+			return Response{OK: false, Error: fmt.Sprintf("forced account %d is excluded", *req.Account)}
+		}
 		for _, sn := range snaps {
 			if sn.Account.ID == *req.Account {
 				if !s.mountReady(sn.Account) {
@@ -539,19 +578,19 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 				if !s.probeWinnerReady(ctx, sn.Account) {
 					return Response{OK: false, Error: fmt.Sprintf("acct-%02d's overlay is wedged; the daemon is recovering it — retry shortly", sn.Account.ID)}
 				}
-				if !s.cl.reserve(sn.Account.ID) {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d is migrating overlays; retry shortly", sn.Account.ID)}
-				}
-				if !req.NoMark && req.PID > 0 {
-					if _, err := s.m.Store.OpenSession(sn.Account.ID, req.PID, sn.Account.ConfigDir, req.Cwd, time.Now()); err != nil {
-						s.log.Printf("open session for acct-%02d pid %d: %v", sn.Account.ID, req.PID, err)
+				token, err := s.cl.beginReservation(sn.Account.ID)
+				if err != nil {
+					if errors.Is(err, errAccountConverting) {
+						return Response{OK: false, Error: fmt.Sprintf("acct-%02d is migrating overlays; retry shortly", sn.Account.ID)}
 					}
+					return Response{OK: false, Error: fmt.Sprintf("reserve acct-%02d: %v", sn.Account.ID, err)}
 				}
-				s.recordSticky(req.Cwd, sn.Account.ID)
+				s.storePendingSelect(token, pendingSelect{accountID: sn.Account.ID, pid: req.PID, cwd: req.Cwd, mark: !req.NoMark, recordSticky: true, createdAt: time.Now()})
 				id := sn.Account.ID
 				return Response{
 					OK: true, Dir: sn.Account.ConfigDir, SelectedID: &id,
-					Remaining5h: sn.Remaining5h, Remaining7d: sn.Remaining7d, HasUsage: sn.HasUsage,
+					ReservationToken: token,
+					Remaining5h:      sn.Remaining5h, Remaining7d: sn.Remaining7d, HasUsage: sn.HasUsage,
 					Scoped7dUtil: sn.Scoped7dUtil, Scoped7dModel: sn.Scoped7dModel,
 				}
 			}
@@ -572,13 +611,21 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	// a session — its config dir is not in a usable shape. Exclude, don't
 	// penalize.
 	usable := make([]pool.Snapshot, 0, len(snaps))
+	excludedReady := false
 	for _, sn := range snaps {
 		if s.cl.held(sn.Account.ID) || !s.mountReady(sn.Account) {
+			continue
+		}
+		if excluded[sn.Account.ID] {
+			excludedReady = true
 			continue
 		}
 		usable = append(usable, sn)
 	}
 	if len(usable) == 0 {
+		if excludedReady {
+			return Response{OK: false, Error: pool.ErrNoneAvailable.Error(), NoneAvailable: true}
+		}
 		soonest := soonestReset(snaps)
 		resp := Response{OK: false, Error: pool.ErrMountsNotReady.Error(), NoneAvailable: true, MountsNotReady: true}
 		if !soonest.IsZero() {
@@ -619,24 +666,18 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	if !s.probeWinnerReady(ctx, best.Account) {
 		return Response{OK: false, Error: fmt.Sprintf("acct-%02d's overlay is wedged; the daemon is recovering it — retry shortly", best.Account.ID)}
 	}
-	if !req.NoMark {
-		if !s.cl.reserve(best.Account.ID) {
-			// A conversion claimed the winner between the filter above and
-			// here — vanishingly rare; the client just retries.
-			return Response{OK: false, Error: fmt.Sprintf("acct-%02d began migrating overlays mid-select; retry shortly", best.Account.ID)}
-		}
-		if req.PID > 0 {
-			if _, err := s.m.Store.OpenSession(best.Account.ID, req.PID, best.Account.ConfigDir, req.Cwd, time.Now()); err != nil {
-				s.log.Printf("open session for acct-%02d pid %d: %v", best.Account.ID, req.PID, err)
-			}
-		}
+	token, err := s.cl.beginReservation(best.Account.ID)
+	if errors.Is(err, errAccountConverting) {
+		// A conversion claimed the winner between the filter above and here.
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d began migrating overlays mid-select; retry shortly", best.Account.ID)}
 	}
-	// Record regardless of NoMark (cache continuity is established by no-mark
-	// selects too) — but never over a held pin, unless the free ranking landed
-	// on the pinned account anyway, which is genuine pin activity.
-	if !outcome.Held() || best.Account.ID == pin.AccountID {
-		s.recordSticky(req.Cwd, best.Account.ID)
+	if err != nil {
+		return Response{OK: false, Error: fmt.Sprintf("reserve acct-%02d: %v", best.Account.ID, err)}
 	}
+	s.storePendingSelect(token, pendingSelect{
+		accountID: best.Account.ID, pid: req.PID, cwd: req.Cwd, mark: !req.NoMark,
+		recordSticky: !outcome.Held() || best.Account.ID == pin.AccountID, createdAt: time.Now(),
+	})
 	s.log.Printf("select%s: %s -> acct-%02d (score %.1f · 5h %.0f%% used · 7d %.0f%% used%s)",
 		selectKind(outcome, fallback), req.Cwd, best.Account.ID,
 		r.Score, best.Util5h, best.Util7d, runnerUp(ranked, r.AccountID, fallback))
@@ -665,8 +706,9 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	}()
 	resp := Response{
 		OK: true, Dir: best.Account.ConfigDir, SelectedID: &id,
-		Sticky:      outcome == pool.StickyBind,
-		Remaining5h: best.Remaining5h, Remaining7d: best.Remaining7d, HasUsage: best.HasUsage,
+		ReservationToken: token,
+		Sticky:           outcome == pool.StickyBind,
+		Remaining5h:      best.Remaining5h, Remaining7d: best.Remaining7d, HasUsage: best.HasUsage,
 		ExhaustedFallback: fallback, ExtraEnabled: best.ExtraEnabled,
 		Scoped7dUtil: best.Scoped7dUtil, Scoped7dModel: best.Scoped7dModel,
 	}
@@ -680,6 +722,138 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		resp.SoonestReset = &r.ExhaustedUntil
 	}
 	return resp
+}
+
+func (s *Server) storePendingSelect(token string, pending pendingSelect) {
+	s.selectMu.Lock()
+	defer s.selectMu.Unlock()
+	if s.selectPending == nil {
+		s.selectPending = map[string]pendingSelect{}
+	}
+	s.selectPending[token] = pending
+}
+
+func (s *Server) handleSelectCommit(ctx context.Context, req Request) Response {
+	if req.ReservationToken == "" {
+		return Response{OK: false, Error: "select commit requires a reservation token"}
+	}
+	for {
+		s.selectMu.Lock()
+		if terminal, ok := s.selectTerminal[req.ReservationToken]; ok {
+			s.selectMu.Unlock()
+			return terminal.response
+		}
+		pending, ok := s.selectPending[req.ReservationToken]
+		if !ok {
+			s.selectMu.Unlock()
+			return Response{OK: false, Error: "selection reservation is unknown or expired"}
+		}
+		if pending.committing {
+			done := pending.done
+			s.selectMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return Response{OK: false, Error: ctx.Err().Error()}
+			case <-done:
+				continue
+			}
+		}
+		pending.committing = true
+		pending.done = make(chan struct{})
+		s.selectPending[req.ReservationToken] = pending
+		s.selectMu.Unlock()
+
+		resp := s.commitPendingSelect(req.ReservationToken, pending)
+		s.selectMu.Lock()
+		delete(s.selectPending, req.ReservationToken)
+		if s.selectTerminal == nil {
+			s.selectTerminal = map[string]terminalSelect{}
+		}
+		s.selectTerminal[req.ReservationToken] = terminalSelect{response: resp, createdAt: time.Now()}
+		close(pending.done)
+		s.selectMu.Unlock()
+		return resp
+	}
+}
+
+func (s *Server) commitPendingSelect(token string, pending pendingSelect) Response {
+	pid := 0
+	configDir := ""
+	if pending.mark && pending.pid > 0 {
+		a, err := s.m.Store.GetAccount(pending.accountID)
+		if err != nil {
+			s.cl.abortReservation(token)
+			return Response{OK: false, Error: fmt.Sprintf("commit selection account %d: %v", pending.accountID, err)}
+		}
+		pid = pending.pid
+		configDir = a.ConfigDir
+	}
+	id, ok := s.cl.commitReservation(token)
+	if !ok {
+		return Response{OK: false, Error: "selection reservation is unknown or expired"}
+	}
+	if id != pending.accountID {
+		s.cl.releaseCommittedReservation(token)
+		return Response{OK: false, Error: "selection reservation account does not match"}
+	}
+	if err := s.m.Store.CommitSelection(pending.accountID, pid, configDir, pending.cwd, time.Now(), pending.recordSticky); err != nil {
+		s.cl.releaseCommittedReservation(token)
+		return Response{OK: false, Error: fmt.Sprintf("commit selection for account %d: %v", pending.accountID, err)}
+	}
+	return Response{OK: true}
+}
+
+func (s *Server) handleSelectAbort(ctx context.Context, req Request) Response {
+	if req.ReservationToken == "" {
+		return Response{OK: false, Error: "select abort requires a reservation token"}
+	}
+	for {
+		s.selectMu.Lock()
+		if _, ok := s.selectTerminal[req.ReservationToken]; ok {
+			s.selectMu.Unlock()
+			return Response{OK: true}
+		}
+		pending, ok := s.selectPending[req.ReservationToken]
+		if !ok {
+			s.selectMu.Unlock()
+			s.cl.abortReservation(req.ReservationToken)
+			return Response{OK: true}
+		}
+		if pending.committing {
+			done := pending.done
+			s.selectMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return Response{OK: false, Error: ctx.Err().Error()}
+			case <-done:
+				continue
+			}
+		}
+		delete(s.selectPending, req.ReservationToken)
+		s.selectMu.Unlock()
+		s.cl.abortReservation(req.ReservationToken)
+		return Response{OK: true}
+	}
+}
+
+func (s *Server) prunePendingSelects(now time.Time) {
+	var expired []string
+	s.selectMu.Lock()
+	for token, pending := range s.selectPending {
+		if !pending.committing && now.Sub(pending.createdAt) > provisionalSelectionTTL {
+			delete(s.selectPending, token)
+			expired = append(expired, token)
+		}
+	}
+	for token, terminal := range s.selectTerminal {
+		if now.Sub(terminal.createdAt) > provisionalSelectionTTL {
+			delete(s.selectTerminal, token)
+		}
+	}
+	s.selectMu.Unlock()
+	for _, token := range expired {
+		s.cl.abortReservation(token)
+	}
 }
 
 // selectKind renders the select log qualifier. A bind and a fallback are
@@ -714,14 +888,6 @@ func runnerUp(ranked []score.Result, winnerID int, fallback bool) string {
 		return fmt.Sprintf(" · runner-up acct-%02d %.1f", r.AccountID, r.Score)
 	}
 	return ""
-}
-
-// recordSticky upserts the cwd->account sticky record, logging (not failing)
-// on error.
-func (s *Server) recordSticky(cwd string, accountID int) {
-	if err := s.m.RecordSticky(cwd, accountID, time.Now()); err != nil {
-		s.log.Printf("record sticky for %s: %v", cwd, err)
-	}
 }
 
 // handleCheckin closes sessions for a pid and adopts any rotated token.

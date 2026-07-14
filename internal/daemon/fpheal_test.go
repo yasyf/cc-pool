@@ -40,15 +40,6 @@ func swapFPDomainProbe(t *testing.T, fn func(context.Context, string) error) {
 	t.Cleanup(func() { fpDomainProbe = prev })
 }
 
-// swapFPDomainProbeShallow overrides the package-level SHALLOW FP probe seam (the
-// routine-liveness probe healthy/parked rows run) for one test.
-func swapFPDomainProbeShallow(t *testing.T, fn func(context.Context, string) error) {
-	t.Helper()
-	prev := fpDomainProbeShallow
-	fpDomainProbeShallow = fn
-	t.Cleanup(func() { fpDomainProbeShallow = prev })
-}
-
 // fpForceRecoveryDue zeroes a wedged dir's backoff clock so the next healFPRows tick
 // treats it as due for a recovery attempt (healFPRows reads wall-clock time.Now,
 // which a test cannot advance).
@@ -269,7 +260,7 @@ func TestFPHealReRegisterRetreatsOnCannotControl(t *testing.T) {
 	}
 }
 
-// TestHealFPRowsDetectsWedgeThenRecovers pins the ticker-driven flow: two shallow
+// TestHealFPRowsDetectsWedgeThenRecovers pins the ticker-driven flow: two periodic deep
 // wedged probes cross the strike threshold (attempt 1 fires), and a later deep
 // due-window probe (healthy) clears the verdict and the ladder.
 func TestHealFPRowsDetectsWedgeThenRecovers(t *testing.T) {
@@ -277,29 +268,24 @@ func TestHealFPRowsDetectsWedgeThenRecovers(t *testing.T) {
 	s.fpBridgeReadyFn = func() bool { return true }
 	swapFPDirLinked(t, func(string) bool { return true })
 
-	// Healthy rows run the SHALLOW probe every tick; keep the deep seam a NoVerdict so
-	// a stray deep call cannot influence the verdict.
-	var shallow, deep int
-	swapFPDomainProbeShallow(t, func(_ context.Context, _ string) error { shallow++; return overlay.ErrFPProbeWedged })
-	swapFPDomainProbe(t, func(_ context.Context, _ string) error { deep++; return overlay.ErrFPProbeNoVerdict })
+	var deep int
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { deep++; return overlay.ErrFPProbeWedged })
 
-	s.healFPRows(t.Context()) // shallow strike 1: not wedged yet, no heal
+	s.healFPRows(t.Context()) // deep strike 1: not wedged yet, no heal
 	if s.fpWedged(dirs[1]) {
 		t.Fatal("one strike must not wedge (2-strike debounce)")
 	}
-	s.healFPRows(t.Context()) // shallow strike 2: wedged + due -> attempt 1 (Sync)
+	forceFPDeepProbeDue(s, dirs[1])
+	s.healFPRows(t.Context()) // deep strike 2: wedged + due -> attempt 1 (Sync)
 
 	if !s.fpWedged(dirs[1]) {
-		t.Fatal("two consecutive shallow wedged probes must mark the domain wedged")
+		t.Fatal("two consecutive deep wedged probes must mark the domain wedged")
 	}
 	if _, _, syncs, _ := fake.counts(); syncs != 1 {
 		t.Fatalf("attempt 1 (Sync) did not run on the wedge tick: syncs=%d, want 1", syncs)
 	}
-	if shallow != 2 {
-		t.Fatalf("healthy rows shallow-probed %d times over two ticks, want 2", shallow)
-	}
-	if deep != 0 {
-		t.Fatalf("a healthy row deep-probed %d times, want 0 (deep only every %s)", deep, fpDeepProbeInterval)
+	if deep != 2 {
+		t.Fatalf("healthy rows deep-probed %d times over two forced due windows, want 2", deep)
 	}
 
 	// The domain recovers. A wedged row is deep-probed only on the due window, so
@@ -568,8 +554,8 @@ func TestHealFPRowsMissingRoutesToControlPlaneHeal(t *testing.T) {
 	s.fpBridgeReadyFn = func() bool { return true }
 	swapFPDirLinked(t, func(string) bool { return true })
 	fake.healthErr = errors.New("no domain registered")
-	// A healthy row's routine tick is the SHALLOW probe (listed=false -> Missing).
-	swapFPDomainProbeShallow(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeMissing })
+	// The first healthy tick is deep-probe due (listed=false -> Missing).
+	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeMissing })
 
 	s.healFPRows(t.Context())
 

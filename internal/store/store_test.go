@@ -396,6 +396,69 @@ func TestSessionsReconcile(t *testing.T) {
 	}
 }
 
+func TestCommitSelectionAtomic(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().Truncate(time.Second)
+	if _, err := s.db.Exec(`
+		CREATE TRIGGER fail_session BEFORE INSERT ON sessions
+		BEGIN
+			SELECT RAISE(ABORT, 'forced session failure');
+		END`); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.CommitSelection(1, 4242, "/acct-01", "/proj", now, true)
+	if err == nil {
+		t.Fatal("CommitSelection succeeded with failing session insert")
+	}
+	if _, ok, getErr := s.GetSticky("/proj"); getErr != nil {
+		t.Fatal(getErr)
+	} else if ok {
+		t.Fatal("sticky write survived failed session insert")
+	}
+	if sessions, listErr := s.ListActiveSessions(); listErr != nil {
+		t.Fatal(listErr)
+	} else if len(sessions) != 0 {
+		t.Fatalf("sessions after failed commit = %+v", sessions)
+	}
+}
+
+func TestCommitSelectionConditionalEffects(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().Truncate(time.Second)
+	if err := s.CommitSelection(1, 4242, "/acct-01", "/proj", now, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.GetSticky("/proj"); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("recordSticky=false recorded sticky state")
+	}
+	sessions, err := s.ListActiveSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].PID != 4242 {
+		t.Fatalf("sessions = %+v, want pid 4242", sessions)
+	}
+
+	if err := s.CommitSelection(1, 0, "", "/sticky-only", now, true); err != nil {
+		t.Fatal(err)
+	}
+	if sticky, ok, err := s.GetSticky("/sticky-only"); err != nil {
+		t.Fatal(err)
+	} else if !ok || sticky.AccountID != 1 {
+		t.Fatalf("sticky = %+v ok=%v, want account 1", sticky, ok)
+	}
+	sessions, err = s.ListActiveSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("sticky-only commit opened a session: %+v", sessions)
+	}
+}
+
 func mustActive(t *testing.T, s *Store) []Session {
 	t.Helper()
 	live, err := s.ListActiveSessions()

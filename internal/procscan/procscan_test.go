@@ -207,14 +207,15 @@ func TestScanFailsClosedOnListError(t *testing.T) {
 }
 
 // TestScanSkipsGoneProcs proves a process that vanished (ESRCH), was reused by
-// another uid mid-scan (EPERM), or has no readable args (EINVAL) is skipped
+// another uid mid-scan (EPERM), has no readable args (EINVAL), or exits during
+// the kernel copyout (EIO) is skipped
 // without failing the scan, while a live claude alongside it is still reported.
 func TestScanSkipsGoneProcs(t *testing.T) {
-	procs := []proc{{pid: 501}, {pid: 777}, {pid: 888}, {pid: 999}}
+	procs := []proc{{pid: 501}, {pid: 777}, {pid: 888}, {pid: 999}, {pid: 1000}}
 	args := map[int][]byte{
 		501: procargs2(1, "/opt/homebrew/bin/claude", []string{"claude"}, nil),
 	}
-	argErr := map[int]error{777: unix.ESRCH, 888: unix.EPERM, 999: unix.EINVAL}
+	argErr := map[int]error{777: unix.ESRCH, 888: unix.EPERM, 999: unix.EINVAL, 1000: unix.EIO}
 	canScan(t, procs, args, argErr)
 
 	got, err := Scan(context.Background())
@@ -227,11 +228,11 @@ func TestScanSkipsGoneProcs(t *testing.T) {
 }
 
 // TestScanFailsClosedOnUnexpectedArgError proves an unexpected per-PID read
-// error (not ESRCH/EINVAL/EPERM) fails the whole scan closed rather than
+// error (not ESRCH/EINVAL/EPERM/EIO) fails the whole scan closed rather than
 // silently dropping a process we could not classify.
 func TestScanFailsClosedOnUnexpectedArgError(t *testing.T) {
 	procs := []proc{{pid: 501}}
-	argErr := map[int]error{501: unix.EIO}
+	argErr := map[int]error{501: errors.New("unexpected procargs failure")}
 	canScan(t, procs, nil, argErr)
 
 	if _, err := Scan(context.Background()); err == nil {
@@ -364,9 +365,9 @@ func TestProcsByExecutableEmptyPath(t *testing.T) {
 
 func TestProcsByExecutableSkipsGoneProcs(t *testing.T) {
 	widget := "/w"
-	procs := []proc{{pid: 100}, {pid: 200}, {pid: 300}, {pid: 400}}
+	procs := []proc{{pid: 100}, {pid: 200}, {pid: 300}, {pid: 400}, {pid: 500}}
 	args := map[int][]byte{100: procargs2(1, widget, []string{"w"}, nil)}
-	argErr := map[int]error{200: unix.ESRCH, 300: unix.EINVAL, 400: unix.EPERM}
+	argErr := map[int]error{200: unix.ESRCH, 300: unix.EINVAL, 400: unix.EPERM, 500: unix.EIO}
 	canScan(t, procs, args, argErr)
 
 	got, err := ProcsByExecutable(context.Background(), widget)
@@ -389,7 +390,7 @@ func TestProcsByExecutableFailsClosed(t *testing.T) {
 		}
 	})
 	t.Run("unexpected arg error", func(t *testing.T) {
-		canScan(t, []proc{{pid: 100}}, nil, map[int]error{100: unix.EIO})
+		canScan(t, []proc{{pid: 100}}, nil, map[int]error{100: errors.New("unexpected procargs failure")})
 
 		if _, err := ProcsByExecutable(context.Background(), "/w"); err == nil {
 			t.Fatal("an unexpected procargs error must fail the walk closed")
