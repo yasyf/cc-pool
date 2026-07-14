@@ -211,6 +211,11 @@ func WidgetAppPath() string {
 	return "/Applications/CCPoolStatus.app"
 }
 
+// WidgetAppBinaryPath is the Mach-O inside the CCPoolStatus app bundle.
+func WidgetAppBinaryPath() string {
+	return filepath.Join(WidgetAppPath(), "Contents", "MacOS", "CCPoolStatus")
+}
+
 // WidgetAppexBinaryPath is the Mach-O inside the Notification Center widget
 // appex in the CCPoolStatus bundle. The daemon and doctor match live
 // processes' exec paths against it to find an appex a cask upgrade left

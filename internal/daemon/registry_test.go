@@ -38,6 +38,7 @@ func TestMaintainerTableOrder(t *testing.T) {
 			{"fuse.remount", claimPerAccount},
 			{"fp.heal", claimPerAccount},
 			{"fp.orphan.reap", claimNone},
+			{"fp.app.reap", claimNone},
 			{"strand.heal", claimPerAccount},
 			{"content.health", claimNone},
 		}},

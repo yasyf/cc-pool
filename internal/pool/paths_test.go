@@ -6,6 +6,13 @@ import (
 	"testing"
 )
 
+func TestWidgetAppBinaryPath(t *testing.T) {
+	want := filepath.Join(WidgetAppPath(), "Contents", "MacOS", "CCPoolStatus")
+	if got := WidgetAppBinaryPath(); got != want {
+		t.Fatalf("WidgetAppBinaryPath() = %q, want %q", got, want)
+	}
+}
+
 // TestConfigDirForMount pins the single wire→ConfigDir translation: a mux subtree
 // (a direct child of MuxRootDir()) maps to its account ConfigDir, and any other
 // served path passes through unchanged.

@@ -181,7 +181,8 @@ func TestEnsureFPAppNonBlocking(t *testing.T) {
 		close(release)
 		t.Fatal("ensureFPAppAsync blocked on the spawn; the heal tick must not stall")
 	}
-	close(release) // let the tracked goroutine (and cleanup's wg.Wait) finish
+	close(release)
+	s.wg.Wait()
 }
 
 // TestEnsureFPAppSpawnFailureLogged pins that a failed launch does not panic and
