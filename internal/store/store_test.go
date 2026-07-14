@@ -1,12 +1,9 @@
 package store
 
 import (
-	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
-
-	_ "modernc.org/sqlite" // pure-Go "sqlite" driver, for the old-schema migration test
 )
 
 func openTest(t *testing.T) *Store {
@@ -309,64 +306,6 @@ func TestUsageSampleScopedRoundTrip(t *testing.T) {
 				t.Fatalf("scoped resets = %v, want %v", got.Scoped7dResets, tc.wantReset)
 			}
 		})
-	}
-}
-
-// TestEnsureColumnMigratesOldSchema hand-creates a pool.db carrying the
-// pre-scoped usage_samples schema, reopens it via store.Open (which runs the
-// in-place ensureColumn migration — no wipe), and proves a scoped INSERT then
-// succeeds and scans back.
-func TestEnsureColumnMigratesOldSchema(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "old.db")
-
-	// The old usage_samples schema, verbatim, before the scoped_7d_* columns.
-	const oldSchema = `
-CREATE TABLE usage_samples (
-  account_id    INTEGER NOT NULL,
-  ts            INTEGER NOT NULL,
-  util_5h       REAL,
-  util_7d       REAL,
-  resets_5h     INTEGER,
-  resets_7d     INTEGER,
-  rate_limited  INTEGER NOT NULL DEFAULT 0,
-  extra_enabled INTEGER NOT NULL DEFAULT 0,
-  extra_used    REAL NOT NULL DEFAULT 0,
-  extra_limit   REAL NOT NULL DEFAULT 0,
-  PRIMARY KEY (account_id, ts)
-);`
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(oldSchema); err != nil {
-		t.Fatalf("create old schema: %v", err)
-	}
-	if _, err := db.Exec(
-		`INSERT INTO usage_samples(account_id,ts,util_7d) VALUES(1,?,42)`,
-		time.Now().Add(-time.Hour).Unix()); err != nil {
-		t.Fatalf("seed old row: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := Open(path)
-	if err != nil {
-		t.Fatalf("reopen migrates in place: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
-
-	reset := time.Now().Add(2 * 24 * time.Hour).Truncate(time.Second)
-	in := UsageSample{AccountID: 1, TS: time.Now(), Scoped7dModel: "Fable", Scoped7dUtil: 88, Scoped7dResets: reset}
-	if err := s.InsertUsageSample(in); err != nil {
-		t.Fatalf("insert after migration: %v", err)
-	}
-	got, ok, err := s.LatestUsageSample(1)
-	if err != nil || !ok {
-		t.Fatalf("latest: ok=%v err=%v", ok, err)
-	}
-	if got.Scoped7dModel != "Fable" || got.Scoped7dUtil != 88 || !got.Scoped7dResets.Equal(reset) {
-		t.Fatalf("scoped fields lost across migration: %+v", got)
 	}
 }
 
@@ -762,53 +701,6 @@ func TestAuthHealthTransitions(t *testing.T) {
 	}
 	if m, _ := s.ListAuthHealth(); len(m) != 0 {
 		t.Fatalf("ListAuthHealth after clear = %+v, want empty", m)
-	}
-}
-
-// TestAuthHealthKindBackfill proves a legacy auth_health row (written before the
-// kind column existed) opens, backfills kind='' as Owned, and round-trips a new
-// kind through the migrated schema.
-func TestAuthHealthKindBackfill(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "pool.db")
-	legacy, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := legacy.Exec(`CREATE TABLE auth_health (
-	  account_id  INTEGER PRIMARY KEY,
-	  needs_login INTEGER NOT NULL DEFAULT 0,
-	  since       INTEGER,
-	  last_err    TEXT NOT NULL DEFAULT ''
-	);
-	INSERT INTO auth_health(account_id,needs_login,since,last_err) VALUES(7,1,123,'legacy 401');`); err != nil {
-		t.Fatalf("seed legacy auth_health: %v", err)
-	}
-	if err := legacy.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open must migrate a kind-less auth_health: %v", err)
-	}
-	defer func() { _ = s.Close() }()
-
-	h, err := s.GetAuthHealth(7)
-	if err != nil {
-		t.Fatalf("GetAuthHealth after backfill: %v", err)
-	}
-	if !h.NeedsLogin || h.LastErr != "legacy 401" || h.Kind != AuthKindOwned {
-		t.Fatalf("backfilled row = %+v, want needs-login/legacy 401/owned", h)
-	}
-
-	if err := s.UpsertAccount(Account{ID: 7, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.SetNeedsLogin(7, time.Unix(456, 0), "awaiting", AuthKindAwaitingOrigin); err != nil {
-		t.Fatalf("SetNeedsLogin through migrated schema: %v", err)
-	}
-	if h, _ := s.GetAuthHealth(7); h.Kind != AuthKindAwaitingOrigin {
-		t.Fatalf("round-trip kind = %q, want awaiting-origin", h.Kind)
 	}
 }
 

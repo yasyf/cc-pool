@@ -2,7 +2,6 @@ package cli
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -443,58 +442,6 @@ func TestAwaitAgentReadyTimeoutKillsChild(t *testing.T) {
 	}
 }
 
-// TestAcquireStableReDerivesOnShapeFlip pins H1: when the row shape flips between the
-// initial derive and Acquire (a legacy→mux migration lands mid-acquire), the helper
-// releases the obsolete key and lands the held lease on the NEW key.
-func TestAcquireStableReDerivesOnShapeFlip(t *testing.T) {
-	root := tempLeaseRoot(t)
-	key1, key2 := "/pool/acct-01-legacy", "/pool/acct-01-mux"
-	var calls int
-	derive := func() string {
-		calls++
-		if calls == 1 {
-			return key1 // the initial, pre-migration derive
-		}
-		return key2 // migration landed: every re-derive returns the mux subtree key
-	}
-	h, key, err := acquireStable(pool.HolderOwner, derive)
-	if err != nil {
-		t.Fatalf("acquireStable = %v, want nil", err)
-	}
-	defer func() { _ = h.Close() }()
-	if key != key2 {
-		t.Fatalf("acquireStable landed on %q, want the post-migration key %q", key, key2)
-	}
-	if held, _, _ := lease.Probe(root, key2); !held {
-		t.Fatal("lease not held on the post-migration key")
-	}
-	if held, _, _ := lease.Probe(root, key1); held {
-		t.Fatal("lease still held on the obsolete pre-migration key")
-	}
-}
-
-// TestAcquireStableFailsWhenShapeNeverStable pins H1's bound: a shape that keeps
-// flipping past the attempt bound fails loud rather than looping forever.
-func TestAcquireStableFailsWhenShapeNeverStable(t *testing.T) {
-	root := tempLeaseRoot(t)
-	var calls int
-	derive := func() string {
-		calls++
-		return fmt.Sprintf("/pool/acct-%d", calls) // a new key every call: never stable
-	}
-	h, key, err := acquireStable(pool.HolderOwner, derive)
-	if err == nil {
-		_ = h.Close()
-		t.Fatal("acquireStable on an ever-changing shape = nil, want a fail-loud error")
-	}
-	if !strings.Contains(err.Error(), "kept changing") {
-		t.Fatalf("acquireStable error = %v, want a 'kept changing' failure", err)
-	}
-	if held, _, _ := lease.Probe(root, key); held {
-		t.Fatal("acquireStable left a lease held on its final failed key")
-	}
-}
-
 // TestRunLeaseAgentPollFallbackLeaderDiesPreOk pins H4: on the kqueue-unavailable
 // (EMFILE/ENFILE) fallback, a leader already gone at the poll watcher's first check
 // yields err — not ok — and the lease releases; ok never precedes a live watcher.
@@ -629,13 +576,12 @@ func TestRunLeaseAgentAdvisorySlotBestEffort(t *testing.T) {
 }
 
 // TestLeaseReadyTimeoutExceedsSequentialWorstCase pins J3: the readiness deadline must
-// exceed the agent's FULL sequential worst case — leaseKeyDeriveAttempts rounds of
-// Acquire plus the stat and deep probe — so a healthy-but-slow init (even one that
-// re-derives across a migration) is never killed.
+// exceed the agent's FULL sequential worst case — Acquire plus the stat and deep
+// probe — so a healthy-but-slow init is never killed.
 func TestLeaseReadyTimeoutExceedsSequentialWorstCase(t *testing.T) {
-	worst := leaseKeyDeriveAttempts*leaseAcquireBound + leaseProbeTimeout + overlay.DeepProbeBound
+	worst := leaseAcquireBound + leaseProbeTimeout + overlay.DeepProbeBound
 	if leaseReadyTimeout <= worst {
-		t.Fatalf("leaseReadyTimeout %s must exceed the full sequential worst case %s (deriveAttempts×acquire + stat + deep-probe)", leaseReadyTimeout, worst)
+		t.Fatalf("leaseReadyTimeout %s must exceed the full sequential worst case %s (acquire + stat + deep-probe)", leaseReadyTimeout, worst)
 	}
 }
 

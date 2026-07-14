@@ -1085,8 +1085,8 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 	// OpMigrate during the reconcile, so a conversion can flip the row between the
 	// listing and this poll claim. Re-read once under the held claim (which blocks any
 	// NEW conversion) and branch every arm on the fresh row, so a stale fuse/fp
-	// snapshot never drives a destructive heal (migrateLegacyFuseRow / healFuse) against
-	// a row that is now symlink in SQLite. A vanished account has nothing to reconcile.
+	// snapshot never drives a destructive heal (healFuse) against a row that is
+	// now symlink in SQLite. A vanished account has nothing to reconcile.
 	fresh, err := s.m.Store.GetAccount(a.ID)
 	if err != nil {
 		s.log.Printf("acct-%02d reconcile: re-read row under the poll claim: %v", a.ID, err)
@@ -1102,14 +1102,6 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 		return
 	}
 	if fuseBackedRow(a.OverlayKind) {
-		// One-time legacy→mux migration: a fuse row whose ConfigDir is still a real
-		// dir — a pre-cutover per-account mount, or a bare dir a half-done migration
-		// left — is converted to a shared-mux subtree + bridge symlink before it is
-		// adopted or healed. Idempotent and crash-resumable; a re-run converges.
-		if s.needsMuxMigration(a) {
-			s.migrateLegacyFuseRow(ctx, a)
-			return
-		}
 		prov := s.overlayForRow(a)
 		if prov != nil && prov.Backend().IsFuse() && prov.Health(pool.ClaudeDir(), a.ConfigDir) == nil {
 			// The detached holder kept the mirror live across the restart (the
@@ -1177,38 +1169,6 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 	}
 }
 
-// needsMuxMigration reports whether a fuse row still needs the one-time
-// legacy→mux migration: its ConfigDir is not yet the bridge symlink into the
-// shared mount (a pre-cutover per-dir mountpoint, a bare dir, or an absent dir).
-// A migrated or freshly mux-created account dir is a bridge symlink, so it does
-// not.
-func (s *Server) needsMuxMigration(a store.Account) bool {
-	return !pool.IsBridgeSymlink(a.ConfigDir)
-}
-
-// migrateLegacyFuseRow converts a pre-cutover per-account fuse mount into a
-// shared-mux subtree bridged by a symlink. Caller holds the account's poll claim.
-// The live legacy mountpoint comes down first (through the holder's lease-gated
-// unmount), its dir is drained, and healFuse re-attaches the subtree. Every step
-// is idempotent. See ccn doc 7bf8406.
-func (s *Server) migrateLegacyFuseRow(ctx context.Context, a store.Account) {
-	base, dir := pool.ClaudeDir(), a.ConfigDir
-	// The drain + teardown remake the dir a launching claude would land in, so
-	// claim the account first: once converting is set tryReserve refuses for the
-	// whole span, and a live reservation defers the migration. Released before
-	// healFuse re-attaches — its own fallback path takes the claim afresh.
-	if !s.cl.ownHeld(a.ID) {
-		s.log.Printf("acct-%02d deferring legacy→mux migration: reserved by a pending select", a.ID)
-		return
-	}
-	drained := s.drainLegacyFuseDir(a, base, dir)
-	s.cl.disownConvert(a.ID)
-	if !drained {
-		return
-	}
-	s.healFuse(ctx, a)
-}
-
 // warnTeardown surfaces an overlay teardown's journal persist-warning loudly (the
 // kernel detach landed but a successor could replay the stale row); empty stays silent.
 func (s *Server) warnTeardown(id int, warning string) {
@@ -1217,96 +1177,6 @@ func (s *Server) warnTeardown(id int, warning string) {
 	}
 }
 
-// drainLegacyFuseDir tears down a legacy per-dir mount and empties the account dir
-// so a bridge symlink can replace it, returning whether the dir is ready for
-// healFuse to re-attach the mux subtree. Caller holds the convert claim. The
-// teardown routes through the holder's lease-ladder unmount — a held session
-// lease or a busy mirror answers ErrBusy (graceful, never a force), deferring the
-// migration until the session exits.
-func (s *Server) drainLegacyFuseDir(a store.Account, base, dir string) bool {
-	if overlayMounted(dir) {
-		prov := s.overlayForRow(a)
-		if prov == nil {
-			s.log.Printf("acct-%02d mux migration: no provider resolved to tear down legacy mount %s", a.ID, dir)
-			return false
-		}
-		// (b) Holder-delegated teardown of the live legacy mount: NO consumer seize
-		// (the holder is the seizer; a held EX would self-bounce its own Seize). Its
-		// mountd.ErrBusy — a live session holding the dir's lease — is the gate.
-		warning, err := prov.Teardown(base, dir)
-		s.warnTeardown(a.ID, warning)
-		if err != nil {
-			if errors.Is(err, mountd.ErrBusy) {
-				s.log.Printf("acct-%02d deferring legacy→mux migration: %s is busy (a live session holds its lease); relaunch it", a.ID, dir)
-				return false
-			}
-			s.log.Printf("acct-%02d mux migration: tear down legacy mount %s: %v", a.ID, dir, err)
-			return false
-		}
-		// Drop the holder-cache vouch the instant the mount is gone: a select
-		// racing the drain must never launch onto the torn-down dir.
-		s.holder.noteUnmounted(dir)
-		s.log.Printf("acct-%02d tore down legacy per-dir mount for mux migration", a.ID)
-	}
-	// (a) The local drain remakes the now-plain dir cc-pool performs itself, so it
-	// runs under an exclusive session-lease fence: a live session or a select handout
-	// (invisible to procscan before claude starts) on the dir defers the drain rather
-	// than having its dir replaced underneath it. The seize follows the holder's
-	// confirmed teardown, closing the gap between it and the local mutation.
-	fence, err := s.m.SeizeSessionLease(a)
-	if err != nil {
-		s.log.Printf("acct-%02d deferring legacy→mux migration: %s is held by a live session or launch; relaunch it: %v", a.ID, dir, err)
-		return false
-	}
-	defer func() { _ = fence.Release() }()
-	if err := s.drainDirForBridge(a, base, dir); err != nil {
-		s.log.Printf("acct-%02d mux migration: %v", a.ID, err)
-		return false
-	}
-	return true
-}
-
-// drainDirForBridge empties a legacy account dir so a bridge symlink can replace
-// it: private files stranded in the bare mountpoint move to the backing root,
-// shared entries claude wrote there move to base, and skip litter is cleared so
-// clearAccountDirForBridge sees an empty dir. Anything left is unclassified state
-// — Setup refuses it loudly (never destroyed here). A symlink or absent dir is a
-// no-op (Setup's AtomicSymlink handles it).
-func (s *Server) drainDirForBridge(a store.Account, base, dir string) error {
-	fi, err := os.Lstat(dir)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("lstat account dir: %w", err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil
-	}
-	spec := s.m.OverlaySpec()
-	switch has, herr := fkoverlay.HasPrivateEntries(dir, spec); {
-	case herr != nil:
-		return fmt.Errorf("check underlay for stranded private files: %w", herr)
-	case has:
-		if err := fkoverlay.MovePrivateEntries(dir, fkoverlay.FusePrivateRoot(dir), spec); err != nil {
-			return fmt.Errorf("sweep stranded private files into the backing dir: %w", err)
-		}
-		s.log.Printf("acct-%02d swept stranded private files from the legacy mountpoint into the backing dir", a.ID)
-	}
-	if err := fkoverlay.MoveSharedOrphans(dir, base, spec); err != nil {
-		return fmt.Errorf("relocate shared orphans into base: %w", err)
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("read account dir: %w", err)
-	}
-	for _, e := range entries {
-		if spec.Skipped(e.Name()) {
-			_ = os.Remove(filepath.Join(dir, e.Name()))
-		}
-	}
-	return nil
-}
 
 // healOutcome classifies one healFuse attempt.
 type healOutcome int
@@ -1366,10 +1236,10 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 		s.log.Printf("acct-%02d mount blocked by a wedged unmount, retrying next poll: %v", a.ID, err)
 		return healRetry
 	case errors.Is(err, fkoverlay.ErrAccountDirOccupied):
-		// The account dir holds unclassified state where the bridge symlink must go
-		// (a half-drained legacy dir). Never destroy it and never demote — the same
-		// state would block the symlink retreat; retry loudly until a human clears it.
-		s.log.Printf("acct-%02d mux migration blocked: account dir holds unclassified state where the bridge symlink belongs; refusing to clobber it, retrying next poll: %v", a.ID, err)
+		// The account dir holds unclassified state where the bridge symlink must go.
+		// Never destroy it and never demote — the same state would block the symlink
+		// retreat; retry loudly until a human clears it.
+		s.log.Printf("acct-%02d fuse heal blocked: account dir holds unclassified state where the bridge symlink belongs; refusing to clobber it, retrying next poll: %v", a.ID, err)
 		return healRetry
 	case errors.Is(err, mountd.ErrMuxMismatch):
 		// Registry state: a mux subtree could not join its shared native mount

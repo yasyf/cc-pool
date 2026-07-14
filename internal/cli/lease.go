@@ -38,19 +38,13 @@ const leaseAcquireBound = 5 * time.Second
 const leaseReadyMargin = 3 * time.Second
 
 // leaseReadyTimeout bounds the parent's wait for a detached lease agent to signal
-// acquired+probed. It is DERIVED from the agent's FULL sequential worst case — up to
-// leaseKeyDeriveAttempts rounds of Acquire's fence wait (a legacy→mux flip re-derives
-// the key, each round bounded by leaseAcquireBound), then the bounded liveness stat and
-// the deep-read probe — plus a margin. With advisory-only slots the child never blocks
-// on another agent, so this is a straight component sum, strictly LARGER (by the
-// margin) than any wait the child can legitimately perform, so a healthy-but-slow init
-// is never killed. A var so tests can shrink it.
-var leaseReadyTimeout = leaseKeyDeriveAttempts*leaseAcquireBound + leaseProbeTimeout + overlay.DeepProbeBound + leaseReadyMargin
-
-// leaseKeyDeriveAttempts bounds acquireStable's derive→acquire→re-derive loop: a
-// legacy→mux migration landing between derive and Acquire flips the key once, so a
-// few attempts converge; past the bound a shape that keeps flipping fails loud.
-const leaseKeyDeriveAttempts = 3
+// acquired+probed. It is DERIVED from the agent's FULL sequential worst case —
+// Acquire's fence wait (bounded by leaseAcquireBound), then the bounded liveness
+// stat and the deep-read probe — plus a margin. With advisory-only slots the child
+// never blocks on another agent, so this is a straight component sum, strictly
+// LARGER (by the margin) than any wait the child can legitimately perform, so a
+// healthy-but-slow init is never killed. A var so tests can shrink it.
+var leaseReadyTimeout = leaseAcquireBound + leaseProbeTimeout + overlay.DeepProbeBound + leaseReadyMargin
 
 // slotReadyMarker is the prefix a lease agent writes into its ADVISORY registry slot
 // once it has acquired, probed, and begun watching. The slot is an OPTIMIZATION ONLY —
@@ -143,30 +137,17 @@ func isFuseRow(overlayKind string) bool {
 	return err == nil && b.IsFuse()
 }
 
-// acquireStable takes a session lease whose key matches the account's CURRENT
-// on-disk shape: it derives the key, acquires, then RE-derives — a legacy→mux
-// migration landing between the two would fence the obsolete ConfigDir key while
-// the holder now fences the mux subtree, so a mismatch releases and retries on the
-// new key (bounded; migration is one-way, so a couple of rounds converge). A stable
-// re-derivation proves the held lease matched the row shape at acquisition. derive
-// reads live FS shape (IsBridgeSymlink), so it is called afresh each attempt.
-func acquireStable(owner string, derive func() string) (*lease.Handle, string, error) {
+// acquireLease takes a session lease on key in the fleet lease root.
+func acquireLease(owner, key string) (*lease.Handle, error) {
 	root, err := leaseRoot()
 	if err != nil {
-		return nil, "", fmt.Errorf("resolve the session lease root: %w", err)
+		return nil, fmt.Errorf("resolve the session lease root: %w", err)
 	}
-	for range leaseKeyDeriveAttempts {
-		key := derive()
-		h, err := lease.Acquire(root, key, owner)
-		if err != nil {
-			return nil, "", fmt.Errorf("take a session lease on %s: %w", key, err)
-		}
-		if derive() == key {
-			return h, key, nil
-		}
-		_ = h.Close() // the shape migrated under us; re-acquire on the new key
+	h, err := lease.Acquire(root, key, owner)
+	if err != nil {
+		return nil, fmt.Errorf("take a session lease on %s: %w", key, err)
 	}
-	return nil, "", fmt.Errorf("the session lease key kept changing under a migrating mount after %d attempts — run `ccp doctor`", leaseKeyDeriveAttempts)
+	return h, nil
 }
 
 // acquireSessionLease takes the shared session lease on account a keyed on a's
@@ -176,8 +157,7 @@ func acquireStable(owner string, derive func() string) (*lease.Handle, string, e
 // pinning the lease for the whole session tree; it releases only when the last
 // descriptor closes.
 func acquireSessionLease(a store.Account) (*lease.Handle, error) {
-	h, _, err := acquireStable(pool.HolderOwner, func() string { return pool.SessionLeaseDir(a) })
-	return h, err
+	return acquireLease(pool.HolderOwner, pool.SessionLeaseDir(a))
 }
 
 // probeSessionLease runs the post-Acquire probe on the dir claude reads (a's
@@ -191,18 +171,18 @@ func probeSessionLease(a store.Account) error {
 // a's session lease then proves the mount answers, closing the handle on a probe
 // failure so a wedged mount never keeps a dangling lease.
 func acquireAndProbeSessionLease(a store.Account) (*lease.Handle, error) {
-	return acquireAndProbe(func() string { return pool.SessionLeaseDir(a) }, a.ConfigDir, isFuseRow(a.OverlayKind))
+	return acquireAndProbe(pool.SessionLeaseDir(a), a.ConfigDir, isFuseRow(a.OverlayKind))
 }
 
 // acquireAndProbePendingLease is acquireAndProbeSessionLease for a fresh add,
 // whose account is not in the store yet: the key derives from the pending row's
 // index, dir, and backend.
 func acquireAndProbePendingLease(p *pool.PendingAdd) (*lease.Handle, error) {
-	return acquireAndProbe(func() string { return pool.SessionLeaseDirFor(p.Index, p.ConfigDir, string(p.OverlayKind)) }, p.ConfigDir, p.OverlayKind.IsFuse())
+	return acquireAndProbe(pool.SessionLeaseDirFor(p.Index, p.ConfigDir, string(p.OverlayKind)), p.ConfigDir, p.OverlayKind.IsFuse())
 }
 
-func acquireAndProbe(derive func() string, probeDir string, fuseRow bool) (*lease.Handle, error) {
-	h, _, err := acquireStable(pool.HolderOwner, derive)
+func acquireAndProbe(key, probeDir string, fuseRow bool) (*lease.Handle, error) {
+	h, err := acquireLease(pool.HolderOwner, key)
 	if err != nil {
 		return nil, err
 	}
@@ -469,10 +449,7 @@ func runLeaseAgent(leader int, wantStart int64, id int, dir, probe string, fuseR
 		return err
 	}
 
-	// Re-derive the key from the account's CURRENT shape after Acquire: a legacy→mux
-	// migration landing in the launcher→agent fork+exec window flips it from ConfigDir
-	// to the mux subtree, and the lease must fence the shape the holder now tears down.
-	h, _, err := acquireStable(pool.HolderOwner, func() string { return pool.SessionLeaseDirForShape(id, dir, fuseRow) })
+	h, err := acquireLease(pool.HolderOwner, pool.SessionLeaseDirForShape(id, dir, fuseRow))
 	if err != nil {
 		return signalFail(ready, err)
 	}

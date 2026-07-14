@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS journal_risks (
   warning     TEXT NOT NULL DEFAULT '',
   recorded_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_accounts_uuid ON accounts(account_uuid);
 `
 
 // Open opens (creating if needed) the database at path and applies the schema.
@@ -109,94 +110,6 @@ func Open(path string) (*Store, error) {
 func (s *Store) applySchema() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
-	}
-	// Columns added after usage_samples first shipped: CREATE TABLE IF NOT
-	// EXISTS never alters an existing table, so pre-existing databases need
-	// these added in place (no pool.db wipe).
-	if err := s.ensureColumn("usage_samples", "scoped_7d_util", "REAL"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("usage_samples", "scoped_7d_resets", "INTEGER"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("usage_samples", "scoped_7d_model", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("accounts", "account_uuid", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	// The chain-hash columns predate origin-owned chains (ownership now lives in
-	// the credential blob itself: refresh-token presence); drop them in place.
-	if err := s.dropColumn("accounts", "cred_hash"); err != nil {
-		return err
-	}
-	if err := s.dropColumn("accounts", "cred_parent_hash"); err != nil {
-		return err
-	}
-	// auth_health.kind classifies a needs-login (owned vs awaiting-origin); added
-	// after auth_health first shipped, so pre-existing databases need it in place.
-	if err := s.ensureColumn("auth_health", "kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	// The index must follow the ensureColumn: on a pre-existing db the column is
-	// added above, so it cannot live in the CREATE TABLE schema block (which runs
-	// before the migration and would reference a not-yet-added column).
-	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_accounts_uuid ON accounts(account_uuid)`); err != nil {
-		return fmt.Errorf("create idx_accounts_uuid: %w", err)
-	}
-	return nil
-}
-
-// ensureColumn adds column (with declaration decl) to table when it is absent.
-// Errors fail Open — running against a half-migrated schema is never
-// acceptable.
-func (s *Store) ensureColumn(table, column, decl string) error {
-	var n int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
-		return fmt.Errorf("inspect %s.%s: %w", table, column, err)
-	}
-	if n > 0 {
-		return nil
-	}
-	// table/column/decl are compile-time constants; nothing user-controlled.
-	if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, decl)); err != nil {
-		// Two processes can race the check-then-ALTER on the first open after
-		// an upgrade (sqlite has no ADD COLUMN IF NOT EXISTS). The
-		// postcondition is "column exists" — re-check before failing so the
-		// duplicate-column loser swallows its error.
-		var again int
-		if err2 := s.db.QueryRow(
-			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&again); err2 == nil && again > 0 {
-			return nil
-		}
-		return fmt.Errorf("add column %s.%s: %w", table, column, err)
-	}
-	return nil
-}
-
-// dropColumn removes column from table when present. Errors fail Open —
-// running against a half-migrated schema is never acceptable.
-func (s *Store) dropColumn(table, column string) error {
-	var n int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
-		return fmt.Errorf("inspect %s.%s: %w", table, column, err)
-	}
-	if n == 0 {
-		return nil
-	}
-	// table/column are compile-time constants; nothing user-controlled.
-	if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s DROP COLUMN %s`, table, column)); err != nil {
-		// Two processes can race the check-then-ALTER on the first open after an
-		// upgrade. The postcondition is "column absent" — re-check before failing
-		// so the no-such-column loser swallows its error.
-		var again int
-		if err2 := s.db.QueryRow(
-			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&again); err2 == nil && again == 0 {
-			return nil
-		}
-		return fmt.Errorf("drop column %s.%s: %w", table, column, err)
 	}
 	return nil
 }

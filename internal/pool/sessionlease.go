@@ -10,15 +10,13 @@ import (
 
 // SessionLeaseDir returns the directory a launcher takes account a's session
 // lease on. It is ROW-AWARE: the key is derived from the dir's CURRENT mounted
-// shape, not the row's eventual shape, so it stays byte-identical to the dir the
-// holder journals and fences at every point in a legacy→mux migration.
+// shape, so it stays byte-identical to the dir the holder journals and fences.
 //
-//   - A fuse row whose ConfigDir is already the mux BRIDGE SYMLINK leases its mux
+//   - A fuse row whose ConfigDir is the mux BRIDGE SYMLINK leases its mux
 //     subtree mount (MuxRootDir()/acct-NN), the exact req.Dir the holder mounts
 //     (the ConfigDir is only a bridge symlink into it).
-//   - A pre-cutover LEGACY fuse row (a per-dir mount, a bare dir, or an absent
-//     dir — anything not yet the bridge symlink) is mounted and holder-fenced at
-//     its own ConfigDir, so it leases ConfigDir.
+//   - A fuse row not yet showing the bridge symlink (a bare or absent dir, mid
+//     setup) leases its own ConfigDir until the symlink lands.
 //   - A symlink or File Provider account has no holder mount, so it leases its
 //     own ConfigDir — a uniform provenance key.
 func SessionLeaseDir(a store.Account) string {
@@ -32,9 +30,8 @@ func SessionLeaseDirFor(id int, configDir, overlayKind string) string {
 	return SessionLeaseDirForShape(id, configDir, err == nil && b.IsFuse())
 }
 
-// SessionLeaseDirForShape derives the key from a row's raw shape inputs, re-reading
-// IsBridgeSymlink so a caller can re-derive after Acquire and land on the shape the
-// holder now fences — the legacy→mux migration TOCTOU guard.
+// SessionLeaseDirForShape derives the key from a row's raw shape inputs, reading
+// IsBridgeSymlink so the key tracks the dir's current mounted shape.
 func SessionLeaseDirForShape(id int, configDir string, fuse bool) string {
 	if fuse && IsBridgeSymlink(configDir) {
 		return filepath.Join(MuxRootDir(), AccountDirName(id))

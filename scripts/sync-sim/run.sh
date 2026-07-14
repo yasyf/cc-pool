@@ -633,23 +633,6 @@ scenario_4_peer_origin() {
 }
 
 # ---------------------------------------------------------------------------
-# Scenario 7 — a v1 (holder/lease) registry fails the schema gate loud
-# ---------------------------------------------------------------------------
-scenario_7_schema_gate() {
-  hdr "Scenario 7: schema gate — a v1 registry fails loud with the runbook message"
-  # Plant a pre-origin (v1) registry with holder/lease/parentHash markers.
-  cat > "$(regfile a)" <<PY
-{"$UUID":{"value":{"uuid":"$UUID","email":"$EMAIL","label":"acct-x","oauthAccount":{"accountUuid":"$UUID","emailAddress":"$EMAIL"},"chain":{"holder":"legacy-host","expiresAt":$E_INIT,"hash":"deadbeef","parentHash":"cafebabe","lease":0}},"added_at":1000,"removed_at":0}}
-PY
-  local out rc=0
-  out="$(hrun a "$BIN/cc-pool" sync converge 2>&1)" || rc=$?
-  [ "$rc" != 0 ] || fail "converge accepted a v1 (holder/lease) registry"
-  echo "$out" | grep -qF "pre-origin registry" \
-    || fail "converge failed but without the ErrRegistrySchema runbook message: $out"
-  ok "v1 registry rejected loud: $(echo "$out" | grep -oF 'pre-origin registry' | head -1) ... (upgrade + delete registry.json)"
-}
-
-# ---------------------------------------------------------------------------
 # One full suite run
 # ---------------------------------------------------------------------------
 run_suite() {
@@ -670,10 +653,9 @@ run_suite() {
   setup_hosts
   scenario_3_origin_offline
 
-  # Group 3 (own setup): peer becomes origin, then the schema gate on those hosts.
+  # Group 3 (own setup): peer becomes origin.
   setup_hosts
   scenario_4_peer_origin
-  scenario_7_schema_gate
 
   stop_daemon a; stop_daemon b
   stop_all_oauth
