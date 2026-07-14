@@ -547,6 +547,65 @@ func TestShortCircuitRelogin(t *testing.T) {
 	}
 }
 
+type reflagOAuth struct {
+	store     *store.Store
+	accountID int
+}
+
+func (o *reflagOAuth) Refresh(context.Context, string, string) (*oauth.TokenResponse, error) {
+	if _, err := o.store.SetNeedsLogin(o.accountID, time.Now(), "newer daemon verdict", store.AuthKindOwned); err != nil {
+		return nil, err
+	}
+	return &oauth.TokenResponse{AccessToken: "at-rotated", RefreshToken: "rt-rotated", ExpiresIn: 3600}, nil
+}
+
+func (o *reflagOAuth) Usage(context.Context, string) (*oauth.Usage, error) {
+	return nil, errors.New("usage must not be called")
+}
+
+func TestShortCircuitReloginPreservesNewerNeedsLoginGeneration(t *testing.T) {
+	home := t.TempDir()
+	st, err := store.Open(filepath.Join(home, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	a := store.Account{ID: 3, ConfigDir: filepath.Join(home, "acct-03"), KeychainService: "svc-03", KeychainAccount: "user", Label: "bob@example.com"}
+	if err := st.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetNeedsLogin(a.ID, time.Now(), "revoked", store.AuthKindOwned); err != nil {
+		t.Fatal(err)
+	}
+	fk := credstest.NewFake()
+	fk.Put(a.KeychainService, a.KeychainAccount, cred("at", "rt", time.Now().Add(time.Hour).UnixMilli()))
+	m := &pool.Manager{
+		Store:   st,
+		OAuth:   &reflagOAuth{store: st, accountID: a.ID},
+		Creds:   fk,
+		LockDir: t.TempDir(),
+	}
+
+	cleared, err := shortCircuitRelogin(context.Background(), m, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared {
+		t.Fatal("short-circuit reported success after a newer daemon verdict")
+	}
+	h, err := st.GetAuthHealth(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.NeedsLogin || h.Gen != 2 || h.LastErr != "newer daemon verdict" {
+		t.Fatalf("auth health = %+v, want newer generation 2 verdict preserved", h)
+	}
+	stored, ok := fk.Get(a.KeychainService, a.KeychainAccount)
+	if !ok || stored.ClaudeAiOauth.RefreshToken != "rt-rotated" {
+		t.Fatalf("stored credential = %+v, want successful rotated chain", stored)
+	}
+}
+
 // TestFinishReloginAndPublish pins the relogin sync hook to the fail-closed
 // discipline: only a landed login publishes to the shared registry; one that
 // never landed generates zero registry traffic.

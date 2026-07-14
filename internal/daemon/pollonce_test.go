@@ -288,6 +288,91 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 	}
 }
 
+// TestPollOnceAbsentCredentialAuthHealth pins the fully-absent classifier at
+// the scheduler boundary, including the locked-Keychain negative and recovery.
+func TestPollOnceAbsentCredentialAuthHealth(t *testing.T) {
+	cases := map[string]struct {
+		keychainFault  error
+		wantNeedsLogin bool
+		wantAvailable  bool
+		recover        bool
+	}{
+		"absent credential flags unavailable then recovers": {
+			wantNeedsLogin: true,
+			wantAvailable:  false,
+			recover:        true,
+		},
+		"unavailable keychain stays selectable": {
+			keychainFault: creds.ErrUnavailable,
+			wantAvailable: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = st.Close() })
+
+			a := store.Account{
+				ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
+				KeychainService: "svc", KeychainAccount: "user",
+			}
+			if err := st.UpsertAccount(a); err != nil {
+				t.Fatal(err)
+			}
+			fk := credstest.NewFake()
+			fk.KeychainFaults = credstest.Faults{Read: tc.keychainFault}
+			fo := &fakeOAuth{}
+			s := &Server{
+				m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+				snapshot:     filepath.Join(t.TempDir(), "status.json"),
+				log:          log.New(io.Discard, "", 0),
+				scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
+				cl:           newClaims(),
+				led:          newLedgers(),
+			}
+
+			s.pollOnce(t.Context())
+			h, err := st.GetAuthHealth(a.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h.NeedsLogin != tc.wantNeedsLogin {
+				t.Fatalf("NeedsLogin = %v, want %v", h.NeedsLogin, tc.wantNeedsLogin)
+			}
+			gotAvailable := score.Score(score.Input{AccountID: a.ID, NeedsLogin: h.NeedsLogin}, time.Now()).Available
+			if gotAvailable != tc.wantAvailable {
+				t.Fatalf("Available = %v, want %v", gotAvailable, tc.wantAvailable)
+			}
+
+			if !tc.recover {
+				return
+			}
+			cred := &creds.Credential{}
+			cred.ClaudeAiOauth.AccessToken = "at-clean"
+			cred.ClaudeAiOauth.RefreshToken = "rt-clean"
+			cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
+			fk.Put(a.KeychainService, a.KeychainAccount, cred)
+			s.led.row(authStreakPolicy, a.ConfigDir).lastAt = time.Now().Add(-needsLoginPollInterval - time.Second)
+
+			s.pollOnce(t.Context())
+			h, err = st.GetAuthHealth(a.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h.NeedsLogin {
+				t.Fatal("clean credential poll did not clear needs-login")
+			}
+			if !score.Score(score.Input{AccountID: a.ID, NeedsLogin: h.NeedsLogin}, time.Now()).Available {
+				t.Fatal("recovered account remains unavailable")
+			}
+		})
+	}
+}
+
 // TestPollOnceTransient401StaysSelectable pins that transient refresh failures
 // (non-Revoked 5xx) never flag needs-login: the 401 streak only arms the poll
 // backoff and the account stays selectable throughout.

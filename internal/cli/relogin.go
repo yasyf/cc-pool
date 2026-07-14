@@ -190,10 +190,11 @@ func shortCircuitRelogin(ctx context.Context, m *pool.Manager, a store.Account) 
 	if err != nil || !refreshed {
 		return false, nil
 	}
-	if _, err := m.Store.ClearNeedsLogin(a.ID); err != nil {
+	cleared, err := m.Store.ClearNeedsLoginIfGen(a.ID, h.Gen)
+	if err != nil {
 		return false, fmt.Errorf("clear needs-login for %s: %w", accountName(a.Label), err)
 	}
-	return true, nil
+	return cleared, nil
 }
 
 // awaitFreshCred re-probes read until a usable credential differing from
@@ -242,7 +243,11 @@ func finishRelogin(ctx context.Context, m *pool.Manager, a store.Account, baseli
 	if err := m.AdoptRotatedToken(ctx, a); err != nil {
 		return fmt.Errorf("re-assert credential for %s: %w", accountName(a.Label), err)
 	}
-	if _, err := m.Store.ClearNeedsLogin(a.ID); err != nil {
+	h, err := m.Store.GetAuthHealth(a.ID)
+	if err != nil {
+		return fmt.Errorf("auth health for %s: %w", accountName(a.Label), err)
+	}
+	if _, err := m.Store.ClearNeedsLoginIfGen(a.ID, h.Gen); err != nil {
 		return fmt.Errorf("clear needs-login for %s: %w", accountName(a.Label), err)
 	}
 	return nil
