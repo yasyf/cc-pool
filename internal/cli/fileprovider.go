@@ -133,8 +133,11 @@ const (
 	// rung still down after the window is stuck, not slow.
 	fpRungAttempts = 20
 	// fpCapabilityStallWindow bounds no-verdict capability failures while leaving
-	// the definitive System Settings lane unbounded.
-	fpCapabilityStallWindow = 60 * time.Second
+	// the definitive System Settings lane unbounded. Sized for the worst-case
+	// legitimate path (a ~30s app spawn then two ~25s probe budgets) so a slow
+	// but progressing onboard is not failed early; one clock, so a lane flap
+	// cannot defer the bound indefinitely.
+	fpCapabilityStallWindow = 120 * time.Second
 	// fpConsentBridgeWindow covers three daemon bridge-bind retry intervals.
 	fpConsentBridgeWindow = 15 * time.Second
 )
@@ -168,8 +171,12 @@ func runFPConsentProbe() error {
 		return fmt.Errorf("create File Provider bridge directory: %w", err)
 	}
 	path := filepath.Join(dir, ".consent-probe")
-	// O_NOFOLLOW|O_EXCL: never follow or truncate a planted symlink/pre-existing
-	// file — the write must land on our own fresh probe, not another target.
+	// Clear a leftover from a crashed run (unlinks the name, not a symlink's
+	// target), then O_EXCL|O_NOFOLLOW: the write lands on our own fresh probe,
+	// never a planted symlink or replanted file.
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("clear stale File Provider consent probe: %w", err)
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return fmt.Errorf("write File Provider consent probe: %w", err)
@@ -519,7 +526,6 @@ func awaitFPCapability(ctx context.Context, out io.Writer, interval time.Duratio
 	explained := false
 	var stallStarted time.Time
 	var lastErr error
-	prevDialRefused := false
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for i := 0; ; i++ {
@@ -545,15 +551,11 @@ func awaitFPCapability(ctx context.Context, out io.Writer, interval time.Duratio
 			}
 		} else {
 			now := fpCapabilityNow()
-			dialRefused := errors.Is(err, fileproviderd.ErrAppDialRefused)
-			// The coming-up and probe-failing lanes are each bounded separately:
-			// a fresh window on the first stall and on every lane transition, so
-			// 30s of each is not one 60s stall.
-			if stallStarted.IsZero() || dialRefused != prevDialRefused {
+			if stallStarted.IsZero() {
 				stallStarted = now
 			}
-			prevDialRefused = dialRefused
 			lastErr = err
+			dialRefused := errors.Is(err, fileproviderd.ErrAppDialRefused)
 			if !dialRefused {
 				msg = "app answering but capability probe failing: " + err.Error() + "… press ctrl-c to abort"
 			}

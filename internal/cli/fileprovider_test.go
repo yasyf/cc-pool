@@ -942,13 +942,13 @@ func TestAwaitFPCapabilityStallLanes(t *testing.T) {
 		"dial-refused startup lane expires with launch remediation and last error": {
 			results: []capResult{{err: firstDial}, {err: lastDial}},
 			wantIs:  fileproviderd.ErrAppDialRefused,
-			wantErr: []string{"did not come up within 1m0s", "last dial", "launch", "ccp fp onboard"},
+			wantErr: []string{"did not come up within 2m0s", "last dial", "launch", "ccp fp onboard"},
 			wantOut: []string{"waiting for the CCPoolStatus app to come up"},
 		},
 		"answering failure lane expires with doctor remediation and last error": {
 			results: []capResult{{err: firstOther}, {err: lastOther}},
 			wantIs:  lastOther,
-			wantErr: []string{"answering", "kept failing for 1m0s", "last capability failure", "ccp doctor"},
+			wantErr: []string{"answering", "kept failing for 2m0s", "last capability failure", "ccp doctor"},
 			wantOut: []string{"app answering but capability probe failing"},
 		},
 	}
