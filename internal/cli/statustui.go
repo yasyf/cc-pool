@@ -163,7 +163,7 @@ func (w *watchedLogin) Run() error {
 	if cred, err := w.read(); err == nil {
 		w.baseline = cred.ClaudeAiOauth.AccessToken
 	}
-	outcome, err := watchAndClose(w.ctx, w.cmd, w.fp, newReloginProbe(w.read, w.baseline))
+	outcome, err := watchAndClose(w.ctx, execProc{w.cmd}, w.fp, newReloginProbe(w.read, w.baseline))
 	// Bubble Tea's post-Exec restore leaves claude's input modes on, so after a
 	// force-kill (not a clean self-exit) reset only those; Bubble Tea owns alt-screen/cursor.
 	if outcome != awaitExited && isTTY() {

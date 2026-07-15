@@ -15,7 +15,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"golang.org/x/term"
 )
 
 // finishReloginGrace bounds the post-exit credential re-probe — claude's exit
@@ -84,8 +83,6 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 
 	note(out, "Logging in %s — complete the login; cc-pool closes claude once it lands (or exit claude yourself).", accountName(a.Label))
 
-	fd := int(os.Stdin.Fd())
-	state, _ := term.GetState(fd) // nil on non-TTY; restore is nil-safe
 	read := func() (*creds.Credential, error) {
 		cred, _, rerr := m.ReadCredential(a)
 		return cred, rerr
@@ -94,9 +91,7 @@ func runRelogin(cmd *cobra.Command, m *pool.Manager, ref string) error {
 	if cred, err := read(); err == nil {
 		baseline = cred.ClaudeAiOauth.AccessToken
 	}
-	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-	outcome, werr := watchAndClose(cmd.Context(), c, isFPRow(a.OverlayKind), newReloginProbe(read, baseline))
-	restoreTerminal(out, fd, state)
+	outcome, werr := runLoginAttached(cmd.Context(), c, isFPRow(a.OverlayKind), newReloginProbe(read, baseline))
 	if outcome == awaitCanceled {
 		return werr
 	}

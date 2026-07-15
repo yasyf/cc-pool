@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/store"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
@@ -87,6 +89,43 @@ func TestLoginFlowManualSpawnsPendingAgentBeforePrint(t *testing.T) {
 	}
 }
 
+// TestLoginFlowRunNowNonTTYQuiet pins the non-TTY output contract: the
+// interactive lead-in and all escape output stay TTY-only.
+func TestLoginFlowRunNowNonTTYQuiet(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tempLeaseRoot(t)
+
+	dir := filepath.Join(t.TempDir(), "acct-07")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	swapVar(t, &watchAndClose, func(context.Context, loginProc, bool, func() (bool, error)) (awaitOutcome, error) {
+		return awaitCred, nil
+	})
+
+	pending := &pool.PendingAdd{Index: 7, ConfigDir: dir, OverlayKind: fkoverlay.BackendSymlink}
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+
+	if err := loginFlow(cmd, pending, addOptions{runNow: true}); err != nil {
+		t.Fatalf("loginFlow (non-TTY --run-login) = %v, want nil", err)
+	}
+	if s := stdout.String(); strings.Contains(s, "Logging in with claude") {
+		t.Errorf("non-TTY run printed the interactive lead-in:\n%s", s)
+	}
+	if s := stdout.String(); strings.Contains(s, "\x1b") {
+		t.Errorf("non-TTY run wrote escape bytes: %q", s)
+	}
+}
+
 func TestDefaultLabel(t *testing.T) {
 	withIdentity := func(t *testing.T, oauthJSON string) string {
 		t.Helper()
@@ -121,10 +160,67 @@ func TestDefaultLabel(t *testing.T) {
 		}
 	})
 
+	t.Run("empty label strips the claude token from a consumer email", func(t *testing.T) {
+		dir := withIdentity(t, `{"accountUuid": "u-1", "emailAddress": "me-claude-2@gmail.com"}`)
+		if got := defaultLabel("", fkoverlay.BackendSymlink, dir); got != "me-2" {
+			t.Errorf("defaultLabel = %q, want %q", got, "me-2")
+		}
+	})
+
 	t.Run("unreadable identity stays empty", func(t *testing.T) {
 		dir := withIdentity(t, "")
 		if got := defaultLabel("", fkoverlay.BackendSymlink, dir); got != "" {
 			t.Errorf("defaultLabel = %q, want empty", got)
 		}
 	})
+}
+
+func TestAccountHeader(t *testing.T) {
+	cases := []struct {
+		name string
+		n    int
+		opts addOptions
+		want string
+	}{
+		{"interactive loop numbers each section", 2, addOptions{}, "Account 2"},
+		{"counted run shows progress", 2, addOptions{count: 3}, "Account 2 of 3"},
+		{"count of one is a lone section", 1, addOptions{count: 1}, ""},
+		{"auto-yes adds exactly one account", 1, addOptions{autoYes: true}, ""},
+		{"auto-yes with a count still shows progress", 1, addOptions{autoYes: true, count: 2}, "Account 1 of 2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := accountHeader(tc.n, tc.opts)
+			if tc.want == "" {
+				if got != "" {
+					t.Errorf("accountHeader = %q, want empty", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("accountHeader = %q, want it to contain %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAddedSummary(t *testing.T) {
+	cases := []struct {
+		name  string
+		added []store.Account
+		want  string
+	}{
+		{"empty adds nothing", nil, ""},
+		{"a single add was already named by its success line", []store.Account{{Label: "Yasyf-10"}}, ""},
+		{"two adds are named", []store.Account{{Label: "Yasyf-10"}, {Label: "Yasyf-11"}}, "Added Yasyf-10 and Yasyf-11."},
+		{"three adds use commas", []store.Account{{Label: "A"}, {Label: "B"}, {Label: "C"}}, "Added A, B and C."},
+		{"unlabeled accounts get a placeholder", []store.Account{{Label: "A"}, {}}, "Added A and an unnamed account."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := addedSummary(tc.added); got != tc.want {
+				t.Errorf("addedSummary = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

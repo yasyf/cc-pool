@@ -739,7 +739,7 @@ func TestStatusTUIReloginLaunchFailureSurfaces(t *testing.T) {
 		t.Cleanup(func() { watchAndClose = prev })
 		wl := &watchedLogin{ctx: context.Background(), cmd: exec.Command("true"), out: io.Discard, read: func() (*creds.Credential, error) { return nil, errors.New("no cred") }}
 
-		watchAndClose = func(context.Context, *exec.Cmd, bool, func() (bool, error)) (awaitOutcome, error) {
+		watchAndClose = func(context.Context, loginProc, bool, func() (bool, error)) (awaitOutcome, error) {
 			return awaitCanceled, wantErr
 		}
 		if err := wl.Run(); !errors.Is(err, wantErr) {
@@ -747,7 +747,7 @@ func TestStatusTUIReloginLaunchFailureSurfaces(t *testing.T) {
 		}
 
 		// A user-quit exit is not a launch failure: it defers to the credential gate.
-		watchAndClose = func(context.Context, *exec.Cmd, bool, func() (bool, error)) (awaitOutcome, error) {
+		watchAndClose = func(context.Context, loginProc, bool, func() (bool, error)) (awaitOutcome, error) {
 			return awaitExited, errors.New("claude exited 130")
 		}
 		if err := wl.Run(); err != nil {

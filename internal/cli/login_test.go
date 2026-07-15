@@ -3,11 +3,15 @@ package cli
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/ptyrelay"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
@@ -103,6 +107,124 @@ func TestNewIdentityProbe(t *testing.T) {
 	}
 }
 
+func TestRunLoginAttachedNonTTY(t *testing.T) {
+	dir := t.TempDir()
+	stdin, err := os.CreateTemp(dir, "stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := os.CreateTemp(dir, "stdout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := os.CreateTemp(dir, "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStdin, origStdout, origStderr := os.Stdin, os.Stdout, os.Stderr
+	os.Stdin, os.Stdout, os.Stderr = stdin, stdout, stderr
+	t.Cleanup(func() {
+		os.Stdin, os.Stdout, os.Stderr = origStdin, origStdout, origStderr
+		_ = stdin.Close()
+		_ = stdout.Close()
+		_ = stderr.Close()
+	})
+
+	prev := watchAndClose
+	t.Cleanup(func() { watchAndClose = prev })
+	wantErr := errors.New("child exited")
+	const wantOutput = "plain output"
+	c := exec.Command("/usr/bin/true")
+	watchAndClose = func(_ context.Context, p loginProc, fp bool, _ func() (bool, error)) (awaitOutcome, error) {
+		ep, ok := p.(execProc)
+		if !ok {
+			t.Fatalf("process = %T, want execProc", p)
+		}
+		if ep.c != c {
+			t.Fatalf("command = %p, want %p", ep.c, c)
+		}
+		if !fp {
+			t.Fatal("fp = false, want true")
+		}
+		if c.Stdin != os.Stdin || c.Stdout != os.Stdout || c.Stderr != os.Stderr {
+			t.Fatalf("stdio = (%p, %p, %p), want (%p, %p, %p)", c.Stdin, c.Stdout, c.Stderr, os.Stdin, os.Stdout, os.Stderr)
+		}
+		if _, err := c.Stdout.Write([]byte(wantOutput)); err != nil {
+			t.Fatal(err)
+		}
+		return awaitExited, wantErr
+	}
+
+	outcome, err := runLoginAttached(context.Background(), c, true, func() (bool, error) { return false, nil })
+	if outcome != awaitExited || !errors.Is(err, wantErr) {
+		t.Fatalf("runLoginAttached = %v, %v; want awaitExited, %v", outcome, err, wantErr)
+	}
+	if _, err := stdout.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != wantOutput {
+		t.Fatalf("stdout = %q, want %q", got, wantOutput)
+	}
+}
+
+func TestLoginURLAnnotation(t *testing.T) {
+	const url = "https://example.com/oauth?code=abc"
+	copyErr := errors.New("pbcopy unavailable")
+	tests := map[string]struct {
+		copy func(string) error
+		want string
+	}{
+		"success": {
+			copy: func(got string) error {
+				if got != url {
+					t.Errorf("copied URL = %q, want %q", got, url)
+				}
+				return nil
+			},
+			want: "Login URL copied",
+		},
+		"failure": {
+			copy: func(got string) error {
+				if got != url {
+					t.Errorf("copied URL = %q, want %q", got, url)
+				}
+				return copyErr
+			},
+			want: "couldn't copy the login URL",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			prev := copyToClipboard
+			copyToClipboard = tc.copy
+			t.Cleanup(func() { copyToClipboard = prev })
+
+			if got := loginURLAnnotation(url); !strings.Contains(got, tc.want) {
+				t.Fatalf("annotation = %q, want it to contain %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExecProcBeforeStart(t *testing.T) {
+	tests := map[string]func(execProc) error{
+		"signal": func(p execProc) error { return p.Signal(os.Interrupt) },
+		"kill":   func(p execProc) error { return p.Kill() },
+	}
+	for name, call := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := call(execProc{exec.Command("/usr/bin/true")})
+			if !errors.Is(err, ptyrelay.ErrNotStarted) {
+				t.Fatalf("error = %v, want %v", err, ptyrelay.ErrNotStarted)
+			}
+		})
+	}
+}
+
 // TestTerminate's already-exited case pins the awaitCred-after-exit race: Go's select picks pseudo-randomly when tick and exit are both ready.
 func TestTerminate(t *testing.T) {
 	t.Run("live process is terminated", func(t *testing.T) {
@@ -114,7 +236,7 @@ func TestTerminate(t *testing.T) {
 		go func() { procExit <- c.Wait() }()
 
 		done := make(chan struct{})
-		go func() { terminate(c, procExit); close(done) }()
+		go func() { terminate(execProc{c}, procExit); close(done) }()
 		select {
 		case <-done:
 		case <-time.After(killGrace + 2*time.Second):
@@ -134,7 +256,7 @@ func TestTerminate(t *testing.T) {
 		procExit <- c.Wait()
 
 		done := make(chan struct{})
-		go func() { terminate(c, procExit); close(done) }()
+		go func() { terminate(execProc{c}, procExit); close(done) }()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
@@ -68,6 +69,9 @@ func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 	}
 	var added []store.Account
 	for i := 0; ; i++ {
+		if h := accountHeader(i+1, opts); h != "" && isTTY() {
+			step(cmd.OutOrStdout(), "\n%s", h)
+		}
 		lbl := ""
 		if i == 0 {
 			lbl = opts.label
@@ -131,6 +135,17 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	if err := loginFlow(cmd, pending, opts); err != nil {
 		releaseKeptAdd(cmd, m, pending)
 		return nil, err
+	}
+	// Decorative acknowledgment; identity-read failures stay silent, and the
+	// non-TTY contract (script-parsed output) is unchanged.
+	if isTTY() {
+		if id, err := pool.AccountIdentity(pending.OverlayKind, pending.ConfigDir); err == nil {
+			if id.EmailAddress != "" {
+				success(out, "Logged in as %s.", id.EmailAddress)
+			} else {
+				success(out, "Logged in.")
+			}
+		}
 	}
 
 	if checkDuplicate(cmd, m, pending, opts) {
@@ -334,7 +349,39 @@ func summarizeAdds(cmd *cobra.Command, m *pool.Manager, added []store.Account) {
 	if all, err := m.Store.ListAccounts(); err == nil {
 		total = len(all)
 	}
+	if s := addedSummary(added); s != "" && isTTY() {
+		step(cmd.OutOrStdout(), "\n%s Your pool now has %s.", s, plural(total, "account"))
+		return
+	}
 	step(cmd.OutOrStdout(), "\nYour pool now has %s.", plural(total, "account"))
+}
+
+// accountHeader returns the wizard section header for the nth add, or "" when
+// a single add is guaranteed (-y, --count 1) — a lone section needs no frame.
+func accountHeader(n int, opts addOptions) string {
+	if opts.count == 1 || (opts.autoYes && opts.count == 0) {
+		return ""
+	}
+	if opts.count > 1 {
+		return hdrStyle.Render(fmt.Sprintf("Account %d of %d", n, opts.count))
+	}
+	return hdrStyle.Render(fmt.Sprintf("Account %d", n))
+}
+
+// addedSummary names the accounts a multi-add landed; "" for a single add —
+// its success line already named it.
+func addedSummary(added []store.Account) string {
+	if len(added) < 2 {
+		return ""
+	}
+	names := make([]string, len(added))
+	for i, a := range added {
+		names[i] = a.Label
+		if names[i] == "" {
+			names[i] = "an unnamed account"
+		}
+	}
+	return fmt.Sprintf("Added %s.", strings.Join(names[:len(names)-1], ", ")+" and "+names[len(names)-1])
 }
 
 func shouldAbandon(_ *cobra.Command) bool {
