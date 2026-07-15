@@ -82,6 +82,14 @@ func newDoctorCmd() *cobra.Command {
 					}
 					if bresp, berr := cl.FPBridgeCheck(); berr == nil && bresp.OK {
 						fpBridge = bresp.FPBridge
+					} else if berr != nil {
+						// A live daemon whose check can't complete is suspect, not
+						// healthy — don't fall back to the dial-only signal. An old
+						// daemon lacking the op answers OK:false, no error.
+						fpBridge = &daemon.FPBridgeStatus{
+							Verdict: daemon.FPBridgeBoundDead,
+							Detail:  fmt.Sprintf("daemon bridge self-test did not complete: %v — restart the daemon (`brew services restart cc-pool`), then re-run `ccp doctor`", berr),
+						}
 					}
 				} else {
 					report("daemon", false, "not running; run `ccp service install`")

@@ -39,6 +39,13 @@ type FPBridgeStatus struct {
 // through-domain I/O and ReadSynth(domain, "settings.json") is domain-independent.
 const fpBridgeProbeDomain = "ccp-bridge-selftest"
 
+// fpBridgeSelfTestBudget bounds the on-demand and periodic self-test so a
+// bound-but-dead bridge (a hung Manifest+Read, up to two 5s fusekit op timeouts)
+// resolves to a BoundDead verdict well within the server's connection deadline
+// and the client's fpBridgeCheckTimeout — never abandoned as a transport error
+// that would fall back to the dial-only signal.
+const fpBridgeSelfTestBudget = 9 * time.Second
+
 // The three levers a not-serving verdict carries at record time. Consent-parked
 // clears itself once granted (the watchdog re-binds with no restart); the others
 // name the concrete daemon action.
@@ -65,6 +72,8 @@ func (s *Server) fpBridgeCheck(ctx context.Context) FPBridgeStatus {
 	if s.fpConsentPending.Load() {
 		return FPBridgeStatus{Verdict: FPBridgeConsentParked, Detail: fpBridgeConsentLever}
 	}
+	ctx, cancel := context.WithTimeout(ctx, fpBridgeSelfTestBudget)
+	defer cancel()
 	cl := content.NewBridgeClient(pool.FPBridgeSocketPath())
 	switch err := cl.SelfTest(ctx, fpBridgeProbeDomain, settingsProbeEntry); {
 	case err == nil:
@@ -105,14 +114,18 @@ func (s *Server) recordFPBridgeHealth(ctx context.Context) {
 // lever as the row's lastErr, and logs the one-shot wedge transition.
 func (s *Server) recordFPBridgeVerdict(st FPBridgeStatus) {
 	s.ledMu.Lock()
-	defer s.ledMu.Unlock()
 	if st.Verdict == FPBridgeServing {
 		s.led.clear(fpBridgePolicy, poolResource)
+		s.ledMu.Unlock()
 		return
 	}
 	before := s.led.faulted(fpBridgePolicy, poolResource)
 	s.led.strike(fpBridgePolicy, poolResource, time.Now(), fmt.Errorf("%s: %s", st.Verdict, st.Detail))
-	if !before && s.led.faulted(fpBridgePolicy, poolResource) {
+	wedged := !before && s.led.faulted(fpBridgePolicy, poolResource)
+	s.ledMu.Unlock()
+	// Log the one-shot wedge transition off the lock — a stalled log sink must
+	// not block every bridge-ledger, readiness, and status reader on ledMu.
+	if wedged {
 		s.log.Printf("file provider bridge: %s — %s", st.Verdict, st.Detail)
 	}
 }

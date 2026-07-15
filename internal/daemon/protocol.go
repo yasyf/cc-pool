@@ -12,7 +12,10 @@ import (
 	"github.com/yasyf/fusekit/version"
 )
 
-// ProtocolVersion is bumped on incompatible wire changes.
+// ProtocolVersion is bumped on incompatible wire changes. Pinned at 1: the
+// StatusSnapshot on-disk format the widget hard-rejects on mismatch shares this
+// constant, and v0.56's removed socket projections degrade gracefully (an old
+// CLI zero-values the absent fields) rather than breaking the wire.
 const ProtocolVersion = 1
 
 // Op is a request operation.

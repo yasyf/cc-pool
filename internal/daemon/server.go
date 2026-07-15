@@ -408,6 +408,12 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		// the client's 150s so the server, not a dead socket, reports the outcome.
 		_ = conn.SetDeadline(time.Now().Add(140 * time.Second))
 	}
+	if req.Op == OpFPBridgeCheck {
+		// Above fpBridgeSelfTestBudget (9s), under the client's 15s: a bound-dead
+		// verdict is written back, not lost as a transport error (doctor reads a
+		// lost check as a healthy dial).
+		_ = conn.SetDeadline(time.Now().Add(13 * time.Second))
+	}
 	resp := s.dispatch(ctx, req)
 	resp.Proto = ProtocolVersion
 	writeResp(conn, resp)

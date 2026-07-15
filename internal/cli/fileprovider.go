@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/huh"
@@ -167,9 +168,13 @@ func runFPConsentProbe() error {
 		return fmt.Errorf("create File Provider bridge directory: %w", err)
 	}
 	path := filepath.Join(dir, ".consent-probe")
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
+	// O_NOFOLLOW|O_EXCL: never follow or truncate a planted symlink/pre-existing
+	// file — the write must land on our own fresh probe, not another target.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
 		return fmt.Errorf("write File Provider consent probe: %w", err)
 	}
+	_ = f.Close()
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("remove File Provider consent probe: %w", err)
 	}
@@ -195,13 +200,28 @@ func runFPConsent(cmd *cobra.Command, interval time.Duration) error {
 		}
 		return fmt.Errorf("File Provider consent cannot be granted over SSH; run this in a local terminal on %s", host)
 	}
+	// A skewed daemon runs a stable binary that predates `fp consent-probe`, so
+	// diagnose the skew here rather than failing later with an opaque probe error
+	// (mirrors runFPRepair).
+	if health, herr := daemon.NewClient().Health(); herr == nil && health.Version != version.String() {
+		return fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) so its stable binary can grant consent, then re-run", health.Version, version.String())
+	}
 	stable := filepath.Join(pool.StableBinDir(), "cc-pool")
-	fi, err := os.Stat(stable)
+	// Lstat (not Stat) + owner/permission checks: refuse to hand the
+	// kTCCServiceSystemPolicyAppData grant to a symlinked, foreign-owned, or
+	// other-writable binary.
+	fi, err := os.Lstat(stable)
 	if err != nil {
 		return fmt.Errorf("stable daemon binary %s is required for File Provider consent; run `ccp service install`: %w", abbreviateHome(stable), err)
 	}
-	if !fi.Mode().IsRegular() {
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
 		return fmt.Errorf("stable daemon binary %s is not a regular file; run `ccp service install`", abbreviateHome(stable))
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
+		return fmt.Errorf("stable daemon binary %s is not owned by you; refusing to grant File Provider consent — run `ccp service install`", abbreviateHome(stable))
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("stable daemon binary %s is writable by group or others; refusing to grant File Provider consent — run `ccp service install`", abbreviateHome(stable))
 	}
 	if err := fpConsentProbeExec(cmd.Context(), stable, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr()); err != nil {
 		return fmt.Errorf("grant File Provider consent to %s: %w", abbreviateHome(stable), err)
@@ -499,6 +519,7 @@ func awaitFPCapability(ctx context.Context, out io.Writer, interval time.Duratio
 	explained := false
 	var stallStarted time.Time
 	var lastErr error
+	prevDialRefused := false
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for i := 0; ; i++ {
@@ -524,11 +545,15 @@ func awaitFPCapability(ctx context.Context, out io.Writer, interval time.Duratio
 			}
 		} else {
 			now := fpCapabilityNow()
-			if stallStarted.IsZero() {
+			dialRefused := errors.Is(err, fileproviderd.ErrAppDialRefused)
+			// The coming-up and probe-failing lanes are each bounded separately:
+			// a fresh window on the first stall and on every lane transition, so
+			// 30s of each is not one 60s stall.
+			if stallStarted.IsZero() || dialRefused != prevDialRefused {
 				stallStarted = now
 			}
+			prevDialRefused = dialRefused
 			lastErr = err
-			dialRefused := errors.Is(err, fileproviderd.ErrAppDialRefused)
 			if !dialRefused {
 				msg = "app answering but capability probe failing: " + err.Error() + "… press ctrl-c to abort"
 			}
