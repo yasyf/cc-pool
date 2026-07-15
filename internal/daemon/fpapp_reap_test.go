@@ -145,7 +145,7 @@ func TestReconcileStaleFPApp(t *testing.T) {
 			wantScanCalls: 1,
 		},
 		{
-			name:    "consent pending blocks a stale app reap",
+			name:    "consent pending (bring-up/enumeration window) blocks a stale app reap",
 			scans:   [][]procscan.Proc{{{PID: 42, StartedAt: old}}},
 			wired:   true,
 			consent: true,

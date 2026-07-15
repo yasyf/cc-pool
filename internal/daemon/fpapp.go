@@ -83,6 +83,10 @@ type fpAppProcess struct {
 	StartedAt time.Time
 }
 
+// shouldReapFPApp gates the stale-app reap. Consent-pending IS the
+// mid-enumeration guard: it is the daemon's only FP bring-up signal, and
+// killing the host app cannot abort appex enumerations (fileproviderd owns
+// the appex).
 func (s *Server) shouldReapFPApp() bool {
 	return s.fpEnabled() && !s.fpConsentPending.Load()
 }
