@@ -301,16 +301,9 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 		}
 	}
 
-	// Consume the reservation before registering: once a sweep or release
-	// re-opened the index, a concurrent add may hold it, and a blind upsert
-	// would silently collide on the same index/dir/Keychain service. A crash
-	// between consume and upsert briefly frees the index while the dir remains
-	// — the pre-reservation semantics — and fail-loud beats silent collision.
-	if err := m.Store.ConsumeAccountIndex(p.Index); err != nil {
+	// Atomic consume+upsert: fails loud if the reservation was swept or released.
+	if err := m.Store.PromoteReservedAccount(acct); err != nil {
 		return nil, fmt.Errorf("finalize %s: %w", p.ConfigDir, err)
-	}
-	if err := m.Store.UpsertAccount(acct); err != nil {
-		return nil, err
 	}
 
 	// Best-effort usage check: a failure returns the added account with the error,
@@ -454,6 +447,14 @@ func (m *Manager) SyncOverlay(a store.Account) error {
 	prov, err := m.overlayFor(backend)
 	if err != nil {
 		return fmt.Errorf("sync overlay for acct-%02d: resolve provider: %w", a.ID, err)
+	}
+	// Re-check just before Sync's MkdirAll: a remove racing the poll must not
+	// recreate the dir. A gone row is not an error — nothing left to sync.
+	if _, err := m.Store.GetAccount(a.ID); err != nil {
+		if errors.Is(err, store.ErrAccountNotFound) {
+			return nil
+		}
+		return fmt.Errorf("sync overlay for acct-%02d: %w", a.ID, err)
 	}
 	return prov.Sync(ClaudeDir(), a.ConfigDir)
 }
