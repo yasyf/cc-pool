@@ -45,6 +45,50 @@ func TestCommitSelectionWithLeaseStopsNewAgentOnCommitFailure(t *testing.T) {
 	}
 }
 
+func TestAbortDaemonSelectionOutlivesCallerCancellation(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "ccp-home")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("unix", pool.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	reqCh := make(chan daemon.Request, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		var req daemon.Request
+		if err := json.NewDecoder(conn).Decode(&req); err != nil {
+			return
+		}
+		reqCh <- req
+		_ = json.NewEncoder(conn).Encode(daemon.Response{Proto: daemon.ProtocolVersion, OK: true})
+	}()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	abortDaemonSelection(ctx, daemon.NewClient(), "reservation-token")
+	select {
+	case req := <-reqCh:
+		if req.Op != daemon.OpSelectAbort || req.ReservationToken != "reservation-token" {
+			t.Fatalf("abort request = %+v", req)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("abort request was not sent after caller cancellation")
+	}
+}
+
 type contextBlockingOverlay struct {
 	started       chan struct{}
 	unboundedSync bool
@@ -57,10 +101,12 @@ func (f *contextBlockingOverlay) Health(_, _ string) error      { return nil }
 func (f *contextBlockingOverlay) Teardown(_, _ string) (string, error) {
 	return "", nil
 }
+
 func (f *contextBlockingOverlay) Sync(_, _ string) error {
 	f.unboundedSync = true
 	return errors.New("unbounded sync called")
 }
+
 func (f *contextBlockingOverlay) SyncContext(ctx context.Context, _, _ string) error {
 	close(f.started)
 	<-ctx.Done()
@@ -81,7 +127,7 @@ func TestResolveSelectionBoundsOverlaySyncByLaunchContext(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.SetContext(context.Background())
 
-	_, err := resolveSelectionTxn(cmd, m, selectReq{account: &id, noDaemon: true, ctx: ctx})
+	_, err := resolveSelectionTxn(ctx, cmd, m, selectReq{account: &id, noDaemon: true})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("resolveSelectionTxn err = %v, want launch deadline", err)
 	}

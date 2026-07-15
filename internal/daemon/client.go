@@ -146,6 +146,11 @@ func (c *Client) Status() (*Response, error) {
 	return c.do(Request{Op: OpStatus}, 5*time.Second)
 }
 
+// StatusContext asks the daemon for all account statuses within ctx's deadline.
+func (c *Client) StatusContext(ctx context.Context) (*Response, error) {
+	return c.doContext(ctx, Request{Op: OpStatus}, 5*time.Second)
+}
+
 // Checkin releases a checkout for pid.
 func (c *Client) Checkin(pid int) (*Response, error) {
 	return c.do(Request{Op: OpCheckin, PID: pid}, 3*time.Second)

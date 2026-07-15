@@ -485,7 +485,7 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 		mounts, dials := tattle(t)
 		s := testServer(f.socket, 3*time.Second)
 		s.holderSocket = mounts
-		ln, lock, err := s.listen()
+		ln, lock, err := s.listen(t.Context())
 		if err != nil {
 			t.Fatalf("listen should evict the skewed daemon and bind: %v", err)
 		}
@@ -508,7 +508,7 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 		})
 		s := testServer(f.socket, 2*time.Second)
 		s.holderSocket = mounts
-		ln, lock, err := s.listen()
+		ln, lock, err := s.listen(t.Context())
 		if err != nil {
 			t.Fatalf("listen should reap the wedged orphan and bind: %v", err)
 		}

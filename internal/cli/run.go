@@ -133,8 +133,8 @@ func runClaude(cmd *cobra.Command, m *pool.Manager, args []string) error {
 	defer cancel()
 	return runLaunchCandidates(ctx, account != nil,
 		func(excluded []int) (*selectionTxn, error) {
-			return resolveSelectionTxn(cmd, m, selectReq{
-				account: account, cwd: cwd, pid: os.Getpid(), excludeIDs: excluded, ctx: ctx,
+			return resolveSelectionTxn(ctx, cmd, m, selectReq{
+				account: account, cwd: cwd, pid: os.Getpid(), excludeIDs: excluded,
 			})
 		},
 		func(selection *selectionTxn) error {

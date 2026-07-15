@@ -287,7 +287,7 @@ func (s *Server) detectAndSetUserAgent(ctx context.Context) {
 }
 
 func (s *Server) serve(ctx context.Context) error {
-	ln, lock, err := s.listen()
+	ln, lock, err := s.listen(ctx)
 	if err != nil {
 		return err
 	}
@@ -366,20 +366,23 @@ func (s *Server) serve(ctx context.Context) error {
 // same-version peer is refused, a version-skewed one evicted. proc.SingleEntrant
 // owns the sequence; the Evict closure, which speaks the daemon wire, is the only
 // cc-pool-specific policy. See ccn doc 7b7a53f.
-func (s *Server) listen() (net.Listener, *os.File, error) {
+func (s *Server) listen(ctx context.Context) (net.Listener, *os.File, error) {
 	return proc.SingleEntrant{
 		Socket:  s.socket,
 		Timeout: s.evictTimeout,
 		Evict: func() (bool, error) {
 			c := &Client{socket: s.socket}
-			resp, err := c.Health()
+			resp, err := c.HealthContext(ctx)
 			if err != nil {
+				if ctx.Err() != nil {
+					return false, ctx.Err()
+				}
 				return false, nil // no live peer answered
 			}
 			if resp.Version == version.String() {
 				return false, errors.New("another cc-pool daemon at the same version is already running")
 			}
-			if err := s.evictPeer(c, resp.Version); err != nil {
+			if err := s.evictPeer(ctx, c, resp.Version); err != nil {
 				return false, err
 			}
 			return true, nil // evicted (flock-holder polls; flock-less binds)
@@ -389,9 +392,9 @@ func (s *Server) listen() (net.Listener, *os.File, error) {
 
 // evictPeer tells a version-skewed peer daemon to step down (OpShutdown) and
 // waits it out, hard-killing the exact socket peer if it acks but wedges.
-func (s *Server) evictPeer(c *Client, ver string) error {
+func (s *Server) evictPeer(ctx context.Context, c *Client, ver string) error {
 	s.log.Printf("evicting version-skewed daemon (%s) holding the socket", ver)
-	if _, err := c.Shutdown(); err != nil {
+	if _, err := c.doContext(ctx, Request{Op: OpShutdown}, 2*time.Second); err != nil {
 		return fmt.Errorf("evict holder %s: %w", ver, err)
 	}
 	if !c.WaitGone(s.evictTimeout) {

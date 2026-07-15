@@ -122,7 +122,7 @@ func testServer(socket string, evict time.Duration) *Server {
 func TestListenRefusesSameVersionHolder(t *testing.T) {
 	f := newFakeDaemon(t, version.String(), false)
 	s := testServer(f.socket, time.Second)
-	if _, _, err := s.listen(); err == nil || !strings.Contains(err.Error(), "same version") {
+	if _, _, err := s.listen(t.Context()); err == nil || !strings.Contains(err.Error(), "same version") {
 		t.Fatalf("listen against a same-version holder: err = %v, want a 'same version' refusal", err)
 	}
 }
@@ -131,7 +131,7 @@ func TestListenEvictsSkewedHolder(t *testing.T) {
 	guardKillSocketPeer(t)
 	f := newFakeDaemon(t, "0.0.0-old", true)
 	s := testServer(f.socket, 3*time.Second)
-	ln, lock, err := s.listen()
+	ln, lock, err := s.listen(t.Context())
 	if err != nil {
 		t.Fatalf("listen should evict the skewed holder and bind, got err = %v", err)
 	}
@@ -148,7 +148,7 @@ func TestListenSkewedHolderIgnoresShutdown(t *testing.T) {
 	guardKillSocketPeer(t)
 	f := newFakeDaemon(t, "0.0.0-old", false)
 	s := testServer(f.socket, 500*time.Millisecond)
-	if _, _, err := s.listen(); err == nil || !strings.Contains(err.Error(), "did not release") {
+	if _, _, err := s.listen(t.Context()); err == nil || !strings.Contains(err.Error(), "did not release") {
 		t.Fatalf("listen against a holder that ignores shutdown: err = %v, want a 'did not release' timeout", err)
 	}
 }
@@ -255,7 +255,7 @@ func TestListenRefusedWhileLockHeld(t *testing.T) {
 		}
 
 		s := testServer(socket, time.Second)
-		if _, _, err := s.listen(); !errors.Is(err, proc.ErrPeerStarting) {
+		if _, _, err := s.listen(t.Context()); !errors.Is(err, proc.ErrPeerStarting) {
 			t.Fatalf("listen with the daemon lock held = %v, want proc.ErrPeerStarting", err)
 		}
 		if _, statErr := os.Stat(socket); !errors.Is(statErr, fs.ErrNotExist) {
@@ -267,7 +267,7 @@ func TestListenRefusedWhileLockHeld(t *testing.T) {
 		guardKillSocketPeer(t)
 		f := newFlockedFakeDaemon(t, version.String(), false)
 		s := testServer(f.socket, time.Second)
-		if _, _, err := s.listen(); err == nil || !strings.Contains(err.Error(), "same version") {
+		if _, _, err := s.listen(t.Context()); err == nil || !strings.Contains(err.Error(), "same version") {
 			t.Fatalf("listen against a same-version flocked peer = %v, want a 'same version' refusal", err)
 		}
 		c := &Client{socket: f.socket}
@@ -281,7 +281,7 @@ func TestListenEvictsFlockedSkewedDaemon(t *testing.T) {
 	guardKillSocketPeer(t)
 	f := newFlockedFakeDaemon(t, "0.0.0-old", true)
 	s := testServer(f.socket, 3*time.Second)
-	ln, lock, err := s.listen()
+	ln, lock, err := s.listen(t.Context())
 	if err != nil {
 		t.Fatalf("listen should evict the flocked skewed daemon and bind: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestListenWaitsOutEvictedPeersFlockDrain(t *testing.T) {
 	guardKillSocketPeer(t)
 	f := newFlockedFakeDaemonLateLockRelease(t, "0.0.0-old", 400*time.Millisecond)
 	s := testServer(f.socket, 2*time.Second)
-	ln, lock, err := s.listen()
+	ln, lock, err := s.listen(t.Context())
 	if err != nil {
 		t.Fatalf("listen must wait out the evicted peer's flock drain: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestListenEvictedPeerNeverReleasesFlock(t *testing.T) {
 	guardKillSocketPeer(t)
 	f := newFlockedFakeDaemonLateLockRelease(t, "0.0.0-old", time.Hour)
 	s := testServer(f.socket, 400*time.Millisecond)
-	if _, _, err := s.listen(); !errors.Is(err, proc.ErrLockStillHeld) {
+	if _, _, err := s.listen(t.Context()); !errors.Is(err, proc.ErrLockStillHeld) {
 		t.Fatalf("listen with the peer's flock never released = %v, want proc.ErrLockStillHeld", err)
 	}
 }
@@ -337,7 +337,7 @@ func TestCrashedDaemonLockAndSocketReclaimed(t *testing.T) {
 	}
 
 	s := testServer(socket, time.Second)
-	ln2, lock, err := s.listen()
+	ln2, lock, err := s.listen(t.Context())
 	if err != nil {
 		t.Fatalf("listen over a crashed daemon's leavings: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestEvictHolderKillsWedgedOrphan(t *testing.T) {
 	})
 
 	s := testServer(f.socket, 3*time.Second)
-	ln, lock, err := s.listen()
+	ln, lock, err := s.listen(t.Context())
 	if err != nil {
 		t.Fatalf("listen should reap the wedged orphan and bind, got err = %v", err)
 	}

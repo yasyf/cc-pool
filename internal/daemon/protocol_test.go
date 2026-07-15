@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -59,6 +60,16 @@ func TestClientRejectsIncompatibleProtocol(t *testing.T) {
 	_, err = (&Client{socket: socket}).HealthContext(ctx)
 	if !errors.Is(err, ErrProtocolMismatch) {
 		t.Fatalf("HealthContext err = %v, want protocol mismatch", err)
+	}
+}
+
+func TestStatusContextHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := (&Client{socket: filepath.Join(t.TempDir(), "missing.sock")}).StatusContext(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("StatusContext err = %v, want context cancellation", err)
 	}
 }
 

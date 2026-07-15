@@ -48,7 +48,7 @@ scores; otherwise it samples usage live.`,
 				if cmd.Flags().Changed("account") {
 					req.account = &account
 				}
-				selection, err := resolveSelectionTxn(cmd, m, req)
+				selection, err := resolveSelectionTxn(commandContext(cmd), cmd, m, req)
 				if err != nil {
 					return err
 				}
@@ -75,9 +75,6 @@ scores; otherwise it samples usage live.`,
 }
 
 func commitSelectionWithLease(ctx context.Context, selection *selectionTxn) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	agent, err := spawnLeaseAgent(selection.acct)
 	if err != nil {
 		return fmt.Errorf("couldn't hold the session lease for %s: %w", accountName(selection.acct.Label), err)
@@ -105,13 +102,9 @@ type selectReq struct {
 	// place), `ccp select` passes 0 so procscan attributes the live process.
 	pid        int
 	excludeIDs []int
-	ctx        context.Context
 }
 
-func (r selectReq) context(cmd *cobra.Command) context.Context {
-	if r.ctx != nil {
-		return r.ctx
-	}
+func commandContext(cmd *cobra.Command) context.Context {
 	if ctx := cmd.Context(); ctx != nil {
 		return ctx
 	}
@@ -153,19 +146,19 @@ func (s *selectionTxn) Abort() {
 // daemon → live), returning the selected account so callers can take its session
 // lease; the caller owns stdout and the diagnostic line.
 func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (acct store.Account, dir, line string, err error) {
-	selection, err := resolveSelectionTxn(cmd, m, req)
+	ctx := commandContext(cmd)
+	selection, err := resolveSelectionTxn(ctx, cmd, m, req)
 	if err != nil {
 		return store.Account{}, "", "", err
 	}
 	defer selection.Abort()
-	if err := selection.Commit(req.context(cmd)); err != nil {
+	if err := selection.Commit(ctx); err != nil {
 		return store.Account{}, "", "", fmt.Errorf("commit selection: %w", err)
 	}
 	return selection.acct, selection.dir, selection.line, nil
 }
 
-func resolveSelectionTxn(cmd *cobra.Command, m *pool.Manager, req selectReq) (*selectionTxn, error) {
-	ctx := req.context(cmd)
+func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manager, req selectReq) (*selectionTxn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -190,12 +183,12 @@ func resolveSelectionTxn(cmd *cobra.Command, m *pool.Manager, req selectReq) (*s
 						return nil, errors.New(resp.Error)
 					}
 					if err := ctx.Err(); err != nil {
-						abortDaemonSelection(cl, resp.ReservationToken)
+						abortDaemonSelection(ctx, cl, resp.ReservationToken)
 						return nil, err
 					}
 					picked, err := validateDaemonSelection(m, resp, &a)
 					if err != nil {
-						abortDaemonSelection(cl, resp.ReservationToken)
+						abortDaemonSelection(ctx, cl, resp.ReservationToken)
 						return nil, err
 					}
 					if resp.ReservationToken == "" {
@@ -203,13 +196,13 @@ func resolveSelectionTxn(cmd *cobra.Command, m *pool.Manager, req selectReq) (*s
 					}
 					dir, err := prepareAccount(ctx, cmd, m, picked)
 					if err != nil {
-						abortDaemonSelection(cl, resp.ReservationToken)
+						abortDaemonSelection(ctx, cl, resp.ReservationToken)
 						return nil, err
 					}
 					return &selectionTxn{
 						acct: picked, dir: dir, line: selectionLine(accountName(picked.Label), false, false, 0, 0, "", 0),
 						commit: func(ctx context.Context) error { return cl.CommitSelection(ctx, resp.ReservationToken) },
-						abort:  func() { abortDaemonSelection(cl, resp.ReservationToken) },
+						abort:  func() { abortDaemonSelection(ctx, cl, resp.ReservationToken) },
 					}, nil
 				}
 			}
@@ -239,7 +232,7 @@ func resolveSelectionTxn(cmd *cobra.Command, m *pool.Manager, req selectReq) (*s
 			if resp, ok := cl.Select(ctx, nil, req.pid, false, req.cwd, req.wait, req.excludeIDs); ok {
 				if err := ctx.Err(); err != nil {
 					if resp.OK {
-						abortDaemonSelection(cl, resp.ReservationToken)
+						abortDaemonSelection(ctx, cl, resp.ReservationToken)
 					}
 					return nil, err
 				}
@@ -247,7 +240,7 @@ func resolveSelectionTxn(cmd *cobra.Command, m *pool.Manager, req selectReq) (*s
 				case outcomePicked:
 					a, err := validateDaemonSelection(m, resp, nil)
 					if err != nil {
-						abortDaemonSelection(cl, resp.ReservationToken)
+						abortDaemonSelection(ctx, cl, resp.ReservationToken)
 						return nil, err
 					}
 					if resp.ReservationToken == "" {
@@ -261,23 +254,23 @@ func resolveSelectionTxn(cmd *cobra.Command, m *pool.Manager, req selectReq) (*s
 					return &selectionTxn{
 						acct: a, dir: a.ConfigDir, line: daemonSelectionLine(m, resp),
 						commit: func(ctx context.Context) error { return cl.CommitSelection(ctx, resp.ReservationToken) },
-						abort:  func() { abortDaemonSelection(cl, resp.ReservationToken) },
+						abort:  func() { abortDaemonSelection(ctx, cl, resp.ReservationToken) },
 					}, nil
 				case outcomeError:
 					if resp.OK {
-						abortDaemonSelection(cl, resp.ReservationToken)
+						abortDaemonSelection(ctx, cl, resp.ReservationToken)
 					}
 					return nil, errors.New(resp.Error)
 				case outcomeWait:
 					if resp.OK {
-						abortDaemonSelection(cl, resp.ReservationToken)
+						abortDaemonSelection(ctx, cl, resp.ReservationToken)
 					}
 					if resp.SoonestReset != nil {
 						step(cmd.ErrOrStderr(), "All accounts are busy; waiting until %s.", humanizeReset(*resp.SoonestReset))
 					}
 				case outcomeFail:
 					if resp.OK {
-						abortDaemonSelection(cl, resp.ReservationToken)
+						abortDaemonSelection(ctx, cl, resp.ReservationToken)
 					}
 					if resp.MountsNotReady {
 						return nil, pool.ErrMountsNotReady
@@ -291,7 +284,7 @@ func resolveSelectionTxn(cmd *cobra.Command, m *pool.Manager, req selectReq) (*s
 	// Live selection defers stickiness and the session row to the caller's commit.
 	opts := pool.SelectOptions{Live: true, FreshFor: req.fresh, Cwd: req.cwd, PID: req.pid, NoFallback: req.wait, ExcludeIDs: req.excludeIDs, DeferCommit: true}
 	for {
-		sr, err := m.Select(req.context(cmd), opts)
+		sr, err := m.Select(ctx, opts)
 		if errors.Is(err, pool.ErrNoneAvailable) {
 			if !req.wait {
 				step(cmd.ErrOrStderr(), "No account is available right now; all are exhausted or rate-limited.")
@@ -306,8 +299,8 @@ func resolveSelectionTxn(cmd *cobra.Command, m *pool.Manager, req selectReq) (*s
 				}
 			}
 			select {
-			case <-req.context(cmd).Done():
-				return nil, req.context(cmd).Err()
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			case <-time.After(d):
 				continue
 			}
@@ -350,11 +343,11 @@ func daemonClientAt(ctx context.Context, cl *daemon.Client, wantVersion string) 
 	return err == nil && resp.OK && resp.Version == wantVersion
 }
 
-func abortDaemonSelection(cl *daemon.Client, token string) {
+func abortDaemonSelection(ctx context.Context, cl *daemon.Client, token string) {
 	if token == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
 	_ = cl.AbortSelection(ctx, token)
 }
