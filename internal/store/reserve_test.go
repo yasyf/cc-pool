@@ -1,6 +1,8 @@
 package store
 
 import (
+	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -219,5 +221,100 @@ func TestSweepPendingAdds(t *testing.T) {
 	}
 	if got := mustReserve(t, s); got != n {
 		t.Fatalf("reserve after sweep = %d, want the reclaimed %d", got, n)
+	}
+}
+
+func TestPromoteReservedAccount(t *testing.T) {
+	t.Run("spends the reservation and lands the row", func(t *testing.T) {
+		s := openReserveTest(t)
+		id := mustReserve(t, s)
+		acct := Account{ID: id, ConfigDir: "dir", KeychainService: "svc", KeychainAccount: "u"}
+		if err := s.PromoteReservedAccount(acct); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.GetAccount(id); err != nil {
+			t.Fatalf("GetAccount after promote: %v", err)
+		}
+		// The reservation is spent: nothing left to sweep, and the index is held
+		// by the accounts row.
+		if swept, err := s.SweepPendingAdds(time.Now().Add(time.Hour)); err != nil || swept != 0 {
+			t.Fatalf("SweepPendingAdds = %d, %v; want 0, nil", swept, err)
+		}
+		if got := mustReserve(t, s); got == id {
+			t.Fatalf("reserve = %d, but index %d is held by the promoted row", got, id)
+		}
+	})
+
+	t.Run("fails loud on a swept reservation without writing a row", func(t *testing.T) {
+		s := openReserveTest(t)
+		id := mustReserve(t, s)
+		if _, err := s.SweepPendingAdds(time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		acct := Account{ID: id, ConfigDir: "dir", KeychainService: "svc", KeychainAccount: "u"}
+		if err := s.PromoteReservedAccount(acct); err == nil {
+			t.Fatal("promote of a swept reservation succeeded, want fail-loud")
+		}
+		if _, err := s.GetAccount(id); !errors.Is(err, ErrAccountNotFound) {
+			t.Fatalf("GetAccount after refused promote = %v, want ErrAccountNotFound (no row written)", err)
+		}
+	})
+}
+
+// TestPromoteReservedAccountConcurrent pins the atomic promote: many adds racing
+// reserve→promote each land a distinct index. A non-atomic consume-then-upsert
+// leaves a half-open window in which a concurrent ReserveAccountIndex reuses the
+// index, handing the same id to two adds.
+func TestPromoteReservedAccountConcurrent(t *testing.T) {
+	s := openReserveTest(t)
+	const workers = 24
+	start := make(chan struct{})
+	got := make(chan int, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			id, err := s.ReserveAccountIndex()
+			if err != nil {
+				errs <- err
+				return
+			}
+			acct := Account{
+				ID:              id,
+				ConfigDir:       fmt.Sprintf("dir-%d", id),
+				KeychainService: fmt.Sprintf("svc-%d", id),
+				KeychainAccount: "u",
+			}
+			if err := s.PromoteReservedAccount(acct); err != nil {
+				errs <- err
+				return
+			}
+			got <- id
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(got)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent add: %v", err)
+	}
+	seen := map[int]bool{}
+	var ids []int
+	for id := range got {
+		if seen[id] {
+			t.Fatalf("index %d handed out to two concurrent adds", id)
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	for i, id := range ids {
+		if id != i+1 {
+			t.Fatalf("indices = %v, want 1..%d with no duplicates or gaps", ids, workers)
+		}
 	}
 }

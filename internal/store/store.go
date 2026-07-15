@@ -173,14 +173,24 @@ func (s *Store) SetMeta(key, value string) error {
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
+// rowExecer is the write subset shared by *sql.DB and *sql.Tx, so an account
+// upsert composes into a caller's transaction (see PromoteReservedAccount).
+type rowExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
 // UpsertAccount inserts or replaces an account row by id; account_uuid is
 // insert-only so a re-upsert can't wipe a backfilled value.
 func (s *Store) UpsertAccount(a Account) error {
+	return upsertAccount(s.db, a)
+}
+
+func upsertAccount(e rowExecer, a Account) error {
 	created := a.CreatedAt
 	if created.IsZero() {
 		created = time.Now()
 	}
-	_, err := s.db.Exec(
+	_, err := e.Exec(
 		`INSERT INTO accounts(id,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at)
 		 VALUES(?,?,?,?,?,?,?,?)
 		 ON CONFLICT(id) DO UPDATE SET
@@ -260,12 +270,17 @@ func (s *Store) ListAccounts() ([]Account, error) {
 	return out, rows.Err()
 }
 
-// GetAccount returns one account by id.
+// ErrAccountNotFound is returned by GetAccount when no row matches the id, so
+// callers can distinguish a removed account from a real query failure.
+var ErrAccountNotFound = errors.New("account not found")
+
+// GetAccount returns one account by id, wrapping ErrAccountNotFound when the
+// row is absent.
 func (s *Store) GetAccount(id int) (Account, error) {
 	row := s.db.QueryRow(`SELECT `+accountCols+` FROM accounts WHERE id=?`, id)
 	a, err := scanAccount(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return a, fmt.Errorf("account %d not found", id)
+		return a, fmt.Errorf("account %d: %w", id, ErrAccountNotFound)
 	}
 	return a, err
 }

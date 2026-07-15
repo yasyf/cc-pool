@@ -42,7 +42,13 @@ func (s *Store) ReleaseAccountIndex(id int) error {
 // exactly one row must be deleted, else it fails loud — a blind promote could
 // collide on the index.
 func (s *Store) ConsumeAccountIndex(id int) error {
-	res, err := s.db.Exec(`DELETE FROM pending_adds WHERE id=?`, id)
+	return consumeReservation(s.db, id)
+}
+
+// consumeReservation runs the consume against e (a *sql.DB or a *sql.Tx), so
+// PromoteReservedAccount can spend the reservation inside its transaction.
+func consumeReservation(e rowExecer, id int) error {
+	res, err := e.Exec(`DELETE FROM pending_adds WHERE id=?`, id)
 	if err != nil {
 		return fmt.Errorf("consume account index %d: %w", id, err)
 	}
@@ -52,6 +58,28 @@ func (s *Store) ConsumeAccountIndex(id int) error {
 	}
 	if n != 1 {
 		return fmt.Errorf("consume account index %d: reservation gone (released or swept)", id)
+	}
+	return nil
+}
+
+// PromoteReservedAccount spends account a's index reservation and inserts its
+// row in one transaction, so a concurrent ReserveAccountIndex never observes
+// the index free between the two. A reservation already gone (released or
+// swept) fails loud and writes no row.
+func (s *Store) PromoteReservedAccount(a Account) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("promote account %d: %w", a.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := consumeReservation(tx, a.ID); err != nil {
+		return err
+	}
+	if err := upsertAccount(tx, a); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("promote account %d: %w", a.ID, err)
 	}
 	return nil
 }
