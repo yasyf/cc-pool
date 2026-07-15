@@ -3,11 +3,16 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/fusekit/fileproviderd"
+	"golang.org/x/sys/unix"
 )
 
 // fpAppPolicy backs the fp.app.ensure row: a fixed-window backoff with no
@@ -22,6 +27,9 @@ const fpAppResource = "app"
 // (pool/overlay.go): File Provider bring-up is heavier than a Go child, so the
 // wait for the freshly launched app's control socket is generous.
 const fpAppSpawnTimeout = 30 * time.Second
+
+// staleFPAppSlack absorbs timestamp rounding between process start and ctime.
+const staleFPAppSlack = 5 * time.Second
 
 // fpAppAvailable reports whether the companion app serves its control socket
 // (it is alive). Zero-spawn — a plain socket dial. Test seam.
@@ -41,6 +49,12 @@ var fpAppSpawn = func(ctx context.Context) error {
 		Timeout:       fpAppSpawnTimeout,
 	}.EnsureRunning(ctx)
 }
+
+var (
+	listFPAppProcs  = procscan.ProcsByExecutable
+	fpAppBinaryPath = pool.WidgetAppBinaryPath
+	killFPAppPID    = func(pid int) error { return unix.Kill(pid, unix.SIGKILL) }
+)
 
 // fpCloudStorageDomains lists the pool account indices with a live
 // ~/Library/CloudStorage File Provider domain root (FPDomainFolderPrefix +
@@ -62,6 +76,15 @@ var fpCloudStorageDomains = func() ([]int, error) {
 		}
 	}
 	return ids, nil
+}
+
+type fpAppProcess struct {
+	PID       int
+	StartedAt time.Time
+}
+
+func (s *Server) shouldReapFPApp() bool {
+	return s.fpEnabled() && !s.fpConsentPending.Load()
 }
 
 // shouldEnsureFPApp is the fp.app.ensure row gate. Each earlier condition
@@ -107,6 +130,78 @@ func (s *Server) fpAppWanted() bool {
 		return false
 	}
 	return len(ids) > 0
+}
+
+func staleFPAppProcesses(ctx context.Context, binaryPath string) ([]fpAppProcess, error) {
+	fi, err := os.Stat(binaryPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stat companion app binary: %w", err)
+	}
+	ct := fi.Sys().(*syscall.Stat_t).Ctimespec
+	installedAt := time.Unix(ct.Sec, ct.Nsec)
+	procs, err := listFPAppProcs(ctx, binaryPath)
+	if err != nil {
+		return nil, err
+	}
+	var stale []fpAppProcess
+	for _, p := range procs {
+		if installedAt.Sub(p.StartedAt) > staleFPAppSlack {
+			stale = append(stale, fpAppProcess{PID: p.PID, StartedAt: p.StartedAt})
+		}
+	}
+	return stale, nil
+}
+
+func (s *Server) reconcileStaleFPApp(ctx context.Context) {
+	if !s.shouldReapFPApp() {
+		return
+	}
+	stale, err := staleFPAppProcesses(ctx, fpAppBinaryPath())
+	if err != nil {
+		s.log.Printf("stale companion app scan: %v", err)
+		return
+	}
+	for _, p := range stale {
+		if s.fpConsentPending.Load() {
+			return
+		}
+		confirm, err := staleFPAppProcesses(ctx, fpAppBinaryPath())
+		if err != nil {
+			s.log.Printf("stale companion app reconfirm: %v", err)
+			return
+		}
+		if s.fpConsentPending.Load() {
+			return
+		}
+		if !fpAppStillStale(confirm, p) {
+			continue
+		}
+		if err := killFPAppPID(p.PID); err != nil {
+			s.log.Printf("kill stale companion app pid %d: %v", p.PID, err)
+			continue
+		}
+		s.clearFPAppEnsure()
+		s.log.Printf("killed stale companion app pid %d (started %s): an upgrade replaced its binary; fp.app.ensure relaunches the current one on the next heal tick",
+			p.PID, p.StartedAt.Format("15:04:05"))
+	}
+}
+
+func fpAppStillStale(confirm []fpAppProcess, p fpAppProcess) bool {
+	for _, c := range confirm {
+		if c.PID == p.PID && c.StartedAt.Equal(p.StartedAt) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) clearFPAppEnsure() {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	s.led.clear(fpAppPolicy, fpAppResource)
 }
 
 // ensureFPAppAsync launches the companion app in a tracked, fire-and-forget

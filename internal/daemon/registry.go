@@ -181,6 +181,7 @@ var healTable = []maintainer{
 		s.sweepOrphanFPDomains(ctx)
 		return true
 	}},
+	{"fp.app.reap", claimNone, (*Server).shouldReapFPApp, func(s *Server, ctx context.Context, _ *tick) bool { s.reconcileStaleFPApp(ctx); return true }},
 	{"strand.heal", claimPerAccount, nil, func(s *Server, ctx context.Context, t *tick) bool {
 		s.healStrandedRows(ctx, t)
 		return true
