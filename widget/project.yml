@@ -171,6 +171,7 @@ targets:
       - path: Sources/App/DomainClaims.swift
       - path: Sources/App/FileProviderControlPolicy.swift
       - path: Sources/App/FileProviderDomainPolicy.swift
+      - path: Sources/FileProvider/BackingMutationIO.swift
       - path: Sources/FileProvider/SynthCache.swift
       - path: Sources/FileProvider/FileProviderEnumerationPolicy.swift
       - path: Sources/FileProvider/ItemID.swift

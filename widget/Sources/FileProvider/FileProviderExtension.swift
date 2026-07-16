@@ -298,7 +298,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                     let st = try BackingStat.lstat(src)
                     guard st.exists, !st.isDir else { throw NSFileProviderError(.noSuchItem) }
                     let dest = dir.appendingPathComponent((src as NSString).lastPathComponent)
-                    try self.cloneOrCopy(from: src, to: dest.path)
+                    try BackingMutationIO.cloneOrCopy(from: src, to: dest.path)
                     completionHandler(dest, try self.lookupItem(itemIdentifier), nil)
                 case .root:
                     throw NSFileProviderError(.noSuchItem)
@@ -390,7 +390,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             guard symlink(target, path) == 0 else { throw CocoaError(.fileWriteUnknown) }
         } else {
             let data = try url.map { try Data(contentsOf: $0) } ?? Data()
-            try coordinatedReplace(path: path, data: data)
+            try BackingMutationIO.replace(path: path, data: data)
         }
         return try lookupItem(id.identifier)
     }
@@ -443,7 +443,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                     name: name, data: try Data(contentsOf: src), removing: nil)
             case .shared, .priv:
                 guard let dest = paths.backing(id) else { throw NSFileProviderError(.noSuchItem) }
-                try coordinatedReplace(path: dest, data: try Data(contentsOf: src))
+                try BackingMutationIO.replace(path: dest, data: try Data(contentsOf: src))
             case .root:
                 throw NSFileProviderError(.noSuchItem)
             }
@@ -491,7 +491,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         try FileManager.default.createDirectory(
             atPath: (destPath as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true)
-        try coordinatedRename(from: src, to: destPath)
+        try BackingMutationIO.rename(from: src, to: destPath)
         return .backing(destID)
     }
 
@@ -539,9 +539,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                try mapUnreachable({ try bridge.classify(name: rel) }) == "symlink" {
                 throw NSFileProviderError(.deletionRejected)
             }
-            try coordinatedRemove(paths.base + "/" + rel)
+            try BackingMutationIO.remove(paths.base + "/" + rel)
         case .priv(let rel):
-            try coordinatedRemove(paths.privateStore + "/" + rel)
+            try BackingMutationIO.remove(paths.privateStore + "/" + rel)
         }
         return nil
     }
@@ -574,7 +574,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 }
             },
             persistPrivate: { name, data in
-                try self.coordinatedReplace(
+                try BackingMutationIO.replace(
                     path: self.paths.privateStore + "/" + name, data: data)
             },
             removeStaging: { try self.removeStagingIfPresent($0) },
@@ -584,7 +584,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
 
     private func removeStagingIfPresent(_ path: String) throws {
         do {
-            try coordinatedRemove(path)
+            try BackingMutationIO.remove(path)
         } catch {
             let e = error as NSError
             if e.domain == NSCocoaErrorDomain && e.code == NSFileNoSuchFileError { return }
@@ -611,81 +611,6 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             }
             return DirEnumerator(source: self, rel: rel)
         }
-    }
-
-    // MARK: - Backing I/O
-
-    /// clonefile(2) semantics via copyfile COPYFILE_CLONE (APFS COW, silent
-    /// data-copy fallback cross-volume); a coordinated read+copy backstop for
-    /// paths under presenter coordination.
-    private func cloneOrCopy(from src: String, to dst: String) throws {
-        if copyfile(src, dst, nil, copyfile_flags_t(COPYFILE_CLONE)) == 0 { return }
-        var coordErr: NSError?
-        var innerErr: Error?
-        NSFileCoordinator(filePresenter: nil).coordinate(
-            readingItemAt: URL(fileURLWithPath: src), options: .withoutChanges,
-            error: &coordErr) { url in
-            do { try FileManager.default.copyItem(at: url, to: URL(fileURLWithPath: dst)) }
-            catch { innerErr = error }
-        }
-        if let e = coordErr { throw e }
-        if let e = innerErr { throw e }
-    }
-
-    /// Atomic temp+rename under NSFileCoordinator — uncoordinated writes to
-    /// replica-backed files get silently reverted. The "._" temp prefix keeps
-    /// the in-flight sibling inside both skip sets (Swift and Go).
-    func coordinatedReplace(path: String, data: Data) throws {
-        var coordErr: NSError?
-        var innerErr: Error?
-        NSFileCoordinator(filePresenter: nil).coordinate(
-            writingItemAt: URL(fileURLWithPath: path), options: .forReplacing,
-            error: &coordErr) { url in
-            let tmp = (url.path as NSString).deletingLastPathComponent
-                + "/._ccp-tmp-" + UUID().uuidString
-            do {
-                try data.write(to: URL(fileURLWithPath: tmp))
-                try FileManager.default.setAttributes(
-                    [.posixPermissions: 0o600], ofItemAtPath: tmp)
-                guard rename(tmp, url.path) == 0 else {
-                    try? FileManager.default.removeItem(atPath: tmp)
-                    throw CocoaError(.fileWriteUnknown)
-                }
-            } catch {
-                innerErr = error
-            }
-        }
-        if let e = coordErr { throw e }
-        if let e = innerErr { throw e }
-    }
-
-    private func coordinatedRename(from src: String, to dst: String) throws {
-        var coordErr: NSError?
-        var innerErr: Error?
-        NSFileCoordinator(filePresenter: nil).coordinate(
-            writingItemAt: URL(fileURLWithPath: src), options: .forMoving,
-            writingItemAt: URL(fileURLWithPath: dst), options: .forReplacing,
-            error: &coordErr) { _, _ in
-            guard rename(src, dst) == 0 else {
-                innerErr = CocoaError(.fileWriteUnknown)
-                return
-            }
-        }
-        if let e = coordErr { throw e }
-        if let e = innerErr { throw e }
-    }
-
-    private func coordinatedRemove(_ path: String) throws {
-        var coordErr: NSError?
-        var innerErr: Error?
-        NSFileCoordinator(filePresenter: nil).coordinate(
-            writingItemAt: URL(fileURLWithPath: path), options: .forDeleting,
-            error: &coordErr) { url in
-            do { try FileManager.default.removeItem(at: url) }
-            catch { innerErr = error }
-        }
-        if let e = coordErr { throw e }
-        if let e = innerErr { throw e }
     }
 
     // MARK: - Errors
