@@ -5,8 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -281,11 +279,18 @@ func TestCheckFPRungs(t *testing.T) {
 			daemonAlive:    false,
 			wantErr:        []string{"daemon isn't running", "ccp service install"},
 		},
-		"bridge down with a live daemon points at the consent lever": {
+		"bridge down with a live daemon points at doctor": {
 			controlUpAfter: 0,
 			bridgeUp:       ptr(false),
 			daemonAlive:    true,
-			wantErr:        []string{"isn't accepting", "ccp fp consent", "no restart"},
+			wantErr:        []string{"isn't accepting", "ccp doctor"},
+		},
+		"bridge bind still pending points at reinstall": {
+			controlUpAfter: 0,
+			bridgeUp:       ptr(false),
+			daemonAlive:    true,
+			consentPending: true,
+			wantErr:        []string{"still pending", "app-group-container", "ccp service install"},
 		},
 		"nil bridge state from a pre-upgrade daemon prescribes a restart": {
 			controlUpAfter: 0,
@@ -482,60 +487,6 @@ func TestCheckFPRungsBridgeVerdict(t *testing.T) {
 	}
 }
 
-func TestCheckFPRungsRunsConsentInline(t *testing.T) {
-	tempHome(t)
-	stable := filepath.Join(pool.StableBinDir(), "cc-pool")
-	if err := os.MkdirAll(filepath.Dir(stable), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(stable, []byte("test"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(stable, 0o700); err != nil { //nolint:gosec // G302: test fixture must be executable.
-		t.Fatal(err)
-	}
-	swapVar(t, &fpControlHealth, func(context.Context) (string, error) { return "9.9.9", nil })
-	probeCalls := 0
-	swapVar(t, &fpDaemonProbe, func() (bool, bool, *bool) {
-		probeCalls++
-		if probeCalls == 1 {
-			return true, true, ptr(false)
-		}
-		return true, false, ptr(true)
-	})
-	execCalls := 0
-	swapVar(t, &fpConsentProbeExec, func(_ context.Context, path string, _ io.Reader, _, _ io.Writer) error {
-		execCalls++
-		if path != stable {
-			t.Errorf("probe path=%q, want %q", path, stable)
-		}
-		return nil
-	})
-	swapVar(t, &fpConsentNow, func() time.Time { return time.Unix(1_700_000_000, 0) })
-	swapVar(t, &fpDaemonHealth, func() (*daemon.Response, error) {
-		return &daemon.Response{OK: true, Version: version.String()}, nil
-	})
-	swapVar(t, &fpBridgeCheck, func() (*daemon.Response, error) {
-		return &daemon.Response{OK: true, FPBridge: &daemon.FPBridgeStatus{Verdict: daemon.FPBridgeServing}}, nil
-	})
-
-	var out bytes.Buffer
-	cmd := &cobra.Command{}
-	cmd.SetContext(t.Context())
-	cmd.SetOut(&out)
-	if err := checkFPRungs(cmd, time.Nanosecond); err != nil {
-		t.Fatalf("checkFPRungs: %v", err)
-	}
-	if execCalls != 1 {
-		t.Errorf("consent probe exec calls=%d, want 1", execCalls)
-	}
-	for _, frag := range []string{"waiting for its one-time local consent grant", "bridge bound", "Daemon bridge serving"} {
-		if !strings.Contains(out.String(), frag) {
-			t.Errorf("output %q missing %q", out.String(), frag)
-		}
-	}
-}
-
 // TestFPOnboardRegistered pins the command wiring: `ccp fp onboard` exists
 // under the fp group with no args accepted.
 func TestFPOnboardRegistered(t *testing.T) {
@@ -571,43 +522,22 @@ func TestFPRepairRegistered(t *testing.T) {
 	}
 }
 
-func TestFPConsentCommandsRegistered(t *testing.T) {
-	cases := map[string]struct {
-		path   []string
-		hidden bool
-	}{
-		"operator command": {path: []string{"fp", "consent"}},
-		"probe command":    {path: []string{"fp", "consent-probe"}, hidden: true},
+// TestFPConsentCommandRegistered pins the command wiring: `ccp fp consent` is a
+// visible, no-args diagnostic (the hidden consent-probe helper is gone).
+func TestFPConsentCommandRegistered(t *testing.T) {
+	root := NewRootCmd()
+	cmd, _, err := root.Find([]string{"fp", "consent"})
+	if err != nil || cmd.Name() != "consent" {
+		t.Fatalf("Find(fp consent) = (%v, %v), want the consent command", cmd, err)
 	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			root := NewRootCmd()
-			cmd, _, err := root.Find(tc.path)
-			if err != nil || cmd.Name() != tc.path[len(tc.path)-1] {
-				t.Fatalf("Find(%v) = (%v, %v)", tc.path, cmd, err)
-			}
-			if cmd.Hidden != tc.hidden {
-				t.Errorf("Hidden = %v, want %v", cmd.Hidden, tc.hidden)
-			}
-			if err := cmd.Args(cmd, []string{"extra"}); err == nil {
-				t.Fatal("command accepted positional args; want cobra.NoArgs")
-			}
-		})
+	if cmd.Hidden {
+		t.Error("consent is hidden; want a visible diagnostic")
 	}
-}
-
-func TestRunFPConsentProbe(t *testing.T) {
-	tempHome(t)
-	dir := filepath.Dir(pool.FPBridgeSocketPath())
-	probe := filepath.Join(dir, ".consent-probe")
-	if err := runFPConsentProbe(); err != nil {
-		t.Fatalf("runFPConsentProbe: %v", err)
+	if err := cmd.Args(cmd, []string{"extra"}); err == nil {
+		t.Fatal("consent accepted positional args; want cobra.NoArgs")
 	}
-	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-		t.Fatalf("bridge directory stat = (%v, %v), want a directory", fi, err)
-	}
-	if _, err := os.Stat(probe); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("consent probe remains after success: %v", err)
+	if probe, _, _ := root.Find([]string{"fp", "consent-probe"}); probe.Name() == "consent-probe" {
+		t.Fatal("fp consent-probe still resolves; the hidden probe command must be gone")
 	}
 }
 
@@ -616,190 +546,75 @@ type fpDaemonState struct {
 	bridgeUp       *bool
 }
 
+// TestRunFPConsent pins the diagnostic: `ccp fp consent` never grants anything
+// (release daemons bind prompt-free from the signed bundle), it only reports the
+// daemon's bridge status and names the concrete fix.
 func TestRunFPConsent(t *testing.T) {
-	probeErr := errors.New("probe failed")
-	hostErr := errors.New("hostname failed")
-	base := time.Unix(1_700_000_000, 0)
 	cases := map[string]struct {
-		sshConnection string
-		sshTTY        string
-		hostErr       error
-		stable        string
-		execErr       error
-		states        []fpDaemonState
-		times         []time.Time
-		cancel        bool
-		wantExec      int
-		wantProbe     int
-		wantErr       []string
-		wantOut       []string
-		wantIs        error
+		state   fpDaemonState
+		wantErr []string // "" = success
+		wantOut []string
 	}{
-		"SSH_CONNECTION refuses with the local host": {
-			sshConnection: "client server",
-			wantErr:       []string{"local terminal on test-host"},
+		"bridge up needs no consent": {
+			state:   fpDaemonState{alive: true, bridgeUp: ptr(true)},
+			wantOut: []string{"File Provider bridge is up", "CCPoolDaemon.app", "no consent is needed"},
 		},
-		"SSH_TTY refuses with the local host": {
-			sshTTY:  "/dev/ttys001",
-			wantErr: []string{"local terminal on test-host"},
+		"bridge up despite a pending flag still needs no consent": {
+			state:   fpDaemonState{alive: true, pending: true, bridgeUp: ptr(true)},
+			wantOut: []string{"File Provider bridge is up", "no consent is needed"},
 		},
-		"hostname failure is loud": {
-			sshConnection: "client server",
-			hostErr:       hostErr,
-			wantErr:       []string{"resolve local hostname"},
-			wantIs:        hostErr,
+		"dead daemon points at service install": {
+			state:   fpDaemonState{alive: false, bridgeUp: ptr(false)},
+			wantErr: []string{"isn't running", "ccp service install", "ccp doctor"},
 		},
-		"missing stable daemon binary points at service install": {
-			wantErr: []string{"stable daemon binary", "ccp service install"},
+		"pending bind means an unbundled build": {
+			state:   fpDaemonState{alive: true, pending: true, bridgeUp: ptr(false)},
+			wantErr: []string{"still pending", "unbundled build", "ccp service install"},
 		},
-		"a directory is not accepted as the stable daemon binary": {
-			stable:  "dir",
-			wantErr: []string{"not a regular file", "ccp service install"},
+		"bridge not accepting points at doctor": {
+			state:   fpDaemonState{alive: true, bridgeUp: ptr(false)},
+			wantErr: []string{"isn't accepting yet", "ccp doctor"},
 		},
-		"probe failure preserves the stable-path identity": {
-			stable:   "file",
-			execErr:  probeErr,
-			wantExec: 1,
-			wantErr:  []string{"grant File Provider consent", "~/.cc-pool/bin/cc-pool"},
-			wantIs:   probeErr,
-		},
-		"bridge binds without a daemon restart": {
-			stable:    "file",
-			states:    []fpDaemonState{{alive: true, bridgeUp: ptr(false)}, {alive: true, bridgeUp: ptr(true)}},
-			wantExec:  1,
-			wantProbe: 2,
-			wantOut:   []string{"bridge bound", "no daemon restart needed"},
-		},
-		"live daemon expiry points at doctor": {
-			stable:    "file",
-			states:    []fpDaemonState{{alive: true, bridgeUp: ptr(false)}},
-			times:     []time.Time{base, base.Add(fpConsentBridgeWindow)},
-			wantExec:  1,
-			wantProbe: 1,
-			wantErr:   []string{"live daemon", "ccp doctor"},
-		},
-		"dead daemon expiry points at service install": {
-			stable:    "file",
-			states:    []fpDaemonState{{bridgeUp: ptr(false)}},
-			times:     []time.Time{base, base.Add(fpConsentBridgeWindow)},
-			wantExec:  1,
-			wantProbe: 1,
-			wantErr:   []string{"daemon is not running", "ccp service install"},
-		},
-		"cancellation unwinds the bridge wait": {
-			stable:    "file",
-			states:    []fpDaemonState{{alive: true, bridgeUp: ptr(false)}},
-			cancel:    true,
-			wantExec:  1,
-			wantProbe: 1,
-			wantIs:    context.Canceled,
+		"unreported bridge on a live daemon points at doctor": {
+			state:   fpDaemonState{alive: true, bridgeUp: nil},
+			wantErr: []string{"isn't accepting yet", "ccp doctor"},
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			home := tempHome(t)
-			t.Setenv("SSH_CONNECTION", tc.sshConnection)
-			t.Setenv("SSH_TTY", tc.sshTTY)
-			stable := filepath.Join(pool.StableBinDir(), "cc-pool")
-			switch tc.stable {
-			case "file":
-				if err := os.MkdirAll(filepath.Dir(stable), 0o700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(stable, []byte("test"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Chmod(stable, 0o700); err != nil { //nolint:gosec // G302: test fixture must be executable.
-					t.Fatal(err)
-				}
-			case "dir":
-				if err := os.MkdirAll(stable, 0o700); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			var out, errOut bytes.Buffer
-			in := strings.NewReader("input")
+			var out bytes.Buffer
 			cmd := &cobra.Command{}
-			cmd.SetIn(in)
+			cmd.SetContext(t.Context())
 			cmd.SetOut(&out)
-			cmd.SetErr(&errOut)
-			ctx := t.Context()
-			if tc.cancel {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithCancel(ctx)
-				cancel()
-			}
-			cmd.SetContext(ctx)
 
-			swapVar(t, &fpHostname, func() (string, error) { return "test-host", tc.hostErr })
-			execCalls := 0
-			swapVar(t, &fpConsentProbeExec, func(gotCtx context.Context, gotPath string, gotIn io.Reader, gotOut, gotErr io.Writer) error {
-				execCalls++
-				if gotCtx != ctx || gotPath != stable {
-					t.Errorf("probe exec context/path = (%v, %q), want (%v, %q)", gotCtx, gotPath, ctx, stable)
-				}
-				if gotIn != in || gotOut != &out || gotErr != &errOut {
-					t.Error("probe exec did not inherit command stdio")
-				}
-				return tc.execErr
-			})
 			probeCalls := 0
 			swapVar(t, &fpDaemonProbe, func() (bool, bool, *bool) {
 				probeCalls++
-				if len(tc.states) == 0 {
-					t.Error("daemon probed before consent probe succeeded")
-					return false, false, nil
-				}
-				i := probeCalls - 1
-				if i >= len(tc.states) {
-					i = len(tc.states) - 1
-				}
-				st := tc.states[i]
-				return st.alive, st.pending, st.bridgeUp
-			})
-			nowCalls := 0
-			swapVar(t, &fpConsentNow, func() time.Time {
-				nowCalls++
-				if len(tc.times) == 0 {
-					return base
-				}
-				i := nowCalls - 1
-				if i >= len(tc.times) {
-					i = len(tc.times) - 1
-				}
-				return tc.times[i]
+				return tc.state.alive, tc.state.pending, tc.state.bridgeUp
 			})
 
-			interval := time.Nanosecond
-			if tc.cancel {
-				interval = time.Hour
+			err := runFPConsent(cmd)
+			if probeCalls != 1 {
+				t.Errorf("daemon probes=%d, want 1 (a pure diagnostic probes once)", probeCalls)
 			}
-			err := runFPConsent(cmd, interval)
-			if len(tc.wantErr) == 0 && tc.wantIs == nil && err != nil {
-				t.Fatalf("runFPConsent: %v", err)
-			}
-			if (len(tc.wantErr) > 0 || tc.wantIs != nil) && err == nil {
-				t.Fatal("runFPConsent succeeded; want an error")
-			}
-			for _, frag := range tc.wantErr {
-				if !strings.Contains(err.Error(), frag) {
-					t.Errorf("error %q missing %q", err, frag)
+			if len(tc.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("runFPConsent: %v", err)
 				}
-			}
-			if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
-				t.Errorf("error %v does not wrap %v", err, tc.wantIs)
+			} else {
+				if err == nil {
+					t.Fatal("runFPConsent succeeded; want an error")
+				}
+				for _, frag := range tc.wantErr {
+					if !strings.Contains(err.Error(), frag) {
+						t.Errorf("error %q missing %q", err, frag)
+					}
+				}
 			}
 			for _, frag := range tc.wantOut {
 				if !strings.Contains(out.String(), frag) {
 					t.Errorf("output %q missing %q", out.String(), frag)
 				}
-			}
-			if execCalls != tc.wantExec || probeCalls != tc.wantProbe {
-				t.Errorf("exec calls=%d daemon probes=%d, want %d/%d", execCalls, probeCalls, tc.wantExec, tc.wantProbe)
-			}
-			if !strings.HasPrefix(stable, home) {
-				t.Fatalf("stable path %q escaped test home %q", stable, home)
 			}
 		})
 	}

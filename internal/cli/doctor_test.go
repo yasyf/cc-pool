@@ -909,7 +909,7 @@ func TestReportFileProvider(t *testing.T) {
 			want: []wantReport{
 				{"file provider extension", true, nil},
 				{"file provider app", true, []string{"1.2.3"}},
-				{"file provider bridge", false, []string{"app group container", "ccp fp consent", "no restart", "ccp fp onboard"}},
+				{"file provider bridge", false, []string{"CCPoolDaemon.app", "app-group container", "ccp service status", "ccp fp onboard"}},
 			},
 			wantProbes: true,
 		},
@@ -923,8 +923,8 @@ func TestReportFileProvider(t *testing.T) {
 				{"file provider extension", true, nil},
 				{"file provider app", true, []string{"1.2.3"}},
 				{"file provider bridge", false, []string{
-					"parked on the app group container consent prompt",
-					"ccp fp consent", "local terminal", "no restart", "ccp fp onboard",
+					"still pending", "app-group-container", "unprofiled build",
+					"ccp service install", "ccp doctor",
 				}},
 			},
 			wantProbes: true,
@@ -1632,6 +1632,50 @@ func TestCheckCredentialFixReassertsKeychain(t *testing.T) {
 	if kc.reads != 2 {
 		t.Errorf("keychain reads = %d, want 2 (classify + reassert)", kc.reads)
 	}
+}
+
+// TestReportLegacyStableBinDir pins the leftover ~/.cc-pool/bin rung: silent when
+// absent, unhealthy pointing at --fix when present, and removed under --fix.
+func TestReportLegacyStableBinDir(t *testing.T) {
+	t.Run("absent dir reports nothing", func(t *testing.T) {
+		tempHome(t)
+		report, calls := captureReports()
+		reportLegacyStableBinDir(false, report)
+		if len(*calls) != 0 {
+			t.Fatalf("reported %d findings for an absent dir, want 0: %+v", len(*calls), *calls)
+		}
+	})
+
+	t.Run("present dir is unhealthy and points at --fix", func(t *testing.T) {
+		tempHome(t)
+		if err := os.MkdirAll(pool.LegacyStableBinDir(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		report, calls := captureReports()
+		reportLegacyStableBinDir(false, report)
+		if len(*calls) != 1 || (*calls)[0].healthy {
+			t.Fatalf("calls = %+v, want one unhealthy finding", *calls)
+		}
+		if !strings.Contains((*calls)[0].detail, "ccp doctor --fix") {
+			t.Errorf("detail %q missing the --fix hint", (*calls)[0].detail)
+		}
+	})
+
+	t.Run("--fix removes the leftover dir", func(t *testing.T) {
+		tempHome(t)
+		dir := pool.LegacyStableBinDir()
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		report, calls := captureReports()
+		reportLegacyStableBinDir(true, report)
+		if len(*calls) != 1 || !(*calls)[0].healthy {
+			t.Fatalf("calls = %+v, want one healthy finding", *calls)
+		}
+		if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("leftover dir still present after --fix: %v", err)
+		}
+	})
 }
 
 func TestDoctorSurfacesFuseFallback(t *testing.T) {

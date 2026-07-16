@@ -159,14 +159,14 @@ func ledgerFooter(ledgers []daemon.LedgerState) string {
 	return warnStyle.Render("self-heal: " + strings.Join(parts, ", ") + " — run `ccp doctor` for detail")
 }
 
-// fpConsentFooter warns that the daemon's File Provider data bridge is parked on
-// the app-group consent prompt — plain-path only, like the other footers (the
-// TUI drops daemon-cache alerts on purpose). "" when not pending.
+// fpConsentFooter warns that the daemon's File Provider data bridge bind is
+// pending its app-group-container grant — plain-path only, like the other footers
+// (the TUI drops daemon-cache alerts on purpose). "" when not pending.
 func fpConsentFooter(pending bool) string {
 	if !pending {
 		return ""
 	}
-	return warnStyle.Render("file provider: the daemon's data bridge is parked on the macOS app-group consent prompt — run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart); run `ccp doctor` for detail")
+	return warnStyle.Render("file provider: the daemon's data bridge bind is pending its macOS app-group-container grant — a release daemon binds prompt-free from the signed CCPoolDaemon.app bundle, so reinstall with `ccp service install`; run `ccp doctor` for detail")
 }
 
 // dirPin is the launch directory's pin as render input (ok=false: no pin).

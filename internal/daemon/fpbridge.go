@@ -45,11 +45,11 @@ const fpBridgeProbeDomain = "ccp-bridge-selftest"
 // that would fall back to the dial-only signal.
 const fpBridgeSelfTestBudget = 9 * time.Second
 
-// The three levers a not-serving verdict carries at record time. Consent-parked
-// clears itself once granted (the watchdog re-binds with no restart); the others
-// name the concrete daemon action.
+// The three levers a not-serving verdict carries at record time. A consent-parked
+// bind never happens on a release daemon (the signed CCPoolDaemon.app bundle binds
+// prompt-free); the others name the concrete daemon action.
 const (
-	fpBridgeConsentLever   = "run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart)"
+	fpBridgeConsentLever   = "the bridge bind is pending its app-group-container grant; a release daemon binds prompt-free from the signed CCPoolDaemon.app bundle, so reinstall with `ccp service install`, then run `ccp doctor`"
 	fpBridgeBoundDeadLever = "the daemon's bridge is bound but not serving; restart the daemon (brew services restart cc-pool)"
 	fpBridgeDownLever      = "bridge socket not bound; check `ccp service status`"
 )

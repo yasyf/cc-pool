@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -133,6 +134,7 @@ func newDoctorCmd() *cobra.Command {
 				reportFPWedges(accts, daemonAlive, fpRawProbe, report)
 				reportOrphanFPDomains(cmd.Context(), m, accts, fix, report)
 				reportContentHealth(contentHealth, report)
+				reportLegacyStableBinDir(fix, report)
 
 				if err := reportSync(cmd.Context(), m, accts, report, reportWarn); err != nil {
 					return err
@@ -610,6 +612,31 @@ func reportContentHealth(health string, report func(string, bool, string)) {
 	}
 	report("content source", false,
 		health+" — reads of the computed files fall back to raw copies; check "+abbreviateHome(pool.LogPath()))
+}
+
+// reportLegacyStableBinDir flags a leftover ~/.cc-pool/bin from the retired
+// stable-path daemon re-exec; --fix removes it. Slated for deletion (with
+// pool.LegacyStableBinDir) a release after the leftover is gone.
+func reportLegacyStableBinDir(fix bool, report func(string, bool, string)) {
+	dir := pool.LegacyStableBinDir()
+	_, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	const label = "legacy stable-bin dir"
+	if err != nil {
+		report(label, false, fmt.Sprintf("couldn't stat %s: %v", abbreviateHome(dir), err))
+		return
+	}
+	if fix {
+		if rerr := os.RemoveAll(dir); rerr != nil {
+			report(label, false, fmt.Sprintf("couldn't remove the leftover %s: %v", abbreviateHome(dir), rerr))
+			return
+		}
+		report(label, true, "removed the leftover "+abbreviateHome(dir))
+		return
+	}
+	report(label, false, "leftover "+abbreviateHome(dir)+" from the retired stable-path daemon re-exec — run `ccp doctor --fix` to remove")
 }
 
 // reportCarcasses flags fuse rows whose dir is a mountpoint no longer showing

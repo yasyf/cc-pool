@@ -89,7 +89,9 @@ func (s *Server) startFPBridge(ctx context.Context) {
 		// serveFPBridge's retry loop; do not mislabel it as consent-pending.
 		return
 	}
-	s.log.Printf("file provider bridge: socket %s did not come up within %s — likely awaiting the one-time app-group-container consent (run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart)); enumerations defer until it is up", sock, wait)
+	// Load-bearing: the VM app-group-noprompt oracle greps the verbatim
+	// 'app-group-container consent' token (CONSENT_MARK) — keep it stable.
+	s.log.Printf("file provider bridge: socket %s did not come up within %s — still awaiting the one-time app-group-container consent; a release daemon ships the signed CCPoolDaemon.app bundle (embedded Developer ID profile) and binds prompt-free, so this signals an unprofiled build — reinstall with `ccp service install`; enumerations defer until it is up", sock, wait)
 	s.fpConsentPending.Store(true)
 	s.wg.Add(1)
 	go func() {

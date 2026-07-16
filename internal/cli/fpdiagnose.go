@@ -64,7 +64,7 @@ func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, bridge *da
 	case consentPending:
 		findings = append(findings, fpFinding{
 			"file provider bridge", false,
-			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon reports its bind parked on the app group container consent prompt: run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart) — `ccp fp onboard` walks this end to end",
+			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon reports its bridge bind still pending its app-group-container grant; a release daemon binds prompt-free from the signed CCPoolDaemon.app bundle, so this signals an unprofiled build — reinstall with `ccp service install`, then re-run `ccp doctor`",
 		})
 	case bridgeUp == nil:
 		findings = append(findings, fpFinding{
@@ -74,7 +74,7 @@ func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, bridge *da
 	default:
 		findings = append(findings, fpFinding{
 			"file provider bridge", false,
-			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon binds it at startup and retries every few seconds (is the daemon running? check `ccp service status`); on first run macOS gates the app group container behind a one-time consent prompt: run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart); domains cannot fetch computed content until the socket is up — run `ccp fp onboard` for the guided setup",
+			"data socket " + abbreviateHome(pool.FPBridgeSocketPath()) + " not accepting — the daemon binds it at startup from the signed CCPoolDaemon.app bundle's app-group container and retries every few seconds (is the daemon running? check `ccp service status`); domains cannot fetch computed content until the socket is up — run `ccp fp onboard` for the guided setup",
 		})
 	}
 	return findings

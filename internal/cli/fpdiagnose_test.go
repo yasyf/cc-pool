@@ -84,7 +84,7 @@ func TestFPDiagnose(t *testing.T) {
 			want: []wantFinding{
 				{"file provider extension", true, nil, nil},
 				{"file provider app", true, []string{"1.2.3"}, nil},
-				{"file provider bridge", false, []string{"app group container", "ccp fp consent", "no restart", "ccp fp onboard"}, []string{"restart the daemon"}},
+				{"file provider bridge", false, []string{"CCPoolDaemon.app", "app-group container", "ccp service status", "ccp fp onboard"}, []string{"restart the daemon"}},
 			},
 			wantProbes: true,
 		},
@@ -98,8 +98,8 @@ func TestFPDiagnose(t *testing.T) {
 				{"file provider extension", true, nil, nil},
 				{"file provider app", true, []string{"1.2.3"}, nil},
 				{"file provider bridge", false, []string{
-					"parked on the app group container consent prompt",
-					"ccp fp consent", "local terminal", "no restart", "ccp fp onboard",
+					"still pending", "app-group-container", "unprofiled build",
+					"ccp service install", "ccp doctor",
 				}, []string{"restart the daemon"}},
 			},
 			wantProbes: true,

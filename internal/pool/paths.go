@@ -59,10 +59,14 @@ func StateDir() string {
 	return stateDir.Root()
 }
 
-// StableBinDir is the version-independent bin dir (~/.cc-pool/bin), a legacy of
-// the deleted stable-path daemon re-exec; only `ccp fp consent` still uses it
-// (the daemon itself runs from the bundle — see DaemonBinaryPath).
-func StableBinDir() string {
+// LegacyStableBinDir is the version-independent bin dir (~/.cc-pool/bin) the
+// deleted stable-path daemon re-exec once populated. Nothing writes it anymore;
+// the daemon runs from the CCPoolDaemon.app bundle (see DaemonBinaryPath).
+//
+// Deprecated: only the doctor leftover-bin rung consults this to report and
+// remove the stale dir; the rung and this helper are slated for deletion a
+// release after the leftover is gone.
+func LegacyStableBinDir() string {
 	return filepath.Join(StateDir(), "bin")
 }
 

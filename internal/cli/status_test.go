@@ -730,13 +730,13 @@ func TestFPConsentFooter(t *testing.T) {
 		t.Errorf("fpConsentFooter(false) = %q, want empty", got)
 	}
 	got := stripANSI(fpConsentFooter(true))
-	for _, frag := range []string{"app-group consent prompt", "ccp fp consent", "local terminal", "no restart", "ccp doctor"} {
+	for _, frag := range []string{"app-group-container grant", "CCPoolDaemon.app", "ccp service install", "ccp doctor"} {
 		if !strings.Contains(got, frag) {
 			t.Errorf("fpConsentFooter(true) = %q, missing %q", got, frag)
 		}
 	}
-	if strings.Contains(got, "restart the daemon") {
-		t.Errorf("fpConsentFooter(true) = %q, retained stale restart guidance", got)
+	if strings.Contains(got, "ccp fp consent") {
+		t.Errorf("fpConsentFooter(true) = %q, retained the stale `ccp fp consent` grant lever", got)
 	}
 }
 
@@ -804,7 +804,7 @@ func TestRunStatusPlainFPConsentFooter(t *testing.T) {
 			if !strings.Contains(out, "work@example.com") {
 				t.Fatalf("table missing the daemon's account:\n%s", out)
 			}
-			shown := strings.Contains(out, "app-group consent prompt")
+			shown := strings.Contains(out, "app-group-container grant")
 			if shown != tc.wantShown {
 				t.Errorf("consent footer shown=%v, want %v:\n%s", shown, tc.wantShown, out)
 			}

@@ -7,9 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/charmbracelet/huh"
@@ -95,16 +93,7 @@ var (
 	fpBridgeCheck = func() (*daemon.Response, error) {
 		return daemon.NewClient().FPBridgeCheck()
 	}
-	fpConsentProbeExec = func(ctx context.Context, path string, in io.Reader, out, errOut io.Writer) error {
-		probe := exec.CommandContext(ctx, path, "fp", "consent-probe")
-		probe.Stdin = in
-		probe.Stdout = out
-		probe.Stderr = errOut
-		return probe.Run()
-	}
-	fpHostname      = os.Hostname
 	fpCapabilityNow = time.Now
-	fpConsentNow    = time.Now
 )
 
 // fpCapabilityProbe reports whether the just-launched companion app can actually
@@ -138,8 +127,6 @@ const (
 	// but progressing onboard is not failed early; one clock, so a lane flap
 	// cannot defer the bound indefinitely.
 	fpCapabilityStallWindow = 120 * time.Second
-	// fpConsentBridgeWindow covers three daemon bridge-bind retry intervals.
-	fpConsentBridgeWindow = 15 * time.Second
 )
 
 func newFPCmd() *cobra.Command {
@@ -150,109 +137,42 @@ func newFPCmd() *cobra.Command {
 	cmd.AddCommand(newFPOnboardCmd())
 	cmd.AddCommand(newFPRepairCmd())
 	cmd.AddCommand(newFPConsentCmd())
-	cmd.AddCommand(newFPConsentProbeCmd())
 	return cmd
-}
-
-func newFPConsentProbeCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:    "consent-probe",
-		Hidden: true,
-		Args:   cobra.NoArgs,
-		RunE: func(*cobra.Command, []string) error {
-			return runFPConsentProbe()
-		},
-	}
-}
-
-func runFPConsentProbe() error {
-	dir := filepath.Dir(pool.FPBridgeSocketPath())
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create File Provider bridge directory: %w", err)
-	}
-	path := filepath.Join(dir, ".consent-probe")
-	// Clear a leftover from a crashed run (unlinks the name, not a symlink's
-	// target), then O_EXCL|O_NOFOLLOW: the write lands on our own fresh probe,
-	// never a planted symlink or replanted file.
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("clear stale File Provider consent probe: %w", err)
-	}
-	//nolint:gosec // G304: path is the fixed probe name inside cc-pool's app-group bridge directory.
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return fmt.Errorf("write File Provider consent probe: %w", err)
-	}
-	_ = f.Close()
-	if err := os.Remove(path); err != nil {
-		return fmt.Errorf("remove File Provider consent probe: %w", err)
-	}
-	return nil
 }
 
 func newFPConsentCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "consent",
-		Short: "Grant the daemon access to its File Provider bridge container",
-		Args:  cobra.NoArgs,
+		Short: "Diagnose the daemon's File Provider bridge (release daemons need no consent)",
+		Long: `consent reports the File Provider data bridge's status. Release daemons ship
+as the signed CCPoolDaemon.app bundle (app-group entitlement + embedded
+Developer ID profile), so the daemon binds its bridge prompt-free and there is no
+consent to grant. This command only diagnoses — it points at ` + "`ccp doctor`" + ` and
+` + "`ccp service install`" + ` when the bridge is not up.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runFPConsent(cmd, fpOnboardPollInterval)
+			return runFPConsent(cmd)
 		},
 	}
 }
 
-func runFPConsent(cmd *cobra.Command, interval time.Duration) error {
-	if os.Getenv("SSH_CONNECTION") != "" || os.Getenv("SSH_TTY") != "" {
-		host, err := fpHostname()
-		if err != nil {
-			return fmt.Errorf("resolve local hostname: %w", err)
-		}
-		return fmt.Errorf("file provider consent cannot be granted over SSH; run this in a local terminal on %s", host)
-	}
-	// A skewed daemon runs a stable binary that predates `fp consent-probe`, so
-	// diagnose the skew here rather than failing later with an opaque probe error
-	// (mirrors runFPRepair).
-	if health, herr := daemon.NewClient().Health(); herr == nil && health.Version != version.String() {
-		return fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) so its stable binary can grant consent, then re-run", health.Version, version.String())
-	}
-	stable := filepath.Join(pool.StableBinDir(), "cc-pool")
-	// Lstat (not Stat) + owner/permission checks: refuse to hand the
-	// kTCCServiceSystemPolicyAppData grant to a symlinked, foreign-owned, or
-	// other-writable binary.
-	fi, err := os.Lstat(stable)
-	if err != nil {
-		return fmt.Errorf("stable daemon binary %s is required for File Provider consent; run `ccp service install`: %w", abbreviateHome(stable), err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
-		return fmt.Errorf("stable daemon binary %s is not a regular file; run `ccp service install`", abbreviateHome(stable))
-	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
-		return fmt.Errorf("stable daemon binary %s is not owned by you; refusing to grant File Provider consent — run `ccp service install`", abbreviateHome(stable))
-	}
-	if fi.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("stable daemon binary %s is writable by group or others; refusing to grant File Provider consent — run `ccp service install`", abbreviateHome(stable))
-	}
-	if err := fpConsentProbeExec(cmd.Context(), stable, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr()); err != nil {
-		return fmt.Errorf("grant File Provider consent to %s: %w", abbreviateHome(stable), err)
-	}
-
-	started := fpConsentNow()
-	for {
-		alive, _, bridgeUp := fpDaemonProbe()
-		if bridgeUp != nil && *bridgeUp {
-			success(cmd.OutOrStdout(), "bridge bound — no daemon restart needed")
-			return nil
-		}
-		if fpConsentNow().Sub(started) >= fpConsentBridgeWindow {
-			if alive {
-				return errors.New("file provider consent was granted, but the live daemon's bridge did not bind within 15s — run `ccp doctor`")
-			}
-			return errors.New("file provider consent was granted, but the daemon is not running — start it with `ccp service install`")
-		}
-		select {
-		case <-cmd.Context().Done():
-			return cmd.Context().Err()
-		case <-time.After(interval):
-		}
+// runFPConsent is a pure diagnostic: a release daemon binds the File Provider
+// bridge prompt-free from the signed CCPoolDaemon.app bundle, so there is nothing
+// to grant. It reports the daemon's bridge status and names the concrete fix
+// (`ccp doctor` / `ccp service install`) when the bridge is not up.
+func runFPConsent(cmd *cobra.Command) error {
+	out := cmd.OutOrStdout()
+	alive, consentPending, bridgeUp := fpDaemonProbe()
+	switch {
+	case bridgeUp != nil && *bridgeUp:
+		success(out, "the daemon's File Provider bridge is up — release daemons ship as the signed CCPoolDaemon.app bundle (app-group entitlement + embedded Developer ID profile), so no consent is needed")
+		return nil
+	case !alive:
+		return errors.New("the cc-pool daemon isn't running, so its File Provider bridge can't come up — start it with `ccp service install`, then run `ccp doctor`")
+	case consentPending:
+		return errors.New("the daemon is up but its File Provider bridge bind is still pending — release daemons bind prompt-free from the signed CCPoolDaemon.app bundle, so a pending bind means an unbundled build; reinstall with `ccp service install`, then run `ccp doctor`")
+	default:
+		return errors.New("the daemon is up but its File Provider bridge isn't accepting yet — run `ccp doctor` to diagnose; if it persists, reinstall with `ccp service install`")
 	}
 }
 
@@ -598,12 +518,6 @@ func checkFPRungs(cmd *cobra.Command, interval time.Duration) error {
 			ver, pool.MinWidgetVersion, widgetCask)
 	}
 	step(out, "CCPoolStatus control socket answering (%s).", ver)
-	if alive, pending, _ := fpDaemonProbe(); alive && pending {
-		step(out, "The daemon bridge is waiting for its one-time local consent grant.")
-		if err := runFPConsent(cmd, interval); err != nil {
-			return err
-		}
-	}
 
 	_, err = pollFPRung(ctx, out, interval, "waiting for the daemon's bridge socket…", func() (string, error) {
 		if _, _, bridgeUp := fpDaemonProbe(); bridgeUp != nil && *bridgeUp {
@@ -621,12 +535,12 @@ func checkFPRungs(cmd *cobra.Command, interval time.Duration) error {
 			return fmt.Errorf("the daemon isn't running, so its bridge socket %s can't come up — start it with `ccp service install`, then re-run `ccp fp onboard`",
 				abbreviateHome(pool.FPBridgeSocketPath()))
 		case pending:
-			return errors.New("the daemon is up but its bridge bind is parked on the app group container consent prompt — run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart)")
+			return errors.New("the daemon is up but its File Provider bridge bind is still pending its app-group-container grant; a release daemon binds prompt-free from the signed CCPoolDaemon.app bundle, so this is an unprofiled build — reinstall with `ccp service install`, then re-run `ccp fp onboard`")
 		case bridgeUp == nil:
 			return errors.New("the daemon is up but predates bridge-health reporting — restart it (`brew services restart cc-pool`) so the upgraded daemon takes over, then re-run `ccp fp onboard`")
 		default:
 			return errors.New("the daemon is up but its bridge socket " + abbreviateHome(pool.FPBridgeSocketPath()) +
-				" isn't accepting — run `ccp fp consent` in a local terminal; the daemon binds automatically once granted (no restart); then re-run `ccp fp onboard` or check " + abbreviateHome(pool.LogPath()))
+				" isn't accepting — run `ccp doctor` to diagnose, then re-run `ccp fp onboard` or check " + abbreviateHome(pool.LogPath()))
 		}
 	}
 	step(out, "Daemon bridge socket up.")
