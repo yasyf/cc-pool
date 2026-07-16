@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"ops":[{"kind":"add_comment","body":"Both halves done: fusekit v1.2.0 exports proc.Flock; cc-pool v0.56.0 deleted internal/pool/flock.go + internal/hostsync/flock.go, callers on proc.Flock. Landed (18957cc2)."}]}
+{"v":1,"lamport":4,"ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"880db6d09c674847c39b4e8a85a439fa8c888e05"}]}
