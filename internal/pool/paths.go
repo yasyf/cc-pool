@@ -232,11 +232,37 @@ func FPControlSocketPath() string {
 	return stateDir.Path("domains.sock")
 }
 
-// FPBridgeSocketPath is the File Provider data socket: the daemon binds it, the
-// sandboxed extension dials it for computed content. It must live in the App Group
-// container, with a leaf short enough for sun_path — see ccn doc f71e9b1.
+// FPBridgeSocketLeaf is the File Provider data socket's filename inside the
+// app-group container. Kept short so the container-relative sun_path stays within
+// AF_UNIX's 104-byte limit — see ccn doc f71e9b1.
+const FPBridgeSocketLeaf = "b.sock"
+
+// FPBridgeSocketPath is a HAND-BUILT ~/Library/Group Containers/<group>/b.sock
+// path for display and diagnostics ONLY. The daemon does not bind here: it
+// resolves the container through -[NSFileManager
+// containerURLForSecurityApplicationGroupIdentifier:] (fusekit/appgroup) so its
+// access is prompt-free, then joins FPBridgeSocketLeaf onto the resolved dir. On
+// disk both point at the same file, so a CLI dial to this advisory path still
+// reaches the daemon's socket; the fixed suffix stays short enough for sun_path
+// (it leaves room for $HOME — see ccn doc f71e9b1).
 func FPBridgeSocketPath() string {
-	return filepath.Join(mustHome(), "Library", "Group Containers", AppGroupID, "b.sock")
+	return filepath.Join(mustHome(), "Library", "Group Containers", AppGroupID, FPBridgeSocketLeaf)
+}
+
+// DaemonBinaryPath is the daemon .app bundle's main executable inside a Homebrew
+// install: <brew prefix>/libexec/CCPoolDaemon.app/Contents/MacOS/cc-pool. The
+// bundle's app-group entitlement + embedded Developer ID profile give the daemon
+// prompt-free group-container access — the durable replacement for the stable-path
+// re-exec. The brew prefix is two dirs up from the running binary (invoked via the
+// <prefix>/bin/cc-pool symlink). Callers stat the result: a missing bundle
+// (source/HEAD builds) is the expected signal to fall back to the running binary.
+func DaemonBinaryPath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve executable: %w", err)
+	}
+	prefix := filepath.Dir(filepath.Dir(exe))
+	return filepath.Join(prefix, "libexec", "CCPoolDaemon.app", "Contents", "MacOS", "cc-pool"), nil
 }
 
 // MountHolderLogPath is the dev-spawned holder's log path; the production
