@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"ops":[{"kind":"add_comment","body":"Dead ledger API resolved: fp.bridge is verdict-only so gateOpen had no production caller; deleted ledger.clear/gateOpen/ledgers.gateOpen + tests (ledgers.parked kept, live via fpParked). Landed v0.56.0 (18957cc2)."}]}
+{"v":1,"lamport":3,"ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"880db6d09c674847c39b4e8a85a439fa8c888e05"}]}
