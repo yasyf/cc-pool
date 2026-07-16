@@ -279,6 +279,16 @@ jobs:
           codesign --verify --deep --strict --verbose=2 \
             widget/build/Build/Products/Release/CCPoolStatus.app
 
+          # Both apps must carry a stapled notarization ticket. codesign --verify
+          # only proves the signature, not that notarization succeeded — and the
+          # wrap-daemon-bundle / sign-notarize-app actions merely WARN when notary
+          # credentials are missing, so a misnamed secret would ship a
+          # signed-but-unnotarized bundle silently. stapler validate fails closed
+          # on a missing or invalid ticket.
+          xcrun stapler validate "$DAEMON_APP"
+          xcrun stapler validate \
+            widget/build/Build/Products/Release/CCPoolStatus.app
+
           # The CLI binary must NOT carry the App Group — the claim moved to the
           # daemon bundle.
           if codesign -d --entitlements - dist/pure/cc-pool 2>&1 | grep -q "application-groups"; then
