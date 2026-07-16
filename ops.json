@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"ops":[{"kind":"set_branch","branch":"worktree-cred-sync-origin"}]}
+{"v":1,"lamport":3,"ops":[{"kind":"add_comment","body":"Verified closed: origin-owned/stripped-envelope cred-sync shipped v0.53.0 (token-free peer blobs, holder/lease deleted, fleet migrated); confirmed present through v0.56.0."}]}
