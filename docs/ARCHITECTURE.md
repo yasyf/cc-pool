@@ -74,10 +74,10 @@ key — so a grant made against a per-version Homebrew keg path dies on every up
 daemon therefore runs from a signed **CCPoolDaemon.app** bundle inside the Homebrew keg's
 `libexec` (`<keg>/libexec/CCPoolDaemon.app/Contents/MacOS/cc-pool`): its app-group
 entitlement plus an embedded Developer ID provisioning profile grant prompt-free
-group-container access for the File Provider bridge, so tccd keys it by identifier like the
-holder app rather than by keg path — the durable replacement for the retired
-`~/.cc-pool/bin` stable-path re-exec. The daemon is the only process that touches the group
-container — the CLI reads bridge health from the daemon. Two residuals
+group-container access for the File Provider bridge, and tccd keys the bundle by
+identifier like the holder app rather than by keg path — the durable replacement for the
+retired `~/.cc-pool/bin` stable-path re-exec. The daemon is the only process that touches
+the group container — the CLI reads bridge health from the daemon. Two residuals
 still re-prompt: the interactive CLI runs from the keg path, so *Network Volumes* grants
 for its deep-probe reads through fuse mounts stay per-version, and unsigned local builds
 carry a per-build cdhash requirement.
