@@ -24,8 +24,9 @@ the harness in another repo". The panic watcher, evidence scrape, exit-code
 mapping, `meta.json`, cc-notes archive flow, and the `/tmp`-only lifecycle come
 from there unchanged. cc-pool-specific: the `/tmp/ccpool-vm` namespace, the
 File-Provider provisioning (no fuse-t / holder), `push.sh` (builds the cc-pool
-binary + the Developer ID-signed `CCPoolStatus.app`), and the
-`scenarios/replay-fp-migrate-storm.sh` scenario.
+binary, the Developer ID-signed `CCPoolStatus.app`, and the Developer ID
+`CCPoolDaemon.app` daemon bundle), and the `scenarios/replay-fp-migrate-storm.sh`
+and `scenarios/verify-appgroup-noprompt.sh` scenarios.
 
 ## Requirements
 
@@ -47,7 +48,7 @@ Run everything from the repo root, on a build that carries the Phase 2 fixes:
 ```sh
 scripts/vm/vmctl create      # install tart if needed, clone the image (first pull: 20-60 min)
 scripts/vm/vmctl provision   # boot, ssh key, App-Group TCC, (FP extension enabled after push)
-scripts/vm/vmctl push        # build cc-pool + Developer ID CCPoolStatus.app, install, selftest
+scripts/vm/vmctl push        # build cc-pool + Developer ID CCPoolStatus.app + CCPoolDaemon.app, install, selftest
 scripts/vm/vmctl run replay-fp-migrate-storm   # exit 0 == the incident does NOT reproduce
 scripts/vm/vmctl destroy     # delete the VM, then rm -rf /tmp/ccpool-vm
 ```
@@ -133,6 +134,47 @@ clean settle exits `0`; a kernel panic exits `2`.
 > that still holds registered cc-pool domains from a prior run can collide on
 > domain registration; `vmctl destroy && vmctl create` is the clean reset.
 
+## The App-Group no-prompt scenario
+
+`scenarios/verify-appgroup-noprompt.sh` (`EXPECT=clean`) proves the packaging
+contract: shipping the daemon as `CCPoolDaemon.app` — a Developer ID bundle
+carrying the `com.apple.security.application-groups` entitlement (and, when
+profiled, an embedded provisioning profile) — makes the daemon's first bind of
+the File Provider bridge socket inside the App Group container a **silent,
+no-prompt grant**, TCC-keyed by the durable `CFBundleIdentifier`
+(`com.yasyf.cc-pool.daemon`) rather than a per-version keg path.
+
+Run it against a guest provisioned **without** the pre-seeded grant:
+
+```sh
+VMCTL_SKIP_TCC=1 scripts/vm/vmctl provision
+# profiled (the shipping config): supply the daemon's provisioning profile
+VMCTL_PROFILE_DAEMON="$(base64 -i daemon.provisionprofile)" scripts/vm/vmctl push
+VMCTL_PROFILE_DAEMON="$(base64 -i daemon.provisionprofile)" scripts/vm/vmctl run verify-appgroup-noprompt
+# unprofiled control (does the Team-ID-prefixed entitlement alone suffice?)
+scripts/vm/vmctl push
+scripts/vm/vmctl run verify-appgroup-noprompt
+```
+
+Set `VMCTL_DAEMON_MODE=both` to A/B both arms in one run. For every selected
+mode the scenario locally re-wraps + Developer ID-signs the daemon bundle (via
+`vm_build_daemon_bundle`, the same path `push` uses), installs it, and asserts:
+
+1. **cold start, no grant** — the FP bridge socket accepts within 3s, the daemon
+   log carries no `awaiting the one-time app-group-container consent` line, both
+   the user and system `TCC.db` hold **zero** cc-pool `kTCCServiceSystemPolicyAppData`
+   rows, and `launchctl procinfo` on the running daemon shows the App Group
+   entitlement validated;
+2. **upgrade-replay** — a second build installed at a fresh keg path adds zero
+   new TCC rows and re-prompts not at all (proof the grant is identifier-keyed,
+   not path-keyed).
+
+> **Run-from-bundle dependency.** The entitlement-validated assertion requires
+> the daemon to keep running from the bundle. On a build that still re-execs the
+> daemon from `pool.StableBinDir()` (a bare `~/.cc-pool/bin/cc-pool` copy) the
+> `assert_runs_from_bundle` check fails by design — that re-exec is what the
+> daemon-bundle packaging obsoletes, and the Go rewire must neutralize it.
+
 ## Environment
 
 cc-pool-specific variables (the fusekit README documents the shared ones —
@@ -145,7 +187,10 @@ cc-pool-specific variables (the fusekit README documents the shared ones —
 | `VMCTL_TART_HOME` | `$VM_ROOT/tart` | Repoint ONLY the image cache to share a warm pull (e.g. `/tmp/fusekit-vm/tart`). |
 | `VMCTL_SIGN_IDENTITY` | auto-discovered | Pin the Developer ID signing identity (sha1 or name). |
 | `VMCTL_SIGN_TEAM` | auto-discovered | Pin the signing team id (must be `SXKCTF23Q2` to match `paths.go`). |
-| `VMCTL_TCC_APPDATA_CLIENTS` | sshd-wrapper + daemon path | App-Group-data TCC grantees. |
+| `VMCTL_TCC_APPDATA_CLIENTS` | sshd-wrapper + daemon path | App-Group-data TCC grantees (ignored when `VMCTL_SKIP_TCC` is set). |
+| `VMCTL_SKIP_TCC` | unset | Set (non-empty) to make `provision` NOT pre-seed the App-Group grant — required for `verify-appgroup-noprompt`. |
+| `VMCTL_PROFILE_DAEMON` | unset | The daemon's App-Group provisioning profile (a `.provisionprofile` path or its base64). Set ⇒ push builds a **profiled** `CCPoolDaemon.app`; unset ⇒ **unprofiled** (app-group entitlement alone). |
+| `VMCTL_DAEMON_MODE` | `auto` | `verify-appgroup-noprompt` arm(s): `auto` (profiled iff a profile is set), `profiled`, `unprofiled`, or `both`. |
 | `VMCTL_CHRONOLOGY_LOG` | resolved by name | Pin the cc-notes log id to archive into. |
 | `BUILD_REV` | short `git` HEAD (`-dirty`) | The revision recorded in the guest and `meta.json`. |
 
