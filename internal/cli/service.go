@@ -106,12 +106,35 @@ func holderClient() *mountd.Client {
 	return &mountd.Client{Socket: mountd.DefaultHolderSocket(), Owner: pool.HolderOwner}
 }
 
-// Program defaults to os.Executable, so a Homebrew symlink stays a stable
-// launchd program path across upgrades.
+// daemonBundleBin resolves the daemon .app bundle's main executable path; a seam
+// so tests exercise both the bundle-present and source-build branches.
+var daemonBundleBin = pool.DaemonBinaryPath
+
+// daemonBundleExecutable returns the daemon .app bundle's main executable and
+// whether it exists on disk. A Homebrew release ships CCPoolDaemon.app (app-group
+// entitlement + embedded Developer ID profile) so launchd execs the bundle for
+// prompt-free group-container access; source and HEAD builds have no bundle.
+func daemonBundleExecutable() (string, bool) {
+	p, err := daemonBundleBin()
+	if err != nil {
+		return "", false
+	}
+	fi, err := os.Stat(p)
+	return p, err == nil && fi.Mode().IsRegular()
+}
+
+// ccpAgent's Program is the daemon .app bundle when it is installed (launchd execs
+// the entitled+profiled bundle), else empty so launchd falls back to os.Executable
+// — a Homebrew symlink that stays a stable program path across upgrades.
 func ccpAgent() service.Agent {
+	program := ""
+	if p, ok := daemonBundleExecutable(); ok {
+		program = p
+	}
 	return service.Agent{
 		Label:   "com.yasyf.cc-pool",
 		Formula: "cc-pool",
+		Program: program,
 		Args:    []string{"daemon"},
 		LogPath: pool.LogPath(),
 		Env: map[string]string{
@@ -439,6 +462,9 @@ func purgeAll(cmd *cobra.Command) error {
 
 func runServiceInstall(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
+	if _, ok := daemonBundleExecutable(); !ok {
+		warn(cmd.ErrOrStderr(), "no CCPoolDaemon.app bundle found; running the daemon from the current binary — File Provider needs the signed release bundle for prompt-free group-container access (expected on source/HEAD builds)")
+	}
 	if ccpAgent().IsBrewManaged() {
 		// A source build leaves a self-rolled agent that would run alongside
 		// the brew one; boot it out first.

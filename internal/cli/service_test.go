@@ -43,6 +43,39 @@ func tempHome(t *testing.T) string {
 	return home
 }
 
+// TestCCPAgentProgramSelection pins the LaunchAgent Program branch: an installed
+// CCPoolDaemon.app bundle makes launchd exec the entitled bundle, while a
+// source/HEAD build with no bundle leaves Program empty so launchd falls back to
+// os.Executable.
+func TestCCPAgentProgramSelection(t *testing.T) {
+	tempHome(t)
+
+	t.Run("bundle present sets Program to the bundle executable", func(t *testing.T) {
+		bundle := filepath.Join(t.TempDir(), "cc-pool")
+		if err := os.WriteFile(bundle, []byte("bin"), 0o755); err != nil { //nolint:gosec // G306: test fixture must be executable.
+			t.Fatal(err)
+		}
+		swapVar(t, &daemonBundleBin, func() (string, error) { return bundle, nil })
+		if got := ccpAgent().Program; got != bundle {
+			t.Fatalf("ccpAgent().Program = %q, want the bundle executable %q", got, bundle)
+		}
+	})
+
+	t.Run("absent bundle leaves Program empty for the os.Executable fallback", func(t *testing.T) {
+		swapVar(t, &daemonBundleBin, func() (string, error) { return filepath.Join(t.TempDir(), "absent"), nil })
+		if got := ccpAgent().Program; got != "" {
+			t.Fatalf("ccpAgent().Program = %q, want empty (os.Executable fallback) with no bundle", got)
+		}
+	})
+
+	t.Run("resolver error leaves Program empty", func(t *testing.T) {
+		swapVar(t, &daemonBundleBin, func() (string, error) { return "", errors.New("no executable") })
+		if got := ccpAgent().Program; got != "" {
+			t.Fatalf("ccpAgent().Program = %q, want empty on resolver error", got)
+		}
+	})
+}
+
 func seedAccounts(t *testing.T, accts ...store.Account) {
 	t.Helper()
 	if err := pool.EnsureStateDir(); err != nil {
