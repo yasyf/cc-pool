@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"time"
 
@@ -12,6 +14,9 @@ import (
 
 // ErrDaemonUnavailable means the daemon socket could not be reached.
 var ErrDaemonUnavailable = errors.New("daemon not running")
+
+// ErrProtocolMismatch means the socket peer speaks an incompatible daemon protocol.
+var ErrProtocolMismatch = errors.New("daemon protocol mismatch")
 
 // Client is a short-lived connection to the daemon socket.
 type Client struct {
@@ -32,39 +37,118 @@ func (c *Client) Available() bool {
 }
 
 func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
-	conn, err := net.DialTimeout("unix", c.socket, 500*time.Millisecond)
+	return c.doContext(context.Background(), req, timeout)
+}
+
+func (c *Client) doContext(ctx context.Context, req Request, timeout time.Duration) (*Response, error) {
+	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
+	conn, err := dialer.DialContext(ctx, "unix", c.socket)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, ErrDaemonUnavailable
 	}
 	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
 
 	req.Proto = ProtocolVersion
 	enc := json.NewEncoder(conn)
 	if err := enc.Encode(req); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	var resp Response
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
+	}
+	if resp.Proto != ProtocolVersion {
+		return nil, fmt.Errorf("%w: daemon=%d client=%d", ErrProtocolMismatch, resp.Proto, ProtocolVersion)
 	}
 	return &resp, nil
 }
 
-// Select asks the daemon for the best account dir. cwd keys best-effort
-// session stickiness (empty disables); noFallback rejects a least-bad
-// exhausted pick; ok=false means fall back to a live, daemonless selection.
-func (c *Client) Select(account *int, pid int, noMark bool, cwd string, noFallback bool) (resp *Response, ok bool) {
-	r, err := c.do(Request{Op: OpSelect, Account: account, PID: pid, NoMark: noMark, Cwd: cwd, NoFallback: noFallback}, 3*time.Second)
+// Select asks the daemon for a provisional account selection. cwd keys
+// best-effort session stickiness (empty disables); noFallback rejects a
+// least-bad exhausted pick; ok=false means fall back to a live, daemonless
+// selection. A successful response must be committed or aborted by token.
+func (c *Client) Select(ctx context.Context, account *int, pid int, noMark bool, cwd string, noFallback bool, excludeIDs []int) (resp *Response, ok bool) {
+	r, err := c.doContext(ctx, Request{Op: OpSelect, Account: account, PID: pid, NoMark: noMark, Cwd: cwd, NoFallback: noFallback, ExcludeIDs: excludeIDs}, 3*time.Second)
 	if err != nil {
 		return nil, false
 	}
 	return r, true
 }
 
+// CommitSelection consumes a provisional selection and records its session and
+// sticky state. The server caches the terminal token result, so transport-ambiguous
+// attempts are safe to retry within one bounded commit window.
+func (c *Client) CommitSelection(ctx context.Context, token string) error {
+	const commitWindow = 3 * time.Second
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	commitDeadline := time.Now().Add(commitWindow)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(commitDeadline) {
+		return context.DeadlineExceeded
+	}
+	// Once the first commit byte can be sent, cancellation cannot make the result
+	// ambiguous: keep confirming the token's terminal result for the full reserved
+	// window. Its deadline is no later than the caller's checked deadline.
+	commitCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), commitDeadline)
+	defer cancel()
+	var lastErr error
+	for {
+		r, err := c.doContext(commitCtx, Request{Op: OpSelectCommit, ReservationToken: token}, time.Second)
+		if err == nil {
+			if !r.OK {
+				return errors.New(r.Error)
+			}
+			return nil
+		}
+		lastErr = err
+		timer := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-commitCtx.Done():
+			timer.Stop()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return lastErr
+		case <-timer.C:
+		}
+	}
+}
+
+// AbortSelection releases a provisional selection. Abort is idempotent.
+func (c *Client) AbortSelection(ctx context.Context, token string) error {
+	r, err := c.doContext(ctx, Request{Op: OpSelectAbort, ReservationToken: token}, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	if !r.OK {
+		return errors.New(r.Error)
+	}
+	return nil
+}
+
 // Status asks the daemon for all account statuses.
 func (c *Client) Status() (*Response, error) {
 	return c.do(Request{Op: OpStatus}, 5*time.Second)
+}
+
+// StatusContext asks the daemon for all account statuses within ctx's deadline.
+func (c *Client) StatusContext(ctx context.Context) (*Response, error) {
+	return c.doContext(ctx, Request{Op: OpStatus}, 5*time.Second)
 }
 
 // Checkin releases a checkout for pid.
@@ -75,6 +159,11 @@ func (c *Client) Checkin(pid int) (*Response, error) {
 // Health probes the daemon.
 func (c *Client) Health() (*Response, error) {
 	return c.do(Request{Op: OpHealth}, 2*time.Second)
+}
+
+// HealthContext probes the daemon within ctx's remaining deadline.
+func (c *Client) HealthContext(ctx context.Context) (*Response, error) {
+	return c.doContext(ctx, Request{Op: OpHealth}, 2*time.Second)
 }
 
 // migrateTimeout covers a probe mount plus, per account, an 8s mount wait and rollback teardown.

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
@@ -154,6 +155,7 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
+	aborted := make(chan struct{}, 1)
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -169,6 +171,10 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 			if req.Op == daemon.OpSelect {
 				resp.SelectedID = &returned.ID
 				resp.Dir = returned.ConfigDir
+				resp.ReservationToken = "malformed-selection"
+			}
+			if req.Op == daemon.OpSelectAbort {
+				aborted <- struct{}{}
 			}
 			_ = json.NewEncoder(conn).Encode(resp)
 			_ = conn.Close()
@@ -182,7 +188,7 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 	cmd.SetContext(context.Background())
 	acquireCalls, execCalls := 0, 0
 	prevLease, prevExec := runAcquireLease, runExecClaude
-	runAcquireLease = func(store.Account) (*lease.Handle, error) {
+	runAcquireLease = func(context.Context, store.Account) (*lease.Handle, error) {
 		acquireCalls++
 		return nil, nil
 	}
@@ -209,6 +215,11 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 	}
 	if acquireCalls != 0 || execCalls != 0 {
 		t.Errorf("malformed response reached launch consequences: acquire=%d exec=%d", acquireCalls, execCalls)
+	}
+	select {
+	case <-aborted:
+	case <-time.After(time.Second):
+		t.Fatal("malformed daemon selection token was not aborted")
 	}
 	for _, acct := range []store.Account{requested, returned} {
 		if _, err := os.Stat(filepath.Join(acct.ConfigDir, ".claude.json")); !os.IsNotExist(err) {

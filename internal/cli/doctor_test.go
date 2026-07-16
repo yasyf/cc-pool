@@ -487,7 +487,6 @@ func TestReportLedgers(t *testing.T) {
 			ledgers: []daemon.LedgerState{
 				{Policy: "auth.streak", Resource: "/p/acct-01", Strikes: 2},
 				{Policy: "fp.domain", Resource: "/p/acct-02", Strikes: 1},
-				{Policy: "fp.shallow", Resource: "/p/acct-02", Strikes: 1},
 				{Policy: "fp.bridge", Resource: "pool", Strikes: 1},
 				{Policy: "fuse.deepwedge", Resource: "/p/acct-01", Strikes: 1},
 				{Policy: "fuse.remount", Resource: "/p/acct-01", Attempts: 3},
@@ -551,13 +550,6 @@ func TestReportLedgers(t *testing.T) {
 				label:    "acct-02 file provider",
 				frags:    []string{"parked", "automated recovery is exhausted", "ccp fp repair --account 2", "--retreat"},
 				notFrags: []string{"wedged"},
-			}},
-		},
-		"faulted fp shallow lane reports the listability failure and last error": {
-			ledgers: []daemon.LedgerState{{Policy: "fp.shallow", Resource: "/p/acct-02", Faulted: true, LastErr: "domain not serving"}},
-			want: []wantCall{{
-				label: "acct-02 file provider shallow probe",
-				frags: []string{"no longer listable", "shallow liveness probe failed", "domain not serving"},
 			}},
 		},
 		"faulted fp bridge reports the pool-wide verdict and lever": {

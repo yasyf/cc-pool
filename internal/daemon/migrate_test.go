@@ -338,9 +338,7 @@ func TestHandleMigrateBusyWhenReserved(t *testing.T) {
 		t.Fatal("busy refusal leaked a converting claim")
 	}
 
-	s.cl.mu.Lock()
-	s.cl.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
-	s.cl.mu.Unlock()
+	expireCommittedReservations(s.cl, 1)
 	resp = s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
 	got = outcomes(resp)
 	if got[1] != MigrationDone || got[2] != MigrationAlready {
@@ -367,9 +365,7 @@ func TestConvertClaimExcludesReservations(t *testing.T) {
 	if s.cl.own(1) {
 		t.Fatal("beginConvert succeeded over a live reservation")
 	}
-	s.cl.mu.Lock()
-	s.cl.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
-	s.cl.mu.Unlock()
+	expireCommittedReservations(s.cl, 1)
 	if !s.cl.own(1) {
 		t.Fatal("beginConvert failed over an expired reservation")
 	}
@@ -729,9 +725,7 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	}
 
 	// Force must flow through the wire path too.
-	s.cl.mu.Lock()
-	s.cl.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
-	s.cl.mu.Unlock()
+	expireCommittedReservations(s.cl, 1)
 	resp := s.handleMigrate(t.Context(), Request{Op: OpMigrate, To: "fuse", Force: true})
 	if !resp.OK {
 		t.Fatalf("forced migrate failed: %s", resp.Error)

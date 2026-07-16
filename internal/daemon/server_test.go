@@ -87,6 +87,17 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 	return s, dirs
 }
 
+func expireCommittedReservations(c *claims, accountID int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for token, r := range c.reservations {
+		if r.accountID == accountID {
+			r.createdAt = time.Now().Add(-reservationTTL - time.Second)
+			c.reservations[token] = r
+		}
+	}
+}
+
 func TestReservedCountExpiresAfterTTL(t *testing.T) {
 	s := &Server{cl: newClaims()}
 
@@ -99,17 +110,15 @@ func TestReservedCountExpiresAfterTTL(t *testing.T) {
 		t.Fatalf("reservedCount after reserve = %d, want 1", got)
 	}
 
-	s.cl.mu.Lock()
-	s.cl.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
-	s.cl.mu.Unlock()
+	expireCommittedReservations(s.cl, 1)
 	if got := s.cl.reservedCount(1); got != 0 {
 		t.Fatalf("reservedCount after TTL = %d, want 0", got)
 	}
 	s.cl.mu.Lock()
-	_, ok := s.cl.reservations[1]
+	left := len(s.cl.reservations)
 	s.cl.mu.Unlock()
-	if ok {
-		t.Fatal("expired reservation was not deleted")
+	if left != 0 {
+		t.Fatalf("expired reservations were not deleted: %d remain", left)
 	}
 }
 
@@ -125,9 +134,172 @@ func TestHandleSelectRecordsSticky(t *testing.T) {
 	if !resp.HasUsage || resp.Remaining5h <= 0 || resp.Remaining7d <= 0 {
 		t.Fatalf("expected remaining headroom on a sampled pick, got HasUsage=%v Remaining5h=%.1f Remaining7d=%.1f", resp.HasUsage, resp.Remaining5h, resp.Remaining7d)
 	}
+	commitSelectResponse(t, s, resp)
 	st, ok, err := s.m.Store.GetSticky("/proj")
 	if err != nil || !ok || st.AccountID != 1 {
 		t.Fatalf("winner not recorded: %+v ok=%v err=%v", st, ok, err)
+	}
+}
+
+func TestHandleSelectTransactionAbortAndExclude(t *testing.T) {
+	s, dirs := newTestServer(t)
+	first := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, Cwd: "/proj"})
+	if !first.OK || first.Dir != dirs[1] || first.ReservationToken == "" {
+		t.Fatalf("provisional select = %+v, want acct-1 with token", first)
+	}
+	if live, _ := s.m.Store.ListActiveSessions(); len(live) != 0 {
+		t.Fatalf("provisional select opened phantom sessions: %+v", live)
+	}
+	if _, ok, _ := s.m.Store.GetSticky("/proj"); ok {
+		t.Fatal("provisional select recorded phantom sticky state")
+	}
+	if got := s.cl.reservedCount(1); got != 1 {
+		t.Fatalf("pending reservation count = %d, want 1", got)
+	}
+	if resp := s.handleSelectAbort(context.Background(), Request{Op: OpSelectAbort, ReservationToken: first.ReservationToken}); !resp.OK {
+		t.Fatalf("abort = %+v", resp)
+	}
+	if got := s.cl.reservedCount(1); got != 0 {
+		t.Fatalf("reservation survived abort: %d", got)
+	}
+
+	second := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, Cwd: "/proj", ExcludeIDs: []int{1}})
+	if !second.OK || second.Dir != dirs[2] {
+		t.Fatalf("excluded retry = %+v, want acct-2", second)
+	}
+	commitSelectResponse(t, s, second)
+	if live, _ := s.m.Store.ListActiveSessions(); len(live) != 1 || live[0].AccountID != 2 {
+		t.Fatalf("committed sessions = %+v, want only acct-2", live)
+	}
+	if sticky, ok, _ := s.m.Store.GetSticky("/proj"); !ok || sticky.AccountID != 2 {
+		t.Fatalf("committed sticky = %+v ok=%v, want acct-2", sticky, ok)
+	}
+}
+
+func TestCommitSelectionRetriesDroppedResponseWithoutDuplicateEffects(t *testing.T) {
+	s, _ := newTestServer(t)
+	selected := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, Cwd: "/proj"})
+	if !selected.OK || selected.ReservationToken == "" {
+		t.Fatalf("select = %+v", selected)
+	}
+
+	socketFile, err := os.CreateTemp("/tmp", "ccp-commit-*.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := socketFile.Name()
+	_ = socketFile.Close()
+	_ = os.Remove(socket)
+	t.Cleanup(func() { _ = os.Remove(socket) })
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	served := make(chan error, 1)
+	go func() {
+		for i := 0; i < 2; i++ {
+			conn, err := ln.Accept()
+			if err != nil {
+				served <- err
+				return
+			}
+			var req Request
+			if err := json.NewDecoder(conn).Decode(&req); err != nil {
+				_ = conn.Close()
+				served <- err
+				return
+			}
+			resp := s.dispatch(t.Context(), req)
+			if i == 0 {
+				_ = conn.Close() // commit landed; its first response is lost
+				continue
+			}
+			resp.Proto = ProtocolVersion
+			err = json.NewEncoder(conn).Encode(resp)
+			_ = conn.Close()
+			if err != nil {
+				served <- err
+				return
+			}
+		}
+		served <- nil
+	}()
+
+	client := &Client{socket: socket}
+	if err := client.CommitSelection(t.Context(), selected.ReservationToken); err != nil {
+		t.Fatalf("retry commit after dropped response: %v", err)
+	}
+	if err := <-served; err != nil {
+		t.Fatalf("serve commit attempts: %v", err)
+	}
+	live, err := s.m.Store.ListActiveSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 1 || live[0].AccountID != 1 {
+		t.Fatalf("replayed commit effects = %+v, want one acct-1 session", live)
+	}
+	if sticky, ok, err := s.m.Store.GetSticky("/proj"); err != nil || !ok || sticky.AccountID != 1 {
+		t.Fatalf("replayed commit sticky = %+v ok=%v err=%v", sticky, ok, err)
+	}
+}
+
+func TestCommitSelectionFailureReleasesPromotedReservation(t *testing.T) {
+	s, _ := newTestServer(t)
+	forced := 1
+	first := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, NoMark: true, Cwd: "/first"})
+	second := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, NoMark: true, Cwd: "/second"})
+	if !first.OK || !second.OK {
+		t.Fatalf("provisional selects = %+v / %+v", first, second)
+	}
+	if committed := s.handleSelectCommit(context.Background(), Request{Op: OpSelectCommit, ReservationToken: first.ReservationToken}); !committed.OK {
+		t.Fatalf("first commit = %+v", committed)
+	}
+	s.wg.Wait()
+	if err := s.m.Store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	failed := s.handleSelectCommit(context.Background(), Request{Op: OpSelectCommit, ReservationToken: second.ReservationToken})
+	if failed.OK || !strings.Contains(failed.Error, "commit selection") {
+		t.Fatalf("second commit against closed store = %+v", failed)
+	}
+	if got := s.cl.reservedCount(forced); got != 1 {
+		t.Fatalf("second commit failure left %d reservations, want first commit's one", got)
+	}
+	replayed := s.handleSelectCommit(context.Background(), Request{Op: OpSelectCommit, ReservationToken: second.ReservationToken})
+	if replayed.OK || replayed.Error != failed.Error {
+		t.Fatalf("terminal failure replay = %+v, want %+v", replayed, failed)
+	}
+}
+
+func TestProvisionalSelectionExpiresWithoutEffects(t *testing.T) {
+	s, _ := newTestServer(t)
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, Cwd: "/proj"})
+	if !resp.OK {
+		t.Fatalf("select = %+v", resp)
+	}
+	expired := time.Now().Add(-provisionalSelectionTTL - time.Second)
+	s.selectMu.Lock()
+	pending := s.selectPending[resp.ReservationToken]
+	pending.createdAt = expired
+	s.selectPending[resp.ReservationToken] = pending
+	s.selectMu.Unlock()
+	s.cl.mu.Lock()
+	claim := s.cl.pending[resp.ReservationToken]
+	claim.createdAt = expired
+	s.cl.pending[resp.ReservationToken] = claim
+	s.cl.mu.Unlock()
+
+	s.prunePendingSelects(time.Now())
+	if committed := s.handleSelectCommit(context.Background(), Request{Op: OpSelectCommit, ReservationToken: resp.ReservationToken}); committed.OK {
+		t.Fatalf("expired commit unexpectedly succeeded: %+v", committed)
+	}
+	if live, _ := s.m.Store.ListActiveSessions(); len(live) != 0 {
+		t.Fatalf("expired selection opened sessions: %+v", live)
+	}
+	if _, ok, _ := s.m.Store.GetSticky("/proj"); ok {
+		t.Fatal("expired selection recorded sticky state")
 	}
 }
 
@@ -164,6 +336,7 @@ func TestHandleSelectSkipsExhaustedStickyPin(t *testing.T) {
 	if resp.Sticky || resp.ExhaustedFallback {
 		t.Fatalf("a fresh healthy pick must report neither sticky nor fallback: %+v", resp)
 	}
+	commitSelectResponse(t, s, resp)
 	st, ok, err := s.m.Store.GetSticky("/proj")
 	if err != nil || !ok || st.AccountID != 1 {
 		t.Fatalf("sticky row not rewritten to the winner: %+v ok=%v err=%v", st, ok, err)
@@ -178,6 +351,7 @@ func TestHandleSelectMarksSessionWithCwd(t *testing.T) {
 	if !resp.OK || resp.SelectedID == nil {
 		t.Fatalf("select failed: %+v", resp)
 	}
+	commitSelectResponse(t, s, resp)
 	live, err := s.m.Store.ListActiveSessions()
 	if err != nil || len(live) != 1 {
 		t.Fatalf("sessions = %+v err=%v", live, err)
@@ -276,6 +450,7 @@ func TestHandleSelectForcedMarksSession(t *testing.T) {
 	if !resp.OK {
 		t.Fatalf("forced select failed: %+v", resp)
 	}
+	commitSelectResponse(t, s, resp)
 	live, err := s.m.Store.ListActiveSessions()
 	if err != nil || len(live) != 1 {
 		t.Fatalf("sessions = %+v err=%v", live, err)
@@ -563,9 +738,18 @@ func TestHandleSelectForcedRecordsSticky(t *testing.T) {
 	if resp.Sticky {
 		t.Fatal("forced select must not report sticky (ranking was not overridden)")
 	}
+	commitSelectResponse(t, s, resp)
 	st, ok, err := s.m.Store.GetSticky("/proj")
 	if err != nil || !ok || st.AccountID != 2 {
 		t.Fatalf("forced account not recorded: %+v ok=%v err=%v", st, ok, err)
+	}
+}
+
+func commitSelectResponse(t *testing.T, s *Server, resp Response) {
+	t.Helper()
+	committed := s.handleSelectCommit(context.Background(), Request{Op: OpSelectCommit, ReservationToken: resp.ReservationToken})
+	if !committed.OK {
+		t.Fatalf("commit selection: %+v", committed)
 	}
 }
 
@@ -623,7 +807,7 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	// Park a handler mid-request: it blocks in Decode awaiting the closing brace.
 	parked := dial()
 	defer func() { _ = parked.Close() }()
-	if _, err := parked.Write([]byte(`{"op":"status"`)); err != nil {
+	if _, err := parked.Write([]byte(`{"proto":2,"op":"status"`)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -631,7 +815,7 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	// wg-tracked: the accept loop is sequential and unix sockets accept FIFO.
 	probe := dial()
 	defer func() { _ = probe.Close() }()
-	if _, err := probe.Write([]byte(`{"op":"health"}` + "\n")); err != nil {
+	if _, err := probe.Write([]byte(`{"proto":2,"op":"health"}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
 	var health Response

@@ -398,15 +398,6 @@ func reportLedgers(accts []store.Account, ledgers []daemon.LedgerState, now time
 				id := byDir[l.Resource].ID
 				report(label(l, "file provider"), false, fmt.Sprintf("domain parked: the daemon's automated recovery is exhausted (the domain was deregistered or its extension is uncontrollable) — run `ccp fp repair --account %d` to re-register it (or `ccp fp repair --retreat --account %d` to fall back to symlink), then relaunch any sessions on it; a stuck fileproviderd needs a manual restart (see %s)", id, id, abbreviateHome(pool.LogPath())))
 			}
-		case "fp.shallow":
-			if !l.Faulted {
-				continue
-			}
-			detail := "domain no longer listable (shallow liveness probe failed); the daemon promoted it into the recovery ladder"
-			if l.LastErr != "" {
-				detail += " — last error: " + l.LastErr
-			}
-			report(label(l, "file provider shallow probe"), false, detail)
 		case "fp.bridge":
 			if !l.Faulted {
 				continue

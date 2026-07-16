@@ -44,7 +44,7 @@ func TestEnvMergesBaseSettings(t *testing.T) {
 
 	// The lease agent forks a detached `ccp lease-agent`; stub it (the test binary
 	// is not ccp, so a real fork would never complete the readiness handshake).
-	swapVar(t, &spawnLeaseAgent, func(store.Account) error { return nil })
+	swapVar(t, &spawnLeaseAgent, func(store.Account) (leaseAgentCleanup, error) { return nil, nil })
 
 	cmd := newEnvCmd()
 	var stdout, stderr bytes.Buffer
@@ -95,8 +95,8 @@ func TestEnvHandsOutNothingOnLeaseFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	swapVar(t, &spawnLeaseAgent, func(store.Account) error {
-		return errors.New("the session lease agent did not become ready")
+	swapVar(t, &spawnLeaseAgent, func(store.Account) (leaseAgentCleanup, error) {
+		return nil, errors.New("the session lease agent did not become ready")
 	})
 
 	cmd := newEnvCmd()

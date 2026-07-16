@@ -111,7 +111,7 @@ func newEnvCmd() *cobra.Command {
 				// terminal's session leader exits. Block on the agent's acquired+probed
 				// handshake BEFORE printing any exports — a failure prints nothing and
 				// exits non-zero rather than handing out an unprotected dir.
-				if err := spawnLeaseAgent(a); err != nil {
+				if _, err := spawnLeaseAgent(a); err != nil {
 					return fmt.Errorf("couldn't hold the session lease for %s: %w", accountName(a.Label), err)
 				}
 				out := cmd.OutOrStdout()

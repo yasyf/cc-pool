@@ -17,7 +17,7 @@ struct StatusProvider: TimelineProvider {
     /// The daemon polls every 180s + up to 30s jitter and stamps generated_at
     /// per completed poll; two missed cycles (~7 min) means it's down or wedged.
     static let staleAfter: TimeInterval = 7 * 60
-    static let supportedProto = 1
+    static let supportedProto = 2
 
     func placeholder(in _: Context) -> StatusEntry {
         StatusEntry(date: .now, state: .ok(.sample, stale: false))

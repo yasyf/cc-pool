@@ -31,6 +31,9 @@ const settingsJSONName = "settings.json"
 // fpLaunchPrepareDeadline bounds the pre-launch File Provider materialization.
 const fpLaunchPrepareDeadline = 30 * time.Second
 
+// runLaunchPrepareBudget bounds selection plus account-local launch gates across retries.
+const runLaunchPrepareBudget = 60 * time.Second
+
 // fpDomainPreparer is the launch-time materialization op the File Provider provider
 // exposes (satisfied by *fusekit/overlay.FileProviderProvider).
 type fpDomainPreparer interface {
@@ -54,9 +57,8 @@ var fpLaunchPreparer = func() (fpDomainPreparer, error) {
 // prepareFPForLaunch force-materializes a File Provider account's computed
 // settings.json before a launch commits, so claude's first read never blocks on a
 // cold fetch. A non-FP account is a no-op. forced (CCP_ACCOUNT) names the account in
-// a not-serving failure for a retry; an auto pick fails the launch too (the daemon's
-// select-time probe already excludes genuinely-non-serving domains, so a retry picks
-// another). An ErrOpUnsupported app is a loud cask-upgrade error, never a silent
+// a not-serving failure for a retry; an automatic pick is excluded and re-ranked by
+// the launch loop. An ErrOpUnsupported app is a loud cask-upgrade error, never a silent
 // unready launch; a busy/unreachable app fails THIS launch without wedging the domain.
 func prepareFPForLaunch(ctx context.Context, a store.Account, forced bool) error {
 	if !isFPRow(a.OverlayKind) {
@@ -75,7 +77,7 @@ func prepareFPForLaunch(ctx context.Context, a store.Account, forced bool) error
 		if forced {
 			return fmt.Errorf("acct-%02d's file provider domain is not serving; retry once it recovers: %w", a.ID, err)
 		}
-		return fmt.Errorf("acct-%02d's file provider domain is not serving; re-run to pick another account: %w", a.ID, err)
+		return fmt.Errorf("acct-%02d's file provider domain is not serving: %w", a.ID, err)
 	case errors.Is(err, fileproviderd.ErrBusy), errors.Is(err, fileproviderd.ErrAppUnavailable):
 		return fmt.Errorf("acct-%02d's companion app is busy or unreachable; retry this launch: %w", a.ID, err)
 	default:
@@ -123,20 +125,73 @@ func runClaude(cmd *cobra.Command, m *pool.Manager, args []string) error {
 		return err
 	}
 	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just disables stickiness
-	// exec replaces this process in place, so os.Getpid() IS the future
-	// claude pid — the pick registers as a real session checkout.
-	acct, dir, line, err := resolveSelection(cmd, m, selectReq{account: account, cwd: cwd, pid: os.Getpid()})
-	if err != nil {
-		return err
+	base := cmd.Context()
+	if base == nil {
+		base = context.Background()
 	}
-	return runLaunch(cmd, acct, dir, line, args, account != nil)
+	ctx, cancel := context.WithTimeout(base, runLaunchPrepareBudget)
+	defer cancel()
+	return runLaunchCandidates(ctx, account != nil,
+		func(excluded []int) (*selectionTxn, error) {
+			return resolveSelectionTxn(ctx, cmd, m, selectReq{
+				account: account, cwd: cwd, pid: os.Getpid(), excludeIDs: excluded,
+			})
+		},
+		func(selection *selectionTxn) error {
+			return runLaunchSelection(ctx, cmd, selection, args, account != nil)
+		},
+	)
+}
+
+func runLaunchCandidates(ctx context.Context, forced bool, resolve func([]int) (*selectionTxn, error), launch func(*selectionTxn) error) error {
+	var attempts []launchAttempt
+	var excluded []int
+	for {
+		if err := ctx.Err(); err != nil {
+			return launchAttemptError(attempts, err)
+		}
+		selection, err := resolve(excluded)
+		if err != nil {
+			return launchAttemptError(attempts, err)
+		}
+		if err := ctx.Err(); err != nil {
+			selection.Abort()
+			return launchAttemptError(attempts, err)
+		}
+		err = launch(selection)
+		if err == nil || forced || !errors.Is(err, fileproviderd.ErrDomainNotServing) {
+			return launchAttemptError(attempts, err)
+		}
+		attempts = append(attempts, launchAttempt{accountID: selection.acct.ID, err: err})
+		excluded = append(excluded, selection.acct.ID)
+		if ctx.Err() != nil {
+			return launchAttemptError(attempts, ctx.Err())
+		}
+	}
+}
+
+type launchAttempt struct {
+	accountID int
+	err       error
+}
+
+func launchAttemptError(attempts []launchAttempt, final error) error {
+	if final == nil || len(attempts) == 0 {
+		return final
+	}
+	parts := make([]string, 0, len(attempts))
+	for _, attempt := range attempts {
+		parts = append(parts, fmt.Sprintf("acct-%02d: %v", attempt.accountID, attempt.err))
+	}
+	return fmt.Errorf("launch preparation exhausted candidates (%s): %w", strings.Join(parts, "; "), final)
 }
 
 // runAcquireLease and runExecClaude are the run pipeline's lease-acquire and exec
 // seams — package vars so a pipeline test can assert the launch ordering (a failed
 // prepare gate leaves them uncalled) without a live holder or a real exec.
 var (
-	runAcquireLease = acquireAndProbeSessionLease
+	runAcquireLease = acquireAndProbeSessionLeaseContext
+	runPrimeForExec = execguard.PrimeForExecContext
 	runExecClaude   = execClaude
 )
 
@@ -145,23 +200,57 @@ var (
 // and NO exec; only then the session lease, the settings.json prime (P8, FP only), the
 // pick banner, and exec. A non-FP account skips prepare and priming.
 func runLaunch(cmd *cobra.Command, acct store.Account, dir, line string, args []string, forced bool) error {
-	if err := prepareFPForLaunch(cmd.Context(), acct, forced); err != nil {
+	selection := &selectionTxn{acct: acct, dir: dir, line: line, commit: func(context.Context) error { return nil }, abort: func() {}}
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return runLaunchSelection(ctx, cmd, selection, args, forced)
+}
+
+func runLaunchSelection(ctx context.Context, cmd *cobra.Command, selection *selectionTxn, args []string, forced bool) error {
+	defer selection.Abort()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := prepareFPForLaunch(ctx, selection.acct, forced); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	// Session lease BEFORE exec: its non-CLOEXEC fd rides into claude, pinning the
 	// mount; the post-Acquire probe refuses a dead/wedged mount.
-	h, err := runAcquireLease(acct)
+	h, err := runAcquireLease(ctx, selection.acct)
 	if err != nil {
 		return err
 	}
-	if isFPRow(acct.OverlayKind) {
-		if err := execguard.PrimeForExec(filepath.Join(dir, settingsJSONName)); err != nil {
-			_ = h.Close()
+	if err := ctx.Err(); err != nil {
+		closeRunLease(h)
+		return err
+	}
+	if isFPRow(selection.acct.OverlayKind) {
+		if err := runPrimeForExec(ctx, filepath.Join(selection.dir, settingsJSONName)); err != nil {
+			closeRunLease(h)
 			return err
 		}
 	}
-	step(cmd.ErrOrStderr(), "%s", line)
-	return runExecClaude(h, dir, args)
+	if err := ctx.Err(); err != nil {
+		closeRunLease(h)
+		return err
+	}
+	if err := selection.Commit(ctx); err != nil {
+		closeRunLease(h)
+		return fmt.Errorf("commit selection: %w", err)
+	}
+	step(cmd.ErrOrStderr(), "%s", selection.line)
+	return runExecClaude(h, selection.dir, args)
+}
+
+func closeRunLease(h *lease.Handle) {
+	if h != nil {
+		_ = h.Close()
+	}
 }
 
 func ccpAccountFromEnv() (*int, error) {

@@ -14,8 +14,8 @@ private struct ControlRequest: Decodable {
     let proto: Int
     let op: String
     let domain: String?
-    /// probe-domain only: true = shallow (lookup + URL + readdir, no byte
-    /// read). Absent/false keeps the deep byte-read path.
+    /// probe-domain only: true = shallow (lookup + URL + lstat, no byte read).
+    /// Absent/false keeps the deep byte-read path.
     let shallow: Bool?
     /// prepare-domain only: materialization wait bound; 0/absent = default.
     let deadlineMS: Int64?
@@ -65,8 +65,8 @@ private enum ErrClass: String {
     case registerFailed = "register-failed"
     case noDomain = "no-domain"
     case busy = "busy"
-    /// probe-domain: a registered domain whose URL, enumeration, or read fails
-    /// or times out — it is not actually serving.
+    /// A registered domain with a proven missing/dataless replica or a direct
+    /// through-domain filesystem failure. Control-plane failures never use it.
     case domainNotServing = "domain-not-serving"
 }
 
@@ -86,6 +86,18 @@ final class FileProviderController {
     private static var socketPath: String { StatusFile.realHome + "/.cc-pool/domains.sock" }
     private static let appVersion =
         (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "dev"
+    private static let appBuild =
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? "dev"
+    private static let rehydratedBuildKey = "cc-pool.fp.rehydrated-build"
+    private static var versionedBuild: String { "\(appVersion)+\(appBuild)" }
+    private static var rehydrateDefaults: UserDefaults {
+        guard
+            let group = Bundle.main.object(forInfoDictionaryKey: "CCPoolAppGroupIdentifier") as? String,
+            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) != nil,
+            let defaults = UserDefaults(suiteName: group)
+        else { return .standard }
+        return defaults
+    }
 
     /// Reply bounds stay ~20% under the Go client's per-op deadlines (fusekit
     /// fileproviderd/appclient.go: health 2s, probe 25s, path/signal 3s,
@@ -120,7 +132,12 @@ final class FileProviderController {
     /// probe claims a key disjoint from every real account domain.
     private let probeDomainID = "ccp-probe-\(getpid())"
     private var listenFD: Int32 = -1
-    private lazy var baseWatcher = ClaudeBaseWatcher { [weak self] in self?.signalAllDomains() }
+    private lazy var baseWatcher = ClaudeBaseWatcher { [weak self] reason in
+        self?.signalAllDomains(reason: reason)
+    }
+    private lazy var canonicalWatcher = CanonicalConfigWatcher { [weak self] reason in
+        self?.signalAllDomains(reason: reason)
+    }
     private var loggedSignalError = false
 
     /// Safe on machines without the extension: every arm fails soft (logged
@@ -128,6 +145,7 @@ final class FileProviderController {
     func start() {
         serveControlSocket()
         baseWatcher.start()
+        canonicalWatcher.start()
         rehydrate()
     }
 
@@ -410,118 +428,273 @@ final class FileProviderController {
     }
 
     /// Probes a registered account domain (the daemon's readiness gate):
-    /// deep reads `.claude.json` in full and reports json_bytes (never st_size
-    /// — FPFS lies for materialized items); shallow stops after the readdir
-    /// (no byte read, no materialization) and reports presence via `listed`.
-    /// Any URL/enumerate/read failure or timeout is domain-not-serving.
+    /// deep enumerates and reads `.claude.json` in full, while shallow uses
+    /// cached filesystem metadata only so it cannot wake the extension with a
+    /// through-domain readdir. Manager/URL failures remain control-plane
+    /// register-failed errors; direct filesystem failures are domain-not-serving.
     private func probeDomain(_ domain: String, shallow: Bool) -> ControlResponse {
+        let started = ProcessInfo.processInfo.systemUptime
+        let mode = shallow ? "shallow" : "deep"
+        var result = "error"
+        var stage = "lookup"
+        var resultClass = "none"
+        func failure(_ message: String, _ cls: ErrClass, stage failedStage: String) -> ControlResponse {
+            stage = failedStage
+            resultClass = cls.rawValue
+            return .failure(message, cls)
+        }
+        defer {
+            NSLog("CCPoolStatus: fp_probe domain=%@ mode=%@ stage=%@ result=%@ class=%@ duration_ms=%.0f",
+                  domain, mode, stage, result, resultClass,
+                  (ProcessInfo.processInfo.systemUptime - started) * 1_000)
+        }
         let mgr: NSFileProviderManager
-        switch manager(for: domain, bound: Bound.lookup, lookupFailClass: .domainNotServing) {
-        case .reply(let resp): return resp // unregistered → no-domain; lookup failure → domain-not-serving
+        switch manager(for: domain, bound: Bound.lookup) {
+        case .reply(let resp):
+            resultClass = resp.errClass ?? "unclassified"
+            return resp
         case .manager(let m): mgr = m
         }
+        stage = "url"
         let url: URL
         switch waitURL(Bound.probeURL, { mgr.getUserVisibleURL(for: .rootContainer, completionHandler: $0) }) {
         case .failure(let f):
-            return .failure("probe-domain URL for \(domain): \(f.message)", .domainNotServing)
+            return failure("probe-domain URL for \(domain): \(f.message)", .registerFailed, stage: "url")
         case .success(let u):
             url = u
         }
+        if shallow {
+            var resp = ControlResponse(ok: true)
+            stage = "lstat"
+            switch Self.pathPresence(url.appendingPathComponent(".claude.json").path) {
+            case .present: resp.listed = true
+            case .missing: resp.listed = false
+            case .failed(let code):
+                return failure(
+                    "probe-domain lstat \(domain): \(String(cString: strerror(code)))",
+                    .domainNotServing, stage: "lstat")
+            }
+            result = "ok"
+            return resp
+        }
+        stage = "enumerate"
         let entries: [String]
         switch waitBlocking(Bound.probeEnum, { try FileManager.default.contentsOfDirectory(atPath: url.path) }) {
         case .failure(let f):
-            return .failure("probe-domain enumerate \(domain): \(f.message)", .domainNotServing)
+            return failure(
+                "probe-domain enumerate \(domain): \(f.message)",
+                .domainNotServing, stage: "enumerate")
         case .success(let e):
             entries = e
         }
-        if shallow {
-            var resp = ControlResponse(ok: true)
-            resp.listed = entries.contains(".claude.json")
-            return resp
-        }
         guard entries.contains(".claude.json") else {
+            result = "ok-missing"
             return ControlResponse(ok: true) // serves, but no .claude.json → json_bytes absent
         }
         let file = url.appendingPathComponent(".claude.json").path
         switch waitBlocking(Bound.probeRead, { try Self.byteCount(ofFileAt: file) }) {
         case .failure(let f):
-            return .failure("probe-domain read \(domain): \(f.message)", .domainNotServing)
+            return failure("probe-domain read \(domain): \(f.message)", .domainNotServing, stage: "read")
         case .success(let n):
+            stage = "read"
             var resp = ControlResponse(ok: true)
             resp.jsonBytes = Int64(n)
+            result = "ok"
             return resp
         }
     }
 
-    /// Forces materialization of the computed settings.json replica via
-    /// requestDownloadForItem — NEVER a raw read: this host app is marked
-    /// non-materializing, so its reads of dataless items EDEADLK by design.
-    /// ok only on materialization WITHIN the caller's deadline; every failure,
-    /// timeout, or expiry is domain-not-serving. One monotonic countdown
-    /// clamps every phase wait, so the reply never outlives the budget.
+    /// Ensures settings.json is materialized without reading it. A local
+    /// materialized replica wins immediately; otherwise File Provider's URL
+    /// mapping supplies the current item identifier for requestDownload. A
+    /// transient no-such-item is re-signaled and resolved again inside one
+    /// monotonic deadline.
     private func prepareDomain(_ domain: String, deadlineMS: Int64,
-                               peerClosed: () -> Bool) -> ControlResponse {
+                                peerClosed: () -> Bool) -> ControlResponse {
+        let started = ProcessInfo.processInfo.systemUptime
+        var result = "error"
+        var stage = "lookup"
+        var resultClass = "none"
+        func success(_ successStage: String) -> ControlResponse {
+            stage = successStage
+            result = "ok"
+            resultClass = "none"
+            return ControlResponse(ok: true)
+        }
+        func failure(_ message: String, _ cls: ErrClass, stage failedStage: String) -> ControlResponse {
+            stage = failedStage
+            resultClass = cls.rawValue
+            return .failure(message, cls)
+        }
+        defer {
+            NSLog("CCPoolStatus: fp_prepare domain=%@ stage=%@ result=%@ class=%@ duration_ms=%.0f",
+                  domain, stage, result, resultClass,
+                  (ProcessInfo.processInfo.systemUptime - started) * 1_000)
+        }
         let budget = deadlineMS > 0 ? TimeInterval(deadlineMS) / 1000 : Self.prepareDefaultDeadline
         let countdown = Countdown(budget)
-        func expired(_ stage: String) -> ControlResponse {
-            .failure("prepare-domain \(domain): deadline exhausted before \(stage)", .domainNotServing)
+        func expired(_ expiredStage: String, _ cls: ErrClass) -> ControlResponse {
+            failure(
+                "prepare-domain \(domain): deadline exhausted before \(expiredStage)",
+                cls, stage: expiredStage)
         }
-        guard !countdown.expired else { return expired("lookup") }
+        func localReplica(_ localStage: String, path: String) -> ControlResponse? {
+            switch Self.materializationState(path) {
+            case .materialized:
+                return success(localStage)
+            case .dataless, .missing:
+                return nil
+            case .failed(let code):
+                return failure(
+                    "prepare-domain lstat settings.json for \(domain): \(String(cString: strerror(code)))",
+                    .registerFailed, stage: localStage + "-lstat")
+            }
+        }
+        guard !countdown.expired else { return expired("lookup", .registerFailed) }
         let mgr: NSFileProviderManager
-        switch manager(for: domain, bound: countdown.bound(Bound.lookup),
-                       lookupFailClass: .domainNotServing) {
-        case .reply(let resp): return resp // unregistered → no-domain; lookup failure → domain-not-serving
+        switch manager(for: domain, bound: countdown.bound(Bound.lookup)) {
+        case .reply(let resp):
+            resultClass = resp.errClass ?? "unclassified"
+            return resp
         case .manager(let m): mgr = m
         }
-        guard !countdown.expired else { return expired("URL") }
+        guard !countdown.expired else { return expired("url", .registerFailed) }
+        stage = "url"
         let url: URL
         switch waitURL(countdown.bound(Bound.probeURL),
                        { mgr.getUserVisibleURL(for: .rootContainer, completionHandler: $0) }) {
         case .failure(let f):
-            return .failure("prepare-domain URL for \(domain): \(f.message)", .domainNotServing)
+            return failure(
+                "prepare-domain URL for \(domain): \(f.message)",
+                .registerFailed, stage: "url")
         case .success(let u):
             url = u
         }
-        guard !countdown.expired else { return expired("enumerate") }
+        let fileURL = url.appendingPathComponent("settings.json")
+        let file = fileURL.path
+        if let reply = localReplica("local", path: file) { return reply }
+        guard !countdown.expired else { return expired("enumerate", .domainNotServing) }
+        stage = "enumerate"
         switch waitBlocking(countdown.bound(Bound.probeEnum),
                             { try FileManager.default.contentsOfDirectory(atPath: url.path) }) {
         case .failure(let f):
-            return .failure("prepare-domain enumerate \(domain): \(f.message)", .domainNotServing)
+            return failure(
+                "prepare-domain enumerate \(domain): \(f.message)",
+                .registerFailed, stage: "enumerate")
         case .success(let entries):
             guard entries.contains("settings.json") else {
-                return .failure("prepare-domain \(domain): settings.json is not enumerated", .domainNotServing)
+                return failure(
+                    "prepare-domain \(domain): settings.json is not enumerated",
+                    .domainNotServing, stage: "enumerate-missing")
             }
         }
-        let item = NSFileProviderItemIdentifier("computed:settings.json")
-        guard !countdown.expired else { return expired("download") }
-        if let f = waitVoid(countdown.remaining, { mgr.requestDownloadForItem(withIdentifier: item, completionHandler: $0) }) {
-            return .failure("prepare-domain download settings.json for \(domain): \(f.message)", .domainNotServing)
+        var retryPolicy = MissingItemRetryPolicy()
+        func recoverMissingItem() -> ControlResponse? {
+            if peerClosed() {
+                return failure(
+                    "prepare-domain \(domain): caller disconnected",
+                    .registerFailed, stage: "retry-peer")
+            }
+            guard !countdown.expired else { return nil }
+            let retry = retryPolicy.next()
+            if retry.shouldSignal {
+                stage = "retry-signal"
+                if let f = waitVoid(countdown.bound(Bound.quick), {
+                    mgr.signalEnumerator(for: .workingSet, completionHandler: $0)
+                }) {
+                    return failure(
+                        "prepare-domain signal settings.json for \(domain): \(f.message)",
+                        .registerFailed, stage: "retry-signal")
+                }
+            }
+            let remainingUS = useconds_t(countdown.remaining * 1_000_000)
+            let sleepUS = min(retry.delay, remainingUS)
+            if sleepUS > 0 { usleep(sleepUS) }
+            return nil
         }
-        // requestDownloadForItem can ack before bytes land; poll the replica's
-        // dataless flag (stat never materializes) until the deadline. Expiry
-        // precedes the materialization test (late bytes never read as ok);
-        // a hung-up caller releases the claim instead of polling on.
-        let file = url.appendingPathComponent("settings.json").path
         while !countdown.expired {
             if peerClosed() {
-                return .failure("prepare-domain \(domain): caller disconnected", .domainNotServing)
+                return failure(
+                    "prepare-domain \(domain): caller disconnected",
+                    .registerFailed, stage: "peer")
             }
-            if Self.isMaterialized(file) { return ControlResponse(ok: true) }
-            usleep(200_000)
+            if let reply = localReplica("local", path: file) { return reply }
+            stage = "identify"
+            let located: LocatedItem
+            switch waitIdentifier(countdown.bound(Bound.quick), fileURL) {
+            case .failure(let f):
+                if let reply = localReplica("identify-recheck", path: file) { return reply }
+                guard Self.isNoSuchItem(f) else {
+                    return failure(
+                        "prepare-domain identify settings.json for \(domain): \(f.message)",
+                        .registerFailed, stage: "identify")
+                }
+                if let response = recoverMissingItem() { return response }
+                continue
+            case .success(let value):
+                located = value
+            }
+            guard located.domain.rawValue == domain else {
+                return failure(
+                    "prepare-domain settings.json mapped to \(located.domain.rawValue), want \(domain)",
+                    .registerFailed, stage: "identify-domain")
+            }
+            guard !countdown.expired else { return expired("download", .domainNotServing) }
+            stage = "download"
+            if let f = waitVoid(countdown.remaining, {
+                mgr.requestDownloadForItem(withIdentifier: located.item, completionHandler: $0)
+            }) {
+                if let reply = localReplica("download-recheck", path: file) { return reply }
+                guard Self.isNoSuchItem(f) else {
+                    return failure(
+                        "prepare-domain download settings.json for \(domain): \(f.message)",
+                        .registerFailed, stage: "download")
+                }
+                if let response = recoverMissingItem() { return response }
+                continue
+            }
+            stage = "materialize"
+            while !countdown.expired {
+                if peerClosed() {
+                    return failure(
+                        "prepare-domain \(domain): caller disconnected",
+                        .registerFailed, stage: "materialize-peer")
+                }
+                if let reply = localReplica("materialized", path: file) { return reply }
+                usleep(200_000)
+            }
+            break
         }
-        return .failure(
+        return failure(
             "prepare-domain \(domain): settings.json did not materialize within \(Int(budget))s",
-            .domainNotServing)
+            .domainNotServing, stage: "materialize-deadline")
     }
 
     private static let prepareDefaultDeadline: TimeInterval = 30
 
     /// True once the replica exists with SF_DATALESS clear — stat(2) is safe:
     /// it never triggers materialization.
-    private static func isMaterialized(_ path: String) -> Bool {
+    private static func materializationState(_ path: String) -> ReplicaMaterialization {
         var st = stat()
-        guard Darwin.lstat(path, &st) == 0 else { return false }
-        return st.st_flags & UInt32(SF_DATALESS) == 0
+        let result = Darwin.lstat(path, &st)
+        let code = errno
+        return FileProviderControlPolicy.materialization(
+            result: result, errno: code, flags: st.st_flags, datalessFlag: UInt32(SF_DATALESS))
+    }
+
+    private static func pathPresence(_ path: String) -> LstatPresence {
+        var st = stat()
+        let result = Darwin.lstat(path, &st)
+        return FileProviderControlPolicy.presence(result: result, errno: errno)
+    }
+
+    private static func isNoSuchItem(_ f: OpFailure) -> Bool {
+        guard case .error(let e) = f else { return false }
+        return FileProviderControlPolicy.itemFailureDisposition(
+            domain: e.domain, code: e.code,
+            fileProviderDomain: NSFileProviderErrorDomain,
+            fileProviderNoSuchItem: NSFileProviderError.Code.noSuchItem.rawValue,
+            cocoaNoSuchFile: CocoaError.fileNoSuchFile.rawValue) == .domainMissing
     }
 
     // MARK: - Error mapping
@@ -557,27 +730,53 @@ final class FileProviderController {
         case reply(ControlResponse)
     }
 
-    /// Resolves a registered domain to its manager. An unregistered id is always
-    /// no-domain (transient — the daemon re-registers); a getDomains error/timeout or
-    /// a nil manager surfaces as `lookupFailClass`. probe-domain passes
-    /// .domainNotServing (a lookup it can't complete = not serving = a real retryable
-    /// wedge on the Go side); other ops keep the default .registerFailed.
-    private func manager(for domain: String, bound: TimeInterval, lookupFailClass: ErrClass = .registerFailed) -> Lookup {
+    /// Resolves a registered domain to its manager. An unregistered id is
+    /// no-domain; manager-list failures, timeouts, and nil managers are fleet
+    /// control-plane failures, never per-domain readiness verdicts.
+    private func manager(for domain: String, bound: TimeInterval) -> Lookup {
         switch registeredDomains(bound) {
         case .failure(let f):
-            return .reply(.failure("list domains: \(f.message)", lookupFailClass))
+            return .reply(.failure("list domains: \(f.message)", .registerFailed))
         case .success(let ds):
             guard let d = ds.first(where: { $0.identifier.rawValue == domain }) else {
                 return .reply(.failure("domain \(domain) is not registered", .noDomain))
             }
             guard let mgr = NSFileProviderManager(for: d) else {
-                return .reply(.failure("no manager for domain \(domain)", lookupFailClass))
+                return .reply(.failure("no manager for domain \(domain)", .registerFailed))
             }
             return .manager(mgr)
         }
     }
 
     // MARK: - Completion-handler bridging
+
+    private struct LocatedItem {
+        let item: NSFileProviderItemIdentifier
+        let domain: NSFileProviderDomainIdentifier
+    }
+
+    private func waitIdentifier(
+        _ bound: TimeInterval, _ url: URL
+    ) -> Result<LocatedItem, OpFailure> {
+        let sem = DispatchSemaphore(value: 0)
+        var item: NSFileProviderItemIdentifier?
+        var domain: NSFileProviderDomainIdentifier?
+        var failure: NSError?
+        NSFileProviderManager.getIdentifierForUserVisibleFile(at: url) { i, d, err in
+            item = i
+            domain = d
+            failure = err as NSError?
+            sem.signal()
+        }
+        guard sem.wait(timeout: .now() + bound) == .success else { return .failure(.timeout) }
+        if let failure { return .failure(.error(failure)) }
+        guard let item, let domain else {
+            return .failure(.error(NSError(
+                domain: NSCocoaErrorDomain, code: CocoaError.fileNoSuchFile.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: "no item identifier returned"])))
+        }
+        return .success(LocatedItem(item: item, domain: domain))
+    }
 
     /// Bridges a completion-handler call to a bounded synchronous wait. A
     /// callback firing after the timeout only writes captured locals nothing
@@ -644,44 +843,74 @@ final class FileProviderController {
 
     // MARK: - Base watcher + rehydrate
 
-    /// ~/.claude changed (edits by plain `claude`): nudge every registered
-    /// domain's working set so replicas re-enumerate. Daemon-originated
-    /// changes arrive as targeted control signals instead.
-    private func signalAllDomains() {
+    /// A relevant base edit nudges every registered domain's working set.
+    /// Daemon-originated changes arrive as targeted control signals instead.
+    private func signalAllDomains(reason: String) {
+        let started = ProcessInfo.processInfo.systemUptime
         NSFileProviderManager.getDomainsWithCompletionHandler { [weak self] domains, error in
             if let error {
                 // Expected forever on widget-only installs: log once.
                 guard let self, !self.loggedSignalError else { return }
                 self.loggedSignalError = true
-                NSLog("CCPoolStatus: list domains for base signal failed: %@", String(describing: error))
+                NSLog("CCPoolStatus: fp_signal reason=%@ domain=* stage=list result=error class=%@ duration_ms=%.0f error=%@",
+                      reason, ErrClass.registerFailed.rawValue,
+                      (ProcessInfo.processInfo.systemUptime - started) * 1_000,
+                      String(describing: error))
                 return
             }
-            for d in domains {
-                NSFileProviderManager(for: d)?.signalEnumerator(for: .workingSet) { err in
-                    if let err {
-                        NSLog("CCPoolStatus: signal %@ failed: %@",
-                              d.identifier.rawValue, String(describing: err))
-                    }
+            self?.signalDomains(domains, reason: reason)
+        }
+    }
+
+    private func signalDomains(_ domains: [NSFileProviderDomain], reason: String) {
+        for d in domains {
+            let started = ProcessInfo.processInfo.systemUptime
+            guard let mgr = NSFileProviderManager(for: d) else {
+                NSLog("CCPoolStatus: fp_signal reason=%@ domain=%@ stage=manager result=error class=%@ duration_ms=0",
+                      reason, d.identifier.rawValue, ErrClass.registerFailed.rawValue)
+                continue
+            }
+            mgr.signalEnumerator(for: .workingSet) { err in
+                let result = err == nil ? "ok" : "error"
+                let cls = err == nil ? "none" : ErrClass.registerFailed.rawValue
+                NSLog("CCPoolStatus: fp_signal reason=%@ domain=%@ stage=signal result=%@ class=%@ duration_ms=%.0f",
+                      reason, d.identifier.rawValue, result, cls,
+                      (ProcessInfo.processInfo.systemUptime - started) * 1_000)
+                if let err {
+                    NSLog("CCPoolStatus: signal %@ failed: %@",
+                          d.identifier.rawValue, String(describing: err))
                 }
             }
         }
     }
 
-    /// NSFileProviderManager is the source of truth for registered domains —
-    /// no local DB. On launch, log what survives and freshen each working set
-    /// (the app may have been dead across base edits).
+    /// An app upgrade gets one fleet signal so fileproviderd retries jobs against
+    /// the new extension. Ordinary app launches never signal the fleet.
     private func rehydrate() {
+        let current = Self.versionedBuild
+        let defaults = Self.rehydrateDefaults
+        let previous = defaults.string(forKey: Self.rehydratedBuildKey)
+        guard FileProviderRehydratePolicy.shouldSignal(lastBuild: previous, currentBuild: current)
+        else {
+            NSLog("CCPoolStatus: fp_rehydrate reason=app-upgrade stage=version result=skip class=none build=%@",
+                  current)
+            return
+        }
+        let started = ProcessInfo.processInfo.systemUptime
         NSFileProviderManager.getDomainsWithCompletionHandler { domains, error in
             if let error {
-                NSLog("CCPoolStatus: file provider rehydrate skipped: %@", String(describing: error))
+                NSLog("CCPoolStatus: fp_rehydrate reason=app-upgrade stage=list result=error class=%@ duration_ms=%.0f error=%@",
+                      ErrClass.registerFailed.rawValue,
+                      (ProcessInfo.processInfo.systemUptime - started) * 1_000,
+                      String(describing: error))
                 return
             }
-            guard !domains.isEmpty else { return }
+            defaults.set(current, forKey: Self.rehydratedBuildKey)
             let ids = domains.map { $0.identifier.rawValue }.sorted().joined(separator: ", ")
-            NSLog("CCPoolStatus: file provider domains: %@", ids)
-            for d in domains {
-                NSFileProviderManager(for: d)?.signalEnumerator(for: .workingSet) { _ in }
-            }
+            NSLog("CCPoolStatus: fp_rehydrate reason=app-upgrade stage=list result=signal class=none duration_ms=%.0f previous=%@ build=%@ domains=%@",
+                  (ProcessInfo.processInfo.systemUptime - started) * 1_000,
+                  previous ?? "none", current, ids)
+            self.signalDomains(domains, reason: "app-upgrade")
         }
     }
 
@@ -766,36 +995,44 @@ final class FileProviderController {
     }
 }
 
-/// Watches ~/.claude with FSEvents (file-level, nested — base edits happen at
-/// arbitrary depth) and fires after a trailing debounce. StatusWatcher's
-/// single-dir vnode watch can't see nested changes, hence a separate mechanism
-/// with the same lifecycle shape.
+/// Watches the shared configuration roots and fires only for changes that can
+/// alter a root enumeration or a synthesized file. Nested session/debug/plugin
+/// churn is ignored before the trailing debounce.
 private final class ClaudeBaseWatcher {
     private let queue = DispatchQueue(label: "cc-pool.fp.base-watch")
     private var stream: FSEventStreamRef?
     private var pending: DispatchWorkItem?
-    private let onChange: () -> Void
+    private var pendingReasons: Set<String> = []
+    private let claudeRoot = StatusFile.realHome + "/.claude"
+    private let onChange: (String) -> Void
 
-    init(onChange: @escaping () -> Void) {
+    init(onChange: @escaping (String) -> Void) {
         self.onChange = onChange
     }
 
     func start() {
         guard stream == nil else { return }
-        let path = StatusFile.realHome + "/.claude"
         var context = FSEventStreamContext(
             version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
             retain: nil, release: nil, copyDescription: nil)
-        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+        let callback: FSEventStreamCallback = { _, info, count, paths, flags, _ in
             guard let info else { return }
-            Unmanaged<ClaudeBaseWatcher>.fromOpaque(info).takeUnretainedValue().changed()
+            let watcher = Unmanaged<ClaudeBaseWatcher>.fromOpaque(info).takeUnretainedValue()
+            let eventPaths = paths.assumingMemoryBound(to: UnsafePointer<CChar>?.self)
+            for index in 0..<Int(count) {
+                guard let eventPath = eventPaths[index] else { continue }
+                watcher.changed(path: String(cString: eventPath), flags: flags[index])
+            }
         }
         guard let s = FSEventStreamCreate(
-            nil, callback, &context, [path] as CFArray,
+            nil, callback, &context, [claudeRoot] as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 1.0,
-            FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer))
+            FSEventStreamCreateFlags(
+                kFSEventStreamCreateFlagFileEvents
+                    | kFSEventStreamCreateFlagNoDefer
+                    | kFSEventStreamCreateFlagWatchRoot))
         else {
-            NSLog("CCPoolStatus: FSEvents stream create failed for %@", path)
+            NSLog("CCPoolStatus: FSEvents stream create failed for %@", claudeRoot)
             return
         }
         FSEventStreamSetDispatchQueue(s, queue)
@@ -807,10 +1044,86 @@ private final class ClaudeBaseWatcher {
     /// change after 2s of quiet — unlike a leading-edge limiter it never
     /// drops the final event of a burst. Runs on `queue` (the stream's
     /// dispatch queue), which serializes `pending`.
-    private func changed() {
+    private func changed(path: String, flags: FSEventStreamEventFlags) {
+        guard let reason = ClaudeBaseEventPolicy.reason(
+            claudeRoot: claudeRoot, path: path, flags: flags)
+        else { return }
+        pendingReasons.insert(reason)
         pending?.cancel()
-        let item = DispatchWorkItem { [onChange] in onChange() }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let reason = self.pendingReasons.sorted().joined(separator: ",")
+            self.pendingReasons.removeAll()
+            self.onChange(reason)
+        }
         pending = item
         queue.asyncAfter(deadline: .now() + 2, execute: item)
+    }
+
+}
+
+/// Polls one canonical file's metadata. This avoids a recursive FSEvents stream
+/// rooted at the home directory while still detecting in-place writes and
+/// atomic replacements of ~/.claude.json.
+private final class CanonicalConfigWatcher {
+    private enum Snapshot {
+        case value(CanonicalConfigFingerprint?)
+        case failed(Int32)
+    }
+
+    private let queue = DispatchQueue(label: "cc-pool.fp.canonical-watch")
+    private let path = StatusFile.realHome + "/.claude.json"
+    private let onChange: (String) -> Void
+    private var timer: DispatchSourceTimer?
+    private var previous: CanonicalConfigFingerprint?
+    private var loggedErrno: Int32?
+
+    init(onChange: @escaping (String) -> Void) {
+        self.onChange = onChange
+    }
+
+    func start() {
+        guard timer == nil else { return }
+        switch snapshot() {
+        case .value(let value): previous = value
+        case .failed(let code): logFailure(code)
+        }
+        let source = DispatchSource.makeTimerSource(queue: queue)
+        source.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(250))
+        source.setEventHandler { [weak self] in self?.poll() }
+        timer = source
+        source.resume()
+    }
+
+    private func poll() {
+        switch snapshot() {
+        case .failed(let code):
+            logFailure(code)
+        case .value(let current):
+            loggedErrno = nil
+            guard CanonicalConfigPolicy.changed(from: previous, to: current) else { return }
+            previous = current
+            onChange("canonical-config")
+        }
+    }
+
+    private func snapshot() -> Snapshot {
+        var st = stat()
+        guard Darwin.lstat(path, &st) == 0 else {
+            return errno == ENOENT ? .value(nil) : .failed(errno)
+        }
+        return .value(CanonicalConfigFingerprint(
+            device: UInt64(st.st_dev), inode: UInt64(st.st_ino), size: Int64(st.st_size),
+            modifiedSeconds: st.st_mtimespec.tv_sec,
+            modifiedNanoseconds: st.st_mtimespec.tv_nsec,
+            changedSeconds: st.st_ctimespec.tv_sec,
+            changedNanoseconds: st.st_ctimespec.tv_nsec))
+    }
+
+    private func logFailure(_ code: Int32) {
+        guard loggedErrno != code else { return }
+        loggedErrno = code
+        NSLog("CCPoolStatus: fp_watch reason=canonical-config stage=lstat result=error class=%@ errno=%d",
+              ErrClass.registerFailed.rawValue, code)
     }
 }

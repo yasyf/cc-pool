@@ -606,6 +606,32 @@ func TestSelectHonorsSticky(t *testing.T) {
 		}
 	})
 
+	t.Run("deferred selection has no effects until commit", func(t *testing.T) {
+		m := setup(t)
+		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj", PID: 4242, DeferCommit: true, ExcludeIDs: []int{2}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sr.Best.ID != 1 {
+			t.Fatalf("excluded selection picked acct %d, want 1", sr.Best.ID)
+		}
+		if live, _ := m.Store.ListActiveSessions(); len(live) != 0 {
+			t.Fatalf("provisional selection opened sessions: %+v", live)
+		}
+		if _, ok, _ := m.Store.GetSticky("/proj"); ok {
+			t.Fatal("provisional selection recorded sticky state")
+		}
+		if err := m.CommitSelection(sr, "/proj", 4242); err != nil {
+			t.Fatal(err)
+		}
+		if live, _ := m.Store.ListActiveSessions(); len(live) != 1 || live[0].AccountID != 1 {
+			t.Fatalf("committed sessions = %+v, want acct-1", live)
+		}
+		if sticky, ok, _ := m.Store.GetSticky("/proj"); !ok || sticky.AccountID != 1 {
+			t.Fatalf("committed sticky = %+v ok=%v, want acct-1", sticky, ok)
+		}
+	})
+
 	t.Run("no cwd records nothing", func(t *testing.T) {
 		m := setup(t)
 		if _, err := m.Select(ctx, SelectOptions{}); err != nil {

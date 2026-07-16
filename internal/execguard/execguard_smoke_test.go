@@ -3,9 +3,12 @@
 package execguard
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestSetiopolicySmoke proves the raw iopolicysys syscall (322) is reachable and
@@ -38,5 +41,14 @@ func TestPrimeForExecReadsFile(t *testing.T) {
 func TestPrimeForExecMissingFileAborts(t *testing.T) {
 	if err := PrimeForExec(filepath.Join(t.TempDir(), "absent.json")); err == nil {
 		t.Fatal("PrimeForExec on a missing file must return an error")
+	}
+}
+
+func TestPrimeForExecContextRequiresRemainingBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := PrimeForExecContext(ctx, filepath.Join(t.TempDir(), "absent.json"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("PrimeForExecContext err = %v, want deadline before materialization", err)
 	}
 }

@@ -1,11 +1,17 @@
 package daemon
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
 )
+
+var errAccountConverting = errors.New("account is converting overlays")
 
 // claims is the daemon's account-claim discipline in one type: the short-lived
 // select reservation plus the poll, convert, and pool-wide claims that keep a
@@ -28,15 +34,22 @@ import (
 // preserves the exact convention the state used as Server fields under s.mu.
 type claims struct {
 	mu           sync.Mutex
-	reservations map[int]time.Time // accountID -> select reserved-at
-	converting   map[int]bool      // accountID -> overlay conversion in flight
-	polling      map[int]bool      // accountID -> scheduler/reconcile owns the dir this iteration
+	reservations map[string]reservation
+	pending      map[string]reservation
+	converting   map[int]bool // accountID -> overlay conversion in flight
+	polling      map[int]bool // accountID -> scheduler/reconcile owns the dir this iteration
+}
+
+type reservation struct {
+	accountID int
+	createdAt time.Time
 }
 
 // newClaims builds an empty claims store.
 func newClaims() *claims {
 	return &claims{
-		reservations: map[int]time.Time{},
+		reservations: map[string]reservation{},
+		pending:      map[string]reservation{},
 		converting:   map[int]bool{},
 		polling:      map[int]bool{},
 	}
@@ -46,28 +59,93 @@ func newClaims() *claims {
 // overlay conversion holds it (it is about to remake the dir a launching claude
 // would land in).
 func (c *claims) reserve(id int) bool {
+	token, err := c.beginReservation(id)
+	if err != nil {
+		return false
+	}
+	_, ok := c.commitReservation(token)
+	return ok
+}
+
+func (c *claims) beginReservation(id int) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.converting[id] {
-		return false
+		return "", errAccountConverting
 	}
-	c.reservations[id] = time.Now()
-	return true
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate reservation token: %w", err)
+	}
+	token := hex.EncodeToString(raw[:])
+	c.pending[token] = reservation{accountID: id, createdAt: time.Now()}
+	return token, nil
+}
+
+func (c *claims) commitReservation(token string) (int, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	r, ok := c.liveReservation(token, now)
+	if !ok {
+		return 0, false
+	}
+	delete(c.pending, token)
+	r.createdAt = now
+	c.reservations[token] = r
+	return r.accountID, true
+}
+
+func (c *claims) releaseCommittedReservation(token string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.reservations[token]
+	delete(c.reservations, token)
+	return ok
+}
+
+func (c *claims) abortReservation(token string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.liveReservation(token, time.Now())
+	delete(c.pending, token)
+	return ok
+}
+
+func (c *claims) liveReservation(token string, now time.Time) (reservation, bool) {
+	r, ok := c.pending[token]
+	if !ok || now.Sub(r.createdAt) > provisionalSelectionTTL {
+		delete(c.pending, token)
+		return reservation{}, false
+	}
+	return r, true
 }
 
 // reservedCount returns the number of live reservations for an account.
 func (c *claims) reservedCount(id int) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	t, ok := c.reservations[id]
-	if !ok {
-		return 0
+	now := time.Now()
+	count := 0
+	for token, r := range c.pending {
+		if now.Sub(r.createdAt) > provisionalSelectionTTL {
+			delete(c.pending, token)
+			continue
+		}
+		if r.accountID == id {
+			count++
+		}
 	}
-	if time.Since(t) > reservationTTL {
-		delete(c.reservations, id)
-		return 0
+	for token, r := range c.reservations {
+		if now.Sub(r.createdAt) > reservationTTL {
+			delete(c.reservations, token)
+			continue
+		}
+		if r.accountID == id {
+			count++
+		}
 	}
-	return 1
+	return count
 }
 
 // hold claims an account for one scheduler/reconcile iteration — the
@@ -104,7 +182,7 @@ func (c *claims) disownHold(id int) {
 func (c *claims) own(id int) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if t, ok := c.reservations[id]; ok && time.Since(t) <= reservationTTL {
+	if c.reservedLocked(id, time.Now()) {
 		return false
 	}
 	if c.converting[id] || c.polling[id] {
@@ -126,7 +204,7 @@ func (c *claims) own(id int) bool {
 func (c *claims) ownHeld(id int) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if t, ok := c.reservations[id]; ok && time.Since(t) <= reservationTTL {
+	if c.reservedLocked(id, time.Now()) {
 		return false
 	}
 	if c.converting[id] {
@@ -137,6 +215,28 @@ func (c *claims) ownHeld(id int) bool {
 	}
 	c.converting[id] = true
 	return true
+}
+
+func (c *claims) reservedLocked(id int, now time.Time) bool {
+	for token, r := range c.pending {
+		if now.Sub(r.createdAt) > provisionalSelectionTTL {
+			delete(c.pending, token)
+			continue
+		}
+		if r.accountID == id {
+			return true
+		}
+	}
+	for token, r := range c.reservations {
+		if now.Sub(r.createdAt) <= reservationTTL {
+			if r.accountID == id {
+				return true
+			}
+			continue
+		}
+		delete(c.reservations, token)
+	}
+	return false
 }
 
 // disownConvert releases a conversion claim (own or ownHeld).

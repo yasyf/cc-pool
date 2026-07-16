@@ -22,13 +22,8 @@ const fpControlProbeTimeout = 3 * time.Second
 
 // fpDomainPolicy is the File Provider DEEP wedge lane: a 2-strike deep-probe
 // debounce, then the backoff-spaced, breaker-capped recovery ladder that parks a
-// domain. It carries the shared wedge verdict; fpShallowPolicy is the separate
-// shallow-probe debounce lane whose latch force-faults it. Both are keyed by the
-// account ConfigDir.
-var (
-	fpDomainPolicy  = policies["fp.domain"]
-	fpShallowPolicy = policies["fp.shallow"]
-)
+// domain. It is keyed by the account ConfigDir.
+var fpDomainPolicy = policies["fp.domain"]
 
 // fpEnabled reports whether FP self-heal is wired (the synth seam is injected).
 // It replaces the fp-state nil guard: bare test servers leave it off, so every FP
@@ -53,8 +48,8 @@ func (s *Server) fpClassifiableStrike(dir string, err error) bool {
 // recordFPProbe folds one DEEP FP data-plane probe outcome for dir into the fp.domain
 // wedge lane, returning a one-shot log line on a wedge or recovery transition. It is
 // the authoritative recorder: a clean deep probe proves bytes serve, so it clears
-// BOTH wedge lanes and the recovery ladder; a wedged verdict strikes the deep
-// debounce. Also drives the select-time and standalone-test paths.
+// the wedge lane and recovery ladder; a wedged verdict strikes the debounce.
+// Also drives the select-time and standalone-test paths.
 func (s *Server) recordFPProbe(dir string, err error) (logMsg string) {
 	if !s.fpEnabled() {
 		return ""
@@ -69,41 +64,12 @@ func (s *Server) recordFPProbe(dir string, err error) (logMsg string) {
 			logMsg = fmt.Sprintf("file provider domain %s: recovered; the domain serves reads again", dir)
 		}
 		s.led.clear(fpDomainPolicy, dir)
-		s.led.clear(fpShallowPolicy, dir)
 		return logMsg
 	}
 	before := s.led.faulted(fpDomainPolicy, dir)
 	s.led.strike(fpDomainPolicy, dir, time.Now(), err)
 	if !before && s.led.faulted(fpDomainPolicy, dir) {
 		logMsg = fmt.Sprintf("file provider domain %s: %d consecutive probe failures; marking wedged (serves control ops but hangs reads): %v", dir, fpWedgeStrikes, err)
-	}
-	return logMsg
-}
-
-// recordFPShallow folds one SHALLOW FP probe outcome for dir into the fp.shallow
-// debounce lane. A clean shallow proves only that the domain is LISTABLE, never that
-// bytes serve, so it clears ONLY the shallow lane — never the deep lane or a latched
-// wedge (that erasure let a persistent deep-only wedge never latch). A shallow wedged
-// verdict strikes the shallow debounce; the strike that reaches it force-faults
-// fp.domain so fpWedged reports the wedge and the recovery ladder engages.
-func (s *Server) recordFPShallow(dir string, err error) (logMsg string) {
-	if !s.fpEnabled() {
-		return ""
-	}
-	if err != nil && !s.fpClassifiableStrike(dir, err) {
-		return ""
-	}
-	s.ledMu.Lock()
-	defer s.ledMu.Unlock()
-	if err == nil {
-		s.led.clear(fpShallowPolicy, dir)
-		return ""
-	}
-	before := s.led.faulted(fpShallowPolicy, dir)
-	s.led.strike(fpShallowPolicy, dir, time.Now(), err)
-	if !before && s.led.faulted(fpShallowPolicy, dir) && !s.led.faulted(fpDomainPolicy, dir) {
-		s.led.forceFault(fpDomainPolicy, dir, time.Now(), err)
-		logMsg = fmt.Sprintf("file provider domain %s: %d consecutive shallow probe failures; marking wedged (domain no longer listable): %v", dir, fpWedgeStrikes, err)
 	}
 	return logMsg
 }
@@ -195,14 +161,6 @@ func (s *Server) recordFPProbeClock(dir string, now time.Time) {
 	s.fpProbeClock[dir] = now
 }
 
-// fpShallowProbe runs the routine-liveness shallow probe for dir, bounded by the
-// control-probe timeout.
-func (s *Server) fpShallowProbe(ctx context.Context, dir string) error {
-	pctx, cancel := context.WithTimeout(ctx, fpControlProbeTimeout)
-	defer cancel()
-	return fpDomainProbeShallow(pctx, dir)
-}
-
 // fpDeepProbe runs the deep byte-count probe for dir (the serve-stale / 0-byte
 // wedge detector), bounded by the control-probe timeout.
 func (s *Server) fpDeepProbe(ctx context.Context, dir string) error {
@@ -238,18 +196,6 @@ var fpDomainProbe = func(ctx context.Context, dir string) error {
 		return err
 	}
 	return overlay.FPDomainProbe(ctx, prober, dir)
-}
-
-// fpDomainProbeShallow is the routine-liveness probe seam: the cheap shallow
-// control op (domain lookup + readdir, no byte count). A package var so heal tests
-// count shallow vs deep probes per tick. Default resolves the FP provider and
-// probes over the app socket under ctx.
-var fpDomainProbeShallow = func(ctx context.Context, dir string) error {
-	prober, err := fpProberFor()
-	if err != nil {
-		return err
-	}
-	return overlay.FPDomainProbeShallow(ctx, prober, dir)
 }
 
 // fpProberFor resolves the File Provider provider as an overlay.FPDomainProber. A
@@ -352,20 +298,20 @@ func (s *Server) healFPRows(ctx context.Context) {
 			}
 			s.escalateFP(ctx, a, probeErr, now)
 		default:
-			// Healthy: shallow every tick (own debounce lane); a slow deep check catches the
-			// serve-stale / 0-byte wedge shallow can't see (clean-tick only, own debounce lane).
-			probeErr := s.fpShallowProbe(ctx, dir)
-			if msg := s.recordFPShallow(dir, probeErr); msg != "" {
-				s.log.Printf("%s", msg)
-			}
-			if probeErr == nil && s.fpProbeClockDue(dir, now, fpDeepProbeInterval) {
+			// Healthy domains get only the slow deep check. Even the companion app's
+			// shallow enumeration wakes an appex, so running it on every healer tick
+			// creates a fleet-wide launch storm.
+			var probeErr error
+			if s.fpProbeClockDue(dir, now, fpDeepProbeInterval) {
 				s.recordFPProbeClock(dir, now)
 				probeErr = s.fpDeepProbe(ctx, dir)
 				if msg := s.recordFPProbe(dir, probeErr); msg != "" {
 					s.log.Printf("%s", msg)
 				}
 			}
-			s.escalateFP(ctx, a, probeErr, now)
+			if probeErr != nil {
+				s.escalateFP(ctx, a, probeErr, now)
+			}
 		}
 	})
 	if completed {
@@ -373,14 +319,13 @@ func (s *Server) healFPRows(ctx context.Context) {
 	}
 }
 
-// pruneFPLedger drops the fp.domain / fp.shallow ledger rows and the periodic-probe
+// pruneFPLedger drops the fp.domain ledger rows and the periodic-probe
 // clock for every dir absent from the current File Provider row set — a reused
 // (gap-filled) account path must not inherit a vanished row's parked state or clock.
 func (s *Server) pruneFPLedger(seen map[string]bool) {
 	keep := func(dir string) bool { return seen[dir] }
 	s.ledMu.Lock()
 	s.led.prune(fpDomainPolicy, keep)
-	s.led.prune(fpShallowPolicy, keep)
 	s.ledMu.Unlock()
 	s.fpProbeClockMu.Lock()
 	for dir := range s.fpProbeClock {

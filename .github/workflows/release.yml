@@ -100,9 +100,17 @@ jobs:
         with:
           xcode-version: "26"
 
-      - name: Build the Notification Center widget app (cc-pool-status cask payload)
+      - name: Test widget and File Provider logic
         run: |
           brew install xcodegen
+          cd widget
+          xcodegen generate
+          xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
+            -configuration Debug -derivedDataPath build-tests test \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-"
+
+      - name: Build the Notification Center widget app (cc-pool-status cask payload)
+        run: |
           cd widget
           xcodegen generate
           # chronod caches widget metadata (supported size families) keyed by

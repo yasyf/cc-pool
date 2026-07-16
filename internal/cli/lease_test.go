@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -56,6 +57,20 @@ func TestAcquireSessionLease(t *testing.T) {
 	}
 	if held, _, _ := lease.Probe(root, dir); held {
 		t.Fatalf("lease on %s still held after Close", dir)
+	}
+}
+
+func TestAcquireAndProbeSessionLeaseContextRequiresRemainingBudget(t *testing.T) {
+	called := 0
+	swapVar(t, &leaseRoot, func() (string, error) {
+		called++
+		return t.TempDir(), nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := acquireAndProbeSessionLeaseContext(ctx, store.Account{ID: 1, ConfigDir: t.TempDir(), OverlayKind: "symlink"})
+	if !errors.Is(err, context.DeadlineExceeded) || called != 0 {
+		t.Fatalf("err=%v leaseRoot calls=%d, want deadline before acquire", err, called)
 	}
 }
 
@@ -355,7 +370,7 @@ func TestSpawnLeaseAgentIdempotentSkip(t *testing.T) {
 
 	// The slot is covered, so spawnLeaseAgent must be a no-op (never fork a second
 	// agent, never block on a readiness handshake that would never come).
-	if err := spawnLeaseAgent(a); err != nil {
+	if _, err := spawnLeaseAgent(a); err != nil {
 		t.Fatalf("spawnLeaseAgent with a covered slot = %v, want nil (idempotent skip)", err)
 	}
 }
@@ -367,7 +382,7 @@ func TestSpawnLeaseAgentNoLeaderFailsClosed(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	swapVar(t, &procSessionLeader, func() (int, error) { return 1, nil })
 	a := store.Account{ID: 7, ConfigDir: pool.AccountDir(7), OverlayKind: "symlink"}
-	if err := spawnLeaseAgent(a); err == nil || !strings.Contains(err.Error(), "session leader") {
+	if _, err := spawnLeaseAgent(a); err == nil || !strings.Contains(err.Error(), "session leader") {
 		t.Fatalf("spawnLeaseAgent with no session leader = %v, want a fail-closed error", err)
 	}
 }
@@ -380,7 +395,7 @@ func TestSpawnLeaseAgentDeadLeaderFailsClosed(t *testing.T) {
 	swapVar(t, &procSessionLeader, func() (int, error) { return 4242, nil })
 	swapVar(t, &procStartTime, func(int) (int64, error) { return 0, ErrNoProc })
 	a := store.Account{ID: 8, ConfigDir: pool.AccountDir(8), OverlayKind: "symlink"}
-	if err := spawnLeaseAgent(a); err == nil || !strings.Contains(err.Error(), "is gone") {
+	if _, err := spawnLeaseAgent(a); err == nil || !strings.Contains(err.Error(), "is gone") {
 		t.Fatalf("spawnLeaseAgent with a dead session leader = %v, want a fail-closed error", err)
 	}
 }

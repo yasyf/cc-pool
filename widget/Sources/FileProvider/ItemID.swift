@@ -91,6 +91,23 @@ enum OverlaySkip {
     }
 }
 
+/// Account-private, non-enumerated staging for atomic settings rewrites.
+enum RootItemPolicy {
+    static let settingsStagingPrefix = "settings.json.tmp."
+
+    static func isSettingsStaging(_ name: String) -> Bool {
+        name.hasPrefix(settingsStagingPrefix)
+    }
+
+    static func classification(name: String, bridgeKind: String) -> String {
+        isSettingsStaging(name) ? "private" : bridgeKind
+    }
+
+    static func isEnumerated(_ name: String) -> Bool {
+        !isSettingsStaging(name)
+    }
+}
+
 /// lstat snapshot of a backing path; absent files read as (-1, -1) — the
 /// holder's freshness convention for a missing gate file. ENOENT is the one
 /// valid "absent" state; any other errno throws so the failure is visible and

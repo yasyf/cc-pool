@@ -42,7 +42,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         let entries = try manifest()
         var items: [FPItem] = []
         var seen = Set<String>()
-        for e in entries where !OverlaySkip.skips(e.name) && !seen.contains(e.name) {
+        for e in entries
+        where RootItemPolicy.isEnumerated(e.name)
+            && !OverlaySkip.skips(e.name) && !seen.contains(e.name) {
             seen.insert(e.name)
             switch e.kind {
             case "synth":
@@ -55,11 +57,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 break
             }
         }
-        // Base leftovers. Go owns the classifier (internal/overlay/
-        // contentsource.go Classify) — parity by RPC, never a Swift port.
-        for name in try readdirNames(paths.base) where !seen.contains(name) && !OverlaySkip.skips(name) {
+        // Go owns classification except the File Provider staging override.
+        for name in try readdirNames(paths.base)
+        where RootItemPolicy.isEnumerated(name)
+            && !seen.contains(name) && !OverlaySkip.skips(name) {
             seen.insert(name)
-            switch try mapUnreachable({ try bridge.classify(name: name) }) {
+            switch try classifyRootName(name) {
             case "symlink":
                 items.append(symlinkItem(name: name, target: paths.base + "/" + name))
             case "":
@@ -78,7 +81,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         // The account's own private files (e.g. .credentials.json).
         // .claude.json is shadowed by its computed item via `seen`.
         for name in try readdirNames(paths.privateStore)
-        where !seen.contains(name) && !OverlaySkip.skips(name) {
+        where RootItemPolicy.isEnumerated(name)
+            && !seen.contains(name) && !OverlaySkip.skips(name) {
             items.append(try privateItem(rel: name))
         }
         return items
@@ -211,7 +215,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             let path = paths.base + "/" + rel
             let st = try BackingStat.lstat(path)
             if !rel.contains("/") {
-                switch try mapUnreachable({ try bridge.classify(name: rel) }) {
+                switch try classifyRootName(rel) {
                 case "symlink":
                     return symlinkItem(name: rel, target: path)
                 case "":
@@ -314,8 +318,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         queue.async {
             defer { progress.completedUnitCount = 1 }
             do {
-                let item = try self.performCreate(itemTemplate, contents: url, options: options)
-                completionHandler(item, [], false, nil)
+                let result = try self.performCreate(itemTemplate, contents: url, options: options)
+                completionHandler(result.item, [], result.shouldFetchContent, nil)
             } catch {
                 completionHandler(nil, fields, false, error)
             }
@@ -324,37 +328,45 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     }
 
     private func performCreate(_ template: NSFileProviderItem, contents url: URL?,
-                               options: NSFileProviderCreateItemOptions) throws -> FPItem {
+                               options: NSFileProviderCreateItemOptions) throws -> MutationResult {
         let name = template.filename
         switch template.parentItemIdentifier {
         case .rootContainer:
-            let kind = try mapUnreachable { try bridge.classify(name: name) }
+            let kind = try classifyRootName(name)
             switch kind {
             case "synth":
-                let data = try url.map { try Data(contentsOf: $0) } ?? Data()
-                try mapUnreachable {
-                    try bridge.writeSynth(domain: paths.configDir, name: name, data: data)
+                switch SynthCreateAction.decide(
+                    mayAlreadyExist: options.contains(.mayAlreadyExist), hasContents: url != nil) {
+                case .adopt:
+                    return try synthMutations.adopt(name: name)
+                case .replace:
+                    guard let url else { throw CocoaError(.fileWriteUnknown) }
+                    return try synthMutations.commit(
+                        name: name, data: try Data(contentsOf: url), removing: nil)
+                case .rejectMissingContents:
+                    throw CocoaError(.fileWriteUnknown)
                 }
-                return try lookupItem(ItemID.computed(name).identifier)
             case "private":
-                return try createBacking(at: paths.privateStore + "/" + name, id: .priv(name),
-                                         template: template, contents: url, options: options)
+                return .unchanged(try createBacking(
+                    at: paths.privateStore + "/" + name, id: .priv(name),
+                    template: template, contents: url, options: options))
             default: // "symlink" or "" passthrough — route to the shared base
                 let item = try createBacking(at: paths.base + "/" + name, id: .shared(name),
                                              template: template, contents: url, options: options)
                 // Match enumeration: carved-out names and dirs are symlink items.
                 if kind == "symlink" || template.contentType == .folder {
-                    return symlinkItem(name: name, target: paths.base + "/" + name)
+                    return .unchanged(symlinkItem(name: name, target: paths.base + "/" + name))
                 }
-                return item
+                return .unchanged(item)
             }
         default:
             guard let pid = ItemID(template.parentItemIdentifier), case .priv(let prel) = pid else {
                 throw NSFileProviderError(.noSuchItem)
             }
             let rel = prel + "/" + name
-            return try createBacking(at: paths.privateStore + "/" + rel, id: .priv(rel),
-                                     template: template, contents: url, options: options)
+            return .unchanged(try createBacking(
+                at: paths.privateStore + "/" + rel, id: .priv(rel),
+                template: template, contents: url, options: options))
         }
     }
 
@@ -391,9 +403,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         queue.async {
             defer { progress.completedUnitCount = 1 }
             do {
-                let updated = try self.performModify(item, changedFields: changedFields,
-                                                     contents: newContents)
-                completionHandler(updated, [], false, nil)
+                let result = try self.performModify(item, changedFields: changedFields,
+                                                    contents: newContents)
+                completionHandler(result.item, [], result.shouldFetchContent, nil)
             } catch {
                 completionHandler(nil, changedFields, false, error)
             }
@@ -405,7 +417,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     // the backing trees are the source of truth and enumeration reconciles.
     private func performModify(_ item: NSFileProviderItem,
                                changedFields: NSFileProviderItemFields,
-                               contents newContents: URL?) throws -> FPItem {
+                               contents newContents: URL?) throws -> MutationResult {
         guard var id = ItemID(item.itemIdentifier) else { throw NSFileProviderError(.noSuchItem) }
 
         if changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier) {
@@ -415,27 +427,20 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             case .root:
                 throw NSFileProviderError(.noSuchItem)
             case .shared, .priv:
-                id = try performRename(id, item: item, contents: newContents)
-                // Rename onto a synth name already committed the contents.
-                if case .computed = id { return try lookupItem(id.identifier) }
+                switch try performRename(id, item: item, contents: newContents) {
+                case .backing(let renamed):
+                    id = renamed
+                case .computed(let committed):
+                    return committed
+                }
             }
         }
 
         if changedFields.contains(.contents), let src = newContents {
             switch id {
             case .computed(let name):
-                let data = try Data(contentsOf: src)
-                try mapUnreachable {
-                    try bridge.writeSynth(domain: paths.configDir, name: name, data: data)
-                }
-                // Division of labor mirrors the fuse holder: Go splits the
-                // shareable keys back to base (WriteThrough); the mount-side
-                // owner persists the committed document as the account's
-                // private backing. Without this, private-key changes vanish
-                // on the next merge. settings.json has no private side.
-                if name == ".claude.json" {
-                    try coordinatedReplace(path: paths.privateStore + "/" + name, data: data)
-                }
+                return try synthMutations.commit(
+                    name: name, data: try Data(contentsOf: src), removing: nil)
             case .shared, .priv:
                 guard let dest = paths.backing(id) else { throw NSFileProviderError(.noSuchItem) }
                 try coordinatedReplace(path: dest, data: try Data(contentsOf: src))
@@ -443,30 +448,32 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 throw NSFileProviderError(.noSuchItem)
             }
         }
-        return try lookupItem(id.identifier)
+        return .unchanged(try lookupItem(id.identifier))
     }
 
     /// Moves the backing to wherever the new name classifies. A rename onto a
     /// synth name is claude's atomic tmp→commit dance: read the temp bytes,
     /// write through the bridge, drop the temp.
+    private enum RenameResult {
+        case backing(ItemID)
+        case computed(MutationResult)
+    }
+
     private func performRename(_ id: ItemID, item: NSFileProviderItem,
-                               contents newContents: URL?) throws -> ItemID {
+                               contents newContents: URL?) throws -> RenameResult {
         guard let src = paths.backing(id) else { throw NSFileProviderError(.noSuchItem) }
         let newName = item.filename
         let destID: ItemID
         let destPath: String
         switch item.parentItemIdentifier {
         case .rootContainer:
-            let kind = try mapUnreachable { try bridge.classify(name: newName) }
+            let kind = try classifyRootName(newName)
             switch kind {
             case "synth":
                 let data = try newContents.map { try Data(contentsOf: $0) }
                     ?? (try Data(contentsOf: URL(fileURLWithPath: src)))
-                try mapUnreachable {
-                    try bridge.writeSynth(domain: paths.configDir, name: newName, data: data)
-                }
-                _ = unlink(src)
-                return .computed(newName)
+                return .computed(try synthMutations.commit(
+                    name: newName, data: data, removing: src))
             case "private":
                 destID = .priv(newName)
                 destPath = paths.privateStore + "/" + newName
@@ -485,7 +492,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             atPath: (destPath as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true)
         try coordinatedRename(from: src, to: destPath)
-        return destID
+        return .backing(destID)
     }
 
     func deleteItem(identifier: NSFileProviderItemIdentifier,
@@ -493,30 +500,97 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                     options: NSFileProviderDeleteItemOptions, request: NSFileProviderRequest,
                     completionHandler: @escaping (Error?) -> Void) -> Progress {
         let progress = Progress(totalUnitCount: 1)
-        queue.async {
+        // A barrier keeps an in-flight enumeration from restoring the anchor
+        // entry between invalidation and the post-completion signal.
+        queue.async(flags: .barrier) {
             defer { progress.completedUnitCount = 1 }
             do {
                 guard let id = ItemID(identifier) else { throw NSFileProviderError(.noSuchItem) }
-                switch id {
-                case .root, .computed:
-                    throw NSFileProviderError(.deletionRejected)
-                case .shared(let rel):
-                    // Carved-out names are read-only symlink items; only
-                    // passthrough leftovers are deletable.
-                    if !rel.contains("/"),
-                       try self.mapUnreachable({ try self.bridge.classify(name: rel) }) == "symlink" {
-                        throw NSFileProviderError(.deletionRejected)
-                    }
-                    try self.coordinatedRemove(self.paths.base + "/" + rel)
-                case .priv(let rel):
-                    try self.coordinatedRemove(self.paths.privateStore + "/" + rel)
+                let reannouncement = try self.performDelete(id)
+                if let reannouncement {
+                    let manager = try self.fileProviderManager()
+                    reannouncement.completeDeletion(
+                        completion: { completionHandler(nil) },
+                        signal: {
+                            manager.signalEnumerator(for: $0) { _ in }
+                        })
+                } else {
+                    completionHandler(nil)
                 }
-                completionHandler(nil)
             } catch {
                 completionHandler(error)
             }
         }
         return progress
+    }
+
+    private func performDelete(_ id: ItemID) throws -> ComputedReannouncement? {
+        switch id {
+        case .root:
+            throw NSFileProviderError(.deletionRejected)
+        case .computed(let name):
+            let reannouncement = ComputedReannouncement(computedName: name)
+            try reannouncement.invalidate(anchors)
+            return reannouncement
+        case .shared(let rel):
+            // Carved-out names are read-only symlink items; only
+            // passthrough leftovers are deletable.
+            if !rel.contains("/"),
+               try mapUnreachable({ try bridge.classify(name: rel) }) == "symlink" {
+                throw NSFileProviderError(.deletionRejected)
+            }
+            try coordinatedRemove(paths.base + "/" + rel)
+        case .priv(let rel):
+            try coordinatedRemove(paths.privateStore + "/" + rel)
+        }
+        return nil
+    }
+
+    private func fileProviderManager() throws -> NSFileProviderManager {
+        guard let manager = NSFileProviderManager(for: domain) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        return manager
+    }
+
+    private func signalEnumerator(_ container: NSFileProviderItemIdentifier) throws {
+        try fileProviderManager().signalEnumerator(for: container) { _ in }
+    }
+
+    private func classifyRootName(_ name: String) throws -> String {
+        if RootItemPolicy.isSettingsStaging(name) {
+            return RootItemPolicy.classification(name: name, bridgeKind: "")
+        }
+        let kind = try mapUnreachable { try bridge.classify(name: name) }
+        return RootItemPolicy.classification(name: name, bridgeKind: kind)
+    }
+
+    private var synthMutations: SynthMutationCoordinator {
+        SynthMutationCoordinator(operations: .init(
+            write: { name, data in
+                try self.mapUnreachable {
+                    try self.bridge.writeSynth(
+                        domain: self.paths.configDir, name: name, data: data)
+                }
+            },
+            persistPrivate: { name, data in
+                try self.coordinatedReplace(
+                    path: self.paths.privateStore + "/" + name, data: data)
+            },
+            removeStaging: { try self.removeStagingIfPresent($0) },
+            lookup: { try self.lookupItem($0) },
+            announce: { try self.signalEnumerator(.workingSet) }))
+    }
+
+    private func removeStagingIfPresent(_ path: String) throws {
+        do {
+            try coordinatedRemove(path)
+        } catch {
+            let e = error as NSError
+            if e.domain == NSCocoaErrorDomain && e.code == NSFileNoSuchFileError { return }
+            if e.domain == NSPOSIXErrorDomain && e.code == Int(ENOENT) { return }
+            throw error
+        }
     }
 
     func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier,

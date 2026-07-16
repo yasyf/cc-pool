@@ -292,7 +292,7 @@ extension PoolStatus {
     /// The pool block is mid-alarm (worried, dry-out projected) so the
     /// gallery shows the mascot earning its keep.
     static let sample = PoolStatus(
-        proto: 1,
+        proto: 2,
         version: "dev",
         generatedAt: Date().addingTimeInterval(-90),
         accounts: [
@@ -369,7 +369,7 @@ extension PoolStatus {
     /// fileprivate, so fixture construction has to live in this file.)
     static func sample(mood: Mood) -> PoolStatus {
         PoolStatus(
-            proto: 1, version: "dev",
+            proto: 2, version: "dev",
             generatedAt: Date().addingTimeInterval(-90),
             accounts: sample.accounts,
             pool: PoolOutlook(
@@ -383,7 +383,7 @@ extension PoolStatus {
     /// burn is present, pace_5h/pace_7d absent. Exercises the version-skew
     /// derivation in `outlook` (pace5h = grossBurn / (20 × usable)).
     static let samplePrePace = PoolStatus(
-        proto: 1,
+        proto: 2,
         version: "dev",
         generatedAt: Date().addingTimeInterval(-90),
         accounts: sample.accounts,
@@ -395,7 +395,7 @@ extension PoolStatus {
     /// A pre-forecast daemon's snapshot: no pool block, no per-account
     /// predictions. Exercises the derived-outlook fallback path in previews.
     static let sampleLegacy = PoolStatus(
-        proto: 1,
+        proto: 2,
         version: "dev",
         generatedAt: Date().addingTimeInterval(-90),
         accounts: [
