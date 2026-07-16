@@ -33,6 +33,11 @@ class CcPool < Formula
       install_from_source
     else
       bin.install "cc-pool"
+      # The daemon runs from a profiled .app bundle, not the bare CLI: tccd keys a
+      # bundle's App-Group-container grant by identifier (durable across upgrades),
+      # and the embedded provisioning profile makes that grant no-prompt. The
+      # service block below launches its inner Contents/MacOS/cc-pool.
+      libexec.install "CCPoolDaemon.app"
     end
     bin.install_symlink "cc-pool" => "ccp"
   end
@@ -41,6 +46,16 @@ class CcPool < Formula
   # elects the appex, sets FP as the default backend). `ccp fp onboard` owns its
   # own messaging, so let it print; never fail or block the install if it errors
   # — an older installed binary may not even know the flag.
+  #
+  # We deliberately do NOT (re)generate or restart the daemon LaunchAgent here.
+  # Rewriting the plist by hand would duplicate the daemon's own launchd-management
+  # logic, and *starting* it from post_install could trip the very TCC prompt this
+  # bundle exists to avoid (the daemon touches the App Group container on launch)
+  # or hard-fail a headless install — both forbidden here. Convergence onto the new
+  # bundle program is instead handled by `brew services`, which regenerates
+  # homebrew.mxcl.cc-pool.plist from the service block on the next start/restart,
+  # and by the CLI's `ensureDaemon` self-heal, which evicts a stale daemon and
+  # reinstalls the agent on the bundle program at the next `ccp` invocation.
   def post_install
     system bin/"cc-pool", "fp", "onboard", "--post-install"
   rescue
@@ -57,17 +72,23 @@ class CcPool < Formula
     ENV["CGO_ENABLED"] = "0"
     system "go", "build", *args, "./cmd/cc-pool"
     codesign_head_build
+    assemble_head_daemon_bundle
   end
 
-  # An adhoc HEAD build gets its TCC grants (Network Volumes deep-probe,
-  # app-group container) path-keyed to this versioned Cellar path, so every
-  # upgrade re-prompts. A maintainer machine has a "Developer ID Application"
-  # identity, so sign under the release's identifier to share its
-  # identifier-keyed grant. No `--options runtime` (TCC keys on the designated
-  # requirement = identifier + Dev ID leaf; hardened runtime only hurts debugger
-  # attach on dev builds) and no notarization (local, unquarantined). A public
-  # user with no identity falls through unsigned — this must never fail install.
-  def codesign_head_build
+  # The App Group parsed from source (the constant release.yml also derives with
+  # sed) and its owning Team ID (a group's prefix). Kept in source so a signed
+  # entitlement can never drift from the code.
+  def app_group_from_source
+    group = (buildpath/"internal/pool/paths.go").read[/^const AppGroupID = "(.+)"$/, 1]
+    [group, group&.slice(/\A[A-Z0-9]+(?=\.)/)]
+  end
+
+  # The Developer ID Application identity to sign HEAD artifacts with, or nil on a
+  # public machine with no identity — signing is best-effort and must never fail
+  # install. Prefers the identity whose team owns the App Group, since the
+  # app-groups entitlement only works when the signer owns the group; any other
+  # team signs identifier-only.
+  def head_signing_identity(group_team)
     # popen_read, not safe_popen_read: probing for a signing identity must never
     # fail the install — no identity (a public machine) just skips signing.
     # rubocop:disable Homebrew/SafePopenCommands
@@ -76,41 +97,101 @@ class CcPool < Formula
     candidates = identities.scan(/Developer ID Application: .+? \([A-Z0-9]+\)/)
     return if candidates.empty?
 
-    # Parse the App Group from source so the entitlement can never drift from the
-    # code (same reason release.yml derives it with sed). The app-groups
-    # entitlement only works when the signing identity owns the group — the
-    # group's prefix is the owning Team ID — so among several identities prefer
-    # that team's; any other team signs identifier-only.
-    app_group = (buildpath/"internal/pool/paths.go").read[/^const AppGroupID = "(.+)"$/, 1]
-    group_team = app_group&.slice(/\A[A-Z0-9]+(?=\.)/)
-    identity = candidates.find { |c| group_team && c.end_with?("(#{group_team})") } || candidates.first
-    codesign_args = ["--force", "--identifier", "com.yasyf.cc-pool", "-s", identity]
+    candidates.find { |c| group_team && c.end_with?("(#{group_team})") } || candidates.first
+  end
 
+  # Writes an app-groups entitlements plist under buildpath and returns its path.
+  def app_group_entitlements(name, app_group)
+    path = buildpath/name
+    path.write <<~XML
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      <plist version="1.0">
+      <dict>
+        <key>com.apple.security.application-groups</key>
+        <array>
+          <string>#{app_group}</string>
+        </array>
+      </dict>
+      </plist>
+    XML
+    path
+  end
+
+  # An adhoc HEAD build gets its Network Volumes deep-probe TCC grant path-keyed
+  # to this versioned Cellar path, so every upgrade re-prompts. A maintainer
+  # machine has a "Developer ID Application" identity, so sign under the release's
+  # identifier to share its identifier-keyed grant. No `--options runtime` (TCC
+  # keys on the designated requirement = identifier + Dev ID leaf; hardened
+  # runtime only hurts debugger attach on dev builds) and no notarization (local,
+  # unquarantined). The CLI carries NO app-group entitlement — like the release,
+  # the group claim rides the daemon bundle. A public user with no identity falls
+  # through unsigned — this must never fail install.
+  def codesign_head_build
+    _, group_team = app_group_from_source
+    identity = head_signing_identity(group_team)
+    return if identity.nil?
+
+    system "/usr/bin/codesign", "--force", "--identifier", "com.yasyf.cc-pool",
+           "-s", identity, bin/"cc-pool"
+  end
+
+  # HEAD has no notarized, profiled bundle from CI, so assemble a minimal
+  # CCPoolDaemon.app around a copy of the just-built CLI and sign it (best-effort)
+  # with the builder's Developer ID + app-group entitlement. WITHOUT an embedded
+  # provisioning profile a Developer ID app-group claim is NOT a no-prompt grant,
+  # so HEAD builds may still prompt for File Provider bridge access on upgrade;
+  # only a release install ships the profiled, notarized bundle. No identity (a
+  # public machine) leaves the bundle unsigned — this must never fail install.
+  def assemble_head_daemon_bundle
+    app = libexec/"CCPoolDaemon.app"
+    (app/"Contents/MacOS").mkpath
+    cp bin/"cc-pool", app/"Contents/MacOS/cc-pool"
+    (app/"Contents/Info.plist").write <<~XML
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      <plist version="1.0">
+      <dict>
+        <key>CFBundleInfoDictionaryVersion</key>
+        <string>6.0</string>
+        <key>CFBundlePackageType</key>
+        <string>APPL</string>
+        <key>CFBundleIdentifier</key>
+        <string>com.yasyf.cc-pool.daemon</string>
+        <key>CFBundleName</key>
+        <string>CCPoolDaemon</string>
+        <key>CFBundleExecutable</key>
+        <string>cc-pool</string>
+        <key>CFBundleShortVersionString</key>
+        <string>#{version}</string>
+        <key>CFBundleVersion</key>
+        <string>#{version}</string>
+        <key>LSUIElement</key>
+        <true/>
+      </dict>
+      </plist>
+    XML
+
+    app_group, group_team = app_group_from_source
+    identity = head_signing_identity(group_team)
+    return if identity.nil?
+
+    codesign_args = ["--force", "--identifier", "com.yasyf.cc-pool.daemon", "-s", identity]
     if group_team && identity.end_with?("(#{group_team})")
-      entitlements = buildpath/"cc-pool-head.entitlements"
-      entitlements.write <<~XML
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-          <key>com.apple.security.application-groups</key>
-          <array>
-            <string>#{app_group}</string>
-          </array>
-        </dict>
-        </plist>
-      XML
-      codesign_args += ["--entitlements", entitlements]
+      codesign_args += ["--entitlements",
+                        app_group_entitlements("cc-pool-daemon-head.entitlements", app_group)]
     end
-
-    system "/usr/bin/codesign", *codesign_args, bin/"cc-pool"
+    system "/usr/bin/codesign", *codesign_args, app
   end
 
   # Run the daemon as a USER LaunchAgent (no sudo): it needs the user's login
   # Keychain, which a root daemon cannot read. `brew services start cc-pool`
   # installs ~/Library/LaunchAgents/homebrew.mxcl.cc-pool.plist.
   service do
-    run [opt_bin/"cc-pool", "daemon"]
+    # Launch the daemon from the profiled bundle so its App-Group-container access
+    # is the identifier-keyed, no-prompt grant. `cc-pool daemon` is the same CLI,
+    # invoked through the bundle's main executable.
+    run [opt_libexec/"CCPoolDaemon.app/Contents/MacOS/cc-pool", "daemon"]
     keep_alive true
     run_at_load true
     environment_variables PATH: std_service_path_env
