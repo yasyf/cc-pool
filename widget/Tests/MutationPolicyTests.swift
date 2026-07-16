@@ -128,21 +128,31 @@ final class MutationPolicyTests: XCTestCase {
         XCTAssertEqual(events, ["write", "persist-private", "lookup", "announce-local"])
     }
 
-    func testComputedDeletionInvalidatesBothAnchorsAndCompletesBeforeSignals() throws {
+    func testComputedDeletionForcesBothUpdatesWithoutExpiringAnchors() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("ccp-mutation-tests-" + UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let anchors = AnchorStore(domainID: "acct-test", root: root)
         let computed = ItemID.computed("settings.json").identifier
-        let other = ItemID.priv("x").identifier.rawValue
+        let computedItem = item(.computed("settings.json"))
+        let other = item(.priv("x"))
+        var prior: [NSFileProviderItemIdentifier: NSFileProviderSyncAnchor] = [:]
         for container in ComputedReannouncement.containers {
-            anchors.save(container, [computed.rawValue: "old", other: "keep"])
+            prior[container] = try anchors.record(container, items: [computedItem, other])
         }
         let reannouncement = ComputedReannouncement(computedName: "settings.json")
 
         try reannouncement.invalidate(anchors)
         for container in ComputedReannouncement.containers {
-            XCTAssertEqual(anchors.load(container), [other: "keep"], container.rawValue)
+            let delta = try XCTUnwrap(
+                anchors.changes(container, from: try XCTUnwrap(prior[container]),
+                                current: [computedItem, other]))
+            XCTAssertEqual(delta.changed.map(\.itemIdentifier), [computed], container.rawValue)
+            XCTAssertTrue(delta.deleted.isEmpty, container.rawValue)
+            let settled = try XCTUnwrap(
+                anchors.changes(container, from: delta.anchor, current: [computedItem, other]))
+            XCTAssertTrue(settled.changed.isEmpty, container.rawValue)
+            XCTAssertTrue(settled.deleted.isEmpty, container.rawValue)
         }
 
         var events: [String] = []

@@ -27,6 +27,7 @@ coverage.txt
 /widget/*.xcodeproj
 /widget/Generated/
 /widget/build/
+/widget/build-*/
 
 # Python (hook bytecode)
 __pycache__/

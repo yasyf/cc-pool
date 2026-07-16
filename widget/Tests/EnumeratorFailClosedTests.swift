@@ -23,9 +23,9 @@ final class EnumeratorFailClosedTests: XCTestCase {
         FakeSource(anchors: AnchorStore(domainID: "test", root: tmp), root: root, dir: dir)
     }
 
-    private static func item(_ name: String) -> FPItem {
+    private static func item(_ name: String, version: String = "0a") -> FPItem {
         FPItem(id: .computed(name), filename: name, contentType: .json,
-               capabilities: [.allowsReading], versionHex: "0a")
+               capabilities: [.allowsReading], versionHex: version)
     }
 
     private enum Bridge: Error { case unreachable }
@@ -69,13 +69,12 @@ final class EnumeratorFailClosedTests: XCTestCase {
         XCTAssertTrue(observer.enumerated.isEmpty)
     }
 
-    func testRootChangesErrorEmitsNoDeletes() {
+    func testRootChangesErrorEmitsNoDeletes() throws {
         for arm in Self.failureArms {
             let src = source(root: .failure(arm.error))
             // Persist a prior listing so a lying "empty" diff WOULD delete it.
-            src.anchors.save(.rootContainer, ["computed:.claude.json": "0a"])
-            let anchor = NSFileProviderSyncAnchor(
-                AnchorStore.anchor(of: ["computed:.claude.json": "0a"]))
+            let anchor = try src.anchors.record(
+                .rootContainer, items: [Self.item(".claude.json")])
             let observer = RecordingChangeObserver()
             RootEnumerator(source: src, container: .rootContainer)
                 .enumerateChanges(for: observer, from: anchor)
@@ -87,15 +86,34 @@ final class EnumeratorFailClosedTests: XCTestCase {
         }
     }
 
-    func testDirChangesErrorFailsEnumeration() {
+    func testDirChangesErrorFailsEnumeration() throws {
         let src = source(dir: .failure(Bridge.unreachable))
         let container = ItemID.priv("projects").identifier
-        src.anchors.save(container, ["private:projects/a": "01"])
-        let anchor = NSFileProviderSyncAnchor(AnchorStore.anchor(of: ["private:projects/a": "01"]))
+        let prior = FPItem(id: .priv("projects/a"), filename: "a", contentType: .json,
+                           capabilities: [.allowsReading], versionHex: "01")
+        let anchor = try src.anchors.record(container, items: [prior])
         let observer = RecordingChangeObserver()
         DirEnumerator(source: src, rel: "projects").enumerateChanges(for: observer, from: anchor)
         observer.waitFinished(self)
         XCTAssertNotNil(observer.error)
+        XCTAssertTrue(observer.deleted.isEmpty)
+    }
+
+    func testOlderRecordedAnchorRemainsValidAfterNewerSnapshot() throws {
+        let current = Self.item(".claude.json", version: "0c")
+        let src = source(root: .success([current]))
+        let old = try src.anchors.record(
+            .rootContainer, items: [Self.item(".claude.json", version: "0a")])
+        _ = try src.anchors.record(
+            .rootContainer, items: [Self.item(".claude.json", version: "0b")])
+        let observer = RecordingChangeObserver()
+
+        RootEnumerator(source: src, container: .rootContainer)
+            .enumerateChanges(for: observer, from: old)
+
+        observer.waitFinished(self)
+        XCTAssertNil(observer.error)
+        XCTAssertEqual(observer.updated.map(\.versionHex), ["0c"])
         XCTAssertTrue(observer.deleted.isEmpty)
     }
 

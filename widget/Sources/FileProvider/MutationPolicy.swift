@@ -65,7 +65,7 @@ struct ComputedReannouncement {
     }
 
     func invalidate(_ anchors: AnchorStore) throws {
-        try anchors.remove(identifier, from: Self.containers)
+        try anchors.forceUpdate(identifier, in: Self.containers)
     }
 
     func signal(_ body: (NSFileProviderItemIdentifier) -> Void) {
