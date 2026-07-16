@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"ops":[{"kind":"add_comment","body":"Verified closed: origin-owned/stripped-envelope cred-sync shipped v0.53.0 (token-free peer blobs, holder/lease deleted, fleet migrated); confirmed present through v0.56.0."}]}
+{"v":1,"lamport":4,"ops":[{"kind":"set_status","status":"done"},{"kind":"link_commit","sha":"880db6d09c674847c39b4e8a85a439fa8c888e05"}]}
