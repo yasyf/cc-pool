@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"ops":[{"kind":"set_branch","branch":"worktree-cred-sync-origin"}]}
+{"v":1,"lamport":3,"ops":[{"kind":"add_comment","body":"Verified closed: fetchOrder dials only the trusted mesh set (origin only reorders); exec: transport is envExecPeer sim-gated. Pinned by TestExecPeerCommandGate + injection-drop + sentinel negatives. Re-verified in v0.56.0."}]}
