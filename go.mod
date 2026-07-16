@@ -10,7 +10,7 @@ require (
 	github.com/descope/go-free-email-providers v0.0.0-20260427134210-d71f4c2c7632
 	github.com/muesli/cancelreader v0.2.2
 	github.com/spf13/cobra v1.10.2
-	github.com/yasyf/fusekit v1.3.0
+	github.com/yasyf/fusekit v1.4.0
 	github.com/yasyf/synckit v0.8.0
 	golang.org/x/mod v0.36.0
 	golang.org/x/net v0.56.0
@@ -61,9 +61,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-// TEMPORARY: consent-fix/go-rewire consumes fusekit's unreleased appgroup
-// package (GroupContainerDir). The orchestrator swaps this for the released
-// fusekit version once the appgroup capability ships. Do NOT merge with this
-// replace in place.
-replace github.com/yasyf/fusekit => /Users/yasyf/Code/.wt/fusekit-groupcontainer
