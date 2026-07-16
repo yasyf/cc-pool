@@ -10,11 +10,19 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/appgroup"
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/version"
 )
+
+// groupContainerDir resolves the daemon's app-group container through
+// -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:] so the FP
+// bridge binds at the prompt-free containerURL path, never a hand-built join. A
+// package var so tests point the bridge at a fake container without a real
+// entitlement.
+var groupContainerDir = appgroup.GroupContainerDir
 
 // fpBackedRow reports whether a stored overlay_kind names the File Provider
 // backend. File Provider is a third backend category
@@ -40,14 +48,24 @@ const defaultFPBridgeWait = 3 * time.Second
 // fpConsentWatchInterval paces the consent watchdog's poll for a late bind.
 const fpConsentWatchInterval = 250 * time.Millisecond
 
-// startFPBridge binds the File Provider data-socket content.BridgeServer
-// (startContentBridge's sibling, same PoolContentSource), waits a bounded
-// fpBridgeWait, and flags fpConsentPending when the bind parks on the
-// app-group-container TCC consent. The consent row keys on the daemon's
-// resolved executable path, held stable by the daemon command's re-exec from
-// pool.StableBinDir() — see ccn doc f71e9b1.
+// startFPBridge resolves the app-group container, binds the File Provider
+// data-socket content.BridgeServer (startContentBridge's sibling, same
+// PoolContentSource) inside it, waits a bounded fpBridgeWait, and flags
+// fpConsentPending when the bind parks on the app-group-container TCC consent.
+// Prompt-free access comes from the signed CCPoolDaemon.app bundle (app-group
+// entitlement + embedded Developer ID profile), so a release daemon never
+// prompts. An unresolvable container (a bare, unbundled daemon) takes the
+// hard-error path — never consent-pending, which is reserved for a live TCC
+// denial of a container that DOES resolve.
 func (s *Server) startFPBridge(ctx context.Context) {
-	sock := pool.FPBridgeSocketPath()
+	dir, err := groupContainerDir(pool.AppGroupID)
+	if err != nil {
+		s.fpBridgeHardErr.Store(true)
+		s.log.Printf("file provider bridge: no app-group container for %s (%v); the bridge stays down — a release daemon binds it from the signed CCPoolDaemon.app bundle", pool.AppGroupID, err)
+		return
+	}
+	sock := filepath.Join(dir, pool.FPBridgeSocketLeaf)
+	s.fpBridgeSock.Store(&sock)
 	bridge := &content.BridgeServer{Socket: sock, Source: s.contentSource, Version: version.String(), Log: s.log}
 	s.wg.Add(1)
 	go func() {
@@ -364,14 +382,17 @@ func (s *Server) fpBridgeReady() bool {
 	if s.fpBridgeReadyFn != nil {
 		return s.fpBridgeReadyFn()
 	}
-	return !s.fpConsentPending.Load() && !s.fpBridgeFaulted() && content.NewBridgeClient(pool.FPBridgeSocketPath()).Available()
+	sock := s.fpBridgeSock.Load()
+	return sock != nil && !s.fpConsentPending.Load() && !s.fpBridgeFaulted() && content.NewBridgeClient(*sock).Available()
 }
 
 // fpBridgeUp reports whether the File Provider data socket accepts a connection,
 // for the status wire's FPBridgeUp field. The daemon is the only process that
 // dials the group-container bridge, so the CLI reads this off status instead of
 // touching the socket. Unlike fpBridgeReady it ignores the consent flag — it is
-// the raw socket-liveness fact the CLI renders.
+// the raw socket-liveness fact the CLI renders. An unresolved container (bridge
+// never started) reads false.
 func (s *Server) fpBridgeUp() bool {
-	return content.NewBridgeClient(pool.FPBridgeSocketPath()).Available()
+	sock := s.fpBridgeSock.Load()
+	return sock != nil && content.NewBridgeClient(*sock).Available()
 }

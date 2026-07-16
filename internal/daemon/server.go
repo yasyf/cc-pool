@@ -87,6 +87,13 @@ type Server struct {
 	// defaultFPBridgeWait. Tests shrink it.
 	fpBridgeWait time.Duration
 
+	// fpBridgeSock is the resolved File Provider data-socket path inside the
+	// app-group container (containerURL dir + FPBridgeSocketLeaf), stored once by
+	// startFPBridge. Nil until it resolves — an unresolvable container (bare,
+	// unbundled daemon) takes the hard-error path and leaves it nil, so every
+	// bridge reader treats an unresolved container as a down bridge.
+	fpBridgeSock atomic.Pointer[string]
+
 	// fpConsentPending: the FP bridge bind has not completed while the daemon is
 	// alive — the app-group-container TCC consent signature. The watchdog binds
 	// automatically once consent is granted (no restart); set and cleared by

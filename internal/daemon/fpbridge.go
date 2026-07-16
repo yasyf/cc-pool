@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/fusekit/content"
 )
 
@@ -72,9 +71,13 @@ func (s *Server) fpBridgeCheck(ctx context.Context) FPBridgeStatus {
 	if s.fpConsentPending.Load() {
 		return FPBridgeStatus{Verdict: FPBridgeConsentParked, Detail: fpBridgeConsentLever}
 	}
+	sock := s.fpBridgeSock.Load()
+	if sock == nil {
+		return FPBridgeStatus{Verdict: FPBridgeDown, Detail: fpBridgeDownLever}
+	}
 	ctx, cancel := context.WithTimeout(ctx, fpBridgeSelfTestBudget)
 	defer cancel()
-	cl := content.NewBridgeClient(pool.FPBridgeSocketPath())
+	cl := content.NewBridgeClient(*sock)
 	switch err := cl.SelfTest(ctx, fpBridgeProbeDomain, settingsProbeEntry); {
 	case err == nil:
 		return FPBridgeStatus{Verdict: FPBridgeServing}

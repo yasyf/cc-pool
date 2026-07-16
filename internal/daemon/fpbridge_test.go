@@ -78,9 +78,10 @@ func TestFPBridgeCheckClassify(t *testing.T) {
 	})
 
 	t.Run("bound-dead when the socket answers nothing", func(t *testing.T) {
-		shortHome(t)
-		deadBridge(t, pool.FPBridgeSocketPath())
+		_, _, sock := fakeGroupContainer(t)
+		deadBridge(t, sock)
 		s := &Server{log: log.New(io.Discard, "", 0)}
+		s.fpBridgeSock.Store(&sock)
 		st := s.fpBridgeCheck(context.Background())
 		if st.Verdict != FPBridgeBoundDead || st.Detail != fpBridgeBoundDeadLever {
 			t.Fatalf("verdict/detail = %q/%q, want bound-dead + the bound-dead lever", st.Verdict, st.Detail)
@@ -89,6 +90,7 @@ func TestFPBridgeCheckClassify(t *testing.T) {
 
 	t.Run("serving over a live bridge", func(t *testing.T) {
 		shortHome(t)
+		_, _, sock := fakeGroupContainer(t)
 		if err := os.MkdirAll(pool.ClaudeDir(), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -103,7 +105,7 @@ func TestFPBridgeCheckClassify(t *testing.T) {
 		defer cancel()
 		s.startFPBridge(ctx)
 		waitFor(t, 2*time.Second, "the FP bridge to bind", func() bool {
-			return content.NewBridgeClient(pool.FPBridgeSocketPath()).Available()
+			return content.NewBridgeClient(sock).Available()
 		})
 		st := s.fpBridgeCheck(ctx)
 		if st.Verdict != FPBridgeServing {
@@ -168,9 +170,10 @@ func TestRecordFPBridgeHealthNonFPMachine(t *testing.T) {
 // though the socket still accepts — a bound-but-dead bridge is not ready to probe
 // through.
 func TestFPBridgeReadyFaultedGate(t *testing.T) {
-	shortHome(t)
-	deadBridge(t, pool.FPBridgeSocketPath()) // socket bound (dial succeeds), never serves
+	_, _, sock := fakeGroupContainer(t)
+	deadBridge(t, sock) // socket bound (dial succeeds), never serves
 	s := newBridgeLedgerServer()
+	s.fpBridgeSock.Store(&sock)
 	if !s.fpBridgeReady() {
 		t.Fatal("a bound bridge with a clean row should read ready (the row faults over strikes, not the dial)")
 	}

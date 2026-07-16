@@ -317,12 +317,12 @@ type Response struct {
 	// Status only.
 	ContentHealth string `json:"content_health,omitempty"`
 	// FPConsentPending: the daemon's File Provider bridge bind has not
-	// completed while the daemon is alive — the signature of the app-group-
-	// container TCC consent (keyed on the daemon's resolved executable path,
-	// held stable by the daemon command's re-exec from pool.StableBinDir(), so
-	// the grant is one-time; unsigned dev builds re-prompt per build). Run `ccp fp
-	// consent` in a local terminal; the daemon binds automatically once granted (no
-	// restart). Additive; status only.
+	// completed while the daemon is alive — the signature of a live app-group-
+	// container TCC denial. A release daemon ships as the signed CCPoolDaemon.app
+	// bundle (app-group entitlement + embedded Developer ID profile), so its
+	// container access is prompt-free and this never trips; an unbundled dev build
+	// has no container and takes the hard-error path instead. Additive; status
+	// only.
 	FPConsentPending bool `json:"fp_consent_pending,omitempty"`
 	// FPBridgeUp: the daemon's File Provider data socket is accepting — the
 	// daemon is the only process that dials the group-container bridge, so the

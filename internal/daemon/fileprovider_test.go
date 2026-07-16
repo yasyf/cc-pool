@@ -21,6 +21,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/fusekit/appgroup"
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
@@ -183,6 +184,27 @@ func shortHome(t *testing.T) string {
 	return home
 }
 
+// fakeGroupContainer points the groupContainerDir seam at container dir
+// <parent>/<AppGroupID> under a short /tmp parent (t.TempDir blows AF_UNIX's
+// 104-byte sun_path) and returns the container dir, its parent (the stand-in
+// "Group Containers" dir), and the FP bridge socket inside the container.
+// startFPBridge binds off the resolved container with no real app-group
+// entitlement; serveFPBridge's MkdirAll creates the container dir itself, matching
+// the real containerURL path.
+func fakeGroupContainer(t *testing.T) (container, parent, sock string) {
+	t.Helper()
+	parent, err := os.MkdirTemp("/tmp", "ccp-gc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(parent) })
+	container = filepath.Join(parent, pool.AppGroupID)
+	prev := groupContainerDir
+	groupContainerDir = func(string) (string, error) { return container, nil }
+	t.Cleanup(func() { groupContainerDir = prev })
+	return container, parent, filepath.Join(container, pool.FPBridgeSocketLeaf)
+}
+
 // TestFPBridgeSharesSourceAndSerializesWrites pins the two-servers-one-Source
 // architecture: startContentBridge and startFPBridge serve the SAME
 // PoolContentSource, so concurrent claude.json write-throughs arriving on both
@@ -191,6 +213,7 @@ func shortHome(t *testing.T) string {
 // and a second bind on the live FP socket is refused by proc.SingleEntrant.
 func TestFPBridgeSharesSourceAndSerializesWrites(t *testing.T) {
 	shortHome(t)
+	_, _, fpSock := fakeGroupContainer(t)
 	if err := os.MkdirAll(pool.ClaudeDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +231,7 @@ func TestFPBridgeSharesSourceAndSerializesWrites(t *testing.T) {
 	s.startContentBridge(ctx)
 	s.startFPBridge(ctx)
 	holderCl := content.NewBridgeClient(pool.BridgeSocketPath())
-	fpCl := content.NewBridgeClient(pool.FPBridgeSocketPath())
+	fpCl := content.NewBridgeClient(fpSock)
 	if !holderCl.Available() || !fpCl.Available() {
 		t.Fatalf("bridges not up: holder=%v fp=%v", holderCl.Available(), fpCl.Available())
 	}
@@ -256,7 +279,7 @@ func TestFPBridgeSharesSourceAndSerializesWrites(t *testing.T) {
 
 	// A second server on the live FP socket must be refused, not silently bound
 	// over the live peer.
-	dup := &content.BridgeServer{Socket: pool.FPBridgeSocketPath(), Source: s.contentSource, Version: "test", Log: log.New(io.Discard, "", 0)}
+	dup := &content.BridgeServer{Socket: fpSock, Source: s.contentSource, Version: "test", Log: log.New(io.Discard, "", 0)}
 	if err := dup.Run(ctx); err == nil || !strings.Contains(err.Error(), "already serves") {
 		t.Fatalf("duplicate FP bridge Run = %v, want a refusal naming the live peer", err)
 	}
@@ -265,14 +288,14 @@ func TestFPBridgeSharesSourceAndSerializesWrites(t *testing.T) {
 	s.wg.Wait()
 }
 
-// TestStartFPBridgeBindsUnconditionally pins the ungated bind: the FP socket
-// lives in the App Group container (pool.FPBridgeSocketPath), and startFPBridge
-// creates that dir itself and binds with no pre-existing container fixture —
-// the TCC consent gating the real container is macOS state, never a code-level
-// precondition. A prompt-free bind must also leave the consent-pending flag
-// clear.
+// TestStartFPBridgeBindsUnconditionally pins the ungated bind: startFPBridge
+// resolves the App Group container, creates the container dir itself, and binds
+// with no pre-existing container fixture — the TCC consent gating the real
+// container is macOS state, never a code-level precondition. A prompt-free bind
+// must also leave the consent-pending flag clear.
 func TestStartFPBridgeBindsUnconditionally(t *testing.T) {
 	shortHome(t)
+	_, _, sock := fakeGroupContainer(t)
 	s := &Server{
 		cl:            newClaims(),
 		log:           log.New(io.Discard, "", 0),
@@ -283,7 +306,7 @@ func TestStartFPBridgeBindsUnconditionally(t *testing.T) {
 
 	s.startFPBridge(ctx)
 
-	if !content.NewBridgeClient(pool.FPBridgeSocketPath()).Available() {
+	if !content.NewBridgeClient(sock).Available() {
 		t.Fatalf("FP bridge not up after startFPBridge with no pre-existing group container dir")
 	}
 	if s.fpConsentPending.Load() {
@@ -315,13 +338,9 @@ func TestStartFPBridgeBindsUnconditionally(t *testing.T) {
 // omitempty field disappears from the wire again.
 func TestStartFPBridgeFlagsConsentPending(t *testing.T) {
 	shortHome(t)
-	sock := pool.FPBridgeSocketPath()
-	groupContainers := filepath.Dir(filepath.Dir(sock))
-	if err := os.MkdirAll(groupContainers, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	// No write bit: MkdirAll of the container subdir fails with EACCES, the
-	// permission signature the consent signal keys on.
+	_, groupContainers, sock := fakeGroupContainer(t)
+	// No write bit on the container's parent: MkdirAll of the container subdir
+	// fails with EACCES, the permission signature the consent signal keys on.
 	if err := os.Chmod(groupContainers, 0o500); err != nil { //nolint:gosec // G302: a directory needs its execute bit; 0o500 deliberately drops only write to inject EACCES.
 		t.Fatal(err)
 	}
@@ -391,10 +410,9 @@ func TestStartFPBridgeFlagsConsentPending(t *testing.T) {
 // and fpConsentPending stays clear.
 func TestStartFPBridgeGenuineErrorNotConsent(t *testing.T) {
 	shortHome(t)
-	sock := pool.FPBridgeSocketPath()
-	if err := os.MkdirAll(filepath.Dir(filepath.Dir(sock)), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	_, _, sock := fakeGroupContainer(t)
+	// A plain file where the container dir belongs makes serveFPBridge's MkdirAll
+	// fail ENOTDIR — a genuine (non-permission) bind failure, not consent-parked.
 	if err := os.WriteFile(filepath.Dir(sock), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -411,6 +429,45 @@ func TestStartFPBridgeGenuineErrorNotConsent(t *testing.T) {
 
 	if s.fpConsentPending.Load() {
 		t.Fatal("a genuine (non-permission) bind failure was mislabeled as consent-pending")
+	}
+	cancel()
+	s.wg.Wait()
+}
+
+// TestStartFPBridgeResolverErrorIsHardErr pins the new resolver seam: when the
+// app-group container cannot be resolved (a bare, unbundled daemon — the
+// ErrNoGroupContainer case), startFPBridge takes the hard-error path (no bind, no
+// stored socket, hard-err latched) and NEVER flags consent-pending, which is
+// reserved for a live TCC denial of a container that DOES resolve.
+func TestStartFPBridgeResolverErrorIsHardErr(t *testing.T) {
+	shortHome(t)
+	prev := groupContainerDir
+	groupContainerDir = func(string) (string, error) { return "", appgroup.ErrNoGroupContainer }
+	t.Cleanup(func() { groupContainerDir = prev })
+	s := &Server{
+		cl:            newClaims(),
+		log:           log.New(io.Discard, "", 0),
+		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(pool.StateDir(), "content-stamps")),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.startFPBridge(ctx)
+
+	if s.fpConsentPending.Load() {
+		t.Fatal("a resolver error was mislabeled as consent-pending")
+	}
+	if !s.fpBridgeHardErr.Load() {
+		t.Fatal("a resolver error must latch the hard-error flag")
+	}
+	if s.fpBridgeSock.Load() != nil {
+		t.Fatal("no socket must be stored when the container does not resolve")
+	}
+	if s.fpBridgeUp() {
+		t.Fatal("fpBridgeUp() true with no resolved container")
+	}
+	if st := s.fpBridgeCheck(ctx); st.Verdict != FPBridgeDown {
+		t.Fatalf("fpBridgeCheck verdict = %q, want down with no resolved container", st.Verdict)
 	}
 	cancel()
 	s.wg.Wait()
@@ -454,7 +511,7 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 // and the FP bridge comes up without a daemon restart.
 func TestStartFPBridgeRetriesAfterBindFailure(t *testing.T) {
 	shortHome(t)
-	sock := pool.FPBridgeSocketPath()
+	_, _, sock := fakeGroupContainer(t)
 
 	// A second BridgeServer stands in for a stale peer holding the socket: it
 	// accepts (so Evict's dial connects) and holds the flock, exactly as a live
