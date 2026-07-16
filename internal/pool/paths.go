@@ -248,19 +248,22 @@ func FPBridgeSocketPath() string {
 	return filepath.Join(mustHome(), "Library", "Group Containers", AppGroupID, FPBridgeSocketLeaf)
 }
 
-// DaemonBinaryPath is the daemon .app bundle's main executable inside a Homebrew
-// install: <brew prefix>/libexec/CCPoolDaemon.app/Contents/MacOS/cc-pool. The
+// DaemonBinaryPath is the daemon .app bundle's main executable inside the same
+// Homebrew keg as exe: <keg>/libexec/CCPoolDaemon.app/Contents/MacOS/cc-pool. The
 // bundle's app-group entitlement + embedded Developer ID profile give the daemon
 // prompt-free group-container access — the durable replacement for the stable-path
-// re-exec. The brew prefix is two dirs up from the running binary (invoked via the
-// <prefix>/bin/cc-pool symlink). Callers stat the result: a missing bundle
-// (source/HEAD builds) is the expected signal to fall back to the running binary.
-func DaemonBinaryPath() (string, error) {
-	exe, err := os.Executable()
+// re-exec. exe is resolved through EvalSymlinks first: a Homebrew install runs the
+// daemon via <prefix>/bin/cc-pool, a symlink into <prefix>/Cellar/<name>/<ver>/bin,
+// and the bundle lives beside it in the keg's libexec — never under <prefix>/libexec
+// (Homebrew links bin but not libexec). The keg is two dirs up from the RESOLVED
+// binary. Callers stat the result: a missing bundle (source/HEAD builds) is the
+// expected signal to fall back to the running binary.
+func DaemonBinaryPath(exe string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(exe)
 	if err != nil {
-		return "", fmt.Errorf("resolve executable: %w", err)
+		return "", fmt.Errorf("resolve executable symlinks: %w", err)
 	}
-	prefix := filepath.Dir(filepath.Dir(exe))
+	prefix := filepath.Dir(filepath.Dir(resolved))
 	return filepath.Join(prefix, "libexec", "CCPoolDaemon.app", "Contents", "MacOS", "cc-pool"), nil
 }
 

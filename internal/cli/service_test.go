@@ -74,6 +74,52 @@ func TestCCPAgentProgramSelection(t *testing.T) {
 			t.Fatalf("ccpAgent().Program = %q, want empty on resolver error", got)
 		}
 	})
+
+	// Homebrew runs the daemon via a <prefix>/bin symlink into the keg; the path
+	// must resolve it to reach the keg's libexec, not the never-linked prefix one.
+	t.Run("resolves a Homebrew bin symlink to the keg bundle", func(t *testing.T) {
+		prefix, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		keg := filepath.Join(prefix, "Cellar", "cc-pool", "1.0")
+		kegBin := filepath.Join(keg, "bin")
+		if err := os.MkdirAll(kegBin, 0o755); err != nil { //nolint:gosec // G301: test fixture dirs.
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(kegBin, "cc-pool"), []byte("bin"), 0o755); err != nil { //nolint:gosec // G306: fixture must be executable.
+			t.Fatal(err)
+		}
+		bundle := filepath.Join(keg, "libexec", "CCPoolDaemon.app", "Contents", "MacOS", "cc-pool")
+		if err := os.MkdirAll(filepath.Dir(bundle), 0o755); err != nil { //nolint:gosec // G301: test fixture dirs.
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(bundle, []byte("daemon"), 0o755); err != nil { //nolint:gosec // G306: fixture must be executable.
+			t.Fatal(err)
+		}
+		prefixBin := filepath.Join(prefix, "bin")
+		if err := os.MkdirAll(prefixBin, 0o755); err != nil { //nolint:gosec // G301: test fixture dirs.
+			t.Fatal(err)
+		}
+		link := filepath.Join(prefixBin, "cc-pool")
+		if err := os.Symlink(filepath.Join("..", "Cellar", "cc-pool", "1.0", "bin", "cc-pool"), link); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := pool.DaemonBinaryPath(link)
+		if err != nil {
+			t.Fatalf("DaemonBinaryPath: %v", err)
+		}
+		if got != bundle {
+			t.Fatalf("DaemonBinaryPath(%q) = %q, want the keg bundle %q", link, got, bundle)
+		}
+
+		// End to end: ccpAgent picks the resolved keg bundle up as launchd's Program.
+		swapVar(t, &daemonBundleBin, func() (string, error) { return pool.DaemonBinaryPath(link) })
+		if p := ccpAgent().Program; p != bundle {
+			t.Fatalf("ccpAgent().Program = %q, want the keg bundle %q", p, bundle)
+		}
+	})
 }
 
 func seedAccounts(t *testing.T, accts ...store.Account) {

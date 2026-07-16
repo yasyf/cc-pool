@@ -106,9 +106,16 @@ func holderClient() *mountd.Client {
 	return &mountd.Client{Socket: mountd.DefaultHolderSocket(), Owner: pool.HolderOwner}
 }
 
-// daemonBundleBin resolves the daemon .app bundle's main executable path; a seam
-// so tests exercise both the bundle-present and source-build branches.
-var daemonBundleBin = pool.DaemonBinaryPath
+// daemonBundleBin resolves the daemon .app bundle's main executable path from the
+// running binary; a seam so tests exercise both the bundle-present and
+// source-build branches.
+var daemonBundleBin = func() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve executable: %w", err)
+	}
+	return pool.DaemonBinaryPath(exe)
+}
 
 // daemonBundleExecutable returns the daemon .app bundle's main executable and
 // whether it exists on disk. A Homebrew release ships CCPoolDaemon.app (app-group
