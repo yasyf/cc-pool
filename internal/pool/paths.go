@@ -59,10 +59,9 @@ func StateDir() string {
 	return stateDir.Root()
 }
 
-// StableBinDir is the version-independent directory the daemon re-execs itself
-// from (~/.cc-pool/bin). TCC keys a bare executable's app-group-container grants
-// by resolved path, so re-execing from here keeps grants alive across the
-// per-version Homebrew keg paths a `brew upgrade` churns through.
+// StableBinDir is the version-independent bin dir (~/.cc-pool/bin), a legacy of
+// the deleted stable-path daemon re-exec; only `ccp fp consent` still uses it
+// (the daemon itself runs from the bundle — see DaemonBinaryPath).
 func StableBinDir() string {
 	return filepath.Join(StateDir(), "bin")
 }
