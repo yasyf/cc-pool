@@ -19,6 +19,7 @@ import (
 	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/lease"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"golang.org/x/term"
 )
 
 // ccpAccountEnv forces a specific account for `ccp run`, which parses no flags
@@ -265,13 +266,52 @@ func ccpAccountFromEnv() (*int, error) {
 	return &id, nil
 }
 
+// qosClampEnv, when set, disables the batch QoS clamp for a launch.
+const qosClampEnv = "CC_POOL_NO_QOS_CLAMP"
+
+// taskpolicyBin is the macOS QoS wrapper batch launches exec through.
+const taskpolicyBin = "/usr/sbin/taskpolicy"
+
+// isBatchLaunch reports whether a launch is non-interactive: spawned from inside
+// another claude session (CLAUDECODE set), stdin not a terminal, or a headless
+// -p/--print run. Batch sessions exec through a utility QoS clamp so a busy pool
+// can't starve fseventsd and interactive processes of CPU.
+func isBatchLaunch(args []string, getenv func(string) string, stdinIsTerminal bool) bool {
+	if getenv("CLAUDECODE") != "" {
+		return true
+	}
+	if !stdinIsTerminal {
+		return true
+	}
+	for _, a := range args {
+		if a == "-p" || a == "--print" {
+			return true
+		}
+	}
+	return false
+}
+
+func useQoSClamp(args []string) bool {
+	if os.Getenv(qosClampEnv) != "" {
+		return false
+	}
+	if _, err := os.Stat(taskpolicyBin); err != nil {
+		return false
+	}
+	return isBatchLaunch(args, os.Getenv, term.IsTerminal(int(os.Stdin.Fd())))
+}
+
 func execClaude(h *lease.Handle, configDir string, args []string) error {
 	bin, err := exec.LookPath("claude")
 	if err != nil {
 		return fmt.Errorf("`claude` not found on PATH: %w", err)
 	}
 	argv := append([]string{"claude"}, args...)
-	//nolint:gosec // G204: bin is the resolved claude executable; argv are this CLI's own passthrough args
+	if useQoSClamp(args) {
+		argv = append([]string{"taskpolicy", "-c", "utility", bin}, args...)
+		bin = taskpolicyBin
+	}
+	//nolint:gosec // G204: bin is the resolved claude executable (or the taskpolicy clamp wrapping it); argv are this CLI's own passthrough args
 	err = syscall.Exec(bin, argv, execEnv(os.Environ(), configDir))
 	// The lease fd must stay open at exec time for the lock to survive into claude;
 	// KeepAlive holds h live across the (on success, non-returning) Exec call.

@@ -84,6 +84,42 @@ func TestExecEnv(t *testing.T) {
 	})
 }
 
+func TestIsBatchLaunch(t *testing.T) {
+	env := func(vars map[string]string) func(string) string {
+		return func(k string) string { return vars[k] }
+	}
+	cases := []struct {
+		name            string
+		args            []string
+		env             map[string]string
+		stdinIsTerminal bool
+		want            bool
+	}{
+		{name: "interactive terminal session", args: nil, stdinIsTerminal: true, want: false},
+		{name: "interactive with ordinary args", args: []string{"--resume", "abc"}, stdinIsTerminal: true, want: false},
+		{name: "nested agent spawn via CLAUDECODE", args: nil, env: map[string]string{"CLAUDECODE": "1"}, stdinIsTerminal: true, want: true},
+		{name: "no terminal on stdin", args: nil, stdinIsTerminal: false, want: true},
+		{name: "headless -p run", args: []string{"-p", "do the thing"}, stdinIsTerminal: true, want: true},
+		{name: "headless --print run", args: []string{"--print", "do the thing"}, stdinIsTerminal: true, want: true},
+		{name: "-p token anywhere clamps (match is positional-blind)", args: []string{"--resume", "-p"}, stdinIsTerminal: true, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isBatchLaunch(tc.args, env(tc.env), tc.stdinIsTerminal); got != tc.want {
+				t.Errorf("isBatchLaunch(%v, env=%v, tty=%v) = %v, want %v", tc.args, tc.env, tc.stdinIsTerminal, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUseQoSClampEscapeHatch(t *testing.T) {
+	t.Setenv(qosClampEnv, "1")
+	// Test stdin is never a terminal, so without the escape hatch this would clamp.
+	if useQoSClamp(nil) {
+		t.Errorf("useQoSClamp(nil) = true with %s set, want false", qosClampEnv)
+	}
+}
+
 func TestCcpAccountFromEnv(t *testing.T) {
 	t.Run("unset yields no override", func(t *testing.T) {
 		t.Setenv(ccpAccountEnv, "")
