@@ -118,6 +118,10 @@ cmd_provision() {
 # the VMCTL_GRAPHICS=1 click-Allow path (README: FP provisioning). The replay
 # scenario proves the grant end-to-end when its through-domain reads succeed.
 provision_tcc() {
+  if [[ -n "${VMCTL_SKIP_TCC:-}" ]]; then
+    log "VMCTL_SKIP_TCC set — NOT pre-seeding the App-Group-data TCC grant (the no-prompt scenario proves the daemon bundle self-authorizes the bind)"
+    return 0
+  fi
   local status client ctype
   status="$(vm_ssh csrutil status 2>/dev/null)" || status=""
   if [[ "$status" != *disabled* ]]; then

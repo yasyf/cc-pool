@@ -28,30 +28,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# discover_signing prints "<identity>\t<team-id>" for a usable Developer ID
-# Application identity, or dies with actionable options. VMCTL_SIGN_IDENTITY +
-# VMCTL_SIGN_TEAM pin a specific identity and skip the search.
-discover_signing() {
-  if [[ -n "${VMCTL_SIGN_IDENTITY:-}" && -n "${VMCTL_SIGN_TEAM:-}" ]]; then
-    printf '%s\t%s\n' "$VMCTL_SIGN_IDENTITY" "$VMCTL_SIGN_TEAM"
-    return 0
-  fi
-  local line sha team
-  line="$(security find-identity -v -p codesigning 2>/dev/null | grep 'Developer ID Application' | head -n1)" || true
-  if [[ -z "$line" ]]; then
-    die "no 'Developer ID Application' code-signing identity in the login keychain.
-  The File Provider appex will NOT register ad-hoc-signed, so a Developer ID cert is REQUIRED for the VM e2e. Options:
-    1. Import the team SXKCTF23Q2 'Developer ID Application' cert + private key into the login keychain (Keychain Access, or 'security import <cert.p12>').
-    2. Pin one you know is present: VMCTL_SIGN_IDENTITY=<sha1-or-name> VMCTL_SIGN_TEAM=<teamid> scripts/vm/vmctl push
-    3. If no Developer ID is available, the FP e2e cannot be validated in the VM — report that back rather than shipping an ad-hoc build."
-  fi
-  # `security find-identity` rows: `  1) <SHA1> "Developer ID Application: Name (TEAMID)"`.
-  sha="$(printf '%s' "$line" | awk '{print $2}')"
-  team="$(printf '%s' "$line" | sed -nE 's/.*\(([A-Z0-9]{10})\).*/\1/p')"
-  [[ -n "$sha" && -n "$team" ]] || die "could not parse a Developer ID identity from: $line"
-  printf '%s\t%s\n' "$sha" "$team"
-}
-
 main() {
   require_cmd go
   require_cmd git
@@ -64,7 +40,7 @@ main() {
   vm_assert_guest
 
   local sign_id sign_team
-  IFS=$'\t' read -r sign_id sign_team < <(discover_signing)
+  IFS=$'\t' read -r sign_id sign_team < <(vm_discover_signing)
   log "signing CCPoolStatus.app with Developer ID $sign_id (team $sign_team)"
 
   # The App Group is Team-ID-prefixed; assert the appex this build will emit
@@ -94,6 +70,15 @@ main() {
   # ccp is cc-pool's user-facing symlink; the incident command is `ccp migrate`.
   ln -sf cc-pool "$stage/bin/ccp"
   printf '%s\n' "$rev" >"$stage/BUILD_REV"
+
+  # --- CCPoolDaemon.app: the daemon's durable TCC identity (release.yml parity) ---
+  local daemon_mode="unprofiled"
+  [[ -n "${VMCTL_PROFILE_DAEMON:-}" ]] && daemon_mode="profiled"
+  # Dotted-numeric CFBundleShortVersionString; the commit count is monotonic.
+  local daemon_ver
+  daemon_ver="0.0.$(git -C "$REPO_ROOT" rev-list --count HEAD)"
+  log "assembling $VMCTL_DAEMON_BUNDLE_ID bundle (mode=$daemon_mode, version=$daemon_ver)"
+  vm_build_daemon_bundle "$stage/bin/cc-pool" "$stage/CCPoolDaemon.app" "$sign_id" "$daemon_ver" "$daemon_mode"
 
   # --- CCPoolStatus.app (CCPoolStatusFP flavor, Developer ID signed) ----------
   log "building CCPoolStatus.app (CCPoolStatusFP, Developer ID) with $(xcodebuild -version | head -n1)"
@@ -145,6 +130,9 @@ main() {
   # shellcheck disable=SC2029
   tar -C "$stage" -cf - bin BUILD_REV | vm_ssh "tar -xf - -C '$VMCTL_GUEST_DIR'"
 
+  log "installing $VMCTL_GUEST_DAEMON_APP (mode=$daemon_mode)"
+  vm_install_daemon_bundle "$stage/CCPoolDaemon.app" "$VMCTL_GUEST_DAEMON_APP"
+
   log "installing $VMCTL_GUEST_APP"
   # shellcheck disable=SC2029
   vm_ssh "rm -rf '$VMCTL_GUEST_APP'"
@@ -175,6 +163,12 @@ main() {
   log "guest selftest: cc-pool binary + File Provider extension enabled"
   # shellcheck disable=SC2029
   vm_ssh "'$VMCTL_GUEST_CCP' --version" || die "ccp --version failed in the guest"
+  # The daemon bundle exe must run and carry the app-group entitlement in-guest.
+  # shellcheck disable=SC2029
+  vm_ssh "'$VMCTL_GUEST_DAEMON_EXE' --version" || die "$VMCTL_GUEST_DAEMON_EXE --version failed — the CCPoolDaemon.app bundle did not install/run"
+  # shellcheck disable=SC2029
+  vm_ssh "codesign -d --entitlements - '$VMCTL_GUEST_DAEMON_APP' 2>&1" | grep -q "$(vm_app_group)" ||
+    die "installed $VMCTL_GUEST_DAEMON_APP is missing the app-group entitlement (signature stripped in transit?)"
   local fp_line="" t0
   t0="$(date +%s)"
   while (($(date +%s) - t0 < 15)); do
