@@ -278,9 +278,7 @@ final class FileProviderController {
     }
 
     private func register(_ domain: String) -> ControlResponse {
-        let d = NSFileProviderDomain(
-            identifier: NSFileProviderDomainIdentifier(rawValue: domain), displayName: domain)
-        d.isHidden = true // overlay-only: keep it out of Finder's Locations sidebar (files stay on disk)
+        let d = FileProviderDomainPolicy.make(domain)
         if let f = waitVoid(Bound.add, { NSFileProviderManager.add(d, completionHandler: $0) }) {
             return .failure("add domain \(domain): \(f.message)", classify(f))
         }
@@ -347,9 +345,7 @@ final class FileProviderController {
     /// every failure path to pin macOS-26 codes before the mapping is trusted.
     private func probe() -> ControlResponse {
         let id = probeDomainID
-        let d = NSFileProviderDomain(
-            identifier: NSFileProviderDomainIdentifier(rawValue: id), displayName: id)
-        d.isHidden = true // never flash the throwaway probe domain in Finder's Locations
+        let d = FileProviderDomainPolicy.make(id)
         defer {
             // Always tear the throwaway domain down, failure paths included.
             if let f = waitVoid(Bound.probeRemove, { NSFileProviderManager.remove(d, completionHandler: $0) }) {

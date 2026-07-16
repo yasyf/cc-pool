@@ -170,7 +170,9 @@ targets:
       - path: Sources/App/Countdown.swift
       - path: Sources/App/DomainClaims.swift
       - path: Sources/App/FileProviderControlPolicy.swift
+      - path: Sources/App/FileProviderDomainPolicy.swift
       - path: Sources/FileProvider/SynthCache.swift
+      - path: Sources/FileProvider/FileProviderEnumerationPolicy.swift
       - path: Sources/FileProvider/ItemID.swift
       - path: Sources/FileProvider/MutationPolicy.swift
       - path: Sources/FileProvider/FPItem.swift

@@ -595,11 +595,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
 
     func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier,
                     request: NSFileProviderRequest) throws -> NSFileProviderEnumerator {
+        if let error = FileProviderEnumerationPolicy.unsupportedContainerError(
+            for: containerItemIdentifier
+        ) {
+            throw error
+        }
         switch containerItemIdentifier {
         case .rootContainer, .workingSet:
             return RootEnumerator(source: self, container: containerItemIdentifier)
-        case .trashContainer:
-            throw NSFileProviderError(.noSuchItem)
         default:
             // Shared dirs are symlink items — no enumerator; only private
             // dirs enumerate.
