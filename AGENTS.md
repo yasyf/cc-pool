@@ -77,33 +77,6 @@ Safety rules baked into the architecture — do not regress them:
 3. **Account dir strings are hashed for Keychain service names** — the path string `ccp` emits and the string hashed must stay byte-identical. No realpath/normalization divergence.
 4. **Fuse mounts are hosted by a detached cc-pool mount-holder process** (socket `~/.cc-pool/mounts.sock`); daemon restarts/upgrades never disturb mounts. The holder is only replaced when no live sessions exist (or `ccp service uninstall --force`).
 
-## Ask Before Assuming
-
-When a request is ambiguous — unclear scope, multiple plausible interpretations, undefined edge cases — stop and ask. Propose 2–4 concrete options, or list the assumptions you'd otherwise make. One wrong implementation costs more than ten clarifying exchanges.
-
-## Code Review Response (Plan Re-Entry)
-
-When the user reviews your code and re-enters plan mode (inline diff comments, a numbered list of issues, or other review-shaped feedback):
-
-1. **Draft a new plan**, not a code change — re-entry means "align on what you'll do next."
-2. **Inline every comment verbatim** with an anchor (`#N`, file:line). Never paraphrase; the user must see each comment reproduced exactly.
-3. **Cluster into themes when >5 comments**, and extrapolate each rule to other call sites with the same problem.
-4. **Map every comment** in a final table: `# | file:line | verbatim | cluster`. No comment silently dropped.
-5. **Don't implement before approval.**
-
-If the user responds to a plan with questions, answer conversationally and surface choices via AskUserQuestion — don't bake answers into the plan before they choose.
-
-## Parallelize Independent Work
-
-Sequential is the exception, not the default. Two steps that don't consume each other's output run at the same time; when unsure whether they're independent, assume they are and fan out. The orchestrator routes and synthesizes — it never executes work a subagent could. Pick the surface by scale:
-
-- **Batch tool calls in one message** — the cheapest parallelism and the most missed. Independent reads, greps, globs, and read-only Bash go in a *single* message, never one per turn.
-- **Parallel subagent calls in one message** — ad-hoc independent investigations: "explore X while I check Y", multi-file reviews, independent edits. One message, N `Agent` tool uses, results gathered in parallel.
-- **Dynamic workflow** — default for substantive multi-step work; the script holds the loop, branching, and intermediate results. See CLAUDE.md `## Plan Execution & Orchestration`.
-- **Named team** — long-running peers needing agent-to-agent handoffs mid-run, via `TeamCreate`.
-
-Single-step exception: one task, no parallel sibling, no follow-on → one subagent call is fine.
-
 ## Style Rules (summary — see STYLEGUIDE.md)
 
 - **Fail fast, fail loud.** No silent fallbacks, sentinels, or defensive coding. No back-compat shims — delete dead code.
@@ -118,6 +91,54 @@ Single-step exception: one task, no parallel sibling, no follow-on → one subag
 
 `gofmt` and `go vet` own formatting and mechanical issues. Don't hand-flag them in review; only fix issues requiring judgment — logic, architecture, edge cases.
 
+## Ask Before Assuming
+
+When the user's request has ambiguity — unclear scope, multiple plausible interpretations, undefined edge cases, or unspecified tradeoffs — stop and ask. Propose 2-4 concrete options and let the user pick, or list the assumptions you'd otherwise make and ask which ones hold. There is no such thing as too many questions; one wrong implementation costs more than ten clarifying exchanges. Default to interrogating the user when in doubt — multiple short questions early beat a wrong direction later.
+
+## Code Review Response (Plan Re-Entry)
+
+When the user reviews code you wrote and re-enters plan mode — whether by leaving inline diff comments, pasting a numbered list of issues, or otherwise sending review-shaped feedback after a recent edit cycle — you MUST:
+
+0. **Delegate context-gathering to a subagent.** Spawn one `Explore` subagent with every cite (file:line + the user's verbatim comment text). Instruct it to, per cite, `Grep` the file with ~5 lines of context either side of the cited line (`-B 5 -A 5`), and only escalate to a full `Read` when the ±5-line window is insufficient (e.g. the comment refers to a function defined further up). Have it also surface sibling call sites with the same issue (Grep across the module). Use the subagent's digest as your source of truth when drafting the plan. Do NOT bulk-`Read` the cited files yourself in the main turn — it bloats the main context window before you've even started writing the plan.
+1. **Draft a new plan**, not a code change. Plan-mode re-entry is the user asking "let's align on what you'll do next," not "go fix it."
+2. **Inline every comment verbatim** in the plan. Each comment gets a short anchor (`#N`, the file:line if provided, or a quoted excerpt) plus the user's exact wording in a blockquote or `*"…"*` italics. Do not paraphrase. The user must be able to scan the plan and see every comment they wrote reproduced exactly.
+3. **Cluster when many.** If there are more than ~5 comments, group them into themes (e.g. "T1 — Guards against impossible states") and list every verbatim trigger per theme. Address every cited line *and* extrapolate the rule to other call sites that have the same problem.
+4. **Map every comment.** Maintain a "verbatim feedback table" near the end of the plan with one row per comment: `# | file:line | verbatim | cluster`. No comment may be silently dropped.
+5. **Do NOT start implementing** before the plan is approved via `ExitPlanMode`. Delegating reads via #0 is fine; editing source is not.
+
+The canonical shape is the `Overarching themes` table + per-cluster `**#N (verbatim):** *"…"*` anchors + final mapping table. When a comment is ambiguous, ask via `AskUserQuestion` rather than guessing.
+
+### Plan follow-up questions
+
+After you write a plan, the user may respond with questions ("why this approach?", "what about X?", "did you consider Y?") rather than approval. In that case you MUST NOT edit the plan to bake in answers. Instead:
+
+1. **Answer the question conversationally** in your text response — explain the reasoning, the tradeoffs, and what you'd recommend.
+2. **Propose options via `AskUserQuestion`** — one question per ambiguity, each with 2–4 concrete options the user can pick from. Batch related questions into one `AskUserQuestion` call.
+3. **Wait for the user's choice** before editing the plan. The plan edit then reflects the user's pick, not your assumption.
+
+Editing the plan first robs the user of the choice and forces them to diff the plan to find what you decided. Surface the decision point first.
+
+## Parallelize Independent Work
+
+Sequential is the exception, not the default. Two steps that don't consume each other's output run at the same time; when unsure whether they're independent, assume they are and fan out. The orchestrator routes and synthesizes — it never executes work a subagent could, including sustained browser automation, QA sweeps, and data extraction. Pick the surface by scale:
+
+- **Batch tool calls in one message** — the cheapest parallelism and the most missed. Independent reads, greps, globs, and read-only Bash go in a *single* message, never one per turn.
+- **Parallel subagent calls in one message** — ad-hoc independent investigations: "explore X while I check Y", multi-file reviews, independent edits. One message, N `Agent` tool uses, results gathered in parallel.
+- **Dynamic workflow** — default for substantive multi-step work; the script holds the loop, branching, and intermediate results. See CLAUDE.md `## Plan Execution & Orchestration`.
+- **Named team** — long-running peers needing agent-to-agent handoffs mid-run, via `TeamCreate`. Sized for a handful of peers; a teammate's own subagents are foreground-only, so an N-unit sweep inside a team delegates to a workflow instead of nesting `Agent` calls.
+
+Single-step exception: one task, no parallel sibling, no follow-on → one subagent call is fine.
+
+## Writing Plans
+
+When you write a plan — in plan mode, or any "here's what I'll do" before you start editing — use this shape so it's fast to scan and complete enough to execute:
+
+- **Context** — why this change: the problem or need, what prompted it, the intended outcome.
+- **Approach** — the recommended approach only (not every alternative you weighed), as ordered steps. Name the critical files to touch; for a pattern repeated across many files, describe it once with a few representative paths instead of listing them all. Cite existing utilities/patterns you'll reuse, with their paths.
+- **Potential Pitfalls** — the sharp edges specific to this work: ordering constraints, code that looks safe to change but isn't, prior art that must not be "fixed", state that diverges from how it's described. One bullet each — front-load the gotchas you'd otherwise hit mid-implementation.
+- **Workflow Plan** — required in every plan; a plan without it is incomplete. One line on what the main agent alone does (track state, dispatch, decide, report), then a `Phase | Shape | Agents | Verification` table covering every fan-out the plan anticipates: Shape is `pipeline` / `parallel` / `loop`; Agents names each phase's model and effort per the Models table (e.g. `opus xhigh ×4`, `gpt-5.6-sol via codex-wrapper ×2`, `sonnet low → codex`); Verification names the check that gates each phase's output. When nothing fans out, one line saying everything stays at the main-agent level replaces the table.
+- **Verification** — how to prove it works end to end: the exact commands to run, tests to add, and behavior to observe.
+
 ## Compact Context (ccx)
 
 `cc-context` — the `ccx` CLI and the `cc-context` MCP (its tools mirror the query surface — read, search, symbol, outline, diff, edit — plus `ccx_exec`/`ccx_exec_tools` for multi-call composition and `BashFormat` for JSON re-encoding) — is the first stop for TARGETED code questions: a file section, a symbol, a search, a diff. It returns token-bounded output (signatures + line numbers, explicit overflow, never silent truncation) instead of raw dumps, and the capt-hook `ccx` guard pack rewrites the mappable token-heavy commands (raw `grep`, bare `git diff`/`git show`, page-dump `curl`, oversized `Read`s) to their ccx equivalents in place and BLOCKS the rest. That budget discipline covers ccx itself: never re-truncate ccx output with `| head`/`| tail` — it re-introduces silent truncation and eats the overflow footer; raise `--budget`, narrow with `--section`/`--scope`, or compose with `ccx exec` (entry 14).
@@ -128,13 +149,13 @@ Single-step exception: one task, no parallel sibling, no follow-on → one subag
 4. **Literal or regex text** → `ccx code grep <text> [paths...] [--regex] [--glob G] [--scope dir] [-i] [-w]` (`--regex`/`-i`/`-w` and explicit file operands run on ripgrep; `--glob` filters within explicit paths; system `grep` fills in when `rg` is missing; a glob or scope anchored at a real path — `.venv/…/pkg/*.py` — is searched even where ignore rules would hide it)
 5. **List files** → `ccx repo find "<glob>" [--scope dir] [--budget N]` (gitignore-honoring, VCS stores skipped, sorted; budget-capped with a footer counting withheld rows and ignore-hidden files; a glob anchored at a real path — `.venv/**/*.py` — lists files ignore rules would hide; orientation is entry 1, not `"**/*"`)
 6. **Read a file** → `ccx code outline <file-or-dir>` first (ast-grep structural map for the languages it outlines and any directory, tilth signatures otherwise; top-level by default — `--deep` expands members, `--section A-B` windows a file), then `ccx code read <file> --section A-B` for the part you need (whole file: `ccx code read <file> --full`)
-7. **Edit a file** → `ccx code edit <file> --at A-B#hash --content <text>` (hash-verified write: refuses on anchor mismatch, re-anchors moved content, returns the new anchor so edits chain; `--content -` reads stdin, `--delete` removes the range)
+7. **Edit a file** → `ccx code edit <file> --at A-B#hash --content <text>` (hash-verified write: refuses on anchor mismatch, re-anchors moved content, returns the new anchor so edits chain; `--content -` reads stdin, `--delete` removes the range; `--match <text>` addresses by exact bytes instead of a span — an ambiguous match errors listing candidate anchors, `--at` scopes the scan, `--all` replaces every occurrence)
 8. **Review changes** → `ccx vcs diff [src]` (structural, jj-aware; exact hunks: `git diff -- <file>`)
 9. **Inspect one commit** → `ccx vcs show [ref]` (message + structural per-file diff; default `@-`/HEAD)
 10. **How a file evolved** → `ccx vcs history <path> [-n N]` (per-commit sha · date · subject + changed symbols)
 11. **Locate a repo/module/package on disk** → `ccx repo locate <name>` (sibling repo, Go module, or Python package by import or dist name; prints tab-separated `kind`/`path`/`version` rows — an installed Python package yields both its sibling `repo` row and its installed `package` row; exit 3 when nothing resolves)
 12. **Read installed dependency source** (`.venv`, site-packages, vendored) → `ccx repo locate <pkg>` for the on-disk path, then entries 4/6 with that path (`--scope <path>` or an anchored glob) — never raw `rg` into `.venv`
-13. **Commit, push, watch CI** → `ccx vcs ship -m "<msg>" [paths...]` (jj-aware commit + push + a watch over every workflow run on the pushed commit, in one call — per-run `workflow · conclusion · duration · url` report, plus failing jobs and a `--budget`-capped log excerpt when a run goes red; trailing paths scope the commit to just those files, leaving the rest of a shared working copy untouched, and the push only auto-advances the trunk bookmark — advancing any other needs an explicit `--bookmark <name>`)
+13. **Commit, push, watch CI** → `ccx vcs ship -m "<msg>" [paths...]` (jj-aware commit + push + a watch over every workflow run on the pushed commit, in one call — per-run `workflow · conclusion · duration · url` report, plus failing jobs and a `--budget`-capped log excerpt when a run goes red; trailing paths scope the commit to just those files, leaving the rest of a shared working copy untouched, and the push only auto-advances the trunk bookmark — advancing any other needs an explicit `--bookmark <name>`; an updated remote is handled in-call — ship fetches first and rebases the stack onto the target bookmark, rolling back and reporting a rebase that would conflict)
 14. **Compose several calls / post-process any output** → `ccx exec '<python>'` — a sandboxed script whose async host functions are every ccx query op, a gated `sh(cmd)`, and every stateless MCP server's tools (auto-reflected, no flag needed); only the script's return value enters context. Rule of thumb: one question → one ccx call (entries 1–13, 15–18); a pipeline, filter, fan-out, or any output you'd immediately post-process (project a JSON blob, sweep signatures across files, join search hits) → exec. Discover the host functions and the Python-subset rules with `ccx exec --list-tools` (MCP: `ccx_exec_tools`), once per session.
 15. **Re-encode JSON tool output** → `ccx format -- <cmd>` (or `… | ccx format`) — a shape classifier picks the leanest encoding (prose, markdown table, CSV/TSV, TOON, TRON, JSONL, or compact JSON), never larger than compact JSON by bytes; `--format=X` forces one encoder
 16. **Map a web page** → `ccx web outline <url>` (heading tree with stable `§` section refs; pages cache 24h, `--refresh` refetches)
@@ -146,3 +167,7 @@ Entries 9–13 are CLI-only (entry 12's `locate` step included) — the MCP mirr
 Durable prose — plans, reviews, memory files — cites code as `path:line#hash` (e.g. `internal/render/finalize.go:31#k2fa`); any later session resolves the cite statelessly with ccx, because the hash re-anchors by content even after the file drifts.
 
 Reach for your **LSP** when the answer must be exhaustive/structural (findReferences, rename, goToImplementation) — and verify any complete-set answer ("every subclass", "every importer") by reading the candidate files: bounded views optimize for precision, not exhaustiveness. Use **Grep/Glob** or `rg` only for literal content in non-source files (logs, JSON, YAML) — on source, raw `rg` is gated the same as raw `grep`.
+
+**Version control.** This repo is a colocated `jj` repo over git — prefer `jj` (`jj describe` / `jj commit`, `jj git push`) over raw `git` for day-to-day work. Commits stay atomic and scoped: one logical change each. For the routine commit, push, and watch-CI cycle, `ccx vcs ship -m "<msg>"` runs the whole dance in one call — a jj-aware commit, the push, and a watch over every workflow run on the pushed commit, with a per-run report and failure logs — instead of the three-to-six Bash calls by hand. A working copy shared with a concurrent session is no reason to bypass ship: `ccx vcs ship -m "<msg>" <paths...>` commits only your paths and leaves the rest of `@` untouched. The push only auto-advances the trunk bookmark — parked on someone else's bookmark, ship refuses, and `--bookmark <name>` advances a non-trunk bookmark deliberately. Drop to the manual `jj` steps when ship still doesn't fit, like a multi-commit split. An updated remote is not one of those cases: ship fetches first and rebases the stack onto the target bookmark itself, rolling back and reporting a rebase that would conflict. The manual recovery — `jj git fetch` then `jj rebase` (your in-flight `@` rides along untouched) — remains for non-ship flows and for resolving a conflicted rebase ship refused; never `git stash` or a worktree + cherry-pick dance.
+
+**Watch CI after every push.** A push that kicks off CI isn't done until every run is green. `ccx vcs ship` folds this in — it pushes, then watches every workflow run on the pushed commit (found by `--commit`, retrying registration for up to a minute) and reports each run's conclusion, duration, and URL, plus failing jobs and a `--budget`-capped log excerpt when a run goes red; on a terminal the watch streams live. A `CI error` segment means the watch itself hit an infra failure after a successful push — the report's `check:` line says how to resume, and re-running ship would cut a new commit. For a push ship didn't make, watch the run to completion yourself before you stop — `gh run watch "$(gh run list -L1 --json databaseId -q '.[0].databaseId')" --exit-status` — and never walk away from a red run: when the failures are mechanical (lint, format, vet — pre-existing baseline debt included), fix them forward in an immediate follow-up commit; report-only (a cc-notes bug) is reserved for failures that need a design or owner decision. (`--exit-status` exits non-zero when the run fails; give the run a moment to register before watching.)

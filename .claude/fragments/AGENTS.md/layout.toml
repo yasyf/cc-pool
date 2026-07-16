@@ -1,6 +1,11 @@
 fragments = [
   "cc-pool-guide",
+  "cc-skills:ask-before-assuming",
+  "cc-skills:code-review-response",
+  "cc-skills:parallelize",
+  "cc-skills:writing-plans",
   "cc-skills:ccx",
+  "cc-skills:version-control",
 ]
 
 [sources.cc-skills]

@@ -76,33 +76,6 @@ Safety rules baked into the architecture — do not regress them:
 3. **Account dir strings are hashed for Keychain service names** — the path string `ccp` emits and the string hashed must stay byte-identical. No realpath/normalization divergence.
 4. **Fuse mounts are hosted by a detached cc-pool mount-holder process** (socket `~/.cc-pool/mounts.sock`); daemon restarts/upgrades never disturb mounts. The holder is only replaced when no live sessions exist (or `ccp service uninstall --force`).
 
-## Ask Before Assuming
-
-When a request is ambiguous — unclear scope, multiple plausible interpretations, undefined edge cases — stop and ask. Propose 2–4 concrete options, or list the assumptions you'd otherwise make. One wrong implementation costs more than ten clarifying exchanges.
-
-## Code Review Response (Plan Re-Entry)
-
-When the user reviews your code and re-enters plan mode (inline diff comments, a numbered list of issues, or other review-shaped feedback):
-
-1. **Draft a new plan**, not a code change — re-entry means "align on what you'll do next."
-2. **Inline every comment verbatim** with an anchor (`#N`, file:line). Never paraphrase; the user must see each comment reproduced exactly.
-3. **Cluster into themes when >5 comments**, and extrapolate each rule to other call sites with the same problem.
-4. **Map every comment** in a final table: `# | file:line | verbatim | cluster`. No comment silently dropped.
-5. **Don't implement before approval.**
-
-If the user responds to a plan with questions, answer conversationally and surface choices via AskUserQuestion — don't bake answers into the plan before they choose.
-
-## Parallelize Independent Work
-
-Sequential is the exception, not the default. Two steps that don't consume each other's output run at the same time; when unsure whether they're independent, assume they are and fan out. The orchestrator routes and synthesizes — it never executes work a subagent could. Pick the surface by scale:
-
-- **Batch tool calls in one message** — the cheapest parallelism and the most missed. Independent reads, greps, globs, and read-only Bash go in a *single* message, never one per turn.
-- **Parallel subagent calls in one message** — ad-hoc independent investigations: "explore X while I check Y", multi-file reviews, independent edits. One message, N `Agent` tool uses, results gathered in parallel.
-- **Dynamic workflow** — default for substantive multi-step work; the script holds the loop, branching, and intermediate results. See CLAUDE.md `## Plan Execution & Orchestration`.
-- **Named team** — long-running peers needing agent-to-agent handoffs mid-run, via `TeamCreate`.
-
-Single-step exception: one task, no parallel sibling, no follow-on → one subagent call is fine.
-
 ## Style Rules (summary — see STYLEGUIDE.md)
 
 - **Fail fast, fail loud.** No silent fallbacks, sentinels, or defensive coding. No back-compat shims — delete dead code.
