@@ -567,17 +567,17 @@ func TestRunFPConsent(t *testing.T) {
 			state:   fpDaemonState{alive: false, bridgeUp: ptr(false)},
 			wantErr: []string{"isn't running", "ccp service install", "ccp doctor"},
 		},
-		"pending bind means an unbundled build": {
+		"pending bind means an unprofiled build": {
 			state:   fpDaemonState{alive: true, pending: true, bridgeUp: ptr(false)},
-			wantErr: []string{"still pending", "unbundled build", "ccp service install"},
+			wantErr: []string{"still pending", "unprofiled build", "ccp service install"},
 		},
 		"bridge not accepting points at doctor": {
 			state:   fpDaemonState{alive: true, bridgeUp: ptr(false)},
 			wantErr: []string{"isn't accepting yet", "ccp doctor"},
 		},
-		"unreported bridge on a live daemon points at doctor": {
+		"unreported bridge on a live daemon prescribes a restart": {
 			state:   fpDaemonState{alive: true, bridgeUp: nil},
-			wantErr: []string{"isn't accepting yet", "ccp doctor"},
+			wantErr: []string{"status is unknown", "brew services restart cc-pool", "ccp doctor"},
 		},
 	}
 	for name, tc := range cases {

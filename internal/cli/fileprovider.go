@@ -170,7 +170,9 @@ func runFPConsent(cmd *cobra.Command) error {
 	case !alive:
 		return errors.New("the cc-pool daemon isn't running, so its File Provider bridge can't come up — start it with `ccp service install`, then run `ccp doctor`")
 	case consentPending:
-		return errors.New("the daemon is up but its File Provider bridge bind is still pending — release daemons bind prompt-free from the signed CCPoolDaemon.app bundle, so a pending bind means an unbundled build; reinstall with `ccp service install`, then run `ccp doctor`")
+		return errors.New("the daemon is up but its File Provider bridge bind is still pending — release daemons bind prompt-free from the signed CCPoolDaemon.app bundle, so a pending bind means an unprofiled build (bundled but missing the embedded Developer ID profile); reinstall with `ccp service install`, then run `ccp doctor`")
+	case bridgeUp == nil:
+		return errors.New("the daemon is up but its File Provider bridge status is unknown — the running daemon predates bridge reporting (pre-v0.49.1) or its status is unavailable; restart it (`brew services restart cc-pool`) so the upgraded daemon takes over, then run `ccp doctor`")
 	default:
 		return errors.New("the daemon is up but its File Provider bridge isn't accepting yet — run `ccp doctor` to diagnose; if it persists, reinstall with `ccp service install`")
 	}
