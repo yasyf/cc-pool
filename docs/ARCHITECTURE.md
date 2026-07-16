@@ -67,20 +67,33 @@ Privacy (TCC) grants across this stack are engineered to be one-time, and durabi
 depends on how tccd keys each grant. **fusekit-holder** (`com.yasyf.fusekit-holder`)
 performs the NFS mounts, so a single *Network Volumes* grant covers every consumer; it
 survives upgrades because the holder is an app bundle at a fixed `/Applications` path,
-which tccd keys by identifier. cc-pool is a bare executable, and tccd keys a bare
-executable's grants by its **resolved path** — the dotted signing identifier lands in the
-grant's code requirement (any Developer ID release satisfies it) but not in the lookup
-key — so a grant made against a per-version Homebrew keg path dies on every upgrade. The
-daemon therefore runs from a signed **CCPoolDaemon.app** bundle inside the Homebrew keg's
-`libexec` (`<keg>/libexec/CCPoolDaemon.app/Contents/MacOS/cc-pool`): its app-group
-entitlement plus an embedded Developer ID provisioning profile grant prompt-free
-group-container access for the File Provider bridge, and tccd keys the bundle by
-identifier like the holder app rather than by keg path — the durable replacement for the
-retired `~/.cc-pool/bin` stable-path re-exec. The daemon is the only process that touches
-the group container — the CLI reads bridge health from the daemon. Two residuals
-still re-prompt: the interactive CLI runs from the keg path, so *Network Volumes* grants
-for its deep-probe reads through fuse mounts stay per-version, and unsigned local builds
-carry a per-build cdhash requirement.
+which tccd keys by identifier.
+
+The File Provider bridge is TCC-gated the same way. The daemon binds a socket inside the
+App Group container (`~/Library/Group Containers/SXKCTF23Q2.ccp/`), and on macOS 15+ a
+process touching a group container without the `application-groups` entitlement trips a
+consent prompt. tccd keys a **bare** executable's grants by resolved path — the dotted
+signing identifier lands in the grant's code requirement but not the lookup key — so a
+grant made against a per-version Homebrew keg path would die on every upgrade. The daemon
+therefore does not run as a bare binary: it ships as **CCPoolDaemon.app**
+(`com.yasyf.cc-pool.daemon`), a minimal Developer ID-signed bundle installed at the stable
+`libexec/CCPoolDaemon.app` opt path, and tccd keys a bundle's grants by identifier —
+durable across upgrades. The bundle resolves the container at runtime via
+`containerURLForSecurityApplicationGroupIdentifier:` (never a raw path join), the
+resolution Apple's no-prompt contract requires, and embeds a Developer ID provisioning
+profile authorizing its App Group claim — the profile is what turns the first
+group-container access into a silent grant rather than a prompt (a Developer ID app-group
+entitlement without an embedded profile still prompts). All three App Group members carry
+an embedded profile: the CCPoolStatus host app, the File Provider appex, and the daemon
+bundle.
+
+The daemon is the only process that touches the group container — the CLI reads bridge
+health from the daemon — so the interactive CLI needs no app-group grant and carries no
+such entitlement. One bare-path residual remains: the CLI runs from the keg path and does
+its own deep-probe reads through fuse mounts, so its *Network Volumes* grant stays
+per-version; unsigned local (HEAD) builds also carry a per-build cdhash requirement, and a
+HEAD daemon bundle is signed without a profile, so its group-container access can still
+prompt.
 
 A few entries stay per-account instead of shared: `daemon/` and `ide/` (Claude's PID-keyed
 supervisor and IDE lock/socket files, which would collide across concurrent sessions),
