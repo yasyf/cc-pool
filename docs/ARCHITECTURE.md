@@ -73,21 +73,21 @@ The File Provider bridge is TCC-gated the same way. The daemon binds a socket in
 App Group container (`~/Library/Group Containers/SXKCTF23Q2.ccp/`), and on macOS 15+ a
 process touching a group container without the `application-groups` entitlement trips a
 consent prompt. tccd keys a **bare** executable's grants by resolved path — the dotted
-signing identifier lands in the grant's code requirement but not the lookup key — so a
-grant made against a per-version Homebrew keg path would die on every upgrade. The daemon
-therefore does not run as a bare binary: it ships as **CCPoolDaemon.app**
-(`com.yasyf.cc-pool.daemon`), a minimal Developer ID-signed bundle installed at the stable
-`libexec/CCPoolDaemon.app` opt path, and tccd keys a bundle's grants by identifier —
-durable across upgrades. The daemon stays pure Go (`CGO_ENABLED=0`): it resolves the
-container at runtime through `containerURLForSecurityApplicationGroupIdentifier:`
-(fusekit's `appgroup` package, objc over purego — no cgo) and joins the socket leaf onto
-the resolved dir; the hand-built `pool.FPBridgeSocketPath` join survives for display and
-diagnostics only. That resolution plus the bundle's embedded Developer ID provisioning
-profile authorizing its App Group claim is what makes the first group-container access a
-silent grant instead of a prompt — a Developer ID app-group entitlement without a
-profile, or a hand-built container path, still prompts. All three App Group members carry
-an embedded profile: the CCPoolStatus host app, the File Provider appex, and the daemon
-bundle.
+signing identifier lands in the grant's code requirement (any Developer ID release
+satisfies it) but not the lookup key — so a grant made against a per-version Homebrew keg
+path would die on every upgrade. The daemon therefore does not run as a bare binary: it
+ships as **CCPoolDaemon.app** (`com.yasyf.cc-pool.daemon`), a minimal Developer ID-signed
+bundle installed at the stable `libexec/CCPoolDaemon.app` opt path, and tccd keys a
+bundle's grants by identifier — durable across upgrades. The daemon stays pure Go
+(`CGO_ENABLED=0`): it resolves the container at runtime through
+`containerURLForSecurityApplicationGroupIdentifier:` (fusekit's `appgroup` package, objc
+over purego — no cgo) and joins the socket leaf onto the resolved dir; the hand-built
+`pool.FPBridgeSocketPath` join survives for display and diagnostics only. That resolution
+plus the bundle's embedded Developer ID provisioning profile authorizing its App Group
+claim is what makes the first group-container access a silent grant instead of a prompt —
+a Developer ID app-group entitlement without a profile, or a hand-built container path,
+still prompts. All three App Group members carry an embedded profile: the CCPoolStatus
+host app, the File Provider appex, and the daemon bundle.
 
 The daemon is the only process that touches the group container — the CLI reads bridge
 health from the daemon — so the interactive CLI needs no app-group grant and carries no
