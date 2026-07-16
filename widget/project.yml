@@ -79,6 +79,13 @@ targets:
     settings:
       base:
         PRODUCT_NAME: CCPoolStatus
+        # Manual signing with an embedded Developer ID provisioning profile: the
+        # profile authorizes the App Group claim, which turns the first
+        # group-container access into a silent (no-prompt) TCC grant. Release CI
+        # installs this profile into ~/Library/MobileDevice/Provisioning Profiles/
+        # so xcodebuild resolves it by name. The ad-hoc CCPoolStatus flavor has no
+        # profile and stays local-only.
+        PROVISIONING_PROFILE_SPECIFIER: "cc-pool Status Host DevID"
     dependencies:
       - target: CCPoolFileProvider
         embed: true
@@ -141,8 +148,8 @@ targets:
     entitlements:
       # Sandboxed (required for appexes); the read-write exception resolves
       # against the REAL home (paired with getpwuid in Swift). NO
-      # fileprovider.testing-mode — restricted, would force a provisioning
-      # profile and break the no-profile Developer ID release.
+      # fileprovider.testing-mode — a restricted entitlement the Developer ID
+      # provisioning profile does not authorize (and Apple gates it).
       path: Generated/FileProvider.entitlements
       properties:
         com.apple.security.app-sandbox: true
@@ -156,6 +163,11 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.yasyf.cc-pool.status.fileprovider
         SKIP_INSTALL: true
+        # Embedded Developer ID profile authorizing this appex's App Group claim —
+        # the no-prompt grant for the File Provider group container (same reason as
+        # the host app). The Notification Center widget appex carries no profile: it
+        # has no App Group and no restricted entitlements.
+        PROVISIONING_PROFILE_SPECIFIER: "cc-pool FileProvider DevID"
 
   CCPoolStatusTests:
     # Host-less unit-test bundle for PURE logic only. It compiles the code
