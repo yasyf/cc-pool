@@ -35,6 +35,7 @@ require (
 	github.com/clipperhouse/displaywidth v0.11.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/gofrs/flock v0.13.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -60,3 +61,9 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+// TEMPORARY: consent-fix/go-rewire consumes fusekit's unreleased appgroup
+// package (GroupContainerDir). The orchestrator swaps this for the released
+// fusekit version once the appgroup capability ships. Do NOT merge with this
+// replace in place.
+replace github.com/yasyf/fusekit => /Users/yasyf/Code/.wt/fusekit-groupcontainer
