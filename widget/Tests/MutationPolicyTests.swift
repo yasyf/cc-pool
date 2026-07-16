@@ -111,6 +111,23 @@ final class MutationPolicyTests: XCTestCase {
         XCTAssertFalse(MutationResult.unchanged(item(.priv("x"))).shouldFetchContent)
     }
 
+    func testClaudeJSONCommitPersistsPrivatelyBeforeLocalAnnouncement() throws {
+        var events: [String] = []
+        let coordinator = SynthMutationCoordinator(operations: operations(
+            write: { _, _ in events.append("write") },
+            persistPrivate: { _, _ in events.append("persist-private") },
+            lookup: { _ in
+                events.append("lookup")
+                return self.item(.computed(".claude.json"))
+            },
+            announce: { events.append("announce-local") }))
+
+        _ = try coordinator.commit(
+            name: ".claude.json", data: Data("{}".utf8), removing: nil)
+
+        XCTAssertEqual(events, ["write", "persist-private", "lookup", "announce-local"])
+    }
+
     func testComputedDeletionInvalidatesBothAnchorsAndCompletesBeforeSignals() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("ccp-mutation-tests-" + UUID().uuidString, isDirectory: true)

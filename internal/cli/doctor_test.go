@@ -1299,7 +1299,7 @@ func TestDoctorHealReportsDiscardedDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := symProv.Setup(base, dir); err != nil {
+	if err := symProv.Reconcile(t.Context(), base, dir); err != nil {
 		t.Fatal(err)
 	}
 

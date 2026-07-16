@@ -19,6 +19,7 @@ const (
 		"projects": {"/acct":{"history":["mine"]}},
 		"firstStartTime": "2026-01-01T00:00:00Z",
 		"numStartups": 7,
+		"pluginUsage": {"plugin-a":{"count":7}},
 		"acctOnly": "survives"
 	}`
 	mergeBase = `{
@@ -30,7 +31,8 @@ const (
 		"anonymousId": "base-anon",
 		"projects": {"/base":{"history":["theirs"]}},
 		"firstStartTime": "2020-01-01T00:00:00Z",
-		"numStartups": 9999
+		"numStartups": 9999,
+		"pluginUsage": {"plugin-a":{"count":9999}}
 	}`
 )
 
@@ -81,12 +83,13 @@ func TestMergeClaudeJSON(t *testing.T) {
 				"projects":       `{"/acct":{"history":["mine"]}}`,
 				"firstStartTime": `"2026-01-01T00:00:00Z"`,
 				"numStartups":    `7`,
+				"pluginUsage":    `{"plugin-a":{"count":7}}`,
 			},
 		},
 		"base oauthAccount never leaks into a private file lacking one": {
 			private: `{"theme": "dark"}`, base: mergeBase, wantChanged: true,
 			want:   map[string]string{"theme": `"light"`},
-			absent: []string{"oauthAccount", "userID", "anonymousId", "projects", "firstStartTime", "numStartups"},
+			absent: []string{"oauthAccount", "userID", "anonymousId", "projects", "firstStartTime", "numStartups", "pluginUsage"},
 		},
 		"private-only key shows through": {
 			private: mergePrivate, base: mergeBase, wantChanged: true,

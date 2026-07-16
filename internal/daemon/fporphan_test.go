@@ -27,12 +27,19 @@ type fakeReapFP struct {
 	beforeRoot    func(dir string)
 }
 
-func (f *fakeReapFP) Backend() fkoverlay.Backend           { return fkoverlay.BackendFileProvider }
-func (f *fakeReapFP) PrivateRoot(dir string) string        { return fkoverlay.FusePrivateRoot(dir) }
-func (f *fakeReapFP) Health(_, _ string) error             { return nil }
-func (f *fakeReapFP) Sync(_, _ string) error               { return nil }
-func (f *fakeReapFP) Setup(_, _ string) error              { return nil }
-func (f *fakeReapFP) Teardown(_, _ string) (string, error) { return "", nil }
+func (f *fakeReapFP) Backend() fkoverlay.Backend    { return fkoverlay.BackendFileProvider }
+func (f *fakeReapFP) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
+func (f *fakeReapFP) Check(context.Context, string, string) error {
+	return nil
+}
+
+func (f *fakeReapFP) Reconcile(context.Context, string, string) error {
+	return nil
+}
+
+func (f *fakeReapFP) Teardown(context.Context, string, string) (string, error) {
+	return "", nil
+}
 
 func (f *fakeReapFP) DomainRoot(_ context.Context, dir string) (string, error) {
 	if f.beforeRoot != nil {
@@ -48,7 +55,7 @@ func (f *fakeReapFP) DomainRoot(_ context.Context, dir string) (string, error) {
 	return "/domain/" + base, nil
 }
 
-func (f *fakeReapFP) RemoveDomain(dir string) error {
+func (f *fakeReapFP) RemoveDomain(_ context.Context, dir string) error {
 	f.removes = append(f.removes, dir)
 	if f.removeErr != nil {
 		return f.removeErr

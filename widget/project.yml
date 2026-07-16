@@ -42,7 +42,6 @@ targetTemplates:
         # chronod caches widget metadata keyed by bundle version.
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        CCPoolAppGroupIdentifier: $(TeamIdentifierPrefix)ccp
         LSUIElement: true # agent app: no Dock icon, no menu bar
         LSApplicationCategoryType: public.app-category.developer-tools
     settings:
@@ -61,8 +60,8 @@ targets:
     templates: [HostApp]
     info:
       path: Generated/App-Info.plist
-    # The host app is deliberately NOT sandboxed (non-App-Store): its file
-    # watcher needs to observe ~/.cc-pool freely. No entitlements file.
+    # The host app is deliberately NOT sandboxed (non-App-Store). No
+    # entitlements file.
 
   CCPoolStatusFP:
     # File-Provider-enabled host flavor: same bundle id, and PRODUCT_NAME pins

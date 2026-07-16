@@ -150,7 +150,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 
 	if checkDuplicate(cmd, m, pending, opts) {
 		note(out, "Skipped; didn't add a duplicate.")
-		if aerr := m.AbandonAdd(pending); aerr != nil {
+		if aerr := m.AbandonAdd(cmd.Context(), pending); aerr != nil {
 			warn(cmd.ErrOrStderr(), "cleanup failed: %v", aerr)
 		}
 		return nil, errAddSkipped
@@ -175,7 +175,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 		} else {
 			fail(cmd.ErrOrStderr(), "couldn't finish adding the account: %v", err)
 			if shouldAbandon(cmd) {
-				if aerr := m.AbandonAdd(pending); aerr != nil {
+				if aerr := m.AbandonAdd(cmd.Context(), pending); aerr != nil {
 					warn(cmd.ErrOrStderr(), "cleanup failed: %v", aerr)
 				} else {
 					step(out, "Rolled back the account.")

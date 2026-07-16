@@ -19,12 +19,13 @@ import (
 
 type orphanProviderBase struct{}
 
-func (*orphanProviderBase) Backend() fkoverlay.Backend           { return fkoverlay.BackendFileProvider }
-func (*orphanProviderBase) PrivateRoot(dir string) string        { return fkoverlay.FusePrivateRoot(dir) }
-func (*orphanProviderBase) Health(_, _ string) error             { return nil }
-func (*orphanProviderBase) Sync(_, _ string) error               { return nil }
-func (*orphanProviderBase) Teardown(_, _ string) (string, error) { return "", nil }
-func (*orphanProviderBase) Setup(_, _ string) error              { return nil }
+func (*orphanProviderBase) Backend() fkoverlay.Backend                      { return fkoverlay.BackendFileProvider }
+func (*orphanProviderBase) PrivateRoot(dir string) string                   { return fkoverlay.FusePrivateRoot(dir) }
+func (*orphanProviderBase) Reconcile(context.Context, string, string) error { return nil }
+func (*orphanProviderBase) Check(context.Context, string, string) error     { return nil }
+func (*orphanProviderBase) Teardown(context.Context, string, string) (string, error) {
+	return "", nil
+}
 
 // orphanFP is a File Provider provider whose zero-spawn DomainRoot registration
 // query and RemoveDomain are scriptable, so orphan reconciliation never registers
@@ -53,7 +54,7 @@ func (f *orphanFP) DomainRoot(_ context.Context, accountDir string) (string, err
 	return f.root, nil
 }
 
-func (f *orphanFP) RemoveDomain(accountDir string) error {
+func (f *orphanFP) RemoveDomain(_ context.Context, accountDir string) error {
 	f.removed++
 	f.removeDirs = append(f.removeDirs, accountDir)
 	return f.removeErr

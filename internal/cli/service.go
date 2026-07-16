@@ -411,7 +411,7 @@ func purgeAll(cmd *cobra.Command) error {
 			return err
 		}
 		for _, a := range accts {
-			if err := m.Remove(a.ID, true); err != nil {
+			if err := m.Remove(cmd.Context(), a.ID, true); err != nil {
 				warn(cmd.ErrOrStderr(), "couldn't remove acct-%02d: %v", a.ID, err)
 			}
 		}

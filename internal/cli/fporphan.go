@@ -138,12 +138,12 @@ func reconcileOrphanFPDomain(ctx context.Context, m *pool.Manager, id int, dir s
 	// Re-confirm against fresh state, adjacent to the remove: in the scan→now window a
 	// concurrent add can reuse the freed index and adopt this domain, so a snapshot
 	// verdict would deregister a live account's. (Racing the earlier reserve→seed gap is
-	// harmless — fusekit Setup re-registers an absent domain — only this window matters.)
+	// harmless — fusekit Reconcile re-registers an absent domain — only this window matters.)
 	if advisory, ok := reconfirmOrphanFPDomain(ctx, m, id, dir, registry); !ok {
 		report(label, false, advisory)
 		return
 	}
-	if err := remover.RemoveDomain(dir); err != nil {
+	if err := remover.RemoveDomain(ctx, dir); err != nil {
 		report(label, false, fmt.Sprintf("couldn't remove orphaned File Provider domain %s: %v", folder, err))
 		return
 	}

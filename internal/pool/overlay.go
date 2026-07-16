@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
-	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"golang.org/x/mod/semver"
@@ -61,10 +60,10 @@ func WidgetVersionSupported(version string) bool {
 // until `brew upgrade --cask fusekit-holder`.
 var ErrHolderUnsupported = errors.New("mount holder lacks a required capability")
 
-// ErrMountedUnverified means a fuse Setup failed AFTER the holder reported the mount
-// live (a lost ack, or a mid-Setup protocol mismatch): the mount is up but unverified,
+// ErrMountedUnverified means a fuse Reconcile failed AFTER the holder reported the mount
+// live (a lost ack, or a mid-Reconcile protocol mismatch): the mount is up but unverified,
 // so the caller must reclaim it before any fallback rather than strand a rowless mount.
-var ErrMountedUnverified = errors.New("fuse mount is live but its setup did not complete")
+var ErrMountedUnverified = errors.New("fuse mount is live but its reconcile did not complete")
 
 // holderHello negotiates the shared holder's capabilities via OpHello; a var so
 // tests can fake an old, current, or absent holder.
@@ -85,21 +84,21 @@ var holderMounts = func() ([]mountd.MountInfo, error) {
 // featureGate wraps the remote fuse provider so every mount entry point (`ccp
 // add`/`ccp init`, migrate's conversion, the daemon's heal loop) refuses to mount
 // through a holder missing a required capability — replacing version arithmetic
-// with the feature handshake. ONLY Setup is gated: Teardown, Health, and Sync must
-// keep working against ANY reachable holder — gating Teardown would strand a
+// with the feature handshake. ONLY Reconcile is gated: Teardown and Check must keep
+// working against ANY reachable holder — gating Teardown would strand a
 // conversion's identity when its rollback cleanup-teardown is refused, and could
 // unmount under a live session through a holder cc-pool distrusts.
 type featureGate struct {
 	fkoverlay.Provider
 	hello func() (*mountd.HelloInfo, error)
-	// mounts lists the holder's live mounts, so Setup can tell a mount that came up
+	// mounts lists the holder's live mounts, so Reconcile can tell a mount that came up
 	// then errored (a lost ack) from one that never mounted. Nil ⇒ dirMounted reads
 	// false, so a bare-provider test never spuriously reports a live mount.
 	mounts func() ([]mountd.MountInfo, error)
 }
 
 // dirMounted reports whether the holder's mount list currently carries dir — the
-// source of truth for "did the inner Setup actually mount". False on a nil seam or any
+// source of truth for "did the inner Reconcile actually mount". False on a nil seam or any
 // list error (an unreachable holder can hold no mount cc-pool could reclaim anyway).
 func (g featureGate) dirMounted(dir string) bool {
 	if g.mounts == nil {
@@ -124,8 +123,8 @@ func (g featureGate) dirMounted(dir string) bool {
 // requireHolder negotiates HolderMountFeatures: a reachable holder missing one (or
 // a proto-mismatched one) is refused with ErrHolderUnsupported; an unreachable
 // holder (still spawning, or not running) returns nil so the caller falls through.
-// This is the PRE-Setup check — an unreachable holder here is a cold start whose
-// remedy IS the spawn Provider.Setup performs, so it fails open.
+// This is the pre-Reconcile check — an unreachable holder here is a cold start whose
+// remedy IS the spawn Provider.Reconcile performs, so it fails open.
 func (g featureGate) requireHolder() error {
 	switch info, herr := g.hello(); {
 	case herr == nil:
@@ -140,23 +139,26 @@ func (g featureGate) requireHolder() error {
 	}
 }
 
-// holderVerifyTimeout bounds the post-Setup capability re-check's retry: the holder
+// holderVerifyTimeout bounds the post-Reconcile capability re-check's retry: the holder
 // that mounted was reachable moments ago, so a brief unavailability is a restart race
 // the cask relauncher closes; past this window an unverifiable holder fails closed. A
 // var so tests can shrink it.
 var holderVerifyTimeout = mountd.DefaultSpawnTimeout
 
-// holderVerifyPoll is the post-Setup re-check poll interval.
+// holderVerifyPoll is the post-Reconcile re-check poll interval.
 const holderVerifyPoll = 100 * time.Millisecond
 
-// requireHolderVerified is the POST-Setup check: unlike requireHolder it is
+// requireHolderVerified is the post-Reconcile check: unlike requireHolder it is
 // MANDATORY. A reachable holder is negotiated as usual; a momentarily-unreachable one
 // is retried within holderVerifyTimeout (the mount is already live, so its holder was
 // reachable moments ago), and a holder that never answers within the window FAILS
 // CLOSED — the mount is unverified and left for the caller's rollback to tear down.
-func (g featureGate) requireHolderVerified() error {
+func (g featureGate) requireHolderVerified(ctx context.Context) error {
 	deadline := time.Now().Add(holderVerifyTimeout)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		switch info, herr := g.hello(); {
 		case herr == nil:
 			if ferr := info.Require(HolderMountFeatures...); ferr != nil {
@@ -169,46 +171,50 @@ func (g featureGate) requireHolderVerified() error {
 			if time.Now().After(deadline) {
 				return fmt.Errorf("%w: the mount holder did not answer a capability handshake after mounting (%w) — the mount is unverified; run `ccp doctor`", ErrHolderUnsupported, herr)
 			}
-			time.Sleep(holderVerifyPoll)
+			timer := time.NewTimer(holderVerifyPoll)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 }
 
-// Setup refuses a reachable-but-underfeatured (or proto-mismatched) holder BEFORE
-// mounting, then — because the pre-check's holder may have exited and Setup
+// Reconcile refuses a reachable-but-underfeatured (or proto-mismatched) holder BEFORE
+// mounting, then — because the pre-check's holder may have exited and Reconcile
 // spawned/attached a DIFFERENT one, or the pre-check was unreachable (cold start) —
 // MANDATORILY re-negotiates against the holder that actually mounted (bounded retry,
 // then fail closed). A post-mount refusal returns ErrHolderUnsupported and LEAVES the
 // mount for the caller's rollback (or the daemon reconcile) to tear down through a
 // supported holder: an unmount here, through a holder cc-pool distrusts, could race a
 // live session onto the kernel force-unmount panic.
-func (g featureGate) Setup(base, dir string) error {
+func (g featureGate) Reconcile(ctx context.Context, base, dir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := g.requireHolder(); err != nil {
 		return err // PRE-mount refusal: nothing mounted
 	}
-	if setupErr := g.Provider.Setup(base, dir); setupErr != nil {
+	if reconcileErr := g.Provider.Reconcile(ctx, base, dir); reconcileErr != nil {
 		// The mount may be live despite the failure — a lost ack after the holder
-		// mounted, or a mid-Setup protocol mismatch. Consult the holder's mount list;
+		// mounted, or a mid-Reconcile protocol mismatch. Consult the holder's mount list;
 		// if dir is mounted, mark the failure POST-mount so the caller reclaims it
 		// before any fallback rather than strand a rowless live mount. A dir that never
 		// mounted is a clean pre-mount miss the caller falls back from.
 		if g.dirMounted(dir) {
-			return fmt.Errorf("%w: %w", ErrMountedUnverified, setupErr)
+			return fmt.Errorf("%w: %w", ErrMountedUnverified, reconcileErr)
 		}
-		return setupErr
+		return reconcileErr
 	}
-	return g.requireHolderVerified()
+	return g.requireHolderVerified(ctx)
 }
 
-// overlaySpec builds cc-pool's fusekit/overlay Spec with no content source (the
-// CLI default: an unconditional FP enumerator signal).
-func overlaySpec() fkoverlay.Spec { return overlaySpecWithSource(nil) }
-
-// overlaySpecWithSource builds cc-pool's fusekit/overlay Spec, wiring src into the
-// File Provider backend so its enumerator signal is fingerprint-gated (nil leaves it
-// unconditional). PassthroughOnly is false because cc-pool serves synthetic content
-// (the merged /.claude.json), forcing fuse-t's NFS backend.
-func overlaySpecWithSource(src content.Source) fkoverlay.Spec {
+// overlaySpec builds cc-pool's fusekit/overlay Spec. PassthroughOnly is false
+// because cc-pool serves synthetic content (the merged /.claude.json), forcing
+// fuse-t's NFS backend.
+func overlaySpec() fkoverlay.Spec {
 	socket := mountd.DefaultHolderSocket()
 	return fkoverlay.Spec{
 		IsPrivate:       overlay.PrivateEntry,
@@ -248,12 +254,9 @@ func overlaySpecWithSource(src content.Source) fkoverlay.Spec {
 			ExtensionBundleID: FPExtensionBundleID,
 			AppGroup:          AppGroupID,
 			SpawnTimeout:      30 * time.Second,
-			// Setup fails loud (never a silent raw-read fallback) when the companion
+			// Reconcile fails loud (never a silent raw-read fallback) when the companion
 			// app is too old to answer probe-domain; the hint names the cask upgrade.
 			UpgradeHint: "upgrade the cc-pool-status cask (brew upgrade --cask cc-pool-status)",
-			// Source gates the enumerator signal on a content-fingerprint change; nil
-			// (the CLI) keeps the unconditional signal-every-Sync.
-			Source: src,
 		},
 	}
 }

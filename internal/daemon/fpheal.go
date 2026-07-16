@@ -104,7 +104,7 @@ func (s *Server) fpRecordAttempt(dir string, now time.Time) (attempt int, trippe
 
 // fpAttemptsSoFar reports how many recovery attempts dir has consumed; 0 if the
 // domain is healthy or never attempted. The heal ladder reads it to pick the next
-// step (Sync vs re-register vs breaker).
+// step (reconcile vs re-register vs breaker).
 func (s *Server) fpAttemptsSoFar(dir string) int {
 	if !s.fpEnabled() {
 		return 0
@@ -141,9 +141,8 @@ func (s *Server) fpParked(dir string) bool {
 	return s.led.parked(fpDomainPolicy, dir)
 }
 
-// fpProbeClockDue reports whether dir's last periodic re-probe is at least interval
-// old (a never-probed dir is immediately due) — the cadence gate for the healthy
-// deep check and the parked re-probe.
+// fpProbeClockDue reports whether dir's last parked recovery probe is at least
+// interval old. Healthy domains are never probed by maintenance.
 func (s *Server) fpProbeClockDue(dir string, now time.Time, interval time.Duration) bool {
 	s.fpProbeClockMu.Lock()
 	defer s.fpProbeClockMu.Unlock()
@@ -214,7 +213,7 @@ func fpProberFor() (overlay.FPDomainProber, error) {
 }
 
 // fpDirLinked reports whether an FP account dir is currently its live domain
-// bridge symlink (Setup makes accountDir a symlink INTO the domain root). A
+// bridge symlink (Reconcile makes accountDir a symlink INTO the domain root). A
 // mid-conversion real dir or an absent path is not probeable — reading it would
 // misclassify a benign transient as a wedge. A package var so heal tests drive the
 // ladder without laying a real symlink.
@@ -252,11 +251,10 @@ func (s *Server) fpAccounts() ([]store.Account, error) {
 	return fp, nil
 }
 
-// healFPRows probes every File Provider domain's data plane and, on a debounced
-// wedge verdict that is due for a recovery attempt, escalates it up the recovery
-// ladder. It runs on the heal ticker beside retryUnvouchedFuseRows — never through
-// it: File Provider is a third backend, not a fuse mount. The probe is a bounded
-// read (no poll claim); the ladder step runs under one. Probing is skipped while
+// healFPRows deep-probes only File Provider domains already in wedged or parked
+// recovery. Healthy domains are validated at selection and receive zero periodic
+// maintenance probes, preventing idle appex wakes. It runs beside
+// retryUnvouchedFuseRows; the ladder step runs under a poll claim. Probing is skipped while
 // the FP bridge is down or awaiting consent (a probe through a down bridge reads
 // every domain as wedged), and per-row while a conversion owns the dir or the dir
 // is not its live bridge symlink.
@@ -298,20 +296,7 @@ func (s *Server) healFPRows(ctx context.Context) {
 			}
 			s.escalateFP(ctx, a, probeErr, now)
 		default:
-			// Healthy domains get only the slow deep check. Even the companion app's
-			// shallow enumeration wakes an appex, so running it on every healer tick
-			// creates a fleet-wide launch storm.
-			var probeErr error
-			if s.fpProbeClockDue(dir, now, fpDeepProbeInterval) {
-				s.recordFPProbeClock(dir, now)
-				probeErr = s.fpDeepProbe(ctx, dir)
-				if msg := s.recordFPProbe(dir, probeErr); msg != "" {
-					s.log.Printf("%s", msg)
-				}
-			}
-			if probeErr != nil {
-				s.escalateFP(ctx, a, probeErr, now)
-			}
+			return
 		}
 	})
 	if completed {
@@ -319,8 +304,8 @@ func (s *Server) healFPRows(ctx context.Context) {
 	}
 }
 
-// pruneFPLedger drops the fp.domain ledger rows and the periodic-probe
-// clock for every dir absent from the current File Provider row set — a reused
+// pruneFPLedger drops the fp.domain ledger rows and parked-probe clock for every
+// dir absent from the current File Provider row set — a reused
 // (gap-filled) account path must not inherit a vanished row's parked state or clock.
 func (s *Server) pruneFPLedger(seen map[string]bool) {
 	keep := func(dir string) bool { return seen[dir] }
@@ -359,9 +344,9 @@ func (s *Server) escalateFP(ctx context.Context, a store.Account, probeErr error
 // controllable domain with no identity yet is benign, so Missing never strikes
 // the wedge ladder; but the same ENOENT masks a control-plane failure — a domain
 // deregistered externally, or a companion app gone uncontrollable, whose bridge
-// symlink now points at a dead root. The cheap Health check tells them apart:
-// Health OK is the benign case (nothing to do); Health failing is the broken one,
-// repaired through reconcileFileProvider (Health→Setup, or the ErrCannotControl
+// symlink now points at a dead root. The cheap Check tells them apart:
+// Check OK is the benign case (nothing to do); Check failing is the broken one,
+// repaired through reconcileFileProvider (Check then Reconcile, or the ErrCannotControl
 // retreat to symlink) under the SAME backoff/attempt schedule that spaces the
 // wedge ladder — one attempt per due window, success resets the ladder. The poll
 // claim is held for the whole run so the repair never interleaves with the
@@ -389,7 +374,7 @@ func (s *Server) healFPMissing(ctx context.Context, a store.Account, now time.Ti
 	if prov == nil {
 		return
 	}
-	switch err := prov.Health(pool.ClaudeDir(), a.ConfigDir); {
+	switch err := prov.Check(ctx, pool.ClaudeDir(), a.ConfigDir); {
 	case err == nil:
 		return // benign: the control plane is healthy, the account just has no identity yet
 	case errors.Is(err, fileproviderd.ErrAppUnavailable):
@@ -410,8 +395,9 @@ func (s *Server) healFPMissing(ctx context.Context, a store.Account, now time.Ti
 }
 
 // healFP runs one recovery-ladder step against a wedged File Provider domain,
-// escalating with the attempt count: attempt 1 re-asserts the overlay (Sync,
-// non-destructive); attempts 2–4 re-register the domain (Teardown+Setup, which
+// escalating with the attempt count: attempt 1 reconciles the overlay and calls
+// NotifyContent (non-destructive); attempts 2–4 re-register the domain
+// (Teardown+Reconcile, which
 // discards fileproviderd's poisoned replica state); attempt 5 trips the breaker
 // (appex bounce, one final re-register, then park — retreat only if the widget is
 // genuinely gone). Each step is
@@ -422,7 +408,7 @@ func (s *Server) healFPMissing(ctx context.Context, a store.Account, now time.Ti
 func (s *Server) healFP(ctx context.Context, a store.Account, now time.Time) {
 	// The probe that scheduled this heal ran unclaimed; the caller's poll claim now
 	// blocks any new conversion, so re-read once under it (claim-then-re-read, see
-	// ownFresh) and use the fresh row throughout — attempt 1's Sync must not re-assert
+	// ownFresh) and use the fresh row throughout — attempt 1's Reconcile must not re-assert
 	// FP state for a row a conversion flipped in the claim gap.
 	fresh, err := s.m.Store.GetAccount(a.ID)
 	if err != nil {
@@ -444,13 +430,13 @@ func (s *Server) healFP(ctx context.Context, a store.Account, now time.Time) {
 		}
 		s.fpRecordAttempt(dir, now)
 		s.log.Printf("acct-%02d file provider domain wedged; recovery attempt 1: re-asserting the overlay (non-destructive) — relaunch any sessions on it", a.ID)
-		if err := prov.Sync(pool.ClaudeDir(), dir); err != nil {
-			s.log.Printf("acct-%02d file provider recovery attempt 1 (sync): %v", a.ID, err)
+		if err := prov.Reconcile(ctx, pool.ClaudeDir(), dir); err != nil {
+			s.log.Printf("acct-%02d file provider recovery attempt 1 (reconcile): %v", a.ID, err)
 		}
-		// Sync's nudge is fingerprint-gated; the ladder needs the enumerator nudged
-		// regardless, so force the UNCONDITIONAL signal.
+		// Reconcile may not notify an unchanged generation; the recovery ladder needs
+		// the enumerator nudged regardless, so send the unconditional signal.
 		if sig, ok := prov.(overlay.FPSignaler); ok {
-			if err := sig.Signal(dir); err != nil {
+			if err := sig.Signal(ctx, dir); err != nil {
 				s.log.Printf("acct-%02d file provider recovery attempt 1 (signal): %v", a.ID, err)
 			}
 		}
@@ -477,8 +463,8 @@ func (s *Server) healFP(ctx context.Context, a store.Account, now time.Time) {
 		return
 	}
 	s.log.Printf("acct-%02d file provider domain still wedged; recovery attempt %d: re-registering the domain (discards its replica state) — relaunch any sessions on it", a.ID, attempt)
-	if s.reRegisterFP(a, prov) {
-		// Setup reported the domain cannot serve here at all; retreat now (we hold
+	if s.reRegisterFP(ctx, a, prov) {
+		// Reconcile reported the domain cannot serve here at all; retreat now (we hold
 		// the convert claim), live-session-gated.
 		if s.convertFPToSymlinkHeld(ctx, a) {
 			s.log.Printf("acct-%02d fell back to symlink: File Provider cannot serve on this machine", a.ID)
@@ -498,21 +484,21 @@ func (s *Server) fpProvider(a store.Account) fkoverlay.Provider {
 	return prov
 }
 
-// reRegisterFP tears the domain down and re-adds it (Teardown+Setup) — the reset
+// reRegisterFP tears the domain down and re-adds it (Teardown+Reconcile) — the reset
 // that discards fileproviderd's poisoned replica state and forces a clean
-// re-enumeration. It returns whether Setup reported ErrCannotControl (File Provider
+// re-enumeration. It returns whether Reconcile reported ErrCannotControl (File Provider
 // cannot serve on this machine) so the caller retreats to symlink. Caller holds the
 // convert claim.
-func (s *Server) reRegisterFP(a store.Account, prov fkoverlay.Provider) (cannotControl bool) {
+func (s *Server) reRegisterFP(ctx context.Context, a store.Account, prov fkoverlay.Provider) (cannotControl bool) {
 	base, dir := pool.ClaudeDir(), a.ConfigDir
-	warning, err := prov.Teardown(base, dir)
+	warning, err := prov.Teardown(ctx, base, dir)
 	s.warnTeardown(a.ID, warning)
 	if err != nil {
-		// A wedged domain may refuse a clean Teardown; the idempotent Setup below
+		// A wedged domain may refuse a clean Teardown; Reconcile below
 		// re-adds regardless, so log and press on rather than stalling the ladder.
 		s.log.Printf("acct-%02d file provider re-register: teardown: %v", a.ID, err)
 	}
-	switch err := prov.Setup(base, dir); {
+	switch err := prov.Reconcile(ctx, base, dir); {
 	case err == nil:
 		s.log.Printf("acct-%02d file provider domain re-registered; the next probe verifies it", a.ID)
 		return false
@@ -520,7 +506,7 @@ func (s *Server) reRegisterFP(a store.Account, prov fkoverlay.Provider) (cannotC
 		s.log.Printf("acct-%02d file provider cannot serve on this machine (no entitlement or extension disabled): %v", a.ID, err)
 		return true
 	default:
-		s.log.Printf("acct-%02d file provider re-register setup failed; the next tick re-probes and re-attempts: %v", a.ID, err)
+		s.log.Printf("acct-%02d file provider re-register reconcile failed; the next tick re-probes and re-attempts: %v", a.ID, err)
 		return false
 	}
 }
@@ -540,7 +526,7 @@ func (s *Server) breakerFP(ctx context.Context, a store.Account, prov fkoverlay.
 	if err := fpAppexBounce(ctx); err != nil {
 		s.log.Printf("acct-%02d file provider extension bounce: %v", a.ID, err)
 	}
-	if s.reRegisterFP(a, prov) {
+	if s.reRegisterFP(ctx, a, prov) {
 		// ErrCannotControl: the widget is genuinely gone, so the domain can never
 		// serve here — the one condition an automatic symlink retreat survives.
 		if s.convertFPToSymlinkHeld(ctx, a) {

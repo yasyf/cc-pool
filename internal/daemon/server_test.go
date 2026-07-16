@@ -122,6 +122,70 @@ func TestReservedCountExpiresAfterTTL(t *testing.T) {
 	}
 }
 
+func TestHandleSelectCanceledClaimWaitCreatesNoReservation(t *testing.T) {
+	s, _ := newTestServer(t)
+	newCoordinatorTestSource(t, s)
+	if !s.cl.hold(1) {
+		t.Fatal("could not hold poll claim")
+	}
+	accountID := 1
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	resp := s.handleSelect(ctx, Request{Account: &accountID, NoMark: true, Cwd: "/project"})
+	if resp.OK {
+		t.Fatalf("selection succeeded after request deadline: %+v", resp)
+	}
+	s.cl.disownHold(1)
+	s.cl.mu.Lock()
+	pending, committed := len(s.cl.pending), len(s.cl.reservations)
+	s.cl.mu.Unlock()
+	if pending != 0 || committed != 0 {
+		t.Fatalf("late reservation after canceled catch-up: pending=%d committed=%d", pending, committed)
+	}
+}
+
+func TestProbeWinnerHonorsSelectionDeadline(t *testing.T) {
+	t.Run("fuse refuses when deep-probe budget does not fit", func(t *testing.T) {
+		s, _ := newTestServer(t)
+		setRowKind(t, s, 1, fkoverlay.BackendNFS)
+		account, err := s.m.Store.GetAccount(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old := deepProbe
+		calls := 0
+		deepProbe = func(string) error { calls++; return nil }
+		t.Cleanup(func() { deepProbe = old })
+		ctx, cancel := context.WithTimeout(t.Context(), overlay.DeepProbeBound-time.Second)
+		defer cancel()
+		if s.probeWinnerReady(ctx, account) {
+			t.Fatal("fuse winner reported ready without enough probe budget")
+		}
+		if calls != 0 {
+			t.Fatalf("deep probe called %d times without enough deadline", calls)
+		}
+	})
+
+	t.Run("file provider cancellation is not NoVerdict-ready", func(t *testing.T) {
+		s, _ := newTestServer(t)
+		setRowKind(t, s, 1, fkoverlay.BackendFileProvider)
+		account, err := s.m.Store.GetAccount(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.fpSynth = alwaysNonEmpty
+		swapFPDomainProbe(t, func(ctx context.Context, _ string) error {
+			<-ctx.Done()
+			return overlay.ErrFPProbeNoVerdict
+		})
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+		defer cancel()
+		if s.probeWinnerReady(ctx, account) {
+			t.Fatal("canceled FP probe reported winner ready")
+		}
+	})
+}
+
 func TestHandleSelectRecordsSticky(t *testing.T) {
 	s, dirs := newTestServer(t)
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
@@ -629,7 +693,7 @@ func TestHandleStatusSurfacesContentHealth(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(priv, ".claude.json"), []byte(`{"userID":"u"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s.contentSource = overlay.NewPoolContentSource(claudeDir, baseJSON)
+	s.contentSource = overlay.NewPoolContentSource(claudeDir, baseJSON, filepath.Join(t.TempDir(), "content-stamps"))
 	if got := s.handleStatus(t.Context()).ContentHealth; got != "" {
 		t.Fatalf("healthy content source must read empty, got %q", got)
 	}
@@ -863,7 +927,7 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s, dirs := newTestServer(t)
-	fake := &fakeFuseProv{} // Health nil: the startup reconcile adopts the mount
+	fake := &fakeFuseProv{} // Provider Check nil: the startup reconcile adopts the mount
 	s.m.OverlayFor = func(backend fkoverlay.Backend) (fkoverlay.Provider, error) {
 		if backend.IsFuse() {
 			return fake, nil
@@ -879,7 +943,7 @@ func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A migrated fuse account's dir is a mux bridge symlink; the startup reconcile
-	// adopts the live mirror (fake Health nil) rather than migrating it.
+	// adopts the live mirror (fake provider Check nil) rather than migrating it.
 	makeBridge(t, dirs[1])
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
@@ -898,11 +962,11 @@ func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.serve(ctx) }()
 
-	// Wait for the startup reconcile to reach acct-1's Health probe before
+	// Wait for the startup reconcile to reach acct-1's provider Check before
 	// shutting down; otherwise the cancelled ctx skips the reconcile and the
 	// adopt assertion races startup.
 	deadline := time.Now().Add(10 * time.Second)
-	for fake.healthCount() == 0 {
+	for fake.checkCount() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("startup reconcile never probed the fuse mount")
 		}

@@ -184,7 +184,7 @@ var fpCapabilityProbe = func(ctx context.Context, socket string) (bool, error) {
 // election (installed AND enabled) is the fast pre-check, but it only proves the
 // extension is registered, not that it can serve: a control Health round-trip is a
 // hard-coded ok:true socket ping an installed-but-unconsented provider also passes,
-// so every conversion then fails slowly through Setup's readiness poll. The second
+// so every conversion then fails slowly through Reconcile's readiness poll. The second
 // rung is therefore the truthful throwaway-domain capability probe — register,
 // enumerate, and remove a throwaway domain — which alone distinguishes "serving"
 // from "enabled but not serving". Both must hold before any account is disturbed.

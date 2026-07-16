@@ -60,7 +60,7 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	// Every failure past PrepareAdd must roll the dir and reservation back —
 	// except a kept dir's retained login state, which release preserves.
 	abandon := func(cause error) (MaterializeResult, error) {
-		if aerr := s.M.AbandonAdd(p); aerr != nil {
+		if aerr := s.M.AbandonAdd(ctx, p); aerr != nil {
 			return MaterializeResult{}, errors.Join(cause, fmt.Errorf("roll back %s: %w", v.UUID, aerr))
 		}
 		return MaterializeResult{}, cause

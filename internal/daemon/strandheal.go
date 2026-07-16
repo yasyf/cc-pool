@@ -27,13 +27,13 @@ func (s *Server) dirIsOverlaySymlink(dir string) bool {
 
 // convergeSymlinkRowBridge retracts a File Provider domain a crashed
 // symlink→fileprovider conversion left bridged at a symlink row's account dir
-// (Setup done, row not flipped), then recreates the real account dir so
+// (Reconcile done, row not flipped), then recreates the real account dir so
 // HealStrandedPrivate can move the private files back. Reports whether the dir is
 // ready for healing; on any failure it logs and returns false so the caller skips
 // this account until the next tick. Caller holds the account's poll claim.
-func (s *Server) convergeSymlinkRowBridge(a store.Account) bool {
+func (s *Server) convergeSymlinkRowBridge(ctx context.Context, a store.Account) bool {
 	target, _ := os.Readlink(a.ConfigDir)
-	s.log.Printf("acct-%02d: symlink row but the dir is an overlay bridge symlink -> %s (a conversion died after Setup, before the row flip); retracting the domain and recreating the dir", a.ID, target)
+	s.log.Printf("acct-%02d: symlink row but the dir is an overlay bridge symlink -> %s (a conversion died after Reconcile, before the row flip); retracting the domain and recreating the dir", a.ID, target)
 	prov := s.overlayFor(fkoverlay.BackendFileProvider)
 	if prov == nil {
 		s.log.Printf("acct-%02d: cannot resolve the file provider to retract the leaked bridge; skipping this tick", a.ID)
@@ -41,7 +41,7 @@ func (s *Server) convergeSymlinkRowBridge(a store.Account) bool {
 	}
 	// Idempotent: Teardown removes the bridge symlink and deregisters the domain
 	// (deregistering a never-registered domain is a no-op).
-	warning, err := prov.Teardown(pool.ClaudeDir(), a.ConfigDir)
+	warning, err := prov.Teardown(ctx, pool.ClaudeDir(), a.ConfigDir)
 	s.warnTeardown(a.ID, warning)
 	if err != nil {
 		s.log.Printf("acct-%02d: retract leaked overlay bridge: %v", a.ID, err)
@@ -115,11 +115,11 @@ func (s *Server) healStrandedSymlinkRow(ctx context.Context, t *tick, a store.Ac
 	defer func() { _ = fence.Release() }()
 
 	if bridged {
-		if !s.convergeSymlinkRowBridge(fresh) {
+		if !s.convergeSymlinkRowBridge(ctx, fresh) {
 			return
 		}
 	}
-	switch healed, err := s.m.HealStrandedPrivate(fresh); {
+	switch healed, err := s.m.HealStrandedPrivate(fresh); { //nolint:contextcheck // Manager API has no context; work is local filesystem I/O.
 	case err != nil:
 		s.log.Printf("acct-%02d heal stranded private files: %v", fresh.ID, err)
 		return
@@ -197,7 +197,7 @@ func (s *Server) sweepLeakedFPDomain(ctx context.Context, a store.Account) {
 		return
 	}
 	s.log.Printf("acct-%02d symlink row still has a file provider domain registered (root %s); deregistering the leak", a.ID, root)
-	if err := remover.RemoveDomain(a.ConfigDir); err != nil {
+	if err := remover.RemoveDomain(ctx, a.ConfigDir); err != nil {
 		s.log.Printf("acct-%02d deregister leaked file provider domain: %v", a.ID, err)
 	}
 }

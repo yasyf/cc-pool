@@ -26,10 +26,10 @@ func flipFuseRows(t *testing.T, s *Server, ids ...int) {
 	}
 }
 
-// muxSetupSim models the fuse provider's setupMux for the fake fuse provider: an
+// muxReconcileSim models the fuse provider's reconcileMux for the fake fuse provider: an
 // empty account dir is replaced by the bridge symlink, a non-empty one is refused
 // (ErrAccountDirOccupied), and an existing symlink is left in place.
-func muxSetupSim(_, dir string) error {
+func muxReconcileSim(_, dir string) error {
 	fi, err := os.Lstat(dir)
 	switch {
 	case os.IsNotExist(err):
@@ -102,8 +102,8 @@ func TestReconcileAccountRaceSkipsFuseArmForConvertedRow(t *testing.T) {
 
 	s.reconcileAccount(t.Context(), stale)
 
-	if got := fake.setupCount(); got != 0 {
-		t.Fatalf("reconcile ran the fuse arm (mount) on a row converted to symlink: fuse setups=%d, want 0", got)
+	if got := fake.reconcileCount(); got != 0 {
+		t.Fatalf("reconcile ran the fuse arm (mount) on a row converted to symlink: fuse reconciles=%d, want 0", got)
 	}
 	if got := fake.teardownCount(); got != 0 {
 		t.Fatalf("reconcile ran the fuse arm (teardown) on a converted row: fuse teardowns=%d, want 0", got)

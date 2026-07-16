@@ -747,9 +747,9 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 		report(prefix+" overlay", false, perr.Error())
 		return
 	}
-	if err := prov.Health(pool.ClaudeDir(), a.ConfigDir); err != nil {
+	if err := prov.Check(cmd.Context(), pool.ClaudeDir(), a.ConfigDir); err != nil {
 		if fix {
-			if serr := prov.Sync(pool.ClaudeDir(), a.ConfigDir); serr == nil {
+			if serr := prov.Reconcile(cmd.Context(), pool.ClaudeDir(), a.ConfigDir); serr == nil {
 				report(prefix+" overlay", true, "re-asserted")
 			} else {
 				report(prefix+" overlay", false, serr.Error())

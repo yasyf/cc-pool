@@ -194,7 +194,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 					if resp.ReservationToken == "" {
 						return nil, fmt.Errorf("invalid daemon selection: empty reservation token for id %d", picked.ID)
 					}
-					dir, err := prepareAccount(ctx, cmd, m, picked)
+					dir, err := prepareAccount(ctx, cmd, m, picked, false)
 					if err != nil {
 						abortDaemonSelection(ctx, cl, resp.ReservationToken)
 						return nil, err
@@ -207,7 +207,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 				}
 			}
 		}
-		dir, err := prepareAccount(ctx, cmd, m, a)
+		dir, err := prepareAccount(ctx, cmd, m, a, true)
 		if err != nil {
 			return nil, err
 		}
@@ -250,7 +250,6 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 						warnExhaustedFallback(cmd, daemonAccountName(m, resp.SelectedID), resp.ExtraEnabled, derefTime(resp.SoonestReset))
 					}
 					warnPinHeld(cmd, m, resp.PinHeldAccount, resp.SelectedID)
-					mergeLaunchSettings(cmd, m, a)
 					return &selectionTxn{
 						acct: a, dir: a.ConfigDir, line: daemonSelectionLine(m, resp),
 						commit: func(ctx context.Context) error { return cl.CommitSelection(ctx, resp.ReservationToken) },
@@ -312,7 +311,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 			warnExhaustedFallback(cmd, accountName(sr.Best.Label), sr.ExtraEnabled, sr.Result.ExhaustedUntil)
 		}
 		warnPinHeld(cmd, m, sr.PinHeldAccount, &sr.Best.ID)
-		dir, err := prepareAccount(ctx, cmd, m, sr.Best)
+		dir, err := prepareAccount(ctx, cmd, m, sr.Best, true)
 		if err != nil {
 			return nil, err
 		}
@@ -434,18 +433,23 @@ func derefTime(t *time.Time) time.Time {
 	return *t
 }
 
-// prepareAccount is the daemonless equivalent of the daemon's own pick prep.
-func prepareAccount(ctx context.Context, cmd *cobra.Command, m *pool.Manager, a store.Account) (string, error) {
-	if err := m.SyncOverlayContext(ctx, a); err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
+// prepareAccount performs the client-side launch prep after a pick. Direct picks
+// set reconcile; daemon-prepared picks do not repeat handleSelect's catch-up.
+func prepareAccount(ctx context.Context, cmd *cobra.Command, m *pool.Manager, a store.Account, reconcile bool) (string, error) {
+	if reconcile {
+		if err := m.ReconcileOverlay(ctx, a); err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			warn(cmd.ErrOrStderr(), "couldn't reconcile this account's overlay: %v", err)
 		}
-		warn(cmd.ErrOrStderr(), "couldn't sync this account's settings: %v", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	mergeLaunchSettings(cmd, m, a)
+	if reconcile {
+		mergeLaunchSettings(cmd, m, a)
+	}
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}

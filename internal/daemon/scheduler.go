@@ -7,7 +7,6 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/proc"
 )
@@ -115,21 +114,6 @@ func (s *Server) scheduler(ctx context.Context) {
 
 func (s *Server) pollOnce(ctx context.Context) {
 	s.runTable(ctx, s.newTick(ctx), pollTable)
-}
-
-// reconcileDeadSessions closes sessions whose pids are gone — only on a
-// successful scan, since AlivePIDs always returns a non-nil map and a failed scan
-// would close every live session. A failed scan is a no-op (fail closed).
-func (s *Server) reconcileDeadSessions(t *tick) {
-	if !t.scanOK() {
-		return
-	}
-	switch n, err := s.m.Store.CloseDeadSessions(procscan.AlivePIDs(t.sessions()), time.Now()); {
-	case err != nil:
-		s.log.Printf("close dead sessions: %v", err)
-	case n > 0:
-		s.log.Printf("reconciled %d ended session(s)", n)
-	}
 }
 
 // pruneStickyRows drops expired sticky-pin rows (hygiene only: StickyPick
@@ -296,42 +280,10 @@ func (s *Server) authThrottled(dir string, needsLogin bool) bool {
 // regardless of the auth streak (the post-outage heal); fetchUsage's deep guard
 // still prevents a refresh-token double-spend. See ccn doc 36b05ef.
 func (s *Server) pollAccount(ctx context.Context, t *tick, a store.Account, recovery bool) sampleOutcome {
-	// Re-assert the overlay so long-lived setups pick up new top-level
-	// ~/.claude entries without an explicit sync.
-	if err := s.m.SyncOverlay(a); err != nil {
-		s.log.Printf("acct-%02d overlay sync: %v", a.ID, err)
-		// A fuse sync failure usually means the mount is down — heal now instead of
-		// leaving the dir dead until restart. A File Provider sync failure is NOT
-		// reconciled inline: the backoff-gated heal ticker (probe + recovery ladder)
-		// owns FP recovery, so a Health+Setup on every failed poll would be the
-		// reconcile storm (defect 3) this drop removes.
-		if fuseBackedRow(a.OverlayKind) {
-			s.healFuse(ctx, a)
-		}
-	}
-
-	// A reserved account's claude may not be procscan-visible yet — treat it as
-	// busy so we don't refresh under the launch. A failed scan also reads busy
-	// (t.idle is false for every dir when the tick's scan failed).
+	// A reserved account's claude may not be heartbeat-visible yet — treat it as
+	// busy so we don't refresh under the launch. A failed heartbeat also makes
+	// every dir non-idle while retaining last-known counts for diagnostics.
 	idle := t.idle(a.ConfigDir) && s.cl.reservedCount(a.ID) == 0
-
-	// A just-idled account may carry a token rotated by its session — adopt
-	// before sampling.
-	if idle {
-		switch err := s.m.AdoptRotatedToken(ctx, a); {
-		case err != nil:
-			s.log.Printf("acct-%02d adopt rotated token: %v", a.ID, err)
-		case fpBackedRow(a.OverlayKind):
-			// The adoption rewrote the account's credential state; nudge the
-			// domain (re-Ensure + re-link + Signal) so the OS re-enumerates the
-			// rotated merged .claude.json instead of serving a stale replica.
-			if prov := s.overlayForRow(a); prov != nil {
-				if serr := prov.Sync(pool.ClaudeDir(), a.ConfigDir); serr != nil {
-					s.log.Printf("acct-%02d file provider sync after token adoption: %v", a.ID, serr)
-				}
-			}
-		}
-	}
 
 	// The prior-401 gate gives a lazily-waking session one full poll to
 	// self-refresh first; a recovery sweep bypasses the streak gate (fetchUsage's

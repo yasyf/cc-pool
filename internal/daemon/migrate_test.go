@@ -30,41 +30,40 @@ import (
 
 // fakeFuseProv: fn seams run outside the lock so they may inspect the fake.
 type fakeFuseProv struct {
-	mu          sync.Mutex
-	calls       []string
-	setups      int
-	teardowns   int
-	healths     int
-	setupErr    error
-	teardownErr error
-	healthErr   error
-	setupFn     func(base, dir string) error
-	teardownFn  func(base, dir string) error
+	mu           sync.Mutex
+	calls        []string
+	reconciles   int
+	teardowns    int
+	checks       int
+	reconcileErr error
+	teardownErr  error
+	checkErr     error
+	reconcileFn  func(base, dir string) error
+	teardownFn   func(base, dir string) error
 }
 
 func (f *fakeFuseProv) Backend() fkoverlay.Backend { return fkoverlay.BackendNFS }
-func (f *fakeFuseProv) Sync(_, _ string) error     { return nil }
 
-func (f *fakeFuseProv) Health(_, _ string) error {
+func (f *fakeFuseProv) Check(_ context.Context, _, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.healths++
-	return f.healthErr
+	f.checks++
+	return f.checkErr
 }
 
-func (f *fakeFuseProv) healthCount() int {
+func (f *fakeFuseProv) checkCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.healths
+	return f.checks
 }
 
 func (f *fakeFuseProv) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
 
-func (f *fakeFuseProv) Setup(base, dir string) error {
+func (f *fakeFuseProv) Reconcile(_ context.Context, base, dir string) error {
 	f.mu.Lock()
-	f.setups++
-	f.calls = append(f.calls, "setup")
-	fn, err := f.setupFn, f.setupErr
+	f.reconciles++
+	f.calls = append(f.calls, "reconcile")
+	fn, err := f.reconcileFn, f.reconcileErr
 	f.mu.Unlock()
 	if fn != nil {
 		return fn(base, dir)
@@ -72,7 +71,7 @@ func (f *fakeFuseProv) Setup(base, dir string) error {
 	return err
 }
 
-func (f *fakeFuseProv) Teardown(base, dir string) (string, error) {
+func (f *fakeFuseProv) Teardown(_ context.Context, base, dir string) (string, error) {
 	f.mu.Lock()
 	f.teardowns++
 	f.calls = append(f.calls, "teardown")
@@ -84,10 +83,10 @@ func (f *fakeFuseProv) Teardown(base, dir string) (string, error) {
 	return "", err
 }
 
-func (f *fakeFuseProv) setupCount() int {
+func (f *fakeFuseProv) reconcileCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.setups
+	return f.reconciles
 }
 
 func (f *fakeFuseProv) teardownCount() int {
@@ -185,8 +184,8 @@ func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
 	if kindOf(t, s, 1) != "nfs" || kindOf(t, s, 2) != "nfs" {
 		t.Fatal("rows not flipped to fuse")
 	}
-	if fake.setupCount() != 2 {
-		t.Fatalf("fuse setups = %d, want 2", fake.setupCount())
+	if fake.reconcileCount() != 2 {
+		t.Fatalf("fuse reconciles = %d, want 2", fake.reconcileCount())
 	}
 	// Fresh mounts must be selectable immediately, not a poll away.
 	if !s.holder.ready(dirs[1]) || !s.holder.ready(dirs[2]) {
@@ -205,8 +204,8 @@ func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
 	if got[1] != MigrationAlready || got[2] != MigrationAlready {
 		t.Fatalf("re-run outcomes = %v, want both already", got)
 	}
-	if fake.setupCount() != 2 {
-		t.Fatalf("re-run mounted again: setups = %d", fake.setupCount())
+	if fake.reconcileCount() != 2 {
+		t.Fatalf("re-run mounted again: reconciles = %d", fake.reconcileCount())
 	}
 }
 
@@ -278,7 +277,7 @@ func TestHandleMigrateFuseGateBlocks(t *testing.T) {
 	if resp.OK || !strings.Contains(resp.Error, "grant Network Volumes access") {
 		t.Fatalf("resp = %+v, want gate error", resp)
 	}
-	if len(resp.Migrations) != 0 || fake.setupCount() != 0 {
+	if len(resp.Migrations) != 0 || fake.reconcileCount() != 0 {
 		t.Fatal("gate failure disturbed accounts")
 	}
 	if kindOf(t, s, 1) != "symlink" {
@@ -331,8 +330,8 @@ func TestHandleMigrateBusyWhenReserved(t *testing.T) {
 	if kindOf(t, s, 1) != "symlink" {
 		t.Fatal("reserved account was converted")
 	}
-	if fake.setupCount() != 1 {
-		t.Fatalf("setups = %d, want 1", fake.setupCount())
+	if fake.reconcileCount() != 1 {
+		t.Fatalf("reconciles = %d, want 1", fake.reconcileCount())
 	}
 	if s.cl.held(1) {
 		t.Fatal("busy refusal leaked a converting claim")
@@ -542,8 +541,8 @@ func TestReconcileOverlaysHealsStrandedAndFallsBack(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(priv2, ".claude.json"), []byte("identity2"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	fake.healthErr = errors.New("not a mountpoint")
-	fake.setupErr = errors.New("mount did not come up")
+	fake.checkErr = errors.New("not a mountpoint")
+	fake.reconcileErr = errors.New("mount did not come up")
 
 	s.reconcileOverlays(t.Context())
 
@@ -619,8 +618,8 @@ func TestMountFuseSweepsUnderlay(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(dirs[1], ".claude.json")); !os.IsNotExist(err) {
 		t.Fatal("identity left in the underlay")
 	}
-	if fake.setupCount() != 1 {
-		t.Fatalf("setups = %d, want 1", fake.setupCount())
+	if fake.reconcileCount() != 1 {
+		t.Fatalf("reconciles = %d, want 1", fake.reconcileCount())
 	}
 
 	// The real resolver always yields a fuse provider; the fence refuses
@@ -697,7 +696,7 @@ func TestHandleMigrateBudgetExhausted(t *testing.T) {
 			t.Fatalf("result = %+v, want busy/window elapsed", r)
 		}
 	}
-	if fake.setupCount() != 0 {
+	if fake.reconcileCount() != 0 {
 		t.Fatal("conversion ran despite an exhausted budget")
 	}
 	if kindOf(t, s, 1) != "symlink" {
@@ -720,7 +719,7 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 	if res.Outcome != MigrationBusy {
 		t.Fatalf("outcome = %s, want busy despite force", res.Outcome)
 	}
-	if fake.setupCount() != 0 {
+	if fake.reconcileCount() != 0 {
 		t.Fatal("forced conversion ran over a live reservation")
 	}
 
@@ -739,12 +738,12 @@ func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
 // fan-out relies on: handleMigrate converts one account at a time, so a slow
 // domain materialization never piles concurrent conversions onto the host — the
 // load that crushed fileproviderd in the migrate storm. An entrancy-recording
-// Setup (run outside the fake's lock) asserts the daemon never runs two
+// Reconcile (run outside the fake's lock) asserts the daemon never runs two
 // conversions at once, even with a widened window a real overlap would land in.
 func TestHandleMigrateConversionsNeverOverlap(t *testing.T) {
 	s, _, fake := newMigrateServer(t)
 	var inFlight, maxInFlight atomic.Int32
-	fake.setupFn = func(string, string) error {
+	fake.reconcileFn = func(string, string) error {
 		n := inFlight.Add(1)
 		for {
 			old := maxInFlight.Load()
@@ -764,8 +763,8 @@ func TestHandleMigrateConversionsNeverOverlap(t *testing.T) {
 	if got := outcomes(resp); got[1] != MigrationDone || got[2] != MigrationDone {
 		t.Fatalf("outcomes = %v, want both done", got)
 	}
-	if fake.setupCount() != 2 {
-		t.Fatalf("setups = %d, want 2 (both accounts converted)", fake.setupCount())
+	if fake.reconcileCount() != 2 {
+		t.Fatalf("reconciles = %d, want 2 (both accounts converted)", fake.reconcileCount())
 	}
 	if got := maxInFlight.Load(); got != 1 {
 		t.Fatalf("max concurrent conversions = %d, want 1 — the fleet settle must stay sequential", got)
@@ -868,7 +867,7 @@ func TestConvertAccountRefetchesRow(t *testing.T) {
 	if res.Outcome != MigrationAlready {
 		t.Fatalf("outcome = %s (%s), want already", res.Outcome, res.Detail)
 	}
-	if fake.setupCount() != 0 {
+	if fake.reconcileCount() != 0 {
 		t.Fatal("conversion ran against a stale row")
 	}
 }
@@ -932,7 +931,7 @@ func TestReconcileAdoptsLiveMount(t *testing.T) {
 	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	// A migrated fuse account's dir is a mux bridge symlink; with healthErr nil
+	// A migrated fuse account's dir is a mux bridge symlink; with checkErr nil
 	// (the default) the mirror reads live, so reconcile adopts it untouched rather
 	// than running the one-time legacy migration.
 	makeBridge(t, dirs[1])
@@ -967,11 +966,11 @@ func TestMountFuseClearsDeadMountThenSweepsThenMounts(t *testing.T) {
 	var mounted atomic.Bool
 	mounted.Store(true)
 	fakeOverlayMounted(t, func(string) bool { return mounted.Load() })
-	fake.healthErr = errors.New("mirror is dead")
+	fake.checkErr = errors.New("mirror is dead")
 	fake.teardownFn = func(string, string) error { mounted.Store(false); return nil }
-	fake.setupFn = func(string, string) error {
+	fake.reconcileFn = func(string, string) error {
 		if _, err := os.Stat(filepath.Join(fkoverlay.FusePrivateRoot(dirs[1]), ".claude.json")); err != nil {
-			return fmt.Errorf("setup ran before the sweep: %w", err)
+			return fmt.Errorf("reconcile ran before the sweep: %w", err)
 		}
 		return nil
 	}
@@ -979,8 +978,8 @@ func TestMountFuseClearsDeadMountThenSweepsThenMounts(t *testing.T) {
 	if err := s.mountFuse(t.Context(), a); err != nil {
 		t.Fatalf("mountFuse: %v", err)
 	}
-	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"teardown", "setup"}) {
-		t.Fatalf("call order = %v, want [teardown setup]", got)
+	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"teardown", "reconcile"}) {
+		t.Fatalf("call order = %v, want [teardown reconcile]", got)
 	}
 	if _, err := os.Lstat(filepath.Join(dirs[1], ".claude.json")); !os.IsNotExist(err) {
 		t.Fatal("identity left in the underlay")
@@ -998,8 +997,8 @@ func TestMountFuseDetachesWedgedBridgeSubtree(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	a := flipToFuse(t, s, 1)
 	makeBridge(t, dirs[1]) // the account dir is a bridge symlink, not a real mountpoint
-	fake.setupFn = muxSetupSim
-	// Shallow-live (Health passes) but deep-wedged: the branch must still detach.
+	fake.reconcileFn = muxReconcileSim
+	// Shallow-live (Check passes) but deep-wedged: the branch must still detach.
 	s.holder.markDeepWedged(dirs[1])
 	fakeOverlayMounted(t, func(string) bool { return false })
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
@@ -1007,8 +1006,8 @@ func TestMountFuseDetachesWedgedBridgeSubtree(t *testing.T) {
 	if err := s.mountFuse(t.Context(), a); err != nil {
 		t.Fatalf("mountFuse: %v", err)
 	}
-	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"teardown", "setup"}) {
-		t.Fatalf("call order = %v, want [teardown setup] — a deep-wedged bridge subtree must be detached before re-attach", got)
+	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"teardown", "reconcile"}) {
+		t.Fatalf("call order = %v, want [teardown reconcile] — a deep-wedged bridge subtree must be detached before re-attach", got)
 	}
 	if !pool.IsBridgeSymlink(dirs[1]) {
 		t.Fatal("bridge symlink not intact after the re-attach")
@@ -1033,14 +1032,14 @@ func TestMountFuseWedgedPreClearAborts(t *testing.T) {
 		t.Fatal(err)
 	}
 	fakeOverlayMounted(t, func(string) bool { return true })
-	fake.healthErr = errors.New("mirror is dead")
+	fake.checkErr = errors.New("mirror is dead")
 	fake.teardownErr = errors.New("umount: resource busy")
 
 	merr := s.mountFuse(t.Context(), a)
 	if merr == nil || !strings.Contains(merr.Error(), "clear dead mount") {
 		t.Fatalf("mountFuse over a wedged unmount = %v, want a clear-dead-mount error", merr)
 	}
-	if fake.setupCount() != 0 {
+	if fake.reconcileCount() != 0 {
 		t.Fatal("mounted through a wedged pre-clear")
 	}
 	if _, err := os.Stat(filepath.Join(dirs[1], ".claude.json")); err != nil {
@@ -1052,7 +1051,7 @@ func TestMountFuseWedgedPreClearAborts(t *testing.T) {
 }
 
 // TestMountFuseForeignCarcassClearedAndRetriedOnce: Teardown's registry-miss
-// path clears the carcass; exactly one sweep+Setup retry answers the refusal.
+// path clears the carcass; exactly one sweep+Reconcile retry answers the refusal.
 func TestMountFuseForeignCarcassClearedAndRetriedOnce(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 	a, err := s.m.Store.GetAccount(1)
@@ -1062,7 +1061,7 @@ func TestMountFuseForeignCarcassClearedAndRetriedOnce(t *testing.T) {
 	a.OverlayKind = "nfs"
 	var foreign atomic.Bool
 	foreign.Store(true)
-	fake.setupFn = func(_, dir string) error {
+	fake.reconcileFn = func(_, dir string) error {
 		if foreign.Load() {
 			return fmt.Errorf("mount %s: %w", dir, mountd.ErrForeignMount)
 		}
@@ -1073,8 +1072,8 @@ func TestMountFuseForeignCarcassClearedAndRetriedOnce(t *testing.T) {
 	if err := s.mountFuse(t.Context(), a); err != nil {
 		t.Fatalf("mountFuse: %v", err)
 	}
-	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"setup", "teardown", "setup"}) {
-		t.Fatalf("call order = %v, want [setup teardown setup]", got)
+	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"reconcile", "teardown", "reconcile"}) {
+		t.Fatalf("call order = %v, want [reconcile teardown reconcile]", got)
 	}
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("remounted carcass not recorded in the holder cache")
@@ -1093,7 +1092,7 @@ func TestMountFuseBaseMismatchClearedAndRetriedOnce(t *testing.T) {
 	a.OverlayKind = "nfs"
 	var mismatched atomic.Bool
 	mismatched.Store(true)
-	fake.setupFn = func(_, dir string) error {
+	fake.reconcileFn = func(_, dir string) error {
 		if mismatched.Load() {
 			return fmt.Errorf("mount %s: %w", dir, mountd.ErrBaseMismatch)
 		}
@@ -1104,8 +1103,8 @@ func TestMountFuseBaseMismatchClearedAndRetriedOnce(t *testing.T) {
 	if err := s.mountFuse(t.Context(), a); err != nil {
 		t.Fatalf("mountFuse: %v", err)
 	}
-	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"setup", "teardown", "setup"}) {
-		t.Fatalf("call order = %v, want [setup teardown setup]", got)
+	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"reconcile", "teardown", "reconcile"}) {
+		t.Fatalf("call order = %v, want [reconcile teardown reconcile]", got)
 	}
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("remounted mismatched dir not recorded in the holder cache")
@@ -1120,13 +1119,13 @@ func TestMountFusePersistentForeignFailsAfterOneRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.OverlayKind = "nfs"
-	fake.setupErr = fmt.Errorf("mount %s: %w", dirs[1], mountd.ErrForeignMount)
+	fake.reconcileErr = fmt.Errorf("mount %s: %w", dirs[1], mountd.ErrForeignMount)
 
 	merr := s.mountFuse(t.Context(), a)
 	if !errors.Is(merr, mountd.ErrForeignMount) {
 		t.Fatalf("mountFuse = %v, want errors.Is ErrForeignMount", merr)
 	}
-	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"setup", "teardown", "setup"}) {
+	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"reconcile", "teardown", "reconcile"}) {
 		t.Fatalf("call order = %v, want exactly one teardown+retry", got)
 	}
 	if s.holder.ready(dirs[1]) {
@@ -1139,80 +1138,80 @@ func TestMountFusePersistentForeignFailsAfterOneRetry(t *testing.T) {
 // failed scan fails closed).
 func TestHealFuseTaxonomy(t *testing.T) {
 	cases := map[string]struct {
-		setupErr    error
-		scanKind    string // "" = real scan (idle), "live" = session on the dir, "err" = scan failure
-		reserve     bool
-		wantOutcome healOutcome
-		wantKind    string
+		reconcileErr error
+		scanKind     string // "" = real scan (idle), "live" = session on the dir, "err" = scan failure
+		reserve      bool
+		wantOutcome  healOutcome
+		wantKind     string
 	}{
 		"holder unavailable retries next poll": {
-			setupErr:    fmt.Errorf("mount: %w", mountd.ErrHolderUnavailable),
-			wantOutcome: healRetry, wantKind: "nfs",
+			reconcileErr: fmt.Errorf("mount: %w", mountd.ErrHolderUnavailable),
+			wantOutcome:  healRetry, wantKind: "nfs",
 		},
-		// The exact chain RemoteProvider.Setup wrapping EnsureRunning's timeout
+		// The exact chain RemoteProvider.Reconcile wrapping EnsureRunning's timeout
 		// produces: a spawn blip retries, never converts.
 		"spawn timeout (holder unavailable chain) retries next poll": {
-			setupErr: fmt.Errorf("mount /pool/acct-01: %w",
+			reconcileErr: fmt.Errorf("mount /pool/acct-01: %w",
 				fmt.Errorf("%w: mount holder did not come up on /tmp/m.sock within 5s; check /tmp/holder.log", mountd.ErrHolderUnavailable)),
 			wantOutcome: healRetry, wantKind: "nfs",
 		},
 		"busy mirror defers without a breaker strike": {
-			setupErr:    fmt.Errorf("mount: %w", mountd.ErrBusy),
-			wantOutcome: healDeferredBusy, wantKind: "nfs",
+			reconcileErr: fmt.Errorf("mount: %w", mountd.ErrBusy),
+			wantOutcome:  healDeferredBusy, wantKind: "nfs",
 		},
 		"tcc block classified and retried": {
-			setupErr:    fmt.Errorf("mount: %w", overlay.ErrMountNotLive),
-			wantOutcome: healTCCBlocked, wantKind: "nfs",
+			reconcileErr: fmt.Errorf("mount: %w", overlay.ErrMountNotLive),
+			wantOutcome:  healTCCBlocked, wantKind: "nfs",
 		},
 		// A wedged unmount is no more a mount verdict than ErrBusy — and the
 		// fallback's ConvertOverlay would hit the same wedge.
 		"wedged unmount retries next poll": {
-			setupErr:    fmt.Errorf("mount: %w", overlay.ErrUnmountWedged),
-			wantOutcome: healRetry, wantKind: "nfs",
+			reconcileErr: fmt.Errorf("mount: %w", overlay.ErrUnmountWedged),
+			wantOutcome:  healRetry, wantKind: "nfs",
 		},
 		// The exact chain overlayClass produces for a timeout under a proven
 		// grant.
 		"mount timeout (proven grant) retries without recording TCC": {
-			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountTimeout, mountd.ErrMountTimeout)),
-			wantOutcome: healRetry, wantKind: "nfs",
+			reconcileErr: fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountTimeout, mountd.ErrMountTimeout)),
+			wantOutcome:  healRetry, wantKind: "nfs",
 		},
 		// Forward skew: an unknown class from a newer holder must read as
 		// retry, never the mount failure that converts.
 		"unknown holder error class retries next poll": {
-			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w (quota-exceeded): per-account quota exhausted", mountd.ErrUnknownClass)),
-			wantOutcome: healRetry, wantKind: "nfs",
+			reconcileErr: fmt.Errorf("mount: %w", fmt.Errorf("%w (quota-exceeded): per-account quota exhausted", mountd.ErrUnknownClass)),
+			wantOutcome:  healRetry, wantKind: "nfs",
 		},
 		// Skew degrade: an older daemon reads the new "mount-timeout" class as
 		// ErrUnknownClass, which routes to retry.
 		"mount-timeout class on a pre-fix daemon degrades to retry": {
-			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w (mount-timeout): fuse mount did not come up in time", mountd.ErrUnknownClass)),
-			wantOutcome: healRetry, wantKind: "nfs",
+			reconcileErr: fmt.Errorf("mount: %w", fmt.Errorf("%w (mount-timeout): fuse mount did not come up in time", mountd.ErrUnknownClass)),
+			wantOutcome:  healRetry, wantKind: "nfs",
 		},
 		// The chain the provider's feature gate produces for a holder missing a
 		// required capability: defer for the cask upgrade, never demote.
 		"unsupported holder defers without demoting": {
-			setupErr: fmt.Errorf("%w: holder v0.9.0 lacks feature \"mux\"; `brew upgrade --cask fusekit-holder`",
+			reconcileErr: fmt.Errorf("%w: holder v0.9.0 lacks feature \"mux\"; `brew upgrade --cask fusekit-holder`",
 				pool.ErrHolderUnsupported),
 			wantOutcome: healDeferredUnsupported, wantKind: "nfs",
 		},
 		// Mux registry state: a subtree could not join its shared root
 		// (unmount-then-retry). Never a mount verdict — retry, never demote.
 		"mux mismatch retries without demoting": {
-			setupErr:    fmt.Errorf("fuse mux setup: %w", mountd.ErrMuxMismatch),
-			wantOutcome: healRetry, wantKind: "nfs",
+			reconcileErr: fmt.Errorf("fuse mux reconcile: %w", mountd.ErrMuxMismatch),
+			wantOutcome:  healRetry, wantKind: "nfs",
 		},
 		// A half-drained legacy account dir still holds unclassified state where
 		// the bridge symlink must go: refuse to clobber it, retry, never demote.
 		"occupied account dir retries without demoting": {
-			setupErr:    fmt.Errorf("fuse mux setup: %w", fkoverlay.ErrAccountDirOccupied),
-			wantOutcome: healRetry, wantKind: "nfs",
+			reconcileErr: fmt.Errorf("fuse mux reconcile: %w", fkoverlay.ErrAccountDirOccupied),
+			wantOutcome:  healRetry, wantKind: "nfs",
 		},
 		"genuine failure on an idle account converts": {
-			setupErr:    errors.New("mount exploded"),
-			wantOutcome: healFallback, wantKind: "symlink",
+			reconcileErr: errors.New("mount exploded"),
+			wantOutcome:  healFallback, wantKind: "symlink",
 		},
 		"genuine failure under a reservation defers": {
-			setupErr: errors.New("mount exploded"), reserve: true,
+			reconcileErr: errors.New("mount exploded"), reserve: true,
 			wantOutcome: healFallback, wantKind: "nfs",
 		},
 		"clean mount": {wantOutcome: healMounted, wantKind: "nfs"},
@@ -1228,7 +1227,7 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			if err := s.m.Store.UpsertAccount(a); err != nil {
 				t.Fatal(err)
 			}
-			fake.setupErr = tc.setupErr
+			fake.reconcileErr = tc.reconcileErr
 			switch tc.scanKind {
 			case "live":
 				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
@@ -1259,11 +1258,11 @@ func TestHealFuseTaxonomy(t *testing.T) {
 	}
 }
 
-// TestHealFuseSweepFailureRetries: a pre-Setup sweep failure (errSweepStranded)
+// TestHealFuseSweepFailureRetries: a pre-Reconcile sweep failure (errSweepStranded)
 // is not a mount verdict — retry next poll, never demote to symlink.
 func TestHealFuseSweepFailureRetries(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
-	fake.setupErr = nil // Setup must never be reached; the sweep fails first.
+	fake.reconcileErr = nil // Reconcile must never be reached; the sweep fails first.
 
 	a, err := s.m.Store.GetAccount(1)
 	if err != nil {
@@ -1274,7 +1273,7 @@ func TestHealFuseSweepFailureRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// moveEntry refuses the file-vs-dir clash, so the sweep fails before Setup.
+	// moveEntry refuses the file-vs-dir clash, so the sweep fails before Reconcile.
 	dir := dirs[1]
 	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte("identity"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1284,7 +1283,7 @@ func TestHealFuseSweepFailureRetries(t *testing.T) {
 	}
 
 	if got := s.healFuse(t.Context(), a); got != healRetry {
-		t.Fatalf("healFuse outcome = %d, want healRetry (%d): a pre-Setup sweep failure must not convert", got, healRetry)
+		t.Fatalf("healFuse outcome = %d, want healRetry (%d): a pre-Reconcile sweep failure must not convert", got, healRetry)
 	}
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind = %q, want \"fuse\": a sweep failure must not demote to symlink", got)
@@ -1607,9 +1606,9 @@ type cancellingSymlinkProv struct {
 	cancel context.CancelFunc
 }
 
-func (p *cancellingSymlinkProv) Teardown(base, dir string) (string, error) {
+func (p *cancellingSymlinkProv) Teardown(ctx context.Context, base, dir string) (string, error) {
 	p.cancel()
-	return p.SymlinkProvider.Teardown(base, dir)
+	return p.SymlinkProvider.Teardown(ctx, base, dir)
 }
 
 // TestHandleMigrateShutdownMidConversionCompletesInFlight: convertAccount
@@ -1642,8 +1641,8 @@ func TestHandleMigrateShutdownMidConversionCompletesInFlight(t *testing.T) {
 	if kindOf(t, s, 1) != "nfs" {
 		t.Fatal("in-flight conversion abandoned inside the strand window (row not flipped)")
 	}
-	if fake.setupCount() != 1 {
-		t.Fatalf("setups = %d, want acct-1's mount only", fake.setupCount())
+	if fake.reconcileCount() != 1 {
+		t.Fatalf("reconciles = %d, want acct-1's mount only", fake.reconcileCount())
 	}
 	if kindOf(t, s, 2) != "symlink" {
 		t.Fatal("migrate loop continued past a cancelled ctx")
@@ -1774,8 +1773,8 @@ func TestHandleMigrateFileProviderGateBlocked(t *testing.T) {
 	if kindOf(t, s, 1) != "symlink" || kindOf(t, s, 2) != "symlink" {
 		t.Fatal("rows changed despite a failed gate")
 	}
-	if fake.setupCount() != 0 {
-		t.Fatalf("overlay setups = %d despite a failed gate", fake.setupCount())
+	if fake.reconcileCount() != 0 {
+		t.Fatalf("overlay reconciles = %d despite a failed gate", fake.reconcileCount())
 	}
 	if _, ok, err := s.m.Store.GetMeta("overlay_kind"); err != nil || ok {
 		t.Fatalf("default recorded despite a failed gate (ok=%v err=%v)", ok, err)

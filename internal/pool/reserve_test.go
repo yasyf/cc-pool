@@ -39,7 +39,7 @@ func TestAbandonAddFreesReservedIndex(t *testing.T) {
 	if p1.Index != 1 {
 		t.Fatalf("first index = %d, want 1", p1.Index)
 	}
-	if err := m.AbandonAdd(p1); err != nil {
+	if err := m.AbandonAdd(t.Context(), p1); err != nil {
 		t.Fatal(err)
 	}
 	p2, err := m.PrepareAdd(t.Context())
@@ -78,7 +78,7 @@ func TestReleaseAddResumesSameIndex(t *testing.T) {
 	if live.Index == p1.Index {
 		t.Fatalf("concurrent PrepareAdd got the live index %d", live.Index)
 	}
-	if err := m.AbandonAdd(live); err != nil {
+	if err := m.AbandonAdd(t.Context(), live); err != nil {
 		t.Fatal(err)
 	}
 
@@ -107,7 +107,7 @@ func TestPrepareAddFailureReleasesReservation(t *testing.T) {
 	m := setupReservePool(t)
 	boom := errors.New("disk full")
 	m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
-		return &stubOverlay{backend: fkoverlay.BackendSymlink, setupErr: boom}, nil
+		return &stubOverlay{backend: fkoverlay.BackendSymlink, reconcileErr: boom}, nil
 	}
 	if _, err := m.PrepareAdd(t.Context()); !errors.Is(err, boom) {
 		t.Fatalf("PrepareAdd = %v, want the setup failure", err)
@@ -150,7 +150,7 @@ func TestStaleReservationSweep(t *testing.T) {
 	if p2.Index != 2 {
 		t.Fatalf("index while the orphan is fresh = %d, want 2", p2.Index)
 	}
-	if err := m.AbandonAdd(p2); err != nil {
+	if err := m.AbandonAdd(t.Context(), p2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -173,11 +173,11 @@ func TestStaleReservationSweep(t *testing.T) {
 // teardownProbe wraps stubOverlay to observe AbandonAdd mid-teardown.
 type teardownProbe struct {
 	stubOverlay
-	onTeardown func()
+	onTeardown func(context.Context)
 }
 
-func (p *teardownProbe) Teardown(_, _ string) (string, error) {
-	p.onTeardown()
+func (p *teardownProbe) Teardown(ctx context.Context, _, _ string) (string, error) {
+	p.onTeardown(ctx)
 	return "", nil
 }
 
@@ -192,7 +192,7 @@ func TestAbandonAddReleasesAfterTeardown(t *testing.T) {
 	m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
 		return &teardownProbe{
 			stubOverlay: stubOverlay{backend: fkoverlay.BackendSymlink},
-			onTeardown: func() {
+			onTeardown: func(context.Context) {
 				// Mid-teardown the lowest free index must not be p's: its
 				// reservation is still live.
 				n, rerr := m.Store.ReserveAccountIndex()
@@ -209,7 +209,7 @@ func TestAbandonAddReleasesAfterTeardown(t *testing.T) {
 			},
 		}, nil
 	}
-	if err := m.AbandonAdd(p); err != nil {
+	if err := m.AbandonAdd(t.Context(), p); err != nil {
 		t.Fatal(err)
 	}
 	m.OverlayFor = nil
@@ -219,6 +219,56 @@ func TestAbandonAddReleasesAfterTeardown(t *testing.T) {
 	}
 	if next.Index != p.Index {
 		t.Fatalf("index after abandon = %d, want the freed %d", next.Index, p.Index)
+	}
+}
+
+func TestManagerTeardownPropagatesContext(t *testing.T) {
+	type requestKey struct{}
+	const requestValue = "caller"
+
+	for _, tc := range []struct {
+		name string
+		run  func(context.Context, *Manager) error
+	}{
+		{
+			name: "abandon add",
+			run: func(ctx context.Context, m *Manager) error {
+				p, err := m.PrepareAdd(ctx)
+				if err != nil {
+					return err
+				}
+				return m.AbandonAdd(ctx, p)
+			},
+		},
+		{
+			name: "remove",
+			run: func(ctx context.Context, m *Manager) error {
+				a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", OverlayKind: string(fkoverlay.BackendSymlink)}
+				if err := m.Store.UpsertAccount(a); err != nil {
+					return err
+				}
+				return m.Remove(ctx, a.ID, true)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := setupReservePool(t)
+			var got any
+			probe := &teardownProbe{
+				stubOverlay: stubOverlay{backend: fkoverlay.BackendSymlink},
+				onTeardown: func(ctx context.Context) {
+					got = ctx.Value(requestKey{})
+				},
+			}
+			m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return probe, nil }
+			ctx := context.WithValue(t.Context(), requestKey{}, requestValue)
+			if err := tc.run(ctx, m); err != nil {
+				t.Fatal(err)
+			}
+			if got != requestValue {
+				t.Fatalf("provider context value = %v, want %q", got, requestValue)
+			}
+		})
 	}
 }
 

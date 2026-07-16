@@ -136,3 +136,15 @@ type JournalRisk struct {
 	Warning    string
 	RecordedAt time.Time
 }
+
+// OverlayApplied is the last content generation successfully applied to one
+// account's stored overlay backend. A backend change invalidates the stamps.
+type OverlayApplied struct {
+	AccountID      int
+	Backend        string
+	CanonicalStamp string
+	SettingsStamp  string
+	StructureStamp string
+	AppStamp       string
+	AppliedAt      time.Time
+}

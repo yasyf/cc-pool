@@ -15,15 +15,15 @@ import (
 type FPBridgeVerdict string
 
 const (
-	// FPBridgeServing: the bridge answers a Manifest+Read self-test.
+	// FPBridgeServing means the bridge answers a Manifest+Read self-test.
 	FPBridgeServing FPBridgeVerdict = "serving"
-	// FPBridgeConsentParked: the bind is parked on the one-time app-group-container
+	// FPBridgeConsentParked means the bind is parked on the one-time app-group-container
 	// TCC consent; the daemon binds automatically once it is granted.
 	FPBridgeConsentParked FPBridgeVerdict = "consent-parked"
-	// FPBridgeBoundDead: the socket is bound but a content round-trip fails —
+	// FPBridgeBoundDead means the socket is bound but a content round-trip fails —
 	// bound-but-dead (the daemon is up but its bridge is not serving).
 	FPBridgeBoundDead FPBridgeVerdict = "bound-dead"
-	// FPBridgeDown: the bridge socket is not bound (dial refused).
+	// FPBridgeDown means the bridge socket is not bound (dial refused).
 	FPBridgeDown FPBridgeVerdict = "down"
 )
 

@@ -33,7 +33,7 @@ func newCSFixture(t *testing.T) csFixture {
 		t.Fatal(err)
 	}
 	return csFixture{
-		src:      NewPoolContentSource(claudeDir, baseCJ),
+		src:      NewPoolContentSource(claudeDir, baseCJ, filepath.Join(root, "content-stamps")),
 		domain:   domain,
 		baseCJ:   baseCJ,
 		baseSet:  filepath.Join(claudeDir, "settings.json"),
@@ -62,8 +62,18 @@ func readJSON(t *testing.T, b []byte) map[string]any {
 	return m
 }
 
+func refreshSemanticStamps(t *testing.T, f csFixture) (SemanticStamps, SemanticStampChanges) {
+	t.Helper()
+	stamps, changes, err := f.src.RefreshSemanticStamps()
+	if err != nil {
+		t.Fatalf("RefreshSemanticStamps: %v", err)
+	}
+	return stamps, changes
+}
+
 func TestPoolContentSourceManifest(t *testing.T) {
 	f := newCSFixture(t)
+	refreshSemanticStamps(t, f)
 	entries, err := f.src.Manifest(f.domain)
 	if err != nil {
 		t.Fatalf("Manifest: %v", err)
@@ -84,15 +94,15 @@ func TestPoolContentSourceManifest(t *testing.T) {
 	if cj.Kind != content.EntrySynth || !cj.Private {
 		t.Errorf(".claude.json entry = %+v, want private synth", cj)
 	}
-	if len(cj.Freshness) != 2 || cj.Freshness[0] != f.privCJ || cj.Freshness[1] != f.baseCJ {
-		t.Errorf(".claude.json freshness = %v, want [%s %s]", cj.Freshness, f.privCJ, f.baseCJ)
+	if len(cj.Freshness) != 2 || cj.Freshness[0] != f.privCJ || cj.Freshness[1] != f.src.canonicalStampPath() {
+		t.Errorf(".claude.json freshness = %v, want [%s %s]", cj.Freshness, f.privCJ, f.src.canonicalStampPath())
 	}
 	set := byName["settings.json"]
 	if set.Kind != content.EntrySynth || set.Private {
 		t.Errorf("settings.json entry = %+v, want shared synth", set)
 	}
-	if len(set.Freshness) != 1 || set.Freshness[0] != f.baseSet {
-		t.Errorf("settings.json freshness = %v, want [%s]", set.Freshness, f.baseSet)
+	if len(set.Freshness) != 1 || set.Freshness[0] != f.src.settingsStampPath() {
+		t.Errorf("settings.json freshness = %v, want [%s]", set.Freshness, f.src.settingsStampPath())
 	}
 }
 
@@ -330,6 +340,7 @@ func TestPoolContentSourceManifestCarveOut(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	refreshSemanticStamps(t, f)
 	entries, err := f.src.Manifest(f.domain)
 	if err != nil {
 		t.Fatalf("Manifest: %v", err)
@@ -440,6 +451,7 @@ func TestPoolContentSourceHealthErrors(t *testing.T) {
 // manifestVersion returns the Version of the named synth entry in domain's manifest.
 func manifestVersion(t *testing.T, f csFixture, name string) string {
 	t.Helper()
+	refreshSemanticStamps(t, f)
 	entries, err := f.src.Manifest(f.domain)
 	if err != nil {
 		t.Fatalf("Manifest: %v", err)
@@ -451,6 +463,65 @@ func manifestVersion(t *testing.T, f csFixture, name string) string {
 	}
 	t.Fatalf("no manifest entry %q", name)
 	return ""
+}
+
+func TestSemanticStampsIgnoreFormattingAndPrivateOnlyCanonicalChurn(t *testing.T) {
+	f := newCSFixture(t)
+	writeJSON(t, f.baseCJ, map[string]any{"theme": "dark", "numStartups": 1})
+	if err := os.WriteFile(f.baseSet, []byte("{\n  \"theme\": \"dark\"\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := refreshSemanticStamps(t, f)
+
+	if err := os.WriteFile(f.baseCJ, []byte(`{"numStartups":999,"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.baseSet, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, changes := refreshSemanticStamps(t, f)
+	if first != second {
+		t.Fatalf("semantic stamps changed on private-only/formatting churn: first=%+v second=%+v", first, second)
+	}
+	if changes.Canonical || changes.Settings || changes.Structure {
+		t.Fatalf("changes = %+v, want none", changes)
+	}
+
+	writeJSON(t, f.baseCJ, map[string]any{"theme": "light", "numStartups": 999})
+	third, changes := refreshSemanticStamps(t, f)
+	if third.Canonical == second.Canonical || !changes.Canonical {
+		t.Fatalf("shared canonical change not reflected: second=%+v third=%+v changes=%+v", second, third, changes)
+	}
+}
+
+func TestSemanticStructureIgnoresLiveSharedSymlinkContent(t *testing.T) {
+	f := newCSFixture(t)
+	shared := filepath.Join(filepath.Dir(f.baseSet), "history.jsonl")
+	if err := os.WriteFile(shared, []byte("first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := refreshSemanticStamps(t, f)
+
+	if err := os.WriteFile(shared, []byte("second and larger\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, changes := refreshSemanticStamps(t, f)
+	if first.Structure != second.Structure || changes.Structure {
+		t.Fatalf("live shared symlink content changed structure: first=%q second=%q changes=%+v", first.Structure, second.Structure, changes)
+	}
+	entries, err := f.src.Manifest(f.domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name == "history.jsonl" {
+			if entry.Kind != content.EntrySymlink || entry.Target != shared {
+				t.Fatalf("history.jsonl entry = %+v, want live symlink to %s", entry, shared)
+			}
+			return
+		}
+	}
+	t.Fatal("history.jsonl missing from manifest")
 }
 
 // TestManifestSynthVersionsTrackFreshness pins that each synth entry carries a

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -44,6 +45,12 @@ func markFPRow(t *testing.T, s *Server, id int) {
 	if err := s.m.Store.SetAccountOverlayKind(id, string(fkoverlay.BackendFileProvider)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func bookFPAppBackoff(s *Server, now time.Time) {
+	s.ledMu.Lock()
+	defer s.ledMu.Unlock()
+	s.led.attempt(fpAppPolicy, fpAppResource, attemptPrimary, now)
 }
 
 func TestEnsureFPAppSpawnsWhenWanted(t *testing.T) {
@@ -118,7 +125,7 @@ func TestEnsureFPAppNegatives(t *testing.T) {
 			name:      "backoff not due",
 			available: func() bool { return false },
 			domains:   func() ([]int, error) { return nil, nil },
-			prep:      func(t *testing.T, s *Server) { markFPRow(t, s, 1); s.bookFPAppEnsure(time.Now()) },
+			prep:      func(t *testing.T, s *Server) { markFPRow(t, s, 1); bookFPAppBackoff(s, time.Now()) },
 		},
 		{
 			name:      "file provider not wired",
@@ -183,6 +190,44 @@ func TestEnsureFPAppNonBlocking(t *testing.T) {
 	}
 	close(release)
 	s.wg.Wait()
+}
+
+func TestEnsureFPAppConcurrentAdmissionSpawnsOnce(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, _ := newTestServer(t)
+	s.fpSynth = alwaysNonEmpty
+	markFPRow(t, s, 1)
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var spawns atomic.Int32
+	stubFPAppSeams(t, func() bool { return false }, func(context.Context) error {
+		if spawns.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return nil
+	}, func() ([]int, error) { return nil, nil })
+
+	var callers sync.WaitGroup
+	callers.Add(2)
+	for range 2 {
+		go func() {
+			defer callers.Done()
+			s.ensureFPAppAsync(t.Context())
+		}()
+	}
+	callers.Wait()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("app spawn did not start")
+	}
+	s.ensureFPAppAsync(t.Context())
+	close(release)
+	s.wg.Wait()
+	if got := spawns.Load(); got != 1 {
+		t.Fatalf("concurrent ensure spawned %d apps, want 1", got)
+	}
 }
 
 // TestEnsureFPAppSpawnFailureLogged pins that a failed launch does not panic and

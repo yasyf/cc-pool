@@ -37,11 +37,10 @@ type fakeFuse struct {
 	created       string
 }
 
-func (f *fakeFuse) Backend() fkoverlay.Backend    { return fkoverlay.BackendNFS }
-func (f *fakeFuse) Sync(_, _ string) error        { return nil }
-func (f *fakeFuse) Health(_, _ string) error      { return nil }
-func (f *fakeFuse) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
-func (f *fakeFuse) Setup(_, dir string) error {
+func (f *fakeFuse) Backend() fkoverlay.Backend                  { return fkoverlay.BackendNFS }
+func (f *fakeFuse) Check(context.Context, string, string) error { return nil }
+func (f *fakeFuse) PrivateRoot(dir string) string               { return fkoverlay.FusePrivateRoot(dir) }
+func (f *fakeFuse) Reconcile(_ context.Context, _, dir string) error {
 	priv := fkoverlay.FusePrivateRoot(dir)
 	privIdentity := false
 	if _, err := os.Stat(filepath.Join(priv, ".claude.json")); err == nil {
@@ -70,7 +69,7 @@ func (f *fakeFuse) Setup(_, dir string) error {
 	return nil
 }
 
-func (f *fakeFuse) Teardown(_, _ string) (string, error) {
+func (f *fakeFuse) Teardown(context.Context, string, string) (string, error) {
 	*f.ops = append(*f.ops, "fuse.teardown")
 	if f.teardownErr != nil {
 		return "", f.teardownErr
@@ -95,7 +94,7 @@ func newConvertFixture(t *testing.T, fake *fakeFuse) (*Manager, store.Account, s
 	}
 
 	dir := filepath.Join(home, "acct-01")
-	if err := newSymlinkProvider().Setup(base, dir); err != nil {
+	if err := newSymlinkProvider().Reconcile(t.Context(), base, dir); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(identityJSON), 0o600); err != nil {
@@ -861,13 +860,13 @@ type hookedSymlink struct {
 	preTeardown func() error
 }
 
-func (h *hookedSymlink) Teardown(base, dir string) (string, error) {
+func (h *hookedSymlink) Teardown(ctx context.Context, base, dir string) (string, error) {
 	if h.preTeardown != nil {
 		if err := h.preTeardown(); err != nil {
 			return "", err
 		}
 	}
-	return h.SymlinkProvider.Teardown(base, dir)
+	return h.SymlinkProvider.Teardown(ctx, base, dir)
 }
 
 // TestConvertToFuseCancelledBeforeMoveAbortsCleanly: a spent budget observed
@@ -1213,12 +1212,11 @@ type bridgeFuse struct {
 	onSetup  func(dir string) // fault injection inside Setup, before setupErr
 }
 
-func (b *bridgeFuse) Backend() fkoverlay.Backend    { return fkoverlay.BackendNFS }
-func (b *bridgeFuse) Sync(_, _ string) error        { return nil }
-func (b *bridgeFuse) Health(_, _ string) error      { return nil }
-func (b *bridgeFuse) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
+func (b *bridgeFuse) Backend() fkoverlay.Backend                  { return fkoverlay.BackendNFS }
+func (b *bridgeFuse) Check(context.Context, string, string) error { return nil }
+func (b *bridgeFuse) PrivateRoot(dir string) string               { return fkoverlay.FusePrivateRoot(dir) }
 
-func (b *bridgeFuse) Setup(base, dir string) error {
+func (b *bridgeFuse) Reconcile(_ context.Context, base, dir string) error {
 	*b.ops = append(*b.ops, "setup")
 	if b.onSetup != nil {
 		b.onSetup(dir)
@@ -1229,7 +1227,7 @@ func (b *bridgeFuse) Setup(base, dir string) error {
 	return muxSetupSim(base, dir)
 }
 
-func (b *bridgeFuse) Teardown(_, dir string) (string, error) {
+func (b *bridgeFuse) Teardown(_ context.Context, _, dir string) (string, error) {
 	*b.ops = append(*b.ops, "teardown")
 	fi, err := os.Lstat(dir)
 	if os.IsNotExist(err) {
@@ -1385,10 +1383,9 @@ func newFakeFP(t *testing.T, ops *[]string) *fakeFP {
 	return &fakeFP{ops: ops, domainsRoot: t.TempDir(), registered: map[string]bool{}}
 }
 
-func (f *fakeFP) Backend() fkoverlay.Backend    { return fkoverlay.BackendFileProvider }
-func (f *fakeFP) Sync(_, _ string) error        { return nil }
-func (f *fakeFP) Health(_, _ string) error      { return nil }
-func (f *fakeFP) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
+func (f *fakeFP) Backend() fkoverlay.Backend                  { return fkoverlay.BackendFileProvider }
+func (f *fakeFP) Check(context.Context, string, string) error { return nil }
+func (f *fakeFP) PrivateRoot(dir string) string               { return fkoverlay.FusePrivateRoot(dir) }
 
 // ProbeDomain models the companion app's control-op verdict: it reads the
 // backing .claude.json the bridge serves at the domain root (never a
@@ -1430,7 +1427,7 @@ func (f *fakeFP) domainRoot(dir string) string {
 	return filepath.Join(f.domainsRoot, "CCPoolStatus-"+filepath.Base(dir))
 }
 
-func (f *fakeFP) Setup(_, dir string) error {
+func (f *fakeFP) Reconcile(_ context.Context, _, dir string) error {
 	*f.ops = append(*f.ops, "fp.setup")
 	if f.setupErr != nil {
 		return f.setupErr
@@ -1461,7 +1458,7 @@ func (f *fakeFP) Setup(_, dir string) error {
 	return nil
 }
 
-func (f *fakeFP) Teardown(_, dir string) (string, error) {
+func (f *fakeFP) Teardown(_ context.Context, _, dir string) (string, error) {
 	*f.ops = append(*f.ops, "fp.teardown")
 	if f.teardownErr != nil {
 		return "", f.teardownErr
@@ -1475,7 +1472,7 @@ func (f *fakeFP) Teardown(_, dir string) (string, error) {
 
 // RemoveDomain deregisters WITHOUT retracting the bridge symlink (unlike Teardown),
 // mirroring fusekit's RemoveDomain: removing a never-registered domain is a no-op.
-func (f *fakeFP) RemoveDomain(dir string) error {
+func (f *fakeFP) RemoveDomain(_ context.Context, dir string) error {
 	*f.ops = append(*f.ops, "fp.removedomain")
 	delete(f.registered, filepath.Base(dir))
 	return nil
@@ -2318,12 +2315,13 @@ func TestConvertCrashInjectionPreservesIdentity(t *testing.T) {
 // dispatch's default arm is reachable behind the Backend() equality fences.
 type stubProvider struct{ backend fkoverlay.Backend }
 
-func (s stubProvider) Backend() fkoverlay.Backend           { return s.backend }
-func (s stubProvider) Setup(_, _ string) error              { return nil }
-func (s stubProvider) Sync(_, _ string) error               { return nil }
-func (s stubProvider) Health(_, _ string) error             { return nil }
-func (s stubProvider) Teardown(_, _ string) (string, error) { return "", nil }
-func (s stubProvider) PrivateRoot(dir string) string        { return dir }
+func (s stubProvider) Backend() fkoverlay.Backend                      { return s.backend }
+func (s stubProvider) Reconcile(context.Context, string, string) error { return nil }
+func (s stubProvider) Check(context.Context, string, string) error     { return nil }
+func (s stubProvider) Teardown(context.Context, string, string) (string, error) {
+	return "", nil
+}
+func (s stubProvider) PrivateRoot(dir string) string { return dir }
 
 // TestConvertOverlayRefusesUnknownTargetArm pins the dispatch's loud default: a
 // target backend with no conversion arm errors without touching the account.

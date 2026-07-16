@@ -488,7 +488,10 @@ func TestCheckFPRungsRunsConsentInline(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(stable), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(stable, []byte("test"), 0o700); err != nil {
+	if err := os.WriteFile(stable, []byte("test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stable, 0o700); err != nil { //nolint:gosec // G302: test fixture must be executable.
 		t.Fatal(err)
 	}
 	swapVar(t, &fpControlHealth, func(context.Context) (string, error) { return "9.9.9", nil })
@@ -703,7 +706,10 @@ func TestRunFPConsent(t *testing.T) {
 				if err := os.MkdirAll(filepath.Dir(stable), 0o700); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(stable, []byte("test"), 0o700); err != nil {
+				if err := os.WriteFile(stable, []byte("test"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(stable, 0o700); err != nil { //nolint:gosec // G302: test fixture must be executable.
 					t.Fatal(err)
 				}
 			case "dir":

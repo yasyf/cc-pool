@@ -171,7 +171,7 @@ func (h *holderState) shallowLive(dir string) bool {
 
 // heldDead reports a healthy holder listing dir as unservable: not Live or
 // deep-wedged. Presence gates it — the holder lists a mount only after a
-// successful Setup, so a TCC-blocked or never-mounted dir can never hot-loop.
+// successful Reconcile, so a TCC-blocked or never-mounted dir can never hot-loop.
 func (h *holderState) heldDead(dir string) (dead, wedged bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -258,7 +258,7 @@ func (h *holderState) stampProbedLocked(dir string) {
 }
 
 // noteMounted trusts a just-established mirror ahead of the next refresh; a
-// successful Setup also proves the holder healthy.
+// successful Reconcile also proves the holder healthy.
 func (h *holderState) noteMounted(dir string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

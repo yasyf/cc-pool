@@ -10,7 +10,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/lease"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/fusekit/proc"
@@ -105,15 +104,8 @@ type Manager struct {
 	// temp dir so a Seize/Probe never touches real state.
 	LeaseRoot func() (string, error)
 
-	// ContentSource is the merged-content seam wired into the memoized File
-	// Provider provider so its enumerator signal is fingerprint-gated (see
-	// overlay.FileProviderSpec.Source). The daemon injects the same PoolContentSource
-	// its bridge serves; nil (the CLI) leaves the FP signal unconditional.
-	ContentSource content.Source
-
-	// fpProvMu guards fpProv, the memoized File Provider provider — memoized so its
-	// fingerprint-signal cache (lastSignal) survives across the daemon's polls
-	// instead of being rebuilt (and re-signalling) every resolve.
+	// fpProvMu guards fpProv, the memoized File Provider provider shared by
+	// lifecycle and content-notification callers.
 	fpProvMu sync.Mutex
 	fpProv   fkoverlay.Provider
 

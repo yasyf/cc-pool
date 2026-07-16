@@ -90,6 +90,15 @@ CREATE TABLE IF NOT EXISTS journal_risks (
   warning     TEXT NOT NULL DEFAULT '',
   recorded_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS overlay_applied (
+  account_id      INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  backend         TEXT NOT NULL,
+  canonical_stamp TEXT NOT NULL,
+  settings_stamp  TEXT NOT NULL,
+  structure_stamp TEXT NOT NULL,
+  app_stamp       TEXT NOT NULL,
+  applied_at      INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_accounts_uuid ON accounts(account_uuid);
 `
 
@@ -533,6 +542,22 @@ func (s *Store) CloseSession(id int64, at time.Time) error {
 	_, err := s.db.Exec(`UPDATE sessions SET ended_at=? WHERE id=? AND ended_at IS NULL`,
 		at.Unix(), id)
 	return err
+}
+
+// CloseAccountSessionsPID closes every still-active row for one account and
+// process. The account qualifier makes a replayed or PID-reused checkin unable
+// to end another account's session.
+func (s *Store) CloseAccountSessionsPID(accountID, pid int, at time.Time) (int, error) {
+	res, err := s.db.Exec(`UPDATE sessions SET ended_at=?
+		WHERE account_id=? AND pid=? AND ended_at IS NULL`, at.Unix(), accountID, pid)
+	if err != nil {
+		return 0, fmt.Errorf("close account %d sessions for pid %d: %w", accountID, pid, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("close account %d sessions for pid %d: rows affected: %w", accountID, pid, err)
+	}
+	return int(n), nil
 }
 
 // ActiveSessionCount returns the number of live sessions for an account.

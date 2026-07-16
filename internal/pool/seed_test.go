@@ -21,6 +21,7 @@ const seedSrc = `{
 	"mcpServers": {"semble": {"command": "uvx", "args": ["semble-mcp"]}},
 	"projects": {"/Users/x/code": {"allowedTools": ["Bash(go test:*)"], "history": ["héllo ✓"]}},
 	"numStartups": 42,
+	"pluginUsage": {"example": {"count": 9}},
 	"userID": "deadbeef"
 }`
 
@@ -45,7 +46,7 @@ func TestSeedClaudeJSON(t *testing.T) {
 		return src
 	}
 
-	t.Run("copies and strips only oauthAccount", func(t *testing.T) {
+	t.Run("copies while stripping identity and telemetry", func(t *testing.T) {
 		acct := t.TempDir()
 		out, err := seedClaudeJSON(prov, acct, writeSrc(t, seedSrc))
 		if err != nil {
@@ -58,10 +59,14 @@ func TestSeedClaudeJSON(t *testing.T) {
 		if _, ok := got["oauthAccount"]; ok {
 			t.Fatal("oauthAccount survived the strip")
 		}
+		if _, ok := got["pluginUsage"]; ok {
+			t.Fatal("pluginUsage survived the strip")
+		}
 		want := decode(t, []byte(seedSrc))
 		delete(want, "oauthAccount")
+		delete(want, "pluginUsage")
 		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("seeded content diverged beyond the oauthAccount strip:\ngot  %v\nwant %v", got, want)
+			t.Fatalf("seeded content diverged beyond the identity/telemetry strip:\ngot  %v\nwant %v", got, want)
 		}
 		fi, err := os.Stat(filepath.Join(acct, ".claude.json"))
 		if err != nil {

@@ -97,7 +97,7 @@ func TestFPBridgeCheckClassify(t *testing.T) {
 		}
 		s := &Server{
 			log:           log.New(io.Discard, "", 0),
-			contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
+			contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(pool.StateDir(), "content-stamps")),
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -148,7 +148,7 @@ func TestRecordFPBridgeVerdict(t *testing.T) {
 func TestRecordFPBridgeHealthNonFPMachine(t *testing.T) {
 	s, _ := newTestServer(t) // two symlink accounts, zero FP rows
 	s.fpBridgeCheckFn = func(context.Context) FPBridgeStatus { return boundDeadStatus() }
-	// Seed a stale fault: the health pass must clear it, not leave it alerting.
+	// Seed a stale fault: the check pass must clear it, not leave it alerting.
 	s.recordFPBridgeVerdict(boundDeadStatus())
 	s.recordFPBridgeVerdict(boundDeadStatus())
 	if !s.fpBridgeFaulted() {
@@ -223,8 +223,8 @@ func TestHandleFPRepairBridgeGate(t *testing.T) {
 		if len(resp.FPRepairs) != 0 {
 			t.Fatalf("FPRepairs = %+v, want no domain claims on a gated repair", resp.FPRepairs)
 		}
-		if _, setups, _, teardowns := fake.counts(); setups != 0 || teardowns != 0 {
-			t.Fatalf("setups=%d teardowns=%d, want 0/0 — a gated repair tears down nothing", setups, teardowns)
+		if _, registrations, _, teardowns := fake.counts(); registrations != 0 || teardowns != 0 {
+			t.Fatalf("registrations=%d teardowns=%d, want 0/0 — a gated repair tears down nothing", registrations, teardowns)
 		}
 	})
 
@@ -238,8 +238,8 @@ func TestHandleFPRepairBridgeGate(t *testing.T) {
 		if !resp.OK || len(resp.FPRepairs) != 1 || resp.FPRepairs[0].Outcome != FPRepairRetreated {
 			t.Fatalf("resp = %+v, want a retreat despite the bound-dead bridge (retreat is un-gated)", resp)
 		}
-		if _, setups, _, _ := fake.counts(); setups != 0 {
-			t.Fatalf("retreat re-registered (setups=%d), want 0", setups)
+		if _, registrations, _, _ := fake.counts(); registrations != 0 {
+			t.Fatalf("retreat re-registered (registrations=%d), want 0", registrations)
 		}
 	})
 }

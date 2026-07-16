@@ -16,6 +16,10 @@ const OAuthAccountKey = "oauthAccount"
 // skip the first-run onboarding wizard.
 const OnboardingCompletedKey = "hasCompletedOnboarding"
 
+// PluginUsageKey is Claude's account-local plugin telemetry. It must never
+// propagate between the canonical config and pooled accounts.
+const PluginUsageKey = "pluginUsage"
+
 // ClaudeJSONPrivateKeys are the top-level .claude.json keys that never cross
 // between base ~/.claude.json and an account's private copy in either
 // direction (the ClaudeJSONSharedProjectKeys carve-out inside "projects"
@@ -27,6 +31,7 @@ var ClaudeJSONPrivateKeys = map[string]bool{
 	"projects":       true,
 	"firstStartTime": true,
 	"numStartups":    true,
+	PluginUsageKey:   true,
 }
 
 // ClaudeJSONSharedProjectKeys are the keys inside each projects["<path>"]

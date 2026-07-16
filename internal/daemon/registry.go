@@ -2,8 +2,8 @@ package daemon
 
 import (
 	"context"
+	"time"
 
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -16,59 +16,35 @@ import (
 // tickers), the holder-loss edge trigger, and the request-scoped RPC handlers are
 // deliberately NOT rows — see their notes below.
 
-// tick is one maintenance pass's shared context. It carries a single, lazily
-// memoized procscan session scan so every consumer in the pass reads one snapshot
-// and the scan-fail-means-all-busy rule lives in exactly one place (idle). The
-// scan is lazy: a pass whose rows never ask about session liveness never scans, so
-// the startup table adds no scan and the heal tick scans at most once even though
-// two families (fuse.remount, strand.heal) consult it.
+// tick is one immutable view of the daemon-wide session heartbeat.
 type tick struct {
-	s       *Server
-	ctx     context.Context
-	scanned bool
-	sess    []procscan.Session
-	ok      bool
+	snapshot heartbeatSnapshot
 }
 
-// newTick builds a fresh per-pass tick; the scan runs on first access.
-func (s *Server) newTick(ctx context.Context) *tick { return &tick{s: s, ctx: ctx} }
-
-// scan runs (once) the tick's session scan, logging a failure a single time — the
-// one home of the "a failed scan proves nothing idle" message.
-func (t *tick) scan() {
-	if t.scanned {
-		return
+// newTick snapshots the shared heartbeat. The first test/startup consumer
+// initializes it synchronously; production starts the heartbeat before workers.
+func (s *Server) newTick(ctx context.Context) *tick {
+	h := s.heartbeatFor()
+	snapshot := h.view()
+	if !snapshot.initialized {
+		snapshot = h.refresh(ctx, 0).snapshot
 	}
-	t.scanned = true
-	sess, err := t.s.scan(t.ctx)
-	t.sess = sess
-	if err != nil {
-		t.s.log.Printf("procscan failed; treating all accounts as busy this tick: %v", err)
-		return
-	}
-	t.ok = true
+	return &tick{snapshot: snapshot}
 }
 
 // scanOK reports whether this tick's session scan succeeded.
-func (t *tick) scanOK() bool { t.scan(); return t.ok }
+func (t *tick) scanOK() bool { return t.snapshot.lastScanOK }
 
-// sessions returns this tick's memoized session scan (nil on a failed scan).
-func (t *tick) sessions() []procscan.Session { t.scan(); return t.sess }
-
-// idle reports whether dir backs no live claude session in this tick's scan. A
-// failed scan makes idle false for EVERY dir: this is the single home of the
-// daemon's scan-fail-means-all-busy fail-closed rule, and every ticker-pass
-// consumer inherits it here rather than re-deriving it.
+// idle reports whether dir is idle in a currently successful heartbeat. Failed
+// refreshes retain counts for diagnostics but make every dir non-idle, so token
+// refresh and destructive maintenance fail closed while liveness is unknown.
 func (t *tick) idle(dir string) bool {
-	t.scan()
-	return t.ok && procscan.CountByConfigDir(t.sess, dir) == 0
+	return t.snapshot.idle(dir)
 }
 
-// sessionCount returns dir's live-session count in this tick's scan (0 on a
-// failed scan).
+// sessionCount returns dir's count from the last successful heartbeat.
 func (t *tick) sessionCount(dir string) int {
-	t.scan()
-	return procscan.CountByConfigDir(t.sess, dir)
+	return t.snapshot.sessionCount(dir)
 }
 
 // claimScope documents a maintainer row's per-account claim discipline. It is
@@ -95,13 +71,13 @@ type maintainer struct {
 	run        func(s *Server, ctx context.Context, t *tick) bool
 }
 
-// runTable executes table in order over one shared tick: skip a gated-out row and
-// stop when a row's run returns false. It does not itself poll ctx between rows —
-// each pass handles cancellation internally exactly as it did before the cutover
-// (the old poll/heal/startup sequences had no per-step ctx check), and a poll that
-// aborts on ctx signals it by returning false.
+// runTable executes table in order over one shared tick: skip a gated-out row,
+// stop when a row returns false, and never begin another row after cancellation.
 func (s *Server) runTable(ctx context.Context, t *tick, table []maintainer) {
 	for _, m := range table {
+		if ctx.Err() != nil {
+			return
+		}
 		if m.gate != nil && !m.gate(s) {
 			continue
 		}
@@ -111,9 +87,52 @@ func (s *Server) runTable(ctx context.Context, t *tick, table []maintainer) {
 	}
 }
 
+// runDueTable executes only rows whose individual clocks are due, preserving
+// table order and advancing each clock before its gate/run body. A failed or
+// gated row therefore cannot spin the maintenance loop; its own recovery ledger
+// still controls any finer-grained backoff inside the body.
+func (s *Server) runDueTable(
+	ctx context.Context,
+	t *tick,
+	table []maintainer,
+	due map[string]time.Time,
+	now time.Time,
+	interval func(string) time.Duration,
+) time.Time {
+	var next time.Time
+	for _, m := range table {
+		if ctx.Err() != nil {
+			return next
+		}
+		rowDue, scheduled := due[m.name]
+		if scheduled && now.Before(rowDue) {
+			if next.IsZero() || rowDue.Before(next) {
+				next = rowDue
+			}
+			continue
+		}
+		cadence := interval(m.name)
+		if cadence <= 0 {
+			cadence = defaultHealInterval
+		}
+		rowDue = now.Add(cadence)
+		due[m.name] = rowDue
+		if next.IsZero() || rowDue.Before(next) {
+			next = rowDue
+		}
+		if m.gate != nil && !m.gate(s) {
+			continue
+		}
+		if !m.run(s, ctx, t) {
+			return next
+		}
+	}
+	return next
+}
+
 // pollTable is the scheduler poll pass. Deliberately no fp row: File Provider
 // recovery is owned exclusively by the backoff-gated heal ticker (probe + recovery
-// ladder), so a Health+Setup on every poll would be the reconcile storm that
+// ladder), so a Check+Reconcile on every poll would be the reconcile storm that
 // removing the inline FP path fixed — with the registry this exclusion is now
 // structural (registry_test.go asserts it). account.poll's body stays whole
 // (outage canary, inline healFuse fallback, AdoptRotatedToken, SampleUsage, auth
@@ -122,10 +141,6 @@ func (s *Server) runTable(ctx context.Context, t *tick, table []maintainer) {
 var pollTable = []maintainer{
 	{"holder.refresh", claimNone, nil, func(s *Server, _ context.Context, _ *tick) bool {
 		s.holder.refresh(s.holderClient())
-		return true
-	}},
-	{"session.reconcile", claimNone, nil, func(s *Server, _ context.Context, t *tick) bool {
-		s.reconcileDeadSessions(t)
 		return true
 	}},
 	{"widget.stale", claimNone, nil, func(s *Server, ctx context.Context, _ *tick) bool {
@@ -199,10 +214,14 @@ var healTable = []maintainer{
 // after bridge.fp settles consent) warms the companion app in parallel so the
 // first FP account's reconcile finds it up rather than eating the cold ~30s
 // spawn serially; overlays.reconcile must finish
-// first (it and the loops both touch fuse Setup). Carcass clearing is the shared
+// first (it and the loops both touch fuse Reconcile). Carcass clearing is the shared
 // holder's job now, so the startup reconcile sweeps nothing. bridge.fp wraps
 // today's in-daemon FP-bridge bind unchanged.
 var startupTable = []maintainer{
+	{"session.heartbeat", claimNone, nil, func(s *Server, ctx context.Context, _ *tick) bool {
+		s.startHeartbeat(ctx)
+		return true
+	}},
 	{"bridge.content", claimNone, nil, func(s *Server, ctx context.Context, _ *tick) bool {
 		s.startContentBridge(ctx)
 		return true
@@ -225,6 +244,10 @@ var startupTable = []maintainer{
 	}},
 	{"overlays.reconcile", claimPerAccount, nil, func(s *Server, ctx context.Context, _ *tick) bool {
 		s.reconcileOverlays(ctx)
+		return true
+	}},
+	{"content.coordinator", claimNone, func(s *Server) bool { return s.overlayCoordinator != nil }, func(s *Server, ctx context.Context, _ *tick) bool {
+		s.overlayCoordinator.start(ctx)
 		return true
 	}},
 }

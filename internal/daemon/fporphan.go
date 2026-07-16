@@ -112,7 +112,7 @@ func (s *Server) reapOrphanFPDomain(ctx context.Context, id int, guard fpOwnerSe
 		return
 	}
 	s.log.Printf("deregistering orphaned file provider domain %s (root %s): no account owns it after %d confirmations", name, root, fpOrphanReapStrikes)
-	if err := remover.RemoveDomain(dir); err != nil {
+	if err := remover.RemoveDomain(ctx, dir); err != nil {
 		s.log.Printf("deregister orphaned file provider domain %s: %v; retrying after %s", name, err, fpOrphanReapBackoff.Base)
 		s.fpOrphanBookRetry(dir, now)
 		return
@@ -164,7 +164,7 @@ func (s *Server) fpOrphanGuardSet() (fpOwnerSet, bool) {
 // fresh guard set. The ownership read runs LAST, adjacent to RemoveDomain, so a
 // concurrent `ccp add` reserving the freed index has the narrowest possible
 // window to slip past — the residual TOCTOU reconfirm-before-kill accepts (a
-// lost race is self-healing: fusekit Setup re-registers an absent domain). It
+// lost race is self-healing: fusekit Reconcile re-registers an absent domain). It
 // returns true only when the candidate is still a registered, unowned domain;
 // any non-registered verdict, listing error, or ownership returns false so the
 // caller leaves the domain untouched.

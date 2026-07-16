@@ -56,11 +56,6 @@ const fpBridgeStrikes = 2
 // breaker trips and heal parks the domain until reset.
 const fpRecoveryBreaker = 5
 
-// fpDeepProbeInterval spaces the slow deep re-probe of a HEALTHY File Provider row:
-// the byte-count probe catches the serve-stale / 0-byte wedge (FPFS lies at size
-// 0), so it runs on this interval instead of every healer tick.
-const fpDeepProbeInterval = 5 * time.Minute
-
 // fpRecoveryBackoff spaces a wedged domain's recovery attempts: 30s after the
 // first attempt, doubling to a 10m cap.
 var fpRecoveryBackoff = proc.Backoff{Base: 30 * time.Second, Cap: 10 * time.Minute}

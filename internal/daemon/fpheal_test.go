@@ -96,15 +96,15 @@ func healFPStep(t *testing.T, s *Server, a store.Account, now time.Time) {
 }
 
 // TestFPHealLadderEscalation pins the escalation order: attempt 1 is a
-// non-destructive Sync, attempts 2–4 re-register the domain (Teardown+Setup).
+// non-destructive Reconcile, attempts 2–4 re-register the domain (Teardown+Reconcile).
 func TestFPHealLadderEscalation(t *testing.T) {
 	s, a, dirs, fake := newFPHealServer(t)
 	wedgeIt(t, s, dirs[1])
 	now := time.Unix(0, 0)
 
 	healFPStep(t, s, a, now)
-	if _, setups, syncs, teardowns := fake.counts(); syncs != 1 || setups != 0 || teardowns != 0 {
-		t.Fatalf("attempt 1: syncs=%d setups=%d teardowns=%d, want 1/0/0 (Sync only)", syncs, setups, teardowns)
+	if _, registrations, reasserts, teardowns := fake.counts(); reasserts != 1 || registrations != 0 || teardowns != 0 {
+		t.Fatalf("attempt 1: reasserts=%d registrations=%d teardowns=%d, want 1/0/0 (Reconcile only)", reasserts, registrations, teardowns)
 	}
 	if s.fpAttemptsSoFar(dirs[1]) != 1 {
 		t.Fatalf("attempt 1 not booked: attemptsSoFar=%d", s.fpAttemptsSoFar(dirs[1]))
@@ -112,10 +112,10 @@ func TestFPHealLadderEscalation(t *testing.T) {
 
 	for attempt := 2; attempt <= 4; attempt++ {
 		healFPStep(t, s, a, now)
-		_, setups, syncs, teardowns := fake.counts()
+		_, registrations, reasserts, teardowns := fake.counts()
 		wantRR := attempt - 1 // re-registers so far
-		if syncs != 1 || setups != wantRR || teardowns != wantRR {
-			t.Fatalf("attempt %d: syncs=%d setups=%d teardowns=%d, want 1/%d/%d (Sync + %d re-registers)", attempt, syncs, setups, teardowns, wantRR, wantRR, wantRR)
+		if reasserts != 1 || registrations != wantRR || teardowns != wantRR {
+			t.Fatalf("attempt %d: reasserts=%d registrations=%d teardowns=%d, want 1/%d/%d (Reconcile + %d re-registers)", attempt, reasserts, registrations, teardowns, wantRR, wantRR, wantRR)
 		}
 	}
 	if kind := kindOf(t, s, 1); kind != "fileprovider" {
@@ -152,8 +152,8 @@ func TestFPHealBreakerParksWhenIdle(t *testing.T) {
 	if bounced != 1 {
 		t.Fatalf("extension bounce fired %d times, want exactly 1 at the breaker", bounced)
 	}
-	if _, setups, _, teardowns := fake.counts(); setups < 1 || teardowns < 1 {
-		t.Fatalf("breaker must run one final re-register: setups=%d teardowns=%d, want >=1/>=1", setups, teardowns)
+	if _, registrations, _, teardowns := fake.counts(); registrations < 1 || teardowns < 1 {
+		t.Fatalf("breaker must run one final re-register: registrations=%d teardowns=%d, want >=1/>=1", registrations, teardowns)
 	}
 	if kind := kindOf(t, s, 1); kind != "fileprovider" {
 		t.Fatalf("breaker auto-retreated a controllable domain (the R1 regression): kind = %q, want fileprovider (parked)", kind)
@@ -208,14 +208,14 @@ func TestFPHealReservationDefersReRegister(t *testing.T) {
 	wedgeIt(t, s, dirs[1])
 	now := time.Unix(0, 0)
 
-	healFPStep(t, s, a, now) // attempt 1: Sync; attemptsSoFar -> 1
+	healFPStep(t, s, a, now) // attempt 1: Reconcile; attemptsSoFar -> 1
 	if !s.cl.reserve(1) {
 		t.Fatal("could not reserve acct-1")
 	}
 	healFPStep(t, s, a, now) // attempt 2 would re-register, but the reservation defers it
 
-	if _, setups, _, teardowns := fake.counts(); setups != 0 || teardowns != 0 {
-		t.Fatalf("re-register ran under a reservation: setups=%d teardowns=%d, want 0/0", setups, teardowns)
+	if _, registrations, _, teardowns := fake.counts(); registrations != 0 || teardowns != 0 {
+		t.Fatalf("re-register ran under a reservation: registrations=%d teardowns=%d, want 0/0", registrations, teardowns)
 	}
 	if got := s.fpAttemptsSoFar(dirs[1]); got != 1 {
 		t.Fatalf("a deferred step consumed an attempt: attemptsSoFar=%d, want 1", got)
@@ -233,26 +233,26 @@ func TestFPHealReRegisterProceedsUnderLiveSessions(t *testing.T) {
 	wedgeIt(t, s, dirs[1])
 	now := time.Unix(0, 0)
 
-	healFPStep(t, s, a, now) // attempt 1: Sync
+	healFPStep(t, s, a, now) // attempt 1: Reconcile
 	healFPStep(t, s, a, now) // attempt 2: re-register, despite the live session
 
-	if _, setups, _, teardowns := fake.counts(); setups != 1 || teardowns != 1 {
-		t.Fatalf("re-register did not proceed under a live session: setups=%d teardowns=%d, want 1/1", setups, teardowns)
+	if _, registrations, _, teardowns := fake.counts(); registrations != 1 || teardowns != 1 {
+		t.Fatalf("re-register did not proceed under a live session: registrations=%d teardowns=%d, want 1/1", registrations, teardowns)
 	}
 	if kind := kindOf(t, s, 1); kind != "fileprovider" {
 		t.Fatalf("re-register must not change the row: kind = %q", kind)
 	}
 }
 
-// TestFPHealReRegisterRetreatsOnCannotControl pins that a re-register whose Setup
+// TestFPHealReRegisterRetreatsOnCannotControl pins that a re-register whose Reconcile
 // reports ErrCannotControl retreats to symlink inline (FP cannot serve here).
 func TestFPHealReRegisterRetreatsOnCannotControl(t *testing.T) {
 	s, a, dirs, fake := newFPHealServer(t)
-	fake.setupErr = fmt.Errorf("file provider setup: %w", fileproviderd.ErrCannotControl)
+	fake.registerErr = fmt.Errorf("file provider reconcile: %w", fileproviderd.ErrCannotControl)
 	wedgeIt(t, s, dirs[1])
 	now := time.Unix(0, 0)
 
-	healFPStep(t, s, a, now) // attempt 1: Sync
+	healFPStep(t, s, a, now) // attempt 1: Reconcile
 	healFPStep(t, s, a, now) // attempt 2: re-register -> ErrCannotControl -> retreat
 
 	if kind := kindOf(t, s, 1); kind != "symlink" {
@@ -263,32 +263,23 @@ func TestFPHealReRegisterRetreatsOnCannotControl(t *testing.T) {
 	}
 }
 
-// TestHealFPRowsDetectsWedgeThenRecovers pins the ticker-driven flow: two periodic deep
-// wedged probes cross the strike threshold (attempt 1 fires), and a later deep
-// due-window probe (healthy) clears the verdict and the ladder.
-func TestHealFPRowsDetectsWedgeThenRecovers(t *testing.T) {
+// TestHealFPRowsRecoversSelectionDetectedWedge pins the event-driven split:
+// selection marks a wedge; maintenance deep-probes only that recovery row.
+func TestHealFPRowsRecoversSelectionDetectedWedge(t *testing.T) {
 	s, _, dirs, fake := newFPHealServer(t)
 	s.fpBridgeReadyFn = func() bool { return true }
 	swapFPDirLinked(t, func(string) bool { return true })
 
+	wedgeIt(t, s, dirs[1])
+	fpForceRecoveryDue(t, s, dirs[1])
 	var deep int
 	swapFPDomainProbe(t, func(_ context.Context, _ string) error { deep++; return overlay.ErrFPProbeWedged })
-
-	s.healFPRows(t.Context()) // deep strike 1: not wedged yet, no heal
-	if s.fpWedged(dirs[1]) {
-		t.Fatal("one strike must not wedge (2-strike debounce)")
+	s.healFPRows(t.Context())
+	if _, _, reasserts, _ := fake.counts(); reasserts != 1 {
+		t.Fatalf("attempt 1 (Reconcile) did not run on the wedge tick: reasserts=%d, want 1", reasserts)
 	}
-	forceFPDeepProbeDue(s, dirs[1])
-	s.healFPRows(t.Context()) // deep strike 2: wedged + due -> attempt 1 (Sync)
-
-	if !s.fpWedged(dirs[1]) {
-		t.Fatal("two consecutive deep wedged probes must mark the domain wedged")
-	}
-	if _, _, syncs, _ := fake.counts(); syncs != 1 {
-		t.Fatalf("attempt 1 (Sync) did not run on the wedge tick: syncs=%d, want 1", syncs)
-	}
-	if deep != 2 {
-		t.Fatalf("healthy rows deep-probed %d times over two forced due windows, want 2", deep)
+	if deep != 1 {
+		t.Fatalf("wedged row deep-probed %d times, want 1", deep)
 	}
 
 	// The domain recovers. A wedged row is deep-probed only on the due window, so
@@ -403,7 +394,7 @@ func TestProbeFPWinnerNoVerdictStaysReady(t *testing.T) {
 
 // TestHealFPRowsNoVerdictSkipsTick pins that a NoVerdict heal probe is neither a
 // strike nor a clear and never escalates the ladder: a previously-wedged domain
-// stays wedged with no new recovery attempt, and no Sync/re-register fires.
+// stays wedged with no new recovery attempt, and no Reconcile/re-register fires.
 func TestHealFPRowsNoVerdictSkipsTick(t *testing.T) {
 	s, _, dirs, fake := newFPHealServer(t)
 	s.fpBridgeReadyFn = func() bool { return true }
@@ -419,14 +410,14 @@ func TestHealFPRowsNoVerdictSkipsTick(t *testing.T) {
 	if s.fpAttemptsSoFar(dirs[1]) != 0 {
 		t.Fatalf("a NoVerdict tick must not book a recovery attempt: attemptsSoFar=%d, want 0", s.fpAttemptsSoFar(dirs[1]))
 	}
-	if _, setups, syncs, teardowns := fake.counts(); setups != 0 || syncs != 0 || teardowns != 0 {
-		t.Fatalf("a NoVerdict tick must not escalate the ladder: setups=%d syncs=%d teardowns=%d, want 0/0/0", setups, syncs, teardowns)
+	if _, registrations, reasserts, teardowns := fake.counts(); registrations != 0 || reasserts != 0 || teardowns != 0 {
+		t.Fatalf("a NoVerdict tick must not escalate the ladder: registrations=%d reasserts=%d teardowns=%d, want 0/0/0", registrations, reasserts, teardowns)
 	}
 }
 
 // TestReconcileFileProviderBackoffGate pins defect-3's reconcile gate: reconcile
 // defers to the heal ladder while it holds the domain wedged and is backing off
-// (no free Health+Setup), but proceeds when the domain is due (or not wedged).
+// (no free Check+Reconcile), but proceeds when the domain is due (or not wedged).
 func TestReconcileFileProviderBackoffGate(t *testing.T) {
 	t.Run("backing off defers reconcile", func(t *testing.T) {
 		s, a, dirs, fake := newFPHealServer(t)
@@ -437,7 +428,7 @@ func TestReconcileFileProviderBackoffGate(t *testing.T) {
 			t.Fatalf("reconcile outcome = %d, want fpDeferred (heal ladder owns the wedged domain)", got)
 		}
 		if h, se, _, _ := fake.counts(); h != 0 || se != 0 {
-			t.Fatalf("reconcile piled control ops on a backing-off domain: healths=%d setups=%d, want 0/0", h, se)
+			t.Fatalf("reconcile piled control ops on a backing-off domain: checks=%d registrations=%d, want 0/0", h, se)
 		}
 	})
 
@@ -449,25 +440,25 @@ func TestReconcileFileProviderBackoffGate(t *testing.T) {
 			t.Fatalf("reconcile outcome = %d, want fpHealthy (a due domain is not gated)", got)
 		}
 		if h, _, _, _ := fake.counts(); h != 1 {
-			t.Fatalf("a due domain must reconcile: healths=%d, want 1", h)
+			t.Fatalf("a due domain must reconcile: checks=%d, want 1", h)
 		}
 	})
 }
 
 // TestHealFPMissingRepairsDeregisteredDomain pins the control-plane gap fix: a
 // domain deregistered out from under the daemon probes ENOENT (Missing, which
-// never strikes the wedge ladder), but its Health fails — so the Missing heal
-// re-registers it (Setup) and resets any prior control-plane backoff.
+// never strikes the wedge ladder), but its Check fails — so the Missing heal
+// re-registers it (Reconcile) and resets any prior control-plane backoff.
 func TestHealFPMissingRepairsDeregisteredDomain(t *testing.T) {
 	s, a, dirs, fake := newFPHealServer(t)
-	fake.healthErr = errors.New("no domain registered") // control plane broken
-	s.fpRecordAttempt(dirs[1], time.Unix(0, 0))         // a prior attempt the successful repair must clear
-	now := time.Unix(0, 0).Add(time.Hour)               // well past the seeded backoff -> due
+	fake.checkErr = errors.New("no domain registered") // control plane broken
+	s.fpRecordAttempt(dirs[1], time.Unix(0, 0))        // a prior attempt the successful repair must clear
+	now := time.Unix(0, 0).Add(time.Hour)              // well past the seeded backoff -> due
 
 	s.healFPMissing(t.Context(), a, now)
 
-	if _, setups, _, _ := fake.counts(); setups != 1 {
-		t.Fatalf("deregistered domain not re-registered: setups=%d, want 1", setups)
+	if _, registrations, _, _ := fake.counts(); registrations != 1 {
+		t.Fatalf("deregistered domain not re-registered: registrations=%d, want 1", registrations)
 	}
 	if kind := kindOf(t, s, 1); kind != "fileprovider" {
 		t.Fatalf("repaired domain must stay on file provider: kind=%q", kind)
@@ -478,13 +469,13 @@ func TestHealFPMissingRepairsDeregisteredDomain(t *testing.T) {
 }
 
 // TestHealFPMissingCannotControlRetreatsToSymlink pins that when the masked
-// control-plane failure is terminal (Setup reports ErrCannotControl), the Missing
+// control-plane failure is terminal (Reconcile reports ErrCannotControl), the Missing
 // heal retreats the row to symlink and forgets its ladder state — the only path
 // that could reach this ErrCannotControl arm post-startup.
 func TestHealFPMissingCannotControlRetreatsToSymlink(t *testing.T) {
 	s, a, dirs, fake := newFPHealServer(t)
-	fake.healthErr = errors.New("no domain registered")
-	fake.setupErr = fmt.Errorf("file provider setup: %w", fileproviderd.ErrCannotControl)
+	fake.checkErr = errors.New("no domain registered")
+	fake.registerErr = fmt.Errorf("file provider reconcile: %w", fileproviderd.ErrCannotControl)
 	now := time.Unix(0, 0)
 
 	s.healFPMissing(t.Context(), a, now)
@@ -501,13 +492,13 @@ func TestHealFPMissingCannotControlRetreatsToSymlink(t *testing.T) {
 // account probes Missing but its control plane is healthy, so the Missing heal
 // does nothing — no reconcile, no attempt consumed, the row untouched.
 func TestHealFPMissingHealthyDoesNothing(t *testing.T) {
-	s, a, dirs, fake := newFPHealServer(t) // fake.healthErr nil -> Health OK
+	s, a, dirs, fake := newFPHealServer(t) // fake.checkErr nil -> Check OK
 	now := time.Unix(0, 0)
 
 	s.healFPMissing(t.Context(), a, now)
 
-	if _, setups, syncs, teardowns := fake.counts(); setups != 0 || syncs != 0 || teardowns != 0 {
-		t.Fatalf("benign Missing must not reconcile: setups=%d syncs=%d teardowns=%d, want 0/0/0", setups, syncs, teardowns)
+	if _, registrations, reasserts, teardowns := fake.counts(); registrations != 0 || reasserts != 0 || teardowns != 0 {
+		t.Fatalf("benign Missing must not reconcile: registrations=%d reasserts=%d teardowns=%d, want 0/0/0", registrations, reasserts, teardowns)
 	}
 	if s.fpAttemptsSoFar(dirs[1]) != 0 {
 		t.Fatalf("benign Missing must consume no attempt: attemptsSoFar=%d, want 0", s.fpAttemptsSoFar(dirs[1]))
@@ -523,47 +514,41 @@ func TestHealFPMissingHealthyDoesNothing(t *testing.T) {
 // elapsed.
 func TestHealFPMissingBacksOff(t *testing.T) {
 	s, a, dirs, fake := newFPHealServer(t)
-	fake.healthErr = errors.New("no domain registered")
-	fake.setupErr = fmt.Errorf("file provider setup: %w", fileproviderd.ErrBusy) // transient -> fpRetry, no reset
+	fake.checkErr = errors.New("no domain registered")
+	fake.registerErr = fmt.Errorf("file provider reconcile: %w", fileproviderd.ErrBusy) // transient -> fpRetry, no reset
 	now := time.Unix(0, 0)
 
-	s.healFPMissing(t.Context(), a, now) // attempt 1: reconcile runs, transient Setup failure books the backoff
-	if _, setups, _, _ := fake.counts(); setups != 1 {
-		t.Fatalf("first Missing-triggered reconcile must run: setups=%d, want 1", setups)
+	s.healFPMissing(t.Context(), a, now) // attempt 1: reconcile runs, transient Reconcile failure books the backoff
+	if _, registrations, _, _ := fake.counts(); registrations != 1 {
+		t.Fatalf("first Missing-triggered reconcile must run: registrations=%d, want 1", registrations)
 	}
 	if s.fpAttemptsSoFar(dirs[1]) != 1 {
 		t.Fatalf("first attempt not booked: attemptsSoFar=%d, want 1", s.fpAttemptsSoFar(dirs[1]))
 	}
 
 	s.healFPMissing(t.Context(), a, now) // inside the backoff window: must NOT reconcile again
-	if _, setups, _, _ := fake.counts(); setups != 1 {
-		t.Fatalf("second reconcile ran inside the backoff window: setups=%d, want 1", setups)
+	if _, registrations, _, _ := fake.counts(); registrations != 1 {
+		t.Fatalf("second reconcile ran inside the backoff window: registrations=%d, want 1", registrations)
 	}
 	if s.fpAttemptsSoFar(dirs[1]) != 1 {
 		t.Fatalf("a backoff-skipped tick consumed an attempt: attemptsSoFar=%d, want 1", s.fpAttemptsSoFar(dirs[1]))
 	}
 
 	s.healFPMissing(t.Context(), a, now.Add(fpRecoveryBackoff.Cap+time.Second)) // past the backoff -> resumes
-	if _, setups, _, _ := fake.counts(); setups != 2 {
-		t.Fatalf("reconcile did not resume after the backoff elapsed: setups=%d, want 2", setups)
+	if _, registrations, _, _ := fake.counts(); registrations != 2 {
+		t.Fatalf("reconcile did not resume after the backoff elapsed: registrations=%d, want 2", registrations)
 	}
 }
 
-// TestHealFPRowsMissingRoutesToControlPlaneHeal pins the ticker wiring: a Missing
-// probe routes to the control-plane heal (reconcile on a failing Health), never to
-// the wedge ladder, and never marks the domain wedged.
-func TestHealFPRowsMissingRoutesToControlPlaneHeal(t *testing.T) {
-	s, _, dirs, fake := newFPHealServer(t)
-	s.fpBridgeReadyFn = func() bool { return true }
-	swapFPDirLinked(t, func(string) bool { return true })
-	fake.healthErr = errors.New("no domain registered")
-	// The first healthy tick is deep-probe due (listed=false -> Missing).
-	swapFPDomainProbe(t, func(_ context.Context, _ string) error { return overlay.ErrFPProbeMissing })
+// TestHealFPMissingRoutesToControlPlaneHeal pins the selection-detected Missing
+// path: it repairs the control plane without marking the domain wedged.
+func TestHealFPMissingRoutesToControlPlaneHeal(t *testing.T) {
+	s, account, dirs, fake := newFPHealServer(t)
+	fake.checkErr = errors.New("no domain registered")
+	s.healFPMissing(t.Context(), account, time.Now())
 
-	s.healFPRows(t.Context())
-
-	if _, setups, _, _ := fake.counts(); setups != 1 {
-		t.Fatalf("a Missing probe with a failing Health must reconcile via the control-plane heal: setups=%d, want 1", setups)
+	if _, registrations, _, _ := fake.counts(); registrations != 1 {
+		t.Fatalf("a Missing probe with a failing Check must reconcile via the control-plane heal: registrations=%d, want 1", registrations)
 	}
 	if s.fpWedged(dirs[1]) {
 		t.Fatal("a Missing probe must never mark the domain wedged")
@@ -574,14 +559,14 @@ func TestHealFPRowsMissingRoutesToControlPlaneHeal(t *testing.T) {
 // converts the row off File Provider between the UNCLAIMED probe that produced the
 // heal's stale snapshot and the poll claim. The re-read under the claim must catch the
 // flip and skip — never reconcile the domain (healFPMissing) or re-assert FP state via
-// Sync (healFP attempt 1) for a row that is no longer File Provider — and clear the
+// Reconcile (healFP attempt 1) for a row that is no longer File Provider — and clear the
 // now-stale ladder.
 func TestHealFPRaceSkipsRowConvertedOffFP(t *testing.T) {
 	t.Run("healFPMissing skips a row converted off FP under the claim", func(t *testing.T) {
 		s, a, dirs, fake := newFPHealServer(t)
-		fake.healthErr = errors.New("no domain registered") // a stale FP row would reconcile here
-		s.fpRecordAttempt(dirs[1], time.Unix(0, 0))         // a prior attempt the skip must clear
-		now := time.Unix(0, 0).Add(time.Hour)               // past the backoff -> due
+		fake.checkErr = errors.New("no domain registered") // a stale FP row would reconcile here
+		s.fpRecordAttempt(dirs[1], time.Unix(0, 0))        // a prior attempt the skip must clear
+		now := time.Unix(0, 0).Add(time.Hour)              // past the backoff -> due
 
 		// The race: the row is symlink in SQLite; `a` is the pre-probe FP snapshot.
 		setRowKind(t, s, 1, fkoverlay.BackendSymlink)
@@ -589,7 +574,7 @@ func TestHealFPRaceSkipsRowConvertedOffFP(t *testing.T) {
 		s.healFPMissing(t.Context(), a, now)
 
 		if h, se, _, _ := fake.counts(); h != 0 || se != 0 {
-			t.Fatalf("healFPMissing acted through a converted row: healths=%d setups=%d, want 0/0", h, se)
+			t.Fatalf("healFPMissing acted through a converted row: checks=%d registrations=%d, want 0/0", h, se)
 		}
 		if kind := kindOf(t, s, 1); kind != "symlink" {
 			t.Fatalf("healFPMissing disturbed a converted row: kind=%q, want symlink", kind)
@@ -601,15 +586,15 @@ func TestHealFPRaceSkipsRowConvertedOffFP(t *testing.T) {
 
 	t.Run("healFP attempt 1 skips a row converted off FP under the claim", func(t *testing.T) {
 		s, a, dirs, fake := newFPHealServer(t)
-		wedgeIt(t, s, dirs[1]) // a genuine wedge, so a stale FP row would run attempt 1 (Sync)
+		wedgeIt(t, s, dirs[1]) // a genuine wedge, so a stale FP row would run attempt 1 (Reconcile)
 		now := time.Unix(0, 0)
 
 		setRowKind(t, s, 1, fkoverlay.BackendSymlink) // converted in the claim gap
 
 		healFPStep(t, s, a, now) // holds the poll claim, as the heal ticker does
 
-		if _, _, syncs, _ := fake.counts(); syncs != 0 {
-			t.Fatalf("healFP attempt 1 re-asserted FP state (Sync) through a converted row: syncs=%d, want 0", syncs)
+		if _, _, reasserts, _ := fake.counts(); reasserts != 0 {
+			t.Fatalf("healFP attempt 1 re-asserted FP state (Reconcile) through a converted row: reasserts=%d, want 0", reasserts)
 		}
 		if kind := kindOf(t, s, 1); kind != "symlink" {
 			t.Fatalf("healFP disturbed a converted row: kind=%q, want symlink", kind)

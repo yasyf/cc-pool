@@ -40,11 +40,15 @@ func newFakeStrandFP(registered ...string) *fakeStrandFP {
 
 func (f *fakeStrandFP) Backend() fkoverlay.Backend    { return fkoverlay.BackendFileProvider }
 func (f *fakeStrandFP) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
-func (f *fakeStrandFP) Health(_, _ string) error      { return nil }
-func (f *fakeStrandFP) Sync(_, _ string) error        { return nil }
-func (f *fakeStrandFP) Setup(_, _ string) error       { return nil }
+func (f *fakeStrandFP) Check(context.Context, string, string) error {
+	return nil
+}
 
-func (f *fakeStrandFP) Teardown(_, dir string) (string, error) {
+func (f *fakeStrandFP) Reconcile(context.Context, string, string) error {
+	return nil
+}
+
+func (f *fakeStrandFP) Teardown(_ context.Context, _, dir string) (string, error) {
 	f.teardowns = append(f.teardowns, dir)
 	if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		if err := os.Remove(dir); err != nil {
@@ -55,7 +59,7 @@ func (f *fakeStrandFP) Teardown(_, dir string) (string, error) {
 	return "", nil
 }
 
-func (f *fakeStrandFP) RemoveDomain(dir string) error {
+func (f *fakeStrandFP) RemoveDomain(_ context.Context, dir string) error {
 	f.removes = append(f.removes, dir)
 	delete(f.registered, filepath.Base(dir))
 	return nil
@@ -266,7 +270,7 @@ func readFileString(t *testing.T, path string) string {
 }
 
 // stageLeakedBridge writes the crash wreckage of a symlink→fileprovider convert
-// that died after Setup, before the row flip: the account identity stranded in the
+// that died after Reconcile, before the row flip: the account identity stranded in the
 // private root, and the account dir replaced by a File Provider domain bridge
 // symlink. The store row is left untouched.
 func stageLeakedBridge(t *testing.T, dir string) {
@@ -296,7 +300,7 @@ func TestHealStrandedRowsLogsOnlyPendingWork(t *testing.T) {
 		wantDeferred bool
 		wantHealed   bool
 	}{
-		{name: "healthy busy row is silent", busy: true},
+		{name: "healthy busy row is silent", busy: true, wantScan: true},
 		{name: "bridged busy row defers", bridged: true, busy: true, wantScan: true, wantDeferred: true},
 		{name: "bridged idle row heals", bridged: true, wantScan: true, wantHealed: true},
 	}

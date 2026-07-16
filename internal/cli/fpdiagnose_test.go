@@ -212,40 +212,40 @@ func TestFPDiagnose(t *testing.T) {
 	}
 }
 
-// TestIsFPSetupFailure pins the sentinel set the add-failure diagnosis keys on:
-// every class FileProviderProvider.Setup (EnsureReport/Register + waitDomainServes)
+// TestIsFPReconcileFailure pins the sentinel set the add-failure diagnosis keys on:
+// every class FileProviderProvider.Reconcile (EnsureReport/Register + waitDomainServes)
 // can surface — including the transient ErrBusy and ErrRegisterFailed a reached,
 // entitled app's register can return — classifies as a setup failure, while non-FP
-// errors do not. Sentinels are tested wrapped as Setup actually returns them.
-func TestIsFPSetupFailure(t *testing.T) {
+// errors do not. Sentinels are tested wrapped as Reconcile actually returns them.
+func TestIsFPReconcileFailure(t *testing.T) {
 	cases := map[string]struct {
 		err  error
 		want bool
 	}{
-		"domain not serving":          {fileproviderd.ErrDomainNotServing, true},
-		"cannot control":              {fileproviderd.ErrCannotControl, true},
-		"op unsupported":              {fileproviderd.ErrOpUnsupported, true},
-		"app unavailable":             {fileproviderd.ErrAppUnavailable, true},
-		"busy":                        {fileproviderd.ErrBusy, true},
-		"register failed":             {fileproviderd.ErrRegisterFailed, true},
-		"busy wrapped as Setup wraps": {fmt.Errorf("file provider setup acct-01: %w", fileproviderd.ErrBusy), true},
-		"register failed wrapped":     {fmt.Errorf("file provider setup acct-01: %w", fileproviderd.ErrRegisterFailed), true},
-		"removal unconfirmed":         {fileproviderd.ErrDomainRemovalUnconfirmed, true},
-		"removal unconfirmed wrapped": {fmt.Errorf("file provider setup acct-01: %w", fileproviderd.ErrDomainRemovalUnconfirmed), true},
-		"non-fp sentinel":             {pool.ErrNotInitialized, false},
-		"bare error":                  {errors.New("disk full"), false},
-		"nil":                         {nil, false},
+		"domain not serving":              {fileproviderd.ErrDomainNotServing, true},
+		"cannot control":                  {fileproviderd.ErrCannotControl, true},
+		"op unsupported":                  {fileproviderd.ErrOpUnsupported, true},
+		"app unavailable":                 {fileproviderd.ErrAppUnavailable, true},
+		"busy":                            {fileproviderd.ErrBusy, true},
+		"register failed":                 {fileproviderd.ErrRegisterFailed, true},
+		"busy wrapped as Reconcile wraps": {fmt.Errorf("file provider reconcile acct-01: %w", fileproviderd.ErrBusy), true},
+		"register failed wrapped":         {fmt.Errorf("file provider reconcile acct-01: %w", fileproviderd.ErrRegisterFailed), true},
+		"removal unconfirmed":             {fileproviderd.ErrDomainRemovalUnconfirmed, true},
+		"removal unconfirmed wrapped":     {fmt.Errorf("file provider reconcile acct-01: %w", fileproviderd.ErrDomainRemovalUnconfirmed), true},
+		"non-fp sentinel":                 {pool.ErrNotInitialized, false},
+		"bare error":                      {errors.New("disk full"), false},
+		"nil":                             {nil, false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if got := isFPSetupFailure(tc.err); got != tc.want {
-				t.Errorf("isFPSetupFailure(%v) = %v, want %v", tc.err, got, tc.want)
+			if got := isFPReconcileFailure(tc.err); got != tc.want {
+				t.Errorf("isFPReconcileFailure(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}
 }
 
-// TestDiagnoseFPAddFailure pins the add-failure diagnosis: an FP Setup sentinel
+// TestDiagnoseFPAddFailure pins the add-failure diagnosis: an FP Reconcile sentinel
 // with the daemon down warns the bridge is down, renders only the unhealthy rungs
 // (root fault first), and closes with the onboard pointer — while a non-FP error
 // produces zero output and never touches a probe seam.

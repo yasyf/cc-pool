@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -88,6 +89,19 @@ var (
 	procStartTime     = realProcStartTime
 	registerProcExit  = realRegisterProcExit
 	procSessionLeader = realSessionLeader
+	leaseAgentCheckin = func(ctx context.Context, accountID, pid int) error {
+		resp, err := daemon.NewClient().Checkin(ctx, accountID, pid)
+		if errors.Is(err, daemon.ErrDaemonUnavailable) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !resp.OK {
+			return errors.New(resp.Error)
+		}
+		return nil
+	}
 )
 
 // boundedStat is a bounded os.Stat: a fully-wedged mirror never answers, so a
@@ -548,7 +562,7 @@ func runLeaseAgent(leader int, wantStart int64, id int, dir, probe string, fuseR
 		slot := writeAdvisorySlot(leader, wantStart, dir)
 		defer removeOwnSlot(slot)
 		signalReady(ready, nil)
-		return <-exited
+		return finishLeaseAgent(id, leader, <-exited)
 	}
 	defer func() { _ = waiter.Close() }()
 	if err := revalidateLeader(leader, wantStart); err != nil {
@@ -567,7 +581,21 @@ func runLeaseAgent(leader int, wantStart int64, id int, dir, probe string, fuseR
 	slot := writeAdvisorySlot(leader, wantStart, dir)
 	defer removeOwnSlot(slot)
 	signalReady(ready, nil) // acquired + probed + watching: the launcher may hand out the dir
-	return waiter.Wait()
+	return finishLeaseAgent(id, leader, waiter.Wait())
+}
+
+// finishLeaseAgent hands the observed leader exit to the daemon while the session
+// lease is still held. The caller's deferred lease close runs only after this
+// returns, so the daemon can close exactly (account, pid) and refresh busy state
+// without waiting for the next heartbeat. A watch failure is not an observed exit.
+func finishLeaseAgent(accountID, pid int, waitErr error) error {
+	if waitErr != nil {
+		return waitErr
+	}
+	if err := leaseAgentCheckin(context.Background(), accountID, pid); err != nil {
+		return fmt.Errorf("check in acct-%02d session leader %d: %w", accountID, pid, err)
+	}
+	return nil
 }
 
 // revalidateLeader re-reads leader's start-time after the exit watch is installed; a

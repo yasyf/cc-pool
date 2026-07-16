@@ -28,6 +28,12 @@ cask "cc-pool-status" do
     system_command "/usr/bin/xattr",
                    args: ["-dr", "com.apple.quarantine", "#{appdir}/CCPoolStatus.app"],
                    must_succeed: false
+    # Replace only the host process so it starts from the newly installed
+    # binary. File Provider and widget appexes have distinct process names and
+    # remain untouched; live Claude sessions keep their registered domains.
+    system_command "/usr/bin/pkill", args: ["-TERM", "-x", "CCPoolStatus"], must_succeed: false
+    sleep 1
+    system_command "/usr/bin/pkill", args: ["-KILL", "-x", "CCPoolStatus"], must_succeed: false
     system_command "/usr/bin/open", args: ["-g", "#{appdir}/CCPoolStatus.app"], must_succeed: false
     # Register + elect the File Provider appex so ccp can default to the FP
     # backend with no System Settings visit; best-effort — `ccp fp onboard`

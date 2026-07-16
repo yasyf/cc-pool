@@ -159,37 +159,73 @@ func staleFPAppProcesses(ctx context.Context, binaryPath string) ([]fpAppProcess
 	return stale, nil
 }
 
-func (s *Server) reconcileStaleFPApp(ctx context.Context) {
+func (s *Server) reconcileStaleFPApp(ctx context.Context) (killed bool) {
 	if !s.shouldReapFPApp() {
-		return
+		return false
 	}
 	stale, err := staleFPAppProcesses(ctx, fpAppBinaryPath())
 	if err != nil {
 		s.log.Printf("stale companion app scan: %v", err)
-		return
+		return false
 	}
 	for _, p := range stale {
+		s.fpAppActionMu.Lock()
+		if s.fpAppKilled[p] || s.fpAppReaping[p] {
+			s.fpAppActionMu.Unlock()
+			continue
+		}
+		if s.fpAppReaping == nil {
+			s.fpAppReaping = map[fpAppProcess]bool{}
+		}
+		s.fpAppReaping[p] = true
+		s.fpAppActionMu.Unlock()
 		if s.fpConsentPending.Load() {
-			return
+			s.finishFPAppReap(p, false)
+			return killed
 		}
 		confirm, err := staleFPAppProcesses(ctx, fpAppBinaryPath())
 		if err != nil {
 			s.log.Printf("stale companion app reconfirm: %v", err)
-			return
+			s.finishFPAppReap(p, false)
+			return killed
 		}
 		if s.fpConsentPending.Load() {
-			return
+			s.finishFPAppReap(p, false)
+			return killed
 		}
 		if !fpAppStillStale(confirm, p) {
+			s.finishFPAppReap(p, false)
 			continue
 		}
 		if err := killFPAppPID(p.PID); err != nil {
 			s.log.Printf("kill stale companion app pid %d: %v", p.PID, err)
+			s.finishFPAppReap(p, false)
 			continue
 		}
-		s.clearFPAppEnsure()
+		s.finishFPAppReap(p, true)
+		killed = true
 		s.log.Printf("killed stale companion app pid %d (started %s): an upgrade replaced its binary; fp.app.ensure relaunches the current one on the next heal tick",
 			p.PID, p.StartedAt.Format("15:04:05"))
+	}
+	if killed && s.overlayCoordinator != nil {
+		s.overlayCoordinator.mark(dirtyApp)
+	}
+	return killed
+}
+
+func (s *Server) finishFPAppReap(p fpAppProcess, killed bool) {
+	s.fpAppActionMu.Lock()
+	defer s.fpAppActionMu.Unlock()
+	delete(s.fpAppReaping, p)
+	if !killed {
+		return
+	}
+	if s.fpAppKilled == nil {
+		s.fpAppKilled = map[fpAppProcess]bool{}
+	}
+	s.fpAppKilled[p] = true
+	if !s.fpAppEnsureInFlight {
+		s.clearFPAppEnsure()
 	}
 }
 
@@ -214,20 +250,20 @@ func (s *Server) clearFPAppEnsure() {
 // s.wg. The fp.app backoff is booked BEFORE the launch, so a later tick's gate
 // stays closed for fpAppEnsureBackoff — bounding a crash-looping app to one loud
 // launch per window and fencing out a second launch while this one is in flight.
-// The row gate (shouldEnsureFPApp) has already established the app is wanted and
-// down; this only acts. Distinct from the widget-appex reaper (reconcileStaleWidget
+// Admission rechecks that the app is wanted and down, atomically books the backoff,
+// and fences concurrent launches. Distinct from the widget-appex reaper (reconcileStaleWidget
 // kills the CCPoolStatusWidget appex) and the FP-appex bouncer (fpAppexBounce
 // kills the CCPoolFileProvider extension): those kill extensions, this launches
 // the host app.
 func (s *Server) ensureFPAppAsync(ctx context.Context) {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || !s.shouldEnsureFPApp() || !s.admitFPAppEnsure(time.Now()) {
 		return
 	}
-	s.bookFPAppEnsure(time.Now())
 	s.log.Printf("file provider companion app is down; launching %s in the background", pool.WidgetAppPath())
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer s.finishFPAppEnsure()
 		if ctx.Err() != nil {
 			return
 		}
@@ -236,13 +272,30 @@ func (s *Server) ensureFPAppAsync(ctx context.Context) {
 			return
 		}
 		s.log.Printf("file provider companion app is up; file provider probe coverage resumes")
+		if s.overlayCoordinator != nil {
+			s.overlayCoordinator.mark(dirtyApp)
+		}
 	}()
 }
 
-// bookFPAppEnsure stamps the fp.app backoff clock so the next ensure holds off
-// for fpAppEnsureBackoff.
-func (s *Server) bookFPAppEnsure(now time.Time) {
+func (s *Server) admitFPAppEnsure(now time.Time) bool {
+	s.fpAppActionMu.Lock()
+	defer s.fpAppActionMu.Unlock()
+	if s.fpAppEnsureInFlight {
+		return false
+	}
 	s.ledMu.Lock()
 	defer s.ledMu.Unlock()
+	if !s.led.due(fpAppPolicy, fpAppResource, now) {
+		return false
+	}
 	s.led.attempt(fpAppPolicy, fpAppResource, attemptPrimary, now)
+	s.fpAppEnsureInFlight = true
+	return true
+}
+
+func (s *Server) finishFPAppEnsure() {
+	s.fpAppActionMu.Lock()
+	defer s.fpAppActionMu.Unlock()
+	s.fpAppEnsureInFlight = false
 }

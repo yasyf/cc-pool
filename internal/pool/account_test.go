@@ -220,7 +220,7 @@ func TestPrepareAddRequiresInit(t *testing.T) {
 // (else the login watcher false-positives) and the plaintext file a dead
 // headless attempt left behind — except on the SeedKeptExisting path.
 func TestPrepareAddPurgesStaleCredentials(t *testing.T) {
-	setup := func(t *testing.T) (*Manager, *credstest.Fake, string) {
+	reconcile := func(t *testing.T) (*Manager, *credstest.Fake, string) {
 		t.Helper()
 		t.Setenv("HOME", t.TempDir())
 		t.Setenv("USER", "tester")
@@ -240,7 +240,7 @@ func TestPrepareAddPurgesStaleCredentials(t *testing.T) {
 	}
 
 	t.Run("fresh dir purges the leftover", func(t *testing.T) {
-		m, fk, svc := setup(t)
+		m, fk, svc := reconcile(t)
 		if _, err := m.PrepareAdd(t.Context()); err != nil {
 			t.Fatal(err)
 		}
@@ -255,7 +255,7 @@ func TestPrepareAddPurgesStaleCredentials(t *testing.T) {
 	t.Run("purges an item stored under a different -a label", func(t *testing.T) {
 		// The stale item's label is whatever claude wrote at login; the purge must
 		// find it by service, not today's label.
-		m, fk, svc := setup(t)
+		m, fk, svc := reconcile(t)
 		fk.Remove(svc, "tester")
 		stale := &creds.Credential{}
 		stale.ClaudeAiOauth.AccessToken = "at-stale"
@@ -271,7 +271,7 @@ func TestPrepareAddPurgesStaleCredentials(t *testing.T) {
 	t.Run("fresh dir purges a stale file credential", func(t *testing.T) {
 		// A dead headless attempt leaves .credentials.json instead of a Keychain
 		// item; a reused index must not inherit it.
-		m, _, _ := setup(t)
+		m, _, _ := reconcile(t)
 		acct := AccountDir(1)
 		if err := os.MkdirAll(acct, 0o700); err != nil {
 			t.Fatal(err)
@@ -290,7 +290,7 @@ func TestPrepareAddPurgesStaleCredentials(t *testing.T) {
 	})
 
 	t.Run("kept-existing dir keeps both credentials", func(t *testing.T) {
-		m, fk, svc := setup(t)
+		m, fk, svc := reconcile(t)
 		acct := AccountDir(1)
 		if err := os.MkdirAll(acct, 0o700); err != nil {
 			t.Fatal(err)
@@ -349,7 +349,7 @@ func TestFinalizeAddRequiresIdentity(t *testing.T) {
 // rolls back whatever credential its login wrote — the Keychain item AND the
 // plaintext file — explicitly, not as a side effect of dir removal.
 func TestAbandonAddDeletesBothStores(t *testing.T) {
-	setup := func(t *testing.T) (*Manager, *credstest.Fake, *PendingAdd) {
+	reconcile := func(t *testing.T) (*Manager, *credstest.Fake, *PendingAdd) {
 		t.Helper()
 		t.Setenv("HOME", t.TempDir())
 		t.Setenv("USER", "tester")
@@ -378,8 +378,8 @@ func TestAbandonAddDeletesBothStores(t *testing.T) {
 	}
 
 	t.Run("rollback deletes both stores and the dir", func(t *testing.T) {
-		m, fk, pending := setup(t)
-		if err := m.AbandonAdd(pending); err != nil {
+		m, fk, pending := reconcile(t)
+		if err := m.AbandonAdd(t.Context(), pending); err != nil {
 			t.Fatalf("AbandonAdd: %v", err)
 		}
 		if _, ok := fk.Get(pending.KeychainService, "claude-wrote-this"); ok {
@@ -394,11 +394,11 @@ func TestAbandonAddDeletesBothStores(t *testing.T) {
 	})
 
 	t.Run("credentials are purged even when dir removal cannot run", func(t *testing.T) {
-		m, fk, pending := setup(t)
+		m, fk, pending := reconcile(t)
 		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
 			return nil, errors.New("holder gone")
 		}
-		if err := m.AbandonAdd(pending); err == nil {
+		if err := m.AbandonAdd(t.Context(), pending); err == nil {
 			t.Fatal("AbandonAdd succeeded despite the overlay provider failing")
 		}
 		if _, ok := fk.Get(pending.KeychainService, "claude-wrote-this"); ok {
@@ -539,7 +539,7 @@ func TestRemoveKeepCredential(t *testing.T) {
 			}
 			m := &Manager{Store: st, Creds: fk}
 
-			err := m.Remove(a.ID, false)
+			err := m.Remove(t.Context(), a.ID, false)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("Remove = %v, want error containing %q", err, tc.wantErr)
@@ -614,22 +614,21 @@ func TestConcurrentPrepareAddIndexRace(t *testing.T) {
 	}
 }
 
-// stubOverlay is an injectable fuse-kind provider whose Setup can be forced to
+// stubOverlay is an injectable fuse-kind provider whose Reconcile can be forced to
 // fail.
 type stubOverlay struct {
-	backend     fkoverlay.Backend
-	setupErr    error
-	teardownErr error
-	setups      int
-	teardowns   int
-	// probesClaudeJSON makes Setup fail unless the private .claude.json exists.
+	backend      fkoverlay.Backend
+	reconcileErr error
+	teardownErr  error
+	reconciles   int
+	teardowns    int
+	// probesClaudeJSON makes Reconcile fail unless the private .claude.json exists.
 	probesClaudeJSON bool
 }
 
-func (s *stubOverlay) Backend() fkoverlay.Backend { return s.backend }
-func (s *stubOverlay) Sync(_, _ string) error     { return nil }
-func (s *stubOverlay) Health(_, _ string) error   { return nil }
-func (s *stubOverlay) Teardown(_, dir string) (string, error) {
+func (s *stubOverlay) Backend() fkoverlay.Backend                  { return s.backend }
+func (s *stubOverlay) Check(context.Context, string, string) error { return nil }
+func (s *stubOverlay) Teardown(_ context.Context, _, dir string) (string, error) {
 	s.teardowns++
 	if s.teardownErr != nil {
 		return "", s.teardownErr
@@ -648,10 +647,10 @@ func (s *stubOverlay) PrivateRoot(dir string) string {
 	return dir
 }
 
-func (s *stubOverlay) Setup(_, dir string) error {
-	s.setups++
-	if s.setupErr != nil {
-		return s.setupErr
+func (s *stubOverlay) Reconcile(_ context.Context, _, dir string) error {
+	s.reconciles++
+	if s.reconcileErr != nil {
+		return s.reconcileErr
 	}
 	if s.probesClaudeJSON {
 		if _, err := os.Stat(filepath.Join(s.PrivateRoot(dir), ".claude.json")); err != nil {
@@ -666,7 +665,7 @@ func (s *stubOverlay) Setup(_, dir string) error {
 	return os.MkdirAll(fkoverlay.FusePrivateRoot(dir), 0o700)
 }
 
-func TestPrepareAddFileProviderSeedsBeforeSetup(t *testing.T) {
+func TestPrepareAddFileProviderSeedsBeforeReconcile(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if err := os.WriteFile(ClaudeJSONPath(), []byte(`{"hasCompletedOnboarding":true}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -682,7 +681,7 @@ func TestPrepareAddFileProviderSeedsBeforeSetup(t *testing.T) {
 
 	pending, err := m.PrepareAdd(t.Context())
 	if err != nil {
-		t.Fatalf("PrepareAdd for File Provider failed — private .claude.json not seeded before Setup's readiness probe: %v", err)
+		t.Fatalf("PrepareAdd for File Provider failed — private .claude.json not seeded before Reconcile's readiness probe: %v", err)
 	}
 	if pending.OverlayKind != fkoverlay.BackendFileProvider {
 		t.Fatalf("OverlayKind = %q, want fileprovider (no fallback)", pending.OverlayKind)
@@ -697,7 +696,7 @@ func TestPrepareAddFileProviderSeedsBeforeSetup(t *testing.T) {
 // symlink overlay it actually established and carries the reason — never a silent
 // substitution.
 func TestPrepareAddFuseFallback(t *testing.T) {
-	setup := func(t *testing.T, fuse fkoverlay.Provider) *Manager {
+	reconcile := func(t *testing.T, fuse fkoverlay.Provider) *Manager {
 		t.Helper()
 		t.Setenv("HOME", t.TempDir())
 		if err := os.MkdirAll(filepath.Join(ClaudeDir(), "projects"), 0o700); err != nil {
@@ -720,9 +719,9 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		return m
 	}
 
-	t.Run("fuse setup failure falls back to symlinks and says why", func(t *testing.T) {
-		m := setup(t, &stubOverlay{backend: fkoverlay.BackendNFS, setupErr: errors.New("mount holder did not start: boom")})
-		// The holder created the backing dir before Setup failed; the fallback must
+	t.Run("fuse reconcile failure falls back to symlinks and says why", func(t *testing.T) {
+		m := reconcile(t, &stubOverlay{backend: fkoverlay.BackendNFS, reconcileErr: errors.New("mount holder did not start: boom")})
+		// The holder created the backing dir before Reconcile failed; the fallback must
 		// not leave it behind.
 		if err := os.MkdirAll(fkoverlay.FusePrivateRoot(AccountDir(1)), 0o700); err != nil {
 			t.Fatal(err)
@@ -738,7 +737,7 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 			t.Fatalf("OverlayKind = %q, want symlink (the overlay actually established)", pending.OverlayKind)
 		}
 		if pending.FallbackReason != "mount holder did not start: boom" {
-			t.Fatalf("FallbackReason = %q, want the fuse setup error", pending.FallbackReason)
+			t.Fatalf("FallbackReason = %q, want the fuse reconcile error", pending.FallbackReason)
 		}
 		if _, err := os.Readlink(filepath.Join(pending.ConfigDir, "projects")); err != nil {
 			t.Fatalf("symlink overlay not established: %v", err)
@@ -760,19 +759,19 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 	t.Run("fuse and fallback both failing reports both causes", func(t *testing.T) {
 		fuseErr := errors.New("dir is a foreign mount carcass")
 		symErr := errors.New("refusing to lay symlinks in a live mountpoint")
-		m := setup(t, &stubOverlay{backend: fkoverlay.BackendNFS, setupErr: fuseErr})
+		m := reconcile(t, &stubOverlay{backend: fkoverlay.BackendNFS, reconcileErr: fuseErr})
 		m.OverlayFor = func(kind fkoverlay.Backend) (fkoverlay.Provider, error) {
 			if kind.IsFuse() {
-				return &stubOverlay{backend: fkoverlay.BackendNFS, setupErr: fuseErr}, nil
+				return &stubOverlay{backend: fkoverlay.BackendNFS, reconcileErr: fuseErr}, nil
 			}
-			return &stubOverlay{backend: fkoverlay.BackendSymlink, setupErr: symErr}, nil
+			return &stubOverlay{backend: fkoverlay.BackendSymlink, reconcileErr: symErr}, nil
 		}
 		pending, err := m.PrepareAdd(t.Context())
 		if pending != nil {
-			t.Fatalf("PrepareAdd returned %+v despite both setups failing", pending)
+			t.Fatalf("PrepareAdd returned %+v despite both reconciles failing", pending)
 		}
 		if err == nil {
-			t.Fatal("PrepareAdd succeeded, want a both-setups failure")
+			t.Fatal("PrepareAdd succeeded, want a both-reconciles failure")
 		}
 		// Both causes must ride the chain (errors.Is), else the symlink complaint
 		// masks the fuse failure that started the fallback.
@@ -793,15 +792,15 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		// holder missing a required capability must fall back to symlink — never
 		// mount through it — and surface the cask-upgrade hint.
 		stub := &stubOverlay{backend: fkoverlay.BackendNFS}
-		m := setup(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
+		m := reconcile(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
 			return &mountd.HelloInfo{Version: "v0.9.0", Features: []string{mountd.FeatureBridge}}, nil
 		}})
 		pending, err := m.PrepareAdd(t.Context())
 		if err != nil {
 			t.Fatalf("PrepareAdd: %v", err)
 		}
-		if stub.setups != 0 {
-			t.Fatalf("fuse setups = %d, want 0 (no mount may be attempted through an unsupported holder)", stub.setups)
+		if stub.reconciles != 0 {
+			t.Fatalf("fuse reconciles = %d, want 0 (no mount may be attempted through an unsupported holder)", stub.reconciles)
 		}
 		if pending.OverlayKind != fkoverlay.BackendSymlink {
 			t.Fatalf("OverlayKind = %q, want symlink", pending.OverlayKind)
@@ -814,9 +813,9 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("fuse setup success keeps fuse and carries no reason", func(t *testing.T) {
+	t.Run("fuse reconcile success keeps fuse and carries no reason", func(t *testing.T) {
 		stub := &stubOverlay{backend: fkoverlay.BackendNFS}
-		m := setup(t, stub)
+		m := reconcile(t, stub)
 		pending, err := m.PrepareAdd(t.Context())
 		if err != nil {
 			t.Fatalf("PrepareAdd: %v", err)
@@ -827,39 +826,39 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		if pending.FallbackReason != "" {
 			t.Fatalf("FallbackReason = %q, want empty", pending.FallbackReason)
 		}
-		if stub.setups != 1 {
-			t.Fatalf("fuse setups = %d, want 1", stub.setups)
+		if stub.reconciles != 1 {
+			t.Fatalf("fuse reconciles = %d, want 1", stub.reconciles)
 		}
 		if _, err := os.Stat(filepath.Join(fkoverlay.FusePrivateRoot(pending.ConfigDir), ".claude.json")); err != nil {
 			t.Fatalf("seed not in the private root: %v", err)
 		}
 	})
 
-	t.Run("a non-fuse setup failure stays fatal", func(t *testing.T) {
-		m := setup(t, &stubOverlay{backend: fkoverlay.BackendNFS})
+	t.Run("a non-fuse reconcile failure stays fatal", func(t *testing.T) {
+		m := reconcile(t, &stubOverlay{backend: fkoverlay.BackendNFS})
 		if err := m.SetDefaultOverlayKind(fkoverlay.BackendSymlink); err != nil {
 			t.Fatal(err)
 		}
 		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
-			return &stubOverlay{backend: fkoverlay.BackendSymlink, setupErr: errors.New("disk full")}, nil
+			return &stubOverlay{backend: fkoverlay.BackendSymlink, reconcileErr: errors.New("disk full")}, nil
 		}
 		_, err := m.PrepareAdd(t.Context())
 		if err == nil || !strings.Contains(err.Error(), "disk full") {
-			t.Fatalf("PrepareAdd = %v, want the symlink setup failure propagated", err)
+			t.Fatalf("PrepareAdd = %v, want the symlink reconcile failure propagated", err)
 		}
 	})
 
-	// H6: requireHolderVerified refuses AFTER Setup mounted, so the fresh mount is
+	// H6: requireHolderVerified refuses AFTER Reconcile mounted, so the fresh mount is
 	// live. PrepareAdd must reclaim it through the holder before the symlink fallback —
 	// else the fallback refuses the live mount and strands a rowless mount that poisons
 	// later adds.
-	t.Run("a post-setup capability failure reclaims the fresh mount before symlink fallback", func(t *testing.T) {
+	t.Run("a post-reconcile capability failure reclaims the fresh mount before symlink fallback", func(t *testing.T) {
 		stub := &stubOverlay{backend: fkoverlay.BackendNFS}
 		var hellos int
-		m := setup(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
+		m := reconcile(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
 			hellos++
 			if hellos == 1 {
-				return &mountd.HelloInfo{Version: "v1.0.0", Features: HolderMountFeatures}, nil // pre-check: full features, so Setup mounts
+				return &mountd.HelloInfo{Version: "v1.0.0", Features: HolderMountFeatures}, nil // pre-check: full features, so Reconcile mounts
 			}
 			return &mountd.HelloInfo{Version: "v1.0.0", Features: []string{mountd.FeatureBridge}}, nil // post-check: the mounted holder lacks a required feature
 		}})
@@ -867,8 +866,8 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PrepareAdd: %v", err)
 		}
-		if stub.setups != 1 {
-			t.Fatalf("fuse setups = %d, want 1 (the mount was established before the post-check refused)", stub.setups)
+		if stub.reconciles != 1 {
+			t.Fatalf("fuse reconciles = %d, want 1 (the mount was established before the post-check refused)", stub.reconciles)
 		}
 		if stub.teardowns != 1 {
 			t.Fatalf("fuse teardowns = %d, want 1 (the unverified fresh mount must be reclaimed before the symlink fallback)", stub.teardowns)
@@ -892,7 +891,7 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 	t.Run("a busy fresh mount defers the add rather than poisoning it", func(t *testing.T) {
 		stub := &stubOverlay{backend: fkoverlay.BackendNFS, teardownErr: mountd.ErrBusy}
 		var hellos int
-		m := setup(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
+		m := reconcile(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
 			hellos++
 			if hellos == 1 {
 				return &mountd.HelloInfo{Version: "v1.0.0", Features: HolderMountFeatures}, nil
@@ -908,13 +907,13 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 		}
 	})
 
-	// J4c: a lost ack after the holder mounted leaves the mount LIVE while Setup reports
+	// J4c: a lost ack after the holder mounted leaves the mount LIVE while Reconcile reports
 	// failure. The feature gate probes the holder's mount list and marks it
 	// ErrMountedUnverified, so PrepareAdd reclaims it before the symlink fallback — the
 	// same breadth as the post-check refusal, not just ErrHolderUnsupported.
 	t.Run("a lost-ack mount is reclaimed via the mount-list probe before the fallback", func(t *testing.T) {
-		stub := &stubOverlay{backend: fkoverlay.BackendNFS, setupErr: errors.New("lost the mount ack")}
-		m := setup(t, featureGate{
+		stub := &stubOverlay{backend: fkoverlay.BackendNFS, reconcileErr: errors.New("lost the mount ack")}
+		m := reconcile(t, featureGate{
 			Provider: stub,
 			hello: func() (*mountd.HelloInfo, error) {
 				return &mountd.HelloInfo{Version: "v1.0.0", Features: HolderMountFeatures}, nil
@@ -940,7 +939,7 @@ func TestPrepareAddFuseFallback(t *testing.T) {
 	t.Run("a hard reclaim failure keeps the pending reservation", func(t *testing.T) {
 		stub := &stubOverlay{backend: fkoverlay.BackendNFS, teardownErr: errors.New("holder rejected the unmount")}
 		var hellos int
-		m := setup(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
+		m := reconcile(t, featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) {
 			hellos++
 			if hellos == 1 {
 				return &mountd.HelloInfo{Version: "v1.0.0", Features: HolderMountFeatures}, nil // pre-check mounts
@@ -974,12 +973,11 @@ type teardownStub struct {
 	calls       int
 }
 
-func (s *teardownStub) Backend() fkoverlay.Backend    { return fkoverlay.BackendNFS }
-func (s *teardownStub) Setup(_, _ string) error       { return nil }
-func (s *teardownStub) Sync(_, _ string) error        { return nil }
-func (s *teardownStub) Health(_, _ string) error      { return nil }
-func (s *teardownStub) PrivateRoot(dir string) string { return dir }
-func (s *teardownStub) Teardown(_, _ string) (string, error) {
+func (s *teardownStub) Backend() fkoverlay.Backend                      { return fkoverlay.BackendNFS }
+func (s *teardownStub) Reconcile(context.Context, string, string) error { return nil }
+func (s *teardownStub) Check(context.Context, string, string) error     { return nil }
+func (s *teardownStub) PrivateRoot(dir string) string                   { return dir }
+func (s *teardownStub) Teardown(context.Context, string, string) (string, error) {
 	w := ""
 	switch {
 	case s.calls < len(s.warnings):
@@ -1010,7 +1008,7 @@ func TestTeardownWithRetry(t *testing.T) {
 	t.Run("a clean teardown records no risk", func(t *testing.T) {
 		m, _ := newMgr(t)
 		stub := &teardownStub{}
-		if err := m.teardownWithRetry(stub, "/base", dir, 1); err != nil {
+		if err := m.teardownWithRetry(t.Context(), stub, "/base", dir, 1); err != nil {
 			t.Fatalf("teardownWithRetry = %v, want nil", err)
 		}
 		if stub.calls != 1 {
@@ -1021,10 +1019,23 @@ func TestTeardownWithRetry(t *testing.T) {
 		}
 	})
 
+	t.Run("a canceled context skips the provider", func(t *testing.T) {
+		m, _ := newMgr(t)
+		stub := &teardownStub{}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := m.teardownWithRetry(ctx, stub, "/base", dir, 1); !errors.Is(err, context.Canceled) {
+			t.Fatalf("teardownWithRetry canceled context = %v, want context.Canceled", err)
+		}
+		if stub.calls != 0 {
+			t.Fatalf("teardown calls = %d, want 0 for an already canceled context", stub.calls)
+		}
+	})
+
 	t.Run("a persistent warning retries then records a doctor-visible risk", func(t *testing.T) {
 		m, warns := newMgr(t)
 		stub := &teardownStub{warnings: []string{"journal save failed"}}
-		if err := m.teardownWithRetry(stub, "/base", dir, 1); err != nil {
+		if err := m.teardownWithRetry(t.Context(), stub, "/base", dir, 1); err != nil {
 			t.Fatalf("teardownWithRetry = %v, want nil (the detach itself succeeded)", err)
 		}
 		if stub.calls != journalRetryAttempts {
@@ -1045,7 +1056,7 @@ func TestTeardownWithRetry(t *testing.T) {
 			t.Fatal(err)
 		}
 		stub := &teardownStub{warnings: []string{"transient", ""}}
-		if err := m.teardownWithRetry(stub, "/base", dir, 1); err != nil {
+		if err := m.teardownWithRetry(t.Context(), stub, "/base", dir, 1); err != nil {
 			t.Fatalf("teardownWithRetry = %v, want nil", err)
 		}
 		if stub.calls != 2 {
@@ -1060,7 +1071,7 @@ func TestTeardownWithRetry(t *testing.T) {
 		m, _ := newMgr(t)
 		boom := errors.New("holder unreachable")
 		stub := &teardownStub{teardownErr: boom}
-		if err := m.teardownWithRetry(stub, "/base", dir, 1); !errors.Is(err, boom) {
+		if err := m.teardownWithRetry(t.Context(), stub, "/base", dir, 1); !errors.Is(err, boom) {
 			t.Fatalf("teardownWithRetry hard error = %v, want the raw teardown error", err)
 		}
 		if stub.calls != 1 {
@@ -1077,7 +1088,7 @@ func TestTeardownWithRetry(t *testing.T) {
 			t.Fatal(err)
 		}
 		stub := &teardownStub{warnings: []string{"journal save failed"}}
-		err := m.teardownWithRetry(stub, "/base", dir, 1)
+		err := m.teardownWithRetry(t.Context(), stub, "/base", dir, 1)
 		if err == nil || !strings.Contains(err.Error(), "journal-risk") {
 			t.Fatalf("teardownWithRetry with a failed ledger write = %v, want a loud journal-risk error (a lost resurrection marker must not read as success)", err)
 		}
@@ -1170,28 +1181,29 @@ func TestInitFuseVerdictCarriesNoReason(t *testing.T) {
 	}
 }
 
-// fpFailStub is an injectable File Provider provider whose Setup can be forced to
+// fpFailStub is an injectable File Provider provider whose Reconcile can be forced to
 // fail and whose PrivateRoot is the real (distinct-from-account-dir) backing dir,
 // so PrepareAdd's fresh-failure cleanup is observable removing exactly it.
 type fpFailStub struct {
-	setupErr error
-	setups   int
+	reconcileErr error
+	reconciles   int
 }
 
-func (s *fpFailStub) Backend() fkoverlay.Backend           { return fkoverlay.BackendFileProvider }
-func (s *fpFailStub) Sync(_, _ string) error               { return nil }
-func (s *fpFailStub) Health(_, _ string) error             { return nil }
-func (s *fpFailStub) Teardown(_, _ string) (string, error) { return "", nil }
-func (s *fpFailStub) PrivateRoot(dir string) string        { return fkoverlay.FusePrivateRoot(dir) }
-func (s *fpFailStub) Setup(_, _ string) error {
-	s.setups++
-	return s.setupErr
+func (s *fpFailStub) Backend() fkoverlay.Backend                  { return fkoverlay.BackendFileProvider }
+func (s *fpFailStub) Check(context.Context, string, string) error { return nil }
+func (s *fpFailStub) Teardown(context.Context, string, string) (string, error) {
+	return "", nil
+}
+func (s *fpFailStub) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
+func (s *fpFailStub) Reconcile(context.Context, string, string) error {
+	s.reconciles++
+	return s.reconcileErr
 }
 
 // TestPrepareAddFileProviderFreshFailureCleanup pins the PrepareAdd fresh-failure
-// hygiene: a File Provider Setup failure removes the private backing dir THIS add
+// hygiene: a File Provider Reconcile failure removes the private backing dir THIS add
 // created, frees the index reservation, and keeps the fusekit sentinel matchable
-// through the wrap — while a pre-existing kept dir survives and a successful Setup
+// through the wrap — while a pre-existing kept dir survives and a successful Reconcile
 // retains its dir. The fuse-fallback path never runs this cleanup.
 func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 	setupFP := func(t *testing.T) *Manager {
@@ -1211,12 +1223,12 @@ func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 	t.Run("fresh private dir removed, reservation freed, sentinel preserved", func(t *testing.T) {
 		m := setupFP(t)
 		serveErr := fmt.Errorf("register domain: %w", fileproviderd.ErrDomainNotServing)
-		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return &fpFailStub{setupErr: serveErr}, nil }
+		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return &fpFailStub{reconcileErr: serveErr}, nil }
 
 		priv := fkoverlay.FusePrivateRoot(AccountDir(1))
 		_, err := m.PrepareAdd(t.Context())
 		if err == nil {
-			t.Fatal("PrepareAdd succeeded, want the File Provider setup failure")
+			t.Fatal("PrepareAdd succeeded, want the File Provider reconcile failure")
 		}
 		if !errors.Is(err, fileproviderd.ErrDomainNotServing) {
 			t.Fatalf("errors.Is(err, ErrDomainNotServing) = false; err = %v", err)
@@ -1240,10 +1252,10 @@ func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 	t.Run("pre-existing kept dir is left intact", func(t *testing.T) {
 		m := setupFP(t)
 		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
-			return &fpFailStub{setupErr: fmt.Errorf("register domain: %w", fileproviderd.ErrDomainNotServing)}, nil
+			return &fpFailStub{reconcileErr: fmt.Errorf("register domain: %w", fileproviderd.ErrDomainNotServing)}, nil
 		}
 		// A prior add logged in but never finalized: the backing dir already holds an
-		// identity-bearing .claude.json, so it must survive a later setup failure.
+		// identity-bearing .claude.json, so it must survive a later reconcile failure.
 		priv := fkoverlay.FusePrivateRoot(AccountDir(1))
 		if err := os.MkdirAll(priv, 0o700); err != nil {
 			t.Fatal(err)
@@ -1253,20 +1265,20 @@ func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := m.PrepareAdd(t.Context()); err == nil {
-			t.Fatal("PrepareAdd succeeded, want the setup failure")
+			t.Fatal("PrepareAdd succeeded, want the reconcile failure")
 		}
 		if _, err := os.Stat(kept); err != nil {
 			t.Fatalf("pre-existing kept .claude.json removed by cleanup: %v", err)
 		}
 	})
 
-	t.Run("pre-existing empty dir is left intact on setup failure", func(t *testing.T) {
+	t.Run("pre-existing empty dir is left intact on reconcile failure", func(t *testing.T) {
 		m := setupFP(t)
 		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) {
-			return &fpFailStub{setupErr: fmt.Errorf("register domain: %w", fileproviderd.ErrDomainNotServing)}, nil
+			return &fpFailStub{reconcileErr: fmt.Errorf("register domain: %w", fileproviderd.ErrDomainNotServing)}, nil
 		}
 		// A racing add (or interrupted resume) created the backing dir before this add's
-		// atomic Mkdir claim, so the EEXIST claim marks it not-ours; a later setup failure
+		// atomic Mkdir claim, so the EEXIST claim marks it not-ours; a later reconcile failure
 		// must never RemoveAll a dir we didn't create — even an empty one the old
 		// stat-then-MkdirAll would have misattributed as freshly created.
 		priv := fkoverlay.FusePrivateRoot(AccountDir(1))
@@ -1274,14 +1286,14 @@ func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := m.PrepareAdd(t.Context()); err == nil {
-			t.Fatal("PrepareAdd succeeded, want the setup failure")
+			t.Fatal("PrepareAdd succeeded, want the reconcile failure")
 		}
 		if _, err := os.Stat(priv); err != nil {
 			t.Fatalf("pre-existing empty backing dir removed by cleanup: %v", err)
 		}
 	})
 
-	t.Run("successful setup retains the private dir", func(t *testing.T) {
+	t.Run("successful reconcile retains the private dir", func(t *testing.T) {
 		m := setupFP(t)
 		m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return &fpFailStub{}, nil }
 		priv := fkoverlay.FusePrivateRoot(AccountDir(1))
@@ -1305,14 +1317,14 @@ func TestPrepareAddFileProviderFreshFailureCleanup(t *testing.T) {
 		m.DetectOverlay = func() (fkoverlay.Backend, string) { return fkoverlay.BackendNFS, "" }
 		m.OverlayFor = func(kind fkoverlay.Backend) (fkoverlay.Provider, error) {
 			if kind.IsFuse() {
-				return &stubOverlay{backend: fkoverlay.BackendNFS, setupErr: errors.New("holder down")}, nil
+				return &stubOverlay{backend: fkoverlay.BackendNFS, reconcileErr: errors.New("holder down")}, nil
 			}
 			return newSymlinkProvider(), nil
 		}
 		if _, err := m.Init(); err != nil {
 			t.Fatal(err)
 		}
-		// A fuse setup failure falls back to symlink and SUCCEEDS — it must never take
+		// A fuse reconcile failure falls back to symlink and SUCCEEDS — it must never take
 		// the non-fuse cleanup-and-return branch (which would surface an error).
 		pending, err := m.PrepareAdd(t.Context())
 		if err != nil {

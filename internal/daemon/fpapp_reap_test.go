@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -205,7 +206,7 @@ func TestReconcileStaleFPApp(t *testing.T) {
 				s.fpSynth = nil
 			}
 			s.fpConsentPending.Store(tc.consent)
-			s.bookFPAppEnsure(time.Now())
+			bookFPAppBackoff(s, time.Now())
 
 			s.reconcileStaleFPApp(context.Background())
 
@@ -240,6 +241,107 @@ func TestReconcileStaleFPAppLogsKill(t *testing.T) {
 	if !strings.Contains(buf.String(), "killed stale companion app pid 42") {
 		t.Fatalf("log %q missing the kill line", buf.String())
 	}
+}
+
+func TestStaleReapDoesNotClearInFlightEnsureFence(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	bin, installedAt := fpAppBinary(t)
+	old := installedAt.Add(-time.Hour)
+	p1 := procscan.Proc{PID: 42, StartedAt: old}
+	p2 := procscan.Proc{PID: 43, StartedAt: old.Add(time.Second)}
+	r := swapFPAppReapSeams(t, bin, [][]procscan.Proc{{p1}, {p1}, {p2}, {p2}}, nil)
+	s, _ := newTestServer(t)
+	s.fpSynth = alwaysNonEmpty
+	markFPRow(t, s, 1)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var spawns atomic.Int32
+	stubFPAppSeams(t, func() bool { return false }, func(context.Context) error {
+		if spawns.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return nil
+	}, func() ([]int, error) { return nil, nil })
+
+	if !s.reconcileStaleFPApp(t.Context()) {
+		t.Fatal("first stale app was not killed")
+	}
+	s.ensureFPAppAsync(t.Context())
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("replacement app spawn did not start")
+	}
+	if !s.reconcileStaleFPApp(t.Context()) {
+		close(release)
+		t.Fatal("second stale app was not killed")
+	}
+	s.ensureFPAppAsync(t.Context())
+	close(release)
+	s.wg.Wait()
+
+	if !equalPIDs(r.killed, []int{42, 43}) {
+		t.Fatalf("killed %v, want [42 43]", r.killed)
+	}
+	if got := spawns.Load(); got != 1 {
+		t.Fatalf("stale reap cleared an in-flight launch fence: spawned %d apps, want 1", got)
+	}
+	s.ledMu.Lock()
+	due := s.led.due(fpAppPolicy, fpAppResource, time.Now())
+	s.ledMu.Unlock()
+	if due {
+		t.Fatal("stale reap cleared the booked launch backoff while an ensure was in flight")
+	}
+}
+
+func TestStaleReconfirmDoesNotHoldAppActionLock(t *testing.T) {
+	bin, installedAt := fpAppBinary(t)
+	stale := procscan.Proc{PID: 42, StartedAt: installedAt.Add(-time.Hour)}
+	origList, origPath, origKill := listFPAppProcs, fpAppBinaryPath, killFPAppPID
+	t.Cleanup(func() { listFPAppProcs, fpAppBinaryPath, killFPAppPID = origList, origPath, origKill })
+	fpAppBinaryPath = func() string { return bin }
+	reconfirming := make(chan struct{})
+	release := make(chan struct{})
+	var scans atomic.Int32
+	listFPAppProcs = func(context.Context, string) ([]procscan.Proc, error) {
+		if scans.Add(1) == 2 {
+			close(reconfirming)
+			<-release
+		}
+		return []procscan.Proc{stale}, nil
+	}
+	killFPAppPID = func(int) error { return nil }
+	s := newFPAppReapServer(io.Discard)
+	done := make(chan struct{})
+	go func() {
+		s.reconcileStaleFPApp(t.Context())
+		close(done)
+	}()
+	select {
+	case <-reconfirming:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("stale app reconfirm did not start")
+	}
+
+	admitted := make(chan bool, 1)
+	go func() { admitted <- s.admitFPAppEnsure(time.Now()) }()
+	select {
+	case ok := <-admitted:
+		if !ok {
+			close(release)
+			t.Fatal("ensure was not admitted while stale reconfirm was blocked")
+		}
+		s.finishFPAppEnsure()
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("stale procscan held the app action mutex")
+	}
+	close(release)
+	<-done
 }
 
 func equalPIDs(got, want []int) bool {

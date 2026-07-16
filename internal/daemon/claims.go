@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -38,6 +39,7 @@ type claims struct {
 	pending      map[string]reservation
 	converting   map[int]bool // accountID -> overlay conversion in flight
 	polling      map[int]bool // accountID -> scheduler/reconcile owns the dir this iteration
+	changed      chan struct{}
 }
 
 type reservation struct {
@@ -52,6 +54,7 @@ func newClaims() *claims {
 		pending:      map[string]reservation{},
 		converting:   map[int]bool{},
 		polling:      map[int]bool{},
+		changed:      make(chan struct{}),
 	}
 }
 
@@ -149,7 +152,7 @@ func (c *claims) reservedCount(id int) int {
 }
 
 // hold claims an account for one scheduler/reconcile iteration — the
-// Sync/Setup/fallback/refresh work that must never interleave with a conversion's
+// Reconcile/fallback/refresh work that must never interleave with a conversion's
 // move/teardown/mount. Unlike a convert claim, a poll claim does not hide the
 // account from select (sessions can land on a dir being health-checked); it only
 // excludes conversions, two-sidedly with own. The claim — not the mutex — owns
@@ -157,6 +160,30 @@ func (c *claims) reservedCount(id int) int {
 func (c *claims) hold(id int) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.holdLocked(id)
+}
+
+func (c *claims) holdContext(ctx context.Context, id int) bool {
+	for {
+		c.mu.Lock()
+		if c.holdLocked(id) {
+			c.mu.Unlock()
+			return true
+		}
+		if c.changed == nil {
+			c.changed = make(chan struct{})
+		}
+		changed := c.changed
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-changed:
+		}
+	}
+}
+
+func (c *claims) holdLocked(id int) bool {
 	if c.converting[id] || c.polling[id] {
 		return false
 	}
@@ -171,6 +198,7 @@ func (c *claims) hold(id int) bool {
 func (c *claims) disownHold(id int) {
 	c.mu.Lock()
 	delete(c.polling, id)
+	c.notifyChangedLocked()
 	c.mu.Unlock()
 }
 
@@ -243,7 +271,17 @@ func (c *claims) reservedLocked(id int, now time.Time) bool {
 func (c *claims) disownConvert(id int) {
 	c.mu.Lock()
 	delete(c.converting, id)
+	c.notifyChangedLocked()
 	c.mu.Unlock()
+}
+
+func (c *claims) notifyChangedLocked() {
+	if c.changed == nil {
+		c.changed = make(chan struct{})
+		return
+	}
+	close(c.changed)
+	c.changed = make(chan struct{})
 }
 
 // held reports whether an overlay conversion holds the account.

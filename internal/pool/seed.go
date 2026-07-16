@@ -14,7 +14,7 @@ import (
 type SeedOutcome string
 
 const (
-	// SeedCopied means ~/.claude.json was copied in with oauthAccount stripped.
+	// SeedCopied means ~/.claude.json was copied in with identity and telemetry stripped.
 	SeedCopied SeedOutcome = "copied"
 	// SeedNoSource means no ~/.claude.json existed to copy; a minimal doc
 	// carrying only the onboarding flag is seeded instead.
@@ -26,7 +26,7 @@ const (
 
 // seedClaudeJSON seeds an account's private .claude.json before login so the account
 // inherits onboarding state instead of the first-run wizard: it copies srcPath
-// verbatim except the stripped oauthAccount identity, and always stamps
+// without oauthAccount identity or pluginUsage telemetry, and always stamps
 // hasCompletedOnboarding:true (login never writes that flag). It strips ONLY
 // overlay.OAuthAccountKey, so projects and userID carry over. Written to the
 // provider's private root, not a fuse mount. See ccn doc d1ab40f.
@@ -59,6 +59,7 @@ func seedClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (SeedOu
 			return "", fmt.Errorf("parse %s: not a JSON object", srcPath)
 		}
 		delete(top, overlay.OAuthAccountKey)
+		delete(top, overlay.PluginUsageKey)
 		outcome = SeedCopied
 	}
 	top[overlay.OnboardingCompletedKey] = json.RawMessage("true")

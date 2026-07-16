@@ -100,7 +100,11 @@ func TestLoginFlowRunNowNonTTYQuiet(t *testing.T) {
 		t.Fatal(err)
 	}
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	claudeBin := filepath.Join(bin, "claude")
+	if err := os.WriteFile(claudeBin, []byte("#!/bin/sh\nexit 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(claudeBin, 0o755); err != nil { //nolint:gosec // G302: test fixture must be executable.
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))

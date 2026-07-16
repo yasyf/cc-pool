@@ -123,7 +123,7 @@ func seedRemount(s *Server, dir string, attempts int) {
 	l.nextDue = time.Now().Add(-time.Second)
 }
 
-// startDegradedHolder serves Health at ver but drops every List reply —
+// startDegradedHolder serves Check at ver but drops every List reply —
 // Client.Poll's "Degraded" shape.
 func startDegradedHolder(t *testing.T, ver string) string {
 	t.Helper()
@@ -160,7 +160,7 @@ func startDegradedHolder(t *testing.T, ver string) string {
 	return socket
 }
 
-// mountTimeoutChain is the exact error chain RemoteProvider.Setup produces for a
+// mountTimeoutChain is the exact error chain RemoteProvider.Reconcile produces for a
 // mount-up timeout.
 func mountTimeoutChain() error {
 	return fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountTimeout, mountd.ErrMountTimeout))
@@ -200,33 +200,33 @@ func TestHealTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = mountTimeoutChain()
+	fake.reconcileErr = mountTimeoutChain()
 
 	healTick(t.Context(), s)
-	if fake.setupCount() != 1 {
-		t.Fatalf("setups after the first tick = %d, want 1", fake.setupCount())
+	if fake.reconcileCount() != 1 {
+		t.Fatalf("reconciles after the first tick = %d, want 1", fake.reconcileCount())
 	}
 	if l := remountRow(s, dirs[1]); l == nil || l.attempts != 1 || !l.nextDue.After(time.Now()) {
 		t.Fatalf("remount row = %+v, want one attempt with a future nextDue", l)
 	}
 
 	healTick(t.Context(), s)
-	if fake.setupCount() != 1 {
-		t.Fatalf("setups inside the backoff window = %d, want still 1", fake.setupCount())
+	if fake.reconcileCount() != 1 {
+		t.Fatalf("reconciles inside the backoff window = %d, want still 1", fake.reconcileCount())
 	}
 
 	rewindRemount(s, dirs[1])
 	healTick(t.Context(), s)
-	if fake.setupCount() != 2 || remountAttempts(s, dirs[1]) != 2 {
-		t.Fatalf("after the rewound window: setups=%d attempts=%d, want 2/2",
-			fake.setupCount(), remountAttempts(s, dirs[1]))
+	if fake.reconcileCount() != 2 || remountAttempts(s, dirs[1]) != 2 {
+		t.Fatalf("after the rewound window: reconciles=%d attempts=%d, want 2/2",
+			fake.reconcileCount(), remountAttempts(s, dirs[1]))
 	}
 
-	fake.setupErr = nil
+	fake.reconcileErr = nil
 	rewindRemount(s, dirs[1])
 	healTick(t.Context(), s)
-	if fake.setupCount() != 3 {
-		t.Fatalf("setups after clearing the failure = %d, want 3", fake.setupCount())
+	if fake.reconcileCount() != 3 {
+		t.Fatalf("reconciles after clearing the failure = %d, want 3", fake.reconcileCount())
 	}
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("healed row not vouched for in the holder cache")
@@ -242,14 +242,14 @@ func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = mountTimeoutChain()
+	fake.reconcileErr = mountTimeoutChain()
 	seedRemount(s, dirs[1], 2)
 	if !s.cl.hold(1) {
 		t.Fatal("beginPoll failed on a free account")
 	}
 
 	healTick(t.Context(), s)
-	if fake.setupCount() != 0 {
+	if fake.reconcileCount() != 0 {
 		t.Fatal("the heal loop raced the claim owner")
 	}
 	if got := remountAttempts(s, dirs[1]); got != 2 {
@@ -258,8 +258,8 @@ func TestHealTickRetrySkipsClaimedAccount(t *testing.T) {
 
 	s.cl.disownHold(1)
 	healTick(t.Context(), s)
-	if fake.setupCount() != 1 {
-		t.Fatalf("setups after release = %d, want 1", fake.setupCount())
+	if fake.reconcileCount() != 1 {
+		t.Fatalf("reconciles after release = %d, want 1", fake.reconcileCount())
 	}
 	if got := remountAttempts(s, dirs[1]); got != 3 {
 		t.Fatalf("attempts after a real attempt = %d, want 3", got)
@@ -277,7 +277,7 @@ func TestHealTickRetryLeavesConvertedRowAndPrunes(t *testing.T) {
 
 	healTick(t.Context(), s)
 
-	if fake.setupCount() != 0 {
+	if fake.reconcileCount() != 0 {
 		t.Fatal("a converted row was healed as fuse")
 	}
 	if remountRow(s, dirs[1]) != nil {
@@ -291,19 +291,19 @@ func TestHealTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
+	fake.reconcileErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
 
 	healTick(t.Context(), s)
-	if fake.setupCount() != 1 || remountAttempts(s, dirs[1]) != 1 {
-		t.Fatalf("after the first tick: setups=%d attempts=%d, want 1/1",
-			fake.setupCount(), remountAttempts(s, dirs[1]))
+	if fake.reconcileCount() != 1 || remountAttempts(s, dirs[1]) != 1 {
+		t.Fatalf("after the first tick: reconciles=%d attempts=%d, want 1/1",
+			fake.reconcileCount(), remountAttempts(s, dirs[1]))
 	}
 	healTick(t.Context(), s)
-	if fake.setupCount() != 1 {
-		t.Fatalf("setups inside the backoff window = %d, want still 1", fake.setupCount())
+	if fake.reconcileCount() != 1 {
+		t.Fatalf("reconciles inside the backoff window = %d, want still 1", fake.reconcileCount())
 	}
 
-	fake.setupErr = nil
+	fake.reconcileErr = nil
 	rewindRemount(s, dirs[1])
 	healTick(t.Context(), s)
 	if !s.holder.ready(dirs[1]) {
@@ -350,15 +350,15 @@ func TestHealTickRemountsHeldDeadRow(t *testing.T) {
 			} else {
 				// Definitive-dead (not a liveness timeout) so deferShallowDead
 				// proceeds without debounce.
-				fake.healthErr = errors.New("not a mountpoint")
+				fake.checkErr = errors.New("not a mountpoint")
 			}
 			var buf bytes.Buffer
 			s.log = log.New(&buf, "", 0)
 
 			healTick(t.Context(), s)
 
-			if fake.setupCount() != 1 {
-				t.Fatalf("setups = %d, want the held-dead mirror remounted", fake.setupCount())
+			if fake.reconcileCount() != 1 {
+				t.Fatalf("reconciles = %d, want the held-dead mirror remounted", fake.reconcileCount())
 			}
 			if !s.holder.ready(dirs[1]) {
 				t.Fatal("remounted mirror not vouched for")
@@ -381,33 +381,33 @@ func TestHealTickRemountsHeldDeadRow(t *testing.T) {
 }
 
 // TestDeferShallowDead pins the corroboration gate: a holder-reported shallow-dead
-// mirror is re-probed with the daemon's own Health before teardown.
+// mirror is re-probed with the daemon's own Check before teardown.
 func TestDeferShallowDead(t *testing.T) {
 	timeout := fmt.Errorf("%w: slow", overlay.ErrLivenessTimeout)
 	dead := errors.New("not a mountpoint")
 	tests := []struct {
 		name       string
-		health     error
+		check      error
 		peerAlive  bool
 		wantDefers []bool // one entry per consecutive deferShallowDead call
 	}{
-		{name: "live corroboration never remounts", health: nil, peerAlive: true, wantDefers: []bool{true, true, true}},
-		{name: "timeout+peer-alive debounces then remounts", health: timeout, peerAlive: true, wantDefers: []bool{true, false}},
-		{name: "timeout+peer-gone remounts at once", health: timeout, peerAlive: false, wantDefers: []bool{false}},
-		{name: "definitive dead remounts at once", health: dead, peerAlive: true, wantDefers: []bool{false}},
+		{name: "live corroboration never remounts", check: nil, peerAlive: true, wantDefers: []bool{true, true, true}},
+		{name: "timeout+peer-alive debounces then remounts", check: timeout, peerAlive: true, wantDefers: []bool{true, false}},
+		{name: "timeout+peer-gone remounts at once", check: timeout, peerAlive: false, wantDefers: []bool{false}},
+		{name: "definitive dead remounts at once", check: dead, peerAlive: true, wantDefers: []bool{false}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, fake := newHealServer(t)
 			flipToFuse(t, s, 1)
-			fake.healthErr = tc.health
+			fake.checkErr = tc.check
 			s.peerAlive = func(string) bool { return tc.peerAlive }
 			acct, err := s.m.Store.GetAccount(1)
 			if err != nil {
 				t.Fatal(err)
 			}
 			for i, want := range tc.wantDefers {
-				if got := s.deferShallowDead(acct); got != want {
+				if got := s.deferShallowDead(t.Context(), acct); got != want {
 					t.Fatalf("deferShallowDead call %d = %v, want %v", i+1, got, want)
 				}
 			}
@@ -428,7 +428,7 @@ func TestHealFuseRowsLoopTicksAndExits(t *testing.T) {
 	go func() { s.healFuseRows(ctx); close(done) }()
 
 	deadline := time.Now().Add(5 * time.Second)
-	for fake.setupCount() == 0 {
+	for fake.reconcileCount() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the heal loop never remounted the fuse row")
 		}
@@ -539,7 +539,7 @@ func TestRemountBreakerEscalates(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = mountTimeoutChain() // healRetry forever — the wedged shape
+	fake.reconcileErr = mountTimeoutChain() // healRetry forever — the wedged shape
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
 	var buf bytes.Buffer
@@ -569,7 +569,7 @@ func TestHealDefersBreakerUnderBusyMirror(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.healthErr = errors.New("mirror is dead")
+	fake.checkErr = errors.New("mirror is dead")
 	fake.teardownErr = mountd.ErrBusy // the holder refuses to seize the held lease
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
@@ -597,7 +597,7 @@ func TestHealUnsupportedHolderDefersWithoutBreaker(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = fmt.Errorf("%w: holder v0.9.0 lacks feature \"mux\"; `brew upgrade --cask fusekit-holder`",
+	fake.reconcileErr = fmt.Errorf("%w: holder v0.9.0 lacks feature \"mux\"; `brew upgrade --cask fusekit-holder`",
 		pool.ErrHolderUnsupported)
 
 	var buf bytes.Buffer
@@ -619,7 +619,7 @@ func TestHealUnsupportedHolderDefersWithoutBreaker(t *testing.T) {
 	}
 
 	// The upgrade lands: the very next tick remounts without operator action.
-	fake.setupErr = nil
+	fake.reconcileErr = nil
 	driveRetryTicks(t, s, dirs[1], 1)
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("row not remounted after the holder upgrade")
@@ -635,7 +635,7 @@ func TestRemountBreakerHoldsUnderThreshold(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = mountTimeoutChain()
+	fake.reconcileErr = mountTimeoutChain()
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
 	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold-1)
@@ -654,7 +654,7 @@ func TestRemountBreakerResetsOnMount(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = mountTimeoutChain()
+	fake.reconcileErr = mountTimeoutChain()
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
 	driveRetryTicks(t, s, dirs[1], remountBreakerThreshold-2)
@@ -662,7 +662,7 @@ func TestRemountBreakerResetsOnMount(t *testing.T) {
 		t.Fatalf("hazard before recovery = %d, want %d", got, remountBreakerThreshold-2)
 	}
 
-	fake.setupErr = nil
+	fake.reconcileErr = nil
 	driveRetryTicks(t, s, dirs[1], 1)
 	if remountRow(s, dirs[1]) != nil {
 		t.Fatal("a successful mount left a remount ledger row")
@@ -671,7 +671,7 @@ func TestRemountBreakerResetsOnMount(t *testing.T) {
 		t.Fatal("recovered row not vouched for")
 	}
 
-	fake.setupErr = mountTimeoutChain()
+	fake.reconcileErr = mountTimeoutChain()
 	driveRetryTicks(t, s, dirs[1], 1)
 	if got := remountHazard(s, dirs[1]); got != 1 {
 		t.Fatalf("hazard after a fresh failure = %d, want 1 (reset by the recovery)", got)
@@ -685,7 +685,7 @@ func TestWedgeBreakerNeverEscalatesTCCRow(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive) // healTCCBlocked
+	fake.reconcileErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive) // healTCCBlocked
 	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
 	// One short of the grant grace — already past the wedged breaker's
@@ -718,7 +718,7 @@ func TestTCCBreakerEscalates(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
+	fake.reconcileErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
 	fakeOverlayMounted(t, func(string) bool { return false })
 
 	var buf bytes.Buffer
@@ -747,7 +747,7 @@ func TestTCCBreakerEscalatesUnderLiveSession(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
+	fake.reconcileErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
 	fakeOverlayMounted(t, func(string) bool { return false })
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
@@ -769,7 +769,7 @@ func TestTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
+	fake.reconcileErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
 	fakeOverlayMounted(t, func(string) bool { return false })
 
 	driveRetryTicks(t, s, dirs[1], tccBreakerThreshold-1)
@@ -780,7 +780,7 @@ func TestTCCBreakerLateGrantPreventsFallback(t *testing.T) {
 		t.Fatalf("tccBlocks = %d, want %d (one short of the grace)", got, tccBreakerThreshold-1)
 	}
 
-	fake.setupErr = nil
+	fake.reconcileErr = nil
 	driveRetryTicks(t, s, dirs[1], 1)
 	if got := kindOf(t, s, 1); got != "nfs" {
 		t.Fatalf("row kind after a late grant = %q, want fuse (it mounted, never retreated)", got)
@@ -815,9 +815,9 @@ func TestAlternatingHazardTCCTripsNeitherBreaker(t *testing.T) {
 	ticks := 2 * (remountBreakerThreshold + tccBreakerThreshold)
 	for i := 0; i < ticks; i++ {
 		if i%2 == 0 {
-			fake.setupErr = mountTimeoutChain() // healRetry — the hazard lane
+			fake.reconcileErr = mountTimeoutChain() // healRetry — the hazard lane
 		} else {
-			fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive) // healTCCBlocked — the TCC lane
+			fake.reconcileErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive) // healTCCBlocked — the TCC lane
 		}
 		rewindRemount(s, dirs[1])
 		healTick(t.Context(), s)
@@ -844,22 +844,22 @@ func TestAlternatingHazardTCCTripsNeitherBreaker(t *testing.T) {
 // escalateTCCBlockedRow).
 func TestConsecutiveLaneOutcomesEscalateAtExactThreshold(t *testing.T) {
 	cases := map[string]struct {
-		setupErr  error
-		mounted   bool
-		threshold int
-		wantLog   string
+		reconcileErr error
+		mounted      bool
+		threshold    int
+		wantLog      string
 	}{
 		"hazard lane escalates on the 5th wedged heal": {
-			setupErr:  mountTimeoutChain(),
-			mounted:   true,
-			threshold: remountBreakerThreshold,
-			wantLog:   "never recovered",
+			reconcileErr: mountTimeoutChain(),
+			mounted:      true,
+			threshold:    remountBreakerThreshold,
+			wantLog:      "never recovered",
 		},
 		"TCC lane escalates on the 6th blocked heal": {
-			setupErr:  fmt.Errorf("mount: %w", overlay.ErrMountNotLive),
-			mounted:   false,
-			threshold: tccBreakerThreshold,
-			wantLog:   "volume-access grant never landed",
+			reconcileErr: fmt.Errorf("mount: %w", overlay.ErrMountNotLive),
+			mounted:      false,
+			threshold:    tccBreakerThreshold,
+			wantLog:      "volume-access grant never landed",
 		},
 	}
 	for name, tc := range cases {
@@ -867,7 +867,7 @@ func TestConsecutiveLaneOutcomesEscalateAtExactThreshold(t *testing.T) {
 			s, dirs, fake := newHealServer(t)
 			flipToFuse(t, s, 1)
 			s.holderSocket = startCannedHolder(t, nil)
-			fake.setupErr = tc.setupErr
+			fake.reconcileErr = tc.reconcileErr
 			mounted := tc.mounted
 			fakeOverlayMounted(t, func(dir string) bool { return mounted && dir == dirs[1] })
 			var buf bytes.Buffer
@@ -902,7 +902,7 @@ func TestHealFuseMountFailedRetreatsImmediately(t *testing.T) {
 	s, dirs, fake := newHealServer(t)
 	flipToFuse(t, s, 1)
 	s.holderSocket = startCannedHolder(t, nil)
-	fake.setupErr = mountFailedChain()
+	fake.reconcileErr = mountFailedChain()
 	fakeOverlayMounted(t, func(string) bool { return false })
 
 	driveRetryTicks(t, s, dirs[1], 1)
@@ -915,7 +915,7 @@ func TestHealFuseMountFailedRetreatsImmediately(t *testing.T) {
 	}
 }
 
-// TestHealFuseForeignRootRetries pins that a mux subtree whose Setup hits a
+// TestHealFuseForeignRootRetries pins that a mux subtree whose Reconcile hits a
 // foreign mount at the SHARED ROOT is classified as a retry (registry state),
 // never the fallbackToSymlink default — the holder clears its own dead carcasses
 // on mount, so the daemon never demotes the pool over a foreign-root error.
@@ -924,7 +924,7 @@ func TestHealFuseForeignRootRetries(t *testing.T) {
 	a := flipToFuse(t, s, 1)
 	makeBridge(t, dirs[1])
 	root := pool.MuxRootDir()
-	fake.setupErr = fmt.Errorf("mount %s: %w", dirs[1], mountd.ErrForeignMount)
+	fake.reconcileErr = fmt.Errorf("mount %s: %w", dirs[1], mountd.ErrForeignMount)
 	fakeOverlayMounted(t, func(d string) bool { return d == root })
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
@@ -1047,9 +1047,9 @@ func TestReconcileCapabilityGateProceedsWhenProbePending(t *testing.T) {
 	flipToFuse(t, s, 1)
 	hostFuseCapable(t)
 	s.holderSocket = startCapabilityHolder(t, nil, mountd.ClassTCC, "grant pending")
-	// Health fails so reconcileAccount heals rather than adopting; the heal then TCC-blocks.
-	fake.healthErr = errors.New("not a mountpoint")
-	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
+	// Check fails so reconcileAccount heals rather than adopting; the heal then TCC-blocks.
+	fake.checkErr = errors.New("not a mountpoint")
+	fake.reconcileErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
 	fakeOverlayMounted(t, func(string) bool { return false })
 
 	s.reconcileOverlays(t.Context())
@@ -1068,13 +1068,13 @@ func TestReconcileCapabilityGateProceedsWhenProbePending(t *testing.T) {
 // hazard strike — the lease, not a ps scan, is the gate.
 func TestHealLoopUnmountGate(t *testing.T) {
 	tests := []struct {
-		name          string
-		teardownErr   error
-		wantTeardowns int
-		wantSetups    int
+		name           string
+		teardownErr    error
+		wantTeardowns  int
+		wantReconciles int
 	}{
-		{name: "a free lease is torn down and remounted", teardownErr: nil, wantTeardowns: 1, wantSetups: 1},
-		{name: "a held lease answers ErrBusy and leaves it mounted", teardownErr: mountd.ErrBusy, wantTeardowns: 1, wantSetups: 0},
+		{name: "a free lease is torn down and remounted", teardownErr: nil, wantTeardowns: 1, wantReconciles: 1},
+		{name: "a held lease answers ErrBusy and leaves it mounted", teardownErr: mountd.ErrBusy, wantTeardowns: 1, wantReconciles: 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1082,7 +1082,7 @@ func TestHealLoopUnmountGate(t *testing.T) {
 			flipToFuse(t, s, 1)
 			s.holderSocket = startCannedHolder(t, nil)
 			// Mounted-but-dead: mountFuse enters the teardown-before-remount branch.
-			fake.healthErr = errors.New("mirror is dead")
+			fake.checkErr = errors.New("mirror is dead")
 			fake.teardownErr = tc.teardownErr
 			fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
 
@@ -1091,8 +1091,8 @@ func TestHealLoopUnmountGate(t *testing.T) {
 			if got := fake.teardownCount(); got != tc.wantTeardowns {
 				t.Fatalf("teardowns = %d, want %d", got, tc.wantTeardowns)
 			}
-			if got := fake.setupCount(); got != tc.wantSetups {
-				t.Fatalf("setups = %d, want %d", got, tc.wantSetups)
+			if got := fake.reconcileCount(); got != tc.wantReconciles {
+				t.Fatalf("reconciles = %d, want %d", got, tc.wantReconciles)
 			}
 			if got := remountHazard(s, dirs[1]); got != 0 {
 				t.Fatalf("hazard = %d, want 0", got)

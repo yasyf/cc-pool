@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/procscan"
 )
@@ -26,7 +27,6 @@ func TestMaintainerTableOrder(t *testing.T) {
 	}{
 		{"poll", pollTable, []row{
 			{"holder.refresh", claimNone},
-			{"session.reconcile", claimNone},
 			{"widget.stale", claimNone},
 			{"sticky.prune", claimNone},
 			{"account.poll", claimPerAccount},
@@ -44,12 +44,14 @@ func TestMaintainerTableOrder(t *testing.T) {
 			{"content.health", claimNone},
 		}},
 		{"startup", startupTable, []row{
+			{"session.heartbeat", claimNone},
 			{"bridge.content", claimNone},
 			{"bridge.fp", claimNone},
 			{"holder.refresh", claimNone},
 			{"ua.detect", claimNone},
 			{"fp.app.ensure", claimNone},
 			{"overlays.reconcile", claimPerAccount},
+			{"content.coordinator", claimNone},
 		}},
 	}
 	for _, tc := range cases {
@@ -83,10 +85,79 @@ func TestPollTableHasNoFPRow(t *testing.T) {
 	}
 }
 
-// TestTickScanFailAllBusy pins the single home of the scan-fail-means-all-busy
-// rule: a failed scan makes idle false for EVERY dir (and a clean scan reports
-// per-dir liveness).
-func TestTickScanFailAllBusy(t *testing.T) {
+func TestRunDueTableKeepsHygieneOffCriticalCadence(t *testing.T) {
+	var runs []string
+	row := func(name string) maintainer {
+		return maintainer{name: name, run: func(*Server, context.Context, *tick) bool {
+			runs = append(runs, name)
+			return true
+		}}
+	}
+	table := []maintainer{row("critical.first"), row("hygiene"), row("critical.last")}
+	due := map[string]time.Time{}
+	now := time.Unix(1_000, 0)
+	interval := func(name string) time.Duration {
+		if name == "hygiene" {
+			return time.Minute
+		}
+		return 10 * time.Second
+	}
+	s := &Server{}
+
+	next := s.runDueTable(t.Context(), &tick{}, table, due, now, interval)
+	if got := strings.Join(runs, ","); got != "critical.first,hygiene,critical.last" {
+		t.Fatalf("first pass order = %q", got)
+	}
+	if want := now.Add(10 * time.Second); !next.Equal(want) {
+		t.Fatalf("next = %v, want %v", next, want)
+	}
+
+	runs = nil
+	s.runDueTable(t.Context(), &tick{}, table, due, now.Add(10*time.Second), interval)
+	if got := strings.Join(runs, ","); got != "critical.first,critical.last" {
+		t.Fatalf("critical pass = %q; hygiene ran on the 10s clock", got)
+	}
+
+	runs = nil
+	s.runDueTable(t.Context(), &tick{}, table, due, now.Add(time.Minute), interval)
+	if got := strings.Join(runs, ","); got != "critical.first,hygiene,critical.last" {
+		t.Fatalf("minute pass order = %q", got)
+	}
+}
+
+func TestMaintenanceTablesDoNotStartRowsAfterCancellation(t *testing.T) {
+	runs := 0
+	table := []maintainer{{name: "must-not-run", run: func(*Server, context.Context, *tick) bool {
+		runs++
+		return true
+	}}}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	s := &Server{}
+	s.runTable(ctx, &tick{}, table)
+	if runs != 0 {
+		t.Fatalf("runTable started %d rows after cancellation", runs)
+	}
+	s.runDueTable(ctx, &tick{}, table, map[string]time.Time{}, time.Now(), func(string) time.Duration { return time.Second })
+	if runs != 0 {
+		t.Fatalf("runDueTable started %d rows after cancellation", runs)
+	}
+}
+
+func TestHealRowInterval(t *testing.T) {
+	for _, name := range []string{"fp.orphan.reap", "fp.app.reap", "strand.heal", "content.health"} {
+		if got := healRowInterval(name, defaultHealInterval); got != time.Minute {
+			t.Errorf("healRowInterval(%q) = %v, want 1m", name, got)
+		}
+	}
+	if got := healRowInterval("fp.heal", defaultHealInterval); got != defaultHealInterval {
+		t.Errorf("critical cadence = %v, want %v", got, defaultHealInterval)
+	}
+}
+
+// TestTickInitialScanFailureFailsClosed pins cold-start behavior: without any
+// successful heartbeat to retain, a failed first scan reports every dir busy.
+func TestTickInitialScanFailureFailsClosed(t *testing.T) {
 	dirs := []string{"/pool/acct-01", "/pool/acct-02", "/pool/acct-03"}
 
 	t.Run("scan failure fails closed to busy everywhere", func(t *testing.T) {

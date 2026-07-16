@@ -129,7 +129,7 @@ func cmdAccount(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := prov.Setup(pool.ClaudeDir(), configDir); err != nil {
+	if err := prov.Reconcile(context.Background(), pool.ClaudeDir(), configDir); err != nil {
 		return fmt.Errorf("set up symlink overlay: %w", err)
 	}
 

@@ -13,10 +13,14 @@ import (
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
-// defaultHealInterval is the steady-state heal cadence, far under the
-// scheduler's ~3.5-minute poll. (Per-row remount backoff/breaker constants live
-// in policies.go — the self-heal policy substrate.)
-const defaultHealInterval = 10 * time.Second
+const (
+	// defaultHealInterval is the critical recovery cadence, far under the
+	// scheduler's ~3.5-minute poll.
+	defaultHealInterval = 10 * time.Second
+	// healHygieneMultiplier keeps rowless cleanup and diagnostic work off the
+	// critical recovery clock while retaining a bounded one-minute cadence.
+	healHygieneMultiplier = 6
+)
 
 // fuseRemountPolicy is the fuse-row remount policy: one shared backoff clock
 // under two mutually-resetting breaker lanes — hazard (strikes, escalating via
@@ -61,7 +65,7 @@ func (s *Server) remountPrune(keep func(dir string) bool) {
 }
 
 // healFuseRows heals unvouched fuse rows until ctx is cancelled. Holder
-// lifecycle belongs to the provider's Setup (the launchd-managed cask), not
+// lifecycle belongs to the provider's Reconcile (the launchd-managed cask), not
 // this loop; started after the startup reconcile so it never races the
 // initial mounts.
 func (s *Server) healFuseRows(ctx context.Context) {
@@ -69,22 +73,33 @@ func (s *Server) healFuseRows(ctx context.Context) {
 	if interval <= 0 {
 		interval = defaultHealInterval
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	due := map[string]time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			// The heal tick body is the healTable: holder cache first (the ticker
-			// outpaces the poll's refresh), then the companion-app ensure, the
-			// fuse/FP/strand self-heal families, the orphaned-domain reap, and
-			// content-source health. FP rows are probed and healed up the recovery
-			// ladder here too — never through fuse.remount, since FP is a third
-			// backend, not a fuse mount. Strand rows carrying crash-window wreckage
-			// converge here, promoting the startup-only reconcile onto the ticker.
-			s.runTable(ctx, s.newTick(ctx), healTable)
+		case <-timer.C:
+			now := time.Now()
+			next := s.runDueTable(ctx, s.newTick(ctx), healTable, due, now, func(name string) time.Duration {
+				return healRowInterval(name, interval)
+			})
+			wait := time.Until(next)
+			if wait <= 0 {
+				wait = interval
+			}
+			timer.Reset(wait)
 		}
+	}
+}
+
+func healRowInterval(name string, base time.Duration) time.Duration {
+	switch name {
+	case "fp.orphan.reap", "fp.app.reap", "strand.heal", "content.health":
+		return time.Duration(healHygieneMultiplier) * base
+	default:
+		return base
 	}
 }
 
@@ -105,8 +120,8 @@ func (s *Server) logContentHealth() {
 
 // retryUnvouchedFuseRows retries every fuse row the holder cache cannot vouch
 // for, under per-row backoff and the scheduler's poll-claim discipline. Session
-// liveness comes from the shared tick (a failed scan reads as zero sessions,
-// which skips probing — the cautious direction).
+// liveness comes from the shared tick; a failed refresh retains last-known
+// active counts, so it cannot trigger work by making a live row look idle.
 func (s *Server) retryUnvouchedFuseRows(ctx context.Context, t *tick) {
 	now := time.Now()
 	inPass := map[string]bool{}
@@ -132,8 +147,8 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context, t *tick) {
 			return
 		}
 		// deferShallowDead sits after the backoff gate: a backed-off row must
-		// not spend a Health probe nor re-arm its shallow-dead strikes.
-		if dead, wedged := s.holder.heldDead(a.ConfigDir); dead && !wedged && s.deferShallowDead(a) {
+		// not spend a Check nor re-arm its shallow-dead strikes.
+		if dead, wedged := s.holder.heldDead(a.ConfigDir); dead && !wedged && s.deferShallowDead(ctx, a) {
 			return
 		}
 		s.claimed(a, func() {
@@ -191,8 +206,8 @@ func (s *Server) retryUnvouchedFuseRows(ctx context.Context, t *tick) {
 
 // deferShallowDead reports whether to defer remounting a holder-reported
 // shallow plain-dead mirror; the holder's liveness stat false-negatives under
-// load, so a passing provider Health check defers the remount.
-func (s *Server) deferShallowDead(a store.Account) bool {
+// load, so a passing provider Check defers the remount.
+func (s *Server) deferShallowDead(ctx context.Context, a store.Account) bool {
 	prov := s.overlayForRow(a)
 	if prov == nil {
 		// No provider to corroborate with (wrong-backend test fake): take the
@@ -200,7 +215,7 @@ func (s *Server) deferShallowDead(a store.Account) bool {
 		s.holder.resetShallowDead(a.ConfigDir)
 		return false
 	}
-	switch err := prov.Health(pool.ClaudeDir(), a.ConfigDir); {
+	switch err := prov.Check(ctx, pool.ClaudeDir(), a.ConfigDir); {
 	case err == nil:
 		s.holder.resetShallowDead(a.ConfigDir)
 		return true

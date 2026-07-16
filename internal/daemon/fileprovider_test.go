@@ -30,69 +30,91 @@ import (
 // Provider seam (the daemon drives providers, never the control wire; fusekit's
 // overlay/fileprovider_fake_test.go fakes the wire for its own provider tests).
 type fakeFPProv struct {
-	mu        sync.Mutex
-	healths   int
-	setups    int
-	syncs     int
-	teardowns int
-	signals   int
-	healthErr error
-	setupErr  error
-	syncErr   error
-	signalErr error
+	mu            sync.Mutex
+	checks        int
+	registrations int
+	reasserts     int
+	teardowns     int
+	signals       int
+	notifies      int
+	tornDown      bool
+	checkErr      error
+	registerErr   error
+	reassertErr   error
+	signalErr     error
+	reconcileFn   func()
 }
 
 func (f *fakeFPProv) Backend() fkoverlay.Backend { return fkoverlay.BackendFileProvider }
 
 func (f *fakeFPProv) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
 
-func (f *fakeFPProv) Health(_, _ string) error {
+func (f *fakeFPProv) Check(_ context.Context, _, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.healths++
-	return f.healthErr
+	f.checks++
+	return f.checkErr
 }
 
-func (f *fakeFPProv) Setup(_, _ string) error {
+func (f *fakeFPProv) Reconcile(_ context.Context, _, _ string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.setups++
-	return f.setupErr
+	fn := f.reconcileFn
+	var err error
+	if f.tornDown || f.checkErr != nil {
+		f.tornDown = false
+		f.registrations++
+		err = f.registerErr
+	} else {
+		f.reasserts++
+		err = f.reassertErr
+	}
+	f.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+	return err
 }
 
-func (f *fakeFPProv) Sync(_, _ string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.syncs++
-	return f.syncErr
-}
-
-func (f *fakeFPProv) Teardown(_, _ string) (string, error) {
+func (f *fakeFPProv) Teardown(_ context.Context, _, _ string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.teardowns++
+	f.tornDown = true
 	return "", nil
 }
 
 // Signal satisfies overlay.FPSignaler — the UNCONDITIONAL enumerator nudge the
-// recovery ladder's attempt 1 fires (never fingerprint-gated).
-func (f *fakeFPProv) Signal(_ string) error {
+// recovery ladder's attempt 1 fires (always followed by the explicit notification).
+func (f *fakeFPProv) Signal(_ context.Context, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.signals++
 	return f.signalErr
 }
 
-func (f *fakeFPProv) counts() (healths, setups, syncs, teardowns int) {
+func (f *fakeFPProv) NotifyContent(_ context.Context, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.healths, f.setups, f.syncs, f.teardowns
+	f.notifies++
+	return nil
+}
+
+func (f *fakeFPProv) counts() (checks, registrations, reasserts, teardowns int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.checks, f.registrations, f.reasserts, f.teardowns
 }
 
 func (f *fakeFPProv) signalCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.signals
+}
+
+func (f *fakeFPProv) notifyCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.notifies
 }
 
 // newFPServer builds a test server whose acct-1 is a fileprovider row served by
@@ -179,7 +201,7 @@ func TestFPBridgeSharesSourceAndSerializesWrites(t *testing.T) {
 	s := &Server{
 		cl:            newClaims(),
 		log:           log.New(io.Discard, "", 0),
-		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
+		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(pool.StateDir(), "content-stamps")),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -254,7 +276,7 @@ func TestStartFPBridgeBindsUnconditionally(t *testing.T) {
 	s := &Server{
 		cl:            newClaims(),
 		log:           log.New(io.Discard, "", 0),
-		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
+		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(pool.StateDir(), "content-stamps")),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -307,7 +329,7 @@ func TestStartFPBridgeFlagsConsentPending(t *testing.T) {
 	s := &Server{
 		cl:              newClaims(),
 		log:             log.New(io.Discard, "", 0),
-		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
+		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(pool.StateDir(), "content-stamps")),
 		fpBridgeBackoff: 25 * time.Millisecond,
 		fpBridgeWait:    50 * time.Millisecond,
 	}
@@ -379,7 +401,7 @@ func TestStartFPBridgeGenuineErrorNotConsent(t *testing.T) {
 	s := &Server{
 		cl:              newClaims(),
 		log:             log.New(io.Discard, "", 0),
-		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
+		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(pool.StateDir(), "content-stamps")),
 		fpBridgeBackoff: 25 * time.Millisecond,
 		fpBridgeWait:    50 * time.Millisecond,
 	}
@@ -441,7 +463,7 @@ func TestStartFPBridgeRetriesAfterBindFailure(t *testing.T) {
 	defer stopBlocker()
 	blocker := &content.BridgeServer{
 		Socket:  sock,
-		Source:  overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
+		Source:  overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(pool.StateDir(), "content-stamps")),
 		Version: "blocker",
 		Log:     log.New(io.Discard, "", 0),
 	}
@@ -453,7 +475,7 @@ func TestStartFPBridgeRetriesAfterBindFailure(t *testing.T) {
 	s := &Server{
 		cl:              newClaims(),
 		log:             log.New(buf, "", 0),
-		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
+		contentSource:   overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(pool.StateDir(), "content-stamps")),
 		fpBridgeBackoff: 25 * time.Millisecond,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -483,51 +505,51 @@ func TestStartFPBridgeRetriesAfterBindFailure(t *testing.T) {
 // nothing.
 func TestReconcileFileProviderErrorDispatch(t *testing.T) {
 	cases := []struct {
-		name       string
-		healthErr  error
-		setupErr   error
-		want       fpOutcome
-		wantKind   string
-		wantSetups int
+		name              string
+		checkErr          error
+		registerErr       error
+		want              fpOutcome
+		wantKind          string
+		wantRegistrations int
 	}{
 		{
-			name: "healthy row needs no setup", want: fpHealthy,
-			wantKind: "fileprovider", wantSetups: 0,
+			name: "healthy row needs no reconcile", want: fpHealthy,
+			wantKind: "fileprovider", wantRegistrations: 0,
 		},
 		{
-			name: "health failure repaired by idempotent setup", healthErr: errors.New("bridge symlink drifted"),
-			want: fpRepaired, wantKind: "fileprovider", wantSetups: 1,
+			name: "check failure repaired by idempotent reconcile", checkErr: errors.New("bridge symlink drifted"),
+			want: fpRepaired, wantKind: "fileprovider", wantRegistrations: 1,
 		},
 		{
-			name: "cannot-control retreats to symlink", healthErr: errors.New("no domain"),
-			setupErr: fmt.Errorf("file provider setup: %w", fileproviderd.ErrCannotControl),
-			want:     fpRetreated, wantKind: "symlink", wantSetups: 1,
+			name: "cannot-control retreats to symlink", checkErr: errors.New("no domain"),
+			registerErr: fmt.Errorf("file provider reconcile: %w", fileproviderd.ErrCannotControl),
+			want:        fpRetreated, wantKind: "symlink", wantRegistrations: 1,
 		},
 		{
-			name: "app unavailable retries", healthErr: errors.New("app down"),
-			setupErr: fmt.Errorf("file provider setup: %w", fileproviderd.ErrAppUnavailable),
-			want:     fpRetry, wantKind: "fileprovider", wantSetups: 1,
+			name: "app unavailable retries", checkErr: errors.New("app down"),
+			registerErr: fmt.Errorf("file provider reconcile: %w", fileproviderd.ErrAppUnavailable),
+			want:        fpRetry, wantKind: "fileprovider", wantRegistrations: 1,
 		},
 		{
-			name: "register failed retries", healthErr: errors.New("no domain"),
-			setupErr: fmt.Errorf("file provider setup: %w", fileproviderd.ErrRegisterFailed),
-			want:     fpRetry, wantKind: "fileprovider", wantSetups: 1,
+			name: "register failed retries", checkErr: errors.New("no domain"),
+			registerErr: fmt.Errorf("file provider reconcile: %w", fileproviderd.ErrRegisterFailed),
+			want:        fpRetry, wantKind: "fileprovider", wantRegistrations: 1,
 		},
 		{
-			name: "busy retries", healthErr: errors.New("no domain"),
-			setupErr: fmt.Errorf("file provider setup: %w", fileproviderd.ErrBusy),
-			want:     fpRetry, wantKind: "fileprovider", wantSetups: 1,
+			name: "busy retries", checkErr: errors.New("no domain"),
+			registerErr: fmt.Errorf("file provider reconcile: %w", fileproviderd.ErrBusy),
+			want:        fpRetry, wantKind: "fileprovider", wantRegistrations: 1,
 		},
 		{
-			name: "no-domain retries", healthErr: errors.New("no domain"),
-			setupErr: fmt.Errorf("file provider setup: %w", fileproviderd.ErrNoDomain),
-			want:     fpRetry, wantKind: "fileprovider", wantSetups: 1,
+			name: "no-domain retries", checkErr: errors.New("no domain"),
+			registerErr: fmt.Errorf("file provider reconcile: %w", fileproviderd.ErrNoDomain),
+			want:        fpRetry, wantKind: "fileprovider", wantRegistrations: 1,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s, dirs, fake := newFPServer(t)
-			fake.healthErr, fake.setupErr = tc.healthErr, tc.setupErr
+			fake.checkErr, fake.registerErr = tc.checkErr, tc.registerErr
 			a, err := s.m.Store.GetAccount(1)
 			if err != nil {
 				t.Fatal(err)
@@ -541,12 +563,12 @@ func TestReconcileFileProviderErrorDispatch(t *testing.T) {
 			if kind := kindOf(t, s, 1); kind != tc.wantKind {
 				t.Fatalf("overlay kind = %q, want %q", kind, tc.wantKind)
 			}
-			healths, setups, _, teardowns := fake.counts()
-			if healths != 1 {
-				t.Fatalf("healths = %d, want exactly 1", healths)
+			checks, registrations, _, teardowns := fake.counts()
+			if checks != 1 {
+				t.Fatalf("checks = %d, want exactly 1", checks)
 			}
-			if setups != tc.wantSetups {
-				t.Fatalf("setups = %d, want %d", setups, tc.wantSetups)
+			if registrations != tc.wantRegistrations {
+				t.Fatalf("registrations = %d, want %d", registrations, tc.wantRegistrations)
 			}
 			switch tc.want {
 			case fpRetreated:
@@ -573,11 +595,11 @@ func TestReconcileFileProviderErrorDispatch(t *testing.T) {
 // ErrCannotControl verdict never converts under a live session or a pending
 // select reservation — it defers instead, leaving the row on fileprovider.
 func TestReconcileFileProviderRetreatGates(t *testing.T) {
-	cannotControl := fmt.Errorf("file provider setup: %w", fileproviderd.ErrCannotControl)
+	cannotControl := fmt.Errorf("file provider reconcile: %w", fileproviderd.ErrCannotControl)
 
 	t.Run("live session defers", func(t *testing.T) {
 		s, _, fake := newFPServer(t)
-		fake.healthErr, fake.setupErr = errors.New("no domain"), cannotControl
+		fake.checkErr, fake.registerErr = errors.New("no domain"), cannotControl
 		a, err := s.m.Store.GetAccount(1)
 		if err != nil {
 			t.Fatal(err)
@@ -599,7 +621,7 @@ func TestReconcileFileProviderRetreatGates(t *testing.T) {
 
 	t.Run("pending select reservation defers", func(t *testing.T) {
 		s, _, fake := newFPServer(t)
-		fake.healthErr, fake.setupErr = errors.New("no domain"), cannotControl
+		fake.checkErr, fake.registerErr = errors.New("no domain"), cannotControl
 		if !s.cl.reserve(1) {
 			t.Fatal("could not reserve acct-1")
 		}
@@ -635,8 +657,8 @@ func TestReconcileAccountRoutesFileProviderRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.reconcileAccount(t.Context(), a1)
-	if healths, _, _, _ := fake.counts(); healths != 1 {
-		t.Fatalf("FP row not routed to reconcileFileProvider: healths = %d", healths)
+	if checks, _, _, _ := fake.counts(); checks != 1 {
+		t.Fatalf("FP row not routed to reconcileFileProvider: checks = %d", checks)
 	}
 	if _, err := os.Stat(filepath.Join(priv1, ".claude.json")); err != nil {
 		t.Fatalf("FP private store drained by the symlink heal arm: %v", err)
@@ -720,55 +742,21 @@ func pollOnceAccount(t *testing.T, s *Server, a store.Account) {
 	s.pollAccount(t.Context(), s.newTick(t.Context()), a, false)
 }
 
-// TestPollAccountFileProviderSyncAfterAdoption pins the post-adoption nudge: an
-// idle FP row whose rotated token was adopted gets a second provider Sync so
-// the domain re-enumerates the rotated .claude.json; a reserved (busy) row and
-// a failed adoption get only the routine overlay sync.
-func TestPollAccountFileProviderSyncAfterAdoption(t *testing.T) {
-	t.Run("idle adoption syncs the domain", func(t *testing.T) {
-		s, a, fake := newFPPollServer(t, true)
-		pollOnceAccount(t, s, a)
-		if _, _, syncs, _ := fake.counts(); syncs != 2 {
-			t.Fatalf("syncs = %d, want 2 (overlay sync + post-adoption)", syncs)
-		}
-	})
-
-	t.Run("reserved account skips adoption and the extra sync", func(t *testing.T) {
-		s, a, fake := newFPPollServer(t, true)
-		if !s.cl.reserve(a.ID) {
-			t.Fatal("could not reserve")
-		}
-		pollOnceAccount(t, s, a)
-		if _, _, syncs, _ := fake.counts(); syncs != 1 {
-			t.Fatalf("syncs = %d, want 1 (no adoption on a reserved account)", syncs)
-		}
-	})
-
-	t.Run("failed adoption skips the extra sync", func(t *testing.T) {
-		s, a, fake := newFPPollServer(t, false) // no credential: adoption fails
-		pollOnceAccount(t, s, a)
-		if _, _, syncs, _ := fake.counts(); syncs != 1 {
-			t.Fatalf("syncs = %d, want 1 (nothing adopted, nothing to re-enumerate)", syncs)
-		}
-	})
-}
-
-// TestPollAccountSyncFailureDoesNotReconcileFP pins defect-3's drop: an FP row's
-// overlay-sync failure in the poll is NOT reconciled inline (no Health, no Setup)
-// — the backoff-gated heal ticker owns FP recovery, so a failed poll never fires
-// the reconcile storm. The row is left unchanged.
-func TestPollAccountSyncFailureDoesNotReconcileFP(t *testing.T) {
+// TestPollAccountDoesNotReconcileFP pins the event-driven split: usage polling
+// never touches an FP provider. The content coordinator and recovery ticker own
+// all provider work.
+func TestPollAccountDoesNotReconcileFP(t *testing.T) {
 	s, a, fake := newFPPollServer(t, false)
-	fake.syncErr = errors.New("bridge symlink drifted")
+	fake.reassertErr = errors.New("bridge symlink drifted")
 
 	pollOnceAccount(t, s, a)
 
-	healths, setups, _, _ := fake.counts()
-	if healths != 0 {
-		t.Fatalf("healths = %d, want 0 (poll sync failure must NOT reconcile FP — the heal ticker owns it)", healths)
+	checks, registrations, _, _ := fake.counts()
+	if checks != 0 {
+		t.Fatalf("checks = %d, want 0", checks)
 	}
-	if setups != 0 {
-		t.Fatalf("setups = %d, want 0", setups)
+	if registrations != 0 {
+		t.Fatalf("registrations = %d, want 0", registrations)
 	}
 	if kind := kindOf(t, s, a.ID); kind != "fileprovider" {
 		t.Fatalf("row changed to %q on a transient sync failure", kind)

@@ -1,4 +1,3 @@
-import CoreServices
 import FileProvider
 import Foundation
 
@@ -88,16 +87,7 @@ final class FileProviderController {
         (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "dev"
     private static let appBuild =
         (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? "dev"
-    private static let rehydratedBuildKey = "cc-pool.fp.rehydrated-build"
     private static var versionedBuild: String { "\(appVersion)+\(appBuild)" }
-    private static var rehydrateDefaults: UserDefaults {
-        guard
-            let group = Bundle.main.object(forInfoDictionaryKey: "CCPoolAppGroupIdentifier") as? String,
-            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) != nil,
-            let defaults = UserDefaults(suiteName: group)
-        else { return .standard }
-        return defaults
-    }
 
     /// Reply bounds stay ~20% under the Go client's per-op deadlines (fusekit
     /// fileproviderd/appclient.go: health 2s, probe 25s, path/signal 3s,
@@ -132,21 +122,11 @@ final class FileProviderController {
     /// probe claims a key disjoint from every real account domain.
     private let probeDomainID = "ccp-probe-\(getpid())"
     private var listenFD: Int32 = -1
-    private lazy var baseWatcher = ClaudeBaseWatcher { [weak self] reason in
-        self?.signalAllDomains(reason: reason)
-    }
-    private lazy var canonicalWatcher = CanonicalConfigWatcher { [weak self] reason in
-        self?.signalAllDomains(reason: reason)
-    }
-    private var loggedSignalError = false
 
     /// Safe on machines without the extension: every arm fails soft (logged
     /// no-op), so the widget-only build keeps launching cleanly.
     func start() {
         serveControlSocket()
-        baseWatcher.start()
-        canonicalWatcher.start()
-        rehydrate()
     }
 
     // MARK: - Control socket server
@@ -228,7 +208,7 @@ final class FileProviderController {
         switch req.op {
         case "health":
             var resp = ControlResponse(ok: true)
-            resp.version = Self.appVersion
+            resp.version = Self.versionedBuild
             reply(fd, resp)
         case "probe", "register", "path", "signal", "remove", "probe-domain", "prepare-domain":
             let domain = req.domain ?? ""
@@ -841,79 +821,6 @@ final class FileProviderController {
         return result ?? .failure(.timeout)
     }
 
-    // MARK: - Base watcher + rehydrate
-
-    /// A relevant base edit nudges every registered domain's working set.
-    /// Daemon-originated changes arrive as targeted control signals instead.
-    private func signalAllDomains(reason: String) {
-        let started = ProcessInfo.processInfo.systemUptime
-        NSFileProviderManager.getDomainsWithCompletionHandler { [weak self] domains, error in
-            if let error {
-                // Expected forever on widget-only installs: log once.
-                guard let self, !self.loggedSignalError else { return }
-                self.loggedSignalError = true
-                NSLog("CCPoolStatus: fp_signal reason=%@ domain=* stage=list result=error class=%@ duration_ms=%.0f error=%@",
-                      reason, ErrClass.registerFailed.rawValue,
-                      (ProcessInfo.processInfo.systemUptime - started) * 1_000,
-                      String(describing: error))
-                return
-            }
-            self?.signalDomains(domains, reason: reason)
-        }
-    }
-
-    private func signalDomains(_ domains: [NSFileProviderDomain], reason: String) {
-        for d in domains {
-            let started = ProcessInfo.processInfo.systemUptime
-            guard let mgr = NSFileProviderManager(for: d) else {
-                NSLog("CCPoolStatus: fp_signal reason=%@ domain=%@ stage=manager result=error class=%@ duration_ms=0",
-                      reason, d.identifier.rawValue, ErrClass.registerFailed.rawValue)
-                continue
-            }
-            mgr.signalEnumerator(for: .workingSet) { err in
-                let result = err == nil ? "ok" : "error"
-                let cls = err == nil ? "none" : ErrClass.registerFailed.rawValue
-                NSLog("CCPoolStatus: fp_signal reason=%@ domain=%@ stage=signal result=%@ class=%@ duration_ms=%.0f",
-                      reason, d.identifier.rawValue, result, cls,
-                      (ProcessInfo.processInfo.systemUptime - started) * 1_000)
-                if let err {
-                    NSLog("CCPoolStatus: signal %@ failed: %@",
-                          d.identifier.rawValue, String(describing: err))
-                }
-            }
-        }
-    }
-
-    /// An app upgrade gets one fleet signal so fileproviderd retries jobs against
-    /// the new extension. Ordinary app launches never signal the fleet.
-    private func rehydrate() {
-        let current = Self.versionedBuild
-        let defaults = Self.rehydrateDefaults
-        let previous = defaults.string(forKey: Self.rehydratedBuildKey)
-        guard FileProviderRehydratePolicy.shouldSignal(lastBuild: previous, currentBuild: current)
-        else {
-            NSLog("CCPoolStatus: fp_rehydrate reason=app-upgrade stage=version result=skip class=none build=%@",
-                  current)
-            return
-        }
-        let started = ProcessInfo.processInfo.systemUptime
-        NSFileProviderManager.getDomainsWithCompletionHandler { domains, error in
-            if let error {
-                NSLog("CCPoolStatus: fp_rehydrate reason=app-upgrade stage=list result=error class=%@ duration_ms=%.0f error=%@",
-                      ErrClass.registerFailed.rawValue,
-                      (ProcessInfo.processInfo.systemUptime - started) * 1_000,
-                      String(describing: error))
-                return
-            }
-            defaults.set(current, forKey: Self.rehydratedBuildKey)
-            let ids = domains.map { $0.identifier.rawValue }.sorted().joined(separator: ", ")
-            NSLog("CCPoolStatus: fp_rehydrate reason=app-upgrade stage=list result=signal class=none duration_ms=%.0f previous=%@ build=%@ domains=%@",
-                  (ProcessInfo.processInfo.systemUptime - started) * 1_000,
-                  previous ?? "none", current, ids)
-            self.signalDomains(domains, reason: "app-upgrade")
-        }
-    }
-
     // MARK: - POSIX plumbing
 
     private static func unixAddr(_ path: String) -> sockaddr_un? {
@@ -992,138 +899,5 @@ final class FileProviderController {
             }
             return true
         }
-    }
-}
-
-/// Watches the shared configuration roots and fires only for changes that can
-/// alter a root enumeration or a synthesized file. Nested session/debug/plugin
-/// churn is ignored before the trailing debounce.
-private final class ClaudeBaseWatcher {
-    private let queue = DispatchQueue(label: "cc-pool.fp.base-watch")
-    private var stream: FSEventStreamRef?
-    private var pending: DispatchWorkItem?
-    private var pendingReasons: Set<String> = []
-    private let claudeRoot = StatusFile.realHome + "/.claude"
-    private let onChange: (String) -> Void
-
-    init(onChange: @escaping (String) -> Void) {
-        self.onChange = onChange
-    }
-
-    func start() {
-        guard stream == nil else { return }
-        var context = FSEventStreamContext(
-            version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
-            retain: nil, release: nil, copyDescription: nil)
-        let callback: FSEventStreamCallback = { _, info, count, paths, flags, _ in
-            guard let info else { return }
-            let watcher = Unmanaged<ClaudeBaseWatcher>.fromOpaque(info).takeUnretainedValue()
-            let eventPaths = paths.assumingMemoryBound(to: UnsafePointer<CChar>?.self)
-            for index in 0..<Int(count) {
-                guard let eventPath = eventPaths[index] else { continue }
-                watcher.changed(path: String(cString: eventPath), flags: flags[index])
-            }
-        }
-        guard let s = FSEventStreamCreate(
-            nil, callback, &context, [claudeRoot] as CFArray,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 1.0,
-            FSEventStreamCreateFlags(
-                kFSEventStreamCreateFlagFileEvents
-                    | kFSEventStreamCreateFlagNoDefer
-                    | kFSEventStreamCreateFlagWatchRoot))
-        else {
-            NSLog("CCPoolStatus: FSEvents stream create failed for %@", claudeRoot)
-            return
-        }
-        FSEventStreamSetDispatchQueue(s, queue)
-        FSEventStreamStart(s)
-        stream = s
-    }
-
-    /// Trailing debounce: a burst (temp write + rename) collapses into one
-    /// change after 2s of quiet — unlike a leading-edge limiter it never
-    /// drops the final event of a burst. Runs on `queue` (the stream's
-    /// dispatch queue), which serializes `pending`.
-    private func changed(path: String, flags: FSEventStreamEventFlags) {
-        guard let reason = ClaudeBaseEventPolicy.reason(
-            claudeRoot: claudeRoot, path: path, flags: flags)
-        else { return }
-        pendingReasons.insert(reason)
-        pending?.cancel()
-        let item = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            let reason = self.pendingReasons.sorted().joined(separator: ",")
-            self.pendingReasons.removeAll()
-            self.onChange(reason)
-        }
-        pending = item
-        queue.asyncAfter(deadline: .now() + 2, execute: item)
-    }
-
-}
-
-/// Polls one canonical file's metadata. This avoids a recursive FSEvents stream
-/// rooted at the home directory while still detecting in-place writes and
-/// atomic replacements of ~/.claude.json.
-private final class CanonicalConfigWatcher {
-    private enum Snapshot {
-        case value(CanonicalConfigFingerprint?)
-        case failed(Int32)
-    }
-
-    private let queue = DispatchQueue(label: "cc-pool.fp.canonical-watch")
-    private let path = StatusFile.realHome + "/.claude.json"
-    private let onChange: (String) -> Void
-    private var timer: DispatchSourceTimer?
-    private var previous: CanonicalConfigFingerprint?
-    private var loggedErrno: Int32?
-
-    init(onChange: @escaping (String) -> Void) {
-        self.onChange = onChange
-    }
-
-    func start() {
-        guard timer == nil else { return }
-        switch snapshot() {
-        case .value(let value): previous = value
-        case .failed(let code): logFailure(code)
-        }
-        let source = DispatchSource.makeTimerSource(queue: queue)
-        source.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(250))
-        source.setEventHandler { [weak self] in self?.poll() }
-        timer = source
-        source.resume()
-    }
-
-    private func poll() {
-        switch snapshot() {
-        case .failed(let code):
-            logFailure(code)
-        case .value(let current):
-            loggedErrno = nil
-            guard CanonicalConfigPolicy.changed(from: previous, to: current) else { return }
-            previous = current
-            onChange("canonical-config")
-        }
-    }
-
-    private func snapshot() -> Snapshot {
-        var st = stat()
-        guard Darwin.lstat(path, &st) == 0 else {
-            return errno == ENOENT ? .value(nil) : .failed(errno)
-        }
-        return .value(CanonicalConfigFingerprint(
-            device: UInt64(st.st_dev), inode: UInt64(st.st_ino), size: Int64(st.st_size),
-            modifiedSeconds: st.st_mtimespec.tv_sec,
-            modifiedNanoseconds: st.st_mtimespec.tv_nsec,
-            changedSeconds: st.st_ctimespec.tv_sec,
-            changedNanoseconds: st.st_ctimespec.tv_nsec))
-    }
-
-    private func logFailure(_ code: Int32) {
-        guard loggedErrno != code else { return }
-        loggedErrno = code
-        NSLog("CCPoolStatus: fp_watch reason=canonical-config stage=lstat result=error class=%@ errno=%d",
-              ErrClass.registerFailed.rawValue, code)
     }
 }

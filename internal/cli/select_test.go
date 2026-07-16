@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -91,30 +92,23 @@ func TestAbortDaemonSelectionOutlivesCallerCancellation(t *testing.T) {
 }
 
 type contextBlockingOverlay struct {
-	started       chan struct{}
-	unboundedSync bool
+	started chan struct{}
 }
 
-func (f *contextBlockingOverlay) Backend() fkoverlay.Backend    { return fkoverlay.BackendSymlink }
-func (f *contextBlockingOverlay) PrivateRoot(dir string) string { return dir }
-func (f *contextBlockingOverlay) Setup(_, _ string) error       { return nil }
-func (f *contextBlockingOverlay) Health(_, _ string) error      { return nil }
-func (f *contextBlockingOverlay) Teardown(_, _ string) (string, error) {
+func (f *contextBlockingOverlay) Backend() fkoverlay.Backend                  { return fkoverlay.BackendSymlink }
+func (f *contextBlockingOverlay) PrivateRoot(dir string) string               { return dir }
+func (f *contextBlockingOverlay) Check(context.Context, string, string) error { return nil }
+func (f *contextBlockingOverlay) Teardown(context.Context, string, string) (string, error) {
 	return "", nil
 }
 
-func (f *contextBlockingOverlay) Sync(_, _ string) error {
-	f.unboundedSync = true
-	return errors.New("unbounded sync called")
-}
-
-func (f *contextBlockingOverlay) SyncContext(ctx context.Context, _, _ string) error {
+func (f *contextBlockingOverlay) Reconcile(ctx context.Context, _, _ string) error {
 	close(f.started)
 	<-ctx.Done()
 	return ctx.Err()
 }
 
-func TestResolveSelectionBoundsOverlaySyncByLaunchContext(t *testing.T) {
+func TestResolveSelectionBoundsOverlayReconcileByLaunchContext(t *testing.T) {
 	st := openTestStore(t)
 	id := 1
 	a := store.Account{ID: id, ConfigDir: filepath.Join(t.TempDir(), "acct-01"), OverlayKind: string(fkoverlay.BackendSymlink)}
@@ -132,13 +126,75 @@ func TestResolveSelectionBoundsOverlaySyncByLaunchContext(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("resolveSelectionTxn err = %v, want launch deadline", err)
 	}
-	if provider.unboundedSync {
-		t.Fatal("resolution called the context-free overlay Sync")
-	}
 	select {
 	case <-provider.started:
 	default:
 		t.Fatal("context-aware overlay sync was not called")
+	}
+}
+
+type countingOverlay struct {
+	reconciles int
+}
+
+func (f *countingOverlay) Backend() fkoverlay.Backend    { return fkoverlay.BackendSymlink }
+func (f *countingOverlay) PrivateRoot(dir string) string { return dir }
+func (f *countingOverlay) Reconcile(context.Context, string, string) error {
+	f.reconciles++
+	return nil
+}
+func (f *countingOverlay) Check(context.Context, string, string) error { return nil }
+func (f *countingOverlay) Teardown(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func TestPrepareDaemonSelectionSkipsLocalReconcile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st := openTestStore(t)
+	a := store.Account{
+		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct-01"), OverlayKind: string(fkoverlay.BackendSymlink),
+		KeychainService: "missing", KeychainAccount: "missing",
+	}
+	if err := os.MkdirAll(a.ConfigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"theme":"shared"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	privatePath := filepath.Join(a.ConfigDir, ".claude.json")
+	private := []byte(`{"oauthAccount":{"accountUuid":"private"}}`)
+	if err := os.WriteFile(privatePath, private, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	provider := &countingOverlay{}
+	m := &pool.Manager{
+		Store: st, Creds: credstest.NewFake(),
+		OverlayFor: func(fkoverlay.Backend) (fkoverlay.Provider, error) { return provider, nil },
+	}
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+
+	dir, err := prepareAccount(t.Context(), cmd, m, a, false)
+	if err != nil {
+		t.Fatalf("prepareAccount(daemon-prepared) = %v", err)
+	}
+	if dir != a.ConfigDir {
+		t.Fatalf("dir = %q, want %q", dir, a.ConfigDir)
+	}
+	if provider.reconciles != 0 {
+		t.Fatalf("local Reconcile calls = %d, want 0 after daemon catch-up", provider.reconciles)
+	}
+	got, err := os.ReadFile(privatePath) //nolint:gosec // G304: test-owned path under t.TempDir.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, private) {
+		t.Fatalf("daemon-prepared launch rewrote private config: got %s, want %s", got, private)
 	}
 }
 
@@ -239,7 +295,7 @@ func TestWarnExhaustedFallback(t *testing.T) {
 // least-bad fallback (emptier 7d, overage enabled).
 func exhaustedPoolManager(t *testing.T) *pool.Manager {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir()) // SyncOverlay resolves ~/.claude from HOME
+	t.Setenv("HOME", t.TempDir()) // ReconcileOverlay resolves ~/.claude from HOME
 	t.Setenv("USER", "user")
 	st := openTestStore(t)
 	now := time.Now()
@@ -474,9 +530,9 @@ func TestResolveSelectionMergesBaseSettings(t *testing.T) {
 	}
 }
 
-// Pins the client-side shared-settings merge after a daemon pick: removing
-// mergeLaunchSettings in resolveSelection fails this.
-func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
+// The daemon's content coordinator applies the semantic generation before it
+// returns a pick; the client must not repeat that work after every selection.
+func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	// Short HOME under /tmp: macOS caps sun_path at 104 bytes; t.TempDir's /var/folders path exceeds it.
 	home, err := os.MkdirTemp("/tmp", "ccp-home")
 	if err != nil {
@@ -491,6 +547,14 @@ func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
 	st := openTestStore(t)
 	id := 1
 	dir := filepath.Join(home, "acct-01")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	privatePath := filepath.Join(dir, ".claude.json")
+	private := []byte(`{"oauthAccount":{"accountUuid":"private"}}`)
+	if err := os.WriteFile(privatePath, private, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.UpsertAccount(store.Account{
 		ID: id, ConfigDir: dir, Label: "work@example.com",
 		KeychainService: "svc", KeychainAccount: "u", OverlayKind: "symlink",
@@ -535,9 +599,12 @@ func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
 	if err != nil || gotDir != dir {
 		t.Fatalf("daemon pick must succeed: dir=%q err=%v (stderr=%q)", gotDir, err, stripANSI(stderr.String()))
 	}
-	var got map[string]any
-	if err := json.Unmarshal(readSelectTestFile(t, filepath.Join(dir, ".claude.json")), &got); err != nil || got["mergeMarker"] != "yes" {
-		t.Fatalf("daemon-pick merge did not land the base marker (err=%v): %v", err, got)
+	got, err := os.ReadFile(privatePath) //nolint:gosec // G304: test-owned path under t.TempDir.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, private) {
+		t.Fatalf("daemon pick repeated the base merge: got %s, want %s", got, private)
 	}
 }
 
@@ -706,15 +773,6 @@ func TestValidateDaemonSelection(t *testing.T) {
 			}
 		})
 	}
-}
-
-func readSelectTestFile(t *testing.T, path string) []byte {
-	t.Helper()
-	b, err := os.ReadFile(path) //nolint:gosec // G304: path is a cc-pool-managed/test-owned file, not external input
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b
 }
 
 // announceLine stays silent on non-TTY stdout (as under $(ccp select)).

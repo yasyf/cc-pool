@@ -7,13 +7,11 @@ import (
 )
 
 // TestOverlayProviderMemoizesFileProvider pins that the File Provider provider is
-// memoized on the Manager — the same pointer across resolves (both the exported
-// OverlayProvider the daemon routes through and the internal overlayFor SyncOverlay
-// uses) so its fingerprint-signal cache survives across polls. Non-FP backends are
-// not memoized.
+// memoized on the Manager — the same pointer across resolves through both the
+// exported and internal paths. Non-FP backends are not memoized.
 func TestOverlayProviderMemoizesFileProvider(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	m := &Manager{} // OverlayFor nil -> real resolution; ContentSource nil (CLI-shaped)
+	m := &Manager{} // OverlayFor nil -> real resolution
 
 	a, err := m.OverlayProvider(fkoverlay.BackendFileProvider)
 	if err != nil {
@@ -35,7 +33,7 @@ func TestOverlayProviderMemoizesFileProvider(t *testing.T) {
 		t.Fatalf("overlayFor FP: %v", err)
 	}
 	if c != a {
-		t.Fatal("SyncOverlay's overlayFor must share the one memoized FP instance")
+		t.Fatal("overlayFor must share the one memoized FP instance")
 	}
 
 	s1, err := m.OverlayProvider(fkoverlay.BackendSymlink)

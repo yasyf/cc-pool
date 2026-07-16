@@ -180,12 +180,12 @@ func TestInUseMountProbedAndHealedWithinInterval(t *testing.T) {
 	s.log = log.New(&buf, "", 0)
 
 	healTick(t.Context(), s)
-	if fake.setupCount() != 0 {
-		t.Fatalf("setups after one strike = %d, want 0 (a wedge needs two)", fake.setupCount())
+	if fake.reconcileCount() != 0 {
+		t.Fatalf("reconciles after one strike = %d, want 0 (a wedge needs two)", fake.reconcileCount())
 	}
 	healTick(t.Context(), s)
-	if fake.setupCount() != 1 {
-		t.Fatalf("setups after the wedge = %d, want the mirror remounted once", fake.setupCount())
+	if fake.reconcileCount() != 1 {
+		t.Fatalf("reconciles after the wedge = %d, want the mirror remounted once", fake.reconcileCount())
 	}
 	if !s.holder.ready(dirs[1]) {
 		t.Fatal("remounted mirror not vouched for (noteMounted should clear the verdict)")
@@ -220,7 +220,7 @@ func TestProbeOnAssignRefusesIdleWedge(t *testing.T) {
 	// Idle, so no periodic probe: the wedge verdict alone drives the remount.
 	s.holderSocket = startCannedHolder(t, []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}})
 	healTick(t.Context(), s)
-	if fake.setupCount() == 0 {
+	if fake.reconcileCount() == 0 {
 		t.Fatal("the heal loop did not remount the wedged mirror the select surfaced")
 	}
 	if !s.holder.ready(dirs[1]) {

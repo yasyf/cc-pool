@@ -61,7 +61,7 @@ Keychain item — the account is still tombstoned and removed everywhere.`,
 				if err := syncRecordRemoval(cmd, m, id); err != nil {
 					return err
 				}
-				if err := m.Remove(id, !keepCred); err != nil {
+				if err := m.Remove(cmd.Context(), id, !keepCred); err != nil {
 					return err
 				}
 				success(cmd.OutOrStdout(), "Removed acct-%02d.", id)

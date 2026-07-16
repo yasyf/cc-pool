@@ -177,6 +177,7 @@ func runFPConsentProbe() error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("clear stale File Provider consent probe: %w", err)
 	}
+	//nolint:gosec // G304: path is the fixed probe name inside cc-pool's app-group bridge directory.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return fmt.Errorf("write File Provider consent probe: %w", err)
@@ -205,7 +206,7 @@ func runFPConsent(cmd *cobra.Command, interval time.Duration) error {
 		if err != nil {
 			return fmt.Errorf("resolve local hostname: %w", err)
 		}
-		return fmt.Errorf("File Provider consent cannot be granted over SSH; run this in a local terminal on %s", host)
+		return fmt.Errorf("file provider consent cannot be granted over SSH; run this in a local terminal on %s", host)
 	}
 	// A skewed daemon runs a stable binary that predates `fp consent-probe`, so
 	// diagnose the skew here rather than failing later with an opaque probe error
@@ -243,9 +244,9 @@ func runFPConsent(cmd *cobra.Command, interval time.Duration) error {
 		}
 		if fpConsentNow().Sub(started) >= fpConsentBridgeWindow {
 			if alive {
-				return errors.New("File Provider consent was granted, but the live daemon's bridge did not bind within 15s — run `ccp doctor`")
+				return errors.New("file provider consent was granted, but the live daemon's bridge did not bind within 15s — run `ccp doctor`")
 			}
-			return errors.New("File Provider consent was granted, but the daemon is not running — start it with `ccp service install`")
+			return errors.New("file provider consent was granted, but the daemon is not running — start it with `ccp service install`")
 		}
 		select {
 		case <-cmd.Context().Done():

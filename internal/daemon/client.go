@@ -82,7 +82,7 @@ func (c *Client) doContext(ctx context.Context, req Request, timeout time.Durati
 // least-bad exhausted pick; ok=false means fall back to a live, daemonless
 // selection. A successful response must be committed or aborted by token.
 func (c *Client) Select(ctx context.Context, account *int, pid int, noMark bool, cwd string, noFallback bool, excludeIDs []int) (resp *Response, ok bool) {
-	r, err := c.doContext(ctx, Request{Op: OpSelect, Account: account, PID: pid, NoMark: noMark, Cwd: cwd, NoFallback: noFallback, ExcludeIDs: excludeIDs}, 3*time.Second)
+	r, err := c.doContext(ctx, Request{Op: OpSelect, Account: account, PID: pid, NoMark: noMark, Cwd: cwd, NoFallback: noFallback, ExcludeIDs: excludeIDs}, 13*time.Second)
 	if err != nil {
 		return nil, false
 	}
@@ -151,9 +151,10 @@ func (c *Client) StatusContext(ctx context.Context) (*Response, error) {
 	return c.doContext(ctx, Request{Op: OpStatus}, 5*time.Second)
 }
 
-// Checkin releases a checkout for pid.
-func (c *Client) Checkin(pid int) (*Response, error) {
-	return c.do(Request{Op: OpCheckin, PID: pid}, 3*time.Second)
+// Checkin releases account's checkout for pid. Account identity prevents a
+// replayed or reused pid from ending another account's session.
+func (c *Client) Checkin(ctx context.Context, accountID, pid int) (*Response, error) {
+	return c.doContext(ctx, Request{Op: OpCheckin, Account: &accountID, PID: pid}, 3*time.Second)
 }
 
 // Health probes the daemon.
@@ -191,7 +192,7 @@ func (c *Client) CredMove(account *int, to string) (*Response, error) {
 // reaches the automatic-retreat-removed convertFPToSymlinkHeld, gated to explicit
 // operator request. The daemon owns the select gate a CLI-side re-register would
 // race, so this routes through it and refuses when it is down. It shares
-// migrateTimeout: each re-register is a Teardown+Setup that can take seconds to
+// migrateTimeout: each re-register is a Teardown+Reconcile that can take seconds to
 // materialize.
 func (c *Client) FPRepair(account *int, retreat bool) (*Response, error) {
 	return c.do(Request{Op: OpFPRepair, Account: account, Retreat: retreat}, migrateTimeout)

@@ -400,7 +400,7 @@ func (s *Service) teardown(ctx context.Context) (tornDown, skippedBusy int, err 
 			release()
 			continue
 		}
-		rerr := s.M.Remove(a.ID, true)
+		rerr := s.M.Remove(ctx, a.ID, true)
 		release()
 		if rerr != nil {
 			s.logf("hostsync: teardown remove acct-%d (%s): %v — deferred to a later pass", a.ID, uuid, rerr)

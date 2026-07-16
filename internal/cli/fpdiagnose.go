@@ -80,12 +80,12 @@ func fpDiagnose(ctx context.Context, spec fkoverlay.Spec, fpRows int, bridge *da
 	return findings
 }
 
-// fpSetupFailureSentinels are the fileproviderd sentinels a File Provider Setup
+// fpReconcileFailureSentinels are the fileproviderd sentinels a File Provider Reconcile
 // surfaces when the OS or companion app cannot stand up a domain — every class the
 // EnsureReport/Register and waitDomainServes chain can return (ErrBusy and
 // ErrRegisterFailed come from a reached, entitled app's register). Slice form so a
 // new sentinel is a one-line append.
-var fpSetupFailureSentinels = []error{
+var fpReconcileFailureSentinels = []error{
 	fileproviderd.ErrDomainNotServing,
 	fileproviderd.ErrCannotControl,
 	fileproviderd.ErrOpUnsupported,
@@ -95,9 +95,9 @@ var fpSetupFailureSentinels = []error{
 	fileproviderd.ErrDomainRemovalUnconfirmed,
 }
 
-// isFPSetupFailure reports whether err is a File Provider Setup failure worth diagnosing.
-func isFPSetupFailure(err error) bool {
-	for _, s := range fpSetupFailureSentinels {
+// isFPReconcileFailure reports whether err is a File Provider Reconcile failure worth diagnosing.
+func isFPReconcileFailure(err error) bool {
+	for _, s := range fpReconcileFailureSentinels {
 		if errors.Is(err, s) {
 			return true
 		}
@@ -106,12 +106,12 @@ func isFPSetupFailure(err error) bool {
 }
 
 // diagnoseFPAddFailure prints a read-only File Provider diagnosis after a `ccp
-// add` whose PrepareAdd failed on a File Provider Setup sentinel: first the data
+// add` whose PrepareAdd failed on a File Provider Reconcile sentinel: first the data
 // bridge's liveness, then the unhealthy health rungs, then the onboard pointer.
 // A no-op for any other failure — it never probes, mutates, or waits beyond the
 // probes' own bounds.
 func diagnoseFPAddFailure(cmd *cobra.Command, m *pool.Manager, err error) {
-	if !isFPSetupFailure(err) {
+	if !isFPReconcileFailure(err) {
 		return
 	}
 	errOut := cmd.ErrOrStderr()

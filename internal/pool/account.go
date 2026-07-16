@@ -11,7 +11,6 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
@@ -58,7 +57,7 @@ type PendingAdd struct {
 	ConfigDir       string
 	KeychainService string
 	OverlayKind     fkoverlay.Backend
-	// FallbackReason says why fuse was ruled out: Setup fell back to symlinks, or
+	// FallbackReason says why fuse was ruled out: Reconcile fell back to symlinks, or
 	// detection did. OverlayKind then records symlink; "" when fuse held or was
 	// never in play.
 	FallbackReason string
@@ -128,9 +127,9 @@ func (m *Manager) PrepareAdd(ctx context.Context) (pending *PendingAdd, err erro
 	if err != nil {
 		return nil, fmt.Errorf("resolve overlay provider for %s: %w", acctDir, err)
 	}
-	// Seed before Setup: File Provider's readiness probe reads .claude.json.
+	// Seed before Reconcile: File Provider's readiness probe reads .claude.json.
 	// privFreshlyCreated is true only when THIS call's atomic Mkdir claimed the
-	// backing dir, so a Setup failure below can clean up its own mess without
+	// backing dir, so a Reconcile failure below can clean up its own mess without
 	// touching a kept/resume dir. A stat-then-MkdirAll would misread a dir born in
 	// that gap (a concurrent add) as ours and RemoveAll it. The parent (AccountsDir)
 	// is guaranteed by Init's EnsureAccountsDir, which the Initialized gate above proves ran.
@@ -150,7 +149,7 @@ func (m *Manager) PrepareAdd(ctx context.Context) (pending *PendingAdd, err erro
 		}
 	}
 	fallbackReason := detectReason
-	if setupErr := prov.Setup(ClaudeDir(), acctDir); setupErr != nil {
+	if setupErr := prov.Reconcile(ctx, ClaudeDir(), acctDir); setupErr != nil {
 		if !backend.IsFuse() {
 			// A File Provider domain that never came up leaves the private backing dir
 			// we just created (seedClaudeJSON always fills it), which a retry would then
@@ -163,10 +162,10 @@ func (m *Manager) PrepareAdd(ctx context.Context) (pending *PendingAdd, err erro
 			}
 			return nil, fmt.Errorf("set up overlay for %s: %w", acctDir, setupErr)
 		}
-		// Fuse Setup failure = holder unavailable, not fatal: fall back to
+		// Fuse Reconcile failure = holder unavailable, not fatal: fall back to
 		// symlinks; the reason rides along so `ccp add` names it.
 		fallbackReason = setupErr.Error()
-		// ANY post-mount Setup failure LEAVES the fresh mount up: a post-Setup capability
+		// ANY post-mount Reconcile failure LEAVES the fresh mount up: a post-Reconcile capability
 		// refusal (ErrHolderUnsupported), or a lost ack / protocol mismatch after the
 		// holder mounted (ErrMountedUnverified — the feature gate probed the holder's
 		// mount list to tell it from a clean pre-mount miss). The symlink fallback below
@@ -176,7 +175,7 @@ func (m *Manager) PrepareAdd(ctx context.Context) (pending *PendingAdd, err erro
 		// KEEPS the reservation so the live mount is never orphaned nameless; the user
 		// retries `ccp add`. A live-session ErrBusy is near-impossible on a fresh mount.
 		if errors.Is(setupErr, ErrHolderUnsupported) || errors.Is(setupErr, ErrMountedUnverified) {
-			if terr := m.teardownWithRetry(prov, ClaudeDir(), acctDir, n); terr != nil {
+			if terr := m.teardownWithRetry(ctx, prov, ClaudeDir(), acctDir, n); terr != nil {
 				keepReservation = true
 				if errors.Is(terr, mountd.ErrBusy) {
 					return nil, fmt.Errorf("set up overlay for %s: the fresh fuse mount is busy and cannot be reclaimed for the symlink fallback (%w) — its reservation is kept; retry `ccp add` once the holding session ends", acctDir, terr)
@@ -188,7 +187,7 @@ func (m *Manager) PrepareAdd(ctx context.Context) (pending *PendingAdd, err erro
 		if err != nil {
 			return nil, fmt.Errorf("resolve fallback symlink provider for %s (after fuse setup failed: %w): %w", acctDir, setupErr, err)
 		}
-		if err := prov.Setup(ClaudeDir(), acctDir); err != nil {
+		if err := prov.Reconcile(ctx, ClaudeDir(), acctDir); err != nil {
 			// Wrap both causes: callers match either with errors.Is, and the
 			// symlink error alone would mask the fuse failure (e.g. ErrForeignMount).
 			return nil, fmt.Errorf("set up fallback symlink overlay for %s (after fuse setup failed: %w): %w", acctDir, setupErr, err)
@@ -328,7 +327,7 @@ func (m *Manager) ReleaseAdd(p *PendingAdd) error {
 // its login wrote (the Keychain item and the plaintext file, each deleted
 // explicitly). The index reservation is released last but unconditionally. p must be
 // non-nil, from PrepareAdd. Idempotent. See ccn doc 935d323.
-func (m *Manager) AbandonAdd(p *PendingAdd) error {
+func (m *Manager) AbandonAdd(ctx context.Context, p *PendingAdd) error {
 	var errs error
 	pend := store.Account{ConfigDir: p.ConfigDir, KeychainService: p.KeychainService}
 	account, err := m.Creds.Discover(p.KeychainService)
@@ -346,7 +345,7 @@ func (m *Manager) AbandonAdd(p *PendingAdd) error {
 		errs = errors.Join(errs, fmt.Errorf("resolve overlay provider for %s: %w", p.ConfigDir, err))
 	} else {
 		pend.ID, pend.OverlayKind = p.Index, string(p.OverlayKind)
-		errs = errors.Join(errs, m.removeAccountDir(pend, prov))
+		errs = errors.Join(errs, m.removeAccountDir(ctx, pend, prov))
 	}
 	return errors.Join(errs, m.Store.ReleaseAccountIndex(p.Index))
 }
@@ -355,7 +354,7 @@ func (m *Manager) AbandonAdd(p *PendingAdd) error {
 // Keychain item, and deletes its rows. ~/.claude is never touched (it is not
 // an account). Keeping the credential (deleteCredential=false) is refused when
 // it is file-backed — the file lives inside the account dir being removed.
-func (m *Manager) Remove(id int, deleteCredential bool) error {
+func (m *Manager) Remove(ctx context.Context, id int, deleteCredential bool) error {
 	a, err := m.Store.GetAccount(id)
 	if err != nil {
 		return err
@@ -381,7 +380,7 @@ func (m *Manager) Remove(id int, deleteCredential bool) error {
 	if err != nil {
 		return fmt.Errorf("remove acct-%02d: resolve overlay provider: %w", id, err)
 	}
-	if err := m.removeAccountDir(a, prov); err != nil {
+	if err := m.removeAccountDir(ctx, a, prov); err != nil {
 		return err
 	}
 	if deleteCredential {
@@ -402,11 +401,11 @@ func (m *Manager) Remove(id int, deleteCredential bool) error {
 //   - A symlink/File Provider row's Teardown is a LOCAL destructive op (delete
 //     links / deregister + unlink the domain), so it runs UNDER the fence — a held
 //     lease must defer it, not discover the overlay already destroyed afterward.
-func (m *Manager) removeAccountDir(a store.Account, prov fkoverlay.Provider) error {
+func (m *Manager) removeAccountDir(ctx context.Context, a store.Account, prov fkoverlay.Provider) error {
 	configDir := a.ConfigDir
 	fuse := prov.Backend().IsFuse()
 	teardown := func() error {
-		if err := m.teardownWithRetry(prov, ClaudeDir(), configDir, a.ID); err != nil {
+		if err := m.teardownWithRetry(ctx, prov, ClaudeDir(), configDir, a.ID); err != nil {
 			return fmt.Errorf("teardown overlay: %w", err)
 		}
 		return nil
@@ -437,83 +436,21 @@ func (m *Manager) removeAccountDir(a store.Account, prov fkoverlay.Provider) err
 	return nil
 }
 
-// SyncOverlay re-asserts an account's overlay against the current ~/.claude: the
-// symlink provider links any new top-level entry, the fuse provider (a live
-// mirror) just health-checks. Run at launch and periodically by the daemon.
-func (m *Manager) SyncOverlay(a store.Account) error {
-	backend, err := fkoverlay.Parse(a.OverlayKind)
-	if err != nil {
-		return fmt.Errorf("sync overlay for acct-%02d: parse stored backend: %w", a.ID, err)
-	}
-	prov, err := m.overlayFor(backend)
-	if err != nil {
-		return fmt.Errorf("sync overlay for acct-%02d: resolve provider: %w", a.ID, err)
-	}
-	// Re-check just before Sync's MkdirAll: a remove racing the poll must not
-	// recreate the dir. A gone row is not an error — nothing left to sync.
-	if _, err := m.Store.GetAccount(a.ID); err != nil {
-		if errors.Is(err, store.ErrAccountNotFound) {
-			return nil
-		}
-		return fmt.Errorf("sync overlay for acct-%02d: %w", a.ID, err)
-	}
-	return prov.Sync(ClaudeDir(), a.ConfigDir)
-}
-
-type contextOverlaySyncer interface {
-	SyncContext(ctx context.Context, base, accountDir string) error
-}
-
-// SyncOverlayContext is the launch-bound form of SyncOverlay. File Provider
-// control calls receive ctx directly instead of the provider's background
-// context; injected providers may implement contextOverlaySyncer themselves.
-func (m *Manager) SyncOverlayContext(ctx context.Context, a store.Account) error {
+// ReconcileOverlay repairs an account's overlay before a daemonless launch.
+// Routine polling must use Check; reconciliation is an explicit lifecycle action.
+func (m *Manager) ReconcileOverlay(ctx context.Context, a store.Account) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	backend, err := fkoverlay.Parse(a.OverlayKind)
 	if err != nil {
-		return fmt.Errorf("sync overlay for acct-%02d: parse stored backend: %w", a.ID, err)
+		return fmt.Errorf("reconcile overlay for acct-%02d: parse stored backend: %w", a.ID, err)
 	}
 	prov, err := m.overlayFor(backend)
 	if err != nil {
-		return fmt.Errorf("sync overlay for acct-%02d: resolve provider: %w", a.ID, err)
+		return fmt.Errorf("reconcile overlay for acct-%02d: resolve provider: %w", a.ID, err)
 	}
-	if syncer, ok := prov.(contextOverlaySyncer); ok {
-		return syncer.SyncContext(ctx, ClaudeDir(), a.ConfigDir)
-	}
-	if backend == fkoverlay.BackendFileProvider && m.OverlayFor == nil {
-		return m.syncFileProviderContext(ctx, a)
-	}
-	if err := prov.Sync(ClaudeDir(), a.ConfigDir); err != nil {
-		return err
-	}
-	return ctx.Err()
-}
-
-func (m *Manager) syncFileProviderContext(ctx context.Context, a store.Account) error {
-	spec := m.overlaySpec().FileProvider
-	host := &fileproviderd.RemoteDomainHost{
-		AppPath:       spec.AppPath,
-		ControlSocket: spec.ControlSocket,
-		SpawnTimeout:  spec.SpawnTimeout,
-		LaunchTimeout: spec.LaunchTimeout,
-	}
-	domain := filepath.Base(a.ConfigDir)
-	root, err := host.Ensure(ctx, domain)
-	if err != nil {
-		return fmt.Errorf("file provider sync %s: %w", a.ConfigDir, err)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := fileproviderd.AtomicSymlink(a.ConfigDir, root); err != nil {
-		return fmt.Errorf("file provider sync %s: %w", a.ConfigDir, err)
-	}
-	if err := host.Signal(ctx, domain); err != nil {
-		return fmt.Errorf("file provider sync %s: signal: %w", a.ConfigDir, err)
-	}
-	return ctx.Err()
+	return prov.Reconcile(ctx, ClaudeDir(), a.ConfigDir)
 }
 
 // ensureOverlayKind returns the new-account overlay backend: the one recorded at

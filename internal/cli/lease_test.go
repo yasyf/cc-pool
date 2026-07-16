@@ -245,11 +245,22 @@ func TestRunLeaseAgentKqueueQueuedDeathFailsBeforeOk(t *testing.T) {
 // agent writes its advisory slot, signals ok, and waits on the leader's exit.
 func TestRunLeaseAgentHoldsUntilExit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	tempLeaseRoot(t)
+	root := tempLeaseRoot(t)
 	tempAgentDir(t)
 	swapVar(t, &procStartTime, func(int) (int64, error) { return 100, nil })
 	waiter := &fakeWaiter{}
 	swapVar(t, &registerProcExit, func(int) (procWaiter, error) { return waiter, nil })
+	checkedIn := false
+	swapVar(t, &leaseAgentCheckin, func(_ context.Context, accountID, pid int) error {
+		checkedIn = true
+		if accountID != 3 || pid != 4242 {
+			t.Errorf("Checkin(%d, %d), want (3, 4242)", accountID, pid)
+		}
+		if held, _, err := lease.Probe(root, "/pool/acct-03"); err != nil || !held {
+			t.Errorf("lease held during Checkin = %v, %v; want true, nil", held, err)
+		}
+		return nil
+	})
 
 	r, w, _ := os.Pipe()
 	if err := runLeaseAgent(4242, 100, 3, "/pool/acct-03", "", false, w); err != nil {
@@ -260,6 +271,35 @@ func TestRunLeaseAgentHoldsUntilExit(t *testing.T) {
 	}
 	if !waiter.waited {
 		t.Fatal("agent did not wait on the leader's exit for a matching pid")
+	}
+	if !checkedIn {
+		t.Fatal("agent did not check the exited leader in with the daemon")
+	}
+}
+
+func TestRunLeaseAgentCheckinFailureStillReleases(t *testing.T) {
+	root := tempLeaseRoot(t)
+	tempAgentDir(t)
+	swapVar(t, &procStartTime, func(int) (int64, error) { return 100, nil })
+	swapVar(t, &registerProcExit, func(int) (procWaiter, error) { return &fakeWaiter{}, nil })
+	boom := errors.New("checkin exploded")
+	swapVar(t, &leaseAgentCheckin, func(context.Context, int, int) error {
+		if held, _, err := lease.Probe(root, "/pool/acct-checkin-fail"); err != nil || !held {
+			t.Errorf("lease held during failed Checkin = %v, %v; want true, nil", held, err)
+		}
+		return boom
+	})
+
+	r, w, _ := os.Pipe()
+	err := runLeaseAgent(4242, 100, 6, "/pool/acct-checkin-fail", "", false, w)
+	if !errors.Is(err, boom) {
+		t.Fatalf("runLeaseAgent = %v, want checkin error", err)
+	}
+	if got := readReady(t, r); got != "ok" {
+		t.Fatalf("readiness = %q, want ok before the later leader exit", got)
+	}
+	if held, _, err := lease.Probe(root, "/pool/acct-checkin-fail"); err != nil || held {
+		t.Fatalf("lease held after failed Checkin = %v, %v; want false, nil", held, err)
 	}
 }
 
@@ -519,7 +559,7 @@ func TestRunLeaseAgentPollFallbackQueuedDeathFailsBeforeOk(t *testing.T) {
 // that then goes away makes the agent exit cleanly.
 func TestRunLeaseAgentPollFallbackHoldsThenExits(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	tempLeaseRoot(t)
+	root := tempLeaseRoot(t)
 	tempAgentDir(t)
 	swapVar(t, &registerProcExit, func(int) (procWaiter, error) { return nil, errors.New("too many open files") })
 	var mu sync.Mutex
@@ -542,6 +582,18 @@ func TestRunLeaseAgentPollFallbackHoldsThenExits(t *testing.T) {
 		}
 		return syscall.ESRCH
 	})
+	type checkinCall struct {
+		accountID int
+		pid       int
+		held      bool
+		err       error
+	}
+	checkin := make(chan checkinCall, 1)
+	swapVar(t, &leaseAgentCheckin, func(_ context.Context, accountID, pid int) error {
+		held, _, err := lease.Probe(root, "/pool/acct-poll-live")
+		checkin <- checkinCall{accountID: accountID, pid: pid, held: held, err: err}
+		return nil
+	})
 
 	r, w, _ := os.Pipe()
 	done := make(chan error, 1)
@@ -559,6 +611,10 @@ func TestRunLeaseAgentPollFallbackHoldsThenExits(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("agent did not exit after the leader went away")
+	}
+	call := <-checkin
+	if call.accountID != 3 || call.pid != 4242 || !call.held || call.err != nil {
+		t.Fatalf("Checkin while lease held = %+v, want account=3 pid=4242 held=true err=nil", call)
 	}
 }
 

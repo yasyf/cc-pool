@@ -39,6 +39,14 @@ const reservationTTL = 30 * time.Second
 // budget; committed reservations still use reservationTTL only until procscan sees claude.
 const provisionalSelectionTTL = 90 * time.Second
 
+// selectRequestTimeout bounds selection lifecycle repair below both the server
+// connection and client transport deadlines, preventing late reservations after
+// a client has fallen back.
+const (
+	selectRequestTimeout = 10 * time.Second
+	selectConnTimeout    = 12 * time.Second
+)
+
 // preflightTimeout bounds a best-effort preflight refresh so shutdown is never
 // blocked on a slow network refresh.
 const preflightTimeout = 8 * time.Second
@@ -127,6 +135,14 @@ type Server struct {
 
 	// scanSessions is a test seam over procscan.Scan; nil means the real scan.
 	scanSessions func(context.Context) ([]procscan.Session, error)
+	// heartbeat is the one daemon-wide procscan cache shared by polling, healing,
+	// content coordination, and selection. heartbeatMu only protects lazy setup.
+	heartbeatMu       sync.Mutex
+	heartbeat         *sessionHeartbeat
+	heartbeatInterval time.Duration
+	adoptionMu        sync.Mutex
+	adoptionNext      map[string]time.Time
+	adoptRotated      func(context.Context, store.Account) error
 
 	// pollSpacing overrides perAccountSpacing (the inter-sample delay); zero means
 	// the default. Tests shrink it so a multi-account sweep does not sleep for
@@ -154,7 +170,8 @@ type Server struct {
 	// contentSource is the content.Source the daemon's BridgeServer serves to the
 	// shared holder — the merged .claude.json and injected settings.json — for
 	// every cc-pool mount.
-	contentSource *overlay.PoolContentSource
+	contentSource      *overlay.PoolContentSource
+	overlayCoordinator *overlayCoordinator
 	// lastContentHealth dedups the content-source health log; only the heal
 	// goroutine touches it — no lock.
 	lastContentHealth string
@@ -162,7 +179,7 @@ type Server struct {
 	// led is the shared self-heal ledger (fp.domain and fuse.remount rows, plus the
 	// auth.streak and ratelimit.acct / ratelimit.pool streaks). ledMu is its
 	// serialization: every s.led access takes ledMu, never held across
-	// mount/Sync/re-register/bounce or usage-fetch/refresh I/O (bookkeeping in, I/O
+	// mount/reconcile/re-register/bounce or usage-fetch/refresh I/O (bookkeeping in, I/O
 	// out). See ccn doc 36b05ef.
 	led   *ledgers
 	ledMu sync.Mutex
@@ -182,11 +199,16 @@ type Server struct {
 	// self-test); nil means the real dial + SelfTest classification.
 	fpBridgeCheckFn func(ctx context.Context) FPBridgeStatus
 
-	// fpProbeClock tracks the last periodic (deep or parked) FP re-probe per dir,
-	// gating the slow deep check on a healthy row (fpDeepProbeInterval) and the
-	// re-probe of a parked row (fpRecoveryBackoff.Cap). Guarded by fpProbeClockMu.
+	// fpProbeClock tracks the last parked FP recovery probe per dir, gating
+	// re-probes on fpRecoveryBackoff.Cap. Healthy rows are deep-validated only at
+	// selection. Guarded by fpProbeClockMu.
 	fpProbeClockMu sync.Mutex
 	fpProbeClock   map[string]time.Time
+
+	fpAppActionMu       sync.Mutex
+	fpAppKilled         map[fpAppProcess]bool
+	fpAppReaping        map[fpAppProcess]bool
+	fpAppEnsureInFlight bool
 
 	// syncSvc is the wired host-sync engine (registry, driver, mesh); nil ⇒ host
 	// sync never wired this run. syncSelf is this host's registry origin name.
@@ -241,17 +263,18 @@ func Run(ctx context.Context) error {
 		log:           log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
 		evictTimeout:  defaultEvictTimeout,
 		startedAt:     time.Now(),
-		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath()),
+		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(pool.StateDir(), "content-stamps")),
 		cl:            newClaims(),
 		led:           newLedgers(),
+	}
+	s.overlayCoordinator = newOverlayCoordinator(s)
+	if err := s.overlayCoordinator.initialize(); err != nil {
+		return fmt.Errorf("initialize semantic content stamps: %w", err)
 	}
 	// The FP wedge detector strikes a 0-byte served .claude.json only when the
 	// account genuinely has an identity (its synth is non-empty) — resolved through
 	// the same content source the bridge serves. Wiring the seam arms FP self-heal.
 	s.fpSynth = s.contentSource.SynthNonEmpty
-	// Wire the same content source into the memoized FP provider so its enumerator
-	// signal is fingerprint-gated (Sync/Health signal only on a real content change).
-	m.ContentSource = s.contentSource
 	// The convert gate proves a freshly registered domain serves before flipping the
 	// row, through the SAME bounded control-op probe the heal loop uses — never a
 	// through-domain read. A NoVerdict returns non-nil, so the gate rolls back rather
@@ -331,6 +354,9 @@ func (s *Server) serve(ctx context.Context) error {
 	go func() {
 		defer s.wg.Done()
 		s.runTable(ctx, s.newTick(ctx), startupTable)
+		if ctx.Err() != nil {
+			return
+		}
 		// The heal loop is only the per-account mount-health net. The Add(1)
 		// runs inside this already-tracked goroutine, so the counter is ≥1 and
 		// cannot race a zero-counter Wait.
@@ -433,7 +459,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	if req.Op == OpMigrate || req.Op == OpCredMove || req.Op == OpFPRepair {
 		// These ops legitimately outlive the 10s deadline (migrate: a probe
 		// mount plus up to an 8s wait and a bounded rollback per account;
-		// credmove: a bounded per-account lock wait; fprepair: a Teardown+Setup
+		// credmove: a bounded per-account lock wait; fprepair: a Teardown+Reconcile
 		// per domain, each of which can take seconds to materialize); stay under
 		// the client's 150s so the server, not a dead socket, reports the outcome.
 		_ = conn.SetDeadline(time.Now().Add(140 * time.Second))
@@ -444,7 +470,14 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		// lost check as a healthy dial).
 		_ = conn.SetDeadline(time.Now().Add(13 * time.Second))
 	}
-	resp := s.dispatch(ctx, req)
+	dispatchCtx := ctx
+	var cancel context.CancelFunc
+	if req.Op == OpSelect {
+		dispatchCtx, cancel = context.WithTimeout(ctx, selectRequestTimeout)
+		defer cancel()
+		_ = conn.SetDeadline(time.Now().Add(selectConnTimeout))
+	}
+	resp := s.dispatch(dispatchCtx, req)
 	resp.Proto = ProtocolVersion
 	writeResp(conn, resp)
 }
@@ -546,6 +579,9 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		}
 		for _, sn := range snaps {
 			if sn.Account.ID == *req.Account {
+				if err := s.catchUpOverlay(ctx, sn.Account); err != nil {
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d content catch-up: %v", sn.Account.ID, err)}
+				}
 				if !s.mountReady(sn.Account) {
 					switch {
 					case fuseBackedRow(sn.Account.OverlayKind):
@@ -579,14 +615,9 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		return Response{OK: false, Error: fmt.Sprintf("account %d not found", *req.Account)}
 	}
 
-	// Reconcile session rows against reality before consulting the pin: a
-	// claude that just exited must read as warm (bind), not live (hold), and
-	// pollOnce's ~3.5-minute cadence is too coarse for a quick resume.
-	if sessions, err := s.scan(ctx); err == nil {
-		if _, cerr := s.m.Store.CloseDeadSessions(procscan.AlivePIDs(sessions), time.Now()); cerr != nil {
-			s.log.Printf("close dead sessions: %v", cerr)
-		}
-	}
+	// Refresh the one shared heartbeat before consulting stickiness so a claude
+	// that just exited reads warm rather than live without starting a second scan.
+	s.refreshHeartbeat(ctx, heartbeatOnDemandFreshness)
 
 	// An account mid-conversion or whose mirror is not mounted yet cannot serve
 	// a session — its config dir is not in a usable shape. Exclude, don't
@@ -642,6 +673,9 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		}
 	}
 	best := bySnap[r.AccountID]
+	if err := s.catchUpOverlay(ctx, best.Account); err != nil {
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d content catch-up: %v", best.Account.ID, err)}
+	}
 	// Deep-probe the winner before handing it to a session — a wedge refuses
 	// and the client retries onto a healthy account.
 	if !s.probeWinnerReady(ctx, best.Account) {
@@ -871,26 +905,22 @@ func runnerUp(ranked []score.Result, winnerID int, fallback bool) string {
 	return ""
 }
 
-// handleCheckin closes sessions for a pid and adopts any rotated token.
-func (s *Server) handleCheckin(ctx context.Context, req Request) Response {
-	sessions, err := s.m.Store.ListActiveSessions()
+// handleCheckin closes one account's sessions for a pid. A shared heartbeat
+// refresh owns the last-busy-to-idle proof and token adoption.
+func (s *Server) handleCheckin(_ context.Context, req Request) Response {
+	if req.Account == nil || *req.Account <= 0 || req.PID <= 0 {
+		return Response{OK: false, Error: "checkin requires account and pid"}
+	}
+	a, err := s.m.Store.GetAccount(*req.Account)
 	if err != nil {
 		return Response{OK: false, Error: err.Error()}
 	}
-	for _, se := range sessions {
-		if se.PID != req.PID {
-			continue
-		}
-		if err := s.m.Store.CloseSession(se.ID, time.Now()); err != nil {
-			s.log.Printf("checkin close session %d: %v", se.ID, err)
-		}
-		if a, err := s.m.Store.GetAccount(se.AccountID); err == nil {
-			actx, cancel := context.WithTimeout(ctx, preflightTimeout)
-			if err := s.m.AdoptRotatedToken(actx, a); err != nil {
-				s.log.Printf("acct-%02d adopt rotated token on checkin: %v", a.ID, err)
-			}
-			cancel()
-		}
+	closed, err := s.m.Store.CloseAccountSessionsPID(a.ID, req.PID, time.Now())
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	if closed > 0 {
+		s.heartbeatFor().expectIdleTransition(a.ConfigDir)
 	}
 	return Response{OK: true}
 }
@@ -939,7 +969,16 @@ func (s *Server) probeWinnerReady(ctx context.Context, a store.Account) bool {
 	if !fuseBackedRow(a.OverlayKind) {
 		return true
 	}
+	if err := ctx.Err(); err != nil {
+		return false
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < overlay.DeepProbeBound {
+		return false
+	}
 	err := deepProbe(a.ConfigDir)
+	if ctx.Err() != nil {
+		return false
+	}
 	if err != nil && !errors.Is(err, overlay.ErrProbeMissing) {
 		s.holder.markDeepWedged(a.ConfigDir)
 		s.log.Printf("acct-%02d mirror wedged at select (serves metadata but hangs reads); excluding it and letting the heal loop remount it — relaunch once it recovers: %v", a.ID, err)
@@ -967,6 +1006,9 @@ func (s *Server) probeFPWinnerReady(ctx context.Context, a store.Account) bool {
 	probeCtx, cancel := context.WithTimeout(ctx, fpControlProbeTimeout)
 	defer cancel()
 	err := fpDomainProbe(probeCtx, a.ConfigDir)
+	if ctx.Err() != nil {
+		return false
+	}
 	switch {
 	case err == nil, errors.Is(err, overlay.ErrFPProbeMissing):
 		return true
@@ -1030,8 +1072,7 @@ func (s *Server) scan(ctx context.Context) ([]procscan.Session, error) {
 }
 
 // overlayFor resolves a backend through the Manager (the OverlayFor test seam,
-// else the memoized provider — so the File Provider instance's fingerprint-signal
-// cache survives across polls). A resolution failure is logged and yields nil —
+// else the memoized provider. A resolution failure is logged and yields nil —
 // callers already fence on a wrong-backend (or here, nil) provider.
 func (s *Server) overlayFor(backend fkoverlay.Backend) fkoverlay.Provider {
 	prov, err := s.m.OverlayProvider(backend)
@@ -1199,7 +1240,7 @@ func (s *Server) fuseHardUnavailable() string {
 		return "" // no cask holder to probe; per-account heal converts each fuse row as it fails
 	}
 	if healthy, _ := s.holder.view(); !healthy {
-		return "" // holder not reachable yet; Setup respawns it, per-account heal mounts through it
+		return "" // holder not reachable yet; Reconcile respawns it, per-account heal mounts through it
 	}
 	if s.holder.wireStatus().Mounts > 0 {
 		return "" // already serving a live mount: capability is proven
@@ -1246,8 +1287,8 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 	}
 	a = fresh
 	if fpBackedRow(a.OverlayKind) {
-		// File Provider rows reconcile through the domain host (Health, then an
-		// idempotent Setup) — never the non-fuse arm below: its
+		// File Provider rows reconcile through the domain host (Check, then an
+		// idempotent Reconcile) — never the non-fuse arm below: its
 		// HealStrandedPrivate would move the account's private files out of the
 		// FP private store, through the domain bridge symlink.
 		s.reconcileFileProvider(ctx, a)
@@ -1255,7 +1296,7 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 	}
 	if fuseBackedRow(a.OverlayKind) {
 		prov := s.overlayForRow(a)
-		if prov != nil && prov.Backend().IsFuse() && prov.Health(pool.ClaudeDir(), a.ConfigDir) == nil {
+		if prov != nil && prov.Backend().IsFuse() && prov.Check(ctx, pool.ClaudeDir(), a.ConfigDir) == nil {
 			// The detached holder kept the mirror live across the restart (the
 			// common case): adopt it untouched and vouch for it in the cache
 			// directly — a live mirror implies the holder serving it, and a
@@ -1268,7 +1309,7 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 		return
 	}
 	// CRASH-WINDOW CONVERGENCE: a symlink row whose dir is itself a symlink is
-	// convert wreckage (a symlink→fileprovider Setup done, the row not flipped).
+	// convert wreckage (a symlink→fileprovider Reconcile done, the row not flipped).
 	// Retract the leaked domain and recreate the real dir so HealStrandedPrivate
 	// below restores the private files. Lstat never follows the link, so this
 	// precedes the mount check. See ccn doc d1ab40f.
@@ -1282,7 +1323,7 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 			return
 		}
 		defer s.cl.disownConvert(a.ID)
-		if !s.convergeSymlinkRowBridge(a) {
+		if !s.convergeSymlinkRowBridge(ctx, a) {
 			return
 		}
 	}
@@ -1311,7 +1352,7 @@ func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
 	}
 	// A symlink account can carry private files stranded in a fuse backing dir
 	// by a conversion that died midway — restore them before anything launches.
-	healed, err := s.m.HealStrandedPrivate(a)
+	healed, err := s.m.HealStrandedPrivate(a) //nolint:contextcheck // Manager API has no context; work is local filesystem I/O.
 	if err != nil {
 		s.log.Printf("acct-%02d heal stranded private files: %v", a.ID, err)
 		return
@@ -1341,8 +1382,8 @@ const (
 	healDeferredUnsupported                    // the holder lacks a required capability; wait for the cask upgrade, no breaker strike
 )
 
-// errSweepStranded marks a failure in mountFuse's pre-Setup sweep of stranded
-// private files — distinct from a mount failure: Setup was never attempted, so
+// errSweepStranded marks a failure in mountFuse's pre-Reconcile sweep of stranded
+// private files — distinct from a mount failure: Reconcile was never attempted, so
 // it is not a mount verdict. healFuse routes it to healRetry, never the
 // irreversible symlink fallback: a fallback never auto-reverts (the scheduler
 // only re-heals fuse rows), and the collision that refused the sweep would
@@ -1376,7 +1417,7 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 		s.log.Printf("acct-%02d remount refused (holder lacks a required capability), retrying next poll: %v", a.ID, err)
 		return healDeferredUnsupported
 	case errors.Is(err, mountd.ErrHolderUnavailable):
-		// Setup already attempts a lazy (re)spawn and launchd owns the respawn
+		// Reconcile already attempts a lazy (re)spawn and launchd owns the respawn
 		// policy, so there is nothing more to do this poll.
 		s.log.Printf("acct-%02d mount deferred (holder unavailable), retrying next poll: %v", a.ID, err)
 		return healRetry
@@ -1428,7 +1469,7 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 		s.log.Printf("acct-%02d fuse mount blocked pending the macOS volume-access grant, retrying next poll: %v", a.ID, err)
 		return healTCCBlocked
 	case errors.Is(err, errSweepStranded):
-		// Sweep failed before Setup (not a mount verdict; see errSweepStranded);
+		// Sweep failed before Reconcile (not a mount verdict; see errSweepStranded);
 		// retry next poll, loudly.
 		s.log.Printf("acct-%02d mount deferred (could not sweep stranded private files before mounting), retrying next poll: %v", a.ID, err)
 		return healRetry
@@ -1451,36 +1492,36 @@ func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
 // over them would shadow the account's identity), then the provider mounts. A dead
 // holder's carcass or a base-mismatched registry row gets one unmount-then-retry.
 // See ccn doc 7bf8406.
-func (s *Server) mountFuse(_ context.Context, a store.Account) error {
+func (s *Server) mountFuse(ctx context.Context, a store.Account) error {
 	prov := s.overlayForRow(a)
 	if prov == nil || !prov.Backend().IsFuse() {
 		return fmt.Errorf("no fuse provider resolved for acct-%02d; refusing to mount through it", a.ID)
 	}
 	base, dir := pool.ClaudeDir(), a.ConfigDir
-	// Health is shallow, so a partial wedge passes it (the deepWedged verdict
+	// Check is shallow, so a partial wedge passes it (the deepWedged verdict
 	// catches that). A dead/wedged mirror must come down before re-establishing.
 	// The provider's Teardown routes through the holder's lease-ladder unmount
 	// (graceful, never a force): a live session holding the lease answers ErrBusy,
 	// so the remount defers instead of breaking the session. See ccn doc 7bf8406.
 	legacy := overlayMounted(dir)
-	if (legacy || pool.IsBridgeSymlink(dir)) && (prov.Health(base, dir) != nil || s.holder.deepWedged(dir)) {
-		warning, err := prov.Teardown(base, dir)
+	if (legacy || pool.IsBridgeSymlink(dir)) && (prov.Check(ctx, base, dir) != nil || s.holder.deepWedged(dir)) {
+		warning, err := prov.Teardown(ctx, base, dir)
 		s.warnTeardown(a.ID, warning)
 		if err != nil {
 			return fmt.Errorf("clear dead mount before remounting: %w", err)
 		}
 		s.log.Printf("acct-%02d cleared a dead mount before remounting", a.ID)
 	}
-	err := s.sweepAndMount(prov, a, base, dir)
+	err := s.sweepAndMount(ctx, prov, a, base, dir)
 	if errors.Is(err, mountd.ErrForeignMount) || errors.Is(err, mountd.ErrBaseMismatch) {
 		// A foreign/mismatched registry row needs one unmount-then-retry; the
 		// holder's lease-gated teardown answers ErrBusy under a live session.
-		warning, terr := prov.Teardown(base, dir)
+		warning, terr := prov.Teardown(ctx, base, dir)
 		s.warnTeardown(a.ID, warning)
 		if terr != nil {
 			return fmt.Errorf("clear foreign mount: %w", terr)
 		}
-		err = s.sweepAndMount(prov, a, base, dir)
+		err = s.sweepAndMount(ctx, prov, a, base, dir)
 	}
 	if err != nil {
 		return err
@@ -1491,10 +1532,10 @@ func (s *Server) mountFuse(_ context.Context, a store.Account) error {
 	return nil
 }
 
-// sweepAndMount is one sweep+Setup attempt for mountFuse: with no mount in
+// sweepAndMount is one sweep+Reconcile attempt for mountFuse: with no mount in
 // the way, private files stranded in the underlay are swept into the backing
 // dir, then the provider mounts.
-func (s *Server) sweepAndMount(prov fkoverlay.Provider, a store.Account, base, dir string) error {
+func (s *Server) sweepAndMount(ctx context.Context, prov fkoverlay.Provider, a store.Account, base, dir string) error {
 	// The sweep reads the underlay dir directly. Skip it when dir is a bridge
 	// symlink into the shared mount — following it would traverse the live mirror
 	// (and could hang on a wedge), and a mux account's private files live in the
@@ -1511,7 +1552,7 @@ func (s *Server) sweepAndMount(prov fkoverlay.Provider, a store.Account, base, d
 			s.log.Printf("acct-%02d swept private files from the mount underlay into the backing dir", a.ID)
 		}
 	}
-	return prov.Setup(base, dir)
+	return prov.Reconcile(ctx, base, dir)
 }
 
 // fallbackToSymlink converts an account to symlink after a genuine mount failure

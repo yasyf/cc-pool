@@ -33,9 +33,9 @@ const (
 // mergeClaudeJSON propagates ~/.claude.json's shareable top-level keys (outside
 // overlay.ClaudeJSONPrivateKeys, base wins) plus per-project
 // overlay.ClaudeJSONSharedProjectKeys into an account's private .claude.json.
-// Only guaranteed visible to the launching session; a concurrent live session
-// rewrites from memory and clobbers merged values — accepted, like SyncOverlay
-// re-laying links mid-conversion.
+// A concurrent live session can rewrite from memory and clobber merged values;
+// the next semantic-content event (or daemonless launch reconciliation) reapplies
+// the shared projection.
 func mergeClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (MergeOutcome, error) {
 	// Writing into a live mirror lands in the wrong root.
 	if overlay.Mounted(accountDir) {
@@ -91,8 +91,8 @@ func mergeClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (Merge
 	return MergeApplied, nil
 }
 
-// MergeBaseClaudeJSON runs the launch-time shareable-settings merge for an
-// account, gating on the RECORDED overlay backend (non-symlink →
+// MergeBaseClaudeJSON applies the shareable-settings projection for an account,
+// gating on the RECORDED overlay backend (non-symlink →
 // MergeSkippedOverlay). The gate keys on the row, never on a resolved provider's
 // backend, so no build variant can silently un-gate a fuse account.
 func (m *Manager) MergeBaseClaudeJSON(a store.Account) (MergeOutcome, error) {

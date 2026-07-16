@@ -2,10 +2,14 @@ package overlay
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/yasyf/fusekit/content"
@@ -37,6 +41,7 @@ type PoolContentSource struct {
 	// construction to avoid importing pool (import cycle).
 	claudeDir      string
 	baseClaudeJSON string
+	stampDir       string
 
 	errMu    sync.Mutex
 	readErr  map[string]error // "<domain>/<name>" -> last merged/served-read failure
@@ -44,11 +49,15 @@ type PoolContentSource struct {
 }
 
 // NewPoolContentSource builds the source from the shared base paths (claudeDir
-// ~/.claude, baseClaudeJSON ~/.claude.json).
-func NewPoolContentSource(claudeDir, baseClaudeJSON string) *PoolContentSource {
+// ~/.claude, baseClaudeJSON ~/.claude.json) and a daemon-owned global semantic
+// stamp directory. The stamp files, not raw source mtimes, drive synthetic-entry
+// freshness so private-only or formatting-only writes do not invalidate every
+// account domain.
+func NewPoolContentSource(claudeDir, baseClaudeJSON, stampDir string) *PoolContentSource {
 	return &PoolContentSource{
 		claudeDir:      claudeDir,
 		baseClaudeJSON: baseClaudeJSON,
+		stampDir:       stampDir,
 		readErr:        map[string]error{},
 		writeErr:       map[string]error{},
 	}
@@ -59,6 +68,177 @@ func (s *PoolContentSource) privClaudeJSON(domain string) string {
 }
 func (s *PoolContentSource) baseSettings() string { return filepath.Join(s.claudeDir, settingsName) }
 func (s *PoolContentSource) plansDir() string     { return filepath.Join(s.claudeDir, "plans") }
+
+// SemanticStamps is the desired shared content generation. Canonical and
+// Settings are also persisted in global stamp files consumed by Manifest;
+// Structure identifies the shared top-level manifest shape for reconciliation.
+type SemanticStamps struct {
+	Canonical string
+	Settings  string
+	Structure string
+}
+
+// SemanticStampChanges reports which desired generation components changed.
+type SemanticStampChanges struct {
+	Canonical bool
+	Settings  bool
+	Structure bool
+}
+
+// SemanticInputPaths are the roots a platform watcher observes. Watching the
+// parent of Canonical catches atomic replacement; ClaudeDir catches settings
+// replacement and top-level manifest changes.
+type SemanticInputPaths struct {
+	Canonical       string
+	CanonicalParent string
+	Settings        string
+	ClaudeDir       string
+	AppBuild        string
+	AppParent       string
+}
+
+// InputPaths returns the global content roots whose changes may alter stamps.
+func (s *PoolContentSource) InputPaths() SemanticInputPaths {
+	return SemanticInputPaths{
+		Canonical: s.baseClaudeJSON, CanonicalParent: filepath.Dir(s.baseClaudeJSON),
+		Settings: s.baseSettings(), ClaudeDir: s.claudeDir,
+	}
+}
+
+func (s *PoolContentSource) canonicalStampPath() string {
+	return filepath.Join(s.stampDir, "canonical.stamp")
+}
+
+func (s *PoolContentSource) settingsStampPath() string {
+	return filepath.Join(s.stampDir, "settings.stamp")
+}
+
+func (s *PoolContentSource) structureStampPath() string {
+	return filepath.Join(s.stampDir, "structure.stamp")
+}
+
+// RefreshSemanticStamps recomputes the normalized shared projections and
+// atomically updates global freshness files only when semantic bytes changed.
+func (s *PoolContentSource) RefreshSemanticStamps() (SemanticStamps, SemanticStampChanges, error) {
+	canonical, err := s.semanticCanonical()
+	if err != nil {
+		return SemanticStamps{}, SemanticStampChanges{}, err
+	}
+	settings, err := s.semanticSettings()
+	if err != nil {
+		return SemanticStamps{}, SemanticStampChanges{}, err
+	}
+	structure, err := s.semanticStructure()
+	if err != nil {
+		return SemanticStamps{}, SemanticStampChanges{}, err
+	}
+	stamps := SemanticStamps{
+		Canonical: semanticDigest("canonical", canonical),
+		Settings:  semanticDigest("settings", settings),
+		Structure: semanticDigest("structure", structure),
+	}
+	canonicalChanged, err := syncSemanticStamp(s.canonicalStampPath(), stamps.Canonical)
+	if err != nil {
+		return SemanticStamps{}, SemanticStampChanges{}, fmt.Errorf("refresh canonical semantic stamp: %w", err)
+	}
+	settingsChanged, err := syncSemanticStamp(s.settingsStampPath(), stamps.Settings)
+	if err != nil {
+		return SemanticStamps{}, SemanticStampChanges{}, fmt.Errorf("refresh settings semantic stamp: %w", err)
+	}
+	structureChanged, err := syncSemanticStamp(s.structureStampPath(), stamps.Structure)
+	if err != nil {
+		return SemanticStamps{}, SemanticStampChanges{}, fmt.Errorf("refresh structure semantic stamp: %w", err)
+	}
+	return stamps, SemanticStampChanges{
+		Canonical: canonicalChanged,
+		Settings:  settingsChanged,
+		Structure: structureChanged,
+	}, nil
+}
+
+func (s *PoolContentSource) semanticCanonical() ([]byte, error) {
+	base, err := os.ReadFile(s.baseClaudeJSON)
+	if err != nil {
+		if os.IsNotExist(err) {
+			base = nil
+		} else {
+			return nil, fmt.Errorf("semantic canonical: read %s: %w", s.baseClaudeJSON, err)
+		}
+	}
+	merged, _, err := MergeClaudeJSON([]byte("{}"), base)
+	if err != nil {
+		return nil, fmt.Errorf("semantic canonical: %w", err)
+	}
+	return merged, nil
+}
+
+func (s *PoolContentSource) semanticSettings() ([]byte, error) {
+	base, err := os.ReadFile(s.baseSettings())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []byte("absent"), nil
+		}
+		return nil, fmt.Errorf("semantic settings: read %s: %w", s.baseSettings(), err)
+	}
+	served, err := injectPlansDirectory(base, s.plansDir())
+	if err != nil {
+		return nil, fmt.Errorf("semantic settings: %w", err)
+	}
+	var value any
+	if err := json.Unmarshal(served, &value); err != nil {
+		return nil, fmt.Errorf("semantic settings: normalize: %w", err)
+	}
+	normalized, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("semantic settings: encode: %w", err)
+	}
+	return normalized, nil
+}
+
+func (s *PoolContentSource) semanticStructure() ([]byte, error) {
+	entries, err := os.ReadDir(s.claudeDir)
+	if err != nil {
+		return nil, fmt.Errorf("semantic structure: read %s: %w", s.claudeDir, err)
+	}
+	names := make([]string, 0, len(entries)+len(SharedEntries))
+	seen := map[string]bool{}
+	for name := range SharedEntries {
+		seen[name] = true
+		names = append(names, name)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !sharedTopLevel(name) || seen[name] {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return json.Marshal(names)
+}
+
+func semanticDigest(kind string, payload []byte) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(kind))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(payload)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func syncSemanticStamp(path, stamp string) (bool, error) {
+	payload := []byte(stamp + "\n")
+	current, err := os.ReadFile(path) //nolint:gosec // path is an internal semantic-stamp path.
+	if err == nil && bytes.Equal(current, payload) {
+		return false, nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+	if err := WriteAtomic0600(path, payload); err != nil {
+		return false, err
+	}
+	return true, nil
+}
 
 // Manifest classifies a domain's specially-treated top-level entries: synths,
 // private dirs, and live symlinks into base (bulk I/O off the synth path). The
@@ -71,8 +251,8 @@ func (s *PoolContentSource) Manifest(domain string) ([]content.Entry, error) {
 		return nil, fmt.Errorf("manifest: read base %s: %w", s.claudeDir, err)
 	}
 	entries := make([]content.Entry, 0, 2+len(SharedEntries)+len(ExcludedEntries)+len(baseEntries))
-	claudeFresh := []string{s.privClaudeJSON(domain), s.baseClaudeJSON}
-	settingsFresh := []string{s.baseSettings()}
+	claudeFresh := []string{s.privClaudeJSON(domain), s.canonicalStampPath()}
+	settingsFresh := []string{s.settingsStampPath()}
 	// Version each synth off its freshness files; empty makes the appex fall back to
 	// its own client stat.
 	claudeVer, err := content.FreshnessVersion(claudeFresh)

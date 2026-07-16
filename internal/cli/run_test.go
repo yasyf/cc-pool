@@ -110,7 +110,7 @@ func TestCcpAccountFromEnv(t *testing.T) {
 	})
 }
 
-// TestResolveSelectionForcedUnknown covers only the error path; the valid-id path hits SyncOverlay/PreflightRefresh, which tests must not touch.
+// TestResolveSelectionForcedUnknown covers only the error path; the valid-id path hits ReconcileOverlay/PreflightRefresh, which tests must not touch.
 func TestResolveSelectionForcedUnknown(t *testing.T) {
 	m := &pool.Manager{Store: openTestStore(t)}
 	cmd := &cobra.Command{}

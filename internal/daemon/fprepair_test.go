@@ -27,8 +27,8 @@ func TestHandleFPRepairTargetSelection(t *testing.T) {
 		if resp.FPRepairs[0].Outcome != FPRepairRepaired {
 			t.Fatalf("outcome = %q, want repaired", resp.FPRepairs[0].Outcome)
 		}
-		if _, setups, _, teardowns := fake.counts(); setups != 1 || teardowns != 1 {
-			t.Fatalf("setups=%d teardowns=%d, want 1/1 (one re-register)", setups, teardowns)
+		if _, registrations, _, teardowns := fake.counts(); registrations != 1 || teardowns != 1 {
+			t.Fatalf("registrations=%d teardowns=%d, want 1/1 (one re-register)", registrations, teardowns)
 		}
 		if kindOf(t, s, 1) != "fileprovider" {
 			t.Fatal("a re-register must not change the row")
@@ -63,8 +63,8 @@ func TestHandleFPRepairTargetSelection(t *testing.T) {
 		if resp.FPRepairs[0].Outcome != FPRepairRepaired {
 			t.Fatalf("outcome = %q, want repaired", resp.FPRepairs[0].Outcome)
 		}
-		if _, setups, _, _ := fake.counts(); setups != 1 {
-			t.Fatalf("setups=%d, want 1 (only the wedged domain)", setups)
+		if _, registrations, _, _ := fake.counts(); registrations != 1 {
+			t.Fatalf("registrations=%d, want 1 (only the wedged domain)", registrations)
 		}
 		if s.fpWedged(dirs[1]) {
 			t.Fatal("a clean re-register must reset the wedge state")
@@ -77,15 +77,15 @@ func TestHandleFPRepairTargetSelection(t *testing.T) {
 		if !resp.OK || len(resp.FPRepairs) != 0 {
 			t.Fatalf("resp = %+v, want OK with no repairs", resp)
 		}
-		if _, setups, _, teardowns := fake.counts(); setups != 0 || teardowns != 0 {
-			t.Fatalf("setups=%d teardowns=%d, want 0/0 (nothing wedged)", setups, teardowns)
+		if _, registrations, _, teardowns := fake.counts(); registrations != 0 || teardowns != 0 {
+			t.Fatalf("registrations=%d teardowns=%d, want 0/0 (nothing wedged)", registrations, teardowns)
 		}
 	})
 }
 
 // TestRepairFPDomainOutcomes pins the per-account outcome classification: a clean
-// Setup repairs, a claimed account is busy, ErrCannotControl retreats to symlink,
-// and a transient Setup failure is reported as failed (never silently repaired).
+// Reconcile repairs, a claimed account is busy, ErrCannotControl retreats to symlink,
+// and a transient Reconcile failure is reported as failed (never silently repaired).
 func TestRepairFPDomainOutcomes(t *testing.T) {
 	t.Run("clean re-register repairs and resets state", func(t *testing.T) {
 		s, a, dirs, _ := newFPHealServer(t)
@@ -108,14 +108,14 @@ func TestRepairFPDomainOutcomes(t *testing.T) {
 		if res.Outcome != FPRepairBusy {
 			t.Fatalf("outcome = %q, want busy under a reservation", res.Outcome)
 		}
-		if _, setups, _, teardowns := fake.counts(); setups != 0 || teardowns != 0 {
-			t.Fatalf("setups=%d teardowns=%d, want 0/0 (never re-registered a claimed dir)", setups, teardowns)
+		if _, registrations, _, teardowns := fake.counts(); registrations != 0 || teardowns != 0 {
+			t.Fatalf("registrations=%d teardowns=%d, want 0/0 (never re-registered a claimed dir)", registrations, teardowns)
 		}
 	})
 
 	t.Run("ErrCannotControl retreats to symlink", func(t *testing.T) {
 		s, a, _, fake := newFPHealServer(t)
-		fake.setupErr = fmt.Errorf("file provider setup: %w", fileproviderd.ErrCannotControl)
+		fake.registerErr = fmt.Errorf("file provider reconcile: %w", fileproviderd.ErrCannotControl)
 		res := s.repairFPDomain(t.Context(), a, false)
 		if res.Outcome != FPRepairRetreated {
 			t.Fatalf("outcome = %q, want retreated", res.Outcome)
@@ -125,13 +125,13 @@ func TestRepairFPDomainOutcomes(t *testing.T) {
 		}
 	})
 
-	t.Run("a transient Setup failure is reported failed, not repaired", func(t *testing.T) {
+	t.Run("a transient Reconcile failure is reported failed, not repaired", func(t *testing.T) {
 		s, a, dirs, fake := newFPHealServer(t)
 		s.fpForceWedge(dirs[1], overlay.ErrFPProbeWedged)
-		fake.setupErr = fmt.Errorf("register domain: %w", fileproviderd.ErrBusy)
+		fake.registerErr = fmt.Errorf("register domain: %w", fileproviderd.ErrBusy)
 		res := s.repairFPDomain(t.Context(), a, false)
 		if res.Outcome != FPRepairFailed {
-			t.Fatalf("outcome = %q, want failed on a transient Setup error", res.Outcome)
+			t.Fatalf("outcome = %q, want failed on a transient Reconcile error", res.Outcome)
 		}
 		if !s.fpWedged(dirs[1]) {
 			t.Fatal("a failed repair must not clear the wedge verdict")
@@ -146,7 +146,7 @@ func TestRepairFPDomainOutcomes(t *testing.T) {
 // --retreat`): Request.Retreat routes to convertFPToSymlinkHeld instead of a
 // re-register — the ONLY caller left now that the heal breaker parks. Idle it
 // retreats and forgets the wedge; under a live session it defers loudly rather than
-// tear a domain out from under it. Neither path ever calls the FP provider's Setup
+// tear a domain out from under it. Neither path ever calls the FP provider's Reconcile
 // (a retreat is not a re-register).
 func TestFPRepairRetreatWire(t *testing.T) {
 	t.Run("explicit retreat converts to symlink without re-registering", func(t *testing.T) {
@@ -168,8 +168,8 @@ func TestFPRepairRetreatWire(t *testing.T) {
 		if s.fpWedged(dirs[1]) {
 			t.Fatal("a retreat must forget the wedge state")
 		}
-		if _, setups, _, _ := fake.counts(); setups != 0 {
-			t.Fatalf("retreat re-registered the domain (setups=%d), want 0 — retreat is not a re-register", setups)
+		if _, registrations, _, _ := fake.counts(); registrations != 0 {
+			t.Fatalf("retreat re-registered the domain (registrations=%d), want 0 — retreat is not a re-register", registrations)
 		}
 	})
 
@@ -213,8 +213,8 @@ func TestFPRepairRetreatWire(t *testing.T) {
 		if kindOf(t, s, 1) != "symlink" {
 			t.Fatal("retreat over the wire must convert the row to symlink")
 		}
-		if _, setups, _, _ := fake.counts(); setups != 0 {
-			t.Fatalf("retreat over the wire re-registered (setups=%d), want 0", setups)
+		if _, registrations, _, _ := fake.counts(); registrations != 0 {
+			t.Fatalf("retreat over the wire re-registered (registrations=%d), want 0", registrations)
 		}
 	})
 }
@@ -236,8 +236,8 @@ func TestFPRepairEndToEndOverSocket(t *testing.T) {
 	if len(resp.FPRepairs) != 1 || resp.FPRepairs[0].Outcome != FPRepairRepaired {
 		t.Fatalf("FPRepairs = %+v, want one repaired result", resp.FPRepairs)
 	}
-	if _, setups, _, _ := fake.counts(); setups != 1 {
-		t.Fatalf("setups = %d over the wire, want 1", setups)
+	if _, registrations, _, _ := fake.counts(); registrations != 1 {
+		t.Fatalf("registrations = %d over the wire, want 1", registrations)
 	}
 }
 

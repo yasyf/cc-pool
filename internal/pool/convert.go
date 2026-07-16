@@ -43,14 +43,21 @@ var journalRetryBackoff = 200 * time.Millisecond
 // nil (the detach itself succeeded) — but if that ledger write itself fails, it returns
 // an error so the caller keeps (never forgets/flips) the row and retries. A hard Teardown
 // error (including mountd.ErrBusy) returns immediately, unwrapped, for the caller to handle.
-func (m *Manager) teardownWithRetry(prov fkoverlay.Provider, base, dir string, id int) error {
+func (m *Manager) teardownWithRetry(ctx context.Context, prov fkoverlay.Provider, base, dir string, id int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var warning string
 	for attempt := range journalRetryAttempts {
 		if attempt > 0 {
-			time.Sleep(journalRetryBackoff)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(journalRetryBackoff):
+			}
 		}
 		var err error
-		warning, err = prov.Teardown(base, dir)
+		warning, err = prov.Teardown(ctx, base, dir)
 		if err != nil {
 			return err
 		}
@@ -83,23 +90,21 @@ func (m *Manager) overlayFor(b fkoverlay.Backend) (fkoverlay.Provider, error) {
 }
 
 // OverlayProvider resolves an overlay backend to a provider, memoizing the File
-// Provider provider (its fingerprint-signal cache must survive across polls). The
-// exported entry the daemon routes through so its Sync/Health and heal paths share
-// the one memoized FP instance.
+// Provider provider. The exported entry the daemon routes through so lifecycle
+// and content-notification callers share the same instance.
 func (m *Manager) OverlayProvider(b fkoverlay.Backend) (fkoverlay.Provider, error) {
 	return m.overlayFor(b)
 }
 
-// fileProvider lazily builds and memoizes the File Provider provider, wired with
-// m.ContentSource so its enumerator signal is fingerprint-gated and the lastSignal
-// cache survives across resolves. Not fuse, so no feature gate.
+// fileProvider lazily builds and memoizes the File Provider provider. Not fuse,
+// so no feature gate.
 func (m *Manager) fileProvider() (fkoverlay.Provider, error) {
 	m.fpProvMu.Lock()
 	defer m.fpProvMu.Unlock()
 	if m.fpProv != nil {
 		return m.fpProv, nil
 	}
-	prov, err := fkoverlay.ProviderFor(fkoverlay.BackendFileProvider, overlaySpecWithSource(m.ContentSource))
+	prov, err := fkoverlay.ProviderFor(fkoverlay.BackendFileProvider, overlaySpec())
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +235,7 @@ func (m *Manager) ConvertOverlay(ctx context.Context, a store.Account, to fkover
 		}
 		return m.convertToFuse(ctx, a, fromProv, toProv)
 	case to == fkoverlay.BackendSymlink:
-		return m.convertToSymlink(a, fromProv, toProv)
+		return m.convertToSymlink(ctx, a, fromProv, toProv)
 	case to == fkoverlay.BackendFileProvider:
 		return m.convertToFileProvider(ctx, a, fromProv, toProv)
 	default:
@@ -241,6 +246,7 @@ func (m *Manager) ConvertOverlay(ctx context.Context, a store.Account, to fkover
 func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, fuseProv fkoverlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
+	rollbackCtx := context.WithoutCancel(ctx)
 	// ROOT GUARD: a symlink row must hold a REAL account dir. A symlink here (a mux
 	// bridge into the shared mirror, or a File Provider domain bridge a crashed
 	// convert left behind) would make MovePrivateEntries below write THROUGH the
@@ -269,19 +275,19 @@ func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, f
 	// must go through rollbackToSymlink, or the account is stranded until
 	// HealStrandedPrivate — the recovery of last resort — finds it.
 	if err := fkoverlay.MovePrivateEntries(dir, priv, m.overlaySpec()); err != nil {
-		return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, fmt.Errorf("move private files: %w", err))
+		return a, m.rollbackToSymlink(rollbackCtx, a, symProv, fuseProv, pre, fmt.Errorf("move private files: %w", err))
 	}
-	warning, err := symProv.Teardown(base, dir)
+	warning, err := symProv.Teardown(rollbackCtx, base, dir)
 	m.warnTeardown(a.ID, warning)
 	if err != nil {
-		return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, fmt.Errorf("tear down symlinks: %w", err))
+		return a, m.rollbackToSymlink(rollbackCtx, a, symProv, fuseProv, pre, fmt.Errorf("tear down symlinks: %w", err))
 	}
 	// A spent budget must not start a mount it has no time to verify.
 	if err := ctx.Err(); err != nil {
-		return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, err)
+		return a, m.rollbackToSymlink(rollbackCtx, a, symProv, fuseProv, pre, err)
 	}
-	if err := fuseProv.Setup(base, dir); err != nil {
-		return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, fmt.Errorf("mount: %w", err))
+	if err := fuseProv.Reconcile(ctx, base, dir); err != nil {
+		return a, m.rollbackToSymlink(rollbackCtx, a, symProv, fuseProv, pre, fmt.Errorf("mount: %w", err))
 	}
 
 	// Verify the moved identity survived by reading the BACKING file, not back
@@ -292,16 +298,16 @@ func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, f
 	if preErr == nil {
 		post, err := readIdentity(filepath.Join(priv, ".claude.json"))
 		if err != nil {
-			return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, fmt.Errorf("identity not readable in private root after move: %w", err))
+			return a, m.rollbackToSymlink(rollbackCtx, a, symProv, fuseProv, pre, fmt.Errorf("identity not readable in private root after move: %w", err))
 		}
 		if post.AccountUUID != pre.AccountUUID {
-			return a, m.rollbackToSymlink(a, symProv, fuseProv, pre,
+			return a, m.rollbackToSymlink(rollbackCtx, a, symProv, fuseProv, pre,
 				fmt.Errorf("identity in private root is %s, expected %s", post.AccountUUID, pre.AccountUUID))
 		}
 	}
 
 	if err := m.Store.SetAccountOverlayKind(a.ID, string(fuseProv.Backend())); err != nil {
-		return a, m.rollbackToSymlink(a, symProv, fuseProv, pre, fmt.Errorf("persist row: %w", err))
+		return a, m.rollbackToSymlink(rollbackCtx, a, symProv, fuseProv, pre, fmt.Errorf("persist row: %w", err))
 	}
 	a.OverlayKind = string(fuseProv.Backend())
 	return a, nil
@@ -310,14 +316,15 @@ func (m *Manager) convertToFuse(ctx context.Context, a store.Account, symProv, f
 // rollbackToSymlink restores a symlink overlay after a failed fuse setup. If the
 // unmount does not take it stops — laying symlinks into a live mirror would write
 // through to the real ~/.claude — leaving recovery to the daemon's reconcile.
-func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay.Provider, pre *Identity, cause error) error {
+func (m *Manager) rollbackToSymlink(ctx context.Context, a store.Account, symProv, fuseProv fkoverlay.Provider, pre *Identity, cause error) error {
+	ctx = context.WithoutCancel(ctx)
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
-	if err := m.teardownWithRetry(fuseProv, base, dir, a.ID); err != nil {
+	if err := m.teardownWithRetry(ctx, fuseProv, base, dir, a.ID); err != nil {
 		return fmt.Errorf("convert acct-%02d: %w (and rollback unmount failed: %w; private files remain in %s until the daemon reconciles)",
 			a.ID, cause, err, priv)
 	}
-	// Both moves run regardless (disjoint name sets); Setup is sequenced after them
+	// Both moves run regardless (disjoint name sets); Reconcile is sequenced after them
 	// so it never lays links over an un-swept dir.
 	spec := m.overlaySpec()
 	if err := errors.Join(
@@ -326,7 +333,7 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay
 	); err != nil {
 		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
 	}
-	if err := symProv.Setup(base, dir); err != nil {
+	if err := symProv.Reconcile(ctx, base, dir); err != nil {
 		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
 	}
 	removePrivateRootIfEmpty(priv, spec)
@@ -348,6 +355,7 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv fkoverlay
 func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fromProv, fpProv fkoverlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
+	rollbackCtx := context.WithoutCancel(ctx)
 	fromFuse := fromProv.Backend().IsFuse()
 	// ROOT GUARD (symlink source only): a symlink row must hold a REAL account dir;
 	// a symlink there (a mux bridge, or a File Provider domain bridge a crashed
@@ -385,7 +393,7 @@ func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fr
 		// Detach the subtree. The mux teardown retracts the bridge symlink
 		// fail-closed (RemoveSymlink refuses a real dir), so nothing is
 		// half-done on failure: plain error, no rollback, files never moved.
-		if err := m.teardownWithRetry(fromProv, base, dir, a.ID); err != nil {
+		if err := m.teardownWithRetry(rollbackCtx, fromProv, base, dir, a.ID); err != nil {
 			return a, fmt.Errorf("convert acct-%02d: tear down fuse overlay: %w", a.ID, err)
 		}
 		// Holder-delegated teardown done; fence the local domain registration of the
@@ -401,29 +409,29 @@ func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fr
 		// must go through a rollback, or the account is stranded until
 		// HealStrandedPrivate — the recovery of last resort — finds it.
 		if err := fkoverlay.MovePrivateEntries(dir, priv, m.overlaySpec()); err != nil {
-			return a, m.rollbackFileProviderToSymlink(ctx, a, fromProv, fpProv, pre, fmt.Errorf("move private files: %w", err))
+			return a, m.rollbackFileProviderToSymlink(rollbackCtx, a, fromProv, fpProv, pre, fmt.Errorf("move private files: %w", err))
 		}
-		warning, err := fromProv.Teardown(base, dir)
+		warning, err := fromProv.Teardown(rollbackCtx, base, dir)
 		m.warnTeardown(a.ID, warning)
 		if err != nil {
-			return a, m.rollbackFileProviderToSymlink(ctx, a, fromProv, fpProv, pre, fmt.Errorf("tear down symlinks: %w", err))
+			return a, m.rollbackFileProviderToSymlink(rollbackCtx, a, fromProv, fpProv, pre, fmt.Errorf("tear down symlinks: %w", err))
 		}
 		if err := os.Remove(dir); err != nil {
-			return a, m.rollbackFileProviderToSymlink(ctx, a, fromProv, fpProv, pre, fmt.Errorf("remove drained account dir: %w", err))
+			return a, m.rollbackFileProviderToSymlink(rollbackCtx, a, fromProv, fpProv, pre, fmt.Errorf("remove drained account dir: %w", err))
 		}
 	}
 	rollback := func(cause error) error {
 		if fromFuse {
-			return m.rollbackFileProviderToFuse(ctx, a, fromProv, fpProv, cause)
+			return m.rollbackFileProviderToFuse(rollbackCtx, a, fromProv, fpProv, cause)
 		}
-		return m.rollbackFileProviderToSymlink(ctx, a, fromProv, fpProv, pre, cause)
+		return m.rollbackFileProviderToSymlink(rollbackCtx, a, fromProv, fpProv, pre, cause)
 	}
 
 	// A spent budget must not register a domain it has no time to verify.
 	if err := ctx.Err(); err != nil {
 		return a, rollback(err)
 	}
-	if err := fpProv.Setup(base, dir); err != nil {
+	if err := fpProv.Reconcile(ctx, base, dir); err != nil {
 		return a, rollback(fmt.Errorf("register domain: %w", err))
 	}
 
@@ -432,7 +440,7 @@ func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fr
 	// FPFS skips fetchContents at size 0, so a Missing/Empty domain read is
 	// expected and benign there, and there is no identity to verify.
 	if preErr == nil {
-		// Setup proved the appex enumerator; this proves the bridge data plane
+		// Reconcile proved the appex enumerator; this proves the bridge data plane
 		// over the app control op — the readiness the wedge incident lacked. A
 		// NoVerdict (busy/unreachable/too old) rolls back too: never flip an
 		// unverified row.
@@ -455,14 +463,14 @@ func (m *Manager) convertToFileProvider(ctx context.Context, a store.Account, fr
 	return a, nil
 }
 
-// retractFileProviderIfLaid undoes whatever a failed File Provider Setup laid at the
-// account dir: an absent path or symlink takes the full Teardown; a REAL dir (Setup
+// retractFileProviderIfLaid undoes whatever a failed File Provider Reconcile laid at the
+// account dir: an absent path or symlink takes the full Teardown; a REAL dir (Reconcile
 // never swapped the bridge in) deregisters the domain ONLY when the zero-spawn
 // registration check finds one — never spawn the app to deregister a domain that was
 // never laid. See ccn doc d1ab40f.
 func retractFileProviderIfLaid(ctx context.Context, base, dir string, fpProv fkoverlay.Provider) (warning string, err error) {
 	if kind, _ := ClassifyAccountDir(dir); kind != DirReal {
-		return fpProv.Teardown(base, dir)
+		return fpProv.Teardown(ctx, base, dir)
 	}
 	registry, ok := fpProv.(overlay.FPDomainRegistry)
 	remover, isRemover := fpProv.(overlay.FPDomainRemover)
@@ -472,14 +480,15 @@ func retractFileProviderIfLaid(ctx context.Context, base, dir string, fpProv fko
 	if _, err := registry.DomainRoot(ctx, dir); err != nil {
 		return "", nil // no registration (ErrNoDomain) or app down (ErrAppUnavailable): nothing laid to retract
 	}
-	return "", remover.RemoveDomain(dir)
+	return "", remover.RemoveDomain(ctx, dir)
 }
 
 // rollbackFileProviderToSymlink restores the symlink overlay after a failed
-// symlink→fileprovider conversion. If retracting what Setup laid fails it stops
+// symlink→fileprovider conversion. If retracting what Reconcile laid fails it stops
 // — moving private files back through a live domain symlink would write into
 // the domain — leaving them in the backing root for HealStrandedPrivate.
 func (m *Manager) rollbackFileProviderToSymlink(ctx context.Context, a store.Account, symProv, fpProv fkoverlay.Provider, pre *Identity, cause error) error {
+	ctx = context.WithoutCancel(ctx)
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
 	warning, err := retractFileProviderIfLaid(ctx, base, dir, fpProv)
@@ -488,7 +497,7 @@ func (m *Manager) rollbackFileProviderToSymlink(ctx context.Context, a store.Acc
 		return fmt.Errorf("convert acct-%02d: %w (and rollback teardown failed: %w; private files remain in %s until the daemon reconciles)",
 			a.ID, cause, err, priv)
 	}
-	// Both moves run regardless (disjoint name sets); Setup is sequenced after them
+	// Both moves run regardless (disjoint name sets); Reconcile is sequenced after them
 	// so it never lays links over an un-swept dir.
 	spec := m.overlaySpec()
 	if err := errors.Join(
@@ -497,7 +506,7 @@ func (m *Manager) rollbackFileProviderToSymlink(ctx context.Context, a store.Acc
 	); err != nil {
 		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
 	}
-	if err := symProv.Setup(base, dir); err != nil {
+	if err := symProv.Reconcile(ctx, base, dir); err != nil {
 		return fmt.Errorf("convert acct-%02d: %w (and symlink rollback failed: %w)", a.ID, cause, err)
 	}
 	removePrivateRootIfEmpty(priv, spec)
@@ -511,11 +520,12 @@ func (m *Manager) rollbackFileProviderToSymlink(ctx context.Context, a store.Acc
 }
 
 // rollbackFileProviderToFuse restores the fuse overlay after a failed
-// fuse→fileprovider conversion: retract whatever Setup laid, then let the fuse
-// Setup re-attach the subtree and re-lay its own bridge symlink. The private
+// fuse→fileprovider conversion: retract whatever Reconcile laid, then let the fuse
+// Reconcile re-attach the subtree and re-lay its own bridge symlink. The private
 // files never moved (both backends share the backing root), so a failure here
 // leaves them intact for the daemon's fuse reconcile.
 func (m *Manager) rollbackFileProviderToFuse(ctx context.Context, a store.Account, fuseProv, fpProv fkoverlay.Provider, cause error) error {
+	ctx = context.WithoutCancel(ctx)
 	base, dir := ClaudeDir(), a.ConfigDir
 	warning, err := retractFileProviderIfLaid(ctx, base, dir, fpProv)
 	m.warnTeardown(a.ID, warning)
@@ -523,7 +533,7 @@ func (m *Manager) rollbackFileProviderToFuse(ctx context.Context, a store.Accoun
 		return fmt.Errorf("convert acct-%02d: %w (and rollback teardown failed: %w; the daemon's reconcile will remount the %s row)",
 			a.ID, cause, err, a.OverlayKind)
 	}
-	if err := fuseProv.Setup(base, dir); err != nil {
+	if err := fuseProv.Reconcile(ctx, base, dir); err != nil {
 		return fmt.Errorf("convert acct-%02d: %w (and fuse rollback failed: %w)", a.ID, cause, err)
 	}
 	return fmt.Errorf("convert acct-%02d: %w (rolled back to %s)", a.ID, cause, a.OverlayKind)
@@ -532,12 +542,13 @@ func (m *Manager) rollbackFileProviderToFuse(ctx context.Context, a store.Accoun
 // convertFileProviderToFuse turns a File Provider account into a fuse one.
 // Nothing moves: both backends keep private files in the same backing root, so
 // the FP Teardown retracts the account-dir symlink and deregisters the domain,
-// the fuse Setup lays its own bridge symlink over the vacated path, and the
+// the fuse Reconcile lays its own bridge symlink over the vacated path, and the
 // identity is verified untouched in the backing root — never through a mount —
 // before the row flips.
 func (m *Manager) convertFileProviderToFuse(ctx context.Context, a store.Account, fpProv, fuseProv fkoverlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
+	rollbackCtx := context.WithoutCancel(ctx)
 
 	pre, preErr := readIdentity(filepath.Join(priv, ".claude.json"))
 	if preErr != nil && !errors.Is(preErr, ErrNoIdentity) {
@@ -549,30 +560,30 @@ func (m *Manager) convertFileProviderToFuse(ctx context.Context, a store.Account
 	}
 	// Fail-closed on both arms (RemoveSymlink refuses a real dir), so a failure
 	// here leaves the FP row consistent for the daemon's reconcile: plain error.
-	warning, err := fpProv.Teardown(base, dir)
+	warning, err := fpProv.Teardown(rollbackCtx, base, dir)
 	m.warnTeardown(a.ID, warning)
 	if err != nil {
 		return a, fmt.Errorf("convert acct-%02d: retract file provider overlay: %w", a.ID, err)
 	}
 	// A spent budget must not start a mount it has no time to verify.
 	if err := ctx.Err(); err != nil {
-		return a, m.rollbackToFileProvider(a, fuseProv, fpProv, err)
+		return a, m.rollbackToFileProvider(rollbackCtx, a, fuseProv, fpProv, err)
 	}
-	if err := fuseProv.Setup(base, dir); err != nil {
-		return a, m.rollbackToFileProvider(a, fuseProv, fpProv, fmt.Errorf("mount: %w", err))
+	if err := fuseProv.Reconcile(ctx, base, dir); err != nil {
+		return a, m.rollbackToFileProvider(rollbackCtx, a, fuseProv, fpProv, fmt.Errorf("mount: %w", err))
 	}
 	if preErr == nil {
 		post, err := readIdentity(filepath.Join(priv, ".claude.json"))
 		if err != nil {
-			return a, m.rollbackToFileProvider(a, fuseProv, fpProv, fmt.Errorf("identity not readable in private root after conversion: %w", err))
+			return a, m.rollbackToFileProvider(rollbackCtx, a, fuseProv, fpProv, fmt.Errorf("identity not readable in private root after conversion: %w", err))
 		}
 		if post.AccountUUID != pre.AccountUUID {
-			return a, m.rollbackToFileProvider(a, fuseProv, fpProv,
+			return a, m.rollbackToFileProvider(rollbackCtx, a, fuseProv, fpProv,
 				fmt.Errorf("identity in private root is %s, expected %s", post.AccountUUID, pre.AccountUUID))
 		}
 	}
 	if err := m.Store.SetAccountOverlayKind(a.ID, string(fuseProv.Backend())); err != nil {
-		return a, m.rollbackToFileProvider(a, fuseProv, fpProv, fmt.Errorf("persist row: %w", err))
+		return a, m.rollbackToFileProvider(rollbackCtx, a, fuseProv, fpProv, fmt.Errorf("persist row: %w", err))
 	}
 	a.OverlayKind = string(fuseProv.Backend())
 	return a, nil
@@ -583,12 +594,13 @@ func (m *Manager) convertFileProviderToFuse(ctx context.Context, a store.Account
 // real dir) and a no-op with nothing mounted; if it fails, it stops — re-laying
 // the domain symlink over live fuse state would divert the account — leaving
 // the fuse wreckage for the daemon to reconcile against the fileprovider row.
-func (m *Manager) rollbackToFileProvider(a store.Account, fuseProv, fpProv fkoverlay.Provider, cause error) error {
+func (m *Manager) rollbackToFileProvider(ctx context.Context, a store.Account, fuseProv, fpProv fkoverlay.Provider, cause error) error {
+	ctx = context.WithoutCancel(ctx)
 	base, dir := ClaudeDir(), a.ConfigDir
-	if err := m.teardownWithRetry(fuseProv, base, dir, a.ID); err != nil {
+	if err := m.teardownWithRetry(ctx, fuseProv, base, dir, a.ID); err != nil {
 		return fmt.Errorf("convert acct-%02d: %w (and rollback unmount failed: %w)", a.ID, cause, err)
 	}
-	if err := fpProv.Setup(base, dir); err != nil {
+	if err := fpProv.Reconcile(ctx, base, dir); err != nil {
 		return fmt.Errorf("convert acct-%02d: %w (and file provider rollback failed: %w)", a.ID, cause, err)
 	}
 	return fmt.Errorf("convert acct-%02d: %w (rolled back to fileprovider)", a.ID, cause)
@@ -599,11 +611,15 @@ func (m *Manager) rollbackToFileProvider(a store.Account, fuseProv, fpProv fkove
 // mounted the fuse teardown is a no-op; the FP teardown retracts the domain
 // symlink and deregisters the domain), so even a build that cannot host the
 // source backend can retreat from a stale row — pure file moves.
-func (m *Manager) convertToSymlink(a store.Account, fromProv, symProv fkoverlay.Provider) (store.Account, error) {
+func (m *Manager) convertToSymlink(ctx context.Context, a store.Account, fromProv, symProv fkoverlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := fkoverlay.FusePrivateRoot(dir)
 	spec := m.overlaySpec()
-	if err := m.teardownWithRetry(fromProv, base, dir, a.ID); err != nil {
+	if err := ctx.Err(); err != nil {
+		return a, fmt.Errorf("convert acct-%02d: %w", a.ID, err)
+	}
+	opCtx := context.WithoutCancel(ctx)
+	if err := m.teardownWithRetry(opCtx, fromProv, base, dir, a.ID); err != nil {
 		return a, fmt.Errorf("convert acct-%02d: tear down %s overlay: %w", a.ID, fromProv.Backend(), err)
 	}
 	// A FUSE source's teardown was holder-delegated (gated by the holder's own
@@ -627,12 +643,12 @@ func (m *Manager) convertToSymlink(a store.Account, fromProv, symProv fkoverlay.
 		return a, fmt.Errorf("convert acct-%02d: stat private root: %w", a.ID, err)
 	}
 	// claude may have written real shared entries into the bare mountpoint after a
-	// force-unmount; move them to base first or Setup's assertSymlink refuses to
+	// force-unmount; move them to base first or Reconcile's assertSymlink refuses to
 	// clobber them and the retreat fails.
 	if err := fkoverlay.MoveSharedOrphans(dir, base, spec); err != nil {
 		return a, fmt.Errorf("convert acct-%02d: relocate orphaned shared entries: %w", a.ID, err)
 	}
-	if err := symProv.Setup(base, dir); err != nil {
+	if err := symProv.Reconcile(opCtx, base, dir); err != nil {
 		return a, fmt.Errorf("convert acct-%02d: lay symlinks: %w", a.ID, err)
 	}
 	if err := m.Store.SetAccountOverlayKind(a.ID, string(fkoverlay.BackendSymlink)); err != nil {
@@ -664,6 +680,7 @@ func removePrivateRootIfEmpty(priv string, spec fkoverlay.Spec) {
 // a fuse private backing dir (an interrupted conversion), moving them back and
 // re-asserting the symlink overlay; reports whether anything was healed.
 func (m *Manager) HealStrandedPrivate(a store.Account) (bool, error) {
+	ctx := context.Background()
 	backend, err := fkoverlay.Parse(a.OverlayKind)
 	if err != nil {
 		return false, fmt.Errorf("heal acct-%02d: parse stored backend: %w", a.ID, err)
@@ -701,7 +718,7 @@ func (m *Manager) HealStrandedPrivate(a store.Account) (bool, error) {
 	}
 	if err := errors.Join(
 		fkoverlay.MovePrivateEntries(priv, dir, spec),
-		symProv.Setup(ClaudeDir(), dir),
+		symProv.Reconcile(ctx, ClaudeDir(), dir),
 	); err != nil {
 		return false, fmt.Errorf("heal acct-%02d: %w", a.ID, err)
 	}

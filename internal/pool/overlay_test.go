@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -120,6 +121,7 @@ func TestWidgetVersionSupported(t *testing.T) {
 		"unparseable version fails open":            {"not-a-version", true},
 		"commit-suffixed wire version passes":       {"0.55.0 (abc1234)", true},
 		"commit-suffixed old version still fails":   {"0.54.0 (abc1234)", false},
+		"app build metadata preserves semver":       {"0.55.0+1234", true},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -130,19 +132,22 @@ func TestWidgetVersionSupported(t *testing.T) {
 	}
 }
 
-// gateStub is a fuse-kind provider for featureGate tests, tracking Setup calls.
+// gateStub is a fuse-kind provider for featureGate tests, tracking Reconcile calls.
 type gateStub struct {
 	setupErr  error
 	setups    int
 	teardowns int
 }
 
-func (s *gateStub) Backend() fkoverlay.Backend    { return fkoverlay.BackendNFS }
-func (s *gateStub) Sync(_, _ string) error        { return nil }
-func (s *gateStub) Health(_, _ string) error      { return nil }
-func (s *gateStub) PrivateRoot(dir string) string { return fkoverlay.FusePrivateRoot(dir) }
-func (s *gateStub) Setup(_, _ string) error       { s.setups++; return s.setupErr }
-func (s *gateStub) Teardown(_, _ string) (string, error) {
+func (s *gateStub) Backend() fkoverlay.Backend                  { return fkoverlay.BackendNFS }
+func (s *gateStub) Check(context.Context, string, string) error { return nil }
+func (s *gateStub) PrivateRoot(dir string) string               { return fkoverlay.FusePrivateRoot(dir) }
+func (s *gateStub) Reconcile(context.Context, string, string) error {
+	s.setups++
+	return s.setupErr
+}
+
+func (s *gateStub) Teardown(context.Context, string, string) (string, error) {
 	s.teardowns++
 	return "", nil
 }
@@ -176,7 +181,7 @@ func TestFeatureGateSetupPostMountRequire(t *testing.T) {
 			stub := &gateStub{}
 			gate := featureGate{Provider: stub, hello: hello}
 
-			err := gate.Setup("/base", "/pool/acct-01")
+			err := gate.Reconcile(t.Context(), "/base", "/pool/acct-01")
 			if !errors.Is(err, ErrHolderUnsupported) {
 				t.Fatalf("Setup post-mount require = %v, want ErrHolderUnsupported", err)
 			}
@@ -214,7 +219,7 @@ func TestFeatureGateSetupPostMountRetry(t *testing.T) {
 	}
 	stub := &gateStub{}
 	gate := featureGate{Provider: stub, hello: hello}
-	if err := gate.Setup("/base", "/pool/acct-01"); err != nil {
+	if err := gate.Reconcile(t.Context(), "/base", "/pool/acct-01"); err != nil {
 		t.Fatalf("Setup with a briefly-unreachable-then-recovered holder = %v, want nil (bounded retry recovers)", err)
 	}
 	if stub.setups != 1 {
@@ -232,7 +237,7 @@ func TestFeatureGateTeardownUngated(t *testing.T) {
 	missingWarn := &mountd.HelloInfo{Version: "v1.0.0", Features: []string{mountd.FeatureMux, mountd.FeatureBridge}}
 	stub := &gateStub{}
 	gate := featureGate{Provider: stub, hello: func() (*mountd.HelloInfo, error) { return missingWarn, nil }}
-	if _, err := gate.Teardown("/base", "/pool/acct-01"); err != nil {
+	if _, err := gate.Teardown(t.Context(), "/base", "/pool/acct-01"); err != nil {
 		t.Fatalf("Teardown through an underfeatured holder = %v, want nil (teardown is ungated)", err)
 	}
 	if stub.teardowns != 1 {
@@ -286,7 +291,7 @@ func TestFeatureGateSetup(t *testing.T) {
 				return tc.info, tc.helloErr
 			}}
 
-			err := gate.Setup("/base", "/pool/acct-01")
+			err := gate.Reconcile(t.Context(), "/base", "/pool/acct-01")
 
 			if wantErr := tc.wantUnsup || tc.wantErrSubstr != ""; (err != nil) != wantErr {
 				t.Fatalf("Setup error = %v, want error: %v", err, wantErr)
@@ -321,7 +326,7 @@ func TestFeatureGateSetupMountedButUnverified(t *testing.T) {
 			hello:    func() (*mountd.HelloInfo, error) { return full, nil },
 			mounts:   func() ([]mountd.MountInfo, error) { return []mountd.MountInfo{{Dir: dir}}, nil },
 		}
-		err := gate.Setup("/base", dir)
+		err := gate.Reconcile(t.Context(), "/base", dir)
 		if !errors.Is(err, ErrMountedUnverified) || !errors.Is(err, boom) {
 			t.Fatalf("Setup = %v, want ErrMountedUnverified wrapping the cause", err)
 		}
@@ -339,7 +344,7 @@ func TestFeatureGateSetupMountedButUnverified(t *testing.T) {
 				return []mountd.MountInfo{{Dir: subtree, MuxRoot: MuxRootDir()}}, nil
 			},
 		}
-		err := gate.Setup("/base", acctDir)
+		err := gate.Reconcile(t.Context(), "/base", acctDir)
 		if !errors.Is(err, ErrMountedUnverified) || !errors.Is(err, boom) {
 			t.Fatalf("Setup on a mounted mux subtree = %v, want ErrMountedUnverified wrapping the cause (the lost-ack reclaim path)", err)
 		}
@@ -351,7 +356,7 @@ func TestFeatureGateSetupMountedButUnverified(t *testing.T) {
 			hello:    func() (*mountd.HelloInfo, error) { return full, nil },
 			mounts:   func() ([]mountd.MountInfo, error) { return nil, nil },
 		}
-		err := gate.Setup("/base", dir)
+		err := gate.Reconcile(t.Context(), "/base", dir)
 		if errors.Is(err, ErrMountedUnverified) || !errors.Is(err, boom) {
 			t.Fatalf("Setup = %v, want the raw cause with no ErrMountedUnverified", err)
 		}
@@ -363,7 +368,7 @@ func TestFeatureGateSetupMountedButUnverified(t *testing.T) {
 			hello:    func() (*mountd.HelloInfo, error) { return full, nil },
 			mounts:   func() ([]mountd.MountInfo, error) { return nil, errors.New("holder unreachable") },
 		}
-		err := gate.Setup("/base", dir)
+		err := gate.Reconcile(t.Context(), "/base", dir)
 		if errors.Is(err, ErrMountedUnverified) || !errors.Is(err, boom) {
 			t.Fatalf("Setup = %v, want the raw cause (an unlistable holder holds no reclaimable mount)", err)
 		}

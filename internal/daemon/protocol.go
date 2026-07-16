@@ -50,7 +50,7 @@ const (
 type Request struct {
 	Proto   int    `json:"proto"`
 	Op      Op     `json:"op"`
-	Account *int   `json:"account,omitempty"` // force a specific account (select)
+	Account *int   `json:"account,omitempty"` // force a select account / identify a checkin account
 	PID     int    `json:"pid,omitempty"`     // launching pid (select checkout / checkin)
 	NoMark  bool   `json:"no_mark,omitempty"` // select without recording a checkout
 	Cwd     string `json:"cwd,omitempty"`     // caller's working directory, keys select stickiness

@@ -124,14 +124,14 @@ type fpOutcome int
 
 const (
 	fpHealthy   fpOutcome = iota // domain registered, bridge symlink intact
-	fpRepaired                   // Health failed; the idempotent Setup re-registered + re-linked
+	fpRepaired                   // Check failed; Reconcile re-registered and re-linked
 	fpRetry                      // transient control condition; retry next cycle
 	fpRetreated                  // ErrCannotControl: permanently retreated to symlink
 	fpDeferred                   // retreat refused, or the self-heal ladder owns the wedged domain; retry next cycle
 )
 
 // reconcileFileProvider brings one File Provider row in line with its domain:
-// Health, then on failure one idempotent Setup. Only fileproviderd.ErrCannotControl
+// Check, then on failure one idempotent Reconcile. Only fileproviderd.ErrCannotControl
 // retreats the row to symlink; everything else retries next cycle. Callers hold
 // the account's poll claim.
 func (s *Server) reconcileFileProvider(ctx context.Context, a store.Account) fpOutcome {
@@ -142,25 +142,25 @@ func (s *Server) reconcileFileProvider(ctx context.Context, a store.Account) fpO
 	}
 	base, dir := pool.ClaudeDir(), a.ConfigDir
 	// Defer to the self-heal ladder while it holds this domain wedged and is backing
-	// off between recovery attempts: reconcile's Health+Setup would pile control ops
+	// off between recovery attempts: another Check+Reconcile would pile control ops
 	// on a domain the ladder is already recovering — the reconcile storm (defect 3)
 	// this gate removes.
 	if s.fpWedged(dir) && !s.fpRecoveryDue(dir, time.Now()) {
 		return fpDeferred
 	}
-	healthErr := prov.Health(base, dir)
-	if healthErr == nil {
+	checkErr := prov.Check(ctx, base, dir)
+	if checkErr == nil {
 		return fpHealthy
 	}
-	if errors.Is(healthErr, fileproviderd.ErrAppUnavailable) {
+	if errors.Is(checkErr, fileproviderd.ErrAppUnavailable) {
 		// A down app is not an unhealthy domain (it survives the app's death): defer on
-		// it rather than pile a Setup onto a domain the app simply can't answer for now.
-		s.log.Printf("acct-%02d file provider reconcile deferred: companion app unavailable: %v", a.ID, healthErr)
+		// it rather than pile a Reconcile onto a domain the app simply can't answer for now.
+		s.log.Printf("acct-%02d file provider reconcile deferred: companion app unavailable: %v", a.ID, checkErr)
 		return fpDeferred
 	}
-	switch err := prov.Setup(base, dir); {
+	switch err := prov.Reconcile(ctx, base, dir); {
 	case err == nil:
-		s.log.Printf("acct-%02d file provider domain repaired (health: %v)", a.ID, healthErr)
+		s.log.Printf("acct-%02d file provider domain repaired (check: %v)", a.ID, checkErr)
 		return fpRepaired
 	case errors.Is(err, fileproviderd.ErrCannotControl):
 		s.log.Printf("acct-%02d file provider cannot serve on this machine (no entitlement or extension disabled); falling back to symlink: %v", a.ID, err)
@@ -191,11 +191,10 @@ func (s *Server) retreatFPToSymlink(ctx context.Context, a store.Account) bool {
 }
 
 // convertFPToSymlinkHeld is the shared File-Provider→symlink retreat body,
-// live-session-gated (a live session's open fds break on the domain removal, and a
-// failed scan cannot rule one out — defer in both cases) and clearing the row's
-// wedge/recovery state on success (fp.forget on retreat). Caller holds the convert
-// claim; the caller logs the success reason (the retreat is invoked for distinct
-// reasons — ErrCannotControl vs breaker exhaustion).
+// live-session-gated (a live session's open fds break on domain removal) and
+// clearing the row's wedge/recovery state on success. The session lease is the
+// authoritative fence, including select handouts not yet visible to procscan.
+// Caller holds the convert claim and logs the success reason.
 func (s *Server) convertFPToSymlinkHeld(ctx context.Context, a store.Account) bool {
 	// A File Provider source has no holder mount, so ConvertOverlay mutates the plain
 	// account dir directly (a live session's open fds break on the domain removal):
@@ -268,13 +267,13 @@ func (s *Server) handleFPRepair(ctx context.Context, req Request) Response {
 	return Response{OK: true, FPRepairs: results}
 }
 
-// repairFPDomain re-registers one File Provider domain (Teardown+Setup, the reset
+// repairFPDomain re-registers one File Provider domain (Teardown+Reconcile, the reset
 // that discards fileproviderd's poisoned replica state) under a standalone convert
 // claim, so no select hands the dir to a launching session mid-re-register. On a
 // clean re-register it resets the domain's wedge/recovery state so the next probe
 // re-verifies; ErrCannotControl retreats the row to symlink. Re-registration
 // proceeds even under live sessions (a wedged domain already fails their reads). It
-// does its own Teardown+Setup rather than reRegisterFP so a transient Setup failure
+// does its own Teardown+Reconcile rather than reRegisterFP so a transient Reconcile failure
 // is reported as FPRepairFailed, not silently as repaired. When retreat is true it
 // takes the explicit-retreat path instead: the ONLY caller of convertFPToSymlinkHeld
 // left, now that the heal breaker parks rather than auto-retreats.
@@ -310,14 +309,14 @@ func (s *Server) repairFPDomain(ctx context.Context, a store.Account, retreat bo
 		return res
 	}
 	base, dir := pool.ClaudeDir(), fresh.ConfigDir
-	warning, terr := prov.Teardown(base, dir)
+	warning, terr := prov.Teardown(ctx, base, dir)
 	s.warnTeardown(fresh.ID, warning)
 	if terr != nil {
-		// A wedged domain may refuse a clean Teardown; the idempotent Setup below
+		// A wedged domain may refuse a clean Teardown; Reconcile below
 		// re-adds regardless, so log and press on rather than failing the repair.
 		s.log.Printf("acct-%02d file provider repair: teardown: %v", fresh.ID, terr)
 	}
-	switch serr := prov.Setup(base, dir); {
+	switch serr := prov.Reconcile(ctx, base, dir); {
 	case serr == nil:
 		s.fpReset(dir)
 		s.log.Printf("acct-%02d file provider domain re-registered by `ccp fp repair`; the next probe verifies it — relaunch any sessions on it", fresh.ID)

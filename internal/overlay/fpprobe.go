@@ -56,7 +56,7 @@ type FPDomainProber interface {
 // never neuter a nudge a wedged domain needs. Satisfied by
 // *fusekit/overlay.FileProviderProvider.
 type FPSignaler interface {
-	Signal(accountDir string) error
+	Signal(ctx context.Context, accountDir string) error
 }
 
 // FPDomainRemover deregisters a File Provider domain WITHOUT retracting the
@@ -64,7 +64,7 @@ type FPSignaler interface {
 // retreat must perform to avoid leaking a domain registration. Satisfied by
 // *fusekit/overlay.FileProviderProvider.
 type FPDomainRemover interface {
-	RemoveDomain(accountDir string) error
+	RemoveDomain(ctx context.Context, accountDir string) error
 }
 
 // FPDomainRegistry reports whether a File Provider domain is currently registered
