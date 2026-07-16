@@ -173,7 +173,8 @@ mode the scenario locally re-wraps + Developer ID-signs the daemon bundle (via
 > the daemon to keep running from the bundle. On a build that still re-execs the
 > daemon from `pool.StableBinDir()` (a bare `~/.cc-pool/bin/cc-pool` copy) the
 > `assert_runs_from_bundle` check fails by design — that re-exec is what the
-> daemon-bundle packaging obsoletes, and the Go rewire must neutralize it.
+> daemon-bundle packaging obsoletes (the go-rewire branch deletes it), so run
+> the scenario on a build that carries the rewire.
 
 ## Environment
 

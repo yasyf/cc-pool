@@ -72,7 +72,7 @@ assert_runs_from_bundle() {
   cmd="$(vm_ssh "ps -p '$pid' -o command= 2>/dev/null")" || cmd=""
   [[ -n "$cmd" ]] || die "daemon PID $pid is not running (crashed on start? check the daemon log)"
   [[ "$cmd" == *"$app"* ]] ||
-    die "daemon PID $pid runs from '$cmd', not the bundle at $app — the run-from-bundle contract is not in effect (the daemon re-exec'd to a bare stable-bin copy; the go-rewire branch must neutralize reexecFromStableBin so the daemon keeps the bundle's identifier-keyed TCC identity)"
+    die "daemon PID $pid runs from '$cmd', not the bundle at $app — the run-from-bundle contract is not in effect (the daemon re-exec'd to a bare stable-bin copy: this build predates the go-rewire that deleted reexecFromStableBin, so it forfeits the bundle's identifier-keyed TCC identity)"
 }
 
 # assert_entitlement_validated dies unless the kernel-validated process entitlements
