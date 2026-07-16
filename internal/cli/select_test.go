@@ -172,7 +172,7 @@ func TestPrepareDaemonSelectionSkipsLocalReconcile(t *testing.T) {
 	}
 	provider := &countingOverlay{}
 	m := &pool.Manager{
-		Store: st, Creds: credstest.NewFake(),
+		Store: st, Creds: credstest.NewFake(), LockDir: t.TempDir(),
 		OverlayFor: func(fkoverlay.Backend) (fkoverlay.Provider, error) { return provider, nil },
 	}
 	cmd := &cobra.Command{}
