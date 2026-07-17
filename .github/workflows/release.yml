@@ -269,9 +269,13 @@ jobs:
           test -f "$PROFILE"
           DECODED="$(security cms -D -i "$PROFILE")"
           echo "$DECODED" | grep -q "com.apple.security.application-groups"
-          echo "$DECODED" | grep -q "$APP_GROUP"
+          # A Developer ID profile authorizes the group as the team wildcard
+          # "TEAM.*" (what the portal mints), which covers "TEAM.ccp"; accept
+          # the literal group or that covering wildcard.
+          echo "$DECODED" | grep -qF "$APP_GROUP" || echo "$DECODED" | grep -qF "${APP_GROUP%.*}.*"
 
-          # The daemon bundle's own code signature carries the App Group.
+          # The daemon bundle's own code signature carries the literal App Group
+          # (the entitlements plist claims it verbatim, not a wildcard).
           codesign -d --entitlements - "$DAEMON_APP" 2>&1 | grep -q "$APP_GROUP"
 
           # Both notarizable apps pass deep, strict verification.
