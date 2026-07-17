@@ -170,11 +170,12 @@ mode the scenario locally re-wraps + Developer ID-signs the daemon bundle (via
    not path-keyed).
 
 > **Run-from-bundle dependency.** The entitlement-validated assertion requires
-> the daemon to keep running from the bundle. On a build that still re-execs the
-> daemon from `pool.StableBinDir()` (a bare `~/.cc-pool/bin/cc-pool` copy) the
-> `assert_runs_from_bundle` check fails by design — that re-exec is what the
-> daemon-bundle packaging obsoletes (the go-rewire branch deletes it), so run
-> the scenario on a build that carries the rewire.
+> the daemon to keep running from the bundle. On a pre-rewire build that still
+> re-execs the daemon into a bare `~/.cc-pool/bin/cc-pool` copy (the retired
+> stable-bin mechanism; only the `doctor` cleanup rung and
+> `pool.LegacyStableBinDir()` reference that path now) the
+> `assert_runs_from_bundle` check fails by design — run the scenario on a build
+> that carries the rewire.
 
 ## Environment
 
