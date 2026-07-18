@@ -245,8 +245,13 @@ jobs:
           # a real one, so an unsigned test build only needs it to exist.
           printf 'MARKETING_VERSION = 0.0.0\nCURRENT_PROJECT_VERSION = 1\n' > Version.xcconfig
           xcodegen generate
-          xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatusFP \
+          # The FP scheme carries no test target; tests live on CCPoolStatus,
+          # and the FP flavor is compile-proven by a build.
+          xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
             -configuration Debug -derivedDataPath build-tests test \
+            CODE_SIGNING_ALLOWED=NO
+          xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatusFP \
+            -configuration Debug -derivedDataPath build-fp build \
             CODE_SIGNING_ALLOWED=NO
 
   release-app:
