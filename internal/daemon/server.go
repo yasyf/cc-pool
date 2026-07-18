@@ -359,7 +359,7 @@ func (s *Server) serve(ctx context.Context) error {
 		}
 		return nil
 	}
-	defer func() { _ = deactivateListeners(context.Background()) }()
+	defer func() { _ = deactivateListeners(ctx) }()
 
 	// drainCtx begins the drain on SIGINT/SIGTERM or OpShutdown (beginDrain, wired
 	// to triggerShutdown); it does NOT cancel the executors.

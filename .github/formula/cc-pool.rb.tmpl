@@ -66,7 +66,7 @@ class CcPool < Formula
   def install_from_source
     ldflags = %W[
       -s -w
-      -X github.com/yasyf/fusekit/version.Version=#{version}
+      -X github.com/yasyf/cc-pool/internal/version.Version=#{version}
     ]
     args = std_go_args(ldflags: ldflags.join(" "), output: bin/"cc-pool")
     ENV["CGO_ENABLED"] = "0"

@@ -25,7 +25,7 @@ func bumpUnderLock(t *testing.T, lockPath, counterPath string) {
 		t.Errorf("acquire: %v", err)
 		return
 	}
-	defer h.Release()
+	defer func() { _ = h.Release() }()
 	b, err := os.ReadFile(counterPath) //nolint:gosec // G304: counterPath is under the test's own t.TempDir()
 	if err != nil {
 		t.Errorf("read counter: %v", err)
@@ -81,7 +81,7 @@ func TestFlockRespectsContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Release()
+	defer func() { _ = held.Release() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -117,7 +117,7 @@ func TestFlockChildHolds(t *testing.T) {
 		t.Fatalf("child signal ready: %v", err)
 	}
 	time.Sleep(flockChildHold)
-	h.Release()
+	_ = h.Release()
 }
 
 // TestFlockCrossProcess is the real proof: a child PROCESS holds the lock while
@@ -157,7 +157,7 @@ func TestFlockCrossProcess(t *testing.T) {
 		t.Fatalf("parent acquire: %v; child output:\n%s", err, out.String())
 	}
 	waited := time.Since(start)
-	h.Release()
+	_ = h.Release()
 	if waited < 300*time.Millisecond {
 		t.Fatalf("parent acquired in %v without blocking — flock is not excluding across processes; child output:\n%s", waited, out.String())
 	}

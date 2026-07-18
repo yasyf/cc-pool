@@ -1648,7 +1648,7 @@ func TestReportLegacyStableBinDir(t *testing.T) {
 
 	t.Run("present dir is unhealthy and points at --fix", func(t *testing.T) {
 		tempHome(t)
-		if err := os.MkdirAll(pool.LegacyStableBinDir(), 0o700); err != nil {
+		if err := os.MkdirAll(pool.LegacyStableBinDir(), 0o700); err != nil { //nolint:staticcheck // SA1019: test covers the deprecated path cleanup.
 			t.Fatal(err)
 		}
 		report, calls := captureReports()
@@ -1663,7 +1663,7 @@ func TestReportLegacyStableBinDir(t *testing.T) {
 
 	t.Run("--fix removes the leftover dir", func(t *testing.T) {
 		tempHome(t)
-		dir := pool.LegacyStableBinDir()
+		dir := pool.LegacyStableBinDir() //nolint:staticcheck // SA1019: test covers the deprecated path cleanup.
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}

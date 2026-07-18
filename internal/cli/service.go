@@ -87,6 +87,7 @@ var (
 	brewManaged     = func() bool { return ccpAgent().IsBrewManaged() }
 	brewStop        = func(ctx context.Context) error { return ccpAgent().BrewStop(ctx) }
 	runCCPLaunchctl = func(ctx context.Context, args ...string) (string, error) {
+		//nolint:gosec // G204: launchctl is fixed; args are daemonkit's service-management argv, not external input.
 		out, err := exec.CommandContext(ctx, "launchctl", args...).CombinedOutput()
 		return string(out), err
 	}
@@ -168,6 +169,7 @@ func adaptCCPAgentPlist(path string) error {
 		return errors.New("adapt cc-pool LaunchAgent: daemonkit KeepAlive policy not found")
 	}
 	body = []byte(strings.Replace(string(body), keepAliveAlways, keepAliveOnFailure, 1))
+	//nolint:gosec // G703: daemonkit supplies the freshly rendered cc-pool LaunchAgent path.
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		return fmt.Errorf("write cc-pool LaunchAgent: %w", err)
 	}

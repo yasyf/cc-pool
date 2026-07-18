@@ -618,7 +618,7 @@ func reportContentHealth(health string, report func(string, bool, string)) {
 // stable-path daemon re-exec; --fix removes it. Slated for deletion (with
 // pool.LegacyStableBinDir) a release after the leftover is gone.
 func reportLegacyStableBinDir(fix bool, report func(string, bool, string)) {
-	dir := pool.LegacyStableBinDir()
+	dir := pool.LegacyStableBinDir() //nolint:staticcheck // SA1019: doctor intentionally removes this deprecated path.
 	_, err := os.Stat(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return

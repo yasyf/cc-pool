@@ -160,7 +160,7 @@ func (m *Manager) lockAccount(ctx context.Context, id int) (func(), error) {
 		return nil, fmt.Errorf("acct-%d refresh lock: %w", id, err)
 	}
 	return func() {
-		h.Release()
+		_ = h.Release()
 		mu.Unlock()
 	}, nil
 }

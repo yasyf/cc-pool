@@ -61,6 +61,7 @@ jobs:
         run: |
           brew install xcodegen
           cd widget
+          printf 'MARKETING_VERSION = 0.0.0\nCURRENT_PROJECT_VERSION = 1\n' > Version.xcconfig
           xcodegen generate
           xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
             -configuration Debug -derivedDataPath build test \
@@ -80,7 +81,7 @@ jobs:
           cache: true
       - name: Build + version smoke
         run: |
-          go build -ldflags "-X github.com/yasyf/fusekit/version.Version=ci" -o /tmp/cc-pool ./cmd/cc-pool
+          go build -ldflags "-X github.com/yasyf/cc-pool/internal/version.Version=ci" -o /tmp/cc-pool ./cmd/cc-pool
           /tmp/cc-pool --version | grep -q ci
           /tmp/cc-pool --help | grep -q "emptiest account"
           /tmp/cc-pool list || true   # exits cleanly with "no accounts" before init

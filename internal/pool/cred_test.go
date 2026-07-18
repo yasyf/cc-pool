@@ -342,7 +342,7 @@ func TestMoveCredentialLockContention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Release()
+	defer func() { _ = held.Release() }()
 
 	fk := credstest.NewFake()
 	fk.Put(a.KeychainService, a.KeychainAccount, moveCred())

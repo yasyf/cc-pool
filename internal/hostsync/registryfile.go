@@ -83,7 +83,7 @@ func (rf RegistryFile) WithLock(ctx context.Context, fn func() error) error {
 	if err != nil {
 		return fmt.Errorf("acquire registry lock: %w", err)
 	}
-	defer h.Release()
+	defer func() { _ = h.Release() }()
 	return fn()
 }
 
