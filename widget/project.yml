@@ -17,14 +17,18 @@ options:
     macOS: "14.0"
   createIntermediateGroups: true
 
+# release-app.yml writes a per-build Version.xcconfig before `xcodegen generate`;
+# keep MARKETING_VERSION/CURRENT_PROJECT_VERSION out of `settings:` so it wins.
+configFiles:
+  Debug: Version.xcconfig
+  Release: Version.xcconfig
+
 settings:
   base:
     SWIFT_VERSION: "5.10"
     CODE_SIGN_STYLE: Manual
     CODE_SIGN_IDENTITY: "-"
     PRODUCT_NAME: $(TARGET_NAME)
-    CURRENT_PROJECT_VERSION: 1
-    MARKETING_VERSION: 0.1.0
 
 targetTemplates:
   HostApp:

@@ -16,13 +16,26 @@ jobs:
           fetch-depth: 0
       - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@v1
 
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      marketing: ${{ steps.derive.outputs.marketing }}
+    steps:
+      - id: derive
+        shell: bash
+        # release-app.yml requires bare MAJOR.MINOR.PATCH; the tag carries a v
+        # prefix and, on rc tags, a prerelease suffix.
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          echo "marketing=${v%%-*}" >> "$GITHUB_OUTPUT"
+
   release:
     needs: verify-tag-on-main
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0 # full history — the widget's CURRENT_PROJECT_VERSION is the commit count
+          fetch-depth: 0
 
       - uses: actions/setup-go@v6
         with:
@@ -120,141 +133,6 @@ jobs:
           entitlements: dist/daemon.entitlements
           provisioning-profile-b64: ${{ secrets.MACOS_PROFILE_DAEMON }}
 
-      # The widget must link against the macOS 26 SDK. A binary built against an
-      # older SDK (the macos-15 runner defaults to Xcode 16.4 → macosx15.5)
-      # renders blank small/large tiles under macOS 26's glass/archived-render
-      # pipeline — only medium survives. The runner ships Xcode 26.x alongside
-      # the default, so select it for the cask payload build.
-      - uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: "26"
-
-      # Phase 0 — install the Developer ID provisioning profiles the Manual-signed
-      # widget targets resolve by PROVISIONING_PROFILE_SPECIFIER (host app, FP
-      # appex). Xcode matches a specifier to a profile in ~/Library/MobileDevice/
-      # Provisioning Profiles/ by its Name; the file itself is UUID-named by
-      # convention. The daemon profile is decoded here for parity/validation —
-      # wrap-daemon-bundle consumes it as base64 directly, not from this directory.
-      - name: Install provisioning profiles
-        env:
-          MACOS_PROFILE_HOST_APP: ${{ secrets.MACOS_PROFILE_HOST_APP }}
-          MACOS_PROFILE_FP_APPEX: ${{ secrets.MACOS_PROFILE_FP_APPEX }}
-          MACOS_PROFILE_DAEMON: ${{ secrets.MACOS_PROFILE_DAEMON }}
-        run: |
-          set -euo pipefail
-          dir="$HOME/Library/MobileDevice/Provisioning Profiles"
-          mkdir -p "$dir"
-          install_profile() {
-            b64="$1"; label="$2"
-            if [ -z "$b64" ]; then
-              echo "::error::provisioning profile secret for $label is empty"
-              exit 1
-            fi
-            tmp="$(mktemp)"
-            printf '%s' "$b64" | base64 --decode > "$tmp"
-            # security cms -D decodes the CMS envelope to the profile's plist; the
-            # UUID names the installed file so xcodebuild resolves it by specifier.
-            security cms -D -i "$tmp" > "$tmp.plist"
-            uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$tmp.plist")"
-            test -n "$uuid"
-            cp "$tmp" "$dir/$uuid.provisionprofile"
-            rm -f "$tmp" "$tmp.plist"
-          }
-          install_profile "$MACOS_PROFILE_HOST_APP" host-app
-          install_profile "$MACOS_PROFILE_FP_APPEX" fp-appex
-          install_profile "$MACOS_PROFILE_DAEMON" daemon
-
-      - name: Test widget and File Provider logic
-        run: |
-          brew install xcodegen
-          cd widget
-          xcodegen generate
-          xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
-            -configuration Debug -derivedDataPath build-tests test \
-            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-"
-
-      - name: Build the Notification Center widget app (cc-pool-status cask payload)
-        run: |
-          cd widget
-          xcodegen generate
-          # chronod caches widget metadata (supported size families) keyed by
-          # bundle version — stamp a real, monotonic version per release or the
-          # gallery keeps a stale descriptor and never gains new widget sizes.
-          # Developer ID + hardened runtime so a quarantined cask install launches
-          # without Gatekeeper blocking it; xcodebuild signs inside-out (appexes,
-          # then app), applying each target's entitlements from project.yml.
-          # TEAM_ID comes from import-developer-id's env export (derived from the
-          # signing identity, never hardcoded).
-          # CCPoolStatusFP is the File-Provider-enabled host flavor: it embeds
-          # CCPoolFileProvider.appex alongside the widget appex and carries the
-          # App Group entitlement; PRODUCT_NAME keeps the product CCPoolStatus.app.
-          # The ad-hoc CCPoolStatus scheme stays local-only.
-          # CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO: a plain `xcodebuild build`
-          # (unlike archive + -exportArchive) injects get-task-allow=YES even in a
-          # Release build, which notarization rejects on every executable. Disabling
-          # the injection drops it; the appex keeps its sandbox + ~/.cc-pool read
-          # exception, which come from its own entitlements file (explicit, not
-          # injected).
-          xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatusFP \
-            -configuration Release -derivedDataPath build build \
-            MARKETING_VERSION="${GITHUB_REF_NAME#v}" \
-            CURRENT_PROJECT_VERSION="$(git rev-list --count HEAD)" \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="$MACOS_SIGN_IDENTITY" \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            ENABLE_HARDENED_RUNTIME=YES \
-            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
-            OTHER_CODE_SIGN_FLAGS="--timestamp"
-          APP=build/Build/Products/Release/CCPoolStatus.app
-          # The appex must carry the sandbox + ~/.cc-pool read exception, or the
-          # widget silently can't read status.json — fail the release instead.
-          codesign --verify --deep --strict --verbose=2 "$APP"
-          codesign -d --entitlements - "$APP/Contents/PlugIns/CCPoolStatusWidget.appex" 2>&1 |
-            grep -q "temporary-exception.files.home-relative-path.read-only"
-          # The stamp must actually reach both bundles ($(…) wiring lives in
-          # project.yml's info.properties) — a silent 1/1.0 re-ships the
-          # stale-gallery bug. The appex is the bundle chronod inspects.
-          test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" != 1
-          test "$(plutil -extract CFBundleVersion raw "$APP/Contents/PlugIns/CCPoolStatusWidget.appex/Contents/Info.plist")" != 1
-          # File Provider appex asserts: present, correctly entitled, and bound to
-          # the same App Group the Go daemon compiled in — fail the release on any
-          # drift between widget/project.yml and internal/pool/paths.go.
-          FP_APPEX="$APP/Contents/PlugIns/CCPoolFileProvider.appex"
-          test -d "$FP_APPEX"
-          APP_GROUP="$(sed -n 's/^const AppGroupID = "\(.*\)"$/\1/p' ../internal/pool/paths.go)"
-          test -n "$APP_GROUP"
-          test "$APP_GROUP" = "${TEAM_ID}.ccp"
-          FP_ENTS="$(codesign -d --entitlements - "$FP_APPEX" 2>&1)"
-          echo "$FP_ENTS" | grep -q "com.apple.security.application-groups"
-          echo "$FP_ENTS" | grep -q "temporary-exception.files.home-relative-path.read-write"
-          # fileprovider.testing-mode is a restricted entitlement our Developer ID
-          # provisioning profiles do not authorize (and Apple gates it) — keep it
-          # absent.
-          if echo "$FP_ENTS" | grep -q "fileprovider.testing-mode"; then
-            echo "::error::CCPoolFileProvider.appex carries fileprovider.testing-mode"
-            exit 1
-          fi
-          # $(TeamIdentifierPrefix) in project.yml expands only because this build
-          # sets DEVELOPMENT_TEAM, so assert the EXPANDED value in the built plist.
-          FP_PLIST="$FP_APPEX/Contents/Info.plist"
-          test "$(plutil -extract NSExtension.NSExtensionPointIdentifier raw "$FP_PLIST")" = "com.apple.fileprovider-nonui"
-          test "$(plutil -extract NSExtension.NSExtensionFileProviderDocumentGroup raw "$FP_PLIST")" = "$APP_GROUP"
-
-      - name: Notarize, staple, zip CCPoolStatus.app
-        id: app
-        uses: yasyf/homebrew-tap/.github/actions/sign-notarize-app@v1
-        with:
-          app: widget/build/Build/Products/Release/CCPoolStatus.app
-          name: cc-pool-status
-          # xcodebuild already signed inside-out with per-target entitlements
-          # (widget appex: sandbox + ~/.cc-pool read exception; FP appex: sandbox +
-          # App Group + home-relative read-write exception; host app: App Group);
-          # re-signing here would flatten them and brick the appexes.
-          sign: "false"
-          # The single release step below attaches every asset and generates
-          # notes exactly once.
-          attach-to-release: "false"
-
       - name: Verify signing invariants
         env:
           DAEMON_APP: ${{ steps.daemon.outputs.bundle-path }}
@@ -278,23 +156,15 @@ jobs:
           # (the entitlements plist claims it verbatim, not a wildcard).
           codesign -d --entitlements - "$DAEMON_APP" 2>&1 | grep -q "$APP_GROUP"
 
-          # Both notarizable apps pass deep, strict verification.
+          # The daemon bundle passes deep, strict verification.
           codesign --verify --deep --strict --verbose=2 "$DAEMON_APP"
-          codesign --verify --deep --strict --verbose=2 \
-            widget/build/Build/Products/Release/CCPoolStatus.app
 
-          # Both apps must carry a stapled notarization ticket. codesign --verify
-          # only proves the signature, not that notarization succeeded — and the
-          # wrap-daemon-bundle / sign-notarize-app actions merely WARN when notary
-          # credentials are missing, so a misnamed secret would ship a
-          # signed-but-unnotarized bundle silently. stapler validate fails closed
-          # on a missing or invalid ticket.
+          # The daemon bundle must carry a stapled notarization ticket. codesign
+          # --verify proves only the signature; wrap-daemon-bundle merely WARNS on
+          # missing notary creds. stapler validate fails closed on a bad ticket.
           xcrun stapler validate "$DAEMON_APP"
-          xcrun stapler validate \
-            widget/build/Build/Products/Release/CCPoolStatus.app
 
-          # The CLI binary must NOT carry the App Group — the claim moved to the
-          # daemon bundle.
+          # Only the daemon bundle claims the App Group; the CLI binary must not.
           if codesign -d --entitlements - dist/pure/cc-pool 2>&1 | grep -q "application-groups"; then
             echo "::error::cc-pool CLI binary still carries an app-group entitlement"
             exit 1
@@ -320,31 +190,25 @@ jobs:
 
       - name: Checksum the release assets
         id: shas
-        env:
-          APP_SHA: ${{ steps.app.outputs.sha256 }}
         run: |
           cd dist
-          shasum -a 256 -- *.tar.gz *.zip > SHA256SUMS.txt
+          shasum -a 256 -- *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
           PURE_SHA="$(grep -E 'darwin-universal\.tar\.gz$' SHA256SUMS.txt | awk '{print $1}')"
-          test -n "$PURE_SHA" && test -n "$APP_SHA"
+          test -n "$PURE_SHA"
           echo "pure=${PURE_SHA}" >> "$GITHUB_OUTPUT"
-          echo "app=${APP_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.tar.gz
-            dist/*.zip
             dist/SHA256SUMS.txt
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
 
-      # Prerelease tags (v1.2.3-rc.1) publish assets but never touch the tap.
-      # The formula and cask live in the shared external tap yasyf/homebrew-tap,
-      # so `brew install yasyf/tap/cc-pool` works without a bespoke tap URL;
-      # release assets still come from THIS repo's GitHub Releases.
+      # Prerelease tags publish assets but never touch the tap. The cc-pool-status
+      # cask is rendered and published by the release-app job's cask stage.
       - name: Render the formula
         if: ${{ !contains(github.ref_name, '-') }}
         uses: yasyf/homebrew-tap/.github/actions/render-formula@v1
@@ -354,19 +218,64 @@ jobs:
           substitutions: |
             __SHA_PURE__=${{ steps.shas.outputs.pure }}
 
-      - name: Render the cask
-        if: ${{ !contains(github.ref_name, '-') }}
-        uses: yasyf/homebrew-tap/.github/actions/render-formula@v1
-        with:
-          template: .github/cask/cc-pool-status.rb.tmpl
-          output: Casks/cc-pool-status.rb
-          substitutions: |
-            __SHA_APP__=${{ steps.shas.outputs.app }}
-
-      - name: Publish the formula and cask to the tap
+      - name: Publish the formula to the tap
         if: ${{ !contains(github.ref_name, '-') }}
         uses: yasyf/homebrew-tap/.github/actions/publish@v1
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging
           message: "cc-pool ${{ github.ref_name }}"
+
+  widget-test:
+    needs: verify-tag-on-main
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      # The widget links against the macOS 26 SDK (glass/archived-render tiles);
+      # the test build must match the release build's toolchain.
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26"
+      - name: Test widget and File Provider logic
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          cd widget
+          # project.yml wires configFiles: Version.xcconfig; release-app.yml writes
+          # a real one, so an unsigned test build only needs it to exist.
+          printf 'MARKETING_VERSION = 0.0.0\nCURRENT_PROJECT_VERSION = 1\n' > Version.xcconfig
+          xcodegen generate
+          xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatusFP \
+            -configuration Debug -derivedDataPath build-tests test \
+            CODE_SIGNING_ALLOWED=NO
+
+  release-app:
+    needs: [version, widget-test]
+    permissions:
+      contents: write
+    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@v1
+    with:
+      app_name: CCPoolStatus
+      project_dir: widget
+      scheme: CCPoolStatusFP
+      bundle_id: com.yasyf.cc-pool.status
+      marketing_version: ${{ needs.version.outputs.marketing }}
+      appexes: |
+        Contents/PlugIns/CCPoolStatusWidget.appex
+        Contents/PlugIns/CCPoolFileProvider.appex
+      app_groups: |
+        com.yasyf.cc-pool.status=SXKCTF23Q2.ccp
+        com.yasyf.cc-pool.status.fileprovider=SXKCTF23Q2.ccp
+      profile_names: |
+        com.yasyf.cc-pool.status=cc-pool Status Host DevID
+        com.yasyf.cc-pool.status.fileprovider=cc-pool FileProvider DevID
+      cask_token: cc-pool-status
+      cask_template_path: .github/cask/cc-pool-status.rb.tmpl
+      assert_script: .github/scripts/assert-widget-app.sh
+    secrets:
+      MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+      MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+      MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+      MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

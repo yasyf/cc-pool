@@ -97,8 +97,9 @@ final class StatusWatcher {
     }
 
     private func changed() {
-        // Debounce bursts (temp write + rename); the daemon cadence is ~3 min.
-        guard Date().timeIntervalSince(lastReload) > 5 else { return }
+        // Coalesce to >=5min: the daemon rewrites status.json on a ~3-min cadence,
+        // and WidgetKit's refresh budget punishes a reload per change.
+        guard Date().timeIntervalSince(lastReload) > 300 else { return }
         lastReload = Date()
         WidgetCenter.shared.reloadAllTimelines()
     }
