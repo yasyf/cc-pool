@@ -19,8 +19,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/version"
 )
 
 type fakeLeaseCleanup struct {

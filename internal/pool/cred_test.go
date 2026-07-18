@@ -12,7 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // moveCred builds the credential the move tests seed and expect back. It is

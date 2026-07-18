@@ -21,7 +21,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/appgroup"
+	"github.com/yasyf/daemonkit/appgroup"
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"

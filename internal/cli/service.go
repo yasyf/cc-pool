@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,10 +17,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/service"
-	"github.com/yasyf/fusekit/version"
 )
 
 // Test seams: tests must never touch real processes, mounts, or launchctl/brew.
@@ -82,9 +83,13 @@ var (
 			return fmt.Errorf("%w: raw read of %s did not answer within %s", overlay.ErrFPProbeWedged, path, fpRawProbeTimeout)
 		}
 	}
-	stopDaemon  = stopDaemonService
-	brewManaged = func() bool { return ccpAgent().IsBrewManaged() }
-	brewStop    = func() error { return ccpAgent().BrewStop() }
+	stopDaemon      = stopDaemonService
+	brewManaged     = func() bool { return ccpAgent().IsBrewManaged() }
+	brewStop        = func(ctx context.Context) error { return ccpAgent().BrewStop(ctx) }
+	runCCPLaunchctl = func(ctx context.Context, args ...string) (string, error) {
+		out, err := exec.CommandContext(ctx, "launchctl", args...).CombinedOutput()
+		return string(out), err
+	}
 )
 
 // fpRawProbeTimeout bounds the opt-in raw File Provider read so `ccp doctor`
@@ -130,6 +135,45 @@ func daemonBundleExecutable() (string, bool) {
 	return p, err == nil && fi.Mode().IsRegular()
 }
 
+const (
+	keepAliveAlways = `    <key>KeepAlive</key>
+    <true/>`
+	keepAliveOnFailure = `    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>`
+)
+
+type ccpAgentLauncher struct{}
+
+func (ccpAgentLauncher) Run(ctx context.Context, args ...string) (string, error) {
+	if len(args) > 0 && args[0] == "bootstrap" {
+		if len(args) != 3 {
+			return "", fmt.Errorf("adapt cc-pool LaunchAgent: unexpected bootstrap arguments %q", args)
+		}
+		if err := adaptCCPAgentPlist(args[2]); err != nil {
+			return "", err
+		}
+	}
+	return runCCPLaunchctl(ctx, args...)
+}
+
+func adaptCCPAgentPlist(path string) error {
+	body, err := os.ReadFile(path) //nolint:gosec // G304: daemonkit supplies the freshly rendered cc-pool LaunchAgent path.
+	if err != nil {
+		return fmt.Errorf("read cc-pool LaunchAgent: %w", err)
+	}
+	if !strings.Contains(string(body), keepAliveAlways) {
+		return errors.New("adapt cc-pool LaunchAgent: daemonkit KeepAlive policy not found")
+	}
+	body = []byte(strings.Replace(string(body), keepAliveAlways, keepAliveOnFailure, 1))
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		return fmt.Errorf("write cc-pool LaunchAgent: %w", err)
+	}
+	return nil
+}
+
 // ccpAgent's Program is the daemon .app bundle when it is installed (launchd execs
 // the entitled+profiled bundle), else empty so launchd falls back to os.Executable
 // — a Homebrew symlink that stays a stable program path across upgrades.
@@ -139,11 +183,12 @@ func ccpAgent() service.Agent {
 		program = p
 	}
 	return service.Agent{
-		Label:   "com.yasyf.cc-pool",
-		Formula: "cc-pool",
-		Program: program,
-		Args:    []string{"daemon"},
-		LogPath: pool.LogPath(),
+		Label:    "com.yasyf.cc-pool",
+		Formula:  "cc-pool",
+		Program:  program,
+		Args:     []string{"daemon"},
+		LogPath:  pool.LogPath(),
+		Launcher: ccpAgentLauncher{},
 		Env: map[string]string{
 			"PATH": os.Getenv("PATH"),
 		},
@@ -169,7 +214,7 @@ func newServiceCmd() *cobra.Command {
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				out := cmd.OutOrStdout()
-				for _, line := range ccpAgent().StatusLines() {
+				for _, line := range ccpAgent().StatusLines(cmd.Context()) {
 					_, _ = fmt.Fprintln(out, line)
 				}
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
@@ -355,15 +400,15 @@ func gateUninstallSessions(accts []store.Account, purge bool) error {
 func stopDaemonService(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	if brewManaged() {
-		if err := brewStop(); err != nil {
+		if err := brewStop(cmd.Context()); err != nil {
 			return fmt.Errorf("brew services stop: %w — a still-running daemon would respawn the mount holder mid-uninstall", err)
 		}
 		// Remove any stale self-rolled agent from before the brew switch.
-		_ = ccpAgent().Uninstall()
+		_ = ccpAgent().Uninstall(cmd.Context())
 		success(out, "Stopped the daemon.")
 		return nil
 	}
-	if err := ccpAgent().Uninstall(); err != nil {
+	if err := ccpAgent().Uninstall(cmd.Context()); err != nil {
 		return err
 	}
 	success(out, "Removed the LaunchAgent.")
@@ -475,19 +520,19 @@ func runServiceInstall(cmd *cobra.Command) error {
 	if ccpAgent().IsBrewManaged() {
 		// A source build leaves a self-rolled agent that would run alongside
 		// the brew one; boot it out first.
-		_ = ccpAgent().Uninstall()
-		if err := ccpAgent().BrewStart(); err != nil {
+		_ = ccpAgent().Uninstall(cmd.Context())
+		if err := ccpAgent().BrewStart(cmd.Context()); err != nil {
 			return fmt.Errorf("brew services start: %w", err)
 		}
 		// brew services start only loads the job; a bootout race can leave it
 		// loaded-but-not-running, so force the daemon to actually exec.
-		if err := ccpAgent().BrewKickstart(); err != nil {
+		if err := ccpAgent().BrewKickstart(cmd.Context()); err != nil {
 			warn(cmd.ErrOrStderr(), "couldn't kickstart the brew service: %v", err)
 		}
 		success(out, "Started the daemon.")
 		return nil
 	}
-	if err := ccpAgent().Install(); err != nil {
+	if err := ccpAgent().Install(cmd.Context()); err != nil {
 		return err
 	}
 	success(out, "Installed and started the daemon.")
@@ -513,9 +558,9 @@ func ensureDaemon(cmd *cobra.Command, force bool) {
 		// pre-upgrade image; mount-safe (the detached holder keeps serving);
 		// a no-op for an orphan.
 		if ccpAgent().IsBrewManaged() {
-			_ = ccpAgent().BrewStop()
+			_ = ccpAgent().BrewStop(cmd.Context())
 		} else {
-			_ = ccpAgent().Uninstall()
+			_ = ccpAgent().Uninstall(cmd.Context())
 		}
 		// An orphan survives bootout.
 		if !cl.WaitGone(evictTimeout) {

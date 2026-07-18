@@ -16,8 +16,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/lease"
-	"github.com/yasyf/fusekit/version"
 )
 
 func TestExecEnv(t *testing.T) {

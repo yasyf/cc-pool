@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -817,11 +818,12 @@ func commitSelectResponse(t *testing.T, s *Server, resp Response) {
 	}
 }
 
-// TestServeDrainsInFlightHandlerOnShutdown: serve must drain in-flight
-// handlers before returning — Run's deferred m.Close() follows immediately.
+// TestServeDrainsInFlightHandlerOnShutdown: a work op admitted at frame receipt
+// settles to its terminal response before serve returns, so Run's deferred
+// m.Close() cannot race it. drain.Settle blocks the teardown until the admitted
+// handler finishes — the settle-before-cancel guarantee.
 func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
-	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -832,6 +834,9 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	settledCtx := make(chan error, 1)
 	var logBuf bytes.Buffer
 	s := &Server{
 		m:        &pool.Manager{Store: st},
@@ -840,6 +845,15 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 		log:      log.New(&logBuf, "", 0),
 		cl:       newClaims(),
 		led:      newLedgers(),
+	}
+	// A work op that blocks in dispatch after admission: it pins the drain open,
+	// proving serve settles admitted work before returning (and before m.Close).
+	var enteredOnce sync.Once
+	s.fpBridgeCheckFn = func(ctx context.Context) FPBridgeStatus {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		settledCtx <- ctx.Err()
+		return FPBridgeStatus{Verdict: FPBridgeServing}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -868,40 +882,33 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 		}
 	}
 
-	// Park a handler mid-request: it blocks in Decode awaiting the closing brace.
-	parked := dial()
-	defer func() { _ = parked.Close() }()
-	if _, err := parked.Write([]byte(`{"proto":2,"op":"status"`)); err != nil {
+	// Admit a work op and block it in dispatch.
+	work := dial()
+	defer func() { _ = work.Close() }()
+	if _, err := work.Write([]byte(`{"proto":2,"op":"fpbridgecheck"}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
-
-	// This round-trip proves the parked connection is already accepted and
-	// wg-tracked: the accept loop is sequential and unix sockets accept FIFO.
-	probe := dial()
-	defer func() { _ = probe.Close() }()
-	if _, err := probe.Write([]byte(`{"proto":2,"op":"health"}` + "\n")); err != nil {
-		t.Fatal(err)
-	}
-	var health Response
-	if err := json.NewDecoder(probe).Decode(&health); err != nil || !health.OK {
-		t.Fatalf("health probe failed: %+v err=%v", health, err)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("work handler never entered dispatch")
 	}
 
 	cancel()
 
-	// Without handler tracking, wg.Wait sees only the scheduler and serve
-	// returns within this window.
+	// drain.Settle blocks on the admitted handler: serve must not return yet.
 	select {
 	case <-done:
-		t.Fatal("serve returned while a handler was still in flight")
+		t.Fatal("serve returned while an admitted handler was still in flight")
 	case <-time.After(300 * time.Millisecond):
 	}
 
-	if _, err := parked.Write([]byte("}\n")); err != nil {
-		t.Fatal(err)
+	close(release)
+	if err := <-settledCtx; err != nil {
+		t.Fatalf("in-flight handler context canceled before settle: %v", err)
 	}
 	var resp Response
-	if err := json.NewDecoder(parked).Decode(&resp); err != nil {
+	if err := json.NewDecoder(work).Decode(&resp); err != nil {
 		t.Fatalf("decode in-flight response: %v", err)
 	}
 	if !resp.OK || resp.Error != "" {
@@ -918,6 +925,50 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	// logBuf is safe to read here: every writer goroutine exited before done.
 	if strings.Contains(logBuf.String(), "database is closed") {
 		t.Fatalf("teardown raced an in-flight handler:\n%s", logBuf.String())
+	}
+}
+
+// TestShutdownLifecycleHandlerWaitsForACK pins the lifecycle/wg split:
+// OpShutdown stays outside drain admission, but serve's wg cannot finish while
+// its terminal ACK is blocked on the connection.
+func TestShutdownLifecycleHandlerWaitsForACK(t *testing.T) {
+	server, client := net.Pipe()
+	defer func() { _ = client.Close() }()
+	triggered := make(chan struct{})
+	s := &Server{triggerShutdown: func() { close(triggered) }}
+	go s.handle(t.Context(), server)
+
+	if err := json.NewEncoder(client).Encode(Request{Proto: ProtocolVersion, Op: OpShutdown}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-triggered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OpShutdown never triggered drain")
+	}
+
+	waited := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+		t.Fatal("lifecycle wg settled before the Shutdown ACK was read")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	var resp Response
+	if err := json.NewDecoder(client).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.Proto != ProtocolVersion {
+		t.Fatalf("Shutdown ACK = %+v", resp)
+	}
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lifecycle wg did not settle after the Shutdown ACK landed")
 	}
 }
 

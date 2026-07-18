@@ -20,10 +20,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/version"
 )
 
 type reportCall struct {
@@ -185,9 +185,9 @@ func TestReportCaskRelauncher(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			called := false
-			swapVar(t, &holderRelauncherLoaded, func() bool { called = true; return tc.loaded })
+			swapVar(t, &holderRelauncherLoaded, func(context.Context) bool { called = true; return tc.loaded })
 			report, calls := captureReports()
-			reportCaskRelauncher(tc.fuseRows, report)
+			reportCaskRelauncher(context.Background(), tc.fuseRows, report)
 
 			if tc.none {
 				if len(*calls) != 0 {

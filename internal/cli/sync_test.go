@@ -330,7 +330,7 @@ func TestRPCServeBridgesFrames(t *testing.T) {
 	t.Run("bridges one frame byte-exact", func(t *testing.T) {
 		in := strings.NewReader(`{"method":"svc.get_state","params":{}}` + "\n")
 		var out bytes.Buffer
-		if err := runSyncRPCServe(ctx, in, &out, func() bool { return true }, sock); err != nil {
+		if err := runSyncRPCServe(ctx, in, &out, func(context.Context) bool { return true }, sock); err != nil {
 			t.Fatal(err)
 		}
 		got := out.String()
@@ -347,7 +347,7 @@ func TestRPCServeBridgesFrames(t *testing.T) {
 
 	t.Run("refuses when the daemon cannot start", func(t *testing.T) {
 		var out bytes.Buffer
-		err := runSyncRPCServe(ctx, strings.NewReader(""), &out, func() bool { return false }, sock)
+		err := runSyncRPCServe(ctx, strings.NewReader(""), &out, func(context.Context) bool { return false }, sock)
 		if err == nil {
 			t.Fatal("want error when ensure fails")
 		}
@@ -379,14 +379,14 @@ func TestSyncConvergeReportsResult(t *testing.T) {
 	t.Cleanup(func() { cancel(); <-done })
 
 	var out bytes.Buffer
-	if err := runSyncConverge(ctx, &out, func() bool { return true }, sock); err != nil {
+	if err := runSyncConverge(ctx, &out, func(context.Context) bool { return true }, sock); err != nil {
 		t.Fatal(err)
 	}
 	if got := stripANSI(out.String()); !strings.Contains(got, "Converged 3 item(s), 1 deferred busy.") {
 		t.Fatalf("output %q missing the converge result", got)
 	}
 
-	if err := runSyncConverge(ctx, &out, func() bool { return false }, sock); err == nil {
+	if err := runSyncConverge(ctx, &out, func(context.Context) bool { return false }, sock); err == nil {
 		t.Fatal("want error when ensure fails")
 	}
 }

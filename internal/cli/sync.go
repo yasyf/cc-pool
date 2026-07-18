@@ -52,8 +52,8 @@ var synckitdRun = func(ctx context.Context, args ...string) error {
 
 // syncEnsureDaemon reports the daemon reachable, spawning it if needed; a var
 // so tests never spawn a real daemon.
-var syncEnsureDaemon = func() bool {
-	return daemon.NewClient().EnsureRunning(syncDaemonSpawnTimeout)
+var syncEnsureDaemon = func(ctx context.Context) bool {
+	return daemon.NewClient().EnsureRunning(ctx, syncDaemonSpawnTimeout)
 }
 
 func newSyncCmd() *cobra.Command {
@@ -259,16 +259,16 @@ func runSyncStatus(cmd *cobra.Command, m *pool.Manager) error {
 
 // runSyncRPCServe bridges frames between in/out and the daemon's sync socket.
 // out is the framing channel: rpc.Proxy owns it exclusively.
-func runSyncRPCServe(ctx context.Context, in io.Reader, out io.Writer, ensure func() bool, sock string) error {
-	if !ensure() {
+func runSyncRPCServe(ctx context.Context, in io.Reader, out io.Writer, ensure func(context.Context) bool, sock string) error {
+	if !ensure(ctx) {
 		return fmt.Errorf("cc-pool daemon is not reachable and could not be started; check `ccp doctor`")
 	}
 	return rpc.Proxy(ctx, in, out, sock)
 }
 
 // runSyncConverge asks the daemon for one converge pass over the sync socket.
-func runSyncConverge(ctx context.Context, out io.Writer, ensure func() bool, sock string) error {
-	if !ensure() {
+func runSyncConverge(ctx context.Context, out io.Writer, ensure func(context.Context) bool, sock string) error {
+	if !ensure(ctx) {
 		return fmt.Errorf("cc-pool daemon is not reachable and could not be started; check `ccp doctor`")
 	}
 	cl := syncservice.NewClient(syncservice.Socket(sock))

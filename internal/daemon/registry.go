@@ -75,7 +75,7 @@ type maintainer struct {
 // stop when a row returns false, and never begin another row after cancellation.
 func (s *Server) runTable(ctx context.Context, t *tick, table []maintainer) {
 	for _, m := range table {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || s.closing.Load() {
 			return
 		}
 		if m.gate != nil && !m.gate(s) {
@@ -101,7 +101,7 @@ func (s *Server) runDueTable(
 ) time.Time {
 	var next time.Time
 	for _, m := range table {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || s.closing.Load() {
 			return next
 		}
 		rowDue, scheduled := due[m.name]

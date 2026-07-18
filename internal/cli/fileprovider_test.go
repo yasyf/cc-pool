@@ -15,9 +15,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/version"
 )
 
 // scriptFPElections shrinks the settle window to test scale and scripts

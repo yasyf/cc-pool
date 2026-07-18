@@ -15,9 +15,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/version"
 )
 
 // tryEnableFP is fusekit's headless File Provider election (`pluginkit -e use`

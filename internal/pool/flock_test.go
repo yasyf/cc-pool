@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // bumpUnderLock's Gosched widens the read-modify-write window so a missing lock

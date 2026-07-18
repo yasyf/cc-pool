@@ -17,11 +17,11 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/service"
-	"github.com/yasyf/fusekit/version"
 )
 
 func newDoctorCmd() *cobra.Command {
@@ -109,7 +109,7 @@ func newDoctorCmd() *cobra.Command {
 					version:   holderVer,
 				}
 				reportHolder(facts, countFuse(accts), report)
-				reportCaskRelauncher(countFuse(accts), report)
+				reportCaskRelauncher(cmd.Context(), countFuse(accts), report)
 				reportLeases(report)
 				reportCarcasses(accts, report)
 				reportLedgers(accts, ledgers, time.Now(), report)
@@ -214,18 +214,18 @@ const caskRelauncherLabel = "com.yasyf.fusekit-holder"
 // holderRelauncherLoaded reports whether the cask's KeepAlive LaunchAgent is
 // registered with launchd — read-only (`launchctl print`), a test seam so doctor
 // never shells out to launchctl.
-var holderRelauncherLoaded = func() bool {
-	return service.Agent{Label: caskRelauncherLabel}.Loaded()
+var holderRelauncherLoaded = func(ctx context.Context) bool {
+	return service.Agent{Label: caskRelauncherLabel}.Loaded(ctx)
 }
 
 // reportCaskRelauncher verifies (never installs) the fusekit-holder cask's
 // KeepAlive LaunchAgent — the relauncher that respawns the self-retiring holder.
 // Silent with no fuse accounts: the shared holder is not cc-pool's concern then.
-func reportCaskRelauncher(fuseRows int, report func(string, bool, string)) {
+func reportCaskRelauncher(ctx context.Context, fuseRows int, report func(string, bool, string)) {
 	if fuseRows == 0 {
 		return
 	}
-	if holderRelauncherLoaded() {
+	if holderRelauncherLoaded(ctx) {
 		report("cask relauncher", true, "")
 		return
 	}

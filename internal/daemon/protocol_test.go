@@ -11,9 +11,34 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
+// TestServerRejectsIncompatibleProtocol pins that a proto-skewed WORK op is
+// rejected at the proto gate. Lifecycle ops (Health/Shutdown) are dispatched
+// before the gate — TestProtoMismatchedHealthAnswers covers that split.
 func TestServerRejectsIncompatibleProtocol(t *testing.T) {
+	server, client := net.Pipe()
+	defer func() { _ = client.Close() }()
+	s := &Server{}
+	go s.handle(t.Context(), server)
+	if err := json.NewEncoder(client).Encode(Request{Proto: ProtocolVersion - 1, Op: OpStatus}); err != nil {
+		t.Fatal(err)
+	}
+	var resp Response
+	if err := json.NewDecoder(client).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.OK || resp.Proto != ProtocolVersion || !strings.Contains(resp.Error, "unsupported protocol") {
+		t.Fatalf("protocol rejection = %+v", resp)
+	}
+}
+
+// TestProtoMismatchedHealthAnswers pins the health-before-proto-gate reorder:
+// Health IS the takeover probe, so it must answer OK+Version even to a
+// proto-skewed successor — never the proto rejection a work op gets.
+func TestProtoMismatchedHealthAnswers(t *testing.T) {
 	server, client := net.Pipe()
 	defer func() { _ = client.Close() }()
 	s := &Server{}
@@ -25,8 +50,11 @@ func TestServerRejectsIncompatibleProtocol(t *testing.T) {
 	if err := json.NewDecoder(client).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp.OK || resp.Proto != ProtocolVersion || !strings.Contains(resp.Error, "unsupported protocol") {
-		t.Fatalf("protocol rejection = %+v", resp)
+	if !resp.OK || resp.Error != "" {
+		t.Fatalf("proto-skewed health = %+v, want OK", resp)
+	}
+	if resp.Proto != ProtocolVersion || resp.Version != version.String() {
+		t.Fatalf("health reply = %+v, want proto %d and version %q", resp, ProtocolVersion, version.String())
 	}
 }
 

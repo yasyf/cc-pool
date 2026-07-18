@@ -192,7 +192,7 @@ class CcPool < Formula
     # is the identifier-keyed, no-prompt grant. `cc-pool daemon` is the same CLI,
     # invoked through the bundle's main executable.
     run [opt_libexec/"CCPoolDaemon.app/Contents/MacOS/cc-pool", "daemon"]
-    keep_alive true
+    keep_alive successful_exit: false
     run_at_load true
     environment_variables PATH: std_service_path_env
     log_path "#{Dir.home}/.cc-pool/daemon.log"

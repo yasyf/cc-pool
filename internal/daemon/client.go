@@ -41,6 +41,20 @@ func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
 }
 
 func (c *Client) doContext(ctx context.Context, req Request, timeout time.Duration) (*Response, error) {
+	resp, err := c.roundTripContext(ctx, req, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Proto != ProtocolVersion {
+		return nil, fmt.Errorf("%w: daemon=%d client=%d", ErrProtocolMismatch, resp.Proto, ProtocolVersion)
+	}
+	return resp, nil
+}
+
+// roundTripContext performs one daemon request without applying a reply-protocol
+// policy. Only the takeover adapter uses it directly; every public Client path
+// stays on doContext's strict protocol check.
+func (c *Client) roundTripContext(ctx context.Context, req Request, timeout time.Duration) (*Response, error) {
 	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
 	conn, err := dialer.DialContext(ctx, "unix", c.socket)
 	if err != nil {
@@ -70,9 +84,6 @@ func (c *Client) doContext(ctx context.Context, req Request, timeout time.Durati
 			return nil, ctx.Err()
 		}
 		return nil, err
-	}
-	if resp.Proto != ProtocolVersion {
-		return nil, fmt.Errorf("%w: daemon=%d client=%d", ErrProtocolMismatch, resp.Proto, ProtocolVersion)
 	}
 	return &resp, nil
 }

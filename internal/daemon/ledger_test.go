@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 var t0 = time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)

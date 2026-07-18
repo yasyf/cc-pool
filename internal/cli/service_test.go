@@ -16,9 +16,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/version"
 )
 
 func ptr[T any](v T) *T { return &v }
@@ -463,7 +463,7 @@ func TestUninstallSurvivorMount(t *testing.T) {
 // a live one respawns the holder and remounts fuse rows on its next heal tick.
 func TestStopDaemonServiceBrewStopFailureIsFatal(t *testing.T) {
 	swapVar(t, &brewManaged, func() bool { return true })
-	swapVar(t, &brewStop, func() error { return errors.New("brew exploded") })
+	swapVar(t, &brewStop, func(context.Context) error { return errors.New("brew exploded") })
 
 	cmd, out, _ := uninstallCmd()
 	err := stopDaemonService(cmd)

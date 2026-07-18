@@ -10,11 +10,11 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/appgroup"
+	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/daemonkit/appgroup"
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/fileproviderd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/version"
 )
 
 // groupContainerDir resolves the daemon's app-group container through

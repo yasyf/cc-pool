@@ -14,9 +14,9 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit"
 	"github.com/yasyf/fusekit/mountd"
-	"github.com/yasyf/fusekit/version"
 )
 
 // fakeHost reports kernel-truth State: a registered dir reads Live=false in List.

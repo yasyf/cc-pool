@@ -14,7 +14,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/forecast"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/version"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 func readSnapshot(t *testing.T, path string) StatusSnapshot {

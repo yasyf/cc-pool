@@ -12,7 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/version"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 func newSelectCmd() *cobra.Command {
@@ -177,7 +177,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 		// remade. Daemonless, conversions can't run, so local prep is safe.
 		if !req.noDaemon {
 			cl := daemon.NewClient()
-			if cl.EnsureRunning(daemonEnsureTimeout(ctx)) && daemonClientAt(ctx, cl, version.String()) {
+			if cl.EnsureRunning(ctx, daemonEnsureTimeout(ctx)) && daemonClientAt(ctx, cl, version.String()) {
 				if resp, ok := cl.Select(ctx, req.account, req.pid, false, req.cwd, false, req.excludeIDs); ok {
 					if !resp.OK {
 						return nil, errors.New(resp.Error)
@@ -225,7 +225,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 	// status/add/init restarts it.
 	if !req.noDaemon {
 		cl := daemon.NewClient()
-		if cl.EnsureRunning(daemonEnsureTimeout(ctx)) && daemonClientAt(ctx, cl, version.String()) {
+		if cl.EnsureRunning(ctx, daemonEnsureTimeout(ctx)) && daemonClientAt(ctx, cl, version.String()) {
 			// Reserve even pid-0 picks (anti-thundering-herd). --wait sends
 			// NoFallback: the daemon must not commit sticky/reservation side
 			// effects for a pick the client would discard.

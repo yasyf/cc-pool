@@ -10,7 +10,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/state"
 	"github.com/yasyf/synckit/cregistry"
 )

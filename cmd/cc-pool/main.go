@@ -11,7 +11,7 @@ import (
 	"syscall"
 
 	"github.com/yasyf/cc-pool/internal/cli"
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 func main() {

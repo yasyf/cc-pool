@@ -12,7 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/version"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 func TestRenderCredMoves(t *testing.T) {

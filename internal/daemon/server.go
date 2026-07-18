@@ -24,11 +24,13 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/drain"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/content"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/proc"
-	"github.com/yasyf/fusekit/version"
 )
 
 // reservationTTL suppresses re-picking an account until its claude becomes
@@ -105,14 +107,24 @@ type Server struct {
 	// signal is not raised for an unrelated failure. Stored by serveFPBridge.
 	fpBridgeHardErr atomic.Bool
 
-	// triggerShutdown cancels serve's context. Set once before the accept loop
-	// starts; the spawning go-statement's happens-before lets handlers read it
-	// unlocked.
+	// triggerShutdown begins the drain (OpShutdown's over-the-socket trigger,
+	// equivalent to a SIGINT/SIGTERM). Set once before the accept loop starts; the
+	// spawning go-statement's happens-before lets handlers read it unlocked.
 	triggerShutdown context.CancelFunc
 
-	// wg tracks every daemon goroutine; serve Waits on it before Run's deferred
-	// m.Close() closes the database under them.
+	// wg tracks only the background loops (startup, heal, scheduler, heartbeat,
+	// sync mirror, fp.app ensure); serve Waits on it after the drain cancels their
+	// context, before Run's deferred m.Close(). Request handlers settle through
+	// drain, not here.
 	wg sync.WaitGroup
+
+	// drain settles admitted request handlers before the executors they depend on
+	// are cancelled; work ops Admit, OpHealth/OpShutdown bypass. Zero value usable.
+	drain drain.Simple
+
+	// closing (set by drain's MarkClosing after settle) stops runTable/runDueTable
+	// starting a new pass in the teardown window before executors cancel.
+	closing atomic.Bool
 
 	// cl is the account-claim discipline: select reservations plus poll, convert,
 	// and pool-wide claims (see claims.go). It owns its own mutex.
@@ -220,8 +232,9 @@ type Server struct {
 	// syncSvc is the wired host-sync engine (registry, driver, mesh); nil ⇒ host
 	// sync never wired this run. syncSelf is this host's registry origin name.
 	// Both feed authKind's persist-time needs-login classification.
-	syncSvc  *hostsync.Service
-	syncSelf string
+	syncSvc      *hostsync.Service
+	syncSelf     string
+	syncListener net.Listener
 
 	// syncPull runs one converge pull for the invalid_grant self-heal (syncHeal)
 	// and the on-demand preflight pull; nil ⇒ sync disabled.
@@ -325,61 +338,75 @@ func (s *Server) detectAndSetUserAgent(ctx context.Context) {
 func (s *Server) serve(ctx context.Context) error {
 	ln, lock, err := s.listen(ctx)
 	if err != nil {
+		if errors.Is(err, errStepAside) {
+			// Same-or-newer daemon holds the socket: step aside cleanly (exit 0).
+			s.log.Printf("a same-or-newer cc-pool daemon already holds %s; stepping aside", s.socket)
+			return nil
+		}
 		return err
 	}
-	// The flock is the cross-process guarantee that only this daemon may
-	// stale-check, remove, bind, or unlink the socket. It must outlive the
-	// listener, so this defer is registered first (runs last).
+	// The flock guarantees only this daemon may stale-check/remove/bind/unlink the
+	// socket; it must outlive the listener, so this defer runs last.
 	defer func() { _ = lock.Close() }()
-	// *net.UnixListener.Close unlinks the socket by path and is NOT idempotent:
-	// a second Close (the late deferred one) would delete a successor daemon's
-	// freshly-bound socket, so sync.Once pins the unlink to the first close. No
-	// explicit os.Remove, same reason.
+	// *net.UnixListener.Close unlinks by path and is NOT idempotent; sync.Once
+	// pins the unlink to the first close (drain's Deactivate) so a late close
+	// can't delete a successor's socket.
 	var closeOnce sync.Once
-	closeListener := func() { closeOnce.Do(func() { _ = ln.Close() }) }
-	defer closeListener()
+	deactivateListeners := func(context.Context) error {
+		closeOnce.Do(func() { _ = ln.Close() })
+		if s.syncListener != nil {
+			_ = s.syncListener.Close()
+		}
+		return nil
+	}
+	defer func() { _ = deactivateListeners(context.Background()) }()
 
-	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	// stop cancels ctx, so it doubles as the over-the-socket shutdown trigger
-	// (OpShutdown). Set before the accept loop spawns any handler.
-	s.triggerShutdown = stop
+	// drainCtx begins the drain on SIGINT/SIGTERM or OpShutdown (beginDrain, wired
+	// to triggerShutdown); it does NOT cancel the executors.
+	drainCtx, beginDrain := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer beginDrain()
+	s.triggerShutdown = beginDrain
+
+	// execCtx bounds the background loops, decoupled from the signal (WithoutCancel)
+	// so drain settles admitted work before cancelling it — cancelled last by
+	// CancelExecutors.
+	execCtx, cancelExecutors := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelExecutors()
 
 	// Host sync wires before any worker or handler can read its seams (per-call
 	// gated on the sync_enabled meta); a failure leaves this run syncless —
 	// sync must never take down single-host pooling.
-	if err := s.setupSync(ctx); err != nil {
+	if err := s.setupSync(execCtx); err != nil {
 		s.log.Printf("host sync disabled for this run: %v", err)
 	}
 
 	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
 
-	// One startup goroutine, off the accept path so Health answers from the first
-	// instant, runs the ordered startupTable strictly in order, then starts the
-	// loops. See ccn doc 7b7a53f for the ordering constraints.
+	// One startup goroutine, off the accept path so Health answers immediately,
+	// runs startupTable in order then starts the loops. See ccn doc 7b7a53f.
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.runTable(ctx, s.newTick(ctx), startupTable)
-		if ctx.Err() != nil {
+		s.runTable(execCtx, s.newTick(execCtx), startupTable)
+		if execCtx.Err() != nil {
 			return
 		}
 		// The heal loop is only the per-account mount-health net. The Add(1)
 		// runs inside this already-tracked goroutine, so the counter is ≥1 and
 		// cannot race a zero-counter Wait.
 		s.wg.Add(1)
-		go func() { defer s.wg.Done(); s.healFuseRows(ctx) }()
-		s.scheduler(ctx)
+		go func() { defer s.wg.Done(); s.healFuseRows(execCtx) }()
+		s.scheduler(execCtx)
 	}()
 
 	go func() {
-		<-ctx.Done()
-		closeListener()
+		<-drainCtx.Done()
+		_ = deactivateListeners(execCtx)
 	}()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+			if drainCtx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				break
 			}
 			// Back off on a transient accept error (e.g. EMFILE) instead of
@@ -388,10 +415,20 @@ func (s *Server) serve(ctx context.Context) error {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		s.wg.Add(1)
-		go func() { defer s.wg.Done(); s.handle(ctx, conn) }()
+		// Handlers settle through drain (work ops Admit), not s.wg; execCtx keeps
+		// an admitted request's context live through the settle.
+		go s.handle(execCtx, conn)
 	}
 
+	// Settle-before-cancel: stop intake, settle admitted work to terminal
+	// responses, mark the maintenance loops closing, then cancel executors.
+	if err := s.drain.Drain(execCtx, drain.SimpleConfig{
+		Deactivate:      deactivateListeners,
+		MarkClosing:     s.markClosing,
+		CancelExecutors: cancelExecutors,
+	}); err != nil {
+		s.log.Printf("drain: %v", err)
+	}
 	s.wg.Wait()
 	// Deliberately no mount teardown: the detached holder owns the fuse
 	// mirrors, and they must outlive this daemon so live claude sessions keep
@@ -400,53 +437,47 @@ func (s *Server) serve(ctx context.Context) error {
 	return nil
 }
 
-// listen binds the unix socket (0600) under an exclusive flock that makes the
-// stale-check/remove/bind sequence single-entrant across processes: a live
-// same-version peer is refused, a version-skewed one evicted. proc.SingleEntrant
-// owns the sequence; the Evict closure, which speaks the daemon wire, is the only
-// cc-pool-specific policy. See ccn doc 7b7a53f.
+// markClosing is drain's MarkClosing: after admitted work settles it stops
+// runTable/runDueTable starting a new pass, just before executors are cancelled.
+func (s *Server) markClosing() { s.closing.Store(true) }
+
+// errStepAside signals that a same-or-newer daemon already holds the socket, so
+// this successor exits cleanly (0) instead of binding — the newer-wins successor
+// to the old same-version error-exit. It flows out of the Evict closure through
+// SingleEntrant.Listen and is swallowed by serve.
+var errStepAside = errors.New("a same-or-newer cc-pool daemon already holds the socket")
+
+// listen binds the unix socket (0600) under an exclusive flock making the
+// stale-check/remove/bind sequence single-entrant across processes.
+// proc.SingleEntrant owns the sequence; the Evict closure runs daemonkit's
+// newer-wins takeover — a strictly-newer successor evicts the incumbent via the
+// Shutdown->grace->PID-revalidated-SIGKILL ladder, same-or-older steps aside.
+// See ccn doc 7b7a53f.
 func (s *Server) listen(ctx context.Context) (net.Listener, *os.File, error) {
 	return proc.SingleEntrant{
 		Socket:  s.socket,
 		Timeout: s.evictTimeout,
 		Evict: func() (bool, error) {
-			c := &Client{socket: s.socket}
-			resp, err := c.HealthContext(ctx)
+			outcome, err := runTakeover(ctx, daemon.TakeoverConfig{
+				Self:     version.String(),
+				Peer:     &daemonPeer{socket: s.socket},
+				Contract: daemon.RequestDaemon,
+				WaitMode: daemon.SocketRelease,
+				Grace:    s.evictTimeout,
+			})
 			if err != nil {
-				if ctx.Err() != nil {
-					return false, ctx.Err()
-				}
-				return false, nil // no live peer answered
-			}
-			if resp.Version == version.String() {
-				return false, errors.New("another cc-pool daemon at the same version is already running")
-			}
-			if err := s.evictPeer(ctx, c, resp.Version); err != nil {
 				return false, err
 			}
-			return true, nil // evicted (flock-holder polls; flock-less binds)
+			switch outcome {
+			case daemon.Bind:
+				return true, nil // socket clear or incumbent evicted: bind
+			case daemon.ExitSelf:
+				return false, errStepAside // same-or-newer incumbent: exit 0
+			default:
+				return false, fmt.Errorf("unexpected takeover outcome %s", outcome)
+			}
 		},
-	}.Listen()
-}
-
-// evictPeer tells a version-skewed peer daemon to step down (OpShutdown) and
-// waits it out, hard-killing the exact socket peer if it acks but wedges.
-func (s *Server) evictPeer(ctx context.Context, c *Client, ver string) error {
-	s.log.Printf("evicting version-skewed daemon (%s) holding the socket", ver)
-	if _, err := c.doContext(ctx, Request{Op: OpShutdown}, 2*time.Second); err != nil {
-		return fmt.Errorf("evict holder %s: %w", ver, err)
-	}
-	if !c.WaitGone(s.evictTimeout) {
-		// Acked OpShutdown but wedged: kill the exact socket holder so we can
-		// rebind, rather than exiting and leaving launchd to retry against it.
-		if _, err := c.KillSocketPeer(); err != nil {
-			s.log.Printf("kill socket peer: %v", err)
-		}
-		if !c.WaitGone(s.evictTimeout) {
-			return fmt.Errorf("holder %s did not release the socket within %s", ver, s.evictTimeout)
-		}
-	}
-	return nil
+	}.Listen(ctx)
 }
 
 // handle serves one connection. ctx is the daemon's lifecycle context (bounds
@@ -459,10 +490,27 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		writeResp(conn, Response{OK: false, Error: "bad request: " + err.Error()})
 		return
 	}
+	// Lifecycle ops bypass the proto gate and the drain: Health IS the takeover
+	// probe (a draining or proto-skewed daemon must still answer it), Shutdown
+	// must land mid-drain.
+	if req.Op == OpHealth || req.Op == OpShutdown {
+		s.wg.Add(1)
+		defer s.wg.Done()
+		writeResp(conn, s.dispatch(ctx, req))
+		return
+	}
 	if req.Proto != ProtocolVersion {
 		writeResp(conn, Response{OK: false, Error: fmt.Sprintf("unsupported protocol %d; want %d", req.Proto, ProtocolVersion)})
 		return
 	}
+	// Admit the work op to the drain: one in flight when an upgrade begins settles
+	// before executors cancel; a draining daemon refuses new work.
+	done, err := s.drain.Admit()
+	if err != nil {
+		writeResp(conn, Response{OK: false, Error: "daemon draining"})
+		return
+	}
+	defer done()
 	if req.Op == OpMigrate || req.Op == OpCredMove || req.Op == OpFPRepair {
 		// These ops legitimately outlive the 10s deadline (migrate: a probe
 		// mount plus up to an 8s wait and a bounded rollback per account;

@@ -10,9 +10,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/lease"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/proc"
 )
 
 // Refresher is the slice of *oauth.Client the Manager needs.

@@ -3,7 +3,7 @@ package daemon
 import (
 	"time"
 
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // This file owns the daemon self-heal policy substrate: every debounce, backoff,

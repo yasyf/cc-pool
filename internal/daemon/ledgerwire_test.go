@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/fusekit/proc"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 func ledgerHasFaultedFP(rows []LedgerState, dir string) bool {

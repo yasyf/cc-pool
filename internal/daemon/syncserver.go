@@ -2,14 +2,17 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"sync"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
@@ -48,6 +51,78 @@ func (c serverClaims) TryClaim(uuid string) (func(), bool) {
 
 var _ hostsync.Claims = serverClaims{}
 
+type admittedSyncConsumer struct {
+	drain *drain.Simple
+	next  syncservice.SyncConsumer
+}
+
+func (c admittedSyncConsumer) Capabilities(ctx context.Context) (syncservice.Capabilities, error) {
+	done, err := c.drain.Admit()
+	if err != nil {
+		return syncservice.Capabilities{}, err
+	}
+	defer done()
+	return c.next.Capabilities(ctx)
+}
+
+func (c admittedSyncConsumer) List(ctx context.Context) ([]syncservice.WatchItem, error) {
+	done, err := c.drain.Admit()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	return c.next.List(ctx)
+}
+
+func (c admittedSyncConsumer) Reconcile(ctx context.Context, origin string) (syncservice.ReconcileResult, error) {
+	done, err := c.drain.Admit()
+	if err != nil {
+		return syncservice.ReconcileResult{}, err
+	}
+	defer done()
+	return c.next.Reconcile(ctx, origin)
+}
+
+func (c admittedSyncConsumer) Sync(ctx context.Context, origin string) (syncservice.SyncResult, error) {
+	done, err := c.drain.Admit()
+	if err != nil {
+		return syncservice.SyncResult{}, err
+	}
+	defer done()
+	return c.next.Sync(ctx, origin)
+}
+
+func (c admittedSyncConsumer) GetState(ctx context.Context) (syncservice.RawRegistry, error) {
+	done, err := c.drain.Admit()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	return c.next.GetState(ctx)
+}
+
+func admittedSyncHandler(d *drain.Simple, next rpc.Handler) rpc.Handler {
+	return func(ctx context.Context, params map[string]any) (any, error) {
+		done, err := d.Admit()
+		if err != nil {
+			return nil, err
+		}
+		defer done()
+		return next(ctx, params)
+	}
+}
+
+type onceCloseListener struct {
+	net.Listener
+	once sync.Once
+}
+
+func (l *onceCloseListener) Close() error {
+	var err error
+	l.once.Do(func() { err = l.Listener.Close() })
+	return err
+}
+
 // startSyncServer stands up the daemon's second socket — the SyncConsumer
 // contract plus the credential fetch method — on a wg-tracked goroutine, returning
 // once the socket is bound; the broader sync setup wires the rest of the Service.
@@ -55,7 +130,12 @@ func (s *Server) startSyncServer(ctx context.Context, svc *hostsync.Service) err
 	svc.Claims = newServerClaims(s)
 	consumer := hostsync.NewConsumer(svc, s.syncEnabled)
 	fetch := hostsync.NewFetchCredentialHandler(s.m.Store.GetAccountByUUID, s.readCredentialForFetch)
-	return serveSyncSocket(ctx, &s.wg, s.syncSocket, consumer, fetch, s.log)
+	ln, err := serveSyncSocket(ctx, &s.wg, &s.drain, s.syncSocket, consumer, fetch, s.log)
+	if err != nil {
+		return err
+	}
+	s.syncListener = ln
+	return nil
 }
 
 // syncEnabled reports whether host sync is on, from the store's sync_enabled meta.
@@ -79,25 +159,26 @@ func (s *Server) readCredentialForFetch(ctx context.Context, a store.Account) (*
 
 // serveSyncSocket binds sockPath (0600) and serves the sync dispatcher until
 // ctx is done; rpc.Serve owns the listener lifecycle. Returns once bound.
-func serveSyncSocket(ctx context.Context, wg *sync.WaitGroup, sockPath string, consumer syncservice.SyncConsumer, fetch rpc.Handler, logger *log.Logger) error {
+func serveSyncSocket(ctx context.Context, wg *sync.WaitGroup, intake *drain.Simple, sockPath string, consumer syncservice.SyncConsumer, fetch rpc.Handler, logger *log.Logger) (net.Listener, error) {
 	ln, err := rpc.Listen(sockPath)
 	if err != nil {
-		return fmt.Errorf("bind sync socket %s: %w", sockPath, err)
+		return nil, fmt.Errorf("bind sync socket %s: %w", sockPath, err)
 	}
+	guarded := &onceCloseListener{Listener: ln}
 	if err := os.Chmod(sockPath, syncSocketPerm); err != nil {
-		_ = ln.Close()
-		return fmt.Errorf("chmod sync socket %s: %w", sockPath, err)
+		_ = guarded.Close()
+		return nil, fmt.Errorf("chmod sync socket %s: %w", sockPath, err)
 	}
 	d := rpc.NewDispatcher()
-	syncservice.RegisterConsumer(d, consumer)
-	d.Register(hostsync.MethodFetchCredential, fetch)
+	syncservice.RegisterConsumer(d, admittedSyncConsumer{drain: intake, next: consumer})
+	d.Register(hostsync.MethodFetchCredential, admittedSyncHandler(intake, fetch))
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := rpc.Serve(ctx, ln, d); err != nil {
+		if err := rpc.Serve(ctx, guarded, d); err != nil && !errors.Is(err, net.ErrClosed) {
 			logger.Printf("sync socket serve: %v", err)
 		}
 	}()
-	return nil
+	return guarded, nil
 }

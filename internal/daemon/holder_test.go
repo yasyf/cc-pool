@@ -19,9 +19,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/proc"
 )
 
 // TestMain no-ops the widget appex reap for the whole package: no daemon test may
@@ -473,38 +473,17 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 		return socket, &dials
 	}
 
-	t.Run("clean step-down", func(t *testing.T) {
-		guardKillSocketPeer(t)
+	// The takeover speaks only the daemon socket (Health + PeerPID); a dead peer
+	// pid drives the evict ladder to Bind without touching the holder mounts socket.
+	t.Run("clean step-down never touches the mounts socket", func(t *testing.T) {
 		f := newFakeDaemon(t, "0.0.0-old", true)
+		setSocketPeerPID(t, func(string) (int, error) { return 0x7ffffffe, nil })
 		mounts, dials := tattle(t)
 		s := testServer(f.socket, 3*time.Second)
 		s.holderSocket = mounts
 		ln, lock, err := s.listen(t.Context())
 		if err != nil {
 			t.Fatalf("listen should evict the skewed daemon and bind: %v", err)
-		}
-		defer func() { _ = ln.Close() }()
-		defer func() { _ = lock.Close() }()
-		if got := dials.Load(); got != 0 {
-			t.Fatalf("daemon eviction dialed the mounts socket %d time(s)", got)
-		}
-	})
-
-	t.Run("wedged orphan killed", func(t *testing.T) {
-		f := newFakeDaemon(t, "0.0.0-old", false)
-		mounts, dials := tattle(t)
-		setKillSocketPeer(t, func(socket string) (int, error) {
-			if socket != f.socket {
-				t.Errorf("kill aimed at %q, want the daemon socket %q", socket, f.socket)
-			}
-			_ = f.ln.Close() // the "kill" releases the daemon socket
-			return 999001, nil
-		})
-		s := testServer(f.socket, 2*time.Second)
-		s.holderSocket = mounts
-		ln, lock, err := s.listen(t.Context())
-		if err != nil {
-			t.Fatalf("listen should reap the wedged orphan and bind: %v", err)
 		}
 		defer func() { _ = ln.Close() }()
 		defer func() { _ = lock.Close() }()

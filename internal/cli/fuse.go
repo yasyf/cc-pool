@@ -7,9 +7,9 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/fusekit/fuset"
 	"github.com/yasyf/fusekit/mountd"
-	"github.com/yasyf/fusekit/service"
 )
 
 // newFuseCmd groups the fuse-t subcommands. No fuse build tag: cc-pool is
@@ -60,7 +60,7 @@ func runFuseEnable(cmd *cobra.Command) error {
 		step(out, "fusekit-holder already installed.")
 	} else {
 		step(out, "Installing the fusekit-holder cask…")
-		if err := service.InstallCask(mountd.HolderCask, out, errOut); err != nil {
+		if err := service.InstallCask(cmd.Context(), mountd.HolderCask, out, errOut); err != nil {
 			return fmt.Errorf("install fusekit-holder: %w", err)
 		}
 		if _, err := os.Stat(mountd.HolderExe); err != nil {

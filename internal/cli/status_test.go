@@ -18,7 +18,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/version"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)

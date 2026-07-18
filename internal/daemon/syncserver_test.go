@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
@@ -66,8 +68,9 @@ func TestSyncSocketServesConsumer(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
+	var intake drain.Simple
 	t.Cleanup(func() { cancel(); wg.Wait() })
-	if err := serveSyncSocket(ctx, &wg, sock, consumer, fetch, log.New(io.Discard, "", 0)); err != nil {
+	if _, err := serveSyncSocket(ctx, &wg, &intake, sock, consumer, fetch, log.New(io.Discard, "", 0)); err != nil {
 		t.Fatalf("serveSyncSocket: %v", err)
 	}
 
@@ -133,6 +136,124 @@ func TestSyncSocketServesConsumer(t *testing.T) {
 	}
 	if payload := string(legacy.Result); payload != "" && payload != "null" {
 		t.Errorf("v1 fetch carried a result payload: %s", payload)
+	}
+}
+
+// TestSyncSocketDrainsInFlightHandler pins the second socket into the daemon's
+// settle-before-cancel order: Deactivate refuses new dials, an admitted handler
+// keeps Drain blocked with a live context, and its store read finishes before
+// teardown closes the store.
+func TestSyncSocketDrainsInFlightHandler(t *testing.T) {
+	sockDir, err := os.MkdirTemp("/tmp", "ccp-sync-drain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "sync.sock")
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	regDir := t.TempDir()
+	rf := hostsync.RegistryFile{Path: filepath.Join(regDir, "registry.json"), LockPath: filepath.Join(regDir, "registry.lock")}
+	svc := &hostsync.Service{Registry: &rf, StampDir: filepath.Join(regDir, "stamps")}
+	consumer := hostsync.NewConsumer(svc, func() (bool, error) { return true, nil })
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+	})
+	ctxErr := make(chan error, 1)
+	storeErr := make(chan error, 1)
+	fetch := func(ctx context.Context, _ map[string]any) (any, error) {
+		close(entered)
+		<-release
+		ctxErr <- ctx.Err()
+		_, _, err := st.GetMeta("sync-drain-probe")
+		storeErr <- err
+		return map[string]any{"settled": true}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	var intake drain.Simple
+	ln, err := serveSyncSocket(ctx, &wg, &intake, sock, consumer, fetch, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = ln.Close()
+		wg.Wait()
+	})
+
+	tx := syncservice.Socket(sock)
+	defer func() { _ = tx.Close() }()
+	type callResult struct {
+		resp *syncservice.Response
+		err  error
+	}
+	called := make(chan callResult, 1)
+	go func() {
+		resp, err := tx.Do(context.Background(), &rpc.Request{Method: hostsync.MethodFetchCredential})
+		called <- callResult{resp: resp, err: err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sync handler never entered")
+	}
+
+	deactivated := make(chan struct{})
+	drained := make(chan error, 1)
+	go func() {
+		drained <- intake.Drain(ctx, drain.SimpleConfig{
+			Deactivate: func(context.Context) error {
+				err := ln.Close()
+				close(deactivated)
+				return err
+			},
+			MarkClosing:     func() {},
+			CancelExecutors: cancel,
+		})
+	}()
+	<-deactivated
+	if conn, err := net.DialTimeout("unix", sock, 100*time.Millisecond); err == nil {
+		_ = conn.Close()
+		t.Fatal("post-drain sync dial succeeded")
+	}
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain returned before the in-flight sync handler settled: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatalf("sync handler context canceled before settle: %v", ctx.Err())
+	default:
+	}
+
+	close(release)
+	released = true
+	if err := <-ctxErr; err != nil {
+		t.Fatalf("sync handler context canceled before store access: %v", err)
+	}
+	if err := <-storeErr; err != nil {
+		t.Fatalf("sync handler store access raced teardown: %v", err)
+	}
+	result := <-called
+	if result.err != nil || result.resp == nil || !result.resp.OK {
+		t.Fatalf("in-flight sync response: resp=%+v err=%v", result.resp, result.err)
+	}
+	if err := <-drained; err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store after sync settle: %v", err)
 	}
 }
 
