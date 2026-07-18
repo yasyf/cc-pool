@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primitives (the root `fusekit` package). cc-pool keeps only its
   mirror-specific code (the `overlay` provider and the `pool` holder seam), and
   runtime is byte-identical.
+- Daemon takeover now uses newer-wins semantics: only a strictly newer cc-pool
+  evicts an incumbent, same-or-newer processes exit cleanly, and forced
+  termination revalidates the socket owner before sending SIGKILL.
+- Daemon shutdown now settles admitted work, including sync-socket requests,
+  before canceling executors; new work is refused during drain and shutdown
+  acknowledgements are delivered before exit.
+- The cc-pool LaunchAgent now uses KeepAlive with `SuccessfulExit=false`,
+  preventing clean takeover exits from being relaunched while continuing to
+  restart after failures.
+- Development builds now use mtime-ordered versions, so a rebuilt cc-pool
+  daemon can take over an older running daemon while release builds retain
+  their injected version and commit.
 
 ### Added
 - A missing libfuse-t now surfaces as a graceful mount failure instead of
@@ -37,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alarmed. Previously weekly exhaustion never reached the mood, so a pool that
   could not serve default-model work within plan limits still showed a calm
   mascot.
+
+### Fixed
+- Commands that start, stop, inspect, or wait for the daemon now honor
+  cancellation while waiting on daemon startup, launchd, or Homebrew.
 
 ## [0.28.0] - 2026-06-16
 
