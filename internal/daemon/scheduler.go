@@ -117,7 +117,7 @@ func (s *Server) pollOnce(ctx context.Context) {
 }
 
 // pruneStickyRows drops expired sticky-pin rows (hygiene only: StickyPick
-// re-checks the activity rule on read, covering the daemonless path).
+// re-checks the activity rule on reads between scheduler passes).
 func (s *Server) pruneStickyRows() {
 	if _, err := s.m.Store.PruneSticky(time.Now().Add(-pool.StickyTTL)); err != nil {
 		s.log.Printf("prune sticky: %v", err)

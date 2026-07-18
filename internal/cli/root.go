@@ -79,7 +79,7 @@ pool.`,
 		newWidgetCmd(),
 		newDaemonCmd(),
 		newSyncCmd(),
-		newLeaseAgentCmd(),
+		newStoreCutoverCmd(),
 	)
 	return root
 }

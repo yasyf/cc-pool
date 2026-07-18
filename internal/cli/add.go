@@ -301,15 +301,7 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 	}
 
 	if !isTTY() {
-		// Non-interactive: ccp exits after printing, so the synchronous lease above dies
-		// with it. Hand the pending dir's lease to a detached agent tied to the
-		// terminal's session leader BEFORE printing the command, so the printed login
-		// (run from any terminal in this session) never races the holder's teardown.
-		if err := spawnPendingLeaseAgent(pending); err != nil {
-			return fmt.Errorf("couldn't hold the session lease for the new account: %w", err)
-		}
-		step(out, "\nRun this in another terminal, finish the login, then come back (keep THIS terminal open until it's done — its session holds the new account's lease):\n\n    %s\n", pending.LoginCommand)
-		return nil
+		return errors.New("non-interactive add requires --run; detached login lease agents were removed")
 	}
 	step(out, "\nRun this in another terminal, finish the login, then come back:\n\n    %s\n", pending.LoginCommand)
 	if pending.ClaudeJSONSeed == pool.SeedKeptExisting {

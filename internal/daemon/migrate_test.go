@@ -377,7 +377,7 @@ func TestSelectSkipsConvertingAccount(t *testing.T) {
 	if !s.cl.own(1) {
 		t.Fatal("beginConvert failed")
 	}
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect})
 	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 2 {
 		t.Fatalf("select = %+v, want acct-2 while acct-1 converts", resp)
 	}
@@ -389,7 +389,7 @@ func TestSelectSkipsConvertingAccount(t *testing.T) {
 	}
 
 	s.cl.disownConvert(1)
-	resp = s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true})
+	resp = s.handleSelect(t.Context(), Request{Op: OpSelect})
 	if !resp.OK || *resp.SelectedID != 1 {
 		t.Fatalf("select after endConvert = %+v, want acct-1", resp)
 	}
@@ -406,7 +406,7 @@ func TestSelectExcludesUnmountedFuseAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect})
 	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 2 {
 		t.Fatalf("select = %+v, want acct-2 while acct-1's mount is down", resp)
 	}
@@ -1306,7 +1306,7 @@ func TestSelectServesFuseAccountWhenHolderVouches(t *testing.T) {
 	}
 	s.holder.noteMounted(dirs[1])
 
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect})
 	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 {
 		t.Fatalf("select = %+v, want vouched-for acct-1 (the emptier account)", resp)
 	}
@@ -1334,7 +1334,7 @@ func TestSelectColdStartPrimesHolderCacheLazily(t *testing.T) {
 	fuseRowWithCannedHolder(t, s, dirs)
 
 	// The cache is zero-valued — never refreshed — exactly the bind→prime gap.
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect})
 	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 {
 		t.Fatalf("cold-start select = %+v, want lazily-primed acct-1 (the emptier account)", resp)
 	}
@@ -1343,7 +1343,7 @@ func TestSelectColdStartPrimesHolderCacheLazily(t *testing.T) {
 	s2, dirs2, _ := newMigrateServer(t)
 	fuseRowWithCannedHolder(t, s2, dirs2)
 	one := 1
-	resp = s2.handleSelect(t.Context(), Request{Op: OpSelect, Account: &one, NoMark: true})
+	resp = s2.handleSelect(t.Context(), Request{Op: OpSelect, Account: &one})
 	if !resp.OK || resp.Dir != dirs2[1] {
 		t.Fatalf("cold-start forced select = %+v, want acct-1's dir", resp)
 	}

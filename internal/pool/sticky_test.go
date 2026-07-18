@@ -3,7 +3,9 @@ package pool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +13,12 @@ import (
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 )
+
+var poolTestToken atomic.Uint64
+
+func nextPoolTestToken() string {
+	return fmt.Sprintf("%032x", poolTestToken.Add(1))
+}
 
 func openTestManager(t *testing.T) *Manager {
 	t.Helper()
@@ -26,15 +34,56 @@ func openTestManager(t *testing.T) *Manager {
 // (claude pids only) can never reap them.
 func seedSessionFor(t *testing.T, m *Manager, accountID int, cwd string, started time.Time, ended *time.Time) {
 	t.Helper()
-	id, err := m.Store.OpenSession(accountID, 0, "dir", cwd, started)
-	if err != nil {
+	if _, err := m.Store.GetAccount(accountID); errors.Is(err, store.ErrAccountNotFound) {
+		if err := m.Store.UpsertAccount(store.Account{
+			ID: accountID, ConfigDir: AccountDir(accountID),
+			KeychainService: fmt.Sprintf("svc-%d", accountID), KeychainAccount: "user",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	} else if err != nil {
 		t.Fatal(err)
 	}
+	pid := 900000 + accountID*1000 + int(started.UnixNano()%997)
+	id := activatePoolTestSession(t, m, accountID, pid, cwd, started)
 	if ended != nil {
 		if err := m.Store.CloseSession(id, *ended); err != nil {
 			t.Fatal(err)
 		}
 	}
+}
+
+func activatePoolTestSession(t *testing.T, m *Manager, accountID, pid int, cwd string, started time.Time) int64 {
+	t.Helper()
+	started = started.Truncate(time.Microsecond)
+	a, err := m.Store.GetAccount(accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.ActivateSelection(store.SelectionActivation{
+		Token:     nextPoolTestToken(),
+		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
+		Process: store.ProcessIdentity{PID: pid, StartedAt: started},
+		Cwd:     cwd, At: started,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, session := range mustPoolSessions(t, m) {
+		if session.PID == pid && session.ProcessStartedAt.Equal(started) && session.Cwd == cwd {
+			return session.ID
+		}
+	}
+	t.Fatal("activated session was not stored")
+	return 0
+}
+
+func mustPoolSessions(t *testing.T, m *Manager) []store.Session {
+	t.Helper()
+	sessions, err := m.Store.ListActiveSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sessions
 }
 
 // seedSession seeds on account 2, the pinned account in most fixtures.
@@ -384,7 +433,7 @@ func TestPinAPI(t *testing.T) {
 func TestClassifyDegradesOnStoreError(t *testing.T) {
 	m := openTestManager(t)
 	_ = m.Store.Close() // force GetCwdActivity to fail
-	now := time.Now()
+	now := time.Now().Truncate(time.Microsecond)
 	ps := m.classify(store.Sticky{Cwd: "/proj", AccountID: 1, SelectedAt: now.Add(-10 * time.Minute)}, now)
 	if ps.live || ps.warm {
 		t.Fatalf("degraded read must carry no session signals: %+v", ps)
@@ -403,7 +452,7 @@ func TestClassifyDegradesOnStoreError(t *testing.T) {
 // finds ZERO claude processes (a nil slice), the state after the last exit.
 func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 	ctx := context.Background()
-	now := time.Now()
+	now := time.Now().Truncate(time.Microsecond)
 
 	setup := func(t *testing.T, scan func(context.Context) ([]procscan.Session, error)) *Manager {
 		t.Helper()
@@ -428,10 +477,8 @@ func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 		if err := m.Store.UpsertSticky("/proj", 2, now.Add(-3*time.Hour)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := m.Store.OpenSession(2, 4000000, "dir", "/proj", now.Add(-3*time.Hour)); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := m.Store.CloseDeadSessions(map[int]bool{4000000: true}, now.Add(-10*time.Minute)); err != nil {
+		activatePoolTestSession(t, m, 2, 4000000, "/proj", now.Add(-3*time.Hour))
+		if _, err := m.Store.CloseDeadSessions(map[int]time.Time{4000000: now.Add(-3 * time.Hour)}, now.Add(-10*time.Minute)); err != nil {
 			t.Fatal(err)
 		}
 		return m
@@ -470,9 +517,7 @@ func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 		m := setup(t, func(context.Context) ([]procscan.Session, error) { return nil, nil })
 		// A just-marked checkout (ccp run pre-exec) looks dead to a claude-only
 		// scan; the grace keeps it alive.
-		if _, err := m.Store.OpenSession(1, 4000001, "dir", "/other", now); err != nil {
-			t.Fatal(err)
-		}
+		activatePoolTestSession(t, m, 1, 4000001, "/other", now)
 		if _, err := m.Select(ctx, SelectOptions{Cwd: "/proj"}); err != nil {
 			t.Fatal(err)
 		}
@@ -485,7 +530,7 @@ func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
 
 // TestSelectHonorsSticky pins the slot-in location (after Rank, before Pick):
 // a fresh sticky record overrides the emptier-account ranking, an expired one
-// does not, and the winner is always (re)recorded.
+// does not. Pure scoring never records a new pin.
 func TestSelectHonorsSticky(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
@@ -521,7 +566,7 @@ func TestSelectHonorsSticky(t *testing.T) {
 		}
 	})
 
-	t.Run("expired sticky falls through and is overwritten", func(t *testing.T) {
+	t.Run("expired sticky falls through and is removed", func(t *testing.T) {
 		m := setup(t)
 		if err := m.Store.UpsertSticky("/proj", 2, now.Add(-2*time.Hour)); err != nil {
 			t.Fatal(err)
@@ -534,8 +579,8 @@ func TestSelectHonorsSticky(t *testing.T) {
 			t.Fatalf("got acct %d sticky=%v, want non-sticky acct 1 (emptier)", sr.Best.ID, sr.Sticky)
 		}
 		st, ok, err := m.Store.GetSticky("/proj")
-		if err != nil || !ok || st.AccountID != 1 {
-			t.Fatalf("winner not recorded: %+v ok=%v err=%v", st, ok, err)
+		if err != nil || ok {
+			t.Fatalf("expired sticky survived pure scoring: %+v ok=%v err=%v", st, ok, err)
 		}
 	})
 
@@ -546,7 +591,15 @@ func TestSelectHonorsSticky(t *testing.T) {
 		if err := m.Store.UpsertSticky("/proj", 2, now); err != nil {
 			t.Fatal(err)
 		}
-		seedSession(t, m, "/proj", now.Add(-10*time.Minute), nil)
+		started := now.Add(-10 * time.Minute).Truncate(time.Microsecond)
+		seedSession(t, m, "/proj", started, nil)
+		account, _ := m.Store.GetAccount(2)
+		live := mustPoolSessions(t, m)[0]
+		oldScan := scanSessions
+		scanSessions = func(context.Context) ([]procscan.Session, error) {
+			return []procscan.Session{{PID: live.PID, ConfigDir: account.ConfigDir, StartedAt: live.ProcessStartedAt}}, nil
+		}
+		t.Cleanup(func() { scanSessions = oldScan })
 		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj"})
 		if err != nil {
 			t.Fatal(err)
@@ -591,24 +644,9 @@ func TestSelectHonorsSticky(t *testing.T) {
 		}
 	})
 
-	t.Run("marking opens a session row with cwd", func(t *testing.T) {
+	t.Run("scoring has no activation effects", func(t *testing.T) {
 		m := setup(t)
-		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj", PID: 4242})
-		if err != nil {
-			t.Fatal(err)
-		}
-		live, err := m.Store.ListActiveSessions()
-		if err != nil || len(live) != 1 {
-			t.Fatalf("sessions = %+v err=%v", live, err)
-		}
-		if live[0].PID != 4242 || live[0].Cwd != "/proj" || live[0].AccountID != sr.Best.ID {
-			t.Fatalf("session row = %+v", live[0])
-		}
-	})
-
-	t.Run("deferred selection has no effects until commit", func(t *testing.T) {
-		m := setup(t)
-		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj", PID: 4242, DeferCommit: true, ExcludeIDs: []int{2}})
+		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj", ExcludeIDs: []int{2}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -620,15 +658,6 @@ func TestSelectHonorsSticky(t *testing.T) {
 		}
 		if _, ok, _ := m.Store.GetSticky("/proj"); ok {
 			t.Fatal("provisional selection recorded sticky state")
-		}
-		if err := m.CommitSelection(sr, "/proj", 4242); err != nil {
-			t.Fatal(err)
-		}
-		if live, _ := m.Store.ListActiveSessions(); len(live) != 1 || live[0].AccountID != 1 {
-			t.Fatalf("committed sessions = %+v, want acct-1", live)
-		}
-		if sticky, ok, _ := m.Store.GetSticky("/proj"); !ok || sticky.AccountID != 1 {
-			t.Fatalf("committed sticky = %+v ok=%v, want acct-1", sticky, ok)
 		}
 	})
 

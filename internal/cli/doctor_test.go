@@ -262,7 +262,7 @@ func TestReportHolderWedges(t *testing.T) {
 
 // TestReportLeasesSilentWhenHolderUnreachable pins the leases panel's fail-quiet:
 // with no holder on the socket it emits nothing (reportHolder owns that failure),
-// so a daemonless doctor run never blocks on a dead holder.
+// so a standalone doctor run never blocks on a dead holder.
 func TestReportLeasesSilentWhenHolderUnreachable(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

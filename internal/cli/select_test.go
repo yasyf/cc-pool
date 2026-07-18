@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -14,38 +13,12 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
-
-type fakeLeaseCleanup struct {
-	stops int
-}
-
-func (f *fakeLeaseCleanup) Stop() error {
-	f.stops++
-	return nil
-}
-
-func TestCommitSelectionWithLeaseStopsNewAgentOnCommitFailure(t *testing.T) {
-	agent := &fakeLeaseCleanup{}
-	swapVar(t, &spawnLeaseAgent, func(store.Account) (leaseAgentCleanup, error) { return agent, nil })
-	want := errors.New("persist selection")
-	selection := &selectionTxn{
-		acct:   store.Account{ID: 1, Label: "work@example.com"},
-		commit: func(context.Context) error { return want },
-		abort:  func() {},
-	}
-	err := commitSelectionWithLease(context.Background(), selection)
-	if !errors.Is(err, want) || agent.stops != 1 {
-		t.Fatalf("err=%v stops=%d, want commit error and one stop", err, agent.stops)
-	}
-}
 
 func TestAbortDaemonSelectionOutlivesCallerCancellation(t *testing.T) {
 	home, err := os.MkdirTemp("/tmp", "ccp-home")
@@ -88,113 +61,6 @@ func TestAbortDaemonSelectionOutlivesCallerCancellation(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("abort request was not sent after caller cancellation")
-	}
-}
-
-type contextBlockingOverlay struct {
-	started chan struct{}
-}
-
-func (f *contextBlockingOverlay) Backend() fkoverlay.Backend                  { return fkoverlay.BackendSymlink }
-func (f *contextBlockingOverlay) PrivateRoot(dir string) string               { return dir }
-func (f *contextBlockingOverlay) Check(context.Context, string, string) error { return nil }
-func (f *contextBlockingOverlay) Teardown(context.Context, string, string) (string, error) {
-	return "", nil
-}
-
-func (f *contextBlockingOverlay) Reconcile(ctx context.Context, _, _ string) error {
-	close(f.started)
-	<-ctx.Done()
-	return ctx.Err()
-}
-
-func TestResolveSelectionBoundsOverlayReconcileByLaunchContext(t *testing.T) {
-	st := openTestStore(t)
-	id := 1
-	a := store.Account{ID: id, ConfigDir: filepath.Join(t.TempDir(), "acct-01"), OverlayKind: string(fkoverlay.BackendSymlink)}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
-	provider := &contextBlockingOverlay{started: make(chan struct{})}
-	m := &pool.Manager{Store: st, OverlayFor: func(fkoverlay.Backend) (fkoverlay.Provider, error) { return provider, nil }}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
-	defer cancel()
-	cmd := &cobra.Command{}
-	cmd.SetContext(context.Background())
-
-	_, err := resolveSelectionTxn(ctx, cmd, m, selectReq{account: &id, noDaemon: true})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("resolveSelectionTxn err = %v, want launch deadline", err)
-	}
-	select {
-	case <-provider.started:
-	default:
-		t.Fatal("context-aware overlay sync was not called")
-	}
-}
-
-type countingOverlay struct {
-	reconciles int
-}
-
-func (f *countingOverlay) Backend() fkoverlay.Backend    { return fkoverlay.BackendSymlink }
-func (f *countingOverlay) PrivateRoot(dir string) string { return dir }
-func (f *countingOverlay) Reconcile(context.Context, string, string) error {
-	f.reconciles++
-	return nil
-}
-func (f *countingOverlay) Check(context.Context, string, string) error { return nil }
-func (f *countingOverlay) Teardown(context.Context, string, string) (string, error) {
-	return "", nil
-}
-
-func TestPrepareDaemonSelectionSkipsLocalReconcile(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	st := openTestStore(t)
-	a := store.Account{
-		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct-01"), OverlayKind: string(fkoverlay.BackendSymlink),
-		KeychainService: "missing", KeychainAccount: "missing",
-	}
-	if err := os.MkdirAll(a.ConfigDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"theme":"shared"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	privatePath := filepath.Join(a.ConfigDir, ".claude.json")
-	private := []byte(`{"oauthAccount":{"accountUuid":"private"}}`)
-	if err := os.WriteFile(privatePath, private, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
-	provider := &countingOverlay{}
-	m := &pool.Manager{
-		Store: st, Creds: credstest.NewFake(), LockDir: t.TempDir(),
-		OverlayFor: func(fkoverlay.Backend) (fkoverlay.Provider, error) { return provider, nil },
-	}
-	cmd := &cobra.Command{}
-	cmd.SetOut(io.Discard)
-	cmd.SetErr(io.Discard)
-
-	dir, err := prepareAccount(t.Context(), cmd, m, a, false)
-	if err != nil {
-		t.Fatalf("prepareAccount(daemon-prepared) = %v", err)
-	}
-	if dir != a.ConfigDir {
-		t.Fatalf("dir = %q, want %q", dir, a.ConfigDir)
-	}
-	if provider.reconciles != 0 {
-		t.Fatalf("local Reconcile calls = %d, want 0 after daemon catch-up", provider.reconciles)
-	}
-	got, err := os.ReadFile(privatePath) //nolint:gosec // G304: test-owned path under t.TempDir.
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, private) {
-		t.Fatalf("daemon-prepared launch rewrote private config: got %s, want %s", got, private)
 	}
 }
 
@@ -317,27 +183,6 @@ func exhaustedPoolManager(t *testing.T) *pool.Manager {
 	return &pool.Manager{Store: st, Creds: credstest.NewFake(), LockDir: t.TempDir()}
 }
 
-// Pins the billing warning at its call site: removing warnExhaustedFallback fails this.
-func TestResolveSelectionWarnsOnExhaustedFallback(t *testing.T) {
-	m := exhaustedPoolManager(t)
-	var stderr bytes.Buffer
-	cmd := &cobra.Command{}
-	cmd.SetErr(&stderr)
-	cmd.SetContext(context.Background())
-
-	_, dir, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, cwd: "/proj"})
-	if err != nil || dir == "" {
-		t.Fatalf("fallback selection must succeed: dir=%q err=%v", dir, err)
-	}
-	out := stripANSI(stderr.String())
-	if !strings.Contains(out, "WILL bill extra-usage credits") {
-		t.Fatalf("billing warning missing from stderr: %q", out)
-	}
-	if !strings.Contains(out, "resets at") {
-		t.Fatalf("warning must name the recovery time: %q", out)
-	}
-}
-
 // The bypass notice is loud only when a held pin was actually bypassed.
 func TestWarnPinHeld(t *testing.T) {
 	m := exhaustedPoolManager(t)
@@ -366,165 +211,6 @@ func TestWarnPinHeld(t *testing.T) {
 			}
 			if !strings.Contains(out, tc.want) || !strings.Contains(out, "pin kept") {
 				t.Fatalf("notice malformed: %q", out)
-			}
-		})
-	}
-}
-
-// Pins the bypass notice at its call site: removing warnPinHeld fails this.
-func TestResolveSelectionWarnsOnHeldManualPin(t *testing.T) {
-	m := exhaustedPoolManager(t)
-	now := time.Now()
-	// Heal acct-1 so selection bypasses the pin on still-pegged acct-2.
-	if err := m.Store.InsertUsageSample(store.UsageSample{
-		AccountID: 1, TS: now.Add(time.Second), Util5h: 10, Util7d: 10,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.Store.PinManual("/proj", 2, now); err != nil {
-		t.Fatal(err)
-	}
-
-	var stderr bytes.Buffer
-	cmd := &cobra.Command{}
-	cmd.SetErr(&stderr)
-	cmd.SetContext(context.Background())
-	_, dir, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, cwd: "/proj"})
-	if err != nil || dir == "" {
-		t.Fatalf("selection must succeed: dir=%q err=%v", dir, err)
-	}
-	out := stripANSI(stderr.String())
-	if !strings.Contains(out, "manual pin to") || !strings.Contains(out, "pin kept") {
-		t.Fatalf("bypass notice missing from stderr: %q", out)
-	}
-	st, ok, _ := m.Store.GetSticky("/proj")
-	if !ok || st.AccountID != 2 || !st.Manual {
-		t.Fatalf("manual pin lost on bypass: %+v ok=%v", st, ok)
-	}
-
-	// Negative: a pin on the least-bad fallback pick is honored in effect — no notice.
-	m2 := exhaustedPoolManager(t)
-	if err := m2.Store.PinManual("/proj", 2, now); err != nil {
-		t.Fatal(err)
-	}
-	var stderr2 bytes.Buffer
-	cmd2 := &cobra.Command{}
-	cmd2.SetErr(&stderr2)
-	cmd2.SetContext(context.Background())
-	if _, _, _, err := resolveSelection(cmd2, m2, selectReq{noDaemon: true, cwd: "/proj"}); err != nil {
-		t.Fatal(err)
-	}
-	if out := stripANSI(stderr2.String()); strings.Contains(out, "manual pin to") {
-		t.Fatalf("honored-in-effect pin must not warn: %q", out)
-	}
-}
-
-// --wait over an all-exhausted pool waits instead of accepting the fallback pick.
-func TestResolveSelectionWaitRefusesExhaustedFallback(t *testing.T) {
-	m := exhaustedPoolManager(t)
-	var stderr bytes.Buffer
-	cmd := &cobra.Command{}
-	cmd.SetErr(&stderr)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // pre-cancelled: selection must stop before scoring
-	cmd.SetContext(ctx)
-
-	_, _, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, wait: true, cwd: "/proj"})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("wait must block until cancelled, got %v", err)
-	}
-	out := stripANSI(stderr.String())
-	if strings.Contains(out, "WILL bill") {
-		t.Fatalf("--wait must never accept (or warn about) a billing fallback: %q", out)
-	}
-}
-
-// TestWarnPreflight pins prepareAccount's non-fatal warn copy: needs-login and
-// unrefreshable get their operator guidance (naming `ccp login <id>`), any
-// other error passes through verbatim.
-func TestWarnPreflight(t *testing.T) {
-	a := store.Account{
-		ID: 7, ConfigDir: t.TempDir(), Label: "work@example.com",
-		KeychainService: "svc-warn-preflight", KeychainAccount: "user",
-	}
-	m := &pool.Manager{Creds: credstest.NewFake(), LockDir: t.TempDir()}
-	_, _, absentErr := m.EnsureFreshToken(context.Background(), a, pool.RefreshLeadTime, true)
-	if !errors.Is(absentErr, pool.ErrNeedsLogin) || !errors.Is(absentErr, creds.ErrNotFound) {
-		t.Fatalf("absent credential error = %v, want ErrNeedsLogin and creds.ErrNotFound", absentErr)
-	}
-	opaque := errors.New("preflight refresh: dial tcp: connection refused")
-	cases := map[string]struct {
-		err  error
-		want []string
-	}{
-		"needs-login names the login command": {
-			err:  pool.ErrNeedsLogin,
-			want: []string{"needs to log in again", "ccp login 7"},
-		},
-		"absent credential names the login command": {
-			err:  absentErr,
-			want: []string{"needs to log in again", "ccp login 7"},
-		},
-		"unrefreshable names the origin and the local login": {
-			err:  pool.ErrUnrefreshable,
-			want: []string{"synced copy it can't refresh", "the origin rotates it", "ccp login 7"},
-		},
-		"other errors pass through verbatim": {
-			err:  opaque,
-			want: []string{opaque.Error()},
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			var stderr bytes.Buffer
-			warnPreflight(&stderr, a, tc.err)
-			out := stripANSI(stderr.String())
-			for _, want := range tc.want {
-				if !strings.Contains(out, want) {
-					t.Errorf("warn = %q, want it to contain %q", out, want)
-				}
-			}
-			if errors.Is(tc.err, pool.ErrUnrefreshable) && strings.Contains(out, "needs to log in again") {
-				t.Errorf("unrefreshable must not use the needs-login copy: %q", out)
-			}
-		})
-	}
-}
-
-// Pins the settings merge on both no-daemon arms: removing mergeLaunchSettings
-// in prepareAccount fails both.
-func TestResolveSelectionMergesBaseSettings(t *testing.T) {
-	cases := map[string]func(id int) selectReq{
-		"forced arm": func(id int) selectReq { return selectReq{noDaemon: true, account: &id, cwd: "/proj"} },
-		"live arm":   func(int) selectReq { return selectReq{noDaemon: true, cwd: "/proj"} },
-	}
-	for name, mkReq := range cases {
-		t.Run(name, func(t *testing.T) {
-			m := exhaustedPoolManager(t) // sets HOME; accounts are symlink-kind
-			marker := []byte(`{"mergeMarker": "yes"}`)
-			//nolint:gosec // G703: HOME is the test's own t.TempDir(), not external input
-			if err := os.WriteFile(filepath.Join(os.Getenv("HOME"), ".claude.json"), marker, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			var stderr bytes.Buffer
-			cmd := &cobra.Command{}
-			cmd.SetErr(&stderr)
-			cmd.SetContext(context.Background())
-
-			_, dir, _, err := resolveSelection(cmd, m, mkReq(1))
-			if err != nil || dir == "" {
-				t.Fatalf("selection must succeed: dir=%q err=%v", dir, err)
-			}
-			b, err := os.ReadFile(filepath.Join(dir, ".claude.json")) //nolint:gosec // G304: path is a cc-pool-managed/test-owned file, not external input
-			if err != nil {
-				t.Fatalf("account .claude.json missing after launch merge: %v", err)
-			}
-			var got map[string]any
-			if err := json.Unmarshal(b, &got); err != nil {
-				t.Fatalf("merged file unparseable: %v", err)
-			}
-			if got["mergeMarker"] != "yes" {
-				t.Fatalf("base marker did not reach the account file: %v", got)
 			}
 		})
 	}
@@ -561,6 +247,10 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	account, err := st.GetAccount(id)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)
@@ -582,7 +272,8 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 			if req.Op == daemon.OpSelect {
 				resp.SelectedID = &id
 				resp.Dir = dir
-				resp.ReservationToken = "test-reservation"
+				resp.AccountInstanceID = account.InstanceID
+				resp.AccountGeneration = account.Generation
 			}
 			_ = json.NewEncoder(conn).Encode(resp)
 			_ = conn.Close()
@@ -679,6 +370,53 @@ func TestResolveSelectionMountsNotReadyError(t *testing.T) {
 	}
 }
 
+func TestResolveSelectionRejectsDaemonBuildSkewWithoutLocalFallback(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "ccp-home")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("unix", pool.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req daemon.Request
+			if err := json.NewDecoder(conn).Decode(&req); err == nil {
+				_ = json.NewEncoder(conn).Encode(daemon.Response{
+					Proto: daemon.ProtocolVersion, OK: true, Version: "incompatible-build",
+				})
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	m := selectTestManager(t)
+	cmd := &cobra.Command{}
+	cmd.SetContext(t.Context())
+	_, _, _, err = resolveSelection(cmd, m, selectReq{cwd: "/project"})
+	if err == nil || !strings.Contains(err.Error(), "require exact daemon version") {
+		t.Fatalf("resolveSelection with daemon build skew = %v", err)
+	}
+	if sessions, listErr := m.Store.ListActiveSessions(); listErr != nil || len(sessions) != 0 {
+		t.Fatalf("build-skewed selection fell back locally: sessions=%+v err=%v", sessions, listErr)
+	}
+	if _, ok, stickyErr := m.Store.GetSticky("/project"); stickyErr != nil || ok {
+		t.Fatalf("build-skewed selection wrote local sticky state: ok=%v err=%v", ok, stickyErr)
+	}
+}
+
 func TestValidateDaemonSelection(t *testing.T) {
 	st := openTestStore(t)
 	a := store.Account{
@@ -694,6 +432,8 @@ func TestValidateDaemonSelection(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	a, _ = st.GetAccount(a.ID)
+	b, _ = st.GetAccount(b.ID)
 	m := &pool.Manager{Store: st}
 	zero, unknown := 0, 999
 	cases := []struct {
@@ -740,13 +480,19 @@ func TestValidateDaemonSelection(t *testing.T) {
 			wantError: []string{"id 6", "forced account 5", "expected dir \"" + a.ConfigDir + "\"", "returned dir \"" + b.ConfigDir + "\""},
 		},
 		{
-			name:   "exact automatic match succeeds",
-			resp:   daemon.Response{SelectedID: &a.ID, Dir: a.ConfigDir},
+			name: "exact automatic match succeeds",
+			resp: daemon.Response{
+				SelectedID: &a.ID, Dir: a.ConfigDir, AccountInstanceID: a.InstanceID,
+				AccountGeneration: a.Generation,
+			},
 			wantID: a.ID,
 		},
 		{
-			name:   "exact forced match succeeds",
-			resp:   daemon.Response{SelectedID: &a.ID, Dir: a.ConfigDir},
+			name: "exact forced match succeeds",
+			resp: daemon.Response{
+				SelectedID: &a.ID, Dir: a.ConfigDir, AccountInstanceID: a.InstanceID,
+				AccountGeneration: a.Generation,
+			},
 			forced: &a,
 			wantID: a.ID,
 		},

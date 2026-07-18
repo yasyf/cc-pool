@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/store"
 )
 
 // ErrDaemonUnavailable means the daemon socket could not be reached.
@@ -90,14 +91,21 @@ func (c *Client) roundTripContext(ctx context.Context, req Request, timeout time
 
 // Select asks the daemon for a provisional account selection. cwd keys
 // best-effort session stickiness (empty disables); noFallback rejects a
-// least-bad exhausted pick; ok=false means fall back to a live, daemonless
-// selection. A successful response must be committed or aborted by token.
-func (c *Client) Select(ctx context.Context, account *int, pid int, noMark bool, cwd string, noFallback bool, excludeIDs []int) (resp *Response, ok bool) {
-	r, err := c.doContext(ctx, Request{Op: OpSelect, Account: account, PID: pid, NoMark: noMark, Cwd: cwd, NoFallback: noFallback, ExcludeIDs: excludeIDs}, 13*time.Second)
-	if err != nil {
-		return nil, false
+// least-bad exhausted pick. PID 0 is an inspect-only request; PID > 0 returns
+// a launch reservation that must be committed or aborted by token.
+func (c *Client) Select(ctx context.Context, account *int, process store.ProcessIdentity, cwd string, noFallback bool, excludeIDs []int) (*Response, error) {
+	var processStartedAt int64
+	if !process.StartedAt.IsZero() {
+		processStartedAt = process.StartedAt.UnixMicro()
 	}
-	return r, true
+	r, err := c.doContext(ctx, Request{
+		Op: OpSelect, Account: account, PID: process.PID, ProcessStartedAt: processStartedAt,
+		Cwd: cwd, NoFallback: noFallback, ExcludeIDs: excludeIDs,
+	}, 13*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // CommitSelection consumes a provisional selection and records its session and
@@ -160,12 +168,6 @@ func (c *Client) Status() (*Response, error) {
 // StatusContext asks the daemon for all account statuses within ctx's deadline.
 func (c *Client) StatusContext(ctx context.Context) (*Response, error) {
 	return c.doContext(ctx, Request{Op: OpStatus}, 5*time.Second)
-}
-
-// Checkin releases account's checkout for pid. Account identity prevents a
-// replayed or reused pid from ending another account's session.
-func (c *Client) Checkin(ctx context.Context, accountID, pid int) (*Response, error) {
-	return c.doContext(ctx, Request{Op: OpCheckin, Account: &accountID, PID: pid}, 3*time.Second)
 }
 
 // Health probes the daemon.

@@ -34,27 +34,54 @@ var errAccountConverting = errors.New("account is converting overlays")
 // that follows (the mutex is never held across a move, mount, or teardown). This
 // preserves the exact convention the state used as Server fields under s.mu.
 type claims struct {
-	mu           sync.Mutex
-	reservations map[string]reservation
-	pending      map[string]reservation
-	converting   map[int]bool // accountID -> overlay conversion in flight
-	polling      map[int]bool // accountID -> scheduler/reconcile owns the dir this iteration
-	changed      chan struct{}
+	mu         sync.Mutex
+	selections map[string]*selectionReservation
+	converting map[int]bool // accountID -> overlay conversion in flight
+	polling    map[int]bool // accountID -> scheduler/reconcile owns the dir this iteration
+	changed    chan struct{}
+	now        func() time.Time
 }
 
 type reservation struct {
-	accountID int
-	createdAt time.Time
+	accountID         int
+	accountInstanceID string
+	accountGeneration uint64
+	createdAt         time.Time
+}
+
+type selectionLaunch struct {
+	pid              int
+	processStartedAt time.Time
+	cwd              string
+	recordSticky     bool
+}
+
+type selectionState uint8
+
+const (
+	selectionPending selectionState = iota
+	selectionCommitting
+	selectionTerminal
+)
+
+type selectionReservation struct {
+	reservation
+	launch     selectionLaunch
+	expiresAt  time.Time
+	state      selectionState
+	done       chan struct{}
+	response   Response
+	terminalAt time.Time
 }
 
 // newClaims builds an empty claims store.
 func newClaims() *claims {
 	return &claims{
-		reservations: map[string]reservation{},
-		pending:      map[string]reservation{},
-		converting:   map[int]bool{},
-		polling:      map[int]bool{},
-		changed:      make(chan struct{}),
+		selections: map[string]*selectionReservation{},
+		converting: map[int]bool{},
+		polling:    map[int]bool{},
+		changed:    make(chan struct{}),
+		now:        time.Now,
 	}
 }
 
@@ -62,89 +89,185 @@ func newClaims() *claims {
 // overlay conversion holds it (it is about to remake the dir a launching claude
 // would land in).
 func (c *claims) reserve(id int) bool {
-	token, err := c.beginReservation(id)
-	if err != nil {
-		return false
-	}
-	_, ok := c.commitReservation(token)
-	return ok
+	_, err := c.beginSelection(
+		store.Account{ID: id, InstanceID: fmt.Sprintf("test-%d", id), Generation: 1},
+		selectionLaunch{}, reservationTTL,
+	)
+	return err == nil
 }
 
-func (c *claims) beginReservation(id int) (string, error) {
+func (c *claims) beginSelection(account store.Account, launch selectionLaunch, ttl time.Duration) (string, error) {
+	if ttl <= 0 {
+		return "", errors.New("reserve account: positive ttl is required")
+	}
+	if launch.pid > 0 && launch.processStartedAt.IsZero() {
+		return "", errors.New("reserve account: process start time is required")
+	}
+	if launch.pid <= 0 && !launch.processStartedAt.IsZero() {
+		return "", errors.New("reserve account: process start time requires a pid")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.converting[id] {
+	now := c.now()
+	c.pruneSelectionsLocked(now)
+	if c.converting[account.ID] {
 		return "", errAccountConverting
+	}
+	if account.ID <= 0 || account.InstanceID == "" || account.Generation == 0 {
+		return "", errors.New("reserve account: complete account identity is required")
 	}
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", fmt.Errorf("generate reservation token: %w", err)
 	}
 	token := hex.EncodeToString(raw[:])
-	c.pending[token] = reservation{accountID: id, createdAt: time.Now()}
+	c.selections[token] = &selectionReservation{
+		reservation: reservation{
+			accountID: account.ID, accountInstanceID: account.InstanceID,
+			accountGeneration: account.Generation, createdAt: now,
+		},
+		launch: launch, expiresAt: now.Add(ttl), state: selectionPending,
+	}
+	c.notifyChangedLocked()
 	return token, nil
 }
 
-func (c *claims) commitReservation(token string) (int, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now()
-	r, ok := c.liveReservation(token, now)
-	if !ok {
-		return 0, false
+func (c *claims) commitSelection(ctx context.Context, token string, activate func(string, reservation, selectionLaunch) Response) Response {
+	for {
+		c.mu.Lock()
+		c.pruneSelectionsLocked(c.now())
+		selection, ok := c.selections[token]
+		if !ok {
+			c.mu.Unlock()
+			return Response{OK: false, Error: "selection reservation is unknown or expired"}
+		}
+		switch selection.state {
+		case selectionTerminal:
+			resp := selection.response
+			c.mu.Unlock()
+			return resp
+		case selectionCommitting:
+			done := selection.done
+			c.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return Response{OK: false, Error: ctx.Err().Error()}
+			case <-done:
+			}
+			continue
+		case selectionPending:
+			selection.state = selectionCommitting
+			selection.done = make(chan struct{})
+			reserved := selection.reservation
+			launch := selection.launch
+			c.mu.Unlock()
+
+			resp := activate(token, reserved, launch)
+			c.mu.Lock()
+			selection.state = selectionTerminal
+			selection.response = resp
+			selection.terminalAt = c.now()
+			close(selection.done)
+			c.notifyChangedLocked()
+			c.mu.Unlock()
+			return resp
+		default:
+			c.mu.Unlock()
+			panic("unknown selection reservation state")
+		}
 	}
-	delete(c.pending, token)
-	r.createdAt = now
-	c.reservations[token] = r
-	return r.accountID, true
 }
 
-func (c *claims) releaseCommittedReservation(token string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	_, ok := c.reservations[token]
-	delete(c.reservations, token)
-	return ok
+func (c *claims) abortSelection(ctx context.Context, token string) Response {
+	for {
+		c.mu.Lock()
+		c.pruneSelectionsLocked(c.now())
+		selection, ok := c.selections[token]
+		if !ok {
+			c.mu.Unlock()
+			return Response{OK: true}
+		}
+		if selection.state == selectionTerminal {
+			c.mu.Unlock()
+			return Response{OK: true}
+		}
+		if selection.state == selectionCommitting {
+			done := selection.done
+			c.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return Response{OK: false, Error: ctx.Err().Error()}
+			case <-done:
+			}
+			continue
+		}
+		delete(c.selections, token)
+		c.notifyChangedLocked()
+		c.mu.Unlock()
+		return Response{OK: true}
+	}
 }
 
 func (c *claims) abortReservation(token string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, ok := c.liveReservation(token, time.Now())
-	delete(c.pending, token)
+	c.pruneSelectionsLocked(c.now())
+	selection, ok := c.selections[token]
+	if !ok || selection.state != selectionPending {
+		return false
+	}
+	delete(c.selections, token)
+	c.notifyChangedLocked()
+	return true
+}
+
+func (c *claims) pruneSelections(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pruneSelectionsLocked(now)
+}
+
+func (c *claims) knowsSelection(token string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pruneSelectionsLocked(c.now())
+	_, ok := c.selections[token]
 	return ok
 }
 
-func (c *claims) liveReservation(token string, now time.Time) (reservation, bool) {
-	r, ok := c.pending[token]
-	if !ok || now.Sub(r.createdAt) > provisionalSelectionTTL {
-		delete(c.pending, token)
-		return reservation{}, false
+func (c *claims) pruneSelectionsLocked(now time.Time) {
+	changed := false
+	for token, selection := range c.selections {
+		switch selection.state {
+		case selectionPending:
+			if now.After(selection.expiresAt) {
+				delete(c.selections, token)
+				changed = true
+			}
+		case selectionTerminal:
+			if now.Sub(selection.terminalAt) > provisionalSelectionTTL {
+				delete(c.selections, token)
+			}
+		}
 	}
-	return r, true
+	if changed {
+		c.notifyChangedLocked()
+	}
+}
+
+func (c *claims) beginReservation(account store.Account) (string, error) {
+	return c.beginSelection(account, selectionLaunch{}, provisionalSelectionTTL)
 }
 
 // reservedCount returns the number of live reservations for an account.
 func (c *claims) reservedCount(id int) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	now := time.Now()
+	now := c.now()
 	count := 0
-	for token, r := range c.pending {
-		if now.Sub(r.createdAt) > provisionalSelectionTTL {
-			delete(c.pending, token)
-			continue
-		}
-		if r.accountID == id {
-			count++
-		}
-	}
-	for token, r := range c.reservations {
-		if now.Sub(r.createdAt) > reservationTTL {
-			delete(c.reservations, token)
-			continue
-		}
-		if r.accountID == id {
+	c.pruneSelectionsLocked(now)
+	for _, selection := range c.selections {
+		if selection.state != selectionTerminal && selection.accountID == id {
 			count++
 		}
 	}
@@ -210,7 +333,7 @@ func (c *claims) disownHold(id int) {
 func (c *claims) own(id int) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.reservedLocked(id, time.Now()) {
+	if c.reservedLocked(id, c.now()) {
 		return false
 	}
 	if c.converting[id] || c.polling[id] {
@@ -232,7 +355,7 @@ func (c *claims) own(id int) bool {
 func (c *claims) ownHeld(id int) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.reservedLocked(id, time.Now()) {
+	if c.reservedLocked(id, c.now()) {
 		return false
 	}
 	if c.converting[id] {
@@ -246,23 +369,11 @@ func (c *claims) ownHeld(id int) bool {
 }
 
 func (c *claims) reservedLocked(id int, now time.Time) bool {
-	for token, r := range c.pending {
-		if now.Sub(r.createdAt) > provisionalSelectionTTL {
-			delete(c.pending, token)
-			continue
-		}
-		if r.accountID == id {
+	c.pruneSelectionsLocked(now)
+	for _, selection := range c.selections {
+		if selection.state != selectionTerminal && selection.accountID == id {
 			return true
 		}
-	}
-	for token, r := range c.reservations {
-		if now.Sub(r.createdAt) <= reservationTTL {
-			if r.accountID == id {
-				return true
-			}
-			continue
-		}
-		delete(c.reservations, token)
 	}
 	return false
 }

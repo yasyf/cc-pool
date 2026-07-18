@@ -22,7 +22,7 @@ const ProtocolVersion = 2
 type Op string
 
 const (
-	// OpSelect picks the best account; optionally marks a checkout.
+	// OpSelect prepares an inspection for PID 0 or reserves a tracked launch for PID > 0.
 	OpSelect Op = "select"
 	// OpSelectCommit commits a provisional selection immediately before launch.
 	OpSelectCommit Op = "select-commit"
@@ -30,8 +30,6 @@ const (
 	OpSelectAbort Op = "select-abort"
 	// OpStatus returns scored status for all accounts.
 	OpStatus Op = "status"
-	// OpCheckin releases a checkout and adopts a rotated token.
-	OpCheckin Op = "checkin"
 	// OpHealth is the liveness + version probe.
 	OpHealth Op = "health"
 	// OpShutdown steps down gracefully and releases the socket.
@@ -48,12 +46,12 @@ const (
 
 // Request is one client request (one JSON object per line).
 type Request struct {
-	Proto   int    `json:"proto"`
-	Op      Op     `json:"op"`
-	Account *int   `json:"account,omitempty"` // force a select account / identify a checkin account
-	PID     int    `json:"pid,omitempty"`     // launching pid (select checkout / checkin)
-	NoMark  bool   `json:"no_mark,omitempty"` // select without recording a checkout
-	Cwd     string `json:"cwd,omitempty"`     // caller's working directory, keys select stickiness
+	Proto            int    `json:"proto"`
+	Op               Op     `json:"op"`
+	Account          *int   `json:"account,omitempty"`            // force a select account / identify a checkin account
+	PID              int    `json:"pid,omitempty"`                // launching pid for select activation
+	ProcessStartedAt int64  `json:"process_started_at,omitempty"` // launching pid start time, Unix microseconds
+	Cwd              string `json:"cwd,omitempty"`                // caller's working directory, keys select stickiness
 	// NoFallback: report none-available instead of a least-bad exhausted pick;
 	// no provisional selection is created when no account can serve.
 	NoFallback bool `json:"no_fallback,omitempty"`
@@ -277,16 +275,18 @@ func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 
 // Response is one server reply (one JSON object per line).
 type Response struct {
-	Proto            int     `json:"proto"`
-	OK               bool    `json:"ok"`
-	Error            string  `json:"error,omitempty"`
-	Dir              string  `json:"dir,omitempty"` // select: chosen config dir
-	SelectedID       *int    `json:"selected_id,omitempty"`
-	ReservationToken string  `json:"reservation_token,omitempty"`
-	Sticky           bool    `json:"sticky,omitempty"`       // select honored a sticky record
-	Remaining5h      float64 `json:"remaining_5h,omitempty"` // select: raw 5h remaining (100−used) of the pick
-	Remaining7d      float64 `json:"remaining_7d,omitempty"` // select: raw 7d remaining (100−used) of the pick
-	HasUsage         bool    `json:"has_usage,omitempty"`    // select: false when the pick has no known-good sample (never sampled, or only 429 placeholders)
+	Proto             int     `json:"proto"`
+	OK                bool    `json:"ok"`
+	Error             string  `json:"error,omitempty"`
+	Dir               string  `json:"dir,omitempty"` // select: chosen config dir
+	SelectedID        *int    `json:"selected_id,omitempty"`
+	ReservationToken  string  `json:"reservation_token,omitempty"`
+	AccountInstanceID string  `json:"account_instance_id,omitempty"`
+	AccountGeneration uint64  `json:"account_generation,omitempty"`
+	Sticky            bool    `json:"sticky,omitempty"`       // select honored a sticky record
+	Remaining5h       float64 `json:"remaining_5h,omitempty"` // select: raw 5h remaining (100−used) of the pick
+	Remaining7d       float64 `json:"remaining_7d,omitempty"` // select: raw 7d remaining (100−used) of the pick
+	HasUsage          bool    `json:"has_usage,omitempty"`    // select: false when the pick has no known-good sample (never sampled, or only 429 placeholders)
 	// ExhaustedFallback: every account was exhausted and the pick is the
 	// least-bad one — the client must warn that it bills credits or rate-limits.
 	ExhaustedFallback bool `json:"exhausted_fallback,omitempty"`

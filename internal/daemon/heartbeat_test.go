@@ -74,9 +74,7 @@ func TestHeartbeatStartupReapQueuesIdleAdoption(t *testing.T) {
 		adoptions++
 		return nil
 	}
-	if _, err := s.m.Store.OpenSession(1, 4242, dir, "", time.Now().Add(-2*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
+	activateDaemonTestSession(t, s, 1, 4242, "", time.Now().Add(-2*time.Minute))
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
 	delta := s.heartbeatFor().refresh(t.Context(), 0)
 	if !containsString(delta.idle, dir) {
@@ -88,58 +86,6 @@ func TestHeartbeatStartupReapQueuesIdleAdoption(t *testing.T) {
 	}
 	if adoptions != 1 {
 		t.Fatal("startup missed-exit did not attempt adoption after reaping the durable row")
-	}
-}
-
-func TestCheckinScanFailureDoesNotAdoptFromRetainedSnapshot(t *testing.T) {
-	s, dirs := newTestServer(t)
-	dir := dirs[1]
-	if _, err := s.m.Store.OpenSession(1, 4242, dir, "", time.Now().Add(-2*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	h := s.heartbeatFor()
-	adoptions := 0
-	s.adoptRotated = func(context.Context, store.Account) error { adoptions++; return nil }
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: dir}}, nil
-	}
-	if delta := h.refresh(t.Context(), 0); !delta.success {
-		t.Fatal("initial heartbeat failed")
-	}
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, errors.New("scan failed") }
-	accountID := 1
-	resp := s.handleCheckin(t.Context(), Request{Account: &accountID, PID: 4242})
-	if !resp.OK {
-		t.Fatalf("handleCheckin = %+v", resp)
-	}
-	s.handleHeartbeatDelta(t.Context(), h.refresh(t.Context(), 0))
-	if adoptions != 0 {
-		t.Fatal("checkin adopted from retained heartbeat state after a failed fresh scan")
-	}
-}
-
-func TestCheckinAdoptsAfterFreshIdleScanWithoutObservedActiveEdge(t *testing.T) {
-	s, dirs := newTestServer(t)
-	dir := dirs[1]
-	if _, err := s.m.Store.OpenSession(1, 4242, dir, "", time.Now().Add(-2*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	adoptions := 0
-	s.adoptRotated = func(context.Context, store.Account) error {
-		adoptions++
-		return nil
-	}
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
-
-	accountID := 1
-	resp := s.handleCheckin(t.Context(), Request{Account: &accountID, PID: 4242})
-	if !resp.OK {
-		t.Fatalf("handleCheckin = %+v", resp)
-	}
-	delta := s.heartbeatFor().refresh(t.Context(), 0)
-	s.handleHeartbeatDelta(t.Context(), delta)
-	if adoptions != 1 {
-		t.Fatalf("adoptions = %d, want 1 after the fresh idle heartbeat", adoptions)
 	}
 }
 
@@ -167,7 +113,11 @@ func TestIdleAdoptionFencesNewReservations(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("adoption did not start")
 	}
-	if _, err := s.cl.beginReservation(1); !errors.Is(err, errAccountConverting) {
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.cl.beginReservation(a); !errors.Is(err, errAccountConverting) {
 		t.Fatalf("beginReservation during adoption = %v, want errAccountConverting", err)
 	}
 	close(release)

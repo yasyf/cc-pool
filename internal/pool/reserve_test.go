@@ -243,7 +243,7 @@ func TestManagerTeardownPropagatesContext(t *testing.T) {
 		{
 			name: "remove",
 			run: func(ctx context.Context, m *Manager) error {
-				a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", OverlayKind: string(fkoverlay.BackendSymlink)}
+				a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user", OverlayKind: string(fkoverlay.BackendSymlink)}
 				if err := m.Store.UpsertAccount(a); err != nil {
 					return err
 				}

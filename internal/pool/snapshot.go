@@ -66,7 +66,7 @@ type Snapshot struct {
 }
 
 // Snapshots returns a scored view of every account. When live is true, stale
-// usage is sampled synchronously first (the no-daemon path).
+// usage is sampled synchronously first for a live status view.
 func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration) ([]Snapshot, error) {
 	accts, err := m.Store.ListAccounts()
 	if err != nil {

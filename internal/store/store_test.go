@@ -2,10 +2,19 @@ package store
 
 import (
 	"database/sql"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+var storeTestToken atomic.Uint64
+
+func nextStoreTestToken() string {
+	return fmt.Sprintf("%032x", storeTestToken.Add(1))
+}
 
 func openTest(t *testing.T) *Store {
 	t.Helper()
@@ -17,7 +26,29 @@ func openTest(t *testing.T) *Store {
 	return s
 }
 
-func TestOpenMigratesAuthHealthGeneration(t *testing.T) {
+func activateTestSession(t *testing.T, s *Store, accountID, pid int, cwd string, started time.Time) int64 {
+	t.Helper()
+	started = started.Truncate(time.Microsecond)
+	a, err := s.GetAccount(accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ActivateSelection(SelectionActivation{
+		Token:     nextStoreTestToken(),
+		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
+		Process: ProcessIdentity{PID: pid, StartedAt: started},
+		Cwd:     cwd, At: started,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	if err := s.db.QueryRow(`SELECT id FROM sessions ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestOpenRejectsOldSchemaWithoutMutation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -32,24 +63,68 @@ func TestOpenMigratesAuthHealthGeneration(t *testing.T) {
 	)`); err != nil {
 		t.Fatal(err)
 	}
+	before, err := schemaHash(db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	s, err := Open(path)
+	if _, err := Open(path); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("Open old schema = %v, want ErrSchemaMismatch", err)
+	}
+	db, err = sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = s.Close() })
-	if _, err := s.SetNeedsLogin(1, time.Unix(1_000_000, 0), "revoked", AuthKindOwned); err != nil {
-		t.Fatal(err)
-	}
-	h, err := s.GetAuthHealth(1)
+	defer func() { _ = db.Close() }()
+	after, err := schemaHash(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Gen != 1 {
-		t.Fatalf("generation after migrating and flagging = %d, want 1", h.Gen)
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if after != before || version != 0 {
+		t.Fatalf("Open mutated rejected schema: hash %s -> %s, version=%d", before, after, version)
+	}
+}
+
+func TestOpenCreatesOnlyACompletelyEmptyVersionZeroDatabase(t *testing.T) {
+	for name, setup := range map[string]string{
+		"version only":  `PRAGMA user_version=1`,
+		"schema object": `CREATE VIEW unexpected AS SELECT 1`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "test.db")
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(setup); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(path); !errors.Is(err, ErrSchemaMismatch) {
+				t.Fatalf("Open incompatible empty database = %v, want ErrSchemaMismatch", err)
+			}
+			db, err = sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+			var accounts int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE name='accounts'`).Scan(&accounts); err != nil {
+				t.Fatal(err)
+			}
+			if accounts != 0 {
+				t.Fatal("Open installed the current schema before rejecting the database")
+			}
+		})
 	}
 }
 
@@ -77,6 +152,213 @@ func TestAccountCRUD(t *testing.T) {
 	all, _ := s.ListAccounts()
 	if len(all) != 1 {
 		t.Fatalf("len = %d", len(all))
+	}
+}
+
+func TestAccountInstanceIdentityIsImmutableAndGenerationTracksTenantShape(t *testing.T) {
+	s := openTest(t)
+	a := Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc-1", KeychainAccount: "acct-1", OverlayKind: "symlink"}
+	if err := s.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.InstanceID) != 32 || first.Generation != 1 {
+		t.Fatalf("initial identity = %q/%d", first.InstanceID, first.Generation)
+	}
+
+	a.InstanceID = "ffffffffffffffffffffffffffffffff"
+	a.Generation = 99
+	a.Label = "renamed"
+	a.KeychainService = "svc-2"
+	if err := s.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	metadataOnly, _ := s.GetAccount(1)
+	if metadataOnly.InstanceID != first.InstanceID || metadataOnly.Generation != 1 {
+		t.Fatalf("metadata update changed identity = %q/%d, want %q/1", metadataOnly.InstanceID, metadataOnly.Generation, first.InstanceID)
+	}
+
+	a.ConfigDir = "/acct-01-replaced"
+	if err := s.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	reshaped, _ := s.GetAccount(1)
+	if reshaped.InstanceID != first.InstanceID || reshaped.Generation != 2 {
+		t.Fatalf("config-dir replacement identity = %q/%d, want %q/2", reshaped.InstanceID, reshaped.Generation, first.InstanceID)
+	}
+	if err := s.SetAccountOverlayKind(1, "fileprovider"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAccountOverlayKind(1, "fileprovider"); err != nil {
+		t.Fatal(err)
+	}
+	final, _ := s.GetAccount(1)
+	if final.InstanceID != first.InstanceID || final.Generation != 3 {
+		t.Fatalf("overlay replacement identity = %q/%d, want %q/3", final.InstanceID, final.Generation, first.InstanceID)
+	}
+
+	if err := s.UpsertAccount(Account{ID: 2, ConfigDir: "/acct-02", KeychainService: "svc-2", KeychainAccount: "acct-2"}); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := s.GetAccount(2)
+	if second.InstanceID == first.InstanceID {
+		t.Fatalf("two accounts share instance id %q", first.InstanceID)
+	}
+}
+
+func TestActivateSelectionRejectsGenerationChangeAtomically(t *testing.T) {
+	s := openTest(t)
+	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct", OverlayKind: "symlink"}); err != nil {
+		t.Fatal(err)
+	}
+	reserved, _ := s.GetAccount(1)
+	if err := s.SetAccountOverlayKind(1, "fileprovider"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.ActivateSelection(SelectionActivation{
+		Token:     nextStoreTestToken(),
+		AccountID: 1, ExpectedInstanceID: reserved.InstanceID, ExpectedGeneration: reserved.Generation,
+		Process: ProcessIdentity{PID: 4242, StartedAt: time.Now().Add(-time.Minute)},
+		Cwd:     "/project", RecordSticky: true,
+	})
+	if !errors.Is(err, ErrAccountGenerationChanged) {
+		t.Fatalf("ActivateSelection after generation change = %v, want ErrAccountGenerationChanged", err)
+	}
+	if sessions, err := s.ListActiveSessions(); err != nil || len(sessions) != 0 {
+		t.Fatalf("sessions after rejected activation = %+v, err=%v", sessions, err)
+	}
+	if _, ok, err := s.GetSticky("/project"); err != nil || ok {
+		t.Fatalf("sticky after rejected activation: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSelectionTerminalReplayAndExpiry(t *testing.T) {
+	s := openTest(t)
+	now := time.Unix(1_700_000_000, 0)
+	s.now = func() time.Time { return now }
+	if err := s.UpsertAccount(Account{
+		ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.GetAccount(1)
+	activation := SelectionActivation{
+		Token: "00000000000000000000000000000001", AccountID: 1,
+		ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
+		Process: ProcessIdentity{PID: 4242, StartedAt: now.Add(-time.Minute)}, At: now,
+	}
+	if err := s.ActivateSelection(activation); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ActivateSelection(activation); err != nil {
+		t.Fatalf("idempotent activation replay: %v", err)
+	}
+	if got := tableCount(t, s, "sessions"); got != 1 {
+		t.Fatalf("replayed activation sessions = %d, want 1", got)
+	}
+	if committed, err := s.SelectionCommitted(activation.Token); err != nil || !committed {
+		t.Fatalf("SelectionCommitted = %v, %v", committed, err)
+	}
+	now = now.Add(selectionTerminalTTL + time.Second)
+	if committed, err := s.SelectionCommitted(activation.Token); err != nil || committed {
+		t.Fatalf("expired SelectionCommitted = %v, %v", committed, err)
+	}
+	if got := tableCount(t, s, "selection_terminals"); got != 0 {
+		t.Fatalf("expired selection terminals = %d, want 0", got)
+	}
+}
+
+func TestSelectionTerminalRetentionIsDeterministicallyBounded(t *testing.T) {
+	s := openTest(t)
+	now := time.Unix(1_700_000_000, 0)
+	s.now = func() time.Time { return now }
+	if err := s.UpsertAccount(Account{
+		ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.GetAccount(1)
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= selectionTerminalLimit+3; i++ {
+		if _, err := tx.Exec(
+			`INSERT INTO selection_terminals(token,account_id,account_instance_id,account_generation,committed_at,expires_at) VALUES(?,?,?,?,?,?)`,
+			fmt.Sprintf("%032x", i), a.ID, a.InstanceID, a.Generation, now.Unix(), now.Add(selectionTerminalTTL).Unix(),
+		); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	latest := fmt.Sprintf("%032x", selectionTerminalLimit+3)
+	if committed, err := s.SelectionCommitted(latest); err != nil || !committed {
+		t.Fatalf("latest terminal = %v, %v", committed, err)
+	}
+	if got := tableCount(t, s, "selection_terminals"); got != selectionTerminalLimit {
+		t.Fatalf("bounded selection terminals = %d, want %d", got, selectionTerminalLimit)
+	}
+	if committed, err := s.SelectionCommitted(fmt.Sprintf("%032x", 1)); err != nil || committed {
+		t.Fatalf("oldest pruned terminal = %v, %v", committed, err)
+	}
+}
+
+func TestSelectionTerminalRejectsMalformedToken(t *testing.T) {
+	s := openTest(t)
+	for _, token := range []string{"", "abcd", "0000000000000000000000000000000g", "ABCDEFABCDEFABCDEFABCDEFABCDEFAB"} {
+		t.Run(token, func(t *testing.T) {
+			if _, err := s.SelectionCommitted(token); err == nil {
+				t.Fatal("SelectionCommitted accepted malformed token")
+			}
+			if err := s.ActivateSelection(SelectionActivation{Token: token}); err == nil {
+				t.Fatal("ActivateSelection accepted malformed token")
+			}
+		})
+	}
+}
+
+func TestCurrentSchemaRejectsInvalidIdentityRows(t *testing.T) {
+	s := openTest(t)
+	validInstance := "0123456789abcdef0123456789abcdef"
+	accountInsert := `INSERT INTO accounts(id,instance_id,generation,config_dir,keychain_service,keychain_account,created_at) VALUES(?,?,?,?,?,?,?)`
+	for name, args := range map[string][]any{
+		"zero id":           {0, validInstance, 1, "/acct", "svc", "user", 1},
+		"empty instance":    {1, "", 1, "/acct", "svc", "user", 1},
+		"zero generation":   {1, validInstance, 0, "/acct", "svc", "user", 1},
+		"empty config":      {1, validInstance, 1, "", "svc", "user", 1},
+		"empty service":     {1, validInstance, 1, "/acct", "", "user", 1},
+		"empty key account": {1, validInstance, 1, "/acct", "svc", "", 1},
+	} {
+		t.Run("account "+name, func(t *testing.T) {
+			if _, err := s.db.Exec(accountInsert, args...); err == nil {
+				t.Fatal("invalid account row was accepted")
+			}
+		})
+	}
+	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "/acct", KeychainService: "svc", KeychainAccount: "user"}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.GetAccount(1)
+	sessionInsert := `INSERT INTO sessions(account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at) VALUES(?,?,?,?,?,?,?,?)`
+	for name, args := range map[string][]any{
+		"null pid":        {1, a.InstanceID, 1, nil, 1, "/acct", "", 1},
+		"zero pid":        {1, a.InstanceID, 1, 0, 1, "/acct", "", 1},
+		"zero start":      {1, a.InstanceID, 1, 1, 0, "/acct", "", 1},
+		"empty config":    {1, a.InstanceID, 1, 1, 1, "", "", 1},
+		"zero instance":   {1, "", 1, 1, 1, "/acct", "", 1},
+		"zero generation": {1, a.InstanceID, 0, 1, 1, "/acct", "", 1},
+	} {
+		t.Run("session "+name, func(t *testing.T) {
+			if _, err := s.db.Exec(sessionInsert, args...); err == nil {
+				t.Fatal("invalid session row was accepted")
+			}
+		})
 	}
 }
 
@@ -403,19 +685,23 @@ func TestSessionsReconcile(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	started := now.Add(-2 * SessionReapGrace)
 	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
-	id1, _ := s.OpenSession(1, 111, "b", "/proj", started)
-	_, _ = s.OpenSession(1, 222, "b", "/proj", started)
-	_, _ = s.OpenSession(1, 333, "b", "/proj", now) // fresh: inside the reap grace
-	if n, _ := s.ActiveSessionCount(1); n != 3 {
-		t.Fatalf("active = %d, want 3", n)
+	id1 := activateTestSession(t, s, 1, 111, "/proj", started)
+	activateTestSession(t, s, 1, 222, "/proj", started)
+	activateTestSession(t, s, 1, 444, "/proj", started)
+	activateTestSession(t, s, 1, 333, "/proj", now) // fresh: inside the reap grace
+	if n, _ := s.ActiveSessionCount(1); n != 4 {
+		t.Fatalf("active = %d, want 4", n)
 	}
 	live, err := s.ListActiveSessions()
-	if err != nil || len(live) != 3 || live[0].Cwd != "/proj" {
+	if err != nil || len(live) != 4 || live[0].Cwd != "/proj" {
 		t.Fatalf("active sessions = %+v err=%v", live, err)
 	}
-	closed, err := s.CloseDeadSessions(map[int]bool{222: true}, now)
-	if err != nil || closed != 1 {
-		t.Fatalf("closed = %d err=%v", closed, err)
+	closed, err := s.CloseDeadSessions(map[int]time.Time{
+		222: started,
+		444: started.Add(time.Second), // same PID, different kernel generation
+	}, now)
+	if err != nil || closed != 2 {
+		t.Fatalf("closed = %d err=%v, want dead PID and reused PID", closed, err)
 	}
 	if n, _ := s.ActiveSessionCount(1); n != 2 {
 		t.Fatalf("active after reconcile = %d, want 2", n)
@@ -433,7 +719,7 @@ func TestSessionsReconcile(t *testing.T) {
 	}
 }
 
-func TestCommitSelectionAtomic(t *testing.T) {
+func TestActivateSelectionAtomic(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
 	if _, err := s.db.Exec(`
@@ -444,9 +730,18 @@ func TestCommitSelectionAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := s.CommitSelection(1, 4242, "/acct-01", "/proj", now, true)
+	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.GetAccount(1)
+	err := s.ActivateSelection(SelectionActivation{
+		AccountID: 1, ExpectedInstanceID: a.InstanceID,
+		Token:              nextStoreTestToken(),
+		ExpectedGeneration: a.Generation, Process: ProcessIdentity{PID: 4242, StartedAt: now},
+		Cwd: "/proj", RecordSticky: true, At: now,
+	})
 	if err == nil {
-		t.Fatal("CommitSelection succeeded with failing session insert")
+		t.Fatal("ActivateSelection succeeded with failing session insert")
 	}
 	if _, ok, getErr := s.GetSticky("/proj"); getErr != nil {
 		t.Fatal(getErr)
@@ -460,10 +755,18 @@ func TestCommitSelectionAtomic(t *testing.T) {
 	}
 }
 
-func TestCommitSelectionConditionalEffects(t *testing.T) {
+func TestActivateSelectionConditionalEffects(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
-	if err := s.CommitSelection(1, 4242, "/acct-01", "/proj", now, false); err != nil {
+	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.GetAccount(1)
+	if err := s.ActivateSelection(SelectionActivation{
+		AccountID: 1, ExpectedInstanceID: a.InstanceID,
+		Token: nextStoreTestToken(), ExpectedGeneration: a.Generation,
+		Process: ProcessIdentity{PID: 4242, StartedAt: now}, At: now,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, err := s.GetSticky("/proj"); err != nil {
@@ -477,22 +780,6 @@ func TestCommitSelectionConditionalEffects(t *testing.T) {
 	}
 	if len(sessions) != 1 || sessions[0].PID != 4242 {
 		t.Fatalf("sessions = %+v, want pid 4242", sessions)
-	}
-
-	if err := s.CommitSelection(1, 0, "", "/sticky-only", now, true); err != nil {
-		t.Fatal(err)
-	}
-	if sticky, ok, err := s.GetSticky("/sticky-only"); err != nil {
-		t.Fatal(err)
-	} else if !ok || sticky.AccountID != 1 {
-		t.Fatalf("sticky = %+v ok=%v, want account 1", sticky, ok)
-	}
-	sessions, err = s.ListActiveSessions()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(sessions) != 1 {
-		t.Fatalf("sticky-only commit opened a session: %+v", sessions)
 	}
 }
 
@@ -511,13 +798,13 @@ func TestCloseDeadSessionsEndsAtLastSeen(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
 	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
-	_, _ = s.OpenSession(1, 555, "b", "/proj", now.Add(-5*time.Hour))
+	activateTestSession(t, s, 1, 555, "/proj", now.Add(-5*time.Hour))
 
 	// A reconcile 4h ago saw the pid alive; the process then died unobserved.
-	if _, err := s.CloseDeadSessions(map[int]bool{555: true}, now.Add(-4*time.Hour)); err != nil {
+	if _, err := s.CloseDeadSessions(map[int]time.Time{555: now.Add(-5 * time.Hour)}, now.Add(-4*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	closed, err := s.CloseDeadSessions(map[int]bool{}, now)
+	closed, err := s.CloseDeadSessions(map[int]time.Time{}, now)
 	if err != nil || closed != 1 {
 		t.Fatalf("closed = %d err=%v", closed, err)
 	}
@@ -531,23 +818,42 @@ func TestCloseDeadSessionsEndsAtLastSeen(t *testing.T) {
 	}
 }
 
+func TestCloseDeadSessionsRejectsReusedPIDIdentity(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().Truncate(time.Microsecond)
+	started := now.Add(-2 * SessionReapGrace)
+	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"}); err != nil {
+		t.Fatal(err)
+	}
+	activateTestSession(t, s, 1, 777, "/project", started)
+	reusedAt := started.Add(time.Minute)
+	closed, err := s.CloseDeadSessions(map[int]time.Time{777: reusedAt}, now)
+	if err != nil || closed != 1 {
+		t.Fatalf("CloseDeadSessions reused pid = %d, %v; want old identity closed", closed, err)
+	}
+	if active, err := s.ActiveSessionCount(1); err != nil || active != 0 {
+		t.Fatalf("active sessions = %d, err=%v", active, err)
+	}
+}
+
 func TestGetCwdActivity(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
 	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	_ = s.UpsertAccount(Account{ID: 2, ConfigDir: "c", KeychainService: "s2", KeychainAccount: "u2"})
 
 	act, err := s.GetCwdActivity("/proj", 1)
 	if err != nil || act.Live != 0 || !act.LastEnded.IsZero() {
 		t.Fatalf("empty table: %+v err=%v", act, err)
 	}
 
-	_, _ = s.OpenSession(1, 100, "b", "/proj", now.Add(-3*time.Hour))
-	early, _ := s.OpenSession(1, 200, "b", "/proj", now.Add(-2*time.Hour))
-	late, _ := s.OpenSession(1, 300, "b", "/proj", now.Add(-90*time.Minute))
+	activateTestSession(t, s, 1, 100, "/proj", now.Add(-3*time.Hour))
+	early := activateTestSession(t, s, 1, 200, "/proj", now.Add(-2*time.Hour))
+	late := activateTestSession(t, s, 1, 300, "/proj", now.Add(-90*time.Minute))
 	_ = s.CloseSession(early, now.Add(-time.Hour))
 	_ = s.CloseSession(late, now.Add(-10*time.Minute))
-	_, _ = s.OpenSession(1, 400, "b", "", now)
-	other, _ := s.OpenSession(2, 500, "c", "/proj", now.Add(-time.Hour))
+	activateTestSession(t, s, 1, 400, "", now)
+	other := activateTestSession(t, s, 2, 500, "/proj", now.Add(-time.Hour))
 	_ = s.CloseSession(other, now.Add(-time.Minute))
 
 	act, err = s.GetCwdActivity("/proj", 1)
@@ -689,14 +995,14 @@ func TestPruneSticky(t *testing.T) {
 	_ = s.UpsertSticky("/fresh", 1, now)
 	// /live: stale select but a live tracked session holds it.
 	_ = s.UpsertSticky("/live", 1, now.Add(-3*time.Hour))
-	_, _ = s.OpenSession(1, 100, "b", "/live", now.Add(-3*time.Hour))
+	activateTestSession(t, s, 1, 100, "/live", now.Add(-3*time.Hour))
 	// /warm: stale select, last session ended within the TTL.
 	_ = s.UpsertSticky("/warm", 1, now.Add(-3*time.Hour))
-	warm, _ := s.OpenSession(1, 200, "b", "/warm", now.Add(-3*time.Hour))
+	warm := activateTestSession(t, s, 1, 200, "/warm", now.Add(-3*time.Hour))
 	_ = s.CloseSession(warm, now.Add(-30*time.Minute))
 	// /cold: stale select, last session ended before the cutoff.
 	_ = s.UpsertSticky("/cold", 1, now.Add(-3*time.Hour))
-	cold, _ := s.OpenSession(1, 300, "b", "/cold", now.Add(-3*time.Hour))
+	cold := activateTestSession(t, s, 1, 300, "/cold", now.Add(-3*time.Hour))
 	_ = s.CloseSession(cold, now.Add(-2*time.Hour))
 	// /manual-new: never-used manual pin inside its 1h minimum.
 	_ = s.PinManual("/manual-new", 1, now.Add(-30*time.Minute))

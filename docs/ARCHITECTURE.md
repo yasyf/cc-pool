@@ -138,7 +138,7 @@ expire (a checked-out session owns its own refresh; the daemon adopts whatever t
 rotated to on check-in), caches scores, and — with the fuse overlay — supervises the
 external **fusekit-holder** app, which owns the mounts so daemon restarts and upgrades never
 disturb them. `ccp add` and `ccp init` start it automatically; if it isn't running, `ccp select`
-auto-spawns it or samples live.
+auto-spawns the exact matching daemon and refuses to select until that daemon is healthy.
 
 No secrets are ever stored in cc-pool's database — the macOS Keychain is the only secret
 store.

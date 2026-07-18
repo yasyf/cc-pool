@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +24,12 @@ import (
 	"github.com/yasyf/fusekit/lease"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
+
+var daemonTestToken atomic.Uint64
+
+func nextDaemonTestToken() string {
+	return fmt.Sprintf("%032x", daemonTestToken.Add(1))
+}
 
 // holdSessionLease simulates a live select/env handout by taking account a's
 // session lease (its current-shape key) under the server's temp lease root; the
@@ -68,6 +76,11 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 			t.Fatal(err)
 		}
 	}
+	contentRoot := t.TempDir()
+	claudeDir := filepath.Join(contentRoot, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	s := &Server{
 		m: &pool.Manager{
 			Store: st, OAuth: &fakeOAuth{}, Creds: credstest.NewFake(), LockDir: t.TempDir(),
@@ -78,6 +91,9 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		cl:           newClaims(),
 		led:          newLedgers(),
+		contentSource: overlay.NewPoolContentSource(
+			claudeDir, filepath.Join(contentRoot, ".claude.json"), filepath.Join(contentRoot, "content-stamps"),
+		),
 	}
 	// Production serve() Waits on s.wg before Run's deferred Close; tests must
 	// too. handleSelect's preflight goroutine creates the winner's LockDir lock
@@ -88,13 +104,40 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 	return s, dirs
 }
 
+func activateDaemonTestSession(t *testing.T, s *Server, accountID, pid int, cwd string, started time.Time) int64 {
+	t.Helper()
+	started = started.Truncate(time.Microsecond)
+	a, err := s.m.Store.GetAccount(accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.Store.ActivateSelection(store.SelectionActivation{
+		Token:     nextDaemonTestToken(),
+		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
+		Process: store.ProcessIdentity{PID: pid, StartedAt: started},
+		Cwd:     cwd, At: started,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := s.m.Store.ListActiveSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, session := range sessions {
+		if session.PID == pid && session.ProcessStartedAt.Equal(started) && session.Cwd == cwd {
+			return session.ID
+		}
+	}
+	t.Fatal("activated session was not stored")
+	return 0
+}
+
 func expireCommittedReservations(c *claims, accountID int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for token, r := range c.reservations {
-		if r.accountID == accountID {
-			r.createdAt = time.Now().Add(-reservationTTL - time.Second)
-			c.reservations[token] = r
+	for _, selection := range c.selections {
+		if selection.accountID == accountID {
+			selection.expiresAt = time.Now().Add(-time.Second)
 		}
 	}
 }
@@ -116,7 +159,7 @@ func TestReservedCountExpiresAfterTTL(t *testing.T) {
 		t.Fatalf("reservedCount after TTL = %d, want 0", got)
 	}
 	s.cl.mu.Lock()
-	left := len(s.cl.reservations)
+	left := len(s.cl.selections)
 	s.cl.mu.Unlock()
 	if left != 0 {
 		t.Fatalf("expired reservations were not deleted: %d remain", left)
@@ -132,16 +175,16 @@ func TestHandleSelectCanceledClaimWaitCreatesNoReservation(t *testing.T) {
 	accountID := 1
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
-	resp := s.handleSelect(ctx, Request{Account: &accountID, NoMark: true, Cwd: "/project"})
+	resp := s.handleSelect(ctx, Request{Account: &accountID, Cwd: "/project"})
 	if resp.OK {
 		t.Fatalf("selection succeeded after request deadline: %+v", resp)
 	}
 	s.cl.disownHold(1)
 	s.cl.mu.Lock()
-	pending, committed := len(s.cl.pending), len(s.cl.reservations)
+	selections := len(s.cl.selections)
 	s.cl.mu.Unlock()
-	if pending != 0 || committed != 0 {
-		t.Fatalf("late reservation after canceled catch-up: pending=%d committed=%d", pending, committed)
+	if selections != 0 {
+		t.Fatalf("late reservation after canceled catch-up: selections=%d", selections)
 	}
 }
 
@@ -187,9 +230,9 @@ func TestProbeWinnerHonorsSelectionDeadline(t *testing.T) {
 	})
 }
 
-func TestHandleSelectRecordsSticky(t *testing.T) {
+func TestRawSelectHasNoActivationEffects(t *testing.T) {
 	s, dirs := newTestServer(t)
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
 	if !resp.OK || resp.Dir != dirs[1] {
 		t.Fatalf("expected emptier acct-1 (%s), got %+v", dirs[1], resp)
 	}
@@ -199,16 +242,23 @@ func TestHandleSelectRecordsSticky(t *testing.T) {
 	if !resp.HasUsage || resp.Remaining5h <= 0 || resp.Remaining7d <= 0 {
 		t.Fatalf("expected remaining headroom on a sampled pick, got HasUsage=%v Remaining5h=%.1f Remaining7d=%.1f", resp.HasUsage, resp.Remaining5h, resp.Remaining7d)
 	}
-	commitSelectResponse(t, s, resp)
-	st, ok, err := s.m.Store.GetSticky("/proj")
-	if err != nil || !ok || st.AccountID != 1 {
-		t.Fatalf("winner not recorded: %+v ok=%v err=%v", st, ok, err)
+	if resp.ReservationToken != "" {
+		t.Fatalf("raw select returned reservation token %q", resp.ReservationToken)
+	}
+	if got := s.cl.reservedCount(1); got != 0 {
+		t.Fatalf("raw select retained %d reservations, want zero", got)
+	}
+	if st, ok, err := s.m.Store.GetSticky("/proj"); err != nil || ok {
+		t.Fatalf("raw select recorded sticky: %+v ok=%v err=%v", st, ok, err)
+	}
+	if sessions, err := s.m.Store.ListActiveSessions(); err != nil || len(sessions) != 0 {
+		t.Fatalf("raw select sessions = %+v, err=%v; raw select has no process owner", sessions, err)
 	}
 }
 
 func TestHandleSelectTransactionAbortAndExclude(t *testing.T) {
 	s, dirs := newTestServer(t)
-	first := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, Cwd: "/proj"})
+	first := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj"})
 	if !first.OK || first.Dir != dirs[1] || first.ReservationToken == "" {
 		t.Fatalf("provisional select = %+v, want acct-1 with token", first)
 	}
@@ -228,7 +278,7 @@ func TestHandleSelectTransactionAbortAndExclude(t *testing.T) {
 		t.Fatalf("reservation survived abort: %d", got)
 	}
 
-	second := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, Cwd: "/proj", ExcludeIDs: []int{1}})
+	second := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj", ExcludeIDs: []int{1}})
 	if !second.OK || second.Dir != dirs[2] {
 		t.Fatalf("excluded retry = %+v, want acct-2", second)
 	}
@@ -243,7 +293,7 @@ func TestHandleSelectTransactionAbortAndExclude(t *testing.T) {
 
 func TestCommitSelectionRetriesDroppedResponseWithoutDuplicateEffects(t *testing.T) {
 	s, _ := newTestServer(t)
-	selected := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, Cwd: "/proj"})
+	selected := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj"})
 	if !selected.OK || selected.ReservationToken == "" {
 		t.Fatalf("select = %+v", selected)
 	}
@@ -310,11 +360,73 @@ func TestCommitSelectionRetriesDroppedResponseWithoutDuplicateEffects(t *testing
 	}
 }
 
+func TestCommitSelectionReplaySurvivesDaemonRestart(t *testing.T) {
+	s, _ := newTestServer(t)
+	selected := s.handleSelect(t.Context(), Request{
+		Op: OpSelect, PID: 4242, ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj",
+	})
+	if !selected.OK || selected.ReservationToken == "" {
+		t.Fatalf("select = %+v", selected)
+	}
+	if committed := s.handleSelectCommit(t.Context(), Request{
+		Op: OpSelectCommit, ReservationToken: selected.ReservationToken,
+	}); !committed.OK {
+		t.Fatalf("commit = %+v", committed)
+	}
+
+	restarted := &Server{m: s.m, cl: newClaims()}
+	if restarted.cl.knowsSelection(selected.ReservationToken) {
+		t.Fatal("fresh daemon unexpectedly retained the old in-memory selection")
+	}
+	if replayed := restarted.handleSelectCommit(t.Context(), Request{
+		Op: OpSelectCommit, ReservationToken: selected.ReservationToken,
+	}); !replayed.OK {
+		t.Fatalf("durable commit replay after daemon restart = %+v", replayed)
+	}
+	if sessions, err := s.m.Store.ListActiveSessions(); err != nil || len(sessions) != 1 {
+		t.Fatalf("durable replay sessions = %+v, err=%v; want exactly one", sessions, err)
+	}
+	if sticky, ok, err := s.m.Store.GetSticky("/proj"); err != nil || !ok || sticky.AccountID != 1 {
+		t.Fatalf("durable replay sticky = %+v ok=%v err=%v", sticky, ok, err)
+	}
+}
+
+func TestForcedSelectionRefusesAccountUnderConversion(t *testing.T) {
+	s, _ := newTestServer(t)
+	accountID := 1
+	if !s.cl.own(accountID) {
+		t.Fatal("could not acquire conversion claim")
+	}
+	defer s.cl.disownConvert(accountID)
+	for name, process := range map[string]store.ProcessIdentity{
+		"inspect": {},
+		"run":     {PID: 4242, StartedAt: time.Now().Add(-time.Minute)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var processStartedAt int64
+			if !process.StartedAt.IsZero() {
+				processStartedAt = process.StartedAt.UnixMicro()
+			}
+			resp := s.handleSelect(t.Context(), Request{
+				Op: OpSelect, Account: &accountID, PID: process.PID,
+				ProcessStartedAt: processStartedAt, Cwd: "/proj",
+			})
+			if resp.OK || !strings.Contains(resp.Error, "migrating overlays") {
+				t.Fatalf("selection under conversion = %+v", resp)
+			}
+			if resp.ReservationToken != "" || s.cl.reservedCount(accountID) != 0 {
+				t.Fatalf("selection under conversion retained reservation: %+v", resp)
+			}
+		})
+	}
+}
+
 func TestCommitSelectionFailureReleasesPromotedReservation(t *testing.T) {
 	s, _ := newTestServer(t)
 	forced := 1
-	first := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, NoMark: true, Cwd: "/first"})
-	second := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, NoMark: true, Cwd: "/second"})
+	started := time.Now().Add(-time.Minute).UnixMicro()
+	first := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, PID: 4241, ProcessStartedAt: started, Cwd: "/first"})
+	second := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, PID: 4242, ProcessStartedAt: started, Cwd: "/second"})
 	if !first.OK || !second.OK {
 		t.Fatalf("provisional selects = %+v / %+v", first, second)
 	}
@@ -326,11 +438,11 @@ func TestCommitSelectionFailureReleasesPromotedReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	failed := s.handleSelectCommit(context.Background(), Request{Op: OpSelectCommit, ReservationToken: second.ReservationToken})
-	if failed.OK || !strings.Contains(failed.Error, "commit selection") {
+	if failed.OK || !strings.Contains(failed.Error, "activate selection") {
 		t.Fatalf("second commit against closed store = %+v", failed)
 	}
-	if got := s.cl.reservedCount(forced); got != 1 {
-		t.Fatalf("second commit failure left %d reservations, want first commit's one", got)
+	if got := s.cl.reservedCount(forced); got != 0 {
+		t.Fatalf("terminal commits retained %d reservations, want zero", got)
 	}
 	replayed := s.handleSelectCommit(context.Background(), Request{Op: OpSelectCommit, ReservationToken: second.ReservationToken})
 	if replayed.OK || replayed.Error != failed.Error {
@@ -340,23 +452,15 @@ func TestCommitSelectionFailureReleasesPromotedReservation(t *testing.T) {
 
 func TestProvisionalSelectionExpiresWithoutEffects(t *testing.T) {
 	s, _ := newTestServer(t)
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj"})
 	if !resp.OK {
 		t.Fatalf("select = %+v", resp)
 	}
-	expired := time.Now().Add(-provisionalSelectionTTL - time.Second)
-	s.selectMu.Lock()
-	pending := s.selectPending[resp.ReservationToken]
-	pending.createdAt = expired
-	s.selectPending[resp.ReservationToken] = pending
-	s.selectMu.Unlock()
 	s.cl.mu.Lock()
-	claim := s.cl.pending[resp.ReservationToken]
-	claim.createdAt = expired
-	s.cl.pending[resp.ReservationToken] = claim
+	s.cl.selections[resp.ReservationToken].expiresAt = time.Now().Add(-time.Second)
 	s.cl.mu.Unlock()
 
-	s.prunePendingSelects(time.Now())
+	s.cl.pruneSelections(time.Now())
 	if committed := s.handleSelectCommit(context.Background(), Request{Op: OpSelectCommit, ReservationToken: resp.ReservationToken}); committed.OK {
 		t.Fatalf("expired commit unexpectedly succeeded: %+v", committed)
 	}
@@ -368,13 +472,48 @@ func TestProvisionalSelectionExpiresWithoutEffects(t *testing.T) {
 	}
 }
 
+func TestRunCommitRejectsAccountGenerationChange(t *testing.T) {
+	s, _ := newTestServer(t)
+	forced := 1
+	resp := s.handleSelect(t.Context(), Request{
+		Op: OpSelect, Account: &forced, PID: 4242,
+		ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj",
+	})
+	if !resp.OK {
+		t.Fatalf("select = %+v", resp)
+	}
+	if err := s.m.Store.SetAccountOverlayKind(forced, "fileprovider"); err != nil {
+		t.Fatal(err)
+	}
+
+	committed := s.handleSelectCommit(context.Background(), Request{
+		Op: OpSelectCommit, ReservationToken: resp.ReservationToken,
+	})
+	if committed.OK || !strings.Contains(committed.Error, "account generation changed") {
+		t.Fatalf("commit after generation change = %+v", committed)
+	}
+	if live, err := s.m.Store.ListActiveSessions(); err != nil {
+		t.Fatal(err)
+	} else if len(live) != 0 {
+		t.Fatalf("generation-raced run opened sessions: %+v", live)
+	}
+	if sticky, ok, err := s.m.Store.GetSticky("/proj"); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatalf("generation-raced run recorded sticky state: %+v", sticky)
+	}
+	if got := s.cl.reservedCount(forced); got != 0 {
+		t.Fatalf("generation-raced run retained %d reservations, want zero", got)
+	}
+}
+
 func TestHandleSelectHonorsSticky(t *testing.T) {
 	s, dirs := newTestServer(t)
 	// Sticky points at the WORSE account.
 	if err := s.m.Store.UpsertSticky("/proj", 2, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
 	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
 		t.Fatalf("expected sticky acct-2 (%s), got %+v", dirs[2], resp)
 	}
@@ -394,17 +533,16 @@ func TestHandleSelectSkipsExhaustedStickyPin(t *testing.T) {
 	if err := s.m.Store.UpsertSticky("/proj", 2, now); err != nil {
 		t.Fatal(err)
 	}
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
 	if !resp.OK || resp.Dir != dirs[1] {
 		t.Fatalf("expected healthy acct-1 (%s) over the exhausted pin, got %+v", dirs[1], resp)
 	}
 	if resp.Sticky || resp.ExhaustedFallback {
 		t.Fatalf("a fresh healthy pick must report neither sticky nor fallback: %+v", resp)
 	}
-	commitSelectResponse(t, s, resp)
 	st, ok, err := s.m.Store.GetSticky("/proj")
-	if err != nil || !ok || st.AccountID != 1 {
-		t.Fatalf("sticky row not rewritten to the winner: %+v ok=%v err=%v", st, ok, err)
+	if err != nil || !ok || st.AccountID != 2 {
+		t.Fatalf("raw inspection rewrote sticky row: %+v ok=%v err=%v", st, ok, err)
 	}
 }
 
@@ -412,7 +550,7 @@ func TestHandleSelectSkipsExhaustedStickyPin(t *testing.T) {
 // activity rules.
 func TestHandleSelectMarksSessionWithCwd(t *testing.T) {
 	s, _ := newTestServer(t)
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj"})
 	if !resp.OK || resp.SelectedID == nil {
 		t.Fatalf("select failed: %+v", resp)
 	}
@@ -424,14 +562,6 @@ func TestHandleSelectMarksSessionWithCwd(t *testing.T) {
 	if live[0].PID != 4242 || live[0].Cwd != "/proj" || live[0].AccountID != *resp.SelectedID {
 		t.Fatalf("session row = %+v, want pid 4242 cwd /proj acct %d", live[0], *resp.SelectedID)
 	}
-
-	s2, _ := newTestServer(t)
-	if resp := s2.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, NoMark: true, Cwd: "/proj"}); !resp.OK {
-		t.Fatalf("select failed: %+v", resp)
-	}
-	if live, _ := s2.m.Store.ListActiveSessions(); len(live) != 0 {
-		t.Fatalf("NoMark must not mark: %+v", live)
-	}
 }
 
 // TestHandleSelectBindsWarmEndedSession: a pin whose session ended minutes
@@ -442,14 +572,11 @@ func TestHandleSelectBindsWarmEndedSession(t *testing.T) {
 	if err := s.m.Store.UpsertSticky("/proj", 2, now.Add(-3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	id, err := s.m.Store.OpenSession(2, 0, dirs[2], "/proj", now.Add(-3*time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
+	id := activateDaemonTestSession(t, s, 2, 800002, "/proj", now.Add(-3*time.Hour))
 	if err := s.m.Store.CloseSession(id, now.Add(-10*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
 	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
 		t.Fatalf("expected sticky acct-2 (%s) via warm ended session, got %+v", dirs[2], resp)
 	}
@@ -465,10 +592,12 @@ func TestHandleSelectHoldsLiveOnlyPin(t *testing.T) {
 	if err := s.m.Store.UpsertSticky("/proj", 2, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.m.Store.OpenSession(2, 0, dirs[2], "/proj", now.Add(-10*time.Minute)); err != nil {
-		t.Fatal(err)
+	started := now.Add(-10 * time.Minute).Truncate(time.Microsecond)
+	activateDaemonTestSession(t, s, 2, 800002, "/proj", started)
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+		return []procscan.Session{{PID: 800002, ConfigDir: dirs[2], StartedAt: started}}, nil
 	}
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
 	if !resp.OK || resp.Dir != dirs[1] || resp.Sticky {
 		t.Fatalf("expected free non-sticky acct-1 (%s), got %+v", dirs[1], resp)
 	}
@@ -496,13 +625,11 @@ func TestHandleSelectQuickResumeBindsAfterReap(t *testing.T) {
 	}
 	// pid 4000000 is impossible (macOS pids are 5-digit), so handleSelect's
 	// sweep reaps the row; the -10m reconcile below makes the reap a warm end.
-	if _, err := s.m.Store.OpenSession(2, 4000000, dirs[2], "/proj", now.Add(-3*time.Hour)); err != nil {
+	activateDaemonTestSession(t, s, 2, 4000000, "/proj", now.Add(-3*time.Hour))
+	if _, err := s.m.Store.CloseDeadSessions(map[int]time.Time{4000000: now.Add(-3 * time.Hour).Truncate(time.Microsecond)}, now.Add(-10*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.m.Store.CloseDeadSessions(map[int]bool{4000000: true}, now.Add(-10*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
 	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
 		t.Fatalf("quick resume must bind the pin via the reaped warm end, got %+v", resp)
 	}
@@ -511,7 +638,7 @@ func TestHandleSelectQuickResumeBindsAfterReap(t *testing.T) {
 func TestHandleSelectForcedMarksSession(t *testing.T) {
 	s, _ := newTestServer(t)
 	forced := 2
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, PID: 4242, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, PID: 4242, ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj"})
 	if !resp.OK {
 		t.Fatalf("forced select failed: %+v", resp)
 	}
@@ -522,14 +649,6 @@ func TestHandleSelectForcedMarksSession(t *testing.T) {
 	}
 	if live[0].PID != 4242 || live[0].Cwd != "/proj" || live[0].AccountID != 2 {
 		t.Fatalf("session row = %+v, want pid 4242 cwd /proj acct 2", live[0])
-	}
-
-	s2, _ := newTestServer(t)
-	if resp := s2.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, PID: 4242, NoMark: true, Cwd: "/proj"}); !resp.OK {
-		t.Fatalf("forced select failed: %+v", resp)
-	}
-	if live, _ := s2.m.Store.ListActiveSessions(); len(live) != 0 {
-		t.Fatalf("forced NoMark must not mark: %+v", live)
 	}
 }
 
@@ -545,7 +664,7 @@ func TestHandleSelectHoldsUnusableManualPin(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
 	if !resp.OK || resp.Dir != dirs[1] || resp.Sticky {
 		t.Fatalf("expected free acct-1 (%s) over the exhausted manual pin, got %+v", dirs[1], resp)
 	}
@@ -565,7 +684,7 @@ func TestHandleSelectForcedKeepsManualPin(t *testing.T) {
 		t.Fatal(err)
 	}
 	forced := 2
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, Cwd: "/proj"})
 	if !resp.OK || resp.Dir != dirs[2] {
 		t.Fatalf("forced select failed: %+v", resp)
 	}
@@ -591,7 +710,7 @@ func TestHandleSelectExhaustedFallback(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
 	if !resp.OK || !resp.ExhaustedFallback {
 		t.Fatalf("expected a flagged fallback pick, got %+v", resp)
 	}
@@ -765,7 +884,7 @@ func TestHandleSelectNoneAvailable(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
 	if resp.OK || !resp.NoneAvailable {
 		t.Fatalf("expected structured none-available, got %+v", resp)
 	}
@@ -780,7 +899,7 @@ func TestHandleSelectLogsPick(t *testing.T) {
 	s, _ := newTestServer(t)
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
-	if resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"}); !resp.OK {
+	if resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"}); !resp.OK {
 		t.Fatalf("select failed: %+v", resp)
 	}
 	s.wg.Wait()
@@ -796,7 +915,10 @@ func TestHandleSelectLogsPick(t *testing.T) {
 func TestHandleSelectForcedRecordsSticky(t *testing.T) {
 	s, dirs := newTestServer(t)
 	acct := 2
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &acct, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{
+		Op: OpSelect, Account: &acct, PID: 4242,
+		ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj",
+	})
 	if !resp.OK || resp.Dir != dirs[2] {
 		t.Fatalf("expected forced acct-2 (%s), got %+v", dirs[2], resp)
 	}

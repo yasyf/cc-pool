@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,10 +41,6 @@ func TestEnvMergesBaseSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The lease agent forks a detached `ccp lease-agent`; stub it (the test binary
-	// is not ccp, so a real fork would never complete the readiness handshake).
-	swapVar(t, &spawnLeaseAgent, func(store.Account) (leaseAgentCleanup, error) { return nil, nil })
-
 	cmd := newEnvCmd()
 	var stdout, stderr bytes.Buffer
 	cmd.SetOut(&stdout)
@@ -65,51 +60,12 @@ func TestEnvMergesBaseSettings(t *testing.T) {
 	if err := json.Unmarshal(b, &got); err != nil || got["mergeMarker"] != "yes" {
 		t.Fatalf("base marker did not reach the account file (err=%v): %v", err, got)
 	}
-}
-
-// TestEnvHandsOutNothingOnLeaseFailure pins F3's no-handout contract at the
-// command level: when the lease agent's acquired+probed handshake fails, `ccp
-// env` prints NO exports (the shell must have nothing to eval) and exits
-// non-zero with the failure on stderr.
-func TestEnvHandsOutNothingOnLeaseFailure(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	dir := filepath.Join(home, "acct-01")
-	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	st, err := store.Open(pool.DBPath())
+	st, err = store.Open(pool.DBPath())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetMeta("initialized", "1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.UpsertAccount(store.Account{
-		ID: 1, ConfigDir: dir, Label: "work@example.com",
-		KeychainService: "svc", KeychainAccount: "u", OverlayKind: "symlink",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	swapVar(t, &spawnLeaseAgent, func(store.Account) (leaseAgentCleanup, error) {
-		return nil, errors.New("the session lease agent did not become ready")
-	})
-
-	cmd := newEnvCmd()
-	cmd.SilenceUsage = true // as under the real root command
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--account", "1"})
-	err = cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "session lease") {
-		t.Fatalf("env with a failed lease handshake = %v, want the lease failure", err)
-	}
-	if stdout.Len() != 0 {
-		t.Fatalf("env handed out %q despite a failed lease handshake; stdout must stay empty", stdout.String())
+	defer func() { _ = st.Close() }()
+	if sessions, err := st.ListActiveSessions(); err != nil || len(sessions) != 0 {
+		t.Fatalf("env active sessions = %+v, err=%v; env must not invent process ownership", sessions, err)
 	}
 }

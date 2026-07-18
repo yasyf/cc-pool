@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -8,7 +9,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/store"
 )
 
 func newListCmd() *cobra.Command {
@@ -78,42 +78,25 @@ func newEnvCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "env",
 		Short: "Print shell export lines to launch an account",
-		Long: `env prints the environment needed to launch a specific account:
+		Long: `env prints the environment needed to inspect a specific account:
 
-    eval "$(ccp env --account 1)"; claude`,
+    ccp env --account 1
+
+Use ` + "`ccp run`" + ` to launch. env creates no process/session lease.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
-				var a store.Account
-				var err error
-				if cmd.Flags().Changed("account") {
-					a, err = m.Store.GetAccount(account)
-				} else {
-					var sr *pool.SelectResult
-					sr, err = m.Select(cmd.Context(), pool.SelectOptions{Live: true})
-					if err == nil {
-						a = sr.Best
-						if sr.ExhaustedFallback {
-							// stderr, so an eval'd stdout capture is unaffected.
-							warnExhaustedFallback(cmd, accountName(a.Label), sr.ExtraEnabled, sr.Result.ExhaustedUntil)
-						}
-					}
+				if !cmd.Flags().Changed("account") {
+					return errors.New("env requires --account; use `ccp run` for selection and launch")
 				}
+				a, err := m.Store.GetAccount(account)
 				if err != nil {
 					return err
 				}
 				mergeLaunchSettings(cmd, m, a)
-				// env prints exports for the invoking shell to run claude, so the
-				// session lease must outlive ccp: a detached agent holds it until the
-				// terminal's session leader exits. Block on the agent's acquired+probed
-				// handshake BEFORE printing any exports — a failure prints nothing and
-				// exits non-zero rather than handing out an unprotected dir.
-				if _, err := spawnLeaseAgent(a); err != nil {
-					return fmt.Errorf("couldn't hold the session lease for %s: %w", accountName(a.Label), err)
-				}
 				out := cmd.OutOrStdout()
 				_, _ = fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(a.ConfigDir))
 				_, _ = fmt.Fprintf(out, "export CLAUDE_CODE_PLUGIN_CACHE_DIR=%s\n", shellQuote(filepath.Join(pool.ClaudeDir(), "plugins")))

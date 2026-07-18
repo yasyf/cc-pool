@@ -282,11 +282,12 @@ func CountByConfigDir(sessions []Session, configDir string) int {
 	return n
 }
 
-// AlivePIDs returns the set of pids currently present, for session reconciliation.
-func AlivePIDs(sessions []Session) map[int]bool {
-	m := make(map[int]bool, len(sessions))
+// AliveProcesses returns the kernel process identities currently present, for
+// session reconciliation without PID-reuse ambiguity.
+func AliveProcesses(sessions []Session) map[int]time.Time {
+	m := make(map[int]time.Time, len(sessions))
 	for _, s := range sessions {
-		m[s.PID] = true
+		m[s.PID] = s.StartedAt
 	}
 	return m
 }

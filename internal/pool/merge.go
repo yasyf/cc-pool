@@ -34,7 +34,7 @@ const (
 // overlay.ClaudeJSONPrivateKeys, base wins) plus per-project
 // overlay.ClaudeJSONSharedProjectKeys into an account's private .claude.json.
 // A concurrent live session can rewrite from memory and clobber merged values;
-// the next semantic-content event (or daemonless launch reconciliation) reapplies
+// the next semantic-content event (or daemon-owned launch reconciliation) reapplies
 // the shared projection.
 func mergeClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (MergeOutcome, error) {
 	// Writing into a live mirror lands in the wrong root.

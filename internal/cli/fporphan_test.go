@@ -80,7 +80,10 @@ func orphanManager(t *testing.T, ownedIDs ...int) *pool.Manager {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	for _, id := range ownedIDs {
-		row := store.Account{ID: id, ConfigDir: pool.AccountDir(id), KeychainService: fmt.Sprintf("svc-%02d", id)}
+		row := store.Account{
+			ID: id, ConfigDir: pool.AccountDir(id),
+			KeychainService: fmt.Sprintf("svc-%02d", id), KeychainAccount: "user",
+		}
 		if err := st.UpsertAccount(row); err != nil {
 			t.Fatal(err)
 		}

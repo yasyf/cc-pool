@@ -42,11 +42,7 @@ func TestLoginFlowRefusesUnprobeableDir(t *testing.T) {
 	}
 }
 
-// TestLoginFlowManualSpawnsPendingAgentBeforePrint pins G2: the non-TTY manual path
-// (ccp exits after printing, so the synchronous lease dies with it) hands the pending
-// dir's lease to a detached session-leader-tied agent BEFORE printing the external
-// login command, so the printed login never races the holder's teardown.
-func TestLoginFlowManualSpawnsPendingAgentBeforePrint(t *testing.T) {
+func TestLoginFlowManualRequiresRun(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	tempLeaseRoot(t)
 
@@ -65,27 +61,12 @@ func TestLoginFlowManualSpawnsPendingAgentBeforePrint(t *testing.T) {
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 
-	var spawned, commandAlreadyPrinted bool
-	swapVar(t, &spawnPendingLeaseAgent, func(p *pool.PendingAdd) error {
-		spawned = true
-		commandAlreadyPrinted = strings.Contains(stdout.String(), pending.LoginCommand)
-		if p.Index != pending.Index {
-			t.Errorf("spawnPendingLeaseAgent got index %d, want %d", p.Index, pending.Index)
-		}
-		return nil
-	})
-
-	if err := loginFlow(cmd, pending, addOptions{}); err != nil {
-		t.Fatalf("loginFlow (non-TTY manual) = %v, want nil", err)
+	err := loginFlow(cmd, pending, addOptions{})
+	if err == nil || !strings.Contains(err.Error(), "requires --run") {
+		t.Fatalf("loginFlow (non-TTY manual) = %v, want --run requirement", err)
 	}
-	if !spawned {
-		t.Fatal("the non-TTY manual path did not spawn the detached pending lease agent")
-	}
-	if commandAlreadyPrinted {
-		t.Fatal("the login command was printed BEFORE the lease agent was spawned; the agent must be spawned first")
-	}
-	if !strings.Contains(stdout.String(), pending.LoginCommand) {
-		t.Fatalf("the login command was never printed:\n%s", stdout.String())
+	if strings.Contains(stdout.String(), pending.LoginCommand) {
+		t.Fatalf("login command was handed out without a process-bound lease:\n%s", stdout.String())
 	}
 }
 

@@ -44,8 +44,8 @@ var (
 )
 
 // DeepProbeBound is the deep probe's worst-case wall-clock budget. Exported so a
-// caller (e.g. the lease-agent readiness deadline) can derive a timeout from the
-// real component bound rather than a hand-copied constant.
+// caller can derive a readiness timeout from the real component bound rather
+// than a hand-copied constant.
 const DeepProbeBound = 5 * time.Second
 
 // deepProbeTimeout is a var, not a const, so tests can shrink it.

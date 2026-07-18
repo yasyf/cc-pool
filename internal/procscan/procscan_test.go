@@ -264,14 +264,16 @@ func TestCountByConfigDir(t *testing.T) {
 	}
 }
 
-func TestAlivePIDs(t *testing.T) {
-	sessions := []Session{{PID: 501}, {PID: 777}}
-	alive := AlivePIDs(sessions)
-	if !alive[501] || !alive[777] {
-		t.Errorf("AlivePIDs = %v, want 501 and 777 present", alive)
+func TestAliveProcesses(t *testing.T) {
+	a := time.Unix(10, 0)
+	b := time.Unix(20, 0)
+	sessions := []Session{{PID: 501, StartedAt: a}, {PID: 777, StartedAt: b}}
+	alive := AliveProcesses(sessions)
+	if !alive[501].Equal(a) || !alive[777].Equal(b) {
+		t.Errorf("AliveProcesses = %v", alive)
 	}
-	if alive[123] {
-		t.Error("AlivePIDs must not report an absent pid as alive")
+	if _, ok := alive[123]; ok {
+		t.Error("AliveProcesses must not report an absent pid")
 	}
 }
 

@@ -19,7 +19,7 @@ type heartbeatSnapshot struct {
 	scannedAt   time.Time
 	sessions    []procscan.Session
 	counts      map[string]int
-	alive       map[int]bool
+	alive       map[int]time.Time
 }
 
 func (s heartbeatSnapshot) sessionCount(dir string) int { return s.counts[dir] }
@@ -63,9 +63,9 @@ func cloneHeartbeatSnapshot(in heartbeatSnapshot) heartbeatSnapshot {
 	for dir, count := range in.counts {
 		out.counts[dir] = count
 	}
-	out.alive = make(map[int]bool, len(in.alive))
-	for pid, alive := range in.alive {
-		out.alive[pid] = alive
+	out.alive = make(map[int]time.Time, len(in.alive))
+	for pid, started := range in.alive {
+		out.alive[pid] = started
 	}
 	return out
 }
@@ -109,7 +109,7 @@ func (h *sessionHeartbeat) refresh(ctx context.Context, maxAge time.Duration) he
 	for _, session := range sessions {
 		counts[session.ConfigDir]++
 	}
-	alive := procscan.AlivePIDs(sessions)
+	alive := procscan.AliveProcesses(sessions)
 	h.mu.Lock()
 	previous := h.snapshot
 	for dir := range durableActive {

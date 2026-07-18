@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"time"
 
@@ -17,25 +16,15 @@ import (
 
 func newSelectCmd() *cobra.Command {
 	var (
-		noDaemon bool
-		wait     bool
-		account  int
-		fresh    time.Duration
+		wait    bool
+		account int
 	)
 	cmd := &cobra.Command{
 		Use:   "select",
 		Short: "Print the config dir of the emptiest account",
-		Long: `select scores every account and prints only the chosen account's config dir
-to stdout, so it composes as:
-
-    CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CODE_DEBUG_LOGS_DIR="$HOME/.claude/debug" CLAUDE_CONFIG_DIR=$(ccp select) claude
-
-(Prefer ` + "`ccp run`" + `, which sets these vars itself. The plugin var keeps the
-session writing canonical ~/.claude plugin paths into the shared plugin state;
-the debug var keeps DEBUG=1's verbose per-session log off the fuse-t mirror.)
-
-Diagnostics go to stderr. With the daemon running, select reads its cached
-scores; otherwise it samples usage live.`,
+		Long: `select asks the exact running daemon to prepare and inspect the best account,
+then prints its config directory. It creates no session, reservation, sticky pin,
+or launch ownership. Use ` + "`ccp run`" + ` to launch Claude Code.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
@@ -44,7 +33,7 @@ scores; otherwise it samples usage live.`,
 				}
 				// Unreadable cwd just disables stickiness.
 				cwd, _ := os.Getwd()
-				req := selectReq{wait: wait, fresh: fresh, noDaemon: noDaemon, cwd: cwd}
+				req := selectReq{wait: wait, cwd: cwd}
 				if cmd.Flags().Changed("account") {
 					req.account = &account
 				}
@@ -53,13 +42,9 @@ scores; otherwise it samples usage live.`,
 					return err
 				}
 				defer selection.Abort()
-				// select prints the dir for the invoking shell to run claude, so the
-				// session lease must outlive ccp: a detached agent holds it until the
-				// terminal's session leader exits. Block on the agent's acquired+probed
-				// handshake BEFORE printing anything — a failure hands out nothing and
-				// exits non-zero rather than launching claude onto an unprotected dir.
-				if err := commitSelectionWithLease(cmd.Context(), selection); err != nil {
-					return err
+				// A raw select is inspect-only; its commit is intentionally a no-op.
+				if err := selection.Commit(cmd.Context()); err != nil {
+					return fmt.Errorf("commit selection: %w", err)
 				}
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), selection.dir)
 				announceLine(cmd, selection.line)
@@ -67,40 +52,18 @@ scores; otherwise it samples usage live.`,
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&noDaemon, "no-daemon", false, "do not use the daemon; sample usage live")
 	cmd.Flags().BoolVar(&wait, "wait", false, "wait for an account with headroom instead of failing or using an exhausted one")
 	cmd.Flags().IntVar(&account, "account", 0, "force a specific account id")
-	cmd.Flags().DurationVar(&fresh, "fresh", pool.DefaultFreshFor, "reuse cached usage newer than this (live mode)")
 	return cmd
 }
 
-func commitSelectionWithLease(ctx context.Context, selection *selectionTxn) error {
-	agent, err := spawnLeaseAgent(selection.acct)
-	if err != nil {
-		return fmt.Errorf("couldn't hold the session lease for %s: %w", accountName(selection.acct.Label), err)
-	}
-	if err := selection.Commit(ctx); err != nil {
-		commitErr := fmt.Errorf("commit selection: %w", err)
-		if agent == nil {
-			return commitErr
-		}
-		if stopErr := agent.Stop(); stopErr != nil {
-			return errors.Join(commitErr, stopErr)
-		}
-		return commitErr
-	}
-	return nil
-}
-
 type selectReq struct {
-	account  *int          // forced pick (CCP_ACCOUNT / --account); nil = auto-score
-	wait     bool          // wait for availability instead of failing (--wait)
-	fresh    time.Duration // live-mode cache window (--fresh)
-	noDaemon bool          // skip the daemon, sample live (--no-daemon)
-	cwd      string        // keys select stickiness; empty disables it
-	// pid tags the session row: `ccp run` passes its own (exec replaces it in
-	// place), `ccp select` passes 0 so procscan attributes the live process.
-	pid        int
+	account *int   // forced pick (CCP_ACCOUNT / --account); nil = auto-score
+	wait    bool   // wait for availability instead of failing (--wait)
+	cwd     string // keys select stickiness; empty disables it
+	// process tags only `ccp run`: exec replaces this exact kernel identity in
+	// place. Raw select carries no process and is intrinsically inspect-only.
+	process    store.ProcessIdentity
 	excludeIDs []int
 }
 
@@ -142,9 +105,7 @@ func (s *selectionTxn) Abort() {
 	s.done = true
 }
 
-// resolveSelection runs the shared `ccp run`/`ccp select` pipeline (forced →
-// daemon → live), returning the selected account so callers can take its session
-// lease; the caller owns stdout and the diagnostic line.
+// resolveSelection runs the shared daemon-owned `ccp run`/`ccp select` pipeline.
 func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (acct store.Account, dir, line string, err error) {
 	ctx := commandContext(cmd)
 	selection, err := resolveSelectionTxn(ctx, cmd, m, req)
@@ -162,6 +123,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var forced *store.Account
 	if req.account != nil {
 		a, err := m.Store.GetAccount(*req.account)
 		if err != nil {
@@ -172,154 +134,80 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 				return nil, fmt.Errorf("forced account %d is excluded", a.ID)
 			}
 		}
-		// An at-version daemon holds gates a client can't see (overlay conversion,
-		// mounts, reservations); prefer it over launching claude into a dir being
-		// remade. Daemonless, conversions can't run, so local prep is safe.
-		if !req.noDaemon {
-			cl := daemon.NewClient()
-			if cl.EnsureRunning(ctx, daemonEnsureTimeout(ctx)) && daemonClientAt(ctx, cl, version.String()) {
-				if resp, ok := cl.Select(ctx, req.account, req.pid, false, req.cwd, false, req.excludeIDs); ok {
-					if !resp.OK {
-						return nil, errors.New(resp.Error)
-					}
-					if err := ctx.Err(); err != nil {
-						abortDaemonSelection(ctx, cl, resp.ReservationToken)
-						return nil, err
-					}
-					picked, err := validateDaemonSelection(m, resp, &a)
-					if err != nil {
-						abortDaemonSelection(ctx, cl, resp.ReservationToken)
-						return nil, err
-					}
-					if resp.ReservationToken == "" {
-						return nil, fmt.Errorf("invalid daemon selection: empty reservation token for id %d", picked.ID)
-					}
-					dir, err := prepareAccount(ctx, cmd, m, picked, false)
-					if err != nil {
-						abortDaemonSelection(ctx, cl, resp.ReservationToken)
-						return nil, err
-					}
-					return &selectionTxn{
-						acct: picked, dir: dir, line: selectionLine(accountName(picked.Label), false, false, 0, 0, "", 0),
-						commit: func(ctx context.Context) error { return cl.CommitSelection(ctx, resp.ReservationToken) },
-						abort:  func() { abortDaemonSelection(ctx, cl, resp.ReservationToken) },
-					}, nil
-				}
-			}
-		}
-		dir, err := prepareAccount(ctx, cmd, m, a, true)
+		forced = &a
+	}
+
+	cl := daemon.NewClient()
+	if !cl.EnsureRunning(ctx, daemonEnsureTimeout(ctx)) {
+		return nil, daemon.ErrDaemonUnavailable
+	}
+	health, err := cl.HealthContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("require daemon: %w", err)
+	}
+	if !health.OK {
+		return nil, fmt.Errorf("require daemon: %s", health.Error)
+	}
+	if health.Version != version.String() {
+		return nil, fmt.Errorf("require exact daemon version: daemon=%s client=%s", health.Version, version.String())
+	}
+	for {
+		resp, err := cl.Select(ctx, req.account, req.process, req.cwd, req.wait, req.excludeIDs)
 		if err != nil {
+			return nil, fmt.Errorf("select through daemon: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			abortDaemonSelection(ctx, cl, resp.ReservationToken)
 			return nil, err
 		}
-		return &selectionTxn{
-			acct: a, dir: dir, line: selectionLine(accountName(a.Label), false, false, 0, 0, "", 0),
-			commit: func(context.Context) error {
-				return m.Store.CommitSelection(a.ID, req.pid, a.ConfigDir, req.cwd, time.Now(), true)
-			},
-			abort: func() {},
-		}, nil
-	}
-
-	// EnsureRunning so a daemon outlives the exec to adopt tokens claude
-	// rotates; a version-skewed daemon (stale scoring) is ignored until
-	// status/add/init restarts it.
-	if !req.noDaemon {
-		cl := daemon.NewClient()
-		if cl.EnsureRunning(ctx, daemonEnsureTimeout(ctx)) && daemonClientAt(ctx, cl, version.String()) {
-			// Reserve even pid-0 picks (anti-thundering-herd). --wait sends
-			// NoFallback: the daemon must not commit sticky/reservation side
-			// effects for a pick the client would discard.
-			if resp, ok := cl.Select(ctx, nil, req.pid, false, req.cwd, req.wait, req.excludeIDs); ok {
-				if err := ctx.Err(); err != nil {
-					if resp.OK {
-						abortDaemonSelection(ctx, cl, resp.ReservationToken)
-					}
-					return nil, err
-				}
-				switch daemonSelectOutcome(resp, req.wait) {
-				case outcomePicked:
-					a, err := validateDaemonSelection(m, resp, nil)
-					if err != nil {
-						abortDaemonSelection(ctx, cl, resp.ReservationToken)
-						return nil, err
-					}
-					if resp.ReservationToken == "" {
-						return nil, fmt.Errorf("invalid daemon selection: empty reservation token for id %d", a.ID)
-					}
-					if resp.ExhaustedFallback {
-						warnExhaustedFallback(cmd, daemonAccountName(m, resp.SelectedID), resp.ExtraEnabled, derefTime(resp.SoonestReset))
-					}
-					warnPinHeld(cmd, m, resp.PinHeldAccount, resp.SelectedID)
-					return &selectionTxn{
-						acct: a, dir: a.ConfigDir, line: daemonSelectionLine(m, resp),
-						commit: func(ctx context.Context) error { return cl.CommitSelection(ctx, resp.ReservationToken) },
-						abort:  func() { abortDaemonSelection(ctx, cl, resp.ReservationToken) },
-					}, nil
-				case outcomeError:
-					if resp.OK {
-						abortDaemonSelection(ctx, cl, resp.ReservationToken)
-					}
-					return nil, errors.New(resp.Error)
-				case outcomeWait:
-					if resp.OK {
-						abortDaemonSelection(ctx, cl, resp.ReservationToken)
-					}
-					if resp.SoonestReset != nil {
-						step(cmd.ErrOrStderr(), "All accounts are busy; waiting until %s.", humanizeReset(*resp.SoonestReset))
-					}
-				case outcomeFail:
-					if resp.OK {
-						abortDaemonSelection(ctx, cl, resp.ReservationToken)
-					}
-					if resp.MountsNotReady {
-						return nil, pool.ErrMountsNotReady
-					}
-					return nil, pool.ErrNoneAvailable
-				}
-			}
-		}
-	}
-
-	// Live selection defers stickiness and the session row to the caller's commit.
-	opts := pool.SelectOptions{Live: true, FreshFor: req.fresh, Cwd: req.cwd, PID: req.pid, NoFallback: req.wait, ExcludeIDs: req.excludeIDs, DeferCommit: true}
-	for {
-		sr, err := m.Select(ctx, opts)
-		if errors.Is(err, pool.ErrNoneAvailable) {
-			if !req.wait {
-				step(cmd.ErrOrStderr(), "No account is available right now; all are exhausted or rate-limited.")
+		switch daemonSelectOutcome(resp, req.wait) {
+		case outcomePicked:
+			a, err := validateDaemonSelection(m, resp, forced)
+			if err != nil {
+				abortDaemonSelection(ctx, cl, resp.ReservationToken)
 				return nil, err
 			}
-			reset, ok := sr.SoonestReset()
-			d := 15 * time.Second
-			if ok {
-				step(cmd.ErrOrStderr(), "All accounts are exhausted or rate-limited; soonest reset at %s.", humanizeReset(reset))
-				if until := time.Until(reset); until > 0 && until < d {
-					d = until
-				}
+			launch := req.process.PID > 0
+			if launch && resp.ReservationToken == "" {
+				return nil, fmt.Errorf("invalid daemon launch selection: empty reservation token for id %d", a.ID)
 			}
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(d):
-				continue
+			if !launch && resp.ReservationToken != "" {
+				abortDaemonSelection(ctx, cl, resp.ReservationToken)
+				return nil, fmt.Errorf("invalid daemon inspection selection: unexpected reservation token for id %d", a.ID)
+			}
+			if resp.ExhaustedFallback {
+				warnExhaustedFallback(cmd, daemonAccountName(m, resp.SelectedID), resp.ExtraEnabled, derefTime(resp.SoonestReset))
+			}
+			warnPinHeld(cmd, m, resp.PinHeldAccount, resp.SelectedID)
+			commit := func(context.Context) error { return nil }
+			abort := func() {}
+			if launch {
+				commit = func(ctx context.Context) error { return cl.CommitSelection(ctx, resp.ReservationToken) }
+				abort = func() { abortDaemonSelection(ctx, cl, resp.ReservationToken) }
+			}
+			return &selectionTxn{acct: a, dir: a.ConfigDir, line: daemonSelectionLine(m, resp), commit: commit, abort: abort}, nil
+		case outcomeError:
+			abortDaemonSelection(ctx, cl, resp.ReservationToken)
+			return nil, errors.New(resp.Error)
+		case outcomeFail:
+			abortDaemonSelection(ctx, cl, resp.ReservationToken)
+			if resp.MountsNotReady {
+				return nil, pool.ErrMountsNotReady
+			}
+			return nil, pool.ErrNoneAvailable
+		case outcomeWait:
+			abortDaemonSelection(ctx, cl, resp.ReservationToken)
+			if resp.SoonestReset != nil {
+				step(cmd.ErrOrStderr(), "All accounts are busy; waiting until %s.", humanizeReset(*resp.SoonestReset))
 			}
 		}
-		if err != nil {
-			return nil, err
+		timer := time.NewTimer(15 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
 		}
-		if sr.ExhaustedFallback {
-			warnExhaustedFallback(cmd, accountName(sr.Best.Label), sr.ExtraEnabled, sr.Result.ExhaustedUntil)
-		}
-		warnPinHeld(cmd, m, sr.PinHeldAccount, &sr.Best.ID)
-		dir, err := prepareAccount(ctx, cmd, m, sr.Best, true)
-		if err != nil {
-			return nil, err
-		}
-		return &selectionTxn{
-			acct: sr.Best, dir: dir, line: liveSelectionLine(sr),
-			commit: func(context.Context) error { return m.CommitSelection(sr, req.cwd, req.pid) },
-			abort:  func() {},
-		}, nil
 	}
 }
 
@@ -335,11 +223,6 @@ func daemonEnsureTimeout(ctx context.Context) time.Duration {
 		}
 	}
 	return limit
-}
-
-func daemonClientAt(ctx context.Context, cl *daemon.Client, wantVersion string) bool {
-	resp, err := cl.HealthContext(ctx)
-	return err == nil && resp.OK && resp.Version == wantVersion
 }
 
 func abortDaemonSelection(ctx context.Context, cl *daemon.Client, token string) {
@@ -369,6 +252,10 @@ func validateDaemonSelection(m *pool.Manager, resp *daemon.Response, forced *sto
 	}
 	if forced != nil && id != forced.ID {
 		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d does not match forced account %d, expected dir %q, returned dir %q", id, forced.ID, forced.ConfigDir, resp.Dir)
+	}
+	if resp.AccountInstanceID != a.InstanceID || resp.AccountGeneration != a.Generation {
+		return store.Account{}, fmt.Errorf("invalid daemon selection: account %d identity %s/%d, current %s/%d",
+			id, resp.AccountInstanceID, resp.AccountGeneration, a.InstanceID, a.Generation)
 	}
 	return a, nil
 }
@@ -433,48 +320,6 @@ func derefTime(t *time.Time) time.Time {
 	return *t
 }
 
-// prepareAccount performs the client-side launch prep after a pick. Direct picks
-// set reconcile; daemon-prepared picks do not repeat handleSelect's catch-up.
-func prepareAccount(ctx context.Context, cmd *cobra.Command, m *pool.Manager, a store.Account, reconcile bool) (string, error) {
-	if reconcile {
-		if err := m.ReconcileOverlay(ctx, a); err != nil {
-			if ctx.Err() != nil {
-				return "", ctx.Err()
-			}
-			warn(cmd.ErrOrStderr(), "couldn't reconcile this account's overlay: %v", err)
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	if reconcile {
-		mergeLaunchSettings(cmd, m, a)
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	if err := m.PreflightRefresh(ctx, a); err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		warnPreflight(cmd.ErrOrStderr(), a, err)
-	}
-	return a.ConfigDir, nil
-}
-
-// warnPreflight translates a non-fatal preflight-refresh error into operator
-// guidance on stderr.
-func warnPreflight(w io.Writer, a store.Account, err error) {
-	switch {
-	case errors.Is(err, pool.ErrNeedsLogin):
-		warn(w, "%s needs to log in again; run `ccp login %d`", accountName(a.Label), a.ID)
-	case errors.Is(err, pool.ErrUnrefreshable):
-		warn(w, "%s's token is expiring and this machine holds a synced copy it can't refresh — the origin rotates it, or run `ccp login %d` here", accountName(a.Label), a.ID)
-	default:
-		warn(w, "%v", err)
-	}
-}
-
 // mergeLaunchSettings warns rather than fails: a malformed ~/.claude.json must
 // not brick every pooled launch.
 func mergeLaunchSettings(cmd *cobra.Command, m *pool.Manager, a store.Account) {
@@ -483,8 +328,7 @@ func mergeLaunchSettings(cmd *cobra.Command, m *pool.Manager, a store.Account) {
 	}
 }
 
-// announceLine prints the diagnostic to stderr only when stdout is a TTY:
-// captured $(ccp select) callers get the bare dir and nothing else.
+// announceLine prints the inspection diagnostic to stderr only when stdout is a TTY.
 func announceLine(cmd *cobra.Command, line string) {
 	if !stdoutIsTTY() {
 		return
@@ -504,8 +348,4 @@ func selectionLine(name string, sticky, hasUsage bool, used5, used7 float64, sco
 
 func daemonSelectionLine(m *pool.Manager, resp *daemon.Response) string {
 	return selectionLine(daemonAccountName(m, resp.SelectedID), resp.Sticky, resp.HasUsage, 100-resp.Remaining5h, 100-resp.Remaining7d, resp.Scoped7dModel, resp.Scoped7dUtil)
-}
-
-func liveSelectionLine(sr *pool.SelectResult) string {
-	return selectionLine(accountName(sr.Best.Label), sr.Sticky, sr.HasUsage, sr.Util5h, sr.Util7d, sr.Scoped7dModel, sr.Scoped7dUtil)
 }

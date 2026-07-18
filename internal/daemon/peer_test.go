@@ -29,9 +29,8 @@ func setSocketPeerPID(t *testing.T, fn func(string) (int, error)) {
 	t.Cleanup(func() { socketPeerPID = old })
 }
 
-// TestDaemonPeerHealth: Health reports the wire version and the kernel-attested
-// socket peer pid (the Response itself carries no pid), State healthy, no
-// handoff feature.
+// TestDaemonPeerHealth: Health reports the exact build/protocol and the
+// kernel-attested socket peer pid (the Response itself carries no pid).
 func TestDaemonPeerHealth(t *testing.T) {
 	f := newFakeDaemon(t, "1.2.3", false)
 	setSocketPeerPID(t, func(socket string) (int, error) {
@@ -44,11 +43,8 @@ func TestDaemonPeerHealth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Health: %v", err)
 	}
-	if h.Version != "1.2.3" || h.PID != 4242 || h.State != daemon.StateHealthy {
-		t.Fatalf("Health = %+v, want {Version:1.2.3 PID:4242 State:healthy}", h)
-	}
-	if len(h.Features) != 0 {
-		t.Errorf("Features = %v, want none (no handoff advertised)", h.Features)
+	if h.Build != "1.2.3" || h.Protocol != ProtocolVersion || h.PID != 4242 || h.State != daemon.StateHealthy {
+		t.Fatalf("Health = %+v, want {Build:1.2.3 Protocol:%d PID:4242 State:healthy}", h, ProtocolVersion)
 	}
 }
 
@@ -101,6 +97,7 @@ func TestTakeoverVersionPolicy(t *testing.T) {
 			setSocketPeerPID(t, func(string) (int, error) { return deadPID, nil })
 			got, err := daemon.Run(t.Context(), daemon.TakeoverConfig{
 				Self:     tt.self,
+				Protocol: ProtocolVersion,
 				Peer:     &daemonPeer{socket: f.socket},
 				Contract: daemon.RequestDaemon,
 				WaitMode: daemon.SocketRelease,

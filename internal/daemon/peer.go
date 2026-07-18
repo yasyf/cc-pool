@@ -46,6 +46,9 @@ func (p *daemonPeer) request(ctx context.Context, req Request) (*Response, error
 // kernel-attested pid; State is healthy and Features nil (no handoff).
 func (p *daemonPeer) Health(ctx context.Context) (daemon.Health, error) {
 	resp, err := p.request(ctx, Request{Op: OpHealth})
+	if errors.Is(err, ErrDaemonUnavailable) {
+		return daemon.Health{}, daemon.ErrNoPeer
+	}
 	if err != nil {
 		return daemon.Health{}, err
 	}
@@ -53,7 +56,7 @@ func (p *daemonPeer) Health(ctx context.Context) (daemon.Health, error) {
 	if err != nil {
 		return daemon.Health{}, err
 	}
-	return daemon.Health{Version: resp.Version, PID: pid, State: daemon.StateHealthy}, nil
+	return daemon.Health{Build: resp.Version, Protocol: ProtocolVersion, PID: pid, State: daemon.StateHealthy}, nil
 }
 
 // Shutdown sends the frozen OpShutdown handshake, asking the incumbent to step

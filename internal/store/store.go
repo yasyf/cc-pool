@@ -3,39 +3,52 @@
 package store
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
 	_ "modernc.org/sqlite" // pure-Go "sqlite" driver
 )
 
 // Store wraps the sqlite connection.
 type Store struct {
-	db *sql.DB
+	db            *sql.DB
+	lifecycleLock *proc.FileLockHandle
+	now           func() time.Time
 }
 
 const schema = `
-CREATE TABLE IF NOT EXISTS meta (
+CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS accounts (
-  id               INTEGER PRIMARY KEY,
-  config_dir       TEXT NOT NULL UNIQUE,
-  keychain_service TEXT NOT NULL,
-  keychain_account TEXT NOT NULL,
+CREATE TABLE accounts (
+  id               INTEGER PRIMARY KEY CHECK(id > 0),
+  instance_id      TEXT NOT NULL UNIQUE CHECK(length(instance_id) = 32 AND instance_id NOT GLOB '*[^0-9a-f]*'),
+  generation       INTEGER NOT NULL CHECK(generation > 0),
+  config_dir       TEXT NOT NULL UNIQUE CHECK(config_dir <> ''),
+  keychain_service TEXT NOT NULL CHECK(keychain_service <> ''),
+  keychain_account TEXT NOT NULL CHECK(keychain_account <> ''),
   label            TEXT NOT NULL DEFAULT '',
   overlay_kind     TEXT NOT NULL DEFAULT 'symlink',
   account_uuid     TEXT NOT NULL DEFAULT '',
   created_at       INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS pending_adds (
+CREATE TABLE pending_adds (
   id         INTEGER PRIMARY KEY,
   created_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS usage_samples (
+CREATE TABLE usage_samples (
   account_id    INTEGER NOT NULL,
   ts            INTEGER NOT NULL,
   util_5h       REAL,
@@ -51,33 +64,44 @@ CREATE TABLE IF NOT EXISTS usage_samples (
   scoped_7d_model  TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (account_id, ts)
 );
-CREATE INDEX IF NOT EXISTS idx_usage_acct_ts ON usage_samples(account_id, ts DESC);
-CREATE TABLE IF NOT EXISTS sessions (
+CREATE INDEX idx_usage_acct_ts ON usage_samples(account_id, ts DESC);
+CREATE TABLE sessions (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  account_id   INTEGER NOT NULL,
-  pid          INTEGER,
-  config_dir   TEXT,
+  account_id   INTEGER NOT NULL CHECK(account_id > 0),
+  account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation INTEGER NOT NULL CHECK(account_generation > 0),
+  pid          INTEGER NOT NULL CHECK(pid > 0),
+  process_started_at INTEGER NOT NULL CHECK(process_started_at > 0),
+  config_dir   TEXT NOT NULL CHECK(config_dir <> ''),
   cwd          TEXT NOT NULL DEFAULT '',
-  started_at   INTEGER NOT NULL,
+  started_at   INTEGER NOT NULL CHECK(started_at > 0),
   last_seen_at INTEGER,
   ended_at     INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(account_id) WHERE ended_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd, ended_at);
-CREATE TABLE IF NOT EXISTS refresh_log (
+CREATE INDEX idx_sessions_active ON sessions(account_id) WHERE ended_at IS NULL;
+CREATE INDEX idx_sessions_cwd ON sessions(cwd, ended_at);
+CREATE TABLE selection_terminals (
+  token               TEXT PRIMARY KEY CHECK(length(token) = 32 AND token NOT GLOB '*[^0-9a-f]*'),
+  account_id          INTEGER NOT NULL CHECK(account_id > 0),
+  account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation  INTEGER NOT NULL CHECK(account_generation > 0),
+  committed_at        INTEGER NOT NULL CHECK(committed_at > 0),
+  expires_at          INTEGER NOT NULL CHECK(expires_at > committed_at)
+);
+CREATE TABLE refresh_log (
   account_id INTEGER NOT NULL,
   ts         INTEGER NOT NULL,
   ok         INTEGER NOT NULL,
   err        TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (account_id, ts)
 );
-CREATE TABLE IF NOT EXISTS sticky (
+CREATE TABLE sticky (
   cwd         TEXT PRIMARY KEY,
   account_id  INTEGER NOT NULL,
   selected_at INTEGER NOT NULL,
   manual      INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS auth_health (
+CREATE TABLE auth_health (
   account_id  INTEGER PRIMARY KEY,
   needs_login INTEGER NOT NULL DEFAULT 0,
   since       INTEGER,
@@ -85,12 +109,12 @@ CREATE TABLE IF NOT EXISTS auth_health (
   kind        TEXT NOT NULL DEFAULT '',
   gen         INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS journal_risks (
+CREATE TABLE journal_risks (
   dir         TEXT PRIMARY KEY,
   warning     TEXT NOT NULL DEFAULT '',
   recorded_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS overlay_applied (
+CREATE TABLE overlay_applied (
   account_id      INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
   backend         TEXT NOT NULL,
   canonical_stamp TEXT NOT NULL,
@@ -99,8 +123,26 @@ CREATE TABLE IF NOT EXISTS overlay_applied (
   app_stamp       TEXT NOT NULL,
   applied_at      INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_accounts_uuid ON accounts(account_uuid);
+CREATE INDEX idx_accounts_uuid ON accounts(account_uuid);
 `
+
+// SchemaVersion is the only runtime schema accepted by this binary.
+const SchemaVersion = 2
+
+// ErrSchemaMismatch means the database must be cut over explicitly while the
+// service is stopped. Open never mutates an existing schema.
+var ErrSchemaMismatch = errors.New("store schema mismatch")
+
+const (
+	selectionTerminalTTL   = 10 * time.Minute
+	selectionTerminalLimit = 4096
+)
+
+var (
+	expectedSchemaOnce sync.Once
+	expectedSchemaHash string
+	expectedSchemaErr  error
+)
 
 const upsertStickySQL = `INSERT INTO sticky(cwd,account_id,selected_at,manual) VALUES(?,?,?,0)
  ON CONFLICT(cwd) DO UPDATE SET
@@ -108,57 +150,155 @@ const upsertStickySQL = `INSERT INTO sticky(cwd,account_id,selected_at,manual) V
    selected_at=excluded.selected_at
  WHERE manual = 0 OR account_id = excluded.account_id`
 
-// Open opens (creating if needed) the database at path and applies the schema.
+// Open opens path. It creates the current schema only for a completely empty
+// database; every existing database must match the exact current schema.
 func Open(path string) (*Store, error) {
+	path, err := canonicalDatabasePath(path)
+	if err != nil {
+		return nil, err
+	}
+	lifecycleLock, err := proc.FileLockSpec{
+		Path: path + ".lifecycle.lock", Mode: proc.FileLockShared, Deadline: time.Second,
+	}.TryAcquire()
+	if err != nil {
+		return nil, fmt.Errorf("open store lifecycle: %w", err)
+	}
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)")
 	if err != nil {
+		_ = lifecycleLock.Close()
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1) // serialize writes
-	s := &Store{db: db}
-	if err := s.applySchema(); err != nil {
+	s := &Store{db: db, lifecycleLock: lifecycleLock, now: time.Now}
+	if err := s.initializeOrVerifySchema(); err != nil {
 		_ = db.Close()
+		_ = lifecycleLock.Close()
+		return nil, err
+	}
+	if err := requireSingleLinkDatabase(path); err != nil {
+		_ = db.Close()
+		_ = lifecycleLock.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) applySchema() error {
-	if _, err := s.db.Exec(schema); err != nil {
-		return fmt.Errorf("apply schema: %w", err)
+func canonicalDatabasePath(path string) (string, error) {
+	if path == "" {
+		return "", errors.New("open store: database path is required")
 	}
-	if err := s.ensureColumn("auth_health", "gen", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-		return err
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved), nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("resolve store path: %w", err)
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return "", fmt.Errorf("resolve store parent: %w", err)
+	}
+	return filepath.Join(parent, filepath.Base(abs)), nil
+}
+
+func requireSingleLinkDatabase(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect store database: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || stat.Nlink != 1 {
+		return fmt.Errorf("open store: database must be one regular single-link file: %s", path)
 	}
 	return nil
 }
 
-// ensureColumn adds column (with declaration decl) to table when it is absent.
-// Errors fail Open — running against a half-migrated schema is never
-// acceptable.
-func (s *Store) ensureColumn(table, column, decl string) error {
-	var n int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
-		return fmt.Errorf("inspect %s.%s: %w", table, column, err)
+func (s *Store) initializeOrVerifySchema() error {
+	var objects, version int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL`).Scan(&objects); err != nil {
+		return fmt.Errorf("inspect store schema: %w", err)
 	}
-	if n > 0 {
-		return nil
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("inspect store schema version: %w", err)
 	}
-	// table/column/decl are compile-time constants; nothing user-controlled.
-	if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, decl)); err != nil {
-		// Two processes can race the check-then-ALTER on the first open after
-		// an upgrade (sqlite has no ADD COLUMN IF NOT EXISTS). The
-		// postcondition is "column exists" — re-check before failing so the
-		// duplicate-column loser swallows its error.
-		var again int
-		if err2 := s.db.QueryRow(
-			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&again); err2 == nil && again > 0 {
-			return nil
+	if objects == 0 {
+		if version != 0 {
+			return fmt.Errorf("%w: empty database has version %d", ErrSchemaMismatch, version)
 		}
-		return fmt.Errorf("add column %s.%s: %w", table, column, err)
+		if _, err := s.db.Exec(schema); err != nil {
+			return fmt.Errorf("create store schema: %w", err)
+		}
+		if _, err := s.db.Exec(fmt.Sprintf(`PRAGMA user_version=%d`, SchemaVersion)); err != nil {
+			return fmt.Errorf("stamp store schema: %w", err)
+		}
+	}
+	return verifySchema(s.db)
+}
+
+func verifySchema(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read store schema version: %w", err)
+	}
+	if version != SchemaVersion {
+		return fmt.Errorf("%w: database=%d binary=%d; stop cc-pool and run `ccp store-cutover`", ErrSchemaMismatch, version, SchemaVersion)
+	}
+	want, err := exactSchemaHash()
+	if err != nil {
+		return err
+	}
+	got, err := schemaHash(db)
+	if err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("%w: schema fingerprint %s, want %s", ErrSchemaMismatch, got, want)
 	}
 	return nil
+}
+
+func exactSchemaHash() (string, error) {
+	expectedSchemaOnce.Do(func() {
+		db, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			expectedSchemaErr = err
+			return
+		}
+		defer func() { _ = db.Close() }()
+		if _, err := db.Exec(schema); err != nil {
+			expectedSchemaErr = fmt.Errorf("build expected store schema: %w", err)
+			return
+		}
+		expectedSchemaHash, expectedSchemaErr = schemaHash(db)
+	})
+	return expectedSchemaHash, expectedSchemaErr
+}
+
+func schemaHash(db *sql.DB) (string, error) {
+	rows, err := db.Query(`SELECT type,name,tbl_name,sql FROM sqlite_schema
+		WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY type,name`)
+	if err != nil {
+		return "", fmt.Errorf("read store schema: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	h := sha256.New()
+	for rows.Next() {
+		var kind, name, table, statement string
+		if err := rows.Scan(&kind, &name, &table, &statement); err != nil {
+			return "", fmt.Errorf("scan store schema: %w", err)
+		}
+		for _, field := range []string{kind, name, table, statement} {
+			_, _ = h.Write([]byte(field))
+			_, _ = h.Write([]byte{0})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // GetMeta returns the meta value for key, ok=false if absent.
@@ -186,7 +326,11 @@ func (s *Store) SetMeta(key, value string) error {
 }
 
 // Close closes the database.
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	dbErr := s.db.Close()
+	lockErr := s.lifecycleLock.Close()
+	return errors.Join(dbErr, lockErr)
+}
 
 // rowExecer is the write subset shared by *sql.DB and *sql.Tx, so an account
 // upsert composes into a caller's transaction (see PromoteReservedAccount).
@@ -201,24 +345,40 @@ func (s *Store) UpsertAccount(a Account) error {
 }
 
 func upsertAccount(e rowExecer, a Account) error {
+	instanceID, err := NewAccountInstanceID()
+	if err != nil {
+		return err
+	}
 	created := a.CreatedAt
 	if created.IsZero() {
 		created = time.Now()
 	}
-	_, err := e.Exec(
-		`INSERT INTO accounts(id,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at)
-		 VALUES(?,?,?,?,?,?,?,?)
+	_, err = e.Exec(
+		`INSERT INTO accounts(id,instance_id,generation,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   config_dir=excluded.config_dir,
 		   keychain_service=excluded.keychain_service,
 		   keychain_account=excluded.keychain_account,
 		   label=excluded.label,
+		   generation=accounts.generation + CASE
+		     WHEN accounts.config_dir <> excluded.config_dir OR accounts.overlay_kind <> excluded.overlay_kind THEN 1
+		     ELSE 0 END,
 		   overlay_kind=excluded.overlay_kind`,
-		a.ID, a.ConfigDir, a.KeychainService, a.KeychainAccount, a.Label, a.OverlayKind, a.AccountUUID, created.Unix())
+		a.ID, instanceID, 1, a.ConfigDir, a.KeychainService, a.KeychainAccount, a.Label, a.OverlayKind, a.AccountUUID, created.Unix())
 	if err != nil {
 		return fmt.Errorf("upsert account %d: %w", a.ID, err)
 	}
 	return nil
+}
+
+// NewAccountInstanceID returns a random immutable 128-bit account instance id.
+func NewAccountInstanceID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate account instance id: %w", err)
+	}
+	return hex.EncodeToString(raw[:]), nil
 }
 
 // SetAccountLabel updates an account's label.
@@ -240,7 +400,7 @@ func (s *Store) SetAccountLabel(id int, label string) error {
 // SetAccountOverlayKind records an account's overlay provider; a targeted
 // UPDATE so it can't clobber concurrent updates to the row's other columns.
 func (s *Store) SetAccountOverlayKind(id int, kind string) error {
-	res, err := s.db.Exec(`UPDATE accounts SET overlay_kind=? WHERE id=?`, kind, id)
+	res, err := s.db.Exec(`UPDATE accounts SET overlay_kind=?, generation=generation+1 WHERE id=? AND overlay_kind<>?`, kind, id, kind)
 	if err != nil {
 		return fmt.Errorf("set overlay kind for account %d: %w", id, err)
 	}
@@ -249,7 +409,9 @@ func (s *Store) SetAccountOverlayKind(id int, kind string) error {
 		return err
 	}
 	if n == 0 {
-		return fmt.Errorf("account %d not found", id)
+		if _, err := s.GetAccount(id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -257,7 +419,7 @@ func (s *Store) SetAccountOverlayKind(id int, kind string) error {
 func scanAccount(rows interface{ Scan(...any) error }) (Account, error) {
 	var a Account
 	var created int64
-	if err := rows.Scan(&a.ID, &a.ConfigDir, &a.KeychainService, &a.KeychainAccount,
+	if err := rows.Scan(&a.ID, &a.InstanceID, &a.Generation, &a.ConfigDir, &a.KeychainService, &a.KeychainAccount,
 		&a.Label, &a.OverlayKind, &a.AccountUUID, &created); err != nil {
 		return a, err
 	}
@@ -265,7 +427,7 @@ func scanAccount(rows interface{ Scan(...any) error }) (Account, error) {
 	return a, nil
 }
 
-const accountCols = `id,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at`
+const accountCols = `id,instance_id,generation,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at`
 
 // ListAccounts returns all accounts ordered by id.
 func (s *Store) ListAccounts() ([]Account, error) {
@@ -491,48 +653,130 @@ func (s *Store) UsageSamplesSince(accountID int, since time.Time) ([]UsageSample
 	return out, rows.Err()
 }
 
-// OpenSession records a new checkout at time at and returns its id. cwd is the
-// launch directory ("" when unknown), feeding the sticky activity rules.
-func (s *Store) OpenSession(accountID, pid int, configDir, cwd string, at time.Time) (int64, error) {
-	res, err := s.db.Exec(
-		`INSERT INTO sessions(account_id,pid,config_dir,cwd,started_at) VALUES(?,?,?,?,?)`,
-		accountID, pid, configDir, cwd, at.Unix())
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
-}
+// ErrAccountGenerationChanged means a reserved account was replaced or its
+// tenant-defining shape changed before activation.
+var ErrAccountGenerationChanged = errors.New("account generation changed")
 
-// CommitSelection atomically records the delayed effects of a provisional
-// selection. A non-empty cwd is recorded only when recordSticky is true, and a
-// session is opened only when pid is positive.
-func (s *Store) CommitSelection(accountID, pid int, configDir, cwd string, at time.Time, recordSticky bool) (err error) {
-	if pid <= 0 && (!recordSticky || cwd == "") {
-		return nil
+// ActivateSelection atomically verifies the reserved account identity and
+// generation, then records sticky/session state. No filesystem or provider I/O
+// occurs in this transaction.
+func (s *Store) ActivateSelection(a SelectionActivation) (err error) {
+	if err := validateSelectionToken(a.Token); err != nil {
+		return fmt.Errorf("activate selection: %w", err)
+	}
+	if a.Process.PID <= 0 {
+		return errors.New("activate selection: positive process pid is required")
+	}
+	if a.Process.StartedAt.IsZero() {
+		return errors.New("activate selection: process start time is required")
+	}
+	if a.At.IsZero() {
+		a.At = s.now()
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("begin selection commit: %w", err)
+		return fmt.Errorf("begin selection activation: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
+	terminalNow := s.now()
+	if err = pruneSelectionTerminals(tx, terminalNow); err != nil {
+		return fmt.Errorf("prune selection terminals: %w", err)
+	}
+	var terminalAccountID int
+	var terminalInstanceID string
+	var terminalGeneration uint64
+	err = tx.QueryRow(
+		`SELECT account_id,account_instance_id,account_generation FROM selection_terminals WHERE token=?`, a.Token,
+	).Scan(&terminalAccountID, &terminalInstanceID, &terminalGeneration)
+	if err == nil {
+		if terminalAccountID != a.AccountID || terminalInstanceID != a.ExpectedInstanceID || terminalGeneration != a.ExpectedGeneration {
+			return fmt.Errorf("activate selection: token %s belongs to account %d %s/%d", a.Token,
+				terminalAccountID, terminalInstanceID, terminalGeneration)
 		}
-	}()
-	if recordSticky && cwd != "" {
-		if _, err = tx.Exec(upsertStickySQL, cwd, accountID, at.Unix()); err != nil {
-			return fmt.Errorf("commit selection sticky for %s: %w", cwd, err)
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read selection terminal: %w", err)
+	}
+	var instanceID, configDir string
+	var generation uint64
+	if err = tx.QueryRow(`SELECT instance_id,generation,config_dir FROM accounts WHERE id=?`, a.AccountID).Scan(&instanceID, &generation, &configDir); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("activate selection account %d: %w", a.AccountID, ErrAccountNotFound)
+		}
+		return fmt.Errorf("activate selection account %d: %w", a.AccountID, err)
+	}
+	if instanceID != a.ExpectedInstanceID || generation != a.ExpectedGeneration {
+		return fmt.Errorf("%w: account=%d reserved=%s/%d current=%s/%d", ErrAccountGenerationChanged,
+			a.AccountID, a.ExpectedInstanceID, a.ExpectedGeneration, instanceID, generation)
+	}
+	if a.RecordSticky && a.Cwd != "" {
+		if _, err = tx.Exec(upsertStickySQL, a.Cwd, a.AccountID, a.At.Unix()); err != nil {
+			return fmt.Errorf("activate selection sticky for %s: %w", a.Cwd, err)
 		}
 	}
-	if pid > 0 {
-		if _, err = tx.Exec(
-			`INSERT INTO sessions(account_id,pid,config_dir,cwd,started_at) VALUES(?,?,?,?,?)`,
-			accountID, pid, configDir, cwd, at.Unix()); err != nil {
-			return fmt.Errorf("commit selection session for account %d: %w", accountID, err)
-		}
+	if _, err = tx.Exec(
+		`INSERT INTO sessions(account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at)
+		 VALUES(?,?,?,?,?,?,?,?)`,
+		a.AccountID, instanceID, generation, a.Process.PID, a.Process.StartedAt.UnixMicro(), configDir, a.Cwd, a.At.Unix()); err != nil {
+		return fmt.Errorf("activate selection session for account %d: %w", a.AccountID, err)
+	}
+	if _, err = tx.Exec(
+		`INSERT INTO selection_terminals(token,account_id,account_instance_id,account_generation,committed_at,expires_at) VALUES(?,?,?,?,?,?)`,
+		a.Token, a.AccountID, instanceID, generation, terminalNow.Unix(), terminalNow.Add(selectionTerminalTTL).Unix()); err != nil {
+		return fmt.Errorf("record selection terminal: %w", err)
+	}
+	if err = pruneSelectionTerminals(tx, terminalNow); err != nil {
+		return fmt.Errorf("bound selection terminals: %w", err)
 	}
 	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit selection transaction: %w", err)
+		return fmt.Errorf("commit selection activation: %w", err)
+	}
+	return nil
+}
+
+// SelectionCommitted reports whether token's activation committed durably.
+func (s *Store) SelectionCommitted(token string) (bool, error) {
+	if err := validateSelectionToken(token); err != nil {
+		return false, err
+	}
+	if err := pruneSelectionTerminals(s.db, s.now()); err != nil {
+		return false, fmt.Errorf("prune selection terminals: %w", err)
+	}
+	var present int
+	err := s.db.QueryRow(`SELECT 1 FROM selection_terminals WHERE token=?`, token).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+type selectionTerminalExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func pruneSelectionTerminals(exec selectionTerminalExecer, now time.Time) error {
+	if _, err := exec.Exec(`DELETE FROM selection_terminals WHERE expires_at<=?`, now.Unix()); err != nil {
+		return err
+	}
+	_, err := exec.Exec(`DELETE FROM selection_terminals WHERE rowid IN (
+		SELECT rowid FROM selection_terminals
+		ORDER BY committed_at DESC, rowid DESC
+		LIMIT -1 OFFSET ?
+	)`, selectionTerminalLimit)
+	return err
+}
+
+func validateSelectionToken(token string) error {
+	raw, err := hex.DecodeString(token)
+	if err != nil || len(raw) != 16 {
+		return errors.New("selection token must be exactly 16 bytes of lowercase hex")
+	}
+	if token != strings.ToLower(token) {
+		return errors.New("selection token must be exactly 16 bytes of lowercase hex")
 	}
 	return nil
 }
@@ -542,22 +786,6 @@ func (s *Store) CloseSession(id int64, at time.Time) error {
 	_, err := s.db.Exec(`UPDATE sessions SET ended_at=? WHERE id=? AND ended_at IS NULL`,
 		at.Unix(), id)
 	return err
-}
-
-// CloseAccountSessionsPID closes every still-active row for one account and
-// process. The account qualifier makes a replayed or PID-reused checkin unable
-// to end another account's session.
-func (s *Store) CloseAccountSessionsPID(accountID, pid int, at time.Time) (int, error) {
-	res, err := s.db.Exec(`UPDATE sessions SET ended_at=?
-		WHERE account_id=? AND pid=? AND ended_at IS NULL`, at.Unix(), accountID, pid)
-	if err != nil {
-		return 0, fmt.Errorf("close account %d sessions for pid %d: %w", accountID, pid, err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("close account %d sessions for pid %d: rows affected: %w", accountID, pid, err)
-	}
-	return int(n), nil
 }
 
 // ActiveSessionCount returns the number of live sessions for an account.
@@ -571,7 +799,8 @@ func (s *Store) ActiveSessionCount(accountID int) (int, error) {
 // ListActiveSessions returns all live sessions across accounts.
 func (s *Store) ListActiveSessions() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id,account_id,pid,config_dir,cwd,started_at,last_seen_at FROM sessions WHERE ended_at IS NULL`)
+		`SELECT id,account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at,last_seen_at
+		 FROM sessions WHERE ended_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -580,13 +809,13 @@ func (s *Store) ListActiveSessions() ([]Session, error) {
 	for rows.Next() {
 		var se Session
 		var started int64
-		var pid, seen sql.NullInt64
-		var cd sql.NullString
-		if err := rows.Scan(&se.ID, &se.AccountID, &pid, &cd, &se.Cwd, &started, &seen); err != nil {
+		var processStarted int64
+		var seen sql.NullInt64
+		if err := rows.Scan(&se.ID, &se.AccountID, &se.AccountInstanceID, &se.AccountGeneration,
+			&se.PID, &processStarted, &se.ConfigDir, &se.Cwd, &started, &seen); err != nil {
 			return nil, err
 		}
-		se.PID = int(pid.Int64)
-		se.ConfigDir = cd.String
+		se.ProcessStartedAt = time.UnixMicro(processStarted)
 		se.StartedAt = time.Unix(started, 0)
 		if seen.Valid {
 			t := time.Unix(seen.Int64, 0)
@@ -614,7 +843,7 @@ func (s *Store) touchSession(id int64, at time.Time) error {
 // SessionReapGrace are closed. A dead row's end is stamped at its last-seen (or
 // start), never observation time — else a reap after a long observer gap
 // fabricates a warm sticky cache from a session that died hours ago.
-func (s *Store) CloseDeadSessions(alive map[int]bool, at time.Time) (int, error) {
+func (s *Store) CloseDeadSessions(alive map[int]time.Time, at time.Time) (int, error) {
 	sessions, err := s.ListActiveSessions()
 	if err != nil {
 		return 0, err
@@ -624,7 +853,7 @@ func (s *Store) CloseDeadSessions(alive map[int]bool, at time.Time) (int, error)
 		if se.PID <= 0 {
 			continue
 		}
-		if alive[se.PID] {
+		if started, ok := alive[se.PID]; ok && started.Equal(se.ProcessStartedAt) {
 			if err := s.touchSession(se.ID, at); err != nil {
 				return closed, err
 			}
@@ -669,7 +898,8 @@ func (s *Store) GetCwdActivity(cwd string, accountID int) (CwdActivity, error) {
 // It never downgrades or repoints a manual pin: a conflict repoints/refreshes
 // an auto pin, refreshes a manual pin only when the select landed on the pinned
 // account, and is a no-op when a manual pin points elsewhere. One atomic
-// statement, since the daemon and a live-path CLI would race a read-modify-write.
+// statement, since daemon activation and manual pin commands can race a
+// read-modify-write.
 func (s *Store) UpsertSticky(cwd string, accountID int, at time.Time) error {
 	_, err := s.db.Exec(upsertStickySQL, cwd, accountID, at.Unix())
 	if err != nil {

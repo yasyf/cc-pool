@@ -104,7 +104,7 @@ The widget ships as its own cask, `yasyf/tap/cc-pool-status`, and shows per-acco
 | `ccp add` | Pool a subscription via its own `claude /login`; auto-inits the pool and starts the daemon |
 | `ccp run [claude args…]` | Select the emptiest account and exec `claude`, forwarding every arg |
 | `ccp status` | Per-account usage, score, and sessions; TUI on a terminal, plain table when piped |
-| `ccp select` | Print the chosen account's config dir on stdout, the composable hot path |
+| `ccp select` | Inspect and print the daemon-prepared best account without creating a session; launch only with `ccp run` |
 | `ccp sync` | Mirror the pool — accounts, credentials, removals — across Macs on a synckit mesh |
 | `ccp doctor` | Check accounts' Keychain items and overlays; `--fix` repairs drift |
 | `ccp service` | Manage the daemon and mount holder via `install`, `uninstall`, and `status` |

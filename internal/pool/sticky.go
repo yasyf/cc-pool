@@ -93,8 +93,8 @@ func (m *Manager) StickyPick(cwd string, ranked []score.Result, now time.Time) (
 	}
 	ps := m.classify(st, now)
 	if !ps.alive(now) {
-		// Expired but unpruned — the daemonless path has no pruner, and an expired
-		// manual row would block UpsertSticky forever. Version-guarded so a newer
+		// Expired but not yet pruned by the scheduler. A manual row would block
+		// UpsertSticky forever, so reads self-prune it. Version-guarded so a newer
 		// concurrent pin is never erased on this stale read. Best-effort.
 		_ = m.Store.DeleteStickyVersion(cwd, st.SelectedAt, st.Manual)
 		return score.Result{}, StickyMiss

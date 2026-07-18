@@ -5,6 +5,8 @@ import "time"
 // Account is one pool account. ID is the account index (>= 1).
 type Account struct {
 	ID              int
+	InstanceID      string
+	Generation      uint64
 	ConfigDir       string // exact string exported as CLAUDE_CONFIG_DIR
 	KeychainService string
 	KeychainAccount string
@@ -41,17 +43,40 @@ type UsageSample struct {
 
 // Session is a checkout of an account to a live claude process.
 type Session struct {
-	ID        int64
-	AccountID int
-	PID       int
-	ConfigDir string
-	Cwd       string // launch working directory; "" when unknown (never matches a pin)
-	StartedAt time.Time
+	ID                int64
+	AccountID         int
+	AccountInstanceID string
+	AccountGeneration uint64
+	PID               int
+	ProcessStartedAt  time.Time
+	ConfigDir         string
+	Cwd               string // launch working directory; "" when unknown (never matches a pin)
+	StartedAt         time.Time
 	// LastSeenAt is when a reconcile scan last observed the pid alive; nil
 	// when never observed. Dead rows are closed at this time, not at reap
 	// time, so an observer gap cannot fabricate a recent session end.
 	LastSeenAt *time.Time
 	EndedAt    *time.Time
+}
+
+// ProcessIdentity is the kernel identity of the process that owns a session.
+// PID alone is not an identity because the kernel reuses it.
+type ProcessIdentity struct {
+	PID       int
+	StartedAt time.Time
+}
+
+// SelectionActivation is the compare-and-swap payload that turns a short
+// reservation into sticky/session state.
+type SelectionActivation struct {
+	Token              string
+	AccountID          int
+	ExpectedInstanceID string
+	ExpectedGeneration uint64
+	Process            ProcessIdentity
+	Cwd                string
+	RecordSticky       bool
+	At                 time.Time
 }
 
 // Sticky is the account pinned to a working directory, used to keep resumed

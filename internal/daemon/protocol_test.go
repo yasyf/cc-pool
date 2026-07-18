@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 )
 
@@ -88,6 +89,14 @@ func TestClientRejectsIncompatibleProtocol(t *testing.T) {
 	_, err = (&Client{socket: socket}).HealthContext(ctx)
 	if !errors.Is(err, ErrProtocolMismatch) {
 		t.Fatalf("HealthContext err = %v, want protocol mismatch", err)
+	}
+}
+
+func TestClientSelectRequiresReachableDaemon(t *testing.T) {
+	client := &Client{socket: filepath.Join(t.TempDir(), "missing.sock")}
+	_, err := client.Select(t.Context(), nil, store.ProcessIdentity{}, "/project", false, nil)
+	if !errors.Is(err, ErrDaemonUnavailable) {
+		t.Fatalf("Select without daemon = %v, want ErrDaemonUnavailable", err)
 	}
 }
 

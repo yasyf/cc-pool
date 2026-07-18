@@ -27,24 +27,19 @@ var ErrMountsNotReady = errors.New("no account is currently available: every acc
 
 // SelectOptions tunes a selection.
 type SelectOptions struct {
-	// Live samples usage synchronously for accounts staler than FreshFor
-	// (no-daemon path); false uses only cached samples.
+	// Live samples usage synchronously for accounts staler than FreshFor;
+	// false uses only cached samples.
 	Live bool
 	// FreshFor is the cache window for Live sampling.
 	FreshFor time.Duration
 	// Cwd is the caller's working directory, keying select stickiness.
 	// Empty disables stickiness.
 	Cwd string
-	// PID > 0 marks the launching process as a session checkout, feeding the
-	// sticky activity rules (`ccp run` execs claude in-place: its pid IS claude's).
-	PID int
 	// NoFallback returns ErrNoneAvailable instead of a least-bad exhausted pick;
 	// set by --wait callers, which would discard the pick to keep waiting.
 	NoFallback bool
 	// ExcludeIDs removes accounts that failed an account-local launch gate.
 	ExcludeIDs []int
-	// DeferCommit leaves stickiness and the session row untouched until CommitSelection.
-	DeferCommit bool
 }
 
 // DefaultFreshFor is the default cache window for live selection.
@@ -77,7 +72,6 @@ type SelectResult struct {
 	// otherwise; callers must surface the bypass when Best differs from it.
 	PinHeldAccount *int
 	byID           map[int]store.Account
-	recordSticky   bool
 }
 
 // Select scores all accounts and returns the best available one.
@@ -114,10 +108,10 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 
 	now := time.Now()
 	if scanErr == nil {
-		// Self-heal dead-pid session rows (no daemon reconciles); else their cwd
-		// pins never expire. Gated on scan success, not on non-empty sessions: a
-		// clean scan finding zero claude processes must still close every row.
-		_, _ = m.Store.CloseDeadSessions(procscan.AlivePIDs(sessions), now)
+		// Self-heal dead-pid session rows after an authoritative scan. Gated on
+		// scan success, not on non-empty sessions: a clean scan finding zero
+		// claude processes must still close every row.
+		_, _ = m.Store.CloseDeadSessions(procscan.AliveProcesses(sessions), now)
 	}
 	inputs := make([]score.Input, 0, len(accts))
 	byID := make(map[int]store.Account, len(accts))
@@ -153,40 +147,18 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 			return &SelectResult{Ranked: ranked, byID: byID}, ErrNoneAvailable
 		}
 	}
-	// Don't re-record a held pin unless the ranking landed on it anyway. Best-effort:
-	// stickiness must never fail a select.
-	recordSticky := !outcome.Held() || best.AccountID == pin.AccountID
-	if !opts.DeferCommit && recordSticky {
-		_ = m.RecordSticky(opts.Cwd, best.AccountID, now)
-	}
-	if !opts.DeferCommit && opts.PID > 0 {
-		// Best-effort: a session row feeds the activity rules.
-		_, _ = m.Store.OpenSession(best.AccountID, opts.PID, byID[best.AccountID].ConfigDir, opts.Cwd, now)
-	}
 	bi := inByID[best.AccountID]
 	res := &SelectResult{
 		Best: byID[best.AccountID], Result: best, Ranked: ranked,
 		Sticky: outcome == StickyBind, HasUsage: bi.HasUsage, Util5h: bi.Util5h, Util7d: bi.Util7d,
 		ExhaustedFallback: fallback, ExtraEnabled: extraByID[best.AccountID], byID: byID,
 		Scoped7dModel: scopedModelByID[best.AccountID], Scoped7dUtil: bi.Util7dScoped,
-		recordSticky: recordSticky,
 	}
 	if outcome == StickyHoldManual {
 		held := pin.AccountID
 		res.PinHeldAccount = &held
 	}
 	return res, nil
-}
-
-// CommitSelection records the delayed sticky and session effects of a provisional selection.
-func (m *Manager) CommitSelection(sr *SelectResult, cwd string, pid int) error {
-	if sr == nil {
-		return errors.New("commit selection: nil result")
-	}
-	if err := m.Store.CommitSelection(sr.Best.ID, pid, sr.Best.ConfigDir, cwd, time.Now(), sr.recordSticky); err != nil {
-		return fmt.Errorf("commit selection: %w", err)
-	}
-	return nil
 }
 
 // sampleStale concurrently refreshes usage for accounts staler than freshFor.
@@ -212,8 +184,8 @@ func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessio
 			defer wg.Done()
 			cctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 			defer cancel()
-			// Daemonless path never busy-refreshes: only the daemon owns the
-			// consecutive-401 streak that gates it.
+			// One-shot live sampling never busy-refreshes: only the daemon scheduler
+			// owns the consecutive-401 streak that gates it.
 			_, _, _, _ = m.SampleUsage(cctx, a, SampleOpts{AllowRefresh: allowRefresh})
 		}()
 	}

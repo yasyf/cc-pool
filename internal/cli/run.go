@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/execguard"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/fileproviderd"
 	"github.com/yasyf/fusekit/lease"
@@ -95,15 +96,8 @@ process tree — signals, the controlling terminal, and the exit code are all cl
 
 Every argument is forwarded verbatim, with no ` + "`--`" + ` separator (e.g.
 ` + "`ccp run --resume`" + `). Set ` + ccpAccountEnv + `=<id> to force a specific account
-instead of auto-selecting.
-
-This is the imperative equivalent of:
-
-    CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CODE_DEBUG_LOGS_DIR="$HOME/.claude/debug" CLAUDE_CONFIG_DIR=$(ccp select) claude ...
-
-(The plugin var keeps the session writing canonical ~/.claude plugin paths into
-the shared plugin state; the debug var keeps DEBUG=1's verbose per-session log
-off the fuse-t mirror, where the bulk write would wedge it. ` + "`ccp run`" + ` sets both for you.)`,
+instead of auto-selecting. This is the only supported pooled launch path; it
+records the exact process identity before replacing itself with Claude Code.`,
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withManager(func(m *pool.Manager) error {
@@ -124,6 +118,11 @@ func runClaude(cmd *cobra.Command, m *pool.Manager, args []string) error {
 	if err != nil {
 		return err
 	}
+	identity, err := procscan.Identity(os.Getpid())
+	if err != nil {
+		return fmt.Errorf("identify launch process: %w", err)
+	}
+	process := store.ProcessIdentity{PID: identity.PID, StartedAt: identity.StartedAt}
 	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just disables stickiness
 	base := cmd.Context()
 	if base == nil {
@@ -134,7 +133,7 @@ func runClaude(cmd *cobra.Command, m *pool.Manager, args []string) error {
 	return runLaunchCandidates(ctx, account != nil,
 		func(excluded []int) (*selectionTxn, error) {
 			return resolveSelectionTxn(ctx, cmd, m, selectReq{
-				account: account, cwd: cwd, pid: os.Getpid(), excludeIDs: excluded,
+				account: account, cwd: cwd, process: process, excludeIDs: excluded,
 			})
 		},
 		func(selection *selectionTxn) error {

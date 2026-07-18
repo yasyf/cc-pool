@@ -206,7 +206,7 @@ func TestProbeOnAssignRefusesIdleWedge(t *testing.T) {
 	swapDeepProbe(t, func(string) error { return wedgeErr() })
 
 	one := 1
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &one, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &one, Cwd: "/proj"})
 	if resp.OK || !strings.Contains(resp.Error, "wedged") {
 		t.Fatalf("forced select of an idle-wedged mirror = %+v, want a wedged refusal", resp)
 	}

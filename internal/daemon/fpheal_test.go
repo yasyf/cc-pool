@@ -334,7 +334,7 @@ func TestSelectExcludesWedgedFPDomain(t *testing.T) {
 	s, _, dirs, _ := newFPHealServer(t) // acct-1 FP (emptier), acct-2 symlink
 	s.fpForceWedge(dirs[1], overlay.ErrFPProbeWedged)
 
-	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
 	if !resp.OK {
 		t.Fatalf("select failed with a healthy fallback available: %+v", resp)
 	}
@@ -343,7 +343,7 @@ func TestSelectExcludesWedgedFPDomain(t *testing.T) {
 	}
 
 	one := 1
-	resp = s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &one, NoMark: true, Cwd: "/proj"})
+	resp = s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &one, Cwd: "/proj"})
 	if resp.OK {
 		t.Fatal("an explicit select of a wedged FP domain must be refused")
 	}

@@ -222,45 +222,24 @@ converge() { hrun "$1" "$BIN/cc-pool" sync converge; }
 # Bring both registries to a fixpoint (Save/TouchStamp are no-ops at rest).
 quiesce() { converge b >/dev/null; converge a >/dev/null; converge b >/dev/null; converge a >/dev/null; }
 
-# reap_lease_agents HOST — kill the detached `ccp lease-agent` that `ccp select`
-# spawns for HOST. select composes as `CLAUDE_CONFIG_DIR=$(ccp select) claude`, so
-# it hands the account's session lease to an agent that releases only when the
-# terminal's session LEADER exits. The sim runs every scenario under ONE login
-# session, so a refresh-only select (no claude follows) would leak that agent —
-# still holding HOST's acct-01 lease — into a later `ccp remove`, which fails loud
-# on a held lease. No first-class release verb exists; the flock frees on exit, so
-# reap by process, scoped to HOST's sandbox path so it never touches the peer's.
-reap_lease_agents() {
-  local h="$1" pat="cc-pool lease-agent.*$SIM/$h/"
-  pkill -f "$pat" 2>/dev/null || true
-  for _ in $(seq 1 50); do
-    pgrep -f "$pat" >/dev/null 2>&1 || return 0
-    sleep 0.1
-  done
-  pkill -9 -f "$pat" 2>/dev/null || true
-}
-
 # force_refresh HOST WANT_AT — refresh HOST's OWNED chain until its access token
 # is WANT_AT. PreflightRefresh fails closed (skips the refresh, no POST) when a
 # transient procscan EIO aborts the idle scan under sim process churn; a real
-# select/daemon-poll just retries, so we do too. HOST's daemon is stopped so the
-# manual select is the sole refresher (no cross-process double-spend), then
-# restarted.
+# select/daemon-poll just retries, so we do too. Selection is daemon-exclusive,
+# so restart the host daemon before driving its account-local refresh.
 force_refresh() {
   local h="$1" want="$2" i
   stop_daemon "$h"
+  start_daemon "$h" >/dev/null
   for i in $(seq 1 40); do
     hrun "$h" "$BIN/seed" setexp --id 1 --expires-ms "$E_NEAR" >/dev/null
-    hrun "$h" "$BIN/cc-pool" select --account 1 --no-daemon >/dev/null 2>&1 || true
+    hrun "$h" "$BIN/cc-pool" select --account 1 >/dev/null 2>&1 || true
     if [ "$(cred_get "$(credfile "$h")" accessToken)" = "$want" ]; then
-      reap_lease_agents "$h" # no claude follows this select, so don't leak its lease agent
-      start_daemon "$h" >/dev/null
       return 0
     fi
     sleep 0.2
   done
-  hrun "$h" "$BIN/cc-pool" select --account 1 --no-daemon 2>&1 | sed 's/^/    /' >&2
-  start_daemon "$h" >/dev/null
+  hrun "$h" "$BIN/cc-pool" select --account 1 2>&1 | sed 's/^/    /' >&2
   fail "$h never refreshed its owned chain to $want (procscan idle-scan kept failing closed)"
 }
 

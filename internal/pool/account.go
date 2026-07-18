@@ -436,7 +436,7 @@ func (m *Manager) removeAccountDir(ctx context.Context, a store.Account, prov fk
 	return nil
 }
 
-// ReconcileOverlay repairs an account's overlay before a daemonless launch.
+// ReconcileOverlay repairs an account's overlay before a daemon-owned launch.
 // Routine polling must use Check; reconciliation is an explicit lifecycle action.
 func (m *Manager) ReconcileOverlay(ctx context.Context, a store.Account) error {
 	if err := ctx.Err(); err != nil {
