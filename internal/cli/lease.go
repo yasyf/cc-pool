@@ -80,10 +80,6 @@ func acquireSessionLease(a store.Account) (*lease.Handle, error) {
 	return acquireLease(pool.HolderOwner, pool.SessionLeaseDir(a))
 }
 
-func probeSessionLease(a store.Account) error {
-	return probeLeasedDir(a.ConfigDir, isFuseRow(a.OverlayKind))
-}
-
 func acquireAndProbeSessionLease(a store.Account) (*lease.Handle, error) {
 	return acquireAndProbe(pool.SessionLeaseDir(a), a.ConfigDir, isFuseRow(a.OverlayKind))
 }

@@ -43,11 +43,10 @@ type sessionHeartbeat struct {
 	snapshot  heartbeatSnapshot
 	active    map[string]bool
 	lastErr   string
-	wake      chan struct{}
 }
 
 func newSessionHeartbeat(s *Server) *sessionHeartbeat {
-	return &sessionHeartbeat{server: s, active: map[string]bool{}, wake: make(chan struct{}, 1)}
+	return &sessionHeartbeat{server: s, active: map[string]bool{}}
 }
 
 func (h *sessionHeartbeat) view() heartbeatSnapshot {
@@ -153,20 +152,6 @@ func (h *sessionHeartbeat) acknowledgeIdle(dir string) {
 	h.mu.Unlock()
 }
 
-func (h *sessionHeartbeat) expectIdleTransition(dir string) {
-	h.mu.Lock()
-	h.active[dir] = true
-	h.mu.Unlock()
-	h.wakeSoon()
-}
-
-func (h *sessionHeartbeat) wakeSoon() {
-	select {
-	case h.wake <- struct{}{}:
-	default:
-	}
-}
-
 func (h *sessionHeartbeat) run(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = defaultSessionHeartbeatInterval
@@ -177,7 +162,6 @@ func (h *sessionHeartbeat) run(ctx context.Context, interval time.Duration) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-h.wake:
 		case <-timer.C:
 		}
 		delta := h.refresh(ctx, 0)
