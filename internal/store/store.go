@@ -129,8 +129,7 @@ CREATE INDEX idx_accounts_uuid ON accounts(account_uuid);
 // SchemaVersion is the only runtime schema accepted by this binary.
 const SchemaVersion = 2
 
-// ErrSchemaMismatch means the database must be cut over explicitly while the
-// service is stopped. Open never mutates an existing schema.
+// ErrSchemaMismatch means the database is not the exact schema accepted by this binary.
 var ErrSchemaMismatch = errors.New("store schema mismatch")
 
 const (
@@ -244,7 +243,7 @@ func verifySchema(db *sql.DB) error {
 		return fmt.Errorf("read store schema version: %w", err)
 	}
 	if version != SchemaVersion {
-		return fmt.Errorf("%w: database=%d binary=%d; stop cc-pool and run `ccp store-cutover`", ErrSchemaMismatch, version, SchemaVersion)
+		return fmt.Errorf("%w: database=%d binary=%d", ErrSchemaMismatch, version, SchemaVersion)
 	}
 	want, err := exactSchemaHash()
 	if err != nil {

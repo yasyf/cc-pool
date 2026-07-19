@@ -26,6 +26,15 @@ func openTest(t *testing.T) *Store {
 	return s
 }
 
+func tableCount(t *testing.T, store *Store, table string) int {
+	t.Helper()
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&count); err != nil { //nolint:gosec // test-owned table names
+		t.Fatal(err)
+	}
+	return count
+}
+
 func activateTestSession(t *testing.T, s *Store, accountID, pid int, cwd string, started time.Time) int64 {
 	t.Helper()
 	started = started.Truncate(time.Microsecond)
