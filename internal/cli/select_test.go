@@ -3,9 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,29 +29,17 @@ func TestAbortDaemonSelectionOutlivesCallerCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ln, err := net.Listen("unix", pool.SocketPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
 	reqCh := make(chan daemon.Request, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		var req daemon.Request
-		if err := json.NewDecoder(conn).Decode(&req); err != nil {
-			return
-		}
+	startDaemonTestServer(t, "", func(_ context.Context, _ daemon.Op, req daemon.Request) daemon.Response {
 		reqCh <- req
-		_ = json.NewEncoder(conn).Encode(daemon.Response{Proto: daemon.ProtocolVersion, OK: true})
-	}()
+		return daemon.Response{OK: true}
+	})
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	abortDaemonSelection(ctx, daemon.NewClient(), "reservation-token")
+	cl := daemon.NewClient()
+	defer func() { _ = cl.Close() }()
+	abortDaemonSelection(ctx, cl, "reservation-token")
 	select {
 	case req := <-reqCh:
 		if req.Op != daemon.OpSelectAbort || req.ReservationToken != "reservation-token" {
@@ -255,30 +241,16 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("unix", pool.SocketPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			var req daemon.Request
-			_ = json.NewDecoder(conn).Decode(&req)
-			resp := daemon.Response{Proto: daemon.ProtocolVersion, OK: true, Version: version.String()}
-			if req.Op == daemon.OpSelect {
-				resp.SelectedID = &id
-				resp.Dir = dir
-				resp.AccountInstanceID = account.InstanceID
-				resp.AccountGeneration = account.Generation
-			}
-			_ = json.NewEncoder(conn).Encode(resp)
-			_ = conn.Close()
+	startDaemonTestServer(t, "", func(_ context.Context, op daemon.Op, _ daemon.Request) daemon.Response {
+		resp := daemon.Response{OK: true, Version: version.String()}
+		if op == daemon.OpSelect {
+			resp.SelectedID = &id
+			resp.Dir = dir
+			resp.AccountInstanceID = account.InstanceID
+			resp.AccountGeneration = account.Generation
 		}
-	}()
+		return resp
+	})
 
 	m := &pool.Manager{Store: st}
 	var stderr bytes.Buffer
@@ -329,30 +301,15 @@ func TestResolveSelectionMountsNotReadyError(t *testing.T) {
 			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 				t.Fatal(err)
 			}
-			ln, err := net.Listen("unix", pool.SocketPath())
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = ln.Close() })
 			selectResp := tc.resp
-			go func() {
-				for {
-					conn, err := ln.Accept()
-					if err != nil {
-						return
-					}
-					var req daemon.Request
-					_ = json.NewDecoder(conn).Decode(&req)
-					resp := daemon.Response{Proto: daemon.ProtocolVersion, OK: true, Version: version.String()}
-					if req.Op == daemon.OpSelect {
-						resp = selectResp
-						resp.Proto = daemon.ProtocolVersion
-						resp.Version = version.String()
-					}
-					_ = json.NewEncoder(conn).Encode(resp)
-					_ = conn.Close()
+			startDaemonTestServer(t, "", func(_ context.Context, op daemon.Op, _ daemon.Request) daemon.Response {
+				resp := daemon.Response{OK: true, Version: version.String()}
+				if op == daemon.OpSelect {
+					resp = selectResp
+					resp.Version = version.String()
 				}
-			}()
+				return resp
+			})
 
 			m := &pool.Manager{Store: st}
 			cmd := &cobra.Command{}
@@ -381,26 +338,7 @@ func TestResolveSelectionRejectsDaemonBuildSkewWithoutLocalFallback(t *testing.T
 		t.Fatal(err)
 	}
 
-	ln, err := net.Listen("unix", pool.SocketPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			var req daemon.Request
-			if err := json.NewDecoder(conn).Decode(&req); err == nil {
-				_ = json.NewEncoder(conn).Encode(daemon.Response{
-					Proto: daemon.ProtocolVersion, OK: true, Version: "incompatible-build",
-				})
-			}
-			_ = conn.Close()
-		}
-	}()
+	startDaemonTestServer(t, "incompatible-build", nil)
 
 	m := selectTestManager(t)
 	cmd := &cobra.Command{}

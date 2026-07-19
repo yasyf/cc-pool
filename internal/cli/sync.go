@@ -53,7 +53,9 @@ var synckitdRun = func(ctx context.Context, args ...string) error {
 // syncEnsureDaemon reports the daemon reachable, spawning it if needed; a var
 // so tests never spawn a real daemon.
 var syncEnsureDaemon = func(ctx context.Context) bool {
-	return daemon.NewClient().EnsureRunning(ctx, syncDaemonSpawnTimeout)
+	cl := daemon.NewClient()
+	defer func() { _ = cl.Close() }()
+	return cl.EnsureRunning(ctx, syncDaemonSpawnTimeout)
 }
 
 func newSyncCmd() *cobra.Command {

@@ -112,7 +112,7 @@ func ensureReady(cmd *cobra.Command, m *pool.Manager) error {
 		success(cmd.OutOrStdout(), "Set up cc-pool on this machine.")
 		reportOverlayChoice(cmd, res)
 	}
-	ensureDaemon(cmd, false)
+	ensureDaemon(cmd)
 	return nil
 }
 

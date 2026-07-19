@@ -40,8 +40,8 @@ func TestWriteStatusSnapshotRoundTrip(t *testing.T) {
 	}
 
 	snap := readSnapshot(t, s.snapshot)
-	if snap.Proto != ProtocolVersion {
-		t.Errorf("proto = %d, want %d", snap.Proto, ProtocolVersion)
+	if snap.Proto != SnapshotVersion {
+		t.Errorf("proto = %d, want %d", snap.Proto, SnapshotVersion)
 	}
 	if snap.Version != version.String() {
 		t.Errorf("version = %q, want %q", snap.Version, version.String())
@@ -184,7 +184,7 @@ func TestPollOnceLogsSnapshotFailure(t *testing.T) {
 }
 
 // TestStatusSnapshotJSONKeys pins the wire keys the Swift widget decodes; any
-// rename or re-case must bump ProtocolVersion.
+// rename or re-case must bump SnapshotVersion.
 func TestStatusSnapshotJSONKeys(t *testing.T) {
 	now := time.Date(2026, 6, 11, 12, 0, 0, 500e6, time.UTC) // sub-second: truncation must strip it
 

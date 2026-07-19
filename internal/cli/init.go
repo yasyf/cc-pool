@@ -33,7 +33,7 @@ same setup automatically.`,
 				reportOverlayChoice(cmd, res)
 
 				if !noService {
-					ensureDaemon(cmd, false)
+					ensureDaemon(cmd)
 				}
 
 				step(out, "\nNext, run `ccp add` to pool your subscriptions, including your main one.")

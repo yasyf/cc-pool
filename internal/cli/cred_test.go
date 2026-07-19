@@ -2,8 +2,7 @@ package cli
 
 import (
 	"bytes"
-	"encoding/json"
-	"net"
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -218,9 +217,14 @@ func TestCredMoveDaemonRequest(t *testing.T) {
 }
 
 func TestCredMoveDaemonUnreachable(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	home, err := os.MkdirTemp("/tmp", "ccp-home")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
 	seedInitializedPool(t)
-	_, err := execCred(t, "move", "--to", "file")
+	_, err = execCred(t, "move", "--to", "file")
 	if err == nil {
 		t.Fatal("cred move must fail without a daemon")
 	}
@@ -292,29 +296,14 @@ func startCredMoveDaemon(t *testing.T, healthVersion string, resp daemon.Respons
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("unix", pool.SocketPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
 	got := make(chan daemon.Request, 4)
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			var req daemon.Request
-			_ = json.NewDecoder(conn).Decode(&req)
-			out := daemon.Response{Proto: daemon.ProtocolVersion, OK: true, Version: healthVersion}
-			if req.Op == daemon.OpCredMove {
-				got <- req
-				out = resp
-				out.Proto = daemon.ProtocolVersion
-			}
-			_ = json.NewEncoder(conn).Encode(out)
-			_ = conn.Close()
+	startDaemonTestServer(t, healthVersion, func(_ context.Context, op daemon.Op, req daemon.Request) daemon.Response {
+		out := daemon.Response{OK: true, Version: healthVersion}
+		if op == daemon.OpCredMove {
+			got <- req
+			out = resp
 		}
-	}()
+		return out
+	})
 	return got
 }

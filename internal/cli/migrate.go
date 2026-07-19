@@ -89,6 +89,7 @@ func requestMigration(cmd *cobra.Command, m *pool.Manager, to string, account in
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = cl.Close() }()
 	if account > 0 {
 		resp, err := cl.Migrate(&account, to, force)
 		if err != nil {

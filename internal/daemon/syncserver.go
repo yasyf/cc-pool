@@ -52,7 +52,7 @@ func (c serverClaims) TryClaim(uuid string) (func(), bool) {
 var _ hostsync.Claims = serverClaims{}
 
 type admittedSyncConsumer struct {
-	drain *drain.Simple
+	drain *drain.Intake
 	next  syncservice.SyncConsumer
 }
 
@@ -101,7 +101,7 @@ func (c admittedSyncConsumer) GetState(ctx context.Context) (syncservice.RawRegi
 	return c.next.GetState(ctx)
 }
 
-func admittedSyncHandler(d *drain.Simple, next rpc.Handler) rpc.Handler {
+func admittedSyncHandler(d *drain.Intake, next rpc.Handler) rpc.Handler {
 	return func(ctx context.Context, params map[string]any) (any, error) {
 		done, err := d.Admit()
 		if err != nil {
@@ -127,10 +127,13 @@ func (l *onceCloseListener) Close() error {
 // contract plus the credential fetch method — on a wg-tracked goroutine, returning
 // once the socket is bound; the broader sync setup wires the rest of the Service.
 func (s *Server) startSyncServer(ctx context.Context, svc *hostsync.Service) error {
+	if s.syncIntake == nil {
+		s.syncIntake = &drain.Intake{}
+	}
 	svc.Claims = newServerClaims(s)
 	consumer := hostsync.NewConsumer(svc, s.syncEnabled)
 	fetch := hostsync.NewFetchCredentialHandler(s.m.Store.GetAccountByUUID, s.readCredentialForFetch)
-	ln, err := serveSyncSocket(ctx, &s.wg, &s.drain, s.syncSocket, consumer, fetch, s.log)
+	ln, err := serveSyncSocket(ctx, &s.wg, s.syncIntake, s.syncSocket, consumer, fetch, s.log)
 	if err != nil {
 		return err
 	}
@@ -159,7 +162,7 @@ func (s *Server) readCredentialForFetch(ctx context.Context, a store.Account) (*
 
 // serveSyncSocket binds sockPath (0600) and serves the sync dispatcher until
 // ctx is done; rpc.Serve owns the listener lifecycle. Returns once bound.
-func serveSyncSocket(ctx context.Context, wg *sync.WaitGroup, intake *drain.Simple, sockPath string, consumer syncservice.SyncConsumer, fetch rpc.Handler, logger *log.Logger) (net.Listener, error) {
+func serveSyncSocket(ctx context.Context, wg *sync.WaitGroup, intake *drain.Intake, sockPath string, consumer syncservice.SyncConsumer, fetch rpc.Handler, logger *log.Logger) (net.Listener, error) {
 	ln, err := rpc.Listen(sockPath)
 	if err != nil {
 		return nil, fmt.Errorf("bind sync socket %s: %w", sockPath, err)

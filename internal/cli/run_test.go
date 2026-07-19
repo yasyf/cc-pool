@@ -3,8 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +14,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/lease"
 )
 
@@ -150,36 +147,19 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("unix", pool.SocketPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
 	aborted := make(chan struct{}, 1)
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			var req daemon.Request
-			if err := json.NewDecoder(conn).Decode(&req); err != nil {
-				_ = conn.Close()
-				continue
-			}
-			resp := daemon.Response{Proto: daemon.ProtocolVersion, OK: true, Version: version.String()}
-			if req.Op == daemon.OpSelect {
-				resp.SelectedID = &returned.ID
-				resp.Dir = returned.ConfigDir
-				resp.ReservationToken = "malformed-selection"
-			}
-			if req.Op == daemon.OpSelectAbort {
-				aborted <- struct{}{}
-			}
-			_ = json.NewEncoder(conn).Encode(resp)
-			_ = conn.Close()
+	startDaemonTestServer(t, "", func(_ context.Context, op daemon.Op, _ daemon.Request) daemon.Response {
+		resp := daemon.Response{OK: true}
+		if op == daemon.OpSelect {
+			resp.SelectedID = &returned.ID
+			resp.Dir = returned.ConfigDir
+			resp.ReservationToken = "malformed-selection"
 		}
-	}()
+		if op == daemon.OpSelectAbort {
+			aborted <- struct{}{}
+		}
+		return resp
+	})
 
 	m := &pool.Manager{Store: st, Creds: credstest.NewFake(), LockDir: t.TempDir()}
 	var stderr bytes.Buffer

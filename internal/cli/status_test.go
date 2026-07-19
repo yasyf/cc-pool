@@ -2,9 +2,8 @@ package cli
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
 	"errors"
-	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -523,8 +522,8 @@ func TestStatusSnapshotJSONLiveFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snap.Proto != daemon.ProtocolVersion || snap.Version != version.String() {
-		t.Errorf("proto/version = %d/%q, want %d/%q", snap.Proto, snap.Version, daemon.ProtocolVersion, version.String())
+	if snap.Proto != daemon.SnapshotVersion || snap.Version != version.String() {
+		t.Errorf("proto/version = %d/%q, want %d/%q", snap.Proto, snap.Version, daemon.SnapshotVersion, version.String())
 	}
 	if len(snap.Accounts) != 1 {
 		t.Fatalf("accounts = %+v, want exactly the seeded account", snap.Accounts)
@@ -566,29 +565,15 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 				t.Fatal(err)
 			}
-			ln, err := net.Listen("unix", pool.SocketPath())
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = ln.Close() })
-			go func() {
-				for {
-					conn, err := ln.Accept()
-					if err != nil {
-						return
-					}
-					var req daemon.Request
-					_ = json.NewDecoder(conn).Decode(&req)
-					_ = json.NewEncoder(conn).Encode(daemon.Response{
-						Proto: daemon.ProtocolVersion, OK: true, Version: tc.daemonVersion,
-						Accounts: []daemon.AccountStatus{{
-							ID: 1, Label: "from-daemon", SampleAge: "42s",
-							HasUsage: true, Remaining5h: 50, Remaining7d: 50,
-						}},
-					})
-					_ = conn.Close()
+			startDaemonTestServer(t, tc.daemonVersion, func(context.Context, daemon.Op, daemon.Request) daemon.Response {
+				return daemon.Response{
+					OK: true, Version: tc.daemonVersion,
+					Accounts: []daemon.AccountStatus{{
+						ID: 1, Label: "from-daemon", SampleAge: "42s",
+						HasUsage: true, Remaining5h: 50, Remaining7d: 50,
+					}},
 				}
-			}()
+			})
 
 			st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 			if err != nil {
@@ -681,29 +666,15 @@ func TestRunStatusPlainLedgerFooter(t *testing.T) {
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("unix", pool.SocketPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			var req daemon.Request
-			_ = json.NewDecoder(conn).Decode(&req)
-			_ = json.NewEncoder(conn).Encode(daemon.Response{
-				Proto: daemon.ProtocolVersion, OK: true, Version: version.String(),
-				Accounts: []daemon.AccountStatus{{
-					ID: 1, Label: "work@example.com", HasUsage: true, Remaining5h: 50, Remaining7d: 50,
-				}},
-				Ledgers: []daemon.LedgerState{{Policy: "fp.domain", Resource: "/p/acct-02", Faulted: true, Parked: true}},
-			})
-			_ = conn.Close()
+	startDaemonTestServer(t, "", func(context.Context, daemon.Op, daemon.Request) daemon.Response {
+		return daemon.Response{
+			OK: true, Version: version.String(),
+			Accounts: []daemon.AccountStatus{{
+				ID: 1, Label: "work@example.com", HasUsage: true, Remaining5h: 50, Remaining7d: 50,
+			}},
+			Ledgers: []daemon.LedgerState{{Policy: "fp.domain", Resource: "/p/acct-02", Faulted: true, Parked: true}},
 		}
-	}()
+	})
 
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -763,29 +734,15 @@ func TestRunStatusPlainFPConsentFooter(t *testing.T) {
 			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 				t.Fatal(err)
 			}
-			ln, err := net.Listen("unix", pool.SocketPath())
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = ln.Close() })
-			go func() {
-				for {
-					conn, err := ln.Accept()
-					if err != nil {
-						return
-					}
-					var req daemon.Request
-					_ = json.NewDecoder(conn).Decode(&req)
-					_ = json.NewEncoder(conn).Encode(daemon.Response{
-						Proto: daemon.ProtocolVersion, OK: true, Version: version.String(),
-						Accounts: []daemon.AccountStatus{{
-							ID: 1, Label: "work@example.com", HasUsage: true, Remaining5h: 50, Remaining7d: 50,
-						}},
-						FPConsentPending: tc.consent,
-					})
-					_ = conn.Close()
+			startDaemonTestServer(t, "", func(context.Context, daemon.Op, daemon.Request) daemon.Response {
+				return daemon.Response{
+					OK: true, Version: version.String(),
+					Accounts: []daemon.AccountStatus{{
+						ID: 1, Label: "work@example.com", HasUsage: true, Remaining5h: 50, Remaining7d: 50,
+					}},
+					FPConsentPending: tc.consent,
 				}
-			}()
+			})
 
 			st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 			if err != nil {

@@ -66,6 +66,7 @@ func newDoctorCmd() *cobra.Command {
 				var ledgers []daemon.LedgerState
 				var daemonAlive bool
 				cl := daemon.NewClient()
+				defer func() { _ = cl.Close() }()
 				if resp, err := cl.Health(); err == nil && resp.OK {
 					daemonAlive = true
 					if resp.Version == version.String() {
@@ -969,7 +970,10 @@ func checkStrandedPrivate(m *pool.Manager, a store.Account, fix bool, out io.Wri
 	}
 	// A CLI-side heal cannot see the daemon's converting claim; racing an
 	// in-flight conversion would move files under its teardown.
-	if daemon.NewClient().Available() {
+	cl := daemon.NewClient()
+	available := cl.Available()
+	_ = cl.Close()
+	if available {
 		report(prefix+" private files", false, "stranded in "+priv+"; the daemon is running — re-run `ccp migrate`, or stop the daemon and re-run doctor --fix")
 		return
 	}

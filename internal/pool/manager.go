@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
@@ -154,13 +155,17 @@ func (m *Manager) acctLock(id int) *sync.Mutex {
 func (m *Manager) lockAccount(ctx context.Context, id int) (func(), error) {
 	mu := m.acctLock(id)
 	mu.Lock()
-	h, err := proc.Flock(ctx, filepath.Join(m.LockDir, AccountDirName(id)+".lock"))
+	h, err := (proc.FileLockSpec{
+		Path:     filepath.Join(m.LockDir, AccountDirName(id)+".lock"),
+		Mode:     proc.FileLockExclusive,
+		Deadline: 30 * time.Second,
+	}).Acquire(ctx)
 	if err != nil {
 		mu.Unlock()
 		return nil, fmt.Errorf("acct-%d refresh lock: %w", id, err)
 	}
 	return func() {
-		_ = h.Release()
+		_ = h.Close()
 		mu.Unlock()
 	}, nil
 }

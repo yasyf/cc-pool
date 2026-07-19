@@ -230,8 +230,8 @@ func TestFPRepairEndToEndOverSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FPRepair: %v", err)
 	}
-	if !resp.OK || resp.Proto != ProtocolVersion {
-		t.Fatalf("resp = %+v, want OK at proto %d", resp, ProtocolVersion)
+	if !resp.OK {
+		t.Fatalf("resp = %+v, want OK", resp)
 	}
 	if len(resp.FPRepairs) != 1 || resp.FPRepairs[0].Outcome != FPRepairRepaired {
 		t.Fatalf("FPRepairs = %+v, want one repaired result", resp.FPRepairs)

@@ -68,6 +68,7 @@ func requestCredMove(m *pool.Manager, to string, account int) (*daemon.Response,
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = cl.Close() }()
 	var acct *int
 	if account > 0 {
 		acct = &account

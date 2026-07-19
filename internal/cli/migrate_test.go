@@ -2,8 +2,7 @@ package cli
 
 import (
 	"bytes"
-	"encoding/json"
-	"net"
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +11,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/cc-pool/internal/version"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
@@ -119,37 +117,23 @@ func startMigrateDaemon(t *testing.T, gateFailID int) <-chan daemon.Request {
 	if err := pool.EnsureStateDir(); err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("unix", pool.SocketPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
 	got := make(chan daemon.Request, 16)
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			var req daemon.Request
-			_ = json.NewDecoder(conn).Decode(&req)
-			out := daemon.Response{Proto: daemon.ProtocolVersion, OK: true, Version: version.String()}
-			if req.Op == daemon.OpMigrate {
-				got <- req
-				switch {
-				case req.Account != nil && *req.Account == gateFailID:
-					out.OK = false
-					out.Error = "fileprovider gate: control socket probe failed"
-				case req.Account != nil:
-					out.Migrations = []daemon.MigrationResult{
-						{ID: *req.Account, Label: "a@x.com", From: "fuse", To: req.To, Outcome: daemon.MigrationDone},
-					}
+	startDaemonTestServer(t, "", func(_ context.Context, op daemon.Op, req daemon.Request) daemon.Response {
+		out := daemon.Response{OK: true}
+		if op == daemon.OpMigrate {
+			got <- req
+			switch {
+			case req.Account != nil && *req.Account == gateFailID:
+				out.OK = false
+				out.Error = "fileprovider gate: control socket probe failed"
+			case req.Account != nil:
+				out.Migrations = []daemon.MigrationResult{
+					{ID: *req.Account, Label: "a@x.com", From: "fuse", To: req.To, Outcome: daemon.MigrationDone},
 				}
 			}
-			_ = json.NewEncoder(conn).Encode(out)
-			_ = conn.Close()
 		}
-	}()
+		return out
+	})
 	return got
 }
 

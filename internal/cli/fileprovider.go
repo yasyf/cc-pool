@@ -77,6 +77,7 @@ var fpOpenSettings = func(ctx context.Context) error {
 // for tests.
 var fpDaemonProbe = func() (alive, consentPending bool, bridgeUp *bool) {
 	cl := daemon.NewClient()
+	defer func() { _ = cl.Close() }()
 	if h, err := cl.Health(); err != nil || !h.OK {
 		return false, false, nil
 	}
@@ -88,10 +89,14 @@ var fpDaemonProbe = func() (alive, consentPending bool, bridgeUp *bool) {
 
 var (
 	fpDaemonHealth = func() (*daemon.Response, error) {
-		return daemon.NewClient().Health()
+		cl := daemon.NewClient()
+		defer func() { _ = cl.Close() }()
+		return cl.Health()
 	}
 	fpBridgeCheck = func() (*daemon.Response, error) {
-		return daemon.NewClient().FPBridgeCheck()
+		cl := daemon.NewClient()
+		defer func() { _ = cl.Close() }()
+		return cl.FPBridgeCheck()
 	}
 	fpCapabilityNow = time.Now
 )
@@ -224,6 +229,7 @@ func runFPRepair(cmd *cobra.Command, m *pool.Manager, account int, retreat bool)
 		acct = &account
 	}
 	cl := daemon.NewClient()
+	defer func() { _ = cl.Close() }()
 	health, err := cl.Health()
 	switch {
 	case errors.Is(err, daemon.ErrDaemonUnavailable):

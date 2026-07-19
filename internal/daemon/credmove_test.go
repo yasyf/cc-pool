@@ -1,19 +1,34 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/drain"
+	"github.com/yasyf/daemonkit/wire"
 )
+
+type handlerLifecycle struct{}
+
+func (handlerLifecycle) Health(context.Context) (dkdaemon.Health, error) {
+	return dkdaemon.Health{
+		Build: version.String(), Protocol: int(wire.ProtocolVersion), PID: os.Getpid(), State: dkdaemon.StateHealthy,
+	}, nil
+}
+
+func (handlerLifecycle) Shutdown(context.Context) error { return nil }
+func (handlerLifecycle) Handoff(context.Context) error  { return nil }
 
 // newCredMoveServer builds the shared test server with existing config dirs
 // and a distinct keychain service per account — the fixture's shared service
@@ -99,9 +114,8 @@ func fileCredEquals(t *testing.T, dir string) {
 	}
 }
 
-// serveHandlerOnSocket binds a real unix socket whose connections flow through
-// the production handler (handle -> dispatch), without serve's scheduler and
-// reconcile side effects rotating credentials mid-test.
+// serveHandlerOnSocket binds the production persistent v4 business handlers
+// without starting scheduler or reconciliation side effects.
 func serveHandlerOnSocket(t *testing.T, s *Server) string {
 	t.Helper()
 	// macOS caps sun_path at 104 bytes; t.TempDir paths overflow it.
@@ -115,21 +129,35 @@ func serveHandlerOnSocket(t *testing.T, s *Server) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := t.Context()
-	var wg sync.WaitGroup
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
+	ladder, err := operationLadder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &wire.Server{Build: version.String(), Ladder: ladder}
+	for _, op := range []Op{OpSelect, OpSelectCommit, OpSelectAbort, OpStatus, OpMigrate, OpCredMove, OpFPRepair, OpFPBridgeCheck} {
+		op := op
+		server.RegisterConcurrent(wire.Op(op), func(ctx context.Context, request wire.Request) (any, error) {
+			var payload Request
+			if err := decodeStrict(request.Payload, &payload); err != nil {
+				return nil, err
 			}
-			wg.Add(1)
-			go func() { defer wg.Done(); s.handle(ctx, conn) }()
-		}
-	}()
+			payload.Op = op
+			return s.dispatch(ctx, payload), nil
+		})
+	}
+	server.RegisterLifecycle(handlerLifecycle{})
+	intake := &drain.Intake{}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, ln, intake.Admit, intake.AdmitLifecycle) }()
 	t.Cleanup(func() {
-		_ = ln.Close()
-		wg.Wait()
+		intake.Close()
+		_ = server.CloseIntake()
+		_ = intake.Settle(context.Background())
+		cancel()
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("serve v4 test socket: %v", err)
+		}
 	})
 	return socket
 }
@@ -148,8 +176,8 @@ func TestCredMoveEndToEndOverSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CredMove: %v", err)
 	}
-	if !resp.OK || resp.Proto != ProtocolVersion {
-		t.Fatalf("resp = %+v, want OK at proto %d", resp, ProtocolVersion)
+	if !resp.OK {
+		t.Fatalf("resp = %+v, want OK", resp)
 	}
 	got := outcomes(*resp)
 	if got[1] != MigrationDone || got[2] != MigrationDone {

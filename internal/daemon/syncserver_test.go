@@ -68,7 +68,7 @@ func TestSyncSocketServesConsumer(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	var intake drain.Simple
+	var intake drain.Intake
 	t.Cleanup(func() { cancel(); wg.Wait() })
 	if _, err := serveSyncSocket(ctx, &wg, &intake, sock, consumer, fetch, log.New(io.Discard, "", 0)); err != nil {
 		t.Fatalf("serveSyncSocket: %v", err)
@@ -180,7 +180,7 @@ func TestSyncSocketDrainsInFlightHandler(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	var intake drain.Simple
+	var intake drain.Intake
 	ln, err := serveSyncSocket(ctx, &wg, &intake, sock, consumer, fetch, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatal(err)
@@ -211,15 +211,14 @@ func TestSyncSocketDrainsInFlightHandler(t *testing.T) {
 	deactivated := make(chan struct{})
 	drained := make(chan error, 1)
 	go func() {
-		drained <- intake.Drain(ctx, drain.SimpleConfig{
-			Deactivate: func(context.Context) error {
-				err := ln.Close()
-				close(deactivated)
-				return err
-			},
-			MarkClosing:     func() {},
-			CancelExecutors: cancel,
-		})
+		intake.Close()
+		err := ln.Close()
+		close(deactivated)
+		if settleErr := intake.Settle(ctx); settleErr != nil {
+			err = errors.Join(err, settleErr)
+		}
+		cancel()
+		drained <- err
 	}()
 	<-deactivated
 	if conn, err := net.DialTimeout("unix", sock, 100*time.Millisecond); err == nil {

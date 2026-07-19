@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/state"
@@ -79,11 +80,15 @@ func (rf RegistryFile) Save(reg Registry) error {
 // WithLock runs fn under the exclusive registry flock; the signature matches
 // converge.Reconcile's lock parameter.
 func (rf RegistryFile) WithLock(ctx context.Context, fn func() error) error {
-	h, err := proc.Flock(ctx, rf.LockPath)
+	h, err := (proc.FileLockSpec{
+		Path:     rf.LockPath,
+		Mode:     proc.FileLockExclusive,
+		Deadline: 30 * time.Second,
+	}).Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire registry lock: %w", err)
 	}
-	defer func() { _ = h.Release() }()
+	defer func() { _ = h.Close() }()
 	return fn()
 }
 

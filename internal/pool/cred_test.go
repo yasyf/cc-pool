@@ -338,11 +338,15 @@ func TestMoveCredentialReadbackMismatch(t *testing.T) {
 func TestMoveCredentialLockContention(t *testing.T) {
 	lockDir := t.TempDir()
 	a := store.Account{ID: 7, ConfigDir: t.TempDir(), KeychainService: "svc-move", KeychainAccount: "user"}
-	held, err := proc.Flock(context.Background(), filepath.Join(lockDir, AccountDirName(a.ID)+".lock"))
+	held, err := (proc.FileLockSpec{
+		Path:     filepath.Join(lockDir, AccountDirName(a.ID)+".lock"),
+		Mode:     proc.FileLockExclusive,
+		Deadline: 5 * time.Second,
+	}).Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = held.Release() }()
+	defer func() { _ = held.Close() }()
 
 	fk := credstest.NewFake()
 	fk.Put(a.KeychainService, a.KeychainAccount, moveCred())

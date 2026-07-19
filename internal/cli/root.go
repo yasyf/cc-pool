@@ -132,6 +132,12 @@ func requireDaemon(m *pool.Manager, purpose string) (*daemon.Client, error) {
 		return nil, err
 	}
 	cl := daemon.NewClient()
+	keepClient := false
+	defer func() {
+		if !keepClient {
+			_ = cl.Close()
+		}
+	}()
 	health, err := cl.Health()
 	switch {
 	case errors.Is(err, daemon.ErrDaemonUnavailable):
@@ -143,5 +149,6 @@ func requireDaemon(m *pool.Manager, purpose string) (*daemon.Client, error) {
 	if health.Version != version.String() {
 		return nil, fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) and re-run — mounts and live sessions are unaffected", health.Version, version.String())
 	}
+	keepClient = true
 	return cl, nil
 }

@@ -80,6 +80,7 @@ type selectionTxn struct {
 	line   string
 	commit func(context.Context) error
 	abort  func()
+	close  func()
 	done   bool
 }
 
@@ -94,6 +95,9 @@ func (s *selectionTxn) Commit(ctx context.Context) error {
 		return err
 	}
 	s.done = true
+	if s.close != nil {
+		s.close()
+	}
 	return nil
 }
 
@@ -103,6 +107,9 @@ func (s *selectionTxn) Abort() {
 	}
 	s.abort()
 	s.done = true
+	if s.close != nil {
+		s.close()
+	}
 }
 
 // resolveSelection runs the shared daemon-owned `ccp run`/`ccp select` pipeline.
@@ -138,10 +145,19 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 	}
 
 	cl := daemon.NewClient()
-	if !cl.EnsureRunning(ctx, daemonEnsureTimeout(ctx)) {
-		return nil, daemon.ErrDaemonUnavailable
-	}
+	keepClient := false
+	defer func() {
+		if !keepClient {
+			_ = cl.Close()
+		}
+	}()
 	health, err := cl.HealthContext(ctx)
+	if errors.Is(err, daemon.ErrDaemonUnavailable) {
+		if !cl.EnsureRunning(ctx, daemonEnsureTimeout(ctx)) {
+			return nil, daemon.ErrDaemonUnavailable
+		}
+		health, err = cl.HealthContext(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("require daemon: %w", err)
 	}
@@ -185,7 +201,11 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 				commit = func(ctx context.Context) error { return cl.CommitSelection(ctx, resp.ReservationToken) }
 				abort = func() { abortDaemonSelection(ctx, cl, resp.ReservationToken) }
 			}
-			return &selectionTxn{acct: a, dir: a.ConfigDir, line: daemonSelectionLine(m, resp), commit: commit, abort: abort}, nil
+			keepClient = true
+			return &selectionTxn{
+				acct: a, dir: a.ConfigDir, line: daemonSelectionLine(m, resp), commit: commit, abort: abort,
+				close: func() { _ = cl.Close() },
+			}, nil
 		case outcomeError:
 			abortDaemonSelection(ctx, cl, resp.ReservationToken)
 			return nil, errors.New(resp.Error)

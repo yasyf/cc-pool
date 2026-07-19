@@ -20,12 +20,12 @@ import (
 // surfaces as a lost update.
 func bumpUnderLock(t *testing.T, lockPath, counterPath string) {
 	t.Helper()
-	h, err := proc.Flock(context.Background(), lockPath)
+	h, err := (proc.FileLockSpec{Path: lockPath, Mode: proc.FileLockExclusive, Deadline: 5 * time.Second}).Acquire(context.Background())
 	if err != nil {
 		t.Errorf("acquire: %v", err)
 		return
 	}
-	defer func() { _ = h.Release() }()
+	defer func() { _ = h.Close() }()
 	b, err := os.ReadFile(counterPath) //nolint:gosec // G304: counterPath is under the test's own t.TempDir()
 	if err != nil {
 		t.Errorf("read counter: %v", err)
@@ -77,20 +77,20 @@ func TestFlockSerializesCriticalSection(t *testing.T) {
 // cancellation promptly instead of blocking in the syscall forever.
 func TestFlockRespectsContext(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ctx.lock")
-	held, err := proc.Flock(context.Background(), path)
+	held, err := (proc.FileLockSpec{Path: path, Mode: proc.FileLockExclusive, Deadline: 5 * time.Second}).Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = held.Release() }()
+	defer func() { _ = held.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := proc.Flock(ctx, path); err == nil {
-		t.Fatal("proc.Flock succeeded while the lock was held; want a ctx error")
+	if _, err := (proc.FileLockSpec{Path: path, Mode: proc.FileLockExclusive, Deadline: 5 * time.Second}).Acquire(ctx); err == nil {
+		t.Fatal("FileLockSpec.Acquire succeeded while the lock was held; want a ctx error")
 	}
 	if waited := time.Since(start); waited > time.Second {
-		t.Fatalf("proc.Flock took %v to honor a 50ms deadline", waited)
+		t.Fatalf("FileLockSpec.Acquire took %v to honor a 50ms deadline", waited)
 	}
 }
 
@@ -108,7 +108,7 @@ func TestFlockChildHolds(t *testing.T) {
 	if lockPath == "" || readyPath == "" {
 		t.Skip("child-only helper; driven by TestFlockCrossProcess")
 	}
-	h, err := proc.Flock(context.Background(), lockPath)
+	h, err := (proc.FileLockSpec{Path: lockPath, Mode: proc.FileLockExclusive, Deadline: 5 * time.Second}).Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("child acquire: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestFlockChildHolds(t *testing.T) {
 		t.Fatalf("child signal ready: %v", err)
 	}
 	time.Sleep(flockChildHold)
-	_ = h.Release()
+	_ = h.Close()
 }
 
 // TestFlockCrossProcess is the real proof: a child PROCESS holds the lock while
@@ -152,12 +152,12 @@ func TestFlockCrossProcess(t *testing.T) {
 	}
 
 	start := time.Now()
-	h, err := proc.Flock(context.Background(), lockPath)
+	h, err := (proc.FileLockSpec{Path: lockPath, Mode: proc.FileLockExclusive, Deadline: 5 * time.Second}).Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("parent acquire: %v; child output:\n%s", err, out.String())
 	}
 	waited := time.Since(start)
-	_ = h.Release()
+	_ = h.Close()
 	if waited < 300*time.Millisecond {
 		t.Fatalf("parent acquired in %v without blocking — flock is not excluding across processes; child output:\n%s", waited, out.String())
 	}

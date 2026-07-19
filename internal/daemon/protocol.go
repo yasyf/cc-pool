@@ -1,7 +1,5 @@
 // Package daemon implements the background user-LaunchAgent: a usage poller,
-// idle-only credential refresher, score cache, and unix-socket server. The CLI
-// hot paths (select/status) talk to it over a 0600 unix socket using the
-// newline-delimited JSON protocol defined here.
+// idle-only credential refresher, score cache, and persistent control server.
 package daemon
 
 import (
@@ -12,11 +10,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/version"
 )
 
-// ProtocolVersion is bumped on incompatible wire changes. Pinned at 1: the
-// StatusSnapshot on-disk format the widget hard-rejects on mismatch shares this
-// constant, and v0.56's removed socket projections degrade gracefully (an old
-// CLI zero-values the absent fields) rather than breaking the wire.
-const ProtocolVersion = 2
+// SnapshotVersion is the exact on-disk status format accepted by the widget.
+// Daemon transport compatibility is daemonkit wire v4 and is deliberately not
+// coupled to this derived snapshot.
+const SnapshotVersion = 2
 
 // Op is a request operation.
 type Op string
@@ -30,10 +27,6 @@ const (
 	OpSelectAbort Op = "select-abort"
 	// OpStatus returns scored status for all accounts.
 	OpStatus Op = "status"
-	// OpHealth is the liveness + version probe.
-	OpHealth Op = "health"
-	// OpShutdown steps down gracefully and releases the socket.
-	OpShutdown Op = "shutdown"
 	// OpMigrate converts accounts between overlay providers.
 	OpMigrate Op = "migrate"
 	// OpCredMove moves account credentials between backends.
@@ -44,10 +37,10 @@ const (
 	OpFPBridgeCheck Op = "fpbridgecheck"
 )
 
-// Request is one client request (one JSON object per line).
+// Request is one typed daemon operation payload. Op is carried by the daemonkit
+// frame route and is never encoded into the payload.
 type Request struct {
-	Proto            int    `json:"proto"`
-	Op               Op     `json:"op"`
+	Op               Op     `json:"-"`
 	Account          *int   `json:"account,omitempty"`            // force a select account / identify a checkin account
 	PID              int    `json:"pid,omitempty"`                // launching pid for select activation
 	ProcessStartedAt int64  `json:"process_started_at,omitempty"` // launching pid start time, Unix microseconds
@@ -240,7 +233,7 @@ func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 		accounts = []AccountStatus{}
 	}
 	snap := StatusSnapshot{
-		Proto:       ProtocolVersion,
+		Proto:       SnapshotVersion,
 		Version:     version.String(),
 		GeneratedAt: now.Truncate(time.Second),
 		Accounts:    accounts,
@@ -273,9 +266,8 @@ func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 	return snap
 }
 
-// Response is one server reply (one JSON object per line).
+// Response is one daemon operation result.
 type Response struct {
-	Proto             int     `json:"proto"`
 	OK                bool    `json:"ok"`
 	Error             string  `json:"error,omitempty"`
 	Dir               string  `json:"dir,omitempty"` // select: chosen config dir

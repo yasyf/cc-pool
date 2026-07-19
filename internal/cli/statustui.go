@@ -35,7 +35,7 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 	ctx := cmd.Context()
 	// Restart a version-skewed daemon so its cached view carries the detail pane's wire fields; gatherStatus falls back to live.
 	if !live {
-		ensureDaemon(cmd, false)
+		ensureDaemon(cmd)
 	}
 	cwd, _ := os.Getwd() // unreadable cwd just hides pin controls
 	model := statusTUI{

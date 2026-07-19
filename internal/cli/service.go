@@ -136,44 +136,10 @@ func daemonBundleExecutable() (string, bool) {
 	return p, err == nil && fi.Mode().IsRegular()
 }
 
-const (
-	keepAliveAlways = `    <key>KeepAlive</key>
-    <true/>`
-	keepAliveOnFailure = `    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>`
-)
-
 type ccpAgentLauncher struct{}
 
 func (ccpAgentLauncher) Run(ctx context.Context, args ...string) (string, error) {
-	if len(args) > 0 && args[0] == "bootstrap" {
-		if len(args) != 3 {
-			return "", fmt.Errorf("adapt cc-pool LaunchAgent: unexpected bootstrap arguments %q", args)
-		}
-		if err := adaptCCPAgentPlist(args[2]); err != nil {
-			return "", err
-		}
-	}
 	return runCCPLaunchctl(ctx, args...)
-}
-
-func adaptCCPAgentPlist(path string) error {
-	body, err := os.ReadFile(path) //nolint:gosec // G304: daemonkit supplies the freshly rendered cc-pool LaunchAgent path.
-	if err != nil {
-		return fmt.Errorf("read cc-pool LaunchAgent: %w", err)
-	}
-	if !strings.Contains(string(body), keepAliveAlways) {
-		return errors.New("adapt cc-pool LaunchAgent: daemonkit KeepAlive policy not found")
-	}
-	body = []byte(strings.Replace(string(body), keepAliveAlways, keepAliveOnFailure, 1))
-	//nolint:gosec // G703: daemonkit supplies the freshly rendered cc-pool LaunchAgent path.
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		return fmt.Errorf("write cc-pool LaunchAgent: %w", err)
-	}
-	return nil
 }
 
 // ccpAgent's Program is the daemon .app bundle when it is installed (launchd execs
@@ -185,12 +151,13 @@ func ccpAgent() service.Agent {
 		program = p
 	}
 	return service.Agent{
-		Label:    "com.yasyf.cc-pool",
-		Formula:  "cc-pool",
-		Program:  program,
-		Args:     []string{"daemon"},
-		LogPath:  pool.LogPath(),
-		Launcher: ccpAgentLauncher{},
+		Label:         "com.yasyf.cc-pool",
+		Formula:       "cc-pool",
+		Program:       program,
+		Args:          []string{"daemon"},
+		LogPath:       pool.LogPath(),
+		RestartPolicy: service.RestartOnFailure,
+		Launcher:      ccpAgentLauncher{},
 		Env: map[string]string{
 			"PATH": os.Getenv("PATH"),
 		},
@@ -219,7 +186,10 @@ func newServiceCmd() *cobra.Command {
 				for _, line := range ccpAgent().StatusLines(cmd.Context()) {
 					_, _ = fmt.Fprintln(out, line)
 				}
-				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
+				cl := daemon.NewClient()
+				resp, healthErr := cl.Health()
+				_ = cl.Close()
+				if healthErr == nil && resp.OK {
 					_, _ = fmt.Fprintf(out, "Daemon: running (%s)\n", resp.Version)
 				} else {
 					_, _ = fmt.Fprintln(out, "Daemon: not responding")
@@ -541,45 +511,14 @@ func runServiceInstall(cmd *cobra.Command) error {
 	return nil
 }
 
-const evictTimeout = 5 * time.Second
-
 // ensureDaemon is best-effort: failures warn, callers fall back to direct
-// sampling. force restarts even a responding same-version daemon (a pure→fuse
-// binary swap the daemonAt short-circuit would miss).
-func ensureDaemon(cmd *cobra.Command, force bool) {
+// sampling. daemonkit Runtime owns any exact-build takeover.
+func ensureDaemon(cmd *cobra.Command) {
 	want := version.String()
-	if !force && daemonAt(want) {
+	if daemonAt(want) {
 		return
 	}
-	cl := daemon.NewClient()
-	if resp, err := cl.Health(); err == nil && resp.OK {
-		// A skewed daemon can answer here: a KeepAlive pre-upgrade image, or a
-		// detached spawn launchd never tracked.
-		step(cmd.OutOrStdout(), "Restarting the cc-pool daemon…")
-		// Bootout first: disables KeepAlive so launchd can't respawn the
-		// pre-upgrade image; mount-safe (the detached holder keeps serving);
-		// a no-op for an orphan.
-		if ccpAgent().IsBrewManaged() {
-			_ = ccpAgent().BrewStop(cmd.Context())
-		} else {
-			_ = ccpAgent().Uninstall(cmd.Context())
-		}
-		// An orphan survives bootout.
-		if !cl.WaitGone(evictTimeout) {
-			_, _ = cl.Shutdown()
-			if !cl.WaitGone(evictTimeout) {
-				if _, err := cl.KillSocketPeer(); err != nil {
-					warn(cmd.ErrOrStderr(), "couldn't evict the old daemon (%s): %v", resp.Version, err)
-				}
-				if !cl.WaitGone(evictTimeout) {
-					warn(cmd.ErrOrStderr(),
-						"the old daemon (%s) still won't release the socket; check `ccp service status`", resp.Version)
-				}
-			}
-		}
-	} else {
-		step(cmd.OutOrStdout(), "Starting the cc-pool daemon…")
-	}
+	step(cmd.OutOrStdout(), "Starting the cc-pool daemon…")
 	if err := runServiceInstall(cmd); err != nil {
 		// A concurrent start or an already-bootstrapped agent can fail the
 		// install while leaving a healthy current daemon behind.
@@ -602,7 +541,9 @@ func ensureDaemon(cmd *cobra.Command, force bool) {
 
 // daemonAt is exact-version: a stale pre-upgrade daemon never counts.
 func daemonAt(wantVersion string) bool {
-	resp, err := daemon.NewClient().Health()
+	cl := daemon.NewClient()
+	defer func() { _ = cl.Close() }()
+	resp, err := cl.Health()
 	return err == nil && resp.OK && resp.Version == wantVersion
 }
 

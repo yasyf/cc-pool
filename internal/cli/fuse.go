@@ -68,7 +68,7 @@ func runFuseEnable(cmd *cobra.Command) error {
 		}
 	}
 
-	ensureDaemon(cmd, false)
+	ensureDaemon(cmd)
 
 	if err := withManager(func(m *pool.Manager) error {
 		if ok, err := m.Initialized(); err != nil {

@@ -17,6 +17,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/fusekit/mountd"
 	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
@@ -120,6 +121,14 @@ func TestCCPAgentProgramSelection(t *testing.T) {
 			t.Fatalf("ccpAgent().Program = %q, want the keg bundle %q", p, bundle)
 		}
 	})
+}
+
+func TestCCPAgentUsesTypedRestartOnFailure(t *testing.T) {
+	tempHome(t)
+	swapVar(t, &daemonBundleBin, func() (string, error) { return "", errors.New("no executable") })
+	if got := ccpAgent().RestartPolicy; got != service.RestartOnFailure {
+		t.Fatalf("ccpAgent().RestartPolicy = %v, want RestartOnFailure", got)
+	}
 }
 
 func seedAccounts(t *testing.T, accts ...store.Account) {

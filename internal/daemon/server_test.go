@@ -3,11 +3,9 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -288,75 +286,6 @@ func TestHandleSelectTransactionAbortAndExclude(t *testing.T) {
 	}
 	if sticky, ok, _ := s.m.Store.GetSticky("/proj"); !ok || sticky.AccountID != 2 {
 		t.Fatalf("committed sticky = %+v ok=%v, want acct-2", sticky, ok)
-	}
-}
-
-func TestCommitSelectionRetriesDroppedResponseWithoutDuplicateEffects(t *testing.T) {
-	s, _ := newTestServer(t)
-	selected := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj"})
-	if !selected.OK || selected.ReservationToken == "" {
-		t.Fatalf("select = %+v", selected)
-	}
-
-	socketFile, err := os.CreateTemp("/tmp", "ccp-commit-*.sock")
-	if err != nil {
-		t.Fatal(err)
-	}
-	socket := socketFile.Name()
-	_ = socketFile.Close()
-	_ = os.Remove(socket)
-	t.Cleanup(func() { _ = os.Remove(socket) })
-	ln, err := net.Listen("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	served := make(chan error, 1)
-	go func() {
-		for i := 0; i < 2; i++ {
-			conn, err := ln.Accept()
-			if err != nil {
-				served <- err
-				return
-			}
-			var req Request
-			if err := json.NewDecoder(conn).Decode(&req); err != nil {
-				_ = conn.Close()
-				served <- err
-				return
-			}
-			resp := s.dispatch(t.Context(), req)
-			if i == 0 {
-				_ = conn.Close() // commit landed; its first response is lost
-				continue
-			}
-			resp.Proto = ProtocolVersion
-			err = json.NewEncoder(conn).Encode(resp)
-			_ = conn.Close()
-			if err != nil {
-				served <- err
-				return
-			}
-		}
-		served <- nil
-	}()
-
-	client := &Client{socket: socket}
-	if err := client.CommitSelection(t.Context(), selected.ReservationToken); err != nil {
-		t.Fatalf("retry commit after dropped response: %v", err)
-	}
-	if err := <-served; err != nil {
-		t.Fatalf("serve commit attempts: %v", err)
-	}
-	live, err := s.m.Store.ListActiveSessions()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(live) != 1 || live[0].AccountID != 1 {
-		t.Fatalf("replayed commit effects = %+v, want one acct-1 session", live)
-	}
-	if sticky, ok, err := s.m.Store.GetSticky("/proj"); err != nil || !ok || sticky.AccountID != 1 {
-		t.Fatalf("replayed commit sticky = %+v ok=%v err=%v", sticky, ok, err)
 	}
 }
 
@@ -980,36 +909,32 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var serveErr, closeErr error
+	var serveErr error
 	done := make(chan struct{})
 	go func() {
-		// Mirror Run's defer ordering.
 		serveErr = s.serve(ctx)
-		closeErr = st.Close()
 		close(done)
 	}()
 
-	dial := func() net.Conn {
-		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			conn, err := net.Dial("unix", s.socket)
-			if err == nil {
-				return conn
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("dial daemon socket: %v", err)
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-
 	// Admit a work op and block it in dispatch.
-	work := dial()
-	defer func() { _ = work.Close() }()
-	if _, err := work.Write([]byte(`{"proto":2,"op":"fpbridgecheck"}` + "\n")); err != nil {
-		t.Fatal(err)
+	client := &Client{socket: s.socket, sessions: make(map[*clientSession]struct{})}
+	defer func() { _ = client.Close() }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !client.Available() {
+		if time.Now().After(deadline) {
+			t.Fatal("daemon never became available")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	type callResult struct {
+		resp *Response
+		err  error
+	}
+	called := make(chan callResult, 1)
+	go func() {
+		resp, err := client.FPBridgeCheck()
+		called <- callResult{resp: resp, err: err}
+	}()
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
@@ -1029,68 +954,21 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	if err := <-settledCtx; err != nil {
 		t.Fatalf("in-flight handler context canceled before settle: %v", err)
 	}
-	var resp Response
-	if err := json.NewDecoder(work).Decode(&resp); err != nil {
-		t.Fatalf("decode in-flight response: %v", err)
+	result := <-called
+	if result.err != nil {
+		t.Fatalf("in-flight request failed during shutdown: %v", result.err)
 	}
-	if !resp.OK || resp.Error != "" {
-		t.Fatalf("in-flight request failed during shutdown: %+v", resp)
+	if !result.resp.OK || result.resp.Error != "" {
+		t.Fatalf("in-flight request failed during shutdown: %+v", result.resp)
 	}
 
 	<-done
 	if serveErr != nil {
 		t.Fatalf("serve: %v", serveErr)
 	}
-	if closeErr != nil {
-		t.Fatalf("store close: %v", closeErr)
-	}
 	// logBuf is safe to read here: every writer goroutine exited before done.
 	if strings.Contains(logBuf.String(), "database is closed") {
 		t.Fatalf("teardown raced an in-flight handler:\n%s", logBuf.String())
-	}
-}
-
-// TestShutdownLifecycleHandlerWaitsForACK pins the lifecycle/wg split:
-// OpShutdown stays outside drain admission, but serve's wg cannot finish while
-// its terminal ACK is blocked on the connection.
-func TestShutdownLifecycleHandlerWaitsForACK(t *testing.T) {
-	server, client := net.Pipe()
-	defer func() { _ = client.Close() }()
-	triggered := make(chan struct{})
-	s := &Server{triggerShutdown: func() { close(triggered) }}
-	go s.handle(t.Context(), server)
-
-	if err := json.NewEncoder(client).Encode(Request{Proto: ProtocolVersion, Op: OpShutdown}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-triggered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("OpShutdown never triggered drain")
-	}
-
-	waited := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(waited)
-	}()
-	select {
-	case <-waited:
-		t.Fatal("lifecycle wg settled before the Shutdown ACK was read")
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	var resp Response
-	if err := json.NewDecoder(client).Decode(&resp); err != nil {
-		t.Fatal(err)
-	}
-	if !resp.OK || resp.Proto != ProtocolVersion {
-		t.Fatalf("Shutdown ACK = %+v", resp)
-	}
-	select {
-	case <-waited:
-	case <-time.After(2 * time.Second):
-		t.Fatal("lifecycle wg did not settle after the Shutdown ACK landed")
 	}
 }
 
@@ -1146,6 +1024,7 @@ func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	cl := &Client{socket: s.socket}
+	defer func() { _ = cl.Close() }()
 	if resp, err := cl.Shutdown(); err != nil || !resp.OK {
 		t.Fatalf("shutdown: resp = %+v, err = %v", resp, err)
 	}
@@ -1155,7 +1034,7 @@ func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
 			t.Fatalf("serve: %v", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("serve did not return after OpShutdown")
+		t.Fatal("serve did not return after lifecycle shutdown")
 	}
 
 	if got := fake.callOrder(); len(got) != 0 {

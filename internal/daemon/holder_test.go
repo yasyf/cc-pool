@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -440,57 +439,6 @@ func TestHealFuseRowsLoopTicksAndExits(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("healFuseRows did not exit on ctx cancellation")
 	}
-}
-
-// TestEvictionNeverDialsMountsSocket pins holder isolation: evicting a
-// version-skewed daemon — clean step-down or wedged-orphan kill — must never
-// touch the mount-holder socket.
-func TestEvictionNeverDialsMountsSocket(t *testing.T) {
-	tattle := func(t *testing.T) (string, *atomic.Int32) {
-		t.Helper()
-		sockDir, err := os.MkdirTemp("/tmp", "ccp-tattle")
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
-		socket := filepath.Join(sockDir, "m.sock")
-		ln, err := net.Listen("unix", socket)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = ln.Close() })
-		var dials atomic.Int32
-		go func() {
-			for {
-				conn, err := ln.Accept()
-				if err != nil {
-					return
-				}
-				dials.Add(1)
-				_ = conn.Close()
-			}
-		}()
-		return socket, &dials
-	}
-
-	// The takeover speaks only the daemon socket (Health + PeerPID); a dead peer
-	// pid drives the evict ladder to Bind without touching the holder mounts socket.
-	t.Run("clean step-down never touches the mounts socket", func(t *testing.T) {
-		f := newFakeDaemon(t, "0.0.0-old", true)
-		setSocketPeerPID(t, func(string) (int, error) { return 0x7ffffffe, nil })
-		mounts, dials := tattle(t)
-		s := testServer(f.socket, 3*time.Second)
-		s.holderSocket = mounts
-		ln, lock, err := s.listen(t.Context())
-		if err != nil {
-			t.Fatalf("listen should evict the skewed daemon and bind: %v", err)
-		}
-		defer func() { _ = ln.Close() }()
-		defer func() { _ = lock.Close() }()
-		if got := dials.Load(); got != 0 {
-			t.Fatalf("daemon eviction dialed the mounts socket %d time(s)", got)
-		}
-	})
 }
 
 // driveRetryTicks runs n heal ticks, rewinding dir's backoff before each so

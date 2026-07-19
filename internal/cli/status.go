@@ -65,7 +65,9 @@ func runStatusJSON(cmd *cobra.Command, m *pool.Manager, forceLive bool) error {
 // drops SampleAge and fabricates "sample_age":"0s".
 func statusSnapshotJSON(ctx context.Context, m *pool.Manager, forceLive bool) (daemon.StatusSnapshot, error) {
 	if !forceLive {
-		resp, err := daemon.NewClient().StatusContext(ctx)
+		cl := daemon.NewClient()
+		resp, err := cl.StatusContext(ctx)
+		_ = cl.Close()
 		if daemonStatusUsable(resp, err) {
 			snap := daemon.NewStatusSnapshot(resp.Accounts, time.Now())
 			snap.Ledgers = resp.Ledgers
@@ -123,7 +125,9 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 
 func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, []daemon.LedgerState, bool, error) {
 	if !forceLive {
-		resp, err := daemon.NewClient().StatusContext(ctx)
+		cl := daemon.NewClient()
+		resp, err := cl.StatusContext(ctx)
+		_ = cl.Close()
 		if daemonStatusUsable(resp, err) {
 			return fromDaemon(resp.Accounts), resp.Ledgers, resp.FPConsentPending, nil
 		}
