@@ -400,7 +400,7 @@ func TestPickFallback(t *testing.T) {
 }
 
 // TestIncidentRegression20260610 replays the real 2026-06-10 05:18 selection
-// (from ~/.cc-pool/pool.db) where acct-1 (100% 5h-used, reset 21m out) outranked
+// (from ~/.cc-pool/pool-v1.db) where acct-1 (100% 5h-used, reset 21m out) outranked
 // acct-2 (31% used) via reset credit and was launched, silently billing
 // extra-usage credits. It must never be picked again.
 func TestIncidentRegression20260610(t *testing.T) {
@@ -482,6 +482,29 @@ func TestScoreNeedsLoginExcluded(t *testing.T) {
 	}
 	if _, ok := PickFallback(onlyFlagged); ok {
 		t.Fatal("PickFallback must skip a needs-login account")
+	}
+}
+
+func TestScoreCredentialQuarantineExcluded(t *testing.T) {
+	now := time.Now()
+	quarantined := Input{
+		AccountID: 1, HasUsage: true, SampleTS: now,
+		CredentialQuarantined: true,
+	}
+	r := Score(quarantined, now)
+	if r.Available || !r.CredentialQuarantined ||
+		r.Components.CredentialQuarantinePenalty != PenCredentialQuarantine {
+		t.Fatalf("quarantined score = %+v", r)
+	}
+	ranked := Rank([]Input{
+		quarantined,
+		{AccountID: 2, HasUsage: true, SampleTS: now, Util5h: 50},
+	}, now)
+	if best, ok := Pick(ranked); !ok || best.AccountID != 2 {
+		t.Fatalf("Pick = %+v ok=%t, want healthy account 2", best, ok)
+	}
+	if _, ok := PickFallback(Rank([]Input{quarantined}, now)); ok {
+		t.Fatal("PickFallback selected a credential-quarantined account")
 	}
 }
 

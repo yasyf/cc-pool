@@ -15,8 +15,9 @@ var (
 	PenRateLimit = 100.0
 	// PenNeedsLogin only orders needs-login accounts among themselves:
 	// Available=false and PickFallback already exclude them.
-	PenNeedsLogin = 100.0
-	PenStale      = 20.0
+	PenNeedsLogin           = 100.0
+	PenCredentialQuarantine = 100.0
+	PenStale                = 20.0
 
 	// StaleAfter is the sample age past which the selection penalty engages;
 	// uniform across the pool between polls, so it does not skew ranking.
@@ -81,10 +82,11 @@ type Input struct {
 	// from usage history. Zero means unknown or idle (no runway penalty).
 	Burn5hPerHour float64
 
-	ActiveSessions int
-	RateLimited    bool // a live 429 / rate-limit observed
-	RefreshFailed  bool // the most recent refresh attempt failed
-	NeedsLogin     bool // the daemon flagged the account: refresh token gone/revoked
+	ActiveSessions        int
+	RateLimited           bool // a live 429 / rate-limit observed
+	RefreshFailed         bool // the most recent refresh attempt failed
+	NeedsLogin            bool // the daemon flagged the account: refresh token gone/revoked
+	CredentialQuarantined bool // exact credential state requires reconciliation
 }
 
 // staleAfter reports stale if the sample is older than d, refresh failed, or the
@@ -101,31 +103,33 @@ func (in Input) staleAfter(now time.Time, d time.Duration) bool {
 
 // Components is the per-term breakdown, for `status` and debugging.
 type Components struct {
-	Eff5              float64 // reset-aware effective 5h remaining
-	Eff7              float64 // reset-aware effective 7d remaining
-	RawRemaining5h    float64 // 100 − util5, no reset credit (drives barriers/runway/sticky)
-	RawRemaining7d    float64 // 100 − util7
-	Remaining5h       float64 // W5h · Eff5 (weighted contribution)
-	Remaining7d       float64 // W7d · Eff7
-	SessionPenalty    float64
-	RateLimitPenalty  float64
-	NeedsLoginPenalty float64
-	StalePenalty      float64
-	Barrier5h         float64
-	Barrier7d         float64
-	RunwayPenalty     float64
+	Eff5                        float64 // reset-aware effective 5h remaining
+	Eff7                        float64 // reset-aware effective 7d remaining
+	RawRemaining5h              float64 // 100 − util5, no reset credit (drives barriers/runway/sticky)
+	RawRemaining7d              float64 // 100 − util7
+	Remaining5h                 float64 // W5h · Eff5 (weighted contribution)
+	Remaining7d                 float64 // W7d · Eff7
+	SessionPenalty              float64
+	RateLimitPenalty            float64
+	NeedsLoginPenalty           float64
+	CredentialQuarantinePenalty float64
+	StalePenalty                float64
+	Barrier5h                   float64
+	Barrier7d                   float64
+	RunwayPenalty               float64
 }
 
 // Result is a scored account.
 type Result struct {
-	AccountID   int
-	Score       float64
-	Components  Components
-	Resets5h    time.Time
-	Stale       bool
-	RateLimited bool
-	NeedsLogin  bool // refresh token gone/revoked; only `ccp login` recovers it
-	Exhausted   bool // a window is fully used and its reset is still pending
+	AccountID             int
+	Score                 float64
+	Components            Components
+	Resets5h              time.Time
+	Stale                 bool
+	RateLimited           bool
+	NeedsLogin            bool // refresh token gone/revoked; only `ccp login` recovers it
+	CredentialQuarantined bool
+	Exhausted             bool // a window is fully used and its reset is still pending
 	// ExhaustedUntil is when the account actually recovers: the latest reset
 	// among the windows that tripped the gate. Zero unless Exhausted.
 	ExhaustedUntil time.Time
@@ -219,26 +223,30 @@ func Score(in Input, now time.Time) Result {
 	if in.NeedsLogin {
 		c.NeedsLoginPenalty = PenNeedsLogin
 	}
+	if in.CredentialQuarantined {
+		c.CredentialQuarantinePenalty = PenCredentialQuarantine
+	}
 	if in.staleAfter(now, StaleAfter) {
 		c.StalePenalty = PenStale
 	}
 	stale := in.staleAfter(now, DisplayStaleAfter)
 
 	score := c.Remaining5h + c.Remaining7d -
-		c.SessionPenalty - c.RateLimitPenalty - c.NeedsLoginPenalty - c.StalePenalty -
+		c.SessionPenalty - c.RateLimitPenalty - c.NeedsLoginPenalty - c.CredentialQuarantinePenalty - c.StalePenalty -
 		c.Barrier5h - c.Barrier7d - c.RunwayPenalty
 	return Result{
-		AccountID:       in.AccountID,
-		Score:           score,
-		Components:      c,
-		Resets5h:        in.Resets5h,
-		Stale:           stale,
-		RateLimited:     in.RateLimited,
-		NeedsLogin:      in.NeedsLogin,
-		Exhausted:       exhausted,
-		ExhaustedUntil:  exhaustedUntil,
-		WeeklyExhausted: exhausted7 || exhausted7Scoped,
-		Available:       !in.RateLimited && !exhausted && !in.NeedsLogin,
+		AccountID:             in.AccountID,
+		Score:                 score,
+		Components:            c,
+		Resets5h:              in.Resets5h,
+		Stale:                 stale,
+		RateLimited:           in.RateLimited,
+		NeedsLogin:            in.NeedsLogin,
+		CredentialQuarantined: in.CredentialQuarantined,
+		Exhausted:             exhausted,
+		ExhaustedUntil:        exhaustedUntil,
+		WeeklyExhausted:       exhausted7 || exhausted7Scoped,
+		Available:             !in.RateLimited && !exhausted && !in.NeedsLogin && !in.CredentialQuarantined,
 	}
 }
 
@@ -351,13 +359,13 @@ func Pick(ranked []Result) (Result, bool) {
 	return Result{}, false
 }
 
-// PickFallback returns the best account that is not rate-limited or needs-login —
+// PickFallback returns the best account that is not rate-limited, needs-login, or credential-quarantined —
 // the least-bad pick when Pick found nothing. An exhausted account can still
 // serve (billing extra-usage credits or waiting out its reset); rate-limited and
 // needs-login ones cannot. ok=false if all are rate-limited/needs-login or empty.
 func PickFallback(ranked []Result) (Result, bool) {
 	for _, r := range ranked {
-		if !r.RateLimited && !r.NeedsLogin {
+		if !r.RateLimited && !r.NeedsLogin && !r.CredentialQuarantined {
 			return r, true
 		}
 	}
