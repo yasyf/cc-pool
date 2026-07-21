@@ -29,6 +29,9 @@ var (
 		0x8a, 0xb7, 0x6f, 0xb2, 0x23, 0xaf, 0x6b, 0x9f,
 		0x8c, 0x6f, 0x25, 0xa6, 0xcf, 0x7f, 0xbd, 0x9b,
 	}
+	holderApplication = func() holder.SignedApplication {
+		return holderbridge.Application(pool.WidgetAppPath())
+	}
 	holderAppStat        = os.Lstat
 	holderControllerOpen = func(
 		ctx context.Context,
@@ -53,7 +56,7 @@ type holderServiceController interface {
 // HolderDeploymentPlan returns the daemon-facing fixed application contract.
 func HolderDeploymentPlan() (holder.DeploymentPlan, error) {
 	return holder.NewDeploymentPlan(holder.DeploymentPlanSpec{
-		Application:         holderbridge.Application(pool.WidgetAppPath()),
+		Application:         holderApplication(),
 		RuntimeDirectory:    pool.FuseKitRuntimeDir(),
 		BuildID:             version.String(),
 		SourceCapable:       true,

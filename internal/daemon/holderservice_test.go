@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -16,13 +17,16 @@ import (
 )
 
 func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testing.T) {
+	if application := holderApplication(); application.AppPath != pool.WidgetAppPath() {
+		t.Fatalf("production application path = %q", application.AppPath)
+	}
+	wantApplication := useTestHolderApplication(t)
 	plan, err := HolderDeploymentPlan()
 	if err != nil {
 		t.Fatal(err)
 	}
 	application := plan.Application()
-	if application.AppPath != pool.WidgetAppPath() ||
-		application.BundleID != holderbridge.BundleID ||
+	if application != wantApplication || application.BundleID != holderbridge.BundleID ||
 		application.TeamID != holderbridge.TeamID {
 		t.Fatalf("application = %#v", application)
 	}
@@ -44,7 +48,7 @@ func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testi
 		)
 	}
 	runtimeSpec := holderbridge.RuntimePlanSpec(
-		pool.WidgetAppPath(), pool.FuseKitRuntimeDir(), plan.BuildID(), nil,
+		wantApplication.AppPath, pool.FuseKitRuntimeDir(), plan.BuildID(), nil,
 	)
 	if runtimeSpec.Application != application || !runtimeSpec.SourceCapable ||
 		runtimeSpec.BrokerPolicy.RequiredAppGroup != holderbridge.AppGroup ||
@@ -52,7 +56,8 @@ func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testi
 		t.Fatal("signed runtime contract differs from daemon deployment identity")
 	}
 	agent := plan.Agent()
-	if agent.Label != holderbridge.BundleID+".fusekit" || agent.Program != pool.WidgetAppBinaryPath() ||
+	if agent.Label != holderbridge.BundleID+".fusekit" ||
+		agent.Program != filepath.Join(wantApplication.AppPath, "Contents", "MacOS", holderbridge.ExecutableName) ||
 		len(agent.Args) != 0 || agent.Env["FUSEKIT_BUILD_ID"] != plan.BuildID() ||
 		agent.LogPath != filepath.Join(pool.FuseKitRuntimeDir(), "holder.log") ||
 		agent.RestartPolicy != service.RestartAlways ||
@@ -68,20 +73,11 @@ func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testi
 }
 
 func TestEnsureHolderServiceConvergesExactAgentAndWaitsForReadiness(t *testing.T) {
-	originalStat, originalOpen, originalReady := holderAppStat, holderControllerOpen, holderReady
+	useTestHolderApplication(t)
+	originalOpen, originalReady := holderControllerOpen, holderReady
 	t.Cleanup(func() {
-		holderAppStat, holderControllerOpen, holderReady = originalStat, originalOpen, originalReady
+		holderControllerOpen, holderReady = originalOpen, originalReady
 	})
-	info, err := os.Stat(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	holderAppStat = func(path string) (os.FileInfo, error) {
-		if path != pool.WidgetAppPath() {
-			t.Fatalf("app path = %q", path)
-		}
-		return info, nil
-	}
 	var order []string
 	controller := &testHolderServiceController{
 		converge: func(_ context.Context, agents []service.Agent) error {
@@ -129,6 +125,7 @@ func TestEnsureHolderServiceConvergesExactAgentAndWaitsForReadiness(t *testing.T
 }
 
 func TestEnsureHolderServiceRefusesMissingAppBeforeControllerEffects(t *testing.T) {
+	useTestHolderApplication(t)
 	originalStat, originalOpen, originalReady := holderAppStat, holderControllerOpen, holderReady
 	t.Cleanup(func() {
 		holderAppStat, holderControllerOpen, holderReady = originalStat, originalOpen, originalReady
@@ -151,15 +148,11 @@ func TestEnsureHolderServiceRefusesMissingAppBeforeControllerEffects(t *testing.
 }
 
 func TestEnsureHolderServiceConvergenceFailureClosesBeforeReadiness(t *testing.T) {
-	originalStat, originalOpen, originalReady := holderAppStat, holderControllerOpen, holderReady
+	useTestHolderApplication(t)
+	originalOpen, originalReady := holderControllerOpen, holderReady
 	t.Cleanup(func() {
-		holderAppStat, holderControllerOpen, holderReady = originalStat, originalOpen, originalReady
+		holderControllerOpen, holderReady = originalOpen, originalReady
 	})
-	info, err := os.Stat(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	holderAppStat = func(string) (os.FileInfo, error) { return info, nil }
 	want := errors.New("launchctl convergence failed")
 	closed := 0
 	holderControllerOpen = func(
@@ -284,4 +277,34 @@ func mustHolderDeploymentPlan(t *testing.T) holder.DeploymentPlan {
 		t.Fatal(err)
 	}
 	return plan
+}
+
+func useTestHolderApplication(t *testing.T) holder.SignedApplication {
+	t.Helper()
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	applications := filepath.Join(account.HomeDir, "Applications")
+	if err := os.MkdirAll(applications, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	appPath := filepath.Join(applications, ".cc-pool-holder-"+filepath.Base(t.TempDir())+".app")
+	application := holderbridge.Application(appPath)
+	executable := filepath.Join(appPath, "Contents", "MacOS", application.Runtime.ExecutableName)
+	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	originalApplication := holderApplication
+	holderApplication = func() holder.SignedApplication { return application }
+	t.Cleanup(func() {
+		holderApplication = originalApplication
+		if err := os.RemoveAll(appPath); err != nil {
+			t.Errorf("remove test holder app: %v", err)
+		}
+	})
+	return application
 }
