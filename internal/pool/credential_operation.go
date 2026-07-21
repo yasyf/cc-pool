@@ -609,9 +609,7 @@ func applyCredentialOperation[T any](
 		failureClass = credentialFailureClass(operationErr)
 		switch failureClass {
 		case store.CredentialFailureRefreshUnauthorized,
-			store.CredentialFailureRefreshRejected,
-			store.CredentialFailureNetwork,
-			store.CredentialFailureRefreshServer:
+			store.CredentialFailureRefreshRejected:
 			status = store.CredentialTerminalFailed
 			category = store.CredentialResultFailed
 		default:

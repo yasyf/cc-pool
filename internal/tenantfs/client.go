@@ -104,8 +104,3 @@ func (c *Client) PrepareTenant(
 ) (catalogproto.PrepareTenantResponse, error) {
 	return c.catalog.PrepareTenant(ctx, tenant, request)
 }
-
-// ProveBrokerPeer returns the exact fully authenticated signed broker peer.
-func (c *Client) ProveBrokerPeer(ctx context.Context) (catalogproto.ProveBrokerPeerResponse, error) {
-	return c.catalog.ProveBrokerPeer(ctx)
-}

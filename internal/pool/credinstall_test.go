@@ -498,26 +498,3 @@ func TestInstallSyncedCredentialAbortsOnLoginDuringInstall(t *testing.T) {
 		t.Fatalf("file backend = (%+v, %v), want the synced copy untouched", got, err)
 	}
 }
-
-// TestWriteCredCASWritesThroughTombstone pins the CAS behavior the
-// install-over-tombstone path depends on: a prior read that fails to parse
-// (claude tombstone) or misses entirely must not block the write.
-func TestWriteCredCASWritesThroughTombstone(t *testing.T) {
-	f := newInstallFixture(t)
-	tombstone := `{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}`
-	if err := os.WriteFile(creds.FileCredentialPath(f.a.ConfigDir), []byte(tombstone), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	next := envCred("healed", 4_000)
-	if err := f.m.writeObservedCredential(t.Context(), f.a, creds.SourceFile, nil, next, nil); err != nil {
-		t.Fatalf("writeObservedCredential over a tombstone = %v, want write-through", err)
-	}
-	got, err := credstest.FileStore(f.a.ConfigDir).Read(t.Context())
-	if err != nil {
-		t.Fatalf("read back after tombstone overwrite: %v", err)
-	}
-	if got.ClaudeAiOauth.AccessToken != "at-healed" {
-		t.Fatalf("file backend holds %q, want at-healed", got.ClaudeAiOauth.AccessToken)
-	}
-}

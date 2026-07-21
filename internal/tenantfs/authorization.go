@@ -62,9 +62,6 @@ func (a CatalogAuthorizer) Authorize(
 	}
 	authorization := catalogservice.Authorization{Route: route}
 	switch {
-	case operation == catalogproto.OperationBrokerProvePeer && route == (catalogservice.Route{}):
-		authorization.Principal = "cc-pool-owner"
-		authorization.Role = catalogservice.RoleTenantOwner
 	case operation == catalogproto.OperationTenantPrepare && route.Tenant != "" && !route.Forwarded && route.Domain == "":
 		authorization.Principal = "cc-pool-owner"
 		authorization.Role = catalogservice.RoleTenantOwner

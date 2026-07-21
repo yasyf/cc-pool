@@ -2214,8 +2214,10 @@ func (failure CredentialFailureClass) allowed(
 	switch failure {
 	case CredentialFailureInternal:
 		return status == CredentialTerminalFailed || status == CredentialTerminalQuarantined
-	case CredentialFailureNetwork, CredentialFailureRefreshServer,
-		CredentialFailureRefreshUnauthorized, CredentialFailureRefreshRejected:
+	case CredentialFailureNetwork, CredentialFailureRefreshServer:
+		return (kind == CredentialOperationEnsureFresh || kind == CredentialOperationRefreshCurrent) &&
+			status == CredentialTerminalQuarantined
+	case CredentialFailureRefreshUnauthorized, CredentialFailureRefreshRejected:
 		return (kind == CredentialOperationEnsureFresh || kind == CredentialOperationRefreshCurrent) &&
 			status == CredentialTerminalFailed
 	default:
@@ -2224,7 +2226,8 @@ func (failure CredentialFailureClass) allowed(
 }
 
 func (failure CredentialFailureClass) quarantine() bool {
-	return failure == CredentialFailureInternal
+	return failure == CredentialFailureInternal || failure == CredentialFailureNetwork ||
+		failure == CredentialFailureRefreshServer
 }
 
 func (state CredentialExternalState) validate() error {

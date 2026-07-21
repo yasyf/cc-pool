@@ -9,7 +9,7 @@ require (
 	github.com/descope/go-free-email-providers v0.0.0-20260427134210-d71f4c2c7632
 	github.com/ebitengine/purego v0.10.1
 	github.com/spf13/cobra v1.10.2
-	github.com/yasyf/daemonkit v0.1.1-0.20260721013056-c39154cdbd0a
+	github.com/yasyf/daemonkit v0.1.1-0.20260721044346-f090a23cf11f
 	github.com/yasyf/fusekit v1.5.1-0.20260719173548-c7394abfd145
 	github.com/yasyf/synckit v0.23.1-0.20260721024529-9b633bf21646
 	golang.org/x/net v0.56.0

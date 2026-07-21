@@ -109,28 +109,24 @@ func TestWriteStatusSnapshotOverwrites(t *testing.T) {
 }
 
 // TestWriteStatusSnapshotCarriesLedgers pins that the on-disk snapshot carries
-// the same composed Ledgers block the status op serves — both stores, sorted —
-// so doctor and the widget can read the self-heal state with the daemon down.
+// the daemon ledger block so doctor and the widget can read self-heal state
+// while the daemon is down.
 func TestWriteStatusSnapshotCarriesLedgers(t *testing.T) {
 	s, dirs := newTestServer(t)
 	s.snapshot = filepath.Join(t.TempDir(), "status.json")
 	s.ledMu.Lock()
-	s.led.forceFault(fpDomainPolicy, dirs[1], time.Now(), errors.New("fp wedged"))
+	s.led.forceFault(authStreakPolicy, dirs[1], time.Now(), errors.New("401"))
 	s.ledMu.Unlock()
-	s.holder.markDeepWedged(dirs[2])
 
 	if err := s.writeStatusSnapshot(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	snap := readSnapshot(t, s.snapshot)
-	if len(snap.Ledgers) != 2 {
-		t.Fatalf("snapshot ledgers = %+v, want the fp.domain and fuse.deepwedge rows", snap.Ledgers)
+	if len(snap.Ledgers) != 1 {
+		t.Fatalf("snapshot ledgers = %+v, want the auth.streak row", snap.Ledgers)
 	}
-	if snap.Ledgers[0].Policy != "fp.domain" || snap.Ledgers[0].Resource != dirs[1] || !snap.Ledgers[0].Faulted || snap.Ledgers[0].LastErr != "fp wedged" {
-		t.Errorf("ledgers[0] = %+v, want the faulted fp.domain row with its error", snap.Ledgers[0])
-	}
-	if snap.Ledgers[1].Policy != "fuse.deepwedge" || snap.Ledgers[1].Resource != dirs[2] || !snap.Ledgers[1].Faulted {
-		t.Errorf("ledgers[1] = %+v, want the holder-store fuse.deepwedge row", snap.Ledgers[1])
+	if snap.Ledgers[0].Policy != "auth.streak" || snap.Ledgers[0].Resource != dirs[1] || !snap.Ledgers[0].Faulted || snap.Ledgers[0].LastErr != "401" {
+		t.Errorf("ledgers[0] = %+v, want the faulted auth.streak row with its error", snap.Ledgers[0])
 	}
 }
 
@@ -190,7 +186,7 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 
 	t.Run("fully populated", func(t *testing.T) {
 		full := AccountStatus{
-			ID: 1, ConfigDir: "/x/acct-01", Label: "a@b.c", OverlayKind: "symlink",
+			ID: 1, ConfigDir: "/x/acct-01", Label: "a@b.c",
 			Score: 95.5, Remaining5h: 90, Remaining7d: 80, ActiveSessions: 2,
 			RateLimited: true, Exhausted: true, HasUsage: true, Stale: true,
 			Resets5h: now, Resets7d: now, SampleAge: "30s",
@@ -201,7 +197,7 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		// A second usable burning account with no known reset, so the rollup
 		// emits every PoolOutlook key for the pin below.
 		burning := AccountStatus{
-			ID: 2, ConfigDir: "/x/acct-02", Label: "b@c.d", OverlayKind: "symlink",
+			ID: 2, ConfigDir: "/x/acct-02", Label: "b@c.d",
 			HasUsage: true, Remaining5h: 50, Remaining7d: 60, SampleAge: "30s",
 			Burn5hPerHour: 10,
 		}
@@ -218,10 +214,9 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		if got := string(top["generated_at"]); got != `"2026-06-11T12:00:00Z"` {
 			t.Errorf("generated_at = %s, want whole-second UTC", got)
 		}
-		// Absolute pin, not == ProtocolVersion: deployed widgets hard-reject other
-		// values. A bump must update supportedProto in widget/Sources/Widget/Provider.swift.
-		if got := string(top["proto"]); got != "2" {
-			t.Errorf("snapshot proto = %s; the on-disk format is pinned at 2 for the widget", got)
+		// Absolute pin: the hard-cut widget rejects every other product epoch.
+		if got := string(top["proto"]); got != "1" {
+			t.Errorf("snapshot proto = %s; the on-disk format is pinned at 1 for the widget", got)
 		}
 
 		var accounts []map[string]json.RawMessage
@@ -229,7 +224,7 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertKeys(t, "account", accounts[0], []string{
-			"id", "config_dir", "label", "overlay_kind", "score",
+			"id", "config_dir", "label", "score",
 			"remaining_5h", "remaining_7d", "active_sessions", "rate_limited",
 			"exhausted", "has_usage", "stale", "resets_5h", "resets_7d",
 			"sample_age", "burn_5h_per_hour", "burn_7d_per_hour",
@@ -304,15 +299,15 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		if got := string(accounts[0]["resets_5h"]); got != `"0001-01-01T00:00:00Z"` {
 			t.Errorf("zero resets_5h = %s, want year-1 sentinel", got)
 		}
-		// Absent "pool" flips the widget to its locally-derived outlook.
+		// Absent "pool" means no account has a known-good sample yet.
 		if _, ok := top["pool"]; ok {
 			t.Error("never-sampled pool must omit the pool block")
 		}
 	})
 
 	t.Run("idle pool omits gross burn, pins net at 0", func(t *testing.T) {
-		// Gross burn 0 drops via omitempty; net burn is not omitempty — absent
-		// means an old daemon and flips the widget to its gross fallback.
+		// Gross burn 0 drops via omitempty; net burn remains required whenever
+		// the exact pool block is present.
 		idle := AccountStatus{ID: 1, HasUsage: true, Remaining5h: 50, Remaining7d: 50}
 		data, err := json.Marshal(NewStatusSnapshot([]AccountStatus{idle}, now))
 		if err != nil {
@@ -333,8 +328,7 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		if got := string(poolBlock["net_burn_5h_per_hour"]); got != "0" {
 			t.Errorf("idle pool net_burn_5h_per_hour = %s, want 0", got)
 		}
-		// Paces are not omitempty either: absent means an old daemon and flips
-		// the widget to its local skew derivation.
+		// Paces remain required whenever the exact pool block is present.
 		if got := string(poolBlock["pace_5h"]); got != "0" {
 			t.Errorf("idle pool pace_5h = %s, want 0", got)
 		}
@@ -392,8 +386,8 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 	t.Run("ledgers block", func(t *testing.T) {
 		snap := NewStatusSnapshot(nil, now)
 		snap.Ledgers = []LedgerState{{
-			Policy: "fp.domain", Resource: "/x/acct-01",
-			Strikes: 1, Faulted: true, Attempts: 2, AltHits: 3, Parked: true,
+			Policy: "auth.streak", Resource: "acct-01",
+			Strikes: 1, Faulted: true, Attempts: 2,
 			NextDue: now.Truncate(time.Second), LastErr: "boom", LastAt: now.Truncate(time.Second),
 		}}
 		data, err := json.Marshal(snap)
@@ -410,8 +404,8 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertKeys(t, "ledger row", rows[0], []string{
-			"policy", "resource", "strikes", "faulted", "attempts", "alt_hits",
-			"parked", "next_due", "last_err", "last_at",
+			"policy", "resource", "strikes", "faulted", "attempts",
+			"next_due", "last_err", "last_at",
 		})
 	})
 
@@ -440,7 +434,7 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 func TestStatusSnapshotScopedRoundTrip(t *testing.T) {
 	now := time.Date(2026, 7, 3, 16, 59, 59, 0, time.UTC) // whole second: RFC3339 round-trips exactly
 	want := AccountStatus{
-		ID: 1, ConfigDir: "/x/acct-01", Label: "a@b.c", OverlayKind: "symlink",
+		ID: 1, ConfigDir: "/x/acct-01", Label: "a@b.c",
 		HasUsage: true, Remaining5h: 40, Remaining7d: 40,
 		Scoped7dUtil: 100, Scoped7dResets: now, Scoped7dModel: "Fable", WeeklyExhausted: true,
 	}

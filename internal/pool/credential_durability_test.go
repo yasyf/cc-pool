@@ -272,14 +272,16 @@ func (f *retainedRefreshFailureOAuth) counts() (refresh []string, usage []string
 
 func TestSampleUsageNeverRepeatsRetainedFailedRefresh(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		err  error
+		name           string
+		err            error
+		wantQuarantine bool
 	}{
 		{
-			name: "network",
-			err:  errors.Join(oauth.ErrNetwork, context.DeadlineExceeded),
+			name:           "network",
+			err:            errors.Join(oauth.ErrNetwork, context.DeadlineExceeded),
+			wantQuarantine: true,
 		},
-		{name: "server", err: &oauth.RefreshError{Status: http.StatusServiceUnavailable}},
+		{name: "server", err: &oauth.RefreshError{Status: http.StatusServiceUnavailable}, wantQuarantine: true},
 		{name: "plain-401", err: &oauth.RefreshError{Status: http.StatusUnauthorized}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -291,10 +293,30 @@ func TestSampleUsageNeverRepeatsRetainedFailedRefresh(t *testing.T) {
 				account.KeychainAccount,
 				cred401("at-stale", "rt-single-use", time.Now().Add(-time.Hour)),
 			)
+			expected, err := manager.credentialMutationObservation(t.Context(), account)
+			if err != nil {
+				t.Fatal(err)
+			}
+			operationID, err := store.NewCredentialOperationID(
+				account.InstanceID, account.Generation,
+				store.CredentialOperationEnsureFresh, store.CredentialTargetAll,
+				store.CredentialLocatorDigest(
+					account.KeychainService, account.KeychainAccount,
+					creds.FileCredentialPath(account.ConfigDir),
+				),
+				expected,
+				credentialIntentDigest(
+					store.CredentialOperationEnsureFresh, RefreshLeadTime.String(), "true",
+				),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-			if _, _, _, err := manager.SampleUsage(
+			_, _, _, firstErr := manager.SampleUsage(
 				t.Context(), account, SampleOpts{AllowRefresh: true},
-			); err == nil {
+			)
+			if firstErr == nil {
 				t.Fatal("first SampleUsage unexpectedly succeeded")
 			}
 			refreshes, usage := oauthClient.counts()
@@ -304,11 +326,32 @@ func TestSampleUsageNeverRepeatsRetainedFailedRefresh(t *testing.T) {
 			if len(usage) != 1 || usage[0] != "at-stale" {
 				t.Fatalf("first SampleUsage usage tokens = %q, want one read-only probe", usage)
 			}
+			receipt, err := manager.Store.CredentialOperationReceiptByID(operationID)
+			if err != nil {
+				t.Fatalf("refresh receipt after %v: %v", firstErr, err)
+			}
+			wantTerminal := store.CredentialTerminalFailed
+			if tc.wantQuarantine {
+				wantTerminal = store.CredentialTerminalQuarantined
+			}
+			if receipt.TerminalStatus != wantTerminal {
+				t.Fatalf("refresh receipt terminal = %q, want %q: %+v", receipt.TerminalStatus, wantTerminal, receipt)
+			}
+			_, quarantineErr := manager.Store.CredentialQuarantine(account.ID)
+			if tc.wantQuarantine != (quarantineErr == nil) {
+				t.Fatalf("credential quarantine err = %v, want present=%t", quarantineErr, tc.wantQuarantine)
+			}
 
-			if _, _, _, err := manager.SampleUsage(
-				t.Context(), account, SampleOpts{AllowRefresh: true},
-			); err == nil {
+			replayCtx, replayCancel := context.WithTimeout(t.Context(), 2*time.Second)
+			_, _, _, replayErr := manager.SampleUsage(
+				replayCtx, account, SampleOpts{AllowRefresh: true},
+			)
+			replayCancel()
+			if replayErr == nil {
 				t.Fatal("retained-receipt SampleUsage unexpectedly succeeded")
+			}
+			if errors.Is(replayErr, context.DeadlineExceeded) {
+				t.Fatalf("retained-receipt SampleUsage waited instead of replaying: %v", replayErr)
 			}
 			refreshes, usage = oauthClient.counts()
 			if len(refreshes) != 1 || refreshes[0] != "rt-single-use" {

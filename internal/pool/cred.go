@@ -169,21 +169,17 @@ func alreadyOnTarget(
 	if err := boundary.Cross(ctx); err != nil {
 		return nil, err
 	}
-	if boundary.manager.credentialCAS != nil {
-		if _, err := boundary.manager.credentialCAS(
-			ctx, boundary.account, boundary.expected,
-			credentialCASMutation{Target: stray.store.Source(), DeleteTarget: true},
-		); err != nil {
-			if errors.Is(err, errCredentialCASConflict) {
-				return nil, ErrCredentialChangedUnderfoot
-			}
-			return nil, err
-		}
-		out.CleanedStray = true
-		return out, nil
+	if boundary.manager.credentialCAS == nil {
+		return nil, errors.New("credential CAS worker is unavailable")
 	}
-	if err := stray.store.Delete(ctx); err != nil {
-		return nil, fmt.Errorf("delete stray credential copy at %s: %w", stray.store, err)
+	if _, err := boundary.manager.credentialCAS(
+		ctx, boundary.account, boundary.expected,
+		credentialCASMutation{Target: stray.store.Source(), DeleteTarget: true},
+	); err != nil {
+		if errors.Is(err, errCredentialCASConflict) {
+			return nil, ErrCredentialChangedUnderfoot
+		}
+		return nil, err
 	}
 	out.CleanedStray = true
 	return out, nil
@@ -238,24 +234,22 @@ func (m *Manager) dropDivergentCopy(
 	if stray.err != nil || stray.cred == nil {
 		return fmt.Errorf("%w: cannot fingerprint divergent credential at %s", ErrCredentialUnverifiable, stray.store)
 	}
-	if boundary != nil {
-		if err := boundary.Cross(ctx); err != nil {
-			return err
-		}
-		if m.credentialCAS != nil {
-			if _, err := m.credentialCAS(ctx, a, boundary.expected, credentialCASMutation{
-				Target: stray.store.Source(), DeleteTarget: true,
-			}); err != nil {
-				if errors.Is(err, errCredentialCASConflict) {
-					return ErrCredentialChangedUnderfoot
-				}
-				return err
-			}
-			return nil
-		}
+	if boundary == nil {
+		return errors.New("credential mutation boundary is required")
 	}
-	if err := stray.store.Delete(ctx); err != nil {
-		return fmt.Errorf("drop divergent credential copy at %s: %w", stray.store, err)
+	if m.credentialCAS == nil {
+		return errors.New("credential CAS worker is unavailable")
+	}
+	if err := boundary.Cross(ctx); err != nil {
+		return err
+	}
+	if _, err := m.credentialCAS(ctx, a, boundary.expected, credentialCASMutation{
+		Target: stray.store.Source(), DeleteTarget: true,
+	}); err != nil {
+		if errors.Is(err, errCredentialCASConflict) {
+			return ErrCredentialChangedUnderfoot
+		}
+		return err
 	}
 	return nil
 }

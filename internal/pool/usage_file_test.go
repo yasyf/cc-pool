@@ -93,43 +93,6 @@ func TestReadCredentialPrecedence(t *testing.T) {
 	}
 }
 
-// TestWriteCredRoutesBySource pins that the paired write stays on the backend
-// the read resolved: a file-source write must never create a Keychain item and
-// vice versa.
-func TestWriteCredRoutesBySource(t *testing.T) {
-	cases := []struct {
-		name     string
-		src      creds.Source
-		wantFile bool // the credential must land in the file, else the keychain
-	}{
-		{name: "file source writes only the file", src: creds.SourceFile, wantFile: true},
-		{name: "keychain source writes only the keychain", src: creds.SourceKeychain, wantFile: false},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc", KeychainAccount: "user"}
-			fk := credstest.NewFake()
-			st := openTestStore(t)
-			a = persistTestAccount(t, st, a)
-			m := &Manager{Store: st, Creds: fk}
-			cred := &creds.Credential{}
-			cred.ClaudeAiOauth.AccessToken = "at-1"
-
-			if err := m.writeCred(t.Context(), a, tc.src, cred); err != nil {
-				t.Fatal(err)
-			}
-			if got := fileCredentialExistsForTest(dir); got != tc.wantFile {
-				t.Errorf("file credential exists = %v, want %v", got, tc.wantFile)
-			}
-			if _, inKeychain := fk.Get(a.KeychainService, a.KeychainAccount); inKeychain == tc.wantFile {
-				t.Errorf("keychain item exists = %v, want %v", inKeychain, !tc.wantFile)
-			}
-		})
-	}
-}
-
 // TestRefreshUsesFileBackendWhenKeychainEmpty pins the headless path: with the
 // credential in claude's plaintext .credentials.json and the Keychain empty, a
 // refresh reads and writes the file backend and never touches the Keychain.

@@ -1002,7 +1002,8 @@ func TestRefreshBoundaryFailureSettlesAndDoesNotRepeat(t *testing.T) {
 					t.Fatalf("replayed network failure = %v", err)
 				}
 			},
-			wantTerminal: ErrCredentialOperationFailed,
+			wantTerminal:   ErrCredentialOperationQuarantined,
+			wantQuarantine: true,
 		},
 		{
 			name: "server response",
@@ -1016,7 +1017,8 @@ func TestRefreshBoundaryFailureSettlesAndDoesNotRepeat(t *testing.T) {
 					t.Fatalf("replayed server failure = %v", err)
 				}
 			},
-			wantTerminal: ErrCredentialOperationFailed,
+			wantTerminal:   ErrCredentialOperationQuarantined,
+			wantQuarantine: true,
 		},
 		{
 			name: "caller cancellation",
@@ -1062,8 +1064,8 @@ func TestRefreshBoundaryFailureSettlesAndDoesNotRepeat(t *testing.T) {
 				}
 			} else {
 				_, _, firstErr := manager.EnsureFreshToken(ctx, account, RefreshLeadTime, true)
-				if errors.Is(firstErr, ErrCredentialOperationQuarantined) {
-					t.Fatalf("definitive transient refresh was quarantined: %v", firstErr)
+				if tc.wantQuarantine && !errors.Is(firstErr, ErrCredentialOperationQuarantined) {
+					t.Fatalf("ambiguous refresh was not quarantined: %v", firstErr)
 				}
 				if tc.checkReplay != nil {
 					tc.checkReplay(t, firstErr)

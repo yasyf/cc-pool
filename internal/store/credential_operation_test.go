@@ -302,14 +302,14 @@ func TestCredentialFailureClassRoundTrip(t *testing.T) {
 			result: CredentialResultAmbiguous, failure: CredentialFailureInternal,
 		},
 		{
-			name: "network failure", kind: CredentialOperationEnsureFresh,
-			target: CredentialTargetAll, status: CredentialTerminalFailed,
-			result: CredentialResultFailed, failure: CredentialFailureNetwork,
+			name: "network ambiguity", kind: CredentialOperationEnsureFresh,
+			target: CredentialTargetAll, status: CredentialTerminalQuarantined,
+			result: CredentialResultAmbiguous, failure: CredentialFailureNetwork,
 		},
 		{
-			name: "server failure", kind: CredentialOperationRefreshCurrent,
-			target: CredentialTargetAll, status: CredentialTerminalFailed,
-			result: CredentialResultFailed, failure: CredentialFailureRefreshServer,
+			name: "server ambiguity", kind: CredentialOperationRefreshCurrent,
+			target: CredentialTargetAll, status: CredentialTerminalQuarantined,
+			result: CredentialResultAmbiguous, failure: CredentialFailureRefreshServer,
 		},
 	}
 	for index, test := range tests {
@@ -399,9 +399,14 @@ func TestCredentialFailureClassRejectsInvalidCombinations(t *testing.T) {
 			failure: CredentialFailureRefreshUnauthorized,
 		},
 		{
-			name: "network is not a quarantine", kind: CredentialOperationEnsureFresh,
-			status: CredentialTerminalQuarantined, result: CredentialResultAmbiguous,
+			name: "network is not definitive failure", kind: CredentialOperationEnsureFresh,
+			status: CredentialTerminalFailed, result: CredentialResultFailed,
 			failure: CredentialFailureNetwork,
+		},
+		{
+			name: "server is not definitive failure", kind: CredentialOperationRefreshCurrent,
+			status: CredentialTerminalFailed, result: CredentialResultFailed,
+			failure: CredentialFailureRefreshServer,
 		},
 		{
 			name: "unauthorized is not ambiguous", kind: CredentialOperationEnsureFresh,

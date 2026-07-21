@@ -112,27 +112,6 @@ func (m *Manager) ReadCredential(
 	return nil, creds.SourceKeychain, fmt.Errorf("no credential in the Keychain or credential file: %w", creds.ErrNotFound)
 }
 
-// writeCred upserts cred on src. Durable publication is settled from the
-// terminal credential-operation receipt, never from this external-I/O edge.
-func (m *Manager) writeCred(
-	ctx context.Context,
-	a store.Account,
-	src creds.Source,
-	cred *creds.Credential,
-) error {
-	if boundary == nil {
-		return errors.New("credential mutation boundary is required")
-	}
-	if m.credentialCAS == nil {
-		return errors.New("credential CAS worker is unavailable")
-	}
-	s := m.Creds.Store(a, src)
-	if err := s.Write(ctx, cred); err != nil {
-		return fmt.Errorf("write credential to %s: %w", s, err)
-	}
-	return nil
-}
-
 // writeObservedCredential stages publication before crossing the journal fence,
 // then delegates the authoritative compare-and-swap to the refresh-lock worker.
 func (m *Manager) writeObservedCredential(
@@ -142,6 +121,12 @@ func (m *Manager) writeObservedCredential(
 	prev, next *creds.Credential,
 	boundary *credentialOperationBoundary,
 ) error {
+	if boundary == nil {
+		return errors.New("credential mutation boundary is required")
+	}
+	if m.credentialCAS == nil {
+		return errors.New("credential CAS worker is unavailable")
+	}
 	s := m.Creds.Store(a, src)
 	cur, err := s.Read(ctx)
 	switch creds.ClassifyRead(err) {
@@ -426,6 +411,9 @@ func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleO
 		fetchOpts.AllowBusyRefresh = false
 	}
 	usage, rateLimited, retryAfter, err := m.fetchUsage(ctx, a, src, cred, fetchOpts)
+	if errors.Is(freshErr, ErrCredentialOperationQuarantined) {
+		return nil, false, 0, freshErr
+	}
 	replayedLiveProbe := errors.Is(freshErr, ErrCredentialOperationReplayed) &&
 		(err != nil || rateLimited)
 	if replayedLiveProbe {
@@ -435,6 +423,9 @@ func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleO
 	// transient 401; a clean fetchUsage recovery suppresses it (a session may have rotated).
 	if errors.Is(freshErr, ErrNeedsLogin) && (err != nil || rateLimited) {
 		return nil, false, 0, freshErr
+	}
+	if freshErr != nil && (err != nil || rateLimited) {
+		return nil, false, 0, errors.Join(freshErr, err)
 	}
 	if err != nil && replayedLiveProbe {
 		err = errors.Join(

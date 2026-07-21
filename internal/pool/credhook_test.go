@@ -7,42 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yasyf/cc-pool/internal/creds"
-	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
 )
-
-func hookCred() *creds.Credential {
-	c := &creds.Credential{}
-	c.ClaudeAiOauth.AccessToken = "at-hook"
-	c.ClaudeAiOauth.RefreshToken = "rt-hook"
-	c.ClaudeAiOauth.ExpiresAt = 1_800_000_000_000
-	return c
-}
-
-func TestWriteCredDoesNotPublishBeforeTerminalSettlement(t *testing.T) {
-	fake := credstest.NewFake()
-	st := openTestStore(t)
-	account := persistTestAccount(t, st, store.Account{
-		ID: 3, ConfigDir: t.TempDir(), KeychainService: "svc-hook", KeychainAccount: "user",
-	})
-	manager := &Manager{Store: st, Creds: fake}
-	settlements := 0
-	manager.SettleCredentialWrite = func(context.Context, CredentialWriteSettlement) error {
-		settlements++
-		return nil
-	}
-
-	if err := manager.writeCred(t.Context(), account, creds.SourceKeychain, hookCred()); err != nil {
-		t.Fatal(err)
-	}
-	if settlements != 0 {
-		t.Fatalf("pre-terminal settlements = %d, want 0", settlements)
-	}
-	if fake.WriteCount() != 1 {
-		t.Fatalf("credential writes = %d, want 1", fake.WriteCount())
-	}
-}
 
 func TestCredentialWriteSettlementStartupDrainRetriesExactReceipt(t *testing.T) {
 	fixture := newInstallFixture(t)

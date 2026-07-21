@@ -227,7 +227,7 @@ CREATE TABLE credential_operations (
 	       failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')) OR
 	      (terminal_status='quarantined' AND failure_class IS NOT NULL AND
 	       result_category IN ('ambiguous','diverged','cleanup-failed','changed-underfoot') AND
-	       failure_class='internal')),
+	       failure_class IN ('internal','network','refresh-server'))),
 	CHECK((kind IN ('compensate','ensure-fresh','refresh-current')) = (target='all')),
   CHECK((expected_keychain_state='present') = (expected_keychain_digest IS NOT NULL)),
   CHECK((expected_file_state='present') = (expected_file_digest IS NOT NULL)),
@@ -275,7 +275,7 @@ CREATE TABLE credential_operation_receipts (
 	       failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')) OR
 	      (terminal_status='quarantined' AND failure_class IS NOT NULL AND
 	       result_category IN ('ambiguous','diverged','cleanup-failed','changed-underfoot') AND
-	       failure_class='internal')),
+	       failure_class IN ('internal','network','refresh-server'))),
   CHECK((expected_keychain_state='present') = (expected_keychain_digest IS NOT NULL)),
 	CHECK((expected_file_state='present') = (expected_file_digest IS NOT NULL)),
 	CHECK((outcome_keychain_state='present') = (outcome_keychain_digest IS NOT NULL)),
@@ -295,7 +295,7 @@ CREATE TABLE credential_quarantines (
   observation_file_digest     BLOB CHECK(observation_file_digest IS NULL OR length(observation_file_digest) = 32),
   token_chain_digest          BLOB CHECK(token_chain_digest IS NULL OR length(token_chain_digest) = 32),
   reason                    TEXT NOT NULL CHECK(reason IN ('ambiguous','diverged','cleanup-failed','changed-underfoot')),
-  failure_class             TEXT NOT NULL CHECK(failure_class='internal'),
+  failure_class             TEXT NOT NULL CHECK(failure_class IN ('internal','network','refresh-server')),
   created_at                INTEGER NOT NULL CHECK(created_at > 0),
   CHECK((observation_keychain_state='present') = (observation_keychain_digest IS NOT NULL)),
   CHECK((observation_file_state='present') = (observation_file_digest IS NOT NULL))
