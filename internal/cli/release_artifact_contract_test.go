@@ -30,11 +30,13 @@ func TestReleaseCLIFailsClosedBeforeArtifactPublication(t *testing.T) {
 		"^TeamIdentifier=${TEAM_ID}$",
 		"flags=.*\\(runtime\\)",
 		`identifier "com.yasyf.cc-pool"`,
-		"spctl --assess --type execute --verbose=4 dist/pure/cc-pool",
 	} {
 		if !strings.Contains(release[build:create], required) {
 			t.Fatalf("CLI release is missing final identity/notarization assertion %q", required)
 		}
+	}
+	if strings.Contains(release[build:create], "spctl --assess --type execute --verbose=4 dist/pure/cc-pool") {
+		t.Fatal("CLI release assesses a raw Mach-O binary as an application bundle")
 	}
 }
 
@@ -66,6 +68,9 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 	}
 	if got := strings.Count(release, "homebrew-tap/.github/actions/publish@"); got != 1 {
 		t.Fatalf("tap publishers = %d, want exactly one", got)
+	}
+	if strings.Contains(publish, "spctl --assess --type execute --verbose=4 cli/cc-pool") {
+		t.Fatal("tap transaction assesses a raw Mach-O binary as an application bundle")
 	}
 	for _, line := range strings.Split(release, "\n") {
 		if strings.Contains(line, "yasyf/homebrew-tap/") && strings.Contains(line, "@v") {

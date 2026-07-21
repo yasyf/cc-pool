@@ -100,7 +100,6 @@ jobs:
           requirement="$(codesign -d -r- dist/pure/cc-pool 2>&1)"
           grep -Fq 'identifier "com.yasyf.cc-pool"' <<< "$requirement"
           grep -Fq "subject.OU] = ${TEAM_ID}" <<< "$requirement"
-          spctl --assess --type execute --verbose=4 dist/pure/cc-pool
           dist/pure/cc-pool --version | grep -q "${VERSION}"
           CLI_ENTITLEMENTS="$(codesign -d --entitlements - dist/pure/cc-pool 2>&1 || true)"
           if grep -q "application-groups" <<<"$CLI_ENTITLEMENTS"; then
@@ -263,7 +262,6 @@ jobs:
           metadata="$(codesign -dvvv cli/cc-pool 2>&1)"
           grep -q '^Identifier=com.yasyf.cc-pool$' <<< "$metadata"
           grep -q '^TeamIdentifier=SXKCTF23Q2$' <<< "$metadata"
-          spctl --assess --type execute --verbose=4 cli/cc-pool
 
           ditto -x -k "$APP_ASSET" app
           test -d app/CCPoolStatus.app
