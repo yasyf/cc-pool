@@ -224,6 +224,7 @@ func TestHandleCredMoveAlreadyOnTarget(t *testing.T) {
 	if err := writeFileCredentialForTest(a.ConfigDir, credFixture()); err != nil {
 		t.Fatal(err)
 	}
+	fk.Remove(a.KeychainService, a.KeychainAccount)
 
 	one := 1
 	resp := s.handleCredMove(t.Context(), credMoveReq(&one, "file"))
