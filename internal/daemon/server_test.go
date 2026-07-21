@@ -9,6 +9,7 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -134,6 +135,179 @@ func TestSelectPreflightFailureAbortsReservation(t *testing.T) {
 	if got := s.cl.reservedCount(forced); got != 0 {
 		t.Fatalf("pending reservations after failed preflight = %d, want 0", got)
 	}
+}
+
+func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
+	s, _ := newTestServer(t)
+	entered := make(chan struct{}, 3)
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	var callsMu sync.Mutex
+	calls := map[int]int{}
+	s.prepareAccount = func(
+		ctx context.Context,
+		account store.Account,
+	) (catalogproto.TenantPreparationProof, error) {
+		callsMu.Lock()
+		calls[account.ID]++
+		callsMu.Unlock()
+		proof := catalogproto.TenantPreparationProof{
+			Catalog: catalogproto.CatalogLaneProof{
+				Tenant: "test", Generation: account.Generation,
+			},
+		}
+		if account.ID != 1 {
+			return proof, nil
+		}
+		entered <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return catalogproto.TenantPreparationProof{}, ctx.Err()
+		case <-release:
+			return proof, nil
+		}
+	}
+
+	forcedOne := 1
+	startedAt := time.Now().Add(-time.Minute).UnixMicro()
+	primaryResponses := make(chan Response, 1)
+	go func() {
+		primaryResponses <- s.handleSelect(t.Context(), Request{
+			Op: OpSelect, Account: &forcedOne, PID: 4101,
+			ProcessStartedAt: startedAt, Cwd: "/prepare-primary",
+		})
+	}()
+	waitForBlockedPrepare(t, entered)
+	primaryToken := exactPendingSelectionToken(t, s.cl, forcedOne)
+
+	canceledContext, cancelCanceled := context.WithCancel(t.Context())
+	canceledResponses := make(chan Response, 1)
+	go func() {
+		canceledResponses <- s.handleSelect(canceledContext, Request{
+			Op: OpSelect, Account: &forcedOne, PID: 4102,
+			ProcessStartedAt: startedAt, Cwd: "/prepare-canceled",
+		})
+	}()
+	waitForBlockedPrepare(t, entered)
+	if got := s.cl.reservedCount(forcedOne); got != 2 {
+		t.Fatalf("same-account reservations during PrepareTenant = %d, want 2", got)
+	}
+	cancelCanceled()
+	select {
+	case response := <-canceledResponses:
+		if response.OK || !strings.Contains(response.Error, context.Canceled.Error()) {
+			t.Fatalf("canceled PrepareTenant response = %+v", response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled same-account PrepareTenant retained the selection")
+	}
+	if got := s.cl.reservedCount(forcedOne); got != 1 {
+		t.Fatalf("canceled PrepareTenant reservations = %d, want only the primary", got)
+	}
+
+	s.cl.mu.Lock()
+	primary := s.cl.selections[primaryToken]
+	if primary == nil {
+		s.cl.mu.Unlock()
+		t.Fatal("primary reservation disappeared before TTL expiry")
+	}
+	primary.expiresAt = s.cl.now().Add(-time.Second)
+	s.cl.mu.Unlock()
+	if got := s.cl.reservedCount(forcedOne); got != 0 {
+		t.Fatalf("expired PrepareTenant reservation count = %d, want 0", got)
+	}
+
+	forcedTwo := 2
+	unrelatedResponses := make(chan Response, 1)
+	go func() {
+		unrelatedResponses <- s.handleSelect(t.Context(), Request{
+			Op: OpSelect, Account: &forcedTwo, PID: 4201,
+			ProcessStartedAt: startedAt, Cwd: "/prepare-unrelated",
+		})
+	}()
+	var unrelated Response
+	select {
+	case unrelated = <-unrelatedResponses:
+		if !unrelated.OK || unrelated.ReservationToken == "" {
+			t.Fatalf("unrelated selection during blocked PrepareTenant = %+v", unrelated)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked PrepareTenant held the account store across unrelated selection")
+	}
+	if response := s.handleSelectAbort(t.Context(), Request{
+		Op: OpSelectAbort, ReservationToken: unrelated.ReservationToken,
+	}); !response.OK {
+		t.Fatalf("abort unrelated selection = %+v", response)
+	}
+
+	select {
+	case response := <-primaryResponses:
+		t.Fatalf("expired primary returned before PrepareTenant settled: %+v", response)
+	default:
+	}
+	close(release)
+	released = true
+	select {
+	case response := <-primaryResponses:
+		if response.OK || !strings.Contains(response.Error, "reservation expired during PrepareTenant") {
+			t.Fatalf("expired primary PrepareTenant response = %+v", response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("primary PrepareTenant did not settle after release")
+	}
+
+	callsMu.Lock()
+	accountOneCalls := calls[1]
+	accountTwoCalls := calls[2]
+	callsMu.Unlock()
+	if accountOneCalls != 2 || accountTwoCalls != 1 {
+		t.Fatalf("PrepareTenant calls = acct-1 %d acct-2 %d, want 2 and 1", accountOneCalls, accountTwoCalls)
+	}
+	for _, accountID := range []int{1, 2} {
+		if got := s.cl.reservedCount(accountID); got != 0 || s.cl.held(accountID) {
+			t.Fatalf("acct-%d retained reservation/claim: reservations=%d held=%v", accountID, got, s.cl.held(accountID))
+		}
+	}
+	if sessions, err := s.m.Store.ListActiveSessions(); err != nil || len(sessions) != 0 {
+		t.Fatalf("blocked PrepareTenant retained session leases: %+v, %v", sessions, err)
+	}
+	for _, token := range []string{primaryToken, unrelated.ReservationToken} {
+		if committed, err := s.m.Store.SelectionCommitted(token); err != nil || committed {
+			t.Fatalf("selection %s committed = %v, %v", token, committed, err)
+		}
+	}
+}
+
+func waitForBlockedPrepare(t *testing.T, entered <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("selection did not enter blocked PrepareTenant")
+	}
+}
+
+func exactPendingSelectionToken(t *testing.T, claims *claims, accountID int) string {
+	t.Helper()
+	claims.mu.Lock()
+	defer claims.mu.Unlock()
+	var token string
+	count := 0
+	for candidate, selection := range claims.selections {
+		if selection.accountID == accountID && selection.state == selectionPending {
+			token = candidate
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("pending acct-%d selections = %d, want 1", accountID, count)
+	}
+	return token
 }
 
 // newTestServer builds a Server with acct-1 emptier than acct-2. scanSessions
@@ -428,6 +602,36 @@ func TestProvisionalSelectionExpiresWithoutEffects(t *testing.T) {
 	}
 	if _, ok, _ := s.m.Store.GetSticky("/proj"); ok {
 		t.Fatal("expired selection recorded sticky state")
+	}
+}
+
+func TestProvisionalSelectionDiesWithDaemonWithoutEffects(t *testing.T) {
+	s, _ := newTestServer(t)
+	response := s.handleSelect(t.Context(), Request{
+		Op: OpSelect, PID: 4242,
+		ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/dead-daemon",
+	})
+	if !response.OK || response.ReservationToken == "" {
+		t.Fatalf("provisional selection = %+v", response)
+	}
+	restarted := &Server{m: s.m, cl: newClaims()}
+	if got := restarted.cl.reservedCount(*response.SelectedID); got != 0 {
+		t.Fatalf("fresh daemon retained %d in-memory reservations", got)
+	}
+	commit := restarted.handleSelectCommit(t.Context(), Request{
+		Op: OpSelectCommit, ReservationToken: response.ReservationToken,
+	})
+	if commit.OK || !strings.Contains(commit.Error, "unknown or expired") {
+		t.Fatalf("dead-daemon provisional commit = %+v", commit)
+	}
+	if committed, err := s.m.Store.SelectionCommitted(response.ReservationToken); err != nil || committed {
+		t.Fatalf("dead-daemon token committed = %v, %v", committed, err)
+	}
+	if sessions, err := s.m.Store.ListActiveSessions(); err != nil || len(sessions) != 0 {
+		t.Fatalf("dead-daemon provisional sessions = %+v, %v", sessions, err)
+	}
+	if _, ok, err := s.m.Store.GetSticky("/dead-daemon"); err != nil || ok {
+		t.Fatalf("dead-daemon provisional sticky = ok %v, %v", ok, err)
 	}
 }
 
