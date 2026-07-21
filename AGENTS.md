@@ -14,13 +14,13 @@ cc-pool (`ccp`) pools several Claude Max/Pro subscriptions and launches each Cla
 ## Releasing
 
 Releases are **tag-triggered** — there is no version file to edit. `Version`/`Commit` in
-fusekit's shared `version` package default to `dev` locally and are injected at build time
-via `-ldflags`.
+`internal/version` default to `dev` locally and are injected at build time via `-ldflags`.
 
 Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which (1) builds the universal
-(arm64+amd64) pure-Go binary on macOS and Developer ID-signs + notarizes it (a bare Mach-O,
-identifier `com.yasyf.cc-pool`, app-group entitlement), (2) builds, Developer ID-signs,
-notarizes, and staples the `CCPoolStatus.app` widget (the `cc-pool-status` cask payload),
+(arm64+amd64) pure-Go binary on macOS and Developer ID-signs + notarizes it without App
+Group access, (2) builds, Developer ID-signs, notarizes, and staples the fixed
+`CCPoolStatus.app` holder, broker, File Provider, and widget bundle (the
+`cc-pool-status` cask payload),
 (3) creates a GitHub Release with auto-generated notes + the binary tarball, widget zip, and
 SHA256SUMS, and (4) renders the
 formula and cask from in-repo templates and publishes them to the shared external tap
@@ -49,21 +49,29 @@ cc-pool/
 ├── internal/
 │   ├── cli/            # ccp subcommands (init, add, select, run, status, doctor, …)
 │   ├── creds/          # Claude Code credentials: blob format + Keychain and plaintext-file stores
-│   ├── daemon/         # background poller: usage polling, idle token refresh, socket protocol; drives the external fusekit-holder app and the FP bridge
+│   ├── daemon/         # account scheduling, polling, daemonkit runtime, and tenant lifecycle
 │   ├── forecast/       # per-account burn rates + depletion estimates; pool-wide rollup shipped to the widget
 │   ├── oauth/          # Claude OAuth refresh + /api/oauth/usage client
-│   ├── overlay/        # shared ~/.claude overlay probing (symlink, fuse-t mirror, File Provider)
-│   ├── pool/           # account dirs, paths, pool manager, overlay selection
+│   ├── holderbridge/   # native bridge embedded in the fixed signed app
+│   ├── overlay/        # Claude-specific merge, split, and classification policy
+│   ├── pool/           # account paths, policy, reservations, and tenant specs
 │   ├── procscan/       # detect live claude sessions per config dir
 │   ├── score/          # account scoring (5h/7d headroom, reset credit, burn rate)
-│   └── store/          # SQLite state (no secrets — Keychain only)
-├── widget/             # CCPoolStatus.app Notification Center widget (SwiftUI, cc-pool-status cask)
+│   ├── store/          # SQLite account state (no secrets — Keychain only)
+│   └── tenantfs/       # Claude authority policy, materializer, and FuseKit adapter
+├── widget/             # fixed signed holder/broker/File Provider/widget application
 ├── docs/               # public design doc (ARCHITECTURE.md) + README assets
 ├── AGENTS.md           # This file — shared conventions
 └── STYLEGUIDE.md       # Full style guide
 ```
 
-The FUSE-T mount machinery — the detached mount-holder protocol (`fusekit/mountd`) and the mount/serve/teardown primitives (the root `fusekit` package) — now lives in [`github.com/yasyf/fusekit`](https://github.com/yasyf/fusekit). cc-pool keeps only its mirror-specific code (the `overlay` provider and the holder seam in `pool/`) and, from the extraction, gains cgofuse-load panic-recovery (a missing libfuse-t surfaces as `ErrFuseUnavailable` instead of crashing the holder) and pre-mount carcass clearing (`ClearCarcass`) — otherwise runtime byte-identical.
+Filesystem identity, catalog revisions, tenant convergence, mount presentation, File
+Provider enumeration, and domain retirement live in
+[`github.com/yasyf/fusekit`](https://github.com/yasyf/fusekit). Process lifecycle,
+transport, exact peer trust, and reaping live in
+[`github.com/yasyf/daemonkit`](https://github.com/yasyf/daemonkit). cc-pool publishes
+Claude source changes and account policy through those APIs; it does not reimplement
+holder, bridge, notification, or reconciliation machinery.
 
 Two filesystem trees, never confused:
 
@@ -75,7 +83,10 @@ Safety rules baked into the architecture — do not regress them:
 1. **The pool NEVER reads, writes, deletes, or even names the canonical unsuffixed Keychain item (`Claude Code-credentials`), and never mutates plain claude's OAuth state.** There is no exception: `keychain.ServiceName` always emits a hash-suffixed name, and no code path can name the canonical item. Every pool account — including the user's main subscription — gets its own config dir, its own refresh-token chain (from its own `claude /login`), and its own suffixed Keychain item. This is why there is no credential "adoption": forking a pool account off plain claude's login would require spending plain claude's single-use refresh token, which rotation invalidates — signing plain claude out. A fresh login per account is the only safe path.
 2. **No secrets in SQLite** — the macOS Keychain is the sole secret store.
 3. **Account dir strings are hashed for Keychain service names** — the path string `ccp` emits and the string hashed must stay byte-identical. No realpath/normalization divergence.
-4. **Fuse mounts are hosted by a detached cc-pool mount-holder process** (socket `~/.cc-pool/mounts.sock`); daemon restarts/upgrades never disturb mounts. The holder is only replaced when no live sessions exist (or `ccp service uninstall --force`).
+4. **Protected filesystem access belongs only to the fixed signed application.** The
+   unsigned Go daemon never resolves, names, or traverses the App Group container. The
+   app embeds `holder.Runtime`; daemonkit proves its exact signed identity, and FuseKit
+   owns the native mount and File Provider presentations across daemon restarts.
 
 ## Style Rules (summary — see STYLEGUIDE.md)
 

@@ -4,423 +4,430 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
+	"strconv"
 	"sync"
-	"time"
 
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/fileproviderd"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/mountservice"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
-
-type dirtyCause uint8
 
 const (
-	dirtyCanonical dirtyCause = 1 << iota
-	dirtySettings
-	dirtyStructure
-	dirtyHeartbeat
-	dirtyStartup
-	dirtyApp
-	dirtyRetry
+	accountRemovalRecoveryConcurrency = 4
+	tenantProvisionConcurrency        = 4
 )
 
-type dirtyQueue struct {
-	mu      sync.Mutex
-	pending dirtyCause
-	ready   chan struct{}
+type sourcePreparer interface {
+	Prepare(context.Context, tenantfs.Account) (catalogproto.TenantPreparationProof, error)
+	Validate(tenantfs.Account, catalogproto.TenantPreparationProof) error
 }
 
-func newDirtyQueue() *dirtyQueue { return &dirtyQueue{ready: make(chan struct{}, 1)} }
+type tenantLifecycleRuntime interface {
+	ProvisionTenant(context.Context, tenantfs.Account) (mountproto.ProvisionTenantResponse, error)
+	ReplaceTenant(context.Context, tenantfs.Account, uint64) (mountproto.ReplaceTenantResponse, error)
+	RemoveTenant(context.Context, tenantfs.Account, uint64) (mountproto.RemoveTenantResponse, error)
+	TenantState(context.Context, tenantfs.Account) (mountproto.StateResponse, error)
+}
 
-func (q *dirtyQueue) mark(cause dirtyCause) {
-	q.mu.Lock()
-	q.pending |= cause
-	q.mu.Unlock()
-	select {
-	case q.ready <- struct{}{}:
-	default:
+// tenantCoordinator owns product account-to-tenant lifecycle and on-demand preparation.
+// FuseKit's signed holder owns source observation, publication, and convergence.
+type tenantCoordinator struct {
+	server         *Server
+	preparer       sourcePreparer
+	runtime        tenantLifecycleRuntime
+	lifecycle      context.Context
+	provisionSlots chan struct{}
+	provisionGroup singleflight.Group
+	readyMu        sync.RWMutex
+	ready          map[catalog.TenantID]uint64
+	laneMu         sync.Mutex
+	lanes          map[catalog.TenantID]*tenantLifecycleLane
+}
+
+type tenantLifecycleLane struct {
+	available  chan struct{}
+	references int
+}
+
+func newTenantCoordinator(
+	lifecycle context.Context,
+	server *Server,
+	preparer sourcePreparer,
+	runtime tenantLifecycleRuntime,
+) *tenantCoordinator {
+	return &tenantCoordinator{
+		server: server, preparer: preparer, runtime: runtime, lifecycle: lifecycle,
+		provisionSlots: make(chan struct{}, tenantProvisionConcurrency),
+		ready:          make(map[catalog.TenantID]uint64),
+		lanes:          make(map[catalog.TenantID]*tenantLifecycleLane),
 	}
 }
 
-func (q *dirtyQueue) take(ctx context.Context) (dirtyCause, bool) {
+func (c *tenantCoordinator) initialize(ctx context.Context) error {
+	// FuseKit recovers its paged desired fleet; cc-pool resumes only product-owned claims.
+	return recoverAccountRemovals(
+		ctx,
+		c.server.m.Store.PageAccountRemovals,
+		c.finishRemoval,
+	)
+}
+
+func recoverAccountRemovals(
+	ctx context.Context,
+	pageRemovals func(context.Context, int, int) (store.AccountRemovalPage, error),
+	finishRemoval func(context.Context, store.AccountRemoval) error,
+) error {
+	for after := 0; ; {
+		page, err := pageRemovals(
+			ctx,
+			after,
+			store.AccountRemovalPageLimit,
+		)
+		if err != nil {
+			return fmt.Errorf("page pending account removals: %w", err)
+		}
+		group, groupContext := errgroup.WithContext(ctx)
+		group.SetLimit(accountRemovalRecoveryConcurrency)
+		for _, pending := range page.Removals {
+			removal := pending
+			group.Go(func() error {
+				if err := finishRemoval(groupContext, removal); err != nil {
+					return fmt.Errorf("resume acct-%02d removal: %w", removal.AccountID, err)
+				}
+				return nil
+			})
+		}
+		if err := group.Wait(); err != nil {
+			return err
+		}
+		if page.Next == 0 {
+			break
+		}
+		if page.Next <= after {
+			return errors.New("account removal cursor did not advance")
+		}
+		after = page.Next
+	}
+	return nil
+}
+
+func (c *tenantCoordinator) prepare(
+	ctx context.Context,
+	account store.Account,
+) (catalogproto.TenantPreparationProof, error) {
+	tenantAccount := pool.TenantAccount(account)
+	if err := c.ensureTenant(ctx, account, tenantAccount); err != nil {
+		return catalogproto.TenantPreparationProof{}, err
+	}
+	return c.preparer.Prepare(ctx, tenantAccount)
+}
+
+func (c *tenantCoordinator) ensureTenant(
+	ctx context.Context,
+	account store.Account,
+	tenantAccount tenantfs.Account,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tenantID, err := tenantAccount.TenantID()
+	if err != nil {
+		return err
+	}
+	if c.tenantReady(tenantID, tenantAccount.Generation) {
+		return nil
+	}
+	key := string(tenantID) + "\x00" + strconv.FormatUint(tenantAccount.Generation, 10)
+	lifecycle := c.lifecycle
+	if lifecycle == nil {
+		lifecycle = ctx
+	}
+	result := c.provisionGroup.DoChan(key, func() (any, error) {
+		if c.tenantReady(tenantID, tenantAccount.Generation) {
+			return nil, nil
+		}
+		release, err := c.acquireTenantLane(lifecycle, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		if c.tenantReady(tenantID, tenantAccount.Generation) {
+			return nil, nil
+		}
+		if c.provisionSlots != nil {
+			select {
+			case c.provisionSlots <- struct{}{}:
+				defer func() { <-c.provisionSlots }()
+			case <-lifecycle.Done():
+				return nil, lifecycle.Err()
+			}
+		}
+		if err := c.ensureTenantOnce(lifecycle, account, tenantAccount, tenantID); err != nil {
+			return nil, err
+		}
+		c.markTenantReady(tenantID, tenantAccount.Generation)
+		return nil, nil
+	})
 	select {
 	case <-ctx.Done():
-		return 0, false
-	case <-q.ready:
-	}
-	q.mu.Lock()
-	cause := q.pending
-	q.pending = 0
-	q.mu.Unlock()
-	return cause, true
-}
-
-type desiredOverlay struct {
-	stamps overlay.SemanticStamps
-}
-
-type appBuildResult struct {
-	attempted bool
-	stamp     string
-	err       error
-}
-
-type overlayCoordinator struct {
-	server         *Server
-	dirty          *dirtyQueue
-	appBuild       func(context.Context) (string, error)
-	watch          func(context.Context, overlay.SemanticInputPaths, func(dirtyCause)) error
-	watchRetryBase time.Duration
-
-	mu          sync.RWMutex
-	desired     desiredOverlay
-	initialized bool
-	retryMu     sync.Mutex
-	retry       *time.Timer
-	retryStep   int
-}
-
-var errContentApplyDeferred = errors.New("content apply deferred by an account claim")
-
-var runSemanticWatcher = watchSemanticInputs
-
-const (
-	semanticWatcherRetryBase = time.Second
-	semanticWatcherRetryMax  = 30 * time.Second
-)
-
-func newOverlayCoordinator(s *Server) *overlayCoordinator {
-	return &overlayCoordinator{
-		server: s,
-		dirty:  newDirtyQueue(),
-		appBuild: func(ctx context.Context) (string, error) {
-			return fileproviderd.NewAppClient(pool.FPControlSocketPath()).Health(ctx)
-		},
-		watch:          runSemanticWatcher,
-		watchRetryBase: semanticWatcherRetryBase,
+		return ctx.Err()
+	case outcome := <-result:
+		return outcome.Err
 	}
 }
 
-func (c *overlayCoordinator) initialize() error {
-	stamps, _, err := c.server.contentSource.RefreshSemanticStamps()
-	if err != nil {
-		return err
+func (c *tenantCoordinator) acquireTenantLane(
+	ctx context.Context,
+	id catalog.TenantID,
+) (func(), error) {
+	c.laneMu.Lock()
+	if c.lanes == nil {
+		c.lanes = make(map[catalog.TenantID]*tenantLifecycleLane)
 	}
-	c.mu.Lock()
-	c.desired = desiredOverlay{stamps: stamps}
-	c.initialized = true
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *overlayCoordinator) mark(cause dirtyCause) { c.dirty.mark(cause) }
-
-func (c *overlayCoordinator) start(ctx context.Context) {
-	c.server.wg.Add(2)
-	go func() {
-		defer c.server.wg.Done()
-		delay := c.watchRetryBase
-		if delay <= 0 {
-			delay = semanticWatcherRetryBase
-		}
-		for ctx.Err() == nil {
-			err := c.watch(ctx, c.inputPaths(), c.mark)
-			if ctx.Err() != nil {
-				return
-			}
-			if err != nil {
-				c.server.log.Printf("content event watcher stopped; retrying in %s: %v", delay, err)
-			} else {
-				c.server.log.Printf("content event watcher stopped unexpectedly; retrying in %s", delay)
-			}
-			c.mark(dirtyStartup)
-			timer := time.NewTimer(delay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-timer.C:
-			}
-			delay = min(delay*2, semanticWatcherRetryMax)
-		}
-	}()
-	go func() {
-		defer c.server.wg.Done()
-		c.run(ctx)
-	}()
-	c.mark(dirtyStartup)
-}
-
-func (c *overlayCoordinator) inputPaths() overlay.SemanticInputPaths {
-	inputs := c.server.contentSource.InputPaths()
-	inputs.AppBuild = filepath.Join(pool.WidgetAppPath(), "Contents", "Info.plist")
-	inputs.AppParent = filepath.Dir(pool.WidgetAppPath())
-	return inputs
-}
-
-func (c *overlayCoordinator) run(ctx context.Context) {
-	defer c.stopRetry()
-	for {
-		cause, ok := c.dirty.take(ctx)
-		if !ok {
-			return
-		}
-		c.converge(ctx, cause)
+	lane := c.lanes[id]
+	if lane == nil {
+		lane = &tenantLifecycleLane{available: make(chan struct{}, 1)}
+		lane.available <- struct{}{}
+		c.lanes[id] = lane
 	}
-}
-
-func (c *overlayCoordinator) converge(ctx context.Context, cause dirtyCause) {
-	if cause&dirtyApp != 0 && c.server.reconcileStaleFPApp(ctx) {
-		if c.server.fpAppWanted() {
-			c.server.ensureFPAppAsync(ctx)
-		}
-		c.scheduleRetry(ctx)
-		return
-	}
-	stamps, changes, err := c.server.contentSource.RefreshSemanticStamps()
-	if err != nil {
-		c.server.log.Printf("refresh semantic content stamps: %v", err)
-		c.scheduleRetry(ctx)
-		return
-	}
-	c.mu.Lock()
-	c.desired = desiredOverlay{stamps: stamps}
-	c.initialized = true
-	c.mu.Unlock()
-	semanticChanged := changes.Canonical || changes.Settings || changes.Structure
-	if !semanticChanged && cause&(dirtyHeartbeat|dirtyStartup|dirtyApp|dirtyRetry) == 0 {
-		return
-	}
-	accounts, err := c.server.m.Store.ListAccounts()
-	if err != nil {
-		c.server.log.Printf("content coordinator: list accounts: %v", err)
-		c.scheduleRetry(ctx)
-		return
-	}
-	snapshot := c.server.heartbeatFor().view()
-	var appBuild appBuildResult
-	failed := false
-	for _, account := range accounts {
-		if ctx.Err() != nil {
-			return
-		}
-		if snapshot.sessionCount(account.ConfigDir) == 0 {
-			continue
-		}
-		if err := c.applyAccount(ctx, account, false, &appBuild); err != nil {
-			c.server.log.Printf("acct-%02d content apply: %v", account.ID, err)
-			failed = true
-		}
-	}
-	if failed {
-		c.scheduleRetry(ctx)
-	} else {
-		c.resetRetry()
-	}
-}
-
-func (c *overlayCoordinator) catchUp(ctx context.Context, account store.Account) error {
-	var appBuild appBuildResult
-	return c.applyAccount(ctx, account, true, &appBuild)
-}
-
-func (c *overlayCoordinator) current() (desiredOverlay, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.desired, c.initialized
-}
-
-func (c *overlayCoordinator) applyAccount(ctx context.Context, listed store.Account, allowIdle bool, appBuild *appBuildResult) error {
-	if !allowIdle && c.server.heartbeatFor().view().sessionCount(listed.ConfigDir) == 0 {
-		return nil
-	}
-	claimed := c.server.cl.hold(listed.ID)
-	if allowIdle && !claimed {
-		claimed = c.server.cl.holdContext(ctx, listed.ID)
-	}
-	if !claimed {
+	lane.references++
+	c.laneMu.Unlock()
+	select {
+	case <-ctx.Done():
+		c.releaseTenantLaneReference(id, lane)
+		return nil, ctx.Err()
+	case <-lane.available:
 		if err := ctx.Err(); err != nil {
-			return err
+			lane.available <- struct{}{}
+			c.releaseTenantLaneReference(id, lane)
+			return nil, err
 		}
-		return errContentApplyDeferred
+		return func() {
+			lane.available <- struct{}{}
+			c.releaseTenantLaneReference(id, lane)
+		}, nil
 	}
-	defer c.server.cl.disownHold(listed.ID)
-	fresh, err := c.server.m.Store.GetAccount(listed.ID)
-	if errors.Is(err, store.ErrAccountNotFound) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("re-read row: %w", err)
-	}
-	if !allowIdle && c.server.heartbeatFor().view().sessionCount(fresh.ConfigDir) == 0 {
-		return nil
-	}
-	desired, ok := c.current()
-	if !ok {
-		return errors.New("semantic content stamps are not initialized")
-	}
-	backend, err := fkoverlay.Parse(fresh.OverlayKind)
-	if err != nil {
-		return fmt.Errorf("parse stored backend: %w", err)
-	}
-	wantApp := ""
-	if backend == fkoverlay.BackendFileProvider {
-		if !appBuild.attempted {
-			appBuild.attempted = true
-			stampCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			appBuild.stamp, appBuild.err = c.appBuild(stampCtx)
-			cancel()
-		}
-		if appBuild.err != nil {
-			return fmt.Errorf("read companion app build: %w", appBuild.err)
-		}
-		wantApp = appBuild.stamp
-	}
-	applied, present, err := c.server.m.Store.GetOverlayApplied(fresh.ID)
-	if err != nil {
-		return err
-	}
-	want := store.OverlayApplied{
-		AccountID: fresh.ID, Backend: fresh.OverlayKind,
-		CanonicalStamp: desired.stamps.Canonical,
-		SettingsStamp:  desired.stamps.Settings,
-		StructureStamp: desired.stamps.Structure,
-		AppStamp:       wantApp,
-	}
-	if backend == fkoverlay.BackendSymlink &&
-		(!present || applied.Backend != want.Backend || applied.CanonicalStamp != want.CanonicalStamp) {
-		if _, err := c.server.m.MergeBaseClaudeJSON(fresh); err != nil {
-			return fmt.Errorf("merge canonical config: %w", err)
-		}
-	}
-	generationMatches := present && sameAppliedGeneration(applied, want)
-	var provider fkoverlay.Provider
-	if generationMatches {
-		if !allowIdle {
-			return nil
-		}
-		provider = c.server.overlayFor(backend)
-		if provider == nil {
-			return fmt.Errorf("resolve provider for %s", backend)
-		}
-		return checkOrReconcile(ctx, provider, fresh.ConfigDir)
-	}
-	if backend != fkoverlay.BackendFileProvider && present &&
-		applied.Backend == want.Backend && applied.StructureStamp == want.StructureStamp {
-		if allowIdle {
-			provider = c.server.overlayFor(backend)
-			if provider == nil {
-				return fmt.Errorf("resolve provider for %s", backend)
-			}
-			if err := checkOrReconcile(ctx, provider, fresh.ConfigDir); err != nil {
-				return err
-			}
-		}
-		want.AppliedAt = time.Now()
-		return c.recordApplied(want)
-	}
-	provider = c.server.overlayFor(backend)
-	if provider == nil {
-		return fmt.Errorf("resolve provider for %s", backend)
-	}
-	if backend == fkoverlay.BackendFileProvider {
-		if err := checkOrReconcile(ctx, provider, fresh.ConfigDir); err != nil {
-			return err
-		}
-		notifier, ok := provider.(fkoverlay.ContentNotifier)
-		if !ok {
-			return errors.New("file provider does not implement ContentNotifier")
-		}
-		if err := notifier.NotifyContent(ctx, fresh.ConfigDir); err != nil {
-			return fmt.Errorf("notify content: %w", err)
-		}
-	} else {
-		if err := provider.Reconcile(ctx, pool.ClaudeDir(), fresh.ConfigDir); err != nil {
-			return fmt.Errorf("reconcile: %w", err)
-		}
-		if err := provider.Check(ctx, pool.ClaudeDir(), fresh.ConfigDir); err != nil {
-			return fmt.Errorf("check applied overlay: %w", err)
-		}
-	}
-	want.AppliedAt = time.Now()
-	return c.recordApplied(want)
 }
 
-func (c *overlayCoordinator) recordApplied(applied store.OverlayApplied) error {
-	if err := c.server.m.Store.SetOverlayApplied(applied); err != nil {
-		if errors.Is(err, store.ErrAccountNotFound) {
+func (c *tenantCoordinator) releaseTenantLaneReference(
+	id catalog.TenantID,
+	lane *tenantLifecycleLane,
+) {
+	c.laneMu.Lock()
+	defer c.laneMu.Unlock()
+	lane.references--
+	if lane.references == 0 && c.lanes[id] == lane {
+		delete(c.lanes, id)
+	}
+}
+
+func (c *tenantCoordinator) tenantReady(id catalog.TenantID, generation uint64) bool {
+	c.readyMu.RLock()
+	defer c.readyMu.RUnlock()
+	return c.ready[id] == generation
+}
+
+func (c *tenantCoordinator) markTenantReady(id catalog.TenantID, generation uint64) {
+	c.readyMu.Lock()
+	defer c.readyMu.Unlock()
+	if c.ready == nil {
+		c.ready = make(map[catalog.TenantID]uint64)
+	}
+	if c.ready[id] < generation {
+		c.ready[id] = generation
+	}
+}
+
+func (c *tenantCoordinator) forgetTenant(id catalog.TenantID) {
+	c.readyMu.Lock()
+	defer c.readyMu.Unlock()
+	delete(c.ready, id)
+}
+
+func (c *tenantCoordinator) ensureTenantOnce(
+	ctx context.Context,
+	account store.Account,
+	tenantAccount tenantfs.Account,
+	tenantID catalog.TenantID,
+) error {
+	response, err := c.runtime.ProvisionTenant(ctx, tenantAccount)
+	if err == nil {
+		if validTenantAcknowledgement(
+			response.Protocol, response.Code, response.Message, response.TenantID, response.Generation,
+			mountproto.TenantID(tenantID), tenantAccount.Generation,
+		) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("provision acct-%02d: invalid FuseKit proof", account.ID)
+	}
+	if !isRemoteCode(err, mountproto.ErrorCodeConflict) {
+		return fmt.Errorf("provision acct-%02d: %w", account.ID, err)
+	}
+	state, present, err := c.tenantState(ctx, tenantAccount)
+	if err != nil {
+		return fmt.Errorf("inspect conflicted acct-%02d tenant: %w", account.ID, err)
+	}
+	if !present {
+		retried, retryErr := c.runtime.ProvisionTenant(ctx, tenantAccount)
+		if retryErr != nil {
+			return fmt.Errorf("provision acct-%02d after absent state: %w", account.ID, retryErr)
+		}
+		if !validTenantAcknowledgement(
+			retried.Protocol, retried.Code, retried.Message, retried.TenantID, retried.Generation,
+			mountproto.TenantID(tenantID), tenantAccount.Generation,
+		) {
+			return fmt.Errorf("provision acct-%02d after absent state: invalid FuseKit proof", account.ID)
+		}
+		return nil
+	}
+	if !state.ReplacementEligible {
+		return fmt.Errorf("replace acct-%02d: FuseKit tenant is not replacement eligible", account.ID)
+	}
+	if state.Generation >= tenantAccount.Generation {
+		return fmt.Errorf(
+			"replace acct-%02d: durable FuseKit generation %d is not older than desired %d",
+			account.ID, state.Generation, tenantAccount.Generation,
+		)
+	}
+	replaced, err := c.runtime.ReplaceTenant(ctx, tenantAccount, state.Generation)
+	if err != nil {
+		return fmt.Errorf(
+			"replace acct-%02d generation %d from durable generation %d: %w",
+			account.ID, account.Generation, state.Generation, err,
+		)
+	}
+	if !validTenantAcknowledgement(
+		replaced.Protocol, replaced.Code, replaced.Message, replaced.TenantID, replaced.Generation,
+		mountproto.TenantID(tenantID), tenantAccount.Generation,
+	) {
+		return fmt.Errorf("replace acct-%02d generation %d: invalid FuseKit proof", account.ID, account.Generation)
 	}
 	return nil
 }
 
-func checkOrReconcile(ctx context.Context, provider fkoverlay.Provider, dir string) error {
-	base := pool.ClaudeDir()
-	if err := provider.Check(ctx, base, dir); err == nil {
-		return nil
-	}
-	if err := provider.Reconcile(ctx, base, dir); err != nil {
-		return fmt.Errorf("reconcile failed check: %w", err)
-	}
-	if err := provider.Check(ctx, base, dir); err != nil {
-		return fmt.Errorf("check reconciled overlay: %w", err)
-	}
-	return nil
-}
-
-func (c *overlayCoordinator) scheduleRetry(ctx context.Context) {
-	c.retryMu.Lock()
-	defer c.retryMu.Unlock()
-	if c.retry != nil {
-		return
-	}
-	delay := 5 * time.Second * time.Duration(1<<min(c.retryStep, 4))
-	c.retryStep++
-	c.retry = time.AfterFunc(delay, func() {
-		c.retryMu.Lock()
-		c.retry = nil
-		c.retryMu.Unlock()
-		if ctx.Err() == nil {
-			c.mark(dirtyRetry)
+func (c *tenantCoordinator) tenantState(
+	ctx context.Context,
+	tenantAccount tenantfs.Account,
+) (mountproto.TenantState, bool, error) {
+	response, err := c.runtime.TenantState(ctx, tenantAccount)
+	if err != nil {
+		if isRemoteCode(err, mountproto.ErrorCodeNotFound) {
+			return mountproto.TenantState{}, false, nil
 		}
-	})
-}
-
-func (c *overlayCoordinator) resetRetry() {
-	c.retryMu.Lock()
-	if c.retry != nil {
-		c.retry.Stop()
-		c.retry = nil
+		return mountproto.TenantState{}, false, err
 	}
-	c.retryStep = 0
-	c.retryMu.Unlock()
-}
-
-func (c *overlayCoordinator) stopRetry() {
-	c.retryMu.Lock()
-	if c.retry != nil {
-		c.retry.Stop()
-		c.retry = nil
+	tenantID, err := tenantAccount.TenantID()
+	if err != nil {
+		return mountproto.TenantState{}, false, err
 	}
-	c.retryMu.Unlock()
-}
-
-func sameAppliedGeneration(got, want store.OverlayApplied) bool {
-	return got.Backend == want.Backend &&
-		got.CanonicalStamp == want.CanonicalStamp &&
-		got.SettingsStamp == want.SettingsStamp &&
-		got.StructureStamp == want.StructureStamp &&
-		got.AppStamp == want.AppStamp
-}
-
-func (s *Server) catchUpOverlay(ctx context.Context, account store.Account) error {
-	if s.overlayCoordinator == nil {
-		return nil
+	if response.Protocol != mountproto.Version || response.Code != mountproto.ErrorCodeOk ||
+		response.Message != "" || response.State == nil ||
+		response.State.OwnerID != mountproto.OwnerID(tenantfs.OwnerID) ||
+		response.State.TenantID != mountproto.TenantID(tenantID) ||
+		response.State.Generation == 0 {
+		return mountproto.TenantState{}, false, errors.New("invalid owner-fenced FuseKit tenant state")
 	}
-	return s.overlayCoordinator.catchUp(ctx, account)
+	return *response.State, true, nil
+}
+
+func isRemoteCode(err error, code mountproto.ErrorCode) bool {
+	var remote *mountservice.RemoteError
+	return errors.As(err, &remote) && remote.Code == code
+}
+
+func validTenantAcknowledgement(
+	protocol uint16,
+	code mountproto.ErrorCode,
+	message string,
+	tenantID mountproto.TenantID,
+	generation uint64,
+	wantID mountproto.TenantID,
+	wantGeneration uint64,
+) bool {
+	return protocol == mountproto.Version && code == mountproto.ErrorCodeOk && message == "" &&
+		tenantID == wantID && generation == wantGeneration
+}
+
+func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.AccountRemoval) error {
+	account, err := c.server.m.Store.GetAccount(removal.AccountID)
+	if err != nil {
+		return err
+	}
+	if account.InstanceID != removal.AccountInstanceID ||
+		account.Generation != removal.AccountGeneration {
+		return errors.New("account identity changed after removal intent")
+	}
+	tenantAccount := pool.TenantAccount(account)
+	tenantID, err := tenantAccount.TenantID()
+	if err != nil {
+		return err
+	}
+	release, err := c.acquireTenantLane(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	account, err = c.server.m.Store.GetAccount(removal.AccountID)
+	if err != nil {
+		return err
+	}
+	if account.InstanceID != removal.AccountInstanceID ||
+		account.Generation != removal.AccountGeneration {
+		return errors.New("account identity changed while awaiting removal lane")
+	}
+	tenantAccount = pool.TenantAccount(account)
+	state, present, err := c.tenantState(ctx, tenantAccount)
+	if err != nil {
+		return fmt.Errorf("inspect FuseKit tenant before removal: %w", err)
+	}
+	if present {
+		if state.Generation != removal.AccountGeneration {
+			return errors.New("FuseKit tenant generation drifted from removal intent")
+		}
+		response, err := c.runtime.RemoveTenant(ctx, tenantAccount, removal.AccountGeneration)
+		if err != nil {
+			return fmt.Errorf("remove FuseKit tenant: %w", err)
+		}
+		if response.Protocol != mountproto.Version || response.Code != mountproto.ErrorCodeOk ||
+			response.Message != "" || response.TenantID != mountproto.TenantID(tenantID) ||
+			response.Generation != removal.AccountGeneration || !response.FileProviderAbsent {
+			return errors.New("remove FuseKit tenant: invalid proof")
+		}
+	}
+	c.forgetTenant(tenantID)
+	return c.server.m.Remove(ctx, account.ID, removal.DeleteCredential)
+}
+
+func (s *Server) prepareTenant(
+	ctx context.Context,
+	account store.Account,
+) (catalogproto.TenantPreparationProof, error) {
+	if s.prepareAccount != nil {
+		return s.prepareAccount(ctx, account)
+	}
+	if s.tenantCoordinator == nil {
+		return catalogproto.TenantPreparationProof{}, errors.New("FuseKit tenant coordinator is unavailable")
+	}
+	return s.tenantCoordinator.prepare(ctx, account)
+}
+
+func (c *tenantCoordinator) activatePrepared(
+	ctx context.Context,
+	account store.Account,
+	proof catalogproto.TenantPreparationProof,
+	activate func() error,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.preparer.Validate(pool.TenantAccount(account), proof); err != nil {
+		return err
+	}
+	return activate()
 }

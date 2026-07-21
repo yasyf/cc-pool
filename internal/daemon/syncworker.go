@@ -1,0 +1,257 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/hostsync"
+	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/procscan"
+	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/synckit/converge"
+)
+
+type hostSyncWorkerSessions struct {
+	manager *pool.Manager
+}
+
+func (s hostSyncWorkerSessions) Busy(ctx context.Context, uuid string) (bool, string, error) {
+	rows, err := s.manager.Store.AccountsByUUID(uuid)
+	if err != nil {
+		return false, "", fmt.Errorf("resolve accounts for %s: %w", uuid, err)
+	}
+	if len(rows) == 0 {
+		return false, "", nil
+	}
+	sessions, err := s.manager.ScanSessions(ctx)
+	if err != nil {
+		return false, "", fmt.Errorf("scan sessions: %w", err)
+	}
+	for _, account := range rows {
+		active, err := s.manager.Store.ActiveSessionCount(account.ID)
+		if err != nil {
+			return false, "", fmt.Errorf("read acct-%02d active sessions: %w", account.ID, err)
+		}
+		if active > 0 {
+			return true, fmt.Sprintf("acct-%02d has %d active session(s)", account.ID, active), nil
+		}
+		if count := procscan.CountByConfigDir(sessions, pool.AccountPresentationDir(account.ID)); count > 0 {
+			return true, fmt.Sprintf("acct-%02d has %d live process session(s)", account.ID, count), nil
+		}
+	}
+	return false, "", nil
+}
+
+type hostSyncWorkerRemover struct {
+	lifecycle context.Context
+	manager   *pool.Manager
+
+	mu          sync.Mutex
+	client      *tenantfs.Client
+	coordinator *tenantCoordinator
+}
+
+type hostSyncWorkerRemoval struct {
+	remover *hostSyncWorkerRemover
+	intent  store.AccountRemoval
+}
+
+func (r *hostSyncWorkerRemover) BeginAccountRemoval(id int, deleteCredential bool) (hostsync.AccountRemoval, error) {
+	intent, err := r.manager.Store.BeginAccountRemoval(id, deleteCredential)
+	if err != nil {
+		return nil, err
+	}
+	return hostSyncWorkerRemoval{remover: r, intent: intent}, nil
+}
+
+func (r hostSyncWorkerRemoval) Finish(ctx context.Context) error {
+	coordinator, err := r.remover.runtime(ctx)
+	if err != nil {
+		return err
+	}
+	return coordinator.finishRemoval(ctx, r.intent)
+}
+
+func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.coordinator != nil {
+		return r.coordinator, nil
+	}
+	client, err := tenantfs.NewClient(ctx, pool.FuseKitSocketPath())
+	if err != nil {
+		return nil, fmt.Errorf("connect FuseKit holder: %w", err)
+	}
+	preparer, err := tenantfs.NewPreparer(client)
+	if err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	server := &Server{m: r.manager}
+	r.client = client
+	r.coordinator = newTenantCoordinator(r.lifecycle, server, preparer, client)
+	return r.coordinator, nil
+}
+
+func (r *hostSyncWorkerRemover) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.client == nil {
+		return nil
+	}
+	err := r.client.Close()
+	r.client = nil
+	r.coordinator = nil
+	return err
+}
+
+// RunHostSyncWorker reconstructs and executes one complete host-sync operation
+// inside the already tracked disposable process group.
+func RunHostSyncWorker(
+	ctx context.Context,
+	owner proc.Record,
+	input io.Reader,
+	output io.Writer,
+) (err error) {
+	manager, err := pool.OpenHostSyncWorker(ctx, owner)
+	if err != nil {
+		return err
+	}
+	remover := &hostSyncWorkerRemover{lifecycle: ctx, manager: manager}
+	defer func() {
+		err = errors.Join(err, remover.Close(), manager.Close())
+	}()
+
+	manifestPath, err := hostsync.ManifestPath()
+	if err != nil {
+		return err
+	}
+	logger := log.New(os.Stderr, "[cc-pool-hostsync] ", log.LstdFlags)
+	self, err := (&Server{m: manager, log: logger}).resolveSyncSelf(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve host-sync worker identity: %w", err)
+	}
+	manager.BuildCredentialWritePublication = credentialWritePublicationBuilder(self)
+	manager.SettleCredentialWrite = func(
+		_ context.Context,
+		settlement pool.CredentialWriteSettlement,
+	) error {
+		publication, err := decodeCredentialWritePublication(settlement.PublicationPayload)
+		if err != nil {
+			return err
+		}
+		if publication.Chain != nil {
+			return errors.New("host-sync worker cannot publish an owned credential chain")
+		}
+		return nil
+	}
+	service := &hostsync.Service{
+		M:        manager,
+		Registry: hostsync.NewRegistryFile(pool.SyncDir()),
+		StampDir: pool.SyncStampsDir(),
+		Log:      logger,
+		Locals:   hostsync.ManagerLocals(manager, self, time.Now),
+		Mesh:     hostsync.SynckitMesh{},
+		Sessions: hostSyncWorkerSessions{manager: manager},
+		Remover:  remover,
+		Status:   converge.NewPeerStatus(),
+		Fetcher:  hostsync.NewSSHFetcher(),
+		Run:      manager.RunHostSyncCommand,
+	}
+	pull := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, localExpiresAt int64, peers []string) (*creds.Credential, error) {
+		return hostsync.FetchCredential(ctx, hostsync.PeerTransport, uuid, chain, localExpiresAt, peers)
+	}
+	service.Driver = hostsync.NewDriver(service, hostsync.DriverDeps{
+		Store:      manager.Store,
+		Cred:       manager,
+		LocalIndex: hostsync.ManagerLocalIndex(manager),
+		Materialize: func(ctx context.Context, value hostsync.AccountValue, peers []string) (hostsync.MaterializeResult, error) {
+			noLocal := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, peers []string) (*creds.Credential, error) {
+				return pull(ctx, uuid, chain, 0, peers)
+			}
+			return service.Materialize(ctx, value, peers, noLocal, manifestPath)
+		},
+		Pull: pull,
+	})
+	enabled := func() (bool, error) {
+		value, ok, err := manager.Store.GetMeta(metaSyncEnabled)
+		if err != nil {
+			return false, fmt.Errorf("read %s meta: %w", metaSyncEnabled, err)
+		}
+		return ok && value == "1", nil
+	}
+	consumer := hostsync.NewConsumer(service, enabled)
+	fetch := hostsync.NewFetchCredentialHandler(
+		manager.Store.GetAccountByUUID,
+		func(ctx context.Context, account store.Account) (*creds.Credential, error) {
+			credential, _, err := manager.EnsureFreshToken(ctx, account, 0, false)
+			return credential, err
+		},
+	)
+	return hostsync.RunWorker(ctx, input, output, hostsync.WorkerRuntime{
+		Consumer: consumer,
+		Fetch:    fetch,
+		AuthKind: func(ctx context.Context, accountID int, uuid string) (store.AuthKind, error) {
+			value, ok, err := manager.Store.GetMeta(metaSyncEnabled)
+			if err != nil {
+				return "", err
+			}
+			if !ok || value != "1" {
+				return store.AuthKindOwned, nil
+			}
+			account, err := manager.Store.GetAccount(accountID)
+			if err != nil {
+				return "", err
+			}
+			if account.AccountUUID != uuid {
+				return "", errors.New("hostsync: auth-kind account identity changed")
+			}
+			registry, err := service.Registry.Load()
+			if err != nil {
+				return "", err
+			}
+			entry, present := registry[uuid]
+			if !present || !entry.Present() {
+				return store.AuthKindOwned, nil
+			}
+			meshSelf, peers, err := service.Mesh.Resolve(ctx)
+			if err != nil {
+				return "", fmt.Errorf("resolve auth-kind mesh: %w", err)
+			}
+			if meshSelf != self {
+				return "", fmt.Errorf("auth-kind mesh identity changed from %q to %q", self, meshSelf)
+			}
+			return classifyAuthKindOwner(entry.Value.Chain.Origin, meshSelf, peers)
+		},
+	})
+}
+
+func classifyAuthKindOwner(origin, self string, peers []string) (store.AuthKind, error) {
+	if origin == "" {
+		return "", hostsync.ErrAuthKindOriginMissing
+	}
+	if origin == self {
+		return store.AuthKindOwned, nil
+	}
+	for _, peer := range peers {
+		if origin == peer {
+			return store.AuthKindAwaitingOrigin, nil
+		}
+	}
+	return "", fmt.Errorf("%w: %q is outside the exact mesh", hostsync.ErrAuthKindOriginForeign, origin)
+}
+
+var (
+	_ hostsync.Sessions       = hostSyncWorkerSessions{}
+	_ hostsync.AccountRemover = (*hostSyncWorkerRemover)(nil)
+	_ hostsync.AccountRemoval = hostSyncWorkerRemoval{}
+)

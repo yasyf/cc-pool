@@ -2,597 +2,695 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
 	"errors"
+	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
-	ccoverlay "github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/mountservice"
 )
 
-func newCoordinatorTestSource(t *testing.T, s *Server) *overlayCoordinator {
-	t.Helper()
-	root := t.TempDir()
-	claudeDir := filepath.Join(root, ".claude")
-	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	baseClaudeJSON := filepath.Join(root, ".claude.json")
-	if err := os.WriteFile(baseClaudeJSON, []byte(`{"theme":"dark"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s.contentSource = ccoverlay.NewPoolContentSource(claudeDir, baseClaudeJSON, filepath.Join(root, "stamps"))
-	c := newOverlayCoordinator(s)
-	if err := c.initialize(); err != nil {
-		t.Fatal(err)
-	}
-	s.overlayCoordinator = c
-	return c
+type lifecycleRuntimeStub struct {
+	mu                 sync.Mutex
+	provision          mountproto.ProvisionTenantResponse
+	provisionErr       error
+	provisionResponses []mountproto.ProvisionTenantResponse
+	provisionErrors    []error
+	provisionCalls     int
+	state              mountproto.StateResponse
+	stateErr           error
+	stateCalls         int
+	replace            mountproto.ReplaceTenantResponse
+	replaceErr         error
+	replaceExpected    uint64
+	remove             mountproto.RemoveTenantResponse
+	removeErr          error
+	removeExpected     uint64
+	removed            bool
 }
 
-func desiredApplied(t *testing.T, c *overlayCoordinator, account store.Account) store.OverlayApplied {
-	t.Helper()
-	desired, ok := c.current()
-	if !ok {
-		t.Fatal("coordinator is not initialized")
+func (r *lifecycleRuntimeStub) ProvisionTenant(
+	context.Context,
+	tenantfs.Account,
+) (mountproto.ProvisionTenantResponse, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	index := r.provisionCalls
+	r.provisionCalls++
+	if index < len(r.provisionResponses) {
+		return r.provisionResponses[index], r.provisionErrors[index]
 	}
-	return store.OverlayApplied{
-		AccountID:      account.ID,
-		Backend:        account.OverlayKind,
-		CanonicalStamp: desired.stamps.Canonical,
-		SettingsStamp:  desired.stamps.Settings,
-		StructureStamp: desired.stamps.Structure,
+	return r.provision, r.provisionErr
+}
+
+func (r *lifecycleRuntimeStub) ReplaceTenant(
+	_ context.Context,
+	_ tenantfs.Account,
+	expected uint64,
+) (mountproto.ReplaceTenantResponse, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.replaceExpected = expected
+	return r.replace, r.replaceErr
+}
+
+func (r *lifecycleRuntimeStub) RemoveTenant(
+	_ context.Context,
+	_ tenantfs.Account,
+	expected uint64,
+) (mountproto.RemoveTenantResponse, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.removeExpected = expected
+	if r.removeErr == nil {
+		r.removed = true
+	}
+	return r.remove, r.removeErr
+}
+
+func (r *lifecycleRuntimeStub) TenantState(
+	context.Context,
+	tenantfs.Account,
+) (mountproto.StateResponse, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stateCalls++
+	if r.stateErr != nil {
+		return mountproto.StateResponse{}, r.stateErr
+	}
+	if r.removed {
+		return mountproto.StateResponse{}, remoteError(mountproto.ErrorCodeNotFound)
+	}
+	return r.state, nil
+}
+
+type sourcePreparerStub struct {
+	proof       catalogproto.TenantPreparationProof
+	prepareErr  error
+	validateErr error
+	prepared    int
+	validated   int
+}
+
+type blockingLifecycleRuntime struct {
+	mu      sync.Mutex
+	started chan struct{}
+	release chan struct{}
+	calls   int
+	active  int
+	maximum int
+}
+
+func newBlockingLifecycleRuntime(total int) *blockingLifecycleRuntime {
+	return &blockingLifecycleRuntime{
+		started: make(chan struct{}, total),
+		release: make(chan struct{}),
 	}
 }
 
-func newSymlinkMergeCoordinator(t *testing.T) (*Server, *overlayCoordinator, store.Account, string) {
+func (r *blockingLifecycleRuntime) ProvisionTenant(
+	ctx context.Context,
+	account tenantfs.Account,
+) (mountproto.ProvisionTenantResponse, error) {
+	r.mu.Lock()
+	r.calls++
+	r.active++
+	if r.active > r.maximum {
+		r.maximum = r.active
+	}
+	r.mu.Unlock()
+	r.started <- struct{}{}
+	select {
+	case <-r.release:
+	case <-ctx.Done():
+		r.mu.Lock()
+		r.active--
+		r.mu.Unlock()
+		return mountproto.ProvisionTenantResponse{}, ctx.Err()
+	}
+	r.mu.Lock()
+	r.active--
+	r.mu.Unlock()
+	id, err := account.TenantID()
+	if err != nil {
+		return mountproto.ProvisionTenantResponse{}, err
+	}
+	return mountproto.ProvisionTenantResponse{
+		Protocol:   mountproto.Version,
+		Code:       mountproto.ErrorCodeOk,
+		TenantID:   mountproto.TenantID(id),
+		Generation: account.Generation,
+	}, nil
+}
+
+func (*blockingLifecycleRuntime) ReplaceTenant(
+	context.Context,
+	tenantfs.Account,
+	uint64,
+) (mountproto.ReplaceTenantResponse, error) {
+	return mountproto.ReplaceTenantResponse{}, errors.New("unexpected replace")
+}
+
+func (*blockingLifecycleRuntime) RemoveTenant(
+	context.Context,
+	tenantfs.Account,
+	uint64,
+) (mountproto.RemoveTenantResponse, error) {
+	return mountproto.RemoveTenantResponse{}, errors.New("unexpected remove")
+}
+
+func (*blockingLifecycleRuntime) TenantState(
+	context.Context,
+	tenantfs.Account,
+) (mountproto.StateResponse, error) {
+	return mountproto.StateResponse{}, errors.New("unexpected state")
+}
+
+func (r *blockingLifecycleRuntime) counts() (calls, active, maximum int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls, r.active, r.maximum
+}
+
+func (p *sourcePreparerStub) Prepare(
+	context.Context,
+	tenantfs.Account,
+) (catalogproto.TenantPreparationProof, error) {
+	p.prepared++
+	return p.proof, p.prepareErr
+}
+
+func (p *sourcePreparerStub) Validate(
+	tenantfs.Account,
+	catalogproto.TenantPreparationProof,
+) error {
+	p.validated++
+	return p.validateErr
+}
+
+func exactState(id mountproto.TenantID, generation uint64) mountproto.StateResponse {
+	return mountproto.StateResponse{
+		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+		State: &mountproto.TenantState{
+			OwnerID: mountproto.OwnerID(tenantfs.OwnerID), TenantID: id, Generation: generation,
+			Desired: 11, Applied: 11, StateVersion: 1, ReplacementEligible: true,
+		},
+	}
+}
+
+func remoteError(code mountproto.ErrorCode) error {
+	return &mountservice.RemoteError{Code: code, Message: string(code)}
+}
+
+func allAccountRemovals(t *testing.T, st *store.Store) []store.AccountRemoval {
 	t.Helper()
+	var removals []store.AccountRemoval
+	for after := 0; ; {
+		page, err := st.PageAccountRemovals(t.Context(), after, store.AccountRemovalPageLimit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		removals = append(removals, page.Removals...)
+		if page.Next == 0 {
+			return removals
+		}
+		after = page.Next
+	}
+}
+
+func testTenantAccount(t *testing.T) (store.Account, tenantfs.Account, mountproto.TenantID) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	account := store.Account{
+		ID: 18, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 7,
+	}
+	tenantAccount := pool.TenantAccount(account)
+	tenantID, err := tenantAccount.TenantID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return account, tenantAccount, mountproto.TenantID(tenantID)
+}
+
+func bulkInsertInactiveAccounts(t *testing.T, database string, total int) {
+	t.Helper()
+	db, err := sql.Open("sqlite", database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	tx, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	statement, err := tx.PrepareContext(t.Context(), `
+		INSERT INTO accounts(
+			id,instance_id,generation,config_dir,keychain_service,keychain_account,created_at
+		) VALUES(?,?,?,?,?,?,?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = statement.Close() }()
+	for id := 1; id <= total; id++ {
+		if _, err := statement.ExecContext(
+			t.Context(), id, fmt.Sprintf("%032x", id), 1,
+			fmt.Sprintf("/accounts/%d", id), "service", "account", 1,
+		); err != nil {
+			t.Fatalf("insert account %d: %v", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnsureTenantReplacesPriorGenerationAfterProvisionConflict(t *testing.T) {
+	account, tenantAccount, tenantID := testTenantAccount(t)
+	runtime := &lifecycleRuntimeStub{
+		provisionErr: remoteError(mountproto.ErrorCodeConflict),
+		state:        exactState(tenantID, 2),
+		replace: mountproto.ReplaceTenantResponse{
+			Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+			TenantID: tenantID, Generation: account.Generation,
+		},
+	}
+	coordinator := &tenantCoordinator{runtime: runtime}
+	if err := coordinator.ensureTenant(t.Context(), account, tenantAccount); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.replaceExpected != 2 {
+		t.Fatalf("replace expected generation = %d, want 2", runtime.replaceExpected)
+	}
+}
+
+func TestEnsureTenantRetriesConflictThatRacesWithAbsence(t *testing.T) {
+	account, tenantAccount, tenantID := testTenantAccount(t)
+	runtime := &lifecycleRuntimeStub{
+		provisionResponses: []mountproto.ProvisionTenantResponse{
+			{},
+			{
+				Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+				TenantID: tenantID, Generation: account.Generation,
+			},
+		},
+		provisionErrors: []error{remoteError(mountproto.ErrorCodeConflict), nil},
+		stateErr:        remoteError(mountproto.ErrorCodeNotFound),
+	}
+	if err := (&tenantCoordinator{runtime: runtime}).ensureTenant(t.Context(), account, tenantAccount); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.provisionCalls != 2 || runtime.replaceExpected != 0 {
+		t.Fatalf("provision calls = %d, replace expected = %d", runtime.provisionCalls, runtime.replaceExpected)
+	}
+}
+
+func TestPrepareProvisionsBeforeOnDemandConvergence(t *testing.T) {
+	account, tenantAccount, tenantID := testTenantAccount(t)
+	runtime := &lifecycleRuntimeStub{provision: mountproto.ProvisionTenantResponse{
+		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+		TenantID: tenantID, Generation: account.Generation,
+	}}
+	preparer := &sourcePreparerStub{}
+	coordinator := &tenantCoordinator{runtime: runtime, preparer: preparer}
+	if _, err := coordinator.prepare(t.Context(), account); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.provisionCalls != 1 || preparer.prepared != 1 {
+		t.Fatalf("provision calls = %d, prepare calls = %d", runtime.provisionCalls, preparer.prepared)
+	}
+	_ = tenantAccount
+}
+
+func TestInitializeAdmissionDoesNotReplayHundredThousandInactiveAccounts(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	if err := os.MkdirAll(pool.ClaudeDir(), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{"theme":"light"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pool.ClaudeDir(), "settings.json"), []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s, dirs := newTestServer(t)
-	account, err := s.m.Store.GetAccount(1)
+	database := filepath.Join(home, "pool-v1.db")
+	st, err := store.Open(database)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(account.ConfigDir, 0o700); err != nil {
+	defer func() { _ = st.Close() }()
+	bulkInsertInactiveAccounts(t, database, 100_000)
+	runtime := &lifecycleRuntimeStub{provisionErr: errors.New("unexpected eager provision")}
+	server := &Server{m: &pool.Manager{Store: st}}
+	coordinator := newTenantCoordinator(t.Context(), server, nil, runtime)
+	if err := coordinator.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	private := filepath.Join(account.ConfigDir, ".claude.json")
-	if err := os.WriteFile(private, []byte(`{"theme":"dark"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s.contentSource = ccoverlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(home, "stamps"))
-	c := newOverlayCoordinator(s)
-	if err := c.initialize(); err != nil {
-		t.Fatal(err)
-	}
-	s.overlayCoordinator = c
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-	}
-	if delta := s.heartbeatFor().refresh(t.Context(), 0); !delta.success {
-		t.Fatal("heartbeat failed")
-	}
-	return s, c, account, private
-}
-
-func TestDirtyQueueCoalescesCauses(t *testing.T) {
-	q := newDirtyQueue()
-	q.mark(dirtyCanonical)
-	q.mark(dirtySettings)
-	q.mark(dirtyHeartbeat)
-	cause, ok := q.take(t.Context())
-	if !ok {
-		t.Fatal("take failed")
-	}
-	want := dirtyCanonical | dirtySettings | dirtyHeartbeat
-	if cause != want {
-		t.Fatalf("cause = %08b, want %08b", cause, want)
-	}
-	if len(q.ready) != 0 {
-		t.Fatalf("ready contains %d signals after one coalesced take", len(q.ready))
+	if runtime.provisionCalls != 0 {
+		t.Fatalf("startup provision calls = %d, want 0", runtime.provisionCalls)
 	}
 }
 
-func TestCoordinatorDirectContentDriftPersistsWithoutProviderIO(t *testing.T) {
-	s, dirs := newTestServer(t)
-	setRowKind(t, s, 1, fkoverlay.BackendNFS)
-	account, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
+func TestRemovalRecoveryIsBounded(t *testing.T) {
+	const total = 3 * accountRemovalRecoveryConcurrency
+	removals := make([]store.AccountRemoval, total)
+	for index := range removals {
+		removals[index].AccountID = index + 1
 	}
-	fake := &fakeFuseProv{}
-	s.m.OverlayFor = func(_ fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil }
-	c := newCoordinatorTestSource(t, s)
-	applied := desiredApplied(t, c, account)
-	applied.CanonicalStamp = "old-canonical"
-	if err := s.m.Store.SetOverlayApplied(applied); err != nil {
-		t.Fatal(err)
-	}
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-	}
-	if delta := s.heartbeatFor().refresh(t.Context(), 0); !delta.success {
-		t.Fatal("heartbeat failed")
-	}
-
-	var appBuild appBuildResult
-	if err := c.applyAccount(t.Context(), account, false, &appBuild); err != nil {
-		t.Fatal(err)
-	}
-	if fake.reconcileCount() != 0 || fake.checkCount() != 0 {
-		t.Fatalf("canonical-only drift touched provider: reconcile=%d check=%d", fake.reconcileCount(), fake.checkCount())
-	}
-	got, present, err := s.m.Store.GetOverlayApplied(account.ID)
-	if err != nil || !present {
-		t.Fatalf("GetOverlayApplied = (%+v, %v, %v)", got, present, err)
-	}
-	want := desiredApplied(t, c, account)
-	if !sameAppliedGeneration(got, want) {
-		t.Fatalf("applied generation = %+v, want %+v", got, want)
-	}
-}
-
-func TestCoordinatorSymlinkCanonicalDriftMergesBeforeStampingApplied(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	if err := os.MkdirAll(pool.ClaudeDir(), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{"theme":"light"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pool.ClaudeDir(), "settings.json"), []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s, dirs := newTestServer(t)
-	account, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(account.ConfigDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(account.ConfigDir, ".claude.json"), []byte(`{"theme":"dark"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s.contentSource = ccoverlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(home, "stamps"))
-	c := newOverlayCoordinator(s)
-	if err := c.initialize(); err != nil {
-		t.Fatal(err)
-	}
-	s.overlayCoordinator = c
-	applied := desiredApplied(t, c, account)
-	applied.CanonicalStamp = "old-canonical"
-	if err := s.m.Store.SetOverlayApplied(applied); err != nil {
-		t.Fatal(err)
-	}
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-	}
-	if delta := s.heartbeatFor().refresh(t.Context(), 0); !delta.success {
-		t.Fatal("heartbeat failed")
-	}
-
-	var appBuild appBuildResult
-	if err := c.applyAccount(t.Context(), account, false, &appBuild); err != nil {
-		t.Fatal(err)
-	}
-	payload, err := os.ReadFile(filepath.Join(account.ConfigDir, ".claude.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var merged map[string]any
-	if err := json.Unmarshal(payload, &merged); err != nil {
-		t.Fatal(err)
-	}
-	if merged["theme"] != "light" {
-		t.Fatalf("symlink canonical config = %v, want base theme applied", merged)
-	}
-	got, present, err := s.m.Store.GetOverlayApplied(account.ID)
-	if err != nil || !present || got.CanonicalStamp != desiredApplied(t, c, account).CanonicalStamp {
-		t.Fatalf("applied canonical stamp = (%+v, %v, %v)", got, present, err)
-	}
-}
-
-func TestCoordinatorSelectionChecksSameGenerationAndRepairsDrift(t *testing.T) {
-	s, _ := newTestServer(t)
-	setRowKind(t, s, 1, fkoverlay.BackendNFS)
-	account, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := &fakeFuseProv{checkErr: errors.New("shared link missing")}
-	fake.reconcileFn = func(_, _ string) error {
-		fake.mu.Lock()
-		fake.checkErr = nil
-		fake.mu.Unlock()
-		return nil
-	}
-	s.m.OverlayFor = func(_ fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil }
-	c := newCoordinatorTestSource(t, s)
-	if err := s.m.Store.SetOverlayApplied(desiredApplied(t, c, account)); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := c.catchUp(t.Context(), account); err != nil {
-		t.Fatal(err)
-	}
-	if fake.reconcileCount() != 1 || fake.checkCount() != 2 {
-		t.Fatalf("selection drift calls = reconcile %d, check %d; want 1, 2", fake.reconcileCount(), fake.checkCount())
-	}
-}
-
-func TestCoordinatorSelectionRepairsGenerationDriftOnce(t *testing.T) {
-	s, _ := newTestServer(t)
-	setRowKind(t, s, 1, fkoverlay.BackendNFS)
-	account, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := &fakeFuseProv{checkErr: errors.New("shared link missing")}
-	fake.reconcileFn = func(_, _ string) error {
-		fake.mu.Lock()
-		fake.checkErr = nil
-		fake.mu.Unlock()
-		return nil
-	}
-	s.m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil }
-	c := newCoordinatorTestSource(t, s)
-	applied := desiredApplied(t, c, account)
-	applied.StructureStamp = "old-structure"
-	if err := s.m.Store.SetOverlayApplied(applied); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.catchUp(t.Context(), account); err != nil {
-		t.Fatal(err)
-	}
-	if fake.reconcileCount() != 1 || fake.checkCount() != 1 {
-		t.Fatalf("generation repair calls = reconcile %d, check %d; want 1, 1", fake.reconcileCount(), fake.checkCount())
-	}
-}
-
-func TestCoordinatorSymlinkMergeCoversFirstGenerationAndBackendChange(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		seedLedger bool
-	}{
-		{name: "absent applied generation"},
-		{name: "fuse to symlink backend change", seedLedger: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s, c, account, private := newSymlinkMergeCoordinator(t)
-			if tc.seedLedger {
-				applied := desiredApplied(t, c, account)
-				applied.Backend = string(fkoverlay.BackendNFS)
-				if err := s.m.Store.SetOverlayApplied(applied); err != nil {
-					t.Fatal(err)
-				}
-			}
-			var appBuild appBuildResult
-			if err := c.applyAccount(t.Context(), account, false, &appBuild); err != nil {
-				t.Fatal(err)
-			}
-			payload, err := os.ReadFile(private) //nolint:gosec // private is a test-owned temp path.
-			if err != nil {
-				t.Fatal(err)
-			}
-			var merged map[string]any
-			if err := json.Unmarshal(payload, &merged); err != nil {
-				t.Fatal(err)
-			}
-			if merged["theme"] != "light" {
-				t.Fatalf("canonical merge did not run: %v", merged)
-			}
-			got, present, err := s.m.Store.GetOverlayApplied(account.ID)
-			if err != nil || !present || !sameAppliedGeneration(got, desiredApplied(t, c, account)) {
-				t.Fatalf("applied generation = (%+v, %v, %v)", got, present, err)
-			}
-		})
-	}
-}
-
-func TestCoordinatorSymlinkMergeFailureDoesNotStampApplied(t *testing.T) {
-	s, c, account, private := newSymlinkMergeCoordinator(t)
-	if err := os.WriteFile(private, []byte(`{not json`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var appBuild appBuildResult
-	if err := c.applyAccount(t.Context(), account, false, &appBuild); err == nil {
-		t.Fatal("malformed private config unexpectedly applied")
-	}
-	if got, present, err := s.m.Store.GetOverlayApplied(account.ID); err != nil || present {
-		t.Fatalf("failed merge stamped applied = (%+v, %v, %v)", got, present, err)
-	}
-}
-
-func TestCoordinatorSelectionRepairsFileProviderBeforeNotify(t *testing.T) {
-	s, _ := newTestServer(t)
-	setRowKind(t, s, 1, fkoverlay.BackendFileProvider)
-	account, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := &fakeFPProv{checkErr: errors.New("domain missing")}
-	fake.reconcileFn = func() {
-		fake.mu.Lock()
-		fake.checkErr = nil
-		fake.mu.Unlock()
-	}
-	s.m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil }
-	c := newCoordinatorTestSource(t, s)
-	c.appBuild = func(context.Context) (string, error) { return "build-1", nil }
-	if err := c.catchUp(t.Context(), account); err != nil {
-		t.Fatal(err)
-	}
-	checks, reconciles, _, _ := fake.counts()
-	if checks != 2 || reconciles != 1 || fake.notifyCount() != 1 {
-		t.Fatalf("FP selection calls = check %d reconcile %d notify %d; want 2, 1, 1", checks, reconciles, fake.notifyCount())
-	}
-}
-
-func TestCoordinatorFailedApplyKeepsPriorGeneration(t *testing.T) {
-	s, dirs := newTestServer(t)
-	setRowKind(t, s, 1, fkoverlay.BackendNFS)
-	account, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := &fakeFuseProv{reconcileErr: errors.New("reconcile failed")}
-	s.m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil }
-	c := newCoordinatorTestSource(t, s)
-	applied := desiredApplied(t, c, account)
-	applied.StructureStamp = "prior-structure"
-	if err := s.m.Store.SetOverlayApplied(applied); err != nil {
-		t.Fatal(err)
-	}
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-	}
-	s.heartbeatFor().refresh(t.Context(), 0)
-	var appBuild appBuildResult
-	if err := c.applyAccount(t.Context(), account, false, &appBuild); err == nil {
-		t.Fatal("failed reconcile unexpectedly succeeded")
-	}
-	got, present, err := s.m.Store.GetOverlayApplied(account.ID)
-	if err != nil || !present || got.StructureStamp != "prior-structure" {
-		t.Fatalf("failed apply changed ledger = (%+v, %v, %v)", got, present, err)
-	}
-}
-
-func TestCoordinatorSelectionWaitUsesLatestDesiredGeneration(t *testing.T) {
-	s, _ := newTestServer(t)
-	setRowKind(t, s, 1, fkoverlay.BackendNFS)
-	account, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := &fakeFuseProv{}
-	s.m.OverlayFor = func(fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil }
-	c := newCoordinatorTestSource(t, s)
-	initial := desiredApplied(t, c, account)
-	if err := s.m.Store.SetOverlayApplied(initial); err != nil {
-		t.Fatal(err)
-	}
-	if !s.cl.hold(account.ID) {
-		t.Fatal("could not hold poll claim")
-	}
+	started := make(chan struct{}, total)
+	release := make(chan struct{})
+	var (
+		mu      sync.Mutex
+		active  int
+		maximum int
+	)
 	done := make(chan error, 1)
-	go func() { done <- c.catchUp(t.Context(), account) }()
-	time.Sleep(20 * time.Millisecond)
-	c.mu.Lock()
-	desired := c.desired
-	desired.stamps.Canonical = "generation-2"
-	c.desired = desired
-	c.mu.Unlock()
-	s.cl.disownHold(account.ID)
+	go func() {
+		done <- recoverAccountRemovals(
+			t.Context(),
+			func(context.Context, int, int) (store.AccountRemovalPage, error) {
+				return store.AccountRemovalPage{Removals: removals}, nil
+			},
+			func(context.Context, store.AccountRemoval) error {
+				mu.Lock()
+				active++
+				if active > maximum {
+					maximum = active
+				}
+				mu.Unlock()
+				started <- struct{}{}
+				<-release
+				mu.Lock()
+				active--
+				mu.Unlock()
+				return nil
+			},
+		)
+	}()
+	for range accountRemovalRecoveryConcurrency {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("removal recovery did not fill its bounded capacity")
+		}
+	}
+	mu.Lock()
+	if active != accountRemovalRecoveryConcurrency || maximum != accountRemovalRecoveryConcurrency {
+		mu.Unlock()
+		t.Fatalf("filled removal concurrency = active %d maximum %d", active, maximum)
+	}
+	mu.Unlock()
+	close(release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	got, present, err := s.m.Store.GetOverlayApplied(account.ID)
-	if err != nil || !present || got.CanonicalStamp != "generation-2" {
-		t.Fatalf("selection persisted stale generation = (%+v, %v, %v)", got, present, err)
+	mu.Lock()
+	defer mu.Unlock()
+	if active != 0 || maximum != accountRemovalRecoveryConcurrency {
+		t.Fatalf("removal concurrency = active %d maximum %d", active, maximum)
 	}
 }
 
-func TestCoordinatorStructureDriftReconcilesAndChecksDirectProvider(t *testing.T) {
-	s, dirs := newTestServer(t)
-	setRowKind(t, s, 1, fkoverlay.BackendNFS)
-	account, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
+func TestRemovalRecoveryRestartsCursorAndReplaysFailedClaims(t *testing.T) {
+	const total = 2*store.AccountRemovalPageLimit + 1
+	claims := make(map[int]struct{}, total)
+	for id := 1; id <= total; id++ {
+		claims[id] = struct{}{}
 	}
-	fake := &fakeFuseProv{}
-	s.m.OverlayFor = func(_ fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil }
-	c := newCoordinatorTestSource(t, s)
-	applied := desiredApplied(t, c, account)
-	applied.StructureStamp = "old-structure"
-	if err := s.m.Store.SetOverlayApplied(applied); err != nil {
-		t.Fatal(err)
-	}
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-	}
-	if delta := s.heartbeatFor().refresh(t.Context(), 0); !delta.success {
-		t.Fatal("heartbeat failed")
-	}
-
-	var appBuild appBuildResult
-	if err := c.applyAccount(t.Context(), account, false, &appBuild); err != nil {
-		t.Fatal(err)
-	}
-	if fake.reconcileCount() != 1 || fake.checkCount() != 1 {
-		t.Fatalf("structure drift calls = reconcile %d, check %d; want 1, 1", fake.reconcileCount(), fake.checkCount())
-	}
-}
-
-func TestCoordinatorAppDirtyNotifiesActiveFileProvider(t *testing.T) {
-	s, dirs := newTestServer(t)
-	setRowKind(t, s, 1, fkoverlay.BackendFileProvider)
-	account, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := &fakeFPProv{}
-	s.m.OverlayFor = func(_ fkoverlay.Backend) (fkoverlay.Provider, error) { return fake, nil }
-	c := newCoordinatorTestSource(t, s)
-	c.appBuild = func(context.Context) (string, error) { return "build-2", nil }
-	applied := desiredApplied(t, c, account)
-	applied.AppStamp = "build-1"
-	if err := s.m.Store.SetOverlayApplied(applied); err != nil {
-		t.Fatal(err)
-	}
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
-	}
-	if delta := s.heartbeatFor().refresh(t.Context(), 0); !delta.success {
-		t.Fatal("heartbeat failed")
-	}
-
-	c.converge(t.Context(), dirtyApp)
-	if fake.notifyCount() != 1 {
-		t.Fatalf("NotifyContent calls = %d, want 1", fake.notifyCount())
-	}
-	if _, reconciles, _, _ := fake.counts(); reconciles != 0 {
-		t.Fatalf("app drift called Reconcile %d times; want NotifyContent only", reconciles)
-	}
-	got, present, err := s.m.Store.GetOverlayApplied(account.ID)
-	if err != nil || !present || got.AppStamp != "build-2" {
-		t.Fatalf("applied app stamp = (%+v, %v, %v), want build-2", got, present, err)
-	}
-}
-
-func TestCoordinatorWatchesExactAppBuildAndBundleParent(t *testing.T) {
-	s, _ := newTestServer(t)
-	c := newCoordinatorTestSource(t, s)
-	inputs := c.inputPaths()
-	wantBuild := filepath.Join(pool.WidgetAppPath(), "Contents", "Info.plist")
-	if inputs.AppBuild != wantBuild {
-		t.Fatalf("AppBuild = %q, want %q", inputs.AppBuild, wantBuild)
-	}
-	if inputs.AppParent != filepath.Dir(pool.WidgetAppPath()) {
-		t.Fatalf("AppParent = %q, want %q", inputs.AppParent, filepath.Dir(pool.WidgetAppPath()))
-	}
-	if inputs.Canonical == "" || inputs.CanonicalParent == "" || inputs.Settings == "" || inputs.ClaudeDir == "" {
-		t.Fatalf("semantic watcher inputs contain an empty source path: %+v", inputs)
-	}
-}
-
-func TestCoordinatorSemanticRefreshFailureSchedulesRetry(t *testing.T) {
-	s, _ := newTestServer(t)
-	c := newCoordinatorTestSource(t, s)
-	t.Cleanup(c.stopRetry)
-	if err := os.WriteFile(c.inputPaths().Canonical, []byte(`{not json`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c.converge(t.Context(), dirtyCanonical)
-	c.retryMu.Lock()
-	retryScheduled := c.retry != nil
-	c.retryMu.Unlock()
-	if !retryScheduled {
-		t.Fatal("semantic refresh failure did not schedule a bounded retry")
-	}
-}
-
-func TestCoordinatorListFailureSchedulesRetry(t *testing.T) {
-	s, _ := newTestServer(t)
-	c := newCoordinatorTestSource(t, s)
-	t.Cleanup(c.stopRetry)
-	if err := s.m.Store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	c.converge(t.Context(), dirtyStartup)
-	c.retryMu.Lock()
-	retryScheduled := c.retry != nil
-	c.retryMu.Unlock()
-	if !retryScheduled {
-		t.Fatal("account list failure did not schedule a bounded retry")
-	}
-}
-
-func TestCoordinatorCachesFailedAppBuildPerConverge(t *testing.T) {
-	s, dirs := newTestServer(t)
-	setRowKind(t, s, 1, fkoverlay.BackendFileProvider)
-	setRowKind(t, s, 2, fkoverlay.BackendFileProvider)
-	c := newCoordinatorTestSource(t, s)
-	t.Cleanup(c.stopRetry)
-	calls := 0
-	c.appBuild = func(context.Context) (string, error) {
-		calls++
-		return "", errors.New("app unavailable")
-	}
-	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{
-			{PID: 4242, ConfigDir: dirs[1]},
-			{PID: 4243, ConfigDir: dirs[2]},
-		}, nil
-	}
-	s.heartbeatFor().refresh(t.Context(), 0)
-	c.converge(t.Context(), dirtyStartup)
-	if calls != 1 {
-		t.Fatalf("failed app Check calls = %d for two accounts, want 1", calls)
-	}
-}
-
-func TestCoordinatorRestartsWatcherAfterFailure(t *testing.T) {
-	s, _ := newTestServer(t)
-	c := newCoordinatorTestSource(t, s)
-	c.watchRetryBase = 5 * time.Millisecond
-	second := make(chan struct{})
-	calls := 0
-	c.watch = func(ctx context.Context, _ ccoverlay.SemanticInputPaths, _ func(dirtyCause)) error {
-		calls++
-		if calls == 1 {
-			return errors.New("kqueue reconcile raced replacement")
+	var (
+		mu          sync.Mutex
+		fail        = true
+		pageCursors []int
+	)
+	page := func(
+		_ context.Context,
+		after, limit int,
+	) (store.AccountRemovalPage, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		pageCursors = append(pageCursors, after)
+		result := store.AccountRemovalPage{Removals: make([]store.AccountRemoval, 0, limit)}
+		for id := after + 1; id <= total; id++ {
+			if _, present := claims[id]; !present {
+				continue
+			}
+			if len(result.Removals) == limit {
+				result.Next = result.Removals[len(result.Removals)-1].AccountID
+				break
+			}
+			result.Removals = append(result.Removals, store.AccountRemoval{AccountID: id})
 		}
-		close(second)
-		<-ctx.Done()
+		return result, nil
+	}
+	finish := func(_ context.Context, removal store.AccountRemoval) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if removal.AccountID == store.AccountRemovalPageLimit/2 && fail {
+			fail = false
+			return errors.New("injected interruption")
+		}
+		delete(claims, removal.AccountID)
 		return nil
 	}
-	ctx, cancel := context.WithCancel(t.Context())
-	c.start(ctx)
-	select {
-	case <-second:
-	case <-time.After(time.Second):
-		t.Fatal("watcher was not restarted")
+	if err := recoverAccountRemovals(t.Context(), page, finish); err == nil {
+		t.Fatal("interrupted recovery succeeded")
 	}
-	cancel()
-	s.wg.Wait()
-	if calls != 2 {
-		t.Fatalf("watch calls = %d, want 2", calls)
+	if err := recoverAccountRemovals(t.Context(), page, finish); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(claims) != 0 {
+		t.Fatalf("recovery left %d durable claims", len(claims))
+	}
+	if len(pageCursors) < 2 || pageCursors[0] != 0 || pageCursors[1] != 0 {
+		t.Fatalf("restart cursors = %v, want prefix [0 0]", pageCursors)
 	}
 }
 
-func TestCoordinatorRecordAppliedIgnoresRemovalRace(t *testing.T) {
-	s, _ := newTestServer(t)
-	c := newCoordinatorTestSource(t, s)
-	account, err := s.m.Store.GetAccount(1)
+func TestInitializePagesOnlyInterruptedRemovalClaims(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	applied := desiredApplied(t, c, account)
-	if err := s.m.Store.DeleteAccount(account.ID); err != nil {
+	defer func() { _ = st.Close() }()
+	const total = store.AccountRemovalPageLimit + 1
+	for id := 1; id <= total; id++ {
+		if err := st.UpsertAccount(store.Account{
+			ID: id, ConfigDir: pool.AccountPresentationDir(id),
+			KeychainService: "service", KeychainAccount: "account",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.BeginAccountRemoval(id, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime := &lifecycleRuntimeStub{stateErr: remoteError(mountproto.ErrorCodeNotFound)}
+	server := &Server{
+		m: newDaemonTestManager(t, st, accountMutationTestRefresher{}, credstest.NewFake()),
+	}
+	coordinator := newTenantCoordinator(t.Context(), server, nil, runtime)
+	if err := coordinator.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.recordApplied(applied); err != nil {
-		t.Fatalf("removed account race = %v, want success", err)
+	accounts, err := st.ListAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 0 || len(allAccountRemovals(t, st)) != 0 {
+		t.Fatalf("restart recovery left accounts=%d removals=%d", len(accounts), len(allAccountRemovals(t, st)))
+	}
+	if runtime.provisionCalls != 0 || runtime.stateCalls != total {
+		t.Fatalf("startup calls: provision=%d state=%d", runtime.provisionCalls, runtime.stateCalls)
+	}
+}
+
+func TestOnDemandProvisioningIsBounded(t *testing.T) {
+	const requests = 3 * tenantProvisionConcurrency
+	runtime := newBlockingLifecycleRuntime(requests)
+	coordinator := newTenantCoordinator(t.Context(), nil, nil, runtime)
+	errs := make(chan error, requests)
+	for id := 1; id <= requests; id++ {
+		account := store.Account{
+			ID: id, InstanceID: fmt.Sprintf("%032x", id), Generation: 1,
+		}
+		go func() {
+			tenantAccount := pool.TenantAccount(account)
+			errs <- coordinator.ensureTenant(t.Context(), account, tenantAccount)
+		}()
+	}
+	for range tenantProvisionConcurrency {
+		select {
+		case <-runtime.started:
+		case <-time.After(time.Second):
+			t.Fatal("bounded provisioning did not fill its capacity")
+		}
+	}
+	if calls, active, maximum := runtime.counts(); calls != tenantProvisionConcurrency ||
+		active != tenantProvisionConcurrency || maximum != tenantProvisionConcurrency {
+		t.Fatalf("filled provision counts = calls %d active %d maximum %d", calls, active, maximum)
+	}
+	close(runtime.release)
+	for range requests {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	calls, active, maximum := runtime.counts()
+	if calls != requests || active != 0 || maximum != tenantProvisionConcurrency {
+		t.Fatalf("provision counts = calls %d active %d maximum %d", calls, active, maximum)
+	}
+}
+
+func TestOnDemandProvisioningCoalescesOneTenantGeneration(t *testing.T) {
+	const requests = 32
+	runtime := newBlockingLifecycleRuntime(requests)
+	coordinator := newTenantCoordinator(t.Context(), nil, nil, runtime)
+	account := store.Account{
+		ID: 18, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 7,
+	}
+	tenantAccount := pool.TenantAccount(account)
+	ready := sync.WaitGroup{}
+	ready.Add(requests)
+	errs := make(chan error, requests)
+	start := make(chan struct{})
+	for range requests {
+		go func() {
+			ready.Done()
+			<-start
+			errs <- coordinator.ensureTenant(t.Context(), account, tenantAccount)
+		}()
+	}
+	ready.Wait()
+	close(start)
+	select {
+	case <-runtime.started:
+	case <-time.After(time.Second):
+		t.Fatal("coalesced provision did not start")
+	}
+	close(runtime.release)
+	for range requests {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls, _, _ := runtime.counts(); calls != 1 {
+		t.Fatalf("coalesced provision calls = %d, want 1", calls)
+	}
+}
+
+func TestCanceledProvisionWaiterDoesNotAbandonSharedSettlement(t *testing.T) {
+	runtime := newBlockingLifecycleRuntime(2)
+	coordinator := newTenantCoordinator(t.Context(), nil, nil, runtime)
+	account := store.Account{
+		ID: 18, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 7,
+	}
+	tenantAccount := pool.TenantAccount(account)
+	waiterContext, cancelWaiter := context.WithCancel(t.Context())
+	waiter := make(chan error, 1)
+	go func() {
+		waiter <- coordinator.ensureTenant(waiterContext, account, tenantAccount)
+	}()
+	select {
+	case <-runtime.started:
+	case <-time.After(time.Second):
+		t.Fatal("provision did not start")
+	}
+	cancelWaiter()
+	if err := <-waiter; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter = %v", err)
+	}
+	follower := make(chan error, 1)
+	go func() {
+		follower <- coordinator.ensureTenant(t.Context(), account, tenantAccount)
+	}()
+	close(runtime.release)
+	if err := <-follower; err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.ensureTenant(t.Context(), account, tenantAccount); err != nil {
+		t.Fatal(err)
+	}
+	if calls, active, maximum := runtime.counts(); calls != 1 || active != 0 || maximum != 1 {
+		t.Fatalf("settled provision counts = calls %d active %d maximum %d", calls, active, maximum)
+	}
+}
+
+func TestActivatePreparedValidatesBeforeSessionActivation(t *testing.T) {
+	account, _, _ := testTenantAccount(t)
+	validationErr := errors.New("stale proof")
+	preparer := &sourcePreparerStub{validateErr: validationErr}
+	activated := false
+	err := (&tenantCoordinator{preparer: preparer}).activatePrepared(
+		t.Context(), account, catalogproto.TenantPreparationProof{},
+		func() error {
+			activated = true
+			return nil
+		},
+	)
+	if !errors.Is(err, validationErr) || activated || preparer.validated != 1 {
+		t.Fatalf("activate = err %v, activated %v, validations %d", err, activated, preparer.validated)
+	}
+}
+
+func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := pool.EnsureStateDir(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.UpsertAccount(store.Account{
+		ID: 1, ConfigDir: pool.AccountPresentationDir(1),
+		KeychainService: "service", KeychainAccount: "account",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	account, err := st.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(pool.AccountBackingDir(account.ID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	removal, err := st.BeginAccountRemoval(account.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID, err := pool.TenantAccount(account).TenantID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &lifecycleRuntimeStub{
+		state: exactState(mountproto.TenantID(tenantID), account.Generation),
+		remove: mountproto.RemoveTenantResponse{
+			Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+			TenantID: mountproto.TenantID(tenantID), Generation: account.Generation,
+			FileProviderAbsent: true,
+		},
+	}
+	server := &Server{
+		m:   newDaemonTestManager(t, st, accountMutationTestRefresher{}, credstest.NewFake()),
+		log: log.New(io.Discard, "", 0),
+	}
+	if err := (&tenantCoordinator{server: server, runtime: runtime}).finishRemoval(t.Context(), removal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetAccount(account.ID); !errors.Is(err, store.ErrAccountNotFound) {
+		t.Fatalf("account after removal = %v", err)
+	}
+	if _, err := os.Lstat(pool.AccountBackingDir(account.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backing after removal = %v", err)
 	}
 }

@@ -1,8 +1,7 @@
 package creds
 
 import (
-	"bytes"
-	"os/exec"
+	"context"
 	"regexp"
 )
 
@@ -11,13 +10,15 @@ var acctAttrRE = regexp.MustCompile(`"acct"<blob>="([^"]*)"`)
 
 // DiscoverAccount returns the account (-a) label stored on the service's item by
 // parsing its attribute dump (no secret read). Returns ErrNotFound if absent.
-func DiscoverAccount(service string) (string, error) {
-	//nolint:gosec // G204: securityBin is the fixed /usr/bin/security path; service is a cc-pool-derived keychain service name
-	cmd := exec.Command(securityBin, "find-generic-password", "-s", service)
-	var out, errb bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
+func DiscoverAccount(ctx context.Context, runner TaskRunner, service string) (string, error) {
+	var out, errb boundedBuffer
+	if err := runKeychainTask(
+		ctx,
+		runner,
+		[]string{"find-generic-password", "-s", service},
+		&out,
+		&errb,
+	); err != nil {
 		if isNotFound(errb.String()) {
 			return "", ErrNotFound
 		}

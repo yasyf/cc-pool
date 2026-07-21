@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,7 +16,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
@@ -44,9 +46,74 @@ func (r *runRecorder) run(_ context.Context, name string, args ...string) error 
 	return nil
 }
 
-// newMaterializeService wires a Service over a real (temp) pool Manager: symlink
-// overlay, an in-memory Keychain + on-disk file store, and a captured command
-// runner. HOME/USER point at temp dirs so nothing touches real state.
+type backingCredentials struct{ *credstest.Fake }
+
+func (c backingCredentials) Store(a store.Account, source creds.Source) creds.Store {
+	if source == creds.SourceFile {
+		return credstest.FaultStore{
+			Store: credstest.FileStore(pool.AccountBackingDir(a.ID)), Faults: c.FileFaults,
+		}
+	}
+	return c.Fake.Store(a, source)
+}
+
+func (c backingCredentials) Stores(a store.Account) []creds.Store {
+	return []creds.Store{c.Store(a, creds.SourceKeychain), c.Store(a, creds.SourceFile)}
+}
+
+type fixtureAccountRemover struct {
+	mu    sync.Mutex
+	m     *pool.Manager
+	fail  map[int]error
+	calls []int
+}
+
+type fixtureAccountRemoval struct {
+	remover          *fixtureAccountRemover
+	id               int
+	deleteCredential bool
+}
+
+func (r *fixtureAccountRemover) BeginAccountRemoval(id int, deleteCredential bool) (AccountRemoval, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, id)
+	if err := r.fail[id]; err != nil {
+		return nil, err
+	}
+	if !deleteCredential {
+		return nil, errors.New("fixture removal requires credential deletion")
+	}
+	return fixtureAccountRemoval{remover: r, id: id, deleteCredential: deleteCredential}, nil
+}
+
+func (r *fixtureAccountRemover) setFailure(id int, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fail[id] = err
+}
+
+func (r *fixtureAccountRemover) callsSnapshot() []int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]int(nil), r.calls...)
+}
+
+func (p fixtureAccountRemoval) Finish(ctx context.Context) error {
+	if err := os.RemoveAll(pool.AccountPresentationDir(p.id)); err != nil {
+		return err
+	}
+	return p.remover.m.Remove(ctx, p.id, p.deleteCredential)
+}
+
+var (
+	_ AccountRemover = (*fixtureAccountRemover)(nil)
+	_ AccountRemoval = fixtureAccountRemoval{}
+)
+
+// newMaterializeService wires a Service over a real temporary pool Manager,
+// an in-memory Keychain, and a captured command runner. Its remover models the
+// holder-first lifecycle boundary before deleting manager-owned private state.
 func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fake, *runRecorder) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
@@ -54,16 +121,14 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 	if err := os.MkdirAll(pool.ClaudeDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	m, err := pool.Open()
+	m, err := pool.OpenDaemon(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.Close() })
 	fk := credstest.NewFake()
-	m.Creds = fk
+	m.Creds = backingCredentials{fk}
 	m.OAuth = stubRefresher{}
-	m.DetectOverlay = func() (fkoverlay.Backend, string) { return fkoverlay.BackendSymlink, "" }
-	m.LockDir = filepath.Join(t.TempDir(), "locks")
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}
@@ -74,8 +139,18 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 		Registry: &rf,
 		StampDir: filepath.Join(t.TempDir(), "stamps"),
 		Run:      rec.run,
+		Remover:  &fixtureAccountRemover{m: m, fail: map[int]error{}},
 	}
 	return s, m, fk, rec
+}
+
+func mustMutationOwner(t *testing.T, manager *pool.Manager) proc.Record {
+	t.Helper()
+	owner, err := manager.MutationOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return owner
 }
 
 // freshEnvelope is a pulled STRIPPED envelope whose access token has not
@@ -128,19 +203,23 @@ func TestMaterializeHappyPath(t *testing.T) {
 	}
 
 	configDir := pool.AccountDir(1)
-	if _, err := os.Stat(configDir); err != nil {
-		t.Fatalf("account dir not created: %v", err)
+	backingDir := pool.AccountBackingDir(1)
+	if _, err := os.Stat(backingDir); err != nil {
+		t.Fatalf("account backing not created: %v", err)
+	}
+	if _, err := os.Lstat(configDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("materialize mutated presentation path: %v", err)
 	}
 
 	// Identity injected verbatim and resolvable through the established reader.
-	id, err := pool.AccountIdentity(fkoverlay.BackendSymlink, configDir)
+	id, err := m.AccountIdentity(t.Context(), 1, configDir)
 	if err != nil {
 		t.Fatalf("AccountIdentity: %v", err)
 	}
 	if id.AccountUUID != "u-happy" || id.EmailAddress != "happy@example.com" {
 		t.Fatalf("identity = %+v, want u-happy / happy@example.com", id)
 	}
-	raw, err := os.ReadFile(filepath.Join(configDir, ".claude.json")) //nolint:gosec // G304: configDir is a cc-pool-managed/test-owned dir, not external input
+	raw, err := os.ReadFile(filepath.Join(backingDir, ".claude.json")) //nolint:gosec // G304: backingDir is a cc-pool-managed/test-owned dir, not external input
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +253,7 @@ func TestMaterializeHappyPath(t *testing.T) {
 	if byUUID.ID != 1 {
 		t.Fatalf("GetAccountByUUID id = %d, want 1", byUUID.ID)
 	}
-	gotCred, src, err := m.ReadCredential(row)
+	gotCred, src, err := m.ReadCredential(t.Context(), row)
 	if err != nil {
 		t.Fatalf("ReadCredential: %v", err)
 	}
@@ -196,7 +275,7 @@ func TestMaterializeHappyPath(t *testing.T) {
 
 // TestMaterializeSeedNoSourceBootstraps pins carry-forward #2: with no
 // ~/.claude.json to seed from, the materializer bootstraps a minimal private
-// document so WriteIdentity lands, and the account completes end to end.
+// onboarding document so WriteIdentity lands, and the account completes end to end.
 func TestMaterializeSeedNoSourceBootstraps(t *testing.T) {
 	s, m, _, _ := newMaterializeService(t)
 	// No ~/.claude.json written: PrepareAdd reports SeedNoSource.
@@ -214,15 +293,15 @@ func TestMaterializeSeedNoSourceBootstraps(t *testing.T) {
 	}
 
 	configDir := pool.AccountDir(1)
-	id, err := pool.AccountIdentity(fkoverlay.BackendSymlink, configDir)
+	id, err := m.AccountIdentity(t.Context(), 1, configDir)
 	if err != nil {
 		t.Fatalf("AccountIdentity: %v", err)
 	}
 	if id.AccountUUID != "u-nosrc" {
 		t.Fatalf("identity uuid = %q, want u-nosrc", id.AccountUUID)
 	}
-	// The bootstrapped document held only the injected identity (started as "{}").
-	raw, err := os.ReadFile(filepath.Join(configDir, ".claude.json")) //nolint:gosec // G304: configDir is a cc-pool-managed/test-owned dir, not external input
+	// The worker-created onboarding flag survives identity injection.
+	raw, err := os.ReadFile(filepath.Join(pool.AccountBackingDir(1), ".claude.json")) //nolint:gosec // G304: backing is cc-pool-managed test state
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,8 +309,8 @@ func TestMaterializeSeedNoSourceBootstraps(t *testing.T) {
 	if err := json.Unmarshal(raw, &top); err != nil {
 		t.Fatal(err)
 	}
-	if len(top) != 1 {
-		t.Fatalf("bootstrapped doc keys = %v, want only oauthAccount", keysOf(top))
+	if len(top) != 2 || string(top["hasCompletedOnboarding"]) != "true" {
+		t.Fatalf("bootstrapped doc = %s, want onboarding and oauthAccount", raw)
 	}
 	row, err := m.Store.GetAccount(1)
 	if err != nil {
@@ -267,7 +346,7 @@ func TestMaterializeKeychainUnavailableFallsBackToFile(t *testing.T) {
 	}
 
 	configDir := pool.AccountDir(1)
-	if _, err := os.Stat(creds.FileCredentialPath(configDir)); err != nil {
+	if _, err := os.Stat(creds.FileCredentialPath(pool.AccountBackingDir(1))); err != nil {
 		t.Fatalf("file credential not written: %v", err)
 	}
 	// No keychain item was written (the fallback avoided it).
@@ -278,7 +357,7 @@ func TestMaterializeKeychainUnavailableFallsBackToFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotCred, src, err := m.ReadCredential(row)
+	gotCred, src, err := m.ReadCredential(t.Context(), row)
 	if err != nil {
 		t.Fatalf("ReadCredential: %v", err)
 	}
@@ -323,16 +402,16 @@ func TestMaterializeNoEnvelopeAborts(t *testing.T) {
 			}
 
 			// Dir torn down.
-			if _, statErr := os.Stat(pool.AccountDir(1)); !os.IsNotExist(statErr) {
+			if _, statErr := os.Stat(pool.AccountBackingDir(1)); !os.IsNotExist(statErr) {
 				t.Fatalf("account dir stat err = %v, want not-exist (AbandonAdd must remove it)", statErr)
 			}
 			// Reservation released: the freed index is handed straight back.
-			n, rerr := m.Store.ReserveAccountIndex()
+			n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
 			if rerr != nil {
 				t.Fatal(rerr)
 			}
-			if n != 1 {
-				t.Fatalf("next reserved index = %d, want the released 1", n)
+			if n.ID != 1 {
+				t.Fatalf("next reserved index = %d, want the released 1", n.ID)
 			}
 			// No row registered.
 			accounts, lerr := m.Store.ListAccounts()
@@ -383,19 +462,19 @@ func TestMaterializeRejectedEnvelopeReleasesNotAbandons(t *testing.T) {
 				t.Fatalf("result = %+v, want zero on rejection", res)
 			}
 			// The dir is kept (release, not abandon) and no credential was written.
-			if _, statErr := os.Stat(pool.AccountDir(1)); statErr != nil {
+			if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
 				t.Fatalf("account dir stat err = %v, want kept on rejection", statErr)
 			}
 			if _, ok := fk.Get(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel()); ok {
 				t.Fatal("a rejected envelope landed in the keychain")
 			}
 			// Reservation released: the freed index is handed straight back.
-			n, rerr := m.Store.ReserveAccountIndex()
+			n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
 			if rerr != nil {
 				t.Fatal(rerr)
 			}
-			if n != 1 {
-				t.Fatalf("next reserved index = %d, want the released 1", n)
+			if n.ID != 1 {
+				t.Fatalf("next reserved index = %d, want the released 1", n.ID)
 			}
 			accounts, lerr := m.Store.ListAccounts()
 			if lerr != nil {
@@ -456,19 +535,19 @@ func TestMaterializeRejectedEnvelopeThroughRealPullerReleases(t *testing.T) {
 				t.Fatalf("result = %+v, want zero on rejection", res)
 			}
 			// ReleaseAdd, not AbandonAdd: dir kept, the login's credential intact.
-			if _, statErr := os.Stat(pool.AccountDir(1)); statErr != nil {
+			if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
 				t.Fatalf("account dir stat err = %v, want kept on rejection", statErr)
 			}
 			got, ok := fk.Get(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel())
 			if !ok || got.ClaudeAiOauth.RefreshToken != "rt-login" {
 				t.Fatalf("retained credential = %+v ok=%v, want rt-login intact", got, ok)
 			}
-			n, rerr := m.Store.ReserveAccountIndex()
+			n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
 			if rerr != nil {
 				t.Fatal(rerr)
 			}
-			if n != 1 {
-				t.Fatalf("next reserved index = %d, want the released 1", n)
+			if n.ID != 1 {
+				t.Fatalf("next reserved index = %d, want the released 1", n.ID)
 			}
 			if len(rec.calls) != 0 {
 				t.Fatalf("nudge calls = %v, want none on rejection", rec.calls)
@@ -517,19 +596,19 @@ func TestMaterializePullFailureNeverDestroysConcurrentLogin(t *testing.T) {
 				t.Fatalf("result = %+v, want zero on abort", res)
 			}
 			// ReleaseAdd, not AbandonAdd: dir kept, the login's credential intact.
-			if _, statErr := os.Stat(pool.AccountDir(1)); statErr != nil {
+			if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
 				t.Fatalf("account dir stat err = %v, want kept", statErr)
 			}
 			got, ok := fk.Get(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel())
 			if !ok || got.ClaudeAiOauth.RefreshToken != "rt-login" {
 				t.Fatalf("slot credential = %+v ok=%v, want the owned login intact", got, ok)
 			}
-			n, rerr := m.Store.ReserveAccountIndex()
+			n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
 			if rerr != nil {
 				t.Fatal(rerr)
 			}
-			if n != 1 {
-				t.Fatalf("next reserved index = %d, want the released 1", n)
+			if n.ID != 1 {
+				t.Fatalf("next reserved index = %d, want the released 1", n.ID)
 			}
 			accounts, lerr := m.Store.ListAccounts()
 			if lerr != nil {
@@ -565,15 +644,15 @@ func TestMaterializePullFailureUnprovableSlotReleases(t *testing.T) {
 	if !errors.Is(err, ErrMaterializeNoEnvelope) {
 		t.Fatalf("err = %v, want errors.Is ErrMaterializeNoEnvelope", err)
 	}
-	if _, statErr := os.Stat(pool.AccountDir(1)); statErr != nil {
+	if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
 		t.Fatalf("account dir stat err = %v, want kept on an unprovable slot", statErr)
 	}
-	n, rerr := m.Store.ReserveAccountIndex()
+	n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
 	if rerr != nil {
 		t.Fatal(rerr)
 	}
-	if n != 1 {
-		t.Fatalf("next reserved index = %d, want the released 1", n)
+	if n.ID != 1 {
+		t.Fatalf("next reserved index = %d, want the released 1", n.ID)
 	}
 }
 
@@ -609,15 +688,15 @@ func TestMaterializeInstallNeverClobbersConcurrentLogin(t *testing.T) {
 		t.Fatalf("slot credential = %+v ok=%v, want the owned login intact", got, ok)
 	}
 	// Release, not abandon: dir kept, reservation freed, no row, no nudge.
-	if _, statErr := os.Stat(pool.AccountDir(1)); statErr != nil {
+	if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
 		t.Fatalf("account dir stat err = %v, want kept", statErr)
 	}
-	n, rerr := m.Store.ReserveAccountIndex()
+	n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
 	if rerr != nil {
 		t.Fatal(rerr)
 	}
-	if n != 1 {
-		t.Fatalf("next reserved index = %d, want the released 1", n)
+	if n.ID != 1 {
+		t.Fatalf("next reserved index = %d, want the released 1", n.ID)
 	}
 	accounts, lerr := m.Store.ListAccounts()
 	if lerr != nil {
@@ -643,11 +722,12 @@ func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
 
 	// A kept dir from an interrupted `ccp add`: its own identity + owned credential.
 	keptDir := pool.AccountDir(1)
-	if err := os.MkdirAll(keptDir, 0o700); err != nil {
+	keptBacking := pool.AccountBackingDir(1)
+	if err := os.MkdirAll(keptBacking, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	const keptIdentity = `{"oauthAccount":{"accountUuid":"u-kept","emailAddress":"kept@example.com"}}`
-	if err := os.WriteFile(filepath.Join(keptDir, ".claude.json"), []byte(keptIdentity), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(keptBacking, ".claude.json"), []byte(keptIdentity), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	retained := cred("at-kept", "rt-kept")
@@ -673,7 +753,7 @@ func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
 		t.Fatalf("retained credential = %+v ok=%v, want rt-kept intact", got, ok)
 	}
 	// #nosec G304 -- keptDir is a test-controlled temporary account directory.
-	raw, err := os.ReadFile(filepath.Join(keptDir, ".claude.json"))
+	raw, err := os.ReadFile(filepath.Join(keptBacking, ".claude.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -681,12 +761,12 @@ func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
 		t.Fatalf("kept identity mutated: %s", raw)
 	}
 	// Reservation released, no row, no nudge.
-	n, rerr := m.Store.ReserveAccountIndex()
+	n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
 	if rerr != nil {
 		t.Fatal(rerr)
 	}
-	if n != 1 {
-		t.Fatalf("next reserved index = %d, want the released 1", n)
+	if n.ID != 1 {
+		t.Fatalf("next reserved index = %d, want the released 1", n.ID)
 	}
 	accounts, lerr := m.Store.ListAccounts()
 	if lerr != nil {
@@ -725,15 +805,15 @@ func TestMaterializeEmptyOAuthDefers(t *testing.T) {
 			}
 
 			// Nothing materialized: no dir, no reservation, no row, no nudge.
-			if _, statErr := os.Stat(pool.AccountDir(1)); !os.IsNotExist(statErr) {
+			if _, statErr := os.Stat(pool.AccountBackingDir(1)); !os.IsNotExist(statErr) {
 				t.Fatalf("account dir stat err = %v, want not-exist (nothing created)", statErr)
 			}
-			n, rerr := m.Store.ReserveAccountIndex()
+			n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
 			if rerr != nil {
 				t.Fatal(rerr)
 			}
-			if n != 1 {
-				t.Fatalf("next reserved index = %d, want 1 (no reservation was taken)", n)
+			if n.ID != 1 {
+				t.Fatalf("next reserved index = %d, want 1 (no reservation was taken)", n.ID)
 			}
 			accounts, lerr := m.Store.ListAccounts()
 			if lerr != nil {

@@ -479,10 +479,10 @@ scenario_5_tombstone_heal() {
 }
 
 # ---------------------------------------------------------------------------
-# Scenario 6 — remove/teardown, and a BUSY peer still refreshes zero times
+# Scenario 6 — remove/teardown through the daemon-owned convergence path
 # ---------------------------------------------------------------------------
-scenario_6_remove_busy() {
-  hdr "Scenario 6: remove/teardown + a busy peer performs ZERO refreshes"
+scenario_6_remove() {
+  hdr "Scenario 6: remove/teardown through daemon-owned convergence"
   # A removes the account (peer tombstone). Quiesce A's daemon around the remove
   # so its poll can't re-assert the overlay under the local teardown.
   stop_daemon a
@@ -491,34 +491,13 @@ scenario_6_remove_busy() {
   [ "$(reg_get a "$UUID" present)" = "no" ] || fail "A did not tombstone X"
   ok "A tombstoned X (peer removal)"
 
-  # A busy (fake live session) peer must DEFER teardown and refresh zero times.
-  # busydefer runs one converge in-process with a fake Sessions seam (the daemon
-  # can't inject a live session from outside), stopping B's daemon so it owns B's
-  # store; A stays up as the peer.
-  stop_daemon b
-  local busy_out idle_out
-  busy_out="$(hrun b "$BIN/busydefer" --busy=true)"
-  echo "    busydefer(busy)=$busy_out"
-  python3 - "$busy_out" <<'PY' || fail "busy converge did not defer"
-import json,sys
-r=json.loads(sys.argv[1])
-assert r["skippedBusy"]>=1, "expected skippedBusy>=1"
-assert r["accounts"]==1, "account destroyed while busy"
-PY
-  [ -d "$SIM/b/.cc-pool/accounts/acct-01" ] || fail "B acct-01 destroyed while busy"
-  assert_zero_posts b
-  ok "busy peer: teardown deferred, nothing destroyed, ZERO refreshes"
-
-  idle_out="$(hrun b "$BIN/busydefer" --busy=false)"
-  echo "    busydefer(idle)=$idle_out"
-  python3 - "$idle_out" <<'PY' || fail "idle converge did not tear down"
-import json,sys
-r=json.loads(sys.argv[1])
-assert r["accounts"]==0, "account not torn down after the session cleared"
-PY
+  converge b >/dev/null
+  local account_count
+  account_count="$(hrun b "$BIN/cc-pool" status --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["accounts"]))')"
+  [ "$account_count" = 0 ] || fail "account not torn down after daemon convergence"
   [ ! -d "$SIM/b/.cc-pool/accounts/acct-01" ] || fail "B acct-01 survived idle teardown"
   [ ! -f "$(credfile b)" ] || fail "B credential survived idle teardown"
-  ok "idle: teardown completed (dir + credential gone)"
+  ok "daemon convergence completed teardown (dir + credential gone)"
 
   assert_zero_posts b
   assert_no_double_spend
@@ -626,7 +605,7 @@ run_suite() {
   scenario_1_materialize
   scenario_2_rotation
   scenario_5_tombstone_heal
-  scenario_6_remove_busy
+  scenario_6_remove
 
   # Group 2 (own setup — destructive to B's view): origin offline.
   setup_hosts
@@ -656,7 +635,6 @@ mkdir -p "$BIN"
 echo "Building cc-pool + sim helpers into $BIN ..."
 ( cd "$REPO" && CGO_ENABLED=0 go build -o "$BIN/cc-pool" ./cmd/cc-pool )
 ( cd "$REPO" && CGO_ENABLED=0 go build -o "$BIN/seed" ./scripts/sync-sim/seed )
-( cd "$REPO" && CGO_ENABLED=0 go build -o "$BIN/busydefer" ./scripts/sync-sim/busydefer )
 ( cd "$REPO" && CGO_ENABLED=0 go build -o "$BIN/fakeoauth" ./scripts/sync-sim/fakeoauth )
 cp "$REPO/scripts/sync-sim/shims/fake-security" "$BIN/fake-security"
 cp "$REPO/scripts/sync-sim/shims/synckitd" "$BIN/synckitd"

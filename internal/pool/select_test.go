@@ -1,10 +1,14 @@
 package pool
 
 import (
+	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -66,9 +70,7 @@ func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = st.Close() })
 			a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "s", KeychainAccount: "u"}
-			if err := st.UpsertAccount(a); err != nil {
-				t.Fatal(err)
-			}
+			a = persistTestAccount(t, st, a)
 			for _, sp := range tc.samples {
 				if err := st.InsertUsageSample(store.UsageSample{
 					AccountID:    1,
@@ -83,8 +85,8 @@ func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 				}
 			}
 
-			m := &Manager{Store: st, LockDir: t.TempDir()}
-			in, _, good, _, err := m.scoreInput(a, nil, now)
+			m := &Manager{Store: st}
+			in, _, good, _, err := m.scoreInput(t.Context(), a, nil, now)
 			if err != nil {
 				t.Fatalf("scoreInput: %v", err)
 			}
@@ -120,5 +122,50 @@ func TestScoreInputRateLimitedReadsLastGood(t *testing.T) {
 				t.Errorf("SampleTS = %v, want %v", in.SampleTS, tc.wantSampleTS)
 			}
 		})
+	}
+}
+
+func TestScoreInputMarksCredentialQuarantine(t *testing.T) {
+	st := openTestStore(t)
+	a := persistTestAccount(t, st, store.Account{
+		ID: 1, ConfigDir: t.TempDir(), KeychainService: "service", KeychainAccount: "account",
+	})
+	filePath := creds.FileCredentialPath(a.ConfigDir)
+	if _, err := st.QuarantineCredential(store.QuarantineCredentialRequest{
+		AccountID: a.ID, AccountInstanceID: a.InstanceID, AccountGeneration: a.Generation,
+		LocatorDigest:     store.CredentialLocatorDigest(a.KeychainService, a.KeychainAccount, filePath),
+		FileLocatorDigest: store.CredentialFileLocatorDigest(filePath),
+		Observation: store.CredentialExternalState{
+			Keychain: store.CredentialSlotObservation{State: store.CredentialSlotEmpty},
+			File:     store.CredentialSlotObservation{State: store.CredentialSlotEmpty},
+		},
+		Reason: store.CredentialResultAmbiguous, FailureClass: store.CredentialFailureInternal,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Store: st}
+	in, _, _, _, err := m.scoreInput(t.Context(), a, nil, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !in.CredentialQuarantined {
+		t.Fatal("score input omitted credential quarantine")
+	}
+	fk := credstest.NewFake()
+	replacement := &creds.Credential{}
+	replacement.ClaudeAiOauth.AccessToken = "at-replacement"
+	replacement.ClaudeAiOauth.RefreshToken = "rt-replacement"
+	replacement.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
+	fk.Put(a.KeychainService, a.KeychainAccount, replacement)
+	m.Creds = fk
+	in, _, _, _, err = m.scoreInput(t.Context(), a, nil, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.CredentialQuarantined {
+		t.Fatal("readable replacement remained quarantined and unselectable")
+	}
+	if _, err := st.CredentialQuarantine(a.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("replacement left quarantine behind: %v", err)
 	}
 }

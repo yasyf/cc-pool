@@ -1,23 +1,10 @@
 package daemon
 
-// policies_test.go is the incident-scar contract: it pins every self-heal policy
-// constant to its current literal so the daemon self-heal redesign (fpState →
-// ledger, rowRetry → ledger, streaks → ledger, registry cutover) cannot silently
-// drift a value. It owns VALUES only — behavior (breaker mutual reset,
-// park-not-retreat, edge latches) stays owned by the existing behavior suites.
-// The redesign will re-point identifiers; the literals must survive unchanged.
-//
-// healFuse's sentinel→outcome classification is deliberately NOT pinned here: it
-// is an inline switch reachable only by driving mountFuse, with side-effectful
-// arms (fallbackToSymlink) and combined-sentinel cases, so its membership can
-// only be asserted through behavior — which deepprobe_test.go and server_test.go
-// own.
+// policies_test.go pins product auth, rate-limit, polling, and sync constants.
 
 import (
 	"testing"
 	"time"
-
-	"github.com/yasyf/cc-pool/internal/pool"
 )
 
 // TestPolicyConstantsPinned freezes each self-heal policy constant against its
@@ -28,40 +15,6 @@ func TestPolicyConstantsPinned(t *testing.T) {
 		got  any
 		want any
 	}{
-		// fuse.remount — per-row remount backoff and the two mutually-resetting
-		// breakers. The breakers share one backoff clock and reset each other
-		// (structural; owned by the behavior suites, not pinned here).
-		{"fuse.remount/backoffBase", remountBackoffBase, 10 * time.Second},
-		{"fuse.remount/backoffCap", remountBackoffCap, 2 * time.Minute},
-		{"fuse.remount/hazardBreaker", remountBreakerThreshold, 5}, // escalateWedgedRow
-		{"fuse.remount/tccBreaker", tccBreakerThreshold, 6},        // escalateTCCBlockedRow
-
-		// fuse.deepwedge — deep-probe wedge verdict debounce on the ticker path.
-		// select-time forceWedge is zero-debounce (structural, not a constant).
-		{"fuse.deepwedge/strikes", deepWedgeStrikes, 2},
-
-		// fuse.shallowdead — holder shallow-dead (List-liveness) remount debounce.
-		{"fuse.shallowdead/strikes", shallowDeadStrikes, 2},
-
-		// fp.domain — File Provider wedge debounce, recovery backoff, park breaker.
-		{"fp.domain/strikes", fpWedgeStrikes, 2},
-		{"fp.domain/recoveryBackoffBase", fpRecoveryBackoff.Base, 30 * time.Second},
-		{"fp.domain/recoveryBackoffCap", fpRecoveryBackoff.Cap, 10 * time.Minute},
-		{"fp.domain/recoveryBreaker", fpRecoveryBreaker, 5},
-
-		// fp.bridge — content-bridge verdict debounce (verdict-only, no breaker).
-		{"fp.bridge/strikes", fpBridgeStrikes, 2},
-
-		// fp.app — companion-app ensure: the fixed launch backoff window (no
-		// debounce, no breaker; structural, owned by the fpapp behavior suite).
-		{"fp.app/ensureBackoff", fpAppEnsureBackoff, time.Minute},
-
-		// fp.orphan — orphaned-domain reap: the confirmation debounce and the fixed
-		// failed-remove retry backoff.
-		{"fp.orphan/reapStrikes", fpOrphanReapStrikes, 3},
-		{"fp.orphan/reapBackoffBase", fpOrphanReapBackoff.Base, 5 * time.Minute},
-		{"fp.orphan/reapBackoffCap", fpOrphanReapBackoff.Cap, 5 * time.Minute},
-
 		// auth.streak — definitive needs-login verdicts before polls throttle.
 		{"auth.streak/needsLoginAfter", needsLoginAfter, 3},
 		{"auth.streak/needsLoginPollInterval", needsLoginPollInterval, 15 * time.Minute},
@@ -71,22 +24,14 @@ func TestPolicyConstantsPinned(t *testing.T) {
 		{"ratelimit/backoffBase", rateLimitBackoffBase, 3 * time.Minute},
 		{"ratelimit/backoffCap", rateLimitBackoffCap, 30 * time.Minute},
 
-		// tickers — heal cadence plus the steady/outage poll cadences with jitter.
-		{"tickers/healInterval", defaultHealInterval, 10 * time.Second},
+		// Poll cadences with jitter.
 		{"tickers/basePollInterval", basePollInterval, 180 * time.Second},
 		{"tickers/pollJitter", pollJitter, 30 * time.Second},
 		{"tickers/outagePollInterval", outagePollInterval, 20 * time.Second},
 		{"tickers/outageJitter", outageJitter, 5 * time.Second},
 
-		// sync engine policy — the heal-pull timeout and mirror queue bound, pinned
-		// against accidental drift.
+		// Sync engine heal-pull timeout.
 		{"sync-drift-guards/syncHealTimeout", syncHealTimeout, 15 * time.Second},
-		{"sync-drift-guards/credMirrorQueueSize", credMirrorQueueSize, 64},
-
-		// registry cutover (B2) — minimum companion version gating FP hosting.
-		// Compile-visible from daemon (it already imports pool); pinned here so a
-		// bump is a deliberate edit to this contract.
-		{"registry/minWidgetVersion", pool.MinWidgetVersion, "v0.55.0"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

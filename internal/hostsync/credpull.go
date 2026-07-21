@@ -18,10 +18,10 @@ import (
 
 // MethodFetchCredential is the credential fetch RPC — the only path a
 // credential ever crosses between hosts, always stripped of its refresh
-// token; namespaced under ccp. clear of the svc.* contract. The name is
-// deliberately NOT v1's "ccp.fetch_credential", which served the full
-// refresh-token-bearing blob: a v2 client against a v1 origin (or vice versa)
-// gets unknown-method, so a secret can never cross a mixed-version pair.
+// token; namespaced under ccp. clear of the svc.* contract. Its name is
+// deliberately distinct from the removed "ccp.fetch_credential", which served
+// the full refresh-token-bearing blob. The fresh v1 protocol never registers
+// that method, so a stale caller receives unknown-method without a secret.
 const MethodFetchCredential = "ccp.fetch_stripped_credential" //nolint:gosec // G101: a JSON-RPC method name, not a credential
 
 // FetchTimeout bounds each per-peer fetch attempt; a var so tests shrink it.
@@ -46,8 +46,8 @@ type CredentialEnvelope struct {
 // store.(*Store).GetAccountByUUID satisfies it.
 type AccountLookup func(uuid string) (store.Account, bool, error)
 
-// CredentialReader reads an account's credential under its per-account lock;
-// it must never refresh or write — the fetch handler is strictly read-only.
+// CredentialReader reads an account without taking a mutation lane; it must
+// never refresh or write — the fetch handler is strictly read-only.
 type CredentialReader func(ctx context.Context, a store.Account) (*creds.Credential, error)
 
 // NewFetchCredentialHandler returns the daemon-side MethodFetchCredential

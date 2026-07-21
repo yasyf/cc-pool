@@ -7,8 +7,6 @@ import WidgetKit
     CCPoolStatusWidget()
 } timeline: {
     StatusEntry(date: .now, state: .ok(.sample, stale: false))
-    StatusEntry(date: .now, state: .ok(.samplePrePace, stale: false))
-    StatusEntry(date: .now, state: .ok(.sampleLegacy, stale: false))
     StatusEntry(date: .now, state: .ok(.sample, stale: true))
     StatusEntry(date: .now, state: .noFile)
 }
@@ -17,8 +15,6 @@ import WidgetKit
     CCPoolStatusWidget()
 } timeline: {
     StatusEntry(date: .now, state: .ok(.sample, stale: false))
-    StatusEntry(date: .now, state: .ok(.samplePrePace, stale: false))
-    StatusEntry(date: .now, state: .ok(.sampleLegacy, stale: false))
     StatusEntry(date: .now, state: .unreadable)
 }
 

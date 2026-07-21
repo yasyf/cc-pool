@@ -2,172 +2,98 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"time"
 
-	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/synckit/converge"
 )
-
-// serverSessions answers the hostsync Sessions seam from daemon truth: a live
-// session, select reservation, or in-flight conversion on any row sharing the
-// uuid reads busy; errors propagate — teardown fails closed — see ccn 10bf17d.
-type serverSessions struct{ s *Server }
-
-// Busy implements hostsync.Sessions.
-func (ss serverSessions) Busy(ctx context.Context, uuid string) (bool, string, error) {
-	rows, err := ss.s.m.Store.AccountsByUUID(uuid)
-	if err != nil {
-		return false, "", fmt.Errorf("resolve accounts for %s: %w", uuid, err)
-	}
-	if len(rows) == 0 {
-		return false, "", nil
-	}
-	sessions, err := ss.s.scan(ctx)
-	if err != nil {
-		return false, "", fmt.Errorf("scan sessions: %w", err)
-	}
-	for _, a := range rows {
-		switch {
-		case ss.s.cl.held(a.ID):
-			return true, fmt.Sprintf("acct-%02d overlay conversion in flight", a.ID), nil
-		case ss.s.cl.reservedCount(a.ID) > 0:
-			return true, fmt.Sprintf("acct-%02d reserved by a launching select", a.ID), nil
-		}
-		if n := procscan.CountByConfigDir(sessions, a.ConfigDir); n > 0 {
-			return true, fmt.Sprintf("acct-%02d has %d live session(s)", a.ID, n), nil
-		}
-		// A select handout holds the session lease before its claude is visible to
-		// procscan; a held lease reports busy so a peer-driven removal defers. An
-		// UNREADABLE lease root must fail CLOSED — read busy and surface the error — so
-		// destructive removal never proceeds on an indeterminate probe.
-		switch held, herr := ss.s.m.SessionLeaseHeld(a); {
-		case herr != nil:
-			return true, fmt.Sprintf("acct-%02d session-lease probe failed, assuming busy", a.ID),
-				fmt.Errorf("probe session lease for acct-%02d: %w", a.ID, herr)
-		case held:
-			return true, fmt.Sprintf("acct-%02d has a held session lease (a live session or launch)", a.ID), nil
-		}
-	}
-	return false, "", nil
-}
-
-var _ hostsync.Sessions = serverSessions{}
 
 // setupSync constructs the host-sync engine and wires it onto the daemon.
 // Always constructed — every acting path re-reads the sync_enabled meta, so
-// enable needs no daemon restart — and it must run before serve spawns any
-// worker or handler: they read s.syncPull / s.authKind unlocked.
+// enable needs no daemon restart — and it must run before serve admits any
+// handler: handlers read s.syncPull / s.authKind unlocked.
 func (s *Server) setupSync(ctx context.Context) error {
 	if s.syncSocket == "" {
 		return fmt.Errorf("no sync socket path configured")
-	}
-	manifestPath, err := hostsync.ManifestPath()
-	if err != nil {
-		return err
 	}
 	self, err := s.resolveSyncSelf(ctx)
 	if err != nil {
 		return err
 	}
+	if s.disposableWorkers == nil {
+		return errors.New("sync requires daemon disposable workers")
+	}
+	workerExecutable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve credential settlement worker executable: %w", err)
+	}
 
 	svc := &hostsync.Service{
-		M:        s.m,
 		Registry: hostsync.NewRegistryFile(pool.SyncDir()),
 		StampDir: pool.SyncStampsDir(),
 		Log:      s.log,
-		Locals:   hostsync.ManagerLocals(s.m, self, time.Now),
-		Mesh:     hostsync.SynckitMesh{},
-		Sessions: serverSessions{s: s},
-		Status:   converge.NewPeerStatus(),
-		Fetcher:  hostsync.NewSSHFetcher(),
 	}
-	pull := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, localExpiresAt int64, peers []string) (*creds.Credential, error) {
-		return hostsync.FetchCredential(ctx, hostsync.PeerTransport, uuid, chain, localExpiresAt, peers)
+	settler := newCredentialWriteSettler(
+		s.disposableWorkers,
+		workerExecutable,
+		s.syncEnabled,
+		*svc.Registry,
+		svc.StampDir,
+		self,
+	)
+	previousBuilder := s.m.BuildCredentialWritePublication
+	previousSettler := s.m.SettleCredentialWrite
+	wired := false
+	defer func() {
+		if wired {
+			return
+		}
+		s.m.BuildCredentialWritePublication = previousBuilder
+		s.m.SettleCredentialWrite = previousSettler
+	}()
+	s.m.BuildCredentialWritePublication = credentialWritePublicationBuilder(self)
+	s.m.SettleCredentialWrite = settler.Settle
+	if err := s.m.SettlePendingCredentialWrites(ctx); err != nil {
+		return fmt.Errorf("settle pending credential writes: %w", err)
 	}
-	svc.Driver = hostsync.NewDriver(svc, hostsync.DriverDeps{
-		Store:      s.m.Store,
-		Cred:       s.m,
-		LocalIndex: hostsync.ManagerLocalIndex(s.m),
-		Materialize: func(ctx context.Context, v hostsync.AccountValue, peers []string) (hostsync.MaterializeResult, error) {
-			// A materializing account has no local chain: any verified envelope wins.
-			noLocal := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, peers []string) (*creds.Credential, error) {
-				return pull(ctx, uuid, chain, 0, peers)
-			}
-			return svc.Materialize(ctx, v, peers, noLocal, manifestPath)
-		},
-		Pull: pull,
-	})
 
-	if err := s.startSyncServer(ctx, svc); err != nil {
+	worker, err := hostsync.NewWorkerClient(s.disposableWorkers, workerExecutable)
+	if err != nil {
+		return err
+	}
+	if err := s.startSyncServer(ctx, worker, worker.FetchCredentialHandler); err != nil {
 		return err
 	}
 	s.syncSvc = svc
 	s.syncSelf = self
+	s.syncAuthKind = worker.AuthKind
 	s.syncPull = func(ctx context.Context) error {
-		if !s.syncEnabledBool() {
+		_, err := worker.Reconcile(ctx, "")
+		if errors.Is(err, hostsync.ErrSyncDisabled) {
 			return nil
 		}
-		_, err := svc.Converge(ctx, "")
 		return err
 	}
-	mirror := newCredMirror(s.gatedNote(svc), self, s.log)
-	s.m.OnCredWrite = mirror.Hook
-	s.wg.Add(1)
-	go func() { defer s.wg.Done(); mirror.Run(ctx) }()
+	wired = true
 	return nil
 }
 
-// authKind classifies a needs-login at persist time via the sync registry: a
-// synced entry whose chain names a different origin is awaiting-origin (this
-// host only waits for the origin's rotation); everything else — sync off, no
-// uuid, no entry, or this host is the origin — is owned. A registry read failure
-// degrades to owned, never blocking the needs-login flag.
-func (s *Server) authKind(a store.Account) store.AuthKind {
-	if s.syncSvc == nil || !s.syncEnabledBool() || a.AccountUUID == "" {
-		return store.AuthKindOwned
+// authKind classifies a needs-login at persist time in the disposable worker.
+// An absent worker or an unprovable registry owner is an error, never Owned.
+func (s *Server) authKind(ctx context.Context, a store.Account) (store.AuthKind, error) {
+	if a.AccountUUID == "" {
+		return store.AuthKindOwned, nil
 	}
-	reg, err := s.syncSvc.Registry.Load()
-	if err != nil {
-		s.log.Printf("acct-%02d auth-kind registry load: %v", a.ID, err)
-		return store.AuthKindOwned
+	if s.syncAuthKind == nil {
+		return "", errors.New("auth-kind worker is unavailable")
 	}
-	e, ok := reg[a.AccountUUID]
-	if !ok || !e.Present() {
-		return store.AuthKindOwned
-	}
-	if e.Value.Chain.Origin == "" {
-		// An origin-less entry (PublishAccount rejects these; legacy or foreign
-		// writers may not) names an unknown minting host: owned only when this
-		// host provably holds the refresh token.
-		if cred, _, err := s.m.ReadCredential(a); err == nil && cred.HasRefreshToken() {
-			return store.AuthKindOwned
-		}
-		return store.AuthKindAwaitingOrigin
-	}
-	if e.Value.Chain.Origin != s.syncSelf {
-		return store.AuthKindAwaitingOrigin
-	}
-	return store.AuthKindOwned
+	return s.syncAuthKind(ctx, a.ID, a.AccountUUID)
 }
 
-// gatedNote wraps NoteCredWrite behind the per-call enable check, so a
-// disabled pool's cred writes leave no registry or stamp residue.
-func (s *Server) gatedNote(svc *hostsync.Service) func(context.Context, string, hostsync.ChainStamp) error {
-	return func(ctx context.Context, uuid string, chain hostsync.ChainStamp) error {
-		if !s.syncEnabledBool() {
-			return nil
-		}
-		return svc.NoteCredWrite(ctx, uuid, chain)
-	}
-}
-
-// syncEnabledBool adapts syncEnabled for the gate and mirror; a meta read
+// syncEnabledBool adapts syncEnabled for acting paths; a meta read
 // failure reads disabled — sync must never take down single-host pooling.
 func (s *Server) syncEnabledBool() bool {
 	on, err := s.syncEnabled()

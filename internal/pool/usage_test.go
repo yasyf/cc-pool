@@ -20,17 +20,16 @@ import (
 func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("USER", "user")
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	svc := creds.ServiceName("/tmp/ccp-test/acct-01")
-	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: svc, KeychainAccount: "user", OverlayKind: "symlink"}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	configDir := AccountDir(1)
+	svc := creds.ServiceName(configDir)
+	a := store.Account{ID: 1, ConfigDir: configDir, KeychainService: svc, KeychainAccount: "user"}
+	a = persistTestAccount(t, st, a)
 
 	fk := credstest.NewFake()
 	cred := &creds.Credential{}
@@ -40,7 +39,9 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Minute).UnixMilli()
 	fk.Put(svc, a.KeychainAccount, cred)
 	fo := &fakeOAuth{currentRT: "rt-0"}
-	m := &Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()}
+	m := &Manager{Store: st, OAuth: fo, Creds: fk}
+	bindTestWorkerAuthority(t, m, "default-keychain")
+	installTestBackingRunner(m)
 
 	if _, _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true}); err != nil {
 		t.Fatalf("SampleUsage: %v", err)
@@ -77,15 +78,13 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 // verbatim (status and the exhausted-fallback billing warning read them there) —
 // a mapping each layer's isolated tests would miss if dropped.
 func TestSampleUsagePersistsExtraUsage(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user", OverlayKind: "symlink"}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user"}
+	a = persistTestAccount(t, st, a)
 
 	fk := credstest.NewFake()
 	cred := &creds.Credential{}
@@ -93,7 +92,8 @@ func TestSampleUsagePersistsExtraUsage(t *testing.T) {
 	cred.ClaudeAiOauth.RefreshToken = "rt-0"
 	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli() // fresh: no refresh needed
 	fk.Put(a.KeychainService, a.KeychainAccount, cred)
-	m := &Manager{Store: st, OAuth: &fakeOAuth{currentRT: "rt-0"}, Creds: fk, LockDir: t.TempDir()}
+	m := &Manager{Store: st, OAuth: &fakeOAuth{currentRT: "rt-0"}, Creds: fk}
+	bindTestWorkerAuthority(t, m, "usage-persistence")
 
 	if _, _, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: false}); err != nil {
 		t.Fatalf("SampleUsage: %v", err)
@@ -141,16 +141,14 @@ func TestRecordSampleCollapsesScoped(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+			st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = st.Close() })
 			a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user"}
-			if err := st.UpsertAccount(a); err != nil {
-				t.Fatal(err)
-			}
-			m := &Manager{Store: st, LockDir: t.TempDir()}
+			a = persistTestAccount(t, st, a)
+			m := &Manager{Store: st}
 			m.recordSample(1, &oauth.Usage{
 				FiveHour:     oauth.Window{Utilization: 12},
 				SevenDay:     oauth.Window{Utilization: 60},

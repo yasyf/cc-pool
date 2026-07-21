@@ -2,27 +2,14 @@ package daemon
 
 import (
 	"context"
-	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// This file declares the daemon's maintenance passes as data: three ordered
-// maintainer tables (poll, heal, startup) run by runTable, over a shared per-pass
-// tick that carries one session scan. The passes' bodies live in their own files
-// (scheduler.go, holder.go, fpheal.go, strandheal.go, server.go); the rows here
-// only name them and fix their order — a reorder is a diff a reviewer must
-// confront (registry_test.go pins each table's order by name). Cadence (both
-// tickers), the holder-loss edge trigger, and the request-scoped RPC handlers are
-// deliberately NOT rows — see their notes below.
-
-// tick is one immutable view of the daemon-wide session heartbeat.
 type tick struct {
 	snapshot heartbeatSnapshot
 }
 
-// newTick snapshots the shared heartbeat. The first test/startup consumer
-// initializes it synchronously; production starts the heartbeat before workers.
 func (s *Server) newTick(ctx context.Context) *tick {
 	h := s.heartbeatFor()
 	snapshot := h.view()
@@ -32,38 +19,19 @@ func (s *Server) newTick(ctx context.Context) *tick {
 	return &tick{snapshot: snapshot}
 }
 
-// scanOK reports whether this tick's session scan succeeded.
 func (t *tick) scanOK() bool { return t.snapshot.lastScanOK }
 
-// idle reports whether dir is idle in a currently successful heartbeat. Failed
-// refreshes retain counts for diagnostics but make every dir non-idle, so token
-// refresh and destructive maintenance fail closed while liveness is unknown.
-func (t *tick) idle(dir string) bool {
-	return t.snapshot.idle(dir)
-}
+func (t *tick) idle(dir string) bool { return t.snapshot.idle(dir) }
 
-// sessionCount returns dir's count from the last successful heartbeat.
-func (t *tick) sessionCount(dir string) int {
-	return t.snapshot.sessionCount(dir)
-}
+func (t *tick) sessionCount(dir string) int { return t.snapshot.sessionCount(dir) }
 
-// claimScope documents a maintainer row's per-account claim discipline. It is
-// declarative — the claim itself is taken inside each pass body (or forEach); the
-// field states the contract a reader relies on, and registry_test.go pins it.
 type claimScope int
 
 const (
-	// claimNone: the row takes no per-account claim (pool-wide or process work).
 	claimNone claimScope = iota
-	// claimPerAccount: the row claims each account it mutates with the poll claim.
 	claimPerAccount
 )
 
-// maintainer is one declared maintenance pass: a named, claim-scoped unit the tick
-// runners execute in table order. gate (nil ⇒ always) decides whether the row runs
-// this tick; run reports whether the runner should continue to the next row —
-// false stops the table (a poll that entered outage skips the status snapshot,
-// mirroring pollOnce's early returns exactly).
 type maintainer struct {
 	name       string
 	claimScope claimScope
@@ -71,84 +39,32 @@ type maintainer struct {
 	run        func(s *Server, ctx context.Context, t *tick) bool
 }
 
-// runTable executes table in order over one shared tick: skip a gated-out row,
-// stop when a row returns false, and never begin another row after cancellation.
 func (s *Server) runTable(ctx context.Context, t *tick, table []maintainer) {
-	for _, m := range table {
+	for _, maintainer := range table {
 		if ctx.Err() != nil || s.closing.Load() {
 			return
 		}
-		if m.gate != nil && !m.gate(s) {
+		if maintainer.gate != nil && !maintainer.gate(s) {
 			continue
 		}
-		if !m.run(s, ctx, t) {
+		if !maintainer.run(s, ctx, t) {
 			return
 		}
 	}
 }
 
-// runDueTable executes only rows whose individual clocks are due, preserving
-// table order and advancing each clock before its gate/run body. A failed or
-// gated row therefore cannot spin the maintenance loop; its own recovery ledger
-// still controls any finer-grained backoff inside the body.
-func (s *Server) runDueTable(
-	ctx context.Context,
-	t *tick,
-	table []maintainer,
-	due map[string]time.Time,
-	now time.Time,
-	interval func(string) time.Duration,
-) time.Time {
-	var next time.Time
-	for _, m := range table {
-		if ctx.Err() != nil || s.closing.Load() {
-			return next
-		}
-		rowDue, scheduled := due[m.name]
-		if scheduled && now.Before(rowDue) {
-			if next.IsZero() || rowDue.Before(next) {
-				next = rowDue
-			}
-			continue
-		}
-		cadence := interval(m.name)
-		if cadence <= 0 {
-			cadence = defaultHealInterval
-		}
-		rowDue = now.Add(cadence)
-		due[m.name] = rowDue
-		if next.IsZero() || rowDue.Before(next) {
-			next = rowDue
-		}
-		if m.gate != nil && !m.gate(s) {
-			continue
-		}
-		if !m.run(s, ctx, t) {
-			return next
-		}
-	}
-	return next
-}
-
-// pollTable is the scheduler poll pass. Deliberately no fp row: File Provider
-// recovery is owned exclusively by the backoff-gated heal ticker (probe + recovery
-// ladder), so a Check+Reconcile on every poll would be the reconcile storm that
-// removing the inline FP path fixed — with the registry this exclusion is now
-// structural (registry_test.go asserts it). account.poll's body stays whole
-// (outage canary, inline healFuse fallback, AdoptRotatedToken, SampleUsage, auth
-// outcome) and returns false on every skip-the-snapshot condition, exactly as
-// pollOnce returned.
 var pollTable = []maintainer{
-	{"holder.refresh", claimNone, nil, func(s *Server, _ context.Context, _ *tick) bool {
-		s.holder.refresh(s.holderClient())
-		return true
-	}},
-	{"widget.stale", claimNone, nil, func(s *Server, ctx context.Context, _ *tick) bool {
-		s.reconcileStaleWidget(ctx)
-		return true
-	}},
 	{"sticky.prune", claimNone, nil, func(s *Server, _ context.Context, _ *tick) bool {
 		s.pruneStickyRows()
+		return true
+	}},
+	{"credential.receipts.prune", claimNone, nil, func(s *Server, _ context.Context, _ *tick) bool {
+		deleted, err := s.m.Store.DeleteExpiredCredentialOperationReceipts(store.CredentialOperationPageLimit)
+		if err != nil {
+			s.log.Printf("prune credential receipts: %v", err)
+		} else if deleted == store.CredentialOperationPageLimit {
+			s.log.Printf("pruned %d expired credential receipts; more remain for the next bounded pass", deleted)
+		}
 		return true
 	}},
 	{"account.poll", claimPerAccount, nil, func(s *Server, ctx context.Context, t *tick) bool {
@@ -162,184 +78,13 @@ var pollTable = []maintainer{
 	}},
 }
 
-// healTable is the per-account mount-health net (the heal ticker body). holder
-// cache first (the ticker outpaces the poll's refresh); then fp.app.ensure
-// relaunches the companion app whose death would otherwise park every FP probe
-// on NoVerdict forever, at tick start so probe coverage resumes the tick after a
-// respawn; then the fuse/FP self-heal families (fp.bridge.health explains a stalled
-// bridge before fp.heal probes through it); then fp.orphan.reap deregisters
-// rowless leaked domains (after fp.heal so a legit domain's own recovery runs
-// first, before strand.heal's row-driven leak sweep); then content-source health
-// logging (gated on a configured source).
-var healTable = []maintainer{
-	{"holder.refresh", claimNone, nil, func(s *Server, _ context.Context, _ *tick) bool {
-		s.holder.refresh(s.holderClient())
-		return true
-	}},
-	{"fp.app.ensure", claimNone, (*Server).shouldEnsureFPApp, func(s *Server, ctx context.Context, _ *tick) bool {
-		s.ensureFPAppAsync(ctx)
-		return true
-	}},
-	{"fuse.remount", claimPerAccount, nil, func(s *Server, ctx context.Context, t *tick) bool {
-		s.retryUnvouchedFuseRows(ctx, t)
-		return true
-	}},
-	{"fp.bridge.health", claimNone, func(s *Server) bool { return s.contentSource != nil }, func(s *Server, ctx context.Context, _ *tick) bool {
-		s.recordFPBridgeHealth(ctx)
-		return true
-	}},
-	{"fp.heal", claimPerAccount, nil, func(s *Server, ctx context.Context, _ *tick) bool {
-		s.healFPRows(ctx)
-		return true
-	}},
-	{"fp.orphan.reap", claimNone, (*Server).fpEnabled, func(s *Server, ctx context.Context, _ *tick) bool {
-		s.sweepOrphanFPDomains(ctx)
-		return true
-	}},
-	{"fp.app.reap", claimNone, (*Server).shouldReapFPApp, func(s *Server, ctx context.Context, _ *tick) bool { s.reconcileStaleFPApp(ctx); return true }},
-	{"strand.heal", claimPerAccount, nil, func(s *Server, ctx context.Context, t *tick) bool {
-		s.healStrandedRows(ctx, t)
-		return true
-	}},
-	{"content.health", claimNone, func(s *Server) bool { return s.contentSource != nil }, func(s *Server, _ context.Context, _ *tick) bool {
-		s.logContentHealth()
-		return true
-	}},
-}
-
-// startupTable is the ordered one-shot the serve goroutine runs before the heal
-// loop and scheduler start. bridge.content and bridge.fp bind before any mount or
-// FP enumeration registers; holder.refresh primes the mount cache before selects
-// key on it; ua.detect only stamps the OAuth UA; fp.app.ensure (non-blocking,
-// after bridge.fp settles consent) warms the companion app in parallel so the
-// first FP account's reconcile finds it up rather than eating the cold ~30s
-// spawn serially; overlays.reconcile must finish
-// first (it and the loops both touch fuse Reconcile). Carcass clearing is the shared
-// holder's job now, so the startup reconcile sweeps nothing. bridge.fp wraps
-// today's in-daemon FP-bridge bind unchanged.
 var startupTable = []maintainer{
 	{"session.heartbeat", claimNone, nil, func(s *Server, ctx context.Context, _ *tick) bool {
 		s.startHeartbeat(ctx)
-		return true
-	}},
-	{"bridge.content", claimNone, nil, func(s *Server, ctx context.Context, _ *tick) bool {
-		s.startContentBridge(ctx)
-		return true
-	}},
-	{"bridge.fp", claimNone, nil, func(s *Server, ctx context.Context, _ *tick) bool {
-		s.startFPBridge(ctx)
-		return true
-	}},
-	{"holder.refresh", claimNone, nil, func(s *Server, _ context.Context, _ *tick) bool {
-		s.holder.refresh(s.holderClient())
 		return true
 	}},
 	{"ua.detect", claimNone, nil, func(s *Server, ctx context.Context, _ *tick) bool {
 		s.detectAndSetUserAgent(ctx)
 		return true
 	}},
-	{"fp.app.ensure", claimNone, (*Server).shouldEnsureFPApp, func(s *Server, ctx context.Context, _ *tick) bool {
-		s.ensureFPAppAsync(ctx)
-		return true
-	}},
-	{"overlays.reconcile", claimPerAccount, nil, func(s *Server, ctx context.Context, _ *tick) bool {
-		s.reconcileOverlays(ctx)
-		return true
-	}},
-	{"content.coordinator", claimNone, func(s *Server) bool { return s.overlayCoordinator != nil }, func(s *Server, ctx context.Context, _ *tick) bool {
-		s.overlayCoordinator.start(ctx)
-		return true
-	}},
-}
-
-// rowKind selects which overlay-backed accounts a heal-family pass iterates.
-type rowKind int
-
-const (
-	fuseRows rowKind = iota
-	fpRows
-	symlinkRows
-)
-
-// String names the kind for the list-accounts error log.
-func (k rowKind) String() string {
-	switch k {
-	case fuseRows:
-		return "fuse"
-	case fpRows:
-		return "file provider"
-	default:
-		return "stranded-row"
-	}
-}
-
-// accountsOf lists the accounts whose overlay backend matches kind.
-func (s *Server) accountsOf(kind rowKind) ([]store.Account, error) {
-	switch kind {
-	case fuseRows:
-		return s.fuseAccounts()
-	case fpRows:
-		return s.fpAccounts()
-	default:
-		return s.symlinkAccounts()
-	}
-}
-
-// symlinkAccounts lists the accounts on the symlink overlay (neither fuse nor File
-// Provider) — the only rows that can strand crash-window wreckage.
-func (s *Server) symlinkAccounts() ([]store.Account, error) {
-	accts, err := s.m.Store.ListAccounts()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]store.Account, 0, len(accts))
-	for _, a := range accts {
-		if !fpBackedRow(a.OverlayKind) && !fuseBackedRow(a.OverlayKind) {
-			out = append(out, a)
-		}
-	}
-	return out, nil
-}
-
-// claimed runs fn under a poll claim on a (hold → skip-don't-race if refused → run
-// → disownHold). The shared claim wrapper the heal-family loops apply to their
-// mutating section: same claim kind, same skip-don't-race behavior across all three.
-func (s *Server) claimed(a store.Account, fn func()) {
-	if !s.cl.hold(a.ID) {
-		return // skip-don't-race; the owner leaves it consistent
-	}
-	defer s.cl.disownHold(a.ID)
-	fn()
-}
-
-// forEach lists every account of kind and runs fn per account, stopping if ctx is
-// cancelled between accounts — the iterator the three heal-family row loops share.
-// It reports whether the full list was iterated (false on a list-accounts error or
-// a mid-iteration ctx cancellation) so a caller with an end-of-pass step gated on
-// completion — fuse.remount's remountPrune — runs it only then, exactly as the old
-// hand-written loop returned before pruning on those two conditions.
-//
-// claim=true wraps fn in the poll claim via claimed (strand.heal, whose only
-// pre-claim work is the kind filter forEach already applies). fuse.remount and
-// fp.heal pass claim=false and take the claim themselves inside fn via claimed,
-// because they must probe UNCLAIMED before claiming: a claim-first loop would skip
-// probing an account the scheduler is concurrently polling (its poll claim is
-// held), silently dropping that account's probe-strike bookkeeping.
-func (s *Server) forEach(ctx context.Context, kind rowKind, claim bool, fn func(a store.Account)) bool {
-	accts, err := s.accountsOf(kind)
-	if err != nil {
-		s.log.Printf("%s heal: list accounts: %v", kind, err)
-		return false
-	}
-	for _, a := range accts {
-		if ctx.Err() != nil {
-			return false
-		}
-		if claim {
-			s.claimed(a, func() { fn(a) })
-			continue
-		}
-		fn(a)
-	}
-	return true
 }

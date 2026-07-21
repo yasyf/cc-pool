@@ -7,30 +7,36 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"reflect"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/wire"
 )
 
+func TestControlPlaneEpochIsHardReset(t *testing.T) {
+	if BusinessBuild != "cc-pool.rpc.v1" {
+		t.Fatalf("business build = %q", BusinessBuild)
+	}
+	if SnapshotVersion != 1 {
+		t.Fatalf("snapshot version = %d", SnapshotVersion)
+	}
+}
+
 func TestServerRejectsLFProtocol(t *testing.T) {
 	s, _ := newTestServer(t)
-	called := make(chan struct{}, 1)
-	s.fpBridgeCheckFn = func(context.Context) FPBridgeStatus {
-		called <- struct{}{}
-		return FPBridgeStatus{Verdict: FPBridgeServing}
-	}
 	socket := serveHandlerOnSocket(t, s)
 	conn, err := net.Dial("unix", socket)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
-	if _, err := conn.Write([]byte("{\"op\":\"fpbridgecheck\"}\n")); err != nil {
+	if _, err := conn.Write([]byte("{\"op\":\"status\"}\n")); err != nil {
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
@@ -38,35 +44,99 @@ func TestServerRejectsLFProtocol(t *testing.T) {
 	if err := json.NewDecoder(conn).Decode(&response); err == nil {
 		t.Fatalf("LF client received a business response: %+v", response)
 	}
-	select {
-	case <-called:
-		t.Fatal("LF request reached a business handler")
-	default:
+}
+
+func TestClientRejectsMismatchedBuildBeforeDispatch(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		build string
+	}{
+		{name: "older", build: "0.0.1"},
+		{name: "newer", build: "9999.9999.9999"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int64
+			socket := serveBuildTestServer(t, test.build, &calls)
+			client := &Client{
+				socket: socket, build: version.String(),
+				sessions: make(map[*clientSession]struct{}),
+			}
+			t.Cleanup(func() { _ = client.Close() })
+			_, err := client.StatusContext(t.Context())
+			var callErr *CallError
+			if !errors.As(err, &callErr) || callErr.Outcome != wire.PreSendFailure ||
+				!errors.Is(err, ErrDaemonBuildMismatch) {
+				t.Fatalf("mismatched build err = %v, want pre-send ErrDaemonBuildMismatch", err)
+			}
+			if calls.Load() != 0 {
+				t.Fatalf("mismatched build dispatched %d handlers", calls.Load())
+			}
+			client.mu.Lock()
+			current, sessions := client.current, len(client.sessions)
+			client.mu.Unlock()
+			if current != nil || sessions != 0 {
+				t.Fatalf("mismatched build retained current=%p sessions=%d", current, sessions)
+			}
+		})
 	}
 }
 
-func TestServerRejectsMismatchedBuildBeforeDispatch(t *testing.T) {
-	s, _ := newTestServer(t)
-	called := make(chan struct{}, 1)
-	s.fpBridgeCheckFn = func(context.Context) FPBridgeStatus {
-		called <- struct{}{}
-		return FPBridgeStatus{Verdict: FPBridgeServing}
-	}
+func TestClientAdmitsExactBuild(t *testing.T) {
+	var calls atomic.Int64
+	socket := serveBuildTestServer(t, version.String(), &calls)
 	client := &Client{
-		socket:   serveHandlerOnSocket(t, s),
-		build:    "0.0.0-wrong",
+		socket: socket, build: version.String(),
 		sessions: make(map[*clientSession]struct{}),
 	}
-	t.Cleanup(func() { _ = client.Close() })
-	_, err := client.FPBridgeCheck()
-	var callErr *CallError
-	if !errors.As(err, &callErr) || callErr.Outcome != wire.Rejected {
-		t.Fatalf("mismatched build err = %v, want rejected CallError", err)
+	response, err := client.StatusContext(t.Context())
+	if err != nil || !response.OK {
+		t.Fatalf("exact build status = %+v, %v", response, err)
 	}
-	select {
-	case <-called:
-		t.Fatal("mismatched build reached a business handler")
-	default:
+	if calls.Load() != 1 {
+		t.Fatalf("exact build dispatched %d handlers, want 1", calls.Load())
+	}
+	client.mu.Lock()
+	current, sessions := client.current, len(client.sessions)
+	client.mu.Unlock()
+	if current == nil || sessions != 1 {
+		t.Fatalf("exact build retained current=%p sessions=%d, want one live session", current, sessions)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	current, sessions = client.current, len(client.sessions)
+	client.mu.Unlock()
+	if current != nil || sessions != 0 {
+		t.Fatalf("closed exact client retained current=%p sessions=%d", current, sessions)
+	}
+}
+
+func TestServerRejectsOldClientBuildBeforeBusinessDispatch(t *testing.T) {
+	var calls atomic.Int64
+	socket := serveBuildTestServer(t, version.String(), &calls)
+	ladder, err := operationLadder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
+		Dial: wire.UnixDialer(socket), Build: "0.0.1", Ladder: ladder,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.Call(t.Context(), wire.Op(OpStatus), "", []byte(`{"op":"status"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != wire.Rejected || result.Response.Reason != wire.ErrBuildMismatch.Error() {
+		t.Fatalf("old client result = %+v, want pre-dispatch build rejection", result)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("old client dispatched %d business handlers", calls.Load())
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -135,17 +205,6 @@ func TestClientSelectRequiresReachableDaemon(t *testing.T) {
 	}
 }
 
-func TestEnsureRunningAcceptsExactLifecycle(t *testing.T) {
-	s, _ := newTestServer(t)
-	client := &Client{socket: serveHandlerOnSocket(t, s), sessions: make(map[*clientSession]struct{})}
-	t.Cleanup(func() { _ = client.Close() })
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	if !client.EnsureRunning(ctx, time.Second) {
-		t.Fatal("EnsureRunning rejected an exact live daemon")
-	}
-}
-
 func TestStatusContextHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -187,45 +246,70 @@ func TestCommitSelectionPreCanceledDoesNotDial(t *testing.T) {
 	}
 }
 
-func TestHolderStatusWire(t *testing.T) {
-	b, err := json.Marshal(Response{OK: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(b), "holder") {
-		t.Fatalf("empty response leaked a holder key: %s", b)
-	}
-	in := Response{OK: true, Holder: &HolderStatus{Version: "9.9.9", Mounts: 2}}
-	b, err = json.Marshal(in)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out Response
-	if err := json.Unmarshal(b, &out); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(in.Holder, out.Holder) {
-		t.Fatalf("holder did not round-trip: %+v != %+v", out.Holder, in.Holder)
-	}
+type buildTestLifecycle struct{ build string }
+
+func (l buildTestLifecycle) Health(context.Context) (dkdaemon.Health, error) {
+	return dkdaemon.Health{
+		Build: l.build, Protocol: int(wire.ProtocolVersion), PID: os.Getpid(),
+		State: dkdaemon.StateHealthy,
+	}, nil
 }
 
-func TestHandleStatusCarriesHolderState(t *testing.T) {
-	s, _ := newTestServer(t)
-	resp := s.handleStatus(t.Context())
-	if !resp.OK || resp.Holder == nil {
-		t.Fatalf("status = %+v, want a holder view", resp)
+func (buildTestLifecycle) Shutdown(context.Context) error { return nil }
+func (buildTestLifecycle) Handoff(context.Context) error  { return nil }
+
+type buildTestProtectedClassifier struct{}
+
+func (buildTestProtectedClassifier) Validate() error { return nil }
+func (buildTestProtectedClassifier) Classify(context.Context, wire.Peer) (bool, error) {
+	return true, nil
+}
+func (buildTestProtectedClassifier) AuthorizeLifecycleBuild(string, string) bool { return true }
+
+func serveBuildTestServer(
+	t *testing.T,
+	build string,
+	calls *atomic.Int64,
+) string {
+	t.Helper()
+	socketDir, err := os.MkdirTemp("/tmp", "ccp-build-")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if resp.Holder.Version != "" || resp.Holder.Mounts != 0 {
-		t.Fatalf("zero-cache holder = %+v, want the unreachable shape", resp.Holder)
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socket := filepath.Join(socketDir, "daemon.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
 	}
-	s.holder.mu.Lock()
-	s.holder.healthy = true
-	s.holder.version = "0.0.9-old"
-	s.holder.mounts = map[string]bool{"/a": true, "/b": false}
-	s.holder.mu.Unlock()
-	resp = s.handleStatus(t.Context())
-	want := &HolderStatus{Version: "0.0.9-old", Mounts: 1}
-	if !reflect.DeepEqual(resp.Holder, want) {
-		t.Fatalf("holder = %+v, want %+v", resp.Holder, want)
+	ladder, err := operationLadder()
+	if err != nil {
+		t.Fatal(err)
 	}
+	server := &wire.Server{
+		Build: build, LifecycleBuild: build, Ladder: ladder,
+		MaxSessions: 2, ReservedProtectedSessions: 1,
+		ProtectedSessionClassifier: buildTestProtectedClassifier{},
+	}
+	server.RegisterConcurrent(wire.Op(OpStatus), func(context.Context, wire.Request) (any, error) {
+		calls.Add(1)
+		return Response{OK: true, Version: build}, nil
+	})
+	server.RegisterLifecycle(buildTestLifecycle{build: build})
+	intake := &drain.Intake{}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ctx, listener, func() error { return nil }, intake.Admit, intake.AdmitLifecycle)
+	}()
+	t.Cleanup(func() {
+		intake.Close()
+		_ = server.CloseIntake()
+		_ = intake.Settle(context.Background())
+		cancel()
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("serve build test socket: %v", err)
+		}
+	})
+	return socket
 }

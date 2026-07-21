@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# scripts/vm/vmctl — disposable tart VM harness for cc-pool File Provider
-# incident replay (fleet `ccp migrate --to fileprovider --force`). See
-# scripts/vm/README.md.
+# scripts/vm/vmctl — disposable tart VM harness for cc-pool's hard-cut FuseKit,
+# File Provider, TCC, and process-kill gates. See scripts/vm/README.md.
 #
 # ALL harness state lives under $VM_ROOT (default /tmp/ccpool-vm): VM disk, ssh
 # key, results, and — unless VMCTL_TART_HOME repoints it to a shared cache — the
@@ -28,13 +27,13 @@ usage() {
   cat <<'EOF'
 usage: scripts/vm/vmctl <command> [args]
 
-Disposable tart VM harness for cc-pool File Provider incident replay.
+Disposable tart VM harness for cc-pool's live FuseKit/File Provider gates.
 All harness state lives under $VM_ROOT (default /tmp/ccpool-vm).
 Details: scripts/vm/README.md.
 
 commands:
   create           install tart if missing (loud), clone the image, set cpu/mem/disk
-  provision        boot, ssh-key bootstrap, no-sleep, App-Group TCC, enable the FP extension
+  provision        boot, ssh-key bootstrap, no-sleep, enable the FP extension
   push             build cc-pool + the Developer ID-signed CCPoolStatus.app, install into the guest
   run <scenario>   execute a scenario under the panic watcher
   shell [cmd...]   ssh into the guest (interactive without args)
@@ -77,10 +76,8 @@ cmd_create() {
   log "created; next: vmctl provision"
 }
 
-# cmd_provision boots the guest and makes it replay-ready: ssh key, sudo, sleep
-# off, the App-Group-data TCC grant the daemon's File Provider bridge needs, and
-# — once the app has been pushed — the File Provider extension enabled. No
-# fuse-t or holder: the incident replay exercises only the File Provider path.
+# cmd_provision boots the guest and makes it test-ready: ssh key, sudo, sleep
+# off, and—once the app has been pushed—the File Provider extension enabled.
 cmd_provision() {
   cmd_create
   if ! vm_is_running; then
@@ -96,54 +93,16 @@ cmd_provision() {
   vm_assert_guest
   log "disabling guest sleep"
   vm_sudo "pmset -a sleep 0 displaysleep 0 disksleep 0"
-  provision_tcc
   # The FP extension can only be enabled once its host app is installed. If a
   # prior push already put it there, enable it now; otherwise push does it.
   if vm_ssh "test -d '$VMCTL_GUEST_APP'" >/dev/null 2>&1; then
-    fp_register_and_enable || warn "FP extension not yet enabled — see the click-Allow fallback (README: FP provisioning)"
+    fp_register_and_enable || warn "FP extension not yet enabled — see the GUI fallback (README: File Provider provisioning)"
   else
     log "FP extension enable deferred to 'vmctl push' (needs the app installed first)"
   fi
   log "provisioned; next: vmctl push"
 }
 
-# provision_tcc grants App-Group-data TCC (kTCCServiceSystemPolicyAppData) to
-# VMCTL_TCC_APPDATA_CLIENTS by writing the guest's system TCC.db directly —
-# possible only when the image ships with SIP disabled (cirruslabs images do).
-# It pre-authorizes the daemon's first bind of the File Provider bridge socket
-# inside the CCPoolStatus App Group container, which macOS otherwise gates behind
-# a one-time GUI prompt a headless guest cannot answer. The service is a best
-# guess (the app-group-data prompt is undocumented); if it does not take, the
-# daemon logs "awaiting the one-time app-group-container consent" and the fix is
-# the VMCTL_GRAPHICS=1 click-Allow path (README: FP provisioning). The replay
-# scenario proves the grant end-to-end when its through-domain reads succeed.
-provision_tcc() {
-  if [[ -n "${VMCTL_SKIP_TCC:-}" ]]; then
-    log "VMCTL_SKIP_TCC set — NOT pre-seeding the App-Group-data TCC grant (the no-prompt scenario proves the daemon bundle self-authorizes the bind)"
-    return 0
-  fi
-  local status client ctype
-  status="$(vm_ssh csrutil status 2>/dev/null)" || status=""
-  if [[ "$status" != *disabled* ]]; then
-    warn "guest SIP is enabled — cannot write the App-Group-data TCC grant directly"
-    warn "fallback: VMCTL_GRAPHICS=1 vmctl provision, then click Allow when the daemon first binds (README: FP provisioning)"
-    return 0
-  fi
-  # shellcheck disable=SC2086 # VMCTL_TCC_APPDATA_CLIENTS is a space-separated list by contract
-  for client in $VMCTL_TCC_APPDATA_CLIENTS; do
-    ctype=0
-    [[ "$client" == /* ]] && ctype=1
-    log "granting App-Group-data (kTCCServiceSystemPolicyAppData) TCC to $client (client_type=$ctype)"
-    if ! printf "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier,flags) VALUES ('kTCCServiceSystemPolicyAppData','%s',%d,2,4,1,'UNUSED',0);\n" "$client" "$ctype" |
-      vm_ssh "sudo -n -- sqlite3 '/Library/Application Support/com.apple.TCC/TCC.db'"; then
-      warn "TCC insert failed for $client — use the VMCTL_GRAPHICS=1 click-Allow path (README: FP provisioning)"
-      return 0
-    fi
-  done
-  # tccd caches the db; a respawn re-reads it.
-  vm_sudo "pkill tccd || true"
-  log "App-Group-data TCC grants written"
-}
 
 # cmd_push delegates to the repo-specific build+install seam.
 cmd_push() { exec "$SCRIPT_DIR/push.sh" "$@"; }
@@ -227,7 +186,8 @@ cmd_run() {
   SCENARIO_PGID=$!
   set +m
 
-  local panicked=0 tart_relaunches=0 scenario_rc="" end_reason="" unreach=0 bt nb np
+  local reboot_marker="$results/intentional-reboot"
+  local panicked=0 tart_relaunches=0 intentional_reboots=0 scenario_rc="" end_reason="" unreach=0 bt nb np
   while :; do
     if (($(date +%s) >= deadline)); then
       end_reason="timeout"
@@ -263,6 +223,10 @@ cmd_run() {
           panicked=1
           end_reason="panic"
           break
+        elif [[ -f "$reboot_marker" ]]; then
+          intentional_reboots=$((intentional_reboots + 1))
+          rm -f "$reboot_marker"
+          log "accepted intentional reboot $intentional_reboots after a clean panic-report check"
         fi
       else
         warn "guest did not come back after the tart relaunch"
@@ -274,10 +238,24 @@ cmd_run() {
     if bt="$(vm_boottime)"; then
       unreach=0
       if [[ "$bt" != "$boot_ref" ]]; then
-        log "guest boottime changed ($boot_ref -> $bt): kernel panic (reboot in place)"
-        panicked=1
-        end_reason="panic"
-        break
+        if [[ -f "$reboot_marker" ]]; then
+          np="$(vm_new_panic_count)" || np=0
+          if [[ "$np" != "0" ]]; then
+            log "intentional reboot produced $np new panic report(s)"
+            panicked=1
+            end_reason="panic"
+            break
+          fi
+          intentional_reboots=$((intentional_reboots + 1))
+          rm -f "$reboot_marker"
+          log "accepted intentional reboot $intentional_reboots ($boot_ref -> $bt)"
+          boot_ref="$bt"
+        else
+          log "guest boottime changed ($boot_ref -> $bt): kernel panic (reboot in place)"
+          panicked=1
+          end_reason="panic"
+          break
+        fi
       fi
     else
       unreach=$((unreach + 1))
@@ -308,7 +286,12 @@ cmd_run() {
       boot_end="$(vm_boottime)" || boot_end=""
       if [[ "$panicked" == "0" && -n "$boot_end" ]]; then
         np="$(vm_new_panic_count)" || np=0
-        if [[ "$boot_end" != "$boot_ref" || "$np" != "0" ]]; then
+        if [[ "$boot_end" != "$boot_ref" && -f "$reboot_marker" && "$np" == "0" ]]; then
+          intentional_reboots=$((intentional_reboots + 1))
+          rm -f "$reboot_marker"
+          log "accepted intentional reboot $intentional_reboots during the post-run check"
+          boot_ref="$boot_end"
+        elif [[ "$boot_end" != "$boot_ref" || "$np" != "0" ]]; then
           log "post-run check found panic evidence (boottime $boot_ref -> $boot_end, new reports: $np)"
           panicked=1
         fi
@@ -374,6 +357,7 @@ cmd_run() {
   "boottime_start": $boot_start,
   "boottime_end": $boot_end_json,
   "tart_relaunches": $tart_relaunches,
+  "intentional_reboots": $intentional_reboots,
   "end_reason": "$end_reason",
   "scenario_exit": $scenario_rc,
   "exit_code": $exit_code,

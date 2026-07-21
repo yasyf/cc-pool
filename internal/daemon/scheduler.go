@@ -68,18 +68,30 @@ const (
 	// outcomeNonNetwork: an auth, rate-limit, decode, or cancelled error. The
 	// API still answered (or the caller stopped), so connectivity is proven.
 	outcomeNonNetwork
+	// outcomeNoProbe: retained durable evidence returned without network I/O.
+	// It proves neither an outage nor recovery.
+	outcomeNoProbe
 	// outcomeNetwork: a transport-layer failure (oauth.ErrNetwork) — the only
 	// outage signal.
 	outcomeNetwork
 )
 
 // classifyOutcome maps a SampleUsage error to an outage-accounting outcome. A
-// nil error is a proven-live sample; an oauth.ErrNetwork transport failure is
-// the only outage signal; every other error still proves the API responded.
+// nil error is a proven-live sample; retained durable evidence alone proves
+// nothing; retained evidence carrying LiveProbe is classified from that probe.
+// An oauth.ErrNetwork transport failure is the only outage signal; every other
+// live error proves the API responded.
 func classifyOutcome(err error) sampleOutcome {
 	switch {
 	case err == nil:
 		return outcomeSuccess
+	case errors.Is(err, pool.ErrCredentialOperationLiveProbe) &&
+		errors.Is(err, oauth.ErrNetwork):
+		return outcomeNetwork
+	case errors.Is(err, pool.ErrCredentialOperationLiveProbe):
+		return outcomeNonNetwork
+	case errors.Is(err, pool.ErrCredentialOperationReplayed):
+		return outcomeNoProbe
 	case errors.Is(err, oauth.ErrNetwork):
 		return outcomeNetwork
 	default:
@@ -129,7 +141,7 @@ func (s *Server) pruneStickyRows() {
 // skip condition (ctx cancel, list-accounts failure, a still-down outage canary,
 // or entering/re-entering outage). See ccn doc 36b05ef.
 func (s *Server) pollAccounts(ctx context.Context, t *tick) bool {
-	accts, err := s.m.Store.ListAccounts()
+	accts, err := s.m.Store.ListActiveAccounts()
 	if err != nil {
 		s.log.Printf("list accounts: %v", err)
 		return false
@@ -147,6 +159,8 @@ func (s *Server) pollAccounts(ctx context.Context, t *tick) bool {
 	}
 	recovery := false
 	var attempts, netFails, sampled int
+	var noProbeAccount store.Account
+	hasNoProbeAccount := false
 	for _, a := range accts {
 		if ctx.Err() != nil {
 			return false
@@ -157,11 +171,7 @@ func (s *Server) pollAccounts(ctx context.Context, t *tick) bool {
 		if !canary && s.poolRateLimited() {
 			break
 		}
-		if !s.cl.hold(a.ID) {
-			continue
-		}
 		if s.pollGated(a) {
-			s.cl.disownHold(a.ID)
 			continue
 		}
 		// Space consecutive samples so N accounts don't burst the shared-IP
@@ -169,16 +179,20 @@ func (s *Server) pollAccounts(ctx context.Context, t *tick) bool {
 		if sampled > 0 {
 			select {
 			case <-ctx.Done():
-				s.cl.disownHold(a.ID)
 				return false
 			case <-time.After(spacing):
 			}
 		}
 		outcome := s.pollAccount(ctx, t, a, recovery || canary)
-		s.cl.disownHold(a.ID)
 		sampled++
 
 		if canary {
+			if outcome == outcomeNoProbe {
+				outcome = s.probeAccountReachability(ctx, a)
+				if outcome == outcomeNoProbe {
+					continue
+				}
+			}
 			if outcome == outcomeNetwork {
 				// Still down: one cheap failing request this short tick. Leave the
 				// snapshot stale (polling is broken) and wait for the next canary.
@@ -193,6 +207,13 @@ func (s *Server) pollAccounts(ctx context.Context, t *tick) bool {
 			continue
 		}
 
+		if outcome == outcomeNoProbe {
+			if !hasNoProbeAccount {
+				noProbeAccount = a
+				hasNoProbeAccount = true
+			}
+			continue
+		}
 		attempts++
 		if outcome == outcomeNetwork {
 			netFails++
@@ -202,6 +223,22 @@ func (s *Server) pollAccounts(ctx context.Context, t *tick) bool {
 		// sample timeout per remaining account and re-enter outage below.
 		if recovery && netFails == attempts && netFails >= recoveryAbandonThreshold {
 			break
+		}
+	}
+
+	// netOutage is deliberately process-local. After a restart, retained
+	// credential evidence can make every account a no-probe result even though
+	// no request in this process has established reachability. Before treating
+	// that sweep as complete, issue one read-only probe against the first such
+	// account. A probe that cannot run leaves the snapshot stale.
+	if !recovery && !s.netOutage && attempts == 0 && hasNoProbeAccount {
+		outcome := s.probeAccountReachability(ctx, noProbeAccount)
+		if outcome == outcomeNoProbe {
+			return false
+		}
+		attempts = 1
+		if outcome == outcomeNetwork {
+			netFails = 1
 		}
 	}
 
@@ -275,20 +312,21 @@ func (s *Server) authThrottled(dir string, needsLogin bool) bool {
 }
 
 // pollAccount samples one account and reports the outcome for outage detection.
-// The caller holds the poll claim, has cleared the backoff gates (pollGated), and
-// owns inter-account spacing. recovery forces AllowBusyRefresh for a busy account
+// The caller has cleared the backoff gates (pollGated) and owns inter-account
+// spacing. recovery forces AllowBusyRefresh for a busy account
 // regardless of the auth streak (the post-outage heal); fetchUsage's deep guard
 // still prevents a refresh-token double-spend. See ccn doc 36b05ef.
 func (s *Server) pollAccount(ctx context.Context, t *tick, a store.Account, recovery bool) sampleOutcome {
 	// A reserved account's claude may not be heartbeat-visible yet — treat it as
 	// busy so we don't refresh under the launch. A failed heartbeat also makes
 	// every dir non-idle while retaining last-known counts for diagnostics.
-	idle := t.idle(a.ConfigDir) && s.cl.reservedCount(a.ID) == 0
+	presentationDir := pool.AccountPresentationDir(a.ID)
+	idle := t.idle(presentationDir) && s.cl.reservedCount(a.ID) == 0
 
 	// The prior-401 gate gives a lazily-waking session one full poll to
 	// self-refresh first; a recovery sweep bypasses the streak gate (fetchUsage's
 	// deep guard still holds). See ccn doc 36b05ef for the accepted gap.
-	busyBySession := t.sessionCount(a.ConfigDir) > 0
+	busyBySession := t.sessionCount(presentationDir) > 0
 
 	// The refresh gate is structural, not a cross-host lease check: a synced
 	// (refresh-token-free) credential cannot refresh (ensureFreshToken returns
@@ -315,6 +353,27 @@ func (s *Server) pollAccount(ctx context.Context, t *tick, a store.Account, reco
 	return classifyOutcome(err)
 }
 
+func (s *Server) probeAccountReachability(ctx context.Context, a store.Account) sampleOutcome {
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	probed, rateLimited, retryAfter, err := s.m.ProbeUsageReachability(probeCtx, a)
+	cancel()
+	if !probed {
+		return outcomeNoProbe
+	}
+	if rateLimited {
+		s.recordRateLimit(a.ConfigDir, retryAfter, time.Now())
+		return outcomeNonNetwork
+	}
+	if err == nil {
+		s.clearRateLimit(a.ConfigDir)
+		return outcomeSuccess
+	}
+	if errors.Is(err, oauth.ErrNetwork) {
+		s.logNetUnreachable(a, err)
+	}
+	return classifyOutcome(err)
+}
+
 // recordRateLimit books one 429 for dir: it advances the per-account and
 // pool-wide 429 backoff streaks, arming each gate's window. The pool window
 // prefers the server's Retry-After hint (clamped to rateLimitBackoffCap) over the
@@ -322,8 +381,8 @@ func (s *Server) pollAccount(ctx context.Context, t *tick, a store.Account, reco
 func (s *Server) recordRateLimit(dir string, retryAfter time.Duration, now time.Time) {
 	s.ledMu.Lock()
 	defer s.ledMu.Unlock()
-	s.led.attempt(acctRateLimitPolicy, dir, attemptPrimary, now)
-	s.led.attempt(poolRateLimitPolicy, poolResource, attemptPrimary, now)
+	s.led.attempt(acctRateLimitPolicy, dir, now)
+	s.led.attempt(poolRateLimitPolicy, poolResource, now)
 	if retryAfter > 0 {
 		s.led.setNextDue(poolRateLimitPolicy, poolResource, now.Add(min(retryAfter, rateLimitBackoffCap)))
 	}
@@ -361,11 +420,18 @@ func (s *Server) handleAuthOutcome(ctx context.Context, a store.Account, err err
 		s.flagNeedsLogin(ctx, a, err)
 		return
 	}
+	if errors.Is(err, pool.ErrCredentialOperationReplayed) &&
+		!errors.Is(err, pool.ErrCredentialOperationLiveProbe) {
+		return
+	}
 	if errors.Is(err, oauth.ErrNetwork) {
 		// An outage keeps today's non-behavior everywhere else: no auth-streak
 		// strike, no needs-login flag, the 429 streaks untouched. Only the outage
 		// detector (via classifyOutcome) reacts.
 		s.logNetUnreachable(a, err)
+		return
+	}
+	if errors.Is(err, pool.ErrCredentialOperationLiveProbe) {
 		return
 	}
 	var ue *oauth.UsageError
@@ -442,7 +508,24 @@ func (s *Server) flagNeedsLogin(ctx context.Context, a store.Account, err error)
 		}
 		return
 	}
-	changed, serr := s.m.Store.SetNeedsLogin(a.ID, time.Now(), err.Error(), s.authKind(a))
+	kind, kindErr := s.authKind(ctx, a)
+	reason := store.AuthReasonRequired
+	digest := store.DigestReason(err.Error())
+	if kindErr != nil {
+		s.log.Printf("acct-%02d classify auth ownership: %v", a.ID, kindErr)
+		kind = store.AuthKindUnverified
+		reason = store.AuthReasonInternal
+		digest = store.DigestReason(errors.Join(err, kindErr).Error())
+	} else if kind == store.AuthKindAwaitingOrigin {
+		reason = store.AuthReasonAwaitingOrigin
+	}
+	changed, serr := s.m.Store.SetNeedsLogin(
+		a.ID,
+		time.Now(),
+		reason,
+		digest,
+		kind,
+	)
 	if serr != nil {
 		s.log.Printf("acct-%02d set needs-login: %v", a.ID, serr)
 		return
@@ -457,7 +540,7 @@ func (s *Server) flagNeedsLogin(ctx context.Context, a store.Account, err error)
 // /usage may grace-serve it with a 200, so ErrUnrefreshable is re-checked here
 // (SampleOpts{} skips the refresh classification that surfaces it).
 func (s *Server) resampleAfterHeal(ctx context.Context, a store.Account) bool {
-	cred, _, err := s.m.ReadCredential(a)
+	cred, _, err := s.m.ReadCredential(ctx, a)
 	if err != nil || (cred.Synced() && cred.Expired()) {
 		return false
 	}
@@ -485,7 +568,7 @@ func (s *Server) syncHeal(ctx context.Context, a store.Account) bool {
 	}
 	// A missing credential baselines at zero, so any pulled chain counts as fresher.
 	var before int64
-	if cred, _, err := s.m.ReadCredential(a); err == nil {
+	if cred, _, err := s.m.ReadCredential(ctx, a); err == nil {
 		before = cred.ClaudeAiOauth.ExpiresAt
 	}
 	hctx, cancel := context.WithTimeout(ctx, syncHealTimeout)
@@ -494,7 +577,7 @@ func (s *Server) syncHeal(ctx context.Context, a store.Account) bool {
 		s.log.Printf("acct-%02d sync heal pull: %v", a.ID, err)
 		return false
 	}
-	cred, _, err := s.m.ReadCredential(a)
+	cred, _, err := s.m.ReadCredential(ctx, a)
 	if err != nil {
 		return false
 	}

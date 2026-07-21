@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"sort"
@@ -19,7 +22,6 @@ import (
 
 func newStatusCmd() *cobra.Command {
 	var watch bool
-	var live bool
 	var plain bool
 	var jsonOut bool
 	cmd := &cobra.Command{
@@ -27,19 +29,18 @@ func newStatusCmd() *cobra.Command {
 		Short: "Show per-account usage, score, and sessions",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
 				if jsonOut {
-					return runStatusJSON(cmd, m, live)
+					return runStatusJSON(cmd)
 				}
-				return runStatus(cmd, m, watch, live, plain)
+				return runStatus(cmd, m, watch, plain)
 			})
 		},
 	}
 	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "refresh continuously (plain mode)")
-	cmd.Flags().BoolVar(&live, "live", false, "force live sampling even if the daemon is running")
 	cmd.Flags().BoolVar(&plain, "plain", false, "print the plain table instead of the interactive TUI")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "print the status snapshot JSON (same schema as ~/.cc-pool/status.json)")
 	cmd.MarkFlagsMutuallyExclusive("json", "watch")
@@ -48,8 +49,8 @@ func newStatusCmd() *cobra.Command {
 }
 
 // runStatusJSON prints the StatusSnapshot the widget reads.
-func runStatusJSON(cmd *cobra.Command, m *pool.Manager, forceLive bool) error {
-	snap, err := statusSnapshotJSON(cmd.Context(), m, forceLive)
+func runStatusJSON(cmd *cobra.Command) error {
+	snap, err := statusSnapshotJSON(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -63,31 +64,17 @@ func runStatusJSON(cmd *cobra.Command, m *pool.Manager, forceLive bool) error {
 
 // statusSnapshotJSON bypasses gatherStatus/fromDaemon: that round-trip
 // drops SampleAge and fabricates "sample_age":"0s".
-func statusSnapshotJSON(ctx context.Context, m *pool.Manager, forceLive bool) (daemon.StatusSnapshot, error) {
-	if !forceLive {
-		cl := daemon.NewClient()
-		resp, err := cl.StatusContext(ctx)
-		_ = cl.Close()
-		if daemonStatusUsable(resp, err) {
-			snap := daemon.NewStatusSnapshot(resp.Accounts, time.Now())
-			snap.Ledgers = resp.Ledgers
-			return snap, nil
-		}
-	}
-	snaps, err := m.Snapshots(ctx, true, pool.DefaultFreshFor)
-	if err != nil {
-		return daemon.StatusSnapshot{}, err
-	}
-	return daemon.NewStatusSnapshot(daemon.ToStatuses(snaps), time.Now()), nil
+func statusSnapshotJSON(ctx context.Context) (daemon.StatusSnapshot, error) {
+	return loadStatusSnapshot(ctx)
 }
 
-func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) error {
+func runStatus(cmd *cobra.Command, m *pool.Manager, watch, plain bool) error {
 	if isTTY() && !plain {
-		return runStatusTUI(cmd, m, live)
+		return runStatusTUI(cmd, m)
 	}
 	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just hides pin state
 	render := func() error {
-		snaps, ledgers, fpConsentPending, err := gatherStatus(cmd.Context(), m, live)
+		snaps, ledgers, err := gatherStatus(cmd.Context())
 		if err != nil {
 			return err
 		}
@@ -100,9 +87,6 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 			_, _ = fmt.Fprint(cmd.OutOrStdout(), "\033[H\033[2J") // clear
 		}
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), out)
-		if line := fpConsentFooter(fpConsentPending); line != "" {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
-		}
 		if line := ledgerFooter(ledgers); line != "" {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 		}
@@ -123,54 +107,92 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 }
 
-func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, []daemon.LedgerState, bool, error) {
-	if !forceLive {
-		cl := daemon.NewClient()
-		resp, err := cl.StatusContext(ctx)
-		_ = cl.Close()
-		if daemonStatusUsable(resp, err) {
-			return fromDaemon(resp.Accounts), resp.Ledgers, resp.FPConsentPending, nil
-		}
+func gatherStatus(ctx context.Context) ([]pool.Snapshot, []daemon.LedgerState, error) {
+	snapshot, err := loadStatusSnapshot(ctx)
+	if err != nil {
+		return nil, nil, err
 	}
-	snaps, err := m.Snapshots(ctx, true, pool.DefaultFreshFor)
-	return snaps, nil, false, err
+	return fromDaemon(snapshot.Accounts), snapshot.Ledgers, nil
 }
 
-// ledgerFooter is the compact self-heal rollup — plain-path only, like the
-// other footer. It renders only when a ledger row is faulted or parked; a
-// healthy pool prints nothing new. `ccp doctor` carries the per-row detail.
+func loadStatusSnapshot(ctx context.Context) (daemon.StatusSnapshot, error) {
+	cl := daemon.NewClient()
+	resp, daemonErr := cl.StatusContext(ctx)
+	_ = cl.Close()
+	if daemonStatusUsable(resp, daemonErr) {
+		snapshot := daemon.NewStatusSnapshot(resp.Accounts, time.Now())
+		snapshot.Ledgers = resp.Ledgers
+		return snapshot, nil
+	}
+	disk, snapshotErr := readStatusSnapshot(pool.StatusSnapshotPath())
+	if snapshotErr != nil {
+		return daemon.StatusSnapshot{}, errors.Join(
+			daemonStatusFailure(resp, daemonErr), snapshotErr,
+		)
+	}
+	return disk, nil
+}
+
+func readStatusSnapshot(path string) (daemon.StatusSnapshot, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return daemon.StatusSnapshot{}, fmt.Errorf("read status snapshot: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var snapshot daemon.StatusSnapshot
+	if err := decoder.Decode(&snapshot); err != nil {
+		return daemon.StatusSnapshot{}, fmt.Errorf("decode status snapshot: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return daemon.StatusSnapshot{}, errors.New("decode status snapshot: trailing JSON value")
+	}
+	if snapshot.Proto != daemon.SnapshotVersion {
+		return daemon.StatusSnapshot{}, fmt.Errorf(
+			"status snapshot protocol is %d, want %d", snapshot.Proto, daemon.SnapshotVersion,
+		)
+	}
+	if snapshot.Version != version.String() {
+		return daemon.StatusSnapshot{}, fmt.Errorf(
+			"status snapshot version is %q, want %q", snapshot.Version, version.String(),
+		)
+	}
+	if snapshot.GeneratedAt.IsZero() {
+		return daemon.StatusSnapshot{}, errors.New("status snapshot has no generation time")
+	}
+	if snapshot.Accounts == nil {
+		return daemon.StatusSnapshot{}, errors.New("status snapshot has null accounts")
+	}
+	return snapshot, nil
+}
+
+func daemonStatusFailure(resp *daemon.Response, err error) error {
+	if err != nil {
+		return fmt.Errorf("request daemon status: %w", err)
+	}
+	if resp == nil {
+		return errors.New("request daemon status: empty response")
+	}
+	if !resp.OK {
+		return fmt.Errorf("request daemon status: %s", resp.Error)
+	}
+	return fmt.Errorf(
+		"daemon status version is %q, want %q", resp.Version, version.String(),
+	)
+}
+
+// ledgerFooter is the compact auth-fault rollup.
 func ledgerFooter(ledgers []daemon.LedgerState) string {
-	faulted, parked := 0, 0
+	faulted := 0
 	for _, l := range ledgers {
-		if l.Parked {
-			parked++
-			continue
-		}
 		if l.Faulted {
 			faulted++
 		}
 	}
-	if faulted == 0 && parked == 0 {
+	if faulted == 0 {
 		return ""
 	}
-	var parts []string
-	if faulted > 0 {
-		parts = append(parts, fmt.Sprintf("%d faulted", faulted))
-	}
-	if parked > 0 {
-		parts = append(parts, fmt.Sprintf("%d parked", parked))
-	}
-	return warnStyle.Render("self-heal: " + strings.Join(parts, ", ") + " — run `ccp doctor` for detail")
-}
-
-// fpConsentFooter warns that the daemon's File Provider data bridge bind is
-// pending its app-group-container grant — plain-path only, like the other footers
-// (the TUI drops daemon-cache alerts on purpose). "" when not pending.
-func fpConsentFooter(pending bool) string {
-	if !pending {
-		return ""
-	}
-	return warnStyle.Render("file provider: the daemon's data bridge bind is pending its macOS app-group-container grant — a release daemon binds prompt-free from the signed CCPoolDaemon.app bundle, so reinstall with `ccp service install`; run `ccp doctor` for detail")
+	return warnStyle.Render(fmt.Sprintf("auth health: %d faulted", faulted))
 }
 
 // dirPin is the launch directory's pin as render input (ok=false: no pin).
@@ -252,35 +274,35 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 	out := make([]pool.Snapshot, 0, len(accs))
 	for _, a := range accs {
 		s := pool.Snapshot{
-			Score:           a.Score,
-			HasUsage:        a.HasUsage,
-			Remaining5h:     a.Remaining5h,
-			Remaining7d:     a.Remaining7d,
-			Util5h:          100 - a.Remaining5h,
-			Util7d:          100 - a.Remaining7d,
-			ActiveSessions:  a.ActiveSessions,
-			RateLimited:     a.RateLimited,
-			Exhausted:       a.Exhausted,
-			NeedsLogin:      a.NeedsLogin,
-			AwaitingOrigin:  a.AwaitingOrigin,
-			Stale:           a.Stale,
-			Resets5h:        a.Resets5h,
-			Resets7d:        a.Resets7d,
-			ExtraEnabled:    a.ExtraEnabled,
-			ExtraUsed:       a.ExtraUsed,
-			ExtraLimit:      a.ExtraLimit,
-			Scoped7dUtil:    a.Scoped7dUtil,
-			Scoped7dResets:  a.Scoped7dResets,
-			Scoped7dModel:   a.Scoped7dModel,
-			WeeklyExhausted: a.WeeklyExhausted,
-			Components:      a.Components,
+			Score:                 a.Score,
+			HasUsage:              a.HasUsage,
+			Remaining5h:           a.Remaining5h,
+			Remaining7d:           a.Remaining7d,
+			Util5h:                100 - a.Remaining5h,
+			Util7d:                100 - a.Remaining7d,
+			ActiveSessions:        a.ActiveSessions,
+			RateLimited:           a.RateLimited,
+			Exhausted:             a.Exhausted,
+			NeedsLogin:            a.NeedsLogin,
+			CredentialQuarantined: a.CredentialQuarantined,
+			AwaitingOrigin:        a.AwaitingOrigin,
+			Stale:                 a.Stale,
+			Resets5h:              a.Resets5h,
+			Resets7d:              a.Resets7d,
+			ExtraEnabled:          a.ExtraEnabled,
+			ExtraUsed:             a.ExtraUsed,
+			ExtraLimit:            a.ExtraLimit,
+			Scoped7dUtil:          a.Scoped7dUtil,
+			Scoped7dResets:        a.Scoped7dResets,
+			Scoped7dModel:         a.Scoped7dModel,
+			WeeklyExhausted:       a.WeeklyExhausted,
+			Components:            a.Components,
 		}
 		// Display fields only: the wire carries no keychain fields, so credential
 		// operations must re-load the account from the store (statusTUI.resolveAccount).
 		s.Account.ID = a.ID
 		s.Account.ConfigDir = a.ConfigDir
 		s.Account.Label = a.Label
-		s.Account.OverlayKind = a.OverlayKind
 		out = append(out, s)
 	}
 	return out
@@ -290,7 +312,7 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 // account must never sort above a usable one, however high its score.
 func snapshotTier(s pool.Snapshot) int {
 	switch {
-	case s.NeedsLogin:
+	case s.NeedsLogin || s.CredentialQuarantined:
 		return 3
 	case s.RateLimited:
 		return 2
@@ -374,6 +396,9 @@ func snapshotFlags(s pool.Snapshot) string {
 	case s.NeedsLogin:
 		flags = append(flags, badStyle.Render("needs login"))
 	}
+	if s.CredentialQuarantined {
+		flags = append(flags, badStyle.Render("credential recovery"))
+	}
 	if s.Stale {
 		flags = append(flags, warnStyle.Render("stale"))
 	}
@@ -400,7 +425,7 @@ func snapshotFlags(s pool.Snapshot) string {
 	return strings.Join(flags, " ")
 }
 
-// accountName never shows the acct-NN id; only `ccp list`/`ccp doctor` do.
+// accountName never shows the acct-NN id; `ccp list` carries that detail.
 func accountName(label string) string {
 	if label == "" {
 		return "(unnamed)"
@@ -408,7 +433,7 @@ func accountName(label string) string {
 	return label
 }
 
-// usageSuffix returns "" for unknown usage (never-sampled or old daemon)
+// usageSuffix returns "" for unknown usage (never sampled or missing status data)
 // rather than a fabricated 0%. When the pick carries a binding model-scoped
 // weekly bucket (scopedModel != ""), its usage is appended too.
 func usageSuffix(hasUsage bool, used5, used7 float64, scopedModel string, scopedUsed float64) string {

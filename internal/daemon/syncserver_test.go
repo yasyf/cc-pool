@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
-	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -122,20 +121,20 @@ func TestSyncSocketServesConsumer(t *testing.T) {
 		t.Error("fetch_credential for an unknown uuid returned OK")
 	}
 
-	// The v1 method name must never be answered: a v1 peer calling it against
-	// this v2 server gets a clean unknown-method error and no payload.
-	legacy, err := tx.Do(ctx, &rpc.Request{Method: "ccp.fetch_credential", Params: map[string]any{"uuid": "u-sock"}})
+	// The removed secret-bearing method must never be answered by the fresh v1
+	// server; stale callers receive unknown-method and no payload.
+	removed, err := tx.Do(ctx, &rpc.Request{Method: "ccp.fetch_credential", Params: map[string]any{"uuid": "u-sock"}})
 	if err != nil {
-		t.Fatalf("v1 fetch Do: %v", err)
+		t.Fatalf("removed fetch Do: %v", err)
 	}
-	if legacy.OK {
-		t.Fatal("the v2 server answered v1's ccp.fetch_credential")
+	if removed.OK {
+		t.Fatal("the fresh-v1 server answered removed ccp.fetch_credential")
 	}
-	if !strings.Contains(legacy.Error, "unknown method") {
-		t.Errorf("v1 fetch error = %q, want an unknown-method rejection", legacy.Error)
+	if !strings.Contains(removed.Error, "unknown method") {
+		t.Errorf("removed fetch error = %q, want an unknown-method rejection", removed.Error)
 	}
-	if payload := string(legacy.Result); payload != "" && payload != "null" {
-		t.Errorf("v1 fetch carried a result payload: %s", payload)
+	if payload := string(removed.Result); payload != "" && payload != "null" {
+		t.Errorf("removed fetch carried a result payload: %s", payload)
 	}
 }
 
@@ -150,7 +149,7 @@ func TestSyncSocketDrainsInFlightHandler(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	sock := filepath.Join(sockDir, "sync.sock")
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,49 +255,10 @@ func TestSyncSocketDrainsInFlightHandler(t *testing.T) {
 	}
 }
 
-// TestServerClaimsAdapter pins the uuid->id convert-claim adapter: an unknown or
-// erroring lookup refuses, a known uuid claims via beginConvert (blocking a second
-// claim) and releases via endConvert.
-func TestServerClaimsAdapter(t *testing.T) {
-	s := &Server{cl: newClaims()}
-	sc := serverClaims{s: s, byUUID: func(uuid string) (store.Account, bool, error) {
-		switch uuid {
-		case "known":
-			return store.Account{ID: 3}, true, nil
-		case "boom":
-			return store.Account{}, false, errors.New("lookup failed")
-		default:
-			return store.Account{}, false, nil
-		}
-	}}
-
-	if _, ok := sc.TryClaim("missing"); ok {
-		t.Error("claimed an unknown uuid")
-	}
-	if _, ok := sc.TryClaim("boom"); ok {
-		t.Error("claimed despite a lookup error")
-	}
-
-	release, ok := sc.TryClaim("known")
-	if !ok {
-		t.Fatal("known uuid not claimed")
-	}
-	if !s.cl.held(3) {
-		t.Error("account 3 not marked converting after claim")
-	}
-	if _, ok2 := sc.TryClaim("known"); ok2 {
-		t.Error("a second claim on a held account succeeded")
-	}
-	release()
-	if s.cl.held(3) {
-		t.Error("account 3 still converting after release")
-	}
-}
-
 // TestSyncEnabledMeta pins that syncEnabled reflects the store's sync_enabled meta
 // and needs no restart: unset or "0" is off, "1" is on.
 func TestSyncEnabledMeta(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,40 +279,5 @@ func TestSyncEnabledMeta(t *testing.T) {
 	}
 	if on, err := s.syncEnabled(); err != nil || on {
 		t.Fatalf("syncEnabled after set 0 = %v (err %v), want false", on, err)
-	}
-}
-
-// TestReadCredentialForFetchNeverRefreshes pins that serving a peer never
-// spends the refresh token: even an expired credential is returned verbatim,
-// proving allowRefresh=false.
-func TestReadCredentialForFetchNeverRefreshes(t *testing.T) {
-	s, _ := newTestServer(t)
-	fk := s.m.Creds.(*credstest.Fake)
-
-	a, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a.KeychainService = "svc-fetch"
-	if err := s.m.Store.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
-	a, err = s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	expired := &creds.Credential{}
-	expired.ClaudeAiOauth.AccessToken = "at-stale"
-	expired.ClaudeAiOauth.RefreshToken = "rt-stale"
-	expired.ClaudeAiOauth.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
-	fk.Put(a.KeychainService, a.KeychainAccount, expired)
-
-	got, err := s.readCredentialForFetch(context.Background(), a)
-	if err != nil {
-		t.Fatalf("readCredentialForFetch: %v", err)
-	}
-	if got.ClaudeAiOauth.AccessToken != "at-stale" || got.ClaudeAiOauth.RefreshToken != "rt-stale" {
-		t.Fatalf("fetch reader rotated the chain to %+v; serving a peer must never refresh the single-use token", got.ClaudeAiOauth)
 	}
 }

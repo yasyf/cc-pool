@@ -6,34 +6,41 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/version"
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/daemonrole"
 	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/wire"
 )
 
 func operationLadder() (wire.Ladder, error) {
 	server := map[wire.Op]time.Duration{
-		wire.Op(OpSelect):        selectRequestTimeout,
-		wire.Op(OpSelectCommit):  2 * time.Second,
-		wire.Op(OpSelectAbort):   2 * time.Second,
-		wire.Op(OpStatus):        4 * time.Second,
-		wire.Op(OpMigrate):       140 * time.Second,
-		wire.Op(OpCredMove):      140 * time.Second,
-		wire.Op(OpFPRepair):      140 * time.Second,
-		wire.Op(OpFPBridgeCheck): 13 * time.Second,
+		wire.Op(OpSelect):             selectRequestTimeout,
+		wire.Op(OpSelectCommit):       2 * time.Second,
+		wire.Op(OpSelectAbort):        2 * time.Second,
+		wire.Op(OpStatus):             4 * time.Second,
+		wire.Op(OpCredMove):           140 * time.Second,
+		wire.Op(OpAccountRemove):      3 * time.Minute,
+		wire.Op(OpAccountIdentity):    31 * time.Second,
+		wire.Op(OpAccountHealth):      61 * time.Second,
+		wire.Op(OpAccountMutation):    30 * time.Minute,
+		wire.Op(OpAccountMutationAck): 2 * time.Second,
 	}
 	client := map[wire.Op]time.Duration{
-		wire.Op(OpSelect):        selectConnTimeout,
-		wire.Op(OpSelectCommit):  3 * time.Second,
-		wire.Op(OpSelectAbort):   3 * time.Second,
-		wire.Op(OpStatus):        5 * time.Second,
-		wire.Op(OpMigrate):       migrateTimeout,
-		wire.Op(OpCredMove):      migrateTimeout,
-		wire.Op(OpFPRepair):      migrateTimeout,
-		wire.Op(OpFPBridgeCheck): fpBridgeCheckTimeout,
+		wire.Op(OpSelect):             selectConnTimeout,
+		wire.Op(OpSelectCommit):       3 * time.Second,
+		wire.Op(OpSelectAbort):        3 * time.Second,
+		wire.Op(OpStatus):             5 * time.Second,
+		wire.Op(OpCredMove):           3 * time.Minute,
+		wire.Op(OpAccountRemove):      4 * time.Minute,
+		wire.Op(OpAccountIdentity):    32 * time.Second,
+		wire.Op(OpAccountHealth):      62 * time.Second,
+		wire.Op(OpAccountMutation):    31 * time.Minute,
+		wire.Op(OpAccountMutationAck): 3 * time.Second,
 	}
 	return wire.NewLadder(server, client)
 }
@@ -43,19 +50,21 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if s.m == nil {
-		return nil, nil, errors.New("daemon manager is required")
-	}
 	if s.wireIntake == nil {
 		s.wireIntake = &drain.Intake{}
 	}
 	if s.syncIntake == nil {
 		s.syncIntake = &drain.Intake{}
 	}
+	role, err := daemonRole()
+	if err != nil {
+		return nil, nil, err
+	}
 	wireServer := &wire.Server{
-		Build:  version.String(),
-		Ladder: ladder,
-		Trust: func(peer wire.Peer) error {
+		Build: BusinessBuild, LifecycleBuild: version.String(), Ladder: ladder,
+		ReservedProtectedSessions:  1,
+		ProtectedSessionClassifier: role,
+		Trust: func(_ context.Context, peer wire.Peer) error {
 			if peer.UID != os.Geteuid() {
 				return fmt.Errorf("%w: peer uid %d, daemon uid %d", wire.ErrUntrustedPeer, peer.UID, os.Geteuid())
 			}
@@ -67,10 +76,12 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 		OpSelectCommit,
 		OpSelectAbort,
 		OpStatus,
-		OpMigrate,
 		OpCredMove,
-		OpFPRepair,
-		OpFPBridgeCheck,
+		OpAccountRemove,
+		OpAccountIdentity,
+		OpAccountHealth,
+		OpAccountMutation,
+		OpAccountMutationAck,
 	} {
 		op := op
 		wireServer.RegisterConcurrent(wire.Op(op), func(ctx context.Context, wireRequest wire.Request) (any, error) {
@@ -79,12 +90,15 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 				return nil, fmt.Errorf("decode %s request: %w", op, err)
 			}
 			request.Op = op
+			if op == OpAccountMutation {
+				return s.handleAccountMutationWire(ctx, wireRequest, request)
+			}
 			return s.dispatch(ctx, request), nil
 		})
 	}
 	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial:  wire.UnixDialer(s.socket),
-		Build: version.String(),
+		Dial: wire.UnixDialer(s.socket), Build: BusinessBuild,
+		LifecycleBuild: version.String(),
 	}}
 	runtime, err := dkdaemon.NewRuntime(dkdaemon.RuntimeConfig{
 		Socket:       s.socket,
@@ -92,20 +106,49 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 		Protocol:     int(wire.ProtocolVersion),
 		Peer:         peer,
 		Contract:     dkdaemon.RequestDaemon,
-		WaitMode:     dkdaemon.SocketRelease,
+		WaitMode:     dkdaemon.PIDExit,
 		Grace:        s.evictTimeout,
 		ListenerWait: s.evictTimeout,
 		Admission:    s.wireIntake,
 		Server:       &sessionServer{owner: s, wire: wireServer},
 		Workers:      &serverWorkers{owner: s},
-		State:        s.m,
-		Resources:    lifecycleResource{peer: peer},
+		State:        serverState{owner: s},
+		Resources:    lifecycleResource{peer: peer, server: s},
+		Activate:     s.activate,
 	})
 	if err != nil {
 		_ = peer.Close()
 		return nil, nil, err
 	}
 	return wireServer, runtime, nil
+}
+
+// ServiceRolePath resolves the stable executable alias shared by launchd and
+// daemon admission. The classifier resolves its current target per candidate.
+func ServiceRolePath() (string, error) {
+	rolePath, err := exec.LookPath("ccp")
+	if err != nil {
+		return "", fmt.Errorf("resolve ccp role alias: %w", err)
+	}
+	rolePath, err = filepath.Abs(rolePath)
+	if err != nil {
+		return "", fmt.Errorf("resolve absolute ccp role alias: %w", err)
+	}
+	return filepath.Clean(rolePath), nil
+}
+
+func daemonRole() (daemonrole.Classifier, error) {
+	rolePath, err := ServiceRolePath()
+	if err != nil {
+		return daemonrole.Classifier{}, err
+	}
+	role := daemonrole.Classifier{
+		RoleID: ServiceRoleID, RolePath: rolePath,
+	}
+	if err := role.Validate(); err != nil {
+		return daemonrole.Classifier{}, err
+	}
+	return role, nil
 }
 
 type sessionServer struct {
@@ -116,6 +159,7 @@ type sessionServer struct {
 func (s *sessionServer) Serve(
 	ctx context.Context,
 	listener net.Listener,
+	ready func() error,
 	admit, admitLifecycle func() (func(), error),
 ) error {
 	execCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -124,7 +168,16 @@ func (s *sessionServer) Serve(
 	s.owner.execMu.Unlock()
 
 	if err := s.owner.setupSync(execCtx); err != nil {
-		s.owner.log.Printf("host sync disabled for this run: %v", err)
+		cancel()
+		return fmt.Errorf("setup host sync publication: %w", err)
+	}
+	if s.owner.m.BuildCredentialWritePublication == nil || s.owner.m.SettleCredentialWrite == nil {
+		cancel()
+		return errors.New("host sync publication wiring is unavailable")
+	}
+	if err := s.owner.m.RecoverRetiredCredentialOwners(execCtx); err != nil {
+		cancel()
+		return fmt.Errorf("recover retired credential owners: %w", err)
 	}
 	s.owner.log.Printf("daemon %s started; socket=%s", version.String(), s.owner.socket)
 	s.owner.wg.Add(1)
@@ -134,14 +187,9 @@ func (s *sessionServer) Serve(
 		if execCtx.Err() != nil {
 			return
 		}
-		s.owner.wg.Add(1)
-		go func() {
-			defer s.owner.wg.Done()
-			s.owner.healFuseRows(execCtx)
-		}()
 		s.owner.scheduler(execCtx)
 	}()
-	err := s.wire.Serve(ctx, listener, admit, admitLifecycle)
+	err := s.wire.Serve(ctx, listener, ready, admit, admitLifecycle)
 	s.owner.log.Printf("daemon stopped")
 	return err
 }
@@ -156,6 +204,9 @@ func (w *serverWorkers) Close() {
 	if w.owner.syncListener != nil {
 		_ = w.owner.syncListener.Close()
 	}
+	if w.owner.disposableWorkers != nil {
+		w.owner.disposableWorkers.Close()
+	}
 }
 
 func (w *serverWorkers) Cancel() {
@@ -164,6 +215,9 @@ func (w *serverWorkers) Cancel() {
 	w.owner.execMu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if w.owner.disposableWorkers != nil {
+		w.owner.disposableWorkers.Cancel()
 	}
 }
 
@@ -174,6 +228,9 @@ func (w *serverWorkers) Wait(ctx context.Context) error {
 			settleErr = errors.Join(settleErr, err)
 		}
 	}
+	if w.owner.disposableWorkers != nil {
+		settleErr = errors.Join(settleErr, w.owner.disposableWorkers.Wait(ctx))
+	}
 	done := make(chan struct{})
 	go func() {
 		w.owner.wg.Wait()
@@ -183,6 +240,29 @@ func (w *serverWorkers) Wait(ctx context.Context) error {
 	return settleErr
 }
 
-type lifecycleResource struct{ peer *wire.LifecyclePeer }
+type lifecycleResource struct {
+	peer   *wire.LifecyclePeer
+	server *Server
+}
 
-func (r lifecycleResource) Close() error { return r.peer.Close() }
+type serverState struct{ owner *Server }
+
+func (s serverState) Close() error {
+	if s.owner == nil || s.owner.m == nil {
+		return nil
+	}
+	err := s.owner.m.Close()
+	s.owner.m = nil
+	return err
+}
+
+func (r lifecycleResource) Close() error {
+	var errs []error
+	if r.peer != nil {
+		errs = append(errs, r.peer.Close())
+	}
+	if r.server != nil && r.server.tenantClient != nil {
+		errs = append(errs, r.server.tenantClient.Close())
+	}
+	return errors.Join(errs...)
+}

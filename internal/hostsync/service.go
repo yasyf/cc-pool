@@ -3,10 +3,10 @@ package hostsync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -52,12 +52,16 @@ type Sessions interface {
 	Busy(ctx context.Context, uuid string) (busy bool, reason string, err error)
 }
 
-// Claims is the convert-claim seam a converge teardown acquires before
-// removing a locally-materialized account; *daemon.Server satisfies it.
-type Claims interface {
-	// TryClaim reserves uuid for a teardown, returning a release func and whether
-	// the claim succeeded (false when a live session already holds it).
-	TryClaim(uuid string) (release func(), ok bool)
+// AccountRemoval completes external teardown after its durable removal intent
+// has been installed.
+type AccountRemoval interface {
+	Finish(context.Context) error
+}
+
+// AccountRemover installs one account's durable removal intent. The
+// returned removal owns FuseKit tenant/domain teardown and private-state deletion.
+type AccountRemover interface {
+	BeginAccountRemoval(id int, deleteCredential bool) (AccountRemoval, error)
 }
 
 // Service owns the convergent account registry and its write hooks: every
@@ -75,15 +79,15 @@ type Service struct {
 	Now func() time.Time
 	// Locals enumerates this host's local accounts for the scan-publish fold.
 	Locals func(ctx context.Context) ([]LocalAccount, error)
-	// Run execs an external command; nil means os/exec.
+	// Run executes external commands in disposable process groups; it is required.
 	Run func(ctx context.Context, name string, args ...string) error
 
 	// Mesh resolves this host and its peers for a converge pass.
 	Mesh Mesh
 	// Sessions reports local liveness so busy items defer.
 	Sessions Sessions
-	// Claims reserves an account for a teardown.
-	Claims Claims
+	// Remover owns the durable FuseKit-first account removal lifecycle.
+	Remover AccountRemover
 	// Status is the process-lifetime peer up/down tracker; one per Service.
 	Status *converge.PeerStatus
 	// Driver is the converge.Driver the reconcile pass drives; the daemon wires
@@ -297,12 +301,12 @@ func (s *Service) NudgeSynckitd(ctx context.Context, manifestPath string) {
 	}
 }
 
-// run execs name through the injected runner, or os/exec when none is injected.
+// run executes through the required disposable process-group runner.
 func (s *Service) run(ctx context.Context, name string, args ...string) error {
-	if s.Run != nil {
-		return s.Run(ctx, name, args...)
+	if s.Run == nil {
+		return errors.New("hostsync: disposable task runner is required")
 	}
-	return exec.CommandContext(ctx, name, args...).Run() //nolint:gosec // G204: name/args are cc-pool-managed sync subprocess invocations, not external input
+	return s.Run(ctx, name, args...)
 }
 
 // Converge runs one convergence pass — pull peers (skipping origin, the
@@ -349,7 +353,7 @@ func convergedOutcome(o converge.Outcome) bool {
 }
 
 // teardown removes every locally-materialized account a peer has tombstoned.
-// Busy, unprovably idle, unclaimed, ambiguous, and per-item failures all defer
+// Busy, unprovably idle, ambiguous, and per-item failures all defer
 // to a later pass; only a registry load failure is fatal.
 func (s *Service) teardown(ctx context.Context) (tornDown, skippedBusy int, err error) {
 	reg, err := s.Registry.Load()
@@ -370,7 +374,7 @@ func (s *Service) teardown(ctx context.Context) (tornDown, skippedBusy int, err 
 		}
 		if len(rows) > 1 {
 			// A tombstone must never serially destroy every row sharing a uuid — see ccn 10bf17d.
-			s.logf("hostsync: teardown of %s deferred: %d local accounts share the uuid — refusing an ambiguous teardown; see `ccp doctor`", uuid, len(rows))
+			s.logf("hostsync: teardown of %s deferred: %d local accounts share the uuid — refusing an ambiguous teardown", uuid, len(rows))
 			skippedBusy++
 			continue
 		}
@@ -379,31 +383,50 @@ func (s *Service) teardown(ctx context.Context) (tornDown, skippedBusy int, err 
 			skippedBusy++
 			continue
 		}
-		if s.Claims == nil {
-			s.logf("hostsync: teardown of acct-%d (%s) deferred: no claim seam wired", a.ID, uuid)
+		if s.Remover == nil {
+			s.logf("hostsync: teardown of acct-%d (%s) deferred: no lifecycle remover wired", a.ID, uuid)
 			skippedBusy++
 			continue
 		}
-		release, claimed := s.Claims.TryClaim(uuid)
-		if !claimed {
-			s.logf("hostsync: teardown of acct-%d (%s) deferred: convert claim refused", a.ID, uuid)
-			skippedBusy++
-			continue
-		}
-		// Re-check under the claim: a re-add since the pass snapshot is spared — see ccn 10bf17d.
-		if cur, err := s.Registry.Load(); err != nil || cur[uuid].Present() {
+		var (
+			removal    AccountRemoval
+			removalErr error
+			readded    bool
+		)
+		// The registry lock is the linearization boundary with re-add writers.
+		// Install the generation-fenced durable removal intent while the registry
+		// snapshot remains fenced. Selection and mutation activation observe that
+		// intent transactionally; no daemon-local claim crosses worker I/O.
+		recheckErr := s.Registry.WithLock(ctx, func() error {
+			cur, err := s.Registry.Load()
 			if err != nil {
-				s.logf("hostsync: teardown of acct-%d (%s) deferred: re-check load: %v", a.ID, uuid, err)
-			} else {
-				s.logf("hostsync: teardown of acct-%d (%s) cancelled: re-added since the pass snapshot", a.ID, uuid)
+				return err
 			}
-			release()
+			if cur[uuid].Present() {
+				readded = true
+				return nil
+			}
+			removal, removalErr = s.Remover.BeginAccountRemoval(a.ID, true)
+			return nil
+		})
+		if recheckErr != nil {
+			s.logf("hostsync: teardown of acct-%d (%s) deferred: registry fence: %v", a.ID, uuid, recheckErr)
 			continue
 		}
-		rerr := s.M.Remove(ctx, a.ID, true)
-		release()
-		if rerr != nil {
-			s.logf("hostsync: teardown remove acct-%d (%s): %v — deferred to a later pass", a.ID, uuid, rerr)
+		if readded {
+			s.logf("hostsync: teardown of acct-%d (%s) cancelled: re-added since the pass snapshot", a.ID, uuid)
+			continue
+		}
+		if removalErr != nil {
+			s.logf("hostsync: begin teardown of acct-%d (%s): %v — deferred to a later pass", a.ID, uuid, removalErr)
+			continue
+		}
+		if removal == nil {
+			s.logf("hostsync: begin teardown of acct-%d (%s) returned no durable removal — deferred to a later pass", a.ID, uuid)
+			continue
+		}
+		if removalErr = removal.Finish(ctx); removalErr != nil {
+			s.logf("hostsync: finish teardown of acct-%d (%s): %v — durable intent will resume", a.ID, uuid, removalErr)
 			continue
 		}
 		s.logf("hostsync: tore down acct-%d (%s) per peer tombstone", a.ID, uuid)

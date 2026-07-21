@@ -14,7 +14,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/lease"
 )
 
 func TestExecEnv(t *testing.T) {
@@ -107,7 +106,7 @@ func TestCcpAccountFromEnv(t *testing.T) {
 	})
 }
 
-// TestResolveSelectionForcedUnknown covers only the error path; the valid-id path hits ReconcileOverlay/PreflightRefresh, which tests must not touch.
+// TestResolveSelectionForcedUnknown covers the missing forced-account path.
 func TestResolveSelectionForcedUnknown(t *testing.T) {
 	m := &pool.Manager{Store: openTestStore(t)}
 	cmd := &cobra.Command{}
@@ -133,11 +132,11 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 	st := openTestStore(t)
 	requested := store.Account{
 		ID: 1, ConfigDir: filepath.Join(home, "acct-01"), Label: "requested@example.com",
-		KeychainService: "svc-1", KeychainAccount: "u-1", OverlayKind: "symlink",
+		KeychainService: "svc-1", KeychainAccount: "u-1",
 	}
 	returned := store.Account{
 		ID: 2, ConfigDir: filepath.Join(home, "acct-02"), Label: "returned@example.com",
-		KeychainService: "svc-2", KeychainAccount: "u-2", OverlayKind: "symlink",
+		KeychainService: "svc-2", KeychainAccount: "u-2",
 	}
 	for _, acct := range []store.Account{requested, returned} {
 		if err := st.UpsertAccount(acct); err != nil {
@@ -152,7 +151,7 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 		resp := daemon.Response{OK: true}
 		if op == daemon.OpSelect {
 			resp.SelectedID = &returned.ID
-			resp.Dir = returned.ConfigDir
+			resp.Dir = pool.AccountPresentationDir(returned.ID)
 			resp.ReservationToken = "malformed-selection"
 		}
 		if op == daemon.OpSelectAbort {
@@ -161,30 +160,26 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 		return resp
 	})
 
-	m := &pool.Manager{Store: st, Creds: credstest.NewFake(), LockDir: t.TempDir()}
+	m := &pool.Manager{Store: st, Creds: credstest.NewFake()}
 	var stderr bytes.Buffer
 	cmd := &cobra.Command{}
 	cmd.SetErr(&stderr)
 	cmd.SetContext(context.Background())
-	acquireCalls, execCalls := 0, 0
-	prevLease, prevExec := runAcquireLease, runExecClaude
-	runAcquireLease = func(context.Context, store.Account) (*lease.Handle, error) {
-		acquireCalls++
-		return nil, nil
-	}
-	runExecClaude = func(*lease.Handle, string, []string) error {
+	execCalls := 0
+	prevExec := runExecClaude
+	runExecClaude = func(string, []string) error {
 		execCalls++
 		return nil
 	}
-	t.Cleanup(func() { runAcquireLease, runExecClaude = prevLease, prevExec })
+	t.Cleanup(func() { runExecClaude = prevExec })
 	err = runClaude(cmd, m, []string{"--version"})
 	if err == nil {
 		t.Fatal("runClaude accepted a daemon response for the wrong forced account")
 	}
 	for _, want := range []string{
 		"id 2",
-		"expected dir \"" + requested.ConfigDir + "\"",
-		"returned dir \"" + returned.ConfigDir + "\"",
+		"expected dir \"" + pool.AccountPresentationDir(requested.ID) + "\"",
+		"returned dir \"" + pool.AccountPresentationDir(returned.ID) + "\"",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err, want)
@@ -193,8 +188,8 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 	if out := stripANSI(stderr.String()); out != "" {
 		t.Errorf("malformed response printed a selection banner: %q", out)
 	}
-	if acquireCalls != 0 || execCalls != 0 {
-		t.Errorf("malformed response reached launch consequences: acquire=%d exec=%d", acquireCalls, execCalls)
+	if execCalls != 0 {
+		t.Errorf("malformed response reached launch consequences: exec=%d", execCalls)
 	}
 	select {
 	case <-aborted:

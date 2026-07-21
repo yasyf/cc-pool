@@ -1,14 +1,14 @@
 package pool
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
-	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/state"
+	"github.com/yasyf/cc-pool/internal/overlay"
 )
 
 // ErrNoIdentity means a .claude.json has no usable "oauthAccount" identity.
@@ -20,39 +20,77 @@ type Identity struct {
 	EmailAddress string
 }
 
-// privateClaudeJSONPath is the account's private .claude.json — pure path
-// math off the backend (see AccountIdentity for why the account dir is never
-// traversed).
-func privateClaudeJSONPath(backend fkoverlay.Backend, configDir string) string {
-	priv := configDir
-	if backend != fkoverlay.BackendSymlink {
-		priv = fkoverlay.FusePrivateRoot(configDir)
+func privateClaudeJSONPath(backingDir string) string {
+	return filepath.Join(backingDir, ".claude.json")
+}
+
+// AccountIdentity reads one account identity through a killable backing worker.
+func (m *Manager) AccountIdentity(
+	ctx context.Context,
+	accountID int,
+	configDir string,
+) (*Identity, error) {
+	response, err := m.runBackingWorker(ctx, backingWorkerRequest{
+		Operation: backingWorkerReadIdentity,
+		AccountID: accountID,
+		ConfigDir: configDir,
+	})
+	if err != nil {
+		return nil, err
 	}
-	return filepath.Join(priv, ".claude.json")
+	if response.Identity == nil {
+		return nil, errors.New("account backing worker returned no identity")
+	}
+	return response.Identity, nil
 }
 
-// AccountIdentity returns a pool account's identity from its private .claude.json.
-// The path is pure math off the backend, so a read works whether or not a mount,
-// holder, or domain is up. Only a symlink row keeps its identity in the account dir;
-// fuse and fileprovider rows hold it in the shared private backing root, and their
-// account dir is a bridge symlink a read must never traverse. See ccn doc d1ab40f.
-func AccountIdentity(backend fkoverlay.Backend, configDir string) (*Identity, error) {
-	_, id, err := readIdentityRaw(privateClaudeJSONPath(backend, configDir))
-	return id, err
+// AccountOAuth reads one account's byte-exact OAuth identity through a killable worker.
+func (m *Manager) AccountOAuth(
+	ctx context.Context,
+	accountID int,
+	configDir string,
+) (json.RawMessage, *Identity, error) {
+	response, err := m.runBackingWorker(ctx, backingWorkerRequest{
+		Operation: backingWorkerReadOAuth,
+		AccountID: accountID,
+		ConfigDir: configDir,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if response.Identity == nil || len(response.OAuthAccount) == 0 {
+		return nil, nil, errors.New("account backing worker returned incomplete OAuth identity")
+	}
+	return response.OAuthAccount, response.Identity, nil
 }
 
-// AccountOAuth returns the verbatim oauthAccount object plus the parsed
-// identity from a pool account's private .claude.json — the byte-exact
-// payload a sync-registry publish carries.
-func AccountOAuth(backend fkoverlay.Backend, configDir string) (json.RawMessage, *Identity, error) {
-	return readIdentityRaw(privateClaudeJSONPath(backend, configDir))
+// WriteIdentity writes one account's OAuth identity through a killable worker.
+func (m *Manager) WriteIdentity(
+	ctx context.Context,
+	accountID int,
+	configDir string,
+	oauthAccount json.RawMessage,
+) error {
+	_, err := m.runBackingWorker(ctx, backingWorkerRequest{
+		Operation:    backingWorkerWriteIdentity,
+		AccountID:    accountID,
+		ConfigDir:    configDir,
+		OAuthAccount: oauthAccount,
+	})
+	return err
 }
 
-// WriteIdentity injects oauthAccount verbatim into a pool account's private
-// .claude.json, preserving sibling keys; a missing or unparseable file fails
-// loud — it never seeds a fresh document.
-func WriteIdentity(backend fkoverlay.Backend, configDir string, oauthAccount json.RawMessage) error {
-	path := privateClaudeJSONPath(backend, configDir)
+func accountIdentityDirect(backingDir string) (*Identity, error) {
+	_, identity, err := accountOAuthDirect(backingDir)
+	return identity, err
+}
+
+func accountOAuthDirect(backingDir string) (json.RawMessage, *Identity, error) {
+	return readIdentityRaw(privateClaudeJSONPath(backingDir))
+}
+
+func writeIdentityDirect(backingDir string, oauthAccount json.RawMessage) error {
+	path := privateClaudeJSONPath(backingDir)
 	src, err := os.ReadFile(path) //nolint:gosec // G304: path is a cc-pool-managed account .claude.json under the state dir
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
@@ -69,15 +107,10 @@ func WriteIdentity(backend fkoverlay.Backend, configDir string, oauthAccount jso
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", path, err)
 	}
-	if err := state.AtomicWrite(path, out, 0o600); err != nil {
+	if err := overlay.WriteAtomic0600(path, out); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
-}
-
-func readIdentity(path string) (*Identity, error) {
-	_, id, err := readIdentityRaw(path)
-	return id, err
 }
 
 func readIdentityRaw(path string) (json.RawMessage, *Identity, error) {

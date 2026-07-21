@@ -2,12 +2,15 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/spf13/cobra"
+	ccdaemon "github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -16,6 +19,9 @@ func renameTestManager(t *testing.T) *pool.Manager {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetMeta("initialized", "1"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
@@ -33,7 +39,7 @@ func addRenameAccount(t *testing.T, m *pool.Manager, id int, label, email string
 		writeClaudeJSON(t, dir, fmt.Sprintf(`{"accountUuid": "u-%d", "emailAddress": %q}`, id, email))
 	}
 	if err := m.Store.UpsertAccount(store.Account{
-		ID: id, ConfigDir: dir, Label: label, OverlayKind: "symlink",
+		ID: id, ConfigDir: dir, Label: label,
 		KeychainService: "ccp-test", KeychainAccount: "ccp-test",
 	}); err != nil {
 		t.Fatal(err)
@@ -50,12 +56,47 @@ func writeClaudeJSON(t *testing.T, dir, oauthJSON string) {
 
 func renameCmd(t *testing.T, m *pool.Manager, args []string, opts renameOptions) (string, string, error) {
 	t.Helper()
+	if opts.auto {
+		tempHome(t)
+		startRenameIdentityServer(t, m)
+	}
 	var out, errOut bytes.Buffer
 	cmd := &cobra.Command{}
+	cmd.SetContext(t.Context())
 	cmd.SetOut(&out)
 	cmd.SetErr(&errOut)
 	err := runRename(cmd, m, args, opts)
 	return stripANSI(out.String()), stripANSI(errOut.String()), err
+}
+
+func startRenameIdentityServer(t *testing.T, m *pool.Manager) {
+	t.Helper()
+	startDaemonTestServer(t, "", func(_ context.Context, op ccdaemon.Op, request ccdaemon.Request) ccdaemon.Response {
+		if op != ccdaemon.OpAccountIdentity || request.Account == nil {
+			return ccdaemon.Response{OK: false, Error: "unexpected identity request"}
+		}
+		account, err := m.Store.GetAccount(*request.Account)
+		if err != nil {
+			return ccdaemon.Response{OK: false, Error: err.Error()}
+		}
+		body, err := os.ReadFile(filepath.Join(account.ConfigDir, ".claude.json"))
+		if err != nil {
+			return ccdaemon.Response{OK: false, Error: err.Error()}
+		}
+		var document struct {
+			OAuthAccount struct {
+				AccountUUID  string `json:"accountUuid"`
+				EmailAddress string `json:"emailAddress"`
+			} `json:"oauthAccount"`
+		}
+		if err := json.Unmarshal(body, &document); err != nil {
+			return ccdaemon.Response{OK: false, Error: err.Error()}
+		}
+		return ccdaemon.Response{OK: true, AccountIdentity: &ccdaemon.AccountIdentityResult{
+			AccountID: *request.Account, AccountUUID: document.OAuthAccount.AccountUUID,
+			EmailAddress: document.OAuthAccount.EmailAddress,
+		}}
+	})
 }
 
 func mustLabel(t *testing.T, m *pool.Manager, id int, want string) {

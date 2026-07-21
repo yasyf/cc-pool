@@ -39,63 +39,33 @@ Each account dir is seeded with a copy of your `~/.claude.json` with the identit
 (the account's own login writes its identity), so pooled sessions inherit your settings, MCP
 servers, and per-project tool approvals instead of running first-run onboarding.
 
-## Shared overlay
+## Revisioned tenant presentation
 
-Each account dir presents **all of `~/.claude`** — `projects/`, `skills/`, `plans/`,
-`settings.json`, `history.jsonl`, the lot — with writes passing straight back, so every
-session shares one workspace and plan-mode plans persist across pooled sessions. Two
-providers:
+Each account has one immutable FuseKit tenant generation. Its private backing directory
+keeps Claude identity and credential state, while the revisioned FuseKit catalog presents
+the effective shared configuration through both the native mount and File Provider. Tenant
+and domain identifiers derive from the account instance ID, never a path, filename, or
+private/computed classification.
 
-- **symlink** (default, zero-dependency): symlinks each top-level entry of `~/.claude` into
-  the account dir. New top-level entries are picked up automatically at launch, by the
-  daemon, and by `ccp doctor --fix`.
-- **fuse** (optional, live mirror): a passthrough mirror served via
-  [fuse-t](https://github.com/macos-fuse-t/fuse-t) — kext-less, mounted as you, no root —
-  and hosted by the external **fusekit-holder** cask app, a Developer ID-signed bundle at a
-  fixed `/Applications` path, so daemon restarts and cc-pool upgrades never disturb live
-  sessions' mounts (cc-pool itself stays pure Go). The pool rides **one native mount** at
-  `~/.cc-pool/mnt`: each account is a subtree (`mnt/acct-NN`) of that single mount — one
-  fuse-t NFS server process (`go-nfsv4`) total, not one per account — and each
-  `accounts/acct-NN` dir is a fail-closed symlink onto its subtree, so account-dir paths
-  (which feed Keychain service-name hashing and session detection) never change. Attaching
-  or detaching an account is a holder-side map operation with no kernel unmount; the only
-  whole-mount operations are holder replacement and wedge recovery, both gated on a
-  pool-wide zero-session window. Requires fusekit-holder ≥ v0.29.0 (`ccp` refuses older
-  holders loudly and keeps accounts on symlink until upgraded).
+cc-pool publishes one authoritative source revision. FuseKit computes the effective object
+fingerprint per tenant, suppresses unchanged tenants, journals the exact catalog delta, and
+notifies only domains that are live and materialized for an affected object. Inactive
+tenants remain logically stale until `PrepareTenant` catches up that one selected tenant.
+Atomic replacement is one catalog transaction: the source object keeps its identity, the
+replaced target is tombstoned once, and old handles retain their pinned snapshot.
 
-Privacy (TCC) grants across this stack are engineered to be one-time, and durability
-depends on how tccd keys each grant. **fusekit-holder** (`com.yasyf.fusekit-holder`)
-performs the NFS mounts, so a single *Network Volumes* grant covers every consumer; it
-survives upgrades because the holder is an app bundle at a fixed `/Applications` path,
-which tccd keys by identifier.
+One native Fuse-T mount at `~/.cc-pool/fusekit/mount` presents every account subtree. The
+fixed Developer ID-signed `/Applications/CCPoolStatus.app` embeds the FuseKit holder and
+dispatches disposable native-child mode from the same Mach-O before SwiftUI starts. The
+fixed signing identity owns the intended Network Volumes authorization across upgrades.
 
-The File Provider bridge is TCC-gated the same way. The daemon binds a socket inside the
-App Group container (`~/Library/Group Containers/SXKCTF23Q2.ccp/`), and on macOS 15+ a
-process touching a group container without the `application-groups` entitlement trips a
-consent prompt. tccd keys a **bare** executable's grants by resolved path — the dotted
-signing identifier lands in the grant's code requirement (any Developer ID release
-satisfies it) but not the lookup key — so a grant made against a per-version Homebrew keg
-path would die on every upgrade. The daemon therefore does not run as a bare binary: it
-ships as **CCPoolDaemon.app** (`com.yasyf.cc-pool.daemon`), a minimal Developer ID-signed
-bundle installed at the stable `libexec/CCPoolDaemon.app` opt path, and tccd keys a
-bundle's grants by identifier — durable across upgrades. The daemon stays pure Go
-(`CGO_ENABLED=0`): it resolves the container at runtime through
-`containerURLForSecurityApplicationGroupIdentifier:` (fusekit's `appgroup` package, objc
-over purego — no cgo) and joins the socket leaf onto the resolved dir; the hand-built
-`pool.FPBridgeSocketPath` join survives for display and diagnostics only. That resolution
-plus the bundle's embedded Developer ID provisioning profile authorizing its App Group
-claim is what makes the first group-container access a silent grant instead of a prompt —
-a Developer ID app-group entitlement without a profile, or a hand-built container path,
-still prompts. All three App Group members carry an embedded profile: the CCPoolStatus
-host app, the File Provider appex, and the daemon bundle.
-
-The daemon is the only process that touches the group container — the CLI reads bridge
-health from the daemon — so the interactive CLI needs no app-group grant and carries no
-such entitlement. One bare-path residual remains: the CLI runs from the keg path and does
-its own deep-probe reads through fuse mounts, so its *Network Volumes* grant stays
-per-version; unsigned local (HEAD) builds also carry a per-build cdhash requirement, and a
-HEAD daemon bundle is signed without a profile, so its group-container access can still
-prompt.
+The same app owns the File Provider broker endpoint in App Group `SXKCTF23Q2.ccp`.
+`CCPoolFileProvider.appex` reaches only that broker. The app forwards catalog traffic to
+the ordinary `~/.cc-pool/fusekit/fusekit.sock` endpoint; the pure-Go cc-pool account daemon
+never resolves, names, binds, dials, or traverses the Group Container. Host and extension
+signatures, Team ID, hardened runtime, provisioning, and entitlements are release gates.
+There is no second signed daemon identity and no direct home-directory exception in the
+File Provider extension.
 
 A few entries stay per-account instead of shared: `daemon/` and `ide/` (Claude's PID-keyed
 supervisor and IDE lock/socket files, which would collide across concurrent sessions),
@@ -105,11 +75,10 @@ auto-update state), and `remote-settings.json` (claude's cached per-subscription
 
 Per-account `.claude.json` doesn't mean settings fork. Its shareable top-level keys —
 everything except identity, per-project state, and startup counters — flow from
-`~/.claude.json` into pooled sessions, so a setting you change in vanilla `claude` reaches
-every account. One caveat: under the default symlink overlay the flow is one-way (merged in
-at launch, base wins), so changing a shareable setting *inside* a pooled session reverts at
-the next launch. Manage shared settings in vanilla `claude`, or use the fuse overlay, whose
-live merged view writes shareable changes back to `~/.claude.json` (two-way).
+`~/.claude.json` into pooled sessions, so a setting changed in vanilla `claude` reaches
+every affected tenant as one source revision. A shareable mutation made inside a pooled
+session commits through the same catalog/source transaction; identity and instance-local
+keys remain in that tenant's private backing state.
 
 ## Scoring
 
@@ -131,14 +100,18 @@ drained. A signed-out account is excluded from selection entirely rather than ra
 
 ## The daemon
 
-`brew services start cc-pool` (Homebrew installs) or `ccp service install` (source builds)
-runs a **user LaunchAgent** — a root daemon couldn't read your login Keychain. It polls
+`ccp service install` installs and starts the daemonkit-owned **user LaunchAgent** — a root
+daemon couldn't read your login Keychain. Homebrew installs the binary but does not own a
+second service lifecycle. The daemon polls
 usage every ~3 min with exponential backoff, refreshes **idle** accounts' tokens before they
 expire (a checked-out session owns its own refresh; the daemon adopts whatever token it
-rotated to on check-in), caches scores, and — with the fuse overlay — supervises the
-external **fusekit-holder** app, which owns the mounts so daemon restarts and upgrades never
-disturb them. `ccp add` and `ccp init` start it automatically; if it isn't running, `ccp select`
-auto-spawns the exact matching daemon and refuses to select until that daemon is healthy.
+rotated to on check-in), caches scores, publishes authoritative source revisions, and asks
+FuseKit to provision or prepare exact tenant generations. It does not supervise mounts,
+File Provider extensions, or App Group listeners. The fixed signed app owns the FuseKit
+runtime through daemonkit; the account daemon connects over the exact private session and
+fails closed on a missing or mismatched holder. `ccp add` and `ccp init` start the account
+daemon automatically; if it is not running, `ccp select` starts the exact matching daemon
+and refuses selection until the daemon and requested tenant revision are ready.
 
 No secrets are ever stored in cc-pool's database — the macOS Keychain is the only secret
 store.
@@ -194,8 +167,9 @@ so a tampered stamp stays uninstallable. The full rationale, including the
 adversarial-review record behind it, is in the design note (`ccn doc show 4dce1ad`).
 
 **Teardown fails closed.** A tombstoned account is removed locally only when the host
-can prove it idle — no live session, no launch reservation, no overlay conversion in
-flight; anything unprovable defers to the next pass. After claiming the removal, the
+can prove it idle — no live session, no launch reservation, no tenant preparation or
+durable source mutation in flight, and exact File Provider domain absence; anything
+unprovable defers to the next pass. After claiming the removal, the
 registry is re-checked so an account re-added in the window is spared, and a uuid shared
 by several local rows is refused outright, never guessed at. `ccp doctor` reports the
 resulting wedge, along with sync-socket health, mesh reachability, and registry

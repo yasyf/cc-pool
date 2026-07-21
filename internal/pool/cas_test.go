@@ -122,24 +122,22 @@ func TestWriteCredCAS(t *testing.T) {
 			}
 			fk.KeychainFaults = credstest.Faults{Read: tc.readFault}
 			st := openTestStore(t)
-			if err := st.UpsertAccount(a); err != nil {
-				t.Fatal(err)
-			}
-			m := &Manager{Store: st, Creds: fk, LockDir: t.TempDir()}
+			a = persistTestAccount(t, st, a)
+			m := &Manager{Store: st, Creds: fk}
 			before := fk.WriteCount()
 
-			err := m.writeCredCAS(a, creds.SourceKeychain, tc.prev, tc.next)
+			err := m.writeObservedCredential(t.Context(), a, creds.SourceKeychain, tc.prev, tc.next, nil)
 			if !errors.Is(err, tc.wantErr) {
-				t.Fatalf("writeCredCAS err = %v, want %v", err, tc.wantErr)
+				t.Fatalf("writeObservedCredential err = %v, want %v", err, tc.wantErr)
 			}
 			got, ok := fk.Get(a.KeychainService, a.KeychainAccount)
 			if tc.wantStored == "" {
 				if ok {
-					t.Fatalf("backend holds %+v after writeCredCAS, want it left absent", got)
+					t.Fatalf("backend holds %+v after writeObservedCredential, want it left absent", got)
 				}
 			} else {
 				if !ok {
-					t.Fatal("no credential in the fake backend after writeCredCAS")
+					t.Fatal("no credential in the fake backend after writeObservedCredential")
 				}
 				if got.ClaudeAiOauth.AccessToken != tc.wantStored {
 					t.Fatalf("stored access token = %q, want %q", got.ClaudeAiOauth.AccessToken, tc.wantStored)
@@ -155,19 +153,18 @@ func TestWriteCredCAS(t *testing.T) {
 // TestAdoptRotatedTokenReassertsUnchanged pins the CAS happy path: with no
 // concurrent writer the re-read matches and the credential is rewritten in place.
 func TestAdoptRotatedTokenReassertsUnchanged(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
 	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user"}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	a = persistTestAccount(t, st, a)
 	fk := credstest.NewFake()
 	fk.Put(a.KeychainService, a.KeychainAccount, casCred("at-0", "rt-0"))
-	m := &Manager{Store: st, Creds: fk, LockDir: t.TempDir()}
+	m := &Manager{Store: st, Creds: fk}
+	bindTestWorkerAuthority(t, m, "adopt-rotated")
 	before := fk.WriteCount()
 
 	if err := m.AdoptRotatedToken(context.Background(), a); err != nil {

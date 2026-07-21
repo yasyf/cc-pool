@@ -51,13 +51,10 @@ jobs:
           notary-key-id: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           notary-issuer-id: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
 
-      - name: Build universal binary (pure Go, arm64 + amd64 via lipo)
-        id: build
+      - name: Build universal CLI (pure Go, arm64 + amd64 via lipo)
         env:
-          # Sign under a stable, dotted identifier (not the undotted "cc-pool"
-          # default). tccd keys a bare executable's grants (the Network Volumes
-          # deep-probe reads) to the resolved path, but the dotted identifier lands
-          # in the grant's code requirement so any Developer ID release satisfies it.
+          # Sign the ordinary CLI/daemon under one stable dotted identifier. It
+          # carries no App Group entitlement; the fixed app owns that boundary.
           MACOS_CODESIGN_IDENTIFIER: com.yasyf.cc-pool
         run: |
           VERSION="${GITHUB_REF_NAME}"
@@ -65,128 +62,37 @@ jobs:
           LDFLAGS="-s -w -X github.com/yasyf/cc-pool/internal/version.Version=${VERSION} -X github.com/yasyf/cc-pool/internal/version.Commit=${COMMIT}"
           mkdir -p dist/pure
 
-          # Pure Go (symlink overlay; the default install).
+          # The account daemon never touches the App Group; the fixed signed
+          # status app owns the FuseKit holder and broker.
           CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/pure-arm64 ./cmd/cc-pool
           CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/pure-amd64 ./cmd/cc-pool
           lipo -create -output dist/pure/cc-pool dist/pure-arm64 dist/pure-amd64
 
-          # The daemon binds the File Provider bridge socket inside the App Group
-          # container (~/Library/Group Containers/<AppGroupID>/); on macOS 15+ a
-          # process without the application-groups entitlement touching a group
-          # container trips a TCC prompt. That entitlement now rides the
-          # CCPoolDaemon.app bundle (assembled below by wrap-daemon-bundle), NOT the
-          # bare CLI — so emit the daemon's entitlements plist here. Derive the group
-          # from the Go constant so the signed entitlement can never drift from what
-          # the code expects, and pin it to the signing team (a group's prefix must
-          # be the Team ID).
-          APP_GROUP="$(sed -n 's/^const AppGroupID = "\(.*\)"$/\1/p' internal/pool/paths.go)"
-          test -n "$APP_GROUP"
-          test "$APP_GROUP" = "${TEAM_ID}.ccp"
-          cat > dist/daemon.entitlements <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>com.apple.security.application-groups</key>
-            <array>
-              <string>${APP_GROUP}</string>
-            </array>
-          </dict>
-          </plist>
-          EOF
-
-          # Keep a second, unsigned copy of the universal binary for the daemon
-          # bundle. wrap-daemon-bundle re-signs it with the daemon identifier, the
-          # app-group entitlement, and the embedded profile.
-          cp dist/pure/cc-pool dist/cc-pool-daemon-bin
-
-          # Developer ID sign (hardened runtime, NO app-group entitlement — the
-          # group claim moved to the daemon bundle) and notarize the bare CLI Mach-O
-          # (recorded against its cdhash — a bare binary can't be stapled) via the
-          # shared script import-developer-id exported. The CLI never touches the
-          # group container (it reads bridge health from the daemon), so it carries
-          # no app-group grant. macOS 15/26 SIGKILL ad-hoc/Team-less signatures, so
-          # unsigned is not an option.
           bash "$MACOS_CODESIGN_SCRIPT" dist/pure/cc-pool darwin_universal
           dist/pure/cc-pool --version | grep -q "${VERSION}"
-
-          # CFBundleShortVersionString/CFBundleVersion must be numeric-dotted, so
-          # strip the leading `v` for the daemon bundle's version stamp.
-          echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
-
-      # Wrap the daemon as a minimal Developer ID .app bundle. A bundle's TCC
-      # grants are keyed by identifier (durable across upgrades) instead of by the
-      # per-version keg path a bare binary gets, and the embedded provisioning
-      # profile authorizing the App Group claim is what makes the first
-      # group-container access a silent, no-prompt grant. Signing/notary creds come
-      # from import-developer-id's env exports (MACOS_SIGN_IDENTITY, notary key);
-      # the action notarizes + staples the result.
-      - name: Wrap the daemon as a profiled .app bundle
-        id: daemon
-        uses: yasyf/homebrew-tap/.github/actions/wrap-daemon-bundle@v1
-        with:
-          binary: dist/cc-pool-daemon-bin
-          bundle-id: com.yasyf.cc-pool.daemon
-          bundle-name: CCPoolDaemon
-          executable-name: cc-pool
-          version: ${{ steps.build.outputs.version }}
-          entitlements: dist/daemon.entitlements
-          provisioning-profile-b64: ${{ secrets.MACOS_PROFILE_DAEMON }}
-
-      - name: Verify signing invariants
-        env:
-          DAEMON_APP: ${{ steps.daemon.outputs.bundle-path }}
-        run: |
-          set -euo pipefail
-          APP_GROUP="$(sed -n 's/^const AppGroupID = "\(.*\)"$/\1/p' internal/pool/paths.go)"
-          test -n "$APP_GROUP"
-
-          # The daemon bundle embeds a provisioning profile that decodes and
-          # authorizes the App Group — the precondition for a no-prompt grant.
-          PROFILE="$DAEMON_APP/Contents/embedded.provisionprofile"
-          test -f "$PROFILE"
-          DECODED="$(security cms -D -i "$PROFILE")"
-          echo "$DECODED" | grep -q "com.apple.security.application-groups"
-          # A Developer ID profile authorizes the group as the team wildcard
-          # "TEAM.*" (what the portal mints), which covers "TEAM.ccp"; accept
-          # the literal group or that covering wildcard.
-          echo "$DECODED" | grep -qF "$APP_GROUP" || echo "$DECODED" | grep -qF "${APP_GROUP%.*}.*"
-
-          # The daemon bundle's own code signature carries the literal App Group
-          # (the entitlements plist claims it verbatim, not a wildcard).
-          codesign -d --entitlements - "$DAEMON_APP" 2>&1 | grep -q "$APP_GROUP"
-
-          # The daemon bundle passes deep, strict verification.
-          codesign --verify --deep --strict --verbose=2 "$DAEMON_APP"
-
-          # The daemon bundle must carry a stapled notarization ticket. codesign
-          # --verify proves only the signature; wrap-daemon-bundle merely WARNS on
-          # missing notary creds. stapler validate fails closed on a bad ticket.
-          xcrun stapler validate "$DAEMON_APP"
-
-          # Only the daemon bundle claims the App Group; the CLI binary must not.
-          if codesign -d --entitlements - dist/pure/cc-pool 2>&1 | grep -q "application-groups"; then
+          CLI_ENTITLEMENTS="$(codesign -d --entitlements - dist/pure/cc-pool 2>&1 || true)"
+          if grep -q "application-groups" <<<"$CLI_ENTITLEMENTS"; then
             echo "::error::cc-pool CLI binary still carries an app-group entitlement"
             exit 1
           fi
+          if grep -Fq "SXKCTF23Q2.ccp" < <(strings -a dist/pure/cc-pool); then
+            echo "::error::cc-pool CLI binary embeds the App Group identifier"
+            exit 1
+          fi
+          if grep -Fq "Library/Group Containers" < <(strings -a dist/pure/cc-pool); then
+            echo "::error::cc-pool CLI binary embeds a Group Container path"
+            exit 1
+          fi
 
-      - name: Assemble the release tarball (cc-pool + CCPoolDaemon.app)
-        env:
-          DAEMON_APP: ${{ steps.daemon.outputs.bundle-path }}
+      - name: Assemble the release tarball
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
-          # ditto preserves the daemon bundle's signing seal and staple ticket
-          # (both regular files inside the bundle tree); the plain gzip tar then
-          # archives the whole tree, carrying the CLI and the notarized bundle at
-          # the tarball root. The formula installs cc-pool into bin and
-          # CCPoolDaemon.app into libexec.
           rm -rf dist/payload
           mkdir -p dist/payload
           cp dist/pure/cc-pool dist/payload/cc-pool
-          ditto "$DAEMON_APP" dist/payload/CCPoolDaemon.app
           tar -czf "dist/cc-pool-${VERSION}-darwin-universal.tar.gz" \
-            -C dist/payload cc-pool CCPoolDaemon.app
+            -C dist/payload cc-pool
 
       - name: Checksum the release assets
         id: shas
@@ -236,33 +142,34 @@ jobs:
       - uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: "26"
+      - uses: yasyf/homebrew-tap/.github/actions/prepare-app-build@fb4f471718f99cbfd627192e8c3f76c620e24be4
+        with:
+          go-version: 1.26.5
+          go-cache-dependency-path: go.sum
+          brew-packages: |
+            xcodegen
+            macos-fuse-t/cask/fuse-t
       - name: Test widget and File Provider logic
         run: |
           set -euo pipefail
-          brew install xcodegen
           cd widget
           # project.yml wires configFiles: Version.xcconfig; release-app.yml writes
           # a real one, so an unsigned test build only needs it to exist.
           printf 'MARKETING_VERSION = 0.0.0\nCURRENT_PROJECT_VERSION = 1\n' > Version.xcconfig
           xcodegen generate
-          # The FP scheme carries no test target; tests live on CCPoolStatus,
-          # and the FP flavor is compile-proven by a build.
           xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
-            -configuration Debug -derivedDataPath build-tests test \
-            CODE_SIGNING_ALLOWED=NO
-          xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatusFP \
-            -configuration Debug -derivedDataPath build-fp build \
+            -configuration Debug -derivedDataPath build-tests build test \
             CODE_SIGNING_ALLOWED=NO
 
   release-app:
-    needs: [version, widget-test]
+    needs: [version, widget-test, release]
     permissions:
       contents: write
-    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@v1
+    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@a566d98394424922d9836fc8cbff84a81a7dd5f2
     with:
       app_name: CCPoolStatus
       project_dir: widget
-      scheme: CCPoolStatusFP
+      scheme: CCPoolStatus
       bundle_id: com.yasyf.cc-pool.status
       marketing_version: ${{ needs.version.outputs.marketing }}
       appexes: |
@@ -277,6 +184,9 @@ jobs:
       cask_token: cc-pool-status
       cask_template_path: .github/cask/cc-pool-status.rb.tmpl
       assert_script: .github/scripts/assert-widget-app.sh
+      go_version: 1.26.5
+      go_cache_dependency_path: go.sum
+      prebuild_brew_packages: macos-fuse-t/cask/fuse-t
     secrets:
       MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
       MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}

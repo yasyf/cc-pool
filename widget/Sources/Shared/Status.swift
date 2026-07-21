@@ -5,11 +5,13 @@ import Foundation
 // pinned by TestStatusSnapshotJSONKeys in internal/daemon/snapshot_test.go.
 
 struct PoolStatus: Decodable {
+    static let protocolVersion = 1
+
     let proto: Int
     let version: String
     let generatedAt: Date
     let accounts: [AccountStatus]
-    let pool: PoolOutlook? // absent before the daemon ever samples, or pre-forecast daemons
+    let pool: PoolOutlook? // absent only before any account has a known-good sample
 
     enum CodingKeys: String, CodingKey {
         case proto, version, accounts, pool
@@ -23,46 +25,25 @@ extension PoolStatus {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         proto = try c.decode(Int.self, forKey: .proto)
+        guard proto == Self.protocolVersion else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .proto,
+                in: c,
+                debugDescription: "unsupported cc-pool status protocol \(proto)")
+        }
         version = try c.decode(String.self, forKey: .version)
         generatedAt = try c.decode(Date.self, forKey: .generatedAt)
         accounts = try c.decode([AccountStatus].self, forKey: .accounts)
-        // A malformed pool block is decorative damage only — degrade to the
-        // derived outlook rather than bricking the whole account list.
-        pool = try? c.decodeIfPresent(PoolOutlook.self, forKey: .pool)
+        pool = try c.decodeIfPresent(PoolOutlook.self, forKey: .pool)
+        if pool == nil, accounts.contains(where: { $0.hasUsage }) {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: c.codingPath,
+                debugDescription: "sampled accounts require the daemon-computed pool outlook"))
+        }
     }
 
-    /// The daemon-computed outlook, or a local approximation for daemons that
-    /// predate the pool block (widget cask and daemon formula upgrade
-    /// independently, so skew windows are real — and a neutral mascot smiling
-    /// at a dry pool would be actively misleading). Burn and dry-out need
-    /// daemon-side history, so the fallback simply omits them. nil means no
-    /// account has a known-good sample yet.
-    var outlook: PoolOutlook? {
-        if let pool {
-            // A daemon that ships the pool block but predates pace: re-derive
-            // pace5h locally from gross burn and the usable count, mirroring
-            // forecast.PoolOf (pace5h = grossBurn / (20 × usable)). PoolOutlook
-            // itself lacks the count, so it must be filled here.
-            guard pool.pace5hRaw == nil else { return pool }
-            let usableCount = accounts.filter { $0.hasUsage && !$0.rateLimited }.count
-            let pace5h = usableCount == 0 ? 0 : pool.burn5hPerHour / (20 * Double(usableCount))
-            return PoolOutlook(remaining5hPct: pool.remaining5hPct,
-                               remaining7dPct: pool.remaining7dPct,
-                               burnRaw: pool.burnRaw, netBurnRaw: pool.netBurnRaw,
-                               pace5hRaw: pace5h, pace7dRaw: 0,
-                               dryAtRaw: pool.dryAtRaw, moodRaw: pool.moodRaw)
-        }
-        let sampled = accounts.filter(\.hasUsage)
-        if sampled.isEmpty { return nil }
-        let usable = sampled.filter { !$0.rateLimited }
-        let mean5 = usable.map(\.remaining5h).meanClamped
-        let mean7 = usable.map(\.remaining7d).meanClamped
-        let mood: Mood = usable.isEmpty
-            ? .panic : Mood(remaining5h: mean5, dryProjected: false)
-        return PoolOutlook(remaining5hPct: mean5, remaining7dPct: mean7,
-                           burnRaw: nil, netBurnRaw: nil, pace5hRaw: nil, pace7dRaw: nil,
-                           dryAtRaw: nil, moodRaw: mood.rawValue)
-    }
+    /// The exact daemon-computed outlook; nil means no account has sampled.
+    var outlook: PoolOutlook? { pool }
 }
 
 /// The pool-wide rollup behind the widget headline and mascot, mirroring the
@@ -73,83 +54,30 @@ struct PoolOutlook: Decodable {
     // fileprivate, not private: the memberwise initializer inherits the most
     // restrictive property's access, and the fixtures below must call it.
     fileprivate let burnRaw: Double? // omitempty
-    fileprivate let netBurnRaw: Double? // omitempty
-    fileprivate let pace5hRaw: Double? // pace_5h; nil only from pre-pace daemons
-    fileprivate let pace7dRaw: Double? // pace_7d; nil only from pre-pace daemons
+    let netBurn5hPerHour: Double
+    let pace5h: Double
+    let pace7d: Double
     fileprivate let dryAtRaw: Date? // omitzero
-    fileprivate let moodRaw: String?
+    let mood: Mood
 
     var burn5hPerHour: Double { burnRaw ?? 0 }
-    /// Mean drain net of upcoming 5h refills, pp/h. nil from daemons that
-    /// predate the field — callers fall back to the gross burn.
-    var netBurn5hPerHour: Double? { netBurnRaw }
-    /// Gross 5h burn ÷ pool regeneration rate; 1.0 = sustainable forever.
-    /// nil only from pre-pace daemons, where PoolStatus.outlook re-derives it.
-    var pace5h: Double { pace5hRaw ?? 0 }
-    /// Gross 7d burn ÷ weekly regeneration rate; 1.0 = sustainable forever.
-    var pace7d: Double { pace7dRaw ?? 0 }
     var dryAt: Date? { dryAtRaw?.nonZero }
-    /// An unknown future mood name degrades by re-deriving from the numbers
-    /// the daemon shipped, not by failing decode or defaulting to calm.
-    var mood: Mood {
-        moodRaw.flatMap(Mood.init(rawValue:))
-            ?? Mood(remaining5h: remaining5hPct, dryProjected: dryAt != nil)
-    }
 
     enum CodingKeys: String, CodingKey {
         case remaining5hPct = "remaining_5h_pct"
         case remaining7dPct = "remaining_7d_pct"
         case burnRaw = "burn_5h_per_hour"
-        case netBurnRaw = "net_burn_5h_per_hour"
-        case pace5hRaw = "pace_5h"
-        case pace7dRaw = "pace_7d"
+        case netBurn5hPerHour = "net_burn_5h_per_hour"
+        case pace5h = "pace_5h"
+        case pace7d = "pace_7d"
         case dryAtRaw = "dry_at"
-        case moodRaw = "mood"
+        case mood
     }
-}
-
-extension PoolOutlook {
-    /// Pool 5h/7d usage as rounded whole percents, and the binding-window pick
-    /// the headline leads with: the fuller window binds, ties break to 5h since
-    /// it regenerates far faster — the softer claim.
-    var used5hPct: Int { Int((100 - remaining5hPct).rounded()) }
-    var used7dPct: Int { Int((100 - remaining7dPct).rounded()) }
-    var weekBinds: Bool { used7dPct > used5hPct }
-    var bindingLabel: String { weekBinds ? "7d" : "5h" }
-    var bindingUsedPct: Int { weekBinds ? used7dPct : used5hPct }
-    var otherLabel: String { weekBinds ? "5h" : "7d" }
-    var otherUsedPct: Int { weekBinds ? used5hPct : used7dPct }
 }
 
 /// Pool-health alarm level, calmest first. Raw values are the wire strings
 /// the daemon emits (forecast.Mood in internal/forecast/pool.go).
-enum Mood: String, CaseIterable {
-    case chill, easy, uneasy, worried, alarmed, panic
-
-    /// Mirrors forecast.moodOf's thresholds so a locally-derived mood matches
-    /// what the daemon would have computed.
-    init(remaining5h: Double, dryProjected: Bool) {
-        let base: Mood = switch remaining5h {
-        case 60...: .chill
-        case 40...: .easy
-        case 25...: .uneasy
-        case 10...: .worried
-        default: .alarmed
-        }
-        self = dryProjected ? base.worse : base
-    }
-
-    /// The next more-alarmed level; panic is terminal.
-    var worse: Mood {
-        switch self {
-        case .chill: .easy
-        case .easy: .uneasy
-        case .uneasy: .worried
-        case .worried: .alarmed
-        case .alarmed, .panic: .panic
-        }
-    }
-}
+enum Mood: String, CaseIterable, Decodable { case chill, easy, uneasy, worried, alarmed, panic }
 
 struct AccountStatus: Decodable, Identifiable {
     let id: Int
@@ -162,6 +90,7 @@ struct AccountStatus: Decodable, Identifiable {
     let rateLimited: Bool
     let exhausted: Bool? // omitempty in Go
     fileprivate let needsLoginRaw: Bool? // omitempty; refresh token gone/revoked
+    fileprivate let credentialQuarantinedRaw: Bool? // omitempty; exact credential recovery required
     let hasUsage: Bool
     let stale: Bool
     let resets5h: Date?
@@ -175,11 +104,10 @@ struct AccountStatus: Decodable, Identifiable {
     let scoped7dUtil: Double? // omitempty, utilization 0–100 of the model-scoped weekly cap
     let scoped7dResets: Date? // omitzero, reset time of the scoped weekly window
     let scoped7dModel: String? // omitempty, wire display name of the scoped model (presence signal)
-    let weeklyExhausted: Bool? // omitempty, the model-scoped weekly window is fully spent
 
     // Explicit keys, not .convertFromSnakeCase: digit-leading components like
-    // remaining_5h convert ambiguously. Keys the widget ignores (sample_age,
-    // overlay_kind, the PascalCase components breakdown) are simply undeclared.
+    // remaining_5h convert ambiguously. Keys the widget ignores (sample_age and
+    // the PascalCase components breakdown) are simply undeclared.
     enum CodingKeys: String, CodingKey {
         case id, label, score, stale, exhausted
         case configDir = "config_dir"
@@ -188,6 +116,7 @@ struct AccountStatus: Decodable, Identifiable {
         case activeSessions = "active_sessions"
         case rateLimited = "rate_limited"
         case needsLoginRaw = "needs_login"
+        case credentialQuarantinedRaw = "credential_quarantined"
         case hasUsage = "has_usage"
         case resets5h = "resets_5h"
         case resets7d = "resets_7d"
@@ -200,37 +129,22 @@ struct AccountStatus: Decodable, Identifiable {
         case scoped7dUtil = "scoped_7d_util"
         case scoped7dResets = "scoped_7d_resets"
         case scoped7dModel = "scoped_7d_model"
-        case weeklyExhausted = "weekly_exhausted"
     }
 
     var isExhausted: Bool { exhausted ?? false }
-    var isWeeklyExhausted: Bool { weeklyExhausted ?? false }
     var needsLogin: Bool { needsLoginRaw ?? false }
+    var credentialQuarantined: Bool { credentialQuarantinedRaw ?? false }
+    var unusable: Bool { rateLimited || isExhausted || needsLogin || credentialQuarantined }
     var hasOverage: Bool { (extraEnabled ?? false) && (extraUsed ?? 0) > 0 }
     var depleted5hAt: Date? { depleted5hAtRaw?.nonZero }
 
     /// The model-scoped weekly bucket (e.g. Fable's separate weekly cap), or
     /// nil when the daemon didn't report one. The model name is the presence
-    /// signal — an absent or empty name means nothing to render, so both skew
-    /// directions are safe: an old daemon omits the keys, an old widget ignores
-    /// them. Mirrors `hasOverage`'s gate-on-presence shape.
+    /// signal — an absent or empty name means nothing to render. Mirrors
+    /// `hasOverage`'s gate-on-presence shape.
     var scoped7d: (model: String, used: Double, resets: Date?)? {
         guard let model = scoped7dModel, !model.isEmpty else { return nil }
         return (model, scoped7dUtil ?? 0, scoped7dResets?.nonZero)
-    }
-
-    /// When the weekly window is exhausted, the reset clock to surface and its
-    /// label: the model-scoped bucket when it's the fuller weekly window (its
-    /// used ≥ the aggregate 7d used), else the aggregate `"7d"` window. nil
-    /// unless weekly-exhausted, or when the chosen window has no known reset.
-    var weeklyExhaustionReset: (label: String, reset: Date)? {
-        guard isWeeklyExhausted else { return nil }
-        if let scoped = scoped7d, scoped.used >= 100 - remaining7d {
-            guard let reset = scoped.resets else { return nil }
-            return (scoped.model, reset)
-        }
-        guard let reset = resets7d?.nonZero else { return nil }
-        return ("7d", reset)
     }
 
     /// Display label; empty labels fall back to the acct-NN dir basename.
@@ -241,7 +155,7 @@ struct AccountStatus: Decodable, Identifiable {
     /// Mirrors snapshotTier in internal/cli/status.go: status must never rank
     /// an unusable account above a usable one, however high its score.
     var tier: Int {
-        if needsLogin { return 3 }
+        if needsLogin || credentialQuarantined { return 3 }
         if !rateLimited && !isExhausted { return 0 }
         if !rateLimited { return 1 }
         return 2
@@ -253,25 +167,6 @@ extension [AccountStatus] {
     /// `ccp status` uses, so "first" here matches the CLI's ▸ next pick.
     var ranked: [AccountStatus] {
         sorted { ($0.tier, -$0.score) < ($1.tier, -$1.score) }
-    }
-}
-
-/// The footer's leading runs: the overflow count, then — split out so the view
-/// can tint it red — the count of exhausted accounts among the hidden ones. The
-/// exhausted run is nil when none are hidden; the whole result is nil when the
-/// footer would be empty, so the view renders nothing.
-func footerText(overflow: Int, exhausted: Int) -> (overflow: String, exhausted: String?)? {
-    guard overflow > 0 || exhausted > 0 else { return nil }
-    let sep = overflow > 0 ? " · " : ""
-    return (overflow > 0 ? "+\(overflow) more" : "",
-            exhausted > 0 ? "\(sep)\(exhausted) exhausted" : nil)
-}
-
-private extension [Double] {
-    /// Mean of values clamped to 0...100; 0 when empty — mirroring the Go
-    /// rollup's aggregation.
-    var meanClamped: Double {
-        isEmpty ? 0 : map { Swift.min(Swift.max($0, 0), 100) }.reduce(0, +) / Double(count)
     }
 }
 
@@ -333,7 +228,7 @@ extension PoolStatus {
     /// The pool block is mid-alarm (worried, dry-out projected) so the
     /// gallery shows the mascot earning its keep.
     static let sample = PoolStatus(
-        proto: 2,
+        proto: protocolVersion,
         version: "dev",
         generatedAt: Date().addingTimeInterval(-90),
         accounts: [
@@ -341,136 +236,89 @@ extension PoolStatus {
                 id: 1, configDir: "/Users/you/.cc-pool/accounts/acct-01",
                 label: "work@example.com", score: 88.4,
                 remaining5h: 58, remaining7d: 91, activeSessions: 4,
-                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil,
+                credentialQuarantinedRaw: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(3 * 3600),
                 resets7d: Date().addingTimeInterval(4 * 86400),
                 burn5hPerHour: 22, projected5hAtReset: nil,
                 depleted5hAtRaw: Date().addingTimeInterval(2.6 * 3600),
                 extraEnabled: nil, extraUsed: nil, extraLimit: nil,
                 scoped7dUtil: 92, scoped7dResets: Date().addingTimeInterval(4 * 86400),
-                scoped7dModel: "Fable", weeklyExhausted: nil),
+                scoped7dModel: "Fable"),
             AccountStatus(
                 id: 2, configDir: "/Users/you/.cc-pool/accounts/acct-02",
                 label: "rebecca.fallon.engineering@example-corp.com", score: 64.0,
                 remaining5h: 60, remaining7d: 41, activeSessions: 2,
-                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil,
+                credentialQuarantinedRaw: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(2 * 3600),
                 resets7d: Date().addingTimeInterval(3 * 86400),
                 burn5hPerHour: 6, projected5hAtReset: 48, depleted5hAtRaw: nil,
                 extraEnabled: nil, extraUsed: nil, extraLimit: nil,
-                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil, weeklyExhausted: nil),
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
             AccountStatus(
                 id: 3, configDir: "/Users/you/.cc-pool/accounts/acct-03",
                 label: "personal@example.com", score: 41.0,
                 remaining5h: 22, remaining7d: 58, activeSessions: 0,
-                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil,
+                credentialQuarantinedRaw: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(90 * 60),
                 resets7d: Date().addingTimeInterval(2 * 86400),
                 burn5hPerHour: 2, projected5hAtReset: 19, depleted5hAtRaw: nil,
                 extraEnabled: true, extraUsed: 5073, extraLimit: 10000,
-                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil, weeklyExhausted: nil),
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
             AccountStatus(
                 id: 4, configDir: "/Users/you/.cc-pool/accounts/acct-04",
                 label: "side@example.com", score: 18.0,
                 remaining5h: 12, remaining7d: 35, activeSessions: 0,
-                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: true,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil,
+                credentialQuarantinedRaw: nil, hasUsage: true, stale: true,
                 resets5h: Date().addingTimeInterval(3600),
                 resets7d: Date().addingTimeInterval(5 * 86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
                 extraEnabled: nil, extraUsed: nil, extraLimit: nil,
-                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil, weeklyExhausted: nil),
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
             AccountStatus(
                 id: 5, configDir: "/Users/you/.cc-pool/accounts/acct-05",
                 label: "fresh@example.com", score: 0.0,
                 remaining5h: 0, remaining7d: 0, activeSessions: 0,
-                rateLimited: false, exhausted: nil, needsLoginRaw: true, hasUsage: false, stale: false,
+                rateLimited: false, exhausted: nil, needsLoginRaw: nil,
+                credentialQuarantinedRaw: true, hasUsage: false, stale: false,
                 resets5h: nil, resets7d: nil,
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
                 extraEnabled: nil, extraUsed: nil, extraLimit: nil,
-                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil, weeklyExhausted: nil),
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
             AccountStatus(
                 id: 6, configDir: "/Users/you/.cc-pool/accounts/acct-06",
                 label: "", score: -40.2,
                 remaining5h: 1, remaining7d: 12, activeSessions: 0,
-                rateLimited: false, exhausted: true, needsLoginRaw: nil, hasUsage: true, stale: false,
+                rateLimited: true, exhausted: true, needsLoginRaw: nil,
+                credentialQuarantinedRaw: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(40 * 60),
                 resets7d: Date().addingTimeInterval(86400),
                 burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
                 extraEnabled: true, extraUsed: 177, extraLimit: 5000,
-                scoped7dUtil: 100, scoped7dResets: Date().addingTimeInterval(2 * 86400),
-                scoped7dModel: "Fable", weeklyExhausted: true),
+                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil),
         ],
         pool: PoolOutlook(
             remaining5hPct: 38, remaining7dPct: 56,
-            burnRaw: 13, netBurnRaw: 4, pace5hRaw: 0.62, pace7dRaw: 1.3,
+            burnRaw: 13, netBurn5hPerHour: 4, pace5h: 0.62, pace7d: 1.3,
             dryAtRaw: Date().addingTimeInterval(2.6 * 3600),
-            moodRaw: Mood.worried.rawValue))
+            mood: .worried))
 
     /// Variant of `sample` pinning a specific mascot mood, for the
     /// mood-sweep preview timeline. (PoolOutlook's raw fields are
     /// fileprivate, so fixture construction has to live in this file.)
     static func sample(mood: Mood) -> PoolStatus {
         PoolStatus(
-            proto: 2, version: "dev",
+            proto: protocolVersion, version: "dev",
             generatedAt: Date().addingTimeInterval(-90),
             accounts: sample.accounts,
             pool: PoolOutlook(
-                remaining5hPct: 38, remaining7dPct: 56, burnRaw: 13, netBurnRaw: 4,
-                pace5hRaw: 0.62, pace7dRaw: 1.3,
+                remaining5hPct: 38, remaining7dPct: 56,
+                burnRaw: 13, netBurn5hPerHour: 4, pace5h: 0.62, pace7d: 1.3,
                 dryAtRaw: mood == .chill ? nil : Date().addingTimeInterval(2.6 * 3600),
-                moodRaw: mood.rawValue))
+                mood: mood))
     }
 
-    /// A daemon that ships the pool block but predates the pace fields: gross
-    /// burn is present, pace_5h/pace_7d absent. Exercises the version-skew
-    /// derivation in `outlook` (pace5h = grossBurn / (20 × usable)).
-    static let samplePrePace = PoolStatus(
-        proto: 2,
-        version: "dev",
-        generatedAt: Date().addingTimeInterval(-90),
-        accounts: sample.accounts,
-        pool: PoolOutlook(
-            remaining5hPct: 38, remaining7dPct: 56, burnRaw: 13, netBurnRaw: 4,
-            pace5hRaw: nil, pace7dRaw: nil,
-            dryAtRaw: nil, moodRaw: Mood.worried.rawValue))
-
-    /// A pre-forecast daemon's snapshot: no pool block, no per-account
-    /// predictions. Exercises the derived-outlook fallback path in previews.
-    static let sampleLegacy = PoolStatus(
-        proto: 2,
-        version: "dev",
-        generatedAt: Date().addingTimeInterval(-90),
-        accounts: [
-            AccountStatus(
-                id: 1, configDir: "/Users/you/.cc-pool/accounts/acct-01",
-                label: "work@example.com", score: 80.1,
-                remaining5h: 72, remaining7d: 88, activeSessions: 1,
-                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
-                resets5h: Date().addingTimeInterval(3 * 3600),
-                resets7d: Date().addingTimeInterval(4 * 86400),
-                burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
-                extraEnabled: nil, extraUsed: nil, extraLimit: nil,
-                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil, weeklyExhausted: nil),
-            AccountStatus(
-                id: 2, configDir: "/Users/you/.cc-pool/accounts/acct-02",
-                label: "personal@example.com", score: 55.0,
-                remaining5h: 48, remaining7d: 61, activeSessions: 0,
-                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
-                resets5h: Date().addingTimeInterval(2 * 3600),
-                resets7d: Date().addingTimeInterval(2 * 86400),
-                burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
-                extraEnabled: nil, extraUsed: nil, extraLimit: nil,
-                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil, weeklyExhausted: nil),
-            AccountStatus(
-                id: 3, configDir: "/Users/you/.cc-pool/accounts/acct-03",
-                label: "", score: 12.0,
-                remaining5h: 15, remaining7d: 30, activeSessions: 0,
-                rateLimited: false, exhausted: nil, needsLoginRaw: nil, hasUsage: true, stale: false,
-                resets5h: Date().addingTimeInterval(3600),
-                resets7d: Date().addingTimeInterval(86400),
-                burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
-                extraEnabled: nil, extraUsed: nil, extraLimit: nil,
-                scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil, weeklyExhausted: nil),
-        ],
-        pool: nil)
 }

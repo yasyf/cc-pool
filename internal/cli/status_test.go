@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -353,14 +354,29 @@ func TestStatusTUISortsTiered(t *testing.T) {
 	exhausted.Account.ID = 1
 	healthy := pool.Snapshot{Score: 13.3}
 	healthy.Account.ID = 2
+	quarantined := pool.Snapshot{Score: 100, CredentialQuarantined: true}
+	quarantined.Account.ID = 3
 
-	model, _ := statusTUI{}.Update(snapsMsg{data: statusData{snaps: []pool.Snapshot{exhausted, healthy}}, at: time.Now()})
+	model, _ := statusTUI{}.Update(snapsMsg{data: statusData{snaps: []pool.Snapshot{quarantined, exhausted, healthy}}, at: time.Now()})
 	tui, ok := model.(statusTUI)
 	if !ok {
 		t.Fatalf("Update returned %T, want statusTUI", model)
 	}
-	if len(tui.snaps) != 2 || tui.snaps[0].Account.ID != 2 || tui.snaps[1].Account.ID != 1 {
+	if len(tui.snaps) != 3 || tui.snaps[0].Account.ID != 2 ||
+		tui.snaps[1].Account.ID != 1 || tui.snaps[2].Account.ID != 3 {
 		t.Fatalf("TUI must order the usable account first, got %+v", tui.snaps)
+	}
+}
+
+func TestCredentialQuarantineIsUnusableThroughDaemonStatus(t *testing.T) {
+	snaps := fromDaemon([]daemon.AccountStatus{{
+		ID: 1, Score: 100, CredentialQuarantined: true,
+	}})
+	if len(snaps) != 1 || !snaps[0].CredentialQuarantined || snapshotTier(snaps[0]) != 3 {
+		t.Fatalf("credential quarantine was not preserved as unusable: %+v", snaps)
+	}
+	if flag := stripANSI(snapshotFlags(snaps[0])); !strings.Contains(flag, "credential recovery") {
+		t.Fatalf("credential quarantine flag = %q, want credential recovery", flag)
 	}
 }
 
@@ -494,46 +510,37 @@ func TestUsageSuffix(t *testing.T) {
 	}
 }
 
-// TestStatusSnapshotJSONLiveFallback pins --json with no daemon: the snapshot
-// assembles from cached-fresh live samples.
-func TestStatusSnapshotJSONLiveFallback(t *testing.T) {
-	// Isolate HOME first: a live daemon at pool.SocketPath() would otherwise hijack the test.
+func writeStatusSnapshotTest(t *testing.T, snapshot daemon.StatusSnapshot) {
+	t.Helper()
+	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pool.StatusSnapshotPath(), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStatusSnapshotJSONUsesExactDiskSnapshotWithoutDaemon(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	generatedAt := time.Now().Add(-time.Minute).Truncate(time.Second)
+	want := daemon.NewStatusSnapshot([]daemon.AccountStatus{{
+		ID: 1, Label: "from-disk", SampleAge: "37s", HasUsage: true, Remaining5h: 60,
+	}}, generatedAt)
+	writeStatusSnapshotTest(t, want)
 
-	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	got, err := statusSnapshotJSON(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
-	if err := st.UpsertAccount(store.Account{
-		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "work@example.com",
-		KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
-	}); err != nil {
-		t.Fatal(err)
+	if !got.GeneratedAt.Equal(generatedAt) || len(got.Accounts) != 1 {
+		t.Fatalf("disk snapshot = %+v, want generated_at %v and one account", got, generatedAt)
 	}
-	// A fresh sample keeps Snapshots(live=true) off the network entirely.
-	if err := st.InsertUsageSample(store.UsageSample{
-		AccountID: 1, TS: time.Now(), Util5h: 40, Util7d: 20,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	snap, err := statusSnapshotJSON(t.Context(), &pool.Manager{Store: st}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if snap.Proto != daemon.SnapshotVersion || snap.Version != version.String() {
-		t.Errorf("proto/version = %d/%q, want %d/%q", snap.Proto, snap.Version, daemon.SnapshotVersion, version.String())
-	}
-	if len(snap.Accounts) != 1 {
-		t.Fatalf("accounts = %+v, want exactly the seeded account", snap.Accounts)
-	}
-	a := snap.Accounts[0]
-	if a.ID != 1 || a.Label != "work@example.com" || a.Remaining5h != 60 || !a.HasUsage {
-		t.Errorf("account = %+v, want id 1, label work@example.com, remaining_5h 60, has_usage", a)
-	}
-	if age := time.Since(snap.GeneratedAt); age < 0 || age > time.Minute {
-		t.Errorf("generated_at %v is not recent (age %v)", snap.GeneratedAt, age)
+	if account := got.Accounts[0]; account.Label != "from-disk" || account.SampleAge != "37s" {
+		t.Fatalf("disk account = %+v", account)
 	}
 }
 
@@ -543,13 +550,13 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 	cases := map[string]struct {
 		daemonVersion string
 		wantLabel     string
-		wantSampleAge string // "" = don't assert (live fallback recomputes it)
+		wantSampleAge string
 	}{
 		"usable daemon passes accounts through": {
 			daemonVersion: version.String(), wantLabel: "from-daemon", wantSampleAge: "42s",
 		},
-		"version skew falls back to live sampling": {
-			daemonVersion: "0.0.0-old", wantLabel: "from-store",
+		"version skew reads exact disk snapshot": {
+			daemonVersion: "0.0.0-old", wantLabel: "from-disk", wantSampleAge: "17s",
 		},
 	}
 	for name, tc := range cases {
@@ -574,26 +581,11 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 					}},
 				}
 			})
+			writeStatusSnapshotTest(t, daemon.NewStatusSnapshot([]daemon.AccountStatus{{
+				ID: 1, Label: "from-disk", SampleAge: "17s",
+			}}, time.Now().Add(-time.Minute)))
 
-			st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = st.Close() })
-			if err := st.UpsertAccount(store.Account{
-				ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "from-store",
-				KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
-			}); err != nil {
-				t.Fatal(err)
-			}
-			// Fresh sample keeps the fallback's Snapshots(live=true) off the network.
-			if err := st.InsertUsageSample(store.UsageSample{
-				AccountID: 1, TS: time.Now(), Util5h: 50, Util7d: 50,
-			}); err != nil {
-				t.Fatal(err)
-			}
-
-			snap, err := statusSnapshotJSON(t.Context(), &pool.Manager{Store: st}, false)
+			snap, err := statusSnapshotJSON(t.Context())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -604,16 +596,89 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 			if a.Label != tc.wantLabel {
 				t.Errorf("label = %q, want %q (wrong branch taken)", a.Label, tc.wantLabel)
 			}
-			if tc.wantSampleAge != "" && a.SampleAge != tc.wantSampleAge {
+			if a.SampleAge != tc.wantSampleAge {
 				t.Errorf("sample_age = %q, want %q passed through verbatim", a.SampleAge, tc.wantSampleAge)
 			}
 		})
 	}
 }
 
-// TestLedgerFooter pins the compact self-heal rollup: silent unless a row is
-// faulted or parked (a parked row counts once, as parked), then counts plus the
-// doctor pointer — per-row detail stays `ccp doctor`'s job.
+func TestReadStatusSnapshotRejectsNonExactFormats(t *testing.T) {
+	valid := daemon.NewStatusSnapshot([]daemon.AccountStatus{}, time.Now())
+	cases := map[string]daemon.StatusSnapshot{
+		"wrong protocol":    func() daemon.StatusSnapshot { s := valid; s.Proto++; return s }(),
+		"wrong version":     func() daemon.StatusSnapshot { s := valid; s.Version = "old"; return s }(),
+		"missing time":      func() daemon.StatusSnapshot { s := valid; s.GeneratedAt = time.Time{}; return s }(),
+		"null account list": func() daemon.StatusSnapshot { s := valid; s.Accounts = nil; return s }(),
+	}
+	for name, snapshot := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "status.json")
+			data, err := json.Marshal(snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readStatusSnapshot(path); err == nil {
+				t.Fatal("non-exact status snapshot was accepted")
+			}
+		})
+	}
+}
+
+func TestReadStatusSnapshotRejectsUnknownAndTrailingJSON(t *testing.T) {
+	valid, err := json.Marshal(daemon.NewStatusSnapshot([]daemon.AccountStatus{}, time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var object map[string]any
+	if err := json.Unmarshal(valid, &object); err != nil {
+		t.Fatal(err)
+	}
+	object["unknown"] = true
+	unknown, err := json.Marshal(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{
+		"unknown field":  unknown,
+		"trailing value": append(append([]byte(nil), valid...), []byte(`{}`)...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "status.json")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readStatusSnapshot(path); err == nil {
+				t.Fatal("non-exact JSON was accepted")
+			}
+		})
+	}
+}
+
+func TestGatherStatusUsesDiskSnapshotWithoutManager(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	writeStatusSnapshotTest(t, daemon.NewStatusSnapshot([]daemon.AccountStatus{{
+		ID: 7, Label: "disk-only",
+	}}, time.Now()))
+	snapshots, _, err := gatherStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshots) != 1 || snapshots[0].Account.ID != 7 || snapshots[0].Account.Label != "disk-only" {
+		t.Fatalf("gathered disk snapshots = %+v", snapshots)
+	}
+}
+
+func TestStatusCommandHasNoLiveSamplingFlag(t *testing.T) {
+	if flag := newStatusCmd().Flags().Lookup("live"); flag != nil {
+		t.Fatalf("retired live sampling flag remains: %+v", flag)
+	}
+}
+
+// TestLedgerFooter pins the compact auth-health rollup.
 func TestLedgerFooter(t *testing.T) {
 	cases := map[string]struct {
 		ledgers []daemon.LedgerState
@@ -629,20 +694,16 @@ func TestLedgerFooter(t *testing.T) {
 			"",
 		},
 		"faulted row": {
-			[]daemon.LedgerState{{Policy: "fuse.deepwedge", Resource: "/p/acct-01", Faulted: true}},
-			"self-heal: 1 faulted — run `ccp doctor` for detail",
+			[]daemon.LedgerState{{Policy: "auth.streak", Resource: "acct-01", Faulted: true}},
+			"auth health: 1 faulted",
 		},
-		"parked row counts once, as parked": {
-			[]daemon.LedgerState{{Policy: "fp.domain", Resource: "/p/acct-02", Faulted: true, Parked: true}},
-			"self-heal: 1 parked — run `ccp doctor` for detail",
-		},
-		"faulted and parked together": {
+		"faulted rows are counted": {
 			[]daemon.LedgerState{
-				{Policy: "fuse.deepwedge", Resource: "/p/acct-01", Faulted: true},
+				{Policy: "ratelimit.pool", Resource: "pool", Faulted: true},
 				{Policy: "auth.streak", Resource: "/p/acct-03", Faulted: true},
-				{Policy: "fp.domain", Resource: "/p/acct-02", Faulted: true, Parked: true},
+				{Policy: "auth.streak", Resource: "acct-02", Faulted: true},
 			},
-			"self-heal: 2 faulted, 1 parked — run `ccp doctor` for detail",
+			"auth health: 3 faulted",
 		},
 	}
 	for name, tc := range cases {
@@ -672,7 +733,7 @@ func TestRunStatusPlainLedgerFooter(t *testing.T) {
 			Accounts: []daemon.AccountStatus{{
 				ID: 1, Label: "work@example.com", HasUsage: true, Remaining5h: 50, Remaining7d: 50,
 			}},
-			Ledgers: []daemon.LedgerState{{Policy: "fp.domain", Resource: "/p/acct-02", Faulted: true, Parked: true}},
+			Ledgers: []daemon.LedgerState{{Policy: "auth.streak", Resource: "acct-02", Faulted: true}},
 		}
 	})
 
@@ -686,85 +747,13 @@ func TestRunStatusPlainLedgerFooter(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.SetOut(&buf)
 	cmd.SetContext(t.Context())
-	if err := runStatus(cmd, &pool.Manager{Store: st}, false, false, true); err != nil {
+	if err := runStatus(cmd, &pool.Manager{Store: st}, false, true); err != nil {
 		t.Fatalf("runStatus: %v", err)
 	}
 	out := stripANSI(buf.String())
-	if !strings.Contains(out, "self-heal: 1 parked — run `ccp doctor` for detail") {
+	if !strings.Contains(out, "auth health: 1 faulted") {
 		t.Errorf("plain status missing the ledger footer:\n%s", out)
 	}
 }
 
 // TestFPConsentFooter pins the consent footer text and its empty case.
-func TestFPConsentFooter(t *testing.T) {
-	if got := fpConsentFooter(false); got != "" {
-		t.Errorf("fpConsentFooter(false) = %q, want empty", got)
-	}
-	got := stripANSI(fpConsentFooter(true))
-	for _, frag := range []string{"app-group-container grant", "CCPoolDaemon.app", "ccp service install", "ccp doctor"} {
-		if !strings.Contains(got, frag) {
-			t.Errorf("fpConsentFooter(true) = %q, missing %q", got, frag)
-		}
-	}
-	if strings.Contains(got, "ccp fp consent") {
-		t.Errorf("fpConsentFooter(true) = %q, retained the stale `ccp fp consent` grant lever", got)
-	}
-}
-
-// TestRunStatusPlainFPConsentFooter pins the consent footer end-to-end through
-// runStatus against a fake daemon socket: shown when the daemon reports its bridge
-// bind parked on the consent prompt, hidden otherwise.
-func TestRunStatusPlainFPConsentFooter(t *testing.T) {
-	cases := map[string]struct {
-		consent   bool
-		wantShown bool
-	}{
-		"pending shows the banner": {true, true},
-		"not pending hides it":     {false, false},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			// Short HOME under /tmp: macOS caps sun_path at 104 bytes.
-			home, err := os.MkdirTemp("/tmp", "ccp-home")
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = os.RemoveAll(home) })
-			t.Setenv("HOME", home)
-			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			startDaemonTestServer(t, "", func(context.Context, daemon.Op, daemon.Request) daemon.Response {
-				return daemon.Response{
-					OK: true, Version: version.String(),
-					Accounts: []daemon.AccountStatus{{
-						ID: 1, Label: "work@example.com", HasUsage: true, Remaining5h: 50, Remaining7d: 50,
-					}},
-					FPConsentPending: tc.consent,
-				}
-			})
-
-			st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = st.Close() })
-
-			var buf bytes.Buffer
-			cmd := &cobra.Command{}
-			cmd.SetOut(&buf)
-			cmd.SetContext(t.Context())
-			if err := runStatus(cmd, &pool.Manager{Store: st}, false, false, true); err != nil {
-				t.Fatalf("runStatus: %v", err)
-			}
-			out := stripANSI(buf.String())
-			if !strings.Contains(out, "work@example.com") {
-				t.Fatalf("table missing the daemon's account:\n%s", out)
-			}
-			shown := strings.Contains(out, "app-group-container grant")
-			if shown != tc.wantShown {
-				t.Errorf("consent footer shown=%v, want %v:\n%s", shown, tc.wantShown, out)
-			}
-		})
-	}
-}

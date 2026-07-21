@@ -30,7 +30,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/synckit/rpc"
 )
 
@@ -68,18 +67,20 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
-// cmdInit sets the pool up as an initialized, symlink-overlay pool and lays a
-// minimal ~/.claude base so the symlink provider and the materializer have a
-// source. Overlay is pinned to symlink so the sim never mounts fuse.
+func openStore() (*store.Store, error) {
+	if err := pool.EnsureStateDir(); err != nil {
+		return nil, err
+	}
+	return store.Open(pool.DBPath())
+}
+
+// cmdInit sets up the pool's source-of-truth state without starting FuseKit.
 func cmdInit() error {
-	m, err := pool.Open()
+	db, err := openStore()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = m.Close() }()
-	if err := pool.EnsureStateDir(); err != nil {
-		return err
-	}
+	defer func() { _ = db.Close() }()
 	if err := pool.EnsureAccountsDir(); err != nil {
 		return err
 	}
@@ -94,10 +95,7 @@ func cmdInit() error {
 			return fmt.Errorf("write ~/.claude.json: %w", err)
 		}
 	}
-	if err := m.Store.SetMeta("overlay_kind", "symlink"); err != nil {
-		return err
-	}
-	if err := m.Store.SetMeta("initialized", "1"); err != nil {
+	if err := db.SetMeta("initialized", "1"); err != nil {
 		return err
 	}
 	return nil
@@ -118,40 +116,34 @@ func cmdAccount(args []string) error {
 		return fmt.Errorf("account needs --uuid, --access, --refresh, --expires-ms")
 	}
 
-	m, err := pool.Open()
+	db, err := openStore()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = m.Close() }()
+	defer func() { _ = db.Close() }()
 
 	configDir := pool.AccountDir(*id)
-	prov, err := pool.OverlayProviderFor(fkoverlay.BackendSymlink)
-	if err != nil {
-		return err
-	}
-	if err := prov.Reconcile(context.Background(), pool.ClaudeDir(), configDir); err != nil {
-		return fmt.Errorf("set up symlink overlay: %w", err)
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return fmt.Errorf("create private account source: %w", err)
 	}
 
-	// Write the private identity exactly as `claude /login` would: a .claude.json
-	// object carrying oauthAccount. Bootstrap an empty object, then inject.
+	// Write the private identity exactly as the source authority expects.
 	identPath := filepath.Join(configDir, ".claude.json")
-	if err := os.WriteFile(identPath, []byte("{}"), 0o600); err != nil {
-		return fmt.Errorf("bootstrap identity file: %w", err)
-	}
-	oauthAccount, err := json.Marshal(map[string]string{
-		"accountUuid":  *uuid,
-		"emailAddress": *email,
+	identity, err := json.Marshal(map[string]any{
+		"oauthAccount": map[string]string{
+			"accountUuid":  *uuid,
+			"emailAddress": *email,
+		},
 	})
 	if err != nil {
 		return err
 	}
-	if err := pool.WriteIdentity(fkoverlay.BackendSymlink, configDir, oauthAccount); err != nil {
+	if err := os.WriteFile(identPath, identity, 0o600); err != nil {
 		return fmt.Errorf("write identity: %w", err)
 	}
 
 	cred := makeCred(*access, *refresh, *expiresMS)
-	if err := (creds.FileStore{ConfigDir: configDir}).Write(cred); err != nil {
+	if err := (creds.FileStore{ConfigDir: configDir}).Write(context.Background(), cred); err != nil {
 		return fmt.Errorf("write file credential: %w", err)
 	}
 
@@ -161,15 +153,16 @@ func cmdAccount(args []string) error {
 	}
 	acct := store.Account{
 		ID:              *id,
+		InstanceID:      fmt.Sprintf("%032x", *id),
+		Generation:      1,
 		ConfigDir:       configDir,
 		KeychainService: creds.ServiceName(configDir),
 		KeychainAccount: creds.AccountLabel(),
 		Label:           *label,
-		OverlayKind:     string(fkoverlay.BackendSymlink),
 		AccountUUID:     rowUUID,
 		CreatedAt:       time.Now(),
 	}
-	if err := m.Store.UpsertAccount(acct); err != nil {
+	if err := db.UpsertAccount(acct); err != nil {
 		return fmt.Errorf("upsert account row: %w", err)
 	}
 	fmt.Printf("seeded acct-%02d uuid=%s hash=%s\n", *id, *uuid, creds.AccessHash(cred))
@@ -193,11 +186,11 @@ func cmdRotate(args []string) error {
 
 	configDir := pool.AccountDir(*id)
 	fstore := creds.FileStore{ConfigDir: configDir}
-	if _, err := fstore.Read(); err != nil {
+	if _, err := fstore.Read(context.Background()); err != nil {
 		return fmt.Errorf("read current credential: %w", err)
 	}
 	next := makeCred(*access, *refresh, *expiresMS)
-	if err := fstore.Write(next); err != nil {
+	if err := fstore.Write(context.Background(), next); err != nil {
 		return fmt.Errorf("write rotated credential: %w", err)
 	}
 	fmt.Printf("rotated acct-%02d hash=%s\n", *id, creds.AccessHash(next))
@@ -216,12 +209,12 @@ func cmdSetExp(args []string) error {
 		return fmt.Errorf("setexp needs --expires-ms")
 	}
 	fstore := creds.FileStore{ConfigDir: pool.AccountDir(*id)}
-	cur, err := fstore.Read()
+	cur, err := fstore.Read(context.Background())
 	if err != nil {
 		return fmt.Errorf("read current credential: %w", err)
 	}
 	cur.ClaudeAiOauth.ExpiresAt = *expiresMS
-	if err := fstore.Write(cur); err != nil {
+	if err := fstore.Write(context.Background(), cur); err != nil {
 		return fmt.Errorf("write re-expired credential: %w", err)
 	}
 	fmt.Printf("setexp acct-%02d expiresAt=%d hash=%s\n", *id, *expiresMS, creds.AccessHash(cur))
@@ -232,7 +225,7 @@ func cmdHash(args []string) error {
 	fs := flag.NewFlagSet("hash", flag.ExitOnError)
 	id := fs.Int("id", 1, "account index")
 	_ = fs.Parse(args)
-	cred, err := (creds.FileStore{ConfigDir: pool.AccountDir(*id)}).Read()
+	cred, err := (creds.FileStore{ConfigDir: pool.AccountDir(*id)}).Read(context.Background())
 	if err != nil {
 		return err
 	}
@@ -244,12 +237,12 @@ func cmdRowUUID(args []string) error {
 	fs := flag.NewFlagSet("rowuuid", flag.ExitOnError)
 	id := fs.Int("id", 1, "account index")
 	_ = fs.Parse(args)
-	m, err := pool.Open()
+	db, err := openStore()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = m.Close() }()
-	a, err := m.Store.GetAccount(*id)
+	defer func() { _ = db.Close() }()
+	a, err := db.GetAccount(*id)
 	if err != nil {
 		return err
 	}

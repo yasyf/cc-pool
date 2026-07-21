@@ -114,15 +114,13 @@ func serving(t *testing.T, cred *creds.Credential) *fakeTransport {
 	return handlerTransport(NewFetchCredentialHandler(lookup, read))
 }
 
-// TestFetchMethodIsNotTheV1Name pins the mixed-version secret boundary: v1's
-// ccp.fetch_credential served the FULL refresh-token-bearing blob, so the v2
-// method must be a distinct name — a v2 client against a rolled-back v1 origin
-// (or a v1 client against a v2 server) gets unknown-method, and the secret
-// never crosses. Reusing the v1 string would silently reopen that leak.
-func TestFetchMethodIsNotTheV1Name(t *testing.T) {
+// TestFetchMethodRejectsRemovedSecretBearingName pins the hard-cut secret
+// boundary: the removed ccp.fetch_credential served the full refresh-token-
+// bearing blob. Reusing that name would silently reopen the leak.
+func TestFetchMethodRejectsRemovedSecretBearingName(t *testing.T) {
 	// #nosec G101 -- this is an RPC method-name constant, not a credential.
 	if MethodFetchCredential != "ccp.fetch_stripped_credential" {
-		t.Fatalf("MethodFetchCredential = %q, want the pinned v2 name ccp.fetch_stripped_credential (never v1's ccp.fetch_credential)", MethodFetchCredential)
+		t.Fatalf("MethodFetchCredential = %q, want fresh-v1 ccp.fetch_stripped_credential", MethodFetchCredential)
 	}
 }
 

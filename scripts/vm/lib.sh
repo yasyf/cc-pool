@@ -10,10 +10,9 @@
 # repointed via VMCTL_TART_HOME to share a warm base-image pull with a sibling
 # harness (see VM_TART_HOME below).
 #
-# Safety: this harness drives File Provider fleet migrations that historically
-# wedged fileproviderd, and rides the same kernel-panic-capable macOS overlay
-# stack. Nothing here mounts anything on the host, and vm_assert_guest refuses
-# any target that is not a VM (kern.hv_vmm_present != 1).
+# Safety: this harness drives File Provider, TCC, and native-holder exercises.
+# Nothing here mounts anything on the host, and vm_assert_guest refuses any
+# target that is not a VM (kern.hv_vmm_present != 1).
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   echo "lib.sh is a library: source it (see scripts/vm/vmctl)" >&2
@@ -27,18 +26,10 @@ export VMCTL_IMAGE="${VMCTL_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-base:latest}"
 export VMCTL_CPUS="${VMCTL_CPUS:-4}"
 export VMCTL_MEMORY_MB="${VMCTL_MEMORY_MB:-8192}"
 export VMCTL_DISK_GB="${VMCTL_DISK_GB:-60}"
-# 10 min is the standing validation window: the FP-migrate storm this harness
-# replays wedged fileproviderd within seconds of the fleet migrate, so a clean
-# 10 min run is a decisive pass. Raise it per-invocation for a longer soak.
+# Ten minutes covers the standard identity, File Provider, worker-kill, and
+# convergence gates. Raise it per invocation for a longer soak.
 export VMCTL_RUN_TIMEOUT_MIN="${VMCTL_RUN_TIMEOUT_MIN:-10}"
 export VMCTL_GRAPHICS="${VMCTL_GRAPHICS:-0}"
-
-# Non-empty skips the provision-time App-Group TCC pre-seed (no-prompt scenario).
-export VMCTL_SKIP_TCC="${VMCTL_SKIP_TCC:-}"
-
-# Daemon App-Group provisioning profile (a `.provisionprofile` path or its
-# base64). Set = "profiled" bundle; unset = "unprofiled" (entitlement alone).
-export VMCTL_PROFILE_DAEMON="${VMCTL_PROFILE_DAEMON:-}"
 
 # --- Fixed layout: harness state under $VM_ROOT (default /tmp/ccpool-vm) -------
 
@@ -54,10 +45,6 @@ export VM_TART_HOME="${VMCTL_TART_HOME:-$VM_ROOT/tart}"
 # Belt and braces: exported once here AND pinned per-invocation in vm_tart /
 # vm_start, so no code path can reach ~/.tart.
 export TART_HOME="$VM_TART_HOME"
-# The cc-pool repo root (this lib lives at scripts/vm/lib.sh) — the daemon-bundle
-# helpers derive the App Group from internal/pool/paths.go so it cannot drift.
-VM_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-export VM_REPO_ROOT
 VM_SSH_DIR="$VM_ROOT/ssh"
 export VM_SSH_KEY="$VM_SSH_DIR/id_ed25519"
 export VM_RESULTS_ROOT="$VM_ROOT/results"
@@ -70,35 +57,20 @@ export VM_GUEST_HOME="/Users/$VM_GUEST_USER"
 export VM_GUEST_MARKER="$VM_GUEST_HOME/.vmctl-run-marker"
 
 # Guest install layout (written by push.sh, consumed by scenarios). The
-# CCPoolStatus companion app sits at the production cask path
-# (pool.WidgetAppPath() = /Applications/CCPoolStatus.app) so the File Provider
-# control/bridge sockets and the extension bundle id resolve unmodified in the
-# guest. The cc-pool binary + its ccp symlink live under the guest harness dir;
-# scenarios call them by absolute path.
+# fixed CCPoolStatus app sits at the production cask path so its designated
+# requirement, App Group broker endpoint, and extension identity are unchanged
+# in the guest. The cc-pool binary + its ccp symlink live under the guest
+# harness dir; scenarios call them by absolute path.
 export VMCTL_GUEST_DIR="$VM_GUEST_HOME/ccpool-vm"
 export VMCTL_GUEST_BIN="$VMCTL_GUEST_DIR/bin"
 export VMCTL_GUEST_CCPOOL="$VMCTL_GUEST_BIN/cc-pool"
 export VMCTL_GUEST_CCP="$VMCTL_GUEST_BIN/ccp"
 export VMCTL_GUEST_APP="/Applications/CCPoolStatus.app"
-# The daemon .app bundle (push installs it; scenarios run its exe). Its
-# CFBundleIdentifier is the durable, upgrade-stable TCC key for the group bind.
-export VMCTL_DAEMON_BUNDLE_ID="${VMCTL_DAEMON_BUNDLE_ID:-com.yasyf.cc-pool.daemon}"
-export VMCTL_GUEST_DAEMON_APP="$VMCTL_GUEST_DIR/CCPoolDaemon.app"
-export VMCTL_GUEST_DAEMON_EXE="$VMCTL_GUEST_DAEMON_APP/Contents/MacOS/cc-pool"
-# The daemon log the replay scenario scrapes; the daemon-start phase writes it.
+# The account daemon remains the ordinary CLI and never touches the App Group.
 export VMCTL_GUEST_DAEMON_LOG="$VMCTL_GUEST_DIR/daemon.log"
-# The File Provider extension bundle id (MUST equal pool.FPExtensionBundleID);
-# provision/push register+enable it with pluginkit, and cc-pool's FP gate reads
-# it back via `pluginkit -m -i`.
+# The File Provider extension bundle id pinned by the signed Swift runtime;
+# provision/push register and enable that exact identity with pluginkit.
 export VMCTL_FP_BUNDLE_ID="${VMCTL_FP_BUNDLE_ID:-com.yasyf.cc-pool.status.fileprovider}"
-
-# Space-separated App-Data TCC grantees (kTCCServiceSystemPolicyAppData): the
-# non-sandboxed cc-pool daemon reaches into the CCPoolStatus App Group container
-# to bind the File Provider bridge socket, which macOS gates behind a one-time
-# app-group-data prompt. sshd-keygen-wrapper is the TCC responsible process for
-# everything run over ssh; the installed daemon binary is a belt-and-braces
-# second grantee, granted by absolute path (client_type 1).
-export VMCTL_TCC_APPDATA_CLIENTS="${VMCTL_TCC_APPDATA_CLIENTS:-com.apple.sshd-keygen-wrapper $VMCTL_GUEST_CCPOOL}"
 
 # --- Logging -------------------------------------------------------------------
 
@@ -161,8 +133,8 @@ vm_exists() { [[ -n "$(vm_list_field Name)" ]]; }
 vm_is_running() { [[ "$(vm_list_field State)" == "running" ]]; }
 
 # vm_start launches `tart run` detached (nohup, pidfile). Mode "headless"
-# forces --no-graphics; the default "auto" honors VMCTL_GRAPHICS=1, the
-# one-time window used for the TCC click-Allow path.
+# forces --no-graphics; the default "auto" honors VMCTL_GRAPHICS=1 for the
+# File Provider Settings toggle when headless election does not stick.
 vm_start() {
   local mode="${1:-auto}" logf
   vm_ensure_dirs
@@ -350,8 +322,9 @@ vm_assert_guest() {
 # --- Panic detection and evidence -------------------------------------------------
 
 # vm_boottime prints the guest kern.boottime seconds, or returns 1 when the
-# guest is unreachable. A change against the run's baseline means the guest
-# rebooted underneath us — on this harness, that is a kernel panic signal.
+# guest is unreachable. A change against the run's baseline is a panic signal
+# unless the active scenario first created vmctl's one-shot intentional-reboot
+# marker; even that path remains gated on finding no new panic report.
 vm_boottime() {
   local out
   out="$(vm_ssh sysctl -n kern.boottime 2>/dev/null)" || return 1
@@ -412,32 +385,13 @@ vm_seconds_left() {
   printf '%s\n' "$left"
 }
 
-# --- Guest waits ------------------------------------------------------------------
-
-# vm_wait_guest_path waits up to $2 seconds (default 30) for a path to exist in
-# the guest — a bound socket, a marker file, a freshly installed binary.
-# Returns 1 on timeout.
-vm_wait_guest_path() {
-  local path="$1" timeout="${2:-30}" t0
-  t0="$(date +%s)"
-  while (($(date +%s) - t0 < timeout)); do
-    # shellcheck disable=SC2029 # host-side path expansion into the guest is intended
-    if vm_ssh "test -e '$path'" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
-}
-
 # --- File Provider provisioning ---------------------------------------------------
 
 # fp_register_and_enable makes the File Provider extension inside the installed
-# CCPoolStatus.app both REGISTERED and ENABLED with pluginkit — the exact gate
-# cc-pool's FileProviderAvailable checks (`pluginkit -m -i <id>` must lead with
-# '+'). Installing the app is not enough: LaunchServices must scan it and
+# CCPoolStatus.app both registered and enabled with pluginkit. Installing the
+# app is not enough: LaunchServices must scan it and
 # pluginkit must be told to `use` the extension. Requires the app already
-# pushed. Returns nonzero (with a click-Allow hint) when '+' is not reached.
+# pushed. Returns nonzero with the explicit GUI fallback when '+' is not reached.
 # Idempotent; push.sh calls it, and `vmctl provision` re-calls it once the app
 # exists so a re-provision after a push also enables the extension.
 fp_register_and_enable() {
@@ -463,7 +417,7 @@ fp_register_and_enable() {
     return 0
   fi
   warn "fp: extension $VMCTL_FP_BUNDLE_ID not enabled (pluginkit: '${line:-<not registered>}')"
-  warn "fp: the Settings File-Provider toggle is a SEPARATE gate from pluginkit — if headless enable did not stick, boot with VMCTL_GRAPHICS=1 and enable it in System Settings > General > Login Items & Extensions (README: FP provisioning)"
+  warn "fp: the Settings File-Provider toggle is a SEPARATE gate from pluginkit — if headless enable did not stick, boot with VMCTL_GRAPHICS=1 and enable it in System Settings > General > Login Items & Extensions (README: File Provider provisioning)"
   return 1
 }
 
@@ -471,9 +425,8 @@ fp_register_and_enable() {
 # CCPoolFileProvider extension. This is a SEPARATE gate from pluginkit enablement
 # (fp_register_and_enable): the tart base image ships residual File Provider state
 # that defaults every provider to DISABLED, so fileproviderd treats the provider as
-# user-disabled and every probe/serve fails FP -2011 (domainDisabled) — the migrate's
-# capability gate then refuses ("extension enabled but not serving") before any
-# account converts. On a real machine the user grants this in System Settings >
+# user-disabled and every probe/serve fails FP -2011 (domainDisabled). On a real
+# machine the user grants this in System Settings >
 # General > Login Items & Extensions > File Provider; that consumer path has no CLI,
 # so this is a TEST-HARNESS-ONLY lever (never a substitute for the Settings toggle
 # on a real install). fileproviderd's consent is a single boolean in the provider's
@@ -515,7 +468,7 @@ REMOTE
   vm_ssh "$remote" || die "fp: could not grant provider consent (Domains.plist edit / fileproviderd kickstart failed) — see the guest output above"
   # Give fileproviderd a beat to re-read, then verify by authoritative read-back.
   # Push-time verification is plist-only by design: the full serving probe needs the
-  # daemon's bridge socket, which is not bound until the replay's daemon-start phase.
+  # catalog broker and provisioned tenants, which are started by later scenarios.
   sleep 3
   local pl state
   # shellcheck disable=SC2016 # $HOME is deliberately literal — it expands guest-side, not here
@@ -524,11 +477,11 @@ REMOTE
   state="$(vm_ssh "/usr/libexec/PlistBuddy -c 'Print :NSFileProviderDomainDefaultIdentifier:Enabled' \"$pl\" 2>/dev/null")" || true
   state="$(printf '%s' "$state" | tr -d '[:space:]')"
   [[ "$state" == "true" ]] ||
-    die "fp: provider consent read-back is '${state:-<absent>}', not 'true' — the Domains.plist flip did not stick (fileproviderd rewrote it, or the state dir is absent on a pristine clone; README: FP provisioning)"
+    die "fp: provider consent read-back is '${state:-<absent>}', not 'true' — the Domains.plist flip did not stick (fileproviderd rewrote it, or the state dir is absent on a pristine clone; README: File Provider provisioning)"
   log "fp: provider consent granted (Domains.plist default-identifier Enabled=true)"
 }
 
-# --- Daemon bundle helpers ---
+# --- Developer ID discovery ----------------------------------------------------
 # Print "<identity>\t<team-id>" for a Developer ID Application identity, or die.
 vm_discover_signing() {
   if [[ -n "${VMCTL_SIGN_IDENTITY:-}" && -n "${VMCTL_SIGN_TEAM:-}" ]]; then
@@ -539,130 +492,14 @@ vm_discover_signing() {
   line="$(security find-identity -v -p codesigning 2>/dev/null | grep 'Developer ID Application' | head -n1)" || true
   if [[ -z "$line" ]]; then
     die "no 'Developer ID Application' code-signing identity in the login keychain.
-  The File Provider appex and CCPoolDaemon.app will NOT register/validate ad-hoc-signed, so a Developer ID cert is REQUIRED for the VM e2e. Options:
+  CCPoolStatus.app and its File Provider extension will NOT register/validate ad-hoc-signed, so a Developer ID cert is REQUIRED for the VM e2e. Options:
     1. Import the team SXKCTF23Q2 'Developer ID Application' cert + key into the login keychain (Keychain Access, or 'security import <cert.p12>').
     2. Pin one you know is present: VMCTL_SIGN_IDENTITY=<sha1-or-name> VMCTL_SIGN_TEAM=<teamid> scripts/vm/vmctl push
-    3. If none is available, the FP / daemon-bundle e2e cannot be validated in the VM — report that back rather than shipping an ad-hoc build."
+    3. If none is available, the File Provider/TCC e2e cannot be validated in the VM — report that back rather than shipping an ad-hoc build."
   fi
   # rows: `  1) <SHA1> "Developer ID Application: Name (TEAMID)"`.
   sha="$(printf '%s' "$line" | awk '{print $2}')"
   team="$(printf '%s' "$line" | sed -nE 's/.*\(([A-Z0-9]{10})\).*/\1/p')"
   [[ -n "$sha" && -n "$team" ]] || die "could not parse a Developer ID identity from: $line"
   printf '%s\t%s\n' "$sha" "$team"
-}
-
-# Print AppGroupID from paths.go (the entitlement + guest-bind source of truth).
-vm_app_group() {
-  local g
-  g="$(sed -n 's/^const AppGroupID = "\(.*\)"$/\1/p' "$VM_REPO_ROOT/internal/pool/paths.go")"
-  [[ -n "$g" ]] || die "could not read AppGroupID from $VM_REPO_ROOT/internal/pool/paths.go"
-  printf '%s\n' "$g"
-}
-
-# Assemble + Developer ID-sign CCPoolDaemon.app (release.yml's wrap-daemon-bundle@v1).
-# Args: <src_bin> <out_app> <sign_id> <version> <profiled|unprofiled>.
-vm_build_daemon_bundle() {
-  local src_bin="$1" out_app="$2" sign_id="$3" version="$4" mode="$5"
-  [[ -f "$src_bin" ]] || die "daemon bundle: source binary not found: $src_bin"
-  case "$mode" in
-  profiled | unprofiled) ;;
-  *) die "daemon bundle: mode must be 'profiled' or 'unprofiled', got: $mode" ;;
-  esac
-  local group bid exe
-  group="$(vm_app_group)"
-  bid="$VMCTL_DAEMON_BUNDLE_ID"
-  exe="cc-pool"
-
-  rm -rf "$out_app"
-  mkdir -p "$out_app/Contents/MacOS"
-  cp "$src_bin" "$out_app/Contents/MacOS/$exe"
-  chmod 755 "$out_app/Contents/MacOS/$exe"
-
-  # Contract Info.plist. LSUIElement (agent); LSBackgroundOnly deliberately absent.
-  cat >"$out_app/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleIdentifier</key><string>${bid}</string>
-  <key>CFBundleName</key><string>CCPoolDaemon</string>
-  <key>CFBundleExecutable</key><string>${exe}</string>
-  <key>CFBundleShortVersionString</key><string>${version}</string>
-  <key>CFBundleVersion</key><string>${version}</string>
-  <key>LSUIElement</key><true/>
-</dict>
-</plist>
-PLIST
-
-  # App-group entitlement only (mirrors release.yml dist/daemon.entitlements).
-  local ents
-  ents="$(mktemp -t ccp-daemon-ents.XXXXXX)"
-  cat >"$ents" <<ENTS
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>com.apple.security.application-groups</key>
-  <array><string>${group}</string></array>
-</dict>
-</plist>
-ENTS
-
-  if [[ "$mode" == "profiled" ]]; then
-    [[ -n "${VMCTL_PROFILE_DAEMON:-}" ]] || {
-      rm -f "$ents"
-      die "daemon bundle: profiled mode needs VMCTL_PROFILE_DAEMON (a .provisionprofile path or its base64)"
-    }
-    local prof="$out_app/Contents/embedded.provisionprofile" decoded
-    if [[ -f "$VMCTL_PROFILE_DAEMON" ]]; then
-      cp "$VMCTL_PROFILE_DAEMON" "$prof"
-    elif ! printf '%s' "$VMCTL_PROFILE_DAEMON" | base64 --decode >"$prof" 2>/dev/null; then
-      rm -f "$ents"
-      die "daemon bundle: VMCTL_PROFILE_DAEMON is neither a readable file nor valid base64"
-    fi
-    # The embedded profile must CMS-decode and authorize this exact group.
-    decoded="$(security cms -D -i "$prof" 2>/dev/null)" || {
-      rm -f "$ents"
-      die "daemon bundle: embedded provisioning profile does not CMS-decode"
-    }
-    printf '%s' "$decoded" | grep -q "com.apple.security.application-groups" || {
-      rm -f "$ents"
-      die "daemon bundle: embedded profile lacks application-groups"
-    }
-    printf '%s' "$decoded" | grep -q "$group" || {
-      rm -f "$ents"
-      die "daemon bundle: embedded profile does not authorize $group"
-    }
-  fi
-
-  # Developer ID sign: hardened runtime, timestamp, daemon identifier, app-group
-  # entitlement (an embedded profile is sealed as a bundle resource).
-  if ! codesign --force --sign "$sign_id" --identifier "$bid" \
-    --options runtime --timestamp \
-    --entitlements "$ents" "$out_app" 2>&1; then
-    rm -f "$ents"
-    die "daemon bundle: codesign failed for $out_app"
-  fi
-  rm -f "$ents"
-
-  codesign --verify --deep --strict --verbose=2 "$out_app" || die "daemon bundle: codesign verify failed for $out_app"
-  codesign -d --entitlements - "$out_app" 2>&1 | grep -q "$group" ||
-    die "daemon bundle: signed bundle is missing the $group app-group entitlement"
-  log "daemon bundle assembled: $out_app (mode=$mode, group=$group, version=$version)"
-}
-
-# Install a locally-built CCPoolDaemon.app into the guest at <guest_app>, keeping
-# its signature (plain tar preserves _CodeSignature). Args: <local_app> <guest_app>.
-vm_install_daemon_bundle() {
-  local local_app="$1" guest_app="$2"
-  [[ -d "$local_app" ]] || die "install daemon bundle: not a bundle: $local_app"
-  local base parent
-  base="$(basename "$local_app")"
-  parent="$(dirname "$guest_app")"
-  # shellcheck disable=SC2029 # host-side interpolation of the guest paths is intended
-  tar -C "$(dirname "$local_app")" -cf - "$base" |
-    vm_ssh "rm -rf '$guest_app' && mkdir -p '$parent' && tmp=\"\$(mktemp -d)\" && tar -xf - -C \"\$tmp\" && mv \"\$tmp/$base\" '$guest_app' && rmdir \"\$tmp\"" ||
-    die "install daemon bundle: tar into the guest failed ($local_app -> $guest_app)"
 }

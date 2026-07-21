@@ -7,52 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- The `CCPoolStatus.app` widget is now Developer ID signed, notarized, and
-  stapled at release time, so the `cc-pool-status` cask installs and launches
-  under Gatekeeper without a quarantine workaround. `ccp widget` no longer
-  strips quarantine, and the cask drops `HOMEBREW_CASK_OPTS=--no-quarantine`.
-- The FUSE-T mount machinery is extracted into
-  [github.com/yasyf/fusekit](https://github.com/yasyf/fusekit) — the detached
-  mount-holder protocol (`fusekit/mountd`) and the mount/serve/teardown
-  primitives (the root `fusekit` package). cc-pool keeps only its
-  mirror-specific code (the `overlay` provider and the `pool` holder seam), and
-  runtime is byte-identical.
-- Daemon takeover now uses newer-wins semantics: only a strictly newer cc-pool
-  evicts an incumbent, same-or-newer processes exit cleanly, and forced
-  termination revalidates the socket owner before sending SIGKILL.
-- Daemon shutdown now settles admitted work, including sync-socket requests,
-  before canceling executors; new work is refused during drain and shutdown
-  acknowledgements are delivered before exit.
-- The cc-pool LaunchAgent now uses KeepAlive with `SuccessfulExit=false`,
-  preventing clean takeover exits from being relaunched while continuing to
-  restart after failures.
-- Development builds now use mtime-ordered versions, so a rebuilt cc-pool
-  daemon can take over an older running daemon while release builds retain
-  their injected version and commit.
+- cc-pool now uses daemonkit for exact persistent-session transport, peer
+  identity, listener takeover, admission and draining, launchd policy,
+  disposable process groups, and durable worker reaping. The daemon no longer
+  owns a parallel LF-delimited protocol, process supervisor, socket lifecycle,
+  or generated-plist rewrite path.
+- Account selection now acquires a short, expiring reservation, releases the
+  account transaction, asks FuseKit to `PrepareTenant` at an exact revision,
+  and activates the session lease only if the reservation and account
+  generation still match. Account claims are never held across filesystem,
+  provider, socket, process, Keychain, or OAuth I/O.
+- Filesystem presentation now uses FuseKit's revisioned tenant catalog and
+  authoritative source fleet. Opaque object identity survives atomic
+  replacement, catalog deltas drive incremental File Provider enumeration, and
+  demand-aware convergence targets only live, materialized domains whose
+  effective content changed.
+- Credential writes, moves, refreshes, divergent-copy cleanup, and recovery are
+  generation-fenced durable operations. Context-unaware Keychain and file work
+  runs in disposable workers under Claude's credential locks, verifies exact
+  before/after observations, and is terminated and reaped before a timed-out
+  lane can be reused.
+- Credential settlement now records explicit result categories, failure
+  classes, slot states (`empty`, `present`, `unsearchable`, and `unreadable`),
+  and terminal success, failure, or quarantine instead of collapsing uncertain
+  external state into a retryable write. Retained provider failures never
+  masquerade as new outage probes or repeat OAuth work; internal ambiguity
+  stays unselectable until an exact readable credential replacement resolves
+  its receipt and quarantine fence.
+- The fixed Developer ID-signed `CCPoolStatus.app` now embeds the FuseKit
+  holder and App Group broker alongside its File Provider extension and widget.
+  The unsigned Go daemon uses only its private socket and never resolves,
+  names, binds, dials, or traverses the App Group container.
+- Runtime state and every cc-pool-owned protocol start at one fresh epoch:
+  `pool-v1.db` with SQLite schema version 1, `cc-pool.rpc.v1`, status snapshot
+  protocol 1, and v1 operation-ID domains. Exact equality is required before
+  mutation; old databases and clients fail closed.
 
 ### Added
-- A missing libfuse-t now surfaces as a graceful mount failure instead of
-  crashing the mount holder (cgofuse-load panic recovery → `ErrFuseUnavailable`),
-  and dead/wedged NFS carcasses are cleared before a remount (`ClearCarcass`).
-- Claude's new per-model weekly usage limit is now tracked end-to-end. Fable 5,
-  for example, gets its own weekly bucket capped at a share of the plan's
-  limit, so an account can be pegged there while its aggregate window looks
-  half-empty. The widget shows the bucket as a third labeled bar (large) and a
-  heat-colored `<model> N%` badge (medium); `ccp status` gains a TUI detail
-  bar, a table badge, and `scoped_7d_*` keys in `--json`; and selection folds
-  the bucket in as the binding weekly constraint, so sessions stop landing on
-  scoped-exhausted accounts. The model label always comes from the API, never
-  a hardcoded string. Wire fields are additive (`omitempty`, no protocol bump)
-  and the new `pool.db` columns are added in place at open (no wipe).
-- Behavior change: a pool whose every usable account is weekly-exhausted, on
-  the aggregate or the model-scoped window, now floors the mascot mood at
-  alarmed. Previously weekly exhaustion never reached the mood, so a pool that
-  could not serve default-model work within plan limits still showed a calm
-  mascot.
+- Durable account-mutation, credential-operation, source-authority, and removal
+  journals with generation fences, exact worker authority, crash recovery, and
+  causal publication evidence.
+- A single signed holder/broker topology and release/VM assertions for code
+  identity, entitlements, App Group isolation, worker deadline enforcement,
+  atomic replacement, and reconciliation amplification.
+
+### Removed
+- The cc-pool-owned mount holder, overlay conversion and probing, custom File
+  Provider bridge/controller/enumerator, per-domain notification fan-out,
+  session-lease files, PTY relay, migration commands, and old daemon wire.
+- All state and wire migration readers, import/export cutover tools, protocol
+  negotiation, compatibility aliases, and mixed-version operation. The hard
+  cut rebuilds derived runtime state from the account source of truth; it does
+  not teach the new binary to read an old epoch.
 
 ### Fixed
-- Commands that start, stop, inspect, or wait for the daemon now honor
-  cancellation while waiting on daemon startup, launchd, or Homebrew.
+- A timed-out content catch-up can no longer retain an account claim or leave
+  abandoned filesystem/provider work running after the caller returns.
+- One semantic Claude configuration change no longer causes global File
+  Provider fan-out, private-to-computed identity changes, full-root incremental
+  rebuilds, or cc-pool-amplified reconciliation retries.
 
 ## [0.28.0] - 2026-06-16
 

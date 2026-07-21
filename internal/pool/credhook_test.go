@@ -2,8 +2,8 @@ package pool
 
 import (
 	"bytes"
+	"context"
 	"errors"
-	"log"
 	"strings"
 	"testing"
 
@@ -20,104 +20,169 @@ func hookCred() *creds.Credential {
 	return c
 }
 
-// TestOnCredWriteHook pins the writeCred seam: the hook fires exactly once per
-// successful store write with the written account and credential, a nil hook
-// is a no-op, and a failed store write fails loud without ever reaching the
-// hook.
-func TestOnCredWriteHook(t *testing.T) {
-	writeFault := errors.New("keychain write exploded")
-	hookErr := errors.New("registry write failed")
-	cases := map[string]struct {
-		setHook    bool
-		hookErr    error
-		writeFault error
-		wantErrIs  error
-		wantHook   int
-		wantWrites int
-	}{
-		"hook fires once, nil error, passthrough":       {setHook: true, wantHook: 1, wantWrites: 1},
-		"hook error is swallowed":                       {setHook: true, hookErr: hookErr, wantHook: 1, wantWrites: 1},
-		"store write failure skips hook and fails loud": {setHook: true, writeFault: writeFault, wantErrIs: writeFault, wantHook: 0, wantWrites: 0},
-		"nil hook is a no-op":                           {setHook: false, wantHook: 0, wantWrites: 1},
+func TestWriteCredDoesNotPublishBeforeTerminalSettlement(t *testing.T) {
+	fake := credstest.NewFake()
+	st := openTestStore(t)
+	account := persistTestAccount(t, st, store.Account{
+		ID: 3, ConfigDir: t.TempDir(), KeychainService: "svc-hook", KeychainAccount: "user",
+	})
+	manager := &Manager{Store: st, Creds: fake}
+	settlements := 0
+	manager.SettleCredentialWrite = func(context.Context, CredentialWriteSettlement) error {
+		settlements++
+		return nil
 	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			fk := credstest.NewFake()
-			fk.KeychainFaults = credstest.Faults{Write: tc.writeFault}
-			st := openTestStore(t)
-			a := store.Account{ID: 3, ConfigDir: t.TempDir(), KeychainService: "svc-hook", KeychainAccount: "user"}
-			if err := st.UpsertAccount(a); err != nil {
-				t.Fatal(err)
-			}
-			m := &Manager{Store: st, Creds: fk, LockDir: t.TempDir()}
 
-			var (
-				gotCalls int
-				gotAcct  store.Account
-				gotCred  *creds.Credential
-			)
-			if tc.setHook {
-				m.OnCredWrite = func(acc store.Account, cr *creds.Credential) error {
-					gotCalls++
-					gotAcct = acc
-					gotCred = cr
-					return tc.hookErr
-				}
-			}
-
-			cred := hookCred()
-			err := m.writeCred(a, creds.SourceKeychain, cred)
-			if tc.wantErrIs != nil {
-				if !errors.Is(err, tc.wantErrIs) {
-					t.Fatalf("writeCred err = %v, want errors.Is %v", err, tc.wantErrIs)
-				}
-			} else if err != nil {
-				t.Fatalf("writeCred err = %v, want nil", err)
-			}
-			if gotCalls != tc.wantHook {
-				t.Fatalf("hook fired %d times, want %d", gotCalls, tc.wantHook)
-			}
-			if fk.WriteCount() != tc.wantWrites {
-				t.Fatalf("store writes = %d, want %d", fk.WriteCount(), tc.wantWrites)
-			}
-			if tc.wantHook > 0 {
-				if gotAcct.ID != a.ID {
-					t.Fatalf("hook account ID = %d, want %d", gotAcct.ID, a.ID)
-				}
-				if gotCred != cred {
-					t.Fatalf("hook received a different *Credential (%p) than was written (%p)", gotCred, cred)
-				}
-			}
-		})
+	if err := manager.writeCred(t.Context(), account, creds.SourceKeychain, hookCred()); err != nil {
+		t.Fatal(err)
+	}
+	if settlements != 0 {
+		t.Fatalf("pre-terminal settlements = %d, want 0", settlements)
+	}
+	if fake.WriteCount() != 1 {
+		t.Fatalf("credential writes = %d, want 1", fake.WriteCount())
 	}
 }
 
-// TestOnCredWriteErrorLoggedAndSwallowed proves the hook error is both logged
-// (naming the account) and swallowed so a registry write never fails a refresh.
-func TestOnCredWriteErrorLoggedAndSwallowed(t *testing.T) {
-	var buf bytes.Buffer
-	prev := log.Writer()
-	log.SetOutput(&buf)
-	defer log.SetOutput(prev)
+func TestCredentialWriteSettlementStartupDrainRetriesExactReceipt(t *testing.T) {
+	fixture := newInstallFixture(t)
+	incoming := envCred("settlement", 5_000)
+	started := make(chan CredentialWriteSettlement, 1)
+	fixture.m.SettleCredentialWrite = func(ctx context.Context, settlement CredentialWriteSettlement) error {
+		started <- settlement
+		<-ctx.Done()
+		return ctx.Err()
+	}
 
-	fk := credstest.NewFake()
-	st := openTestStore(t)
-	a := store.Account{ID: 9, ConfigDir: t.TempDir(), KeychainService: "svc-hook", KeychainAccount: "user"}
-	if err := st.UpsertAccount(a); err != nil {
+	ctx, cancel := context.WithCancel(t.Context())
+	type result struct {
+		installed bool
+		err       error
+	}
+	done := make(chan result, 1)
+	go func() {
+		installed, err := fixture.m.InstallSyncedCredential(ctx, fixture.a, incoming)
+		done <- result{installed: installed, err: err}
+	}()
+	first := <-started
+	cancel()
+	got := <-done
+	if !got.installed || !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("first result = installed:%v err:%v", got.installed, got.err)
+	}
+	receipt, err := fixture.m.Store.CredentialOperationReceiptByID(first.OperationID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{Store: st, Creds: fk, LockDir: t.TempDir()}
-	hookErr := errors.New("registry unreachable")
-	m.OnCredWrite = func(store.Account, *creds.Credential) error { return hookErr }
+	if !receipt.AcknowledgedAt.IsZero() {
+		t.Fatalf("failed settlement acknowledged at %v", receipt.AcknowledgedAt)
+	}
+	replayFailure := errors.New("replay unavailable")
+	fixture.m.SettleCredentialWrite = func(context.Context, CredentialWriteSettlement) error {
+		t.Fatal("settlement ran after replay failure")
+		return nil
+	}
+	if _, err := replayCredentialOperation(
+		t.Context(), fixture.m, fixture.a,
+		credentialOperationCodec[struct{}]{
+			replay: func(
+				context.Context, *Manager, store.Account, store.CredentialOperationReceipt,
+			) (struct{}, error) {
+				return struct{}{}, replayFailure
+			},
+		},
+		receipt,
+	); !errors.Is(err, replayFailure) {
+		t.Fatalf("failed replay error = %v", err)
+	}
+	receipt, err = fixture.m.Store.CredentialOperationReceiptByID(first.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !receipt.AcknowledgedAt.IsZero() {
+		t.Fatalf("failed replay acknowledged at %v", receipt.AcknowledgedAt)
+	}
+	if fixture.fk.WriteCount() != 1 {
+		t.Fatalf("first credential writes = %d, want 1", fixture.fk.WriteCount())
+	}
 
-	if err := m.writeCred(a, creds.SourceKeychain, hookCred()); err != nil {
-		t.Fatalf("writeCred err = %v, want nil (hook error must be swallowed)", err)
+	var replayed CredentialWriteSettlement
+	fixture.m.SettleCredentialWrite = func(_ context.Context, settlement CredentialWriteSettlement) error {
+		replayed = settlement
+		return nil
 	}
-	out := buf.String()
-	if !strings.Contains(out, "OnCredWrite") || !strings.Contains(out, hookErr.Error()) {
-		t.Fatalf("log = %q, want it to mention OnCredWrite and %q", out, hookErr)
+	if err := fixture.m.SettlePendingCredentialWrites(t.Context()); err != nil {
+		t.Fatalf("settle pending credential writes: %v", err)
 	}
-	if !strings.Contains(out, "acct-9") {
-		t.Fatalf("log = %q, want it to name acct-9", out)
+	if replayed.OperationID != first.OperationID ||
+		!bytes.Equal(replayed.PublicationPayload, first.PublicationPayload) {
+		t.Fatalf("settlement replay drifted: first=%+v replayed=%+v", first, replayed)
 	}
+	if fixture.fk.WriteCount() != 1 {
+		t.Fatalf("replay repeated external write: writes=%d", fixture.fk.WriteCount())
+	}
+	receipt, err = fixture.m.Store.CredentialOperationReceiptByID(first.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.AcknowledgedAt.IsZero() {
+		t.Fatal("successful exact settlement did not acknowledge the receipt")
+	}
+	installed, err := fixture.m.InstallSyncedCredential(t.Context(), fixture.a, incoming)
+	if err != nil || installed {
+		t.Fatalf("post-settlement install = installed:%v err:%v, want clean skip", installed, err)
+	}
+	if fixture.fk.WriteCount() != 1 {
+		t.Fatalf("post-settlement operation repeated external write: writes=%d", fixture.fk.WriteCount())
+	}
+}
+
+func TestCredentialWritePublicationWiringFailsClosedPerOperation(t *testing.T) {
+	t.Run("missing builder never crosses the external write boundary", func(t *testing.T) {
+		fixture := newInstallFixture(t)
+		fixture.m.BuildCredentialWritePublication = nil
+
+		installed, err := fixture.m.InstallSyncedCredential(
+			t.Context(), fixture.a, envCred("missing-builder", 5_000),
+		)
+		if installed || err == nil || !strings.Contains(err.Error(), "builder is unavailable") {
+			t.Fatalf("install = (%v, %v), want a pre-write builder failure", installed, err)
+		}
+		if fixture.fk.WriteCount() != 0 {
+			t.Fatalf("credential writes = %d, want zero", fixture.fk.WriteCount())
+		}
+	})
+
+	t.Run("missing settler retains the terminal publication receipt", func(t *testing.T) {
+		fixture := newInstallFixture(t)
+		fixture.m.SettleCredentialWrite = nil
+
+		installed, err := fixture.m.InstallSyncedCredential(
+			t.Context(), fixture.a, envCred("missing-settler", 5_000),
+		)
+		if !installed || err == nil || !strings.Contains(err.Error(), "settlement is unavailable") {
+			t.Fatalf("install = (%v, %v), want a post-write settlement failure", installed, err)
+		}
+		if fixture.fk.WriteCount() != 1 {
+			t.Fatalf("credential writes = %d, want one", fixture.fk.WriteCount())
+		}
+		receipts, more, err := fixture.m.Store.UnacknowledgedCredentialWriteReceipts(0, 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if more || len(receipts) != 1 || !receipts[0].AcknowledgedAt.IsZero() {
+			t.Fatalf("unacknowledged receipts = %+v more=%v, want one retained receipt", receipts, more)
+		}
+		if err := fixture.m.SettlePendingCredentialWrites(t.Context()); err == nil ||
+			!strings.Contains(err.Error(), "settlement is unavailable") {
+			t.Fatalf("startup settlement without wiring = %v, want fail closed", err)
+		}
+		receipt, err := fixture.m.Store.CredentialOperationReceiptByID(receipts[0].OperationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !receipt.AcknowledgedAt.IsZero() {
+			t.Fatalf("missing settler acknowledged receipt at %v", receipt.AcknowledgedAt)
+		}
+	})
 }

@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 
@@ -29,13 +30,36 @@ func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, 
 	case !cred.Synced():
 		return false, fmt.Errorf("refusing install for acct-%d: %w", a.ID, ErrEnvelopeNoAccessToken)
 	}
-	release, err := m.lockAccount(ctx, a.ID)
+	raw, err := cred.Marshal()
 	if err != nil {
 		return false, err
 	}
-	defer release()
+	fingerprint := sha256.Sum256(raw)
+	target := store.CredentialTargetKeychain
+	if _, source, readErr := m.ReadCredential(ctx, a); readErr == nil {
+		target = credentialTarget(source)
+	} else if errors.Is(readErr, creds.ErrUnavailable) {
+		target = store.CredentialTargetFile
+	}
+	return runCredentialOperation(
+		ctx,
+		m,
+		a,
+		store.CredentialOperationInstallSynced,
+		installCredentialOperationCodec(target, store.CredentialDigest(fingerprint)),
+		func(ctx context.Context, boundary *credentialOperationBoundary) (bool, error) {
+			return m.installSyncedCredential(ctx, a, cred, boundary)
+		},
+	)
+}
 
-	current, src, err := m.ReadCredential(a)
+func (m *Manager) installSyncedCredential(
+	ctx context.Context,
+	a store.Account,
+	cred *creds.Credential,
+	boundary *credentialOperationBoundary,
+) (bool, error) {
+	current, src, err := m.ReadCredential(ctx, a)
 	var prev *creds.Credential
 	switch {
 	case err == nil:
@@ -48,20 +72,20 @@ func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, 
 		prev = current
 	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
 		// No credential, or a claude tombstone: install to the resolved backend
-		// (writeCredCAS re-verifies the slot is still empty before writing).
+		// (writeObservedCredential re-verifies the slot is still empty before writing).
 	case errors.Is(err, creds.ErrUnavailable):
 		// No readable credential and the keychain is unsearchable (headless
 		// host); the re-check below retargets the write at the file store.
 	default:
-		return false, err
+		return false, fmt.Errorf("%w: %w", ErrCredentialUnverifiable, err)
 	}
-	// The CAS re-read guards only src, so re-check every backend: owned
+	// The source re-read guards only src, so re-check every backend: owned
 	// anywhere wins outright; a backend not PROVEN not-owned fails closed.
 	// ErrUnavailable is installEnvelope's headless file fallback, not an
 	// abort — owned-before-synced resolution (credOutranks) means an owned
 	// chain surfacing there later still outranks the synced copy.
 	for _, s := range m.Creds.Stores(a) {
-		cur, rerr := s.Read()
+		cur, rerr := s.Read(ctx)
 		switch creds.ClassifyRead(rerr) {
 		case creds.ReadEmpty:
 		case creds.ReadUnsearchable:
@@ -76,7 +100,7 @@ func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, 
 			}
 		}
 	}
-	if err := m.writeCredCAS(a, src, prev, cred); err != nil {
+	if err := m.writeObservedCredential(ctx, a, src, prev, cred, boundary); err != nil {
 		if errors.Is(err, ErrCredentialChangedUnderfoot) {
 			return false, nil
 		}

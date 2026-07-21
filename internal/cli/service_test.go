@@ -3,26 +3,18 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/fusekit/mountd"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
-
-func ptr[T any](v T) *T { return &v }
 
 func swapVar[T any](t *testing.T, target *T, val T) {
 	t.Helper()
@@ -31,8 +23,6 @@ func swapVar[T any](t *testing.T, target *T, val T) {
 	t.Cleanup(func() { *target = old })
 }
 
-// tempHome isolates HOME under a short /tmp path (macOS caps sun_path at 104
-// bytes; t.TempDir's /var/folders path overflows it once socket names append).
 func tempHome(t *testing.T) string {
 	t.Helper()
 	home, err := os.MkdirTemp("/tmp", "ccp-home")
@@ -42,93 +32,6 @@ func tempHome(t *testing.T) string {
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
 	t.Setenv("HOME", home)
 	return home
-}
-
-// TestCCPAgentProgramSelection pins the LaunchAgent Program branch: an installed
-// CCPoolDaemon.app bundle makes launchd exec the entitled bundle, while a
-// source/HEAD build with no bundle leaves Program empty so launchd falls back to
-// os.Executable.
-func TestCCPAgentProgramSelection(t *testing.T) {
-	tempHome(t)
-
-	t.Run("bundle present sets Program to the bundle executable", func(t *testing.T) {
-		bundle := filepath.Join(t.TempDir(), "cc-pool")
-		if err := os.WriteFile(bundle, []byte("bin"), 0o755); err != nil { //nolint:gosec // G306: test fixture must be executable.
-			t.Fatal(err)
-		}
-		swapVar(t, &daemonBundleBin, func() (string, error) { return bundle, nil })
-		if got := ccpAgent().Program; got != bundle {
-			t.Fatalf("ccpAgent().Program = %q, want the bundle executable %q", got, bundle)
-		}
-	})
-
-	t.Run("absent bundle leaves Program empty for the os.Executable fallback", func(t *testing.T) {
-		swapVar(t, &daemonBundleBin, func() (string, error) { return filepath.Join(t.TempDir(), "absent"), nil })
-		if got := ccpAgent().Program; got != "" {
-			t.Fatalf("ccpAgent().Program = %q, want empty (os.Executable fallback) with no bundle", got)
-		}
-	})
-
-	t.Run("resolver error leaves Program empty", func(t *testing.T) {
-		swapVar(t, &daemonBundleBin, func() (string, error) { return "", errors.New("no executable") })
-		if got := ccpAgent().Program; got != "" {
-			t.Fatalf("ccpAgent().Program = %q, want empty on resolver error", got)
-		}
-	})
-
-	// Homebrew runs the daemon via a <prefix>/bin symlink into the keg; the path
-	// must resolve it to reach the keg's libexec, not the never-linked prefix one.
-	t.Run("resolves a Homebrew bin symlink to the keg bundle", func(t *testing.T) {
-		prefix, err := filepath.EvalSymlinks(t.TempDir())
-		if err != nil {
-			t.Fatal(err)
-		}
-		keg := filepath.Join(prefix, "Cellar", "cc-pool", "1.0")
-		kegBin := filepath.Join(keg, "bin")
-		if err := os.MkdirAll(kegBin, 0o755); err != nil { //nolint:gosec // G301: test fixture dirs.
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(kegBin, "cc-pool"), []byte("bin"), 0o755); err != nil { //nolint:gosec // G306: fixture must be executable.
-			t.Fatal(err)
-		}
-		bundle := filepath.Join(keg, "libexec", "CCPoolDaemon.app", "Contents", "MacOS", "cc-pool")
-		if err := os.MkdirAll(filepath.Dir(bundle), 0o755); err != nil { //nolint:gosec // G301: test fixture dirs.
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(bundle, []byte("daemon"), 0o755); err != nil { //nolint:gosec // G306: fixture must be executable.
-			t.Fatal(err)
-		}
-		prefixBin := filepath.Join(prefix, "bin")
-		if err := os.MkdirAll(prefixBin, 0o755); err != nil { //nolint:gosec // G301: test fixture dirs.
-			t.Fatal(err)
-		}
-		link := filepath.Join(prefixBin, "cc-pool")
-		if err := os.Symlink(filepath.Join("..", "Cellar", "cc-pool", "1.0", "bin", "cc-pool"), link); err != nil {
-			t.Fatal(err)
-		}
-
-		got, err := pool.DaemonBinaryPath(link)
-		if err != nil {
-			t.Fatalf("DaemonBinaryPath: %v", err)
-		}
-		if got != bundle {
-			t.Fatalf("DaemonBinaryPath(%q) = %q, want the keg bundle %q", link, got, bundle)
-		}
-
-		// End to end: ccpAgent picks the resolved keg bundle up as launchd's Program.
-		swapVar(t, &daemonBundleBin, func() (string, error) { return pool.DaemonBinaryPath(link) })
-		if p := ccpAgent().Program; p != bundle {
-			t.Fatalf("ccpAgent().Program = %q, want the keg bundle %q", p, bundle)
-		}
-	})
-}
-
-func TestCCPAgentUsesTypedRestartOnFailure(t *testing.T) {
-	tempHome(t)
-	swapVar(t, &daemonBundleBin, func() (string, error) { return "", errors.New("no executable") })
-	if got := ccpAgent().RestartPolicy; got != service.RestartOnFailure {
-		t.Fatalf("ccpAgent().RestartPolicy = %v, want RestartOnFailure", got)
-	}
 }
 
 func seedAccounts(t *testing.T, accts ...store.Account) {
@@ -141,535 +44,347 @@ func seedAccounts(t *testing.T, accts ...store.Account) {
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
-	for _, a := range accts {
-		if a.KeychainService == "" {
-			a.KeychainService = "ccp-test-missing"
+	for _, account := range accts {
+		if account.InstanceID == "" {
+			account.InstanceID = "instance-" + pool.AccountDirName(account.ID)
 		}
-		if a.KeychainAccount == "" {
-			a.KeychainAccount = "ccp-test"
+		if account.Generation == 0 {
+			account.Generation = 1
 		}
-		if err := st.UpsertAccount(a); err != nil {
+		if account.KeychainService == "" {
+			account.KeychainService = "ccp-test-missing"
+		}
+		if account.KeychainAccount == "" {
+			account.KeychainAccount = "ccp-test"
+		}
+		if err := st.UpsertAccount(account); err != nil {
 			t.Fatal(err)
 		}
 	}
 }
 
-// stubStopDaemon stubs the daemon-stop seam so tests never drive the real
-// launchctl/brew.
-func stubStopDaemon(t *testing.T) *bool {
-	t.Helper()
-	called := false
-	swapVar(t, &stopDaemon, func(_ *cobra.Command) error {
-		called = true
-		return nil
-	})
-	return &called
-}
-
 func uninstallCmd() (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
 	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
 	var out, errOut bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&errOut)
 	return cmd, &out, &errOut
 }
 
-type fakeHolder struct {
-	t  *testing.T
-	ln net.Listener
-
-	mu  sync.Mutex
-	ops []string
-
-	version       string
-	mounts        []mountd.MountInfo
-	reclaimFailed []mountd.MountInfo
-	failHealth    bool
+type testDaemonServiceController struct {
+	desired     [][]service.Agent
+	closed      int
+	closeCtxErr error
+	convergeErr error
+	closeErr    error
 }
 
-func startFakeHolder(t *testing.T, fh *fakeHolder) *fakeHolder {
+func (c *testDaemonServiceController) Converge(_ context.Context, agents []service.Agent) error {
+	c.desired = append(c.desired, append([]service.Agent(nil), agents...))
+	return c.convergeErr
+}
+
+func (c *testDaemonServiceController) Close(ctx context.Context) error {
+	c.closed++
+	c.closeCtxErr = ctx.Err()
+	return c.closeErr
+}
+
+func useDaemonServiceController(t *testing.T, controller daemonServiceController) {
 	t.Helper()
-	fh.t = t
-	socket := mountd.DefaultHolderSocket()
-	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	ln, err := net.Listen("unix", socket)
+	swapVar(t, &openDaemonServiceController, func(context.Context) (daemonServiceController, error) {
+		return controller, nil
+	})
+}
+
+func TestCCPAgentUsesPinnedExecutableAndTypedRestartPolicy(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "ccp")
+	agent, err := ccpAgent(executable)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fh.ln = ln
-	t.Cleanup(func() { _ = ln.Close() })
-	go fh.serve()
-	return fh
-}
-
-func (f *fakeHolder) serve() {
-	for {
-		conn, err := f.ln.Accept()
-		if err != nil {
-			return
-		}
-		var req mountd.Request
-		if err := json.NewDecoder(conn).Decode(&req); err != nil {
-			_ = conn.Close() // Available() probes dial-and-close; not an op
-			continue
-		}
-		f.mu.Lock()
-		f.ops = append(f.ops, string(req.Op))
-		f.mu.Unlock()
-		resp := mountd.Response{Proto: mountd.MountProtoVersion, OK: true, Version: f.version}
-		switch req.Op {
-		case mountd.OpHealth:
-			if f.failHealth {
-				resp.OK = false
-				resp.Error = "health check failed"
-			}
-		case mountd.OpList:
-			resp.Mounts = f.mounts
-		case mountd.OpReclaim:
-			resp.Mounts = f.reclaimFailed
-		}
-		_ = json.NewEncoder(conn).Encode(resp)
-		_ = conn.Close()
+	if agent.Program != executable {
+		t.Fatalf("Program = %q, want %q", agent.Program, executable)
+	}
+	if agent.RestartPolicy != service.RestartOnFailure {
+		t.Fatalf("RestartPolicy = %v, want RestartOnFailure", agent.RestartPolicy)
+	}
+	if agent.Env["PATH"] != daemonServicePATH {
+		t.Fatalf("PATH = %q, want stable service PATH", agent.Env["PATH"])
+	}
+	if _, err := ccpAgent("ccp"); err == nil {
+		t.Fatal("ccpAgent accepted relative executable")
 	}
 }
 
-func (f *fakeHolder) sawOp(op mountd.Op) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, o := range f.ops {
-		if o == string(op) {
-			return true
-		}
+func TestResolveDaemonServiceExecutablePinsCurrentRoleTarget(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "ccp-v1")
+	if err := os.WriteFile(target, []byte("fixture"), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	return false
-}
-
-// TestUninstallSessionGate pins the uninstall session gate: fuse rows always
-// gate, every row under --purge, --force skips the scan, a failed scan aborts.
-func TestUninstallSessionGate(t *testing.T) {
-	type tc struct {
-		purge, force bool
-		sessions     []procscan.Session
-		scanErr      error
-		wantErr      []string
-		notInErr     []string
-		wantStop     bool
+	if err := os.Symlink(target, filepath.Join(root, "ccp")); err != nil {
+		t.Fatal(err)
 	}
-	home := func(t *testing.T) (fuseDir, symDir string) {
-		h := tempHome(t)
-		fuseDir = filepath.Join(h, ".cc-pool", "accounts", "acct-01")
-		symDir = filepath.Join(h, ".cc-pool", "accounts", "acct-02")
-		seedAccounts(t,
-			store.Account{ID: 1, ConfigDir: fuseDir, OverlayKind: string(fkoverlay.BackendNFS)},
-			store.Account{ID: 2, ConfigDir: symDir, OverlayKind: string(fkoverlay.BackendSymlink)},
-		)
-		return fuseDir, symDir
+	t.Setenv("PATH", root)
+	executable, err := resolveDaemonServiceExecutable()
+	if err != nil {
+		t.Fatal(err)
 	}
-	cases := map[string]struct {
-		build func(fuseDir, symDir string) tc
-	}{
-		"fuse sessions block a plain uninstall, listing pids": {
-			build: func(fuseDir, _ string) tc {
-				return tc{
-					sessions: []procscan.Session{{PID: 101, ConfigDir: fuseDir}, {PID: 102, ConfigDir: fuseDir}},
-					wantErr:  []string{"acct-01 (pid 101, 102)", "close them or pass --force"},
-					notInErr: []string{"acct-02"},
-				}
-			},
-		},
-		"symlink sessions do not block a plain uninstall": {
-			build: func(_, symDir string) tc {
-				return tc{
-					sessions: []procscan.Session{{PID: 201, ConfigDir: symDir}},
-					wantStop: true,
-				}
-			},
-		},
-		"purge blocks on sessions of any kind": {
-			build: func(_, symDir string) tc {
-				return tc{
-					purge:    true,
-					sessions: []procscan.Session{{PID: 201, ConfigDir: symDir}},
-					wantErr:  []string{"acct-02 (pid 201)"},
-				}
-			},
-		},
-		// purge=false: a passing purge would reach m.Remove and the Keychain,
-		// which tests never touch.
-		"plain-claude sessions (no config dir) never block": {
-			build: func(_, _ string) tc {
-				return tc{
-					sessions: []procscan.Session{{PID: 300, ConfigDir: ""}},
-					wantStop: true,
-				}
-			},
-		},
-		"force bypasses the gate with live fuse sessions": {
-			build: func(fuseDir, _ string) tc {
-				return tc{
-					force:    true,
-					sessions: []procscan.Session{{PID: 101, ConfigDir: fuseDir}},
-					wantStop: true,
-				}
-			},
-		},
-		"a failed scan aborts": {
-			build: func(_, _ string) tc {
-				return tc{
-					scanErr: errors.New("ps exploded"),
-					wantErr: []string{"cannot verify no live sessions", "ps exploded", "--force"},
-				}
-			},
-		},
-		"force skips even a failing scan": {
-			build: func(_, _ string) tc {
-				return tc{
-					force:    true,
-					scanErr:  errors.New("ps exploded"),
-					wantStop: true,
-				}
-			},
-		},
+	want, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for name, c := range cases {
-		t.Run(name, func(t *testing.T) {
-			fuseDir, symDir := home(t)
-			tc := c.build(fuseDir, symDir)
-			scanned := false
-			swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) {
-				scanned = true
-				return tc.sessions, tc.scanErr
-			})
-			swapVar(t, &dirMounted, func(string) bool { return false })
-			stopped := stubStopDaemon(t)
-			// No fake holder: the absent socket makes the holder leg a silent skip.
-			cmd, _, _ := uninstallCmd()
-			err := runServiceUninstall(cmd, tc.purge, tc.force)
-
-			if len(tc.wantErr) > 0 {
-				if err == nil {
-					t.Fatal("uninstall proceeded; want gate refusal")
-				}
-				for _, want := range tc.wantErr {
-					if !strings.Contains(err.Error(), want) {
-						t.Errorf("error %q missing %q", err, want)
-					}
-				}
-				for _, bad := range tc.notInErr {
-					if strings.Contains(err.Error(), bad) {
-						t.Errorf("error %q must not name %q", err, bad)
-					}
-				}
-				if *stopped {
-					t.Error("the daemon was stopped despite the gate refusing")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("uninstall: %v", err)
-			}
-			if *stopped != tc.wantStop {
-				t.Errorf("daemon stop reached = %v, want %v", *stopped, tc.wantStop)
-			}
-			if tc.force && scanned {
-				t.Error("--force must skip the session scan entirely")
-			}
-		})
+	if executable != want {
+		t.Fatalf("service executable = %q, want current role target %q", executable, want)
 	}
 }
 
-// TestUninstallReclaimsHolderMounts pins that uninstall reclaims cc-pool's own
-// mounts but never shuts down the shared multi-tenant holder.
-func TestUninstallReclaimsHolderMounts(t *testing.T) {
+func TestDaemonServiceControllerConfigIsStableAndDistinct(t *testing.T) {
 	tempHome(t)
-	swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) { return nil, nil })
-	swapVar(t, &dirMounted, func(string) bool { return false })
-	stubStopDaemon(t)
-	fh := startFakeHolder(t, &fakeHolder{
-		version:       version.String(),
-		reclaimFailed: []mountd.MountInfo{{Dir: "/tmp/stuck-dir"}},
+	config := daemonServiceControllerConfig()
+	if !filepath.IsAbs(config.StatePath) || !filepath.IsAbs(config.ProcessPath) ||
+		config.StatePath == config.ProcessPath {
+		t.Fatalf("controller paths = %q / %q", config.StatePath, config.ProcessPath)
+	}
+	if config.WorkerLimit != daemonServiceWorkerLimit {
+		t.Fatalf("WorkerLimit = %d, want %d", config.WorkerLimit, daemonServiceWorkerLimit)
+	}
+}
+
+func TestRunServiceInstallConvergesExactExecutableAgent(t *testing.T) {
+	tempHome(t)
+	executable := filepath.Join(t.TempDir(), "ccp")
+	swapVar(t, &serviceExecutable, func() (string, error) { return executable, nil })
+	holderReady := false
+	swapVar(t, &ensureHolder, func(context.Context) error {
+		holderReady = true
+		return nil
 	})
+	controller := &testDaemonServiceController{}
+	useDaemonServiceController(t, controller)
+	cmd, out, _ := uninstallCmd()
+	cmd.SetContext(t.Context())
+	if err := runServiceInstall(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if !holderReady {
+		t.Fatal("daemon service converged before holder readiness")
+	}
+	if len(controller.desired) != 1 || len(controller.desired[0]) != 1 {
+		t.Fatalf("desired = %+v", controller.desired)
+	}
+	agent := controller.desired[0][0]
+	if agent.Program != executable || agent.Label != "com.yasyf.cc-pool" ||
+		agent.RestartPolicy != service.RestartOnFailure {
+		t.Fatalf("agent = %+v", agent)
+	}
+	if controller.closed != 1 || controller.closeCtxErr != nil {
+		t.Fatalf("controller close = %d, context error = %v", controller.closed, controller.closeCtxErr)
+	}
+	if !strings.Contains(stripANSI(out.String()), "Installed and started the daemon") {
+		t.Fatalf("output = %q", out.String())
+	}
+}
 
-	cmd, out, errOut := uninstallCmd()
+func TestRunServiceInstallStopsBeforeControllerWhenHolderFails(t *testing.T) {
+	want := errors.New("holder not ready")
+	swapVar(t, &ensureHolder, func(context.Context) error { return want })
+	opened := false
+	swapVar(t, &openDaemonServiceController, func(context.Context) (daemonServiceController, error) {
+		opened = true
+		return nil, errors.New("must not open")
+	})
+	cmd, _, _ := uninstallCmd()
+	cmd.SetContext(t.Context())
+	if err := runServiceInstall(cmd); !errors.Is(err, want) {
+		t.Fatalf("error = %v, want holder failure", err)
+	}
+	if opened {
+		t.Fatal("controller opened before holder readiness")
+	}
+}
+
+func TestDaemonServiceControllerCloseJoinsAndOutlivesCancellation(t *testing.T) {
+	runErr := errors.New("converge failed")
+	closeErr := errors.New("close failed")
+	controller := &testDaemonServiceController{closeErr: closeErr}
+	useDaemonServiceController(t, controller)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := withDaemonServiceController(ctx, func(daemonServiceController) error { return runErr })
+	if !errors.Is(err, runErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("error = %v, want converge and close failures", err)
+	}
+	if controller.closed != 1 || controller.closeCtxErr != nil {
+		t.Fatalf("controller close = %d, context error = %v", controller.closed, controller.closeCtxErr)
+	}
+}
+
+func TestUninstallWithoutPurgeStopsDaemonAndPreservesState(t *testing.T) {
+	tempHome(t)
+	seedAccounts(t, store.Account{ID: 1, ConfigDir: pool.AccountDir(1)})
+	scanned := false
+	swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) {
+		scanned = true
+		return nil, errors.New("must not scan")
+	})
+	stopped := false
+	swapVar(t, &stopDaemon, func(*cobra.Command) error {
+		stopped = true
+		return nil
+	})
+	cmd, out, _ := uninstallCmd()
 	if err := runServiceUninstall(cmd, false, false); err != nil {
-		t.Fatalf("uninstall: %v", err)
+		t.Fatal(err)
 	}
-	if !fh.sawOp(mountd.OpReclaim) {
-		t.Error("the holder never received a reclaim op")
+	if scanned || !stopped {
+		t.Fatalf("scanned = %t, stopped = %t", scanned, stopped)
 	}
-	// Proto 2 has no shutdown op — the holder self-retires, never on consumer
-	// command — so uninstall structurally cannot stop the shared holder.
-	if got := stripANSI(errOut.String()); !strings.Contains(got, "couldn't unmount /tmp/stuck-dir") {
-		t.Errorf("failed dir not reported:\n%s", got)
+	if _, err := os.Stat(pool.DBPath()); err != nil {
+		t.Fatalf("state was not preserved: %v", err)
 	}
-	if got := stripANSI(out.String()); !strings.Contains(got, "Released cc-pool's mounts from the shared holder.") {
-		t.Errorf("missing holder-released line:\n%s", got)
+	if !strings.Contains(stripANSI(out.String()), "accounts and state are preserved") {
+		t.Fatalf("output = %q", out.String())
 	}
 }
 
-// TestUninstallSurvivorMount pins the unconditional post-stop survivor verify:
-// a still-mounted account dir hard-aborts a purge and exits nonzero otherwise;
-// --force vouches only for the session gate.
-func TestUninstallSurvivorMount(t *testing.T) {
-	cases := map[string]struct {
-		purge, force bool
-		wantErr      string
-	}{
-		"purge hard-aborts":                   {purge: true, wantErr: "refusing to purge"},
-		"plain uninstall is nonzero":          {purge: false, wantErr: "still mounted"},
-		"force purge still hard-aborts":       {purge: true, force: true, wantErr: "refusing to purge"},
-		"force plain uninstall stays nonzero": {purge: false, force: true, wantErr: "still mounted"},
+func TestPurgeSessionGateIsExactAndForceable(t *testing.T) {
+	accounts := []store.Account{
+		{ID: 1, ConfigDir: "/private/acct-01"},
+		{ID: 2, ConfigDir: "/private/acct-02"},
 	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			home := tempHome(t)
-			fuseDir := filepath.Join(home, ".cc-pool", "accounts", "acct-01")
-			seedAccounts(t, store.Account{ID: 1, ConfigDir: fuseDir, OverlayKind: string(fkoverlay.BackendNFS)})
-			if err := os.MkdirAll(fuseDir, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) { return nil, nil })
-			swapVar(t, &dirMounted, func(dir string) bool { return dir == fuseDir })
-			stubStopDaemon(t)
+	swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) {
+		return []procscan.Session{{PID: 42, ConfigDir: accounts[1].ConfigDir}}, nil
+	})
+	err := gateUninstallSessions(accounts)
+	if err == nil || !strings.Contains(err.Error(), "acct-02 (pid 42)") || strings.Contains(err.Error(), "acct-01") {
+		t.Fatalf("error = %v", err)
+	}
 
-			cmd, _, errOut := uninstallCmd()
-			err := runServiceUninstall(cmd, tc.purge, tc.force)
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("error = %v, want substring %q", err, tc.wantErr)
-			}
-			if tc.purge && !strings.Contains(err.Error(), "acct-01") {
-				t.Errorf("purge abort must name the mounted account, got %v", err)
-			}
-			if got := stripANSI(errOut.String()); !strings.Contains(got, "still a live mountpoint") {
-				t.Errorf("survivor not warned:\n%s", got)
-			}
-			if _, serr := os.Stat(pool.DBPath()); serr != nil {
-				t.Errorf("pool state must survive an aborted run: %v", serr)
-			}
-			st, serr := store.Open(pool.DBPath())
-			if serr != nil {
-				t.Fatalf("reopen store: %v", serr)
-			}
-			defer func() { _ = st.Close() }()
-			accts, lerr := st.ListAccounts()
-			if lerr != nil {
-				t.Fatalf("list accounts: %v", lerr)
-			}
-			if len(accts) != 1 || accts[0].ID != 1 {
-				t.Errorf("account rows after aborted run = %+v, want acct-01 intact", accts)
-			}
-			if _, serr := os.Stat(fuseDir); serr != nil {
-				t.Errorf("account dir must survive an aborted run: %v", serr)
-			}
-		})
+	tempHome(t)
+	seedAccounts(t)
+	scanned := false
+	swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) {
+		scanned = true
+		return nil, errors.New("must not scan")
+	})
+	stopped := false
+	swapVar(t, &stopDaemon, func(*cobra.Command) error {
+		stopped = true
+		return nil
+	})
+	cmd, _, _ := uninstallCmd()
+	if err := runServiceUninstall(cmd, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if scanned || !stopped {
+		t.Fatalf("scanned = %t, stopped = %t", scanned, stopped)
 	}
 }
 
-// TestStopDaemonServiceBrewStopFailureIsFatal: a failed `brew services stop`
-// aborts the uninstall — teardown is only safe once the daemon is down, since
-// a live one respawns the holder and remounts fuse rows on its next heal tick.
-func TestStopDaemonServiceBrewStopFailureIsFatal(t *testing.T) {
-	swapVar(t, &brewManaged, func() bool { return true })
-	swapVar(t, &brewStop, func(context.Context) error { return errors.New("brew exploded") })
-
+func TestStopDaemonServiceControllerFailureIsFatal(t *testing.T) {
+	want := errors.New("controller exploded")
+	controller := &testDaemonServiceController{convergeErr: want}
+	useDaemonServiceController(t, controller)
+	holderCalled := false
+	swapVar(t, &stopHolder, func(context.Context) error {
+		holderCalled = true
+		return nil
+	})
 	cmd, out, _ := uninstallCmd()
 	err := stopDaemonService(cmd)
-	if err == nil || !strings.Contains(err.Error(), "brew exploded") {
-		t.Fatalf("error = %v, want the brew failure surfaced", err)
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want controller failure", err)
 	}
-	if !strings.Contains(err.Error(), "respawn the mount holder") {
-		t.Errorf("error %q must explain why a live daemon is unsafe", err)
-	}
-	if got := stripANSI(out.String()); strings.Contains(got, "Stopped the daemon.") {
-		t.Errorf("must not claim success after a failed stop:\n%s", got)
+	if holderCalled || strings.Contains(stripANSI(out.String()), "Removed the daemon") {
+		t.Fatalf("claimed success: %s", out.String())
 	}
 }
 
-// TestPurgeAllDefensiveMountRecheck: a mounted dir with no account row still
-// aborts purgeAll before its RemoveAll — the guard on the catastrophic
-// delete-into-~/.claude path.
-func TestPurgeAllDefensiveMountRecheck(t *testing.T) {
+func TestStopDaemonServiceSettlesHolderBeforeSuccess(t *testing.T) {
 	tempHome(t)
-	carcass := filepath.Join(pool.AccountsDir(), "acct-99")
-	if err := os.MkdirAll(carcass, 0o700); err != nil {
+	controller := &testDaemonServiceController{}
+	useDaemonServiceController(t, controller)
+	swapVar(t, &stopHolder, func(context.Context) error { return nil })
+	cmd, out, _ := uninstallCmd()
+	cmd.SetContext(t.Context())
+	if err := stopDaemonService(cmd); err != nil {
 		t.Fatal(err)
 	}
-	swapVar(t, &dirMounted, func(dir string) bool { return dir == carcass })
-
-	cmd, _, _ := uninstallCmd()
-	err := purgeAll(cmd)
-	if err == nil || !strings.Contains(err.Error(), "refusing to purge") || !strings.Contains(err.Error(), carcass) {
-		t.Fatalf("error = %v, want refusal naming %s", err, carcass)
+	if !strings.Contains(stripANSI(out.String()), "Removed the daemon and holder LaunchAgents") {
+		t.Fatalf("output = %q", out.String())
 	}
-	if _, serr := os.Stat(pool.StateDir()); serr != nil {
-		t.Fatalf("state dir must survive the aborted purge: %v", serr)
+	if len(controller.desired) != 1 || controller.desired[0] != nil || controller.closed != 1 {
+		t.Fatalf("controller state: desired=%v closed=%d", controller.desired, controller.closed)
 	}
 }
 
-// TestPurgeAllRemovesStateWhenClean seeds zero accounts on purpose — row
-// removal goes through the Keychain, which tests never touch.
-func TestPurgeAllRemovesStateWhenClean(t *testing.T) {
+func TestStopDaemonServiceDoesNotClaimSuccessWhenHolderStopFails(t *testing.T) {
+	tempHome(t)
+	controller := &testDaemonServiceController{}
+	useDaemonServiceController(t, controller)
+	want := errors.New("holder remained live")
+	swapVar(t, &stopHolder, func(context.Context) error { return want })
+	cmd, out, _ := uninstallCmd()
+	cmd.SetContext(t.Context())
+	if err := stopDaemonService(cmd); !errors.Is(err, want) {
+		t.Fatalf("error = %v, want holder failure", err)
+	}
+	if strings.Contains(stripANSI(out.String()), "Removed the daemon") {
+		t.Fatalf("claimed success: %s", out.String())
+	}
+}
+
+func TestPurgeRefusesProvisionedAccount(t *testing.T) {
+	tempHome(t)
+	seedAccounts(t, store.Account{ID: 1, ConfigDir: pool.AccountPresentationDir(1)})
+	cmd, _, _ := uninstallCmd()
+	err := purgeAll(cmd)
+	if err == nil || !strings.Contains(err.Error(), "accounts remain provisioned") {
+		t.Fatalf("error = %v", err)
+	}
+	if _, err := os.Stat(pool.StateDir()); err != nil {
+		t.Fatalf("state removed after refusal: %v", err)
+	}
+}
+
+func TestPurgeAllRemovesCleanState(t *testing.T) {
 	tempHome(t)
 	if err := pool.EnsureAccountsDir(); err != nil {
 		t.Fatal(err)
 	}
-	swapVar(t, &dirMounted, func(string) bool { return false })
-
 	cmd, out, _ := uninstallCmd()
 	if err := purgeAll(cmd); err != nil {
-		t.Fatalf("purgeAll: %v", err)
-	}
-	if _, err := os.Stat(pool.StateDir()); !os.IsNotExist(err) {
-		t.Errorf("state dir still exists (err=%v)", err)
-	}
-	if got := stripANSI(out.String()); !strings.Contains(got, "Purged all pool state") {
-		t.Errorf("missing purge confirmation:\n%s", got)
-	}
-}
-
-// TestUninstallSurvivorMuxRoot pins the mux-root survivor check: account dirs are
-// bridge symlinks into ~/.cc-pool/mnt, so a still-mounted shared root is invisible
-// to mountedAccounts — the uninstall must treat the mounted mux root itself as a
-// survivor (else purgeAll's RemoveAll walks the live mirror into ~/.claude).
-func TestUninstallSurvivorMuxRoot(t *testing.T) {
-	cases := map[string]struct {
-		purge   bool
-		wantErr string
-	}{
-		"plain uninstall is nonzero": {purge: false, wantErr: "still mounted"},
-		"purge hard-aborts":          {purge: true, wantErr: "refusing to purge"},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			home := tempHome(t)
-			// A fuse account whose dir is a bridge symlink — never a mountpoint itself.
-			acctDir := filepath.Join(home, ".cc-pool", "accounts", "acct-01")
-			seedAccounts(t, store.Account{ID: 1, ConfigDir: acctDir, OverlayKind: string(fkoverlay.BackendNFS)})
-			swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) { return nil, nil })
-			// Only the shared mux root reads mounted; the bridge-symlink account dir does not.
-			swapVar(t, &dirMounted, func(dir string) bool { return dir == pool.MuxRootDir() })
-			stubStopDaemon(t)
-
-			cmd, _, errOut := uninstallCmd()
-			err := runServiceUninstall(cmd, tc.purge, false)
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("error = %v, want substring %q", err, tc.wantErr)
-			}
-			if tc.purge && !strings.Contains(err.Error(), pool.MuxRootDir()) {
-				t.Errorf("purge abort must name the live mux root, got %v", err)
-			}
-			if got := stripANSI(errOut.String()); !strings.Contains(got, "still a live mountpoint") {
-				t.Errorf("mux-root survivor not warned:\n%s", got)
-			}
-			if _, serr := os.Stat(pool.DBPath()); serr != nil {
-				t.Errorf("pool state must survive an aborted run: %v", serr)
-			}
-		})
-	}
-}
-
-// TestPurgeAllRefusesLiveMuxRoot pins the second guard on the catastrophic
-// delete-into-~/.claude path: purgeAll refuses its RemoveAll while the shared mux
-// root (outside accounts/, so mountedStateDirs never sees it) is a live mountpoint.
-func TestPurgeAllRefusesLiveMuxRoot(t *testing.T) {
-	tempHome(t)
-	if err := pool.EnsureAccountsDir(); err != nil {
 		t.Fatal(err)
 	}
-	swapVar(t, &dirMounted, func(dir string) bool { return dir == pool.MuxRootDir() })
-
-	cmd, _, _ := uninstallCmd()
-	err := purgeAll(cmd)
-	if err == nil || !strings.Contains(err.Error(), "refusing to purge") || !strings.Contains(err.Error(), pool.MuxRootDir()) {
-		t.Fatalf("error = %v, want a refusal naming the mux root", err)
+	if _, err := os.Stat(pool.StateDir()); !os.IsNotExist(err) {
+		t.Fatalf("state still exists: %v", err)
 	}
-	if _, serr := os.Stat(pool.StateDir()); serr != nil {
-		t.Fatalf("state dir must survive the aborted purge: %v", serr)
+	if !strings.Contains(stripANSI(out.String()), "Purged all pool state") {
+		t.Fatalf("output = %q", out.String())
 	}
 }
 
-// TestHolderStatusLine pins the `ccp service status` holder line: silent when
-// there is no holder and no fuse rows, "not running" when fuse rows need one,
-// a running line with mount count otherwise.
-func TestHolderStatusLine(t *testing.T) {
-	cases := map[string]struct {
-		holder   *fakeHolder
-		fuseRows int
-		want     []string
-		notWant  []string
-		empty    bool
-	}{
-		"absent with no fuse rows says nothing": {
-			holder: nil, fuseRows: 0, empty: true,
-		},
-		"absent with fuse rows is reported": {
-			holder: nil, fuseRows: 2, want: []string{"Mount holder: not running"},
-		},
-		"running at the current version": {
-			holder:   &fakeHolder{version: version.String(), mounts: []mountd.MountInfo{{Dir: "/a"}, {Dir: "/b"}}},
-			fuseRows: 2,
-			want:     []string{"Mount holder: running (" + version.String() + ", 2 mounts)"},
-		},
-		"running with zero fuse rows still shows (orphan visibility)": {
-			holder:   &fakeHolder{version: version.String()},
-			fuseRows: 0,
-			want:     []string{"Mount holder: running (" + version.String() + ", 0 mounts)"},
-		},
-		"holder version is reported as-is, never as skew": {
-			// The holder is a separate product (the fusekit-holder cask), so its
-			// version never reads as skew.
-			holder:   &fakeHolder{version: "0.0.1-old", mounts: []mountd.MountInfo{{Dir: "/a"}}},
-			fuseRows: 1,
-			want:     []string{"running (0.0.1-old, 1 mount)"},
-			notWant:  []string{"version skew", "will be replaced"},
-		},
-		"live socket failing health is not responding": {
-			holder:   &fakeHolder{version: version.String(), failHealth: true},
-			fuseRows: 1,
-			want:     []string{"Mount holder: not responding"},
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			tempHome(t)
-			if tc.holder != nil {
-				startFakeHolder(t, tc.holder)
-			}
-			got := holderStatusLine(holderClient(), tc.fuseRows)
-			if tc.empty {
-				if got != "" {
-					t.Fatalf("want no line, got %q", got)
-				}
-				return
-			}
-			for _, want := range tc.want {
-				if !strings.Contains(got, want) {
-					t.Errorf("line %q missing %q", got, want)
-				}
-			}
-			for _, notWant := range tc.notWant {
-				if strings.Contains(got, notWant) {
-					t.Errorf("line %q must not contain %q", got, notWant)
-				}
-			}
-		})
-	}
-}
-
-// TestUninstallHelpMentionsGateAndPurge keeps the command help honest about
-// the gate and purge semantics.
-func TestUninstallHelpMentionsGateAndPurge(t *testing.T) {
+func TestUninstallHelpMentionsPurgeGate(t *testing.T) {
 	cmd := newServiceUninstallCmd()
-	for _, want := range []string{"mount", "live claude sessions", "--force", "~/.claude is\nnever touched"} {
-		if !strings.Contains(cmd.Short+"\n"+cmd.Long, want) {
-			t.Errorf("uninstall help missing %q", want)
+	help := cmd.Short + "\n" + cmd.Long
+	for _, want := range []string{"live claude sessions", "--force", "~/.claude is never"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("help missing %q", want)
 		}
 	}
 	for _, flag := range []string{"purge", "force"} {
 		if cmd.Flags().Lookup(flag) == nil {
-			t.Errorf("uninstall lost the --%s flag", flag)
+			t.Errorf("missing --%s", flag)
 		}
+	}
+}
+
+func TestFuseKitPresentationRootIsInsideState(t *testing.T) {
+	tempHome(t)
+	if filepath.Dir(pool.FuseKitRuntimeDir()) != pool.StateDir() {
+		t.Fatalf("runtime dir = %q", pool.FuseKitRuntimeDir())
 	}
 }

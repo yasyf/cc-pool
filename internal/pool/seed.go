@@ -4,10 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // SeedOutcome describes what seedClaudeJSON did for an account dir.
@@ -30,8 +28,8 @@ const (
 // hasCompletedOnboarding:true (login never writes that flag). It strips ONLY
 // overlay.OAuthAccountKey, so projects and userID carry over. Written to the
 // provider's private root, not a fuse mount. See ccn doc d1ab40f.
-func seedClaudeJSON(prov fkoverlay.Provider, accountDir, srcPath string) (SeedOutcome, error) {
-	dst := filepath.Join(prov.PrivateRoot(accountDir), ".claude.json")
+func seedClaudeJSON(accountDir, srcPath string) (SeedOutcome, error) {
+	dst := privateClaudeJSONPath(accountDir)
 
 	if existing, err := os.ReadFile(dst); err == nil { //nolint:gosec // G304: dst is the account's own .claude.json under the cc-pool-managed config dir
 		var cur map[string]json.RawMessage

@@ -60,7 +60,7 @@ func writeBrokenSecurity(t *testing.T) string {
 func TestKeychainItemRead(t *testing.T) {
 	const svc = "Claude Code-credentials-deadbeef"
 	const acct = "tester"
-	item := KeychainItem{Service: svc, Account: acct}
+	item := KeychainItem{Service: svc, Account: acct, Runner: testTaskRunner{}}
 
 	if got := item.Source(); got != SourceKeychain {
 		t.Errorf("Source() = %v, want SourceKeychain", got)
@@ -95,12 +95,12 @@ func TestKeychainItemRead(t *testing.T) {
 			}
 			if tc.seedToken != "" {
 				seed := &Credential{ClaudeAiOauth: OAuth{AccessToken: tc.seedToken, RefreshToken: "rt"}}
-				if err := item.Write(seed); err != nil {
+				if err := item.Write(t.Context(), seed); err != nil {
 					t.Fatal(err)
 				}
 			}
 
-			got, err := item.Read()
+			got, err := item.Read(t.Context())
 			switch {
 			case tc.wantNeither:
 				if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrUnavailable) {
@@ -134,15 +134,15 @@ func TestKeychainItemRead(t *testing.T) {
 func TestKeychainItemReassert(t *testing.T) {
 	const svc = "Claude Code-credentials-deadbeef"
 	const acct = "tester"
-	item := KeychainItem{Service: svc, Account: acct}
+	item := KeychainItem{Service: svc, Account: acct, Runner: testTaskRunner{}}
 	storeDir := fakeKeychain(t)
 	setSearchList(t, storeDir, loginSearchList)
 
 	seed := &Credential{ClaudeAiOauth: OAuth{AccessToken: "at-1", RefreshToken: "rt-1", ExpiresAt: 1700000000000}}
-	if err := item.Write(seed); err != nil {
+	if err := item.Write(t.Context(), seed); err != nil {
 		t.Fatal(err)
 	}
-	got, err := item.Reassert()
+	got, err := item.Reassert(t.Context())
 	if err != nil {
 		t.Fatalf("Reassert: %v", err)
 	}
@@ -157,11 +157,11 @@ func TestKeychainItemReassert(t *testing.T) {
 		t.Fatalf("add-generic-password ran %d times, want 2 (seed + write-back)", n)
 	}
 
-	if err := item.Delete(); err != nil {
+	if err := item.Delete(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	setSearchList(t, storeDir, headlessSearchList)
-	if _, err := item.Reassert(); !errors.Is(err, ErrUnavailable) {
+	if _, err := item.Reassert(t.Context()); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Reassert on unsearchable miss = %v, want ErrUnavailable", err)
 	}
 }
@@ -170,7 +170,9 @@ func TestKeychainItemReassert(t *testing.T) {
 // idempotence, and its Source/String identity.
 func TestFileStore(t *testing.T) {
 	dir := t.TempDir()
-	st := FileStore{ConfigDir: dir}
+	st := FileStore{
+		ConfigDir: dir, Runner: testTaskRunner{}, WorkerExecutable: "test-worker",
+	}
 
 	if got := st.Source(); got != SourceFile {
 		t.Errorf("Source() = %v, want SourceFile", got)
@@ -179,15 +181,15 @@ func TestFileStore(t *testing.T) {
 		t.Errorf("String() = %q, want %q", got, want)
 	}
 
-	if _, err := st.Read(); !errors.Is(err, ErrNotFound) {
+	if _, err := st.Read(t.Context()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Read on empty dir = %v, want ErrNotFound", err)
 	}
-	if err := st.Delete(); err != nil {
+	if err := st.Delete(t.Context()); err != nil {
 		t.Fatalf("Delete on missing = %v, want nil", err)
 	}
 
 	cred := &Credential{ClaudeAiOauth: OAuth{AccessToken: "at-1", RefreshToken: "rt-1", ExpiresAt: 1700000000000}}
-	if err := st.Write(cred); err != nil {
+	if err := st.Write(t.Context(), cred); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(FileCredentialPath(dir))
@@ -197,7 +199,7 @@ func TestFileStore(t *testing.T) {
 	if fi.Mode().Perm() != 0o600 {
 		t.Errorf("mode = %v, want 0600", fi.Mode().Perm())
 	}
-	got, err := st.Read()
+	got, err := st.Read(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,13 +207,13 @@ func TestFileStore(t *testing.T) {
 		t.Fatalf("round-trip mismatch: %+v", got.ClaudeAiOauth)
 	}
 
-	if err := st.Delete(); err != nil {
+	if err := st.Delete(t.Context()); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if _, err := st.Read(); !errors.Is(err, ErrNotFound) {
+	if _, err := st.Read(t.Context()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Read after Delete = %v, want ErrNotFound", err)
 	}
-	if err := st.Delete(); err != nil {
+	if err := st.Delete(t.Context()); err != nil {
 		t.Fatalf("second Delete = %v, want nil", err)
 	}
 }

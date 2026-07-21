@@ -15,11 +15,9 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 	"github.com/yasyf/synckit/codec"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/manifest"
@@ -38,10 +36,6 @@ const syncWatchDebounce = 2 * time.Second
 // syncProbeTimeout bounds the status command's sync-socket capabilities probe.
 const syncProbeTimeout = 2 * time.Second
 
-// syncDaemonSpawnTimeout bounds how long rpc-serve/converge wait for the
-// daemon socket after spawning it.
-const syncDaemonSpawnTimeout = 5 * time.Second
-
 // synckitdLookPath resolves synckitd on PATH; a var so tests fake absence.
 var synckitdLookPath = func() (string, error) { return exec.LookPath("synckitd") }
 
@@ -50,13 +44,16 @@ var synckitdRun = func(ctx context.Context, args ...string) error {
 	return exec.CommandContext(ctx, "synckitd", args...).Run() //nolint:gosec // G204: synckitd is a fixed cc-pool-managed binary; args are fixed subcommands
 }
 
-// syncEnsureDaemon reports the daemon reachable, spawning it if needed; a var
-// so tests never spawn a real daemon.
+// syncEnsureDaemon reports whether the daemonkit-managed service is reachable;
+// a var so tests never dial a real daemon.
 var syncEnsureDaemon = func(ctx context.Context) bool {
 	cl := daemon.NewClient()
 	defer func() { _ = cl.Close() }()
-	return cl.EnsureRunning(ctx, syncDaemonSpawnTimeout)
+	health, err := cl.HealthContext(ctx)
+	return err == nil && health.OK
 }
+
+var syncConverge = runSyncConverge
 
 func newSyncCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -88,7 +85,7 @@ func newSyncEnableCmd() *cobra.Command {
 		Short: "Enable host sync: publish local accounts and register with synckitd",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
@@ -104,7 +101,7 @@ func newSyncDisableCmd() *cobra.Command {
 		Short: "Disable host sync and unregister from synckitd",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
@@ -120,7 +117,7 @@ func newSyncStatusCmd() *cobra.Command {
 		Short: "Show mesh peers, sync socket health, and the shared account registry",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
@@ -151,10 +148,11 @@ func newSyncConvergeCmd() *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
+				ensureDaemon(cmd)
 				return runSyncConverge(cmd.Context(), cmd.OutOrStdout(), syncEnsureDaemon, pool.SyncSocketPath())
 			})
 		},
@@ -166,31 +164,19 @@ func runSyncEnable(cmd *cobra.Command, m *pool.Manager) error {
 	if _, err := synckitdLookPath(); err != nil {
 		return fmt.Errorf("synckitd is not on PATH; install it with `brew install yasyf/tap/synckit` and re-run `ccp sync enable`: %w", err)
 	}
-	if err := os.MkdirAll(pool.SyncStampsDir(), 0o700); err != nil {
-		return fmt.Errorf("create sync dirs: %w", err)
-	}
 	if err := m.Store.SetMeta(syncMetaKey, "1"); err != nil {
 		return fmt.Errorf("enable sync: %w", err)
 	}
-
-	if err := syncBackfillUUIDs(out, m); err != nil {
-		return err
-	}
+	ensureDaemon(cmd)
 
 	mesh, err := hostregistry.Mesh.Load()
 	if err != nil {
 		warn(out, "mesh state unreadable: %v", err)
 		mesh = &hostregistry.Registry{}
 	}
-	self, err := syncSelf(mesh)
-	if err != nil {
+	if err := syncConverge(cmd.Context(), out, syncEnsureDaemon, pool.SyncSocketPath()); err != nil {
 		return err
 	}
-	published, err := syncScanPublish(cmd.Context(), m, self)
-	if err != nil {
-		return err
-	}
-	success(out, "Published %s to the shared registry.", plural(published, "account"))
 
 	path, err := writeSyncManifest()
 	if err != nil {
@@ -247,23 +233,37 @@ func runSyncStatus(cmd *cobra.Command, m *pool.Manager) error {
 
 	probeSyncSocket(cmd.Context(), out)
 
-	reg, err := syncRegistryFile().Load()
+	reg, err := syncRegistryState(cmd.Context(), pool.SyncSocketPath())
 	if err != nil {
-		warn(out, "shared registry unreadable: %v (see `ccp doctor`)", err)
+		warn(out, "shared registry unreadable: %v", err)
 	} else if len(reg) > 0 {
-		printRegistryTable(out, reg, m)
+		printRegistryTable(cmd.Context(), out, reg, m)
 	} else {
 		note(out, "Shared registry is empty.")
 	}
 
-	return syncFileFallbackWarnings(out, m)
+	return nil
+}
+
+func syncRegistryState(ctx context.Context, sock string) (hostsync.Registry, error) {
+	cl := syncservice.NewClient(syncservice.Socket(sock))
+	defer func() { _ = cl.Close() }()
+	raw, err := cl.GetState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var reg hostsync.Registry
+	if err := json.Unmarshal(raw, &reg); err != nil {
+		return nil, fmt.Errorf("decode shared registry: %w", err)
+	}
+	return reg, nil
 }
 
 // runSyncRPCServe bridges frames between in/out and the daemon's sync socket.
 // out is the framing channel: rpc.Proxy owns it exclusively.
 func runSyncRPCServe(ctx context.Context, in io.Reader, out io.Writer, ensure func(context.Context) bool, sock string) error {
 	if !ensure(ctx) {
-		return fmt.Errorf("cc-pool daemon is not reachable and could not be started; check `ccp doctor`")
+		return fmt.Errorf("cc-pool daemon is not reachable; run `ccp service install`")
 	}
 	return rpc.Proxy(ctx, in, out, sock)
 }
@@ -271,7 +271,7 @@ func runSyncRPCServe(ctx context.Context, in io.Reader, out io.Writer, ensure fu
 // runSyncConverge asks the daemon for one converge pass over the sync socket.
 func runSyncConverge(ctx context.Context, out io.Writer, ensure func(context.Context) bool, sock string) error {
 	if !ensure(ctx) {
-		return fmt.Errorf("cc-pool daemon is not reachable and could not be started; check `ccp doctor`")
+		return fmt.Errorf("cc-pool daemon is not reachable; run `ccp service install`")
 	}
 	cl := syncservice.NewClient(syncservice.Socket(sock))
 	defer func() { _ = cl.Close() }()
@@ -283,111 +283,15 @@ func runSyncConverge(ctx context.Context, out io.Writer, ensure func(context.Con
 	return nil
 }
 
-// syncBackfillUUIDs stamps each local row missing its Claude accountUuid from
-// the account's own .claude.json identity; unreadable identities are skipped loudly.
-func syncBackfillUUIDs(out io.Writer, m *pool.Manager) error {
-	accts, err := m.Store.ListAccounts()
-	if err != nil {
-		return err
-	}
-	for _, a := range accts {
-		if a.AccountUUID != "" {
-			continue
-		}
-		backend, err := fkoverlay.Parse(a.OverlayKind)
-		if err != nil {
-			note(out, "acct-%02d: unparseable overlay backend; not published", a.ID)
-			continue
-		}
-		ident, err := pool.AccountIdentity(backend, a.ConfigDir)
-		if errors.Is(err, pool.ErrNoIdentity) {
-			note(out, "acct-%02d: no readable identity; not published (finish `ccp login %d` first)", a.ID, a.ID)
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("read acct-%02d identity: %w", a.ID, err)
-		}
-		if err := m.Store.SetAccountUUID(a.ID, ident.AccountUUID); err != nil {
-			return fmt.Errorf("backfill acct-%02d uuid: %w", a.ID, err)
-		}
-	}
-	return nil
-}
-
-// syncSelf names this host as chain holder: the mesh ssh target when joined
-// (peers dial the holder by it), else the hostname — the daemon's
-// resolveSyncSelf must resolve identically. A host that cannot name itself
-// must not publish: an empty Origin would corrupt chain ownership.
-func syncSelf(mesh *hostregistry.Registry) (string, error) {
-	if mesh.Self != "" {
-		return mesh.Self, nil
-	}
-	host, err := os.Hostname()
-	if err != nil {
-		return "", fmt.Errorf("resolve sync self: %w", err)
-	}
-	if host == "" {
-		return "", fmt.Errorf("resolve sync self: kernel hostname is empty")
-	}
-	return host, nil
-}
-
-// syncRegistryFile is the shared-registry handle every CLI sync surface uses;
-// same paths as the daemon's hostsync.NewRegistryFile(pool.SyncDir()).
-func syncRegistryFile() hostsync.RegistryFile {
-	return hostsync.RegistryFile{
-		Path:     pool.SyncRegistryPath(),
-		LockPath: pool.SyncRegistryLockPath(),
-	}
-}
-
-// syncScanPublish folds local accounts into the shared registry, then touches
-// the changed stamps. ScanPublish, never PublishAccount — a bulk publish would
-// resurrect peers' removals — see ccn 10bf17d.
-func syncScanPublish(ctx context.Context, m *pool.Manager, self string) (int, error) {
-	rf := syncRegistryFile()
-	svc := &hostsync.Service{
-		Registry: &rf,
-		StampDir: pool.SyncStampsDir(),
-		Locals:   hostsync.ManagerLocals(m, self, time.Now),
-	}
-	changed := map[string]bool{}
-	err := rf.Update(ctx, func(reg hostsync.Registry) error {
-		before := make(map[string]string, len(reg))
-		for id, entry := range reg {
-			before[id] = hostsync.Fingerprint(entry)
-		}
-		if _, err := svc.ScanPublish(ctx, reg); err != nil {
-			return err
-		}
-		for id, entry := range reg {
-			if hostsync.Fingerprint(entry) != before[id] {
-				changed[id] = true
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, fmt.Errorf("publish local accounts: %w", err)
-	}
-	for uuid := range changed {
-		if err := svc.TouchStamp(uuid); err != nil {
-			return len(changed), err
-		}
-	}
-	return len(changed), nil
-}
-
-// ccpoolManifest is the synckit manifest synckitd drives cc-pool with: fsnotify
-// on the stamp dirs, the typed service on the sync socket, the rpc-serve stdio
-// bridge. No launchd/helper blocks — cc-pool's daemon owns its own lifecycle.
+// ccpoolManifest is the synckit manifest synckitd drives cc-pool with: stamp
+// directory watches, the typed service on the sync socket, and the rpc-serve
+// stdio bridge. No helper blocks; cc-pool's daemon owns its own lifecycle.
 func ccpoolManifest() manifest.Manifest {
 	return manifest.Manifest{
 		Name:   "cc-pool",
 		Binary: "cc-pool",
 		Brew:   "yasyf/tap/cc-pool",
 		Watch: manifest.WatchSpec{
-			Backend:  "fsnotify",
 			Debounce: codec.Duration(syncWatchDebounce),
 		},
 		Service: manifest.ServiceSpec{
@@ -443,16 +347,21 @@ func probeSyncSocket(ctx context.Context, out io.Writer) {
 		warn(out, "sync socket %s not answering (%v); is the daemon running with sync enabled?", pool.SyncSocketPath(), err)
 		return
 	}
-	success(out, "Sync socket healthy: %s (protocol %d, %s).", caps.Name, caps.ProtocolVersion, plural(len(caps.Methods), "method"))
+	success(out, "Sync socket healthy: %s (%s).", caps.Name, plural(len(caps.Methods), "method"))
 }
 
-func printRegistryTable(out io.Writer, reg hostsync.Registry, m *pool.Manager) {
+func printRegistryTable(
+	ctx context.Context,
+	out io.Writer,
+	reg hostsync.Registry,
+	m *pool.Manager,
+) {
 	uuids := make([]string, 0, len(reg))
 	for uuid := range reg {
 		uuids = append(uuids, uuid)
 	}
 	sort.Strings(uuids)
-	local := localOwnershipByUUID(out, m)
+	local := localOwnershipByUUID(ctx, out, m)
 	tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "UUID\tLABEL\tCHAIN EXPIRY\tORIGIN\tLOCAL\tSTATE")
 	for _, uuid := range uuids {
@@ -468,12 +377,13 @@ func printRegistryTable(out io.Writer, reg hostsync.Registry, m *pool.Manager) {
 	_ = tw.Flush()
 }
 
-// localOwnershipByUUID classifies each locally-held account's credential as
-// "owned" (a refresh token present) or "synced" (a peer copy, none), keyed by
-// account UUID — a refresh-free read, so it never spends a refresh token.
-// Accounts with no local credential are simply absent (rendered "-"); a load
-// failure warns to w rather than silently blanking the column.
-func localOwnershipByUUID(w io.Writer, m *pool.Manager) map[string]string {
+// localOwnershipByUUID reports local registry presence without opening a
+// credential store. Credential inspection is daemon-only.
+func localOwnershipByUUID(
+	_ context.Context,
+	w io.Writer,
+	m *pool.Manager,
+) map[string]string {
 	out := map[string]string{}
 	accts, err := m.Store.ListAccounts()
 	if err != nil {
@@ -484,38 +394,9 @@ func localOwnershipByUUID(w io.Writer, m *pool.Manager) map[string]string {
 		if a.AccountUUID == "" {
 			continue
 		}
-		cred, _, err := m.ReadCredential(a)
-		switch creds.ClassifyRead(err) {
-		case creds.ReadPresent:
-			if cred.HasRefreshToken() {
-				out[a.AccountUUID] = "owned"
-			} else {
-				out[a.AccountUUID] = "synced"
-			}
-		case creds.ReadFatal:
-			warn(w, "acct-%02d reading credential for the LOCAL column: %v", a.ID, err)
-		}
+		out[a.AccountUUID] = "present"
 	}
 	return out
-}
-
-// syncFileFallbackWarnings flags accounts whose credential lives in the
-// plaintext file store instead of the Keychain.
-func syncFileFallbackWarnings(out io.Writer, m *pool.Manager) error {
-	accts, err := m.Store.ListAccounts()
-	if err != nil {
-		return err
-	}
-	for _, a := range accts {
-		_, src, err := m.ReadCredential(a)
-		if err != nil {
-			continue
-		}
-		if src == creds.SourceFile {
-			warn(out, "acct-%02d credential is in the plaintext file store, not the Keychain (headless fallback)", a.ID)
-		}
-	}
-	return nil
 }
 
 func formatMillis(ms int64) string {

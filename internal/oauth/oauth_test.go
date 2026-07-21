@@ -2,8 +2,10 @@ package oauth
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -100,6 +102,9 @@ func TestUsageErrorClassification(t *testing.T) {
 		}
 		if errors.Is(err, ErrNetwork) {
 			t.Fatalf("a 401 must not classify as ErrNetwork: %v", err)
+		}
+		if strings.Contains(err.Error(), "unauthorized") {
+			t.Fatalf("usage error exposed response body: %v", err)
 		}
 	})
 
@@ -277,47 +282,49 @@ func TestRefreshRequestAndResponse(t *testing.T) {
 	}
 }
 
-// TestRefreshRevoked pins the RefreshError classification per status and OAuth
-// error-body code: Revoked is status-driven (400/401), InvalidGrant requires
-// the server-confirmed invalid_grant code — a plain 401 or a codeless body
-// must never read as a confirmed revocation.
-func TestRefreshRevoked(t *testing.T) {
+// TestRefreshInvalidGrant pins the only definitive refresh-token revocation:
+// the server-confirmed invalid_grant code. HTTP status alone is transient.
+func TestRefreshInvalidGrant(t *testing.T) {
 	cases := []struct {
 		name             string
 		status           int
 		body             string
-		wantRevoked      bool
 		wantInvalidGrant bool
 	}{
 		{
-			name:   "400 invalid_grant is revoked and confirmed",
+			name:   "400 invalid_grant is confirmed",
 			status: http.StatusBadRequest, body: `{"error":"invalid_grant"}`,
-			wantRevoked: true, wantInvalidGrant: true,
+			wantInvalidGrant: true,
 		},
 		{
-			name:   "401 invalid_grant is revoked and confirmed",
+			name:   "401 invalid_grant is confirmed",
 			status: http.StatusUnauthorized, body: `{"error":"invalid_grant"}`,
-			wantRevoked: true, wantInvalidGrant: true,
+			wantInvalidGrant: true,
 		},
 		{
-			name:   "401 with another code is revoked but unconfirmed",
+			name:   "401 with another code is unconfirmed",
 			status: http.StatusUnauthorized, body: `{"error":"invalid_client"}`,
-			wantRevoked: true, wantInvalidGrant: false,
+			wantInvalidGrant: false,
 		},
 		{
-			name:   "401 with a non-JSON body is revoked but unconfirmed",
+			name: "401 response body is never retained", status: http.StatusUnauthorized,
+			body:             `{"error":"canary-secret","access_token":"canary-secret"}`,
+			wantInvalidGrant: false,
+		},
+		{
+			name:   "401 with a non-JSON body is unconfirmed",
 			status: http.StatusUnauthorized, body: `unauthorized`,
-			wantRevoked: true, wantInvalidGrant: false,
+			wantInvalidGrant: false,
 		},
 		{
-			name:   "401 with an empty body is revoked but unconfirmed",
+			name:   "401 with an empty body is unconfirmed",
 			status: http.StatusUnauthorized, body: ``,
-			wantRevoked: true, wantInvalidGrant: false,
+			wantInvalidGrant: false,
 		},
 		{
-			name:   "500 is neither revoked nor confirmed",
+			name:   "500 is unconfirmed",
 			status: http.StatusInternalServerError, body: `{"error":"server_error"}`,
-			wantRevoked: false, wantInvalidGrant: false,
+			wantInvalidGrant: false,
 		},
 	}
 	for _, tc := range cases {
@@ -334,11 +341,17 @@ func TestRefreshRevoked(t *testing.T) {
 			if !errors.As(err, &re) {
 				t.Fatalf("expected a RefreshError, got %v", err)
 			}
-			if re.Revoked() != tc.wantRevoked {
-				t.Errorf("Revoked() = %v, want %v", re.Revoked(), tc.wantRevoked)
-			}
 			if re.InvalidGrant() != tc.wantInvalidGrant {
-				t.Errorf("InvalidGrant() = %v, want %v (Code=%q)", re.InvalidGrant(), tc.wantInvalidGrant, re.Code)
+				t.Errorf("InvalidGrant() = %v, want %v", re.InvalidGrant(), tc.wantInvalidGrant)
+			}
+			if re.ResponseDigest != sha256.Sum256([]byte(tc.body)) {
+				t.Errorf("ResponseDigest does not match the response body")
+			}
+			if tc.body != "" && strings.Contains(err.Error(), tc.body) {
+				t.Fatalf("refresh error exposed response body: %v", err)
+			}
+			if strings.Contains(fmt.Sprintf("%+v", re), "canary-secret") {
+				t.Fatalf("refresh error retained secret response bytes: %+v", re)
 			}
 		})
 	}
@@ -629,6 +642,32 @@ func TestUsageUserAgentSent(t *testing.T) {
 	}
 	if !strings.HasPrefix(ua, "claude-cli/") {
 		t.Errorf("User-Agent = %q, want claude-cli/... form", ua)
+	}
+}
+
+func TestExplicitUserAgentIsPinnedForWorkerRefresh(t *testing.T) {
+	var got string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("User-Agent")
+		_ = json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: "new-at", RefreshToken: "new-rt", ExpiresIn: 3600,
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewWithUserAgent("claude-cli/exact-worker (external)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.tokenURL = server.URL
+	if _, err := client.Refresh(t.Context(), "acct-1", "old-rt"); err != nil {
+		t.Fatal(err)
+	}
+	if got != "claude-cli/exact-worker (external)" {
+		t.Fatalf("worker User-Agent = %q", got)
+	}
+	if _, err := NewWithUserAgent("invalid\r\nheader"); err == nil {
+		t.Fatal("NewWithUserAgent accepted header injection")
 	}
 }
 

@@ -3,12 +3,10 @@ package daemon
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
-	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -24,6 +22,9 @@ func revokedServer(t *testing.T) (*Server, store.Account, *creds.Credential) {
 	// The server's chain moved on: our rt-stale refresh gets invalid_grant.
 	fo.currentRT = "rt-0"
 	fo.setUsage401(true)
+	s.syncAuthKind = func(context.Context, int, string) (store.AuthKind, error) {
+		return store.AuthKindOwned, nil
+	}
 	return s, a, cred
 }
 
@@ -32,11 +33,11 @@ func revokedServer(t *testing.T) (*Server, store.Account, *creds.Credential) {
 // pull of a peer's stripped chain. When healsUsage, it also flips the fake OAuth
 // usage endpoint to succeed, modeling an origin token that actually works.
 func pullHealing(s *Server, a store.Account, expiresAt int64, healsUsage bool) func(context.Context) error {
-	return func(context.Context) error {
+	return func(ctx context.Context) error {
 		fresh := &creds.Credential{}
 		fresh.ClaudeAiOauth.AccessToken = "at-peer"
 		fresh.ClaudeAiOauth.ExpiresAt = expiresAt
-		if err := s.m.Creds.Store(a, creds.SourceKeychain).Write(fresh); err != nil {
+		if err := s.m.Creds.Store(a, creds.SourceKeychain).Write(ctx, fresh); err != nil {
 			return err
 		}
 		if healsUsage {
@@ -46,26 +47,25 @@ func pullHealing(s *Server, a store.Account, expiresAt int64, healsUsage bool) f
 	}
 }
 
-// wireSyncRegistry attaches a minimal sync service whose registry names origin
-// as uuid's chain holder, so authKind classifies at persist time.
+// wireSyncRegistry makes the disposable-worker seam prove uuid's exact owner.
 func wireSyncRegistry(t *testing.T, s *Server, uuid, origin string) {
 	t.Helper()
-	svc := &hostsync.Service{
-		Registry: hostsync.NewRegistryFile(t.TempDir()),
-		StampDir: filepath.Join(t.TempDir(), "stamps"),
-	}
-	err := svc.PublishAccount(context.Background(), hostsync.AccountValue{
-		UUID:  uuid,
-		Chain: hostsync.ChainStamp{Origin: origin, ExpiresAt: 1, Hash: "h-" + uuid},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
 		t.Fatal(err)
 	}
-	s.syncSvc = svc
 	s.syncSelf = "host-self"
+	s.syncAuthKind = func(_ context.Context, _ int, gotUUID string) (store.AuthKind, error) {
+		if gotUUID != uuid {
+			return "", errors.New("test auth-kind identity mismatch")
+		}
+		if origin == "host-self" {
+			return store.AuthKindOwned, nil
+		}
+		if origin == "peer-b" {
+			return store.AuthKindAwaitingOrigin, nil
+		}
+		return "", errors.New("test auth-kind owner is unproven")
+	}
 }
 
 // TestSyncHealDecidesEachTick pins the reworked flagNeedsLogin: it heals, then
@@ -180,6 +180,25 @@ func TestSyncHealDecidesEachTick(t *testing.T) {
 		s.pollOnce(t.Context())
 		if h, _ := s.m.Store.GetAuthHealth(a.ID); !h.NeedsLogin {
 			t.Fatal("a failing pull must fall through to flagging needs-login")
+		}
+	})
+
+	t.Run("auth-kind failure persists an internal unverified verdict", func(t *testing.T) {
+		s, a, _ := revokedServer(t)
+		s.syncAuthKind = func(context.Context, int, string) (store.AuthKind, error) {
+			return "", errors.New("registry provenance unavailable")
+		}
+
+		s.flagNeedsLogin(t.Context(), a, errors.New("stored credential is revoked"))
+		h, err := s.m.Store.GetAuthHealth(a.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !h.NeedsLogin || h.Kind != store.AuthKindUnverified || h.Reason != store.AuthReasonInternal {
+			t.Fatalf("auth health = %+v, want internal unverified needs-login", h)
+		}
+		if h.Digest == ([32]byte{}) {
+			t.Fatal("auth-kind failure did not retain a non-secret correlation digest")
 		}
 	})
 }

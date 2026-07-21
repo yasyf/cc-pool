@@ -334,10 +334,6 @@ struct SmallView: View {
 
 // MARK: - Pieces
 
-extension AccountStatus {
-    var unusable: Bool { rateLimited || isExhausted || needsLogin }
-}
-
 /// Capsule gauge. The bar fills with % USED — matching the `ccp status`
 /// columns and the row's number. The gradient runs the window's identity
 /// hues, heating toward amber/red as headroom drains.
@@ -437,9 +433,15 @@ struct BadgeRow: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.red)
             }
-            // The bottom tier: no live token at all until `ccp login N` runs, so
-            // it gets the red error treatment plus a word, not just a glyph.
-            if account.needsLogin {
+            if account.credentialQuarantined {
+                Image(systemName: "lock.trianglebadge.exclamationmark.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.red)
+                Text("credential recovery")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.red)
+            } else if account.needsLogin {
+                // No live token exists until `ccp login N` runs.
                 Image(systemName: "person.crop.circle.badge.exclamationmark")
                     .font(.system(size: 10))
                     .foregroundStyle(.red)

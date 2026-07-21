@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,8 +13,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/creds"
-	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -27,7 +26,7 @@ import (
 
 // syncTestEnv isolates HOME and XDG_CONFIG_HOME and returns a manager over a
 // temp store with an in-memory credential fake.
-func syncTestEnv(t *testing.T) (*pool.Manager, *credstest.Fake) {
+func syncTestEnv(t *testing.T) *pool.Manager {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -40,8 +39,7 @@ func syncTestEnv(t *testing.T) (*pool.Manager, *credstest.Fake) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	fk := credstest.NewFake()
-	return &pool.Manager{Store: st, Creds: fk}, fk
+	return &pool.Manager{Store: st}
 }
 
 // putSynckitdOnPath makes the real LookPath find a fake synckitd binary.
@@ -64,6 +62,27 @@ func stubSynckitdRun(t *testing.T) *[][]string {
 		return nil
 	}
 	t.Cleanup(func() { synckitdRun = orig })
+	return &calls
+}
+
+func stubSyncConverge(t *testing.T) *int {
+	t.Helper()
+	var calls int
+	origConverge := syncConverge
+	origEnsure := syncEnsureDaemon
+	syncEnsureDaemon = func(context.Context) bool { return true }
+	syncConverge = func(ctx context.Context, out io.Writer, ensure func(context.Context) bool, _ string) error {
+		if !ensure(ctx) {
+			return fmt.Errorf("daemon unavailable")
+		}
+		calls++
+		success(out, "Converged 1 item(s), 0 deferred busy.")
+		return nil
+	}
+	t.Cleanup(func() {
+		syncConverge = origConverge
+		syncEnsureDaemon = origEnsure
+	})
 	return &calls
 }
 
@@ -91,38 +110,11 @@ func syncCmdBuf(t *testing.T) (*cobra.Command, *bytes.Buffer) {
 	return cmd, &out
 }
 
-// addSyncTestAccount creates a symlink-backed row with a .claude.json identity
-// and a keychain credential in the fake.
-func addSyncTestAccount(t *testing.T, m *pool.Manager, fk *credstest.Fake, id int, uuid, email, label string, cred *creds.Credential) store.Account {
-	t.Helper()
-	dir := t.TempDir()
-	body := fmt.Sprintf(`{"oauthAccount": {"accountUuid": %q, "emailAddress": %q, "extra": "keep-me-%d"}}`, uuid, email, id)
-	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(body), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	a := store.Account{
-		ID: id, ConfigDir: dir, Label: label, OverlayKind: "symlink",
-		KeychainService: fmt.Sprintf("svc-%d", id), KeychainAccount: "u",
-	}
-	if err := m.Store.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
-	if cred != nil {
-		fk.Put(a.KeychainService, a.KeychainAccount, cred)
-	}
-	return a
-}
-
-func testCred(access string, expiresAt int64) *creds.Credential {
-	return &creds.Credential{ClaudeAiOauth: creds.OAuth{
-		AccessToken: access, RefreshToken: "rt-" + access, ExpiresAt: expiresAt,
-	}}
-}
-
 func TestEnableWritesValidManifest(t *testing.T) {
-	m, _ := syncTestEnv(t)
+	m := syncTestEnv(t)
 	putSynckitdOnPath(t)
 	calls := stubSynckitdRun(t)
+	converges := stubSyncConverge(t)
 
 	cmd, _ := syncCmdBuf(t)
 	if err := runSyncEnable(cmd, m); err != nil {
@@ -150,7 +142,7 @@ func TestEnableWritesValidManifest(t *testing.T) {
 	if lm.Name != "cc-pool" || lm.Binary != "cc-pool" || lm.Brew != "yasyf/tap/cc-pool" {
 		t.Fatalf("manifest identity = %q/%q/%q", lm.Name, lm.Binary, lm.Brew)
 	}
-	if lm.Watch.Backend != "fsnotify" || lm.Watch.Debounce != codec.Duration(syncWatchDebounce) {
+	if lm.Watch.Debounce != codec.Duration(syncWatchDebounce) {
 		t.Fatalf("watch spec = %+v", lm.Watch)
 	}
 	if lm.Service.Transport != "socket" || lm.Service.Sock != pool.SyncSocketPath() {
@@ -159,8 +151,8 @@ func TestEnableWritesValidManifest(t *testing.T) {
 	if want := []string{"sync", "rpc-serve"}; !equalStrings(lm.Service.ServeArgs, want) {
 		t.Fatalf("serve args = %v, want %v", lm.Service.ServeArgs, want)
 	}
-	if lm.Launchd != nil || lm.Helper != nil {
-		t.Fatalf("manifest must not carry launchd/helper blocks: %+v", lm)
+	if lm.Helper != nil {
+		t.Fatalf("manifest must not carry a helper block: %+v", lm)
 	}
 
 	if v, ok, err := m.Store.GetMeta(syncMetaKey); err != nil || !ok || v != "1" {
@@ -169,10 +161,13 @@ func TestEnableWritesValidManifest(t *testing.T) {
 	if len(*calls) != 1 || !equalStrings((*calls)[0], []string{"register", path}) {
 		t.Fatalf("synckitd calls = %v, want one register of %s", *calls, path)
 	}
+	if *converges != 1 {
+		t.Fatalf("daemon converge calls = %d, want 1", *converges)
+	}
 }
 
 func TestEnableRefusesWithoutSynckitd(t *testing.T) {
-	m, _ := syncTestEnv(t)
+	m := syncTestEnv(t)
 	t.Setenv("PATH", t.TempDir())
 
 	cmd, _ := syncCmdBuf(t)
@@ -195,86 +190,34 @@ func TestEnableRefusesWithoutSynckitd(t *testing.T) {
 	}
 }
 
-func TestEnableBackfillsAndScanPublishes(t *testing.T) {
-	m, fk := syncTestEnv(t)
+func TestEnableRequestsDaemonConvergence(t *testing.T) {
+	m := syncTestEnv(t)
 	putSynckitdOnPath(t)
 	stubSynckitdRun(t)
+	converges := stubSyncConverge(t)
 	writeMeshState(t, `{"self":"me@hosta","hosts":[]}`)
-
-	cred1 := testCred("at-1", 1893456000000)
-	addSyncTestAccount(t, m, fk, 1, "u-1", "one@example.com", "Work", cred1)
-	cred2 := testCred("at-2", 1893456000000)
-	addSyncTestAccount(t, m, fk, 2, "u-2", "two@example.com", "Old", cred2)
-
-	// A peer already removed u-2; enable must NOT resurrect the tombstone.
-	rf := syncRegistryFile()
-	if err := rf.Update(context.Background(), func(reg hostsync.Registry) error {
-		reg.Remove("u-2", cregistry.UnixMicros(time.Now()))
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
 
 	cmd, out := syncCmdBuf(t)
 	if err := runSyncEnable(cmd, m); err != nil {
 		t.Fatal(err)
 	}
-
-	for id, want := range map[int]string{1: "u-1", 2: "u-2"} {
-		a, err := m.Store.GetAccount(id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if a.AccountUUID != want {
-			t.Fatalf("acct-%02d uuid = %q, want %q", id, a.AccountUUID, want)
-		}
+	if *converges != 1 {
+		t.Fatalf("daemon converge calls = %d, want 1", *converges)
 	}
-
-	reg, err := rf.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	e1, ok := reg["u-1"]
-	if !ok || !e1.Present() {
-		t.Fatalf("u-1 not present in registry: %+v", reg)
-	}
-	v := e1.Value
-	if v.Email != "one@example.com" || v.Label != "Work" {
-		t.Fatalf("u-1 value = %+v", v)
-	}
-	if !bytes.Contains(v.OAuthAccount, []byte("keep-me-1")) {
-		t.Fatalf("u-1 oauthAccount not passed through verbatim: %s", v.OAuthAccount)
-	}
-	if v.Chain.Hash != creds.AccessHash(cred1) {
-		t.Fatalf("u-1 chain hash = %q, want AccessHash(cred1)", v.Chain.Hash)
-	}
-	if v.Chain.ExpiresAt != 1893456000000 || v.Chain.Origin != "me@hosta" {
-		t.Fatalf("u-1 chain = %+v", v.Chain)
-	}
-	if v.Chain.RotatedAt <= 0 {
-		t.Fatalf("u-1 chain rotatedAt = %d, want > 0", v.Chain.RotatedAt)
-	}
-
-	if e2 := reg["u-2"]; e2.Present() {
-		t.Fatalf("u-2 tombstone resurrected by enable: %+v", e2)
-	}
-
-	if _, err := os.Stat(filepath.Join(pool.SyncStampsDir(), "u-1", "stamp")); err != nil {
-		t.Fatalf("u-1 stamp missing: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(pool.SyncStampsDir(), "u-2")); !os.IsNotExist(err) {
-		t.Fatalf("u-2 stamp dir created for an unchanged tombstone: %v", err)
-	}
-
-	if got := stripANSI(out.String()); !strings.Contains(got, "Published 1 account") {
-		t.Fatalf("output %q missing the publish count", got)
+	if got := stripANSI(out.String()); !strings.Contains(got, "Converged 1 item") {
+		t.Fatalf("output %q missing daemon convergence", got)
 	}
 }
 
 func TestDisableClearsMetaAndRemovesManifest(t *testing.T) {
-	m, _ := syncTestEnv(t)
+	m := syncTestEnv(t)
 	putSynckitdOnPath(t)
 	calls := stubSynckitdRun(t)
+	stubSyncConverge(t)
+	rf := hostsync.NewRegistryFile(pool.SyncDir())
+	if err := rf.Save(hostsync.Registry{}); err != nil {
+		t.Fatal(err)
+	}
 
 	cmd, _ := syncCmdBuf(t)
 	if err := runSyncEnable(cmd, m); err != nil {
@@ -304,7 +247,7 @@ func TestDisableClearsMetaAndRemovesManifest(t *testing.T) {
 	}
 }
 
-func TestRPCServeBridgesFrames(t *testing.T) {
+func TestRPCServeBridgesPersistentSessionByteExact(t *testing.T) {
 	base, err := os.MkdirTemp("", "ccp")
 	if err != nil {
 		t.Fatal(err)
@@ -312,36 +255,32 @@ func TestRPCServeBridgesFrames(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(base) })
 	sock := filepath.Join(base, "s.sock")
 
-	ln, err := rpc.Listen(sock)
+	ln, err := rpc.Listen(t.Context(), sock)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := rpc.NewDispatcher()
-	// 2^53+1: any float64 round-trip corrupts it to ...992, so byte-exact
-	// bridging is the only way this digit string survives.
-	d.Register(syncservice.MethodGetState, func(context.Context, map[string]any) (any, error) {
-		return json.RawMessage(`{"u1":{"added_at":9007199254740993,"value":null}}`), nil
-	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { _ = rpc.Serve(ctx, ln, d); close(done) }()
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = io.Copy(conn, conn)
+	}()
 	t.Cleanup(func() { cancel(); <-done })
 
-	t.Run("bridges one frame byte-exact", func(t *testing.T) {
-		in := strings.NewReader(`{"method":"svc.get_state","params":{}}` + "\n")
+	t.Run("bridges one persistent session byte-exact", func(t *testing.T) {
+		payload := []byte{0, 1, 2, 0xff, '\n', '{', '}', 0}
+		in := bytes.NewReader(payload)
 		var out bytes.Buffer
 		if err := runSyncRPCServe(ctx, in, &out, func(context.Context) bool { return true }, sock); err != nil {
 			t.Fatal(err)
 		}
-		got := out.String()
-		if !strings.Contains(got, "9007199254740993") {
-			t.Fatalf("int64 stamp corrupted in transit: %q", got)
-		}
-		if !strings.Contains(got, `"ok":true`) {
-			t.Fatalf("response not ok: %q", got)
-		}
-		if strings.Count(got, "\n") != 1 || !strings.HasSuffix(got, "\n") {
-			t.Fatalf("want exactly one newline-terminated frame, got %q", got)
+		if !bytes.Equal(out.Bytes(), payload) {
+			t.Fatalf("bridged bytes = %v, want %v", out.Bytes(), payload)
 		}
 	})
 
@@ -365,7 +304,7 @@ func TestSyncConvergeReportsResult(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(base) })
 	sock := filepath.Join(base, "c.sock")
 
-	ln, err := rpc.Listen(sock)
+	ln, err := rpc.Listen(t.Context(), sock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +314,7 @@ func TestSyncConvergeReportsResult(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { _ = rpc.Serve(ctx, ln, d); close(done) }()
+	go func() { _ = rpc.NewServer(d).Serve(ctx, ln); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
 
 	var out bytes.Buffer
@@ -392,13 +331,13 @@ func TestSyncConvergeReportsResult(t *testing.T) {
 }
 
 func TestStatusRendersMesh(t *testing.T) {
-	m, _ := syncTestEnv(t)
+	m := syncTestEnv(t)
 	writeMeshState(t, `{"self":"me@hosta","hosts":["you@hostb"]}`)
 	if err := m.Store.SetMeta(syncMetaKey, "1"); err != nil {
 		t.Fatal(err)
 	}
 
-	rf := syncRegistryFile()
+	rf := hostsync.NewRegistryFile(pool.SyncDir())
 	if err := rf.Update(context.Background(), func(reg hostsync.Registry) error {
 		reg.Add("u-1", hostsync.AccountValue{
 			UUID:  "u-1",
@@ -411,13 +350,35 @@ func TestStatusRendersMesh(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A credential only in the plaintext file store must draw the fallback warning.
-	dir := t.TempDir()
-	if err := creds.WriteFileCredential(dir, testCred("at-f", 1893456000000)); err != nil {
+	reg, err := rf.Load()
+	if err != nil {
 		t.Fatal(err)
 	}
+	raw, err := json.Marshal(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := rpc.Listen(t.Context(), pool.SyncSocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := rpc.NewDispatcher()
+	d.Register(syncservice.MethodCapabilities, func(context.Context, map[string]any) (any, error) {
+		return syncservice.Capabilities{
+			Name:    "cc-pool",
+			Methods: []string{syncservice.MethodCapabilities, syncservice.MethodGetState},
+		}, nil
+	})
+	d.Register(syncservice.MethodGetState, func(context.Context, map[string]any) (any, error) {
+		return json.RawMessage(raw), nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = rpc.NewServer(d).Serve(ctx, ln); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+
 	if err := m.Store.UpsertAccount(store.Account{
-		ID: 1, ConfigDir: dir, Label: "Work", OverlayKind: "symlink",
+		ID: 1, ConfigDir: t.TempDir(), Label: "Work", AccountUUID: "u-1",
 		KeychainService: "svc-1", KeychainAccount: "u",
 	}); err != nil {
 		t.Fatal(err)
@@ -432,15 +393,15 @@ func TestStatusRendersMesh(t *testing.T) {
 		"Host sync: enabled",
 		"Mesh self: me@hosta",
 		"Mesh peers: you@hostb",
-		"not answering", // no daemon, no sync socket
+		"Sync socket healthy",
 		"u-1",
 		"Work",
 		"2023-11-14T22:13:20Z", // 1700000000000 ms
-		"ORIGIN",               // the v2 registry table columns
+		"ORIGIN",               // the current registry table columns
 		"LOCAL",
 		"hosta",   // u-1's chain origin
 		"removed", // the u-9 tombstone row
-		"plaintext file store",
+		"present",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status output missing %q:\n%s", want, got)

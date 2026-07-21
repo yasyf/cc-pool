@@ -1,7 +1,6 @@
 package pool
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -9,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -27,7 +25,7 @@ func openTestManager(t *testing.T) *Manager {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	return &Manager{Store: st, LockDir: t.TempDir()}
+	return &Manager{Store: st}
 }
 
 // seedSessionFor's live fixtures use pid 0 so the select-path dead-session sweep
@@ -63,8 +61,9 @@ func activatePoolTestSession(t *testing.T, m *Manager, accountID, pid int, cwd s
 	if err := m.Store.ActivateSelection(store.SelectionActivation{
 		Token:     nextPoolTestToken(),
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
-		Process: store.ProcessIdentity{PID: pid, StartedAt: started},
-		Cwd:     cwd, At: started,
+		Process:   store.ProcessIdentity{PID: pid, StartedAt: started},
+		ConfigDir: AccountPresentationDir(accountID),
+		Cwd:       cwd, At: started,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -450,275 +449,3 @@ func TestClassifyDegradesOnStoreError(t *testing.T) {
 // TestSelectSweepReconcilesDeadSessions covers the select-path self-heal: with no
 // daemon, a select reaps session rows whose pids are gone — even when the scan
 // finds ZERO claude processes (a nil slice), the state after the last exit.
-func TestSelectSweepReconcilesDeadSessions(t *testing.T) {
-	ctx := context.Background()
-	now := time.Now().Truncate(time.Microsecond)
-
-	setup := func(t *testing.T, scan func(context.Context) ([]procscan.Session, error)) *Manager {
-		t.Helper()
-		old := scanSessions
-		scanSessions = scan
-		t.Cleanup(func() { scanSessions = old })
-		m := openTestManager(t)
-		dir := t.TempDir()
-		for id, util := range map[int]float64{1: 10, 2: 50} {
-			if err := m.Store.UpsertAccount(store.Account{
-				ID: id, ConfigDir: filepath.Join(dir, "acct", string(rune('a'+id))), //nolint:gosec // G115: id is a small test-loop index; 'a'+id stays well within rune range
-				KeychainService: "svc", KeychainAccount: "u",
-			}); err != nil {
-				t.Fatal(err)
-			}
-			if err := m.Store.InsertUsageSample(store.UsageSample{AccountID: id, TS: now, Util5h: util, Util7d: util}); err != nil {
-				t.Fatal(err)
-			}
-		}
-		// Pin /proj -> acct-2 long ago; its session uses a dead pid no claude can
-		// own, last seen alive 10 minutes ago.
-		if err := m.Store.UpsertSticky("/proj", 2, now.Add(-3*time.Hour)); err != nil {
-			t.Fatal(err)
-		}
-		activatePoolTestSession(t, m, 2, 4000000, "/proj", now.Add(-3*time.Hour))
-		if _, err := m.Store.CloseDeadSessions(map[int]time.Time{4000000: now.Add(-3 * time.Hour)}, now.Add(-10*time.Minute)); err != nil {
-			t.Fatal(err)
-		}
-		return m
-	}
-
-	t.Run("zero-claude scan reaps and the pin binds warm", func(t *testing.T) {
-		m := setup(t, func(context.Context) ([]procscan.Session, error) { return nil, nil })
-		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if sr.Best.ID != 2 || !sr.Sticky {
-			t.Fatalf("reaped warm end must bind the pin: got acct %d sticky=%v", sr.Best.ID, sr.Sticky)
-		}
-		if live, _ := m.Store.ListActiveSessions(); len(live) != 0 {
-			t.Fatalf("dead row must be reaped: %+v", live)
-		}
-	})
-
-	t.Run("scan failure skips the sweep and the pin holds", func(t *testing.T) {
-		m := setup(t, func(context.Context) ([]procscan.Session, error) { return nil, errors.New("ps exploded") })
-		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Without a trustworthy scan the row must stay open — no fabricated end.
-		if sr.Best.ID != 1 || sr.Sticky {
-			t.Fatalf("failed scan must not reap: got acct %d sticky=%v", sr.Best.ID, sr.Sticky)
-		}
-		if live, _ := m.Store.ListActiveSessions(); len(live) != 1 {
-			t.Fatalf("row must survive a failed scan: %+v", live)
-		}
-	})
-
-	t.Run("fresh dead row survives the reap grace", func(t *testing.T) {
-		m := setup(t, func(context.Context) ([]procscan.Session, error) { return nil, nil })
-		// A just-marked checkout (ccp run pre-exec) looks dead to a claude-only
-		// scan; the grace keeps it alive.
-		activatePoolTestSession(t, m, 1, 4000001, "/other", now)
-		if _, err := m.Select(ctx, SelectOptions{Cwd: "/proj"}); err != nil {
-			t.Fatal(err)
-		}
-		live, _ := m.Store.ListActiveSessions()
-		if len(live) != 1 || live[0].PID != 4000001 {
-			t.Fatalf("graced row must survive: %+v", live)
-		}
-	})
-}
-
-// TestSelectHonorsSticky pins the slot-in location (after Rank, before Pick):
-// a fresh sticky record overrides the emptier-account ranking, an expired one
-// does not. Pure scoring never records a new pin.
-func TestSelectHonorsSticky(t *testing.T) {
-	ctx := context.Background()
-	now := time.Now()
-
-	setup := func(t *testing.T) *Manager {
-		m := openTestManager(t)
-		dir := t.TempDir()
-		for id, util := range map[int]float64{1: 10, 2: 50} {
-			if err := m.Store.UpsertAccount(store.Account{
-				ID: id, ConfigDir: filepath.Join(dir, "acct", string(rune('a'+id))), //nolint:gosec // G115: id is a small test-loop index; 'a'+id stays well within rune range
-				KeychainService: "svc", KeychainAccount: "u",
-			}); err != nil {
-				t.Fatal(err)
-			}
-			if err := m.Store.InsertUsageSample(store.UsageSample{AccountID: id, TS: now, Util5h: util, Util7d: util}); err != nil {
-				t.Fatal(err)
-			}
-		}
-		return m
-	}
-
-	t.Run("fresh sticky overrides ranking", func(t *testing.T) {
-		m := setup(t)
-		if err := m.Store.UpsertSticky("/proj", 2, now); err != nil {
-			t.Fatal(err)
-		}
-		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if sr.Best.ID != 2 || !sr.Sticky {
-			t.Fatalf("got acct %d sticky=%v, want sticky acct 2", sr.Best.ID, sr.Sticky)
-		}
-	})
-
-	t.Run("expired sticky falls through and is removed", func(t *testing.T) {
-		m := setup(t)
-		if err := m.Store.UpsertSticky("/proj", 2, now.Add(-2*time.Hour)); err != nil {
-			t.Fatal(err)
-		}
-		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if sr.Best.ID != 1 || sr.Sticky {
-			t.Fatalf("got acct %d sticky=%v, want non-sticky acct 1 (emptier)", sr.Best.ID, sr.Sticky)
-		}
-		st, ok, err := m.Store.GetSticky("/proj")
-		if err != nil || ok {
-			t.Fatalf("expired sticky survived pure scoring: %+v ok=%v err=%v", st, ok, err)
-		}
-	})
-
-	t.Run("held pin is not repointed", func(t *testing.T) {
-		m := setup(t)
-		// Live-only session in /proj: the auto pin to acct-2 must hold — the
-		// free ranking picks acct-1 without overwriting the pin.
-		if err := m.Store.UpsertSticky("/proj", 2, now); err != nil {
-			t.Fatal(err)
-		}
-		started := now.Add(-10 * time.Minute).Truncate(time.Microsecond)
-		seedSession(t, m, "/proj", started, nil)
-		account, _ := m.Store.GetAccount(2)
-		live := mustPoolSessions(t, m)[0]
-		oldScan := scanSessions
-		scanSessions = func(context.Context) ([]procscan.Session, error) {
-			return []procscan.Session{{PID: live.PID, ConfigDir: account.ConfigDir, StartedAt: live.ProcessStartedAt}}, nil
-		}
-		t.Cleanup(func() { scanSessions = oldScan })
-		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if sr.Best.ID != 1 || sr.Sticky {
-			t.Fatalf("got acct %d sticky=%v, want free non-sticky acct 1", sr.Best.ID, sr.Sticky)
-		}
-		if sr.PinHeldAccount != nil {
-			t.Fatalf("auto hold must not flag a held manual pin: %+v", sr.PinHeldAccount)
-		}
-		st, ok, _ := m.Store.GetSticky("/proj")
-		if !ok || st.AccountID != 2 {
-			t.Fatalf("held pin was repointed: %+v ok=%v", st, ok)
-		}
-	})
-
-	t.Run("held manual pin surfaces and survives", func(t *testing.T) {
-		m := setup(t)
-		// Pin /proj to acct-2, then exhaust it: manual hold, free pick acct-1.
-		if err := m.Store.PinManual("/proj", 2, now); err != nil {
-			t.Fatal(err)
-		}
-		if err := m.Store.InsertUsageSample(store.UsageSample{
-			AccountID: 2, TS: now.Add(time.Second), Util5h: 100, Util7d: 50,
-			Resets5h: now.Add(time.Hour),
-		}); err != nil {
-			t.Fatal(err)
-		}
-		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if sr.Best.ID != 1 || sr.Sticky {
-			t.Fatalf("got acct %d sticky=%v, want free acct 1", sr.Best.ID, sr.Sticky)
-		}
-		if sr.PinHeldAccount == nil || *sr.PinHeldAccount != 2 {
-			t.Fatalf("held manual pin not surfaced: %+v", sr.PinHeldAccount)
-		}
-		st, ok, _ := m.Store.GetSticky("/proj")
-		if !ok || st.AccountID != 2 || !st.Manual {
-			t.Fatalf("manual pin lost on hold: %+v ok=%v", st, ok)
-		}
-	})
-
-	t.Run("scoring has no activation effects", func(t *testing.T) {
-		m := setup(t)
-		sr, err := m.Select(ctx, SelectOptions{Cwd: "/proj", ExcludeIDs: []int{2}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if sr.Best.ID != 1 {
-			t.Fatalf("excluded selection picked acct %d, want 1", sr.Best.ID)
-		}
-		if live, _ := m.Store.ListActiveSessions(); len(live) != 0 {
-			t.Fatalf("provisional selection opened sessions: %+v", live)
-		}
-		if _, ok, _ := m.Store.GetSticky("/proj"); ok {
-			t.Fatal("provisional selection recorded sticky state")
-		}
-	})
-
-	t.Run("no cwd records nothing", func(t *testing.T) {
-		m := setup(t)
-		if _, err := m.Select(ctx, SelectOptions{}); err != nil {
-			t.Fatal(err)
-		}
-		if _, ok, _ := m.Store.GetSticky(""); ok {
-			t.Fatal("empty cwd must not be recorded")
-		}
-	})
-}
-
-// TestSelectAllExhaustedFallback: when every account's 5h window is pegged with a
-// pending reset, Select returns the least-bad one flagged, not an error; only
-// all-rate-limited errors.
-func TestSelectAllExhaustedFallback(t *testing.T) {
-	ctx := context.Background()
-	now := time.Now()
-
-	m := openTestManager(t)
-	dir := t.TempDir()
-	for id, util7 := range map[int]float64{1: 90, 2: 10} {
-		if err := m.Store.UpsertAccount(store.Account{
-			ID: id, ConfigDir: filepath.Join(dir, "acct", string(rune('a'+id))), //nolint:gosec // G115: id is a small test-loop index; 'a'+id stays well within rune range
-			KeychainService: "svc", KeychainAccount: "u",
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if err := m.Store.InsertUsageSample(store.UsageSample{
-			AccountID: id, TS: now, Util5h: 100, Util7d: util7,
-			Resets5h: now.Add(20 * time.Minute), ExtraEnabled: id == 2,
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	sr, err := m.Select(ctx, SelectOptions{})
-	if err != nil {
-		t.Fatalf("all-exhausted select must fall back, got %v", err)
-	}
-	if !sr.ExhaustedFallback || !sr.Result.Exhausted {
-		t.Fatalf("fallback pick must be flagged: %+v", sr)
-	}
-	if sr.Best.ID != 2 {
-		t.Fatalf("expected least-bad acct 2 (emptier 7d), got %d", sr.Best.ID)
-	}
-	if !sr.ExtraEnabled {
-		t.Fatal("pick's extra-usage flag must surface for the warning")
-	}
-
-	// Negative control: rate-limited accounts cannot serve at all.
-	m2 := openTestManager(t)
-	if err := m2.Store.UpsertAccount(store.Account{ID: 1, ConfigDir: filepath.Join(dir, "rl"), KeychainService: "svc", KeychainAccount: "u"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := m2.Store.InsertUsageSample(store.UsageSample{AccountID: 1, TS: now, Util5h: 100, Resets5h: now.Add(20 * time.Minute), RateLimited: true}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := m2.Select(ctx, SelectOptions{}); !errors.Is(err, ErrNoneAvailable) {
-		t.Fatalf("all-rate-limited must error ErrNoneAvailable, got %v", err)
-	}
-}

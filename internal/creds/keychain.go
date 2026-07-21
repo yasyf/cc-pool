@@ -13,25 +13,29 @@ package creds
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
 	"golang.org/x/text/unicode/norm"
 )
 
 // securityBin is Apple's security(1), overridable for tests.
-var securityBin = func() string {
-	if v := os.Getenv("CLAUDE_POOL_SECURITY_BIN"); v != "" {
-		return v
+var securityBin = "/usr/bin/security"
+
+func securityExecutable() string {
+	if executable := os.Getenv("CLAUDE_POOL_SECURITY_BIN"); executable != "" {
+		return executable
 	}
-	return "/usr/bin/security"
-}()
+	return securityBin
+}
 
 // baseService is the un-suffixed service used for the default ~/.claude item.
 const baseService = "Claude Code-credentials"
@@ -40,6 +44,25 @@ const baseService = "Claude Code-credentials"
 var usernameRE = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
 const fallbackAccount = "claude-code-user"
+
+const maxSecurityOutput = 1 << 20
+
+type boundedBuffer struct {
+	bytes.Buffer
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	original := len(p)
+	remaining := maxSecurityOutput - b.Len()
+	if remaining <= 0 {
+		return original, nil
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	_, err := b.Buffer.Write(p)
+	return original, err
+}
 
 // ErrNotFound is returned when a store holds no credential; both the Keychain
 // and file backends share it, so its text names neither.
@@ -77,25 +100,26 @@ func AccountLabel() string {
 
 // Read fetches and parses the credential stored under (service, account).
 // account may be empty, in which case AccountLabel() is used.
-func Read(service, account string) (*Credential, error) {
+func Read(ctx context.Context, runner TaskRunner, service, account string) (*Credential, error) {
 	if account == "" {
 		account = AccountLabel()
 	}
-	raw, err := readRaw(service, account)
+	raw, err := readRaw(ctx, runner, service, account)
 	if err != nil {
 		return nil, err
 	}
 	return parseCredential(raw)
 }
 
-func readRaw(service, account string) ([]byte, error) {
-	//nolint:gosec // G204: securityBin is the fixed /usr/bin/security path; account/service are cc-pool-derived keychain identifiers
-	cmd := exec.Command(securityBin,
-		"find-generic-password", "-a", account, "-s", service, "-w")
-	var out, errb bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
+func readRaw(ctx context.Context, runner TaskRunner, service, account string) ([]byte, error) {
+	var out, errb boundedBuffer
+	if err := runKeychainTask(
+		ctx,
+		runner,
+		[]string{"find-generic-password", "-a", account, "-s", service, "-w"},
+		&out,
+		&errb,
+	); err != nil {
 		if isNotFound(errb.String()) {
 			return nil, ErrNotFound
 		}
@@ -108,7 +132,7 @@ func readRaw(service, account string) ([]byte, error) {
 // Write upserts cred under (service, account) via security -U, the secret
 // hex-encoded through -X. -X leaves the value in same-user-ps-visible argv by
 // design (matches claude's trust model), not a leak to eliminate.
-func Write(service, account string, cred *Credential) error {
+func Write(ctx context.Context, runner TaskRunner, service, account string, cred *Credential) error {
 	if err := cred.validateForWrite(); err != nil {
 		return err
 	}
@@ -119,39 +143,62 @@ func Write(service, account string, cred *Credential) error {
 	if err != nil {
 		return err
 	}
-	return writeRaw(service, account, blob)
+	return writeRaw(ctx, runner, service, account, blob)
 }
 
-func writeRaw(service, account string, blob []byte) error {
+func writeRaw(ctx context.Context, runner TaskRunner, service, account string, blob []byte) error {
 	hexed := hex.EncodeToString(blob)
-	//nolint:gosec // G204: securityBin is the fixed /usr/bin/security path; account/service/hexed are cc-pool-derived, not external input
-	cmd := exec.Command(securityBin,
-		"add-generic-password", "-U", "-a", account, "-s", service, "-X", hexed)
-	var errb bytes.Buffer
-	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
+	var errb boundedBuffer
+	if err := runKeychainTask(
+		ctx,
+		runner,
+		[]string{"add-generic-password", "-U", "-a", account, "-s", service, "-X", hexed},
+		nil,
+		&errb,
+	); err != nil {
 		return fmt.Errorf("security add-generic-password: %w: %s", err, strings.TrimSpace(errb.String()))
 	}
 	return nil
 }
 
 // Delete removes the item under (service, account). Missing is not an error.
-func Delete(service, account string) error {
+func Delete(ctx context.Context, runner TaskRunner, service, account string) error {
 	if account == "" {
 		account = AccountLabel()
 	}
-	//nolint:gosec // G204: securityBin is the fixed /usr/bin/security path; account/service are cc-pool-derived keychain identifiers
-	cmd := exec.Command(securityBin,
-		"delete-generic-password", "-a", account, "-s", service)
-	var errb bytes.Buffer
-	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
+	var errb boundedBuffer
+	if err := runKeychainTask(
+		ctx,
+		runner,
+		[]string{"delete-generic-password", "-a", account, "-s", service},
+		nil,
+		&errb,
+	); err != nil {
 		if isNotFound(errb.String()) {
 			return nil
 		}
 		return fmt.Errorf("security delete-generic-password: %w: %s", err, strings.TrimSpace(errb.String()))
 	}
 	return nil
+}
+
+func runKeychainTask(
+	ctx context.Context,
+	runner TaskRunner,
+	args []string,
+	stdout, stderr *boundedBuffer,
+) error {
+	if runner == nil {
+		return errors.New("credential keychain worker runner is required")
+	}
+	task := supervise.Task{RecoveryClass: proc.RecoveryTask, Path: securityExecutable(), Args: args}
+	if stdout != nil {
+		task.Stdout = stdout
+	}
+	if stderr != nil {
+		task.Stderr = stderr
+	}
+	return runner.Run(ctx, task)
 }
 
 // isNotFound recognizes security(1)'s errSecItemNotFound ("could not be found") text.

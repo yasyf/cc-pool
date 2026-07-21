@@ -12,6 +12,8 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
+	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
@@ -37,11 +39,13 @@ func (handlerLifecycle) Handoff(context.Context) error  { return nil }
 func newCredMoveServer(t *testing.T) (*Server, map[int]string, *credstest.Fake) {
 	t.Helper()
 	s, dirs := newTestServer(t)
-	for id, dir := range dirs {
+	for id := range dirs {
+		a := acct(t, s, id)
+		dir := a.ConfigDir
+		dirs[id] = dir
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		a := acct(t, s, id)
 		a.KeychainService = fmt.Sprintf("svc-acct-%d", id)
 		if err := s.m.Store.UpsertAccount(a); err != nil {
 			t.Fatal(err)
@@ -75,15 +79,23 @@ func credMoveReq(account *int, to string) Request {
 	return Request{Op: OpCredMove, Account: account, To: to}
 }
 
-func resultByID(t *testing.T, resp Response, id int) MigrationResult {
+func resultByID(t *testing.T, resp Response, id int) CredentialMoveResult {
 	t.Helper()
-	for _, r := range resp.Migrations {
+	for _, r := range resp.CredentialMoves {
 		if r.ID == id {
 			return r
 		}
 	}
-	t.Fatalf("no result for account %d: %+v", id, resp.Migrations)
-	return MigrationResult{}
+	t.Fatalf("no result for account %d: %+v", id, resp.CredentialMoves)
+	return CredentialMoveResult{}
+}
+
+func outcomes(resp Response) map[int]CredentialMoveOutcome {
+	result := make(map[int]CredentialMoveOutcome, len(resp.CredentialMoves))
+	for _, move := range resp.CredentialMoves {
+		result[move.ID] = move.Outcome
+	}
+	return result
 }
 
 // credUntouched asserts a's credential still lives in the keychain alone —
@@ -93,7 +105,7 @@ func credUntouched(t *testing.T, fk *credstest.Fake, a store.Account) {
 	if _, ok := fk.Get(a.KeychainService, a.KeychainAccount); !ok {
 		t.Error("keychain item missing after a refused move")
 	}
-	if creds.FileCredentialExists(a.ConfigDir) {
+	if fileCredentialExistsForTest(a.ConfigDir) {
 		t.Error("file credential appeared despite the refusal")
 	}
 }
@@ -102,7 +114,7 @@ func credUntouched(t *testing.T, fk *credstest.Fake, a store.Account) {
 // tokens — moved as-is, never refreshed.
 func fileCredEquals(t *testing.T, dir string) {
 	t.Helper()
-	got, err := creds.ReadFileCredential(dir)
+	got, err := readFileCredentialForTest(dir)
 	if err != nil {
 		t.Fatalf("read moved credential: %v", err)
 	}
@@ -114,7 +126,7 @@ func fileCredEquals(t *testing.T, dir string) {
 	}
 }
 
-// serveHandlerOnSocket binds the production persistent v4 business handlers
+// serveHandlerOnSocket binds the production persistent v1 business handlers
 // without starting scheduler or reconciliation side effects.
 func serveHandlerOnSocket(t *testing.T, s *Server) string {
 	t.Helper()
@@ -133,8 +145,12 @@ func serveHandlerOnSocket(t *testing.T, s *Server) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &wire.Server{Build: version.String(), Ladder: ladder}
-	for _, op := range []Op{OpSelect, OpSelectCommit, OpSelectAbort, OpStatus, OpMigrate, OpCredMove, OpFPRepair, OpFPBridgeCheck} {
+	server := &wire.Server{
+		Build: BusinessBuild, LifecycleBuild: version.String(), Ladder: ladder,
+		MaxSessions: 2, ReservedProtectedSessions: 1,
+		ProtectedSessionClassifier: buildTestProtectedClassifier{},
+	}
+	for _, op := range []Op{OpSelect, OpSelectCommit, OpSelectAbort, OpStatus, OpCredMove} {
 		op := op
 		server.RegisterConcurrent(wire.Op(op), func(ctx context.Context, request wire.Request) (any, error) {
 			var payload Request
@@ -149,14 +165,16 @@ func serveHandlerOnSocket(t *testing.T, s *Server) string {
 	intake := &drain.Intake{}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- server.Serve(ctx, ln, intake.Admit, intake.AdmitLifecycle) }()
+	go func() {
+		done <- server.Serve(ctx, ln, func() error { return nil }, intake.Admit, intake.AdmitLifecycle)
+	}()
 	t.Cleanup(func() {
 		intake.Close()
 		_ = server.CloseIntake()
 		_ = intake.Settle(context.Background())
 		cancel()
 		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("serve v4 test socket: %v", err)
+			t.Errorf("serve v1 test socket: %v", err)
 		}
 	})
 	return socket
@@ -180,7 +198,7 @@ func TestCredMoveEndToEndOverSocket(t *testing.T) {
 		t.Fatalf("resp = %+v, want OK", resp)
 	}
 	got := outcomes(*resp)
-	if got[1] != MigrationDone || got[2] != MigrationDone {
+	if got[1] != CredentialMoveDone || got[2] != CredentialMoveDone {
 		t.Fatalf("outcomes = %v, want both done", got)
 	}
 	r := resultByID(t, *resp, 1)
@@ -204,7 +222,7 @@ func TestHandleCredMoveAlreadyOnTarget(t *testing.T) {
 	fk.KeychainFaults = credstest.Faults{Write: errNoWrite}
 	fk.FileFaults = credstest.Faults{Write: errNoWrite}
 	a := acct(t, s, 1)
-	if err := creds.WriteFileCredential(a.ConfigDir, credFixture()); err != nil {
+	if err := writeFileCredentialForTest(a.ConfigDir, credFixture()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -214,7 +232,7 @@ func TestHandleCredMoveAlreadyOnTarget(t *testing.T) {
 		t.Fatalf("credmove failed: %s", resp.Error)
 	}
 	r := resultByID(t, resp, 1)
-	if r.Outcome != MigrationAlready || r.Detail != "" {
+	if r.Outcome != CredentialMoveAlready || r.Detail != "" {
 		t.Fatalf("result = %+v, want a detail-less already", r)
 	}
 	if r.From != "file" || r.To != "file" {
@@ -235,7 +253,7 @@ func TestHandleCredMoveAlreadyOnKeychainCleansStray(t *testing.T) {
 	fk.FileFaults = credstest.Faults{Write: errNoWrite}
 	a := acct(t, s, 1)
 	fk.Put(a.KeychainService, a.KeychainAccount, credFixture())
-	if err := creds.WriteFileCredential(a.ConfigDir, credFixture()); err != nil {
+	if err := writeFileCredentialForTest(a.ConfigDir, credFixture()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -245,72 +263,14 @@ func TestHandleCredMoveAlreadyOnKeychainCleansStray(t *testing.T) {
 		t.Fatalf("credmove failed: %s", resp.Error)
 	}
 	r := resultByID(t, resp, 1)
-	if r.Outcome != MigrationAlready || r.Detail != "cleaned a stray file copy" {
+	if r.Outcome != CredentialMoveAlready || r.Detail != "cleaned a stray file copy" {
 		t.Fatalf("result = %+v, want already with the stray-cleanup detail", r)
 	}
-	if creds.FileCredentialExists(a.ConfigDir) {
+	if fileCredentialExistsForTest(a.ConfigDir) {
 		t.Error("stray file copy not deleted")
 	}
 	if _, ok := fk.Get(a.KeychainService, a.KeychainAccount); !ok {
 		t.Error("keychain item disturbed by the stray cleanup")
-	}
-}
-
-// TestHandleCredMoveBusyClaims: every claim kind refuses with the busy reason,
-// touches no store, and never releases the claim it did not take.
-func TestHandleCredMoveBusyClaims(t *testing.T) {
-	cases := map[string]struct {
-		hold      func(s *Server) bool
-		stillHeld func(s *Server) bool
-		release   func(s *Server)
-	}{
-		"live select reservation": {
-			hold:      func(s *Server) bool { return s.cl.reserve(1) },
-			stillHeld: func(s *Server) bool { return s.cl.reservedCount(1) == 1 },
-		},
-		"daemon poll claim": {
-			hold:      func(s *Server) bool { return s.cl.hold(1) },
-			stillHeld: func(s *Server) bool { return !s.cl.hold(1) },
-			release:   func(s *Server) { s.cl.disownHold(1) },
-		},
-		"another conversion": {
-			hold:      func(s *Server) bool { return s.cl.own(1) },
-			stillHeld: func(s *Server) bool { return s.cl.held(1) },
-			release:   func(s *Server) { s.cl.disownConvert(1) },
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			s, _, fk := newCredMoveServer(t)
-			a := acct(t, s, 1)
-			fk.Put(a.KeychainService, a.KeychainAccount, credFixture())
-			if !tc.hold(s) {
-				t.Fatal("claim setup failed on a free account")
-			}
-			if tc.release != nil {
-				defer tc.release(s)
-			}
-
-			one := 1
-			resp := s.handleCredMove(t.Context(), credMoveReq(&one, "file"))
-			if !resp.OK {
-				t.Fatalf("credmove failed: %s", resp.Error)
-			}
-			r := resultByID(t, resp, 1)
-			if r.Outcome != MigrationBusy {
-				t.Fatalf("outcome = %s (%s), want busy", r.Outcome, r.Detail)
-			}
-			if r.Detail != "held by a pending select, a daemon poll, or another conversion; retry shortly" {
-				t.Fatalf("detail = %q, want the claim-busy reason", r.Detail)
-			}
-			if !tc.stillHeld(s) {
-				t.Fatal("the busy refusal released a claim it did not take")
-			}
-			if got := fk.TouchedServices(); len(got) != 0 {
-				t.Fatalf("a busy account's keychain was probed: %v", got)
-			}
-			credUntouched(t, fk, a)
-		})
 	}
 }
 
@@ -320,10 +280,12 @@ func TestHandleCredMoveLiveSessionGate(t *testing.T) {
 	s, _, fk := newCredMoveServer(t)
 	a := acct(t, s, 1)
 	fk.Put(a.KeychainService, a.KeychainAccount, credFixture())
-	// A held session lease (a live session or a select handout — invisible to
-	// procscan before claude starts) makes the move's exclusive seize bounce, so the
-	// move defers rather than forking the refresh-token chain under a live claude.
-	holdSessionLease(t, s, a)
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
+		return []procscan.Session{{PID: 4242, ConfigDir: pool.AccountPresentationDir(a.ID)}}, nil
+	}
+	if delta := s.heartbeatFor().refresh(t.Context(), 0); !delta.success {
+		t.Fatal("heartbeat did not observe the live session")
+	}
 
 	one := 1
 	resp := s.handleCredMove(t.Context(), credMoveReq(&one, "file"))
@@ -331,16 +293,40 @@ func TestHandleCredMoveLiveSessionGate(t *testing.T) {
 		t.Fatalf("credmove failed: %s", resp.Error)
 	}
 	r := resultByID(t, resp, 1)
-	if r.Outcome != MigrationBusy || !strings.Contains(r.Detail, "held by a live session or a select handout") {
-		t.Fatalf("result = %+v, want MigrationBusy naming a held handout", r)
+	if r.Outcome != CredentialMoveBusy || !strings.Contains(r.Detail, "held by a live session") {
+		t.Fatalf("result = %+v, want busy naming the live session", r)
 	}
 	if s.cl.held(1) {
-		t.Fatal("gate refusal leaked a converting claim")
+		t.Fatal("gate refusal leaked an exclusive claim")
 	}
 	if got := fk.TouchedServices(); len(got) != 0 {
 		t.Fatalf("a gated account's keychain was probed: %v", got)
 	}
 	credUntouched(t, fk, a)
+}
+
+func TestHandleCredMovePendingSelectionGate(t *testing.T) {
+	s, _, fk := newCredMoveServer(t)
+	a := acct(t, s, 1)
+	fk.Put(a.KeychainService, a.KeychainAccount, credFixture())
+	token, err := s.cl.beginReservation(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.cl.abortReservation(token)
+
+	one := 1
+	resp := s.handleCredMove(t.Context(), credMoveReq(&one, "file"))
+	if !resp.OK {
+		t.Fatalf("credmove failed: %s", resp.Error)
+	}
+	r := resultByID(t, resp, 1)
+	if r.Outcome != CredentialMoveBusy || !strings.Contains(r.Detail, "pending selection") {
+		t.Fatalf("result = %+v, want busy naming the pending selection", r)
+	}
+	if got := fk.TouchedServices(); len(got) != 0 {
+		t.Fatalf("a reserved account's keychain was probed: %v", got)
+	}
 }
 
 // TestHandleCredMoveValidation: an unknown target and an unknown account are
@@ -356,8 +342,8 @@ func TestHandleCredMoveValidation(t *testing.T) {
 		if resp.OK || !strings.Contains(resp.Error, "unknown credential target") {
 			t.Fatalf("to=%q: resp = %+v, want an unknown-target error", to, resp)
 		}
-		if len(resp.Migrations) != 0 {
-			t.Fatalf("to=%q: unknown target produced results: %+v", to, resp.Migrations)
+		if len(resp.CredentialMoves) != 0 {
+			t.Fatalf("to=%q: unknown target produced results: %+v", to, resp.CredentialMoves)
 		}
 	}
 
@@ -382,7 +368,7 @@ func TestHandleCredMoveAllAccountsMixed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := s.m.Store.UpsertAccount(store.Account{
-		ID: 3, ConfigDir: dir3, OverlayKind: "symlink",
+		ID: 3, ConfigDir: dir3, InstanceID: "instance-3", Generation: 1,
 		KeychainService: "svc-acct-3", KeychainAccount: "ccp-test",
 	}); err != nil {
 		t.Fatal(err)
@@ -390,7 +376,7 @@ func TestHandleCredMoveAllAccountsMixed(t *testing.T) {
 	a1 := acct(t, s, 1)
 	fk.Put(a1.KeychainService, a1.KeychainAccount, credFixture()) // -> done
 	a2 := acct(t, s, 2)
-	if err := creds.WriteFileCredential(a2.ConfigDir, credFixture()); err != nil { // -> already
+	if err := writeFileCredentialForTest(a2.ConfigDir, credFixture()); err != nil { // -> already
 		t.Fatal(err)
 	}
 	// acct-3 holds no credential anywhere. -> failed
@@ -399,11 +385,11 @@ func TestHandleCredMoveAllAccountsMixed(t *testing.T) {
 	if !resp.OK {
 		t.Fatalf("credmove failed: %s", resp.Error)
 	}
-	if len(resp.Migrations) != 3 {
-		t.Fatalf("results = %+v, want one per account", resp.Migrations)
+	if len(resp.CredentialMoves) != 3 {
+		t.Fatalf("results = %+v, want one per account", resp.CredentialMoves)
 	}
 	got := outcomes(resp)
-	if got[1] != MigrationDone || got[2] != MigrationAlready || got[3] != MigrationFailed {
+	if got[1] != CredentialMoveDone || got[2] != CredentialMoveAlready || got[3] != CredentialMoveFailed {
 		t.Fatalf("outcomes = %v, want done/already/failed", got)
 	}
 	r1 := resultByID(t, resp, 1)
@@ -423,7 +409,7 @@ func TestHandleCredMoveAllAccountsMixed(t *testing.T) {
 	}
 	fileCredEquals(t, dirs[1])
 	fileCredEquals(t, dirs[2])
-	if creds.FileCredentialExists(dir3) {
+	if fileCredentialExistsForTest(dir3) {
 		t.Error("acct-3 grew a file credential from nowhere")
 	}
 }

@@ -96,7 +96,7 @@ func newFakeCred() *fakeCred {
 	return &fakeCred{expiry: map[int]int64{}, cred: map[int]*creds.Credential{}, installOK: true}
 }
 
-func (c *fakeCred) ReadCredential(a store.Account) (*creds.Credential, creds.Source, error) {
+func (c *fakeCred) ReadCredential(_ context.Context, a store.Account) (*creds.Credential, creds.Source, error) {
 	if c.readErr != nil {
 		return nil, creds.SourceKeychain, c.readErr
 	}

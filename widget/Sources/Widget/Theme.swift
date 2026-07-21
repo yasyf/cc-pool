@@ -145,8 +145,8 @@ extension PoolOutlook {
     /// max of the dimensionless 5h/7d ratios, 1.0 = sustainable forever) is
     /// shown, labeled when the week binds. Under 0.02 reads as cruising.
     var pacePhrase: String {
-        if let net = netBurn5hPerHour, net <= -1 {
-            return "refilling \(Int((-net).rounded()))%/h"
+        if netBurn5hPerHour <= -1 {
+            return "refilling \(Int((-netBurn5hPerHour).rounded()))%/h"
         }
         let binding = max(pace5h, pace7d)
         if binding < 0.02 { return "cruising" }

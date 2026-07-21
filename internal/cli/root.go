@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -33,7 +34,7 @@ pool.`,
 		// Args deliberately nil: cobra's legacyArgs already rejects unknown
 		// subcommands on a root with children, so RunE only runs for bare `ccp`.
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				initialized, err := m.Initialized()
 				if err != nil {
 					return err
@@ -48,7 +49,7 @@ pool.`,
 				}
 				switch bareAction(initialized, accounts, isTTY()) {
 				case actionStatus:
-					return runStatus(cmd, m, false, false, false)
+					return runStatus(cmd, m, false, false)
 				case actionAdd:
 					return runAdd(cmd, m, addOptions{})
 				default:
@@ -69,9 +70,6 @@ pool.`,
 		newRunCmd(),
 		newEnvCmd(),
 		newDoctorCmd(),
-		newMigrateCmd(),
-		newFuseCmd(),
-		newFPCmd(),
 		newCredCmd(),
 		newRemoveCmd(),
 		newRenameCmd(),
@@ -102,8 +100,8 @@ func bareAction(initialized bool, accounts int, tty bool) rootAction {
 	}
 }
 
-func withManager(fn func(*pool.Manager) error) error {
-	m, err := pool.Open()
+func withManager(_ context.Context, fn func(*pool.Manager) error) error {
+	m, err := pool.OpenLocal()
 	if err != nil {
 		return err
 	}
@@ -124,8 +122,7 @@ func requireInit(m *pool.Manager) error {
 
 // requireDaemon vets an op that must run inside the daemon: pool initialized,
 // daemon reachable, and an exact version match — a skewed daemon is refused,
-// never auto-restarted here. purpose opens the not-running error, e.g.
-// "migration runs inside the daemon (it owns the conversion gates)".
+// never auto-restarted here. purpose opens the not-running error.
 func requireDaemon(m *pool.Manager, purpose string) (*daemon.Client, error) {
 	if err := requireInit(m); err != nil {
 		return nil, err
@@ -146,7 +143,7 @@ func requireDaemon(m *pool.Manager, purpose string) (*daemon.Client, error) {
 		return nil, fmt.Errorf("daemon health check: %w", err)
 	}
 	if health.Version != version.String() {
-		return nil, fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) and re-run — mounts and live sessions are unaffected", health.Version, version.String())
+		return nil, fmt.Errorf("the daemon is %s but this ccp is %s; restart it with `ccp service install` and re-run", health.Version, version.String())
 	}
 	keepClient = true
 	return cl, nil

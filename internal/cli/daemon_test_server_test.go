@@ -51,10 +51,8 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 		ccdaemon.OpSelectCommit,
 		ccdaemon.OpSelectAbort,
 		ccdaemon.OpStatus,
-		ccdaemon.OpMigrate,
 		ccdaemon.OpCredMove,
-		ccdaemon.OpFPRepair,
-		ccdaemon.OpFPBridgeCheck,
+		ccdaemon.OpAccountIdentity,
 	} {
 		serverDurations[wire.Op(op)] = 2 * time.Minute
 		clientDurations[wire.Op(op)] = 3 * time.Minute
@@ -63,16 +61,18 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &wire.Server{Build: build, Ladder: ladder}
+	server := &wire.Server{
+		Build: ccdaemon.BusinessBuild, LifecycleBuild: build, Ladder: ladder,
+		MaxSessions: 2, ReservedProtectedSessions: 1,
+		ProtectedSessionClassifier: daemonTestProtectedClassifier{},
+	}
 	for _, op := range []ccdaemon.Op{
 		ccdaemon.OpSelect,
 		ccdaemon.OpSelectCommit,
 		ccdaemon.OpSelectAbort,
 		ccdaemon.OpStatus,
-		ccdaemon.OpMigrate,
 		ccdaemon.OpCredMove,
-		ccdaemon.OpFPRepair,
-		ccdaemon.OpFPBridgeCheck,
+		ccdaemon.OpAccountIdentity,
 	} {
 		op := op
 		server.RegisterConcurrent(wire.Op(op), func(ctx context.Context, request wire.Request) (any, error) {
@@ -91,7 +91,9 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 	intake := &drain.Intake{}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- server.Serve(ctx, listener, intake.Admit, intake.AdmitLifecycle) }()
+	go func() {
+		done <- server.Serve(ctx, listener, func() error { return nil }, intake.Admit, intake.AdmitLifecycle)
+	}()
 	t.Cleanup(func() {
 		intake.Close()
 		_ = server.CloseIntake()
@@ -102,3 +104,11 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 		}
 	})
 }
+
+type daemonTestProtectedClassifier struct{}
+
+func (daemonTestProtectedClassifier) Validate() error { return nil }
+func (daemonTestProtectedClassifier) Classify(context.Context, wire.Peer) (bool, error) {
+	return true, nil
+}
+func (daemonTestProtectedClassifier) AuthorizeLifecycleBuild(string, string) bool { return true }

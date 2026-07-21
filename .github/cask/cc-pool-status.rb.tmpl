@@ -10,45 +10,56 @@ cask "__CASK_TOKEN__" do
 
   url "https://github.com/__REPO__/releases/download/v#{version}/__CASK_TOKEN__-v#{version}-darwin.zip"
   name "cc-pool Status"
-  desc "Notification Center widget showing cc-pool account status"
+  desc "cc-pool status, File Provider, and fixed FuseKit holder app"
   homepage "https://github.com/__REPO__"
 
-  depends_on macos: :sonoma # parsed with a ">=" comparator: sonoma or newer
+  depends_on macos: :sequoia # deployment target is macOS 15
+  depends_on cask: "macos-fuse-t/homebrew-cask/fuse-t"
   depends_on formula: "cc-pool"
 
-  app "__APP_NAME__.app"
+  app "__APP_NAME__.app", target: "/Applications/__APP_NAME__.app"
+
+  preflight do
+    # The exact daemonkit AppKeepAlive.Stop path must settle the signed holder
+    # and unregister its service before Homebrew replaces the bundle.
+    if Dir.exist?("/Applications/__APP_NAME__.app")
+      system_command "#{HOMEBREW_PREFIX}/bin/ccp",
+                     args: ["service", "holder-stop-uninstall"],
+                     must_succeed: true
+    end
+  end
 
   postflight do
     # Strip Homebrew's download quarantine so first launch is silent (notarized+stapled).
     system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/__APP_NAME__.app"],
+                   args: ["-dr", "com.apple.quarantine", "/Applications/__APP_NAME__.app"],
                    must_succeed: false
-    # Replace only the host process so it starts from the newly installed binary.
-    # File Provider and widget appexes have distinct process names and stay untouched.
-    system_command "/usr/bin/pkill", args: ["-TERM", "-x", "__APP_NAME__"], must_succeed: false
-    sleep 1
-    system_command "/usr/bin/pkill", args: ["-KILL", "-x", "__APP_NAME__"], must_succeed: false
-    system_command "/usr/bin/open", args: ["-g", "#{appdir}/__APP_NAME__.app"], must_succeed: false
-    # Register + elect the File Provider appex so ccp can default to the FP backend
-    # with no System Settings visit; best-effort — `ccp fp onboard` re-attempts.
-    system_command "/usr/bin/pluginkit", args: ["-a", "#{appdir}/__APP_NAME__.app/Contents/PlugIns/CCPoolFileProvider.appex"], must_succeed: false
-    system_command "/usr/bin/pluginkit", args: ["-e", "use", "-i", "com.yasyf.cc-pool.status.fileprovider"], must_succeed: false
+    # Register and elect the exact File Provider before starting the daemon;
+    # tenant provisioning must never race an absent extension registration.
+    system_command "/usr/bin/pluginkit", args: ["-a", "/Applications/__APP_NAME__.app/Contents/PlugIns/CCPoolFileProvider.appex"], must_succeed: true
+    system_command "/usr/bin/pluginkit", args: ["-e", "use", "-i", "com.yasyf.cc-pool.status.fileprovider"], must_succeed: true
+    # The daemonkit-owned LaunchAgent is the sole holder lifecycle authority.
+    system_command "#{HOMEBREW_PREFIX}/bin/ccp",
+                   args: ["service", "install"],
+                   must_succeed: true
   end
 
-  uninstall quit: "com.yasyf.cc-pool.status"
+  uninstall_preflight do
+    system_command "#{HOMEBREW_PREFIX}/bin/ccp",
+                   args: ["service", "holder-stop-uninstall"],
+                   must_succeed: true
+  end
 
   zap trash: [
     "~/Library/Containers/com.yasyf.cc-pool.status.widget",
-    "~/Library/Preferences/com.yasyf.cc-pool.status.plist", # login-item one-shot flag
+    "~/Library/Preferences/com.yasyf.cc-pool.status.plist",
   ]
 
   caveats <<~EOS
-    Launch the app once so macOS discovers the widget:
-      open -ga __APP_NAME__
-    Then: Notification Center (click the menu-bar clock) → Edit Widgets → "cc-pool".
+    The fixed app and daemon services are installed and started together.
+    Add the widget from Notification Center → Edit Widgets → "cc-pool".
 
-    For the File Provider overlay, run the guided setup:
-      ccp fp onboard
-    Health checks any time: ccp doctor
+    File Provider domains are managed automatically by cc-pool. Health checks:
+      ccp doctor
   EOS
 end

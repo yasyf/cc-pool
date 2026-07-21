@@ -8,8 +8,8 @@ func TestGetAccountByUUID(t *testing.T) {
 	s := openTest(t)
 
 	// One account carries a uuid at insert; another keeps the empty default.
-	withUUID := Account{ID: 1, ConfigDir: "/cfg/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "alpha", OverlayKind: "symlink", AccountUUID: "u-alpha"}
-	blank := Account{ID: 2, ConfigDir: "/cfg/acct-02", KeychainService: "svc2", KeychainAccount: "me", Label: "beta", OverlayKind: "symlink"}
+	withUUID := Account{ID: 1, ConfigDir: "/cfg/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "alpha", AccountUUID: "u-alpha"}
+	blank := Account{ID: 2, ConfigDir: "/cfg/acct-02", KeychainService: "svc2", KeychainAccount: "me", Label: "beta"}
 	for _, a := range []Account{withUUID, blank} {
 		if err := s.UpsertAccount(a); err != nil {
 			t.Fatalf("upsert %d: %v", a.ID, err)
@@ -115,7 +115,7 @@ func TestAccountsByUUID(t *testing.T) {
 
 func TestSetAccountUUIDRoundTrip(t *testing.T) {
 	s := openTest(t)
-	a := Account{ID: 1, ConfigDir: "/cfg/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "work", OverlayKind: "symlink"}
+	a := Account{ID: 1, ConfigDir: "/cfg/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "work"}
 	if err := s.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestSetAccountUUIDRoundTrip(t *testing.T) {
 		t.Fatalf("AccountUUID = %q, want u-set", got.AccountUUID)
 	}
 	// The targeted UPDATE leaves the row's other columns untouched.
-	if got.Label != "work" || got.ConfigDir != a.ConfigDir || got.OverlayKind != "symlink" {
+	if got.Label != "work" || got.ConfigDir != a.ConfigDir {
 		t.Fatalf("SetAccountUUID clobbered other columns: %+v", got)
 	}
 	if _, ok, err := s.GetAccountByUUID("u-set"); err != nil || !ok {

@@ -61,13 +61,13 @@ func TestReadCredentialPrecedence(t *testing.T) {
 				if tc.fileExp != 0 {
 					fc.ClaudeAiOauth.ExpiresAt = time.Now().Add(tc.fileExp).UnixMilli()
 				}
-				if err := creds.WriteFileCredential(dir, fc); err != nil {
+				if err := writeFileCredentialForTest(dir, fc); err != nil {
 					t.Fatal(err)
 				}
 			}
 			m := &Manager{Creds: fk}
 
-			cred, src, err := m.ReadCredential(a)
+			cred, src, err := m.ReadCredential(t.Context(), a)
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) {
 					t.Fatalf("err = %v, want errors.Is(%v)", err, tc.wantErr)
@@ -112,17 +112,15 @@ func TestWriteCredRoutesBySource(t *testing.T) {
 			a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc", KeychainAccount: "user"}
 			fk := credstest.NewFake()
 			st := openTestStore(t)
-			if err := st.UpsertAccount(a); err != nil {
-				t.Fatal(err)
-			}
+			a = persistTestAccount(t, st, a)
 			m := &Manager{Store: st, Creds: fk}
 			cred := &creds.Credential{}
 			cred.ClaudeAiOauth.AccessToken = "at-1"
 
-			if err := m.writeCred(a, tc.src, cred); err != nil {
+			if err := m.writeCred(t.Context(), a, tc.src, cred); err != nil {
 				t.Fatal(err)
 			}
-			if got := creds.FileCredentialExists(dir); got != tc.wantFile {
+			if got := fileCredentialExistsForTest(dir); got != tc.wantFile {
 				t.Errorf("file credential exists = %v, want %v", got, tc.wantFile)
 			}
 			if _, inKeychain := fk.Get(a.KeychainService, a.KeychainAccount); inKeychain == tc.wantFile {
@@ -139,18 +137,20 @@ func TestRefreshUsesFileBackendWhenKeychainEmpty(t *testing.T) {
 	st := openTestStore(t)
 	dir := t.TempDir()
 	a := store.Account{ID: 1, ConfigDir: dir, KeychainService: creds.ServiceName(dir), KeychainAccount: "user"}
+	a = persistTestAccount(t, st, a)
 
 	seed := &creds.Credential{}
 	seed.ClaudeAiOauth.AccessToken = "at-0"
 	seed.ClaudeAiOauth.RefreshToken = "rt-0"
 	seed.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Minute).UnixMilli()
-	if err := creds.WriteFileCredential(dir, seed); err != nil {
+	if err := writeFileCredentialForTest(dir, seed); err != nil {
 		t.Fatal(err)
 	}
 
 	fk := credstest.NewFake()
 	fo := &fakeOAuth{currentRT: "rt-0"}
-	m := &Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()}
+	m := &Manager{Store: st, OAuth: fo, Creds: fk}
+	bindTestWorkerAuthority(t, m, "usage-file")
 
 	cred, refreshed, err := m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
 	if err != nil {
@@ -163,7 +163,7 @@ func TestRefreshUsesFileBackendWhenKeychainEmpty(t *testing.T) {
 		t.Fatalf("returned access token = %q, want at-1", cred.ClaudeAiOauth.AccessToken)
 	}
 
-	onDisk, err := creds.ReadFileCredential(dir)
+	onDisk, err := readFileCredentialForTest(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

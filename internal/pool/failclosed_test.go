@@ -17,15 +17,13 @@ import (
 // idle-refresh path spends a token — letting a test assert a failed scan spends none.
 func newFailClosedManager(t *testing.T) (*Manager, store.Account, *fakeOAuth, *credstest.Fake) {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user"}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	a = persistTestAccount(t, st, a)
 	fk := credstest.NewFake()
 	seed := &creds.Credential{}
 	seed.ClaudeAiOauth.AccessToken = "at-0"
@@ -33,7 +31,16 @@ func newFailClosedManager(t *testing.T) (*Manager, store.Account, *fakeOAuth, *c
 	seed.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Minute).UnixMilli()
 	fk.Put(a.KeychainService, a.KeychainAccount, seed)
 	fo := &fakeOAuth{currentRT: "rt-0"}
-	return &Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()}, a, fo, fk
+	manager := &Manager{
+		Store: st,
+		OAuth: fo,
+		Creds: fk,
+		ScanSessions: func(context.Context) ([]procscan.Session, error) {
+			return nil, nil
+		},
+	}
+	bindTestWorkerAuthority(t, manager, "fail-closed")
+	return manager, a, fo, fk
 }
 
 func refreshCount(fo *fakeOAuth) int {
@@ -78,12 +85,9 @@ func TestSampleStaleFailsClosedOnScanError(t *testing.T) {
 // TestPreflightRefreshFailsClosedOnScanError pins that PreflightRefresh skips the
 // refresh on a failed scan or a live session, and refreshes only on a clean idle scan.
 func TestPreflightRefreshFailsClosedOnScanError(t *testing.T) {
-	orig := scanSessions
-	t.Cleanup(func() { scanSessions = orig })
-
 	t.Run("scan error skips refresh", func(t *testing.T) {
 		m, a, fo, _ := newFailClosedManager(t)
-		scanSessions = func(context.Context) ([]procscan.Session, error) {
+		m.ScanSessions = func(context.Context) ([]procscan.Session, error) {
 			return nil, errors.New("procscan: simulated EIO")
 		}
 		if err := m.PreflightRefresh(context.Background(), a); err != nil {
@@ -96,7 +100,6 @@ func TestPreflightRefreshFailsClosedOnScanError(t *testing.T) {
 
 	t.Run("clean scan refreshes an idle near-expiry account", func(t *testing.T) {
 		m, a, fo, _ := newFailClosedManager(t)
-		scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
 		if err := m.PreflightRefresh(context.Background(), a); err != nil {
 			t.Fatalf("PreflightRefresh: %v", err)
 		}
@@ -107,8 +110,8 @@ func TestPreflightRefreshFailsClosedOnScanError(t *testing.T) {
 
 	t.Run("live session skips refresh", func(t *testing.T) {
 		m, a, fo, _ := newFailClosedManager(t)
-		scanSessions = func(context.Context) ([]procscan.Session, error) {
-			return []procscan.Session{{PID: 1, ConfigDir: a.ConfigDir, StartedAt: time.Now()}}, nil
+		m.ScanSessions = func(context.Context) ([]procscan.Session, error) {
+			return []procscan.Session{{PID: 1, ConfigDir: AccountPresentationDir(a.ID), StartedAt: time.Now()}}, nil
 		}
 		if err := m.PreflightRefresh(context.Background(), a); err != nil {
 			t.Fatalf("PreflightRefresh: %v", err)
@@ -124,10 +127,6 @@ func TestPreflightRefreshFailsClosedOnScanError(t *testing.T) {
 // unwrapped (non-fatal, like ErrNeedsLogin) with zero refresh POSTs; a
 // still-valid synced blob — even inside the lead window — is a clean nil.
 func TestPreflightRefreshUnrefreshablePassthrough(t *testing.T) {
-	orig := scanSessions
-	t.Cleanup(func() { scanSessions = orig })
-	scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
-
 	cases := map[string]struct {
 		expiry  time.Time
 		wantErr error

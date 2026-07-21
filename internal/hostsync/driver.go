@@ -44,8 +44,8 @@ type DriverStore interface {
 type CredentialManager interface {
 	// ReadCredential returns the account's current credential and its store, or
 	// creds.ErrNotFound when the account holds none.
-	ReadCredential(a store.Account) (*creds.Credential, creds.Source, error)
-	// InstallSyncedCredential installs a pulled credential under the account lock
+	ReadCredential(context.Context, store.Account) (*creds.Credential, creds.Source, error)
+	// InstallSyncedCredential installs a pulled credential under the durable account lane
 	// when it wins the owned-precedence/freshness re-check; reports whether it landed.
 	InstallSyncedCredential(ctx context.Context, a store.Account, cred *creds.Credential) (bool, error)
 }
@@ -210,7 +210,7 @@ func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountV
 		outcome = OutcomeLabeled
 	}
 
-	localExp, localHash, owned, err := d.localChain(a)
+	localExp, localHash, owned, err := d.localChain(ctx, a)
 	if errors.Is(err, creds.ErrUnavailable) {
 		return OutcomeDeferred, nil
 	}
@@ -288,8 +288,11 @@ func (d *Driver) pullAndInstall(ctx context.Context, a store.Account, v AccountV
 
 // localChain returns a's credential expiry (Unix ms), AccessHash, and whether
 // it is owned; absent and tombstoned both read (0, "", false) — pullable.
-func (d *Driver) localChain(a store.Account) (int64, string, bool, error) {
-	cred, _, err := d.deps.Cred.ReadCredential(a)
+func (d *Driver) localChain(
+	ctx context.Context,
+	a store.Account,
+) (int64, string, bool, error) {
+	cred, _, err := d.deps.Cred.ReadCredential(ctx, a)
 	switch {
 	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
 		return 0, "", false, nil

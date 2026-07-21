@@ -89,7 +89,7 @@ func TestHeartbeatStartupReapQueuesIdleAdoption(t *testing.T) {
 	}
 }
 
-func TestIdleAdoptionFencesNewReservations(t *testing.T) {
+func TestIdleAdoptionDoesNotHoldAccountClaimAcrossCredentialIO(t *testing.T) {
 	s, dirs := newTestServer(t)
 	dir := dirs[1]
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
@@ -117,11 +117,40 @@ func TestIdleAdoptionFencesNewReservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.cl.beginReservation(a); !errors.Is(err, errAccountConverting) {
-		t.Fatalf("beginReservation during adoption = %v, want errAccountConverting", err)
+	token, err := s.cl.beginReservation(a)
+	if err != nil {
+		t.Fatalf("beginReservation during adoption = %v, want no account claim", err)
 	}
+	s.cl.abortReservation(token)
 	close(release)
 	<-done
+}
+
+func TestIdleAdoptionDefersForPendingSelection(t *testing.T) {
+	s, dirs := newTestServer(t)
+	dir := dirs[1]
+	s.scanSessions = func(context.Context) ([]procscan.Session, error) { return nil, nil }
+	if delta := s.heartbeatFor().refresh(t.Context(), 0); !delta.success {
+		t.Fatal("heartbeat failed")
+	}
+	account, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.cl.beginReservation(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.cl.abortReservation(token)
+	called := false
+	s.adoptRotated = func(context.Context, store.Account) error {
+		called = true
+		return nil
+	}
+	s.handleIdleTransition(t.Context(), dir)
+	if called {
+		t.Fatal("idle adoption ran while a selection reservation was pending")
+	}
 }
 
 func containsString(values []string, want string) bool {

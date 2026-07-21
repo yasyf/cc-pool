@@ -9,7 +9,6 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
-	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -20,7 +19,7 @@ import (
 func newGateServer(t *testing.T, cred *creds.Credential, sessions []procscan.Session) (*Server, *fakeOAuth, store.Account) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,8 +34,10 @@ func newGateServer(t *testing.T, cred *creds.Credential, sessions []procscan.Ses
 	fk := credstest.NewFake()
 	fk.Put(a.KeychainService, a.KeychainAccount, cred)
 	fo := &fakeOAuth{currentRT: cred.ClaudeAiOauth.RefreshToken}
+	manager := newDaemonTestManager(t, st, fo, fk)
+	manager.ScanSessions = func(context.Context) ([]procscan.Session, error) { return sessions, nil }
 	s := &Server{
-		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		m:            manager,
 		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		scanSessions: func(context.Context) ([]procscan.Session, error) { return sessions, nil },

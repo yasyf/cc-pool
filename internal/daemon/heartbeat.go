@@ -205,9 +205,6 @@ func (s *Server) handleHeartbeatDelta(ctx context.Context, delta heartbeatDelta)
 	} else if n > 0 {
 		s.log.Printf("reconciled %d ended session(s)", n)
 	}
-	if len(delta.newlyActive) > 0 && s.overlayCoordinator != nil {
-		s.overlayCoordinator.mark(dirtyHeartbeat)
-	}
 	for _, dir := range delta.idle {
 		s.handleIdleTransition(ctx, dir)
 	}

@@ -70,18 +70,16 @@ var scanTimeout = 3 * time.Second
 // ccdPrefix is the environment key whose value binds a session to a pool account.
 var ccdPrefix = []byte("CLAUDE_CONFIG_DIR=")
 
-// Scan returns all live claude sessions, bounding the walk with scanTimeout: a
-// wedged fuse-t mount can pin a process in uninterruptible D-state where a
-// KERN_PROCARGS2 copyin from its address space never returns and no ctx frees
-// the caller, so Scan runs the walk in a goroutine and returns on the deadline.
-// DeadlineExceeded surfaces as an error callers treat as "no sessions discovered".
+// Scan returns all live claude sessions. Daemon callers install WorkerScanner
+// so context-unaware kernel reads execute in a killable disposable process.
 func Scan(ctx context.Context) ([]Session, error) {
-	// Capture the seams before spawning: the goroutine may outlive Scan and race
-	// a test swapping them.
-	list, args := listProcs, procArgs
-	return runBounded(ctx, func(cctx context.Context) ([]Session, error) {
-		return scan(cctx, list, args)
-	})
+	cctx, cancel := context.WithTimeout(ctx, scanTimeout)
+	defer cancel()
+	sessions, err := scan(cctx, listProcs, procArgs)
+	if err != nil {
+		return nil, fmt.Errorf("procscan: %w", err)
+	}
+	return sessions, nil
 }
 
 // Proc is a live process's identity: pid and absolute start time. StartedAt
@@ -100,35 +98,13 @@ func ProcsByExecutable(ctx context.Context, execPath string) ([]Proc, error) {
 	if execPath == "" {
 		return nil, nil
 	}
-	list, args := listProcs, procArgs
-	return runBounded(ctx, func(cctx context.Context) ([]Proc, error) {
-		return byExecutable(cctx, execPath, list, args)
-	})
-}
-
-// runBounded runs walk in its own goroutine and returns on scanTimeout; the
-// buffered channel lets the abandoned goroutine finish without leaking.
-func runBounded[T any](ctx context.Context, walk func(context.Context) ([]T, error)) ([]T, error) {
 	cctx, cancel := context.WithTimeout(ctx, scanTimeout)
 	defer cancel()
-	type result struct {
-		items []T
-		err   error
+	procs, err := byExecutable(cctx, execPath, listProcs, procArgs)
+	if err != nil {
+		return nil, fmt.Errorf("procscan: %w", err)
 	}
-	ch := make(chan result, 1)
-	go func() {
-		items, err := walk(cctx)
-		ch <- result{items, err}
-	}()
-	select {
-	case <-cctx.Done():
-		return nil, fmt.Errorf("procscan: %w", cctx.Err())
-	case r := <-ch:
-		if r.err != nil {
-			return nil, fmt.Errorf("procscan: %w", r.err)
-		}
-		return r.items, nil
-	}
+	return procs, nil
 }
 
 // scan lists this user's processes and attributes the claude ones. A failed list

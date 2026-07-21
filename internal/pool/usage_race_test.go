@@ -32,7 +32,7 @@ func (f *fakeOAuth) Refresh(_ context.Context, _, refreshToken string) (*oauth.T
 	defer f.mu.Unlock()
 	if refreshToken != f.currentRT {
 		f.invalidGrants++
-		return nil, &oauth.RefreshError{Status: 400, Body: `{"error":"invalid_grant"}`, Code: "invalid_grant"}
+		return nil, &oauth.RefreshError{Status: 400, ConfirmedInvalidGrant: true}
 	}
 	f.refreshes++
 	f.currentRT = fmt.Sprintf("rt-%d", f.refreshes)
@@ -52,9 +52,9 @@ func (f *fakeOAuth) Usage(context.Context, string) (*oauth.Usage, error) {
 	}, nil
 }
 
-// TestPerAccountLockSerializesCredentialCycle hammers one account's credential
-// with concurrent SampleUsage and AdoptRotatedToken cycles; the per-account lock
-// must prevent both failure modes of the unsynchronized code:
+// TestDurableCredentialLaneSerializesCredentialCycle hammers one account's
+// credential with concurrent SampleUsage and AdoptRotatedToken cycles; the
+// durable account lane must prevent both failure modes of unsynchronized code:
 //
 //   - double-spend: two concurrent refreshes POST the same single-use token; the
 //     loser gets invalid_grant → account flagged dead (invalidGrants > 0);
@@ -62,14 +62,15 @@ func (f *fakeOAuth) Usage(context.Context, string) (*oauth.Usage, error) {
 //     clobbering Y with a consumed token (final keychain RT != provider's).
 //
 // Run with -race; iteration count is the amplifier, no sleeps.
-func TestPerAccountLockSerializesCredentialCycle(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+func TestDurableCredentialLaneSerializesCredentialCycle(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
 	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user"}
+	a = persistTestAccount(t, st, a)
 	fk := credstest.NewFake()
 	seed := &creds.Credential{}
 	seed.ClaudeAiOauth.AccessToken = "at-0"
@@ -78,7 +79,8 @@ func TestPerAccountLockSerializesCredentialCycle(t *testing.T) {
 	seed.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Minute).UnixMilli()
 	fk.Put(a.KeychainService, a.KeychainAccount, seed)
 	fo := &fakeOAuth{currentRT: "rt-0"}
-	m := &Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()}
+	m := &Manager{Store: st, OAuth: fo, Creds: fk}
+	bindTestWorkerAuthority(t, m, "usage-race")
 
 	const goroutines = 16
 	const iterations = 25

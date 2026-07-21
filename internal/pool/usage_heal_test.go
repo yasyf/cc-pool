@@ -20,16 +20,16 @@ import (
 // OAuth client and an upserted account, matching the other pool tests' shape.
 func newHealManager(t *testing.T, fk *credstest.Fake, oa Refresher) (*Manager, store.Account) {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc-heal", KeychainAccount: "user"}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
-	return &Manager{Store: st, OAuth: oa, Creds: fk, LockDir: t.TempDir()}, a
+	a = persistTestAccount(t, st, a)
+	manager := &Manager{Store: st, OAuth: oa, Creds: fk}
+	bindTestWorkerAuthority(t, manager, "usage-heal")
+	return manager, a
 }
 
 // refreshOnly builds the account-1 corruption shape: a blob whose access token
@@ -104,7 +104,7 @@ func TestEnsureFreshTokenRefreshOnlyRevoked(t *testing.T) {
 	if strings.Contains(string(raw), "refreshToken") || strings.Contains(string(raw), "rt-dead") {
 		t.Fatalf("stored blob still carries the dead refresh token: %s", raw)
 	}
-	if _, rerr := (creds.FileStore{ConfigDir: a.ConfigDir}).Read(); !errors.Is(rerr, creds.ErrNoTokens) {
+	if _, rerr := credstest.FileStore(a.ConfigDir).Read(t.Context()); !errors.Is(rerr, creds.ErrNoTokens) {
 		t.Fatalf("stripped blob reads back as %v, want the ErrNoTokens tombstone", rerr)
 	}
 	_, _, err = m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
@@ -116,7 +116,7 @@ func TestEnsureFreshTokenRefreshOnlyRevoked(t *testing.T) {
 	if err != nil || !installed {
 		t.Fatalf("InstallSyncedCredential over the tombstone = (%v, %v), want a heal", installed, err)
 	}
-	healed, _, err := m.ReadCredential(a)
+	healed, _, err := m.ReadCredential(t.Context(), a)
 	if err != nil || healed.ClaudeAiOauth.AccessToken != "at-peer" {
 		t.Fatalf("post-heal credential = (%+v, %v), want the peer's synced copy", healed, err)
 	}
@@ -214,7 +214,7 @@ func TestPreflightInvalidGrantStripsRefreshToken(t *testing.T) {
 	spent.ClaudeAiOauth.RefreshToken = "rt-spent"
 	spent.ClaudeAiOauth.ExpiresAt = time.Now().Add(-time.Minute).UnixMilli()
 	spent.ClaudeAiOauth.SubscriptionType = "max"
-	if err := (creds.FileStore{ConfigDir: a.ConfigDir}).Write(spent); err != nil {
+	if err := credstest.FileStore(a.ConfigDir).Write(t.Context(), spent); err != nil {
 		t.Fatal(err)
 	}
 
@@ -229,7 +229,7 @@ func TestPreflightInvalidGrantStripsRefreshToken(t *testing.T) {
 	if strings.Contains(string(raw), "refreshToken") {
 		t.Fatalf("stripped blob bytes still carry a refreshToken key: %s", raw)
 	}
-	got, rerr := (creds.FileStore{ConfigDir: a.ConfigDir}).Read()
+	got, rerr := credstest.FileStore(a.ConfigDir).Read(t.Context())
 	if rerr != nil {
 		t.Fatalf("read stripped blob back: %v", rerr)
 	}
@@ -250,18 +250,19 @@ func TestPreflightInvalidGrantStripsRefreshToken(t *testing.T) {
 // access-token-only compare would destroy the live rotated chain.
 func TestStripAbortsOnRefreshTokenRotatedUnderfoot(t *testing.T) {
 	kc := &rotatingCreds{
-		// read#1 (pre-flight) sees the stale chain; read#2 (the strip's CAS
-		// re-read) sees the rotation: same access token, new refresh token.
-		rotateAfter: 1,
+		// Reads #1-#4 are target classification, durable admission, apply
+		// verification, and pre-flight. The strip's source re-read sees the
+		// rotation: same access token, new refresh token.
+		rotateAfter: 4,
 		current:     cred401("at-0", "rt-stale", time.Now().Add(-time.Hour)),
 		rotated:     cred401("at-0", "rt-live", time.Now().Add(time.Hour)),
 	}
 	fo := newFakeOAuth401("rt-current") // rt-stale → invalid_grant
 	m, a := newManager401(t, kc, fo)
 
-	_, _, err := m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
-	if !errors.Is(err, ErrNeedsLogin) {
-		t.Fatalf("err = %v, want ErrNeedsLogin (the strip stays best-effort)", err)
+	got, refreshed, err := m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
+	if err != nil || refreshed || got == nil || got.ClaudeAiOauth.RefreshToken != "rt-live" {
+		t.Fatalf("rotated credential = %+v refreshed=%t err=%v, want live chain", got, refreshed, err)
 	}
 	kc.mu.Lock()
 	after, rotated := *kc.current, kc.rotated
@@ -275,22 +276,63 @@ func TestStripAbortsOnRefreshTokenRotatedUnderfoot(t *testing.T) {
 	}
 }
 
+// TestStripFailureReplaysNeedsLoginWithoutRefresh pins the ambiguous write
+// edge: once the provider has confirmed invalid_grant, a failed local strip
+// still settles the auth verdict durably. Retrying returns the same
+// needs-login result from retained evidence without re-spending the token.
+func TestStripFailureReplaysNeedsLoginWithoutRefresh(t *testing.T) {
+	writeErr := errors.New("strip write failed")
+	fk := credstest.NewFake()
+	fk.KeychainFaults = credstest.Faults{Write: writeErr}
+	fo := &fakeOAuth{currentRT: "rt-current"}
+	m, a := newHealManager(t, fk, fo)
+	spent := cred401("at-stale", "rt-spent", time.Now().Add(-time.Hour))
+	fk.Put(a.KeychainService, a.KeychainAccount, spent)
+
+	_, _, firstErr := m.EnsureFreshToken(t.Context(), a, RefreshLeadTime, true)
+	if !errors.Is(firstErr, ErrNeedsLogin) || !errors.Is(firstErr, writeErr) {
+		t.Fatalf("first err = %v, want needs-login joined with strip failure", firstErr)
+	}
+	fo.mu.Lock()
+	firstRefreshes := fo.invalidGrants
+	fo.mu.Unlock()
+	if firstRefreshes != 1 {
+		t.Fatalf("invalid-grant refreshes = %d, want 1", firstRefreshes)
+	}
+
+	_, _, replayErr := m.EnsureFreshToken(t.Context(), a, RefreshLeadTime, true)
+	if !errors.Is(replayErr, ErrNeedsLogin) ||
+		!errors.Is(replayErr, ErrCredentialOperationReplayed) {
+		t.Fatalf("replay err = %v, want retained needs-login evidence", replayErr)
+	}
+	fo.mu.Lock()
+	refreshesAfterReplay := fo.invalidGrants
+	fo.mu.Unlock()
+	if refreshesAfterReplay != firstRefreshes {
+		t.Fatalf("replay issued %d new refresh(es), want 0", refreshesAfterReplay-firstRefreshes)
+	}
+	stored, ok := fk.Get(a.KeychainService, a.KeychainAccount)
+	if !ok || stored.ClaudeAiOauth.RefreshToken != "rt-spent" {
+		t.Fatalf("stored credential = %+v, want the failed strip left untouched", stored)
+	}
+}
+
 // fakeOAuthPlain401 401s every refresh without an OAuth error code — the
 // transient-401 shape that must never destroy a refresh token.
 type fakeOAuthPlain401 struct{}
 
 func (fakeOAuthPlain401) Refresh(_ context.Context, _, _ string) (*oauth.TokenResponse, error) {
-	return nil, &oauth.RefreshError{Status: 401, Body: "unauthorized"}
+	return nil, &oauth.RefreshError{Status: 401}
 }
 
 func (fakeOAuthPlain401) Usage(_ context.Context, _ string) (*oauth.Usage, error) {
 	return nil, &oauth.UsageError{Status: 401}
 }
 
-// TestPlain401RevokedDoesNotStrip pins the strip gate's negative: a 401
-// without a confirmed invalid_grant still classifies needs-login but must NOT
-// clear the refresh token — the chain may be alive behind a transient 401.
-func TestPlain401RevokedDoesNotStrip(t *testing.T) {
+// TestPlain401IsTransientAndDoesNotStrip pins the strip gate's negative: a 401
+// without a confirmed invalid_grant remains transient and must not clear the
+// refresh token.
+func TestPlain401IsTransientAndDoesNotStrip(t *testing.T) {
 	fk := credstest.NewFake()
 	m, a := newHealManager(t, fk, fakeOAuthPlain401{})
 	owned := &creds.Credential{}
@@ -300,8 +342,12 @@ func TestPlain401RevokedDoesNotStrip(t *testing.T) {
 	fk.Put(a.KeychainService, a.KeychainAccount, owned)
 
 	_, _, err := m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
-	if !errors.Is(err, ErrNeedsLogin) {
-		t.Fatalf("err = %v, want ErrNeedsLogin", err)
+	if errors.Is(err, ErrNeedsLogin) {
+		t.Fatalf("err = %v, plain 401 must not require login", err)
+	}
+	var refreshErr *oauth.RefreshError
+	if !errors.As(err, &refreshErr) || refreshErr.Status != 401 {
+		t.Fatalf("err = %v, want transient refresh 401", err)
 	}
 	if fk.WriteCount() != 0 {
 		t.Fatalf("writes = %d, want 0 (an unconfirmed 401 must not strip)", fk.WriteCount())
@@ -309,6 +355,10 @@ func TestPlain401RevokedDoesNotStrip(t *testing.T) {
 	stored, ok := fk.Get(a.KeychainService, a.KeychainAccount)
 	if !ok || stored.ClaudeAiOauth.RefreshToken != "rt-live" {
 		t.Fatalf("stored blob = %+v, want the refresh token intact", stored)
+	}
+	entry, ok, entryErr := m.Store.LastRefresh(a.ID)
+	if entryErr != nil || !ok || entry.Category != store.RefreshRejected {
+		t.Fatalf("refresh audit = %+v ok=%t err=%v, want rejected", entry, ok, entryErr)
 	}
 }
 

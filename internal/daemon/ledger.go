@@ -2,63 +2,16 @@ package daemon
 
 import "time"
 
-// ledger is one (policy, resource) self-heal record — the shape every self-heal
-// family folds onto. It runs a policy's two phases:
-//
-//   - Phase 1 (debounce): strike accumulates the primary lane toward the
-//     policy's debounce; the strike that reaches it latches faulted (or
-//     forceFault latches it immediately). The lane resets on the latch so the
-//     recovery ladder counts from zero.
-//   - Phase 2 (recovery ladder): attempt advances the shared backoff clock
-//     (attempts); attempts alone spaces the next attempt (nextDue). A two-lane
-//     policy (alt > 0) additionally charges one of two mutually-resetting
-//     breaker lanes — strikes (primary) or altHits (alt) — and a lane reaching
-//     its threshold parks the ledger (onTrip). A single-lane policy (alt == 0)
-//     parks when the attempts clock reaches breaker; its strikes stays a pure
-//     debounce counter, so pre-fault recovery attempts (the FP Missing
-//     control-plane heal) can never erode the fault debounce.
-//
-// The two-lane, shared-clock shape is fuse.remount's incident contract: hazard
-// and TCC outcomes each reset the other's lane, so an alternating row trips
-// neither breaker while the shared attempts clock still spaces every remount.
+// ledger is one product auth or rate-limit gate record.
 type ledger struct {
-	// strikes is the debounce count before the fault latches; on a two-lane
-	// policy it doubles as the primary breaker lane during recovery. Single-lane
-	// policies never charge it from attempt — their breaker measures attempts.
-	strikes int
-	// faulted latches the debounce verdict (wedged / needs-login / forced). It
-	// persists across recovery attempts — a parked resource stays faulted.
-	faulted bool
-	// attempts is the shared backoff clock: every recovery attempt, whatever its
-	// lane, so the backoff spacing never resets on alternating outcome kinds. It
-	// is also the breaker measure for single-lane policies.
+	strikes  int
+	faulted  bool
 	attempts int
-	// altHits is the alt breaker lane (e.g. TCC), mutually-resetting with strikes.
-	altHits int
 	// nextDue is the earliest time the next attempt may run (attempts × backoff).
 	nextDue time.Time
 	lastErr error
 	lastAt  time.Time
 }
-
-// attemptKind selects which breaker lane a recovery attempt charges on a
-// two-lane policy (alt > 0); the primary and alt lanes mutually reset, so
-// alternating kinds trip neither. Single-lane policies ignore the kind — their
-// breaker measures the shared attempts clock, so pre-fault recovery attempts
-// (the FP Missing heal) never touch the strikes debounce.
-type attemptKind int
-
-const (
-	// attemptPrimary charges the strikes lane and resets altHits — the hazard /
-	// remount-failure outcome.
-	attemptPrimary attemptKind = iota
-	// attemptAlt charges the altHits lane and resets strikes — the TCC-block
-	// outcome.
-	attemptAlt
-	// attemptNeutral advances only the shared clock and resets both lanes — a
-	// benign deferral (busy / unmitigated) that must reach no breaker.
-	attemptNeutral
-)
 
 // strike records one debounce failure. Until the ledger faults, strikes
 // accumulate toward the policy's debounce; the strike that reaches it latches
@@ -95,50 +48,20 @@ func (l *ledger) stamp(now time.Time, err error) {
 	l.lastErr, l.lastAt = err, now
 }
 
-// attempt books one recovery attempt: it advances the shared backoff clock
-// (spacing the next attempt) and stamps lastAt, returning whether the attempt
-// parked a breaker. On a two-lane policy it also charges the selected breaker
-// lane while resetting the other; a single-lane policy ignores kind — its
-// breaker measures the attempts clock.
-func (l *ledger) attempt(p policy, kind attemptKind, now time.Time) (parked bool) {
+// attempt books one rate-limit observation and advances its backoff clock.
+func (l *ledger) attempt(p policy, now time.Time) {
 	l.attempts++
-	if p.alt > 0 {
-		switch kind {
-		case attemptPrimary:
-			l.strikes++
-			l.altHits = 0
-		case attemptAlt:
-			l.altHits++
-			l.strikes = 0
-		case attemptNeutral:
-			l.strikes, l.altHits = 0, 0
-		}
-	}
 	l.nextDue = now.Add(p.backoff.After(l.attempts))
 	l.lastAt = now
-	return l.parked(p)
 }
 
 // setNextDue overrides the backoff clock so the gate holds until t — the 429
 // Retry-After hint replacing the computed exponential window.
 func (l *ledger) setNextDue(t time.Time) { l.nextDue = t }
 
-// parked reports whether a breaker has tripped. A two-lane policy trips when
-// the primary lane reaches breaker or the alt lane reaches alt; a single-lane
-// policy trips when the shared attempts clock reaches breaker — strikes stays a
-// pure debounce counter there. onTrip names what the consumer then does
-// (gate / park / retreat).
-func (l *ledger) parked(p policy) bool {
-	if p.alt > 0 {
-		return (p.breaker > 0 && l.strikes >= p.breaker) || l.altHits >= p.alt
-	}
-	return p.breaker > 0 && l.attempts >= p.breaker
-}
-
-// due reports whether another recovery attempt is warranted now: no breaker has
-// tripped and the backoff since the last attempt has elapsed.
+// due reports whether the product gate's backoff has elapsed.
 func (l *ledger) due(p policy, now time.Time) bool {
-	return !l.parked(p) && !now.Before(l.nextDue)
+	return !now.Before(l.nextDue)
 }
 
 // backoffElapsed reports whether the backoff window since the last attempt has
@@ -162,8 +85,6 @@ type ledgerSnapshot struct {
 	Strikes  int
 	Faulted  bool
 	Attempts int
-	AltHits  int
-	Parked   bool
 	NextDue  time.Time
 	LastErr  string
 	LastAt   time.Time
@@ -218,10 +139,9 @@ func (ls *ledgers) stamp(p policy, resource string, now time.Time, err error) {
 	ls.row(p, resource).stamp(now, err)
 }
 
-// attempt books one recovery attempt for (p, resource), returning whether it
-// parked a breaker; see ledger.attempt.
-func (ls *ledgers) attempt(p policy, resource string, kind attemptKind, now time.Time) bool {
-	return ls.row(p, resource).attempt(p, kind, now)
+// attempt books one rate-limit observation for (p, resource).
+func (ls *ledgers) attempt(p policy, resource string, now time.Time) {
+	ls.row(p, resource).attempt(p, now)
 }
 
 // setNextDue overrides (p, resource)'s backoff clock; see ledger.setNextDue.
@@ -256,13 +176,6 @@ func (ls *ledgers) backoffElapsed(p policy, resource string, now time.Time) bool
 	return l == nil || l.backoffElapsed(now)
 }
 
-// parked reports whether (p, resource) has tripped a breaker. An absent ledger
-// is not parked.
-func (ls *ledgers) parked(p policy, resource string) bool {
-	l := ls.peek(p, resource)
-	return l != nil && l.parked(p)
-}
-
 // snapshot lists every live ledger for the status wire, taken by the caller
 // under the Server's mu so the wire sees a consistent view.
 func (ls *ledgers) snapshot() []ledgerSnapshot {
@@ -270,8 +183,8 @@ func (ls *ledgers) snapshot() []ledgerSnapshot {
 	for k, l := range ls.m {
 		s := ledgerSnapshot{
 			Policy: k.policy, Resource: k.resource,
-			Strikes: l.strikes, Faulted: l.faulted, Attempts: l.attempts, AltHits: l.altHits,
-			Parked: l.parked(policies[k.policy]), NextDue: l.nextDue, LastAt: l.lastAt,
+			Strikes: l.strikes, Faulted: l.faulted, Attempts: l.attempts,
+			NextDue: l.nextDue, LastAt: l.lastAt,
 		}
 		if l.lastErr != nil {
 			s.LastErr = l.lastErr.Error()

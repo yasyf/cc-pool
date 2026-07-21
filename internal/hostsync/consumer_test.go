@@ -49,9 +49,6 @@ func TestCapabilitiesIncludeFetch(t *testing.T) {
 	if caps.Name != "cc-pool" {
 		t.Errorf("Name = %q, want cc-pool", caps.Name)
 	}
-	if caps.ProtocolVersion != syncservice.ProtocolVersion {
-		t.Errorf("ProtocolVersion = %d, want %d", caps.ProtocolVersion, syncservice.ProtocolVersion)
-	}
 	if !containsStr(caps.Methods, MethodFetchCredential) {
 		t.Errorf("Methods %v missing the custom %s", caps.Methods, MethodFetchCredential)
 	}

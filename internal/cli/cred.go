@@ -36,7 +36,7 @@ can reach the Keychain even when this shell (over SSH, for example) cannot.
 Accounts with live sessions are skipped and reported — re-run after they end.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				if to != creds.SourceKeychain.String() && to != creds.SourceFile.String() {
 					return fmt.Errorf("unknown credential backend %q (want keychain or file)", to)
 				}
@@ -44,7 +44,7 @@ Accounts with live sessions are skipped and reported — re-run after they end.`
 				if err != nil {
 					return err
 				}
-				if len(resp.Migrations) == 0 {
+				if len(resp.CredentialMoves) == 0 {
 					if resp.Error != "" {
 						return errors.New(resp.Error)
 					}
@@ -83,7 +83,7 @@ func requestCredMove(m *pool.Manager, to string, account int) (*daemon.Response,
 func renderCredMoves(cmd *cobra.Command, resp *daemon.Response, explicit bool) error {
 	out := cmd.OutOrStdout()
 	var done, already, busy, failed int
-	for _, r := range resp.Migrations {
+	for _, r := range resp.CredentialMoves {
 		name := fmt.Sprintf("acct-%02d (%s)", r.ID, accountName(r.Label))
 		// Done/already may carry a detail ("cleaned a stray file copy").
 		suffix := ""
@@ -91,22 +91,22 @@ func renderCredMoves(cmd *cobra.Command, resp *daemon.Response, explicit bool) e
 			suffix = " — " + r.Detail
 		}
 		switch r.Outcome {
-		case daemon.MigrationDone:
+		case daemon.CredentialMoveDone:
 			done++
 			success(out, "%s %s → %s%s", name, r.From, r.To, suffix)
-		case daemon.MigrationAlready:
+		case daemon.CredentialMoveAlready:
 			already++
 			note(out, "%s already %s%s", name, r.To, suffix)
-		case daemon.MigrationBusy:
+		case daemon.CredentialMoveBusy:
 			busy++
 			step(out, "%s skipped: %s", name, r.Detail)
-		case daemon.MigrationFailed:
+		case daemon.CredentialMoveFailed:
 			failed++
 			step(out, "%s %s: %s", badStyle.Render("✗"), name, r.Detail)
 		}
 	}
 	if busy > 0 {
-		step(out, "Moved %d of %d; %d busy — re-run `ccp cred move` when their sessions end.", done, len(resp.Migrations), busy)
+		step(out, "Moved %d of %d; %d busy — re-run `ccp cred move` when their sessions end.", done, len(resp.CredentialMoves), busy)
 	} else if done > 0 {
 		step(out, "Moved %d credential(s).", done)
 	}

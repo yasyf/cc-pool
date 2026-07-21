@@ -12,7 +12,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // localsFixture is a temp-dir pool Manager for the Locals/LocalIndex builders:
@@ -24,36 +23,35 @@ type localsFixture struct {
 
 func newLocalsFixture(t *testing.T) *localsFixture {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	t.Setenv("HOME", t.TempDir())
+	m, err := pool.OpenDaemon(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(func() { _ = m.Close() })
 	fk := credstest.NewFake()
+	m.Creds = backingCredentials{fk}
+	m.OAuth = stubRefresher{}
 	return &localsFixture{
-		m:  &pool.Manager{Store: st, OAuth: stubRefresher{}, Creds: fk, LockDir: t.TempDir()},
+		m:  m,
 		fk: fk,
 	}
 }
 
 // addAccount inserts a pool row; identityJSON (when non-empty) is written to
 // the row's private .claude.json, honoring the backend's private-root math.
-func (fx *localsFixture) addAccount(t *testing.T, id int, kind, label, identityJSON string) store.Account {
+func (fx *localsFixture) addAccount(t *testing.T, id int, _ string, label, identityJSON string) store.Account {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), fmt.Sprintf("acct-%02d", id))
+	dir := pool.AccountDir(id)
 	a := store.Account{
-		ID: id, ConfigDir: dir, OverlayKind: kind, Label: label,
+		ID: id, ConfigDir: dir, Label: label,
 		KeychainService: fmt.Sprintf("svc%d", id), KeychainAccount: "me",
 	}
 	if err := fx.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
 	if identityJSON != "" {
-		backend, err := fkoverlay.Parse(kind)
-		if err != nil {
-			t.Fatal(err)
-		}
-		path := privateClaudeJSON(backend, dir)
+		path := filepath.Join(pool.AccountBackingDir(id), ".claude.json")
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -189,41 +187,6 @@ func TestManagerLocalsAdvertisesOnlyOwnedChains(t *testing.T) {
 		}
 		if locals[0].Chain != (ChainStamp{}) {
 			t.Fatalf("chain = %+v, want zero", locals[0].Chain)
-		}
-	})
-
-	t.Run("fuse row reads identity from the private backing root", func(t *testing.T) {
-		fx := newLocalsFixture(t)
-		a := fx.addAccount(t, 1, "nfs", "l", `{"oauthAccount":`+oauthRaw+`}`)
-		// A decoy at the bridged path must never be read: the account dir of a
-		// fuse row is a bridge symlink whose traversal is unbounded.
-		if err := os.MkdirAll(a.ConfigDir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		decoy := `{"oauthAccount":{"accountUuid":"DECOY","emailAddress":"d@x.com"}}`
-		if err := os.WriteFile(filepath.Join(a.ConfigDir, ".claude.json"), []byte(decoy), 0o600); err != nil {
-			t.Fatal(err)
-		}
-
-		locals, err := ManagerLocals(fx.m, "h", now)(context.Background())
-		if err != nil {
-			t.Fatalf("ManagerLocals: %v", err)
-		}
-		if len(locals) != 1 || locals[0].UUID != "u1" {
-			t.Fatalf("locals = %+v, want the private-root identity u1", locals)
-		}
-	})
-
-	t.Run("unparseable overlay kind fails loud", func(t *testing.T) {
-		fx := newLocalsFixture(t)
-		fx.addAccount(t, 1, "symlink", "l", `{"oauthAccount":`+oauthRaw+`}`)
-		bad := store.Account{ID: 2, ConfigDir: t.TempDir(), OverlayKind: "bogus", KeychainService: "svc2", KeychainAccount: "me"}
-		if err := fx.m.Store.UpsertAccount(bad); err != nil {
-			t.Fatal(err)
-		}
-
-		if _, err := ManagerLocals(fx.m, "h", now)(context.Background()); err == nil {
-			t.Fatal("corrupt overlay_kind must fail the scan loudly")
 		}
 	})
 }

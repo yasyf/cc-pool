@@ -25,7 +25,7 @@ func TestSelectionReservationExpiresAndRestartDropsIt(t *testing.T) {
 	if c.reservedCount(a.ID) != 0 {
 		t.Fatal("expired reservation remained live")
 	}
-	if resp := c.commitSelection(t.Context(), token, func(string, reservation, selectionLaunch) Response {
+	if resp := c.commitSelection(t.Context(), token, func(context.Context, string, reservation, selectionLaunch) Response {
 		t.Fatal("expired reservation reached activation")
 		return Response{}
 	}); resp.OK {
@@ -67,7 +67,7 @@ func TestSelectionReservationSerializesConcurrentCommit(t *testing.T) {
 	release := make(chan struct{})
 	var mu sync.Mutex
 	calls := 0
-	activate := func(gotToken string, got reservation, gotLaunch selectionLaunch) Response {
+	activate := func(_ context.Context, gotToken string, got reservation, gotLaunch selectionLaunch) Response {
 		mu.Lock()
 		calls++
 		mu.Unlock()
@@ -111,7 +111,7 @@ func TestBeginSelectionPrunesTerminalHistory(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if resp := c.commitSelection(t.Context(), token, func(string, reservation, selectionLaunch) Response {
+		if resp := c.commitSelection(t.Context(), token, func(context.Context, string, reservation, selectionLaunch) Response {
 			return Response{OK: true}
 		}); !resp.OK {
 			t.Fatalf("commit = %+v", resp)

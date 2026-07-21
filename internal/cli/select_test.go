@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,14 +146,14 @@ func TestWarnExhaustedFallback(t *testing.T) {
 // least-bad fallback (emptier 7d, overage enabled).
 func exhaustedPoolManager(t *testing.T) *pool.Manager {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir()) // ReconcileOverlay resolves ~/.claude from HOME
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("USER", "user")
 	st := openTestStore(t)
 	now := time.Now()
 	for id, util7 := range map[int]float64{1: 90, 2: 10} {
 		if err := st.UpsertAccount(store.Account{
 			ID: id, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "work@example.com",
-			KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test", OverlayKind: "symlink",
+			KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -166,7 +165,7 @@ func exhaustedPoolManager(t *testing.T) *pool.Manager {
 		}
 	}
 	// An empty seam fake makes any preflight refresh a harmless needs-login miss.
-	return &pool.Manager{Store: st, Creds: credstest.NewFake(), LockDir: t.TempDir()}
+	return &pool.Manager{Store: st, Creds: credstest.NewFake()}
 }
 
 // The bypass notice is loud only when a held pin was actually bypassed.
@@ -229,7 +228,7 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	}
 	if err := st.UpsertAccount(store.Account{
 		ID: id, ConfigDir: dir, Label: "work@example.com",
-		KeychainService: "svc", KeychainAccount: "u", OverlayKind: "symlink",
+		KeychainService: "svc", KeychainAccount: "u",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +244,7 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 		resp := daemon.Response{OK: true, Version: version.String()}
 		if op == daemon.OpSelect {
 			resp.SelectedID = &id
-			resp.Dir = dir
+			resp.Dir = pool.AccountPresentationDir(id)
 			resp.AccountInstanceID = account.InstanceID
 			resp.AccountGeneration = account.Generation
 		}
@@ -259,7 +258,7 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	cmd.SetContext(context.Background())
 
 	_, gotDir, _, err := resolveSelection(cmd, m, selectReq{cwd: "/proj"})
-	if err != nil || gotDir != dir {
+	if err != nil || gotDir != pool.AccountPresentationDir(id) {
 		t.Fatalf("daemon pick must succeed: dir=%q err=%v (stderr=%q)", gotDir, err, stripANSI(stderr.String()))
 	}
 	got, err := os.ReadFile(privatePath) //nolint:gosec // G304: test-owned path under t.TempDir.
@@ -268,62 +267,6 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	}
 	if !bytes.Equal(got, private) {
 		t.Fatalf("daemon pick repeated the base merge: got %s, want %s", got, private)
-	}
-}
-
-// A mount-layer problem must never surface as "exhausted or rate-limited".
-func TestResolveSelectionMountsNotReadyError(t *testing.T) {
-	cases := map[string]struct {
-		resp    daemon.Response
-		wantErr error
-		notErr  error
-	}{
-		"mounts not ready": {
-			daemon.Response{OK: false, NoneAvailable: true, MountsNotReady: true, Error: pool.ErrMountsNotReady.Error()},
-			pool.ErrMountsNotReady, pool.ErrNoneAvailable,
-		},
-		"plain none available": {
-			daemon.Response{OK: false, NoneAvailable: true, Error: pool.ErrNoneAvailable.Error()},
-			pool.ErrNoneAvailable, pool.ErrMountsNotReady,
-		},
-	}
-	for name, tc := range cases {
-		tc := tc
-		t.Run(name, func(t *testing.T) {
-			home, err := os.MkdirTemp("/tmp", "ccp-home")
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = os.RemoveAll(home) })
-			t.Setenv("HOME", home)
-
-			st := openTestStore(t)
-			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			selectResp := tc.resp
-			startDaemonTestServer(t, "", func(_ context.Context, op daemon.Op, _ daemon.Request) daemon.Response {
-				resp := daemon.Response{OK: true, Version: version.String()}
-				if op == daemon.OpSelect {
-					resp = selectResp
-					resp.Version = version.String()
-				}
-				return resp
-			})
-
-			m := &pool.Manager{Store: st}
-			cmd := &cobra.Command{}
-			cmd.SetErr(&bytes.Buffer{})
-			cmd.SetContext(context.Background())
-
-			_, _, _, err = resolveSelection(cmd, m, selectReq{cwd: "/proj"})
-			if !errors.Is(err, tc.wantErr) {
-				t.Fatalf("resolveSelection err = %v, want errors.Is %v", err, tc.wantErr)
-			}
-			if errors.Is(err, tc.notErr) {
-				t.Fatalf("err must not match the other sentinel %v; err = %v", tc.notErr, err)
-			}
-		})
 	}
 }
 
@@ -356,14 +299,15 @@ func TestResolveSelectionRejectsDaemonBuildSkewWithoutLocalFallback(t *testing.T
 }
 
 func TestValidateDaemonSelection(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	st := openTestStore(t)
 	a := store.Account{
 		ID: 5, ConfigDir: filepath.Join(t.TempDir(), "acct-05"), Label: "work@example.com",
-		KeychainService: "svc-5", KeychainAccount: "u-5", OverlayKind: "symlink",
+		KeychainService: "svc-5", KeychainAccount: "u-5",
 	}
 	b := store.Account{
 		ID: 6, ConfigDir: filepath.Join(t.TempDir(), "acct-06"), Label: "other@example.com",
-		KeychainService: "svc-6", KeychainAccount: "u-6", OverlayKind: "symlink",
+		KeychainService: "svc-6", KeychainAccount: "u-6",
 	}
 	for _, acct := range []store.Account{a, b} {
 		if err := st.UpsertAccount(acct); err != nil {
@@ -372,6 +316,8 @@ func TestValidateDaemonSelection(t *testing.T) {
 	}
 	a, _ = st.GetAccount(a.ID)
 	b, _ = st.GetAccount(b.ID)
+	presentationA := pool.AccountPresentationDir(a.ID)
+	presentationB := pool.AccountPresentationDir(b.ID)
 	m := &pool.Manager{Store: st}
 	zero, unknown := 0, 999
 	cases := []struct {
@@ -399,28 +345,28 @@ func TestValidateDaemonSelection(t *testing.T) {
 		{
 			name:      "wrong dir",
 			resp:      daemon.Response{SelectedID: &a.ID, Dir: "/wrong/dir"},
-			wantError: []string{"id 5", "expected dir \"" + a.ConfigDir + "\"", "returned dir \"/wrong/dir\""},
+			wantError: []string{"id 5", "expected dir \"" + presentationA + "\"", "returned dir \"/wrong/dir\""},
 		},
 		{
 			name:      "trailing slash alias fails",
-			resp:      daemon.Response{SelectedID: &a.ID, Dir: a.ConfigDir + "/"},
-			wantError: []string{"id 5", "expected dir \"" + a.ConfigDir + "\"", "returned dir \"" + a.ConfigDir + "/\""},
+			resp:      daemon.Response{SelectedID: &a.ID, Dir: presentationA + "/"},
+			wantError: []string{"id 5", "expected dir \"" + presentationA + "\"", "returned dir \"" + presentationA + "/\""},
 		},
 		{
 			name:      "dot segment alias fails",
-			resp:      daemon.Response{SelectedID: &a.ID, Dir: a.ConfigDir + "/./"},
-			wantError: []string{"id 5", "expected dir \"" + a.ConfigDir + "\"", "returned dir \"" + a.ConfigDir + "/./\""},
+			resp:      daemon.Response{SelectedID: &a.ID, Dir: presentationA + "/./"},
+			wantError: []string{"id 5", "expected dir \"" + presentationA + "\"", "returned dir \"" + presentationA + "/./\""},
 		},
 		{
 			name:      "forced account mismatch",
-			resp:      daemon.Response{SelectedID: &b.ID, Dir: b.ConfigDir},
+			resp:      daemon.Response{SelectedID: &b.ID, Dir: presentationB},
 			forced:    &a,
-			wantError: []string{"id 6", "forced account 5", "expected dir \"" + a.ConfigDir + "\"", "returned dir \"" + b.ConfigDir + "\""},
+			wantError: []string{"id 6", "forced account 5", "expected dir \"" + presentationA + "\"", "returned dir \"" + presentationB + "\""},
 		},
 		{
 			name: "exact automatic match succeeds",
 			resp: daemon.Response{
-				SelectedID: &a.ID, Dir: a.ConfigDir, AccountInstanceID: a.InstanceID,
+				SelectedID: &a.ID, Dir: presentationA, AccountInstanceID: a.InstanceID,
 				AccountGeneration: a.Generation,
 			},
 			wantID: a.ID,
@@ -428,7 +374,7 @@ func TestValidateDaemonSelection(t *testing.T) {
 		{
 			name: "exact forced match succeeds",
 			resp: daemon.Response{
-				SelectedID: &a.ID, Dir: a.ConfigDir, AccountInstanceID: a.InstanceID,
+				SelectedID: &a.ID, Dir: presentationA, AccountInstanceID: a.InstanceID,
 				AccountGeneration: a.Generation,
 			},
 			forced: &a,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
@@ -29,7 +30,7 @@ func envCred(suffix string, expiresAt int64) *creds.Credential {
 }
 
 // installFixture is a Manager over a fake credential seam with a counting
-// OnCredWrite hook, plus the account under test.
+// exact credential-write settlement, plus the account under test.
 type installFixture struct {
 	m         *Manager
 	fk        *credstest.Fake
@@ -45,13 +46,21 @@ func newInstallFixture(t *testing.T) *installFixture {
 		a:  store.Account{ID: 5, ConfigDir: t.TempDir(), KeychainService: "svc-install", KeychainAccount: "user"},
 	}
 	st := openTestStore(t)
-	if err := st.UpsertAccount(f.a); err != nil {
-		t.Fatal(err)
+	f.a = persistTestAccount(t, st, f.a)
+	f.m = &Manager{Store: st, Creds: f.fk}
+	bindTestWorkerAuthority(t, f.m, "install")
+	f.m.BuildCredentialWritePublication = func(
+		_ store.Account,
+		credential *creds.Credential,
+		_ store.CredentialOperationID,
+		_ time.Time,
+	) ([]byte, error) {
+		copy := *credential
+		f.hookCred = &copy
+		return []byte(`{"test":"credential-write"}`), nil
 	}
-	f.m = &Manager{Store: st, Creds: f.fk, LockDir: t.TempDir()}
-	f.m.OnCredWrite = func(_ store.Account, cr *creds.Credential) error {
+	f.m.SettleCredentialWrite = func(_ context.Context, settlement CredentialWriteSettlement) error {
 		f.hookCalls++
-		f.hookCred = cr
 		return nil
 	}
 	return f
@@ -148,8 +157,8 @@ func TestInstallSyncedCredentialOwnedPrecedence(t *testing.T) {
 				if got.HasRefreshToken() {
 					t.Fatal("installed blob carries a refresh token")
 				}
-				if f.hookCalls != 1 || f.hookCred != tc.incoming {
-					t.Fatalf("OnCredWrite calls=%d cred=%p, want 1 with the installed credential", f.hookCalls, f.hookCred)
+				if f.hookCalls != 1 || !sameTokens(f.hookCred, tc.incoming) {
+					t.Fatalf("credential settlements=%d cred=%+v, want 1 with the installed credential", f.hookCalls, f.hookCred)
 				}
 				return
 			}
@@ -174,7 +183,7 @@ func TestInstallSyncedCredentialOwnedPrecedence(t *testing.T) {
 func TestInstallSyncedCredentialFollowsBackendResolution(t *testing.T) {
 	f := newInstallFixture(t)
 	local := envCred("local", 1_000)
-	if err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Write(local); err != nil {
+	if err := credstest.FileStore(f.a.ConfigDir).Write(t.Context(), local); err != nil {
 		t.Fatalf("seed file credential: %v", err)
 	}
 	incoming := envCred("incoming", 2_000)
@@ -186,7 +195,7 @@ func TestInstallSyncedCredentialFollowsBackendResolution(t *testing.T) {
 	if !installed {
 		t.Fatal("installed = false, want true")
 	}
-	got, err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Read()
+	got, err := credstest.FileStore(f.a.ConfigDir).Read(t.Context())
 	if err != nil {
 		t.Fatalf("read file credential back: %v", err)
 	}
@@ -200,7 +209,7 @@ func TestInstallSyncedCredentialFollowsBackendResolution(t *testing.T) {
 		t.Fatal("keychain gained an item; the install must not mirror across backends")
 	}
 	if f.hookCalls != 1 {
-		t.Fatalf("OnCredWrite fired %d times, want 1", f.hookCalls)
+		t.Fatalf("credential settlement fired %d times, want 1", f.hookCalls)
 	}
 }
 
@@ -229,9 +238,9 @@ func TestInstallSyncedCredentialHeadlessKeychainUnavailable(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newInstallFixture(t)
 			f.fk.KeychainFaults = credstest.Faults{Read: creds.ErrUnavailable}
-			fileStore := creds.FileStore{ConfigDir: f.a.ConfigDir}
+			fileStore := credstest.FileStore(f.a.ConfigDir)
 			if tc.file != nil {
-				if err := fileStore.Write(tc.file); err != nil {
+				if err := fileStore.Write(t.Context(), tc.file); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -253,16 +262,16 @@ func TestInstallSyncedCredentialHeadlessKeychainUnavailable(t *testing.T) {
 			}
 			if !tc.wantInstalled {
 				if f.hookCalls != 0 {
-					t.Fatalf("OnCredWrite fired %d times on a skip, want 0", f.hookCalls)
+					t.Fatalf("credential settlement fired %d times on a skip, want 0", f.hookCalls)
 				}
-				got, rerr := fileStore.Read()
+				got, rerr := fileStore.Read(t.Context())
 				if rerr != nil || got.ClaudeAiOauth.AccessToken != tc.file.ClaudeAiOauth.AccessToken ||
 					got.ClaudeAiOauth.RefreshToken != tc.file.ClaudeAiOauth.RefreshToken {
 					t.Fatalf("file backend = (%+v, %v), want the local credential untouched", got, rerr)
 				}
 				return
 			}
-			got, rerr := fileStore.Read()
+			got, rerr := fileStore.Read(t.Context())
 			if rerr != nil || got.ClaudeAiOauth.AccessToken != "at-incoming" {
 				t.Fatalf("file backend = (%+v, %v), want the incoming rotation", got, rerr)
 			}
@@ -270,60 +279,16 @@ func TestInstallSyncedCredentialHeadlessKeychainUnavailable(t *testing.T) {
 				t.Fatal("installed blob carries a refresh token")
 			}
 			if f.hookCalls != 1 {
-				t.Fatalf("OnCredWrite fired %d times, want 1", f.hookCalls)
+				t.Fatalf("credential settlement fired %d times, want 1", f.hookCalls)
 			}
 		})
 	}
 }
 
-// TestInstallSyncedCredentialConcurrentRotationWins pins the owned-precedence
-// re-check across the lock-free window: a local login landing before the
-// install wins outright — the local chain is owned, so the pull is skipped.
-func TestInstallSyncedCredentialConcurrentRotationWins(t *testing.T) {
-	f := newInstallFixture(t)
-	f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, envCred("old", 1_000))
-	// Verified lock-free against a synced expiry 1_000, so 2_000 looked strictly fresher.
-	incoming := envCred("incoming", 2_000)
-	rotated := syncCred("rotated", 3_000)
-
-	release, err := f.m.lockAccount(context.Background(), f.a.ID)
-	if err != nil {
-		t.Fatalf("lockAccount: %v", err)
-	}
-	type result struct {
-		installed bool
-		err       error
-	}
-	done := make(chan result, 1)
-	go func() {
-		installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, incoming)
-		done <- result{installed, err}
-	}()
-	// While the install is (or will be) blocked on the account lock, a local
-	// login mints an owned chain.
-	f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, rotated)
-	release()
-
-	res := <-done
-	if res.err != nil {
-		t.Fatalf("InstallSyncedCredential: %v", res.err)
-	}
-	if res.installed {
-		t.Fatal("installed = true; the concurrent login must win")
-	}
-	got, ok := f.fk.Get(f.a.KeychainService, f.a.KeychainAccount)
-	if !ok || got.ClaudeAiOauth.AccessToken != rotated.ClaudeAiOauth.AccessToken {
-		t.Fatalf("keychain holds %+v, want the rotated credential", got)
-	}
-	if f.hookCalls != 0 {
-		t.Fatalf("OnCredWrite fired %d times, want 0 (nothing was installed)", f.hookCalls)
-	}
-}
-
-// swapStore serves scripted keychain reads: the first read (the locked probe)
-// returns old/oldErr, later reads return swapped/swappedErr — a `claude`
-// login or logout landing between the probe and any later re-read, outside
-// every lock cc-pool holds.
+// swapStore serves scripted keychain reads: the durable operation's observation
+// and the operation's first probe return old/oldErr, then later reads return
+// swapped/swappedErr — a `claude` login or logout landing between the probe and
+// any later re-read, outside every lane cc-pool owns.
 type swapStore struct {
 	creds.Store
 	old, swapped       *creds.Credential
@@ -331,9 +296,9 @@ type swapStore struct {
 	reads              int
 }
 
-func (s *swapStore) Read() (*creds.Credential, error) {
+func (s *swapStore) Read(context.Context) (*creds.Credential, error) {
 	s.reads++
-	if s.reads == 1 {
+	if s.reads <= 2 {
 		return s.old, s.oldErr
 	}
 	return s.swapped, s.swappedErr
@@ -357,7 +322,7 @@ func (c swapCreds) Stores(a store.Account) []creds.Store {
 }
 
 // TestInstallSyncedCredentialCASAbortsOnUnderfootLogin pins the CAS discipline:
-// a `claude /login` landing between the locked read and the write aborts the
+// a `claude /login` landing between the initial read and the write aborts the
 // install as a clean skip, the login's chain untouched.
 func TestInstallSyncedCredentialCASAbortsOnUnderfootLogin(t *testing.T) {
 	f := newInstallFixture(t)
@@ -383,7 +348,7 @@ func TestInstallSyncedCredentialCASAbortsOnUnderfootLogin(t *testing.T) {
 		t.Fatalf("backing store = %+v; an aborted install must write nothing", got)
 	}
 	if f.hookCalls != 0 {
-		t.Fatalf("OnCredWrite fired %d times on an aborted install", f.hookCalls)
+		t.Fatalf("credential settlement fired %d times on an aborted install", f.hookCalls)
 	}
 }
 
@@ -436,7 +401,7 @@ func TestInstallSyncedCredentialAbortsOnLoginOverEmptySlot(t *testing.T) {
 func TestInstallSyncedCredentialSkipsOnOwnedOtherBackend(t *testing.T) {
 	f := newInstallFixture(t)
 	f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, syncCred("owned", 1_000))
-	if err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Write(envCred("synced", 3_000)); err != nil {
+	if err := credstest.FileStore(f.a.ConfigDir).Write(t.Context(), envCred("synced", 3_000)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -453,7 +418,7 @@ func TestInstallSyncedCredentialSkipsOnOwnedOtherBackend(t *testing.T) {
 	if got, ok := f.fk.Get(f.a.KeychainService, f.a.KeychainAccount); !ok || got.ClaudeAiOauth.RefreshToken != "rt-owned" {
 		t.Fatalf("keychain holds %+v, want the owned chain untouched", got)
 	}
-	if got, err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Read(); err != nil || got.ClaudeAiOauth.AccessToken != "at-synced" {
+	if got, err := credstest.FileStore(f.a.ConfigDir).Read(t.Context()); err != nil || got.ClaudeAiOauth.AccessToken != "at-synced" {
 		t.Fatalf("file backend = (%+v, %v), want the synced copy untouched", got, err)
 	}
 }
@@ -478,7 +443,7 @@ func TestInstallSyncedCredentialFailsClosedOnUnverifiableBackend(t *testing.T) {
 				f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, envCred("synced", 1_000))
 				f.fk.FileFaults = credstest.Faults{Read: errOpaque}
 			} else {
-				if err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Write(envCred("synced", 1_000)); err != nil {
+				if err := credstest.FileStore(f.a.ConfigDir).Write(t.Context(), envCred("synced", 1_000)); err != nil {
 					t.Fatal(err)
 				}
 				ks := &swapStore{Store: f.fk.Store(f.a, creds.SourceKeychain), oldErr: creds.ErrNotFound, swappedErr: errOpaque}
@@ -509,7 +474,7 @@ func TestInstallSyncedCredentialFailsClosedOnUnverifiableBackend(t *testing.T) {
 // never see it.
 func TestInstallSyncedCredentialAbortsOnLoginDuringInstall(t *testing.T) {
 	f := newInstallFixture(t)
-	if err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Write(envCred("synced", 1_000)); err != nil {
+	if err := credstest.FileStore(f.a.ConfigDir).Write(t.Context(), envCred("synced", 1_000)); err != nil {
 		t.Fatal(err)
 	}
 	login := syncCred("login", 2_000)
@@ -529,7 +494,7 @@ func TestInstallSyncedCredentialAbortsOnLoginDuringInstall(t *testing.T) {
 	if f.fk.WriteCount() != 0 || f.hookCalls != 0 {
 		t.Fatalf("aborted install acted (writes=%d hooks=%d), want none", f.fk.WriteCount(), f.hookCalls)
 	}
-	if got, err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Read(); err != nil || got.ClaudeAiOauth.AccessToken != "at-synced" {
+	if got, err := credstest.FileStore(f.a.ConfigDir).Read(t.Context()); err != nil || got.ClaudeAiOauth.AccessToken != "at-synced" {
 		t.Fatalf("file backend = (%+v, %v), want the synced copy untouched", got, err)
 	}
 }
@@ -545,10 +510,10 @@ func TestWriteCredCASWritesThroughTombstone(t *testing.T) {
 	}
 
 	next := envCred("healed", 4_000)
-	if err := f.m.writeCredCAS(f.a, creds.SourceFile, nil, next); err != nil {
-		t.Fatalf("writeCredCAS over a tombstone = %v, want write-through", err)
+	if err := f.m.writeObservedCredential(t.Context(), f.a, creds.SourceFile, nil, next, nil); err != nil {
+		t.Fatalf("writeObservedCredential over a tombstone = %v, want write-through", err)
 	}
-	got, err := (creds.FileStore{ConfigDir: f.a.ConfigDir}).Read()
+	got, err := credstest.FileStore(f.a.ConfigDir).Read(t.Context())
 	if err != nil {
 		t.Fatalf("read back after tombstone overwrite: %v", err)
 	}

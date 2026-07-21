@@ -13,8 +13,8 @@ const plansDirectoryKey = "plansDirectory"
 // injectPlansDirectory returns the settings.json bytes to serve: base with
 // plansDirectory=plansDir injected when base lacks the key, or base unchanged
 // when it already sets one (a user value is never overridden). Injected output is
-// key-sorted json.Marshal — deterministic bytes, load-bearing for the fuse merged
-// view's Getattr/Read coherence.
+// key-sorted json.Marshal — deterministic bytes, load-bearing for catalog
+// content revisions and File Provider content versions.
 func injectPlansDirectory(base []byte, plansDir string) (served []byte, err error) {
 	top, err := parseObject(base, "settings.json")
 	if err != nil {
@@ -65,4 +65,14 @@ func stripInjectedPlansDirectory(committed []byte, plansDir string) (newBase []b
 		return nil, fmt.Errorf("encode stripped settings.json: %w", err)
 	}
 	return newBase, nil
+}
+
+// StripInjectedPlansDirectory removes cc-pool's exact synthetic plans path before source persistence.
+func StripInjectedPlansDirectory(committed []byte, plansDir string) ([]byte, error) {
+	return stripInjectedPlansDirectory(committed, plansDir)
+}
+
+// InjectPlansDirectory adds cc-pool's canonical plans path when settings do not override it.
+func InjectPlansDirectory(base []byte, plansDir string) ([]byte, error) {
+	return injectPlansDirectory(base, plansDir)
 }

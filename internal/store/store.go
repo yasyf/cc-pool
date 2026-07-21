@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,17 +37,91 @@ CREATE TABLE accounts (
   id               INTEGER PRIMARY KEY CHECK(id > 0),
   instance_id      TEXT NOT NULL UNIQUE CHECK(length(instance_id) = 32 AND instance_id NOT GLOB '*[^0-9a-f]*'),
   generation       INTEGER NOT NULL CHECK(generation > 0),
-  config_dir       TEXT NOT NULL UNIQUE CHECK(config_dir <> ''),
+  config_dir       TEXT NOT NULL CHECK(config_dir <> ''),
   keychain_service TEXT NOT NULL CHECK(keychain_service <> ''),
   keychain_account TEXT NOT NULL CHECK(keychain_account <> ''),
   label            TEXT NOT NULL DEFAULT '',
-  overlay_kind     TEXT NOT NULL DEFAULT 'symlink',
   account_uuid     TEXT NOT NULL DEFAULT '',
-  created_at       INTEGER NOT NULL
+  created_at       INTEGER NOT NULL,
+  deleted_at       INTEGER CHECK(deleted_at IS NULL OR deleted_at > 0)
+);
+CREATE TABLE account_removals (
+  account_id         INTEGER PRIMARY KEY CHECK(account_id > 0),
+  account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation INTEGER NOT NULL CHECK(account_generation > 0),
+  registry_sequence  INTEGER NOT NULL CHECK(registry_sequence > 0),
+  delete_credential  INTEGER NOT NULL CHECK(delete_credential IN (0,1)),
+  created_at         INTEGER NOT NULL
 );
 CREATE TABLE pending_adds (
-  id         INTEGER PRIMARY KEY,
-  created_at INTEGER NOT NULL
+  id          INTEGER PRIMARY KEY CHECK(id > 0),
+  instance_id TEXT NOT NULL UNIQUE CHECK(length(instance_id) = 32 AND instance_id NOT GLOB '*[^0-9a-f]*'),
+  generation  INTEGER NOT NULL CHECK(generation = 1),
+	owner_record BLOB NOT NULL CHECK(length(owner_record) > 0),
+  created_at  INTEGER NOT NULL CHECK(created_at > 0)
+);
+CREATE TABLE account_registry_sequences (
+  account_id INTEGER PRIMARY KEY CHECK(account_id > 0),
+  sequence   INTEGER NOT NULL CHECK(sequence >= 0)
+);
+CREATE TABLE account_mutations (
+  operation_id               BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
+  account_id                 INTEGER NOT NULL UNIQUE CHECK(account_id > 0),
+  kind                       TEXT NOT NULL CHECK(kind IN ('add','relogin','sync-install')),
+  state                      TEXT NOT NULL CHECK(state IN ('awaiting-input','reserved','applying','applied','publishing','compensating')),
+  registry_sequence          INTEGER NOT NULL CHECK(registry_sequence > 0),
+  account_instance_id        TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation         INTEGER NOT NULL CHECK(account_generation > 0),
+  locator_digest             BLOB NOT NULL CHECK(length(locator_digest) = 32),
+  expected_credential_digest BLOB NOT NULL CHECK(length(expected_credential_digest) = 32),
+  intent_digest              BLOB NOT NULL CHECK(length(intent_digest) = 32),
+  input_digest               BLOB CHECK(input_digest IS NULL OR length(input_digest) = 32),
+  written_credential_digest  BLOB NOT NULL DEFAULT (zeroblob(32)) CHECK(length(written_credential_digest) = 32),
+  credential_written         INTEGER NOT NULL DEFAULT 0 CHECK(credential_written IN (0,1)),
+  config_dir                 TEXT NOT NULL CHECK(config_dir <> ''),
+  keychain_service           TEXT NOT NULL CHECK(keychain_service <> ''),
+  keychain_account           TEXT NOT NULL CHECK(keychain_account <> ''),
+  label                      TEXT NOT NULL DEFAULT '',
+  account_uuid               TEXT NOT NULL DEFAULT '',
+  owner_record               BLOB NOT NULL CHECK(length(owner_record) > 0),
+  owner_epoch                INTEGER NOT NULL CHECK(owner_epoch > 0),
+  created_at                 INTEGER NOT NULL CHECK(created_at > 0),
+  updated_at                 INTEGER NOT NULL CHECK(updated_at >= created_at)
+);
+CREATE TABLE account_mutation_receipts (
+  operation_id      BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
+  account_id        INTEGER NOT NULL CHECK(account_id > 0),
+  kind              TEXT NOT NULL CHECK(kind IN ('add','relogin','sync-install')),
+  registry_sequence INTEGER NOT NULL CHECK(registry_sequence > 0),
+  account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation INTEGER NOT NULL CHECK(account_generation > 0),
+  locator_digest     BLOB NOT NULL CHECK(length(locator_digest) = 32),
+  expected_credential_digest BLOB NOT NULL CHECK(length(expected_credential_digest) = 32),
+  intent_digest      BLOB NOT NULL CHECK(length(intent_digest) = 32),
+  input_digest       BLOB CHECK(input_digest IS NULL OR length(input_digest) = 32),
+  written_credential_digest BLOB CHECK(written_credential_digest IS NULL OR length(written_credential_digest) = 32),
+  credential_written INTEGER NOT NULL CHECK(credential_written IN (0,1)),
+  outcome_digest      BLOB NOT NULL CHECK(length(outcome_digest) = 32),
+  terminal          TEXT NOT NULL CHECK(terminal IN ('committed','superseded','aborted','quarantined')),
+	quarantine_file_locator_digest BLOB CHECK(quarantine_file_locator_digest IS NULL OR length(quarantine_file_locator_digest) = 32),
+	quarantine_reason TEXT CHECK(quarantine_reason IS NULL OR quarantine_reason IN ('ambiguous','diverged','cleanup-failed','changed-underfoot')),
+	resolution TEXT CHECK(resolution IS NULL OR resolution='compensated-release'),
+	resolution_observed_digest BLOB CHECK(resolution_observed_digest IS NULL OR length(resolution_observed_digest) = 32),
+	resolved_at INTEGER,
+  config_dir        TEXT NOT NULL CHECK(config_dir <> ''),
+  keychain_service  TEXT NOT NULL CHECK(keychain_service <> ''),
+  keychain_account  TEXT NOT NULL CHECK(keychain_account <> ''),
+  label             TEXT NOT NULL DEFAULT '',
+  account_uuid      TEXT NOT NULL DEFAULT '',
+  owner_record      BLOB NOT NULL CHECK(length(owner_record) > 0),
+  owner_epoch       INTEGER NOT NULL CHECK(owner_epoch > 0),
+  committed_at      INTEGER NOT NULL CHECK(committed_at > 0),
+  acknowledged_at   INTEGER CHECK(acknowledged_at IS NULL OR acknowledged_at >= committed_at),
+  expires_at        INTEGER NOT NULL CHECK(expires_at > committed_at),
+	CHECK((credential_written=1) = (written_credential_digest IS NOT NULL)),
+	CHECK((terminal='quarantined') = (quarantine_file_locator_digest IS NOT NULL AND quarantine_reason IS NOT NULL)),
+	CHECK((resolution IS NULL AND resolution_observed_digest IS NULL AND resolved_at IS NULL)
+	   OR (resolution IS NOT NULL AND resolution_observed_digest IS NOT NULL AND resolved_at IS NOT NULL AND resolved_at>=committed_at))
 );
 CREATE TABLE usage_samples (
   account_id    INTEGER NOT NULL,
@@ -91,8 +166,8 @@ CREATE TABLE selection_terminals (
 CREATE TABLE refresh_log (
   account_id INTEGER NOT NULL,
   ts         INTEGER NOT NULL,
-  ok         INTEGER NOT NULL,
-  err        TEXT NOT NULL DEFAULT '',
+	category   TEXT NOT NULL CHECK(category IN ('succeeded','canceled','network','invalid_grant','rejected','server','internal')),
+	digest     BLOB NOT NULL CHECK(length(digest) = 32),
   PRIMARY KEY (account_id, ts)
 );
 CREATE TABLE sticky (
@@ -105,29 +180,141 @@ CREATE TABLE auth_health (
   account_id  INTEGER PRIMARY KEY,
   needs_login INTEGER NOT NULL DEFAULT 0,
   since       INTEGER,
-  last_err    TEXT NOT NULL DEFAULT '',
-  kind        TEXT NOT NULL DEFAULT '',
-  gen         INTEGER NOT NULL DEFAULT 0
+	reason      TEXT NOT NULL CHECK(reason IN ('none','auth_required','awaiting_origin','internal')),
+	digest      BLOB NOT NULL CHECK(length(digest) = 32),
+	kind        TEXT NOT NULL DEFAULT 'owned' CHECK(kind IN ('owned','awaiting_origin','unverified')),
+	gen         INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE journal_risks (
-  dir         TEXT PRIMARY KEY,
-  warning     TEXT NOT NULL DEFAULT '',
-  recorded_at INTEGER NOT NULL
+CREATE TABLE credential_operations (
+	account_id             INTEGER PRIMARY KEY CHECK(account_id > 0),
+  operation_id           BLOB NOT NULL UNIQUE CHECK(length(operation_id) = 32),
+  token                  TEXT NOT NULL UNIQUE CHECK(length(token) = 32 AND token NOT GLOB '*[^0-9a-f]*'),
+  kind                   TEXT NOT NULL CHECK(kind IN ('move','ensure-fresh','refresh-current','install-synced','adopt-rotated','drop-divergent-copy','compensate')),
+  target                 TEXT NOT NULL CHECK(target IN ('keychain','file','all')),
+  intent_digest          BLOB NOT NULL CHECK(length(intent_digest) = 32),
+  account_instance_id    TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation     INTEGER NOT NULL CHECK(account_generation > 0),
+  locator_digest         BLOB NOT NULL CHECK(length(locator_digest) = 32),
+  file_locator_digest    BLOB NOT NULL CHECK(length(file_locator_digest) = 32),
+  owner_record           BLOB NOT NULL CHECK(length(owner_record) > 0),
+  owner_epoch            INTEGER NOT NULL CHECK(owner_epoch > 0),
+  state                  TEXT NOT NULL CHECK(state IN ('prepared','applying','applied')),
+  expected_keychain_state TEXT NOT NULL CHECK(expected_keychain_state IN ('empty','present','unsearchable','unreadable')),
+  expected_keychain_digest BLOB CHECK(expected_keychain_digest IS NULL OR length(expected_keychain_digest) = 32),
+  expected_file_state     TEXT NOT NULL CHECK(expected_file_state IN ('empty','present','unsearchable','unreadable')),
+  expected_file_digest    BLOB CHECK(expected_file_digest IS NULL OR length(expected_file_digest) = 32),
+  outcome_keychain_state  TEXT CHECK(outcome_keychain_state IS NULL OR outcome_keychain_state IN ('empty','present','unsearchable','unreadable')),
+  outcome_keychain_digest BLOB CHECK(outcome_keychain_digest IS NULL OR length(outcome_keychain_digest) = 32),
+  outcome_file_state      TEXT CHECK(outcome_file_state IS NULL OR outcome_file_state IN ('empty','present','unsearchable','unreadable')),
+  outcome_file_digest     BLOB CHECK(outcome_file_digest IS NULL OR length(outcome_file_digest) = 32),
+  terminal_status         TEXT CHECK(terminal_status IS NULL OR terminal_status IN ('succeeded','failed','quarantined')),
+  result_category         TEXT CHECK(result_category IS NULL OR result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','moved','already-target','cleaned-stray','failed','ambiguous','diverged','cleanup-failed','changed-underfoot')),
+  failure_class           TEXT CHECK(failure_class IS NULL OR failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')),
+  publication_payload     BLOB CHECK(publication_payload IS NULL OR (length(publication_payload) > 0 AND length(publication_payload) <= 4096)),
+  created_at             INTEGER NOT NULL CHECK(created_at > 0),
+  updated_at             INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK(
+    (state IN ('prepared','applying') AND outcome_keychain_state IS NULL AND outcome_file_state IS NULL AND terminal_status IS NULL AND result_category IS NULL AND failure_class IS NULL)
+    OR
+    (state='applied' AND outcome_keychain_state IS NOT NULL AND outcome_file_state IS NOT NULL AND terminal_status IS NOT NULL AND result_category IS NOT NULL)
+  ),
+	CHECK(failure_class IS NULL OR failure_class='internal' OR
+	      (kind IN ('ensure-fresh','refresh-current') AND failure_class IN ('network','refresh-unauthorized','refresh-rejected','refresh-server'))),
+	CHECK(terminal_status IS NULL OR
+	      (terminal_status='succeeded' AND failure_class IS NULL AND
+	       result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','moved','already-target','cleaned-stray')) OR
+	      (terminal_status='failed' AND result_category='failed' AND failure_class IS NOT NULL AND
+	       failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')) OR
+	      (terminal_status='quarantined' AND failure_class IS NOT NULL AND
+	       result_category IN ('ambiguous','diverged','cleanup-failed','changed-underfoot') AND
+	       failure_class='internal')),
+	CHECK((kind IN ('compensate','ensure-fresh','refresh-current')) = (target='all')),
+  CHECK((expected_keychain_state='present') = (expected_keychain_digest IS NOT NULL)),
+  CHECK((expected_file_state='present') = (expected_file_digest IS NOT NULL)),
+	CHECK(outcome_keychain_state IS NULL OR ((outcome_keychain_state='present') = (outcome_keychain_digest IS NOT NULL))),
+	CHECK(outcome_file_state IS NULL OR ((outcome_file_state='present') = (outcome_file_digest IS NOT NULL))),
+	CHECK(publication_payload IS NULL OR state='applying' OR
+	      (state='applied' AND terminal_status='succeeded' AND result_category IN ('refreshed','installed','moved'))),
+	CHECK(state!='applied' OR terminal_status!='succeeded' OR
+	      result_category NOT IN ('refreshed','installed','moved') OR publication_payload IS NOT NULL)
 );
-CREATE TABLE overlay_applied (
-  account_id      INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
-  backend         TEXT NOT NULL,
-  canonical_stamp TEXT NOT NULL,
-  settings_stamp  TEXT NOT NULL,
-  structure_stamp TEXT NOT NULL,
-  app_stamp       TEXT NOT NULL,
-  applied_at      INTEGER NOT NULL
+CREATE TABLE credential_operation_receipts (
+  operation_id         BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
+  token                TEXT NOT NULL UNIQUE CHECK(length(token) = 32 AND token NOT GLOB '*[^0-9a-f]*'),
+	account_id           INTEGER NOT NULL CHECK(account_id > 0),
+  account_instance_id  TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation   INTEGER NOT NULL CHECK(account_generation > 0),
+  locator_digest       BLOB NOT NULL CHECK(length(locator_digest) = 32),
+  file_locator_digest  BLOB NOT NULL CHECK(length(file_locator_digest) = 32),
+  kind                 TEXT NOT NULL CHECK(kind IN ('move','ensure-fresh','refresh-current','install-synced','adopt-rotated','drop-divergent-copy','compensate')),
+  target               TEXT NOT NULL CHECK(target IN ('keychain','file','all')),
+  intent_digest        BLOB NOT NULL CHECK(length(intent_digest) = 32),
+  expected_keychain_state TEXT NOT NULL CHECK(expected_keychain_state IN ('empty','present','unsearchable','unreadable')),
+  expected_keychain_digest BLOB CHECK(expected_keychain_digest IS NULL OR length(expected_keychain_digest) = 32),
+  expected_file_state     TEXT NOT NULL CHECK(expected_file_state IN ('empty','present','unsearchable','unreadable')),
+  expected_file_digest    BLOB CHECK(expected_file_digest IS NULL OR length(expected_file_digest) = 32),
+  owner_record         BLOB NOT NULL CHECK(length(owner_record) > 0),
+  owner_epoch          INTEGER NOT NULL CHECK(owner_epoch > 0),
+  terminal_status      TEXT NOT NULL CHECK(terminal_status IN ('succeeded','failed','quarantined')),
+  result_category      TEXT NOT NULL CHECK(result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','moved','already-target','cleaned-stray','failed','ambiguous','diverged','cleanup-failed','changed-underfoot')),
+  failure_class        TEXT CHECK(failure_class IS NULL OR failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')),
+  outcome_keychain_state  TEXT NOT NULL CHECK(outcome_keychain_state IN ('empty','present','unsearchable','unreadable')),
+  outcome_keychain_digest BLOB CHECK(outcome_keychain_digest IS NULL OR length(outcome_keychain_digest) = 32),
+  outcome_file_state      TEXT NOT NULL CHECK(outcome_file_state IN ('empty','present','unsearchable','unreadable')),
+  outcome_file_digest     BLOB CHECK(outcome_file_digest IS NULL OR length(outcome_file_digest) = 32),
+  publication_payload     BLOB CHECK(publication_payload IS NULL OR (length(publication_payload) > 0 AND length(publication_payload) <= 4096)),
+  committed_at         INTEGER NOT NULL CHECK(committed_at > 0),
+  acknowledged_at      INTEGER CHECK(acknowledged_at IS NULL OR acknowledged_at >= committed_at),
+  expires_at           INTEGER NOT NULL CHECK(expires_at > committed_at),
+	CHECK((kind IN ('compensate','ensure-fresh','refresh-current')) = (target='all')),
+	CHECK(failure_class IS NULL OR failure_class='internal' OR
+	      (kind IN ('ensure-fresh','refresh-current') AND failure_class IN ('network','refresh-unauthorized','refresh-rejected','refresh-server'))),
+	CHECK((terminal_status='succeeded' AND failure_class IS NULL AND
+	       result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','moved','already-target','cleaned-stray')) OR
+	      (terminal_status='failed' AND result_category='failed' AND failure_class IS NOT NULL AND
+	       failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')) OR
+	      (terminal_status='quarantined' AND failure_class IS NOT NULL AND
+	       result_category IN ('ambiguous','diverged','cleanup-failed','changed-underfoot') AND
+	       failure_class='internal')),
+  CHECK((expected_keychain_state='present') = (expected_keychain_digest IS NOT NULL)),
+	CHECK((expected_file_state='present') = (expected_file_digest IS NOT NULL)),
+	CHECK((outcome_keychain_state='present') = (outcome_keychain_digest IS NOT NULL)),
+	CHECK((outcome_file_state='present') = (outcome_file_digest IS NOT NULL)),
+	CHECK((publication_payload IS NOT NULL) =
+	      (terminal_status='succeeded' AND result_category IN ('refreshed','installed','moved')))
+);
+CREATE TABLE credential_quarantines (
+	account_id               INTEGER PRIMARY KEY CHECK(account_id > 0),
+  account_instance_id      TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation       INTEGER NOT NULL CHECK(account_generation > 0),
+  locator_digest           BLOB NOT NULL CHECK(length(locator_digest) = 32),
+  file_locator_digest      BLOB NOT NULL CHECK(length(file_locator_digest) = 32),
+  observation_keychain_state  TEXT NOT NULL CHECK(observation_keychain_state IN ('empty','present','unsearchable','unreadable')),
+  observation_keychain_digest BLOB CHECK(observation_keychain_digest IS NULL OR length(observation_keychain_digest) = 32),
+  observation_file_state      TEXT NOT NULL CHECK(observation_file_state IN ('empty','present','unsearchable','unreadable')),
+  observation_file_digest     BLOB CHECK(observation_file_digest IS NULL OR length(observation_file_digest) = 32),
+  token_chain_digest          BLOB CHECK(token_chain_digest IS NULL OR length(token_chain_digest) = 32),
+  reason                    TEXT NOT NULL CHECK(reason IN ('ambiguous','diverged','cleanup-failed','changed-underfoot')),
+  failure_class             TEXT NOT NULL CHECK(failure_class='internal'),
+  created_at                INTEGER NOT NULL CHECK(created_at > 0),
+  CHECK((observation_keychain_state='present') = (observation_keychain_digest IS NOT NULL)),
+  CHECK((observation_file_state='present') = (observation_file_digest IS NOT NULL))
 );
 CREATE INDEX idx_accounts_uuid ON accounts(account_uuid);
+CREATE UNIQUE INDEX idx_accounts_live_config_dir ON accounts(config_dir) WHERE deleted_at IS NULL;
+CREATE INDEX idx_account_mutations_owner ON account_mutations(owner_record,account_id);
+CREATE UNIQUE INDEX idx_account_mutations_single_add ON account_mutations(kind) WHERE kind='add';
+CREATE INDEX idx_account_mutation_receipts_scope ON account_mutation_receipts(kind,account_id,acknowledged_at,committed_at);
+CREATE INDEX idx_account_mutation_receipts_expiry ON account_mutation_receipts(acknowledged_at,expires_at,operation_id);
+CREATE INDEX idx_credential_operations_owner ON credential_operations(owner_record,account_id);
+CREATE INDEX idx_credential_operation_receipts_expiry ON credential_operation_receipts(acknowledged_at,expires_at,token);
+CREATE UNIQUE INDEX idx_credential_write_receipts_pending ON credential_operation_receipts(account_id)
+  WHERE acknowledged_at IS NULL AND terminal_status='succeeded'
+  AND result_category IN ('refreshed','installed','moved');
 `
 
 // SchemaVersion is the only runtime schema accepted by this binary.
-const SchemaVersion = 2
+const SchemaVersion = 1
 
 // ErrSchemaMismatch means the database is not the exact schema accepted by this binary.
 var ErrSchemaMismatch = errors.New("store schema mismatch")
@@ -152,9 +339,27 @@ const upsertStickySQL = `INSERT INTO sticky(cwd,account_id,selected_at,manual) V
 // Open opens path. It creates the current schema only for a completely empty
 // database; every existing database must match the exact current schema.
 func Open(path string) (*Store, error) {
+	return open(path, false)
+}
+
+// OpenReadOnly opens an existing exact-schema store without initializing or
+// reconciling any durable state.
+func OpenReadOnly(path string) (*Store, error) {
+	return open(path, true)
+}
+
+func open(path string, readOnly bool) (*Store, error) {
 	path, err := canonicalDatabasePath(path)
 	if err != nil {
 		return nil, err
+	}
+	if readOnly {
+		if err := requireSingleLinkDatabase(path); err != nil {
+			return nil, err
+		}
+		if _, err := os.Lstat(path + ".lifecycle.lock"); err != nil {
+			return nil, fmt.Errorf("open read-only store lifecycle: %w", err)
+		}
 	}
 	lifecycleLock, err := proc.FileLockSpec{
 		Path: path + ".lifecycle.lock", Mode: proc.FileLockShared, Deadline: time.Second,
@@ -162,14 +367,19 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open store lifecycle: %w", err)
 	}
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)")
+	db, err := sql.Open("sqlite", storeDSN(path, readOnly))
 	if err != nil {
 		_ = lifecycleLock.Close()
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1) // serialize writes
 	s := &Store{db: db, lifecycleLock: lifecycleLock, now: time.Now}
-	if err := s.initializeOrVerifySchema(); err != nil {
+	if readOnly {
+		err = verifySchema(db)
+	} else {
+		err = s.initializeOrVerifySchema()
+	}
+	if err != nil {
 		_ = db.Close()
 		_ = lifecycleLock.Close()
 		return nil, err
@@ -180,6 +390,21 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+func storeDSN(path string, readOnly bool) string {
+	location := &url.URL{Scheme: "file", Path: path}
+	query := location.Query()
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "foreign_keys(on)")
+	if readOnly {
+		query.Add("_pragma", "query_only(on)")
+		query.Set("mode", "ro")
+	} else {
+		query.Add("_pragma", "journal_mode(WAL)")
+	}
+	location.RawQuery = query.Encode()
+	return location.String()
 }
 
 func canonicalDatabasePath(path string) (string, error) {
@@ -352,21 +577,26 @@ func upsertAccount(e rowExecer, a Account) error {
 	if created.IsZero() {
 		created = time.Now()
 	}
-	_, err = e.Exec(
-		`INSERT INTO accounts(id,instance_id,generation,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?)
+	result, err := e.Exec(
+		`INSERT INTO accounts(id,instance_id,generation,config_dir,keychain_service,keychain_account,label,account_uuid,created_at)
+		 VALUES(?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   config_dir=excluded.config_dir,
 		   keychain_service=excluded.keychain_service,
 		   keychain_account=excluded.keychain_account,
 		   label=excluded.label,
-		   generation=accounts.generation + CASE
-		     WHEN accounts.config_dir <> excluded.config_dir OR accounts.overlay_kind <> excluded.overlay_kind THEN 1
-		     ELSE 0 END,
-		   overlay_kind=excluded.overlay_kind`,
-		a.ID, instanceID, 1, a.ConfigDir, a.KeychainService, a.KeychainAccount, a.Label, a.OverlayKind, a.AccountUUID, created.Unix())
+		   generation=accounts.generation + CASE WHEN accounts.config_dir <> excluded.config_dir THEN 1 ELSE 0 END
+		 WHERE accounts.deleted_at IS NULL`,
+		a.ID, instanceID, 1, a.ConfigDir, a.KeychainService, a.KeychainAccount, a.Label, a.AccountUUID, created.Unix())
 	if err != nil {
 		return fmt.Errorf("upsert account %d: %w", a.ID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("upsert account %d: account id is tombstoned", a.ID)
 	}
 	return nil
 }
@@ -382,7 +612,7 @@ func NewAccountInstanceID() (string, error) {
 
 // SetAccountLabel updates an account's label.
 func (s *Store) SetAccountLabel(id int, label string) error {
-	res, err := s.db.Exec(`UPDATE accounts SET label=? WHERE id=?`, label, id)
+	res, err := s.db.Exec(`UPDATE accounts SET label=? WHERE id=? AND deleted_at IS NULL`, label, id)
 	if err != nil {
 		return fmt.Errorf("set label for account %d: %w", id, err)
 	}
@@ -396,41 +626,43 @@ func (s *Store) SetAccountLabel(id int, label string) error {
 	return nil
 }
 
-// SetAccountOverlayKind records an account's overlay provider; a targeted
-// UPDATE so it can't clobber concurrent updates to the row's other columns.
-func (s *Store) SetAccountOverlayKind(id int, kind string) error {
-	res, err := s.db.Exec(`UPDATE accounts SET overlay_kind=?, generation=generation+1 WHERE id=? AND overlay_kind<>?`, kind, id, kind)
-	if err != nil {
-		return fmt.Errorf("set overlay kind for account %d: %w", id, err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		if _, err := s.GetAccount(id); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func scanAccount(rows interface{ Scan(...any) error }) (Account, error) {
 	var a Account
 	var created int64
 	if err := rows.Scan(&a.ID, &a.InstanceID, &a.Generation, &a.ConfigDir, &a.KeychainService, &a.KeychainAccount,
-		&a.Label, &a.OverlayKind, &a.AccountUUID, &created); err != nil {
+		&a.Label, &a.AccountUUID, &created); err != nil {
 		return a, err
 	}
 	a.CreatedAt = time.Unix(created, 0)
 	return a, nil
 }
 
-const accountCols = `id,instance_id,generation,config_dir,keychain_service,keychain_account,label,overlay_kind,account_uuid,created_at`
+const accountCols = `id,instance_id,generation,config_dir,keychain_service,keychain_account,label,account_uuid,created_at`
 
 // ListAccounts returns all accounts ordered by id.
 func (s *Store) ListAccounts() ([]Account, error) {
-	rows, err := s.db.Query(`SELECT ` + accountCols + ` FROM accounts ORDER BY id`)
+	rows, err := s.db.Query(`SELECT ` + accountCols + ` FROM accounts WHERE deleted_at IS NULL ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Account
+	for rows.Next() {
+		a, err := scanAccount(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ListActiveAccounts returns accounts not fenced by a durable removal intent.
+func (s *Store) ListActiveAccounts() ([]Account, error) {
+	rows, err := s.db.Query(`SELECT ` + accountCols + ` FROM accounts
+		WHERE deleted_at IS NULL
+		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)
+		ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -450,10 +682,13 @@ func (s *Store) ListAccounts() ([]Account, error) {
 // callers can distinguish a removed account from a real query failure.
 var ErrAccountNotFound = errors.New("account not found")
 
+// ErrAccountSessionActive means removal cannot begin while a session is live.
+var ErrAccountSessionActive = errors.New("account session is active")
+
 // GetAccount returns one account by id, wrapping ErrAccountNotFound when the
 // row is absent.
 func (s *Store) GetAccount(id int) (Account, error) {
-	row := s.db.QueryRow(`SELECT `+accountCols+` FROM accounts WHERE id=?`, id)
+	row := s.db.QueryRow(`SELECT `+accountCols+` FROM accounts WHERE id=? AND deleted_at IS NULL`, id)
 	a, err := scanAccount(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, fmt.Errorf("account %d: %w", id, ErrAccountNotFound)
@@ -464,7 +699,7 @@ func (s *Store) GetAccount(id int) (Account, error) {
 // SetAccountUUID records an account's Claude accountUuid; a targeted UPDATE so
 // it can't clobber concurrent updates to the row's other columns.
 func (s *Store) SetAccountUUID(id int, uuid string) error {
-	res, err := s.db.Exec(`UPDATE accounts SET account_uuid=? WHERE id=?`, uuid, id)
+	res, err := s.db.Exec(`UPDATE accounts SET account_uuid=? WHERE id=? AND deleted_at IS NULL`, uuid, id)
 	if err != nil {
 		return fmt.Errorf("set account_uuid for account %d: %w", id, err)
 	}
@@ -486,7 +721,7 @@ func (s *Store) GetAccountByUUID(uuid string) (Account, bool, error) {
 	if uuid == "" {
 		return Account{}, false, nil
 	}
-	row := s.db.QueryRow(`SELECT `+accountCols+` FROM accounts WHERE account_uuid=? ORDER BY id LIMIT 1`, uuid)
+	row := s.db.QueryRow(`SELECT `+accountCols+` FROM accounts WHERE account_uuid=? AND deleted_at IS NULL ORDER BY id LIMIT 1`, uuid)
 	a, err := scanAccount(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Account{}, false, nil
@@ -504,7 +739,7 @@ func (s *Store) AccountsByUUID(uuid string) ([]Account, error) {
 	if uuid == "" {
 		return nil, nil
 	}
-	rows, err := s.db.Query(`SELECT `+accountCols+` FROM accounts WHERE account_uuid=? ORDER BY id`, uuid)
+	rows, err := s.db.Query(`SELECT `+accountCols+` FROM accounts WHERE account_uuid=? AND deleted_at IS NULL ORDER BY id`, uuid)
 	if err != nil {
 		return nil, fmt.Errorf("accounts by uuid %q: %w", uuid, err)
 	}
@@ -520,26 +755,181 @@ func (s *Store) AccountsByUUID(uuid string) ([]Account, error) {
 	return out, rows.Err()
 }
 
-// DeleteAccount removes an account and its dependent rows.
+// DeleteAccount tombstones an account after active and unacknowledged credential evidence clears.
 func (s *Store) DeleteAccount(id int) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`UPDATE accounts SET id=id WHERE id=? AND deleted_at IS NULL`, id); err != nil {
+		return err
+	}
+	var evidence int
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM account_mutations WHERE account_id=?)
+		      OR EXISTS(SELECT 1 FROM account_mutation_receipts WHERE account_id=? AND acknowledged_at IS NULL)
+		      OR EXISTS(SELECT 1 FROM credential_operations WHERE account_id=?)
+		      OR EXISTS(SELECT 1 FROM credential_operation_receipts WHERE account_id=? AND acknowledged_at IS NULL)
+		      OR EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=?)`,
+		id, id, id, id, id,
+	).Scan(&evidence); err != nil {
+		return err
+	}
+	if evidence != 0 {
+		return ErrCredentialOperationEvidenceActive
+	}
 	for _, q := range []string{
 		`DELETE FROM usage_samples WHERE account_id=?`,
 		`DELETE FROM sessions WHERE account_id=?`,
 		`DELETE FROM refresh_log WHERE account_id=?`,
 		`DELETE FROM sticky WHERE account_id=?`,
 		`DELETE FROM auth_health WHERE account_id=?`,
-		`DELETE FROM accounts WHERE id=?`,
+		`DELETE FROM account_removals WHERE account_id=?`,
 	} {
 		if _, err := tx.Exec(q, id); err != nil {
 			return err
 		}
 	}
+	result, err := tx.Exec(`UPDATE accounts SET deleted_at=? WHERE id=? AND deleted_at IS NULL`, s.now().UnixNano(), id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return ErrAccountNotFound
+	}
 	return tx.Commit()
+}
+
+// BeginAccountRemoval durably fences an account before external deprovisioning.
+func (s *Store) BeginAccountRemoval(id int, deleteCredential bool) (AccountRemoval, error) {
+	if id <= 0 {
+		return AccountRemoval{}, ErrAccountNotFound
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AccountRemoval{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(
+		`INSERT INTO account_registry_sequences(account_id,sequence) VALUES(?,0)
+		 ON CONFLICT(account_id) DO NOTHING`, id,
+	); err != nil {
+		return AccountRemoval{}, err
+	}
+	if existing, err := accountRemovalByID(tx, id); err == nil {
+		if existing.DeleteCredential != deleteCredential {
+			return AccountRemoval{}, fmt.Errorf("account %d removal intent conflicts with current request", id)
+		}
+		if err := tx.Commit(); err != nil {
+			return AccountRemoval{}, err
+		}
+		return existing, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return AccountRemoval{}, err
+	}
+	var instanceID string
+	var generation uint64
+	err = tx.QueryRow(
+		`SELECT instance_id,generation FROM accounts WHERE id=? AND deleted_at IS NULL`, id,
+	).Scan(&instanceID, &generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = tx.QueryRow(
+			`SELECT instance_id,generation FROM pending_adds WHERE id=?`, id,
+		).Scan(&instanceID, &generation)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return AccountRemoval{}, ErrAccountNotFound
+	}
+	if err != nil {
+		return AccountRemoval{}, err
+	}
+	var activeSession, activeCredentialOperation int
+	var unacknowledgedAccountMutation, unacknowledgedCredentialOperation, credentialQuarantine int
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM sessions WHERE account_id=? AND ended_at IS NULL),
+		        EXISTS(SELECT 1 FROM credential_operations WHERE account_id=?),
+		        EXISTS(SELECT 1 FROM account_mutation_receipts WHERE account_id=? AND acknowledged_at IS NULL),
+		        EXISTS(SELECT 1 FROM credential_operation_receipts WHERE account_id=? AND acknowledged_at IS NULL),
+		        EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=?)`,
+		id, id, id, id, id,
+	).Scan(
+		&activeSession, &activeCredentialOperation,
+		&unacknowledgedAccountMutation, &unacknowledgedCredentialOperation, &credentialQuarantine,
+	); err != nil {
+		return AccountRemoval{}, err
+	}
+	if activeSession != 0 {
+		return AccountRemoval{}, ErrAccountSessionActive
+	}
+	if activeCredentialOperation != 0 {
+		return AccountRemoval{}, ErrCredentialOperationBusy
+	}
+	if unacknowledgedAccountMutation != 0 || unacknowledgedCredentialOperation != 0 || credentialQuarantine != 0 {
+		return AccountRemoval{}, ErrCredentialOperationEvidenceActive
+	}
+	if mutation, err := accountMutationByAccount(tx, id); err == nil {
+		allowed, err := pendingAddMutationAllowsRemoval(tx, mutation)
+		if err != nil {
+			return AccountRemoval{}, err
+		}
+		if !allowed {
+			return AccountRemoval{}, ErrAccountMutationBusy
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return AccountRemoval{}, err
+	}
+	deleteValue := 0
+	if deleteCredential {
+		deleteValue = 1
+	}
+	now := s.now()
+	var sequence uint64
+	if err := tx.QueryRow(
+		`UPDATE account_registry_sequences SET sequence=sequence+1
+		 WHERE account_id=? RETURNING sequence`, id,
+	).Scan(&sequence); err != nil {
+		return AccountRemoval{}, err
+	}
+	if _, err := tx.Exec(`INSERT INTO account_removals(
+		account_id,account_instance_id,account_generation,registry_sequence,delete_credential,created_at
+	) VALUES(?,?,?,?,?,?)`,
+		id, instanceID, generation, sequence, deleteValue, now.UnixNano()); err != nil {
+		return AccountRemoval{}, fmt.Errorf("begin account %d removal: %w", id, err)
+	}
+	removal, err := accountRemovalByID(tx, id)
+	if err != nil {
+		return AccountRemoval{}, err
+	}
+	if removal.AccountInstanceID != instanceID || removal.AccountGeneration != generation ||
+		removal.RegistrySequence != sequence ||
+		removal.DeleteCredential != deleteCredential {
+		return AccountRemoval{}, fmt.Errorf("account %d removal intent conflicts with current request", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return AccountRemoval{}, err
+	}
+	return removal, nil
+}
+
+func pendingAddMutationAllowsRemoval(tx *sql.Tx, mutation AccountMutation) (bool, error) {
+	if mutation.Kind != AccountMutationAdd ||
+		(mutation.State != AccountMutationPublishing && mutation.State != AccountMutationCompensating) {
+		return false, nil
+	}
+	err := validateAccountMutationSubject(tx, BeginAccountMutationRequest{
+		AccountID: mutation.AccountID, Kind: mutation.Kind,
+		AccountInstanceID: mutation.AccountInstanceID, AccountGeneration: mutation.AccountGeneration,
+		Owner: mutation.Owner,
+	})
+	if errors.Is(err, ErrAccountGenerationChanged) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func tsOrNil(t time.Time) any {
@@ -669,6 +1059,9 @@ func (s *Store) ActivateSelection(a SelectionActivation) (err error) {
 	if a.Process.StartedAt.IsZero() {
 		return errors.New("activate selection: process start time is required")
 	}
+	if a.ConfigDir == "" {
+		return errors.New("activate selection: config dir is required")
+	}
 	if a.At.IsZero() {
 		a.At = s.now()
 	}
@@ -697,9 +1090,11 @@ func (s *Store) ActivateSelection(a SelectionActivation) (err error) {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("read selection terminal: %w", err)
 	}
-	var instanceID, configDir string
+	var instanceID string
 	var generation uint64
-	if err = tx.QueryRow(`SELECT instance_id,generation,config_dir FROM accounts WHERE id=?`, a.AccountID).Scan(&instanceID, &generation, &configDir); err != nil {
+	if err = tx.QueryRow(
+		`SELECT instance_id,generation FROM accounts WHERE id=? AND deleted_at IS NULL`, a.AccountID,
+	).Scan(&instanceID, &generation); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("activate selection account %d: %w", a.AccountID, ErrAccountNotFound)
 		}
@@ -709,6 +1104,11 @@ func (s *Store) ActivateSelection(a SelectionActivation) (err error) {
 		return fmt.Errorf("%w: account=%d reserved=%s/%d current=%s/%d", ErrAccountGenerationChanged,
 			a.AccountID, a.ExpectedInstanceID, a.ExpectedGeneration, instanceID, generation)
 	}
+	if _, err = accountRemovalByID(tx, a.AccountID); err == nil {
+		return fmt.Errorf("activate selection account %d: %w", a.AccountID, ErrAccountRemoving)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read selection account %d removal: %w", a.AccountID, err)
+	}
 	if a.RecordSticky && a.Cwd != "" {
 		if _, err = tx.Exec(upsertStickySQL, a.Cwd, a.AccountID, a.At.Unix()); err != nil {
 			return fmt.Errorf("activate selection sticky for %s: %w", a.Cwd, err)
@@ -717,7 +1117,7 @@ func (s *Store) ActivateSelection(a SelectionActivation) (err error) {
 	if _, err = tx.Exec(
 		`INSERT INTO sessions(account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at)
 		 VALUES(?,?,?,?,?,?,?,?)`,
-		a.AccountID, instanceID, generation, a.Process.PID, a.Process.StartedAt.UnixMicro(), configDir, a.Cwd, a.At.Unix()); err != nil {
+		a.AccountID, instanceID, generation, a.Process.PID, a.Process.StartedAt.UnixMicro(), a.ConfigDir, a.Cwd, a.At.Unix()); err != nil {
 		return fmt.Errorf("activate selection session for account %d: %w", a.AccountID, err)
 	}
 	if _, err = tx.Exec(
@@ -981,16 +1381,12 @@ func (s *Store) PruneSticky(cutoff time.Time) (int, error) {
 	return int(n), err
 }
 
-// LogRefresh records a refresh attempt outcome.
-func (s *Store) LogRefresh(accountID int, ok bool, errMsg string) error {
-	v := 0
-	if ok {
-		v = 1
-	}
+// LogRefresh records a typed refresh outcome and an opaque error digest.
+func (s *Store) LogRefresh(accountID int, category RefreshCategory, digest [32]byte) error {
 	_, err := s.db.Exec(
-		`INSERT INTO refresh_log(account_id,ts,ok,err) VALUES(?,?,?,?)
+		`INSERT INTO refresh_log(account_id,ts,category,digest) VALUES(?,?,?,?)
 		 ON CONFLICT(account_id,ts) DO NOTHING`,
-		accountID, time.Now().Unix(), v, errMsg)
+		accountID, time.Now().Unix(), category, digest[:])
 	return err
 }
 
@@ -998,18 +1394,21 @@ func (s *Store) LogRefresh(accountID int, ok bool, errMsg string) error {
 // if none.
 func (s *Store) LastRefresh(accountID int) (RefreshEntry, bool, error) {
 	row := s.db.QueryRow(
-		`SELECT account_id,ts,ok,err FROM refresh_log WHERE account_id=? ORDER BY ts DESC LIMIT 1`, accountID)
+		`SELECT account_id,ts,category,digest FROM refresh_log WHERE account_id=? ORDER BY ts DESC LIMIT 1`, accountID)
 	var e RefreshEntry
 	var ts int64
-	var ok int
-	if err := row.Scan(&e.AccountID, &ts, &ok, &e.Err); err != nil {
+	var digest []byte
+	if err := row.Scan(&e.AccountID, &ts, &e.Category, &digest); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return e, false, nil
 		}
 		return e, false, err
 	}
+	if len(digest) != len(e.Digest) {
+		return e, false, errors.New("refresh log digest has invalid length")
+	}
+	copy(e.Digest[:], digest)
 	e.TS = time.Unix(ts, 0)
-	e.OK = ok != 0
 	return e, true, nil
 }
 
@@ -1017,17 +1416,22 @@ func (s *Store) LastRefresh(accountID int) (RefreshEntry, bool, error) {
 // as healthy (NeedsLogin false).
 func (s *Store) GetAuthHealth(accountID int) (AuthHealth, error) {
 	row := s.db.QueryRow(
-		`SELECT account_id,needs_login,since,last_err,kind,gen FROM auth_health WHERE account_id=?`, accountID)
+		`SELECT account_id,needs_login,since,reason,digest,kind,gen FROM auth_health WHERE account_id=?`, accountID)
 	var h AuthHealth
 	var needs int
 	var since sql.NullInt64
+	var digest []byte
 	var kind string
-	if err := row.Scan(&h.AccountID, &needs, &since, &h.LastErr, &kind, &h.Gen); err != nil {
+	if err := row.Scan(&h.AccountID, &needs, &since, &h.Reason, &digest, &kind, &h.Gen); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return AuthHealth{AccountID: accountID}, nil
+			return AuthHealth{AccountID: accountID, Kind: AuthKindOwned}, nil
 		}
 		return AuthHealth{}, fmt.Errorf("get auth health for account %d: %w", accountID, err)
 	}
+	if len(digest) != len(h.Digest) {
+		return AuthHealth{}, errors.New("auth health digest has invalid length")
+	}
+	copy(h.Digest[:], digest)
 	h.NeedsLogin = needs != 0
 	if since.Valid {
 		h.Since = time.Unix(since.Int64, 0)
@@ -1039,7 +1443,7 @@ func (s *Store) GetAuthHealth(accountID int) (AuthHealth, error) {
 // ListAuthHealth returns the needs-login accounts keyed by id; healthy accounts
 // are omitted.
 func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
-	rows, err := s.db.Query(`SELECT account_id,needs_login,since,last_err,kind,gen FROM auth_health WHERE needs_login=1`)
+	rows, err := s.db.Query(`SELECT account_id,needs_login,since,reason,digest,kind,gen FROM auth_health WHERE needs_login=1`)
 	if err != nil {
 		return nil, err
 	}
@@ -1049,10 +1453,15 @@ func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
 		var h AuthHealth
 		var needs int
 		var since sql.NullInt64
+		var digest []byte
 		var kind string
-		if err := rows.Scan(&h.AccountID, &needs, &since, &h.LastErr, &kind, &h.Gen); err != nil {
+		if err := rows.Scan(&h.AccountID, &needs, &since, &h.Reason, &digest, &kind, &h.Gen); err != nil {
 			return nil, err
 		}
+		if len(digest) != len(h.Digest) {
+			return nil, errors.New("auth health digest has invalid length")
+		}
+		copy(h.Digest[:], digest)
 		h.NeedsLogin = needs != 0
 		if since.Valid {
 			h.Since = time.Unix(since.Int64, 0)
@@ -1068,8 +1477,14 @@ func (s *Store) ListAuthHealth() (map[int]AuthHealth, error) {
 // (so the daemon logs the hint once). Kind is refreshed and Gen increments on
 // every call. The scheduler goroutine is the sole setter of needs_login=1; CLI
 // clears use a generation CAS to preserve a fresher verdict.
-func (s *Store) SetNeedsLogin(accountID int, at time.Time, errMsg string, kind AuthKind) (bool, error) {
-	if !kind.Valid() {
+func (s *Store) SetNeedsLogin(
+	accountID int,
+	at time.Time,
+	reason AuthReasonCategory,
+	digest [32]byte,
+	kind AuthKind,
+) (bool, error) {
+	if !kind.Valid() || !reason.Valid() || reason == AuthReasonNone {
 		return false, fmt.Errorf("set needs-login for account %d: invalid auth kind %q", accountID, kind)
 	}
 	prev, err := s.GetAuthHealth(accountID)
@@ -1077,14 +1492,15 @@ func (s *Store) SetNeedsLogin(accountID int, at time.Time, errMsg string, kind A
 		return false, err
 	}
 	if _, err := s.db.Exec(
-		`INSERT INTO auth_health(account_id,needs_login,since,last_err,kind,gen) VALUES(?,1,?,?,?,1)
+		`INSERT INTO auth_health(account_id,needs_login,since,reason,digest,kind,gen) VALUES(?,1,?,?,?,?,1)
 		 ON CONFLICT(account_id) DO UPDATE SET
 		   needs_login=1,
-		   last_err=excluded.last_err,
+		   reason=excluded.reason,
+		   digest=excluded.digest,
 		   kind=excluded.kind,
 		   since=CASE WHEN auth_health.needs_login=1 THEN auth_health.since ELSE excluded.since END,
 		   gen=auth_health.gen+1`,
-		accountID, at.Unix(), errMsg, string(kind)); err != nil {
+		accountID, at.Unix(), reason, digest[:], string(kind)); err != nil {
 		return false, fmt.Errorf("set needs-login for account %d: %w", accountID, err)
 	}
 	return !prev.NeedsLogin, nil
@@ -1094,7 +1510,7 @@ func (s *Store) SetNeedsLogin(accountID int, at time.Time, errMsg string, kind A
 // only on the true→false transition, so the daemon logs recovery exactly once.
 func (s *Store) ClearNeedsLogin(accountID int) (bool, error) {
 	res, err := s.db.Exec(
-		`UPDATE auth_health SET needs_login=0, since=NULL, last_err='', kind='' WHERE account_id=? AND needs_login=1`,
+		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none', digest=zeroblob(32), kind='owned' WHERE account_id=? AND needs_login=1`,
 		accountID)
 	if err != nil {
 		return false, fmt.Errorf("clear needs-login for account %d: %w", accountID, err)
@@ -1110,7 +1526,7 @@ func (s *Store) ClearNeedsLogin(accountID int) (bool, error) {
 // matches the caller's observed generation.
 func (s *Store) ClearNeedsLoginIfGen(accountID int, gen int64) (bool, error) {
 	res, err := s.db.Exec(
-		`UPDATE auth_health SET needs_login=0, since=NULL, last_err='', kind='' WHERE account_id=? AND needs_login=1 AND gen=?`,
+		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none', digest=zeroblob(32), kind='owned' WHERE account_id=? AND needs_login=1 AND gen=?`,
 		accountID, gen)
 	if err != nil {
 		return false, fmt.Errorf("clear needs-login for account %d: %w", accountID, err)
@@ -1120,45 +1536,4 @@ func (s *Store) ClearNeedsLoginIfGen(accountID int, gen int64) (bool, error) {
 		return false, err
 	}
 	return n > 0, nil
-}
-
-// RecordJournalRisk upserts a stale-journal risk for dir: cc-pool forgot the row while
-// the holder's Unmount still reported a persist-warning, so a holder restart may replay
-// dir. The latest warning and time overwrite any prior entry for the same dir.
-func (s *Store) RecordJournalRisk(dir, warning string, at time.Time) error {
-	if _, err := s.db.Exec(
-		`INSERT INTO journal_risks(dir,warning,recorded_at) VALUES(?,?,?)
-		 ON CONFLICT(dir) DO UPDATE SET warning=excluded.warning, recorded_at=excluded.recorded_at`,
-		dir, warning, at.Unix()); err != nil {
-		return fmt.Errorf("record journal risk for %s: %w", dir, err)
-	}
-	return nil
-}
-
-// ListJournalRisks returns every recorded stale-journal risk, oldest first.
-func (s *Store) ListJournalRisks() ([]JournalRisk, error) {
-	rows, err := s.db.Query(`SELECT dir,warning,recorded_at FROM journal_risks ORDER BY recorded_at`)
-	if err != nil {
-		return nil, fmt.Errorf("list journal risks: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var out []JournalRisk
-	for rows.Next() {
-		var r JournalRisk
-		var at int64
-		if err := rows.Scan(&r.Dir, &r.Warning, &at); err != nil {
-			return nil, fmt.Errorf("scan journal risk: %w", err)
-		}
-		r.RecordedAt = time.Unix(at, 0)
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// ClearJournalRisk drops the stale-journal risk for dir; a no-op when none is recorded.
-func (s *Store) ClearJournalRisk(dir string) error {
-	if _, err := s.db.Exec(`DELETE FROM journal_risks WHERE dir=?`, dir); err != nil {
-		return fmt.Errorf("clear journal risk for %s: %w", dir, err)
-	}
-	return nil
 }

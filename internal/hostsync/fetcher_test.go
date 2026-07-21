@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -192,15 +193,11 @@ func TestPeerTransportExecServesRegistry(t *testing.T) {
 		t.Fatalf("marshal registry: %v", err)
 	}
 
-	// One response line for svc.get_state: {"ok":true,"result":<registry>}.
-	respLine := `{"ok":true,"result":` + string(body) + "}\n"
-	respFile := filepath.Join(t.TempDir(), "resp.json")
-	if err := os.WriteFile(respFile, []byte(respLine), 0o600); err != nil {
-		t.Fatalf("write response file: %v", err)
+	stateFile := filepath.Join(t.TempDir(), "registry.json")
+	if err := os.WriteFile(stateFile, body, 0o600); err != nil {
+		t.Fatalf("write registry file: %v", err)
 	}
-	// Drain the request line first (keeping stdin open until the client writes, so
-	// the client's write never SIGPIPEs), then emit the canned response and exit.
-	script := "IFS= read -r _ || true; cat '" + respFile + "'"
+	script := "env " + testRPCStateEnv + "=" + strconv.Quote(stateFile) + " " + strconv.Quote(os.Args[0])
 
 	fetcher := NewSSHFetcher()
 	got, err := fetcher.Fetch(context.Background(), execPeerPrefix+script)

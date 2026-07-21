@@ -22,10 +22,10 @@ func TestRenderCredMoves(t *testing.T) {
 		wantOut  []string // substrings of (ANSI-stripped) stdout
 	}{
 		"sweep with busy stragglers": {
-			resp: daemon.Response{OK: true, Migrations: []daemon.MigrationResult{
-				{ID: 4, Label: "a@x.com", From: "keychain", To: "file", Outcome: daemon.MigrationDone},
-				{ID: 5, Label: "b@x.com", To: "file", Outcome: daemon.MigrationAlready},
-				{ID: 1, Label: "c@x.com", To: "file", Outcome: daemon.MigrationBusy, Detail: "2 live session(s)"},
+			resp: daemon.Response{OK: true, CredentialMoves: []daemon.CredentialMoveResult{
+				{ID: 4, Label: "a@x.com", From: "keychain", To: "file", Outcome: daemon.CredentialMoveDone},
+				{ID: 5, Label: "b@x.com", To: "file", Outcome: daemon.CredentialMoveAlready},
+				{ID: 1, Label: "c@x.com", To: "file", Outcome: daemon.CredentialMoveBusy, Detail: "2 live session(s)"},
 			}},
 			wantOut: []string{
 				"acct-04 (a@x.com) keychain → file",
@@ -35,15 +35,15 @@ func TestRenderCredMoves(t *testing.T) {
 			},
 		},
 		"already with cleaned stray shows the detail": {
-			resp: daemon.Response{OK: true, Migrations: []daemon.MigrationResult{
-				{ID: 2, Label: "b@x.com", To: "keychain", Outcome: daemon.MigrationAlready, Detail: "cleaned a stray file copy"},
+			resp: daemon.Response{OK: true, CredentialMoves: []daemon.CredentialMoveResult{
+				{ID: 2, Label: "b@x.com", To: "keychain", Outcome: daemon.CredentialMoveAlready, Detail: "cleaned a stray file copy"},
 			}},
 			wantOut: []string{"acct-02 (b@x.com) already keychain — cleaned a stray file copy"},
 		},
 		"failure exits nonzero": {
-			resp: daemon.Response{OK: true, Migrations: []daemon.MigrationResult{
-				{ID: 4, From: "file", To: "keychain", Outcome: daemon.MigrationDone},
-				{ID: 5, To: "keychain", Outcome: daemon.MigrationFailed, Detail: "keychain state is unknowable in this session"},
+			resp: daemon.Response{OK: true, CredentialMoves: []daemon.CredentialMoveResult{
+				{ID: 4, From: "file", To: "keychain", Outcome: daemon.CredentialMoveDone},
+				{ID: 5, To: "keychain", Outcome: daemon.CredentialMoveFailed, Detail: "keychain state is unknowable in this session"},
 			}},
 			wantErr: "1 account(s) failed",
 			wantOut: []string{
@@ -53,21 +53,21 @@ func TestRenderCredMoves(t *testing.T) {
 			},
 		},
 		"explicit busy account exits nonzero": {
-			resp: daemon.Response{OK: true, Migrations: []daemon.MigrationResult{
-				{ID: 6, To: "file", Outcome: daemon.MigrationBusy, Detail: "1 live session(s)"},
+			resp: daemon.Response{OK: true, CredentialMoves: []daemon.CredentialMoveResult{
+				{ID: 6, To: "file", Outcome: daemon.CredentialMoveBusy, Detail: "1 live session(s)"},
 			}},
 			explicit: true,
 			wantErr:  "did not move",
 		},
 		"explicit already is success": {
-			resp: daemon.Response{OK: true, Migrations: []daemon.MigrationResult{
-				{ID: 6, To: "file", Outcome: daemon.MigrationAlready},
+			resp: daemon.Response{OK: true, CredentialMoves: []daemon.CredentialMoveResult{
+				{ID: 6, To: "file", Outcome: daemon.CredentialMoveAlready},
 			}},
 			explicit: true,
 		},
 		"op-level error propagates after truthful rendering": {
-			resp: daemon.Response{OK: false, Error: "list accounts: disk I/O", Migrations: []daemon.MigrationResult{
-				{ID: 4, From: "keychain", To: "file", Outcome: daemon.MigrationDone},
+			resp: daemon.Response{OK: false, Error: "list accounts: disk I/O", CredentialMoves: []daemon.CredentialMoveResult{
+				{ID: 4, From: "keychain", To: "file", Outcome: daemon.CredentialMoveDone},
 			}},
 			wantErr: "disk I/O",
 			wantOut: []string{"keychain → file"},
@@ -130,16 +130,16 @@ func TestCredMoveDaemonRequest(t *testing.T) {
 	}{
 		"moves all accounts": {
 			args: []string{"move", "--to", "file"},
-			resp: daemon.Response{OK: true, Migrations: []daemon.MigrationResult{
-				{ID: 1, Label: "a@x.com", From: "keychain", To: "file", Outcome: daemon.MigrationDone},
-				{ID: 2, Label: "b@x.com", To: "file", Outcome: daemon.MigrationAlready},
+			resp: daemon.Response{OK: true, CredentialMoves: []daemon.CredentialMoveResult{
+				{ID: 1, Label: "a@x.com", From: "keychain", To: "file", Outcome: daemon.CredentialMoveDone},
+				{ID: 2, Label: "b@x.com", To: "file", Outcome: daemon.CredentialMoveAlready},
 			}},
 			wantOut: []string{"acct-01 (a@x.com) keychain → file", "acct-02 (b@x.com) already file", "Moved 1 credential(s)."},
 		},
 		"account flag scopes the request": {
 			args: []string{"move", "--to", "file", "--account", "6"},
-			resp: daemon.Response{OK: true, Migrations: []daemon.MigrationResult{
-				{ID: 6, Label: "c@x.com", From: "keychain", To: "file", Outcome: daemon.MigrationDone},
+			resp: daemon.Response{OK: true, CredentialMoves: []daemon.CredentialMoveResult{
+				{ID: 6, Label: "c@x.com", From: "keychain", To: "file", Outcome: daemon.CredentialMoveDone},
 			}},
 			wantAccount: intp(6),
 			wantOut:     []string{"acct-06 (c@x.com) keychain → file"},
@@ -203,9 +203,6 @@ func TestCredMoveDaemonRequest(t *testing.T) {
 					t.Errorf("request account = %d, want nil (all accounts)", *req.Account)
 				case tc.wantAccount != nil && (req.Account == nil || *req.Account != *tc.wantAccount):
 					t.Errorf("request account = %v, want %d", req.Account, *tc.wantAccount)
-				}
-				if req.Force {
-					t.Error("credmove has no force override; request must not carry one")
 				}
 			default:
 				if !tc.wantNoRequest {

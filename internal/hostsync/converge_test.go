@@ -8,10 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/synckit/converge"
 	"github.com/yasyf/synckit/cregistry"
 )
@@ -72,23 +74,6 @@ func (f *fakeFetcher) Fetch(_ context.Context, peer string) (cregistry.Registry[
 	}
 	return cregistry.New[AccountValue](), nil
 }
-
-// fakeClaims records claim/release and can refuse.
-type fakeClaims struct {
-	claimed  []string
-	released int
-	refuse   bool
-}
-
-func (c *fakeClaims) TryClaim(uuid string) (func(), bool) {
-	c.claimed = append(c.claimed, uuid)
-	if c.refuse {
-		return func() {}, false
-	}
-	return func() { c.released++ }, true
-}
-
-var _ Claims = (*fakeClaims)(nil)
 
 // regWith returns a one-entry registry with a present account, for driving the
 // fake driver's LoadRegistry.
@@ -179,7 +164,7 @@ func materializeForTeardown(t *testing.T, s *Service, m *pool.Manager, uuid stri
 	s.Driver = &fakeDriver{}
 	s.Fetcher = &fakeFetcher{}
 	s.Status = converge.NewPeerStatus()
-	return res.AccountID, row.ConfigDir, row.KeychainService
+	return res.AccountID, pool.AccountBackingDir(res.AccountID), row.KeychainService
 }
 
 func TestTombstoneTeardownDefersBusy(t *testing.T) {
@@ -189,8 +174,6 @@ func TestTombstoneTeardownDefersBusy(t *testing.T) {
 	id, configDir, _ := materializeForTeardown(t, s, m, uuid)
 
 	s.Sessions = fakeSessions{busy: map[string]bool{uuid: true}, reason: "live session"}
-	claims := &fakeClaims{}
-	s.Claims = claims
 
 	res, err := s.Converge(ctx, "")
 	if err != nil {
@@ -199,43 +182,15 @@ func TestTombstoneTeardownDefersBusy(t *testing.T) {
 	if res.SkippedBusy != 1 || res.Converged != 0 {
 		t.Fatalf("result = %+v, want SkippedBusy 1 / Converged 0", res)
 	}
-	// A busy account is never claimed and never removed.
-	if len(claims.claimed) != 0 {
-		t.Errorf("claimed %v; a busy teardown must defer before claiming", claims.claimed)
+	// A busy account never receives a durable removal intent.
+	if calls := s.Remover.(*fixtureAccountRemover).callsSnapshot(); len(calls) != 0 {
+		t.Errorf("removal calls = %v; a busy teardown must defer", calls)
 	}
 	if _, ok, _ := m.Store.GetAccountByUUID(uuid); !ok {
 		t.Errorf("acct-%d row removed while a session was live", id)
 	}
 	if _, err := os.Stat(configDir); err != nil {
 		t.Errorf("account dir removed while busy: %v", err)
-	}
-}
-
-func TestTombstoneTeardownDefersOnClaimRefused(t *testing.T) {
-	ctx := context.Background()
-	s, m, _, _ := newMaterializeService(t)
-	const uuid = "u-claimed-elsewhere"
-	id, configDir, _ := materializeForTeardown(t, s, m, uuid)
-
-	s.Sessions = fakeSessions{busy: map[string]bool{}}
-	claims := &fakeClaims{refuse: true}
-	s.Claims = claims
-
-	res, err := s.Converge(ctx, "")
-	if err != nil {
-		t.Fatalf("Converge: %v", err)
-	}
-	if res.SkippedBusy != 1 || res.Converged != 0 {
-		t.Fatalf("result = %+v, want SkippedBusy 1 / Converged 0", res)
-	}
-	if len(claims.claimed) != 1 {
-		t.Errorf("claimed = %v, want exactly one attempt", claims.claimed)
-	}
-	if _, ok, _ := m.Store.GetAccountByUUID(uuid); !ok {
-		t.Errorf("acct-%d row removed after the claim was refused", id)
-	}
-	if _, err := os.Stat(configDir); err != nil {
-		t.Errorf("account dir removed after the claim was refused: %v", err)
 	}
 }
 
@@ -251,8 +206,7 @@ func TestTeardownRemovesEverything(t *testing.T) {
 	}
 
 	s.Sessions = fakeSessions{busy: map[string]bool{}}
-	claims := &fakeClaims{}
-	s.Claims = claims
+	remover := s.Remover.(*fixtureAccountRemover)
 
 	res, err := s.Converge(ctx, "")
 	if err != nil {
@@ -261,10 +215,11 @@ func TestTeardownRemovesEverything(t *testing.T) {
 	if res.Converged != 1 || res.SkippedBusy != 0 {
 		t.Fatalf("result = %+v, want Converged 1 / SkippedBusy 0", res)
 	}
-	if len(claims.claimed) != 1 || claims.released != 1 {
-		t.Errorf("claim lifecycle = claimed %v / released %d, want one claim + one release", claims.claimed, claims.released)
+	calls := remover.callsSnapshot()
+	if len(calls) != 1 || calls[0] != id {
+		t.Errorf("lifecycle removals = %v, want [%d]", calls, id)
 	}
-	// Row, dir, and credential are all gone (Remove(id, true) contract).
+	// The lifecycle proof precedes removal of the row, presentation, and credential.
 	if _, ok, _ := m.Store.GetAccountByUUID(uuid); ok {
 		t.Errorf("acct-%d row survived teardown", id)
 	}
@@ -285,23 +240,12 @@ func TestTeardownIsolatesFailedRemove(t *testing.T) {
 	idX, dirX, _ := materializeForTeardown(t, s, m, "u-wedged")
 	idY, dirY, _ := materializeForTeardown(t, s, m, "u-healthy")
 
-	// Wedge X's removal: an unwritable subdir fails os.RemoveAll inside Remove
-	// (dir is removed before keychain and row, so both survive for a retry).
-	sub := filepath.Join(dirX, "wedge")
-	if err := os.MkdirAll(sub, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(sub, "f"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(sub, 0o500); err != nil { //nolint:gosec // G302: deliberately makes the dir read-only to exercise the write-failure path
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(sub, 0o700) }) //nolint:gosec // G302: restoring a test dir to traversable perms in cleanup
+	// Fail X at the lifecycle seam. Presentation/backing removal belongs behind
+	// this seam, so a presentation-path chmod no longer exercises the contract.
+	remover := s.Remover.(*fixtureAccountRemover)
+	remover.setFailure(idX, errors.New("holder refused tenant removal"))
 
 	s.Sessions = fakeSessions{busy: map[string]bool{}}
-	claims := &fakeClaims{}
-	s.Claims = claims
 
 	res, err := s.Converge(ctx, "")
 	if err != nil {
@@ -324,59 +268,63 @@ func TestTeardownIsolatesFailedRemove(t *testing.T) {
 	if _, err := os.Stat(dirX); err != nil {
 		t.Errorf("wedged account dir must survive the failed remove: %v", err)
 	}
-	if claims.released != len(claims.claimed) {
-		t.Errorf("claims unbalanced: claimed %v, released %d — a failed remove must still release", claims.claimed, claims.released)
+	calls := remover.callsSnapshot()
+	if len(calls) != 2 || !containsInt(calls, idX) || !containsInt(calls, idY) {
+		t.Errorf("lifecycle removals = %v, want exactly acct-%d and acct-%d", calls, idX, idY)
 	}
 }
 
-// readdClaims grants the claim but lands an explicit re-add first, modeling a
-// user re-adding the account between the teardown pass's registry snapshot and
-// its claim.
-type readdClaims struct {
-	s        *Service
-	v        AccountValue
-	claimErr error
-	claimed  int
-	released int
+func containsInt(values []int, want int) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
-func (c *readdClaims) TryClaim(string) (func(), bool) {
-	c.claimed++
-	c.claimErr = c.s.PublishAccount(context.Background(), c.v)
-	return func() { c.released++ }, true
-}
-
-// TestTeardownRecheckSparesReadd pins the post-claim re-check: a re-add
-// landing after the pass snapshot is spared — destroying it would eat a fresh
-// login whose chain exists nowhere else.
-func TestTeardownRecheckSparesReadd(t *testing.T) {
+// TestTeardownRegistryFencePrecedesRemovalIntent pins the ordering boundary:
+// blocked registry I/O cannot install the durable account-removal intent.
+func TestTeardownRegistryFencePrecedesRemovalIntent(t *testing.T) {
 	ctx := context.Background()
 	s, m, _, _ := newMaterializeService(t)
-	const uuid = "u-readd"
-	id, configDir, _ := materializeForTeardown(t, s, m, uuid)
+	const uuid = "u-registry-fence"
+	materializeForTeardown(t, s, m, uuid)
 
 	s.Sessions = fakeSessions{busy: map[string]bool{}}
-	claims := &readdClaims{s: s, v: materializeVal(uuid, "e@x", json.RawMessage(`{"accountUuid":"`+uuid+`"}`))}
-	s.Claims = claims
+	remover := s.Remover.(*fixtureAccountRemover)
 
-	res, err := s.Converge(ctx, "")
+	lock, err := (proc.FileLockSpec{
+		Path: s.Registry.LockPath, Mode: proc.FileLockExclusive, Deadline: time.Second,
+	}).Acquire(ctx)
 	if err != nil {
-		t.Fatalf("Converge: %v", err)
+		t.Fatal(err)
 	}
-	if claims.claimErr != nil {
-		t.Fatalf("re-add publish inside the claim: %v", claims.claimErr)
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Converge(ctx, "")
+		done <- err
+	}()
+	select {
+	case <-time.After(100 * time.Millisecond):
+		if len(remover.callsSnapshot()) != 0 {
+			t.Fatal("removal intent installed while registry lock was unavailable")
+		}
 	}
-	if claims.claimed != 1 || claims.released != 1 {
-		t.Errorf("claim lifecycle = %d/%d, want one claim and one release", claims.claimed, claims.released)
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
 	}
-	if res.Converged != 0 {
-		t.Errorf("result = %+v; a spared re-add must not count as torn down", res)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Converge: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Converge did not resume after registry lock release")
 	}
-	if _, ok, _ := m.Store.GetAccountByUUID(uuid); !ok {
-		t.Errorf("acct-%d row destroyed despite the re-add landing first", id)
-	}
-	if _, err := os.Stat(configDir); err != nil {
-		t.Errorf("account dir destroyed despite the re-add landing first: %v", err)
+	calls := remover.callsSnapshot()
+	if len(calls) != 1 {
+		t.Fatalf("removal calls = %v, want one after registry fence completed", calls)
 	}
 }
 
@@ -390,7 +338,7 @@ func TestTeardownRefusesAmbiguousUUID(t *testing.T) {
 	_, configDir, _ := materializeForTeardown(t, s, m, uuid)
 
 	if err := m.Store.UpsertAccount(store.Account{
-		ID: 99, ConfigDir: filepath.Join(t.TempDir(), "dup"), OverlayKind: "symlink",
+		ID: 99, ConfigDir: filepath.Join(t.TempDir(), "dup"),
 		KeychainService: "ccp-test-dup", KeychainAccount: "ccp-test",
 	}); err != nil {
 		t.Fatal(err)
@@ -400,8 +348,6 @@ func TestTeardownRefusesAmbiguousUUID(t *testing.T) {
 	}
 
 	s.Sessions = fakeSessions{busy: map[string]bool{}}
-	claims := &fakeClaims{}
-	s.Claims = claims
 
 	res, err := s.Converge(ctx, "")
 	if err != nil {
@@ -410,8 +356,8 @@ func TestTeardownRefusesAmbiguousUUID(t *testing.T) {
 	if res.SkippedBusy != 1 || res.Converged != 0 {
 		t.Fatalf("result = %+v, want SkippedBusy 1 / Converged 0", res)
 	}
-	if len(claims.claimed) != 0 {
-		t.Errorf("claimed %v; an ambiguous uuid must be refused before claiming", claims.claimed)
+	if calls := s.Remover.(*fixtureAccountRemover).callsSnapshot(); len(calls) != 0 {
+		t.Errorf("removal calls = %v; an ambiguous uuid must be refused", calls)
 	}
 	rows, err := m.Store.AccountsByUUID(uuid)
 	if err != nil || len(rows) != 2 {

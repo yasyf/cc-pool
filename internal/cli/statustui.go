@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -15,11 +15,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/lease"
 )
 
 const statusRefreshInterval = 5 * time.Second
@@ -31,19 +29,16 @@ var (
 )
 
 // runStatusTUI runs only on an interactive terminal; the piped/`--plain` path uses renderTable.
-func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
+func runStatusTUI(cmd *cobra.Command, m *pool.Manager) error {
 	ctx := cmd.Context()
-	// Restart a version-skewed daemon so its cached view carries the detail pane's wire fields; gatherStatus falls back to live.
-	if !live {
-		ensureDaemon(cmd)
-	}
+	ensureDaemon(cmd)
 	cwd, _ := os.Getwd() // unreadable cwd just hides pin controls
 	model := statusTUI{
 		ctx: ctx,
 		cwd: cwd,
 		gather: func(c context.Context) (statusData, error) {
-			// Ledger and FP-consent alerts stay a plain-path concern.
-			snaps, _, _, err := gatherStatus(c, m, live)
+			// Ledger alerts stay a plain-path concern.
+			snaps, _, err := gatherStatus(c)
 			if err != nil {
 				return statusData{}, err
 			}
@@ -56,21 +51,8 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 		toggle: func(accountID int) (bool, error) {
 			return m.TogglePin(cwd, accountID, time.Now())
 		},
-		buildLogin: func(a store.Account) (*exec.Cmd, error) {
-			return loginCommand(a.ConfigDir, accountLoginEmail(a))
-		},
-		acquireLease: acquireAndProbeSessionLease,
-		finishLogin: func(a store.Account, baseline string) error {
-			return tuiFinishRelogin(ctx, m, a, baseline)
-		},
-		readCred: func(a store.Account) (*creds.Credential, error) {
-			cred, _, err := m.ReadCredential(a)
-			return cred, err
-		},
+		buildLogin:     buildDaemonLoginCommand,
 		resolveAccount: m.Store.GetAccount,
-		checkFresh: func(a store.Account) (bool, error) {
-			return tuiCheckFresh(ctx, m, a)
-		},
 	}
 	p := tea.NewProgram(model,
 		tea.WithContext(ctx),
@@ -90,20 +72,14 @@ type statusData struct {
 
 // statusTUI is the Bubble Tea model for `ccp status`; the cursor tracks account id so a refresh re-sort never moves the selection.
 type statusTUI struct {
-	ctx         context.Context
-	cwd         string // launch directory; "" hides pin controls
-	gather      func(context.Context) (statusData, error)
-	toggle      func(accountID int) (bool, error)
-	buildLogin  func(a store.Account) (*exec.Cmd, error)
-	finishLogin func(a store.Account, baseline string) error
-	// acquireLease holds the session lease across the interactive relogin so the
-	// holder never tears down the mount mid-login; nil uses acquireAndProbeSessionLease.
-	acquireLease func(a store.Account) (*lease.Handle, error)
-	readCred     func(a store.Account) (*creds.Credential, error) // credential resolution for the re-login probe (both backends)
+	ctx        context.Context
+	cwd        string // launch directory; "" hides pin controls
+	gather     func(context.Context) (statusData, error)
+	toggle     func(accountID int) (bool, error)
+	buildLogin func(a store.Account) (*exec.Cmd, error)
 	// resolveAccount re-loads the account from the store: wire snapshots carry
 	// no keychain fields, so credential operations must never use s.Account.
 	resolveAccount func(id int) (store.Account, error)
-	checkFresh     func(a store.Account) (bool, error) // needs-login short-circuit: a login that already landed
 	snaps          []pool.Snapshot
 	pin            dirPin
 	cursorID       int
@@ -114,7 +90,6 @@ type statusTUI struct {
 	pinBusy        bool
 	reloginErr     error
 	reloginBusy    bool
-	reloginLease   *lease.Handle // held for the interactive relogin flow; closed on reloginDoneMsg
 	lastUpdate     time.Time
 	quitting       bool
 }
@@ -126,56 +101,13 @@ type (
 	}
 	errMsg     struct{ err error }
 	pinDoneMsg struct{ err error }
-	// reloginStartMsg starts the interactive login after the short-circuit check passed
-	// on it; lease is the session lease already acquired (before any credential
-	// read-modify-write) and held across the login, released on reloginDoneMsg.
+	// reloginStartMsg starts the interactive login after the short-circuit check.
 	reloginStartMsg struct {
 		account store.Account
-		lease   *lease.Handle
-	}
-	// reloginExitedMsg fires after claude auth login exits and the terminal is back
-	// under the TUI; baseline is the pre-login access token finishRelogin
-	// compares against, so a quit-without-login never reads as success.
-	reloginExitedMsg struct {
-		account  store.Account
-		baseline string
 	}
 	reloginDoneMsg struct{ err error }
 	tickMsg        time.Time
 )
-
-// watchedLogin runs `claude auth login` as a tea.ExecCommand and auto-closes claude
-// once a fresh credential lands; Bubble Tea releases the tty for Run, so poll+terminate never fight claude for it.
-type watchedLogin struct {
-	ctx      context.Context
-	cmd      *exec.Cmd
-	fp       bool // File Provider account: turn on dataless-file materialization around the spawn
-	read     credReader
-	out      io.Writer // where the input-mode reset is emitted
-	baseline string    // pre-login access token, set by Run for the finish gate
-}
-
-func (w *watchedLogin) SetStdin(r io.Reader)  { w.cmd.Stdin = r }
-func (w *watchedLogin) SetStdout(o io.Writer) { w.cmd.Stdout = o; w.out = o }
-func (w *watchedLogin) SetStderr(o io.Writer) { w.cmd.Stderr = o }
-
-func (w *watchedLogin) Run() error {
-	if cred, err := w.read(); err == nil {
-		w.baseline = cred.ClaudeAiOauth.AccessToken
-	}
-	outcome, err := watchAndClose(w.ctx, execProc{w.cmd}, w.fp, newReloginProbe(w.read, w.baseline))
-	// Bubble Tea's post-Exec restore leaves claude's input modes on, so after a
-	// force-kill (not a clean self-exit) reset only those; Bubble Tea owns alt-screen/cursor.
-	if outcome != awaitExited && isTTY() {
-		_, _ = fmt.Fprint(w.out, inputModeReset)
-	}
-	// A launch/execguard failure (awaitCanceled) fails loud; a clean exit or landed
-	// identity defers to finishRelogin's credential gate.
-	if outcome == awaitCanceled {
-		return err
-	}
-	return nil
-}
 
 func (t statusTUI) Init() tea.Cmd {
 	return tea.Batch(t.refreshCmd(), tickCmd())
@@ -199,61 +131,15 @@ func (t statusTUI) togglePinCmd(accountID int) tea.Cmd {
 	}
 }
 
-func (t statusTUI) finishReloginCmd(a store.Account, baseline string) tea.Cmd {
-	return func() tea.Msg {
-		return reloginDoneMsg{err: t.finishLogin(a, baseline)}
-	}
-}
-
-// startReloginCmd resolves the store account off the event loop, acquires+probes the
-// session lease BEFORE any credential read-modify-write (the needs-login
-// short-circuit persists credentials, so the holder must not tear the mount down
-// under it), then lets a login that already landed clear the needs-login flag
-// without spawning claude; otherwise the interactive login starts holding the lease.
+// startReloginCmd resolves the store account off the event loop. The spawned
+// command is only another CLI terminal attachment; the daemon owns mutation.
 func (t statusTUI) startReloginCmd(id int) tea.Cmd {
 	return func() tea.Msg {
 		a, err := t.resolveAccount(id)
 		if err != nil {
 			return reloginDoneMsg{err: err}
 		}
-		acquire := t.acquireLease
-		if acquire == nil {
-			acquire = acquireAndProbeSessionLease
-		}
-		h, err := acquire(a)
-		if err != nil {
-			return reloginDoneMsg{err: err}
-		}
-		if t.checkFresh != nil {
-			cleared, err := t.checkFresh(a)
-			if err != nil {
-				closeLease(h)
-				return reloginDoneMsg{err: err}
-			}
-			if cleared {
-				closeLease(h)
-				return reloginDoneMsg{}
-			}
-		}
-		return reloginStartMsg{account: a, lease: h}
-	}
-}
-
-// reloginExited maps a watchedLogin.Run result into the next relogin message: a
-// launch/execguard failure (non-nil err) surfaces immediately via reloginDoneMsg,
-// releasing the lease and skipping finishRelogin's misleading unchanged-credential
-// report; a clean run proceeds to that credential gate via reloginExitedMsg.
-func reloginExited(a store.Account, baseline string, err error) tea.Msg {
-	if err != nil {
-		return reloginDoneMsg{err: err}
-	}
-	return reloginExitedMsg{account: a, baseline: baseline}
-}
-
-// closeLease closes a session-lease handle when non-nil (a test seam may return nil).
-func closeLease(h *lease.Handle) {
-	if h != nil {
-		_ = h.Close()
+		return reloginStartMsg{account: a}
 	}
 }
 
@@ -261,27 +147,15 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(statusRefreshInterval, func(tm time.Time) tea.Msg { return tickMsg(tm) })
 }
 
-// tuiFinishRelogin is the TUI's finishLogin seam: the CLI relogin tail with
-// warnings discarded — the alt-screen owns the terminal.
-func tuiFinishRelogin(ctx context.Context, m *pool.Manager, a store.Account, baseline string) error {
-	if err := finishRelogin(ctx, m, a, baseline); err != nil {
-		return err
+func buildDaemonLoginCommand(a store.Account) (*exec.Cmd, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, err
 	}
-	afterReloginIO(ctx, io.Discard, io.Discard, m, a)
-	return nil
+	return exec.Command(executable, "login", strconv.Itoa(a.ID)), nil //nolint:gosec
 }
 
-// tuiCheckFresh is the TUI's short-circuit seam; a cleared flag runs the same
-// publish tail as `ccp login`.
-func tuiCheckFresh(ctx context.Context, m *pool.Manager, a store.Account) (bool, error) {
-	cleared, err := shortCircuitRelogin(ctx, m, a)
-	if cleared {
-		afterReloginIO(ctx, io.Discard, io.Discard, m, a)
-	}
-	return cleared, err
-}
-
-// reloginable reports whether a manual `claude auth login` could clear s's state (no health gate).
+// reloginable reports whether a daemon-owned login could clear s's state (no health gate).
 func reloginable(s pool.Snapshot) bool {
 	return s.NeedsLogin || s.Stale || s.RateLimited || s.Exhausted
 }
@@ -340,35 +214,14 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return t, t.refreshCmd()
 	case reloginStartMsg:
-		// The session lease was acquired+probed in startReloginCmd (before the
-		// credential-persisting short-circuit) and is held across the interactive login
-		// so the holder never tears down the account's mount while claude writes its new
-		// identity. Released on reloginDoneMsg. This is the leased equivalent of
-		// runRelogin, which the TUI cannot call directly (it owns the terminal via
-		// Bubble Tea).
-		t.reloginLease = msg.lease
 		c, err := t.buildLogin(msg.account)
 		if err != nil {
-			closeLease(msg.lease)
-			t.reloginLease = nil
 			t.reloginBusy = false
 			t.reloginErr = err
 			return t, nil
 		}
-		a := msg.account
-		wl := &watchedLogin{ctx: t.ctx, cmd: c, fp: isFPRow(a.OverlayKind), read: func() (*creds.Credential, error) {
-			return t.readCred(a)
-		}}
-		// The callback runs after wl.Run, so wl.baseline is set by then; wl.Run's
-		// error (a launch/execguard failure) routes to reloginExited.
-		return t, tea.Exec(wl, func(err error) tea.Msg { return reloginExited(a, wl.baseline, err) })
-	case reloginExitedMsg:
-		return t, t.finishReloginCmd(msg.account, msg.baseline)
+		return t, tea.ExecProcess(c, func(err error) tea.Msg { return reloginDoneMsg{err: err} })
 	case reloginDoneMsg:
-		if t.reloginLease != nil {
-			_ = t.reloginLease.Close()
-			t.reloginLease = nil
-		}
 		t.reloginBusy = false
 		t.reloginErr = msg.err
 		if msg.err != nil {
@@ -580,22 +433,18 @@ func (t statusTUI) renderDetail() string {
 		}
 	}
 
-	overlay := s.Account.OverlayKind
-	if overlay == "" {
-		overlay = "symlink"
-	}
-	meta := "overlay " + overlay
+	meta := make([]string, 0, 2)
 	if t.pin.ok && s.Account.ID == t.pin.view.AccountID {
 		if t.pin.view.Manual {
-			meta += " · pinned to this directory (manual)"
+			meta = append(meta, "pinned to this directory (manual)")
 		} else {
-			meta += " · pinned to this directory (auto)"
+			meta = append(meta, "pinned to this directory (auto)")
 		}
 	}
 	if !t.lastUpdate.IsZero() {
-		meta += " · updated " + t.lastUpdate.Format("15:04:05")
+		meta = append(meta, "updated "+t.lastUpdate.Format("15:04:05"))
 	}
-	b.WriteString(dimStyle.Render(meta))
+	b.WriteString(dimStyle.Render(strings.Join(meta, " · ")))
 	return b.String()
 }
 

@@ -4,13 +4,37 @@
 package credstest
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit/supervise"
 )
+
+type fileTaskRunner struct{}
+
+func (fileTaskRunner) Run(ctx context.Context, task supervise.Task) error {
+	if !creds.IsFileWorkerInvocation(task.Args) {
+		return errors.New("unexpected credential test worker task")
+	}
+	if task.Stdin == nil || task.Stdout == nil {
+		return io.ErrUnexpectedEOF
+	}
+	return creds.RunFileWorker(ctx, task.Stdin, task.Stdout)
+}
+
+// FileStore returns a plaintext credential store backed by the in-process
+// worker adapter used only by tests.
+func FileStore(configDir string) creds.FileStore {
+	return creds.FileStore{
+		ConfigDir: configDir, Runner: fileTaskRunner{}, WorkerExecutable: "test-worker",
+	}
+}
 
 // Faults selects the per-op errors a FaultStore injects; nil fields pass
 // through to the wrapped Store.
@@ -27,27 +51,27 @@ type FaultStore struct {
 }
 
 // Read fails with Faults.Read when set.
-func (s FaultStore) Read() (*creds.Credential, error) {
+func (s FaultStore) Read(ctx context.Context) (*creds.Credential, error) {
 	if s.Faults.Read != nil {
 		return nil, s.Faults.Read
 	}
-	return s.Store.Read()
+	return s.Store.Read(ctx)
 }
 
 // Write fails with Faults.Write when set.
-func (s FaultStore) Write(cred *creds.Credential) error {
+func (s FaultStore) Write(ctx context.Context, cred *creds.Credential) error {
 	if s.Faults.Write != nil {
 		return s.Faults.Write
 	}
-	return s.Store.Write(cred)
+	return s.Store.Write(ctx, cred)
 }
 
 // Delete fails with Faults.Delete when set.
-func (s FaultStore) Delete() error {
+func (s FaultStore) Delete(ctx context.Context) error {
 	if s.Faults.Delete != nil {
 		return s.Faults.Delete
 	}
-	return s.Store.Delete()
+	return s.Store.Delete(ctx)
 }
 
 // Fake is an in-memory credential seam (it implements pool.Credentials).
@@ -106,7 +130,7 @@ func (f *Fake) Get(service, account string) (*creds.Credential, bool) {
 // configured faults.
 func (f *Fake) Store(a store.Account, src creds.Source) creds.Store {
 	if src == creds.SourceFile {
-		return FaultStore{Store: creds.FileStore{ConfigDir: a.ConfigDir}, Faults: f.FileFaults}
+		return FaultStore{Store: FileStore(a.ConfigDir), Faults: f.FileFaults}
 	}
 	return FaultStore{
 		Store:  keychainItem{f: f, service: a.KeychainService, account: a.KeychainAccount},
@@ -121,7 +145,7 @@ func (f *Fake) Stores(a store.Account) []creds.Store {
 }
 
 // Discover mirrors creds.DiscoverAccount over the in-memory items.
-func (f *Fake) Discover(service string) (string, error) {
+func (f *Fake) Discover(_ context.Context, service string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.touched = append(f.touched, service)
@@ -165,7 +189,7 @@ type keychainItem struct {
 
 func (k keychainItem) Source() creds.Source { return creds.SourceKeychain }
 
-func (k keychainItem) Read() (*creds.Credential, error) {
+func (k keychainItem) Read(context.Context) (*creds.Credential, error) {
 	k.f.mu.Lock()
 	defer k.f.mu.Unlock()
 	k.f.touched = append(k.f.touched, k.service)
@@ -177,7 +201,7 @@ func (k keychainItem) Read() (*creds.Credential, error) {
 	return &cp, nil
 }
 
-func (k keychainItem) Write(cred *creds.Credential) error {
+func (k keychainItem) Write(_ context.Context, cred *creds.Credential) error {
 	k.f.mu.Lock()
 	defer k.f.mu.Unlock()
 	k.f.touched = append(k.f.touched, k.service)
@@ -187,7 +211,7 @@ func (k keychainItem) Write(cred *creds.Credential) error {
 	return nil
 }
 
-func (k keychainItem) Delete() error {
+func (k keychainItem) Delete(context.Context) error {
 	k.f.mu.Lock()
 	defer k.f.mu.Unlock()
 	k.f.touched = append(k.f.touched, k.service)

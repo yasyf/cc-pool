@@ -1,14 +1,13 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,16 +15,17 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/oauth"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/drain"
-	"github.com/yasyf/fusekit/content"
-	"github.com/yasyf/fusekit/mountd"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/fusekit/catalogproto"
 )
 
 // reservationTTL suppresses re-picking an account until its claude becomes
@@ -40,67 +40,30 @@ const provisionalSelectionTTL = 90 * time.Second
 // connection and client transport deadlines, preventing late reservations after
 // a client has fallen back.
 const (
-	selectRequestTimeout = 10 * time.Second
-	selectConnTimeout    = 12 * time.Second
+	selectRequestTimeout = 55 * time.Second
+	selectConnTimeout    = 58 * time.Second
 )
 
-// preflightTimeout bounds a best-effort preflight refresh so shutdown is never
-// blocked on a slow network refresh.
+// preflightTimeout bounds required credential preflight below the selection
+// reservation lifetime and the outer request deadline.
 const preflightTimeout = 8 * time.Second
 
 // defaultEvictTimeout bounds how long a starting daemon waits for a
 // version-skewed holder to release the socket after being told to step down.
 const defaultEvictTimeout = 5 * time.Second
 
-// overlayMounted is a test seam over overlay.Mounted, which reads the kernel
-// mount table via Getfsstat — non-blocking, so it cannot wedge on a dead
-// fuse-t mirror.
-var overlayMounted = overlay.Mounted
-
+// sourceAuthorityOpenTimeout bounds startup on an untracked external holder of
+// the cross-process authority lane after exact FuseKit worker recovery ran.
 // Server is the running daemon.
 type Server struct {
-	m            *pool.Manager
-	socket       string
-	holderSocket string // mount-holder socket; tests point it at a fake holder
-	syncSocket   string // synckit consumer socket; tests point it into a short temp dir
-	snapshot     string // status mirror path; tests point it into a temp dir
-	log          *log.Logger
-
-	// holder caches mount-holder truth (reachability, version, per-dir mount
-	// liveness); refreshed at prime, reconcile, and each poll, and lazily
-	// (rate-limited) on a select cache-miss.
-	holder holderState
+	m          *pool.Manager
+	socket     string
+	syncSocket string // synckit consumer socket; tests point it into a short temp dir
+	snapshot   string // status mirror path; tests point it into a temp dir
+	log        *log.Logger
 
 	// evictTimeout bounds the wait for a skewed holder to release the socket.
 	evictTimeout time.Duration
-
-	// fpBridgeBackoff is the FP bridge serve-loop retry delay; zero means
-	// defaultFPBridgeBackoff. Tests shrink it to pin the retry-after-bind-failure
-	// path.
-	fpBridgeBackoff time.Duration
-
-	// fpBridgeWait bounds startFPBridge's synchronous wait for the FP socket to
-	// accept before flagging the bind consent-pending; zero means
-	// defaultFPBridgeWait. Tests shrink it.
-	fpBridgeWait time.Duration
-
-	// fpBridgeSock is the resolved File Provider data-socket path inside the
-	// app-group container (containerURL dir + FPBridgeSocketLeaf), stored once by
-	// startFPBridge. Nil until it resolves — an unresolvable container (bare,
-	// unbundled daemon) takes the hard-error path and leaves it nil, so every
-	// bridge reader treats an unresolved container as a down bridge.
-	fpBridgeSock atomic.Pointer[string]
-
-	// fpConsentPending: the FP bridge bind has not completed while the daemon is
-	// alive — the app-group-container TCC consent signature. The watchdog binds
-	// automatically once consent is granted (no restart); set and cleared by
-	// startFPBridge, read by handleStatus.
-	fpConsentPending atomic.Bool
-
-	// fpBridgeHardErr latches a NON-permission serve-loop failure (a genuine
-	// bind error, not the TCC-parked/denied signature), so the consent-pending
-	// signal is not raised for an unrelated failure. Stored by serveFPBridge.
-	fpBridgeHardErr atomic.Bool
 
 	// wg tracks only the background loops (startup, heal, scheduler, heartbeat,
 	// sync mirror, fp.app ensure); serve Waits on it after the drain cancels their
@@ -135,14 +98,6 @@ type Server struct {
 	// on each outage entry. Scheduler-goroutine-local — no lock.
 	netProbeLogSkip int
 
-	// fuseGateFn is a test seam over the migrate handler's fuse-capability
-	// gate; nil means the real check (CanHostFuse + probe mount).
-	fuseGateFn func() (fkoverlay.Backend, string)
-
-	// migrateBudget bounds one migrate request's conversion work; zero means
-	// defaultMigrateBudget. Tests shrink it to pin the out-of-time path.
-	migrateBudget time.Duration
-
 	// scanSessions is a test seam over procscan.Scan; nil means the real scan.
 	scanSessions func(context.Context) ([]procscan.Session, error)
 	// heartbeat is the one daemon-wide procscan cache shared by polling, healing,
@@ -164,61 +119,20 @@ type Server struct {
 	// select may not have exec'd its claude yet.
 	startedAt time.Time
 
-	// holderLog receives a dev-spawned holder's stdout/stderr (production
-	// launches the signed cask via launchd, which owns its own log).
-	holderLog string
+	tenantClient        *tenantfs.Client
+	tenantCoordinator   *tenantCoordinator
+	prepareAccount      func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error)
+	activatePrepared    func(context.Context, store.Account, catalogproto.TenantPreparationProof, func() error) error
+	preflightCredential func(context.Context, store.Account) error
+	disposableWorkers   *supervise.Pool
 
-	// healInterval is the steady-state heal-loop cadence; zero means
-	// defaultHealInterval. Tests shrink it.
-	healInterval time.Duration
-
-	// peerAlive is a test seam over mountd.Client.PeerAlive — true means the
-	// holder socket still has a live peer (saturated-but-alive: wait it out),
-	// false means gone.
-	peerAlive func(socket string) bool
-
-	// contentSource is the content.Source the daemon's BridgeServer serves to the
-	// shared holder — the merged .claude.json and injected settings.json — for
-	// every cc-pool mount.
-	contentSource      *overlay.PoolContentSource
-	overlayCoordinator *overlayCoordinator
-	// lastContentHealth dedups the content-source health log; only the heal
-	// goroutine touches it — no lock.
-	lastContentHealth string
-
-	// led is the shared self-heal ledger (fp.domain and fuse.remount rows, plus the
-	// auth.streak and ratelimit.acct / ratelimit.pool streaks). ledMu is its
+	// led is the product self-heal ledger for auth.streak and the
+	// ratelimit.acct / ratelimit.pool streaks. ledMu is its
 	// serialization: every s.led access takes ledMu, never held across
 	// mount/reconcile/re-register/bounce or usage-fetch/refresh I/O (bookkeeping in, I/O
 	// out). See ccn doc 36b05ef.
 	led   *ledgers
 	ledMu sync.Mutex
-
-	// fpSynth reports whether an account's synthetic .claude.json is non-empty, so
-	// the wedge detector strikes a 0-byte served file only for an account that
-	// genuinely has an identity. It doubles as the "FP self-heal wired" marker: nil
-	// in bare test servers, so every FP reader guards on fpEnabled.
-	fpSynth func(dir string) bool
-
-	// fpBridgeReadyFn is a test seam over the FP-bridge-up precondition for probing
-	// FP domains; nil means the real check (consent settled + not faulted + data
-	// socket up).
-	fpBridgeReadyFn func() bool
-
-	// fpBridgeCheckFn is a test seam over fpBridgeCheck (the bridge data-plane
-	// self-test); nil means the real dial + SelfTest classification.
-	fpBridgeCheckFn func(ctx context.Context) FPBridgeStatus
-
-	// fpProbeClock tracks the last parked FP recovery probe per dir, gating
-	// re-probes on fpRecoveryBackoff.Cap. Healthy rows are deep-validated only at
-	// selection. Guarded by fpProbeClockMu.
-	fpProbeClockMu sync.Mutex
-	fpProbeClock   map[string]time.Time
-
-	fpAppActionMu       sync.Mutex
-	fpAppKilled         map[fpAppProcess]bool
-	fpAppReaping        map[fpAppProcess]bool
-	fpAppEnsureInFlight bool
 
 	// syncSvc is the wired host-sync engine (registry, driver, mesh); nil ⇒ host
 	// sync never wired this run. syncSelf is this host's registry origin name.
@@ -226,81 +140,132 @@ type Server struct {
 	syncSvc      *hostsync.Service
 	syncSelf     string
 	syncListener net.Listener
+	syncAuthKind func(context.Context, int, string) (store.AuthKind, error)
 
 	// syncPull runs one converge pull for the invalid_grant self-heal (syncHeal)
 	// and the on-demand preflight pull; nil ⇒ sync disabled.
 	syncPull func(ctx context.Context) error
+
+	accountMutationTerminal accountMutationTerminalRunner
+	accountMutationLifetime context.Context
+	accountMutationOwner    func() (proc.Record, error)
+	accountMutationMu       sync.Mutex
+	accountMutationRuns     map[store.AccountMutationID]*accountMutationRun
 }
+
+var ensureHolderRuntime = EnsureHolderService
 
 // Run is the entry point for `cc-pool daemon`. It blocks until the process
 // is signalled.
 func Run(ctx context.Context) error {
-	m, err := pool.Open()
-	if err != nil {
+	if err := pool.EnsureStateDir(); err != nil {
 		return err
 	}
-
-	// Reclaim account-index reservations whose `ccp add` died before
-	// FinalizeAdd/AbandonAdd could run; one sweep per daemon start is the TTL
-	// backstop for the pending-row allocator.
-	if _, err := m.Store.SweepPendingAdds(time.Now().Add(-store.PendingAddTTL)); err != nil {
-		_ = m.Close()
-		return fmt.Errorf("sweep stale pending adds: %w", err)
-	}
-
 	s := &Server{
-		m:             m,
-		socket:        pool.SocketPath(),
-		holderSocket:  mountd.DefaultHolderSocket(),
-		syncSocket:    pool.SyncSocketPath(),
-		holderLog:     pool.MountHolderLogPath(),
-		snapshot:      pool.StatusSnapshotPath(),
-		log:           log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
-		evictTimeout:  defaultEvictTimeout,
-		startedAt:     time.Now(),
-		contentSource: overlay.NewPoolContentSource(pool.ClaudeDir(), pool.ClaudeJSONPath(), filepath.Join(pool.StateDir(), "content-stamps")),
-		cl:            newClaims(),
-		led:           newLedgers(),
-		wireIntake:    &drain.Intake{},
-		syncIntake:    &drain.Intake{},
+		socket:       pool.SocketPath(),
+		syncSocket:   pool.SyncSocketPath(),
+		snapshot:     pool.StatusSnapshotPath(),
+		log:          log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
+		evictTimeout: defaultEvictTimeout,
+		startedAt:    time.Now(),
+		cl:           newClaims(),
+		led:          newLedgers(),
+		wireIntake:   &drain.Intake{},
+		syncIntake:   &drain.Intake{},
 	}
-	s.overlayCoordinator = newOverlayCoordinator(s)
-	if err := s.overlayCoordinator.initialize(); err != nil {
-		_ = m.Close()
-		return fmt.Errorf("initialize semantic content stamps: %w", err)
-	}
-	// The FP wedge detector strikes a 0-byte served .claude.json only when the
-	// account genuinely has an identity (its synth is non-empty) — resolved through
-	// the same content source the bridge serves. Wiring the seam arms FP self-heal.
-	s.fpSynth = s.contentSource.SynthNonEmpty
-	// The convert gate proves a freshly registered domain serves before flipping the
-	// row, through the SAME bounded control-op probe the heal loop uses — never a
-	// through-domain read. A NoVerdict returns non-nil, so the gate rolls back rather
-	// than flip an unverified row.
-	m.FPProbe = func(ctx context.Context, accountDir string) error {
-		probeCtx, cancel := context.WithTimeout(ctx, fpControlProbeTimeout)
-		defer cancel()
-		return fpDomainProbe(probeCtx, accountDir)
-	}
-	// Surface overlay teardown persist-warnings through the daemon log instead of
-	// dropping them; a package-independent seam set once before serve spawns workers.
-	m.Warnf = s.log.Printf
-	// Route fusekit/overlay's conflict-resolution log through s.log. A package
-	// global, so assigned once before serve spawns any worker.
-	fkoverlay.ResolvedConflictLogf = s.log.Printf
 	return s.serve(ctx)
 }
 
-// detectClaudeVersion runs `claude --version` (best-effort) to stamp the UA.
-func detectClaudeVersion(ctx context.Context) string {
+func (s *Server) activate(activation dkdaemon.Activation) (err error) {
+	if err := ensureHolderRuntime(activation.Startup); err != nil {
+		return err
+	}
+	m, err := pool.OpenDaemon(activation.Lifetime)
+	if err != nil {
+		return err
+	}
+	var tenantClient *tenantfs.Client
+	published := false
+	defer func() {
+		if published {
+			return
+		}
+		if tenantClient != nil {
+			err = errors.Join(err, tenantClient.Close())
+		}
+		err = errors.Join(err, m.Close())
+	}()
+
+	tenantClient, err = tenantfs.NewClient(activation.Startup, pool.FuseKitSocketPath())
+	if err != nil {
+		return fmt.Errorf("connect FuseKit holder: %w", err)
+	}
+	preparer, err := tenantfs.NewPreparer(tenantClient)
+	if err != nil {
+		return err
+	}
+	workers := m.DisposableWorkers()
+	s.m = m
+	s.tenantClient = tenantClient
+	s.disposableWorkers = workers
+	s.accountMutationTerminal = daemonkitAccountMutationTerminalRunner{workers: workers, manager: m}
+	s.accountMutationLifetime = activation.Lifetime
+	s.scanSessions = m.ScanSessions
+	if err := s.recoverRetiredAccountMutations(activation.Startup); err != nil {
+		s.clearActivation()
+		return fmt.Errorf("recover account mutations: %w", err)
+	}
+	s.tenantCoordinator = newTenantCoordinator(activation.Lifetime, s, preparer, tenantClient)
+	if err := s.tenantCoordinator.initialize(activation.Startup); err != nil {
+		s.clearActivation()
+		return fmt.Errorf("initialize FuseKit tenants: %w", err)
+	}
+	published = true
+	return nil
+}
+
+func (s *Server) clearActivation() {
+	s.m = nil
+	s.tenantClient = nil
+	s.tenantCoordinator = nil
+	s.disposableWorkers = nil
+	s.accountMutationTerminal = nil
+	s.accountMutationLifetime = nil
+	s.scanSessions = nil
+}
+
+const maxVersionOutput = 64 << 10
+
+type boundedVersionBuffer struct{ bytes.Buffer }
+
+func (buffer *boundedVersionBuffer) Write(input []byte) (int, error) {
+	length := len(input)
+	remaining := maxVersionOutput - buffer.Len()
+	if remaining > 0 {
+		if len(input) > remaining {
+			input = input[:remaining]
+		}
+		_, _ = buffer.Buffer.Write(input)
+	}
+	return length, nil
+}
+
+// detectClaudeVersion runs `claude --version` in a disposable process group.
+func detectClaudeVersion(ctx context.Context, workers *supervise.Pool) string {
+	if workers == nil {
+		return ""
+	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "claude", "--version").Output()
-	if err != nil {
+	var output boundedVersionBuffer
+	if err := workers.Run(ctx, supervise.Task{
+		RecoveryClass: proc.RecoveryTask,
+		Path:          "claude", Args: []string{"--version"}, Stdout: &output,
+	}); err != nil {
 		return ""
 	}
 	// `claude --version` emits "2.1.166 (Claude Code)".
-	fields := strings.Fields(string(out))
+	fields := strings.Fields(output.String())
 	if len(fields) > 0 {
 		return fields[0]
 	}
@@ -310,13 +275,12 @@ func detectClaudeVersion(ctx context.Context) string {
 // detectAndSetUserAgent stamps the OAuth user-agent with the detected claude
 // version (the ua.detect startup row).
 func (s *Server) detectAndSetUserAgent(ctx context.Context) {
-	oauth.SetUserAgentVersion(detectClaudeVersion(ctx))
+	oauth.SetUserAgentVersion(detectClaudeVersion(ctx, s.disposableWorkers))
 }
 
 func (s *Server) serve(ctx context.Context) error {
 	wireServer, runtime, err := s.runtime()
 	if err != nil {
-		_ = s.m.Close()
 		return err
 	}
 	wireServer.RegisterLifecycle(runtime)
@@ -341,17 +305,56 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 		return s.handleSelectCommit(ctx, req)
 	case OpSelectAbort:
 		return s.handleSelectAbort(ctx, req)
-	case OpMigrate:
-		return s.handleMigrate(ctx, req)
 	case OpCredMove:
 		return s.handleCredMove(ctx, req)
-	case OpFPRepair:
-		return s.handleFPRepair(ctx, req)
-	case OpFPBridgeCheck:
-		return s.handleFPBridgeCheck(ctx)
+	case OpAccountRemove:
+		return s.handleAccountRemove(ctx, req)
+	case OpAccountIdentity:
+		return s.handleAccountIdentity(ctx, req)
+	case OpAccountHealth:
+		return s.handleAccountHealth(ctx, req)
+	case OpAccountMutationAck:
+		return s.handleAccountMutationAck(req)
 	default:
 		return Response{OK: false, Error: "unknown op: " + string(req.Op)}
 	}
+}
+
+func (s *Server) handleAccountIdentity(ctx context.Context, request Request) Response {
+	if request.Account == nil || *request.Account <= 0 {
+		return Response{Error: "account identity requires a positive account ID"}
+	}
+	account, err := s.m.Store.GetAccount(*request.Account)
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+	identity, err := s.m.AccountIdentity(ctx, account.ID, account.ConfigDir)
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+	if identity.AccountUUID == "" {
+		return Response{Error: "account identity has no account UUID"}
+	}
+	return Response{OK: true, AccountIdentity: &AccountIdentityResult{
+		AccountID: account.ID, AccountUUID: identity.AccountUUID, EmailAddress: identity.EmailAddress,
+	}}
+}
+
+func (s *Server) handleAccountHealth(ctx context.Context, request Request) Response {
+	if request.Account == nil || *request.Account <= 0 {
+		return Response{Error: "account health requires a positive account ID"}
+	}
+	account, err := s.m.Store.GetAccount(*request.Account)
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+	if _, err := s.m.AccountIdentity(ctx, account.ID, account.ConfigDir); err != nil {
+		return Response{Error: err.Error()}
+	}
+	if _, _, err := s.m.ReadCredential(ctx, account); err != nil {
+		return Response{Error: err.Error()}
+	}
+	return Response{OK: true, AccountHealth: &AccountHealthResult{AccountID: account.ID}}
 }
 
 // handleStatus returns scored snapshots from cached samples (no live fetch).
@@ -360,17 +363,9 @@ func (s *Server) handleStatus(ctx context.Context) Response {
 	if err != nil {
 		return Response{OK: false, Error: err.Error()}
 	}
-	// Version lets the client detect a pre-upgrade daemon (which omits newer wire
-	// fields like Components) and fall back to live sampling.
-	bridgeUp := s.fpBridgeUp()
-	resp := Response{OK: true, Version: version.String(), Accounts: accts, Holder: s.holder.wireStatus(), FPConsentPending: s.fpConsentPending.Load(), FPBridgeUp: &bridgeUp}
-	// Content-source health lives only in this process; errors.Join's newlines
-	// fold to "; " so doctor renders one line.
-	if s.contentSource != nil {
-		if err := s.contentSource.HealthErrors(); err != nil {
-			resp.ContentHealth = strings.ReplaceAll(err.Error(), "\n", "; ")
-		}
-	}
+	// Version lets the client reject a pre-upgrade daemon before consuming fields
+	// whose meaning changed; status clients then read the exact disk snapshot.
+	resp := Response{OK: true, Version: version.String(), Accounts: accts}
 	resp.Ledgers = s.ledgersWire()
 	return resp
 }
@@ -418,9 +413,6 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		}
 		for _, sn := range snaps {
 			if sn.Account.ID == *req.Account {
-				if req.PID == 0 && s.cl.held(sn.Account.ID) {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d is migrating overlays; retry shortly", sn.Account.ID)}
-				}
 				launch := selectionLaunch{
 					pid: req.PID, processStartedAt: processStartedAt, cwd: req.Cwd,
 					recordSticky: true,
@@ -429,34 +421,24 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 				if req.PID > 0 {
 					token, err = s.cl.beginSelection(sn.Account, launch, provisionalSelectionTTL)
 					if err != nil {
-						if errors.Is(err, errAccountConverting) {
-							return Response{OK: false, Error: fmt.Sprintf("acct-%02d is migrating overlays; retry shortly", sn.Account.ID)}
-						}
 						return Response{OK: false, Error: fmt.Sprintf("reserve acct-%02d: %v", sn.Account.ID, err)}
 					}
 				}
-				if err := s.catchUpOverlay(ctx, sn.Account); err != nil {
+				proof, err := s.prepareTenant(ctx, sn.Account)
+				if err != nil {
 					s.cl.abortReservation(token)
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d content catch-up: %v", sn.Account.ID, err)}
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
 				}
-				if !s.mountReady(sn.Account) {
-					s.cl.abortReservation(token)
-					switch {
-					case fuseBackedRow(sn.Account.OverlayKind):
-						return Response{OK: false, Error: fmt.Sprintf("acct-%02d's fuse mount is not up yet; retry shortly", sn.Account.ID)}
-					case fpBackedRow(sn.Account.OverlayKind):
-						return Response{OK: false, Error: fmt.Sprintf("acct-%02d's file provider domain is wedged; the daemon is recovering it — retry shortly", sn.Account.ID)}
-					default:
-						return Response{OK: false, Error: fmt.Sprintf("acct-%02d's dir is unexpectedly a mountpoint (wedged unmount?); see `ccp doctor` and the daemon log", sn.Account.ID)}
-					}
+				if token != "" && !s.cl.bindPreparation(token, proof) {
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d reservation expired during PrepareTenant", sn.Account.ID)}
 				}
-				if !s.probeWinnerReady(ctx, sn.Account) {
+				if err := s.preflightSelectionCredential(ctx, sn.Account); err != nil {
 					s.cl.abortReservation(token)
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d's overlay is wedged; the daemon is recovering it — retry shortly", sn.Account.ID)}
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", sn.Account.ID, err)}
 				}
 				id := sn.Account.ID
 				return Response{
-					OK: true, Dir: sn.Account.ConfigDir, SelectedID: &id,
+					OK: true, Dir: pool.AccountPresentationDir(sn.Account.ID), SelectedID: &id,
 					ReservationToken:  token,
 					AccountInstanceID: sn.Account.InstanceID, AccountGeneration: sn.Account.Generation,
 					Remaining5h: sn.Remaining5h, Remaining7d: sn.Remaining7d, HasUsage: sn.HasUsage,
@@ -471,15 +453,9 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	// that just exited reads warm rather than live without starting a second scan.
 	s.refreshHeartbeat(ctx, heartbeatOnDemandFreshness)
 
-	// An account mid-conversion or whose mirror is not mounted yet cannot serve
-	// a session — its config dir is not in a usable shape. Exclude, don't
-	// penalize.
 	usable := make([]pool.Snapshot, 0, len(snaps))
 	excludedReady := false
 	for _, sn := range snaps {
-		if s.cl.held(sn.Account.ID) || !s.mountReady(sn.Account) {
-			continue
-		}
 		if excluded[sn.Account.ID] {
 			excludedReady = true
 			continue
@@ -491,11 +467,11 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 			return Response{OK: false, Error: pool.ErrNoneAvailable.Error(), NoneAvailable: true}
 		}
 		soonest := soonestReset(snaps)
-		resp := Response{OK: false, Error: pool.ErrMountsNotReady.Error(), NoneAvailable: true, MountsNotReady: true}
+		resp := Response{OK: false, Error: pool.ErrNoneAvailable.Error(), NoneAvailable: true}
 		if !soonest.IsZero() {
 			resp.SoonestReset = &soonest
 		}
-		s.log.Printf("select: %s -> none available (all accounts migrating or unmounted)", req.Cwd)
+		s.log.Printf("select: %s -> none available", req.Cwd)
 		return resp
 	}
 
@@ -532,51 +508,32 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	token := ""
 	if req.PID > 0 {
 		token, err = s.cl.beginSelection(best.Account, launch, provisionalSelectionTTL)
-		if errors.Is(err, errAccountConverting) {
-			return Response{OK: false, Error: fmt.Sprintf("acct-%02d began migrating overlays mid-select; retry shortly", best.Account.ID)}
-		}
 		if err != nil {
 			return Response{OK: false, Error: fmt.Sprintf("reserve acct-%02d: %v", best.Account.ID, err)}
 		}
 	}
-	if err := s.catchUpOverlay(ctx, best.Account); err != nil {
+	proof, err := s.prepareTenant(ctx, best.Account)
+	if err != nil {
 		s.cl.abortReservation(token)
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d content catch-up: %v", best.Account.ID, err)}
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
 	}
-	// Deep-probe the winner before handing it to a session — a wedge refuses
-	// and the client retries onto a healthy account.
-	if !s.probeWinnerReady(ctx, best.Account) {
+	if token != "" && !s.cl.bindPreparation(token, proof) {
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d reservation expired during PrepareTenant", best.Account.ID)}
+	}
+	id := best.Account.ID
+	// Finish credential preflight before returning the reservation. Credential
+	// maintenance observes pending reservations, while maintenance that won the
+	// durable lane first must settle before this selection may activate.
+	err = s.preflightSelectionCredential(ctx, best.Account)
+	if err != nil {
 		s.cl.abortReservation(token)
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d's overlay is wedged; the daemon is recovering it — retry shortly", best.Account.ID)}
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", best.Account.ID, err)}
 	}
 	s.log.Printf("select%s: %s -> acct-%02d (score %.1f · 5h %.0f%% used · 7d %.0f%% used%s)",
 		selectKind(outcome, fallback), req.Cwd, best.Account.ID,
 		r.Score, best.Util5h, best.Util7d, runnerUp(ranked, r.AccountID, fallback))
-	id := best.Account.ID
-	// Best-effort preflight refresh of the winner. The Add(1) is inside an
-	// already-tracked goroutine, so it cannot race a zero-counter Wait.
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		pctx, cancel := context.WithTimeout(ctx, preflightTimeout)
-		defer cancel()
-		err := s.m.PreflightRefresh(pctx, best.Account)
-		// A synced token expired here: the origin's rotation may already be in the
-		// registry but not yet pulled locally (fsnotify is the fast path; this
-		// covers the 10-min-lead vs 900s-reconcile gap). Pull once, then re-evaluate.
-		if errors.Is(err, pool.ErrUnrefreshable) && s.syncPull != nil {
-			if perr := s.syncPull(pctx); perr != nil {
-				s.log.Printf("acct-%02d preflight sync pull: %v", best.Account.ID, perr)
-			} else {
-				err = s.m.PreflightRefresh(pctx, best.Account)
-			}
-		}
-		if err != nil {
-			s.log.Printf("acct-%02d preflight refresh: %v", best.Account.ID, err)
-		}
-	}()
 	resp := Response{
-		OK: true, Dir: best.Account.ConfigDir, SelectedID: &id,
+		OK: true, Dir: pool.AccountPresentationDir(best.Account.ID), SelectedID: &id,
 		ReservationToken:  token,
 		AccountInstanceID: best.Account.InstanceID, AccountGeneration: best.Account.Generation,
 		Sticky:      outcome == pool.StickyBind,
@@ -596,6 +553,28 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	return resp
 }
 
+func (s *Server) preflightSelectionCredential(
+	ctx context.Context,
+	account store.Account,
+) error {
+	pctx, cancel := context.WithTimeout(ctx, preflightTimeout)
+	defer cancel()
+	preflight := s.preflightCredential
+	if preflight == nil {
+		preflight = s.m.PreflightRefresh
+	}
+	err := preflight(pctx, account)
+	// A synced token expired here: the origin's rotation may already be in the
+	// registry but not yet pulled locally. Pull once, then re-evaluate.
+	if !errors.Is(err, pool.ErrUnrefreshable) || s.syncPull == nil {
+		return err
+	}
+	if pullErr := s.syncPull(pctx); pullErr != nil {
+		return errors.Join(err, fmt.Errorf("preflight sync pull: %w", pullErr))
+	}
+	return preflight(pctx, account)
+}
+
 func (s *Server) handleSelectCommit(ctx context.Context, req Request) Response {
 	if req.ReservationToken == "" {
 		return Response{OK: false, Error: "select commit requires a reservation token"}
@@ -613,14 +592,32 @@ func (s *Server) handleSelectCommit(ctx context.Context, req Request) Response {
 	return Response{OK: false, Error: "selection reservation is unknown or expired"}
 }
 
-func (s *Server) activateSelection(token string, reserved reservation, launch selectionLaunch) Response {
-	if err := s.m.Store.ActivateSelection(store.SelectionActivation{
-		Token:     token,
-		AccountID: reserved.accountID, ExpectedInstanceID: reserved.accountInstanceID,
-		ExpectedGeneration: reserved.accountGeneration,
-		Process:            store.ProcessIdentity{PID: launch.pid, StartedAt: launch.processStartedAt},
-		Cwd:                launch.cwd, RecordSticky: launch.recordSticky, At: time.Now(),
-	}); err != nil {
+func (s *Server) activateSelection(ctx context.Context, token string, reserved reservation, launch selectionLaunch) Response {
+	if reserved.preparation == nil {
+		return Response{OK: false, Error: "selection reservation has no preparation proof"}
+	}
+	account := store.Account{
+		ID: reserved.accountID, InstanceID: reserved.accountInstanceID, Generation: reserved.accountGeneration,
+	}
+	activate := func() error {
+		return s.m.Store.ActivateSelection(store.SelectionActivation{
+			Token:     token,
+			AccountID: reserved.accountID, ExpectedInstanceID: reserved.accountInstanceID,
+			ExpectedGeneration: reserved.accountGeneration,
+			Process:            store.ProcessIdentity{PID: launch.pid, StartedAt: launch.processStartedAt},
+			ConfigDir:          pool.AccountPresentationDir(reserved.accountID),
+			Cwd:                launch.cwd, RecordSticky: launch.recordSticky, At: time.Now(),
+		})
+	}
+	var err error
+	if s.activatePrepared != nil {
+		err = s.activatePrepared(ctx, account, *reserved.preparation, activate)
+	} else if s.tenantCoordinator != nil {
+		err = s.tenantCoordinator.activatePrepared(ctx, account, *reserved.preparation, activate)
+	} else {
+		err = errors.New("FuseKit tenant coordinator is unavailable")
+	}
+	if err != nil {
 		return Response{OK: false, Error: fmt.Sprintf("activate selection for account %d: %v", reserved.accountID, err)}
 	}
 	return Response{OK: true}
@@ -667,143 +664,6 @@ func runnerUp(ranked []score.Result, winnerID int, fallback bool) string {
 	return ""
 }
 
-// mountReady reports whether an account's overlay can serve a session now. A fuse
-// row is ready iff the holder cache vouches for a live mirror at its dir (cached
-// kernel truth, no filesystem touch — an lstat through a dead fuse-t mount can hang
-// select), with one rate-limited refresh on a cache-miss. A non-fuse row needs its
-// dir NOT mounted; a File Provider row also needs its domain not wedged. See ccn
-// doc 4f56e54.
-func (s *Server) mountReady(a store.Account) bool {
-	if fuseBackedRow(a.OverlayKind) {
-		if !s.holder.ready(a.ConfigDir) {
-			s.holder.refreshIfStale(s.holderClient())
-		}
-		return s.holder.ready(a.ConfigDir)
-	}
-	if fpBackedRow(a.OverlayKind) {
-		return !overlayMounted(a.ConfigDir) && !s.fpWedged(a.ConfigDir)
-	}
-	return !overlayMounted(a.ConfigDir)
-}
-
-// fpWedged reports whether dir's File Provider domain has latched its wedge
-// verdict on the fp.domain ledger; false when FP self-heal is not wired (bare
-// test servers).
-func (s *Server) fpWedged(dir string) bool {
-	if !s.fpEnabled() {
-		return false
-	}
-	s.ledMu.Lock()
-	defer s.ledMu.Unlock()
-	return s.led.faulted(fpDomainPolicy, dir)
-}
-
-// probeWinnerReady deep-probes a chosen fuse mirror at select time, reporting
-// whether it is safe to assign — the ONLY probe of an idle mirror, so a partial
-// wedge (shallow-alive, bulk reads hang) would otherwise go undetected until a
-// session hung on it. A wedge is force-marked (no debounce) and reads not-ready;
-// bounded by the 5s deep-probe timeout, never remounting inline. Non-fuse and
-// pre-probe (ErrProbeMissing) mirrors read ready. See ccn doc 4f56e54.
-func (s *Server) probeWinnerReady(ctx context.Context, a store.Account) bool {
-	if fpBackedRow(a.OverlayKind) {
-		return s.probeFPWinnerReady(ctx, a)
-	}
-	if !fuseBackedRow(a.OverlayKind) {
-		return true
-	}
-	if err := ctx.Err(); err != nil {
-		return false
-	}
-	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < overlay.DeepProbeBound {
-		return false
-	}
-	err := deepProbe(a.ConfigDir)
-	if ctx.Err() != nil {
-		return false
-	}
-	if err != nil && !errors.Is(err, overlay.ErrProbeMissing) {
-		s.holder.markDeepWedged(a.ConfigDir)
-		s.log.Printf("acct-%02d mirror wedged at select (serves metadata but hangs reads); excluding it and letting the heal loop remount it — relaunch once it recovers: %v", a.ID, err)
-		return false
-	}
-	if msg := s.holder.recordDeep(a.ConfigDir, err); msg != "" {
-		s.log.Printf("%s", msg)
-	}
-	return true
-}
-
-// probeFPWinnerReady live-probes a chosen File Provider domain's data plane at
-// select time (through the app control op, never a through-domain read), reporting
-// whether it is safe to assign. A hard wedge verdict force-marks the domain wedged
-// (no debounce) and reads not-ready; a NoVerdict (app busy/unreachable/restart)
-// reads ready WITHOUT force-wedging, so an app restart never fleet-wedges selects.
-// Bounded to 3s. See ccn doc 4f56e54.
-func (s *Server) probeFPWinnerReady(ctx context.Context, a store.Account) bool {
-	if !s.fpEnabled() {
-		return true
-	}
-	if s.fpWedged(a.ConfigDir) {
-		return false // already known wedged (mountReady also excludes it)
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, fpControlProbeTimeout)
-	defer cancel()
-	err := fpDomainProbe(probeCtx, a.ConfigDir)
-	if ctx.Err() != nil {
-		return false
-	}
-	switch {
-	case err == nil, errors.Is(err, overlay.ErrFPProbeMissing):
-		return true
-	case errors.Is(err, overlay.ErrFPProbeEmpty) && !s.fpSynth(a.ConfigDir):
-		return true // 0 bytes served for an account with no identity yet
-	case errors.Is(err, overlay.ErrFPProbeNoVerdict):
-		return true // app restart / busy / unreachable — never fleet-wedge a select
-	default:
-		s.fpForceWedge(a.ConfigDir, err)
-		s.log.Printf("acct-%02d file provider domain wedged at select (serves control ops but hangs reads); excluding it and letting the heal loop recover it — relaunch once it recovers: %v", a.ID, err)
-		return false
-	}
-}
-
-// holderClient returns an Owner-scoped client for the shared mount-holder socket:
-// every List/Poll/Reclaim is filtered to cc-pool's own mounts, so the daemon never
-// observes or disturbs another tenant's (e.g. cc-notes').
-func (s *Server) holderClient() *mountd.Client {
-	return &mountd.Client{Socket: s.holderSocket, Owner: pool.HolderOwner}
-}
-
-// startContentBridge binds the daemon's content.BridgeServer and waits for it to
-// accept connections, so the first mount's manifest fetch over the bridge succeeds
-// (holderfs.Build fails a mount loudly if the consumer is unreachable). The server
-// runs until ctx is cancelled, tracked by wg.
-func (s *Server) startContentBridge(ctx context.Context) {
-	sock := pool.BridgeSocketPath()
-	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
-		s.log.Printf("content bridge: create socket dir: %v", err)
-		return
-	}
-	bridge := &content.BridgeServer{Socket: sock, Source: s.contentSource, Version: version.String(), Log: s.log}
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		// Fail loud on a bind failure: every fuse mount's manifest fetch depends on
-		// this bridge, so a dead bridge (and the every-mount-defers state it causes)
-		// must be visible, not swallowed. A clean ctx-cancel shutdown returns nil.
-		if err := bridge.Run(ctx); err != nil && ctx.Err() == nil {
-			s.log.Printf("content bridge: serve %s failed; fuse mounts will defer until the daemon restarts: %v", sock, err)
-		}
-	}()
-	cl := content.NewBridgeClient(sock)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil || cl.Available() {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	s.log.Printf("content bridge: socket %s did not come up within 3s; mounts may defer until it does", sock)
-}
-
 // scan resolves session scanning through the test seam; nil means
 // procscan.Scan.
 func (s *Server) scan(ctx context.Context) ([]procscan.Session, error) {
@@ -811,45 +671,6 @@ func (s *Server) scan(ctx context.Context) ([]procscan.Session, error) {
 		return s.scanSessions(ctx)
 	}
 	return procscan.Scan(ctx)
-}
-
-// overlayFor resolves a backend through the Manager (the OverlayFor test seam,
-// else the memoized provider. A resolution failure is logged and yields nil —
-// callers already fence on a wrong-backend (or here, nil) provider.
-func (s *Server) overlayFor(backend fkoverlay.Backend) fkoverlay.Provider {
-	prov, err := s.m.OverlayProvider(backend)
-	if err != nil {
-		s.log.Printf("resolve overlay provider for backend %q: %v", backend, err)
-		return nil
-	}
-	return prov
-}
-
-// overlayForRow resolves the overlay provider named by a's stored overlay_kind,
-// keeping cc-pool blind: it carries the received Backend rather than re-deriving
-// one. nil on an unparseable kind (logged) or an unresolvable backend; callers
-// already fence on nil before mounting through the provider.
-func (s *Server) overlayForRow(a store.Account) fkoverlay.Provider {
-	backend, err := fkoverlay.Parse(a.OverlayKind)
-	if err != nil {
-		s.log.Printf("acct-%02d: unparseable overlay_kind %q: %v", a.ID, a.OverlayKind, err)
-		return nil
-	}
-	return s.overlayFor(backend)
-}
-
-// fuseBackedRow reports whether a stored overlay_kind names a fuse backend.
-// The daemon's hot paths check IsFuse on the stored string constantly; this is
-// the one place that parse lives.
-func fuseBackedRow(overlayKind string) bool {
-	b, err := fkoverlay.Parse(overlayKind)
-	if err != nil {
-		// overlay_kind is cc-pool-written (always valid); an unparseable value is
-		// corruption. Treat as non-fuse so the safe symlink path handles the dir
-		// rather than mounting over it.
-		return false
-	}
-	return b.IsFuse()
 }
 
 // rankWithReservations re-ranks snapshots with the local reservation penalty
@@ -862,21 +683,22 @@ func (s *Server) rankWithReservations(snaps []pool.Snapshot) ([]score.Result, ma
 	for _, sn := range snaps {
 		bySnap[sn.Account.ID] = sn
 		inputs = append(inputs, score.Input{
-			AccountID:      sn.Account.ID,
-			HasUsage:       sn.HasUsage,
-			SampleTS:       time.Now().Add(-sn.SampleAge),
-			Util5h:         sn.Util5h,
-			Util7d:         sn.Util7d,
-			Resets5h:       sn.Resets5h,
-			Resets7d:       sn.Resets7d,
-			Burn5hPerHour:  sn.Burn5hPerHour,
-			ActiveSessions: sn.ActiveSessions + s.cl.reservedCount(sn.Account.ID),
-			RateLimited:    sn.RateLimited,
-			RefreshFailed:  sn.Stale && !sn.HasUsage,
-			NeedsLogin:     sn.NeedsLogin,
-			HasScoped7d:    sn.Scoped7dModel != "",
-			Util7dScoped:   sn.Scoped7dUtil,
-			Resets7dScoped: sn.Scoped7dResets,
+			AccountID:             sn.Account.ID,
+			HasUsage:              sn.HasUsage,
+			SampleTS:              time.Now().Add(-sn.SampleAge),
+			Util5h:                sn.Util5h,
+			Util7d:                sn.Util7d,
+			Resets5h:              sn.Resets5h,
+			Resets7d:              sn.Resets7d,
+			Burn5hPerHour:         sn.Burn5hPerHour,
+			ActiveSessions:        sn.ActiveSessions + s.cl.reservedCount(sn.Account.ID),
+			RateLimited:           sn.RateLimited,
+			RefreshFailed:         sn.Stale && !sn.HasUsage,
+			NeedsLogin:            sn.NeedsLogin,
+			CredentialQuarantined: sn.CredentialQuarantined,
+			HasScoped7d:           sn.Scoped7dModel != "",
+			Util7dScoped:          sn.Scoped7dUtil,
+			Resets7dScoped:        sn.Scoped7dResets,
 		})
 	}
 	return score.Rank(inputs, time.Now()), bySnap
@@ -900,23 +722,23 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 	out := make([]AccountStatus, 0, len(snaps))
 	for _, sn := range snaps {
 		out = append(out, AccountStatus{
-			ID:             sn.Account.ID,
-			ConfigDir:      sn.Account.ConfigDir,
-			Label:          sn.Account.Label,
-			OverlayKind:    sn.Account.OverlayKind,
-			Score:          sn.Score,
-			Remaining5h:    sn.Remaining5h,
-			Remaining7d:    sn.Remaining7d,
-			ActiveSessions: sn.ActiveSessions,
-			RateLimited:    sn.RateLimited,
-			Exhausted:      sn.Exhausted,
-			NeedsLogin:     sn.NeedsLogin,
-			AwaitingOrigin: sn.AwaitingOrigin,
-			HasUsage:       sn.HasUsage,
-			Stale:          sn.Stale,
-			Resets5h:       sn.Resets5h,
-			Resets7d:       sn.Resets7d,
-			SampleAge:      sn.SampleAge.Round(time.Second).String(),
+			ID:                    sn.Account.ID,
+			ConfigDir:             pool.AccountPresentationDir(sn.Account.ID),
+			Label:                 sn.Account.Label,
+			Score:                 sn.Score,
+			Remaining5h:           sn.Remaining5h,
+			Remaining7d:           sn.Remaining7d,
+			ActiveSessions:        sn.ActiveSessions,
+			RateLimited:           sn.RateLimited,
+			Exhausted:             sn.Exhausted,
+			NeedsLogin:            sn.NeedsLogin,
+			CredentialQuarantined: sn.CredentialQuarantined,
+			AwaitingOrigin:        sn.AwaitingOrigin,
+			HasUsage:              sn.HasUsage,
+			Stale:                 sn.Stale,
+			Resets5h:              sn.Resets5h,
+			Resets7d:              sn.Resets7d,
+			SampleAge:             sn.SampleAge.Round(time.Second).String(),
 			// The wire ships the gated display forecast, never the raw
 			// scoring burn (which stays live on stale samples).
 			Burn5hPerHour:      sn.Forecast.BurnPerHour,
@@ -934,391 +756,4 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 		})
 	}
 	return out
-}
-
-// reconcileOverlays brings each account's on-disk overlay in line with its row
-// at startup, off the accept path; ctx is checked between accounts so a
-// boot-time shutdown doesn't block wg.Wait on a slow account's mount timeout.
-func (s *Server) reconcileOverlays(ctx context.Context) {
-	// Prime the holder cache before any per-account decision: mountReady (and
-	// so every select racing this reconcile) keys fuse readiness on it. Carcass
-	// clearing is the shared holder's job (proven-dead pre-mount clear), so the
-	// daemon reaps nothing here.
-	s.holder.refresh(s.holderClient())
-	accts, err := s.m.Store.ListAccounts()
-	if err != nil {
-		return
-	}
-	// Capability gate: one probe settles whether this machine can fuse at all
-	// BEFORE any per-account cold mount — a hard "no" retreats the whole pool to
-	// symlink in one pass (vs a doomed mount per account), and the loop below
-	// reconciles the now-symlink rows.
-	if reason := s.fuseHardUnavailable(); reason != "" {
-		s.retreatPoolToSymlink(ctx, accts, reason)
-		if accts, err = s.m.Store.ListAccounts(); err != nil {
-			return
-		}
-	}
-	for _, a := range accts {
-		if ctx.Err() != nil {
-			return
-		}
-		if !s.cl.hold(a.ID) {
-			// An OpMigrate landed before startup reconcile reached this
-			// account; the conversion leaves it consistent on its own.
-			s.log.Printf("acct-%02d busy converting; skipping startup reconcile", a.ID)
-			continue
-		}
-		s.reconcileAccount(ctx, a)
-		s.cl.disownHold(a.ID)
-	}
-}
-
-// fuseHardUnavailable reports a reason iff one capability probe proves this
-// machine cannot host fuse mounts right now (ErrMountFailed on a throwaway
-// probe mount); every "" return leaves the per-account heal in charge.
-func (s *Server) fuseHardUnavailable() string {
-	if !s.canSpawnHolder() {
-		return "" // no cask holder to probe; per-account heal converts each fuse row as it fails
-	}
-	if healthy, _ := s.holder.view(); !healthy {
-		return "" // holder not reachable yet; Reconcile respawns it, per-account heal mounts through it
-	}
-	if s.holder.wireStatus().Mounts > 0 {
-		return "" // already serving a live mount: capability is proven
-	}
-	if _, err := s.holderClient().Probe(); errors.Is(err, mountd.ErrMountFailed) {
-		return err.Error()
-	}
-	return ""
-}
-
-// retreatPoolToSymlink retreats every fuse row to symlink and records symlink
-// as the new-account default; `ccp migrate --to fuse` re-promotes later.
-func (s *Server) retreatPoolToSymlink(ctx context.Context, accts []store.Account, reason string) {
-	fuse := make([]store.Account, 0, len(accts))
-	for _, a := range accts {
-		if fuseBackedRow(a.OverlayKind) {
-			fuse = append(fuse, a)
-		}
-	}
-	if len(fuse) == 0 {
-		return
-	}
-	s.log.Printf("fuse is unavailable on this machine (%s); retreating %d fuse account(s) to symlink and defaulting new accounts to symlink — see %s",
-		reason, len(fuse), pool.MountHolderLogPath())
-	s.retreatAllFuseRows(ctx, fuse, "fuse-t cannot mount on this machine")
-	if err := s.m.SetDefaultOverlayKind(fkoverlay.BackendSymlink); err != nil {
-		s.log.Printf("capability retreat: record symlink as the new-account default: %v", err)
-	}
-}
-
-// reconcileAccount brings one account's on-disk overlay in line with its row.
-// Caller holds the poll claim.
-func (s *Server) reconcileAccount(ctx context.Context, a store.Account) {
-	// The startup listing that produced `a` can age: the socket serves OpSelect /
-	// OpMigrate during the reconcile, so a conversion can flip the row between the
-	// listing and this poll claim. Re-read once under the held claim (which blocks any
-	// NEW conversion) and branch every arm on the fresh row, so a stale fuse/fp
-	// snapshot never drives a destructive heal (healFuse) against a row that is
-	// now symlink in SQLite. A vanished account has nothing to reconcile.
-	fresh, err := s.m.Store.GetAccount(a.ID)
-	if err != nil {
-		s.log.Printf("acct-%02d reconcile: re-read row under the poll claim: %v", a.ID, err)
-		return
-	}
-	a = fresh
-	if fpBackedRow(a.OverlayKind) {
-		// File Provider rows reconcile through the domain host (Check, then an
-		// idempotent Reconcile) — never the non-fuse arm below: its
-		// HealStrandedPrivate would move the account's private files out of the
-		// FP private store, through the domain bridge symlink.
-		s.reconcileFileProvider(ctx, a)
-		return
-	}
-	if fuseBackedRow(a.OverlayKind) {
-		prov := s.overlayForRow(a)
-		if prov != nil && prov.Backend().IsFuse() && prov.Check(ctx, pool.ClaudeDir(), a.ConfigDir) == nil {
-			// The detached holder kept the mirror live across the restart (the
-			// common case): adopt it untouched and vouch for it in the cache
-			// directly — a live mirror implies the holder serving it, and a
-			// select must not depend on the startup refresh still being accurate.
-			s.holder.noteMounted(a.ConfigDir)
-			s.log.Printf("acct-%02d adopted live mount", a.ID)
-			return
-		}
-		s.healFuse(ctx, a)
-		return
-	}
-	// CRASH-WINDOW CONVERGENCE: a symlink row whose dir is itself a symlink is
-	// convert wreckage (a symlink→fileprovider Reconcile done, the row not flipped).
-	// Retract the leaked domain and recreate the real dir so HealStrandedPrivate
-	// below restores the private files. Lstat never follows the link, so this
-	// precedes the mount check. See ccn doc d1ab40f.
-	if s.dirIsOverlaySymlink(a.ConfigDir) {
-		// A fresh per-account tick, not the startup table's shared one: this
-		// crash-window retract is destructive, so its liveness check gets one scan
-		// per reconciled account. The retract runs only under the convert claim and
-		// with no live session on the bridge, since beginPoll does not hide the dir
-		// from a select landing on it.
-		if !s.beginSymlinkHealHeld(s.newTick(ctx), a) {
-			return
-		}
-		defer s.cl.disownConvert(a.ID)
-		if !s.convergeSymlinkRowBridge(ctx, a) {
-			return
-		}
-	}
-	// A live mountpoint under a FUSE row is normal at startup (the holder
-	// survived the restart); under a NON-fuse row it is wreckage — an aborted
-	// rollback's wedged unmount, or a conversion that died before its row flip —
-	// serving a mirror whose backing no longer holds the account's identity. It
-	// blocks every symlink repair (they refuse mountpoints); tear it down first.
-	if overlayMounted(a.ConfigDir) {
-		// Route the teardown through the shared holder's lease-ladder unmount
-		// (graceful, never a force): a held session lease or a busy mirror answers
-		// ErrBusy, so a live session defers this to a later tick instead of breaking.
-		warning, err := s.holderClient().Unmount(pool.ClaudeDir(), a.ConfigDir)
-		if warning != "" {
-			s.log.Printf("acct-%02d: stale-mountpoint unmount persist-warning: %s", a.ID, warning)
-		}
-		if err != nil {
-			if errors.Is(err, mountd.ErrBusy) {
-				s.log.Printf("acct-%02d: stale mountpoint at %s is busy (a live session holds its lease); leaving it, re-checking next tick", a.ID, a.ConfigDir)
-				return
-			}
-			s.log.Printf("acct-%02d: unmount stale mountpoint: %v", a.ID, err)
-			return
-		}
-		s.log.Printf("acct-%02d: cleared a stale mountpoint", a.ID)
-	}
-	// A symlink account can carry private files stranded in a fuse backing dir
-	// by a conversion that died midway — restore them before anything launches.
-	healed, err := s.m.HealStrandedPrivate(a) //nolint:contextcheck // Manager API has no context; work is local filesystem I/O.
-	if err != nil {
-		s.log.Printf("acct-%02d heal stranded private files: %v", a.ID, err)
-		return
-	}
-	if healed {
-		s.log.Printf("acct-%02d restored private files stranded by an interrupted migration", a.ID)
-	}
-}
-
-// warnTeardown surfaces an overlay teardown's journal persist-warning loudly (the
-// kernel detach landed but a successor could replay the stale row); empty stays silent.
-func (s *Server) warnTeardown(id int, warning string) {
-	if warning != "" {
-		s.log.Printf("acct-%02d overlay teardown persist-warning: %s", id, warning)
-	}
-}
-
-// healOutcome classifies one healFuse attempt.
-type healOutcome int
-
-const (
-	healMounted             healOutcome = iota // the mirror is up
-	healRetry                                  // transient holder condition; retry next poll
-	healTCCBlocked                             // mount blocked pending the TCC grant; recorded; retry next poll
-	healFallback                               // genuine mount failure; gated symlink fallback attempted
-	healDeferredBusy                           // the mirror is busy (a live session holds its lease, or a graceful unmount answered EBUSY); defer, no breaker strike
-	healDeferredUnsupported                    // the holder lacks a required capability; wait for the cask upgrade, no breaker strike
-)
-
-// errSweepStranded marks a failure in mountFuse's pre-Reconcile sweep of stranded
-// private files — distinct from a mount failure: Reconcile was never attempted, so
-// it is not a mount verdict. healFuse routes it to healRetry, never the
-// irreversible symlink fallback: a fallback never auto-reverts (the scheduler
-// only re-heals fuse rows), and the collision that refused the sweep would
-// refuse the symlink retreat the same way — so converting fixes nothing.
-var errSweepStranded = errors.New("sweep stranded private files")
-
-// healFuse establishes a fuse account's mirror, classifying failures instead of
-// blindly converting (see the switch): transient conditions and a mount pending
-// the macOS volume-access grant retry next poll; only a genuine mount failure
-// falls back to symlink, itself gated on the account being idle (see
-// fallbackToSymlink). Used by the startup reconcile, the per-poll self-heal, and
-// the heal loop; callers hold the account's poll claim.
-func (s *Server) healFuse(ctx context.Context, a store.Account) healOutcome {
-	err := s.mountFuse(ctx, a)
-	switch {
-	case err == nil:
-		return healMounted
-	case errors.Is(err, mountd.ErrBusy):
-		// The mirror is busy: a live session holds its lease (the holder refused to
-		// seize across a teardown), or a graceful unmount answered EBUSY. Defer
-		// WITHOUT a hazard strike so the wedged breaker never fires on a busy
-		// mirror — it clears on its own once the session exits.
-		s.log.Printf("acct-%02d remount deferred: the mirror is busy (a live session holds its lease); relaunch it: %v", a.ID, err)
-		return healDeferredBusy
-	case errors.Is(err, pool.ErrHolderUnsupported), errors.Is(err, mountd.ErrProtoMismatch):
-		// The feature gate refused a holder missing a required capability, or the
-		// holder speaks an older protocol generation. A benign wait for the cask
-		// upgrade, not a mount hazard: defer without a breaker strike and never
-		// demote the row — the remount resumes once `brew upgrade --cask
-		// fusekit-holder` lands.
-		s.log.Printf("acct-%02d remount refused (holder lacks a required capability), retrying next poll: %v", a.ID, err)
-		return healDeferredUnsupported
-	case errors.Is(err, mountd.ErrHolderUnavailable):
-		// Reconcile already attempts a lazy (re)spawn and launchd owns the respawn
-		// policy, so there is nothing more to do this poll.
-		s.log.Printf("acct-%02d mount deferred (holder unavailable), retrying next poll: %v", a.ID, err)
-		return healRetry
-	case errors.Is(err, overlay.ErrUnmountWedged):
-		// A wedged unmount says nothing about whether a fresh mount would work,
-		// and the fallback's ConvertOverlay would hit the same wedge — converting
-		// here would fail closed every poll for nothing.
-		s.log.Printf("acct-%02d mount blocked by a wedged unmount, retrying next poll: %v", a.ID, err)
-		return healRetry
-	case errors.Is(err, fkoverlay.ErrAccountDirOccupied):
-		// The account dir holds unclassified state where the bridge symlink must go.
-		// Never destroy it and never demote — the same state would block the symlink
-		// retreat; retry loudly until a human clears it.
-		s.log.Printf("acct-%02d fuse heal blocked: account dir holds unclassified state where the bridge symlink belongs; refusing to clobber it, retrying next poll: %v", a.ID, err)
-		return healRetry
-	case errors.Is(err, mountd.ErrMuxMismatch):
-		// Registry state: a mux subtree could not join its shared native mount
-		// (unmount-then-retry). Never a mount verdict — retry, never demote to
-		// symlink. Unreachable in cc-pool's steady state (one MuxRoot, uniform
-		// options), so a loud retry is the safe classification if it ever fires.
-		s.log.Printf("acct-%02d mux subtree could not join the shared mount (registry state), retrying next poll: %v", a.ID, err)
-		return healRetry
-	case errors.Is(err, mountd.ErrForeignMount):
-		// A foreign mount sits where a mux mount must go. The holder clears its own
-		// dead carcasses on mount (the fenced, proven-dead pre-mount clear), so a
-		// mount still refused foreign is genuine registry state, never a mount
-		// verdict — retry, never demote the pool to symlink.
-		s.log.Printf("acct-%02d mux setup blocked by a foreign mount at the shared root, retrying next poll: %v", a.ID, err)
-		return healRetry
-	case errors.Is(err, mountd.ErrUnknownClass):
-		// Forward skew: a newer holder sent an error class this daemon predates.
-		// Unclassifiable is not a mount verdict — retry, loudly, until the daemon
-		// is upgraded.
-		s.log.Printf("acct-%02d mount failed with an error class this daemon does not recognize (newer holder; upgrade the daemon), retrying next poll: %v", a.ID, err)
-		return healRetry
-	case errors.Is(err, overlay.ErrMountTimeout):
-		// Timed out in a holder whose volume-access grant is already proven by an
-		// earlier live mount — transient fuse-t slowness, not the TCC condition.
-		s.log.Printf("acct-%02d fuse mount did not come up within the mount wait; retrying: %v", a.ID, err)
-		return healRetry
-	case errors.Is(err, overlay.ErrMountFailed):
-		// A hard mount(2) rejection (fuse-t not installed/loadable, the kernel
-		// refusing) — NEVER the TCC grant, so don't wait: retreat to symlink on
-		// this first heal. The real cause is in the holder log.
-		s.log.Printf("acct-%02d fuse mount rejected outright (not a TCC grant); falling back to symlink — see %s: %v", a.ID, pool.MountHolderLogPath(), err)
-		s.fallbackToSymlink(ctx, a)
-		return healFallback
-	case errors.Is(err, overlay.ErrMountNotLive):
-		s.log.Printf("acct-%02d fuse mount blocked pending the macOS volume-access grant, retrying next poll: %v", a.ID, err)
-		return healTCCBlocked
-	case errors.Is(err, errSweepStranded):
-		// Sweep failed before Reconcile (not a mount verdict; see errSweepStranded);
-		// retry next poll, loudly.
-		s.log.Printf("acct-%02d mount deferred (could not sweep stranded private files before mounting), retrying next poll: %v", a.ID, err)
-		return healRetry
-	case errors.Is(err, mountd.ErrContentUnavailable):
-		// Holder refused only because the content bridge was unreachable (daemon
-		// mid-restart, not a mount verdict). A symlink demotion would be
-		// irreversible, so defer until the bridge is back.
-		s.log.Printf("acct-%02d mount deferred (content bridge unavailable, daemon mid-restart?), retrying next poll: %v", a.ID, err)
-		return healRetry
-	default:
-		s.log.Printf("acct-%02d mount failed; attempting gated symlink fallback: %v", a.ID, err)
-		s.fallbackToSymlink(ctx, a)
-		return healFallback
-	}
-}
-
-// mountFuse establishes a fuse account's mirror through the resolved provider in a
-// fixed order: a dead mount comes down first, private files stranded by a
-// conversion killed before its row flip are swept into the backing dir (mounting
-// over them would shadow the account's identity), then the provider mounts. A dead
-// holder's carcass or a base-mismatched registry row gets one unmount-then-retry.
-// See ccn doc 7bf8406.
-func (s *Server) mountFuse(ctx context.Context, a store.Account) error {
-	prov := s.overlayForRow(a)
-	if prov == nil || !prov.Backend().IsFuse() {
-		return fmt.Errorf("no fuse provider resolved for acct-%02d; refusing to mount through it", a.ID)
-	}
-	base, dir := pool.ClaudeDir(), a.ConfigDir
-	// Check is shallow, so a partial wedge passes it (the deepWedged verdict
-	// catches that). A dead/wedged mirror must come down before re-establishing.
-	// The provider's Teardown routes through the holder's lease-ladder unmount
-	// (graceful, never a force): a live session holding the lease answers ErrBusy,
-	// so the remount defers instead of breaking the session. See ccn doc 7bf8406.
-	legacy := overlayMounted(dir)
-	if (legacy || pool.IsBridgeSymlink(dir)) && (prov.Check(ctx, base, dir) != nil || s.holder.deepWedged(dir)) {
-		warning, err := prov.Teardown(ctx, base, dir)
-		s.warnTeardown(a.ID, warning)
-		if err != nil {
-			return fmt.Errorf("clear dead mount before remounting: %w", err)
-		}
-		s.log.Printf("acct-%02d cleared a dead mount before remounting", a.ID)
-	}
-	err := s.sweepAndMount(ctx, prov, a, base, dir)
-	if errors.Is(err, mountd.ErrForeignMount) || errors.Is(err, mountd.ErrBaseMismatch) {
-		// A foreign/mismatched registry row needs one unmount-then-retry; the
-		// holder's lease-gated teardown answers ErrBusy under a live session.
-		warning, terr := prov.Teardown(ctx, base, dir)
-		s.warnTeardown(a.ID, warning)
-		if terr != nil {
-			return fmt.Errorf("clear foreign mount: %w", terr)
-		}
-		err = s.sweepAndMount(ctx, prov, a, base, dir)
-	}
-	if err != nil {
-		return err
-	}
-	// Update the holder cache in place so a select landing before the next
-	// poll's refresh trusts the fresh mount.
-	s.holder.noteMounted(dir)
-	return nil
-}
-
-// sweepAndMount is one sweep+Reconcile attempt for mountFuse: with no mount in
-// the way, private files stranded in the underlay are swept into the backing
-// dir, then the provider mounts.
-func (s *Server) sweepAndMount(ctx context.Context, prov fkoverlay.Provider, a store.Account, base, dir string) error {
-	// The sweep reads the underlay dir directly. Skip it when dir is a bridge
-	// symlink into the shared mount — following it would traverse the live mirror
-	// (and could hang on a wedge), and a mux account's private files live in the
-	// backing root, never under the bridged path. A legacy real dir still gets swept.
-	if !overlayMounted(dir) && !pool.IsBridgeSymlink(dir) {
-		spec := s.m.OverlaySpec()
-		switch has, err := fkoverlay.HasPrivateEntries(dir, spec); {
-		case err != nil:
-			return fmt.Errorf("%w: check underlay: %w", errSweepStranded, err)
-		case has:
-			if err := fkoverlay.MovePrivateEntries(dir, fkoverlay.FusePrivateRoot(dir), spec); err != nil {
-				return fmt.Errorf("%w: move into backing dir: %w", errSweepStranded, err)
-			}
-			s.log.Printf("acct-%02d swept private files from the mount underlay into the backing dir", a.ID)
-		}
-	}
-	return prov.Reconcile(ctx, base, dir)
-}
-
-// fallbackToSymlink converts an account to symlink after a genuine mount failure
-// so its dir is usable again. ConvertOverlay's teardown routes through the
-// holder's lease-ladder unmount, so a live session holding the lease answers
-// ErrBusy and the fallback defers instead of breaking it; private files move back
-// out of the fuse backing dir. Callers must hold the account's poll claim. See ccn
-// doc d1ab40f.
-func (s *Server) fallbackToSymlink(ctx context.Context, a store.Account) {
-	if !s.cl.ownHeld(a.ID) {
-		s.log.Printf("acct-%02d deferring fuse→symlink fallback: reserved by a pending select or already converting", a.ID)
-		return
-	}
-	defer s.cl.disownConvert(a.ID)
-	if _, err := s.m.ConvertOverlay(ctx, a, fkoverlay.BackendSymlink); err != nil {
-		if errors.Is(err, mountd.ErrBusy) {
-			s.log.Printf("acct-%02d deferring fuse→symlink fallback: a live session holds the lease on %s", a.ID, a.ConfigDir)
-			return
-		}
-		s.log.Printf("acct-%02d symlink fallback: %v", a.ID, err)
-		return
-	}
-	// The mirror is down and the row is symlink; drop the cache entry so
-	// HolderStatus.Mounts stops counting it.
-	s.holder.noteUnmounted(a.ConfigDir)
-	s.log.Printf("acct-%02d fell back to symlink after a genuine mount failure", a.ID)
 }

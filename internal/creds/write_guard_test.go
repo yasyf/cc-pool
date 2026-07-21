@@ -36,11 +36,11 @@ func TestWriteFuncRejectsEmptyAccessToken(t *testing.T) {
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				dir := t.TempDir()
-				err := WriteFileCredential(dir, tc.cred)
+				err := writeFileCredentialForTest(dir, tc.cred)
 				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("WriteFileCredential err = %v, want %v", err, tc.wantErr)
+					t.Fatalf("credential file write err = %v, want %v", err, tc.wantErr)
 				}
-				if got := FileCredentialExists(dir); got != tc.wantStored {
+				if got := fileCredentialExistsForTest(dir); got != tc.wantStored {
 					t.Fatalf("credential persisted = %v, want %v", got, tc.wantStored)
 				}
 			})
@@ -48,7 +48,13 @@ func TestWriteFuncRejectsEmptyAccessToken(t *testing.T) {
 	})
 
 	t.Run("keychain funnel rejects before any security(1) exec", func(t *testing.T) {
-		if err := Write("some-suffixed-service", "user", empty); !errors.Is(err, ErrNoAccessToken) {
+		if err := Write(
+			t.Context(),
+			testTaskRunner{},
+			"some-suffixed-service",
+			"user",
+			empty,
+		); !errors.Is(err, ErrNoAccessToken) {
 			t.Fatalf("Write err = %v, want ErrNoAccessToken", err)
 		}
 	})

@@ -89,7 +89,7 @@ func TestSnapshotScopedFields(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			m := &Manager{Store: st, LockDir: t.TempDir()}
+			m := &Manager{Store: st, ScanSessions: noPoolSessions}
 			snaps, err := m.Snapshots(t.Context(), false, 0)
 			if err != nil {
 				t.Fatal(err)
@@ -145,7 +145,7 @@ func TestSnapshotOnly429IsNoData(t *testing.T) {
 		}
 	}
 
-	m := &Manager{Store: st, LockDir: t.TempDir()}
+	m := &Manager{Store: st, ScanSessions: noPoolSessions}
 	snaps, err := m.Snapshots(t.Context(), false, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +196,7 @@ func TestSnapshotBurn7d(t *testing.T) {
 			base := time.Now().Truncate(time.Second).Add(-tc.sampleAge)
 			seed7dClimb(t, st, 1, base, 6)
 
-			m := &Manager{Store: st, LockDir: t.TempDir()}
+			m := &Manager{Store: st, ScanSessions: noPoolSessions}
 			snaps, err := m.Snapshots(t.Context(), false, 0)
 			if err != nil {
 				t.Fatal(err)
@@ -241,7 +241,7 @@ func TestSnapshotsForecast(t *testing.T) {
 			base := time.Now().Truncate(time.Second).Add(-tc.sampleAge)
 			seedClimb(t, st, 1, base, 10)
 
-			m := &Manager{Store: st, LockDir: t.TempDir()}
+			m := &Manager{Store: st, ScanSessions: noPoolSessions}
 			snaps, err := m.Snapshots(t.Context(), false, 0)
 			if err != nil {
 				t.Fatal(err)

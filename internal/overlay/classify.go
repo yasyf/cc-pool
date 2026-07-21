@@ -1,15 +1,14 @@
-// Package overlay holds cc-pool's mirror-specific overlay code: the ~/.claude
-// entry classification (ExcludedEntries, SharedEntries, SkipEntries,
-// SkipPrefixes, PrivateEntry) that builds the fusekit/overlay Spec, the fuse
-// mirror, and the detached mount-holder host (fuse-tagged) driven by
-// fusekit/overlay's
-// RemoteFuseProvider. The overlay abstraction (Backend, Provider, selection,
-// migration) lives in github.com/yasyf/fusekit/overlay.
+// Package overlay holds Claude-specific merge and classification policy.
 package overlay
 
 import (
 	"path"
 	"strings"
+)
+
+const (
+	claudeJSONName = ".claude.json"
+	settingsName   = "settings.json"
 )
 
 // ExcludedEntries are top-level ~/.claude entries that must NOT be shared across
@@ -27,17 +26,10 @@ var ExcludedEntries = map[string]bool{
 	"backups": true,
 }
 
-// SharedEntries are top-level entries shared across all accounts even when
-// ~/.claude lacks them yet: claude writes them lazily into $CLAUDE_CONFIG_DIR, so
-// without pre-creating them in the base and linking they would scatter as real
-// per-account dirs. plans is the motivating case. Disjoint from ExcludedEntries
-// and PrivateEntry.
-//
-// plans is the physical share both the symlink mechanism (acct-NN/plans →
-// ~/.claude/plans) and the fuse base-absent fallback rely on, so it must stay.
-// Fuse accounts additionally report the canonical path via an injected
-// settings.json plansDirectory (fuse_settings.go) — an additive reporting layer,
-// not a replacement for this share.
+// SharedEntries are canonical top-level entries projected into every tenant.
+// plans is both a shared physical subtree and the path injected into each
+// tenant's synthetic settings.json. Disjoint from ExcludedEntries and
+// PrivateEntry.
 var SharedEntries = map[string]bool{
 	"plans": true,
 }
@@ -47,20 +39,16 @@ var SkipEntries = map[string]bool{
 	".DS_Store": true,
 }
 
-// SkipPrefixes are top-level name prefixes skipped exactly like SkipEntries
-// (fkoverlay.Spec.Skipped matches by HasPrefix): AppleDouble "._*" sidecar
-// litter, plus ".fuse_hidden*" and ".nfs.*" silly-rename litter left by crashed
-// old-provider fuse-t/NFS mounts — ignored and cleaned by conversion and sweeps,
-// never linked, moved, or carved out into ~/.claude, but NOT blocked from
-// creation through the mount.
+// SkipPrefixes are top-level prefixes skipped exactly like SkipEntries:
+// AppleDouble "._*" sidecar litter, plus ".fuse_hidden*" and ".nfs.*"
+// silly-rename litter. Source authority snapshots and deltas omit these
+// artifacts from every tenant view.
 var SkipPrefixes = []string{"._", ".fuse_hidden", ".nfs."}
 
 // PrivatePatterns are top-level (path.Match, no Separator) glob patterns whose
 // matches are per-account private — case-sensitive in PrivateEntry, case-
-// insensitive in the carveOutPrivate leak guard. Unlike PrivatePrefixes they are
-// deliberately NOT on the fusekit wire, so a glob-only match created live through
-// a FUSE mount keeps prefix-only routing in holderfs (a divergence from the FP and
-// symlink backends).
+// insensitive in PrivateTopLevel. The complete set is part of the source
+// authority declaration digest, so policy changes fence the durable fleet.
 var PrivatePatterns = []string{"*.lock"}
 
 // PrivateEntry reports whether a top-level entry name is per-account private:
@@ -101,11 +89,17 @@ func PrivateEntry(name string) bool {
 	return false
 }
 
-// sharedTopLevel reports whether a top-level base entry is carved out as a live
+// PrivateTopLevel reports whether a top-level account object belongs in the
+// private FuseKit backing tree, including case-insensitive leak guards.
+func PrivateTopLevel(name string) bool {
+	return PrivateEntry(name) || carveOutPrivate(name)
+}
+
+// SharedTopLevel reports whether a top-level base entry is carved out as a live
 // symlink into ~/.claude. carveOutPrivate keeps the symlink set disjoint from the
 // holder's private-redirect set — a name in both would serve plain claude's file.
-func sharedTopLevel(name string) bool {
-	if PrivateEntry(name) || carveOutPrivate(name) || SkipEntries[name] || name == claudeJSONName || name == settingsName || name == ProbeFileName {
+func SharedTopLevel(name string) bool {
+	if PrivateTopLevel(name) || SkipEntries[name] || name == claudeJSONName || name == settingsName {
 		return false
 	}
 	for _, p := range SkipPrefixes {

@@ -8,7 +8,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 type renameOptions struct {
@@ -35,7 +34,7 @@ unique: status and list always disambiguate by acct-NN.`,
 		// Args deliberately ArbitraryArgs: arity depends on --auto, so RunE validates.
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
@@ -90,14 +89,14 @@ func renameAuto(cmd *cobra.Command, m *pool.Manager, refs []string, force bool) 
 		step(cmd.ErrOrStderr(), "No accounts yet. Run `ccp add` to add one.")
 		return nil
 	}
+	client, err := requireDaemon(m, "automatic rename requires the account daemon")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
 	out := cmd.OutOrStdout()
 	for _, a := range accts {
-		backend, err := fkoverlay.Parse(a.OverlayKind)
-		if err != nil {
-			note(out, "acct-%02d: unparseable overlay backend; skipped", a.ID)
-			continue
-		}
-		ident, err := pool.AccountIdentity(backend, a.ConfigDir)
+		ident, err := client.AccountIdentity(cmd.Context(), a.ID)
 		if err != nil {
 			note(out, "acct-%02d: no readable identity; skipped", a.ID)
 			continue

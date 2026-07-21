@@ -27,7 +27,7 @@ then prints its config directory. It creates no session, reservation, sticky pin
 or launch ownership. Use ` + "`ccp run`" + ` to launch Claude Code.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
@@ -153,9 +153,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 	}()
 	health, err := cl.HealthContext(ctx)
 	if errors.Is(err, daemon.ErrDaemonUnavailable) {
-		if !cl.EnsureRunning(ctx, daemonEnsureTimeout(ctx)) {
-			return nil, daemon.ErrDaemonUnavailable
-		}
+		ensureDaemon(cmd)
 		health, err = cl.HealthContext(ctx)
 	}
 	if err != nil {
@@ -203,7 +201,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 			}
 			keepClient = true
 			return &selectionTxn{
-				acct: a, dir: a.ConfigDir, line: daemonSelectionLine(m, resp), commit: commit, abort: abort,
+				acct: a, dir: resp.Dir, line: daemonSelectionLine(m, resp), commit: commit, abort: abort,
 				close: func() { _ = cl.Close() },
 			}, nil
 		case outcomeError:
@@ -211,9 +209,6 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 			return nil, errors.New(resp.Error)
 		case outcomeFail:
 			abortDaemonSelection(ctx, cl, resp.ReservationToken)
-			if resp.MountsNotReady {
-				return nil, pool.ErrMountsNotReady
-			}
 			return nil, pool.ErrNoneAvailable
 		case outcomeWait:
 			abortDaemonSelection(ctx, cl, resp.ReservationToken)
@@ -257,7 +252,7 @@ func abortDaemonSelection(ctx context.Context, cl *daemon.Client, token string) 
 func validateDaemonSelection(m *pool.Manager, resp *daemon.Response, forced *store.Account) (store.Account, error) {
 	expectedDir := "<unknown>"
 	if forced != nil {
-		expectedDir = forced.ConfigDir
+		expectedDir = pool.AccountPresentationDir(forced.ID)
 	}
 	if resp.SelectedID == nil {
 		return store.Account{}, fmt.Errorf("invalid daemon selection: id <nil>, expected dir %q, returned dir %q", expectedDir, resp.Dir)
@@ -267,11 +262,12 @@ func validateDaemonSelection(m *pool.Manager, resp *daemon.Response, forced *sto
 	if err != nil {
 		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d, expected dir %q, returned dir %q: %w", id, expectedDir, resp.Dir, err)
 	}
-	if resp.Dir != a.ConfigDir {
-		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d, expected dir %q, returned dir %q", id, a.ConfigDir, resp.Dir)
+	presentationDir := pool.AccountPresentationDir(a.ID)
+	if resp.Dir != presentationDir {
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d, expected dir %q, returned dir %q", id, presentationDir, resp.Dir)
 	}
 	if forced != nil && id != forced.ID {
-		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d does not match forced account %d, expected dir %q, returned dir %q", id, forced.ID, forced.ConfigDir, resp.Dir)
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d does not match forced account %d, expected dir %q, returned dir %q", id, forced.ID, expectedDir, resp.Dir)
 	}
 	if resp.AccountInstanceID != a.InstanceID || resp.AccountGeneration != a.Generation {
 		return store.Account{}, fmt.Errorf("invalid daemon selection: account %d identity %s/%d, current %s/%d",
@@ -338,14 +334,6 @@ func derefTime(t *time.Time) time.Time {
 		return time.Time{}
 	}
 	return *t
-}
-
-// mergeLaunchSettings warns rather than fails: a malformed ~/.claude.json must
-// not brick every pooled launch.
-func mergeLaunchSettings(cmd *cobra.Command, m *pool.Manager, a store.Account) {
-	if _, err := m.MergeBaseClaudeJSON(a); err != nil {
-		warn(cmd.ErrOrStderr(), "couldn't propagate shared settings from ~/.claude.json: %v", err)
-	}
 }
 
 // announceLine prints the inspection diagnostic to stderr only when stdout is a TTY.

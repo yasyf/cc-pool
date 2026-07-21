@@ -109,7 +109,7 @@ The widget ships as its own cask, `yasyf/tap/cc-pool-status`, and shows per-acco
 | `ccp doctor` | Check accounts' Keychain items and overlays; `--fix` repairs drift |
 | `ccp service` | Manage the daemon and mount holder via `install`, `uninstall`, and `status` |
 
-Run `ccp help <command>` for every flag and the rest of the surface, which covers `env`, `list`, `login`, `rename`, `remove`, `init`, `migrate`, `cred`, and `fuse`.
+Run `ccp help <command>` for every flag and the rest of the surface, which covers `env`, `list`, `login`, `rename`, `remove`, `init`, `cred`, `widget`, and `daemon`.
 
 ## How it works
 

@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log"
 	"os"
@@ -18,6 +17,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	daemonproc "github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/synckit/syncservice"
 )
 
@@ -34,13 +35,16 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
-	st, err := store.Open(filepath.Join(home, "pool.db"))
+	if err := pool.EnsureStateDir(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(pool.DBPath())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	s := &Server{
-		m:            &pool.Manager{Store: st, OAuth: &fakeOAuth{}, Creds: credstest.NewFake(), LockDir: filepath.Join(home, "locks")},
+		m:            newDaemonTestManager(t, st, &fakeOAuth{}, credstest.NewFake()),
 		syncSocket:   filepath.Join(home, "sync.sock"),
 		snapshot:     filepath.Join(home, "status.json"),
 		log:          log.New(io.Discard, "", 0),
@@ -48,6 +52,22 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 		cl:           newClaims(),
 		led:          newLedgers(),
 	}
+	reaper := &daemonproc.Reaper{
+		Store:      &daemonproc.FileStore{Path: filepath.Join(home, "workers.json")},
+		Generation: "syncwire-test",
+	}
+	workers, err := supervise.NewPool(1, reaper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.disposableWorkers = workers
+	t.Cleanup(func() {
+		workers.Close()
+		workers.Cancel()
+		if err := workers.Wait(context.Background()); err != nil {
+			t.Errorf("wait disposable workers: %v", err)
+		}
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); s.wg.Wait() })
 	return s, ctx
@@ -80,15 +100,14 @@ func wiredService(t *testing.T, s *Server) *hostsync.Service {
 }
 
 // TestSetupSyncWiresEverything pins that one setupSync call constructs the
-// full engine — gate (mesh-resolved self), heal pull, cred mirror hook,
-// Sessions AND Claims, driver, fetcher — and binds the consumer socket.
+// mutation publisher, mesh identity, heal worker, credential settlement, and
+// worker-backed consumer socket without retaining an in-process converge path.
 func TestSetupSyncWiresEverything(t *testing.T) {
 	s, ctx := newWireServer(t)
 	writeWireMeshState(t, "host-mesh", []string{"peer-b"})
 	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
 		t.Fatal(err)
 	}
-
 	if err := s.setupSync(ctx); err != nil {
 		t.Fatalf("setupSync: %v", err)
 	}
@@ -102,19 +121,14 @@ func TestSetupSyncWiresEverything(t *testing.T) {
 	if s.syncPull == nil {
 		t.Error("syncPull not wired")
 	}
-	if s.m.OnCredWrite == nil {
-		t.Error("Manager.OnCredWrite not wired to the cred mirror")
+	if s.m.SettleCredentialWrite == nil {
+		t.Error("Manager.SettleCredentialWrite not wired")
 	}
 
 	svc := wiredService(t, s)
-	if svc.Sessions == nil {
-		t.Error("svc.Sessions not wired — teardown would defer everything forever")
-	}
-	if svc.Claims == nil {
-		t.Error("svc.Claims not wired")
-	}
-	if svc.Driver == nil || svc.Fetcher == nil || svc.Locals == nil || svc.Mesh == nil || svc.Status == nil {
-		t.Errorf("service incompletely wired: %+v", svc)
+	if svc.M != nil || svc.Locals != nil || svc.Mesh != nil || svc.Sessions != nil ||
+		svc.Remover != nil || svc.Status != nil || svc.Driver != nil || svc.Fetcher != nil || svc.Run != nil {
+		t.Errorf("parent retained an in-process host-sync operation path: %+v", svc)
 	}
 	if want := filepath.Join(pool.SyncDir(), "registry.json"); svc.Registry.Path != want {
 		t.Errorf("registry path = %q, want %q", svc.Registry.Path, want)
@@ -131,6 +145,36 @@ func TestSetupSyncWiresEverything(t *testing.T) {
 	}
 	if caps.Name != "cc-pool" || !hasMethod(caps.Methods, hostsync.MethodFetchCredential) {
 		t.Fatalf("capabilities = %+v, want cc-pool with %s", caps, hostsync.MethodFetchCredential)
+	}
+}
+
+func TestSessionServerRefusesAdmissionWhenSyncPublicationSetupFails(t *testing.T) {
+	s, ctx := newWireServer(t)
+	s.m.BuildCredentialWritePublication = nil
+	s.m.SettleCredentialWrite = nil
+	s.syncSocket = filepath.Join(pool.StateDir(), "missing", "sync.sock")
+	readyCalled := false
+	admitCalled := false
+	admit := func() (func(), error) {
+		admitCalled = true
+		return func() {}, nil
+	}
+
+	err := (&sessionServer{owner: s}).Serve(
+		ctx,
+		nil,
+		func() error { readyCalled = true; return nil },
+		admit,
+		admit,
+	)
+	if err == nil || !strings.Contains(err.Error(), "setup host sync publication") {
+		t.Fatalf("Serve error = %v, want sync-publication setup failure", err)
+	}
+	if readyCalled || admitCalled {
+		t.Fatalf("transport admitted work after setup failure: ready=%v admit=%v", readyCalled, admitCalled)
+	}
+	if s.m.BuildCredentialWritePublication != nil || s.m.SettleCredentialWrite != nil {
+		t.Fatal("failed setup retained partial credential publication wiring")
 	}
 }
 
@@ -152,17 +196,29 @@ func TestSetupSyncStaysInertWhenDisabled(t *testing.T) {
 	}
 	// The refresh gate is now structural (a refresh-token-free synced credential
 	// cannot refresh), so a disabled pool needs no gate to stay syncless.
-	if kind := s.authKind(store.Account{ID: 1, AccountUUID: "u1"}); kind != store.AuthKindOwned {
-		t.Errorf("disabled authKind = %q, want owned (no registry classification)", kind)
+	if kind, err := s.authKind(t.Context(), store.Account{ID: 1, AccountUUID: "u1"}); err != nil || kind != store.AuthKindOwned {
+		t.Errorf("disabled authKind = (%q, %v), want owned (no registry classification)", kind, err)
 	}
 
 	if err := s.syncPull(ctx); err != nil {
 		t.Errorf("disabled syncPull = %v, want a silent no-op", err)
 	}
-	svc := wiredService(t, s)
-	note := s.gatedNote(svc)
-	if err := note(ctx, "u1", hostsync.ChainStamp{ExpiresAt: 42, Hash: "h"}); err != nil {
-		t.Errorf("disabled note = %v, want a silent no-op", err)
+	credential := creds.Credential{}
+	credential.ClaudeAiOauth.AccessToken = "disabled-access"
+	credential.ClaudeAiOauth.RefreshToken = "disabled-refresh"
+	payload, err := s.m.BuildCredentialWritePublication(
+		store.Account{ID: 1, AccountUUID: "u1"},
+		&credential,
+		store.CredentialOperationID{1},
+		time.UnixMilli(1_700_000_000_000),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.SettleCredentialWrite(ctx, pool.CredentialWriteSettlement{
+		OperationID: store.CredentialOperationID{1}, PublicationPayload: payload,
+	}); err != nil {
+		t.Errorf("disabled credential settlement = %v, want a silent no-op", err)
 	}
 	if _, err := os.Stat(pool.SyncDir()); !os.IsNotExist(err) {
 		t.Errorf("disabled sync left residue under %s (stat err %v)", pool.SyncDir(), err)
@@ -187,111 +243,45 @@ func TestSetupSyncStaysInertWhenDisabled(t *testing.T) {
 	}
 }
 
-// TestServerSessionsBusy pins the Sessions seam: live procscan sessions,
-// live reservations, and in-flight conversions all read busy; an idle or
-// unknown uuid reads free; a scan failure propagates so teardown fails closed.
-func TestServerSessionsBusy(t *testing.T) {
-	newSessionsFixture := func(t *testing.T) (*Server, serverSessions) {
-		t.Helper()
-		st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = st.Close() })
-		a := store.Account{
-			ID: 1, ConfigDir: "/cfg/acct-01", OverlayKind: "symlink",
-			KeychainService: "svc", KeychainAccount: "me", AccountUUID: "u1",
-		}
-		if err := st.UpsertAccount(a); err != nil {
-			t.Fatal(err)
-		}
-		s := &Server{
-			m:            &pool.Manager{Store: st},
-			log:          log.New(io.Discard, "", 0),
-			scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
-			cl:           newClaims(),
-		}
-		return s, serverSessions{s: s}
+func TestHostSyncWorkerDeadlineKillsReapsAndReusesLane(t *testing.T) {
+	s, ctx := newWireServer(t)
+	writeWireMeshState(t, "host-mesh", nil)
+	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.setupSync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := (daemonproc.FileLockSpec{
+		Path: s.syncSvc.Registry.LockPath, Mode: daemonproc.FileLockExclusive, Deadline: time.Second,
+	}).Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	cases := map[string]struct {
-		arrange    func(t *testing.T, s *Server)
-		uuid       string
-		wantBusy   bool
-		wantReason string
-		wantErr    bool
-	}{
-		"idle account is free": {
-			arrange: func(*testing.T, *Server) {}, uuid: "u1",
-		},
-		"live session reads busy": {
-			arrange: func(_ *testing.T, s *Server) {
-				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-					return []procscan.Session{{PID: 4242, ConfigDir: "/cfg/acct-01", StartedAt: time.Now()}}, nil
-				}
-			},
-			uuid: "u1", wantBusy: true, wantReason: "live session",
-		},
-		"reservation reads busy": {
-			arrange: func(t *testing.T, s *Server) {
-				if !s.cl.reserve(1) {
-					t.Fatal("tryReserve failed")
-				}
-			},
-			uuid: "u1", wantBusy: true, wantReason: "reserved",
-		},
-		"conversion reads busy": {
-			arrange: func(t *testing.T, s *Server) {
-				if !s.cl.own(1) {
-					t.Fatal("beginConvert failed")
-				}
-			},
-			uuid: "u1", wantBusy: true, wantReason: "conversion",
-		},
-		"unknown uuid is free": {
-			arrange: func(*testing.T, *Server) {}, uuid: "u-elsewhere",
-		},
-		"scan failure fails closed": {
-			arrange: func(_ *testing.T, s *Server) {
-				s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-					return nil, errors.New("ps wedged")
-				}
-			},
-			uuid: "u1", wantErr: true,
-		},
-		"unreadable lease root fails closed as busy": {
-			arrange: func(_ *testing.T, s *Server) {
-				// No live session, no reservation, no conversion — the probe reaches the
-				// session-lease check, whose root is unreadable.
-				s.m.LeaseRoot = func() (string, error) { return "", errors.New("lease root unreadable") }
-			},
-			uuid: "u1", wantBusy: true, wantErr: true,
-		},
+	client := syncservice.NewClient(syncservice.Socket(s.syncSocket))
+	defer func() { _ = client.Close() }()
+	deadline, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	_, reconcileErr := client.Reconcile(deadline, "")
+	cancel()
+	if reconcileErr == nil {
+		t.Fatal("blocked reconcile survived its deadline")
 	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			s, ss := newSessionsFixture(t)
-			tc.arrange(t, s)
-			busy, reason, err := ss.Busy(context.Background(), tc.uuid)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("want an error so teardown defers, got nil")
-				}
-				if tc.wantBusy && !busy {
-					t.Fatal("want busy=true (fail closed) alongside the surfaced error")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("Busy: %v", err)
-			}
-			if busy != tc.wantBusy {
-				t.Fatalf("busy = %v (reason %q), want %v", busy, reason, tc.wantBusy)
-			}
-			if tc.wantReason != "" && !strings.Contains(reason, tc.wantReason) {
-				t.Errorf("reason = %q, want it to mention %q", reason, tc.wantReason)
-			}
-		})
+
+	records, err := (&daemonproc.FileStore{
+		Path: filepath.Join(os.Getenv("HOME"), "workers.json"),
+	}).Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("timed-out host-sync worker retained records: %+v", records)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Reconcile(ctx, ""); err != nil {
+		t.Fatalf("reconcile after reaping timed-out worker: %v", err)
 	}
 }
 
@@ -310,13 +300,22 @@ func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
 	credB.ClaudeAiOauth.RefreshToken = "rt-peer"
 	credB.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
 	acctB := store.Account{
-		ID: 9, ConfigDir: "/cfg/acct-09", OverlayKind: "symlink",
-		KeychainService: "svc9", KeychainAccount: "me", AccountUUID: "u9",
+		ID: 9, ConfigDir: pool.AccountPresentationDir(9),
+		KeychainService: creds.ServiceName(pool.AccountPresentationDir(9)),
+		KeychainAccount: "me", AccountUUID: "u9",
 	}
 	if err := b.m.Store.UpsertAccount(acctB); err != nil {
 		t.Fatal(err)
 	}
-	b.m.Creds.(*credstest.Fake).Put(acctB.KeychainService, acctB.KeychainAccount, credB)
+	if err := os.MkdirAll(acctB.ConfigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(pool.AccountBackingDir(acctB.ID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileCredentialForTest(pool.AccountBackingDir(acctB.ID), credB); err != nil {
+		t.Fatal(err)
+	}
 	if err := b.setupSync(ctxB); err != nil {
 		t.Fatalf("setupSync(B): %v", err)
 	}
@@ -334,13 +333,7 @@ func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
 		t.Fatalf("publish on B: %v", err)
 	}
 
-	// Host A: its own wired engine; B is reachable only as an exec: peer.
-	a, ctxA := newWireServer(t)
-	if err := a.setupSync(ctxA); err != nil {
-		t.Fatalf("setupSync(A): %v", err)
-	}
-
-	reg, err := wiredService(t, a).Fetcher.Fetch(ctxA, peer)
+	reg, err := hostsync.NewSSHFetcher().Fetch(ctxB, peer)
 	if err != nil {
 		t.Fatalf("Fetch via exec peer: %v", err)
 	}
@@ -352,7 +345,7 @@ func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
 		t.Fatalf("fetched chain = %+v, want %+v", entry.Value.Chain, chain)
 	}
 
-	got, err := hostsync.FetchCredential(ctxA, hostsync.PeerTransport, "u9", chain, 0, []string{peer})
+	got, err := hostsync.FetchCredential(ctxB, hostsync.PeerTransport, "u9", chain, 0, []string{peer})
 	if err != nil {
 		t.Fatalf("FetchCredential via exec peer: %v", err)
 	}
@@ -364,13 +357,20 @@ func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
 }
 
 // TestAuthKindClassification pins the persist-time needs-login classification:
-// an entry whose chain origin is this host is owned; a different origin is
-// awaiting-origin; a missing entry, a uuid-less account, and sync-disabled all
-// fall back to owned.
+// this host is owned, an exact mesh peer is awaiting-origin, and missing or
+// foreign origin provenance fails closed. Missing entries, uuid-less accounts,
+// and disabled sync are locally owned.
 func TestAuthKindClassification(t *testing.T) {
 	s, ctx := newWireServer(t)
 	writeWireMeshState(t, "host-self", []string{"peer-b"})
 	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.Store.UpsertAccount(store.Account{
+		ID: 1, ConfigDir: pool.AccountPresentationDir(1),
+		KeychainService: "svc-auth-kind", KeychainAccount: "cc-pool",
+		AccountUUID: "u-self",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.setupSync(ctx); err != nil {
@@ -388,33 +388,25 @@ func TestAuthKindClassification(t *testing.T) {
 	}
 	pub("u-self", "host-self")
 	pub("u-peer", "peer-b")
+	pub("u-foreign", "intruder")
 	// An origin-less entry can only predate the PublishAccount guard (or come
 	// from a foreign writer); seed one as an identity-only value.
 	if err := s.syncSvc.PublishAccount(ctx, hostsync.AccountValue{UUID: "u-noorigin"}); err != nil {
 		t.Fatal(err)
 	}
-	fk := s.m.Creds.(*credstest.Fake)
-	fk.Put("svc-owned", "u", &creds.Credential{ClaudeAiOauth: creds.OAuth{
-		AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1,
-	}})
-	fk.Put("svc-synced", "u", &creds.Credential{ClaudeAiOauth: creds.OAuth{
-		AccessToken: "at", ExpiresAt: 1,
-	}})
-
 	cases := map[string]struct {
 		uuid    string
-		svc     string
 		disable bool
 		want    store.AuthKind
+		wantErr bool
 	}{
-		"origin is self → owned":                     {uuid: "u-self", want: store.AuthKindOwned},
-		"origin is a peer → awaiting":                {uuid: "u-peer", want: store.AuthKindAwaitingOrigin},
-		"no registry entry → owned":                  {uuid: "u-absent", want: store.AuthKindOwned},
-		"no account uuid → owned":                    {uuid: "", want: store.AuthKindOwned},
-		"sync disabled → owned":                      {uuid: "u-peer", disable: true, want: store.AuthKindOwned},
-		"empty origin, owned local chain → owned":    {uuid: "u-noorigin", svc: "svc-owned", want: store.AuthKindOwned},
-		"empty origin, synced local copy → awaiting": {uuid: "u-noorigin", svc: "svc-synced", want: store.AuthKindAwaitingOrigin},
-		"empty origin, no local cred → awaiting":     {uuid: "u-noorigin", svc: "svc-absent", want: store.AuthKindAwaitingOrigin},
+		"origin is self → owned":      {uuid: "u-self", want: store.AuthKindOwned},
+		"origin is a peer → awaiting": {uuid: "u-peer", want: store.AuthKindAwaitingOrigin},
+		"no registry entry → owned":   {uuid: "u-absent", want: store.AuthKindOwned},
+		"no account uuid → owned":     {uuid: "", want: store.AuthKindOwned},
+		"sync disabled → owned":       {uuid: "u-peer", disable: true, want: store.AuthKindOwned},
+		"empty origin is unproven":    {uuid: "u-noorigin", wantErr: true},
+		"foreign origin is unproven":  {uuid: "u-foreign", wantErr: true},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -424,12 +416,24 @@ func TestAuthKindClassification(t *testing.T) {
 				}
 				t.Cleanup(func() { _ = s.m.Store.SetMeta(metaSyncEnabled, "1") })
 			}
+			if tc.uuid != "" {
+				if err := s.m.Store.SetAccountUUID(1, tc.uuid); err != nil {
+					t.Fatal(err)
+				}
+			}
 			a := store.Account{
 				ID: 1, AccountUUID: tc.uuid, ConfigDir: t.TempDir(),
-				KeychainService: tc.svc, KeychainAccount: "u",
+				KeychainService: "svc-auth-kind", KeychainAccount: "cc-pool",
 			}
-			if got := s.authKind(a); got != tc.want {
-				t.Fatalf("authKind(uuid=%q) = %q, want %q", tc.uuid, got, tc.want)
+			got, err := s.authKind(t.Context(), a)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("authKind(uuid=%q) = %q, want error", tc.uuid, got)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("authKind(uuid=%q) = (%q, %v), want %q", tc.uuid, got, err, tc.want)
 			}
 		})
 	}

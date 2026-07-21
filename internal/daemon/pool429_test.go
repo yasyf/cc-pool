@@ -56,8 +56,8 @@ func TestPollOnceCleanSweepArmsNoPoolGate(t *testing.T) {
 // once the window elapses a clean sample resumes polling and clears the gate.
 func TestPollOncePool429GateExpiresAndResumes(t *testing.T) {
 	t.Run("active gate skips the whole sweep", func(t *testing.T) {
-		s, fo := newOutageServer(t, 2)                                               // both accounts would answer cleanly
-		s.led.attempt(poolRateLimitPolicy, poolResource, attemptPrimary, time.Now()) // fresh → inside rlBackoff(1)=3m
+		s, fo := newOutageServer(t, 2)                               // both accounts would answer cleanly
+		s.led.attempt(poolRateLimitPolicy, poolResource, time.Now()) // fresh → inside rlBackoff(1)=3m
 
 		s.pollOnce(t.Context())
 

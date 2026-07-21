@@ -2,6 +2,8 @@ package pool
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -34,17 +36,56 @@ var ErrCredentialChangedUnderfoot = errors.New("stored credential changed under 
 // writing over an unverifiable state could destroy a credential we cannot see.
 var ErrCredentialUnverifiable = errors.New("stored credential unreadable before write-back")
 
+var (
+	errCredentialDeterministicNeedsLogin = errors.New("credential refresh deterministically requires login")
+	errCredentialDeterministicNoTokens   = errors.New("credential refresh deterministically produced no tokens")
+	errCredentialCleanupPending          = errors.New("credential refresh cleanup remains pending")
+)
+
 // EnsureFreshToken returns the account's credential, refreshing it when the access
 // token expires within `within` and allowRefresh is true. allowRefresh must be
 // false for an account with a live session (that session owns refresh).
 func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*creds.Credential, bool, error) {
-	release, err := m.lockAccount(ctx, a.ID)
-	if err != nil {
-		return nil, false, err
-	}
-	defer release()
-	cred, _, refreshed, err := m.ensureFreshToken(ctx, a, within, allowRefresh)
-	return cred, refreshed, err
+	result, err := m.ensureFreshTokenOperation(ctx, a, within, allowRefresh)
+	return result.Credential, result.Refreshed, err
+}
+
+func (m *Manager) ensureFreshTokenOperation(
+	ctx context.Context,
+	a store.Account,
+	within time.Duration,
+	allowRefresh bool,
+) (freshTokenResult, error) {
+	result, err := runCredentialOperation(
+		ctx,
+		m,
+		a,
+		store.CredentialOperationEnsureFresh,
+		freshCredentialOperationCodec(),
+		func(ctx context.Context, boundary *credentialOperationBoundary) (freshTokenResult, error) {
+			credential, source, refreshed, err := m.ensureFreshToken(
+				ctx,
+				a,
+				within,
+				allowRefresh,
+				boundary,
+			)
+			return freshTokenResult{
+				Credential: credential, Source: source, Refreshed: refreshed,
+				RefreshAttempted: boundary.crossed,
+			}, err
+		},
+		within.String(),
+		fmt.Sprintf("%t", allowRefresh),
+	)
+	return result, err
+}
+
+type freshTokenResult struct {
+	Credential       *creds.Credential
+	Source           creds.Source
+	Refreshed        bool
+	RefreshAttempted bool
 }
 
 // ReadCredential resolves a's credential from whichever backend holds it, reading
@@ -52,8 +93,11 @@ func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within 
 // .credentials.json). On drift ownership then freshness decides (see credOutranks) and
 // its Source is returned. When every store misses, creds.ErrUnavailable outranks
 // creds.ErrNotFound. See ccn doc 935d323.
-func (m *Manager) ReadCredential(a store.Account) (*creds.Credential, creds.Source, error) {
-	probes, win, err := m.probeCredentialStores(a)
+func (m *Manager) ReadCredential(
+	ctx context.Context,
+	a store.Account,
+) (*creds.Credential, creds.Source, error) {
+	probes, win, err := m.probeCredentialStores(ctx, a)
 	if err != nil {
 		return nil, creds.SourceKeychain, err
 	}
@@ -68,30 +112,38 @@ func (m *Manager) ReadCredential(a store.Account) (*creds.Credential, creds.Sour
 	return nil, creds.SourceKeychain, fmt.Errorf("no credential in the Keychain or credential file: %w", creds.ErrNotFound)
 }
 
-// writeCred upserts cred on src, then fires OnCredWrite; hook errors are
-// logged and swallowed — the hook may never fail a refresh.
-func (m *Manager) writeCred(a store.Account, src creds.Source, cred *creds.Credential) error {
-	s := m.Creds.Store(a, src)
-	if err := s.Write(cred); err != nil {
-		return fmt.Errorf("write credential to %s: %w", s, err)
+// writeCred upserts cred on src. Durable publication is settled from the
+// terminal credential-operation receipt, never from this external-I/O edge.
+func (m *Manager) writeCred(
+	ctx context.Context,
+	a store.Account,
+	src creds.Source,
+	cred *creds.Credential,
+) error {
+	if boundary == nil {
+		return errors.New("credential mutation boundary is required")
 	}
-	if m.OnCredWrite != nil {
-		if err := m.OnCredWrite(a, cred); err != nil {
-			log.Printf("acct-%d OnCredWrite hook: %v", a.ID, err)
-		}
+	if m.credentialCAS == nil {
+		return errors.New("credential CAS worker is unavailable")
+	}
+	s := m.Creds.Store(a, src)
+	if err := s.Write(ctx, cred); err != nil {
+		return fmt.Errorf("write credential to %s: %w", s, err)
 	}
 	return nil
 }
 
-// writeCredCAS writes next only when the backend still holds prev (both
-// tokens) or, for a nil prev, is still the empty slot the caller decided
-// over. Any divergence — including the credential vanishing under a non-nil
-// prev (a concurrent logout) — aborts with ErrCredentialChangedUnderfoot;
-// unverifiable re-reads with ErrCredentialUnverifiable. Caller must hold the
-// account lock.
-func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prev, next *creds.Credential) error {
+// writeObservedCredential stages publication before crossing the journal fence,
+// then delegates the authoritative compare-and-swap to the refresh-lock worker.
+func (m *Manager) writeObservedCredential(
+	ctx context.Context,
+	a store.Account,
+	src creds.Source,
+	prev, next *creds.Credential,
+	boundary *credentialOperationBoundary,
+) error {
 	s := m.Creds.Store(a, src)
-	cur, err := s.Read()
+	cur, err := s.Read(ctx)
 	switch creds.ClassifyRead(err) {
 	case creds.ReadEmpty:
 		if prev != nil {
@@ -104,16 +156,33 @@ func (m *Manager) writeCredCAS(a store.Account, src creds.Source, prev, next *cr
 			return fmt.Errorf("%w: %s (a concurrent writer owns the newer credential)", ErrCredentialChangedUnderfoot, s)
 		}
 	}
-	// Residual re-read→write TOCTOU vs an in-session claude (separate .oauth_refresh.lock); deferred by design — ccn task 4ed1146.
-	return m.writeCred(a, src, next)
+	if err := boundary.recordCredentialWrite(next); err != nil {
+		return err
+	}
+	if err := boundary.Cross(ctx); err != nil {
+		return err
+	}
+	if _, err := m.credentialCAS(ctx, a, boundary.expected, credentialCASMutation{
+		Target: src, Credential: next,
+	}); err != nil {
+		if errors.Is(err, errCredentialCASConflict) {
+			return ErrCredentialChangedUnderfoot
+		}
+		return err
+	}
+	return nil
 }
 
-// ensureFreshToken requires the caller hold the per-account lock and is itself
-// lock-free so SampleUsage composes it with fetchUsage's 401-retry in one critical
-// section (sync.Mutex is not reentrant). Re-reading the credential under the lock lets
-// a waiter that lost the race skip a redundant refresh POST.
-func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*creds.Credential, creds.Source, bool, error) {
-	cred, src, err := m.ReadCredential(a)
+// ensureFreshToken runs inside one durable credential operation. Re-reading the
+// credential after admission lets a coalesced caller skip a redundant refresh POST.
+func (m *Manager) ensureFreshToken(
+	ctx context.Context,
+	a store.Account,
+	within time.Duration,
+	allowRefresh bool,
+	boundary *credentialOperationBoundary,
+) (*creds.Credential, creds.Source, bool, error) {
+	cred, src, err := m.ReadCredential(ctx, a)
 	if err != nil {
 		if errors.Is(err, creds.ErrNoTokens) || errors.Is(err, creds.ErrNotFound) {
 			return nil, src, false, fmt.Errorf("%w: %w", ErrNeedsLogin, err)
@@ -131,19 +200,63 @@ func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within 
 		}
 		return cred, src, false, ErrUnrefreshable
 	}
-	refreshed, err := m.refresh(ctx, a, src, cred)
+	refreshed, err := m.refresh(ctx, a, src, boundary)
 	if err != nil {
-		_ = m.Store.LogRefresh(a.ID, false, err.Error())
+		category, digest := classifyRefreshOutcome(err)
+		_ = m.Store.LogRefresh(a.ID, category, digest)
 		var re *oauth.RefreshError
-		if errors.As(err, &re) && re.Revoked() {
-			m.stripSpentRefreshToken(a, src, cred, re)
-			return cred, src, false, ErrNeedsLogin
+		if errors.As(err, &re) && re.InvalidGrant() {
+			stripErr := m.stripSpentRefreshToken(ctx, a, src, cred, re, boundary)
+			if stripErr != nil {
+				if current, currentSource, ok := m.concurrentCredentialRotation(ctx, a, cred); ok {
+					return current, currentSource, false, nil
+				}
+				return cred, src, false, errors.Join(
+					err, stripErr, deterministicNeedsLoginError(cred.Strip()),
+					errCredentialCleanupPending,
+				)
+			}
+			return cred, src, false, deterministicNeedsLoginError(cred.Strip())
 		}
 		// Transient: fall back to the stale credential.
 		return cred, src, false, err
 	}
-	_ = m.Store.LogRefresh(a.ID, true, "")
+	_ = m.Store.LogRefresh(a.ID, store.RefreshSucceeded, [32]byte{})
 	return refreshed, src, true, nil
+}
+
+func (m *Manager) concurrentCredentialRotation(
+	ctx context.Context,
+	a store.Account,
+	expected *creds.Credential,
+) (*creds.Credential, creds.Source, bool) {
+	current, source, err := m.ReadCredential(ctx, a)
+	if err != nil || sameTokens(current, expected) {
+		return nil, source, false
+	}
+	return current, source, true
+}
+
+func classifyRefreshOutcome(err error) (store.RefreshCategory, [32]byte) {
+	digest := sha256.Sum256([]byte(err.Error()))
+	switch {
+	case errors.Is(err, context.Canceled):
+		return store.RefreshCanceled, digest
+	case errors.Is(err, oauth.ErrNetwork):
+		return store.RefreshNetwork, digest
+	}
+	var refreshErr *oauth.RefreshError
+	if !errors.As(err, &refreshErr) {
+		return store.RefreshInternal, digest
+	}
+	switch {
+	case refreshErr.InvalidGrant():
+		return store.RefreshInvalidGrant, digest
+	case refreshErr.Status >= 500:
+		return store.RefreshServer, digest
+	default:
+		return store.RefreshRejected, digest
+	}
 }
 
 // stripSpentRefreshToken demotes a server-confirmed dead chain to a
@@ -152,33 +265,64 @@ func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within 
 // tombstone (ErrNoTokens → needs-login). Only invalid_grant strips — a plain
 // 401 may be transient. Best-effort: the CAS aborts if a concurrent
 // login/rotation landed, and needs-login covers any failure.
-func (m *Manager) stripSpentRefreshToken(a store.Account, src creds.Source, cred *creds.Credential, re *oauth.RefreshError) {
+func (m *Manager) stripSpentRefreshToken(
+	ctx context.Context,
+	a store.Account,
+	src creds.Source,
+	cred *creds.Credential,
+	re *oauth.RefreshError,
+	boundary *credentialOperationBoundary,
+) error {
 	if !re.InvalidGrant() {
-		return
+		return nil
 	}
-	if err := m.writeCredCAS(a, src, cred, cred.Strip()); err != nil {
+	if err := m.writeObservedCredential(ctx, a, src, cred, cred.Strip(), boundary); err != nil {
 		log.Printf("acct-%d strip spent refresh token: %v", a.ID, err)
+		return err
 	}
+	return nil
+}
+
+func deterministicNeedsLoginError(credential *creds.Credential) error {
+	if credential.ClaudeAiOauth.AccessToken == "" && !credential.HasRefreshToken() {
+		return errors.Join(
+			ErrNeedsLogin, creds.ErrNoTokens, errCredentialDeterministicNoTokens,
+		)
+	}
+	return errors.Join(ErrNeedsLogin, errCredentialDeterministicNeedsLogin)
 }
 
 // refresh performs the OAuth refresh and persists the new blob, preserving the prior
-// credential's non-token fields. Caller must hold the per-account lock. Each account
-// runs its own token chain, so refreshing a pool account never touches plain claude.
-func (m *Manager) refresh(ctx context.Context, a store.Account, src creds.Source, prev *creds.Credential) (*creds.Credential, error) {
-	tr, err := m.OAuth.Refresh(ctx, fmt.Sprintf("acct-%d", a.ID), prev.ClaudeAiOauth.RefreshToken)
+// credential's non-token fields. Each account runs its own token chain, so
+// refreshing a pool account never touches plain claude.
+func (m *Manager) refresh(
+	ctx context.Context,
+	a store.Account,
+	src creds.Source,
+	boundary *credentialOperationBoundary,
+) (*creds.Credential, error) {
+	if m.credentialCAS == nil {
+		return nil, errors.New("credential CAS worker is unavailable")
+	}
+	if err := boundary.Cross(ctx); err != nil {
+		return nil, err
+	}
+	proof, err := m.credentialCAS(ctx, a, boundary.expected, credentialCASMutation{
+		Target: src, Refresh: true,
+	})
 	if err != nil {
+		if errors.Is(err, errCredentialCASConflict) {
+			return nil, ErrCredentialChangedUnderfoot
+		}
 		return nil, err
 	}
-	next := &creds.Credential{ClaudeAiOauth: prev.ClaudeAiOauth}
-	next.ClaudeAiOauth.AccessToken = tr.AccessToken
-	if tr.RefreshToken != "" { // rotated
-		next.ClaudeAiOauth.RefreshToken = tr.RefreshToken
+	if proof.Credential == nil {
+		return nil, errors.New("credential refresh worker returned no credential")
 	}
-	next.ClaudeAiOauth.ExpiresAt = tr.Expiry(time.Now()).UnixMilli()
-	if err := m.writeCredCAS(a, src, prev, next); err != nil {
+	if err := boundary.recordCredentialWrite(proof.Credential); err != nil {
 		return nil, err
 	}
-	return next, nil
+	return proof.Credential, nil
 }
 
 // AdoptRotatedToken re-reads an account's credential (a live session may have rotated
@@ -186,16 +330,39 @@ func (m *Manager) refresh(ctx context.Context, a store.Account, src creds.Source
 // Keychain item; on the file backend it is a harmless no-ACL rewrite. The write-back
 // is CAS-guarded against a concurrent `claude /login`.
 func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error {
-	release, err := m.lockAccount(ctx, a.ID)
+	if err := m.requireCredentialMutationAllowed(a); err != nil {
+		return err
+	}
+	_, source, err := m.ReadCredential(ctx, a)
 	if err != nil {
 		return err
 	}
-	defer release()
-	cred, src, err := m.ReadCredential(a)
-	if err != nil {
-		return err
+	_, err = runCredentialOperation(
+		ctx,
+		m,
+		a,
+		store.CredentialOperationAdoptRotated,
+		unitCredentialOperationCodec(store.CredentialOperationAdoptRotated, credentialTarget(source)),
+		func(ctx context.Context, boundary *credentialOperationBoundary) (struct{}, error) {
+			return struct{}{}, m.adoptRotatedToken(ctx, a, source, boundary)
+		},
+	)
+	return err
+}
+
+func (m *Manager) adoptRotatedToken(
+	ctx context.Context,
+	a store.Account,
+	expectedSource creds.Source,
+	boundary *credentialOperationBoundary,
+) error {
+	credential, source, err := m.ReadCredential(ctx, a)
+	if err != nil || source != expectedSource {
+		return errors.Join(ErrCredentialChangedUnderfoot, err)
 	}
-	return m.writeCredCAS(a, src, cred, cred)
+	return m.writeObservedCredential(
+		ctx, a, source, credential, credential, boundary,
+	)
 }
 
 // SampleOpts controls how SampleUsage may recover a 401. AllowRefresh permits the
@@ -219,16 +386,30 @@ func (m *Manager) SampleUsage(ctx context.Context, a store.Account, opts SampleO
 	return usage, rateLimited, retryAfter, nil
 }
 
-// sampleUsage holds acctLock across the whole credential span so the pre-flight refresh
-// and fetchUsage's 401-retry form one atomic cycle; else a peer could rotate the token
-// between them and the retry would re-POST a consumed single-use refresh token.
-func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleOpts) (*oauth.Usage, bool, time.Duration, error) {
-	release, err := m.lockAccount(ctx, a.ID)
-	if err != nil {
-		return nil, false, 0, err
+// ProbeUsageReachability performs one read-only usage request with the stored
+// access token. It never refreshes or records a sample; outage recovery uses it
+// when durable credential evidence returned without any network I/O.
+func (m *Manager) ProbeUsageReachability(
+	ctx context.Context,
+	a store.Account,
+) (probed, rateLimited bool, retryAfter time.Duration, err error) {
+	credential, _, readErr := m.ReadCredential(ctx, a)
+	if readErr != nil || credential == nil || credential.ClaudeAiOauth.AccessToken == "" || m.OAuth == nil {
+		return false, false, 0, readErr
 	}
-	defer release()
-	cred, src, _, freshErr := m.ensureFreshToken(ctx, a, RefreshLeadTime, opts.AllowRefresh)
+	_, err = m.OAuth.Usage(ctx, credential.ClaudeAiOauth.AccessToken)
+	var usageErr *oauth.UsageError
+	if errors.As(err, &usageErr) && usageErr.RateLimited() {
+		return true, true, usageErr.RetryAfter, nil
+	}
+	return true, false, 0, err
+}
+
+// sampleUsage serializes only credential refresh/mutation. The usage request is
+// ordinary network I/O and never occupies the account's durable credential lane.
+func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleOpts) (*oauth.Usage, bool, time.Duration, error) {
+	fresh, freshErr := m.ensureFreshTokenOperation(ctx, a, RefreshLeadTime, opts.AllowRefresh)
+	cred, src := fresh.Credential, fresh.Source
 	if cred == nil {
 		return nil, false, 0, freshErr
 	}
@@ -239,11 +420,26 @@ func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleO
 	if errors.Is(freshErr, ErrUnrefreshable) {
 		return nil, false, 0, freshErr
 	}
-	usage, rateLimited, retryAfter, err := m.fetchUsage(ctx, a, src, cred, opts)
+	fetchOpts := opts
+	if fresh.RefreshAttempted {
+		fetchOpts.AllowRefresh = false
+		fetchOpts.AllowBusyRefresh = false
+	}
+	usage, rateLimited, retryAfter, err := m.fetchUsage(ctx, a, src, cred, fetchOpts)
+	replayedLiveProbe := errors.Is(freshErr, ErrCredentialOperationReplayed) &&
+		(err != nil || rateLimited)
+	if replayedLiveProbe {
+		freshErr = errors.Join(freshErr, err, ErrCredentialOperationLiveProbe)
+	}
 	// A confirmed pre-flight revocation must not be masked by a usage-endpoint 429 or
 	// transient 401; a clean fetchUsage recovery suppresses it (a session may have rotated).
 	if errors.Is(freshErr, ErrNeedsLogin) && (err != nil || rateLimited) {
 		return nil, false, 0, freshErr
+	}
+	if err != nil && replayedLiveProbe {
+		err = errors.Join(
+			err, ErrCredentialOperationReplayed, ErrCredentialOperationLiveProbe,
+		)
 	}
 	return usage, rateLimited, retryAfter, err
 }
@@ -257,7 +453,8 @@ func sameTokens(a, b *creds.Credential) bool {
 
 // fetchUsage fetches usage and, on a 401, walks a recovery ladder: re-read for a
 // session-rotated token, else signed-out (ErrNeedsLogin), else refresh+retry when
-// permitted. Caller must hold the per-account lock.
+// permitted. Usage I/O stays outside the durable lane; only the guarded refresh
+// enters a credential operation.
 func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src creds.Source, cred *creds.Credential, opts SampleOpts) (*oauth.Usage, bool, time.Duration, error) {
 	usage, err := m.OAuth.Usage(ctx, cred.ClaudeAiOauth.AccessToken)
 	if err == nil {
@@ -274,7 +471,7 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src creds.Sou
 		return nil, false, 0, err
 	}
 
-	if reread, _, rerr := m.ReadCredential(a); rerr == nil && reread.ClaudeAiOauth.AccessToken != cred.ClaudeAiOauth.AccessToken {
+	if reread, _, rerr := m.ReadCredential(ctx, a); rerr == nil && reread.ClaudeAiOauth.AccessToken != cred.ClaudeAiOauth.AccessToken {
 		if usage, err2 := m.OAuth.Usage(ctx, reread.ClaudeAiOauth.AccessToken); err2 == nil {
 			return usage, false, 0, nil
 		}
@@ -289,7 +486,7 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src creds.Sou
 	// on a fresh re-read.
 	mayRefresh := opts.AllowRefresh
 	if !mayRefresh && opts.AllowBusyRefresh && cred.Expired() {
-		if reread, _, rerr := m.ReadCredential(a); rerr == nil && sameTokens(reread, cred) {
+		if reread, _, rerr := m.ReadCredential(ctx, a); rerr == nil && sameTokens(reread, cred) {
 			mayRefresh = true
 		}
 	}
@@ -297,26 +494,74 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src creds.Sou
 		return nil, false, 0, err
 	}
 
-	refreshed, rfErr := m.refresh(ctx, a, src, cred)
+	fresh, rfErr := m.refreshCurrentCredentialOperation(ctx, a, src, cred)
 	if rfErr != nil {
-		_ = m.Store.LogRefresh(a.ID, false, rfErr.Error())
-		var re *oauth.RefreshError
-		if errors.As(rfErr, &re) && re.Revoked() {
-			// Revoked: a differing on-disk credential means a session rotated the chain
-			// (transient); unchanged means genuine server-side revocation.
-			if reread, _, rerr := m.ReadCredential(a); rerr == nil && !sameTokens(reread, cred) {
-				return nil, false, 0, err
-			}
-			m.stripSpentRefreshToken(a, src, cred, re)
-			return nil, false, 0, fmt.Errorf("%w: %w", ErrNeedsLogin, rfErr)
+		if errors.Is(rfErr, ErrNeedsLogin) {
+			return nil, false, 0, rfErr
 		}
 		return nil, false, 0, err
 	}
-	_ = m.Store.LogRefresh(a.ID, true, "")
-	if usage, err2 := m.OAuth.Usage(ctx, refreshed.ClaudeAiOauth.AccessToken); err2 == nil {
+	if fresh.Credential == nil {
+		return nil, false, 0, err
+	}
+	if usage, err2 := m.OAuth.Usage(ctx, fresh.Credential.ClaudeAiOauth.AccessToken); err2 == nil {
 		return usage, false, 0, nil
 	}
 	return nil, false, 0, err
+}
+
+func (m *Manager) refreshCurrentCredentialOperation(
+	ctx context.Context,
+	a store.Account,
+	source creds.Source,
+	expected *creds.Credential,
+) (freshTokenResult, error) {
+	fingerprint := sha256.Sum256([]byte(expected.ClaudeAiOauth.AccessToken + "\x00" + expected.ClaudeAiOauth.RefreshToken))
+	return runCredentialOperation(
+		ctx,
+		m,
+		a,
+		store.CredentialOperationRefreshCurrent,
+		freshCredentialOperationCodec(),
+		func(ctx context.Context, boundary *credentialOperationBoundary) (result freshTokenResult, resultErr error) {
+			defer func() { result.RefreshAttempted = boundary.crossed }()
+			current, currentSource, err := m.ReadCredential(ctx, a)
+			if err != nil {
+				return freshTokenResult{}, err
+			}
+			if !sameTokens(current, expected) {
+				return freshTokenResult{Credential: current, Source: currentSource}, nil
+			}
+			refreshed, err := m.refresh(ctx, a, source, boundary)
+			if err == nil {
+				_ = m.Store.LogRefresh(a.ID, store.RefreshSucceeded, [32]byte{})
+				return freshTokenResult{Credential: refreshed, Source: source, Refreshed: true}, nil
+			}
+			category, digest := classifyRefreshOutcome(err)
+			_ = m.Store.LogRefresh(a.ID, category, digest)
+			var refreshErr *oauth.RefreshError
+			if errors.As(err, &refreshErr) && refreshErr.InvalidGrant() {
+				if reread, rereadSource, readErr := m.ReadCredential(ctx, a); readErr == nil && !sameTokens(reread, current) {
+					return freshTokenResult{Credential: reread, Source: rereadSource}, nil
+				}
+				stripErr := m.stripSpentRefreshToken(ctx, a, source, current, refreshErr, boundary)
+				if stripErr != nil {
+					if reread, rereadSource, ok := m.concurrentCredentialRotation(ctx, a, current); ok {
+						return freshTokenResult{Credential: reread, Source: rereadSource}, nil
+					}
+					return freshTokenResult{Credential: current, Source: source, RefreshAttempted: true}, errors.Join(
+						err, stripErr, deterministicNeedsLoginError(current.Strip()),
+						errCredentialCleanupPending,
+					)
+				}
+				return freshTokenResult{Credential: current, Source: source, RefreshAttempted: true}, errors.Join(
+					err, deterministicNeedsLoginError(current.Strip()),
+				)
+			}
+			return freshTokenResult{Credential: current, Source: source, RefreshAttempted: true}, err
+		},
+		hex.EncodeToString(fingerprint[:]),
+	)
 }
 
 // recordSample persists a usage sample (utilization stored as 0..100 percent).

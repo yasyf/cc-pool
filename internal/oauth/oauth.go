@@ -6,6 +6,7 @@ package oauth
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,6 +78,7 @@ type Client struct {
 	http      *http.Client
 	tokenURL  string
 	usageURL  string
+	userAgent string
 	refreshSF singleflight.Group
 }
 
@@ -89,6 +91,26 @@ func New() *Client {
 		tokenURL: endpointOverride("CLAUDE_POOL_TOKEN_URL", tokenEndpoint),
 		usageURL: endpointOverride("CLAUDE_POOL_USAGE_URL", usageEndpoint),
 	}
+}
+
+// CurrentUserAgent returns the exact process-configured OAuth User-Agent.
+func CurrentUserAgent() string { return userAgent() }
+
+// NewWithUserAgent returns a client pinned to one exact non-empty User-Agent.
+func NewWithUserAgent(value string) (*Client, error) {
+	if strings.TrimSpace(value) == "" || strings.ContainsAny(value, "\r\n") {
+		return nil, errors.New("OAuth User-Agent is invalid")
+	}
+	client := New()
+	client.userAgent = value
+	return client, nil
+}
+
+func (c *Client) requestUserAgent() string {
+	if c.userAgent != "" {
+		return c.userAgent
+	}
+	return userAgent()
 }
 
 // endpointOverride returns the env override when non-empty, else def.
@@ -113,32 +135,24 @@ func (t *TokenResponse) Expiry(now time.Time) time.Time {
 	return now.Add(time.Duration(t.ExpiresIn) * time.Second)
 }
 
-// RefreshError carries the HTTP status and the OAuth error code so callers can
-// distinguish a revoked token (4xx -> re-login needed) from a transient failure
-// (5xx/network), and a server-confirmed invalid_grant from any other 4xx.
+// RefreshError carries only typed classification and a response digest so
+// callers can distinguish revocation from transient failure without retaining
+// or logging response bytes.
 type RefreshError struct {
-	Status int
-	Body   string
-	// Code is the OAuth error code from the response body's {"error":"..."};
-	// "" when the body carried none.
-	Code string
+	Status                int
+	ResponseDigest        [32]byte
+	ConfirmedInvalidGrant bool
 }
 
 func (e *RefreshError) Error() string {
-	return fmt.Sprintf("oauth refresh failed: HTTP %d: %s", e.Status, e.Body)
-}
-
-// Revoked reports whether the error indicates the refresh token is no longer
-// valid (invalid_grant / 400 / 401), meaning the account must be re-logged-in.
-func (e *RefreshError) Revoked() bool {
-	return e.Status == http.StatusBadRequest || e.Status == http.StatusUnauthorized
+	return fmt.Sprintf("oauth refresh failed: HTTP %d response=%x", e.Status, e.ResponseDigest[:8])
 }
 
 // InvalidGrant reports whether the server confirmed the refresh token spent or
 // revoked (error code invalid_grant) — the only refresh outcome that may
 // destroy local state; a plain 401 might be transient.
 func (e *RefreshError) InvalidGrant() bool {
-	return e.Code == "invalid_grant"
+	return e.ConfirmedInvalidGrant
 }
 
 // Refresh exchanges a refresh token for a fresh access token. Calls sharing
@@ -166,7 +180,7 @@ func (c *Client) refresh(ctx context.Context, refreshToken string) (*TokenRespon
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", userAgent())
+	req.Header.Set("User-Agent", c.requestUserAgent())
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -176,7 +190,10 @@ func (c *Client) refresh(ctx context.Context, refreshToken string) (*TokenRespon
 	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, &RefreshError{Status: resp.StatusCode, Body: truncate(string(raw), 300), Code: oauthErrorCode(raw)}
+		return nil, &RefreshError{
+			Status: resp.StatusCode, ResponseDigest: sha256.Sum256(raw),
+			ConfirmedInvalidGrant: oauthErrorCode(raw) == "invalid_grant",
+		}
 	}
 	// A status line arrived, so a non-200 above is a proven API answer; a read
 	// error only past that point is a transport failure mid-body — classify it
@@ -376,14 +393,14 @@ func (re *rawExtraUsage) toExtraUsage() ExtraUsage {
 
 // UsageError carries the HTTP status from a failed usage fetch.
 type UsageError struct {
-	Status int
-	Body   string
+	Status         int
+	ResponseDigest [32]byte
 	// RetryAfter is the server's Retry-After hint (0 when absent or unparseable).
 	RetryAfter time.Duration
 }
 
 func (e *UsageError) Error() string {
-	return fmt.Sprintf("oauth usage failed: HTTP %d: %s", e.Status, e.Body)
+	return fmt.Sprintf("oauth usage failed: HTTP %d response=%x", e.Status, e.ResponseDigest[:8])
 }
 
 // RateLimited reports whether the usage fetch itself was rate-limited (429).
@@ -402,7 +419,7 @@ func (c *Client) Usage(ctx context.Context, accessToken string) (*Usage, error) 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("anthropic-beta", betaHeader)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", userAgent())
+	req.Header.Set("User-Agent", c.requestUserAgent())
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -413,9 +430,9 @@ func (c *Client) Usage(ctx context.Context, accessToken string) (*Usage, error) 
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, &UsageError{
-			Status:     resp.StatusCode,
-			Body:       truncate(string(raw), 300),
-			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+			Status:         resp.StatusCode,
+			ResponseDigest: sha256.Sum256(raw),
+			RetryAfter:     parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 		}
 	}
 	// A status line arrived, so a non-200 above is a proven API answer; a read
@@ -494,11 +511,4 @@ func oauthErrorCode(raw []byte) string {
 		return ""
 	}
 	return body.Error
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }

@@ -32,13 +32,26 @@ func (m *Manager) MoveCredential(ctx context.Context, a store.Account, target cr
 	if target != creds.SourceKeychain && target != creds.SourceFile {
 		return nil, fmt.Errorf("unknown credential backend %d: move target must be the keychain or the plaintext file", target)
 	}
-	release, err := m.lockAccount(ctx, a.ID)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
+	return runCredentialOperation(
+		ctx,
+		m,
+		a,
+		store.CredentialOperationMove,
+		moveCredentialOperationCodec(target),
+		func(ctx context.Context, boundary *credentialOperationBoundary) (*CredMove, error) {
+			return m.moveCredential(ctx, a, target, boundary)
+		},
+		target.String(),
+	)
+}
 
-	probes, win, err := m.probeCredentialStores(a)
+func (m *Manager) moveCredential(
+	ctx context.Context,
+	a store.Account,
+	target creds.Source,
+	boundary *credentialOperationBoundary,
+) (*CredMove, error) {
+	probes, win, err := m.probeCredentialStores(ctx, a)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +66,7 @@ func (m *Manager) MoveCredential(ctx context.Context, a store.Account, target cr
 
 	src := win.store.Source()
 	if src == target {
-		return alreadyOnTarget(probes, target)
+		return alreadyOnTarget(ctx, probes, target, boundary)
 	}
 	if target == creds.SourceKeychain {
 		// src is the file, so the Keychain probe missed. ErrNotFound proved the
@@ -65,23 +78,26 @@ func (m *Manager) MoveCredential(ctx context.Context, a store.Account, target cr
 		}
 	}
 
-	dst := m.Creds.Store(a, target)
-	if err := dst.Write(win.cred); err != nil {
-		return nil, fmt.Errorf("write credential to %s: %w", dst, err)
+	if err := boundary.recordCredentialWrite(win.cred); err != nil {
+		return nil, err
 	}
-	readback, err := dst.Read()
-	if err != nil {
-		return nil, unwindTarget(dst, fmt.Errorf("read back credential from %s: %w", dst, err))
+	if err := boundary.Cross(ctx); err != nil {
+		return nil, err
 	}
-	if !sameTokens(readback, win.cred) {
-		return nil, unwindTarget(dst, fmt.Errorf("credential read back from %s does not match what was written", dst))
+	if m.credentialCAS == nil {
+		return nil, errors.New("credential CAS worker is unavailable")
 	}
-	if err := win.store.Delete(); err != nil {
-		derr := fmt.Errorf("delete source credential at %s: %w", win.store, err)
-		if rerr := dst.Delete(); rerr != nil {
-			return nil, errors.Join(derr, fmt.Errorf("roll back target copy at %s: %w", dst, rerr))
+	var rollback *creds.Credential
+	if targetProbe := probeBySource(probes, target); targetProbe != nil && targetProbe.cred != nil {
+		rollback = targetProbe.cred
+	}
+	if _, err := m.credentialCAS(ctx, a, boundary.expected, credentialCASMutation{
+		Target: target, Credential: win.cred, DeleteOther: true, RollbackTarget: rollback,
+	}); err != nil {
+		if errors.Is(err, errCredentialCASConflict) {
+			return nil, ErrCredentialChangedUnderfoot
 		}
-		return nil, fmt.Errorf("%w (rolled back the copy at %s; the credential stays at %s)", derr, dst, win.store)
+		return nil, err
 	}
 	return &CredMove{From: src, To: target, Moved: true}, nil
 }
@@ -91,12 +107,15 @@ func (m *Manager) MoveCredential(ctx context.Context, a store.Account, target cr
 // hit — MoveCredential also needs the losers' state. win is the highest-ranked
 // clean read per credOutranks (Keychain first on a tie), or nil when every store
 // missed. See ccn doc 935d323.
-func (m *Manager) probeCredentialStores(a store.Account) ([]credProbe, *credProbe, error) {
+func (m *Manager) probeCredentialStores(
+	ctx context.Context,
+	a store.Account,
+) ([]credProbe, *credProbe, error) {
 	stores := m.Creds.Stores(a)
 	probes := make([]credProbe, len(stores))
 	winIdx := -1
 	for i, s := range stores {
-		cred, err := s.Read()
+		cred, err := s.Read(ctx)
 		probes[i] = credProbe{store: s, cred: cred, err: err}
 		switch {
 		case err == nil:
@@ -131,17 +150,39 @@ func credOutranks(a, b *creds.Credential) bool {
 // alreadyOnTarget finishes a MoveCredential whose winning credential already
 // resolves to the target backend. Nothing moves, but the losing copy on the
 // OTHER backend is deleted: it is the diverged shadow a later headless session
-// would resurrect. Any non-absent, reachable outcome — a parsed credential or a
-// hard read error (corrupt JSON) — counts as presence; content is never
-// compared, because the winner already outranks it. A copy we cannot reach (an
-// unsearchable Keychain, ErrUnavailable) is left untouched.
-func alreadyOnTarget(probes []credProbe, target creds.Source) (*CredMove, error) {
+// would resurrect. Only an exactly readable shadow is deletable; corrupt or
+// unreachable state fails closed.
+func alreadyOnTarget(
+	ctx context.Context,
+	probes []credProbe,
+	target creds.Source,
+	boundary *credentialOperationBoundary,
+) (*CredMove, error) {
 	out := &CredMove{From: target, To: target}
 	stray := probeBySource(probes, otherSource(target))
 	if !strayPresent(stray) {
 		return out, nil
 	}
-	if err := stray.store.Delete(); err != nil {
+	if stray.err != nil || stray.cred == nil {
+		return nil, fmt.Errorf("%w: cannot fingerprint stray credential at %s", ErrCredentialUnverifiable, stray.store)
+	}
+	if err := boundary.Cross(ctx); err != nil {
+		return nil, err
+	}
+	if boundary.manager.credentialCAS != nil {
+		if _, err := boundary.manager.credentialCAS(
+			ctx, boundary.account, boundary.expected,
+			credentialCASMutation{Target: stray.store.Source(), DeleteTarget: true},
+		); err != nil {
+			if errors.Is(err, errCredentialCASConflict) {
+				return nil, ErrCredentialChangedUnderfoot
+			}
+			return nil, err
+		}
+		out.CleanedStray = true
+		return out, nil
+	}
+	if err := stray.store.Delete(ctx); err != nil {
 		return nil, fmt.Errorf("delete stray credential copy at %s: %w", stray.store, err)
 	}
 	out.CleanedStray = true
@@ -156,13 +197,34 @@ func alreadyOnTarget(probes []credProbe, target creds.Source) (*CredMove, error)
 // it. No credential anywhere, or nothing on the other backend, is a no-op,
 // not an error.
 func (m *Manager) DropDivergentCopy(ctx context.Context, a store.Account) error {
-	release, err := m.lockAccount(ctx, a.ID)
-	if err != nil {
-		return err
+	target := store.CredentialTargetKeychain
+	if probes, win, probeErr := m.probeCredentialStores(ctx, a); probeErr == nil && win != nil {
+		stray := probeBySource(probes, otherSource(win.store.Source()))
+		if strayPresent(stray) {
+			target = credentialTarget(stray.store.Source())
+		} else {
+			target = credentialTarget(win.store.Source())
+		}
 	}
-	defer release()
+	_, err := runCredentialOperation(
+		ctx,
+		m,
+		a,
+		store.CredentialOperationDropDivergent,
+		unitCredentialOperationCodec(store.CredentialOperationDropDivergent, target),
+		func(ctx context.Context, boundary *credentialOperationBoundary) (struct{}, error) {
+			return struct{}{}, m.dropDivergentCopy(ctx, a, boundary)
+		},
+	)
+	return err
+}
 
-	probes, win, err := m.probeCredentialStores(a)
+func (m *Manager) dropDivergentCopy(
+	ctx context.Context,
+	a store.Account,
+	boundary *credentialOperationBoundary,
+) error {
+	probes, win, err := m.probeCredentialStores(ctx, a)
 	if err != nil {
 		return err
 	}
@@ -173,7 +235,26 @@ func (m *Manager) DropDivergentCopy(ctx context.Context, a store.Account) error 
 	if !strayPresent(stray) {
 		return nil
 	}
-	if err := stray.store.Delete(); err != nil {
+	if stray.err != nil || stray.cred == nil {
+		return fmt.Errorf("%w: cannot fingerprint divergent credential at %s", ErrCredentialUnverifiable, stray.store)
+	}
+	if boundary != nil {
+		if err := boundary.Cross(ctx); err != nil {
+			return err
+		}
+		if m.credentialCAS != nil {
+			if _, err := m.credentialCAS(ctx, a, boundary.expected, credentialCASMutation{
+				Target: stray.store.Source(), DeleteTarget: true,
+			}); err != nil {
+				if errors.Is(err, errCredentialCASConflict) {
+					return ErrCredentialChangedUnderfoot
+				}
+				return err
+			}
+			return nil
+		}
+	}
+	if err := stray.store.Delete(ctx); err != nil {
 		return fmt.Errorf("drop divergent credential copy at %s: %w", stray.store, err)
 	}
 	return nil
@@ -205,13 +286,4 @@ func probeBySource(probes []credProbe, src creds.Source) *credProbe {
 		}
 	}
 	return nil
-}
-
-// unwindTarget deletes an unverified target copy so the source stays the only
-// live credential, joining a failed delete onto cause.
-func unwindTarget(dst creds.Store, cause error) error {
-	if err := dst.Delete(); err != nil {
-		return errors.Join(cause, fmt.Errorf("delete unverified target copy at %s: %w", dst, err))
-	}
-	return cause
 }

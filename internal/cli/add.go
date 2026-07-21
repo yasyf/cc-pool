@@ -3,27 +3,22 @@ package cli
 import (
 	"errors"
 	"fmt"
-	"io"
-	"os/exec"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 type addOptions struct {
 	label   string
-	runNow  bool
 	autoYes bool
 	count   int
 	noAlias bool
 }
-
-// errAddSkipped: the user declined to add an already-pooled subscription; not a failure.
-var errAddSkipped = errors.New("add skipped")
 
 func newAddCmd() *cobra.Command {
 	var opts addOptions
@@ -40,22 +35,17 @@ On a fresh machine, add also sets up the pool and starts the background daemon,
 so you do not need a separate ` + "`ccp init`" + `.
 
 Run it without flags to add accounts one at a time; it offers to add another
-after each. Use --count to add a set number, or -y to add one and log in right
-away.
-
-When the login prompt can't run here (a non-interactive shell), add prints a
-command to run elsewhere and holds the new account's overlay with a session lease
-tied to THIS terminal. Keep this terminal open until the login finishes: closing
-it releases the lease even if the login is still going in another terminal.`,
+after each. Use --count to add a set number, or -y to add one. The terminal is
+attached to a daemon-supervised login process; the CLI never opens credential
+stores or owns the login child.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				return runAdd(cmd, m, opts)
 			})
 		},
 	}
 	cmd.Flags().StringVar(&opts.label, "label", "", "name for the first account")
-	cmd.Flags().BoolVar(&opts.runNow, "run-login", false, "log in immediately instead of asking how")
 	cmd.Flags().BoolVarP(&opts.autoYes, "yes", "y", false, "add one account and log in right away")
 	cmd.Flags().IntVar(&opts.count, "count", 0, "add exactly N accounts, no continue prompt")
 	cmd.Flags().BoolVar(&opts.noAlias, "no-alias", false, "don't add a `claude` shell alias")
@@ -67,6 +57,11 @@ func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 	if err := ensureReady(cmd, m); err != nil {
 		return err
 	}
+	cl, err := requireDaemon(m, "account and credential mutation runs inside the daemon")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cl.Close() }()
 	var added []store.Account
 	for i := 0; ; i++ {
 		if h := accountHeader(i+1, opts); h != "" && isTTY() {
@@ -76,11 +71,8 @@ func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 		if i == 0 {
 			lbl = opts.label
 		}
-		acct, err := addOne(cmd, m, lbl, opts)
+		acct, err := addOne(cmd, m, cl, lbl, opts)
 		if err != nil {
-			if errors.Is(err, errAddSkipped) {
-				break
-			}
 			if len(added) == 0 {
 				return err
 			}
@@ -105,216 +97,42 @@ func ensureReady(cmd *cobra.Command, m *pool.Manager) error {
 		return err
 	}
 	if !ok {
-		res, err := m.Init()
+		_, err := m.Init()
 		if err != nil {
 			return err
 		}
 		success(cmd.OutOrStdout(), "Set up cc-pool on this machine.")
-		reportOverlayChoice(cmd, res)
 	}
 	ensureDaemon(cmd)
 	return nil
 }
 
-func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) (*store.Account, error) {
+func addOne(cmd *cobra.Command, m *pool.Manager, cl *daemon.Client, label string, opts addOptions) (*store.Account, error) {
 	out := cmd.OutOrStdout()
-	var pending *pool.PendingAdd
-	if err := withSpinner(out, "preparing the account…", func() error {
-		var e error
-		pending, e = m.PrepareAdd(cmd.Context())
-		return e
-	}); err != nil {
-		diagnoseFPAddFailure(cmd, m, err)
-		return nil, err
-	}
-	if pending.FallbackReason != "" {
-		warn(cmd.ErrOrStderr(), "fuse overlay unavailable (%s); using symlinks", pending.FallbackReason)
-	}
-	noteFuseFirstMount(out, pending.OverlayKind)
-
-	if err := loginFlow(cmd, pending, opts); err != nil {
-		releaseKeptAdd(cmd, m, pending)
-		return nil, err
-	}
-	// Decorative acknowledgment; identity-read failures stay silent, and the
-	// non-TTY contract (script-parsed output) is unchanged.
-	if isTTY() {
-		if id, err := pool.AccountIdentity(pending.OverlayKind, pending.ConfigDir); err == nil {
-			if id.EmailAddress != "" {
-				success(out, "Logged in as %s.", id.EmailAddress)
-			} else {
-				success(out, "Logged in.")
-			}
-		}
-	}
-
-	if checkDuplicate(cmd, m, pending, opts) {
-		note(out, "Skipped; didn't add a duplicate.")
-		if aerr := m.AbandonAdd(cmd.Context(), pending); aerr != nil {
-			warn(cmd.ErrOrStderr(), "cleanup failed: %v", aerr)
-		}
-		return nil, errAddSkipped
-	}
-
-	prompt := label == "" && isTTY() && !opts.autoYes
-	label = defaultLabel(label, pending.OverlayKind, pending.ConfigDir)
-	if prompt {
-		_ = huh.NewInput().
-			Title("Name for this account (optional)").
-			Placeholder("e.g. Work, or an email").
-			Value(&label).
-			WithTheme(ccpTheme()).
-			Run()
-	}
-
-	acct, err := m.FinalizeAdd(cmd.Context(), pending, label)
+	loginURL := &terminalURLAction{}
+	result, err := cl.AccountMutationTerminal(cmd.Context(), daemon.AccountMutationRequest{
+		Kind: daemon.AccountMutationAdd, Action: daemon.AccountMutationStartOrAttach,
+		Label: label,
+	}, os.Stdin, out, loginURL.observe)
+	loginURL.annotate(out)
 	if err != nil {
-		if acct != nil {
-			// Row and credential are live; only the best-effort usage check failed.
-			warn(cmd.ErrOrStderr(), "added the account, but its first usage check failed; run `ccp doctor` to retry")
-		} else {
-			fail(cmd.ErrOrStderr(), "couldn't finish adding the account: %v", err)
-			if shouldAbandon(cmd) {
-				if aerr := m.AbandonAdd(cmd.Context(), pending); aerr != nil {
-					warn(cmd.ErrOrStderr(), "cleanup failed: %v", aerr)
-				} else {
-					step(out, "Rolled back the account.")
-				}
-			} else {
-				releaseKeptAdd(cmd, m, pending)
-			}
-			return nil, err
-		}
+		fail(cmd.ErrOrStderr(), "couldn't finish adding the account: %v", err)
+		return nil, err
 	}
-	// Explicit add intent: publish past any tombstone so a re-add survives a
-	// peer's earlier removal; the account is live locally either way.
-	if perr := syncPublishAccount(cmd, m, acct.ID); perr != nil {
-		warn(cmd.ErrOrStderr(), "added the account, but couldn't publish it to the sync registry: %v — peer hosts won't see it; check `ccp sync status`", perr)
+	if !result.Completed || result.State != daemon.AccountMutationCompleted {
+		return nil, errors.New("daemon did not commit the account mutation")
 	}
+	committed, err := m.Store.GetAccount(result.AccountID)
+	if err != nil {
+		return nil, err
+	}
+	acct := &committed
 	name := acct.Label
 	if name == "" {
 		name = "the account"
 	}
 	success(out, "Added %s.", name)
 	return acct, nil
-}
-
-// releaseKeptAdd frees a kept-dir attempt's index reservation so rerunning
-// `ccp add` resumes it on the same index (SeedKeptExisting adopts the login);
-// without it a retry would count up until the daemon's TTL sweep.
-func releaseKeptAdd(cmd *cobra.Command, m *pool.Manager, p *pool.PendingAdd) {
-	if err := m.ReleaseAdd(p); err != nil {
-		warn(cmd.ErrOrStderr(), "couldn't release the account's index reservation: %v", err)
-	}
-}
-
-// noteFuseFirstMount warns about macOS's one-time volume-access grant prompts on an account's first fuse mount.
-func noteFuseFirstMount(out io.Writer, backend fkoverlay.Backend) {
-	if !pool.CanHostFuse() || !backend.IsFuse() {
-		return
-	}
-	en := backend.Enablement()
-	if !en.Needed {
-		return
-	}
-	note(out, "macOS will show one-time grant prompts for both the fusekit-holder app and cc-pool itself (%s) — click Allow on each.", en.Pane)
-}
-
-// defaultLabel's email-derived prefill is decorative — identity-read failures
-// stay silent.
-func defaultLabel(explicit string, backend fkoverlay.Backend, configDir string) string {
-	if explicit != "" {
-		return explicit
-	}
-	id, err := pool.AccountIdentity(backend, configDir)
-	if err != nil {
-		return ""
-	}
-	return pool.LabelForEmail(id.EmailAddress)
-}
-
-// checkDuplicate reports whether to skip an already-pooled subscription.
-// Non-interactive runs keep it (never block automation); no identity, no check.
-func checkDuplicate(cmd *cobra.Command, m *pool.Manager, p *pool.PendingAdd, opts addOptions) bool {
-	id, err := pool.AccountIdentity(p.OverlayKind, p.ConfigDir)
-	if err != nil {
-		return false
-	}
-	dup, err := m.DuplicateIdentity(*id)
-	if err != nil || dup == nil {
-		return false
-	}
-	who := id.EmailAddress
-	if who == "" {
-		who = "that subscription"
-	}
-	if opts.autoYes || opts.count > 0 || !isTTY() {
-		warn(cmd.ErrOrStderr(), "%s is already in the pool; adding it again", who)
-		return false
-	}
-	warn(cmd.ErrOrStderr(), "%s is already in the pool.", who)
-	keep := false
-	_ = huh.NewConfirm().
-		Title("Add it again anyway?").
-		Value(&keep).
-		WithTheme(ccpTheme()).
-		Run()
-	return !keep
-}
-
-func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) error {
-	out := cmd.OutOrStdout()
-	// Hold the pending account's session lease across the whole login interaction so
-	// holder retirement/recovery never tears down its fresh mount while claude writes
-	// credentials; the supervising ccp parent releases it on return. Probe first —
-	// never log in through a dead or wedged mirror.
-	h, err := acquireAndProbePendingLease(pending)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = h.Close() }()
-	doRun := opts.runNow || opts.autoYes
-	if isTTY() && !doRun {
-		choice := "run"
-		_ = huh.NewSelect[string]().
-			Title("How do you want to log in?").
-			Options(
-				huh.NewOption("Log in now, in this terminal", "run"),
-				huh.NewOption("I'll log in from another terminal", "manual"),
-			).
-			Value(&choice).
-			WithTheme(ccpTheme()).
-			Run()
-		doRun = choice == "run"
-	}
-
-	if doRun {
-		if err := runWatchedLogin(cmd.Context(), cmd, pending); err != nil {
-			var exitErr *exec.ExitError
-			if !errors.As(err, &exitErr) {
-				return err
-			}
-			// A nonzero claude exit isn't fatal; finalize decides.
-			warn(cmd.ErrOrStderr(), "the login command exited with an error: %v", err)
-		}
-		return nil
-	}
-
-	if !isTTY() {
-		return errors.New("non-interactive add requires --run; detached login lease agents were removed")
-	}
-	step(out, "\nRun this in another terminal, finish the login, then come back:\n\n    %s\n", pending.LoginCommand)
-	if pending.ClaudeJSONSeed == pool.SeedKeptExisting {
-		// Polling can't tell a reused dir's pre-existing login from a fresh one.
-		cont := true
-		_ = huh.NewConfirm().
-			Title("Press enter when the login is done").
-			Value(&cont).
-			WithTheme(ccpTheme()).
-			Run()
-		return nil
-	}
-	return waitForLogin(cmd.Context(), out, pending.OverlayKind, pending.ConfigDir)
 }
 
 func addAnother(cmd *cobra.Command, done, count int, autoYes bool) bool {

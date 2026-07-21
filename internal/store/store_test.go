@@ -1,10 +1,13 @@
 package store
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,8 +48,8 @@ func activateTestSession(t *testing.T, s *Store, accountID, pid int, cwd string,
 	if err := s.ActivateSelection(SelectionActivation{
 		Token:     nextStoreTestToken(),
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
-		Process: ProcessIdentity{PID: pid, StartedAt: started},
-		Cwd:     cwd, At: started,
+		Process:   ProcessIdentity{PID: pid, StartedAt: started},
+		ConfigDir: fmt.Sprintf("/presentation/acct-%02d", accountID), Cwd: cwd, At: started,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -101,6 +104,56 @@ func TestOpenRejectsOldSchemaWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlyRequiresExistingExactStoreWithoutMutation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pool-v1.db")
+	if _, err := OpenReadOnly(path); err == nil {
+		t.Fatal("OpenReadOnly created a missing store")
+	}
+	for _, candidate := range []string{path, path + ".lifecycle.lock"} {
+		if _, err := os.Lstat(candidate); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("missing read-only open created %s: %v", candidate, err)
+		}
+	}
+
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.SetMeta("read-only-proof", "present"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, found, err := reader.GetMeta("read-only-proof")
+	if err != nil || !found || value != "present" {
+		t.Fatalf("read-only GetMeta = %q, %v, %v", value, found, err)
+	}
+	if err := reader.SetMeta("forbidden", "write"); err == nil {
+		t.Fatal("read-only store accepted a write")
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatalf("read-only open changed database metadata: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestOpenCreatesOnlyACompletelyEmptyVersionZeroDatabase(t *testing.T) {
 	for name, setup := range map[string]string{
 		"version only":  `PRAGMA user_version=1`,
@@ -137,6 +190,84 @@ func TestOpenCreatesOnlyACompletelyEmptyVersionZeroDatabase(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsDriftedCurrentSchemaWithoutMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pool-v1.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE VIEW unexpected_drift AS SELECT 1`); err != nil {
+		t.Fatal(err)
+	}
+	before, err := schemaHash(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(path); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("Open drifted current schema = %v, want ErrSchemaMismatch", err)
+	}
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	after, err := schemaHash(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if after != before || version != SchemaVersion {
+		t.Fatalf("Open mutated drifted schema: hash %s -> %s, version=%d", before, after, version)
+	}
+}
+
+func TestOpenRejectsFutureSchemaWithoutMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pool-v1.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version=2`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(path); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("Open future schema = %v, want ErrSchemaMismatch", err)
+	}
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var version, accounts int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE name='accounts'`).Scan(&accounts); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 || accounts != 0 {
+		t.Fatalf("Open mutated future schema: version=%d accounts=%d", version, accounts)
+	}
+}
+
 func TestAccountCRUD(t *testing.T) {
 	s := openTest(t)
 	a := Account{ID: 1, ConfigDir: "/home/.cc-pool/accounts/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "work"}
@@ -166,7 +297,7 @@ func TestAccountCRUD(t *testing.T) {
 
 func TestAccountInstanceIdentityIsImmutableAndGenerationTracksTenantShape(t *testing.T) {
 	s := openTest(t)
-	a := Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc-1", KeychainAccount: "acct-1", OverlayKind: "symlink"}
+	a := Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc-1", KeychainAccount: "acct-1"}
 	if err := s.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -198,15 +329,9 @@ func TestAccountInstanceIdentityIsImmutableAndGenerationTracksTenantShape(t *tes
 	if reshaped.InstanceID != first.InstanceID || reshaped.Generation != 2 {
 		t.Fatalf("config-dir replacement identity = %q/%d, want %q/2", reshaped.InstanceID, reshaped.Generation, first.InstanceID)
 	}
-	if err := s.SetAccountOverlayKind(1, "fileprovider"); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SetAccountOverlayKind(1, "fileprovider"); err != nil {
-		t.Fatal(err)
-	}
 	final, _ := s.GetAccount(1)
-	if final.InstanceID != first.InstanceID || final.Generation != 3 {
-		t.Fatalf("overlay replacement identity = %q/%d, want %q/3", final.InstanceID, final.Generation, first.InstanceID)
+	if final.InstanceID != first.InstanceID || final.Generation != 2 {
+		t.Fatalf("final identity = %q/%d, want %q/2", final.InstanceID, final.Generation, first.InstanceID)
 	}
 
 	if err := s.UpsertAccount(Account{ID: 2, ConfigDir: "/acct-02", KeychainService: "svc-2", KeychainAccount: "acct-2"}); err != nil {
@@ -220,18 +345,20 @@ func TestAccountInstanceIdentityIsImmutableAndGenerationTracksTenantShape(t *tes
 
 func TestActivateSelectionRejectsGenerationChangeAtomically(t *testing.T) {
 	s := openTest(t)
-	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct", OverlayKind: "symlink"}); err != nil {
+	account := Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"}
+	if err := s.UpsertAccount(account); err != nil {
 		t.Fatal(err)
 	}
 	reserved, _ := s.GetAccount(1)
-	if err := s.SetAccountOverlayKind(1, "fileprovider"); err != nil {
+	account.ConfigDir = "/acct-01-replaced"
+	if err := s.UpsertAccount(account); err != nil {
 		t.Fatal(err)
 	}
 	err := s.ActivateSelection(SelectionActivation{
 		Token:     nextStoreTestToken(),
 		AccountID: 1, ExpectedInstanceID: reserved.InstanceID, ExpectedGeneration: reserved.Generation,
-		Process: ProcessIdentity{PID: 4242, StartedAt: time.Now().Add(-time.Minute)},
-		Cwd:     "/project", RecordSticky: true,
+		Process:   ProcessIdentity{PID: 4242, StartedAt: time.Now().Add(-time.Minute)},
+		ConfigDir: "/presentation/acct-01", Cwd: "/project", RecordSticky: true,
 	})
 	if !errors.Is(err, ErrAccountGenerationChanged) {
 		t.Fatalf("ActivateSelection after generation change = %v, want ErrAccountGenerationChanged", err)
@@ -257,7 +384,8 @@ func TestSelectionTerminalReplayAndExpiry(t *testing.T) {
 	activation := SelectionActivation{
 		Token: "00000000000000000000000000000001", AccountID: 1,
 		ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
-		Process: ProcessIdentity{PID: 4242, StartedAt: now.Add(-time.Minute)}, At: now,
+		Process:   ProcessIdentity{PID: 4242, StartedAt: now.Add(-time.Minute)},
+		ConfigDir: "/presentation/acct-01", At: now,
 	}
 	if err := s.ActivateSelection(activation); err != nil {
 		t.Fatal(err)
@@ -371,55 +499,9 @@ func TestCurrentSchemaRejectsInvalidIdentityRows(t *testing.T) {
 	}
 }
 
-func TestJournalRisks(t *testing.T) {
-	s := openTest(t)
-	if risks, err := s.ListJournalRisks(); err != nil || len(risks) != 0 {
-		t.Fatalf("empty ledger = (%v, %v), want ([], nil)", risks, err)
-	}
-
-	now := time.Unix(1_700_000_000, 0)
-	if err := s.RecordJournalRisk("/cfg/acct-01", "journal save failed", now); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.RecordJournalRisk("/cfg/acct-02", "still warning", now.Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	risks, err := s.ListJournalRisks()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(risks) != 2 || risks[0].Dir != "/cfg/acct-01" || risks[1].Dir != "/cfg/acct-02" {
-		t.Fatalf("risks = %+v, want two entries oldest-first", risks)
-	}
-	if risks[0].Warning != "journal save failed" || !risks[0].RecordedAt.Equal(now) {
-		t.Fatalf("risk[0] = %+v, want the recorded warning and time", risks[0])
-	}
-
-	// A re-record overwrites the same dir's warning, never duplicates it.
-	if err := s.RecordJournalRisk("/cfg/acct-01", "newer warning", now.Add(2*time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	risks, _ = s.ListJournalRisks()
-	if len(risks) != 2 {
-		t.Fatalf("re-record duplicated the entry: %+v", risks)
-	}
-
-	if err := s.ClearJournalRisk("/cfg/acct-01"); err != nil {
-		t.Fatal(err)
-	}
-	risks, _ = s.ListJournalRisks()
-	if len(risks) != 1 || risks[0].Dir != "/cfg/acct-02" {
-		t.Fatalf("after clear = %+v, want only acct-02", risks)
-	}
-	// Clearing an absent dir is a no-op, not an error.
-	if err := s.ClearJournalRisk("/cfg/acct-absent"); err != nil {
-		t.Fatalf("clear of an absent risk = %v, want nil", err)
-	}
-}
-
 func TestSetAccountLabel(t *testing.T) {
 	s := openTest(t)
-	a := Account{ID: 1, ConfigDir: "/home/.cc-pool/accounts/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "me@example.com", OverlayKind: "symlink"}
+	a := Account{ID: 1, ConfigDir: "/home/.cc-pool/accounts/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "me@example.com"}
 	if err := s.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -434,8 +516,7 @@ func TestSetAccountLabel(t *testing.T) {
 	if got.Label != "Example" {
 		t.Fatalf("label = %q, want %q", got.Label, "Example")
 	}
-	if got.ConfigDir != a.ConfigDir || got.KeychainService != a.KeychainService ||
-		got.KeychainAccount != a.KeychainAccount || got.OverlayKind != a.OverlayKind {
+	if got.ConfigDir != a.ConfigDir || got.KeychainService != a.KeychainService || got.KeychainAccount != a.KeychainAccount {
 		t.Fatalf("non-label fields changed: %+v", got)
 	}
 
@@ -747,7 +828,7 @@ func TestActivateSelectionAtomic(t *testing.T) {
 		AccountID: 1, ExpectedInstanceID: a.InstanceID,
 		Token:              nextStoreTestToken(),
 		ExpectedGeneration: a.Generation, Process: ProcessIdentity{PID: 4242, StartedAt: now},
-		Cwd: "/proj", RecordSticky: true, At: now,
+		ConfigDir: "/presentation/acct-01", Cwd: "/proj", RecordSticky: true, At: now,
 	})
 	if err == nil {
 		t.Fatal("ActivateSelection succeeded with failing session insert")
@@ -774,7 +855,7 @@ func TestActivateSelectionConditionalEffects(t *testing.T) {
 	if err := s.ActivateSelection(SelectionActivation{
 		AccountID: 1, ExpectedInstanceID: a.InstanceID,
 		Token: nextStoreTestToken(), ExpectedGeneration: a.Generation,
-		Process: ProcessIdentity{PID: 4242, StartedAt: now}, At: now,
+		Process: ProcessIdentity{PID: 4242, StartedAt: now}, ConfigDir: "/presentation/acct-01", At: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1055,10 +1136,18 @@ func TestRefreshLog(t *testing.T) {
 	if _, ok, _ := s.LastRefresh(1); ok {
 		t.Fatal("expected no refresh yet")
 	}
-	_ = s.LogRefresh(1, false, "boom")
+	digest := sha256.Sum256([]byte("oauth body with secret"))
+	_ = s.LogRefresh(1, RefreshRejected, digest)
 	e, ok, err := s.LastRefresh(1)
-	if err != nil || !ok || e.OK || e.Err != "boom" {
+	if err != nil || !ok || e.Category != RefreshRejected || e.Digest != digest {
 		t.Fatalf("last refresh = %+v ok=%v err=%v", e, ok, err)
+	}
+	var persisted string
+	if err := s.db.QueryRow(`SELECT CAST(category AS TEXT) || ':' || hex(digest) FROM refresh_log`).Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(persisted, "oauth body with secret") {
+		t.Fatalf("refresh log persisted raw error: %q", persisted)
 	}
 }
 
@@ -1071,17 +1160,19 @@ func TestAuthHealthTransitions(t *testing.T) {
 	}
 
 	t0 := time.Unix(1_000_000, 0)
-	changed, err := s.SetNeedsLogin(1, t0, "401 revoked", AuthKindOwned)
+	firstDigest := DigestReason("confirmed invalid_grant")
+	changed, err := s.SetNeedsLogin(1, t0, AuthReasonRequired, firstDigest, AuthKindOwned)
 	if err != nil || !changed {
 		t.Fatalf("first SetNeedsLogin changed=%v err=%v, want true", changed, err)
 	}
 	h, _ := s.GetAuthHealth(1)
-	if !h.NeedsLogin || !h.Since.Equal(t0) || h.LastErr != "401 revoked" || h.Kind != AuthKindOwned {
+	if !h.NeedsLogin || !h.Since.Equal(t0) || h.Reason != AuthReasonRequired || h.Digest != firstDigest || h.Kind != AuthKindOwned {
 		t.Fatalf("after flag = %+v", h)
 	}
 
-	// A repeat preserves Since but refreshes LastErr AND Kind (owned→awaiting).
-	changed, _ = s.SetNeedsLogin(1, t0.Add(time.Hour), "401 again", AuthKindAwaitingOrigin)
+	// A repeat preserves Since but refreshes Reason, Digest, and Kind.
+	secondDigest := DigestReason("401 again")
+	changed, _ = s.SetNeedsLogin(1, t0.Add(time.Hour), AuthReasonAwaitingOrigin, secondDigest, AuthKindAwaitingOrigin)
 	if changed {
 		t.Fatal("repeat SetNeedsLogin must report changed=false")
 	}
@@ -1089,8 +1180,8 @@ func TestAuthHealthTransitions(t *testing.T) {
 	if !h.Since.Equal(t0) {
 		t.Fatalf("Since must measure the whole outage; got %v want %v", h.Since, t0)
 	}
-	if h.LastErr != "401 again" {
-		t.Fatalf("LastErr should update; got %q", h.LastErr)
+	if h.Reason != AuthReasonAwaitingOrigin || h.Digest != secondDigest {
+		t.Fatalf("reason should update; got %+v", h)
 	}
 	if h.Kind != AuthKindAwaitingOrigin {
 		t.Fatalf("Kind should refresh to awaiting-origin; got %q", h.Kind)
@@ -1100,7 +1191,7 @@ func TestAuthHealthTransitions(t *testing.T) {
 		t.Fatalf("ListAuthHealth = %+v err=%v", m, err)
 	}
 
-	if _, err := s.SetNeedsLogin(1, t0, "x", AuthKind("bogus")); err == nil {
+	if _, err := s.SetNeedsLogin(1, t0, AuthReasonInternal, DigestReason("x"), AuthKind("bogus")); err == nil {
 		t.Fatal("SetNeedsLogin with an invalid kind must error")
 	}
 
@@ -1111,11 +1202,47 @@ func TestAuthHealthTransitions(t *testing.T) {
 	if changed, _ := s.ClearNeedsLogin(1); changed {
 		t.Fatal("clearing an already-healthy account must report changed=false")
 	}
-	if h, _ := s.GetAuthHealth(1); h.NeedsLogin || !h.Since.IsZero() || h.LastErr != "" || h.Kind != AuthKindOwned {
+	if h, _ := s.GetAuthHealth(1); h.NeedsLogin || !h.Since.IsZero() || h.Reason != AuthReasonNone || h.Digest != ([32]byte{}) || h.Kind != AuthKindOwned {
 		t.Fatalf("after clear = %+v, want healthy/zeroed", h)
 	}
 	if m, _ := s.ListAuthHealth(); len(m) != 0 {
 		t.Fatalf("ListAuthHealth after clear = %+v, want empty", m)
+	}
+}
+
+func TestAuthKindUsesHardOwnedAndUnverifiedEncodings(t *testing.T) {
+	s := openTest(t)
+	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	if AuthKindOwned != "owned" || AuthKindUnverified != "unverified" || AuthKind("").Valid() {
+		t.Fatalf("auth kind contract: owned=%q unverified=%q empty-valid=%v",
+			AuthKindOwned, AuthKindUnverified, AuthKind("").Valid())
+	}
+	missing, err := s.GetAuthHealth(1)
+	if err != nil || missing.Kind != AuthKindOwned || missing.NeedsLogin {
+		t.Fatalf("missing health = %+v err=%v, want healthy owned", missing, err)
+	}
+	if _, err := s.SetNeedsLogin(
+		1, time.Unix(1_000_000, 0), AuthReasonInternal,
+		DigestReason("ownership not verified"), AuthKindUnverified,
+	); err != nil {
+		t.Fatal(err)
+	}
+	flagged, err := s.GetAuthHealth(1)
+	if err != nil || !flagged.NeedsLogin || flagged.Kind != AuthKindUnverified {
+		t.Fatalf("unverified health = %+v err=%v", flagged, err)
+	}
+	if _, err := s.ClearNeedsLogin(1); err != nil {
+		t.Fatal(err)
+	}
+	var stored string
+	if err := s.db.QueryRow(`SELECT kind FROM auth_health WHERE account_id=1`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != string(AuthKindOwned) {
+		t.Fatalf("cleared kind = %q, want %q", stored, AuthKindOwned)
+	}
+	if _, err := s.db.Exec(`UPDATE auth_health SET kind='' WHERE account_id=1`); err == nil {
+		t.Fatal("empty legacy auth kind was accepted")
 	}
 }
 
@@ -1134,10 +1261,10 @@ func TestAuthHealthGenerationCAS(t *testing.T) {
 	}
 
 	t0 := time.Unix(1_000_000, 0)
-	if _, err := s.SetNeedsLogin(1, t0, "first", AuthKindOwned); err != nil {
+	if _, err := s.SetNeedsLogin(1, t0, AuthReasonRequired, DigestReason("first"), AuthKindOwned); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SetNeedsLogin(1, t0.Add(time.Minute), "second", AuthKindAwaitingOrigin); err != nil {
+	if _, err := s.SetNeedsLogin(1, t0.Add(time.Minute), AuthReasonAwaitingOrigin, DigestReason("second"), AuthKindAwaitingOrigin); err != nil {
 		t.Fatal(err)
 	}
 	h, err = s.GetAuthHealth(1)
@@ -1178,11 +1305,11 @@ func TestAuthHealthGenerationCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.NeedsLogin || h.Gen != 2 || !h.Since.IsZero() || h.LastErr != "" || h.Kind != AuthKindOwned {
+	if h.NeedsLogin || h.Gen != 2 || !h.Since.IsZero() || h.Reason != AuthReasonNone || h.Digest != ([32]byte{}) || h.Kind != AuthKindOwned {
 		t.Fatalf("after current-generation clear = %+v, want healthy at generation 2", h)
 	}
 
-	if _, err := s.SetNeedsLogin(1, t0.Add(2*time.Minute), "third", AuthKindOwned); err != nil {
+	if _, err := s.SetNeedsLogin(1, t0.Add(2*time.Minute), AuthReasonRequired, DigestReason("third"), AuthKindOwned); err != nil {
 		t.Fatal(err)
 	}
 	h, err = s.GetAuthHealth(1)
@@ -1197,7 +1324,7 @@ func TestAuthHealthGenerationCAS(t *testing.T) {
 func TestDeleteAccountRemovesAuthHealth(t *testing.T) {
 	s := openTest(t)
 	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-	_, _ = s.SetNeedsLogin(1, time.Now(), "x", AuthKindOwned)
+	_, _ = s.SetNeedsLogin(1, time.Now(), AuthReasonRequired, DigestReason("x"), AuthKindOwned)
 	if err := s.DeleteAccount(1); err != nil {
 		t.Fatal(err)
 	}

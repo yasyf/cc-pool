@@ -6,7 +6,7 @@ import (
 )
 
 // TestPrivateClassificationDisjoint pins the credential-leak invariant across every
-// classification category: the shared carve-out set (sharedTopLevel) and the private
+// classification category: the shared carve-out set (SharedTopLevel) and the private
 // set (PrivateEntry or the carveOutPrivate leak guard) never overlap — a name in both
 // would serve plain claude's file through a shared symlink. Each case also asserts the
 // concrete verdict so a dropped arm (e.g. carveOutPrivate losing its glob match) is
@@ -36,13 +36,13 @@ func TestPrivateClassificationDisjoint(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			shared := sharedTopLevel(tc.name)
+			shared := SharedTopLevel(tc.name)
 			private := PrivateEntry(tc.name) || carveOutPrivate(tc.name)
 			if shared && private {
-				t.Fatalf("%s (%s): sharedTopLevel AND private — the carve-out set must stay disjoint from private classification", tc.name, tc.desc)
+				t.Fatalf("%s (%s): SharedTopLevel AND private — the carve-out set must stay disjoint from private classification", tc.name, tc.desc)
 			}
 			if shared != tc.wantShared {
-				t.Errorf("sharedTopLevel(%q) = %v, want %v (%s)", tc.name, shared, tc.wantShared, tc.desc)
+				t.Errorf("SharedTopLevel(%q) = %v, want %v (%s)", tc.name, shared, tc.wantShared, tc.desc)
 			}
 			if private != tc.wantPrivate {
 				t.Errorf("PrivateEntry||carveOutPrivate(%q) = %v, want %v (%s)", tc.name, private, tc.wantPrivate, tc.desc)
@@ -83,8 +83,8 @@ func TestCacheFileClassification(t *testing.T) {
 			if got := carveOutPrivate(tc.name); got != tc.wantPrivate {
 				t.Errorf("carveOutPrivate(%q) = %v, want %v", tc.name, got, tc.wantPrivate)
 			}
-			if got := sharedTopLevel(tc.name); got != tc.wantShared {
-				t.Errorf("sharedTopLevel(%q) = %v, want %v", tc.name, got, tc.wantShared)
+			if got := SharedTopLevel(tc.name); got != tc.wantShared {
+				t.Errorf("SharedTopLevel(%q) = %v, want %v", tc.name, got, tc.wantShared)
 			}
 		})
 	}

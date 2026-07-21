@@ -3,9 +3,12 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -26,12 +29,13 @@ import (
 var _ pool.Credentials = (*credstest.Fake)(nil)
 
 type fakeOAuth struct {
-	mu         sync.Mutex
-	currentRT  string
-	refreshes  int
-	usageCalls int
-	usage401   bool
-	refresh5xx bool
+	mu              sync.Mutex
+	currentRT       string
+	refreshes       int
+	refreshAttempts int
+	usageCalls      int
+	usage401        bool
+	refresh5xx      bool
 
 	// usageNet makes every Usage return a network-class (oauth.ErrNetwork) error.
 	usageNet   bool
@@ -51,12 +55,13 @@ func netError() error { return fmt.Errorf("simulated transport failure: %w", oau
 func (f *fakeOAuth) Refresh(_ context.Context, _, refreshToken string) (*oauth.TokenResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.refreshAttempts++
 	if f.refresh5xx {
-		// 503 is not Revoked(): a recoverable blip, not needs-login.
-		return nil, &oauth.RefreshError{Status: 503, Body: "service unavailable"}
+		// 503 is not confirmed invalid_grant: it is recoverable, not needs-login.
+		return nil, &oauth.RefreshError{Status: 503}
 	}
 	if refreshToken != f.currentRT {
-		return nil, &oauth.RefreshError{Status: 400, Body: `{"error":"invalid_grant"}`, Code: "invalid_grant"}
+		return nil, &oauth.RefreshError{Status: 400, ConfirmedInvalidGrant: true}
 	}
 	f.refreshes++
 	f.currentRT = fmt.Sprintf("rt-%d", f.refreshes)
@@ -65,6 +70,12 @@ func (f *fakeOAuth) Refresh(_ context.Context, _, refreshToken string) (*oauth.T
 		RefreshToken: f.currentRT,
 		ExpiresIn:    3600,
 	}, nil
+}
+
+func (f *fakeOAuth) refreshAttemptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.refreshAttempts
 }
 
 func (f *fakeOAuth) refreshCount() int {
@@ -85,10 +96,10 @@ func (f *fakeOAuth) Usage(_ context.Context, at string) (*oauth.Usage, error) {
 		return nil, netError()
 	}
 	if f.usage429 || f.rlByAT[at] {
-		return nil, &oauth.UsageError{Status: 429, Body: "rate limited", RetryAfter: f.retryAfter}
+		return nil, &oauth.UsageError{Status: 429, RetryAfter: f.retryAfter}
 	}
 	if f.usage401 {
-		return nil, &oauth.UsageError{Status: 401, Body: `{"type":"error"}`}
+		return nil, &oauth.UsageError{Status: 401}
 	}
 	return &oauth.Usage{}, nil
 }
@@ -118,7 +129,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	// Redirect ClaudeDir/StateDir off the real ~/.claude and ~/.cc-pool.
 	t.Setenv("HOME", t.TempDir())
 
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +154,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	fo := &fakeOAuth{currentRT: "rt-0"}
 
 	s := &Server{
-		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		m:            newDaemonTestManager(t, st, fo, fk),
 		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
@@ -173,7 +184,7 @@ func TestPollOnceFailsClosedOnScanError(t *testing.T) {
 	setup := func(t *testing.T, scan func(context.Context) ([]procscan.Session, error)) (*Server, *fakeOAuth, *credstest.Fake) {
 		t.Helper()
 		t.Setenv("HOME", t.TempDir())
-		st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+		st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -193,7 +204,7 @@ func TestPollOnceFailsClosedOnScanError(t *testing.T) {
 		fk.Put(a.KeychainService, a.KeychainAccount, cred)
 		fo := &fakeOAuth{currentRT: "rt-0"}
 		s := &Server{
-			m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+			m:            newDaemonTestManager(t, st, fo, fk),
 			snapshot:     filepath.Join(t.TempDir(), "status.json"),
 			log:          log.New(io.Discard, "", 0),
 			scanSessions: scan,
@@ -231,7 +242,7 @@ func TestPollOnceFailsClosedOnScanError(t *testing.T) {
 // credential clears it on the next due poll.
 func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +264,7 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true}
 
 	s := &Server{
-		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		m:            newDaemonTestManager(t, st, fo, fk),
 		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
@@ -308,7 +319,7 @@ func TestPollOnceAbsentCredentialAuthHealth(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
-			st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+			st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -325,7 +336,7 @@ func TestPollOnceAbsentCredentialAuthHealth(t *testing.T) {
 			fk.KeychainFaults = credstest.Faults{Read: tc.keychainFault}
 			fo := &fakeOAuth{}
 			s := &Server{
-				m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+				m:            newDaemonTestManager(t, st, fo, fk),
 				snapshot:     filepath.Join(t.TempDir(), "status.json"),
 				log:          log.New(io.Discard, "", 0),
 				scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
@@ -371,12 +382,11 @@ func TestPollOnceAbsentCredentialAuthHealth(t *testing.T) {
 	}
 }
 
-// TestPollOnceTransient401StaysSelectable pins that transient refresh failures
-// (non-Revoked 5xx) never flag needs-login: the 401 streak only arms the poll
-// backoff and the account stays selectable throughout.
+// TestPollOnceTransient401StaysSelectable pins that one durable transient
+// refresh failure cannot be replayed into multiple auth strikes or needs-login.
 func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +408,7 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true, refresh5xx: true}
 
 	s := &Server{
-		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		m:            newDaemonTestManager(t, st, fo, fk),
 		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
@@ -406,37 +416,230 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 		led:          newLedgers(),
 	}
 
-	for i := 1; i <= needsLoginAfter; i++ {
-		s.pollOnce(t.Context())
-		// The 401 streak advances by one per transient failure and latches the
-		// needs-login gate (faulted) on the needsLoginAfter-th, where the debounce
-		// resets strikes to 0.
-		l := s.led.peek(authStreakPolicy, a.ConfigDir)
-		switch {
-		case i < needsLoginAfter:
-			if l == nil || l.strikes != i || l.faulted {
-				t.Fatalf("after %d transient 401(s), auth streak = %+v, want strikes %d unfaulted", i, l, i)
-			}
-		case l == nil || !l.faulted:
-			t.Fatalf("the %dth transient 401 must latch the needs-login gate (faulted): %+v", i, l)
-		}
-		h, _ := st.GetAuthHealth(1)
-		if h.NeedsLogin {
-			t.Fatalf("transient 401 #%d falsely flagged needs-login", i)
-		}
-		if !score.Score(score.Input{AccountID: 1, NeedsLogin: h.NeedsLogin}, time.Now()).Available {
-			t.Fatalf("transient 401 #%d made the account unselectable", i)
-		}
-	}
-
-	// The needsLoginAfter-th failure arms the backoff: the next poll skips sampling.
-	before := fo.usageCallCount()
 	s.pollOnce(t.Context())
-	if got := fo.usageCallCount(); got != before {
-		t.Fatalf("backed-off account was still sampled: Usage called %d extra time(s)", got-before)
+	before := fo.usageCallCount()
+	refreshesBefore := fo.refreshAttemptCount()
+	for range needsLoginAfter + 1 {
+		s.pollOnce(t.Context())
+	}
+	if l := s.led.peek(authStreakPolicy, a.ConfigDir); l == nil || l.strikes != 1 || l.faulted {
+		t.Fatalf("durably replayed transient failure inflated auth streak: %+v", l)
+	}
+	if got := fo.usageCallCount() - before; got != needsLoginAfter+1 {
+		t.Fatalf("retained failure read-only Usage calls = %d, want %d", got, needsLoginAfter+1)
+	}
+	if got := fo.refreshAttemptCount(); got != refreshesBefore {
+		t.Fatalf("durably replayed failure repeated refresh %d time(s)", got-refreshesBefore)
 	}
 	if h, _ := st.GetAuthHealth(1); h.NeedsLogin {
-		t.Fatal("poll backoff must not flag needs-login")
+		t.Fatal("transient failure replay must not flag needs-login")
+	} else if !score.Score(score.Input{AccountID: 1, NeedsLogin: h.NeedsLogin}, time.Now()).Available {
+		t.Fatal("transient failure replay made the account unselectable")
+	}
+}
+
+func TestClassifyOutcomeRetainedEvidenceIsNotAProbe(t *testing.T) {
+	if got := classifyOutcome(errors.Join(pool.ErrCredentialOperationReplayed, oauth.ErrNetwork)); got != outcomeNoProbe {
+		t.Fatalf("replayed network outcome = %v, want no-probe", got)
+	}
+	if got := classifyOutcome(errors.Join(
+		pool.ErrCredentialOperationReplayed,
+		&oauth.RefreshError{Status: http.StatusServiceUnavailable},
+	)); got != outcomeNoProbe {
+		t.Fatalf("replayed server outcome = %v, want no-probe", got)
+	}
+	if got := classifyOutcome(oauth.ErrNetwork); got != outcomeNetwork {
+		t.Fatalf("live network outcome = %v, want network", got)
+	}
+	if got := classifyOutcome(errors.Join(
+		pool.ErrCredentialOperationReplayed,
+		pool.ErrCredentialOperationLiveProbe,
+		oauth.ErrNetwork,
+	)); got != outcomeNetwork {
+		t.Fatalf("retained evidence with live network probe = %v, want network", got)
+	}
+	if got := classifyOutcome(errors.Join(
+		pool.ErrCredentialOperationReplayed,
+		pool.ErrCredentialOperationLiveProbe,
+		&oauth.UsageError{Status: http.StatusUnauthorized},
+	)); got != outcomeNonNetwork {
+		t.Fatalf("retained evidence with live response = %v, want nonnetwork", got)
+	}
+}
+
+// TestPollOnceOutageProbesAfterRetainedFailure pins that durable failure
+// evidence cannot keep outage mode alive without network I/O. The scheduler
+// follows a replay-only credential result with one read-only usage probe.
+func TestPollOnceOutageProbesAfterRetainedFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	fk := credstest.NewFake()
+	first := store.Account{
+		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct-1"),
+		KeychainService: "svc-1", KeychainAccount: "user",
+	}
+	if err := st.UpsertAccount(first); err != nil {
+		t.Fatal(err)
+	}
+	expired := &creds.Credential{}
+	expired.ClaudeAiOauth.AccessToken = "at-1"
+	expired.ClaudeAiOauth.RefreshToken = "rt-1"
+	expired.ClaudeAiOauth.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
+	fk.Put(first.KeychainService, first.KeychainAccount, expired)
+
+	fo := &fakeOAuth{currentRT: "rt-1", usage401: true, refresh5xx: true}
+	s := &Server{
+		m:            newDaemonTestManager(t, st, fo, fk),
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
+		log:          log.New(io.Discard, "", 0),
+		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
+		pollSpacing:  time.Millisecond,
+		cl:           newClaims(),
+		led:          newLedgers(),
+	}
+
+	// Settle account 1's refresh-server failure into durable evidence.
+	s.pollOnce(t.Context())
+	before := fo.usageCountFor("at-1")
+
+	second := store.Account{
+		ID: 2, ConfigDir: filepath.Join(t.TempDir(), "acct-2"),
+		KeychainService: "svc-2", KeychainAccount: "user",
+	}
+	if err := st.UpsertAccount(second); err != nil {
+		t.Fatal(err)
+	}
+	live := &creds.Credential{}
+	live.ClaudeAiOauth.AccessToken = "at-2"
+	live.ClaudeAiOauth.RefreshToken = "rt-2"
+	live.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
+	fk.Put(second.KeychainService, second.KeychainAccount, live)
+	fo.usage401 = false
+	fo.refresh5xx = false
+	s.netOutage = true
+
+	s.pollOnce(t.Context())
+
+	if s.netOutage {
+		t.Fatal("a live fallback probe did not clear outage mode")
+	}
+	if got := fo.usageCountFor("at-1"); got != before+1 {
+		t.Fatalf("retained failure fallback performed %d new Usage call(s), want 1", got-before)
+	}
+	if got := fo.usageCountFor("at-2"); got != 1 {
+		t.Fatalf("live second canary sampled %d time(s), want 1", got)
+	}
+}
+
+func TestPollOnceRestartProbesWhenAllCredentialResultsRetained(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		networkDown bool
+	}{
+		{name: "reachable"},
+		{name: "network outage", networkDown: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			databasePath := filepath.Join(t.TempDir(), "pool-v1.db")
+			st, err := store.Open(databasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			fk := credstest.NewFake()
+			fo := &fakeOAuth{}
+			manager := newDaemonTestManager(t, st, fo, fk)
+			for id := 1; id <= 2; id++ {
+				account := store.Account{
+					ID: id, ConfigDir: filepath.Join(t.TempDir(), fmt.Sprintf("acct-%d", id)),
+					KeychainService: fmt.Sprintf("svc-%d", id), KeychainAccount: "user",
+				}
+				if err := st.UpsertAccount(account); err != nil {
+					t.Fatal(err)
+				}
+				account, err = st.GetAccount(id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				credential := &creds.Credential{}
+				credential.ClaudeAiOauth.AccessToken = fmt.Sprintf("at-%d", id)
+				credential.ClaudeAiOauth.RefreshToken = fmt.Sprintf("rt-%d", id)
+				credential.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
+				fk.Put(account.KeychainService, account.KeychainAccount, credential)
+				observation, err := manager.CredentialExternalState(t.Context(), account)
+				if err != nil {
+					t.Fatal(err)
+				}
+				filePath := creds.FileCredentialPath(account.ConfigDir)
+				if _, err := st.QuarantineCredential(store.QuarantineCredentialRequest{
+					AccountID: account.ID, AccountInstanceID: account.InstanceID,
+					AccountGeneration: account.Generation,
+					LocatorDigest: store.CredentialLocatorDigest(
+						account.KeychainService, account.KeychainAccount, filePath,
+					),
+					FileLocatorDigest: store.CredentialFileLocatorDigest(filePath),
+					Observation:       observation,
+					Reason:            store.CredentialResultAmbiguous,
+					FailureClass:      store.CredentialFailureInternal,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := st.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			st, err = store.Open(databasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = st.Close() })
+			fo.usageNet = test.networkDown
+			snapshotPath := filepath.Join(t.TempDir(), "status.json")
+			s := &Server{
+				m:            newDaemonTestManager(t, st, fo, fk),
+				snapshot:     snapshotPath,
+				log:          log.New(io.Discard, "", 0),
+				scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
+				pollSpacing:  time.Millisecond,
+				cl:           newClaims(),
+				led:          newLedgers(),
+			}
+
+			s.pollOnce(t.Context())
+
+			if got := fo.usageCallCount(); got != 1 {
+				t.Fatalf("restart fallback Usage calls = %d, want exactly 1", got)
+			}
+			if got := fo.usageCountFor("at-1"); got != 1 {
+				t.Fatalf("first retained account probes = %d, want 1", got)
+			}
+			if got := fo.usageCountFor("at-2"); got != 0 {
+				t.Fatalf("second retained account probes = %d, want 0", got)
+			}
+			for id := 1; id <= 2; id++ {
+				if _, err := st.CredentialQuarantine(id); err != nil {
+					t.Fatalf("account %d quarantine after read-only probe: %v", id, err)
+				}
+			}
+			if s.netOutage != test.networkDown {
+				t.Fatalf("netOutage = %t, want %t", s.netOutage, test.networkDown)
+			}
+			_, statErr := os.Stat(snapshotPath)
+			if test.networkDown {
+				if !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("outage restart snapshot stat = %v, want absent", statErr)
+				}
+			} else if statErr != nil {
+				t.Fatalf("reachable restart snapshot stat: %v", statErr)
+			}
+		})
 	}
 }
 
@@ -445,7 +648,7 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 // first poll, independent of the transient-401 streak.
 func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +670,7 @@ func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 	fo := &fakeOAuth{currentRT: "rt-0", usage401: true}
 
 	s := &Server{
-		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		m:            newDaemonTestManager(t, st, fo, fk),
 		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
@@ -491,7 +694,7 @@ func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 func newOutageServer(t *testing.T, n int) (*Server, *fakeOAuth) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +716,7 @@ func newOutageServer(t *testing.T, n int) (*Server, *fakeOAuth) {
 	}
 	fo := &fakeOAuth{currentRT: "rt-0"}
 	s := &Server{
-		m:            &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+		m:            newDaemonTestManager(t, st, fo, fk),
 		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
@@ -668,7 +871,7 @@ func TestPollOnceRecoverySweepHealsBusy401(t *testing.T) {
 	newBusy := func(t *testing.T) (*Server, *fakeOAuth) {
 		t.Helper()
 		t.Setenv("HOME", t.TempDir())
-		st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+		st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -688,11 +891,11 @@ func TestPollOnceRecoverySweepHealsBusy401(t *testing.T) {
 		fk.Put(a.KeychainService, a.KeychainAccount, cred)
 		fo := &fakeOAuth{currentRT: "rt-0", usage401: true}
 		s := &Server{
-			m:        &pool.Manager{Store: st, OAuth: fo, Creds: fk, LockDir: t.TempDir()},
+			m:        newDaemonTestManager(t, st, fo, fk),
 			snapshot: filepath.Join(t.TempDir(), "status.json"),
 			log:      log.New(io.Discard, "", 0),
 			scanSessions: func(context.Context) ([]procscan.Session, error) { // a live session → busy
-				return []procscan.Session{{PID: 4242, ConfigDir: a.ConfigDir, StartedAt: time.Now()}}, nil
+				return []procscan.Session{{PID: 4242, ConfigDir: pool.AccountPresentationDir(a.ID), StartedAt: time.Now()}}, nil
 			},
 			cl:  newClaims(),
 			led: newLedgers(),

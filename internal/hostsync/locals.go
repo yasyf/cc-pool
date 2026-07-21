@@ -10,7 +10,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
 )
 
 // localRow is one logged-in local account: its store row plus the identity
@@ -26,14 +25,14 @@ type localRow struct {
 // account with its identity, label, and secretless chain stamp. Credential
 // reads are read-only — building the scan must never spend a refresh token.
 func ManagerLocals(m *pool.Manager, self string, now func() time.Time) func(context.Context) ([]LocalAccount, error) {
-	return func(context.Context) ([]LocalAccount, error) {
-		rows, err := scanLocalAccounts(m)
+	return func(ctx context.Context) ([]LocalAccount, error) {
+		rows, err := scanLocalAccounts(ctx, m)
 		if err != nil {
 			return nil, err
 		}
 		out := make([]LocalAccount, 0, len(rows))
 		for _, r := range rows {
-			chain, err := localChainStamp(m, r.acct, self, now)
+			chain, err := localChainStamp(ctx, m, r.acct, self, now)
 			if err != nil {
 				return nil, err
 			}
@@ -52,8 +51,8 @@ func ManagerLocals(m *pool.Manager, self string, now func() time.Time) func(cont
 // ManagerLocalIndex builds the LoadRegistry uuid-backfill index (uuid -> row
 // id) over the same identity scan as ManagerLocals.
 func ManagerLocalIndex(m *pool.Manager) LocalIndex {
-	return func(context.Context) (map[string]int, error) {
-		rows, err := scanLocalAccounts(m)
+	return func(ctx context.Context) (map[string]int, error) {
+		rows, err := scanLocalAccounts(ctx, m)
 		if err != nil {
 			return nil, err
 		}
@@ -67,18 +66,14 @@ func ManagerLocalIndex(m *pool.Manager) LocalIndex {
 
 // scanLocalAccounts reads every pool row's private identity; rows with no
 // identity yet (pre-login) are skipped — they have no uuid to sync under.
-func scanLocalAccounts(m *pool.Manager) ([]localRow, error) {
+func scanLocalAccounts(ctx context.Context, m *pool.Manager) ([]localRow, error) {
 	accts, err := m.Store.ListAccounts()
 	if err != nil {
 		return nil, fmt.Errorf("list accounts: %w", err)
 	}
 	out := make([]localRow, 0, len(accts))
 	for _, a := range accts {
-		backend, err := fkoverlay.Parse(a.OverlayKind)
-		if err != nil {
-			return nil, fmt.Errorf("acct-%d: unparseable overlay kind %q: %w", a.ID, a.OverlayKind, err)
-		}
-		raw, id, err := pool.AccountOAuth(backend, a.ConfigDir)
+		raw, id, err := m.AccountOAuth(ctx, a.ID, a.ConfigDir)
 		if errors.Is(err, pool.ErrNoIdentity) {
 			continue
 		}
@@ -94,8 +89,14 @@ func scanLocalAccounts(m *pool.Manager) ([]localRow, error) {
 // OWNED chains are advertised (origin = self); a synced copy, tombstone, or
 // unreadable slot is a zero chain, which the fold's strictly-fresher gates
 // never adopt — a peer must never republish a chain it doesn't own.
-func localChainStamp(m *pool.Manager, a store.Account, self string, now func() time.Time) (ChainStamp, error) {
-	cred, _, err := m.ReadCredential(a)
+func localChainStamp(
+	ctx context.Context,
+	m *pool.Manager,
+	a store.Account,
+	self string,
+	now func() time.Time,
+) (ChainStamp, error) {
+	cred, _, err := m.ReadCredential(ctx, a)
 	switch {
 	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrUnavailable), errors.Is(err, creds.ErrNoTokens):
 		return ChainStamp{}, nil

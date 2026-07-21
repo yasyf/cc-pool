@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -19,7 +20,7 @@ func (s *Server) handleIdleTransition(ctx context.Context, dir string) {
 	if !snapshot.idle(dir) {
 		return
 	}
-	accounts, err := s.m.Store.ListAccounts()
+	accounts, err := s.m.Store.ListActiveAccounts()
 	if err != nil {
 		s.log.Printf("idle adoption: list accounts: %v", err)
 		return
@@ -27,7 +28,7 @@ func (s *Server) handleIdleTransition(ctx context.Context, dir string) {
 	var account store.Account
 	found := false
 	for _, candidate := range accounts {
-		if candidate.ConfigDir == dir {
+		if pool.AccountPresentationDir(candidate.ID) == dir {
 			account = candidate
 			found = true
 			break
@@ -37,10 +38,9 @@ func (s *Server) handleIdleTransition(ctx context.Context, dir string) {
 		s.heartbeatFor().acknowledgeIdle(dir)
 		return
 	}
-	if !s.idleAdoptionDue(dir, time.Now()) || !s.cl.hold(account.ID) {
+	if !s.idleAdoptionDue(dir, time.Now()) {
 		return
 	}
-	defer s.cl.disownHold(account.ID)
 	fresh, err := s.m.Store.GetAccount(account.ID)
 	if errors.Is(err, store.ErrAccountNotFound) {
 		s.heartbeatFor().acknowledgeIdle(dir)
@@ -50,7 +50,10 @@ func (s *Server) handleIdleTransition(ctx context.Context, dir string) {
 		s.log.Printf("acct-%02d idle adoption: re-read row: %v", account.ID, err)
 		return
 	}
-	if fresh.ConfigDir != dir || !s.heartbeatFor().view().idle(dir) {
+	if pool.AccountPresentationDir(fresh.ID) != dir || !s.heartbeatFor().view().idle(dir) {
+		return
+	}
+	if s.cl.reservedCount(fresh.ID) != 0 {
 		return
 	}
 	active, err := s.m.Store.ActiveSessionCount(fresh.ID)
@@ -61,10 +64,6 @@ func (s *Server) handleIdleTransition(ctx context.Context, dir string) {
 	if active != 0 {
 		return
 	}
-	if !s.cl.ownHeld(fresh.ID) {
-		return
-	}
-	defer s.cl.disownConvert(fresh.ID)
 	if !s.heartbeatFor().view().idle(dir) {
 		return
 	}

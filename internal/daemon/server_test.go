@@ -3,24 +3,24 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
-	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/lease"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/fusekit/catalogproto"
 )
 
 var daemonTestToken atomic.Uint64
@@ -29,76 +29,162 @@ func nextDaemonTestToken() string {
 	return fmt.Sprintf("%032x", daemonTestToken.Add(1))
 }
 
-// holdSessionLease simulates a live select/env handout by taking account a's
-// session lease (its current-shape key) under the server's temp lease root; the
-// returned handle releases it, and a t.Cleanup closes it as a backstop.
-func holdSessionLease(t *testing.T, s *Server, a store.Account) *lease.Handle {
+func newDaemonTestManager(
+	t *testing.T,
+	st *store.Store,
+	refresher pool.Refresher,
+	credentials pool.Credentials,
+) *pool.Manager {
 	t.Helper()
-	root, err := s.m.LeaseRoot()
+	identity, err := proc.CurrentIdentity()
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := lease.Acquire(root, pool.SessionLeaseDir(a), pool.HolderOwner)
-	if err != nil {
-		t.Fatalf("hold session lease on %s: %v", pool.SessionLeaseDir(a), err)
+	owner := proc.Record{
+		RecoveryClass: proc.RecoveryTask,
+		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		Comm: identity.Comm, Executable: identity.Executable,
+		AuditToken: identity.AuditToken, Generation: "daemon-test",
 	}
-	t.Cleanup(func() { _ = h.Close() })
-	return h
+	authority, err := pool.NewWorkerAuthority(
+		accountMutationTestTaskRunner{credentials: credentials}, identity.Executable, owner,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := pool.NewManager(
+		st, refresher,
+		func(context.Context) ([]procscan.Session, error) { return nil, nil },
+		authority,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Creds = credentials
+	manager.BuildCredentialWritePublication = credentialWritePublicationBuilder("daemon-test")
+	manager.SettleCredentialWrite = func(context.Context, pool.CredentialWriteSettlement) error {
+		return nil
+	}
+	return manager
+}
+
+func TestSelectPreflightSettlesBeforeReturnAndBlocksCredentialMove(t *testing.T) {
+	s, _ := newTestServer(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s.preflightCredential = func(context.Context, store.Account) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	forced := 1
+	responses := make(chan Response, 1)
+	go func() {
+		responses <- s.handleSelect(t.Context(), Request{
+			Op: OpSelect, Account: &forced, PID: 4242,
+			ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj",
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("selection did not enter credential preflight")
+	}
+	if got := s.cl.reservedCount(forced); got != 1 {
+		t.Fatalf("pending reservations = %d, want 1 during preflight", got)
+	}
+	account, err := s.m.Store.GetAccount(forced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	move := s.moveAccountCred(t.Context(), account, creds.SourceFile, "file")
+	if move.Outcome != CredentialMoveBusy || !strings.Contains(move.Detail, "pending selection") {
+		t.Fatalf("credential move during preflight = %+v, want pending-selection busy", move)
+	}
+	select {
+	case response := <-responses:
+		t.Fatalf("selection returned before preflight settled: %+v", response)
+	default:
+	}
+	close(release)
+	select {
+	case response := <-responses:
+		if !response.OK {
+			t.Fatalf("selection after preflight: %+v", response)
+		}
+		s.cl.abortReservation(response.ReservationToken)
+	case <-time.After(time.Second):
+		t.Fatal("selection did not return after preflight settled")
+	}
+}
+
+func TestSelectPreflightFailureAbortsReservation(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.preflightCredential = func(context.Context, store.Account) error {
+		return errors.New("credential quarantine")
+	}
+	forced := 1
+	response := s.handleSelect(t.Context(), Request{
+		Op: OpSelect, Account: &forced, PID: 4242,
+		ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj",
+	})
+	if response.OK || !strings.Contains(response.Error, "credential quarantine") {
+		t.Fatalf("selection with failed credential preflight = %+v", response)
+	}
+	if got := s.cl.reservedCount(forced); got != 0 {
+		t.Fatalf("pending reservations after failed preflight = %d, want 0", got)
+	}
 }
 
 // newTestServer builds a Server with acct-1 emptier than acct-2. scanSessions
 // is stubbed: real `ps` can hang on a wedged mount.
 func newTestServer(t *testing.T) (*Server, map[int]string) {
 	t.Helper()
+	t.Setenv("HOME", t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Point the session-lease root at a temp dir so any Seize/Probe under test
-	// never touches real ~/.fusekit.
-	leaseRoot := filepath.Join(t.TempDir(), "leases")
 	t.Cleanup(func() { _ = st.Close() })
 
 	dirs := map[int]string{}
+	fakeCreds := credstest.NewFake()
 	now := time.Now()
 	for id, util := range map[int]float64{1: 10, 2: 50} {
-		dir := filepath.Join(t.TempDir(), "acct")
+		dir := pool.AccountPresentationDir(id)
 		dirs[id] = dir
+		service := creds.ServiceName(dir)
 		if err := st.UpsertAccount(store.Account{
-			ID: id, ConfigDir: dir, OverlayKind: "symlink",
-			KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
+			ID: id, ConfigDir: dir, InstanceID: fmt.Sprintf("instance-%d", id), Generation: 1,
+			KeychainService: service, KeychainAccount: "ccp-test",
 		}); err != nil {
 			t.Fatal(err)
 		}
 		if err := st.InsertUsageSample(store.UsageSample{AccountID: id, TS: now, Util5h: util, Util7d: util}); err != nil {
 			t.Fatal(err)
 		}
-	}
-	contentRoot := t.TempDir()
-	claudeDir := filepath.Join(contentRoot, ".claude")
-	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
-		t.Fatal(err)
+		credential := &creds.Credential{}
+		credential.ClaudeAiOauth.AccessToken = fmt.Sprintf("access-%d", id)
+		credential.ClaudeAiOauth.RefreshToken = fmt.Sprintf("refresh-%d", id)
+		credential.ClaudeAiOauth.ExpiresAt = now.Add(time.Hour).UnixMilli()
+		fakeCreds.Put(service, "ccp-test", credential)
 	}
 	s := &Server{
-		m: &pool.Manager{
-			Store: st, OAuth: &fakeOAuth{}, Creds: credstest.NewFake(), LockDir: t.TempDir(),
-			LeaseRoot: func() (string, error) { return leaseRoot, nil },
-		},
+		m:            newDaemonTestManager(t, st, &fakeOAuth{}, fakeCreds),
 		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		cl:           newClaims(),
 		led:          newLedgers(),
-		contentSource: overlay.NewPoolContentSource(
-			claudeDir, filepath.Join(contentRoot, ".claude.json"), filepath.Join(contentRoot, "content-stamps"),
-		),
+		prepareAccount: func(ctx context.Context, account store.Account) (catalogproto.TenantPreparationProof, error) {
+			return catalogproto.TenantPreparationProof{
+				Catalog: catalogproto.CatalogLaneProof{Tenant: catalogproto.TenantID("test"), Generation: account.Generation},
+			}, ctx.Err()
+		},
+		activatePrepared: func(_ context.Context, _ store.Account, _ catalogproto.TenantPreparationProof, activate func() error) error {
+			return activate()
+		},
 	}
-	// Production serve() Waits on s.wg before Run's deferred Close; tests must
-	// too. handleSelect's preflight goroutine creates the winner's LockDir lock
-	// file — unwaited, it races t.TempDir's RemoveAll ("directory not empty")
-	// and the store Close. Registered after the t.TempDir calls above, so this
-	// cleanup runs before theirs (LIFO), after t.Context() is cancelled.
-	t.Cleanup(func() { s.wg.Wait() })
 	return s, dirs
 }
 
@@ -112,8 +198,9 @@ func activateDaemonTestSession(t *testing.T, s *Server, accountID, pid int, cwd 
 	if err := s.m.Store.ActivateSelection(store.SelectionActivation{
 		Token:     nextDaemonTestToken(),
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
-		Process: store.ProcessIdentity{PID: pid, StartedAt: started},
-		Cwd:     cwd, At: started,
+		Process:   store.ProcessIdentity{PID: pid, StartedAt: started},
+		ConfigDir: pool.AccountPresentationDir(accountID),
+		Cwd:       cwd, At: started,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -164,68 +251,41 @@ func TestReservedCountExpiresAfterTTL(t *testing.T) {
 	}
 }
 
-func TestHandleSelectCanceledClaimWaitCreatesNoReservation(t *testing.T) {
+func TestSelectionActivationRejectsStalePreparationProof(t *testing.T) {
 	s, _ := newTestServer(t)
-	newCoordinatorTestSource(t, s)
-	if !s.cl.hold(1) {
-		t.Fatal("could not hold poll claim")
+	account, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
 	}
-	accountID := 1
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
-	defer cancel()
-	resp := s.handleSelect(ctx, Request{Account: &accountID, Cwd: "/project"})
-	if resp.OK {
-		t.Fatalf("selection succeeded after request deadline: %+v", resp)
+	launch := selectionLaunch{pid: 42, processStartedAt: time.Now(), cwd: "/work"}
+	token, err := s.cl.beginSelection(account, launch, time.Minute)
+	if err != nil {
+		t.Fatal(err)
 	}
-	s.cl.disownHold(1)
-	s.cl.mu.Lock()
-	selections := len(s.cl.selections)
-	s.cl.mu.Unlock()
-	if selections != 0 {
-		t.Fatalf("late reservation after canceled catch-up: selections=%d", selections)
+	proof := catalogproto.TenantPreparationProof{
+		Catalog:        catalogproto.CatalogLaneProof{Tenant: "test", Generation: account.Generation, Requested: 1},
+		SourceRevision: 1,
 	}
-}
-
-func TestProbeWinnerHonorsSelectionDeadline(t *testing.T) {
-	t.Run("fuse refuses when deep-probe budget does not fit", func(t *testing.T) {
-		s, _ := newTestServer(t)
-		setRowKind(t, s, 1, fkoverlay.BackendNFS)
-		account, err := s.m.Store.GetAccount(1)
-		if err != nil {
-			t.Fatal(err)
+	if !s.cl.bindPreparation(token, proof) {
+		t.Fatal("bind preparation failed")
+	}
+	s.activatePrepared = func(_ context.Context, _ store.Account, got catalogproto.TenantPreparationProof, _ func() error) error {
+		if got.SourceRevision != 1 {
+			t.Fatalf("proof source revision = %d", got.SourceRevision)
 		}
-		old := deepProbe
-		calls := 0
-		deepProbe = func(string) error { calls++; return nil }
-		t.Cleanup(func() { deepProbe = old })
-		ctx, cancel := context.WithTimeout(t.Context(), overlay.DeepProbeBound-time.Second)
-		defer cancel()
-		if s.probeWinnerReady(ctx, account) {
-			t.Fatal("fuse winner reported ready without enough probe budget")
-		}
-		if calls != 0 {
-			t.Fatalf("deep probe called %d times without enough deadline", calls)
-		}
-	})
-
-	t.Run("file provider cancellation is not NoVerdict-ready", func(t *testing.T) {
-		s, _ := newTestServer(t)
-		setRowKind(t, s, 1, fkoverlay.BackendFileProvider)
-		account, err := s.m.Store.GetAccount(1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s.fpSynth = alwaysNonEmpty
-		swapFPDomainProbe(t, func(ctx context.Context, _ string) error {
-			<-ctx.Done()
-			return overlay.ErrFPProbeNoVerdict
-		})
-		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
-		defer cancel()
-		if s.probeWinnerReady(ctx, account) {
-			t.Fatal("canceled FP probe reported winner ready")
-		}
-	})
+		return tenantfs.ErrPreparationConflict
+	}
+	response := s.cl.commitSelection(t.Context(), token, s.activateSelection)
+	if response.OK || !strings.Contains(response.Error, tenantfs.ErrPreparationConflict.Error()) {
+		t.Fatalf("commit response = %+v", response)
+	}
+	sessions, err := s.m.Store.ListActiveSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("sessions after stale preparation = %+v", sessions)
+	}
 }
 
 func TestRawSelectHasNoActivationEffects(t *testing.T) {
@@ -320,36 +380,6 @@ func TestCommitSelectionReplaySurvivesDaemonRestart(t *testing.T) {
 	}
 }
 
-func TestForcedSelectionRefusesAccountUnderConversion(t *testing.T) {
-	s, _ := newTestServer(t)
-	accountID := 1
-	if !s.cl.own(accountID) {
-		t.Fatal("could not acquire conversion claim")
-	}
-	defer s.cl.disownConvert(accountID)
-	for name, process := range map[string]store.ProcessIdentity{
-		"inspect": {},
-		"run":     {PID: 4242, StartedAt: time.Now().Add(-time.Minute)},
-	} {
-		t.Run(name, func(t *testing.T) {
-			var processStartedAt int64
-			if !process.StartedAt.IsZero() {
-				processStartedAt = process.StartedAt.UnixMicro()
-			}
-			resp := s.handleSelect(t.Context(), Request{
-				Op: OpSelect, Account: &accountID, PID: process.PID,
-				ProcessStartedAt: processStartedAt, Cwd: "/proj",
-			})
-			if resp.OK || !strings.Contains(resp.Error, "migrating overlays") {
-				t.Fatalf("selection under conversion = %+v", resp)
-			}
-			if resp.ReservationToken != "" || s.cl.reservedCount(accountID) != 0 {
-				t.Fatalf("selection under conversion retained reservation: %+v", resp)
-			}
-		})
-	}
-}
-
 func TestCommitSelectionFailureReleasesPromotedReservation(t *testing.T) {
 	s, _ := newTestServer(t)
 	forced := 1
@@ -411,7 +441,12 @@ func TestRunCommitRejectsAccountGenerationChange(t *testing.T) {
 	if !resp.OK {
 		t.Fatalf("select = %+v", resp)
 	}
-	if err := s.m.Store.SetAccountOverlayKind(forced, "fileprovider"); err != nil {
+	a, err := s.m.Store.GetAccount(forced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.ConfigDir += "-replacement"
+	if err := s.m.Store.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
 
@@ -537,8 +572,6 @@ func TestHandleSelectHoldsLiveOnlyPin(t *testing.T) {
 	if !ok || st.AccountID != 2 {
 		t.Fatalf("held pin was repointed: %+v ok=%v", st, ok)
 	}
-	// Drain the preflight goroutine before reading the shared log buffer.
-	s.wg.Wait()
 	if !strings.Contains(buf.String(), "select (pin-held): /proj -> acct-01") {
 		t.Fatalf("held pin not logged: %q", buf.String())
 	}
@@ -718,80 +751,6 @@ func TestHandleStatusPropagatesExhaustionAndOverage(t *testing.T) {
 	}
 }
 
-// TestHandleStatusSurfacesContentHealth pins the status wire's content-health
-// field: a nil or healthy content source reads empty, recorded degraded-read
-// failures surface with errors.Join's newlines folded to "; " (doctor renders
-// one line), and the next successful reads clear it.
-func TestHandleStatusSurfacesContentHealth(t *testing.T) {
-	s, _ := newTestServer(t)
-	if got := s.handleStatus(t.Context()).ContentHealth; got != "" {
-		t.Fatalf("nil content source must read healthy, got %q", got)
-	}
-
-	home := t.TempDir()
-	claudeDir := filepath.Join(home, ".claude")
-	baseJSON := filepath.Join(home, ".claude.json")
-	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	domain := filepath.Join(home, "acct-01")
-	priv := fkoverlay.FusePrivateRoot(domain)
-	if err := os.MkdirAll(priv, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(priv, ".claude.json"), []byte(`{"userID":"u"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s.contentSource = overlay.NewPoolContentSource(claudeDir, baseJSON, filepath.Join(t.TempDir(), "content-stamps"))
-	if got := s.handleStatus(t.Context()).ContentHealth; got != "" {
-		t.Fatalf("healthy content source must read empty, got %q", got)
-	}
-
-	// Corrupt both shared bases: each ReadSynth degrades to raw bytes (no
-	// error to the session) while recording the failure for HealthErrors.
-	if err := os.WriteFile(baseJSON, []byte("{not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte("{not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.contentSource.ReadSynth(domain, ".claude.json"); err != nil {
-		t.Fatalf("degraded claude.json read must not error: %v", err)
-	}
-	if _, err := s.contentSource.ReadSynth(domain, "settings.json"); err != nil {
-		t.Fatalf("degraded settings.json read must not error: %v", err)
-	}
-	got := s.handleStatus(t.Context()).ContentHealth
-	for _, frag := range []string{"merge claude.json for " + domain, "inject plansDirectory"} {
-		if !strings.Contains(got, frag) {
-			t.Errorf("content health %q missing %q", got, frag)
-		}
-	}
-	if strings.Contains(got, "\n") {
-		t.Errorf("content health must be newline-free on the wire, got %q", got)
-	}
-	if !strings.Contains(got, "; ") {
-		t.Errorf("joined failures must be %q-separated, got %q", "; ", got)
-	}
-
-	// The next successful read of each entry clears its recorded failure.
-	if err := os.WriteFile(baseJSON, []byte(`{"firstStartTime":"2026-01-01"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.contentSource.ReadSynth(domain, ".claude.json"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.contentSource.ReadSynth(domain, "settings.json"); err != nil {
-		t.Fatal(err)
-	}
-	if got := s.handleStatus(t.Context()).ContentHealth; got != "" {
-		t.Fatalf("cleared failures still on the wire: %q", got)
-	}
-}
-
 // TestHandleSelectNoneAvailable: all rate-limited → structured NoneAvailable
 // plus the soonest reset for --wait, read through to each account's last
 // known-good sample.
@@ -866,181 +825,5 @@ func commitSelectResponse(t *testing.T, s *Server, resp Response) {
 	committed := s.handleSelectCommit(context.Background(), Request{Op: OpSelectCommit, ReservationToken: resp.ReservationToken})
 	if !committed.OK {
 		t.Fatalf("commit selection: %+v", committed)
-	}
-}
-
-// TestServeDrainsInFlightHandlerOnShutdown: a work op admitted at frame receipt
-// settles to its terminal response before serve returns, so Run's deferred
-// m.Close() cannot race it. drain.Settle blocks the teardown until the admitted
-// handler finishes — the settle-before-cancel guarantee.
-func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// macOS caps sun_path at 104 bytes; the socket gets its own short dir.
-	sockDir, err := os.MkdirTemp("/tmp", "ccp-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
-
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	settledCtx := make(chan error, 1)
-	var logBuf bytes.Buffer
-	s := &Server{
-		m:        &pool.Manager{Store: st},
-		socket:   filepath.Join(sockDir, "d.sock"),
-		snapshot: filepath.Join(t.TempDir(), "status.json"),
-		log:      log.New(&logBuf, "", 0),
-		cl:       newClaims(),
-		led:      newLedgers(),
-	}
-	// A work op that blocks in dispatch after admission: it pins the drain open,
-	// proving serve settles admitted work before returning (and before m.Close).
-	var enteredOnce sync.Once
-	s.fpBridgeCheckFn = func(ctx context.Context) FPBridgeStatus {
-		enteredOnce.Do(func() { close(entered) })
-		<-release
-		settledCtx <- ctx.Err()
-		return FPBridgeStatus{Verdict: FPBridgeServing}
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var serveErr error
-	done := make(chan struct{})
-	go func() {
-		serveErr = s.serve(ctx)
-		close(done)
-	}()
-
-	// Admit a work op and block it in dispatch.
-	client := &Client{socket: s.socket, sessions: make(map[*clientSession]struct{})}
-	defer func() { _ = client.Close() }()
-	deadline := time.Now().Add(5 * time.Second)
-	for !client.Available() {
-		if time.Now().After(deadline) {
-			t.Fatal("daemon never became available")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	type callResult struct {
-		resp *Response
-		err  error
-	}
-	called := make(chan callResult, 1)
-	go func() {
-		resp, err := client.FPBridgeCheck()
-		called <- callResult{resp: resp, err: err}
-	}()
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("work handler never entered dispatch")
-	}
-
-	cancel()
-
-	// drain.Settle blocks on the admitted handler: serve must not return yet.
-	select {
-	case <-done:
-		t.Fatal("serve returned while an admitted handler was still in flight")
-	case <-time.After(300 * time.Millisecond):
-	}
-
-	close(release)
-	if err := <-settledCtx; err != nil {
-		t.Fatalf("in-flight handler context canceled before settle: %v", err)
-	}
-	result := <-called
-	if result.err != nil {
-		t.Fatalf("in-flight request failed during shutdown: %v", result.err)
-	}
-	if !result.resp.OK || result.resp.Error != "" {
-		t.Fatalf("in-flight request failed during shutdown: %+v", result.resp)
-	}
-
-	<-done
-	if serveErr != nil {
-		t.Fatalf("serve: %v", serveErr)
-	}
-	// logBuf is safe to read here: every writer goroutine exited before done.
-	if strings.Contains(logBuf.String(), "database is closed") {
-		t.Fatalf("teardown raced an in-flight handler:\n%s", logBuf.String())
-	}
-}
-
-// TestServeShutdownLeavesMountsUntouched: daemon shutdown leaves fuse mirrors
-// to the detached holder — no Teardown on any path. All provider resolution
-// flows through the injected fake, so zero recorded calls proves it.
-func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	s, dirs := newTestServer(t)
-	fake := &fakeFuseProv{} // Provider Check nil: the startup reconcile adopts the mount
-	s.m.OverlayFor = func(backend fkoverlay.Backend) (fkoverlay.Provider, error) {
-		if backend.IsFuse() {
-			return fake, nil
-		}
-		return &fkoverlay.SymlinkProvider{Spec: s.m.OverlaySpec()}, nil
-	}
-	a, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a.OverlayKind = "nfs"
-	if err := s.m.Store.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
-	// A migrated fuse account's dir is a mux bridge symlink; the startup reconcile
-	// adopts the live mirror (fake provider Check nil) rather than migrating it.
-	makeBridge(t, dirs[1])
-	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
-
-	sockDir, err := os.MkdirTemp("/tmp", "ccp-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
-	s.socket = filepath.Join(sockDir, "d.sock")
-	s.evictTimeout = defaultEvictTimeout
-	var buf bytes.Buffer
-	s.log = log.New(&buf, "", 0)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- s.serve(ctx) }()
-
-	// Wait for the startup reconcile to reach acct-1's provider Check before
-	// shutting down; otherwise the cancelled ctx skips the reconcile and the
-	// adopt assertion races startup.
-	deadline := time.Now().Add(10 * time.Second)
-	for fake.checkCount() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("startup reconcile never probed the fuse mount")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	cl := &Client{socket: s.socket}
-	defer func() { _ = cl.Close() }()
-	if resp, err := cl.Shutdown(); err != nil || !resp.OK {
-		t.Fatalf("shutdown: resp = %+v, err = %v", resp, err)
-	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("serve: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("serve did not return after lifecycle shutdown")
-	}
-
-	if got := fake.callOrder(); len(got) != 0 {
-		t.Fatalf("daemon lifecycle touched the mount: provider calls = %v, want none", got)
-	}
-	if !strings.Contains(buf.String(), "adopted live mount") {
-		t.Fatalf("startup reconcile did not adopt the live mount:\n%s", buf.String())
 	}
 }

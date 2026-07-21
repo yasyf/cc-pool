@@ -11,9 +11,15 @@ import (
 )
 
 // SnapshotVersion is the exact on-disk status format accepted by the widget.
-// Daemon transport compatibility is daemonkit wire v4 and is deliberately not
-// coupled to this derived snapshot.
-const SnapshotVersion = 2
+// Daemon transport identity is owned by daemonkit and deliberately not coupled
+// to this derived snapshot.
+const SnapshotVersion = 1
+
+// BusinessBuild is the exact control-plane schema identity.
+const BusinessBuild = "cc-pool.rpc.v1"
+
+// ServiceRoleID is the exact request-daemon role shared by launchd and lifecycle admission.
+const ServiceRoleID = "com.yasyf.cc-pool"
 
 // Op is a request operation.
 type Op string
@@ -27,14 +33,93 @@ const (
 	OpSelectAbort Op = "select-abort"
 	// OpStatus returns scored status for all accounts.
 	OpStatus Op = "status"
-	// OpMigrate converts accounts between overlay providers.
-	OpMigrate Op = "migrate"
 	// OpCredMove moves account credentials between backends.
 	OpCredMove Op = "credmove"
-	// OpFPRepair re-registers wedged File Provider domains.
-	OpFPRepair Op = "fprepair"
-	// OpFPBridgeCheck self-tests the File Provider content bridge on demand.
-	OpFPBridgeCheck Op = "fpbridgecheck"
+	// OpAccountRemove durably deprovisions and destroys one account.
+	OpAccountRemove Op = "account-remove"
+	// OpAccountIdentity reads worker-validated identity metadata for one account.
+	OpAccountIdentity Op = "account-identity"
+	// OpAccountHealth verifies one account's backing identity and credential stores.
+	OpAccountHealth Op = "account-health"
+	// OpAccountMutation starts or attaches to one daemon-owned credential workflow.
+	OpAccountMutation Op = "account-mutation"
+	// OpAccountMutationAck acknowledges one replayed terminal workflow receipt.
+	OpAccountMutationAck Op = "account-mutation-ack"
+)
+
+// AccountMutationKind names one daemon-only account/credential workflow.
+type AccountMutationKind string
+
+const (
+	AccountMutationAdd         AccountMutationKind = "add"
+	AccountMutationRelogin     AccountMutationKind = "relogin"
+	AccountMutationSyncInstall AccountMutationKind = "sync-install"
+)
+
+// AccountMutationAction is the only client-controlled workflow input. The
+// daemon alone advances reserve/apply/publish/compensate states.
+type AccountMutationAction string
+
+const (
+	AccountMutationStartOrAttach AccountMutationAction = "start-or-attach"
+	AccountMutationProvideInput  AccountMutationAction = "provide-input"
+	AccountMutationCancel        AccountMutationAction = "cancel"
+)
+
+// AccountMutationRequest carries workflow intent plus the exact daemon-issued
+// fence required after StartOrAttach. It cannot select an internal mutation transition.
+type AccountMutationRequest struct {
+	Kind           AccountMutationKind   `json:"kind"`
+	Action         AccountMutationAction `json:"action"`
+	AccountID      int                   `json:"account_id,omitempty"`
+	Label          string                `json:"label,omitempty"`
+	Fence          AccountMutationFence  `json:"fence,omitzero"`
+	TerminalCursor *uint64               `json:"terminal_cursor,omitempty"`
+}
+
+// AccountMutationFence prevents publication across account/removal/credential drift.
+type AccountMutationFence struct {
+	CanonicalOperationID [32]byte `json:"canonical_operation_id,omitempty"`
+	AccountInstanceID    string   `json:"account_instance_id,omitempty"`
+	AccountGeneration    uint64   `json:"account_generation,omitempty"`
+	RegistrySequence     uint64   `json:"registry_sequence,omitempty"`
+	CredentialDigest     [32]byte `json:"credential_digest,omitempty"`
+}
+
+// AccountMutationResult is an exact replayable stage result.
+type AccountMutationResult struct {
+	OperationID [32]byte             `json:"operation_id"`
+	Kind        AccountMutationKind  `json:"kind"`
+	State       AccountMutationState `json:"state"`
+	AccountID   int                  `json:"account_id,omitempty"`
+	ConfigDir   string               `json:"config_dir,omitempty"`
+	Label       string               `json:"label,omitempty"`
+	Fence       AccountMutationFence `json:"fence,omitzero"`
+	Completed   bool                 `json:"completed,omitempty"`
+}
+
+// AccountIdentityResult is the minimal worker-validated account identity projection.
+type AccountIdentityResult struct {
+	AccountID    int    `json:"account_id"`
+	AccountUUID  string `json:"account_uuid"`
+	EmailAddress string `json:"email_address,omitempty"`
+}
+
+// AccountHealthResult proves the daemon completed every account health check.
+type AccountHealthResult struct {
+	AccountID int `json:"account_id"`
+}
+
+// AccountMutationState is a closed daemon-owned externally observable state.
+type AccountMutationState string
+
+const (
+	AccountMutationAwaitingInput AccountMutationState = "awaiting-input"
+	AccountMutationApplying      AccountMutationState = "applying"
+	AccountMutationCompleted     AccountMutationState = "completed"
+	AccountMutationCancelled     AccountMutationState = "cancelled"
+	AccountMutationSuperseded    AccountMutationState = "superseded"
+	AccountMutationQuarantined   AccountMutationState = "quarantined"
 )
 
 // Request is one typed daemon operation payload. Op is carried by the daemonkit
@@ -48,120 +133,74 @@ type Request struct {
 	// NoFallback: report none-available instead of a least-bad exhausted pick;
 	// no provisional selection is created when no account can serve.
 	NoFallback bool `json:"no_fallback,omitempty"`
-	// To: target overlay kind for migrate ("fuse" or "symlink") or credential
-	// backend for credmove ("keychain" or "file"). Only the daemon converts or
-	// moves: it owns the reservations and poll claims those ops gate on.
+	// To is the credential backend for credmove ("keychain" or "file").
 	To string `json:"to,omitempty"`
-	// Force: migrate despite live sessions. Reservations still refuse — a
-	// reserved account has a claude launching into it right now. Ignored by
-	// credmove: moving a credential under a live session forks its
-	// refresh-token chain, so that gate has no override.
-	Force bool `json:"force,omitempty"`
-	// Retreat: on fprepair, retreat the target File Provider domain(s) to the
-	// symlink floor instead of re-registering. This is the ONLY path that reaches
-	// the (now automatic-retreat-removed) File-Provider→symlink conversion; the
-	// heal breaker parks a wedged-but-controllable domain rather than retreating it.
-	Retreat bool `json:"retreat,omitempty"`
 	// ExcludeIDs removes account-local preparation failures from a retry ranking.
 	ExcludeIDs []int `json:"exclude_ids,omitempty"`
 	// ReservationToken identifies a provisional select for commit or abort.
 	ReservationToken string `json:"reservation_token,omitempty"`
+	// DeleteCredential controls whether account removal destroys its Keychain item.
+	DeleteCredential bool `json:"delete_credential,omitempty"`
+	// Mutation is required only for OpAccountMutation.
+	Mutation        *AccountMutationRequest `json:"mutation,omitempty"`
+	MutationReceipt *[32]byte               `json:"mutation_receipt,omitempty"`
 }
 
-// MigrationOutcome classifies one account's migrate or credmove result.
-type MigrationOutcome string
+// CredentialMoveOutcome classifies one account's credential move result.
+type CredentialMoveOutcome string
 
 const (
-	// MigrationDone means the account converted.
-	MigrationDone MigrationOutcome = "done"
-	// MigrationAlready means the account was already the target kind.
-	MigrationAlready MigrationOutcome = "already"
-	// MigrationBusy means a live session or reservation blocked it; re-run later.
-	MigrationBusy MigrationOutcome = "busy"
-	// MigrationFailed means the conversion errored (detail says why).
-	MigrationFailed MigrationOutcome = "failed"
+	// CredentialMoveDone means the credential moved.
+	CredentialMoveDone CredentialMoveOutcome = "done"
+	// CredentialMoveAlready means the credential was already in the target backend.
+	CredentialMoveAlready CredentialMoveOutcome = "already"
+	// CredentialMoveBusy means a live session or reservation blocked it; re-run later.
+	CredentialMoveBusy CredentialMoveOutcome = "busy"
+	// CredentialMoveFailed means the move errored (detail says why).
+	CredentialMoveFailed CredentialMoveOutcome = "failed"
 )
 
-// MigrationResult is one account's outcome in a migrate or credmove response.
-// From/To carry overlay kinds for migrate and credential backend names
-// ("keychain"/"file") for credmove; From is empty when the move never probed
-// the source (busy/failed).
-type MigrationResult struct {
-	ID      int              `json:"id"`
-	Label   string           `json:"label,omitempty"`
-	From    string           `json:"from,omitempty"`
-	To      string           `json:"to,omitempty"`
-	Outcome MigrationOutcome `json:"outcome"`
-	Detail  string           `json:"detail,omitempty"` // busy reason / failure text
+// CredentialMoveResult is one account's credential move outcome.
+type CredentialMoveResult struct {
+	ID      int                   `json:"id"`
+	Label   string                `json:"label,omitempty"`
+	From    string                `json:"from,omitempty"`
+	To      string                `json:"to,omitempty"`
+	Outcome CredentialMoveOutcome `json:"outcome"`
+	Detail  string                `json:"detail,omitempty"`
 }
 
-// FPRepairOutcome classifies one domain's `ccp fp repair` result.
-type FPRepairOutcome string
-
-const (
-	// FPRepairRepaired means the domain re-registered; the next probe verifies it.
-	FPRepairRepaired FPRepairOutcome = "repaired"
-	// FPRepairRetreated means File Provider cannot serve here; the account fell back to symlink.
-	FPRepairRetreated FPRepairOutcome = "retreated"
-	// FPRepairBusy means the domain is held by a pending select; retry.
-	FPRepairBusy FPRepairOutcome = "busy"
-	// FPRepairFailed means the re-register errored (detail says why).
-	FPRepairFailed FPRepairOutcome = "failed"
-)
-
-// FPRepairResult is one account's `ccp fp repair` outcome.
-type FPRepairResult struct {
-	ID      int             `json:"id"`
-	Label   string          `json:"label,omitempty"`
-	Outcome FPRepairOutcome `json:"outcome"`
-	Detail  string          `json:"detail,omitempty"` // failure text / retreat reason
-}
-
-// LedgerState is one self-heal ledger row on the status wire: the composed
-// observability view over both ledger stores (the Server-owned store and the
-// holder cache's fuse verdict rows — composed at snapshot time, never merged).
-// Parked is computed against the row's policy. Additive; status only.
+// LedgerState is one daemon-owned auth or rate-limit gate row on the status wire.
 type LedgerState struct {
 	Policy   string    `json:"policy"`
 	Resource string    `json:"resource"`
 	Strikes  int       `json:"strikes,omitempty"`
 	Faulted  bool      `json:"faulted,omitempty"`
 	Attempts int       `json:"attempts,omitempty"`
-	AltHits  int       `json:"alt_hits,omitempty"`
-	Parked   bool      `json:"parked,omitempty"`
 	NextDue  time.Time `json:"next_due,omitzero"`
 	LastErr  string    `json:"last_err,omitempty"`
 	LastAt   time.Time `json:"last_at,omitzero"`
 }
 
-// HolderStatus is the daemon's cached view of the detached mount holder.
-type HolderStatus struct {
-	// Version is the holder's reported build version; "" means the holder was
-	// unreachable at the daemon's last refresh.
-	Version string `json:"version"`
-	// Mounts counts the live mirrors in the holder's last List.
-	Mounts int `json:"mounts"`
-}
-
 // AccountStatus is the per-account view returned by status/select.
 type AccountStatus struct {
-	ID             int       `json:"id"`
-	ConfigDir      string    `json:"config_dir"`
-	Label          string    `json:"label"`
-	OverlayKind    string    `json:"overlay_kind"`
-	Score          float64   `json:"score"`
-	Remaining5h    float64   `json:"remaining_5h"`
-	Remaining7d    float64   `json:"remaining_7d"`
-	ActiveSessions int       `json:"active_sessions"`
-	RateLimited    bool      `json:"rate_limited"`
-	Exhausted      bool      `json:"exhausted,omitempty"`       // a window is pegged with its reset pending
-	NeedsLogin     bool      `json:"needs_login,omitempty"`     // refresh token gone/revoked; run `ccp login N`
-	AwaitingOrigin bool      `json:"awaiting_origin,omitempty"` // synced peer copy expired; recovers on origin rotation or a local `ccp login`
-	HasUsage       bool      `json:"has_usage"`                 // false when there is no known-good sample (never sampled, or only 429 placeholders)
-	Stale          bool      `json:"stale"`
-	Resets5h       time.Time `json:"resets_5h"`
-	Resets7d       time.Time `json:"resets_7d"`
-	SampleAge      string    `json:"sample_age"`
+	ID                    int       `json:"id"`
+	ConfigDir             string    `json:"config_dir"`
+	Label                 string    `json:"label"`
+	Score                 float64   `json:"score"`
+	Remaining5h           float64   `json:"remaining_5h"`
+	Remaining7d           float64   `json:"remaining_7d"`
+	ActiveSessions        int       `json:"active_sessions"`
+	RateLimited           bool      `json:"rate_limited"`
+	Exhausted             bool      `json:"exhausted,omitempty"`   // a window is pegged with its reset pending
+	NeedsLogin            bool      `json:"needs_login,omitempty"` // refresh token gone/revoked; run `ccp login N`
+	CredentialQuarantined bool      `json:"credential_quarantined,omitempty"`
+	AwaitingOrigin        bool      `json:"awaiting_origin,omitempty"` // synced peer copy expired; recovers on origin rotation or a local `ccp login`
+	HasUsage              bool      `json:"has_usage"`                 // false when there is no known-good sample (never sampled, or only 429 placeholders)
+	Stale                 bool      `json:"stale"`
+	Resets5h              time.Time `json:"resets_5h"`
+	Resets7d              time.Time `json:"resets_7d"`
+	SampleAge             string    `json:"sample_age"`
 	// Forecast fields; all omitted when no projection is possible, so the
 	// widget decodes them as optionals.
 	Burn5hPerHour float64 `json:"burn_5h_per_hour,omitempty"` // %/hr drain
@@ -215,11 +254,9 @@ type PoolOutlook struct {
 	// key and type are unchanged; only its meaning tightens.
 	Remaining7dPct float64 `json:"remaining_7d_pct"`
 	Burn5hPerHour  float64 `json:"burn_5h_per_hour,omitempty"`
-	// NetBurn5hPerHour is deliberately NOT omitempty: 0 is a real value, and
-	// the widget falls back to gross burn on an absent key.
+	// NetBurn5hPerHour is required because zero is a real idle-pool value.
 	NetBurn5hPerHour float64 `json:"net_burn_5h_per_hour"`
-	// Pace5h and Pace7d are deliberately NOT omitempty: 0 is a real value
-	// (idle pool), and the widget re-derives pace locally on an absent key.
+	// Pace5h and Pace7d are required because zero is a real idle-pool value.
 	Pace5h float64       `json:"pace_5h"`
 	Pace7d float64       `json:"pace_7d"`
 	DryAt  time.Time     `json:"dry_at,omitzero"`
@@ -301,45 +338,14 @@ type Response struct {
 	PinHeldAccount *int `json:"pin_held_account,omitempty"`
 	// NoneAvailable: select found no servable account (all rate-limited or the
 	// pool is empty) — a structured signal so clients don't match error strings.
-	NoneAvailable bool `json:"none_available,omitempty"`
-	// MountsNotReady: the none-available verdict is a mount-layer fact — every
-	// account has headroom but none has a mounted, healthy mirror — so clients
-	// don't misreport it as exhausted/rate-limited.
-	MountsNotReady bool            `json:"mounts_not_ready,omitempty"`
-	Accounts       []AccountStatus `json:"accounts,omitempty"` // status
-	Holder         *HolderStatus   `json:"holder,omitempty"`   // status: mount-holder cache
-	// ContentHealth joins the daemon content source's recorded read and
-	// write-through failures for the computed files (merged .claude.json,
-	// injected settings.json) it serves over the holder and File Provider
-	// bridges, "; "-separated; "" when every domain's content is healthy.
-	// Status only.
-	ContentHealth string `json:"content_health,omitempty"`
-	// FPConsentPending: the daemon's File Provider bridge bind has not
-	// completed while the daemon is alive — the signature of a live app-group-
-	// container TCC denial. A release daemon ships as the signed CCPoolDaemon.app
-	// bundle (app-group entitlement + embedded Developer ID profile), so its
-	// container access is prompt-free and this never trips; an unbundled dev build
-	// has no container and takes the hard-error path instead. Additive; status
-	// only.
-	FPConsentPending bool `json:"fp_consent_pending,omitempty"`
-	// FPBridgeUp: the daemon's File Provider data socket is accepting — the
-	// daemon is the only process that dials the group-container bridge, so the
-	// CLI (doctor, onboard, add-failure diagnosis) reads this fact off the status
-	// wire instead of touching the socket itself. A pointer so absence (a
-	// pre-v0.49.1 daemon that predates bridge reporting) is distinguishable from
-	// a down bridge; the daemon always stamps it. Additive; status only.
-	FPBridgeUp *bool `json:"fp_bridge_up,omitempty"`
-	// FPBridge is the on-demand File Provider content-bridge verdict — the
-	// OpFPBridgeCheck op payload, NOT a status projection (the dial-only FPBridgeUp
-	// stays untouched for wire skew).
-	FPBridge *FPBridgeStatus `json:"fp_bridge,omitempty"`
-	// Ledgers is the composed self-heal ledger block: every live ledger row from
-	// both stores (Server-owned and holder-cache), sorted by policy then
-	// resource. Additive; status only.
-	Ledgers    []LedgerState     `json:"ledgers,omitempty"`
-	Version    string            `json:"version,omitempty"`    // health
-	Migrations []MigrationResult `json:"migrations,omitempty"` // migrate/credmove
-	// FPRepairs carries per-account `ccp fp repair` outcomes.
-	FPRepairs    []FPRepairResult `json:"fp_repairs,omitempty"`
-	SoonestReset *time.Time       `json:"soonest_reset,omitempty"`
+	NoneAvailable bool            `json:"none_available,omitempty"`
+	Accounts      []AccountStatus `json:"accounts,omitempty"` // status
+	// Ledgers is the daemon self-heal ledger block, sorted by policy then resource.
+	Ledgers         []LedgerState          `json:"ledgers,omitempty"`
+	Version         string                 `json:"version,omitempty"` // health
+	CredentialMoves []CredentialMoveResult `json:"credential_moves,omitempty"`
+	AccountIdentity *AccountIdentityResult `json:"account_identity,omitempty"`
+	AccountHealth   *AccountHealthResult   `json:"account_health,omitempty"`
+	AccountMutation *AccountMutationResult `json:"account_mutation,omitempty"`
+	SoonestReset    *time.Time             `json:"soonest_reset,omitempty"`
 }

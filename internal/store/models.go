@@ -1,6 +1,9 @@
 package store
 
-import "time"
+import (
+	"crypto/sha256"
+	"time"
+)
 
 // Account is one pool account. ID is the account index (>= 1).
 type Account struct {
@@ -11,9 +14,18 @@ type Account struct {
 	KeychainService string
 	KeychainAccount string
 	Label           string // human note, e.g. an email or alias
-	OverlayKind     string // overlay backend string: "symlink" | "nfs" | "fskit" | "fileprovider"
 	AccountUUID     string // Claude accountUuid; "" until lazily backfilled
 	CreatedAt       time.Time
+}
+
+// AccountRemoval is one crash-recoverable destructive lifecycle intent.
+type AccountRemoval struct {
+	AccountID         int
+	AccountInstanceID string
+	AccountGeneration uint64
+	RegistrySequence  uint64
+	DeleteCredential  bool
+	CreatedAt         time.Time
 }
 
 // UsageSample is one poll of an account's quota windows. Utilization fields are
@@ -74,6 +86,7 @@ type SelectionActivation struct {
 	ExpectedInstanceID string
 	ExpectedGeneration uint64
 	Process            ProcessIdentity
+	ConfigDir          string
 	Cwd                string
 	RecordSticky       bool
 	At                 time.Time
@@ -101,75 +114,89 @@ type CwdActivity struct {
 	LastEnded time.Time // most recent ended_at; zero when none ended
 }
 
-// RefreshEntry is one credential-refresh attempt.
+// RefreshCategory is the non-secret classification of one refresh attempt.
+type RefreshCategory string
+
+const (
+	RefreshSucceeded    RefreshCategory = "succeeded"
+	RefreshCanceled     RefreshCategory = "canceled"
+	RefreshNetwork      RefreshCategory = "network"
+	RefreshInvalidGrant RefreshCategory = "invalid_grant"
+	RefreshRejected     RefreshCategory = "rejected"
+	RefreshServer       RefreshCategory = "server"
+	RefreshInternal     RefreshCategory = "internal"
+)
+
+// RefreshEntry is one credential-refresh attempt. Digest fingerprints the
+// in-memory error without persisting its potentially secret response body.
 type RefreshEntry struct {
 	AccountID int
 	TS        time.Time
-	OK        bool
-	Err       string
+	Category  RefreshCategory
+	Digest    [32]byte
 }
 
 // AuthKind classifies why an account needs re-login, so status can tell a truly
 // owned dead chain apart from a synced peer copy merely waiting on its origin's
-// rotation. The empty value is Owned, so a legacy (pre-kind-column) row and a
-// default backfill both read as Owned.
+// rotation or a chain whose ownership has not been verified.
 type AuthKind string
 
 const (
 	// AuthKindOwned is a chain this host owns (or an account with no sync
 	// entry): only a local `ccp login` recovers it.
-	AuthKindOwned AuthKind = ""
+	AuthKindOwned AuthKind = "owned"
 	// AuthKindAwaitingOrigin is a synced peer copy whose access token expired;
 	// it recovers when the origin host's rotation syncs over, or via a local
 	// `ccp login` that makes this host the origin.
 	AuthKindAwaitingOrigin AuthKind = "awaiting_origin"
+	// AuthKindUnverified means ownership could not be proven and acting as the
+	// origin would be unsafe.
+	AuthKindUnverified AuthKind = "unverified"
 )
 
 // Valid reports whether k is a recognized AuthKind.
 func (k AuthKind) Valid() bool {
 	switch k {
-	case AuthKindOwned, AuthKindAwaitingOrigin:
+	case AuthKindOwned, AuthKindAwaitingOrigin, AuthKindUnverified:
 		return true
 	default:
 		return false
 	}
 }
 
+// AuthReasonCategory is a non-secret authentication-failure classification.
+type AuthReasonCategory string
+
+const (
+	AuthReasonNone           AuthReasonCategory = "none"
+	AuthReasonRequired       AuthReasonCategory = "auth_required"
+	AuthReasonAwaitingOrigin AuthReasonCategory = "awaiting_origin"
+	AuthReasonInternal       AuthReasonCategory = "internal"
+)
+
+// Valid reports whether c is a recognized authentication reason.
+func (c AuthReasonCategory) Valid() bool {
+	switch c {
+	case AuthReasonNone, AuthReasonRequired, AuthReasonAwaitingOrigin, AuthReasonInternal:
+		return true
+	default:
+		return false
+	}
+}
+
+// DigestReason returns the only durable representation of error detail.
+func DigestReason(detail string) [32]byte { return sha256.Sum256([]byte(detail)) }
+
 // AuthHealth is an account's authentication health. NeedsLogin is set by the
 // daemon when the stored refresh token is gone/revoked and only an interactive
-// `ccp login` can recover; Since marks the false→true transition, LastErr the
-// triggering failure, Kind why it needs login, and Gen the monotonic verdict
-// generation. No secrets — a flag, a timestamp, an error string, a kind.
+// `ccp login` can recover; Since marks the false→true transition. Reason and
+// Digest retain classification and correlation without the raw OAuth body.
 type AuthHealth struct {
 	AccountID  int
 	NeedsLogin bool
 	Since      time.Time // zero when NeedsLogin is false
-	LastErr    string
+	Reason     AuthReasonCategory
+	Digest     [32]byte
 	Kind       AuthKind
 	Gen        int64
-}
-
-// JournalRisk records that cc-pool forgot a fuse row (removal, fallback, or
-// conversion) after its holder Unmount confirmed the kernel detach but reported a
-// persist-warning that survived a bounded retry — so the holder's durable journal may
-// replay Dir as a live mount on its next restart. `ccp doctor` surfaces it so the user
-// reconciles after the next holder restart; a later warning-free teardown of Dir, or
-// doctor confirming Dir is no longer mounted, clears it. No secrets — a path, a warning
-// string, a timestamp.
-type JournalRisk struct {
-	Dir        string
-	Warning    string
-	RecordedAt time.Time
-}
-
-// OverlayApplied is the last content generation successfully applied to one
-// account's stored overlay backend. A backend change invalidates the stamps.
-type OverlayApplied struct {
-	AccountID      int
-	Backend        string
-	CanonicalStamp string
-	SettingsStamp  string
-	StructureStamp string
-	AppStamp       string
-	AppliedAt      time.Time
 }

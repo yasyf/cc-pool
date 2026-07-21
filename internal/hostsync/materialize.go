@@ -4,13 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	fkoverlay "github.com/yasyf/fusekit/overlay"
-	"github.com/yasyf/fusekit/state"
 )
 
 // ErrMaterializeNoEnvelope is a retryable materialization failure: no peer
@@ -52,7 +49,11 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		return MaterializeResult{UUID: v.UUID, Deferred: true}, nil
 	}
 
-	p, err := s.M.PrepareAdd(ctx)
+	reservation, err := s.M.ReserveAdd()
+	if err != nil {
+		return MaterializeResult{}, err
+	}
+	p, err := s.M.PrepareReservedAdd(ctx, reservation)
 	if err != nil {
 		return MaterializeResult{}, fmt.Errorf("materialize %s: prepare add: %w", v.UUID, err)
 	}
@@ -76,7 +77,7 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	// credential mid-pull, which AbandonAdd would delete. Only a provably
 	// empty slot is torn down; a retained or unprovable one is released intact.
 	abandonUnlessRetained := func(cause error) (MaterializeResult, error) {
-		retained, err := s.slotRetainsCredential(p)
+		retained, err := s.slotRetainsCredential(ctx, p)
 		switch {
 		case err != nil:
 			return release(errors.Join(cause, err))
@@ -90,7 +91,7 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	// (ReleaseAdd keeps login state); materializing over it would destroy an
 	// owned chain, so abort before touching the dir.
 	if p.ClaudeJSONSeed == pool.SeedKeptExisting {
-		retained, err := s.slotRetainsCredential(p)
+		retained, err := s.slotRetainsCredential(ctx, p)
 		if err != nil {
 			return release(fmt.Errorf("materialize %s: %w", v.UUID, err))
 		}
@@ -101,14 +102,11 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 
 	bootstrapped := false
 	if p.ClaudeJSONSeed == pool.SeedNoSource {
-		// No seed document exists; WriteIdentity would ENOENT forever without this bootstrap.
-		if err := state.AtomicWrite(privateClaudeJSON(p.OverlayKind, p.ConfigDir), []byte("{}"), 0o600); err != nil {
-			return abandon(fmt.Errorf("materialize %s: bootstrap private .claude.json: %w", v.UUID, err))
-		}
+		// The backing worker seeded the minimal onboarding document.
 		bootstrapped = true
 	}
 
-	if err := pool.WriteIdentity(p.OverlayKind, p.ConfigDir, v.OAuthAccount); err != nil {
+	if err := s.M.WriteIdentity(ctx, p.Reservation.ID, p.ConfigDir, v.OAuthAccount); err != nil {
 		return abandon(fmt.Errorf("materialize %s: write identity: %w", v.UUID, err))
 	}
 
@@ -167,9 +165,12 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 // slotAccount is the pending slot's credential coordinates; Discover adopts
 // whatever account label a prior login wrote, and an absent or unsearchable
 // Keychain keeps the default label (the store probes rule on it separately).
-func (s *Service) slotAccount(p *pool.PendingAdd) (store.Account, error) {
-	acct := store.Account{ID: p.Index, ConfigDir: p.ConfigDir, KeychainService: p.KeychainService, KeychainAccount: creds.AccountLabel()}
-	account, err := s.M.Creds.Discover(p.KeychainService)
+func (s *Service) slotAccount(
+	ctx context.Context,
+	p *pool.PendingAdd,
+) (store.Account, error) {
+	acct := store.Account{ID: p.Reservation.ID, InstanceID: p.Reservation.InstanceID, Generation: p.Reservation.Generation, ConfigDir: p.ConfigDir, KeychainService: p.KeychainService, KeychainAccount: creds.AccountLabel()}
+	account, err := s.M.Creds.Discover(ctx, p.KeychainService)
 	switch {
 	case err == nil:
 		acct.KeychainAccount = account
@@ -181,13 +182,16 @@ func (s *Service) slotAccount(p *pool.PendingAdd) (store.Account, error) {
 
 // slotRetainsCredential reports whether a kept dir's credential slot still
 // holds a credential (tombstones excluded); an unprovable backend fails closed.
-func (s *Service) slotRetainsCredential(p *pool.PendingAdd) (bool, error) {
-	acct, err := s.slotAccount(p)
+func (s *Service) slotRetainsCredential(
+	ctx context.Context,
+	p *pool.PendingAdd,
+) (bool, error) {
+	acct, err := s.slotAccount(ctx, p)
 	if err != nil {
 		return false, err
 	}
 	for _, st := range s.M.Creds.Stores(acct) {
-		_, err := st.Read()
+		_, err := st.Read(ctx)
 		switch creds.ClassifyRead(err) {
 		case creds.ReadEmpty:
 		case creds.ReadUnsearchable, creds.ReadFatal:
@@ -210,21 +214,16 @@ func (s *Service) installEnvelope(ctx context.Context, p *pool.PendingAdd, env *
 	case !env.Synced():
 		return false, fmt.Errorf("install credential envelope: %w", pool.ErrEnvelopeNoAccessToken)
 	}
-	// Serializes the empty-proof→write against concurrent cc-pool-side writers;
-	// the in-session claude race stays tracked in ccn 4ed1146.
-	release, err := s.M.LockAccount(ctx, p.Index)
-	if err != nil {
-		return false, err
-	}
-	defer release()
-	acct, err := s.slotAccount(p)
+	// PendingAdd is the durable exclusive reservation for this not-yet-created
+	// account. No account mutex or flock spans the credential I/O.
+	acct, err := s.slotAccount(ctx, p)
 	if err != nil {
 		return false, err
 	}
 	kc := s.M.Creds.Store(acct, creds.SourceKeychain)
 	file := s.M.Creds.Store(acct, creds.SourceFile)
 	target, fileFallback := kc, false
-	_, kcErr := kc.Read()
+	_, kcErr := kc.Read(ctx)
 	switch creds.ClassifyRead(kcErr) {
 	case creds.ReadEmpty:
 		// Provably empty (or a tombstone): install there.
@@ -235,7 +234,7 @@ func (s *Service) installEnvelope(ctx context.Context, p *pool.PendingAdd, env *
 	case creds.ReadPresent:
 		return false, fmt.Errorf("%w: %s holds a credential", pool.ErrCredentialChangedUnderfoot, kc)
 	}
-	_, fErr := file.Read()
+	_, fErr := file.Read(ctx)
 	switch creds.ClassifyRead(fErr) {
 	case creds.ReadEmpty:
 	case creds.ReadUnsearchable, creds.ReadFatal:
@@ -243,18 +242,8 @@ func (s *Service) installEnvelope(ctx context.Context, p *pool.PendingAdd, env *
 	case creds.ReadPresent:
 		return false, fmt.Errorf("%w: %s holds a credential", pool.ErrCredentialChangedUnderfoot, file)
 	}
-	if err := target.Write(env); err != nil {
+	if err := target.Write(ctx, env); err != nil {
 		return false, fmt.Errorf("write credential to %s: %w", target, err)
 	}
 	return fileFallback, nil
-}
-
-// privateClaudeJSON is the account's private .claude.json path — the same
-// private-root math as pool.WriteIdentity and pool.AccountIdentity.
-func privateClaudeJSON(backend fkoverlay.Backend, configDir string) string {
-	priv := configDir
-	if backend != fkoverlay.BackendSymlink {
-		priv = fkoverlay.FusePrivateRoot(configDir)
-	}
-	return filepath.Join(priv, ".claude.json")
 }

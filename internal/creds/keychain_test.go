@@ -71,7 +71,7 @@ func TestSecurityRoundTrip(t *testing.T) {
 	const svc = "Claude Code-credentials-deadbeef"
 	const acct = "tester"
 
-	if _, err := Read(svc, acct); !errors.Is(err, ErrNotFound) {
+	if _, err := Read(t.Context(), testTaskRunner{}, svc, acct); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound before write, got %v", err)
 	}
 
@@ -82,10 +82,10 @@ func TestSecurityRoundTrip(t *testing.T) {
 	cred.ClaudeAiOauth.SubscriptionType = "max"
 	cred.ClaudeAiOauth.Scopes = []string{"user:inference"}
 
-	if err := Write(svc, acct, cred); err != nil {
+	if err := Write(t.Context(), testTaskRunner{}, svc, acct, cred); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	got, err := Read(svc, acct)
+	got, err := Read(t.Context(), testTaskRunner{}, svc, acct)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -95,16 +95,16 @@ func TestSecurityRoundTrip(t *testing.T) {
 	if got.ClaudeAiOauth.SubscriptionType != "max" {
 		t.Fatalf("subscriptionType not preserved: %q", got.ClaudeAiOauth.SubscriptionType)
 	}
-	if acctGot, err := DiscoverAccount(svc); err != nil || acctGot != acct {
+	if acctGot, err := DiscoverAccount(t.Context(), testTaskRunner{}, svc); err != nil || acctGot != acct {
 		t.Fatalf("DiscoverAccount = %q, %v; want %q", acctGot, err, acct)
 	}
-	if err := Delete(svc, acct); err != nil {
+	if err := Delete(t.Context(), testTaskRunner{}, svc, acct); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if _, err := Read(svc, acct); !errors.Is(err, ErrNotFound) {
+	if _, err := Read(t.Context(), testTaskRunner{}, svc, acct); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Read after Delete = %v, want ErrNotFound", err)
 	}
-	if err := Delete(svc, acct); err != nil {
+	if err := Delete(t.Context(), testTaskRunner{}, svc, acct); err != nil {
 		t.Fatalf("Delete of missing should be nil, got %v", err)
 	}
 }

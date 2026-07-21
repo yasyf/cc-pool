@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-
-	"github.com/yasyf/fusekit/state"
+	"os"
+	"path/filepath"
 )
 
 // OAuthAccountKey is the top-level .claude.json key holding an account's
@@ -228,5 +228,42 @@ func normalizeValue(v json.RawMessage) (json.RawMessage, error) {
 // WriteAtomic0600 writes data to dst via temp+rename with mode 0600, creating
 // dst's directory if missing, so a concurrent reader never sees a partial file.
 func WriteAtomic0600(dst string, data []byte) error {
-	return state.AtomicWrite(dst, data, 0o600)
+	directory := filepath.Dir(dst)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(directory, "."+filepath.Base(dst)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	remove := true
+	defer func() {
+		_ = temporary.Close()
+		if remove {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, dst); err != nil {
+		return err
+	}
+	remove = false
+	dir, err := os.Open(directory) //nolint:gosec // caller supplies a cc-pool-owned directory.
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+	return dir.Sync()
 }

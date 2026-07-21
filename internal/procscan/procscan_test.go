@@ -277,40 +277,21 @@ func TestAliveProcesses(t *testing.T) {
 	}
 }
 
-// TestScanBoundsWedgedProcArgs proves scanTimeout releases the caller even when
-// a KERN_PROCARGS2 read is unkillable (the stub ignores ctx). Only a
-// goroutine-decoupled Scan passes; a synchronous walk would hang.
-func TestScanBoundsWedgedProcArgs(t *testing.T) {
+func TestScanReturnsContextCancellationWithoutAbandoningWork(t *testing.T) {
 	origList, origArgs, origTimeout := listProcs, procArgs, scanTimeout
-	release := make(chan struct{})
 	t.Cleanup(func() {
-		close(release) // free the parked stub goroutine
 		listProcs, procArgs, scanTimeout = origList, origArgs, origTimeout
 	})
 
 	scanTimeout = 20 * time.Millisecond
 	listProcs = func(context.Context) ([]proc, error) { return []proc{{pid: 4242}}, nil }
 	procArgs = func(ctx context.Context, _ int) ([]byte, error) {
-		<-release // ignore ctx — mimic a procargs2 copyin that SIGKILL cannot reap
+		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-
-	done := make(chan error, 1)
-	start := time.Now()
-	go func() {
-		_, err := Scan(context.Background())
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("Scan err = %v, want context.DeadlineExceeded", err)
-		}
-		if elapsed := time.Since(start); elapsed > time.Second {
-			t.Fatalf("Scan took %v, want ≲ scanTimeout (%v)", elapsed, scanTimeout)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Scan did not return within the bound — the timeout did not release the caller")
+	_, err := Scan(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Scan err = %v, want context.DeadlineExceeded", err)
 	}
 }
 

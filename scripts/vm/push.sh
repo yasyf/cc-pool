@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 # scripts/vm/push.sh — the cc-pool-specific seam of the VM harness.
 #
-# Host-builds the cc-pool binary (pure Go) and the Developer ID-signed
-# CCPoolStatus.app (the File-Provider-enabled CCPoolStatusFP flavor), installs
+# Host-builds the cc-pool binary (pure Go) and the Developer ID-signed fixed
+# CCPoolStatus.app, installs
 # both into the guest, registers + enables the File Provider extension, and
 # proves the install with an in-guest selftest. The app lands at the production
-# cask path (/Applications/CCPoolStatus.app) so pool.WidgetAppPath() and the FP
-# control/bridge sockets resolve unmodified in the guest.
+# cask path (/Applications/CCPoolStatus.app) so the FP broker/holder identity
+# resolves unmodified in the guest.
 #
 # The FP appex MUST be Developer ID-signed: an ad-hoc signature will not register
-# with pluginkit, so cc-pool's File Provider gate would never see '+'. push
+# with pluginkit, so the installed extension gate would never see '+'. push
 # discovers a "Developer ID Application" identity on the host (team SXKCTF23Q2)
 # and STOPS with guidance if none is usable — it never ships an ad-hoc appex.
-# The cc-pool binary itself stays pure-Go/ad-hoc (its App-Group access is gated
-# by TCC, not by a Developer ID signature).
+# The cc-pool binary itself stays pure Go and never accesses the App Group.
 #
 # BUILD_REV (env-overridable; defaults to the repo short HEAD, "-dirty" when the
 # tree is unclean) is recorded in the guest and host state so `vmctl run` can
@@ -43,13 +42,11 @@ main() {
   IFS=$'\t' read -r sign_id sign_team < <(vm_discover_signing)
   log "signing CCPoolStatus.app with Developer ID $sign_id (team $sign_team)"
 
-  # The App Group is Team-ID-prefixed; assert the appex this build will emit
-  # matches the group the Go daemon compiled in (internal/pool/paths.go), or the
-  # daemon and the extension would never share a container.
+  # The App Group is Team-ID-prefixed and owned only by the fixed signed app.
   local want_group="${sign_team}.ccp" paths_group
-  paths_group="$(sed -n 's/^const AppGroupID = "\(.*\)"$/\1/p' "$REPO_ROOT/internal/pool/paths.go")"
+  paths_group="$(sed -n 's/^[[:space:]]*static let appGroupIdentifier = "\(.*\)"$/\1/p' "$REPO_ROOT/widget/Sources/FileProviderRuntime/Configuration.swift")"
   [[ "$paths_group" == "$want_group" ]] ||
-    die "App Group mismatch: signing team yields $want_group but internal/pool/paths.go pins $paths_group"
+    die "App Group mismatch: signing team yields $want_group but the fixed app pins $paths_group"
 
   local rev
   if [[ -n "${BUILD_REV:-}" ]]; then
@@ -63,36 +60,28 @@ main() {
   rm -rf "$stage"
   mkdir -p "$stage/bin"
 
-  # --- cc-pool binary (pure Go: symlink + File Provider overlay, no cgo) -------
-  local ldflags="-X github.com/yasyf/fusekit/version.Version=vm-$rev -X github.com/yasyf/fusekit/version.Commit=$rev"
+  # --- cc-pool account daemon and CLI (pure Go, no App Group access) -----------
   log "building cc-pool (pure Go, arm64, BUILD_REV=$rev)"
-  (cd "$REPO_ROOT" && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$ldflags" -o "$stage/bin/cc-pool" ./cmd/cc-pool)
-  # ccp is cc-pool's user-facing symlink; the incident command is `ccp migrate`.
+  (cd "$REPO_ROOT" && GOWORK=off CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o "$stage/bin/cc-pool" ./cmd/cc-pool)
+  # ccp is cc-pool's user-facing symlink.
   ln -sf cc-pool "$stage/bin/ccp"
   printf '%s\n' "$rev" >"$stage/BUILD_REV"
 
-  # --- CCPoolDaemon.app: the daemon's durable TCC identity (release.yml parity) ---
-  local daemon_mode="unprofiled"
-  [[ -n "${VMCTL_PROFILE_DAEMON:-}" ]] && daemon_mode="profiled"
-  # Dotted-numeric CFBundleShortVersionString; the commit count is monotonic.
-  local daemon_ver
-  daemon_ver="0.0.$(git -C "$REPO_ROOT" rev-list --count HEAD)"
-  log "assembling $VMCTL_DAEMON_BUNDLE_ID bundle (mode=$daemon_mode, version=$daemon_ver)"
-  vm_build_daemon_bundle "$stage/bin/cc-pool" "$stage/CCPoolDaemon.app" "$sign_id" "$daemon_ver" "$daemon_mode"
-
-  # --- CCPoolStatus.app (CCPoolStatusFP flavor, Developer ID signed) ----------
-  log "building CCPoolStatus.app (CCPoolStatusFP, Developer ID) with $(xcodebuild -version | head -n1)"
-  local dd="$stage/widget-dd"
+  # --- One fixed CCPoolStatus.app identity (holder + broker + extensions) ------
+  local app_version="${VMCTL_APP_VERSION:-0.0.0}" dd="$stage/widget-dd"
+  [[ "$app_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    die "VMCTL_APP_VERSION must be dotted numeric MAJOR.MINOR.PATCH (got $app_version)"
+  log "building CCPoolStatus.app v$app_version (Developer ID) with $(xcodebuild -version | head -n1)"
   (
     cd "$REPO_ROOT/widget"
     xcodegen generate
     # Mirrors release.yml's widget build. CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO
     # keeps a plain `build` from injecting get-task-allow; ENABLE_HARDENED_RUNTIME
-    # + --timestamp match the shipped cask payload. The version stamp is cosmetic
-    # here (the VM never inspects widget tiles), so it is fixed and numeric.
-    xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatusFP \
+    # + --timestamp match the shipped cask payload. VMCTL_APP_VERSION lets the
+    # upgrade gate change the signed payload without changing its identity.
+    xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
       -configuration Release -derivedDataPath "$dd" build \
-      MARKETING_VERSION="0.0.0" \
+      MARKETING_VERSION="$app_version" \
       CURRENT_PROJECT_VERSION="$(git -C "$REPO_ROOT" rev-list --count HEAD)" \
       CODE_SIGN_STYLE=Manual \
       CODE_SIGN_IDENTITY="$sign_id" \
@@ -102,26 +91,42 @@ main() {
       OTHER_CODE_SIGN_FLAGS="--timestamp"
   )
   local app="$dd/Build/Products/Release/CCPoolStatus.app"
-  [[ -d "$app" ]] || die "widget build did not produce $app (wrong scheme? need CCPoolStatusFP)"
+  [[ -d "$app" ]] || die "status app build did not produce $app"
+
+  # Use the same FuseKit-owned reviewed source/sign/license transaction as the
+  # release assertion before the bundle leaves the host.
+  (
+    cd "$REPO_ROOT"
+    GOFLAGS=-mod=readonly go run ./cmd/cc-pool-fuse-package \
+      -app "$app" -signing-identity "$sign_id"
+  ) || die "FuseKit FUSE-T packaging failed for $app"
 
   # Assert the FP appex is present, validly signed, and App-Group-bound — the
   # same drift checks release.yml runs, so a broken build fails here not in-guest.
   local fp_appex="$app/Contents/PlugIns/CCPoolFileProvider.appex"
-  [[ -d "$fp_appex" ]] || die "built app is missing CCPoolFileProvider.appex — wrong scheme? (need CCPoolStatusFP)"
+  [[ -d "$fp_appex" ]] || die "built app is missing CCPoolFileProvider.appex"
   codesign --verify --deep --strict --verbose=2 "$app" || die "codesign verify failed for $app"
   local fp_ents
   fp_ents="$(codesign -d --entitlements - "$fp_appex" 2>&1)"
-  printf '%s' "$fp_ents" | grep -q "com.apple.security.application-groups" ||
-    die "FP appex lacks the App Group entitlement — the daemon bridge would never reach it"
-  if printf '%s' "$fp_ents" | grep -q "fileprovider.testing-mode"; then
+  grep -q "com.apple.security.application-groups" <<<"$fp_ents" ||
+    die "FP appex lacks the App Group entitlement — the signed broker would never reach it"
+  if grep -q "temporary-exception.files.home-relative-path" <<<"$fp_ents"; then
+    die "FP appex directly accesses the home directory instead of the signed broker"
+  fi
+  if grep -q "fileprovider.testing-mode" <<<"$fp_ents"; then
     die "FP appex carries fileprovider.testing-mode (restricted) — it would force a provisioning profile"
   fi
 
   # --- Install into the guest --------------------------------------------------
-  # A stale app or daemon would keep serving the OLD build; stop them first.
-  log "stopping any running guest daemon / companion app"
+  # A stale process would keep serving the old exact protocol; stop the hard-cut
+  # stack before replacing either executable.
+  log "stopping any running guest daemon / signed app"
   # shellcheck disable=SC2029
-  vm_ssh "pkill -x cc-pool 2>/dev/null; osascript -e 'quit app \"CCPoolStatus\"' 2>/dev/null; pkill -f CCPoolStatus 2>/dev/null; true"
+  vm_ssh "pkill -x cc-pool 2>/dev/null; osascript -e 'quit app \"CCPoolStatus\"' 2>/dev/null; \
+    for _ in \$(seq 1 60); do pgrep -x CCPoolStatus >/dev/null || exit 0; sleep 0.5; done; \
+    pkill -TERM -x CCPoolStatus 2>/dev/null; \
+    for _ in \$(seq 1 10); do pgrep -x CCPoolStatus >/dev/null || exit 0; sleep 0.5; done; \
+    pkill -KILL -x CCPoolStatus 2>/dev/null; true"
 
   log "installing cc-pool into the guest: $VMCTL_GUEST_DIR"
   # shellcheck disable=SC2029
@@ -129,9 +134,6 @@ main() {
   # tar over ssh preserves the ccp symlink and perms in one trip.
   # shellcheck disable=SC2029
   tar -C "$stage" -cf - bin BUILD_REV | vm_ssh "tar -xf - -C '$VMCTL_GUEST_DIR'"
-
-  log "installing $VMCTL_GUEST_DAEMON_APP (mode=$daemon_mode)"
-  vm_install_daemon_bundle "$stage/CCPoolDaemon.app" "$VMCTL_GUEST_DAEMON_APP"
 
   log "installing $VMCTL_GUEST_APP"
   # shellcheck disable=SC2029
@@ -144,17 +146,15 @@ main() {
 
   # Register + enable the FP extension now that the app is in place.
   fp_register_and_enable ||
-    warn "FP extension not enabled headlessly — the selftest below confirms; if it fails, use the VMCTL_GRAPHICS=1 click-Allow path (README: FP provisioning)"
+    warn "FP extension not enabled headlessly — the selftest below confirms; if it fails, use the VMCTL_GRAPHICS=1 GUI path (README: File Provider provisioning)"
 
   # Grant fileproviderd's per-provider consent (a SEPARATE gate from pluginkit): the
-  # base image defaults providers to user-disabled, which makes the replay's migrate
-  # capability gate refuse. Fatal on failure — a disabled provider silently fails the
-  # replay downstream, so fail loud here (fp_grant_consent dies unless the read-back
-  # confirms Enabled=true).
+  # base image defaults providers to user-disabled. Fatal on failure: a disabled
+  # provider makes every File Provider scenario meaningless, so fail loud here.
   fp_grant_consent
 
   # --- Selftest ----------------------------------------------------------------
-  # Verify the extension the SAME way the enable step and cc-pool's FP gate do:
+  # Verify the extension the same way the enable step and VM scenarios do:
   # `pluginkit -m -i <bundleid>` must lead with '+'. Do NOT `pluginkit -m | grep
   # ccpool` — the bundle id is com.yasyf.cc-pool.status.fileprovider ("cc-pool"
   # with a HYPHEN), so a hyphen-less pattern never matches even when the plugin
@@ -163,12 +163,6 @@ main() {
   log "guest selftest: cc-pool binary + File Provider extension enabled"
   # shellcheck disable=SC2029
   vm_ssh "'$VMCTL_GUEST_CCP' --version" || die "ccp --version failed in the guest"
-  # The daemon bundle exe must run and carry the app-group entitlement in-guest.
-  # shellcheck disable=SC2029
-  vm_ssh "'$VMCTL_GUEST_DAEMON_EXE' --version" || die "$VMCTL_GUEST_DAEMON_EXE --version failed — the CCPoolDaemon.app bundle did not install/run"
-  # shellcheck disable=SC2029
-  vm_ssh "codesign -d --entitlements - '$VMCTL_GUEST_DAEMON_APP' 2>&1" | grep -q "$(vm_app_group)" ||
-    die "installed $VMCTL_GUEST_DAEMON_APP is missing the app-group entitlement (signature stripped in transit?)"
   local fp_line="" t0
   t0="$(date +%s)"
   while (($(date +%s) - t0 < 15)); do
@@ -182,11 +176,11 @@ main() {
     return 0
   fi
   if [[ -z "$fp_line" ]]; then
-    die "pluginkit shows no $VMCTL_FP_BUNDLE_ID extension — the app did not register (ad-hoc signature? missing LaunchServices scan?); see README: FP provisioning"
+    die "pluginkit shows no $VMCTL_FP_BUNDLE_ID extension — the app did not register (ad-hoc signature? missing LaunchServices scan?); see README: File Provider provisioning"
   fi
-  die "FP extension $VMCTL_FP_BUNDLE_ID is registered but NOT enabled ('$fp_line') — the replay's FP gate will refuse.
+  die "FP extension $VMCTL_FP_BUNDLE_ID is registered but NOT enabled ('$fp_line') — File Provider scenarios cannot run.
 Enable headlessly: scripts/vm/vmctl shell \"pluginkit -e use -i $VMCTL_FP_BUNDLE_ID\"
-Or boot VMCTL_GRAPHICS=1 and flip the Settings File-Provider toggle (README: FP provisioning)"
+Or boot VMCTL_GRAPHICS=1 and flip the Settings File-Provider toggle (README: File Provider provisioning)"
 }
 
 main "$@"

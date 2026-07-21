@@ -1,18 +1,18 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
-	"time"
 )
 
 func openReserveTest(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "pool.db"))
+	s, err := Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,9 +20,9 @@ func openReserveTest(t *testing.T) *Store {
 	return s
 }
 
-func mustReserve(t *testing.T, s *Store) int {
+func mustReserve(t *testing.T, s *Store) PendingAccountReservation {
 	t.Helper()
-	n, err := s.ReserveAccountIndex()
+	n, err := s.ReserveAccountIndex(credentialOperationTestOwner("reservation-owner"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,11 +32,11 @@ func mustReserve(t *testing.T, s *Store) int {
 func TestReserveAccountIndexAllocation(t *testing.T) {
 	t.Run("empty pool starts at 1 and counts up", func(t *testing.T) {
 		s := openReserveTest(t)
-		if n := mustReserve(t, s); n != 1 {
-			t.Fatalf("first index = %d, want 1", n)
+		if n := mustReserve(t, s); n.ID != 1 {
+			t.Fatalf("first index = %d, want 1", n.ID)
 		}
-		if n := mustReserve(t, s); n != 2 {
-			t.Fatalf("second index = %d, want 2 (the first reservation must be visible)", n)
+		if n := mustReserve(t, s); n.ID != 2 {
+			t.Fatalf("second index = %d, want 2 (the first reservation must be visible)", n.ID)
 		}
 	})
 
@@ -50,11 +50,11 @@ func TestReserveAccountIndexAllocation(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if n := mustReserve(t, s); n != 2 {
-			t.Fatalf("gap index = %d, want 2", n)
+		if n := mustReserve(t, s); n.ID != 2 {
+			t.Fatalf("gap index = %d, want 2", n.ID)
 		}
-		if n := mustReserve(t, s); n != 4 {
-			t.Fatalf("next index = %d, want 4 (1,3 taken by rows, 2 by reservation)", n)
+		if n := mustReserve(t, s); n.ID != 4 {
+			t.Fatalf("next index = %d, want 4 (1,3 taken by rows, 2 by reservation)", n.ID)
 		}
 	})
 
@@ -64,27 +64,22 @@ func TestReserveAccountIndexAllocation(t *testing.T) {
 		if err := s.ReleaseAccountIndex(n); err != nil {
 			t.Fatal(err)
 		}
-		if got := mustReserve(t, s); got != n {
-			t.Fatalf("re-reserve = %d, want the released %d", got, n)
+		if got := mustReserve(t, s); got.ID != n.ID {
+			t.Fatalf("re-reserve = %d, want the released %d", got.ID, n.ID)
 		}
 	})
 
 	t.Run("release is idempotent and never frees a finalized account", func(t *testing.T) {
 		s := openReserveTest(t)
 		n := mustReserve(t, s)
-		if err := s.UpsertAccount(Account{ID: n, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"}); err != nil {
+		if err := s.PromoteReservedAccount(n, Account{ID: n.ID, InstanceID: n.InstanceID, Generation: n.Generation, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"}); err != nil {
 			t.Fatal(err)
 		}
-		// Promotion: the row exists, the reservation is dropped — twice, for the
-		// retry paths.
-		if err := s.ReleaseAccountIndex(n); err != nil {
-			t.Fatal(err)
+		if err := s.ReleaseAccountIndex(n); err == nil {
+			t.Fatal("release after promotion succeeded, want exact fence rejection")
 		}
-		if err := s.ReleaseAccountIndex(n); err != nil {
-			t.Fatalf("second release: %v", err)
-		}
-		if got := mustReserve(t, s); got == n {
-			t.Fatalf("reserve = %d, but index %d is held by an accounts row", got, n)
+		if got := mustReserve(t, s); got.ID == n.ID {
+			t.Fatalf("reserve = %d, but index %d is held by an accounts row", got.ID, n.ID)
 		}
 	})
 }
@@ -101,12 +96,12 @@ func TestReserveAccountIndexConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			n, err := s.ReserveAccountIndex()
+			n, err := s.ReserveAccountIndex(credentialOperationTestOwner("reservation-owner"))
 			if err != nil {
 				errs <- err
 				return
 			}
-			got <- n
+			got <- n.ID
 		}()
 	}
 	close(start)
@@ -138,25 +133,14 @@ func TestConsumeAccountIndex(t *testing.T) {
 		if err := s.ConsumeAccountIndex(n); err == nil {
 			t.Fatal("second consume succeeded, want fail-loud on a spent reservation")
 		}
-		if got := mustReserve(t, s); got != n {
-			t.Fatalf("reserve after consume = %d, want the spent %d (no accounts row landed)", got, n)
-		}
-	})
-
-	t.Run("fails loud after a sweep reclaimed the reservation", func(t *testing.T) {
-		s := openReserveTest(t)
-		n := mustReserve(t, s)
-		if _, err := s.SweepPendingAdds(time.Now().Add(time.Hour)); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.ConsumeAccountIndex(n); err == nil {
-			t.Fatal("consume after sweep succeeded, want fail-loud")
+		if got := mustReserve(t, s); got.ID != n.ID {
+			t.Fatalf("reserve after consume = %d, want the spent %d (no accounts row landed)", got.ID, n.ID)
 		}
 	})
 
 	t.Run("fails loud on a never-reserved index", func(t *testing.T) {
 		s := openReserveTest(t)
-		if err := s.ConsumeAccountIndex(7); err == nil {
+		if err := s.ConsumeAccountIndex(PendingAccountReservation{ID: 7, InstanceID: "missing", Generation: 1}); err == nil {
 			t.Fatal("consume of an unreserved index succeeded, want fail-loud")
 		}
 	})
@@ -176,16 +160,16 @@ func TestPendingAddIndexes(t *testing.T) {
 		t.Fatal(err)
 	}
 	sort.Ints(ids)
-	if len(ids) != 2 || ids[0] != a || ids[1] != b {
-		t.Fatalf("PendingAddIndexes = %v, want the two live reservations %d,%d", ids, a, b)
+	if len(ids) != 2 || ids[0] != a.ID || ids[1] != b.ID {
+		t.Fatalf("PendingAddIndexes = %v, want the two live reservations %d,%d", ids, a.ID, b.ID)
 	}
 
 	// Consume promotes a to a row; the reservation must drop from the list.
 	if err := s.ConsumeAccountIndex(a); err != nil {
 		t.Fatal(err)
 	}
-	if ids, err := s.PendingAddIndexes(); err != nil || len(ids) != 1 || ids[0] != b {
-		t.Fatalf("after consume PendingAddIndexes = %v, %v; want only %d", ids, err, b)
+	if ids, err := s.PendingAddIndexes(); err != nil || len(ids) != 1 || ids[0] != b.ID {
+		t.Fatalf("after consume PendingAddIndexes = %v, %v; want only %d", ids, err, b.ID)
 	}
 
 	// Release drops the last reservation.
@@ -197,65 +181,64 @@ func TestPendingAddIndexes(t *testing.T) {
 	}
 }
 
-func TestSweepPendingAdds(t *testing.T) {
+func TestRetiredPendingAddRequiresExactReapReceipt(t *testing.T) {
 	s := openReserveTest(t)
-	n := mustReserve(t, s)
-
-	swept, err := s.SweepPendingAdds(time.Now().Add(-time.Hour))
+	owner := credentialOperationTestOwner("pending-owner")
+	reservation, err := s.ReserveAccountIndex(owner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if swept != 0 {
-		t.Fatalf("swept %d fresh reservations, want 0", swept)
+	newOwner := credentialOperationTestOwner("pending-recovery")
+	if err := s.ReleaseRetiredPendingAdd(
+		t.Context(), reservation, newOwner, procZeroReceipt(), nil,
+	); err == nil {
+		t.Fatal("retired pending add released without an exact receipt")
 	}
-	if got := mustReserve(t, s); got == n {
-		t.Fatalf("reserve = %d, but a fresh reservation must survive the sweep", got)
+	if err := s.ReleaseAccountIndex(PendingAccountReservation{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation, Owner: newOwner,
+	}); err == nil {
+		t.Fatal("foreign owner released pending add")
 	}
-
-	swept, err = s.SweepPendingAdds(time.Now().Add(time.Hour))
-	if err != nil {
+	receipt, verifier := credentialOperationTestRetirement(t, owner, newOwner)
+	if err := s.ReleaseRetiredPendingAdd(
+		t.Context(), reservation, newOwner, receipt, verifier,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if swept != 2 {
-		t.Fatalf("swept = %d, want both stale reservations", swept)
-	}
-	if got := mustReserve(t, s); got != n {
-		t.Fatalf("reserve after sweep = %d, want the reclaimed %d", got, n)
+	if _, err := pendingAccountReservationByID(s.db, reservation.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("retired reservation survived: %v", err)
 	}
 }
 
 func TestPromoteReservedAccount(t *testing.T) {
 	t.Run("spends the reservation and lands the row", func(t *testing.T) {
 		s := openReserveTest(t)
-		id := mustReserve(t, s)
-		acct := Account{ID: id, ConfigDir: "dir", KeychainService: "svc", KeychainAccount: "u"}
-		if err := s.PromoteReservedAccount(acct); err != nil {
+		reservation := mustReserve(t, s)
+		acct := Account{ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation, ConfigDir: "dir", KeychainService: "svc", KeychainAccount: "u"}
+		if err := s.PromoteReservedAccount(reservation, acct); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.GetAccount(id); err != nil {
+		if got, err := s.GetAccount(reservation.ID); err != nil {
 			t.Fatalf("GetAccount after promote: %v", err)
+		} else if got.InstanceID != reservation.InstanceID || got.Generation != reservation.Generation {
+			t.Fatalf("promoted identity = (%q,%d), want (%q,%d)", got.InstanceID, got.Generation, reservation.InstanceID, reservation.Generation)
 		}
-		// The reservation is spent: nothing left to sweep, and the index is held
-		// by the accounts row.
-		if swept, err := s.SweepPendingAdds(time.Now().Add(time.Hour)); err != nil || swept != 0 {
-			t.Fatalf("SweepPendingAdds = %d, %v; want 0, nil", swept, err)
-		}
-		if got := mustReserve(t, s); got == id {
-			t.Fatalf("reserve = %d, but index %d is held by the promoted row", got, id)
+		// The reservation is spent and the index is held by the accounts row.
+		if got := mustReserve(t, s); got.ID == reservation.ID {
+			t.Fatalf("reserve = %d, but index %d is held by the promoted row", got.ID, reservation.ID)
 		}
 	})
 
-	t.Run("fails loud on a swept reservation without writing a row", func(t *testing.T) {
+	t.Run("fails loud on a mismatched owner without writing a row", func(t *testing.T) {
 		s := openReserveTest(t)
-		id := mustReserve(t, s)
-		if _, err := s.SweepPendingAdds(time.Now().Add(time.Hour)); err != nil {
-			t.Fatal(err)
+		reservation := mustReserve(t, s)
+		reservation.Owner = credentialOperationTestOwner("different-owner")
+		acct := Account{ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation, ConfigDir: "dir", KeychainService: "svc", KeychainAccount: "u"}
+		if err := s.PromoteReservedAccount(reservation, acct); err == nil {
+			t.Fatal("promote with a mismatched owner succeeded, want fail-loud")
 		}
-		acct := Account{ID: id, ConfigDir: "dir", KeychainService: "svc", KeychainAccount: "u"}
-		if err := s.PromoteReservedAccount(acct); err == nil {
-			t.Fatal("promote of a swept reservation succeeded, want fail-loud")
-		}
-		if _, err := s.GetAccount(id); !errors.Is(err, ErrAccountNotFound) {
+		if _, err := s.GetAccount(reservation.ID); !errors.Is(err, ErrAccountNotFound) {
 			t.Fatalf("GetAccount after refused promote = %v, want ErrAccountNotFound (no row written)", err)
 		}
 	})
@@ -277,22 +260,24 @@ func TestPromoteReservedAccountConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			id, err := s.ReserveAccountIndex()
+			reservation, err := s.ReserveAccountIndex(credentialOperationTestOwner("reservation-owner"))
 			if err != nil {
 				errs <- err
 				return
 			}
 			acct := Account{
-				ID:              id,
-				ConfigDir:       fmt.Sprintf("dir-%d", id),
-				KeychainService: fmt.Sprintf("svc-%d", id),
+				ID:              reservation.ID,
+				InstanceID:      reservation.InstanceID,
+				Generation:      reservation.Generation,
+				ConfigDir:       fmt.Sprintf("dir-%d", reservation.ID),
+				KeychainService: fmt.Sprintf("svc-%d", reservation.ID),
 				KeychainAccount: "u",
 			}
-			if err := s.PromoteReservedAccount(acct); err != nil {
+			if err := s.PromoteReservedAccount(reservation, acct); err != nil {
 				errs <- err
 				return
 			}
-			got <- id
+			got <- reservation.ID
 		}()
 	}
 	close(start)

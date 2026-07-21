@@ -1,7 +1,6 @@
 package creds
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,39 +34,6 @@ func (s Source) String() string {
 // FileCredentialPath returns the plaintext credential path for a config dir.
 func FileCredentialPath(configDir string) string {
 	return filepath.Join(configDir, credentialFile)
-}
-
-// FileCredentialExists reports whether configDir holds a plaintext credential.
-func FileCredentialExists(configDir string) bool {
-	_, err := os.Stat(FileCredentialPath(configDir))
-	return err == nil
-}
-
-// ReadFileCredential reads and parses the plaintext credential in configDir,
-// returning ErrNotFound when the file is absent.
-func ReadFileCredential(configDir string) (*Credential, error) {
-	path := FileCredentialPath(configDir)
-	b, err := os.ReadFile(path) //nolint:gosec // G304: path is the account's own .credentials.json under the cc-pool-managed config dir
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
-	}
-	return parseCredential(b)
-}
-
-// WriteFileCredential writes cred to configDir's plaintext credential file at
-// 0600, atomically so a concurrent reader never sees a partial file.
-func WriteFileCredential(configDir string, cred *Credential) error {
-	if err := cred.validateForWrite(); err != nil {
-		return err
-	}
-	blob, err := cred.Marshal()
-	if err != nil {
-		return err
-	}
-	return writeCredentialFile(FileCredentialPath(configDir), blob)
 }
 
 // writeCredentialFile writes via temp+rename at 0600. The temp keeps the

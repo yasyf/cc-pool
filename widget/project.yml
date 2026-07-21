@@ -2,20 +2,21 @@
 # `xcodegen generate` emits CCPoolStatus.xcodeproj plus the Info.plists and
 # entitlements under Generated/ — all gitignored; this file is the source of truth.
 #
-# Signing: ad-hoc by default (runs locally, no Apple ID). If chronod refuses to
-# load the ad-hoc-signed widget, switch to a free personal team:
-#   xcodebuild ... CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=<TEAMID> -allowProvisioningUpdates
-#
-# Two host-app flavors share the HostApp template: CCPoolStatus (ad-hoc, widget
-# appex only — the unchanged local build) and CCPoolStatusFP (adds the File
-# Provider appex + App Group entitlements; identity/team come from the
-# xcodebuild command line: CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=SXKCTF23Q2).
+# The one fixed signed host embeds both extensions and owns the FuseKit broker.
 name: CCPoolStatus
 options:
   bundleIdPrefix: com.yasyf.cc-pool
   deploymentTarget:
-    macOS: "14.0"
+    macOS: "15.0"
   createIntermediateGroups: true
+
+packages:
+  FuseKit:
+    url: https://github.com/yasyf/fusekit.git
+    revision: c7394abfd1455f465dd12e9389b29352150e0449
+  DaemonKit:
+    url: https://github.com/yasyf/daemonkit.git
+    revision: c39154cdbd0aaafdb47f937614ec23e8fef7e529
 
 # release-app.yml writes a per-build Version.xcconfig before `xcodegen generate`;
 # keep MARKETING_VERSION/CURRENT_PROJECT_VERSION out of `settings:` so it wins.
@@ -37,6 +38,7 @@ targetTemplates:
     sources:
       - path: Sources/App
       - path: Sources/Shared
+      - path: Sources/FileProviderRuntime
     info:
       properties:
         CFBundleDisplayName: cc-pool Status
@@ -51,44 +53,56 @@ targetTemplates:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.yasyf.cc-pool.status
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/HolderBridge/CCPoolFuseKitBridge.h
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - $(DERIVED_FILE_DIR)/libCCPoolFuseKit.a
         # Sources/App/Assets.xcassets is auto-included by the Sources/App source
         # path; this names its appiconset as the app icon the widget gallery shows.
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    preBuildScripts:
+      - name: Build embedded FuseKit runtime
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          arm64_archive="$DERIVED_FILE_DIR/libCCPoolFuseKit-arm64.a"
+          x86_archive="$DERIVED_FILE_DIR/libCCPoolFuseKit-x86_64.a"
+          archive="$DERIVED_FILE_DIR/libCCPoolFuseKit.a"
+          cd "$SRCROOT/.."
+          holder_version="v$MARKETING_VERSION"
+          case "${GITHUB_REF_NAME:-}" in
+            v[0-9]*) holder_version="$GITHUB_REF_NAME" ;;
+          esac
+          holder_commit="$(git rev-parse --short HEAD)"
+          holder_ldflags="-X github.com/yasyf/cc-pool/internal/version.Version=$holder_version -X github.com/yasyf/cc-pool/internal/version.Commit=$holder_commit"
+          export CGO_CFLAGS="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
+          export CGO_LDFLAGS="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
+          GOWORK=off CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+            go build -tags fuse -buildmode=c-archive -ldflags "$holder_ldflags" \
+            -o "$arm64_archive" ./cmd/cc-pool-holder-archive
+          GOWORK=off CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
+            go build -tags fuse -buildmode=c-archive -ldflags "$holder_ldflags" \
+            -o "$x86_archive" ./cmd/cc-pool-holder-archive
+          lipo -create "$arm64_archive" "$x86_archive" -output "$archive"
     dependencies:
       - target: CCPoolStatusWidget
         embed: true
         codeSign: true
+      - package: FuseKit
+      - package: DaemonKit
 
 targets:
   CCPoolStatus:
     templates: [HostApp]
     info:
       path: Generated/App-Info.plist
-    # The host app is deliberately NOT sandboxed (non-App-Store). No
-    # entitlements file.
-
-  CCPoolStatusFP:
-    # File-Provider-enabled host flavor: same bundle id, and PRODUCT_NAME pins
-    # the built product to CCPoolStatus.app (/Applications/CCPoolStatus.app is
-    # a fixed identifier in the Go code). Stays non-sandboxed — the App Group
-    # is its ONLY entitlement.
-    templates: [HostApp]
-    info:
-      path: Generated/AppFP-Info.plist
     entitlements:
-      path: Generated/AppFP.entitlements
+      path: Generated/App.entitlements
       properties:
         com.apple.security.application-groups:
           - $(TeamIdentifierPrefix)ccp
     settings:
       base:
-        PRODUCT_NAME: CCPoolStatus
-        # Manual signing with an embedded Developer ID provisioning profile: the
-        # profile authorizes the App Group claim, which turns the first
-        # group-container access into a silent (no-prompt) TCC grant. Release CI
-        # installs this profile into ~/Library/MobileDevice/Provisioning Profiles/
-        # so xcodebuild resolves it by name. The ad-hoc CCPoolStatus flavor has no
-        # profile and stays local-only.
         PROVISIONING_PROFILE_SPECIFIER: "cc-pool Status Host DevID"
     dependencies:
       - target: CCPoolFileProvider
@@ -96,7 +110,7 @@ targets:
         codeSign: true
 
   CCPoolStatusWidget:
-    # Legacy NSExtension-style WidgetKit appex (PlugIns/), the best-trodden
+    # NSExtension-style WidgetKit appex (PlugIns/), the best-trodden
     # XcodeGen path. If gallery discovery ever breaks, the ExtensionKit
     # conversion is mechanical: type extensionkit-extension + replace the
     # NSExtension dict with EXAppExtensionAttributes/EXExtensionPointIdentifier.
@@ -131,13 +145,13 @@ targets:
 
   CCPoolFileProvider:
     # NSFileProviderReplicatedExtension appex (PlugIns/), embedded only by the
-    # CCPoolStatusFP flavor. Reads the App Group at runtime from
-    # NSExtensionFileProviderDocumentGroup — never hardcoded in Swift.
+    # fixed CCPoolStatus host. The plist and Swift runtime pin the same exact
+    # App Group; release assertions reject any divergence.
     type: app-extension
     platform: macOS
     sources:
       - path: Sources/FileProvider
-      - path: Sources/Shared
+      - path: Sources/FileProviderRuntime
     info:
       path: Generated/FileProvider-Info.plist
       properties:
@@ -150,19 +164,13 @@ targets:
           NSExtensionFileProviderDocumentGroup: $(TeamIdentifierPrefix)ccp
           NSExtensionFileProviderSupportsEnumeration: true
     entitlements:
-      # Sandboxed (required for appexes); the read-write exception resolves
-      # against the REAL home (paired with getpwuid in Swift). NO
-      # fileprovider.testing-mode — a restricted entitlement the Developer ID
-      # provisioning profile does not authorize (and Apple gates it).
+      # Sandboxed as required. The extension reaches only the App Group broker;
+      # it never traverses ~/.claude or ~/.cc-pool directly.
       path: Generated/FileProvider.entitlements
       properties:
         com.apple.security.app-sandbox: true
         com.apple.security.application-groups:
           - $(TeamIdentifierPrefix)ccp
-        com.apple.security.temporary-exception.files.home-relative-path.read-write:
-          - /.claude/
-          - /.claude.json
-          - /.cc-pool/
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.yasyf.cc-pool.status.fileprovider
@@ -172,6 +180,9 @@ targets:
         # the host app). The Notification Center widget appex carries no profile: it
         # has no App Group and no restricted entitlements.
         PROVISIONING_PROFILE_SPECIFIER: "cc-pool FileProvider DevID"
+    dependencies:
+      - package: FuseKit
+      - package: DaemonKit
 
   CCPoolStatusTests:
     # Host-less unit-test bundle for PURE logic only. It compiles the code
@@ -184,16 +195,7 @@ targets:
     sources:
       - path: Tests
       - path: Sources/App/Countdown.swift
-      - path: Sources/App/DomainClaims.swift
-      - path: Sources/App/FileProviderControlPolicy.swift
-      - path: Sources/App/FileProviderDomainPolicy.swift
-      - path: Sources/FileProvider/BackingMutationIO.swift
-      - path: Sources/FileProvider/SynthCache.swift
-      - path: Sources/FileProvider/FileProviderEnumerationPolicy.swift
-      - path: Sources/FileProvider/ItemID.swift
-      - path: Sources/FileProvider/MutationPolicy.swift
-      - path: Sources/FileProvider/FPItem.swift
-      - path: Sources/FileProvider/Enumerators.swift
+      - path: Sources/FileProviderRuntime
       - path: Sources/Shared/Status.swift
     settings:
       base:
@@ -201,6 +203,9 @@ targets:
         GENERATE_INFOPLIST_FILE: "YES"
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "-"
+    dependencies:
+      - package: FuseKit
+      - package: DaemonKit
 
 schemes:
   CCPoolStatus:
@@ -212,15 +217,6 @@ schemes:
       config: Debug
       targets:
         - CCPoolStatusTests
-    run:
-      config: Debug
-    archive:
-      config: Release
-
-  CCPoolStatusFP:
-    build:
-      targets:
-        CCPoolStatusFP: all
     run:
       config: Debug
     archive:

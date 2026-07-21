@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/fusekit/state"
 	"github.com/yasyf/synckit/cregistry"
 )
 
@@ -71,7 +71,7 @@ func (rf RegistryFile) Save(reg Registry) error {
 	case !errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("read registry %s: %w", rf.Path, err)
 	}
-	if err := state.AtomicWrite(rf.Path, data, registryPerm); err != nil {
+	if err := overlay.WriteAtomic0600(rf.Path, data); err != nil {
 		return fmt.Errorf("write registry %s: %w", rf.Path, err)
 	}
 	return nil

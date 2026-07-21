@@ -1,17 +1,14 @@
-import ServiceManagement
 import SwiftUI
 import WidgetKit
 
 // LSUIElement host app for the widget extension. Its only jobs: exist so the
-// widget appears in the gallery after first launch, keep itself launching at
-// login (one-shot Login Item registration), and (while running) watch
-// ~/.cc-pool for the daemon's status.json rewrites so the widget tracks the
-// 3-minute poll cadence instead of WidgetKit's lazy refresh budget. The widget
-// still works without the app running — just less fresh. It also hosts the
-// File Provider control plane (FileProviderController) the cc-pool daemon
-// drives to register per-account domains.
+// widget appears in the gallery after first launch and, while daemonkit's
+// fixed-app service keeps it running, watch ~/.cc-pool for the daemon's
+// status.json rewrites so the widget tracks the 3-minute poll cadence instead
+// of WidgetKit's lazy refresh budget. The widget still works without the app
+// running — just less fresh. The fixed app also owns the embedded FuseKit
+// runtime and its exact broker child mode.
 
-@main
 struct CCPoolStatusApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
 
@@ -20,40 +17,24 @@ struct CCPoolStatusApp: App {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private static let didRegisterKey = "didRegisterLoginItem"
     private let watcher = StatusWatcher()
-    private let fileProvider = FileProviderController()
+    private var terminationTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_: Notification) {
         watcher.start() // fires an immediate reload once the watch is armed
-        fileProvider.start()
-        registerLoginItemOnce()
     }
 
-    /// Adds the app to Login Items exactly once, then defers to the user: the
-    /// one-shot flag — not the current status — gates re-registration, so
-    /// disabling the item in System Settings sticks. .enabled/.requiresApproval
-    /// set the flag without registering (the user already added it by hand
-    /// under the old instructions); a register() failure leaves it unset so
-    /// the next launch retries.
-    private func registerLoginItemOnce() {
-        let defaults = UserDefaults.standard
-        guard !defaults.bool(forKey: Self.didRegisterKey) else { return }
-        switch SMAppService.mainApp.status {
-        case .enabled, .requiresApproval:
-            defaults.set(true, forKey: Self.didRegisterKey)
-        default:
-            // .notRegistered or .notFound: mainApp reports .notFound until its
-            // first-ever register() (not just for dev builds), so both mean
-            // "try now" — register() itself is the only reliable probe.
-            do {
-                try SMAppService.mainApp.register()
-                defaults.set(true, forKey: Self.didRegisterKey)
-            } catch {
-                NSLog("CCPoolStatus: login item registration failed: %@", String(describing: error))
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard terminationTask == nil else { return .terminateLater }
+        terminationTask = Task { [weak sender] in
+            if CCPoolFuseKitStop() != 0 {
+                NSLog("CCPoolStatus: FuseKit holder shutdown failed")
             }
+            sender?.reply(toApplicationShouldTerminate: true)
         }
+        return .terminateLater
     }
 }
 
@@ -74,7 +55,8 @@ final class StatusWatcher {
             return
         }
         let src = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
+            fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main
+        )
         src.setEventHandler { [weak self] in self?.handleEvent() }
         src.setCancelHandler { close(fd) }
         src.resume()

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -38,14 +39,14 @@ func (f *fakeOAuth401) Usage(_ context.Context, at string) (*oauth.Usage, error)
 	if f.validAT[at] {
 		return &oauth.Usage{FiveHour: oauth.Window{Utilization: 31}, SevenDay: oauth.Window{Utilization: 7}}, nil
 	}
-	return nil, &oauth.UsageError{Status: 401, Body: `{"type":"error","error":{"type":"authentication_error"}}`}
+	return nil, &oauth.UsageError{Status: 401}
 }
 
 func (f *fakeOAuth401) Refresh(_ context.Context, _, rt string) (*oauth.TokenResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if rt != f.currentRT {
-		return nil, &oauth.RefreshError{Status: 400, Body: `{"error":"invalid_grant"}`, Code: "invalid_grant"}
+		return nil, &oauth.RefreshError{Status: 400, ConfirmedInvalidGrant: true}
 	}
 	f.refreshes++
 	at := fmt.Sprintf("at-r%d", f.refreshes)
@@ -70,7 +71,7 @@ type rotatingCreds struct {
 
 func (k *rotatingCreds) Store(a store.Account, src creds.Source) creds.Store {
 	if src == creds.SourceFile {
-		return creds.FileStore{ConfigDir: a.ConfigDir}
+		return credstest.FileStore(a.ConfigDir)
 	}
 	return rotatingItem{k: k, service: a.KeychainService}
 }
@@ -79,7 +80,7 @@ func (k *rotatingCreds) Stores(a store.Account) []creds.Store {
 	return []creds.Store{k.Store(a, creds.SourceKeychain), k.Store(a, creds.SourceFile)}
 }
 
-func (k *rotatingCreds) Discover(string) (string, error) { return "user", nil }
+func (k *rotatingCreds) Discover(context.Context, string) (string, error) { return "user", nil }
 
 func (k *rotatingCreds) touchedServices() []string {
 	k.mu.Lock()
@@ -95,7 +96,7 @@ type rotatingItem struct {
 
 func (i rotatingItem) Source() creds.Source { return creds.SourceKeychain }
 
-func (i rotatingItem) Read() (*creds.Credential, error) {
+func (i rotatingItem) Read(context.Context) (*creds.Credential, error) {
 	i.k.mu.Lock()
 	defer i.k.mu.Unlock()
 	i.k.touched = append(i.k.touched, i.service)
@@ -111,7 +112,7 @@ func (i rotatingItem) Read() (*creds.Credential, error) {
 	return &cp, nil
 }
 
-func (i rotatingItem) Write(cred *creds.Credential) error {
+func (i rotatingItem) Write(_ context.Context, cred *creds.Credential) error {
 	i.k.mu.Lock()
 	defer i.k.mu.Unlock()
 	i.k.touched = append(i.k.touched, i.service)
@@ -121,7 +122,7 @@ func (i rotatingItem) Write(cred *creds.Credential) error {
 	return nil
 }
 
-func (i rotatingItem) Delete() error {
+func (i rotatingItem) Delete(context.Context) error {
 	i.k.mu.Lock()
 	defer i.k.mu.Unlock()
 	i.k.touched = append(i.k.touched, i.service)
@@ -140,16 +141,16 @@ func cred401(at, rt string, expiresAt time.Time) *creds.Credential {
 
 func newManager401(t *testing.T, kc Credentials, fo *fakeOAuth401) (*Manager, store.Account) {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "acct-1-suffixed", KeychainAccount: "user", OverlayKind: "symlink"}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
-	return &Manager{Store: st, OAuth: fo, Creds: kc, LockDir: t.TempDir()}, a
+	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "acct-1-suffixed", KeychainAccount: "user"}
+	a = persistTestAccount(t, st, a)
+	manager := &Manager{Store: st, OAuth: fo, Creds: kc}
+	bindTestWorkerAuthority(t, manager, "usage-401")
+	return manager, a
 }
 
 // assertNeverCanonical pins the safety rule that no op ever names plain claude's
@@ -169,7 +170,7 @@ func assertNeverCanonical(t *testing.T, touched []string) {
 type fakeOAuthRevoked struct{}
 
 func (fakeOAuthRevoked) Refresh(_ context.Context, _, _ string) (*oauth.TokenResponse, error) {
-	return nil, &oauth.RefreshError{Status: 400, Body: `{"error":"invalid_grant"}`, Code: "invalid_grant"}
+	return nil, &oauth.RefreshError{Status: 400, ConfirmedInvalidGrant: true}
 }
 
 func (fakeOAuthRevoked) Usage(_ context.Context, _ string) (*oauth.Usage, error) {
@@ -183,16 +184,15 @@ func TestSampleUsageRevokedNotMaskedByRateLimit(t *testing.T) {
 	kc := &rotatingCreds{
 		current: cred401("at-0", "rt-stale", time.Now().Add(-time.Hour)),
 	}
-	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "acct-1-suffixed", KeychainAccount: "user", OverlayKind: "symlink"}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
-	m := &Manager{Store: st, OAuth: fakeOAuthRevoked{}, Creds: kc, LockDir: t.TempDir()}
+	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "acct-1-suffixed", KeychainAccount: "user"}
+	a = persistTestAccount(t, st, a)
+	m := &Manager{Store: st, OAuth: fakeOAuthRevoked{}, Creds: kc}
+	bindTestWorkerAuthority(t, m, "usage-revoked")
 
 	_, rateLimited, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
 	if !errors.Is(err, ErrNeedsLogin) {

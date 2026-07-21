@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +11,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/proc"
 )
 
 // moveCred builds the credential the move tests seed and expect back. It is
@@ -25,6 +23,19 @@ func moveCred() *creds.Credential {
 	c.ClaudeAiOauth.RefreshToken = "rt-1"
 	c.ClaudeAiOauth.ExpiresAt = 1_700_000_000_000
 	return c
+}
+
+func credentialOperationTestManager(
+	t *testing.T,
+	account store.Account,
+	credentials Credentials,
+) (*Manager, store.Account) {
+	t.Helper()
+	st := openTestStore(t)
+	account = persistTestAccount(t, st, account)
+	manager := &Manager{Store: st, Creds: credentials}
+	bindTestWorkerAuthority(t, manager, "credential-operation")
+	return manager, account
 }
 
 // TestMoveCredential drives every MoveCredential outcome: real moves in both
@@ -100,14 +111,16 @@ func TestMoveCredential(t *testing.T) {
 			wantKC:     true,
 		},
 		{
-			name:        "corrupt stray file still counts as a stray",
-			seedKC:      true,
-			corruptFile: true,
-			kcFaults:    noWrites,
-			fileFaults:  noWrites,
-			target:      creds.SourceKeychain,
-			want:        &CredMove{From: creds.SourceKeychain, To: creds.SourceKeychain, CleanedStray: true},
-			wantKC:      true,
+			name:          "corrupt stray file fails closed without deletion",
+			seedKC:        true,
+			corruptFile:   true,
+			kcFaults:      noWrites,
+			fileFaults:    noWrites,
+			target:        creds.SourceKeychain,
+			wantErrIs:     []error{ErrCredentialUnverifiable},
+			wantErrSubstr: []string{"cannot fingerprint stray credential"},
+			wantKC:        true,
+			wantFile:      true,
 		},
 		{
 			name:          "no credential anywhere refuses with a login hint",
@@ -203,7 +216,7 @@ func TestMoveCredential(t *testing.T) {
 				fk.Put(a.KeychainService, a.KeychainAccount, moveCred())
 			}
 			if tc.seedFile {
-				if err := creds.WriteFileCredential(dir, moveCred()); err != nil {
+				if err := writeFileCredentialForTest(dir, moveCred()); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -212,7 +225,7 @@ func TestMoveCredential(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			m := &Manager{Creds: fk, LockDir: t.TempDir()}
+			m, a := credentialOperationTestManager(t, a, fk)
 
 			got, err := m.MoveCredential(context.Background(), a, tc.target)
 			if tc.want == nil {
@@ -241,7 +254,7 @@ func TestMoveCredential(t *testing.T) {
 			if _, ok := fk.Get(a.KeychainService, a.KeychainAccount); ok != tc.wantKC {
 				t.Errorf("keychain item present = %v, want %v", ok, tc.wantKC)
 			}
-			if present := creds.FileCredentialExists(dir); present != tc.wantFile {
+			if present := fileCredentialExistsForTest(dir); present != tc.wantFile {
 				t.Errorf("file credential present = %v, want %v", present, tc.wantFile)
 			}
 			if n := fk.WriteCount(); n != tc.wantKCWrites {
@@ -270,7 +283,7 @@ func TestMoveCredential(t *testing.T) {
 // on, bypassing the seam's fault injection.
 func readMovedCredential(fk *credstest.Fake, a store.Account, target creds.Source) (*creds.Credential, error) {
 	if target == creds.SourceFile {
-		return creds.ReadFileCredential(a.ConfigDir)
+		return readFileCredentialForTest(a.ConfigDir)
 	}
 	c, ok := fk.Get(a.KeychainService, a.KeychainAccount)
 	if !ok {
@@ -283,8 +296,8 @@ func readMovedCredential(fk *credstest.Fake, a store.Account, target creds.Sourc
 // that acknowledges the write but returns different bytes.
 type tamperStore struct{ creds.Store }
 
-func (s tamperStore) Read() (*creds.Credential, error) {
-	c, err := s.Store.Read()
+func (s tamperStore) Read(ctx context.Context) (*creds.Credential, error) {
+	c, err := s.Store.Read(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +331,11 @@ func TestMoveCredentialReadbackMismatch(t *testing.T) {
 	a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc-move", KeychainAccount: "user"}
 	fk := credstest.NewFake()
 	fk.Put(a.KeychainService, a.KeychainAccount, moveCred())
-	m := &Manager{Creds: tamperCreds{Credentials: fk, src: creds.SourceFile}, LockDir: t.TempDir()}
+	m, a := credentialOperationTestManager(
+		t,
+		a,
+		tamperCreds{Credentials: fk, src: creds.SourceFile},
+	)
 
 	_, err := m.MoveCredential(context.Background(), a, creds.SourceFile)
 	if err == nil || !strings.Contains(err.Error(), "does not match") {
@@ -327,41 +344,8 @@ func TestMoveCredentialReadbackMismatch(t *testing.T) {
 	if _, ok := fk.Get(a.KeychainService, a.KeychainAccount); !ok {
 		t.Error("source keychain item deleted after a failed verify")
 	}
-	if creds.FileCredentialExists(dir) {
+	if fileCredentialExistsForTest(dir) {
 		t.Error("unverified target copy not unwound")
-	}
-}
-
-// TestMoveCredentialLockContention pins that MoveCredential runs under the
-// per-account cross-process lock: with another holder on the flock and a
-// short ctx, the lock error propagates and neither backend is touched.
-func TestMoveCredentialLockContention(t *testing.T) {
-	lockDir := t.TempDir()
-	a := store.Account{ID: 7, ConfigDir: t.TempDir(), KeychainService: "svc-move", KeychainAccount: "user"}
-	held, err := (proc.FileLockSpec{
-		Path:     filepath.Join(lockDir, AccountDirName(a.ID)+".lock"),
-		Mode:     proc.FileLockExclusive,
-		Deadline: 5 * time.Second,
-	}).Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = held.Close() }()
-
-	fk := credstest.NewFake()
-	fk.Put(a.KeychainService, a.KeychainAccount, moveCred())
-	m := &Manager{Creds: fk, LockDir: lockDir}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if _, err := m.MoveCredential(ctx, a, creds.SourceFile); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("MoveCredential = %v, want context.DeadlineExceeded", err)
-	}
-	if got := fk.TouchedServices(); len(got) != 0 {
-		t.Errorf("keychain ops ran without the lock: %v", got)
-	}
-	if creds.FileCredentialExists(a.ConfigDir) {
-		t.Error("file credential appeared under a refused lock")
 	}
 }
 
@@ -385,10 +369,10 @@ func TestMoveCredentialFresherWins(t *testing.T) {
 	a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc-move", KeychainAccount: "user"}
 	fk := credstest.NewFake()
 	fk.Put(a.KeychainService, a.KeychainAccount, datedCred("stale", time.Hour))
-	if err := creds.WriteFileCredential(dir, datedCred("fresh", 4*time.Hour)); err != nil {
+	if err := writeFileCredentialForTest(dir, datedCred("fresh", 4*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{Creds: fk, LockDir: t.TempDir()}
+	m, a := credentialOperationTestManager(t, a, fk)
 
 	got, err := m.MoveCredential(context.Background(), a, creds.SourceKeychain)
 	if err != nil {
@@ -404,7 +388,7 @@ func TestMoveCredentialFresherWins(t *testing.T) {
 	if kc.ClaudeAiOauth.AccessToken != "fresh" {
 		t.Errorf("keychain now holds %q, want the fresher \"fresh\" credential", kc.ClaudeAiOauth.AccessToken)
 	}
-	if creds.FileCredentialExists(dir) {
+	if fileCredentialExistsForTest(dir) {
 		t.Error("stale-superseding file copy not removed after the move")
 	}
 }
@@ -424,12 +408,12 @@ func TestReadCredentialRefreshOnlyKeychainWinsByExpiry(t *testing.T) {
 	fileCred.ClaudeAiOauth.AccessToken = "at-file"
 	fileCred.ClaudeAiOauth.RefreshToken = "rt-file"
 	fileCred.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli() // earlier
-	if err := creds.WriteFileCredential(dir, fileCred); err != nil {
+	if err := writeFileCredentialForTest(dir, fileCred); err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{Creds: fk, LockDir: t.TempDir()}
+	m := &Manager{Creds: fk}
 
-	cred, src, err := m.ReadCredential(a)
+	cred, src, err := m.ReadCredential(t.Context(), a)
 	if err != nil {
 		t.Fatalf("ReadCredential: %v", err)
 	}
@@ -499,12 +483,12 @@ func TestReadCredentialOwnershipFirst(t *testing.T) {
 			a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc-rank", KeychainAccount: "user"}
 			fk := credstest.NewFake()
 			fk.Put(a.KeychainService, a.KeychainAccount, tc.kc)
-			if err := creds.WriteFileCredential(dir, tc.file); err != nil {
+			if err := writeFileCredentialForTest(dir, tc.file); err != nil {
 				t.Fatal(err)
 			}
-			m := &Manager{Creds: fk, LockDir: t.TempDir()}
+			m, a := credentialOperationTestManager(t, a, fk)
 
-			cred, src, err := m.ReadCredential(a)
+			cred, src, err := m.ReadCredential(t.Context(), a)
 			if err != nil {
 				t.Fatalf("ReadCredential: %v", err)
 			}
@@ -597,11 +581,11 @@ func TestDropDivergentCopy(t *testing.T) {
 				fk.Put(a.KeychainService, a.KeychainAccount, tc.seedKC)
 			}
 			if tc.seedFile != nil {
-				if err := creds.WriteFileCredential(dir, tc.seedFile); err != nil {
+				if err := writeFileCredentialForTest(dir, tc.seedFile); err != nil {
 					t.Fatal(err)
 				}
 			}
-			m := &Manager{Creds: fk, LockDir: t.TempDir()}
+			m, a := credentialOperationTestManager(t, a, fk)
 
 			err := m.DropDivergentCopy(context.Background(), a)
 			if tc.wantErrIs != nil {
@@ -614,7 +598,7 @@ func TestDropDivergentCopy(t *testing.T) {
 			if _, ok := fk.Get(a.KeychainService, a.KeychainAccount); ok != tc.wantKC {
 				t.Errorf("keychain item present = %v, want %v", ok, tc.wantKC)
 			}
-			if got := creds.FileCredentialExists(dir); got != tc.wantFile {
+			if got := fileCredentialExistsForTest(dir); got != tc.wantFile {
 				t.Errorf("file credential present = %v, want %v", got, tc.wantFile)
 			}
 		})

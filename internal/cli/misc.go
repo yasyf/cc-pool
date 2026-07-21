@@ -17,7 +17,7 @@ func newListCmd() *cobra.Command {
 		Short: "List accounts with their ids, paths, and Keychain items",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				accts, err := m.Store.ListAccounts()
 				if err != nil {
 					return err
@@ -27,10 +27,10 @@ func newListCmd() *cobra.Command {
 					return nil
 				}
 				tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
-				_, _ = fmt.Fprintln(tw, "ACCT\tLABEL\tOVERLAY\tCONFIG DIR\tKEYCHAIN SERVICE")
+				_, _ = fmt.Fprintln(tw, "ACCT\tLABEL\tCONFIG DIR\tKEYCHAIN SERVICE")
 				for _, a := range accts {
-					_, _ = fmt.Fprintf(tw, "acct-%02d\t%s\t%s\t%s\t%s\n",
-						a.ID, accountName(a.Label), a.OverlayKind, a.ConfigDir, a.KeychainService)
+					_, _ = fmt.Fprintf(tw, "acct-%02d\t%s\t%s\t%s\n",
+						a.ID, accountName(a.Label), a.ConfigDir, a.KeychainService)
 				}
 				return tw.Flush()
 			})
@@ -55,18 +55,18 @@ Keychain item — the account is still tombstoned and removed everywhere.`,
 			if err != nil {
 				return err
 			}
-			return withManager(func(m *pool.Manager) error {
-				// Tombstone first: after teardown the identity is unreadable and a
-				// peer converge would re-materialize the account.
-				if err := syncRecordRemoval(cmd, m, id); err != nil {
+			if err := withManager(cmd.Context(), func(m *pool.Manager) error {
+				client, err := requireDaemon(m, "account and credential removal runs inside the daemon")
+				if err != nil {
 					return err
 				}
-				if err := m.Remove(cmd.Context(), id, !keepCred); err != nil {
-					return err
-				}
-				success(cmd.OutOrStdout(), "Removed acct-%02d.", id)
-				return nil
-			})
+				defer func() { _ = client.Close() }()
+				return client.RemoveAccount(cmd.Context(), id, !keepCred)
+			}); err != nil {
+				return err
+			}
+			success(cmd.OutOrStdout(), "Removed acct-%02d.", id)
+			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&keepCred, "keep-credential", false, "keep this host's Keychain item (the account is still removed pool-wide when sync is enabled)")
@@ -82,10 +82,10 @@ func newEnvCmd() *cobra.Command {
 
     ccp env --account 1
 
-Use ` + "`ccp run`" + ` to launch. env creates no process/session lease.`,
+Use ` + "`ccp run`" + ` to launch. env does not create a session.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
+			return withManager(cmd.Context(), func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
@@ -96,9 +96,8 @@ Use ` + "`ccp run`" + ` to launch. env creates no process/session lease.`,
 				if err != nil {
 					return err
 				}
-				mergeLaunchSettings(cmd, m, a)
 				out := cmd.OutOrStdout()
-				_, _ = fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(a.ConfigDir))
+				_, _ = fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(pool.AccountPresentationDir(a.ID)))
 				_, _ = fmt.Fprintf(out, "export CLAUDE_CODE_PLUGIN_CACHE_DIR=%s\n", shellQuote(filepath.Join(pool.ClaudeDir(), "plugins")))
 				return nil
 			})

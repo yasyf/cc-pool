@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/forecast"
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -14,17 +13,18 @@ import (
 // is provider- and transport-neutral so both the live CLI path and the daemon
 // produce the same shape.
 type Snapshot struct {
-	Account        store.Account
-	Score          float64
-	HasUsage       bool    // a known-good sample exists (false = never sampled, or only 429 placeholders)
-	Util5h         float64 // percent used 0..100
-	Util7d         float64
-	Remaining5h    float64
-	Remaining7d    float64
-	ActiveSessions int
-	RateLimited    bool
-	Exhausted      bool // a window is fully used and its reset is still pending
-	NeedsLogin     bool // refresh token gone/revoked; only `ccp login` recovers it
+	Account               store.Account
+	Score                 float64
+	HasUsage              bool    // a known-good sample exists (false = never sampled, or only 429 placeholders)
+	Util5h                float64 // percent used 0..100
+	Util7d                float64
+	Remaining5h           float64
+	Remaining7d           float64
+	ActiveSessions        int
+	RateLimited           bool
+	Exhausted             bool // a window is fully used and its reset is still pending
+	NeedsLogin            bool // refresh token gone/revoked; only `ccp login` recovers it
+	CredentialQuarantined bool // exact credential state requires reconciliation
 	// AwaitingOrigin narrows NeedsLogin: this is a synced peer copy whose token
 	// expired, so it recovers when the origin's rotation syncs over (or a local
 	// `ccp login`). Display-only — scoring treats it identically to NeedsLogin.
@@ -68,11 +68,11 @@ type Snapshot struct {
 // Snapshots returns a scored view of every account. When live is true, stale
 // usage is sampled synchronously first for a live status view.
 func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration) ([]Snapshot, error) {
-	accts, err := m.Store.ListAccounts()
+	accts, err := m.Store.ListActiveAccounts()
 	if err != nil {
 		return nil, err
 	}
-	sessions, scanErr := procscan.Scan(ctx)
+	sessions, scanErr := m.scanSessions(ctx)
 	if live {
 		m.sampleStale(ctx, accts, sessions, scanErr == nil, fresh)
 	}
@@ -83,7 +83,7 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 	goods := make([]*store.UsageSample, len(accts))
 	awaiting := make([]bool, len(accts))
 	for i, a := range accts {
-		in, recent, good, awaitingOrigin, err := m.scoreInput(a, sessions, now)
+		in, recent, good, awaitingOrigin, err := m.scoreInput(ctx, a, sessions, now)
 		if err != nil {
 			return nil, err
 		}
@@ -108,32 +108,33 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 			good = *goods[i]
 		}
 		s := Snapshot{
-			Account:         a,
-			Score:           r.Score,
-			HasUsage:        in.HasUsage,
-			Util5h:          in.Util5h,
-			Util7d:          in.Util7d,
-			Remaining5h:     100 - in.Util5h,
-			Remaining7d:     100 - in.Util7d,
-			ActiveSessions:  in.ActiveSessions,
-			RateLimited:     in.RateLimited,
-			Exhausted:       r.Exhausted,
-			NeedsLogin:      r.NeedsLogin,
-			AwaitingOrigin:  awaiting[i],
-			Stale:           r.Stale,
-			Resets5h:        in.Resets5h,
-			Resets7d:        in.Resets7d,
-			Burn5hPerHour:   in.Burn5hPerHour,
-			Forecast:        forecast.Estimate5h(samples[i], r.Exhausted, now),
-			Burn7dPerHour:   forecast.Burn7dGated(samples[i], r.Exhausted, now),
-			ExtraEnabled:    good.ExtraEnabled,
-			ExtraUsed:       good.ExtraUsed,
-			ExtraLimit:      good.ExtraLimit,
-			Scoped7dUtil:    good.Scoped7dUtil,
-			Scoped7dResets:  good.Scoped7dResets,
-			Scoped7dModel:   good.Scoped7dModel,
-			Components:      r.Components,
-			WeeklyExhausted: r.WeeklyExhausted,
+			Account:               a,
+			Score:                 r.Score,
+			HasUsage:              in.HasUsage,
+			Util5h:                in.Util5h,
+			Util7d:                in.Util7d,
+			Remaining5h:           100 - in.Util5h,
+			Remaining7d:           100 - in.Util7d,
+			ActiveSessions:        in.ActiveSessions,
+			RateLimited:           in.RateLimited,
+			Exhausted:             r.Exhausted,
+			NeedsLogin:            r.NeedsLogin,
+			CredentialQuarantined: r.CredentialQuarantined,
+			AwaitingOrigin:        awaiting[i],
+			Stale:                 r.Stale,
+			Resets5h:              in.Resets5h,
+			Resets7d:              in.Resets7d,
+			Burn5hPerHour:         in.Burn5hPerHour,
+			Forecast:              forecast.Estimate5h(samples[i], r.Exhausted, now),
+			Burn7dPerHour:         forecast.Burn7dGated(samples[i], r.Exhausted, now),
+			ExtraEnabled:          good.ExtraEnabled,
+			ExtraUsed:             good.ExtraUsed,
+			ExtraLimit:            good.ExtraLimit,
+			Scoped7dUtil:          good.Scoped7dUtil,
+			Scoped7dResets:        good.Scoped7dResets,
+			Scoped7dModel:         good.Scoped7dModel,
+			Components:            r.Components,
+			WeeklyExhausted:       r.WeeklyExhausted,
 		}
 		if in.HasUsage {
 			s.SampleAge = now.Sub(in.SampleTS)
