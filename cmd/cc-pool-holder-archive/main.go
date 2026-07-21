@@ -121,14 +121,13 @@ func newHolderRuntime(ctx context.Context) (daemon.EmbeddedRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
-	runtime, err := holder.New(ctx, holder.Config{
+	return holderbridge.NewEmbeddedRuntime(ctx, holderbridge.EmbeddedRuntimeSpec{
 		Plan: plan, Build: version.String(),
 		Owner: tenantfs.SourceAuthorityFleetOwner, Drivers: drivers,
 		CatalogAuthorizer: tenantfs.NewCatalogAuthorizer(),
 		Authorizer:        tenantfs.NewMountAuthorizer(),
 		ShutdownTimeout:   shutdownTimeout,
 	})
-	return runtime, err
 }
 
 func claudeDriverFactories() (holder.DriverFactories, error) {

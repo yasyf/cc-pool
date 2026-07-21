@@ -74,10 +74,11 @@ func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testi
 
 func TestEnsureHolderServiceConvergesExactAgentAndWaitsForReadiness(t *testing.T) {
 	useTestHolderApplication(t)
-	originalOpen, originalReady := holderControllerOpen, holderReady
+	originalOpen, originalReady, originalPresent := holderControllerOpen, holderReady, holderServicePresent
 	t.Cleanup(func() {
-		holderControllerOpen, holderReady = originalOpen, originalReady
+		holderControllerOpen, holderReady, holderServicePresent = originalOpen, originalReady, originalPresent
 	})
+	holderServicePresent = func(service.Agent) (bool, error) { return false, nil }
 	var order []string
 	controller := &testHolderServiceController{
 		converge: func(_ context.Context, agents []service.Agent) error {
@@ -149,18 +150,31 @@ func TestEnsureHolderServiceRefusesMissingAppBeforeControllerEffects(t *testing.
 
 func TestEnsureHolderServiceConvergenceFailureClosesBeforeReadiness(t *testing.T) {
 	useTestHolderApplication(t)
-	originalOpen, originalReady := holderControllerOpen, holderReady
+	originalOpen, originalReady, originalPresent := holderControllerOpen, holderReady, holderServicePresent
 	t.Cleanup(func() {
-		holderControllerOpen, holderReady = originalOpen, originalReady
+		holderControllerOpen, holderReady, holderServicePresent = originalOpen, originalReady, originalPresent
 	})
+	holderServicePresent = func(service.Agent) (bool, error) { return false, nil }
 	want := errors.New("launchctl convergence failed")
-	closed := 0
+	closed, converged := 0, 0
 	holderControllerOpen = func(
 		context.Context,
 		service.ControllerConfig,
 	) (holderServiceController, error) {
 		return &testHolderServiceController{
-			converge: func(context.Context, []service.Agent) error { return want },
+			converge: func(_ context.Context, agents []service.Agent) error {
+				converged++
+				if converged == 1 {
+					if len(agents) != 1 {
+						t.Fatalf("initial desired set = %#v, want holder", agents)
+					}
+					return want
+				}
+				if len(agents) != 0 {
+					t.Fatalf("rollback desired set = %#v, want empty", agents)
+				}
+				return nil
+			},
 			close: func(context.Context) error {
 				closed++
 				return nil
@@ -176,6 +190,76 @@ func TestEnsureHolderServiceConvergenceFailureClosesBeforeReadiness(t *testing.T
 	}
 	if closed != 1 {
 		t.Fatalf("controller close calls = %d, want 1", closed)
+	}
+	if converged != 2 {
+		t.Fatalf("converge calls = %d, want initial plus rollback", converged)
+	}
+}
+
+func TestEnsureHolderServiceReadinessFailureRemovesNewService(t *testing.T) {
+	useTestHolderApplication(t)
+	originalOpen, originalReady, originalPresent := holderControllerOpen, holderReady, holderServicePresent
+	t.Cleanup(func() {
+		holderControllerOpen, holderReady, holderServicePresent = originalOpen, originalReady, originalPresent
+	})
+	holderServicePresent = func(service.Agent) (bool, error) { return false, nil }
+	ctx, cancel := context.WithCancel(t.Context())
+	want := errors.New("holder socket absent")
+	holderReady = func(context.Context, string) error {
+		cancel()
+		return want
+	}
+	var desiredSizes []int
+	holderControllerOpen = func(context.Context, service.ControllerConfig) (holderServiceController, error) {
+		return &testHolderServiceController{
+			converge: func(_ context.Context, agents []service.Agent) error {
+				desiredSizes = append(desiredSizes, len(agents))
+				return nil
+			},
+			close: func(closeCtx context.Context) error {
+				if err := closeCtx.Err(); err != nil {
+					t.Fatalf("controller close context = %v", err)
+				}
+				return nil
+			},
+		}, nil
+	}
+	err := EnsureHolderService(ctx)
+	if !errors.Is(err, want) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("EnsureHolderService error = %v, want readiness cause and cancellation", err)
+	}
+	if !slices.Equal(desiredSizes, []int{1, 0}) {
+		t.Fatalf("desired set sizes = %v, want install then empty rollback", desiredSizes)
+	}
+}
+
+func TestEnsureHolderServiceReadinessFailurePreservesPreexistingService(t *testing.T) {
+	useTestHolderApplication(t)
+	originalOpen, originalReady, originalPresent := holderControllerOpen, holderReady, holderServicePresent
+	t.Cleanup(func() {
+		holderControllerOpen, holderReady, holderServicePresent = originalOpen, originalReady, originalPresent
+	})
+	holderServicePresent = func(service.Agent) (bool, error) { return true, nil }
+	ctx, cancel := context.WithCancel(t.Context())
+	holderReady = func(context.Context, string) error {
+		cancel()
+		return errors.New("holder socket absent")
+	}
+	var desiredSizes []int
+	holderControllerOpen = func(context.Context, service.ControllerConfig) (holderServiceController, error) {
+		return &testHolderServiceController{
+			converge: func(_ context.Context, agents []service.Agent) error {
+				desiredSizes = append(desiredSizes, len(agents))
+				return nil
+			},
+			close: func(context.Context) error { return nil },
+		}, nil
+	}
+	if err := EnsureHolderService(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("EnsureHolderService error = %v, want cancellation", err)
+	}
+	if !slices.Equal(desiredSizes, []int{1}) {
+		t.Fatalf("desired set sizes = %v, want preexisting holder preserved", desiredSizes)
 	}
 }
 

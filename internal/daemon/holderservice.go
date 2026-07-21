@@ -46,6 +46,20 @@ var (
 		}
 		return client.Close()
 	}
+	holderServicePresent = func(agent service.Agent) (bool, error) {
+		path, err := agent.PlistPath()
+		if err != nil {
+			return false, err
+		}
+		_, err = os.Lstat(path)
+		if err == nil {
+			return true, nil
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
 )
 
 type holderServiceController interface {
@@ -87,25 +101,62 @@ func EnsureHolderService(ctx context.Context) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("required FuseKit holder app %s is not a direct app bundle", appPath)
 	}
-	if err := convergeHolderServices(ctx, []service.Agent{plan.Agent()}); err != nil {
-		return fmt.Errorf("converge FuseKit holder service: %w", err)
-	}
-	readyCtx, cancel := context.WithTimeout(ctx, holderReadinessWindow)
-	defer cancel()
-	for {
-		err := holderReady(readyCtx, plan.Paths().Socket)
-		if err == nil {
-			return nil
+	agent := plan.Agent()
+	return withHolderServiceController(ctx, func(controller holderServiceController) error {
+		preexisting, err := holderServicePresent(agent)
+		if err != nil {
+			return fmt.Errorf("inspect FuseKit holder service: %w", err)
 		}
-		select {
-		case <-readyCtx.Done():
-			return fmt.Errorf("wait for FuseKit holder readiness: %w", errors.Join(readyCtx.Err(), err))
-		case <-time.After(100 * time.Millisecond):
+		if err := controller.Converge(ctx, []service.Agent{agent}); err != nil {
+			return rollbackNewHolderService(ctx, controller, preexisting,
+				fmt.Errorf("converge FuseKit holder service: %w", err))
 		}
-	}
+		readyCtx, cancel := context.WithTimeout(ctx, holderReadinessWindow)
+		defer cancel()
+		for {
+			err := holderReady(readyCtx, plan.Paths().Socket)
+			if err == nil {
+				return nil
+			}
+			select {
+			case <-readyCtx.Done():
+				readinessErr := fmt.Errorf(
+					"wait for FuseKit holder readiness: %w", errors.Join(readyCtx.Err(), err),
+				)
+				return rollbackNewHolderService(ctx, controller, preexisting, readinessErr)
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	})
 }
 
-func convergeHolderServices(ctx context.Context, agents []service.Agent) (err error) {
+func rollbackNewHolderService(
+	ctx context.Context,
+	controller holderServiceController,
+	preexisting bool,
+	cause error,
+) error {
+	if preexisting {
+		return cause
+	}
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), holderServiceCloseWait)
+	defer cancel()
+	if err := controller.Converge(rollbackCtx, nil); err != nil {
+		return errors.Join(cause, fmt.Errorf("roll back FuseKit holder service: %w", err))
+	}
+	return cause
+}
+
+func convergeHolderServices(ctx context.Context, agents []service.Agent) error {
+	return withHolderServiceController(ctx, func(controller holderServiceController) error {
+		return controller.Converge(ctx, agents)
+	})
+}
+
+func withHolderServiceController(
+	ctx context.Context,
+	run func(holderServiceController) error,
+) (err error) {
 	controller, err := holderControllerOpen(ctx, service.ControllerConfig{
 		StatePath:   filepath.Join(pool.FuseKitRuntimeDir(), "service-state.db"),
 		ProcessPath: filepath.Join(pool.FuseKitRuntimeDir(), "service-processes.db"),
@@ -119,5 +170,5 @@ func convergeHolderServices(ctx context.Context, agents []service.Agent) (err er
 		defer cancel()
 		err = errors.Join(err, controller.Close(closeCtx))
 	}()
-	return controller.Converge(ctx, agents)
+	return run(controller)
 }
