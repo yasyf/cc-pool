@@ -13,6 +13,7 @@ import (
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/daemonrole"
 	"github.com/yasyf/daemonkit/drain"
+	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -122,10 +123,10 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 	return wireServer, runtime, nil
 }
 
-var serviceRoleExecutable = os.Executable
+var serviceRoleExecutable = service.CanonicalExecutable
 
-// ServiceRolePath returns the exact current executable shared by launchd and
-// daemon admission without consulting PATH or normalizing symlinks.
+// ServiceRolePath returns the canonical current executable shared by launchd
+// and daemon admission without consulting PATH or falling back to an alias.
 func ServiceRolePath() (string, error) {
 	rolePath, err := serviceRoleExecutable()
 	if err != nil {

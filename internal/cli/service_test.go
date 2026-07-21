@@ -133,7 +133,7 @@ func TestCCPAgentUsesPinnedExecutableAndTypedRestartPolicy(t *testing.T) {
 	}
 }
 
-func TestResolveDaemonServiceExecutableUsesCurrentExecutableWithoutPATH(t *testing.T) {
+func TestResolveDaemonServiceExecutableUsesCanonicalCurrentExecutableWithoutPATH(t *testing.T) {
 	t.Setenv("PATH", "/usr/bin:/bin")
 	executable, err := resolveDaemonServiceExecutable()
 	if err != nil {
@@ -143,8 +143,12 @@ func TestResolveDaemonServiceExecutableUsesCurrentExecutableWithoutPATH(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	want, err = filepath.EvalSymlinks(want)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if executable != want {
-		t.Fatalf("service executable = %q, want exact current executable %q", executable, want)
+		t.Fatalf("service executable = %q, want canonical current executable %q", executable, want)
 	}
 }
 

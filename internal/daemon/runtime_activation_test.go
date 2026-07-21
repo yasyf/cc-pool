@@ -72,23 +72,19 @@ func TestRuntimeAcquiresListenerBeforeGenerationActivation(t *testing.T) {
 	}
 }
 
-func TestServiceRolePathUsesExactCurrentExecutableWithoutPATH(t *testing.T) {
+func TestServiceRolePathUsesCanonicalCurrentExecutableWithoutPATH(t *testing.T) {
 	root := t.TempDir()
 	target := writeExecutableFixture(t, root, "ccp-v1")
-	alias := filepath.Join(root, "ccp")
-	if err := os.Symlink(target, alias); err != nil {
-		t.Fatal(err)
-	}
 	original := serviceRoleExecutable
-	serviceRoleExecutable = func() (string, error) { return alias, nil }
+	serviceRoleExecutable = func() (string, error) { return target, nil }
 	t.Cleanup(func() { serviceRoleExecutable = original })
 	t.Setenv("PATH", "/usr/bin:/bin")
 	path, err := ServiceRolePath()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if path != alias {
-		t.Fatalf("ServiceRolePath() = %q, want current executable %q", path, alias)
+	if path != target {
+		t.Fatalf("ServiceRolePath() = %q, want canonical executable %q", path, target)
 	}
 }
 
