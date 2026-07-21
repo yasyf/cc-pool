@@ -22,6 +22,8 @@ final class OutlookDisplayTests: XCTestCase {
     private func decodeOutlook(remaining5h: Double, remaining7d: Double) throws -> PoolOutlook {
         let data = try JSONSerialization.data(withJSONObject: [
             "remaining_5h_pct": remaining5h, "remaining_7d_pct": remaining7d,
+            "net_burn_5h_per_hour": 0, "pace_5h": 0, "pace_7d": 0,
+            "mood": "chill",
         ])
         return try JSONDecoder.poolStatus.decode(PoolOutlook.self, from: data)
     }
@@ -30,7 +32,7 @@ final class OutlookDisplayTests: XCTestCase {
         let cases: [(name: String, override: [String: Any], want: Bool)] = [
             ("present true", ["weekly_exhausted": true], true),
             ("present false", ["weekly_exhausted": false], false),
-            ("absent reads false (old daemon compat)", [:], false),
+            ("absent omitempty false", [:], false),
         ]
         for c in cases {
             XCTAssertEqual(try decodeAccount(c.override).isWeeklyExhausted, c.want, c.name)
