@@ -422,8 +422,8 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 	for range needsLoginAfter + 1 {
 		s.pollOnce(t.Context())
 	}
-	if l := s.led.peek(authStreakPolicy, a.ConfigDir); l == nil || l.strikes != 1 || l.faulted {
-		t.Fatalf("durably replayed transient failure inflated auth streak: %+v", l)
+	if l := s.led.peek(authStreakPolicy, a.ConfigDir); l != nil {
+		t.Fatalf("durably replayed transient failure booked auth evidence: %+v", l)
 	}
 	if got := fo.usageCallCount() - before; got != needsLoginAfter+1 {
 		t.Fatalf("retained failure read-only Usage calls = %d, want %d", got, needsLoginAfter+1)

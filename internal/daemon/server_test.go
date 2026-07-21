@@ -48,7 +48,8 @@ func newDaemonTestManager(
 		AuditToken: identity.AuditToken, Generation: "daemon-test",
 	}
 	authority, err := pool.NewWorkerAuthority(
-		accountMutationTestTaskRunner{credentials: credentials}, identity.Executable, owner,
+		accountMutationTestTaskRunner{credentials: credentials, refresher: refresher},
+		identity.Executable, owner,
 	)
 	if err != nil {
 		t.Fatal(err)

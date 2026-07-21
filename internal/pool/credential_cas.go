@@ -28,7 +28,9 @@ const (
 
 var errCredentialCASConflict = errors.New("credential changed before compare-and-swap")
 
-type credentialCASRequest struct {
+// CredentialCASRequest is the exact v1 request accepted by the disposable
+// credential compare-and-swap worker.
+type CredentialCASRequest struct {
 	AccountID       int                           `json:"account_id"`
 	ConfigDir       string                        `json:"config_dir"`
 	KeychainService string                        `json:"keychain_service"`
@@ -44,7 +46,9 @@ type credentialCASRequest struct {
 	RollbackTarget  []byte                        `json:"rollback_target,omitempty"`
 }
 
-type credentialCASResponse struct {
+// CredentialCASResponse is the exact v1 result emitted by the disposable
+// credential compare-and-swap worker.
+type CredentialCASResponse struct {
 	Before              store.CredentialExternalState `json:"before"`
 	After               store.CredentialExternalState `json:"after"`
 	Credential          []byte                        `json:"credential,omitempty"`
@@ -102,7 +106,7 @@ func (m *Manager) runCredentialCAS(
 			return credentialCASProof{}, err
 		}
 	}
-	request := credentialCASRequest{
+	request := CredentialCASRequest{
 		AccountID: account.ID, ConfigDir: account.ConfigDir,
 		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
 		Source: mutation.Target, Expected: expected, Credential: payload,
@@ -147,7 +151,7 @@ func (m *Manager) runCredentialCAS(
 	if err := errors.Join(runErr, writeErr); err != nil {
 		return credentialCASProof{}, fmt.Errorf("credential CAS worker: %w: %s", err, stderr.String())
 	}
-	var response credentialCASResponse
+	var response CredentialCASResponse
 	if err := decodeCredentialCASJSON(&output, &response); err != nil {
 		return credentialCASProof{}, fmt.Errorf("decode credential CAS response: %w", err)
 	}
@@ -192,9 +196,9 @@ func RunCredentialCASWorker(
 	input io.Reader,
 	output io.Writer,
 ) (returnErr error) {
-	var request credentialCASRequest
-	if err := decodeCredentialCASJSON(input, &request); err != nil {
-		return fmt.Errorf("decode credential CAS request: %w", err)
+	request, err := DecodeCredentialCASRequest(input)
+	if err != nil {
+		return err
 	}
 	if err := validateCredentialCASRequest(request); err != nil {
 		return err
@@ -215,10 +219,10 @@ func RunCredentialCASWorker(
 	stores := credentialCASStores(request, runner, executable)
 	before, err := observeCredentialCASState(ctx, stores)
 	if err != nil {
-		return writeCredentialCASResponse(output, credentialCASResponse{ErrorCode: "io", Error: err.Error()})
+		return WriteCredentialCASResponse(output, CredentialCASResponse{ErrorCode: "io", Error: err.Error()})
 	}
 	if !sameStoreObservation(before, request.Expected) {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "conflict", Error: errCredentialCASConflict.Error(),
 		})
 	}
@@ -236,19 +240,19 @@ func RunCredentialCASWorker(
 			beforeOther = before.Keychain
 		}
 		if beforeTarget.State != store.CredentialSlotPresent {
-			return writeCredentialCASResponse(output, credentialCASResponse{
+			return WriteCredentialCASResponse(output, CredentialCASResponse{
 				Before: before, After: before, ErrorCode: "conflict",
 				Error: "credential CAS delete target is not exactly readable",
 			})
 		}
 		if err := stores[request.Source].Delete(ctx); err != nil {
-			return writeCredentialCASResponse(output, credentialCASResponse{
+			return WriteCredentialCASResponse(output, CredentialCASResponse{
 				Before: before, After: before, ErrorCode: "io", Error: err.Error(),
 			})
 		}
 		after, err := observeCredentialCASState(ctx, stores)
 		if err != nil {
-			return writeCredentialCASResponse(output, credentialCASResponse{
+			return WriteCredentialCASResponse(output, CredentialCASResponse{
 				Before: before, ErrorCode: "io", Error: err.Error(),
 			})
 		}
@@ -260,25 +264,25 @@ func RunCredentialCASWorker(
 		}
 		if afterTarget.State != store.CredentialSlotEmpty ||
 			!sameCredentialCASSlot(beforeOther, afterOther) {
-			return writeCredentialCASResponse(output, credentialCASResponse{
+			return WriteCredentialCASResponse(output, CredentialCASResponse{
 				Before: before, After: after, ErrorCode: "io",
 				Error: "credential CAS delete verification failed",
 			})
 		}
-		return writeCredentialCASResponse(output, credentialCASResponse{Before: before, After: after})
+		return WriteCredentialCASResponse(output, CredentialCASResponse{Before: before, After: after})
 	}
 	var credential creds.Credential
 	if err := json.Unmarshal(request.Credential, &credential); err != nil {
 		return errors.New("credential CAS payload is invalid")
 	}
 	if err := stores[request.Source].Write(ctx, &credential); err != nil {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "io", Error: err.Error(),
 		})
 	}
 	afterWrite, err := observeCredentialCASState(ctx, stores)
 	if err != nil {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, ErrorCode: "io", Error: err.Error(),
 		})
 	}
@@ -293,19 +297,19 @@ func RunCredentialCASWorker(
 	}
 	if written.State != store.CredentialSlotPresent || written.Digest == nil ||
 		*written.Digest != wantDigest || !sameCredentialCASSlot(unchanged, actualUnchanged) {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: afterWrite, ErrorCode: "io",
 			Error: "credential CAS write verification failed",
 		})
 	}
 	if !request.DeleteOther {
-		return writeCredentialCASResponse(output, credentialCASResponse{Before: before, After: afterWrite})
+		return WriteCredentialCASResponse(output, CredentialCASResponse{Before: before, After: afterWrite})
 	}
 	source := otherSource(request.Source)
 	if err := stores[source].Delete(ctx); err != nil {
 		rollbackErr := rollbackCredentialCASTarget(ctx, stores[request.Source], request.RollbackTarget)
 		afterRollback, observeErr := observeCredentialCASState(ctx, stores)
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: afterRollback, ErrorCode: "io",
 			Error: errors.Join(
 				fmt.Errorf("delete credential CAS source: %w", err),
@@ -316,7 +320,7 @@ func RunCredentialCASWorker(
 	}
 	after, err := observeCredentialCASState(ctx, stores)
 	if err != nil {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, ErrorCode: "io", Error: err.Error(),
 		})
 	}
@@ -328,29 +332,29 @@ func RunCredentialCASWorker(
 	}
 	if written.State != store.CredentialSlotPresent || written.Digest == nil ||
 		*written.Digest != wantDigest || deleted.State != store.CredentialSlotEmpty {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: after, ErrorCode: "io",
 			Error: "credential CAS move verification failed",
 		})
 	}
-	return writeCredentialCASResponse(output, credentialCASResponse{Before: before, After: after})
+	return WriteCredentialCASResponse(output, CredentialCASResponse{Before: before, After: after})
 }
 
 func refreshCredentialCAS(
 	ctx context.Context,
 	output io.Writer,
-	request credentialCASRequest,
+	request CredentialCASRequest,
 	stores map[creds.Source]creds.Store,
 	before store.CredentialExternalState,
 ) error {
 	previous, err := stores[request.Source].Read(ctx)
 	if err != nil {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "io", Error: err.Error(),
 		})
 	}
 	if !previous.HasRefreshToken() {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "io", Error: "credential has no refresh token",
 		})
 	}
@@ -372,18 +376,18 @@ func refreshCredentialCAS(
 	next.ClaudeAiOauth.ExpiresAt = response.Expiry(time.Now()).UnixMilli()
 	payload, err := next.Marshal()
 	if err != nil {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "io", Error: err.Error(),
 		})
 	}
 	if err := stores[request.Source].Write(ctx, &next); err != nil {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "io", Error: err.Error(),
 		})
 	}
 	after, err := observeCredentialCASState(ctx, stores)
 	if err != nil {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, ErrorCode: "io", Error: err.Error(),
 		})
 	}
@@ -398,12 +402,12 @@ func refreshCredentialCAS(
 	wantDigest := store.CredentialDigest(sha256.Sum256(payload))
 	if written.State != store.CredentialSlotPresent || written.Digest == nil ||
 		*written.Digest != wantDigest || !sameCredentialCASSlot(unchanged, actualUnchanged) {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: after, ErrorCode: "io",
 			Error: "credential refresh write verification failed",
 		})
 	}
-	return writeCredentialCASResponse(output, credentialCASResponse{
+	return WriteCredentialCASResponse(output, CredentialCASResponse{
 		Before: before, After: after, Credential: payload,
 	})
 }
@@ -415,18 +419,18 @@ func writeCredentialCASRefreshError(
 ) error {
 	var refreshErr *oauth.RefreshError
 	if errors.As(err, &refreshErr) {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "refresh", Error: refreshErr.Error(),
 			RefreshStatus: refreshErr.Status, RefreshDigest: refreshErr.ResponseDigest,
 			RefreshInvalidGrant: refreshErr.ConfirmedInvalidGrant,
 		})
 	}
 	if errors.Is(err, oauth.ErrNetwork) {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "network", Error: err.Error(),
 		})
 	}
-	return writeCredentialCASResponse(output, credentialCASResponse{
+	return WriteCredentialCASResponse(output, CredentialCASResponse{
 		Before: before, After: before, ErrorCode: "io", Error: err.Error(),
 	})
 }
@@ -438,7 +442,7 @@ func deleteAllCredentialCAS(
 	before store.CredentialExternalState,
 ) error {
 	if !credentialStateReadable(before) {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "conflict",
 			Error: "credential CAS delete-all state is not exactly readable",
 		})
@@ -449,7 +453,7 @@ func deleteAllCredentialCAS(
 		}
 		if err := stores[source].Delete(ctx); err != nil {
 			after, observeErr := observeCredentialCASState(ctx, stores)
-			return writeCredentialCASResponse(output, credentialCASResponse{
+			return WriteCredentialCASResponse(output, CredentialCASResponse{
 				Before: before, After: after, ErrorCode: "io",
 				Error: errors.Join(err, observeErr).Error(),
 			})
@@ -457,17 +461,17 @@ func deleteAllCredentialCAS(
 	}
 	after, err := observeCredentialCASState(ctx, stores)
 	if err != nil {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, ErrorCode: "io", Error: err.Error(),
 		})
 	}
 	if !credentialStateEmpty(after) {
-		return writeCredentialCASResponse(output, credentialCASResponse{
+		return WriteCredentialCASResponse(output, CredentialCASResponse{
 			Before: before, After: after, ErrorCode: "io",
 			Error: "credential CAS delete-all verification failed",
 		})
 	}
-	return writeCredentialCASResponse(output, credentialCASResponse{Before: before, After: after})
+	return WriteCredentialCASResponse(output, CredentialCASResponse{Before: before, After: after})
 }
 
 func rollbackCredentialCASTarget(
@@ -501,7 +505,7 @@ func sameCredentialCASSlot(
 }
 
 func credentialCASStores(
-	request credentialCASRequest,
+	request CredentialCASRequest,
 	runner creds.TaskRunner,
 	executable string,
 ) map[creds.Source]creds.Store {
@@ -564,7 +568,7 @@ func observeCredentialCASSlot(
 	}
 }
 
-func validateCredentialCASRequest(request credentialCASRequest) error {
+func validateCredentialCASRequest(request CredentialCASRequest) error {
 	if request.AccountID < 1 || request.ConfigDir != AccountDir(request.AccountID) {
 		return errors.New("credential CAS account path is not canonical")
 	}
@@ -635,7 +639,17 @@ func validateCredentialCASRequest(request credentialCASRequest) error {
 	return validateCredentialLockDirectory(request.ConfigDir)
 }
 
-func writeCredentialCASResponse(output io.Writer, response credentialCASResponse) error {
+// DecodeCredentialCASRequest decodes one exact v1 worker request frame.
+func DecodeCredentialCASRequest(input io.Reader) (CredentialCASRequest, error) {
+	var request CredentialCASRequest
+	if err := decodeCredentialCASJSON(input, &request); err != nil {
+		return CredentialCASRequest{}, fmt.Errorf("decode credential CAS request: %w", err)
+	}
+	return request, nil
+}
+
+// WriteCredentialCASResponse writes one exact v1 worker response.
+func WriteCredentialCASResponse(output io.Writer, response CredentialCASResponse) error {
 	return json.NewEncoder(output).Encode(response)
 }
 

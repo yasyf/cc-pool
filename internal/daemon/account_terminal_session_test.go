@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 
 type accountMutationTestTaskRunner struct {
 	credentials pool.Credentials
+	refresher   pool.Refresher
 }
 
 func (r accountMutationTestTaskRunner) Run(ctx context.Context, task supervise.Task) error {
@@ -29,45 +31,24 @@ func (r accountMutationTestTaskRunner) Run(ctx context.Context, task supervise.T
 	case pool.IsBackingWorkerInvocation(task.Args):
 		return pool.RunBackingWorker(ctx, task.Stdin, task.Stdout)
 	case pool.IsCredentialCASWorkerInvocation(task.Args):
-		return runDaemonTestCredentialCAS(ctx, task, r.credentials)
+		return runDaemonTestCredentialCAS(ctx, task, r.credentials, r.refresher)
 	case procscan.IsWorkerInvocation(task.Args):
 		return procscan.RunWorker(ctx, task.Stdin, task.Stdout)
 	}
 	return errors.New("unexpected account mutation test worker task")
 }
 
-type daemonTestCredentialCASRequest struct {
-	AccountID       int                           `json:"account_id"`
-	ConfigDir       string                        `json:"config_dir"`
-	KeychainService string                        `json:"keychain_service"`
-	KeychainAccount string                        `json:"keychain_account"`
-	Source          creds.Source                  `json:"source"`
-	Expected        store.CredentialExternalState `json:"expected"`
-	Credential      []byte                        `json:"credential"`
-	DeleteOther     bool                          `json:"delete_other"`
-	DeleteTarget    bool                          `json:"delete_target"`
-	RollbackTarget  []byte                        `json:"rollback_target,omitempty"`
-}
-
-type daemonTestCredentialCASResponse struct {
-	Before    store.CredentialExternalState `json:"before"`
-	After     store.CredentialExternalState `json:"after"`
-	ErrorCode string                        `json:"error_code,omitempty"`
-	Error     string                        `json:"error,omitempty"`
-}
-
 func runDaemonTestCredentialCAS(
 	ctx context.Context,
 	task supervise.Task,
 	credentials pool.Credentials,
+	refresher pool.Refresher,
 ) error {
 	if credentials == nil {
 		return errors.New("daemon test credential CAS requires credentials")
 	}
-	var request daemonTestCredentialCASRequest
-	decoder := json.NewDecoder(task.Stdin)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
+	request, err := pool.DecodeCredentialCASRequest(task.Stdin)
+	if err != nil {
 		return err
 	}
 	account := store.Account{
@@ -76,7 +57,7 @@ func runDaemonTestCredentialCAS(
 	}
 	before, err := daemonTestCredentialState(ctx, credentials, account)
 	if err != nil {
-		return json.NewEncoder(task.Stdout).Encode(daemonTestCredentialCASResponse{ErrorCode: "io", Error: err.Error()})
+		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{ErrorCode: "io", Error: err.Error()})
 	}
 	beforeDigest, err := before.Digest()
 	if err != nil {
@@ -87,9 +68,26 @@ func runDaemonTestCredentialCAS(
 		return err
 	}
 	if beforeDigest != expectedDigest {
-		return json.NewEncoder(task.Stdout).Encode(daemonTestCredentialCASResponse{
+		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "conflict", Error: "credential changed before compare-and-swap",
 		})
+	}
+	if request.Refresh {
+		return runDaemonTestCredentialRefresh(ctx, task, credentials, refresher, account, request, before)
+	}
+	if request.DeleteAll {
+		for _, source := range []creds.Source{creds.SourceKeychain, creds.SourceFile} {
+			if err = credentials.Store(account, source).Delete(ctx); err != nil && !errors.Is(err, creds.ErrNotFound) {
+				break
+			}
+		}
+		after, observeErr := daemonTestCredentialState(ctx, credentials, account)
+		if err != nil || observeErr != nil {
+			return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+				Before: before, After: after, ErrorCode: "io", Error: errors.Join(err, observeErr).Error(),
+			})
+		}
+		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{Before: before, After: after})
 	}
 	target := credentials.Store(account, request.Source)
 	if request.DeleteTarget {
@@ -115,11 +113,68 @@ func runDaemonTestCredentialCAS(
 	}
 	after, observeErr := daemonTestCredentialState(ctx, credentials, account)
 	if err != nil || observeErr != nil {
-		return json.NewEncoder(task.Stdout).Encode(daemonTestCredentialCASResponse{
+		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
 			Before: before, After: after, ErrorCode: "io", Error: errors.Join(err, observeErr).Error(),
 		})
 	}
-	return json.NewEncoder(task.Stdout).Encode(daemonTestCredentialCASResponse{Before: before, After: after})
+	return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{Before: before, After: after})
+}
+
+func runDaemonTestCredentialRefresh(
+	ctx context.Context,
+	task supervise.Task,
+	credentials pool.Credentials,
+	refresher pool.Refresher,
+	account store.Account,
+	request pool.CredentialCASRequest,
+	before store.CredentialExternalState,
+) error {
+	if refresher == nil {
+		return errors.New("daemon test credential CAS refresh requires refresher")
+	}
+	target := credentials.Store(account, request.Source)
+	previous, err := target.Read(ctx)
+	if err != nil {
+		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+			Before: before, After: before, ErrorCode: "io", Error: err.Error(),
+		})
+	}
+	response, err := refresher.Refresh(
+		ctx, fmt.Sprintf("acct-%d", request.AccountID), previous.ClaudeAiOauth.RefreshToken,
+	)
+	if err != nil {
+		result := pool.CredentialCASResponse{Before: before, After: before, ErrorCode: "io", Error: err.Error()}
+		var refreshErr *oauth.RefreshError
+		switch {
+		case errors.As(err, &refreshErr):
+			result.ErrorCode = "refresh"
+			result.RefreshStatus = refreshErr.Status
+			result.RefreshDigest = refreshErr.ResponseDigest
+			result.RefreshInvalidGrant = refreshErr.ConfirmedInvalidGrant
+		case errors.Is(err, oauth.ErrNetwork):
+			result.ErrorCode = "network"
+		}
+		return pool.WriteCredentialCASResponse(task.Stdout, result)
+	}
+	next := *previous
+	next.ClaudeAiOauth.AccessToken = response.AccessToken
+	if response.RefreshToken != "" {
+		next.ClaudeAiOauth.RefreshToken = response.RefreshToken
+	}
+	next.ClaudeAiOauth.ExpiresAt = response.Expiry(time.Now()).UnixMilli()
+	payload, err := next.Marshal()
+	if err == nil {
+		err = target.Write(ctx, &next)
+	}
+	after, observeErr := daemonTestCredentialState(ctx, credentials, account)
+	if err != nil || observeErr != nil {
+		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+			Before: before, After: after, ErrorCode: "io", Error: errors.Join(err, observeErr).Error(),
+		})
+	}
+	return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+		Before: before, After: after, Credential: payload,
+	})
 }
 
 func daemonTestCredentialState(

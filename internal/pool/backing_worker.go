@@ -81,8 +81,13 @@ func (m *Manager) runBackingWorker(
 		Stderr:        &stderr,
 	})
 	_ = stdin.Close()
-	_ = inputWriter.Close()
+	if runErr != nil {
+		_ = inputWriter.Close()
+	}
 	writeErr := <-writeDone
+	if runErr != nil && errors.Is(writeErr, os.ErrClosed) {
+		writeErr = nil
+	}
 	if err := errors.Join(runErr, writeErr); err != nil {
 		return backingWorkerResponse{}, fmt.Errorf("account backing worker: %w: %s", err, stderr.String())
 	}

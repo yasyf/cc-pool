@@ -790,7 +790,10 @@ func newAccountMutationTestServer(
 		AuditToken: identity.AuditToken, Generation: "account-mutation-test",
 	}
 	authority, err := pool.NewWorkerAuthority(
-		accountMutationTestTaskRunner{credentials: fake}, identity.Executable, owner,
+		accountMutationTestTaskRunner{
+			credentials: fake, refresher: accountMutationTestRefresher{},
+		},
+		identity.Executable, owner,
 	)
 	if err != nil {
 		t.Fatal(err)

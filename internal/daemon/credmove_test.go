@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -46,7 +45,7 @@ func newCredMoveServer(t *testing.T) (*Server, map[int]string, *credstest.Fake) 
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		a.KeychainService = fmt.Sprintf("svc-acct-%d", id)
+		a.KeychainService = creds.ServiceName(dir)
 		if err := s.m.Store.UpsertAccount(a); err != nil {
 			t.Fatal(err)
 		}
@@ -379,6 +378,7 @@ func TestHandleCredMoveAllAccountsMixed(t *testing.T) {
 	if err := writeFileCredentialForTest(a2.ConfigDir, credFixture()); err != nil { // -> already
 		t.Fatal(err)
 	}
+	fk.Remove(a2.KeychainService, a2.KeychainAccount)
 	// acct-3 holds no credential anywhere. -> failed
 
 	resp := s.handleCredMove(t.Context(), credMoveReq(nil, "file"))

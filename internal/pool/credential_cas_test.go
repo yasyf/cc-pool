@@ -134,7 +134,7 @@ func TestCredentialCASDeleteAllExactStateUnderOneLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response := runCredentialCASTestWorker(t, credentialCASRequest{
+	response := runCredentialCASTestWorker(t, CredentialCASRequest{
 		AccountID: account.ID, ConfigDir: account.ConfigDir,
 		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
 		Expected: expected, DeleteAll: true,
@@ -160,7 +160,7 @@ func TestCredentialCASRefusesUnreadableDeleteTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := credentialCASRequest{
+	request := CredentialCASRequest{
 		AccountID: account.ID, ConfigDir: account.ConfigDir,
 		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
 		Source: creds.SourceFile, Expected: expected, DeleteTarget: true,
@@ -230,7 +230,7 @@ func TestCredentialCASWaitsForClaudeLockAndNeverClobbersRacingWriter(t *testing.
 		t.Fatal(err)
 	}
 
-	response := make(chan credentialCASResponse, 1)
+	response := make(chan CredentialCASResponse, 1)
 	go func() {
 		response <- runCredentialCASTestWorker(
 			t, credentialCASTestRequest(t, account, creds.SourceFile, expected, credentialCASCredential("cas")),
@@ -356,7 +356,7 @@ func TestCredentialCASRefreshHoldsClaudeLocksThroughPostAndWrite(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	t.Setenv("CLAUDE_POOL_TOKEN_URL", server.URL)
-	request := credentialCASRequest{
+	request := CredentialCASRequest{
 		AccountID: account.ID, ConfigDir: account.ConfigDir,
 		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
 		Source: creds.SourceFile, Expected: expected, Refresh: true,
@@ -393,7 +393,7 @@ func TestCredentialCASRefreshPreservesTypedInvalidGrant(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	t.Setenv("CLAUDE_POOL_TOKEN_URL", server.URL)
-	response := runCredentialCASTestWorker(t, credentialCASRequest{
+	response := runCredentialCASTestWorker(t, CredentialCASRequest{
 		AccountID: account.ID, ConfigDir: account.ConfigDir,
 		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
 		Source: creds.SourceFile, Expected: expected, Refresh: true,
@@ -441,7 +441,7 @@ func newCredentialCASFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := credentialCASRequest{
+	request := CredentialCASRequest{
 		AccountID: account.ID, ConfigDir: account.ConfigDir,
 		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
 	}
@@ -454,20 +454,20 @@ func credentialCASTestRequest(
 	source creds.Source,
 	expected store.CredentialExternalState,
 	credential *creds.Credential,
-) credentialCASRequest {
+) CredentialCASRequest {
 	t.Helper()
 	payload, err := credential.Marshal()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return credentialCASRequest{
+	return CredentialCASRequest{
 		AccountID: account.ID, ConfigDir: account.ConfigDir,
 		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
 		Source: source, Expected: expected, Credential: payload,
 	}
 }
 
-func runCredentialCASTestWorker(t *testing.T, request credentialCASRequest) credentialCASResponse {
+func runCredentialCASTestWorker(t *testing.T, request CredentialCASRequest) CredentialCASResponse {
 	t.Helper()
 	var input, output bytes.Buffer
 	if err := json.NewEncoder(&input).Encode(request); err != nil {
@@ -476,7 +476,7 @@ func runCredentialCASTestWorker(t *testing.T, request credentialCASRequest) cred
 	if err := RunCredentialCASWorker(t.Context(), &input, &output); err != nil {
 		t.Fatal(err)
 	}
-	var response credentialCASResponse
+	var response CredentialCASResponse
 	if err := decodeCredentialCASJSON(&output, &response); err != nil {
 		t.Fatal(err)
 	}
