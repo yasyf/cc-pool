@@ -15,7 +15,7 @@ Durable knowledge routes through cc-notes, never loose markdown in the tree — 
 
 ## Plan Execution & Orchestration
 
-Plans you author must specify, and plans you execute must enforce, that substantive work runs as **dynamic workflows** (`Workflow` tool): the script holds the loop, branching, and intermediate results; your context holds only final answers. This section is standing authorization to invoke `Workflow`. Multi-phase work runs as workflows in sequence (understand → implement → verify); read each result before dispatching the next.
+Plans you author must specify, and plans you execute must enforce, that substantive work runs as **dynamic workflows** (`Workflow` tool) — the script holds the loop, branching, and intermediate results; your context holds only final answers — and that the schedule runs at the **dependency graph's full width**: at every dispatch point, every lane whose inputs are ready is in flight, and two phases sequence only where one consumes the other's output, the `Blocks on` edge the plan's Workflow Plan table names. A runnable lane left waiting, or a pending gate with no speculative lane building its likely next step (below), is a scheduling bug to fix, not a style choice. This section is standing authorization to invoke `Workflow`. Multi-phase work runs as workflows in sequence (understand → implement → verify) exactly because each phase consumes the last one's result; read each result before dispatching the next.
 
 Exceptions: trivial single-file edits, single file reads, and single targeted `ccx`/`LSP`/`Grep` lookups stay at the main-agent level; a lone ad-hoc investigation gets one subagent (fallbacks: AGENTS.md `## Parallelize Independent Work`).
 
@@ -25,7 +25,7 @@ Exceptions: trivial single-file edits, single file reads, and single targeted `c
 
 **Quality patterns**: pick per task — adversarial verify, judge panel, loop-until-dry, multi-modal sweep. Reviews and audits lean thorough; quick checks lean brief.
 
-**Speculate while you verify.** Verification and the fix it gates are not sequential phases. When verification lanes dispatch — a ground-truth repro loop, adversarial review, a security pass — with a concrete candidate fix already in hand, build that fix concurrently in a background lane routed per the Models table, always worktree-isolated (`isolation: 'worktree'`, or the lane's own worktree — never the shared working copy the in-flight verification is observing). The speculative lane never ships on its own: a confirming verdict applies the already-built fix; a refuting one discards the worktree. A discarded worktree costs tokens; verify-then-fix serialization costs wall-clock every time.
+**Speculate across every gate.** A gate and the work it gates are not sequential phases. Whenever any gate is pending — a verification verdict, an adversarial review, a CI run, an external wait — and a concrete candidate for the gated next step is in hand, a speculative lane builds it by default, routed per the Models table and always worktree-isolated (`isolation: 'worktree'`, or the lane's own worktree — never the shared working copy an in-flight verification is observing). The speculative lane never ships on its own: a confirming verdict applies the already-built result; a refuting one discards the worktree. An idle gate with a candidate in hand is the same scheduling bug as an idle lane — a discarded worktree costs tokens; gate-then-build serialization costs wall-clock every time.
 
 **Models** — route per agent, up-front by task type. Higher = better; cost = cheaper:
 
