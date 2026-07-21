@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
@@ -188,7 +187,11 @@ func IsCredentialCASWorkerInvocation(args []string) bool {
 
 // RunCredentialCASWorker performs one compare-and-swap while holding both
 // lock names used by Claude Code for the same explicit config directory.
-func RunCredentialCASWorker(ctx context.Context, input io.Reader, output io.Writer) error {
+func RunCredentialCASWorker(
+	ctx context.Context,
+	input io.Reader,
+	output io.Writer,
+) (returnErr error) {
 	var request credentialCASRequest
 	if err := decodeCredentialCASJSON(input, &request); err != nil {
 		return fmt.Errorf("decode credential CAS request: %w", err)
@@ -196,11 +199,13 @@ func RunCredentialCASWorker(ctx context.Context, input io.Reader, output io.Writ
 	if err := validateCredentialCASRequest(request); err != nil {
 		return err
 	}
-	release, err := acquireCredentialRefreshLocks(ctx, request.ConfigDir)
+	lease, err := acquireCredentialRefreshLocks(ctx, request.AccountID, request.ConfigDir)
 	if err != nil {
 		return err
 	}
-	defer release()
+	defer func() {
+		returnErr = errors.Join(returnErr, lease.Release())
+	}()
 
 	runner := credentialCASDirectRunner{}
 	executable, err := os.Executable()
@@ -628,69 +633,6 @@ func validateCredentialCASRequest(request credentialCASRequest) error {
 		}
 	}
 	return validateCredentialLockDirectory(request.ConfigDir)
-}
-
-func acquireCredentialRefreshLocks(ctx context.Context, configDir string) (func(), error) {
-	realConfigDir, err := filepath.EvalSymlinks(configDir)
-	if err != nil {
-		return nil, fmt.Errorf("resolve credential lock directory: %w", err)
-	}
-	paths := []string{filepath.Join(configDir, ".oauth_refresh.lock"), realConfigDir + ".lock"}
-	held := make([]string, 0, len(paths))
-	release := func() {
-		for index := len(held) - 1; index >= 0; index-- {
-			_ = os.Remove(held[index])
-		}
-	}
-	for _, path := range paths {
-		if err := acquireCredentialRefreshLock(ctx, path); err != nil {
-			release()
-			return nil, err
-		}
-		held = append(held, path)
-	}
-	return release, nil
-}
-
-func acquireCredentialRefreshLock(ctx context.Context, path string) error {
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		err := os.Mkdir(path, 0o700)
-		if err == nil {
-			if err := validateCredentialLockDirectory(path); err != nil {
-				_ = os.Remove(path)
-				return err
-			}
-			return nil
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("acquire credential refresh lock: %w", err)
-		}
-		if err := validateCredentialLockDirectory(path); err != nil {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-}
-
-func validateCredentialLockDirectory(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
-		return errors.New("credential refresh lock path is not a private directory")
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || int(stat.Uid) != os.Geteuid() {
-		return errors.New("credential refresh lock directory has the wrong owner")
-	}
-	return nil
 }
 
 func writeCredentialCASResponse(output io.Writer, response credentialCASResponse) error {
