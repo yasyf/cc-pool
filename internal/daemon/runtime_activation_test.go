@@ -72,19 +72,32 @@ func TestRuntimeAcquiresListenerBeforeGenerationActivation(t *testing.T) {
 	}
 }
 
-func TestServiceRolePathPreservesStableAlias(t *testing.T) {
+func TestServiceRolePathUsesExactCurrentExecutableWithoutPATH(t *testing.T) {
 	root := t.TempDir()
 	target := writeExecutableFixture(t, root, "ccp-v1")
 	alias := filepath.Join(root, "ccp")
 	if err := os.Symlink(target, alias); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", root)
+	original := serviceRoleExecutable
+	serviceRoleExecutable = func() (string, error) { return alias, nil }
+	t.Cleanup(func() { serviceRoleExecutable = original })
+	t.Setenv("PATH", "/usr/bin:/bin")
 	path, err := ServiceRolePath()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if path != alias {
-		t.Fatalf("ServiceRolePath() = %q, want stable alias %q", path, alias)
+		t.Fatalf("ServiceRolePath() = %q, want current executable %q", path, alias)
+	}
+}
+
+func TestServiceRolePathRejectsNonAbsoluteCurrentExecutable(t *testing.T) {
+	original := serviceRoleExecutable
+	serviceRoleExecutable = func() (string, error) { return "ccp", nil }
+	t.Cleanup(func() { serviceRoleExecutable = original })
+	t.Setenv("PATH", "/opt/homebrew/bin")
+	if _, err := ServiceRolePath(); err == nil {
+		t.Fatal("ServiceRolePath accepted a relative current executable")
 	}
 }

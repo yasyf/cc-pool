@@ -188,11 +188,55 @@ func TestEnsureHolderServiceConvergenceFailureClosesBeforeReadiness(t *testing.T
 	if err := EnsureHolderService(t.Context()); !errors.Is(err, want) {
 		t.Fatalf("EnsureHolderService error = %v, want %v", err, want)
 	}
-	if closed != 1 {
-		t.Fatalf("controller close calls = %d, want 1", closed)
+	if closed != 2 {
+		t.Fatalf("controller close calls = %d, want initial plus rollback", closed)
 	}
 	if converged != 2 {
 		t.Fatalf("converge calls = %d, want initial plus rollback", converged)
+	}
+}
+
+func TestHolderServiceInstallReceiptRollsBackOnlyCreatedService(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		preexisting  bool
+		wantDesireds []int
+	}{
+		{name: "created", wantDesireds: []int{1, 0}},
+		{name: "preexisting", preexisting: true, wantDesireds: []int{1}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			useTestHolderApplication(t)
+			originalOpen, originalReady, originalPresent := holderControllerOpen, holderReady, holderServicePresent
+			t.Cleanup(func() {
+				holderControllerOpen, holderReady, holderServicePresent = originalOpen, originalReady, originalPresent
+			})
+			holderServicePresent = func(service.Agent) (bool, error) { return test.preexisting, nil }
+			holderReady = func(context.Context, string) error { return nil }
+			var desiredSizes []int
+			holderControllerOpen = func(
+				context.Context,
+				service.ControllerConfig,
+			) (holderServiceController, error) {
+				return &testHolderServiceController{
+					converge: func(_ context.Context, agents []service.Agent) error {
+						desiredSizes = append(desiredSizes, len(agents))
+						return nil
+					},
+					close: func(context.Context) error { return nil },
+				}, nil
+			}
+			install, err := InstallHolderService(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := install.Rollback(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(desiredSizes, test.wantDesireds) {
+				t.Fatalf("desired set sizes = %v, want %v", desiredSizes, test.wantDesireds)
+			}
+		})
 	}
 }
 

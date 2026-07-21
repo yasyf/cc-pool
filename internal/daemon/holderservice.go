@@ -67,6 +67,24 @@ type holderServiceController interface {
 	Close(context.Context) error
 }
 
+// HolderServiceInstall records whether one install transaction created the holder service.
+type HolderServiceInstall struct {
+	created bool
+}
+
+// Rollback removes only a holder service created by this install transaction.
+func (install HolderServiceInstall) Rollback(ctx context.Context) error {
+	if !install.created {
+		return nil
+	}
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), holderServiceCloseWait)
+	defer cancel()
+	if err := StopAndUninstallHolderService(rollbackCtx); err != nil {
+		return fmt.Errorf("roll back FuseKit holder install: %w", err)
+	}
+	return nil
+}
+
 // HolderDeploymentPlan returns the daemon-facing fixed application contract.
 func HolderDeploymentPlan() (holder.DeploymentPlan, error) {
 	return holder.NewDeploymentPlan(holder.DeploymentPlanSpec{
@@ -89,27 +107,34 @@ func StopAndUninstallHolderService(ctx context.Context) error {
 
 // EnsureHolderService installs the fixed app service and proves its FuseKit session ready.
 func EnsureHolderService(ctx context.Context) error {
+	_, err := InstallHolderService(ctx)
+	return err
+}
+
+// InstallHolderService installs the holder and returns its transaction-scoped rollback receipt.
+func InstallHolderService(ctx context.Context) (HolderServiceInstall, error) {
 	plan, err := HolderDeploymentPlan()
 	if err != nil {
-		return fmt.Errorf("derive FuseKit holder plan: %w", err)
+		return HolderServiceInstall{}, fmt.Errorf("derive FuseKit holder plan: %w", err)
 	}
 	appPath := plan.Application().AppPath
 	info, err := holderAppStat(appPath)
 	if err != nil {
-		return fmt.Errorf("required FuseKit holder app %s: %w", appPath, err)
+		return HolderServiceInstall{}, fmt.Errorf("required FuseKit holder app %s: %w", appPath, err)
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("required FuseKit holder app %s is not a direct app bundle", appPath)
+		return HolderServiceInstall{}, fmt.Errorf("required FuseKit holder app %s is not a direct app bundle", appPath)
 	}
 	agent := plan.Agent()
-	return withHolderServiceController(ctx, func(controller holderServiceController) error {
+	install := HolderServiceInstall{}
+	err = withHolderServiceController(ctx, func(controller holderServiceController) error {
 		preexisting, err := holderServicePresent(agent)
 		if err != nil {
 			return fmt.Errorf("inspect FuseKit holder service: %w", err)
 		}
+		install.created = !preexisting
 		if err := controller.Converge(ctx, []service.Agent{agent}); err != nil {
-			return rollbackNewHolderService(ctx, controller, preexisting,
-				fmt.Errorf("converge FuseKit holder service: %w", err))
+			return fmt.Errorf("converge FuseKit holder service: %w", err)
 		}
 		readyCtx, cancel := context.WithTimeout(ctx, holderReadinessWindow)
 		defer cancel()
@@ -120,31 +145,17 @@ func EnsureHolderService(ctx context.Context) error {
 			}
 			select {
 			case <-readyCtx.Done():
-				readinessErr := fmt.Errorf(
+				return fmt.Errorf(
 					"wait for FuseKit holder readiness: %w", errors.Join(readyCtx.Err(), err),
 				)
-				return rollbackNewHolderService(ctx, controller, preexisting, readinessErr)
 			case <-time.After(100 * time.Millisecond):
 			}
 		}
 	})
-}
-
-func rollbackNewHolderService(
-	ctx context.Context,
-	controller holderServiceController,
-	preexisting bool,
-	cause error,
-) error {
-	if preexisting {
-		return cause
+	if err == nil {
+		return install, nil
 	}
-	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), holderServiceCloseWait)
-	defer cancel()
-	if err := controller.Converge(rollbackCtx, nil); err != nil {
-		return errors.Join(cause, fmt.Errorf("roll back FuseKit holder service: %w", err))
-	}
-	return cause
+	return HolderServiceInstall{}, errors.Join(err, install.Rollback(ctx))
 }
 
 func convergeHolderServices(ctx context.Context, agents []service.Agent) error {

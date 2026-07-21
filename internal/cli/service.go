@@ -23,7 +23,7 @@ import (
 var (
 	scanSessions                = procscan.Scan
 	stopDaemon                  = stopDaemonService
-	ensureHolder                = daemon.EnsureHolderService
+	ensureHolder                = func(ctx context.Context) (holderServiceInstall, error) { return daemon.InstallHolderService(ctx) }
 	stopHolder                  = daemon.StopAndUninstallHolderService
 	serviceExecutable           = resolveDaemonServiceExecutable
 	openDaemonServiceController = func(ctx context.Context) (daemonServiceController, error) {
@@ -40,6 +40,10 @@ const (
 type daemonServiceController interface {
 	Converge(context.Context, []service.Agent) error
 	Close(context.Context) error
+}
+
+type holderServiceInstall interface {
+	Rollback(context.Context) error
 }
 
 func ccpAgent(executable string) (service.Agent, error) {
@@ -59,16 +63,12 @@ func ccpAgent(executable string) (service.Agent, error) {
 }
 
 func resolveDaemonServiceExecutable() (string, error) {
-	rolePath, err := daemon.ServiceRolePath()
+	executable, err := daemon.ServiceRolePath()
 	if err != nil {
 		return "", err
 	}
-	executable, err := filepath.EvalSymlinks(rolePath)
-	if err != nil {
-		return "", fmt.Errorf("resolve daemon service target: %w", err)
-	}
 	if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
-		return "", fmt.Errorf("daemon service target %q is not exact and absolute", executable)
+		return "", fmt.Errorf("daemon service executable %q is not exact and absolute", executable)
 	}
 	return executable, nil
 }
@@ -281,11 +281,15 @@ func deprovisionAll(cmd *cobra.Command) error {
 	return nil
 }
 
-func runServiceInstall(cmd *cobra.Command) error {
-	out := cmd.OutOrStdout()
-	if err := ensureHolder(cmd.Context()); err != nil {
+func runServiceInstall(cmd *cobra.Command) (err error) {
+	if err := installDaemonService(cmd.Context()); err != nil {
 		return err
 	}
+	success(cmd.OutOrStdout(), "Installed and started the daemon.")
+	return nil
+}
+
+func installDaemonService(ctx context.Context) (err error) {
 	executable, err := serviceExecutable()
 	if err != nil {
 		return err
@@ -294,12 +298,20 @@ func runServiceInstall(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	if err := withDaemonServiceController(cmd.Context(), func(controller daemonServiceController) error {
-		return controller.Converge(cmd.Context(), []service.Agent{agent})
+	holderInstall, err := ensureHolder(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, holderInstall.Rollback(ctx))
+		}
+	}()
+	if err := withDaemonServiceController(ctx, func(controller daemonServiceController) error {
+		return controller.Converge(ctx, []service.Agent{agent})
 	}); err != nil {
 		return err
 	}
-	success(out, "Installed and started the daemon.")
 	return nil
 }
 

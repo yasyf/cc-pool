@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -123,18 +122,19 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 	return wireServer, runtime, nil
 }
 
-// ServiceRolePath resolves the stable executable alias shared by launchd and
-// daemon admission. The classifier resolves its current target per candidate.
+var serviceRoleExecutable = os.Executable
+
+// ServiceRolePath returns the exact current executable shared by launchd and
+// daemon admission without consulting PATH or normalizing symlinks.
 func ServiceRolePath() (string, error) {
-	rolePath, err := exec.LookPath("ccp")
+	rolePath, err := serviceRoleExecutable()
 	if err != nil {
-		return "", fmt.Errorf("resolve ccp role alias: %w", err)
+		return "", fmt.Errorf("resolve current ccp executable: %w", err)
 	}
-	rolePath, err = filepath.Abs(rolePath)
-	if err != nil {
-		return "", fmt.Errorf("resolve absolute ccp role alias: %w", err)
+	if !filepath.IsAbs(rolePath) || filepath.Clean(rolePath) != rolePath {
+		return "", fmt.Errorf("current ccp executable %q is not exact and absolute", rolePath)
 	}
-	return filepath.Clean(rolePath), nil
+	return rolePath, nil
 }
 
 func daemonRole() (daemonrole.Classifier, error) {

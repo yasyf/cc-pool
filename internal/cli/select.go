@@ -12,7 +12,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
-	"github.com/yasyf/daemonkit/service"
 )
 
 func newSelectCmd() *cobra.Command {
@@ -260,20 +259,7 @@ func startSelectionDaemon(ctx context.Context, cmd *cobra.Command, cl *daemon.Cl
 }
 
 func installSelectionDaemon(ctx context.Context, cmd *cobra.Command) error {
-	if err := ensureHolder(ctx); err != nil {
-		return err
-	}
-	executable, err := serviceExecutable()
-	if err != nil {
-		return err
-	}
-	agent, err := ccpAgent(executable)
-	if err != nil {
-		return err
-	}
-	if err := withDaemonServiceController(ctx, func(controller daemonServiceController) error {
-		return controller.Converge(ctx, []service.Agent{agent})
-	}); err != nil {
+	if err := installDaemonService(ctx); err != nil {
 		return err
 	}
 	success(cmd.OutOrStdout(), "Installed and started the daemon.")

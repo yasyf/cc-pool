@@ -80,6 +80,21 @@ type testDaemonServiceController struct {
 	closeErr    error
 }
 
+type testHolderServiceInstall struct {
+	created       bool
+	rollbackCalls int
+	removeCalls   int
+	rollbackErr   error
+}
+
+func (install *testHolderServiceInstall) Rollback(context.Context) error {
+	install.rollbackCalls++
+	if install.created {
+		install.removeCalls++
+	}
+	return install.rollbackErr
+}
+
 func (c *testDaemonServiceController) Converge(_ context.Context, agents []service.Agent) error {
 	c.desired = append(c.desired, append([]service.Agent(nil), agents...))
 	return c.convergeErr
@@ -118,29 +133,18 @@ func TestCCPAgentUsesPinnedExecutableAndTypedRestartPolicy(t *testing.T) {
 	}
 }
 
-func TestResolveDaemonServiceExecutablePinsCurrentRoleTarget(t *testing.T) {
-	root := t.TempDir()
-	target := filepath.Join(root, "ccp-v1")
-	if err := os.WriteFile(target, []byte("fixture"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(target, 0o700); err != nil { //nolint:gosec // G302: private role fixture needs its owner execute bit
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, filepath.Join(root, "ccp")); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", root)
+func TestResolveDaemonServiceExecutableUsesCurrentExecutableWithoutPATH(t *testing.T) {
+	t.Setenv("PATH", "/usr/bin:/bin")
 	executable, err := resolveDaemonServiceExecutable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := filepath.EvalSymlinks(target)
+	want, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if executable != want {
-		t.Fatalf("service executable = %q, want current role target %q", executable, want)
+		t.Fatalf("service executable = %q, want exact current executable %q", executable, want)
 	}
 }
 
@@ -161,9 +165,10 @@ func TestRunServiceInstallConvergesExactExecutableAgent(t *testing.T) {
 	executable := filepath.Join(t.TempDir(), "ccp")
 	swapVar(t, &serviceExecutable, func() (string, error) { return executable, nil })
 	holderReady := false
-	swapVar(t, &ensureHolder, func(context.Context) error {
+	install := &testHolderServiceInstall{created: true}
+	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
 		holderReady = true
-		return nil
+		return install, nil
 	})
 	controller := &testDaemonServiceController{}
 	useDaemonServiceController(t, controller)
@@ -189,11 +194,15 @@ func TestRunServiceInstallConvergesExactExecutableAgent(t *testing.T) {
 	if !strings.Contains(stripANSI(out.String()), "Installed and started the daemon") {
 		t.Fatalf("output = %q", out.String())
 	}
+	if install.rollbackCalls != 0 {
+		t.Fatalf("successful install rollback calls = %d, want 0", install.rollbackCalls)
+	}
 }
 
 func TestRunServiceInstallStopsBeforeControllerWhenHolderFails(t *testing.T) {
 	want := errors.New("holder not ready")
-	swapVar(t, &ensureHolder, func(context.Context) error { return want })
+	swapVar(t, &serviceExecutable, func() (string, error) { return filepath.Join(t.TempDir(), "ccp"), nil })
+	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) { return nil, want })
 	opened := false
 	swapVar(t, &openDaemonServiceController, func(context.Context) (daemonServiceController, error) {
 		opened = true
@@ -206,6 +215,53 @@ func TestRunServiceInstallStopsBeforeControllerWhenHolderFails(t *testing.T) {
 	}
 	if opened {
 		t.Fatal("controller opened before holder readiness")
+	}
+}
+
+func TestRunServiceInstallResolvesDaemonBeforeCreatingHolder(t *testing.T) {
+	want := errors.New("current executable unavailable")
+	swapVar(t, &serviceExecutable, func() (string, error) { return "", want })
+	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
+		t.Fatal("created holder before resolving daemon executable")
+		return nil, nil
+	})
+	cmd, _, _ := uninstallCmd()
+	cmd.SetContext(t.Context())
+	if err := runServiceInstall(cmd); !errors.Is(err, want) {
+		t.Fatalf("error = %v, want executable failure", err)
+	}
+}
+
+func TestRunServiceInstallRollsBackOnlyNewHolderAfterDaemonFailure(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		created     bool
+		wantRemoves int
+	}{
+		{name: "created", created: true, wantRemoves: 1},
+		{name: "preexisting", created: false, wantRemoves: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executable := filepath.Join(t.TempDir(), "ccp")
+			swapVar(t, &serviceExecutable, func() (string, error) { return executable, nil })
+			install := &testHolderServiceInstall{created: test.created}
+			swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
+				return install, nil
+			})
+			want := errors.New("daemon convergence failed")
+			useDaemonServiceController(t, &testDaemonServiceController{convergeErr: want})
+			cmd, _, _ := uninstallCmd()
+			cmd.SetContext(t.Context())
+			if err := runServiceInstall(cmd); !errors.Is(err, want) {
+				t.Fatalf("error = %v, want daemon convergence failure", err)
+			}
+			if install.rollbackCalls != 1 || install.removeCalls != test.wantRemoves {
+				t.Fatalf(
+					"rollback/remove calls = %d/%d, want 1/%d",
+					install.rollbackCalls, install.removeCalls, test.wantRemoves,
+				)
+			}
+		})
 	}
 }
 
