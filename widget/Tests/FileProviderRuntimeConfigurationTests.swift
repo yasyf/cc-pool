@@ -4,6 +4,11 @@ final class FileProviderRuntimeConfigurationTests: XCTestCase {
   func testSignedTopologyIsExact() {
     XCTAssertEqual(CCPoolFileProviderConfiguration.appGroupEndpoint.identifier, "SXKCTF23Q2.ccp")
     XCTAssertEqual(CCPoolFileProviderConfiguration.appGroupEndpoint.socketLeaf, "fusekit.sock")
+    XCTAssertEqual(CCPoolFileProviderConfiguration.brokerTeamIdentifier, "SXKCTF23Q2")
+    XCTAssertEqual(
+      CCPoolFileProviderConfiguration.brokerSigningIdentifier,
+      "com.yasyf.cc-pool.status"
+    )
     XCTAssertEqual(CCPoolFileProviderConfiguration.extensionTeamIdentifier, "SXKCTF23Q2")
     XCTAssertEqual(
       CCPoolFileProviderConfiguration.extensionSigningIdentifier,

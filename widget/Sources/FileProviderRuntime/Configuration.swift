@@ -8,6 +8,8 @@ enum CCPoolFileProviderConfiguration {
     identifier: appGroupIdentifier,
     socketLeaf: "fusekit.sock"
   )
+  static let brokerTeamIdentifier = "SXKCTF23Q2"
+  static let brokerSigningIdentifier = "com.yasyf.cc-pool.status"
   static let extensionTeamIdentifier = "SXKCTF23Q2"
   static let extensionSigningIdentifier = "com.yasyf.cc-pool.status.fileprovider"
 
@@ -36,7 +38,12 @@ enum CCPoolFileProviderConfiguration {
   static func makeRuntime(
     binding: CatalogFileProviderBinding
   ) throws -> CatalogFileProviderRuntime {
-    let transport = try SocketCatalogTransport(appGroupEndpoint: appGroupEndpoint)
+    let transport = try SocketCatalogTransport(
+      appGroupEndpoint: appGroupEndpoint,
+      brokerTeamIdentifier: brokerTeamIdentifier,
+      brokerSigningIdentifier: brokerSigningIdentifier,
+      brokerRequiredEntitlements: [:]
+    )
     return CatalogFileProviderRuntime(
       binding: binding,
       client: CatalogClient(transport: transport)

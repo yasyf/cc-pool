@@ -132,6 +132,19 @@ func TestWidgetBundlesReviewedSameTeamFuseTRuntime(t *testing.T) {
 	if _, err := os.Stat(license); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("consumer-owned FUSE-T license still exists: %v", err)
 	}
+
+	push := readReleaseContract(t, "scripts", "vm", "push.sh")
+	packageAt := strings.Index(push, "GOFLAGS=-mod=readonly go run ./cmd/cc-pool-fuse-package")
+	installAt := strings.Index(push, `log "installing $VMCTL_GUEST_APP"`)
+	if packageAt < 0 {
+		t.Fatal("VM push does not invoke the reviewed FuseKit FUSE-T packager")
+	}
+	if !strings.Contains(push[packageAt:], `-app "$app" -signing-identity "$sign_id"`) {
+		t.Fatal("VM push does not package the exact app with the selected Developer ID")
+	}
+	if installAt < 0 || packageAt >= installAt {
+		t.Fatal("VM push does not package and re-sign FUSE-T before installing the app")
+	}
 }
 
 func TestTCCSnapshotCoversProtectedSurfacesAndRejectsDaemonRows(t *testing.T) {
