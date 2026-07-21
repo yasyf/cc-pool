@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@v1
+      - uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@f45550932b0c8a42eb04e9ab0e5de8f82ad78b6a
 
   version:
     runs-on: ubuntu-latest
@@ -32,6 +32,8 @@ jobs:
   release:
     needs: verify-tag-on-main
     runs-on: macos-15
+    outputs:
+      pure_sha256: ${{ steps.shas.outputs.pure }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -42,8 +44,26 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Require CLI signing and notarization secrets
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          require_secret() {
+            [ -n "$1" ] || { echo "::error::required secret $2 is empty"; exit 1; }
+          }
+          require_secret "$MACOS_SIGN_P12" MACOS_SIGN_P12
+          require_secret "$MACOS_SIGN_PASSWORD" MACOS_SIGN_PASSWORD
+          require_secret "$MACOS_NOTARY_KEY" MACOS_NOTARY_KEY
+          require_secret "$MACOS_NOTARY_KEY_ID" MACOS_NOTARY_KEY_ID
+          require_secret "$MACOS_NOTARY_ISSUER_ID" MACOS_NOTARY_ISSUER_ID
+
       - name: Import Developer ID certificate
-        uses: yasyf/homebrew-tap/.github/actions/import-developer-id@v1
+        uses: yasyf/homebrew-tap/.github/actions/import-developer-id@f45550932b0c8a42eb04e9ab0e5de8f82ad78b6a
         with:
           p12: ${{ secrets.MACOS_SIGN_P12 }}
           p12-password: ${{ secrets.MACOS_SIGN_PASSWORD }}
@@ -68,7 +88,19 @@ jobs:
           CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/pure-amd64 ./cmd/cc-pool
           lipo -create -output dist/pure/cc-pool dist/pure-arm64 dist/pure-amd64
 
+          test -n "$MACOS_SIGN_IDENTITY"
+          test -n "$TEAM_ID"
+          test -f "$MACOS_NOTARY_KEY_FILE"
           bash "$MACOS_CODESIGN_SCRIPT" dist/pure/cc-pool darwin_universal
+          codesign --verify --strict --verbose=2 dist/pure/cc-pool
+          metadata="$(codesign -dvvv dist/pure/cc-pool 2>&1)"
+          grep -q '^Identifier=com.yasyf.cc-pool$' <<< "$metadata"
+          grep -q "^TeamIdentifier=${TEAM_ID}$" <<< "$metadata"
+          grep -Eq '^CodeDirectory .* flags=.*\(runtime\)' <<< "$metadata"
+          requirement="$(codesign -d -r- dist/pure/cc-pool 2>&1)"
+          grep -Fq 'identifier "com.yasyf.cc-pool"' <<< "$requirement"
+          grep -Fq "subject.OU] = ${TEAM_ID}" <<< "$requirement"
+          spctl --assess --type execute --verbose=4 dist/pure/cc-pool
           dist/pure/cc-pool --version | grep -q "${VERSION}"
           CLI_ENTITLEMENTS="$(codesign -d --entitlements - dist/pure/cc-pool 2>&1 || true)"
           if grep -q "application-groups" <<<"$CLI_ENTITLEMENTS"; then
@@ -93,6 +125,7 @@ jobs:
           cp dist/pure/cc-pool dist/payload/cc-pool
           tar -czf "dist/cc-pool-${VERSION}-darwin-universal.tar.gz" \
             -C dist/payload cc-pool
+          test "$(tar -tzf "dist/cc-pool-${VERSION}-darwin-universal.tar.gz")" = cc-pool
 
       - name: Checksum the release assets
         id: shas
@@ -112,25 +145,6 @@ jobs:
             dist/SHA256SUMS.txt
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
-
-      # Prerelease tags publish assets but never touch the tap. The cc-pool-status
-      # cask is rendered and published by the release-app job's cask stage.
-      - name: Render the formula
-        if: ${{ !contains(github.ref_name, '-') }}
-        uses: yasyf/homebrew-tap/.github/actions/render-formula@v1
-        with:
-          template: .github/formula/cc-pool.rb.tmpl
-          output: Formula/cc-pool.rb
-          substitutions: |
-            __SHA_PURE__=${{ steps.shas.outputs.pure }}
-
-      - name: Publish the formula to the tap
-        if: ${{ !contains(github.ref_name, '-') }}
-        uses: yasyf/homebrew-tap/.github/actions/publish@v1
-        with:
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          dir: tap-staging
-          message: "cc-pool ${{ github.ref_name }}"
 
   widget-test:
     needs: verify-tag-on-main
@@ -165,9 +179,10 @@ jobs:
     needs: [version, widget-test, release]
     permissions:
       contents: write
-    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@a566d98394424922d9836fc8cbff84a81a7dd5f2
+    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@f45550932b0c8a42eb04e9ab0e5de8f82ad78b6a
     with:
       app_name: CCPoolStatus
+      asset_name: cc-pool-status
       project_dir: widget
       scheme: CCPoolStatus
       bundle_id: com.yasyf.cc-pool.status
@@ -181,8 +196,6 @@ jobs:
       profile_names: |
         com.yasyf.cc-pool.status=cc-pool Status Host DevID
         com.yasyf.cc-pool.status.fileprovider=cc-pool FileProvider DevID
-      cask_token: cc-pool-status
-      cask_template_path: .github/cask/cc-pool-status.rb.tmpl
       assert_script: .github/scripts/assert-widget-app.sh
       go_version: 1.26.5
       go_cache_dependency_path: go.sum
@@ -193,4 +206,102 @@ jobs:
       MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
       MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
       MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+  publish-tap:
+    needs: [release, release-app]
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Require the atomic tap publication secret
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$HOMEBREW_TAP_TOKEN" ] \
+            || { echo "::error::required secret HOMEBREW_TAP_TOKEN is empty"; exit 1; }
+
+      - name: Download the final published release bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLI_ASSET: cc-pool-${{ github.ref_name }}-darwin-universal.tar.gz
+          APP_ASSET: ${{ needs.release-app.outputs.asset_filename }}
+          APP_ASSET_URL: ${{ needs.release-app.outputs.asset_url }}
+        run: |
+          set -euo pipefail
+          expected_app="cc-pool-status-${GITHUB_REF_NAME}-darwin.zip"
+          [ "$APP_ASSET" = "$expected_app" ] \
+            || { echo "::error::verified app filename '$APP_ASSET' != '$expected_app'"; exit 1; }
+          expected_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${expected_app}"
+          [ "$APP_ASSET_URL" = "$expected_url" ] \
+            || { echo "::error::verified app URL does not name the exact release asset"; exit 1; }
+          mkdir -p dist/released
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --dir dist/released --pattern "$CLI_ASSET"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --dir dist/released --pattern "$APP_ASSET" --pattern "$APP_ASSET.sha256"
+
+      - name: Verify the exact distributed CLI and application
+        env:
+          CLI_SHA256: ${{ needs.release.outputs.pure_sha256 }}
+          APP_SHA256: ${{ needs.release-app.outputs.sha256 }}
+          CLI_ASSET: cc-pool-${{ github.ref_name }}-darwin-universal.tar.gz
+          APP_ASSET: ${{ needs.release-app.outputs.asset_filename }}
+        run: |
+          set -euo pipefail
+          cd dist/released
+          [ "$(shasum -a 256 "$CLI_ASSET" | awk '{print $1}')" = "$CLI_SHA256" ]
+          shasum -a 256 -c "$APP_ASSET.sha256"
+          [ "$(shasum -a 256 "$APP_ASSET" | awk '{print $1}')" = "$APP_SHA256" ]
+
+          mkdir cli app
+          tar -xzf "$CLI_ASSET" -C cli
+          codesign --verify --strict --verbose=2 cli/cc-pool
+          metadata="$(codesign -dvvv cli/cc-pool 2>&1)"
+          grep -q '^Identifier=com.yasyf.cc-pool$' <<< "$metadata"
+          grep -q '^TeamIdentifier=SXKCTF23Q2$' <<< "$metadata"
+          spctl --assess --type execute --verbose=4 cli/cc-pool
+
+          ditto -x -k "$APP_ASSET" app
+          test -d app/CCPoolStatus.app
+          APP_PATH="$PWD/app/CCPoolStatus.app" TEAM_ID=SXKCTF23Q2 APP_GROUP=SXKCTF23Q2.ccp \
+            bash "$GITHUB_WORKSPACE/scripts/assert-signed-topology.sh"
+          xcrun stapler validate app/CCPoolStatus.app
+          spctl --assess --type execute --verbose=4 app/CCPoolStatus.app
+
+      - name: Require the full-application cask contract
+        run: |
+          set -euo pipefail
+          template=.github/cask/cc-pool-status.rb.tmpl
+          grep -Eq '^[[:space:]]*app[[:space:]]+' "$template"
+          ! grep -Eq '^[[:space:]]*binary[[:space:]]+' "$template"
+
+      - name: Render the formula into the atomic tap transaction
+        uses: yasyf/homebrew-tap/.github/actions/render-formula@f45550932b0c8a42eb04e9ab0e5de8f82ad78b6a
+        with:
+          template: .github/formula/cc-pool.rb.tmpl
+          output: Formula/cc-pool.rb
+          substitutions: |
+            __SHA_PURE__=${{ needs.release.outputs.pure_sha256 }}
+
+      - name: Render the cask into the atomic tap transaction
+        uses: yasyf/homebrew-tap/.github/actions/render-formula@f45550932b0c8a42eb04e9ab0e5de8f82ad78b6a
+        with:
+          template: .github/cask/cc-pool-status.rb.tmpl
+          output: Casks/cc-pool-status.rb
+          substitutions: |
+            __SHA_APP__=${{ needs.release-app.outputs.sha256 }}
+            __ASSET_URL__=${{ needs.release-app.outputs.asset_url }}
+            __APP_NAME__=CCPoolStatus
+            __CASK_TOKEN__=cc-pool-status
+            __REPO__=${{ github.repository }}
+
+      - name: Publish formula and cask in one tap commit
+        uses: yasyf/homebrew-tap/.github/actions/publish@f45550932b0c8a42eb04e9ab0e5de8f82ad78b6a
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          dir: tap-staging
+          message: "cc-pool stack ${{ github.ref_name }}"

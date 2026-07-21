@@ -70,10 +70,23 @@ func TestStatusCaskPinsFixedAppAndFuseTRuntime(t *testing.T) {
 	}
 }
 
-func TestReleaseOrdersApplicationAfterCLIRelease(t *testing.T) {
+func TestReleasePublishesFormulaAndCaskOnlyAfterVerifiedApplication(t *testing.T) {
 	release := readReleaseContract(t, ".github", "workflows", "release.yml")
 	if !strings.Contains(release, "needs: [version, widget-test, release]") {
-		t.Fatal("application release does not depend on the CLI/formula release")
+		t.Fatal("application release does not depend on the CLI artifact release")
+	}
+	if !strings.Contains(release, "needs: [release, release-app]") {
+		t.Fatal("tap publication does not wait for both verified release artifacts")
+	}
+	if got := strings.Count(release, ".github/actions/publish@"); got != 1 {
+		t.Fatalf("tap publication calls = %d, want one atomic formula+cask call", got)
+	}
+	publishJob := strings.Index(release, "\n  publish-tap:")
+	formula := strings.Index(release, "Render the formula into the atomic tap transaction")
+	cask := strings.Index(release, "Render the cask into the atomic tap transaction")
+	publish := strings.Index(release, "Publish formula and cask in one tap commit")
+	if publishJob < 0 || formula < publishJob || cask < formula || publish < cask {
+		t.Fatal("formula and cask are not rendered and published after the verified stack")
 	}
 }
 
