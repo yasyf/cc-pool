@@ -353,12 +353,28 @@ func TestSampleUsageNeverRepeatsRetainedFailedRefresh(t *testing.T) {
 			if errors.Is(replayErr, context.DeadlineExceeded) {
 				t.Fatalf("retained-receipt SampleUsage waited instead of replaying: %v", replayErr)
 			}
+			wantReplayErr := ErrCredentialOperationFailed
+			if tc.wantQuarantine {
+				wantReplayErr = ErrCredentialOperationQuarantined
+			}
+			if !errors.Is(replayErr, wantReplayErr) {
+				t.Fatalf("retained-receipt SampleUsage = %v, want %v", replayErr, wantReplayErr)
+			}
 			refreshes, usage = oauthClient.counts()
 			if len(refreshes) != 1 || refreshes[0] != "rt-single-use" {
 				t.Fatalf("retained receipt re-POSTed refresh tokens: %q", refreshes)
 			}
-			if len(usage) != 2 || usage[0] != "at-stale" || usage[1] != "at-stale" {
-				t.Fatalf("retained receipt usage tokens = %q, want one read-only request per sample", usage)
+			wantUsageCalls := 2
+			if tc.wantQuarantine {
+				wantUsageCalls = 1
+			}
+			if len(usage) != wantUsageCalls {
+				t.Fatalf("retained receipt usage tokens = %q, want %d call(s)", usage, wantUsageCalls)
+			}
+			for _, token := range usage {
+				if token != "at-stale" {
+					t.Fatalf("retained receipt usage token = %q, want at-stale", token)
+				}
 			}
 		})
 	}

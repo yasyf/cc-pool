@@ -422,6 +422,9 @@ func (m *Manager) sampleUsage(ctx context.Context, a store.Account, opts SampleO
 	// A confirmed pre-flight revocation must not be masked by a usage-endpoint 429 or
 	// transient 401; a clean fetchUsage recovery suppresses it (a session may have rotated).
 	if errors.Is(freshErr, ErrNeedsLogin) && (err != nil || rateLimited) {
+		if replayedLiveProbe {
+			return nil, rateLimited, retryAfter, freshErr
+		}
 		return nil, false, 0, freshErr
 	}
 	if freshErr != nil && (err != nil || rateLimited) {

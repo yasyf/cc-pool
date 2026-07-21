@@ -244,25 +244,34 @@ func TestPreflightInvalidGrantStripsRefreshToken(t *testing.T) {
 	assertNeverCanonical(t, fk.TouchedServices())
 }
 
-// TestStripAbortsOnRefreshTokenRotatedUnderfoot pins the full-credential CAS
-// ahead of the strip: a login rotating only the refresh token (same access
-// token) between the failed refresh and the write must abort the strip — an
-// access-token-only compare would destroy the live rotated chain.
-func TestStripAbortsOnRefreshTokenRotatedUnderfoot(t *testing.T) {
+// TestStripRotationUnderfootQuarantinesWithoutMutation pins the full-credential
+// CAS ahead of the strip. A rotation after the durable boundary is ambiguous,
+// so the operation quarantines without touching either token chain.
+func TestStripRotationUnderfootQuarantinesWithoutMutation(t *testing.T) {
 	kc := &rotatingCreds{
-		// Reads #1-#4 are target classification, durable admission, apply
-		// verification, and pre-flight. The strip's source re-read sees the
-		// rotation: same access token, new refresh token.
-		rotateAfter: 4,
-		current:     cred401("at-0", "rt-stale", time.Now().Add(-time.Hour)),
-		rotated:     cred401("at-0", "rt-live", time.Now().Add(time.Hour)),
+		current: cred401("at-0", "rt-stale", time.Now().Add(-time.Hour)),
+		rotated: cred401("at-0", "rt-live", time.Now().Add(time.Hour)),
 	}
 	fo := newFakeOAuth401("rt-current") // rt-stale → invalid_grant
 	m, a := newManager401(t, kc, fo)
+	baseCAS := m.credentialCAS
+	m.credentialCAS = func(
+		ctx context.Context,
+		account store.Account,
+		expected store.CredentialExternalState,
+		mutation credentialCASMutation,
+	) (credentialCASProof, error) {
+		kc.mu.Lock()
+		kc.rotateAfter = kc.reads
+		kc.mu.Unlock()
+		return baseCAS(ctx, account, expected, mutation)
+	}
 
 	got, refreshed, err := m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
-	if err != nil || refreshed || got == nil || got.ClaudeAiOauth.RefreshToken != "rt-live" {
-		t.Fatalf("rotated credential = %+v refreshed=%t err=%v, want live chain", got, refreshed, err)
+	if refreshed || got == nil || got.ClaudeAiOauth.RefreshToken != "rt-stale" ||
+		!errors.Is(err, ErrCredentialChangedUnderfoot) ||
+		!errors.Is(err, ErrCredentialOperationQuarantined) {
+		t.Fatalf("rotated credential = %+v refreshed=%t err=%v, want quarantined stale result", got, refreshed, err)
 	}
 	kc.mu.Lock()
 	after, rotated := *kc.current, kc.rotated
@@ -273,6 +282,10 @@ func TestStripAbortsOnRefreshTokenRotatedUnderfoot(t *testing.T) {
 	if after.ClaudeAiOauth.RefreshToken != "rt-stale" || rotated.ClaudeAiOauth.RefreshToken != "rt-live" {
 		t.Fatalf("stored chains mutated (current=%q rotated=%q), want both untouched",
 			after.ClaudeAiOauth.RefreshToken, rotated.ClaudeAiOauth.RefreshToken)
+	}
+	quarantine, quarantineErr := m.Store.CredentialQuarantine(a.ID)
+	if quarantineErr != nil || quarantine.Reason != store.CredentialResultAmbiguous {
+		t.Fatalf("rotation quarantine = %+v, %v", quarantine, quarantineErr)
 	}
 }
 

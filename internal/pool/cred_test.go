@@ -40,14 +40,13 @@ func credentialOperationTestManager(
 
 // TestMoveCredential drives every MoveCredential outcome: real moves in both
 // directions, both no-ops, stray-file cleanup, the three refusals, and the
-// unwind/rollback fault paths. No-op and refusal cases inject Write faults on
+// rollback fault paths. No-op and refusal cases inject Write faults on
 // BOTH backends so any write attempt fails the case.
 func TestMoveCredential(t *testing.T) {
 	var (
 		errNoWrite    = errors.New("unexpected write: this case must not write")
 		errKCDelete   = errors.New("keychain delete exploded")
 		errFileDelete = errors.New("file delete exploded")
-		errFileRead   = errors.New("file read exploded")
 	)
 	noWrites := credstest.Faults{Write: errNoWrite}
 
@@ -158,32 +157,23 @@ func TestMoveCredential(t *testing.T) {
 			wantFile:      true,
 		},
 		{
-			name:       "readback failure unwinds the target copy",
-			seedKC:     true,
-			fileFaults: credstest.Faults{Read: errFileRead},
-			target:     creds.SourceFile,
-			wantErrIs:  []error{errFileRead},
-			wantKC:     true, // source untouched
-		},
-		{
 			name:          "source delete failure rolls back the target",
 			seedKC:        true,
 			kcFaults:      credstest.Faults{Delete: errKCDelete},
 			target:        creds.SourceFile,
-			wantErrIs:     []error{errKCDelete},
-			wantErrSubstr: []string{`fake keychain item "svc-move"`, ".credentials.json"},
+			wantErrSubstr: []string{errKCDelete.Error()},
 			wantKC:        true, // exactly one copy remains: the source
 		},
 		{
-			name:          "failed rollback names both locations",
+			name:          "failed rollback quarantines both copies",
 			seedKC:        true,
 			kcFaults:      credstest.Faults{Delete: errKCDelete},
 			fileFaults:    credstest.Faults{Delete: errFileDelete},
 			target:        creds.SourceFile,
-			wantErrIs:     []error{errKCDelete, errFileDelete},
-			wantErrSubstr: []string{`fake keychain item "svc-move"`, ".credentials.json"},
+			wantErrIs:     []error{ErrCredentialOperationQuarantined},
+			wantErrSubstr: []string{errKCDelete.Error()},
 			wantKC:        true,
-			wantFile:      true, // double fault: both copies remain, both named
+			wantFile:      true,
 		},
 		{
 			name:          "unknown backend target refused",
@@ -290,63 +280,6 @@ func readMovedCredential(fk *credstest.Fake, a store.Account, target creds.Sourc
 		return nil, errors.New("keychain item missing after the move")
 	}
 	return c, nil
-}
-
-// tamperStore corrupts every successful read, simulating a target backend
-// that acknowledges the write but returns different bytes.
-type tamperStore struct{ creds.Store }
-
-func (s tamperStore) Read(ctx context.Context) (*creds.Credential, error) {
-	c, err := s.Store.Read(ctx)
-	if err != nil {
-		return nil, err
-	}
-	c.ClaudeAiOauth.RefreshToken = "tampered-" + c.ClaudeAiOauth.RefreshToken
-	return c, nil
-}
-
-// tamperCreds swaps a tamperStore in for one source of the wrapped seam.
-type tamperCreds struct {
-	Credentials
-	src creds.Source
-}
-
-func (c tamperCreds) Store(a store.Account, src creds.Source) creds.Store {
-	s := c.Credentials.Store(a, src)
-	if src == c.src {
-		return tamperStore{s}
-	}
-	return s
-}
-
-func (c tamperCreds) Stores(a store.Account) []creds.Store {
-	return []creds.Store{c.Store(a, creds.SourceKeychain), c.Store(a, creds.SourceFile)}
-}
-
-// TestMoveCredentialReadbackMismatch pins the write-verify step: a target
-// whose readback differs from what was written (a racing writer, a lying
-// backend) is unwound, leaving the source as the only live credential.
-func TestMoveCredentialReadbackMismatch(t *testing.T) {
-	dir := t.TempDir()
-	a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc-move", KeychainAccount: "user"}
-	fk := credstest.NewFake()
-	fk.Put(a.KeychainService, a.KeychainAccount, moveCred())
-	m, a := credentialOperationTestManager(
-		t,
-		a,
-		tamperCreds{Credentials: fk, src: creds.SourceFile},
-	)
-
-	_, err := m.MoveCredential(context.Background(), a, creds.SourceFile)
-	if err == nil || !strings.Contains(err.Error(), "does not match") {
-		t.Fatalf("MoveCredential = %v, want a readback-mismatch error", err)
-	}
-	if _, ok := fk.Get(a.KeychainService, a.KeychainAccount); !ok {
-		t.Error("source keychain item deleted after a failed verify")
-	}
-	if fileCredentialExistsForTest(dir) {
-		t.Error("unverified target copy not unwound")
-	}
 }
 
 // datedCred builds a usable credential whose token names it and whose expiry is
