@@ -181,6 +181,53 @@ func TestPoolOf(t *testing.T) {
 			Pool{Remaining5h: 50, Remaining7d: 100, Mood: MoodEasy},
 			true,
 		},
+		"scoped lower than aggregate folds the mean down": {
+			// Aggregate weekly headroom 60, but the scoped bucket is 80% used
+			// (headroom 20) with its reset pending: the mean folds to the binding 20.
+			[]PoolAccount{{
+				HasUsage: true, Remaining5h: 100, Remaining7d: 60,
+				HasScoped7d: true, Scoped7dUtil: 80, Scoped7dResets: now.Add(48 * time.Hour),
+			}},
+			Pool{Remaining5h: 100, Remaining7d: 20, Mood: MoodWorried},
+			true,
+		},
+		"scoped higher than aggregate is ignored": {
+			// Scoped headroom 90 exceeds aggregate 40: the min-fold keeps aggregate.
+			[]PoolAccount{{
+				HasUsage: true, Remaining5h: 100, Remaining7d: 40,
+				HasScoped7d: true, Scoped7dUtil: 10, Scoped7dResets: now.Add(48 * time.Hour),
+			}},
+			Pool{Remaining5h: 100, Remaining7d: 40, Mood: MoodEasy},
+			true,
+		},
+		"scoped with a passed reset is ignored": {
+			// The scoped bucket is pegged (5% left) but its reset already elapsed —
+			// the window refilled, so the stale sample must not fold pressure in.
+			[]PoolAccount{{
+				HasUsage: true, Remaining5h: 100, Remaining7d: 70,
+				HasScoped7d: true, Scoped7dUtil: 95, Scoped7dResets: now.Add(-time.Hour),
+			}},
+			Pool{Remaining5h: 100, Remaining7d: 70, Mood: MoodChill},
+			true,
+		},
+		"zero scoped reset still folds": {
+			// An unknown (zero) scoped reset never counts as passed, so the fold
+			// applies: aggregate 90 folds to the scoped headroom 30.
+			[]PoolAccount{{
+				HasUsage: true, Remaining5h: 100, Remaining7d: 90,
+				HasScoped7d: true, Scoped7dUtil: 70,
+			}},
+			Pool{Remaining5h: 100, Remaining7d: 30, Mood: MoodUneasy},
+			true,
+		},
+		"HasScoped7d false ignores a stray scoped util": {
+			// Without HasScoped7d the scoped util is inert, however pegged.
+			[]PoolAccount{{
+				HasUsage: true, Remaining5h: 100, Remaining7d: 55, Scoped7dUtil: 99,
+			}},
+			Pool{Remaining5h: 100, Remaining7d: 55, Mood: MoodChill},
+			true,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -218,49 +265,69 @@ func TestPoolOf(t *testing.T) {
 
 func TestMoodOf(t *testing.T) {
 	cases := map[string]struct {
-		usable    int
-		remaining float64
-		dry       bool
-		weekly    bool
-		want      Mood
+		in   moodInput
+		want Mood
 	}{
-		"no usable accounts is panic":  {0, 0, false, false, MoodPanic},
-		"60 is chill":                  {1, 60, false, false, MoodChill},
-		"just below 60 is easy":        {1, 59.9, false, false, MoodEasy},
-		"40 is easy":                   {1, 40, false, false, MoodEasy},
-		"just below 40 is uneasy":      {1, 39.9, false, false, MoodUneasy},
-		"25 is uneasy":                 {1, 25, false, false, MoodUneasy},
-		"just below 25 is worried":     {1, 24.9, false, false, MoodWorried},
-		"10 is worried":                {1, 10, false, false, MoodWorried},
-		"just below 10 is alarmed":     {1, 9.9, false, false, MoodAlarmed},
-		"dry bumps chill to easy":      {1, 80, true, false, MoodEasy},
-		"dry bumps easy to uneasy":     {1, 50, true, false, MoodUneasy},
-		"dry bumps uneasy to worried":  {1, 30, true, false, MoodWorried},
-		"dry bumps worried to alarmed": {1, 15, true, false, MoodAlarmed},
-		"dry bumps alarmed to panic":   {1, 5, true, false, MoodPanic},
-		"panic stays panic under bump": {0, 0, true, false, MoodPanic},
-		// Weekly exhaustion floors the mood at alarmed however fresh the 5h mean.
-		"weekly floors chill at alarmed":    {1, 100, false, true, MoodAlarmed},
-		"weekly floors easy at alarmed":     {1, 50, false, true, MoodAlarmed},
-		"weekly no-op once already alarmed": {1, 5, false, true, MoodAlarmed},
-		// The dry bump applies on top of the weekly floor, reaching panic.
-		"weekly floor then dry is panic": {1, 100, true, true, MoodPanic},
-		// Floor off leaves the base mapping untouched (partial exhaustion path).
-		"weekly off leaves chill": {1, 100, false, false, MoodChill},
+		"no usable accounts is panic":  {moodInput{usable: 0}, MoodPanic},
+		"panic stays panic under bump": {moodInput{usable: 0, dryProjected: true}, MoodPanic},
+
+		// 5h rungs bind when the weekly window has ample slack (remaining7d 100).
+		"5h 60 is chill":           {moodInput{usable: 1, remaining5h: 60, remaining7d: 100}, MoodChill},
+		"5h just below 60 is easy": {moodInput{usable: 1, remaining5h: 59.9, remaining7d: 100}, MoodEasy},
+		"5h 40 is easy":            {moodInput{usable: 1, remaining5h: 40, remaining7d: 100}, MoodEasy},
+		"5h below 40 is uneasy":    {moodInput{usable: 1, remaining5h: 39.9, remaining7d: 100}, MoodUneasy},
+		"5h 25 is uneasy":          {moodInput{usable: 1, remaining5h: 25, remaining7d: 100}, MoodUneasy},
+		"5h below 25 is worried":   {moodInput{usable: 1, remaining5h: 24.9, remaining7d: 100}, MoodWorried},
+		"5h 10 is worried":         {moodInput{usable: 1, remaining5h: 10, remaining7d: 100}, MoodWorried},
+		"5h below 10 is alarmed":   {moodInput{usable: 1, remaining5h: 9.9, remaining7d: 100}, MoodAlarmed},
+
+		// Weekly rungs bind when the 5h window has ample slack (remaining5h 100).
+		"weekly 50 is chill":         {moodInput{usable: 1, remaining5h: 100, remaining7d: 50}, MoodChill},
+		"weekly below 50 is easy":    {moodInput{usable: 1, remaining5h: 100, remaining7d: 49.9}, MoodEasy},
+		"weekly 35 is easy":          {moodInput{usable: 1, remaining5h: 100, remaining7d: 35}, MoodEasy},
+		"weekly below 35 is uneasy":  {moodInput{usable: 1, remaining5h: 100, remaining7d: 34.9}, MoodUneasy},
+		"weekly 25 is uneasy":        {moodInput{usable: 1, remaining5h: 100, remaining7d: 25}, MoodUneasy},
+		"weekly below 25 is worried": {moodInput{usable: 1, remaining5h: 100, remaining7d: 24.9}, MoodWorried},
+		"weekly 15 is worried":       {moodInput{usable: 1, remaining5h: 100, remaining7d: 15}, MoodWorried},
+		"weekly below 15 is alarmed": {moodInput{usable: 1, remaining5h: 100, remaining7d: 14.9}, MoodAlarmed},
+
+		// The 7d pace bumps the weekly bucket one level at paceHotWeekly (1.25),
+		// hysteresis-guarded so 1.24 does nothing.
+		"pace 1.24 leaves chill":        {moodInput{usable: 1, remaining5h: 100, remaining7d: 100, pace7d: 1.24}, MoodChill},
+		"pace 1.25 bumps chill to easy": {moodInput{usable: 1, remaining5h: 100, remaining7d: 100, pace7d: 1.25}, MoodEasy},
+		// Worried weekly + pace bump (→ alarmed) + dry bump (→ panic) stack.
+		"worried weekly pace and dry stack to panic": {moodInput{usable: 1, remaining5h: 100, remaining7d: 20, pace7d: 1.25, dryProjected: true}, MoodPanic},
+
+		// The dry bump raises the merged mood one level, saturating at panic.
+		"dry bumps chill to easy":      {moodInput{usable: 1, remaining5h: 80, remaining7d: 100, dryProjected: true}, MoodEasy},
+		"dry bumps easy to uneasy":     {moodInput{usable: 1, remaining5h: 50, remaining7d: 100, dryProjected: true}, MoodUneasy},
+		"dry bumps uneasy to worried":  {moodInput{usable: 1, remaining5h: 30, remaining7d: 100, dryProjected: true}, MoodWorried},
+		"dry bumps worried to alarmed": {moodInput{usable: 1, remaining5h: 15, remaining7d: 100, dryProjected: true}, MoodAlarmed},
+		"dry bumps alarmed to panic":   {moodInput{usable: 1, remaining5h: 5, remaining7d: 100, dryProjected: true}, MoodPanic},
+
+		// The weekly-exhausted fraction floors the mood proportionally.
+		"floor 1 of 4 does not fire": {moodInput{usable: 4, remaining5h: 100, remaining7d: 100, weeklyExhausted: 1}, MoodChill},
+		"floor 1 of 3 is uneasy":     {moodInput{usable: 3, remaining5h: 100, remaining7d: 100, weeklyExhausted: 1}, MoodUneasy},
+		"floor 1 of 2 is worried":    {moodInput{usable: 2, remaining5h: 100, remaining7d: 100, weeklyExhausted: 1}, MoodWorried},
+		"floor 2 of 3 is alarmed":    {moodInput{usable: 3, remaining5h: 100, remaining7d: 100, weeklyExhausted: 2}, MoodAlarmed},
+		"floor 3 of 3 is alarmed":    {moodInput{usable: 3, remaining5h: 100, remaining7d: 100, weeklyExhausted: 3}, MoodAlarmed},
+
+		// The 2026-07 screenshot state: fresh 5h (92) masks a nearly-spent, hot,
+		// partly-exhausted weekly window that must alarm the mascot.
+		"screenshot state alarms": {moodInput{usable: 16, remaining5h: 92, remaining7d: 16.4, pace7d: 1.79, weeklyExhausted: 6}, MoodAlarmed},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if got := moodOf(tc.usable, tc.remaining, tc.dry, tc.weekly); got != tc.want {
-				t.Errorf("moodOf(%d, %v, %v, %v) = %q, want %q",
-					tc.usable, tc.remaining, tc.dry, tc.weekly, got, tc.want)
+			if got := moodOf(tc.in); got != tc.want {
+				t.Errorf("moodOf(%+v) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
 }
 
-// TestPoolMoodWeeklyExhaustion pins the mood floor a fully weekly-exhausted pool
-// raises through PoolOf: the mascot must alarm however fresh the 5h windows,
-// while partial exhaustion changes nothing.
+// TestPoolMoodWeeklyExhaustion pins the mood floor the weekly-exhausted fraction
+// raises through PoolOf: the mascot alarms when the pool is fully pegged and
+// floors proportionally short of that, however fresh the 5h windows.
 func TestPoolMoodWeeklyExhaustion(t *testing.T) {
 	now := time.Date(2026, 6, 11, 12, 0, 0, 0, time.UTC)
 	cases := map[string]struct {
@@ -283,14 +350,14 @@ func TestPoolMoodWeeklyExhaustion(t *testing.T) {
 			},
 			MoodPanic,
 		},
-		"one of two exhausted changes nothing": {
-			// Partial exhaustion: selection routes around the pegged account, so the
-			// mood stays the fresh-5h baseline (chill), never floored.
+		"one of two exhausted floors at worried": {
+			// Half the usable pool is weekly-pegged (frac 1/2), so the proportional
+			// floor raises the fresh-5h baseline (chill) to worried.
 			[]PoolAccount{
 				{HasUsage: true, WeeklyExhausted: true, Remaining5h: 100, Remaining7d: 100},
 				{HasUsage: true, Remaining5h: 100, Remaining7d: 100},
 			},
-			MoodChill,
+			MoodWorried,
 		},
 		"a rate-limited straggler cannot veto the floor": {
 			// The fold runs over usable accounts only: a non-usable
@@ -325,14 +392,18 @@ func TestPoolMoodWeeklyExhaustion(t *testing.T) {
 		})
 	}
 
-	// The floor fires only when ALL usable accounts are pegged: a partially
-	// exhausted pool must land on the exact mood the flag-cleared pool does.
-	t.Run("partial exhaustion matches the flag-cleared baseline", func(t *testing.T) {
+	// Below the first floor rung (frac < 1/3) exhaustion adds nothing: a 1-of-4
+	// pegged pool must land on the exact mood the flag-cleared pool does.
+	t.Run("sub-rung exhaustion matches the flag-cleared baseline", func(t *testing.T) {
 		partial := []PoolAccount{
 			{HasUsage: true, WeeklyExhausted: true, Remaining5h: 30, Remaining7d: 40},
 			{HasUsage: true, Remaining5h: 30, Remaining7d: 40},
+			{HasUsage: true, Remaining5h: 30, Remaining7d: 40},
+			{HasUsage: true, Remaining5h: 30, Remaining7d: 40},
 		}
 		baseline := []PoolAccount{
+			{HasUsage: true, Remaining5h: 30, Remaining7d: 40},
+			{HasUsage: true, Remaining5h: 30, Remaining7d: 40},
 			{HasUsage: true, Remaining5h: 30, Remaining7d: 40},
 			{HasUsage: true, Remaining5h: 30, Remaining7d: 40},
 		}
@@ -342,7 +413,7 @@ func TestPoolMoodWeeklyExhaustion(t *testing.T) {
 			t.Errorf("partial mood %q != baseline mood %q", gotPartial.Mood, gotBaseline.Mood)
 		}
 		if gotPartial.Mood == MoodAlarmed {
-			t.Error("partial exhaustion floored the mood at alarmed; the floor must not fire")
+			t.Error("sub-rung exhaustion floored the mood at alarmed; the floor must not fire")
 		}
 	})
 }

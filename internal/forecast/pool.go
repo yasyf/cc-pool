@@ -47,12 +47,23 @@ type PoolAccount struct {
 	Burn5hPerHour   float64 // gated display 5h burn (Estimate.BurnPerHour)
 	Burn7dPerHour   float64 // gated display 7d burn (Burn7dGated)
 	Resets5h        time.Time
+	// HasScoped7d reports whether a model-scoped weekly bucket was sampled; false
+	// leaves the weekly fold on the aggregate Remaining7d alone.
+	HasScoped7d bool
+	// Scoped7dUtil is percent used 0..100 of the model-scoped weekly bucket; its
+	// remaining min-folds into the account's effective weekly headroom.
+	Scoped7dUtil float64
+	// Scoped7dResets is when the scoped bucket resets (zero = unknown); a passed
+	// reset self-lifts the fold, so a stale pegged sample never fabricates pressure.
+	Scoped7dResets time.Time
 }
 
 // Pool is the pool-wide rollup behind the widget's headline and mascot.
 type Pool struct {
 	// Remaining5h and Remaining7d are unweighted means over usable accounts: the
 	// API exposes only percentages, so equal weights are the only honest aggregate.
+	// Remaining7d is the mean EFFECTIVE weekly remaining — each account's aggregate
+	// weekly headroom min-folded with its model-scoped bucket (see effRemaining7d).
 	Remaining5h float64
 	Remaining7d float64
 	// BurnPerHour is the summed 5h drain across usable accounts (percent of one
@@ -63,6 +74,9 @@ type Pool struct {
 	Pace5h float64
 	// Pace7d is gross 7d burn over the pool's 7d regen rate (regen7dPerHour ×
 	// usable accounts); same 1.0-is-sustainable semantics over the weekly window.
+	// It deliberately does NOT fold scoped burn: no scoped burn estimator exists,
+	// and a scoped numerator over the aggregate-regen denominator would mix
+	// budgets — scoped usage already sits inside the aggregate window.
 	Pace7d float64
 	// NetBurnPerHour is the projected change of the pool's mean 5h remaining over
 	// the next hour (percentage points per hour), crediting refills that land
@@ -73,6 +87,27 @@ type Pool struct {
 	// forward simulation; zero means no wall lands within dryHorizon.
 	DryAt time.Time
 	Mood  Mood
+}
+
+// resetPassed reports whether a known reset time has already elapsed — the
+// window has refilled even if the latest sample predates it. Mirrors
+// score.resetPassed; a zero reset never counts as passed.
+func resetPassed(resetsAt, now time.Time) bool {
+	return !resetsAt.IsZero() && !now.Before(resetsAt)
+}
+
+// effRemaining7d is an account's effective weekly headroom: its aggregate weekly
+// remaining, min-folded with the model-scoped bucket's remaining when one was
+// sampled and its reset has not passed. A passed scoped reset self-lifts the
+// fold — the bucket has refilled — matching score.Score's per-window self-lift.
+func effRemaining7d(a PoolAccount, now time.Time) float64 {
+	rem := clamp(a.Remaining7d)
+	if a.HasScoped7d && !resetPassed(a.Scoped7dResets, now) {
+		if scoped := clamp(100 - a.Scoped7dUtil); scoped < rem {
+			rem = scoped
+		}
+	}
+	return rem
 }
 
 // PoolOf rolls up account states; ok=false means no account has a known-good
@@ -94,19 +129,19 @@ func PoolOf(accts []PoolAccount, now time.Time) (Pool, bool) {
 
 	var usableAccts []PoolAccount
 	var sum5, sum7, burn, burn7, drop float64
-	allWeeklyExhausted := true
+	weeklyExhausted := 0
 	for _, a := range accts {
 		if !a.HasUsage || a.RateLimited {
 			continue
 		}
 		usableAccts = append(usableAccts, a)
 		sum5 += clamp(a.Remaining5h)
-		sum7 += clamp(a.Remaining7d)
+		sum7 += effRemaining7d(a, now)
 		burn += a.Burn5hPerHour
 		burn7 += a.Burn7dPerHour
 		drop += netDrop(a, now)
-		if !a.WeeklyExhausted {
-			allWeeklyExhausted = false
+		if a.WeeklyExhausted {
+			weeklyExhausted++
 		}
 	}
 	usable := len(usableAccts)
@@ -120,7 +155,14 @@ func PoolOf(accts []PoolAccount, now time.Time) (Pool, bool) {
 		p.NetBurnPerHour = drop / float64(usable) / netBurnHorizon.Hours()
 		p.DryAt = dryAt(usableAccts, sum5, burn, now)
 	}
-	p.Mood = moodOf(usable, p.Remaining5h, !p.DryAt.IsZero(), usable > 0 && allWeeklyExhausted)
+	p.Mood = moodOf(moodInput{
+		usable:          usable,
+		remaining5h:     p.Remaining5h,
+		remaining7d:     p.Remaining7d,
+		pace7d:          p.Pace7d,
+		dryProjected:    !p.DryAt.IsZero(),
+		weeklyExhausted: weeklyExhausted,
+	})
 	return p, true
 }
 
@@ -208,35 +250,99 @@ func atLeast(m, floor Mood) Mood {
 	return m
 }
 
-// moodOf maps mean remaining to an alarm level. When every usable account is
-// weekly-exhausted the pool cannot serve its default-model work within plan
-// limits however fresh the 5h windows, so the mood floors at MoodAlarmed; the
-// dry-out bump then applies on top, so a floored-alarmed pool can still reach
-// panic.
-func moodOf(usable int, remaining5h float64, dryProjected, allWeeklyExhausted bool) Mood {
-	if usable == 0 {
+// moodInput is everything moodOf folds into the pool's alarm level: the usable
+// count, the mean 5h and effective-weekly remaining, the 7d pace, whether a 5h
+// dry-out is projected, and how many usable accounts are weekly-exhausted.
+type moodInput struct {
+	usable          int
+	remaining5h     float64
+	remaining7d     float64
+	pace7d          float64
+	dryProjected    bool
+	weeklyExhausted int
+}
+
+// Weekly-bucket thresholds and the pace bump. The weekly rungs are lenient at
+// the top and strict at the bottom: the weekly window regenerates ~34× slower
+// than the 5h one, so a low weekly reading is far harder to recover from.
+const (
+	weeklyChill   = 50.0
+	weeklyEasy    = 35.0
+	weeklyUneasy  = 25.0
+	weeklyWorried = 15.0
+	// paceHotWeekly is the 7d pace at or above which the weekly bucket bumps one
+	// level. It sits above break-even as hysteresis against Burn7d's integer-
+	// percent quantization noise (cf. burn.go's widened 7d lookback).
+	paceHotWeekly = 1.25
+)
+
+// moodOf folds the pool's 5h and weekly pressure into one alarm level: the worst
+// of the 5h and weekly buckets, raised to the proportional weekly-exhaustion
+// floor, then bumped once per live hazard — a hot 7d pace lifts the weekly
+// bucket pre-merge, a projected 5h dry-out lifts the merged mood post-merge.
+// Both bumps saturate at MoodPanic; a pool with no usable account is MoodPanic.
+func moodOf(in moodInput) Mood {
+	if in.usable == 0 {
 		return MoodPanic
 	}
-	var m Mood
-	switch {
-	case remaining5h >= 60:
-		m = MoodChill
-	case remaining5h >= 40:
-		m = MoodEasy
-	case remaining5h >= 25:
-		m = MoodUneasy
-	case remaining5h >= 10:
-		m = MoodWorried
-	default:
-		m = MoodAlarmed
+	weekly := weeklyBucket(in.remaining7d)
+	if in.pace7d >= paceHotWeekly {
+		weekly = weekly.worse()
 	}
-	if allWeeklyExhausted {
-		m = atLeast(m, MoodAlarmed)
-	}
-	if dryProjected {
+	m := atLeast(bucket5h(in.remaining5h), weekly)
+	m = atLeast(m, exhaustedFloor(in.weeklyExhausted, in.usable))
+	if in.dryProjected {
 		m = m.worse()
 	}
 	return m
+}
+
+// bucket5h maps mean 5h remaining to an alarm level.
+func bucket5h(remaining5h float64) Mood {
+	switch {
+	case remaining5h >= 60:
+		return MoodChill
+	case remaining5h >= 40:
+		return MoodEasy
+	case remaining5h >= 25:
+		return MoodUneasy
+	case remaining5h >= 10:
+		return MoodWorried
+	default:
+		return MoodAlarmed
+	}
+}
+
+// weeklyBucket maps mean effective weekly remaining to an alarm level.
+func weeklyBucket(remaining7d float64) Mood {
+	switch {
+	case remaining7d >= weeklyChill:
+		return MoodChill
+	case remaining7d >= weeklyEasy:
+		return MoodEasy
+	case remaining7d >= weeklyUneasy:
+		return MoodUneasy
+	case remaining7d >= weeklyWorried:
+		return MoodWorried
+	default:
+		return MoodAlarmed
+	}
+}
+
+// exhaustedFloor is the mood floor the weekly-exhausted fraction raises the pool
+// to: ≥2/3 alarmed, ≥1/2 worried, ≥1/3 uneasy, and MoodChill (no floor) below.
+// A fully-exhausted pool (frac 1) floors at alarmed, as before the rungs.
+func exhaustedFloor(weeklyExhausted, usable int) Mood {
+	switch frac := float64(weeklyExhausted) / float64(usable); {
+	case frac >= 2.0/3:
+		return MoodAlarmed
+	case frac >= 1.0/2:
+		return MoodWorried
+	case frac >= 1.0/3:
+		return MoodUneasy
+	default:
+		return MoodChill
+	}
 }
 
 // netBurnHorizon is the NetBurnPerHour lookahead: refills landing inside it

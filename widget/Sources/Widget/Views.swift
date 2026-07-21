@@ -107,7 +107,7 @@ struct PoolHeaderView: View {
     }
 
     private func headline(_ o: PoolOutlook) -> String {
-        let pct = "Pool \(Int((100 - o.remaining5hPct).rounded()))% used"
+        let pct = "Pool \(o.bindingUsedPct)% used (\(o.bindingLabel))"
         guard detailed else { return pct }
         // The compact caption moves into the headline on the large widget;
         // burn lives on the second line, so only the dry clock joins here.
@@ -118,7 +118,7 @@ struct PoolHeaderView: View {
     }
 
     private func secondLine(_ o: PoolOutlook) -> String {
-        "7d \(Int((100 - o.remaining7dPct).rounded()))% · " + o.pacePhrase
+        "\(o.otherLabel) \(o.otherUsedPct)% · " + o.pacePhrase
     }
 }
 
@@ -140,7 +140,8 @@ struct AccountListView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             }
             FooterView(generatedAt: status.generatedAt, now: now, stale: stale,
-                       overflow: max(0, ranked.count - maxRows))
+                       overflow: max(0, ranked.count - maxRows),
+                       exhausted: ranked.dropFirst(maxRows).filter(\.isExhausted).count)
                 .padding(.top, 2)
         }
     }
@@ -212,12 +213,17 @@ struct AccountRow: View {
 
     /// Detail line: the forward-looking projection (now carrying its own reset
     /// clock), the relief time when depleting before reset, the 7d reset only
-    /// when the week is heavily spent, then overage spend.
+    /// when the week is heavily spent and the exhaustion clock hasn't already
+    /// shown it, then overage spend.
     private var detail: String? {
         var parts: [String] = []
         if account.unusable {
-            // Rate-limited / exhausted: the recovery time is the only fact.
-            if let reset = account.resets5h?.nonZero {
+            // Rate-limited / exhausted: the recovery time is the only fact. The
+            // weekly reset wins when the week is what's pegged — its clock is
+            // the honest one, not the idle 5h window's.
+            if let weekly = account.weeklyExhaustionReset {
+                parts.append("\(weekly.label) resets " + weekResetText(weekly.reset))
+            } else if let reset = account.resets5h?.nonZero {
                 parts.append("resets " + reset.formatted(date: .omitted, time: .shortened))
             }
         } else if let prediction = account.predictionText() {
@@ -228,7 +234,9 @@ struct AccountRow: View {
                 parts.append("resets " + reset.formatted(date: .omitted, time: .shortened))
             }
         }
-        if 100 - account.remaining7d >= Self.weekHeavyUsedPct, let reset = account.resets7d?.nonZero {
+        if account.weeklyExhaustionReset?.label != "7d",
+            100 - account.remaining7d >= Self.weekHeavyUsedPct, let reset = account.resets7d?.nonZero
+        {
             parts.append("7d resets " + weekResetText(reset))
         }
         if account.hasOverage {
@@ -241,16 +249,16 @@ struct AccountRow: View {
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
+}
 
-    /// The 7d reset as an abbreviated weekday ("Wed"), but the hour ("8 AM")
-    /// when it lands within a day — so a same-day weekday never misreads as
-    /// next week.
-    private func weekResetText(_ reset: Date, now: Date = .now) -> String {
-        if reset.timeIntervalSince(now) < 24 * 3600 {
-            return reset.formatted(.dateTime.hour())
-        }
-        return reset.formatted(.dateTime.weekday(.abbreviated))
+/// A weekly reset as an abbreviated weekday plus hour ("Fri 2 PM") once it's
+/// more than a day out, or just the hour ("8 AM") when it lands within a day —
+/// so a same-day weekday never misreads as next week.
+func weekResetText(_ reset: Date, now: Date = .now) -> String {
+    if reset.timeIntervalSince(now) < 24 * 3600 {
+        return reset.formatted(.dateTime.hour())
     }
+    return reset.formatted(.dateTime.weekday(.abbreviated).hour())
 }
 
 // MARK: - Small: the pool at a glance (mascot + headline + next pick)
@@ -269,10 +277,10 @@ struct SmallView: View {
                 CritterView(mood: status.outlook?.mood ?? .chill, size: 54, seed: seed)
                 VStack(alignment: .leading, spacing: 0) {
                     if let outlook = status.outlook {
-                        Text("\(Int((100 - outlook.remaining5hPct).rounded()))%")
+                        Text("\(outlook.bindingUsedPct)%")
                             .font(.system(size: 26, weight: .bold, design: .rounded))
                             .monospacedDigit()
-                            + Text(" used")
+                            + Text(" used (\(outlook.bindingLabel))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Text(outlook.caption())
@@ -460,7 +468,11 @@ struct BadgeRow: View {
                 // fact that matters — the CLI's RESETS column, shown on demand.
                 // predictionText is nil for unusable rows, so the slot is shared,
                 // never crowded.
-                if account.unusable, let reset = account.resets5h?.nonZero {
+                if account.unusable, let weekly = account.weeklyExhaustionReset {
+                    Text("\(weekly.label) " + weekResetText(weekly.reset))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                } else if account.unusable, let reset = account.resets5h?.nonZero {
                     Text(reset, format: .dateTime.hour().minute())
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
@@ -484,13 +496,14 @@ struct FooterView: View {
     let now: Date
     let stale: Bool
     let overflow: Int
+    var exhausted: Int = 0
 
     var body: some View {
         HStack(spacing: 4) {
-            if overflow > 0 {
-                Text("+\(overflow) more")
+            if let runs = footerText(overflow: overflow, exhausted: exhausted) {
+                (Text(runs.overflow).foregroundStyle(.tertiary)
+                    + Text(runs.exhausted ?? "").foregroundStyle(.red))
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
             }
             Spacer(minLength: 0)
             if stale {

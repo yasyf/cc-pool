@@ -210,6 +210,9 @@ type StatusSnapshot struct {
 // daemon-side so the widget mascot and CLI rendering always agree.
 type PoolOutlook struct {
 	Remaining5hPct float64 `json:"remaining_5h_pct"`
+	// Remaining7dPct is the pool's mean EFFECTIVE weekly remaining — aggregate
+	// weekly headroom min-folded with each account's model-scoped bucket. The wire
+	// key and type are unchanged; only its meaning tightens.
 	Remaining7dPct float64 `json:"remaining_7d_pct"`
 	Burn5hPerHour  float64 `json:"burn_5h_per_hour,omitempty"`
 	// NetBurn5hPerHour is deliberately NOT omitempty: 0 is a real value, and
@@ -249,6 +252,9 @@ func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 			Burn5hPerHour:   a.Burn5hPerHour,
 			Burn7dPerHour:   a.Burn7dPerHour,
 			Resets5h:        a.Resets5h,
+			HasScoped7d:     a.Scoped7dModel != "",
+			Scoped7dUtil:    a.Scoped7dUtil,
+			Scoped7dResets:  a.Scoped7dResets,
 		})
 	}
 	if p, ok := forecast.PoolOf(pa, now); ok {

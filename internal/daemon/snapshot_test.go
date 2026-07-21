@@ -500,6 +500,25 @@ func TestStatusSnapshotWeeklyExhaustedMood(t *testing.T) {
 	}
 }
 
+// TestStatusSnapshotScopedFoldsPoolRemaining proves the daemon conversion feeds
+// the scoped weekly trio into the forecast fold: an account with aggregate weekly
+// headroom 60 but a model-scoped bucket 80% used (reset pending) folds the pool's
+// mean effective weekly remaining down to the binding 20.
+func TestStatusSnapshotScopedFoldsPoolRemaining(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	acct := AccountStatus{
+		ID: 1, HasUsage: true, Remaining5h: 100, Remaining7d: 60,
+		Scoped7dUtil: 80, Scoped7dResets: now.Add(48 * time.Hour), Scoped7dModel: "Fable",
+	}
+	snap := NewStatusSnapshot([]AccountStatus{acct}, now)
+	if snap.Pool == nil {
+		t.Fatal("pool block missing from a sampled snapshot")
+	}
+	if snap.Pool.Remaining7dPct != 20 {
+		t.Errorf("pool remaining_7d_pct = %v, want 20 (scoped 80%% used folds 60→20)", snap.Pool.Remaining7dPct)
+	}
+}
+
 func TestWriteStatusSnapshotForecast(t *testing.T) {
 	s, _ := newTestServer(t)
 	s.snapshot = filepath.Join(t.TempDir(), "status.json")
@@ -566,7 +585,7 @@ func TestWriteStatusSnapshotForecast(t *testing.T) {
 	if snap.Pool == nil {
 		t.Fatal("pool block missing from a sampled snapshot")
 	}
-	// 90+50 remaining at burn 40%/hr = dry in 3.5h, no reset relief: chill bumps to easy.
+	// Mean 90+50 5h remaining → 70; burn 40%/hr dries the pool in 3.5h with no reset relief.
 	if snap.Pool.Remaining5hPct != 70 {
 		t.Errorf("pool remaining_5h_pct = %v, want 70", snap.Pool.Remaining5hPct)
 	}
@@ -591,8 +610,11 @@ func TestWriteStatusSnapshotForecast(t *testing.T) {
 	if snap.Pool.DryAt.IsZero() {
 		t.Error("pool dry_at missing despite positive burn and no reset relief")
 	}
-	if snap.Pool.Mood != forecast.MoodEasy {
-		t.Errorf("pool mood = %q, want %q", snap.Pool.Mood, forecast.MoodEasy)
+	// Mean effective weekly remaining 70 is weekly-chill, but Pace7d≈1.68 (≥1.25)
+	// bumps the weekly bucket chill→easy; worst-of holds easy, then the projected
+	// 5h dry-out bumps easy→uneasy.
+	if snap.Pool.Mood != forecast.MoodUneasy {
+		t.Errorf("pool mood = %q, want %q", snap.Pool.Mood, forecast.MoodUneasy)
 	}
 }
 
