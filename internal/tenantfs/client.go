@@ -52,6 +52,11 @@ func NewClient(ctx context.Context, socket string) (*Client, error) {
 // Close settles and closes the shared persistent session.
 func (c *Client) Close() error { return c.wire.Close() }
 
+// RuntimeHealth returns the holder's exact activation and native presentation state.
+func (c *Client) RuntimeHealth(ctx context.Context) (mountproto.RuntimeHealthResponse, error) {
+	return c.mount.RuntimeHealth(ctx)
+}
+
 // ProvisionTenant durably provisions one account before publishing its source state.
 func (c *Client) ProvisionTenant(ctx context.Context, account Account) (mountproto.ProvisionTenantResponse, error) {
 	id, err := account.TenantID()

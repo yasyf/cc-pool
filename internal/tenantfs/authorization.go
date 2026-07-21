@@ -22,6 +22,18 @@ type MountAuthorizer struct{ UID int }
 // NewMountAuthorizer returns the current-user product authorizer.
 func NewMountAuthorizer() MountAuthorizer { return MountAuthorizer{UID: os.Getuid()} }
 
+// AuthorizeRuntime admits one exact local runtime-health request.
+func (a MountAuthorizer) AuthorizeRuntime(
+	_ context.Context,
+	identity mountservice.Identity,
+	operation mountproto.Operation,
+) error {
+	if !validMountIdentity(a.UID, identity) || operation != mountproto.OperationRuntimeHealth {
+		return errUnauthorized
+	}
+	return nil
+}
+
 // Authorize admits one exact local tenant lifecycle request.
 func (a MountAuthorizer) Authorize(
 	_ context.Context,

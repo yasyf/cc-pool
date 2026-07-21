@@ -13,8 +13,9 @@ import (
 func TestRuntimePlanSpecPinsProductIdentityAndProtectedPolicy(t *testing.T) {
 	const appPath = "/Applications/CCPoolStatus.app"
 	const runtimeDirectory = "/Users/test/.cc-pool/fusekit"
+	const presentationRoot = "/Users/test/.cc-pool/accounts"
 	const buildID = "v0.60.0"
-	spec := RuntimePlanSpec(appPath, runtimeDirectory, buildID, nil)
+	spec := RuntimePlanSpec(appPath, runtimeDirectory, presentationRoot, buildID, nil)
 	application := spec.Application
 	if application != Application(appPath) || application.BundleID != BundleID ||
 		application.TeamID != TeamID || application.Broker != application.Runtime ||
@@ -22,7 +23,8 @@ func TestRuntimePlanSpecPinsProductIdentityAndProtectedPolicy(t *testing.T) {
 		application.Runtime.SigningIdentifier != BundleID {
 		t.Fatalf("application = %#v", application)
 	}
-	if spec.RuntimeDirectory != runtimeDirectory || spec.BuildID != buildID ||
+	if spec.RuntimeDirectory != runtimeDirectory || spec.PresentationRoot != presentationRoot ||
+		spec.BuildID != buildID ||
 		!spec.SourceCapable || spec.BrokerPolicy.RequiredAppGroup != AppGroup ||
 		spec.RuntimePolicy.RequiredAppGroup != AppGroup {
 		t.Fatalf("runtime plan spec = %#v", spec)

@@ -10,12 +10,14 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/daemonkit/wire/lifeproto"
 	"github.com/yasyf/fusekit/holder"
+	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/transportproto"
 )
 
@@ -42,7 +44,7 @@ var (
 	) (holderServiceController, error) {
 		return service.NewController(ctx, config)
 	}
-	holderReady = func(ctx context.Context, socket string) error {
+	holderLifecycleReady = func(ctx context.Context, socket string) error {
 		peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
 			Dial: wire.UnixDialer(socket), Build: transportproto.Build,
 			LifecycleBuild: version.String(),
@@ -52,7 +54,28 @@ var (
 		if err != nil {
 			return errors.Join(err, closeErr)
 		}
-		return errors.Join(validateHolderHealth(health), closeErr)
+		if err := errors.Join(validateHolderHealth(health), closeErr); err != nil {
+			return err
+		}
+		return nil
+	}
+	holderRuntimeReady = func(ctx context.Context, socket string) error {
+		client, err := tenantfs.NewClient(ctx, socket)
+		if err != nil {
+			return err
+		}
+		runtimeHealth, err := client.RuntimeHealth(ctx)
+		closeErr := client.Close()
+		if err != nil {
+			return errors.Join(err, closeErr)
+		}
+		return errors.Join(validateHolderRuntimeHealth(runtimeHealth), closeErr)
+	}
+	holderReady = func(ctx context.Context, socket string) error {
+		if err := holderLifecycleReady(ctx, socket); err != nil {
+			return err
+		}
+		return holderRuntimeReady(ctx, socket)
 	}
 	holderServicePresent = func(agent service.Agent) (bool, error) {
 		path, err := agent.PlistPath()
@@ -86,6 +109,29 @@ func validateHolderHealth(health dkdaemon.Health) error {
 	return nil
 }
 
+func validateHolderRuntimeHealth(health mountproto.RuntimeHealthResponse) error {
+	if health.ActivationGeneration == "" {
+		return errors.New("holder runtime activation generation is empty")
+	}
+	if health.NativePhase != mountproto.NativePhaseLive || health.NativeMount == nil {
+		return fmt.Errorf(
+			"holder native presentation is not ready: phase=%q proof=%t",
+			health.NativePhase, health.NativeMount != nil,
+		)
+	}
+	proof := health.NativeMount
+	if proof.PresentationRoot != pool.FuseKitPresentationRoot() ||
+		proof.Filesystem != mountproto.NativeMountFilesystem ||
+		proof.Source != mountproto.NativeMountSource ||
+		proof.CatalogEpoch == 0 {
+		return fmt.Errorf(
+			"holder native mount proof is not exact: root=%q filesystem=%q source=%q catalog_epoch=%d",
+			proof.PresentationRoot, proof.Filesystem, proof.Source, proof.CatalogEpoch,
+		)
+	}
+	return nil
+}
+
 type holderServiceController interface {
 	Converge(context.Context, []service.Agent) error
 	Close(context.Context) error
@@ -114,6 +160,7 @@ func HolderDeploymentPlan() (holder.DeploymentPlan, error) {
 	return holder.NewDeploymentPlan(holder.DeploymentPlanSpec{
 		Application:         holderApplication(),
 		RuntimeDirectory:    pool.FuseKitRuntimeDir(),
+		PresentationRoot:    pool.FuseKitPresentationRoot(),
 		BuildID:             version.String(),
 		SourceCapable:       true,
 		BrokerPolicyDigest:  holderEntitlementPolicyDigest,

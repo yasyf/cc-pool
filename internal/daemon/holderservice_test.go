@@ -18,6 +18,7 @@ import (
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/wire/lifeproto"
 	"github.com/yasyf/fusekit/holder"
+	"github.com/yasyf/fusekit/mountproto"
 )
 
 func TestValidateHolderHealthRequiresExactReadyLifecycle(t *testing.T) {
@@ -47,6 +48,84 @@ func TestValidateHolderHealthRequiresExactReadyLifecycle(t *testing.T) {
 				t.Fatalf("validateHolderHealth(%#v) = %v, want %q", got, err, test.want)
 			}
 		})
+	}
+}
+
+func TestValidateHolderRuntimeHealthRequiresExactNativeMountProof(t *testing.T) {
+	healthy := mountproto.RuntimeHealthResponse{
+		Protocol:             mountproto.Version,
+		Code:                 mountproto.ErrorCodeOk,
+		ActivationGeneration: "activation-7",
+		NativePhase:          mountproto.NativePhaseLive,
+		NativeMount: &mountproto.NativeMountProof{
+			PresentationRoot: pool.FuseKitPresentationRoot(),
+			Filesystem:       mountproto.NativeMountFilesystem,
+			Source:           mountproto.NativeMountSource,
+			CatalogEpoch:     7,
+		},
+	}
+	if err := validateHolderRuntimeHealth(healthy); err != nil {
+		t.Fatalf("healthy runtime: %v", err)
+	}
+	for _, test := range []struct {
+		name string
+		edit func(*mountproto.RuntimeHealthResponse)
+		want string
+	}{
+		{name: "activation", edit: func(h *mountproto.RuntimeHealthResponse) { h.ActivationGeneration = "" }, want: "activation generation is empty"},
+		{name: "phase", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativePhase = mountproto.NativePhaseStarting }, want: "presentation is not ready"},
+		{name: "proof", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount = nil }, want: "presentation is not ready"},
+		{name: "root", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.PresentationRoot += "-wrong" }, want: "proof is not exact"},
+		{name: "filesystem", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.Filesystem = "fusefs" }, want: "proof is not exact"},
+		{name: "source", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.Source = "fuse-t:/wrong" }, want: "proof is not exact"},
+		{name: "epoch", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.CatalogEpoch = 0 }, want: "proof is not exact"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := healthy
+			proof := *healthy.NativeMount
+			got.NativeMount = &proof
+			test.edit(&got)
+			if err := validateHolderRuntimeHealth(got); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateHolderRuntimeHealth(%#v) = %v, want %q", got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestHolderReadyRequiresLifecycleBeforeRuntimeHealth(t *testing.T) {
+	originalLifecycle, originalRuntime := holderLifecycleReady, holderRuntimeReady
+	t.Cleanup(func() { holderLifecycleReady, holderRuntimeReady = originalLifecycle, originalRuntime })
+	var order []string
+	holderLifecycleReady = func(context.Context, string) error {
+		order = append(order, "lifecycle")
+		return nil
+	}
+	holderRuntimeReady = func(context.Context, string) error {
+		order = append(order, "runtime")
+		return nil
+	}
+	if err := holderReady(t.Context(), "/tmp/fusekit.sock"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(order, []string{"lifecycle", "runtime"}) {
+		t.Fatalf("readiness order = %v", order)
+	}
+
+	want := errors.New("lifecycle not ready")
+	order = nil
+	holderLifecycleReady = func(context.Context, string) error {
+		order = append(order, "lifecycle")
+		return want
+	}
+	holderRuntimeReady = func(context.Context, string) error {
+		t.Fatal("runtime health queried before lifecycle readiness")
+		return nil
+	}
+	if err := holderReady(t.Context(), "/tmp/fusekit.sock"); !errors.Is(err, want) {
+		t.Fatalf("holderReady error = %v, want %v", err, want)
+	}
+	if !slices.Equal(order, []string{"lifecycle"}) {
+		t.Fatalf("failed readiness order = %v", order)
 	}
 }
 
@@ -82,9 +161,11 @@ func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testi
 		)
 	}
 	runtimeSpec := holderbridge.RuntimePlanSpec(
-		wantApplication.AppPath, pool.FuseKitRuntimeDir(), plan.BuildID(), nil,
+		wantApplication.AppPath, pool.FuseKitRuntimeDir(), pool.FuseKitPresentationRoot(),
+		plan.BuildID(), nil,
 	)
 	if runtimeSpec.Application != application || !runtimeSpec.SourceCapable ||
+		runtimeSpec.PresentationRoot != pool.AccountsDir() ||
 		runtimeSpec.BrokerPolicy.RequiredAppGroup != holderbridge.AppGroup ||
 		runtimeSpec.RuntimePolicy.RequiredAppGroup != holderbridge.AppGroup {
 		t.Fatal("signed runtime contract differs from daemon deployment identity")
@@ -101,8 +182,14 @@ func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testi
 	}
 	if plan.Paths().Directory != pool.FuseKitRuntimeDir() ||
 		plan.Paths().Socket != pool.FuseKitSocketPath() ||
+		plan.Paths().PresentationRoot != pool.AccountsDir() ||
 		plan.Paths().ProcessStore != filepath.Join(pool.FuseKitRuntimeDir(), "processes.db") {
 		t.Fatalf("runtime paths = %#v", plan.Paths())
+	}
+	for _, id := range []int{1, 7, 20} {
+		if parent := filepath.Dir(pool.AccountPresentationDir(id)); parent != plan.Paths().PresentationRoot {
+			t.Fatalf("account %d presentation parent = %q, want %q", id, parent, plan.Paths().PresentationRoot)
+		}
 	}
 }
 

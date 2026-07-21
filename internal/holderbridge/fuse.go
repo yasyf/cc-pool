@@ -35,13 +35,14 @@ func Application(appPath string) holder.SignedApplication {
 
 // RuntimePlanSpec returns the concrete signed-side cc-pool holder contract.
 func RuntimePlanSpec(
-	appPath, runtimeDirectory, buildID string,
+	appPath, runtimeDirectory, presentationRoot, buildID string,
 	verifier *holder.FUSEVerifier,
 ) holder.RuntimePlanSpec {
 	policy := holder.EntitlementPolicy{RequiredAppGroup: AppGroup}
 	return holder.RuntimePlanSpec{
 		Application: Application(appPath), RuntimeDirectory: runtimeDirectory,
-		BuildID: buildID, SourceCapable: true,
+		PresentationRoot: presentationRoot,
+		BuildID:          buildID, SourceCapable: true,
 		BrokerPolicy: policy, RuntimePolicy: policy, FUSEVerifier: verifier,
 	}
 }
@@ -66,13 +67,15 @@ func PackageFUSE(
 // NewRuntimePlan verifies FuseKit's installed bundle before deriving the holder plan.
 func NewRuntimePlan(
 	runner supervise.TaskRunner,
-	appPath, runtimeDirectory, buildID string,
+	appPath, runtimeDirectory, presentationRoot, buildID string,
 ) (holder.RuntimePlan, error) {
 	verifier, err := holder.NewFUSEVerifier(runner)
 	if err != nil {
 		return holder.RuntimePlan{}, fmt.Errorf("holderbridge: create FUSE verifier: %w", err)
 	}
-	plan, err := holder.NewRuntimePlan(RuntimePlanSpec(appPath, runtimeDirectory, buildID, verifier))
+	plan, err := holder.NewRuntimePlan(RuntimePlanSpec(
+		appPath, runtimeDirectory, presentationRoot, buildID, verifier,
+	))
 	if err != nil {
 		return holder.RuntimePlan{}, fmt.Errorf("holderbridge: verify FUSE runtime plan: %w", err)
 	}
