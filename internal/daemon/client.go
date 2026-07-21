@@ -16,7 +16,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/daemonkit/wire/lifeproto"
@@ -1017,12 +1016,3 @@ func decodeStrict(payload []byte, target any) error {
 func provesNoListener(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)
 }
-
-func (c *Client) lifecyclePeer() *wire.LifecyclePeer {
-	return &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(c.socket), Build: c.clientBuild(),
-		LifecycleBuild: c.clientLifecycleBuild(),
-	}}
-}
-
-var _ dkdaemon.Peer = (*wire.LifecyclePeer)(nil)

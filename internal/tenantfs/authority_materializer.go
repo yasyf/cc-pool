@@ -396,7 +396,7 @@ func newProjectionStream(reader io.ReadCloser) *projectionStream {
 
 func (s *projectionStream) Settle(_ error) error {
 	s.once.Do(func() {
-		s.err = s.ReadCloser.Close()
+		s.err = s.Close()
 		close(s.done)
 	})
 	return s.err

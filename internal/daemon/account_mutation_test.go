@@ -530,7 +530,7 @@ func TestAccountMutationTerminalReplaysSettledReceiptBeforeAcknowledgement(t *te
 	if got := binary.BigEndian.Uint64(frame[:8]); got != 1 || string(frame[8:]) != "after-drop" {
 		t.Fatalf("retained frame = sequence %d data %q", got, frame[8:])
 	}
-	if response := s.handleAccountMutationAck(Request{MutationReceipt: &begin.OperationID}); !response.OK {
+	if response := s.handleAccountMutationAck(t.Context(), Request{MutationReceipt: &begin.OperationID}); !response.OK {
 		t.Fatalf("ack retained receipt = %+v", response)
 	}
 }
@@ -680,7 +680,7 @@ func TestAccountMutationOldOwnerFenceCannotAdvanceWithoutRetirementReceipt(t *te
 func TestAccountMutationInvalidPostBoundaryCredentialQuarantines(t *testing.T) {
 	s, fake, account := newAccountMutationTestServer(t, true)
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
-		ctx context.Context,
+		_ context.Context,
 		mutation store.AccountMutation,
 		_ supervise.TerminalInput,
 		_ supervise.TerminalSize,
@@ -713,7 +713,7 @@ func TestAccountMutationInvalidPostBoundaryCredentialQuarantines(t *testing.T) {
 	if err != nil || receipt.Terminal != store.AccountMutationQuarantined {
 		t.Fatalf("quarantine receipt = %+v err=%v", receipt, err)
 	}
-	if response := s.handleAccountMutationAck(Request{MutationReceipt: &begin.OperationID}); !response.OK {
+	if response := s.handleAccountMutationAck(t.Context(), Request{MutationReceipt: &begin.OperationID}); !response.OK {
 		t.Fatalf("ack quarantine receipt = %+v", response)
 	}
 	quarantine, err := s.m.Store.CredentialQuarantine(account.ID)
@@ -811,7 +811,7 @@ func newAccountMutationTestServer(
 	m.SettleCredentialWrite = func(context.Context, pool.CredentialWriteSettlement) error {
 		return nil
 	}
-	t.Cleanup(func() { _ = m.Close() })
+	t.Cleanup(func() { _ = m.Close(t.Context()) })
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}

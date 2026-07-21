@@ -52,8 +52,6 @@ const preflightTimeout = 8 * time.Second
 // version-skewed holder to release the socket after being told to step down.
 const defaultEvictTimeout = 5 * time.Second
 
-// sourceAuthorityOpenTimeout bounds startup on an untracked external holder of
-// the cross-process authority lane after exact FuseKit worker recovery ran.
 // Server is the running daemon.
 type Server struct {
 	m          *pool.Manager
@@ -193,7 +191,7 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 		if tenantClient != nil {
 			err = errors.Join(err, tenantClient.Close())
 		}
-		err = errors.Join(err, m.Close())
+		err = errors.Join(err, m.Close(activation.Lifetime))
 	}()
 
 	tenantClient, err = tenantfs.NewClient(activation.Startup, pool.FuseKitSocketPath())
@@ -314,7 +312,7 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 	case OpAccountHealth:
 		return s.handleAccountHealth(ctx, req)
 	case OpAccountMutationAck:
-		return s.handleAccountMutationAck(req)
+		return s.handleAccountMutationAck(ctx, req)
 	default:
 		return Response{OK: false, Error: "unknown op: " + string(req.Op)}
 	}

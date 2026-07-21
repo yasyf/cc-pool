@@ -125,7 +125,7 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = m.Close() })
+	t.Cleanup(func() { _ = m.Close(t.Context()) })
 	fk := credstest.NewFake()
 	m.Creds = backingCredentials{fk}
 	m.OAuth = stubRefresher{}
@@ -837,13 +837,4 @@ func recorded(rec *runRecorder, want []string) bool {
 		}
 	}
 	return false
-}
-
-// keysOf returns a map's keys for a readable failure message.
-func keysOf(m map[string]json.RawMessage) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	return ks
 }

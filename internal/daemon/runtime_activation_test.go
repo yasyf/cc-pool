@@ -10,16 +10,34 @@ import (
 	"github.com/yasyf/daemonkit/drain"
 )
 
+func writeExecutableFixture(t *testing.T, dir, name string) string {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("fixture"); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(dir, name)
+}
+
 func TestRuntimeAcquiresListenerBeforeGenerationActivation(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "ccp-activation-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	role := filepath.Join(root, "ccp")
-	if err := os.WriteFile(role, []byte("fixture"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	_ = writeExecutableFixture(t, root, "ccp")
 	t.Setenv("PATH", root)
 	socket := filepath.Join(root, "daemon.sock")
 	want := errors.New("activation stopped")
@@ -56,10 +74,7 @@ func TestRuntimeAcquiresListenerBeforeGenerationActivation(t *testing.T) {
 
 func TestServiceRolePathPreservesStableAlias(t *testing.T) {
 	root := t.TempDir()
-	target := filepath.Join(root, "ccp-v1")
-	if err := os.WriteFile(target, []byte("fixture"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	target := writeExecutableFixture(t, root, "ccp-v1")
 	alias := filepath.Join(root, "ccp")
 	if err := os.Symlink(target, alias); err != nil {
 		t.Fatal(err)

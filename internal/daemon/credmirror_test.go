@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -64,7 +65,7 @@ func TestCredentialWriteSettlementIsWorkerBackedAndExactIdempotent(t *testing.T)
 	runner := credentialWriteTaskRunnerFunc(func(ctx context.Context, task supervise.Task) error {
 		calls.Add(1)
 		if task.RecoveryClass != proc.RecoveryTask || task.Path != "credential-worker" ||
-			len(task.Args) != 1 || task.Args[0] != credentialWriteWorkerArgument {
+			len(task.Args) != 1 || task.Args[0] != writeWorkerArgument {
 			t.Fatalf("worker task = %+v", task)
 		}
 		return RunCredentialWriteWorker(ctx, task.Stdin, task.Stdout)
@@ -101,7 +102,7 @@ func TestCredentialWriteSettlementIsWorkerBackedAndExactIdempotent(t *testing.T)
 		t.Fatal(err)
 	}
 	stampPath := filepath.Join(stampDir, "account-uuid", "stamp")
-	stampBytes, err := os.ReadFile(stampPath)
+	stampBytes, err := fs.ReadFile(os.DirFS(stampDir), filepath.Join("account-uuid", "stamp"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +128,7 @@ func TestCredentialWriteSettlementIsWorkerBackedAndExactIdempotent(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	afterStamp, err := os.ReadFile(stampPath)
+	afterStamp, err := fs.ReadFile(os.DirFS(stampDir), filepath.Join("account-uuid", "stamp"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,22 +195,18 @@ func TestCredentialWriteWorkerRepairsRegistrySavedBeforeStamp(t *testing.T) {
 	}
 	run()
 	wantStamp := []byte("1700000000123000000")
-	stamp, err := os.ReadFile(stampPath)
+	stamp, err := fs.ReadFile(os.DirFS(stampDir), filepath.Join("account-uuid", "stamp"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(stamp, wantStamp) {
 		t.Fatalf("repaired stamp = %q, want %q", stamp, wantStamp)
 	}
-	info, err := os.Stat(stampPath)
-	if err != nil {
-		t.Fatal(err)
-	}
 	fixedModTime := time.Unix(123, 0)
 	if err := os.Chtimes(stampPath, fixedModTime, fixedModTime); err != nil {
 		t.Fatal(err)
 	}
-	info, err = os.Stat(stampPath)
+	info, err := os.Stat(stampPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,9 +332,9 @@ func TestCredentialWriteSettlementPropagatesCancellationAndRejectsWrongResponse(
 }
 
 func TestCredentialWriteWorkerRejectsInexactInvocation(t *testing.T) {
-	if !IsCredentialWriteWorkerInvocation([]string{credentialWriteWorkerArgument}) ||
+	if !IsCredentialWriteWorkerInvocation([]string{writeWorkerArgument}) ||
 		IsCredentialWriteWorkerInvocation(nil) ||
-		IsCredentialWriteWorkerInvocation([]string{credentialWriteWorkerArgument, "extra"}) {
+		IsCredentialWriteWorkerInvocation([]string{writeWorkerArgument, "extra"}) {
 		t.Fatal("credential worker invocation predicate is not exact")
 	}
 	input := bytes.NewBufferString(`{"operation_id":[1],"unknown":true}`)

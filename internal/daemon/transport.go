@@ -251,7 +251,10 @@ func (s serverState) Close() error {
 	if s.owner == nil || s.owner.m == nil {
 		return nil
 	}
-	err := s.owner.m.Close()
+	if s.owner.accountMutationLifetime == nil {
+		return errors.New("daemon manager close requires an active lifecycle")
+	}
+	err := s.owner.m.Close(s.owner.accountMutationLifetime)
 	s.owner.m = nil
 	return err
 }

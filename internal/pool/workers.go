@@ -15,7 +15,10 @@ import (
 	"github.com/yasyf/daemonkit/supervise"
 )
 
-const disposableWorkerLimit = 4
+const (
+	disposableWorkerLimit = 4
+	workerCloseTimeout    = 30 * time.Second
+)
 
 type workerRuntime struct {
 	pool       *supervise.Pool
@@ -54,37 +57,27 @@ func newWorkerRuntime(
 		return nil, nil, err
 	}
 	if err := workers.Recover(ctx); err != nil {
-		workers.Close()
-		workers.Cancel()
-		_ = workers.Wait(context.Background())
+		_ = closeWorkerPool(ctx, workers)
 		return nil, nil, err
 	}
 	identity, err := proc.CurrentIdentity()
 	if err != nil {
-		workers.Close()
-		workers.Cancel()
-		_ = workers.Wait(context.Background())
+		_ = closeWorkerPool(ctx, workers)
 		return nil, nil, fmt.Errorf("bind credential owner process: %w", err)
 	}
 	owner, err := reaper.TrackIdentity(ctx, identity, proc.RecoveryTask)
 	if err != nil {
-		workers.Close()
-		workers.Cancel()
-		_ = workers.Wait(context.Background())
+		_ = closeWorkerPool(ctx, workers)
 		return nil, nil, fmt.Errorf("track credential owner process: %w", err)
 	}
 	executable, err := os.Executable()
 	if err != nil {
-		workers.Close()
-		workers.Cancel()
-		_ = workers.Wait(context.Background())
+		_ = closeWorkerPool(ctx, workers)
 		return nil, nil, fmt.Errorf("resolve disposable worker executable: %w", err)
 	}
 	scanner, err := procscan.NewWorkerScanner(workers, executable)
 	if err != nil {
-		workers.Close()
-		workers.Cancel()
-		_ = workers.Wait(context.Background())
+		_ = closeWorkerPool(ctx, workers)
 		return nil, nil, err
 	}
 	return &workerRuntime{
@@ -103,15 +96,21 @@ func newWorkerReaper(path string) (*proc.Reaper, error) {
 	}, nil
 }
 
-func (runtime *workerRuntime) close() error {
+func closeWorkerPool(ctx context.Context, workers *supervise.Pool) error {
+	workers.Close()
+	workers.Cancel()
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), workerCloseTimeout)
+	defer cancel()
+	return workers.Wait(waitCtx)
+}
+
+func (runtime *workerRuntime) close(ctx context.Context) error {
 	if runtime == nil {
 		return nil
 	}
-	runtime.pool.Close()
-	runtime.pool.Cancel()
-	waitCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	waitErr := closeWorkerPool(ctx, runtime.pool)
+	untrackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), workerCloseTimeout)
 	defer cancel()
-	waitErr := runtime.pool.Wait(waitCtx)
-	untrackErr := runtime.reaper.Untrack(context.Background(), runtime.owner)
+	untrackErr := runtime.reaper.Untrack(untrackCtx, runtime.owner)
 	return errors.Join(waitErr, untrackErr)
 }

@@ -8,16 +8,6 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 )
 
-func countPolicy(rows []LedgerState, policy string) int {
-	n := 0
-	for _, r := range rows {
-		if r.Policy == policy {
-			n++
-		}
-	}
-	return n
-}
-
 // TestLedgersWireSortsDaemonRows pins deterministic policy-then-resource order.
 func TestLedgersWireSortsDaemonRows(t *testing.T) {
 	s, dirs := newTestServer(t)

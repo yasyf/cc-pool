@@ -55,6 +55,21 @@ type tenantLifecycleLane struct {
 	references int
 }
 
+func contextWithoutCancelUntil(
+	ctx context.Context,
+	done <-chan struct{},
+) (context.Context, context.CancelCauseFunc) {
+	result, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	go func(ctx context.Context) {
+		select {
+		case <-ctx.Done():
+		case <-done:
+			cancel(context.Canceled)
+		}
+	}(result)
+	return result, cancel
+}
+
 func newTenantCoordinator(
 	lifecycle context.Context,
 	server *Server,
@@ -144,11 +159,13 @@ func (c *tenantCoordinator) ensureTenant(
 		return nil
 	}
 	key := string(tenantID) + "\x00" + strconv.FormatUint(tenantAccount.Generation, 10)
-	lifecycle := c.lifecycle
-	if lifecycle == nil {
-		lifecycle = ctx
-	}
 	result := c.provisionGroup.DoChan(key, func() (any, error) {
+		lifecycle := ctx
+		if c.lifecycle != nil {
+			var cancel context.CancelCauseFunc
+			lifecycle, cancel = contextWithoutCancelUntil(ctx, c.lifecycle.Done())
+			defer cancel(context.Canceled)
+		}
 		if c.tenantReady(tenantID, tenantAccount.Generation) {
 			return nil, nil
 		}

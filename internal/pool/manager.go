@@ -142,13 +142,13 @@ func OpenDaemon(ctx context.Context) (*Manager, error) {
 	}
 	authority, err := NewWorkerAuthority(workers.pool, workers.executable, workers.owner)
 	if err != nil {
-		_ = workers.close()
+		_ = workers.close(ctx)
 		_ = st.Close()
 		return nil, err
 	}
 	manager, err := NewManager(st, oauth.New(), scanner.Scan, authority)
 	if err != nil {
-		_ = workers.close()
+		_ = workers.close(ctx)
 		_ = st.Close()
 		return nil, err
 	}
@@ -176,12 +176,12 @@ func (m *Manager) scanSessions(ctx context.Context) ([]procscan.Session, error) 
 	return m.ScanSessions(ctx)
 }
 
-// Close releases resources.
-func (m *Manager) Close() error {
+// Close releases resources within a cleanup context derived from ctx.
+func (m *Manager) Close(ctx context.Context) error {
 	var result error
 	m.stopCredentialOwnerRecovery()
 	if m.workers != nil {
-		result = m.workers.close()
+		result = m.workers.close(ctx)
 	}
 	if m.Store != nil {
 		result = errors.Join(result, m.Store.Close())

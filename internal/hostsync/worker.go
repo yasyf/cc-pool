@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
@@ -319,11 +320,12 @@ func writeWorkerFrame(output io.Writer, value any) error {
 	if err != nil {
 		return fmt.Errorf("hostsync: marshal worker frame: %w", err)
 	}
-	if len(payload) == 0 || len(payload) > maxHostSyncWorkerFrame {
+	payloadSize := len(payload)
+	if payloadSize == 0 || payloadSize > maxHostSyncWorkerFrame || uint64(payloadSize) > math.MaxUint32 {
 		return errors.New("hostsync: worker frame size is invalid")
 	}
 	var header [4]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+	binary.BigEndian.PutUint32(header[:], uint32(payloadSize))
 	if _, err := output.Write(header[:]); err != nil {
 		return fmt.Errorf("hostsync: write worker frame header: %w", err)
 	}

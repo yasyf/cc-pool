@@ -305,11 +305,9 @@ func TestTeardownRegistryFencePrecedesRemovalIntent(t *testing.T) {
 		_, err := s.Converge(ctx, "")
 		done <- err
 	}()
-	select {
-	case <-time.After(100 * time.Millisecond):
-		if len(remover.callsSnapshot()) != 0 {
-			t.Fatal("removal intent installed while registry lock was unavailable")
-		}
+	<-time.After(100 * time.Millisecond)
+	if len(remover.callsSnapshot()) != 0 {
+		t.Fatal("removal intent installed while registry lock was unavailable")
 	}
 	if err := lock.Close(); err != nil {
 		t.Fatal(err)

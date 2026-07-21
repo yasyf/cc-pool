@@ -60,7 +60,7 @@ func (l *ledger) attempt(p policy, now time.Time) {
 func (l *ledger) setNextDue(t time.Time) { l.nextDue = t }
 
 // due reports whether the product gate's backoff has elapsed.
-func (l *ledger) due(p policy, now time.Time) bool {
+func (l *ledger) due(now time.Time) bool {
 	return !now.Before(l.nextDue)
 }
 
@@ -154,18 +154,11 @@ func (ls *ledgers) clear(p policy, resource string) {
 	delete(ls.m, ledgerKey{p.name, resource})
 }
 
-// faulted reports whether (p, resource) has latched its fault verdict. An absent
-// ledger is not faulted.
-func (ls *ledgers) faulted(p policy, resource string) bool {
-	l := ls.peek(p, resource)
-	return l != nil && l.faulted
-}
-
 // due reports whether (p, resource) is due for a recovery attempt. An absent
 // ledger (never attempted) is immediately due.
 func (ls *ledgers) due(p policy, resource string, now time.Time) bool {
 	l := ls.peek(p, resource)
-	return l == nil || l.due(p, now)
+	return l == nil || l.due(now)
 }
 
 // backoffElapsed reports whether (p, resource)'s backoff window has elapsed,
@@ -192,14 +185,4 @@ func (ls *ledgers) snapshot() []ledgerSnapshot {
 		out = append(out, s)
 	}
 	return out
-}
-
-// prune drops p's ledgers whose resource keep rejects — the per-pass hygiene the
-// heal loop runs when a resource leaves the live set.
-func (ls *ledgers) prune(p policy, keep func(resource string) bool) {
-	for k := range ls.m {
-		if k.policy == p.name && !keep(k.resource) {
-			delete(ls.m, k)
-		}
-	}
 }

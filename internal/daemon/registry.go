@@ -19,8 +19,6 @@ func (s *Server) newTick(ctx context.Context) *tick {
 	return &tick{snapshot: snapshot}
 }
 
-func (t *tick) scanOK() bool { return t.snapshot.lastScanOK }
-
 func (t *tick) idle(dir string) bool { return t.snapshot.idle(dir) }
 
 func (t *tick) sessionCount(dir string) int { return t.snapshot.sessionCount(dir) }

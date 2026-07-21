@@ -39,14 +39,6 @@ func (s *Server) beginAccountRemoval(id int, deleteCredential bool) (removal sto
 	return s.beginFreshAccountRemoval(account, deleteCredential)
 }
 
-func (s *Server) beginClaimedAccountRemoval(id int, deleteCredential bool) (store.AccountRemoval, error) {
-	account, err := s.m.Store.GetAccount(id)
-	if err != nil {
-		return store.AccountRemoval{}, err
-	}
-	return s.beginFreshAccountRemoval(account, deleteCredential)
-}
-
 func (s *Server) beginFreshAccountRemoval(account store.Account, deleteCredential bool) (store.AccountRemoval, error) {
 	if s.heartbeatFor().view().sessionCount(pool.AccountPresentationDir(account.ID)) != 0 {
 		return store.AccountRemoval{}, fmt.Errorf("acct-%02d has a live session", account.ID)

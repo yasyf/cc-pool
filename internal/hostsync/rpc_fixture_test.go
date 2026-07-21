@@ -2,6 +2,7 @@ package hostsync
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 
@@ -36,9 +37,9 @@ func (c testRPCConsumer) GetState(context.Context) (syncservice.RawRegistry, err
 }
 
 func runTestRPCServer(ctx context.Context) error {
-	state, err := os.ReadFile(os.Getenv(testRPCStateEnv))
+	state, err := base64.RawStdEncoding.DecodeString(os.Getenv(testRPCStateEnv))
 	if err != nil {
-		return fmt.Errorf("read test RPC registry: %w", err)
+		return fmt.Errorf("decode test RPC registry: %w", err)
 	}
 	dispatcher := rpc.NewDispatcher()
 	syncservice.RegisterConsumer(dispatcher, testRPCConsumer{state: state})

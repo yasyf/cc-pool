@@ -262,7 +262,7 @@ func (accountMutationTerminalStarter) LoginReady(
 }
 
 func (f accountMutationTerminalRunnerFunc) Start(
-	_ context.Context,
+	ctx context.Context,
 	mutation store.AccountMutation,
 	size supervise.TerminalSize,
 ) (accountMutationTerminal, error) {
@@ -271,7 +271,7 @@ func (f accountMutationTerminalRunnerFunc) Start(
 		input := make(chan wire.Chunk)
 		close(input)
 		err := f(
-			context.Background(), mutation, first, size, input,
+			ctx, mutation, first, size, input,
 			func(_ context.Context, payload []byte) error {
 				terminal.publish(payload)
 				return nil

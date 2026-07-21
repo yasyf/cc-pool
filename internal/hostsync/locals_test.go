@@ -28,7 +28,7 @@ func newLocalsFixture(t *testing.T) *localsFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = m.Close() })
+	t.Cleanup(func() { _ = m.Close(t.Context()) })
 	fk := credstest.NewFake()
 	m.Creds = backingCredentials{fk}
 	m.OAuth = stubRefresher{}

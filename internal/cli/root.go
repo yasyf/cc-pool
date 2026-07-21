@@ -100,12 +100,12 @@ func bareAction(initialized bool, accounts int, tty bool) rootAction {
 	}
 }
 
-func withManager(_ context.Context, fn func(*pool.Manager) error) error {
+func withManager(ctx context.Context, fn func(*pool.Manager) error) error {
 	m, err := pool.OpenLocal()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = m.Close() }()
+	defer func() { _ = m.Close(ctx) }()
 	return fn(m)
 }
 

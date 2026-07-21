@@ -16,9 +16,6 @@ import (
 	"github.com/yasyf/synckit/cregistry"
 )
 
-// registryPerm keeps the registry file private, like the rest of the state dir.
-const registryPerm = 0o600
-
 // RegistryFile is the on-disk account Registry plus the flock that serializes
 // read-modify-write cycles across processes.
 type RegistryFile struct {

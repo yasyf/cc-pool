@@ -100,11 +100,8 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		}
 	}
 
-	bootstrapped := false
-	if p.ClaudeJSONSeed == pool.SeedNoSource {
-		// The backing worker seeded the minimal onboarding document.
-		bootstrapped = true
-	}
+	// The backing worker seeded the minimal onboarding document when no source existed.
+	bootstrapped := p.ClaudeJSONSeed == pool.SeedNoSource
 
 	if err := s.M.WriteIdentity(ctx, p.Reservation.ID, p.ConfigDir, v.OAuthAccount); err != nil {
 		return abandon(fmt.Errorf("materialize %s: write identity: %w", v.UUID, err))

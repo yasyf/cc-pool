@@ -21,10 +21,10 @@ import (
 )
 
 const (
-	credentialWriteWorkerArgument      = "__credential-write-worker"
-	credentialWritePublicationProtocol = "cc-pool.credential-write-publication.v1"
-	credentialWriteWorkerTimeout       = 30 * time.Second
-	credentialWriteWorkerMaxIO         = 1 << 20
+	writeWorkerArgument          = "__credential-write-worker"
+	writePublicationProtocol     = "cc-pool.credential-write-publication.v1"
+	credentialWriteWorkerTimeout = 30 * time.Second
+	credentialWriteWorkerMaxIO   = 1 << 20
 )
 
 type credentialWritePublication struct {
@@ -122,7 +122,7 @@ func credentialWritePublicationBuilder(self string) pool.CredentialWritePublicat
 			return nil, errors.New("credential write publication requires an operation ID")
 		}
 		publication := credentialWritePublication{
-			Protocol: credentialWritePublicationProtocol,
+			Protocol: writePublicationProtocol,
 		}
 		if account.AccountUUID != "" && credential.HasRefreshToken() {
 			publication.AccountUUID = account.AccountUUID
@@ -143,7 +143,7 @@ func decodeCredentialWritePublication(payload []byte) (credentialWritePublicatio
 	if err := decodeCredentialWriteWorkerJSON(bytes.NewReader(payload), &publication); err != nil {
 		return publication, fmt.Errorf("decode credential write publication: %w", err)
 	}
-	if publication.Protocol != credentialWritePublicationProtocol {
+	if publication.Protocol != writePublicationProtocol {
 		return publication, errors.New("credential write publication protocol mismatch")
 	}
 	if publication.Chain == nil {
@@ -184,7 +184,7 @@ func (settler *credentialWriteSettler) runWorker(
 	runErr := settler.runner.Run(ctx, supervise.Task{
 		RecoveryClass: proc.RecoveryTask,
 		Path:          settler.workerExecutable,
-		Args:          []string{credentialWriteWorkerArgument},
+		Args:          []string{writeWorkerArgument},
 		Stdin:         stdin,
 		Stdout:        &output,
 		Stderr:        &stderr,
@@ -228,7 +228,7 @@ func (buffer *credentialWriteWorkerBuffer) Write(input []byte) (int, error) {
 // IsCredentialWriteWorkerInvocation reports whether args names exactly the
 // credential-write settlement child role.
 func IsCredentialWriteWorkerInvocation(args []string) bool {
-	return len(args) == 1 && args[0] == credentialWriteWorkerArgument
+	return len(args) == 1 && args[0] == writeWorkerArgument
 }
 
 // RunCredentialWriteWorker applies one exact host-sync credential publication.

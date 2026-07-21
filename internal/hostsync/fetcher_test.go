@@ -2,11 +2,11 @@ package hostsync
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"math"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -193,11 +193,8 @@ func TestPeerTransportExecServesRegistry(t *testing.T) {
 		t.Fatalf("marshal registry: %v", err)
 	}
 
-	stateFile := filepath.Join(t.TempDir(), "registry.json")
-	if err := os.WriteFile(stateFile, body, 0o600); err != nil {
-		t.Fatalf("write registry file: %v", err)
-	}
-	script := "env " + testRPCStateEnv + "=" + strconv.Quote(stateFile) + " " + strconv.Quote(os.Args[0])
+	encodedState := base64.RawStdEncoding.EncodeToString(body)
+	script := "env " + testRPCStateEnv + "=" + strconv.Quote(encodedState) + " " + strconv.Quote(os.Args[0])
 
 	fetcher := NewSSHFetcher()
 	got, err := fetcher.Fetch(context.Background(), execPeerPrefix+script)

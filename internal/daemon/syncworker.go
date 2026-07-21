@@ -58,6 +58,7 @@ type hostSyncWorkerRemover struct {
 	mu          sync.Mutex
 	client      *tenantfs.Client
 	coordinator *tenantCoordinator
+	cancel      context.CancelCauseFunc
 }
 
 type hostSyncWorkerRemoval struct {
@@ -97,14 +98,20 @@ func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator
 		return nil, err
 	}
 	server := &Server{m: r.manager}
+	lifecycle, cancel := contextWithoutCancelUntil(ctx, r.lifecycle.Done())
 	r.client = client
-	r.coordinator = newTenantCoordinator(r.lifecycle, server, preparer, client)
+	r.cancel = cancel
+	r.coordinator = newTenantCoordinator(lifecycle, server, preparer, client)
 	return r.coordinator, nil
 }
 
 func (r *hostSyncWorkerRemover) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.cancel != nil {
+		r.cancel(context.Canceled)
+		r.cancel = nil
+	}
 	if r.client == nil {
 		return nil
 	}
@@ -127,9 +134,9 @@ func RunHostSyncWorker(
 		return err
 	}
 	remover := &hostSyncWorkerRemover{lifecycle: ctx, manager: manager}
-	defer func() {
-		err = errors.Join(err, remover.Close(), manager.Close())
-	}()
+	defer func(ctx context.Context) {
+		err = errors.Join(err, remover.Close(), manager.Close(ctx))
+	}(ctx)
 
 	manifestPath, err := hostsync.ManifestPath()
 	if err != nil {

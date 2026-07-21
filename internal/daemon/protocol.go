@@ -51,8 +51,11 @@ const (
 type AccountMutationKind string
 
 const (
-	AccountMutationAdd         AccountMutationKind = "add"
-	AccountMutationRelogin     AccountMutationKind = "relogin"
+	// AccountMutationAdd creates a new account through the daemon-owned workflow.
+	AccountMutationAdd AccountMutationKind = "add"
+	// AccountMutationRelogin replaces one existing account credential.
+	AccountMutationRelogin AccountMutationKind = "relogin"
+	// AccountMutationSyncInstall installs one account received through host sync.
 	AccountMutationSyncInstall AccountMutationKind = "sync-install"
 )
 
@@ -61,9 +64,12 @@ const (
 type AccountMutationAction string
 
 const (
+	// AccountMutationStartOrAttach starts a workflow or attaches to its exact operation.
 	AccountMutationStartOrAttach AccountMutationAction = "start-or-attach"
-	AccountMutationProvideInput  AccountMutationAction = "provide-input"
-	AccountMutationCancel        AccountMutationAction = "cancel"
+	// AccountMutationProvideInput supplies terminal input under the daemon-issued fence.
+	AccountMutationProvideInput AccountMutationAction = "provide-input"
+	// AccountMutationCancel cancels the fenced workflow.
+	AccountMutationCancel AccountMutationAction = "cancel"
 )
 
 // AccountMutationRequest carries workflow intent plus the exact daemon-issued
@@ -114,12 +120,18 @@ type AccountHealthResult struct {
 type AccountMutationState string
 
 const (
+	// AccountMutationAwaitingInput means the terminal is waiting for client input.
 	AccountMutationAwaitingInput AccountMutationState = "awaiting-input"
-	AccountMutationApplying      AccountMutationState = "applying"
-	AccountMutationCompleted     AccountMutationState = "completed"
-	AccountMutationCancelled     AccountMutationState = "cancelled"
-	AccountMutationSuperseded    AccountMutationState = "superseded"
-	AccountMutationQuarantined   AccountMutationState = "quarantined"
+	// AccountMutationApplying means the daemon is applying the credential mutation.
+	AccountMutationApplying AccountMutationState = "applying"
+	// AccountMutationCompleted means the mutation and publication committed.
+	AccountMutationCompleted AccountMutationState = "completed"
+	// AccountMutationCancelled means the workflow was cancelled without publication.
+	AccountMutationCancelled AccountMutationState = "cancelled"
+	// AccountMutationSuperseded means a newer account generation invalidated the workflow.
+	AccountMutationSuperseded AccountMutationState = "superseded"
+	// AccountMutationQuarantined means the workflow stopped after an ambiguous credential boundary.
+	AccountMutationQuarantined AccountMutationState = "quarantined"
 )
 
 // Request is one typed daemon operation payload. Op is carried by the daemonkit

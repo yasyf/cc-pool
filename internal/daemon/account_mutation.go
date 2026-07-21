@@ -35,7 +35,7 @@ type accountMutationRun struct {
 	outcome  supervise.TerminalOutcome
 }
 
-func (s *Server) handleAccountMutationAck(request Request) Response {
+func (s *Server) handleAccountMutationAck(ctx context.Context, request Request) Response {
 	if request.MutationReceipt == nil || *request.MutationReceipt == ([32]byte{}) {
 		return Response{Error: "account mutation receipt is required"}
 	}
@@ -55,7 +55,7 @@ func (s *Server) handleAccountMutationAck(request Request) Response {
 			return Response{Error: "account mutation terminal is not settled"}
 		}
 		if running.terminal != nil {
-			ackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ackCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			err := running.terminal.Acknowledge(ackCtx, running.outcome.Digest)
 			cancel()
 			if err != nil && !errors.Is(err, supervise.ErrTerminalRetentionExpired) {
@@ -231,10 +231,12 @@ func (s *Server) runAttachedAccountMutation(
 	running.terminal = terminal
 	close(running.ready)
 	s.wg.Add(1)
-	go func() {
+	lifetime, cancelLifetime := contextWithoutCancelUntil(ctx, s.accountMutationLifetime.Done())
+	go func(ctx context.Context) {
 		defer s.wg.Done()
-		s.watchAccountMutationRun(active, running)
-	}()
+		defer cancelLifetime(context.Canceled)
+		s.watchAccountMutationRun(ctx, active, running)
+	}(lifetime)
 	return s.relayAccountMutationRun(ctx, running, attachment, true, input, output)
 }
 
@@ -536,14 +538,15 @@ func (s *Server) relayAccountMutationRun(
 }
 
 func (s *Server) watchAccountMutationRun(
+	ctx context.Context,
 	mutation store.AccountMutation,
 	running *accountMutationRun,
 ) {
 	running.outcome, running.err = waitAccountMutationTerminal(
-		s.accountMutationLifetime, s.accountMutationTerminal, running.terminal, mutation,
+		ctx, s.accountMutationTerminal, running.terminal, mutation,
 	)
 	settleCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(s.accountMutationLifetime), accountMutationSettleWait,
+		context.WithoutCancel(ctx), accountMutationSettleWait,
 	)
 	running.result, running.err = s.settleAccountMutationTerminal(
 		settleCtx, mutation, running.err,
@@ -556,7 +559,7 @@ func (s *Server) watchAccountMutationRun(
 	}
 	select {
 	case <-running.terminal.Retired():
-	case <-s.accountMutationLifetime.Done():
+	case <-ctx.Done():
 	}
 	s.forgetAccountMutationRun(mutation.OperationID, running)
 }
