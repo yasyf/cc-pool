@@ -8,13 +8,47 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/version"
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/daemonkit/wire/lifeproto"
 	"github.com/yasyf/fusekit/holder"
 )
+
+func TestValidateHolderHealthRequiresExactReadyLifecycle(t *testing.T) {
+	healthy := dkdaemon.Health{
+		Build: version.String(), Protocol: lifeproto.Version, PID: 42,
+		State: dkdaemon.StateHealthy,
+	}
+	if err := validateHolderHealth(healthy); err != nil {
+		t.Fatalf("healthy lifecycle: %v", err)
+	}
+	for _, test := range []struct {
+		name string
+		edit func(*dkdaemon.Health)
+		want string
+	}{
+		{name: "build", edit: func(h *dkdaemon.Health) { h.Build = "v0.0.0" }, want: "identity is not exact"},
+		{name: "protocol", edit: func(h *dkdaemon.Health) { h.Protocol++ }, want: "identity is not exact"},
+		{name: "pid", edit: func(h *dkdaemon.Health) { h.PID = 0 }, want: "identity is not exact"},
+		{name: "state", edit: func(h *dkdaemon.Health) { h.State = dkdaemon.StateDegraded }, want: "is not ready"},
+		{name: "draining", edit: func(h *dkdaemon.Health) { h.Draining = true }, want: "is not ready"},
+		{name: "busy", edit: func(h *dkdaemon.Health) { h.Busy = true }, want: "is not ready"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := healthy
+			test.edit(&got)
+			if err := validateHolderHealth(got); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateHolderHealth(%#v) = %v, want %q", got, err, test.want)
+			}
+		})
+	}
+}
 
 func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testing.T) {
 	if application := holderApplication(); application.AppPath != pool.WidgetAppPath() {

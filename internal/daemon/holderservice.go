@@ -10,10 +10,13 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/wire/lifeproto"
 	"github.com/yasyf/fusekit/holder"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 const (
@@ -40,11 +43,16 @@ var (
 		return service.NewController(ctx, config)
 	}
 	holderReady = func(ctx context.Context, socket string) error {
-		client, err := tenantfs.NewClient(ctx, socket)
+		peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
+			Dial: wire.UnixDialer(socket), Build: transportproto.Build,
+			LifecycleBuild: version.String(),
+		}}
+		health, err := peer.Health(ctx)
+		closeErr := peer.Close()
 		if err != nil {
-			return err
+			return errors.Join(err, closeErr)
 		}
-		return client.Close()
+		return errors.Join(validateHolderHealth(health), closeErr)
 	}
 	holderServicePresent = func(agent service.Agent) (bool, error) {
 		path, err := agent.PlistPath()
@@ -61,6 +69,22 @@ var (
 		return false, err
 	}
 )
+
+func validateHolderHealth(health dkdaemon.Health) error {
+	if health.Build != version.String() || health.Protocol != lifeproto.Version || health.PID <= 0 {
+		return fmt.Errorf(
+			"holder lifecycle identity is not exact: build=%q protocol=%d pid=%d",
+			health.Build, health.Protocol, health.PID,
+		)
+	}
+	if health.State != dkdaemon.StateHealthy || health.Draining || health.Busy {
+		return fmt.Errorf(
+			"holder lifecycle is not ready: state=%q draining=%t busy=%t",
+			health.State, health.Draining, health.Busy,
+		)
+	}
+	return nil
+}
 
 type holderServiceController interface {
 	Converge(context.Context, []service.Agent) error
