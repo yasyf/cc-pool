@@ -121,7 +121,10 @@ func TestCCPAgentUsesPinnedExecutableAndTypedRestartPolicy(t *testing.T) {
 func TestResolveDaemonServiceExecutablePinsCurrentRoleTarget(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "ccp-v1")
-	if err := os.WriteFile(target, []byte("fixture"), 0o700); err != nil {
+	if err := os.WriteFile(target, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o700); err != nil { //nolint:gosec // G302: private role fixture needs its owner execute bit
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, filepath.Join(root, "ccp")); err != nil {

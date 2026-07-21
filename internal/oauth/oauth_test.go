@@ -649,6 +649,7 @@ func TestExplicitUserAgentIsPinnedForWorkerRefresh(t *testing.T) {
 	var got string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Get("User-Agent")
+		//nolint:gosec // G117: a test fixture token response, not a real credential
 		_ = json.NewEncoder(w).Encode(TokenResponse{
 			AccessToken: "new-at", RefreshToken: "new-rt", ExpiresIn: 3600,
 		})

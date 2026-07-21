@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	credentialFileWorkerArgument = "__credential-file-worker"
-	credentialFileTaskTimeout    = 30 * time.Second
+	fileWorkerArgument        = "__credential-file-worker"
+	credentialFileTaskTimeout = 30 * time.Second
 )
 
 type credentialFileOperation string
@@ -96,7 +96,7 @@ func (f FileStore) run(
 
 // IsFileWorkerInvocation reports whether args request the credential file worker.
 func IsFileWorkerInvocation(args []string) bool {
-	return len(args) == 1 && args[0] == credentialFileWorkerArgument
+	return len(args) == 1 && args[0] == fileWorkerArgument
 }
 
 // RunFileWorker serves one credential file request in a disposable child.
@@ -119,8 +119,7 @@ func RunFileWorker(_ context.Context, input io.Reader, output io.Writer) error {
 	}
 	if errors.Is(err, os.ErrNotExist) {
 		err = nil
-		if request.Operation == credentialFileDelete {
-		} else {
+		if request.Operation != credentialFileDelete {
 			response.ErrorCode = "not_found"
 		}
 	}
@@ -150,7 +149,7 @@ func runCredentialFileTask(
 	runErr := runner.Run(ctx, supervise.Task{
 		RecoveryClass: daemonproc.RecoveryTask,
 		Path:          executable,
-		Args:          []string{credentialFileWorkerArgument},
+		Args:          []string{fileWorkerArgument},
 		Stdin:         stdin,
 		Stdout:        stdout,
 		Stderr:        stderr,

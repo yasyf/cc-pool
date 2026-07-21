@@ -71,7 +71,7 @@ func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 		if i == 0 {
 			lbl = opts.label
 		}
-		acct, err := addOne(cmd, m, cl, lbl, opts)
+		acct, err := addOne(cmd, m, cl, lbl)
 		if err != nil {
 			if len(added) == 0 {
 				return err
@@ -107,7 +107,7 @@ func ensureReady(cmd *cobra.Command, m *pool.Manager) error {
 	return nil
 }
 
-func addOne(cmd *cobra.Command, m *pool.Manager, cl *daemon.Client, label string, opts addOptions) (*store.Account, error) {
+func addOne(cmd *cobra.Command, m *pool.Manager, cl *daemon.Client, label string) (*store.Account, error) {
 	out := cmd.OutOrStdout()
 	loginURL := &terminalURLAction{}
 	result, err := cl.AccountMutationTerminal(cmd.Context(), daemon.AccountMutationRequest{
@@ -192,17 +192,4 @@ func addedSummary(added []store.Account) string {
 		}
 	}
 	return fmt.Sprintf("Added %s.", strings.Join(names[:len(names)-1], ", ")+" and "+names[len(names)-1])
-}
-
-func shouldAbandon(_ *cobra.Command) bool {
-	if !isTTY() {
-		return false
-	}
-	abandon := true
-	_ = huh.NewConfirm().
-		Title("Roll back this incomplete account?").
-		Value(&abandon).
-		WithTheme(ccpTheme()).
-		Run()
-	return abandon
 }

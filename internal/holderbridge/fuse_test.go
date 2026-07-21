@@ -41,13 +41,13 @@ func TestToolRunnerExecutesAndSettlesOneDisposableTask(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runner.Close(); err != nil {
+	if err := runner.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("runner directory still exists: %v", err)
 	}
-	if err := runner.Close(); err != nil {
+	if err := runner.Close(t.Context()); err != nil {
 		t.Fatalf("idempotent close = %v", err)
 	}
 }
@@ -57,7 +57,7 @@ func TestToolRunnerRejectsTaskAfterClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runner.Close(); err != nil {
+	if err := runner.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	err = runner.Run(context.Background(), supervise.Task{

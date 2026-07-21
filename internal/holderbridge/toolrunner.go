@@ -54,7 +54,7 @@ func NewToolRunner(ctx context.Context) (*ToolRunner, error) {
 		workers.Cancel()
 		return nil, errors.Join(
 			fmt.Errorf("holderbridge: recover tool runner: %w", err),
-			workers.Wait(context.Background()),
+			workers.Wait(context.WithoutCancel(ctx)),
 			os.RemoveAll(directory),
 		)
 	}
@@ -67,14 +67,14 @@ func (r *ToolRunner) Run(ctx context.Context, task supervise.Task) error {
 }
 
 // Close settles the worker pool and removes its empty recovery store.
-func (r *ToolRunner) Close() error {
+func (r *ToolRunner) Close(ctx context.Context) error {
 	if r == nil {
 		return nil
 	}
 	r.closeOnce.Do(func() {
 		r.pool.Close()
 		r.pool.Cancel()
-		ctx, cancel := context.WithTimeout(context.Background(), toolRunnerCloseTimeout)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), toolRunnerCloseTimeout)
 		defer cancel()
 		if err := r.pool.Wait(ctx); err != nil {
 			r.closeErr = err

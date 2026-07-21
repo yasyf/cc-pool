@@ -1,3 +1,4 @@
+// Package holderbridge binds cc-pool's signed application to FuseKit.
 package holderbridge
 
 import (

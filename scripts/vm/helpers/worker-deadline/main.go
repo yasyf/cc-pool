@@ -1,3 +1,4 @@
+// Package main verifies disposable-worker deadline and process-group semantics.
 package main
 
 import (
@@ -33,12 +34,17 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (resultErr error) {
 	root, err := os.MkdirTemp("", "ccpool-worker-deadline-")
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(root)
+	defer func() { resultErr = errors.Join(resultErr, os.RemoveAll(root)) }()
+	rootFS, err := os.OpenRoot(root)
+	if err != nil {
+		return fmt.Errorf("open worker deadline root: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, rootFS.Close()) }()
 
 	store := &proc.FileStore{Path: filepath.Join(root, "processes.json")}
 	reaper := &proc.Reaper{Store: store, Generation: "ccpool-vm-worker-deadline"}
@@ -46,9 +52,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	leaderPath := filepath.Join(root, "leader.pid")
-	descendantPath := filepath.Join(root, "descendant.pid")
-	termPath := filepath.Join(root, "term-observed")
+	const leaderName = "leader.pid"
+	const descendantName = "descendant.pid"
+	const termName = "term-observed"
+	leaderPath := filepath.Join(root, leaderName)
+	descendantPath := filepath.Join(root, descendantName)
+	termPath := filepath.Join(root, termName)
 	script := `
 trap 'printf term > "$3"' TERM
 printf '%s\n' "$$" > "$1"
@@ -63,20 +72,27 @@ while :; do sleep 10; done
 	})
 	cancel()
 	elapsed := time.Since(started)
+	if err == nil {
+		return errors.New("worker completed without deadline error")
+	}
 	if !errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("worker error = %v, want deadline exceeded", err)
+		return fmt.Errorf("worker error, want deadline exceeded: %w", err)
 	}
 	if elapsed < supervise.TerminationGrace {
 		return fmt.Errorf("worker settled after %s, before TERM grace %s", elapsed, supervise.TerminationGrace)
 	}
-	if content, readErr := os.ReadFile(termPath); readErr != nil || string(content) != "term" {
-		return fmt.Errorf("TERM observation = %q, %v", content, readErr)
+	content, err := rootFS.ReadFile(termName)
+	if err != nil {
+		return fmt.Errorf("read TERM observation: %w", err)
 	}
-	leader, err := readPID(leaderPath)
+	if string(content) != "term" {
+		return fmt.Errorf("TERM observation = %q, want term", content)
+	}
+	leader, err := readPID(rootFS, leaderName)
 	if err != nil {
 		return err
 	}
-	descendant, err := readPID(descendantPath)
+	descendant, err := readPID(rootFS, descendantName)
 	if err != nil {
 		return err
 	}
@@ -111,14 +127,17 @@ while :; do sleep 10; done
 	})
 }
 
-func readPID(path string) (int, error) {
-	content, err := os.ReadFile(path)
+func readPID(root *os.Root, name string) (int, error) {
+	content, err := root.ReadFile(name)
 	if err != nil {
-		return 0, fmt.Errorf("read %s: %w", filepath.Base(path), err)
+		return 0, fmt.Errorf("read %s: %w", name, err)
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(content)))
-	if err != nil || pid <= 1 {
-		return 0, fmt.Errorf("invalid pid in %s: %q", filepath.Base(path), content)
+	if err != nil {
+		return 0, fmt.Errorf("parse pid in %s: %w", name, err)
+	}
+	if pid <= 1 {
+		return 0, fmt.Errorf("invalid pid in %s: %q", name, content)
 	}
 	return pid, nil
 }

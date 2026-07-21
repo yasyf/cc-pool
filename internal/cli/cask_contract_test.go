@@ -27,12 +27,7 @@ func TestHolderStopUninstallCommandUsesExactDaemonkitStopPath(t *testing.T) {
 }
 
 func TestStatusCaskRequiresExactHolderStopAndRejectsNameBasedKills(t *testing.T) {
-	path := filepath.Join("..", "..", ".github", "cask", "cc-pool-status.rb.tmpl")
-	payload, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cask := string(payload)
+	cask := readReleaseContract(t, ".github", "cask", "cc-pool-status.rb.tmpl")
 	if strings.Count(cask, `args: ["service", "holder-stop-uninstall"]`) != 2 ||
 		strings.Count(cask, "must_succeed: true") < 3 {
 		t.Fatal("status cask does not fail closed through the exact holder stop hook")
@@ -199,8 +194,12 @@ func TestTCCSnapshotCoversProtectedSurfacesAndRejectsDaemonRows(t *testing.T) {
 
 func readReleaseContract(t *testing.T, components ...string) string {
 	t.Helper()
-	components = append([]string{"..", ".."}, components...)
-	payload, err := os.ReadFile(filepath.Join(components...))
+	root, err := os.OpenRoot(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	payload, err := root.ReadFile(filepath.Join(components...))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,5 +1,6 @@
 //go:build darwin && cgo && fuse
 
+// Package main exports the signed holder runtime archive entry points.
 package main
 
 /*
@@ -66,18 +67,18 @@ func startHolder(ctx context.Context) error {
 	if err := embeddedHolder.Start(ctx, newHolderRuntime); err != nil {
 		return err
 	}
-	if err := tenantfs.PublishClaudeSourceFleet(
+	err := tenantfs.PublishClaudeSourceFleet(
 		ctx, pool.FuseKitSocketPath(), claudeAuthorityPolicy(),
-	); err == nil {
+	)
+	if err == nil {
 		return nil
-	} else {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		return errors.Join(
-			fmt.Errorf("publish exact source fleet: %w", err),
-			embeddedHolder.Close(cleanupCtx),
-		)
 	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+	defer cancel()
+	return errors.Join(
+		fmt.Errorf("publish exact source fleet: %w", err),
+		embeddedHolder.Close(cleanupCtx),
+	)
 }
 
 //export CCPoolFuseKitReady
@@ -112,7 +113,7 @@ func newHolderRuntime(ctx context.Context) (daemon.EmbeddedRuntime, error) {
 	plan, planErr := holderbridge.NewRuntimePlan(
 		toolRunner, pool.WidgetAppPath(), pool.FuseKitRuntimeDir(), version.String(),
 	)
-	err = errors.Join(planErr, toolRunner.Close())
+	err = errors.Join(planErr, toolRunner.Close(ctx))
 	if err != nil {
 		return nil, err
 	}

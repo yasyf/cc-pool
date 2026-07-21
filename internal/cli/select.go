@@ -12,6 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/daemonkit/service"
 )
 
 func newSelectCmd() *cobra.Command {
@@ -153,8 +154,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 	}()
 	health, err := cl.HealthContext(ctx)
 	if errors.Is(err, daemon.ErrDaemonUnavailable) {
-		ensureDaemon(cmd)
-		health, err = cl.HealthContext(ctx)
+		health, err = startSelectionDaemon(ctx, cmd, cl)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("require daemon: %w", err)
@@ -226,18 +226,58 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 	}
 }
 
-func daemonEnsureTimeout(ctx context.Context) time.Duration {
-	const limit = 2 * time.Second
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining < limit {
-			if remaining <= 0 {
-				return time.Nanosecond
-			}
-			return remaining
+func startSelectionDaemon(ctx context.Context, cmd *cobra.Command, cl *daemon.Client) (*daemon.Response, error) {
+	want := version.String()
+	step(cmd.OutOrStdout(), "Starting the cc-pool daemon…")
+	if err := installSelectionDaemon(ctx, cmd); err != nil {
+		health, healthErr := cl.HealthContext(ctx)
+		if healthErr == nil && health.OK && health.Version == want {
+			return health, nil
+		}
+		warn(cmd.ErrOrStderr(),
+			"couldn't start the daemon: %v; run `ccp service install` from a GUI session to enable background polling", err)
+		return health, healthErr
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var health *daemon.Response
+	var err error
+	for {
+		health, err = cl.HealthContext(waitCtx)
+		if err == nil && health.OK && health.Version == want {
+			return health, nil
+		}
+		select {
+		case <-waitCtx.Done():
+			warn(cmd.ErrOrStderr(), "the daemon isn't responding yet; check `ccp service status`")
+			return health, err
+		case <-ticker.C:
 		}
 	}
-	return limit
+}
+
+func installSelectionDaemon(ctx context.Context, cmd *cobra.Command) error {
+	if err := ensureHolder(ctx); err != nil {
+		return err
+	}
+	executable, err := serviceExecutable()
+	if err != nil {
+		return err
+	}
+	agent, err := ccpAgent(executable)
+	if err != nil {
+		return err
+	}
+	if err := withDaemonServiceController(ctx, func(controller daemonServiceController) error {
+		return controller.Converge(ctx, []service.Agent{agent})
+	}); err != nil {
+		return err
+	}
+	success(cmd.OutOrStdout(), "Installed and started the daemon.")
+	return nil
 }
 
 func abortDaemonSelection(ctx context.Context, cl *daemon.Client, token string) {

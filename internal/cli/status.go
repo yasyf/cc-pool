@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -134,7 +135,12 @@ func loadStatusSnapshot(ctx context.Context) (daemon.StatusSnapshot, error) {
 }
 
 func readStatusSnapshot(path string) (daemon.StatusSnapshot, error) {
-	data, err := os.ReadFile(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return daemon.StatusSnapshot{}, fmt.Errorf("open status snapshot root: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	data, err := root.ReadFile(filepath.Base(path))
 	if err != nil {
 		return daemon.StatusSnapshot{}, fmt.Errorf("read status snapshot: %w", err)
 	}

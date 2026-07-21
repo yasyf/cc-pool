@@ -15,7 +15,10 @@ import (
 func TestWorkerScannerCancellationKillsReapsAndUntracks(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "wedged-worker")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(script, 0o700); err != nil { //nolint:gosec // G302: private test script needs its owner execute bit
 		t.Fatal(err)
 	}
 	store := &dkproc.FileStore{Path: filepath.Join(dir, "workers.json")}

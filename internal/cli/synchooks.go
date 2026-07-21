@@ -21,7 +21,7 @@ func syncHooksEnabled(m *pool.Manager) (bool, error) {
 
 // syncRecordLabel mirrors a local rename into the shared registry; the label
 // is display-only, so failures warn instead of failing the rename.
-func syncRecordLabel(cmd *cobra.Command, m *pool.Manager, a store.Account, label string) {
+func syncRecordLabel(cmd *cobra.Command, m *pool.Manager, a store.Account) {
 	on, err := syncHooksEnabled(m)
 	if err != nil {
 		warn(cmd.ErrOrStderr(), "check host-sync state: %v", err)

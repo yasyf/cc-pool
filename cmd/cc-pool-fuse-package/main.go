@@ -1,3 +1,4 @@
+// Package main packages the pinned FUSE runtime into the signed application.
 package main
 
 import (
@@ -26,7 +27,7 @@ func run(ctx context.Context, arguments []string) (resultErr error) {
 	if err != nil {
 		return fmt.Errorf("cc-pool-fuse-package: start tool runner: %w", err)
 	}
-	defer func() { resultErr = errors.Join(resultErr, runner.Close()) }()
+	defer func() { resultErr = errors.Join(resultErr, runner.Close(ctx)) }()
 	if err := holderbridge.PackageFUSE(ctx, runner, *signingIdentity, *appPath); err != nil {
 		return fmt.Errorf("cc-pool-fuse-package: %w", err)
 	}
