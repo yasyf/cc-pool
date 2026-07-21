@@ -7,17 +7,15 @@ require (
 	github.com/charmbracelet/huh v1.0.0
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/descope/go-free-email-providers v0.0.0-20260427134210-d71f4c2c7632
-	github.com/ebitengine/purego v0.10.1
 	github.com/spf13/cobra v1.10.2
-	github.com/yasyf/daemonkit v0.1.1-0.20260721044346-f090a23cf11f
-	github.com/yasyf/fusekit v1.5.1-0.20260719173548-c7394abfd145
+	github.com/yasyf/daemonkit v0.1.1-0.20260721061939-ea1216777bb8
+	github.com/yasyf/fusekit v1.5.1-0.20260721064313-07f25dbc9c1b
 	github.com/yasyf/synckit v0.23.1-0.20260721024529-9b633bf21646
 	golang.org/x/net v0.56.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
 	golang.org/x/text v0.40.0
-	modernc.org/libc v1.74.1
 	modernc.org/sqlite v1.54.0
 )
 
@@ -36,8 +34,8 @@ require (
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/creack/pty v1.1.24 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
-	github.com/gofrs/flock v0.13.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
@@ -60,6 +58,7 @@ require (
 	go.etcd.io/bbolt v1.5.0 // indirect
 	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
+	modernc.org/libc v1.74.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
