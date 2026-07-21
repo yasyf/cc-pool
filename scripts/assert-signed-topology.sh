@@ -138,7 +138,7 @@ child_rc=$?
 set -e
 [[ "$child_rc" == 1 ]] \
   || fail "malformed native-child invocation exited $child_rc, expected 1"
-grep -q 'native child failed' <<<"$child_output" \
+grep -Fqx 'CCPoolStatus: FuseKit child failed: mountmux: native child arguments are invalid' <<<"$child_output" \
   || fail "malformed native-child invocation did not reach the embedded Go dispatcher"
 
 set +e
