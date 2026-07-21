@@ -147,7 +147,7 @@ func TestRecordSampleCollapsesScoped(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = st.Close() })
 			a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user"}
-			a = persistTestAccount(t, st, a)
+			persistTestAccount(t, st, a)
 			m := &Manager{Store: st}
 			m.recordSample(1, &oauth.Usage{
 				FiveHour:     oauth.Window{Utilization: 12},

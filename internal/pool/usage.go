@@ -327,7 +327,7 @@ func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error 
 		m,
 		a,
 		store.CredentialOperationAdoptRotated,
-		unitCredentialOperationCodec(store.CredentialOperationAdoptRotated, credentialTarget(source)),
+		unitCredentialOperationCodec(credentialTarget(source)),
 		func(ctx context.Context, boundary *credentialOperationBoundary) (struct{}, error) {
 			return struct{}{}, m.adoptRotatedToken(ctx, a, source, boundary)
 		},

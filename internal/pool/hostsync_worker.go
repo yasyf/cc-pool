@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
@@ -62,9 +63,19 @@ func (m *Manager) RunHostSyncCommand(
 	if m.workerAuthority == nil || !m.workerAuthority.inline {
 		return errors.New("host-sync command requires inline child authority")
 	}
+	if path != "synckitd" {
+		return errors.New("host-sync command is not an approved executable")
+	}
+	executable, err := exec.LookPath(path)
+	if err != nil {
+		return fmt.Errorf("resolve host-sync command: %w", err)
+	}
+	if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
+		return errors.New("host-sync command did not resolve to a clean absolute executable")
+	}
 	return m.workerAuthority.runner.Run(ctx, supervise.Task{
 		RecoveryClass: proc.RecoveryTask,
-		Path:          path,
+		Path:          executable,
 		Args:          args,
 	})
 }
@@ -107,6 +118,10 @@ func (hostSyncInlineTaskRunner) Run(ctx context.Context, task supervise.Task) er
 	if task.Path == "" {
 		return errors.New("host-sync child task path is required")
 	}
+	if !filepath.IsAbs(task.Path) || filepath.Clean(task.Path) != task.Path {
+		return errors.New("host-sync child task requires a clean absolute executable")
+	}
+	// #nosec G204 -- task.Path is a validated absolute synckitd, security(1), or test path.
 	command := exec.CommandContext(ctx, task.Path, task.Args...)
 	command.Dir = task.Dir
 	command.Env = task.Env

@@ -21,9 +21,9 @@ import (
 )
 
 const (
-	credentialCASWorkerArgument = "__credential-cas-worker"
-	credentialCASWorkerTimeout  = 30 * time.Second
-	credentialCASWorkerMaxIO    = 1 << 20
+	casWorkerArgument          = "__credential-cas-worker"
+	credentialCASWorkerTimeout = 30 * time.Second
+	credentialCASWorkerMaxIO   = 1 << 20
 )
 
 var errCredentialCASConflict = errors.New("credential changed before compare-and-swap")
@@ -137,7 +137,7 @@ func (m *Manager) runCredentialCAS(
 	}
 	runErr := m.taskRunner.Run(ctx, supervise.Task{
 		RecoveryClass: daemonproc.RecoveryTask,
-		Path:          m.workerExecutable, Args: []string{credentialCASWorkerArgument},
+		Path:          m.workerExecutable, Args: []string{casWorkerArgument},
 		Stdin: stdin, Stdout: &output, Stderr: &stderr,
 	})
 	_ = stdin.Close()
@@ -186,7 +186,7 @@ func (m *Manager) runCredentialCAS(
 // IsCredentialCASWorkerInvocation reports whether args request one exact
 // refresh-lock-coordinated credential mutation.
 func IsCredentialCASWorkerInvocation(args []string) bool {
-	return len(args) == 1 && args[0] == credentialCASWorkerArgument
+	return len(args) == 1 && args[0] == casWorkerArgument
 }
 
 // RunCredentialCASWorker performs one compare-and-swap while holding both
@@ -208,7 +208,7 @@ func RunCredentialCASWorker(
 		return err
 	}
 	defer func() {
-		returnErr = errors.Join(returnErr, lease.Release())
+		returnErr = errors.Join(returnErr, lease.Release(ctx))
 	}()
 
 	runner := credentialCASDirectRunner{}
@@ -685,6 +685,10 @@ func (credentialCASDirectRunner) Run(ctx context.Context, task supervise.Task) e
 	if task.Path == "" {
 		return errors.New("credential CAS nested task has no executable")
 	}
+	if !filepath.IsAbs(task.Path) || filepath.Clean(task.Path) != task.Path {
+		return errors.New("credential CAS nested task requires a clean absolute executable")
+	}
+	// #nosec G204 -- task.Path is a validated absolute security(1) or test-fixture path.
 	command := exec.CommandContext(ctx, task.Path, task.Args...)
 	command.Dir = task.Dir
 	command.Env = task.Env

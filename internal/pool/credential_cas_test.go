@@ -22,7 +22,7 @@ import (
 type credentialCASTestTaskRunner struct{}
 
 func (credentialCASTestTaskRunner) Run(ctx context.Context, task supervise.Task) error {
-	if len(task.Args) != 1 || task.Args[0] != credentialCASWorkerArgument {
+	if len(task.Args) != 1 || task.Args[0] != casWorkerArgument {
 		return errors.New("unexpected credential CAS test task")
 	}
 	return RunCredentialCASWorker(ctx, task.Stdin, task.Stdout)
@@ -169,6 +169,7 @@ func TestCredentialCASRefusesUnreadableDeleteTarget(t *testing.T) {
 	if response.ErrorCode != "conflict" {
 		t.Fatalf("unreadable credential CAS delete = %+v", response)
 	}
+	// #nosec G304 -- path is the credential file inside this test's temporary account directory.
 	if got, err := os.ReadFile(path); err != nil || string(got) != "not-json" {
 		t.Fatalf("unreadable delete target changed: %q, %v", got, err)
 	}
@@ -540,8 +541,6 @@ case "$command" in
   *) exit 64 ;;
 esac
 `
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writePoolTestExecutable(t, path, script)
 	return path
 }

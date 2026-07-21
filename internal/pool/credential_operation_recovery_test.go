@@ -71,8 +71,8 @@ func TestRecoverRetiredCredentialOwnersCancellationReentryJoinsWedgedGeneration(
 	lockAcquired := make(chan struct{})
 	go func() {
 		manager.recoveryMu.Lock()
-		manager.recoveryMu.Unlock()
 		close(lockAcquired)
+		manager.recoveryMu.Unlock()
 	}()
 	select {
 	case <-lockAcquired:
@@ -142,7 +142,7 @@ func TestCredentialOperationTwoManagersJoinAndReplayImmutableReceipt(t *testing.
 		result, err := runCredentialOperation(
 			context.Background(), first, account, store.CredentialOperationAdoptRotated,
 			unitCredentialOperationCodec(
-				store.CredentialOperationAdoptRotated, store.CredentialTargetKeychain,
+				store.CredentialTargetKeychain,
 			),
 			func(context.Context, *credentialOperationBoundary) (struct{}, error) {
 				executions.Add(1)
@@ -167,7 +167,7 @@ func TestCredentialOperationTwoManagersJoinAndReplayImmutableReceipt(t *testing.
 		result, err := runCredentialOperation(
 			context.Background(), second, account, store.CredentialOperationAdoptRotated,
 			unitCredentialOperationCodec(
-				store.CredentialOperationAdoptRotated, store.CredentialTargetKeychain,
+				store.CredentialTargetKeychain,
 			),
 			func(context.Context, *credentialOperationBoundary) (struct{}, error) {
 				executions.Add(1)
@@ -248,7 +248,7 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	codec := unitCredentialOperationCodec(kind, target)
+	codec := unitCredentialOperationCodec(target)
 	apply := func(ctx context.Context, boundary *credentialOperationBoundary) (struct{}, error) {
 		executions.Add(1)
 		if err := boundary.Cross(ctx); err != nil {
@@ -357,7 +357,7 @@ func TestCredentialOperationLiveOwnerReopenOnlyJoins(t *testing.T) {
 	defer cancel()
 	var executed atomic.Bool
 	_, err = runCredentialOperation(
-		ctx, reopened, account, kind, unitCredentialOperationCodec(kind, target),
+		ctx, reopened, account, kind, unitCredentialOperationCodec(target),
 		func(context.Context, *credentialOperationBoundary) (struct{}, error) {
 			executed.Store(true)
 			return struct{}{}, nil
@@ -413,7 +413,7 @@ func TestCredentialOperationExpiredLiveOwnerIsNeverTakenOverWithoutReceipt(t *te
 		recovery,
 		account,
 		kind,
-		unitCredentialOperationCodec(kind, target),
+		unitCredentialOperationCodec(target),
 		func(context.Context, *credentialOperationBoundary) (struct{}, error) {
 			executions.Add(1)
 			return struct{}{}, nil
@@ -1590,7 +1590,7 @@ func TestCredentialOperationCancellationReleasesFlightAndLeavesReceipt(t *testin
 			account,
 			store.CredentialOperationAdoptRotated,
 			unitCredentialOperationCodec(
-				store.CredentialOperationAdoptRotated, store.CredentialTargetKeychain,
+				store.CredentialTargetKeychain,
 			),
 			func(ctx context.Context, boundary *credentialOperationBoundary) (struct{}, error) {
 				if err := boundary.Cross(ctx); err != nil {
@@ -1638,7 +1638,7 @@ func TestCredentialOperationCancellationReleasesFlightAndLeavesReceipt(t *testin
 		t.Fatalf("cancellation receipt = %+v", receipt)
 	}
 	if _, err := unitCredentialOperationCodec(
-		store.CredentialOperationAdoptRotated, store.CredentialTargetKeychain,
+		store.CredentialTargetKeychain,
 	).replay(t.Context(), manager, account, receipt); !errors.Is(err, ErrCredentialOperationFailed) {
 		t.Fatalf("receipt replay = %v, want failed-operation sentinel", err)
 	}
@@ -1648,7 +1648,7 @@ func TestCredentialOperationCancellationReleasesFlightAndLeavesReceipt(t *testin
 		account,
 		store.CredentialOperationDropDivergent,
 		unitCredentialOperationCodec(
-			store.CredentialOperationDropDivergent, store.CredentialTargetKeychain,
+			store.CredentialTargetKeychain,
 		),
 		func(context.Context, *credentialOperationBoundary) (struct{}, error) { return struct{}{}, nil },
 	); err != nil {

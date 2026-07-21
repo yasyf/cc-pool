@@ -24,13 +24,19 @@ const (
 	credentialWriteReceiptPage  = 64
 )
 
-var (
-	ErrCredentialOperationFailed      = errors.New("credential operation failed in another process")
-	ErrCredentialOperationQuarantined = errors.New("credential operation requires manual recovery")
-	ErrCredentialOperationReplayed    = errors.New("credential operation returned retained evidence")
-	ErrCredentialOperationLiveProbe   = errors.New("credential operation replay included a live read-only probe")
-	errCredentialOperationRetry       = errors.New("credential operation state changed before external I/O")
-)
+// ErrCredentialOperationFailed reports a terminal failure retained from another process.
+var ErrCredentialOperationFailed = errors.New("credential operation failed in another process")
+
+// ErrCredentialOperationQuarantined reports an operation requiring manual recovery.
+var ErrCredentialOperationQuarantined = errors.New("credential operation requires manual recovery")
+
+// ErrCredentialOperationReplayed reports that retained evidence determined the result.
+var ErrCredentialOperationReplayed = errors.New("credential operation returned retained evidence")
+
+// ErrCredentialOperationLiveProbe reports replay evidence from a live read-only probe.
+var ErrCredentialOperationLiveProbe = errors.New("credential operation replay included a live read-only probe")
+
+var errCredentialOperationRetry = errors.New("credential operation state changed before external I/O")
 
 // CredentialWriteSettlement is one exact terminal credential write awaiting
 // durable publication by a worker-backed consumer.
@@ -1004,7 +1010,7 @@ func (m *Manager) compensateCredentialStateObserved(
 		return err
 	}
 	codec := unitCredentialOperationCodec(
-		store.CredentialOperationCompensate, store.CredentialTargetAll,
+		store.CredentialTargetAll,
 	)
 	if receipt != nil {
 		_, err := replayCredentialOperation(ctx, m, account, codec, *receipt)
@@ -1115,7 +1121,6 @@ func (m *Manager) compensateCredentialState(
 }
 
 func unitCredentialOperationCodec(
-	kind store.CredentialOperationKind,
 	target store.CredentialTarget,
 ) credentialOperationCodec[struct{}] {
 	return credentialOperationCodec[struct{}]{

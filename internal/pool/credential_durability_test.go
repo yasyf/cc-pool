@@ -559,15 +559,15 @@ func (s admissionFlipStore) Read(context.Context) (*creds.Credential, error) {
 	if s.credentials.reads == 1 {
 		credential = s.credentials.fresh
 	}
-	copy := *credential
-	return &copy, nil
+	clone := *credential
+	return &clone, nil
 }
 
 func (s admissionFlipStore) Write(_ context.Context, credential *creds.Credential) error {
 	s.credentials.mu.Lock()
 	defer s.credentials.mu.Unlock()
-	copy := *credential
-	s.credentials.expired = &copy
+	clone := *credential
+	s.credentials.expired = &clone
 	return nil
 }
 

@@ -207,7 +207,7 @@ func (m *Manager) DropDivergentCopy(ctx context.Context, a store.Account) error 
 		m,
 		a,
 		store.CredentialOperationDropDivergent,
-		unitCredentialOperationCodec(store.CredentialOperationDropDivergent, target),
+		unitCredentialOperationCodec(target),
 		func(ctx context.Context, boundary *credentialOperationBoundary) (struct{}, error) {
 			return struct{}{}, m.dropDivergentCopy(ctx, a, boundary)
 		},

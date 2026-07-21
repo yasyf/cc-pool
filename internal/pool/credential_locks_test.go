@@ -13,12 +13,12 @@ import (
 )
 
 const (
-	credentialLockCrashPhaseEnv = "CCPOOL_LOCK_CRASH_PHASE"
-	credentialLockReadyPathEnv  = "CCPOOL_LOCK_READY_PATH"
+	lockCrashPhaseEnv = "CCPOOL_LOCK_CRASH_PHASE"
+	lockReadyPathEnv  = "CCPOOL_LOCK_READY_PATH"
 )
 
 func TestCredentialLockCrashHelper(t *testing.T) {
-	phase := os.Getenv(credentialLockCrashPhaseEnv)
+	phase := os.Getenv(lockCrashPhaseEnv)
 	if phase == "" {
 		t.Skip("credential lock crash helper")
 	}
@@ -30,7 +30,11 @@ func TestCredentialLockCrashHelper(t *testing.T) {
 		if checkpoint != phase {
 			return
 		}
-		if readyPath := os.Getenv(credentialLockReadyPathEnv); readyPath != "" {
+		if readyPath := os.Getenv(lockReadyPathEnv); readyPath != "" {
+			if readyPath != filepath.Join(os.Getenv("HOME"), "lock-ready") {
+				panic("credential lock ready path escaped the test home")
+			}
+			// #nosec G703 -- readyPath is exactly the fixed filename in the test HOME.
 			if err := os.WriteFile(readyPath, []byte(checkpoint), 0o600); err != nil {
 				panic(err)
 			}
@@ -44,7 +48,7 @@ func TestCredentialLockCrashHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := lease.Release(); err != nil {
+	if err := lease.Release(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	t.Fatalf("credential lock checkpoint %q was not reached", phase)
@@ -79,11 +83,16 @@ func TestCredentialLockRecoversEveryCrashTransition(t *testing.T) {
 		t.Run(checkpoint.name, func(t *testing.T) {
 			home := t.TempDir()
 			t.Setenv("HOME", home)
-			command := exec.Command(os.Args[0], "-test.run=^TestCredentialLockCrashHelper$")
-			command.Env = append(os.Environ(), credentialLockCrashPhaseEnv+"="+checkpoint.name)
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// #nosec G204 -- executable is the current Go test binary returned by os.Executable.
+			command := exec.Command(executable, "-test.run=^TestCredentialLockCrashHelper$")
+			command.Env = append(os.Environ(), lockCrashPhaseEnv+"="+checkpoint.name)
 			if checkpoint.kill {
 				readyPath := filepath.Join(home, "lock-ready")
-				command.Env = append(command.Env, credentialLockReadyPathEnv+"="+readyPath)
+				command.Env = append(command.Env, lockReadyPathEnv+"="+readyPath)
 				if err := command.Start(); err != nil {
 					t.Fatal(err)
 				}
@@ -109,7 +118,7 @@ func TestCredentialLockRecoversEveryCrashTransition(t *testing.T) {
 			if err != nil {
 				t.Fatalf("recover after %s: %v", checkpoint.name, err)
 			}
-			if err := lease.Release(); err != nil {
+			if err := lease.Release(ctx); err != nil {
 				t.Fatalf("release after %s: %v", checkpoint.name, err)
 			}
 			assertCredentialLockResidueGone(t, 1, configDir)
@@ -135,7 +144,7 @@ func TestCredentialLockRecoversAbandonedSameWorkerJournal(t *testing.T) {
 	if err := os.WriteFile(foreign, []byte("block rmdir"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := lease.Release(); err == nil {
+	if err := lease.Release(t.Context()); err == nil {
 		t.Fatal("release unexpectedly removed a non-empty exact lock")
 	}
 	if err := os.Remove(foreign); err != nil {
@@ -148,7 +157,25 @@ func TestCredentialLockRecoversAbandonedSameWorkerJournal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recover same-worker abandoned journal: %v", err)
 	}
-	if err := recovered.Release(); err != nil {
+	if err := recovered.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCredentialLockResidueGone(t, 1, configDir)
+}
+
+func TestCredentialLockReleaseOutlivesCallerCancellation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	configDir := AccountDir(1)
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := acquireCredentialRefreshLocks(t.Context(), 1, configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := lease.Release(ctx); err != nil {
 		t.Fatal(err)
 	}
 	assertCredentialLockResidueGone(t, 1, configDir)

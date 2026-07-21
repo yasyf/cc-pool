@@ -85,12 +85,6 @@ func mustPoolSessions(t *testing.T, m *Manager) []store.Session {
 	return sessions
 }
 
-// seedSession seeds on account 2, the pinned account in most fixtures.
-func seedSession(t *testing.T, m *Manager, cwd string, started time.Time, ended *time.Time) {
-	t.Helper()
-	seedSessionFor(t, m, 2, cwd, started, ended)
-}
-
 func TestStickyPick(t *testing.T) {
 	// SelectedAt round-trips through the store as Unix seconds; the TTL-boundary
 	// case needs the exact comparison.

@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"errors"
 	"os"
 	"syscall"
 
@@ -15,8 +16,13 @@ func credentialLockFingerprintForPath(path string) (credentialLockFingerprint, e
 		return credentialLockFingerprint{}, err
 	}
 	stat := info.Sys().(*syscall.Stat_t)
+	if stat.Dev < 0 {
+		return credentialLockFingerprint{}, errors.New("credential lock device is negative")
+	}
+	// #nosec G115 -- stat.Dev is proven non-negative immediately above.
+	device := uint64(stat.Dev)
 	return credentialLockFingerprint{
-		Device: uint64(stat.Dev), Inode: stat.Ino,
+		Device: device, Inode: stat.Ino,
 		BirthSecond: stat.Birthtimespec.Sec, BirthNanos: stat.Birthtimespec.Nsec,
 	}, nil
 }

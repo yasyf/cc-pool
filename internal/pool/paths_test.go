@@ -70,6 +70,7 @@ func TestV1StoreIgnoresOldPoolDatabase(t *testing.T) {
 	if err := current.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// #nosec G304 -- oldPath is a fixed filename inside this test's temporary HOME.
 	got, err := os.ReadFile(oldPath)
 	if err != nil {
 		t.Fatal(err)

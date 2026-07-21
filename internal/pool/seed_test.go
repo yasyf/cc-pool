@@ -24,9 +24,11 @@ func TestSeedClaudeJSONStripsIdentityAndNeverWritesThroughSymlink(t *testing.T) 
 	if err != nil || outcome != SeedCopied {
 		t.Fatalf("seed = %q, %v", outcome, err)
 	}
+	// #nosec G304 -- canary is a fixed file inside this test's temporary directory.
 	if content, _ := os.ReadFile(canary); string(content) != "untouched" {
 		t.Fatalf("canary changed: %q", content)
 	}
+	// #nosec G304 -- backing is a test-controlled temporary directory.
 	content, err := os.ReadFile(privateClaudeJSONPath(backing))
 	if err != nil {
 		t.Fatal(err)

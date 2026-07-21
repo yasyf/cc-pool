@@ -20,7 +20,7 @@ import (
 
 const (
 	credentialLockJournalSchema = 1
-	credentialLockMarkerName    = ".cc-pool-owner-v1.json"
+	lockMarkerName              = ".cc-pool-owner-v1.json"
 	credentialLockPollInterval  = 25 * time.Millisecond
 	credentialLockMaxJournal    = 64 << 10
 )
@@ -120,7 +120,7 @@ func acquireCredentialRefreshLocks(
 	fail := func(cause error) (*credentialLockLease, error) {
 		var cleanupErr error
 		if lease.journalOwned {
-			cleanupErr = lease.release(ctx)
+			cleanupErr = lease.Release(ctx)
 		} else if lease.guard != nil {
 			cleanupErr = lease.guard.Close()
 			lease.guard = nil
@@ -218,16 +218,30 @@ func (lease *credentialLockLease) acquireTarget(ctx context.Context, index int) 
 	}
 }
 
-func (lease *credentialLockLease) Release() error {
-	return lease.release(context.Background())
-}
-
-func (lease *credentialLockLease) release(ctx context.Context) error {
+func (lease *credentialLockLease) Release(ctx context.Context) error {
 	if lease == nil || lease.released {
 		return nil
 	}
+	cleanupCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		credentialCASWorkerTimeout,
+	)
+	defer cancel()
+
 	var releaseErr error
+	checkCleanup := func() bool {
+		if err := cleanupCtx.Err(); err != nil {
+			releaseErr = errors.Join(releaseErr, err)
+			return false
+		}
+		return true
+	}
+
+releaseTargets:
 	for index := len(lease.journal.Targets) - 1; index >= 0; index-- {
+		if !checkCleanup() {
+			break
+		}
 		target := &lease.journal.Targets[index]
 		switch target.Phase {
 		case credentialLockAcquired:
@@ -237,9 +251,15 @@ func (lease *credentialLockLease) release(ctx context.Context) error {
 				continue
 			}
 			credentialLockCheckpoint(fmt.Sprintf("release-intended-%d", index))
+			if !checkCleanup() {
+				break releaseTargets
+			}
 			if err := releaseCredentialLockTarget(lease.journal, *target, true); err != nil {
 				releaseErr = errors.Join(releaseErr, err)
 				continue
+			}
+			if !checkCleanup() {
+				break releaseTargets
 			}
 			target.Phase = credentialLockReleased
 			if err := lease.writeJournal(); err != nil {
@@ -254,6 +274,9 @@ func (lease *credentialLockLease) release(ctx context.Context) error {
 				continue
 			}
 			if !stageExisted {
+				if !checkCleanup() {
+					break releaseTargets
+				}
 				if err := releaseCredentialLockTarget(lease.journal, *target, true); err != nil {
 					releaseErr = errors.Join(releaseErr, err)
 				}
@@ -269,7 +292,9 @@ func (lease *credentialLockLease) release(ctx context.Context) error {
 		}
 	}
 	if releaseErr == nil && lease.journalOwned {
-		if err := removeCredentialLockJournal(lease.journalPath); err != nil {
+		if err := cleanupCtx.Err(); err != nil {
+			releaseErr = errors.Join(releaseErr, err)
+		} else if err := removeCredentialLockJournal(lease.journalPath); err != nil {
 			releaseErr = err
 		} else {
 			lease.journalOwned = false
@@ -281,7 +306,6 @@ func (lease *credentialLockLease) release(ctx context.Context) error {
 		lease.guard = nil
 	}
 	lease.released = releaseErr == nil
-	_ = ctx
 	return releaseErr
 }
 
@@ -307,7 +331,7 @@ func releaseCredentialLockTarget(
 	if fingerprint != target.Fingerprint {
 		return errors.New("credential lock target identity changed before release")
 	}
-	markerPath := filepath.Join(target.Path, credentialLockMarkerName)
+	markerPath := filepath.Join(target.Path, lockMarkerName)
 	marker, markerErr := readCredentialLockMarker(markerPath)
 	if markerErr == nil {
 		if err := validateCredentialLockMarker(journal, target, marker); err != nil {
@@ -353,7 +377,7 @@ func cleanupCredentialLockStage(
 		index < 0 || target.Stage != credentialLockStagePath(target.Path, journal.Nonce, index) {
 		return true, errors.New("credential lock stage identity is invalid")
 	}
-	markerPath := filepath.Join(target.Stage, credentialLockMarkerName)
+	markerPath := filepath.Join(target.Stage, lockMarkerName)
 	marker, markerErr := readCredentialLockMarker(markerPath)
 	if markerErr == nil {
 		if target.Fingerprint.zero() {
@@ -422,7 +446,7 @@ func recoverCredentialLockJournal(
 		case credentialLockPrepared, credentialLockAcquired:
 			if target.Fingerprint.zero() {
 				marker, markerErr := readCredentialLockMarker(
-					filepath.Join(target.Path, credentialLockMarkerName),
+					filepath.Join(target.Path, lockMarkerName),
 				)
 				if markerErr != nil {
 					return errors.Join(errors.New("credential lock recovery lacks exact identity"), markerErr)
@@ -521,7 +545,7 @@ func writeCredentialLockMarker(directory string, marker credentialLockMarker) er
 		return err
 	}
 	return daemonstate.WriteFileDurable(
-		filepath.Join(directory, credentialLockMarkerName), payload, 0o600,
+		filepath.Join(directory, lockMarkerName), payload, 0o600,
 	)
 }
 
@@ -534,7 +558,17 @@ func readCredentialLockMarker(path string) (credentialLockMarker, error) {
 }
 
 func decodeCredentialLockFile(path string, value any) error {
-	payload, err := os.ReadFile(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	file, err := root.Open(filepath.Base(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	payload, err := io.ReadAll(io.LimitReader(file, credentialLockMaxJournal+1))
 	if err != nil {
 		return err
 	}

@@ -55,11 +55,11 @@ func newInstallFixture(t *testing.T) *installFixture {
 		_ store.CredentialOperationID,
 		_ time.Time,
 	) ([]byte, error) {
-		copy := *credential
-		f.hookCred = &copy
+		clone := *credential
+		f.hookCred = &clone
 		return []byte(`{"test":"credential-write"}`), nil
 	}
-	f.m.SettleCredentialWrite = func(_ context.Context, settlement CredentialWriteSettlement) error {
+	f.m.SettleCredentialWrite = func(_ context.Context, _ CredentialWriteSettlement) error {
 		f.hookCalls++
 		return nil
 	}

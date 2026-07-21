@@ -26,6 +26,25 @@ func installTestBackingRunner(manager *Manager) {
 	manager.workerExecutable = "test-worker"
 }
 
+func writePoolTestExecutable(t *testing.T, path, contents string) {
+	t.Helper()
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		t.Fatal("pool test executable requires a clean absolute path")
+	}
+	// #nosec G302 G304 -- this validated test-only path must be owner-executable.
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(contents); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBackingWorkerRejectsMismatchedPresentationIdentity(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if _, err := accountBackingPath(18, AccountDir(19)); err == nil {
@@ -51,13 +70,11 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	script := filepath.Join(home, "wedged-account-worker")
-	if err := os.WriteFile(
+	writePoolTestExecutable(
+		t,
 		script,
-		[]byte("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n"),
-		0o700,
-	); err != nil {
-		t.Fatal(err)
-	}
+		"#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+	)
 	recordStore := &daemonproc.FileStore{Path: filepath.Join(home, "workers.json")}
 	reaper := &daemonproc.Reaper{
 		Store: recordStore, Generation: "account-backing-worker-test",
