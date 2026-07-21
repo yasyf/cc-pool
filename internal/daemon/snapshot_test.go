@@ -273,7 +273,8 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		assertKeys(t, "components", components, []string{
 			"Eff5", "Eff7", "RawRemaining5h", "RawRemaining7d",
 			"Remaining5h", "Remaining7d", "SessionPenalty", "RateLimitPenalty",
-			"NeedsLoginPenalty", "StalePenalty", "Barrier5h", "Barrier7d", "RunwayPenalty",
+			"NeedsLoginPenalty", "CredentialQuarantinePenalty", "StalePenalty",
+			"Barrier5h", "Barrier7d", "RunwayPenalty",
 		})
 	})
 
