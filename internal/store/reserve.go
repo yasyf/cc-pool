@@ -156,7 +156,7 @@ func (s *Store) PromoteReservedAccount(reservation PendingAccountReservation, a 
 func (s *Store) PendingAddReservationsOwnedBy(
 	owner proc.Record,
 	afterAccountID, limit int,
-) ([]PendingAccountReservation, bool, error) {
+) (reservations []PendingAccountReservation, more bool, err error) {
 	if err := owner.Validate(); err != nil {
 		return nil, false, err
 	}
@@ -176,9 +176,8 @@ func (s *Store) PendingAddReservationsOwnedBy(
 	if err != nil {
 		return nil, false, err
 	}
-	defer rows.Close()
-	reservations := make([]PendingAccountReservation, 0, limit)
-	more := false
+	defer func() { err = errors.Join(err, rows.Close()) }()
+	reservations = make([]PendingAccountReservation, 0, limit)
 	for rows.Next() {
 		if len(reservations) == limit {
 			more = true

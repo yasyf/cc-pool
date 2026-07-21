@@ -1060,11 +1060,11 @@ func TestCredentialOperationRejectsSecretBearingStructuralFields(t *testing.T) {
 	now := time.Unix(1_900_000_000, 0)
 	s.now = func() time.Time { return now }
 	account := credentialOperationTestAccount(t, s)
-	const secret = "sk-ant-secret-canary"
+	const canary = "sk-ant-secret-canary"
 	request := credentialOperationTestRequest(
 		t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
 		credentialOperationTestState("before", ""), "refresh", credentialOperationTestOwner("owner"))
-	request.Kind = CredentialOperationKind(secret)
+	request.Kind = CredentialOperationKind(canary)
 	if _, err := s.BeginCredentialOperation(request); err == nil {
 		t.Fatal("secret-bearing operation kind was accepted")
 	}
@@ -1080,13 +1080,13 @@ func TestCredentialOperationRejectsSecretBearingStructuralFields(t *testing.T) {
 	}
 	if _, err := s.MarkCredentialOperationApplied(
 		begin.Active.Fence(), begin.Active.Expected, CredentialTerminalSucceeded,
-		CredentialResultCategory(secret), CredentialFailureNone, nil,
+		CredentialResultCategory(canary), CredentialFailureNone, nil,
 	); err == nil {
 		t.Fatal("secret-bearing result category was accepted")
 	}
 	if _, err := s.MarkCredentialOperationApplied(
 		begin.Active.Fence(), begin.Active.Expected, CredentialTerminalFailed,
-		CredentialResultFailed, CredentialFailureClass(secret), nil,
+		CredentialResultFailed, CredentialFailureClass(canary), nil,
 	); err == nil {
 		t.Fatal("secret-bearing failure class was accepted")
 	}
@@ -1097,7 +1097,7 @@ func TestCredentialOperationRejectsSecretBearingStructuralFields(t *testing.T) {
 			account.KeychainService, account.KeychainAccount, account.ConfigDir,
 		),
 		FileLocatorDigest: CredentialFileLocatorDigest(account.ConfigDir),
-		Observation:       begin.Active.Expected, Reason: CredentialResultCategory(secret),
+		Observation:       begin.Active.Expected, Reason: CredentialResultCategory(canary),
 		FailureClass: CredentialFailureInternal,
 	}); err == nil {
 		t.Fatal("secret-bearing quarantine reason was accepted")
@@ -1106,11 +1106,15 @@ func TestCredentialOperationRejectsSecretBearingStructuralFields(t *testing.T) {
 	if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(path)
+	directory, err := os.OpenRoot(filepath.Dir(path))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), secret) {
+	data, readErr := directory.ReadFile(filepath.Base(path))
+	if err := errors.Join(readErr, directory.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), canary) {
 		t.Fatal("secret-bearing structural value reached SQLite")
 	}
 }
@@ -1587,7 +1591,11 @@ func storeDatabasePath(t *testing.T, s *Store) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close database list: %v", err)
+		}
+	}()
 	for rows.Next() {
 		var sequence int
 		var name, path string

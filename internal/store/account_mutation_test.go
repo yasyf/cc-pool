@@ -25,7 +25,7 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := accountMutationTestRequest(t, reservation, AccountMutationAdd, now.Add(time.Minute))
+	request := accountMutationTestRequest(t, reservation, AccountMutationAdd)
 	begin, err := s.BeginAccountMutation(t.Context(), request)
 	if err != nil || !begin.Created || begin.Active == nil || begin.Active.State != AccountMutationAwaitingInput {
 		t.Fatalf("begin = %+v err=%v", begin, err)
@@ -121,7 +121,7 @@ func TestAccountMutationExactPendingFenceRejectsStaleReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := accountMutationTestRequest(t, stale, AccountMutationAdd, now.Add(time.Minute))
+	request := accountMutationTestRequest(t, stale, AccountMutationAdd)
 	if err := s.ReleaseAccountIndex(stale); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestAccountMutationReloginPublishesVerifiedMetadata(t *testing.T) {
 	account := credentialOperationTestAccountID(t, s, 10)
 	request := existingAccountMutationTestRequest(
 		t, account, AccountMutationRelogin,
-		credentialOperationTestOwner("relogin-owner"), now.Add(time.Minute),
+		credentialOperationTestOwner("relogin-owner"),
 	)
 	begin, err := s.BeginAccountMutation(t.Context(), request)
 	if err != nil {
@@ -202,7 +202,7 @@ func TestRearmAccountMutationInputIsFencedAndLostResponseIdempotent(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := accountMutationTestRequest(t, reservation, AccountMutationAdd, now.Add(time.Minute))
+	request := accountMutationTestRequest(t, reservation, AccountMutationAdd)
 	begin, err := s.BeginAccountMutation(t.Context(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -255,7 +255,7 @@ func TestRearmAccountMutationInputRejectsDriftAndNonInteractiveKind(t *testing.T
 	account := credentialOperationTestAccountID(t, s, 10)
 	relogin := existingAccountMutationTestRequest(
 		t, account, AccountMutationRelogin,
-		credentialOperationTestOwner("rearm-relogin"), now.Add(time.Minute),
+		credentialOperationTestOwner("rearm-relogin"),
 	)
 	begin, err := s.BeginAccountMutation(t.Context(), relogin)
 	if err != nil {
@@ -287,7 +287,7 @@ func TestRearmAccountMutationInputRejectsDriftAndNonInteractiveKind(t *testing.T
 	other := credentialOperationTestAccountID(t, s, 11)
 	syncInstall := existingAccountMutationTestRequest(
 		t, other, AccountMutationSyncInstall,
-		credentialOperationTestOwner("rearm-sync"), now.Add(time.Minute),
+		credentialOperationTestOwner("rearm-sync"),
 	)
 	syncBegin, err := s.BeginAccountMutation(t.Context(), syncInstall)
 	if err != nil {
@@ -312,7 +312,7 @@ func TestAccountMutationCancellationIsPreBoundaryOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := accountMutationTestRequest(t, reservation, AccountMutationAdd, now.Add(time.Minute))
+	request := accountMutationTestRequest(t, reservation, AccountMutationAdd)
 	begin, err := s.BeginAccountMutation(t.Context(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -341,7 +341,7 @@ func TestAccountMutationCancellationIsPreBoundaryOnly(t *testing.T) {
 	account := credentialOperationTestAccountID(t, s, 10)
 	existing := existingAccountMutationTestRequest(
 		t, account, AccountMutationSyncInstall,
-		credentialOperationTestOwner("sync-owner"), now.Add(time.Minute),
+		credentialOperationTestOwner("sync-owner"),
 	)
 	started, err := s.BeginAccountMutation(t.Context(), existing)
 	if err != nil {
@@ -372,7 +372,7 @@ func TestAccountMutationConcurrentSameIDCoalesces(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := accountMutationTestRequest(t, reservation, AccountMutationAdd, now.Add(time.Minute))
+	request := accountMutationTestRequest(t, reservation, AccountMutationAdd)
 	results := make(chan BeginAccountMutationResult, 2)
 	errorsOut := make(chan error, 2)
 	start := make(chan struct{})
@@ -419,7 +419,7 @@ func TestAccountMutationSecondAddAttachesAndReleasesLosingReservation(t *testing
 		t.Fatal(err)
 	}
 	firstRequest := accountMutationTestRequest(
-		t, firstReservation, AccountMutationAdd, now.Add(time.Minute),
+		t, firstReservation, AccountMutationAdd,
 	)
 	first, err := s.BeginAccountMutation(t.Context(), firstRequest)
 	if err != nil {
@@ -430,7 +430,7 @@ func TestAccountMutationSecondAddAttachesAndReleasesLosingReservation(t *testing
 		t.Fatal(err)
 	}
 	secondRequest := accountMutationTestRequest(
-		t, secondReservation, AccountMutationAdd, now.Add(time.Minute),
+		t, secondReservation, AccountMutationAdd,
 	)
 	attached, err := s.BeginAccountMutation(t.Context(), secondRequest)
 	if !errors.Is(err, ErrAccountMutationBusy) || attached.Active == nil ||
@@ -454,7 +454,7 @@ func TestAccountRemovalWinsPublishSequenceAndForcesCompensation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := accountMutationTestRequest(t, reservation, AccountMutationAdd, now.Add(time.Minute))
+	request := accountMutationTestRequest(t, reservation, AccountMutationAdd)
 	begin, err := s.BeginAccountMutation(t.Context(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -664,7 +664,7 @@ func TestAccountMutationTakeoverRequiresExactReapReceipt(t *testing.T) {
 	account := credentialOperationTestAccount(t, s)
 	owner := credentialOperationTestOwner("registry-owner")
 	request := existingAccountMutationTestRequest(
-		t, account, AccountMutationSyncInstall, owner, now.Add(time.Minute),
+		t, account, AccountMutationSyncInstall, owner,
 	)
 	begin, err := s.BeginAccountMutation(t.Context(), request)
 	if err != nil {
@@ -695,7 +695,7 @@ func TestAccountMutationAgeAloneCannotTakeover(t *testing.T) {
 	account := credentialOperationTestAccount(t, s)
 	owner := credentialOperationTestOwner("registry-expired-owner")
 	request := existingAccountMutationTestRequest(
-		t, account, AccountMutationSyncInstall, owner, now.Add(time.Minute),
+		t, account, AccountMutationSyncInstall, owner,
 	)
 	begin, err := s.BeginAccountMutation(t.Context(), request)
 	if err != nil {
@@ -723,7 +723,7 @@ func TestAccountMutationsOwnedByPagesExactOwner(t *testing.T) {
 			requestOwner = other
 		}
 		request := existingAccountMutationTestRequest(
-			t, account, AccountMutationSyncInstall, requestOwner, now.Add(time.Minute),
+			t, account, AccountMutationSyncInstall, requestOwner,
 		)
 		if _, err := s.BeginAccountMutation(t.Context(), request); err != nil {
 			t.Fatal(err)
@@ -746,7 +746,6 @@ func accountMutationTestRequest(
 	t *testing.T,
 	reservation PendingAccountReservation,
 	kind AccountMutationKind,
-	expiresAt time.Time,
 ) BeginAccountMutationRequest {
 	t.Helper()
 	request := BeginAccountMutationRequest{
@@ -775,7 +774,6 @@ func existingAccountMutationTestRequest(
 	account Account,
 	kind AccountMutationKind,
 	owner proc.Record,
-	expiresAt time.Time,
 ) BeginAccountMutationRequest {
 	t.Helper()
 	request := BeginAccountMutationRequest{

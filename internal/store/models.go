@@ -118,13 +118,20 @@ type CwdActivity struct {
 type RefreshCategory string
 
 const (
-	RefreshSucceeded    RefreshCategory = "succeeded"
-	RefreshCanceled     RefreshCategory = "canceled"
-	RefreshNetwork      RefreshCategory = "network"
+	// RefreshSucceeded records a successful refresh attempt.
+	RefreshSucceeded RefreshCategory = "succeeded"
+	// RefreshCanceled records caller cancellation.
+	RefreshCanceled RefreshCategory = "canceled"
+	// RefreshNetwork records a transport failure.
+	RefreshNetwork RefreshCategory = "network"
+	// RefreshInvalidGrant records an invalid OAuth grant.
 	RefreshInvalidGrant RefreshCategory = "invalid_grant"
-	RefreshRejected     RefreshCategory = "rejected"
-	RefreshServer       RefreshCategory = "server"
-	RefreshInternal     RefreshCategory = "internal"
+	// RefreshRejected records a non-grant refresh rejection.
+	RefreshRejected RefreshCategory = "rejected"
+	// RefreshServer records a remote service failure.
+	RefreshServer RefreshCategory = "server"
+	// RefreshInternal records a local invariant or system failure.
+	RefreshInternal RefreshCategory = "internal"
 )
 
 // RefreshEntry is one credential-refresh attempt. Digest fingerprints the
@@ -168,10 +175,14 @@ func (k AuthKind) Valid() bool {
 type AuthReasonCategory string
 
 const (
-	AuthReasonNone           AuthReasonCategory = "none"
-	AuthReasonRequired       AuthReasonCategory = "auth_required"
+	// AuthReasonNone records a healthy account without an authentication failure.
+	AuthReasonNone AuthReasonCategory = "none"
+	// AuthReasonRequired records an interactive authentication requirement.
+	AuthReasonRequired AuthReasonCategory = "auth_required"
+	// AuthReasonAwaitingOrigin records a synchronized copy awaiting its origin.
 	AuthReasonAwaitingOrigin AuthReasonCategory = "awaiting_origin"
-	AuthReasonInternal       AuthReasonCategory = "internal"
+	// AuthReasonInternal records an internal authentication-state failure.
+	AuthReasonInternal AuthReasonCategory = "internal"
 )
 
 // Valid reports whether c is a recognized authentication reason.

@@ -20,8 +20,11 @@ type AccountMutationID [32]byte
 type AccountMutationKind string
 
 const (
-	AccountMutationAdd         AccountMutationKind = "add"
-	AccountMutationRelogin     AccountMutationKind = "relogin"
+	// AccountMutationAdd starts the globally serialized account-add lane.
+	AccountMutationAdd AccountMutationKind = "add"
+	// AccountMutationRelogin replaces one existing account's credentials.
+	AccountMutationRelogin AccountMutationKind = "relogin"
+	// AccountMutationSyncInstall installs one synchronized account.
 	AccountMutationSyncInstall AccountMutationKind = "sync-install"
 )
 
@@ -29,31 +32,47 @@ const (
 type AccountMutationState string
 
 const (
+	// AccountMutationAwaitingInput is the pre-I/O interactive phase.
 	AccountMutationAwaitingInput AccountMutationState = "awaiting-input"
-	AccountMutationReserved      AccountMutationState = "reserved"
-	AccountMutationApplying      AccountMutationState = "applying"
-	AccountMutationApplied       AccountMutationState = "applied"
-	AccountMutationPublishing    AccountMutationState = "publishing"
-	AccountMutationCompensating  AccountMutationState = "compensating"
+	// AccountMutationReserved owns one durable account reservation.
+	AccountMutationReserved AccountMutationState = "reserved"
+	// AccountMutationApplying has crossed the external-I/O boundary.
+	AccountMutationApplying AccountMutationState = "applying"
+	// AccountMutationApplied has completed external I/O.
+	AccountMutationApplied AccountMutationState = "applied"
+	// AccountMutationPublishing is committing the registry result.
+	AccountMutationPublishing AccountMutationState = "publishing"
+	// AccountMutationCompensating is undoing an unpublished external write.
+	AccountMutationCompensating AccountMutationState = "compensating"
 )
 
 // AccountMutationTerminal is one immutable registry mutation result.
 type AccountMutationTerminal string
 
 const (
-	AccountMutationCommitted   AccountMutationTerminal = "committed"
-	AccountMutationSuperseded  AccountMutationTerminal = "superseded"
-	AccountMutationAborted     AccountMutationTerminal = "aborted"
+	// AccountMutationCommitted records a successfully published mutation.
+	AccountMutationCommitted AccountMutationTerminal = "committed"
+	// AccountMutationSuperseded records registry drift before publication.
+	AccountMutationSuperseded AccountMutationTerminal = "superseded"
+	// AccountMutationAborted records a pre-I/O cancellation.
+	AccountMutationAborted AccountMutationTerminal = "aborted"
+	// AccountMutationQuarantined records unresolved external ambiguity.
 	AccountMutationQuarantined AccountMutationTerminal = "quarantined"
 )
 
 var (
-	ErrAccountMutationBusy             = errors.New("account mutation lane busy")
-	ErrAccountMutationFence            = errors.New("account mutation fence changed")
-	ErrAccountMutationState            = errors.New("account mutation state changed")
+	// ErrAccountMutationBusy reports an occupied mutation lane.
+	ErrAccountMutationBusy = errors.New("account mutation lane busy")
+	// ErrAccountMutationFence reports stale owner authority.
+	ErrAccountMutationFence = errors.New("account mutation fence changed")
+	// ErrAccountMutationState reports an invalid phase transition.
+	ErrAccountMutationState = errors.New("account mutation state changed")
+	// ErrAccountMutationRecoveryRequired reports unresolved durable evidence.
 	ErrAccountMutationRecoveryRequired = errors.New("account mutation recovery required")
-	ErrAccountMutationSuperseded       = errors.New("account mutation superseded by registry change")
-	ErrAccountRemoving                 = errors.New("account removal already reserved")
+	// ErrAccountMutationSuperseded reports registry generation drift.
+	ErrAccountMutationSuperseded = errors.New("account mutation superseded by registry change")
+	// ErrAccountRemoving reports a conflicting durable removal.
+	ErrAccountRemoving = errors.New("account removal already reserved")
 )
 
 // AccountMutationFence authorizes one exact daemon owner epoch.
@@ -145,6 +164,7 @@ type AccountMutationQuarantine struct {
 type AccountMutationResolution string
 
 const (
+	// AccountMutationCompensatedRelease records an explicitly released quarantined add.
 	AccountMutationCompensatedRelease AccountMutationResolution = "compensated-release"
 )
 
@@ -346,7 +366,7 @@ func (s *Store) ActiveAccountMutationByKind(kind AccountMutationKind) (AccountMu
 func (s *Store) AccountMutationsOwnedBy(
 	owner proc.Record,
 	afterAccountID, limit int,
-) ([]AccountMutation, bool, error) {
+) (mutations []AccountMutation, more bool, err error) {
 	if err := owner.Validate(); err != nil {
 		return nil, false, err
 	}
@@ -366,9 +386,8 @@ func (s *Store) AccountMutationsOwnedBy(
 	if err != nil {
 		return nil, false, err
 	}
-	defer rows.Close()
-	mutations := make([]AccountMutation, 0, limit)
-	more := false
+	defer func() { err = errors.Join(err, rows.Close()) }()
+	mutations = make([]AccountMutation, 0, limit)
 	for rows.Next() {
 		mutation, err := scanAccountMutation(rows)
 		if err != nil {

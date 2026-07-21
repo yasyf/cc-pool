@@ -25,9 +25,12 @@ type ProcessRetirementVerifier interface {
 type CredentialOperationState string
 
 const (
+	// CredentialOperationPrepared is the durable pre-I/O phase.
 	CredentialOperationPrepared CredentialOperationState = "prepared"
+	// CredentialOperationApplying has crossed the external-I/O boundary.
 	CredentialOperationApplying CredentialOperationState = "applying"
-	CredentialOperationApplied  CredentialOperationState = "applied"
+	// CredentialOperationApplied has completed external I/O.
+	CredentialOperationApplied CredentialOperationState = "applied"
 )
 
 // CredentialPublicationPayloadMaxBytes bounds the daemon-owned non-secret envelope.
@@ -37,51 +40,81 @@ const CredentialPublicationPayloadMaxBytes = 4096
 type CredentialTerminalStatus string
 
 const (
-	CredentialTerminalSucceeded   CredentialTerminalStatus = "succeeded"
-	CredentialTerminalFailed      CredentialTerminalStatus = "failed"
+	// CredentialTerminalSucceeded records a successful immutable outcome.
+	CredentialTerminalSucceeded CredentialTerminalStatus = "succeeded"
+	// CredentialTerminalFailed records a classified terminal failure.
+	CredentialTerminalFailed CredentialTerminalStatus = "failed"
+	// CredentialTerminalQuarantined records unresolved external ambiguity.
 	CredentialTerminalQuarantined CredentialTerminalStatus = "quarantined"
 )
 
 // CredentialOperationKind is one closed credential mutation policy.
 type CredentialOperationKind string
 
+const dropDivergentOperationKind CredentialOperationKind = "drop-divergent-copy"
+
 const (
-	CredentialOperationMove           CredentialOperationKind = "move"
-	CredentialOperationEnsureFresh    CredentialOperationKind = "ensure-fresh"
+	// CredentialOperationMove moves one exact credential identity.
+	CredentialOperationMove CredentialOperationKind = "move"
+	// CredentialOperationEnsureFresh refreshes only when required.
+	CredentialOperationEnsureFresh CredentialOperationKind = "ensure-fresh"
+	// CredentialOperationRefreshCurrent refreshes the selected current account.
 	CredentialOperationRefreshCurrent CredentialOperationKind = "refresh-current"
-	CredentialOperationInstallSynced  CredentialOperationKind = "install-synced"
-	CredentialOperationAdoptRotated   CredentialOperationKind = "adopt-rotated"
-	CredentialOperationDropDivergent  CredentialOperationKind = "drop-divergent-copy"
-	CredentialOperationCompensate     CredentialOperationKind = "compensate"
+	// CredentialOperationInstallSynced installs synchronized credentials.
+	CredentialOperationInstallSynced CredentialOperationKind = "install-synced"
+	// CredentialOperationAdoptRotated adopts a proven rotated credential.
+	CredentialOperationAdoptRotated CredentialOperationKind = "adopt-rotated"
+	// CredentialOperationDropDivergent removes one divergent synchronized copy.
+	CredentialOperationDropDivergent CredentialOperationKind = dropDivergentOperationKind
+	// CredentialOperationCompensate reverses an unpublished credential write.
+	CredentialOperationCompensate CredentialOperationKind = "compensate"
 )
 
 // CredentialTarget identifies the exact external credential slot an operation targets.
 type CredentialTarget string
 
 const (
+	// CredentialTargetKeychain selects only the Keychain slot.
 	CredentialTargetKeychain CredentialTarget = "keychain"
-	CredentialTargetFile     CredentialTarget = "file"
-	CredentialTargetAll      CredentialTarget = "all"
+	// CredentialTargetFile selects only the file slot.
+	CredentialTargetFile CredentialTarget = "file"
+	// CredentialTargetAll selects both credential slots.
+	CredentialTargetAll CredentialTarget = "all"
 )
 
 // CredentialResultCategory is one closed, secret-free terminal result.
 type CredentialResultCategory string
 
 const (
-	CredentialResultDone             CredentialResultCategory = "done"
-	CredentialResultUnchanged        CredentialResultCategory = "unchanged"
-	CredentialResultRefreshed        CredentialResultCategory = "refreshed"
-	CredentialResultNeedsLogin       CredentialResultCategory = "needs-login"
-	CredentialResultNoTokens         CredentialResultCategory = "no-tokens"
-	CredentialResultInstalled        CredentialResultCategory = "installed"
-	CredentialResultSkipped          CredentialResultCategory = "skipped"
-	CredentialResultMoved            CredentialResultCategory = "moved"
-	CredentialResultAlreadyTarget    CredentialResultCategory = "already-target"
-	CredentialResultCleanedStray     CredentialResultCategory = "cleaned-stray"
-	CredentialResultFailed           CredentialResultCategory = "failed"
-	CredentialResultAmbiguous        CredentialResultCategory = "ambiguous"
-	CredentialResultDiverged         CredentialResultCategory = "diverged"
-	CredentialResultCleanupFailed    CredentialResultCategory = "cleanup-failed"
+	// CredentialResultDone records a completed operation without a narrower category.
+	CredentialResultDone CredentialResultCategory = "done"
+	// CredentialResultUnchanged records byte-identical external state.
+	CredentialResultUnchanged CredentialResultCategory = "unchanged"
+	// CredentialResultRefreshed records newly refreshed credentials.
+	CredentialResultRefreshed CredentialResultCategory = "refreshed"
+	// CredentialResultNeedsLogin records an interactive authentication requirement.
+	CredentialResultNeedsLogin CredentialResultCategory = "needs-login"
+	// CredentialResultNoTokens records absent source credentials.
+	CredentialResultNoTokens CredentialResultCategory = "no-tokens"
+	// CredentialResultInstalled records a completed synchronized install.
+	CredentialResultInstalled CredentialResultCategory = "installed"
+	// CredentialResultSkipped records an intentionally omitted mutation.
+	CredentialResultSkipped CredentialResultCategory = "skipped"
+	// CredentialResultMoved records a completed credential move.
+	CredentialResultMoved CredentialResultCategory = "moved"
+	// CredentialResultAlreadyTarget records an already-canonical target.
+	CredentialResultAlreadyTarget CredentialResultCategory = "already-target"
+	// CredentialResultCleanedStray records removal of a stray credential.
+	CredentialResultCleanedStray CredentialResultCategory = "cleaned-stray"
+	// CredentialResultFailed records a classified operation failure.
+	CredentialResultFailed CredentialResultCategory = "failed"
+	// CredentialResultAmbiguous records unprovable external state.
+	CredentialResultAmbiguous CredentialResultCategory = "ambiguous"
+	// CredentialResultDiverged records conflicting credential copies.
+	CredentialResultDiverged CredentialResultCategory = "diverged"
+	// CredentialResultCleanupFailed records a failed compensating cleanup.
+	CredentialResultCleanupFailed CredentialResultCategory = "cleanup-failed"
+	// CredentialResultChangedUnderfoot records concurrent external drift.
 	CredentialResultChangedUnderfoot CredentialResultCategory = "changed-underfoot"
 )
 
@@ -90,22 +123,32 @@ const (
 type CredentialFailureClass string
 
 const (
-	CredentialFailureNone                CredentialFailureClass = ""
-	CredentialFailureInternal            CredentialFailureClass = "internal"
-	CredentialFailureNetwork             CredentialFailureClass = "network"
+	// CredentialFailureNone records the absence of a failure.
+	CredentialFailureNone CredentialFailureClass = ""
+	// CredentialFailureInternal records an invariant or local-system failure.
+	CredentialFailureInternal CredentialFailureClass = "internal"
+	// CredentialFailureNetwork records a transport failure.
+	CredentialFailureNetwork CredentialFailureClass = "network"
+	// CredentialFailureRefreshUnauthorized records rejected refresh authorization.
 	CredentialFailureRefreshUnauthorized CredentialFailureClass = "refresh-unauthorized"
-	CredentialFailureRefreshRejected     CredentialFailureClass = "refresh-rejected"
-	CredentialFailureRefreshServer       CredentialFailureClass = "refresh-server"
+	// CredentialFailureRefreshRejected records a non-authorization refresh rejection.
+	CredentialFailureRefreshRejected CredentialFailureClass = "refresh-rejected"
+	// CredentialFailureRefreshServer records a remote refresh service failure.
+	CredentialFailureRefreshServer CredentialFailureClass = "refresh-server"
 )
 
 // CredentialSlotState is one closed observation state for a credential slot.
 type CredentialSlotState string
 
 const (
-	CredentialSlotEmpty        CredentialSlotState = "empty"
-	CredentialSlotPresent      CredentialSlotState = "present"
+	// CredentialSlotEmpty records a proven absent slot.
+	CredentialSlotEmpty CredentialSlotState = "empty"
+	// CredentialSlotPresent records a readable present slot.
+	CredentialSlotPresent CredentialSlotState = "present"
+	// CredentialSlotUnsearchable records a slot whose existence cannot be proven.
 	CredentialSlotUnsearchable CredentialSlotState = "unsearchable"
-	CredentialSlotUnreadable   CredentialSlotState = "unreadable"
+	// CredentialSlotUnreadable records present but unreadable data.
+	CredentialSlotUnreadable CredentialSlotState = "unreadable"
 )
 
 // CredentialDigest is a secret-free SHA-256 digest.
@@ -504,14 +547,13 @@ func (s *Store) CredentialOperationByToken(token string) (CredentialOperation, e
 // CredentialOperationEvidence returns the sole exact active operation or retained receipt.
 func (s *Store) CredentialOperationEvidence(
 	query CredentialOperationEvidenceQuery,
-) (*CredentialOperation, *CredentialOperationReceipt, error) {
+) (active *CredentialOperation, receipt *CredentialOperationReceipt, err error) {
 	if query.AccountID <= 0 || validateAccountInstanceID(query.AccountInstanceID) != nil ||
 		query.AccountGeneration == 0 || query.LocatorDigest.zero() ||
 		query.FileLocatorDigest.zero() || !validCredentialKindTarget(query.Kind, query.Target) ||
 		query.IntentDigest.zero() {
 		return nil, nil, ErrCredentialOperationState
 	}
-	var active *CredentialOperation
 	operation, err := credentialOperationByAccount(s.db, query.AccountID)
 	if err == nil {
 		if credentialOperationMatchesEvidence(operation, query) {
@@ -521,7 +563,7 @@ func (s *Store) CredentialOperationEvidence(
 		return nil, nil, err
 	}
 	rows, err := s.db.Query(
-		`SELECT `+credentialReceiptColumns+` FROM credential_operation_receipts
+		`SELECT `+receiptSelectColumns+` FROM credential_operation_receipts
 		 WHERE account_id=? AND account_instance_id=? AND account_generation=?
 		 AND locator_digest=? AND file_locator_digest=? AND kind=? AND target=? AND intent_digest=?
 		 ORDER BY committed_at DESC,operation_id DESC LIMIT 2`,
@@ -532,8 +574,7 @@ func (s *Store) CredentialOperationEvidence(
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
-	var receipt *CredentialOperationReceipt
+	defer func() { err = errors.Join(err, rows.Close()) }()
 	for rows.Next() {
 		current, err := scanCredentialOperationReceipt(rows)
 		if err != nil {
@@ -567,7 +608,7 @@ func credentialOperationMatchesEvidence(
 func (s *Store) CredentialOperationsOwnedBy(
 	owner proc.Record,
 	afterAccountID, limit int,
-) ([]CredentialOperation, bool, error) {
+) (operations []CredentialOperation, more bool, err error) {
 	if err := owner.Validate(); err != nil {
 		return nil, false, err
 	}
@@ -579,7 +620,7 @@ func (s *Store) CredentialOperationsOwnedBy(
 		return nil, false, err
 	}
 	rows, err := s.db.Query(
-		`SELECT `+credentialOperationColumns+`
+		`SELECT `+operationSelectColumns+`
 		 FROM credential_operations
 		 WHERE owner_record=? AND account_id>?
 		 ORDER BY account_id LIMIT ?`,
@@ -588,9 +629,8 @@ func (s *Store) CredentialOperationsOwnedBy(
 	if err != nil {
 		return nil, false, err
 	}
-	defer rows.Close()
-	operations := make([]CredentialOperation, 0, limit)
-	more := false
+	defer func() { err = errors.Join(err, rows.Close()) }()
+	operations = make([]CredentialOperation, 0, limit)
 	for rows.Next() {
 		operation, err := scanCredentialOperation(rows)
 		if err != nil {
@@ -1060,12 +1100,12 @@ func (s *Store) CredentialOperationReceiptByID(
 // UnacknowledgedCredentialWriteReceipts returns one stable account-id page.
 func (s *Store) UnacknowledgedCredentialWriteReceipts(
 	afterAccountID, limit int,
-) ([]CredentialOperationReceipt, bool, error) {
+) (receipts []CredentialOperationReceipt, more bool, err error) {
 	if afterAccountID < 0 || limit <= 0 || limit > CredentialOperationPageLimit {
 		return nil, false, errors.New("credential write receipt page is invalid")
 	}
 	rows, err := s.db.Query(
-		`SELECT `+credentialReceiptColumns+` FROM credential_operation_receipts
+		`SELECT `+receiptSelectColumns+` FROM credential_operation_receipts
 		 WHERE account_id>? AND acknowledged_at IS NULL AND terminal_status='succeeded'
 		 AND result_category IN ('refreshed','installed','moved')
 		 ORDER BY account_id LIMIT ?`,
@@ -1074,9 +1114,8 @@ func (s *Store) UnacknowledgedCredentialWriteReceipts(
 	if err != nil {
 		return nil, false, err
 	}
-	defer rows.Close()
-	receipts := make([]CredentialOperationReceipt, 0, limit)
-	more := false
+	defer func() { err = errors.Join(err, rows.Close()) }()
+	receipts = make([]CredentialOperationReceipt, 0, limit)
 	for rows.Next() {
 		receipt, err := scanCredentialOperationReceipt(rows)
 		if err != nil {
@@ -1612,14 +1651,14 @@ func (s *Store) advanceCredentialOperation(
 	return operation, nil
 }
 
-const credentialOperationColumns = `
+const operationSelectColumns = `
 account_id,operation_id,token,kind,target,intent_digest,
 account_instance_id,account_generation,locator_digest,file_locator_digest,owner_record,owner_epoch,state,
 expected_keychain_state,expected_keychain_digest,expected_file_state,expected_file_digest,
 outcome_keychain_state,outcome_keychain_digest,outcome_file_state,outcome_file_digest,
 terminal_status,result_category,failure_class,publication_payload,created_at,updated_at`
 
-const credentialReceiptColumns = `
+const receiptSelectColumns = `
 account_id,operation_id,token,kind,target,intent_digest,
 account_instance_id,account_generation,locator_digest,file_locator_digest,
 expected_keychain_state,expected_keychain_digest,expected_file_state,expected_file_digest,
@@ -1636,7 +1675,7 @@ func credentialOperationByAccount(
 	accountID int,
 ) (CredentialOperation, error) {
 	return scanCredentialOperation(queryer.QueryRow(
-		`SELECT `+credentialOperationColumns+` FROM credential_operations WHERE account_id=?`,
+		`SELECT `+operationSelectColumns+` FROM credential_operations WHERE account_id=?`,
 		accountID,
 	))
 }
@@ -1649,7 +1688,7 @@ func credentialOperationByToken(
 		return CredentialOperation{}, err
 	}
 	return scanCredentialOperation(queryer.QueryRow(
-		`SELECT `+credentialOperationColumns+` FROM credential_operations WHERE token=?`,
+		`SELECT `+operationSelectColumns+` FROM credential_operations WHERE token=?`,
 		token,
 	))
 }
@@ -1743,7 +1782,7 @@ func credentialOperationReceiptByToken(
 	token string,
 ) (CredentialOperationReceipt, error) {
 	return scanCredentialOperationReceipt(queryer.QueryRow(
-		`SELECT `+credentialReceiptColumns+` FROM credential_operation_receipts WHERE token=?`,
+		`SELECT `+receiptSelectColumns+` FROM credential_operation_receipts WHERE token=?`,
 		token,
 	))
 }
@@ -1753,7 +1792,7 @@ func credentialOperationReceiptByID(
 	operationID CredentialOperationID,
 ) (CredentialOperationReceipt, error) {
 	return scanCredentialOperationReceipt(queryer.QueryRow(
-		`SELECT `+credentialReceiptColumns+` FROM credential_operation_receipts WHERE operation_id=?`,
+		`SELECT `+receiptSelectColumns+` FROM credential_operation_receipts WHERE operation_id=?`,
 		operationID[:],
 	))
 }
@@ -1763,7 +1802,7 @@ func unacknowledgedCredentialWriteReceiptByAccount(
 	accountID int,
 ) (CredentialOperationReceipt, error) {
 	return scanCredentialOperationReceipt(queryer.QueryRow(
-		`SELECT `+credentialReceiptColumns+` FROM credential_operation_receipts
+		`SELECT `+receiptSelectColumns+` FROM credential_operation_receipts
 		 WHERE account_id=? AND acknowledged_at IS NULL AND terminal_status='succeeded'
 		 AND result_category IN ('refreshed','installed','moved')
 		 ORDER BY committed_at,operation_id LIMIT 1`,

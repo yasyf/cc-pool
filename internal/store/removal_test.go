@@ -37,7 +37,7 @@ func TestBeginAccountRemovalRejectsAdmittedExternalOperations(t *testing.T) {
 		account := credentialOperationTestAccount(t, s)
 		request := existingAccountMutationTestRequest(
 			t, account, AccountMutationSyncInstall,
-			credentialOperationTestOwner("removal-account-mutation"), now.Add(time.Minute),
+			credentialOperationTestOwner("removal-account-mutation"),
 		)
 		begin, err := s.BeginAccountMutation(t.Context(), request)
 		if err != nil {
@@ -141,7 +141,7 @@ func TestBeginAccountRemovalOnlyAllowsSettledMatchingPendingAdd(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			request := accountMutationTestRequest(t, reservation, AccountMutationAdd, now.Add(time.Minute))
+			request := accountMutationTestRequest(t, reservation, AccountMutationAdd)
 			begin, err := s.BeginAccountMutation(t.Context(), request)
 			if err != nil {
 				t.Fatal(err)
@@ -179,7 +179,7 @@ func TestBeginAccountRemovalOnlyAllowsSettledMatchingPendingAdd(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		request := accountMutationTestRequest(t, reservation, AccountMutationAdd, now.Add(time.Minute))
+		request := accountMutationTestRequest(t, reservation, AccountMutationAdd)
 		begin, err := s.BeginAccountMutation(t.Context(), request)
 		if err != nil {
 			t.Fatal(err)
@@ -296,7 +296,7 @@ func TestAccountRemovalIntentFencesActiveFleetAndSurvivesRestart(t *testing.T) {
 	}
 	mutationRequest := existingAccountMutationTestRequest(
 		t, account, AccountMutationSyncInstall,
-		credentialOperationTestOwner("post-removal-account-mutation"), time.Now().Add(time.Minute),
+		credentialOperationTestOwner("post-removal-account-mutation"),
 	)
 	if _, err := s.BeginAccountMutation(t.Context(), mutationRequest); !errors.Is(err, ErrAccountRemoving) {
 		t.Fatalf("begin account mutation after removal = %v, want ErrAccountRemoving", err)
