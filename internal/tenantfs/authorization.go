@@ -60,6 +60,22 @@ func (a CatalogAuthorizer) Authorize(
 	if !validCatalogIdentity(a.UID, identity) {
 		return catalogservice.Authorization{}, errUnauthorized
 	}
+	return catalogAuthorization(operation, route)
+}
+
+func catalogAuthorization(
+	operation catalogproto.Operation,
+	route catalogservice.Route,
+) (catalogservice.Authorization, error) {
+	if operation == catalogproto.OperationSourceAuthorityPublishDesiredFleet ||
+		operation == catalogproto.OperationSourceAuthorityReadDesiredFleet {
+		if route != (catalogservice.Route{}) {
+			return catalogservice.Authorization{}, errUnauthorized
+		}
+		return catalogservice.Authorization{
+			Principal: string(SourceAuthorityFleetOwner), Role: catalogservice.RoleProductAdmin,
+		}, nil
+	}
 	authorization := catalogservice.Authorization{Route: route}
 	switch {
 	case operation == catalogproto.OperationTenantPrepare && route.Tenant != "" && !route.Forwarded && route.Domain == "":

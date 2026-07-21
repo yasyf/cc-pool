@@ -59,7 +59,25 @@ func CCPoolFuseKitDispatchChild() C.int32_t {
 func CCPoolFuseKitStart() C.int32_t {
 	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
-	return operationStatus("holder start", embeddedHolder.Start(ctx, newHolderRuntime))
+	return operationStatus("holder start", startHolder(ctx))
+}
+
+func startHolder(ctx context.Context) error {
+	if err := embeddedHolder.Start(ctx, newHolderRuntime); err != nil {
+		return err
+	}
+	if err := tenantfs.PublishClaudeSourceFleet(
+		ctx, pool.FuseKitSocketPath(), claudeAuthorityPolicy(),
+	); err == nil {
+		return nil
+	} else {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		return errors.Join(
+			fmt.Errorf("publish exact source fleet: %w", err),
+			embeddedHolder.Close(cleanupCtx),
+		)
+	}
 }
 
 //export CCPoolFuseKitReady
@@ -113,9 +131,13 @@ func newHolderRuntime(ctx context.Context) (daemon.EmbeddedRuntime, error) {
 }
 
 func claudeDriverFactories() (holder.DriverFactories, error) {
-	return tenantfs.NewClaudeDriverFactories(tenantfs.ClaudeAuthorityPolicy{
+	return tenantfs.NewClaudeDriverFactories(claudeAuthorityPolicy())
+}
+
+func claudeAuthorityPolicy() tenantfs.ClaudeAuthorityPolicy {
+	return tenantfs.ClaudeAuthorityPolicy{
 		ClaudeDir: pool.ClaudeDir(), ClaudeJSONPath: pool.ClaudeJSONPath(),
-	})
+	}
 }
 
 func operationStatus(operation string, err error) C.int32_t {
