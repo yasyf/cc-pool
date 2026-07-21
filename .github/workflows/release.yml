@@ -253,7 +253,9 @@ jobs:
           set -euo pipefail
           cd dist/released
           [ "$(shasum -a 256 "$CLI_ASSET" | awk '{print $1}')" = "$CLI_SHA256" ]
-          shasum -a 256 -c "$APP_ASSET.sha256"
+          read -r sidecar_sha sidecar_path < "$APP_ASSET.sha256"
+          [ "$sidecar_sha" = "$APP_SHA256" ]
+          [ "$(basename "$sidecar_path")" = "$APP_ASSET" ]
           [ "$(shasum -a 256 "$APP_ASSET" | awk '{print $1}')" = "$APP_SHA256" ]
 
           mkdir cli app
