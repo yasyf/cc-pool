@@ -196,7 +196,11 @@ func TestPeerTransportExecServesRegistry(t *testing.T) {
 	encodedState := base64.RawStdEncoding.EncodeToString(body)
 	script := "env " + testRPCStateEnv + "=" + strconv.Quote(encodedState) + " " + strconv.Quote(os.Args[0])
 
-	fetcher := NewSSHFetcher()
+	workers := newHostSyncTestWorkers(t)
+	fetcher, err := NewSSHFetcher(workers)
+	if err != nil {
+		t.Fatal(err)
+	}
 	got, err := fetcher.Fetch(context.Background(), execPeerPrefix+script)
 	if err != nil {
 		t.Fatalf("Fetch over exec: peer: %v", err)

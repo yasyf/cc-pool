@@ -31,12 +31,8 @@ func (m *Manager) credentialOwnerRecord() (proc.Record, error) {
 	if err := validateCurrentWorkerOwner(m.workerAuthority.owner, identity); err != nil {
 		return proc.Record{}, err
 	}
-	expectedClass := proc.RecoveryTask
-	if m.workerAuthority.inline {
-		expectedClass = proc.RecoverySourceOwner
-	}
-	if m.workerAuthority.owner.RecoveryClass != expectedClass ||
-		m.workerAuthority.inline != m.workerAuthority.owner.ProcessGroup {
+	if m.workerAuthority.owner.RecoveryClass != proc.RecoveryTask ||
+		m.workerAuthority.owner.ProcessGroup {
 		return proc.Record{}, errors.New("credential worker authority kind changed")
 	}
 	return m.workerAuthority.owner, nil

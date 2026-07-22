@@ -7,6 +7,8 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -181,6 +183,92 @@ func TestWorkerAuthKindPreservesTypedFailure(t *testing.T) {
 
 type canceledHostSyncRunner struct {
 	task supervise.Task
+}
+
+type gatedHostSyncRunner struct {
+	inner   *inlineHostSyncRunner
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	calls   atomic.Int32
+}
+
+func (r *gatedHostSyncRunner) Run(ctx context.Context, task supervise.Task) error {
+	r.calls.Add(1)
+	r.once.Do(func() { close(r.started) })
+	select {
+	case <-r.release:
+		return r.inner.Run(ctx, task)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestWorkerClientSerializesExclusiveChildActivation(t *testing.T) {
+	inner := &inlineHostSyncRunner{t: t, runtime: WorkerRuntime{
+		Consumer: &workerConsumerFixture{state: json.RawMessage(`{}`)},
+		Fetch:    func(context.Context, map[string]any) (any, error) { return struct{}{}, nil },
+		AuthKind: func(context.Context, int, string) (store.AuthKind, error) { return store.AuthKindOwned, nil },
+	}}
+	runner := &gatedHostSyncRunner{
+		inner: inner, started: make(chan struct{}), release: make(chan struct{}),
+	}
+	client, err := NewWorkerClient(runner, "/exact/ccp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := client.GetState(t.Context())
+		firstDone <- err
+	}()
+	<-runner.started
+	secondCtx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := client.List(secondCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second operation = %v, want deadline while exclusive worker is active", err)
+	}
+	close(runner.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if inner.runtimeCall != 1 {
+		t.Fatalf("worker activations = %d, want one", inner.runtimeCall)
+	}
+}
+
+func TestWorkerClientDefaultDeadlineIncludesLaneWait(t *testing.T) {
+	inner := &inlineHostSyncRunner{t: t, runtime: WorkerRuntime{
+		Consumer: &workerConsumerFixture{state: json.RawMessage(`{}`)},
+		Fetch:    func(context.Context, map[string]any) (any, error) { return struct{}{}, nil },
+		AuthKind: func(context.Context, int, string) (store.AuthKind, error) { return store.AuthKindOwned, nil },
+	}}
+	runner := &gatedHostSyncRunner{
+		inner: inner, started: make(chan struct{}), release: make(chan struct{}),
+	}
+	client, err := NewWorkerClient(runner, "/exact/ccp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.timeout = 20 * time.Millisecond
+	firstCtx, cancelFirst := context.WithTimeout(t.Context(), time.Second)
+	defer cancelFirst()
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := client.GetState(firstCtx)
+		firstDone <- err
+	}()
+	<-runner.started
+	if _, err := client.List(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second operation = %v, want default deadline while waiting for lane", err)
+	}
+	if calls := runner.calls.Load(); calls != 1 {
+		t.Fatalf("worker activations = %d, want no activation for timed-out waiter", calls)
+	}
+	close(runner.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (r *canceledHostSyncRunner) Run(ctx context.Context, task supervise.Task) error {

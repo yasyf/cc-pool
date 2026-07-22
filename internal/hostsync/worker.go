@@ -82,6 +82,8 @@ type WorkerRuntime struct {
 type WorkerClient struct {
 	runner     supervise.TaskRunner
 	executable string
+	lane       chan struct{}
+	timeout    time.Duration
 }
 
 // NewWorkerClient binds host-sync operations to one daemonkit worker pool.
@@ -89,7 +91,10 @@ func NewWorkerClient(runner supervise.TaskRunner, executable string) (*WorkerCli
 	if runner == nil || executable == "" {
 		return nil, errors.New("hostsync: worker runner and executable are required")
 	}
-	return &WorkerClient{runner: runner, executable: executable}, nil
+	return &WorkerClient{
+		runner: runner, executable: executable, lane: make(chan struct{}, 1),
+		timeout: hostSyncWorkerTimeout,
+	}, nil
 }
 
 // Capabilities executes the complete capability read in a disposable child.
@@ -144,6 +149,17 @@ func (c *WorkerClient) AuthKind(ctx context.Context, accountID int, uuid string)
 }
 
 func (c *WorkerClient) do(ctx context.Context, operation workerOperation, params, result any) error {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+	select {
+	case c.lane <- struct{}{}:
+		defer func() { <-c.lane }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
 		return fmt.Errorf("hostsync: encode %s params: %w", operation, err)
@@ -165,11 +181,6 @@ func (c *WorkerClient) do(ctx context.Context, operation workerOperation, params
 		writeDone <- errors.Join(writeErr, inputWriter.Close())
 	}()
 	var output, stderr boundedWorkerBuffer
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, hostSyncWorkerTimeout)
-		defer cancel()
-	}
 	runErr := c.runner.Run(ctx, supervise.Task{
 		RecoveryClass: proc.RecoverySourceOwner,
 		Path:          c.executable,

@@ -18,6 +18,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/synckit/converge"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 type hostSyncWorkerSessions struct {
@@ -143,6 +144,17 @@ func RunHostSyncWorker(
 		return err
 	}
 	logger := log.New(os.Stderr, "[cc-pool-hostsync] ", log.LstdFlags)
+	workers := manager.DisposableWorkers()
+	if workers == nil {
+		return errors.New("host-sync worker requires disposable process ownership")
+	}
+	fetcher, err := hostsync.NewSSHFetcher(workers)
+	if err != nil {
+		return err
+	}
+	peerTransport := func(peer string) syncservice.Transport {
+		return hostsync.PeerTransport(workers, peer)
+	}
 	self, err := (&Server{m: manager, log: logger}).resolveSyncSelf(ctx)
 	if err != nil {
 		return fmt.Errorf("resolve host-sync worker identity: %w", err)
@@ -171,11 +183,11 @@ func RunHostSyncWorker(
 		Sessions: hostSyncWorkerSessions{manager: manager},
 		Remover:  remover,
 		Status:   converge.NewPeerStatus(),
-		Fetcher:  hostsync.NewSSHFetcher(),
+		Fetcher:  fetcher,
 		Run:      manager.RunHostSyncCommand,
 	}
 	pull := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, localExpiresAt int64, peers []string) (*creds.Credential, error) {
-		return hostsync.FetchCredential(ctx, hostsync.PeerTransport, uuid, chain, localExpiresAt, peers)
+		return hostsync.FetchCredential(ctx, peerTransport, uuid, chain, localExpiresAt, peers)
 	}
 	service.Driver = hostsync.NewDriver(service, hostsync.DriverDeps{
 		Store:      manager.Store,

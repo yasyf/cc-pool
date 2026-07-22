@@ -19,7 +19,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -30,6 +33,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/synckit/rpc"
 )
 
@@ -254,7 +259,7 @@ func cmdRowUUID(args []string) error {
 // envelope bytes that crossed the wire, so the harness can prove the origin's
 // stripped envelope carries no refresh token. It bypasses FetchCredential's
 // verification on purpose — the goal is the unfiltered wire payload.
-func cmdWireCap(args []string) error {
+func cmdWireCap(args []string) (err error) {
 	fs := flag.NewFlagSet("wirecap", flag.ExitOnError)
 	peer := fs.String("peer", "", "peer transport string (exec:... or ssh target)")
 	uuid := fs.String("uuid", "", "account uuid to fetch")
@@ -262,10 +267,15 @@ func cmdWireCap(args []string) error {
 	if *peer == "" || *uuid == "" {
 		return fmt.Errorf("wirecap needs --peer and --uuid")
 	}
-	tx := hostsync.PeerTransport(*peer)
-	defer func() { _ = tx.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	workers, err := openWireCaptureWorkers(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, closeWireCaptureWorkers(ctx, workers)) }()
+	tx := hostsync.PeerTransport(workers, *peer)
+	defer func() { _ = tx.Close() }()
 	resp, err := tx.Do(ctx, &rpc.Request{Method: hostsync.MethodFetchCredential, Params: map[string]any{"uuid": *uuid}})
 	if err != nil {
 		return fmt.Errorf("fetch %s from peer: %w", *uuid, err)
@@ -276,6 +286,48 @@ func cmdWireCap(args []string) error {
 	_, _ = os.Stdout.Write(resp.Result)
 	fmt.Println()
 	return nil
+}
+
+func openWireCaptureWorkers(ctx context.Context) (*supervise.Pool, error) {
+	if err := pool.EnsureStateDir(); err != nil {
+		return nil, err
+	}
+	var generation [16]byte
+	if _, err := rand.Read(generation[:]); err != nil {
+		return nil, fmt.Errorf("generate wire-capture worker generation: %w", err)
+	}
+	reaper := &proc.Reaper{
+		Store: &proc.FileStore{
+			Path: filepath.Join(pool.StateDir(), "sync-sim-workers-v1.json"),
+		},
+		Generation: hex.EncodeToString(generation[:]),
+	}
+	workers, err := supervise.NewPool(1, reaper)
+	if err != nil {
+		return nil, err
+	}
+	if err := workers.Recover(ctx); err != nil {
+		_ = closeWireCaptureWorkers(ctx, workers)
+		return nil, err
+	}
+	_, err = reaper.RecoverReapReceipts(
+		ctx,
+		proc.RecoveryTask,
+		func(context.Context, proc.ReapReceipt) error { return nil },
+	)
+	if err != nil {
+		_ = closeWireCaptureWorkers(ctx, workers)
+		return nil, err
+	}
+	return workers, nil
+}
+
+func closeWireCaptureWorkers(ctx context.Context, workers *supervise.Pool) error {
+	workers.Close()
+	workers.Cancel()
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	return workers.Wait(waitCtx)
 }
 
 func makeCred(access, refresh string, expiresMS int64) *creds.Credential {

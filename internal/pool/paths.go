@@ -69,6 +69,9 @@ func FuseKitProcessStorePath() string { return filepath.Join(FuseKitRuntimeDir()
 // DisposableWorkerStorePath is daemonkit's durable process-group identity store.
 func DisposableWorkerStorePath() string { return statePath("workers.json") }
 
+// HostSyncWorkerStorePath is the host-sync child's independent durable process ledger.
+func HostSyncWorkerStorePath() string { return statePath("hostsync-workers-v1.json") }
+
 // FuseKitBackingRoot is the private source root behind every account presentation.
 func FuseKitBackingRoot() string { return filepath.Join(FuseKitRuntimeDir(), "backing") }
 

@@ -56,7 +56,7 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 		Store:      &daemonproc.FileStore{Path: filepath.Join(home, "workers.json")},
 		Generation: "syncwire-test",
 	}
-	workers, err := supervise.NewPool(1, reaper)
+	workers, err := supervise.NewPool(2, reaper)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,11 @@ func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
 		t.Fatalf("publish on B: %v", err)
 	}
 
-	reg, err := hostsync.NewSSHFetcher().Fetch(ctxB, peer)
+	fetcher, err := hostsync.NewSSHFetcher(b.disposableWorkers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := fetcher.Fetch(ctxB, peer)
 	if err != nil {
 		t.Fatalf("Fetch via exec peer: %v", err)
 	}
@@ -345,7 +349,10 @@ func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
 		t.Fatalf("fetched chain = %+v, want %+v", entry.Value.Chain, chain)
 	}
 
-	got, err := hostsync.FetchCredential(ctxB, hostsync.PeerTransport, "u9", chain, 0, []string{peer})
+	dial := func(peer string) syncservice.Transport {
+		return hostsync.PeerTransport(b.disposableWorkers, peer)
+	}
+	got, err := hostsync.FetchCredential(ctxB, dial, "u9", chain, 0, []string{peer})
 	if err != nil {
 		t.Fatalf("FetchCredential via exec peer: %v", err)
 	}

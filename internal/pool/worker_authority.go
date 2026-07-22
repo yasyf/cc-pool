@@ -16,7 +16,6 @@ type WorkerAuthority struct {
 	runner     supervise.TaskRunner
 	executable string
 	owner      proc.Record
-	inline     bool
 }
 
 // NewWorkerAuthority validates a parent daemon's durable worker authority.
@@ -39,16 +38,6 @@ func NewWorkerAuthority(
 		return WorkerAuthority{}, errors.New("parent worker authority cannot be a disposable process group")
 	}
 	return WorkerAuthority{runner: runner, executable: executable, owner: owner}, nil
-}
-
-func newInlineWorkerAuthority(
-	runner supervise.TaskRunner,
-	executable string,
-	owner proc.Record,
-) WorkerAuthority {
-	return WorkerAuthority{
-		runner: runner, executable: executable, owner: owner, inline: true,
-	}
 }
 
 func validateCurrentWorkerOwner(owner proc.Record, identity proc.Identity) error {
@@ -86,12 +75,7 @@ func NewManager(
 	if err := validateCurrentWorkerOwner(authority.owner, identity); err != nil {
 		return nil, fmt.Errorf("validate worker-bound manager owner: %w", err)
 	}
-	expectedClass := proc.RecoveryTask
-	if authority.inline {
-		expectedClass = proc.RecoverySourceOwner
-	}
-	if authority.owner.RecoveryClass != expectedClass ||
-		authority.inline != authority.owner.ProcessGroup {
+	if authority.owner.RecoveryClass != proc.RecoveryTask || authority.owner.ProcessGroup {
 		return nil, errors.New("worker authority kind does not match process ownership")
 	}
 	manager := &Manager{

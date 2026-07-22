@@ -688,10 +688,12 @@ func TestRegistryOriginNeverShellExecuted(t *testing.T) {
 	sentinel := filepath.Join(t.TempDir(), "pwned")
 	origin := execPeerPrefix + "touch " + sentinel // the registry-injected RCE payload
 	chain := ChainStamp{Origin: origin, ExpiresAt: 9_999, Hash: "h"}
+	workers := newHostSyncTestWorkers(t)
+	dial := func(peer string) syncservice.Transport { return PeerTransport(workers, peer) }
 
 	// The trusted configured mesh is a single exec: peer that fails; the injected
 	// origin is NOT a member.
-	_, err := FetchCredential(context.Background(), PeerTransport, "u-1", chain, 0, []string{execPeerPrefix + "false"})
+	_, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{execPeerPrefix + "false"})
 	if !errors.Is(err, ErrNoPeerCredential) {
 		t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
 	}

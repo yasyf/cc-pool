@@ -1,11 +1,10 @@
 package pool
 
 import (
-	"context"
 	"errors"
+	"strings"
 	"testing"
 
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/daemonkit/proc"
 )
 
@@ -35,26 +34,11 @@ func TestValidateHostSyncWorkerOwnerRequiresExactCurrentSessionLeader(t *testing
 	}
 }
 
-func TestNewManagerAcceptsExactInlineSourceOwner(t *testing.T) {
-	st := openTestStore(t)
-	dummy := &Manager{}
-	owner := bindTestWorkerAuthority(t, dummy, "inline-source-owner")
-	owner.RecoveryClass = proc.RecoverySourceOwner
-	owner.ProcessGroup = true
-	owner.SessionID = owner.PID
-	authority := newInlineWorkerAuthority(
-		rejectingTestTaskRunner{}, owner.Executable, owner,
-	)
-	manager, err := NewManager(
-		st,
-		&fakeOAuth{},
-		func(context.Context) ([]procscan.Session, error) { return nil, nil },
-		authority,
-	)
-	if err != nil {
-		t.Fatal(err)
+func TestHostSyncWorkersUseDistinctV1ProcessLedger(t *testing.T) {
+	if HostSyncWorkerStorePath() == DisposableWorkerStorePath() {
+		t.Fatal("host-sync and daemon workers share a process ledger")
 	}
-	if manager.workerAuthority == nil || !manager.workerAuthority.inline {
-		t.Fatal("inline source owner was not retained")
+	if got := HostSyncWorkerStorePath(); !strings.HasSuffix(got, "hostsync-workers-v1.json") {
+		t.Fatalf("host-sync worker ledger = %q, want v1 path", got)
 	}
 }

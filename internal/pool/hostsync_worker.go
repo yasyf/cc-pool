@@ -7,19 +7,15 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
-	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 	"golang.org/x/sys/unix"
 )
 
-const hostSyncInlineWorkerExecutable = "cc-pool-host-sync-inline"
-
 // OpenHostSyncWorker opens child-local state inside an already tracked,
-// killable host-sync process group. It never creates a nested worker pool.
+// killable host-sync process group with its own recovered disposable workers.
 func OpenHostSyncWorker(ctx context.Context, owner proc.Record) (*Manager, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -35,22 +31,28 @@ func OpenHostSyncWorker(ctx context.Context, owner proc.Record) (*Manager, error
 	if err := validateHostSyncWorkerOwner(owner, identity, sessionID); err != nil {
 		return nil, err
 	}
+	workers, scanner, err := newWorkerRuntimeAt(ctx, HostSyncWorkerStorePath(), true)
+	if err != nil {
+		return nil, err
+	}
 	db, err := store.Open(DBPath())
 	if err != nil {
+		_ = workers.close(ctx)
 		return nil, err
 	}
-	runner := hostSyncInlineTaskRunner{}
-	scanner, err := procscan.NewWorkerScanner(runner, hostSyncInlineWorkerExecutable)
+	authority, err := NewWorkerAuthority(workers.pool, workers.executable, workers.owner)
 	if err != nil {
+		_ = workers.close(ctx)
 		_ = db.Close()
 		return nil, err
 	}
-	authority := newInlineWorkerAuthority(runner, hostSyncInlineWorkerExecutable, owner)
 	manager, err := NewManager(db, oauth.New(), scanner.Scan, authority)
 	if err != nil {
+		_ = workers.close(ctx)
 		_ = db.Close()
 		return nil, err
 	}
+	manager.workers = workers
 	return manager, nil
 }
 
@@ -60,8 +62,8 @@ func (m *Manager) RunHostSyncCommand(
 	path string,
 	args ...string,
 ) error {
-	if m.workerAuthority == nil || !m.workerAuthority.inline {
-		return errors.New("host-sync command requires inline child authority")
+	if m.workers == nil || m.taskRunner == nil {
+		return errors.New("host-sync command requires disposable worker ownership")
 	}
 	if path != "synckitd" {
 		return errors.New("host-sync command is not an approved executable")
@@ -73,7 +75,7 @@ func (m *Manager) RunHostSyncCommand(
 	if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
 		return errors.New("host-sync command did not resolve to a clean absolute executable")
 	}
-	return m.workerAuthority.runner.Run(ctx, supervise.Task{
+	return m.taskRunner.Run(ctx, supervise.Task{
 		RecoveryClass: proc.RecoveryTask,
 		Path:          executable,
 		Args:          args,
@@ -97,36 +99,4 @@ func validateHostSyncWorkerOwner(
 		return proc.ErrIdentityChanged
 	}
 	return nil
-}
-
-type hostSyncInlineTaskRunner struct{}
-
-func (hostSyncInlineTaskRunner) Run(ctx context.Context, task supervise.Task) error {
-	if err := task.RecoveryClass.Validate(); err != nil {
-		return err
-	}
-	switch {
-	case IsBackingWorkerInvocation(task.Args):
-		return RunBackingWorker(ctx, task.Stdin, task.Stdout)
-	case IsCredentialCASWorkerInvocation(task.Args):
-		return RunCredentialCASWorker(ctx, task.Stdin, task.Stdout)
-	case creds.IsFileWorkerInvocation(task.Args):
-		return creds.RunFileWorker(ctx, task.Stdin, task.Stdout)
-	case procscan.IsWorkerInvocation(task.Args):
-		return procscan.RunWorker(ctx, task.Stdin, task.Stdout)
-	}
-	if task.Path == "" {
-		return errors.New("host-sync child task path is required")
-	}
-	if !filepath.IsAbs(task.Path) || filepath.Clean(task.Path) != task.Path {
-		return errors.New("host-sync child task requires a clean absolute executable")
-	}
-	// #nosec G204 -- task.Path is a validated absolute synckitd, security(1), or test path.
-	command := exec.CommandContext(ctx, task.Path, task.Args...)
-	command.Dir = task.Dir
-	command.Env = task.Env
-	command.Stdin = task.Stdin
-	command.Stdout = task.Stdout
-	command.Stderr = task.Stderr
-	return command.Run()
 }

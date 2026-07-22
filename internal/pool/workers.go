@@ -48,7 +48,15 @@ func currentProcessGeneration() (string, error) {
 func newWorkerRuntime(
 	ctx context.Context,
 ) (*workerRuntime, *procscan.WorkerScanner, error) {
-	reaper, err := newWorkerReaper(DisposableWorkerStorePath())
+	return newWorkerRuntimeAt(ctx, DisposableWorkerStorePath(), false)
+}
+
+func newWorkerRuntimeAt(
+	ctx context.Context,
+	storePath string,
+	ackRecoveredTasks bool,
+) (*workerRuntime, *procscan.WorkerScanner, error) {
+	reaper, err := newWorkerReaper(storePath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -60,30 +68,40 @@ func newWorkerRuntime(
 		_ = closeWorkerPool(ctx, workers)
 		return nil, nil, err
 	}
+	if ackRecoveredTasks {
+		_, err := reaper.RecoverReapReceipts(
+			ctx,
+			proc.RecoveryTask,
+			func(context.Context, proc.ReapReceipt) error { return nil },
+		)
+		if err != nil {
+			_ = closeWorkerPool(ctx, workers)
+			return nil, nil, fmt.Errorf("settle recovered disposable tasks: %w", err)
+		}
+	}
 	identity, err := proc.CurrentIdentity()
 	if err != nil {
 		_ = closeWorkerPool(ctx, workers)
-		return nil, nil, fmt.Errorf("bind credential owner process: %w", err)
+		return nil, nil, fmt.Errorf("bind worker owner process: %w", err)
 	}
 	owner, err := reaper.TrackIdentity(ctx, identity, proc.RecoveryTask)
 	if err != nil {
 		_ = closeWorkerPool(ctx, workers)
 		return nil, nil, fmt.Errorf("track credential owner process: %w", err)
 	}
+	runtime := &workerRuntime{pool: workers, reaper: reaper, owner: owner}
 	executable, err := os.Executable()
 	if err != nil {
-		_ = closeWorkerPool(ctx, workers)
+		_ = runtime.close(ctx)
 		return nil, nil, fmt.Errorf("resolve disposable worker executable: %w", err)
 	}
+	runtime.executable = executable
 	scanner, err := procscan.NewWorkerScanner(workers, executable)
 	if err != nil {
-		_ = closeWorkerPool(ctx, workers)
+		_ = runtime.close(ctx)
 		return nil, nil, err
 	}
-	return &workerRuntime{
-		pool: workers, reaper: reaper, owner: owner,
-		executable: executable,
-	}, scanner, nil
+	return runtime, scanner, nil
 }
 
 func newWorkerReaper(path string) (*proc.Reaper, error) {
