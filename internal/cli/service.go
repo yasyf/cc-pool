@@ -26,6 +26,7 @@ var (
 	ensureHolder                = func(ctx context.Context) (holderServiceInstall, error) { return daemon.InstallHolderService(ctx) }
 	stopHolder                  = daemon.StopAndUninstallHolderService
 	serviceExecutable           = resolveDaemonServiceExecutable
+	daemonServiceReady          = waitForDaemonService
 	openDaemonServiceController = func(ctx context.Context) (daemonServiceController, error) {
 		return service.NewController(ctx, daemonServiceControllerConfig())
 	}
@@ -34,6 +35,7 @@ var (
 const (
 	daemonServiceWorkerLimit  = 1
 	daemonServiceCloseTimeout = 30 * time.Second
+	daemonServiceReadyTimeout = 10 * time.Second
 	daemonServicePATH         = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 )
 
@@ -302,13 +304,31 @@ func installDaemonService(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	holderStopped := false
 	defer func() {
-		if err != nil {
+		if err != nil && !holderStopped {
 			err = errors.Join(err, holderInstall.Rollback(ctx))
 		}
 	}()
 	if err := withDaemonServiceController(ctx, func(controller daemonServiceController) error {
-		return controller.Converge(ctx, []service.Agent{agent})
+		if err := controller.Converge(ctx, []service.Agent{agent}); err != nil {
+			return err
+		}
+		readyCtx, cancel := context.WithTimeout(ctx, daemonServiceReadyTimeout)
+		readyErr := daemonServiceReady(readyCtx, version.String())
+		cancel()
+		if readyErr == nil {
+			return nil
+		}
+		readyErr = fmt.Errorf("wait for cc-pool daemon readiness: %w", readyErr)
+		rollbackCtx, rollbackCancel := context.WithTimeout(
+			context.WithoutCancel(ctx), daemonServiceCloseTimeout,
+		)
+		defer rollbackCancel()
+		daemonRollbackErr := controller.Converge(rollbackCtx, nil)
+		holderRollbackErr := stopHolder(rollbackCtx)
+		holderStopped = holderRollbackErr == nil
+		return errors.Join(readyErr, daemonRollbackErr, holderRollbackErr)
 	}); err != nil {
 		return err
 	}
@@ -345,19 +365,41 @@ func ensureDaemon(cmd *cobra.Command) {
 
 // daemonAt is exact-version: a stale pre-upgrade daemon never counts.
 func daemonAt(wantVersion string) bool {
+	return daemonHealth(context.Background(), wantVersion) == nil
+}
+
+func daemonHealth(ctx context.Context, wantVersion string) error {
 	cl := daemon.NewClient()
 	defer func() { _ = cl.Close() }()
-	resp, err := cl.Health()
-	return err == nil && resp.OK && resp.Version == wantVersion
+	resp, err := cl.HealthContext(ctx)
+	if err != nil {
+		return err
+	}
+	if !resp.OK || resp.Version != wantVersion {
+		return fmt.Errorf("daemon identity is not exact: ready=%t build=%q, want build=%q", resp.OK, resp.Version, wantVersion)
+	}
+	return nil
+}
+
+func waitForDaemonService(ctx context.Context, wantVersion string) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		lastErr = daemonHealth(ctx, wantVersion)
+		if lastErr == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(ctx.Err(), lastErr)
+		case <-ticker.C:
+		}
+	}
 }
 
 func waitDaemon(wantVersion string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if daemonAt(wantVersion) {
-			return true
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return false
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return waitForDaemonService(ctx, wantVersion) == nil
 }

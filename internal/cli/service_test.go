@@ -13,6 +13,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/service"
 )
 
@@ -169,6 +170,7 @@ func TestRunServiceInstallConvergesExactExecutableAgent(t *testing.T) {
 	executable := filepath.Join(t.TempDir(), "ccp")
 	swapVar(t, &serviceExecutable, func() (string, error) { return executable, nil })
 	holderReady := false
+	daemonReady := false
 	install := &testHolderServiceInstall{created: true}
 	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
 		holderReady = true
@@ -176,6 +178,16 @@ func TestRunServiceInstallConvergesExactExecutableAgent(t *testing.T) {
 	})
 	controller := &testDaemonServiceController{}
 	useDaemonServiceController(t, controller)
+	swapVar(t, &daemonServiceReady, func(_ context.Context, want string) error {
+		daemonReady = true
+		if want != version.String() {
+			t.Fatalf("daemon readiness build = %q, want %q", want, version.String())
+		}
+		if len(controller.desired) != 1 {
+			t.Fatal("daemon readiness checked before service convergence")
+		}
+		return nil
+	})
 	cmd, out, _ := uninstallCmd()
 	cmd.SetContext(t.Context())
 	if err := runServiceInstall(cmd); err != nil {
@@ -183,6 +195,9 @@ func TestRunServiceInstallConvergesExactExecutableAgent(t *testing.T) {
 	}
 	if !holderReady {
 		t.Fatal("daemon service converged before holder readiness")
+	}
+	if !daemonReady {
+		t.Fatal("service install returned before daemon readiness")
 	}
 	if len(controller.desired) != 1 || len(controller.desired[0]) != 1 {
 		t.Fatalf("desired = %+v", controller.desired)
@@ -200,6 +215,42 @@ func TestRunServiceInstallConvergesExactExecutableAgent(t *testing.T) {
 	}
 	if install.rollbackCalls != 0 {
 		t.Fatalf("successful install rollback calls = %d, want 0", install.rollbackCalls)
+	}
+}
+
+func TestRunServiceInstallFailsClosedWhenDaemonIsNotReady(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "ccp")
+	swapVar(t, &serviceExecutable, func() (string, error) { return executable, nil })
+	install := &testHolderServiceInstall{created: true}
+	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
+		return install, nil
+	})
+	controller := &testDaemonServiceController{}
+	useDaemonServiceController(t, controller)
+	holderStops := 0
+	swapVar(t, &stopHolder, func(context.Context) error {
+		holderStops++
+		return nil
+	})
+	want := errors.New("daemon health unavailable")
+	swapVar(t, &daemonServiceReady, func(context.Context, string) error { return want })
+	cmd, out, _ := uninstallCmd()
+	cmd.SetContext(t.Context())
+	err := runServiceInstall(cmd)
+	if !errors.Is(err, want) || !strings.Contains(err.Error(), "daemon readiness") {
+		t.Fatalf("error = %v, want daemon readiness failure", err)
+	}
+	if len(controller.desired) != 2 || controller.desired[1] != nil {
+		t.Fatalf("desired calls = %+v, want daemon install then empty rollback", controller.desired)
+	}
+	if holderStops != 1 || install.rollbackCalls != 0 || install.removeCalls != 0 {
+		t.Fatalf(
+			"holder stop/receipt rollback/remove calls = %d/%d/%d, want 1/0/0",
+			holderStops, install.rollbackCalls, install.removeCalls,
+		)
+	}
+	if strings.Contains(stripANSI(out.String()), "Installed and started") {
+		t.Fatalf("claimed install success: %q", out.String())
 	}
 }
 
