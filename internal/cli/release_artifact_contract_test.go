@@ -7,6 +7,11 @@ import (
 	"testing"
 )
 
+const (
+	releaseAppWorkflowPin = "8f422c652d836c40f9cc5a9d893d4120b26bc681"
+	releaseActionPin      = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
+)
+
 func TestReleaseCLIFailsClosedBeforeArtifactPublication(t *testing.T) {
 	release := readReleaseArtifactContract(t, ".github", "workflows", "release.yml")
 	require := strings.Index(release, "Require CLI signing and notarization secrets")
@@ -106,7 +111,7 @@ func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
 	if !strings.Contains(release, "permissions:\n  contents: read") {
 		t.Fatal("release workflow does not default non-owner jobs to read-only contents")
 	}
-	if !strings.Contains(release, "release-app.yml@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9") {
+	if !strings.Contains(release, "release-app.yml@"+releaseAppWorkflowPin) {
 		t.Fatal("release workflow is not pinned to the caller-owned staging contract")
 	}
 	appJob := strings.Index(release, "\n  release-app:")
@@ -161,9 +166,15 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 		t.Fatal("tap transaction assesses a raw Mach-O binary as an application bundle")
 	}
 	for _, line := range strings.Split(release, "\n") {
-		if strings.Contains(line, "yasyf/homebrew-tap/") &&
-			!strings.Contains(line, "@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9") {
-			t.Fatalf("release uses a mixed or mutable homebrew-tap reference: %s", line)
+		switch {
+		case strings.Contains(line, "yasyf/homebrew-tap/.github/workflows/release-app.yml@"):
+			if !strings.Contains(line, "@"+releaseAppWorkflowPin) {
+				t.Fatalf("release-app uses a mixed or mutable workflow reference: %s", line)
+			}
+		case strings.Contains(line, "yasyf/homebrew-tap/.github/actions/"):
+			if !strings.Contains(line, "@"+releaseActionPin) {
+				t.Fatalf("release uses a mixed or mutable action reference: %s", line)
+			}
 		}
 	}
 }
