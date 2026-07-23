@@ -327,7 +327,7 @@ func TestMaterializeHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
-	if res.Deferred || res.FileFallback || res.Bootstrapped {
+	if res.Deferred || res.Bootstrapped {
 		t.Fatalf("result flags = %+v, want all false on the keychain happy path", res)
 	}
 	if res.UUID != "u-happy" || res.AccountID != 1 {
@@ -544,10 +544,7 @@ func TestMaterializeSeedNoSourceBootstraps(t *testing.T) {
 	}
 }
 
-// TestMaterializeKeychainUnavailableFallsBackToFile pins carry-forward #1: an
-// unsearchable login Keychain routes the credential to the plaintext file store,
-// and the fallback is surfaced on the result (not merely logged).
-func TestMaterializeKeychainUnavailableFallsBackToFile(t *testing.T) {
+func TestMaterializeKeychainUnavailableFailsClosed(t *testing.T) {
 	s, m, fk, _ := newMaterializeService(t)
 	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -558,37 +555,27 @@ func TestMaterializeKeychainUnavailableFallsBackToFile(t *testing.T) {
 
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-file","emailAddress":"file@example.com"}`)
 	res, err := s.Materialize(context.Background(), materializeVal("u-file", "file@example.com", oauthAccount), []string{"hostB"}, pullConst(freshEnvelope("at-f")), materializeManifest)
-	if err != nil {
-		t.Fatalf("Materialize: %v", err)
-	}
-	if !res.FileFallback {
-		t.Fatalf("result = %+v, want FileFallback true when the keychain is unavailable", res)
+	if !errors.Is(err, pool.ErrCredentialUnverifiable) {
+		t.Fatalf("Materialize error = %v, want ErrCredentialUnverifiable", err)
 	}
 	if res.AccountID != 1 {
-		t.Fatalf("result = %+v, want a completed acct 1", res)
+		t.Fatalf("result = %+v, want durable awaiting-origin acct 1", res)
 	}
 
 	configDir := materializePresentationPath(1)
-	if _, err := os.Stat(creds.FileCredentialPath(pool.AccountBackingDir(1))); err != nil {
-		t.Fatalf("file credential not written: %v", err)
-	}
-	// No keychain item was written (the fallback avoided it).
 	if _, ok := fk.Get(creds.ServiceName(configDir), creds.AccountLabel()); ok {
-		t.Fatal("keychain item present, want none on the file-fallback path")
+		t.Fatal("keychain item present after failed install")
 	}
 	row, err := m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotCred, src, err := m.ReadCredential(t.Context(), row)
+	health, err := m.Store.GetAuthHealth(row.ID)
 	if err != nil {
-		t.Fatalf("ReadCredential: %v", err)
+		t.Fatal(err)
 	}
-	if src != creds.SourceFile {
-		t.Fatalf("credential source = %v, want file", src)
-	}
-	if gotCred.ClaudeAiOauth.AccessToken != "at-f" {
-		t.Fatalf("installed credential = %+v, want the pulled at-f", gotCred.ClaudeAiOauth)
+	if !health.NeedsLogin || health.Kind != store.AuthKindAwaitingOrigin {
+		t.Fatalf("auth health = %+v, want awaiting origin", health)
 	}
 	if row.AccountUUID != "u-file" {
 		t.Fatalf("row AccountUUID = %q, want u-file", row.AccountUUID)

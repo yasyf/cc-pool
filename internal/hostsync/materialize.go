@@ -25,9 +25,6 @@ type MaterializeResult struct {
 	UUID string
 	// AccountID is the new pool row's account index, or 0 when Deferred.
 	AccountID int
-	// FileFallback is true when the credential landed in the plaintext file
-	// store because the login Keychain was unsearchable.
-	FileFallback bool
 	// Bootstrapped is true when a minimal private .claude.json had to be
 	// written first (no ~/.claude.json to seed from).
 	Bootstrapped bool
@@ -166,7 +163,7 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	if !installed {
 		return durable, fmt.Errorf("materialize %s: access-only credential did not land", v.UUID)
 	}
-	credential, source, err := s.M.ReadCredential(ctx, *acct)
+	credential, _, err := s.M.ReadCredential(ctx, *acct)
 	if err != nil {
 		return durable, fmt.Errorf("materialize %s: read installed credential: %w", v.UUID, err)
 	}
@@ -174,7 +171,6 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		creds.AccessHash(credential) != creds.AccessHash(env) {
 		return durable, fmt.Errorf("materialize %s: installed credential violates origin policy", v.UUID)
 	}
-	durable.FileFallback = source == creds.SourceFile
 	if _, _, _, err := s.M.SampleUsage(ctx, *acct, pool.SampleOpts{AllowRefresh: false}); err != nil {
 		return durable, fmt.Errorf("materialize %s: validate access-only credential: %w", v.UUID, err)
 	}
@@ -248,15 +244,15 @@ func (s *Service) slotRetainsCredential(
 	if err != nil {
 		return false, err
 	}
-	for _, st := range s.M.Creds.Stores(acct) {
-		_, err := st.Read(ctx)
-		switch creds.ClassifyRead(err) {
-		case creds.ReadEmpty:
-		case creds.ReadUnsearchable, creds.ReadFatal:
-			return false, fmt.Errorf("probe retained credential in %s: %w", st, err)
-		case creds.ReadPresent:
-			return true, nil
-		}
+	st := s.M.Creds.Store(acct, creds.SourceKeychain)
+	_, err = st.Read(ctx)
+	switch creds.ClassifyRead(err) {
+	case creds.ReadEmpty:
+		return false, nil
+	case creds.ReadUnsearchable, creds.ReadFatal:
+		return false, fmt.Errorf("probe retained credential in %s: %w", st, err)
+	case creds.ReadPresent:
+		return true, nil
 	}
-	return false, nil
+	panic("unreachable")
 }

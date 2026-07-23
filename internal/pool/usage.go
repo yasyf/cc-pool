@@ -88,28 +88,13 @@ type freshTokenResult struct {
 	RefreshAttempted bool
 }
 
-// ReadCredential resolves a's credential from whichever backend holds it, reading
-// every candidate store (the Keychain claude prefers, then the plaintext
-// .credentials.json). On drift ownership then freshness decides (see credOutranks) and
-// its Source is returned. When every store misses, creds.ErrUnavailable outranks
-// creds.ErrNotFound. See ccn doc 935d323.
+// ReadCredential reads the account's canonical Keychain item.
 func (m *Manager) ReadCredential(
 	ctx context.Context,
 	a store.Account,
 ) (*creds.Credential, creds.Source, error) {
-	probes, win, err := m.probeCredentialStores(ctx, a)
-	if err != nil {
-		return nil, creds.SourceKeychain, err
-	}
-	if win != nil {
-		return win.cred, win.store.Source(), nil
-	}
-	for _, p := range probes {
-		if errors.Is(p.err, creds.ErrUnavailable) {
-			return nil, creds.SourceKeychain, p.err
-		}
-	}
-	return nil, creds.SourceKeychain, fmt.Errorf("no credential in the Keychain or credential file: %w", creds.ErrNotFound)
+	credential, err := m.Creds.Store(a, creds.SourceKeychain).Read(ctx)
+	return credential, creds.SourceKeychain, err
 }
 
 // writeObservedCredential stages publication before crossing the journal fence,

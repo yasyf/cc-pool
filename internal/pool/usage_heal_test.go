@@ -3,10 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -87,25 +84,17 @@ func TestEnsureFreshTokenHealsRefreshOnlyBlob(t *testing.T) {
 func TestEnsureFreshTokenRefreshOnlyRevoked(t *testing.T) {
 	fk := credstest.NewFake()
 	m, a := newHealManager(t, fk, fakeOAuthRevoked{})
-	blob := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"","refreshToken":"rt-dead","expiresAt":%d,"subscriptionType":"max"}}`,
-		time.Now().Add(time.Hour).UnixMilli())
-	if err := os.WriteFile(creds.FileCredentialPath(a.ConfigDir), []byte(blob), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	dead := refreshOnly("rt-dead", time.Now().Add(time.Hour))
+	dead.ClaudeAiOauth.SubscriptionType = "max"
+	fk.Put(a.KeychainService, a.KeychainAccount, dead)
 
 	_, _, err := m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
 	if !errors.Is(err, ErrNeedsLogin) {
 		t.Fatalf("err = %v, want ErrNeedsLogin", err)
 	}
-	raw, err := os.ReadFile(creds.FileCredentialPath(a.ConfigDir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), "refreshToken") || strings.Contains(string(raw), "rt-dead") {
-		t.Fatalf("stored blob still carries the dead refresh token: %s", raw)
-	}
-	if _, rerr := credstest.FileStore(a.ConfigDir).Read(t.Context()); !errors.Is(rerr, creds.ErrNoTokens) {
-		t.Fatalf("stripped blob reads back as %v, want the ErrNoTokens tombstone", rerr)
+	stripped, ok := fk.Get(a.KeychainService, a.KeychainAccount)
+	if !ok || stripped.HasRefreshToken() || stripped.ClaudeAiOauth.AccessToken != "" {
+		t.Fatalf("stored credential = %+v, want tokenless", stripped)
 	}
 	_, _, err = m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
 	if !errors.Is(err, ErrNeedsLogin) || !errors.Is(err, creds.ErrNoTokens) {
@@ -214,24 +203,15 @@ func TestPreflightInvalidGrantStripsRefreshToken(t *testing.T) {
 	spent.ClaudeAiOauth.RefreshToken = "rt-spent"
 	spent.ClaudeAiOauth.ExpiresAt = time.Now().Add(-time.Minute).UnixMilli()
 	spent.ClaudeAiOauth.SubscriptionType = "max"
-	if err := credstest.FileStore(a.ConfigDir).Write(t.Context(), spent); err != nil {
-		t.Fatal(err)
-	}
+	fk.Put(a.KeychainService, a.KeychainAccount, spent)
 
 	_, _, err := m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)
 	if !errors.Is(err, ErrNeedsLogin) {
 		t.Fatalf("err = %v, want ErrNeedsLogin", err)
 	}
-	raw, err := os.ReadFile(creds.FileCredentialPath(a.ConfigDir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), "refreshToken") {
-		t.Fatalf("stripped blob bytes still carry a refreshToken key: %s", raw)
-	}
-	got, rerr := credstest.FileStore(a.ConfigDir).Read(t.Context())
-	if rerr != nil {
-		t.Fatalf("read stripped blob back: %v", rerr)
+	got, ok := fk.Get(a.KeychainService, a.KeychainAccount)
+	if !ok {
+		t.Fatal("stripped Keychain credential is missing")
 	}
 	if !got.Synced() {
 		t.Fatalf("stored blob = %+v, want the synced shape", got.ClaudeAiOauth)
@@ -433,10 +413,7 @@ func TestFetchUsageRotationUnderfootBlocksStrip(t *testing.T) {
 func TestSampleUsageTokenlessFlagsNeedsLogin(t *testing.T) {
 	fk := credstest.NewFake()
 	m, a := newHealManager(t, fk, &fakeOAuth{})
-	tombstone := `{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"scopes":["user:inference"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}}`
-	if err := os.WriteFile(creds.FileCredentialPath(a.ConfigDir), []byte(tombstone), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	fk.KeychainFaults = credstest.Faults{Read: creds.ErrNoTokens}
 
 	_, rateLimited, _, err := m.SampleUsage(context.Background(), a, SampleOpts{AllowRefresh: true})
 	if !errors.Is(err, ErrNeedsLogin) {
@@ -478,14 +455,14 @@ func TestEnsureFreshTokenClassification(t *testing.T) {
 	cases := []struct {
 		name         string
 		kcReadFault  error
-		fileDeadBlob bool
+		tokenless    bool
 		wantErrIs    []error
 		wantNotErrIs []error
 	}{
 		{
-			name:         "tokenless blob flags needs-login and names no-tokens",
-			fileDeadBlob: true,
-			wantErrIs:    []error{ErrNeedsLogin, creds.ErrNoTokens},
+			name:      "tokenless blob flags needs-login and names no-tokens",
+			tokenless: true,
+			wantErrIs: []error{ErrNeedsLogin, creds.ErrNoTokens},
 		},
 		{
 			name:         "unsearchable keychain is not needs-login",
@@ -509,10 +486,8 @@ func TestEnsureFreshTokenClassification(t *testing.T) {
 			fk := credstest.NewFake()
 			fk.KeychainFaults = credstest.Faults{Read: tc.kcReadFault}
 			m, a := newHealManager(t, fk, &fakeOAuth{})
-			if tc.fileDeadBlob {
-				if err := os.WriteFile(creds.FileCredentialPath(a.ConfigDir), []byte(`{"claudeAiOauth":{}}`), 0o600); err != nil {
-					t.Fatal(err)
-				}
+			if tc.tokenless {
+				fk.KeychainFaults = credstest.Faults{Read: creds.ErrNoTokens}
 			}
 
 			_, _, err := m.EnsureFreshToken(context.Background(), a, RefreshLeadTime, true)

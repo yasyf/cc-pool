@@ -79,11 +79,9 @@ func NewManager(
 		return nil, errors.New("worker authority kind does not match process ownership")
 	}
 	manager := &Manager{
-		Store: st,
-		OAuth: refresher,
-		Creds: sysCredentials{
-			runner: authority.runner, workerExecutable: authority.executable,
-		},
+		Store:            st,
+		OAuth:            refresher,
+		Creds:            sysCredentials{runner: authority.runner},
 		ScanSessions:     scanSessions,
 		workerAuthority:  &authority,
 		taskRunner:       authority.runner,

@@ -213,11 +213,7 @@ func RunCredentialCASWorker(
 	}()
 
 	runner := credentialCASDirectRunner{}
-	executable, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	stores := credentialCASStores(request, runner, executable)
+	stores := credentialCASStores(request, runner)
 	before, err := observeCredentialCASState(ctx, stores)
 	if err != nil {
 		return WriteCredentialCASResponse(output, CredentialCASResponse{ErrorCode: "io", Error: err.Error()})
@@ -236,10 +232,6 @@ func RunCredentialCASWorker(
 	if request.DeleteTarget {
 		beforeTarget := before.Keychain
 		beforeOther := before.File
-		if request.Source == creds.SourceFile {
-			beforeTarget = before.File
-			beforeOther = before.Keychain
-		}
 		if beforeTarget.State != store.CredentialSlotPresent {
 			return WriteCredentialCASResponse(output, CredentialCASResponse{
 				Before: before, After: before, ErrorCode: "conflict",
@@ -259,10 +251,6 @@ func RunCredentialCASWorker(
 		}
 		afterTarget := after.Keychain
 		afterOther := after.File
-		if request.Source == creds.SourceFile {
-			afterTarget = after.File
-			afterOther = after.Keychain
-		}
 		if afterTarget.State != store.CredentialSlotEmpty ||
 			!sameCredentialCASSlot(beforeOther, afterOther) {
 			return WriteCredentialCASResponse(output, CredentialCASResponse{
@@ -291,11 +279,6 @@ func RunCredentialCASWorker(
 	written := afterWrite.Keychain
 	unchanged := before.File
 	actualUnchanged := afterWrite.File
-	if request.Source == creds.SourceFile {
-		written = afterWrite.File
-		unchanged = before.Keychain
-		actualUnchanged = afterWrite.Keychain
-	}
 	if written.State != store.CredentialSlotPresent || written.Digest == nil ||
 		*written.Digest != wantDigest || !sameCredentialCASSlot(unchanged, actualUnchanged) {
 		return WriteCredentialCASResponse(output, CredentialCASResponse{
@@ -303,42 +286,7 @@ func RunCredentialCASWorker(
 			Error: "credential CAS write verification failed",
 		})
 	}
-	if !request.DeleteOther {
-		return WriteCredentialCASResponse(output, CredentialCASResponse{Before: before, After: afterWrite})
-	}
-	source := otherSource(request.Source)
-	if err := stores[source].Delete(ctx); err != nil {
-		rollbackErr := rollbackCredentialCASTarget(ctx, stores[request.Source], request.RollbackTarget)
-		afterRollback, observeErr := observeCredentialCASState(ctx, stores)
-		return WriteCredentialCASResponse(output, CredentialCASResponse{
-			Before: before, After: afterRollback, ErrorCode: "io",
-			Error: errors.Join(
-				fmt.Errorf("delete credential CAS source: %w", err),
-				rollbackErr,
-				observeErr,
-			).Error(),
-		})
-	}
-	after, err := observeCredentialCASState(ctx, stores)
-	if err != nil {
-		return WriteCredentialCASResponse(output, CredentialCASResponse{
-			Before: before, ErrorCode: "io", Error: err.Error(),
-		})
-	}
-	written = after.Keychain
-	deleted := after.File
-	if request.Source == creds.SourceFile {
-		written = after.File
-		deleted = after.Keychain
-	}
-	if written.State != store.CredentialSlotPresent || written.Digest == nil ||
-		*written.Digest != wantDigest || deleted.State != store.CredentialSlotEmpty {
-		return WriteCredentialCASResponse(output, CredentialCASResponse{
-			Before: before, After: after, ErrorCode: "io",
-			Error: "credential CAS move verification failed",
-		})
-	}
-	return WriteCredentialCASResponse(output, CredentialCASResponse{Before: before, After: after})
+	return WriteCredentialCASResponse(output, CredentialCASResponse{Before: before, After: afterWrite})
 }
 
 func refreshCredentialCAS(
@@ -395,11 +343,6 @@ func refreshCredentialCAS(
 	written := after.Keychain
 	unchanged := before.File
 	actualUnchanged := after.File
-	if request.Source == creds.SourceFile {
-		written = after.File
-		unchanged = before.Keychain
-		actualUnchanged = after.Keychain
-	}
 	wantDigest := store.CredentialDigest(sha256.Sum256(payload))
 	if written.State != store.CredentialSlotPresent || written.Digest == nil ||
 		*written.Digest != wantDigest || !sameCredentialCASSlot(unchanged, actualUnchanged) {
@@ -448,11 +391,8 @@ func deleteAllCredentialCAS(
 			Error: "credential CAS delete-all state is not exactly readable",
 		})
 	}
-	for _, source := range []creds.Source{creds.SourceKeychain, creds.SourceFile} {
-		if credentialSourceSlot(before, source).State == store.CredentialSlotEmpty {
-			continue
-		}
-		if err := stores[source].Delete(ctx); err != nil {
+	if before.Keychain.State != store.CredentialSlotEmpty {
+		if err := stores[creds.SourceKeychain].Delete(ctx); err != nil {
 			after, observeErr := observeCredentialCASState(ctx, stores)
 			return WriteCredentialCASResponse(output, CredentialCASResponse{
 				Before: before, After: after, ErrorCode: "io",
@@ -475,27 +415,6 @@ func deleteAllCredentialCAS(
 	return WriteCredentialCASResponse(output, CredentialCASResponse{Before: before, After: after})
 }
 
-func rollbackCredentialCASTarget(
-	ctx context.Context,
-	target creds.Store,
-	rollbackPayload []byte,
-) error {
-	if len(rollbackPayload) == 0 {
-		if err := target.Delete(ctx); err != nil && !errors.Is(err, creds.ErrNotFound) {
-			return fmt.Errorf("delete credential CAS rollback target: %w", err)
-		}
-		return nil
-	}
-	var credential creds.Credential
-	if err := json.Unmarshal(rollbackPayload, &credential); err != nil {
-		return errors.New("credential CAS rollback payload is invalid")
-	}
-	if err := target.Write(ctx, &credential); err != nil {
-		return fmt.Errorf("restore credential CAS rollback target: %w", err)
-	}
-	return nil
-}
-
 func sameCredentialCASSlot(
 	left, right store.CredentialSlotObservation,
 ) bool {
@@ -508,15 +427,10 @@ func sameCredentialCASSlot(
 func credentialCASStores(
 	request CredentialCASRequest,
 	runner creds.TaskRunner,
-	executable string,
 ) map[creds.Source]creds.Store {
 	return map[creds.Source]creds.Store{
 		creds.SourceKeychain: creds.KeychainItem{
 			Service: request.KeychainService, Account: request.KeychainAccount, Runner: runner,
-		},
-		creds.SourceFile: creds.FileStore{
-			ConfigDir: AccountBackingDir(request.AccountID),
-			Runner:    runner, WorkerExecutable: executable,
 		},
 	}
 }
@@ -525,17 +439,13 @@ func observeCredentialCASState(
 	ctx context.Context,
 	stores map[creds.Source]creds.Store,
 ) (store.CredentialExternalState, error) {
-	var state store.CredentialExternalState
-	for _, source := range []creds.Source{creds.SourceKeychain, creds.SourceFile} {
-		slot, err := observeCredentialCASSlot(ctx, stores[source])
-		if err != nil {
-			return store.CredentialExternalState{}, err
-		}
-		if source == creds.SourceKeychain {
-			state.Keychain = slot
-		} else {
-			state.File = slot
-		}
+	slot, err := observeCredentialCASSlot(ctx, stores[creds.SourceKeychain])
+	if err != nil {
+		return store.CredentialExternalState{}, err
+	}
+	state := store.CredentialExternalState{
+		Keychain: slot,
+		File:     store.CredentialSlotObservation{State: store.CredentialSlotEmpty},
 	}
 	if _, err := state.Digest(); err != nil {
 		return store.CredentialExternalState{}, err
@@ -578,8 +488,8 @@ func validateCredentialCASRequest(request CredentialCASRequest) error {
 		request.KeychainAccount == "" || filepath.Base(request.KeychainAccount) != request.KeychainAccount {
 		return errors.New("credential CAS Keychain identity is not canonical")
 	}
-	if request.Source != creds.SourceKeychain && request.Source != creds.SourceFile {
-		return errors.New("credential CAS source is invalid")
+	if request.Source != creds.SourceKeychain {
+		return errors.New("credential CAS source must be the Keychain")
 	}
 	modes := 0
 	if len(request.Credential) != 0 {
@@ -594,7 +504,7 @@ func validateCredentialCASRequest(request CredentialCASRequest) error {
 	if request.Refresh {
 		modes++
 	}
-	if modes != 1 || request.DeleteOther && (request.DeleteTarget || request.DeleteAll || request.Refresh) {
+	if modes != 1 || request.DeleteOther {
 		return errors.New("credential CAS mutation mode is invalid")
 	}
 	if request.Refresh != (request.UserAgent != "") {
@@ -608,35 +518,11 @@ func validateCredentialCASRequest(request CredentialCASRequest) error {
 	if len(request.Credential) > credentialCASWorkerMaxIO {
 		return errors.New("credential CAS payload is invalid")
 	}
-	if !request.DeleteOther && len(request.RollbackTarget) != 0 {
-		return errors.New("credential CAS rollback requires a move")
-	}
-	if len(request.RollbackTarget) > credentialCASWorkerMaxIO {
-		return errors.New("credential CAS rollback payload is invalid")
+	if len(request.RollbackTarget) != 0 {
+		return errors.New("credential CAS rollback is unsupported")
 	}
 	if _, err := request.Expected.Digest(); err != nil {
 		return err
-	}
-	if request.DeleteOther {
-		wantDigest := store.CredentialDigest(sha256.Sum256(request.Credential))
-		source := request.Expected.Keychain
-		target := request.Expected.File
-		if request.Source == creds.SourceKeychain {
-			source = request.Expected.File
-			target = request.Expected.Keychain
-		}
-		if source.State != store.CredentialSlotPresent || source.Digest == nil ||
-			*source.Digest != wantDigest {
-			return errors.New("credential CAS move source does not match its payload")
-		}
-		if target.State == store.CredentialSlotPresent {
-			if target.Digest == nil || len(request.RollbackTarget) == 0 ||
-				store.CredentialDigest(sha256.Sum256(request.RollbackTarget)) != *target.Digest {
-				return errors.New("credential CAS move rollback does not match its target")
-			}
-		} else if len(request.RollbackTarget) != 0 {
-			return errors.New("credential CAS move rollback targets an empty slot")
-		}
 	}
 	return validateCredentialLockDirectory(request.ConfigDir)
 }
@@ -681,9 +567,6 @@ func decodeCredentialCASJSON(input io.Reader, value any) error {
 type credentialCASDirectRunner struct{}
 
 func (credentialCASDirectRunner) Run(ctx context.Context, task supervise.Task) error {
-	if creds.IsFileWorkerInvocation(task.Args) {
-		return creds.RunFileWorker(ctx, task.Stdin, task.Stdout)
-	}
 	if task.Path == "" {
 		return errors.New("credential CAS nested task has no executable")
 	}

@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"os"
@@ -276,90 +275,6 @@ func TestHostSyncWorkerDeadlineKillsReapsAndReusesLane(t *testing.T) {
 // TestExecPeerRoundTripThroughWiredFetcher proves the exec: peer convention
 // end to end through the PRODUCTION dial path: a second wired daemon serves
 // its registry and credential, reached via `exec:nc -U <sock>`.
-func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
-	t.Setenv("CCP_SYNC_EXEC_PEER", "1") // exec: peers are sim-only; enable for this test
-	// Peer B: a fully wired server with one synced account and its credential.
-	b, ctxB := newWireServer(t)
-	if err := b.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
-		t.Fatal(err)
-	}
-	credB := &creds.Credential{}
-	credB.ClaudeAiOauth.AccessToken = "at-peer"
-	credB.ClaudeAiOauth.RefreshToken = "rt-peer"
-	credB.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
-	acctB := store.Account{
-		ID: 9, ConfigDir: pool.AccountDir(9),
-		KeychainService: creds.ServiceName(pool.AccountDir(9)),
-		KeychainAccount: "me", AccountUUID: "u9",
-	}
-	if err := b.m.Store.UpsertAccount(acctB); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(acctB.ConfigDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(pool.AccountBackingDir(acctB.ID), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeFileCredentialForTest(pool.AccountBackingDir(acctB.ID), credB); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.setupSync(ctxB); err != nil {
-		t.Fatalf("setupSync(B): %v", err)
-	}
-	// The holder IS the exec: peer, so the holder-first dial exercises the
-	// production transport without ever touching real ssh.
-	peer := "exec:nc -U " + b.syncSocket
-	chain := hostsync.ChainStamp{
-		Origin:    peer,
-		ExpiresAt: credB.ClaudeAiOauth.ExpiresAt,
-		Hash:      creds.AccessHash(credB),
-		RotatedAt: time.Now().UnixMilli(),
-	}
-	svcB := wiredService(t, b)
-	if err := svcB.PublishAccount(ctxB, hostsync.AccountValue{UUID: "u9", Email: "b@x.com", Chain: chain}); err != nil {
-		t.Fatalf("publish on B: %v", err)
-	}
-
-	if err := syncservice.WithTransportRunner(ctxB, func(runner syncservice.TransportRunner) error {
-		fetcher, err := hostsync.NewSSHFetcher(runner)
-		if err != nil {
-			return err
-		}
-		reg, err := fetcher.Fetch(ctxB, peer)
-		if err != nil {
-			return fmt.Errorf("Fetch via exec peer: %w", err)
-		}
-		entry, ok := reg["u9"]
-		if !ok || !entry.Present() {
-			t.Fatalf("fetched registry missing u9: %+v", reg)
-		}
-		if entry.Value.Chain != chain {
-			t.Fatalf("fetched chain = %+v, want %+v", entry.Value.Chain, chain)
-		}
-
-		dial := func(peer string) syncservice.Transport {
-			return hostsync.PeerTransport(runner, peer)
-		}
-		got, err := hostsync.FetchCredential(ctxB, dial, "u9", chain, 0, []string{peer})
-		if err != nil {
-			return fmt.Errorf("FetchCredential via exec peer: %w", err)
-		}
-		// The origin strips the refresh token from the envelope: the peer gets an
-		// access-token-only synced copy, never the long-lived secret.
-		if got.ClaudeAiOauth.AccessToken != "at-peer" || got.ClaudeAiOauth.RefreshToken != "" {
-			t.Fatalf("pulled credential = %+v, want the peer's access token with the refresh token stripped", got.ClaudeAiOauth)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestAuthKindClassification pins the persist-time needs-login classification:
-// this host is owned, an exact mesh peer is awaiting-origin, and missing or
-// foreign origin provenance fails closed. Missing entries, uuid-less accounts,
-// and disabled sync are locally owned.
 func TestAuthKindClassification(t *testing.T) {
 	s, ctx := newWireServer(t)
 	writeWireMeshState(t, "host-self", []string{"peer-b"})

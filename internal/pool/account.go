@@ -128,32 +128,22 @@ func (m *Manager) FinalizeAdd(ctx context.Context, pending *PendingAdd, label st
 		ConfigDir:  pending.ConfigDir, KeychainService: pending.KeychainService,
 		Label: label, CreatedAt: time.Now(),
 	}
-	source := creds.SourceKeychain
 	keychainAccount, err := m.Creds.Discover(ctx, pending.KeychainService)
 	switch {
 	case err == nil:
 		account.KeychainAccount = keychainAccount
 	case errors.Is(err, creds.ErrNotFound):
-		if _, readErr := m.Creds.Store(account, creds.SourceFile).Read(ctx); readErr != nil {
-			if errors.Is(readErr, creds.ErrNotFound) {
-				return nil, fmt.Errorf("no credential found for %s", pending.ConfigDir)
-			}
-			return nil, readErr
-		}
-		account.KeychainAccount = creds.AccountLabel()
-		source = creds.SourceFile
+		return nil, fmt.Errorf("no Keychain credential found for %s", pending.ConfigDir)
 	default:
 		return nil, err
 	}
-	if source == creds.SourceKeychain {
-		item := m.Creds.Store(account, source)
-		credential, err := item.Read(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("re-assert keychain item: %w", err)
-		}
-		if err := item.Write(ctx, credential); err != nil {
-			return nil, fmt.Errorf("re-assert keychain item: %w", err)
-		}
+	item := m.Creds.Store(account, creds.SourceKeychain)
+	credential, err := item.Read(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("re-assert keychain item: %w", err)
+	}
+	if err := item.Write(ctx, credential); err != nil {
+		return nil, fmt.Errorf("re-assert keychain item: %w", err)
 	}
 	if err := m.Store.PromoteReservedAccount(pending.Reservation, account); err != nil {
 		return nil, fmt.Errorf("finalize %s: %w", pending.ConfigDir, err)
@@ -236,7 +226,6 @@ func (m *Manager) AbandonAdd(ctx context.Context, pending *PendingAdd) error {
 		account.KeychainAccount = keychainAccount
 		result = m.Creds.Store(account, creds.SourceKeychain).Delete(ctx)
 	}
-	result = errors.Join(result, m.Creds.Store(account, creds.SourceFile).Delete(ctx))
 	result = errors.Join(result, m.removeAccountBacking(ctx, pending.Reservation.ID))
 	return errors.Join(result, m.Store.ReleaseAccountIndex(pending.Reservation))
 }
@@ -253,16 +242,6 @@ func (m *Manager) Remove(ctx context.Context, id int, deleteCredential bool) err
 	if m.Creds != nil {
 		if _, err := m.credentialMutationObservation(ctx, account); err != nil {
 			return fmt.Errorf("remove acct-%02d credential guard: %w", id, err)
-		}
-	}
-	if !deleteCredential {
-		_, source, err := m.ReadCredential(ctx, account)
-		switch {
-		case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrUnavailable):
-		case err != nil:
-			return fmt.Errorf("resolve acct-%02d credential backend: %w", id, err)
-		case source == creds.SourceFile:
-			return fmt.Errorf("cannot keep acct-%02d credential: it is stored in the private backing", id)
 		}
 	}
 	if err := m.removeAccountBacking(ctx, account.ID); err != nil {

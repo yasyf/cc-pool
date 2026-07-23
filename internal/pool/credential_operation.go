@@ -1,7 +1,6 @@
 package pool
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -9,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
@@ -1651,17 +1649,13 @@ func credentialSlotPresent(slot store.CredentialSlotObservation) bool {
 }
 
 func credentialStateReadable(state store.CredentialExternalState) bool {
-	for _, slot := range []store.CredentialSlotObservation{state.Keychain, state.File} {
-		if slot.State != store.CredentialSlotEmpty && slot.State != store.CredentialSlotPresent {
-			return false
-		}
-	}
-	return true
+	return (state.Keychain.State == store.CredentialSlotEmpty ||
+		state.Keychain.State == store.CredentialSlotPresent) &&
+		state.File.State == store.CredentialSlotEmpty
 }
 
 func credentialObservationHasPresent(state store.CredentialExternalState) bool {
-	return state.Keychain.State == store.CredentialSlotPresent ||
-		state.File.State == store.CredentialSlotPresent
+	return state.Keychain.State == store.CredentialSlotPresent
 }
 
 func credentialStateEmpty(state store.CredentialExternalState) bool {
@@ -1673,31 +1667,28 @@ func (m *Manager) credentialObservation(
 	ctx context.Context,
 	account store.Account,
 ) (store.CredentialExternalState, error) {
-	var result store.CredentialExternalState
-	for _, location := range m.Creds.Stores(account) {
-		slot := store.CredentialSlotObservation{}
-		credential, err := location.Read(ctx)
-		switch creds.ClassifyRead(err) {
-		case creds.ReadEmpty:
-			slot.State = store.CredentialSlotEmpty
-		case creds.ReadPresent:
-			raw, marshalErr := credential.Marshal()
-			if marshalErr != nil {
-				return store.CredentialExternalState{}, marshalErr
-			}
-			digest := store.CredentialDigest(sha256.Sum256(raw))
-			slot.State = store.CredentialSlotPresent
-			slot.Digest = &digest
-		case creds.ReadUnsearchable:
-			slot.State = store.CredentialSlotUnsearchable
-		case creds.ReadFatal:
-			slot.State = store.CredentialSlotUnreadable
+	location := m.Creds.Store(account, creds.SourceKeychain)
+	slot := store.CredentialSlotObservation{}
+	credential, err := location.Read(ctx)
+	switch creds.ClassifyRead(err) {
+	case creds.ReadEmpty:
+		slot.State = store.CredentialSlotEmpty
+	case creds.ReadPresent:
+		raw, marshalErr := credential.Marshal()
+		if marshalErr != nil {
+			return store.CredentialExternalState{}, marshalErr
 		}
-		if location.Source() == creds.SourceFile {
-			result.File = slot
-		} else {
-			result.Keychain = slot
-		}
+		digest := store.CredentialDigest(sha256.Sum256(raw))
+		slot.State = store.CredentialSlotPresent
+		slot.Digest = &digest
+	case creds.ReadUnsearchable:
+		slot.State = store.CredentialSlotUnsearchable
+	case creds.ReadFatal:
+		slot.State = store.CredentialSlotUnreadable
+	}
+	result := store.CredentialExternalState{
+		Keychain: slot,
+		File:     store.CredentialSlotObservation{State: store.CredentialSlotEmpty},
 	}
 	if _, err := result.Digest(); err != nil {
 		return store.CredentialExternalState{}, err
@@ -1757,42 +1748,17 @@ func (m *Manager) credentialTokenChainStateDigest(
 	ctx context.Context,
 	account store.Account,
 ) (*store.CredentialDigest, error) {
-	chains := make([]store.CredentialDigest, 0, 2)
-	for _, location := range m.Creds.Stores(account) {
-		credential, err := location.Read(ctx)
-		switch creds.ClassifyRead(err) {
-		case creds.ReadEmpty:
-			continue
-		case creds.ReadPresent:
-			chains = append(chains, credentialTokenChainDigest(credential))
-		default:
-			return nil, fmt.Errorf("read %s credential token chain: %w", location.Source(), err)
-		}
-	}
-	if len(chains) == 0 {
+	location := m.Creds.Store(account, creds.SourceKeychain)
+	credential, err := location.Read(ctx)
+	switch creds.ClassifyRead(err) {
+	case creds.ReadEmpty:
 		return nil, nil
-	}
-	sort.Slice(chains, func(i, j int) bool {
-		return bytes.Compare(chains[i][:], chains[j][:]) < 0
-	})
-	unique := chains[:1]
-	for _, chain := range chains[1:] {
-		if chain != unique[len(unique)-1] {
-			unique = append(unique, chain)
-		}
-	}
-	if len(unique) == 1 {
-		digest := unique[0]
+	case creds.ReadPresent:
+		digest := credentialTokenChainDigest(credential)
 		return &digest, nil
+	default:
+		return nil, fmt.Errorf("read Keychain credential token chain: %w", err)
 	}
-	hash := sha256.New()
-	_, _ = hash.Write([]byte("cc-pool:credential-token-chain-set:v1"))
-	for _, chain := range unique {
-		_, _ = hash.Write(chain[:])
-	}
-	var digest store.CredentialDigest
-	copy(digest[:], hash.Sum(nil))
-	return &digest, nil
 }
 
 func (m *Manager) credentialTokenChainStateAtObservation(

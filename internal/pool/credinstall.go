@@ -35,18 +35,12 @@ func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, 
 		return false, err
 	}
 	fingerprint := sha256.Sum256(raw)
-	target := store.CredentialTargetKeychain
-	if _, source, readErr := m.ReadCredential(ctx, a); readErr == nil {
-		target = credentialTarget(source)
-	} else if errors.Is(readErr, creds.ErrUnavailable) {
-		target = store.CredentialTargetFile
-	}
 	return runCredentialOperation(
 		ctx,
 		m,
 		a,
 		store.CredentialOperationInstallSynced,
-		installCredentialOperationCodec(target, store.CredentialDigest(fingerprint)),
+		installCredentialOperationCodec(store.CredentialTargetKeychain, store.CredentialDigest(fingerprint)),
 		func(ctx context.Context, boundary *credentialOperationBoundary) (bool, error) {
 			return m.installSyncedCredential(ctx, a, cred, boundary)
 		},
@@ -59,7 +53,7 @@ func (m *Manager) installSyncedCredential(
 	cred *creds.Credential,
 	boundary *credentialOperationBoundary,
 ) (bool, error) {
-	current, src, err := m.ReadCredential(ctx, a)
+	current, _, err := m.ReadCredential(ctx, a)
 	var prev *creds.Credential
 	switch {
 	case err == nil:
@@ -71,36 +65,10 @@ func (m *Manager) installSyncedCredential(
 		}
 		prev = current
 	case errors.Is(err, creds.ErrNotFound), errors.Is(err, creds.ErrNoTokens):
-		// No credential, or a claude tombstone: install to the resolved backend
-		// (writeObservedCredential re-verifies the slot is still empty before writing).
-	case errors.Is(err, creds.ErrUnavailable):
-		// No readable credential and the keychain is unsearchable (headless
-		// host); the re-check below retargets the write at the file store.
 	default:
 		return false, fmt.Errorf("%w: %w", ErrCredentialUnverifiable, err)
 	}
-	// The source re-read guards only src, so re-check every backend: owned
-	// anywhere wins outright; a backend not PROVEN not-owned fails closed.
-	// ErrUnavailable is installEnvelope's headless file fallback, not an
-	// abort — owned-before-synced resolution (credOutranks) means an owned
-	// chain surfacing there later still outranks the synced copy.
-	for _, s := range m.Creds.Stores(a) {
-		cur, rerr := s.Read(ctx)
-		switch creds.ClassifyRead(rerr) {
-		case creds.ReadEmpty:
-		case creds.ReadUnsearchable:
-			if prev == nil && s.Source() == src {
-				src = creds.SourceFile
-			}
-		case creds.ReadFatal:
-			return false, fmt.Errorf("%w: %s: %w", ErrCredentialUnverifiable, s, rerr)
-		case creds.ReadPresent:
-			if cur.HasRefreshToken() {
-				return false, nil
-			}
-		}
-	}
-	if err := m.writeObservedCredential(ctx, a, src, prev, cred, boundary); err != nil {
+	if err := m.writeObservedCredential(ctx, a, creds.SourceKeychain, prev, cred, boundary); err != nil {
 		if errors.Is(err, ErrCredentialChangedUnderfoot) {
 			return false, nil
 		}

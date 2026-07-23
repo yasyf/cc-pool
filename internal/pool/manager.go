@@ -64,28 +64,20 @@ type Credentials interface {
 // sysCredentials is the production Credentials: the account's own Keychain
 // item and the plaintext .credentials.json inside its config dir.
 type sysCredentials struct {
-	runner           creds.TaskRunner
-	workerExecutable string
+	runner creds.TaskRunner
 }
 
 func (c sysCredentials) Store(a store.Account, src creds.Source) creds.Store {
-	switch src {
-	case creds.SourceKeychain:
-		return creds.KeychainItem{
-			Service: a.KeychainService, Account: a.KeychainAccount, Runner: c.runner,
-		}
-	case creds.SourceFile:
-		return creds.FileStore{
-			ConfigDir:        AccountBackingDir(a.ID),
-			Runner:           c.runner,
-			WorkerExecutable: c.workerExecutable,
-		}
+	if src != creds.SourceKeychain {
+		panic(fmt.Sprintf("unknown credential source %d", src))
 	}
-	panic(fmt.Sprintf("unknown credential source %d", src))
+	return creds.KeychainItem{
+		Service: a.KeychainService, Account: a.KeychainAccount, Runner: c.runner,
+	}
 }
 
 func (c sysCredentials) Stores(a store.Account) []creds.Store {
-	return []creds.Store{c.Store(a, creds.SourceKeychain), c.Store(a, creds.SourceFile)}
+	return []creds.Store{c.Store(a, creds.SourceKeychain)}
 }
 
 func (c sysCredentials) Discover(ctx context.Context, service string) (string, error) {

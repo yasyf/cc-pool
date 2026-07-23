@@ -192,8 +192,8 @@ func (d *Driver) materialize(ctx context.Context, v AccountValue, peers []string
 	if res.Deferred {
 		return OutcomeDeferred, nil
 	}
-	d.svc.logf("hostsync: materialized %s as acct-%d (fileFallback=%v bootstrapped=%v)",
-		v.UUID, res.AccountID, res.FileFallback, res.Bootstrapped)
+	d.svc.logf("hostsync: materialized %s as acct-%d (bootstrapped=%v)",
+		v.UUID, res.AccountID, res.Bootstrapped)
 	return OutcomeMaterialized, nil
 }
 
