@@ -1402,15 +1402,12 @@ func pendingAddCompensationTestRequest(
 	mutationRequest := BeginAccountMutationRequest{
 		AccountID: reservation.ID, Kind: AccountMutationAdd,
 		AccountInstanceID: reservation.InstanceID, AccountGeneration: reservation.Generation,
-		LocatorDigest: locator, ExpectedCredentialDigest: expectedDigest,
-		IntentDigest: credentialOperationTestDigest("add-intent"), ConfigDir: configDir,
-		KeychainService: service, KeychainAccount: account,
-		Owner: credentialOperationTestOwner("add-owner"),
+		IntentDigest: credentialOperationTestDigest("add-intent"),
+		Owner:        credentialOperationTestOwner("add-owner"),
 	}
-	mutationRequest.OperationID, err = NewAccountMutationID(
+	mutationRequest.OperationID, err = NewPendingAddMutationID(
 		mutationRequest.AccountID, mutationRequest.AccountInstanceID,
-		mutationRequest.AccountGeneration, mutationRequest.Kind, mutationRequest.LocatorDigest,
-		mutationRequest.ExpectedCredentialDigest, mutationRequest.IntentDigest,
+		mutationRequest.AccountGeneration, mutationRequest.IntentDigest,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1419,8 +1416,14 @@ func pendingAddCompensationTestRequest(
 	if err != nil {
 		t.Fatal(err)
 	}
+	boundFence, err := s.BindAccountMutationPresentation(
+		begin.Active.Fence(), configDir, service, account, locator, expectedDigest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fence, err := s.MarkAccountMutationInputProvided(
-		begin.Active.Fence(), credentialOperationTestDigest("input"),
+		boundFence, credentialOperationTestDigest("input"),
 	)
 	if err != nil {
 		t.Fatal(err)

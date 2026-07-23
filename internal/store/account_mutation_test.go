@@ -27,10 +27,10 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 	}
 	request := accountMutationTestRequest(t, reservation, AccountMutationAdd)
 	begin, err := s.BeginAccountMutation(t.Context(), request)
-	if err != nil || !begin.Created || begin.Active == nil || begin.Active.State != AccountMutationAwaitingInput {
+	if err != nil || !begin.Created || begin.Active == nil || begin.Active.State != AccountMutationAwaitingPresentation {
 		t.Fatalf("begin = %+v err=%v", begin, err)
 	}
-	operation := *begin.Active
+	operation := bindAccountMutationTestPresentation(t, s, *begin.Active)
 	byKind, err := s.ActiveAccountMutationByKind(AccountMutationAdd)
 	if err != nil || byKind.OperationID != operation.OperationID {
 		t.Fatalf("active add lookup = %+v err=%v", byKind, err)
@@ -81,8 +81,8 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 		t.Fatal(err)
 	}
 	if account.InstanceID != reservation.InstanceID || account.Generation != reservation.Generation ||
-		account.ConfigDir != request.ConfigDir || account.KeychainService != request.KeychainService ||
-		account.KeychainAccount != request.KeychainAccount {
+		account.ConfigDir != operation.ConfigDir || account.KeychainService != operation.KeychainService ||
+		account.KeychainAccount != operation.KeychainAccount {
 		t.Fatalf("published account = %+v", account)
 	}
 	replay, err := s.BeginAccountMutation(t.Context(), request)
@@ -110,6 +110,35 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 	now = now.Add(credentialReceiptPostAckRetention + time.Minute)
 	if deleted, err := s.DeleteExpiredAccountMutationReceipts(1); err != nil || deleted != 1 {
 		t.Fatalf("receipt not collected after post-ack window: deleted=%d err=%v", deleted, err)
+	}
+}
+
+func TestCancelUnboundAccountMutationReleasesExactReservation(t *testing.T) {
+	s := openTest(t)
+	reservation, err := s.ReserveAccountIndex(credentialOperationTestOwner("registry-owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := accountMutationTestRequest(t, reservation, AccountMutationAdd)
+	begin, err := s.BeginAccountMutation(t.Context(), request)
+	if err != nil || begin.Active == nil || begin.Active.State != AccountMutationAwaitingPresentation {
+		t.Fatalf("begin = %+v err=%v", begin, err)
+	}
+	if err := s.CancelUnboundAccountMutation(begin.Active.Fence()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AccountMutation(request.OperationID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("canceled mutation remained active: %v", err)
+	}
+	replacement, err := s.ReserveAccountIndex(credentialOperationTestOwner("registry-owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.ID != reservation.ID || replacement.InstanceID == reservation.InstanceID {
+		t.Fatalf("reservation not released exactly: old=%+v replacement=%+v", reservation, replacement)
+	}
+	if err := s.CancelUnboundAccountMutation(begin.Active.Fence()); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("stale cancel = %v, want missing mutation", err)
 	}
 }
 
@@ -207,8 +236,9 @@ func TestRearmAccountMutationInputIsFencedAndLostResponseIdempotent(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	operation := bindAccountMutationTestPresentation(t, s, *begin.Active)
 	firstInput := credentialOperationTestDigest("first-input")
-	fence, err := s.MarkAccountMutationInputProvided(begin.Active.Fence(), firstInput)
+	fence, err := s.MarkAccountMutationInputProvided(operation.Fence(), firstInput)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +246,7 @@ func TestRearmAccountMutationInputIsFencedAndLostResponseIdempotent(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	rearmed, err := s.RearmAccountMutationInput(applying, begin.Active.ExpectedCredentialDigest)
+	rearmed, err := s.RearmAccountMutationInput(applying, operation.ExpectedCredentialDigest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,11 +261,11 @@ func TestRearmAccountMutationInputIsFencedAndLostResponseIdempotent(t *testing.T
 		mutation.InputDigest != firstInput || !reflect.DeepEqual(mutation.Fence(), rearmed) {
 		t.Fatalf("rearmed mutation = %+v", mutation)
 	}
-	replay, err := s.RearmAccountMutationInput(applying, begin.Active.ExpectedCredentialDigest)
+	replay, err := s.RearmAccountMutationInput(applying, operation.ExpectedCredentialDigest)
 	if err != nil || !reflect.DeepEqual(replay, rearmed) {
 		t.Fatalf("lost response replay = %+v err=%v want=%+v", replay, err, rearmed)
 	}
-	if _, err := s.RearmAccountMutationInput(rearmed, begin.Active.ExpectedCredentialDigest); !errors.Is(err, ErrAccountMutationState) {
+	if _, err := s.RearmAccountMutationInput(rearmed, operation.ExpectedCredentialDigest); !errors.Is(err, ErrAccountMutationState) {
 		t.Fatalf("awaiting-input rearm repeated with current fence: %v", err)
 	}
 	secondInput := credentialOperationTestDigest("second-input")
@@ -317,9 +347,10 @@ func TestAccountMutationCancellationIsPreBoundaryOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	operation := bindAccountMutationTestPresentation(t, s, *begin.Active)
 	receipt, err := s.ResolveAccountMutation(
-		begin.Active.Fence(), AccountMutationAborted,
-		begin.Active.ExpectedCredentialDigest, nil, now.Add(10*time.Minute),
+		operation.Fence(), AccountMutationAborted,
+		operation.ExpectedCredentialDigest, nil, now.Add(10*time.Minute),
 	)
 	if err != nil || receipt.Terminal != AccountMutationAborted || receipt.CredentialWritten {
 		t.Fatalf("awaiting-input abort = %+v err=%v", receipt, err)
@@ -459,8 +490,9 @@ func TestAccountRemovalWinsPublishSequenceAndForcesCompensation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	operation := bindAccountMutationTestPresentation(t, s, *begin.Active)
 	fence, err := s.MarkAccountMutationInputProvided(
-		begin.Active.Fence(), credentialOperationTestDigest("input"),
+		operation.Fence(), credentialOperationTestDigest("input"),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -529,9 +561,9 @@ func TestAccountRemovalWinsPublishSequenceAndForcesCompensation(t *testing.T) {
 		t.Fatalf("mutation did not replay removal-winner receipt: %+v err=%v", replay, err)
 	}
 	request.IntentDigest = credentialOperationTestDigest("new-intent")
-	request.OperationID, err = NewAccountMutationID(
+	request.OperationID, err = NewPendingAddMutationID(
 		request.AccountID, request.AccountInstanceID, request.AccountGeneration,
-		request.Kind, request.LocatorDigest, request.ExpectedCredentialDigest, request.IntentDigest,
+		request.IntentDigest,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -572,14 +604,12 @@ func TestQuarantinedAddSurvivesAckRestartAndResolvesExactly(t *testing.T) {
 	blocked := BeginAccountMutationRequest{
 		AccountID: mutation.AccountID, Kind: AccountMutationAdd,
 		AccountInstanceID: mutation.AccountInstanceID, AccountGeneration: mutation.AccountGeneration,
-		LocatorDigest: mutation.LocatorDigest, ExpectedCredentialDigest: mutation.ExpectedCredentialDigest,
 		IntentDigest: credentialOperationTestDigest("blocked-after-quarantine"),
-		ConfigDir:    mutation.ConfigDir, KeychainService: mutation.KeychainService,
-		KeychainAccount: mutation.KeychainAccount, Owner: mutation.Owner,
+		Owner:        mutation.Owner,
 	}
-	blocked.OperationID, err = NewAccountMutationID(
+	blocked.OperationID, err = NewPendingAddMutationID(
 		blocked.AccountID, blocked.AccountInstanceID, blocked.AccountGeneration,
-		blocked.Kind, blocked.LocatorDigest, blocked.ExpectedCredentialDigest, blocked.IntentDigest,
+		blocked.IntentDigest,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -751,22 +781,39 @@ func accountMutationTestRequest(
 	request := BeginAccountMutationRequest{
 		AccountID: reservation.ID, Kind: kind,
 		AccountInstanceID: reservation.InstanceID, AccountGeneration: reservation.Generation,
-		LocatorDigest:            credentialOperationTestDigest("locator"),
-		ExpectedCredentialDigest: credentialOperationTestDigest("expected"),
-		IntentDigest:             credentialOperationTestDigest("intent"),
-		ConfigDir:                "/tmp/account-mutation", KeychainService: "service",
-		KeychainAccount: "account", Label: "label", AccountUUID: "uuid",
+		IntentDigest: credentialOperationTestDigest("intent"),
+		Label:        "label", AccountUUID: "uuid",
 		Owner: credentialOperationTestOwner("registry-owner"),
 	}
-	operationID, err := NewAccountMutationID(
+	operationID, err := NewPendingAddMutationID(
 		request.AccountID, request.AccountInstanceID, request.AccountGeneration,
-		request.Kind, request.LocatorDigest, request.ExpectedCredentialDigest, request.IntentDigest,
+		request.IntentDigest,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request.OperationID = operationID
 	return request
+}
+
+func bindAccountMutationTestPresentation(
+	t *testing.T,
+	s *Store,
+	mutation AccountMutation,
+) AccountMutation {
+	t.Helper()
+	_, err := s.BindAccountMutationPresentation(
+		mutation.Fence(), "/File Provider/CCPool/account", "service", "account",
+		credentialOperationTestDigest("locator"), credentialOperationTestDigest("expected"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := s.AccountMutation(mutation.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bound
 }
 
 func existingAccountMutationTestRequest(

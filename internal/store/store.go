@@ -68,7 +68,7 @@ CREATE TABLE account_mutations (
   operation_id               BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
   account_id                 INTEGER NOT NULL UNIQUE CHECK(account_id > 0),
   kind                       TEXT NOT NULL CHECK(kind IN ('add','relogin','sync-install')),
-  state                      TEXT NOT NULL CHECK(state IN ('awaiting-input','reserved','applying','applied','publishing','compensating')),
+  state                      TEXT NOT NULL CHECK(state IN ('awaiting-presentation','awaiting-input','reserved','applying','applied','publishing','compensating')),
   registry_sequence          INTEGER NOT NULL CHECK(registry_sequence > 0),
   account_instance_id        TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation         INTEGER NOT NULL CHECK(account_generation > 0),
@@ -78,15 +78,19 @@ CREATE TABLE account_mutations (
   input_digest               BLOB CHECK(input_digest IS NULL OR length(input_digest) = 32),
   written_credential_digest  BLOB NOT NULL DEFAULT (zeroblob(32)) CHECK(length(written_credential_digest) = 32),
   credential_written         INTEGER NOT NULL DEFAULT 0 CHECK(credential_written IN (0,1)),
-  config_dir                 TEXT NOT NULL CHECK(config_dir <> ''),
-  keychain_service           TEXT NOT NULL CHECK(keychain_service <> ''),
-  keychain_account           TEXT NOT NULL CHECK(keychain_account <> ''),
+  config_dir                 TEXT NOT NULL,
+  keychain_service           TEXT NOT NULL,
+  keychain_account           TEXT NOT NULL,
   label                      TEXT NOT NULL DEFAULT '',
   account_uuid               TEXT NOT NULL DEFAULT '',
   owner_record               BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch                INTEGER NOT NULL CHECK(owner_epoch > 0),
   created_at                 INTEGER NOT NULL CHECK(created_at > 0),
-  updated_at                 INTEGER NOT NULL CHECK(updated_at >= created_at)
+  updated_at                 INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK((kind='add' AND state='awaiting-presentation' AND
+         locator_digest=zeroblob(32) AND expected_credential_digest=zeroblob(32) AND
+         config_dir='' AND keychain_service='' AND keychain_account='') OR
+        (state<>'awaiting-presentation' AND config_dir<>'' AND keychain_service<>'' AND keychain_account<>''))
 );
 CREATE TABLE account_mutation_receipts (
   operation_id      BLOB PRIMARY KEY CHECK(length(operation_id) = 32),

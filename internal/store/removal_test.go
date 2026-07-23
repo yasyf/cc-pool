@@ -146,7 +146,8 @@ func TestBeginAccountRemovalOnlyAllowsSettledMatchingPendingAdd(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			fence := begin.Active.Fence()
+			operation := bindAccountMutationTestPresentation(t, s, *begin.Active)
+			fence := operation.Fence()
 			if state == AccountMutationApplying || state == AccountMutationApplied {
 				fence, err = s.MarkAccountMutationInputProvided(fence, credentialOperationTestDigest("input"))
 				if err != nil {
@@ -184,8 +185,9 @@ func TestBeginAccountRemovalOnlyAllowsSettledMatchingPendingAdd(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		operation := bindAccountMutationTestPresentation(t, s, *begin.Active)
 		fence, err := s.MarkAccountMutationInputProvided(
-			begin.Active.Fence(), credentialOperationTestDigest("input"),
+			operation.Fence(), credentialOperationTestDigest("input"),
 		)
 		if err != nil {
 			t.Fatal(err)
