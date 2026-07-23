@@ -2,7 +2,7 @@ package hostsync
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,7 +15,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// localsFixture is a temp-dir pool Manager for the Locals/LocalIndex builders:
+// localsFixture is a temp-dir pool Manager for the Locals builder:
 // real store, in-memory keychain, no network.
 type localsFixture struct {
 	m  *pool.Manager
@@ -44,21 +44,27 @@ func newLocalsFixture(t *testing.T) *localsFixture {
 func (fx *localsFixture) addAccount(t *testing.T, id int, _ string, label, identityJSON string) store.Account {
 	t.Helper()
 	dir := pool.AccountDir(id)
+	var identity struct {
+		OAuthAccount *struct {
+			AccountUUID string `json:"accountUuid"`
+		} `json:"oauthAccount"`
+	}
+	if err := json.Unmarshal([]byte(identityJSON), &identity); err != nil ||
+		identity.OAuthAccount == nil || identity.OAuthAccount.AccountUUID == "" {
+		t.Fatalf("acct-%d test identity is not exact: %v", id, err)
+	}
 	a := store.Account{
 		ID: id, ConfigDir: dir, Label: label,
 		KeychainService: fmt.Sprintf("svc%d", id), KeychainAccount: "me",
+		AccountUUID: identity.OAuthAccount.AccountUUID,
 	}
-	if err := fx.m.Store.UpsertAccount(a); err != nil {
+	a = admitHostsyncTestAccount(t, fx.m, a)
+	path := filepath.Join(pool.AccountBackingDir(id), ".claude.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if identityJSON != "" {
-		path := filepath.Join(pool.AccountBackingDir(id), ".claude.json")
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(identityJSON), 0o600); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.WriteFile(path, []byte(identityJSON), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	got, err := fx.m.Store.GetAccount(id)
 	if err != nil {
@@ -146,21 +152,6 @@ func TestManagerLocalsAdvertisesOnlyOwnedChains(t *testing.T) {
 		}
 	})
 
-	t.Run("pre-login account is skipped", func(t *testing.T) {
-		fx := newLocalsFixture(t)
-		fx.addAccount(t, 1, "symlink", "l", "") // no .claude.json at all
-		fx.addAccount(t, 2, "symlink", "l", `{"no":"identity"}`)
-		fx.addAccount(t, 3, "symlink", "l", `{"oauthAccount":null}`)
-
-		locals, err := ManagerLocals(fx.m, "h", now)(context.Background())
-		if err != nil {
-			t.Fatalf("ManagerLocals: %v", err)
-		}
-		if len(locals) != 0 {
-			t.Fatalf("pre-login accounts leaked into the scan: %+v", locals)
-		}
-	})
-
 	t.Run("credential-less account lists with a zero chain", func(t *testing.T) {
 		fx := newLocalsFixture(t)
 		fx.addAccount(t, 1, "symlink", "l", `{"oauthAccount":`+oauthRaw+`}`)
@@ -190,31 +181,4 @@ func TestManagerLocalsAdvertisesOnlyOwnedChains(t *testing.T) {
 			t.Fatalf("chain = %+v, want zero", locals[0].Chain)
 		}
 	})
-}
-
-func TestManagerLocalIndexRejectsDuplicateExternalUUID(t *testing.T) {
-	fx := newLocalsFixture(t)
-	const identity = `{"oauthAccount":{"accountUuid":"duplicate","emailAddress":"a@example.com"}}`
-	fx.addAccount(t, 1, "", "one", identity)
-	fx.addAccount(t, 2, "", "two", identity)
-	if _, err := ManagerLocalIndex(fx.m)(t.Context()); !errors.Is(err, store.ErrDuplicateAccountUUID) {
-		t.Fatalf("duplicate external identity index = %v", err)
-	}
-}
-
-// TestManagerLocalIndex pins the uuid backfill index: logged-in rows map uuid
-// to row id, pre-login rows are absent.
-func TestManagerLocalIndex(t *testing.T) {
-	fx := newLocalsFixture(t)
-	fx.addAccount(t, 1, "symlink", "l", `{"oauthAccount":{"accountUuid":"u1","emailAddress":"a@x.com"}}`)
-	fx.addAccount(t, 2, "symlink", "l", `{"oauthAccount":{"accountUuid":"u2","emailAddress":"b@x.com"}}`)
-	fx.addAccount(t, 3, "symlink", "l", "") // pre-login
-
-	idx, err := ManagerLocalIndex(fx.m)(context.Background())
-	if err != nil {
-		t.Fatalf("ManagerLocalIndex: %v", err)
-	}
-	if len(idx) != 2 || idx["u1"] != 1 || idx["u2"] != 2 {
-		t.Fatalf("index = %v, want {u1:1 u2:2}", idx)
-	}
 }

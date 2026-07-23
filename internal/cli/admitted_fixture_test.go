@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -45,7 +46,9 @@ func admitCLITestAccount(t *testing.T, database *store.Store, requested store.Ac
 		}
 		fresh := proof
 		fresh.FileProvider.ActivationGeneration = "cli-test-admitted"
-		admitted, err := database.AdmitSyncedAccount(account, proof, fresh)
+		admitted, err := database.AdmitSyncedAccount(
+			account, proof, fresh, cliTestAdmissionFence(account),
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -62,6 +65,19 @@ func admitCLITestAccount(t *testing.T, database *store.Store, requested store.Ac
 		if err := database.DeleteAccount(reservation.ID); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func cliTestAdmissionFence(account store.Account) store.SyncedCredentialAdmissionFence {
+	external := store.CredentialDigest(sha256.Sum256([]byte("cli-test-external-" + account.InstanceID)))
+	tokenChain := store.CredentialDigest(sha256.Sum256([]byte("cli-test-chain-" + account.InstanceID)))
+	access := store.CredentialDigest(sha256.Sum256([]byte("cli-test-access-" + account.InstanceID)))
+	return store.SyncedCredentialAdmissionFence{
+		AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
+		LocatorDigest: store.CredentialKeychainLocatorDigest(
+			account.KeychainService, account.KeychainAccount,
+		),
+		ExternalStateDigest: external, TokenChainDigest: tokenChain, AccessHashDigest: access,
 	}
 }
 

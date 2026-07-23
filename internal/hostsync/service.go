@@ -113,6 +113,13 @@ type Service struct {
 	Driver converge.Driver[AccountValue]
 	// Fetcher reads each peer's registry for the pull-merge.
 	Fetcher converge.Fetcher[AccountValue]
+
+	promoteSyncedAdd func(
+		context.Context, *pool.PendingAdd, string, string,
+	) (*store.Account, error)
+	resolvePromotedSyncedAdd func(
+		*pool.PendingAdd, string, string,
+	) (*store.Account, bool, error)
 }
 
 // now returns the injected clock, or the wall clock when none is injected.

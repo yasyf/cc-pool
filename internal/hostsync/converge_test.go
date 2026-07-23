@@ -6,13 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/synckit/converge"
 	"github.com/yasyf/synckit/cregistry"
@@ -323,28 +321,5 @@ func TestTeardownRegistryFencePrecedesRemovalIntent(t *testing.T) {
 	calls := remover.callsSnapshot()
 	if len(calls) != 1 {
 		t.Fatalf("removal calls = %v, want one after registry fence completed", calls)
-	}
-}
-
-func TestTeardownDuplicateUUIDCannotBeCreated(t *testing.T) {
-	s, m, _, _ := newMaterializeService(t)
-	const uuid = "u-dup"
-	_, configDir, _ := materializeForTeardown(t, s, m, uuid)
-
-	if err := m.Store.UpsertAccount(store.Account{
-		ID: 99, ConfigDir: filepath.Join(t.TempDir(), "dup"),
-		KeychainService: "ccp-test-dup", KeychainAccount: "ccp-test",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.Store.SetAccountUUID(99, uuid); !errors.Is(err, store.ErrDuplicateAccountUUID) {
-		t.Fatalf("duplicate uuid = %v", err)
-	}
-	rows, err := m.Store.AccountsByUUID(uuid)
-	if err != nil || len(rows) != 1 {
-		t.Errorf("rows sharing the uuid = %d (err %v), want exactly one", len(rows), err)
-	}
-	if _, err := os.Stat(configDir); err != nil {
-		t.Errorf("account dir destroyed after rejected duplicate: %v", err)
 	}
 }

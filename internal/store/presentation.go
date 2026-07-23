@@ -193,12 +193,13 @@ func (s *Store) RefreshAccountPresentation(
 	return tx.Commit()
 }
 
-// AdmitSyncedAccount atomically advances the complete presentation proof and
-// clears awaiting-origin state only while the account and old proof match.
+// AdmitSyncedAccount atomically records exact credential evidence, advances the
+// complete presentation proof, and clears an exact awaiting-origin state.
 func (s *Store) AdmitSyncedAccount(
 	account Account,
 	currentProof PresentationPreparationProof,
 	freshProof PresentationPreparationProof,
+	credential SyncedCredentialAdmissionFence,
 ) (bool, error) {
 	if err := validatePresentationPreparationProofForAccount(
 		freshProof, account.InstanceID, account.Generation, account.ConfigDir,
@@ -206,6 +207,9 @@ func (s *Store) AdmitSyncedAccount(
 		return false, err
 	}
 	if err := ValidatePresentationPreparationProofAdvance(currentProof, freshProof); err != nil {
+		return false, err
+	}
+	if err := credential.validate(account); err != nil {
 		return false, err
 	}
 	tx, err := s.db.Begin()
@@ -225,6 +229,29 @@ func (s *Store) AdmitSyncedAccount(
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
+	var liveSession int
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM sessions WHERE account_id=? AND ended_at IS NULL)`,
+		account.ID,
+	).Scan(&liveSession); err != nil {
+		return false, err
+	}
+	if liveSession != 0 {
+		return false, ErrAccountSessionActive
+	}
+	var busy int
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM account_mutations WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM credential_operations WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM account_removals WHERE account_id=?)`,
+		account.ID, account.ID, account.ID, account.ID,
+	).Scan(&busy); err != nil {
+		return false, err
+	}
+	if busy != 0 {
+		return false, ErrAccountPresentationBusy
+	}
 	bound, err := accountPresentation(tx, account.ID)
 	if err != nil {
 		return false, err
@@ -239,10 +266,28 @@ func (s *Store) AdmitSyncedAccount(
 	}); err != nil {
 		return false, err
 	}
+	if _, err := tx.Exec(
+		`INSERT INTO synced_credential_admissions(
+		 account_id,account_instance_id,account_generation,locator_digest,
+		 external_state_digest,token_chain_digest,access_hash_digest,admitted_at)
+		 VALUES(?,?,?,?,?,?,?,?)
+		 ON CONFLICT(account_id,account_instance_id,account_generation) DO UPDATE SET
+		 locator_digest=excluded.locator_digest,
+		 external_state_digest=excluded.external_state_digest,
+		 token_chain_digest=excluded.token_chain_digest,
+		 access_hash_digest=excluded.access_hash_digest,
+		 admitted_at=excluded.admitted_at`,
+		account.ID, account.InstanceID, account.Generation, credential.LocatorDigest[:],
+		credential.ExternalStateDigest[:], credential.TokenChainDigest[:],
+		credential.AccessHashDigest[:], s.now().UnixNano(),
+	); err != nil {
+		return false, err
+	}
 	result, err := tx.Exec(
 		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none',
 		 digest=zeroblob(32), kind='owned'
-		 WHERE account_id=? AND needs_login=1 AND kind='awaiting_origin'`,
+		 WHERE account_id=? AND needs_login=1 AND kind='awaiting_origin'
+		 AND reason='awaiting_origin'`,
 		account.ID,
 	)
 	if err != nil {

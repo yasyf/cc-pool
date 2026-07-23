@@ -48,38 +48,25 @@ func ManagerLocals(m *pool.Manager, self string, now func() time.Time) func(cont
 	}
 }
 
-// ManagerLocalIndex builds the LoadRegistry uuid-backfill index (uuid -> row
-// id) over the same identity scan as ManagerLocals.
-func ManagerLocalIndex(m *pool.Manager) LocalIndex {
-	return func(ctx context.Context) (map[string]int, error) {
-		rows, err := scanLocalAccounts(ctx, m)
-		if err != nil {
-			return nil, err
-		}
-		idx := make(map[string]int, len(rows))
-		for _, r := range rows {
-			idx[r.uuid] = r.acct.ID
-		}
-		return idx, nil
-	}
-}
-
-// scanLocalAccounts reads every pool row's private identity; rows with no
-// identity yet (pre-login) are skipped — they have no uuid to sync under.
+// scanLocalAccounts reads only exact publishable origins and verifies their
+// private identity against the durable account identity.
 func scanLocalAccounts(ctx context.Context, m *pool.Manager) ([]localRow, error) {
-	accts, err := m.Store.ListAccounts()
+	accts, err := m.Store.ListPublishableOrigins()
 	if err != nil {
-		return nil, fmt.Errorf("list accounts: %w", err)
+		return nil, fmt.Errorf("list publishable origins: %w", err)
 	}
 	out := make([]localRow, 0, len(accts))
 	byUUID := make(map[string]int, len(accts))
 	for _, a := range accts {
 		raw, id, err := m.AccountOAuth(ctx, a.ID, a.ConfigDir)
-		if errors.Is(err, pool.ErrNoIdentity) {
-			continue
-		}
 		if err != nil {
 			return nil, fmt.Errorf("acct-%d: %w", a.ID, err)
+		}
+		if id.AccountUUID != a.AccountUUID {
+			return nil, fmt.Errorf(
+				"acct-%d: durable account UUID %q does not match private identity %q",
+				a.ID, a.AccountUUID, id.AccountUUID,
+			)
 		}
 		if prior, exists := byUUID[id.AccountUUID]; exists {
 			return nil, fmt.Errorf(

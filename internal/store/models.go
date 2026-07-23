@@ -14,7 +14,7 @@ type Account struct {
 	KeychainService string
 	KeychainAccount string
 	Label           string // human note, e.g. an email or alias
-	AccountUUID     string // Claude accountUuid; "" until lazily backfilled
+	AccountUUID     string // immutable Claude accountUuid
 	CreatedAt       time.Time
 }
 

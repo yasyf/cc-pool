@@ -19,6 +19,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -201,7 +203,11 @@ func cmdAccount(args []string) error {
 	}
 	freshProof := proof
 	freshProof.FileProvider.ActivationGeneration = "sync-sim-admitted"
-	admitted, err := db.AdmitSyncedAccount(acct, proof, freshProof)
+	admissionFence, err := simAdmissionFence(acct, cred)
+	if err != nil {
+		return fmt.Errorf("build admission evidence: %w", err)
+	}
+	admitted, err := db.AdmitSyncedAccount(acct, proof, freshProof, admissionFence)
 	if err != nil {
 		return fmt.Errorf("admit account row: %w", err)
 	}
@@ -210,6 +216,31 @@ func cmdAccount(args []string) error {
 	}
 	fmt.Printf("seeded acct-%02d uuid=%s hash=%s\n", *id, *uuid, creds.AccessHash(cred))
 	return nil
+}
+
+func simAdmissionFence(
+	account store.Account,
+	credential *creds.Credential,
+) (store.SyncedCredentialAdmissionFence, error) {
+	raw, err := json.Marshal(credential)
+	if err != nil {
+		return store.SyncedCredentialAdmissionFence{}, err
+	}
+	external := store.CredentialDigest(sha256.Sum256(raw))
+	tokenChain := store.CredentialDigest(sha256.Sum256(append([]byte("sync-sim-token-chain:"), raw...)))
+	accessBytes, err := hex.DecodeString(creds.AccessHash(credential))
+	if err != nil || len(accessBytes) != sha256.Size {
+		return store.SyncedCredentialAdmissionFence{}, errors.New("invalid simulated access hash")
+	}
+	var access store.CredentialDigest
+	copy(access[:], accessBytes)
+	return store.SyncedCredentialAdmissionFence{
+		AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
+		LocatorDigest: store.CredentialKeychainLocatorDigest(
+			account.KeychainService, account.KeychainAccount,
+		),
+		ExternalStateDigest: external, TokenChainDigest: tokenChain, AccessHashDigest: access,
+	}, nil
 }
 
 func simPresentationProof(account store.Account, activation string) store.PresentationPreparationProof {

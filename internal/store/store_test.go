@@ -1167,7 +1167,7 @@ func TestAuthHealthTransitions(t *testing.T) {
 
 	// A repeat preserves Since but refreshes Reason, Digest, and Kind.
 	secondDigest := DigestReason("401 again")
-	changed, _ = s.SetNeedsLogin(1, t0.Add(time.Hour), AuthReasonAwaitingOrigin, secondDigest, AuthKindAwaitingOrigin)
+	changed, _ = s.SetNeedsLogin(1, t0.Add(time.Hour), AuthReasonInternal, secondDigest, AuthKindUnverified)
 	if changed {
 		t.Fatal("repeat SetNeedsLogin must report changed=false")
 	}
@@ -1175,14 +1175,14 @@ func TestAuthHealthTransitions(t *testing.T) {
 	if !h.Since.Equal(t0) {
 		t.Fatalf("Since must measure the whole outage; got %v want %v", h.Since, t0)
 	}
-	if h.Reason != AuthReasonAwaitingOrigin || h.Digest != secondDigest {
+	if h.Reason != AuthReasonInternal || h.Digest != secondDigest {
 		t.Fatalf("reason should update; got %+v", h)
 	}
-	if h.Kind != AuthKindAwaitingOrigin {
-		t.Fatalf("Kind should refresh to awaiting-origin; got %q", h.Kind)
+	if h.Kind != AuthKindUnverified {
+		t.Fatalf("Kind should refresh to unverified; got %q", h.Kind)
 	}
 
-	if m, err := s.ListAuthHealth(); err != nil || len(m) != 1 || !m[1].NeedsLogin || m[1].Kind != AuthKindAwaitingOrigin {
+	if m, err := s.ListAuthHealth(); err != nil || len(m) != 1 || !m[1].NeedsLogin || m[1].Kind != AuthKindUnverified {
 		t.Fatalf("ListAuthHealth = %+v err=%v", m, err)
 	}
 
@@ -1202,6 +1202,34 @@ func TestAuthHealthTransitions(t *testing.T) {
 	}
 	if m, _ := s.ListAuthHealth(); len(m) != 0 {
 		t.Fatalf("ListAuthHealth after clear = %+v, want empty", m)
+	}
+}
+
+func TestAwaitingOriginAuthHealthHasOneExit(t *testing.T) {
+	s := openTest(t)
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	t0 := time.Unix(1_000_000, 0)
+	digest := DigestReason("awaiting origin")
+	if _, err := s.SetNeedsLogin(1, t0, AuthReasonAwaitingOrigin, digest, AuthKindAwaitingOrigin); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []AuthKind{AuthKindOwned, AuthKindUnverified} {
+		if changed, err := s.SetNeedsLogin(
+			1, t0.Add(time.Minute), AuthReasonInternal, DigestReason(string(kind)), kind,
+		); changed || !errors.Is(err, ErrAwaitingOriginAdmission) {
+			t.Fatalf("SetNeedsLogin(%s) changed=%v err=%v, want explicit fence", kind, changed, err)
+		}
+	}
+	if changed, err := s.ClearNeedsLogin(1); err != nil || changed {
+		t.Fatalf("ClearNeedsLogin changed=%v err=%v, want fenced", changed, err)
+	}
+	if changed, err := s.ClearNeedsLoginIfGen(1, 1); err != nil || changed {
+		t.Fatalf("ClearNeedsLoginIfGen changed=%v err=%v, want fenced", changed, err)
+	}
+	health, err := s.GetAuthHealth(1)
+	if err != nil || !health.NeedsLogin || health.Kind != AuthKindAwaitingOrigin ||
+		health.Reason != AuthReasonAwaitingOrigin || health.Digest != digest || health.Gen != 2 {
+		t.Fatalf("awaiting-origin fence changed: %+v err=%v", health, err)
 	}
 }
 
@@ -1292,7 +1320,7 @@ func TestAuthHealthGenerationCAS(t *testing.T) {
 
 	cleared, err = s.ClearNeedsLoginIfGen(1, 3)
 	if err != nil || !cleared {
-		t.Fatalf("current-generation clear changed=%v err=%v, want true", cleared, err)
+		t.Fatalf("current generation clear changed=%v err=%v, want true", cleared, err)
 	}
 	h, err = s.GetAuthHealth(1)
 	if err != nil {

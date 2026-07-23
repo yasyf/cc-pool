@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"testing"
@@ -8,7 +9,39 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/store"
 )
+
+func TestDaemonAuthRoutesCannotBypassAwaitingOriginAdmission(t *testing.T) {
+	s, _ := newOutageServer(t, 1)
+	accounts, err := s.m.Store.ListAccounts()
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("accounts = %+v err=%v", accounts, err)
+	}
+	account := accounts[0]
+	if _, err := s.m.Store.SetNeedsLogin(
+		account.ID, time.Now(), store.AuthReasonAwaitingOrigin,
+		store.DigestReason("awaiting exact admission"), store.AuthKindAwaitingOrigin,
+	); err != nil {
+		t.Fatal(err)
+	}
+	s.handleAuthOutcome(t.Context(), account, nil)
+	assertDaemonAwaitingOrigin(t, s, account.ID)
+	s.syncAuthKind = func(context.Context, int, string) (store.AuthKind, error) {
+		return store.AuthKindOwned, nil
+	}
+	s.flagNeedsLogin(t.Context(), account, pool.ErrNeedsLogin)
+	assertDaemonAwaitingOrigin(t, s, account.ID)
+}
+
+func assertDaemonAwaitingOrigin(t *testing.T, s *Server, accountID int) {
+	t.Helper()
+	health, err := s.m.Store.GetAuthHealth(accountID)
+	if err != nil || !health.NeedsLogin || health.Kind != store.AuthKindAwaitingOrigin ||
+		health.Reason != store.AuthReasonAwaitingOrigin {
+		t.Fatalf("awaiting-origin daemon fence = %+v err=%v", health, err)
+	}
+}
 
 func TestRetainedNeedsLoginLiveProbeOrdering(t *testing.T) {
 	for _, tc := range []struct {

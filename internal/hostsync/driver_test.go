@@ -17,10 +17,6 @@ import (
 
 // --- fakes -------------------------------------------------------------------
 
-type uuidSet struct {
-	id   int
-	uuid string
-}
 type labelSet struct {
 	id    int
 	label string
@@ -31,7 +27,6 @@ type labelSet struct {
 // row, recording each write for assertions.
 type fakeDriverStore struct {
 	byID      map[int]*store.Account
-	uuidSets  []uuidSet
 	labelSets []labelSet
 }
 
@@ -53,16 +48,6 @@ func (s *fakeDriverStore) GetAccountByUUID(uuid string) (store.Account, bool, er
 		return store.Account{}, false, nil
 	}
 	return *s.byID[best], true, nil
-}
-
-func (s *fakeDriverStore) SetAccountUUID(id int, uuid string) error {
-	a, ok := s.byID[id]
-	if !ok {
-		return errors.New("account not found")
-	}
-	a.AccountUUID = uuid
-	s.uuidSets = append(s.uuidSets, uuidSet{id, uuid})
-	return nil
 }
 
 func (s *fakeDriverStore) SetAccountLabel(id int, label string) error {
@@ -204,7 +189,6 @@ type driverHarness struct {
 	cred  *fakeCred
 	mat   *fakeMaterializer
 	pull  *fakePuller
-	idx   map[string]int
 	d     *Driver
 }
 
@@ -221,12 +205,10 @@ func newDriverHarness(t *testing.T) *driverHarness {
 		cred:  cr,
 		mat:   &fakeMaterializer{store: st, cred: cr},
 		pull:  &fakePuller{},
-		idx:   map[string]int{},
 	}
 	h.d = NewDriver(svc, DriverDeps{
 		Store:       st,
 		Cred:        cr,
-		LocalIndex:  func(context.Context) (map[string]int, error) { return h.idx, nil },
 		Materialize: h.mat.materialize,
 		Admit: func(context.Context, store.Account, string) (bool, error) {
 			return false, nil
@@ -625,56 +607,6 @@ func strippedCred(exp int64) *creds.Credential {
 	c.ClaudeAiOauth.ExpiresAt = exp
 	c.ClaudeAiOauth.AccessToken = "at"
 	return c
-}
-
-// TestDriverUnifyBackfillsUUID pins the LoadRegistry backfill: a local account row
-// the store has not yet tagged with its accountUuid is unified with the matching
-// registry entry — so Reconcile resolves it and NEVER materializes a duplicate.
-func TestDriverUnifyBackfillsUUID(t *testing.T) {
-	ctx := context.Background()
-	h := newDriverHarness(t)
-
-	// An existing local row with no uuid yet, and the identity index that knows it.
-	h.store.add(store.Account{ID: 5, AccountUUID: "", Label: "mine"})
-	h.idx["u1"] = 5
-	h.svc.Locals = func(context.Context) ([]LocalAccount, error) {
-		return []LocalAccount{{UUID: "u1", Email: "u1@x", Label: "mine", Chain: ChainStamp{ExpiresAt: 5000, Hash: "h-u1"}}}, nil
-	}
-
-	// A peer already advertises this account in the seeded registry.
-	seed := cregistry.New[AccountValue]()
-	seed.Add("u1", acctValue("u1", "mine", "hostA", 5000, freshOAuth("u1")), cregistry.Micros(10))
-	if err := h.svc.Registry.Save(seed); err != nil {
-		t.Fatalf("seed registry: %v", err)
-	}
-
-	reg, err := h.d.LoadRegistry(ctx)
-	if err != nil {
-		t.Fatalf("LoadRegistry: %v", err)
-	}
-	if len(h.store.uuidSets) != 1 || h.store.uuidSets[0] != (uuidSet{5, "u1"}) {
-		t.Fatalf("uuid backfills = %+v, want one (5,u1)", h.store.uuidSets)
-	}
-
-	h.cred.expiry[5] = 5000 // chain equal ⇒ no pull
-	outcome, err := h.d.Reconcile(ctx, "u1", reg["u1"], []string{"hostB"}, "")
-	if err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	if outcome != OutcomeUnchanged {
-		t.Fatalf("outcome = %q, want unchanged (unified, not materialized)", outcome)
-	}
-	if len(h.mat.calls) != 0 {
-		t.Fatalf("a tagged local account was materialized as a duplicate: %+v", h.mat.calls)
-	}
-
-	// A second LoadRegistry finds the row already tagged and writes nothing.
-	if _, err := h.d.LoadRegistry(ctx); err != nil {
-		t.Fatalf("second LoadRegistry: %v", err)
-	}
-	if len(h.store.uuidSets) != 1 {
-		t.Fatalf("backfill wrote again on a converged host: %+v", h.store.uuidSets)
-	}
 }
 
 // TestSaveRegistryTouchesChangedStamps proves SaveRegistry notifies peers of only

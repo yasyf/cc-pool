@@ -33,8 +33,6 @@ const (
 type DriverStore interface {
 	// GetAccountByUUID resolves the local row whose Claude accountUuid is uuid.
 	GetAccountByUUID(uuid string) (store.Account, bool, error)
-	// SetAccountUUID tags a local row with its Claude accountUuid.
-	SetAccountUUID(id int, uuid string) error
 	// SetAccountLabel updates a local row's label.
 	SetAccountLabel(id int, label string) error
 }
@@ -50,10 +48,6 @@ type CredentialManager interface {
 	InstallSyncedCredential(ctx context.Context, a store.Account, cred *creds.Credential) (bool, error)
 }
 
-// LocalIndex maps each local account's Claude accountUuid to its store row id,
-// for LoadRegistry's account_uuid backfill; tests inject a fake.
-type LocalIndex func(ctx context.Context) (map[string]int, error)
-
 // AccountMaterializer creates the local pool account for a peer-added entry
 // missing locally; tests inject a fake.
 type AccountMaterializer func(ctx context.Context, v AccountValue, peers []string) (MaterializeResult, error)
@@ -67,12 +61,10 @@ type FresherPuller func(ctx context.Context, uuid string, chain ChainStamp, loca
 
 // DriverDeps are the injected seams the Driver reconciles through.
 type DriverDeps struct {
-	// Store resolves, tags, and relabels local account rows.
+	// Store resolves and relabels local account rows.
 	Store DriverStore
 	// Cred reads the local credential and installs a fresher pulled one.
 	Cred CredentialManager
-	// LocalIndex enumerates local (uuid -> row id) for the LoadRegistry backfill.
-	LocalIndex LocalIndex
 	// Materialize creates a local account for a peer-added entry missing locally.
 	Materialize AccountMaterializer
 	// Admit revalidates a synced account's persisted presentation before selection.
@@ -97,17 +89,14 @@ func NewDriver(svc *Service, deps DriverDeps) *Driver {
 	return &Driver{svc: svc, deps: deps, base: map[string]string{}}
 }
 
-// LoadRegistry loads the registry, snapshots per-entry fingerprints, backfills
-// local uuids, and folds local accounts in via ScanPublish (in memory only).
+// LoadRegistry loads the registry, snapshots per-entry fingerprints, and folds
+// local accounts in via ScanPublish (in memory only).
 func (d *Driver) LoadRegistry(ctx context.Context) (cregistry.Registry[AccountValue], error) {
 	reg, err := d.svc.Registry.Load()
 	if err != nil {
 		return nil, err
 	}
 	d.snapshot(reg)
-	if err := d.backfillUUIDs(ctx); err != nil {
-		return nil, err
-	}
 	if _, err := d.svc.ScanPublish(ctx, reg); err != nil {
 		return nil, err
 	}
@@ -158,29 +147,6 @@ func (d *Driver) Reconcile(ctx context.Context, id string, entry cregistry.Entry
 	return d.reconcileLocal(ctx, a, v, peers)
 }
 
-// backfillUUIDs tags local rows the store has not yet stamped with their uuid,
-// so Reconcile unifies with the existing account instead of materializing a duplicate.
-func (d *Driver) backfillUUIDs(ctx context.Context) error {
-	idx, err := d.deps.LocalIndex(ctx)
-	if err != nil {
-		return fmt.Errorf("index local accounts: %w", err)
-	}
-	for uuid, id := range idx {
-		_, ok, err := d.deps.Store.GetAccountByUUID(uuid)
-		if err != nil {
-			return fmt.Errorf("resolve local account %s: %w", uuid, err)
-		}
-		if ok {
-			continue
-		}
-		if err := d.deps.Store.SetAccountUUID(id, uuid); err != nil {
-			return fmt.Errorf("backfill uuid on acct-%d: %w", id, err)
-		}
-		d.svc.logf("hostsync: backfilled acct-%d uuid=%s", id, uuid)
-	}
-	return nil
-}
-
 // materialize creates a missing local account for v, deferring when the
 // identity is not yet scan-published or no peer holds the envelope.
 func (d *Driver) materialize(ctx context.Context, v AccountValue, peers []string) (converge.Outcome, error) {
@@ -227,10 +193,11 @@ func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountV
 		return outcome, nil
 	}
 	if v.Chain.Hash == localHash {
-		if d.deps.Admit != nil {
-			if _, err := d.deps.Admit(ctx, a, v.Chain.Hash); err != nil {
-				return "", fmt.Errorf("admit synced acct-%d: %w", a.ID, err)
-			}
+		if d.deps.Admit == nil {
+			return "", errors.New("hostsync: synced account admitter is required")
+		}
+		if _, err := d.deps.Admit(ctx, a, v.Chain.Hash); err != nil {
+			return "", fmt.Errorf("admit synced acct-%d: %w", a.ID, err)
 		}
 		return outcome, nil
 	}
@@ -257,10 +224,11 @@ func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountV
 	case err != nil:
 		return "", err
 	case installed:
-		if d.deps.Admit != nil {
-			if _, err := d.deps.Admit(ctx, a, v.Chain.Hash); err != nil {
-				return "", fmt.Errorf("admit synced acct-%d: %w", a.ID, err)
-			}
+		if d.deps.Admit == nil {
+			return "", errors.New("hostsync: synced account admitter is required")
+		}
+		if _, err := d.deps.Admit(ctx, a, v.Chain.Hash); err != nil {
+			return "", fmt.Errorf("admit synced acct-%d: %w", a.ID, err)
 		}
 		return OutcomeCredInstalled, nil
 	case deferred:

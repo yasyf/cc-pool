@@ -273,9 +273,8 @@ func newHostSyncWorkerRuntime(
 			return hostsync.FetchCredential(ctx, peerTransport, uuid, chain, localExpiresAt, peers)
 		}
 		service.Driver = hostsync.NewDriver(service, hostsync.DriverDeps{
-			Store:      manager.Store,
-			Cred:       manager,
-			LocalIndex: hostsync.ManagerLocalIndex(manager),
+			Store: manager.Store,
+			Cred:  manager,
 			Materialize: func(ctx context.Context, value hostsync.AccountValue, peers []string) (hostsync.MaterializeResult, error) {
 				noLocal := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, peers []string) (*creds.Credential, error) {
 					return pull(ctx, uuid, chain, 0, peers)

@@ -29,7 +29,7 @@ type MaterializeResult struct {
 	// written first (no ~/.claude.json to seed from).
 	Bootstrapped bool
 	// Deferred is true when v carried no oauthAccount yet: nothing was created,
-	// and a later scan-publish backfill supplies the identity.
+	// and a later origin publication must supply the identity.
 	Deferred bool
 }
 
@@ -160,9 +160,17 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		return abandon(fmt.Errorf("materialize %s: revalidate presentation before promotion: %w", v.UUID, err))
 	}
 	p.PresentationProof = freshProof
-	acct, err := s.M.PromoteSyncedAdd(ctx, p, v.Label, v.UUID)
+	acct, err := s.promotePreparedSyncedAdd(ctx, p, v.Label, v.UUID)
 	if err != nil {
-		return abandon(fmt.Errorf("materialize %s: publish awaiting-origin row: %w", v.UUID, err))
+		promotionErr := fmt.Errorf("materialize %s: publish awaiting-origin row: %w", v.UUID, err)
+		resolved, committed, resolveErr := s.resolvePreparedSyncedAdd(p, v.Label, v.UUID)
+		if resolveErr != nil {
+			return MaterializeResult{}, errors.Join(promotionErr, fmt.Errorf("resolve promotion: %w", resolveErr))
+		}
+		if !committed {
+			return abandonUnlessRetained(promotionErr)
+		}
+		acct = resolved
 	}
 	durable := MaterializeResult{UUID: v.UUID, AccountID: acct.ID, Bootstrapped: bootstrapped}
 	installed, err := s.M.InstallSyncedCredential(ctx, *acct, env)
@@ -180,6 +188,29 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	s.NudgeSynckitd(ctx, manifestPath)
 
 	return durable, nil
+}
+
+func (s *Service) promotePreparedSyncedAdd(
+	ctx context.Context,
+	pending *pool.PendingAdd,
+	label string,
+	accountUUID string,
+) (*store.Account, error) {
+	if s.promoteSyncedAdd != nil {
+		return s.promoteSyncedAdd(ctx, pending, label, accountUUID)
+	}
+	return s.M.PromoteSyncedAdd(ctx, pending, label, accountUUID)
+}
+
+func (s *Service) resolvePreparedSyncedAdd(
+	pending *pool.PendingAdd,
+	label string,
+	accountUUID string,
+) (*store.Account, bool, error) {
+	if s.resolvePromotedSyncedAdd != nil {
+		return s.resolvePromotedSyncedAdd(pending, label, accountUUID)
+	}
+	return s.M.ResolvePromotedSyncedAdd(pending, label, accountUUID)
 }
 
 // AdmitSyncedAccount verifies credential and presentation freshness before
@@ -221,7 +252,9 @@ func (s *Service) AdmitSyncedAccount(
 	if _, _, _, err := s.M.SampleUsage(ctx, account, pool.SampleOpts{AllowRefresh: false}); err != nil {
 		return false, fmt.Errorf("validate access-only credential: %w", err)
 	}
-	return s.M.Store.AdmitSyncedAccount(account, presentation.Proof, freshProof)
+	return s.M.AdmitSyncedCredential(
+		ctx, account, presentation.Proof, freshProof, expectedAccessHash,
+	)
 }
 
 func validateMaterializeIdentity(value AccountValue) error {

@@ -1,0 +1,324 @@
+package pool
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/cc-pool/internal/creds/credstest"
+	"github.com/yasyf/cc-pool/internal/store"
+)
+
+func TestPromoteSyncedAddLostResponseResolvesWithoutCleanup(t *testing.T) {
+	manager := newAccountManager(t)
+	reservation, err := manager.ReserveAdd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	configDir := filepath.Join(t.TempDir(), "CloudStorage", "cc-pool-acct-01")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	prospective := store.Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation, ConfigDir: configDir,
+	}
+	pending, err := manager.PrepareReservedSyncedAdd(
+		t.Context(), reservation, syncedAdmissionProof(prospective, "activation-promotion"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := json.RawMessage(`{"accountUuid":"promotion-uuid"}`)
+	if err := manager.WriteIdentity(t.Context(), reservation.ID, configDir, identity); err != nil {
+		t.Fatal(err)
+	}
+	promoteSyncedAddFailpoint = func(checkpoint string) error {
+		if checkpoint == "after-commit" {
+			return errors.New("injected post-commit response loss")
+		}
+		return nil
+	}
+	t.Cleanup(func() { promoteSyncedAddFailpoint = nil })
+	if account, err := manager.PromoteSyncedAdd(
+		t.Context(), pending, "peer", "promotion-uuid",
+	); account != nil || err == nil {
+		t.Fatalf("lost response account=%+v err=%v", account, err)
+	}
+	resolved, exact, err := manager.ResolvePromotedSyncedAdd(
+		pending, "peer", "promotion-uuid",
+	)
+	if err != nil || !exact || resolved == nil || resolved.AccountUUID != "promotion-uuid" {
+		t.Fatalf("resolved account=%+v exact=%v err=%v", resolved, exact, err)
+	}
+	if _, err := os.Stat(AccountBackingDir(reservation.ID)); err != nil {
+		t.Fatalf("committed backing missing after response loss: %v", err)
+	}
+}
+
+func TestAdmitSyncedCredentialRejectsCredentialChangedUnderfoot(t *testing.T) {
+	mutations := []struct {
+		name   string
+		mutate func(*credstest.Fake, store.Account, *creds.Credential)
+	}{
+		{name: "deleted", mutate: func(fake *credstest.Fake, account store.Account, _ *creds.Credential) {
+			fake.Remove(account.KeychainService, account.KeychainAccount)
+		}},
+		{name: "refresh-bearing", mutate: func(fake *credstest.Fake, account store.Account, credential *creds.Credential) {
+			changed := *credential
+			changed.ClaudeAiOauth.RefreshToken = "refresh-underfoot"
+			fake.Put(account.KeychainService, account.KeychainAccount, &changed)
+		}},
+		{name: "access-changed", mutate: func(fake *credstest.Fake, account store.Account, credential *creds.Credential) {
+			changed := *credential
+			changed.ClaudeAiOauth.AccessToken = "access-underfoot"
+			fake.Put(account.KeychainService, account.KeychainAccount, &changed)
+		}},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			manager, fake, account, currentProof, freshProof, credential, _ := syncedAdmissionFixture(t)
+			syncedAdmissionFailpoint = func(checkpoint string) {
+				if checkpoint == "before-final-observation" {
+					mutation.mutate(fake, account, credential)
+				}
+			}
+			t.Cleanup(func() { syncedAdmissionFailpoint = nil })
+			admitted, err := manager.AdmitSyncedCredential(
+				t.Context(), account, currentProof, freshProof, creds.AccessHash(credential),
+			)
+			if admitted || !errors.Is(err, ErrCredentialChangedUnderfoot) {
+				t.Fatalf("admit changed credential = %v err=%v", admitted, err)
+			}
+			assertSyncedAdmissionPending(t, manager.Store, account, currentProof)
+		})
+	}
+}
+
+func TestAdmitSyncedCredentialPersistsExactEvidenceAndRetriesAfterReopen(t *testing.T) {
+	manager, fake, account, currentProof, freshProof, credential, databasePath := syncedAdmissionFixture(t)
+	syncedAdmissionFailpoint = func(checkpoint string) {
+		if checkpoint == "before-final-observation" {
+			fake.Remove(account.KeychainService, account.KeychainAccount)
+		}
+	}
+	t.Cleanup(func() { syncedAdmissionFailpoint = nil })
+	admitted, err := manager.AdmitSyncedCredential(
+		t.Context(), account, currentProof, freshProof, creds.AccessHash(credential),
+	)
+	syncedAdmissionFailpoint = nil
+	if admitted || !errors.Is(err, ErrCredentialChangedUnderfoot) {
+		t.Fatalf("first admission = %v err=%v", admitted, err)
+	}
+	assertSyncedAdmissionPending(t, manager.Store, account, currentProof)
+
+	if err := manager.Store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	manager.Store = reopened
+	fake.Put(account.KeychainService, account.KeychainAccount, credential)
+	admitted, err = manager.AdmitSyncedCredential(
+		t.Context(), account, currentProof, freshProof, creds.AccessHash(credential),
+	)
+	if err != nil || !admitted {
+		t.Fatalf("retry after reopen = %v err=%v", admitted, err)
+	}
+	health, err := reopened.GetAuthHealth(account.ID)
+	if err != nil || health.NeedsLogin || health.Kind != store.AuthKindOwned {
+		t.Fatalf("admitted health = %+v err=%v", health, err)
+	}
+	presentation, err := reopened.AccountPresentation(account.ID)
+	if err != nil || presentation.Proof != freshProof {
+		t.Fatalf("admitted proof = %+v err=%v", presentation, err)
+	}
+	evidence, err := reopened.SyncedCredentialAdmission(account)
+	if err != nil || evidence.AccountID != account.ID || evidence.AccessHashDigest == ([32]byte{}) {
+		t.Fatalf("admission evidence = %+v err=%v", evidence, err)
+	}
+	firstAccessDigest := evidence.AccessHashDigest
+	if _, err := reopened.SetNeedsLogin(
+		account.ID, time.Now(), store.AuthReasonAwaitingOrigin,
+		store.DigestReason("origin rotated"), store.AuthKindAwaitingOrigin,
+	); err != nil {
+		t.Fatal(err)
+	}
+	rotated := *credential
+	rotated.ClaudeAiOauth.AccessToken = "synced-access-rotated"
+	fake.Put(account.KeychainService, account.KeychainAccount, &rotated)
+	nextProof := freshProof
+	nextProof.FileProvider.ActivationGeneration = "activation-C"
+	admitted, err = manager.AdmitSyncedCredential(
+		t.Context(), account, freshProof, nextProof, creds.AccessHash(&rotated),
+	)
+	if err != nil || !admitted {
+		t.Fatalf("same-generation re-admission = %v err=%v", admitted, err)
+	}
+	evidence, err = reopened.SyncedCredentialAdmission(account)
+	if err != nil || evidence.AccessHashDigest == firstAccessDigest {
+		t.Fatalf("rotated admission evidence = %+v err=%v", evidence, err)
+	}
+	if err := reopened.DeleteAccount(account.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.SyncedCredentialAdmission(account); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("admission evidence survived account teardown: %v", err)
+	}
+}
+
+func TestAdmitSyncedCredentialRefusesActiveCredentialOperation(t *testing.T) {
+	manager, _, account, currentProof, freshProof, credential, _ := syncedAdmissionFixture(t)
+	observation, err := manager.CredentialExternalState(t.Context(), account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginCredentialOperation(
+		t, manager, account, store.CredentialOperationAdoptRotated,
+		store.CredentialTargetKeychain,
+		credentialIntentDigest(store.CredentialOperationAdoptRotated, "admission-race"),
+		observation,
+	)
+	admitted, err := manager.AdmitSyncedCredential(
+		t.Context(), account, currentProof, freshProof, creds.AccessHash(credential),
+	)
+	if admitted || !errors.Is(err, store.ErrAccountPresentationBusy) {
+		t.Fatalf("admit with active credential operation = %v err=%v", admitted, err)
+	}
+	assertSyncedAdmissionPending(t, manager.Store, account, currentProof)
+}
+
+func TestAdmitSyncedCredentialRefusesLiveSession(t *testing.T) {
+	manager, _, account, currentProof, freshProof, credential, _ := syncedAdmissionFixture(t)
+	admitted, err := manager.AdmitSyncedCredential(
+		t.Context(), account, currentProof, freshProof, creds.AccessHash(credential),
+	)
+	if err != nil || !admitted {
+		t.Fatalf("establish selectable admission = %v err=%v", admitted, err)
+	}
+	if err := manager.Store.ActivateSelection(store.SelectionActivation{
+		Token:     "0123456789abcdef0123456789abcdef",
+		AccountID: account.ID, ExpectedInstanceID: account.InstanceID,
+		ExpectedGeneration: account.Generation,
+		Process:            store.ProcessIdentity{PID: os.Getpid(), StartedAt: time.Now()},
+		ConfigDir:          account.ConfigDir, At: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Store.SetNeedsLogin(
+		account.ID, time.Now(), store.AuthReasonAwaitingOrigin,
+		store.DigestReason("origin rotated during live session"), store.AuthKindAwaitingOrigin,
+	); err != nil {
+		t.Fatal(err)
+	}
+	nextProof := freshProof
+	nextProof.FileProvider.ActivationGeneration = "activation-C"
+	admitted, err = manager.AdmitSyncedCredential(
+		t.Context(), account, freshProof, nextProof, creds.AccessHash(credential),
+	)
+	if admitted || !errors.Is(err, store.ErrAccountSessionActive) {
+		t.Fatalf("admit with live session = %v err=%v", admitted, err)
+	}
+	health, err := manager.Store.GetAuthHealth(account.ID)
+	if err != nil || !health.NeedsLogin || health.Kind != store.AuthKindAwaitingOrigin {
+		t.Fatalf("live-session admission health = %+v err=%v", health, err)
+	}
+	presentation, err := manager.Store.AccountPresentation(account.ID)
+	if err != nil || presentation.Proof != freshProof {
+		t.Fatalf("live-session admission proof = %+v err=%v", presentation, err)
+	}
+	if _, err := manager.Store.SyncedCredentialAdmission(account); err != nil {
+		t.Fatalf("prior exact admission evidence was lost: %v", err)
+	}
+}
+
+func syncedAdmissionFixture(
+	t *testing.T,
+) (*Manager, *credstest.Fake, store.Account, store.PresentationPreparationProof, store.PresentationPreparationProof, *creds.Credential, string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	databasePath := filepath.Join(t.TempDir(), "synced-admission-v1.db")
+	st, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := credstest.NewFake()
+	manager := credentialRecoveryManager(t, st, fake, "synced-admission")
+	installTestBackingRunner(manager)
+	if _, err := manager.Init(); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := manager.ReserveAdd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	configDir := filepath.Join(home, "Library", "CloudStorage", "cc-pool-acct-01")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	account := store.Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation, ConfigDir: configDir,
+		KeychainService: "synced-service", KeychainAccount: creds.AccountLabel(),
+		Label: "synced", AccountUUID: "synced-uuid", CreatedAt: time.Now(),
+	}
+	currentProof := syncedAdmissionProof(account, "activation-A")
+	if err := st.PromoteReservedSyncedAccount(reservation, account, currentProof); err != nil {
+		t.Fatal(err)
+	}
+	freshProof := currentProof
+	freshProof.FileProvider.ActivationGeneration = "activation-B"
+	credential := &creds.Credential{ClaudeAiOauth: creds.OAuth{
+		AccessToken: "synced-access", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	}}
+	fake.Put(account.KeychainService, account.KeychainAccount, credential)
+	return manager, fake, account, currentProof, freshProof, credential, databasePath
+}
+
+func syncedAdmissionProof(
+	account store.Account,
+	activation string,
+) store.PresentationPreparationProof {
+	tenantID := "account-" + account.InstanceID
+	return store.PresentationPreparationProof{
+		CatalogTenantID: tenantID, CatalogGeneration: account.Generation,
+		Requested: 1, Desired: 1, Observed: 1, Verified: 1, Applied: 1,
+		SourceAuthority: "source-authority", SourceRevision: 1, CatalogRevision: 1,
+		ChangeID: "change-id", OperationID: "operation-id",
+		PresentationKind: store.PresentationKindFileProvider,
+		FileProvider: store.FileProviderPreparationProof{
+			TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
+			Generation: account.Generation, ActivationGeneration: activation,
+			PublicPath: account.ConfigDir,
+		},
+	}
+}
+
+func assertSyncedAdmissionPending(
+	t *testing.T,
+	st *store.Store,
+	account store.Account,
+	wantProof store.PresentationPreparationProof,
+) {
+	t.Helper()
+	health, err := st.GetAuthHealth(account.ID)
+	if err != nil || !health.NeedsLogin || health.Kind != store.AuthKindAwaitingOrigin {
+		t.Fatalf("pending health = %+v err=%v", health, err)
+	}
+	presentation, err := st.AccountPresentation(account.ID)
+	if err != nil || presentation.Proof != wantProof {
+		t.Fatalf("pending proof = %+v err=%v", presentation, err)
+	}
+	if _, err := st.SyncedCredentialAdmission(account); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("pending admission evidence error = %v, want sql.ErrNoRows", err)
+	}
+}

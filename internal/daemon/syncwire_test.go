@@ -329,11 +329,6 @@ func TestAuthKindClassification(t *testing.T) {
 				}
 				t.Cleanup(func() { _ = s.m.Store.SetMeta(metaSyncEnabled, "1") })
 			}
-			if tc.uuid != "" {
-				if err := s.m.Store.SetAccountUUID(1, tc.uuid); err != nil {
-					t.Fatal(err)
-				}
-			}
 			a := store.Account{
 				ID: 1, AccountUUID: tc.uuid, ConfigDir: t.TempDir(),
 				KeychainService: "svc-auth-kind", KeychainAccount: "cc-pool",

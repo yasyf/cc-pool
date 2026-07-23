@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -19,6 +20,10 @@ type PendingAccountReservation struct {
 	Owner      proc.Record
 	CreatedAt  time.Time
 }
+
+// ErrSyncedPromotionAmbiguous means durable state cannot prove either an exact
+// promotion or an untouched reservation safe to abandon.
+var ErrSyncedPromotionAmbiguous = errors.New("synced account promotion state is ambiguous")
 
 // ReserveAccountIndex atomically allocates the smallest unused account index
 // (>= 1, gap-filling): the free-index computation and insert are one SQL
@@ -233,11 +238,88 @@ func exactSyncedPromotion(
 		presentation.AccountGeneration != expected.Generation || presentation.Proof != proof {
 		return false, nil
 	}
-	var authRows int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM auth_health WHERE account_id=?`, expected.ID).Scan(&authRows); err != nil {
+	var needsLogin, gen int64
+	var reason, kind string
+	var digest []byte
+	if err := tx.QueryRow(
+		`SELECT needs_login,reason,digest,kind,gen FROM auth_health WHERE account_id=?`,
+		expected.ID,
+	).Scan(&needsLogin, &reason, &digest, &kind, &gen); errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
 		return false, err
 	}
-	return authRows == 1, nil
+	wantDigest := DigestReason("host-sync: awaiting origin credential")
+	var reservationRows int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pending_adds WHERE id=?`, expected.ID).Scan(&reservationRows); err != nil {
+		return false, err
+	}
+	return reservationRows == 0 && needsLogin == 1 && reason == string(AuthReasonAwaitingOrigin) &&
+		kind == string(AuthKindAwaitingOrigin) && gen == 1 &&
+		bytes.Equal(digest, wantDigest[:]), nil
+}
+
+// ResolveReservedSyncedPromotion classifies an interrupted promotion from one
+// consistent snapshot. Only an exact untouched reservation is safe to abandon.
+func (s *Store) ResolveReservedSyncedPromotion(
+	reservation PendingAccountReservation,
+	expected Account,
+	proof PresentationPreparationProof,
+) (Account, bool, error) {
+	if err := validatePendingReservationFence(reservation); err != nil {
+		return Account{}, false, err
+	}
+	if expected.ID != reservation.ID || expected.InstanceID != reservation.InstanceID ||
+		expected.Generation != reservation.Generation {
+		return Account{}, false, ErrSyncedPromotionAmbiguous
+	}
+	if err := validatePresentationPreparationProofForAccount(
+		proof, expected.InstanceID, expected.Generation, expected.ConfigDir,
+	); err != nil {
+		return Account{}, false, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Account{}, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	replayed, err := exactSyncedPromotion(tx, expected, proof)
+	if err != nil {
+		return Account{}, false, err
+	}
+	if replayed {
+		account, err := presentationAccount(tx, expected.ID)
+		return account, err == nil, err
+	}
+	var partial int
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM accounts WHERE id=?)
+		 OR EXISTS(SELECT 1 FROM account_presentations WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM auth_health WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM synced_credential_admissions WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM account_mutations WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM credential_operations WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM account_removals WHERE account_id=?)`,
+		expected.ID, expected.ID, expected.ID, expected.ID,
+		expected.ID, expected.ID, expected.ID, expected.ID,
+	).Scan(&partial); err != nil {
+		return Account{}, false, err
+	}
+	if partial != 0 {
+		return Account{}, false, ErrSyncedPromotionAmbiguous
+	}
+	current, err := pendingAccountReservationByID(tx, reservation.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Account{}, false, ErrSyncedPromotionAmbiguous
+	}
+	if err != nil {
+		return Account{}, false, err
+	}
+	if !samePendingAccountReservation(current, reservation) {
+		return Account{}, false, ErrSyncedPromotionAmbiguous
+	}
+	return Account{}, false, nil
 }
 
 // PendingAddReservationsOwnedBy returns one bounded stable account-id page.
@@ -327,9 +409,8 @@ func (s *Store) ReleaseRetiredPendingAdd(
 }
 
 // PendingAddIndexes lists every live account-index reservation, ascending. It
-// is the daemon orphan reap's mid-add guard: a domain whose account row has not
-// yet been promoted (PrepareAdd registers the domain before FinalizeAdd upserts
-// the row) is reserved here, so it is never mistaken for an orphan.
+// is the daemon orphan reap's mid-add guard: an account whose exact add mutation
+// has not committed remains reserved here, so it is never mistaken for an orphan.
 func (s *Store) PendingAddIndexes() ([]int, error) {
 	rows, err := s.db.Query(`SELECT id FROM pending_adds ORDER BY id`)
 	if err != nil {

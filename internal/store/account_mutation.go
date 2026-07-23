@@ -1059,6 +1059,9 @@ func (s *Store) SetAccountMutationMetadata(
 	if fence.OperationID == (AccountMutationID{}) || fence.OwnerEpoch == 0 {
 		return AccountMutationFence{}, ErrAccountMutationFence
 	}
+	if accountUUID == "" {
+		return AccountMutationFence{}, ErrAccountMutationState
+	}
 	mutation, err := s.AccountMutation(fence.OperationID)
 	if err != nil {
 		return AccountMutationFence{}, err

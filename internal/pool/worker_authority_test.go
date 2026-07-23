@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,6 +41,11 @@ func bindTestWorkerAuthority(t *testing.T, manager *Manager, generation string) 
 	}
 	manager.workerAuthority = &WorkerAuthority{
 		runner: rejectingTestTaskRunner{}, executable: identity.Executable, owner: owner,
+	}
+	var credentialClaim sync.Mutex
+	manager.ClaimCredentialMutation = func(int) (func(), error) {
+		credentialClaim.Lock()
+		return credentialClaim.Unlock, nil
 	}
 	manager.credentialCAS = testCredentialCAS(manager)
 	if manager.BuildCredentialWritePublication == nil {

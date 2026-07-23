@@ -77,6 +77,9 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.SetAccountMutationMetadata(fence, "verified-label", ""); !errors.Is(err, ErrAccountMutationState) {
+		t.Fatalf("empty account UUID metadata = %v, want ErrAccountMutationState", err)
+	}
 	fence, err = s.SetAccountMutationMetadata(fence, "verified-label", "verified-uuid")
 	if err != nil {
 		t.Fatal(err)

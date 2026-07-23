@@ -134,6 +134,8 @@ func (m *Manager) prepareReservedAdd(
 
 // PromoteSyncedAdd publishes one proven-path non-origin account before its
 // access-only credential is installed.
+var promoteSyncedAddFailpoint func(string) error
+
 func (m *Manager) PromoteSyncedAdd(
 	ctx context.Context,
 	pending *PendingAdd,
@@ -153,22 +155,54 @@ func (m *Manager) PromoteSyncedAdd(
 			accountUUID, identity.AccountUUID,
 		)
 	}
-	account := store.Account{
-		ID: pending.Reservation.ID, InstanceID: pending.Reservation.InstanceID,
-		Generation: pending.Reservation.Generation, ConfigDir: pending.ConfigDir,
-		KeychainService: pending.KeychainService, KeychainAccount: creds.AccountLabel(),
-		Label: label, AccountUUID: accountUUID, CreatedAt: time.Now(),
-	}
+	account := syncedPromotionAccount(pending, label, accountUUID)
 	if err := m.Store.PromoteReservedSyncedAccount(
 		pending.Reservation, account, pending.PresentationProof,
 	); err != nil {
 		return nil, fmt.Errorf("promote synced account %s: %w", pending.ConfigDir, err)
 	}
-	committed, err := m.Store.GetAccount(account.ID)
+	if promoteSyncedAddFailpoint != nil {
+		if err := promoteSyncedAddFailpoint("after-commit"); err != nil {
+			return nil, err
+		}
+	}
+	committed, exact, err := m.ResolvePromotedSyncedAdd(pending, label, accountUUID)
 	if err != nil {
 		return nil, err
 	}
-	return &committed, nil
+	if !exact {
+		return nil, store.ErrSyncedPromotionAmbiguous
+	}
+	return committed, nil
+}
+
+// ResolvePromotedSyncedAdd proves whether an interrupted promotion committed
+// exactly or retains its untouched reservation and is safe to abandon.
+func (m *Manager) ResolvePromotedSyncedAdd(
+	pending *PendingAdd,
+	label string,
+	accountUUID string,
+) (*store.Account, bool, error) {
+	if pending == nil || accountUUID == "" {
+		return nil, false, errors.New("resolve synced promotion: incomplete expected account")
+	}
+	expected := syncedPromotionAccount(pending, label, accountUUID)
+	account, exact, err := m.Store.ResolveReservedSyncedPromotion(
+		pending.Reservation, expected, pending.PresentationProof,
+	)
+	if err != nil || !exact {
+		return nil, exact, err
+	}
+	return &account, true, nil
+}
+
+func syncedPromotionAccount(pending *PendingAdd, label, accountUUID string) store.Account {
+	return store.Account{
+		ID: pending.Reservation.ID, InstanceID: pending.Reservation.InstanceID,
+		Generation: pending.Reservation.Generation, ConfigDir: pending.ConfigDir,
+		KeychainService: pending.KeychainService, KeychainAccount: creds.AccountLabel(),
+		Label: label, AccountUUID: accountUUID, CreatedAt: time.Now(),
+	}
 }
 
 // ReleaseAdd releases the index while retaining its private login state.

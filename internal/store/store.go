@@ -387,6 +387,17 @@ CREATE TABLE credential_quarantines (
   created_at                INTEGER NOT NULL CHECK(created_at > 0),
   CHECK((observation_keychain_state='present') = (observation_keychain_digest IS NOT NULL))
 );
+CREATE TABLE synced_credential_admissions (
+	account_id               INTEGER NOT NULL CHECK(account_id > 0),
+	account_instance_id      TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+	account_generation       INTEGER NOT NULL CHECK(account_generation > 0),
+	locator_digest           BLOB NOT NULL CHECK(length(locator_digest) = 32 AND locator_digest <> zeroblob(32)),
+	external_state_digest    BLOB NOT NULL CHECK(length(external_state_digest) = 32 AND external_state_digest <> zeroblob(32)),
+	token_chain_digest       BLOB NOT NULL CHECK(length(token_chain_digest) = 32 AND token_chain_digest <> zeroblob(32)),
+	access_hash_digest       BLOB NOT NULL CHECK(length(access_hash_digest) = 32 AND access_hash_digest <> zeroblob(32)),
+	admitted_at              INTEGER NOT NULL CHECK(admitted_at > 0),
+	PRIMARY KEY (account_id, account_instance_id, account_generation)
+);
 CREATE TABLE account_presentations (
   account_id              INTEGER PRIMARY KEY CHECK(account_id > 0),
   account_instance_id     TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
@@ -458,6 +469,10 @@ const SchemaVersion = 1
 
 // ErrSchemaMismatch means the database is not the exact schema accepted by this binary.
 var ErrSchemaMismatch = errors.New("store schema mismatch")
+
+// ErrAwaitingOriginAdmission means a generic auth-health path attempted to
+// bypass credential-bound synced admission.
+var ErrAwaitingOriginAdmission = errors.New("awaiting-origin admission requires exact credential evidence")
 
 const (
 	selectionTerminalTTL   = 10 * time.Minute
@@ -856,49 +871,8 @@ func (s *Store) GetAccount(id int) (Account, error) {
 	return a, err
 }
 
-// SetAccountUUID records an account's Claude accountUuid; a targeted UPDATE so
-// it can't clobber concurrent updates to the row's other columns.
-func (s *Store) SetAccountUUID(id int, uuid string) error {
-	if uuid == "" {
-		return fmt.Errorf("set account_uuid for account %d: empty UUID", id)
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var duplicateID int
-	err = tx.QueryRow(
-		`SELECT id FROM accounts WHERE account_uuid=? AND id!=? AND deleted_at IS NULL LIMIT 1`,
-		uuid, id,
-	).Scan(&duplicateID)
-	if err == nil {
-		return fmt.Errorf("%w: %q already belongs to account %d", ErrDuplicateAccountUUID, uuid, duplicateID)
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	res, err := tx.Exec(
-		`UPDATE accounts SET account_uuid=? WHERE id=? AND deleted_at IS NULL`,
-		uuid, id,
-	)
-	if err != nil {
-		return fmt.Errorf("set account_uuid for account %d: %w", id, err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return fmt.Errorf("account %d not found", id)
-	}
-	return tx.Commit()
-}
-
 // GetAccountByUUID returns the account whose Claude accountUuid is uuid,
-// ok=false if none. An empty uuid never matches (every un-backfilled row holds
-// the empty-string default), and duplicate uuids resolve to the lowest id so
-// repeated calls never flap.
+// ok=false if none. An empty uuid never matches.
 func (s *Store) GetAccountByUUID(uuid string) (Account, bool, error) {
 	if uuid == "" {
 		return Account{}, false, nil
@@ -966,6 +940,7 @@ func (s *Store) DeleteAccount(id int) error {
 		`DELETE FROM sessions WHERE account_id=?`,
 		`DELETE FROM refresh_log WHERE account_id=?`,
 		`DELETE FROM sticky WHERE account_id=?`,
+		`DELETE FROM synced_credential_admissions WHERE account_id=?`,
 		`DELETE FROM auth_health WHERE account_id=?`,
 		`DELETE FROM account_presentation_quarantines WHERE account_id=?`,
 		`DELETE FROM account_presentations WHERE account_id=?`,
@@ -1722,14 +1697,15 @@ func (s *Store) SetNeedsLogin(
 	digest [32]byte,
 	kind AuthKind,
 ) (bool, error) {
-	if !kind.Valid() || !reason.Valid() || reason == AuthReasonNone {
+	if !kind.Valid() || !reason.Valid() || reason == AuthReasonNone ||
+		(kind == AuthKindAwaitingOrigin) != (reason == AuthReasonAwaitingOrigin) {
 		return false, fmt.Errorf("set needs-login for account %d: invalid auth kind %q", accountID, kind)
 	}
 	prev, err := s.GetAuthHealth(accountID)
 	if err != nil {
 		return false, err
 	}
-	if _, err := s.db.Exec(
+	result, err := s.db.Exec(
 		`INSERT INTO auth_health(account_id,needs_login,since,reason,digest,kind,gen) VALUES(?,1,?,?,?,?,1)
 		 ON CONFLICT(account_id) DO UPDATE SET
 		   needs_login=1,
@@ -1737,9 +1713,25 @@ func (s *Store) SetNeedsLogin(
 		   digest=excluded.digest,
 		   kind=excluded.kind,
 		   since=CASE WHEN auth_health.needs_login=1 THEN auth_health.since ELSE excluded.since END,
-		   gen=auth_health.gen+1`,
-		accountID, at.Unix(), reason, digest[:], string(kind)); err != nil {
+		   gen=auth_health.gen+1
+		 WHERE auth_health.kind<>'awaiting_origin' OR excluded.kind='awaiting_origin'`,
+		accountID, at.Unix(), reason, digest[:], string(kind))
+	if err != nil {
 		return false, fmt.Errorf("set needs-login for account %d: %w", accountID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows == 0 {
+		current, readErr := s.GetAuthHealth(accountID)
+		if readErr != nil {
+			return false, readErr
+		}
+		if current.NeedsLogin && current.Kind == AuthKindAwaitingOrigin && kind != AuthKindAwaitingOrigin {
+			return false, ErrAwaitingOriginAdmission
+		}
+		return false, errors.New("set needs-login changed no rows")
 	}
 	return !prev.NeedsLogin, nil
 }
@@ -1748,7 +1740,8 @@ func (s *Store) SetNeedsLogin(
 // only on the true→false transition, so the daemon logs recovery exactly once.
 func (s *Store) ClearNeedsLogin(accountID int) (bool, error) {
 	res, err := s.db.Exec(
-		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none', digest=zeroblob(32), kind='owned' WHERE account_id=? AND needs_login=1`,
+		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none', digest=zeroblob(32), kind='owned'
+		 WHERE account_id=? AND needs_login=1 AND kind<>'awaiting_origin'`,
 		accountID)
 	if err != nil {
 		return false, fmt.Errorf("clear needs-login for account %d: %w", accountID, err)
@@ -1764,7 +1757,8 @@ func (s *Store) ClearNeedsLogin(accountID int) (bool, error) {
 // matches the caller's observed generation.
 func (s *Store) ClearNeedsLoginIfGen(accountID int, gen int64) (bool, error) {
 	res, err := s.db.Exec(
-		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none', digest=zeroblob(32), kind='owned' WHERE account_id=? AND needs_login=1 AND gen=?`,
+		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none', digest=zeroblob(32), kind='owned'
+		 WHERE account_id=? AND needs_login=1 AND gen=? AND kind<>'awaiting_origin'`,
 		accountID, gen)
 	if err != nil {
 		return false, fmt.Errorf("clear needs-login for account %d: %w", accountID, err)

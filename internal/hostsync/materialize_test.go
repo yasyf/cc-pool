@@ -28,9 +28,8 @@ import (
 
 const materializeManifest = "/cfg/synckit/manifests/cc-pool.json"
 
-// stubRefresher satisfies pool.Refresher: Usage always succeeds so FinalizeAdd's
-// best-effort validation passes, and Refresh is never reached by these tests
-// (their pulled credentials carry a future expiry, so no preemptive refresh runs).
+// stubRefresher satisfies pool.Refresher: Usage always succeeds and Refresh is
+// never reached by these tests because their pulled credentials are unexpired.
 type stubRefresher struct{}
 
 func (stubRefresher) Refresh(context.Context, string, string) (*oauth.TokenResponse, error) {
@@ -262,6 +261,11 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 	if err != nil {
 		t.Fatal(err)
 	}
+	var credentialClaim sync.Mutex
+	m.ClaimCredentialMutation = func(int) (func(), error) {
+		credentialClaim.Lock()
+		return credentialClaim.Unlock, nil
+	}
 	t.Cleanup(func() { _ = m.Close(t.Context()) })
 	m.Creds = credentials
 	m.OAuth = stubRefresher{}
@@ -309,8 +313,7 @@ func mustMutationOwner(t *testing.T, manager *pool.Manager) proc.Record {
 	return owner
 }
 
-// freshEnvelope is a pulled STRIPPED envelope whose access token has not
-// expired, so FinalizeAdd's usage validation never triggers a refresh.
+// freshEnvelope is a pulled stripped envelope whose access token is unexpired.
 func freshEnvelope(access string) *creds.Credential {
 	c := cred(access, "")
 	c.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
@@ -334,8 +337,8 @@ func pullConst(c *creds.Credential) PullCredential {
 }
 
 // TestMaterializeHappyPath pins the full peer-add: a dir, the verbatim identity,
-// the pulled credential in the Keychain, a registered row with the backfilled
-// uuid, and a synckitd nudge — with no interactive login.
+// the pulled credential in the Keychain, an exact UUID-bound row, and a
+// synckitd nudge — with no interactive login.
 func TestMaterializeHappyPath(t *testing.T) {
 	s, m, fk, rec := newMaterializeService(t)
 
@@ -394,13 +397,13 @@ func TestMaterializeHappyPath(t *testing.T) {
 		t.Fatalf("oauthAccount = %s, want %s (verbatim)", top["oauthAccount"], oauthAccount)
 	}
 
-	// Row registered, credential in the Keychain, uuid backfilled.
+	// Row registered with its immutable UUID and credential in the Keychain.
 	row, err := m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if row.AccountUUID != "u-happy" {
-		t.Fatalf("row AccountUUID = %q, want u-happy (backfill)", row.AccountUUID)
+		t.Fatalf("row AccountUUID = %q, want u-happy", row.AccountUUID)
 	}
 	if row.ConfigDir != configDir || row.ConfigDir == pool.AccountDir(1) ||
 		row.KeychainService != creds.ServiceName(configDir) {
@@ -451,15 +454,104 @@ func TestMaterializeHappyPath(t *testing.T) {
 	}
 }
 
-func TestMaterializeRejectsExistingExternalUUIDBeforePull(t *testing.T) {
+func TestMaterializeResolvesCommittedPromotionBeforeCleanup(t *testing.T) {
 	s, manager, _, _ := newMaterializeService(t)
-	existing := store.Account{
-		ID: 9, ConfigDir: materializePresentationPath(9),
-		KeychainService: "existing-service", KeychainAccount: "existing-account",
-	}
-	if err := manager.Store.UpsertAccount(existing); err != nil {
+	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	s.promoteSyncedAdd = func(
+		ctx context.Context,
+		pending *pool.PendingAdd,
+		label string,
+		uuid string,
+	) (*store.Account, error) {
+		if _, err := manager.PromoteSyncedAdd(ctx, pending, label, uuid); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("injected lost promotion response")
+	}
+	result, err := s.Materialize(
+		t.Context(),
+		materializeVal("u-lost-response", "lost@example.com", json.RawMessage(`{"accountUuid":"u-lost-response"}`)),
+		[]string{"hostB"}, pullConst(freshEnvelope("at-lost-response")), materializeManifest,
+	)
+	if err != nil || result.AccountID != 1 {
+		t.Fatalf("Materialize after lost promotion response = %+v err=%v", result, err)
+	}
+	account, err := manager.Store.GetAccount(result.AccountID)
+	if err != nil || account.AccountUUID != "u-lost-response" {
+		t.Fatalf("durable account = %+v err=%v", account, err)
+	}
+	if _, err := os.Stat(pool.AccountBackingDir(result.AccountID)); err != nil {
+		t.Fatalf("committed backing was abandoned: %v", err)
+	}
+}
+
+func TestMaterializeAbandonsOnlyProvenUntouchedPromotion(t *testing.T) {
+	s, manager, _, _ := newMaterializeService(t)
+	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.promoteSyncedAdd = func(
+		context.Context, *pool.PendingAdd, string, string,
+	) (*store.Account, error) {
+		return nil, errors.New("injected pre-commit failure")
+	}
+	_, err := s.Materialize(
+		t.Context(),
+		materializeVal("u-precommit", "precommit@example.com", json.RawMessage(`{"accountUuid":"u-precommit"}`)),
+		[]string{"hostB"}, pullConst(freshEnvelope("at-precommit")), materializeManifest,
+	)
+	if err == nil {
+		t.Fatal("Materialize pre-commit failure succeeded")
+	}
+	if _, err := manager.Store.GetAccount(1); !errors.Is(err, store.ErrAccountNotFound) {
+		t.Fatalf("account after proven pre-commit failure = %v", err)
+	}
+	if _, err := os.Stat(pool.AccountBackingDir(1)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uncommitted backing survived safe abandon: %v", err)
+	}
+}
+
+func TestMaterializeNeverAbandonsAmbiguousPromotion(t *testing.T) {
+	s, manager, _, _ := newMaterializeService(t)
+	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.promoteSyncedAdd = func(
+		context.Context, *pool.PendingAdd, string, string,
+	) (*store.Account, error) {
+		return nil, errors.New("injected unknown promotion result")
+	}
+	s.resolvePromotedSyncedAdd = func(
+		*pool.PendingAdd, string, string,
+	) (*store.Account, bool, error) {
+		return nil, false, store.ErrSyncedPromotionAmbiguous
+	}
+	_, err := s.Materialize(
+		t.Context(),
+		materializeVal("u-ambiguous", "ambiguous@example.com", json.RawMessage(`{"accountUuid":"u-ambiguous"}`)),
+		[]string{"hostB"}, pullConst(freshEnvelope("at-ambiguous")), materializeManifest,
+	)
+	if !errors.Is(err, store.ErrSyncedPromotionAmbiguous) {
+		t.Fatalf("Materialize ambiguous promotion err=%v", err)
+	}
+	if _, err := os.Stat(pool.AccountBackingDir(1)); err != nil {
+		t.Fatalf("ambiguous backing was destroyed: %v", err)
+	}
+	indexes, err := manager.Store.PendingAddIndexes()
+	if err != nil || !reflect.DeepEqual(indexes, []int{1}) {
+		t.Fatalf("ambiguous reservation indexes = %v err=%v", indexes, err)
+	}
+}
+
+func TestMaterializeRejectsExistingExternalUUIDBeforePull(t *testing.T) {
+	s, manager, _, _ := newMaterializeService(t)
+	existing := admitHostsyncTestAccount(t, manager, store.Account{
+		ID: 9, ConfigDir: materializePresentationPath(9),
+		KeychainService: "existing-service", KeychainAccount: "existing-account",
+		AccountUUID: "duplicate",
+	})
 	identityPath := filepath.Join(pool.AccountBackingDir(existing.ID), ".claude.json")
 	if err := os.MkdirAll(filepath.Dir(identityPath), 0o700); err != nil {
 		t.Fatal(err)
@@ -586,6 +678,9 @@ func TestSyncedAdmissionRefreshesActivationAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := materializePresentationPath(reservation.ID)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	proofA := materializePreparationProof(reservation, path)
 	proofA.FileProvider.ActivationGeneration = "activation-A"
 	pending, err := m.PrepareReservedSyncedAdd(t.Context(), reservation, proofA)
@@ -610,7 +705,9 @@ func TestSyncedAdmissionRefreshesActivationAfterRestart(t *testing.T) {
 	proofB.FileProvider.ActivationGeneration = "activation-B"
 	drifted := proofB
 	drifted.FileProvider.PublicPath += "-other"
-	if admitted, err := m.Store.AdmitSyncedAccount(*account, proofA, drifted); admitted || !errors.Is(err, store.ErrAccountPresentationEvidence) {
+	if admitted, err := m.Store.AdmitSyncedAccount(
+		*account, proofA, drifted, store.SyncedCredentialAdmissionFence{},
+	); admitted || !errors.Is(err, store.ErrAccountPresentationEvidence) {
 		t.Fatalf("drifted admission = %v err=%v", admitted, err)
 	}
 	if presentation, err := m.Store.AccountPresentation(account.ID); err != nil || presentation.Proof != proofA {
@@ -1139,7 +1236,7 @@ func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
 
 // TestMaterializeEmptyOAuthDefers pins carry-forward #3: an entry with no
 // oauthAccount is deferred — no dir, no reservation, no pull — never an error
-// loop, so a later scan-publish backfill can supply the identity.
+// loop, so a later origin publication can supply the identity.
 func TestMaterializeEmptyOAuthDefers(t *testing.T) {
 	cases := map[string]json.RawMessage{
 		"absent": nil,

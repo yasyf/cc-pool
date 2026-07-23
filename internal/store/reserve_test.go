@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 )
 
 func openReserveTest(t *testing.T) *Store {
@@ -320,6 +321,10 @@ func TestPromoteReservedSyncedAccountLostResponseReplaysAfterReopen(t *testing.T
 	if err := s.PromoteReservedSyncedAccount(reservation, account, proof); err != nil {
 		t.Fatalf("replay after reopen: %v", err)
 	}
+	resolved, exact, err := s.ResolveReservedSyncedPromotion(reservation, account, proof)
+	if err != nil || !exact || resolved.InstanceID != account.InstanceID {
+		t.Fatalf("resolve after reopen = %+v exact=%v err=%v", resolved, exact, err)
+	}
 	committed, err := s.GetAccount(account.ID)
 	if err != nil || committed.InstanceID != account.InstanceID || committed.AccountUUID != account.AccountUUID {
 		t.Fatalf("committed account = %+v err=%v", committed, err)
@@ -335,6 +340,31 @@ func TestPromoteReservedSyncedAccountLostResponseReplaysAfterReopen(t *testing.T
 	next := mustReserve(t, s)
 	if next.ID == reservation.ID {
 		t.Fatalf("replayed reservation index %d became reusable", reservation.ID)
+	}
+}
+
+func TestResolveReservedSyncedPromotionProvesOnlyUntouchedReservationSafe(t *testing.T) {
+	s := openReserveTest(t)
+	reservation := mustReserve(t, s)
+	account := Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "external-uuid",
+	}
+	proof := presentationTestProof(account, account.ConfigDir, "activation-synced")
+	if _, exact, err := s.ResolveReservedSyncedPromotion(reservation, account, proof); err != nil || exact {
+		t.Fatalf("untouched reservation exact=%v err=%v, want safe uncommitted", exact, err)
+	}
+	partialDigest := DigestReason("partial")
+	if _, err := s.db.Exec(
+		`INSERT INTO auth_health(account_id,needs_login,since,reason,digest,kind,gen)
+		 VALUES(?,1,?,'awaiting_origin',?,'awaiting_origin',1)`,
+		account.ID, time.Now().Unix(), partialDigest[:],
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, exact, err := s.ResolveReservedSyncedPromotion(reservation, account, proof); exact || !errors.Is(err, ErrSyncedPromotionAmbiguous) {
+		t.Fatalf("partial promotion exact=%v err=%v, want ambiguous", exact, err)
 	}
 }
 
