@@ -161,8 +161,9 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 		t.Fatal("tap transaction assesses a raw Mach-O binary as an application bundle")
 	}
 	for _, line := range strings.Split(release, "\n") {
-		if strings.Contains(line, "yasyf/homebrew-tap/") && strings.Contains(line, "@v") {
-			t.Fatalf("release uses a mutable homebrew-tap workflow or action reference: %s", line)
+		if strings.Contains(line, "yasyf/homebrew-tap/") &&
+			!strings.Contains(line, "@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9") {
+			t.Fatalf("release uses a mixed or mutable homebrew-tap reference: %s", line)
 		}
 	}
 }
