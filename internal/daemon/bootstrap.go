@@ -69,11 +69,25 @@ func (s *Server) finishBootstrap(err error) {
 	s.bootstrap.lastProgressAt = s.bootstrapTime()
 }
 
-func (s *Server) bootstrapSnapshot(generation string) BootstrapProgress {
+type bootstrapProgress struct {
+	Total          int
+	Settled        int
+	Quarantined    int
+	Terminal       bool
+	Failures       []bootstrapFailure
+	LastProgressAt time.Time
+}
+
+type bootstrapFailure struct {
+	AccountID int
+	Error     string
+}
+
+func (s *Server) bootstrapSnapshot() bootstrapProgress {
 	s.bootstrapMu.Lock()
 	defer s.bootstrapMu.Unlock()
-	progress := BootstrapProgress{
-		Generation: generation, Total: s.bootstrap.total, Settled: s.bootstrap.settled,
+	progress := bootstrapProgress{
+		Total: s.bootstrap.total, Settled: s.bootstrap.settled,
 		Quarantined: s.bootstrap.quarantined, Terminal: s.bootstrap.terminal,
 		LastProgressAt: s.bootstrap.lastProgressAt,
 	}
@@ -83,7 +97,7 @@ func (s *Server) bootstrapSnapshot(generation string) BootstrapProgress {
 	}
 	sort.Ints(ids)
 	for _, id := range ids {
-		progress.Failures = append(progress.Failures, BootstrapFailure{AccountID: id, Error: s.bootstrap.failures[id]})
+		progress.Failures = append(progress.Failures, bootstrapFailure{AccountID: id, Error: s.bootstrap.failures[id]})
 	}
 	return progress
 }

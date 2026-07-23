@@ -559,7 +559,7 @@ func TestInitializeBindsLiveProofForFreshDesiredAccounts(t *testing.T) {
 			t.Fatalf("acct-%02d presentation = %+v", account.ID, presentation)
 		}
 	}
-	progress := server.bootstrapSnapshot("generation-fresh")
+	progress := server.bootstrapSnapshot()
 	if progress.Total != 2 || progress.Settled != 2 || progress.Quarantined != 0 ||
 		!progress.Terminal || len(progress.Failures) != 0 {
 		t.Fatalf("bootstrap progress = %+v", progress)
@@ -666,7 +666,7 @@ func TestInitializeSettlesDesiredGenerationMismatchWithDurableQuarantine(t *test
 	if active, err := st.ListActiveAccounts(); err != nil || len(active) != 0 {
 		t.Fatalf("active after mismatch = %+v err=%v", active, err)
 	}
-	progress := server.bootstrapSnapshot("generation-quarantine")
+	progress := server.bootstrapSnapshot()
 	if progress.Total != 1 || progress.Settled != 1 || progress.Quarantined != 1 ||
 		!progress.Terminal || len(progress.Failures) != 0 {
 		t.Fatalf("quarantine bootstrap progress = %+v", progress)
