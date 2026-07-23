@@ -8,10 +8,12 @@ import (
 )
 
 const (
-	releaseAppWorkflowPin = "83ee384b1d4fe25a8e4aa7258bb76d55e1593735"
-	releaseActionPin      = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
-	releaseDraftActionPin = "54e3e194bda69896894a82c17fcdb2822beefab5"
-	releasePublishPin     = "9ca67392d45d66b6ae01e262383c8f3138d56f5e"
+	// releaseAppWorkflowCommit is an immutable Git commit, not a credential.
+	//nolint:gosec // G101 cannot distinguish the pinned commit from a secret.
+	releaseAppWorkflowCommit = "83ee384b1d4fe25a8e4aa7258bb76d55e1593735"
+	releaseActionCommit      = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
+	releaseDraftActionCommit = "54e3e194bda69896894a82c17fcdb2822beefab5"
+	releasePublishCommit     = "9ca67392d45d66b6ae01e262383c8f3138d56f5e"
 )
 
 func TestReleaseCLIFailsClosedBeforeArtifactPublication(t *testing.T) {
@@ -80,8 +82,8 @@ func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
 		`"dist/staged-app/$APP_ASSET"`,
 		`"dist/staged-app/$APP_ASSET.sha256"`,
 		`> "$RUNNER_TEMP/cc-pool-release-assets"`,
-		"actions/stage-draft-release@" + releaseDraftActionPin,
-		"actions/publish-draft-release@" + releaseDraftActionPin,
+		"actions/stage-draft-release@" + releaseDraftActionCommit,
+		"actions/publish-draft-release@" + releaseDraftActionCommit,
 		`release-id: ${{ steps.draft.outputs['release-id'] }}`,
 		`manifest: ${{ runner.temp }}/cc-pool-release-assets`,
 	} {
@@ -103,7 +105,7 @@ func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
 	if !strings.Contains(release, "permissions:\n  contents: read") {
 		t.Fatal("release workflow does not default non-owner jobs to read-only contents")
 	}
-	if !strings.Contains(release, "release-app.yml@"+releaseAppWorkflowPin) {
+	if !strings.Contains(release, "release-app.yml@"+releaseAppWorkflowCommit) {
 		t.Fatal("release workflow is not pinned to the caller-owned staging contract")
 	}
 	appJob := strings.Index(release, "\n  release-app:")
@@ -149,7 +151,7 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 		"xcrun stapler validate app/CCPoolStatus.app",
 		"spctl --assess --type execute --verbose=4 app/CCPoolStatus.app",
 		"Publish the CLI formula to the tap",
-		"homebrew-tap/.github/actions/publish@" + releasePublishPin,
+		"homebrew-tap/.github/actions/publish@" + releasePublishCommit,
 		"delete-file: Casks/cc-pool-status.rb",
 	} {
 		if !strings.Contains(publish, required) {
@@ -170,20 +172,20 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 	for _, line := range strings.Split(release, "\n") {
 		switch {
 		case strings.Contains(line, "yasyf/homebrew-tap/.github/workflows/release-app.yml@"):
-			if !strings.Contains(line, "@"+releaseAppWorkflowPin) {
+			if !strings.Contains(line, "@"+releaseAppWorkflowCommit) {
 				t.Fatalf("release-app uses a mixed or mutable workflow reference: %s", line)
 			}
 		case strings.Contains(line, "actions/stage-draft-release@"),
 			strings.Contains(line, "actions/publish-draft-release@"):
-			if !strings.Contains(line, "@"+releaseDraftActionPin) {
+			if !strings.Contains(line, "@"+releaseDraftActionCommit) {
 				t.Fatalf("release uses a mixed or mutable draft action reference: %s", line)
 			}
 		case strings.Contains(line, "yasyf/homebrew-tap/.github/actions/publish@"):
-			if !strings.Contains(line, "@"+releasePublishPin) {
+			if !strings.Contains(line, "@"+releasePublishCommit) {
 				t.Fatalf("release uses a mixed or mutable tap publish action reference: %s", line)
 			}
 		case strings.Contains(line, "yasyf/homebrew-tap/.github/actions/"):
-			if !strings.Contains(line, "@"+releaseActionPin) {
+			if !strings.Contains(line, "@"+releaseActionCommit) {
 				t.Fatalf("release uses a mixed or mutable action reference: %s", line)
 			}
 		}

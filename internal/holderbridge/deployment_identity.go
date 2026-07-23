@@ -204,15 +204,19 @@ func currentConsumerBuild() (string, error) {
 	return consumerBuildForExecutable(path)
 }
 
-func consumerBuildForExecutable(path string) (string, error) {
+func consumerBuildForExecutable(path string) (_ string, resultErr error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return "", errors.New("CCPoolStatus: updater executable path is not exact and absolute")
 	}
-	file, err := os.Open(path)
+	file, err := os.OpenInRoot(filepath.Dir(path), filepath.Base(path))
 	if err != nil {
 		return "", fmt.Errorf("CCPoolStatus: open updater executable: %w", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("CCPoolStatus: close updater executable: %w", err))
+		}
+	}()
 	info, err := file.Stat()
 	if err != nil {
 		return "", fmt.Errorf("CCPoolStatus: inspect updater executable: %w", err)

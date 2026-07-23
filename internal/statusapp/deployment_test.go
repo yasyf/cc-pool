@@ -74,7 +74,10 @@ func exactDeploymentReceipt(
 	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(executable, []byte("test helper"), 0o700); err != nil {
+	if err := os.WriteFile(executable, []byte("test helper"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(executable, 0o700); err != nil { //nolint:gosec // Executable fixture requires the owner execute bit.
 		t.Fatal(err)
 	}
 	operation := deployment.Operation{ID: "00112233445566778899aabbccddeeff", Generation: generation}

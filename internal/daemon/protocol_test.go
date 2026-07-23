@@ -162,6 +162,7 @@ func TestServerRejectsOldClientBuildBeforeBusinessDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = client.Close() })
 	result, err := client.Call(t.Context(), wire.Op(OpStatus), "", []byte(`{"op":"status"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -171,9 +172,6 @@ func TestServerRejectsOldClientBuildBeforeBusinessDispatch(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Fatalf("old client dispatched %d business handlers", calls.Load())
-	}
-	if err := client.Close(); err != nil {
-		t.Fatal(err)
 	}
 }
 

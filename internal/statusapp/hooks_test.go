@@ -325,7 +325,10 @@ func testOperation(t *testing.T) deployment.Operation {
 	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(executable, []byte("test helper"), 0o700); err != nil {
+	if err := os.WriteFile(executable, []byte("test helper"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(executable, 0o700); err != nil { //nolint:gosec // Executable fixture requires the owner execute bit.
 		t.Fatal(err)
 	}
 	return operation

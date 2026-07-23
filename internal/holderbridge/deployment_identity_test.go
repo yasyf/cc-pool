@@ -18,7 +18,10 @@ import (
 func TestConsumerBuildForExecutableHashesExactBytes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ccp")
 	payload := []byte("exact updater bytes")
-	if err := os.WriteFile(path, payload, 0o700); err != nil {
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // Executable fixture requires the owner execute bit.
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(payload)
