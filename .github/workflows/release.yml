@@ -177,7 +177,7 @@ jobs:
     needs: [version, widget-test]
     permissions:
       contents: write
-    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@a023f584d39d221bc6028261db4dfdf99a047dea
+    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@b143646dd7291fd4b83c53afdfbb9a5a130740c6
     with:
       app_name: CCPoolStatus
       asset_name: cc-pool-status
