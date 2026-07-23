@@ -384,7 +384,7 @@ jobs:
             __SHA_PURE__=${{ needs.release.outputs.pure_sha256 }}
 
       - name: Publish the CLI formula to the tap
-        uses: yasyf/homebrew-tap/.github/actions/publish@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
+        uses: yasyf/homebrew-tap/.github/actions/publish@9ca67392d45d66b6ae01e262383c8f3138d56f5e
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging

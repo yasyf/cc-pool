@@ -11,6 +11,7 @@ const (
 	releaseAppWorkflowPin = "83ee384b1d4fe25a8e4aa7258bb76d55e1593735"
 	releaseActionPin      = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
 	releaseDraftActionPin = "54e3e194bda69896894a82c17fcdb2822beefab5"
+	releasePublishPin     = "9ca67392d45d66b6ae01e262383c8f3138d56f5e"
 )
 
 func TestReleaseCLIFailsClosedBeforeArtifactPublication(t *testing.T) {
@@ -148,6 +149,7 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 		"xcrun stapler validate app/CCPoolStatus.app",
 		"spctl --assess --type execute --verbose=4 app/CCPoolStatus.app",
 		"Publish the CLI formula to the tap",
+		"homebrew-tap/.github/actions/publish@" + releasePublishPin,
 		"delete-file: Casks/cc-pool-status.rb",
 	} {
 		if !strings.Contains(publish, required) {
@@ -175,6 +177,10 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 			strings.Contains(line, "actions/publish-draft-release@"):
 			if !strings.Contains(line, "@"+releaseDraftActionPin) {
 				t.Fatalf("release uses a mixed or mutable draft action reference: %s", line)
+			}
+		case strings.Contains(line, "yasyf/homebrew-tap/.github/actions/publish@"):
+			if !strings.Contains(line, "@"+releasePublishPin) {
+				t.Fatalf("release uses a mixed or mutable tap publish action reference: %s", line)
 			}
 		case strings.Contains(line, "yasyf/homebrew-tap/.github/actions/"):
 			if !strings.Contains(line, "@"+releaseActionPin) {
