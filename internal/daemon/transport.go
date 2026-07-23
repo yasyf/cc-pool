@@ -172,6 +172,7 @@ func (s *Server) daemonHealthObservation(ctx context.Context, request wire.Obser
 			return wire.ObservationResponse{}, fmt.Errorf("count active sessions: %w", err)
 		}
 	}
+	snapshot.Bootstrap = s.bootstrapSnapshot(health.ProcessGeneration)
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return wire.ObservationResponse{}, fmt.Errorf("encode daemon health observation: %w", err)

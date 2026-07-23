@@ -90,12 +90,16 @@ func (c *tenantCoordinator) initialize(ctx context.Context) error {
 		c.server.m.Store.PageAccountRemovals,
 		c.finishRemoval,
 	); err != nil {
+		c.server.finishBootstrap(err)
 		return err
 	}
 	accounts, err := c.server.m.Store.ListDesiredAccounts()
 	if err != nil {
-		return fmt.Errorf("list desired accounts for tenant recovery: %w", err)
+		err = fmt.Errorf("list desired accounts for tenant recovery: %w", err)
+		c.server.finishBootstrap(err)
+		return err
 	}
+	c.server.setBootstrapTotal(len(accounts))
 	prepareContext := ctx
 	if c.lifecycle != nil {
 		var cancel context.CancelCauseFunc
@@ -107,38 +111,42 @@ func (c *tenantCoordinator) initialize(ctx context.Context) error {
 	for _, desired := range accounts {
 		account := desired
 		group.Go(func() error {
-			if err := c.prepareDesiredAccount(prepareContext, account); err != nil {
-				return fmt.Errorf("recover acct-%02d tenant: %w", account.ID, err)
+			quarantined, err := c.prepareDesiredAccount(prepareContext, account)
+			if err != nil {
+				err = fmt.Errorf("recover acct-%02d tenant: %w", account.ID, err)
 			}
-			return nil
+			c.server.settleBootstrapAccount(account.ID, quarantined, err)
+			return err
 		})
 	}
-	return group.Wait()
+	err = group.Wait()
+	c.server.finishBootstrap(err)
+	return err
 }
 
-func (c *tenantCoordinator) prepareDesiredAccount(ctx context.Context, account store.Account) error {
+func (c *tenantCoordinator) prepareDesiredAccount(ctx context.Context, account store.Account) (bool, error) {
 	proof, err := c.prepare(ctx, account)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := c.activatePrepared(ctx, account, proof, func() error { return nil }); err != nil {
-		return err
+		return false, err
 	}
 	stored, err := projectPreparationProof(proof)
 	if err != nil {
-		return err
+		return false, err
 	}
 	expected, err := expectedPresentationIdentity(account)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := c.server.m.Store.BindDesiredAccountPresentation(account, expected, stored); err != nil {
 		if errors.Is(err, store.ErrAccountPresentationQuarantined) {
-			return nil
+			return true, nil
 		}
-		return err
+		return false, err
 	}
-	return nil
+	return false, nil
 }
 
 func expectedPresentationIdentity(account store.Account) (store.FileProviderPresentationIdentity, error) {

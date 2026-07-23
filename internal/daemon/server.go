@@ -129,6 +129,9 @@ type Server struct {
 	runtimePublished           atomic.Bool
 	runtimeShutdown            func(context.Context) error
 	runtimeHealth              func(context.Context) (dkdaemon.Health, error)
+	bootstrapMu                sync.Mutex
+	bootstrap                  bootstrapState
+	bootstrapNow               func() time.Time
 	prepareAccount             func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error)
 	prepareReservedAccount     func(context.Context, store.PendingAccountReservation) (catalogproto.TenantPreparationProof, error)
 	observePresentationBinding func(context.Context, store.Account, store.PresentationPreparationProof) error
@@ -187,6 +190,12 @@ func Run(ctx context.Context) error {
 }
 
 func (s *Server) activate(activation dkdaemon.Activation) (err error) {
+	s.beginBootstrap()
+	defer func() {
+		if err != nil {
+			s.finishBootstrap(err)
+		}
+	}()
 	s.holderActive.Store(false)
 	s.holderLost.Store(false)
 	s.runtimePublished.Store(false)

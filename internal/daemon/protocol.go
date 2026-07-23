@@ -166,18 +166,36 @@ type HealthRequest struct {
 
 // HealthResponse is one exact daemon process-generation lifecycle snapshot.
 type HealthResponse struct {
-	Schema             uint16       `json:"schema"`
-	RuntimeBuild       string       `json:"runtime_build"`
-	RuntimeProtocol    int          `json:"runtime_protocol"`
-	ProcessGeneration  string       `json:"process_generation"`
-	PID                int          `json:"pid"`
-	State              RuntimeState `json:"state"`
-	Draining           bool         `json:"draining"`
-	Busy               bool         `json:"busy"`
-	Ready              bool         `json:"ready"`
-	ActiveReservations int          `json:"active_reservations"`
-	ActiveSessions     int          `json:"active_sessions"`
-	ExclusiveClaims    int          `json:"exclusive_claims"`
+	Schema             uint16            `json:"schema"`
+	RuntimeBuild       string            `json:"runtime_build"`
+	RuntimeProtocol    int               `json:"runtime_protocol"`
+	ProcessGeneration  string            `json:"process_generation"`
+	PID                int               `json:"pid"`
+	State              RuntimeState      `json:"state"`
+	Draining           bool              `json:"draining"`
+	Busy               bool              `json:"busy"`
+	Ready              bool              `json:"ready"`
+	ActiveReservations int               `json:"active_reservations"`
+	ActiveSessions     int               `json:"active_sessions"`
+	ExclusiveClaims    int               `json:"exclusive_claims"`
+	Bootstrap          BootstrapProgress `json:"bootstrap"`
+}
+
+// BootstrapProgress is the exact current-generation desired-tenant bootstrap state.
+type BootstrapProgress struct {
+	Generation     string             `json:"generation"`
+	Total          int                `json:"total"`
+	Settled        int                `json:"settled"`
+	Quarantined    int                `json:"quarantined"`
+	Terminal       bool               `json:"terminal"`
+	Failures       []BootstrapFailure `json:"failures"`
+	LastProgressAt time.Time          `json:"last_progress_at"`
+}
+
+// BootstrapFailure is one currently terminal account bootstrap failure.
+type BootstrapFailure struct {
+	AccountID int    `json:"account_id,omitempty"`
+	Error     string `json:"error"`
 }
 
 // RuntimeState is the exact v1 daemon-health state enum.

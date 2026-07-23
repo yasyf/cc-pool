@@ -65,6 +65,9 @@ func TestDaemonHealthObservationRequiresPublishedHealthyRuntime(t *testing.T) {
 	if response.ActiveReservations != 1 || response.ActiveSessions != 0 || response.ExclusiveClaims != 1 {
 		t.Fatalf("live health counts = %+v", response)
 	}
+	if response.Bootstrap.Generation != "generation-1" {
+		t.Fatalf("bootstrap generation = %+v", response.Bootstrap)
+	}
 	health.Busy = false
 	health.Ready = true
 	result, err = server.daemonHealthObservation(t.Context(), request)
