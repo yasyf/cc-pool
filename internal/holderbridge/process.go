@@ -14,7 +14,7 @@ func OwnRuntime(
 	cleanup func() error,
 ) (daemon.EmbeddedRuntime, error) {
 	if runtime == nil || cleanup == nil {
-		return nil, errors.New("holderbridge: owned runtime and cleanup are required")
+		return nil, errors.New("FuseKit runtime: owned runtime and cleanup are required")
 	}
 	return &ownedRuntime{
 		EmbeddedRuntime: runtime,
