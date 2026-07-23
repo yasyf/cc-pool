@@ -1,15 +1,15 @@
-// Command seed fabricates and mutates file-backend pool accounts for the
+// Command seed fabricates and mutates Keychain-backed pool accounts for the
 // two-host sync sim (scripts/sync-sim/run.sh). It drives cc-pool's own
-// packages — store.Open, creds.FileStore, the pool identity writers, and
+// packages — store.Open, creds.KeychainItem, the pool identity writers, and
 // hostsync — so the fabricated state matches what a real `ccp add` plus
-// `claude /login` would leave on disk, minus any real token or Keychain item.
+// `claude /login` would leave on disk, using the sim's isolated fake Keychain.
 // Every path resolves off $HOME, so the caller points HOME at /tmp/ccp-sim/{a,b}.
-// It never talks to the real network or the Keychain.
+// It never talks to the real network or login Keychain.
 //
 // Subcommands:
 //
 //	seed init                     set the initialized + symlink-overlay meta, make ~/.claude base
-//	seed account --id N ...       fabricate a logged-in file-backend account (row uuid left empty)
+//	seed account --id N ...       fabricate a logged-in Keychain account (row uuid left empty)
 //	seed rotate  --id N ...       write a fresh OWNED chain in place (models a login/rotation on this host)
 //	seed setexp  --id N ...       rewrite the credential's expiresAt in place, tokens preserved
 //	seed hash    --id N           print the current credential's AccessHash
@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -30,9 +31,28 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
+
+type directTaskRunner struct{}
+
+func (directTaskRunner) Run(ctx context.Context, task supervise.Task) error {
+	command := exec.CommandContext(ctx, task.Path, task.Args...) //nolint:gosec // sim controls the exact security shim path
+	command.Dir = task.Dir
+	command.Env = task.Env
+	command.Stdin = task.Stdin
+	command.Stdout = task.Stdout
+	command.Stderr = task.Stderr
+	return command.Run()
+}
+
+func simCredentialStore(configDir string) creds.KeychainItem {
+	return creds.KeychainItem{
+		Service: creds.ServiceName(configDir), Account: creds.AccountLabel(), Runner: directTaskRunner{},
+	}
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -144,8 +164,8 @@ func cmdAccount(args []string) error {
 	}
 
 	cred := makeCred(*access, *refresh, *expiresMS)
-	if err := (creds.FileStore{ConfigDir: configDir}).Write(context.Background(), cred); err != nil {
-		return fmt.Errorf("write file credential: %w", err)
+	if err := simCredentialStore(configDir).Write(context.Background(), cred); err != nil {
+		return fmt.Errorf("write Keychain credential: %w", err)
 	}
 
 	rowUUID := ""
@@ -170,8 +190,8 @@ func cmdAccount(args []string) error {
 	return nil
 }
 
-// cmdRotate writes a fresh OWNED chain in place: new tokens/expiry to the file
-// store, refresh token present. On a host that currently holds a synced (peer)
+// cmdRotate writes a fresh OWNED chain in place: new tokens/expiry to the
+// isolated Keychain, refresh token present. On a host that currently holds a synced (peer)
 // copy this models `ccp login` minting the host its own origin chain; on the
 // origin it models an out-of-band rotation.
 func cmdRotate(args []string) error {
@@ -186,12 +206,12 @@ func cmdRotate(args []string) error {
 	}
 
 	configDir := pool.AccountDir(*id)
-	fstore := creds.FileStore{ConfigDir: configDir}
-	if _, err := fstore.Read(context.Background()); err != nil {
+	credentialStore := simCredentialStore(configDir)
+	if _, err := credentialStore.Read(context.Background()); err != nil {
 		return fmt.Errorf("read current credential: %w", err)
 	}
 	next := makeCred(*access, *refresh, *expiresMS)
-	if err := fstore.Write(context.Background(), next); err != nil {
+	if err := credentialStore.Write(context.Background(), next); err != nil {
 		return fmt.Errorf("write rotated credential: %w", err)
 	}
 	fmt.Printf("rotated acct-%02d hash=%s\n", *id, creds.AccessHash(next))
@@ -209,13 +229,13 @@ func cmdSetExp(args []string) error {
 	if *expiresMS == 0 {
 		return fmt.Errorf("setexp needs --expires-ms")
 	}
-	fstore := creds.FileStore{ConfigDir: pool.AccountDir(*id)}
-	cur, err := fstore.Read(context.Background())
+	credentialStore := simCredentialStore(pool.AccountDir(*id))
+	cur, err := credentialStore.Read(context.Background())
 	if err != nil {
 		return fmt.Errorf("read current credential: %w", err)
 	}
 	cur.ClaudeAiOauth.ExpiresAt = *expiresMS
-	if err := fstore.Write(context.Background(), cur); err != nil {
+	if err := credentialStore.Write(context.Background(), cur); err != nil {
 		return fmt.Errorf("write re-expired credential: %w", err)
 	}
 	fmt.Printf("setexp acct-%02d expiresAt=%d hash=%s\n", *id, *expiresMS, creds.AccessHash(cur))
@@ -226,7 +246,7 @@ func cmdHash(args []string) error {
 	fs := flag.NewFlagSet("hash", flag.ExitOnError)
 	id := fs.Int("id", 1, "account index")
 	_ = fs.Parse(args)
-	cred, err := (creds.FileStore{ConfigDir: pool.AccountDir(*id)}).Read(context.Background())
+	cred, err := simCredentialStore(pool.AccountDir(*id)).Read(context.Background())
 	if err != nil {
 		return err
 	}

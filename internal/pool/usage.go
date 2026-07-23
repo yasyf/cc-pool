@@ -133,7 +133,7 @@ func (m *Manager) writeObservedCredential(
 		return err
 	}
 	if _, err := m.credentialCAS(ctx, a, boundary.expected, credentialCASMutation{
-		Target: src, Credential: next,
+		Credential: next,
 	}); err != nil {
 		if errors.Is(err, errCredentialCASConflict) {
 			return ErrCredentialChangedUnderfoot
@@ -278,7 +278,7 @@ func (m *Manager) refresh(
 		return nil, err
 	}
 	proof, err := m.credentialCAS(ctx, a, boundary.expected, credentialCASMutation{
-		Target: src, Refresh: true,
+		Refresh: true,
 	})
 	if err != nil {
 		if errors.Is(err, errCredentialCASConflict) {
@@ -297,8 +297,7 @@ func (m *Manager) refresh(
 
 // AdoptRotatedToken re-reads an account's credential (a live session may have rotated
 // it) and writes it back to re-assert our `security`-trusted ACL over the rotated
-// Keychain item; on the file backend it is a harmless no-ACL rewrite. The write-back
-// is CAS-guarded against a concurrent `claude /login`.
+// Keychain item. The write-back is CAS-guarded against a concurrent `claude /login`.
 func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error {
 	if err := m.requireCredentialMutationAllowed(a); err != nil {
 		return err
@@ -312,7 +311,7 @@ func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error 
 		m,
 		a,
 		store.CredentialOperationAdoptRotated,
-		unitCredentialOperationCodec(credentialTarget(source)),
+		unitCredentialOperationCodec(store.CredentialTargetKeychain),
 		func(ctx context.Context, boundary *credentialOperationBoundary) (struct{}, error) {
 			return struct{}{}, m.adoptRotatedToken(ctx, a, source, boundary)
 		},

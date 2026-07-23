@@ -72,7 +72,7 @@ func newDaemonTestManager(
 	return manager
 }
 
-func TestSelectPreflightSettlesBeforeReturnAndBlocksCredentialMove(t *testing.T) {
+func TestSelectPreflightSettlesBeforeReturn(t *testing.T) {
 	s, _ := newTestServer(t)
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -96,14 +96,6 @@ func TestSelectPreflightSettlesBeforeReturnAndBlocksCredentialMove(t *testing.T)
 	}
 	if got := s.cl.reservedCount(forced); got != 1 {
 		t.Fatalf("pending reservations = %d, want 1 during preflight", got)
-	}
-	account, err := s.m.Store.GetAccount(forced)
-	if err != nil {
-		t.Fatal(err)
-	}
-	move := s.moveAccountCred(t.Context(), account, creds.SourceFile, "file")
-	if move.Outcome != CredentialMoveBusy || !strings.Contains(move.Detail, "pending selection") {
-		t.Fatalf("credential move during preflight = %+v, want pending-selection busy", move)
 	}
 	select {
 	case response := <-responses:

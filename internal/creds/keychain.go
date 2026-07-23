@@ -1,7 +1,6 @@
 // Package creds owns Claude Code credentials: the Credential blob format, the
 // per-config-dir Keychain service-name derivation (exactly as Claude Code
-// does), and both storage backends — the macOS Keychain item accessed via
-// /usr/bin/security, and claude's plaintext .credentials.json fallback.
+// does), and the macOS Keychain item accessed via /usr/bin/security.
 //
 // Shelling out to Apple's signed security(1) keeps items prompt-free on later
 // reads: the item ACL trusts that binary, not ours, sidestepping ad-hoc-signing
@@ -64,8 +63,7 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	return original, err
 }
 
-// ErrNotFound is returned when a store holds no credential; both the Keychain
-// and file backends share it, so its text names neither.
+// ErrNotFound is returned when the Keychain item holds no credential.
 var ErrNotFound = errors.New("credential not found")
 
 // ServiceName derives the Keychain service name Claude Code uses for a given

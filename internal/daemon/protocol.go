@@ -40,8 +40,6 @@ const (
 	OpSelectAbort Op = "select-abort"
 	// OpStatus returns scored status for all accounts.
 	OpStatus Op = "status"
-	// OpCredMove moves account credentials between backends.
-	OpCredMove Op = "credmove"
 	// OpAccountRemove durably deprovisions and destroys one account.
 	OpAccountRemove Op = "account-remove"
 	// OpAccountIdentity reads worker-validated identity metadata for one account.
@@ -152,8 +150,6 @@ type Request struct {
 	// NoFallback: report none-available instead of a least-bad exhausted pick;
 	// no provisional selection is created when no account can serve.
 	NoFallback bool `json:"no_fallback,omitempty"`
-	// To is the credential backend for credmove ("keychain" or "file").
-	To string `json:"to,omitempty"`
 	// ExcludeIDs removes account-local preparation failures from a retry ranking.
 	ExcludeIDs []int `json:"exclude_ids,omitempty"`
 	// ReservationToken identifies a provisional select for commit or abort.
@@ -194,30 +190,6 @@ const (
 	// RuntimeStateFailed means the runtime cannot safely serve work.
 	RuntimeStateFailed RuntimeState = "failed"
 )
-
-// CredentialMoveOutcome classifies one account's credential move result.
-type CredentialMoveOutcome string
-
-const (
-	// CredentialMoveDone means the credential moved.
-	CredentialMoveDone CredentialMoveOutcome = "done"
-	// CredentialMoveAlready means the credential was already in the target backend.
-	CredentialMoveAlready CredentialMoveOutcome = "already"
-	// CredentialMoveBusy means a live session or reservation blocked it; re-run later.
-	CredentialMoveBusy CredentialMoveOutcome = "busy"
-	// CredentialMoveFailed means the move errored (detail says why).
-	CredentialMoveFailed CredentialMoveOutcome = "failed"
-)
-
-// CredentialMoveResult is one account's credential move outcome.
-type CredentialMoveResult struct {
-	ID      int                   `json:"id"`
-	Label   string                `json:"label,omitempty"`
-	From    string                `json:"from,omitempty"`
-	To      string                `json:"to,omitempty"`
-	Outcome CredentialMoveOutcome `json:"outcome"`
-	Detail  string                `json:"detail,omitempty"`
-}
 
 // LedgerState is one daemon-owned auth or rate-limit gate row on the status wire.
 type LedgerState struct {
@@ -475,7 +447,6 @@ type Response struct {
 	// Ledgers is the daemon self-heal ledger block, sorted by policy then resource.
 	Ledgers         []LedgerState          `json:"ledgers,omitempty"`
 	Version         string                 `json:"version,omitempty"` // health
-	CredentialMoves []CredentialMoveResult `json:"credential_moves,omitempty"`
 	AccountIdentity *AccountIdentityResult `json:"account_identity,omitempty"`
 	AccountHealth   *AccountHealthResult   `json:"account_health,omitempty"`
 	AccountMutation *AccountMutationResult `json:"account_mutation,omitempty"`

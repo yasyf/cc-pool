@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
-	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -58,8 +57,7 @@ func (f *fakeOAuth401) Refresh(_ context.Context, _, rt string) (*oauth.TokenRes
 // rotatingCreds is a Credentials seam whose Keychain store returns `current`
 // until rotateAfter reads elapse, then `rotated` — injecting a live session
 // that rotates the chain between successive reads. A Write makes the written
-// credential authoritative and cancels the pending rotation. The file backend
-// is the real (empty) FileStore under the account's temp ConfigDir.
+// credential authoritative and cancels the pending rotation.
 type rotatingCreds struct {
 	mu          sync.Mutex
 	reads       int
@@ -70,14 +68,11 @@ type rotatingCreds struct {
 }
 
 func (k *rotatingCreds) Store(a store.Account, src creds.Source) creds.Store {
-	if src == creds.SourceFile {
-		return credstest.FileStore(a.ConfigDir)
-	}
 	return rotatingItem{k: k, service: a.KeychainService}
 }
 
 func (k *rotatingCreds) Stores(a store.Account) []creds.Store {
-	return []creds.Store{k.Store(a, creds.SourceKeychain), k.Store(a, creds.SourceFile)}
+	return []creds.Store{k.Store(a, creds.SourceKeychain)}
 }
 
 func (k *rotatingCreds) Discover(context.Context, string) (string, error) { return "user", nil }

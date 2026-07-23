@@ -49,10 +49,9 @@ func (m *Manager) MutationOwner() (proc.Record, error) {
 // Credentials resolves an account's candidate credential stores; injectable
 // for tests.
 type Credentials interface {
-	// Store returns a's store for the backend src names.
+	// Store returns a's Keychain credential store.
 	Store(a store.Account, src creds.Source) creds.Store
-	// Stores returns a's candidate stores in resolution order: Keychain first
-	// (as claude prefers), then the plaintext file fallback.
+	// Stores returns a's sole Keychain credential store.
 	Stores(a store.Account) []creds.Store
 	// Discover resolves the account (-a) label actually stored on a service's
 	// Keychain item, or creds.ErrNotFound: `claude /login` items carry whatever
@@ -61,8 +60,7 @@ type Credentials interface {
 	Discover(context.Context, string) (string, error)
 }
 
-// sysCredentials is the production Credentials: the account's own Keychain
-// item and the plaintext .credentials.json inside its config dir.
+// sysCredentials resolves the account's sole Keychain credential item.
 type sysCredentials struct {
 	runner creds.TaskRunner
 }

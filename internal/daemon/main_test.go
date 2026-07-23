@@ -6,7 +6,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
@@ -29,8 +28,6 @@ func TestMain(m *testing.M) {
 		}
 	case IsCredentialWriteWorkerInvocation(os.Args[1:]):
 		err = RunCredentialWriteWorker(ctx, os.Stdin, os.Stdout)
-	case creds.IsFileWorkerInvocation(os.Args[1:]):
-		err = creds.RunFileWorker(ctx, os.Stdin, os.Stdout)
 	case pool.IsBackingWorkerInvocation(os.Args[1:]):
 		err = pool.RunBackingWorker(ctx, os.Stdin, os.Stdout)
 	case pool.IsCredentialCASWorkerInvocation(os.Args[1:]):

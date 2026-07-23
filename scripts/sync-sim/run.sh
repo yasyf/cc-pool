@@ -13,7 +13,7 @@
 #      family. The suite fails if the detector ever fires.
 #
 # HARD SAFETY: every process runs with HOME (and XDG_CONFIG_HOME) inside
-# /tmp/ccp-sim/{a,b}; credentials are file-backed with FAKE tokens; the real
+# /tmp/ccp-sim/{a,b}; credentials use isolated fake Keychains with FAKE tokens; the real
 # login Keychain is never touched (CLAUDE_POOL_SECURITY_BIN -> a file-backend
 # shim); the token/usage endpoints are redirected to a per-host fake-oauth
 # (CLAUDE_POOL_TOKEN_URL / CLAUDE_POOL_USAGE_URL); all NON-loopback egress is

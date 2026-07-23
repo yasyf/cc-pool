@@ -12,9 +12,6 @@ import (
 type testTaskRunner struct{}
 
 func (testTaskRunner) Run(ctx context.Context, task supervise.Task) error {
-	if IsFileWorkerInvocation(task.Args) {
-		return RunFileWorker(ctx, task.Stdin, task.Stdout)
-	}
 	if !filepath.IsAbs(task.Path) || filepath.Clean(task.Path) != task.Path {
 		return errors.New("test task executable must be a clean absolute path")
 	}

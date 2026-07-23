@@ -76,7 +76,7 @@ func testCredentialCAS(manager *Manager) credentialCASFunc {
 			return proof, errCredentialCASConflict
 		}
 		if mutation.Refresh {
-			previous, err := manager.Creds.Store(account, mutation.Target).Read(ctx)
+			previous, err := manager.Creds.Store(account, creds.SourceKeychain).Read(ctx)
 			if err != nil {
 				return proof, err
 			}
@@ -92,37 +92,21 @@ func testCredentialCAS(manager *Manager) credentialCASFunc {
 				next.ClaudeAiOauth.RefreshToken = response.RefreshToken
 			}
 			next.ClaudeAiOauth.ExpiresAt = response.Expiry(time.Now()).UnixMilli()
-			if err := manager.Creds.Store(account, mutation.Target).Write(ctx, &next); err != nil {
+			if err := manager.Creds.Store(account, creds.SourceKeychain).Write(ctx, &next); err != nil {
 				return proof, err
 			}
 			proof.Credential = &next
-		} else if mutation.DeleteAll {
-			for _, source := range []creds.Source{creds.SourceKeychain, creds.SourceFile} {
-				if err := manager.Creds.Store(account, source).Delete(ctx); err != nil {
-					return proof, err
-				}
-			}
-		} else if mutation.DeleteTarget {
-			if err := manager.Creds.Store(account, mutation.Target).Delete(ctx); err != nil {
+		} else if mutation.Delete {
+			if err := manager.Creds.Store(account, creds.SourceKeychain).Delete(ctx); err != nil {
 				return proof, err
 			}
 		} else {
 			if mutation.Credential == nil {
 				return proof, errors.New("test credential CAS mutation is empty")
 			}
-			target := manager.Creds.Store(account, mutation.Target)
+			target := manager.Creds.Store(account, creds.SourceKeychain)
 			if err := target.Write(ctx, mutation.Credential); err != nil {
 				return proof, err
-			}
-			if mutation.DeleteOther {
-				if err := manager.Creds.Store(account, otherSource(mutation.Target)).Delete(ctx); err != nil {
-					if mutation.RollbackTarget == nil {
-						_ = target.Delete(ctx)
-					} else {
-						_ = target.Write(ctx, mutation.RollbackTarget)
-					}
-					return proof, err
-				}
 			}
 		}
 		after, err := manager.credentialObservation(ctx, account)

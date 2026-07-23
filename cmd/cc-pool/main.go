@@ -53,13 +53,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	if creds.IsFileWorkerInvocation(os.Args[1:]) {
-		if err := creds.RunFileWorker(ctx, os.Stdin, os.Stdout); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-		return
-	}
 	if pool.IsBackingWorkerInvocation(os.Args[1:]) {
 		if err := pool.RunBackingWorker(ctx, os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)

@@ -67,38 +67,23 @@ func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task supervis
 			KeychainService: request.KeychainService, KeychainAccount: request.KeychainAccount,
 		}
 		after := request.Expected
-		empty := store.CredentialSlotObservation{State: store.CredentialSlotEmpty}
 		if len(request.Credential) != 0 {
 			var credential creds.Credential
 			if err := json.Unmarshal(request.Credential, &credential); err != nil {
 				return err
 			}
-			if err := runner.credentials.Store(account, request.Source).Write(ctx, &credential); err != nil {
+			if err := runner.credentials.Store(account, creds.SourceKeychain).Write(ctx, &credential); err != nil {
 				return err
 			}
 			digest := store.CredentialDigest(sha256.Sum256(request.Credential))
-			present := store.CredentialSlotObservation{State: store.CredentialSlotPresent, Digest: &digest}
-			if request.Source == creds.SourceKeychain {
-				after.Keychain = present
-			} else {
-				after.File = present
+			after.Keychain = store.CredentialSlotObservation{
+				State: store.CredentialSlotPresent, Digest: &digest,
 			}
-		} else if request.DeleteAll {
-			for _, source := range []creds.Source{creds.SourceKeychain, creds.SourceFile} {
-				if err := runner.credentials.Store(account, source).Delete(ctx); err != nil {
-					return err
-				}
-			}
-			after.Keychain, after.File = empty, empty
-		} else if request.DeleteTarget {
-			if err := runner.credentials.Store(account, request.Source).Delete(ctx); err != nil {
+		} else if request.Delete {
+			if err := runner.credentials.Store(account, creds.SourceKeychain).Delete(ctx); err != nil {
 				return err
 			}
-			if request.Source == creds.SourceKeychain {
-				after.Keychain = empty
-			} else {
-				after.File = empty
-			}
+			after.Keychain = store.CredentialSlotObservation{State: store.CredentialSlotEmpty}
 		} else {
 			return errors.New("unsupported materialize test credential CAS mutation")
 		}
@@ -113,16 +98,11 @@ func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task supervis
 type backingCredentials struct{ *credstest.Fake }
 
 func (c backingCredentials) Store(a store.Account, source creds.Source) creds.Store {
-	if source == creds.SourceFile {
-		return credstest.FaultStore{
-			Store: credstest.FileStore(pool.AccountBackingDir(a.ID)), Faults: c.FileFaults,
-		}
-	}
-	return c.Fake.Store(a, source)
+	return c.Fake.Store(a, creds.SourceKeychain)
 }
 
 func (c backingCredentials) Stores(a store.Account) []creds.Store {
-	return []creds.Store{c.Store(a, creds.SourceKeychain), c.Store(a, creds.SourceFile)}
+	return []creds.Store{c.Store(a, creds.SourceKeychain)}
 }
 
 type fixtureAccountRemover struct {

@@ -26,8 +26,6 @@ type accountMutationTestTaskRunner struct {
 
 func (r accountMutationTestTaskRunner) Run(ctx context.Context, task supervise.Task) error {
 	switch {
-	case creds.IsFileWorkerInvocation(task.Args):
-		return creds.RunFileWorker(ctx, task.Stdin, task.Stdout)
 	case pool.IsBackingWorkerInvocation(task.Args):
 		return pool.RunBackingWorker(ctx, task.Stdin, task.Stdout)
 	case pool.IsCredentialCASWorkerInvocation(task.Args):
@@ -75,12 +73,8 @@ func runDaemonTestCredentialCAS(
 	if request.Refresh {
 		return runDaemonTestCredentialRefresh(ctx, task, credentials, refresher, account, request, before)
 	}
-	if request.DeleteAll {
-		for _, source := range []creds.Source{creds.SourceKeychain, creds.SourceFile} {
-			if err = credentials.Store(account, source).Delete(ctx); err != nil && !errors.Is(err, creds.ErrNotFound) {
-				break
-			}
-		}
+	if request.Delete {
+		err = credentials.Store(account, creds.SourceKeychain).Delete(ctx)
 		after, observeErr := daemonTestCredentialState(ctx, credentials, account)
 		if err != nil || observeErr != nil {
 			return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
@@ -89,27 +83,10 @@ func runDaemonTestCredentialCAS(
 		}
 		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{Before: before, After: after})
 	}
-	target := credentials.Store(account, request.Source)
-	if request.DeleteTarget {
-		err = target.Delete(ctx)
-	} else {
-		var credential creds.Credential
-		if err = json.Unmarshal(request.Credential, &credential); err == nil {
-			err = target.Write(ctx, &credential)
-		}
-		if err == nil && request.DeleteOther {
-			err = credentials.Store(account, daemonTestOtherCredentialSource(request.Source)).Delete(ctx)
-			if err != nil {
-				if len(request.RollbackTarget) == 0 {
-					_ = target.Delete(ctx)
-				} else {
-					var rollback creds.Credential
-					if decodeErr := json.Unmarshal(request.RollbackTarget, &rollback); decodeErr == nil {
-						_ = target.Write(ctx, &rollback)
-					}
-				}
-			}
-		}
+	target := credentials.Store(account, creds.SourceKeychain)
+	var credential creds.Credential
+	if err = json.Unmarshal(request.Credential, &credential); err == nil {
+		err = target.Write(ctx, &credential)
 	}
 	after, observeErr := daemonTestCredentialState(ctx, credentials, account)
 	if err != nil || observeErr != nil {
@@ -132,7 +109,7 @@ func runDaemonTestCredentialRefresh(
 	if refresher == nil {
 		return errors.New("daemon test credential CAS refresh requires refresher")
 	}
-	target := credentials.Store(account, request.Source)
+	target := credentials.Store(account, creds.SourceKeychain)
 	previous, err := target.Read(ctx)
 	if err != nil {
 		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
@@ -182,39 +159,24 @@ func daemonTestCredentialState(
 	credentials pool.Credentials,
 	account store.Account,
 ) (store.CredentialExternalState, error) {
-	var state store.CredentialExternalState
-	for _, source := range []creds.Source{creds.SourceKeychain, creds.SourceFile} {
-		credential, err := credentials.Store(account, source).Read(ctx)
-		var slot store.CredentialSlotObservation
-		switch creds.ClassifyRead(err) {
-		case creds.ReadEmpty:
-			slot.State = store.CredentialSlotEmpty
-		case creds.ReadPresent:
-			payload, marshalErr := credential.Marshal()
-			if marshalErr != nil {
-				return store.CredentialExternalState{}, marshalErr
-			}
-			digest := store.CredentialDigest(sha256.Sum256(payload))
-			slot = store.CredentialSlotObservation{State: store.CredentialSlotPresent, Digest: &digest}
-		case creds.ReadUnsearchable:
-			slot.State = store.CredentialSlotUnsearchable
-		case creds.ReadFatal:
-			slot.State = store.CredentialSlotUnreadable
+	credential, err := credentials.Store(account, creds.SourceKeychain).Read(ctx)
+	var slot store.CredentialSlotObservation
+	switch creds.ClassifyRead(err) {
+	case creds.ReadEmpty:
+		slot.State = store.CredentialSlotEmpty
+	case creds.ReadPresent:
+		payload, marshalErr := credential.Marshal()
+		if marshalErr != nil {
+			return store.CredentialExternalState{}, marshalErr
 		}
-		if source == creds.SourceKeychain {
-			state.Keychain = slot
-		} else {
-			state.File = slot
-		}
+		digest := store.CredentialDigest(sha256.Sum256(payload))
+		slot = store.CredentialSlotObservation{State: store.CredentialSlotPresent, Digest: &digest}
+	case creds.ReadUnsearchable:
+		slot.State = store.CredentialSlotUnsearchable
+	case creds.ReadFatal:
+		slot.State = store.CredentialSlotUnreadable
 	}
-	return state, nil
-}
-
-func daemonTestOtherCredentialSource(source creds.Source) creds.Source {
-	if source == creds.SourceKeychain {
-		return creds.SourceFile
-	}
-	return creds.SourceKeychain
+	return store.CredentialExternalState{Keychain: slot}, nil
 }
 
 type accountMutationTestRefresher struct{}

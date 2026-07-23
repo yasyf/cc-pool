@@ -130,14 +130,11 @@ func TestScoreInputMarksCredentialQuarantine(t *testing.T) {
 	a := persistTestAccount(t, st, store.Account{
 		ID: 1, ConfigDir: t.TempDir(), KeychainService: "service", KeychainAccount: "account",
 	})
-	filePath := creds.FileCredentialPath(a.ConfigDir)
 	if _, err := st.QuarantineCredential(store.QuarantineCredentialRequest{
 		AccountID: a.ID, AccountInstanceID: a.InstanceID, AccountGeneration: a.Generation,
-		LocatorDigest:     store.CredentialLocatorDigest(a.KeychainService, a.KeychainAccount, filePath),
-		FileLocatorDigest: store.CredentialFileLocatorDigest(filePath),
+		LocatorDigest: store.CredentialKeychainLocatorDigest(a.KeychainService, a.KeychainAccount),
 		Observation: store.CredentialExternalState{
 			Keychain: store.CredentialSlotObservation{State: store.CredentialSlotEmpty},
-			File:     store.CredentialSlotObservation{State: store.CredentialSlotEmpty},
 		},
 		Reason: store.CredentialResultAmbiguous, FailureClass: store.CredentialFailureInternal,
 	}); err != nil {

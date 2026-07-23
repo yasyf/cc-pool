@@ -360,8 +360,6 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 		return s.handleSelectCommit(ctx, req)
 	case OpSelectAbort:
 		return s.handleSelectAbort(ctx, req)
-	case OpCredMove:
-		return s.handleCredMove(ctx, req)
 	case OpAccountRemove:
 		return s.handleAccountRemove(ctx, req)
 	case OpAccountIdentity:

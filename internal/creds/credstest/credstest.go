@@ -1,40 +1,16 @@
-// Package credstest provides in-memory test doubles for the pool's credential
-// seam: Fake resolves accounts to an in-memory Keychain plus the real on-disk
-// file store, and FaultStore injects per-op failures into any creds.Store.
+// Package credstest provides in-memory Keychain test doubles for the pool's
+// credential seam and per-operation failure injection.
 package credstest
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/supervise"
 )
-
-type fileTaskRunner struct{}
-
-func (fileTaskRunner) Run(ctx context.Context, task supervise.Task) error {
-	if !creds.IsFileWorkerInvocation(task.Args) {
-		return errors.New("unexpected credential test worker task")
-	}
-	if task.Stdin == nil || task.Stdout == nil {
-		return io.ErrUnexpectedEOF
-	}
-	return creds.RunFileWorker(ctx, task.Stdin, task.Stdout)
-}
-
-// FileStore returns a plaintext credential store backed by the in-process
-// worker adapter used only by tests.
-func FileStore(configDir string) creds.FileStore {
-	return creds.FileStore{
-		ConfigDir: configDir, Runner: fileTaskRunner{}, WorkerExecutable: "test-worker",
-	}
-}
 
 // Faults selects the per-op errors a FaultStore injects; nil fields pass
 // through to the wrapped Store.
@@ -74,17 +50,10 @@ func (s FaultStore) Delete(ctx context.Context) error {
 	return s.Store.Delete(ctx)
 }
 
-// Fake is an in-memory credential seam (it implements pool.Credentials).
-// Keychain items live in an internally locked map so any race the detector
-// reports is in the code under test; the file backend is the real on-disk
-// creds.FileStore under the account's ConfigDir, which tests point at a temp
-// dir. Keychain ops from code under test are recorded; seeding via Put/Remove
-// is not.
+// Fake is an in-memory Keychain credential seam (it implements pool.Credentials).
 type Fake struct {
-	// KeychainFaults and FileFaults are injected into every store Fake hands
-	// out. Set them before use — they are read without the lock.
+	// KeychainFaults are injected into every store Fake hands out.
 	KeychainFaults Faults
-	FileFaults     Faults
 
 	mu      sync.Mutex
 	items   map[string]*creds.Credential
@@ -126,22 +95,17 @@ func (f *Fake) Get(service, account string) (*creds.Credential, bool) {
 	return &cp, true
 }
 
-// Store returns a's store for the backend src names, wrapped with the
-// configured faults.
+// Store returns a's Keychain store wrapped with configured faults.
 func (f *Fake) Store(a store.Account, src creds.Source) creds.Store {
-	if src == creds.SourceFile {
-		return FaultStore{Store: FileStore(a.ConfigDir), Faults: f.FileFaults}
-	}
 	return FaultStore{
 		Store:  keychainItem{f: f, service: a.KeychainService, account: a.KeychainAccount},
 		Faults: f.KeychainFaults,
 	}
 }
 
-// Stores returns a's stores in the production resolution order: Keychain
-// first, then the file.
+// Stores returns a's sole Keychain credential store.
 func (f *Fake) Stores(a store.Account) []creds.Store {
-	return []creds.Store{f.Store(a, creds.SourceKeychain), f.Store(a, creds.SourceFile)}
+	return []creds.Store{f.Store(a, creds.SourceKeychain)}
 }
 
 // Discover mirrors creds.DiscoverAccount over the in-memory items.

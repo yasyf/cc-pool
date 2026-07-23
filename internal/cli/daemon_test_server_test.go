@@ -54,7 +54,6 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 		ccdaemon.OpSelectCommit,
 		ccdaemon.OpSelectAbort,
 		ccdaemon.OpStatus,
-		ccdaemon.OpCredMove,
 		ccdaemon.OpAccountIdentity,
 	} {
 		serverDurations[wire.Op(op)] = 2 * time.Minute
@@ -72,7 +71,6 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 		ccdaemon.OpSelectCommit,
 		ccdaemon.OpSelectAbort,
 		ccdaemon.OpStatus,
-		ccdaemon.OpCredMove,
 		ccdaemon.OpAccountIdentity,
 	} {
 		op := op

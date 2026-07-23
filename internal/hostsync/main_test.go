@@ -6,7 +6,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 )
@@ -17,8 +16,6 @@ func TestMain(m *testing.M) {
 	switch {
 	case os.Getenv(testRPCStateEnv) != "":
 		err = runTestRPCServer(ctx)
-	case creds.IsFileWorkerInvocation(os.Args[1:]):
-		err = creds.RunFileWorker(ctx, os.Stdin, os.Stdout)
 	case pool.IsBackingWorkerInvocation(os.Args[1:]):
 		err = pool.RunBackingWorker(ctx, os.Stdin, os.Stdout)
 	case procscan.IsWorkerInvocation(os.Args[1:]):

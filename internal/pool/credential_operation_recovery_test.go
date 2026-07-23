@@ -238,9 +238,8 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	filePath := creds.FileCredentialPath(account.ConfigDir)
-	locator := store.CredentialLocatorDigest(
-		account.KeychainService, account.KeychainAccount, filePath,
+	locator := store.CredentialKeychainLocatorDigest(
+		account.KeychainService, account.KeychainAccount,
 	)
 	operationID, err := store.NewCredentialOperationID(
 		account.InstanceID, account.Generation, kind, target, locator, expected, intent,
@@ -268,7 +267,6 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 		kind,
 		operationID,
 		locator,
-		store.CredentialFileLocatorDigest(filePath),
 		intent,
 		expected,
 		codec,
@@ -286,7 +284,6 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 		kind,
 		operationID,
 		locator,
-		store.CredentialFileLocatorDigest(filePath),
 		intent,
 		expected,
 		codec,
@@ -315,7 +312,6 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 		kind,
 		operationID,
 		locator,
-		store.CredentialFileLocatorDigest(filePath),
 		intent,
 		expected,
 		codec,
@@ -565,9 +561,8 @@ func TestRetirementReceiptWaitsForCredentialAndAccountMutationLanes(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	mutationFile := creds.FileCredentialPath(mutationAccount.ConfigDir)
-	mutationLocator := store.CredentialLocatorDigest(
-		mutationAccount.KeychainService, mutationAccount.KeychainAccount, mutationFile,
+	mutationLocator := store.CredentialKeychainLocatorDigest(
+		mutationAccount.KeychainService, mutationAccount.KeychainAccount,
 	)
 	mutationIntent := credentialIntentDigest(store.CredentialOperationAdoptRotated, "account-mutation")
 	mutationID, err := store.NewAccountMutationID(
@@ -677,9 +672,8 @@ func TestSourceOwnerReceiptsRecoverEveryCredentialLaneBeforeExactPrefixAck(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	mutationFile := creds.FileCredentialPath(mutationAccount.ConfigDir)
-	mutationLocator := store.CredentialLocatorDigest(
-		mutationAccount.KeychainService, mutationAccount.KeychainAccount, mutationFile,
+	mutationLocator := store.CredentialKeychainLocatorDigest(
+		mutationAccount.KeychainService, mutationAccount.KeychainAccount,
 	)
 	mutationIntent := credentialIntentDigest(store.CredentialOperationAdoptRotated, "source-account-mutation")
 	mutationID, err := store.NewAccountMutationID(
@@ -798,7 +792,7 @@ func TestExpiredEnsureFreshQuarantineAutoClearsOnExternalReplacement(t *testing.
 		manager,
 		account,
 		store.CredentialOperationEnsureFresh,
-		store.CredentialTargetAll,
+		store.CredentialTargetKeychain,
 		credentialIntentDigest(
 			store.CredentialOperationEnsureFresh, time.Minute.String(), "true",
 		),
@@ -863,7 +857,7 @@ func TestExpiredEnsureFreshDoesNotClaimConcurrentReplacement(t *testing.T) {
 		manager,
 		account,
 		store.CredentialOperationEnsureFresh,
-		store.CredentialTargetAll,
+		store.CredentialTargetKeychain,
 		credentialIntentDigest(
 			store.CredentialOperationEnsureFresh, time.Minute.String(), "true",
 		),
@@ -1060,17 +1054,15 @@ func TestCredentialQuarantineGatesEveryMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	filePath := creds.FileCredentialPath(account.ConfigDir)
 	if _, err := st.QuarantineCredential(store.QuarantineCredentialRequest{
 		AccountID: account.ID, AccountInstanceID: account.InstanceID,
 		AccountGeneration: account.Generation,
-		LocatorDigest: store.CredentialLocatorDigest(
-			account.KeychainService, account.KeychainAccount, filePath,
+		LocatorDigest: store.CredentialKeychainLocatorDigest(
+			account.KeychainService, account.KeychainAccount,
 		),
-		FileLocatorDigest: store.CredentialFileLocatorDigest(filePath),
-		Observation:       actual,
-		Reason:            store.CredentialResultAmbiguous,
-		FailureClass:      store.CredentialFailureInternal,
+		Observation:  actual,
+		Reason:       store.CredentialResultAmbiguous,
+		FailureClass: store.CredentialFailureInternal,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1080,13 +1072,6 @@ func TestCredentialQuarantineGatesEveryMutation(t *testing.T) {
 		name string
 		run  func() error
 	}{
-		{"move", func() error {
-			_, err := manager.MoveCredential(t.Context(), account, creds.SourceFile)
-			return err
-		}},
-		{"drop-divergent-copy", func() error {
-			return manager.DropDivergentCopy(t.Context(), account)
-		}},
 		{"adopt-rotated", func() error {
 			return manager.AdoptRotatedToken(t.Context(), account)
 		}},
@@ -1140,7 +1125,6 @@ func TestCompensateCredentialStateDeletesOnlyExactWrittenState(t *testing.T) {
 	credentials := credstest.NewFake()
 	written := datedCred("written", time.Hour)
 	credentials.Put(account.KeychainService, account.KeychainAccount, written)
-	writeRecoveryFileCredential(t, account, written)
 	manager := credentialRecoveryManager(t, st, credentials, "compensate-owner")
 	state, err := manager.CredentialExternalState(t.Context(), account)
 	if err != nil {
@@ -1159,9 +1143,6 @@ func TestCompensateCredentialStateDeletesOnlyExactWrittenState(t *testing.T) {
 	if _, ok := credentials.Get(account.KeychainService, account.KeychainAccount); !ok {
 		t.Fatal("mismatched compensation deleted Keychain credential")
 	}
-	if !fileCredentialExistsForTest(account.ConfigDir) {
-		t.Fatal("mismatched compensation deleted file credential")
-	}
 	if got := credentials.DeletedServices(); len(got) != 0 {
 		t.Fatalf("mismatched compensation Keychain deletes = %v, want none", got)
 	}
@@ -1171,9 +1152,6 @@ func TestCompensateCredentialStateDeletesOnlyExactWrittenState(t *testing.T) {
 	}
 	if _, ok := credentials.Get(account.KeychainService, account.KeychainAccount); ok {
 		t.Fatal("exact compensation retained Keychain credential")
-	}
-	if fileCredentialExistsForTest(account.ConfigDir) {
-		t.Fatal("exact compensation retained file credential")
 	}
 	if err := manager.CompensateCredentialState(t.Context(), account, exactDigest); err != nil {
 		t.Fatalf("idempotent compensation retry: %v", err)
@@ -1197,17 +1175,15 @@ func TestCompensateQuarantinedCredentialStateRejectsFailureClassMismatch(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	filePath := creds.FileCredentialPath(account.ConfigDir)
 	quarantine, err := st.QuarantineCredential(store.QuarantineCredentialRequest{
 		AccountID: account.ID, AccountInstanceID: account.InstanceID,
 		AccountGeneration: account.Generation,
-		LocatorDigest: store.CredentialLocatorDigest(
-			account.KeychainService, account.KeychainAccount, filePath,
+		LocatorDigest: store.CredentialKeychainLocatorDigest(
+			account.KeychainService, account.KeychainAccount,
 		),
-		FileLocatorDigest: store.CredentialFileLocatorDigest(filePath),
-		Observation:       state,
-		Reason:            store.CredentialResultAmbiguous,
-		FailureClass:      store.CredentialFailureInternal,
+		Observation:  state,
+		Reason:       store.CredentialResultAmbiguous,
+		FailureClass: store.CredentialFailureInternal,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1235,7 +1211,6 @@ func TestExpiredCompensationRecoveryFinishesExactPartialDelete(t *testing.T) {
 	credentials := credstest.NewFake()
 	written := datedCred("recovery-written", time.Hour)
 	credentials.Put(account.KeychainService, account.KeychainAccount, written)
-	writeRecoveryFileCredential(t, account, written)
 	manager := credentialRecoveryManager(t, st, credentials, "compensate-recovery-owner")
 	before, err := manager.credentialObservation(t.Context(), account)
 	if err != nil {
@@ -1250,7 +1225,7 @@ func TestExpiredCompensationRecoveryFinishesExactPartialDelete(t *testing.T) {
 		manager,
 		account,
 		store.CredentialOperationCompensate,
-		store.CredentialTargetAll,
+		store.CredentialTargetKeychain,
 		credentialIntentDigest(store.CredentialOperationCompensate, string(exactDigest[:])),
 		before,
 	)
@@ -1260,9 +1235,6 @@ func TestExpiredCompensationRecoveryFinishesExactPartialDelete(t *testing.T) {
 	}
 	if _, ok := credentials.Get(account.KeychainService, account.KeychainAccount); ok {
 		t.Fatal("compensation recovery retained Keychain credential")
-	}
-	if fileCredentialExistsForTest(account.ConfigDir) {
-		t.Fatal("compensation recovery retained file credential")
 	}
 	receipt, err := st.CredentialOperationReceipt(operation.Token)
 	if err != nil {
@@ -1294,9 +1266,8 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	filePath := creds.FileCredentialPath(account.ConfigDir)
-	locator := store.CredentialLocatorDigest(
-		account.KeychainService, account.KeychainAccount, filePath,
+	locator := store.CredentialKeychainLocatorDigest(
+		account.KeychainService, account.KeychainAccount,
 	)
 	accountIntent := credentialIntentDigest(store.CredentialOperationCompensate, "pending-add")
 	accountOperationID, err := store.NewPendingAddMutationID(
@@ -1314,7 +1285,8 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 		t.Fatalf("begin pending Add = %+v err=%v", begin, err)
 	}
 	fence, err := st.BindAccountMutationPresentation(
-		begin.Active.Fence(), account.ConfigDir, account.KeychainService,
+		begin.Active.Fence(), presentationRebindProof(account, account.ConfigDir, "activation-pending"),
+		account.ConfigDir, account.KeychainService,
 		account.KeychainAccount, locator, emptyDigest,
 	)
 	if err != nil {
@@ -1332,7 +1304,6 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 	}
 	written := datedCred("pending-written", time.Hour)
 	credentials.Put(account.KeychainService, account.KeychainAccount, written)
-	writeRecoveryFileCredential(t, account, written)
 	writtenState, err := manager.credentialObservation(t.Context(), account)
 	if err != nil {
 		t.Fatal(err)
@@ -1365,7 +1336,7 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 		manager,
 		account,
 		store.CredentialOperationCompensate,
-		store.CredentialTargetAll,
+		store.CredentialTargetKeychain,
 		credentialIntentDigest(store.CredentialOperationCompensate, string(writtenDigest[:])),
 		writtenState,
 	)
@@ -1373,11 +1344,7 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 	if err := recoverExpiredCredentialOperation(t, manager, operation); err != nil {
 		t.Fatalf("recover pending Add compensation: %v", err)
 	}
-	if fileCredentialExistsForTest(account.ConfigDir) {
-		t.Fatal("pending Add recovery retained file credential")
-	}
 	credentials.KeychainFaults.Read = errors.New("receipt replay must not read Keychain")
-	credentials.FileFaults.Read = errors.New("receipt replay must not read file credential")
 	if err := manager.CompensateCredentialState(t.Context(), account, writtenDigest); err != nil {
 		t.Fatalf("replay recovered pending Add compensation: %v", err)
 	}
@@ -1409,7 +1376,7 @@ func TestFreshReceiptReplayRejectsChangedCredential(t *testing.T) {
 		manager,
 		account,
 		store.CredentialOperationEnsureFresh,
-		store.CredentialTargetAll,
+		store.CredentialTargetKeychain,
 		credentialIntentDigest(store.CredentialOperationEnsureFresh, "inspect", "replay"),
 		before,
 	)
@@ -1500,11 +1467,12 @@ func TestCredentialOperationCancellationReleasesFlightAndLeavesReceipt(t *testin
 		t.Context(),
 		manager,
 		account,
-		store.CredentialOperationDropDivergent,
+		store.CredentialOperationAdoptRotated,
 		unitCredentialOperationCodec(
 			store.CredentialTargetKeychain,
 		),
 		func(context.Context, *credentialOperationBoundary) (struct{}, error) { return struct{}{}, nil },
+		"reused-after-cancellation",
 	); err != nil {
 		t.Fatalf("operation lane was not reusable after cancellation: %v", err)
 	}
@@ -1631,9 +1599,8 @@ func beginCredentialOperation(
 	before store.CredentialExternalState,
 ) store.CredentialOperation {
 	t.Helper()
-	filePath := creds.FileCredentialPath(account.ConfigDir)
-	locator := store.CredentialLocatorDigest(
-		account.KeychainService, account.KeychainAccount, filePath,
+	locator := store.CredentialKeychainLocatorDigest(
+		account.KeychainService, account.KeychainAccount,
 	)
 	operationID, err := store.NewCredentialOperationID(
 		account.InstanceID, account.Generation, kind, target, locator, before, intent,
@@ -1646,7 +1613,6 @@ func beginCredentialOperation(
 		AccountID:   account.ID, AccountInstanceID: account.InstanceID,
 		AccountGeneration: account.Generation,
 		LocatorDigest:     locator,
-		FileLocatorDigest: store.CredentialFileLocatorDigest(filePath),
 		Owner:             manager.workers.owner,
 		Kind:              kind,
 		Target:            target,
@@ -1673,13 +1639,6 @@ func recoverExpiredCredentialOperation(
 	)
 	recovery.workers.reaper = verifier
 	return recovery.recoverCredentialOperation(t.Context(), operation, receipt)
-}
-
-func writeRecoveryFileCredential(t *testing.T, account store.Account, credential *creds.Credential) {
-	t.Helper()
-	if err := writeFileCredentialForTest(account.ConfigDir, credential); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func credentialRetirementReceipt(

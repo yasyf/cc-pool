@@ -220,11 +220,9 @@ func runCredentialOperationObserved[T any](
 	if codec.intent != nil {
 		intent = *codec.intent
 	}
-	fileLocator := creds.FileCredentialPath(account.ConfigDir)
-	locator := store.CredentialLocatorDigest(
-		account.KeychainService, account.KeychainAccount, fileLocator,
+	locator := store.CredentialKeychainLocatorDigest(
+		account.KeychainService, account.KeychainAccount,
 	)
-	fileLocatorDigest := store.CredentialFileLocatorDigest(fileLocator)
 	operationID, err := store.NewCredentialOperationID(
 		account.InstanceID, account.Generation, kind, codec.target, locator, expected, intent,
 	)
@@ -273,7 +271,6 @@ func runCredentialOperationObserved[T any](
 			kind,
 			operationID,
 			locator,
-			fileLocatorDigest,
 			intent,
 			expected,
 			codec,
@@ -306,7 +303,6 @@ func executeCredentialOperation[T any](
 	kind store.CredentialOperationKind,
 	operationID store.CredentialOperationID,
 	locator store.CredentialDigest,
-	fileLocator store.CredentialDigest,
 	intent store.CredentialDigest,
 	expected store.CredentialExternalState,
 	codec credentialOperationCodec[T],
@@ -325,7 +321,6 @@ func executeCredentialOperation[T any](
 				AccountID:   account.ID, AccountInstanceID: account.InstanceID,
 				AccountGeneration: account.Generation,
 				LocatorDigest:     locator,
-				FileLocatorDigest: fileLocator,
 				Owner:             owner,
 				Kind:              kind,
 				Target:            codec.target,
@@ -339,7 +334,7 @@ func executeCredentialOperation[T any](
 		case errors.Is(err, store.ErrCredentialOperationSettlementRequired):
 			receipt := *begin.Receipt
 			if credentialReceiptMatchesInvocation(
-				receipt, account, kind, codec.target, locator, fileLocator, intent,
+				receipt, account, kind, codec.target, locator, intent,
 			) {
 				return replayCredentialOperation(ctx, manager, account, codec, receipt)
 			}
@@ -501,12 +496,11 @@ func validateCredentialQuarantineAccount(
 	account store.Account,
 	quarantine store.CredentialQuarantine,
 ) error {
-	filePath := creds.FileCredentialPath(account.ConfigDir)
 	if quarantine.AccountInstanceID != account.InstanceID ||
 		quarantine.AccountGeneration != account.Generation ||
-		quarantine.LocatorDigest != store.CredentialLocatorDigest(
-			account.KeychainService, account.KeychainAccount, filePath,
-		) || quarantine.FileLocatorDigest != store.CredentialFileLocatorDigest(filePath) {
+		quarantine.LocatorDigest != store.CredentialKeychainLocatorDigest(
+			account.KeychainService, account.KeychainAccount,
+		) {
 		return store.ErrAccountGenerationChanged
 	}
 	return nil
@@ -751,13 +745,13 @@ func credentialReceiptMatchesInvocation(
 	account store.Account,
 	kind store.CredentialOperationKind,
 	target store.CredentialTarget,
-	locator, fileLocator, intent store.CredentialDigest,
+	locator, intent store.CredentialDigest,
 ) bool {
 	return receipt.AccountID == account.ID &&
 		receipt.AccountInstanceID == account.InstanceID &&
 		receipt.AccountGeneration == account.Generation &&
 		receipt.Kind == kind && receipt.Target == target &&
-		receipt.LocatorDigest == locator && receipt.FileLocatorDigest == fileLocator &&
+		receipt.LocatorDigest == locator &&
 		receipt.IntentDigest == intent
 }
 
@@ -827,8 +821,7 @@ func credentialPublicationPayload(
 func credentialResultPublishesWrite(result store.CredentialResultCategory) bool {
 	switch result {
 	case store.CredentialResultRefreshed,
-		store.CredentialResultInstalled,
-		store.CredentialResultMoved:
+		store.CredentialResultInstalled:
 		return true
 	default:
 		return false
@@ -841,8 +834,7 @@ func credentialReceiptPublishesWrite(receipt store.CredentialOperationReceipt) b
 	}
 	switch receipt.Result {
 	case store.CredentialResultRefreshed,
-		store.CredentialResultInstalled,
-		store.CredentialResultMoved:
+		store.CredentialResultInstalled:
 		return true
 	default:
 		return false
@@ -987,7 +979,6 @@ func (m *Manager) compensateCredentialStateObserved(
 	if exactWrittenDigest == (store.CredentialDigest{}) {
 		return errors.New("credential compensation digest is required")
 	}
-	filePath := creds.FileCredentialPath(account.ConfigDir)
 	intent := credentialIntentDigest(
 		store.CredentialOperationCompensate, string(exactWrittenDigest[:]),
 	)
@@ -995,20 +986,19 @@ func (m *Manager) compensateCredentialStateObserved(
 		store.CredentialOperationEvidenceQuery{
 			AccountID: account.ID, AccountInstanceID: account.InstanceID,
 			AccountGeneration: account.Generation,
-			LocatorDigest: store.CredentialLocatorDigest(
-				account.KeychainService, account.KeychainAccount, filePath,
+			LocatorDigest: store.CredentialKeychainLocatorDigest(
+				account.KeychainService, account.KeychainAccount,
 			),
-			FileLocatorDigest: store.CredentialFileLocatorDigest(filePath),
-			Kind:              store.CredentialOperationCompensate,
-			Target:            store.CredentialTargetAll,
-			IntentDigest:      intent,
+			Kind:         store.CredentialOperationCompensate,
+			Target:       store.CredentialTargetKeychain,
+			IntentDigest: intent,
 		},
 	)
 	if err != nil {
 		return err
 	}
 	codec := unitCredentialOperationCodec(
-		store.CredentialTargetAll,
+		store.CredentialTargetKeychain,
 	)
 	if receipt != nil {
 		_, err := replayCredentialOperation(ctx, m, account, codec, *receipt)
@@ -1068,15 +1058,12 @@ func (m *Manager) credentialObservationWithExactQuarantine(
 	if !sameStoreCredentialQuarantine(expected, actual) {
 		return store.CredentialExternalState{}, store.ErrCredentialOperationState
 	}
-	filePath := creds.FileCredentialPath(account.ConfigDir)
 	if actual.AccountInstanceID != account.InstanceID ||
 		actual.AccountGeneration != account.Generation ||
-		actual.LocatorDigest != store.CredentialLocatorDigest(
+		actual.LocatorDigest != store.CredentialKeychainLocatorDigest(
 			account.KeychainService,
 			account.KeychainAccount,
-			filePath,
-		) ||
-		actual.FileLocatorDigest != store.CredentialFileLocatorDigest(filePath) {
+		) {
 		return store.CredentialExternalState{}, store.ErrAccountGenerationChanged
 	}
 	return m.credentialObservation(ctx, account)
@@ -1111,7 +1098,7 @@ func (m *Manager) compensateCredentialState(
 	if m.credentialCAS == nil {
 		return errors.New("credential CAS worker is unavailable")
 	}
-	_, err = m.credentialCAS(ctx, account, boundary.expected, credentialCASMutation{DeleteAll: true})
+	_, err = m.credentialCAS(ctx, account, boundary.expected, credentialCASMutation{Delete: true})
 	if errors.Is(err, errCredentialCASConflict) {
 		return ErrCredentialChangedUnderfoot
 	}
@@ -1143,7 +1130,7 @@ func unitCredentialOperationCodec(
 
 func freshCredentialOperationCodec() credentialOperationCodec[freshTokenResult] {
 	return credentialOperationCodec[freshTokenResult]{
-		target: store.CredentialTargetAll,
+		target: store.CredentialTargetKeychain,
 		resultCode: func(result freshTokenResult, err error) store.CredentialResultCategory {
 			if errors.Is(err, errCredentialCleanupPending) {
 				return store.CredentialResultCleanupFailed
@@ -1180,13 +1167,9 @@ func freshCredentialOperationCodec() credentialOperationCodec[freshTokenResult] 
 					store.QuarantineCredentialRequest{
 						AccountID: account.ID, AccountInstanceID: account.InstanceID,
 						AccountGeneration: account.Generation,
-						LocatorDigest: store.CredentialLocatorDigest(
+						LocatorDigest: store.CredentialKeychainLocatorDigest(
 							account.KeychainService,
 							account.KeychainAccount,
-							creds.FileCredentialPath(account.ConfigDir),
-						),
-						FileLocatorDigest: store.CredentialFileLocatorDigest(
-							creds.FileCredentialPath(account.ConfigDir),
 						),
 						Observation: quarantineObservation, TokenChainDigest: tokenChainDigest,
 						Reason:       store.CredentialResultChangedUnderfoot,
@@ -1271,55 +1254,6 @@ func installCredentialOperationCodec(
 	}
 }
 
-func moveCredentialOperationCodec(target creds.Source) credentialOperationCodec[*CredMove] {
-	return credentialOperationCodec[*CredMove]{
-		target: credentialTarget(target),
-		resultCode: func(result *CredMove, err error) store.CredentialResultCategory {
-			if err != nil || result == nil {
-				return store.CredentialResultFailed
-			}
-			switch {
-			case result.Moved:
-				return store.CredentialResultMoved
-			case result.CleanedStray:
-				return store.CredentialResultCleanedStray
-			default:
-				return store.CredentialResultAlreadyTarget
-			}
-		},
-		replay: func(_ context.Context, _ *Manager, _ store.Account, receipt store.CredentialOperationReceipt) (*CredMove, error) {
-			if receipt.TerminalStatus != store.CredentialTerminalSucceeded {
-				return replayCredentialReceiptFailure[*CredMove](receipt)
-			}
-			to := credentialSourceFromTarget(receipt.Target)
-			switch receipt.Result {
-			case store.CredentialResultMoved:
-				return &CredMove{From: otherSource(to), To: to, Moved: true}, nil
-			case store.CredentialResultAlreadyTarget:
-				return &CredMove{From: to, To: to}, nil
-			case store.CredentialResultCleanedStray:
-				return &CredMove{From: to, To: to, CleanedStray: true}, nil
-			default:
-				return nil, store.ErrCredentialOperationState
-			}
-		},
-	}
-}
-
-func credentialTarget(source creds.Source) store.CredentialTarget {
-	if source == creds.SourceFile {
-		return store.CredentialTargetFile
-	}
-	return store.CredentialTargetKeychain
-}
-
-func credentialSourceFromTarget(target store.CredentialTarget) creds.Source {
-	if target == store.CredentialTargetFile {
-		return creds.SourceFile
-	}
-	return creds.SourceKeychain
-}
-
 func (m *Manager) recoverCredentialOperation(
 	ctx context.Context,
 	operation store.CredentialOperation,
@@ -1331,14 +1265,10 @@ func (m *Manager) recoverCredentialOperation(
 	}
 	if account.InstanceID != operation.AccountInstanceID ||
 		account.Generation != operation.AccountGeneration ||
-		store.CredentialLocatorDigest(
+		store.CredentialKeychainLocatorDigest(
 			account.KeychainService,
 			account.KeychainAccount,
-			creds.FileCredentialPath(account.ConfigDir),
-		) != operation.LocatorDigest ||
-		store.CredentialFileLocatorDigest(
-			creds.FileCredentialPath(account.ConfigDir),
-		) != operation.FileLocatorDigest {
+		) != operation.LocatorDigest {
 		return store.ErrAccountGenerationChanged
 	}
 	owner, err := m.credentialOwnerRecord()
@@ -1369,7 +1299,7 @@ func (m *Manager) credentialOperationAccount(
 		return account, err
 	}
 	if operation.Kind != store.CredentialOperationCompensate ||
-		operation.Target != store.CredentialTargetAll {
+		operation.Target != store.CredentialTargetKeychain {
 		return store.Account{}, err
 	}
 	mutation, mutationErr := m.Store.ActiveAccountMutation(operation.AccountID)
@@ -1420,12 +1350,6 @@ func (m *Manager) recoverRetiredCredentialOperation(
 		return err
 	}
 	switch operation.Kind {
-	case store.CredentialOperationMove:
-		return m.recoverMoveCredentialOperation(ctx, account, operation, actual)
-	case store.CredentialOperationDropDivergent:
-		// Deleting whichever slot loses *now* could destroy a login that landed
-		// after the original process died. The expired owner did not persist an
-		// exact applied result, so observation alone cannot justify a delete.
 	case store.CredentialOperationAdoptRotated:
 		// Rewriting identical bytes is an ACL side effect not visible in the
 		// credential fingerprint. A usable blob therefore does not prove adopt.
@@ -1461,26 +1385,21 @@ func (m *Manager) recoverCompensateCredentialOperation(
 			operation, actual, store.CredentialTerminalQuarantined, store.CredentialResultAmbiguous,
 		)
 	}
-	for _, source := range []creds.Source{creds.SourceKeychain, creds.SourceFile} {
-		expectedSlot := credentialSourceSlot(operation.Expected, source)
-		actualSlot := credentialSourceSlot(actual, source)
-		switch {
-		case actualSlot.State == store.CredentialSlotEmpty:
-			continue
-		case credentialSlotPresent(expectedSlot) && credentialSlotPresent(actualSlot) &&
-			*expectedSlot.Digest == *actualSlot.Digest:
-		default:
-			return m.resolveRecoveredCredentialOperation(
-				operation, actual, store.CredentialTerminalQuarantined, store.CredentialResultChangedUnderfoot,
-			)
-		}
+	expectedSlot := operation.Expected.Keychain
+	actualSlot := actual.Keychain
+	if actualSlot.State != store.CredentialSlotEmpty &&
+		(!credentialSlotPresent(expectedSlot) || !credentialSlotPresent(actualSlot) ||
+			*expectedSlot.Digest != *actualSlot.Digest) {
+		return m.resolveRecoveredCredentialOperation(
+			operation, actual, store.CredentialTerminalQuarantined, store.CredentialResultChangedUnderfoot,
+		)
 	}
 	if m.credentialCAS == nil {
 		return m.resolveRecoveredCredentialOperation(
 			operation, actual, store.CredentialTerminalQuarantined, store.CredentialResultCleanupFailed,
 		)
 	}
-	proof, err := m.credentialCAS(ctx, account, actual, credentialCASMutation{DeleteAll: true})
+	proof, err := m.credentialCAS(ctx, account, actual, credentialCASMutation{Delete: true})
 	if err != nil {
 		result := store.CredentialResultCleanupFailed
 		if errors.Is(err, errCredentialCASConflict) {
@@ -1517,130 +1436,10 @@ func (m *Manager) resolveRecoveredCredentialOperation(
 	return err
 }
 
-func (m *Manager) recoverMoveCredentialOperation(
-	ctx context.Context,
-	account store.Account,
-	operation store.CredentialOperation,
-	actual store.CredentialExternalState,
-) error {
-	target := credentialSourceFromTarget(operation.Target)
-	before := operation.Expected
-	current := actual
-	if !credentialStateReadable(current) {
-		return m.resolveRecoveredCredentialOperation(
-			operation, actual, store.CredentialTerminalQuarantined, store.CredentialResultAmbiguous,
-		)
-	}
-	other := otherSource(target)
-	expectedFingerprint := expectedMoveFingerprint(before, target)
-	if expectedFingerprint == nil {
-		return m.resolveRecoveredCredentialOperation(
-			operation, actual, store.CredentialTerminalQuarantined, store.CredentialResultAmbiguous,
-		)
-	}
-	targetSlot := credentialSourceSlot(current, target)
-	otherSlot := credentialSourceSlot(current, other)
-	if credentialSlotPresent(targetSlot) && credentialSlotPresent(otherSlot) {
-		if *targetSlot.Digest != *otherSlot.Digest {
-			return m.resolveRecoveredCredentialOperation(
-				operation, actual, store.CredentialTerminalQuarantined, store.CredentialResultDiverged,
-			)
-		}
-		if *targetSlot.Digest != *expectedFingerprint {
-			return m.resolveRecoveredCredentialOperation(
-				operation, actual, store.CredentialTerminalQuarantined, store.CredentialResultDiverged,
-			)
-		}
-		if m.credentialCAS == nil {
-			return m.resolveRecoveredCredentialOperation(
-				operation, actual, store.CredentialTerminalQuarantined, store.CredentialResultCleanupFailed,
-			)
-		}
-		proof, err := m.credentialCAS(ctx, account, current, credentialCASMutation{
-			Target: other, DeleteTarget: true,
-		})
-		if err != nil {
-			result := store.CredentialResultCleanupFailed
-			if errors.Is(err, errCredentialCASConflict) {
-				result = store.CredentialResultChangedUnderfoot
-			}
-			return m.resolveRecoveredCredentialOperation(
-				operation, actual, store.CredentialTerminalQuarantined, result,
-			)
-		}
-		actual = proof.After
-		current = actual
-		if !credentialSlotPresent(credentialSourceSlot(current, target)) ||
-			credentialSlotPresent(credentialSourceSlot(current, other)) {
-			return m.resolveRecoveredCredentialOperation(
-				operation, actual, store.CredentialTerminalQuarantined, store.CredentialResultCleanupFailed,
-			)
-		}
-	}
-	if credentialSlotPresent(targetSlot) &&
-		*targetSlot.Digest == *expectedFingerprint &&
-		!credentialSlotPresent(credentialSourceSlot(current, other)) {
-		wasTarget := credentialSlotPresent(credentialSourceSlot(before, target))
-		wasOther := credentialSlotPresent(credentialSourceSlot(before, other))
-		result := &CredMove{
-			From: target, To: target, Moved: false, CleanedStray: wasTarget && wasOther,
-		}
-		if !wasTarget && wasOther {
-			result.From = other
-			result.Moved = true
-		}
-		return m.resolveRecoveredCredentialOperation(
-			operation,
-			actual,
-			store.CredentialTerminalSucceeded,
-			moveCredentialOperationCodec(target).resultCode(result, nil),
-		)
-	}
-	if !credentialSlotPresent(targetSlot) && credentialSlotPresent(otherSlot) &&
-		sameStoreObservation(operation.Expected, actual) {
-		return m.resolveRecoveredCredentialOperation(
-			operation, actual, store.CredentialTerminalFailed, store.CredentialResultFailed,
-		)
-	}
-	return m.resolveRecoveredCredentialOperation(
-		operation, actual, store.CredentialTerminalQuarantined, store.CredentialResultAmbiguous,
-	)
-}
-
-func expectedMoveFingerprint(
-	before store.CredentialExternalState,
-	target creds.Source,
-) *store.CredentialDigest {
-	other := otherSource(target)
-	targetSlot := credentialSourceSlot(before, target)
-	otherSlot := credentialSourceSlot(before, other)
-	switch {
-	case credentialSlotPresent(targetSlot) && !credentialSlotPresent(otherSlot):
-		return targetSlot.Digest
-	case !credentialSlotPresent(targetSlot) && credentialSlotPresent(otherSlot):
-		return otherSlot.Digest
-	case credentialSlotPresent(targetSlot) && credentialSlotPresent(otherSlot) &&
-		*targetSlot.Digest == *otherSlot.Digest:
-		return targetSlot.Digest
-	default:
-		return nil
-	}
-}
-
 func credentialTargetSlot(
 	state store.CredentialExternalState,
-	target store.CredentialTarget,
+	_ store.CredentialTarget,
 ) store.CredentialSlotObservation {
-	return credentialSourceSlot(state, credentialSourceFromTarget(target))
-}
-
-func credentialSourceSlot(
-	state store.CredentialExternalState,
-	source creds.Source,
-) store.CredentialSlotObservation {
-	if source == creds.SourceFile {
-		return state.File
-	}
 	return state.Keychain
 }
 
@@ -1649,9 +1448,8 @@ func credentialSlotPresent(slot store.CredentialSlotObservation) bool {
 }
 
 func credentialStateReadable(state store.CredentialExternalState) bool {
-	return (state.Keychain.State == store.CredentialSlotEmpty ||
-		state.Keychain.State == store.CredentialSlotPresent) &&
-		state.File.State == store.CredentialSlotEmpty
+	return state.Keychain.State == store.CredentialSlotEmpty ||
+		state.Keychain.State == store.CredentialSlotPresent
 }
 
 func credentialObservationHasPresent(state store.CredentialExternalState) bool {
@@ -1659,8 +1457,7 @@ func credentialObservationHasPresent(state store.CredentialExternalState) bool {
 }
 
 func credentialStateEmpty(state store.CredentialExternalState) bool {
-	return state.Keychain.State == store.CredentialSlotEmpty &&
-		state.File.State == store.CredentialSlotEmpty
+	return state.Keychain.State == store.CredentialSlotEmpty
 }
 
 func (m *Manager) credentialObservation(
@@ -1686,10 +1483,7 @@ func (m *Manager) credentialObservation(
 	case creds.ReadFatal:
 		slot.State = store.CredentialSlotUnreadable
 	}
-	result := store.CredentialExternalState{
-		Keychain: slot,
-		File:     store.CredentialSlotObservation{State: store.CredentialSlotEmpty},
-	}
+	result := store.CredentialExternalState{Keychain: slot}
 	if _, err := result.Digest(); err != nil {
 		return store.CredentialExternalState{}, err
 	}
@@ -1800,7 +1594,6 @@ func sameStoreCredentialQuarantine(
 		left.AccountInstanceID == right.AccountInstanceID &&
 		left.AccountGeneration == right.AccountGeneration &&
 		left.LocatorDigest == right.LocatorDigest &&
-		left.FileLocatorDigest == right.FileLocatorDigest &&
 		sameStoreObservation(left.Observation, right.Observation) &&
 		sameStoreOptionalCredentialDigest(left.TokenChainDigest, right.TokenChainDigest) &&
 		left.Reason == right.Reason &&

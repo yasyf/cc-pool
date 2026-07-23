@@ -24,8 +24,7 @@ type TaskRunner interface {
 // keychainPathRE captures each quoted keychain path in `security list-keychains` output.
 var keychainPathRE = regexp.MustCompile(`"([^"]+)"`)
 
-// Store is one concrete credential location — a single Keychain item or a
-// single plaintext credential file — with uniform read/write/delete semantics.
+// Store is one concrete Keychain credential location.
 type Store interface {
 	// Source identifies the backend kind.
 	Source() Source
@@ -152,41 +151,4 @@ func loginKeychainSearchable(ctx context.Context, runner TaskRunner) (bool, erro
 	return false, nil
 }
 
-// FileStore is the Store for claude's plaintext .credentials.json fallback
-// inside one config dir.
-type FileStore struct {
-	ConfigDir        string
-	Runner           TaskRunner
-	WorkerExecutable string
-}
-
-// Source returns SourceFile.
-func (f FileStore) Source() Source { return SourceFile }
-
-// Read parses the credential file, returning ErrNotFound when absent.
-func (f FileStore) Read(ctx context.Context) (*Credential, error) {
-	return f.run(ctx, credentialFileRead, nil)
-}
-
-// Write writes the credential file at 0600, atomically.
-func (f FileStore) Write(ctx context.Context, cred *Credential) error {
-	if err := cred.validateForWrite(); err != nil {
-		return err
-	}
-	_, err := f.run(ctx, credentialFileWrite, cred)
-	return err
-}
-
-// Delete removes the credential file; missing is not an error.
-func (f FileStore) Delete(ctx context.Context) error {
-	_, err := f.run(ctx, credentialFileDelete, nil)
-	return err
-}
-
-// String returns the credential file path.
-func (f FileStore) String() string { return FileCredentialPath(f.ConfigDir) }
-
-var (
-	_ Store = KeychainItem{}
-	_ Store = FileStore{}
-)
+var _ Store = KeychainItem{}

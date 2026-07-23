@@ -166,58 +166,6 @@ func TestKeychainItemReassert(t *testing.T) {
 	}
 }
 
-// TestFileStore pins the plaintext-file Store: 0600 round-trip, Delete
-// idempotence, and its Source/String identity.
-func TestFileStore(t *testing.T) {
-	dir := t.TempDir()
-	st := FileStore{
-		ConfigDir: dir, Runner: testTaskRunner{}, WorkerExecutable: "test-worker",
-	}
-
-	if got := st.Source(); got != SourceFile {
-		t.Errorf("Source() = %v, want SourceFile", got)
-	}
-	if got, want := st.String(), FileCredentialPath(dir); got != want {
-		t.Errorf("String() = %q, want %q", got, want)
-	}
-
-	if _, err := st.Read(t.Context()); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("Read on empty dir = %v, want ErrNotFound", err)
-	}
-	if err := st.Delete(t.Context()); err != nil {
-		t.Fatalf("Delete on missing = %v, want nil", err)
-	}
-
-	cred := &Credential{ClaudeAiOauth: OAuth{AccessToken: "at-1", RefreshToken: "rt-1", ExpiresAt: 1700000000000}}
-	if err := st.Write(t.Context(), cred); err != nil {
-		t.Fatal(err)
-	}
-	fi, err := os.Stat(FileCredentialPath(dir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fi.Mode().Perm() != 0o600 {
-		t.Errorf("mode = %v, want 0600", fi.Mode().Perm())
-	}
-	got, err := st.Read(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.ClaudeAiOauth.AccessToken != "at-1" || got.ClaudeAiOauth.RefreshToken != "rt-1" {
-		t.Fatalf("round-trip mismatch: %+v", got.ClaudeAiOauth)
-	}
-
-	if err := st.Delete(t.Context()); err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
-	if _, err := st.Read(t.Context()); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("Read after Delete = %v, want ErrNotFound", err)
-	}
-	if err := st.Delete(t.Context()); err != nil {
-		t.Fatalf("second Delete = %v, want nil", err)
-	}
-}
-
 // TestClassifyRead pins the shared owned-precedence read taxonomy: nil is
 // present, the two empty sentinels collapse to ReadEmpty, ErrUnavailable is its
 // own unsearchable arm, and every other error (including wrapped sentinels)

@@ -3,7 +3,6 @@ package pool
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
@@ -73,11 +72,10 @@ func newInstallFixture(t *testing.T) *installFixture {
 // refused outright.
 func TestInstallSyncedCredentialOwnedPrecedence(t *testing.T) {
 	const incomingExpiry = 5_000
-	tombstone := `{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"max"}}`
 
 	cases := map[string]struct {
 		local         *creds.Credential // nil: no local credential
-		localTomb     bool              // seed a claude tombstone in the file store
+		localTomb     bool              // seed a tokenless Keychain tombstone
 		incoming      *creds.Credential
 		wantInstalled bool
 		wantErrIs     error
@@ -127,9 +125,7 @@ func TestInstallSyncedCredentialOwnedPrecedence(t *testing.T) {
 				f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, tc.local)
 			}
 			if tc.localTomb {
-				if err := os.WriteFile(creds.FileCredentialPath(f.a.ConfigDir), []byte(tombstone), 0o600); err != nil {
-					t.Fatal(err)
-				}
+				f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, &creds.Credential{})
 			}
 
 			installed, err := f.m.InstallSyncedCredential(context.Background(), f.a, tc.incoming)
@@ -177,9 +173,8 @@ func TestInstallSyncedCredentialOwnedPrecedence(t *testing.T) {
 	}
 }
 
-// TestInstallSyncedCredentialFollowsBackendResolution pins that the install
-// writes to the backend resolution picks: a file-backed account gets the file
-// write and the Keychain is never touched.
+// swapStore lets installation tests change the Keychain observation between
+// the initial read and the compare-and-swap boundary.
 type swapStore struct {
 	creds.Store
 	old, swapped       *creds.Credential
@@ -248,7 +243,6 @@ func TestInstallSyncedCredentialCASAbortsOnUnderfootLogin(t *testing.T) {
 // tombstone), a `claude /login` lands an owned chain before the write, and the
 // CAS re-read must refuse to bury it — a clean skip, nothing written.
 func TestInstallSyncedCredentialAbortsOnLoginOverEmptySlot(t *testing.T) {
-	tombstone := `{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}`
 	cases := map[string]struct {
 		seedTombstone bool
 	}{
@@ -259,9 +253,7 @@ func TestInstallSyncedCredentialAbortsOnLoginOverEmptySlot(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newInstallFixture(t)
 			if tc.seedTombstone {
-				if err := os.WriteFile(creds.FileCredentialPath(f.a.ConfigDir), []byte(tombstone), 0o600); err != nil {
-					t.Fatal(err)
-				}
+				f.fk.Put(f.a.KeychainService, f.a.KeychainAccount, &creds.Credential{})
 			}
 			login := syncCred("login", 2_000)
 			ks := &swapStore{Store: f.fk.Store(f.a, creds.SourceKeychain), oldErr: creds.ErrNotFound, swapped: login}

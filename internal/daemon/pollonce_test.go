@@ -576,17 +576,15 @@ func TestPollOnceRestartProbesWhenAllCredentialResultsRetained(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				filePath := creds.FileCredentialPath(account.ConfigDir)
 				if _, err := st.QuarantineCredential(store.QuarantineCredentialRequest{
 					AccountID: account.ID, AccountInstanceID: account.InstanceID,
 					AccountGeneration: account.Generation,
-					LocatorDigest: store.CredentialLocatorDigest(
-						account.KeychainService, account.KeychainAccount, filePath,
+					LocatorDigest: store.CredentialKeychainLocatorDigest(
+						account.KeychainService, account.KeychainAccount,
 					),
-					FileLocatorDigest: store.CredentialFileLocatorDigest(filePath),
-					Observation:       observation,
-					Reason:            store.CredentialResultAmbiguous,
-					FailureClass:      store.CredentialFailureInternal,
+					Observation:  observation,
+					Reason:       store.CredentialResultAmbiguous,
+					FailureClass: store.CredentialFailureInternal,
 				}); err != nil {
 					t.Fatal(err)
 				}

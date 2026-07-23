@@ -285,11 +285,6 @@ func validateDaemonHealth(response HealthResponse, expectedBuild string) error {
 	return nil
 }
 
-// CredMove asks the daemon to move account credentials to the given backend.
-func (c *Client) CredMove(account *int, to string) (*Response, error) {
-	return c.do(Request{Op: OpCredMove, Account: account, To: to}, 60*time.Second)
-}
-
 // RemoveAccount durably deprovisions one account before deleting its source state.
 func (c *Client) RemoveAccount(ctx context.Context, account int, deleteCredential bool) error {
 	r, err := c.doContext(ctx, Request{

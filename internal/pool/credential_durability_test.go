@@ -79,10 +79,9 @@ func TestSampleUsageNeverRepeatsRetainedFailedRefresh(t *testing.T) {
 			}
 			operationID, err := store.NewCredentialOperationID(
 				account.InstanceID, account.Generation,
-				store.CredentialOperationEnsureFresh, store.CredentialTargetAll,
-				store.CredentialLocatorDigest(
+				store.CredentialOperationEnsureFresh, store.CredentialTargetKeychain,
+				store.CredentialKeychainLocatorDigest(
 					account.KeychainService, account.KeychainAccount,
-					creds.FileCredentialPath(account.ConfigDir),
 				),
 				expected,
 				credentialIntentDigest(
@@ -248,7 +247,7 @@ func TestRetainedNeedsLoginReplayPreservesLiveProbeOutcome(t *testing.T) {
 				manager,
 				account,
 				store.CredentialOperationEnsureFresh,
-				store.CredentialTargetAll,
+				store.CredentialTargetKeychain,
 				credentialIntentDigest(
 					store.CredentialOperationEnsureFresh,
 					RefreshLeadTime.String(),
@@ -308,17 +307,11 @@ type admissionFlipCredentials struct {
 }
 
 func (c *admissionFlipCredentials) Store(account store.Account, source creds.Source) creds.Store {
-	if source == creds.SourceFile {
-		return credstest.FileStore(account.ConfigDir)
-	}
 	return admissionFlipStore{credentials: c}
 }
 
 func (c *admissionFlipCredentials) Stores(account store.Account) []creds.Store {
-	return []creds.Store{
-		c.Store(account, creds.SourceKeychain),
-		c.Store(account, creds.SourceFile),
-	}
+	return []creds.Store{c.Store(account, creds.SourceKeychain)}
 }
 
 func (*admissionFlipCredentials) Discover(context.Context, string) (string, error) {
@@ -408,16 +401,14 @@ func TestEnsureFreshAdmissionRaceUsesCrossedBoundaryAndAllStoreIdentity(t *testi
 				t.Fatalf("read-only Usage calls = %q, want %d", usage, wantUsage)
 			}
 
-			filePath := creds.FileCredentialPath(account.ConfigDir)
 			active, receipt, err := st.CredentialOperationEvidence(store.CredentialOperationEvidenceQuery{
 				AccountID: account.ID, AccountInstanceID: account.InstanceID,
 				AccountGeneration: account.Generation,
-				LocatorDigest: store.CredentialLocatorDigest(
-					account.KeychainService, account.KeychainAccount, filePath,
+				LocatorDigest: store.CredentialKeychainLocatorDigest(
+					account.KeychainService, account.KeychainAccount,
 				),
-				FileLocatorDigest: store.CredentialFileLocatorDigest(filePath),
-				Kind:              store.CredentialOperationEnsureFresh,
-				Target:            store.CredentialTargetAll,
+				Kind:   store.CredentialOperationEnsureFresh,
+				Target: store.CredentialTargetKeychain,
 				IntentDigest: credentialIntentDigest(
 					store.CredentialOperationEnsureFresh,
 					RefreshLeadTime.String(),
@@ -427,7 +418,7 @@ func TestEnsureFreshAdmissionRaceUsesCrossedBoundaryAndAllStoreIdentity(t *testi
 			if err != nil || active != nil || receipt == nil {
 				t.Fatalf("all-store EnsureFresh evidence = active=%+v receipt=%+v err=%v", active, receipt, err)
 			}
-			if receipt.Target != store.CredentialTargetAll ||
+			if receipt.Target != store.CredentialTargetKeychain ||
 				receipt.FailureClass != store.CredentialFailureRefreshServer {
 				t.Fatalf("EnsureFresh receipt = %+v, want all-store server failure", receipt)
 			}
