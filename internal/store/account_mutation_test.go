@@ -69,7 +69,8 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 		receipt.InputDigest != input || !receipt.CredentialWritten ||
 		receipt.WrittenCredentialDigest != written || receipt.AccountInstanceID != reservation.InstanceID ||
 		receipt.AccountGeneration != reservation.Generation || receipt.Label != "verified-label" ||
-		receipt.AccountUUID != "verified-uuid" || receipt.OutcomeDigest != written {
+		receipt.AccountUUID != "verified-uuid" || receipt.OutcomeDigest != written ||
+		!receipt.HasPresentationProof || receipt.PresentationProof != operation.PresentationProof {
 		t.Fatalf("receipt lost exact evidence: %+v", receipt)
 	}
 	byScope, err := s.UnacknowledgedAccountMutationReceipt(AccountMutationAdd, 0)
@@ -110,6 +111,36 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 	now = now.Add(credentialReceiptPostAckRetention + time.Minute)
 	if deleted, err := s.DeleteExpiredAccountMutationReceipts(1); err != nil || deleted != 1 {
 		t.Fatalf("receipt not collected after post-ack window: deleted=%d err=%v", deleted, err)
+	}
+}
+
+func TestBindAccountMutationPresentationRejectsSubstitutedTenant(t *testing.T) {
+	s := openTest(t)
+	reservation, err := s.ReserveAccountIndex(credentialOperationTestOwner("registry-owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := accountMutationTestRequest(t, reservation, AccountMutationAdd)
+	begin, err := s.BeginAccountMutation(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicPath := "/File Provider/CCPool/account"
+	proof := presentationTestProof(Account{
+		InstanceID: reservation.InstanceID, Generation: reservation.Generation,
+	}, publicPath, "activation-test")
+	proof.CatalogTenantID = "account-0123456789abcdef0123456789abcdef"
+	proof.FileProvider.TenantID = proof.CatalogTenantID
+	_, err = s.BindAccountMutationPresentation(
+		begin.Active.Fence(), proof, publicPath, "service", "account",
+		credentialOperationTestDigest("locator"), credentialOperationTestDigest("expected"),
+	)
+	if !errors.Is(err, ErrAccountPresentationEvidence) {
+		t.Fatalf("substituted tenant bind = %v", err)
+	}
+	active, err := s.AccountMutation(request.OperationID)
+	if err != nil || active.State != AccountMutationAwaitingPresentation || active.HasPresentationProof {
+		t.Fatalf("mutation changed after rejected proof = %+v err=%v", active, err)
 	}
 }
 
@@ -803,7 +834,10 @@ func bindAccountMutationTestPresentation(
 ) AccountMutation {
 	t.Helper()
 	_, err := s.BindAccountMutationPresentation(
-		mutation.Fence(), "/File Provider/CCPool/account", "service", "account",
+		mutation.Fence(), presentationTestProof(Account{
+			InstanceID: mutation.AccountInstanceID, Generation: mutation.AccountGeneration,
+		}, "/File Provider/CCPool/account", "activation-test"),
+		"/File Provider/CCPool/account", "service", "account",
 		credentialOperationTestDigest("locator"), credentialOperationTestDigest("expected"),
 	)
 	if err != nil {

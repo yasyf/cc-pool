@@ -1417,7 +1417,9 @@ func pendingAddCompensationTestRequest(
 		t.Fatal(err)
 	}
 	boundFence, err := s.BindAccountMutationPresentation(
-		begin.Active.Fence(), configDir, service, account, locator, expectedDigest,
+		begin.Active.Fence(), presentationTestProof(Account{
+			InstanceID: reservation.InstanceID, Generation: reservation.Generation,
+		}, configDir, "activation-test"), configDir, service, account, locator, expectedDigest,
 	)
 	if err != nil {
 		t.Fatal(err)
