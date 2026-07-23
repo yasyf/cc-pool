@@ -2,6 +2,7 @@ package holderbridge
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
@@ -39,6 +40,8 @@ func newEmbeddedRuntime(
 		Owner: spec.Owner, Drivers: spec.Drivers,
 		CatalogAuthorizer:       spec.CatalogAuthorizer,
 		Authorizer:              spec.Authorizer,
+		NativeStdout:            os.Stdout,
+		NativeStderr:            os.Stderr,
 		CatalogOperationTimeout: catalogOperationTimeout,
 		ShutdownTimeout:         spec.ShutdownTimeout,
 	}

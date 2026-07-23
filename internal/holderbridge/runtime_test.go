@@ -3,6 +3,7 @@ package holderbridge
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -24,6 +25,9 @@ func TestNewEmbeddedRuntimeSuppliesCatalogOperationDeadline(t *testing.T) {
 	}
 	if got.CatalogOperationTimeout != 30*time.Second {
 		t.Fatalf("catalog operation timeout = %s, want 30s", got.CatalogOperationTimeout)
+	}
+	if got.NativeStdout != os.Stdout || got.NativeStderr != os.Stderr {
+		t.Fatalf("native output = %#v/%#v, want process stdout/stderr", got.NativeStdout, got.NativeStderr)
 	}
 }
 
