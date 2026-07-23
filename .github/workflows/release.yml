@@ -270,14 +270,6 @@ jobs:
           xcrun stapler validate app/CCPoolStatus.app
           spctl --assess --type execute --verbose=4 app/CCPoolStatus.app
 
-      - name: Require the full-application cask contract
-        run: |
-          set -euo pipefail
-          template=.github/cask/cc-pool-status.rb.tmpl
-          grep -Eq '^[[:space:]]*app[[:space:]]+' "$template"
-          ! grep -Eq '^[[:space:]]*binary[[:space:]]+' "$template"
-          ! grep -Eiq 'xattr|com\.apple\.quarantine|--no-quarantine' "$template"
-
       - name: Render the formula into the atomic tap transaction
         uses: yasyf/homebrew-tap/.github/actions/render-formula@33755e73573a27eebbc5962cdf04b7b7e302c8f5
         with:
@@ -286,21 +278,10 @@ jobs:
           substitutions: |
             __SHA_PURE__=${{ needs.release.outputs.pure_sha256 }}
 
-      - name: Render the cask into the atomic tap transaction
-        uses: yasyf/homebrew-tap/.github/actions/render-formula@33755e73573a27eebbc5962cdf04b7b7e302c8f5
-        with:
-          template: .github/cask/cc-pool-status.rb.tmpl
-          output: Casks/cc-pool-status.rb
-          substitutions: |
-            __SHA_APP__=${{ needs.release-app.outputs.sha256 }}
-            __ASSET_URL__=${{ needs.release-app.outputs.asset_url }}
-            __APP_NAME__=CCPoolStatus
-            __CASK_TOKEN__=cc-pool-status
-            __REPO__=${{ github.repository }}
-
-      - name: Publish formula and cask in one tap commit
-        uses: yasyf/homebrew-tap/.github/actions/publish@33755e73573a27eebbc5962cdf04b7b7e302c8f5
+      - name: Publish formula and retire the cask in one tap commit
+        uses: yasyf/homebrew-tap/.github/actions/publish@9ca67392d45d66b6ae01e262383c8f3138d56f5e
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging
+          delete-file: Casks/cc-pool-status.rb
           message: "cc-pool stack ${{ github.ref_name }}"

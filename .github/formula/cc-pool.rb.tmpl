@@ -54,9 +54,8 @@ class CcPool < Formula
         ccp             # walks you through pooling your subscriptions
         ccp run         # launch claude on the emptiest account
 
-      The daemon requires the fixed signed CCPoolStatus/File Provider app.
-      Install the complete stack with:
-        brew install --cask yasyf/tap/cc-pool-status
+      The daemon requires the fixed signed CCPoolStatus/File Provider app from
+      the same GitHub release. Install that app before running:
         ccp service install
 
       daemonkit owns the user LaunchAgent. Homebrew does not install or control
