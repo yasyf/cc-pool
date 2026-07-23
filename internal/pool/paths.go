@@ -57,17 +57,6 @@ func FuseKitRuntimeDir() string { return statePath("fusekit") }
 // FuseKitSocketPath is the exact persistent runtime session socket.
 func FuseKitSocketPath() string { return filepath.Join(FuseKitRuntimeDir(), "fusekit.sock") }
 
-// FuseKitProcessStorePath is the signed runtime's durable child and worker identity store.
-func FuseKitProcessStorePath() string { return filepath.Join(FuseKitRuntimeDir(), "processes.json") }
-
-// FuseKitServiceStatePath is the runtime LaunchAgent controller's durable desired state.
-func FuseKitServiceStatePath() string { return filepath.Join(FuseKitRuntimeDir(), "service-state.db") }
-
-// FuseKitServiceProcessStorePath is the runtime service controller's worker and stop-authority ledger.
-func FuseKitServiceProcessStorePath() string {
-	return filepath.Join(FuseKitRuntimeDir(), "service-processes.db")
-}
-
 // DaemonServiceStatePath is the cc-pool LaunchAgent controller's durable desired state.
 func DaemonServiceStatePath() string { return statePath("daemon-services.db") }
 
@@ -142,11 +131,6 @@ func WidgetAppDir() string {
 // Notification Center widget host and File Provider companion app.
 func WidgetAppPath() string {
 	return filepath.Join(WidgetAppDir(), "CCPoolStatus.app")
-}
-
-// WidgetAppBinaryPath is the Mach-O inside the CCPoolStatus app bundle.
-func WidgetAppBinaryPath() string {
-	return filepath.Join(WidgetAppPath(), "Contents", "MacOS", "CCPoolStatus")
 }
 
 // StatusSnapshotPath is the daemon's on-disk status mirror

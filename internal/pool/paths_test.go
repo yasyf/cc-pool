@@ -17,9 +17,6 @@ func TestFuseKitPathsArePrivate(t *testing.T) {
 	if got := FuseKitSocketPath(); got != filepath.Join(runtime, "fusekit.sock") {
 		t.Fatalf("FuseKitSocketPath() = %q", got)
 	}
-	if got := FuseKitProcessStorePath(); got != filepath.Join(runtime, "processes.json") {
-		t.Fatalf("FuseKitProcessStorePath() = %q", got)
-	}
 	backing := filepath.Join(runtime, "backing")
 	if got := FuseKitBackingRoot(); got != backing {
 		t.Fatalf("FuseKitBackingRoot() = %q, want %q", got, backing)
@@ -29,15 +26,11 @@ func TestFuseKitPathsArePrivate(t *testing.T) {
 	}
 }
 
-func TestWidgetAppBinaryPath(t *testing.T) {
+func TestWidgetAppPath(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	if got, want := WidgetAppPath(), filepath.Join(home, "Applications", "CCPoolStatus.app"); got != want {
 		t.Fatalf("WidgetAppPath() = %q, want %q", got, want)
-	}
-	want := filepath.Join(WidgetAppPath(), "Contents", "MacOS", "CCPoolStatus")
-	if got := WidgetAppBinaryPath(); got != want {
-		t.Fatalf("WidgetAppBinaryPath() = %q, want %q", got, want)
 	}
 }
 

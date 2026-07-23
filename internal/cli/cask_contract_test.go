@@ -133,7 +133,7 @@ func TestWidgetBuildsFileProviderOnlyRuntime(t *testing.T) {
 	}
 }
 
-func TestReleaseRejectsStandaloneHolderProductNames(t *testing.T) {
+func TestReleaseRejectsStandaloneHolderNamesAndSystemInstall(t *testing.T) {
 	contracts := map[string]string{
 		"formula":      readReleaseContract(t, ".github", "formula", "cc-pool.rb.tmpl"),
 		"ci":           readReleaseContract(t, ".github", "workflows", "ci.yml"),
@@ -151,6 +151,10 @@ func TestReleaseRejectsStandaloneHolderProductNames(t *testing.T) {
 			if strings.Contains(lower, forbidden) {
 				t.Fatalf("%s retains standalone holder product name %q", name, forbidden)
 			}
+		}
+		withoutUserApp := strings.ReplaceAll(contract, "~/Applications/CCPoolStatus.app", "")
+		if strings.Contains(withoutUserApp, "/Applications/CCPoolStatus.app") {
+			t.Fatalf("%s installs the status app in the system Applications directory", name)
 		}
 	}
 }

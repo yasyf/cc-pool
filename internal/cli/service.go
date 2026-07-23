@@ -24,7 +24,7 @@ import (
 var (
 	scanSessions                = procscan.Scan
 	stopDaemon                  = stopDaemonService
-	ensureHolder                = func(ctx context.Context) (holderServiceInstall, error) { return daemon.InstallHolderService(ctx) }
+	ensureHolder                = daemon.InstallHolderService
 	stopHolder                  = daemon.StopAndUninstallHolderService
 	serviceExecutable           = resolveDaemonServiceExecutable
 	daemonServiceReady          = waitForDaemonService
@@ -50,10 +50,6 @@ type daemonServiceController interface {
 	Converge(context.Context, []service.Agent) error
 	StopRuntime(context.Context, service.StopControlSpec) (wire.StopResult, error)
 	Close(context.Context) error
-}
-
-type holderServiceInstall interface {
-	Rollback(context.Context) error
 }
 
 func ccpAgent(executable string) (service.Agent, error) {
@@ -315,15 +311,9 @@ func installDaemonService(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	holderInstall, err := ensureHolder(ctx)
-	if err != nil {
+	if err := ensureHolder(ctx); err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, holderInstall.Rollback(ctx))
-		}
-	}()
 	if err := withDaemonServiceController(ctx, func(controller daemonServiceController) error {
 		if err := stopObservedDaemonRuntime(ctx, controller, executable, wire.StopIntentUpgrade); err != nil {
 			return err

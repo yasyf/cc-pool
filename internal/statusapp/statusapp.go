@@ -14,21 +14,16 @@ import (
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/version"
-	"github.com/yasyf/daemonkit/codeidentity"
 	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/fetch"
+	"github.com/yasyf/daemonkit/deployment"
 )
 
 const (
 	appName              = "CCPoolStatus"
 	fileProviderBundleID = "com.yasyf.cc-pool.status.fileprovider"
-	electionWait         = 5 * time.Second
-	electionPoll         = 100 * time.Millisecond
+	electionWait         = holderbridge.DeploymentElectionTimeout
+	electionPoll         = holderbridge.DeploymentPollInterval
 )
-
-type fetcher interface {
-	Fetch(context.Context, fetch.Config) (fetch.Installation, error)
-}
 
 type runner interface {
 	Run(context.Context, string, ...string) error
@@ -52,22 +47,22 @@ func (commandRunner) Output(ctx context.Context, name string, arguments ...strin
 	return output, nil
 }
 
-func release() (fetch.Release, error) {
+func release() (deployment.Release, error) {
 	if version.StatusAppVersion == "" || strings.TrimSpace(version.StatusAppVersion) != version.StatusAppVersion {
-		return fetch.Release{}, errors.New("CCPoolStatus: release bundle version is not exact")
+		return deployment.Release{}, errors.New("CCPoolStatus: release bundle version is not exact")
 	}
 	releasePrefix := "v" + version.StatusAppVersion
 	if version.Version != releasePrefix && !strings.HasPrefix(version.Version, releasePrefix+"-") {
-		return fetch.Release{}, fmt.Errorf(
+		return deployment.Release{}, fmt.Errorf(
 			"CCPoolStatus: application version %q does not match release %q",
 			version.StatusAppVersion, version.Version,
 		)
 	}
-	digest, err := fetch.ParseSHA256(version.StatusAppSHA256)
+	digest, err := deployment.ParseSHA256(version.StatusAppSHA256)
 	if err != nil {
-		return fetch.Release{}, fmt.Errorf("CCPoolStatus: parse release digest: %w", err)
+		return deployment.Release{}, fmt.Errorf("CCPoolStatus: parse release digest: %w", err)
 	}
-	return fetch.Release{
+	return deployment.Release{
 		Version: version.StatusAppVersion,
 		URL: fmt.Sprintf(
 			"https://github.com/yasyf/cc-pool/releases/download/%s/cc-pool-status-%s-darwin.zip",
@@ -77,46 +72,21 @@ func release() (fetch.Release, error) {
 	}, nil
 }
 
-// Reconcile installs the exact signed application release and registers its
-// File Provider extension before any tenant or service can use it.
-func Reconcile(ctx context.Context) (string, error) {
-	return reconcile(ctx, fetch.New(), commandRunner{})
-}
-
-func reconcile(ctx context.Context, source fetcher, commands runner) (string, error) {
-	directory := pool.WidgetAppDir()
-	if err := ensureInstallDirectory(directory); err != nil {
-		return "", err
+func proveElection(ctx context.Context, appPath string, commands runner) error {
+	if appPath != pool.WidgetAppPath() {
+		return fmt.Errorf("CCPoolStatus: installed path %q differs from fixed path %q", appPath, pool.WidgetAppPath())
 	}
-	bundle, err := release()
-	if err != nil {
-		return "", err
-	}
-	installation, err := source.Fetch(ctx, fetch.Config{
-		Release: bundle,
-		Dir:     directory,
-		AppName: appName,
-		Identity: codeidentity.CodeIdentity{
-			TeamID: holderbridge.TeamID, SigningIdentifier: holderbridge.BundleID,
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("CCPoolStatus: fetch signed app %s: %w", version.Version, err)
-	}
-	if installation.Path != pool.WidgetAppPath() {
-		return "", fmt.Errorf("CCPoolStatus: installed path %q differs from fixed path %q", installation.Path, pool.WidgetAppPath())
-	}
-	extension := filepath.Join(installation.Path, "Contents", "PlugIns", "CCPoolFileProvider.appex")
+	extension := filepath.Join(appPath, "Contents", "PlugIns", "CCPoolFileProvider.appex")
 	if err := commands.Run(ctx, "/usr/bin/pluginkit", "-a", extension); err != nil {
-		return "", fmt.Errorf("CCPoolStatus: register File Provider extension: %w", err)
+		return fmt.Errorf("CCPoolStatus: register File Provider extension: %w", err)
 	}
 	if err := commands.Run(ctx, "/usr/bin/pluginkit", "-e", "use", "-i", fileProviderBundleID); err != nil {
-		return "", fmt.Errorf("CCPoolStatus: enable File Provider extension: %w", err)
+		return fmt.Errorf("CCPoolStatus: enable File Provider extension: %w", err)
 	}
 	if err := waitForElection(ctx, commands, extension); err != nil {
-		return "", err
+		return err
 	}
-	return installation.Path, nil
+	return nil
 }
 
 func waitForElection(ctx context.Context, commands runner, expectedPath string) error {

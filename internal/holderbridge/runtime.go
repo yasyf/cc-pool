@@ -12,7 +12,18 @@ import (
 	"github.com/yasyf/fusekit/mountservice"
 )
 
-const catalogOperationTimeout = 30 * time.Second
+const (
+	// NativeReadinessTimeout is cc-pool's hard native-presentation startup budget.
+	NativeReadinessTimeout = 30 * time.Second
+	// SourceReadinessTimeout is cc-pool's hard source-observer startup budget.
+	SourceReadinessTimeout = 30 * time.Second
+	// CatalogReadinessTimeout is cc-pool's hard catalog-process startup budget.
+	CatalogReadinessTimeout = 30 * time.Second
+	// CatalogOperationTimeout is cc-pool's hard catalog request budget.
+	CatalogOperationTimeout = 30 * time.Second
+	// RuntimeShutdownTimeout is cc-pool's hard runtime settlement budget.
+	RuntimeShutdownTimeout = 30 * time.Second
+)
 
 // EmbeddedRuntimeSpec defines cc-pool's complete FuseKit runtime policy.
 type EmbeddedRuntimeSpec struct {
@@ -23,7 +34,6 @@ type EmbeddedRuntimeSpec struct {
 	Drivers           holder.DriverFactories
 	CatalogAuthorizer catalogservice.Authorizer
 	Authorizer        mountservice.Authorizer
-	ShutdownTimeout   time.Duration
 }
 
 // NewEmbeddedRuntime constructs the signed app's FuseKit runtime.
@@ -42,8 +52,11 @@ func newEmbeddedRuntime(
 		Owner: spec.Owner, Drivers: spec.Drivers,
 		CatalogAuthorizer:       spec.CatalogAuthorizer,
 		Authorizer:              spec.Authorizer,
-		CatalogOperationTimeout: catalogOperationTimeout,
-		ShutdownTimeout:         spec.ShutdownTimeout,
+		NativeReadinessTimeout:  NativeReadinessTimeout,
+		SourceReadinessTimeout:  SourceReadinessTimeout,
+		CatalogReadinessTimeout: CatalogReadinessTimeout,
+		CatalogOperationTimeout: CatalogOperationTimeout,
+		ShutdownTimeout:         RuntimeShutdownTimeout,
 	}
 	return constructEmbeddedRuntime(ctx, config, construct)
 }

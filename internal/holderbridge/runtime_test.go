@@ -5,13 +5,12 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/holder"
 )
 
-func TestNewEmbeddedRuntimeSuppliesCatalogOperationDeadline(t *testing.T) {
+func TestNewEmbeddedRuntimeSuppliesExactRuntimeDeadlines(t *testing.T) {
 	want := errors.New("stop after config capture")
 	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "stop-processes.db")}
 	var got holder.Config
@@ -25,8 +24,20 @@ func TestNewEmbeddedRuntimeSuppliesCatalogOperationDeadline(t *testing.T) {
 	if runtime != nil || !errors.Is(err, want) {
 		t.Fatalf("runtime/error = %#v/%v, want literal nil and %v", runtime, err, want)
 	}
-	if got.CatalogOperationTimeout != 30*time.Second {
-		t.Fatalf("catalog operation timeout = %s, want 30s", got.CatalogOperationTimeout)
+	if got.NativeReadinessTimeout != NativeReadinessTimeout ||
+		got.SourceReadinessTimeout != SourceReadinessTimeout ||
+		got.CatalogReadinessTimeout != CatalogReadinessTimeout ||
+		got.CatalogOperationTimeout != CatalogOperationTimeout ||
+		got.ShutdownTimeout != RuntimeShutdownTimeout {
+		t.Fatalf(
+			"runtime timeouts = native %s, source %s, catalog readiness %s, operation %s, shutdown %s",
+			got.NativeReadinessTimeout, got.SourceReadinessTimeout,
+			got.CatalogReadinessTimeout, got.CatalogOperationTimeout, got.ShutdownTimeout,
+		)
+	}
+	if NativeReadinessTimeout <= 0 || SourceReadinessTimeout <= 0 ||
+		CatalogReadinessTimeout <= 0 || CatalogOperationTimeout <= 0 || RuntimeShutdownTimeout <= 0 {
+		t.Fatal("cc-pool runtime deadlines must be explicit and positive")
 	}
 	if got.RuntimeBuild != got.Plan.BuildID() {
 		t.Fatalf("holder config build = %q, plan build = %q", got.RuntimeBuild, got.Plan.BuildID())

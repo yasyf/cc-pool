@@ -9,24 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/version"
-	"github.com/yasyf/daemonkit/fetch"
 )
-
-type recordingFetcher struct {
-	installation fetch.Installation
-	err          error
-	calls        int
-	config       fetch.Config
-}
-
-func (f *recordingFetcher) Fetch(_ context.Context, config fetch.Config) (fetch.Installation, error) {
-	f.calls++
-	f.config = config
-	return f.installation, f.err
-}
 
 type recordingRunner struct {
 	calls  [][]string
@@ -83,27 +68,14 @@ func TestReleaseRejectsMissingOrInexactMetadata(t *testing.T) {
 	}
 }
 
-func TestReconcileFetchesFixedAppAndRegistersFileProvider(t *testing.T) {
-	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("cd", 32))
+func TestProveElectionRegistersExactFixedFileProvider(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	appPath := filepath.Join(home, "Applications", "CCPoolStatus.app")
-	fetcher := &recordingFetcher{installation: fetch.Installation{Path: appPath}}
 	extension := filepath.Join(appPath, "Contents", "PlugIns", "CCPoolFileProvider.appex")
 	commands := &recordingRunner{output: []byte("+    " + fileProviderBundleID + "(0.63.0)\tUUID\tdate\t" + extension + "\n (1 plug-in)\n")}
-	got, err := reconcile(t.Context(), fetcher, commands)
-	if err != nil {
+	if err := proveElection(t.Context(), appPath, commands); err != nil {
 		t.Fatal(err)
-	}
-	if got != appPath || fetcher.calls != 1 {
-		t.Fatalf("reconcile = %q, fetch calls = %d", got, fetcher.calls)
-	}
-	if fetcher.config.Dir != filepath.Join(home, "Applications") || fetcher.config.AppName != appName {
-		t.Fatalf("fetch config = %+v", fetcher.config)
-	}
-	if fetcher.config.Identity.TeamID != holderbridge.TeamID ||
-		fetcher.config.Identity.SigningIdentifier != holderbridge.BundleID {
-		t.Fatalf("fetch identity = %+v", fetcher.config.Identity)
 	}
 	wantCalls := [][]string{
 		{"/usr/bin/pluginkit", "-a", extension},
@@ -113,53 +85,34 @@ func TestReconcileFetchesFixedAppAndRegistersFileProvider(t *testing.T) {
 	if !reflect.DeepEqual(commands.calls, wantCalls) {
 		t.Fatalf("commands = %#v, want %#v", commands.calls, wantCalls)
 	}
-	info, err := os.Lstat(filepath.Join(home, "Applications"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
-		t.Fatalf("Applications mode = %v", info.Mode())
-	}
 }
 
-func TestReconcileRejectsUnexpectedInstallPathBeforeRegistration(t *testing.T) {
-	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("cd", 32))
+func TestProveElectionRejectsUnexpectedInstallPathBeforeRegistration(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	fetcher := &recordingFetcher{installation: fetch.Installation{Path: filepath.Join(t.TempDir(), "CCPoolStatus.app")}}
 	commands := &recordingRunner{}
-	if _, err := reconcile(t.Context(), fetcher, commands); err == nil {
-		t.Fatal("reconcile accepted an unexpected installation path")
+	if err := proveElection(t.Context(), filepath.Join(t.TempDir(), "CCPoolStatus.app"), commands); err == nil {
+		t.Fatal("proof accepted an unexpected installation path")
 	}
 	if len(commands.calls) != 0 {
 		t.Fatalf("registration ran after path mismatch: %#v", commands.calls)
 	}
 }
 
-func TestReconcileRejectsSymlinkedApplicationsDirectory(t *testing.T) {
-	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("cd", 32))
+func TestEnsureInstallDirectoryRejectsSymlink(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	if err := os.Symlink(t.TempDir(), pool.WidgetAppDir()); err != nil {
 		t.Fatal(err)
 	}
-	fetcher := &recordingFetcher{}
-	if _, err := reconcile(t.Context(), fetcher, &recordingRunner{}); err == nil {
-		t.Fatal("reconcile accepted a symlinked Applications directory")
-	}
-	if fetcher.calls != 0 {
-		t.Fatalf("fetch calls = %d, want 0", fetcher.calls)
+	if err := ensureInstallDirectory(pool.WidgetAppDir()); err == nil {
+		t.Fatal("install directory accepted a symlink")
 	}
 }
 
-func TestReconcileSurfacesFetchAndRegistrationFailures(t *testing.T) {
-	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("cd", 32))
+func TestProveElectionSurfacesRegistrationFailure(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	want := errors.New("failure")
-	if _, err := reconcile(t.Context(), &recordingFetcher{err: want}, &recordingRunner{}); !errors.Is(err, want) {
-		t.Fatalf("fetch error = %v", err)
-	}
-	appPath := pool.WidgetAppPath()
-	if _, err := reconcile(t.Context(), &recordingFetcher{installation: fetch.Installation{Path: appPath}}, &recordingRunner{err: want}); !errors.Is(err, want) {
+	if err := proveElection(t.Context(), pool.WidgetAppPath(), &recordingRunner{err: want}); !errors.Is(err, want) {
 		t.Fatalf("registration error = %v", err)
 	}
 }

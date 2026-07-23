@@ -22,7 +22,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/fusekit/holder"
 )
 
@@ -110,7 +110,7 @@ func CCPoolFuseKitWait() C.int32_t {
 func CCPoolFuseKitStop() C.int32_t {
 	embeddedHolderStopping.Store(true)
 	ctx, cancel := context.WithTimeout(
-		context.Background(), holderbridge.ReadinessContract().SettlementTimeout(),
+		context.Background(), holderbridge.RuntimeShutdownTimeout,
 	)
 	defer cancel()
 	return operationStatus("runtime shutdown", embeddedHolder.Close(ctx))
@@ -127,13 +127,16 @@ func newHolderRuntime(ctx context.Context) (daemon.EmbeddedRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	stopControlStore, err := deployment.RuntimeStopControlStore()
+	if err != nil {
+		return nil, fmt.Errorf("FuseKit runtime: resolve deployment stop authority: %w", err)
+	}
 	return holderbridge.NewEmbeddedRuntime(ctx, holderbridge.EmbeddedRuntimeSpec{
 		Plan: plan, StopRole: holderbridge.StopRoleID,
-		StopControlStore: &proc.FileStore{Path: pool.FuseKitServiceProcessStorePath()},
+		StopControlStore: stopControlStore,
 		Owner:            tenantfs.SourceAuthorityFleetOwner, Drivers: drivers,
 		CatalogAuthorizer: tenantfs.NewCatalogAuthorizer(),
 		Authorizer:        tenantfs.NewMountAuthorizer(),
-		ShutdownTimeout:   holderbridge.ReadinessContract().SettlementTimeout(),
 	})
 }
 
