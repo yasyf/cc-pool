@@ -304,6 +304,31 @@ CREATE TABLE credential_quarantines (
   CHECK((observation_keychain_state='present') = (observation_keychain_digest IS NOT NULL)),
   CHECK((observation_file_state='present') = (observation_file_digest IS NOT NULL))
 );
+CREATE TABLE account_presentations (
+  account_id              INTEGER PRIMARY KEY CHECK(account_id > 0),
+  account_instance_id     TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation      INTEGER NOT NULL CHECK(account_generation > 0),
+  tenant_id               TEXT NOT NULL CHECK(tenant_id <> ''),
+  domain_id               TEXT NOT NULL CHECK(domain_id <> ''),
+  presentation_generation INTEGER NOT NULL CHECK(presentation_generation > 0),
+  activation_generation   TEXT NOT NULL CHECK(activation_generation <> ''),
+  public_path             TEXT NOT NULL CHECK(public_path <> ''),
+  observed_at             INTEGER NOT NULL CHECK(observed_at > 0),
+  CHECK(account_generation = presentation_generation)
+);
+CREATE TABLE account_presentation_quarantines (
+  account_id              INTEGER PRIMARY KEY CHECK(account_id > 0),
+  account_instance_id     TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation      INTEGER NOT NULL CHECK(account_generation > 0),
+  expected_config_dir     TEXT NOT NULL CHECK(expected_config_dir <> ''),
+  observed_tenant_id      TEXT NOT NULL CHECK(observed_tenant_id <> ''),
+  observed_domain_id      TEXT NOT NULL CHECK(observed_domain_id <> ''),
+  observed_generation     INTEGER NOT NULL CHECK(observed_generation > 0),
+  observed_activation_generation TEXT NOT NULL CHECK(observed_activation_generation <> ''),
+  observed_public_path    TEXT NOT NULL CHECK(observed_public_path <> ''),
+  reason                  TEXT NOT NULL CHECK(reason IN ('public-path-drift','tenant-id-drift','domain-id-drift','generation-drift')),
+  created_at              INTEGER NOT NULL CHECK(created_at > 0)
+);
 CREATE INDEX idx_accounts_uuid ON accounts(account_uuid);
 CREATE UNIQUE INDEX idx_accounts_live_config_dir ON accounts(config_dir) WHERE deleted_at IS NULL;
 CREATE INDEX idx_account_mutations_owner ON account_mutations(owner_record,account_id);
@@ -315,6 +340,7 @@ CREATE INDEX idx_credential_operation_receipts_expiry ON credential_operation_re
 CREATE UNIQUE INDEX idx_credential_write_receipts_pending ON credential_operation_receipts(account_id)
   WHERE acknowledged_at IS NULL AND terminal_status='succeeded'
   AND result_category IN ('refreshed','installed','moved');
+CREATE UNIQUE INDEX idx_account_presentations_public_path ON account_presentations(public_path);
 `
 
 // SchemaVersion is the only runtime schema accepted by this binary.
@@ -666,6 +692,7 @@ func (s *Store) ListActiveAccounts() ([]Account, error) {
 	rows, err := s.db.Query(`SELECT ` + accountCols + ` FROM accounts
 		WHERE deleted_at IS NULL
 		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)
+		  AND NOT EXISTS (SELECT 1 FROM account_presentation_quarantines WHERE account_id=accounts.id)
 		ORDER BY id`)
 	if err != nil {
 		return nil, err

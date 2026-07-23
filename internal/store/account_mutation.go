@@ -305,6 +305,11 @@ func (s *Store) BeginAccountMutation(
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return BeginAccountMutationResult{}, err
 	}
+	if _, err := accountPresentationQuarantine(tx, request.AccountID); err == nil {
+		return BeginAccountMutationResult{}, ErrAccountPresentationQuarantined
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return BeginAccountMutationResult{}, err
+	}
 	if current, err := accountMutationByAccount(tx, request.AccountID); err == nil {
 		if current.OperationID == request.OperationID && sameAccountMutationIntent(current, request) {
 			if err := tx.Commit(); err != nil {
