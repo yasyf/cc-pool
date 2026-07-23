@@ -246,9 +246,19 @@ force_refresh() {
 # ---------------------------------------------------------------------------
 # Registry + credential inspection helpers
 # ---------------------------------------------------------------------------
-regfile()   { echo "$SIM/$1/.cc-pool/sync/registry.json"; }
-credfile()  { echo "$SIM/$1/.cc-pool/accounts/acct-01/.credentials.json"; }
-identfile() { echo "$SIM/$1/.cc-pool/accounts/acct-01/.claude.json"; }
+regfile() { echo "$SIM/$1/.cc-pool/sync/registry.json"; }
+credfile() {
+  local dir="$SIM/$1/.cc-pool/fake-keychain" files=()
+  shopt -s nullglob
+  files=("$dir"/*.item)
+  shopt -u nullglob
+  case "${#files[@]}" in
+    0) echo "$dir/__missing__.item" ;;
+    1) echo "${files[0]}" ;;
+    *) fail "$1 has ${#files[@]} fake Keychain items, want exactly one" ;;
+  esac
+}
+identfile() { echo "$SIM/$1/.cc-pool/fusekit/backing/acct-01/.claude.json"; }
 
 # reg_get HOST UUID FIELD — read a registry entry field: present | hash | origin
 # | expiresat | added | removed. Prints MISSING when the uuid has no entry.
@@ -380,7 +390,7 @@ setup_hosts() {
 # materialize_peer — drive B to materialize its read-only peer copy of c1.
 materialize_peer() {
   quiesce
-  [ -d "$SIM/b/.cc-pool/accounts/acct-01" ] || fail "B never materialized acct-01"
+  [ -d "$SIM/b/.cc-pool/fusekit/backing/acct-01" ] || fail "B never materialized private backing for acct-01"
 }
 
 # ---------------------------------------------------------------------------
@@ -495,9 +505,9 @@ scenario_6_remove() {
   local account_count
   account_count="$(hrun b "$BIN/cc-pool" status --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["accounts"]))')"
   [ "$account_count" = 0 ] || fail "account not torn down after daemon convergence"
-  [ ! -d "$SIM/b/.cc-pool/accounts/acct-01" ] || fail "B acct-01 survived idle teardown"
+  [ ! -d "$SIM/b/.cc-pool/fusekit/backing/acct-01" ] || fail "B private backing survived idle teardown"
   [ ! -f "$(credfile b)" ] || fail "B credential survived idle teardown"
-  ok "daemon convergence completed teardown (dir + credential gone)"
+  ok "daemon convergence completed teardown (private backing + credential gone)"
 
   assert_zero_posts b
   assert_no_double_spend

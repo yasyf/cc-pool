@@ -358,7 +358,7 @@ func insertCoordinatorAccounts(t *testing.T, st *store.Store, total int) {
 	for id := 1; id <= total; id++ {
 		admitDaemonTestAccount(t, st, store.Account{
 			ID: id, InstanceID: fmt.Sprintf("%032x", id), Generation: 1,
-			ConfigDir:       pool.AccountDir(id),
+			ConfigDir:       testFileProviderConfigDir(id),
 			KeychainService: "service", KeychainAccount: "account",
 		})
 	}
@@ -729,7 +729,7 @@ func TestInitializePagesOnlyInterruptedRemovalClaims(t *testing.T) {
 	const total = store.AccountRemovalPageLimit + 1
 	for id := 1; id <= total; id++ {
 		admitDaemonTestAccount(t, st, store.Account{
-			ID: id, ConfigDir: pool.AccountDir(id),
+			ID: id, ConfigDir: testFileProviderConfigDir(id),
 			KeychainService: "service", KeychainAccount: "account",
 		})
 		if _, err := st.BeginAccountRemoval(id, true); err != nil {
@@ -896,7 +896,7 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 	admitDaemonTestAccount(t, st, store.Account{
-		ID: 1, ConfigDir: pool.AccountDir(1),
+		ID: 1, ConfigDir: testFileProviderConfigDir(1),
 		KeychainService: "service", KeychainAccount: "account",
 	})
 	account, err := st.GetAccount(1)

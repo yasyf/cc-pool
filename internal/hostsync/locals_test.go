@@ -43,7 +43,7 @@ func newLocalsFixture(t *testing.T) *localsFixture {
 // the row's private .claude.json, honoring the backend's private-root math.
 func (fx *localsFixture) addAccount(t *testing.T, id int, _ string, label, identityJSON string) store.Account {
 	t.Helper()
-	dir := pool.AccountDir(id)
+	dir := testFileProviderConfigDir(id)
 	var identity struct {
 		OAuthAccount *struct {
 			AccountUUID string `json:"accountUuid"`

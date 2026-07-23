@@ -81,47 +81,47 @@ var (
 func validateHolderRuntimeHealth(health mountproto.RuntimeHealthResponse) error {
 	if health.Protocol != mountproto.Version || health.Code != mountproto.ErrorCodeOk || health.Message != "" {
 		return fmt.Errorf(
-			"holder runtime health response is not exact: protocol=%d code=%q message=%q",
+			"FuseKit runtime health response is not exact: protocol=%d code=%q message=%q",
 			health.Protocol, health.Code, health.Message,
 		)
 	}
 	if health.RuntimeBuild != version.String() {
 		return fmt.Errorf(
-			"holder runtime build is not exact: build=%q want=%q",
+			"FuseKit runtime build is not exact: build=%q want=%q",
 			health.RuntimeBuild, version.String(),
 		)
 	}
 	if health.RuntimeProtocol != mountproto.RuntimeProtocolVersion {
 		return fmt.Errorf(
-			"holder runtime protocol is not exact: protocol=%d want=%d",
+			"FuseKit runtime protocol is not exact: protocol=%d want=%d",
 			health.RuntimeProtocol, mountproto.RuntimeProtocolVersion,
 		)
 	}
 	if health.RuntimePID <= 0 {
-		return fmt.Errorf("holder runtime pid is invalid: pid=%d", health.RuntimePID)
+		return fmt.Errorf("FuseKit runtime pid is invalid: pid=%d", health.RuntimePID)
 	}
 	if health.ProcessGeneration == "" {
-		return errors.New("holder runtime process generation is empty")
+		return errors.New("FuseKit runtime process generation is empty")
 	}
 	if health.ActivationGeneration == "" {
-		return errors.New("holder runtime activation generation is empty")
+		return errors.New("FuseKit runtime activation generation is empty")
 	}
 	if health.State != mountproto.RuntimeStateHealthy || health.Draining || health.Busy || !health.Ready {
 		return fmt.Errorf(
-			"holder runtime lifecycle is not ready: state=%q draining=%t busy=%t",
+			"FuseKit runtime lifecycle is not ready: state=%q draining=%t busy=%t",
 			health.State, health.Draining, health.Busy,
 		)
 	}
 	if health.ReadinessPhase != mountproto.ReadinessPhaseReady ||
 		health.ReadinessStep != mountproto.ReadinessStepPublished {
 		return fmt.Errorf(
-			"holder runtime readiness is not published: phase=%q step=%q",
+			"FuseKit runtime readiness is not published: phase=%q step=%q",
 			health.ReadinessPhase, health.ReadinessStep,
 		)
 	}
 	if health.NativePhase != mountproto.NativePhaseDisabled || health.NativeMount != nil {
 		return fmt.Errorf(
-			"holder native presentation is not disabled: phase=%q proof=%t",
+			"native presentation is not disabled: phase=%q proof=%t",
 			health.NativePhase, health.NativeMount != nil,
 		)
 	}

@@ -22,7 +22,7 @@ func TestCredentialLockCrashHelper(t *testing.T) {
 	if phase == "" {
 		t.Skip("credential lock crash helper")
 	}
-	configDir := AccountDir(1)
+	configDir := testFileProviderConfigDir(1)
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestCredentialLockRecoversEveryCrashTransition(t *testing.T) {
 				}
 			}
 
-			configDir := AccountDir(1)
+			configDir := testFileProviderConfigDir(1)
 			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 			defer cancel()
 			lease, err := acquireCredentialRefreshLocks(ctx, 1, configDir)
@@ -128,7 +128,7 @@ func TestCredentialLockRecoversEveryCrashTransition(t *testing.T) {
 
 func TestCredentialLockRecoversAbandonedSameWorkerJournal(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	configDir := AccountDir(1)
+	configDir := testFileProviderConfigDir(1)
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestCredentialLockRecoversAbandonedSameWorkerJournal(t *testing.T) {
 
 func TestCredentialLockReleaseOutlivesCallerCancellation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	configDir := AccountDir(1)
+	configDir := testFileProviderConfigDir(1)
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestCredentialLockReleaseOutlivesCallerCancellation(t *testing.T) {
 
 func TestCredentialLockNeverDeletesUnmarkedAmbiguousTarget(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	configDir := AccountDir(1)
+	configDir := testFileProviderConfigDir(1)
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}

@@ -154,7 +154,7 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 		callsMu.Lock()
 		calls[account.ID]++
 		callsMu.Unlock()
-		proof := daemonTestPreparationProof(account, pool.AccountDir(account.ID))
+		proof := daemonTestPreparationProof(account, testFileProviderConfigDir(account.ID))
 		if account.ID != 1 {
 			return proof, nil
 		}
@@ -321,7 +321,7 @@ func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[in
 	now := time.Now()
 	for _, id := range []int{1, 2} {
 		util := map[int]float64{1: 10, 2: 50}[id]
-		configDir := pool.AccountDir(id)
+		configDir := testFileProviderConfigDir(id)
 		if paths[id] != "" {
 			configDir = paths[id]
 		}
@@ -579,7 +579,7 @@ func activateDaemonTestSession(t *testing.T, s *Server, accountID, pid int, cwd 
 		Token:     nextDaemonTestToken(),
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   store.ProcessIdentity{PID: pid, StartedAt: started},
-		ConfigDir: pool.AccountDir(accountID),
+		ConfigDir: testFileProviderConfigDir(accountID),
 		Cwd:       cwd, At: started,
 	}); err != nil {
 		t.Fatal(err)

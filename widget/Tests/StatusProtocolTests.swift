@@ -53,7 +53,7 @@ final class StatusProtocolTests: XCTestCase {
               "generated_at": "2026-07-19T09:00:00Z",
               "accounts": [{
                 "id": 18,
-                "config_dir": "/Users/you/.cc-pool/accounts/acct-18",
+                "config_dir": "/Users/you/Library/CloudStorage/CCPoolStatus-acct-18",
                 "label": "acct-18",
                 "score": 40,
                 "remaining_5h": 50,

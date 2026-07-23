@@ -42,9 +42,9 @@ func TestParseProcArgs(t *testing.T) {
 			buf: procargs2(2,
 				"/Users/me/.local/bin/claude",
 				[]string{"/Users/me/.local/bin/claude", "--session-id=abc"},
-				[]string{"FOO=bar", "CLAUDE_CONFIG_DIR=/Users/me/.cc-pool/accounts/acct-01", "PATH=/usr/bin"}),
+				[]string{"FOO=bar", "CLAUDE_CONFIG_DIR=/Users/me/Library/CloudStorage/CCPoolStatus-acct-01", "PATH=/usr/bin"}),
 			wantArgv0:  "/Users/me/.local/bin/claude",
-			wantCfgDir: "/Users/me/.cc-pool/accounts/acct-01",
+			wantCfgDir: "/Users/me/Library/CloudStorage/CCPoolStatus-acct-01",
 		},
 		"plain claude (no CLAUDE_CONFIG_DIR)": {
 			buf: procargs2(1,
@@ -66,9 +66,9 @@ func TestParseProcArgs(t *testing.T) {
 			buf: procargs2(3,
 				"/usr/bin/node",
 				[]string{"/usr/bin/node", "/some/script.js", "--flag"},
-				[]string{"CLAUDE_CONFIG_DIR=/Users/me/.cc-pool/accounts/acct-03"}),
+				[]string{"CLAUDE_CONFIG_DIR=/Users/me/Library/CloudStorage/CCPoolStatus-acct-03"}),
 			wantArgv0:  "/usr/bin/node",
-			wantCfgDir: "/Users/me/.cc-pool/accounts/acct-03",
+			wantCfgDir: "/Users/me/Library/CloudStorage/CCPoolStatus-acct-03",
 		},
 		"no env block": {
 			buf:        procargs2(1, "/opt/homebrew/bin/claude", []string{"claude"}, nil),
@@ -152,12 +152,12 @@ func TestScan(t *testing.T) {
 	}
 	args := map[int][]byte{
 		501: procargs2(1, "/Users/me/.local/bin/claude", []string{"/Users/me/.local/bin/claude"},
-			[]string{"CLAUDE_CONFIG_DIR=/Users/me/.cc-pool/accounts/acct-01"}),
+			[]string{"CLAUDE_CONFIG_DIR=/Users/me/Library/CloudStorage/CCPoolStatus-acct-01"}),
 		777: procargs2(1, "/opt/homebrew/bin/claude", []string{"claude"}, []string{"PATH=/usr/bin"}),
 		888: procargs2(3, "/opt/homebrew/bin/fish", []string{"fish", "-c", "claude"},
-			[]string{"CLAUDE_CONFIG_DIR=/Users/me/.cc-pool/accounts/acct-02"}),
+			[]string{"CLAUDE_CONFIG_DIR=/Users/me/Library/CloudStorage/CCPoolStatus-acct-02"}),
 		999: procargs2(2, "/usr/bin/node", []string{"/usr/bin/node", "/some/script.js"},
-			[]string{"CLAUDE_CONFIG_DIR=/Users/me/.cc-pool/accounts/acct-03"}),
+			[]string{"CLAUDE_CONFIG_DIR=/Users/me/Library/CloudStorage/CCPoolStatus-acct-03"}),
 		1010: procargs2(1, "/Users/me/.local/bin/claude", []string{"/Users/me/.local/bin/claude"},
 			[]string{"CLAUDE_CONFIG_DIR=/Users/me/.claude"}),
 	}
@@ -174,7 +174,7 @@ func TestScan(t *testing.T) {
 	for _, s := range got {
 		byPID[s.PID] = s
 	}
-	if byPID[501].ConfigDir != "/Users/me/.cc-pool/accounts/acct-01" {
+	if byPID[501].ConfigDir != "/Users/me/Library/CloudStorage/CCPoolStatus-acct-01" {
 		t.Errorf("pid 501 dir = %q", byPID[501].ConfigDir)
 	}
 	if !byPID[501].StartedAt.Equal(start) {
@@ -242,7 +242,7 @@ func TestScanFailsClosedOnUnexpectedArgError(t *testing.T) {
 
 func TestCountByConfigDir(t *testing.T) {
 	sessions := []Session{
-		{PID: 501, ConfigDir: "/Users/me/.cc-pool/accounts/acct-01"},
+		{PID: 501, ConfigDir: "/Users/me/Library/CloudStorage/CCPoolStatus-acct-01"},
 		{PID: 777, ConfigDir: ""},
 		{PID: 1010, ConfigDir: "/Users/me/.claude"},
 	}
@@ -250,8 +250,8 @@ func TestCountByConfigDir(t *testing.T) {
 		configDir string
 		want      int
 	}{
-		"exact match":           {"/Users/me/.cc-pool/accounts/acct-01", 1},
-		"no sessions for dir":   {"/Users/me/.cc-pool/accounts/acct-99", 0},
+		"exact match":           {"/Users/me/Library/CloudStorage/CCPoolStatus-acct-01", 1},
+		"no sessions for dir":   {"/Users/me/Library/CloudStorage/CCPoolStatus-acct-99", 0},
 		"explicit ~/.claude":    {"/Users/me/.claude", 1},
 		"empty matches nothing": {"", 0},
 	}

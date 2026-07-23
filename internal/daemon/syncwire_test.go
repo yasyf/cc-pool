@@ -282,7 +282,7 @@ func TestAuthKindClassification(t *testing.T) {
 		t.Fatal(err)
 	}
 	admitDaemonTestAccount(t, s.m.Store, store.Account{
-		ID: 1, ConfigDir: pool.AccountDir(1),
+		ID: 1, ConfigDir: testFileProviderConfigDir(1),
 		KeychainService: "svc-auth-kind", KeychainAccount: "cc-pool",
 		AccountUUID: "u-self",
 	})

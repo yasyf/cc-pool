@@ -170,6 +170,53 @@ func TestReleaseRejectsStandaloneHolderProductNames(t *testing.T) {
 	}
 }
 
+func TestFileProviderOnlyRuntimeRejectsNativeAndLegacyPathResidue(t *testing.T) {
+	contracts := map[string]struct {
+		body      string
+		forbidden []string
+	}{
+		"catalog authorization": {
+			body:      readReleaseContract(t, "internal", "tenantfs", "authorization.go"),
+			forbidden: []string{"cc-pool-mount", "RoleMount", "PresentationMount"},
+		},
+		"catalog materialization": {
+			body:      readReleaseContract(t, "internal", "tenantfs", "authority_materializer.go"),
+			forbidden: []string{"Mount: true"},
+		},
+		"pool paths": {
+			body:      readReleaseContract(t, "internal", "pool", "paths.go"),
+			forbidden: []string{"func AccountsDir", "func AccountDir", "func EnsureAccountsDir", ".cc-pool/accounts", "holder runtime"},
+		},
+		"pool initialization": {
+			body:      readReleaseContract(t, "internal", "pool", "account.go"),
+			forbidden: []string{"EnsureAccountsDir"},
+		},
+		"user-facing runtime errors": {
+			body: readReleaseContract(t, "internal", "daemon", "holderservice.go") +
+				readReleaseContract(t, "internal", "tenantfs", "preparer.go") +
+				readReleaseContract(t, "internal", "cli", "misc.go"),
+			forbidden: []string{"holder runtime", "holder activation", "holder native presentation", "its overlay"},
+		},
+		"current documentation and fixtures": {
+			body: readReleaseContract(t, "AGENTS.md") +
+				readReleaseContract(t, ".claude", "fragments", "AGENTS.md", "cc-pool-guide.fragment.md") +
+				readReleaseContract(t, "docs", "ARCHITECTURE.md") +
+				readReleaseContract(t, "scripts", "sync-sim", "run.sh") +
+				readReleaseContract(t, "widget", "Sources", "Shared", "Status.swift") +
+				readReleaseContract(t, "widget", "Tests", "StatusProtocolTests.swift") +
+				readReleaseContract(t, "widget", "Tests", "OutlookDisplayTests.swift"),
+			forbidden: []string{".cc-pool/accounts", "shared overlay", "mount presentation"},
+		},
+	}
+	for name, contract := range contracts {
+		for _, forbidden := range contract.forbidden {
+			if strings.Contains(contract.body, forbidden) {
+				t.Fatalf("%s retains forbidden File Provider-only residue %q", name, forbidden)
+			}
+		}
+	}
+}
+
 func TestTCCSnapshotCoversProtectedSurfacesAndRejectsDaemonRows(t *testing.T) {
 	snapshot := readReleaseContract(t, "scripts", "vm", "tcc-snapshot.sh")
 	for _, service := range []string{

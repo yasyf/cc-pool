@@ -63,6 +63,15 @@ func TestNativeOperationsAreExhaustivelyRejected(t *testing.T) {
 	}
 }
 
+func TestUnforwardedTenantCatalogRequestsAreRejected(t *testing.T) {
+	if _, err := catalogAuthorization(
+		catalogproto.OperationCatalogLookup,
+		catalogservice.Route{Tenant: "tenant"},
+	); err == nil {
+		t.Fatal("unforwarded tenant catalog request was authorized")
+	}
+}
+
 func TestSourceFleetOperationsRequireExactUnroutedProductAdminRole(t *testing.T) {
 	for _, operation := range []catalogproto.Operation{
 		catalogproto.OperationSourceAuthorityPublishDesiredFleet,

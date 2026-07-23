@@ -99,10 +99,6 @@ func catalogAuthorization(
 		authorization.Principal = "cc-pool-fileprovider"
 		authorization.Role = catalogservice.RoleFileProvider
 		authorization.Presentation = catalog.PresentationFileProvider
-	case !route.Forwarded && route.Tenant != "" && route.Domain == "":
-		authorization.Principal = "cc-pool-mount"
-		authorization.Role = catalogservice.RoleMount
-		authorization.Presentation = catalog.PresentationMount
 	default:
 		return catalogservice.Authorization{}, errUnauthorized
 	}

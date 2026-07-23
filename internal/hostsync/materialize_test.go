@@ -405,7 +405,7 @@ func TestMaterializeHappyPath(t *testing.T) {
 	if row.AccountUUID != "u-happy" {
 		t.Fatalf("row AccountUUID = %q, want u-happy", row.AccountUUID)
 	}
-	if row.ConfigDir != configDir || row.ConfigDir == pool.AccountDir(1) ||
+	if row.ConfigDir != configDir || row.ConfigDir == pool.AccountBackingDir(1) ||
 		row.KeychainService != creds.ServiceName(configDir) {
 		t.Fatalf("persisted presentation binding = %+v, want exact proven path %q", row, configDir)
 	}

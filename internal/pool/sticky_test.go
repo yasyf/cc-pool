@@ -40,7 +40,7 @@ func seedSessionFor(t *testing.T, m *Manager, accountID int, cwd string, started
 				t.Fatal(existingErr)
 			}
 			admitPoolTestAccount(t, m.Store, store.Account{
-				ID: id, ConfigDir: AccountDir(id),
+				ID: id, ConfigDir: testFileProviderConfigDir(id),
 				KeychainService: fmt.Sprintf("svc-%d", id), KeychainAccount: "user",
 			})
 		}

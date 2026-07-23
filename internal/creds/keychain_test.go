@@ -12,8 +12,8 @@ import (
 // oracle (values computed via `shasum -a 256` of the NFC path, first 8 hex).
 func TestServiceNameGoldenVectors(t *testing.T) {
 	cases := map[string]string{
-		"/Users/yasyf/.cc-pool/accounts/acct-01": "Claude Code-credentials-0fc8328e",
-		"/Users/yasyf/.claude":                   "Claude Code-credentials-c25ff9d8",
+		"/Users/yasyf/Library/CloudStorage/CCPoolStatus-acct-01": "Claude Code-credentials-b6e43404",
+		"/Users/yasyf/.claude": "Claude Code-credentials-c25ff9d8",
 	}
 	for dir, want := range cases {
 		if got := ServiceName(dir); got != want {
@@ -29,7 +29,7 @@ func TestServiceNameAlwaysSuffixed(t *testing.T) {
 	for _, dir := range []string{
 		"",
 		"/Users/x/.claude",
-		"/Users/x/.cc-pool/accounts/acct-01",
+		"/Users/x/Library/CloudStorage/CCPoolStatus-acct-01",
 		"/Users/x/.claude/", // trailing slash → different hash, still suffixed
 		"/Users/é/.claude",  // non-ASCII, NFC-normalized before hashing
 	} {

@@ -1163,7 +1163,7 @@ func newAccountMutationTestServer(
 				ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
 			}
 			return daemonTestPreparationProof(
-				account, fmt.Sprintf("/Users/test/Library/CloudStorage/cc-pool-account-%d", reservation.ID),
+				account, testFileProviderConfigDir(reservation.ID),
 			), nil
 		},
 		prepareAccount: func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error) {
@@ -1182,7 +1182,7 @@ func newAccountMutationTestServer(
 	if !withAccount {
 		return s, fake, store.Account{}
 	}
-	dir := pool.AccountDir(1)
+	dir := testFileProviderConfigDir(1)
 	account := store.Account{
 		ID: 1, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 1,
 		ConfigDir: dir, KeychainService: "cc-pool-test-account-1",
