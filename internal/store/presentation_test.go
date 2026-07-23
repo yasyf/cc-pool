@@ -101,13 +101,15 @@ func TestRebindAccountPresentationBumpsGenerationAndRequiresQuarantine(t *testin
 	}
 	proof := drifted
 	proof.Generation = account.Generation + 1
-	updated, err := s.RebindAccountPresentation(account, proof, "new-keychain-service")
+	updated, err := s.RebindAccountPresentation(
+		account, proof, "new-keychain-service", "new-keychain-account",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if updated.InstanceID != account.InstanceID || updated.Generation != account.Generation+1 ||
 		updated.ConfigDir != newPath || updated.KeychainService != "new-keychain-service" ||
-		updated.KeychainAccount != account.KeychainAccount {
+		updated.KeychainAccount != "new-keychain-account" {
 		t.Fatalf("updated account = %+v", updated)
 	}
 	bound, err := s.AccountPresentation(account.ID)
@@ -140,7 +142,9 @@ func TestRebindAccountPresentationRejectsActiveMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	drifted.Generation++
-	if _, err := s.RebindAccountPresentation(account, drifted, "new-service"); !errors.Is(err, ErrAccountPresentationBusy) {
+	if _, err := s.RebindAccountPresentation(
+		account, drifted, "new-service", "new-account",
+	); !errors.Is(err, ErrAccountPresentationBusy) {
 		t.Fatalf("rebind with active mutation = %v", err)
 	}
 }

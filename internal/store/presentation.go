@@ -121,11 +121,12 @@ func (s *Store) RebindAccountPresentation(
 	account Account,
 	evidence PresentationEvidence,
 	keychainService string,
+	keychainAccount string,
 ) (Account, error) {
 	if err := validatePresentationEvidence(evidence); err != nil {
 		return Account{}, err
 	}
-	if keychainService == "" || evidence.Generation != account.Generation+1 ||
+	if keychainService == "" || keychainAccount == "" || evidence.Generation != account.Generation+1 ||
 		evidence.PublicPath == account.ConfigDir {
 		return Account{}, ErrAccountPresentationEvidence
 	}
@@ -161,9 +162,9 @@ func (s *Store) RebindAccountPresentation(
 		return Account{}, ErrAccountPresentationBusy
 	}
 	result, err := tx.Exec(
-		`UPDATE accounts SET generation=?,config_dir=?,keychain_service=?
+		`UPDATE accounts SET generation=?,config_dir=?,keychain_service=?,keychain_account=?
 		 WHERE id=? AND instance_id=? AND generation=? AND config_dir=? AND deleted_at IS NULL`,
-		evidence.Generation, evidence.PublicPath, keychainService,
+		evidence.Generation, evidence.PublicPath, keychainService, keychainAccount,
 		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
 	)
 	if err != nil {
