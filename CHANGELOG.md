@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.62.0] - 2026-07-23
+
 ### Changed
 - cc-pool now uses daemonkit for exact persistent-session transport, peer
   identity, listener takeover, admission and draining, launchd policy,
@@ -35,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays unselectable until an exact readable credential replacement resolves
   its receipt and quarantine fence.
 - The fixed Developer ID-signed `CCPoolStatus.app` now embeds the FuseKit
-  FuseKit runtime and App Group broker alongside its File Provider extension and widget.
+  runtime and App Group broker alongside its File Provider extension and widget.
   The unsigned Go daemon uses only its private socket and never resolves,
   names, binds, dials, or traverses the App Group container.
 - Runtime state and every cc-pool-owned protocol start at one fresh epoch:
@@ -518,7 +520,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.18.2...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.62.0...HEAD
+[0.62.0]: https://github.com/yasyf/cc-pool/compare/v0.61.7...v0.62.0
 [0.18.2]: https://github.com/yasyf/cc-pool/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/yasyf/cc-pool/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/yasyf/cc-pool/compare/v0.17.0...v0.18.0

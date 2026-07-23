@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +19,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	daemonproc "github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/syncservice"
 )
 
@@ -78,15 +78,15 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 // XDG_CONFIG_HOME so SynckitMesh resolves the given self and peers.
 func writeWireMeshState(t *testing.T, self string, hosts []string) {
 	t.Helper()
-	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "synckit")
-	if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // G703: dir is under the test's own XDG_CONFIG_HOME (t.TempDir), not external input
+	ctx := context.Background()
+	if err := hostregistry.Mesh.InitializeState(ctx); err != nil {
 		t.Fatal(err)
 	}
-	body, err := json.Marshal(map[string]any{"self": self, "hosts": hosts})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "state.json"), body, 0o600); err != nil { //nolint:gosec // G703: dir is under the test's own XDG_CONFIG_HOME (t.TempDir), not external input
+	if _, err := hostregistry.Mesh.Update(ctx, func(reg *hostregistry.Registry) error {
+		reg.Self = self
+		reg.Hosts = append([]string{}, hosts...)
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 }

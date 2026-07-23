@@ -86,16 +86,17 @@ func stubSyncConverge(t *testing.T) *int {
 	return &calls
 }
 
-func writeMeshState(t *testing.T, payload string) {
+func writeMeshState(t *testing.T, self string, hosts []string) {
 	t.Helper()
-	dir, err := hostregistry.Mesh.Dir()
-	if err != nil {
+	ctx := context.Background()
+	if err := hostregistry.Mesh.InitializeState(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(payload), 0o600); err != nil {
+	if _, err := hostregistry.Mesh.Update(ctx, func(reg *hostregistry.Registry) error {
+		reg.Self = self
+		reg.Hosts = append([]string{}, hosts...)
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -195,7 +196,7 @@ func TestEnableRequestsDaemonConvergence(t *testing.T) {
 	putSynckitdOnPath(t)
 	stubSynckitdRun(t)
 	converges := stubSyncConverge(t)
-	writeMeshState(t, `{"self":"me@hosta","hosts":[]}`)
+	writeMeshState(t, "me@hosta", nil)
 
 	cmd, out := syncCmdBuf(t)
 	if err := runSyncEnable(cmd, m); err != nil {
@@ -332,7 +333,7 @@ func TestSyncConvergeReportsResult(t *testing.T) {
 
 func TestStatusRendersMesh(t *testing.T) {
 	m := syncTestEnv(t)
-	writeMeshState(t, `{"self":"me@hosta","hosts":["you@hostb"]}`)
+	writeMeshState(t, "me@hosta", []string{"you@hostb"})
 	if err := m.Store.SetMeta(syncMetaKey, "1"); err != nil {
 		t.Fatal(err)
 	}
