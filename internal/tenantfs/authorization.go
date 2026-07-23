@@ -49,12 +49,9 @@ func (a MountAuthorizer) Authorize(
 	return tenant.OwnerID(OwnerID), nil
 }
 
-// AuthorizeNative admits the signed holder's exact native child session.
-func (a MountAuthorizer) AuthorizeNative(_ context.Context, identity mountservice.Identity, operation mountproto.Operation) error {
-	if !validMountIdentity(a.UID, identity) || !nativeOperation(operation) {
-		return errUnauthorized
-	}
-	return nil
+// AuthorizeNative rejects native presentations for this File Provider-only product.
+func (MountAuthorizer) AuthorizeNative(context.Context, mountservice.Identity, mountproto.Operation) error {
+	return errUnauthorized
 }
 
 // CatalogAuthorizer maps authenticated product operations to closed FuseKit roles.
@@ -125,18 +122,6 @@ func validCatalogIdentity(uid int, identity catalogservice.Identity) bool {
 func tenantLifecycleOperation(operation mountproto.Operation) bool {
 	return operation == mountproto.OperationTenantProvision || operation == mountproto.OperationTenantReplace ||
 		operation == mountproto.OperationTenantRemove || operation == mountproto.OperationTenantState
-}
-
-func nativeOperation(operation mountproto.Operation) bool {
-	return operation == mountproto.OperationNativeBind || operation == mountproto.OperationNativeMounted ||
-		operation == mountproto.OperationNativeReady ||
-		operation == mountproto.OperationNativeUnbind || operation == mountproto.OperationNativeRoutePage ||
-		operation == mountproto.OperationNativePin || operation == mountproto.OperationNativeRelease ||
-		operation == mountproto.OperationNativeSnapshotOpen || operation == mountproto.OperationNativeSnapshotRead ||
-		operation == mountproto.OperationNativeSnapshotClose || operation == mountproto.OperationNativeWriteOpen ||
-		operation == mountproto.OperationNativeWriteRead || operation == mountproto.OperationNativeWriteWrite ||
-		operation == mountproto.OperationNativeWriteTruncate || operation == mountproto.OperationNativeWriteSync ||
-		operation == mountproto.OperationNativeWriteCommit || operation == mountproto.OperationNativeWriteAbort
 }
 
 var (

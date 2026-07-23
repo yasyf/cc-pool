@@ -31,7 +31,12 @@ func TestRuntimeHealthObservationUsesImmutablePeerIdentity(t *testing.T) {
 	}
 }
 
-func TestNativeOperationsAreExhaustivelyAuthorized(t *testing.T) {
+func TestNativeOperationsAreExhaustivelyRejected(t *testing.T) {
+	authorizer := MountAuthorizer{UID: 42}
+	identity := mountservice.Identity{
+		Peer: wire.Peer{PID: 7, UID: 42}, WireBuild: transportproto.WireBuild,
+		Session: &wire.AcceptedSession{},
+	}
 	operations := []mountproto.Operation{
 		mountproto.OperationNativeBind,
 		mountproto.OperationNativeMounted,
@@ -52,21 +57,8 @@ func TestNativeOperationsAreExhaustivelyAuthorized(t *testing.T) {
 		mountproto.OperationNativeWriteAbort,
 	}
 	for _, operation := range operations {
-		if !nativeOperation(operation) {
-			t.Errorf("native operation %q was rejected", operation)
-		}
-	}
-
-	for _, operation := range []mountproto.Operation{
-		mountproto.OperationRuntimeHealth,
-		mountproto.OperationTenantProvision,
-		mountproto.OperationTenantReplace,
-		mountproto.OperationTenantRemove,
-		mountproto.OperationTenantState,
-		"unknown",
-	} {
-		if nativeOperation(operation) {
-			t.Errorf("non-native operation %q was authorized", operation)
+		if err := authorizer.AuthorizeNative(t.Context(), identity, operation); err == nil {
+			t.Errorf("native operation %q was authorized", operation)
 		}
 	}
 }
