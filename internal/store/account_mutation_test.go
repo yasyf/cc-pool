@@ -891,6 +891,86 @@ func TestPresentationRebindJournalRetainsQuarantineUntilOldOwnerCleanup(t *testi
 	}
 }
 
+func TestPresentationRebindFencesCredentialOperationsThroughAdmission(t *testing.T) {
+	s := openTest(t)
+	account, request, target := presentationRebindMutationTestFixture(t, s)
+	empty := CredentialExternalState{
+		Keychain: CredentialSlotObservation{State: CredentialSlotEmpty},
+	}
+	oldOperation := credentialOperationTestRequest(
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
+		empty, "old-owner-before-rebind", request.Owner,
+	)
+	oldBegin, err := s.BeginCredentialOperation(oldOperation)
+	if err != nil || !oldBegin.Created || oldBegin.Active == nil {
+		t.Fatalf("begin old credential operation = %+v err=%v", oldBegin, err)
+	}
+	if _, err := s.BeginAccountMutation(t.Context(), request); !errors.Is(err, ErrAccountMutationRecoveryRequired) {
+		t.Fatalf("rebind admitted over active credential operation: %v", err)
+	}
+	if err := s.AbandonPreparedCredentialOperation(oldBegin.Active.Fence()); err != nil {
+		t.Fatal(err)
+	}
+
+	begin, err := s.BeginAccountMutation(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := s.BindAccountMutationPresentation(
+		begin.Active.Fence(), target, target.FileProvider.PublicPath,
+		"new-service", "new-account", CredentialKeychainLocatorDigest("new-service", "new-account"),
+		credentialOperationTestDigest("new-expected"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err = s.MarkAccountMutationInputProvided(fence, credentialOperationTestDigest("input"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err = s.MarkAccountMutationApplying(fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetAccount := Account{
+		ID: account.ID, InstanceID: account.InstanceID, Generation: account.Generation + 1,
+		ConfigDir:       target.FileProvider.PublicPath,
+		KeychainService: "new-service", KeychainAccount: "new-account",
+	}
+	adopt := credentialOperationTestRequest(
+		t, targetAccount, CredentialOperationAdoptRotated, CredentialTargetKeychain,
+		empty, "target-adopt", request.Owner,
+	)
+	if _, err := s.BeginCredentialOperation(adopt); !errors.Is(err, ErrAccountPresentationQuarantined) {
+		t.Fatalf("credential operation entered applying rebind: %v", err)
+	}
+	fence, err = s.MarkAccountMutationApplied(fence, credentialOperationTestDigest("written"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BeginCredentialOperation(adopt); !errors.Is(err, ErrAccountPresentationQuarantined) {
+		t.Fatalf("credential operation entered applied rebind: %v", err)
+	}
+	fence, err = s.MarkAccountMutationPublishing(fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, _, err = s.PublishAccountPresentationRebind(fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BeginCredentialOperation(adopt); !errors.Is(err, ErrAccountPresentationQuarantined) {
+		t.Fatalf("credential operation entered published rebind: %v", err)
+	}
+	if _, err := s.CommitAccountPresentationRebind(fence, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.BeginCredentialOperation(adopt)
+	if err != nil || !after.Created || after.Active == nil {
+		t.Fatalf("credential operation remained fenced after admission = %+v err=%v", after, err)
+	}
+}
+
 func TestRefreshPresentationRebindProofAllowsCurrentActivationAndAdvancingProvenance(t *testing.T) {
 	s := openTest(t)
 	account, request, target := presentationRebindMutationTestFixture(t, s)
