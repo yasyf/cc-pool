@@ -207,7 +207,11 @@ func (lease *credentialLockLease) acquireTarget(ctx context.Context, index int) 
 		if !errors.Is(err, os.ErrExist) && !errors.Is(err, syscall.EEXIST) {
 			return fmt.Errorf("publish credential refresh lock: %w", err)
 		}
+		credentialLockCheckpoint(fmt.Sprintf("target-contended-%d", index))
 		if err := validateCredentialLockDirectory(target.Path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return err
 		}
 		select {

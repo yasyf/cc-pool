@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,11 @@ import (
 )
 
 type credentialCASTestTaskRunner struct{}
+
+type credentialCASTestResult struct {
+	response CredentialCASResponse
+	err      error
+}
 
 func (credentialCASTestTaskRunner) Run(ctx context.Context, task supervise.Task) error {
 	if len(task.Args) != 1 || task.Args[0] != casWorkerArgument {
@@ -143,14 +149,40 @@ func TestCredentialCASWaitsForClaudeLockAndNeverClobbersRacingWriter(t *testing.
 	if err := os.Mkdir(lock, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	contended := make(chan struct{})
+	resume := make(chan struct{})
+	var contendedOnce sync.Once
+	var resumeOnce sync.Once
+	credentialLockFailpoint = func(checkpoint string) {
+		if checkpoint != "target-contended-0" {
+			return
+		}
+		contendedOnce.Do(func() {
+			close(contended)
+			<-resume
+		})
+	}
+	t.Cleanup(func() {
+		resumeOnce.Do(func() { close(resume) })
+		credentialLockFailpoint = nil
+	})
 
-	response := make(chan CredentialCASResponse, 1)
+	workerContext, cancelWorker := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancelWorker)
+	request := credentialCASTestRequest(t, account, creds.SourceKeychain, expected, credentialCASCredential("cas"))
+	response := make(chan credentialCASTestResult, 1)
 	go func() {
-		response <- runCredentialCASTestWorker(
-			t, credentialCASTestRequest(t, account, creds.SourceKeychain, expected, credentialCASCredential("cas")),
-		)
+		result, err := runCredentialCASTestWorkerResult(workerContext, request)
+		response <- credentialCASTestResult{response: result, err: err}
 	}()
-	time.Sleep(75 * time.Millisecond)
+	select {
+	case <-contended:
+	case workerResult := <-response:
+		if workerResult.err != nil {
+			t.Fatalf("credential CAS worker before contention: %v", workerResult.err)
+		}
+		t.Fatalf("credential CAS worker completed before contention: %+v", workerResult.response)
+	}
 	racing := credentialCASCredential("claude")
 	if err := stores[creds.SourceKeychain].Write(t.Context(), racing); err != nil {
 		t.Fatal(err)
@@ -158,7 +190,12 @@ func TestCredentialCASWaitsForClaudeLockAndNeverClobbersRacingWriter(t *testing.
 	if err := os.Remove(lock); err != nil {
 		t.Fatal(err)
 	}
-	result := <-response
+	resumeOnce.Do(func() { close(resume) })
+	workerResult := <-response
+	if workerResult.err != nil {
+		t.Fatal(workerResult.err)
+	}
+	result := workerResult.response
 	if result.ErrorCode != "conflict" {
 		t.Fatalf("racing writer result = %+v, want conflict", result)
 	}
@@ -379,18 +416,29 @@ func credentialCASTestRequest(
 
 func runCredentialCASTestWorker(t *testing.T, request CredentialCASRequest) CredentialCASResponse {
 	t.Helper()
-	var input, output bytes.Buffer
-	if err := json.NewEncoder(&input).Encode(request); err != nil {
-		t.Fatal(err)
-	}
-	if err := RunCredentialCASWorker(t.Context(), &input, &output); err != nil {
-		t.Fatal(err)
-	}
-	var response CredentialCASResponse
-	if err := decodeCredentialCASJSON(&output, &response); err != nil {
+	response, err := runCredentialCASTestWorkerResult(t.Context(), request)
+	if err != nil {
 		t.Fatal(err)
 	}
 	return response
+}
+
+func runCredentialCASTestWorkerResult(
+	ctx context.Context,
+	request CredentialCASRequest,
+) (CredentialCASResponse, error) {
+	var input, output bytes.Buffer
+	if err := json.NewEncoder(&input).Encode(request); err != nil {
+		return CredentialCASResponse{}, err
+	}
+	if err := RunCredentialCASWorker(ctx, &input, &output); err != nil {
+		return CredentialCASResponse{}, err
+	}
+	var response CredentialCASResponse
+	if err := decodeCredentialCASJSON(&output, &response); err != nil {
+		return CredentialCASResponse{}, err
+	}
+	return response, nil
 }
 
 func credentialCASCredential(suffix string) *creds.Credential {
