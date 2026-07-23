@@ -30,7 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard terminationTask == nil else { return .terminateLater }
         terminationTask = Task { [weak sender] in
             if CCPoolFuseKitStop() != 0 {
-                NSLog("CCPoolStatus: FuseKit holder shutdown failed")
+                NSLog("CCPoolStatus: FuseKit runtime shutdown failed")
             }
             sender?.reply(toApplicationShouldTerminate: true)
         }

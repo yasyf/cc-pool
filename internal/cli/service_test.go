@@ -448,7 +448,7 @@ func TestStopDaemonServiceSettlesHolderBeforeSuccess(t *testing.T) {
 	if err := stopDaemonService(cmd); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stripANSI(out.String()), "Removed the daemon and holder LaunchAgents") {
+	if !strings.Contains(stripANSI(out.String()), "Removed the daemon and FuseKit runtime LaunchAgents") {
 		t.Fatalf("output = %q", out.String())
 	}
 	if len(controller.desired) != 1 || controller.desired[0] != nil || controller.closed != 1 {

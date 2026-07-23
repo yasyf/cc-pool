@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestHolderStopUninstallCommandUsesExactDaemonkitStopPath(t *testing.T) {
+func TestRuntimeStopUninstallCommandUsesExactDaemonkitStopPath(t *testing.T) {
 	want := errors.New("exact stop failure")
 	called := 0
 	swapVar(t, &stopHolder, func(context.Context) error {
@@ -17,20 +17,20 @@ func TestHolderStopUninstallCommandUsesExactDaemonkitStopPath(t *testing.T) {
 		return want
 	})
 	cmd := newServiceCmd()
-	cmd.SetArgs([]string{"holder-stop-uninstall"})
+	cmd.SetArgs([]string{"runtime-stop-uninstall"})
 	if err := cmd.ExecuteContext(t.Context()); !errors.Is(err, want) {
-		t.Fatalf("holder-stop-uninstall = %v, want %v", err, want)
+		t.Fatalf("runtime-stop-uninstall = %v, want %v", err, want)
 	}
 	if called != 1 {
-		t.Fatalf("exact holder stop calls = %d, want 1", called)
+		t.Fatalf("exact runtime stop calls = %d, want 1", called)
 	}
 }
 
-func TestStatusCaskRequiresExactHolderStopAndRejectsNameBasedKills(t *testing.T) {
+func TestStatusCaskRequiresExactRuntimeStopAndRejectsNameBasedKills(t *testing.T) {
 	cask := readReleaseContract(t, ".github", "cask", "cc-pool-status.rb.tmpl")
-	if strings.Count(cask, `args: ["service", "holder-stop-uninstall"]`) != 2 ||
+	if strings.Count(cask, `args: ["service", "runtime-stop-uninstall"]`) != 2 ||
 		strings.Count(cask, "must_succeed: true") < 3 {
-		t.Fatal("status cask does not fail closed through the exact holder stop hook")
+		t.Fatal("status cask does not fail closed through the exact runtime stop hook")
 	}
 	lower := strings.ToLower(cask)
 	for _, forbidden := range []string{"pkill", "pgrep", "killall", "osascript", "uninstall quit:"} {
@@ -87,11 +87,11 @@ func TestReleasePublishesFormulaAndCaskOnlyAfterVerifiedApplication(t *testing.T
 	}
 }
 
-func TestWidgetBuildsFileProviderOnlyHolderWithoutNativeRuntime(t *testing.T) {
+func TestWidgetBuildsFileProviderOnlyRuntime(t *testing.T) {
 	project := readReleaseContract(t, "widget", "project.yml")
 	for _, required := range []string{
 		"go build -buildmode=c-archive",
-		"./cmd/cc-pool-holder-archive",
+		"./cmd/cc-pool-runtime-archive",
 	} {
 		if !strings.Contains(project, required) {
 			t.Fatalf("widget project is missing %q", required)
@@ -99,7 +99,7 @@ func TestWidgetBuildsFileProviderOnlyHolderWithoutNativeRuntime(t *testing.T) {
 	}
 	appMain := readReleaseContract(t, "widget", "Sources", "App", "main.swift")
 	if !strings.Contains(appMain, "exit(CCPoolFuseKitWait())") {
-		t.Fatal("fixed app does not exit after exact holder terminal settlement")
+		t.Fatal("fixed app does not exit after exact runtime terminal settlement")
 	}
 	for _, forbidden := range []string{
 		"-tags fuse", "cc-pool-fuse-package",
@@ -144,6 +144,29 @@ func TestWidgetBuildsFileProviderOnlyHolderWithoutNativeRuntime(t *testing.T) {
 	}
 	if installAt < 0 {
 		t.Fatal("VM push no longer installs the signed app")
+	}
+}
+
+func TestReleaseRejectsStandaloneHolderProductNames(t *testing.T) {
+	contracts := map[string]string{
+		"cask":         readReleaseContract(t, ".github", "cask", "cc-pool-status.rb.tmpl"),
+		"formula":      readReleaseContract(t, ".github", "formula", "cc-pool.rb.tmpl"),
+		"ci":           readReleaseContract(t, ".github", "workflows", "ci.yml"),
+		"release":      readReleaseContract(t, ".github", "workflows", "release.yml"),
+		"widget":       readReleaseContract(t, "widget", "project.yml"),
+		"readme":       readReleaseContract(t, "README.md"),
+		"architecture": readReleaseContract(t, "docs", "ARCHITECTURE.md"),
+	}
+	for name, contract := range contracts {
+		lower := strings.ToLower(contract)
+		for _, forbidden := range []string{
+			"fusekitholder", "fusekit-holder", "holder.app", "cc-pool-holder-archive",
+			"fusekit holder", "mount holder", "holder cask", "fuse overlays", "shared overlay",
+		} {
+			if strings.Contains(lower, forbidden) {
+				t.Fatalf("%s retains standalone holder product name %q", name, forbidden)
+			}
+		}
 	}
 }
 

@@ -29,7 +29,7 @@ func TestRuntimePlanSpecPinsProductIdentityAndProtectedPolicy(t *testing.T) {
 }
 
 func TestSignedHolderUsesOnlyTheRuntimePlanReadinessBudget(t *testing.T) {
-	payload, err := os.ReadFile(filepath.Join("..", "..", "cmd", "cc-pool-holder-archive", "main.go"))
+	payload, err := os.ReadFile(filepath.Join("..", "..", "cmd", "cc-pool-runtime-archive", "main.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestSignedHolderUsesOnlyTheRuntimePlanReadinessBudget(t *testing.T) {
 }
 
 func TestSignedHolderDispatchesStopControlBeforeOtherChildWork(t *testing.T) {
-	payload, err := os.ReadFile(filepath.Join("..", "..", "cmd", "cc-pool-holder-archive", "main.go"))
+	payload, err := os.ReadFile(filepath.Join("..", "..", "cmd", "cc-pool-runtime-archive", "main.go"))
 	if err != nil {
 		t.Fatal(err)
 	}

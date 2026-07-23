@@ -106,19 +106,19 @@ The widget ships as its own cask, `yasyf/tap/cc-pool-status`, and shows per-acco
 | `ccp status` | Per-account usage, score, and sessions; TUI on a terminal, plain table when piped |
 | `ccp select` | Inspect and print the daemon-prepared best account without creating a session; launch only with `ccp run` |
 | `ccp sync` | Mirror the pool — accounts, credentials, removals — across Macs on a synckit mesh |
-| `ccp doctor` | Check accounts' Keychain items and overlays; `--fix` repairs drift |
-| `ccp service` | Manage the daemon and mount holder via `install`, `uninstall`, and `status` |
+| `ccp doctor` | Check accounts' Keychain items and File Provider presentations; `--fix` repairs drift |
+| `ccp service` | Manage the daemon and signed `CCPoolStatus.app` via `install`, `uninstall`, and `status` |
 
 Run `ccp help <command>` for every flag and the rest of the surface, which covers `env`, `list`, `login`, `rename`, `remove`, `init`, `cred`, `widget`, and `daemon`.
 
 ## How it works
 
-`~/.claude` is **never touched**. Plain `claude` keeps working and can't be logged out by the pool. Secrets live only in the macOS Keychain, never in cc-pool's database. Selection is **predictive**. It scores each account's live 5h/7d usage before launch and picks the emptiest, instead of waiting for a rate-limit error to tell you the pick was wrong. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) covers the full design, from per-account config dirs and the shared overlay to the scoring formula and the daemon.
+`~/.claude` is **never touched**. Plain `claude` keeps working and can't be logged out by the pool. Secrets live only in the macOS Keychain, never in cc-pool's database. Selection is **predictive**. It scores each account's live 5h/7d usage before launch and picks the emptiest, instead of waiting for a rate-limit error to tell you the pick was wrong. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) covers the full design, from per-account config dirs and revisioned File Provider presentation to the scoring formula and the daemon.
 
 ## Uninstall
 
 ```sh
-ccp service uninstall            # stop the daemon + mount holder, unmount fuse overlays
+ccp service uninstall            # stop the daemon + CCPoolStatus app services
                                  # (refuses under live sessions; --force overrides)
 ccp service uninstall --purge    # ...and remove all pool accounts/dirs/state
 brew uninstall cc-pool

@@ -10,7 +10,7 @@ cask "__CASK_TOKEN__" do
 
   url "__ASSET_URL__"
   name "cc-pool Status"
-  desc "cc-pool status, File Provider, and fixed FuseKit holder app"
+  desc "cc-pool status, File Provider, and widget app"
   homepage "https://github.com/__REPO__"
 
   depends_on macos: :sequoia # deployment target is macOS 15
@@ -19,11 +19,11 @@ cask "__CASK_TOKEN__" do
   app "__APP_NAME__.app", target: "/Applications/__APP_NAME__.app"
 
   preflight do
-    # The exact daemonkit AppKeepAlive.Stop path must settle the signed holder
+    # The exact daemonkit AppKeepAlive.Stop path must settle the signed runtime
     # and unregister its service before Homebrew replaces the bundle.
     if Dir.exist?("/Applications/__APP_NAME__.app")
       system_command "#{HOMEBREW_PREFIX}/bin/ccp",
-                     args: ["service", "holder-stop-uninstall"],
+                     args: ["service", "runtime-stop-uninstall"],
                      must_succeed: true
     end
   end
@@ -37,7 +37,7 @@ cask "__CASK_TOKEN__" do
     # tenant provisioning must never race an absent extension registration.
     system_command "/usr/bin/pluginkit", args: ["-a", "/Applications/__APP_NAME__.app/Contents/PlugIns/CCPoolFileProvider.appex"], must_succeed: true
     system_command "/usr/bin/pluginkit", args: ["-e", "use", "-i", "com.yasyf.cc-pool.status.fileprovider"], must_succeed: true
-    # The daemonkit-owned LaunchAgent is the sole holder lifecycle authority.
+    # The daemonkit-owned LaunchAgent is the sole runtime lifecycle authority.
     system_command "#{HOMEBREW_PREFIX}/bin/ccp",
                    args: ["service", "install"],
                    must_succeed: true
@@ -45,7 +45,7 @@ cask "__CASK_TOKEN__" do
 
   uninstall_preflight do
     system_command "#{HOMEBREW_PREFIX}/bin/ccp",
-                   args: ["service", "holder-stop-uninstall"],
+                   args: ["service", "runtime-stop-uninstall"],
                    must_succeed: true
   end
 

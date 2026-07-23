@@ -14,14 +14,14 @@ completed poll (~3 min) — same schema as `ccp status --json`. The sandboxed
 widget extension reads that file via a read-only sandbox exception for
 `~/.cc-pool/`; it never touches the socket, the database, or the Keychain.
 
-The fixed signed `/Applications/CCPoolStatus.app` is also the FuseKit holder and
+The fixed signed `/Applications/CCPoolStatus.app` also embeds the FuseKit runtime and
 File Provider broker. Its one Mach-O dispatches authenticated service roles before
 SwiftUI startup, owns the ordinary FuseKit socket below `~/.cc-pool/fusekit`, and owns
 the App Group socket used by `CCPoolFileProvider.appex`. The Go account daemon
 never names or traverses the Group Container.
 
 In normal app mode it registers the widget, launches at login, watches
-`~/.cc-pool` for status updates, runs the holder, and brokers File Provider
+`~/.cc-pool` for status updates, runs the runtime, and brokers File Provider
 catalog traffic. The File Provider extension has no direct home-directory
 exception.
 
@@ -124,4 +124,4 @@ xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
 - `nm -gU /Applications/CCPoolStatus.app/Contents/MacOS/CCPoolStatus` must show
   `_CCPoolFuseKitDispatchChild`, `_CCPoolFuseKitStart`, `_CCPoolFuseKitReady`,
   `_CCPoolFuseKitWait`, and `_CCPoolFuseKitStop`, proving worker dispatch and
-  exact holder settlement are in the same signed Mach-O.
+  exact runtime settlement are in the same signed Mach-O.

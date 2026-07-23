@@ -54,9 +54,9 @@ tenants remain logically stale until `PrepareTenant` catches up that one selecte
 Atomic replacement is one catalog transaction: the source object keeps its identity, the
 replaced target is tombstoned once, and old handles retain their pinned snapshot.
 
-The fixed Developer ID-signed `/Applications/CCPoolStatus.app` embeds the File Provider-only
-FuseKit holder in the same Mach-O as the application. No native filesystem runtime, mount,
-or Network Volumes authorization participates in account presentation.
+The fixed Developer ID-signed `/Applications/CCPoolStatus.app` embeds the File Provider
+catalog runtime in the same Mach-O as the application. Account presentation uses only File
+Provider and requires no Network Volumes authorization.
 
 The same app owns the File Provider broker endpoint in App Group `SXKCTF23Q2.ccp`.
 `CCPoolFileProvider.appex` reaches only that broker. The app forwards catalog traffic to
@@ -105,10 +105,10 @@ second service lifecycle. The daemon polls
 usage every ~3 min with exponential backoff, refreshes **idle** accounts' tokens before they
 expire (a checked-out session owns its own refresh; the daemon adopts whatever token it
 rotated to on check-in), caches scores, publishes authoritative source revisions, and asks
-FuseKit to provision or prepare exact tenant generations. It does not supervise mounts,
+FuseKit to provision or prepare exact tenant generations. It does not supervise presentations,
 File Provider extensions, or App Group listeners. The fixed signed app owns the FuseKit
 runtime through daemonkit; the account daemon connects over the exact private session and
-fails closed on a missing or mismatched holder. `ccp add` and `ccp init` start the account
+fails closed on a missing or mismatched runtime. `ccp add` and `ccp init` start the account
 daemon automatically; if it is not running, `ccp select` starts the exact matching daemon
 and refuses selection until the daemon and requested tenant revision are ready.
 

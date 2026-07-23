@@ -1,6 +1,6 @@
 //go:build darwin && cgo
 
-// Package main exports the signed holder runtime archive entry points.
+// Package main exports the signed FuseKit runtime archive entry points.
 package main
 
 /*
@@ -65,7 +65,7 @@ func CCPoolFuseKitStart() C.int32_t {
 		context.Background(), holderbridge.ReadinessContract().StartupTimeout(),
 	)
 	defer cancel()
-	return operationStatus("holder start", startHolder(ctx))
+	return operationStatus("runtime start", startHolder(ctx))
 }
 
 func startHolder(ctx context.Context) error {
@@ -94,16 +94,16 @@ func CCPoolFuseKitReady() C.int32_t {
 		context.Background(), holderbridge.ReadinessContract().StartupTimeout(),
 	)
 	defer cancel()
-	return operationStatus("holder readiness", embeddedHolder.Ready(ctx))
+	return operationStatus("runtime readiness", embeddedHolder.Ready(ctx))
 }
 
 //export CCPoolFuseKitWait
 func CCPoolFuseKitWait() C.int32_t {
 	err := embeddedHolder.Wait(context.Background())
 	if err == nil && !embeddedHolderStopping.Load() {
-		err = errors.New("holder runtime exited before shutdown")
+		err = errors.New("runtime exited before shutdown")
 	}
-	return operationStatus("holder terminal settlement", err)
+	return operationStatus("runtime terminal settlement", err)
 }
 
 //export CCPoolFuseKitStop
@@ -113,7 +113,7 @@ func CCPoolFuseKitStop() C.int32_t {
 		context.Background(), holderbridge.ReadinessContract().SettlementTimeout(),
 	)
 	defer cancel()
-	return operationStatus("holder shutdown", embeddedHolder.Close(ctx))
+	return operationStatus("runtime shutdown", embeddedHolder.Close(ctx))
 }
 
 func newHolderRuntime(ctx context.Context) (daemon.EmbeddedRuntime, error) {

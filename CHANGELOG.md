@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays unselectable until an exact readable credential replacement resolves
   its receipt and quarantine fence.
 - The fixed Developer ID-signed `CCPoolStatus.app` now embeds the FuseKit
-  holder and App Group broker alongside its File Provider extension and widget.
+  FuseKit runtime and App Group broker alongside its File Provider extension and widget.
   The unsigned Go daemon uses only its private socket and never resolves,
   names, binds, dials, or traverses the App Group container.
 - Runtime state and every cc-pool-owned protocol start at one fresh epoch:
@@ -47,12 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Durable account-mutation, credential-operation, source-authority, and removal
   journals with generation fences, exact worker authority, crash recovery, and
   causal publication evidence.
-- A single signed holder/broker topology and release/VM assertions for code
+- A single signed runtime/broker topology and release/VM assertions for code
   identity, entitlements, App Group isolation, worker deadline enforcement,
   atomic replacement, and reconciliation amplification.
 
 ### Removed
-- The cc-pool-owned mount holder, overlay conversion and probing, custom File
+- The cc-pool-owned mount runtime, overlay conversion and probing, custom File
   Provider bridge/controller/enumerator, per-domain notification fan-out,
   session-lease files, PTY relay, migration commands, and old daemon wire.
 - All state and wire migration readers, import/export cutover tools, protocol
@@ -324,7 +324,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when an orphaned old-version daemon held the socket but launchd no longer
   tracked it, the new daemon refused to bind and `ccp status` restarted the
   daemon on every run without converging. A starting daemon now evicts a
-  version-skewed holder (refusing to bind only against a genuine same-version
+  version-skewed runtime (refusing to bind only against a genuine same-version
   peer), and `ccp` asks the old daemon to step down before restarting it.
   Along the way: an exiting daemon can no longer delete its successor's
   socket, health checks respond immediately on boot even while fuse mounts

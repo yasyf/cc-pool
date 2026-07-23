@@ -83,7 +83,7 @@ jobs:
           mkdir -p dist/pure
 
           # The account daemon never touches the App Group; the fixed signed
-          # status app owns the FuseKit holder and broker.
+          # status app owns the FuseKit runtime and broker.
           CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/pure-arm64 ./cmd/cc-pool
           CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/pure-amd64 ./cmd/cc-pool
           lipo -create -output dist/pure/cc-pool dist/pure-arm64 dist/pure-amd64

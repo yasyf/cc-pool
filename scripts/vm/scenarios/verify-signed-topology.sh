@@ -50,7 +50,7 @@ vm_ssh "APP_PATH='$VMCTL_GUEST_APP' TEAM_ID=SXKCTF23Q2 APP_GROUP='$APP_GROUP' \
   CLI_PATH='$VMCTL_GUEST_CCPOOL' bash '$TOPOLOGY_PROBE'" \
   || die "installed signed-app topology is invalid"
 
-# Cold-launch only the fixed signed app. The embedded holder keeps the broker's
+# Cold-launch only the fixed signed app. The embedded runtime keeps the broker's
 # outbound session alive; no fake server or provisioned tenant is involved.
 vm_phase broker-cold-launch
 require_seconds broker-cold-launch
@@ -103,4 +103,4 @@ if ! cmp -s "$VMCTL_RESULTS_DIR/tcc-before.txt" "$VMCTL_RESULTS_DIR/tcc-after.tx
   die "cold broker launch changed the fixed app/File Provider TCC rows"
 fi
 
-log "verify-signed-topology: one fixed signed host owned holder, broker, and native child with unchanged TCC state; the account daemon has no App Group capability"
+log "verify-signed-topology: one fixed signed host owned runtime, broker, and native child with unchanged TCC state; the account daemon has no App Group capability"

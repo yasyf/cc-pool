@@ -1,7 +1,7 @@
 # vmctl — disposable macOS gates for the hard-cut FuseKit stack
 
 `vmctl` owns a throwaway tart VM for cc-pool's live File Provider, TCC, native
-holder, and process-kill verification. The VM disk, ssh key, logs, and results
+runtime, and process-kill verification. The VM disk, ssh key, logs, and results
 live below `/tmp/ccpool-vm`; `vmctl destroy` removes that state. The harness
 refuses any ssh target whose `kern.hv_vmm_present` is not `1`.
 
@@ -17,7 +17,7 @@ CCPoolFileProvider.appex
 cc-pool account daemon
 ```
 
-The fixed signed `CCPoolStatus.app` embeds the FuseKit holder and broker. The
+The fixed signed `CCPoolStatus.app` embeds the FuseKit runtime and broker. The
 ordinary Go account daemon never resolves or traverses the App Group. The
 harness never pre-seeds TCC state.
 
@@ -74,7 +74,7 @@ versions are retained in the run results.
 
 | Scenario | Exact prerequisite | Result proved |
 | --- | --- | --- |
-| `verify-signed-topology` | Developer ID host/File Provider profiles and successful `push` | Exact host, File Provider, and widget identities; one host/FP App Group; one host Mach-O; broker/holder sockets; unchanged protected-filesystem TCC rows; zero daemon TCC rows or App Group capability. |
+| `verify-signed-topology` | Developer ID host/File Provider profiles and successful `push` | Exact host, File Provider, and widget identities; one host/FP App Group; one host Mach-O; broker/runtime sockets; unchanged protected-filesystem TCC rows; zero daemon TCC rows or App Group capability. |
 | `verify-worker-deadline` | Go toolchain on the host and a pushed arm64 guest | A real TERM-handling/continuing worker and TERM-ignoring descendant exceed a deadline; daemonkit waits the fixed grace, escalates to process-group KILL, proves both PIDs gone, removes the durable process record, and admits a second task through the same bounded worker lane. Evidence is `worker-deadline.json`. |
 | `verify-convergence-amplification` | Exact pinned FuseKit module available to `GOWORK=off go test -c` | Production convergence/catalog code applies one source change to the reported 14-domain/9-active fleet, targets exactly nine domains with at most two pending acknowledgements, sends no post-ack relaunch, and returns bounded replayable catalog deltas with stable identity. Evidence is `convergence-tests.log` and `catalog-delta-tests.log`. |
 | `verify-atomic-replacement` | Exact pinned FuseKit module available to `GOWORK=off go test -c` | Production catalog replacement preserves the source object ID and old handle, has one concurrent winner, publishes final metadata/content in one revision, and remains old-or-new atomic at every failpoint. The same window must contain no `itemCollision`, `ESTALE`, or `itemDocTrackedButNotOnDisk` unified-log event. |

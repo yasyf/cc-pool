@@ -10,7 +10,7 @@
 # repointed via VMCTL_TART_HOME to share a warm base-image pull with a sibling
 # harness (see VM_TART_HOME below).
 #
-# Safety: this harness drives File Provider, TCC, and native-holder exercises.
+# Safety: this harness drives File Provider, TCC, and native-runtime exercises.
 # Nothing here mounts anything on the host, and vm_assert_guest refuses any
 # target that is not a VM (kern.hv_vmm_present != 1).
 

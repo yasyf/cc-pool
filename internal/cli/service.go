@@ -120,7 +120,7 @@ func newServiceCmd() *cobra.Command {
 			RunE:  func(cmd *cobra.Command, _ []string) error { return runServiceInstall(cmd) },
 		},
 		&cobra.Command{
-			Use:    "holder-stop-uninstall",
+			Use:    "runtime-stop-uninstall",
 			Hidden: true,
 			Args:   cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
@@ -243,7 +243,7 @@ func stopDaemonService(cmd *cobra.Command) error {
 	if err := stopHolder(cmd.Context()); err != nil {
 		return err
 	}
-	success(out, "Removed the daemon and holder LaunchAgents.")
+	success(out, "Removed the daemon and FuseKit runtime LaunchAgents.")
 	return nil
 }
 
