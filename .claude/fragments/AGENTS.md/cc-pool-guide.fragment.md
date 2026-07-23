@@ -6,8 +6,8 @@ Full style guide: [STYLEGUIDE.md](STYLEGUIDE.md)
 
 cc-pool (`ccp`) pools several Claude Max/Pro subscriptions and launches each Claude Code session on the emptiest account. Go, macOS-only, single binary.
 
-- **Build**: `CGO_ENABLED=0 go build ./cmd/cc-pool`; the signed File Provider holder archive is built with cgo but has no native filesystem dependency.
-- **Test**: `scripts/test.sh ./...` — a `ulimit -u` wrapper around `go test` so a runaway spawn cannot fork-bomb the host. Must pass with no network, no Keychain, no daemon. Never run bare `go test` on a real machine; use the harness, or an isolated VM/container for live holder and File Provider work.
+- **Build**: `CGO_ENABLED=0 go build ./cmd/cc-pool`; the signed File Provider runtime archive is built with cgo but has no native filesystem dependency.
+- **Test**: `scripts/test.sh ./...` — a `ulimit -u` wrapper around `go test` so a runaway spawn cannot fork-bomb the host. Must pass with no network, no Keychain, no daemon. Never run bare `go test` on a real machine; use the harness, or an isolated VM/container for live signed-runtime and File Provider work.
 - **Vet**: `go vet ./...` before every commit
 
 ## Releasing
@@ -18,7 +18,7 @@ Releases are **tag-triggered** — there is no version file to edit. `Version`/`
 Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which (1) builds the universal
 (arm64+amd64) pure-Go binary on macOS and Developer ID-signs + notarizes it without App
 Group access, (2) builds, Developer ID-signs, notarizes, and staples the fixed
-`CCPoolStatus.app` holder, broker, File Provider, and widget bundle (the
+`CCPoolStatus.app` runtime, broker, File Provider, and widget bundle (the
 `cc-pool-status` cask payload),
 (3) creates a GitHub Release with auto-generated notes + the binary tarball, widget zip, and
 SHA256SUMS, and (4) renders the
@@ -58,7 +58,7 @@ cc-pool/
 │   ├── score/          # account scoring (5h/7d headroom, reset credit, burn rate)
 │   ├── store/          # SQLite account state (no secrets — Keychain only)
 │   └── tenantfs/       # Claude authority policy, materializer, and FuseKit adapter
-├── widget/             # fixed signed holder/broker/File Provider/widget application
+├── widget/             # fixed signed runtime/broker/File Provider/widget application
 ├── docs/               # public design doc (ARCHITECTURE.md) + README assets
 ├── AGENTS.md           # This file — shared conventions
 └── STYLEGUIDE.md       # Full style guide
@@ -70,7 +70,7 @@ Provider enumeration, and domain retirement live in
 transport, exact peer trust, and reaping live in
 [`github.com/yasyf/daemonkit`](https://github.com/yasyf/daemonkit). cc-pool publishes
 Claude source changes and account policy through those APIs; it does not reimplement
-holder, bridge, notification, or reconciliation machinery.
+runtime, bridge, notification, or reconciliation machinery.
 
 Two filesystem trees, never confused:
 

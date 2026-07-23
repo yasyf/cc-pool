@@ -19,7 +19,7 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 )
 
-var errHolderSessionLost = errors.New("daemon: FuseKit holder session lost")
+var errHolderSessionLost = errors.New("daemon: FuseKit runtime session lost")
 
 const daemonHealthMaxResponse = 16 << 10
 
@@ -240,7 +240,7 @@ func (s serverReadiness) BeforeReady(ctx context.Context) error {
 	}
 	if s.owner.holderSessionDone == nil {
 		cancel()
-		return errors.New("FuseKit holder session monitor is unavailable")
+		return errors.New("FuseKit runtime session monitor is unavailable")
 	}
 	if err := s.owner.m.RecoverRetiredCredentialOwners(execCtx); err != nil {
 		cancel()

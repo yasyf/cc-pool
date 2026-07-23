@@ -126,7 +126,7 @@ func validateHolderRuntimeHealth(health mountproto.RuntimeHealthResponse) error 
 		)
 	}
 	if health.BrokerPhase != mountproto.BrokerPhaseLive {
-		return fmt.Errorf("holder broker is not ready: phase=%q", health.BrokerPhase)
+		return fmt.Errorf("FuseKit broker is not ready: phase=%q", health.BrokerPhase)
 	}
 	return nil
 }
@@ -150,7 +150,7 @@ func (install HolderServiceInstall) Rollback(ctx context.Context) error {
 	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), holderServiceCloseWait)
 	defer cancel()
 	if err := StopAndUninstallHolderService(rollbackCtx); err != nil {
-		return fmt.Errorf("roll back FuseKit holder install: %w", err)
+		return fmt.Errorf("roll back FuseKit runtime install: %w", err)
 	}
 	return nil
 }
@@ -172,7 +172,7 @@ func HolderDeploymentPlan() (holder.DeploymentPlan, error) {
 func StopAndUninstallHolderService(ctx context.Context) error {
 	plan, err := HolderDeploymentPlan()
 	if err != nil {
-		return fmt.Errorf("derive FuseKit holder plan: %w", err)
+		return fmt.Errorf("derive FuseKit runtime plan: %w", err)
 	}
 	if err := withHolderServiceController(ctx, func(controller holderServiceController) error {
 		if err := stopObservedHolderRuntime(ctx, controller, plan, wire.StopIntentUninstall); err != nil {
@@ -180,7 +180,7 @@ func StopAndUninstallHolderService(ctx context.Context) error {
 		}
 		return controller.Converge(ctx, nil)
 	}); err != nil {
-		return fmt.Errorf("remove FuseKit holder service: %w", err)
+		return fmt.Errorf("remove FuseKit runtime service: %w", err)
 	}
 	return nil
 }
@@ -195,29 +195,29 @@ func EnsureHolderService(ctx context.Context) error {
 func InstallHolderService(ctx context.Context) (HolderServiceInstall, error) {
 	plan, err := HolderDeploymentPlan()
 	if err != nil {
-		return HolderServiceInstall{}, fmt.Errorf("derive FuseKit holder plan: %w", err)
+		return HolderServiceInstall{}, fmt.Errorf("derive FuseKit runtime plan: %w", err)
 	}
 	appPath := plan.Application().AppPath
 	info, err := holderAppStat(appPath)
 	if err != nil {
-		return HolderServiceInstall{}, fmt.Errorf("required FuseKit holder app %s: %w", appPath, err)
+		return HolderServiceInstall{}, fmt.Errorf("required signed runtime app %s: %w", appPath, err)
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return HolderServiceInstall{}, fmt.Errorf("required FuseKit holder app %s is not a direct app bundle", appPath)
+		return HolderServiceInstall{}, fmt.Errorf("required signed runtime app %s is not a direct app bundle", appPath)
 	}
 	agent := plan.Agent()
 	install := HolderServiceInstall{}
 	err = withHolderServiceController(ctx, func(controller holderServiceController) error {
 		preexisting, err := holderServicePresent(agent)
 		if err != nil {
-			return fmt.Errorf("inspect FuseKit holder service: %w", err)
+			return fmt.Errorf("inspect FuseKit runtime service: %w", err)
 		}
 		install.created = !preexisting
 		if err := stopObservedHolderRuntime(ctx, controller, plan, wire.StopIntentUpgrade); err != nil {
 			return err
 		}
 		if err := controller.Converge(ctx, []service.Agent{agent}); err != nil {
-			return fmt.Errorf("converge FuseKit holder service: %w", err)
+			return fmt.Errorf("converge FuseKit runtime service: %w", err)
 		}
 		readyCtx, cancel := context.WithTimeout(ctx, plan.Readiness().ObservationTimeout())
 		defer cancel()
@@ -229,7 +229,7 @@ func InstallHolderService(ctx context.Context) (HolderServiceInstall, error) {
 			select {
 			case <-readyCtx.Done():
 				return fmt.Errorf(
-					"wait for FuseKit holder readiness: %w", errors.Join(readyCtx.Err(), err),
+					"wait for FuseKit runtime readiness: %w", errors.Join(readyCtx.Err(), err),
 				)
 			case <-time.After(100 * time.Millisecond):
 			}
@@ -244,14 +244,14 @@ func InstallHolderService(ctx context.Context) (HolderServiceInstall, error) {
 func validateHolderStopTarget(health mountproto.RuntimeHealthResponse) error {
 	if health.Protocol != mountproto.Version || health.Code != mountproto.ErrorCodeOk || health.Message != "" {
 		return fmt.Errorf(
-			"holder stop target response is not exact: protocol=%d code=%q message=%q",
+			"runtime stop target response is not exact: protocol=%d code=%q message=%q",
 			health.Protocol, health.Code, health.Message,
 		)
 	}
 	if health.RuntimeBuild == "" || health.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
 		health.RuntimePID <= 1 || health.ProcessGeneration == "" {
 		return fmt.Errorf(
-			"holder stop target identity is incomplete: build=%q protocol=%d pid=%d generation=%q",
+			"runtime stop target identity is incomplete: build=%q protocol=%d pid=%d generation=%q",
 			health.RuntimeBuild, health.RuntimeProtocol, health.RuntimePID, health.ProcessGeneration,
 		)
 	}
@@ -271,7 +271,7 @@ func stopObservedHolderRuntime(
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("observe FuseKit holder stop target: %w", err)
+		return fmt.Errorf("observe FuseKit runtime stop target: %w", err)
 	}
 	if err := validateHolderStopTarget(health); err != nil {
 		return err
@@ -290,7 +290,7 @@ func stopObservedHolderRuntime(
 		TargetProcessGeneration: health.ProcessGeneration, Intent: intent,
 	})
 	if err != nil {
-		return fmt.Errorf("stop exact FuseKit holder generation: %w", err)
+		return fmt.Errorf("stop exact FuseKit runtime generation: %w", err)
 	}
 	return nil
 }

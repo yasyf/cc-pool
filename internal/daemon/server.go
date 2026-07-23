@@ -209,7 +209,7 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 
 	tenantClient, err = tenantfs.NewClient(activation.Startup, pool.FuseKitSocketPath())
 	if err != nil {
-		return fmt.Errorf("connect FuseKit holder: %w", err)
+		return fmt.Errorf("connect FuseKit runtime: %w", err)
 	}
 	preparer, err := tenantfs.NewPreparer(tenantClient)
 	if err != nil {
@@ -281,11 +281,11 @@ func (s *Server) monitorHolderSession(ctx context.Context, done <-chan struct{})
 	s.holderLost.Store(true)
 	s.runtimePublished.Store(false)
 	if s.runtimeShutdown == nil {
-		s.log.Printf("FuseKit holder session lost without runtime shutdown ownership")
+		s.log.Printf("FuseKit runtime session lost without shutdown ownership")
 		return
 	}
 	if err := s.runtimeShutdown(context.WithoutCancel(ctx)); err != nil {
-		s.log.Printf("shut down after FuseKit holder session loss: %v", err)
+		s.log.Printf("shut down after FuseKit runtime session loss: %v", err)
 	}
 }
 

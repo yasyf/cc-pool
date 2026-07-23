@@ -144,7 +144,7 @@ func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator
 	}
 	client, err := tenantfs.NewClient(ctx, pool.FuseKitSocketPath())
 	if err != nil {
-		return nil, fmt.Errorf("connect FuseKit holder: %w", err)
+		return nil, fmt.Errorf("connect FuseKit runtime: %w", err)
 	}
 	preparer, err := tenantfs.NewPreparer(client)
 	if err != nil {

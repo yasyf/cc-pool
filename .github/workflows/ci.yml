@@ -38,8 +38,8 @@ jobs:
       - name: Build amd64 (cross, pure Go)
         run: CGO_ENABLED=0 GOARCH=amd64 go build -o /tmp/ccp-amd64 ./cmd/cc-pool
 
-      - name: Build signed holder archive
-        run: CGO_ENABLED=1 go build -buildmode=c-archive -o /tmp/libCCPoolFuseKit.a ./cmd/cc-pool-holder-archive
+      - name: Build signed runtime archive
+        run: CGO_ENABLED=1 go build -buildmode=c-archive -o /tmp/libCCPoolFuseKit.a ./cmd/cc-pool-runtime-archive
 
   widget-test:
     runs-on: macos-15

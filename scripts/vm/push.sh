@@ -5,7 +5,7 @@
 # CCPoolStatus.app, installs
 # both into the guest, registers + enables the File Provider extension, and
 # proves the install with an in-guest selftest. The app lands at the production
-# cask path (/Applications/CCPoolStatus.app) so the FP broker/holder identity
+# cask path (/Applications/CCPoolStatus.app) so the FP broker/runtime identity
 # resolves unmodified in the guest.
 #
 # The FP appex MUST be Developer ID-signed: an ad-hoc signature will not register
@@ -67,7 +67,7 @@ main() {
   ln -sf cc-pool "$stage/bin/ccp"
   printf '%s\n' "$rev" >"$stage/BUILD_REV"
 
-  # --- One fixed CCPoolStatus.app identity (holder + broker + extensions) ------
+  # --- One fixed CCPoolStatus.app identity (runtime + broker + extensions) -----
   local app_version="${VMCTL_APP_VERSION:-0.0.0}" dd="$stage/widget-dd"
   [[ "$app_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
     die "VMCTL_APP_VERSION must be dotted numeric MAJOR.MINOR.PATCH (got $app_version)"
