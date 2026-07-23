@@ -161,6 +161,17 @@ func (s *Server) daemonHealthObservation(ctx context.Context, request wire.Obser
 	if err != nil {
 		return wire.ObservationResponse{}, fmt.Errorf("project daemon runtime health: %w", err)
 	}
+	if s.cl != nil {
+		counts := s.cl.liveCounts()
+		snapshot.ActiveReservations = counts.reservations
+		snapshot.ExclusiveClaims = counts.exclusive
+	}
+	if s.m != nil && s.m.Store != nil {
+		snapshot.ActiveSessions, err = s.m.Store.ActiveSessionTotal()
+		if err != nil {
+			return wire.ObservationResponse{}, fmt.Errorf("count active sessions: %w", err)
+		}
+	}
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return wire.ObservationResponse{}, fmt.Errorf("encode daemon health observation: %w", err)

@@ -91,6 +91,9 @@ type Manager struct {
 	// ScanSessions is the process-inspection boundary. The daemon installs a
 	// killable worker scanner; tests may inject a deterministic implementation.
 	ScanSessions func(context.Context) ([]procscan.Session, error)
+	// ScanProcesses returns Claude sessions and every process identity from one
+	// killable, atomic process-table observation.
+	ScanProcesses func(context.Context) (procscan.Snapshot, error)
 
 	// SettleCredentialWrite durably publishes one terminal credential write.
 	// Implementations must be exact-idempotent by OperationID and worker-backed.
@@ -141,6 +144,7 @@ func OpenDaemon(ctx context.Context) (*Manager, error) {
 		_ = st.Close()
 		return nil, err
 	}
+	manager.ScanProcesses = scanner.Snapshot
 	manager.workers = workers
 	return manager, nil
 }

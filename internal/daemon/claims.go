@@ -69,6 +69,11 @@ type selectionReservation struct {
 	terminalAt time.Time
 }
 
+type liveClaimCounts struct {
+	reservations int
+	exclusive    int
+}
+
 // newClaims builds an empty claims store.
 func newClaims() *claims {
 	return &claims{
@@ -267,6 +272,19 @@ func (c *claims) reservedCount(id int) int {
 		}
 	}
 	return count
+}
+
+func (c *claims) liveCounts() liveClaimCounts {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pruneSelectionsLocked(c.now())
+	counts := liveClaimCounts{exclusive: len(c.exclusive)}
+	for _, selection := range c.selections {
+		if selection.state != selectionTerminal {
+			counts.reservations++
+		}
+	}
+	return counts
 }
 
 // ownExclusive claims an account while durable removal intent is installed.

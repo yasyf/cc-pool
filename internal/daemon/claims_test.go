@@ -124,3 +124,26 @@ func TestBeginSelectionPrunesTerminalHistory(t *testing.T) {
 		t.Fatalf("terminal selection history = %d, want only current terminal", got)
 	}
 }
+
+func TestLiveClaimCountsExcludeTerminalReplayMarkers(t *testing.T) {
+	c := newClaims()
+	account := store.Account{ID: 1, InstanceID: "instance-1", Generation: 1}
+	token, err := c.beginSelection(account, selectionLaunch{}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.ownExclusive(2) {
+		t.Fatal("own exclusive claim")
+	}
+	if got := c.liveCounts(); got.reservations != 1 || got.exclusive != 1 {
+		t.Fatalf("live counts = %+v, want one reservation and one exclusive claim", got)
+	}
+	response := c.commitSelection(t.Context(), token,
+		func(context.Context, string, reservation, selectionLaunch) Response { return Response{OK: true} })
+	if !response.OK {
+		t.Fatalf("commit response = %+v", response)
+	}
+	if got := c.liveCounts(); got.reservations != 0 || got.exclusive != 1 {
+		t.Fatalf("post-commit counts = %+v; terminal replay marker counted as live", got)
+	}
+}

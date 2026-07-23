@@ -773,19 +773,27 @@ func TestSessionsReconcile(t *testing.T) {
 	if n, _ := s.ActiveSessionCount(1); n != 4 {
 		t.Fatalf("active = %d, want 4", n)
 	}
+	if n, _ := s.ActiveSessionTotal(); n != 4 {
+		t.Fatalf("active total = %d, want 4", n)
+	}
 	live, err := s.ListActiveSessions()
 	if err != nil || len(live) != 4 || live[0].Cwd != "/proj" {
 		t.Fatalf("active sessions = %+v err=%v", live, err)
 	}
-	closed, err := s.CloseDeadSessions(map[int]time.Time{
+	claude := map[int]time.Time{
 		222: started,
 		444: started.Add(time.Second), // same PID, different kernel generation
-	}, now)
+	}
+	processes := map[int]time.Time{222: started, 333: now, 444: started.Add(time.Second)}
+	closed, err := s.CloseDeadSessions(claude, processes, now)
 	if err != nil || closed != 2 {
 		t.Fatalf("closed = %d err=%v, want dead PID and reused PID", closed, err)
 	}
 	if n, _ := s.ActiveSessionCount(1); n != 2 {
 		t.Fatalf("active after reconcile = %d, want 2", n)
+	}
+	if n, _ := s.ActiveSessionTotal(); n != 2 {
+		t.Fatalf("active total after reconcile = %d, want 2", n)
 	}
 	for _, se := range mustActive(t, s) {
 		if se.PID == 222 && (se.LastSeenAt == nil || !se.LastSeenAt.Equal(now)) {
@@ -878,10 +886,11 @@ func TestCloseDeadSessionsEndsAtLastSeen(t *testing.T) {
 	activateTestSession(t, s, 1, 555, "/proj", now.Add(-5*time.Hour))
 
 	// A reconcile 4h ago saw the pid alive; the process then died unobserved.
-	if _, err := s.CloseDeadSessions(map[int]time.Time{555: now.Add(-5 * time.Hour)}, now.Add(-4*time.Hour)); err != nil {
+	alive := map[int]time.Time{555: now.Add(-5 * time.Hour)}
+	if _, err := s.CloseDeadSessions(alive, alive, now.Add(-4*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	closed, err := s.CloseDeadSessions(map[int]time.Time{}, now)
+	closed, err := s.CloseDeadSessions(map[int]time.Time{}, map[int]time.Time{}, now)
 	if err != nil || closed != 1 {
 		t.Fatalf("closed = %d err=%v", closed, err)
 	}
@@ -902,12 +911,38 @@ func TestCloseDeadSessionsRejectsReusedPIDIdentity(t *testing.T) {
 	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"})
 	activateTestSession(t, s, 1, 777, "/project", started)
 	reusedAt := started.Add(time.Minute)
-	closed, err := s.CloseDeadSessions(map[int]time.Time{777: reusedAt}, now)
+	reused := map[int]time.Time{777: reusedAt}
+	closed, err := s.CloseDeadSessions(reused, reused, now)
 	if err != nil || closed != 1 {
 		t.Fatalf("CloseDeadSessions reused pid = %d, %v; want old identity closed", closed, err)
 	}
 	if active, err := s.ActiveSessionCount(1); err != nil || active != 0 {
 		t.Fatalf("active sessions = %d, err=%v", active, err)
+	}
+}
+
+func TestCloseDeadSessionsLaunchGraceRequiresExactLiveProcess(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().Truncate(time.Microsecond)
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"})
+	activateTestSession(t, s, 1, 700, "/missing", now)
+	activateTestSession(t, s, 1, 701, "/pre-exec", now)
+
+	closed, err := s.CloseDeadSessions(
+		map[int]time.Time{}, map[int]time.Time{701: now}, now.Add(time.Second),
+	)
+	if err != nil || closed != 1 {
+		t.Fatalf("first reconcile = %d, %v; want missing identity closed", closed, err)
+	}
+	active := mustActive(t, s)
+	if len(active) != 1 || active[0].PID != 701 {
+		t.Fatalf("active during launch grace = %+v", active)
+	}
+	closed, err = s.CloseDeadSessions(
+		map[int]time.Time{}, map[int]time.Time{701: now}, now.Add(SessionReapGrace),
+	)
+	if err != nil || closed != 1 {
+		t.Fatalf("post-grace reconcile = %d, %v; want stale pre-exec identity closed", closed, err)
 	}
 }
 

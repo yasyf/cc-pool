@@ -166,15 +166,18 @@ type HealthRequest struct {
 
 // HealthResponse is one exact daemon process-generation lifecycle snapshot.
 type HealthResponse struct {
-	Schema            uint16       `json:"schema"`
-	RuntimeBuild      string       `json:"runtime_build"`
-	RuntimeProtocol   int          `json:"runtime_protocol"`
-	ProcessGeneration string       `json:"process_generation"`
-	PID               int          `json:"pid"`
-	State             RuntimeState `json:"state"`
-	Draining          bool         `json:"draining"`
-	Busy              bool         `json:"busy"`
-	Ready             bool         `json:"ready"`
+	Schema             uint16       `json:"schema"`
+	RuntimeBuild       string       `json:"runtime_build"`
+	RuntimeProtocol    int          `json:"runtime_protocol"`
+	ProcessGeneration  string       `json:"process_generation"`
+	PID                int          `json:"pid"`
+	State              RuntimeState `json:"state"`
+	Draining           bool         `json:"draining"`
+	Busy               bool         `json:"busy"`
+	Ready              bool         `json:"ready"`
+	ActiveReservations int          `json:"active_reservations"`
+	ActiveSessions     int          `json:"active_sessions"`
+	ExclusiveClaims    int          `json:"exclusive_claims"`
 }
 
 // RuntimeState is the exact v1 daemon-health state enum.

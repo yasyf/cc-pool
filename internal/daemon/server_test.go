@@ -1002,7 +1002,8 @@ func TestHandleSelectQuickResumeBindsAfterReap(t *testing.T) {
 	// pid 4000000 is impossible (macOS pids are 5-digit), so handleSelect's
 	// sweep reaps the row; the -10m reconcile below makes the reap a warm end.
 	activateDaemonTestSession(t, s, 2, 4000000, "/proj", now.Add(-3*time.Hour))
-	if _, err := s.m.Store.CloseDeadSessions(map[int]time.Time{4000000: now.Add(-3 * time.Hour).Truncate(time.Microsecond)}, now.Add(-10*time.Minute)); err != nil {
+	alive := map[int]time.Time{4000000: now.Add(-3 * time.Hour).Truncate(time.Microsecond)}
+	if _, err := s.m.Store.CloseDeadSessions(alive, alive, now.Add(-10*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})

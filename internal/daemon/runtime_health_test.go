@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
+	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/drain"
@@ -32,9 +34,17 @@ func TestDaemonHealthObservationRequiresPublishedHealthyRuntime(t *testing.T) {
 		RuntimeBuild: version.String(), RuntimeProtocol: int(wire.ProtocolVersion),
 		ProcessGeneration: "generation-1", PID: 42, State: dkdaemon.StateHealthy, Busy: true,
 	}
+	claims := newClaims()
+	if _, err := claims.beginSelection(store.Account{ID: 1, InstanceID: "instance-1", Generation: 1}, selectionLaunch{}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if !claims.ownExclusive(2) {
+		t.Fatal("own exclusive claim")
+	}
 	server := &Server{
 		wireIntake:    &drain.Intake{},
 		runtimeHealth: func(context.Context) (dkdaemon.Health, error) { return health, nil },
+		cl:            claims,
 	}
 	route := server.daemonHealthRoute()
 	if route.Op != wire.Op(OpHealth) || route.MaxResponseBytes != daemonHealthMaxResponse || !route.AvailableBeforeReady {
@@ -51,6 +61,9 @@ func TestDaemonHealthObservationRequiresPublishedHealthyRuntime(t *testing.T) {
 	}
 	if response.Ready || response.State != RuntimeStateHealthy || !response.Busy {
 		t.Fatalf("unpublished health = %+v", response)
+	}
+	if response.ActiveReservations != 1 || response.ActiveSessions != 0 || response.ExclusiveClaims != 1 {
+		t.Fatalf("live health counts = %+v", response)
 	}
 	health.Busy = false
 	health.Ready = true

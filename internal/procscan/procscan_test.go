@@ -194,6 +194,38 @@ func TestScan(t *testing.T) {
 	}
 }
 
+func TestScanSnapshotUsesOneEnumerationForSessionsAndAllProcesses(t *testing.T) {
+	start := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	origList, origArgs := listProcs, procArgs
+	t.Cleanup(func() { listProcs, procArgs = origList, origArgs })
+	lists := 0
+	listProcs = func(context.Context) ([]proc, error) {
+		lists++
+		return []proc{{pid: 101, startedAt: start}, {pid: 202, startedAt: start.Add(time.Second)}}, nil
+	}
+	procArgs = func(_ context.Context, pid int) ([]byte, error) {
+		if pid == 101 {
+			return procargs2(1, "/opt/homebrew/bin/claude", []string{"claude"}, []string{"CLAUDE_CONFIG_DIR=/acct-01"}), nil
+		}
+		return procargs2(1, "/opt/homebrew/bin/ccp", []string{"ccp"}, nil), nil
+	}
+
+	snapshot, err := ScanSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lists != 1 {
+		t.Fatalf("process enumerations = %d, want 1", lists)
+	}
+	if len(snapshot.Sessions) != 1 || snapshot.Sessions[0].PID != 101 {
+		t.Fatalf("Claude sessions = %+v", snapshot.Sessions)
+	}
+	if len(snapshot.Processes) != 2 || !snapshot.Processes[101].Equal(start) ||
+		!snapshot.Processes[202].Equal(start.Add(time.Second)) {
+		t.Fatalf("all process identities = %+v", snapshot.Processes)
+	}
+}
+
 // TestScanFailsClosedOnListError pins the load-bearing fail-closed: a failed
 // process enumeration surfaces as Scan's error, never a silent empty slice.
 func TestScanFailsClosedOnListError(t *testing.T) {
@@ -264,16 +296,16 @@ func TestCountByConfigDir(t *testing.T) {
 	}
 }
 
-func TestAliveProcesses(t *testing.T) {
+func TestClaudeProcesses(t *testing.T) {
 	a := time.Unix(10, 0)
 	b := time.Unix(20, 0)
 	sessions := []Session{{PID: 501, StartedAt: a}, {PID: 777, StartedAt: b}}
-	alive := AliveProcesses(sessions)
+	alive := ClaudeProcesses(sessions)
 	if !alive[501].Equal(a) || !alive[777].Equal(b) {
-		t.Errorf("AliveProcesses = %v", alive)
+		t.Errorf("ClaudeProcesses = %v", alive)
 	}
 	if _, ok := alive[123]; ok {
-		t.Error("AliveProcesses must not report an absent pid")
+		t.Error("ClaudeProcesses must not report an absent pid")
 	}
 }
 

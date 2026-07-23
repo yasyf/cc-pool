@@ -29,6 +29,14 @@ type Session struct {
 	StartedAt time.Time
 }
 
+// Snapshot is one atomic process-table observation. Processes contains every
+// user process identity from the same kern.proc.uid enumeration used to
+// classify Sessions.
+type Snapshot struct {
+	Sessions  []Session         `json:"sessions,omitempty"`
+	Processes map[int]time.Time `json:"processes,omitempty"`
+}
+
 // proc is one live process: its pid and absolute start time.
 type proc struct {
 	pid       int
@@ -73,13 +81,20 @@ var ccdPrefix = []byte("CLAUDE_CONFIG_DIR=")
 // Scan returns all live claude sessions. Daemon callers install WorkerScanner
 // so context-unaware kernel reads execute in a killable disposable process.
 func Scan(ctx context.Context) ([]Session, error) {
+	snapshot, err := ScanSnapshot(ctx)
+	return snapshot.Sessions, err
+}
+
+// ScanSnapshot returns live Claude sessions and every user process identity
+// from one process-table enumeration.
+func ScanSnapshot(ctx context.Context) (Snapshot, error) {
 	cctx, cancel := context.WithTimeout(ctx, scanTimeout)
 	defer cancel()
-	sessions, err := scan(cctx, listProcs, procArgs)
+	snapshot, err := scanSnapshot(cctx, listProcs, procArgs)
 	if err != nil {
-		return nil, fmt.Errorf("procscan: %w", err)
+		return Snapshot{}, fmt.Errorf("procscan: %w", err)
 	}
-	return sessions, nil
+	return snapshot, nil
 }
 
 // Proc is a live process's identity: pid and absolute start time. StartedAt
@@ -113,11 +128,19 @@ func ProcsByExecutable(ctx context.Context, execPath string) ([]Proc, error) {
 // readable args (EINVAL: zombie or kernel proc), or died mid-read (EIO) skips just that process, while
 // any other per-PID error fails the whole scan closed.
 func scan(ctx context.Context, list func(context.Context) ([]proc, error), args func(context.Context, int) ([]byte, error)) ([]Session, error) {
+	snapshot, err := scanSnapshot(ctx, list, args)
+	return snapshot.Sessions, err
+}
+
+func scanSnapshot(ctx context.Context, list func(context.Context) ([]proc, error), args func(context.Context, int) ([]byte, error)) (Snapshot, error) {
 	procs, err := list(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list processes: %w", err)
+		return Snapshot{}, fmt.Errorf("list processes: %w", err)
 	}
-	var sessions []Session
+	snapshot := Snapshot{Processes: make(map[int]time.Time, len(procs))}
+	for _, p := range procs {
+		snapshot.Processes[p.pid] = p.startedAt
+	}
 	for _, p := range procs {
 		buf, err := args(ctx, p.pid)
 		if err != nil {
@@ -128,15 +151,15 @@ func scan(ctx context.Context, list func(context.Context) ([]proc, error), args 
 			if skippableProcArgsError(err) {
 				continue
 			}
-			return nil, fmt.Errorf("read args for pid %d: %w", p.pid, err)
+			return Snapshot{}, fmt.Errorf("read args for pid %d: %w", p.pid, err)
 		}
 		argv0, configDir := parseProcArgs(buf)
 		if !isClaudeProcess(argv0) {
 			continue
 		}
-		sessions = append(sessions, Session{PID: p.pid, ConfigDir: configDir, StartedAt: p.startedAt})
+		snapshot.Sessions = append(snapshot.Sessions, Session{PID: p.pid, ConfigDir: configDir, StartedAt: p.startedAt})
 	}
-	return sessions, nil
+	return snapshot, nil
 }
 
 // byExecutable walks this user's processes keeping those whose exec path
@@ -258,9 +281,8 @@ func CountByConfigDir(sessions []Session, configDir string) int {
 	return n
 }
 
-// AliveProcesses returns the kernel process identities currently present, for
-// session reconciliation without PID-reuse ambiguity.
-func AliveProcesses(sessions []Session) map[int]time.Time {
+// ClaudeProcesses returns the exact kernel identities of classified Claude sessions.
+func ClaudeProcesses(sessions []Session) map[int]time.Time {
 	m := make(map[int]time.Time, len(sessions))
 	for _, s := range sessions {
 		m[s.PID] = s.StartedAt

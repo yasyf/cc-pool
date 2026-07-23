@@ -54,7 +54,9 @@ func runDoctor(cmd *cobra.Command, manager *pool.Manager) error {
 		fail(cmd.ErrOrStderr(), "daemon version %s does not match client %s", health.RuntimeBuild, version.String())
 		return fmt.Errorf("doctor found unhealthy state")
 	}
-	success(cmd.OutOrStdout(), "Daemon and FuseKit runtime are ready (%s).", health.RuntimeBuild)
+	success(cmd.OutOrStdout(),
+		"Daemon and FuseKit runtime are ready (%s; active reservations=%d sessions=%d exclusive claims=%d).",
+		health.RuntimeBuild, health.ActiveReservations, health.ActiveSessions, health.ExclusiveClaims)
 	failed := false
 	for _, account := range accounts {
 		if err := client.AccountHealth(cmd.Context(), account.ID); err != nil {

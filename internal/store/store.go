@@ -1475,6 +1475,13 @@ func (s *Store) ActiveSessionCount(accountID int) (int, error) {
 	return n, err
 }
 
+// ActiveSessionTotal returns the number of live sessions across the pool.
+func (s *Store) ActiveSessionTotal() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL`).Scan(&n)
+	return n, err
+}
+
 // ListActiveSessions returns all live sessions across accounts.
 func (s *Store) ListActiveSessions() ([]Session, error) {
 	rows, err := s.db.Query(
@@ -1505,10 +1512,8 @@ func (s *Store) ListActiveSessions() ([]Session, error) {
 	return out, rows.Err()
 }
 
-// SessionReapGrace is how long a freshly opened session is immune to
-// CloseDeadSessions: `ccp run` marks its checkout before exec'ing into claude,
-// so briefly the pid is a ccp process no claude-only scan sees, and reaping it
-// would fabricate a "session ended" signal for the sticky rules.
+// SessionReapGrace bounds how long the exact pre-exec ccp process may remain
+// live without yet appearing as Claude.
 const SessionReapGrace = time.Minute
 
 func (s *Store) touchSession(id int64, at time.Time) error {
@@ -1517,12 +1522,12 @@ func (s *Store) touchSession(id int64, at time.Time) error {
 	return err
 }
 
-// CloseDeadSessions reconciles active sessions against the live claude pids in
-// alive at time at: live rows are stamped last-seen, dead rows older than
-// SessionReapGrace are closed. A dead row's end is stamped at its last-seen (or
-// start), never observation time — else a reap after a long observer gap
-// fabricates a warm sticky cache from a session that died hours ago.
-func (s *Store) CloseDeadSessions(alive map[int]time.Time, at time.Time) (int, error) {
+// CloseDeadSessions reconciles sessions against one atomic process snapshot.
+// An exact Claude identity is touched. An exact live non-Claude identity is
+// retained only during SessionReapGrace; an absent or reused identity closes
+// immediately. A dead row ends at its last-seen (or start), never observation
+// time, so an observer gap cannot fabricate recent activity.
+func (s *Store) CloseDeadSessions(claude, processes map[int]time.Time, at time.Time) (int, error) {
 	sessions, err := s.ListActiveSessions()
 	if err != nil {
 		return 0, err
@@ -1532,13 +1537,14 @@ func (s *Store) CloseDeadSessions(alive map[int]time.Time, at time.Time) (int, e
 		if se.PID <= 0 {
 			continue
 		}
-		if started, ok := alive[se.PID]; ok && started.Equal(se.ProcessStartedAt) {
+		if started, ok := claude[se.PID]; ok && started.Equal(se.ProcessStartedAt) {
 			if err := s.touchSession(se.ID, at); err != nil {
 				return closed, err
 			}
 			continue
 		}
-		if at.Sub(se.StartedAt) < SessionReapGrace {
+		if started, ok := processes[se.PID]; ok && started.Equal(se.ProcessStartedAt) &&
+			at.Sub(se.StartedAt) < SessionReapGrace {
 			continue
 		}
 		end := se.StartedAt

@@ -19,7 +19,8 @@ type heartbeatSnapshot struct {
 	scannedAt   time.Time
 	sessions    []procscan.Session
 	counts      map[string]int
-	alive       map[int]time.Time
+	claude      map[int]time.Time
+	processes   map[int]time.Time
 }
 
 func (s heartbeatSnapshot) sessionCount(dir string) int { return s.counts[dir] }
@@ -62,9 +63,13 @@ func cloneHeartbeatSnapshot(in heartbeatSnapshot) heartbeatSnapshot {
 	for dir, count := range in.counts {
 		out.counts[dir] = count
 	}
-	out.alive = make(map[int]time.Time, len(in.alive))
-	for pid, started := range in.alive {
-		out.alive[pid] = started
+	out.claude = make(map[int]time.Time, len(in.claude))
+	for pid, started := range in.claude {
+		out.claude[pid] = started
+	}
+	out.processes = make(map[int]time.Time, len(in.processes))
+	for pid, started := range in.processes {
+		out.processes[pid] = started
 	}
 	return out
 }
@@ -90,7 +95,7 @@ func (h *sessionHeartbeat) refresh(ctx context.Context, maxAge time.Duration) he
 			}
 		}
 	}
-	sessions, err := h.server.scan(ctx)
+	processSnapshot, err := h.server.scan(ctx)
 	now := time.Now()
 	if err != nil {
 		h.mu.Lock()
@@ -103,12 +108,13 @@ func (h *sessionHeartbeat) refresh(ctx context.Context, maxAge time.Duration) he
 		h.mu.Unlock()
 		return heartbeatDelta{snapshot: failed}
 	}
+	sessions := processSnapshot.Sessions
 
 	counts := map[string]int{}
 	for _, session := range sessions {
 		counts[session.ConfigDir]++
 	}
-	alive := procscan.AliveProcesses(sessions)
+	claude := procscan.ClaudeProcesses(sessions)
 	h.mu.Lock()
 	previous := h.snapshot
 	for dir := range durableActive {
@@ -136,7 +142,8 @@ func (h *sessionHeartbeat) refresh(ctx context.Context, maxAge time.Duration) he
 		scannedAt:   now,
 		sessions:    append([]procscan.Session(nil), sessions...),
 		counts:      counts,
-		alive:       alive,
+		claude:      claude,
+		processes:   processSnapshot.Processes,
 	}
 	h.lastErr = ""
 	result := cloneHeartbeatSnapshot(h.snapshot)
@@ -200,7 +207,7 @@ func (s *Server) handleHeartbeatDelta(ctx context.Context, delta heartbeatDelta)
 	if !delta.success {
 		return
 	}
-	if n, err := s.m.Store.CloseDeadSessions(delta.snapshot.alive, time.Now()); err != nil {
+	if n, err := s.m.Store.CloseDeadSessions(delta.snapshot.claude, delta.snapshot.processes, time.Now()); err != nil {
 		s.log.Printf("close dead sessions: %v", err)
 	} else if n > 0 {
 		s.log.Printf("reconciled %d ended session(s)", n)

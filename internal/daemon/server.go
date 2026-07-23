@@ -96,8 +96,10 @@ type Server struct {
 	// on each outage entry. Scheduler-goroutine-local — no lock.
 	netProbeLogSkip int
 
-	// scanSessions is a test seam over procscan.Scan; nil means the real scan.
-	scanSessions func(context.Context) ([]procscan.Session, error)
+	// scanSessions is the narrow deterministic test seam. Production installs
+	// scanProcesses so heartbeat reconciliation observes one atomic process table.
+	scanSessions  func(context.Context) ([]procscan.Session, error)
+	scanProcesses func(context.Context) (procscan.Snapshot, error)
 	// heartbeat is the one daemon-wide procscan cache shared by polling, healing,
 	// content coordination, and selection. heartbeatMu only protects lazy setup.
 	heartbeatMu       sync.Mutex
@@ -229,6 +231,7 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	s.accountMutationTerminal = daemonkitAccountMutationTerminalRunner{workers: workers, manager: m}
 	s.accountMutationLifetime = activation.Lifetime
 	s.scanSessions = m.ScanSessions
+	s.scanProcesses = m.ScanProcesses
 	s.tenantCoordinator = newTenantCoordinator(activation.Lifetime, s, preparer, tenantClient)
 	if err := s.tenantCoordinator.initialize(activation.Startup); err != nil {
 		s.clearActivation()
@@ -299,6 +302,7 @@ func (s *Server) clearActivation() {
 	s.accountMutationTerminal = nil
 	s.accountMutationLifetime = nil
 	s.scanSessions = nil
+	s.scanProcesses = nil
 }
 
 const maxVersionOutput = 64 << 10
@@ -775,13 +779,17 @@ func runnerUp(ranked []score.Result, winnerID int, fallback bool) string {
 	return ""
 }
 
-// scan resolves session scanning through the test seam; nil means
-// procscan.Scan.
-func (s *Server) scan(ctx context.Context) ([]procscan.Session, error) {
-	if s.scanSessions != nil {
-		return s.scanSessions(ctx)
+// scan resolves one atomic process observation. Narrow test fixtures synthesize
+// the all-process set from their Claude sessions.
+func (s *Server) scan(ctx context.Context) (procscan.Snapshot, error) {
+	if s.scanProcesses != nil {
+		return s.scanProcesses(ctx)
 	}
-	return procscan.Scan(ctx)
+	if s.scanSessions != nil {
+		sessions, err := s.scanSessions(ctx)
+		return procscan.Snapshot{Sessions: sessions, Processes: procscan.ClaudeProcesses(sessions)}, err
+	}
+	return procscan.ScanSnapshot(ctx)
 }
 
 // rankWithReservations re-ranks snapshots with the local reservation penalty

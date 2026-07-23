@@ -43,9 +43,9 @@ type workerRequest struct {
 }
 
 type workerResponse struct {
-	Sessions []Session `json:"sessions,omitempty"`
-	Procs    []Proc    `json:"procs,omitempty"`
-	Error    string    `json:"error,omitempty"`
+	Snapshot Snapshot `json:"snapshot,omitzero"`
+	Procs    []Proc   `json:"procs,omitempty"`
+	Error    string   `json:"error,omitempty"`
 }
 
 // WorkerScanner executes context-unaware process inspection in disposable workers.
@@ -64,8 +64,14 @@ func NewWorkerScanner(runner workerRunner, executable string) (*WorkerScanner, e
 
 // Scan executes one complete session scan in a disposable worker.
 func (s *WorkerScanner) Scan(ctx context.Context) ([]Session, error) {
+	snapshot, err := s.Snapshot(ctx)
+	return snapshot.Sessions, err
+}
+
+// Snapshot executes one complete process observation in a disposable worker.
+func (s *WorkerScanner) Snapshot(ctx context.Context) (Snapshot, error) {
 	response, err := s.run(ctx, workerRequest{})
-	return response.Sessions, err
+	return response.Snapshot, err
 }
 
 // ProcsByExecutable executes one exact-path scan in a disposable worker.
@@ -125,7 +131,7 @@ func RunWorker(ctx context.Context, input io.Reader, output io.Writer) error {
 	response := workerResponse{}
 	var err error
 	if request.Executable == "" {
-		response.Sessions, err = scan(ctx, listProcs, procArgs)
+		response.Snapshot, err = scanSnapshot(ctx, listProcs, procArgs)
 	} else {
 		response.Procs, err = byExecutable(ctx, request.Executable, listProcs, procArgs)
 	}
