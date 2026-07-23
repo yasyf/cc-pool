@@ -608,23 +608,21 @@ func TestQuarantinedAddSurvivesAckRestartAndResolvesExactly(t *testing.T) {
 	s := openTest(t)
 	now := time.Unix(1_900_000_000, 0)
 	s.now = func() time.Time { return now }
-	credentialRequest, mutation := pendingAddCompensationTestRequest(t, s, now)
+	_, mutation := pendingAddCompensationTestRequest(t, s, now)
 	quarantinedState := credentialOperationTestState("drifted", "")
 	quarantinedDigest, err := quarantinedState.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	quarantineRequest := AccountMutationQuarantine{
-		FileLocatorDigest: credentialRequest.FileLocatorDigest,
-		Observation:       quarantinedState,
-		Reason:            CredentialResultChangedUnderfoot,
+		Observation: quarantinedState,
+		Reason:      CredentialResultChangedUnderfoot,
 	}
 	receipt, err := s.ResolveAccountMutation(
 		mutation.Fence(), AccountMutationQuarantined, quarantinedDigest,
 		&quarantineRequest, now.Add(10*time.Minute),
 	)
 	if err != nil || !receipt.HasQuarantine ||
-		receipt.QuarantineFileLocator != credentialRequest.FileLocatorDigest ||
 		receipt.QuarantineReason != CredentialResultChangedUnderfoot {
 		t.Fatalf("quarantined account receipt = %+v err=%v", receipt, err)
 	}

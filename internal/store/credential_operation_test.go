@@ -23,7 +23,7 @@ func TestCredentialOperationLifecycleAndPostCommitAdmission(t *testing.T) {
 	s.now = func() time.Time { return now }
 	account := credentialOperationTestAccount(t, s)
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
 		credentialOperationTestState("before", ""), "refresh-request", credentialOperationTestOwner("owner"))
 
 	begin, err := s.BeginCredentialOperation(request)
@@ -76,7 +76,7 @@ func TestCredentialOperationLifecycleAndPostCommitAdmission(t *testing.T) {
 		t.Fatalf("conflicting immutable receipt = %+v err=%v", conflict, err)
 	}
 	nextRequest := credentialOperationTestRequest(
-		t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
 		outcome, "next-refresh-request", credentialOperationTestOwner("owner"),
 	)
 	blocked, err := s.BeginCredentialOperation(nextRequest)
@@ -102,7 +102,7 @@ func TestCredentialPublicationPayloadIsBoundedExactAndImmutable(t *testing.T) {
 	s.now = func() time.Time { return now }
 	account := credentialOperationTestAccount(t, s)
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
 		credentialOperationTestState("before", ""), "publication-exact",
 		credentialOperationTestOwner("publication-owner"),
 	)
@@ -173,7 +173,7 @@ func TestCredentialPublicationPayloadSurvivesApplyingCrash(t *testing.T) {
 	}
 	account := credentialOperationTestAccount(t, s)
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
 		credentialOperationTestState("before", ""), "publication-crash",
 		credentialOperationTestOwner("publication-crash-owner"),
 	)
@@ -243,14 +243,14 @@ func TestCredentialPublicationPayloadTerminalContract(t *testing.T) {
 	}{
 		{name: "publishing result requires payload", result: CredentialResultInstalled},
 		{name: "non-publishing result forbids payload", result: CredentialResultDone, payload: []byte(`{"version":1}`)},
-		{name: "publishing payload is bounded", result: CredentialResultMoved, payload: bytes.Repeat([]byte{'x'}, CredentialPublicationPayloadMaxBytes+1)},
+		{name: "publishing payload is bounded", result: CredentialResultInstalled, payload: bytes.Repeat([]byte{'x'}, CredentialPublicationPayloadMaxBytes+1)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := openTest(t)
 			account := credentialOperationTestAccount(t, s)
 			request := credentialOperationTestRequest(
-				t, account, CredentialOperationMove, CredentialTargetFile,
+				t, account, CredentialOperationInstallSynced, CredentialTargetKeychain,
 				credentialOperationTestState("before", ""), test.name,
 				credentialOperationTestOwner(test.name),
 			)
@@ -288,27 +288,27 @@ func TestCredentialFailureClassRoundTrip(t *testing.T) {
 		},
 		{
 			name: "refresh unauthorized", kind: CredentialOperationEnsureFresh,
-			target: CredentialTargetAll, status: CredentialTerminalFailed,
+			target: CredentialTargetKeychain, status: CredentialTerminalFailed,
 			result: CredentialResultFailed, failure: CredentialFailureRefreshUnauthorized,
 		},
 		{
 			name: "refresh rejected", kind: CredentialOperationRefreshCurrent,
-			target: CredentialTargetAll, status: CredentialTerminalFailed,
+			target: CredentialTargetKeychain, status: CredentialTerminalFailed,
 			result: CredentialResultFailed, failure: CredentialFailureRefreshRejected,
 		},
 		{
-			name: "internal quarantine", kind: CredentialOperationMove,
-			target: CredentialTargetFile, status: CredentialTerminalQuarantined,
+			name: "internal quarantine", kind: CredentialOperationInstallSynced,
+			target: CredentialTargetKeychain, status: CredentialTerminalQuarantined,
 			result: CredentialResultAmbiguous, failure: CredentialFailureInternal,
 		},
 		{
 			name: "network ambiguity", kind: CredentialOperationEnsureFresh,
-			target: CredentialTargetAll, status: CredentialTerminalQuarantined,
+			target: CredentialTargetKeychain, status: CredentialTerminalQuarantined,
 			result: CredentialResultAmbiguous, failure: CredentialFailureNetwork,
 		},
 		{
 			name: "server ambiguity", kind: CredentialOperationRefreshCurrent,
-			target: CredentialTargetAll, status: CredentialTerminalQuarantined,
+			target: CredentialTargetKeychain, status: CredentialTerminalQuarantined,
 			result: CredentialResultAmbiguous, failure: CredentialFailureRefreshServer,
 		},
 	}
@@ -394,7 +394,7 @@ func TestCredentialFailureClassRejectsInvalidCombinations(t *testing.T) {
 			failure: CredentialFailureNone,
 		},
 		{
-			name: "refresh class on move", kind: CredentialOperationMove,
+			name: "refresh class on move", kind: CredentialOperationInstallSynced,
 			status: CredentialTerminalFailed, result: CredentialResultFailed,
 			failure: CredentialFailureRefreshUnauthorized,
 		},
@@ -423,9 +423,9 @@ func TestCredentialFailureClassRejectsInvalidCombinations(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			s := openTest(t)
 			account := credentialOperationTestAccount(t, s)
-			target := CredentialTargetAll
-			if test.kind == CredentialOperationMove {
-				target = CredentialTargetFile
+			target := CredentialTargetKeychain
+			if test.kind == CredentialOperationInstallSynced {
+				target = CredentialTargetKeychain
 			} else if test.kind != CredentialOperationEnsureFresh &&
 				test.kind != CredentialOperationRefreshCurrent {
 				target = CredentialTargetKeychain
@@ -457,7 +457,7 @@ func TestCredentialFailureClassExactIdempotency(t *testing.T) {
 	s.now = func() time.Time { return now }
 	account := credentialOperationTestAccount(t, s)
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
 		credentialOperationTestState("before", ""), "failure-idempotency",
 		credentialOperationTestOwner("failure-idempotency"),
 	)
@@ -537,7 +537,7 @@ func TestResolveCredentialOperationPublicationPayloadReplayIsExact(t *testing.T)
 	s.now = func() time.Time { return now }
 	account := credentialOperationTestAccount(t, s)
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationMove, CredentialTargetFile,
+		t, account, CredentialOperationInstallSynced, CredentialTargetKeychain,
 		credentialOperationTestState("before", ""), "resolve-publication",
 		credentialOperationTestOwner("resolve-owner"),
 	)
@@ -561,21 +561,21 @@ func TestResolveCredentialOperationPublicationPayloadReplayIsExact(t *testing.T)
 	payload := []byte(`{"version":1,"recovered":true}`)
 	receipt, err := s.ResolveCredentialOperation(
 		taken.Fence(), outcome, CredentialTerminalSucceeded,
-		CredentialResultMoved, CredentialFailureNone, payload, now.Add(time.Minute),
+		CredentialResultInstalled, CredentialFailureNone, payload, now.Add(time.Minute),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	replayed, err := s.ResolveCredentialOperation(
 		taken.Fence(), outcome, CredentialTerminalSucceeded,
-		CredentialResultMoved, CredentialFailureNone, payload, now.Add(2*time.Minute),
+		CredentialResultInstalled, CredentialFailureNone, payload, now.Add(2*time.Minute),
 	)
 	if err != nil || !reflect.DeepEqual(replayed, receipt) {
 		t.Fatalf("exact resolve replay = %+v err=%v, want %+v", replayed, err, receipt)
 	}
 	conflict, err := s.ResolveCredentialOperation(
 		taken.Fence(), outcome, CredentialTerminalSucceeded,
-		CredentialResultMoved, CredentialFailureNone,
+		CredentialResultInstalled, CredentialFailureNone,
 		[]byte(`{"version":1,"recovered":false}`), now.Add(2*time.Minute),
 	)
 	if !errors.Is(err, ErrCredentialOperationState) || !reflect.DeepEqual(conflict, receipt) {
@@ -635,7 +635,7 @@ func TestCredentialOperationOwnerEpochSurvivesArbitraryAge(t *testing.T) {
 	owner := credentialOperationTestOwner("owner-a")
 	other := credentialOperationTestOwner("owner-b")
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationMove, CredentialTargetFile,
+		t, account, CredentialOperationInstallSynced, CredentialTargetKeychain,
 		credentialOperationTestState("source", ""), "move-file", owner)
 	begin, err := s.BeginCredentialOperation(request)
 	if err != nil {
@@ -681,7 +681,7 @@ func TestCredentialOperationOwnerEpochSurvivesArbitraryAge(t *testing.T) {
 	outcome := credentialOperationTestState("", "source")
 	if _, err := s.MarkCredentialOperationApplied(
 		taken.Fence(), outcome, CredentialTerminalSucceeded,
-		CredentialResultMoved, CredentialFailureNone, publication,
+		CredentialResultInstalled, CredentialFailureNone, publication,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +698,7 @@ func TestCredentialOperationAgeAloneCannotTakeover(t *testing.T) {
 	account := credentialOperationTestAccount(t, s)
 	owner := credentialOperationTestOwner("expired-owner")
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationMove, CredentialTargetFile,
+		t, account, CredentialOperationInstallSynced, CredentialTargetKeychain,
 		credentialOperationTestState("source", ""), "expired-move", owner)
 	begin, err := s.BeginCredentialOperation(request)
 	if err != nil {
@@ -739,7 +739,7 @@ func TestCredentialOperationGenerationAndLocatorDriftPreservesEvidence(t *testin
 			s.now = func() time.Time { return now }
 			account := credentialOperationTestAccount(t, s)
 			request := credentialOperationTestRequest(
-				t, account, CredentialOperationInstallSynced, CredentialTargetFile,
+				t, account, CredentialOperationInstallSynced, CredentialTargetKeychain,
 				credentialOperationTestState("before", ""), "install", credentialOperationTestOwner("owner"))
 			begin, err := s.BeginCredentialOperation(request)
 			if err != nil {
@@ -862,7 +862,7 @@ func TestCredentialOperationAcknowledgementPreservesMultiwaiterLostResponse(t *t
 	second.now = func() time.Time { return now }
 	account := credentialOperationTestAccount(t, first)
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
 		credentialOperationTestState("same", ""), "refresh", credentialOperationTestOwner("owner"))
 	begin, err := first.BeginCredentialOperation(request)
 	if err != nil {
@@ -908,7 +908,7 @@ func TestCredentialQuarantineRetainsAcknowledgedReceiptUntilExplicitClear(t *tes
 	s.now = func() time.Time { return now }
 	account := credentialOperationTestAccount(t, s)
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
 		credentialOperationTestState("before", ""), "ambiguous-refresh",
 		credentialOperationTestOwner("owner"),
 	)
@@ -979,7 +979,7 @@ func TestCredentialOperationConcurrentConflictingSettlementIsImmutable(t *testin
 	second.now = func() time.Time { return now }
 	account := credentialOperationTestAccount(t, first)
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationInstallSynced, CredentialTargetFile,
+		t, account, CredentialOperationInstallSynced, CredentialTargetKeychain,
 		credentialOperationTestState("before", ""), "install", credentialOperationTestOwner("owner"))
 	begin, err := first.BeginCredentialOperation(request)
 	if err != nil {
@@ -1062,14 +1062,14 @@ func TestCredentialOperationRejectsSecretBearingStructuralFields(t *testing.T) {
 	account := credentialOperationTestAccount(t, s)
 	const canary = "sk-ant-secret-canary"
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
 		credentialOperationTestState("before", ""), "refresh", credentialOperationTestOwner("owner"))
 	request.Kind = CredentialOperationKind(canary)
 	if _, err := s.BeginCredentialOperation(request); err == nil {
 		t.Fatal("secret-bearing operation kind was accepted")
 	}
 	request = credentialOperationTestRequest(
-		t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
 		credentialOperationTestState("before", ""), "refresh", credentialOperationTestOwner("owner"))
 	begin, err := s.BeginCredentialOperation(request)
 	if err != nil {
@@ -1093,10 +1093,7 @@ func TestCredentialOperationRejectsSecretBearingStructuralFields(t *testing.T) {
 	if _, err := s.QuarantineCredential(QuarantineCredentialRequest{
 		AccountID: account.ID, AccountInstanceID: account.InstanceID,
 		AccountGeneration: account.Generation,
-		LocatorDigest: CredentialLocatorDigest(
-			account.KeychainService, account.KeychainAccount, account.ConfigDir,
-		),
-		FileLocatorDigest: CredentialFileLocatorDigest(account.ConfigDir),
+		LocatorDigest:     CredentialKeychainLocatorDigest(account.KeychainService, account.KeychainAccount),
 		Observation:       begin.Active.Expected, Reason: CredentialResultCategory(canary),
 		FailureClass: CredentialFailureInternal,
 	}); err == nil {
@@ -1127,7 +1124,7 @@ func TestCredentialOperationOwnerPagingBoundary(t *testing.T) {
 	for id := 1; id <= CredentialOperationPageLimit+1; id++ {
 		account := credentialOperationTestAccountID(t, s, id)
 		request := credentialOperationTestRequest(
-			t, account, CredentialOperationDropDivergent, CredentialTargetKeychain,
+			t, account, CredentialOperationAdoptRotated, CredentialTargetKeychain,
 			credentialOperationTestState(fmt.Sprintf("credential-%d", id), ""),
 			fmt.Sprintf("drop-%d", id), owner)
 		if begin, err := s.BeginCredentialOperation(request); err != nil || !begin.Created {
@@ -1159,7 +1156,7 @@ func TestUnacknowledgedCredentialWriteReceiptPaging(t *testing.T) {
 	for id := 1; id <= 2; id++ {
 		account := credentialOperationTestAccountID(t, s, id)
 		request := credentialOperationTestRequest(
-			t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
+			t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
 			credentialOperationTestState(fmt.Sprintf("before-%d", id), ""),
 			fmt.Sprintf("refresh-%d", id), credentialOperationTestOwner("receipt-page"),
 		)
@@ -1266,7 +1263,7 @@ func TestPendingAddCredentialCompensationAdmissionAndCommit(t *testing.T) {
 	evidenceQuery := CredentialOperationEvidenceQuery{
 		AccountID: request.AccountID, AccountInstanceID: request.AccountInstanceID,
 		AccountGeneration: request.AccountGeneration, LocatorDigest: request.LocatorDigest,
-		FileLocatorDigest: request.FileLocatorDigest, Kind: request.Kind, Target: request.Target,
+		Kind: request.Kind, Target: request.Target,
 		IntentDigest: request.IntentDigest,
 	}
 	activeEvidence, receiptEvidence, err := s.CredentialOperationEvidence(evidenceQuery)
@@ -1295,7 +1292,7 @@ func TestPendingAddCredentialCompensationAdmissionAndCommit(t *testing.T) {
 	}
 	if receipt.AccountInstanceID != mutation.AccountInstanceID ||
 		receipt.AccountGeneration != mutation.AccountGeneration ||
-		receipt.Kind != CredentialOperationCompensate || receipt.Target != CredentialTargetAll {
+		receipt.Kind != CredentialOperationCompensate || receipt.Target != CredentialTargetKeychain {
 		t.Fatalf("pending compensation receipt = %+v", receipt)
 	}
 	activeEvidence, receiptEvidence, err = s.CredentialOperationEvidence(evidenceQuery)
@@ -1353,7 +1350,7 @@ func TestPendingAddCredentialCompensationRejectsCrossJournalMismatch(t *testing.
 			name: "locator",
 			mutate: func(t *testing.T, _ *Store, request *BeginCredentialOperationRequest, _ AccountMutation) {
 				t.Helper()
-				request.FileLocatorDigest = credentialOperationTestDigest("different-file-locator")
+				request.LocatorDigest = credentialOperationTestDigest("different-locator")
 				rederiveCredentialOperationTestID(t, request)
 			},
 		},
@@ -1392,8 +1389,7 @@ func pendingAddCompensationTestRequest(
 	configDir := "/tmp/pending-compensation"
 	service := "pending-service"
 	account := "pending-account"
-	fileLocator := CredentialFileLocatorDigest(configDir)
-	locator := credentialCompositeLocatorDigest(service, account, fileLocator)
+	locator := CredentialKeychainLocatorDigest(service, account)
 	expectedState := credentialOperationTestState("", "")
 	expectedDigest, err := expectedState.Digest()
 	if err != nil {
@@ -1462,7 +1458,7 @@ func pendingAddCompensationTestRequest(
 	intent := credentialCompensationIntentDigest(writtenDigest)
 	operationID, err := NewCredentialOperationID(
 		reservation.InstanceID, reservation.Generation,
-		CredentialOperationCompensate, CredentialTargetAll,
+		CredentialOperationCompensate, CredentialTargetKeychain,
 		locator, writtenState, intent,
 	)
 	if err != nil {
@@ -1471,9 +1467,9 @@ func pendingAddCompensationTestRequest(
 	return BeginCredentialOperationRequest{
 		OperationID: operationID, AccountID: reservation.ID,
 		AccountInstanceID: reservation.InstanceID, AccountGeneration: reservation.Generation,
-		LocatorDigest: locator, FileLocatorDigest: fileLocator,
-		Owner: credentialOperationTestOwner("compensation-owner"),
-		Kind:  CredentialOperationCompensate, Target: CredentialTargetAll,
+		LocatorDigest: locator,
+		Owner:         credentialOperationTestOwner("compensation-owner"),
+		Kind:          CredentialOperationCompensate, Target: CredentialTargetKeychain,
 		IntentDigest: intent, Expected: writtenState,
 	}, mutation
 }
@@ -1521,10 +1517,7 @@ func credentialOperationTestRequest(
 	owner proc.Record,
 ) BeginCredentialOperationRequest {
 	t.Helper()
-	fileLocator := CredentialFileLocatorDigest(account.ConfigDir)
-	locator := CredentialLocatorDigest(
-		account.KeychainService, account.KeychainAccount, account.ConfigDir,
-	)
+	locator := CredentialKeychainLocatorDigest(account.KeychainService, account.KeychainAccount)
 	intentDigest := credentialOperationTestDigest(intent)
 	operationID, err := NewCredentialOperationID(
 		account.InstanceID, account.Generation, kind, target, locator, expected, intentDigest,
@@ -1535,16 +1528,15 @@ func credentialOperationTestRequest(
 	return BeginCredentialOperationRequest{
 		OperationID: operationID, AccountID: account.ID,
 		AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
-		LocatorDigest: locator, FileLocatorDigest: fileLocator,
-		Owner: owner, Kind: kind, Target: target,
+		LocatorDigest: locator,
+		Owner:         owner, Kind: kind, Target: target,
 		IntentDigest: intentDigest, Expected: expected,
 	}
 }
 
-func credentialOperationTestState(keychain, file string) CredentialExternalState {
+func credentialOperationTestState(keychain, _ string) CredentialExternalState {
 	return CredentialExternalState{
 		Keychain: credentialOperationTestSlot(keychain),
-		File:     credentialOperationTestSlot(file),
 	}
 }
 

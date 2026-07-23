@@ -104,10 +104,7 @@ func TestBeginAccountRemovalRejectsAdmittedExternalOperations(t *testing.T) {
 		quarantine, err := s.QuarantineCredential(QuarantineCredentialRequest{
 			AccountID: account.ID, AccountInstanceID: account.InstanceID,
 			AccountGeneration: account.Generation,
-			LocatorDigest: CredentialLocatorDigest(
-				account.KeychainService, account.KeychainAccount, account.ConfigDir,
-			),
-			FileLocatorDigest: CredentialFileLocatorDigest(account.ConfigDir),
+			LocatorDigest:     CredentialKeychainLocatorDigest(account.KeychainService, account.KeychainAccount),
 			Observation:       credentialOperationTestState("ambiguous", ""),
 			Reason:            CredentialResultAmbiguous,
 			FailureClass:      CredentialFailureInternal,
@@ -304,7 +301,7 @@ func TestAccountRemovalIntentFencesActiveFleetAndSurvivesRestart(t *testing.T) {
 		t.Fatalf("begin account mutation after removal = %v, want ErrAccountRemoving", err)
 	}
 	credentialRequest := credentialOperationTestRequest(
-		t, account, CredentialOperationEnsureFresh, CredentialTargetAll,
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
 		credentialOperationTestState("before", ""), "post-removal-credential-operation",
 		credentialOperationTestOwner("post-removal-credential-operation"),
 	)

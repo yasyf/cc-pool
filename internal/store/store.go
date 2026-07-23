@@ -158,7 +158,6 @@ CREATE TABLE account_mutation_receipts (
   credential_written INTEGER NOT NULL CHECK(credential_written IN (0,1)),
   outcome_digest      BLOB NOT NULL CHECK(length(outcome_digest) = 32),
   terminal          TEXT NOT NULL CHECK(terminal IN ('committed','superseded','aborted','quarantined')),
-	quarantine_file_locator_digest BLOB CHECK(quarantine_file_locator_digest IS NULL OR length(quarantine_file_locator_digest) = 32),
 	quarantine_reason TEXT CHECK(quarantine_reason IS NULL OR quarantine_reason IN ('ambiguous','diverged','cleanup-failed','changed-underfoot')),
 	resolution TEXT CHECK(resolution IS NULL OR resolution='compensated-release'),
 	resolution_observed_digest BLOB CHECK(resolution_observed_digest IS NULL OR length(resolution_observed_digest) = 32),
@@ -218,7 +217,7 @@ CREATE TABLE account_mutation_receipts (
 	      (kind<>'presentation-rebind' AND previous_config_dir='' AND previous_keychain_service='' AND
 	       previous_keychain_account='' AND previous_locator_digest=zeroblob(32) AND
 	       previous_credential_digest=zeroblob(32))),
-	CHECK((terminal='quarantined') = (quarantine_file_locator_digest IS NOT NULL AND quarantine_reason IS NOT NULL)),
+	CHECK((terminal='quarantined') = (quarantine_reason IS NOT NULL)),
 	CHECK((resolution IS NULL AND resolution_observed_digest IS NULL AND resolved_at IS NULL)
 	   OR (resolution IS NOT NULL AND resolution_observed_digest IS NOT NULL AND resolved_at IS NOT NULL AND resolved_at>=committed_at))
 );
@@ -288,54 +287,46 @@ CREATE TABLE credential_operations (
 	account_id             INTEGER PRIMARY KEY CHECK(account_id > 0),
   operation_id           BLOB NOT NULL UNIQUE CHECK(length(operation_id) = 32),
   token                  TEXT NOT NULL UNIQUE CHECK(length(token) = 32 AND token NOT GLOB '*[^0-9a-f]*'),
-  kind                   TEXT NOT NULL CHECK(kind IN ('move','ensure-fresh','refresh-current','install-synced','adopt-rotated','drop-divergent-copy','compensate')),
-  target                 TEXT NOT NULL CHECK(target IN ('keychain','file','all')),
+  kind                   TEXT NOT NULL CHECK(kind IN ('ensure-fresh','refresh-current','install-synced','adopt-rotated','compensate')),
+  target                 TEXT NOT NULL CHECK(target='keychain'),
   intent_digest          BLOB NOT NULL CHECK(length(intent_digest) = 32),
   account_instance_id    TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation     INTEGER NOT NULL CHECK(account_generation > 0),
   locator_digest         BLOB NOT NULL CHECK(length(locator_digest) = 32),
-  file_locator_digest    BLOB NOT NULL CHECK(length(file_locator_digest) = 32),
   owner_record           BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch            INTEGER NOT NULL CHECK(owner_epoch > 0),
   state                  TEXT NOT NULL CHECK(state IN ('prepared','applying','applied')),
   expected_keychain_state TEXT NOT NULL CHECK(expected_keychain_state IN ('empty','present','unsearchable','unreadable')),
   expected_keychain_digest BLOB CHECK(expected_keychain_digest IS NULL OR length(expected_keychain_digest) = 32),
-  expected_file_state     TEXT NOT NULL CHECK(expected_file_state IN ('empty','present','unsearchable','unreadable')),
-  expected_file_digest    BLOB CHECK(expected_file_digest IS NULL OR length(expected_file_digest) = 32),
   outcome_keychain_state  TEXT CHECK(outcome_keychain_state IS NULL OR outcome_keychain_state IN ('empty','present','unsearchable','unreadable')),
   outcome_keychain_digest BLOB CHECK(outcome_keychain_digest IS NULL OR length(outcome_keychain_digest) = 32),
-  outcome_file_state      TEXT CHECK(outcome_file_state IS NULL OR outcome_file_state IN ('empty','present','unsearchable','unreadable')),
-  outcome_file_digest     BLOB CHECK(outcome_file_digest IS NULL OR length(outcome_file_digest) = 32),
   terminal_status         TEXT CHECK(terminal_status IS NULL OR terminal_status IN ('succeeded','failed','quarantined')),
-  result_category         TEXT CHECK(result_category IS NULL OR result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','moved','already-target','cleaned-stray','failed','ambiguous','diverged','cleanup-failed','changed-underfoot')),
+  result_category         TEXT CHECK(result_category IS NULL OR result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','failed','ambiguous','diverged','cleanup-failed','changed-underfoot')),
   failure_class           TEXT CHECK(failure_class IS NULL OR failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')),
   publication_payload     BLOB CHECK(publication_payload IS NULL OR (length(publication_payload) > 0 AND length(publication_payload) <= 4096)),
   created_at             INTEGER NOT NULL CHECK(created_at > 0),
   updated_at             INTEGER NOT NULL CHECK(updated_at >= created_at),
   CHECK(
-    (state IN ('prepared','applying') AND outcome_keychain_state IS NULL AND outcome_file_state IS NULL AND terminal_status IS NULL AND result_category IS NULL AND failure_class IS NULL)
+    (state IN ('prepared','applying') AND outcome_keychain_state IS NULL AND terminal_status IS NULL AND result_category IS NULL AND failure_class IS NULL)
     OR
-    (state='applied' AND outcome_keychain_state IS NOT NULL AND outcome_file_state IS NOT NULL AND terminal_status IS NOT NULL AND result_category IS NOT NULL)
+    (state='applied' AND outcome_keychain_state IS NOT NULL AND terminal_status IS NOT NULL AND result_category IS NOT NULL)
   ),
 	CHECK(failure_class IS NULL OR failure_class='internal' OR
 	      (kind IN ('ensure-fresh','refresh-current') AND failure_class IN ('network','refresh-unauthorized','refresh-rejected','refresh-server'))),
 	CHECK(terminal_status IS NULL OR
 	      (terminal_status='succeeded' AND failure_class IS NULL AND
-	       result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','moved','already-target','cleaned-stray')) OR
+	       result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped')) OR
 	      (terminal_status='failed' AND result_category='failed' AND failure_class IS NOT NULL AND
 	       failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')) OR
 	      (terminal_status='quarantined' AND failure_class IS NOT NULL AND
 	       result_category IN ('ambiguous','diverged','cleanup-failed','changed-underfoot') AND
 	       failure_class IN ('internal','network','refresh-server'))),
-	CHECK((kind IN ('compensate','ensure-fresh','refresh-current')) = (target='all')),
   CHECK((expected_keychain_state='present') = (expected_keychain_digest IS NOT NULL)),
-  CHECK((expected_file_state='present') = (expected_file_digest IS NOT NULL)),
 	CHECK(outcome_keychain_state IS NULL OR ((outcome_keychain_state='present') = (outcome_keychain_digest IS NOT NULL))),
-	CHECK(outcome_file_state IS NULL OR ((outcome_file_state='present') = (outcome_file_digest IS NOT NULL))),
 	CHECK(publication_payload IS NULL OR state='applying' OR
-	      (state='applied' AND terminal_status='succeeded' AND result_category IN ('refreshed','installed','moved'))),
+	      (state='applied' AND terminal_status='succeeded' AND result_category IN ('refreshed','installed'))),
 	CHECK(state!='applied' OR terminal_status!='succeeded' OR
-	      result_category NOT IN ('refreshed','installed','moved') OR publication_payload IS NOT NULL)
+	      result_category NOT IN ('refreshed','installed') OR publication_payload IS NOT NULL)
 );
 CREATE TABLE credential_operation_receipts (
   operation_id         BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
@@ -344,60 +335,48 @@ CREATE TABLE credential_operation_receipts (
   account_instance_id  TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation   INTEGER NOT NULL CHECK(account_generation > 0),
   locator_digest       BLOB NOT NULL CHECK(length(locator_digest) = 32),
-  file_locator_digest  BLOB NOT NULL CHECK(length(file_locator_digest) = 32),
-  kind                 TEXT NOT NULL CHECK(kind IN ('move','ensure-fresh','refresh-current','install-synced','adopt-rotated','drop-divergent-copy','compensate')),
-  target               TEXT NOT NULL CHECK(target IN ('keychain','file','all')),
+  kind                 TEXT NOT NULL CHECK(kind IN ('ensure-fresh','refresh-current','install-synced','adopt-rotated','compensate')),
+  target               TEXT NOT NULL CHECK(target='keychain'),
   intent_digest        BLOB NOT NULL CHECK(length(intent_digest) = 32),
   expected_keychain_state TEXT NOT NULL CHECK(expected_keychain_state IN ('empty','present','unsearchable','unreadable')),
   expected_keychain_digest BLOB CHECK(expected_keychain_digest IS NULL OR length(expected_keychain_digest) = 32),
-  expected_file_state     TEXT NOT NULL CHECK(expected_file_state IN ('empty','present','unsearchable','unreadable')),
-  expected_file_digest    BLOB CHECK(expected_file_digest IS NULL OR length(expected_file_digest) = 32),
   owner_record         BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch          INTEGER NOT NULL CHECK(owner_epoch > 0),
   terminal_status      TEXT NOT NULL CHECK(terminal_status IN ('succeeded','failed','quarantined')),
-  result_category      TEXT NOT NULL CHECK(result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','moved','already-target','cleaned-stray','failed','ambiguous','diverged','cleanup-failed','changed-underfoot')),
+  result_category      TEXT NOT NULL CHECK(result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','failed','ambiguous','diverged','cleanup-failed','changed-underfoot')),
   failure_class        TEXT CHECK(failure_class IS NULL OR failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')),
   outcome_keychain_state  TEXT NOT NULL CHECK(outcome_keychain_state IN ('empty','present','unsearchable','unreadable')),
   outcome_keychain_digest BLOB CHECK(outcome_keychain_digest IS NULL OR length(outcome_keychain_digest) = 32),
-  outcome_file_state      TEXT NOT NULL CHECK(outcome_file_state IN ('empty','present','unsearchable','unreadable')),
-  outcome_file_digest     BLOB CHECK(outcome_file_digest IS NULL OR length(outcome_file_digest) = 32),
   publication_payload     BLOB CHECK(publication_payload IS NULL OR (length(publication_payload) > 0 AND length(publication_payload) <= 4096)),
   committed_at         INTEGER NOT NULL CHECK(committed_at > 0),
   acknowledged_at      INTEGER CHECK(acknowledged_at IS NULL OR acknowledged_at >= committed_at),
   expires_at           INTEGER NOT NULL CHECK(expires_at > committed_at),
-	CHECK((kind IN ('compensate','ensure-fresh','refresh-current')) = (target='all')),
 	CHECK(failure_class IS NULL OR failure_class='internal' OR
 	      (kind IN ('ensure-fresh','refresh-current') AND failure_class IN ('network','refresh-unauthorized','refresh-rejected','refresh-server'))),
 	CHECK((terminal_status='succeeded' AND failure_class IS NULL AND
-	       result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','moved','already-target','cleaned-stray')) OR
+	       result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped')) OR
 	      (terminal_status='failed' AND result_category='failed' AND failure_class IS NOT NULL AND
 	       failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')) OR
 	      (terminal_status='quarantined' AND failure_class IS NOT NULL AND
 	       result_category IN ('ambiguous','diverged','cleanup-failed','changed-underfoot') AND
 	       failure_class IN ('internal','network','refresh-server'))),
   CHECK((expected_keychain_state='present') = (expected_keychain_digest IS NOT NULL)),
-	CHECK((expected_file_state='present') = (expected_file_digest IS NOT NULL)),
 	CHECK((outcome_keychain_state='present') = (outcome_keychain_digest IS NOT NULL)),
-	CHECK((outcome_file_state='present') = (outcome_file_digest IS NOT NULL)),
 	CHECK((publication_payload IS NOT NULL) =
-	      (terminal_status='succeeded' AND result_category IN ('refreshed','installed','moved')))
+	      (terminal_status='succeeded' AND result_category IN ('refreshed','installed')))
 );
 CREATE TABLE credential_quarantines (
 	account_id               INTEGER PRIMARY KEY CHECK(account_id > 0),
   account_instance_id      TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation       INTEGER NOT NULL CHECK(account_generation > 0),
   locator_digest           BLOB NOT NULL CHECK(length(locator_digest) = 32),
-  file_locator_digest      BLOB NOT NULL CHECK(length(file_locator_digest) = 32),
   observation_keychain_state  TEXT NOT NULL CHECK(observation_keychain_state IN ('empty','present','unsearchable','unreadable')),
   observation_keychain_digest BLOB CHECK(observation_keychain_digest IS NULL OR length(observation_keychain_digest) = 32),
-  observation_file_state      TEXT NOT NULL CHECK(observation_file_state IN ('empty','present','unsearchable','unreadable')),
-  observation_file_digest     BLOB CHECK(observation_file_digest IS NULL OR length(observation_file_digest) = 32),
   token_chain_digest          BLOB CHECK(token_chain_digest IS NULL OR length(token_chain_digest) = 32),
   reason                    TEXT NOT NULL CHECK(reason IN ('ambiguous','diverged','cleanup-failed','changed-underfoot')),
   failure_class             TEXT NOT NULL CHECK(failure_class IN ('internal','network','refresh-server')),
   created_at                INTEGER NOT NULL CHECK(created_at > 0),
-  CHECK((observation_keychain_state='present') = (observation_keychain_digest IS NOT NULL)),
-  CHECK((observation_file_state='present') = (observation_file_digest IS NOT NULL))
+  CHECK((observation_keychain_state='present') = (observation_keychain_digest IS NOT NULL))
 );
 CREATE TABLE account_presentations (
   account_id              INTEGER PRIMARY KEY CHECK(account_id > 0),

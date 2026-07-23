@@ -15,7 +15,7 @@ func TestCredentialQuarantineTokenChainBindingIsExactAndIdempotent(t *testing.T)
 		t,
 		account,
 		CredentialOperationEnsureFresh,
-		CredentialTargetAll,
+		CredentialTargetKeychain,
 		credentialOperationTestState("before", ""),
 		"bind-token-chain",
 		credentialOperationTestOwner("owner"),
@@ -23,8 +23,8 @@ func TestCredentialQuarantineTokenChainBindingIsExactAndIdempotent(t *testing.T)
 	quarantine, err := first.QuarantineCredential(QuarantineCredentialRequest{
 		AccountID: account.ID, AccountInstanceID: account.InstanceID,
 		AccountGeneration: account.Generation,
-		LocatorDigest:     request.LocatorDigest, FileLocatorDigest: request.FileLocatorDigest,
-		Observation: request.Expected, Reason: CredentialResultAmbiguous,
+		LocatorDigest:     request.LocatorDigest,
+		Observation:       request.Expected, Reason: CredentialResultAmbiguous,
 		FailureClass: CredentialFailureInternal,
 	})
 	if err != nil {
@@ -77,7 +77,7 @@ func TestCredentialQuarantineBindRacesExactAcknowledgeAndClear(t *testing.T) {
 		t,
 		account,
 		CredentialOperationEnsureFresh,
-		CredentialTargetAll,
+		CredentialTargetKeychain,
 		credentialOperationTestState("before", ""),
 		"bind-clear-race",
 		credentialOperationTestOwner("owner"),

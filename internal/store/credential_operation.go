@@ -51,11 +51,7 @@ const (
 // CredentialOperationKind is one closed credential mutation policy.
 type CredentialOperationKind string
 
-const dropDivergentOperationKind CredentialOperationKind = "drop-divergent-copy"
-
 const (
-	// CredentialOperationMove moves one exact credential identity.
-	CredentialOperationMove CredentialOperationKind = "move"
 	// CredentialOperationEnsureFresh refreshes only when required.
 	CredentialOperationEnsureFresh CredentialOperationKind = "ensure-fresh"
 	// CredentialOperationRefreshCurrent refreshes the selected current account.
@@ -64,8 +60,6 @@ const (
 	CredentialOperationInstallSynced CredentialOperationKind = "install-synced"
 	// CredentialOperationAdoptRotated adopts a proven rotated credential.
 	CredentialOperationAdoptRotated CredentialOperationKind = "adopt-rotated"
-	// CredentialOperationDropDivergent removes one divergent synchronized copy.
-	CredentialOperationDropDivergent CredentialOperationKind = dropDivergentOperationKind
 	// CredentialOperationCompensate reverses an unpublished credential write.
 	CredentialOperationCompensate CredentialOperationKind = "compensate"
 )
@@ -76,10 +70,6 @@ type CredentialTarget string
 const (
 	// CredentialTargetKeychain selects only the Keychain slot.
 	CredentialTargetKeychain CredentialTarget = "keychain"
-	// CredentialTargetFile selects only the file slot.
-	CredentialTargetFile CredentialTarget = "file"
-	// CredentialTargetAll selects both credential slots.
-	CredentialTargetAll CredentialTarget = "all"
 )
 
 // CredentialResultCategory is one closed, secret-free terminal result.
@@ -100,12 +90,6 @@ const (
 	CredentialResultInstalled CredentialResultCategory = "installed"
 	// CredentialResultSkipped records an intentionally omitted mutation.
 	CredentialResultSkipped CredentialResultCategory = "skipped"
-	// CredentialResultMoved records a completed credential move.
-	CredentialResultMoved CredentialResultCategory = "moved"
-	// CredentialResultAlreadyTarget records an already-canonical target.
-	CredentialResultAlreadyTarget CredentialResultCategory = "already-target"
-	// CredentialResultCleanedStray records removal of a stray credential.
-	CredentialResultCleanedStray CredentialResultCategory = "cleaned-stray"
 	// CredentialResultFailed records a classified operation failure.
 	CredentialResultFailed CredentialResultCategory = "failed"
 	// CredentialResultAmbiguous records unprovable external state.
@@ -175,10 +159,9 @@ type CredentialSlotObservation struct {
 	Digest *CredentialDigest
 }
 
-// CredentialExternalState records both credential slots without storing secrets.
+// CredentialExternalState records the Keychain slot without storing secrets.
 type CredentialExternalState struct {
 	Keychain CredentialSlotObservation
-	File     CredentialSlotObservation
 }
 
 // Digest returns the canonical digest of the complete external state.
@@ -188,48 +171,15 @@ func (state CredentialExternalState) Digest() (CredentialDigest, error) {
 	}
 	hash := sha256.New()
 	writeCredentialHashField(hash, []byte("cc-pool:credential-external-state:v1"))
-	for _, slot := range []CredentialSlotObservation{state.Keychain, state.File} {
-		writeCredentialHashField(hash, []byte(slot.State))
-		if slot.Digest == nil {
-			writeCredentialHashField(hash, nil)
-		} else {
-			writeCredentialHashField(hash, slot.Digest[:])
-		}
+	writeCredentialHashField(hash, []byte(state.Keychain.State))
+	if state.Keychain.Digest == nil {
+		writeCredentialHashField(hash, nil)
+	} else {
+		writeCredentialHashField(hash, state.Keychain.Digest[:])
 	}
 	var digest CredentialDigest
 	copy(digest[:], hash.Sum(nil))
 	return digest, nil
-}
-
-// CredentialFileLocatorDigest returns the canonical digest of the exact file-backend path.
-func CredentialFileLocatorDigest(path string) CredentialDigest {
-	hash := sha256.New()
-	writeCredentialHashField(hash, []byte("cc-pool:credential-file-locator:v1"))
-	writeCredentialHashField(hash, []byte(path))
-	var digest CredentialDigest
-	copy(digest[:], hash.Sum(nil))
-	return digest
-}
-
-// CredentialLocatorDigest binds both Keychain fields and the exact file-backend path.
-func CredentialLocatorDigest(service, account, filePath string) CredentialDigest {
-	return credentialCompositeLocatorDigest(
-		service, account, CredentialFileLocatorDigest(filePath),
-	)
-}
-
-func credentialCompositeLocatorDigest(
-	service, account string,
-	fileLocator CredentialDigest,
-) CredentialDigest {
-	hash := sha256.New()
-	writeCredentialHashField(hash, []byte("cc-pool:credential-locator:v1"))
-	writeCredentialHashField(hash, []byte(service))
-	writeCredentialHashField(hash, []byte(account))
-	writeCredentialHashField(hash, fileLocator[:])
-	var digest CredentialDigest
-	copy(digest[:], hash.Sum(nil))
-	return digest
 }
 
 // NewCredentialOperationID derives the only operation ID accepted by Begin.
@@ -304,7 +254,6 @@ type CredentialOperation struct {
 	AccountInstanceID  string
 	AccountGeneration  uint64
 	LocatorDigest      CredentialDigest
-	FileLocatorDigest  CredentialDigest
 	Owner              proc.Record
 	OwnerEpoch         uint64
 	State              CredentialOperationState
@@ -337,7 +286,6 @@ type CredentialOperationReceipt struct {
 	AccountInstanceID  string
 	AccountGeneration  uint64
 	LocatorDigest      CredentialDigest
-	FileLocatorDigest  CredentialDigest
 	Expected           CredentialExternalState
 	Owner              proc.Record
 	OwnerEpoch         uint64
@@ -357,7 +305,6 @@ type CredentialQuarantine struct {
 	AccountInstanceID string
 	AccountGeneration uint64
 	LocatorDigest     CredentialDigest
-	FileLocatorDigest CredentialDigest
 	Observation       CredentialExternalState
 	TokenChainDigest  *CredentialDigest
 	Reason            CredentialResultCategory
@@ -372,7 +319,6 @@ type BeginCredentialOperationRequest struct {
 	AccountInstanceID string
 	AccountGeneration uint64
 	LocatorDigest     CredentialDigest
-	FileLocatorDigest CredentialDigest
 	Owner             proc.Record
 	Kind              CredentialOperationKind
 	Target            CredentialTarget
@@ -393,7 +339,6 @@ type CredentialOperationEvidenceQuery struct {
 	AccountInstanceID string
 	AccountGeneration uint64
 	LocatorDigest     CredentialDigest
-	FileLocatorDigest CredentialDigest
 	Kind              CredentialOperationKind
 	Target            CredentialTarget
 	IntentDigest      CredentialDigest
@@ -468,18 +413,16 @@ func (s *Store) BeginCredentialOperation(
 	result, err := tx.Exec(
 		`INSERT INTO credential_operations(
 		 account_id,operation_id,token,kind,target,intent_digest,
-		 account_instance_id,account_generation,locator_digest,file_locator_digest,
+		 account_instance_id,account_generation,locator_digest,
 		 owner_record,owner_epoch,state,
 		 expected_keychain_state,expected_keychain_digest,
-		 expected_file_state,expected_file_digest,
 		 created_at,updated_at
-		) VALUES(?,?,?,?,?,?,?,?,?,?,?,1,'prepared',?,?,?,?,?,?)
+		) VALUES(?,?,?,?,?,?,?,?,?,?,1,'prepared',?,?,?,?)
 		 ON CONFLICT(account_id) DO NOTHING`,
 		request.AccountID, request.OperationID[:], token, request.Kind, request.Target,
 		request.IntentDigest[:], request.AccountInstanceID, request.AccountGeneration,
-		request.LocatorDigest[:], request.FileLocatorDigest[:], ownerRecord,
+		request.LocatorDigest[:], ownerRecord,
 		request.Expected.Keychain.State, credentialDigestValue(request.Expected.Keychain.Digest),
-		request.Expected.File.State, credentialDigestValue(request.Expected.File.Digest),
 		now.UnixNano(), now.UnixNano(),
 	)
 	if err != nil {
@@ -518,7 +461,7 @@ func pendingAddRemovalAllowsCredentialCompensation(
 	request BeginCredentialOperationRequest,
 ) (bool, error) {
 	if !removal.DeleteCredential || request.Kind != CredentialOperationCompensate ||
-		request.Target != CredentialTargetAll || removal.AccountID != request.AccountID ||
+		request.Target != CredentialTargetKeychain || removal.AccountID != request.AccountID ||
 		removal.AccountInstanceID != request.AccountInstanceID ||
 		removal.AccountGeneration != request.AccountGeneration {
 		return false, nil
@@ -535,7 +478,7 @@ func pendingAddRemovalAllowsCredentialCompensation(
 	}
 	err = credentialPendingAddCompensationMatches(
 		tx, request.AccountID, request.AccountInstanceID, request.AccountGeneration,
-		request.LocatorDigest, request.FileLocatorDigest, request.Expected, request.IntentDigest,
+		request.LocatorDigest, request.Expected, request.IntentDigest,
 	)
 	if errors.Is(err, ErrAccountGenerationChanged) {
 		return false, nil
@@ -562,7 +505,7 @@ func (s *Store) CredentialOperationEvidence(
 ) (active *CredentialOperation, receipt *CredentialOperationReceipt, err error) {
 	if query.AccountID <= 0 || validateAccountInstanceID(query.AccountInstanceID) != nil ||
 		query.AccountGeneration == 0 || query.LocatorDigest.zero() ||
-		query.FileLocatorDigest.zero() || !validCredentialKindTarget(query.Kind, query.Target) ||
+		!validCredentialKindTarget(query.Kind, query.Target) ||
 		query.IntentDigest.zero() {
 		return nil, nil, ErrCredentialOperationState
 	}
@@ -577,10 +520,10 @@ func (s *Store) CredentialOperationEvidence(
 	rows, err := s.db.Query(
 		`SELECT `+receiptSelectColumns+` FROM credential_operation_receipts
 		 WHERE account_id=? AND account_instance_id=? AND account_generation=?
-		 AND locator_digest=? AND file_locator_digest=? AND kind=? AND target=? AND intent_digest=?
+		 AND locator_digest=? AND kind=? AND target=? AND intent_digest=?
 		 ORDER BY committed_at DESC,operation_id DESC LIMIT 2`,
 		query.AccountID, query.AccountInstanceID, query.AccountGeneration,
-		query.LocatorDigest[:], query.FileLocatorDigest[:], query.Kind, query.Target,
+		query.LocatorDigest[:], query.Kind, query.Target,
 		query.IntentDigest[:],
 	)
 	if err != nil {
@@ -611,7 +554,6 @@ func credentialOperationMatchesEvidence(
 		operation.AccountInstanceID == query.AccountInstanceID &&
 		operation.AccountGeneration == query.AccountGeneration &&
 		operation.LocatorDigest == query.LocatorDigest &&
-		operation.FileLocatorDigest == query.FileLocatorDigest &&
 		operation.Kind == query.Kind && operation.Target == query.Target &&
 		operation.IntentDigest == query.IntentDigest
 }
@@ -928,8 +870,7 @@ func (s *Store) settleCredentialOperation(
 		if err := upsertCredentialQuarantine(tx, CredentialQuarantine{
 			AccountID: operation.AccountID, AccountInstanceID: operation.AccountInstanceID,
 			AccountGeneration: operation.AccountGeneration, LocatorDigest: operation.LocatorDigest,
-			FileLocatorDigest: operation.FileLocatorDigest,
-			Observation:       request.Actual, TokenChainDigest: request.QuarantineTokenChainDigest,
+			Observation: request.Actual, TokenChainDigest: request.QuarantineTokenChainDigest,
 			Reason:       result,
 			FailureClass: failure, CreatedAt: now,
 		}); err != nil {
@@ -1184,7 +1125,7 @@ func (s *Store) AcknowledgeCredentialOperation(token string) error {
 // a crash between acknowledgement and clear stays fail-closed.
 func (s *Store) AcknowledgeCredentialQuarantine(quarantine CredentialQuarantine) error {
 	if quarantine.AccountID <= 0 || quarantine.AccountGeneration == 0 ||
-		quarantine.LocatorDigest.zero() || quarantine.FileLocatorDigest.zero() ||
+		quarantine.LocatorDigest.zero() ||
 		!quarantine.Reason.quarantine() || !quarantine.FailureClass.quarantine() ||
 		quarantine.CreatedAt.IsZero() {
 		return errors.New("credential quarantine is invalid")
@@ -1217,15 +1158,14 @@ func (s *Store) AcknowledgeCredentialQuarantine(quarantine CredentialQuarantine)
 		`UPDATE credential_operation_receipts
 		 SET acknowledged_at=COALESCE(acknowledged_at,?)
 		 WHERE account_id=? AND account_instance_id=? AND account_generation=?
-		 AND locator_digest=? AND file_locator_digest=?
+		 AND locator_digest=?
 		 AND terminal_status='quarantined' AND result_category=? AND failure_class=?
 		 AND outcome_keychain_state=? AND outcome_keychain_digest IS ?
-		 AND outcome_file_state=? AND outcome_file_digest IS ? AND committed_at=?`,
+		 AND committed_at=?`,
 		s.now().UnixNano(), quarantine.AccountID, quarantine.AccountInstanceID,
-		quarantine.AccountGeneration, quarantine.LocatorDigest[:], quarantine.FileLocatorDigest[:],
+		quarantine.AccountGeneration, quarantine.LocatorDigest[:],
 		quarantine.Reason, quarantine.FailureClass, quarantine.Observation.Keychain.State,
-		credentialDigestValue(quarantine.Observation.Keychain.Digest), quarantine.Observation.File.State,
-		credentialDigestValue(quarantine.Observation.File.Digest), quarantine.CreatedAt.UnixNano(),
+		credentialDigestValue(quarantine.Observation.Keychain.Digest), quarantine.CreatedAt.UnixNano(),
 	)
 	if err != nil {
 		return err
@@ -1246,7 +1186,6 @@ type QuarantineCredentialRequest struct {
 	AccountInstanceID string
 	AccountGeneration uint64
 	LocatorDigest     CredentialDigest
-	FileLocatorDigest CredentialDigest
 	Observation       CredentialExternalState
 	TokenChainDigest  *CredentialDigest
 	Reason            CredentialResultCategory
@@ -1258,7 +1197,7 @@ func (s *Store) QuarantineCredential(
 	request QuarantineCredentialRequest,
 ) (CredentialQuarantine, error) {
 	if request.AccountID <= 0 || request.AccountGeneration == 0 ||
-		request.LocatorDigest.zero() || request.FileLocatorDigest.zero() {
+		request.LocatorDigest.zero() {
 		return CredentialQuarantine{}, errors.New("credential quarantine identity is invalid")
 	}
 	if err := validateAccountInstanceID(request.AccountInstanceID); err != nil {
@@ -1287,28 +1226,26 @@ func (s *Store) QuarantineCredential(
 	}
 	if err := credentialAccountMatchesIdentity(
 		tx, request.AccountID, request.AccountInstanceID,
-		request.AccountGeneration, request.LocatorDigest, request.FileLocatorDigest,
+		request.AccountGeneration, request.LocatorDigest,
 	); err != nil {
 		return CredentialQuarantine{}, err
 	}
 	quarantine := CredentialQuarantine{
 		AccountID: request.AccountID, AccountInstanceID: request.AccountInstanceID,
 		AccountGeneration: request.AccountGeneration, LocatorDigest: request.LocatorDigest,
-		FileLocatorDigest: request.FileLocatorDigest,
-		Observation:       request.Observation, TokenChainDigest: request.TokenChainDigest,
+		Observation: request.Observation, TokenChainDigest: request.TokenChainDigest,
 		Reason:       request.Reason,
 		FailureClass: request.FailureClass, CreatedAt: now,
 	}
 	if _, err := tx.Exec(
 		`INSERT INTO credential_quarantines(
-		 account_id,account_instance_id,account_generation,locator_digest,file_locator_digest,
+		 account_id,account_instance_id,account_generation,locator_digest,
 		 observation_keychain_state,observation_keychain_digest,
-		 observation_file_state,observation_file_digest,token_chain_digest,reason,failure_class,created_at
-		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id) DO NOTHING`,
+		 token_chain_digest,reason,failure_class,created_at
+		) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id) DO NOTHING`,
 		quarantine.AccountID, quarantine.AccountInstanceID, quarantine.AccountGeneration,
-		quarantine.LocatorDigest[:], quarantine.FileLocatorDigest[:], quarantine.Observation.Keychain.State,
-		credentialDigestValue(quarantine.Observation.Keychain.Digest), quarantine.Observation.File.State,
-		credentialDigestValue(quarantine.Observation.File.Digest), credentialDigestValue(quarantine.TokenChainDigest),
+		quarantine.LocatorDigest[:], quarantine.Observation.Keychain.State,
+		credentialDigestValue(quarantine.Observation.Keychain.Digest), credentialDigestValue(quarantine.TokenChainDigest),
 		quarantine.Reason, quarantine.FailureClass,
 		quarantine.CreatedAt.UnixNano(),
 	); err != nil {
@@ -1359,17 +1296,14 @@ func (s *Store) BindCredentialQuarantineTokenChain(
 		`UPDATE credential_quarantines
 		 SET token_chain_digest=COALESCE(token_chain_digest,?)
 		 WHERE account_id=? AND account_instance_id=? AND account_generation=?
-		 AND locator_digest=? AND file_locator_digest=?
+		 AND locator_digest=?
 		 AND observation_keychain_state=? AND observation_keychain_digest IS ?
-		 AND observation_file_state=? AND observation_file_digest IS ?
 		 AND reason=? AND failure_class=? AND created_at=?
 		 AND (token_chain_digest IS NULL OR token_chain_digest=?)`,
 		digest[:], quarantine.AccountID, quarantine.AccountInstanceID,
-		quarantine.AccountGeneration, quarantine.LocatorDigest[:], quarantine.FileLocatorDigest[:],
+		quarantine.AccountGeneration, quarantine.LocatorDigest[:],
 		quarantine.Observation.Keychain.State,
 		credentialDigestValue(quarantine.Observation.Keychain.Digest),
-		quarantine.Observation.File.State,
-		credentialDigestValue(quarantine.Observation.File.Digest),
 		quarantine.Reason, quarantine.FailureClass, quarantine.CreatedAt.UnixNano(), digest[:],
 	)
 	if err != nil {
@@ -1399,7 +1333,7 @@ func (s *Store) BindCredentialQuarantineTokenChain(
 // ClearCredentialQuarantine removes one exact unchanged fence.
 func (s *Store) ClearCredentialQuarantine(quarantine CredentialQuarantine) error {
 	if quarantine.AccountID <= 0 || quarantine.AccountGeneration == 0 ||
-		quarantine.LocatorDigest.zero() || quarantine.FileLocatorDigest.zero() ||
+		quarantine.LocatorDigest.zero() ||
 		!quarantine.Reason.quarantine() || !quarantine.FailureClass.quarantine() ||
 		quarantine.CreatedAt.IsZero() {
 		return errors.New("credential quarantine is invalid")
@@ -1488,15 +1422,14 @@ func deleteCredentialQuarantine(execer rowExecer, quarantine CredentialQuarantin
 	result, err := execer.Exec(
 		`DELETE FROM credential_quarantines
 		 WHERE account_id=? AND account_instance_id=? AND account_generation=?
-		   AND locator_digest=? AND file_locator_digest=?
+		   AND locator_digest=?
 		   AND observation_keychain_state=? AND observation_keychain_digest IS ?
-		   AND observation_file_state=? AND observation_file_digest IS ?
 		   AND token_chain_digest IS ?
 		   AND reason=? AND failure_class=? AND created_at=?`,
 		quarantine.AccountID, quarantine.AccountInstanceID, quarantine.AccountGeneration,
-		quarantine.LocatorDigest[:], quarantine.FileLocatorDigest[:], quarantine.Observation.Keychain.State,
-		credentialDigestValue(quarantine.Observation.Keychain.Digest), quarantine.Observation.File.State,
-		credentialDigestValue(quarantine.Observation.File.Digest), credentialDigestValue(quarantine.TokenChainDigest),
+		quarantine.LocatorDigest[:], quarantine.Observation.Keychain.State,
+		credentialDigestValue(quarantine.Observation.Keychain.Digest),
+		credentialDigestValue(quarantine.TokenChainDigest),
 		quarantine.Reason, quarantine.FailureClass,
 		quarantine.CreatedAt.UnixNano(),
 	)
@@ -1615,17 +1548,15 @@ func (s *Store) advanceCredentialOperation(
 	} else if len(publicationPayload) != 0 && to != CredentialOperationApplying {
 		return CredentialOperation{}, errors.New("credential publication payload requires an applying operation")
 	}
-	var outcomeKeychainState, outcomeFileState any
-	var outcomeKeychainDigest, outcomeFileDigest any
+	var outcomeKeychainState, outcomeKeychainDigest any
 	var terminalStatus, resultCategory, failureClass any
 	var storedPublicationPayload any
 	if !hasOutcome && len(publicationPayload) != 0 {
 		storedPublicationPayload = bytes.Clone(publicationPayload)
 	}
 	if hasOutcome {
-		outcomeKeychainState, outcomeFileState = outcome.Keychain.State, outcome.File.State
+		outcomeKeychainState = outcome.Keychain.State
 		outcomeKeychainDigest = credentialDigestValue(outcome.Keychain.Digest)
-		outcomeFileDigest = credentialDigestValue(outcome.File.Digest)
 		terminalStatus, resultCategory = status, result
 		failureClass = credentialFailureClassValue(failure)
 		if len(publicationPayload) != 0 {
@@ -1635,11 +1566,11 @@ func (s *Store) advanceCredentialOperation(
 	updated, err := tx.Exec(
 		`UPDATE credential_operations SET
 		 state=?,outcome_keychain_state=?,outcome_keychain_digest=?,
-		 outcome_file_state=?,outcome_file_digest=?,terminal_status=?,result_category=?,failure_class=?,
+		 terminal_status=?,result_category=?,failure_class=?,
 		 publication_payload=?,
 		 updated_at=?
 		 WHERE token=? AND owner_record=? AND owner_epoch=? AND state=?`,
-		to, outcomeKeychainState, outcomeKeychainDigest, outcomeFileState, outcomeFileDigest,
+		to, outcomeKeychainState, outcomeKeychainDigest,
 		terminalStatus, resultCategory, failureClass, storedPublicationPayload, now.UnixNano(), fence.Token,
 		mustEncodeCredentialOwner(fence.Owner), fence.Epoch, from,
 	)
@@ -1665,17 +1596,17 @@ func (s *Store) advanceCredentialOperation(
 
 const operationSelectColumns = `
 account_id,operation_id,token,kind,target,intent_digest,
-account_instance_id,account_generation,locator_digest,file_locator_digest,owner_record,owner_epoch,state,
-expected_keychain_state,expected_keychain_digest,expected_file_state,expected_file_digest,
-outcome_keychain_state,outcome_keychain_digest,outcome_file_state,outcome_file_digest,
+account_instance_id,account_generation,locator_digest,owner_record,owner_epoch,state,
+expected_keychain_state,expected_keychain_digest,
+outcome_keychain_state,outcome_keychain_digest,
 terminal_status,result_category,failure_class,publication_payload,created_at,updated_at`
 
 const receiptSelectColumns = `
 account_id,operation_id,token,kind,target,intent_digest,
-account_instance_id,account_generation,locator_digest,file_locator_digest,
-expected_keychain_state,expected_keychain_digest,expected_file_state,expected_file_digest,
+account_instance_id,account_generation,locator_digest,
+expected_keychain_state,expected_keychain_digest,
 owner_record,owner_epoch,terminal_status,result_category,failure_class,
-outcome_keychain_state,outcome_keychain_digest,outcome_file_state,outcome_file_digest,
+outcome_keychain_state,outcome_keychain_digest,
 publication_payload,committed_at,acknowledged_at,expires_at`
 
 type credentialOperationQueryer interface {
@@ -1711,22 +1642,20 @@ type credentialOperationScanner interface {
 
 func scanCredentialOperation(row credentialOperationScanner) (CredentialOperation, error) {
 	var (
-		operation                                                             CredentialOperation
-		operationID, intentDigest, locatorDigest, fileLocatorDigest, ownerRaw []byte
-		expectedKeychainDigest, expectedFileDigest                            []byte
-		outcomeKeychainDigest, outcomeFileDigest                              []byte
-		outcomeKeychainState, outcomeFileState                                sql.NullString
-		terminalStatus, resultCategory, failureClass                          sql.NullString
-		publicationPayload                                                    []byte
-		createdAt, updatedAt                                                  int64
+		operation                                          CredentialOperation
+		operationID, intentDigest, locatorDigest, ownerRaw []byte
+		expectedKeychainDigest, outcomeKeychainDigest      []byte
+		outcomeKeychainState                               sql.NullString
+		terminalStatus, resultCategory, failureClass       sql.NullString
+		publicationPayload                                 []byte
+		createdAt, updatedAt                               int64
 	)
 	if err := row.Scan(
 		&operation.AccountID, &operationID, &operation.Token, &operation.Kind,
 		&operation.Target, &intentDigest, &operation.AccountInstanceID,
-		&operation.AccountGeneration, &locatorDigest, &fileLocatorDigest, &ownerRaw, &operation.OwnerEpoch,
+		&operation.AccountGeneration, &locatorDigest, &ownerRaw, &operation.OwnerEpoch,
 		&operation.State, &operation.Expected.Keychain.State, &expectedKeychainDigest,
-		&operation.Expected.File.State, &expectedFileDigest, &outcomeKeychainState,
-		&outcomeKeychainDigest, &outcomeFileState, &outcomeFileDigest,
+		&outcomeKeychainState, &outcomeKeychainDigest,
 		&terminalStatus, &resultCategory, &failureClass, &publicationPayload, &createdAt, &updatedAt,
 	); err != nil {
 		return CredentialOperation{}, err
@@ -1740,9 +1669,6 @@ func scanCredentialOperation(row credentialOperationScanner) (CredentialOperatio
 	if err := scanCredentialDigest(locatorDigest, &operation.LocatorDigest); err != nil {
 		return CredentialOperation{}, err
 	}
-	if err := scanCredentialDigest(fileLocatorDigest, &operation.FileLocatorDigest); err != nil {
-		return CredentialOperation{}, err
-	}
 	if err := decodeCredentialOwner(ownerRaw, &operation.Owner); err != nil {
 		return CredentialOperation{}, err
 	}
@@ -1751,24 +1677,14 @@ func scanCredentialOperation(row credentialOperationScanner) (CredentialOperatio
 	if err != nil {
 		return CredentialOperation{}, err
 	}
-	operation.Expected.File.Digest, err = scanOptionalCredentialDigest(expectedFileDigest)
-	if err != nil {
-		return CredentialOperation{}, err
-	}
 	operation.PublicationPayload = bytes.Clone(publicationPayload)
-	if outcomeKeychainState.Valid || outcomeFileState.Valid {
-		if !outcomeKeychainState.Valid || !outcomeFileState.Valid ||
-			!terminalStatus.Valid || !resultCategory.Valid {
+	if outcomeKeychainState.Valid {
+		if !terminalStatus.Valid || !resultCategory.Valid {
 			return CredentialOperation{}, errors.New("credential operation outcome is corrupt")
 		}
 		operation.HasOutcome = true
 		operation.Outcome.Keychain.State = CredentialSlotState(outcomeKeychainState.String)
-		operation.Outcome.File.State = CredentialSlotState(outcomeFileState.String)
 		operation.Outcome.Keychain.Digest, err = scanOptionalCredentialDigest(outcomeKeychainDigest)
-		if err != nil {
-			return CredentialOperation{}, err
-		}
-		operation.Outcome.File.Digest, err = scanOptionalCredentialDigest(outcomeFileDigest)
 		if err != nil {
 			return CredentialOperation{}, err
 		}
@@ -1778,7 +1694,7 @@ func scanCredentialOperation(row credentialOperationScanner) (CredentialOperatio
 			operation.FailureClass = CredentialFailureClass(failureClass.String)
 		}
 	} else if terminalStatus.Valid || resultCategory.Valid || failureClass.Valid ||
-		outcomeKeychainDigest != nil || outcomeFileDigest != nil {
+		outcomeKeychainDigest != nil {
 		return CredentialOperation{}, errors.New("credential operation outcome is corrupt")
 	}
 	operation.CreatedAt = time.Unix(0, createdAt)
@@ -1816,7 +1732,7 @@ func unacknowledgedCredentialWriteReceiptByAccount(
 	return scanCredentialOperationReceipt(queryer.QueryRow(
 		`SELECT `+receiptSelectColumns+` FROM credential_operation_receipts
 		 WHERE account_id=? AND acknowledged_at IS NULL AND terminal_status='succeeded'
-		 AND result_category IN ('refreshed','installed','moved')
+		 AND result_category IN ('refreshed','installed')
 		 ORDER BY committed_at,operation_id LIMIT 1`,
 		accountID,
 	))
@@ -1826,22 +1742,21 @@ func scanCredentialOperationReceipt(
 	row credentialOperationScanner,
 ) (CredentialOperationReceipt, error) {
 	var (
-		receipt                                                               CredentialOperationReceipt
-		operationID, intentDigest, locatorDigest, fileLocatorDigest, ownerRaw []byte
-		expectedKeychainDigest, expectedFileDigest                            []byte
-		outcomeKeychainDigest, outcomeFileDigest                              []byte
-		publicationPayload                                                    []byte
-		failureClass                                                          sql.NullString
-		committedAt, expiresAt                                                int64
-		acknowledgedAt                                                        sql.NullInt64
+		receipt                                            CredentialOperationReceipt
+		operationID, intentDigest, locatorDigest, ownerRaw []byte
+		expectedKeychainDigest, outcomeKeychainDigest      []byte
+		publicationPayload                                 []byte
+		failureClass                                       sql.NullString
+		committedAt, expiresAt                             int64
+		acknowledgedAt                                     sql.NullInt64
 	)
 	if err := row.Scan(
 		&receipt.AccountID, &operationID, &receipt.Token, &receipt.Kind, &receipt.Target,
 		&intentDigest, &receipt.AccountInstanceID, &receipt.AccountGeneration,
-		&locatorDigest, &fileLocatorDigest, &receipt.Expected.Keychain.State, &expectedKeychainDigest,
-		&receipt.Expected.File.State, &expectedFileDigest, &ownerRaw, &receipt.OwnerEpoch,
+		&locatorDigest, &receipt.Expected.Keychain.State, &expectedKeychainDigest,
+		&ownerRaw, &receipt.OwnerEpoch,
 		&receipt.TerminalStatus, &receipt.Result, &failureClass, &receipt.Outcome.Keychain.State,
-		&outcomeKeychainDigest, &receipt.Outcome.File.State, &outcomeFileDigest,
+		&outcomeKeychainDigest,
 		&publicationPayload, &committedAt, &acknowledgedAt, &expiresAt,
 	); err != nil {
 		return CredentialOperationReceipt{}, err
@@ -1855,9 +1770,6 @@ func scanCredentialOperationReceipt(
 	if err := scanCredentialDigest(locatorDigest, &receipt.LocatorDigest); err != nil {
 		return CredentialOperationReceipt{}, err
 	}
-	if err := scanCredentialDigest(fileLocatorDigest, &receipt.FileLocatorDigest); err != nil {
-		return CredentialOperationReceipt{}, err
-	}
 	if err := decodeCredentialOwner(ownerRaw, &receipt.Owner); err != nil {
 		return CredentialOperationReceipt{}, err
 	}
@@ -1866,15 +1778,7 @@ func scanCredentialOperationReceipt(
 	if err != nil {
 		return CredentialOperationReceipt{}, err
 	}
-	receipt.Expected.File.Digest, err = scanOptionalCredentialDigest(expectedFileDigest)
-	if err != nil {
-		return CredentialOperationReceipt{}, err
-	}
 	receipt.Outcome.Keychain.Digest, err = scanOptionalCredentialDigest(outcomeKeychainDigest)
-	if err != nil {
-		return CredentialOperationReceipt{}, err
-	}
-	receipt.Outcome.File.Digest, err = scanOptionalCredentialDigest(outcomeFileDigest)
 	if err != nil {
 		return CredentialOperationReceipt{}, err
 	}
@@ -1902,22 +1806,20 @@ func insertCredentialOperationReceipt(
 	}
 	_, err := tx.Exec(
 		`INSERT INTO credential_operation_receipts(
-		 operation_id,token,account_id,account_instance_id,account_generation,locator_digest,file_locator_digest,
+		 operation_id,token,account_id,account_instance_id,account_generation,locator_digest,
 		 kind,target,intent_digest,
-		 expected_keychain_state,expected_keychain_digest,expected_file_state,expected_file_digest,
+		 expected_keychain_state,expected_keychain_digest,
 		 owner_record,owner_epoch,terminal_status,result_category,failure_class,
-		 outcome_keychain_state,outcome_keychain_digest,outcome_file_state,outcome_file_digest,
+		 outcome_keychain_state,outcome_keychain_digest,
 		 publication_payload,committed_at,acknowledged_at,expires_at
-		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		receipt.OperationID[:], receipt.Token, receipt.AccountID, receipt.AccountInstanceID,
-		receipt.AccountGeneration, receipt.LocatorDigest[:], receipt.FileLocatorDigest[:], receipt.Kind, receipt.Target,
+		receipt.AccountGeneration, receipt.LocatorDigest[:], receipt.Kind, receipt.Target,
 		receipt.IntentDigest[:], receipt.Expected.Keychain.State,
-		credentialDigestValue(receipt.Expected.Keychain.Digest), receipt.Expected.File.State,
-		credentialDigestValue(receipt.Expected.File.Digest), mustEncodeCredentialOwner(receipt.Owner),
+		credentialDigestValue(receipt.Expected.Keychain.Digest), mustEncodeCredentialOwner(receipt.Owner),
 		receipt.OwnerEpoch, receipt.TerminalStatus, receipt.Result,
 		credentialFailureClassValue(receipt.FailureClass), receipt.Outcome.Keychain.State,
-		credentialDigestValue(receipt.Outcome.Keychain.Digest), receipt.Outcome.File.State,
-		credentialDigestValue(receipt.Outcome.File.Digest), credentialPublicationPayloadValue(receipt.PublicationPayload),
+		credentialDigestValue(receipt.Outcome.Keychain.Digest), credentialPublicationPayloadValue(receipt.PublicationPayload),
 		receipt.CommittedAt.UnixNano(),
 		nil, receipt.ExpiresAt.UnixNano(),
 	)
@@ -1938,8 +1840,7 @@ func receiptFromOperation(
 		Token: operation.Token, Kind: operation.Kind, Target: operation.Target,
 		IntentDigest: operation.IntentDigest, AccountInstanceID: operation.AccountInstanceID,
 		AccountGeneration: operation.AccountGeneration, LocatorDigest: operation.LocatorDigest,
-		FileLocatorDigest: operation.FileLocatorDigest,
-		Expected:          operation.Expected, Owner: operation.Owner, OwnerEpoch: operation.OwnerEpoch,
+		Expected: operation.Expected, Owner: operation.Owner, OwnerEpoch: operation.OwnerEpoch,
 		TerminalStatus: status, Result: result, FailureClass: failure, Outcome: outcome,
 		PublicationPayload: bytes.Clone(publicationPayload),
 		CommittedAt:        committedAt, ExpiresAt: expiresAt,
@@ -1951,21 +1852,20 @@ func credentialQuarantine(
 	accountID int,
 ) (CredentialQuarantine, error) {
 	var (
-		quarantine                       CredentialQuarantine
-		locatorDigest, fileLocatorDigest []byte
-		keychainDigest, fileDigest       []byte
-		tokenChainDigest                 []byte
-		createdAt                        int64
+		quarantine                    CredentialQuarantine
+		locatorDigest, keychainDigest []byte
+		tokenChainDigest              []byte
+		createdAt                     int64
 	)
 	err := queryer.QueryRow(
-		`SELECT account_id,account_instance_id,account_generation,locator_digest,file_locator_digest,
+		`SELECT account_id,account_instance_id,account_generation,locator_digest,
 		 observation_keychain_state,observation_keychain_digest,
-		 observation_file_state,observation_file_digest,token_chain_digest,reason,failure_class,created_at
+		 token_chain_digest,reason,failure_class,created_at
 		 FROM credential_quarantines WHERE account_id=?`, accountID,
 	).Scan(
 		&quarantine.AccountID, &quarantine.AccountInstanceID, &quarantine.AccountGeneration,
-		&locatorDigest, &fileLocatorDigest, &quarantine.Observation.Keychain.State, &keychainDigest,
-		&quarantine.Observation.File.State, &fileDigest, &tokenChainDigest, &quarantine.Reason,
+		&locatorDigest, &quarantine.Observation.Keychain.State, &keychainDigest,
+		&tokenChainDigest, &quarantine.Reason,
 		&quarantine.FailureClass, &createdAt,
 	)
 	if err != nil {
@@ -1974,14 +1874,7 @@ func credentialQuarantine(
 	if err := scanCredentialDigest(locatorDigest, &quarantine.LocatorDigest); err != nil {
 		return CredentialQuarantine{}, err
 	}
-	if err := scanCredentialDigest(fileLocatorDigest, &quarantine.FileLocatorDigest); err != nil {
-		return CredentialQuarantine{}, err
-	}
 	quarantine.Observation.Keychain.Digest, err = scanOptionalCredentialDigest(keychainDigest)
-	if err != nil {
-		return CredentialQuarantine{}, err
-	}
-	quarantine.Observation.File.Digest, err = scanOptionalCredentialDigest(fileDigest)
 	if err != nil {
 		return CredentialQuarantine{}, err
 	}
@@ -1991,7 +1884,7 @@ func credentialQuarantine(
 	}
 	quarantine.CreatedAt = time.Unix(0, createdAt)
 	if quarantine.AccountID <= 0 || quarantine.AccountGeneration == 0 ||
-		quarantine.LocatorDigest.zero() || quarantine.FileLocatorDigest.zero() ||
+		quarantine.LocatorDigest.zero() ||
 		!quarantine.Reason.quarantine() || !quarantine.FailureClass.quarantine() ||
 		createdAt <= 0 {
 		return CredentialQuarantine{}, errors.New("credential quarantine is corrupt")
@@ -2009,7 +1902,7 @@ func upsertCredentialQuarantine(tx *sql.Tx, quarantine CredentialQuarantine) err
 	if !quarantine.Reason.quarantine() || !quarantine.FailureClass.quarantine() || quarantine.AccountID <= 0 ||
 		validateAccountInstanceID(quarantine.AccountInstanceID) != nil ||
 		quarantine.AccountGeneration == 0 || quarantine.LocatorDigest.zero() ||
-		quarantine.FileLocatorDigest.zero() || quarantine.CreatedAt.IsZero() {
+		quarantine.CreatedAt.IsZero() {
 		return errors.New("credential quarantine reason is invalid")
 	}
 	if err := quarantine.Observation.validate(); err != nil {
@@ -2017,15 +1910,15 @@ func upsertCredentialQuarantine(tx *sql.Tx, quarantine CredentialQuarantine) err
 	}
 	if _, err := tx.Exec(
 		`INSERT INTO credential_quarantines(
-		 account_id,account_instance_id,account_generation,locator_digest,file_locator_digest,
+		 account_id,account_instance_id,account_generation,locator_digest,
 		 observation_keychain_state,observation_keychain_digest,
-		 observation_file_state,observation_file_digest,token_chain_digest,reason,failure_class,created_at
-		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 token_chain_digest,reason,failure_class,created_at
+		) VALUES(?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(account_id) DO NOTHING`,
 		quarantine.AccountID, quarantine.AccountInstanceID, quarantine.AccountGeneration,
-		quarantine.LocatorDigest[:], quarantine.FileLocatorDigest[:], quarantine.Observation.Keychain.State,
-		credentialDigestValue(quarantine.Observation.Keychain.Digest), quarantine.Observation.File.State,
-		credentialDigestValue(quarantine.Observation.File.Digest), credentialDigestValue(quarantine.TokenChainDigest),
+		quarantine.LocatorDigest[:], quarantine.Observation.Keychain.State,
+		credentialDigestValue(quarantine.Observation.Keychain.Digest),
+		credentialDigestValue(quarantine.TokenChainDigest),
 		quarantine.Reason, quarantine.FailureClass,
 		quarantine.CreatedAt.UnixNano(),
 	); err != nil {
@@ -2044,7 +1937,7 @@ func upsertCredentialQuarantine(tx *sql.Tx, quarantine CredentialQuarantine) err
 func validateCredentialOperationRequest(request BeginCredentialOperationRequest) error {
 	if request.AccountID <= 0 || request.AccountGeneration == 0 ||
 		request.OperationID.zero() || request.LocatorDigest.zero() ||
-		request.FileLocatorDigest.zero() || request.IntentDigest.zero() ||
+		request.IntentDigest.zero() ||
 		!validCredentialKindTarget(request.Kind, request.Target) {
 		return errors.New("credential operation request identity is invalid")
 	}
@@ -2073,7 +1966,7 @@ func validateCredentialOperationRequest(request BeginCredentialOperationRequest)
 func validateCredentialOperation(operation CredentialOperation) error {
 	if operation.AccountID <= 0 || operation.OperationID.zero() || operation.IntentDigest.zero() ||
 		operation.AccountGeneration == 0 || operation.LocatorDigest.zero() ||
-		operation.FileLocatorDigest.zero() || operation.OwnerEpoch == 0 ||
+		operation.OwnerEpoch == 0 ||
 		!validCredentialKindTarget(operation.Kind, operation.Target) || !operation.State.valid() {
 		return errors.New("credential operation is corrupt")
 	}
@@ -2125,7 +2018,7 @@ func validateCredentialOperation(operation CredentialOperation) error {
 func validateCredentialReceipt(receipt CredentialOperationReceipt) error {
 	if receipt.AccountID <= 0 || receipt.OperationID.zero() || receipt.IntentDigest.zero() ||
 		receipt.AccountGeneration == 0 || receipt.LocatorDigest.zero() ||
-		receipt.FileLocatorDigest.zero() || receipt.OwnerEpoch == 0 ||
+		receipt.OwnerEpoch == 0 ||
 		!validCredentialKindTarget(receipt.Kind, receipt.Target) {
 		return errors.New("credential operation receipt is corrupt")
 	}
@@ -2186,7 +2079,7 @@ func validateCredentialPublicationPayload(
 
 func credentialResultPublishesWrite(result CredentialResultCategory) bool {
 	switch result {
-	case CredentialResultRefreshed, CredentialResultInstalled, CredentialResultMoved:
+	case CredentialResultRefreshed, CredentialResultInstalled:
 		return true
 	default:
 		return false
@@ -2239,15 +2132,12 @@ func validateCredentialTerminal(
 	}
 	valid := false
 	switch kind {
-	case CredentialOperationMove:
-		valid = result == CredentialResultMoved || result == CredentialResultAlreadyTarget ||
-			result == CredentialResultCleanedStray
 	case CredentialOperationEnsureFresh, CredentialOperationRefreshCurrent:
 		valid = result == CredentialResultUnchanged || result == CredentialResultRefreshed ||
 			result == CredentialResultNeedsLogin || result == CredentialResultNoTokens
 	case CredentialOperationInstallSynced:
 		valid = result == CredentialResultInstalled || result == CredentialResultSkipped
-	case CredentialOperationAdoptRotated, CredentialOperationDropDivergent:
+	case CredentialOperationAdoptRotated:
 		valid = result == CredentialResultDone
 	case CredentialOperationCompensate:
 		valid = result == CredentialResultDone
@@ -2285,9 +2175,6 @@ func (state CredentialExternalState) validate() error {
 	if err := state.Keychain.validate(); err != nil {
 		return fmt.Errorf("credential keychain observation: %w", err)
 	}
-	if err := state.File.validate(); err != nil {
-		return fmt.Errorf("credential file observation: %w", err)
-	}
 	return nil
 }
 
@@ -2318,31 +2205,22 @@ func (state CredentialOperationState) valid() bool {
 
 func (kind CredentialOperationKind) valid() bool {
 	switch kind {
-	case CredentialOperationMove, CredentialOperationEnsureFresh,
+	case CredentialOperationEnsureFresh,
 		CredentialOperationRefreshCurrent, CredentialOperationInstallSynced,
-		CredentialOperationAdoptRotated, CredentialOperationDropDivergent,
-		CredentialOperationCompensate:
+		CredentialOperationAdoptRotated, CredentialOperationCompensate:
 		return true
 	default:
 		return false
 	}
 }
 
-func (target CredentialTarget) valid() bool {
-	return target == CredentialTargetKeychain || target == CredentialTargetFile ||
-		target == CredentialTargetAll
-}
+func (target CredentialTarget) valid() bool { return target == CredentialTargetKeychain }
 
 func validCredentialKindTarget(kind CredentialOperationKind, target CredentialTarget) bool {
 	if !kind.valid() || !target.valid() {
 		return false
 	}
-	if kind == CredentialOperationCompensate ||
-		kind == CredentialOperationEnsureFresh ||
-		kind == CredentialOperationRefreshCurrent {
-		return target == CredentialTargetAll
-	}
-	return target != CredentialTargetAll
+	return target == CredentialTargetKeychain
 }
 
 func (result CredentialResultCategory) quarantine() bool {
@@ -2393,8 +2271,7 @@ func operationIdentityMatchesRequest(
 ) bool {
 	return operation.AccountInstanceID == request.AccountInstanceID &&
 		operation.AccountGeneration == request.AccountGeneration &&
-		operation.LocatorDigest == request.LocatorDigest &&
-		operation.FileLocatorDigest == request.FileLocatorDigest
+		operation.LocatorDigest == request.LocatorDigest
 }
 
 func credentialOperationMatchesRequest(
@@ -2417,7 +2294,6 @@ func credentialReceiptMatchesRequest(
 		receipt.AccountInstanceID == request.AccountInstanceID &&
 		receipt.AccountGeneration == request.AccountGeneration &&
 		receipt.LocatorDigest == request.LocatorDigest &&
-		receipt.FileLocatorDigest == request.FileLocatorDigest &&
 		receipt.Kind == request.Kind && receipt.Target == request.Target &&
 		receipt.IntentDigest == request.IntentDigest &&
 		sameCredentialExternalState(receipt.Expected, request.Expected)
@@ -2429,15 +2305,15 @@ func credentialAccountMatchesRequest(
 ) error {
 	err := credentialAccountMatchesIdentity(
 		queryer, request.AccountID, request.AccountInstanceID,
-		request.AccountGeneration, request.LocatorDigest, request.FileLocatorDigest,
+		request.AccountGeneration, request.LocatorDigest,
 	)
 	if err == nil || !errors.Is(err, sql.ErrNoRows) ||
-		request.Kind != CredentialOperationCompensate || request.Target != CredentialTargetAll {
+		request.Kind != CredentialOperationCompensate || request.Target != CredentialTargetKeychain {
 		return err
 	}
 	return credentialPendingAddCompensationMatches(
 		queryer, request.AccountID, request.AccountInstanceID, request.AccountGeneration,
-		request.LocatorDigest, request.FileLocatorDigest, request.Expected, request.IntentDigest,
+		request.LocatorDigest, request.Expected, request.IntentDigest,
 	)
 }
 
@@ -2447,15 +2323,15 @@ func credentialAccountMatchesOperation(
 ) error {
 	err := credentialAccountMatchesIdentity(
 		queryer, operation.AccountID, operation.AccountInstanceID,
-		operation.AccountGeneration, operation.LocatorDigest, operation.FileLocatorDigest,
+		operation.AccountGeneration, operation.LocatorDigest,
 	)
 	if err == nil || !errors.Is(err, sql.ErrNoRows) ||
-		operation.Kind != CredentialOperationCompensate || operation.Target != CredentialTargetAll {
+		operation.Kind != CredentialOperationCompensate || operation.Target != CredentialTargetKeychain {
 		return err
 	}
 	return credentialPendingAddCompensationMatches(
 		queryer, operation.AccountID, operation.AccountInstanceID, operation.AccountGeneration,
-		operation.LocatorDigest, operation.FileLocatorDigest, operation.Expected, operation.IntentDigest,
+		operation.LocatorDigest, operation.Expected, operation.IntentDigest,
 	)
 }
 
@@ -2465,7 +2341,6 @@ func credentialPendingAddCompensationMatches(
 	instanceID string,
 	generation uint64,
 	locator CredentialDigest,
-	fileLocator CredentialDigest,
 	expected CredentialExternalState,
 	intent CredentialDigest,
 ) error {
@@ -2491,9 +2366,7 @@ func credentialPendingAddCompensationMatches(
 		mutation.AccountInstanceID != instanceID || mutation.AccountGeneration != generation ||
 		!mutation.CredentialWritten || mutation.WrittenCredentialDigest != expectedDigest ||
 		mutation.LocatorDigest != locator ||
-		credentialCompositeLocatorDigest(
-			mutation.KeychainService, mutation.KeychainAccount, fileLocator,
-		) != locator ||
+		CredentialKeychainLocatorDigest(mutation.KeychainService, mutation.KeychainAccount) != locator ||
 		credentialCompensationIntentDigest(mutation.WrittenCredentialDigest) != intent {
 		return ErrAccountGenerationChanged
 	}
@@ -2516,7 +2389,6 @@ func credentialAccountMatchesIdentity(
 	instanceID string,
 	generation uint64,
 	locator CredentialDigest,
-	fileLocator CredentialDigest,
 ) error {
 	var currentInstance, service, account string
 	var currentGeneration uint64
@@ -2528,7 +2400,7 @@ func credentialAccountMatchesIdentity(
 		return errors.Join(ErrAccountGenerationChanged, err)
 	}
 	if currentInstance != instanceID || currentGeneration != generation ||
-		credentialCompositeLocatorDigest(service, account, fileLocator) != locator {
+		CredentialKeychainLocatorDigest(service, account) != locator {
 		return ErrAccountGenerationChanged
 	}
 	return nil
@@ -2637,8 +2509,7 @@ func (operationID CredentialOperationID) zero() bool {
 }
 
 func sameCredentialExternalState(left, right CredentialExternalState) bool {
-	return sameCredentialSlot(left.Keychain, right.Keychain) &&
-		sameCredentialSlot(left.File, right.File)
+	return sameCredentialSlot(left.Keychain, right.Keychain)
 }
 
 func sameCredentialSlot(left, right CredentialSlotObservation) bool {
@@ -2658,7 +2529,6 @@ func sameCredentialQuarantineIdentity(left, right CredentialQuarantine) bool {
 		left.AccountInstanceID == right.AccountInstanceID &&
 		left.AccountGeneration == right.AccountGeneration &&
 		left.LocatorDigest == right.LocatorDigest &&
-		left.FileLocatorDigest == right.FileLocatorDigest &&
 		sameCredentialExternalState(left.Observation, right.Observation) &&
 		left.Reason == right.Reason && left.FailureClass == right.FailureClass &&
 		left.CreatedAt.Equal(right.CreatedAt)
@@ -2673,7 +2543,7 @@ func sameOptionalCredentialDigest(left, right *CredentialDigest) bool {
 
 func validateCredentialQuarantineValue(quarantine CredentialQuarantine) error {
 	if quarantine.AccountID <= 0 || quarantine.AccountGeneration == 0 ||
-		quarantine.LocatorDigest.zero() || quarantine.FileLocatorDigest.zero() ||
+		quarantine.LocatorDigest.zero() ||
 		!quarantine.Reason.quarantine() || !quarantine.FailureClass.quarantine() ||
 		quarantine.CreatedAt.IsZero() {
 		return errors.New("credential quarantine is invalid")

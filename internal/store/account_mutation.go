@@ -165,7 +165,6 @@ type AccountMutationReceipt struct {
 	CommittedAt              time.Time
 	AcknowledgedAt           time.Time
 	ExpiresAt                time.Time
-	QuarantineFileLocator    CredentialDigest
 	QuarantineReason         CredentialResultCategory
 	HasQuarantine            bool
 	Resolution               AccountMutationResolution
@@ -175,9 +174,8 @@ type AccountMutationReceipt struct {
 
 // AccountMutationQuarantine records the exact unsafe external observation.
 type AccountMutationQuarantine struct {
-	FileLocatorDigest CredentialDigest
-	Observation       CredentialExternalState
-	Reason            CredentialResultCategory
+	Observation CredentialExternalState
+	Reason      CredentialResultCategory
 }
 
 // AccountMutationResolution is one explicit audited terminal recovery result.
@@ -1435,8 +1433,7 @@ func (s *Store) ResolveAccountMutation(
 		if err := upsertCredentialQuarantine(tx, CredentialQuarantine{
 			AccountID: mutation.AccountID, AccountInstanceID: mutation.AccountInstanceID,
 			AccountGeneration: mutation.AccountGeneration, LocatorDigest: mutation.LocatorDigest,
-			FileLocatorDigest: quarantine.FileLocatorDigest,
-			Observation:       quarantine.Observation, Reason: quarantine.Reason,
+			Observation: quarantine.Observation, Reason: quarantine.Reason,
 			FailureClass: CredentialFailureInternal, CreatedAt: now,
 		}); err != nil {
 			return AccountMutationReceipt{}, err
@@ -1485,7 +1482,7 @@ func validateAccountMutationQuarantine(
 	outcome CredentialDigest,
 	quarantine AccountMutationQuarantine,
 ) error {
-	if quarantine.FileLocatorDigest.zero() || !quarantine.Reason.quarantine() {
+	if !quarantine.Reason.quarantine() {
 		return ErrAccountMutationState
 	}
 	if err := quarantine.Observation.validate(); err != nil {
@@ -1495,8 +1492,8 @@ func validateAccountMutationQuarantine(
 	if err != nil {
 		return err
 	}
-	if observedDigest != outcome || credentialCompositeLocatorDigest(
-		mutation.KeychainService, mutation.KeychainAccount, quarantine.FileLocatorDigest,
+	if observedDigest != outcome || CredentialKeychainLocatorDigest(
+		mutation.KeychainService, mutation.KeychainAccount,
 	) != mutation.LocatorDigest {
 		return ErrAccountMutationState
 	}
@@ -1530,7 +1527,6 @@ func (s *Store) ResolveQuarantinedAdd(
 		receipt.AccountInstanceID != request.Quarantine.AccountInstanceID ||
 		receipt.AccountGeneration != request.Quarantine.AccountGeneration ||
 		receipt.LocatorDigest != request.Quarantine.LocatorDigest || !receipt.HasQuarantine ||
-		receipt.QuarantineFileLocator != request.Quarantine.FileLocatorDigest ||
 		receipt.QuarantineReason != request.Quarantine.Reason {
 		return ErrAccountMutationState
 	}
@@ -1900,7 +1896,7 @@ func scanAccountMutation(row interface{ Scan(...any) error }) (AccountMutation, 
 const accountMutationReceiptColumns = `operation_id,account_id,kind,registry_sequence,
  account_instance_id,account_generation,locator_digest,expected_credential_digest,intent_digest,
  input_digest,written_credential_digest,credential_written,outcome_digest,terminal,
- quarantine_file_locator_digest,quarantine_reason,resolution,resolution_observed_digest,resolved_at,
+ quarantine_reason,resolution,resolution_observed_digest,resolved_at,
  config_dir,keychain_service,keychain_account,label,account_uuid,owner_record,owner_epoch,
  proof_catalog_tenant_id,proof_catalog_generation,proof_requested,proof_desired,proof_observed,
  proof_verified,proof_applied,proof_source_authority,proof_source_revision,proof_catalog_revision,
@@ -1924,7 +1920,7 @@ func scanAccountMutationReceipt(row interface{ Scan(...any) error }) (AccountMut
 	var receipt AccountMutationReceipt
 	var operationID, locator, expected, intent, input, written, outcome, owner []byte
 	var previousLocator, previousCredential []byte
-	var quarantineFileLocator, resolutionObserved []byte
+	var resolutionObserved []byte
 	var credentialWritten int
 	var committedAt, expiresAt int64
 	var acknowledgedAt, resolvedAt sql.NullInt64
@@ -1933,7 +1929,7 @@ func scanAccountMutationReceipt(row interface{ Scan(...any) error }) (AccountMut
 		&operationID, &receipt.AccountID, &receipt.Kind, &receipt.RegistrySequence,
 		&receipt.AccountInstanceID, &receipt.AccountGeneration, &locator, &expected, &intent,
 		&input, &written, &credentialWritten, &outcome, &receipt.Terminal,
-		&quarantineFileLocator, &quarantineReason, &resolution, &resolutionObserved, &resolvedAt,
+		&quarantineReason, &resolution, &resolutionObserved, &resolvedAt,
 		&receipt.ConfigDir,
 		&receipt.KeychainService, &receipt.KeychainAccount, &receipt.Label, &receipt.AccountUUID,
 		&owner, &receipt.OwnerEpoch,
@@ -1980,15 +1976,9 @@ func scanAccountMutationReceipt(row interface{ Scan(...any) error }) (AccountMut
 		copy(receipt.WrittenCredentialDigest[:], written)
 	}
 	copy(receipt.OutcomeDigest[:], outcome)
-	if quarantineFileLocator != nil {
-		if len(quarantineFileLocator) != 32 || !quarantineReason.Valid {
-			return receipt, ErrAccountMutationState
-		}
-		copy(receipt.QuarantineFileLocator[:], quarantineFileLocator)
+	if quarantineReason.Valid {
 		receipt.QuarantineReason = CredentialResultCategory(quarantineReason.String)
 		receipt.HasQuarantine = true
-	} else if quarantineReason.Valid {
-		return receipt, ErrAccountMutationState
 	}
 	if resolution.Valid || resolutionObserved != nil || resolvedAt.Valid {
 		if !resolution.Valid || len(resolutionObserved) != 32 || !resolvedAt.Valid {
@@ -2033,9 +2023,8 @@ func insertAccountMutationReceipt(
 	if mutation.HasInput {
 		input = mutation.InputDigest[:]
 	}
-	var quarantineFileLocator, quarantineReason any
+	var quarantineReason any
 	if quarantine != nil {
-		quarantineFileLocator = quarantine.FileLocatorDigest[:]
 		quarantineReason = quarantine.Reason
 	}
 	_, err := tx.Exec(
@@ -2043,7 +2032,7 @@ func insertAccountMutationReceipt(
 		 operation_id,account_id,kind,registry_sequence,
 		 account_instance_id,account_generation,locator_digest,expected_credential_digest,intent_digest,
 		 input_digest,written_credential_digest,credential_written,outcome_digest,terminal,
-		 quarantine_file_locator_digest,quarantine_reason,resolution,resolution_observed_digest,resolved_at,
+		 quarantine_reason,resolution,resolution_observed_digest,resolved_at,
 		 config_dir,keychain_service,keychain_account,label,account_uuid,owner_record,owner_epoch,
 		 proof_catalog_tenant_id,proof_catalog_generation,proof_requested,proof_desired,proof_observed,
 		 proof_verified,proof_applied,proof_source_authority,proof_source_revision,proof_catalog_revision,
@@ -2052,11 +2041,11 @@ func insertAccountMutationReceipt(
 		 previous_config_dir,previous_keychain_service,previous_keychain_account,
 		 previous_locator_digest,previous_credential_digest,
 		 committed_at,acknowledged_at,expires_at
-		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)`,
+		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)`,
 		mutation.OperationID[:], mutation.AccountID, mutation.Kind, mutation.RegistrySequence,
 		mutation.AccountInstanceID, mutation.AccountGeneration, mutation.LocatorDigest[:],
 		mutation.ExpectedCredentialDigest[:], mutation.IntentDigest[:], input, written, mutation.CredentialWritten,
-		outcome[:], terminal, quarantineFileLocator, quarantineReason,
+		outcome[:], terminal, quarantineReason,
 		mutation.ConfigDir, mutation.KeychainService, mutation.KeychainAccount,
 		mutation.Label, mutation.AccountUUID, mustEncodeCredentialOwner(mutation.Owner), mutation.OwnerEpoch,
 		mutation.PresentationProof.CatalogTenantID, mutation.PresentationProof.CatalogGeneration,
@@ -2224,8 +2213,7 @@ func validateAccountMutationReceipt(receipt AccountMutationReceipt) error {
 		return ErrAccountMutationState
 	}
 	if (receipt.Terminal == AccountMutationQuarantined) != receipt.HasQuarantine ||
-		(receipt.HasQuarantine &&
-			(receipt.QuarantineFileLocator.zero() || !receipt.QuarantineReason.quarantine())) {
+		(receipt.HasQuarantine && !receipt.QuarantineReason.quarantine()) {
 		return ErrAccountMutationState
 	}
 	if receipt.ResolvedAt.IsZero() {
