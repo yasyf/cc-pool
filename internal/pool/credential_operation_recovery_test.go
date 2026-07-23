@@ -1147,39 +1147,40 @@ func TestCredentialQuarantineGatesEveryMutation(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		run  func() error
+		want error
 	}{
 		{"adopt-rotated", func() error {
 			return manager.AdoptRotatedToken(t.Context(), account)
-		}},
+		}, ErrCredentialOperationQuarantined},
 		{"install-synced", func() error {
 			_, err := manager.InstallSyncedCredential(t.Context(), account, syncedCredential)
 			return err
-		}},
+		}, ErrCredentialOperationQuarantined},
 		{"ensure-fresh", func() error {
 			_, _, err := manager.EnsureFreshToken(t.Context(), account, 0, false)
 			return err
-		}},
+		}, ErrCredentialOperationQuarantined},
 		{"refresh-current", func() error {
 			_, err := manager.refreshCurrentCredentialOperation(
 				t.Context(), account, creds.SourceKeychain, owned,
 			)
 			return err
-		}},
+		}, ErrCredentialOperationQuarantined},
 		{"compensate", func() error {
 			return manager.CompensateCredentialState(t.Context(), account, actualDigest)
-		}},
+		}, ErrCredentialOperationQuarantined},
 		{"remove-account", func() error {
 			removal, err := manager.Store.BeginAccountRemoval(account.ID, true)
 			if err != nil {
 				return err
 			}
 			return manager.FinishAccountRemoval(t.Context(), removal)
-		}},
+		}, store.ErrCredentialOperationEvidenceActive},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.run()
-			if !errors.Is(err, ErrCredentialOperationQuarantined) {
-				t.Fatalf("quarantined %s = %v, want quarantine", tc.name, err)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("quarantined %s = %v, want %v", tc.name, err, tc.want)
 			}
 		})
 	}
