@@ -170,7 +170,7 @@ func (state CredentialExternalState) Digest() (CredentialDigest, error) {
 		return CredentialDigest{}, err
 	}
 	hash := sha256.New()
-	writeCredentialHashField(hash, []byte("cc-pool:credential-external-state:v1"))
+	writeCredentialHashField(hash, []byte("cc-pool:keychain-credential-external-state:v1"))
 	writeCredentialHashField(hash, []byte(state.Keychain.State))
 	if state.Keychain.Digest == nil {
 		writeCredentialHashField(hash, nil)
@@ -203,7 +203,7 @@ func NewCredentialOperationID(
 		return CredentialOperationID{}, err
 	}
 	hash := sha256.New()
-	writeCredentialHashField(hash, []byte("cc-pool:credential-operation:v1"))
+	writeCredentialHashField(hash, []byte("cc-pool:keychain-credential-operation:v1"))
 	writeCredentialHashField(hash, []byte(accountInstanceID))
 	var generation [8]byte
 	binary.BigEndian.PutUint64(generation[:], accountGeneration)
