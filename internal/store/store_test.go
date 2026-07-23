@@ -271,9 +271,7 @@ func TestOpenRejectsFutureSchemaWithoutMutation(t *testing.T) {
 func TestAccountCRUD(t *testing.T) {
 	s := openTest(t)
 	a := Account{ID: 1, ConfigDir: "/home/.cc-pool/accounts/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "work"}
-	if err := s.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	admitTestAccount(t, s, a)
 	got, err := s.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
@@ -282,7 +280,7 @@ func TestAccountCRUD(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 	a.Label = "renamed"
-	if err := s.UpsertAccount(a); err != nil {
+	if err := s.SetAccountLabel(a.ID, a.Label); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = s.GetAccount(1)
@@ -298,46 +296,19 @@ func TestAccountCRUD(t *testing.T) {
 func TestAccountInstanceIdentityIsImmutableAndGenerationTracksTenantShape(t *testing.T) {
 	s := openTest(t)
 	a := Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc-1", KeychainAccount: "acct-1"}
-	if err := s.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
-	first, err := s.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	first := admitTestAccount(t, s, a)
 	if len(first.InstanceID) != 32 || first.Generation != 1 {
 		t.Fatalf("initial identity = %q/%d", first.InstanceID, first.Generation)
 	}
 
-	a.InstanceID = "ffffffffffffffffffffffffffffffff"
-	a.Generation = 99
-	a.Label = "renamed"
-	a.KeychainService = "svc-2"
-	if err := s.UpsertAccount(a); err != nil {
+	if err := s.SetAccountLabel(a.ID, "renamed"); err != nil {
 		t.Fatal(err)
 	}
 	metadataOnly, _ := s.GetAccount(1)
 	if metadataOnly.InstanceID != first.InstanceID || metadataOnly.Generation != 1 {
 		t.Fatalf("metadata update changed identity = %q/%d, want %q/1", metadataOnly.InstanceID, metadataOnly.Generation, first.InstanceID)
 	}
-
-	a.ConfigDir = "/acct-01-replaced"
-	if err := s.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
-	reshaped, _ := s.GetAccount(1)
-	if reshaped.InstanceID != first.InstanceID || reshaped.Generation != 2 {
-		t.Fatalf("config-dir replacement identity = %q/%d, want %q/2", reshaped.InstanceID, reshaped.Generation, first.InstanceID)
-	}
-	final, _ := s.GetAccount(1)
-	if final.InstanceID != first.InstanceID || final.Generation != 2 {
-		t.Fatalf("final identity = %q/%d, want %q/2", final.InstanceID, final.Generation, first.InstanceID)
-	}
-
-	if err := s.UpsertAccount(Account{ID: 2, ConfigDir: "/acct-02", KeychainService: "svc-2", KeychainAccount: "acct-2"}); err != nil {
-		t.Fatal(err)
-	}
-	second, _ := s.GetAccount(2)
+	second := admitTestAccount(t, s, Account{ID: 2, ConfigDir: "/acct-02", KeychainService: "svc-2", KeychainAccount: "acct-2"})
 	if second.InstanceID == first.InstanceID {
 		t.Fatalf("two accounts share instance id %q", first.InstanceID)
 	}
@@ -346,12 +317,8 @@ func TestAccountInstanceIdentityIsImmutableAndGenerationTracksTenantShape(t *tes
 func TestActivateSelectionRejectsGenerationChangeAtomically(t *testing.T) {
 	s := openTest(t)
 	account := Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"}
-	if err := s.UpsertAccount(account); err != nil {
-		t.Fatal(err)
-	}
-	reserved, _ := s.GetAccount(1)
-	account.ConfigDir = "/acct-01-replaced"
-	if err := s.UpsertAccount(account); err != nil {
+	reserved := admitTestAccount(t, s, account)
+	if _, err := s.db.Exec(`UPDATE accounts SET generation=generation+1 WHERE id=?`, account.ID); err != nil {
 		t.Fatal(err)
 	}
 	err := s.ActivateSelection(SelectionActivation{
@@ -375,11 +342,9 @@ func TestSelectionTerminalReplayAndExpiry(t *testing.T) {
 	s := openTest(t)
 	now := time.Unix(1_700_000_000, 0)
 	s.now = func() time.Time { return now }
-	if err := s.UpsertAccount(Account{
+	admitTestAccount(t, s, Account{
 		ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	a, _ := s.GetAccount(1)
 	activation := SelectionActivation{
 		Token: "00000000000000000000000000000001", AccountID: 1,
@@ -412,11 +377,9 @@ func TestSelectionTerminalRetentionIsDeterministicallyBounded(t *testing.T) {
 	s := openTest(t)
 	now := time.Unix(1_700_000_000, 0)
 	s.now = func() time.Time { return now }
-	if err := s.UpsertAccount(Account{
+	admitTestAccount(t, s, Account{
 		ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	a, _ := s.GetAccount(1)
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -478,9 +441,7 @@ func TestCurrentSchemaRejectsInvalidIdentityRows(t *testing.T) {
 			}
 		})
 	}
-	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "/acct", KeychainService: "svc", KeychainAccount: "user"}); err != nil {
-		t.Fatal(err)
-	}
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "/acct", KeychainService: "svc", KeychainAccount: "user"})
 	a, _ := s.GetAccount(1)
 	sessionInsert := `INSERT INTO sessions(account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at) VALUES(?,?,?,?,?,?,?,?)`
 	for name, args := range map[string][]any{
@@ -502,9 +463,7 @@ func TestCurrentSchemaRejectsInvalidIdentityRows(t *testing.T) {
 func TestSetAccountLabel(t *testing.T) {
 	s := openTest(t)
 	a := Account{ID: 1, ConfigDir: "/home/.cc-pool/accounts/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "me@example.com"}
-	if err := s.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	admitTestAccount(t, s, a)
 
 	if err := s.SetAccountLabel(1, "Example"); err != nil {
 		t.Fatal(err)
@@ -554,7 +513,7 @@ func TestMetaRoundTrip(t *testing.T) {
 
 func TestUsageSampleLatest(t *testing.T) {
 	s := openTest(t)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 	old := UsageSample{AccountID: 1, TS: time.Now().Add(-time.Minute), Util5h: 10}
 	cur := UsageSample{AccountID: 1, TS: time.Now(), Util5h: 50, Resets5h: time.Now().Add(time.Hour), RateLimited: true}
 	if err := s.InsertUsageSample(old); err != nil {
@@ -616,7 +575,7 @@ func TestLatestGoodUsageSample(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			s := openTest(t)
-			_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+			admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 			for _, sp := range tc.samples {
 				if err := s.InsertUsageSample(UsageSample{
 					AccountID:   1,
@@ -652,7 +611,7 @@ func TestLatestGoodUsageSample(t *testing.T) {
 
 func TestUsageSampleExtraUsageRoundTrip(t *testing.T) {
 	s := openTest(t)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 	in := UsageSample{AccountID: 1, TS: time.Now(), Util5h: 100, ExtraEnabled: true, ExtraUsed: 177, ExtraLimit: 5000}
 	if err := s.InsertUsageSample(in); err != nil {
 		t.Fatal(err)
@@ -694,7 +653,7 @@ func TestUsageSampleScopedRoundTrip(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			s := openTest(t)
-			_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+			admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 			if err := s.InsertUsageSample(tc.in); err != nil {
 				t.Fatal(err)
 			}
@@ -720,8 +679,8 @@ func TestUsageSampleScopedRoundTrip(t *testing.T) {
 
 func TestUsageSamplesSince(t *testing.T) {
 	s := openTest(t)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-	_ = s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s2", KeychainAccount: "u2"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 2, ConfigDir: "b", KeychainService: "s2", KeychainAccount: "u2"})
 	now := time.Now().Truncate(time.Second)
 	for _, sp := range []struct {
 		age  time.Duration
@@ -774,7 +733,7 @@ func TestSessionsReconcile(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
 	started := now.Add(-2 * SessionReapGrace)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 	id1 := activateTestSession(t, s, 1, 111, "/proj", started)
 	activateTestSession(t, s, 1, 222, "/proj", started)
 	activateTestSession(t, s, 1, 444, "/proj", started)
@@ -820,9 +779,7 @@ func TestActivateSelectionAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"}); err != nil {
-		t.Fatal(err)
-	}
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"})
 	a, _ := s.GetAccount(1)
 	err := s.ActivateSelection(SelectionActivation{
 		AccountID: 1, ExpectedInstanceID: a.InstanceID,
@@ -848,9 +805,7 @@ func TestActivateSelectionAtomic(t *testing.T) {
 func TestActivateSelectionConditionalEffects(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
-	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"}); err != nil {
-		t.Fatal(err)
-	}
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"})
 	a, _ := s.GetAccount(1)
 	if err := s.ActivateSelection(SelectionActivation{
 		AccountID: 1, ExpectedInstanceID: a.InstanceID,
@@ -887,7 +842,7 @@ func mustActive(t *testing.T, s *Store) []Session {
 func TestCloseDeadSessionsEndsAtLastSeen(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 	activateTestSession(t, s, 1, 555, "/proj", now.Add(-5*time.Hour))
 
 	// A reconcile 4h ago saw the pid alive; the process then died unobserved.
@@ -912,9 +867,7 @@ func TestCloseDeadSessionsRejectsReusedPIDIdentity(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Microsecond)
 	started := now.Add(-2 * SessionReapGrace)
-	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"}); err != nil {
-		t.Fatal(err)
-	}
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"})
 	activateTestSession(t, s, 1, 777, "/project", started)
 	reusedAt := started.Add(time.Minute)
 	closed, err := s.CloseDeadSessions(map[int]time.Time{777: reusedAt}, now)
@@ -929,8 +882,8 @@ func TestCloseDeadSessionsRejectsReusedPIDIdentity(t *testing.T) {
 func TestGetCwdActivity(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
-	_ = s.UpsertAccount(Account{ID: 2, ConfigDir: "c", KeychainService: "s2", KeychainAccount: "u2"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 2, ConfigDir: "c", KeychainService: "s2", KeychainAccount: "u2"})
 
 	act, err := s.GetCwdActivity("/proj", 1)
 	if err != nil || act.Live != 0 || !act.LastEnded.IsZero() {
@@ -988,8 +941,8 @@ func TestDeleteStickyVersion(t *testing.T) {
 
 func TestSticky(t *testing.T) {
 	s := openTest(t)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-	_ = s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 
 	if _, ok, err := s.GetSticky("/proj"); ok || err != nil {
 		t.Fatalf("empty table: ok=%v err=%v", ok, err)
@@ -1077,7 +1030,7 @@ func TestPruneSticky(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
 	cutoff := now.Add(-time.Hour)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 
 	// /old: selected long ago, no sessions -> pruned.
 	_ = s.UpsertSticky("/old", 1, now.Add(-2*time.Hour))
@@ -1120,7 +1073,7 @@ func TestPruneSticky(t *testing.T) {
 
 func TestDeleteAccountRemovesSticky(t *testing.T) {
 	s := openTest(t)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 	_ = s.UpsertSticky("/proj", 1, time.Now())
 	if err := s.DeleteAccount(1); err != nil {
 		t.Fatal(err)
@@ -1132,7 +1085,7 @@ func TestDeleteAccountRemovesSticky(t *testing.T) {
 
 func TestRefreshLog(t *testing.T) {
 	s := openTest(t)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 	if _, ok, _ := s.LastRefresh(1); ok {
 		t.Fatal("expected no refresh yet")
 	}
@@ -1153,7 +1106,7 @@ func TestRefreshLog(t *testing.T) {
 
 func TestAuthHealthTransitions(t *testing.T) {
 	s := openTest(t)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 
 	if h, err := s.GetAuthHealth(1); err != nil || h.NeedsLogin {
 		t.Fatalf("fresh account = %+v err=%v, want healthy", h, err)
@@ -1212,7 +1165,7 @@ func TestAuthHealthTransitions(t *testing.T) {
 
 func TestAuthKindUsesHardOwnedAndUnverifiedEncodings(t *testing.T) {
 	s := openTest(t)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 	if AuthKindOwned != "owned" || AuthKindUnverified != "unverified" || AuthKind("").Valid() {
 		t.Fatalf("auth kind contract: owned=%q unverified=%q empty-valid=%v",
 			AuthKindOwned, AuthKindUnverified, AuthKind("").Valid())
@@ -1248,41 +1201,39 @@ func TestAuthKindUsesHardOwnedAndUnverifiedEncodings(t *testing.T) {
 
 func TestAuthHealthGenerationCAS(t *testing.T) {
 	s := openTest(t)
-	if err := s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"}); err != nil {
-		t.Fatal(err)
-	}
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 
 	h, err := s.GetAuthHealth(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Gen != 0 {
-		t.Fatalf("never-flagged generation = %d, want 0", h.Gen)
+	if h.Gen != 1 || h.NeedsLogin || h.Kind != AuthKindOwned {
+		t.Fatalf("fixture auth health = %+v, want explicit healthy generation 1", h)
 	}
 
 	t0 := time.Unix(1_000_000, 0)
 	if _, err := s.SetNeedsLogin(1, t0, AuthReasonRequired, DigestReason("first"), AuthKindOwned); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SetNeedsLogin(1, t0.Add(time.Minute), AuthReasonAwaitingOrigin, DigestReason("second"), AuthKindAwaitingOrigin); err != nil {
+	if _, err := s.SetNeedsLogin(1, t0.Add(time.Minute), AuthReasonInternal, DigestReason("second"), AuthKindUnverified); err != nil {
 		t.Fatal(err)
 	}
 	h, err = s.GetAuthHealth(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Gen != 2 {
-		t.Fatalf("generation after two flags = %d, want 2", h.Gen)
+	if h.Gen != 3 {
+		t.Fatalf("generation after two flags = %d, want 3", h.Gen)
 	}
 	health, err := s.ListAuthHealth()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health[1].Gen != 2 {
-		t.Fatalf("listed generation = %d, want 2", health[1].Gen)
+	if health[1].Gen != 3 {
+		t.Fatalf("listed generation = %d, want 3", health[1].Gen)
 	}
 
-	cleared, err := s.ClearNeedsLoginIfGen(1, 1)
+	cleared, err := s.ClearNeedsLoginIfGen(1, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1293,11 +1244,11 @@ func TestAuthHealthGenerationCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !h.NeedsLogin || h.Gen != 2 {
-		t.Fatalf("after stale clear = %+v, want flagged at generation 2", h)
+	if !h.NeedsLogin || h.Gen != 3 {
+		t.Fatalf("after stale clear = %+v, want flagged at generation 3", h)
 	}
 
-	cleared, err = s.ClearNeedsLoginIfGen(1, 2)
+	cleared, err = s.ClearNeedsLoginIfGen(1, 3)
 	if err != nil || !cleared {
 		t.Fatalf("current-generation clear changed=%v err=%v, want true", cleared, err)
 	}
@@ -1305,8 +1256,8 @@ func TestAuthHealthGenerationCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.NeedsLogin || h.Gen != 2 || !h.Since.IsZero() || h.Reason != AuthReasonNone || h.Digest != ([32]byte{}) || h.Kind != AuthKindOwned {
-		t.Fatalf("after current-generation clear = %+v, want healthy at generation 2", h)
+	if h.NeedsLogin || h.Gen != 3 || !h.Since.IsZero() || h.Reason != AuthReasonNone || h.Digest != ([32]byte{}) || h.Kind != AuthKindOwned {
+		t.Fatalf("after current-generation clear = %+v, want healthy at generation 3", h)
 	}
 
 	if _, err := s.SetNeedsLogin(1, t0.Add(2*time.Minute), AuthReasonRequired, DigestReason("third"), AuthKindOwned); err != nil {
@@ -1316,14 +1267,14 @@ func TestAuthHealthGenerationCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !h.NeedsLogin || h.Gen != 3 {
-		t.Fatalf("after reflag = %+v, want flagged at generation 3", h)
+	if !h.NeedsLogin || h.Gen != 4 {
+		t.Fatalf("after reflag = %+v, want flagged at generation 4", h)
 	}
 }
 
 func TestDeleteAccountRemovesAuthHealth(t *testing.T) {
 	s := openTest(t)
-	_ = s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 	_, _ = s.SetNeedsLogin(1, time.Now(), AuthReasonRequired, DigestReason("x"), AuthKindOwned)
 	if err := s.DeleteAccount(1); err != nil {
 		t.Fatal(err)

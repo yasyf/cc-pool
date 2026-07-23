@@ -266,12 +266,10 @@ func TestAccountRemovalIntentFencesActiveFleetAndSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	for id := 1; id <= 2; id++ {
-		if err := s.UpsertAccount(Account{
+		admitTestAccount(t, s, Account{
 			ID: id, ConfigDir: fmt.Sprintf("/presentation/acct-%02d", id),
 			KeychainService: "service", KeychainAccount: "account", CreatedAt: time.Now(),
-		}); err != nil {
-			t.Fatal(err)
-		}
+		})
 	}
 	account, err := s.GetAccount(1)
 	if err != nil {

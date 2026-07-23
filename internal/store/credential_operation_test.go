@@ -750,7 +750,15 @@ func TestCredentialOperationGenerationAndLocatorDriftPreservesEvidence(t *testin
 			if _, err := s.MarkCredentialOperationApplying(operation.Fence(), publication); err != nil {
 				t.Fatal(err)
 			}
-			if err := s.UpsertAccount(test.mutate(account)); err != nil {
+			mutated := test.mutate(account)
+			generation := account.Generation
+			if mutated.ConfigDir != account.ConfigDir {
+				generation++
+			}
+			if _, err := s.db.Exec(
+				`UPDATE accounts SET generation=?,config_dir=?,keychain_service=?,keychain_account=? WHERE id=?`,
+				generation, mutated.ConfigDir, mutated.KeychainService, mutated.KeychainAccount, account.ID,
+			); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := s.MarkCredentialOperationApplied(
@@ -840,14 +848,11 @@ func TestDeleteAccountRejectsActiveAndUnacknowledgedEvidence(t *testing.T) {
 	if _, err := s.GetAccount(account.ID); !errors.Is(err, ErrAccountNotFound) {
 		t.Fatalf("tombstoned account remained visible: %v", err)
 	}
-	if err := s.UpsertAccount(account); err == nil {
-		t.Fatal("upsert resurrected a tombstoned account identity")
-	}
 	replacement := account
 	replacement.ID++
-	if err := s.UpsertAccount(replacement); err != nil {
-		t.Fatalf("tombstone retained live config-dir uniqueness: %v", err)
-	}
+	replacement.ConfigDir += "-replacement"
+	replacement.AccountUUID = "replacement-uuid"
+	admitTestAccount(t, s, replacement)
 	replay, err = s.BeginCredentialOperation(request)
 	if err != nil || replay.Receipt == nil || replay.Receipt.OperationID != request.OperationID {
 		t.Fatalf("tombstoned account lost receipt replay: %+v err=%v", replay, err)
@@ -1492,19 +1497,12 @@ func credentialOperationTestAccount(t *testing.T, s *Store) Account {
 
 func credentialOperationTestAccountID(t *testing.T, s *Store, id int) Account {
 	t.Helper()
-	if err := s.UpsertAccount(Account{
+	return admitTestAccount(t, s, Account{
 		ID: id, ConfigDir: fmt.Sprintf("/tmp/acct-%d", id),
 		KeychainService: fmt.Sprintf("service-%d", id),
 		KeychainAccount: fmt.Sprintf("account-%d", id),
 		CreatedAt:       time.Unix(1_800_000_000, 0),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	account, err := s.GetAccount(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return account
+	})
 }
 
 func credentialOperationTestRequest(

@@ -42,13 +42,15 @@ func TestReserveAccountIndexAllocation(t *testing.T) {
 
 	t.Run("skips finalized accounts and fills gaps", func(t *testing.T) {
 		s := openReserveTest(t)
-		for _, a := range []Account{
-			{ID: 1, ConfigDir: "a", KeychainService: "s1", KeychainAccount: "u"},
-			{ID: 3, ConfigDir: "c", KeychainService: "s3", KeychainAccount: "u"},
-		} {
-			if err := s.UpsertAccount(a); err != nil {
-				t.Fatal(err)
-			}
+		admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s1", KeychainAccount: "u"})
+		gap := mustReserve(t, s)
+		third := mustReserve(t, s)
+		if gap.ID != 2 || third.ID != 3 {
+			t.Fatalf("reservations = %d,%d, want 2,3", gap.ID, third.ID)
+		}
+		commitTestAccount(t, s, third, Account{ID: 3, ConfigDir: "c", KeychainService: "s3", KeychainAccount: "u"})
+		if err := s.ReleaseAccountIndex(gap); err != nil {
+			t.Fatal(err)
 		}
 		if n := mustReserve(t, s); n.ID != 2 {
 			t.Fatalf("gap index = %d, want 2", n.ID)
@@ -72,9 +74,7 @@ func TestReserveAccountIndexAllocation(t *testing.T) {
 	t.Run("release is idempotent and never frees a finalized account", func(t *testing.T) {
 		s := openReserveTest(t)
 		n := mustReserve(t, s)
-		if err := s.promoteReservedAccount(n, Account{ID: n.ID, InstanceID: n.InstanceID, Generation: n.Generation, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"}, false, nil); err != nil {
-			t.Fatal(err)
-		}
+		commitTestAccount(t, s, n, Account{ID: n.ID, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 		if err := s.ReleaseAccountIndex(n); err == nil {
 			t.Fatal("release after promotion succeeded, want exact fence rejection")
 		}
@@ -123,29 +123,6 @@ func TestReserveAccountIndexConcurrent(t *testing.T) {
 	}
 }
 
-func TestConsumeAccountIndex(t *testing.T) {
-	t.Run("spends a live reservation exactly once", func(t *testing.T) {
-		s := openReserveTest(t)
-		n := mustReserve(t, s)
-		if err := s.ConsumeAccountIndex(n); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.ConsumeAccountIndex(n); err == nil {
-			t.Fatal("second consume succeeded, want fail-loud on a spent reservation")
-		}
-		if got := mustReserve(t, s); got.ID != n.ID {
-			t.Fatalf("reserve after consume = %d, want the spent %d (no accounts row landed)", got.ID, n.ID)
-		}
-	})
-
-	t.Run("fails loud on a never-reserved index", func(t *testing.T) {
-		s := openReserveTest(t)
-		if err := s.ConsumeAccountIndex(PendingAccountReservation{ID: 7, InstanceID: "missing", Generation: 1}); err == nil {
-			t.Fatal("consume of an unreserved index succeeded, want fail-loud")
-		}
-	})
-}
-
 func TestPendingAddIndexes(t *testing.T) {
 	s := openReserveTest(t)
 
@@ -164,10 +141,8 @@ func TestPendingAddIndexes(t *testing.T) {
 		t.Fatalf("PendingAddIndexes = %v, want the two live reservations %d,%d", ids, a.ID, b.ID)
 	}
 
-	// Consume promotes a to a row; the reservation must drop from the list.
-	if err := s.ConsumeAccountIndex(a); err != nil {
-		t.Fatal(err)
-	}
+	// Admission promotes a to a row; the reservation must drop from the list.
+	commitTestAccount(t, s, a, Account{ID: a.ID})
 	if ids, err := s.PendingAddIndexes(); err != nil || len(ids) != 1 || ids[0] != b.ID {
 		t.Fatalf("after consume PendingAddIndexes = %v, %v; want only %d", ids, err, b.ID)
 	}
@@ -211,12 +186,13 @@ func TestRetiredPendingAddRequiresExactReapReceipt(t *testing.T) {
 	}
 }
 
-func TestPromoteReservedAccount(t *testing.T) {
+func TestPromoteReservedSyncedAccount(t *testing.T) {
 	t.Run("spends the reservation and lands the row", func(t *testing.T) {
 		s := openReserveTest(t)
 		reservation := mustReserve(t, s)
-		acct := Account{ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation, ConfigDir: "dir", KeychainService: "svc", KeychainAccount: "u"}
-		if err := s.promoteReservedAccount(reservation, acct, false, nil); err != nil {
+		acct := Account{ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation, ConfigDir: "/dir", KeychainService: "svc", KeychainAccount: "u", AccountUUID: "external-uuid"}
+		proof := presentationTestProof(acct, acct.ConfigDir, "activation-synced")
+		if err := s.PromoteReservedSyncedAccount(reservation, acct, proof); err != nil {
 			t.Fatal(err)
 		}
 		if got, err := s.GetAccount(reservation.ID); err != nil {
@@ -234,8 +210,9 @@ func TestPromoteReservedAccount(t *testing.T) {
 		s := openReserveTest(t)
 		reservation := mustReserve(t, s)
 		reservation.Owner = credentialOperationTestOwner("different-owner")
-		acct := Account{ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation, ConfigDir: "dir", KeychainService: "svc", KeychainAccount: "u"}
-		if err := s.promoteReservedAccount(reservation, acct, false, nil); err == nil {
+		acct := Account{ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation, ConfigDir: "/dir", KeychainService: "svc", KeychainAccount: "u", AccountUUID: "external-uuid"}
+		proof := presentationTestProof(acct, acct.ConfigDir, "activation-synced")
+		if err := s.PromoteReservedSyncedAccount(reservation, acct, proof); err == nil {
 			t.Fatal("promote with a mismatched owner succeeded, want fail-loud")
 		}
 		if _, err := s.GetAccount(reservation.ID); !errors.Is(err, ErrAccountNotFound) {
@@ -361,11 +338,11 @@ func TestPromoteReservedSyncedAccountLostResponseReplaysAfterReopen(t *testing.T
 	}
 }
 
-// TestPromoteReservedAccountConcurrent pins the atomic promote: many adds racing
+// TestPromoteReservedSyncedAccountConcurrent pins the atomic promote: many adds racing
 // reserve→promote each land a distinct index. A non-atomic consume-then-upsert
 // leaves a half-open window in which a concurrent ReserveAccountIndex reuses the
 // index, handing the same id to two adds.
-func TestPromoteReservedAccountConcurrent(t *testing.T) {
+func TestPromoteReservedSyncedAccountConcurrent(t *testing.T) {
 	s := openReserveTest(t)
 	const workers = 24
 	start := make(chan struct{})
@@ -386,11 +363,13 @@ func TestPromoteReservedAccountConcurrent(t *testing.T) {
 				ID:              reservation.ID,
 				InstanceID:      reservation.InstanceID,
 				Generation:      reservation.Generation,
-				ConfigDir:       fmt.Sprintf("dir-%d", reservation.ID),
+				ConfigDir:       fmt.Sprintf("/dir-%d", reservation.ID),
 				KeychainService: fmt.Sprintf("svc-%d", reservation.ID),
 				KeychainAccount: "u",
+				AccountUUID:     fmt.Sprintf("external-uuid-%d", reservation.ID),
 			}
-			if err := s.promoteReservedAccount(reservation, acct, false, nil); err != nil {
+			proof := presentationTestProof(acct, acct.ConfigDir, fmt.Sprintf("activation-%d", reservation.ID))
+			if err := s.PromoteReservedSyncedAccount(reservation, acct, proof); err != nil {
 				errs <- err
 				return
 			}
