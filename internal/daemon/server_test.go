@@ -579,7 +579,7 @@ func activateDaemonTestSession(t *testing.T, s *Server, accountID, pid int, cwd 
 		Token:     nextDaemonTestToken(),
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   store.ProcessIdentity{PID: pid, StartedAt: started},
-		ConfigDir: testFileProviderConfigDir(accountID),
+		ConfigDir: a.ConfigDir,
 		Cwd:       cwd, At: started,
 	}); err != nil {
 		t.Fatal(err)

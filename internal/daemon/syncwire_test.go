@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -281,11 +282,15 @@ func TestAuthKindClassification(t *testing.T) {
 	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
 		t.Fatal(err)
 	}
-	admitDaemonTestAccount(t, s.m.Store, store.Account{
-		ID: 1, ConfigDir: testFileProviderConfigDir(1),
-		KeychainService: "svc-auth-kind", KeychainAccount: "cc-pool",
-		AccountUUID: "u-self",
-	})
+	accounts := make(map[string]store.Account)
+	for index, uuid := range []string{"u-self", "u-peer", "u-absent", "u-noorigin", "u-foreign"} {
+		id := index + 1
+		accounts[uuid] = admitDaemonTestAccount(t, s.m.Store, store.Account{
+			ID: id, ConfigDir: testFileProviderConfigDir(id),
+			KeychainService: fmt.Sprintf("svc-auth-kind-%d", id), KeychainAccount: "cc-pool",
+			AccountUUID: uuid,
+		})
+	}
 	if err := s.setupSync(ctx); err != nil {
 		t.Fatalf("setupSync: %v", err)
 	}
@@ -329,10 +334,7 @@ func TestAuthKindClassification(t *testing.T) {
 				}
 				t.Cleanup(func() { _ = s.m.Store.SetMeta(metaSyncEnabled, "1") })
 			}
-			a := store.Account{
-				ID: 1, AccountUUID: tc.uuid, ConfigDir: t.TempDir(),
-				KeychainService: "svc-auth-kind", KeychainAccount: "cc-pool",
-			}
+			a := accounts[tc.uuid]
 			got, err := s.authKind(t.Context(), a)
 			if tc.wantErr {
 				if err == nil {

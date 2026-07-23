@@ -1095,12 +1095,6 @@ func seedAccountPresentationQuarantine(
 	if err != nil {
 		t.Fatal(err)
 	}
-	initial := target
-	initial.FileProvider.PublicPath = account.ConfigDir
-	initial.FileProvider.ActivationGeneration = "activation-old"
-	if err := s.m.Store.ObserveAccountPresentation(account, initial); err != nil {
-		t.Fatal(err)
-	}
 	if err := s.m.Store.ObserveAccountPresentation(account, target); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
 		t.Fatalf("seed presentation quarantine: %v", err)
 	}
@@ -1162,12 +1156,20 @@ func newAccountMutationTestServer(
 			account := store.Account{
 				ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
 			}
+			publicPath := testFileProviderConfigDir(reservation.ID)
+			if reservation.Generation > 1 {
+				publicPath = fmt.Sprintf(
+					"/Users/test/Library/CloudStorage/cc-pool-account-%d", reservation.ID,
+				)
+			}
 			return daemonTestPreparationProof(
-				account, testFileProviderConfigDir(reservation.ID),
+				account, publicPath,
 			), nil
 		},
-		prepareAccount: func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error) {
-			return catalogproto.TenantPreparationProof{}, nil
+		prepareAccount: func(_ context.Context, account store.Account) (catalogproto.TenantPreparationProof, error) {
+			return daemonTestPreparationProof(
+				account, fmt.Sprintf("/Users/test/Library/CloudStorage/cc-pool-account-%d", account.ID),
+			), nil
 		},
 		activatePrepared: func(_ context.Context, _ store.Account, _ catalogproto.TenantPreparationProof, activate func() error) error {
 			return activate()

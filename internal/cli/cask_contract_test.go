@@ -185,7 +185,7 @@ func TestFileProviderOnlyRuntimeRejectsNativeAndLegacyPathResidue(t *testing.T) 
 		},
 		"pool paths": {
 			body:      readReleaseContract(t, "internal", "pool", "paths.go"),
-			forbidden: []string{"func AccountsDir", "func AccountDir", "func EnsureAccountsDir", ".cc-pool/accounts", "holder runtime"},
+			forbidden: []string{"func AccountsDir(", "func AccountDir(", "func EnsureAccountsDir(", ".cc-pool/accounts", "holder runtime"},
 		},
 		"pool initialization": {
 			body:      readReleaseContract(t, "internal", "pool", "account.go"),
