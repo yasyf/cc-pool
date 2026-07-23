@@ -25,9 +25,6 @@ func (m *Manager) Init() (*InitResult, error) {
 	if err := EnsureStateDir(); err != nil {
 		return nil, err
 	}
-	if err := EnsureAccountsDir(); err != nil {
-		return nil, err
-	}
 	already, err := m.Initialized()
 	if err != nil {
 		return nil, err

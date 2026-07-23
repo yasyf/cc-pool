@@ -165,7 +165,7 @@ func TestAccountIdentityAndWriteUseBackingOnly(t *testing.T) {
 
 func TestIdentityMissingIsExplicit(t *testing.T) {
 	manager := newAccountManager(t)
-	if _, err := manager.AccountIdentity(t.Context(), 1, AccountDir(1)); !errors.Is(err, ErrNoIdentity) {
+	if _, err := manager.AccountIdentity(t.Context(), 1, testFileProviderConfigDir(1)); !errors.Is(err, ErrNoIdentity) {
 		t.Fatalf("AccountIdentity error = %v", err)
 	}
 }

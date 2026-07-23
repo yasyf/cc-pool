@@ -270,7 +270,7 @@ func TestOpenRejectsFutureSchemaWithoutMutation(t *testing.T) {
 
 func TestAccountCRUD(t *testing.T) {
 	s := openTest(t)
-	a := Account{ID: 1, ConfigDir: "/home/.cc-pool/accounts/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "work"}
+	a := Account{ID: 1, ConfigDir: "/home/Library/CloudStorage/CCPoolStatus-acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "work"}
 	if err := s.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -501,7 +501,7 @@ func TestCurrentSchemaRejectsInvalidIdentityRows(t *testing.T) {
 
 func TestSetAccountLabel(t *testing.T) {
 	s := openTest(t)
-	a := Account{ID: 1, ConfigDir: "/home/.cc-pool/accounts/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "me@example.com"}
+	a := Account{ID: 1, ConfigDir: "/home/Library/CloudStorage/CCPoolStatus-acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "me@example.com"}
 	if err := s.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}

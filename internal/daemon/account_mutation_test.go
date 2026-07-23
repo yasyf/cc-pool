@@ -852,7 +852,7 @@ func newAccountMutationTestServer(
 		m: m, log: log.New(io.Discard, "", 0), accountMutationLifetime: t.Context(),
 		accountMutationOwner: func() (proc.Record, error) { return owner, nil },
 		prepareReservedAccount: func(_ context.Context, reservation store.PendingAccountReservation) (string, error) {
-			return pool.AccountDir(reservation.ID), nil
+			return testFileProviderConfigDir(reservation.ID), nil
 		},
 		prepareAccount: func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error) {
 			return catalogproto.TenantPreparationProof{}, nil
@@ -861,7 +861,7 @@ func newAccountMutationTestServer(
 	if !withAccount {
 		return s, fake, store.Account{}
 	}
-	dir := pool.AccountDir(1)
+	dir := testFileProviderConfigDir(1)
 	account := store.Account{
 		ID: 1, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 1,
 		ConfigDir: dir, KeychainService: "cc-pool-test-account-1",

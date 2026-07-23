@@ -244,7 +244,7 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 		resp := daemon.Response{OK: true, Version: version.String()}
 		if op == daemon.OpSelect {
 			resp.SelectedID = &id
-			resp.Dir = pool.AccountDir(id)
+			resp.Dir = testFileProviderConfigDir(id)
 			resp.AccountInstanceID = account.InstanceID
 			resp.AccountGeneration = account.Generation
 		}
@@ -258,7 +258,7 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	cmd.SetContext(context.Background())
 
 	_, gotDir, _, err := resolveSelection(cmd, m, selectReq{cwd: "/proj"})
-	if err != nil || gotDir != pool.AccountDir(id) {
+	if err != nil || gotDir != testFileProviderConfigDir(id) {
 		t.Fatalf("daemon pick must succeed: dir=%q err=%v (stderr=%q)", gotDir, err, stripANSI(stderr.String()))
 	}
 	got, err := os.ReadFile(privatePath) //nolint:gosec // G304: test-owned path under t.TempDir.
@@ -316,8 +316,8 @@ func TestValidateDaemonSelection(t *testing.T) {
 	}
 	a, _ = st.GetAccount(a.ID)
 	b, _ = st.GetAccount(b.ID)
-	presentationA := pool.AccountDir(a.ID)
-	presentationB := pool.AccountDir(b.ID)
+	presentationA := testFileProviderConfigDir(a.ID)
+	presentationB := testFileProviderConfigDir(b.ID)
 	m := &pool.Manager{Store: st}
 	zero, unknown := 0, 999
 	cases := []struct {

@@ -43,7 +43,7 @@ func newRemoveCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "remove <account-id>",
 		Short: "Remove an account from the pool",
-		Long: `remove tears down an account: its overlay, config dir, Keychain item, and rows.
+		Long: `remove tears down an account: its File Provider presentation, private backing, Keychain item, and rows.
 
 With host sync enabled the removal is pool-wide: the account is tombstoned in
 the shared registry before any local teardown, and peer hosts tear down their

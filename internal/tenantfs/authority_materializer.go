@@ -115,7 +115,7 @@ func materializePhysicalObject(
 			Parent: physicalParentLogical(payload.Root, payload.Relative, spec),
 			Name:   path.Base(payload.Relative), Kind: kind, Mode: mode,
 			LinkTarget: input.Physical.LinkTarget,
-			Visibility: catalog.Visibility{Mount: true, FileProvider: true},
+			Visibility: catalog.Visibility{FileProvider: true},
 		}
 		if kind == catalog.KindFile {
 			if input.Content == nil {
@@ -169,7 +169,7 @@ func (p ClaudeAuthorityPolicy) materializeClaudeJSON(
 		Tenant: spec.ID, Generation: spec.Generation, Parent: tenantRoot(spec).Logical,
 		Name: claudeJSONFile, Kind: catalog.KindFile, Mode: 0o600,
 		Content:    memoryProjectionContent{body: merged},
-		Visibility: catalog.Visibility{Mount: true, FileProvider: true},
+		Visibility: catalog.Visibility{FileProvider: true},
 	}
 	fingerprint, err := materializationFingerprint(task.Logical, []sourceauthority.Projection{object}, sourceauthority.Fingerprint{}, merged)
 	if err != nil {
@@ -208,7 +208,7 @@ func (p ClaudeAuthorityPolicy) materializeSettings(
 		Tenant: spec.ID, Generation: spec.Generation, Parent: tenantRoot(spec).Logical,
 		Name: settingsFile, Kind: catalog.KindFile, Mode: 0o600,
 		Content:    memoryProjectionContent{body: served},
-		Visibility: catalog.Visibility{Mount: true, FileProvider: true},
+		Visibility: catalog.Visibility{FileProvider: true},
 	}
 	fingerprint, err := materializationFingerprint(task.Logical, []sourceauthority.Projection{object}, sourceauthority.Fingerprint{}, served)
 	if err != nil {
@@ -250,7 +250,7 @@ func materializeSyntheticDirectory(
 	object := sourceauthority.Projection{
 		Tenant: spec.ID, Generation: spec.Generation, Parent: tenantRoot(spec).Logical,
 		Name: payload.Name, Kind: catalog.KindDirectory, Mode: 0o700,
-		Visibility: catalog.Visibility{Mount: true, FileProvider: true},
+		Visibility: catalog.Visibility{FileProvider: true},
 	}
 	fingerprint, err := materializationFingerprint(task.Logical, []sourceauthority.Projection{object}, sourceauthority.Fingerprint{}, nil)
 	if err != nil {

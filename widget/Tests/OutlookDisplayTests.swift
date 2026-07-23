@@ -9,7 +9,7 @@ final class OutlookDisplayTests: XCTestCase {
 
     private func decodeAccount(_ overrides: [String: Any]) throws -> AccountStatus {
         var obj: [String: Any] = [
-            "id": 1, "config_dir": "/Users/you/.cc-pool/accounts/acct-01",
+            "id": 1, "config_dir": "/Users/you/Library/CloudStorage/CCPoolStatus-acct-01",
             "label": "acct", "score": 0,
             "remaining_5h": 50, "remaining_7d": 50, "active_sessions": 0,
             "rate_limited": false, "has_usage": true, "stale": false,

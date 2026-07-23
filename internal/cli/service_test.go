@@ -359,7 +359,7 @@ func TestDaemonServiceControllerCloseJoinsAndOutlivesCancellation(t *testing.T) 
 
 func TestUninstallWithoutPurgeStopsDaemonAndPreservesState(t *testing.T) {
 	tempHome(t)
-	seedAccounts(t, store.Account{ID: 1, ConfigDir: pool.AccountDir(1)})
+	seedAccounts(t, store.Account{ID: 1, ConfigDir: testFileProviderConfigDir(1)})
 	scanned := false
 	swapVar(t, &scanSessions, func(context.Context) ([]procscan.Session, error) {
 		scanned = true
@@ -474,7 +474,7 @@ func TestStopDaemonServiceDoesNotClaimSuccessWhenHolderStopFails(t *testing.T) {
 
 func TestPurgeRefusesProvisionedAccount(t *testing.T) {
 	tempHome(t)
-	seedAccounts(t, store.Account{ID: 1, ConfigDir: pool.AccountDir(1)})
+	seedAccounts(t, store.Account{ID: 1, ConfigDir: testFileProviderConfigDir(1)})
 	cmd, _, _ := uninstallCmd()
 	err := purgeAll(cmd)
 	if err == nil || !strings.Contains(err.Error(), "accounts remain provisioned") {
@@ -487,7 +487,7 @@ func TestPurgeRefusesProvisionedAccount(t *testing.T) {
 
 func TestPurgeAllRemovesCleanState(t *testing.T) {
 	tempHome(t)
-	if err := pool.EnsureAccountsDir(); err != nil {
+	if err := pool.EnsureStateDir(); err != nil {
 		t.Fatal(err)
 	}
 	cmd, out, _ := uninstallCmd()

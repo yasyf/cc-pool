@@ -151,7 +151,7 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 		callsMu.Lock()
 		calls[account.ID]++
 		callsMu.Unlock()
-		proof := daemonTestPreparationProof(account, pool.AccountDir(account.ID))
+		proof := daemonTestPreparationProof(account, testFileProviderConfigDir(account.ID))
 		if account.ID != 1 {
 			return proof, nil
 		}
@@ -316,7 +316,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 	fakeCreds := credstest.NewFake()
 	now := time.Now()
 	for id, util := range map[int]float64{1: 10, 2: 50} {
-		configDir := pool.AccountDir(id)
+		configDir := testFileProviderConfigDir(id)
 		dirs[id] = configDir
 		service := creds.ServiceName(configDir)
 		if err := st.UpsertAccount(store.Account{
@@ -579,7 +579,7 @@ func activateDaemonTestSession(t *testing.T, s *Server, accountID, pid int, cwd 
 		Token:     nextDaemonTestToken(),
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   store.ProcessIdentity{PID: pid, StartedAt: started},
-		ConfigDir: pool.AccountDir(accountID),
+		ConfigDir: testFileProviderConfigDir(accountID),
 		Cwd:       cwd, At: started,
 	}); err != nil {
 		t.Fatal(err)

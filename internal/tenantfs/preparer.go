@@ -67,7 +67,7 @@ func (p *Preparer) Validate(ctx context.Context, account Account, proof catalogp
 func (p *Preparer) request(ctx context.Context, account Account) (catalogproto.PrepareTenantRequest, error) {
 	health, err := p.runtime.RuntimeHealth(ctx)
 	if err != nil {
-		return catalogproto.PrepareTenantRequest{}, fmt.Errorf("tenantfs: observe holder activation: %w", err)
+		return catalogproto.PrepareTenantRequest{}, fmt.Errorf("tenantfs: observe FuseKit runtime activation: %w", err)
 	}
 	if health.Protocol != mountproto.Version || health.Code != mountproto.ErrorCodeOk ||
 		health.Message != "" || health.RuntimeBuild != version.String() ||

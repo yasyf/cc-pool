@@ -151,7 +151,7 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 		resp := daemon.Response{OK: true}
 		if op == daemon.OpSelect {
 			resp.SelectedID = &returned.ID
-			resp.Dir = pool.AccountDir(returned.ID)
+			resp.Dir = testFileProviderConfigDir(returned.ID)
 			resp.ReservationToken = "malformed-selection"
 		}
 		if op == daemon.OpSelectAbort {
@@ -178,7 +178,7 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 	}
 	for _, want := range []string{
 		"id 2",
-		"returned dir \"" + pool.AccountDir(returned.ID) + "\"",
+		"returned dir \"" + testFileProviderConfigDir(returned.ID) + "\"",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err, want)

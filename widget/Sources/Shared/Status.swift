@@ -265,7 +265,7 @@ extension PoolStatus {
         generatedAt: Date().addingTimeInterval(-90),
         accounts: [
             AccountStatus(
-                id: 1, configDir: "/Users/you/.cc-pool/accounts/acct-01",
+                id: 1, configDir: "/Users/you/Library/CloudStorage/CCPoolStatus-acct-01",
                 label: "work@example.com", score: 88.4,
                 remaining5h: 58, remaining7d: 91, activeSessions: 4,
                 rateLimited: false, exhausted: nil, needsLoginRaw: nil,
@@ -278,7 +278,7 @@ extension PoolStatus {
                 scoped7dUtil: 92, scoped7dResets: Date().addingTimeInterval(4 * 86400),
                 scoped7dModel: "Fable", weeklyExhausted: nil),
             AccountStatus(
-                id: 2, configDir: "/Users/you/.cc-pool/accounts/acct-02",
+                id: 2, configDir: "/Users/you/Library/CloudStorage/CCPoolStatus-acct-02",
                 label: "rebecca.fallon.engineering@example-corp.com", score: 64.0,
                 remaining5h: 60, remaining7d: 41, activeSessions: 2,
                 rateLimited: false, exhausted: nil, needsLoginRaw: nil,
@@ -290,7 +290,7 @@ extension PoolStatus {
                 scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil,
                 weeklyExhausted: nil),
             AccountStatus(
-                id: 3, configDir: "/Users/you/.cc-pool/accounts/acct-03",
+                id: 3, configDir: "/Users/you/Library/CloudStorage/CCPoolStatus-acct-03",
                 label: "personal@example.com", score: 41.0,
                 remaining5h: 22, remaining7d: 58, activeSessions: 0,
                 rateLimited: false, exhausted: nil, needsLoginRaw: nil,
@@ -302,7 +302,7 @@ extension PoolStatus {
                 scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil,
                 weeklyExhausted: nil),
             AccountStatus(
-                id: 4, configDir: "/Users/you/.cc-pool/accounts/acct-04",
+                id: 4, configDir: "/Users/you/Library/CloudStorage/CCPoolStatus-acct-04",
                 label: "side@example.com", score: 18.0,
                 remaining5h: 12, remaining7d: 35, activeSessions: 0,
                 rateLimited: false, exhausted: nil, needsLoginRaw: nil,
@@ -314,7 +314,7 @@ extension PoolStatus {
                 scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil,
                 weeklyExhausted: nil),
             AccountStatus(
-                id: 5, configDir: "/Users/you/.cc-pool/accounts/acct-05",
+                id: 5, configDir: "/Users/you/Library/CloudStorage/CCPoolStatus-acct-05",
                 label: "fresh@example.com", score: 0.0,
                 remaining5h: 0, remaining7d: 0, activeSessions: 0,
                 rateLimited: false, exhausted: nil, needsLoginRaw: nil,
@@ -325,7 +325,7 @@ extension PoolStatus {
                 scoped7dUtil: nil, scoped7dResets: nil, scoped7dModel: nil,
                 weeklyExhausted: nil),
             AccountStatus(
-                id: 6, configDir: "/Users/you/.cc-pool/accounts/acct-06",
+                id: 6, configDir: "/Users/you/Library/CloudStorage/CCPoolStatus-acct-06",
                 label: "", score: -40.2,
                 remaining5h: 1, remaining7d: 12, activeSessions: 0,
                 rateLimited: false, exhausted: true, needsLoginRaw: nil,

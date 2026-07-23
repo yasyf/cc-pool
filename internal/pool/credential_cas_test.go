@@ -341,7 +341,7 @@ func newCredentialCASFixture(
 	t.Setenv("CLAUDE_POOL_SECURITY_BIN", writeCredentialCASFakeSecurity(t))
 	t.Setenv("CCP_CAS_KEYCHAIN_ITEM", filepath.Join(t.TempDir(), "keychain-item"))
 	account := store.Account{
-		ID: 1, ConfigDir: AccountDir(1), KeychainService: creds.ServiceName(AccountDir(1)),
+		ID: 1, ConfigDir: testFileProviderConfigDir(1), KeychainService: creds.ServiceName(testFileProviderConfigDir(1)),
 		KeychainAccount: "credential-cas-test",
 	}
 	for _, directory := range []string{account.ConfigDir, AccountBackingDir(account.ID)} {

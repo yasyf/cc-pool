@@ -183,6 +183,7 @@ func TestClaudeAuthorityMaterializesMergedClaudeJSONAndInjectedSettings(t *testi
 		t.Fatal(err)
 	}
 	body := readProjection(t, value.Objects[0])
+	assertFileProviderOnlyProjection(t, value.Objects[0])
 	if !bytes.Contains(body, []byte(`"theme":"dark"`)) || !bytes.Contains(body, []byte(`"id":"pool"`)) {
 		t.Fatalf("merged Claude JSON = %s", body)
 	}
@@ -203,9 +204,17 @@ func TestClaudeAuthorityMaterializesMergedClaudeJSONAndInjectedSettings(t *testi
 		t.Fatal(err)
 	}
 	body = readProjection(t, value.Objects[0])
+	assertFileProviderOnlyProjection(t, value.Objects[0])
 	if !bytes.Contains(body, []byte(`"enabled":true`)) ||
 		!bytes.Contains(body, []byte(`"plansDirectory":"/Users/test/.claude/plans"`)) {
 		t.Fatalf("settings = %s", body)
+	}
+}
+
+func assertFileProviderOnlyProjection(t *testing.T, projection sourceauthority.Projection) {
+	t.Helper()
+	if !projection.Visibility.FileProvider || projection.Visibility.Mount {
+		t.Fatalf("projection visibility = %+v, want File Provider only", projection.Visibility)
 	}
 }
 

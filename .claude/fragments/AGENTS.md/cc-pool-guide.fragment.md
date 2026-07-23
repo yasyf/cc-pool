@@ -64,7 +64,7 @@ cc-pool/
 └── STYLEGUIDE.md       # Full style guide
 ```
 
-Filesystem identity, catalog revisions, tenant convergence, mount presentation, File
+Filesystem identity, catalog revisions, tenant convergence, File
 Provider enumeration, and domain retirement live in
 [`github.com/yasyf/fusekit`](https://github.com/yasyf/fusekit). Process lifecycle,
 transport, exact peer trust, and reaping live in
@@ -74,8 +74,8 @@ runtime, bridge, notification, or reconciliation machinery.
 
 Two filesystem trees, never confused:
 
-- `~/.claude` — canonical Claude Code config dir. **NEVER moved, modified structurally, or registered as a pool account.** It is plain `claude`'s home and the shared overlay base; plain `claude` must keep working untouched.
-- `~/.cc-pool/` — cc-pool's own state (sqlite db, daemon socket, logs) plus `accounts/acct-NN` pool config dirs (ids start at 1).
+- `~/.claude` — canonical Claude Code config dir. **NEVER moved, modified structurally, or registered as a pool account.** It is plain `claude`'s home and the shared source base; plain `claude` must keep working untouched.
+- `~/.cc-pool/` — cc-pool's private state and FuseKit source backing. Public account config dirs are File Provider roots selected by macOS.
 
 Safety rules baked into the architecture — do not regress them:
 
@@ -84,8 +84,8 @@ Safety rules baked into the architecture — do not regress them:
 3. **Account dir strings are hashed for Keychain service names** — the path string `ccp` emits and the string hashed must stay byte-identical. No realpath/normalization divergence.
 4. **Protected filesystem access belongs only to the fixed signed application.** The
    unsigned Go daemon never resolves, names, or traverses the App Group container. The
-   app embeds `holder.Runtime`; daemonkit proves its exact signed identity, and FuseKit
-   owns the native mount and File Provider presentations across daemon restarts.
+   app embeds the FuseKit runtime; daemonkit proves its exact signed identity, and FuseKit
+   owns File Provider presentation across daemon restarts.
 
 ## Style Rules (summary — see STYLEGUIDE.md)
 

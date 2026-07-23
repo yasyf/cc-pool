@@ -27,17 +27,18 @@ out. A fresh login per account is the only safe path.
 
 Claude Code namespaces its Keychain credential **per config dir**. The default `~/.claude`
 uses the item `Claude Code-credentials`; a custom `CLAUDE_CONFIG_DIR` gets a suffixed item
-`Claude Code-credentials-<hash>`. cc-pool gives each account a real, unique dir
-(`~/.cc-pool/accounts/acct-NN`), so each gets its own Keychain item, its own independent
+`Claude Code-credentials-<hash>`. cc-pool gives each account a real, unique File Provider
+root selected by macOS, so each gets its own Keychain item, its own independent
 OAuth grant (its own refresh-token chain), and runs on its own **subscription** — never API
 billing.
 
 The pool's service-name derivation always emits a hash-suffixed name and can never name the
 canonical unsuffixed item, so plain claude's credential is unreachable from pool code.
 
-Each account dir is seeded with a copy of your `~/.claude.json` with the identity stripped
-(the account's own login writes its identity), so pooled sessions inherit your settings, MCP
-servers, and per-project tool approvals instead of running first-run onboarding.
+Each account's private FuseKit backing is seeded with a copy of your `~/.claude.json` with
+the identity stripped (the account's own login writes its identity), so pooled sessions
+inherit your settings, MCP servers, and per-project tool approvals instead of running
+first-run onboarding.
 
 ## Revisioned tenant presentation
 
