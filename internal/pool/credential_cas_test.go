@@ -96,6 +96,39 @@ func TestCredentialCASDeleteExactStateUnderOneLock(t *testing.T) {
 	assertCredentialCASLocksGone(t, account.ConfigDir)
 }
 
+func TestCredentialCASDeletesAtExactFileProviderPublicPath(t *testing.T) {
+	account, _ := newCredentialCASFixture(t)
+	account.ConfigDir = filepath.Join(
+		os.Getenv("HOME"), "Library", "CloudStorage", "CCPool", "account-1",
+	)
+	account.KeychainService = creds.ServiceName(account.ConfigDir)
+	if err := os.MkdirAll(account.ConfigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	request := CredentialCASRequest{
+		AccountID: account.ID, ConfigDir: account.ConfigDir,
+		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
+	}
+	credentialStore := credentialCASStore(request, credentialCASDirectRunner{})
+	if err := credentialStore.Write(t.Context(), credentialCASCredential("old-public-path")); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := observeCredentialCASState(t.Context(), credentialStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Expected = expected
+	request.Delete = true
+	response := runCredentialCASTestWorker(t, request)
+	if response.ErrorCode != "" || !credentialStateEmpty(response.After) {
+		t.Fatalf("File Provider credential CAS delete = %+v", response)
+	}
+	if _, err := credentialStore.Read(t.Context()); creds.ClassifyRead(err) != creds.ReadEmpty {
+		t.Fatalf("File Provider credential remained: %v", err)
+	}
+	assertCredentialCASLocksGone(t, account.ConfigDir)
+}
+
 func TestCredentialCASWaitsForClaudeLockAndNeverClobbersRacingWriter(t *testing.T) {
 	account, stores := newCredentialCASFixture(t)
 	initial := credentialCASCredential("initial")
