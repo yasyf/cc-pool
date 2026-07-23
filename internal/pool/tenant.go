@@ -13,7 +13,6 @@ func TenantAccount(account store.Account) tenantfs.Account {
 		PresentationRoot: AccountPresentationDir(account.ID), BackingRoot: AccountBackingDir(account.ID),
 		FileProviderDisplayName: AccountDirName(account.ID),
 		Presentations: []mountproto.Presentation{
-			mountproto.PresentationMount,
 			mountproto.PresentationFileProvider,
 		},
 	}

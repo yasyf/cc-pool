@@ -27,8 +27,7 @@ func TestTenantAccountSeparatesPreservedBackingFromPresentation(t *testing.T) {
 	if tenant.FileProviderDisplayName != "acct-18" {
 		t.Fatalf("File Provider display name = %q", tenant.FileProviderDisplayName)
 	}
-	if len(tenant.Presentations) != 2 || tenant.Presentations[0] != mountproto.PresentationMount ||
-		tenant.Presentations[1] != mountproto.PresentationFileProvider {
+	if len(tenant.Presentations) != 1 || tenant.Presentations[0] != mountproto.PresentationFileProvider {
 		t.Fatalf("presentations = %v", tenant.Presentations)
 	}
 	definition, err := tenant.Definition()
@@ -38,5 +37,8 @@ func TestTenantAccountSeparatesPreservedBackingFromPresentation(t *testing.T) {
 	if definition.BackingRoot != backing || definition.PresentationRoot != presentation || definition.Generation != 7 ||
 		definition.FileProviderAccountID != account.InstanceID || definition.FileProviderDisplayName != "acct-18" {
 		t.Fatalf("definition = %+v", definition)
+	}
+	if len(definition.Presentations) != 1 || definition.Presentations[0] != mountproto.PresentationFileProvider {
+		t.Fatalf("definition presentations = %v", definition.Presentations)
 	}
 }
