@@ -281,13 +281,11 @@ func TestAuthKindClassification(t *testing.T) {
 	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.m.Store.UpsertAccount(store.Account{
+	admitDaemonTestAccount(t, s.m.Store, store.Account{
 		ID: 1, ConfigDir: pool.AccountDir(1),
 		KeychainService: "svc-auth-kind", KeychainAccount: "cc-pool",
 		AccountUUID: "u-self",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	if err := s.setupSync(ctx); err != nil {
 		t.Fatalf("setupSync: %v", err)
 	}

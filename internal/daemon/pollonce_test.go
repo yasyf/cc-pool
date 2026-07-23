@@ -139,9 +139,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
 		KeychainService: "svc", KeychainAccount: "user",
 	}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	a = admitDaemonTestAccount(t, st, a)
 
 	fk := credstest.NewFake()
 	cred := &creds.Credential{}
@@ -193,9 +191,7 @@ func TestPollOnceFailsClosedOnScanError(t *testing.T) {
 			ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
 			KeychainService: "svc", KeychainAccount: "user",
 		}
-		if err := st.UpsertAccount(a); err != nil {
-			t.Fatal(err)
-		}
+		a = admitDaemonTestAccount(t, st, a)
 		fk := credstest.NewFake()
 		cred := &creds.Credential{}
 		cred.ClaudeAiOauth.AccessToken = "at-0"
@@ -252,9 +248,7 @@ func TestPollOnceFlagsAndRecoversNeedsLogin(t *testing.T) {
 		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
 		KeychainService: "svc", KeychainAccount: "user",
 	}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	a = admitDaemonTestAccount(t, st, a)
 	fk := credstest.NewFake()
 	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-0"
@@ -329,9 +323,7 @@ func TestPollOnceAbsentCredentialAuthHealth(t *testing.T) {
 				ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
 				KeychainService: "svc", KeychainAccount: "user",
 			}
-			if err := st.UpsertAccount(a); err != nil {
-				t.Fatal(err)
-			}
+			a = admitDaemonTestAccount(t, st, a)
 			fk := credstest.NewFake()
 			fk.KeychainFaults = credstest.Faults{Read: tc.keychainFault}
 			fo := &fakeOAuth{}
@@ -396,9 +388,7 @@ func TestPollOnceTransient401StaysSelectable(t *testing.T) {
 		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
 		KeychainService: "svc", KeychainAccount: "user",
 	}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	a = admitDaemonTestAccount(t, st, a)
 	fk := credstest.NewFake()
 	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-0"
@@ -483,9 +473,7 @@ func TestPollOnceOutageProbesAfterRetainedFailure(t *testing.T) {
 		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct-1"),
 		KeychainService: "svc-1", KeychainAccount: "user",
 	}
-	if err := st.UpsertAccount(first); err != nil {
-		t.Fatal(err)
-	}
+	first = admitDaemonTestAccount(t, st, first)
 	expired := &creds.Credential{}
 	expired.ClaudeAiOauth.AccessToken = "at-1"
 	expired.ClaudeAiOauth.RefreshToken = "rt-1"
@@ -511,9 +499,7 @@ func TestPollOnceOutageProbesAfterRetainedFailure(t *testing.T) {
 		ID: 2, ConfigDir: filepath.Join(t.TempDir(), "acct-2"),
 		KeychainService: "svc-2", KeychainAccount: "user",
 	}
-	if err := st.UpsertAccount(second); err != nil {
-		t.Fatal(err)
-	}
+	second = admitDaemonTestAccount(t, st, second)
 	live := &creds.Credential{}
 	live.ClaudeAiOauth.AccessToken = "at-2"
 	live.ClaudeAiOauth.RefreshToken = "rt-2"
@@ -560,9 +546,7 @@ func TestPollOnceRestartProbesWhenAllCredentialResultsRetained(t *testing.T) {
 					ID: id, ConfigDir: filepath.Join(t.TempDir(), fmt.Sprintf("acct-%d", id)),
 					KeychainService: fmt.Sprintf("svc-%d", id), KeychainAccount: "user",
 				}
-				if err := st.UpsertAccount(account); err != nil {
-					t.Fatal(err)
-				}
+				account = admitDaemonTestAccount(t, st, account)
 				account, err = st.GetAccount(id)
 				if err != nil {
 					t.Fatal(err)
@@ -656,9 +640,7 @@ func TestPollOnceFlagsConfirmedRevocation(t *testing.T) {
 		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
 		KeychainService: "svc", KeychainAccount: "user",
 	}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	a = admitDaemonTestAccount(t, st, a)
 	fk := credstest.NewFake()
 	cred := &creds.Credential{}
 	cred.ClaudeAiOauth.AccessToken = "at-0"
@@ -703,9 +685,7 @@ func newOutageServer(t *testing.T, n int) (*Server, *fakeOAuth) {
 			ID: i, ConfigDir: filepath.Join(t.TempDir(), fmt.Sprintf("acct-%d", i)),
 			KeychainService: fmt.Sprintf("svc-%d", i), KeychainAccount: "user",
 		}
-		if err := st.UpsertAccount(a); err != nil {
-			t.Fatal(err)
-		}
+		a = admitDaemonTestAccount(t, st, a)
 		cred := &creds.Credential{}
 		cred.ClaudeAiOauth.AccessToken = fmt.Sprintf("at-%d", i)
 		cred.ClaudeAiOauth.RefreshToken = fmt.Sprintf("rt-%d", i)
@@ -878,9 +858,7 @@ func TestPollOnceRecoverySweepHealsBusy401(t *testing.T) {
 			ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
 			KeychainService: "svc", KeychainAccount: "user",
 		}
-		if err := st.UpsertAccount(a); err != nil {
-			t.Fatal(err)
-		}
+		a = admitDaemonTestAccount(t, st, a)
 		fk := credstest.NewFake()
 		cred := &creds.Credential{}
 		cred.ClaudeAiOauth.AccessToken = "at-0"

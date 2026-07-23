@@ -1182,13 +1182,7 @@ func newAccountMutationTestServer(
 		ConfigDir: dir, KeychainService: "cc-pool-test-account-1",
 		KeychainAccount: "claude", Label: "existing",
 	}
-	if err := st.UpsertAccount(account); err != nil {
-		t.Fatal(err)
-	}
-	account, err = st.GetAccount(account.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	account = admitDaemonTestAccount(t, st, account)
 	credential := &creds.Credential{}
 	credential.ClaudeAiOauth.AccessToken = "old-access"
 	credential.ClaudeAiOauth.RefreshToken = "old-refresh"

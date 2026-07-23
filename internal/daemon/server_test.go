@@ -304,6 +304,10 @@ func exactPendingSelectionToken(t *testing.T, claims *claims, accountID int) str
 // newTestServer builds a Server with acct-1 emptier than acct-2. scanSessions
 // is stubbed: real `ps` can hang on a wedged mount.
 func newTestServer(t *testing.T) (*Server, map[int]string) {
+	return newTestServerWithPaths(t, nil)
+}
+
+func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[int]string) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
@@ -315,16 +319,18 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 	dirs := map[int]string{}
 	fakeCreds := credstest.NewFake()
 	now := time.Now()
-	for id, util := range map[int]float64{1: 10, 2: 50} {
+	for _, id := range []int{1, 2} {
+		util := map[int]float64{1: 10, 2: 50}[id]
 		configDir := pool.AccountDir(id)
+		if paths[id] != "" {
+			configDir = paths[id]
+		}
 		dirs[id] = configDir
 		service := creds.ServiceName(configDir)
-		if err := st.UpsertAccount(store.Account{
+		admitDaemonTestAccount(t, st, store.Account{
 			ID: id, ConfigDir: configDir, InstanceID: fmt.Sprintf("instance-%d", id), Generation: 1,
 			KeychainService: service, KeychainAccount: "ccp-test",
-		}); err != nil {
-			t.Fatal(err)
-		}
+		})
 		if err := st.InsertUsageSample(store.UsageSample{AccountID: id, TS: now, Util5h: util, Util7d: util}); err != nil {
 			t.Fatal(err)
 		}
@@ -488,17 +494,9 @@ func TestStoredPreparationProofRevalidatesRuntimeBoundFieldsAgainstCurrentActiva
 }
 
 func TestSelectionUsesPersistedFusePublicPathWithoutSynthesizing(t *testing.T) {
-	s, _ := newTestServer(t)
-	account, err := s.m.Store.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
 	publicPath := "/Users/test/Library/CloudStorage/cc-pool-account-1"
-	account.ConfigDir = publicPath
-	if err := s.m.Store.UpsertAccount(account); err != nil {
-		t.Fatal(err)
-	}
-	account, err = s.m.Store.GetAccount(1)
+	s, _ := newTestServerWithPaths(t, map[int]string{1: publicPath})
+	account, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -843,7 +841,7 @@ func TestProvisionalSelectionDiesWithDaemonWithoutEffects(t *testing.T) {
 	}
 }
 
-func TestRunCommitRejectsAccountGenerationChange(t *testing.T) {
+func TestRunCommitRejectsReservedGenerationMismatch(t *testing.T) {
 	s, _ := newTestServer(t)
 	forced := 1
 	resp := s.handleSelect(t.Context(), Request{
@@ -853,14 +851,9 @@ func TestRunCommitRejectsAccountGenerationChange(t *testing.T) {
 	if !resp.OK {
 		t.Fatalf("select = %+v", resp)
 	}
-	a, err := s.m.Store.GetAccount(forced)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a.ConfigDir += "-replacement"
-	if err := s.m.Store.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	s.cl.mu.Lock()
+	s.cl.selections[resp.ReservationToken].accountGeneration++
+	s.cl.mu.Unlock()
 
 	committed := s.handleSelectCommit(context.Background(), Request{
 		Op: OpSelectCommit, ReservationToken: resp.ReservationToken,

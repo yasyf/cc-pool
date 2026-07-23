@@ -33,11 +33,16 @@ func openTestManager(t *testing.T) *Manager {
 func seedSessionFor(t *testing.T, m *Manager, accountID int, cwd string, started time.Time, ended *time.Time) {
 	t.Helper()
 	if _, err := m.Store.GetAccount(accountID); errors.Is(err, store.ErrAccountNotFound) {
-		if err := m.Store.UpsertAccount(store.Account{
-			ID: accountID, ConfigDir: AccountDir(accountID),
-			KeychainService: fmt.Sprintf("svc-%d", accountID), KeychainAccount: "user",
-		}); err != nil {
-			t.Fatal(err)
+		for id := 1; id <= accountID; id++ {
+			if _, existingErr := m.Store.GetAccount(id); existingErr == nil {
+				continue
+			} else if !errors.Is(existingErr, store.ErrAccountNotFound) {
+				t.Fatal(existingErr)
+			}
+			admitPoolTestAccount(t, m.Store, store.Account{
+				ID: id, ConfigDir: AccountDir(id),
+				KeychainService: fmt.Sprintf("svc-%d", id), KeychainAccount: "user",
+			})
 		}
 	} else if err != nil {
 		t.Fatal(err)
@@ -253,7 +258,9 @@ func TestStickyPick(t *testing.T) {
 			if tc.record {
 				var err error
 				if tc.manual {
-					_ = m.Store.UpsertAccount(store.Account{ID: tc.recordID, ConfigDir: "dir", KeychainService: "s", KeychainAccount: "u"})
+					for id := 1; id <= tc.recordID; id++ {
+						admitPoolTestAccount(t, m.Store, store.Account{ID: id, ConfigDir: fmt.Sprintf("/dir-%d", id), KeychainService: fmt.Sprintf("s-%d", id), KeychainAccount: "u"})
+					}
 					err = m.Store.PinManual("/proj", tc.recordID, tc.recordedAt)
 				} else {
 					err = m.Store.UpsertSticky("/proj", tc.recordID, tc.recordedAt)
@@ -326,7 +333,7 @@ func TestPinAPI(t *testing.T) {
 		if err := m.PinManual("/proj", 9, now); err == nil {
 			t.Fatal("unknown account must fail")
 		}
-		_ = m.Store.UpsertAccount(store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+		admitPoolTestAccount(t, m.Store, store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 		if err := m.PinManual("/proj", 1, now); err != nil {
 			t.Fatal(err)
 		}
@@ -338,8 +345,8 @@ func TestPinAPI(t *testing.T) {
 
 	t.Run("toggle pins, repins, unpins", func(t *testing.T) {
 		m := openTestManager(t)
-		_ = m.Store.UpsertAccount(store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
-		_ = m.Store.UpsertAccount(store.Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+		admitPoolTestAccount(t, m.Store, store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+		admitPoolTestAccount(t, m.Store, store.Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
 
 		pinned, err := m.TogglePin("/proj", 1, now)
 		if err != nil || !pinned {
@@ -380,7 +387,7 @@ func TestPinAPI(t *testing.T) {
 
 	t.Run("view reflects state and hides expired pins", func(t *testing.T) {
 		m := openTestManager(t)
-		_ = m.Store.UpsertAccount(store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+		admitPoolTestAccount(t, m.Store, store.Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 
 		if _, ok, err := m.PinView("/proj", now); ok || err != nil {
 			t.Fatalf("no pin: ok=%v err=%v", ok, err)

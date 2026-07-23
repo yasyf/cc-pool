@@ -23,14 +23,7 @@ func openTestStore(t *testing.T) *store.Store {
 
 func persistTestAccount(t *testing.T, st *store.Store, account store.Account) store.Account {
 	t.Helper()
-	if err := st.UpsertAccount(account); err != nil {
-		t.Fatal(err)
-	}
-	stored, err := st.GetAccount(account.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return stored
+	return admitPoolTestAccount(t, st, account)
 }
 
 func newAccountManager(t *testing.T) *Manager {

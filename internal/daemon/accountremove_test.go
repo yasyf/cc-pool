@@ -50,18 +50,10 @@ func newAccountRemovalTestServer(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertAccount(store.Account{
+	account := admitDaemonTestAccount(t, st, store.Account{
 		ID: 1, ConfigDir: pool.AccountDir(1),
 		KeychainService: "service", KeychainAccount: "account",
-	}); err != nil {
-		_ = st.Close()
-		t.Fatal(err)
-	}
-	account, err := st.GetAccount(1)
-	if err != nil {
-		_ = st.Close()
-		t.Fatal(err)
-	}
+	})
 	server := &Server{
 		m:   newDaemonTestManager(t, st, accountMutationTestRefresher{}, credstest.NewFake()),
 		cl:  newClaims(),

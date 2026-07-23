@@ -28,9 +28,7 @@ func newGateServer(t *testing.T, cred *creds.Credential, sessions []procscan.Ses
 		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"),
 		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "u1",
 	}
-	if err := st.UpsertAccount(a); err != nil {
-		t.Fatal(err)
-	}
+	a = admitDaemonTestAccount(t, st, a)
 	fk := credstest.NewFake()
 	fk.Put(a.KeychainService, a.KeychainAccount, cred)
 	fo := &fakeOAuth{currentRT: cred.ClaudeAiOauth.RefreshToken}

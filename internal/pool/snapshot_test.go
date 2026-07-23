@@ -67,12 +67,10 @@ func TestSnapshotScopedFields(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = st.Close() })
-			if err := st.UpsertAccount(store.Account{
+			admitPoolTestAccount(t, st, store.Account{
 				ID: 1, ConfigDir: t.TempDir(),
 				KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
-			}); err != nil {
-				t.Fatal(err)
-			}
+			})
 			now := time.Now().Truncate(time.Second)
 			sample := store.UsageSample{
 				AccountID:     1,
@@ -127,12 +125,10 @@ func TestSnapshotOnly429IsNoData(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	if err := st.UpsertAccount(store.Account{
+	admitPoolTestAccount(t, st, store.Account{
 		ID: 1, ConfigDir: t.TempDir(),
 		KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	now := time.Now().Truncate(time.Second)
 	// Two 429 placeholders and no clean reading: the newest carries a non-zero
 	// util the placeholder path must never expose as real usage.
@@ -187,12 +183,10 @@ func TestSnapshotBurn7d(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = st.Close() })
-			if err := st.UpsertAccount(store.Account{
+			admitPoolTestAccount(t, st, store.Account{
 				ID: 1, ConfigDir: t.TempDir(),
 				KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
-			}); err != nil {
-				t.Fatal(err)
-			}
+			})
 			base := time.Now().Truncate(time.Second).Add(-tc.sampleAge)
 			seed7dClimb(t, st, 1, base, 6)
 
@@ -232,12 +226,10 @@ func TestSnapshotsForecast(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = st.Close() })
-			if err := st.UpsertAccount(store.Account{
+			admitPoolTestAccount(t, st, store.Account{
 				ID: 1, ConfigDir: t.TempDir(),
 				KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
-			}); err != nil {
-				t.Fatal(err)
-			}
+			})
 			base := time.Now().Truncate(time.Second).Add(-tc.sampleAge)
 			seedClimb(t, st, 1, base, 10)
 

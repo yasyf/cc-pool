@@ -19,9 +19,7 @@ func TestHostSyncWorkerSessionsUsesDurableAndObservedActivity(t *testing.T) {
 		KeychainService: "svc-worker-sessions", KeychainAccount: "cc-pool",
 		AccountUUID: "u-worker-sessions",
 	}
-	if err := s.m.Store.UpsertAccount(account); err != nil {
-		t.Fatal(err)
-	}
+	account = admitDaemonTestAccount(t, s.m.Store, account)
 	s.m.ScanSessions = s.scanSessions
 	sessions := hostSyncWorkerSessions{manager: s.m}
 

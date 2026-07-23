@@ -356,13 +356,11 @@ func testTenantAccount(t *testing.T) (store.Account, tenantfs.Account, mountprot
 func insertCoordinatorAccounts(t *testing.T, st *store.Store, total int) {
 	t.Helper()
 	for id := 1; id <= total; id++ {
-		if err := st.UpsertAccount(store.Account{
+		admitDaemonTestAccount(t, st, store.Account{
 			ID: id, InstanceID: fmt.Sprintf("%032x", id), Generation: 1,
 			ConfigDir:       pool.AccountDir(id),
 			KeychainService: "service", KeychainAccount: "account",
-		}); err != nil {
-			t.Fatalf("insert account %d: %v", id, err)
-		}
+		})
 	}
 }
 
@@ -730,12 +728,10 @@ func TestInitializePagesOnlyInterruptedRemovalClaims(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	const total = store.AccountRemovalPageLimit + 1
 	for id := 1; id <= total; id++ {
-		if err := st.UpsertAccount(store.Account{
+		admitDaemonTestAccount(t, st, store.Account{
 			ID: id, ConfigDir: pool.AccountDir(id),
 			KeychainService: "service", KeychainAccount: "account",
-		}); err != nil {
-			t.Fatal(err)
-		}
+		})
 		if _, err := st.BeginAccountRemoval(id, true); err != nil {
 			t.Fatal(err)
 		}
@@ -899,12 +895,10 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
-	if err := st.UpsertAccount(store.Account{
+	admitDaemonTestAccount(t, st, store.Account{
 		ID: 1, ConfigDir: pool.AccountDir(1),
 		KeychainService: "service", KeychainAccount: "account",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	account, err := st.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
