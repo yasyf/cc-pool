@@ -147,6 +147,9 @@ func (c *tenantCoordinator) prepareDesiredAccount(ctx context.Context, account s
 			return err
 		}
 		if err := c.server.m.Store.BindDesiredAccountPresentation(account, expected, stored); err != nil {
+			if errors.Is(err, store.ErrAccountPresentationQuarantined) {
+				return nil
+			}
 			return err
 		}
 		return nil

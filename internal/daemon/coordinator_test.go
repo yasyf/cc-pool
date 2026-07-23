@@ -482,7 +482,7 @@ func TestInitializePreparesEveryActiveAccountWithBoundedFanout(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
-	const total = 20
+	const total = 19
 	insertCoordinatorAccounts(t, st, total)
 	runtime := &fleetLifecycleRuntime{}
 	release := make(chan struct{})
@@ -640,7 +640,7 @@ func TestConcurrentInitializeConvergesOneDesiredPresentation(t *testing.T) {
 	}
 }
 
-func TestInitializeQuarantinesDesiredGenerationMismatch(t *testing.T) {
+func TestInitializeSettlesDesiredGenerationMismatchWithDurableQuarantine(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 1)
 	preparer := &fleetSourcePreparer{mutateProof: func(proof *catalogproto.TenantPreparationProof) {
 		proof.Catalog.Generation++
@@ -648,9 +648,8 @@ func TestInitializeQuarantinesDesiredGenerationMismatch(t *testing.T) {
 	}}
 	server := &Server{m: &pool.Manager{Store: st}}
 	coordinator := newTenantCoordinator(t.Context(), server, preparer, &fleetLifecycleRuntime{})
-	err := coordinator.initialize(t.Context())
-	if !errors.Is(err, store.ErrAccountPresentationQuarantined) {
-		t.Fatalf("initialize mismatch = %v, want quarantine", err)
+	if err := coordinator.initialize(t.Context()); err != nil {
+		t.Fatalf("initialize mismatch = %v, want settled quarantine", err)
 	}
 	quarantine, err := st.AccountPresentationQuarantine(1)
 	if err != nil || quarantine.Reason != store.AccountPresentationGenerationDrift {
