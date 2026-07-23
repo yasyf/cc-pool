@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,10 +72,11 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	script := filepath.Join(home, "wedged-account-worker")
+	pidPath := filepath.Join(home, "wedged-account-worker.pid")
 	writePoolTestExecutable(
 		t,
 		script,
-		"#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+		"#!/bin/sh\necho $$ > "+strconv.Quote(pidPath)+"\ntrap '' TERM\nwhile :; do sleep 1; done\n",
 	)
 	recordStore := &daemonproc.FileStore{Path: filepath.Join(home, "workers.json")}
 	reaper := &daemonproc.Reaper{
@@ -83,19 +86,60 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	workersSettled := false
+	t.Cleanup(func() {
+		if workersSettled {
+			return
+		}
+		workers.Close()
+		workers.Cancel()
+		if waitErr := workers.Wait(context.Background()); waitErr != nil {
+			t.Errorf("settle account backing workers: %v", waitErr)
+		}
+	})
 	manager := &Manager{taskRunner: workers, workerExecutable: script}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	_, err = manager.prepareAccountBacking(
-		ctx, 18, AccountDir(18), ClaudeJSONPath(),
-	)
+	result := make(chan error, 1)
+	go func() {
+		_, prepareErr := manager.prepareAccountBacking(
+			ctx, 18, AccountDir(18), ClaudeJSONPath(),
+		)
+		result <- prepareErr
+	}()
+	var identity daemonproc.Identity
+	for identity.PID == 0 {
+		payload, readErr := os.ReadFile(pidPath)
+		if readErr == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(payload)))
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			identity, err = daemonproc.Probe(pid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		if !errors.Is(readErr, os.ErrNotExist) {
+			t.Fatal(readErr)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("wedged account worker did not publish its process identity")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	err = <-result
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("prepare account backing error = %v, want deadline exceeded", err)
 	}
 	workers.Close()
 	workers.Cancel()
-	if err := workers.Wait(context.Background()); err != nil {
-		t.Fatal(err)
+	waitErr := workers.Wait(context.Background())
+	workersSettled = true
+	if waitErr != nil {
+		t.Fatal(waitErr)
 	}
 	records, err := recordStore.Load(context.Background())
 	if err != nil {
@@ -103,5 +147,9 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Fatalf("durable worker records after cancellation = %+v", records)
+	}
+	if current, probeErr := daemonproc.Probe(identity.PID); probeErr == nil &&
+		current.Boot == identity.Boot && current.StartTime == identity.StartTime {
+		t.Fatalf("exact wedged account worker survived cancellation: %+v", current)
 	}
 }

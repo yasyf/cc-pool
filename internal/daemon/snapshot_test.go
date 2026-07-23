@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/forecast"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 )
@@ -259,7 +258,7 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			t.Errorf("pool pace_7d = %s, want 0", got)
 		}
 
-		// score.Components has no json tags (PascalCase keys); the widget must
+		// ScoreComponents has no json tags (PascalCase keys); the widget must
 		// skip it, never decode it.
 		var components map[string]json.RawMessage
 		if err := json.Unmarshal(accounts[0]["components"], &components); err != nil {
@@ -479,8 +478,8 @@ func TestStatusSnapshotWeeklyExhaustedMood(t *testing.T) {
 	if snap.Pool == nil {
 		t.Fatal("pool block missing from a sampled snapshot")
 	}
-	if snap.Pool.Mood != forecast.MoodAlarmed {
-		t.Errorf("pool mood = %q, want %q for an all-weekly-exhausted pool", snap.Pool.Mood, forecast.MoodAlarmed)
+	if snap.Pool.Mood != PoolMoodAlarmed {
+		t.Errorf("pool mood = %q, want %q for an all-weekly-exhausted pool", snap.Pool.Mood, PoolMoodAlarmed)
 	}
 
 	// Clearing the flag on one account drops the pool back below the floor,
@@ -490,7 +489,7 @@ func TestStatusSnapshotWeeklyExhaustedMood(t *testing.T) {
 	if relaxed.Pool == nil {
 		t.Fatal("pool block missing from a sampled snapshot")
 	}
-	if relaxed.Pool.Mood == forecast.MoodAlarmed {
+	if relaxed.Pool.Mood == PoolMoodAlarmed {
 		t.Errorf("pool mood = %q; partial exhaustion must not floor at alarmed", relaxed.Pool.Mood)
 	}
 }
@@ -608,8 +607,8 @@ func TestWriteStatusSnapshotForecast(t *testing.T) {
 	// Mean effective weekly remaining 70 is weekly-chill, but Pace7d≈1.68 (≥1.25)
 	// bumps the weekly bucket chill→easy; worst-of holds easy, then the projected
 	// 5h dry-out bumps easy→uneasy.
-	if snap.Pool.Mood != forecast.MoodUneasy {
-		t.Errorf("pool mood = %q, want %q", snap.Pool.Mood, forecast.MoodUneasy)
+	if snap.Pool.Mood != PoolMoodUneasy {
+		t.Errorf("pool mood = %q, want %q", snap.Pool.Mood, PoolMoodUneasy)
 	}
 }
 

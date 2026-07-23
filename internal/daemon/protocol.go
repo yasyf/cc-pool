@@ -15,18 +15,23 @@ import (
 // to this derived snapshot.
 const SnapshotVersion = 1
 
-// BusinessBuild is the exact control-plane schema identity.
-const BusinessBuild = "cc-pool.rpc.v1"
+// DaemonHealthSchema is the sole hard-cut runtime-health schema.
+const DaemonHealthSchema uint16 = 1
+
+//go:generate go run ./wirebuildgen -protocol protocol.go -output wirebuild_gen.go
 
 // ServiceRoleID is the exact request-daemon role shared by launchd and lifecycle admission.
 const ServiceRoleID = "com.yasyf.cc-pool"
+
+// StopRoleID is the controller-launched one-shot daemon settlement role.
+const StopRoleID = "com.yasyf.cc-pool.stop-control"
 
 // Op is a request operation.
 type Op string
 
 const (
-	// OpHealth returns the exact ready daemon build over the ordinary business session.
-	OpHealth Op = "daemon-health"
+	// OpHealth returns the exact ready daemon build through daemonkit's immutable observation route.
+	OpHealth Op = "cc-pool.runtime.health"
 	// OpSelect prepares an inspection for PID 0 or reserves a tracked launch for PID > 0.
 	OpSelect Op = "select"
 	// OpSelectCommit commits a provisional selection immediately before launch.
@@ -160,6 +165,36 @@ type Request struct {
 	MutationReceipt *[32]byte               `json:"mutation_receipt,omitempty"`
 }
 
+// DaemonHealthRequest selects the exact v1 immutable daemon-health schema.
+type DaemonHealthRequest struct {
+	Schema uint16 `json:"schema"`
+}
+
+// DaemonHealthResponse is one exact daemon process-generation lifecycle snapshot.
+type DaemonHealthResponse struct {
+	Schema            uint16             `json:"schema"`
+	RuntimeBuild      string             `json:"runtime_build"`
+	RuntimeProtocol   int                `json:"runtime_protocol"`
+	ProcessGeneration string             `json:"process_generation"`
+	PID               int                `json:"pid"`
+	State             DaemonRuntimeState `json:"state"`
+	Draining          bool               `json:"draining"`
+	Busy              bool               `json:"busy"`
+	Ready             bool               `json:"ready"`
+}
+
+// DaemonRuntimeState is the exact v1 daemon-health state enum.
+type DaemonRuntimeState string
+
+const (
+	// DaemonRuntimeStateHealthy means the runtime is fully operational.
+	DaemonRuntimeStateHealthy DaemonRuntimeState = "healthy"
+	// DaemonRuntimeStateDegraded means the runtime remains available with reduced capability.
+	DaemonRuntimeStateDegraded DaemonRuntimeState = "degraded"
+	// DaemonRuntimeStateFailed means the runtime cannot safely serve work.
+	DaemonRuntimeStateFailed DaemonRuntimeState = "failed"
+)
+
 // CredentialMoveOutcome classifies one account's credential move result.
 type CredentialMoveOutcome string
 
@@ -194,6 +229,52 @@ type LedgerState struct {
 	NextDue  time.Time `json:"next_due,omitzero"`
 	LastErr  string    `json:"last_err,omitempty"`
 	LastAt   time.Time `json:"last_at,omitzero"`
+}
+
+// ScoreComponents is the exact v1 wire projection of the scoring breakdown.
+type ScoreComponents struct {
+	Eff5                        float64
+	Eff7                        float64
+	RawRemaining5h              float64
+	RawRemaining7d              float64
+	Remaining5h                 float64
+	Remaining7d                 float64
+	SessionPenalty              float64
+	RateLimitPenalty            float64
+	NeedsLoginPenalty           float64
+	CredentialQuarantinePenalty float64
+	StalePenalty                float64
+	Barrier5h                   float64
+	Barrier7d                   float64
+	RunwayPenalty               float64
+}
+
+// ScoreComponentsFromDomain converts the scoring model into its exact wire projection.
+func ScoreComponentsFromDomain(components score.Components) ScoreComponents {
+	return ScoreComponents{
+		Eff5: components.Eff5, Eff7: components.Eff7,
+		RawRemaining5h: components.RawRemaining5h, RawRemaining7d: components.RawRemaining7d,
+		Remaining5h: components.Remaining5h, Remaining7d: components.Remaining7d,
+		SessionPenalty: components.SessionPenalty, RateLimitPenalty: components.RateLimitPenalty,
+		NeedsLoginPenalty:           components.NeedsLoginPenalty,
+		CredentialQuarantinePenalty: components.CredentialQuarantinePenalty,
+		StalePenalty:                components.StalePenalty, Barrier5h: components.Barrier5h,
+		Barrier7d: components.Barrier7d, RunwayPenalty: components.RunwayPenalty,
+	}
+}
+
+// ScoreComponentsToDomain converts the exact wire projection into the scoring model.
+func ScoreComponentsToDomain(components ScoreComponents) score.Components {
+	return score.Components{
+		Eff5: components.Eff5, Eff7: components.Eff7,
+		RawRemaining5h: components.RawRemaining5h, RawRemaining7d: components.RawRemaining7d,
+		Remaining5h: components.Remaining5h, Remaining7d: components.Remaining7d,
+		SessionPenalty: components.SessionPenalty, RateLimitPenalty: components.RateLimitPenalty,
+		NeedsLoginPenalty:           components.NeedsLoginPenalty,
+		CredentialQuarantinePenalty: components.CredentialQuarantinePenalty,
+		StalePenalty:                components.StalePenalty, Barrier5h: components.Barrier5h,
+		Barrier7d: components.Barrier7d, RunwayPenalty: components.RunwayPenalty,
+	}
 }
 
 // AccountStatus is the per-account view returned by status/select.
@@ -240,7 +321,7 @@ type AccountStatus struct {
 	// is pegged with its reset pending; feeds the daemon-side pool mood.
 	WeeklyExhausted bool `json:"weekly_exhausted,omitempty"`
 	// Components is the per-term score breakdown.
-	Components score.Components `json:"components"`
+	Components ScoreComponents `json:"components"`
 }
 
 // StatusSnapshot is the on-disk mirror of the status op, written atomically to
@@ -259,6 +340,43 @@ type StatusSnapshot struct {
 	Ledgers []LedgerState `json:"ledgers,omitempty"`
 }
 
+// PoolMood is the exact v1 pool-health mood enum.
+type PoolMood string
+
+const (
+	// PoolMoodChill is the calmest pool state.
+	PoolMoodChill PoolMood = "chill"
+	// PoolMoodEasy indicates ample headroom.
+	PoolMoodEasy PoolMood = "easy"
+	// PoolMoodUneasy indicates tightening headroom.
+	PoolMoodUneasy PoolMood = "uneasy"
+	// PoolMoodWorried indicates near-term pressure.
+	PoolMoodWorried PoolMood = "worried"
+	// PoolMoodAlarmed indicates severe pressure.
+	PoolMoodAlarmed PoolMood = "alarmed"
+	// PoolMoodPanic is the most severe pool state.
+	PoolMoodPanic PoolMood = "panic"
+)
+
+func poolMoodFromForecast(mood forecast.Mood) PoolMood {
+	switch mood {
+	case forecast.MoodChill:
+		return PoolMoodChill
+	case forecast.MoodEasy:
+		return PoolMoodEasy
+	case forecast.MoodUneasy:
+		return PoolMoodUneasy
+	case forecast.MoodWorried:
+		return PoolMoodWorried
+	case forecast.MoodAlarmed:
+		return PoolMoodAlarmed
+	case forecast.MoodPanic:
+		return PoolMoodPanic
+	default:
+		panic("daemon: unknown forecast mood " + string(mood))
+	}
+}
+
 // PoolOutlook is the wire form of the forecast pool rollup. Mood is computed
 // daemon-side so the widget mascot and CLI rendering always agree.
 type PoolOutlook struct {
@@ -271,10 +389,10 @@ type PoolOutlook struct {
 	// NetBurn5hPerHour is required because zero is a real idle-pool value.
 	NetBurn5hPerHour float64 `json:"net_burn_5h_per_hour"`
 	// Pace5h and Pace7d are required because zero is a real idle-pool value.
-	Pace5h float64       `json:"pace_5h"`
-	Pace7d float64       `json:"pace_7d"`
-	DryAt  time.Time     `json:"dry_at,omitzero"`
-	Mood   forecast.Mood `json:"mood"`
+	Pace5h float64   `json:"pace_5h"`
+	Pace7d float64   `json:"pace_7d"`
+	DryAt  time.Time `json:"dry_at,omitzero"`
+	Mood   PoolMood  `json:"mood"`
 }
 
 // NewStatusSnapshot builds the stamped snapshot plus pool rollup. GeneratedAt
@@ -317,7 +435,7 @@ func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 			Pace5h:           p.Pace5h,
 			Pace7d:           p.Pace7d,
 			DryAt:            p.DryAt,
-			Mood:             p.Mood,
+			Mood:             poolMoodFromForecast(p.Mood),
 		}
 	}
 	return snap

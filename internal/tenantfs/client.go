@@ -32,7 +32,7 @@ func NewClient(ctx context.Context, socket string) (*Client, error) {
 		return nil, errors.New("tenantfs: FuseKit socket is empty")
 	}
 	session, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), Build: transportproto.Build,
+		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
 	})
 	if err != nil {
 		return nil, err

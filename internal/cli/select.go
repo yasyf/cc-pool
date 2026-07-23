@@ -158,11 +158,8 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 	if err != nil {
 		return nil, fmt.Errorf("require daemon: %w", err)
 	}
-	if !health.OK {
-		return nil, fmt.Errorf("require daemon: %s", health.Error)
-	}
-	if health.Version != version.String() {
-		return nil, fmt.Errorf("require exact daemon version: daemon=%s client=%s", health.Version, version.String())
+	if health.RuntimeBuild != version.String() {
+		return nil, fmt.Errorf("require exact daemon version: daemon=%s client=%s", health.RuntimeBuild, version.String())
 	}
 	for {
 		resp, err := cl.Select(ctx, req.account, req.process, req.cwd, req.wait, req.excludeIDs)
@@ -225,12 +222,12 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 	}
 }
 
-func startSelectionDaemon(ctx context.Context, cmd *cobra.Command, cl *daemon.Client) (*daemon.Response, error) {
+func startSelectionDaemon(ctx context.Context, cmd *cobra.Command, cl *daemon.Client) (*daemon.DaemonHealthResponse, error) {
 	want := version.String()
 	step(cmd.OutOrStdout(), "Starting the cc-pool daemon…")
 	if err := installSelectionDaemon(ctx, cmd); err != nil {
 		health, healthErr := cl.HealthContext(ctx)
-		if healthErr == nil && health.OK && health.Version == want {
+		if healthErr == nil && health.RuntimeBuild == want {
 			return health, nil
 		}
 		warn(cmd.ErrOrStderr(),
@@ -242,11 +239,11 @@ func startSelectionDaemon(ctx context.Context, cmd *cobra.Command, cl *daemon.Cl
 	defer cancel()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	var health *daemon.Response
+	var health *daemon.DaemonHealthResponse
 	var err error
 	for {
 		health, err = cl.HealthContext(waitCtx)
-		if err == nil && health.OK && health.Version == want {
+		if err == nil && health.RuntimeBuild == want {
 			return health, nil
 		}
 		select {

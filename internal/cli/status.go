@@ -302,7 +302,7 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 			Scoped7dResets:        a.Scoped7dResets,
 			Scoped7dModel:         a.Scoped7dModel,
 			WeeklyExhausted:       a.WeeklyExhausted,
-			Components:            a.Components,
+			Components:            daemon.ScoreComponentsToDomain(a.Components),
 		}
 		// Display fields only: the wire carries no keychain fields, so credential
 		// operations must re-load the account from the store (statusTUI.resolveAccount).

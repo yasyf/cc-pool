@@ -23,6 +23,13 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if recognized, err := daemon.RunStopControlChild(ctx, os.Args[1:]); recognized {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if hostsync.IsWorkerInvocation(os.Args[1:]) {
 		owner, err := supervise.ReceiveTrackedOwner(ctx, proc.RecoverySourceOwner)
 		if err != nil {

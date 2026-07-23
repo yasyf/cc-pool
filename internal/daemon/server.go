@@ -120,8 +120,13 @@ type Server struct {
 	tenantClient        *tenantfs.Client
 	tenantCoordinator   *tenantCoordinator
 	holderSessionDone   <-chan struct{}
+	holderMonitorMu     sync.Mutex
+	holderMonitorCancel context.CancelFunc
 	holderActive        atomic.Bool
 	holderLost          atomic.Bool
+	runtimePublished    atomic.Bool
+	runtimeShutdown     func(context.Context) error
+	runtimeHealth       func(context.Context) (dkdaemon.Health, error)
 	prepareAccount      func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error)
 	activatePrepared    func(context.Context, store.Account, catalogproto.TenantPreparationProof, func() error) error
 	preflightCredential func(context.Context, store.Account) error
@@ -180,6 +185,7 @@ func Run(ctx context.Context) error {
 func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	s.holderActive.Store(false)
 	s.holderLost.Store(false)
+	s.runtimePublished.Store(false)
 	if err := ensureHolderRuntime(activation.Startup); err != nil {
 		return err
 	}
@@ -225,8 +231,45 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 		return fmt.Errorf("initialize FuseKit tenants: %w", err)
 	}
 	s.holderActive.Store(true)
+	monitorCtx, monitorCancel := context.WithCancel(activation.Lifetime)
+	s.holderMonitorMu.Lock()
+	s.holderMonitorCancel = monitorCancel
+	s.holderMonitorMu.Unlock()
+	s.wg.Add(1)
+	go s.monitorHolderSession(monitorCtx, s.holderSessionDone)
 	published = true
 	return nil
+}
+
+func (s *Server) cancelHolderMonitor() {
+	s.holderMonitorMu.Lock()
+	cancel := s.holderMonitorCancel
+	s.holderMonitorMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *Server) monitorHolderSession(ctx context.Context, done <-chan struct{}) {
+	defer s.wg.Done()
+	select {
+	case <-ctx.Done():
+		return
+	case <-done:
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	s.holderActive.Store(false)
+	s.holderLost.Store(true)
+	s.runtimePublished.Store(false)
+	if s.runtimeShutdown == nil {
+		s.log.Printf("FuseKit holder session lost without runtime shutdown ownership")
+		return
+	}
+	if err := s.runtimeShutdown(context.Background()); err != nil {
+		s.log.Printf("shut down after FuseKit holder session loss: %v", err)
+	}
 }
 
 func (s *Server) clearActivation() {
@@ -286,12 +329,15 @@ func (s *Server) detectAndSetUserAgent(ctx context.Context) {
 }
 
 func (s *Server) serve(ctx context.Context) error {
-	wireServer, runtime, err := s.runtime()
+	_, runtime, err := s.runtime()
 	if err != nil {
 		return err
 	}
-	wireServer.RegisterLifecycle(runtime)
 	err = runtime.Run(ctx)
+	s.log.Printf("daemon stopped")
+	if s.holderLost.Load() {
+		err = errors.Join(errHolderSessionLost, err)
+	}
 	if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 		return nil
 	}
@@ -304,8 +350,6 @@ func (s *Server) markClosing() { s.closing.Store(true) }
 
 func (s *Server) dispatch(ctx context.Context, req Request) Response {
 	switch req.Op {
-	case OpHealth:
-		return Response{OK: true, Version: version.String()}
 	case OpStatus:
 		return s.handleStatus(ctx)
 	case OpSelect:
@@ -761,7 +805,7 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 			Scoped7dResets:     sn.Scoped7dResets,
 			Scoped7dModel:      sn.Scoped7dModel,
 			WeeklyExhausted:    sn.WeeklyExhausted,
-			Components:         sn.Components,
+			Components:         ScoreComponentsFromDomain(sn.Components),
 		})
 	}
 	return out

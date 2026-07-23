@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
@@ -13,12 +13,12 @@ import (
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
 )
 
 const (
-	holderReadinessWindow  = 15 * time.Second
 	holderServiceWorkers   = 1
 	holderServiceCloseWait = 30 * time.Second
 )
@@ -40,17 +40,24 @@ var (
 	) (holderServiceController, error) {
 		return service.NewController(ctx, config)
 	}
-	holderRuntimeReady = func(ctx context.Context, socket string) error {
+	holderRuntimeHealth = func(ctx context.Context, socket string) (mountproto.RuntimeHealthResponse, error) {
 		client, err := tenantfs.NewClient(ctx, socket)
 		if err != nil {
-			return err
+			return mountproto.RuntimeHealthResponse{}, err
 		}
 		runtimeHealth, err := client.RuntimeHealth(ctx)
 		closeErr := client.Close()
 		if err != nil {
-			return errors.Join(err, closeErr)
+			return mountproto.RuntimeHealthResponse{}, errors.Join(err, closeErr)
 		}
-		return errors.Join(validateHolderRuntimeHealth(runtimeHealth), closeErr)
+		return runtimeHealth, closeErr
+	}
+	holderRuntimeReady = func(ctx context.Context, socket string) error {
+		runtimeHealth, err := holderRuntimeHealth(ctx, socket)
+		if err != nil {
+			return err
+		}
+		return validateHolderRuntimeHealth(runtimeHealth)
 	}
 	holderReady = func(ctx context.Context, socket string) error {
 		return holderRuntimeReady(ctx, socket)
@@ -72,8 +79,45 @@ var (
 )
 
 func validateHolderRuntimeHealth(health mountproto.RuntimeHealthResponse) error {
+	if health.Protocol != mountproto.Version || health.Code != mountproto.ErrorCodeOk || health.Message != "" {
+		return fmt.Errorf(
+			"holder runtime health response is not exact: protocol=%d code=%q message=%q",
+			health.Protocol, health.Code, health.Message,
+		)
+	}
+	if health.RuntimeBuild != version.String() {
+		return fmt.Errorf(
+			"holder runtime build is not exact: build=%q want=%q",
+			health.RuntimeBuild, version.String(),
+		)
+	}
+	if health.RuntimeProtocol != mountproto.RuntimeProtocolVersion {
+		return fmt.Errorf(
+			"holder runtime protocol is not exact: protocol=%d want=%d",
+			health.RuntimeProtocol, mountproto.RuntimeProtocolVersion,
+		)
+	}
+	if health.RuntimePID <= 0 {
+		return fmt.Errorf("holder runtime pid is invalid: pid=%d", health.RuntimePID)
+	}
+	if health.ProcessGeneration == "" {
+		return errors.New("holder runtime process generation is empty")
+	}
 	if health.ActivationGeneration == "" {
 		return errors.New("holder runtime activation generation is empty")
+	}
+	if health.State != mountproto.RuntimeStateHealthy || health.Draining || health.Busy {
+		return fmt.Errorf(
+			"holder runtime lifecycle is not ready: state=%q draining=%t busy=%t",
+			health.State, health.Draining, health.Busy,
+		)
+	}
+	if health.ReadinessPhase != mountproto.ReadinessPhaseReady ||
+		health.ReadinessStep != mountproto.ReadinessStepPublished {
+		return fmt.Errorf(
+			"holder runtime readiness is not published: phase=%q step=%q",
+			health.ReadinessPhase, health.ReadinessStep,
+		)
 	}
 	if health.NativePhase != mountproto.NativePhaseLive || health.NativeMount == nil {
 		return fmt.Errorf(
@@ -95,11 +139,15 @@ func validateHolderRuntimeHealth(health mountproto.RuntimeHealthResponse) error 
 			proof.PresentationRoot, proof.Filesystem, proof.Source, proof.RootReadEpoch,
 		)
 	}
+	if health.BrokerPhase != mountproto.BrokerPhaseLive {
+		return fmt.Errorf("holder broker is not ready: phase=%q", health.BrokerPhase)
+	}
 	return nil
 }
 
 type holderServiceController interface {
 	Converge(context.Context, []service.Agent) error
+	StopRuntime(context.Context, service.StopControlSpec) (wire.StopResult, error)
 	Close(context.Context) error
 }
 
@@ -128,6 +176,7 @@ func HolderDeploymentPlan() (holder.DeploymentPlan, error) {
 		RuntimeDirectory:    pool.FuseKitRuntimeDir(),
 		PresentationRoot:    pool.FuseKitPresentationRoot(),
 		BuildID:             version.String(),
+		Readiness:           holderbridge.ReadinessContract(),
 		SourceCapable:       true,
 		BrokerPolicyDigest:  holderEntitlementPolicyDigest,
 		RuntimePolicyDigest: holderEntitlementPolicyDigest,
@@ -136,7 +185,16 @@ func HolderDeploymentPlan() (holder.DeploymentPlan, error) {
 
 // StopAndUninstallHolderService removes the holder from the complete desired service set.
 func StopAndUninstallHolderService(ctx context.Context) error {
-	if err := convergeHolderServices(ctx, nil); err != nil {
+	plan, err := HolderDeploymentPlan()
+	if err != nil {
+		return fmt.Errorf("derive FuseKit holder plan: %w", err)
+	}
+	if err := withHolderServiceController(ctx, func(controller holderServiceController) error {
+		if err := stopObservedHolderRuntime(ctx, controller, plan, wire.StopIntentUninstall); err != nil {
+			return err
+		}
+		return controller.Converge(ctx, nil)
+	}); err != nil {
 		return fmt.Errorf("remove FuseKit holder service: %w", err)
 	}
 	return nil
@@ -170,10 +228,13 @@ func InstallHolderService(ctx context.Context) (HolderServiceInstall, error) {
 			return fmt.Errorf("inspect FuseKit holder service: %w", err)
 		}
 		install.created = !preexisting
+		if err := stopObservedHolderRuntime(ctx, controller, plan, wire.StopIntentUpgrade); err != nil {
+			return err
+		}
 		if err := controller.Converge(ctx, []service.Agent{agent}); err != nil {
 			return fmt.Errorf("converge FuseKit holder service: %w", err)
 		}
-		readyCtx, cancel := context.WithTimeout(ctx, holderReadinessWindow)
+		readyCtx, cancel := context.WithTimeout(ctx, plan.Readiness().ObservationTimeout())
 		defer cancel()
 		for {
 			err := holderReady(readyCtx, plan.Paths().Socket)
@@ -195,10 +256,58 @@ func InstallHolderService(ctx context.Context) (HolderServiceInstall, error) {
 	return HolderServiceInstall{}, errors.Join(err, install.Rollback(ctx))
 }
 
-func convergeHolderServices(ctx context.Context, agents []service.Agent) error {
-	return withHolderServiceController(ctx, func(controller holderServiceController) error {
-		return controller.Converge(ctx, agents)
+func validateHolderStopTarget(health mountproto.RuntimeHealthResponse) error {
+	if health.Protocol != mountproto.Version || health.Code != mountproto.ErrorCodeOk || health.Message != "" {
+		return fmt.Errorf(
+			"holder stop target response is not exact: protocol=%d code=%q message=%q",
+			health.Protocol, health.Code, health.Message,
+		)
+	}
+	if health.RuntimeBuild == "" || health.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
+		health.RuntimePID <= 1 || health.ProcessGeneration == "" {
+		return fmt.Errorf(
+			"holder stop target identity is incomplete: build=%q protocol=%d pid=%d generation=%q",
+			health.RuntimeBuild, health.RuntimeProtocol, health.RuntimePID, health.ProcessGeneration,
+		)
+	}
+	return nil
+}
+
+func stopObservedHolderRuntime(
+	ctx context.Context,
+	controller holderServiceController,
+	plan holder.DeploymentPlan,
+	intent wire.StopIntent,
+) error {
+	stopCtx, cancel := context.WithTimeout(ctx, plan.Readiness().ObservationTimeout())
+	defer cancel()
+	health, err := holderRuntimeHealth(stopCtx, plan.Paths().Socket)
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("observe FuseKit holder stop target: %w", err)
+	}
+	if err := validateHolderStopTarget(health); err != nil {
+		return err
+	}
+	if intent == wire.StopIntentUpgrade && health.RuntimeBuild == version.String() &&
+		validateHolderRuntimeHealth(health) == nil {
+		return nil
+	}
+	if intent == wire.StopIntentUpgrade && health.RuntimeBuild == version.String() {
+		intent = wire.StopIntentRestart
+	}
+	_, err = controller.StopRuntime(stopCtx, service.StopControlSpec{
+		Executable: plan.RuntimeExecutable(),
+		Args:       holder.StopControlChildArguments(), Role: holderbridge.StopRoleID,
+		RuntimeBuild: version.String(), RuntimeProtocol: int(mountproto.RuntimeProtocolVersion),
+		TargetProcessGeneration: health.ProcessGeneration, Intent: intent,
 	})
+	if err != nil {
+		return fmt.Errorf("stop exact FuseKit holder generation: %w", err)
+	}
+	return nil
 }
 
 func withHolderServiceController(
@@ -206,8 +315,8 @@ func withHolderServiceController(
 	run func(holderServiceController) error,
 ) (err error) {
 	controller, err := holderControllerOpen(ctx, service.ControllerConfig{
-		StatePath:   filepath.Join(pool.FuseKitRuntimeDir(), "service-state.db"),
-		ProcessPath: filepath.Join(pool.FuseKitRuntimeDir(), "service-processes.db"),
+		StatePath:   pool.FuseKitServiceStatePath(),
+		ProcessPath: pool.FuseKitServiceProcessStorePath(),
 		WorkerLimit: holderServiceWorkers,
 	})
 	if err != nil {

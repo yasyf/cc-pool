@@ -142,8 +142,8 @@ func requireDaemon(m *pool.Manager, purpose string) (*daemon.Client, error) {
 		// Dial ok, probe failed: hung not absent — don't prescribe a restart (masks the real failure).
 		return nil, fmt.Errorf("daemon health check: %w", err)
 	}
-	if health.Version != version.String() {
-		return nil, fmt.Errorf("the daemon is %s but this ccp is %s; restart it with `ccp service install` and re-run", health.Version, version.String())
+	if health.RuntimeBuild != version.String() {
+		return nil, fmt.Errorf("the daemon is %s but this ccp is %s; restart it with `ccp service install` and re-run", health.RuntimeBuild, version.String())
 	}
 	keepClient = true
 	return cl, nil

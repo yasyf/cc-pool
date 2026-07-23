@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"errors"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,22 +13,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/cc-pool/internal/version"
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/wire"
 )
-
-type handlerLifecycle struct{}
-
-func (handlerLifecycle) Health(context.Context) (dkdaemon.Health, error) {
-	return dkdaemon.Health{
-		Build: version.String(), Protocol: int(wire.ProtocolVersion), PID: os.Getpid(), State: dkdaemon.StateHealthy,
-	}, nil
-}
-
-func (handlerLifecycle) Shutdown(context.Context) error { return nil }
-func (handlerLifecycle) Handoff(context.Context) error  { return nil }
 
 // newCredMoveServer builds the shared test server with existing config dirs
 // and a distinct keychain service per account — the fixture's shared service
@@ -136,20 +121,14 @@ func serveHandlerOnSocket(t *testing.T, s *Server) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	socket := filepath.Join(sockDir, "d.sock")
-	ln, err := net.Listen("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
 	ladder, err := operationLadder()
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := &wire.Server{
-		Build: BusinessBuild, LifecycleBuild: version.String(), Ladder: ladder,
-		MaxSessions: 2, ReservedProtectedSessions: 1,
-		ProtectedSessionClassifier: buildTestProtectedClassifier{},
+		WireBuild: WireBuild, Ladder: ladder, MaxSessions: 2,
 	}
-	for _, op := range []Op{OpHealth, OpSelect, OpSelectCommit, OpSelectAbort, OpStatus, OpCredMove} {
+	for _, op := range []Op{OpSelect, OpSelectCommit, OpSelectAbort, OpStatus, OpCredMove} {
 		op := op
 		server.RegisterConcurrent(wire.Op(op), func(ctx context.Context, request wire.Request) (any, error) {
 			var payload Request
@@ -160,21 +139,8 @@ func serveHandlerOnSocket(t *testing.T, s *Server) string {
 			return s.dispatch(ctx, payload), nil
 		})
 	}
-	server.RegisterLifecycle(handlerLifecycle{})
-	intake := &drain.Intake{}
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() {
-		done <- server.Serve(ctx, ln, func() error { return nil }, intake.Admit, intake.AdmitLifecycle)
-	}()
-	t.Cleanup(func() {
-		intake.Close()
-		_ = server.CloseIntake()
-		_ = intake.Settle(context.Background())
-		cancel()
-		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("serve v1 test socket: %v", err)
-		}
+	startTestWireRuntime(t, socket, "test-runtime", server, buildTestProtectedClassifier{}, []wire.ObservationRoute{
+		testHealthObservation("test-runtime", nil),
 	})
 	return socket
 }

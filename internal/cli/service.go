@@ -17,6 +17,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/daemonkit/wire"
 )
 
 // Test seams: tests must never touch real processes, mounts, or launchctl/brew.
@@ -30,17 +31,24 @@ var (
 	openDaemonServiceController = func(ctx context.Context) (daemonServiceController, error) {
 		return service.NewController(ctx, daemonServiceControllerConfig())
 	}
+	observeDaemonRuntime = func(ctx context.Context) (*daemon.DaemonHealthResponse, error) {
+		client := daemon.NewClient()
+		defer client.Close()
+		return client.ObserveHealthContext(ctx)
+	}
 )
 
 const (
 	daemonServiceWorkerLimit  = 1
 	daemonServiceCloseTimeout = 30 * time.Second
 	daemonServiceReadyTimeout = 10 * time.Second
+	daemonServiceStopTimeout  = 65 * time.Second
 	daemonServicePATH         = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 )
 
 type daemonServiceController interface {
 	Converge(context.Context, []service.Agent) error
+	StopRuntime(context.Context, service.StopControlSpec) (wire.StopResult, error)
 	Close(context.Context) error
 }
 
@@ -65,7 +73,7 @@ func ccpAgent(executable string) (service.Agent, error) {
 }
 
 func resolveDaemonServiceExecutable() (string, error) {
-	executable, err := daemon.ServiceRolePath()
+	executable, err := daemon.CurrentServiceExecutable()
 	if err != nil {
 		return "", err
 	}
@@ -77,8 +85,8 @@ func resolveDaemonServiceExecutable() (string, error) {
 
 func daemonServiceControllerConfig() service.ControllerConfig {
 	return service.ControllerConfig{
-		StatePath:   filepath.Join(pool.StateDir(), "daemon-services.db"),
-		ProcessPath: filepath.Join(pool.StateDir(), "daemon-service-processes.db"),
+		StatePath:   pool.DaemonServiceStatePath(),
+		ProcessPath: pool.DaemonServiceProcessStorePath(),
 		WorkerLimit: daemonServiceWorkerLimit,
 	}
 }
@@ -129,8 +137,8 @@ func newServiceCmd() *cobra.Command {
 				cl := daemon.NewClient()
 				resp, healthErr := cl.Health()
 				_ = cl.Close()
-				if healthErr == nil && resp.OK {
-					_, _ = fmt.Fprintf(out, "Daemon: running (%s)\n", resp.Version)
+				if healthErr == nil {
+					_, _ = fmt.Fprintf(out, "Daemon: running (%s)\n", resp.RuntimeBuild)
 				} else {
 					_, _ = fmt.Fprintln(out, "Daemon: not responding")
 				}
@@ -221,6 +229,13 @@ func gateUninstallSessions(accts []store.Account) error {
 func stopDaemonService(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	if err := withDaemonServiceController(cmd.Context(), func(controller daemonServiceController) error {
+		executable, err := serviceExecutable()
+		if err != nil {
+			return err
+		}
+		if err := stopObservedDaemonRuntime(cmd.Context(), controller, executable, wire.StopIntentUninstall); err != nil {
+			return err
+		}
 		return controller.Converge(cmd.Context(), nil)
 	}); err != nil {
 		return err
@@ -310,6 +325,9 @@ func installDaemonService(ctx context.Context) (err error) {
 		}
 	}()
 	if err := withDaemonServiceController(ctx, func(controller daemonServiceController) error {
+		if err := stopObservedDaemonRuntime(ctx, controller, executable, wire.StopIntentUpgrade); err != nil {
+			return err
+		}
 		if err := controller.Converge(ctx, []service.Agent{agent}); err != nil {
 			return err
 		}
@@ -328,6 +346,39 @@ func installDaemonService(ctx context.Context) (err error) {
 		return errors.Join(readyErr, daemonRollbackErr)
 	}); err != nil {
 		return err
+	}
+	return nil
+}
+
+func stopObservedDaemonRuntime(
+	ctx context.Context,
+	controller daemonServiceController,
+	executable string,
+	intent wire.StopIntent,
+) error {
+	stopCtx, cancel := context.WithTimeout(ctx, daemonServiceStopTimeout)
+	defer cancel()
+	health, err := observeDaemonRuntime(stopCtx)
+	if errors.Is(err, daemon.ErrDaemonUnavailable) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("observe cc-pool daemon stop target: %w", err)
+	}
+	if intent == wire.StopIntentUpgrade && health.RuntimeBuild == version.String() &&
+		health.State == daemon.DaemonRuntimeStateHealthy && !health.Draining && !health.Busy && health.Ready {
+		return nil
+	}
+	if intent == wire.StopIntentUpgrade && health.RuntimeBuild == version.String() {
+		intent = wire.StopIntentRestart
+	}
+	_, err = controller.StopRuntime(stopCtx, service.StopControlSpec{
+		Executable: executable, Args: daemon.StopControlChildArguments(), Role: daemon.StopRoleID,
+		RuntimeBuild: version.String(), RuntimeProtocol: int(wire.ProtocolVersion),
+		TargetProcessGeneration: health.ProcessGeneration, Intent: intent,
+	})
+	if err != nil {
+		return fmt.Errorf("stop exact cc-pool daemon generation: %w", err)
 	}
 	return nil
 }
@@ -372,8 +423,8 @@ func daemonHealth(ctx context.Context, wantVersion string) error {
 	if err != nil {
 		return err
 	}
-	if !resp.OK || resp.Version != wantVersion {
-		return fmt.Errorf("daemon identity is not exact: ready=%t build=%q, want build=%q", resp.OK, resp.Version, wantVersion)
+	if resp.RuntimeBuild != wantVersion {
+		return fmt.Errorf("daemon identity is not exact: build=%q, want build=%q", resp.RuntimeBuild, wantVersion)
 	}
 	return nil
 }

@@ -25,3 +25,26 @@ func TestServerWorkersWaitHonorsShutdownDeadline(t *testing.T) {
 		t.Fatalf("Wait() elapsed = %s, ignored shutdown deadline", elapsed)
 	}
 }
+
+func TestServerWorkersCancelSettlesHolderMonitorBeforeLifetimeCancellation(t *testing.T) {
+	server := &Server{syncIntake: &drain.Intake{}}
+	lifetime, cancelLifetime := context.WithCancel(t.Context())
+	defer cancelLifetime()
+	monitorCtx, cancelMonitor := context.WithCancel(lifetime)
+	server.holderMonitorMu.Lock()
+	server.holderMonitorCancel = cancelMonitor
+	server.holderMonitorMu.Unlock()
+	server.wg.Add(1)
+	go server.monitorHolderSession(monitorCtx, make(chan struct{}))
+
+	workers := &serverWorkers{owner: server}
+	workers.Cancel()
+	waitCtx, cancelWait := context.WithTimeout(t.Context(), time.Second)
+	defer cancelWait()
+	if err := workers.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait() after Cancel() = %v", err)
+	}
+	if lifetime.Err() != nil {
+		t.Fatalf("holder monitor required lifetime cancellation: %v", lifetime.Err())
+	}
+}

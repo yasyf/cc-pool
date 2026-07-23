@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -148,30 +149,17 @@ func TestSetupSyncWiresEverything(t *testing.T) {
 	}
 }
 
-func TestSessionServerRefusesAdmissionWhenSyncPublicationSetupFails(t *testing.T) {
+func TestServerReadinessRefusesPublicationWhenSyncSetupFails(t *testing.T) {
 	s, ctx := newWireServer(t)
 	s.m.BuildCredentialWritePublication = nil
 	s.m.SettleCredentialWrite = nil
 	s.syncSocket = filepath.Join(pool.StateDir(), "missing", "sync.sock")
-	readyCalled := false
-	admitCalled := false
-	admit := func() (func(), error) {
-		admitCalled = true
-		return func() {}, nil
-	}
-
-	err := (&sessionServer{owner: s}).Serve(
-		ctx,
-		nil,
-		func() error { readyCalled = true; return nil },
-		admit,
-		admit,
-	)
+	err := (serverReadiness{owner: s}).BeforeReady(ctx)
 	if err == nil || !strings.Contains(err.Error(), "setup host sync publication") {
-		t.Fatalf("Serve error = %v, want sync-publication setup failure", err)
+		t.Fatalf("BeforeReady error = %v, want sync-publication setup failure", err)
 	}
-	if readyCalled || admitCalled {
-		t.Fatalf("transport admitted work after setup failure: ready=%v admit=%v", readyCalled, admitCalled)
+	if s.runtimePublished.Load() {
+		t.Fatal("failed sync setup published runtime readiness")
 	}
 	if s.m.BuildCredentialWritePublication != nil || s.m.SettleCredentialWrite != nil {
 		t.Fatal("failed setup retained partial credential publication wiring")
@@ -333,33 +321,38 @@ func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
 		t.Fatalf("publish on B: %v", err)
 	}
 
-	fetcher, err := hostsync.NewSSHFetcher(b.disposableWorkers)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg, err := fetcher.Fetch(ctxB, peer)
-	if err != nil {
-		t.Fatalf("Fetch via exec peer: %v", err)
-	}
-	entry, ok := reg["u9"]
-	if !ok || !entry.Present() {
-		t.Fatalf("fetched registry missing u9: %+v", reg)
-	}
-	if entry.Value.Chain != chain {
-		t.Fatalf("fetched chain = %+v, want %+v", entry.Value.Chain, chain)
-	}
+	if err := syncservice.WithTransportRunner(ctxB, func(runner syncservice.TransportRunner) error {
+		fetcher, err := hostsync.NewSSHFetcher(runner)
+		if err != nil {
+			return err
+		}
+		reg, err := fetcher.Fetch(ctxB, peer)
+		if err != nil {
+			return fmt.Errorf("Fetch via exec peer: %w", err)
+		}
+		entry, ok := reg["u9"]
+		if !ok || !entry.Present() {
+			t.Fatalf("fetched registry missing u9: %+v", reg)
+		}
+		if entry.Value.Chain != chain {
+			t.Fatalf("fetched chain = %+v, want %+v", entry.Value.Chain, chain)
+		}
 
-	dial := func(peer string) syncservice.Transport {
-		return hostsync.PeerTransport(b.disposableWorkers, peer)
-	}
-	got, err := hostsync.FetchCredential(ctxB, dial, "u9", chain, 0, []string{peer})
-	if err != nil {
-		t.Fatalf("FetchCredential via exec peer: %v", err)
-	}
-	// The origin strips the refresh token from the envelope: the peer gets an
-	// access-token-only synced copy, never the long-lived secret.
-	if got.ClaudeAiOauth.AccessToken != "at-peer" || got.ClaudeAiOauth.RefreshToken != "" {
-		t.Fatalf("pulled credential = %+v, want the peer's access token with the refresh token stripped", got.ClaudeAiOauth)
+		dial := func(peer string) syncservice.Transport {
+			return hostsync.PeerTransport(runner, peer)
+		}
+		got, err := hostsync.FetchCredential(ctxB, dial, "u9", chain, 0, []string{peer})
+		if err != nil {
+			return fmt.Errorf("FetchCredential via exec peer: %w", err)
+		}
+		// The origin strips the refresh token from the envelope: the peer gets an
+		// access-token-only synced copy, never the long-lived secret.
+		if got.ClaudeAiOauth.AccessToken != "at-peer" || got.ClaudeAiOauth.RefreshToken != "" {
+			t.Fatalf("pulled credential = %+v, want the peer's access token with the refresh token stripped", got.ClaudeAiOauth)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

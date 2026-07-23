@@ -56,6 +56,7 @@ type inlineHostSyncRunner struct {
 	runtime     WorkerRuntime
 	tasks       []supervise.Task
 	runtimeCall int
+	transport   []bool
 }
 
 func (r *inlineHostSyncRunner) Run(ctx context.Context, task supervise.Task) error {
@@ -65,7 +66,14 @@ func (r *inlineHostSyncRunner) Run(ctx context.Context, task supervise.Task) err
 		r.t.Fatalf("task = %+v, want exact recovery worker role", task)
 	}
 	r.runtimeCall++
-	return RunWorker(ctx, task.Stdin, task.Stdout, r.runtime)
+	return RunWorker(ctx, task.Stdin, task.Stdout, func(
+		_ context.Context,
+		needsTransport bool,
+		run func(WorkerRuntime) error,
+	) error {
+		r.transport = append(r.transport, needsTransport)
+		return run(r.runtime)
+	})
 }
 
 func TestWorkerClientExecutesExactOperations(t *testing.T) {
@@ -133,6 +141,21 @@ func TestWorkerClientExecutesExactOperations(t *testing.T) {
 	if runner.runtimeCall != 7 {
 		t.Fatalf("worker calls after auth kind = %d", runner.runtimeCall)
 	}
+	wantTransport := []bool{false, false, true, true, false, false, false}
+	if len(runner.transport) != len(wantTransport) {
+		t.Fatalf("transport requests = %v, want %v", runner.transport, wantTransport)
+	}
+	for index := range wantTransport {
+		if runner.transport[index] != wantTransport[index] {
+			t.Fatalf("transport requests = %v, want %v", runner.transport, wantTransport)
+		}
+	}
+}
+
+func staticWorkerRuntime(runtime WorkerRuntime) WorkerRuntimeScope {
+	return func(_ context.Context, _ bool, run func(WorkerRuntime) error) error {
+		return run(runtime)
+	}
 }
 
 func TestWorkerProtocolRejectsTrailingAndMismatchedFrames(t *testing.T) {
@@ -150,7 +173,7 @@ func TestWorkerProtocolRejectsTrailingAndMismatchedFrames(t *testing.T) {
 		t.Fatal(err)
 	}
 	framed.WriteByte(0)
-	if err := RunWorker(t.Context(), &framed, &bytes.Buffer{}, runtime); err == nil || !strings.Contains(err.Error(), "trailing bytes") {
+	if err := RunWorker(t.Context(), &framed, &bytes.Buffer{}, staticWorkerRuntime(runtime)); err == nil || !strings.Contains(err.Error(), "trailing bytes") {
 		t.Fatalf("trailing frame error = %v", err)
 	}
 
@@ -159,7 +182,7 @@ func TestWorkerProtocolRejectsTrailingAndMismatchedFrames(t *testing.T) {
 	if err := writeWorkerFrame(&framed, request); err != nil {
 		t.Fatal(err)
 	}
-	if err := RunWorker(t.Context(), &framed, &bytes.Buffer{}, runtime); err == nil || !strings.Contains(err.Error(), "protocol mismatch") {
+	if err := RunWorker(t.Context(), &framed, &bytes.Buffer{}, staticWorkerRuntime(runtime)); err == nil || !strings.Contains(err.Error(), "protocol mismatch") {
 		t.Fatalf("protocol error = %v", err)
 	}
 }

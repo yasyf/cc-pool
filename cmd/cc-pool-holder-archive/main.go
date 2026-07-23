@@ -16,22 +16,19 @@ import (
 	"os/signal"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/holder"
 )
 
 const (
 	notChild        C.int32_t = -1
 	operationFailed C.int32_t = 1
-	startTimeout              = 60 * time.Second
-	readyTimeout              = 5 * time.Second
-	shutdownTimeout           = 30 * time.Second
 )
 
 var (
@@ -43,11 +40,17 @@ var (
 func CCPoolFuseKitDispatchChild() C.int32_t {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	recognized, err := holder.RunStopControlChild(ctx, os.Args[1:], holder.StopControlChildConfig{
+		Socket: pool.FuseKitSocketPath(),
+	})
+	if recognized {
+		return operationStatus("stop-control child", err)
+	}
 	drivers, err := claudeDriverFactories()
 	if err != nil {
 		return operationStatus("source driver registry", err)
 	}
-	recognized, err := holder.RunChild(ctx, os.Args[1:], holder.ChildConfig{
+	recognized, err = holder.RunChild(ctx, os.Args[1:], holder.ChildConfig{
 		Stdout: os.Stdout, Drivers: drivers,
 	})
 	if !recognized {
@@ -58,7 +61,9 @@ func CCPoolFuseKitDispatchChild() C.int32_t {
 
 //export CCPoolFuseKitStart
 func CCPoolFuseKitStart() C.int32_t {
-	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
+	ctx, cancel := context.WithTimeout(
+		context.Background(), holderbridge.ReadinessContract().StartupTimeout(),
+	)
 	defer cancel()
 	return operationStatus("holder start", startHolder(ctx))
 }
@@ -73,7 +78,9 @@ func startHolder(ctx context.Context) error {
 	if err == nil {
 		return nil
 	}
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+	cleanupCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx), holderbridge.ReadinessContract().SettlementTimeout(),
+	)
 	defer cancel()
 	return errors.Join(
 		fmt.Errorf("publish exact source fleet: %w", err),
@@ -83,7 +90,9 @@ func startHolder(ctx context.Context) error {
 
 //export CCPoolFuseKitReady
 func CCPoolFuseKitReady() C.int32_t {
-	ctx, cancel := context.WithTimeout(context.Background(), readyTimeout)
+	ctx, cancel := context.WithTimeout(
+		context.Background(), holderbridge.ReadinessContract().StartupTimeout(),
+	)
 	defer cancel()
 	return operationStatus("holder readiness", embeddedHolder.Ready(ctx))
 }
@@ -100,7 +109,9 @@ func CCPoolFuseKitWait() C.int32_t {
 //export CCPoolFuseKitStop
 func CCPoolFuseKitStop() C.int32_t {
 	embeddedHolderStopping.Store(true)
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	ctx, cancel := context.WithTimeout(
+		context.Background(), holderbridge.ReadinessContract().SettlementTimeout(),
+	)
 	defer cancel()
 	return operationStatus("holder shutdown", embeddedHolder.Close(ctx))
 }
@@ -123,11 +134,12 @@ func newHolderRuntime(ctx context.Context) (daemon.EmbeddedRuntime, error) {
 		return nil, err
 	}
 	return holderbridge.NewEmbeddedRuntime(ctx, holderbridge.EmbeddedRuntimeSpec{
-		Plan: plan, Build: version.String(),
-		Owner: tenantfs.SourceAuthorityFleetOwner, Drivers: drivers,
+		Plan: plan, StopRole: holderbridge.StopRoleID,
+		StopControlStore: &proc.FileStore{Path: pool.FuseKitServiceProcessStorePath()},
+		Owner:            tenantfs.SourceAuthorityFleetOwner, Drivers: drivers,
 		CatalogAuthorizer: tenantfs.NewCatalogAuthorizer(),
 		Authorizer:        tenantfs.NewMountAuthorizer(),
-		ShutdownTimeout:   shutdownTimeout,
+		ShutdownTimeout:   holderbridge.ReadinessContract().SettlementTimeout(),
 	})
 }
 

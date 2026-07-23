@@ -50,11 +50,11 @@ func runDoctor(cmd *cobra.Command, manager *pool.Manager) error {
 	if err != nil {
 		fail(cmd.ErrOrStderr(), "daemon/FuseKit readiness: %v", err)
 		return fmt.Errorf("doctor found unhealthy state")
-	} else if health.Version != version.String() {
-		fail(cmd.ErrOrStderr(), "daemon version %s does not match client %s", health.Version, version.String())
+	} else if health.RuntimeBuild != version.String() {
+		fail(cmd.ErrOrStderr(), "daemon version %s does not match client %s", health.RuntimeBuild, version.String())
 		return fmt.Errorf("doctor found unhealthy state")
 	}
-	success(cmd.OutOrStdout(), "Daemon and FuseKit holder are ready (%s).", health.Version)
+	success(cmd.OutOrStdout(), "Daemon and FuseKit holder are ready (%s).", health.RuntimeBuild)
 	failed := false
 	for _, account := range accounts {
 		if err := client.AccountHealth(cmd.Context(), account.ID); err != nil {

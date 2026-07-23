@@ -69,9 +69,9 @@ type clientSession struct {
 // Client maintains one generation-aware persistent daemonkit session. A
 // failed operation is never replayed; the next operation opens a new session.
 type Client struct {
-	socket         string
-	build          string
-	lifecycleBuild string
+	socket       string
+	build        string
+	runtimeBuild string
 
 	mu         sync.Mutex
 	current    *clientSession
@@ -84,10 +84,10 @@ type Client struct {
 // NewClient returns a lazy client for the default daemon socket and exact build.
 func NewClient() *Client {
 	return &Client{
-		socket:         pool.SocketPath(),
-		build:          BusinessBuild,
-		lifecycleBuild: version.String(),
-		sessions:       make(map[*clientSession]struct{}),
+		socket:       pool.SocketPath(),
+		build:        WireBuild,
+		runtimeBuild: version.String(),
+		sessions:     make(map[*clientSession]struct{}),
 	}
 }
 
@@ -119,8 +119,8 @@ func (c *Client) Close() error {
 func (c *Client) Available() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	response, err := c.HealthContext(ctx)
-	return err == nil && response.Version == c.clientLifecycleBuild()
+	_, err := c.HealthContext(ctx)
+	return err == nil
 }
 
 func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
@@ -203,27 +203,83 @@ func (c *Client) StatusContext(ctx context.Context) (*Response, error) {
 }
 
 // Health probes daemon readiness over the ordinary business session.
-func (c *Client) Health() (*Response, error) {
+func (c *Client) Health() (*DaemonHealthResponse, error) {
 	return c.HealthContext(context.Background())
 }
 
 // HealthContext probes daemon readiness within ctx's remaining deadline.
-func (c *Client) HealthContext(ctx context.Context) (*Response, error) {
-	response, err := c.doContext(ctx, Request{Op: OpHealth}, 2*time.Second)
+func (c *Client) HealthContext(ctx context.Context) (*DaemonHealthResponse, error) {
+	response, err := c.ObserveHealthContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateDaemonHealth(*response); err != nil {
+	if err := validateDaemonHealth(*response, c.clientRuntimeBuild()); err != nil {
 		return nil, err
 	}
 	return response, nil
 }
 
-func validateDaemonHealth(response Response) error {
-	if !response.OK || response.Error != "" || response.Version == "" {
+// ObserveHealthContext reads exact structural runtime identity without requiring readiness or the current release.
+func (c *Client) ObserveHealthContext(ctx context.Context) (*DaemonHealthResponse, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+	}
+	payload, err := json.Marshal(DaemonHealthRequest{Schema: DaemonHealthSchema})
+	if err != nil {
+		return nil, fmt.Errorf("encode daemon health request: %w", err)
+	}
+	result, err := c.call(ctx, wire.Op(OpHealth), payload)
+	if err != nil {
+		return nil, err
+	}
+	if result.Response.Err != "" {
+		return nil, errors.New(result.Response.Err)
+	}
+	var response DaemonHealthResponse
+	if err := decodeStrict(result.Response.Payload, &response); err != nil {
+		return nil, fmt.Errorf("decode daemon health response: %w", err)
+	}
+	if err := validateDaemonHealthIdentity(response); err != nil {
+		return nil, err
+	}
+	return &response, nil
+}
+
+func validateDaemonHealthIdentity(response DaemonHealthResponse) error {
+	if response.Schema != DaemonHealthSchema || response.RuntimeBuild == "" ||
+		response.RuntimeProtocol != int(wire.ProtocolVersion) || response.PID <= 1 || response.ProcessGeneration == "" ||
+		!validDaemonRuntimeState(response.State) {
 		return fmt.Errorf(
-			"daemon business health is invalid: ready=%t build=%q error=%q",
-			response.OK, response.Version, response.Error,
+			"daemon runtime identity is not exact: schema=%d build=%q protocol=%d pid=%d generation=%q",
+			response.Schema, response.RuntimeBuild, response.RuntimeProtocol, response.PID, response.ProcessGeneration,
+		)
+	}
+	return nil
+}
+
+func validDaemonRuntimeState(state DaemonRuntimeState) bool {
+	switch state {
+	case DaemonRuntimeStateHealthy, DaemonRuntimeStateDegraded, DaemonRuntimeStateFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateDaemonHealth(response DaemonHealthResponse, expectedBuild string) error {
+	if err := validateDaemonHealthIdentity(response); err != nil {
+		return err
+	}
+	if response.RuntimeBuild != expectedBuild {
+		return fmt.Errorf("daemon runtime build is not exact: build=%q want=%q", response.RuntimeBuild, expectedBuild)
+	}
+	if response.State != DaemonRuntimeStateHealthy || response.Draining || response.Busy || !response.Ready {
+		return fmt.Errorf(
+			"daemon runtime is not ready: state=%q draining=%t busy=%t ready=%t process=%q",
+			response.State, response.Draining, response.Busy, response.Ready,
+			response.ProcessGeneration,
 		)
 	}
 	return nil
@@ -912,18 +968,17 @@ func (c *Client) dial(ctx context.Context) (*clientSession, error) {
 		return nil, err
 	}
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(c.socket), Build: c.clientBuild(),
-		LifecycleBuild: c.clientLifecycleBuild(), Ladder: ladder,
+		Dial: wire.UnixDialer(c.socket), WireBuild: c.clientBuild(), Ladder: ladder,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("connect daemon: %w", err)
 	}
-	peer := client.PeerBuild()
-	if peer.Build != c.clientBuild() {
+	peer := client.PeerWireIdentity()
+	if peer.WireBuild != c.clientBuild() {
 		mismatch := fmt.Errorf(
 			"%w: peer %q, client %q",
 			ErrDaemonBuildMismatch,
-			peer.Build,
+			peer.WireBuild,
 			c.clientBuild(),
 		)
 		return nil, errors.Join(mismatch, client.Close())
@@ -935,12 +990,12 @@ func (c *Client) clientBuild() string {
 	if c.build != "" {
 		return c.build
 	}
-	return BusinessBuild
+	return WireBuild
 }
 
-func (c *Client) clientLifecycleBuild() string {
-	if c.lifecycleBuild != "" {
-		return c.lifecycleBuild
+func (c *Client) clientRuntimeBuild() string {
+	if c.runtimeBuild != "" {
+		return c.runtimeBuild
 	}
 	return version.String()
 }

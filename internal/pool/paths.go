@@ -66,6 +66,20 @@ func FuseKitSocketPath() string { return filepath.Join(FuseKitRuntimeDir(), "fus
 // FuseKitProcessStorePath is the signed holder's durable native-child and worker identity store.
 func FuseKitProcessStorePath() string { return filepath.Join(FuseKitRuntimeDir(), "processes.json") }
 
+// FuseKitServiceStatePath is the holder LaunchAgent controller's durable desired state.
+func FuseKitServiceStatePath() string { return filepath.Join(FuseKitRuntimeDir(), "service-state.db") }
+
+// FuseKitServiceProcessStorePath is the holder service controller's worker and stop-authority ledger.
+func FuseKitServiceProcessStorePath() string {
+	return filepath.Join(FuseKitRuntimeDir(), "service-processes.db")
+}
+
+// DaemonServiceStatePath is the cc-pool LaunchAgent controller's durable desired state.
+func DaemonServiceStatePath() string { return statePath("daemon-services.db") }
+
+// DaemonServiceProcessStorePath is the daemon service controller's worker and stop-authority ledger.
+func DaemonServiceProcessStorePath() string { return statePath("daemon-service-processes.db") }
+
 // DisposableWorkerStorePath is daemonkit's durable process-group identity store.
 func DisposableWorkerStorePath() string { return statePath("workers.json") }
 

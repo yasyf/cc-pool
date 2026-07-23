@@ -196,24 +196,25 @@ func TestPeerTransportExecServesRegistry(t *testing.T) {
 	encodedState := base64.RawStdEncoding.EncodeToString(body)
 	script := "env " + testRPCStateEnv + "=" + strconv.Quote(encodedState) + " " + strconv.Quote(os.Args[0])
 
-	workers := newHostSyncTestWorkers(t)
-	fetcher, err := NewSSHFetcher(workers)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := fetcher.Fetch(context.Background(), execPeerPrefix+script)
-	if err != nil {
-		t.Fatalf("Fetch over exec: peer: %v", err)
-	}
-	e, ok := got["u1"]
-	if !ok {
-		t.Fatal("exec: peer registry missing u1")
-	}
-	if int64(e.Added) != big-2 || e.Value.Chain.ExpiresAt != big {
-		t.Fatalf("int64 stamps corrupted through the real bridge: added=%d expiry=%d, want %d/%d",
-			int64(e.Added), e.Value.Chain.ExpiresAt, big-2, big)
-	}
-	if e.Value.Chain.Origin != "hostA" {
-		t.Fatalf("value not round-tripped through the exec: bridge: %+v", e.Value)
-	}
+	withHostSyncTestTransportRunner(t, func(runner syncservice.TransportRunner) {
+		fetcher, err := NewSSHFetcher(runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := fetcher.Fetch(context.Background(), execPeerPrefix+script)
+		if err != nil {
+			t.Fatalf("Fetch over exec: peer: %v", err)
+		}
+		e, ok := got["u1"]
+		if !ok {
+			t.Fatal("exec: peer registry missing u1")
+		}
+		if int64(e.Added) != big-2 || e.Value.Chain.ExpiresAt != big {
+			t.Fatalf("int64 stamps corrupted through the real bridge: added=%d expiry=%d, want %d/%d",
+				int64(e.Added), e.Value.Chain.ExpiresAt, big-2, big)
+		}
+		if e.Value.Chain.Origin != "hostA" {
+			t.Fatalf("value not round-tripped through the exec: bridge: %+v", e.Value)
+		}
+	})
 }

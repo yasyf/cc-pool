@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/synckit/converge"
 	"github.com/yasyf/synckit/cregistry"
 	"github.com/yasyf/synckit/syncservice"
@@ -43,11 +42,11 @@ type stateGetter interface {
 // `sh -c <cmd>` locally ONLY when envExecPeer is set (sim harness); otherwise,
 // and for every other peer, it is ssh-stdio driving RemoteServeCmd. The shared
 // dialer for the registry fetch and the credential pull.
-func PeerTransport(workers *supervise.Pool, peer string) syncservice.Transport {
+func PeerTransport(runner syncservice.TransportRunner, peer string) syncservice.Transport {
 	if cmd, ok := execPeerCommand(peer); ok {
-		return syncservice.Stdio(workers, "sh", "-c", cmd)
+		return runner.Stdio("sh", "-c", cmd)
 	}
-	return syncservice.SSHStdio(workers, peer, RemoteServeCmd)
+	return runner.SSHStdio(peer, RemoteServeCmd)
 }
 
 // execPeerCommand reports the local shell command an exec: peer names, but only
@@ -69,12 +68,12 @@ type SSHFetcher struct {
 }
 
 // NewSSHFetcher builds the fetcher that dials each peer via PeerTransport.
-func NewSSHFetcher(workers *supervise.Pool) (SSHFetcher, error) {
-	if workers == nil {
-		return SSHFetcher{}, errors.New("hostsync: SSH fetcher requires disposable workers")
+func NewSSHFetcher(runner syncservice.TransportRunner) (SSHFetcher, error) {
+	if runner == nil {
+		return SSHFetcher{}, errors.New("hostsync: SSH fetcher requires a transport runner")
 	}
 	return newSSHFetcher(func(peer string) stateGetter {
-		return syncservice.NewClient(PeerTransport(workers, peer))
+		return syncservice.NewClient(PeerTransport(runner, peer))
 	}), nil
 }
 

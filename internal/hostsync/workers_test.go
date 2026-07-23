@@ -1,30 +1,21 @@
 package hostsync
 
 import (
-	"context"
-	"path/filepath"
 	"testing"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/synckit/syncservice"
 )
 
-func newHostSyncTestWorkers(t *testing.T) *supervise.Pool {
+func withHostSyncTestTransportRunner(t *testing.T, run func(syncservice.TransportRunner)) {
 	t.Helper()
-	reaper := &proc.Reaper{
-		Store:      &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers-v1.json")},
-		Generation: "hostsync-test",
-	}
-	workers, err := supervise.NewPool(2, reaper)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", home)
+	err := syncservice.WithTransportRunner(t.Context(), func(runner syncservice.TransportRunner) error {
+		run(runner)
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		workers.Close()
-		workers.Cancel()
-		if err := workers.Wait(context.Background()); err != nil {
-			t.Errorf("wait host-sync test workers: %v", err)
-		}
-	})
-	return workers
 }

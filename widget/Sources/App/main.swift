@@ -1,6 +1,11 @@
 import Darwin
 import FuseKit
 
+let childStatus = CCPoolFuseKitDispatchChild()
+if childStatus >= 0 {
+    exit(childStatus)
+}
+
 do {
     if try await CatalogBroker.runChildIfRequested(
         configuration: CCPoolFileProviderConfiguration.brokerConfiguration
@@ -10,11 +15,6 @@ do {
 } catch {
     fputs("CCPoolStatus: FuseKit broker child failed: \(error)\n", stderr)
     exit(1)
-}
-
-let childStatus = CCPoolFuseKitDispatchChild()
-if childStatus >= 0 {
-    exit(childStatus)
 }
 
 guard CCPoolFuseKitStart() == 0 else {

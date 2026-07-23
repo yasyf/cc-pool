@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/yasyf/daemonkit/daemonrole"
 	"github.com/yasyf/daemonkit/drain"
+	"github.com/yasyf/daemonkit/wire"
 )
 
 func writeExecutableFixture(t *testing.T, dir, name string) string {
@@ -28,7 +30,11 @@ func writeExecutableFixture(t *testing.T, dir, name string) string {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	return filepath.Join(dir, name)
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(resolvedDir, name)
 }
 
 func TestRuntimeAcquiresListenerBeforeGenerationActivation(t *testing.T) {
@@ -59,11 +65,10 @@ func TestRuntimeAcquiresListenerBeforeGenerationActivation(t *testing.T) {
 		syncIntake:   &drain.Intake{},
 		evictTimeout: defaultEvictTimeout,
 	}
-	wireServer, runtime, err := s.runtime()
+	_, runtime, err := s.runtime()
 	if err != nil {
 		t.Fatal(err)
 	}
-	wireServer.RegisterLifecycle(runtime)
 	if err := runtime.Run(t.Context()); !errors.Is(err, want) {
 		t.Fatalf("runtime error = %v, want activation failure", err)
 	}
@@ -72,28 +77,61 @@ func TestRuntimeAcquiresListenerBeforeGenerationActivation(t *testing.T) {
 	}
 }
 
-func TestServiceRolePathUsesCanonicalCurrentExecutableWithoutPATH(t *testing.T) {
+func TestServiceRolePathIsStableHomebrewAliasWithoutPATH(t *testing.T) {
+	t.Setenv("PATH", "/usr/bin:/bin")
+	if path := ServiceRolePath(); path != "/opt/homebrew/bin/cc-pool" {
+		t.Fatalf("ServiceRolePath() = %q", path)
+	}
+}
+
+func TestCurrentServiceExecutableRequiresExactAbsolutePath(t *testing.T) {
 	root := t.TempDir()
 	target := writeExecutableFixture(t, root, "ccp-v1")
-	original := serviceRoleExecutable
-	serviceRoleExecutable = func() (string, error) { return target, nil }
-	t.Cleanup(func() { serviceRoleExecutable = original })
-	t.Setenv("PATH", "/usr/bin:/bin")
-	path, err := ServiceRolePath()
+	original := currentServiceExecutable
+	currentServiceExecutable = func() (string, error) { return target, nil }
+	t.Cleanup(func() { currentServiceExecutable = original })
+	path, err := CurrentServiceExecutable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if path != target {
-		t.Fatalf("ServiceRolePath() = %q, want canonical executable %q", path, target)
+		t.Fatalf("CurrentServiceExecutable() = %q, want %q", path, target)
+	}
+	currentServiceExecutable = func() (string, error) { return "ccp", nil }
+	if _, err := CurrentServiceExecutable(); err == nil {
+		t.Fatal("CurrentServiceExecutable accepted a relative executable")
 	}
 }
 
-func TestServiceRolePathRejectsNonAbsoluteCurrentExecutable(t *testing.T) {
-	original := serviceRoleExecutable
-	serviceRoleExecutable = func() (string, error) { return "ccp", nil }
-	t.Cleanup(func() { serviceRoleExecutable = original })
-	t.Setenv("PATH", "/opt/homebrew/bin")
-	if _, err := ServiceRolePath(); err == nil {
-		t.Fatal("ServiceRolePath accepted a relative current executable")
+func TestStableServiceRoleReauthorizesOnlyRetargetedSuccessor(t *testing.T) {
+	dir := t.TempDir()
+	oldExecutable := writeExecutableFixture(t, dir, "cc-pool-old")
+	newExecutable := writeExecutableFixture(t, dir, "cc-pool-new")
+	unrelated := writeExecutableFixture(t, dir, "unrelated")
+	alias := filepath.Join(dir, "cc-pool")
+	if err := os.Symlink(oldExecutable, alias); err != nil {
+		t.Fatal(err)
+	}
+	classifier := daemonrole.Classifier{RoleID: ServiceRoleID, RolePath: alias}
+	peer := func(path string) wire.Peer {
+		return wire.Peer{PID: os.Getpid(), UID: os.Geteuid(), StartTime: "start", Boot: "boot", Executable: path}
+	}
+	if accepted, err := classifier.Classify(t.Context(), peer(oldExecutable)); err != nil || !accepted {
+		t.Fatalf("old role accepted=%t err=%v", accepted, err)
+	}
+	replacement := alias + ".new"
+	if err := os.Symlink(newExecutable, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, alias); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := classifier.Classify(t.Context(), peer(newExecutable)); err != nil || !accepted {
+		t.Fatalf("new role accepted=%t err=%v", accepted, err)
+	}
+	for _, path := range []string{oldExecutable, unrelated} {
+		if accepted, err := classifier.Classify(t.Context(), peer(path)); err != nil || accepted {
+			t.Fatalf("role %q accepted=%t err=%v", path, accepted, err)
+		}
 	}
 }

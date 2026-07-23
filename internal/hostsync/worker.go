@@ -78,6 +78,14 @@ type WorkerRuntime struct {
 	AuthKind func(context.Context, int, string) (store.AuthKind, error)
 }
 
+// WorkerRuntimeScope owns operation-specific resources until run returns.
+// needsTransport is true only for operations that can contact another host.
+type WorkerRuntimeScope func(
+	ctx context.Context,
+	needsTransport bool,
+	run func(WorkerRuntime) error,
+) error
+
 // WorkerClient executes each host-sync operation in one daemonkit worker group.
 type WorkerClient struct {
 	runner     supervise.TaskRunner
@@ -236,9 +244,9 @@ func IsWorkerInvocation(args []string) bool {
 }
 
 // RunWorker serves one exact, bounded host-sync worker operation.
-func RunWorker(ctx context.Context, input io.Reader, output io.Writer, runtime WorkerRuntime) error {
-	if runtime.Consumer == nil || runtime.Fetch == nil || runtime.AuthKind == nil {
-		return errors.New("hostsync: complete worker runtime is required")
+func RunWorker(ctx context.Context, input io.Reader, output io.Writer, scope WorkerRuntimeScope) error {
+	if scope == nil {
+		return errors.New("hostsync: worker runtime scope is required")
 	}
 	var request workerRequest
 	if err := readWorkerFrame(input, &request); err != nil {
@@ -247,7 +255,15 @@ func RunWorker(ctx context.Context, input io.Reader, output io.Writer, runtime W
 	if request.Protocol != hostSyncWorkerProtocol {
 		return errors.New("hostsync: worker protocol mismatch")
 	}
-	result, err := executeWorkerOperation(ctx, runtime, request)
+	var result any
+	err := scope(ctx, workerNeedsTransport(request.Operation), func(runtime WorkerRuntime) error {
+		if runtime.Consumer == nil || runtime.Fetch == nil || runtime.AuthKind == nil {
+			return errors.New("hostsync: complete worker runtime is required")
+		}
+		var executeErr error
+		result, executeErr = executeWorkerOperation(ctx, runtime, request)
+		return executeErr
+	})
 	response := workerResponse{
 		Protocol: hostSyncWorkerProtocol, Operation: request.Operation,
 	}
@@ -270,6 +286,10 @@ func RunWorker(ctx context.Context, input io.Reader, output io.Writer, runtime W
 		}
 	}
 	return writeWorkerFrame(output, response)
+}
+
+func workerNeedsTransport(operation workerOperation) bool {
+	return operation == workerReconcile || operation == workerSync
 }
 
 func executeWorkerOperation(ctx context.Context, runtime WorkerRuntime, request workerRequest) (any, error) {

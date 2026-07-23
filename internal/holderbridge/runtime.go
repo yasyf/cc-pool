@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/holder"
@@ -17,7 +18,8 @@ const catalogOperationTimeout = 30 * time.Second
 // EmbeddedRuntimeSpec defines cc-pool's complete FuseKit runtime policy.
 type EmbeddedRuntimeSpec struct {
 	Plan              holder.RuntimePlan
-	Build             string
+	StopRole          string
+	StopControlStore  proc.StopControlStore
 	Owner             catalog.SourceAuthorityFleetOwnerID
 	Drivers           holder.DriverFactories
 	CatalogAuthorizer catalogservice.Authorizer
@@ -36,7 +38,8 @@ func newEmbeddedRuntime(
 	construct func(context.Context, holder.Config) (*holder.Runtime, error),
 ) (daemon.EmbeddedRuntime, error) {
 	config := holder.Config{
-		Plan: spec.Plan, Build: spec.Build,
+		Plan: spec.Plan, RuntimeBuild: spec.Plan.BuildID(),
+		StopRole: spec.StopRole, StopControlStore: spec.StopControlStore,
 		Owner: spec.Owner, Drivers: spec.Drivers,
 		CatalogAuthorizer:       spec.CatalogAuthorizer,
 		Authorizer:              spec.Authorizer,

@@ -287,7 +287,7 @@ func TestResolveSelectionRejectsDaemonBuildSkewWithoutLocalFallback(t *testing.T
 	cmd := &cobra.Command{}
 	cmd.SetContext(t.Context())
 	_, _, _, err = resolveSelection(cmd, m, selectReq{cwd: "/project"})
-	if err == nil || !strings.Contains(err.Error(), "require exact daemon version") {
+	if err == nil || !strings.Contains(err.Error(), "daemon runtime build is not exact") {
 		t.Fatalf("resolveSelection with daemon build skew = %v", err)
 	}
 	if sessions, listErr := m.Store.ListActiveSessions(); listErr != nil || len(sessions) != 0 {

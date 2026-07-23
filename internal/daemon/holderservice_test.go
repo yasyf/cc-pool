@@ -13,12 +13,14 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
 )
 
-func TestValidateHolderRuntimeHealthRequiresExactNativeMountProof(t *testing.T) {
+func TestValidateHolderRuntimeHealthRequiresExactPublishedRuntime(t *testing.T) {
 	source, err := mountproto.NativeMountSource(pool.FuseKitPresentationRoot())
 	if err != nil {
 		t.Fatal(err)
@@ -26,7 +28,14 @@ func TestValidateHolderRuntimeHealthRequiresExactNativeMountProof(t *testing.T) 
 	healthy := mountproto.RuntimeHealthResponse{
 		Protocol:             mountproto.Version,
 		Code:                 mountproto.ErrorCodeOk,
-		ActivationGeneration: "activation-7",
+		RuntimeBuild:         version.String(),
+		RuntimeProtocol:      mountproto.RuntimeProtocolVersion,
+		RuntimePID:           77,
+		ProcessGeneration:    "process-generation-7",
+		ActivationGeneration: "activation-generation-9",
+		State:                mountproto.RuntimeStateHealthy,
+		ReadinessPhase:       mountproto.ReadinessPhaseReady,
+		ReadinessStep:        mountproto.ReadinessStepPublished,
 		NativePhase:          mountproto.NativePhaseLive,
 		NativeMount: &mountproto.NativeMountProof{
 			PresentationRoot: pool.FuseKitPresentationRoot(),
@@ -34,6 +43,7 @@ func TestValidateHolderRuntimeHealthRequiresExactNativeMountProof(t *testing.T) 
 			Source:           source,
 			RootReadEpoch:    7,
 		},
+		BrokerPhase: mountproto.BrokerPhaseLive,
 	}
 	if err := validateHolderRuntimeHealth(healthy); err != nil {
 		t.Fatalf("healthy runtime: %v", err)
@@ -43,13 +53,31 @@ func TestValidateHolderRuntimeHealthRequiresExactNativeMountProof(t *testing.T) 
 		edit func(*mountproto.RuntimeHealthResponse)
 		want string
 	}{
-		{name: "activation", edit: func(h *mountproto.RuntimeHealthResponse) { h.ActivationGeneration = "" }, want: "activation generation is empty"},
+		{name: "protocol", edit: func(h *mountproto.RuntimeHealthResponse) { h.Protocol++ }, want: "response is not exact"},
+		{name: "code", edit: func(h *mountproto.RuntimeHealthResponse) {
+			h.Code = mountproto.ErrorCodeUnavailable
+			h.Message = "not ready"
+		}, want: "response is not exact"},
+		{name: "build", edit: func(h *mountproto.RuntimeHealthResponse) { h.RuntimeBuild = "other" }, want: "build is not exact"},
+		{name: "runtime protocol", edit: func(h *mountproto.RuntimeHealthResponse) { h.RuntimeProtocol++ }, want: "runtime protocol is not exact"},
+		{name: "runtime pid", edit: func(h *mountproto.RuntimeHealthResponse) { h.RuntimePID = 0 }, want: "runtime pid is invalid"},
+		{name: "process generation", edit: func(h *mountproto.RuntimeHealthResponse) { h.ProcessGeneration = "" }, want: "process generation is empty"},
+		{name: "activation generation", edit: func(h *mountproto.RuntimeHealthResponse) { h.ActivationGeneration = "" }, want: "activation generation is empty"},
+		{name: "state", edit: func(h *mountproto.RuntimeHealthResponse) { h.State = mountproto.RuntimeStateDegraded }, want: "lifecycle is not ready"},
+		{name: "draining", edit: func(h *mountproto.RuntimeHealthResponse) { h.Draining = true }, want: "lifecycle is not ready"},
+		{name: "busy", edit: func(h *mountproto.RuntimeHealthResponse) { h.Busy = true }, want: "lifecycle is not ready"},
+		{name: "readiness phase", edit: func(h *mountproto.RuntimeHealthResponse) {
+			h.ReadinessPhase = mountproto.ReadinessPhaseStarting
+			h.ReadinessStep = mountproto.ReadinessStepBroker
+		}, want: "readiness is not published"},
+		{name: "readiness step", edit: func(h *mountproto.RuntimeHealthResponse) { h.ReadinessStep = mountproto.ReadinessStepReceipts }, want: "readiness is not published"},
 		{name: "phase", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativePhase = mountproto.NativePhaseStarting }, want: "presentation is not ready"},
 		{name: "proof", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount = nil }, want: "presentation is not ready"},
 		{name: "root", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.PresentationRoot += "-wrong" }, want: "proof is not exact"},
 		{name: "filesystem", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.Filesystem = "fusefs" }, want: "proof is not exact"},
 		{name: "source", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.Source = "fuse-t:/wrong" }, want: "proof is not exact"},
 		{name: "epoch", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.RootReadEpoch = 0 }, want: "proof is not exact"},
+		{name: "broker", edit: func(h *mountproto.RuntimeHealthResponse) { h.BrokerPhase = mountproto.BrokerPhaseStarting }, want: "broker is not ready"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got := healthy
@@ -60,6 +88,61 @@ func TestValidateHolderRuntimeHealthRequiresExactNativeMountProof(t *testing.T) 
 				t.Fatalf("validateHolderRuntimeHealth(%#v) = %v, want %q", got, err, test.want)
 			}
 		})
+	}
+}
+
+func TestValidateHolderStopTargetAcceptsOlderStartingAndDrainingRuntime(t *testing.T) {
+	base := mountproto.RuntimeHealthResponse{
+		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+		RuntimeBuild: "v0.61.7", RuntimeProtocol: mountproto.RuntimeProtocolVersion,
+		RuntimePID: 77, ProcessGeneration: "process-generation-7",
+	}
+	for _, health := range []mountproto.RuntimeHealthResponse{
+		base,
+		func() mountproto.RuntimeHealthResponse {
+			draining := base
+			draining.State = mountproto.RuntimeStateDraining
+			draining.Draining = true
+			draining.ReadinessPhase = mountproto.ReadinessPhaseDraining
+			draining.ReadinessStep = mountproto.ReadinessStepPublished
+			return draining
+		}(),
+	} {
+		if err := validateHolderStopTarget(health); err != nil {
+			t.Fatalf("stop target %+v: %v", health, err)
+		}
+	}
+	base.ProcessGeneration = ""
+	if err := validateHolderStopTarget(base); err == nil {
+		t.Fatal("stop target accepted empty process generation")
+	}
+}
+
+func TestStopObservedHolderRuntimeTargetsProcessGeneration(t *testing.T) {
+	original := holderRuntimeHealth
+	t.Cleanup(func() { holderRuntimeHealth = original })
+	holderRuntimeHealth = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) {
+		return mountproto.RuntimeHealthResponse{
+			Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+			RuntimeBuild: "v0.61.7", RuntimeProtocol: mountproto.RuntimeProtocolVersion,
+			RuntimePID: 77, ProcessGeneration: "process-generation",
+			ActivationGeneration: "activation-generation",
+		}, nil
+	}
+	var got service.StopControlSpec
+	controller := &testHolderServiceController{
+		stop: func(_ context.Context, spec service.StopControlSpec) (wire.StopResult, error) {
+			got = spec
+			return wire.StopResult{ProcessGeneration: spec.TargetProcessGeneration, Stopped: true}, nil
+		},
+	}
+	if err := stopObservedHolderRuntime(
+		t.Context(), controller, mustHolderDeploymentPlan(t), wire.StopIntentUpgrade,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got.TargetProcessGeneration != "process-generation" || got.TargetProcessGeneration == "activation-generation" {
+		t.Fatalf("stop target generation = %q", got.TargetProcessGeneration)
 	}
 }
 
@@ -84,6 +167,15 @@ func TestHolderReadyUsesAuthorizedRuntimeHealthOnly(t *testing.T) {
 	}
 	if err := holderReady(t.Context(), "/tmp/fusekit.sock"); !errors.Is(err, want) {
 		t.Fatalf("holderReady error = %v, want %v", err, want)
+	}
+}
+
+func TestDaemonAndHolderHealthObservationsAreDisjoint(t *testing.T) {
+	if string(OpHealth) == string(mountproto.OperationRuntimeHealth) {
+		t.Fatalf("cc-pool daemon health op aliases FuseKit holder health: %q", OpHealth)
+	}
+	if filepath.Clean(pool.SocketPath()) == filepath.Clean(pool.FuseKitSocketPath()) {
+		t.Fatalf("cc-pool daemon and FuseKit holder health share socket %q", pool.SocketPath())
 	}
 }
 
@@ -123,6 +215,7 @@ func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testi
 		plan.BuildID(), nil,
 	)
 	if runtimeSpec.Application != application || !runtimeSpec.SourceCapable ||
+		runtimeSpec.Readiness != plan.Readiness() ||
 		runtimeSpec.PresentationRoot != pool.AccountsDir() ||
 		runtimeSpec.BrokerPolicy.RequiredAppGroup != holderbridge.AppGroup ||
 		runtimeSpec.RuntimePolicy.RequiredAppGroup != holderbridge.AppGroup {
@@ -151,7 +244,32 @@ func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testi
 	}
 }
 
+func TestHolderReadinessObservationHasNoIndependentDeadline(t *testing.T) {
+	useTestHolderApplication(t)
+	plan, err := HolderDeploymentPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Readiness() != holderbridge.ReadinessContract() {
+		t.Fatalf("deployment readiness = %#v, want shared contract %#v", plan.Readiness(), holderbridge.ReadinessContract())
+	}
+	payload, err := os.ReadFile("holderservice.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(payload)
+	for _, forbidden := range []string{"holderReadinessWindow", "15 * time.Second"} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("holder readiness retains independent deadline %q", forbidden)
+		}
+	}
+	if !strings.Contains(source, "plan.Readiness().ObservationTimeout()") {
+		t.Fatal("holder readiness does not consume the deployment plan observation budget")
+	}
+}
+
 func TestEnsureHolderServiceConvergesExactAgentAndWaitsForReadiness(t *testing.T) {
+	stubNoHolderRuntime(t)
 	useTestHolderApplication(t)
 	originalOpen, originalReady, originalPresent := holderControllerOpen, holderReady, holderServicePresent
 	t.Cleanup(func() {
@@ -205,6 +323,7 @@ func TestEnsureHolderServiceConvergesExactAgentAndWaitsForReadiness(t *testing.T
 }
 
 func TestEnsureHolderServiceRefusesMissingAppBeforeControllerEffects(t *testing.T) {
+	stubNoHolderRuntime(t)
 	useTestHolderApplication(t)
 	originalStat, originalOpen, originalReady := holderAppStat, holderControllerOpen, holderReady
 	t.Cleanup(func() {
@@ -228,6 +347,7 @@ func TestEnsureHolderServiceRefusesMissingAppBeforeControllerEffects(t *testing.
 }
 
 func TestEnsureHolderServiceConvergenceFailureClosesBeforeReadiness(t *testing.T) {
+	stubNoHolderRuntime(t)
 	useTestHolderApplication(t)
 	originalOpen, originalReady, originalPresent := holderControllerOpen, holderReady, holderServicePresent
 	t.Cleanup(func() {
@@ -276,6 +396,7 @@ func TestEnsureHolderServiceConvergenceFailureClosesBeforeReadiness(t *testing.T
 }
 
 func TestHolderServiceInstallReceiptRollsBackOnlyCreatedService(t *testing.T) {
+	stubNoHolderRuntime(t)
 	for _, test := range []struct {
 		name         string
 		preexisting  bool
@@ -320,6 +441,7 @@ func TestHolderServiceInstallReceiptRollsBackOnlyCreatedService(t *testing.T) {
 }
 
 func TestEnsureHolderServiceReadinessFailureRemovesNewService(t *testing.T) {
+	stubNoHolderRuntime(t)
 	useTestHolderApplication(t)
 	originalOpen, originalReady, originalPresent := holderControllerOpen, holderReady, holderServicePresent
 	t.Cleanup(func() {
@@ -357,6 +479,7 @@ func TestEnsureHolderServiceReadinessFailureRemovesNewService(t *testing.T) {
 }
 
 func TestEnsureHolderServiceReadinessFailurePreservesPreexistingService(t *testing.T) {
+	stubNoHolderRuntime(t)
 	useTestHolderApplication(t)
 	originalOpen, originalReady, originalPresent := holderControllerOpen, holderReady, holderServicePresent
 	t.Cleanup(func() {
@@ -387,6 +510,7 @@ func TestEnsureHolderServiceReadinessFailurePreservesPreexistingService(t *testi
 }
 
 func TestStopAndUninstallHolderServiceConvergesEmptyDesiredSet(t *testing.T) {
+	stubNoHolderRuntime(t)
 	originalOpen := holderControllerOpen
 	t.Cleanup(func() { holderControllerOpen = originalOpen })
 	var converged, closed int
@@ -420,6 +544,7 @@ func TestStopAndUninstallHolderServiceConvergesEmptyDesiredSet(t *testing.T) {
 }
 
 func TestStopAndUninstallHolderServiceReportsControllerFailure(t *testing.T) {
+	stubNoHolderRuntime(t)
 	originalOpen := holderControllerOpen
 	t.Cleanup(func() { holderControllerOpen = originalOpen })
 	want := errors.New("controller state unavailable")
@@ -453,18 +578,38 @@ func TestHolderControllerCloseOutlivesCallerCancellation(t *testing.T) {
 	holderControllerOpen = func(context.Context, service.ControllerConfig) (holderServiceController, error) {
 		return controller, nil
 	}
-	if err := convergeHolderServices(ctx, nil); !errors.Is(err, context.Canceled) {
-		t.Fatalf("convergeHolderServices error = %v, want cancellation", err)
+	err := withHolderServiceController(ctx, func(controller holderServiceController) error {
+		return controller.Converge(ctx, nil)
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("holder controller error = %v, want cancellation", err)
 	}
 }
 
 type testHolderServiceController struct {
 	converge func(context.Context, []service.Agent) error
+	stop     func(context.Context, service.StopControlSpec) (wire.StopResult, error)
 	close    func(context.Context) error
+}
+
+func stubNoHolderRuntime(t *testing.T) {
+	t.Helper()
+	original := holderRuntimeHealth
+	holderRuntimeHealth = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) {
+		return mountproto.RuntimeHealthResponse{}, os.ErrNotExist
+	}
+	t.Cleanup(func() { holderRuntimeHealth = original })
 }
 
 func (c *testHolderServiceController) Converge(ctx context.Context, agents []service.Agent) error {
 	return c.converge(ctx, agents)
+}
+
+func (c *testHolderServiceController) StopRuntime(ctx context.Context, spec service.StopControlSpec) (wire.StopResult, error) {
+	if c.stop == nil {
+		return wire.StopResult{ProcessGeneration: spec.TargetProcessGeneration, Stopped: true}, nil
+	}
+	return c.stop(ctx, spec)
 }
 
 func (c *testHolderServiceController) Close(ctx context.Context) error { return c.close(ctx) }

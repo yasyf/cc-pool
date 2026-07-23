@@ -1,12 +1,35 @@
 package tenantfs
 
 import (
+	"context"
 	"testing"
 
+	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/catalogservice"
 	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/mountservice"
+	"github.com/yasyf/fusekit/transportproto"
 )
+
+func TestRuntimeHealthObservationUsesImmutablePeerIdentity(t *testing.T) {
+	authorizer := MountAuthorizer{UID: 42}
+	identity := mountservice.ObservationIdentity{
+		Peer: wire.Peer{PID: 7, UID: 42}, WireBuild: transportproto.WireBuild,
+	}
+	if err := authorizer.AuthorizeObservation(t.Context(), identity, mountproto.OperationRuntimeHealth); err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []mountservice.ObservationIdentity{
+		{Peer: wire.Peer{PID: 1, UID: 42}, WireBuild: transportproto.WireBuild},
+		{Peer: wire.Peer{PID: 7, UID: 43}, WireBuild: transportproto.WireBuild},
+		{Peer: wire.Peer{PID: 7, UID: 42}, WireBuild: "wrong"},
+	} {
+		if err := authorizer.AuthorizeObservation(context.Background(), invalid, mountproto.OperationRuntimeHealth); err == nil {
+			t.Fatalf("authorized invalid observation identity %+v", invalid)
+		}
+	}
+}
 
 func TestNativeOperationsAreExhaustivelyAuthorized(t *testing.T) {
 	operations := []mountproto.Operation{

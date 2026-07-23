@@ -22,13 +22,14 @@ type MountAuthorizer struct{ UID int }
 // NewMountAuthorizer returns the current-user product authorizer.
 func NewMountAuthorizer() MountAuthorizer { return MountAuthorizer{UID: os.Getuid()} }
 
-// AuthorizeRuntime admits one exact local runtime-health request.
-func (a MountAuthorizer) AuthorizeRuntime(
+// AuthorizeObservation admits one exact immutable local runtime-health request.
+func (a MountAuthorizer) AuthorizeObservation(
 	_ context.Context,
-	identity mountservice.Identity,
+	identity mountservice.ObservationIdentity,
 	operation mountproto.Operation,
 ) error {
-	if !validMountIdentity(a.UID, identity) || operation != mountproto.OperationRuntimeHealth {
+	if identity.WireBuild != transportproto.WireBuild || identity.Peer.PID <= 1 || identity.Peer.UID != a.UID ||
+		operation != mountproto.OperationRuntimeHealth {
 		return errUnauthorized
 	}
 	return nil
@@ -112,12 +113,12 @@ func catalogAuthorization(
 }
 
 func validMountIdentity(uid int, identity mountservice.Identity) bool {
-	return identity.Build == transportproto.Build && identity.Session != nil &&
+	return identity.WireBuild == transportproto.WireBuild && identity.Session != nil &&
 		identity.Peer.PID > 1 && identity.Peer.UID == uid
 }
 
 func validCatalogIdentity(uid int, identity catalogservice.Identity) bool {
-	return identity.Build == transportproto.Build && identity.Session != nil &&
+	return identity.WireBuild == transportproto.WireBuild && identity.Session != nil &&
 		identity.Peer.PID > 1 && identity.Peer.UID == uid
 }
 

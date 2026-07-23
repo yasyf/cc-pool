@@ -13,19 +13,55 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/forecast"
+	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/wire"
 )
 
 func TestControlPlaneEpochIsHardReset(t *testing.T) {
-	if BusinessBuild != "cc-pool.rpc.v1" {
-		t.Fatalf("business build = %q", BusinessBuild)
+	const prefix = "com.yasyf.cc-pool.control/"
+	const suffix = "/v1"
+	digest := strings.TrimSuffix(strings.TrimPrefix(WireBuild, prefix), suffix)
+	if !strings.HasPrefix(WireBuild, prefix) || !strings.HasSuffix(WireBuild, suffix) || len(digest) != 64 {
+		t.Fatalf("wire build = %q, want generated v1 schema identity", WireBuild)
+	}
+	for _, character := range digest {
+		if !strings.ContainsRune("0123456789abcdef", character) {
+			t.Fatalf("wire build = %q, want lowercase SHA-256 digest", WireBuild)
+		}
 	}
 	if SnapshotVersion != 1 {
 		t.Fatalf("snapshot version = %d", SnapshotVersion)
+	}
+	if DaemonHealthSchema != 1 {
+		t.Fatalf("daemon health schema = %d", DaemonHealthSchema)
+	}
+}
+
+func TestScoreComponentsWireProjectionIsExact(t *testing.T) {
+	want := score.Components{
+		Eff5: 1, Eff7: 2, RawRemaining5h: 3, RawRemaining7d: 4,
+		Remaining5h: 5, Remaining7d: 6, SessionPenalty: 7,
+		RateLimitPenalty: 8, NeedsLoginPenalty: 9, CredentialQuarantinePenalty: 10,
+		StalePenalty: 11, Barrier5h: 12, Barrier7d: 13, RunwayPenalty: 14,
+	}
+	wireComponents := ScoreComponentsFromDomain(want)
+	if got := ScoreComponentsToDomain(wireComponents); got != want {
+		t.Fatalf("score component round trip = %+v, want %+v", got, want)
+	}
+}
+
+func TestPoolMoodWireProjectionIsExact(t *testing.T) {
+	for domain, want := range map[forecast.Mood]PoolMood{
+		forecast.MoodChill: PoolMoodChill, forecast.MoodEasy: PoolMoodEasy,
+		forecast.MoodUneasy: PoolMoodUneasy, forecast.MoodWorried: PoolMoodWorried,
+		forecast.MoodAlarmed: PoolMoodAlarmed, forecast.MoodPanic: PoolMoodPanic,
+	} {
+		if got := poolMoodFromForecast(domain); got != want {
+			t.Fatalf("pool mood %q = %q, want %q", domain, got, want)
+		}
 	}
 }
 
@@ -121,7 +157,7 @@ func TestServerRejectsOldClientBuildBeforeBusinessDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), Build: "0.0.1", Ladder: ladder,
+		Dial: wire.UnixDialer(socket), WireBuild: "0.0.1", Ladder: ladder,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -149,55 +185,34 @@ func (ordinaryTestProtectedClassifier) Classify(context.Context, wire.Peer) (boo
 }
 func (ordinaryTestProtectedClassifier) AuthorizeLifecycleBuild(string, string) bool { return true }
 
-func TestOrdinaryPeerCannotInvokeAnyProtectedLifecycleOperation(t *testing.T) {
+func TestRemovedLifecycleOperationsAreAbsent(t *testing.T) {
 	socketDir, err := os.MkdirTemp("/tmp", "ccp-lifecycle-boundary-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
 	socket := filepath.Join(socketDir, "daemon.sock")
-	listener, err := net.Listen("unix", socket)
+	server := &wire.Server{
+		WireBuild: WireBuild, MaxSessions: 2,
+	}
+	startTestWireRuntime(t, socket, version.String(), server, ordinaryTestProtectedClassifier{}, nil)
+	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
+		Dial: wire.UnixDialer(socket), WireBuild: WireBuild,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &wire.Server{
-		Build: BusinessBuild, LifecycleBuild: version.String(),
-		MaxSessions: 2, ReservedProtectedSessions: 1,
-		ProtectedSessionClassifier: ordinaryTestProtectedClassifier{},
-	}
-	server.RegisterLifecycle(buildTestLifecycle{build: version.String()})
-	intake := &drain.Intake{}
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() {
-		done <- server.Serve(ctx, listener, func() error { return nil }, intake.Admit, intake.AdmitLifecycle)
-	}()
-	t.Cleanup(func() {
-		intake.Close()
-		_ = server.CloseIntake()
-		_ = intake.Settle(context.Background())
-		cancel()
-		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("serve lifecycle boundary socket: %v", err)
-		}
-	})
-
-	operations := []struct {
-		name string
-		call func(*wire.LifecyclePeer) error
-	}{
-		{name: "health", call: func(peer *wire.LifecyclePeer) error { _, err := peer.Health(t.Context()); return err }},
-		{name: "shutdown", call: func(peer *wire.LifecyclePeer) error { return peer.Shutdown(t.Context()) }},
-		{name: "handoff", call: func(peer *wire.LifecyclePeer) error { return peer.Handoff(t.Context()) }},
-	}
-	for _, operation := range operations {
-		t.Run(operation.name, func(t *testing.T) {
-			peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-				Dial: wire.UnixDialer(socket), Build: BusinessBuild, LifecycleBuild: version.String(),
-			}}
-			defer func() { _ = peer.Close() }()
-			if err := operation.call(peer); err == nil || !strings.Contains(err.Error(), wire.ErrProtectedSessionRequired.Error()) {
-				t.Fatalf("ordinary lifecycle %s = %v, want protected rejection", operation.name, err)
+	t.Cleanup(func() { _ = client.Close() })
+	for _, operation := range []wire.Op{
+		"daemon.lifecycle.health", "daemon.lifecycle.shutdown", "daemon.lifecycle.handoff",
+	} {
+		t.Run(string(operation), func(t *testing.T) {
+			result, callErr := client.Call(t.Context(), operation, "", []byte(`{}`))
+			if callErr != nil {
+				t.Fatal(callErr)
+			}
+			if result.Outcome != wire.Delivered || !strings.Contains(result.Response.Err, "wire: unknown op") {
+				t.Fatalf("removed lifecycle %s = %+v, want unknown operation", operation, result)
 			}
 		})
 	}
@@ -309,18 +324,6 @@ func TestCommitSelectionPreCanceledDoesNotDial(t *testing.T) {
 	}
 }
 
-type buildTestLifecycle struct{ build string }
-
-func (l buildTestLifecycle) Health(context.Context) (dkdaemon.Health, error) {
-	return dkdaemon.Health{
-		Build: l.build, Protocol: int(wire.ProtocolVersion), PID: os.Getpid(),
-		State: dkdaemon.StateHealthy,
-	}, nil
-}
-
-func (buildTestLifecycle) Shutdown(context.Context) error { return nil }
-func (buildTestLifecycle) Handoff(context.Context) error  { return nil }
-
 type buildTestProtectedClassifier struct{}
 
 func (buildTestProtectedClassifier) Validate() error { return nil }
@@ -341,40 +344,21 @@ func serveBuildTestServer(
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
 	socket := filepath.Join(socketDir, "daemon.sock")
-	listener, err := net.Listen("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
 	ladder, err := operationLadder()
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := &wire.Server{
-		Build: build, LifecycleBuild: build, Ladder: ladder,
-		MaxSessions: 2, ReservedProtectedSessions: 1,
-		ProtectedSessionClassifier: buildTestProtectedClassifier{},
+		WireBuild: build, Ladder: ladder, MaxSessions: 2,
 	}
-	for _, op := range []Op{OpHealth, OpStatus} {
+	for _, op := range []Op{OpStatus} {
 		server.RegisterConcurrent(wire.Op(op), func(context.Context, wire.Request) (any, error) {
 			calls.Add(1)
 			return Response{OK: true, Version: build}, nil
 		})
 	}
-	server.RegisterLifecycle(buildTestLifecycle{build: build})
-	intake := &drain.Intake{}
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() {
-		done <- server.Serve(ctx, listener, func() error { return nil }, intake.Admit, intake.AdmitLifecycle)
-	}()
-	t.Cleanup(func() {
-		intake.Close()
-		_ = server.CloseIntake()
-		_ = intake.Settle(context.Background())
-		cancel()
-		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("serve build test socket: %v", err)
-		}
+	startTestWireRuntime(t, socket, build, server, buildTestProtectedClassifier{}, []wire.ObservationRoute{
+		testHealthObservation(build, nil),
 	})
 	return socket
 }

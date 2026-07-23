@@ -22,9 +22,6 @@ func TestProductionOrdinaryCallersContainNoProtectedLifecycleOperations(t *testi
 			if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
 				return nil
 			}
-			if root == "." && filepath.Base(path) == "transport.go" {
-				return nil
-			}
 			payload, err := rootFS.ReadFile(path)
 			if err != nil {
 				return err
@@ -32,7 +29,7 @@ func TestProductionOrdinaryCallersContainNoProtectedLifecycleOperations(t *testi
 			source := string(payload)
 			for _, forbidden := range []string{
 				"wire.LifecyclePeer", "lifeproto.", "NewHealthRequest(",
-				"NewShutdownRequest(", "NewHandoffRequest(",
+				"NewShutdownRequest(", "NewHandoffRequest(", "RegisterLifecycle(", `"daemon-health"`,
 			} {
 				if strings.Contains(source, forbidden) {
 					t.Errorf("production ordinary caller %s contains protected lifecycle operation %q", path, forbidden)

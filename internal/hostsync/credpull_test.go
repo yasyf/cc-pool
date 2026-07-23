@@ -688,15 +688,16 @@ func TestRegistryOriginNeverShellExecuted(t *testing.T) {
 	sentinel := filepath.Join(t.TempDir(), "pwned")
 	origin := execPeerPrefix + "touch " + sentinel // the registry-injected RCE payload
 	chain := ChainStamp{Origin: origin, ExpiresAt: 9_999, Hash: "h"}
-	workers := newHostSyncTestWorkers(t)
-	dial := func(peer string) syncservice.Transport { return PeerTransport(workers, peer) }
+	withHostSyncTestTransportRunner(t, func(runner syncservice.TransportRunner) {
+		dial := func(peer string) syncservice.Transport { return PeerTransport(runner, peer) }
 
-	// The trusted configured mesh is a single exec: peer that fails; the injected
-	// origin is NOT a member.
-	_, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{execPeerPrefix + "false"})
-	if !errors.Is(err, ErrNoPeerCredential) {
-		t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
-	}
+		// The trusted configured mesh is a single exec: peer that fails; the injected
+		// origin is NOT a member.
+		_, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{execPeerPrefix + "false"})
+		if !errors.Is(err, ErrNoPeerCredential) {
+			t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
+		}
+	})
 	if _, statErr := os.Stat(sentinel); statErr == nil {
 		t.Fatalf("sentinel %s was created — the registry-injected exec: origin was shell-executed", sentinel)
 	}

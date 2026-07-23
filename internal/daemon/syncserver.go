@@ -83,7 +83,7 @@ func serveSyncSocket(ctx context.Context, wg *sync.WaitGroup, intake *drain.Inta
 	go func() {
 		defer wg.Done()
 		if err := server.Wire.Serve(
-			ctx, guarded, func() error { return nil }, intake.Admit, intake.AdmitLifecycle,
+			ctx, guarded, func() error { return nil }, intake.Admit, intake.AdmitProtected,
 		); err != nil && !errors.Is(err, net.ErrClosed) {
 			logger.Printf("sync socket serve: %v", err)
 		}

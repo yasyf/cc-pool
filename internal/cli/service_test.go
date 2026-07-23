@@ -10,11 +10,13 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/daemonkit/wire"
 )
 
 func swapVar[T any](t *testing.T, target *T, val T) {
@@ -75,6 +77,7 @@ func uninstallCmd() (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
 
 type testDaemonServiceController struct {
 	desired     [][]service.Agent
+	stops       []service.StopControlSpec
 	closed      int
 	closeCtxErr error
 	convergeErr error
@@ -101,6 +104,11 @@ func (c *testDaemonServiceController) Converge(_ context.Context, agents []servi
 	return c.convergeErr
 }
 
+func (c *testDaemonServiceController) StopRuntime(_ context.Context, spec service.StopControlSpec) (wire.StopResult, error) {
+	c.stops = append(c.stops, spec)
+	return wire.StopResult{ProcessGeneration: spec.TargetProcessGeneration, Stopped: true}, nil
+}
+
 func (c *testDaemonServiceController) Close(ctx context.Context) error {
 	c.closed++
 	c.closeCtxErr = ctx.Err()
@@ -111,6 +119,9 @@ func useDaemonServiceController(t *testing.T, controller daemonServiceController
 	t.Helper()
 	swapVar(t, &openDaemonServiceController, func(context.Context) (daemonServiceController, error) {
 		return controller, nil
+	})
+	swapVar(t, &observeDaemonRuntime, func(context.Context) (*daemon.DaemonHealthResponse, error) {
+		return nil, daemon.ErrDaemonUnavailable
 	})
 }
 

@@ -26,6 +26,9 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: Verify generated control wire identity
+        run: go run ./internal/daemon/wirebuildgen -check
+
       - name: Test
         run: ./scripts/test.sh -race -count=1 ./...
 

@@ -13,6 +13,8 @@ import (
 const (
 	// BundleID is the fixed signed holder application's bundle identifier.
 	BundleID = "com.yasyf.cc-pool.status"
+	// StopRoleID is the controller-launched one-shot signed holder settlement role.
+	StopRoleID = "com.yasyf.cc-pool.status.fusekit.stop-control"
 	// TeamID is the fixed signing team for every protected holder role.
 	TeamID = "SXKCTF23Q2"
 	// ExecutableName is the one embedded holder and broker executable.
@@ -33,6 +35,9 @@ func Application(appPath string) holder.SignedApplication {
 	}
 }
 
+// ReadinessContract returns cc-pool's one signed-runtime and service-observer budget.
+func ReadinessContract() holder.ReadinessContract { return holder.StandardReadinessContract() }
+
 // RuntimePlanSpec returns the concrete signed-side cc-pool holder contract.
 func RuntimePlanSpec(
 	appPath, runtimeDirectory, presentationRoot, buildID string,
@@ -42,7 +47,7 @@ func RuntimePlanSpec(
 	return holder.RuntimePlanSpec{
 		Application: Application(appPath), RuntimeDirectory: runtimeDirectory,
 		PresentationRoot: presentationRoot,
-		BuildID:          buildID, SourceCapable: true,
+		BuildID:          buildID, Readiness: ReadinessContract(), SourceCapable: true,
 		BrokerPolicy: policy, RuntimePolicy: policy, FUSEVerifier: verifier,
 	}
 }

@@ -2,22 +2,26 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/version"
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/daemonrole"
 	"github.com/yasyf/daemonkit/drain"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/wire"
 )
 
 var errHolderSessionLost = errors.New("daemon: FuseKit holder session lost")
+
+const daemonHealthMaxResponse = 16 << 10
 
 func operationLadder() (wire.Ladder, error) {
 	server := map[wire.Op]time.Duration{
@@ -65,9 +69,7 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 		return nil, nil, err
 	}
 	wireServer := &wire.Server{
-		Build: BusinessBuild, LifecycleBuild: version.String(), Ladder: ladder,
-		ReservedProtectedSessions:  1,
-		ProtectedSessionClassifier: role,
+		WireBuild: WireBuild, Ladder: ladder,
 		Trust: func(_ context.Context, peer wire.Peer) error {
 			if peer.UID != os.Geteuid() {
 				return fmt.Errorf("%w: peer uid %d, daemon uid %d", wire.ErrUntrustedPeer, peer.UID, os.Geteuid())
@@ -76,7 +78,6 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 		},
 	}
 	for _, op := range []Op{
-		OpHealth,
 		OpSelect,
 		OpSelectCommit,
 		OpSelectAbort,
@@ -101,41 +102,110 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 			return s.dispatch(ctx, request), nil
 		})
 	}
-	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(s.socket), Build: BusinessBuild,
-		LifecycleBuild: version.String(),
-	}}
-	runtime, err := dkdaemon.NewRuntime(dkdaemon.RuntimeConfig{
-		Socket:       s.socket,
-		Build:        version.String(),
-		Protocol:     int(wire.ProtocolVersion),
-		Peer:         peer,
-		Contract:     dkdaemon.RequestDaemon,
-		WaitMode:     dkdaemon.PIDExit,
-		Grace:        s.evictTimeout,
+	runtime, err := wire.NewRuntime(wire.RuntimeConfig{
+		Socket:                    s.socket,
+		RuntimeBuild:              version.String(),
+		RuntimeProtocol:           int(wire.ProtocolVersion),
+		Wire:                      wireServer,
+		Classifier:                role,
+		ReservedProtectedSessions: 1,
+		StopVerifier: wire.StopVerifier{
+			Classifier: role, Role: StopRoleID,
+			Store: &proc.FileStore{Path: pool.DaemonServiceProcessStorePath()},
+		},
+		Observations: []wire.ObservationRoute{s.daemonHealthRoute()},
+		Readiness:    serverReadiness{owner: s},
 		ListenerWait: s.evictTimeout,
 		Admission:    s.wireIntake,
-		Server:       &sessionServer{owner: s, wire: wireServer},
 		Workers:      &serverWorkers{owner: s},
 		State:        serverState{owner: s},
-		Resources:    lifecycleResource{peer: peer, server: s},
+		Resources:    lifecycleResource{server: s},
 		Activate:     s.activate,
 		HealthState:  s.runtimeHealthState,
 		Busy:         s.runtimeBusy,
 	})
 	if err != nil {
-		_ = peer.Close()
 		return nil, nil, err
 	}
+	s.runtimeShutdown = runtime.Shutdown
+	s.runtimeHealth = runtime.Health
 	return wireServer, runtime, nil
 }
 
-var serviceRoleExecutable = service.CanonicalExecutable
+func (s *Server) daemonHealthRoute() wire.ObservationRoute {
+	return wire.ObservationRoute{
+		Op: wire.Op(OpHealth), MaxResponseBytes: daemonHealthMaxResponse,
+		AvailableBeforeReady: true, Handler: s.daemonHealthObservation,
+	}
+}
 
-// ServiceRolePath returns the canonical current executable shared by launchd
-// and daemon admission without consulting PATH or falling back to an alias.
-func ServiceRolePath() (string, error) {
-	rolePath, err := serviceRoleExecutable()
+func (s *Server) daemonHealthObservation(ctx context.Context, request wire.ObservationRequest) (wire.ObservationResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return wire.ObservationResponse{}, err
+	}
+	if request.Op != wire.Op(OpHealth) || request.Tenant != "" {
+		return wire.ObservationResponse{}, errors.New("daemon health observation route is not exact")
+	}
+	var body DaemonHealthRequest
+	if err := decodeStrict(request.Payload, &body); err != nil {
+		return wire.ObservationResponse{}, fmt.Errorf("decode daemon health observation: %w", err)
+	}
+	if body.Schema != DaemonHealthSchema {
+		return wire.ObservationResponse{}, fmt.Errorf("daemon health schema %d is not exact", body.Schema)
+	}
+	if s.runtimeHealth == nil {
+		return wire.ObservationResponse{}, errors.New("daemon runtime health is unavailable")
+	}
+	health, err := s.runtimeHealth(ctx)
+	if err != nil {
+		return wire.ObservationResponse{}, fmt.Errorf("read daemon runtime health: %w", err)
+	}
+	snapshot, err := daemonHealthSnapshot(health)
+	if err != nil {
+		return wire.ObservationResponse{}, fmt.Errorf("project daemon runtime health: %w", err)
+	}
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		return wire.ObservationResponse{}, fmt.Errorf("encode daemon health observation: %w", err)
+	}
+	return wire.ObservationResponse{Payload: payload}, nil
+}
+
+func daemonHealthSnapshot(health dkdaemon.Health) (DaemonHealthResponse, error) {
+	state, err := daemonRuntimeStateFromDaemon(health.State)
+	if err != nil {
+		return DaemonHealthResponse{}, err
+	}
+	return DaemonHealthResponse{
+		Schema: DaemonHealthSchema, RuntimeBuild: health.RuntimeBuild, RuntimeProtocol: health.RuntimeProtocol,
+		ProcessGeneration: health.ProcessGeneration, PID: health.PID, State: state,
+		Draining: health.Draining, Busy: health.Busy, Ready: health.Ready,
+	}, nil
+}
+
+func daemonRuntimeStateFromDaemon(state dkdaemon.State) (DaemonRuntimeState, error) {
+	switch state {
+	case dkdaemon.StateHealthy:
+		return DaemonRuntimeStateHealthy, nil
+	case dkdaemon.StateDegraded:
+		return DaemonRuntimeStateDegraded, nil
+	case dkdaemon.StateFailed:
+		return DaemonRuntimeStateFailed, nil
+	default:
+		return "", fmt.Errorf("daemon runtime state %q is not exact", state)
+	}
+}
+
+const serviceRolePath = "/opt/homebrew/bin/cc-pool"
+
+var currentServiceExecutable = service.CanonicalExecutable
+
+// ServiceRolePath returns the stable Homebrew alias re-resolved for each authorization.
+func ServiceRolePath() string { return serviceRolePath }
+
+// CurrentServiceExecutable returns the exact resolved binary installed into launchd.
+func CurrentServiceExecutable() (string, error) {
+	rolePath, err := currentServiceExecutable()
 	if err != nil {
 		return "", fmt.Errorf("resolve current ccp executable: %w", err)
 	}
@@ -146,12 +216,8 @@ func ServiceRolePath() (string, error) {
 }
 
 func daemonRole() (daemonrole.Classifier, error) {
-	rolePath, err := ServiceRolePath()
-	if err != nil {
-		return daemonrole.Classifier{}, err
-	}
 	role := daemonrole.Classifier{
-		RoleID: ServiceRoleID, RolePath: rolePath,
+		RoleID: ServiceRoleID, RolePath: ServiceRolePath(),
 	}
 	if err := role.Validate(); err != nil {
 		return daemonrole.Classifier{}, err
@@ -159,18 +225,10 @@ func daemonRole() (daemonrole.Classifier, error) {
 	return role, nil
 }
 
-type sessionServer struct {
-	owner *Server
-	wire  *wire.Server
-}
+type serverReadiness struct{ owner *Server }
 
-func (s *sessionServer) Serve(
-	ctx context.Context,
-	listener net.Listener,
-	ready func() error,
-	admit, admitLifecycle func() (func(), error),
-) error {
-	execCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+func (s serverReadiness) BeforeReady(ctx context.Context) error {
+	execCtx, cancel := context.WithCancel(ctx)
 	s.owner.execMu.Lock()
 	s.owner.execCancel = cancel
 	s.owner.execMu.Unlock()
@@ -201,37 +259,30 @@ func (s *sessionServer) Serve(
 		}
 		s.owner.scheduler(execCtx)
 	}()
-	serveCtx, cancelServe := context.WithCancelCause(ctx)
-	monitorDone := make(chan struct{})
-	go func() {
-		defer close(monitorDone)
-		select {
-		case <-serveCtx.Done():
-		case <-s.owner.holderSessionDone:
-			if serveCtx.Err() != nil {
-				return
-			}
-			s.owner.holderActive.Store(false)
-			s.owner.holderLost.Store(true)
-			cancelServe(errHolderSessionLost)
-		}
-	}()
-	err := s.wire.Serve(serveCtx, listener, ready, admit, admitLifecycle)
-	cancelServe(nil)
-	<-monitorDone
-	if errors.Is(context.Cause(serveCtx), errHolderSessionLost) {
-		err = errors.Join(errHolderSessionLost, err)
-	}
-	s.owner.log.Printf("daemon stopped")
-	return err
+	return nil
 }
 
-func (s *sessionServer) CloseIntake() error { return s.wire.CloseIntake() }
+func (s serverReadiness) AfterReady(err error) {
+	if err == nil {
+		s.owner.runtimePublished.Store(true)
+		return
+	}
+	s.owner.runtimePublished.Store(false)
+	s.owner.execMu.Lock()
+	cancel := s.owner.execCancel
+	s.owner.execMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s serverReadiness) Published() bool { return s.owner.runtimePublished.Load() }
 
 type serverWorkers struct{ owner *Server }
 
 func (w *serverWorkers) Close() {
 	w.owner.markClosing()
+	w.owner.runtimePublished.Store(false)
 	w.owner.syncIntake.Close()
 	if w.owner.syncListener != nil {
 		_ = w.owner.syncListener.Close()
@@ -242,6 +293,7 @@ func (w *serverWorkers) Close() {
 }
 
 func (w *serverWorkers) Cancel() {
+	w.owner.cancelHolderMonitor()
 	w.owner.execMu.Lock()
 	cancel := w.owner.execCancel
 	w.owner.execMu.Unlock()
@@ -272,7 +324,6 @@ func (w *serverWorkers) Wait(ctx context.Context) error {
 }
 
 type lifecycleResource struct {
-	peer   *wire.LifecyclePeer
 	server *Server
 }
 
@@ -306,9 +357,6 @@ func (s serverState) Close() error {
 
 func (r lifecycleResource) Close() error {
 	var errs []error
-	if r.peer != nil {
-		errs = append(errs, r.peer.Close())
-	}
 	if r.server != nil && r.server.tenantClient != nil {
 		r.server.holderActive.Store(false)
 		errs = append(errs, r.server.tenantClient.Close())

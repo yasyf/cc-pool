@@ -51,7 +51,7 @@ var syncEnsureDaemon = func(ctx context.Context) bool {
 	cl := daemon.NewClient()
 	defer func() { _ = cl.Close() }()
 	health, err := cl.HealthContext(ctx)
-	return err == nil && health.OK && health.Version == version.String()
+	return err == nil && health.RuntimeBuild == version.String()
 }
 
 var syncConverge = runSyncConverge

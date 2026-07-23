@@ -148,7 +148,7 @@ func TestCredMoveDaemonRequest(t *testing.T) {
 			args:          []string{"move", "--to", "file"},
 			healthVersion: "0.0.0-old",
 			wantNoRequest: true,
-			wantErr:       "the daemon is 0.0.0-old but this ccp is",
+			wantErr:       "daemon runtime build is not exact",
 		},
 		"op-level error surfaces": {
 			args:        []string{"move", "--to", "keychain", "--account", "9"},
