@@ -54,16 +54,16 @@ func statePath(elements ...string) string {
 // FuseKitRuntimeDir is the consumer-owned private FuseKit runtime directory.
 func FuseKitRuntimeDir() string { return statePath("fusekit") }
 
-// FuseKitSocketPath is the exact persistent holder session socket.
+// FuseKitSocketPath is the exact persistent runtime session socket.
 func FuseKitSocketPath() string { return filepath.Join(FuseKitRuntimeDir(), "fusekit.sock") }
 
-// FuseKitProcessStorePath is the signed holder's durable child and worker identity store.
+// FuseKitProcessStorePath is the signed runtime's durable child and worker identity store.
 func FuseKitProcessStorePath() string { return filepath.Join(FuseKitRuntimeDir(), "processes.json") }
 
-// FuseKitServiceStatePath is the holder LaunchAgent controller's durable desired state.
+// FuseKitServiceStatePath is the runtime LaunchAgent controller's durable desired state.
 func FuseKitServiceStatePath() string { return filepath.Join(FuseKitRuntimeDir(), "service-state.db") }
 
-// FuseKitServiceProcessStorePath is the holder service controller's worker and stop-authority ledger.
+// FuseKitServiceProcessStorePath is the runtime service controller's worker and stop-authority ledger.
 func FuseKitServiceProcessStorePath() string {
 	return filepath.Join(FuseKitRuntimeDir(), "service-processes.db")
 }
@@ -133,11 +133,15 @@ func SyncRegistryLockPath() string {
 	return filepath.Join(SyncDir(), "registry.lock")
 }
 
-// WidgetAppPath is the CCPoolStatus app bundle path (the cask's default
-// appdir): the Notification Center widget host and the File Provider
-// companion app.
+// WidgetAppDir is the fixed per-user application root.
+func WidgetAppDir() string {
+	return filepath.Join(mustHome(), "Applications")
+}
+
+// WidgetAppPath is the fixed per-user CCPoolStatus app bundle path: the
+// Notification Center widget host and File Provider companion app.
 func WidgetAppPath() string {
-	return "/Applications/CCPoolStatus.app"
+	return filepath.Join(WidgetAppDir(), "CCPoolStatus.app")
 }
 
 // WidgetAppBinaryPath is the Mach-O inside the CCPoolStatus app bundle.

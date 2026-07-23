@@ -62,8 +62,8 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 		"scripts/assert-signed-topology.sh",
 		"xcrun stapler validate app/CCPoolStatus.app",
 		"spctl --assess --type execute --verbose=4 app/CCPoolStatus.app",
-		"__ASSET_URL__=${{ needs.release-app.outputs.asset_url }}",
-		"Publish formula and cask in one tap commit",
+		"Publish the CLI formula to the tap",
+		"delete-file: Casks/cc-pool-status.rb",
 	} {
 		if !strings.Contains(publish, required) {
 			t.Fatalf("tap transaction is missing exact released-byte gate %q", required)
@@ -82,13 +82,15 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 	}
 }
 
-func TestStatusCaskUsesVerifiedAssetURL(t *testing.T) {
-	cask := readReleaseArtifactContract(t, ".github", "cask", "cc-pool-status.rb.tmpl")
-	if !strings.Contains(cask, `url "__ASSET_URL__"`) {
-		t.Fatal("status cask reconstructs an asset URL instead of using the verified release output")
+func TestReleaseDoesNotPublishStandaloneStatusCask(t *testing.T) {
+	release := readReleaseArtifactContract(t, ".github", "workflows", "release.yml")
+	if got := strings.Count(release, "delete-file: Casks/cc-pool-status.rb"); got != 1 {
+		t.Fatalf("retired status cask deletions = %d, want exactly one", got)
 	}
-	if strings.Contains(cask, "/releases/download/") {
-		t.Fatal("status cask retains a second release-asset URL derivation")
+	for _, forbidden := range []string{"Render the cask", ".github/cask/cc-pool-status"} {
+		if strings.Contains(release, forbidden) {
+			t.Fatalf("release retains standalone status cask contract %q", forbidden)
+		}
 	}
 }
 

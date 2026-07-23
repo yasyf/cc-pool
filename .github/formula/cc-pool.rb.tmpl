@@ -54,13 +54,12 @@ class CcPool < Formula
         ccp             # walks you through pooling your subscriptions
         ccp run         # launch claude on the emptiest account
 
-      The daemon requires the fixed signed CCPoolStatus/File Provider app.
-      Install the complete stack with:
-        brew install --cask yasyf/tap/cc-pool-status
-        ccp service install
+      `ccp init`, `ccp widget`, and `ccp service install` reconcile the exact
+      signed CCPoolStatus app from the same release into:
+        ~/Applications/CCPoolStatus.app
 
       daemonkit owns the user LaunchAgent. Homebrew does not install or control
-      a second daemon service, and a formula-only install cannot start one.
+      a second daemon service.
 
       Plain `claude` on ~/.claude keeps working untouched.
 

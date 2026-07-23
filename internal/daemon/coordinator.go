@@ -36,7 +36,7 @@ type tenantLifecycleRuntime interface {
 }
 
 // tenantCoordinator owns product account-to-tenant lifecycle and on-demand preparation.
-// FuseKit's signed holder owns source observation, publication, and convergence.
+// FuseKit's signed runtime owns source observation, publication, and convergence.
 type tenantCoordinator struct {
 	server         *Server
 	preparer       sourcePreparer

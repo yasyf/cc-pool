@@ -92,7 +92,10 @@ Headroom you check only at launch time is headroom you discover too late. Put it
 ccp widget
 ```
 
-The widget ships as its own cask, `yasyf/tap/cc-pool-status`, and shows per-account 5h/7d usage bars, live-session counts, and a pool mascot whose mood tracks how fast the pool is draining. Details in [widget/README.md](widget/README.md).
+The CLI reconciles the exact signed app from the same cc-pool release into
+`~/Applications/CCPoolStatus.app`. It shows per-account 5h/7d usage bars,
+live-session counts, and a pool mascot whose mood tracks how fast the pool is
+draining. Details in [widget/README.md](widget/README.md).
 
 <img src="docs/assets/widget-medium.png" alt="The cc-pool Notification Center widget — per-account 5-hour and 7-day usage bars, live-session counts, and a worried mascot at 62% pool usage" width="450">
 

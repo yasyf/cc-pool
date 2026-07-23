@@ -90,7 +90,7 @@ exit 1" \
   || die "fixed signed app did not bind both $BROKER_SOCKET and $HOLDER_SOCKET"
 
 vm_ssh "! ps -ax -o command= | grep '[f]usekit-native-v1'" \
-  || die "File Provider-only holder launched a native filesystem child"
+  || die "File Provider-only helper launched a native filesystem child"
 
 vm_sudo "launchctl procinfo '$APP_PID'" >"$VMCTL_RESULTS_DIR/host-procinfo.txt" 2>&1 \
   || die "could not inspect the kernel-validated CCPoolStatus process identity"

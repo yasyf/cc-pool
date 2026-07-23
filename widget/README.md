@@ -14,7 +14,7 @@ completed poll (~3 min) — same schema as `ccp status --json`. The sandboxed
 widget extension reads that file via a read-only sandbox exception for
 `~/.cc-pool/`; it never touches the socket, the database, or the Keychain.
 
-The fixed signed `/Applications/CCPoolStatus.app` also embeds the FuseKit runtime and
+The fixed signed `~/Applications/CCPoolStatus.app` also embeds the FuseKit runtime and
 File Provider broker. Its one Mach-O dispatches authenticated service roles before
 SwiftUI startup, owns the ordinary FuseKit socket below `~/.cc-pool/fusekit`, and owns
 the App Group socket used by `CCPoolFileProvider.appex`. The Go account daemon
@@ -31,9 +31,9 @@ exception.
 ccp widget
 ```
 
-That installs the prebuilt app from the `cc-pool-status` Homebrew cask (the
-release build is Developer ID signed, notarized, and stapled, so a normal
-install passes Gatekeeper), launches it once so macOS discovers the widget, and
+That reconciles the exact app from the same cc-pool release into
+`~/Applications/CCPoolStatus.app` (the release build is Developer ID signed,
+notarized, and stapled), launches it once so macOS discovers the widget, and
 prints the enable steps:
 
 Open Notification Center (click the menu-bar clock), scroll down →
@@ -43,7 +43,7 @@ widgets work too: right-click the desktop → Edit Widgets.
 If the widget doesn't appear in the gallery: `killall NotificationCenter
 chronod`, relaunch the app, and re-open the gallery.
 
-To remove it: `brew uninstall --cask cc-pool-status`.
+To stop the app and daemon services: `ccp service uninstall`.
 
 ## Build from source (development)
 
@@ -88,7 +88,7 @@ Re-run it whenever the widget UI changes. It needs only the Xcode toolchain
 ## Signing
 
 Release builds (CI) are **Developer ID signed, notarized, and stapled**, so the
-cask installs and launches under Gatekeeper with no quarantine workaround — see
+CLI's exact release fetch launches under Gatekeeper with no workaround — see
 the widget-app step in `.github/workflows/release.yml`.
 
 The fixed signed host embeds the File Provider-only FuseKit runtime in its one
@@ -109,7 +109,7 @@ xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
 
 ## Troubleshooting
 
-- `codesign -d --entitlements - /Applications/CCPoolStatus.app/Contents/PlugIns/CCPoolStatusWidget.appex`
+- `codesign -d --entitlements - ~/Applications/CCPoolStatus.app/Contents/PlugIns/CCPoolStatusWidget.appex`
   must show `com.apple.security.app-sandbox` plus the
   `temporary-exception.files.home-relative-path.read-only` entry for `/.cc-pool/`.
 - `log stream --predicate 'process == "chronod" OR process CONTAINS "CCPoolStatusWidget"'`
@@ -118,10 +118,10 @@ xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
   unreadable" → version skew between
   the snapshot and the widget — rebuild the widget or update cc-pool, and check
   `ccp status --json`.
-- `codesign -d --entitlements - /Applications/CCPoolStatus.app` and the File
+- `codesign -d --entitlements - ~/Applications/CCPoolStatus.app` and the File
   Provider appex must both contain `SXKCTF23Q2.ccp`; the appex must contain no
   home-relative file exception.
-- `nm -gU /Applications/CCPoolStatus.app/Contents/MacOS/CCPoolStatus` must show
+- `nm -gU ~/Applications/CCPoolStatus.app/Contents/MacOS/CCPoolStatus` must show
   `_CCPoolFuseKitDispatchChild`, `_CCPoolFuseKitStart`, `_CCPoolFuseKitReady`,
   `_CCPoolFuseKitWait`, and `_CCPoolFuseKitStop`, proving worker dispatch and
   exact runtime settlement are in the same signed Mach-O.

@@ -30,6 +30,11 @@ func TestFuseKitPathsArePrivate(t *testing.T) {
 }
 
 func TestWidgetAppBinaryPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if got, want := WidgetAppPath(), filepath.Join(home, "Applications", "CCPoolStatus.app"); got != want {
+		t.Fatalf("WidgetAppPath() = %q, want %q", got, want)
+	}
 	want := filepath.Join(WidgetAppPath(), "Contents", "MacOS", "CCPoolStatus")
 	if got := WidgetAppBinaryPath(); got != want {
 		t.Fatalf("WidgetAppBinaryPath() = %q, want %q", got, want)

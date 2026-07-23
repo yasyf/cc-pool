@@ -318,7 +318,7 @@ func TestParseExecPath(t *testing.T) {
 
 func TestProcsByExecutable(t *testing.T) {
 	start := time.Date(2026, 7, 4, 16, 18, 9, 0, time.UTC)
-	widget := "/Applications/CCPoolStatus.app/Contents/PlugIns/CCPoolStatusWidget.appex/Contents/MacOS/CCPoolStatusWidget"
+	widget := "/Users/test/Applications/CCPoolStatus.app/Contents/PlugIns/CCPoolStatusWidget.appex/Contents/MacOS/CCPoolStatusWidget"
 	procs := []proc{{pid: 100, startedAt: start}, {pid: 200, startedAt: start.Add(time.Hour)}}
 	args := map[int][]byte{
 		100: procargs2(1, widget, []string{"CCPoolStatusWidget"}, nil),

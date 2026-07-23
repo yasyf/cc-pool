@@ -57,7 +57,7 @@ export VM_GUEST_HOME="/Users/$VM_GUEST_USER"
 export VM_GUEST_MARKER="$VM_GUEST_HOME/.vmctl-run-marker"
 
 # Guest install layout (written by push.sh, consumed by scenarios). The
-# fixed CCPoolStatus app sits at the production cask path so its designated
+# fixed CCPoolStatus app sits at the production per-user path so its designated
 # requirement, App Group broker endpoint, and extension identity are unchanged
 # in the guest. The cc-pool binary + its ccp symlink live under the guest
 # harness dir; scenarios call them by absolute path.
@@ -65,7 +65,7 @@ export VMCTL_GUEST_DIR="$VM_GUEST_HOME/ccpool-vm"
 export VMCTL_GUEST_BIN="$VMCTL_GUEST_DIR/bin"
 export VMCTL_GUEST_CCPOOL="$VMCTL_GUEST_BIN/cc-pool"
 export VMCTL_GUEST_CCP="$VMCTL_GUEST_BIN/ccp"
-export VMCTL_GUEST_APP="/Applications/CCPoolStatus.app"
+export VMCTL_GUEST_APP="$VM_GUEST_HOME/Applications/CCPoolStatus.app"
 # The account daemon remains the ordinary CLI and never touches the App Group.
 export VMCTL_GUEST_DAEMON_LOG="$VMCTL_GUEST_DIR/daemon.log"
 # The File Provider extension bundle id pinned by the signed Swift runtime;

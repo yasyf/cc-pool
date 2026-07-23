@@ -11,7 +11,7 @@ The permanent topology under test is:
 CCPoolFileProvider.appex
         | App Group socket
         v
-/Applications/CCPoolStatus.app
+~/Applications/CCPoolStatus.app
         | ordinary private socket
         v
 cc-pool account daemon

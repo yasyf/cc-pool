@@ -26,61 +26,16 @@ func TestRuntimeStopUninstallCommandUsesExactDaemonkitStopPath(t *testing.T) {
 	}
 }
 
-func TestStatusCaskRequiresExactRuntimeStopAndRejectsNameBasedKills(t *testing.T) {
-	cask := readReleaseContract(t, ".github", "cask", "cc-pool-status.rb.tmpl")
-	if strings.Count(cask, `args: ["service", "runtime-stop-uninstall"]`) != 2 ||
-		strings.Count(cask, "must_succeed: true") < 3 {
-		t.Fatal("status cask does not fail closed through the exact runtime stop hook")
-	}
-	lower := strings.ToLower(cask)
-	for _, forbidden := range []string{"pkill", "pgrep", "killall", "osascript", "uninstall quit:"} {
-		if strings.Contains(lower, forbidden) {
-			t.Fatalf("status cask contains forbidden process control %q", forbidden)
-		}
-	}
-}
-
-func TestStatusCaskPinsFixedFileProviderApp(t *testing.T) {
-	cask := readReleaseContract(t, ".github", "cask", "cc-pool-status.rb.tmpl")
-	for _, required := range []string{
-		"app \"__APP_NAME__.app\", target: \"/Applications/__APP_NAME__.app\"",
-		"\"/Applications/__APP_NAME__.app\"",
-	} {
-		if !strings.Contains(cask, required) {
-			t.Fatalf("status cask is missing %q", required)
-		}
-	}
-	if strings.Contains(cask, "appdir") {
-		t.Fatal("status cask permits a configurable application path")
-	}
-	if strings.Contains(strings.ToLower(cask), "fuse-t") {
-		t.Fatal("status cask retains a native FUSE dependency")
-	}
-	if got := strings.Count(cask, "/Applications/__APP_NAME__.app"); got != 3 {
-		t.Fatalf("fixed application path occurrences = %d, want 3", got)
-	}
-	register := strings.Index(cask, `args: ["-a", "/Applications/__APP_NAME__.app/Contents/PlugIns/CCPoolFileProvider.appex"], must_succeed: true`)
-	elect := strings.Index(cask, `args: ["-e", "use", "-i", "com.yasyf.cc-pool.status.fileprovider"], must_succeed: true`)
-	start := strings.Index(cask, `args: ["service", "install"]`)
-	if register < 0 || elect < register || start < elect {
-		t.Fatal("status cask does not fail-closed register and elect File Provider before daemon start")
-	}
-}
-
-func TestStatusCaskPreservesGatekeeperQuarantine(t *testing.T) {
-	cask := readReleaseContract(t, ".github", "cask", "cc-pool-status.rb.tmpl")
-	for _, forbidden := range []string{"xattr", "com.apple.quarantine", "--no-quarantine"} {
-		if strings.Contains(strings.ToLower(cask), forbidden) {
-			t.Fatalf("status cask bypasses Gatekeeper with %q", forbidden)
-		}
-	}
+func TestReleasePreservesGatekeeperAndPinsAppDigestIntoCLI(t *testing.T) {
 	release := readReleaseContract(t, ".github", "workflows", "release.yml")
 	for _, required := range []string{
 		"Require CLI signing and notarization secrets",
+		"needs: [verify-tag-on-main, release-app, version]",
+		"internal/version.StatusAppVersion=${{ needs.version.outputs.marketing }}",
+		"internal/version.StatusAppSHA256=${{ needs.release-app.outputs.sha256 }}",
 		"bash \"$GITHUB_WORKSPACE/scripts/assert-signed-topology.sh\"",
 		"xcrun stapler validate app/CCPoolStatus.app",
 		"spctl --assess --type execute --verbose=4 app/CCPoolStatus.app",
-		"! grep -Eiq 'xattr|com\\.apple\\.quarantine|--no-quarantine' \"$template\"",
 	} {
 		if !strings.Contains(release, required) {
 			t.Fatalf("release workflow is missing Gatekeeper contract %q", required)
@@ -88,23 +43,33 @@ func TestStatusCaskPreservesGatekeeperQuarantine(t *testing.T) {
 	}
 }
 
-func TestReleasePublishesFormulaAndCaskOnlyAfterVerifiedApplication(t *testing.T) {
+func TestReleasePublishesOnlyFormulaAfterVerifiedApplication(t *testing.T) {
 	release := readReleaseContract(t, ".github", "workflows", "release.yml")
-	if !strings.Contains(release, "needs: [version, widget-test, release]") {
-		t.Fatal("application release does not depend on the CLI artifact release")
+	if !strings.Contains(release, "needs: [version, widget-test]") {
+		t.Fatal("application release does not depend on its independent build gates")
 	}
 	if !strings.Contains(release, "needs: [release, release-app]") {
 		t.Fatal("tap publication does not wait for both verified release artifacts")
 	}
 	if got := strings.Count(release, ".github/actions/publish@"); got != 1 {
-		t.Fatalf("tap publication calls = %d, want one atomic formula+cask call", got)
+		t.Fatalf("tap publication calls = %d, want one formula publication", got)
 	}
 	publishJob := strings.Index(release, "\n  publish-tap:")
 	formula := strings.Index(release, "Render the formula into the atomic tap transaction")
-	cask := strings.Index(release, "Render the cask into the atomic tap transaction")
-	publish := strings.Index(release, "Publish formula and cask in one tap commit")
-	if publishJob < 0 || formula < publishJob || cask < formula || publish < cask {
-		t.Fatal("formula and cask are not rendered and published after the verified stack")
+	publish := strings.Index(release, "Publish the CLI formula to the tap")
+	if publishJob < 0 || formula < publishJob || publish < formula {
+		t.Fatal("formula is not rendered and published after the verified stack")
+	}
+	if got := strings.Count(release, "delete-file: Casks/cc-pool-status.rb"); got != 1 {
+		t.Fatalf("retired status cask deletions = %d, want exactly one", got)
+	}
+	for _, forbidden := range []string{"Render the cask", ".github/cask/"} {
+		if strings.Contains(release, forbidden) {
+			t.Fatalf("release retains standalone status cask contract %q", forbidden)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join("..", "..", ".github", "cask")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("standalone cask directory exists or could not be inspected: %v", err)
 	}
 }
 
@@ -170,7 +135,6 @@ func TestWidgetBuildsFileProviderOnlyRuntime(t *testing.T) {
 
 func TestReleaseRejectsStandaloneHolderProductNames(t *testing.T) {
 	contracts := map[string]string{
-		"cask":         readReleaseContract(t, ".github", "cask", "cc-pool-status.rb.tmpl"),
 		"formula":      readReleaseContract(t, ".github", "formula", "cc-pool.rb.tmpl"),
 		"ci":           readReleaseContract(t, ".github", "workflows", "ci.yml"),
 		"release":      readReleaseContract(t, ".github", "workflows", "release.yml"),

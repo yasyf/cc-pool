@@ -5,7 +5,7 @@
 # CCPoolStatus.app, installs
 # both into the guest, registers + enables the File Provider extension, and
 # proves the install with an in-guest selftest. The app lands at the production
-# cask path (/Applications/CCPoolStatus.app) so the FP broker/runtime identity
+# per-user path (~/Applications/CCPoolStatus.app) so the FP broker/runtime identity
 # resolves unmodified in the guest.
 #
 # The FP appex MUST be Developer ID-signed: an ad-hoc signature will not register
@@ -77,7 +77,7 @@ main() {
     xcodegen generate
     # Mirrors release.yml's widget build. CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO
     # keeps a plain `build` from injecting get-task-allow; ENABLE_HARDENED_RUNTIME
-    # + --timestamp match the shipped cask payload. VMCTL_APP_VERSION lets the
+    # + --timestamp match the shipped release payload. VMCTL_APP_VERSION lets the
     # upgrade gate change the signed payload without changing its identity.
     xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
       -configuration Release -derivedDataPath "$dd" build \
@@ -130,10 +130,10 @@ main() {
   log "installing $VMCTL_GUEST_APP"
   # shellcheck disable=SC2029
   vm_ssh "rm -rf '$VMCTL_GUEST_APP'"
-  # /Applications is admin-group writable; tar preserves the .app structure,
-  # perms, and the embedded code signature (signatures live in the bundle, not
-  # in xattrs, so plain tar keeps them intact).
-  tar -C "$(dirname "$app")" -cf - "$(basename "$app")" | vm_ssh "tar -xf - -C /Applications"
+  # The per-user Applications directory matches production. Tar preserves the
+  # app structure, permissions, and embedded code signature.
+  vm_ssh "mkdir -p '$VM_GUEST_HOME/Applications' && chmod 700 '$VM_GUEST_HOME/Applications'"
+  tar -C "$(dirname "$app")" -cf - "$(basename "$app")" | vm_ssh "tar -xf - -C '$VM_GUEST_HOME/Applications'"
   printf '%s\n' "$rev" >"$VM_STATE_DIR/build-rev"
 
   # Register + enable the FP extension now that the app is in place.

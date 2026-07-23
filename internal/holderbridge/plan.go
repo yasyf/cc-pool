@@ -8,13 +8,13 @@ import (
 )
 
 const (
-	// BundleID is the fixed signed holder application's bundle identifier.
+	// BundleID is the fixed signed status helper application's bundle identifier.
 	BundleID = "com.yasyf.cc-pool.status"
-	// StopRoleID is the controller-launched one-shot signed holder settlement role.
+	// StopRoleID is the controller-launched one-shot signed runtime settlement role.
 	StopRoleID = "com.yasyf.cc-pool.status.fusekit.stop-control"
-	// TeamID is the fixed signing team for every protected holder role.
+	// TeamID is the fixed signing team for every protected helper role.
 	TeamID = "SXKCTF23Q2"
-	// ExecutableName is the one embedded holder and broker executable.
+	// ExecutableName is the embedded status helper and broker executable.
 	ExecutableName = "CCPoolStatus"
 	// AppGroup is the one protected broker transport container.
 	AppGroup = TeamID + ".ccp"
@@ -35,7 +35,7 @@ func Application(appPath string) holder.SignedApplication {
 // ReadinessContract returns cc-pool's one signed-runtime and service-observer budget.
 func ReadinessContract() holder.ReadinessContract { return holder.StandardReadinessContract() }
 
-// RuntimePlanSpec returns the concrete signed-side cc-pool holder contract.
+// RuntimePlanSpec returns the concrete signed-side cc-pool helper contract.
 func RuntimePlanSpec(
 	appPath, runtimeDirectory, buildID string,
 ) holder.RuntimePlanSpec {
@@ -47,7 +47,7 @@ func RuntimePlanSpec(
 	}
 }
 
-// NewRuntimePlan derives the File Provider-only signed holder plan.
+// NewRuntimePlan derives the File Provider-only signed helper plan.
 func NewRuntimePlan(appPath, runtimeDirectory, buildID string) (holder.RuntimePlan, error) {
 	plan, err := holder.NewRuntimePlan(RuntimePlanSpec(appPath, runtimeDirectory, buildID))
 	if err != nil {

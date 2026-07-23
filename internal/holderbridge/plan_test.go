@@ -8,7 +8,7 @@ import (
 )
 
 func TestRuntimePlanSpecPinsProductIdentityAndProtectedPolicy(t *testing.T) {
-	const appPath = "/Applications/CCPoolStatus.app"
+	const appPath = "/Users/test/Applications/CCPoolStatus.app"
 	const runtimeDirectory = "/Users/test/.cc-pool/fusekit"
 	const buildID = "v0.60.0"
 	spec := RuntimePlanSpec(appPath, runtimeDirectory, buildID)

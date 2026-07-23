@@ -18,11 +18,10 @@ Releases are **tag-triggered** — there is no version file to edit. `Version`/`
 Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which (1) builds the universal
 (arm64+amd64) pure-Go binary on macOS and Developer ID-signs + notarizes it without App
 Group access, (2) builds, Developer ID-signs, notarizes, and staples the fixed
-`CCPoolStatus.app` runtime, broker, File Provider, and widget bundle (the
-`cc-pool-status` cask payload),
+`CCPoolStatus.app` runtime, broker, File Provider, and widget bundle,
 (3) creates a GitHub Release with auto-generated notes + the binary tarball, widget zip, and
 SHA256SUMS, and (4) renders the
-formula and cask from in-repo templates and publishes them to the shared external tap
+formula from the in-repo template and publishes it to the shared external tap
 [`yasyf/homebrew-tap`](https://github.com/yasyf/homebrew-tap) (`brew install yasyf/tap/cc-pool`).
 There is no in-repo `Formula/` — **never hand-edit the tap**; the release job owns it. A tag
 containing `-` (e.g. `v1.2.3-rc.1`) publishes assets but never touches the tap (prerelease).

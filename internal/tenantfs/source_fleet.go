@@ -25,7 +25,7 @@ type sourceFleetSession interface {
 type sourceFleetConnector func(context.Context) (sourceFleetSession, error)
 
 // PublishClaudeSourceFleet publishes cc-pool's complete v1 topology from the
-// fixed signed holder process.
+// fixed signed runtime process.
 func PublishClaudeSourceFleet(
 	ctx context.Context,
 	socket string,

@@ -80,7 +80,7 @@ launch_and_assert_runtime() {
   exit 1" || die "signed app did not bind both broker and runtime sockets during $phase"
 
   vm_ssh "! ps -ax -o command= | grep '[f]usekit-native-v1'" \
-    || die "File Provider-only holder launched a native filesystem child during $phase"
+    || die "File Provider-only helper launched a native filesystem child during $phase"
 }
 
 vm_scp_to "$SCRIPT_DIR/tcc-snapshot.sh" "$TCC_PROBE" \

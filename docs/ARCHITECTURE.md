@@ -55,7 +55,7 @@ tenants remain logically stale until `PrepareTenant` catches up that one selecte
 Atomic replacement is one catalog transaction: the source object keeps its identity, the
 replaced target is tombstoned once, and old handles retain their pinned snapshot.
 
-The fixed Developer ID-signed `/Applications/CCPoolStatus.app` embeds the File Provider
+The fixed Developer ID-signed `~/Applications/CCPoolStatus.app` embeds the File Provider
 catalog runtime in the same Mach-O as the application. Account presentation uses only File
 Provider and requires no Network Volumes authorization.
 

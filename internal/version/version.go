@@ -10,6 +10,10 @@ var (
 	Version = "dev"
 	// Commit is the short git SHA, set by -ldflags at release time.
 	Commit = ""
+	// StatusAppVersion is the exact signed application version, set by -ldflags.
+	StatusAppVersion = ""
+	// StatusAppSHA256 is the exact signed application release digest, set by -ldflags.
+	StatusAppSHA256 = ""
 )
 
 // String reports the running binary's build version, memoized on first call: a
