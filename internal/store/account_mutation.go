@@ -357,6 +357,18 @@ func (s *Store) BeginAccountMutation(
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return BeginAccountMutationResult{}, err
 	}
+	if request.Kind == AccountMutationPresentationRebind {
+		if _, err := credentialOperationByAccount(tx, request.AccountID); err == nil {
+			return BeginAccountMutationResult{}, ErrAccountMutationRecoveryRequired
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return BeginAccountMutationResult{}, err
+		}
+		if _, err := unacknowledgedCredentialWriteReceiptByAccount(tx, request.AccountID); err == nil {
+			return BeginAccountMutationResult{}, ErrAccountMutationRecoveryRequired
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return BeginAccountMutationResult{}, err
+		}
+	}
 	if _, err := accountPresentationQuarantine(tx, request.AccountID); err == nil {
 		if request.Kind != AccountMutationPresentationRebind {
 			return BeginAccountMutationResult{}, ErrAccountPresentationQuarantined
@@ -938,13 +950,81 @@ func (s *Store) MarkAccountMutationApplied(
 	fence AccountMutationFence,
 	written CredentialDigest,
 ) (AccountMutationFence, error) {
+	if fence.OperationID == (AccountMutationID{}) || fence.OwnerEpoch == 0 {
+		return AccountMutationFence{}, ErrAccountMutationFence
+	}
 	if written.zero() {
 		return AccountMutationFence{}, ErrAccountMutationState
+	}
+	mutation, err := s.AccountMutation(fence.OperationID)
+	if err != nil {
+		return AccountMutationFence{}, err
+	}
+	if mutation.Kind == AccountMutationPresentationRebind {
+		return s.markPresentationRebindApplied(fence, written)
 	}
 	return s.advanceAccountMutation(
 		fence, AccountMutationApplying, AccountMutationApplied,
 		CredentialDigest{}, false, written, true,
 	)
+}
+
+func (s *Store) markPresentationRebindApplied(
+	fence AccountMutationFence,
+	written CredentialDigest,
+) (AccountMutationFence, error) {
+	if err := fence.Owner.Validate(); err != nil {
+		return AccountMutationFence{}, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AccountMutationFence{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(
+		`UPDATE account_mutations SET updated_at=updated_at WHERE operation_id=?`,
+		fence.OperationID[:],
+	); err != nil {
+		return AccountMutationFence{}, err
+	}
+	mutation, err := accountMutationByID(tx, fence.OperationID)
+	if err != nil {
+		return AccountMutationFence{}, err
+	}
+	if !sameAccountMutationFence(mutation, fence) ||
+		mutation.Kind != AccountMutationPresentationRebind ||
+		mutation.State != AccountMutationApplying {
+		return AccountMutationFence{}, ErrAccountMutationFence
+	}
+	if _, err := credentialOperationByAccount(tx, mutation.AccountID); err == nil {
+		return AccountMutationFence{}, ErrAccountMutationRecoveryRequired
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return AccountMutationFence{}, err
+	}
+	if _, err := unacknowledgedCredentialWriteReceiptByAccount(tx, mutation.AccountID); err == nil {
+		return AccountMutationFence{}, ErrAccountMutationRecoveryRequired
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return AccountMutationFence{}, err
+	}
+	result, err := tx.Exec(
+		`UPDATE account_mutations SET state='applied',owner_epoch=owner_epoch+1,updated_at=?,
+		 written_credential_digest=?,credential_written=1
+		 WHERE operation_id=? AND owner_record=? AND owner_epoch=?
+		 AND kind='presentation-rebind' AND state='applying'`,
+		s.now().UnixNano(), written[:], fence.OperationID[:],
+		mustEncodeCredentialOwner(fence.Owner), fence.OwnerEpoch,
+	)
+	if err != nil {
+		return AccountMutationFence{}, err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return AccountMutationFence{}, ErrAccountMutationFence
+	}
+	if err := tx.Commit(); err != nil {
+		return AccountMutationFence{}, err
+	}
+	fence.OwnerEpoch++
+	return fence, nil
 }
 
 // SetAccountMutationMetadata records verified post-login account metadata before publication.

@@ -385,6 +385,13 @@ func (s *Store) BeginCredentialOperation(
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return BeginCredentialOperationResult{}, err
 	}
+	if mutation, err := accountMutationByAccount(tx, request.AccountID); err == nil {
+		if mutation.Kind == AccountMutationPresentationRebind {
+			return BeginCredentialOperationResult{}, ErrAccountPresentationQuarantined
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return BeginCredentialOperationResult{}, err
+	}
 	if removal, err := accountRemovalByID(tx, request.AccountID); err == nil {
 		allowed, err := pendingAddRemovalAllowsCredentialCompensation(tx, removal, request)
 		if err != nil {
