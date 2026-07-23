@@ -12,9 +12,10 @@ import (
 )
 
 var syncedAdmissionFailpoint func(string)
+var syncedAdmissionResultFailpoint func(string) error
 
 // AdmitSyncedCredential serializes credential validation with every credential
-// mutation and atomically advances the presentation proof and admission state.
+// mutation and advances presentation and admission through durable exact evidence.
 func (m *Manager) AdmitSyncedCredential(
 	ctx context.Context,
 	account store.Account,
@@ -142,7 +143,56 @@ func (m *Manager) admitSyncedCredential(
 		TokenChainDigest:    *verifiedTokenChain,
 		AccessHashDigest:    accessHashDigest,
 	}
-	return m.Store.AdmitSyncedAccount(account, currentProof, freshProof, fence)
+	stage, err := m.Store.StageSyncedAccountAdmission(account, currentProof, freshProof, fence)
+	if err != nil {
+		return false, err
+	}
+	if syncedAdmissionFailpoint != nil {
+		syncedAdmissionFailpoint("after-stage")
+	}
+	if syncedAdmissionResultFailpoint != nil {
+		if err := syncedAdmissionResultFailpoint("after-stage"); err != nil {
+			return false, err
+		}
+	}
+	if !stage.Finalized {
+		postStage, postStageTokenChain, err := m.credentialTokenChainStateAtObservation(ctx, account)
+		if err != nil {
+			return false, err
+		}
+		if !sameStoreObservation(verified, postStage) || postStageTokenChain == nil ||
+			*postStageTokenChain != *verifiedTokenChain {
+			return false, ErrCredentialChangedUnderfoot
+		}
+		if syncedAdmissionFailpoint != nil {
+			syncedAdmissionFailpoint("after-post-stage-observation")
+		}
+		admitted, err := m.Store.FinalizeSyncedAccountAdmission(account, freshProof, fence)
+		if err != nil {
+			return false, err
+		}
+		if !admitted {
+			return false, store.ErrAccountPresentationEvidence
+		}
+		if syncedAdmissionResultFailpoint != nil {
+			if err := syncedAdmissionResultFailpoint("after-finalize"); err != nil {
+				return false, err
+			}
+		}
+	}
+	if syncedAdmissionFailpoint != nil {
+		syncedAdmissionFailpoint("before-post-finalize-observation")
+	}
+	postFinalize, postFinalizeTokenChain, err := m.credentialTokenChainStateAtObservation(ctx, account)
+	if err == nil && sameStoreObservation(verified, postFinalize) &&
+		postFinalizeTokenChain != nil && *postFinalizeTokenChain == *verifiedTokenChain {
+		return true, nil
+	}
+	reopenErr := m.Store.ReopenSyncedAccountAdmission(account, freshProof, fence)
+	if err != nil {
+		return false, errors.Join(err, reopenErr)
+	}
+	return false, errors.Join(ErrCredentialChangedUnderfoot, reopenErr)
 }
 
 func syncedAdmissionSignature(

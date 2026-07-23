@@ -296,12 +296,13 @@ func (s *Store) ResolveReservedSyncedPromotion(
 		`SELECT EXISTS(SELECT 1 FROM accounts WHERE id=?)
 		 OR EXISTS(SELECT 1 FROM account_presentations WHERE account_id=?)
 		 OR EXISTS(SELECT 1 FROM auth_health WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM pending_synced_credential_admissions WHERE account_id=?)
 		 OR EXISTS(SELECT 1 FROM synced_credential_admissions WHERE account_id=?)
 		 OR EXISTS(SELECT 1 FROM account_mutations WHERE account_id=?)
 		 OR EXISTS(SELECT 1 FROM credential_operations WHERE account_id=?)
 		 OR EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=?)
 		 OR EXISTS(SELECT 1 FROM account_removals WHERE account_id=?)`,
-		expected.ID, expected.ID, expected.ID, expected.ID,
+		expected.ID, expected.ID, expected.ID, expected.ID, expected.ID,
 		expected.ID, expected.ID, expected.ID, expected.ID,
 	).Scan(&partial); err != nil {
 		return Account{}, false, err

@@ -404,6 +404,16 @@ CREATE TABLE synced_credential_admissions (
 	admitted_at              INTEGER NOT NULL CHECK(admitted_at > 0),
 	PRIMARY KEY (account_id, account_instance_id, account_generation)
 );
+CREATE TABLE pending_synced_credential_admissions (
+	account_id               INTEGER PRIMARY KEY CHECK(account_id > 0),
+	account_instance_id      TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+	account_generation       INTEGER NOT NULL CHECK(account_generation > 0),
+	locator_digest           BLOB NOT NULL CHECK(length(locator_digest) = 32 AND locator_digest <> zeroblob(32)),
+	external_state_digest    BLOB NOT NULL CHECK(length(external_state_digest) = 32 AND external_state_digest <> zeroblob(32)),
+	token_chain_digest       BLOB NOT NULL CHECK(length(token_chain_digest) = 32 AND token_chain_digest <> zeroblob(32)),
+	access_hash_digest       BLOB NOT NULL CHECK(length(access_hash_digest) = 32 AND access_hash_digest <> zeroblob(32)),
+	staged_at                INTEGER NOT NULL CHECK(staged_at > 0)
+);
 CREATE TABLE account_presentations (
   account_id              INTEGER PRIMARY KEY CHECK(account_id > 0),
   account_instance_id     TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
@@ -832,6 +842,10 @@ func (s *Store) ListPublishableOrigins() ([]Account, error) {
 		  AND NOT EXISTS (SELECT 1 FROM credential_operations WHERE account_id=accounts.id)
 		  AND NOT EXISTS (SELECT 1 FROM credential_quarantines WHERE account_id=accounts.id)
 		  AND NOT EXISTS (
+		    SELECT 1 FROM pending_synced_credential_admissions
+		    WHERE account_id=accounts.id
+		  )
+		  AND NOT EXISTS (
 		    SELECT 1 FROM credential_operation_receipts
 		    WHERE account_id=accounts.id AND publication_payload IS NOT NULL
 		      AND acknowledged_at IS NULL
@@ -946,6 +960,7 @@ func (s *Store) DeleteAccount(id int) error {
 		`DELETE FROM sessions WHERE account_id=?`,
 		`DELETE FROM refresh_log WHERE account_id=?`,
 		`DELETE FROM sticky WHERE account_id=?`,
+		`DELETE FROM pending_synced_credential_admissions WHERE account_id=?`,
 		`DELETE FROM synced_credential_admissions WHERE account_id=?`,
 		`DELETE FROM auth_health WHERE account_id=?`,
 		`DELETE FROM account_presentation_quarantines WHERE account_id=?`,
@@ -1239,6 +1254,10 @@ func selectionEligible(
 		  )
 		  AND NOT EXISTS (SELECT 1 FROM credential_operations WHERE account_id=accounts.id)
 		  AND NOT EXISTS (SELECT 1 FROM credential_quarantines WHERE account_id=accounts.id)
+		  AND NOT EXISTS (
+		    SELECT 1 FROM pending_synced_credential_admissions
+		    WHERE account_id=accounts.id
+		  )
 		  AND NOT EXISTS (
 		    SELECT 1 FROM credential_operation_receipts
 		    WHERE account_id=accounts.id AND publication_payload IS NOT NULL

@@ -708,10 +708,10 @@ func TestSyncedAdmissionRefreshesActivationAfterRestart(t *testing.T) {
 	proofB.FileProvider.ActivationGeneration = "activation-B"
 	drifted := proofB
 	drifted.FileProvider.PublicPath += "-other"
-	if admitted, err := m.Store.AdmitSyncedAccount(
+	if _, err := m.Store.StageSyncedAccountAdmission(
 		*account, proofA, drifted, store.SyncedCredentialAdmissionFence{},
-	); admitted || !errors.Is(err, store.ErrAccountPresentationEvidence) {
-		t.Fatalf("drifted admission = %v err=%v", admitted, err)
+	); !errors.Is(err, store.ErrAccountPresentationEvidence) {
+		t.Fatalf("drifted admission err=%v", err)
 	}
 	if presentation, err := m.Store.AccountPresentation(account.ID); err != nil || presentation.Proof != proofA {
 		t.Fatalf("proof after refused admission = %+v err=%v", presentation, err)

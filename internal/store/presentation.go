@@ -193,20 +193,118 @@ func (s *Store) RefreshAccountPresentation(
 	return tx.Commit()
 }
 
-// AdmitSyncedAccount atomically records exact credential evidence, advances the
-// complete presentation proof, and clears an exact awaiting-origin state.
-func (s *Store) AdmitSyncedAccount(
+// StageSyncedAccountAdmission durably records exact external evidence and
+// advances the presentation while retaining awaiting-origin state.
+func (s *Store) StageSyncedAccountAdmission(
 	account Account,
 	currentProof PresentationPreparationProof,
+	freshProof PresentationPreparationProof,
+	credential SyncedCredentialAdmissionFence,
+) (SyncedCredentialAdmissionStage, error) {
+	if err := validatePresentationPreparationProofForAccount(
+		freshProof, account.InstanceID, account.Generation, account.ConfigDir,
+	); err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	if err := ValidatePresentationPreparationProofAdvance(currentProof, freshProof); err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	if err := credential.validate(account); err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, err := presentationAccount(tx, account.ID)
+	if err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	if !samePresentationAccount(current, account) {
+		return SyncedCredentialAdmissionStage{}, ErrAccountGenerationChanged
+	}
+	if err := validateSyncedAdmissionGuards(tx, account.ID); err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	bound, err := accountPresentation(tx, account.ID)
+	if err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	health, err := syncedAdmissionAuth(tx, account.ID)
+	if err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	if final, finalErr := syncedCredentialAdmissionTx(tx, account); finalErr == nil &&
+		sameSyncedCredentialAdmissionFence(final.SyncedCredentialAdmissionFence, credential) &&
+		bound.Proof == freshProof && health.healthyOwned() {
+		return SyncedCredentialAdmissionStage{
+			AccountID: account.ID, SyncedCredentialAdmissionFence: credential,
+			StagedAt: final.AdmittedAt, Finalized: true,
+		}, nil
+	} else if finalErr != nil && !errors.Is(finalErr, sql.ErrNoRows) {
+		return SyncedCredentialAdmissionStage{}, finalErr
+	}
+	if pending, pendingErr := pendingSyncedCredentialAdmissionTx(tx, account); pendingErr == nil &&
+		sameSyncedCredentialAdmissionFence(pending.SyncedCredentialAdmissionFence, credential) &&
+		bound.Proof == freshProof && health.awaitingOrigin() {
+		return pending, nil
+	} else if pendingErr != nil && !errors.Is(pendingErr, sql.ErrNoRows) {
+		return SyncedCredentialAdmissionStage{}, pendingErr
+	}
+	if bound.AccountInstanceID != account.InstanceID ||
+		bound.AccountGeneration != account.Generation || bound.Proof != currentProof ||
+		!health.awaitingOrigin() {
+		return SyncedCredentialAdmissionStage{}, ErrAccountPresentationEvidence
+	}
+	now := s.now()
+	if err := upsertAccountPresentation(tx, AccountPresentation{
+		AccountID: account.ID, AccountInstanceID: account.InstanceID,
+		AccountGeneration: account.Generation, Proof: freshProof, ObservedAt: now,
+	}); err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	if _, err := tx.Exec(`DELETE FROM synced_credential_admissions WHERE account_id=?`, account.ID); err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO pending_synced_credential_admissions(
+		 account_id,account_instance_id,account_generation,locator_digest,
+		 external_state_digest,token_chain_digest,access_hash_digest,staged_at)
+		 VALUES(?,?,?,?,?,?,?,?)
+		 ON CONFLICT(account_id) DO UPDATE SET
+		 account_instance_id=excluded.account_instance_id,
+		 account_generation=excluded.account_generation,
+		 locator_digest=excluded.locator_digest,
+		 external_state_digest=excluded.external_state_digest,
+		 token_chain_digest=excluded.token_chain_digest,
+		 access_hash_digest=excluded.access_hash_digest,
+		 staged_at=excluded.staged_at`,
+		account.ID, account.InstanceID, account.Generation, credential.LocatorDigest[:],
+		credential.ExternalStateDigest[:], credential.TokenChainDigest[:],
+		credential.AccessHashDigest[:], now.UnixNano(),
+	); err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	return SyncedCredentialAdmissionStage{
+		AccountID: account.ID, SyncedCredentialAdmissionFence: credential,
+		StagedAt: now,
+	}, nil
+}
+
+// FinalizeSyncedAccountAdmission atomically consumes exact pending evidence
+// and clears awaiting-origin state.
+func (s *Store) FinalizeSyncedAccountAdmission(
+	account Account,
 	freshProof PresentationPreparationProof,
 	credential SyncedCredentialAdmissionFence,
 ) (bool, error) {
 	if err := validatePresentationPreparationProofForAccount(
 		freshProof, account.InstanceID, account.Generation, account.ConfigDir,
 	); err != nil {
-		return false, err
-	}
-	if err := ValidatePresentationPreparationProofAdvance(currentProof, freshProof); err != nil {
 		return false, err
 	}
 	if err := credential.validate(account); err != nil {
@@ -224,48 +322,34 @@ func (s *Store) AdmitSyncedAccount(
 	if !samePresentationAccount(current, account) {
 		return false, ErrAccountGenerationChanged
 	}
-	if _, err := accountPresentationQuarantine(tx, account.ID); err == nil {
-		return false, ErrAccountPresentationQuarantined
-	} else if !errors.Is(err, sql.ErrNoRows) {
+	if err := validateSyncedAdmissionGuards(tx, account.ID); err != nil {
 		return false, err
-	}
-	var liveSession int
-	if err := tx.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM sessions WHERE account_id=? AND ended_at IS NULL)`,
-		account.ID,
-	).Scan(&liveSession); err != nil {
-		return false, err
-	}
-	if liveSession != 0 {
-		return false, ErrAccountSessionActive
-	}
-	var busy int
-	if err := tx.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM account_mutations WHERE account_id=?)
-		 OR EXISTS(SELECT 1 FROM credential_operations WHERE account_id=?)
-		 OR EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=?)
-		 OR EXISTS(SELECT 1 FROM account_removals WHERE account_id=?)`,
-		account.ID, account.ID, account.ID, account.ID,
-	).Scan(&busy); err != nil {
-		return false, err
-	}
-	if busy != 0 {
-		return false, ErrAccountPresentationBusy
 	}
 	bound, err := accountPresentation(tx, account.ID)
 	if err != nil {
 		return false, err
 	}
-	if bound.AccountInstanceID != account.InstanceID ||
-		bound.AccountGeneration != account.Generation || bound.Proof != currentProof {
-		return false, ErrAccountPresentationEvidence
-	}
-	if err := upsertAccountPresentation(tx, AccountPresentation{
-		AccountID: account.ID, AccountInstanceID: account.InstanceID,
-		AccountGeneration: account.Generation, Proof: freshProof, ObservedAt: s.now(),
-	}); err != nil {
+	health, err := syncedAdmissionAuth(tx, account.ID)
+	if err != nil {
 		return false, err
 	}
+	if final, finalErr := syncedCredentialAdmissionTx(tx, account); finalErr == nil &&
+		sameSyncedCredentialAdmissionFence(final.SyncedCredentialAdmissionFence, credential) &&
+		bound.Proof == freshProof && health.healthyOwned() {
+		return true, nil
+	} else if finalErr != nil && !errors.Is(finalErr, sql.ErrNoRows) {
+		return false, finalErr
+	}
+	pending, err := pendingSyncedCredentialAdmissionTx(tx, account)
+	if err != nil || !sameSyncedCredentialAdmissionFence(
+		pending.SyncedCredentialAdmissionFence, credential,
+	) || bound.Proof != freshProof || !health.awaitingOrigin() {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
+		return false, ErrAccountPresentationEvidence
+	}
+	now := s.now()
 	if _, err := tx.Exec(
 		`INSERT INTO synced_credential_admissions(
 		 account_id,account_instance_id,account_generation,locator_digest,
@@ -279,9 +363,23 @@ func (s *Store) AdmitSyncedAccount(
 		 admitted_at=excluded.admitted_at`,
 		account.ID, account.InstanceID, account.Generation, credential.LocatorDigest[:],
 		credential.ExternalStateDigest[:], credential.TokenChainDigest[:],
-		credential.AccessHashDigest[:], s.now().UnixNano(),
+		credential.AccessHashDigest[:], now.UnixNano(),
 	); err != nil {
 		return false, err
+	}
+	deleted, err := tx.Exec(
+		`DELETE FROM pending_synced_credential_admissions
+		 WHERE account_id=? AND account_instance_id=? AND account_generation=?
+		 AND locator_digest=? AND external_state_digest=?
+		 AND token_chain_digest=? AND access_hash_digest=?`,
+		account.ID, account.InstanceID, account.Generation, credential.LocatorDigest[:],
+		credential.ExternalStateDigest[:], credential.TokenChainDigest[:], credential.AccessHashDigest[:],
+	)
+	if err != nil {
+		return false, err
+	}
+	if rows, _ := deleted.RowsAffected(); rows != 1 {
+		return false, ErrAccountPresentationEvidence
 	}
 	result, err := tx.Exec(
 		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none',
@@ -293,17 +391,239 @@ func (s *Store) AdmitSyncedAccount(
 	if err != nil {
 		return false, err
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if rows != 1 {
+	if rows, _ := result.RowsAffected(); rows != 1 {
 		return false, ErrAccountPresentationEvidence
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// ReopenSyncedAccountAdmission restores exact finalized evidence to pending
+// liability after a post-finalization external mismatch.
+func (s *Store) ReopenSyncedAccountAdmission(
+	account Account,
+	freshProof PresentationPreparationProof,
+	credential SyncedCredentialAdmissionFence,
+) error {
+	if err := validatePresentationPreparationProofForAccount(
+		freshProof, account.InstanceID, account.Generation, account.ConfigDir,
+	); err != nil {
+		return err
+	}
+	if err := credential.validate(account); err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, err := presentationAccount(tx, account.ID)
+	if err != nil {
+		return err
+	}
+	if !samePresentationAccount(current, account) {
+		return ErrAccountGenerationChanged
+	}
+	bound, err := accountPresentation(tx, account.ID)
+	if err != nil || bound.Proof != freshProof {
+		if err != nil {
+			return err
+		}
+		return ErrAccountPresentationEvidence
+	}
+	health, err := syncedAdmissionAuth(tx, account.ID)
+	if err != nil {
+		return err
+	}
+	if pending, pendingErr := pendingSyncedCredentialAdmissionTx(tx, account); pendingErr == nil &&
+		sameSyncedCredentialAdmissionFence(pending.SyncedCredentialAdmissionFence, credential) &&
+		health.awaitingOrigin() {
+		return nil
+	} else if pendingErr != nil && !errors.Is(pendingErr, sql.ErrNoRows) {
+		return pendingErr
+	}
+	final, err := syncedCredentialAdmissionTx(tx, account)
+	if err != nil || !sameSyncedCredentialAdmissionFence(final.SyncedCredentialAdmissionFence, credential) ||
+		!health.healthyOwned() {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		return ErrAccountPresentationEvidence
+	}
+	now := s.now()
+	if _, err := tx.Exec(
+		`INSERT INTO pending_synced_credential_admissions(
+		 account_id,account_instance_id,account_generation,locator_digest,
+		 external_state_digest,token_chain_digest,access_hash_digest,staged_at)
+		 VALUES(?,?,?,?,?,?,?,?)
+		 ON CONFLICT(account_id) DO UPDATE SET
+		 account_instance_id=excluded.account_instance_id,
+		 account_generation=excluded.account_generation,
+		 locator_digest=excluded.locator_digest,
+		 external_state_digest=excluded.external_state_digest,
+		 token_chain_digest=excluded.token_chain_digest,
+		 access_hash_digest=excluded.access_hash_digest,
+		 staged_at=excluded.staged_at`,
+		account.ID, account.InstanceID, account.Generation, credential.LocatorDigest[:],
+		credential.ExternalStateDigest[:], credential.TokenChainDigest[:],
+		credential.AccessHashDigest[:], now.UnixNano(),
+	); err != nil {
+		return err
+	}
+	deleted, err := tx.Exec(
+		`DELETE FROM synced_credential_admissions
+		 WHERE account_id=? AND account_instance_id=? AND account_generation=?
+		 AND locator_digest=? AND external_state_digest=?
+		 AND token_chain_digest=? AND access_hash_digest=?`,
+		account.ID, account.InstanceID, account.Generation, credential.LocatorDigest[:],
+		credential.ExternalStateDigest[:], credential.TokenChainDigest[:], credential.AccessHashDigest[:],
+	)
+	if err != nil {
+		return err
+	}
+	if rows, _ := deleted.RowsAffected(); rows != 1 {
+		return ErrAccountPresentationEvidence
+	}
+	digest := DigestReason("host-sync: awaiting origin credential")
+	result, err := tx.Exec(
+		`UPDATE auth_health SET needs_login=1,since=?,reason='awaiting_origin',
+		 digest=?,kind='awaiting_origin',gen=gen+1
+		 WHERE account_id=? AND needs_login=0 AND kind='owned'`,
+		now.Unix(), digest[:], account.ID,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return ErrAccountPresentationEvidence
+	}
+	return tx.Commit()
+}
+
+type syncedAdmissionAuthState struct {
+	needsLogin bool
+	reason     AuthReasonCategory
+	kind       AuthKind
+}
+
+func (state syncedAdmissionAuthState) awaitingOrigin() bool {
+	return state.needsLogin && state.reason == AuthReasonAwaitingOrigin && state.kind == AuthKindAwaitingOrigin
+}
+
+func (state syncedAdmissionAuthState) healthyOwned() bool {
+	return !state.needsLogin && state.reason == AuthReasonNone && state.kind == AuthKindOwned
+}
+
+func syncedAdmissionAuth(tx *sql.Tx, accountID int) (syncedAdmissionAuthState, error) {
+	var needsLogin int
+	var reason string
+	var kind string
+	if err := tx.QueryRow(
+		`SELECT needs_login,reason,kind FROM auth_health WHERE account_id=?`, accountID,
+	).Scan(&needsLogin, &reason, &kind); err != nil {
+		return syncedAdmissionAuthState{}, err
+	}
+	return syncedAdmissionAuthState{
+		needsLogin: needsLogin != 0, reason: AuthReasonCategory(reason), kind: AuthKind(kind),
+	}, nil
+}
+
+func validateSyncedAdmissionGuards(tx *sql.Tx, accountID int) error {
+	if _, err := accountPresentationQuarantine(tx, accountID); err == nil {
+		return ErrAccountPresentationQuarantined
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var liveSession int
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM sessions WHERE account_id=? AND ended_at IS NULL)`, accountID,
+	).Scan(&liveSession); err != nil {
+		return err
+	}
+	if liveSession != 0 {
+		return ErrAccountSessionActive
+	}
+	var busy int
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM account_mutations WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM credential_operations WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM account_removals WHERE account_id=?)`,
+		accountID, accountID, accountID, accountID,
+	).Scan(&busy); err != nil {
+		return err
+	}
+	if busy != 0 {
+		return ErrAccountPresentationBusy
+	}
+	return nil
+}
+
+func pendingSyncedCredentialAdmissionTx(
+	tx *sql.Tx,
+	account Account,
+) (SyncedCredentialAdmissionStage, error) {
+	row := tx.QueryRow(
+		`SELECT locator_digest,external_state_digest,token_chain_digest,
+		 access_hash_digest,staged_at
+		 FROM pending_synced_credential_admissions
+		 WHERE account_id=? AND account_instance_id=? AND account_generation=?`,
+		account.ID, account.InstanceID, account.Generation,
+	)
+	result := SyncedCredentialAdmissionStage{
+		AccountID: account.ID,
+		SyncedCredentialAdmissionFence: SyncedCredentialAdmissionFence{
+			AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
+		},
+	}
+	var locator, external, tokenChain, access []byte
+	var stagedAt int64
+	if err := row.Scan(&locator, &external, &tokenChain, &access, &stagedAt); err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	if !copyCredentialDigest(&result.LocatorDigest, locator) ||
+		!copyCredentialDigest(&result.ExternalStateDigest, external) ||
+		!copyCredentialDigest(&result.TokenChainDigest, tokenChain) ||
+		!copyCredentialDigest(&result.AccessHashDigest, access) || stagedAt <= 0 {
+		return SyncedCredentialAdmissionStage{}, ErrAccountPresentationEvidence
+	}
+	result.StagedAt = time.Unix(0, stagedAt)
+	return result, nil
+}
+
+func syncedCredentialAdmissionTx(
+	tx *sql.Tx,
+	account Account,
+) (SyncedCredentialAdmission, error) {
+	row := tx.QueryRow(
+		`SELECT locator_digest,external_state_digest,token_chain_digest,
+		 access_hash_digest,admitted_at
+		 FROM synced_credential_admissions
+		 WHERE account_id=? AND account_instance_id=? AND account_generation=?`,
+		account.ID, account.InstanceID, account.Generation,
+	)
+	result := SyncedCredentialAdmission{
+		AccountID: account.ID,
+		SyncedCredentialAdmissionFence: SyncedCredentialAdmissionFence{
+			AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
+		},
+	}
+	var locator, external, tokenChain, access []byte
+	var admittedAt int64
+	if err := row.Scan(&locator, &external, &tokenChain, &access, &admittedAt); err != nil {
+		return SyncedCredentialAdmission{}, err
+	}
+	if !copyCredentialDigest(&result.LocatorDigest, locator) ||
+		!copyCredentialDigest(&result.ExternalStateDigest, external) ||
+		!copyCredentialDigest(&result.TokenChainDigest, tokenChain) ||
+		!copyCredentialDigest(&result.AccessHashDigest, access) || admittedAt <= 0 {
+		return SyncedCredentialAdmission{}, ErrAccountPresentationEvidence
+	}
+	result.AdmittedAt = time.Unix(0, admittedAt)
+	return result, nil
 }
 
 func validateFileProviderPreparationProof(fileProvider FileProviderPreparationProof) error {

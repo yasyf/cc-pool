@@ -207,7 +207,10 @@ func cmdAccount(args []string) error {
 	if err != nil {
 		return fmt.Errorf("build admission evidence: %w", err)
 	}
-	admitted, err := db.AdmitSyncedAccount(acct, proof, freshProof, admissionFence)
+	if _, err := db.StageSyncedAccountAdmission(acct, proof, freshProof, admissionFence); err != nil {
+		return fmt.Errorf("stage account admission: %w", err)
+	}
+	admitted, err := db.FinalizeSyncedAccountAdmission(acct, freshProof, admissionFence)
 	if err != nil {
 		return fmt.Errorf("admit account row: %w", err)
 	}

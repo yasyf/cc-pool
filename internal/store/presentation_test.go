@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestListActiveAccountsExcludesAccountWithoutExactPresentation(t *testing.T) {
@@ -54,6 +55,59 @@ func TestObserveAccountPresentationBindsExactEvidenceAndRefreshesActivation(t *t
 	}
 	if _, err := s.AccountPresentationQuarantine(account.ID); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("matching observation quarantined: %v", err)
+	}
+}
+
+func TestPendingSyncedAdmissionFailsClosedForSelectionAndOriginPublication(t *testing.T) {
+	s := openTest(t)
+	account := admitTestAccount(t, s, Account{
+		ID: 1, ConfigDir: "/presentation/acct-01",
+		KeychainService: "service-1", KeychainAccount: "account-1",
+	})
+	bound, err := s.AccountPresentation(account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := bound.Proof
+	fresh.FileProvider.ActivationGeneration = "pending-admission"
+	if _, err := s.SetNeedsLogin(
+		account.ID, time.Now(), AuthReasonAwaitingOrigin,
+		DigestReason("pending synced admission"), AuthKindAwaitingOrigin,
+	); err != nil {
+		t.Fatal(err)
+	}
+	fence := SyncedCredentialAdmissionFence{
+		AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
+		LocatorDigest: CredentialKeychainLocatorDigest(
+			account.KeychainService, account.KeychainAccount,
+		),
+		ExternalStateDigest: credentialOperationTestDigest("pending-external"),
+		TokenChainDigest:    credentialOperationTestDigest("pending-token-chain"),
+		AccessHashDigest:    credentialOperationTestDigest("pending-access"),
+	}
+	if _, err := s.StageSyncedAccountAdmission(account, bound.Proof, fresh, fence); err != nil {
+		t.Fatal(err)
+	}
+	request := credentialOperationTestRequest(
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
+		credentialOperationTestState("pending-admission", ""),
+		"pending-admission", credentialOperationTestOwner("pending-admission"),
+	)
+	if begin, err := s.BeginCredentialOperation(request); !errors.Is(err, ErrAwaitingOriginAdmission) || begin.Active != nil || begin.Receipt != nil {
+		t.Fatalf("credential mutation with pending admission = %+v err=%v", begin, err)
+	}
+	if _, err := s.db.Exec(
+		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none',
+		 digest=zeroblob(32), kind='owned' WHERE account_id=?`,
+		account.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SelectionEligible(account); !errors.Is(err, ErrAccountSelectionIneligible) {
+		t.Fatalf("selection with pending admission = %v", err)
+	}
+	if origins, err := s.ListPublishableOrigins(); err != nil || len(origins) != 0 {
+		t.Fatalf("publishable origins with pending admission = %+v err=%v", origins, err)
 	}
 }
 

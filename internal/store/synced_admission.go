@@ -23,6 +23,15 @@ type SyncedCredentialAdmission struct {
 	AdmittedAt time.Time
 }
 
+// SyncedCredentialAdmissionStage is durable admission liability that has not
+// yet cleared awaiting-origin state. Finalized reports an exact replay.
+type SyncedCredentialAdmissionStage struct {
+	AccountID int
+	SyncedCredentialAdmissionFence
+	StagedAt  time.Time
+	Finalized bool
+}
+
 func (fence SyncedCredentialAdmissionFence) validate(account Account) error {
 	if fence.AccountInstanceID != account.InstanceID ||
 		fence.AccountGeneration != account.Generation ||
@@ -66,6 +75,43 @@ func (s *Store) SyncedCredentialAdmission(account Account) (SyncedCredentialAdmi
 		return SyncedCredentialAdmission{}, err
 	}
 	return result, nil
+}
+
+// PendingSyncedCredentialAdmission returns the exact unfinalized evidence for account.
+func (s *Store) PendingSyncedCredentialAdmission(account Account) (SyncedCredentialAdmissionStage, error) {
+	row := s.db.QueryRow(
+		`SELECT locator_digest,external_state_digest,token_chain_digest,
+		 access_hash_digest,staged_at
+		 FROM pending_synced_credential_admissions
+		 WHERE account_id=? AND account_instance_id=? AND account_generation=?`,
+		account.ID, account.InstanceID, account.Generation,
+	)
+	result := SyncedCredentialAdmissionStage{
+		AccountID: account.ID,
+		SyncedCredentialAdmissionFence: SyncedCredentialAdmissionFence{
+			AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
+		},
+	}
+	var locator, external, tokenChain, access []byte
+	var stagedAt int64
+	if err := row.Scan(&locator, &external, &tokenChain, &access, &stagedAt); err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	if !copyCredentialDigest(&result.LocatorDigest, locator) ||
+		!copyCredentialDigest(&result.ExternalStateDigest, external) ||
+		!copyCredentialDigest(&result.TokenChainDigest, tokenChain) ||
+		!copyCredentialDigest(&result.AccessHashDigest, access) || stagedAt <= 0 {
+		return SyncedCredentialAdmissionStage{}, errors.New("pending synced credential admission evidence is corrupt")
+	}
+	result.StagedAt = time.Unix(0, stagedAt)
+	if err := result.SyncedCredentialAdmissionFence.validate(account); err != nil {
+		return SyncedCredentialAdmissionStage{}, err
+	}
+	return result, nil
+}
+
+func sameSyncedCredentialAdmissionFence(left, right SyncedCredentialAdmissionFence) bool {
+	return left == right
 }
 
 func copyCredentialDigest(target *CredentialDigest, source []byte) bool {

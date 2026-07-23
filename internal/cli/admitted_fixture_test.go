@@ -46,9 +46,11 @@ func admitCLITestAccount(t *testing.T, database *store.Store, requested store.Ac
 		}
 		fresh := proof
 		fresh.FileProvider.ActivationGeneration = "cli-test-admitted"
-		admitted, err := database.AdmitSyncedAccount(
-			account, proof, fresh, cliTestAdmissionFence(account),
-		)
+		fence := cliTestAdmissionFence(account)
+		if _, err := database.StageSyncedAccountAdmission(account, proof, fresh, fence); err != nil {
+			t.Fatal(err)
+		}
+		admitted, err := database.FinalizeSyncedAccountAdmission(account, fresh, fence)
 		if err != nil {
 			t.Fatal(err)
 		}

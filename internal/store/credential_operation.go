@@ -467,6 +467,20 @@ func (s *Store) BeginCredentialOperation(
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return BeginCredentialOperationResult{}, err
 	}
+	if request.Kind != CredentialOperationRemove {
+		var pendingAdmission int
+		if err := tx.QueryRow(
+			`SELECT EXISTS(
+			 SELECT 1 FROM pending_synced_credential_admissions WHERE account_id=?
+			)`,
+			request.AccountID,
+		).Scan(&pendingAdmission); err != nil {
+			return BeginCredentialOperationResult{}, err
+		}
+		if pendingAdmission != 0 {
+			return BeginCredentialOperationResult{}, ErrAwaitingOriginAdmission
+		}
+	}
 	if _, err := tx.Exec(`UPDATE accounts SET id=id WHERE id=? AND deleted_at IS NULL`, request.AccountID); err != nil {
 		return BeginCredentialOperationResult{}, err
 	}
