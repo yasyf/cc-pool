@@ -45,7 +45,7 @@ func (s hostSyncWorkerSessions) Busy(ctx context.Context, uuid string) (bool, st
 		if active > 0 {
 			return true, fmt.Sprintf("acct-%02d has %d active session(s)", account.ID, active), nil
 		}
-		if count := procscan.CountByConfigDir(sessions, pool.AccountPresentationDir(account.ID)); count > 0 {
+		if count := procscan.CountByConfigDir(sessions, account.ConfigDir); count > 0 {
 			return true, fmt.Sprintf("acct-%02d has %d live process session(s)", account.ID, count), nil
 		}
 	}

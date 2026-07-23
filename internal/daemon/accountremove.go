@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -40,7 +39,7 @@ func (s *Server) beginAccountRemoval(id int, deleteCredential bool) (removal sto
 }
 
 func (s *Server) beginFreshAccountRemoval(account store.Account, deleteCredential bool) (store.AccountRemoval, error) {
-	if s.heartbeatFor().view().sessionCount(pool.AccountPresentationDir(account.ID)) != 0 {
+	if s.heartbeatFor().view().sessionCount(account.ConfigDir) != 0 {
 		return store.AccountRemoval{}, fmt.Errorf("acct-%02d has a live session", account.ID)
 	}
 	removal, err := s.m.Store.BeginAccountRemoval(account.ID, deleteCredential)

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -28,7 +27,7 @@ func (s *Server) handleIdleTransition(ctx context.Context, dir string) {
 	var account store.Account
 	found := false
 	for _, candidate := range accounts {
-		if pool.AccountPresentationDir(candidate.ID) == dir {
+		if candidate.ConfigDir == dir {
 			account = candidate
 			found = true
 			break
@@ -50,7 +49,7 @@ func (s *Server) handleIdleTransition(ctx context.Context, dir string) {
 		s.log.Printf("acct-%02d idle adoption: re-read row: %v", account.ID, err)
 		return
 	}
-	if pool.AccountPresentationDir(fresh.ID) != dir || !s.heartbeatFor().view().idle(dir) {
+	if fresh.ConfigDir != dir || !s.heartbeatFor().view().idle(dir) {
 		return
 	}
 	if s.cl.reservedCount(fresh.ID) != 0 {

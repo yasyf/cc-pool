@@ -42,7 +42,7 @@ func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessio
 			continue
 		}
 		a := a
-		allowRefresh := scanOK && procscan.CountByConfigDir(sessions, AccountPresentationDir(a.ID)) == 0
+		allowRefresh := scanOK && procscan.CountByConfigDir(sessions, a.ConfigDir) == 0
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -91,7 +91,7 @@ func (m *Manager) scoreInput(ctx context.Context, a store.Account, sessions []pr
 			in.Resets7dScoped = g.Scoped7dResets
 		}
 	}
-	in.ActiveSessions = procscan.CountByConfigDir(sessions, AccountPresentationDir(a.ID))
+	in.ActiveSessions = procscan.CountByConfigDir(sessions, a.ConfigDir)
 	if r, ok, _ := m.Store.LastRefresh(a.ID); ok && r.Category != store.RefreshSucceeded {
 		in.RefreshFailed = true
 	}
@@ -132,7 +132,7 @@ func (m *Manager) PreflightRefresh(ctx context.Context, a store.Account) error {
 		log.Printf("acct-%d preflight refresh: procscan failed; skipping refresh: %v", a.ID, err)
 		return nil
 	}
-	if procscan.CountByConfigDir(sessions, AccountPresentationDir(a.ID)) != 0 {
+	if procscan.CountByConfigDir(sessions, a.ConfigDir) != 0 {
 		return nil
 	}
 	_, _, ferr := m.EnsureFreshToken(ctx, a, RefreshLeadTime, true)

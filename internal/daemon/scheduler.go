@@ -320,7 +320,7 @@ func (s *Server) pollAccount(ctx context.Context, t *tick, a store.Account, reco
 	// A reserved account's claude may not be heartbeat-visible yet — treat it as
 	// busy so we don't refresh under the launch. A failed heartbeat also makes
 	// every dir non-idle while retaining last-known counts for diagnostics.
-	presentationDir := pool.AccountPresentationDir(a.ID)
+	presentationDir := a.ConfigDir
 	idle := t.idle(presentationDir) && s.cl.reservedCount(a.ID) == 0
 
 	// The prior-401 gate gives a lazily-waking session one full poll to

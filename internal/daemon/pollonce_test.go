@@ -895,7 +895,7 @@ func TestPollOnceRecoverySweepHealsBusy401(t *testing.T) {
 			snapshot: filepath.Join(t.TempDir(), "status.json"),
 			log:      log.New(io.Discard, "", 0),
 			scanSessions: func(context.Context) ([]procscan.Session, error) { // a live session → busy
-				return []procscan.Session{{PID: 4242, ConfigDir: pool.AccountPresentationDir(a.ID), StartedAt: time.Now()}}, nil
+				return []procscan.Session{{PID: 4242, ConfigDir: a.ConfigDir, StartedAt: time.Now()}}, nil
 			},
 			cl:  newClaims(),
 			led: newLedgers(),

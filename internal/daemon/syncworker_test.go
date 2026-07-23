@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/hostsync"
-	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -16,7 +15,7 @@ import (
 func TestHostSyncWorkerSessionsUsesDurableAndObservedActivity(t *testing.T) {
 	s, _ := newWireServer(t)
 	account := store.Account{
-		ID: 1, ConfigDir: pool.AccountPresentationDir(1),
+		ID: 1, ConfigDir: "/File Provider/CCPool/acct-01",
 		KeychainService: "svc-worker-sessions", KeychainAccount: "cc-pool",
 		AccountUUID: "u-worker-sessions",
 	}
@@ -37,7 +36,7 @@ func TestHostSyncWorkerSessionsUsesDurableAndObservedActivity(t *testing.T) {
 
 	s.m.ScanSessions = func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{
-			PID: 4242, ConfigDir: pool.AccountPresentationDir(account.ID), StartedAt: time.Now(),
+			PID: 4242, ConfigDir: account.ConfigDir, StartedAt: time.Now(),
 		}}, nil
 	}
 	busy, reason, err = sessions.Busy(t.Context(), account.AccountUUID)

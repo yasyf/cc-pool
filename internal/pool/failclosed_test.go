@@ -111,7 +111,7 @@ func TestPreflightRefreshFailsClosedOnScanError(t *testing.T) {
 	t.Run("live session skips refresh", func(t *testing.T) {
 		m, a, fo, _ := newFailClosedManager(t)
 		m.ScanSessions = func(context.Context) ([]procscan.Session, error) {
-			return []procscan.Session{{PID: 1, ConfigDir: AccountPresentationDir(a.ID), StartedAt: time.Now()}}, nil
+			return []procscan.Session{{PID: 1, ConfigDir: a.ConfigDir, StartedAt: time.Now()}}, nil
 		}
 		if err := m.PreflightRefresh(context.Background(), a); err != nil {
 			t.Fatalf("PreflightRefresh: %v", err)

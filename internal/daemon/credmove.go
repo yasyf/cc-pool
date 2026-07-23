@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
-	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -75,7 +74,7 @@ func (s *Server) moveAccountCred(ctx context.Context, a store.Account, target cr
 	// Existing sessions and already-pending selections prevent a move. A new
 	// selection that starts after this check waits on the durable credential lane
 	// before its reservation can be returned or activated.
-	if s.heartbeatFor().view().sessionCount(pool.AccountPresentationDir(a.ID)) != 0 {
+	if s.heartbeatFor().view().sessionCount(a.ConfigDir) != 0 {
 		res.Outcome = CredentialMoveBusy
 		res.Detail = "held by a live session; close it, then retry"
 		return res
