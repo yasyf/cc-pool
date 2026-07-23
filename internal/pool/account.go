@@ -129,10 +129,10 @@ func (m *Manager) prepareReservedAdd(
 	}, nil
 }
 
-// PromoteSyncedAdd publishes one proven-path non-origin account before its
-// access-only credential is installed.
 var promoteSyncedAddFailpoint func(string) error
 
+// PromoteSyncedAdd publishes one proven-path non-origin account before its
+// access-only credential is installed.
 func (m *Manager) PromoteSyncedAdd(
 	ctx context.Context,
 	pending *PendingAdd,

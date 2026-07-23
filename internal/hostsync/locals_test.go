@@ -58,7 +58,7 @@ func (fx *localsFixture) addAccount(t *testing.T, id int, _ string, label, ident
 		KeychainService: fmt.Sprintf("svc%d", id), KeychainAccount: "me",
 		AccountUUID: identity.OAuthAccount.AccountUUID,
 	}
-	a = admitHostsyncTestAccount(t, fx.m, a)
+	admitHostsyncTestAccount(t, fx.m, a)
 	path := filepath.Join(pool.AccountBackingDir(id), ".claude.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)

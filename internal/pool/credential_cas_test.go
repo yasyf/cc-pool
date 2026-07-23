@@ -102,7 +102,7 @@ func TestCredentialCASDeletesAtExactFileProviderPublicPath(t *testing.T) {
 		os.Getenv("HOME"), "Library", "CloudStorage", "CCPool", "account-1",
 	)
 	account.KeychainService = creds.ServiceName(account.ConfigDir)
-	if err := os.MkdirAll(account.ConfigDir, 0o700); err != nil {
+	if err := os.MkdirAll(account.ConfigDir, 0o700); err != nil { //nolint:gosec // G703: the path is under the test HOME.
 		t.Fatal(err)
 	}
 	request := CredentialCASRequest{
@@ -408,7 +408,7 @@ func assertCredentialCASLocksGone(t *testing.T, configDir string) {
 		t.Fatal(err)
 	}
 	for _, path := range []string{filepath.Join(configDir, ".oauth_refresh.lock"), realConfigDir + ".lock"} {
-		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) { //nolint:gosec // G703: fixture paths are test-owned.
 			t.Fatalf("credential CAS lock remained at %s: %v", path, err)
 		}
 	}

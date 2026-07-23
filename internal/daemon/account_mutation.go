@@ -778,20 +778,20 @@ func (s *Server) startOrAttachAccountMutation(
 	var locator, expected store.CredentialDigest
 	var previousLocator, previousCredential store.CredentialDigest
 	var previousCredentialState store.CredentialSlotState
-	if kind == store.AccountMutationAdd {
+	switch kind {
+	case store.AccountMutationAdd:
 		operationID, err = store.NewPendingAddMutationID(
 			account.ID, account.InstanceID, account.Generation, intent,
 		)
-	} else if kind == store.AccountMutationPresentationRebind {
-		previousLocator, previousCredentialState, previousCredential, err =
-			s.m.AccountPresentationRebindSourceEvidence(ctx, account)
+	case store.AccountMutationPresentationRebind:
+		previousLocator, previousCredentialState, previousCredential, err = s.m.AccountPresentationRebindSourceEvidence(ctx, account)
 		if err == nil {
 			operationID, err = store.NewPresentationRebindMutationID(
 				account.ID, account.InstanceID, account.Generation+1,
 				previousLocator, previousCredentialState, previousCredential, intent,
 			)
 		}
-	} else {
+	default:
 		expectedState, stateErr := s.m.CredentialExternalState(ctx, account)
 		if stateErr != nil {
 			return store.AccountMutation{}, nil, stateErr
@@ -1296,7 +1296,7 @@ func (s *Server) recoverRetiredAccountMutations(ctx context.Context) error {
 					"account mutation recovery deferred: account=%d operation=%x state=%s: %v",
 					mutation.AccountID, mutation.OperationID, mutation.State, err,
 				)
-				s.deferAccountMutationRecovery(mutation)
+				s.deferAccountMutationRecovery(mutation) //nolint:contextcheck // recovery follows the holder lifetime, not startup.
 			}
 		}
 		if !more {

@@ -26,6 +26,7 @@ type FileProviderPreparationProof struct {
 	PublicPath           string
 }
 
+// PresentationKindFileProvider identifies the sole account presentation kind.
 const PresentationKindFileProvider = "file_provider"
 
 // PresentationPreparationProof is the product-owned projection of one exact
@@ -60,9 +61,13 @@ type AccountPresentation struct {
 type AccountPresentationQuarantineReason string
 
 const (
+	// AccountPresentationPublicPathDrift reports a changed public path.
 	AccountPresentationPublicPathDrift AccountPresentationQuarantineReason = "public-path-drift"
-	AccountPresentationTenantIDDrift   AccountPresentationQuarantineReason = "tenant-id-drift"
-	AccountPresentationDomainIDDrift   AccountPresentationQuarantineReason = "domain-id-drift"
+	// AccountPresentationTenantIDDrift reports a changed tenant identity.
+	AccountPresentationTenantIDDrift AccountPresentationQuarantineReason = "tenant-id-drift"
+	// AccountPresentationDomainIDDrift reports a changed File Provider domain.
+	AccountPresentationDomainIDDrift AccountPresentationQuarantineReason = "domain-id-drift"
+	// AccountPresentationGenerationDrift reports a changed presentation generation.
 	AccountPresentationGenerationDrift AccountPresentationQuarantineReason = "generation-drift"
 )
 

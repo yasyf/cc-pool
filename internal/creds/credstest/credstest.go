@@ -96,7 +96,7 @@ func (f *Fake) Get(service, account string) (*creds.Credential, bool) {
 }
 
 // Store returns a's Keychain store wrapped with configured faults.
-func (f *Fake) Store(a store.Account, src creds.Source) creds.Store {
+func (f *Fake) Store(a store.Account, _ creds.Source) creds.Store {
 	return FaultStore{
 		Store:  keychainItem{f: f, service: a.KeychainService, account: a.KeychainAccount},
 		Faults: f.KeychainFaults,

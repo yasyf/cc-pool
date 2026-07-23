@@ -546,7 +546,7 @@ func TestPollOnceRestartProbesWhenAllCredentialResultsRetained(t *testing.T) {
 					ID: id, ConfigDir: filepath.Join(t.TempDir(), fmt.Sprintf("acct-%d", id)),
 					KeychainService: fmt.Sprintf("svc-%d", id), KeychainAccount: "user",
 				}
-				account = admitDaemonTestAccount(t, st, account)
+				admitDaemonTestAccount(t, st, account)
 				account, err = st.GetAccount(id)
 				if err != nil {
 					t.Fatal(err)

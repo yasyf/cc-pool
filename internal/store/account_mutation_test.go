@@ -439,7 +439,6 @@ func TestRearmAccountMutationInputRejectsDriftAndNonInteractiveKind(t *testing.T
 	); !errors.Is(err, ErrAccountMutationFence) {
 		t.Fatalf("stale rearm = %v", err)
 	}
-
 }
 
 func TestAccountMutationCancellationIsPreBoundaryOnly(t *testing.T) {

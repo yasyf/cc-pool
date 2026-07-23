@@ -67,7 +67,7 @@ type rotatingCreds struct {
 	touched     []string
 }
 
-func (k *rotatingCreds) Store(a store.Account, src creds.Source) creds.Store {
+func (k *rotatingCreds) Store(a store.Account, _ creds.Source) creds.Store {
 	return rotatingItem{k: k, service: a.KeychainService}
 }
 

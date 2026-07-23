@@ -307,7 +307,7 @@ type admissionFlipCredentials struct {
 	expired *creds.Credential
 }
 
-func (c *admissionFlipCredentials) Store(account store.Account, source creds.Source) creds.Store {
+func (c *admissionFlipCredentials) Store(_ store.Account, _ creds.Source) creds.Store {
 	return admissionFlipStore{credentials: c}
 }
 

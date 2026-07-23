@@ -72,7 +72,7 @@ func (s *Store) SyncedCredentialAdmission(account Account) (SyncedCredentialAdmi
 		return SyncedCredentialAdmission{}, errors.New("synced credential admission evidence is corrupt")
 	}
 	result.AdmittedAt = time.Unix(0, admittedAt)
-	if err := result.SyncedCredentialAdmissionFence.validate(account); err != nil {
+	if err := result.validate(account); err != nil {
 		return SyncedCredentialAdmission{}, err
 	}
 	return result, nil
@@ -109,7 +109,7 @@ func (s *Store) PendingSyncedCredentialAdmission(account Account) (SyncedCredent
 	if candidateAt > 0 {
 		result.CandidateAt = time.Unix(0, candidateAt)
 	}
-	if err := result.SyncedCredentialAdmissionFence.validate(account); err != nil {
+	if err := result.validate(account); err != nil {
 		return SyncedCredentialAdmissionStage{}, err
 	}
 	return result, nil

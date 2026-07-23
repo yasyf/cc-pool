@@ -720,16 +720,16 @@ func (s *Server) activateSelection(ctx context.Context, token string, reserved r
 			Cwd:                launch.cwd, RecordSticky: launch.recordSticky, At: time.Now(),
 		})
 	}
-	err = nil
+	var activationErr error
 	if s.activatePrepared != nil {
-		err = s.activatePrepared(ctx, account, *reserved.preparation, activate)
+		activationErr = s.activatePrepared(ctx, account, *reserved.preparation, activate)
 	} else if s.tenantCoordinator != nil {
-		err = s.tenantCoordinator.activatePrepared(ctx, account, *reserved.preparation, activate)
+		activationErr = s.tenantCoordinator.activatePrepared(ctx, account, *reserved.preparation, activate)
 	} else {
-		err = errors.New("FuseKit tenant coordinator is unavailable")
+		activationErr = errors.New("FuseKit tenant coordinator is unavailable")
 	}
-	if err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("activate selection for account %d: %v", reserved.accountID, err)}
+	if activationErr != nil {
+		return Response{OK: false, Error: fmt.Sprintf("activate selection for account %d: %v", reserved.accountID, activationErr)}
 	}
 	return Response{OK: true}
 }

@@ -12,14 +12,13 @@ import (
 
 // writeMeshState writes the shared synckit state.json under a fresh
 // XDG_CONFIG_HOME; hostregistry keys off that env, so this seams the mesh.
-func writeMeshState(t *testing.T, reg *hostregistry.Registry) {
+func writeMeshState(ctx context.Context, t *testing.T, reg *hostregistry.Registry) {
 	t.Helper()
 	xdg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", xdg)
 	if reg == nil {
 		return
 	}
-	ctx := context.Background()
 	if err := hostregistry.Mesh.InitializeState(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +37,7 @@ func TestSynckitMeshResolve(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("resolves self and peers from the shared state", func(t *testing.T) {
-		writeMeshState(t, &hostregistry.Registry{Self: "me@a.ts.net", Hosts: []string{"you@b.ts.net", "exec:true"}})
+		writeMeshState(ctx, t, &hostregistry.Registry{Self: "me@a.ts.net", Hosts: []string{"you@b.ts.net", "exec:true"}})
 		self, peers, err := (SynckitMesh{}).Resolve(ctx)
 		if err != nil {
 			t.Fatalf("Resolve: %v", err)
@@ -52,14 +51,14 @@ func TestSynckitMeshResolve(t *testing.T) {
 	})
 
 	t.Run("unjoined host fails loud", func(t *testing.T) {
-		writeMeshState(t, nil) // no state.json at all
+		writeMeshState(ctx, t, nil) // no state.json at all
 		if _, _, err := (SynckitMesh{}).Resolve(ctx); !errors.Is(err, hostregistry.ErrStateMissing) {
 			t.Fatalf("Resolve on an unjoined host = %v, want a loud not-joined error", err)
 		}
 	})
 
 	t.Run("empty self with peers still fails loud", func(t *testing.T) {
-		writeMeshState(t, &hostregistry.Registry{Hosts: []string{"you@b.ts.net"}})
+		writeMeshState(ctx, t, &hostregistry.Registry{Hosts: []string{"you@b.ts.net"}})
 		if _, _, err := (SynckitMesh{}).Resolve(ctx); err == nil {
 			t.Fatal("Resolve without a self must not return a mesh it cannot converge")
 		}

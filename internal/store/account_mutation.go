@@ -362,7 +362,8 @@ func (s *Store) BeginAccountMutation(
 		return BeginAccountMutationResult{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx,
+	if _, err := tx.ExecContext(
+		ctx,
 		`INSERT INTO account_registry_sequences(account_id,sequence) VALUES(?,0)
 		 ON CONFLICT(account_id) DO NOTHING`, request.AccountID,
 	); err != nil {
@@ -436,19 +437,22 @@ func (s *Store) BeginAccountMutation(
 		return BeginAccountMutationResult{}, err
 	}
 	var sequence uint64
-	if err := tx.QueryRowContext(ctx,
+	if err := tx.QueryRowContext(
+		ctx,
 		`UPDATE account_registry_sequences SET sequence=sequence+1
 		 WHERE account_id=? RETURNING sequence`, request.AccountID,
 	).Scan(&sequence); err != nil {
 		return BeginAccountMutationResult{}, err
 	}
 	state := AccountMutationReserved
-	if request.Kind == AccountMutationAdd || request.Kind == AccountMutationPresentationRebind {
+	switch request.Kind {
+	case AccountMutationAdd, AccountMutationPresentationRebind:
 		state = AccountMutationAwaitingPresentation
-	} else if request.Kind == AccountMutationRelogin {
+	case AccountMutationRelogin:
 		state = AccountMutationAwaitingInput
 	}
-	if _, err := tx.ExecContext(ctx,
+	if _, err := tx.ExecContext(
+		ctx,
 		`INSERT INTO account_mutations(
 		 operation_id,account_id,kind,state,registry_sequence,
 		 account_instance_id,account_generation,locator_digest,
@@ -840,7 +844,8 @@ func (s *Store) TakeoverAccountMutation(
 	if !sameAccountMutationFence(mutation, expected) {
 		return AccountMutation{}, ErrAccountMutationFence
 	}
-	result, err := tx.ExecContext(ctx,
+	result, err := tx.ExecContext(
+		ctx,
 		`UPDATE account_mutations
 		 SET owner_record=?,owner_epoch=owner_epoch+1,updated_at=?
 		 WHERE operation_id=? AND owner_record=? AND owner_epoch=?`,
@@ -854,7 +859,8 @@ func (s *Store) TakeoverAccountMutation(
 		return AccountMutation{}, ErrAccountMutationFence
 	}
 	if mutation.Kind == AccountMutationAdd {
-		result, err := tx.ExecContext(ctx,
+		result, err := tx.ExecContext(
+			ctx,
 			`UPDATE pending_adds SET owner_record=?
 			 WHERE id=? AND instance_id=? AND generation=? AND owner_record=?`,
 			encodedNewOwner, mutation.AccountID, mutation.AccountInstanceID,
@@ -2257,7 +2263,8 @@ func validateAccountMutationRequest(request BeginAccountMutationRequest) error {
 	previousEmpty := request.PreviousConfigDir == "" && request.PreviousKeychainService == "" &&
 		request.PreviousKeychainAccount == "" && request.PreviousLocatorDigest.zero() &&
 		request.PreviousCredentialState == "" && request.PreviousCredentialDigest.zero()
-	if request.Kind == AccountMutationAdd {
+	switch request.Kind {
+	case AccountMutationAdd:
 		if request.ConfigDir != "" || request.KeychainService != "" || request.KeychainAccount != "" ||
 			!request.LocatorDigest.zero() || !request.ExpectedCredentialDigest.zero() || !previousEmpty {
 			return ErrAccountMutationState
@@ -2265,7 +2272,7 @@ func validateAccountMutationRequest(request BeginAccountMutationRequest) error {
 		expectedID, err = NewPendingAddMutationID(
 			request.AccountID, request.AccountInstanceID, request.AccountGeneration, request.IntentDigest,
 		)
-	} else if request.Kind == AccountMutationPresentationRebind {
+	case AccountMutationPresentationRebind:
 		if request.AccountGeneration < 2 || request.ConfigDir != "" || request.KeychainService != "" ||
 			request.KeychainAccount != "" || !request.LocatorDigest.zero() ||
 			!request.ExpectedCredentialDigest.zero() || request.PreviousConfigDir == "" ||
@@ -2284,7 +2291,7 @@ func validateAccountMutationRequest(request BeginAccountMutationRequest) error {
 			request.PreviousLocatorDigest, request.PreviousCredentialState,
 			request.PreviousCredentialDigest, request.IntentDigest,
 		)
-	} else {
+	default:
 		if request.ConfigDir == "" || request.KeychainService == "" || request.KeychainAccount == "" ||
 			request.LocatorDigest.zero() || request.ExpectedCredentialDigest.zero() || !previousEmpty {
 			return ErrAccountMutationState

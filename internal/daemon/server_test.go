@@ -283,24 +283,6 @@ func waitForBlockedPrepare(t *testing.T, entered <-chan struct{}) {
 	}
 }
 
-func exactPendingSelectionToken(t *testing.T, claims *claims, accountID int) string {
-	t.Helper()
-	claims.mu.Lock()
-	defer claims.mu.Unlock()
-	var token string
-	count := 0
-	for candidate, selection := range claims.selections {
-		if selection.accountID == accountID && selection.state == selectionPending {
-			token = candidate
-			count++
-		}
-	}
-	if count != 1 {
-		t.Fatalf("pending acct-%d selections = %d, want 1", accountID, count)
-	}
-	return token
-}
-
 // newTestServer builds a Server with acct-1 emptier than acct-2. scanSessions
 // is stubbed: real `ps` can hang on a wedged mount.
 func newTestServer(t *testing.T) (*Server, map[int]string) {

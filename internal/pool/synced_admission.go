@@ -12,8 +12,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-var syncedAdmissionFailpoint func(string)
-var syncedAdmissionResultFailpoint func(string) error
+var (
+	syncedAdmissionFailpoint       func(string)
+	syncedAdmissionResultFailpoint func(string) error
+)
 
 // AdmitSyncedCredential serializes credential validation with every credential
 // mutation and advances presentation and admission through durable exact evidence.

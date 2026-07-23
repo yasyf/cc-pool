@@ -268,7 +268,7 @@ func deterministicNeedsLoginError(credential *creds.Credential) error {
 func (m *Manager) refresh(
 	ctx context.Context,
 	a store.Account,
-	src creds.Source,
+	_ creds.Source,
 	boundary *credentialOperationBoundary,
 ) (*creds.Credential, error) {
 	if m.credentialCAS == nil {

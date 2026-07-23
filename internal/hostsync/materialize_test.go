@@ -97,7 +97,7 @@ func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task supervis
 
 type backingCredentials struct{ *credstest.Fake }
 
-func (c backingCredentials) Store(a store.Account, source creds.Source) creds.Store {
+func (c backingCredentials) Store(a store.Account, _ creds.Source) creds.Store {
 	return c.Fake.Store(a, creds.SourceKeychain)
 }
 
