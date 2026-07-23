@@ -20,8 +20,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/mountproto"
 )
 
 var daemonTestToken atomic.Uint64
@@ -358,19 +360,37 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 }
 
 func daemonTestPreparationProof(account store.Account, publicPath string) catalogproto.TenantPreparationProof {
+	tenantID, err := (tenantfs.Account{InstanceID: account.InstanceID}).TenantID()
+	if err != nil {
+		panic(err)
+	}
+	domainID, err := catalogproto.DeriveDomainID(
+		tenantfs.OwnerID,
+		catalogproto.PresentationInstanceID(account.InstanceID),
+	)
+	if err != nil {
+		panic(err)
+	}
+	const revision = 7
 	return catalogproto.TenantPreparationProof{
-		Catalog: catalogproto.CatalogLaneProof{Tenant: catalogproto.TenantID("test"), Generation: account.Generation},
+		Catalog: catalogproto.CatalogLaneProof{
+			Tenant: catalogproto.TenantID(tenantID), Generation: account.Generation,
+			Requested: revision, Desired: revision, Observed: revision, Verified: revision, Applied: revision,
+		},
 		Presentation: catalogproto.PresentationProof{
 			Kind: catalogproto.PresentationKindFileProvider,
 			FileProvider: &catalogproto.FileProviderPresentationProof{
-				TenantID: catalogproto.TenantID("test"), DomainID: catalogproto.DomainID(fmt.Sprintf("domain-%d", account.ID)),
+				TenantID: catalogproto.TenantID(tenantID), DomainID: domainID,
 				Generation: account.Generation, PublicPath: publicPath, ActivationGeneration: "activation-test",
 			},
 		},
+		SourceAuthority: catalogproto.SourceAuthorityID(tenantfs.ClaudeAuthorityID),
+		SourceRevision:  revision, CatalogRevision: revision,
+		ChangeID: "change-test", OperationID: "operation-test",
 	}
 }
 
-func TestPrepareReservedAccountPathReturnsOnlyValidatedFusePublicPath(t *testing.T) {
+func TestPrepareReservedAccountProofReturnsCompleteValidatedFuseProof(t *testing.T) {
 	s, dirs := newTestServer(t)
 	account, err := s.m.Store.GetAccount(1)
 	if err != nil {
@@ -379,18 +399,103 @@ func TestPrepareReservedAccountPathReturnsOnlyValidatedFusePublicPath(t *testing
 	reservation := store.PendingAccountReservation{
 		ID: account.ID, InstanceID: account.InstanceID, Generation: account.Generation,
 	}
-	publicPath, err := s.prepareReservedAccountPath(t.Context(), reservation)
-	if err != nil || publicPath != dirs[1] {
-		t.Fatalf("prepare reserved account path = %q, %v; want %q", publicPath, err, dirs[1])
+	proof, err := s.prepareReservedAccountProof(t.Context(), reservation)
+	if err != nil || proof.FileProvider.PublicPath != dirs[1] || proof.ChangeID == "" || proof.OperationID == "" {
+		t.Fatalf("prepare reserved account proof = %+v, %v; want path %q", proof, err, dirs[1])
 	}
-	s.prepareReservedAccount = func(_ context.Context, got store.PendingAccountReservation) (string, error) {
+	s.prepareReservedAccount = func(_ context.Context, got store.PendingAccountReservation) (catalogproto.TenantPreparationProof, error) {
 		if got.ID != reservation.ID || got.InstanceID != reservation.InstanceID || got.Generation != reservation.Generation {
 			t.Fatalf("reservation = %+v, want %+v", got, reservation)
 		}
-		return "relative/path", nil
+		invalid := daemonTestPreparationProof(account, "relative/path")
+		return invalid, nil
 	}
-	if _, err := s.prepareReservedAccountPath(t.Context(), reservation); !errors.Is(err, tenantfs.ErrPreparationConflict) {
-		t.Fatalf("invalid injected public path error = %v, want ErrPreparationConflict", err)
+	if _, err := s.prepareReservedAccountProof(t.Context(), reservation); !errors.Is(err, tenantfs.ErrPreparationConflict) {
+		t.Fatalf("invalid injected proof error = %v, want ErrPreparationConflict", err)
+	}
+}
+
+type fixedPreparationHealth struct {
+	health mountproto.RuntimeHealthResponse
+}
+
+func (r fixedPreparationHealth) RuntimeHealth(context.Context) (mountproto.RuntimeHealthResponse, error) {
+	return r.health, nil
+}
+
+func (fixedPreparationHealth) PrepareTenant(
+	context.Context,
+	catalogproto.TenantID,
+	catalogproto.PrepareTenantRequest,
+) (catalogproto.PrepareTenantResponse, error) {
+	return catalogproto.PrepareTenantResponse{}, errors.New("unexpected PrepareTenant call")
+}
+
+func TestStoredPreparationProofRevalidatesEveryFieldAgainstCurrentActivation(t *testing.T) {
+	account := store.Account{
+		ID: 7, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 4,
+	}
+	raw := daemonTestPreparationProof(account, "/Users/test/Library/CloudStorage/proof-account-7")
+	stored, err := projectPreparationProof(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := catalogPreparationProof(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectedAgain, err := projectPreparationProof(roundTrip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projectedAgain != stored {
+		t.Fatalf("stored proof did not round trip:\n got  %+v\n want %+v", projectedAgain, stored)
+	}
+	health := mountproto.RuntimeHealthResponse{
+		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+		RuntimeBuild: version.String(), RuntimeProtocol: mountproto.RuntimeProtocolVersion,
+		RuntimePID: 42, ProcessGeneration: "process-current",
+		ActivationGeneration: stored.FileProvider.ActivationGeneration,
+		State:                mountproto.RuntimeStateHealthy, Ready: true,
+		ReadinessPhase: mountproto.ReadinessPhaseReady, ReadinessStep: mountproto.ReadinessStepPublished,
+		NativePhase: mountproto.NativePhaseDisabled, BrokerPhase: mountproto.BrokerPhaseLive,
+	}
+	preparer, err := tenantfs.NewPreparer(fixedPreparationHealth{health: health})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{tenantCoordinator: &tenantCoordinator{preparer: preparer}}
+	if err := s.revalidatePreparationProof(t.Context(), account, stored); err != nil {
+		t.Fatalf("revalidate exact proof: %v", err)
+	}
+	tests := map[string]func(*store.PresentationPreparationProof){
+		"catalog tenant":      func(p *store.PresentationPreparationProof) { p.CatalogTenantID += "-other" },
+		"catalog generation":  func(p *store.PresentationPreparationProof) { p.CatalogGeneration++ },
+		"requested":           func(p *store.PresentationPreparationProof) { p.Requested++ },
+		"desired":             func(p *store.PresentationPreparationProof) { p.Desired++ },
+		"observed":            func(p *store.PresentationPreparationProof) { p.Observed++ },
+		"verified":            func(p *store.PresentationPreparationProof) { p.Verified++ },
+		"applied":             func(p *store.PresentationPreparationProof) { p.Applied++ },
+		"source authority":    func(p *store.PresentationPreparationProof) { p.SourceAuthority = "foreign" },
+		"source revision":     func(p *store.PresentationPreparationProof) { p.SourceRevision++ },
+		"catalog revision":    func(p *store.PresentationPreparationProof) { p.CatalogRevision++ },
+		"change id":           func(p *store.PresentationPreparationProof) { p.ChangeID += "-other" },
+		"operation id":        func(p *store.PresentationPreparationProof) { p.OperationID += "-other" },
+		"presentation kind":   func(p *store.PresentationPreparationProof) { p.PresentationKind = "mount" },
+		"presentation tenant": func(p *store.PresentationPreparationProof) { p.FileProvider.TenantID += "-other" },
+		"domain":              func(p *store.PresentationPreparationProof) { p.FileProvider.DomainID += "-other" },
+		"presentation gen":    func(p *store.PresentationPreparationProof) { p.FileProvider.Generation++ },
+		"public path":         func(p *store.PresentationPreparationProof) { p.FileProvider.PublicPath += "-other" },
+		"activation":          func(p *store.PresentationPreparationProof) { p.FileProvider.ActivationGeneration = "stale" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			changed := stored
+			mutate(&changed)
+			if err := s.revalidatePreparationProof(t.Context(), account, changed); !errors.Is(err, tenantfs.ErrPreparationConflict) {
+				t.Fatalf("revalidate changed proof error = %v, want ErrPreparationConflict", err)
+			}
+		})
 	}
 }
 
@@ -455,11 +560,11 @@ func TestSelectionQuarantinesPresentationBindingDrift(t *testing.T) {
 	fileProvider := daemonTestPreparationProof(account, provenPath).Presentation.FileProvider
 	if quarantine.AccountID != account.ID || quarantine.AccountInstanceID != account.InstanceID ||
 		quarantine.AccountGeneration != account.Generation || quarantine.ExpectedConfigDir != account.ConfigDir ||
-		quarantine.Observed.TenantID != string(fileProvider.TenantID) ||
-		quarantine.Observed.DomainID != string(fileProvider.DomainID) ||
-		quarantine.Observed.Generation != fileProvider.Generation ||
-		quarantine.Observed.ActivationGeneration != fileProvider.ActivationGeneration ||
-		quarantine.Observed.PublicPath != provenPath ||
+		quarantine.Proof.FileProvider.TenantID != string(fileProvider.TenantID) ||
+		quarantine.Proof.FileProvider.DomainID != string(fileProvider.DomainID) ||
+		quarantine.Proof.FileProvider.Generation != fileProvider.Generation ||
+		quarantine.Proof.FileProvider.ActivationGeneration != fileProvider.ActivationGeneration ||
+		quarantine.Proof.FileProvider.PublicPath != provenPath ||
 		quarantine.Reason != store.AccountPresentationPublicPathDrift {
 		t.Fatalf("presentation quarantine = %+v", quarantine)
 	}

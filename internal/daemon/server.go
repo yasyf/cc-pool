@@ -128,8 +128,8 @@ type Server struct {
 	runtimeShutdown            func(context.Context) error
 	runtimeHealth              func(context.Context) (dkdaemon.Health, error)
 	prepareAccount             func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error)
-	prepareReservedAccount     func(context.Context, store.PendingAccountReservation) (string, error)
-	observePresentationBinding func(context.Context, store.Account, store.PresentationEvidence) error
+	prepareReservedAccount     func(context.Context, store.PendingAccountReservation) (catalogproto.TenantPreparationProof, error)
+	observePresentationBinding func(context.Context, store.Account, store.PresentationPreparationProof) error
 	activatePrepared           func(context.Context, store.Account, catalogproto.TenantPreparationProof, func() error) error
 	preflightCredential        func(context.Context, store.Account) error
 	disposableWorkers          *supervise.Pool
@@ -623,28 +623,20 @@ func (s *Server) selectionPublicPath(
 	account store.Account,
 	proof catalogproto.TenantPreparationProof,
 ) (string, error) {
-	publicPath, err := tenantfs.FileProviderPublicPath(proof)
+	storedProof, err := projectPreparationProof(proof)
 	if err != nil {
 		return "", err
 	}
-	fileProvider := proof.Presentation.FileProvider
-	evidence := store.PresentationEvidence{
-		TenantID:             string(fileProvider.TenantID),
-		DomainID:             string(fileProvider.DomainID),
-		Generation:           fileProvider.Generation,
-		ActivationGeneration: fileProvider.ActivationGeneration,
-		PublicPath:           publicPath,
-	}
 	observe := s.observePresentationBinding
 	if observe == nil {
-		observe = func(_ context.Context, account store.Account, evidence store.PresentationEvidence) error {
-			return s.m.Store.ObserveAccountPresentation(account, evidence)
+		observe = func(_ context.Context, account store.Account, proof store.PresentationPreparationProof) error {
+			return s.m.Store.ObserveAccountPresentation(account, proof)
 		}
 	}
-	if err := observe(ctx, account, evidence); err != nil {
+	if err := observe(ctx, account, storedProof); err != nil {
 		return "", fmt.Errorf("observe account presentation: %w", err)
 	}
-	return publicPath, nil
+	return storedProof.FileProvider.PublicPath, nil
 }
 
 func (s *Server) preflightSelectionCredential(
