@@ -660,58 +660,32 @@ func TestInitializeSettlesDesiredGenerationMismatchWithDurableQuarantine(t *test
 	}
 }
 
-func TestInitializeWaitsForStartingHolderAndRejectsDrainingHolder(t *testing.T) {
-	t.Run("starting", func(t *testing.T) {
-		st := openDesiredCoordinatorStore(t, 1)
-		account, err := st.GetAccount(1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		tenantID, err := pool.TenantAccount(account).TenantID()
-		if err != nil {
-			t.Fatal(err)
-		}
-		runtime := &lifecycleRuntimeStub{
-			provisionResponses: []mountproto.ProvisionTenantResponse{
-				{},
-				{
-					Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-					TenantID: mountproto.TenantID(tenantID), Generation: account.Generation,
-				},
-			},
-			provisionErrors: []error{wire.ErrNotReady, nil},
-		}
-		preparer := &fleetSourcePreparer{}
-		server := &Server{m: &pool.Manager{Store: st}}
-		coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
-		if err := coordinator.initialize(t.Context()); err != nil {
-			t.Fatal(err)
-		}
-		prepared, _, _ := preparer.counts()
-		if runtime.provisionCalls != 2 || len(prepared) != 1 {
-			t.Fatalf("startup attempts: provision=%d prepare=%d", runtime.provisionCalls, len(prepared))
-		}
-		if _, err := st.AccountPresentation(1); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("draining", func(t *testing.T) {
-		st := openDesiredCoordinatorStore(t, 1)
-		runtime := &lifecycleRuntimeStub{provisionErr: wire.ErrDraining}
-		preparer := &fleetSourcePreparer{}
-		server := &Server{m: &pool.Manager{Store: st}}
-		coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
-		if err := coordinator.initialize(t.Context()); !errors.Is(err, wire.ErrDraining) {
-			t.Fatalf("initialize draining = %v", err)
-		}
-		prepared, _, _ := preparer.counts()
-		if runtime.provisionCalls != 1 || len(prepared) != 0 {
-			t.Fatalf("draining attempts: provision=%d prepare=%d", runtime.provisionCalls, len(prepared))
-		}
-		if _, err := st.AccountPresentation(1); !errors.Is(err, sql.ErrNoRows) {
-			t.Fatalf("presentation after drain = %v", err)
-		}
-	})
+func TestInitializeDoesNotRetryRawHolderTransitions(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "starting", err: wire.ErrNotReady},
+		{name: "draining", err: wire.ErrDraining},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			st := openDesiredCoordinatorStore(t, 1)
+			runtime := &lifecycleRuntimeStub{provisionErr: test.err}
+			preparer := &fleetSourcePreparer{}
+			server := &Server{m: &pool.Manager{Store: st}}
+			coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
+			if err := coordinator.initialize(t.Context()); !errors.Is(err, test.err) {
+				t.Fatalf("initialize %s = %v", test.name, err)
+			}
+			prepared, _, _ := preparer.counts()
+			if runtime.provisionCalls != 1 || len(prepared) != 0 {
+				t.Fatalf("%s attempts: provision=%d prepare=%d", test.name, runtime.provisionCalls, len(prepared))
+			}
+			if _, err := st.AccountPresentation(1); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("presentation after %s = %v", test.name, err)
+			}
+		})
+	}
 }
 
 func TestInitializeRecoversRemovalBeforePreparingActiveFleet(t *testing.T) {

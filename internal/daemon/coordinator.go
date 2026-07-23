@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
-	"time"
 
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
-	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/mountproto"
@@ -23,7 +21,6 @@ import (
 const (
 	accountRemovalRecoveryConcurrency = 4
 	tenantProvisionConcurrency        = 4
-	tenantStartingRetryDelay          = 100 * time.Millisecond
 )
 
 type sourcePreparer interface {
@@ -120,40 +117,28 @@ func (c *tenantCoordinator) initialize(ctx context.Context) error {
 }
 
 func (c *tenantCoordinator) prepareDesiredAccount(ctx context.Context, account store.Account) error {
-	for {
-		proof, err := c.prepare(ctx, account)
-		if errors.Is(err, wire.ErrNotReady) {
-			timer := time.NewTimer(tenantStartingRetryDelay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-				continue
-			}
-		}
-		if err != nil {
-			return err
-		}
-		if err := c.activatePrepared(ctx, account, proof, func() error { return nil }); err != nil {
-			return err
-		}
-		stored, err := projectPreparationProof(proof)
-		if err != nil {
-			return err
-		}
-		expected, err := expectedPresentationIdentity(account)
-		if err != nil {
-			return err
-		}
-		if err := c.server.m.Store.BindDesiredAccountPresentation(account, expected, stored); err != nil {
-			if errors.Is(err, store.ErrAccountPresentationQuarantined) {
-				return nil
-			}
-			return err
-		}
-		return nil
+	proof, err := c.prepare(ctx, account)
+	if err != nil {
+		return err
 	}
+	if err := c.activatePrepared(ctx, account, proof, func() error { return nil }); err != nil {
+		return err
+	}
+	stored, err := projectPreparationProof(proof)
+	if err != nil {
+		return err
+	}
+	expected, err := expectedPresentationIdentity(account)
+	if err != nil {
+		return err
+	}
+	if err := c.server.m.Store.BindDesiredAccountPresentation(account, expected, stored); err != nil {
+		if errors.Is(err, store.ErrAccountPresentationQuarantined) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func expectedPresentationIdentity(account store.Account) (store.FileProviderPresentationIdentity, error) {
