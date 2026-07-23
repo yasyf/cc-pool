@@ -411,6 +411,21 @@ func (s *Store) BeginCredentialOperation(
 	if err := credentialAccountMatchesRequest(tx, request); err != nil {
 		return BeginCredentialOperationResult{}, err
 	}
+	if _, err := credentialOperationByAccount(tx, request.AccountID); errors.Is(err, sql.ErrNoRows) {
+		var sessionID int64
+		err = tx.QueryRow(
+			`SELECT id FROM sessions WHERE account_id=? AND ended_at IS NULL LIMIT 1`,
+			request.AccountID,
+		).Scan(&sessionID)
+		if err == nil {
+			return BeginCredentialOperationResult{}, ErrAccountSessionActive
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return BeginCredentialOperationResult{}, err
+		}
+	} else if err != nil {
+		return BeginCredentialOperationResult{}, err
+	}
 	token, err := newCredentialOperationToken()
 	if err != nil {
 		return BeginCredentialOperationResult{}, err

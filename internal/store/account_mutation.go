@@ -24,8 +24,6 @@ const (
 	AccountMutationAdd AccountMutationKind = "add"
 	// AccountMutationRelogin replaces one existing account's credentials.
 	AccountMutationRelogin AccountMutationKind = "relogin"
-	// AccountMutationSyncInstall installs one synchronized account.
-	AccountMutationSyncInstall AccountMutationKind = "sync-install"
 	// AccountMutationPresentationRebind repairs one quarantined presentation generation.
 	AccountMutationPresentationRebind AccountMutationKind = "presentation-rebind"
 )
@@ -392,6 +390,19 @@ func (s *Store) BeginAccountMutation(
 		return BeginAccountMutationResult{}, ErrAccountRemoving
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return BeginAccountMutationResult{}, err
+	}
+	if request.Kind != AccountMutationAdd {
+		var sessionID int64
+		err := tx.QueryRow(
+			`SELECT id FROM sessions WHERE account_id=? AND ended_at IS NULL LIMIT 1`,
+			request.AccountID,
+		).Scan(&sessionID)
+		if err == nil {
+			return BeginAccountMutationResult{}, ErrAccountSessionActive
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return BeginAccountMutationResult{}, err
+		}
 	}
 	if err := validateAccountMutationSubject(tx, request); err != nil {
 		return BeginAccountMutationResult{}, err
@@ -2355,8 +2366,7 @@ func validateAccountMutationReceipt(receipt AccountMutationReceipt) error {
 
 func (kind AccountMutationKind) valid() bool {
 	switch kind {
-	case AccountMutationAdd, AccountMutationRelogin, AccountMutationSyncInstall,
-		AccountMutationPresentationRebind:
+	case AccountMutationAdd, AccountMutationRelogin, AccountMutationPresentationRebind:
 		return true
 	default:
 		return false

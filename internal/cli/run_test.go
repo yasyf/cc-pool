@@ -139,9 +139,7 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 		KeychainService: "svc-2", KeychainAccount: "u-2",
 	}
 	for _, acct := range []store.Account{requested, returned} {
-		if err := st.UpsertAccount(acct); err != nil {
-			t.Fatal(err)
-		}
+		admitCLITestAccount(t, st, acct)
 	}
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)

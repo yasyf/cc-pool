@@ -65,6 +65,9 @@ func newDaemonTestManager(
 		t.Fatal(err)
 	}
 	manager.Creds = credentials
+	manager.ClaimCredentialMutation = func(int) (func(), error) {
+		return func() {}, nil
+	}
 	manager.BuildCredentialWritePublication = credentialWritePublicationBuilder("daemon-test")
 	manager.SettleCredentialWrite = func(context.Context, pool.CredentialWriteSettlement) error {
 		return nil
@@ -94,8 +97,8 @@ func TestSelectPreflightSettlesBeforeReturn(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("selection did not enter credential preflight")
 	}
-	if got := s.cl.reservedCount(forced); got != 1 {
-		t.Fatalf("pending reservations = %d, want 1 during preflight", got)
+	if got := s.cl.reservedCount(forced); got != 0 {
+		t.Fatalf("pending reservations = %d, want none during credential preflight", got)
 	}
 	select {
 	case response := <-responses:
@@ -174,7 +177,9 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 		})
 	}()
 	waitForBlockedPrepare(t, entered)
-	primaryToken := exactPendingSelectionToken(t, s.cl, forcedOne)
+	if got := s.cl.reservedCount(forcedOne); got != 0 {
+		t.Fatalf("primary PrepareTenant reservations = %d, want 0", got)
+	}
 
 	canceledContext, cancelCanceled := context.WithCancel(t.Context())
 	canceledResponses := make(chan Response, 1)
@@ -185,8 +190,8 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 		})
 	}()
 	waitForBlockedPrepare(t, entered)
-	if got := s.cl.reservedCount(forcedOne); got != 2 {
-		t.Fatalf("same-account reservations during PrepareTenant = %d, want 2", got)
+	if got := s.cl.reservedCount(forcedOne); got != 0 {
+		t.Fatalf("same-account reservations during PrepareTenant = %d, want 0", got)
 	}
 	cancelCanceled()
 	select {
@@ -197,20 +202,8 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("canceled same-account PrepareTenant retained the selection")
 	}
-	if got := s.cl.reservedCount(forcedOne); got != 1 {
-		t.Fatalf("canceled PrepareTenant reservations = %d, want only the primary", got)
-	}
-
-	s.cl.mu.Lock()
-	primary := s.cl.selections[primaryToken]
-	if primary == nil {
-		s.cl.mu.Unlock()
-		t.Fatal("primary reservation disappeared before TTL expiry")
-	}
-	primary.expiresAt = s.cl.now().Add(-time.Second)
-	s.cl.mu.Unlock()
 	if got := s.cl.reservedCount(forcedOne); got != 0 {
-		t.Fatalf("expired PrepareTenant reservation count = %d, want 0", got)
+		t.Fatalf("canceled PrepareTenant reservation count = %d, want 0", got)
 	}
 
 	forcedTwo := 2
@@ -238,15 +231,22 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 
 	select {
 	case response := <-primaryResponses:
-		t.Fatalf("expired primary returned before PrepareTenant settled: %+v", response)
+		t.Fatalf("primary returned before PrepareTenant settled: %+v", response)
 	default:
 	}
 	close(release)
 	released = true
+	var primaryToken string
 	select {
 	case response := <-primaryResponses:
-		if response.OK || !strings.Contains(response.Error, "reservation expired during PrepareTenant") {
-			t.Fatalf("expired primary PrepareTenant response = %+v", response)
+		if !response.OK || response.ReservationToken == "" {
+			t.Fatalf("primary PrepareTenant response = %+v", response)
+		}
+		primaryToken = response.ReservationToken
+		if abort := s.handleSelectAbort(t.Context(), Request{
+			Op: OpSelectAbort, ReservationToken: response.ReservationToken,
+		}); !abort.OK {
+			t.Fatalf("abort primary selection = %+v", abort)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("primary PrepareTenant did not settle after release")
@@ -353,6 +353,12 @@ func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[in
 		activatePrepared: func(_ context.Context, _ store.Account, _ catalogproto.TenantPreparationProof, activate func() error) error {
 			return activate()
 		},
+	}
+	s.m.ClaimCredentialMutation = func(accountID int) (func(), error) {
+		if !s.cl.ownExclusive(accountID) {
+			return nil, errAccountExclusive
+		}
+		return func() { s.cl.releaseExclusive(accountID) }, nil
 	}
 	return s, dirs
 }

@@ -6,6 +6,33 @@ import (
 	"testing"
 )
 
+func TestListActiveAccountsExcludesAccountWithoutExactPresentation(t *testing.T) {
+	s := openTest(t)
+	account := Account{
+		ID: 1, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 1,
+		ConfigDir: "/tmp/account-1", KeychainService: "service-1",
+		KeychainAccount: "account-1", AccountUUID: "uuid-1",
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO accounts(id,instance_id,generation,config_dir,keychain_service,keychain_account,account_uuid,created_at)
+		 VALUES(?,?,?,?,?,?,?,1)`,
+		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
+		account.KeychainService, account.KeychainAccount, account.AccountUUID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := s.ListActiveAccounts(); err != nil || len(active) != 0 {
+		t.Fatalf("active accounts without presentation = %+v err=%v", active, err)
+	}
+	proof := presentationTestProof(account, account.ConfigDir, "activation-1")
+	if err := s.ObserveAccountPresentation(account, proof); !errors.Is(err, ErrAccountPresentationEvidence) {
+		t.Fatalf("first observation = %v, want presentation evidence error", err)
+	}
+	if active, err := s.ListActiveAccounts(); err != nil || len(active) != 0 {
+		t.Fatalf("raw row became active through observation = %+v err=%v", active, err)
+	}
+}
+
 func TestObserveAccountPresentationBindsExactEvidenceAndRefreshesActivation(t *testing.T) {
 	s := openTest(t)
 	account := credentialOperationTestAccountID(t, s, 1)

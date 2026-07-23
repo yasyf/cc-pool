@@ -1156,7 +1156,7 @@ func newAccountMutationTestServer(
 		t.Fatal(err)
 	}
 	s := &Server{
-		m: m, log: log.New(io.Discard, "", 0), accountMutationLifetime: t.Context(),
+		m: m, cl: newClaims(), log: log.New(io.Discard, "", 0), accountMutationLifetime: t.Context(),
 		accountMutationOwner: func() (proc.Record, error) { return owner, nil },
 		prepareReservedAccount: func(_ context.Context, reservation store.PendingAccountReservation) (catalogproto.TenantPreparationProof, error) {
 			account := store.Account{
@@ -1172,6 +1172,12 @@ func newAccountMutationTestServer(
 		activatePrepared: func(_ context.Context, _ store.Account, _ catalogproto.TenantPreparationProof, activate func() error) error {
 			return activate()
 		},
+	}
+	m.ClaimCredentialMutation = func(accountID int) (func(), error) {
+		if !s.cl.ownExclusive(accountID) {
+			return nil, errAccountExclusive
+		}
+		return func() { s.cl.releaseExclusive(accountID) }, nil
 	}
 	if !withAccount {
 		return s, fake, store.Account{}

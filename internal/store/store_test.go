@@ -49,7 +49,7 @@ func activateTestSession(t *testing.T, s *Store, accountID, pid int, cwd string,
 		Token:     nextStoreTestToken(),
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   ProcessIdentity{PID: pid, StartedAt: started},
-		ConfigDir: fmt.Sprintf("/presentation/acct-%02d", accountID), Cwd: cwd, At: started,
+		ConfigDir: a.ConfigDir, Cwd: cwd, At: started,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -101,6 +101,38 @@ func TestOpenRejectsOldSchemaWithoutMutation(t *testing.T) {
 	}
 	if after != before || version != 0 {
 		t.Fatalf("Open mutated rejected schema: hash %s -> %s, version=%d", before, after, version)
+	}
+}
+
+func TestActivateSelectionRechecksExactEligibilityAfterReservation(t *testing.T) {
+	s := openTest(t)
+	account := admitTestAccount(t, s, Account{
+		ID: 1, ConfigDir: "/presentation/acct-01",
+		KeychainService: "service-1", KeychainAccount: "account-1",
+	})
+	if err := s.SelectionEligible(account); err != nil {
+		t.Fatalf("initial eligibility: %v", err)
+	}
+	if _, err := s.SetNeedsLogin(
+		account.ID, time.Now(), AuthReasonRequired,
+		DigestReason("selection race"), AuthKindOwned,
+	); err != nil {
+		t.Fatal(err)
+	}
+	err := s.ActivateSelection(SelectionActivation{
+		Token: nextStoreTestToken(), AccountID: account.ID,
+		ExpectedInstanceID: account.InstanceID, ExpectedGeneration: account.Generation,
+		Process:   ProcessIdentity{PID: 42, StartedAt: time.Now().Add(-time.Minute)},
+		ConfigDir: account.ConfigDir, Cwd: "/tmp/selection-race",
+	})
+	if !errors.Is(err, ErrAccountSelectionIneligible) {
+		t.Fatalf("activation after eligibility loss = %v", err)
+	}
+	if count, err := s.ActiveSessionCount(account.ID); err != nil || count != 0 {
+		t.Fatalf("active sessions after rejected activation = %d err=%v", count, err)
+	}
+	if _, ok, err := s.GetSticky("/tmp/selection-race"); err != nil || ok {
+		t.Fatalf("sticky after rejected activation: ok=%v err=%v", ok, err)
 	}
 }
 
@@ -350,7 +382,7 @@ func TestSelectionTerminalReplayAndExpiry(t *testing.T) {
 		Token: "00000000000000000000000000000001", AccountID: 1,
 		ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   ProcessIdentity{PID: 4242, StartedAt: now.Add(-time.Minute)},
-		ConfigDir: "/presentation/acct-01", At: now,
+		ConfigDir: a.ConfigDir, At: now,
 	}
 	if err := s.ActivateSelection(activation); err != nil {
 		t.Fatal(err)
@@ -785,7 +817,7 @@ func TestActivateSelectionAtomic(t *testing.T) {
 		AccountID: 1, ExpectedInstanceID: a.InstanceID,
 		Token:              nextStoreTestToken(),
 		ExpectedGeneration: a.Generation, Process: ProcessIdentity{PID: 4242, StartedAt: now},
-		ConfigDir: "/presentation/acct-01", Cwd: "/proj", RecordSticky: true, At: now,
+		ConfigDir: a.ConfigDir, Cwd: "/proj", RecordSticky: true, At: now,
 	})
 	if err == nil {
 		t.Fatal("ActivateSelection succeeded with failing session insert")
@@ -810,7 +842,7 @@ func TestActivateSelectionConditionalEffects(t *testing.T) {
 	if err := s.ActivateSelection(SelectionActivation{
 		AccountID: 1, ExpectedInstanceID: a.InstanceID,
 		Token: nextStoreTestToken(), ExpectedGeneration: a.Generation,
-		Process: ProcessIdentity{PID: 4242, StartedAt: now}, ConfigDir: "/presentation/acct-01", At: now,
+		Process: ProcessIdentity{PID: 4242, StartedAt: now}, ConfigDir: a.ConfigDir, At: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1073,13 +1105,23 @@ func TestPruneSticky(t *testing.T) {
 
 func TestDeleteAccountRemovesSticky(t *testing.T) {
 	s := openTest(t)
-	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	account := admitTestAccount(t, s, Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
 	_ = s.UpsertSticky("/proj", 1, time.Now())
 	if err := s.DeleteAccount(1); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, _ := s.GetSticky("/proj"); ok {
 		t.Fatal("sticky row should be deleted with its account")
+	}
+	if _, err := s.AccountPresentation(account.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted account retained presentation: %v", err)
+	}
+	replacement := admitTestAccount(t, s, Account{
+		ID: 2, ConfigDir: account.ConfigDir,
+		KeychainService: "replacement-service", KeychainAccount: "replacement-account",
+	})
+	if replacement.ConfigDir != account.ConfigDir {
+		t.Fatalf("replacement public path = %q, want %q", replacement.ConfigDir, account.ConfigDir)
 	}
 }
 

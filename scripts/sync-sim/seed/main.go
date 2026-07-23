@@ -9,7 +9,7 @@
 // Subcommands:
 //
 //	seed init                     set the initialized + symlink-overlay meta, make ~/.claude base
-//	seed account --id N ...       fabricate a logged-in Keychain account (row uuid left empty)
+//	seed account --id N ...       fabricate one exactly admitted logged-in Keychain account
 //	seed rotate  --id N ...       write a fresh OWNED chain in place (models a login/rotation on this host)
 //	seed setexp  --id N ...       rewrite the credential's expiresAt in place, tokens preserved
 //	seed hash    --id N           print the current credential's AccessHash
@@ -20,6 +20,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
@@ -102,7 +104,7 @@ func cmdInit() error {
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	if err := pool.EnsureAccountsDir(); err != nil {
+	if err := os.MkdirAll(pool.FuseKitBackingRoot(), 0o700); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(pool.SyncStampsDir(), 0o700); err != nil {
@@ -131,7 +133,6 @@ func cmdAccount(args []string) error {
 	access := fs.String("access", "", "access token")
 	refresh := fs.String("refresh", "", "refresh token")
 	expiresMS := fs.Int64("expires-ms", 0, "access-token expiry, unix millis")
-	setRowUUID := fs.Bool("set-row-uuid", false, "stamp the account_uuid column now (else left empty for backfill)")
 	_ = fs.Parse(args)
 	if *uuid == "" || *access == "" || *refresh == "" || *expiresMS == 0 {
 		return fmt.Errorf("account needs --uuid, --access, --refresh, --expires-ms")
@@ -143,13 +144,16 @@ func cmdAccount(args []string) error {
 	}
 	defer func() { _ = db.Close() }()
 
-	configDir := pool.AccountDir(*id)
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
+	backingDir := pool.AccountBackingDir(*id)
+	if err := os.MkdirAll(backingDir, 0o700); err != nil {
 		return fmt.Errorf("create private account source: %w", err)
 	}
+	configDir := filepath.Join(
+		os.Getenv("HOME"), "Library", "CloudStorage", fmt.Sprintf("CCPool-sim-acct-%02d", *id),
+	)
 
 	// Write the private identity exactly as the source authority expects.
-	identPath := filepath.Join(configDir, ".claude.json")
+	identPath := filepath.Join(backingDir, ".claude.json")
 	identity, err := json.Marshal(map[string]any{
 		"oauthAccount": map[string]string{
 			"accountUuid":  *uuid,
@@ -168,26 +172,60 @@ func cmdAccount(args []string) error {
 		return fmt.Errorf("write Keychain credential: %w", err)
 	}
 
-	rowUUID := ""
-	if *setRowUUID {
-		rowUUID = *uuid
+	owner := proc.Record{
+		RecoveryClass: proc.RecoveryTask,
+		PID:           os.Getpid(), StartTime: "sync-sim", Boot: "sync-sim",
+		Comm: "seed", Generation: *uuid,
+	}
+	reservation, err := db.ReserveAccountIndex(owner)
+	if err != nil {
+		return fmt.Errorf("reserve account row: %w", err)
+	}
+	if reservation.ID != *id {
+		return fmt.Errorf("reserved account %d, want requested account %d", reservation.ID, *id)
 	}
 	acct := store.Account{
-		ID:              *id,
-		InstanceID:      fmt.Sprintf("%032x", *id),
-		Generation:      1,
+		ID:              reservation.ID,
+		InstanceID:      reservation.InstanceID,
+		Generation:      reservation.Generation,
 		ConfigDir:       configDir,
 		KeychainService: creds.ServiceName(configDir),
 		KeychainAccount: creds.AccountLabel(),
 		Label:           *label,
-		AccountUUID:     rowUUID,
+		AccountUUID:     *uuid,
 		CreatedAt:       time.Now(),
 	}
-	if err := db.UpsertAccount(acct); err != nil {
-		return fmt.Errorf("upsert account row: %w", err)
+	proof := simPresentationProof(acct, "sync-sim-promotion")
+	if err := db.PromoteReservedSyncedAccount(reservation, acct, proof); err != nil {
+		return fmt.Errorf("promote account row: %w", err)
+	}
+	freshProof := proof
+	freshProof.FileProvider.ActivationGeneration = "sync-sim-admitted"
+	admitted, err := db.AdmitSyncedAccount(acct, proof, freshProof)
+	if err != nil {
+		return fmt.Errorf("admit account row: %w", err)
+	}
+	if !admitted {
+		return errors.New("admit account row: awaiting-origin state was not cleared")
 	}
 	fmt.Printf("seeded acct-%02d uuid=%s hash=%s\n", *id, *uuid, creds.AccessHash(cred))
 	return nil
+}
+
+func simPresentationProof(account store.Account, activation string) store.PresentationPreparationProof {
+	tenantID := "account-" + account.InstanceID
+	return store.PresentationPreparationProof{
+		CatalogTenantID: tenantID, CatalogGeneration: account.Generation,
+		Requested: 1, Desired: 1, Observed: 1, Verified: 1, Applied: 1,
+		SourceAuthority: "sync-sim", SourceRevision: 1, CatalogRevision: 1,
+		ChangeID: "sync-sim-change", OperationID: "sync-sim-operation",
+		PresentationKind: store.PresentationKindFileProvider,
+		FileProvider: store.FileProviderPreparationProof{
+			TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
+			Generation: account.Generation, ActivationGeneration: activation,
+			PublicPath: account.ConfigDir,
+		},
+	}
 }
 
 // cmdRotate writes a fresh OWNED chain in place: new tokens/expiry to the
@@ -205,7 +243,10 @@ func cmdRotate(args []string) error {
 		return fmt.Errorf("rotate needs --access, --refresh, --expires-ms")
 	}
 
-	configDir := pool.AccountDir(*id)
+	configDir, err := accountConfigDir(*id)
+	if err != nil {
+		return err
+	}
 	credentialStore := simCredentialStore(configDir)
 	if _, err := credentialStore.Read(context.Background()); err != nil {
 		return fmt.Errorf("read current credential: %w", err)
@@ -229,7 +270,11 @@ func cmdSetExp(args []string) error {
 	if *expiresMS == 0 {
 		return fmt.Errorf("setexp needs --expires-ms")
 	}
-	credentialStore := simCredentialStore(pool.AccountDir(*id))
+	configDir, err := accountConfigDir(*id)
+	if err != nil {
+		return err
+	}
+	credentialStore := simCredentialStore(configDir)
 	cur, err := credentialStore.Read(context.Background())
 	if err != nil {
 		return fmt.Errorf("read current credential: %w", err)
@@ -246,12 +291,29 @@ func cmdHash(args []string) error {
 	fs := flag.NewFlagSet("hash", flag.ExitOnError)
 	id := fs.Int("id", 1, "account index")
 	_ = fs.Parse(args)
-	cred, err := simCredentialStore(pool.AccountDir(*id)).Read(context.Background())
+	configDir, err := accountConfigDir(*id)
+	if err != nil {
+		return err
+	}
+	cred, err := simCredentialStore(configDir).Read(context.Background())
 	if err != nil {
 		return err
 	}
 	fmt.Print(creds.AccessHash(cred))
 	return nil
+}
+
+func accountConfigDir(id int) (string, error) {
+	db, err := openStore()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = db.Close() }()
+	account, err := db.GetAccount(id)
+	if err != nil {
+		return "", err
+	}
+	return account.ConfigDir, nil
 }
 
 func cmdRowUUID(args []string) error {

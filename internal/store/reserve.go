@@ -76,15 +76,7 @@ func (s *Store) ReleaseAccountIndex(reservation PendingAccountReservation) error
 	return nil
 }
 
-// ConsumeAccountIndex spends a reservation for promotion to an accounts row;
-// exactly one row must be deleted, else it fails loud — a blind promote could
-// collide on the index.
-func (s *Store) ConsumeAccountIndex(reservation PendingAccountReservation) error {
-	return consumeReservation(s.db, reservation)
-}
-
-// consumeReservation runs the consume against e (a *sql.DB or a *sql.Tx), so
-// PromoteReservedAccount can spend the reservation inside its transaction.
+// consumeReservation spends a reservation inside an exact promotion transaction.
 func consumeReservation(e rowExecer, reservation PendingAccountReservation) error {
 	if err := validatePendingReservationFence(reservation); err != nil {
 		return err

@@ -26,12 +26,10 @@ func TestEnvExportsFuseKitPresentationWithoutSessionOwnership(t *testing.T) {
 	if err := st.SetMeta("initialized", "1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertAccount(store.Account{
+	admitCLITestAccount(t, st, store.Account{
 		ID: 1, ConfigDir: dir, Label: "work@example.com",
 		KeychainService: "svc", KeychainAccount: "u",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}

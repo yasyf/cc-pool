@@ -60,8 +60,6 @@ const (
 	AccountMutationAdd AccountMutationKind = "add"
 	// AccountMutationRelogin replaces one existing account credential.
 	AccountMutationRelogin AccountMutationKind = "relogin"
-	// AccountMutationSyncInstall installs one account received through host sync.
-	AccountMutationSyncInstall AccountMutationKind = "sync-install"
 )
 
 // AccountMutationAction is the only client-controlled workflow input. The

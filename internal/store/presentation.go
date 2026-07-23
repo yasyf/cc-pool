@@ -101,10 +101,13 @@ func (s *Store) ObserveAccountPresentation(account Account, proof PresentationPr
 		return err
 	}
 	bound, err := accountPresentation(tx, account.ID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrAccountPresentationEvidence
+	}
+	if err != nil {
 		return err
 	}
-	reason := presentationMismatch(current, bound, err == nil, fileProvider)
+	reason := presentationMismatch(current, bound, fileProvider)
 	if reason != "" {
 		quarantine := AccountPresentationQuarantine{
 			AccountID: current.ID, AccountInstanceID: current.InstanceID,
@@ -118,6 +121,9 @@ func (s *Store) ObserveAccountPresentation(account Account, proof PresentationPr
 			return err
 		}
 		return ErrAccountPresentationQuarantined
+	}
+	if err := ValidatePresentationPreparationProofAdvance(bound.Proof, proof); err != nil {
+		return err
 	}
 	if err := upsertAccountPresentation(tx, AccountPresentation{
 		AccountID: current.ID, AccountInstanceID: current.InstanceID,
@@ -371,7 +377,6 @@ func samePresentationAccount(current, expected Account) bool {
 func presentationMismatch(
 	account Account,
 	bound AccountPresentation,
-	hasBinding bool,
 	fileProvider FileProviderPreparationProof,
 ) AccountPresentationQuarantineReason {
 	if fileProvider.Generation != account.Generation {
@@ -379,9 +384,6 @@ func presentationMismatch(
 	}
 	if fileProvider.PublicPath != account.ConfigDir {
 		return AccountPresentationPublicPathDrift
-	}
-	if !hasBinding {
-		return ""
 	}
 	if fileProvider.TenantID != bound.Proof.FileProvider.TenantID {
 		return AccountPresentationTenantIDDrift

@@ -377,12 +377,10 @@ func TestStatusRendersMesh(t *testing.T) {
 	go func() { _ = rpc.NewServer(d).Serve(ctx, ln); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
 
-	if err := m.Store.UpsertAccount(store.Account{
+	admitCLITestAccount(t, m.Store, store.Account{
 		ID: 1, ConfigDir: t.TempDir(), Label: "Work", AccountUUID: "u-1",
 		KeychainService: "svc-1", KeychainAccount: "u",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 
 	cmd, out := syncCmdBuf(t)
 	if err := runSyncStatus(cmd, m); err != nil {

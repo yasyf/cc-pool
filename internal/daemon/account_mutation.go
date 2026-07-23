@@ -108,8 +108,6 @@ func validateAccountMutationCommand(request AccountMutationRequest) error {
 		if request.AccountID <= 0 {
 			return errors.New("relogin mutation requires an account")
 		}
-	case AccountMutationSyncInstall:
-		return errors.New("sync installation is daemon-internal")
 	default:
 		return errors.New("unknown account mutation kind")
 	}
@@ -747,6 +745,15 @@ func (s *Server) startOrAttachAccountMutation(
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return store.AccountMutation{}, nil, err
+	}
+	if kind != store.AccountMutationAdd {
+		if s.cl == nil {
+			return store.AccountMutation{}, nil, errors.New("account mutation claims are required")
+		}
+		if !s.cl.ownExclusive(request.AccountID) {
+			return store.AccountMutation{}, nil, errAccountExclusive
+		}
+		defer s.cl.releaseExclusive(request.AccountID)
 	}
 
 	account, release, err := s.accountMutationSubject(request)

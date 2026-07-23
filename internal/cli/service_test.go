@@ -60,9 +60,7 @@ func seedAccounts(t *testing.T, accts ...store.Account) {
 		if account.KeychainAccount == "" {
 			account.KeychainAccount = "ccp-test"
 		}
-		if err := st.UpsertAccount(account); err != nil {
-			t.Fatal(err)
-		}
+		admitCLITestAccount(t, st, account)
 	}
 }
 

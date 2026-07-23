@@ -41,7 +41,7 @@ CREATE TABLE accounts (
   keychain_service TEXT NOT NULL CHECK(keychain_service <> ''),
   keychain_account TEXT NOT NULL CHECK(keychain_account <> ''),
   label            TEXT NOT NULL DEFAULT '',
-  account_uuid     TEXT NOT NULL DEFAULT '',
+  account_uuid     TEXT NOT NULL UNIQUE CHECK(account_uuid <> ''),
   created_at       INTEGER NOT NULL,
   deleted_at       INTEGER CHECK(deleted_at IS NULL OR deleted_at > 0)
 );
@@ -67,7 +67,7 @@ CREATE TABLE account_registry_sequences (
 CREATE TABLE account_mutations (
   operation_id               BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
   account_id                 INTEGER NOT NULL UNIQUE CHECK(account_id > 0),
-  kind                       TEXT NOT NULL CHECK(kind IN ('add','relogin','sync-install','presentation-rebind')),
+  kind                       TEXT NOT NULL CHECK(kind IN ('add','relogin','presentation-rebind')),
   state                      TEXT NOT NULL CHECK(state IN ('awaiting-presentation','awaiting-input','reserved','applying','applied','publishing','compensating','rebind-published')),
   registry_sequence          INTEGER NOT NULL CHECK(registry_sequence > 0),
   account_instance_id        TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
@@ -146,7 +146,7 @@ CREATE TABLE account_mutations (
 CREATE TABLE account_mutation_receipts (
   operation_id      BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
   account_id        INTEGER NOT NULL CHECK(account_id > 0),
-  kind              TEXT NOT NULL CHECK(kind IN ('add','relogin','sync-install','presentation-rebind')),
+  kind              TEXT NOT NULL CHECK(kind IN ('add','relogin','presentation-rebind')),
   registry_sequence INTEGER NOT NULL CHECK(registry_sequence > 0),
   account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation INTEGER NOT NULL CHECK(account_generation > 0),
@@ -434,8 +434,6 @@ CREATE TABLE account_presentation_quarantines (
   created_at              INTEGER NOT NULL CHECK(created_at > 0),
 	CHECK(observed_catalog_tenant_id=observed_tenant_id AND observed_catalog_generation=observed_generation)
 );
-CREATE INDEX idx_accounts_uuid ON accounts(account_uuid);
-CREATE UNIQUE INDEX idx_accounts_live_uuid ON accounts(account_uuid) WHERE account_uuid != '' AND deleted_at IS NULL;
 CREATE UNIQUE INDEX idx_accounts_live_config_dir ON accounts(config_dir) WHERE deleted_at IS NULL;
 CREATE INDEX idx_account_mutations_owner ON account_mutations(owner_record,account_id);
 CREATE UNIQUE INDEX idx_account_mutations_single_add ON account_mutations(kind) WHERE kind='add';
@@ -692,49 +690,9 @@ func (s *Store) Close() error {
 	return errors.Join(dbErr, lockErr)
 }
 
-// rowExecer is the write subset shared by *sql.DB and *sql.Tx, so an account
-// upsert composes into a caller's transaction (see PromoteReservedAccount).
+// rowExecer is the write subset shared by *sql.DB and *sql.Tx.
 type rowExecer interface {
 	Exec(query string, args ...any) (sql.Result, error)
-}
-
-// UpsertAccount inserts or replaces an account row by id; account_uuid is
-// insert-only so a re-upsert can't wipe a backfilled value.
-func (s *Store) UpsertAccount(a Account) error {
-	return upsertAccount(s.db, a)
-}
-
-func upsertAccount(e rowExecer, a Account) error {
-	instanceID, err := NewAccountInstanceID()
-	if err != nil {
-		return err
-	}
-	created := a.CreatedAt
-	if created.IsZero() {
-		created = time.Now()
-	}
-	result, err := e.Exec(
-		`INSERT INTO accounts(id,instance_id,generation,config_dir,keychain_service,keychain_account,label,account_uuid,created_at)
-		 VALUES(?,?,?,?,?,?,?,?,?)
-		 ON CONFLICT(id) DO UPDATE SET
-		   config_dir=excluded.config_dir,
-		   keychain_service=excluded.keychain_service,
-		   keychain_account=excluded.keychain_account,
-		   label=excluded.label,
-		   generation=accounts.generation + CASE WHEN accounts.config_dir <> excluded.config_dir THEN 1 ELSE 0 END
-		 WHERE accounts.deleted_at IS NULL`,
-		a.ID, instanceID, 1, a.ConfigDir, a.KeychainService, a.KeychainAccount, a.Label, a.AccountUUID, created.Unix())
-	if err != nil {
-		return fmt.Errorf("upsert account %d: %w", a.ID, err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows != 1 {
-		return fmt.Errorf("upsert account %d: account id is tombstoned", a.ID)
-	}
-	return nil
 }
 
 // NewAccountInstanceID returns a random immutable 128-bit account instance id.
@@ -793,10 +751,14 @@ func (s *Store) ListAccounts() ([]Account, error) {
 	return out, rows.Err()
 }
 
-// ListActiveAccounts returns accounts not fenced by durable removal,
-// presentation quarantine, or unsettled credential publication.
+// ListActiveAccounts returns exactly presented accounts not fenced by durable
+// removal, presentation quarantine, or unsettled credential publication.
 func (s *Store) ListActiveAccounts() ([]Account, error) {
 	rows, err := s.db.Query(`SELECT ` + accountCols + ` FROM accounts
+		JOIN account_presentations ON account_presentations.account_id=accounts.id
+		  AND account_presentations.account_instance_id=accounts.instance_id
+		  AND account_presentations.account_generation=accounts.generation
+		  AND account_presentations.public_path=accounts.config_dir
 		WHERE deleted_at IS NULL
 		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)
 		  AND NOT EXISTS (SELECT 1 FROM account_presentation_quarantines WHERE account_id=accounts.id)
@@ -804,7 +766,50 @@ func (s *Store) ListActiveAccounts() ([]Account, error) {
 		    SELECT 1 FROM account_mutation_receipts
 		    WHERE account_id=accounts.id AND publication_pending=1
 		  )
-		ORDER BY id`)
+		ORDER BY accounts.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Account
+	for rows.Next() {
+		a, err := scanAccount(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ListPublishableOrigins returns accounts with exact presentation, ownership,
+// and publication state suitable for host-sync origin publication.
+func (s *Store) ListPublishableOrigins() ([]Account, error) {
+	rows, err := s.db.Query(`SELECT ` + accountCols + ` FROM accounts
+		JOIN account_presentations ON account_presentations.account_id=accounts.id
+		  AND account_presentations.account_instance_id=accounts.instance_id
+		  AND account_presentations.account_generation=accounts.generation
+		  AND account_presentations.public_path=accounts.config_dir
+		LEFT JOIN auth_health ON auth_health.account_id=accounts.id
+		WHERE deleted_at IS NULL
+		  AND accounts.account_uuid<>''
+		  AND COALESCE(auth_health.needs_login,0)=0
+		  AND COALESCE(auth_health.kind,'owned')='owned'
+		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)
+		  AND NOT EXISTS (SELECT 1 FROM account_presentation_quarantines WHERE account_id=accounts.id)
+		  AND NOT EXISTS (SELECT 1 FROM account_mutations WHERE account_id=accounts.id)
+		  AND NOT EXISTS (
+		    SELECT 1 FROM account_mutation_receipts
+		    WHERE account_id=accounts.id AND publication_pending=1
+		  )
+		  AND NOT EXISTS (SELECT 1 FROM credential_operations WHERE account_id=accounts.id)
+		  AND NOT EXISTS (SELECT 1 FROM credential_quarantines WHERE account_id=accounts.id)
+		  AND NOT EXISTS (
+		    SELECT 1 FROM credential_operation_receipts
+		    WHERE account_id=accounts.id AND publication_payload IS NOT NULL
+		      AND acknowledged_at IS NULL
+		  )
+		ORDER BY accounts.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -829,6 +834,10 @@ var ErrDuplicateAccountUUID = errors.New("duplicate external account UUID")
 
 // ErrAccountSessionActive means removal cannot begin while a session is live.
 var ErrAccountSessionActive = errors.New("account session is active")
+
+// ErrAccountSelectionIneligible means an account lost a durable identity,
+// presentation, health, or publication fence required to launch.
+var ErrAccountSelectionIneligible = errors.New("account is not eligible for selection")
 
 // GetAccount returns one account by id, wrapping ErrAccountNotFound when the
 // row is absent.
@@ -952,6 +961,8 @@ func (s *Store) DeleteAccount(id int) error {
 		`DELETE FROM refresh_log WHERE account_id=?`,
 		`DELETE FROM sticky WHERE account_id=?`,
 		`DELETE FROM auth_health WHERE account_id=?`,
+		`DELETE FROM account_presentation_quarantines WHERE account_id=?`,
+		`DELETE FROM account_presentations WHERE account_id=?`,
 		`DELETE FROM account_removals WHERE account_id=?`,
 	} {
 		if _, err := tx.Exec(q, id); err != nil {
@@ -1209,6 +1220,55 @@ func (s *Store) UsageSamplesSince(accountID int, since time.Time) ([]UsageSample
 	return out, rows.Err()
 }
 
+type selectionEligibilityQueryer interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func selectionEligible(
+	queryer selectionEligibilityQueryer,
+	accountID int,
+	instanceID string,
+	generation uint64,
+	configDir string,
+) error {
+	var eligible int
+	err := queryer.QueryRow(`SELECT 1 FROM accounts
+		JOIN account_presentations ON account_presentations.account_id=accounts.id
+		  AND account_presentations.account_instance_id=accounts.instance_id
+		  AND account_presentations.account_generation=accounts.generation
+		  AND account_presentations.public_path=accounts.config_dir
+		WHERE accounts.id=? AND accounts.instance_id=? AND accounts.generation=?
+		  AND accounts.config_dir=? AND accounts.deleted_at IS NULL
+		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)
+		  AND NOT EXISTS (SELECT 1 FROM account_presentation_quarantines WHERE account_id=accounts.id)
+		  AND NOT EXISTS (SELECT 1 FROM account_mutations WHERE account_id=accounts.id)
+		  AND NOT EXISTS (
+		    SELECT 1 FROM account_mutation_receipts
+		    WHERE account_id=accounts.id AND publication_pending=1
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM auth_health
+		    WHERE account_id=accounts.id AND (needs_login=1 OR kind<>'owned')
+		  )
+		  AND NOT EXISTS (SELECT 1 FROM credential_operations WHERE account_id=accounts.id)
+		  AND NOT EXISTS (SELECT 1 FROM credential_quarantines WHERE account_id=accounts.id)
+		  AND NOT EXISTS (
+		    SELECT 1 FROM credential_operation_receipts
+		    WHERE account_id=accounts.id AND publication_payload IS NOT NULL
+		      AND acknowledged_at IS NULL
+		  )`, accountID, instanceID, generation, configDir).Scan(&eligible)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrAccountSelectionIneligible
+	}
+	return err
+}
+
+// SelectionEligible verifies the exact durable fences required before tenant
+// preparation or credential preflight starts.
+func (s *Store) SelectionEligible(account Account) error {
+	return selectionEligible(s.db, account.ID, account.InstanceID, account.Generation, account.ConfigDir)
+}
+
 // ErrAccountGenerationChanged means a reserved account was replaced or its
 // tenant-defining shape changed before activation.
 var ErrAccountGenerationChanged = errors.New("account generation changed")
@@ -1271,10 +1331,15 @@ func (s *Store) ActivateSelection(a SelectionActivation) (err error) {
 		return fmt.Errorf("%w: account=%d reserved=%s/%d current=%s/%d", ErrAccountGenerationChanged,
 			a.AccountID, a.ExpectedInstanceID, a.ExpectedGeneration, instanceID, generation)
 	}
-	if _, err = accountRemovalByID(tx, a.AccountID); err == nil {
+	if _, removalErr := accountRemovalByID(tx, a.AccountID); removalErr == nil {
 		return fmt.Errorf("activate selection account %d: %w", a.AccountID, ErrAccountRemoving)
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("read selection account %d removal: %w", a.AccountID, err)
+	} else if !errors.Is(removalErr, sql.ErrNoRows) {
+		return fmt.Errorf("read selection removal for account %d: %w", a.AccountID, removalErr)
+	}
+	if err = selectionEligible(
+		tx, a.AccountID, a.ExpectedInstanceID, a.ExpectedGeneration, a.ConfigDir,
+	); err != nil {
+		return fmt.Errorf("activate selection account %d: %w", a.AccountID, err)
 	}
 	if a.RecordSticky && a.Cwd != "" {
 		if _, err = tx.Exec(upsertStickySQL, a.Cwd, a.AccountID, a.At.Unix()); err != nil {

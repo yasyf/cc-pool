@@ -56,12 +56,10 @@ func selectTestManager(t *testing.T) *pool.Manager {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	if err := st.UpsertAccount(store.Account{
+	admitCLITestAccount(t, st, store.Account{
 		ID: 5, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "work@example.com",
 		KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	return &pool.Manager{Store: st}
 }
 
@@ -150,13 +148,15 @@ func exhaustedPoolManager(t *testing.T) *pool.Manager {
 	t.Setenv("USER", "user")
 	st := openTestStore(t)
 	now := time.Now()
-	for id, util7 := range map[int]float64{1: 90, 2: 10} {
-		if err := st.UpsertAccount(store.Account{
+	for _, fixture := range []struct {
+		id    int
+		util7 float64
+	}{{id: 1, util7: 90}, {id: 2, util7: 10}} {
+		id, util7 := fixture.id, fixture.util7
+		admitCLITestAccount(t, st, store.Account{
 			ID: id, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "work@example.com",
 			KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
-		}); err != nil {
-			t.Fatal(err)
-		}
+		})
 		if err := st.InsertUsageSample(store.UsageSample{
 			AccountID: id, TS: now, Util5h: 100, Util7d: util7,
 			Resets5h: now.Add(20 * time.Minute), ExtraEnabled: id == 2,
@@ -226,12 +226,10 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	if err := os.WriteFile(privatePath, private, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertAccount(store.Account{
+	admitCLITestAccount(t, st, store.Account{
 		ID: id, ConfigDir: dir, Label: "work@example.com",
 		KeychainService: "svc", KeychainAccount: "u",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	account, err := st.GetAccount(id)
 	if err != nil {
 		t.Fatal(err)
@@ -310,9 +308,7 @@ func TestValidateDaemonSelection(t *testing.T) {
 		KeychainService: "svc-6", KeychainAccount: "u-6",
 	}
 	for _, acct := range []store.Account{a, b} {
-		if err := st.UpsertAccount(acct); err != nil {
-			t.Fatal(err)
-		}
+		admitCLITestAccount(t, st, acct)
 	}
 	a, _ = st.GetAccount(a.ID)
 	b, _ = st.GetAccount(b.ID)

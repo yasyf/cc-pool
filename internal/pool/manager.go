@@ -98,6 +98,9 @@ type Manager struct {
 	// BuildCredentialWritePublication captures immutable, non-secret publication
 	// bytes before the terminal receipt commits. It must perform no I/O.
 	BuildCredentialWritePublication CredentialWritePublicationBuilder
+	// ClaimCredentialMutation serializes credential writes with daemon selection
+	// reservations. The returned release must be called after the durable lane settles.
+	ClaimCredentialMutation func(accountID int) (release func(), err error)
 
 	credentialMu      sync.Mutex
 	credentialFlights map[int]*credentialFlight

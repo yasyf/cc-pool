@@ -216,6 +216,12 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 		return err
 	}
 	workers := m.DisposableWorkers()
+	m.ClaimCredentialMutation = func(accountID int) (func(), error) {
+		if !s.cl.ownExclusive(accountID) {
+			return nil, errAccountExclusive
+		}
+		return func() { s.cl.releaseExclusive(accountID) }, nil
+	}
 	s.m = m
 	s.tenantClient = tenantClient
 	s.holderSessionDone = tenantClient.Done()
@@ -475,6 +481,23 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		}
 		for _, sn := range snaps {
 			if sn.Account.ID == *req.Account {
+				if err := s.m.Store.SelectionEligible(sn.Account); err != nil {
+					return Response{OK: false, Error: fmt.Sprintf("account %d is not selectable: %v", *req.Account, err)}
+				}
+				proof, err := s.prepareTenant(ctx, sn.Account)
+				if err != nil {
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
+				}
+				publicPath, err := s.selectionPublicPath(ctx, sn.Account, proof)
+				if err != nil {
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
+				}
+				if err := s.preflightSelectionCredential(ctx, sn.Account); err != nil {
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", sn.Account.ID, err)}
+				}
+				if err := s.m.Store.SelectionEligible(sn.Account); err != nil {
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d selection eligibility: %v", sn.Account.ID, err)}
+				}
 				launch := selectionLaunch{
 					pid: req.PID, processStartedAt: processStartedAt, cwd: req.Cwd,
 					recordSticky: true,
@@ -485,23 +508,9 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 					if err != nil {
 						return Response{OK: false, Error: fmt.Sprintf("reserve acct-%02d: %v", sn.Account.ID, err)}
 					}
-				}
-				proof, err := s.prepareTenant(ctx, sn.Account)
-				if err != nil {
-					s.cl.abortReservation(token)
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
-				}
-				publicPath, err := s.selectionPublicPath(ctx, sn.Account, proof)
-				if err != nil {
-					s.cl.abortReservation(token)
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
-				}
-				if token != "" && !s.cl.bindPreparation(token, proof) {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d reservation expired during PrepareTenant", sn.Account.ID)}
-				}
-				if err := s.preflightSelectionCredential(ctx, sn.Account); err != nil {
-					s.cl.abortReservation(token)
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", sn.Account.ID, err)}
+					if !s.cl.bindPreparation(token, proof) {
+						return Response{OK: false, Error: fmt.Sprintf("acct-%02d reservation expired after PrepareTenant", sn.Account.ID)}
+					}
 				}
 				id := sn.Account.ID
 				return Response{
@@ -526,6 +535,12 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		if excluded[sn.Account.ID] {
 			excludedReady = true
 			continue
+		}
+		if err := s.m.Store.SelectionEligible(sn.Account); err != nil {
+			if errors.Is(err, store.ErrAccountSelectionIneligible) {
+				continue
+			}
+			return Response{OK: false, Error: fmt.Sprintf("acct-%02d selection eligibility: %v", sn.Account.ID, err)}
 		}
 		usable = append(usable, sn)
 	}
@@ -568,6 +583,24 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		}
 	}
 	best := bySnap[r.AccountID]
+	proof, err := s.prepareTenant(ctx, best.Account)
+	if err != nil {
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
+	}
+	publicPath, err := s.selectionPublicPath(ctx, best.Account, proof)
+	if err != nil {
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
+	}
+	id := best.Account.ID
+	// Credential mutation takes the exclusive claim before the pending selection
+	// is created; the claims mutex then orders every later mutation against it.
+	err = s.preflightSelectionCredential(ctx, best.Account)
+	if err != nil {
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", best.Account.ID, err)}
+	}
+	if err := s.m.Store.SelectionEligible(best.Account); err != nil {
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d selection eligibility: %v", best.Account.ID, err)}
+	}
 	launch := selectionLaunch{
 		pid: req.PID, processStartedAt: processStartedAt, cwd: req.Cwd,
 		recordSticky: !outcome.Held() || best.Account.ID == pin.AccountID,
@@ -578,28 +611,9 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		if err != nil {
 			return Response{OK: false, Error: fmt.Sprintf("reserve acct-%02d: %v", best.Account.ID, err)}
 		}
-	}
-	proof, err := s.prepareTenant(ctx, best.Account)
-	if err != nil {
-		s.cl.abortReservation(token)
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
-	}
-	publicPath, err := s.selectionPublicPath(ctx, best.Account, proof)
-	if err != nil {
-		s.cl.abortReservation(token)
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
-	}
-	if token != "" && !s.cl.bindPreparation(token, proof) {
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d reservation expired during PrepareTenant", best.Account.ID)}
-	}
-	id := best.Account.ID
-	// Finish credential preflight before returning the reservation. Credential
-	// maintenance observes pending reservations, while maintenance that won the
-	// durable lane first must settle before this selection may activate.
-	err = s.preflightSelectionCredential(ctx, best.Account)
-	if err != nil {
-		s.cl.abortReservation(token)
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", best.Account.ID, err)}
+		if !s.cl.bindPreparation(token, proof) {
+			return Response{OK: false, Error: fmt.Sprintf("acct-%02d reservation expired after PrepareTenant", best.Account.ID)}
+		}
 	}
 	s.log.Printf("select%s: %s -> acct-%02d (score %.1f · 5h %.0f%% used · 7d %.0f%% used%s)",
 		selectKind(outcome, fallback), req.Cwd, best.Account.ID,

@@ -36,7 +36,7 @@ func TestBeginAccountRemovalRejectsAdmittedExternalOperations(t *testing.T) {
 		s.now = func() time.Time { return now }
 		account := credentialOperationTestAccount(t, s)
 		request := existingAccountMutationTestRequest(
-			t, account, AccountMutationSyncInstall,
+			t, account, AccountMutationRelogin,
 			credentialOperationTestOwner("removal-account-mutation"),
 		)
 		begin, err := s.BeginAccountMutation(t.Context(), request)
@@ -292,7 +292,7 @@ func TestAccountRemovalIntentFencesActiveFleetAndSurvivesRestart(t *testing.T) {
 		t.Fatalf("activate selection after removal = %v, want ErrAccountRemoving", err)
 	}
 	mutationRequest := existingAccountMutationTestRequest(
-		t, account, AccountMutationSyncInstall,
+		t, account, AccountMutationRelogin,
 		credentialOperationTestOwner("post-removal-account-mutation"),
 	)
 	if _, err := s.BeginAccountMutation(t.Context(), mutationRequest); !errors.Is(err, ErrAccountRemoving) {

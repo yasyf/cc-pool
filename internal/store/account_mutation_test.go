@@ -17,6 +17,34 @@ func TestAccountMutationIDDomainIsHardReset(t *testing.T) {
 	}
 }
 
+func TestCredentialMutationsRejectLiveSession(t *testing.T) {
+	s := openTest(t)
+	account := credentialOperationTestAccount(t, s)
+	if err := s.ActivateSelection(SelectionActivation{
+		Token: nextStoreTestToken(), AccountID: account.ID,
+		ExpectedInstanceID: account.InstanceID, ExpectedGeneration: account.Generation,
+		Process:   ProcessIdentity{PID: 42, StartedAt: time.Now().Add(-time.Minute)},
+		ConfigDir: account.ConfigDir,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	credentialRequest := credentialOperationTestRequest(
+		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
+		credentialOperationTestState("before", ""), "live-session",
+		credentialOperationTestOwner("live-session-credential"),
+	)
+	if _, err := s.BeginCredentialOperation(credentialRequest); !errors.Is(err, ErrAccountSessionActive) {
+		t.Fatalf("credential operation with live session = %v", err)
+	}
+	mutationRequest := existingAccountMutationTestRequest(
+		t, account, AccountMutationRelogin,
+		credentialOperationTestOwner("live-session-account-mutation"),
+	)
+	if _, err := s.BeginAccountMutation(t.Context(), mutationRequest); !errors.Is(err, ErrAccountSessionActive) {
+		t.Fatalf("account mutation with live session = %v", err)
+	}
+}
+
 func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing.T) {
 	s := openTest(t)
 	now := time.Unix(1_900_000_000, 0)
@@ -370,24 +398,6 @@ func TestRearmAccountMutationInputRejectsDriftAndNonInteractiveKind(t *testing.T
 		t.Fatalf("stale rearm = %v", err)
 	}
 
-	other := credentialOperationTestAccountID(t, s, 11)
-	syncInstall := existingAccountMutationTestRequest(
-		t, other, AccountMutationSyncInstall,
-		credentialOperationTestOwner("rearm-sync"),
-	)
-	syncBegin, err := s.BeginAccountMutation(t.Context(), syncInstall)
-	if err != nil {
-		t.Fatal(err)
-	}
-	syncFence, err := s.MarkAccountMutationApplying(syncBegin.Active.Fence())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.RearmAccountMutationInput(
-		syncFence, syncBegin.Active.ExpectedCredentialDigest,
-	); !errors.Is(err, ErrAccountMutationState) {
-		t.Fatalf("sync-install rearm = %v", err)
-	}
 }
 
 func TestAccountMutationCancellationIsPreBoundaryOnly(t *testing.T) {
@@ -427,19 +437,22 @@ func TestAccountMutationCancellationIsPreBoundaryOnly(t *testing.T) {
 
 	account := credentialOperationTestAccountID(t, s, 10)
 	existing := existingAccountMutationTestRequest(
-		t, account, AccountMutationSyncInstall,
-		credentialOperationTestOwner("sync-owner"),
+		t, account, AccountMutationRelogin,
+		credentialOperationTestOwner("relogin-owner"),
 	)
 	started, err := s.BeginAccountMutation(t.Context(), existing)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence, err := s.MarkAccountMutationApplying(started.Active.Fence())
+	fence, err := s.MarkAccountMutationInputProvided(
+		started.Active.Fence(), started.Active.ExpectedCredentialDigest,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SetAccountMutationMetadata(fence, "invalid", "invalid"); !errors.Is(err, ErrAccountMutationState) {
-		t.Fatalf("sync install accepted account metadata: %v", err)
+	fence, err = s.MarkAccountMutationApplying(fence)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if _, err := s.ResolveAccountMutation(
 		fence, AccountMutationAborted,
@@ -748,7 +761,7 @@ func TestAccountMutationTakeoverRequiresExactReapReceipt(t *testing.T) {
 	account := credentialOperationTestAccount(t, s)
 	owner := credentialOperationTestOwner("registry-owner")
 	request := existingAccountMutationTestRequest(
-		t, account, AccountMutationSyncInstall, owner,
+		t, account, AccountMutationRelogin, owner,
 	)
 	begin, err := s.BeginAccountMutation(t.Context(), request)
 	if err != nil {
@@ -779,7 +792,7 @@ func TestAccountMutationAgeAloneCannotTakeover(t *testing.T) {
 	account := credentialOperationTestAccount(t, s)
 	owner := credentialOperationTestOwner("registry-expired-owner")
 	request := existingAccountMutationTestRequest(
-		t, account, AccountMutationSyncInstall, owner,
+		t, account, AccountMutationRelogin, owner,
 	)
 	begin, err := s.BeginAccountMutation(t.Context(), request)
 	if err != nil {
@@ -807,7 +820,7 @@ func TestAccountMutationsOwnedByPagesExactOwner(t *testing.T) {
 			requestOwner = other
 		}
 		request := existingAccountMutationTestRequest(
-			t, account, AccountMutationSyncInstall, requestOwner,
+			t, account, AccountMutationRelogin, requestOwner,
 		)
 		if _, err := s.BeginAccountMutation(t.Context(), request); err != nil {
 			t.Fatal(err)

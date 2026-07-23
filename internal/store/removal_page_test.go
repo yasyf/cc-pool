@@ -16,8 +16,8 @@ func insertRemovalFleet(t *testing.T, s *Store, total int) {
 	defer func() { _ = tx.Rollback() }()
 	account, err := tx.PrepareContext(t.Context(), `
 		INSERT INTO accounts(
-			id,instance_id,generation,config_dir,keychain_service,keychain_account,created_at
-		) VALUES(?,?,?,?,?,?,?)`)
+			id,instance_id,generation,account_uuid,config_dir,keychain_service,keychain_account,created_at
+		) VALUES(?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func insertRemovalFleet(t *testing.T, s *Store, total int) {
 	for id := 1; id <= total; id++ {
 		instanceID := fmt.Sprintf("%032x", id)
 		if _, err := account.ExecContext(
-			t.Context(), id, instanceID, 1, fmt.Sprintf("/accounts/%d", id),
+			t.Context(), id, instanceID, 1, fmt.Sprintf("uuid-%d", id), fmt.Sprintf("/accounts/%d", id),
 			"service", "account", 1,
 		); err != nil {
 			t.Fatalf("insert account %d: %v", id, err)
