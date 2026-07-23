@@ -228,7 +228,10 @@ func newDriverHarness(t *testing.T) *driverHarness {
 		Cred:        cr,
 		LocalIndex:  func(context.Context) (map[string]int, error) { return h.idx, nil },
 		Materialize: h.mat.materialize,
-		Pull:        h.pull.pull,
+		Admit: func(context.Context, store.Account, string) (bool, error) {
+			return false, nil
+		},
+		Pull: h.pull.pull,
 	})
 	return h
 }

@@ -252,8 +252,12 @@ func TestPromoteReservedSyncedAccountStartsAwaitingOrigin(t *testing.T) {
 		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
 		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "external-uuid",
 	}
-	if err := s.PromoteReservedSyncedAccount(reservation, account); err != nil {
+	proof := presentationTestProof(account, account.ConfigDir, "activation-synced")
+	if err := s.PromoteReservedSyncedAccount(reservation, account, proof); err != nil {
 		t.Fatal(err)
+	}
+	if err := s.PromoteReservedSyncedAccount(reservation, account, proof); err != nil {
+		t.Fatalf("exact lost-response replay: %v", err)
 	}
 	health, err := s.GetAuthHealth(account.ID)
 	if err != nil {
@@ -269,6 +273,91 @@ func TestPromoteReservedSyncedAccountStartsAwaitingOrigin(t *testing.T) {
 	}
 	if committed.ConfigDir != account.ConfigDir || committed.AccountUUID != account.AccountUUID {
 		t.Fatalf("committed synced row = %+v", committed)
+	}
+	presentation, err := s.AccountPresentation(account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presentation.AccountInstanceID != account.InstanceID ||
+		presentation.AccountGeneration != account.Generation || presentation.Proof != proof {
+		t.Fatalf("committed presentation = %+v, want proof %+v", presentation, proof)
+	}
+}
+
+func TestPromoteReservedSyncedAccountRejectsIncompleteProofAtomically(t *testing.T) {
+	s := openReserveTest(t)
+	reservation := mustReserve(t, s)
+	account := Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "external-uuid",
+	}
+	proof := presentationTestProof(account, account.ConfigDir, "activation-synced")
+	proof.SourceAuthority = ""
+	if err := s.PromoteReservedSyncedAccount(reservation, account, proof); !errors.Is(err, ErrAccountPresentationEvidence) {
+		t.Fatalf("incomplete proof promotion = %v, want presentation evidence error", err)
+	}
+	if _, err := s.GetAccount(account.ID); !errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("account after refused proof = %v, want absent", err)
+	}
+	if _, err := s.AccountPresentation(account.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("presentation after refused proof = %v, want absent", err)
+	}
+	var authRows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM auth_health WHERE account_id=?`, account.ID).Scan(&authRows); err != nil {
+		t.Fatal(err)
+	}
+	if authRows != 0 {
+		t.Fatalf("auth rows after refused proof = %d, want zero", authRows)
+	}
+	if err := s.ReleaseAccountIndex(reservation); err != nil {
+		t.Fatalf("refused promotion consumed reservation: %v", err)
+	}
+}
+
+func TestPromoteReservedSyncedAccountLostResponseReplaysAfterReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pool-v1.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation := mustReserve(t, s)
+	account := Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		KeychainService: "svc", KeychainAccount: "user", Label: "peer",
+		AccountUUID: "external-uuid",
+	}
+	proof := presentationTestProof(account, account.ConfigDir, "activation-synced")
+	if err := s.PromoteReservedSyncedAccount(reservation, account, proof); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.PromoteReservedSyncedAccount(reservation, account, proof); err != nil {
+		t.Fatalf("replay after reopen: %v", err)
+	}
+	committed, err := s.GetAccount(account.ID)
+	if err != nil || committed.InstanceID != account.InstanceID || committed.AccountUUID != account.AccountUUID {
+		t.Fatalf("committed account = %+v err=%v", committed, err)
+	}
+	presentation, err := s.AccountPresentation(account.ID)
+	if err != nil || presentation.Proof != proof {
+		t.Fatalf("committed presentation = %+v err=%v", presentation, err)
+	}
+	health, err := s.GetAuthHealth(account.ID)
+	if err != nil || !health.NeedsLogin || health.Kind != AuthKindAwaitingOrigin {
+		t.Fatalf("committed auth health = %+v err=%v", health, err)
+	}
+	next := mustReserve(t, s)
+	if next.ID == reservation.ID {
+		t.Fatalf("replayed reservation index %d became reusable", reservation.ID)
 	}
 }
 

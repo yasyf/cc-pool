@@ -40,10 +40,11 @@ func (m *Manager) Init() (*InitResult, error) {
 
 // PendingAdd is one private account backing awaiting interactive login.
 type PendingAdd struct {
-	Reservation     store.PendingAccountReservation
-	ConfigDir       string
-	KeychainService string
-	ClaudeJSONSeed  SeedOutcome
+	Reservation       store.PendingAccountReservation
+	ConfigDir         string
+	KeychainService   string
+	ClaudeJSONSeed    SeedOutcome
+	PresentationProof store.PresentationPreparationProof
 }
 
 // DuplicateIdentity returns an existing account sharing want's subscription.
@@ -92,6 +93,28 @@ func (m *Manager) PrepareReservedAdd(
 	reservation store.PendingAccountReservation,
 	configDir string,
 ) (pending *PendingAdd, err error) {
+	return m.prepareReservedAdd(ctx, reservation, configDir, store.PresentationPreparationProof{})
+}
+
+// PrepareReservedSyncedAdd seeds a peer-added account only from its complete
+// generation-fenced FuseKit presentation proof.
+func (m *Manager) PrepareReservedSyncedAdd(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+	proof store.PresentationPreparationProof,
+) (pending *PendingAdd, err error) {
+	if err := store.ValidateReservedPresentationPreparationProof(reservation, proof); err != nil {
+		return nil, fmt.Errorf("prepare reserved synced add: %w", err)
+	}
+	return m.prepareReservedAdd(ctx, reservation, proof.FileProvider.PublicPath, proof)
+}
+
+func (m *Manager) prepareReservedAdd(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+	configDir string,
+	proof store.PresentationPreparationProof,
+) (pending *PendingAdd, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -105,7 +128,7 @@ func (m *Manager) PrepareReservedAdd(
 	service := creds.ServiceName(configDir)
 	return &PendingAdd{
 		Reservation: reservation, ConfigDir: configDir, KeychainService: service,
-		ClaudeJSONSeed: seed,
+		ClaudeJSONSeed: seed, PresentationProof: proof,
 	}, nil
 }
 
@@ -185,7 +208,9 @@ func (m *Manager) PromoteSyncedAdd(
 		KeychainService: pending.KeychainService, KeychainAccount: creds.AccountLabel(),
 		Label: label, AccountUUID: accountUUID, CreatedAt: time.Now(),
 	}
-	if err := m.Store.PromoteReservedSyncedAccount(pending.Reservation, account); err != nil {
+	if err := m.Store.PromoteReservedSyncedAccount(
+		pending.Reservation, account, pending.PresentationProof,
+	); err != nil {
 		return nil, fmt.Errorf("promote synced account %s: %w", pending.ConfigDir, err)
 	}
 	committed, err := m.Store.GetAccount(account.ID)

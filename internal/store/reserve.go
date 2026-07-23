@@ -112,22 +112,27 @@ func consumeReservation(e rowExecer, reservation PendingAccountReservation) erro
 // the index free between the two. A reservation already gone (released or
 // swept) fails loud and writes no row.
 func (s *Store) PromoteReservedAccount(reservation PendingAccountReservation, a Account) error {
-	return s.promoteReservedAccount(reservation, a, false)
+	return s.promoteReservedAccount(reservation, a, false, nil)
 }
 
-// PromoteReservedSyncedAccount atomically publishes a non-origin row as
-// awaiting its first access-only credential.
-func (s *Store) PromoteReservedSyncedAccount(reservation PendingAccountReservation, a Account) error {
+// PromoteReservedSyncedAccount atomically publishes a non-origin row, its
+// complete FuseKit presentation proof, and awaiting-origin health state.
+func (s *Store) PromoteReservedSyncedAccount(
+	reservation PendingAccountReservation,
+	a Account,
+	proof PresentationPreparationProof,
+) error {
 	if a.AccountUUID == "" {
 		return errors.New("promote synced account: external UUID is required")
 	}
-	return s.promoteReservedAccount(reservation, a, true)
+	return s.promoteReservedAccount(reservation, a, true, &proof)
 }
 
 func (s *Store) promoteReservedAccount(
 	reservation PendingAccountReservation,
 	a Account,
 	awaitingOrigin bool,
+	presentationProof *PresentationPreparationProof,
 ) error {
 	if err := validatePendingReservationFence(reservation); err != nil {
 		return err
@@ -136,12 +141,31 @@ func (s *Store) promoteReservedAccount(
 		a.Generation != reservation.Generation {
 		return fmt.Errorf("promote account %d: reserved identity changed", a.ID)
 	}
+	if awaitingOrigin {
+		if presentationProof == nil {
+			return errors.New("promote synced account: presentation proof is required")
+		}
+		if err := validatePresentationPreparationProofForAccount(
+			*presentationProof, a.InstanceID, a.Generation, a.ConfigDir,
+		); err != nil {
+			return fmt.Errorf("promote synced account: %w", err)
+		}
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("promote account %d: %w", a.ID, err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	if err := consumeReservation(tx, reservation); err != nil {
+		if awaitingOrigin && presentationProof != nil {
+			replayed, replayErr := exactSyncedPromotion(tx, a, *presentationProof)
+			if replayErr != nil {
+				return errors.Join(err, replayErr)
+			}
+			if replayed {
+				return tx.Commit()
+			}
+		}
 		return err
 	}
 	if a.AccountUUID != "" {
@@ -177,6 +201,12 @@ func (s *Store) promoteReservedAccount(
 		return fmt.Errorf("promote account %d: inserted %d rows", a.ID, rows)
 	}
 	if awaitingOrigin {
+		if err := upsertAccountPresentation(tx, AccountPresentation{
+			AccountID: a.ID, AccountInstanceID: a.InstanceID,
+			AccountGeneration: a.Generation, Proof: *presentationProof, ObservedAt: s.now(),
+		}); err != nil {
+			return fmt.Errorf("promote synced account %d presentation: %w", a.ID, err)
+		}
 		digest := DigestReason("host-sync: awaiting origin credential")
 		if _, err := tx.Exec(
 			`INSERT INTO auth_health(account_id,needs_login,since,reason,digest,kind,gen)
@@ -190,6 +220,40 @@ func (s *Store) promoteReservedAccount(
 		return fmt.Errorf("promote account %d: %w", a.ID, err)
 	}
 	return nil
+}
+
+func exactSyncedPromotion(
+	tx *sql.Tx,
+	expected Account,
+	proof PresentationPreparationProof,
+) (bool, error) {
+	current, err := presentationAccount(tx, expected.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !samePresentationAccount(current, expected) || current.Label != expected.Label ||
+		current.AccountUUID != expected.AccountUUID {
+		return false, nil
+	}
+	presentation, err := accountPresentation(tx, expected.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if presentation.AccountInstanceID != expected.InstanceID ||
+		presentation.AccountGeneration != expected.Generation || presentation.Proof != proof {
+		return false, nil
+	}
+	var authRows int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM auth_health WHERE account_id=?`, expected.ID).Scan(&authRows); err != nil {
+		return false, err
+	}
+	return authRows == 1, nil
 }
 
 // PendingAddReservationsOwnedBy returns one bounded stable account-id page.

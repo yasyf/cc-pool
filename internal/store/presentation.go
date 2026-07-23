@@ -138,6 +138,74 @@ func (s *Store) AccountPresentationQuarantine(accountID int) (AccountPresentatio
 	return accountPresentationQuarantine(s.db, accountID)
 }
 
+// AdmitSyncedAccount atomically advances the complete presentation proof and
+// clears awaiting-origin state only while the account and old proof match.
+func (s *Store) AdmitSyncedAccount(
+	account Account,
+	currentProof PresentationPreparationProof,
+	freshProof PresentationPreparationProof,
+) (bool, error) {
+	if err := validatePresentationPreparationProofForAccount(
+		freshProof, account.InstanceID, account.Generation, account.ConfigDir,
+	); err != nil {
+		return false, err
+	}
+	if err := ValidatePresentationPreparationProofAdvance(currentProof, freshProof); err != nil {
+		return false, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, err := presentationAccount(tx, account.ID)
+	if err != nil {
+		return false, err
+	}
+	if !samePresentationAccount(current, account) {
+		return false, ErrAccountGenerationChanged
+	}
+	if _, err := accountPresentationQuarantine(tx, account.ID); err == nil {
+		return false, ErrAccountPresentationQuarantined
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	bound, err := accountPresentation(tx, account.ID)
+	if err != nil {
+		return false, err
+	}
+	if bound.AccountInstanceID != account.InstanceID ||
+		bound.AccountGeneration != account.Generation || bound.Proof != currentProof {
+		return false, ErrAccountPresentationEvidence
+	}
+	if err := upsertAccountPresentation(tx, AccountPresentation{
+		AccountID: account.ID, AccountInstanceID: account.InstanceID,
+		AccountGeneration: account.Generation, Proof: freshProof, ObservedAt: s.now(),
+	}); err != nil {
+		return false, err
+	}
+	result, err := tx.Exec(
+		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none',
+		 digest=zeroblob(32), kind='owned'
+		 WHERE account_id=? AND needs_login=1 AND kind='awaiting_origin'`,
+		account.ID,
+	)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows != 1 {
+		return false, ErrAccountPresentationEvidence
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func validateFileProviderPreparationProof(fileProvider FileProviderPreparationProof) error {
 	if fileProvider.TenantID == "" || fileProvider.DomainID == "" || fileProvider.Generation == 0 ||
 		fileProvider.ActivationGeneration == "" || !exactPresentationPath(fileProvider.PublicPath) ||
@@ -187,6 +255,54 @@ func validatePresentationPreparationProofForAccount(
 		proof.CatalogTenantID != "account-"+instanceID ||
 		proof.CatalogGeneration != generation || proof.FileProvider.Generation != generation ||
 		proof.FileProvider.PublicPath != publicPath {
+		return ErrAccountPresentationEvidence
+	}
+	return nil
+}
+
+// ValidateReservedPresentationPreparationProof requires proof for exactly one
+// prospective account identity before any product-owned state is materialized.
+func ValidateReservedPresentationPreparationProof(
+	reservation PendingAccountReservation,
+	proof PresentationPreparationProof,
+) error {
+	return validatePresentationPreparationProofForAccount(
+		proof,
+		reservation.InstanceID,
+		reservation.Generation,
+		proof.FileProvider.PublicPath,
+	)
+}
+
+// ValidatePresentationPreparationProofAdvance permits only a monotonic proof
+// refresh for the same presentation identity and source authority.
+func ValidatePresentationPreparationProofAdvance(
+	current PresentationPreparationProof,
+	next PresentationPreparationProof,
+) error {
+	if err := validatePresentationPreparationProof(current); err != nil {
+		return err
+	}
+	if err := validatePresentationPreparationProof(next); err != nil {
+		return err
+	}
+	if current.CatalogTenantID != next.CatalogTenantID ||
+		current.CatalogGeneration != next.CatalogGeneration ||
+		current.SourceAuthority != next.SourceAuthority ||
+		current.PresentationKind != next.PresentationKind ||
+		current.FileProvider.TenantID != next.FileProvider.TenantID ||
+		current.FileProvider.DomainID != next.FileProvider.DomainID ||
+		current.FileProvider.Generation != next.FileProvider.Generation ||
+		current.FileProvider.PublicPath != next.FileProvider.PublicPath ||
+		next.Requested < current.Requested ||
+		next.SourceRevision < current.SourceRevision ||
+		next.CatalogRevision < current.CatalogRevision {
+		return ErrAccountPresentationEvidence
+	}
+	revisionAdvanced := next.Requested > current.Requested ||
+		next.SourceRevision > current.SourceRevision ||
+		next.CatalogRevision > current.CatalogRevision
+	if !revisionAdvanced && (next.ChangeID != current.ChangeID || next.OperationID != current.OperationID) {
 		return ErrAccountPresentationEvidence
 	}
 	return nil

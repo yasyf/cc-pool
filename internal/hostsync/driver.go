@@ -58,6 +58,9 @@ type LocalIndex func(ctx context.Context) (map[string]int, error)
 // missing locally; tests inject a fake.
 type AccountMaterializer func(ctx context.Context, v AccountValue, peers []string) (MaterializeResult, error)
 
+// SyncedAdmitter revalidates one persisted presentation before admission.
+type SyncedAdmitter func(context.Context, store.Account, string) (bool, error)
+
 // FresherPuller pulls a fresher credential for uuid from its chain origin,
 // falling back to the other peers; ErrNoPeerCredential is the deferred outcome.
 type FresherPuller func(ctx context.Context, uuid string, chain ChainStamp, localExpiresAt int64, peers []string) (*creds.Credential, error)
@@ -72,6 +75,8 @@ type DriverDeps struct {
 	LocalIndex LocalIndex
 	// Materialize creates a local account for a peer-added entry missing locally.
 	Materialize AccountMaterializer
+	// Admit revalidates a synced account's persisted presentation before selection.
+	Admit SyncedAdmitter
 	// Pull fetches a strictly-fresher credential for an existing local account.
 	Pull FresherPuller
 }
@@ -222,6 +227,11 @@ func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountV
 		return outcome, nil
 	}
 	if v.Chain.Hash == localHash {
+		if d.deps.Admit != nil {
+			if _, err := d.deps.Admit(ctx, a, v.Chain.Hash); err != nil {
+				return "", fmt.Errorf("admit synced acct-%d: %w", a.ID, err)
+			}
+		}
 		return outcome, nil
 	}
 	// Strictly-later expiry, same ordering as InstallSyncedCredential's guard.
@@ -247,6 +257,11 @@ func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountV
 	case err != nil:
 		return "", err
 	case installed:
+		if d.deps.Admit != nil {
+			if _, err := d.deps.Admit(ctx, a, v.Chain.Hash); err != nil {
+				return "", fmt.Errorf("admit synced acct-%d: %w", a.ID, err)
+			}
+		}
 		return OutcomeCredInstalled, nil
 	case deferred:
 		return OutcomeDeferred, nil

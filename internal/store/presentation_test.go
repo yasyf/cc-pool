@@ -95,6 +95,52 @@ func TestObserveAccountPresentationQuarantinesIdentityAndGenerationDrift(t *test
 	}
 }
 
+func TestValidatePresentationPreparationProofAdvance(t *testing.T) {
+	s := openTest(t)
+	account := credentialOperationTestAccountID(t, s, 1)
+	current := presentationTestProof(account, account.ConfigDir, "activation-1")
+
+	activation := current
+	activation.FileProvider.ActivationGeneration = "activation-2"
+	if err := ValidatePresentationPreparationProofAdvance(current, activation); err != nil {
+		t.Fatalf("activation refresh: %v", err)
+	}
+	advanced := activation
+	advanced.Requested++
+	advanced.Desired, advanced.Observed = advanced.Requested, advanced.Requested
+	advanced.Verified, advanced.Applied = advanced.Requested, advanced.Requested
+	advanced.CatalogRevision = advanced.Requested
+	advanced.SourceRevision++
+	advanced.ChangeID, advanced.OperationID = "change-advanced", "operation-advanced"
+	if err := ValidatePresentationPreparationProofAdvance(current, advanced); err != nil {
+		t.Fatalf("revision advance: %v", err)
+	}
+
+	tests := map[string]func(*PresentationPreparationProof){
+		"public path": func(p *PresentationPreparationProof) { p.FileProvider.PublicPath += "-other" },
+		"tenant": func(p *PresentationPreparationProof) {
+			p.CatalogTenantID, p.FileProvider.TenantID = "account-other", "account-other"
+		},
+		"domain":    func(p *PresentationPreparationProof) { p.FileProvider.DomainID = "domain-other" },
+		"authority": func(p *PresentationPreparationProof) { p.SourceAuthority = "source-other" },
+		"rollback": func(p *PresentationPreparationProof) {
+			p.Requested--
+			p.Desired, p.Observed, p.Verified, p.Applied = p.Requested, p.Requested, p.Requested, p.Requested
+			p.CatalogRevision = p.Requested
+		},
+		"causal drift": func(p *PresentationPreparationProof) { p.ChangeID = "change-other" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			next := current
+			mutate(&next)
+			if err := ValidatePresentationPreparationProofAdvance(current, next); !errors.Is(err, ErrAccountPresentationEvidence) {
+				t.Fatalf("validation = %v, want presentation evidence error", err)
+			}
+		})
+	}
+}
+
 func presentationTestProof(account Account, publicPath, activation string) PresentationPreparationProof {
 	return PresentationPreparationProof{
 		CatalogTenantID: "account-" + account.InstanceID, CatalogGeneration: account.Generation,

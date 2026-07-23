@@ -87,10 +87,10 @@ func (r *hostSyncWorkerRemover) PrepareReservedAccount(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
 	label string,
-) (string, error) {
+) (store.PresentationPreparationProof, error) {
 	coordinator, err := r.runtime(ctx)
 	if err != nil {
-		return "", err
+		return store.PresentationPreparationProof{}, err
 	}
 	account := store.Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
@@ -98,12 +98,42 @@ func (r *hostSyncWorkerRemover) PrepareReservedAccount(
 	}
 	proof, err := coordinator.prepare(ctx, account)
 	if err != nil {
-		return "", err
+		return store.PresentationPreparationProof{}, err
 	}
 	if err := coordinator.activatePrepared(ctx, account, proof, func() error { return nil }); err != nil {
-		return "", err
+		return store.PresentationPreparationProof{}, err
 	}
-	return tenantfs.FileProviderPublicPath(proof)
+	storedProof, err := projectPreparationProof(proof)
+	if err != nil {
+		return store.PresentationPreparationProof{}, err
+	}
+	if err := validateReservedPreparationProof(reservation, storedProof); err != nil {
+		return store.PresentationPreparationProof{}, err
+	}
+	return storedProof, nil
+}
+
+func (r *hostSyncWorkerRemover) RefreshPreparedAccount(
+	ctx context.Context,
+	account store.Account,
+	retained store.PresentationPreparationProof,
+) (store.PresentationPreparationProof, error) {
+	coordinator, err := r.runtime(ctx)
+	if err != nil {
+		return store.PresentationPreparationProof{}, err
+	}
+	freshCatalogProof, err := coordinator.prepare(ctx, account)
+	if err != nil {
+		return store.PresentationPreparationProof{}, err
+	}
+	fresh, err := projectPreparationProof(freshCatalogProof)
+	if err != nil {
+		return store.PresentationPreparationProof{}, err
+	}
+	if err := store.ValidatePresentationPreparationProofAdvance(retained, fresh); err != nil {
+		return store.PresentationPreparationProof{}, err
+	}
+	return fresh, nil
 }
 
 func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator, error) {
@@ -252,7 +282,8 @@ func newHostSyncWorkerRuntime(
 				}
 				return service.Materialize(ctx, value, peers, noLocal, manifestPath)
 			},
-			Pull: pull,
+			Admit: service.AdmitSyncedAccount,
+			Pull:  pull,
 		})
 	}
 	enabled := func() (bool, error) {

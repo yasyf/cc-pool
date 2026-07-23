@@ -66,11 +66,11 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		}
 		return MaterializeResult{}, cause
 	}
-	publicPath, err := s.Preparer.PrepareReservedAccount(ctx, reservation, v.Label)
+	presentation, err := s.Preparer.PrepareReservedAccount(ctx, reservation, v.Label)
 	if err != nil {
 		return releaseReservation(fmt.Errorf("materialize %s: prepare presentation: %w", v.UUID, err))
 	}
-	p, err := s.M.PrepareReservedAdd(ctx, reservation, publicPath)
+	p, err := s.M.PrepareReservedSyncedAdd(ctx, reservation, presentation)
 	if err != nil {
 		return releaseReservation(fmt.Errorf("materialize %s: prepare add: %w", v.UUID, err))
 	}
@@ -151,6 +151,15 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	if err := rejectExistingExternalUUID(ctx, s.M, v.UUID); err != nil {
 		return abandon(err)
 	}
+	prospective := store.Account{
+		ID: p.Reservation.ID, InstanceID: p.Reservation.InstanceID,
+		Generation: p.Reservation.Generation, ConfigDir: p.ConfigDir,
+	}
+	freshProof, err := s.Preparer.RefreshPreparedAccount(ctx, prospective, p.PresentationProof)
+	if err != nil {
+		return abandon(fmt.Errorf("materialize %s: revalidate presentation before promotion: %w", v.UUID, err))
+	}
+	p.PresentationProof = freshProof
 	acct, err := s.M.PromoteSyncedAdd(ctx, p, v.Label, v.UUID)
 	if err != nil {
 		return abandon(fmt.Errorf("materialize %s: publish awaiting-origin row: %w", v.UUID, err))
@@ -163,25 +172,56 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	if !installed {
 		return durable, fmt.Errorf("materialize %s: access-only credential did not land", v.UUID)
 	}
-	credential, _, err := s.M.ReadCredential(ctx, *acct)
-	if err != nil {
-		return durable, fmt.Errorf("materialize %s: read installed credential: %w", v.UUID, err)
-	}
-	if credential.HasRefreshToken() || !credential.Synced() ||
-		creds.AccessHash(credential) != creds.AccessHash(env) {
-		return durable, fmt.Errorf("materialize %s: installed credential violates origin policy", v.UUID)
-	}
-	if _, _, _, err := s.M.SampleUsage(ctx, *acct, pool.SampleOpts{AllowRefresh: false}); err != nil {
-		return durable, fmt.Errorf("materialize %s: validate access-only credential: %w", v.UUID, err)
-	}
-	if _, err := s.M.Store.ClearNeedsLogin(acct.ID); err != nil {
-		return durable, fmt.Errorf("materialize %s: activate validated credential: %w", v.UUID, err)
+	if _, err := s.AdmitSyncedAccount(ctx, *acct, creds.AccessHash(env)); err != nil {
+		return durable, fmt.Errorf("materialize %s: admit synced account: %w", v.UUID, err)
 	}
 
 	// The new stamp dir is not watched yet; the nudge re-reads the manifest.
 	s.NudgeSynckitd(ctx, manifestPath)
 
 	return durable, nil
+}
+
+// AdmitSyncedAccount verifies credential and presentation freshness before
+// atomically refreshing proof and clearing awaiting-origin admission state.
+func (s *Service) AdmitSyncedAccount(
+	ctx context.Context,
+	account store.Account,
+	expectedAccessHash string,
+) (bool, error) {
+	health, err := s.M.Store.GetAuthHealth(account.ID)
+	if err != nil {
+		return false, err
+	}
+	if !health.NeedsLogin {
+		return false, nil
+	}
+	if health.Kind != store.AuthKindAwaitingOrigin {
+		return false, errors.New("hostsync: account is not awaiting its origin credential")
+	}
+	presentation, err := s.M.Store.AccountPresentation(account.ID)
+	if err != nil {
+		return false, fmt.Errorf("read presentation proof: %w", err)
+	}
+	if s.Preparer == nil {
+		return false, errors.New("hostsync: account preparer is required")
+	}
+	freshProof, err := s.Preparer.RefreshPreparedAccount(ctx, account, presentation.Proof)
+	if err != nil {
+		return false, fmt.Errorf("revalidate presentation before admission: %w", err)
+	}
+	credential, _, err := s.M.ReadCredential(ctx, account)
+	if err != nil {
+		return false, fmt.Errorf("read installed credential: %w", err)
+	}
+	if credential.HasRefreshToken() || !credential.Synced() ||
+		(expectedAccessHash != "" && creds.AccessHash(credential) != expectedAccessHash) {
+		return false, errors.New("installed credential violates origin policy")
+	}
+	if _, _, _, err := s.M.SampleUsage(ctx, account, pool.SampleOpts{AllowRefresh: false}); err != nil {
+		return false, fmt.Errorf("validate access-only credential: %w", err)
+	}
+	return s.M.Store.AdmitSyncedAccount(account, presentation.Proof, freshProof)
 }
 
 func validateMaterializeIdentity(value AccountValue) error {
