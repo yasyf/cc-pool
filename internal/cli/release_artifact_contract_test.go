@@ -81,8 +81,9 @@ func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
 		"dist/SHA256SUMS.txt",
 		`"dist/staged-app/$APP_ASSET"`,
 		`"dist/staged-app/$APP_ASSET.sha256"`,
-		`actual="$(jq -r '.assets[].name' <<< "$release" | LC_ALL=C sort)"`,
+		`actual="$(jq -r '.[][] | .name' <<< "$assets" | LC_ALL=C sort)"`,
 		`release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"`,
+		`repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100`,
 		`https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}`,
 		`if: ${{ steps.draft.outputs.already_public != 'true' }}`,
 		`already_public=$already_public`,
@@ -105,8 +106,11 @@ func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
 	if got := strings.Count(job, "if: ${{ steps.draft.outputs.already_public != 'true' }}"); got != 2 {
 		t.Fatalf("draft-only mutations = %d, want upload and publish", got)
 	}
-	if got := strings.Count(job, "gh api --paginate --slurp"); got != 2 {
+	if got := strings.Count(job, `repos/${GITHUB_REPOSITORY}/releases?per_page=100`); got != 2 {
 		t.Fatalf("stable-order checks = %d, want initial and final", got)
+	}
+	if got := strings.Count(release, `/assets?per_page=100`); got != 3 {
+		t.Fatalf("paginated release-ID asset listings = %d, want draft reset, validation, and tap", got)
 	}
 	if !strings.Contains(release, "permissions:\n  contents: read") {
 		t.Fatal("release workflow does not default non-owner jobs to read-only contents")
@@ -140,10 +144,12 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 	for _, required := range []string{
 		"needs: [release, release-app]",
 		"needs.release.outputs.pure_sha256",
+		"needs.release.outputs.release_id",
 		"needs.release-app.outputs.asset_filename",
 		"needs.release-app.outputs.asset_url",
 		"needs.release-app.outputs.sha256",
-		`gh release download "$GITHUB_REF_NAME"`,
+		`repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100`,
+		`https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}`,
 		`read -r sidecar_sha sidecar_path < "$APP_ASSET.sha256"`,
 		`[ "$sidecar_sha" = "$APP_SHA256" ]`,
 		`[ "$(basename "$sidecar_path")" = "$APP_ASSET" ]`,
@@ -164,6 +170,11 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 	}
 	if strings.Contains(publish, "spctl --assess --type execute --verbose=4 cli/cc-pool") {
 		t.Fatal("tap transaction assesses a raw Mach-O binary as an application bundle")
+	}
+	for _, forbidden := range []string{"gh release view", "gh release download", "releases/tags/"} {
+		if strings.Contains(release, forbidden) {
+			t.Fatalf("release uses tag-only draft or asset lookup %q", forbidden)
+		}
 	}
 	for _, line := range strings.Split(release, "\n") {
 		switch {

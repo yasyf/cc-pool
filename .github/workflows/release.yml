@@ -40,6 +40,7 @@ jobs:
       contents: write
     outputs:
       pure_sha256: ${{ steps.shas.outputs.pure }}
+      release_id: ${{ steps.draft.outputs.release_id }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -256,11 +257,13 @@ jobs:
           [ "$release_id" != null ] && [ -n "$release_id" ]
           if [ "$already_public" = false ]; then
             [ "$(jq -r '.draft' <<< "$release")" = true ]
+            assets="$(gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100")"
             while IFS= read -r asset_id; do
               [ -n "$asset_id" ] || continue
               gh api --method DELETE \
                 "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
-            done < <(jq -r '.assets[].id' <<< "$release")
+            done < <(jq -r '.[][] | .id' <<< "$assets")
           fi
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
           echo "already_public=$already_public" >> "$GITHUB_OUTPUT"
@@ -307,9 +310,11 @@ jobs:
             || { echo "::error::release publication state changed before validation"; exit 1; }
           [ "$(jq -r '.prerelease' <<< "$release")" = "$PRERELEASE" ] \
             || { echo "::error::release prerelease state changed before validation"; exit 1; }
+          assets="$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100")"
           expected="$(printf '%s\n' \
             "$CLI_ASSET" SHA256SUMS.txt "$APP_ASSET" "$APP_ASSET.sha256" | LC_ALL=C sort)"
-          actual="$(jq -r '.assets[].name' <<< "$release" | LC_ALL=C sort)"
+          actual="$(jq -r '.[][] | .name' <<< "$assets" | LC_ALL=C sort)"
           [ "$actual" = "$expected" ] \
             || { echo "::error::draft release asset set is not exact"; diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"); exit 1; }
 
@@ -322,7 +327,7 @@ jobs:
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
               --output "dist/draft-verify/$name"
-          done < <(jq -r '.assets[] | [.name, (.id | tostring)] | @tsv' <<< "$release")
+          done < <(jq -r '.[][] | [.name, (.id | tostring)] | @tsv' <<< "$assets")
           cmp "dist/$CLI_ASSET" "dist/draft-verify/$CLI_ASSET"
           cmp dist/SHA256SUMS.txt dist/draft-verify/SHA256SUMS.txt
           cmp "dist/staged-app/$APP_ASSET" "dist/draft-verify/$APP_ASSET"
@@ -442,6 +447,7 @@ jobs:
           CLI_ASSET: cc-pool-${{ github.ref_name }}-darwin-universal.tar.gz
           APP_ASSET: ${{ needs.release-app.outputs.asset_filename }}
           APP_ASSET_URL: ${{ needs.release-app.outputs.asset_url }}
+          RELEASE_ID: ${{ needs.release.outputs.release_id }}
         run: |
           set -euo pipefail
           expected_app="cc-pool-status-${GITHUB_REF_NAME}-darwin.zip"
@@ -450,11 +456,26 @@ jobs:
           expected_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${expected_app}"
           [ "$APP_ASSET_URL" = "$expected_url" ] \
             || { echo "::error::verified app URL does not name the exact release asset"; exit 1; }
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          [ "$(jq -r '.tag_name' <<< "$release")" = "$GITHUB_REF_NAME" ]
+          [ "$(jq -r '.draft' <<< "$release")" = false ]
+          [ "$(jq -r '.prerelease' <<< "$release")" = false ]
+          assets="$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100")"
+          expected="$(printf '%s\n' \
+            "$CLI_ASSET" SHA256SUMS.txt "$APP_ASSET" "$APP_ASSET.sha256" | LC_ALL=C sort)"
+          actual="$(jq -r '.[][] | .name' <<< "$assets" | LC_ALL=C sort)"
+          [ "$actual" = "$expected" ] \
+            || { echo "::error::published release asset set is not exact"; exit 1; }
           mkdir -p dist/released
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --dir dist/released --pattern "$CLI_ASSET"
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --dir dist/released --pattern "$APP_ASSET" --pattern "$APP_ASSET.sha256"
+          while IFS=$'\t' read -r name asset_id; do
+            curl --fail --silent --show-error --location \
+              -H "Accept: application/octet-stream" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              --output "dist/released/$name"
+          done < <(jq -r '.[][] | [.name, (.id | tostring)] | @tsv' <<< "$assets")
 
       - name: Verify the exact distributed CLI and application
         env:
@@ -465,6 +486,8 @@ jobs:
         run: |
           set -euo pipefail
           cd dist/released
+          [ "$(wc -l < SHA256SUMS.txt | tr -d ' ')" = 1 ]
+          shasum -a 256 -c SHA256SUMS.txt
           [ "$(shasum -a 256 "$CLI_ASSET" | awk '{print $1}')" = "$CLI_SHA256" ]
           read -r sidecar_sha sidecar_path < "$APP_ASSET.sha256"
           [ "$sidecar_sha" = "$APP_SHA256" ]
