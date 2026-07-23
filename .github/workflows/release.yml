@@ -113,7 +113,8 @@ jobs:
           requirement="$(codesign -d -r- dist/pure/cc-pool 2>&1)"
           grep -Fq 'identifier "com.yasyf.cc-pool"' <<< "$requirement"
           grep -Fq "subject.OU] = ${TEAM_ID}" <<< "$requirement"
-          dist/pure/cc-pool --version | grep -q "${VERSION}"
+          cli_version="$(dist/pure/cc-pool --version)"
+          grep -Fq "${VERSION}" <<< "$cli_version"
           CLI_ENTITLEMENTS="$(codesign -d --entitlements - dist/pure/cc-pool 2>&1 || true)"
           if grep -q "application-groups" <<<"$CLI_ENTITLEMENTS"; then
             echo "::error::cc-pool CLI binary still carries an app-group entitlement"
@@ -188,8 +189,10 @@ jobs:
           metadata="$(codesign -dvvv dist/verified/cli/cc-pool 2>&1)"
           grep -q '^Identifier=com.yasyf.cc-pool$' <<< "$metadata"
           grep -q '^TeamIdentifier=SXKCTF23Q2$' <<< "$metadata"
-          dist/verified/cli/cc-pool --version | grep -q "$GITHUB_REF_NAME"
-          dist/verified/cli/cc-pool --help | grep -q "emptiest account"
+          cli_version="$(dist/verified/cli/cc-pool --version)"
+          cli_help="$(dist/verified/cli/cc-pool --help)"
+          grep -Fq "$GITHUB_REF_NAME" <<< "$cli_version"
+          grep -Fq "emptiest account" <<< "$cli_help"
 
           ditto -x -k "$app_zip" dist/verified/app
           test -d dist/verified/app/CCPoolStatus.app

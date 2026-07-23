@@ -21,6 +21,10 @@ if grep -Eq '/releases/tags/|gh release (create|view|upload|download|edit)' "$wo
   echo "release publication must retain one exact numeric release ID" >&2
   exit 1
 fi
+if grep -Eq -- '--(help|version)[^|]*\|[[:space:]]*grep[[:space:]]+-[EF]*q' "$workflow"; then
+  echo "release assertions must capture complete command output before matching" >&2
+  exit 1
+fi
 
 for required in \
   'name: Stage and verify the complete draft release' \
