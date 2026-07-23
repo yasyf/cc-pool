@@ -83,7 +83,7 @@ jobs:
           mkdir -p dist/pure
 
           # The account daemon never touches the App Group; the fixed signed
-          # status app owns the FuseKit holder and broker.
+          # status app owns the FuseKit runtime and broker.
           CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/pure-arm64 ./cmd/cc-pool
           CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/pure-amd64 ./cmd/cc-pool
           lipo -create -output dist/pure/cc-pool dist/pure-arm64 dist/pure-amd64
@@ -276,6 +276,7 @@ jobs:
           template=.github/cask/cc-pool-status.rb.tmpl
           grep -Eq '^[[:space:]]*app[[:space:]]+' "$template"
           ! grep -Eq '^[[:space:]]*binary[[:space:]]+' "$template"
+          ! grep -Eiq 'xattr|com\.apple\.quarantine|--no-quarantine' "$template"
 
       - name: Render the formula into the atomic tap transaction
         uses: yasyf/homebrew-tap/.github/actions/render-formula@33755e73573a27eebbc5962cdf04b7b7e302c8f5
