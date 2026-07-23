@@ -267,7 +267,7 @@ func (s *Server) monitorHolderSession(ctx context.Context, done <-chan struct{})
 		s.log.Printf("FuseKit holder session lost without runtime shutdown ownership")
 		return
 	}
-	if err := s.runtimeShutdown(context.Background()); err != nil {
+	if err := s.runtimeShutdown(context.WithoutCancel(ctx)); err != nil {
 		s.log.Printf("shut down after FuseKit holder session loss: %v", err)
 	}
 }

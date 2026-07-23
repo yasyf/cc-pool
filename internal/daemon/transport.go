@@ -146,7 +146,7 @@ func (s *Server) daemonHealthObservation(ctx context.Context, request wire.Obser
 	if request.Op != wire.Op(OpHealth) || request.Tenant != "" {
 		return wire.ObservationResponse{}, errors.New("daemon health observation route is not exact")
 	}
-	var body DaemonHealthRequest
+	var body HealthRequest
 	if err := decodeStrict(request.Payload, &body); err != nil {
 		return wire.ObservationResponse{}, fmt.Errorf("decode daemon health observation: %w", err)
 	}
@@ -171,26 +171,26 @@ func (s *Server) daemonHealthObservation(ctx context.Context, request wire.Obser
 	return wire.ObservationResponse{Payload: payload}, nil
 }
 
-func daemonHealthSnapshot(health dkdaemon.Health) (DaemonHealthResponse, error) {
+func daemonHealthSnapshot(health dkdaemon.Health) (HealthResponse, error) {
 	state, err := daemonRuntimeStateFromDaemon(health.State)
 	if err != nil {
-		return DaemonHealthResponse{}, err
+		return HealthResponse{}, err
 	}
-	return DaemonHealthResponse{
+	return HealthResponse{
 		Schema: DaemonHealthSchema, RuntimeBuild: health.RuntimeBuild, RuntimeProtocol: health.RuntimeProtocol,
 		ProcessGeneration: health.ProcessGeneration, PID: health.PID, State: state,
 		Draining: health.Draining, Busy: health.Busy, Ready: health.Ready,
 	}, nil
 }
 
-func daemonRuntimeStateFromDaemon(state dkdaemon.State) (DaemonRuntimeState, error) {
+func daemonRuntimeStateFromDaemon(state dkdaemon.State) (RuntimeState, error) {
 	switch state {
 	case dkdaemon.StateHealthy:
-		return DaemonRuntimeStateHealthy, nil
+		return RuntimeStateHealthy, nil
 	case dkdaemon.StateDegraded:
-		return DaemonRuntimeStateDegraded, nil
+		return RuntimeStateDegraded, nil
 	case dkdaemon.StateFailed:
-		return DaemonRuntimeStateFailed, nil
+		return RuntimeStateFailed, nil
 	default:
 		return "", fmt.Errorf("daemon runtime state %q is not exact", state)
 	}

@@ -222,7 +222,7 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 	}
 }
 
-func startSelectionDaemon(ctx context.Context, cmd *cobra.Command, cl *daemon.Client) (*daemon.DaemonHealthResponse, error) {
+func startSelectionDaemon(ctx context.Context, cmd *cobra.Command, cl *daemon.Client) (*daemon.HealthResponse, error) {
 	want := version.String()
 	step(cmd.OutOrStdout(), "Starting the cc-pool daemon…")
 	if err := installSelectionDaemon(ctx, cmd); err != nil {
@@ -239,7 +239,7 @@ func startSelectionDaemon(ctx context.Context, cmd *cobra.Command, cl *daemon.Cl
 	defer cancel()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	var health *daemon.DaemonHealthResponse
+	var health *daemon.HealthResponse
 	var err error
 	for {
 		health, err = cl.HealthContext(waitCtx)

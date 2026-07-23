@@ -51,7 +51,7 @@ func TestMainDispatchesStopControlBeforeInheritedFDCleanup(t *testing.T) {
 	worker := strings.Index(source, "hostsync.IsWorkerInvocation")
 	closeFDs := strings.Index(source, "proc.CloseInheritedFDs")
 	cli := strings.Index(source, "cli.NewRootCmd")
-	if stop < 0 || worker < 0 || closeFDs < 0 || cli < 0 || !(stop < worker && stop < closeFDs && stop < cli) {
+	if stop < 0 || worker < 0 || closeFDs < 0 || cli < 0 || stop >= worker || stop >= closeFDs || stop >= cli {
 		t.Fatalf("main dispatch order stop=%d worker=%d close=%d cli=%d", stop, worker, closeFDs, cli)
 	}
 }

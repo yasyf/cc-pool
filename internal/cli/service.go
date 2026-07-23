@@ -31,9 +31,9 @@ var (
 	openDaemonServiceController = func(ctx context.Context) (daemonServiceController, error) {
 		return service.NewController(ctx, daemonServiceControllerConfig())
 	}
-	observeDaemonRuntime = func(ctx context.Context) (*daemon.DaemonHealthResponse, error) {
+	observeDaemonRuntime = func(ctx context.Context) (_ *daemon.HealthResponse, err error) {
 		client := daemon.NewClient()
-		defer client.Close()
+		defer func() { err = errors.Join(err, client.Close()) }()
 		return client.ObserveHealthContext(ctx)
 	}
 )
@@ -366,7 +366,7 @@ func stopObservedDaemonRuntime(
 		return fmt.Errorf("observe cc-pool daemon stop target: %w", err)
 	}
 	if intent == wire.StopIntentUpgrade && health.RuntimeBuild == version.String() &&
-		health.State == daemon.DaemonRuntimeStateHealthy && !health.Draining && !health.Busy && health.Ready {
+		health.State == daemon.RuntimeStateHealthy && !health.Draining && !health.Busy && health.Ready {
 		return nil
 	}
 	if intent == wire.StopIntentUpgrade && health.RuntimeBuild == version.String() {

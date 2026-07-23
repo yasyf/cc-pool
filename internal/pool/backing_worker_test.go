@@ -109,6 +109,7 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 	}()
 	var identity daemonproc.Identity
 	for identity.PID == 0 {
+		// #nosec G304 -- pidPath is test-owned beneath t.TempDir().
 		payload, readErr := os.ReadFile(pidPath)
 		if readErr == nil {
 			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(payload)))

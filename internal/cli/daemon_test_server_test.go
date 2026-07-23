@@ -100,14 +100,14 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 				if request.Op != wire.Op(ccdaemon.OpHealth) || request.Tenant != "" {
 					return wire.ObservationResponse{}, errors.New("daemon test health route is not exact")
 				}
-				var healthRequest ccdaemon.DaemonHealthRequest
+				var healthRequest ccdaemon.HealthRequest
 				if decodeErr := json.Unmarshal(request.Payload, &healthRequest); decodeErr != nil ||
 					healthRequest.Schema != ccdaemon.DaemonHealthSchema {
 					return wire.ObservationResponse{}, errors.New("daemon test health schema is not exact")
 				}
-				payload, encodeErr := json.Marshal(ccdaemon.DaemonHealthResponse{
+				payload, encodeErr := json.Marshal(ccdaemon.HealthResponse{
 					Schema: ccdaemon.DaemonHealthSchema, RuntimeBuild: build, RuntimeProtocol: int(wire.ProtocolVersion),
-					PID: os.Getpid(), ProcessGeneration: "test-generation", State: ccdaemon.DaemonRuntimeStateHealthy,
+					PID: os.Getpid(), ProcessGeneration: "test-generation", State: ccdaemon.RuntimeStateHealthy,
 					Ready: true,
 				})
 				return wire.ObservationResponse{Payload: payload}, encodeErr

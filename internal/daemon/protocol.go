@@ -165,34 +165,34 @@ type Request struct {
 	MutationReceipt *[32]byte               `json:"mutation_receipt,omitempty"`
 }
 
-// DaemonHealthRequest selects the exact v1 immutable daemon-health schema.
-type DaemonHealthRequest struct {
+// HealthRequest selects the exact v1 immutable daemon-health schema.
+type HealthRequest struct {
 	Schema uint16 `json:"schema"`
 }
 
-// DaemonHealthResponse is one exact daemon process-generation lifecycle snapshot.
-type DaemonHealthResponse struct {
-	Schema            uint16             `json:"schema"`
-	RuntimeBuild      string             `json:"runtime_build"`
-	RuntimeProtocol   int                `json:"runtime_protocol"`
-	ProcessGeneration string             `json:"process_generation"`
-	PID               int                `json:"pid"`
-	State             DaemonRuntimeState `json:"state"`
-	Draining          bool               `json:"draining"`
-	Busy              bool               `json:"busy"`
-	Ready             bool               `json:"ready"`
+// HealthResponse is one exact daemon process-generation lifecycle snapshot.
+type HealthResponse struct {
+	Schema            uint16       `json:"schema"`
+	RuntimeBuild      string       `json:"runtime_build"`
+	RuntimeProtocol   int          `json:"runtime_protocol"`
+	ProcessGeneration string       `json:"process_generation"`
+	PID               int          `json:"pid"`
+	State             RuntimeState `json:"state"`
+	Draining          bool         `json:"draining"`
+	Busy              bool         `json:"busy"`
+	Ready             bool         `json:"ready"`
 }
 
-// DaemonRuntimeState is the exact v1 daemon-health state enum.
-type DaemonRuntimeState string
+// RuntimeState is the exact v1 daemon-health state enum.
+type RuntimeState string
 
 const (
-	// DaemonRuntimeStateHealthy means the runtime is fully operational.
-	DaemonRuntimeStateHealthy DaemonRuntimeState = "healthy"
-	// DaemonRuntimeStateDegraded means the runtime remains available with reduced capability.
-	DaemonRuntimeStateDegraded DaemonRuntimeState = "degraded"
-	// DaemonRuntimeStateFailed means the runtime cannot safely serve work.
-	DaemonRuntimeStateFailed DaemonRuntimeState = "failed"
+	// RuntimeStateHealthy means the runtime is fully operational.
+	RuntimeStateHealthy RuntimeState = "healthy"
+	// RuntimeStateDegraded means the runtime remains available with reduced capability.
+	RuntimeStateDegraded RuntimeState = "degraded"
+	// RuntimeStateFailed means the runtime cannot safely serve work.
+	RuntimeStateFailed RuntimeState = "failed"
 )
 
 // CredentialMoveOutcome classifies one account's credential move result.

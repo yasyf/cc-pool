@@ -203,12 +203,12 @@ func (c *Client) StatusContext(ctx context.Context) (*Response, error) {
 }
 
 // Health probes daemon readiness over the ordinary business session.
-func (c *Client) Health() (*DaemonHealthResponse, error) {
+func (c *Client) Health() (*HealthResponse, error) {
 	return c.HealthContext(context.Background())
 }
 
 // HealthContext probes daemon readiness within ctx's remaining deadline.
-func (c *Client) HealthContext(ctx context.Context) (*DaemonHealthResponse, error) {
+func (c *Client) HealthContext(ctx context.Context) (*HealthResponse, error) {
 	response, err := c.ObserveHealthContext(ctx)
 	if err != nil {
 		return nil, err
@@ -220,13 +220,13 @@ func (c *Client) HealthContext(ctx context.Context) (*DaemonHealthResponse, erro
 }
 
 // ObserveHealthContext reads exact structural runtime identity without requiring readiness or the current release.
-func (c *Client) ObserveHealthContext(ctx context.Context) (*DaemonHealthResponse, error) {
+func (c *Client) ObserveHealthContext(ctx context.Context) (*HealthResponse, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 	}
-	payload, err := json.Marshal(DaemonHealthRequest{Schema: DaemonHealthSchema})
+	payload, err := json.Marshal(HealthRequest{Schema: DaemonHealthSchema})
 	if err != nil {
 		return nil, fmt.Errorf("encode daemon health request: %w", err)
 	}
@@ -237,7 +237,7 @@ func (c *Client) ObserveHealthContext(ctx context.Context) (*DaemonHealthRespons
 	if result.Response.Err != "" {
 		return nil, errors.New(result.Response.Err)
 	}
-	var response DaemonHealthResponse
+	var response HealthResponse
 	if err := decodeStrict(result.Response.Payload, &response); err != nil {
 		return nil, fmt.Errorf("decode daemon health response: %w", err)
 	}
@@ -247,7 +247,7 @@ func (c *Client) ObserveHealthContext(ctx context.Context) (*DaemonHealthRespons
 	return &response, nil
 }
 
-func validateDaemonHealthIdentity(response DaemonHealthResponse) error {
+func validateDaemonHealthIdentity(response HealthResponse) error {
 	if response.Schema != DaemonHealthSchema || response.RuntimeBuild == "" ||
 		response.RuntimeProtocol != int(wire.ProtocolVersion) || response.PID <= 1 || response.ProcessGeneration == "" ||
 		!validDaemonRuntimeState(response.State) {
@@ -259,23 +259,23 @@ func validateDaemonHealthIdentity(response DaemonHealthResponse) error {
 	return nil
 }
 
-func validDaemonRuntimeState(state DaemonRuntimeState) bool {
+func validDaemonRuntimeState(state RuntimeState) bool {
 	switch state {
-	case DaemonRuntimeStateHealthy, DaemonRuntimeStateDegraded, DaemonRuntimeStateFailed:
+	case RuntimeStateHealthy, RuntimeStateDegraded, RuntimeStateFailed:
 		return true
 	default:
 		return false
 	}
 }
 
-func validateDaemonHealth(response DaemonHealthResponse, expectedBuild string) error {
+func validateDaemonHealth(response HealthResponse, expectedBuild string) error {
 	if err := validateDaemonHealthIdentity(response); err != nil {
 		return err
 	}
 	if response.RuntimeBuild != expectedBuild {
 		return fmt.Errorf("daemon runtime build is not exact: build=%q want=%q", response.RuntimeBuild, expectedBuild)
 	}
-	if response.State != DaemonRuntimeStateHealthy || response.Draining || response.Busy || !response.Ready {
+	if response.State != RuntimeStateHealthy || response.Draining || response.Busy || !response.Ready {
 		return fmt.Errorf(
 			"daemon runtime is not ready: state=%q draining=%t busy=%t ready=%t process=%q",
 			response.State, response.Draining, response.Busy, response.Ready,

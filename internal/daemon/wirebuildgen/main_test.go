@@ -25,8 +25,8 @@ const OpStatus Op = "status"
 type Op string
 type Request struct { Op Op ` + "`json:\"-\"`" + `; Account int ` + "`json:\"account\"`" + ` }
 type Response struct{}
-type DaemonHealthRequest struct{}
-type DaemonHealthResponse struct{}
+type HealthRequest struct{}
+type HealthResponse struct{}
 type Snapshot struct { Value string }
 `
 	identityOnly := `package daemon
@@ -37,8 +37,8 @@ const OpStatus Op = "status"
 type Op string
 type Request struct { Op Op ` + "`json:\"-\"`" + `; Account int ` + "`json:\"account\"`" + ` }
 type Response struct{}
-type DaemonHealthRequest struct{}
-type DaemonHealthResponse struct{}
+type HealthRequest struct{}
+type HealthResponse struct{}
 type Snapshot struct { Value int }
 `
 	changedShape := `package daemon
@@ -49,8 +49,8 @@ const OpStatus Op = "status"
 type Op string
 type Request struct { Op Op ` + "`json:\"-\"`" + `; Account int ` + "`json:\"account_id\"`" + ` }
 type Response struct{}
-type DaemonHealthRequest struct{}
-type DaemonHealthResponse struct{}
+type HealthRequest struct{}
+type HealthResponse struct{}
 type Snapshot struct { Value int }
 `
 	canonical := func(source string) []byte {
@@ -85,8 +85,8 @@ const ModeReady Mode = "ready"
 type Nested struct { Value string ` + "`json:\"value\"`" + ` }
 type Request struct { Nested Nested ` + "`json:\"nested\"`" + `; Mode Mode ` + "`json:\"mode\"`" + ` }
 type Response struct{}
-type DaemonHealthRequest struct{}
-type DaemonHealthResponse struct{}
+type HealthRequest struct{}
+type HealthResponse struct{}
 `
 	nestedShapeChanged := `package daemon
 type Mode string
@@ -94,8 +94,8 @@ const ModeReady Mode = "ready"
 type Nested struct { Value int ` + "`json:\"value\"`" + ` }
 type Request struct { Nested Nested ` + "`json:\"nested\"`" + `; Mode Mode ` + "`json:\"mode\"`" + ` }
 type Response struct{}
-type DaemonHealthRequest struct{}
-type DaemonHealthResponse struct{}
+type HealthRequest struct{}
+type HealthResponse struct{}
 `
 	enumValueChanged := `package daemon
 type Mode string
@@ -103,8 +103,8 @@ const ModeReady Mode = "prepared"
 type Nested struct { Value string ` + "`json:\"value\"`" + ` }
 type Request struct { Nested Nested ` + "`json:\"nested\"`" + `; Mode Mode ` + "`json:\"mode\"`" + ` }
 type Response struct{}
-type DaemonHealthRequest struct{}
-type DaemonHealthResponse struct{}
+type HealthRequest struct{}
+type HealthResponse struct{}
 `
 	canonical := func(source string) []byte {
 		t.Helper()

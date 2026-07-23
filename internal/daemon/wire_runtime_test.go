@@ -41,7 +41,7 @@ func testHealthObservation(build string, called func()) wire.ObservationRoute {
 			if request.Op != wire.Op(OpHealth) || request.Tenant != "" {
 				return wire.ObservationResponse{}, errors.New("test health observation route is not exact")
 			}
-			var input DaemonHealthRequest
+			var input HealthRequest
 			if err := decodeStrict(request.Payload, &input); err != nil || input.Schema != DaemonHealthSchema {
 				return wire.ObservationResponse{}, errors.New("test health observation schema is not exact")
 			}
@@ -54,10 +54,10 @@ func testHealthObservation(build string, called func()) wire.ObservationRoute {
 	}
 }
 
-func healthyDaemonHealth(build string) DaemonHealthResponse {
-	return DaemonHealthResponse{
+func healthyDaemonHealth(build string) HealthResponse {
+	return HealthResponse{
 		Schema: DaemonHealthSchema, RuntimeBuild: build, RuntimeProtocol: int(wire.ProtocolVersion),
-		PID: os.Getpid(), ProcessGeneration: "test-generation", State: DaemonRuntimeStateHealthy,
+		PID: os.Getpid(), ProcessGeneration: "test-generation", State: RuntimeStateHealthy,
 		Ready: true,
 	}
 }

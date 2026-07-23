@@ -1,3 +1,4 @@
+// Package main generates cc-pool's exact daemon wire identity.
 package main
 
 import (
@@ -50,7 +51,7 @@ const WireBuild = %q
 		}
 		return
 	}
-	if err := os.WriteFile(*output, generated, 0o644); err != nil {
+	if err := os.WriteFile(*output, generated, 0o600); err != nil {
 		panic(err)
 	}
 }
@@ -73,7 +74,7 @@ func canonicalSchema(path string) ([]byte, error) {
 		}
 	}
 	reachable := make(map[string]bool)
-	queue := []string{"Request", "Response", "DaemonHealthRequest", "DaemonHealthResponse"}
+	queue := []string{"Request", "Response", "HealthRequest", "HealthResponse"}
 	for len(queue) > 0 {
 		name := queue[0]
 		queue = queue[1:]

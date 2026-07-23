@@ -120,7 +120,7 @@ func useDaemonServiceController(t *testing.T, controller daemonServiceController
 	swapVar(t, &openDaemonServiceController, func(context.Context) (daemonServiceController, error) {
 		return controller, nil
 	})
-	swapVar(t, &observeDaemonRuntime, func(context.Context) (*daemon.DaemonHealthResponse, error) {
+	swapVar(t, &observeDaemonRuntime, func(context.Context) (*daemon.HealthResponse, error) {
 		return nil, daemon.ErrDaemonUnavailable
 	})
 }

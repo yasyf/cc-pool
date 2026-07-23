@@ -64,7 +64,7 @@ func TestSignedHolderDispatchesStopControlBeforeOtherChildWork(t *testing.T) {
 	stop := strings.Index(source, "holder.RunStopControlChild")
 	drivers := strings.Index(source, "drivers, err := claudeDriverFactories()")
 	child := strings.Index(source, "holder.RunChild")
-	if stop < 0 || drivers < 0 || child < 0 || !(stop < drivers && drivers < child) {
+	if stop < 0 || drivers < 0 || child < 0 || stop >= drivers || drivers >= child {
 		t.Fatalf("signed child dispatch order stop=%d drivers=%d child=%d", stop, drivers, child)
 	}
 }
@@ -86,7 +86,7 @@ func TestSignedAppDispatchesStopControlBeforeBrokerInitialization(t *testing.T) 
 	stop := strings.Index(source, "CCPoolFuseKitDispatchChild()")
 	broker := strings.Index(source, "CatalogBroker.runChildIfRequested")
 	start := strings.Index(source, "CCPoolFuseKitStart()")
-	if stop < 0 || broker < 0 || start < 0 || !(stop < broker && broker < start) {
+	if stop < 0 || broker < 0 || start < 0 || stop >= broker || broker >= start {
 		t.Fatalf("signed app dispatch order stop=%d broker=%d start=%d", stop, broker, start)
 	}
 }

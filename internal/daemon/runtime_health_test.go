@@ -45,11 +45,11 @@ func TestDaemonHealthObservationRequiresPublishedHealthyRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var response DaemonHealthResponse
+	var response HealthResponse
 	if err := json.Unmarshal(result.Payload, &response); err != nil {
 		t.Fatal(err)
 	}
-	if response.Ready || response.State != DaemonRuntimeStateHealthy || !response.Busy {
+	if response.Ready || response.State != RuntimeStateHealthy || !response.Busy {
 		t.Fatalf("unpublished health = %+v", response)
 	}
 	health.Busy = false
@@ -58,7 +58,7 @@ func TestDaemonHealthObservationRequiresPublishedHealthyRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response = DaemonHealthResponse{}
+	response = HealthResponse{}
 	if err := json.Unmarshal(result.Payload, &response); err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestDaemonHealthObservationRequiresPublishedHealthyRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response = DaemonHealthResponse{}
+	response = HealthResponse{}
 	if err := json.Unmarshal(result.Payload, &response); err != nil {
 		t.Fatal(err)
 	}
