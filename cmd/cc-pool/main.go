@@ -11,7 +11,6 @@ import (
 	"syscall"
 
 	"github.com/yasyf/cc-pool/internal/cli"
-	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"

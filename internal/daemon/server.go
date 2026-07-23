@@ -223,14 +223,18 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	s.accountMutationTerminal = daemonkitAccountMutationTerminalRunner{workers: workers, manager: m}
 	s.accountMutationLifetime = activation.Lifetime
 	s.scanSessions = m.ScanSessions
-	if err := s.recoverRetiredAccountMutations(activation.Startup); err != nil {
-		s.clearActivation()
-		return fmt.Errorf("recover account mutations: %w", err)
-	}
 	s.tenantCoordinator = newTenantCoordinator(activation.Lifetime, s, preparer, tenantClient)
 	if err := s.tenantCoordinator.initialize(activation.Startup); err != nil {
 		s.clearActivation()
 		return fmt.Errorf("initialize FuseKit tenants: %w", err)
+	}
+	if err := s.recoverRetiredAccountMutations(activation.Startup); err != nil {
+		s.clearActivation()
+		return fmt.Errorf("recover account mutations: %w", err)
+	}
+	if err := s.recoverPendingAccountMutationPublications(activation.Startup); err != nil {
+		s.clearActivation()
+		return fmt.Errorf("recover account mutation publications: %w", err)
 	}
 	s.holderActive.Store(true)
 	monitorCtx, monitorCancel := context.WithCancel(activation.Lifetime)
@@ -239,6 +243,11 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	s.holderMonitorMu.Unlock()
 	s.wg.Add(1)
 	go s.monitorHolderSession(monitorCtx, s.holderSessionDone)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.monitorPendingAccountMutationPublications(monitorCtx)
+	}()
 	published = true
 	return nil
 }

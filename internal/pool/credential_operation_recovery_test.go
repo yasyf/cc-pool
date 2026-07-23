@@ -140,7 +140,7 @@ func TestCredentialOperationTwoManagersJoinAndReplayImmutableReceipt(t *testing.
 	var executions atomic.Int32
 	go func() {
 		result, err := runCredentialOperation(
-			context.Background(), first, account, store.CredentialOperationAdoptRotated,
+			context.Background(), first, account, store.CredentialOperationCompensate,
 			unitCredentialOperationCodec(
 				store.CredentialTargetKeychain,
 			),
@@ -165,7 +165,7 @@ func TestCredentialOperationTwoManagersJoinAndReplayImmutableReceipt(t *testing.
 	}
 	go func() {
 		result, err := runCredentialOperation(
-			context.Background(), second, account, store.CredentialOperationAdoptRotated,
+			context.Background(), second, account, store.CredentialOperationCompensate,
 			unitCredentialOperationCodec(
 				store.CredentialTargetKeychain,
 			),
@@ -231,6 +231,8 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 	first := credentialRecoveryManager(t, st, credentials, "lost-response-first")
 	second := credentialRecoveryManager(t, st, credentials, "lost-response-second")
 	var executions atomic.Int32
+	adopted := datedCred("adopted-after-boundary", time.Hour)
+	credentials.Put(account.KeychainService, account.KeychainAccount, adopted)
 	kind := store.CredentialOperationAdoptRotated
 	target := store.CredentialTargetKeychain
 	intent := credentialIntentDigest(kind, "same-request")
@@ -247,16 +249,19 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	codec := unitCredentialOperationCodec(target)
+	codec := adoptRotatedCredentialOperationCodec(target)
 	apply := func(ctx context.Context, boundary *credentialOperationBoundary) (struct{}, error) {
 		executions.Add(1)
+		if err := boundary.recordCredentialWrite(adopted); err != nil {
+			return struct{}{}, err
+		}
 		if err := boundary.Cross(ctx); err != nil {
 			return struct{}{}, err
 		}
 		credentials.Put(
 			account.KeychainService,
 			account.KeychainAccount,
-			datedCred("installed-after-boundary", time.Hour),
+			adopted,
 		)
 		return struct{}{}, nil
 	}
@@ -1467,7 +1472,7 @@ func TestCredentialOperationCancellationReleasesFlightAndLeavesReceipt(t *testin
 		t.Context(),
 		manager,
 		account,
-		store.CredentialOperationAdoptRotated,
+		store.CredentialOperationCompensate,
 		unitCredentialOperationCodec(
 			store.CredentialTargetKeychain,
 		),

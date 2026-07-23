@@ -66,9 +66,14 @@ func (r daemonkitAccountMutationTerminalRunner) Start(
 		return nil, errors.New("daemonkit terminal worker pool is unavailable")
 	}
 	args := []string{"auth", "login"}
-	if mutation.Kind == store.AccountMutationRelogin {
+	if mutation.Kind == store.AccountMutationRelogin ||
+		mutation.Kind == store.AccountMutationPresentationRebind {
+		identityConfigDir := mutation.ConfigDir
+		if mutation.Kind == store.AccountMutationPresentationRebind {
+			identityConfigDir = mutation.PreviousConfigDir
+		}
 		if identity, err := r.manager.AccountIdentity(
-			ctx, mutation.AccountID, mutation.ConfigDir,
+			ctx, mutation.AccountID, identityConfigDir,
 		); err == nil && identity.EmailAddress != "" {
 			args = append(args, "--email", identity.EmailAddress)
 		}

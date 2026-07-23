@@ -72,7 +72,7 @@ func TestReserveAccountIndexAllocation(t *testing.T) {
 	t.Run("release is idempotent and never frees a finalized account", func(t *testing.T) {
 		s := openReserveTest(t)
 		n := mustReserve(t, s)
-		if err := s.PromoteReservedAccount(n, Account{ID: n.ID, InstanceID: n.InstanceID, Generation: n.Generation, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"}); err != nil {
+		if err := s.promoteReservedAccount(n, Account{ID: n.ID, InstanceID: n.InstanceID, Generation: n.Generation, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"}, false, nil); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.ReleaseAccountIndex(n); err == nil {
@@ -216,7 +216,7 @@ func TestPromoteReservedAccount(t *testing.T) {
 		s := openReserveTest(t)
 		reservation := mustReserve(t, s)
 		acct := Account{ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation, ConfigDir: "dir", KeychainService: "svc", KeychainAccount: "u"}
-		if err := s.PromoteReservedAccount(reservation, acct); err != nil {
+		if err := s.promoteReservedAccount(reservation, acct, false, nil); err != nil {
 			t.Fatal(err)
 		}
 		if got, err := s.GetAccount(reservation.ID); err != nil {
@@ -235,7 +235,7 @@ func TestPromoteReservedAccount(t *testing.T) {
 		reservation := mustReserve(t, s)
 		reservation.Owner = credentialOperationTestOwner("different-owner")
 		acct := Account{ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation, ConfigDir: "dir", KeychainService: "svc", KeychainAccount: "u"}
-		if err := s.PromoteReservedAccount(reservation, acct); err == nil {
+		if err := s.promoteReservedAccount(reservation, acct, false, nil); err == nil {
 			t.Fatal("promote with a mismatched owner succeeded, want fail-loud")
 		}
 		if _, err := s.GetAccount(reservation.ID); !errors.Is(err, ErrAccountNotFound) {
@@ -390,7 +390,7 @@ func TestPromoteReservedAccountConcurrent(t *testing.T) {
 				KeychainService: fmt.Sprintf("svc-%d", reservation.ID),
 				KeychainAccount: "u",
 			}
-			if err := s.PromoteReservedAccount(reservation, acct); err != nil {
+			if err := s.promoteReservedAccount(reservation, acct, false, nil); err != nil {
 				errs <- err
 				return
 			}

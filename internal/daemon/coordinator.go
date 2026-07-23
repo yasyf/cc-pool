@@ -495,6 +495,28 @@ func (s *Server) prepareReservedAccountProof(
 	return storedProof, nil
 }
 
+func (s *Server) prepareAccountProof(
+	ctx context.Context,
+	account store.Account,
+) (store.PresentationPreparationProof, error) {
+	proof, err := s.prepareTenant(ctx, account)
+	if err != nil {
+		return store.PresentationPreparationProof{}, err
+	}
+	activate := func() error { return nil }
+	if s.activatePrepared != nil {
+		err = s.activatePrepared(ctx, account, proof, activate)
+	} else if s.tenantCoordinator != nil {
+		err = s.tenantCoordinator.activatePrepared(ctx, account, proof, activate)
+	} else {
+		err = errors.New("FuseKit tenant coordinator is unavailable")
+	}
+	if err != nil {
+		return store.PresentationPreparationProof{}, err
+	}
+	return projectPreparationProof(proof)
+}
+
 func (s *Server) revalidatePreparationProof(
 	ctx context.Context,
 	account store.Account,

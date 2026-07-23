@@ -821,7 +821,8 @@ func credentialPublicationPayload(
 func credentialResultPublishesWrite(result store.CredentialResultCategory) bool {
 	switch result {
 	case store.CredentialResultRefreshed,
-		store.CredentialResultInstalled:
+		store.CredentialResultInstalled,
+		store.CredentialResultAdopted:
 		return true
 	default:
 		return false
@@ -834,7 +835,8 @@ func credentialReceiptPublishesWrite(receipt store.CredentialOperationReceipt) b
 	}
 	switch receipt.Result {
 	case store.CredentialResultRefreshed,
-		store.CredentialResultInstalled:
+		store.CredentialResultInstalled,
+		store.CredentialResultAdopted:
 		return true
 	default:
 		return false
@@ -1121,6 +1123,34 @@ func unitCredentialOperationCodec(
 				return replayCredentialReceiptFailure[struct{}](receipt)
 			}
 			if receipt.Result != store.CredentialResultDone {
+				return struct{}{}, store.ErrCredentialOperationState
+			}
+			return struct{}{}, nil
+		},
+	}
+}
+
+func adoptRotatedCredentialOperationCodec(
+	target store.CredentialTarget,
+) credentialOperationCodec[struct{}] {
+	return credentialOperationCodec[struct{}]{
+		target: target,
+		resultCode: func(_ struct{}, err error) store.CredentialResultCategory {
+			if err != nil {
+				return store.CredentialResultFailed
+			}
+			return store.CredentialResultAdopted
+		},
+		replay: func(
+			_ context.Context,
+			_ *Manager,
+			_ store.Account,
+			receipt store.CredentialOperationReceipt,
+		) (struct{}, error) {
+			if receipt.TerminalStatus != store.CredentialTerminalSucceeded {
+				return replayCredentialReceiptFailure[struct{}](receipt)
+			}
+			if receipt.Result != store.CredentialResultAdopted {
 				return struct{}{}, store.ErrCredentialOperationState
 			}
 			return struct{}{}, nil

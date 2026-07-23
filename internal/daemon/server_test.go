@@ -423,7 +423,7 @@ func (fixedPreparationHealth) PrepareTenant(
 	return catalogproto.PrepareTenantResponse{}, errors.New("unexpected PrepareTenant call")
 }
 
-func TestStoredPreparationProofRevalidatesEveryFieldAgainstCurrentActivation(t *testing.T) {
+func TestStoredPreparationProofRevalidatesRuntimeBoundFieldsAgainstCurrentActivation(t *testing.T) {
 	account := store.Account{
 		ID: 7, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 4,
 	}
@@ -469,15 +469,11 @@ func TestStoredPreparationProofRevalidatesEveryFieldAgainstCurrentActivation(t *
 		"verified":            func(p *store.PresentationPreparationProof) { p.Verified++ },
 		"applied":             func(p *store.PresentationPreparationProof) { p.Applied++ },
 		"source authority":    func(p *store.PresentationPreparationProof) { p.SourceAuthority = "foreign" },
-		"source revision":     func(p *store.PresentationPreparationProof) { p.SourceRevision++ },
 		"catalog revision":    func(p *store.PresentationPreparationProof) { p.CatalogRevision++ },
-		"change id":           func(p *store.PresentationPreparationProof) { p.ChangeID += "-other" },
-		"operation id":        func(p *store.PresentationPreparationProof) { p.OperationID += "-other" },
 		"presentation kind":   func(p *store.PresentationPreparationProof) { p.PresentationKind = "mount" },
 		"presentation tenant": func(p *store.PresentationPreparationProof) { p.FileProvider.TenantID += "-other" },
 		"domain":              func(p *store.PresentationPreparationProof) { p.FileProvider.DomainID += "-other" },
 		"presentation gen":    func(p *store.PresentationPreparationProof) { p.FileProvider.Generation++ },
-		"public path":         func(p *store.PresentationPreparationProof) { p.FileProvider.PublicPath += "-other" },
 		"activation":          func(p *store.PresentationPreparationProof) { p.FileProvider.ActivationGeneration = "stale" },
 	}
 	for name, mutate := range tests {

@@ -138,6 +138,55 @@ func (s *Store) AccountPresentationQuarantine(accountID int) (AccountPresentatio
 	return accountPresentationQuarantine(s.db, accountID)
 }
 
+// RefreshAccountPresentation atomically advances one admitted binding while
+// its account identity and previously retained proof still match.
+func (s *Store) RefreshAccountPresentation(
+	account Account,
+	currentProof PresentationPreparationProof,
+	freshProof PresentationPreparationProof,
+) error {
+	if err := validatePresentationPreparationProofForAccount(
+		freshProof, account.InstanceID, account.Generation, account.ConfigDir,
+	); err != nil {
+		return err
+	}
+	if err := ValidatePresentationPreparationProofAdvance(currentProof, freshProof); err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, err := presentationAccount(tx, account.ID)
+	if err != nil {
+		return err
+	}
+	if !samePresentationAccount(current, account) {
+		return ErrAccountGenerationChanged
+	}
+	if _, err := accountPresentationQuarantine(tx, account.ID); err == nil {
+		return ErrAccountPresentationQuarantined
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	bound, err := accountPresentation(tx, account.ID)
+	if err != nil {
+		return err
+	}
+	if bound.AccountInstanceID != account.InstanceID ||
+		bound.AccountGeneration != account.Generation || bound.Proof != currentProof {
+		return ErrAccountPresentationEvidence
+	}
+	if err := upsertAccountPresentation(tx, AccountPresentation{
+		AccountID: account.ID, AccountInstanceID: account.InstanceID,
+		AccountGeneration: account.Generation, Proof: freshProof, ObservedAt: s.now(),
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // AdmitSyncedAccount atomically advances the complete presentation proof and
 // clears awaiting-origin state only while the account and old proof match.
 func (s *Store) AdmitSyncedAccount(

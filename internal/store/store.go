@@ -192,6 +192,7 @@ CREATE TABLE account_mutation_receipts (
 	previous_credential_digest BLOB NOT NULL CHECK(length(previous_credential_digest)=32),
   owner_record      BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch       INTEGER NOT NULL CHECK(owner_epoch > 0),
+	publication_pending INTEGER NOT NULL CHECK(publication_pending IN (0,1)),
   committed_at      INTEGER NOT NULL CHECK(committed_at > 0),
   acknowledged_at   INTEGER CHECK(acknowledged_at IS NULL OR acknowledged_at >= committed_at),
   expires_at        INTEGER NOT NULL CHECK(expires_at > committed_at),
@@ -218,6 +219,8 @@ CREATE TABLE account_mutation_receipts (
 	       previous_keychain_account='' AND previous_locator_digest=zeroblob(32) AND
 	       previous_credential_digest=zeroblob(32))),
 	CHECK((terminal='quarantined') = (quarantine_reason IS NOT NULL)),
+	CHECK(publication_pending=0 OR
+	      (terminal='committed' AND kind IN ('add','presentation-rebind'))),
 	CHECK((resolution IS NULL AND resolution_observed_digest IS NULL AND resolved_at IS NULL)
 	   OR (resolution IS NOT NULL AND resolution_observed_digest IS NOT NULL AND resolved_at IS NOT NULL AND resolved_at>=committed_at))
 );
@@ -301,7 +304,7 @@ CREATE TABLE credential_operations (
   outcome_keychain_state  TEXT CHECK(outcome_keychain_state IS NULL OR outcome_keychain_state IN ('empty','present','unsearchable','unreadable')),
   outcome_keychain_digest BLOB CHECK(outcome_keychain_digest IS NULL OR length(outcome_keychain_digest) = 32),
   terminal_status         TEXT CHECK(terminal_status IS NULL OR terminal_status IN ('succeeded','failed','quarantined')),
-  result_category         TEXT CHECK(result_category IS NULL OR result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','failed','ambiguous','diverged','cleanup-failed','changed-underfoot')),
+  result_category         TEXT CHECK(result_category IS NULL OR result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','adopted','skipped','failed','ambiguous','diverged','cleanup-failed','changed-underfoot')),
   failure_class           TEXT CHECK(failure_class IS NULL OR failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')),
   publication_payload     BLOB CHECK(publication_payload IS NULL OR (length(publication_payload) > 0 AND length(publication_payload) <= 4096)),
   created_at             INTEGER NOT NULL CHECK(created_at > 0),
@@ -315,7 +318,7 @@ CREATE TABLE credential_operations (
 	      (kind IN ('ensure-fresh','refresh-current') AND failure_class IN ('network','refresh-unauthorized','refresh-rejected','refresh-server'))),
 	CHECK(terminal_status IS NULL OR
 	      (terminal_status='succeeded' AND failure_class IS NULL AND
-	       result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped')) OR
+	       result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','adopted','skipped')) OR
 	      (terminal_status='failed' AND result_category='failed' AND failure_class IS NOT NULL AND
 	       failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')) OR
 	      (terminal_status='quarantined' AND failure_class IS NOT NULL AND
@@ -324,9 +327,9 @@ CREATE TABLE credential_operations (
   CHECK((expected_keychain_state='present') = (expected_keychain_digest IS NOT NULL)),
 	CHECK(outcome_keychain_state IS NULL OR ((outcome_keychain_state='present') = (outcome_keychain_digest IS NOT NULL))),
 	CHECK(publication_payload IS NULL OR state='applying' OR
-	      (state='applied' AND terminal_status='succeeded' AND result_category IN ('refreshed','installed'))),
+	      (state='applied' AND terminal_status='succeeded' AND result_category IN ('refreshed','installed','adopted'))),
 	CHECK(state!='applied' OR terminal_status!='succeeded' OR
-	      result_category NOT IN ('refreshed','installed') OR publication_payload IS NOT NULL)
+	      result_category NOT IN ('refreshed','installed','adopted') OR publication_payload IS NOT NULL)
 );
 CREATE TABLE credential_operation_receipts (
   operation_id         BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
@@ -343,7 +346,7 @@ CREATE TABLE credential_operation_receipts (
   owner_record         BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch          INTEGER NOT NULL CHECK(owner_epoch > 0),
   terminal_status      TEXT NOT NULL CHECK(terminal_status IN ('succeeded','failed','quarantined')),
-  result_category      TEXT NOT NULL CHECK(result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped','failed','ambiguous','diverged','cleanup-failed','changed-underfoot')),
+  result_category      TEXT NOT NULL CHECK(result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','adopted','skipped','failed','ambiguous','diverged','cleanup-failed','changed-underfoot')),
   failure_class        TEXT CHECK(failure_class IS NULL OR failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')),
   outcome_keychain_state  TEXT NOT NULL CHECK(outcome_keychain_state IN ('empty','present','unsearchable','unreadable')),
   outcome_keychain_digest BLOB CHECK(outcome_keychain_digest IS NULL OR length(outcome_keychain_digest) = 32),
@@ -354,7 +357,7 @@ CREATE TABLE credential_operation_receipts (
 	CHECK(failure_class IS NULL OR failure_class='internal' OR
 	      (kind IN ('ensure-fresh','refresh-current') AND failure_class IN ('network','refresh-unauthorized','refresh-rejected','refresh-server'))),
 	CHECK((terminal_status='succeeded' AND failure_class IS NULL AND
-	       result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','skipped')) OR
+	       result_category IN ('done','unchanged','refreshed','needs-login','no-tokens','installed','adopted','skipped')) OR
 	      (terminal_status='failed' AND result_category='failed' AND failure_class IS NOT NULL AND
 	       failure_class IN ('internal','network','refresh-unauthorized','refresh-rejected','refresh-server')) OR
 	      (terminal_status='quarantined' AND failure_class IS NOT NULL AND
@@ -363,7 +366,7 @@ CREATE TABLE credential_operation_receipts (
   CHECK((expected_keychain_state='present') = (expected_keychain_digest IS NOT NULL)),
 	CHECK((outcome_keychain_state='present') = (outcome_keychain_digest IS NOT NULL)),
 	CHECK((publication_payload IS NOT NULL) =
-	      (terminal_status='succeeded' AND result_category IN ('refreshed','installed')))
+	      (terminal_status='succeeded' AND result_category IN ('refreshed','installed','adopted')))
 );
 CREATE TABLE credential_quarantines (
 	account_id               INTEGER PRIMARY KEY CHECK(account_id > 0),
@@ -442,7 +445,7 @@ CREATE INDEX idx_credential_operations_owner ON credential_operations(owner_reco
 CREATE INDEX idx_credential_operation_receipts_expiry ON credential_operation_receipts(acknowledged_at,expires_at,token);
 CREATE UNIQUE INDEX idx_credential_write_receipts_pending ON credential_operation_receipts(account_id)
   WHERE acknowledged_at IS NULL AND terminal_status='succeeded'
-  AND result_category IN ('refreshed','installed','moved');
+  AND result_category IN ('refreshed','installed','adopted');
 CREATE UNIQUE INDEX idx_account_presentations_public_path ON account_presentations(public_path);
 `
 
@@ -790,12 +793,17 @@ func (s *Store) ListAccounts() ([]Account, error) {
 	return out, rows.Err()
 }
 
-// ListActiveAccounts returns accounts not fenced by a durable removal intent.
+// ListActiveAccounts returns accounts not fenced by durable removal,
+// presentation quarantine, or unsettled credential publication.
 func (s *Store) ListActiveAccounts() ([]Account, error) {
 	rows, err := s.db.Query(`SELECT ` + accountCols + ` FROM accounts
 		WHERE deleted_at IS NULL
 		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)
 		  AND NOT EXISTS (SELECT 1 FROM account_presentation_quarantines WHERE account_id=accounts.id)
+		  AND NOT EXISTS (
+		    SELECT 1 FROM account_mutation_receipts
+		    WHERE account_id=accounts.id AND publication_pending=1
+		  )
 		ORDER BY id`)
 	if err != nil {
 		return nil, err

@@ -73,6 +73,9 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 		!receipt.HasPresentationProof || receipt.PresentationProof != operation.PresentationProof {
 		t.Fatalf("receipt lost exact evidence: %+v", receipt)
 	}
+	if !receipt.PublicationPending {
+		t.Fatal("committed add was admitted before credential publication settled")
+	}
 	byScope, err := s.UnacknowledgedAccountMutationReceipt(AccountMutationAdd, 0)
 	if err != nil || !reflect.DeepEqual(byScope, receipt) {
 		t.Fatalf("add scope receipt = %+v err=%v", byScope, err)
@@ -85,6 +88,28 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 		account.ConfigDir != operation.ConfigDir || account.KeychainService != operation.KeychainService ||
 		account.KeychainAccount != operation.KeychainAccount {
 		t.Fatalf("published account = %+v", account)
+	}
+	presentation, err := s.AccountPresentation(account.ID)
+	if err != nil || presentation.AccountInstanceID != account.InstanceID ||
+		presentation.AccountGeneration != account.Generation ||
+		presentation.Proof != operation.PresentationProof {
+		t.Fatalf("published presentation = %+v err=%v", presentation, err)
+	}
+	if active, err := s.ListActiveAccounts(); err != nil || len(active) != 0 {
+		t.Fatalf("publication-pending active accounts = %+v err=%v", active, err)
+	}
+	if err := s.AcknowledgeAccountMutationReceipt(receipt.OperationID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("publication-pending receipt acknowledgement = %v", err)
+	}
+	if err := s.MarkAccountMutationPublicationSettled(receipt.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err = s.AccountMutationReceipt(receipt.OperationID)
+	if err != nil || receipt.PublicationPending {
+		t.Fatalf("settled publication receipt = %+v err=%v", receipt, err)
+	}
+	if active, err := s.ListActiveAccounts(); err != nil || len(active) != 1 || active[0].ID != account.ID {
+		t.Fatalf("settled active accounts = %+v err=%v", active, err)
 	}
 	replay, err := s.BeginAccountMutation(t.Context(), request)
 	if err != nil || replay.Receipt == nil || replay.Active != nil ||
@@ -880,6 +905,19 @@ func TestPresentationRebindJournalRetainsQuarantineUntilOldOwnerCleanup(t *testi
 	}
 	if _, err := s.AccountPresentationQuarantine(account.ID); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("committed rebind retained quarantine: %v", err)
+	}
+	if !receipt.PublicationPending {
+		t.Fatal("committed rebind cleared publication fence")
+	}
+	if selectable, err := s.ListActiveAccounts(); err != nil || len(selectable) != 0 {
+		t.Fatalf("publication-pending rebind became selectable: %+v err=%v", selectable, err)
+	}
+	if err := s.MarkAccountMutationPublicationSettled(receipt.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err = s.AccountMutationReceipt(receipt.OperationID)
+	if err != nil || receipt.PublicationPending {
+		t.Fatalf("settled rebind receipt = %+v err=%v", receipt, err)
 	}
 	if selectable, err := s.ListActiveAccounts(); err != nil || len(selectable) != 1 ||
 		selectable[0].Generation != account.Generation+1 {

@@ -162,6 +162,7 @@ type AccountMutationReceipt struct {
 	PreviousCredentialDigest CredentialDigest
 	Owner                    proc.Record
 	OwnerEpoch               uint64
+	PublicationPending       bool
 	CommittedAt              time.Time
 	AcknowledgedAt           time.Time
 	ExpiresAt                time.Time
@@ -569,7 +570,7 @@ func (s *Store) RefreshAccountMutationPresentation(
 		return AccountMutationFence{}, err
 	}
 	if !sameAccountMutationFence(mutation, fence) ||
-		mutation.Kind != AccountMutationPresentationRebind ||
+		(mutation.Kind != AccountMutationAdd && mutation.Kind != AccountMutationPresentationRebind) ||
 		mutation.State == AccountMutationAwaitingPresentation ||
 		mutation.State == AccountMutationCompensating {
 		return AccountMutationFence{}, ErrAccountMutationFence
@@ -579,18 +580,10 @@ func (s *Store) RefreshAccountMutationPresentation(
 	); err != nil {
 		return AccountMutationFence{}, err
 	}
-	if !sameRebindPresentationIdentity(mutation.PresentationProof, proof) ||
-		proof.Requested < mutation.PresentationProof.Requested ||
-		proof.SourceRevision < mutation.PresentationProof.SourceRevision ||
-		proof.CatalogRevision < mutation.PresentationProof.CatalogRevision {
-		return AccountMutationFence{}, ErrAccountPresentationEvidence
-	}
-	revisionAdvanced := proof.Requested > mutation.PresentationProof.Requested ||
-		proof.SourceRevision > mutation.PresentationProof.SourceRevision ||
-		proof.CatalogRevision > mutation.PresentationProof.CatalogRevision
-	if !revisionAdvanced && (proof.ChangeID != mutation.PresentationProof.ChangeID ||
-		proof.OperationID != mutation.PresentationProof.OperationID) {
-		return AccountMutationFence{}, ErrAccountPresentationEvidence
+	if err := ValidatePresentationPreparationProofAdvance(
+		mutation.PresentationProof, proof,
+	); err != nil {
+		return AccountMutationFence{}, err
 	}
 	result, err := tx.Exec(
 		`UPDATE account_mutations SET
@@ -601,7 +594,8 @@ func (s *Store) RefreshAccountMutationPresentation(
 		 proof_presentation_generation=?,proof_activation_generation=?,proof_public_path=?,
 		 owner_epoch=owner_epoch+1,updated_at=?
 		 WHERE operation_id=? AND owner_record=? AND owner_epoch=?
-		 AND kind='presentation-rebind' AND state<>'awaiting-presentation' AND state<>'compensating'`,
+		 AND kind IN ('add','presentation-rebind')
+		 AND state<>'awaiting-presentation' AND state<>'compensating'`,
 		proof.CatalogTenantID, proof.CatalogGeneration, proof.Requested, proof.Desired,
 		proof.Observed, proof.Verified, proof.Applied, proof.SourceAuthority,
 		proof.SourceRevision, proof.CatalogRevision, proof.ChangeID, proof.OperationID,
@@ -639,17 +633,6 @@ func (s *Store) RefreshAccountMutationPresentation(
 	}
 	fence.OwnerEpoch++
 	return fence, nil
-}
-
-func sameRebindPresentationIdentity(current, next PresentationPreparationProof) bool {
-	return current.CatalogTenantID == next.CatalogTenantID &&
-		current.CatalogGeneration == next.CatalogGeneration &&
-		current.SourceAuthority == next.SourceAuthority &&
-		current.PresentationKind == next.PresentationKind &&
-		current.FileProvider.TenantID == next.FileProvider.TenantID &&
-		current.FileProvider.DomainID == next.FileProvider.DomainID &&
-		current.FileProvider.Generation == next.FileProvider.Generation &&
-		current.FileProvider.PublicPath == next.FileProvider.PublicPath
 }
 
 func quarantineAllowsPresentationRebind(
@@ -1395,6 +1378,13 @@ func (s *Store) CommitAccountMutation(
 		); err != nil {
 			return AccountMutationReceipt{}, err
 		}
+		if err := upsertAccountPresentation(tx, AccountPresentation{
+			AccountID: mutation.AccountID, AccountInstanceID: mutation.AccountInstanceID,
+			AccountGeneration: mutation.AccountGeneration, Proof: mutation.PresentationProof,
+			ObservedAt: now,
+		}); err != nil {
+			return AccountMutationReceipt{}, err
+		}
 	} else {
 		if err := accountMutationSubjectMatches(tx, mutation); err != nil {
 			return AccountMutationReceipt{}, err
@@ -1717,6 +1707,31 @@ func (s *Store) UnacknowledgedAccountMutationReceipt(
 	))
 }
 
+// PendingAccountMutationPublications returns one bounded admission-fenced page.
+func (s *Store) PendingAccountMutationPublications(limit int) ([]AccountMutationReceipt, error) {
+	if limit <= 0 || limit > CredentialOperationPageLimit {
+		return nil, ErrAccountMutationState
+	}
+	rows, err := s.db.Query(
+		`SELECT `+accountMutationReceiptColumns+` FROM account_mutation_receipts
+		 WHERE publication_pending=1 ORDER BY committed_at,operation_id LIMIT ?`,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	receipts := make([]AccountMutationReceipt, 0, limit)
+	for rows.Next() {
+		receipt, err := scanAccountMutationReceipt(rows)
+		if err != nil {
+			return nil, err
+		}
+		receipts = append(receipts, receipt)
+	}
+	return receipts, rows.Err()
+}
+
 // AcknowledgeAccountMutationReceipt records delivery without deleting replay evidence.
 func (s *Store) AcknowledgeAccountMutationReceipt(operationID AccountMutationID) error {
 	if operationID == (AccountMutationID{}) {
@@ -1724,8 +1739,30 @@ func (s *Store) AcknowledgeAccountMutationReceipt(operationID AccountMutationID)
 	}
 	result, err := s.db.Exec(
 		`UPDATE account_mutation_receipts
-		 SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE operation_id=?`,
+		 SET acknowledged_at=COALESCE(acknowledged_at,?)
+		 WHERE operation_id=? AND publication_pending=0`,
 		s.now().UnixNano(), operationID[:],
+	)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// MarkAccountMutationPublicationSettled clears the admission fence after the
+// committed credential write-back and durable publication have settled.
+func (s *Store) MarkAccountMutationPublicationSettled(operationID AccountMutationID) error {
+	if operationID == (AccountMutationID{}) {
+		return ErrAccountMutationState
+	}
+	result, err := s.db.Exec(
+		`UPDATE account_mutation_receipts SET publication_pending=0
+		 WHERE operation_id=? AND terminal='committed'
+		 AND kind IN ('add','presentation-rebind')`,
+		operationID[:],
 	)
 	if err != nil {
 		return err
@@ -1984,7 +2021,7 @@ const accountMutationReceiptColumns = `operation_id,account_id,kind,registry_seq
  proof_tenant_id,proof_domain_id,proof_presentation_generation,proof_activation_generation,proof_public_path,
  previous_config_dir,previous_keychain_service,previous_keychain_account,
  previous_locator_digest,previous_credential_digest,
- committed_at,acknowledged_at,expires_at`
+ publication_pending,committed_at,acknowledged_at,expires_at`
 
 func accountMutationReceiptByID(
 	queryer accountMutationQueryer,
@@ -2001,7 +2038,7 @@ func scanAccountMutationReceipt(row interface{ Scan(...any) error }) (AccountMut
 	var operationID, locator, expected, intent, input, written, outcome, owner []byte
 	var previousLocator, previousCredential []byte
 	var resolutionObserved []byte
-	var credentialWritten int
+	var credentialWritten, publicationPending int
 	var committedAt, expiresAt int64
 	var acknowledgedAt, resolvedAt sql.NullInt64
 	var quarantineReason, resolution sql.NullString
@@ -2027,7 +2064,7 @@ func scanAccountMutationReceipt(row interface{ Scan(...any) error }) (AccountMut
 		&receipt.PresentationProof.FileProvider.PublicPath,
 		&receipt.PreviousConfigDir, &receipt.PreviousKeychainService,
 		&receipt.PreviousKeychainAccount, &previousLocator, &previousCredential,
-		&committedAt, &acknowledgedAt, &expiresAt,
+		&publicationPending, &committedAt, &acknowledgedAt, &expiresAt,
 	); err != nil {
 		return receipt, err
 	}
@@ -2072,6 +2109,7 @@ func scanAccountMutationReceipt(row interface{ Scan(...any) error }) (AccountMut
 		return receipt, err
 	}
 	receipt.CredentialWritten = credentialWritten != 0
+	receipt.PublicationPending = publicationPending != 0
 	receipt.HasPresentationProof = receipt.PresentationProof.PresentationKind != ""
 	receipt.CommittedAt = time.Unix(0, committedAt)
 	if acknowledgedAt.Valid {
@@ -2120,8 +2158,8 @@ func insertAccountMutationReceipt(
 		 proof_tenant_id,proof_domain_id,proof_presentation_generation,proof_activation_generation,proof_public_path,
 		 previous_config_dir,previous_keychain_service,previous_keychain_account,
 		 previous_locator_digest,previous_credential_digest,
-		 committed_at,acknowledged_at,expires_at
-		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)`,
+		 publication_pending,committed_at,acknowledged_at,expires_at
+		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)`,
 		mutation.OperationID[:], mutation.AccountID, mutation.Kind, mutation.RegistrySequence,
 		mutation.AccountInstanceID, mutation.AccountGeneration, mutation.LocatorDigest[:],
 		mutation.ExpectedCredentialDigest[:], mutation.IntentDigest[:], input, written, mutation.CredentialWritten,
@@ -2142,6 +2180,8 @@ func insertAccountMutationReceipt(
 		mutation.PresentationProof.FileProvider.PublicPath,
 		mutation.PreviousConfigDir, mutation.PreviousKeychainService, mutation.PreviousKeychainAccount,
 		mutation.PreviousLocatorDigest[:], mutation.PreviousCredentialDigest[:],
+		terminal == AccountMutationCommitted &&
+			(mutation.Kind == AccountMutationAdd || mutation.Kind == AccountMutationPresentationRebind),
 		committedAt.UnixNano(), expiresAt.UnixNano(),
 	)
 	return err
@@ -2290,6 +2330,12 @@ func validateAccountMutationReceipt(receipt AccountMutationReceipt) error {
 			return ErrAccountMutationState
 		}
 	} else if receipt.HasPresentationProof {
+		return ErrAccountMutationState
+	}
+	if receipt.PublicationPending &&
+		(receipt.Terminal != AccountMutationCommitted ||
+			(receipt.Kind != AccountMutationAdd && receipt.Kind != AccountMutationPresentationRebind) ||
+			!receipt.AcknowledgedAt.IsZero()) {
 		return ErrAccountMutationState
 	}
 	if (receipt.Terminal == AccountMutationQuarantined) != receipt.HasQuarantine ||

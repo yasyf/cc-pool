@@ -595,7 +595,7 @@ func TestCredentialOperationSemanticIntentFencesActiveAndReceiptReplay(t *testin
 			s.now = func() time.Time { return now }
 			account := credentialOperationTestAccount(t, s)
 			request := credentialOperationTestRequest(
-				t, account, CredentialOperationAdoptRotated, CredentialTargetKeychain,
+				t, account, CredentialOperationCompensate, CredentialTargetKeychain,
 				credentialOperationTestState("before", ""), "semantic-intent",
 				credentialOperationTestOwner("owner"),
 			)
@@ -798,7 +798,7 @@ func TestDeleteAccountRejectsActiveAndUnacknowledgedEvidence(t *testing.T) {
 	s.now = func() time.Time { return now }
 	account := credentialOperationTestAccount(t, s)
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationAdoptRotated, CredentialTargetKeychain,
+		t, account, CredentialOperationCompensate, CredentialTargetKeychain,
 		credentialOperationTestState("same", ""), "adopt", credentialOperationTestOwner("owner"))
 	begin, err := s.BeginCredentialOperation(request)
 	if err != nil {
@@ -1124,7 +1124,7 @@ func TestCredentialOperationOwnerPagingBoundary(t *testing.T) {
 	for id := 1; id <= CredentialOperationPageLimit+1; id++ {
 		account := credentialOperationTestAccountID(t, s, id)
 		request := credentialOperationTestRequest(
-			t, account, CredentialOperationAdoptRotated, CredentialTargetKeychain,
+			t, account, CredentialOperationCompensate, CredentialTargetKeychain,
 			credentialOperationTestState(fmt.Sprintf("credential-%d", id), ""),
 			fmt.Sprintf("drop-%d", id), owner)
 		if begin, err := s.BeginCredentialOperation(request); err != nil || !begin.Created {
@@ -1201,7 +1201,7 @@ func TestCredentialOperationReceiptGCIsBounded(t *testing.T) {
 	for id := 1; id <= CredentialOperationPageLimit+1; id++ {
 		account := credentialOperationTestAccountID(t, s, id)
 		request := credentialOperationTestRequest(
-			t, account, CredentialOperationAdoptRotated, CredentialTargetKeychain,
+			t, account, CredentialOperationCompensate, CredentialTargetKeychain,
 			credentialOperationTestState(fmt.Sprintf("credential-%d", id), ""),
 			fmt.Sprintf("adopt-%d", id), credentialOperationTestOwner("gc-owner"))
 		begin, err := s.BeginCredentialOperation(request)
@@ -1233,7 +1233,7 @@ func TestCredentialOperationReceiptGCIsBounded(t *testing.T) {
 	}
 	account := credentialOperationTestAccountID(t, s, CredentialOperationPageLimit+2)
 	request := credentialOperationTestRequest(
-		t, account, CredentialOperationAdoptRotated, CredentialTargetKeychain,
+		t, account, CredentialOperationCompensate, CredentialTargetKeychain,
 		credentialOperationTestState("unacknowledged", ""), "unacknowledged",
 		credentialOperationTestOwner("gc-owner"))
 	begin, err := s.BeginCredentialOperation(request)

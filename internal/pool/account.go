@@ -132,55 +132,6 @@ func (m *Manager) prepareReservedAdd(
 	}, nil
 }
 
-// FinalizeAdd verifies the logged-in identity and atomically promotes its reservation.
-func (m *Manager) FinalizeAdd(ctx context.Context, pending *PendingAdd, label string) (*store.Account, error) {
-	if pending == nil {
-		return nil, errors.New("finalize add: pending account is nil")
-	}
-	if _, err := m.AccountIdentity(
-		ctx, pending.Reservation.ID, pending.ConfigDir,
-	); err != nil {
-		if errors.Is(err, ErrNoIdentity) {
-			return nil, fmt.Errorf("login didn't complete for %s: %w", pending.ConfigDir, ErrNoIdentity)
-		}
-		return nil, fmt.Errorf("read account identity for %s: %w", pending.ConfigDir, err)
-	}
-	account := store.Account{
-		ID: pending.Reservation.ID, InstanceID: pending.Reservation.InstanceID,
-		Generation: pending.Reservation.Generation,
-		ConfigDir:  pending.ConfigDir, KeychainService: pending.KeychainService,
-		Label: label, CreatedAt: time.Now(),
-	}
-	keychainAccount, err := m.Creds.Discover(ctx, pending.KeychainService)
-	switch {
-	case err == nil:
-		account.KeychainAccount = keychainAccount
-	case errors.Is(err, creds.ErrNotFound):
-		return nil, fmt.Errorf("no Keychain credential found for %s", pending.ConfigDir)
-	default:
-		return nil, err
-	}
-	item := m.Creds.Store(account, creds.SourceKeychain)
-	credential, err := item.Read(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("re-assert keychain item: %w", err)
-	}
-	if err := item.Write(ctx, credential); err != nil {
-		return nil, fmt.Errorf("re-assert keychain item: %w", err)
-	}
-	if err := m.Store.PromoteReservedAccount(pending.Reservation, account); err != nil {
-		return nil, fmt.Errorf("finalize %s: %w", pending.ConfigDir, err)
-	}
-	committed, err := m.Store.GetAccount(account.ID)
-	if err != nil {
-		return nil, err
-	}
-	if _, _, _, err := m.SampleUsage(ctx, committed, SampleOpts{AllowRefresh: true}); err != nil {
-		return &committed, fmt.Errorf("account added but usage validation failed: %w", err)
-	}
-	return &committed, nil
-}
-
 // PromoteSyncedAdd publishes one proven-path non-origin account before its
 // access-only credential is installed.
 func (m *Manager) PromoteSyncedAdd(

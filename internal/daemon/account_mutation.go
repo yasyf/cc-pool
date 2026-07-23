@@ -24,6 +24,8 @@ const (
 	accountMutationReceiptTTL  = 24 * time.Hour
 	accountMutationProbeWait   = 5 * time.Second
 	accountMutationSettleWait  = 30 * time.Second
+	accountMutationRecoverWait = 100 * time.Millisecond
+	accountMutationRecoverMax  = 30 * time.Second
 )
 
 type accountMutationRun struct {
@@ -144,7 +146,7 @@ func (s *Server) runAccountMutation(
 	if request.Action == AccountMutationStartOrAttach {
 		active, receipt, err = s.startOrAttachAccountMutation(ctx, request)
 	} else {
-		active, receipt, err = s.exactAccountMutation(request)
+		active, receipt, err = s.exactAccountMutation(ctx, request)
 	}
 	if err != nil {
 		return AccountMutationResult{}, err
@@ -645,6 +647,9 @@ func (s *Server) finishOrQuarantineAccountMutation(
 	if current.Kind == store.AccountMutationAdd && current.State == store.AccountMutationCompensating {
 		return AccountMutationResult{}, errors.Join(finishErr, store.ErrAccountMutationRecoveryRequired)
 	}
+	if current.Kind == store.AccountMutationPresentationRebind {
+		return AccountMutationResult{}, errors.Join(finishErr, store.ErrAccountMutationRecoveryRequired)
+	}
 	state, err := s.m.CredentialExternalState(ctx, accountMutationAccount(current))
 	if err != nil {
 		return AccountMutationResult{}, errors.Join(finishErr, err)
@@ -656,9 +661,6 @@ func (s *Server) finishOrQuarantineAccountMutation(
 	receipt, err := s.m.Store.ResolveAccountMutation(
 		current.Fence(), store.AccountMutationQuarantined, observed,
 		&store.AccountMutationQuarantine{
-			FileLocatorDigest: store.CredentialFileLocatorDigest(
-				creds.FileCredentialPath(current.ConfigDir),
-			),
 			Observation: state,
 			Reason:      store.CredentialResultAmbiguous,
 		},
@@ -671,6 +673,7 @@ func (s *Server) finishOrQuarantineAccountMutation(
 }
 
 func (s *Server) exactAccountMutation(
+	ctx context.Context,
 	request AccountMutationRequest,
 ) (store.AccountMutation, *store.AccountMutationReceipt, error) {
 	operationID := store.AccountMutationID(request.Fence.CanonicalOperationID)
@@ -692,6 +695,13 @@ func (s *Server) exactAccountMutation(
 	if err := s.requireCurrentAccountMutationOwner(active); err != nil {
 		return store.AccountMutation{}, nil, err
 	}
+	if active.Kind == store.AccountMutationPresentationRebind &&
+		active.State != store.AccountMutationAwaitingPresentation {
+		active, err = s.refreshAccountMutationPresentation(ctx, active)
+		if err != nil {
+			return store.AccountMutation{}, nil, err
+		}
+	}
 	return active, nil, nil
 }
 
@@ -700,7 +710,7 @@ func (s *Server) startOrAttachAccountMutation(
 	request AccountMutationRequest,
 ) (store.AccountMutation, *store.AccountMutationReceipt, error) {
 	kind := store.AccountMutationKind(request.Kind)
-	if receipt, err := s.m.Store.UnacknowledgedAccountMutationReceipt(kind, request.AccountID); err == nil {
+	if receipt, err := s.unacknowledgedAccountMutationReceipt(request); err == nil {
 		if err := validateAccountMutationReceiptIntent(receipt, request); err != nil {
 			return store.AccountMutation{}, nil, err
 		}
@@ -727,6 +737,11 @@ func (s *Server) startOrAttachAccountMutation(
 			if err != nil {
 				return store.AccountMutation{}, nil, err
 			}
+		} else if active.Kind == store.AccountMutationPresentationRebind {
+			active, err = s.refreshAccountMutationPresentation(ctx, active)
+			if err != nil {
+				return store.AccountMutation{}, nil, err
+			}
 		}
 		return active, nil, nil
 	}
@@ -744,13 +759,30 @@ func (s *Server) startOrAttachAccountMutation(
 			_ = release()
 		}
 	}()
+	if kind == store.AccountMutationRelogin {
+		if _, quarantineErr := s.m.Store.AccountPresentationQuarantine(account.ID); quarantineErr == nil {
+			kind = store.AccountMutationPresentationRebind
+		} else if !errors.Is(quarantineErr, sql.ErrNoRows) {
+			return store.AccountMutation{}, nil, quarantineErr
+		}
+	}
 	intent := accountMutationIntentDigest(kind, account.ID, request.Label)
 	var operationID store.AccountMutationID
 	var locator, expected store.CredentialDigest
+	var previousLocator, previousCredential store.CredentialDigest
 	if kind == store.AccountMutationAdd {
 		operationID, err = store.NewPendingAddMutationID(
 			account.ID, account.InstanceID, account.Generation, intent,
 		)
+	} else if kind == store.AccountMutationPresentationRebind {
+		previousLocator, previousCredential, err =
+			s.m.AccountPresentationRebindSourceEvidence(ctx, account)
+		if err == nil {
+			operationID, err = store.NewPresentationRebindMutationID(
+				account.ID, account.InstanceID, account.Generation+1,
+				previousLocator, previousCredential, intent,
+			)
+		}
 	} else {
 		expectedState, stateErr := s.m.CredentialExternalState(ctx, account)
 		if stateErr != nil {
@@ -760,9 +792,8 @@ func (s *Server) startOrAttachAccountMutation(
 		if err != nil {
 			return store.AccountMutation{}, nil, err
 		}
-		locator = store.CredentialLocatorDigest(
+		locator = store.CredentialKeychainLocatorDigest(
 			account.KeychainService, account.KeychainAccount,
-			creds.FileCredentialPath(account.ConfigDir),
 		)
 		operationID, err = store.NewAccountMutationID(
 			account.ID, account.InstanceID, account.Generation, kind, locator, expected, intent,
@@ -775,14 +806,29 @@ func (s *Server) startOrAttachAccountMutation(
 	if err != nil {
 		return store.AccountMutation{}, nil, err
 	}
-	begin, err := s.m.Store.BeginAccountMutation(ctx, store.BeginAccountMutationRequest{
+	accountGeneration := account.Generation
+	if kind == store.AccountMutationPresentationRebind {
+		accountGeneration++
+	}
+	beginRequest := store.BeginAccountMutationRequest{
 		OperationID: operationID, AccountID: account.ID, Kind: kind,
-		AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
-		LocatorDigest: locator, ExpectedCredentialDigest: expected, IntentDigest: intent,
-		ConfigDir: account.ConfigDir, KeychainService: account.KeychainService,
-		KeychainAccount: account.KeychainAccount, Label: request.Label,
-		AccountUUID: account.AccountUUID, Owner: owner,
-	})
+		AccountInstanceID: account.InstanceID, AccountGeneration: accountGeneration,
+		IntentDigest: intent, Label: request.Label, AccountUUID: account.AccountUUID, Owner: owner,
+	}
+	if kind == store.AccountMutationPresentationRebind {
+		beginRequest.PreviousConfigDir = account.ConfigDir
+		beginRequest.PreviousKeychainService = account.KeychainService
+		beginRequest.PreviousKeychainAccount = account.KeychainAccount
+		beginRequest.PreviousLocatorDigest = previousLocator
+		beginRequest.PreviousCredentialDigest = previousCredential
+	} else if kind != store.AccountMutationAdd {
+		beginRequest.LocatorDigest = locator
+		beginRequest.ExpectedCredentialDigest = expected
+		beginRequest.ConfigDir = account.ConfigDir
+		beginRequest.KeychainService = account.KeychainService
+		beginRequest.KeychainAccount = account.KeychainAccount
+	}
+	begin, err := s.m.Store.BeginAccountMutation(ctx, beginRequest)
 	if err != nil {
 		return store.AccountMutation{}, nil, err
 	}
@@ -807,10 +853,11 @@ func (s *Server) bindAccountMutationPresentation(
 	ctx context.Context,
 	mutation store.AccountMutation,
 ) (store.AccountMutation, error) {
-	publicPath, err := s.prepareReservedAccountPath(ctx, accountMutationReservation(mutation))
+	proof, err := s.prepareReservedAccountProof(ctx, accountMutationReservation(mutation))
 	if err != nil {
 		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
 	}
+	publicPath := proof.FileProvider.PublicPath
 	account := store.Account{
 		ID: mutation.AccountID, InstanceID: mutation.AccountInstanceID,
 		Generation: mutation.AccountGeneration, ConfigDir: publicPath,
@@ -825,18 +872,52 @@ func (s *Server) bindAccountMutationPresentation(
 	if err != nil {
 		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
 	}
-	locator := store.CredentialLocatorDigest(
+	locator := store.CredentialKeychainLocatorDigest(
 		account.KeychainService, account.KeychainAccount,
-		creds.FileCredentialPath(publicPath),
 	)
 	fence, err := s.m.Store.BindAccountMutationPresentation(
-		mutation.Fence(), publicPath, account.KeychainService, account.KeychainAccount,
+		mutation.Fence(), proof, publicPath, account.KeychainService, account.KeychainAccount,
 		locator, expected,
 	)
 	if err != nil {
 		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
 	}
 	return s.m.Store.AccountMutation(fence.OperationID)
+}
+
+func (s *Server) refreshAccountMutationPresentation(
+	ctx context.Context,
+	mutation store.AccountMutation,
+) (store.AccountMutation, error) {
+	if (mutation.Kind != store.AccountMutationAdd &&
+		mutation.Kind != store.AccountMutationPresentationRebind) ||
+		mutation.State == store.AccountMutationAwaitingPresentation ||
+		mutation.State == store.AccountMutationCompensating {
+		return store.AccountMutation{}, store.ErrAccountMutationState
+	}
+	proof, err := s.prepareReservedAccountProof(ctx, accountMutationReservation(mutation))
+	if err != nil {
+		return store.AccountMutation{}, err
+	}
+	fence, err := s.m.Store.RefreshAccountMutationPresentation(mutation.Fence(), proof)
+	if err != nil {
+		return store.AccountMutation{}, err
+	}
+	return s.m.Store.AccountMutation(fence.OperationID)
+}
+
+func (s *Server) unacknowledgedAccountMutationReceipt(
+	request AccountMutationRequest,
+) (store.AccountMutationReceipt, error) {
+	receipt, err := s.m.Store.UnacknowledgedAccountMutationReceipt(
+		store.AccountMutationKind(request.Kind), request.AccountID,
+	)
+	if err == nil || !errors.Is(err, sql.ErrNoRows) || request.Kind != AccountMutationRelogin {
+		return receipt, err
+	}
+	return s.m.Store.UnacknowledgedAccountMutationReceipt(
+		store.AccountMutationPresentationRebind, request.AccountID,
+	)
 }
 
 func (s *Server) cancelUnboundAccountMutation(
@@ -869,7 +950,7 @@ func validateAccountMutationActiveIntent(
 	request AccountMutationRequest,
 ) error {
 	want := accountMutationIntentDigest(mutation.Kind, mutation.AccountID, request.Label)
-	if mutation.Kind != store.AccountMutationKind(request.Kind) || mutation.IntentDigest != want ||
+	if !accountMutationKindMatchesRequest(mutation.Kind, request.Kind) || mutation.IntentDigest != want ||
 		(request.Kind != AccountMutationAdd && mutation.AccountID != request.AccountID) {
 		return errors.New("active account mutation intent does not match request")
 	}
@@ -881,11 +962,19 @@ func validateAccountMutationReceiptIntent(
 	request AccountMutationRequest,
 ) error {
 	want := accountMutationIntentDigest(receipt.Kind, receipt.AccountID, request.Label)
-	if receipt.Kind != store.AccountMutationKind(request.Kind) || receipt.IntentDigest != want ||
+	if !accountMutationKindMatchesRequest(receipt.Kind, request.Kind) || receipt.IntentDigest != want ||
 		(request.Kind != AccountMutationAdd && receipt.AccountID != request.AccountID) {
 		return errors.New("unacknowledged account mutation intent does not match request")
 	}
 	return nil
+}
+
+func accountMutationKindMatchesRequest(
+	kind store.AccountMutationKind,
+	request AccountMutationKind,
+) bool {
+	return kind == store.AccountMutationKind(request) ||
+		(request == AccountMutationRelogin && kind == store.AccountMutationPresentationRebind)
 }
 
 func validateAccountMutationActiveRequest(
@@ -940,35 +1029,36 @@ func (s *Server) finishAccountMutation(
 ) (AccountMutationResult, error) {
 	if mutation.State == store.AccountMutationApplying {
 		account := accountMutationAccount(mutation)
-		state, err := s.m.CredentialExternalState(ctx, account)
-		if err != nil {
-			return AccountMutationResult{}, err
+		var written store.CredentialDigest
+		var err error
+		if mutation.Kind == store.AccountMutationPresentationRebind {
+			written, err = s.m.VerifyAccountPresentationRebindCredential(ctx, mutation)
+		} else {
+			var state store.CredentialExternalState
+			state, err = s.m.CredentialExternalState(ctx, account)
+			if err == nil {
+				written, err = state.Digest()
+			}
+			if err == nil && written == mutation.ExpectedCredentialDigest {
+				err = errors.New("login exited without changing the credential")
+			}
+			var credential *creds.Credential
+			if err == nil {
+				credential, _, err = s.m.ReadCredential(ctx, account)
+			}
+			if err == nil && (!credential.HasRefreshToken() || credential.Expired()) {
+				err = errors.New("login left no usable credential")
+			}
+			if err == nil && mutation.Kind == store.AccountMutationRelogin {
+				err = s.m.AdoptRotatedToken(ctx, account)
+			}
+			if err == nil {
+				state, err = s.m.CredentialExternalState(ctx, account)
+			}
+			if err == nil {
+				written, err = state.Digest()
+			}
 		}
-		written, err := state.Digest()
-		if err != nil {
-			return AccountMutationResult{}, err
-		}
-		if written == mutation.ExpectedCredentialDigest {
-			return AccountMutationResult{}, errors.New("login exited without changing the credential")
-		}
-		credential, _, err := s.m.ReadCredential(ctx, account)
-		if err != nil {
-			return AccountMutationResult{}, err
-		}
-		if !credential.HasRefreshToken() || credential.Expired() {
-			return AccountMutationResult{}, errors.New("login left no usable credential")
-		}
-		if err := s.m.AdoptRotatedToken(ctx, account); err != nil {
-			return AccountMutationResult{}, err
-		}
-		if err := s.m.DropDivergentCopy(ctx, account); err != nil {
-			return AccountMutationResult{}, err
-		}
-		state, err = s.m.CredentialExternalState(ctx, account)
-		if err != nil {
-			return AccountMutationResult{}, err
-		}
-		written, err = state.Digest()
 		if err != nil {
 			return AccountMutationResult{}, err
 		}
@@ -996,6 +1086,14 @@ func (s *Server) finishAccountMutation(
 		}
 	}
 	if mutation.State == store.AccountMutationApplied {
+		if mutation.Kind == store.AccountMutationAdd ||
+			mutation.Kind == store.AccountMutationPresentationRebind {
+			var err error
+			mutation, err = s.refreshAccountMutationPresentation(ctx, mutation)
+			if err != nil {
+				return AccountMutationResult{}, err
+			}
+		}
 		fence, err := s.m.Store.MarkAccountMutationPublishing(mutation.Fence())
 		if err != nil {
 			return AccountMutationResult{}, err
@@ -1004,6 +1102,44 @@ func (s *Server) finishAccountMutation(
 		if err != nil {
 			return AccountMutationResult{}, err
 		}
+	}
+	if (mutation.Kind == store.AccountMutationAdd ||
+		mutation.Kind == store.AccountMutationPresentationRebind) &&
+		mutation.State == store.AccountMutationPublishing {
+		var err error
+		mutation, err = s.refreshAccountMutationPresentation(ctx, mutation)
+		if err != nil {
+			return AccountMutationResult{}, err
+		}
+	}
+	if mutation.Kind == store.AccountMutationPresentationRebind &&
+		mutation.State == store.AccountMutationPublishing {
+		fence, _, err := s.m.Store.PublishAccountPresentationRebind(mutation.Fence())
+		if err != nil {
+			return AccountMutationResult{}, err
+		}
+		mutation, err = s.m.Store.AccountMutation(fence.OperationID)
+		if err != nil {
+			return AccountMutationResult{}, err
+		}
+	}
+	if mutation.Kind == store.AccountMutationPresentationRebind &&
+		mutation.State == store.AccountMutationRebindPublished {
+		var err error
+		mutation, err = s.refreshAccountMutationPresentation(ctx, mutation)
+		if err != nil {
+			return AccountMutationResult{}, err
+		}
+		receipt, err := s.m.FinalizeAccountPresentationRebind(
+			ctx, mutation, time.Now().Add(accountMutationReceiptTTL),
+		)
+		if err != nil {
+			return AccountMutationResult{}, err
+		}
+		if err := s.prepareCommittedAccountMutation(ctx, receipt); err != nil {
+			return AccountMutationResult{}, err
+		}
+		return accountMutationReceiptResult(receipt), nil
 	}
 	if mutation.State != store.AccountMutationPublishing {
 		return AccountMutationResult{}, fmt.Errorf("account mutation cannot finish from %s", mutation.State)
@@ -1032,7 +1168,9 @@ func (s *Server) prepareCommittedAccountMutation(
 	ctx context.Context,
 	receipt store.AccountMutationReceipt,
 ) error {
-	if receipt.Terminal != store.AccountMutationCommitted || receipt.Kind != store.AccountMutationAdd {
+	if receipt.Terminal != store.AccountMutationCommitted ||
+		(receipt.Kind != store.AccountMutationAdd &&
+			receipt.Kind != store.AccountMutationPresentationRebind) {
 		return nil
 	}
 	account, err := s.m.Store.GetAccount(receipt.AccountID)
@@ -1042,8 +1180,44 @@ func (s *Server) prepareCommittedAccountMutation(
 	if account.InstanceID != receipt.AccountInstanceID || account.Generation != receipt.AccountGeneration {
 		return fmt.Errorf("prepare committed acct-%02d: account generation changed", receipt.AccountID)
 	}
-	if _, err := s.prepareTenant(ctx, account); err != nil {
-		return fmt.Errorf("prepare committed acct-%02d tenant: %w", receipt.AccountID, err)
+	if account.ConfigDir != receipt.ConfigDir || account.KeychainService != receipt.KeychainService ||
+		account.KeychainAccount != receipt.KeychainAccount {
+		return fmt.Errorf("prepare committed acct-%02d: credential owner changed", receipt.AccountID)
+	}
+	presentation, err := s.m.Store.AccountPresentation(receipt.AccountID)
+	if err != nil {
+		return fmt.Errorf("read committed acct-%02d presentation: %w", receipt.AccountID, err)
+	}
+	if presentation.AccountInstanceID != account.InstanceID ||
+		presentation.AccountGeneration != account.Generation {
+		return fmt.Errorf("prepare committed acct-%02d: retained presentation proof changed", receipt.AccountID)
+	}
+	if err := store.ValidatePresentationPreparationProofAdvance(
+		receipt.PresentationProof, presentation.Proof,
+	); err != nil {
+		return fmt.Errorf("prepare committed acct-%02d: retained presentation proof changed: %w", receipt.AccountID, err)
+	}
+	freshProof, err := s.prepareAccountProof(ctx, account)
+	if err != nil {
+		return fmt.Errorf("prepare committed acct-%02d presentation: %w", receipt.AccountID, err)
+	}
+	if err := store.ValidatePresentationPreparationProofAdvance(
+		receipt.PresentationProof, freshProof,
+	); err != nil {
+		return fmt.Errorf("prepare committed acct-%02d presentation advanced unsafely: %w", receipt.AccountID, err)
+	}
+	if err := s.m.Store.RefreshAccountPresentation(
+		account, presentation.Proof, freshProof,
+	); err != nil {
+		return fmt.Errorf("persist committed acct-%02d presentation: %w", receipt.AccountID, err)
+	}
+	if receipt.PublicationPending {
+		if err := s.m.AdoptRotatedToken(ctx, account); err != nil {
+			return fmt.Errorf("publish committed acct-%02d credential: %w", receipt.AccountID, err)
+		}
+		if err := s.m.Store.MarkAccountMutationPublicationSettled(receipt.OperationID); err != nil {
+			return fmt.Errorf("admit committed acct-%02d publication: %w", receipt.AccountID, err)
+		}
 	}
 	return nil
 }
@@ -1052,6 +1226,9 @@ func (s *Server) resolveSupersededAccountMutation(
 	ctx context.Context,
 	current store.AccountMutation,
 ) (AccountMutationResult, error) {
+	if current.Kind == store.AccountMutationPresentationRebind {
+		return AccountMutationResult{}, store.ErrAccountMutationRecoveryRequired
+	}
 	if current.Kind != store.AccountMutationAdd {
 		state, err := s.m.CredentialExternalState(ctx, accountMutationAccount(current))
 		if err != nil {
@@ -1064,9 +1241,6 @@ func (s *Server) resolveSupersededAccountMutation(
 		receipt, err := s.m.Store.ResolveAccountMutation(
 			current.Fence(), store.AccountMutationQuarantined,
 			observed, &store.AccountMutationQuarantine{
-				FileLocatorDigest: store.CredentialFileLocatorDigest(
-					creds.FileCredentialPath(current.ConfigDir),
-				),
 				Observation: state,
 				Reason:      store.CredentialResultChangedUnderfoot,
 			}, time.Now().Add(accountMutationReceiptTTL),
@@ -1113,6 +1287,7 @@ func (s *Server) recoverRetiredAccountMutations(ctx context.Context) error {
 					"account mutation recovery deferred: account=%d operation=%x state=%s: %v",
 					mutation.AccountID, mutation.OperationID, mutation.State, err,
 				)
+				s.deferAccountMutationRecovery(mutation)
 			}
 		}
 		if !more {
@@ -1121,10 +1296,96 @@ func (s *Server) recoverRetiredAccountMutations(ctx context.Context) error {
 	}
 }
 
+func (s *Server) deferAccountMutationRecovery(
+	mutation store.AccountMutation,
+) {
+	ctx := s.accountMutationLifetime
+	if ctx == nil {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		wait := accountMutationRecoverWait
+		for {
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			if receipt, err := s.m.Store.AccountMutationReceipt(mutation.OperationID); err == nil {
+				if err := s.prepareCommittedAccountMutation(ctx, receipt); err == nil {
+					return
+				}
+			} else if current, readErr := s.m.Store.AccountMutation(mutation.OperationID); readErr == nil {
+				mutation = current
+				if err := s.recoverAccountMutation(ctx, mutation); err == nil {
+					return
+				}
+			} else {
+				return
+			}
+			if wait < accountMutationRecoverMax/2 {
+				wait *= 2
+			} else {
+				wait = accountMutationRecoverMax
+			}
+		}
+	}()
+}
+
+func (s *Server) recoverPendingAccountMutationPublications(ctx context.Context) error {
+	receipts, err := s.m.Store.PendingAccountMutationPublications(store.CredentialOperationPageLimit)
+	if err != nil {
+		return err
+	}
+	for _, receipt := range receipts {
+		if err := s.prepareCommittedAccountMutation(ctx, receipt); err != nil {
+			s.log.Printf(
+				"account mutation publication deferred: account=%d operation=%x: %v",
+				receipt.AccountID, receipt.OperationID, err,
+			)
+		}
+	}
+	return nil
+}
+
+func (s *Server) monitorPendingAccountMutationPublications(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.recoverPendingAccountMutationPublications(ctx); err != nil {
+				s.log.Printf("account mutation publication scan deferred: %v", err)
+			}
+		}
+	}
+}
+
 func (s *Server) recoverAccountMutation(
 	ctx context.Context,
 	mutation store.AccountMutation,
 ) error {
+	if (mutation.Kind == store.AccountMutationAdd ||
+		mutation.Kind == store.AccountMutationPresentationRebind) &&
+		mutation.State == store.AccountMutationAwaitingPresentation {
+		_, err := s.bindAccountMutationPresentation(ctx, mutation)
+		return err
+	}
+	if mutation.Kind == store.AccountMutationPresentationRebind {
+		if mutation.State != store.AccountMutationCompensating {
+			var err error
+			mutation, err = s.refreshAccountMutationPresentation(ctx, mutation)
+			if err != nil {
+				return err
+			}
+		}
+	}
 	switch mutation.State {
 	case store.AccountMutationAwaitingInput:
 		return nil
@@ -1145,7 +1406,8 @@ func (s *Server) recoverAccountMutation(
 		}
 		_, err = s.finishOrQuarantineAccountMutation(ctx, mutation)
 		return err
-	case store.AccountMutationApplied, store.AccountMutationPublishing:
+	case store.AccountMutationApplied, store.AccountMutationPublishing,
+		store.AccountMutationRebindPublished:
 		_, err := s.finishOrQuarantineAccountMutation(ctx, mutation)
 		return err
 	case store.AccountMutationCompensating:
@@ -1228,7 +1490,7 @@ func accountMutationActiveResult(mutation store.AccountMutation) AccountMutation
 		state = AccountMutationAwaitingInput
 	}
 	return AccountMutationResult{
-		OperationID: [32]byte(mutation.OperationID), Kind: AccountMutationKind(mutation.Kind),
+		OperationID: [32]byte(mutation.OperationID), Kind: wireAccountMutationKind(mutation.Kind),
 		State: state, AccountID: mutation.AccountID, ConfigDir: mutation.ConfigDir,
 		Label: mutation.Label, Fence: AccountMutationFence{
 			CanonicalOperationID: [32]byte(mutation.OperationID),
@@ -1252,7 +1514,7 @@ func accountMutationReceiptResult(receipt store.AccountMutationReceipt) AccountM
 		state = AccountMutationQuarantined
 	}
 	return AccountMutationResult{
-		OperationID: [32]byte(receipt.OperationID), Kind: AccountMutationKind(receipt.Kind),
+		OperationID: [32]byte(receipt.OperationID), Kind: wireAccountMutationKind(receipt.Kind),
 		State: state, AccountID: receipt.AccountID, ConfigDir: receipt.ConfigDir,
 		Label: receipt.Label, Completed: completed,
 		Fence: AccountMutationFence{
@@ -1263,6 +1525,13 @@ func accountMutationReceiptResult(receipt store.AccountMutationReceipt) AccountM
 			CredentialDigest:     [32]byte(receipt.ExpectedCredentialDigest),
 		},
 	}
+}
+
+func wireAccountMutationKind(kind store.AccountMutationKind) AccountMutationKind {
+	if kind == store.AccountMutationPresentationRebind {
+		return AccountMutationRelogin
+	}
+	return AccountMutationKind(kind)
 }
 
 func accountMutationRetainedResult(receipt store.AccountMutationReceipt) AccountMutationResult {

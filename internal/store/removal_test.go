@@ -70,7 +70,7 @@ func TestBeginAccountRemovalRejectsAdmittedExternalOperations(t *testing.T) {
 		s.now = func() time.Time { return now }
 		account := credentialOperationTestAccount(t, s)
 		request := credentialOperationTestRequest(
-			t, account, CredentialOperationAdoptRotated, CredentialTargetKeychain,
+			t, account, CredentialOperationCompensate, CredentialTargetKeychain,
 			credentialOperationTestState("before", ""), "removal-credential-operation",
 			credentialOperationTestOwner("removal-credential-operation"),
 		)

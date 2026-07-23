@@ -443,10 +443,16 @@ func (a *testAccountMutationAttachment) Receive(
 		}
 		settled := a.terminal.settled
 		notify := a.terminal.notify
+		select {
+		case <-settled:
+			a.terminal.mu.Unlock()
+			return supervise.TerminalOutput{}, io.EOF
+		default:
+		}
 		a.terminal.mu.Unlock()
 		select {
 		case <-settled:
-			return supervise.TerminalOutput{}, io.EOF
+			continue
 		case <-notify:
 		case <-ctx.Done():
 			return supervise.TerminalOutput{}, ctx.Err()

@@ -88,6 +88,8 @@ const (
 	CredentialResultNoTokens CredentialResultCategory = "no-tokens"
 	// CredentialResultInstalled records a completed synchronized install.
 	CredentialResultInstalled CredentialResultCategory = "installed"
+	// CredentialResultAdopted records a trusted write-back of rotated credentials.
+	CredentialResultAdopted CredentialResultCategory = "adopted"
 	// CredentialResultSkipped records an intentionally omitted mutation.
 	CredentialResultSkipped CredentialResultCategory = "skipped"
 	// CredentialResultFailed records a classified operation failure.
@@ -2086,7 +2088,7 @@ func validateCredentialPublicationPayload(
 
 func credentialResultPublishesWrite(result CredentialResultCategory) bool {
 	switch result {
-	case CredentialResultRefreshed, CredentialResultInstalled:
+	case CredentialResultRefreshed, CredentialResultInstalled, CredentialResultAdopted:
 		return true
 	default:
 		return false
@@ -2145,7 +2147,7 @@ func validateCredentialTerminal(
 	case CredentialOperationInstallSynced:
 		valid = result == CredentialResultInstalled || result == CredentialResultSkipped
 	case CredentialOperationAdoptRotated:
-		valid = result == CredentialResultDone
+		valid = result == CredentialResultAdopted
 	case CredentialOperationCompensate:
 		valid = result == CredentialResultDone
 	}

@@ -107,14 +107,6 @@ func consumeReservation(e rowExecer, reservation PendingAccountReservation) erro
 	return nil
 }
 
-// PromoteReservedAccount spends account a's index reservation and inserts its
-// row in one transaction, so a concurrent ReserveAccountIndex never observes
-// the index free between the two. A reservation already gone (released or
-// swept) fails loud and writes no row.
-func (s *Store) PromoteReservedAccount(reservation PendingAccountReservation, a Account) error {
-	return s.promoteReservedAccount(reservation, a, false, nil)
-}
-
 // PromoteReservedSyncedAccount atomically publishes a non-origin row, its
 // complete FuseKit presentation proof, and awaiting-origin health state.
 func (s *Store) PromoteReservedSyncedAccount(
