@@ -440,7 +440,7 @@ func physicalMaterializationRequest(
 			return sourceauthority.MaterializationRequest{}, false, nil
 		}
 	case strings.HasPrefix(string(entry.Root), privateRootPrefix):
-		if top == claudeJSONFile || top == settingsFile || sourceMutationArtifact(top) {
+		if top == claudeJSONFile || top == settingsFile {
 			return sourceauthority.MaterializationRequest{}, false, nil
 		}
 		if !overlay.PrivateTopLevel(top) {
@@ -604,10 +604,6 @@ func affectedPathKey(root sourceauthority.RootID, relative string) causal.Logica
 		scope = string(root)
 	}
 	return causal.LogicalKey(scope + ":" + topLevel(relative))
-}
-
-func sourceMutationArtifact(name string) bool {
-	return strings.HasPrefix(name, ".fuse_hidden.ccpool.")
 }
 
 func exactPolicyAbsolutePath(value string) bool {

@@ -187,8 +187,8 @@ func TestMergeClaudeJSONIdempotentAgainstPrettyBase(t *testing.T) {
 }
 
 // TestMergeClaudeJSONDeterministic pins byte-determinism: two merges of the same
-// inputs must be byte-equal (json.Marshal key-sorts maps). The fuse merged view's
-// Getattr size and Read depend on it.
+// inputs must be byte-equal (json.Marshal key-sorts maps). Catalog metadata and
+// immutable content snapshots depend on it.
 func TestMergeClaudeJSONDeterministic(t *testing.T) {
 	a, _, err := MergeClaudeJSON([]byte(mergePrivate), []byte(mergeBase))
 	if err != nil {
@@ -582,8 +582,8 @@ func TestSplitClaudeJSONSharedProjectKeys(t *testing.T) {
 	}
 }
 
-// TestMergeSplitRoundTrip rehearses the fuse write-through cycle: merge base over
-// private, change a shareable key and accept a project's trust dialog, split the
+// TestMergeSplitRoundTrip rehearses the materialization and mutation cycle: merge
+// base over private, change a shareable key and accept a project's trust dialog, split the
 // commit back. The new base must carry both changes while every other blacklisted
 // key stays byte-identical, and inside projects only the shared approval crosses:
 // base's own entry survives and the session's history never lands.

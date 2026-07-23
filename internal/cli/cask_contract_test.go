@@ -217,6 +217,16 @@ func TestFileProviderOnlyRuntimeRejectsNativeAndLegacyPathResidue(t *testing.T) 
 	}
 }
 
+func TestSourceAuthorityRejectsLegacyFuseArtifactFilters(t *testing.T) {
+	production := readReleaseContract(t, "internal", "overlay", "classify.go") +
+		readReleaseContract(t, "internal", "tenantfs", "authority_policy.go")
+	for _, forbidden := range []string{".fuse_hidden", ".nfs.", "sourceMutationArtifact"} {
+		if strings.Contains(production, forbidden) {
+			t.Fatalf("source authority retains legacy FUSE artifact filter %q", forbidden)
+		}
+	}
+}
+
 func TestTCCSnapshotCoversProtectedSurfacesAndRejectsDaemonRows(t *testing.T) {
 	snapshot := readReleaseContract(t, "scripts", "vm", "tcc-snapshot.sh")
 	for _, service := range []string{

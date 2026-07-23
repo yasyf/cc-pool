@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// plansDir is the value the mirror injects and strips by value-equality.
+// plansDir is the value the materializer injects and strips by value-equality.
 const plansDir = "/Users/test/.claude/plans"
 
 func TestInjectPlansDirectory(t *testing.T) {
@@ -211,8 +211,8 @@ func TestInjectStripNestedKeysUntouched(t *testing.T) {
 }
 
 // TestInjectPlansDirectoryDeterministic pins byte-determinism: two injections of
-// the same input must be byte-equal (json.Marshal key-sorts maps). The fuse
-// merged view's Getattr size and Read content depend on it.
+// the same input must be byte-equal (json.Marshal key-sorts maps). Catalog size
+// metadata and immutable content snapshots depend on it.
 func TestInjectPlansDirectoryDeterministic(t *testing.T) {
 	base := []byte(`{"theme":"dark","model":"opus","verbose":true}`)
 	a, err := injectPlansDirectory(base, plansDir)

@@ -53,8 +53,8 @@ var ClaudeJSONSharedProjectKeys = map[string]bool{
 // inside "projects" only ClaudeJSONSharedProjectKeys cross. changed gates
 // callers' rewrites; base values are normalized before comparison so a
 // pretty-printed base reports unchanged. Output is key-sorted json.Marshal —
-// deterministic bytes, load-bearing for the fuse merged view's Getattr/Read
-// coherence. Non-object input errors rather than replacing an unparseable file.
+// deterministic bytes, load-bearing for catalog metadata and immutable content
+// snapshot coherence. Non-object input errors rather than replacing an unparseable file.
 func MergeClaudeJSON(private, base []byte) (merged []byte, changed bool, err error) {
 	if base == nil {
 		return private, false, nil

@@ -8,7 +8,7 @@ import (
 // TestPrivateClassificationDisjoint pins the credential-leak invariant across every
 // classification category: the shared carve-out set (SharedTopLevel) and the private
 // set (PrivateEntry or the carveOutPrivate leak guard) never overlap — a name in both
-// would serve plain claude's file through a shared symlink. Each case also asserts the
+// would cross plain claude state into an account projection. Each case also asserts the
 // concrete verdict so a dropped arm (e.g. carveOutPrivate losing its glob match) is
 // caught, not just a lucky still-disjoint result.
 func TestPrivateClassificationDisjoint(t *testing.T) {
@@ -48,6 +48,17 @@ func TestPrivateClassificationDisjoint(t *testing.T) {
 				t.Errorf("PrivateEntry||carveOutPrivate(%q) = %v, want %v (%s)", tc.name, private, tc.wantPrivate, tc.desc)
 			}
 		})
+	}
+}
+
+func TestSkipPrefixesContainOnlyCurrentSourceArtifacts(t *testing.T) {
+	if len(SkipPrefixes) != 1 || SkipPrefixes[0] != "._" {
+		t.Fatalf("SkipPrefixes = %v, want only AppleDouble sidecars", SkipPrefixes)
+	}
+	for _, name := range []string{".fuse_hidden.ccpool.orphan", ".nfs.orphan"} {
+		if !SharedTopLevel(name) {
+			t.Errorf("SharedTopLevel(%q) = false, want ordinary current source content", name)
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package tenantfs
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"slices"
@@ -104,6 +105,10 @@ func TestClaudeAuthorityDeclarationDigestTracksProductConfiguration(t *testing.T
 	if first == ([32]byte{}) || repeated != first {
 		t.Fatalf("declaration digests = %x and %x", first, repeated)
 	}
+	const wantDigest = "c808d93d1096f26990bef30cb47344cb500715bd0081b3da621ec1f964594ec6"
+	if got := hex.EncodeToString(first[:]); got != wantDigest {
+		t.Fatalf("declaration digest = %s, want %s", got, wantDigest)
+	}
 	changed := policy
 	changed.ClaudeDir = "/Users/test/.claude-next"
 	second, err := changed.DeclarationDigest()
@@ -158,6 +163,19 @@ func TestClaudeAuthorityPolicySnapshotIsBoundedAndDeterministic(t *testing.T) {
 	}
 	if pages < 5 || view.scanCalls == 0 {
 		t.Fatalf("snapshot pages=%d scanCalls=%d", pages, view.scanCalls)
+	}
+}
+
+func TestClaudeAuthorityPolicyRejectsLegacyMutationArtifactAsPrivateContent(t *testing.T) {
+	specs := testPolicyTenants()
+	entry := sourceauthority.PhysicalEntry{
+		Root: privateRootID(specs[0].ID), Relative: ".fuse_hidden.ccpool.orphan",
+		Exists: true, Kind: sourceauthority.PhysicalFile, Mode: 0o100600,
+	}
+	request, included, err := physicalMaterializationRequest(entry, specs)
+	if err == nil || included || request.Logical != "" || len(request.Inputs) != 0 || len(request.Payload) != 0 ||
+		!strings.Contains(err.Error(), "private root contains non-private entry") {
+		t.Fatalf("legacy mutation artifact = request %+v included=%t err=%v, want loud private-source rejection", request, included, err)
 	}
 }
 
