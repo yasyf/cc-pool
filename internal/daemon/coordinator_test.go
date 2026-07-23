@@ -194,15 +194,15 @@ func (p *fleetSourcePreparer) Prepare(
 	if p.started != nil {
 		p.started <- name
 	}
+	if name == p.failName {
+		return catalogproto.TenantPreparationProof{}, errors.New("injected prepare failure")
+	}
 	if p.release != nil {
 		select {
 		case <-p.release:
 		case <-ctx.Done():
 			return catalogproto.TenantPreparationProof{}, ctx.Err()
 		}
-	}
-	if name == p.failName {
-		return catalogproto.TenantPreparationProof{}, errors.New("injected prepare failure")
 	}
 	return catalogproto.TenantPreparationProof{}, nil
 }
@@ -558,6 +558,46 @@ func TestInitializeFailureBlocksReadinessAndRestartRetriesFleet(t *testing.T) {
 	want := []string{"acct-01", "acct-02"}
 	if !slices.Equal(retried, want) || !slices.Equal(reprovisioned, want) {
 		t.Fatalf("restart fleet = prepared %v provisioned %v, want %v", retried, reprovisioned, want)
+	}
+}
+
+func TestInitializeJoinsEveryStartedPreparationAfterFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	insertCoordinatorAccounts(t, st, 2)
+	server := &Server{m: &pool.Manager{Store: st}}
+	release := make(chan struct{})
+	preparer := &fleetSourcePreparer{
+		started: make(chan string, 2), release: release, failName: "acct-02",
+	}
+	coordinator := newTenantCoordinator(t.Context(), server, preparer, &fleetLifecycleRuntime{})
+	done := make(chan error, 1)
+	go func() { done <- coordinator.initialize(t.Context()) }()
+	for range 2 {
+		select {
+		case <-preparer.started:
+		case <-time.After(time.Second):
+			t.Fatal("startup did not begin the exact active fleet")
+		}
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("startup returned before every started preparation settled: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err == nil {
+		t.Fatal("startup preparation failure reported readiness")
+	}
+	prepared, active, _ := preparer.counts()
+	slices.Sort(prepared)
+	if !slices.Equal(prepared, []string{"acct-01", "acct-02"}) || active != 0 {
+		t.Fatalf("settled startup fleet = prepared %v active %d", prepared, active)
 	}
 }
 

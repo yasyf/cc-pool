@@ -96,12 +96,18 @@ func (c *tenantCoordinator) initialize(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list active accounts for tenant recovery: %w", err)
 	}
-	group, groupContext := errgroup.WithContext(ctx)
+	prepareContext := ctx
+	if c.lifecycle != nil {
+		var cancel context.CancelCauseFunc
+		prepareContext, cancel = contextWithoutCancelUntil(ctx, c.lifecycle.Done())
+		defer cancel(context.Canceled)
+	}
+	var group errgroup.Group
 	group.SetLimit(tenantProvisionConcurrency)
 	for _, active := range accounts {
 		account := active
 		group.Go(func() error {
-			if _, err := c.prepare(groupContext, account); err != nil {
+			if _, err := c.prepare(prepareContext, account); err != nil {
 				return fmt.Errorf("recover acct-%02d tenant: %w", account.ID, err)
 			}
 			return nil
