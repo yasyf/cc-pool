@@ -13,45 +13,16 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/version"
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/wire/lifeproto"
 	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
 )
 
-func TestValidateHolderHealthRequiresExactReadyLifecycle(t *testing.T) {
-	healthy := dkdaemon.Health{
-		Build: version.String(), Protocol: lifeproto.Version, PID: 42,
-		State: dkdaemon.StateHealthy,
-	}
-	if err := validateHolderHealth(healthy); err != nil {
-		t.Fatalf("healthy lifecycle: %v", err)
-	}
-	for _, test := range []struct {
-		name string
-		edit func(*dkdaemon.Health)
-		want string
-	}{
-		{name: "build", edit: func(h *dkdaemon.Health) { h.Build = "v0.0.0" }, want: "identity is not exact"},
-		{name: "protocol", edit: func(h *dkdaemon.Health) { h.Protocol++ }, want: "identity is not exact"},
-		{name: "pid", edit: func(h *dkdaemon.Health) { h.PID = 0 }, want: "identity is not exact"},
-		{name: "state", edit: func(h *dkdaemon.Health) { h.State = dkdaemon.StateDegraded }, want: "is not ready"},
-		{name: "draining", edit: func(h *dkdaemon.Health) { h.Draining = true }, want: "is not ready"},
-		{name: "busy", edit: func(h *dkdaemon.Health) { h.Busy = true }, want: "is not ready"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			got := healthy
-			test.edit(&got)
-			if err := validateHolderHealth(got); err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("validateHolderHealth(%#v) = %v, want %q", got, err, test.want)
-			}
-		})
-	}
-}
-
 func TestValidateHolderRuntimeHealthRequiresExactNativeMountProof(t *testing.T) {
+	source, err := mountproto.NativeMountSource(pool.FuseKitPresentationRoot())
+	if err != nil {
+		t.Fatal(err)
+	}
 	healthy := mountproto.RuntimeHealthResponse{
 		Protocol:             mountproto.Version,
 		Code:                 mountproto.ErrorCodeOk,
@@ -60,8 +31,8 @@ func TestValidateHolderRuntimeHealthRequiresExactNativeMountProof(t *testing.T) 
 		NativeMount: &mountproto.NativeMountProof{
 			PresentationRoot: pool.FuseKitPresentationRoot(),
 			Filesystem:       mountproto.NativeMountFilesystem,
-			Source:           mountproto.NativeMountSource,
-			CatalogEpoch:     7,
+			Source:           source,
+			RootReadEpoch:    7,
 		},
 	}
 	if err := validateHolderRuntimeHealth(healthy); err != nil {
@@ -78,7 +49,7 @@ func TestValidateHolderRuntimeHealthRequiresExactNativeMountProof(t *testing.T) 
 		{name: "root", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.PresentationRoot += "-wrong" }, want: "proof is not exact"},
 		{name: "filesystem", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.Filesystem = "fusefs" }, want: "proof is not exact"},
 		{name: "source", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.Source = "fuse-t:/wrong" }, want: "proof is not exact"},
-		{name: "epoch", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.CatalogEpoch = 0 }, want: "proof is not exact"},
+		{name: "epoch", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.RootReadEpoch = 0 }, want: "proof is not exact"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got := healthy
@@ -92,40 +63,27 @@ func TestValidateHolderRuntimeHealthRequiresExactNativeMountProof(t *testing.T) 
 	}
 }
 
-func TestHolderReadyRequiresLifecycleBeforeRuntimeHealth(t *testing.T) {
-	originalLifecycle, originalRuntime := holderLifecycleReady, holderRuntimeReady
-	t.Cleanup(func() { holderLifecycleReady, holderRuntimeReady = originalLifecycle, originalRuntime })
-	var order []string
-	holderLifecycleReady = func(context.Context, string) error {
-		order = append(order, "lifecycle")
-		return nil
-	}
+func TestHolderReadyUsesAuthorizedRuntimeHealthOnly(t *testing.T) {
+	originalRuntime := holderRuntimeReady
+	t.Cleanup(func() { holderRuntimeReady = originalRuntime })
+	var calls int
 	holderRuntimeReady = func(context.Context, string) error {
-		order = append(order, "runtime")
+		calls++
 		return nil
 	}
 	if err := holderReady(t.Context(), "/tmp/fusekit.sock"); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(order, []string{"lifecycle", "runtime"}) {
-		t.Fatalf("readiness order = %v", order)
+	if calls != 1 {
+		t.Fatalf("runtime health calls = %d, want 1", calls)
 	}
 
-	want := errors.New("lifecycle not ready")
-	order = nil
-	holderLifecycleReady = func(context.Context, string) error {
-		order = append(order, "lifecycle")
-		return want
-	}
+	want := errors.New("runtime not ready")
 	holderRuntimeReady = func(context.Context, string) error {
-		t.Fatal("runtime health queried before lifecycle readiness")
-		return nil
+		return want
 	}
 	if err := holderReady(t.Context(), "/tmp/fusekit.sock"); !errors.Is(err, want) {
 		t.Fatalf("holderReady error = %v, want %v", err, want)
-	}
-	if !slices.Equal(order, []string{"lifecycle"}) {
-		t.Fatalf("failed readiness order = %v", order)
 	}
 }
 

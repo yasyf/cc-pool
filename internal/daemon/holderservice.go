@@ -12,13 +12,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/wire/lifeproto"
 	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
-	"github.com/yasyf/fusekit/transportproto"
 )
 
 const (
@@ -44,21 +40,6 @@ var (
 	) (holderServiceController, error) {
 		return service.NewController(ctx, config)
 	}
-	holderLifecycleReady = func(ctx context.Context, socket string) error {
-		peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-			Dial: wire.UnixDialer(socket), Build: transportproto.Build,
-			LifecycleBuild: version.String(),
-		}}
-		health, err := peer.Health(ctx)
-		closeErr := peer.Close()
-		if err != nil {
-			return errors.Join(err, closeErr)
-		}
-		if err := errors.Join(validateHolderHealth(health), closeErr); err != nil {
-			return err
-		}
-		return nil
-	}
 	holderRuntimeReady = func(ctx context.Context, socket string) error {
 		client, err := tenantfs.NewClient(ctx, socket)
 		if err != nil {
@@ -72,9 +53,6 @@ var (
 		return errors.Join(validateHolderRuntimeHealth(runtimeHealth), closeErr)
 	}
 	holderReady = func(ctx context.Context, socket string) error {
-		if err := holderLifecycleReady(ctx, socket); err != nil {
-			return err
-		}
 		return holderRuntimeReady(ctx, socket)
 	}
 	holderServicePresent = func(agent service.Agent) (bool, error) {
@@ -93,22 +71,6 @@ var (
 	}
 )
 
-func validateHolderHealth(health dkdaemon.Health) error {
-	if health.Build != version.String() || health.Protocol != lifeproto.Version || health.PID <= 0 {
-		return fmt.Errorf(
-			"holder lifecycle identity is not exact: build=%q protocol=%d pid=%d",
-			health.Build, health.Protocol, health.PID,
-		)
-	}
-	if health.State != dkdaemon.StateHealthy || health.Draining || health.Busy {
-		return fmt.Errorf(
-			"holder lifecycle is not ready: state=%q draining=%t busy=%t",
-			health.State, health.Draining, health.Busy,
-		)
-	}
-	return nil
-}
-
 func validateHolderRuntimeHealth(health mountproto.RuntimeHealthResponse) error {
 	if health.ActivationGeneration == "" {
 		return errors.New("holder runtime activation generation is empty")
@@ -120,13 +82,17 @@ func validateHolderRuntimeHealth(health mountproto.RuntimeHealthResponse) error 
 		)
 	}
 	proof := health.NativeMount
+	expectedSource, err := mountproto.NativeMountSource(pool.FuseKitPresentationRoot())
+	if err != nil {
+		return fmt.Errorf("derive holder native mount source: %w", err)
+	}
 	if proof.PresentationRoot != pool.FuseKitPresentationRoot() ||
 		proof.Filesystem != mountproto.NativeMountFilesystem ||
-		proof.Source != mountproto.NativeMountSource ||
-		proof.CatalogEpoch == 0 {
+		proof.Source != expectedSource ||
+		proof.RootReadEpoch == 0 {
 		return fmt.Errorf(
-			"holder native mount proof is not exact: root=%q filesystem=%q source=%q catalog_epoch=%d",
-			proof.PresentationRoot, proof.Filesystem, proof.Source, proof.CatalogEpoch,
+			"holder native mount proof is not exact: root=%q filesystem=%q source=%q root_read_epoch=%d",
+			proof.PresentationRoot, proof.Filesystem, proof.Source, proof.RootReadEpoch,
 		)
 	}
 	return nil
