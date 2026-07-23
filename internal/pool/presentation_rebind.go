@@ -10,39 +10,33 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// AccountPresentationRebindSourceEvidence proves one usable Keychain-only
-// source owner and returns its exact locator and token-chain digests.
+// AccountPresentationRebindSourceEvidence proves one exact Keychain slot and
+// returns its locator, state, and optional token-chain digest.
 func (m *Manager) AccountPresentationRebindSourceEvidence(
 	ctx context.Context,
 	account store.Account,
-) (store.CredentialDigest, store.CredentialDigest, error) {
+) (store.CredentialDigest, store.CredentialSlotState, store.CredentialDigest, error) {
 	if account.ID < 1 || account.ConfigDir == "" || account.KeychainService == "" ||
 		account.KeychainAccount == "" {
-		return store.CredentialDigest{}, store.CredentialDigest{},
+		return store.CredentialDigest{}, "", store.CredentialDigest{},
 			store.ErrAccountPresentationEvidence
 	}
 	state, digest, err := m.credentialTokenChainStateAtObservation(ctx, account)
 	if err != nil {
-		return store.CredentialDigest{}, store.CredentialDigest{},
+		return store.CredentialDigest{}, "", store.CredentialDigest{},
 			fmt.Errorf("observe presentation rebind source: %w", err)
 	}
-	if state.Keychain.State != store.CredentialSlotPresent || state.Keychain.Digest == nil || digest == nil {
-		return store.CredentialDigest{}, store.CredentialDigest{}, ErrCredentialChangedUnderfoot
+	locator := store.CredentialKeychainLocatorDigest(account.KeychainService, account.KeychainAccount)
+	switch {
+	case state.Keychain.State == store.CredentialSlotEmpty &&
+		state.Keychain.Digest == nil && digest == nil:
+		return locator, store.CredentialSlotEmpty, store.CredentialDigest{}, nil
+	case state.Keychain.State == store.CredentialSlotPresent &&
+		state.Keychain.Digest != nil && digest != nil:
+		return locator, store.CredentialSlotPresent, *digest, nil
+	default:
+		return store.CredentialDigest{}, "", store.CredentialDigest{}, ErrCredentialChangedUnderfoot
 	}
-	credential, err := m.Creds.Store(account, creds.SourceKeychain).Read(ctx)
-	if err != nil {
-		return store.CredentialDigest{}, store.CredentialDigest{},
-			fmt.Errorf("read presentation rebind source: %w", err)
-	}
-	if !credential.HasRefreshToken() || credential.Expired() {
-		return store.CredentialDigest{}, store.CredentialDigest{}, ErrNeedsLogin
-	}
-	if credentialTokenChainDigest(credential) != *digest {
-		return store.CredentialDigest{}, store.CredentialDigest{}, ErrCredentialChangedUnderfoot
-	}
-	return store.CredentialKeychainLocatorDigest(
-		account.KeychainService, account.KeychainAccount,
-	), *digest, nil
 }
 
 // VerifyAccountPresentationRebindCredential proves the target has one usable
@@ -104,7 +98,13 @@ func (m *Manager) FinalizeAccountPresentationRebind(
 		mutation.AccountGeneration < 2 ||
 		mutation.PreviousLocatorDigest != store.CredentialKeychainLocatorDigest(
 			mutation.PreviousKeychainService, mutation.PreviousKeychainAccount,
-		) {
+		) ||
+		(mutation.PreviousCredentialState == store.CredentialSlotEmpty &&
+			mutation.PreviousCredentialDigest != (store.CredentialDigest{})) ||
+		(mutation.PreviousCredentialState == store.CredentialSlotPresent &&
+			mutation.PreviousCredentialDigest == (store.CredentialDigest{})) ||
+		(mutation.PreviousCredentialState != store.CredentialSlotEmpty &&
+			mutation.PreviousCredentialState != store.CredentialSlotPresent) {
 		return store.AccountMutationReceipt{}, store.ErrAccountMutationState
 	}
 	if m.credentialCAS == nil {
@@ -118,25 +118,34 @@ func (m *Manager) FinalizeAccountPresentationRebind(
 	if err != nil {
 		return store.AccountMutationReceipt{}, fmt.Errorf("observe previous credential: %w", err)
 	}
-	switch {
-	case oldState.Keychain.State == store.CredentialSlotEmpty && oldDigest == nil:
-	case oldState.Keychain.State == store.CredentialSlotPresent &&
-		oldState.Keychain.Digest != nil && oldDigest != nil &&
-		*oldDigest == mutation.PreviousCredentialDigest:
-		proof, casErr := m.credentialCAS(ctx, oldAccount, oldState, credentialCASMutation{
-			Delete: true,
-		})
-		if casErr != nil {
-			if errors.Is(casErr, errCredentialCASConflict) {
+	switch mutation.PreviousCredentialState {
+	case store.CredentialSlotEmpty:
+		if oldState.Keychain.State != store.CredentialSlotEmpty || oldDigest != nil {
+			return store.AccountMutationReceipt{}, ErrCredentialChangedUnderfoot
+		}
+	case store.CredentialSlotPresent:
+		switch {
+		case oldState.Keychain.State == store.CredentialSlotEmpty && oldDigest == nil:
+		case oldState.Keychain.State == store.CredentialSlotPresent &&
+			oldState.Keychain.Digest != nil && oldDigest != nil &&
+			*oldDigest == mutation.PreviousCredentialDigest:
+			proof, casErr := m.credentialCAS(ctx, oldAccount, oldState, credentialCASMutation{
+				Delete: true,
+			})
+			if casErr != nil {
+				if errors.Is(casErr, errCredentialCASConflict) {
+					return store.AccountMutationReceipt{}, ErrCredentialChangedUnderfoot
+				}
+				return store.AccountMutationReceipt{}, fmt.Errorf("delete previous Keychain credential: %w", casErr)
+			}
+			if proof.After.Keychain.State != store.CredentialSlotEmpty {
 				return store.AccountMutationReceipt{}, ErrCredentialChangedUnderfoot
 			}
-			return store.AccountMutationReceipt{}, fmt.Errorf("delete previous Keychain credential: %w", casErr)
-		}
-		if proof.After.Keychain.State != store.CredentialSlotEmpty {
+		default:
 			return store.AccountMutationReceipt{}, ErrCredentialChangedUnderfoot
 		}
 	default:
-		return store.AccountMutationReceipt{}, ErrCredentialChangedUnderfoot
+		return store.AccountMutationReceipt{}, store.ErrAccountMutationState
 	}
 	oldState, oldDigest, err = m.credentialTokenChainStateAtObservation(ctx, oldAccount)
 	if err != nil {

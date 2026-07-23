@@ -777,17 +777,18 @@ func (s *Server) startOrAttachAccountMutation(
 	var operationID store.AccountMutationID
 	var locator, expected store.CredentialDigest
 	var previousLocator, previousCredential store.CredentialDigest
+	var previousCredentialState store.CredentialSlotState
 	if kind == store.AccountMutationAdd {
 		operationID, err = store.NewPendingAddMutationID(
 			account.ID, account.InstanceID, account.Generation, intent,
 		)
 	} else if kind == store.AccountMutationPresentationRebind {
-		previousLocator, previousCredential, err =
+		previousLocator, previousCredentialState, previousCredential, err =
 			s.m.AccountPresentationRebindSourceEvidence(ctx, account)
 		if err == nil {
 			operationID, err = store.NewPresentationRebindMutationID(
 				account.ID, account.InstanceID, account.Generation+1,
-				previousLocator, previousCredential, intent,
+				previousLocator, previousCredentialState, previousCredential, intent,
 			)
 		}
 	} else {
@@ -827,6 +828,7 @@ func (s *Server) startOrAttachAccountMutation(
 		beginRequest.PreviousKeychainService = account.KeychainService
 		beginRequest.PreviousKeychainAccount = account.KeychainAccount
 		beginRequest.PreviousLocatorDigest = previousLocator
+		beginRequest.PreviousCredentialState = previousCredentialState
 		beginRequest.PreviousCredentialDigest = previousCredential
 	} else if kind != store.AccountMutationAdd {
 		beginRequest.LocatorDigest = locator

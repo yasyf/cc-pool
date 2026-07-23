@@ -105,7 +105,8 @@ CREATE TABLE account_mutations (
 	previous_keychain_service TEXT NOT NULL,
 	previous_keychain_account TEXT NOT NULL,
 	previous_locator_digest   BLOB NOT NULL CHECK(length(previous_locator_digest)=32),
-	previous_credential_digest BLOB NOT NULL CHECK(length(previous_credential_digest)=32),
+	previous_credential_state TEXT NOT NULL CHECK(previous_credential_state IN ('','empty','present')),
+	previous_credential_digest BLOB CHECK(previous_credential_digest IS NULL OR length(previous_credential_digest)=32),
   owner_record               BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch                INTEGER NOT NULL CHECK(owner_epoch > 0),
   created_at                 INTEGER NOT NULL CHECK(created_at > 0),
@@ -137,10 +138,12 @@ CREATE TABLE account_mutations (
 		   proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path='')))),
 	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
 	       previous_keychain_account<>'' AND previous_locator_digest<>zeroblob(32) AND
-	       previous_credential_digest<>zeroblob(32)) OR
+	       ((previous_credential_state='empty' AND previous_credential_digest IS NULL) OR
+	        (previous_credential_state='present' AND previous_credential_digest IS NOT NULL AND
+	         previous_credential_digest<>zeroblob(32)))) OR
 	      (kind<>'presentation-rebind' AND previous_config_dir='' AND previous_keychain_service='' AND
 	       previous_keychain_account='' AND previous_locator_digest=zeroblob(32) AND
-	       previous_credential_digest=zeroblob(32))),
+	       previous_credential_state='' AND previous_credential_digest IS NULL)),
 	CHECK(state<>'rebind-published' OR kind='presentation-rebind')
 );
 CREATE TABLE account_mutation_receipts (
@@ -189,7 +192,8 @@ CREATE TABLE account_mutation_receipts (
 	previous_keychain_service TEXT NOT NULL,
 	previous_keychain_account TEXT NOT NULL,
 	previous_locator_digest BLOB NOT NULL CHECK(length(previous_locator_digest)=32),
-	previous_credential_digest BLOB NOT NULL CHECK(length(previous_credential_digest)=32),
+	previous_credential_state TEXT NOT NULL CHECK(previous_credential_state IN ('','empty','present')),
+	previous_credential_digest BLOB CHECK(previous_credential_digest IS NULL OR length(previous_credential_digest)=32),
   owner_record      BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch       INTEGER NOT NULL CHECK(owner_epoch > 0),
 	publication_pending INTEGER NOT NULL CHECK(publication_pending IN (0,1)),
@@ -214,10 +218,12 @@ CREATE TABLE account_mutation_receipts (
 	       proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path='')),
 	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
 	       previous_keychain_account<>'' AND previous_locator_digest<>zeroblob(32) AND
-	       previous_credential_digest<>zeroblob(32)) OR
+	       ((previous_credential_state='empty' AND previous_credential_digest IS NULL) OR
+	        (previous_credential_state='present' AND previous_credential_digest IS NOT NULL AND
+	         previous_credential_digest<>zeroblob(32)))) OR
 	      (kind<>'presentation-rebind' AND previous_config_dir='' AND previous_keychain_service='' AND
 	       previous_keychain_account='' AND previous_locator_digest=zeroblob(32) AND
-	       previous_credential_digest=zeroblob(32))),
+	       previous_credential_state='' AND previous_credential_digest IS NULL)),
 	CHECK((terminal='quarantined') = (quarantine_reason IS NOT NULL)),
 	CHECK(publication_pending=0 OR
 	      (terminal='committed' AND kind IN ('add','presentation-rebind'))),

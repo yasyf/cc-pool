@@ -13,16 +13,16 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-func TestAccountPresentationRebindSourceEvidenceRequiresOneUsableKeychainOwner(t *testing.T) {
+func TestAccountPresentationRebindSourceEvidenceRecordsExactOldSlot(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		keychain  bool
 		expired   bool
-		wantError error
+		wantState store.CredentialSlotState
 	}{
-		{name: "exact", keychain: true},
-		{name: "missing", wantError: ErrCredentialChangedUnderfoot},
-		{name: "expired", keychain: true, expired: true, wantError: ErrNeedsLogin},
+		{name: "present", keychain: true, wantState: store.CredentialSlotPresent},
+		{name: "empty", wantState: store.CredentialSlotEmpty},
+		{name: "expired-present", keychain: true, expired: true, wantState: store.CredentialSlotPresent},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -41,20 +41,21 @@ func TestAccountPresentationRebindSourceEvidenceRequiresOneUsableKeychainOwner(t
 			if test.keychain {
 				credentials.Put(account.KeychainService, account.KeychainAccount, credential)
 			}
-			locator, digest, err := manager.AccountPresentationRebindSourceEvidence(t.Context(), account)
-			if test.wantError != nil {
-				if !errors.Is(err, test.wantError) {
-					t.Fatalf("source evidence error = %v, want %v", err, test.wantError)
-				}
-				return
-			}
+			locator, state, digest, err := manager.AccountPresentationRebindSourceEvidence(t.Context(), account)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if locator != store.CredentialKeychainLocatorDigest(
 				account.KeychainService, account.KeychainAccount,
-			) || digest != credentialTokenChainDigest(credential) {
-				t.Fatalf("source evidence locator=%x digest=%x", locator, digest)
+			) || state != test.wantState {
+				t.Fatalf("source evidence locator=%x state=%s digest=%x", locator, state, digest)
+			}
+			if test.wantState == store.CredentialSlotPresent &&
+				digest != credentialTokenChainDigest(credential) {
+				t.Fatalf("present source digest=%x", digest)
+			}
+			if test.wantState == store.CredentialSlotEmpty && digest != (store.CredentialDigest{}) {
+				t.Fatalf("empty source digest=%x", digest)
 			}
 		})
 	}
@@ -180,8 +181,73 @@ func TestFinalizeAccountPresentationRebindCASRefusesRacingOldCredential(t *testi
 	}
 }
 
+func TestFinalizeAccountPresentationRebindEmptyOldSlotIsReplayable(t *testing.T) {
+	manager, credentials, mutation, _, _ := presentationRebindFixtureWithOldState(
+		t, store.CredentialSlotEmpty, false,
+	)
+	receipt, err := manager.FinalizeAccountPresentationRebind(
+		t.Context(), mutation, time.Now().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.PreviousCredentialState != store.CredentialSlotEmpty ||
+		receipt.PreviousCredentialDigest != (store.CredentialDigest{}) {
+		t.Fatalf("empty old-slot receipt = %+v", receipt)
+	}
+	if _, ok := credentials.Get(mutation.PreviousKeychainService, mutation.PreviousKeychainAccount); ok {
+		t.Fatal("empty old slot unexpectedly appeared")
+	}
+	replayed, err := manager.FinalizeAccountPresentationRebind(
+		t.Context(), mutation, time.Now().Add(time.Hour),
+	)
+	if err != nil || replayed.OperationID != receipt.OperationID {
+		t.Fatalf("empty old-slot replay = %+v err=%v", replayed, err)
+	}
+}
+
+func TestFinalizeAccountPresentationRebindRejectsCredentialAppearingInEmptyOldSlot(t *testing.T) {
+	manager, credentials, mutation, _, _ := presentationRebindFixtureWithOldState(
+		t, store.CredentialSlotEmpty, false,
+	)
+	appeared := presentationRebindCredential("appeared")
+	credentials.Put(mutation.PreviousKeychainService, mutation.PreviousKeychainAccount, appeared)
+	if _, err := manager.FinalizeAccountPresentationRebind(
+		t.Context(), mutation, time.Now().Add(time.Hour),
+	); !errors.Is(err, ErrCredentialChangedUnderfoot) {
+		t.Fatalf("credential appearing in empty old slot = %v", err)
+	}
+	got, ok := credentials.Get(mutation.PreviousKeychainService, mutation.PreviousKeychainAccount)
+	if !ok || credentialTokenChainDigest(got) != credentialTokenChainDigest(appeared) {
+		t.Fatalf("appeared credential was changed: %+v present=%v", got, ok)
+	}
+}
+
+func TestFinalizeAccountPresentationRebindDeletesExpiredPresentOldSlot(t *testing.T) {
+	manager, credentials, mutation, _, _ := presentationRebindFixtureWithOldState(
+		t, store.CredentialSlotPresent, true,
+	)
+	if _, err := manager.FinalizeAccountPresentationRebind(
+		t.Context(), mutation, time.Now().Add(time.Hour),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := credentials.Get(mutation.PreviousKeychainService, mutation.PreviousKeychainAccount); ok {
+		t.Fatal("expired present old credential survived finalization")
+	}
+}
+
 func presentationRebindFixture(
 	t *testing.T,
+) (*Manager, *credstest.Fake, store.AccountMutation, *creds.Credential, *creds.Credential) {
+	t.Helper()
+	return presentationRebindFixtureWithOldState(t, store.CredentialSlotPresent, false)
+}
+
+func presentationRebindFixtureWithOldState(
+	t *testing.T,
+	oldState store.CredentialSlotState,
+	expired bool,
 ) (*Manager, *credstest.Fake, store.AccountMutation, *creds.Credential, *creds.Credential) {
 	t.Helper()
 	home := t.TempDir()
@@ -193,10 +259,6 @@ func presentationRebindFixture(
 		ID: 1, ConfigDir: oldPath, KeychainService: creds.ServiceName(oldPath),
 		KeychainAccount: "old-account",
 	})
-	initial := presentationRebindProof(account, oldPath, "activation-old")
-	if err := manager.Store.ObserveAccountPresentation(account, initial); err != nil {
-		t.Fatal(err)
-	}
 	newPath := filepath.Join(home, "File Provider", "CCPool", "new")
 	drifted := presentationRebindProof(account, newPath, "activation-observed")
 	if err := manager.Store.ObserveAccountPresentation(account, drifted); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
@@ -206,20 +268,30 @@ func presentationRebindFixture(
 	proof.CatalogGeneration++
 	proof.FileProvider.Generation++
 	oldCredential := presentationRebindCredential("old")
+	if expired {
+		oldCredential.ClaudeAiOauth.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
+	}
 	newCredential := presentationRebindCredential("new")
-	credentials.Put(account.KeychainService, account.KeychainAccount, oldCredential)
+	if oldState == store.CredentialSlotPresent {
+		credentials.Put(account.KeychainService, account.KeychainAccount, oldCredential)
+	} else if oldState != store.CredentialSlotEmpty {
+		t.Fatalf("invalid old state %q", oldState)
+	}
 	newService := creds.ServiceName(newPath)
 	newAccount := creds.AccountLabel()
-	previousLocator, previousCredential, err := manager.AccountPresentationRebindSourceEvidence(
+	previousLocator, previousCredentialState, previousCredential, err := manager.AccountPresentationRebindSourceEvidence(
 		t.Context(), account,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if previousCredentialState != oldState {
+		t.Fatalf("source state = %q, want %q", previousCredentialState, oldState)
+	}
 	intent := store.CredentialDigest{1}
 	operationID, err := store.NewPresentationRebindMutationID(
 		account.ID, account.InstanceID, account.Generation+1, previousLocator,
-		previousCredential, intent,
+		previousCredentialState, previousCredential, intent,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -232,8 +304,10 @@ func presentationRebindFixture(
 		OperationID: operationID, AccountID: account.ID,
 		Kind: store.AccountMutationPresentationRebind, AccountInstanceID: account.InstanceID,
 		AccountGeneration: account.Generation + 1, IntentDigest: intent,
+		Label: account.Label, AccountUUID: account.AccountUUID,
 		PreviousConfigDir: account.ConfigDir, PreviousKeychainService: account.KeychainService,
 		PreviousKeychainAccount: account.KeychainAccount, PreviousLocatorDigest: previousLocator,
+		PreviousCredentialState:  previousCredentialState,
 		PreviousCredentialDigest: previousCredential, Owner: owner,
 	})
 	if err != nil {

@@ -113,6 +113,7 @@ type AccountMutation struct {
 	PreviousKeychainService  string
 	PreviousKeychainAccount  string
 	PreviousLocatorDigest    CredentialDigest
+	PreviousCredentialState  CredentialSlotState
 	PreviousCredentialDigest CredentialDigest
 	Owner                    proc.Record
 	OwnerEpoch               uint64
@@ -157,6 +158,7 @@ type AccountMutationReceipt struct {
 	PreviousKeychainService  string
 	PreviousKeychainAccount  string
 	PreviousLocatorDigest    CredentialDigest
+	PreviousCredentialState  CredentialSlotState
 	PreviousCredentialDigest CredentialDigest
 	Owner                    proc.Record
 	OwnerEpoch               uint64
@@ -211,6 +213,7 @@ type BeginAccountMutationRequest struct {
 	PreviousKeychainService  string
 	PreviousKeychainAccount  string
 	PreviousLocatorDigest    CredentialDigest
+	PreviousCredentialState  CredentialSlotState
 	PreviousCredentialDigest CredentialDigest
 	Owner                    proc.Record
 }
@@ -254,17 +257,37 @@ func NewPendingAddMutationID(
 	return operationID, nil
 }
 
+func validPreviousCredential(state CredentialSlotState, digest CredentialDigest) bool {
+	switch state {
+	case CredentialSlotEmpty:
+		return digest.zero()
+	case CredentialSlotPresent:
+		return !digest.zero()
+	default:
+		return false
+	}
+}
+
+func optionalPreviousCredentialDigest(state CredentialSlotState, digest CredentialDigest) any {
+	if state == CredentialSlotEmpty || state == "" {
+		return nil
+	}
+	return digest[:]
+}
+
 // NewPresentationRebindMutationID derives one quarantined presentation repair.
 func NewPresentationRebindMutationID(
 	accountID int,
 	accountInstanceID string,
 	accountGeneration uint64,
 	previousLocator CredentialDigest,
+	previousCredentialState CredentialSlotState,
 	previousCredential CredentialDigest,
 	intent CredentialDigest,
 ) (AccountMutationID, error) {
 	if accountID <= 0 || validateAccountInstanceID(accountInstanceID) != nil ||
-		accountGeneration < 2 || previousLocator.zero() || previousCredential.zero() || intent.zero() {
+		accountGeneration < 2 || previousLocator.zero() ||
+		!validPreviousCredential(previousCredentialState, previousCredential) || intent.zero() {
 		return AccountMutationID{}, ErrAccountMutationState
 	}
 	hash := sha256.New()
@@ -277,7 +300,12 @@ func NewPresentationRebindMutationID(
 	binary.BigEndian.PutUint64(generation[:], accountGeneration)
 	writeCredentialHashField(hash, generation[:])
 	writeCredentialHashField(hash, previousLocator[:])
-	writeCredentialHashField(hash, previousCredential[:])
+	writeCredentialHashField(hash, []byte(previousCredentialState))
+	if previousCredentialState == CredentialSlotEmpty {
+		writeCredentialHashField(hash, nil)
+	} else {
+		writeCredentialHashField(hash, previousCredential[:])
+	}
 	writeCredentialHashField(hash, intent[:])
 	var operationID AccountMutationID
 	copy(operationID[:], hash.Sum(nil))
@@ -430,15 +458,16 @@ func (s *Store) BeginAccountMutation(
 		 proof_change_id,proof_operation_id,proof_presentation_kind,proof_tenant_id,proof_domain_id,
 		 proof_presentation_generation,proof_activation_generation,proof_public_path,
 		 previous_config_dir,previous_keychain_service,previous_keychain_account,
-		 previous_locator_digest,previous_credential_digest,
+		 previous_locator_digest,previous_credential_state,previous_credential_digest,
 		 owner_record,owner_epoch,created_at,updated_at
-		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'',0,0,0,0,0,0,'',0,0,'','','','','',0,'','',?,?,?,?,?,?,1,?,?)`,
+		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'',0,0,0,0,0,0,'',0,0,'','','','','',0,'','',?,?,?,?,?,?,?,1,?,?)`,
 		request.OperationID[:], request.AccountID, request.Kind, state, sequence,
 		request.AccountInstanceID, request.AccountGeneration, request.LocatorDigest[:],
 		request.ExpectedCredentialDigest[:], request.IntentDigest[:], request.ConfigDir,
 		request.KeychainService, request.KeychainAccount, request.Label, request.AccountUUID,
 		request.PreviousConfigDir, request.PreviousKeychainService, request.PreviousKeychainAccount,
-		request.PreviousLocatorDigest[:], request.PreviousCredentialDigest[:],
+		request.PreviousLocatorDigest[:], request.PreviousCredentialState,
+		optionalPreviousCredentialDigest(request.PreviousCredentialState, request.PreviousCredentialDigest),
 		owner, now.UnixNano(), now.UnixNano(),
 	); err != nil {
 		if request.Kind == AccountMutationAdd {
@@ -1104,6 +1133,9 @@ func (s *Store) PublishAccountPresentationRebind(
 	if sequence != mutation.RegistrySequence {
 		return AccountMutationFence{}, Account{}, ErrAccountMutationSuperseded
 	}
+	if mutation.AccountUUID == "" {
+		return AccountMutationFence{}, Account{}, ErrAccountMutationState
+	}
 	if err := accountMutationSubjectMatches(tx, mutation); err != nil {
 		return AccountMutationFence{}, Account{}, err
 	}
@@ -1371,6 +1403,9 @@ func (s *Store) CommitAccountMutation(
 			return AccountMutationReceipt{}, err
 		}
 		return AccountMutationReceipt{}, ErrAccountMutationSuperseded
+	}
+	if mutation.AccountUUID == "" {
+		return AccountMutationReceipt{}, ErrAccountMutationState
 	}
 	if mutation.Kind == AccountMutationAdd {
 		if err := consumeReservation(tx, PendingAccountReservation{
@@ -1935,7 +1970,7 @@ const accountMutationColumns = `operation_id,account_id,kind,state,registry_sequ
  proof_change_id,proof_operation_id,proof_presentation_kind,
  proof_tenant_id,proof_domain_id,proof_presentation_generation,proof_activation_generation,proof_public_path,
  previous_config_dir,previous_keychain_service,previous_keychain_account,
- previous_locator_digest,previous_credential_digest,
+ previous_locator_digest,previous_credential_state,previous_credential_digest,
  owner_record,owner_epoch,created_at,updated_at`
 
 func accountMutationByID(queryer accountMutationQueryer, operationID AccountMutationID) (AccountMutation, error) {
@@ -1983,7 +2018,8 @@ func scanAccountMutation(row interface{ Scan(...any) error }) (AccountMutation, 
 		&mutation.PresentationProof.FileProvider.ActivationGeneration,
 		&mutation.PresentationProof.FileProvider.PublicPath,
 		&mutation.PreviousConfigDir, &mutation.PreviousKeychainService,
-		&mutation.PreviousKeychainAccount, &previousLocator, &previousCredential,
+		&mutation.PreviousKeychainAccount, &previousLocator, &mutation.PreviousCredentialState,
+		&previousCredential,
 		&owner, &mutation.OwnerEpoch,
 		&createdAt, &updatedAt,
 	); err != nil {
@@ -1991,7 +2027,7 @@ func scanAccountMutation(row interface{ Scan(...any) error }) (AccountMutation, 
 	}
 	if len(operationID) != 32 || len(locator) != 32 || len(expected) != 32 ||
 		len(intent) != 32 || len(written) != 32 || len(previousLocator) != 32 ||
-		len(previousCredential) != 32 {
+		(previousCredential != nil && len(previousCredential) != 32) {
 		return mutation, ErrAccountMutationState
 	}
 	copy(mutation.OperationID[:], operationID)
@@ -1999,7 +2035,9 @@ func scanAccountMutation(row interface{ Scan(...any) error }) (AccountMutation, 
 	copy(mutation.ExpectedCredentialDigest[:], expected)
 	copy(mutation.IntentDigest[:], intent)
 	copy(mutation.PreviousLocatorDigest[:], previousLocator)
-	copy(mutation.PreviousCredentialDigest[:], previousCredential)
+	if previousCredential != nil {
+		copy(mutation.PreviousCredentialDigest[:], previousCredential)
+	}
 	if input != nil {
 		if len(input) != 32 {
 			return mutation, ErrAccountMutationState
@@ -2031,7 +2069,7 @@ const accountMutationReceiptColumns = `operation_id,account_id,kind,registry_seq
  proof_change_id,proof_operation_id,proof_presentation_kind,
  proof_tenant_id,proof_domain_id,proof_presentation_generation,proof_activation_generation,proof_public_path,
  previous_config_dir,previous_keychain_service,previous_keychain_account,
- previous_locator_digest,previous_credential_digest,
+ previous_locator_digest,previous_credential_state,previous_credential_digest,
  publication_pending,committed_at,acknowledged_at,expires_at`
 
 func accountMutationReceiptByID(
@@ -2074,14 +2112,15 @@ func scanAccountMutationReceipt(row interface{ Scan(...any) error }) (AccountMut
 		&receipt.PresentationProof.FileProvider.ActivationGeneration,
 		&receipt.PresentationProof.FileProvider.PublicPath,
 		&receipt.PreviousConfigDir, &receipt.PreviousKeychainService,
-		&receipt.PreviousKeychainAccount, &previousLocator, &previousCredential,
+		&receipt.PreviousKeychainAccount, &previousLocator, &receipt.PreviousCredentialState,
+		&previousCredential,
 		&publicationPending, &committedAt, &acknowledgedAt, &expiresAt,
 	); err != nil {
 		return receipt, err
 	}
 	if len(operationID) != 32 || len(locator) != 32 || len(expected) != 32 ||
 		len(intent) != 32 || len(outcome) != 32 || len(previousLocator) != 32 ||
-		len(previousCredential) != 32 {
+		(previousCredential != nil && len(previousCredential) != 32) {
 		return receipt, ErrAccountMutationState
 	}
 	copy(receipt.OperationID[:], operationID)
@@ -2089,7 +2128,9 @@ func scanAccountMutationReceipt(row interface{ Scan(...any) error }) (AccountMut
 	copy(receipt.ExpectedCredentialDigest[:], expected)
 	copy(receipt.IntentDigest[:], intent)
 	copy(receipt.PreviousLocatorDigest[:], previousLocator)
-	copy(receipt.PreviousCredentialDigest[:], previousCredential)
+	if previousCredential != nil {
+		copy(receipt.PreviousCredentialDigest[:], previousCredential)
+	}
 	if input != nil {
 		if len(input) != 32 {
 			return receipt, ErrAccountMutationState
@@ -2168,9 +2209,9 @@ func insertAccountMutationReceipt(
 		 proof_change_id,proof_operation_id,proof_presentation_kind,
 		 proof_tenant_id,proof_domain_id,proof_presentation_generation,proof_activation_generation,proof_public_path,
 		 previous_config_dir,previous_keychain_service,previous_keychain_account,
-		 previous_locator_digest,previous_credential_digest,
+		 previous_locator_digest,previous_credential_state,previous_credential_digest,
 		 publication_pending,committed_at,acknowledged_at,expires_at
-		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)`,
+		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)`,
 		mutation.OperationID[:], mutation.AccountID, mutation.Kind, mutation.RegistrySequence,
 		mutation.AccountInstanceID, mutation.AccountGeneration, mutation.LocatorDigest[:],
 		mutation.ExpectedCredentialDigest[:], mutation.IntentDigest[:], input, written, mutation.CredentialWritten,
@@ -2190,7 +2231,8 @@ func insertAccountMutationReceipt(
 		mutation.PresentationProof.FileProvider.ActivationGeneration,
 		mutation.PresentationProof.FileProvider.PublicPath,
 		mutation.PreviousConfigDir, mutation.PreviousKeychainService, mutation.PreviousKeychainAccount,
-		mutation.PreviousLocatorDigest[:], mutation.PreviousCredentialDigest[:],
+		mutation.PreviousLocatorDigest[:], mutation.PreviousCredentialState,
+		optionalPreviousCredentialDigest(mutation.PreviousCredentialState, mutation.PreviousCredentialDigest),
 		terminal == AccountMutationCommitted &&
 			(mutation.Kind == AccountMutationAdd || mutation.Kind == AccountMutationPresentationRebind),
 		committedAt.UnixNano(), expiresAt.UnixNano(),
@@ -2211,7 +2253,7 @@ func validateAccountMutationRequest(request BeginAccountMutationRequest) error {
 	var err error
 	previousEmpty := request.PreviousConfigDir == "" && request.PreviousKeychainService == "" &&
 		request.PreviousKeychainAccount == "" && request.PreviousLocatorDigest.zero() &&
-		request.PreviousCredentialDigest.zero()
+		request.PreviousCredentialState == "" && request.PreviousCredentialDigest.zero()
 	if request.Kind == AccountMutationAdd {
 		if request.ConfigDir != "" || request.KeychainService != "" || request.KeychainAccount != "" ||
 			!request.LocatorDigest.zero() || !request.ExpectedCredentialDigest.zero() || !previousEmpty {
@@ -2225,7 +2267,8 @@ func validateAccountMutationRequest(request BeginAccountMutationRequest) error {
 			request.KeychainAccount != "" || !request.LocatorDigest.zero() ||
 			!request.ExpectedCredentialDigest.zero() || request.PreviousConfigDir == "" ||
 			request.PreviousKeychainService == "" || request.PreviousKeychainAccount == "" ||
-			request.PreviousLocatorDigest.zero() || request.PreviousCredentialDigest.zero() {
+			request.PreviousLocatorDigest.zero() ||
+			!validPreviousCredential(request.PreviousCredentialState, request.PreviousCredentialDigest) {
 			return ErrAccountMutationState
 		}
 		if request.PreviousLocatorDigest != CredentialKeychainLocatorDigest(
@@ -2235,7 +2278,8 @@ func validateAccountMutationRequest(request BeginAccountMutationRequest) error {
 		}
 		expectedID, err = NewPresentationRebindMutationID(
 			request.AccountID, request.AccountInstanceID, request.AccountGeneration,
-			request.PreviousLocatorDigest, request.PreviousCredentialDigest, request.IntentDigest,
+			request.PreviousLocatorDigest, request.PreviousCredentialState,
+			request.PreviousCredentialDigest, request.IntentDigest,
 		)
 	} else {
 		if request.ConfigDir == "" || request.KeychainService == "" || request.KeychainAccount == "" ||
@@ -2276,12 +2320,12 @@ func validateAccountMutation(mutation AccountMutation) error {
 	if mutation.Kind == AccountMutationPresentationRebind {
 		if mutation.PreviousConfigDir == "" || mutation.PreviousKeychainService == "" ||
 			mutation.PreviousKeychainAccount == "" || mutation.PreviousLocatorDigest.zero() ||
-			mutation.PreviousCredentialDigest.zero() {
+			!validPreviousCredential(mutation.PreviousCredentialState, mutation.PreviousCredentialDigest) {
 			return ErrAccountMutationState
 		}
 	} else if mutation.PreviousConfigDir != "" || mutation.PreviousKeychainService != "" ||
 		mutation.PreviousKeychainAccount != "" || !mutation.PreviousLocatorDigest.zero() ||
-		!mutation.PreviousCredentialDigest.zero() {
+		mutation.PreviousCredentialState != "" || !mutation.PreviousCredentialDigest.zero() {
 		return ErrAccountMutationState
 	}
 	if (mutation.Kind == AccountMutationAdd || mutation.Kind == AccountMutationPresentationRebind) &&
@@ -2325,12 +2369,12 @@ func validateAccountMutationReceipt(receipt AccountMutationReceipt) error {
 	if receipt.Kind == AccountMutationPresentationRebind {
 		if receipt.PreviousConfigDir == "" || receipt.PreviousKeychainService == "" ||
 			receipt.PreviousKeychainAccount == "" || receipt.PreviousLocatorDigest.zero() ||
-			receipt.PreviousCredentialDigest.zero() {
+			!validPreviousCredential(receipt.PreviousCredentialState, receipt.PreviousCredentialDigest) {
 			return ErrAccountMutationState
 		}
 	} else if receipt.PreviousConfigDir != "" || receipt.PreviousKeychainService != "" ||
 		receipt.PreviousKeychainAccount != "" || !receipt.PreviousLocatorDigest.zero() ||
-		!receipt.PreviousCredentialDigest.zero() {
+		receipt.PreviousCredentialState != "" || !receipt.PreviousCredentialDigest.zero() {
 		return ErrAccountMutationState
 	}
 	if receipt.Kind == AccountMutationAdd || receipt.Kind == AccountMutationPresentationRebind {
@@ -2410,6 +2454,7 @@ func sameAccountMutationIntent(mutation AccountMutation, request BeginAccountMut
 			mutation.PreviousKeychainService == request.PreviousKeychainService &&
 			mutation.PreviousKeychainAccount == request.PreviousKeychainAccount &&
 			mutation.PreviousLocatorDigest == request.PreviousLocatorDigest &&
+			mutation.PreviousCredentialState == request.PreviousCredentialState &&
 			mutation.PreviousCredentialDigest == request.PreviousCredentialDigest
 	}
 	return mutation.Kind == request.Kind &&
@@ -2443,6 +2488,7 @@ func sameAccountMutationReceiptIntent(
 			receipt.PreviousKeychainService == request.PreviousKeychainService &&
 			receipt.PreviousKeychainAccount == request.PreviousKeychainAccount &&
 			receipt.PreviousLocatorDigest == request.PreviousLocatorDigest &&
+			receipt.PreviousCredentialState == request.PreviousCredentialState &&
 			receipt.PreviousCredentialDigest == request.PreviousCredentialDigest
 	}
 	return receipt.OperationID == request.OperationID &&

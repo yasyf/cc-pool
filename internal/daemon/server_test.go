@@ -771,10 +771,31 @@ func TestCommitSelectionFailureReleasesPromotedReservation(t *testing.T) {
 	forced := 1
 	started := time.Now().Add(-time.Minute).UnixMicro()
 	first := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, PID: 4241, ProcessStartedAt: started, Cwd: "/first"})
-	second := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, PID: 4242, ProcessStartedAt: started, Cwd: "/second"})
-	if !first.OK || !second.OK {
-		t.Fatalf("provisional selects = %+v / %+v", first, second)
+	if !first.OK {
+		t.Fatalf("first provisional select = %+v", first)
 	}
+	account, err := s.m.Store.GetAccount(forced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondToken, err := s.cl.beginSelection(account, selectionLaunch{
+		pid: 4242, processStartedAt: time.UnixMicro(started), cwd: "/second",
+	}, reservationTTL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.cl.mu.Lock()
+	firstSelection := s.cl.selections[first.ReservationToken]
+	var preparation *catalogproto.TenantPreparationProof
+	if firstSelection != nil && firstSelection.preparation != nil {
+		proof := *firstSelection.preparation
+		preparation = &proof
+	}
+	s.cl.mu.Unlock()
+	if preparation == nil || !s.cl.bindPreparation(secondToken, *preparation) {
+		t.Fatal("copy first selection preparation into commit-failure fixture")
+	}
+	second := Response{OK: true, ReservationToken: secondToken}
 	if committed := s.handleSelectCommit(context.Background(), Request{Op: OpSelectCommit, ReservationToken: first.ReservationToken}); !committed.OK {
 		t.Fatalf("first commit = %+v", committed)
 	}

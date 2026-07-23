@@ -167,6 +167,45 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 	}
 }
 
+func TestAccountMutationAddCommitRejectsEmptyAccountUUID(t *testing.T) {
+	s := openTest(t)
+	reservation, err := s.ReserveAccountIndex(credentialOperationTestOwner("registry-owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := accountMutationTestRequest(t, reservation, AccountMutationAdd)
+	request.AccountUUID = ""
+	begin, err := s.BeginAccountMutation(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation := bindAccountMutationTestPresentation(t, s, *begin.Active)
+	fence, err := s.MarkAccountMutationInputProvided(
+		mutation.Fence(), credentialOperationTestDigest("input"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err = s.MarkAccountMutationApplying(fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err = s.MarkAccountMutationApplied(fence, credentialOperationTestDigest("written"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err = s.MarkAccountMutationPublishing(fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CommitAccountMutation(fence, time.Now().Add(time.Hour)); !errors.Is(err, ErrAccountMutationState) {
+		t.Fatalf("empty account UUID committed: %v", err)
+	}
+	if _, err := s.GetAccount(reservation.ID); !errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("empty-UUID add published account: %v", err)
+	}
+}
+
 func TestBindAccountMutationPresentationRejectsSubstitutedTenant(t *testing.T) {
 	s := openTest(t)
 	reservation, err := s.ReserveAccountIndex(credentialOperationTestOwner("registry-owner"))
@@ -854,6 +893,7 @@ func TestPresentationRebindJournalRetainsQuarantineUntilOldOwnerCleanup(t *testi
 		begin.Active.PreviousKeychainService != account.KeychainService ||
 		begin.Active.PreviousKeychainAccount != account.KeychainAccount ||
 		begin.Active.PreviousLocatorDigest != request.PreviousLocatorDigest ||
+		begin.Active.PreviousCredentialState != request.PreviousCredentialState ||
 		begin.Active.PreviousCredentialDigest != request.PreviousCredentialDigest {
 		t.Fatalf("begin lost old ownership evidence: %+v", begin.Active)
 	}
@@ -913,6 +953,7 @@ func TestPresentationRebindJournalRetainsQuarantineUntilOldOwnerCleanup(t *testi
 		receipt.PreviousKeychainService != account.KeychainService ||
 		receipt.PreviousKeychainAccount != account.KeychainAccount ||
 		receipt.PreviousLocatorDigest != request.PreviousLocatorDigest ||
+		receipt.PreviousCredentialState != request.PreviousCredentialState ||
 		receipt.PreviousCredentialDigest != request.PreviousCredentialDigest {
 		t.Fatalf("receipt lost rebind evidence: %+v", receipt)
 	}
@@ -939,6 +980,46 @@ func TestPresentationRebindJournalRetainsQuarantineUntilOldOwnerCleanup(t *testi
 	replay, err := s.BeginAccountMutation(t.Context(), request)
 	if err != nil || replay.Receipt == nil || !reflect.DeepEqual(*replay.Receipt, receipt) {
 		t.Fatalf("receipt replay = %+v err=%v", replay, err)
+	}
+}
+
+func TestPresentationRebindEmptyOldCredentialStateRoundTrips(t *testing.T) {
+	s := openTest(t)
+	_, request, _ := presentationRebindMutationTestFixture(t, s)
+	presentID := request.OperationID
+	request.PreviousCredentialState = CredentialSlotEmpty
+	request.PreviousCredentialDigest = CredentialDigest{}
+	operationID, err := NewPresentationRebindMutationID(
+		request.AccountID, request.AccountInstanceID, request.AccountGeneration,
+		request.PreviousLocatorDigest, request.PreviousCredentialState,
+		request.PreviousCredentialDigest, request.IntentDigest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operationID == presentID {
+		t.Fatal("empty and present old-slot evidence produced the same operation ID")
+	}
+	request.OperationID = operationID
+	begin, err := s.BeginAccountMutation(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if begin.Active == nil ||
+		begin.Active.PreviousCredentialState != CredentialSlotEmpty ||
+		begin.Active.PreviousCredentialDigest != (CredentialDigest{}) {
+		t.Fatalf("empty old-slot mutation = %+v", begin.Active)
+	}
+	var state CredentialSlotState
+	var digest []byte
+	if err := s.db.QueryRow(
+		`SELECT previous_credential_state,previous_credential_digest
+		 FROM account_mutations WHERE operation_id=?`, operationID[:],
+	).Scan(&state, &digest); err != nil {
+		t.Fatal(err)
+	}
+	if state != CredentialSlotEmpty || digest != nil {
+		t.Fatalf("durable empty old slot state=%q digest=%x", state, digest)
 	}
 }
 
@@ -1099,7 +1180,8 @@ func TestPresentationRebindRejectsIncoherentOldEvidenceAndOwnerAliasing(t *testi
 	invalid.PreviousLocatorDigest = credentialOperationTestDigest("substituted-old-locator")
 	operationID, err := NewPresentationRebindMutationID(
 		invalid.AccountID, invalid.AccountInstanceID, invalid.AccountGeneration,
-		invalid.PreviousLocatorDigest, invalid.PreviousCredentialDigest, invalid.IntentDigest,
+		invalid.PreviousLocatorDigest, invalid.PreviousCredentialState,
+		invalid.PreviousCredentialDigest, invalid.IntentDigest,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1156,12 +1238,14 @@ func presentationRebindMutationTestFixture(
 		PreviousLocatorDigest: CredentialKeychainLocatorDigest(
 			account.KeychainService, account.KeychainAccount,
 		),
+		PreviousCredentialState:  CredentialSlotPresent,
 		PreviousCredentialDigest: credentialOperationTestDigest("old-credential"),
 		Owner:                    credentialOperationTestOwner("rebind-owner"),
 	}
 	operationID, err := NewPresentationRebindMutationID(
 		request.AccountID, request.AccountInstanceID, request.AccountGeneration,
-		request.PreviousLocatorDigest, request.PreviousCredentialDigest, request.IntentDigest,
+		request.PreviousLocatorDigest, request.PreviousCredentialState,
+		request.PreviousCredentialDigest, request.IntentDigest,
 	)
 	if err != nil {
 		t.Fatal(err)
