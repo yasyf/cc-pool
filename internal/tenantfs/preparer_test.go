@@ -101,6 +101,16 @@ func TestPreparerRejectsForeignAuthorityProof(t *testing.T) {
 func TestPreparerRejectsDrainingHealthAndStaleActivationProof(t *testing.T) {
 	account := preparationAccount(t)
 	for name, runtime := range map[string]*recordingPreparationRuntime{
+		"starting": {health: func() mountproto.RuntimeHealthResponse {
+			health := exactRuntimeHealth()
+			health.State = mountproto.RuntimeStateDegraded
+			health.Busy = true
+			health.Ready = false
+			health.ReadinessPhase = mountproto.ReadinessPhaseStarting
+			health.ReadinessStep = mountproto.ReadinessStepBroker
+			health.BrokerPhase = mountproto.BrokerPhaseStarting
+			return health
+		}()},
 		"draining": {health: func() mountproto.RuntimeHealthResponse {
 			health := exactRuntimeHealth()
 			health.Draining = true

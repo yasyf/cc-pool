@@ -34,6 +34,92 @@ func TestListActiveAccountsExcludesAccountWithoutExactPresentation(t *testing.T)
 	}
 }
 
+func TestListDesiredAccountsIncludesUnpresentedExactAccount(t *testing.T) {
+	s := openTest(t)
+	account := insertDesiredPresentationTestAccount(t, s, 1)
+	desired, err := s.ListDesiredAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(desired) != 1 || desired[0] != account {
+		t.Fatalf("desired accounts = %+v, want %+v", desired, account)
+	}
+	if active, err := s.ListActiveAccounts(); err != nil || len(active) != 0 {
+		t.Fatalf("active accounts = %+v err=%v, want none", active, err)
+	}
+}
+
+func TestBindDesiredAccountPresentationIsLostResponseAndRestartIdempotent(t *testing.T) {
+	s := openTest(t)
+	account := insertDesiredPresentationTestAccount(t, s, 1)
+	proof := presentationTestProof(account, account.ConfigDir, "activation-1")
+	expected := presentationTestIdentity(proof)
+	if err := s.BindDesiredAccountPresentation(account, expected, proof); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindDesiredAccountPresentation(account, expected, proof); err != nil {
+		t.Fatalf("lost-response replay: %v", err)
+	}
+	proof.FileProvider.ActivationGeneration = "activation-2"
+	if err := s.BindDesiredAccountPresentation(account, expected, proof); err != nil {
+		t.Fatalf("restart activation refresh: %v", err)
+	}
+	bound, err := s.AccountPresentation(account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.Proof != proof {
+		t.Fatalf("bound proof = %+v, want %+v", bound.Proof, proof)
+	}
+	if active, err := s.ListActiveAccounts(); err != nil || len(active) != 1 || active[0] != account {
+		t.Fatalf("active accounts = %+v err=%v, want %+v", active, err, account)
+	}
+}
+
+func TestBindDesiredAccountPresentationQuarantinesIdentityMismatch(t *testing.T) {
+	tests := map[string]struct {
+		mutate func(*PresentationPreparationProof)
+		reason AccountPresentationQuarantineReason
+	}{
+		"tenant": {func(p *PresentationPreparationProof) {
+			p.CatalogTenantID = "account-other"
+			p.FileProvider.TenantID = "account-other"
+		}, AccountPresentationTenantIDDrift},
+		"domain": {func(p *PresentationPreparationProof) {
+			p.FileProvider.DomainID = "domain-other"
+		}, AccountPresentationDomainIDDrift},
+		"generation": {func(p *PresentationPreparationProof) {
+			p.CatalogGeneration++
+			p.FileProvider.Generation++
+		}, AccountPresentationGenerationDrift},
+		"public path": {func(p *PresentationPreparationProof) {
+			p.FileProvider.PublicPath += "-other"
+		}, AccountPresentationPublicPathDrift},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			s := openTest(t)
+			account := insertDesiredPresentationTestAccount(t, s, 1)
+			proof := presentationTestProof(account, account.ConfigDir, "activation-1")
+			expected := presentationTestIdentity(proof)
+			test.mutate(&proof)
+			if err := s.BindDesiredAccountPresentation(account, expected, proof); !errors.Is(err, ErrAccountPresentationQuarantined) {
+				t.Fatalf("bind mismatch = %v, want quarantine", err)
+			}
+			quarantine, err := s.AccountPresentationQuarantine(account.ID)
+			if err != nil || quarantine.Reason != test.reason || quarantine.Proof != proof {
+				t.Fatalf("quarantine = %+v err=%v, want reason %s", quarantine, err, test.reason)
+			}
+			if desired, err := s.ListDesiredAccounts(); err != nil || len(desired) != 0 {
+				t.Fatalf("desired after quarantine = %+v err=%v", desired, err)
+			}
+			if active, err := s.ListActiveAccounts(); err != nil || len(active) != 0 {
+				t.Fatalf("active after quarantine = %+v err=%v", active, err)
+			}
+		})
+	}
+}
+
 func TestObserveAccountPresentationBindsExactEvidenceAndRefreshesActivation(t *testing.T) {
 	s := openTest(t)
 	account := credentialOperationTestAccountID(t, s, 1)
@@ -234,4 +320,29 @@ func presentationTestProof(account Account, publicPath, activation string) Prese
 			Generation: account.Generation, ActivationGeneration: activation, PublicPath: publicPath,
 		},
 	}
+}
+
+func presentationTestIdentity(proof PresentationPreparationProof) FileProviderPresentationIdentity {
+	return FileProviderPresentationIdentity{
+		TenantID: proof.FileProvider.TenantID, DomainID: proof.FileProvider.DomainID,
+		Generation: proof.FileProvider.Generation, PublicPath: proof.FileProvider.PublicPath,
+	}
+}
+
+func insertDesiredPresentationTestAccount(t *testing.T, s *Store, id int) Account {
+	t.Helper()
+	account := Account{
+		ID: id, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 1,
+		ConfigDir: "/tmp/account-1", KeychainService: "service-1",
+		KeychainAccount: "account-1", AccountUUID: "uuid-1", CreatedAt: time.Unix(1, 0),
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO accounts(id,instance_id,generation,config_dir,keychain_service,keychain_account,account_uuid,created_at)
+		 VALUES(?,?,?,?,?,?,?,?)`,
+		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
+		account.KeychainService, account.KeychainAccount, account.AccountUUID, account.CreatedAt.Unix(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	return account
 }

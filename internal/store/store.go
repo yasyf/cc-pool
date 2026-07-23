@@ -771,9 +771,50 @@ func scanAccount(rows interface{ Scan(...any) error }) (Account, error) {
 
 const accountCols = `id,instance_id,generation,config_dir,keychain_service,keychain_account,label,account_uuid,created_at`
 
+const desiredAccountPredicate = `accounts.deleted_at IS NULL
+	  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)
+	  AND NOT EXISTS (SELECT 1 FROM account_presentation_quarantines WHERE account_id=accounts.id)
+	  AND NOT EXISTS (SELECT 1 FROM account_mutations WHERE account_id=accounts.id)
+	  AND NOT EXISTS (
+	    SELECT 1 FROM account_mutation_receipts
+	    WHERE account_id=accounts.id AND publication_pending=1
+	  )
+	  AND NOT EXISTS (SELECT 1 FROM credential_operations WHERE account_id=accounts.id)
+	  AND NOT EXISTS (SELECT 1 FROM credential_quarantines WHERE account_id=accounts.id)
+	  AND NOT EXISTS (
+	    SELECT 1 FROM pending_synced_credential_admissions
+	    WHERE account_id=accounts.id
+	  )
+	  AND NOT EXISTS (
+	    SELECT 1 FROM credential_operation_receipts
+	    WHERE account_id=accounts.id AND publication_payload IS NOT NULL
+	      AND acknowledged_at IS NULL
+	  )`
+
 // ListAccounts returns all accounts ordered by id.
 func (s *Store) ListAccounts() ([]Account, error) {
 	rows, err := s.db.Query(`SELECT ` + accountCols + ` FROM accounts WHERE deleted_at IS NULL ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Account
+	for rows.Next() {
+		a, err := scanAccount(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ListDesiredAccounts returns exact account generations eligible for live
+// presentation convergence, whether or not a presentation is already bound.
+func (s *Store) ListDesiredAccounts() ([]Account, error) {
+	rows, err := s.db.Query(`SELECT ` + accountCols + ` FROM accounts
+		WHERE ` + desiredAccountPredicate + `
+		ORDER BY accounts.id`)
 	if err != nil {
 		return nil, err
 	}

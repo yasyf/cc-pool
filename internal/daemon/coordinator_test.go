@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
@@ -165,13 +167,15 @@ func (r *fleetLifecycleRuntime) provisionedAccounts() []string {
 }
 
 type fleetSourcePreparer struct {
-	mu       sync.Mutex
-	started  chan string
-	release  <-chan struct{}
-	failName string
-	prepared []string
-	active   int
-	maximum  int
+	mu          sync.Mutex
+	started     chan string
+	release     <-chan struct{}
+	failName    string
+	activation  string
+	mutateProof func(*catalogproto.TenantPreparationProof)
+	prepared    []string
+	active      int
+	maximum     int
 }
 
 func (p *fleetSourcePreparer) Prepare(
@@ -204,7 +208,16 @@ func (p *fleetSourcePreparer) Prepare(
 			return catalogproto.TenantPreparationProof{}, ctx.Err()
 		}
 	}
-	return catalogproto.TenantPreparationProof{}, nil
+	proof := daemonTestPreparationProof(store.Account{
+		InstanceID: account.InstanceID, Generation: account.Generation,
+	}, filepath.Join("/Users/test/Library/CloudStorage", "CCPoolStatus-"+name))
+	if p.activation != "" {
+		proof.Presentation.FileProvider.ActivationGeneration = p.activation
+	}
+	if p.mutateProof != nil {
+		p.mutateProof(&proof)
+	}
+	return proof, nil
 }
 
 func (*fleetSourcePreparer) Validate(
@@ -364,6 +377,46 @@ func insertCoordinatorAccounts(t *testing.T, st *store.Store, total int) {
 	}
 }
 
+func openDesiredCoordinatorStore(t *testing.T, total int) *store.Store {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, "pool-v1.db")
+	initial, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(on)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id := 1; id <= total; id++ {
+		if _, err := db.Exec(
+			`INSERT INTO accounts(
+			 id,instance_id,generation,config_dir,keychain_service,keychain_account,label,account_uuid,created_at
+			 ) VALUES(?,?,?,?,?,?,?,?,1)`,
+			id, fmt.Sprintf("%032x", id), 1, testFileProviderConfigDir(id),
+			fmt.Sprintf("service-%d", id), fmt.Sprintf("account-%d", id),
+			fmt.Sprintf("label-%d", id), fmt.Sprintf("uuid-%d", id),
+		); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
 func TestEnsureTenantReplacesPriorGenerationAfterProvisionConflict(t *testing.T) {
 	account, tenantAccount, tenantID := testTenantAccount(t)
 	runtime := &lifecycleRuntimeStub{
@@ -475,6 +528,191 @@ func TestInitializePreparesEveryActiveAccountWithBoundedFanout(t *testing.T) {
 			t.Fatalf("startup account %d = prepared %q provisioned %q, want %q", id, prepared[id-1], provisioned[id-1], want)
 		}
 	}
+}
+
+func TestInitializeBindsLiveProofForFreshDesiredAccounts(t *testing.T) {
+	st := openDesiredCoordinatorStore(t, 2)
+	runtime := &fleetLifecycleRuntime{}
+	preparer := &fleetSourcePreparer{activation: "activation-fresh"}
+	server := &Server{m: &pool.Manager{Store: st}}
+	coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
+	if err := coordinator.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	active, err := st.ListActiveAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 2 {
+		t.Fatalf("active accounts = %d, want 2", len(active))
+	}
+	for _, account := range active {
+		presentation, err := st.AccountPresentation(account.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if presentation.AccountInstanceID != account.InstanceID ||
+			presentation.AccountGeneration != account.Generation ||
+			presentation.Proof.FileProvider.PublicPath != account.ConfigDir ||
+			presentation.Proof.FileProvider.ActivationGeneration != "activation-fresh" {
+			t.Fatalf("acct-%02d presentation = %+v", account.ID, presentation)
+		}
+	}
+}
+
+func TestInitializeReadinessWaitsForDesiredPresentationProof(t *testing.T) {
+	st := openDesiredCoordinatorStore(t, 1)
+	release := make(chan struct{})
+	preparer := &fleetSourcePreparer{started: make(chan string, 1), release: release}
+	server := &Server{m: &pool.Manager{Store: st}}
+	coordinator := newTenantCoordinator(t.Context(), server, preparer, &fleetLifecycleRuntime{})
+	done := make(chan error, 1)
+	go func() { done <- coordinator.initialize(t.Context()) }()
+	select {
+	case <-preparer.started:
+	case <-time.After(time.Second):
+		t.Fatal("desired preparation did not start")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("initialize returned before proof was available: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, err := st.AccountPresentation(1); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("presentation before proof = %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AccountPresentation(1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInitializeRefreshesDesiredPresentationAfterRestart(t *testing.T) {
+	st := openDesiredCoordinatorStore(t, 1)
+	server := &Server{m: &pool.Manager{Store: st}}
+	first := newTenantCoordinator(
+		t.Context(), server, &fleetSourcePreparer{activation: "activation-1"}, &fleetLifecycleRuntime{},
+	)
+	if err := first.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted := newTenantCoordinator(
+		t.Context(), server, &fleetSourcePreparer{activation: "activation-2"}, &fleetLifecycleRuntime{},
+	)
+	if err := restarted.initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	presentation, err := st.AccountPresentation(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presentation.Proof.FileProvider.ActivationGeneration != "activation-2" {
+		t.Fatalf("restart activation = %q", presentation.Proof.FileProvider.ActivationGeneration)
+	}
+}
+
+func TestConcurrentInitializeConvergesOneDesiredPresentation(t *testing.T) {
+	st := openDesiredCoordinatorStore(t, 1)
+	server := &Server{m: &pool.Manager{Store: st}}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for range 2 {
+		coordinator := newTenantCoordinator(
+			t.Context(), server, &fleetSourcePreparer{release: start}, &fleetLifecycleRuntime{},
+		)
+		go func() { errs <- coordinator.initialize(t.Context()) }()
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	active, err := st.ListActiveAccounts()
+	if err != nil || len(active) != 1 {
+		t.Fatalf("active accounts = %+v err=%v", active, err)
+	}
+	if _, err := st.AccountPresentation(1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInitializeQuarantinesDesiredGenerationMismatch(t *testing.T) {
+	st := openDesiredCoordinatorStore(t, 1)
+	preparer := &fleetSourcePreparer{mutateProof: func(proof *catalogproto.TenantPreparationProof) {
+		proof.Catalog.Generation++
+		proof.Presentation.FileProvider.Generation++
+	}}
+	server := &Server{m: &pool.Manager{Store: st}}
+	coordinator := newTenantCoordinator(t.Context(), server, preparer, &fleetLifecycleRuntime{})
+	err := coordinator.initialize(t.Context())
+	if !errors.Is(err, store.ErrAccountPresentationQuarantined) {
+		t.Fatalf("initialize mismatch = %v, want quarantine", err)
+	}
+	quarantine, err := st.AccountPresentationQuarantine(1)
+	if err != nil || quarantine.Reason != store.AccountPresentationGenerationDrift {
+		t.Fatalf("quarantine = %+v err=%v", quarantine, err)
+	}
+	if active, err := st.ListActiveAccounts(); err != nil || len(active) != 0 {
+		t.Fatalf("active after mismatch = %+v err=%v", active, err)
+	}
+}
+
+func TestInitializeWaitsForStartingHolderAndRejectsDrainingHolder(t *testing.T) {
+	t.Run("starting", func(t *testing.T) {
+		st := openDesiredCoordinatorStore(t, 1)
+		account, err := st.GetAccount(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tenantID, err := pool.TenantAccount(account).TenantID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime := &lifecycleRuntimeStub{
+			provisionResponses: []mountproto.ProvisionTenantResponse{
+				{},
+				{
+					Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+					TenantID: mountproto.TenantID(tenantID), Generation: account.Generation,
+				},
+			},
+			provisionErrors: []error{wire.ErrNotReady, nil},
+		}
+		preparer := &fleetSourcePreparer{}
+		server := &Server{m: &pool.Manager{Store: st}}
+		coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
+		if err := coordinator.initialize(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		prepared, _, _ := preparer.counts()
+		if runtime.provisionCalls != 2 || len(prepared) != 1 {
+			t.Fatalf("startup attempts: provision=%d prepare=%d", runtime.provisionCalls, len(prepared))
+		}
+		if _, err := st.AccountPresentation(1); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("draining", func(t *testing.T) {
+		st := openDesiredCoordinatorStore(t, 1)
+		runtime := &lifecycleRuntimeStub{provisionErr: wire.ErrDraining}
+		preparer := &fleetSourcePreparer{}
+		server := &Server{m: &pool.Manager{Store: st}}
+		coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
+		if err := coordinator.initialize(t.Context()); !errors.Is(err, wire.ErrDraining) {
+			t.Fatalf("initialize draining = %v", err)
+		}
+		prepared, _, _ := preparer.counts()
+		if runtime.provisionCalls != 1 || len(prepared) != 0 {
+			t.Fatalf("draining attempts: provision=%d prepare=%d", runtime.provisionCalls, len(prepared))
+		}
+		if _, err := st.AccountPresentation(1); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("presentation after drain = %v", err)
+		}
+	})
 }
 
 func TestInitializeRecoversRemovalBeforePreparingActiveFleet(t *testing.T) {

@@ -57,6 +57,15 @@ type AccountPresentation struct {
 	ObservedAt        time.Time
 }
 
+// FileProviderPresentationIdentity is the expected immutable presentation
+// identity derived by the product layer for one account generation.
+type FileProviderPresentationIdentity struct {
+	TenantID   string
+	DomainID   string
+	Generation uint64
+	PublicPath string
+}
+
 // AccountPresentationQuarantineReason classifies exact presentation identity drift.
 type AccountPresentationQuarantineReason string
 
@@ -128,6 +137,73 @@ func (s *Store) ObserveAccountPresentation(account Account, proof PresentationPr
 		return ErrAccountPresentationQuarantined
 	}
 	if err := ValidatePresentationPreparationProofAdvance(bound.Proof, proof); err != nil {
+		return err
+	}
+	if err := upsertAccountPresentation(tx, AccountPresentation{
+		AccountID: current.ID, AccountInstanceID: current.InstanceID,
+		AccountGeneration: current.Generation, Proof: proof, ObservedAt: s.now(),
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// BindDesiredAccountPresentation atomically installs the first live holder
+// proof for a desired account or advances an already-bound exact identity.
+func (s *Store) BindDesiredAccountPresentation(
+	account Account,
+	expected FileProviderPresentationIdentity,
+	proof PresentationPreparationProof,
+) error {
+	if err := validatePresentationPreparationProof(proof); err != nil {
+		return err
+	}
+	if err := validateExpectedPresentationIdentity(account, expected); err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, err := presentationAccount(tx, account.ID)
+	if err != nil {
+		return err
+	}
+	if !samePresentationAccount(current, account) {
+		return ErrAccountGenerationChanged
+	}
+	if _, err := accountPresentationQuarantine(tx, account.ID); err == nil {
+		return ErrAccountPresentationQuarantined
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if _, err := desiredPresentationAccount(tx, account.ID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrAccountPresentationBusy
+		}
+		return err
+	}
+	if reason := expectedPresentationMismatch(expected, proof); reason != "" {
+		quarantine := AccountPresentationQuarantine{
+			AccountID: current.ID, AccountInstanceID: current.InstanceID,
+			AccountGeneration: current.Generation, ExpectedConfigDir: current.ConfigDir,
+			Proof: proof, Reason: reason, CreatedAt: s.now(),
+		}
+		if err := insertAccountPresentationQuarantine(tx, quarantine); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return ErrAccountPresentationQuarantined
+	}
+	bound, err := accountPresentation(tx, account.ID)
+	if err == nil {
+		if err := ValidatePresentationPreparationProofAdvance(bound.Proof, proof); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	if err := upsertAccountPresentation(tx, AccountPresentation{
@@ -953,6 +1029,36 @@ func exactPresentationPath(path string) bool {
 	return filepath.IsAbs(path) && filepath.Clean(path) == path && !strings.ContainsRune(path, 0)
 }
 
+func validateExpectedPresentationIdentity(account Account, expected FileProviderPresentationIdentity) error {
+	if validateAccountInstanceID(account.InstanceID) != nil ||
+		expected.TenantID != "account-"+account.InstanceID ||
+		expected.DomainID == "" || strings.ContainsRune(expected.DomainID, 0) ||
+		expected.Generation != account.Generation || expected.PublicPath != account.ConfigDir ||
+		!exactPresentationPath(expected.PublicPath) {
+		return ErrAccountPresentationEvidence
+	}
+	return nil
+}
+
+func expectedPresentationMismatch(
+	expected FileProviderPresentationIdentity,
+	proof PresentationPreparationProof,
+) AccountPresentationQuarantineReason {
+	if proof.CatalogTenantID != expected.TenantID || proof.FileProvider.TenantID != expected.TenantID {
+		return AccountPresentationTenantIDDrift
+	}
+	if proof.FileProvider.DomainID != expected.DomainID {
+		return AccountPresentationDomainIDDrift
+	}
+	if proof.CatalogGeneration != expected.Generation || proof.FileProvider.Generation != expected.Generation {
+		return AccountPresentationGenerationDrift
+	}
+	if proof.FileProvider.PublicPath != expected.PublicPath {
+		return AccountPresentationPublicPathDrift
+	}
+	return ""
+}
+
 func samePresentationAccount(current, expected Account) bool {
 	return current.ID == expected.ID && current.InstanceID == expected.InstanceID &&
 		current.Generation == expected.Generation && current.ConfigDir == expected.ConfigDir &&
@@ -993,6 +1099,13 @@ type presentationQueryer interface {
 func presentationAccount(queryer presentationQueryer, accountID int) (Account, error) {
 	return scanAccount(queryer.QueryRow(
 		`SELECT `+accountCols+` FROM accounts WHERE id=? AND deleted_at IS NULL`, accountID,
+	))
+}
+
+func desiredPresentationAccount(queryer presentationQueryer, accountID int) (Account, error) {
+	return scanAccount(queryer.QueryRow(
+		`SELECT `+accountCols+` FROM accounts WHERE accounts.id=? AND `+desiredAccountPredicate,
+		accountID,
 	))
 }
 

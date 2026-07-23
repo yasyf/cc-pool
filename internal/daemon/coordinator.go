@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
+	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/mountproto"
@@ -21,6 +23,7 @@ import (
 const (
 	accountRemovalRecoveryConcurrency = 4
 	tenantProvisionConcurrency        = 4
+	tenantStartingRetryDelay          = 100 * time.Millisecond
 )
 
 type sourcePreparer interface {
@@ -92,9 +95,9 @@ func (c *tenantCoordinator) initialize(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
-	accounts, err := c.server.m.Store.ListActiveAccounts()
+	accounts, err := c.server.m.Store.ListDesiredAccounts()
 	if err != nil {
-		return fmt.Errorf("list active accounts for tenant recovery: %w", err)
+		return fmt.Errorf("list desired accounts for tenant recovery: %w", err)
 	}
 	prepareContext := ctx
 	if c.lifecycle != nil {
@@ -104,16 +107,69 @@ func (c *tenantCoordinator) initialize(ctx context.Context) error {
 	}
 	var group errgroup.Group
 	group.SetLimit(tenantProvisionConcurrency)
-	for _, active := range accounts {
-		account := active
+	for _, desired := range accounts {
+		account := desired
 		group.Go(func() error {
-			if _, err := c.prepare(prepareContext, account); err != nil {
+			if err := c.prepareDesiredAccount(prepareContext, account); err != nil {
 				return fmt.Errorf("recover acct-%02d tenant: %w", account.ID, err)
 			}
 			return nil
 		})
 	}
 	return group.Wait()
+}
+
+func (c *tenantCoordinator) prepareDesiredAccount(ctx context.Context, account store.Account) error {
+	for {
+		proof, err := c.prepare(ctx, account)
+		if errors.Is(err, wire.ErrNotReady) {
+			timer := time.NewTimer(tenantStartingRetryDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+				continue
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if err := c.activatePrepared(ctx, account, proof, func() error { return nil }); err != nil {
+			return err
+		}
+		stored, err := projectPreparationProof(proof)
+		if err != nil {
+			return err
+		}
+		expected, err := expectedPresentationIdentity(account)
+		if err != nil {
+			return err
+		}
+		if err := c.server.m.Store.BindDesiredAccountPresentation(account, expected, stored); err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
+func expectedPresentationIdentity(account store.Account) (store.FileProviderPresentationIdentity, error) {
+	tenantAccount := pool.TenantAccount(account)
+	tenantID, err := tenantAccount.TenantID()
+	if err != nil {
+		return store.FileProviderPresentationIdentity{}, err
+	}
+	domainID, err := catalogproto.DeriveDomainID(
+		tenantfs.OwnerID,
+		catalogproto.PresentationInstanceID(account.InstanceID),
+	)
+	if err != nil {
+		return store.FileProviderPresentationIdentity{}, err
+	}
+	return store.FileProviderPresentationIdentity{
+		TenantID: string(tenantID), DomainID: string(domainID),
+		Generation: account.Generation, PublicPath: account.ConfigDir,
+	}, nil
 }
 
 func recoverAccountRemovals(
