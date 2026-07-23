@@ -1,11 +1,7 @@
 // Package holderbridge binds cc-pool's signed application to FuseKit.
 package holderbridge
 
-import (
-	"fmt"
-
-	"github.com/yasyf/fusekit/holder"
-)
+import "github.com/yasyf/fusekit/holder"
 
 const (
 	// BundleID is the fixed signed status helper application's bundle identifier.
@@ -51,7 +47,7 @@ func RuntimePlanSpec(
 func NewRuntimePlan(appPath, runtimeDirectory, buildID string) (holder.RuntimePlan, error) {
 	plan, err := holder.NewRuntimePlan(RuntimePlanSpec(appPath, runtimeDirectory, buildID))
 	if err != nil {
-		return holder.RuntimePlan{}, fmt.Errorf("holderbridge: create runtime plan: %w", err)
+		return holder.RuntimePlan{}, err
 	}
 	return plan, nil
 }
