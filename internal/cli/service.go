@@ -24,7 +24,7 @@ import (
 var (
 	scanSessions                = procscan.Scan
 	stopDaemon                  = stopDaemonService
-	ensureHolder                = daemon.InstallHolderService
+	ensureHolder                = func(ctx context.Context) (holderServiceInstall, error) { return daemon.InstallHolderService(ctx) }
 	stopHolder                  = daemon.StopAndUninstallHolderService
 	serviceExecutable           = resolveDaemonServiceExecutable
 	daemonServiceReady          = waitForDaemonService
@@ -50,6 +50,11 @@ type daemonServiceController interface {
 	Converge(context.Context, []service.Agent) error
 	StopRuntime(context.Context, service.StopControlSpec) (wire.StopResult, error)
 	Close(context.Context) error
+}
+
+type holderServiceInstall interface {
+	Commit()
+	Rollback(context.Context) error
 }
 
 func ccpAgent(executable string) (service.Agent, error) {
@@ -151,11 +156,11 @@ func newServiceUninstallCmd() *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Stop the daemon; --purge also removes pool state",
-		Long: `uninstall stops the background daemon. --purge additionally removes all pool
-accounts, their Keychain items, and ~/.cc-pool after refusing while live claude sessions
-use those private account directories unless --force vouches for them. ~/.claude is never
-touched.`,
+		Short: "Stop the daemon; --purge also deprovisions accounts and removes pool state",
+		Long: `uninstall stops only the background daemon and preserves the signed runtime and
+File Provider domains. --purge additionally deprovisions all accounts, removes their
+Keychain items and ~/.cc-pool, and refuses while live claude sessions use those private
+account directories unless --force vouches for them. ~/.claude is never touched.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runServiceUninstall(cmd, purge, force)
@@ -193,6 +198,9 @@ func runServiceUninstall(cmd *cobra.Command, purge, force bool) error {
 	if !purge {
 		note(out, "Your accounts and state are preserved. Run `ccp service install` to resume.")
 		return nil
+	}
+	if err := stopHolder(cmd.Context()); err != nil {
+		return err
 	}
 	return purgeAll(cmd)
 }
@@ -236,10 +244,7 @@ func stopDaemonService(cmd *cobra.Command) error {
 	}); err != nil {
 		return err
 	}
-	if err := stopHolder(cmd.Context()); err != nil {
-		return err
-	}
-	success(out, "Removed the daemon and FuseKit runtime LaunchAgents.")
+	success(out, "Removed the daemon LaunchAgent. The signed FuseKit runtime and File Provider domains are preserved.")
 	return nil
 }
 
@@ -311,13 +316,23 @@ func installDaemonService(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	if err := ensureHolder(ctx); err != nil {
+	holderInstall, err := ensureHolder(ctx)
+	if err != nil {
 		return err
 	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), daemonServiceCloseTimeout)
+		defer cancel()
+		err = errors.Join(err, holderInstall.Rollback(rollbackCtx))
+	}()
 	if err := withDaemonServiceController(ctx, func(controller daemonServiceController) error {
 		if err := stopObservedDaemonRuntime(ctx, controller, executable, wire.StopIntentUpgrade); err != nil {
 			return err
 		}
+		holderInstall.Commit()
 		if err := controller.Converge(ctx, []service.Agent{agent}); err != nil {
 			return err
 		}

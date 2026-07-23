@@ -23,6 +23,23 @@ type recordingDeployer struct {
 	deactivateCalls int
 	deactivate      deployment.DeactivateConfig
 	deactivation    deactivationResult
+	statuses        []deploymentStatus
+	statusCalls     int
+}
+
+func (d *recordingDeployer) Status(
+	_ context.Context,
+	_ deployment.Config,
+) (deploymentStatus, error) {
+	index := d.statusCalls
+	d.statusCalls++
+	if len(d.statuses) == 0 {
+		return deploymentStatus{}, nil
+	}
+	if index >= len(d.statuses) {
+		index = len(d.statuses) - 1
+	}
+	return d.statuses[index], nil
 }
 
 func (d *recordingDeployer) Deactivate(
@@ -131,7 +148,8 @@ func TestInstallServiceDeploysExactGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !receipt.hasCurrent || receipt.current.Path != pool.WidgetAppPath() || controller.calls != 1 {
+	if receipt.Current.State != ServiceDeploymentActive ||
+		receipt.Current.Holder.Path != pool.WidgetAppPath() || controller.calls != 1 {
 		t.Fatalf("receipt/calls = %#v/%d", receipt, controller.calls)
 	}
 	config := controller.config
@@ -142,7 +160,7 @@ func TestInstallServiceDeploysExactGeneration(t *testing.T) {
 		config.BuildPlan == nil || config.Readiness == nil {
 		t.Fatalf("deployment config = %#v", config)
 	}
-	if got, want := receipt.current.Path, filepath.Join(home, "Applications", "CCPoolStatus.app"); got != want {
+	if got, want := receipt.Current.Holder.Path, filepath.Join(home, "Applications", "CCPoolStatus.app"); got != want {
 		t.Fatalf("app path = %q, want %q", got, want)
 	}
 }
@@ -175,6 +193,114 @@ func TestInstallServiceReturnsDeploymentFailure(t *testing.T) {
 	want := errors.New("deployment failed")
 	if _, err := installService(t.Context(), &recordingDeployer{err: want}); !errors.Is(err, want) {
 		t.Fatalf("error = %v, want %v", err, want)
+	}
+}
+
+func TestInstallServiceReceiptDistinguishesPreexistingAndNewActivation(t *testing.T) {
+	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("ab", 32))
+	setCanonicalTestHome(t)
+	release, err := release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, plan := exactDeploymentReceipt(t, release, deployment.DeploymentActive)
+	useDeploymentHooks(t, plan)
+
+	preexisting, err := installService(t.Context(), &recordingDeployer{
+		receipt:  active,
+		statuses: []deploymentStatus{{receipt: active, hasReceipt: true, configMatches: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preexisting.Changed || preexisting.NewlyActivated || preexisting.Prior != preexisting.Current {
+		t.Fatalf("preexisting receipt = %#v", preexisting)
+	}
+
+	created, err := installService(t.Context(), &recordingDeployer{receipt: active})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created.Changed || !created.NewlyActivated || created.Prior.State != ServiceDeploymentAbsent ||
+		created.Current.State != ServiceDeploymentActive {
+		t.Fatalf("new activation receipt = %#v", created)
+	}
+}
+
+func TestInstallServiceRecoversLostDeployResponseFromExactStatus(t *testing.T) {
+	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("ab", 32))
+	setCanonicalTestHome(t)
+	release, err := release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, plan := exactDeploymentReceipt(t, release, deployment.DeploymentActive)
+	useDeploymentHooks(t, plan)
+	want := errors.New("deployment response lost")
+	controller := &recordingDeployer{
+		receipt: active, err: want,
+		statuses: []deploymentStatus{
+			{},
+			{receipt: active, hasReceipt: true, configMatches: true},
+		},
+	}
+	receipt, err := installService(t.Context(), controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !receipt.NewlyActivated || receipt.Current.OperationID != active.operationID || controller.statusCalls != 2 {
+		t.Fatalf("receipt/status calls = %#v/%d", receipt, controller.statusCalls)
+	}
+}
+
+func TestServiceInstallReceiptRollbackIsExactAndIdempotentAfterLostResponse(t *testing.T) {
+	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("ab", 32))
+	setCanonicalTestHome(t)
+	release, err := release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, plan := exactDeploymentReceipt(t, release, deployment.DeploymentActive)
+	inactive := active
+	inactive.state = deployment.DeploymentInactive
+	emptyPlan, err := service.NewPlan(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inactive.plan = emptyPlan
+	useDeploymentHooks(t, plan)
+	receipt := ServiceInstallReceipt{
+		Prior: ServiceDeployment{State: ServiceDeploymentAbsent}, Current: publicServiceDeployment(active),
+		Changed: true, NewlyActivated: true,
+	}
+	want := errors.New("deactivation response lost")
+	controller := &recordingDeployer{
+		err: want, deactivation: deactivationResult{
+			state: deployment.DeactivationInactive, receipt: inactive, hasReceipt: true,
+		},
+		statuses: []deploymentStatus{
+			{receipt: active, hasReceipt: true, configMatches: true},
+			{receipt: inactive, hasReceipt: true, configMatches: true},
+		},
+	}
+	if err := rollbackService(t.Context(), controller, receipt); !errors.Is(err, want) {
+		t.Fatalf("first rollback error = %v, want lost response", err)
+	}
+	if err := rollbackService(t.Context(), controller, receipt); err != nil {
+		t.Fatalf("idempotent rollback: %v", err)
+	}
+	if controller.deactivateCalls != 1 || controller.statusCalls != 2 {
+		t.Fatalf("deactivate/status calls = %d/%d", controller.deactivateCalls, controller.statusCalls)
+	}
+
+	preexisting := receipt
+	preexisting.Prior = publicServiceDeployment(active)
+	preexisting.NewlyActivated = false
+	untouched := &recordingDeployer{}
+	if err := rollbackService(t.Context(), untouched, preexisting); err != nil ||
+		untouched.statusCalls != 0 || untouched.deactivateCalls != 0 {
+		t.Fatalf("preexisting rollback touched deployment: status=%d deactivate=%d err=%v",
+			untouched.statusCalls, untouched.deactivateCalls, err)
 	}
 }
 

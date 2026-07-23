@@ -82,6 +82,24 @@ type testDaemonServiceController struct {
 	closeErr    error
 }
 
+type testHolderServiceInstall struct {
+	committed        bool
+	rollbackAttempts int
+	deactivations    int
+	rollbackErr      error
+}
+
+func (i *testHolderServiceInstall) Commit() { i.committed = true }
+
+func (i *testHolderServiceInstall) Rollback(context.Context) error {
+	i.rollbackAttempts++
+	if i.committed {
+		return nil
+	}
+	i.deactivations++
+	return i.rollbackErr
+}
+
 func (c *testDaemonServiceController) Converge(_ context.Context, agents []service.Agent) error {
 	c.desired = append(c.desired, append([]service.Agent(nil), agents...))
 	return c.convergeErr
@@ -165,9 +183,10 @@ func TestRunServiceInstallConvergesExactExecutableAgent(t *testing.T) {
 	swapVar(t, &serviceExecutable, func() (string, error) { return executable, nil })
 	holderReady := false
 	daemonReady := false
-	swapVar(t, &ensureHolder, func(context.Context) error {
+	holderInstall := &testHolderServiceInstall{}
+	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
 		holderReady = true
-		return nil
+		return holderInstall, nil
 	})
 	controller := &testDaemonServiceController{}
 	useDaemonServiceController(t, controller)
@@ -192,6 +211,9 @@ func TestRunServiceInstallConvergesExactExecutableAgent(t *testing.T) {
 	if !daemonReady {
 		t.Fatal("service install returned before daemon readiness")
 	}
+	if !holderInstall.committed || holderInstall.rollbackAttempts != 0 {
+		t.Fatalf("holder install = %+v", holderInstall)
+	}
 	if len(controller.desired) != 1 || len(controller.desired[0]) != 1 {
 		t.Fatalf("desired = %+v", controller.desired)
 	}
@@ -213,8 +235,9 @@ func TestRunServiceInstallFailsClosedWhenDaemonIsNotReady(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			executable := filepath.Join(t.TempDir(), "ccp")
 			swapVar(t, &serviceExecutable, func() (string, error) { return executable, nil })
-			swapVar(t, &ensureHolder, func(context.Context) error {
-				return nil
+			holderInstall := &testHolderServiceInstall{}
+			swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
+				return holderInstall, nil
 			})
 			controller := &testDaemonServiceController{}
 			useDaemonServiceController(t, controller)
@@ -229,6 +252,9 @@ func TestRunServiceInstallFailsClosedWhenDaemonIsNotReady(t *testing.T) {
 			if len(controller.desired) != 2 || controller.desired[1] != nil {
 				t.Fatalf("desired calls = %+v, want daemon install then empty rollback", controller.desired)
 			}
+			if !holderInstall.committed || holderInstall.deactivations != 0 {
+				t.Fatalf("holder install = %+v", holderInstall)
+			}
 			if strings.Contains(stripANSI(out.String()), "Installed and started") {
 				t.Fatalf("claimed install success: %q", out.String())
 			}
@@ -239,7 +265,7 @@ func TestRunServiceInstallFailsClosedWhenDaemonIsNotReady(t *testing.T) {
 func TestRunServiceInstallStopsBeforeControllerWhenHolderFails(t *testing.T) {
 	want := errors.New("holder not ready")
 	swapVar(t, &serviceExecutable, func() (string, error) { return filepath.Join(t.TempDir(), "ccp"), nil })
-	swapVar(t, &ensureHolder, func(context.Context) error { return want })
+	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) { return nil, want })
 	opened := false
 	swapVar(t, &openDaemonServiceController, func(context.Context) (daemonServiceController, error) {
 		opened = true
@@ -258,9 +284,9 @@ func TestRunServiceInstallStopsBeforeControllerWhenHolderFails(t *testing.T) {
 func TestRunServiceInstallResolvesDaemonBeforeCreatingHolder(t *testing.T) {
 	want := errors.New("current executable unavailable")
 	swapVar(t, &serviceExecutable, func() (string, error) { return "", want })
-	swapVar(t, &ensureHolder, func(context.Context) error {
+	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
 		t.Fatal("created holder before resolving daemon executable")
-		return nil
+		return nil, nil
 	})
 	cmd, _, _ := uninstallCmd()
 	cmd.SetContext(t.Context())
@@ -269,15 +295,30 @@ func TestRunServiceInstallResolvesDaemonBeforeCreatingHolder(t *testing.T) {
 	}
 }
 
+func TestRunServiceInstallRollsBackNewHolderBeforeDaemonBootstrap(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "ccp")
+	swapVar(t, &serviceExecutable, func() (string, error) { return executable, nil })
+	holderInstall := &testHolderServiceInstall{}
+	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) { return holderInstall, nil })
+	want := errors.New("controller unavailable")
+	swapVar(t, &openDaemonServiceController, func(context.Context) (daemonServiceController, error) {
+		return nil, want
+	})
+	cmd, _, _ := uninstallCmd()
+	cmd.SetContext(t.Context())
+	if err := runServiceInstall(cmd); !errors.Is(err, want) {
+		t.Fatalf("error = %v, want controller failure", err)
+	}
+	if holderInstall.committed || holderInstall.rollbackAttempts != 1 || holderInstall.deactivations != 1 {
+		t.Fatalf("holder install = %+v", holderInstall)
+	}
+}
+
 func TestRunServiceInstallPreservesAtomicHelperDeploymentAfterDaemonFailure(t *testing.T) {
 	executable := filepath.Join(t.TempDir(), "ccp")
 	swapVar(t, &serviceExecutable, func() (string, error) { return executable, nil })
-	swapVar(t, &ensureHolder, func(context.Context) error { return nil })
-	stops := 0
-	swapVar(t, &stopHolder, func(context.Context) error {
-		stops++
-		return nil
-	})
+	holderInstall := &testHolderServiceInstall{}
+	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) { return holderInstall, nil })
 	want := errors.New("daemon convergence failed")
 	useDaemonServiceController(t, &testDaemonServiceController{convergeErr: want})
 	cmd, _, _ := uninstallCmd()
@@ -285,8 +326,8 @@ func TestRunServiceInstallPreservesAtomicHelperDeploymentAfterDaemonFailure(t *t
 	if err := runServiceInstall(cmd); !errors.Is(err, want) {
 		t.Fatalf("error = %v, want daemon convergence failure", err)
 	}
-	if stops != 0 {
-		t.Fatalf("helper stop calls = %d, want 0", stops)
+	if !holderInstall.committed || holderInstall.deactivations != 0 {
+		t.Fatalf("holder install = %+v", holderInstall)
 	}
 }
 
@@ -317,6 +358,10 @@ func TestUninstallWithoutPurgeStopsDaemonAndPreservesState(t *testing.T) {
 	stopped := false
 	swapVar(t, &stopDaemon, func(*cobra.Command) error {
 		stopped = true
+		return nil
+	})
+	swapVar(t, &stopHolder, func(context.Context) error {
+		t.Fatal("non-purge uninstall deactivated the signed holder")
 		return nil
 	})
 	cmd, out, _ := uninstallCmd()
@@ -359,12 +404,17 @@ func TestPurgeSessionGateIsExactAndForceable(t *testing.T) {
 		stopped = true
 		return nil
 	})
+	holderStopped := false
+	swapVar(t, &stopHolder, func(context.Context) error {
+		holderStopped = true
+		return nil
+	})
 	cmd, _, _ := uninstallCmd()
 	if err := runServiceUninstall(cmd, true, true); err != nil {
 		t.Fatal(err)
 	}
-	if scanned || !stopped {
-		t.Fatalf("scanned = %t, stopped = %t", scanned, stopped)
+	if scanned || !stopped || !holderStopped {
+		t.Fatalf("scanned = %t, daemon stopped = %t, holder stopped = %t", scanned, stopped, holderStopped)
 	}
 }
 
@@ -387,17 +437,22 @@ func TestStopDaemonServiceControllerFailureIsFatal(t *testing.T) {
 	}
 }
 
-func TestStopDaemonServiceSettlesHolderBeforeSuccess(t *testing.T) {
+func TestStopDaemonServicePreservesHolderAndDomains(t *testing.T) {
 	tempHome(t)
 	controller := &testDaemonServiceController{}
 	useDaemonServiceController(t, controller)
-	swapVar(t, &stopHolder, func(context.Context) error { return nil })
+	swapVar(t, &stopHolder, func(context.Context) error {
+		t.Fatal("daemon-only stop deactivated the signed holder")
+		return nil
+	})
 	cmd, out, _ := uninstallCmd()
 	cmd.SetContext(t.Context())
 	if err := stopDaemonService(cmd); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stripANSI(out.String()), "Removed the daemon and FuseKit runtime LaunchAgents") {
+	message := stripANSI(out.String())
+	if !strings.Contains(message, "Removed the daemon LaunchAgent") ||
+		!strings.Contains(message, "signed FuseKit runtime and File Provider domains are preserved") {
 		t.Fatalf("output = %q", out.String())
 	}
 	if len(controller.desired) != 1 || controller.desired[0] != nil || controller.closed != 1 {
@@ -405,19 +460,24 @@ func TestStopDaemonServiceSettlesHolderBeforeSuccess(t *testing.T) {
 	}
 }
 
-func TestStopDaemonServiceDoesNotClaimSuccessWhenHolderStopFails(t *testing.T) {
+func TestPurgeStopsBeforeStateRemovalWhenHolderDeactivationFails(t *testing.T) {
 	tempHome(t)
-	controller := &testDaemonServiceController{}
-	useDaemonServiceController(t, controller)
+	if err := pool.EnsureStateDir(); err != nil {
+		t.Fatal(err)
+	}
+	swapVar(t, &stopDaemon, func(*cobra.Command) error { return nil })
 	want := errors.New("holder remained live")
 	swapVar(t, &stopHolder, func(context.Context) error { return want })
 	cmd, out, _ := uninstallCmd()
 	cmd.SetContext(t.Context())
-	if err := stopDaemonService(cmd); !errors.Is(err, want) {
+	if err := runServiceUninstall(cmd, true, true); !errors.Is(err, want) {
 		t.Fatalf("error = %v, want holder failure", err)
 	}
-	if strings.Contains(stripANSI(out.String()), "Removed the daemon") {
-		t.Fatalf("claimed success: %s", out.String())
+	if _, err := os.Stat(pool.StateDir()); err != nil {
+		t.Fatalf("state removed after holder deactivation failure: %v", err)
+	}
+	if strings.Contains(stripANSI(out.String()), "Purged all pool state") {
+		t.Fatalf("claimed purge success: %s", out.String())
 	}
 }
 
@@ -454,7 +514,7 @@ func TestPurgeAllRemovesCleanState(t *testing.T) {
 func TestUninstallHelpMentionsPurgeGate(t *testing.T) {
 	cmd := newServiceUninstallCmd()
 	help := cmd.Short + "\n" + cmd.Long
-	for _, want := range []string{"live claude sessions", "--force", "~/.claude is never"} {
+	for _, want := range []string{"preserves the signed runtime", "deprovisions all accounts", "live claude sessions", "--force", "~/.claude is never"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("help missing %q", want)
 		}
