@@ -224,7 +224,9 @@ func runCredentialOperationObserved[T any](
 		account.KeychainService, account.KeychainAccount,
 	)
 	operationID, err := store.NewCredentialOperationID(
-		account.InstanceID, account.Generation, kind, codec.target, locator, expected, intent,
+		account.InstanceID, account.Generation, account.ConfigDir,
+		account.KeychainService, account.KeychainAccount,
+		kind, codec.target, locator, expected, intent,
 	)
 	if err != nil {
 		return zero, err
@@ -247,7 +249,9 @@ func runCredentialOperationObserved[T any](
 					return zero, err
 				}
 				operationID, err = store.NewCredentialOperationID(
-					account.InstanceID, account.Generation, kind, codec.target, locator, expected, intent,
+					account.InstanceID, account.Generation, account.ConfigDir,
+					account.KeychainService, account.KeychainAccount,
+					kind, codec.target, locator, expected, intent,
 				)
 				if err != nil {
 					return zero, err
@@ -300,7 +304,9 @@ func runCredentialOperationObserved[T any](
 				return zero, err
 			}
 			operationID, err = store.NewCredentialOperationID(
-				account.InstanceID, account.Generation, kind, codec.target, locator, expected, intent,
+				account.InstanceID, account.Generation, account.ConfigDir,
+				account.KeychainService, account.KeychainAccount,
+				kind, codec.target, locator, expected, intent,
 			)
 			if err != nil {
 				return zero, err
@@ -336,12 +342,14 @@ func executeCredentialOperation[T any](
 				OperationID: operationID,
 				AccountID:   account.ID, AccountInstanceID: account.InstanceID,
 				AccountGeneration: account.Generation,
-				LocatorDigest:     locator,
-				Owner:             owner,
-				Kind:              kind,
-				Target:            codec.target,
-				IntentDigest:      intent,
-				Expected:          expected,
+				ConfigDir:         account.ConfigDir, KeychainService: account.KeychainService,
+				KeychainAccount: account.KeychainAccount,
+				LocatorDigest:   locator,
+				Owner:           owner,
+				Kind:            kind,
+				Target:          codec.target,
+				IntentDigest:    intent,
+				Expected:        expected,
 			},
 		)
 		switch {
@@ -574,6 +582,17 @@ func applyCredentialOperation[T any](
 	if observeErr != nil {
 		return result, errors.Join(operationErr, observeErr)
 	}
+	if !boundary.crossed && boundary.operation.Kind == store.CredentialOperationRemove &&
+		(operationErr != nil || !sameStoreObservation(expected, after)) {
+		applying, markErr := manager.Store.MarkCredentialOperationApplying(
+			boundary.operation.Fence(), nil,
+		)
+		if markErr != nil {
+			return result, errors.Join(operationErr, markErr)
+		}
+		boundary.operation = applying
+		boundary.crossed = true
+	}
 	if !boundary.crossed {
 		if !sameStoreObservation(expected, after) {
 			_ = manager.Store.AbandonPreparedCredentialOperation(operation.Fence())
@@ -602,7 +621,10 @@ func applyCredentialOperation[T any](
 	category := codec.resultCode(result, operationErr)
 	failureClass := store.CredentialFailureNone
 	outcome := actual
-	if boundary.operation.Kind == store.CredentialOperationCompensate &&
+	if boundary.operation.Kind == store.CredentialOperationRemove && credentialStateEmpty(actual) {
+		category = store.CredentialResultDone
+	} else if (boundary.operation.Kind == store.CredentialOperationCompensate ||
+		boundary.operation.Kind == store.CredentialOperationRemove) &&
 		!credentialStateEmpty(actual) {
 		status = store.CredentialTerminalQuarantined
 		category = store.CredentialResultChangedUnderfoot
@@ -766,6 +788,9 @@ func credentialReceiptMatchesInvocation(
 	return receipt.AccountID == account.ID &&
 		receipt.AccountInstanceID == account.InstanceID &&
 		receipt.AccountGeneration == account.Generation &&
+		receipt.ConfigDir == account.ConfigDir &&
+		receipt.KeychainService == account.KeychainService &&
+		receipt.KeychainAccount == account.KeychainAccount &&
 		receipt.Kind == kind && receipt.Target == target &&
 		receipt.LocatorDigest == locator &&
 		receipt.IntentDigest == intent
@@ -988,6 +1013,104 @@ func (m *Manager) CompensateQuarantinedCredentialState(
 	)
 }
 
+func (m *Manager) removeCredentialForAccountRemoval(
+	ctx context.Context,
+	account store.Account,
+) error {
+	intent, err := store.CredentialRemovalIntentDigest(
+		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
+		account.KeychainService, account.KeychainAccount,
+	)
+	if err != nil {
+		return err
+	}
+	locator := store.CredentialKeychainLocatorDigest(
+		account.KeychainService, account.KeychainAccount,
+	)
+	query := store.CredentialOperationEvidenceQuery{
+		AccountID: account.ID, AccountInstanceID: account.InstanceID,
+		AccountGeneration: account.Generation, ConfigDir: account.ConfigDir,
+		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
+		LocatorDigest: locator, Kind: store.CredentialOperationRemove,
+		Target: store.CredentialTargetKeychain, IntentDigest: intent,
+	}
+	active, receipt, err := m.Store.CredentialOperationEvidence(query)
+	if err != nil {
+		return err
+	}
+	codec := unitCredentialOperationCodec(store.CredentialTargetKeychain)
+	codec.intent = &intent
+	if receipt != nil {
+		if _, err := replayCredentialOperation(ctx, m, account, codec, *receipt); err != nil {
+			return err
+		}
+		return m.requireCredentialAbsent(ctx, account)
+	}
+	if active != nil {
+		receipt, err := m.waitCredentialOperation(ctx, active.Token)
+		if err != nil {
+			return err
+		}
+		if _, err := replayCredentialOperation(ctx, m, account, codec, receipt); err != nil {
+			return err
+		}
+		return m.requireCredentialAbsent(ctx, account)
+	}
+	_, err = runCredentialOperationObserved(
+		ctx, m, account, store.CredentialOperationRemove, codec,
+		m.credentialMutationObservation,
+		func(ctx context.Context, boundary *credentialOperationBoundary) (struct{}, error) {
+			actual, err := m.credentialMutationObservation(ctx, account)
+			if err != nil {
+				return struct{}{}, err
+			}
+			if !credentialStateReadable(actual) {
+				return struct{}{}, ErrCredentialUnverifiable
+			}
+			if credentialStateEmpty(actual) {
+				return struct{}{}, nil
+			}
+			if err := boundary.Cross(ctx); err != nil {
+				return struct{}{}, err
+			}
+			if m.credentialCAS == nil {
+				return struct{}{}, errors.New("credential CAS worker is unavailable")
+			}
+			proof, err := m.credentialCAS(
+				ctx, account, boundary.expected, credentialCASMutation{Delete: true},
+			)
+			if errors.Is(err, errCredentialCASConflict) {
+				return struct{}{}, ErrCredentialChangedUnderfoot
+			}
+			if err != nil {
+				return struct{}{}, err
+			}
+			if !credentialStateEmpty(proof.After) {
+				return struct{}{}, ErrCredentialChangedUnderfoot
+			}
+			return struct{}{}, nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+	return m.requireCredentialAbsent(ctx, account)
+}
+
+func (m *Manager) requireCredentialAbsent(ctx context.Context, account store.Account) error {
+	actual, err := m.credentialMutationObservation(ctx, account)
+	if err != nil {
+		return err
+	}
+	if !credentialStateReadable(actual) {
+		return ErrCredentialUnverifiable
+	}
+	if !credentialStateEmpty(actual) {
+		return ErrCredentialChangedUnderfoot
+	}
+	return nil
+}
+
 func (m *Manager) compensateCredentialStateObserved(
 	ctx context.Context,
 	account store.Account,
@@ -1004,6 +1127,9 @@ func (m *Manager) compensateCredentialStateObserved(
 		store.CredentialOperationEvidenceQuery{
 			AccountID: account.ID, AccountInstanceID: account.InstanceID,
 			AccountGeneration: account.Generation,
+			ConfigDir:         account.ConfigDir,
+			KeychainService:   account.KeychainService,
+			KeychainAccount:   account.KeychainAccount,
 			LocatorDigest: store.CredentialKeychainLocatorDigest(
 				account.KeychainService, account.KeychainAccount,
 			),
@@ -1311,6 +1437,9 @@ func (m *Manager) recoverCredentialOperation(
 	}
 	if account.InstanceID != operation.AccountInstanceID ||
 		account.Generation != operation.AccountGeneration ||
+		account.ConfigDir != operation.ConfigDir ||
+		account.KeychainService != operation.KeychainService ||
+		account.KeychainAccount != operation.KeychainAccount ||
 		store.CredentialKeychainLocatorDigest(
 			account.KeychainService,
 			account.KeychainAccount,
@@ -1331,7 +1460,8 @@ func (m *Manager) recoverCredentialOperation(
 	if err != nil {
 		return err
 	}
-	if operation.State == store.CredentialOperationPrepared {
+	if operation.State == store.CredentialOperationPrepared &&
+		operation.Kind != store.CredentialOperationRemove {
 		return m.Store.AbandonPreparedCredentialOperation(operation.Fence())
 	}
 	return m.recoverRetiredCredentialOperation(ctx, account, operation)
@@ -1344,8 +1474,17 @@ func (m *Manager) credentialOperationAccount(
 	if err == nil || !errors.Is(err, store.ErrAccountNotFound) {
 		return account, err
 	}
-	if operation.Kind != store.CredentialOperationCompensate ||
-		operation.Target != store.CredentialTargetKeychain {
+	if operation.Target != store.CredentialTargetKeychain {
+		return store.Account{}, err
+	}
+	if operation.Kind == store.CredentialOperationRemove {
+		return store.Account{
+			ID: operation.AccountID, InstanceID: operation.AccountInstanceID,
+			Generation: operation.AccountGeneration, ConfigDir: operation.ConfigDir,
+			KeychainService: operation.KeychainService, KeychainAccount: operation.KeychainAccount,
+		}, nil
+	}
+	if operation.Kind != store.CredentialOperationCompensate {
 		return store.Account{}, err
 	}
 	mutation, mutationErr := m.Store.ActiveAccountMutation(operation.AccountID)
@@ -1412,7 +1551,7 @@ func (m *Manager) recoverRetiredCredentialOperation(
 				operation, actual, store.CredentialTerminalSucceeded, store.CredentialResultInstalled,
 			)
 		}
-	case store.CredentialOperationCompensate:
+	case store.CredentialOperationCompensate, store.CredentialOperationRemove:
 		return m.recoverCompensateCredentialOperation(ctx, account, operation, actual)
 	}
 	return m.resolveRecoveredCredentialOperation(

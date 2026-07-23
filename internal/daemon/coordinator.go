@@ -396,6 +396,9 @@ func validTenantAcknowledgement(
 
 func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.AccountRemoval) error {
 	account, err := c.server.m.Store.GetAccount(removal.AccountID)
+	if errors.Is(err, store.ErrAccountNotFound) && removal.DeleteCredential {
+		account, err = c.server.m.Store.CredentialRemovalSubject(removal)
+	}
 	if err != nil {
 		return err
 	}
@@ -441,7 +444,7 @@ func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.Acc
 		}
 	}
 	c.forgetTenant(tenantID)
-	return c.server.m.Remove(ctx, account.ID, removal.DeleteCredential)
+	return c.server.m.FinishAccountRemoval(ctx, removal)
 }
 
 func (s *Server) prepareTenant(

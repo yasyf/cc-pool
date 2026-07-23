@@ -244,7 +244,9 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 		account.KeychainService, account.KeychainAccount,
 	)
 	operationID, err := store.NewCredentialOperationID(
-		account.InstanceID, account.Generation, kind, target, locator, expected, intent,
+		account.InstanceID, account.Generation,
+		account.ConfigDir, account.KeychainService, account.KeychainAccount,
+		kind, target, locator, expected, intent,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -327,6 +329,75 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 	}
 	if got := executions.Load(); got != 1 {
 		t.Fatalf("post-delete receipt replay executions = %d, want 1", got)
+	}
+}
+
+func TestCredentialRemovalRecoversOwnerDeathAfterDelete(t *testing.T) {
+	st := openTestStore(t)
+	credentials := credstest.NewFake()
+	owner := credentialRecoveryManager(t, st, credentials, "remove-owner")
+	reservation, err := st.ReserveAccountIndex(owner.workers.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := store.Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation, ConfigDir: t.TempDir(),
+		KeychainService: "service-remove-recovery", KeychainAccount: "account-remove-recovery",
+	}
+	credentials.Put(
+		account.KeychainService, account.KeychainAccount,
+		datedCred("remove-recovery", time.Hour),
+	)
+	before, err := owner.credentialObservation(t.Context(), account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := store.CredentialRemovalIntentDigest(
+		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
+		account.KeychainService, account.KeychainAccount,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := beginCredentialOperation(
+		t, owner, account, store.CredentialOperationRemove,
+		store.CredentialTargetKeychain, intent, before,
+	)
+	operation, err = st.MarkCredentialOperationApplying(operation.Fence(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials.Remove(account.KeychainService, account.KeychainAccount)
+
+	recovery := credentialRecoveryManager(t, st, credentials, "remove-recovery")
+	recovery.ClaimCredentialMutation = func(int) (func(), error) {
+		return func() {}, nil
+	}
+	retirement, verifier := credentialRetirementReceipt(
+		t, operation.Owner, recovery.workers.owner.Generation,
+	)
+	recovery.workers.reaper = verifier
+	if err := recovery.recoverCredentialOperation(t.Context(), operation, retirement); err != nil {
+		t.Fatalf("recover exact delete: %v", err)
+	}
+	terminal, err := st.CredentialOperationReceipt(operation.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.TerminalStatus != store.CredentialTerminalSucceeded ||
+		terminal.Result != store.CredentialResultDone {
+		t.Fatalf("recovered removal = %+v", terminal)
+	}
+	if err := recovery.removeCredentialForAccountRemoval(t.Context(), account); err != nil {
+		t.Fatalf("replay recovered receipt: %v", err)
+	}
+	removal, err := st.BeginAccountRemoval(account.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinalizePendingAccountRemoval(removal); err != nil {
+		t.Fatalf("finalize recovered pending removal: %v", err)
 	}
 }
 
@@ -1098,7 +1169,11 @@ func TestCredentialQuarantineGatesEveryMutation(t *testing.T) {
 			return manager.CompensateCredentialState(t.Context(), account, actualDigest)
 		}},
 		{"remove-account", func() error {
-			return manager.Remove(t.Context(), account.ID, true)
+			removal, err := manager.Store.BeginAccountRemoval(account.ID, true)
+			if err != nil {
+				return err
+			}
+			return manager.FinishAccountRemoval(t.Context(), removal)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1608,7 +1683,9 @@ func beginCredentialOperation(
 		account.KeychainService, account.KeychainAccount,
 	)
 	operationID, err := store.NewCredentialOperationID(
-		account.InstanceID, account.Generation, kind, target, locator, before, intent,
+		account.InstanceID, account.Generation,
+		account.ConfigDir, account.KeychainService, account.KeychainAccount,
+		kind, target, locator, before, intent,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1617,6 +1694,9 @@ func beginCredentialOperation(
 		OperationID: operationID,
 		AccountID:   account.ID, AccountInstanceID: account.InstanceID,
 		AccountGeneration: account.Generation,
+		ConfigDir:         account.ConfigDir,
+		KeychainService:   account.KeychainService,
+		KeychainAccount:   account.KeychainAccount,
 		LocatorDigest:     locator,
 		Owner:             manager.workers.owner,
 		Kind:              kind,

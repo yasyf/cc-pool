@@ -52,7 +52,11 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 	if err := m.AdoptRotatedToken(context.Background(), a); err != nil {
 		t.Fatalf("AdoptRotatedToken: %v", err)
 	}
-	if err := m.Remove(t.Context(), a.ID, true); err != nil {
+	removal, err := st.BeginAccountRemoval(a.ID, true)
+	if err != nil {
+		t.Fatalf("BeginAccountRemoval: %v", err)
+	}
+	if err := m.FinishAccountRemoval(t.Context(), removal); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
 

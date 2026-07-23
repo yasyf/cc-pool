@@ -62,6 +62,8 @@ const (
 	CredentialOperationAdoptRotated CredentialOperationKind = "adopt-rotated"
 	// CredentialOperationCompensate reverses an unpublished credential write.
 	CredentialOperationCompensate CredentialOperationKind = "compensate"
+	// CredentialOperationRemove deletes one exact slot under a durable account removal.
+	CredentialOperationRemove CredentialOperationKind = "remove"
 )
 
 // CredentialTarget identifies the exact external credential slot an operation targets.
@@ -155,6 +157,36 @@ func CredentialKeychainLocatorDigest(service, account string) CredentialDigest {
 	return digest
 }
 
+// CredentialRemovalIntentDigest binds one account generation to one exact slot retirement.
+func CredentialRemovalIntentDigest(
+	accountID int,
+	instanceID string,
+	generation uint64,
+	configDir string,
+	keychainService string,
+	keychainAccount string,
+) (CredentialDigest, error) {
+	if accountID <= 0 || validateAccountInstanceID(instanceID) != nil || generation == 0 ||
+		configDir == "" || keychainService == "" || keychainAccount == "" {
+		return CredentialDigest{}, ErrCredentialOperationState
+	}
+	hash := sha256.New()
+	writeCredentialHashField(hash, []byte("cc-pool:credential-removal-intent:v1"))
+	var id [8]byte
+	binary.BigEndian.PutUint64(id[:], uint64(accountID))
+	writeCredentialHashField(hash, id[:])
+	writeCredentialHashField(hash, []byte(instanceID))
+	var encodedGeneration [8]byte
+	binary.BigEndian.PutUint64(encodedGeneration[:], generation)
+	writeCredentialHashField(hash, encodedGeneration[:])
+	writeCredentialHashField(hash, []byte(configDir))
+	writeCredentialHashField(hash, []byte(keychainService))
+	writeCredentialHashField(hash, []byte(keychainAccount))
+	var result CredentialDigest
+	copy(result[:], hash.Sum(nil))
+	return result, nil
+}
+
 // CredentialSlotObservation records one slot without storing credential bytes.
 type CredentialSlotObservation struct {
 	State  CredentialSlotState
@@ -188,6 +220,9 @@ func (state CredentialExternalState) Digest() (CredentialDigest, error) {
 func NewCredentialOperationID(
 	accountInstanceID string,
 	accountGeneration uint64,
+	configDir string,
+	keychainService string,
+	keychainAccount string,
 	kind CredentialOperationKind,
 	target CredentialTarget,
 	locator CredentialDigest,
@@ -197,7 +232,9 @@ func NewCredentialOperationID(
 	if err := validateAccountInstanceID(accountInstanceID); err != nil {
 		return CredentialOperationID{}, err
 	}
-	if accountGeneration == 0 || !validCredentialKindTarget(kind, target) || locator.zero() || intent.zero() {
+	if accountGeneration == 0 || configDir == "" || keychainService == "" || keychainAccount == "" ||
+		!validCredentialKindTarget(kind, target) || locator.zero() || intent.zero() ||
+		CredentialKeychainLocatorDigest(keychainService, keychainAccount) != locator {
 		return CredentialOperationID{}, errors.New("credential operation identity is invalid")
 	}
 	expectedDigest, err := expected.Digest()
@@ -210,6 +247,9 @@ func NewCredentialOperationID(
 	var generation [8]byte
 	binary.BigEndian.PutUint64(generation[:], accountGeneration)
 	writeCredentialHashField(hash, generation[:])
+	writeCredentialHashField(hash, []byte(configDir))
+	writeCredentialHashField(hash, []byte(keychainService))
+	writeCredentialHashField(hash, []byte(keychainAccount))
 	writeCredentialHashField(hash, []byte(kind))
 	writeCredentialHashField(hash, []byte(target))
 	writeCredentialHashField(hash, locator[:])
@@ -255,6 +295,9 @@ type CredentialOperation struct {
 	IntentDigest       CredentialDigest
 	AccountInstanceID  string
 	AccountGeneration  uint64
+	ConfigDir          string
+	KeychainService    string
+	KeychainAccount    string
 	LocatorDigest      CredentialDigest
 	Owner              proc.Record
 	OwnerEpoch         uint64
@@ -287,6 +330,9 @@ type CredentialOperationReceipt struct {
 	IntentDigest       CredentialDigest
 	AccountInstanceID  string
 	AccountGeneration  uint64
+	ConfigDir          string
+	KeychainService    string
+	KeychainAccount    string
 	LocatorDigest      CredentialDigest
 	Expected           CredentialExternalState
 	Owner              proc.Record
@@ -306,6 +352,9 @@ type CredentialQuarantine struct {
 	AccountID         int
 	AccountInstanceID string
 	AccountGeneration uint64
+	ConfigDir         string
+	KeychainService   string
+	KeychainAccount   string
 	LocatorDigest     CredentialDigest
 	Observation       CredentialExternalState
 	TokenChainDigest  *CredentialDigest
@@ -320,6 +369,9 @@ type BeginCredentialOperationRequest struct {
 	AccountID         int
 	AccountInstanceID string
 	AccountGeneration uint64
+	ConfigDir         string
+	KeychainService   string
+	KeychainAccount   string
 	LocatorDigest     CredentialDigest
 	Owner             proc.Record
 	Kind              CredentialOperationKind
@@ -340,6 +392,9 @@ type CredentialOperationEvidenceQuery struct {
 	AccountID         int
 	AccountInstanceID string
 	AccountGeneration uint64
+	ConfigDir         string
+	KeychainService   string
+	KeychainAccount   string
 	LocatorDigest     CredentialDigest
 	Kind              CredentialOperationKind
 	Target            CredentialTarget
@@ -388,13 +443,20 @@ func (s *Store) BeginCredentialOperation(
 		return BeginCredentialOperationResult{}, err
 	}
 	if mutation, err := accountMutationByAccount(tx, request.AccountID); err == nil {
+		if request.Kind == CredentialOperationRemove {
+			return BeginCredentialOperationResult{}, ErrAccountMutationBusy
+		}
 		if mutation.Kind == AccountMutationPresentationRebind {
 			return BeginCredentialOperationResult{}, ErrAccountPresentationQuarantined
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return BeginCredentialOperationResult{}, err
 	}
-	if removal, err := accountRemovalByID(tx, request.AccountID); err == nil {
+	if request.Kind == CredentialOperationRemove {
+		if err := ensureCredentialRemoval(tx, request, now); err != nil {
+			return BeginCredentialOperationResult{}, err
+		}
+	} else if removal, err := accountRemovalByID(tx, request.AccountID); err == nil {
 		allowed, err := pendingAddRemovalAllowsCredentialCompensation(tx, removal, request)
 		if err != nil {
 			return BeginCredentialOperationResult{}, err
@@ -437,14 +499,15 @@ func (s *Store) BeginCredentialOperation(
 	result, err := tx.Exec(
 		`INSERT INTO credential_operations(
 		 account_id,operation_id,token,kind,target,intent_digest,
-		 account_instance_id,account_generation,locator_digest,
+		 account_instance_id,account_generation,config_dir,keychain_service,keychain_account,locator_digest,
 		 owner_record,owner_epoch,state,
 		 expected_keychain_state,expected_keychain_digest,
 		 created_at,updated_at
-		) VALUES(?,?,?,?,?,?,?,?,?,?,1,'prepared',?,?,?,?)
+		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,'prepared',?,?,?,?)
 		 ON CONFLICT(account_id) DO NOTHING`,
 		request.AccountID, request.OperationID[:], token, request.Kind, request.Target,
 		request.IntentDigest[:], request.AccountInstanceID, request.AccountGeneration,
+		request.ConfigDir, request.KeychainService, request.KeychainAccount,
 		request.LocatorDigest[:], ownerRecord,
 		request.Expected.Keychain.State, credentialDigestValue(request.Expected.Keychain.Digest),
 		now.UnixNano(), now.UnixNano(),
@@ -479,6 +542,71 @@ func (s *Store) BeginCredentialOperation(
 	return begin, ErrCredentialOperationBusy
 }
 
+func ensureCredentialRemoval(
+	tx *sql.Tx,
+	request BeginCredentialOperationRequest,
+	now time.Time,
+) error {
+	expectedIntent, err := CredentialRemovalIntentDigest(
+		request.AccountID, request.AccountInstanceID, request.AccountGeneration,
+		request.ConfigDir, request.KeychainService, request.KeychainAccount,
+	)
+	if err != nil || expectedIntent != request.IntentDigest {
+		return ErrCredentialOperationState
+	}
+	removal, err := accountRemovalByID(tx, request.AccountID)
+	if err == nil {
+		if !removal.DeleteCredential || removal.AccountInstanceID != request.AccountInstanceID ||
+			removal.AccountGeneration != request.AccountGeneration {
+			return ErrAccountRemoving
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var accountExists int
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM accounts WHERE id=? AND deleted_at IS NULL)`, request.AccountID,
+	).Scan(&accountExists); err != nil {
+		return err
+	}
+	if accountExists != 0 {
+		return ErrAccountRemoving
+	}
+	var pendingInstance string
+	var pendingGeneration uint64
+	if err := tx.QueryRow(
+		`SELECT instance_id,generation FROM pending_adds WHERE id=?`, request.AccountID,
+	).Scan(&pendingInstance, &pendingGeneration); err != nil {
+		return errors.Join(ErrAccountGenerationChanged, err)
+	}
+	if pendingInstance != request.AccountInstanceID || pendingGeneration != request.AccountGeneration {
+		return ErrAccountGenerationChanged
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO account_registry_sequences(account_id,sequence) VALUES(?,0)
+		 ON CONFLICT(account_id) DO NOTHING`, request.AccountID,
+	); err != nil {
+		return err
+	}
+	var sequence uint64
+	if err := tx.QueryRow(
+		`UPDATE account_registry_sequences SET sequence=sequence+1
+		 WHERE account_id=? RETURNING sequence`, request.AccountID,
+	).Scan(&sequence); err != nil {
+		return err
+	}
+	_, err = tx.Exec(
+		`INSERT INTO account_removals(
+		 account_id,account_instance_id,account_generation,registry_sequence,delete_credential,created_at
+		 ) VALUES(?,?,?,?,1,?)`,
+		request.AccountID, request.AccountInstanceID, request.AccountGeneration,
+		sequence, now.UnixNano(),
+	)
+	return err
+}
+
 func pendingAddRemovalAllowsCredentialCompensation(
 	tx *sql.Tx,
 	removal AccountRemoval,
@@ -502,6 +630,7 @@ func pendingAddRemovalAllowsCredentialCompensation(
 	}
 	err = credentialPendingAddCompensationMatches(
 		tx, request.AccountID, request.AccountInstanceID, request.AccountGeneration,
+		request.ConfigDir, request.KeychainService, request.KeychainAccount,
 		request.LocatorDigest, request.Expected, request.IntentDigest,
 	)
 	if errors.Is(err, ErrAccountGenerationChanged) {
@@ -528,7 +657,10 @@ func (s *Store) CredentialOperationEvidence(
 	query CredentialOperationEvidenceQuery,
 ) (active *CredentialOperation, receipt *CredentialOperationReceipt, err error) {
 	if query.AccountID <= 0 || validateAccountInstanceID(query.AccountInstanceID) != nil ||
-		query.AccountGeneration == 0 || query.LocatorDigest.zero() ||
+		query.AccountGeneration == 0 || query.ConfigDir == "" ||
+		query.KeychainService == "" || query.KeychainAccount == "" ||
+		query.LocatorDigest.zero() ||
+		CredentialKeychainLocatorDigest(query.KeychainService, query.KeychainAccount) != query.LocatorDigest ||
 		!validCredentialKindTarget(query.Kind, query.Target) ||
 		query.IntentDigest.zero() {
 		return nil, nil, ErrCredentialOperationState
@@ -544,9 +676,11 @@ func (s *Store) CredentialOperationEvidence(
 	rows, err := s.db.Query(
 		`SELECT `+receiptSelectColumns+` FROM credential_operation_receipts
 		 WHERE account_id=? AND account_instance_id=? AND account_generation=?
+		 AND config_dir=? AND keychain_service=? AND keychain_account=?
 		 AND locator_digest=? AND kind=? AND target=? AND intent_digest=?
 		 ORDER BY committed_at DESC,operation_id DESC LIMIT 2`,
 		query.AccountID, query.AccountInstanceID, query.AccountGeneration,
+		query.ConfigDir, query.KeychainService, query.KeychainAccount,
 		query.LocatorDigest[:], query.Kind, query.Target,
 		query.IntentDigest[:],
 	)
@@ -577,6 +711,9 @@ func credentialOperationMatchesEvidence(
 	return operation.AccountID == query.AccountID &&
 		operation.AccountInstanceID == query.AccountInstanceID &&
 		operation.AccountGeneration == query.AccountGeneration &&
+		operation.ConfigDir == query.ConfigDir &&
+		operation.KeychainService == query.KeychainService &&
+		operation.KeychainAccount == query.KeychainAccount &&
 		operation.LocatorDigest == query.LocatorDigest &&
 		operation.Kind == query.Kind && operation.Target == query.Target &&
 		operation.IntentDigest == query.IntentDigest
@@ -1620,14 +1757,15 @@ func (s *Store) advanceCredentialOperation(
 
 const operationSelectColumns = `
 account_id,operation_id,token,kind,target,intent_digest,
-account_instance_id,account_generation,locator_digest,owner_record,owner_epoch,state,
+account_instance_id,account_generation,config_dir,keychain_service,keychain_account,
+locator_digest,owner_record,owner_epoch,state,
 expected_keychain_state,expected_keychain_digest,
 outcome_keychain_state,outcome_keychain_digest,
 terminal_status,result_category,failure_class,publication_payload,created_at,updated_at`
 
 const receiptSelectColumns = `
 account_id,operation_id,token,kind,target,intent_digest,
-account_instance_id,account_generation,locator_digest,
+account_instance_id,account_generation,config_dir,keychain_service,keychain_account,locator_digest,
 expected_keychain_state,expected_keychain_digest,
 owner_record,owner_epoch,terminal_status,result_category,failure_class,
 outcome_keychain_state,outcome_keychain_digest,
@@ -1677,7 +1815,8 @@ func scanCredentialOperation(row credentialOperationScanner) (CredentialOperatio
 	if err := row.Scan(
 		&operation.AccountID, &operationID, &operation.Token, &operation.Kind,
 		&operation.Target, &intentDigest, &operation.AccountInstanceID,
-		&operation.AccountGeneration, &locatorDigest, &ownerRaw, &operation.OwnerEpoch,
+		&operation.AccountGeneration, &operation.ConfigDir, &operation.KeychainService,
+		&operation.KeychainAccount, &locatorDigest, &ownerRaw, &operation.OwnerEpoch,
 		&operation.State, &operation.Expected.Keychain.State, &expectedKeychainDigest,
 		&outcomeKeychainState, &outcomeKeychainDigest,
 		&terminalStatus, &resultCategory, &failureClass, &publicationPayload, &createdAt, &updatedAt,
@@ -1777,6 +1916,7 @@ func scanCredentialOperationReceipt(
 	if err := row.Scan(
 		&receipt.AccountID, &operationID, &receipt.Token, &receipt.Kind, &receipt.Target,
 		&intentDigest, &receipt.AccountInstanceID, &receipt.AccountGeneration,
+		&receipt.ConfigDir, &receipt.KeychainService, &receipt.KeychainAccount,
 		&locatorDigest, &receipt.Expected.Keychain.State, &expectedKeychainDigest,
 		&ownerRaw, &receipt.OwnerEpoch,
 		&receipt.TerminalStatus, &receipt.Result, &failureClass, &receipt.Outcome.Keychain.State,
@@ -1830,15 +1970,17 @@ func insertCredentialOperationReceipt(
 	}
 	_, err := tx.Exec(
 		`INSERT INTO credential_operation_receipts(
-		 operation_id,token,account_id,account_instance_id,account_generation,locator_digest,
+		 operation_id,token,account_id,account_instance_id,account_generation,
+		 config_dir,keychain_service,keychain_account,locator_digest,
 		 kind,target,intent_digest,
 		 expected_keychain_state,expected_keychain_digest,
 		 owner_record,owner_epoch,terminal_status,result_category,failure_class,
 		 outcome_keychain_state,outcome_keychain_digest,
 		 publication_payload,committed_at,acknowledged_at,expires_at
-		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		receipt.OperationID[:], receipt.Token, receipt.AccountID, receipt.AccountInstanceID,
-		receipt.AccountGeneration, receipt.LocatorDigest[:], receipt.Kind, receipt.Target,
+		receipt.AccountGeneration, receipt.ConfigDir, receipt.KeychainService,
+		receipt.KeychainAccount, receipt.LocatorDigest[:], receipt.Kind, receipt.Target,
 		receipt.IntentDigest[:], receipt.Expected.Keychain.State,
 		credentialDigestValue(receipt.Expected.Keychain.Digest), mustEncodeCredentialOwner(receipt.Owner),
 		receipt.OwnerEpoch, receipt.TerminalStatus, receipt.Result,
@@ -1863,8 +2005,10 @@ func receiptFromOperation(
 		AccountID: operation.AccountID, OperationID: operation.OperationID,
 		Token: operation.Token, Kind: operation.Kind, Target: operation.Target,
 		IntentDigest: operation.IntentDigest, AccountInstanceID: operation.AccountInstanceID,
-		AccountGeneration: operation.AccountGeneration, LocatorDigest: operation.LocatorDigest,
-		Expected: operation.Expected, Owner: operation.Owner, OwnerEpoch: operation.OwnerEpoch,
+		AccountGeneration: operation.AccountGeneration, ConfigDir: operation.ConfigDir,
+		KeychainService: operation.KeychainService, KeychainAccount: operation.KeychainAccount,
+		LocatorDigest: operation.LocatorDigest,
+		Expected:      operation.Expected, Owner: operation.Owner, OwnerEpoch: operation.OwnerEpoch,
 		TerminalStatus: status, Result: result, FailureClass: failure, Outcome: outcome,
 		PublicationPayload: bytes.Clone(publicationPayload),
 		CommittedAt:        committedAt, ExpiresAt: expiresAt,
@@ -1961,7 +2105,9 @@ func upsertCredentialQuarantine(tx *sql.Tx, quarantine CredentialQuarantine) err
 func validateCredentialOperationRequest(request BeginCredentialOperationRequest) error {
 	if request.AccountID <= 0 || request.AccountGeneration == 0 ||
 		request.OperationID.zero() || request.LocatorDigest.zero() ||
-		request.IntentDigest.zero() ||
+		request.IntentDigest.zero() || request.ConfigDir == "" ||
+		request.KeychainService == "" || request.KeychainAccount == "" ||
+		CredentialKeychainLocatorDigest(request.KeychainService, request.KeychainAccount) != request.LocatorDigest ||
 		!validCredentialKindTarget(request.Kind, request.Target) {
 		return errors.New("credential operation request identity is invalid")
 	}
@@ -1975,7 +2121,8 @@ func validateCredentialOperationRequest(request BeginCredentialOperationRequest)
 		return err
 	}
 	expectedID, err := NewCredentialOperationID(
-		request.AccountInstanceID, request.AccountGeneration, request.Kind, request.Target,
+		request.AccountInstanceID, request.AccountGeneration, request.ConfigDir,
+		request.KeychainService, request.KeychainAccount, request.Kind, request.Target,
 		request.LocatorDigest, request.Expected, request.IntentDigest,
 	)
 	if err != nil {
@@ -1989,7 +2136,10 @@ func validateCredentialOperationRequest(request BeginCredentialOperationRequest)
 
 func validateCredentialOperation(operation CredentialOperation) error {
 	if operation.AccountID <= 0 || operation.OperationID.zero() || operation.IntentDigest.zero() ||
-		operation.AccountGeneration == 0 || operation.LocatorDigest.zero() ||
+		operation.AccountGeneration == 0 || operation.ConfigDir == "" ||
+		operation.KeychainService == "" || operation.KeychainAccount == "" ||
+		operation.LocatorDigest.zero() ||
+		CredentialKeychainLocatorDigest(operation.KeychainService, operation.KeychainAccount) != operation.LocatorDigest ||
 		operation.OwnerEpoch == 0 ||
 		!validCredentialKindTarget(operation.Kind, operation.Target) || !operation.State.valid() {
 		return errors.New("credential operation is corrupt")
@@ -2041,7 +2191,10 @@ func validateCredentialOperation(operation CredentialOperation) error {
 
 func validateCredentialReceipt(receipt CredentialOperationReceipt) error {
 	if receipt.AccountID <= 0 || receipt.OperationID.zero() || receipt.IntentDigest.zero() ||
-		receipt.AccountGeneration == 0 || receipt.LocatorDigest.zero() ||
+		receipt.AccountGeneration == 0 || receipt.ConfigDir == "" ||
+		receipt.KeychainService == "" || receipt.KeychainAccount == "" ||
+		receipt.LocatorDigest.zero() ||
+		CredentialKeychainLocatorDigest(receipt.KeychainService, receipt.KeychainAccount) != receipt.LocatorDigest ||
 		receipt.OwnerEpoch == 0 ||
 		!validCredentialKindTarget(receipt.Kind, receipt.Target) {
 		return errors.New("credential operation receipt is corrupt")
@@ -2163,7 +2316,7 @@ func validateCredentialTerminal(
 		valid = result == CredentialResultInstalled || result == CredentialResultSkipped
 	case CredentialOperationAdoptRotated:
 		valid = result == CredentialResultAdopted
-	case CredentialOperationCompensate:
+	case CredentialOperationCompensate, CredentialOperationRemove:
 		valid = result == CredentialResultDone
 	}
 	if !valid {
@@ -2231,7 +2384,8 @@ func (kind CredentialOperationKind) valid() bool {
 	switch kind {
 	case CredentialOperationEnsureFresh,
 		CredentialOperationRefreshCurrent, CredentialOperationInstallSynced,
-		CredentialOperationAdoptRotated, CredentialOperationCompensate:
+		CredentialOperationAdoptRotated, CredentialOperationCompensate,
+		CredentialOperationRemove:
 		return true
 	default:
 		return false
@@ -2295,6 +2449,9 @@ func operationIdentityMatchesRequest(
 ) bool {
 	return operation.AccountInstanceID == request.AccountInstanceID &&
 		operation.AccountGeneration == request.AccountGeneration &&
+		operation.ConfigDir == request.ConfigDir &&
+		operation.KeychainService == request.KeychainService &&
+		operation.KeychainAccount == request.KeychainAccount &&
 		operation.LocatorDigest == request.LocatorDigest
 }
 
@@ -2317,6 +2474,9 @@ func credentialReceiptMatchesRequest(
 		receipt.AccountID == request.AccountID &&
 		receipt.AccountInstanceID == request.AccountInstanceID &&
 		receipt.AccountGeneration == request.AccountGeneration &&
+		receipt.ConfigDir == request.ConfigDir &&
+		receipt.KeychainService == request.KeychainService &&
+		receipt.KeychainAccount == request.KeychainAccount &&
 		receipt.LocatorDigest == request.LocatorDigest &&
 		receipt.Kind == request.Kind && receipt.Target == request.Target &&
 		receipt.IntentDigest == request.IntentDigest &&
@@ -2327,16 +2487,27 @@ func credentialAccountMatchesRequest(
 	queryer credentialOperationQueryer,
 	request BeginCredentialOperationRequest,
 ) error {
-	err := credentialAccountMatchesIdentity(
+	err := credentialAccountMatchesOperationIdentity(
 		queryer, request.AccountID, request.AccountInstanceID,
-		request.AccountGeneration, request.LocatorDigest,
+		request.AccountGeneration, request.ConfigDir, request.KeychainService,
+		request.KeychainAccount, request.LocatorDigest,
 	)
-	if err == nil || !errors.Is(err, sql.ErrNoRows) ||
-		request.Kind != CredentialOperationCompensate || request.Target != CredentialTargetKeychain {
+	if err == nil || !errors.Is(err, sql.ErrNoRows) || request.Target != CredentialTargetKeychain {
+		return err
+	}
+	if request.Kind == CredentialOperationRemove {
+		return credentialPendingRemovalMatches(
+			queryer, request.AccountID, request.AccountInstanceID, request.AccountGeneration,
+			request.ConfigDir, request.KeychainService, request.KeychainAccount,
+			request.LocatorDigest, request.IntentDigest,
+		)
+	}
+	if request.Kind != CredentialOperationCompensate {
 		return err
 	}
 	return credentialPendingAddCompensationMatches(
 		queryer, request.AccountID, request.AccountInstanceID, request.AccountGeneration,
+		request.ConfigDir, request.KeychainService, request.KeychainAccount,
 		request.LocatorDigest, request.Expected, request.IntentDigest,
 	)
 }
@@ -2345,18 +2516,67 @@ func credentialAccountMatchesOperation(
 	queryer credentialOperationQueryer,
 	operation CredentialOperation,
 ) error {
-	err := credentialAccountMatchesIdentity(
+	err := credentialAccountMatchesOperationIdentity(
 		queryer, operation.AccountID, operation.AccountInstanceID,
-		operation.AccountGeneration, operation.LocatorDigest,
+		operation.AccountGeneration, operation.ConfigDir, operation.KeychainService,
+		operation.KeychainAccount, operation.LocatorDigest,
 	)
-	if err == nil || !errors.Is(err, sql.ErrNoRows) ||
-		operation.Kind != CredentialOperationCompensate || operation.Target != CredentialTargetKeychain {
+	if err == nil || !errors.Is(err, sql.ErrNoRows) || operation.Target != CredentialTargetKeychain {
+		return err
+	}
+	if operation.Kind == CredentialOperationRemove {
+		return credentialPendingRemovalMatches(
+			queryer, operation.AccountID, operation.AccountInstanceID, operation.AccountGeneration,
+			operation.ConfigDir, operation.KeychainService, operation.KeychainAccount,
+			operation.LocatorDigest, operation.IntentDigest,
+		)
+	}
+	if operation.Kind != CredentialOperationCompensate {
 		return err
 	}
 	return credentialPendingAddCompensationMatches(
 		queryer, operation.AccountID, operation.AccountInstanceID, operation.AccountGeneration,
+		operation.ConfigDir, operation.KeychainService, operation.KeychainAccount,
 		operation.LocatorDigest, operation.Expected, operation.IntentDigest,
 	)
+}
+
+func credentialPendingRemovalMatches(
+	queryer credentialOperationQueryer,
+	accountID int,
+	instanceID string,
+	generation uint64,
+	configDir string,
+	keychainService string,
+	keychainAccount string,
+	locator CredentialDigest,
+	intent CredentialDigest,
+) error {
+	var pendingInstance string
+	var pendingGeneration uint64
+	if err := queryer.QueryRow(
+		`SELECT instance_id,generation FROM pending_adds WHERE id=?`, accountID,
+	).Scan(&pendingInstance, &pendingGeneration); err != nil {
+		return errors.Join(ErrAccountGenerationChanged, err)
+	}
+	removal, err := accountRemovalByID(queryer, accountID)
+	if err != nil {
+		return errors.Join(ErrAccountGenerationChanged, err)
+	}
+	expectedIntent, err := CredentialRemovalIntentDigest(
+		accountID, instanceID, generation, configDir, keychainService, keychainAccount,
+	)
+	if err != nil {
+		return err
+	}
+	if pendingInstance != instanceID || pendingGeneration != generation ||
+		removal.AccountInstanceID != instanceID || removal.AccountGeneration != generation ||
+		!removal.DeleteCredential ||
+		CredentialKeychainLocatorDigest(keychainService, keychainAccount) != locator ||
+		expectedIntent != intent {
+		return ErrAccountGenerationChanged
+	}
+	return nil
 }
 
 func credentialPendingAddCompensationMatches(
@@ -2364,6 +2584,9 @@ func credentialPendingAddCompensationMatches(
 	accountID int,
 	instanceID string,
 	generation uint64,
+	configDir string,
+	keychainService string,
+	keychainAccount string,
 	locator CredentialDigest,
 	expected CredentialExternalState,
 	intent CredentialDigest,
@@ -2388,6 +2611,8 @@ func credentialPendingAddCompensationMatches(
 		!bytes.Equal(pendingOwner, mustEncodeCredentialOwner(mutation.Owner)) ||
 		mutation.Kind != AccountMutationAdd || mutation.State != AccountMutationCompensating ||
 		mutation.AccountInstanceID != instanceID || mutation.AccountGeneration != generation ||
+		mutation.ConfigDir != configDir || mutation.KeychainService != keychainService ||
+		mutation.KeychainAccount != keychainAccount ||
 		!mutation.CredentialWritten || mutation.WrittenCredentialDigest != expectedDigest ||
 		mutation.LocatorDigest != locator ||
 		CredentialKeychainLocatorDigest(mutation.KeychainService, mutation.KeychainAccount) != locator ||
@@ -2424,6 +2649,33 @@ func credentialAccountMatchesIdentity(
 		return errors.Join(ErrAccountGenerationChanged, err)
 	}
 	if currentInstance != instanceID || currentGeneration != generation ||
+		CredentialKeychainLocatorDigest(service, account) != locator {
+		return ErrAccountGenerationChanged
+	}
+	return nil
+}
+
+func credentialAccountMatchesOperationIdentity(
+	queryer credentialOperationQueryer,
+	accountID int,
+	instanceID string,
+	generation uint64,
+	configDir string,
+	keychainService string,
+	keychainAccount string,
+	locator CredentialDigest,
+) error {
+	var currentInstance, currentConfigDir, service, account string
+	var currentGeneration uint64
+	if err := queryer.QueryRow(
+		`SELECT instance_id,generation,config_dir,keychain_service,keychain_account
+		 FROM accounts WHERE id=? AND deleted_at IS NULL`,
+		accountID,
+	).Scan(&currentInstance, &currentGeneration, &currentConfigDir, &service, &account); err != nil {
+		return errors.Join(ErrAccountGenerationChanged, err)
+	}
+	if currentInstance != instanceID || currentGeneration != generation || currentConfigDir != configDir ||
+		service != keychainService || account != keychainAccount ||
 		CredentialKeychainLocatorDigest(service, account) != locator {
 		return ErrAccountGenerationChanged
 	}

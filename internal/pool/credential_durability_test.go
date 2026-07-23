@@ -79,6 +79,7 @@ func TestSampleUsageNeverRepeatsRetainedFailedRefresh(t *testing.T) {
 			}
 			operationID, err := store.NewCredentialOperationID(
 				account.InstanceID, account.Generation,
+				account.ConfigDir, account.KeychainService, account.KeychainAccount,
 				store.CredentialOperationEnsureFresh, store.CredentialTargetKeychain,
 				store.CredentialKeychainLocatorDigest(
 					account.KeychainService, account.KeychainAccount,
@@ -404,6 +405,9 @@ func TestEnsureFreshAdmissionRaceUsesCrossedBoundaryAndAllStoreIdentity(t *testi
 			active, receipt, err := st.CredentialOperationEvidence(store.CredentialOperationEvidenceQuery{
 				AccountID: account.ID, AccountInstanceID: account.InstanceID,
 				AccountGeneration: account.Generation,
+				ConfigDir:         account.ConfigDir,
+				KeychainService:   account.KeychainService,
+				KeychainAccount:   account.KeychainAccount,
 				LocatorDigest: store.CredentialKeychainLocatorDigest(
 					account.KeychainService, account.KeychainAccount,
 				),

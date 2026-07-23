@@ -222,42 +222,57 @@ func (m *Manager) AbandonAdd(ctx context.Context, pending *PendingAdd) error {
 		ID: pending.Reservation.ID, InstanceID: pending.Reservation.InstanceID,
 		Generation: pending.Reservation.Generation,
 		ConfigDir:  pending.ConfigDir, KeychainService: pending.KeychainService,
+		KeychainAccount: creds.AccountLabel(),
 	}
-	var result error
 	keychainAccount, err := m.Creds.Discover(ctx, pending.KeychainService)
 	switch {
 	case errors.Is(err, creds.ErrNotFound):
 	case err != nil:
-		result = fmt.Errorf("probe credential for %s: %w", pending.ConfigDir, err)
+		return fmt.Errorf("probe credential for %s: %w", pending.ConfigDir, err)
 	default:
 		account.KeychainAccount = keychainAccount
-		result = m.Creds.Store(account, creds.SourceKeychain).Delete(ctx)
 	}
-	result = errors.Join(result, m.removeAccountBacking(ctx, pending.Reservation.ID))
-	return errors.Join(result, m.Store.ReleaseAccountIndex(pending.Reservation))
+	if err := m.removeCredentialForAccountRemoval(ctx, account); err != nil {
+		return fmt.Errorf("retire pending credential for %s: %w", pending.ConfigDir, err)
+	}
+	removal, err := m.Store.BeginAccountRemoval(pending.Reservation.ID, true)
+	if err != nil {
+		return fmt.Errorf("read pending removal for %s: %w", pending.ConfigDir, err)
+	}
+	if err := m.removeAccountBacking(ctx, pending.Reservation.ID); err != nil {
+		return err
+	}
+	return m.Store.FinalizePendingAccountRemoval(removal)
 }
 
-// Remove deletes one deprovisioned account's private data, credential, and source rows.
-func (m *Manager) Remove(ctx context.Context, id int, deleteCredential bool) error {
+// FinishAccountRemoval settles one exact deprovisioned account removal.
+func (m *Manager) FinishAccountRemoval(ctx context.Context, removal store.AccountRemoval) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	account, err := m.Store.GetAccount(id)
+	account, err := m.Store.GetAccount(removal.AccountID)
+	pending := false
+	if errors.Is(err, store.ErrAccountNotFound) {
+		account, err = m.Store.CredentialRemovalSubject(removal)
+		pending = true
+	}
 	if err != nil {
 		return err
 	}
-	if m.Creds != nil {
-		if _, err := m.credentialMutationObservation(ctx, account); err != nil {
-			return fmt.Errorf("remove acct-%02d credential guard: %w", id, err)
+	if account.ID != removal.AccountID || account.InstanceID != removal.AccountInstanceID ||
+		account.Generation != removal.AccountGeneration {
+		return store.ErrAccountGenerationChanged
+	}
+	if removal.DeleteCredential {
+		if err := m.removeCredentialForAccountRemoval(ctx, account); err != nil {
+			return fmt.Errorf("retire acct-%02d credential: %w", account.ID, err)
 		}
 	}
 	if err := m.removeAccountBacking(ctx, account.ID); err != nil {
 		return err
 	}
-	if deleteCredential {
-		if err := m.Creds.Store(account, creds.SourceKeychain).Delete(ctx); err != nil {
-			return fmt.Errorf("delete keychain item %q: %w", account.KeychainService, err)
-		}
+	if pending {
+		return m.Store.FinalizePendingAccountRemoval(removal)
 	}
-	return m.Store.DeleteAccount(id)
+	return m.Store.DeleteAccount(account.ID)
 }

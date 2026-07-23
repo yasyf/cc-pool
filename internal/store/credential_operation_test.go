@@ -1267,8 +1267,12 @@ func TestPendingAddCredentialCompensationAdmissionAndCommit(t *testing.T) {
 	}
 	evidenceQuery := CredentialOperationEvidenceQuery{
 		AccountID: request.AccountID, AccountInstanceID: request.AccountInstanceID,
-		AccountGeneration: request.AccountGeneration, LocatorDigest: request.LocatorDigest,
-		Kind: request.Kind, Target: request.Target,
+		AccountGeneration: request.AccountGeneration,
+		ConfigDir:         request.ConfigDir,
+		KeychainService:   request.KeychainService,
+		KeychainAccount:   request.KeychainAccount,
+		LocatorDigest:     request.LocatorDigest,
+		Kind:              request.Kind, Target: request.Target,
 		IntentDigest: request.IntentDigest,
 	}
 	activeEvidence, receiptEvidence, err := s.CredentialOperationEvidence(evidenceQuery)
@@ -1355,7 +1359,10 @@ func TestPendingAddCredentialCompensationRejectsCrossJournalMismatch(t *testing.
 			name: "locator",
 			mutate: func(t *testing.T, _ *Store, request *BeginCredentialOperationRequest, _ AccountMutation) {
 				t.Helper()
-				request.LocatorDigest = credentialOperationTestDigest("different-locator")
+				request.KeychainAccount = "different-account"
+				request.LocatorDigest = CredentialKeychainLocatorDigest(
+					request.KeychainService, request.KeychainAccount,
+				)
 				rederiveCredentialOperationTestID(t, request)
 			},
 		},
@@ -1463,6 +1470,7 @@ func pendingAddCompensationTestRequest(
 	intent := credentialCompensationIntentDigest(writtenDigest)
 	operationID, err := NewCredentialOperationID(
 		reservation.InstanceID, reservation.Generation,
+		configDir, service, account,
 		CredentialOperationCompensate, CredentialTargetKeychain,
 		locator, writtenState, intent,
 	)
@@ -1472,9 +1480,11 @@ func pendingAddCompensationTestRequest(
 	return BeginCredentialOperationRequest{
 		OperationID: operationID, AccountID: reservation.ID,
 		AccountInstanceID: reservation.InstanceID, AccountGeneration: reservation.Generation,
-		LocatorDigest: locator,
-		Owner:         credentialOperationTestOwner("compensation-owner"),
-		Kind:          CredentialOperationCompensate, Target: CredentialTargetKeychain,
+		ConfigDir: configDir, KeychainService: service,
+		KeychainAccount: account,
+		LocatorDigest:   locator,
+		Owner:           credentialOperationTestOwner("compensation-owner"),
+		Kind:            CredentialOperationCompensate, Target: CredentialTargetKeychain,
 		IntentDigest: intent, Expected: writtenState,
 	}, mutation
 }
@@ -1482,7 +1492,9 @@ func pendingAddCompensationTestRequest(
 func rederiveCredentialOperationTestID(t *testing.T, request *BeginCredentialOperationRequest) {
 	t.Helper()
 	operationID, err := NewCredentialOperationID(
-		request.AccountInstanceID, request.AccountGeneration, request.Kind, request.Target,
+		request.AccountInstanceID, request.AccountGeneration,
+		request.ConfigDir, request.KeychainService, request.KeychainAccount,
+		request.Kind, request.Target,
 		request.LocatorDigest, request.Expected, request.IntentDigest,
 	)
 	if err != nil {
@@ -1518,7 +1530,9 @@ func credentialOperationTestRequest(
 	locator := CredentialKeychainLocatorDigest(account.KeychainService, account.KeychainAccount)
 	intentDigest := credentialOperationTestDigest(intent)
 	operationID, err := NewCredentialOperationID(
-		account.InstanceID, account.Generation, kind, target, locator, expected, intentDigest,
+		account.InstanceID, account.Generation,
+		account.ConfigDir, account.KeychainService, account.KeychainAccount,
+		kind, target, locator, expected, intentDigest,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1526,8 +1540,10 @@ func credentialOperationTestRequest(
 	return BeginCredentialOperationRequest{
 		OperationID: operationID, AccountID: account.ID,
 		AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
-		LocatorDigest: locator,
-		Owner:         owner, Kind: kind, Target: target,
+		ConfigDir: account.ConfigDir, KeychainService: account.KeychainService,
+		KeychainAccount: account.KeychainAccount,
+		LocatorDigest:   locator,
+		Owner:           owner, Kind: kind, Target: target,
 		IntentDigest: intentDigest, Expected: expected,
 	}
 }

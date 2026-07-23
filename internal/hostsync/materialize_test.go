@@ -113,9 +113,8 @@ type fixtureAccountRemover struct {
 }
 
 type fixtureAccountRemoval struct {
-	remover          *fixtureAccountRemover
-	id               int
-	deleteCredential bool
+	remover *fixtureAccountRemover
+	removal store.AccountRemoval
 }
 
 type fixtureAccountPreparer struct {
@@ -165,7 +164,11 @@ func (r *fixtureAccountRemover) BeginAccountRemoval(id int, deleteCredential boo
 	if !deleteCredential {
 		return nil, errors.New("fixture removal requires credential deletion")
 	}
-	return fixtureAccountRemoval{remover: r, id: id, deleteCredential: deleteCredential}, nil
+	removal, err := r.m.Store.BeginAccountRemoval(id, deleteCredential)
+	if err != nil {
+		return nil, err
+	}
+	return fixtureAccountRemoval{remover: r, removal: removal}, nil
 }
 
 func (r *fixtureAccountRemover) setFailure(id int, err error) {
@@ -181,10 +184,10 @@ func (r *fixtureAccountRemover) callsSnapshot() []int {
 }
 
 func (p fixtureAccountRemoval) Finish(ctx context.Context) error {
-	if err := os.RemoveAll(materializePresentationPath(p.id)); err != nil {
+	if err := os.RemoveAll(materializePresentationPath(p.removal.AccountID)); err != nil {
 		return err
 	}
-	return p.remover.m.Remove(ctx, p.id, p.deleteCredential)
+	return p.remover.m.FinishAccountRemoval(ctx, p.removal)
 }
 
 func materializePresentationPath(id int) string {
