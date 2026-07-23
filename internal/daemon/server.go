@@ -304,6 +304,8 @@ func (s *Server) markClosing() { s.closing.Store(true) }
 
 func (s *Server) dispatch(ctx context.Context, req Request) Response {
 	switch req.Op {
+	case OpHealth:
+		return Response{OK: true, Version: version.String()}
 	case OpStatus:
 		return s.handleStatus(ctx)
 	case OpSelect:

@@ -18,6 +18,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/synckit/codec"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/manifest"
@@ -50,7 +51,7 @@ var syncEnsureDaemon = func(ctx context.Context) bool {
 	cl := daemon.NewClient()
 	defer func() { _ = cl.Close() }()
 	health, err := cl.HealthContext(ctx)
-	return err == nil && health.OK
+	return err == nil && health.OK && health.Version == version.String()
 }
 
 var syncConverge = runSyncConverge

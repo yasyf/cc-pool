@@ -47,6 +47,7 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 	serverDurations := make(map[wire.Op]time.Duration)
 	clientDurations := make(map[wire.Op]time.Duration)
 	for _, op := range []ccdaemon.Op{
+		ccdaemon.OpHealth,
 		ccdaemon.OpSelect,
 		ccdaemon.OpSelectCommit,
 		ccdaemon.OpSelectAbort,
@@ -67,6 +68,7 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 		ProtectedSessionClassifier: daemonTestProtectedClassifier{},
 	}
 	for _, op := range []ccdaemon.Op{
+		ccdaemon.OpHealth,
 		ccdaemon.OpSelect,
 		ccdaemon.OpSelectCommit,
 		ccdaemon.OpSelectAbort,
@@ -81,7 +83,7 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 				return nil, err
 			}
 			payload.Op = op
-			if handler == nil {
+			if op == ccdaemon.OpHealth || handler == nil {
 				return ccdaemon.Response{OK: true, Version: build}, nil
 			}
 			return handler(ctx, op, payload), nil

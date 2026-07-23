@@ -16,10 +16,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/wire/lifeproto"
 )
 
 // ErrDaemonUnavailable means the daemon socket could not be reached.
@@ -117,12 +115,12 @@ func (c *Client) Close() error {
 	return errors.Join(errs...)
 }
 
-// Available reports whether an exact lifecycle session can reach the daemon.
+// Available reports whether an exact ready business session can reach the daemon.
 func (c *Client) Available() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	_, err := c.HealthContext(ctx)
-	return err == nil
+	response, err := c.HealthContext(ctx)
+	return err == nil && response.Version == c.clientLifecycleBuild()
 }
 
 func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
@@ -204,40 +202,28 @@ func (c *Client) StatusContext(ctx context.Context) (*Response, error) {
 	return c.doContext(ctx, Request{Op: OpStatus}, 5*time.Second)
 }
 
-// Health probes the daemon lifecycle.
+// Health probes daemon readiness over the ordinary business session.
 func (c *Client) Health() (*Response, error) {
 	return c.HealthContext(context.Background())
 }
 
-// HealthContext probes the daemon lifecycle within ctx's remaining deadline.
+// HealthContext probes daemon readiness within ctx's remaining deadline.
 func (c *Client) HealthContext(ctx context.Context) (*Response, error) {
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-	}
-	var response lifeproto.HealthResponse
-	if err := c.lifecycle(ctx, wire.Op(lifeproto.OpHealth), lifeproto.NewHealthRequest(), &response); err != nil {
+	response, err := c.doContext(ctx, Request{Op: OpHealth}, 2*time.Second)
+	if err != nil {
 		return nil, err
 	}
-	if err := validateDaemonHealth(response, c.clientLifecycleBuild()); err != nil {
+	if err := validateDaemonHealth(*response); err != nil {
 		return nil, err
 	}
-	return &Response{OK: true, Version: response.Build}, nil
+	return response, nil
 }
 
-func validateDaemonHealth(response lifeproto.HealthResponse, build string) error {
-	if response.V != lifeproto.Version || response.Op != lifeproto.OpHealth ||
-		response.Build != build || response.Protocol != int(wire.ProtocolVersion) || response.PID <= 0 {
+func validateDaemonHealth(response Response) error {
+	if !response.OK || response.Error != "" || response.Version == "" {
 		return fmt.Errorf(
-			"daemon lifecycle identity is not exact: v=%d op=%q build=%q protocol=%d pid=%d",
-			response.V, response.Op, response.Build, response.Protocol, response.PID,
-		)
-	}
-	if response.State != string(dkdaemon.StateHealthy) || response.Draining || response.Busy {
-		return fmt.Errorf(
-			"daemon lifecycle is not ready: state=%q draining=%t busy=%t",
-			response.State, response.Draining, response.Busy,
+			"daemon business health is invalid: ready=%t build=%q error=%q",
+			response.OK, response.Version, response.Error,
 		)
 	}
 	return nil
@@ -845,38 +831,6 @@ func retryableAccountMutationAck(err error) bool {
 	}
 	return callErr.Outcome == wire.PreSendFailure ||
 		callErr.Outcome == wire.PostSendFailure || callErr.Outcome == wire.DeliveryUnknown
-}
-
-// Shutdown asks the daemon runtime to step down gracefully.
-func (c *Client) Shutdown() (*Response, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	var response lifeproto.ShutdownResponse
-	if err := c.lifecycle(ctx, wire.Op(lifeproto.OpShutdown), lifeproto.NewShutdownRequest(), &response); err != nil {
-		return nil, err
-	}
-	if !response.OK {
-		return nil, errors.New("daemon shutdown not acknowledged")
-	}
-	return &Response{OK: true}, nil
-}
-
-func (c *Client) lifecycle(ctx context.Context, op wire.Op, message, response any) error {
-	payload, err := lifeproto.Encode(message)
-	if err != nil {
-		return err
-	}
-	result, err := c.call(ctx, op, payload)
-	if err != nil {
-		return err
-	}
-	if result.Response.Err != "" {
-		return errors.New(result.Response.Err)
-	}
-	if err := decodeStrict(result.Response.Payload, response); err != nil {
-		return fmt.Errorf("decode lifecycle %s: %w", op, err)
-	}
-	return nil
 }
 
 func (c *Client) call(ctx context.Context, op wire.Op, payload []byte) (wire.Result, error) {

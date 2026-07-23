@@ -21,6 +21,7 @@ var errHolderSessionLost = errors.New("daemon: FuseKit holder session lost")
 
 func operationLadder() (wire.Ladder, error) {
 	server := map[wire.Op]time.Duration{
+		wire.Op(OpHealth):             1500 * time.Millisecond,
 		wire.Op(OpSelect):             selectRequestTimeout,
 		wire.Op(OpSelectCommit):       2 * time.Second,
 		wire.Op(OpSelectAbort):        2 * time.Second,
@@ -33,6 +34,7 @@ func operationLadder() (wire.Ladder, error) {
 		wire.Op(OpAccountMutationAck): 2 * time.Second,
 	}
 	client := map[wire.Op]time.Duration{
+		wire.Op(OpHealth):             2 * time.Second,
 		wire.Op(OpSelect):             selectConnTimeout,
 		wire.Op(OpSelectCommit):       3 * time.Second,
 		wire.Op(OpSelectAbort):        3 * time.Second,
@@ -74,6 +76,7 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 		},
 	}
 	for _, op := range []Op{
+		OpHealth,
 		OpSelect,
 		OpSelectCommit,
 		OpSelectAbort,

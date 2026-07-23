@@ -25,6 +25,8 @@ const ServiceRoleID = "com.yasyf.cc-pool"
 type Op string
 
 const (
+	// OpHealth returns the exact ready daemon build over the ordinary business session.
+	OpHealth Op = "daemon-health"
 	// OpSelect prepares an inspection for PID 0 or reserves a tracked launch for PID > 0.
 	OpSelect Op = "select"
 	// OpSelectCommit commits a provisional selection immediately before launch.

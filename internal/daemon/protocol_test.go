@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -137,6 +138,68 @@ func TestServerRejectsOldClientBuildBeforeBusinessDispatch(t *testing.T) {
 	}
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+type ordinaryTestProtectedClassifier struct{}
+
+func (ordinaryTestProtectedClassifier) Validate() error { return nil }
+func (ordinaryTestProtectedClassifier) Classify(context.Context, wire.Peer) (bool, error) {
+	return false, nil
+}
+func (ordinaryTestProtectedClassifier) AuthorizeLifecycleBuild(string, string) bool { return true }
+
+func TestOrdinaryPeerCannotInvokeAnyProtectedLifecycleOperation(t *testing.T) {
+	socketDir, err := os.MkdirTemp("/tmp", "ccp-lifecycle-boundary-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socket := filepath.Join(socketDir, "daemon.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &wire.Server{
+		Build: BusinessBuild, LifecycleBuild: version.String(),
+		MaxSessions: 2, ReservedProtectedSessions: 1,
+		ProtectedSessionClassifier: ordinaryTestProtectedClassifier{},
+	}
+	server.RegisterLifecycle(buildTestLifecycle{build: version.String()})
+	intake := &drain.Intake{}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ctx, listener, func() error { return nil }, intake.Admit, intake.AdmitLifecycle)
+	}()
+	t.Cleanup(func() {
+		intake.Close()
+		_ = server.CloseIntake()
+		_ = intake.Settle(context.Background())
+		cancel()
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("serve lifecycle boundary socket: %v", err)
+		}
+	})
+
+	operations := []struct {
+		name string
+		call func(*wire.LifecyclePeer) error
+	}{
+		{name: "health", call: func(peer *wire.LifecyclePeer) error { _, err := peer.Health(t.Context()); return err }},
+		{name: "shutdown", call: func(peer *wire.LifecyclePeer) error { return peer.Shutdown(t.Context()) }},
+		{name: "handoff", call: func(peer *wire.LifecyclePeer) error { return peer.Handoff(t.Context()) }},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
+				Dial: wire.UnixDialer(socket), Build: BusinessBuild, LifecycleBuild: version.String(),
+			}}
+			defer peer.Close()
+			if err := operation.call(peer); err == nil || !strings.Contains(err.Error(), wire.ErrProtectedSessionRequired.Error()) {
+				t.Fatalf("ordinary lifecycle %s = %v, want protected rejection", operation.name, err)
+			}
+		})
 	}
 }
 
@@ -291,10 +354,12 @@ func serveBuildTestServer(
 		MaxSessions: 2, ReservedProtectedSessions: 1,
 		ProtectedSessionClassifier: buildTestProtectedClassifier{},
 	}
-	server.RegisterConcurrent(wire.Op(OpStatus), func(context.Context, wire.Request) (any, error) {
-		calls.Add(1)
-		return Response{OK: true, Version: build}, nil
-	})
+	for _, op := range []Op{OpHealth, OpStatus} {
+		server.RegisterConcurrent(wire.Op(op), func(context.Context, wire.Request) (any, error) {
+			calls.Add(1)
+			return Response{OK: true, Version: build}, nil
+		})
+	}
 	server.RegisterLifecycle(buildTestLifecycle{build: build})
 	intake := &drain.Intake{}
 	ctx, cancel := context.WithCancel(t.Context())

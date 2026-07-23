@@ -149,7 +149,7 @@ func serveHandlerOnSocket(t *testing.T, s *Server) string {
 		MaxSessions: 2, ReservedProtectedSessions: 1,
 		ProtectedSessionClassifier: buildTestProtectedClassifier{},
 	}
-	for _, op := range []Op{OpSelect, OpSelectCommit, OpSelectAbort, OpStatus, OpCredMove} {
+	for _, op := range []Op{OpHealth, OpSelect, OpSelectCommit, OpSelectAbort, OpStatus, OpCredMove} {
 		op := op
 		server.RegisterConcurrent(wire.Op(op), func(ctx context.Context, request wire.Request) (any, error) {
 			var payload Request
