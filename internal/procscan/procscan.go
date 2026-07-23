@@ -127,11 +127,6 @@ func ProcsByExecutable(ctx context.Context, execPath string) ([]Proc, error) {
 // says the process is gone (ESRCH), was reused by another uid (EPERM), has no
 // readable args (EINVAL: zombie or kernel proc), or died mid-read (EIO) skips just that process, while
 // any other per-PID error fails the whole scan closed.
-func scan(ctx context.Context, list func(context.Context) ([]proc, error), args func(context.Context, int) ([]byte, error)) ([]Session, error) {
-	snapshot, err := scanSnapshot(ctx, list, args)
-	return snapshot.Sessions, err
-}
-
 func scanSnapshot(ctx context.Context, list func(context.Context) ([]proc, error), args func(context.Context, int) ([]byte, error)) (Snapshot, error) {
 	procs, err := list(ctx)
 	if err != nil {
