@@ -5,7 +5,11 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: cc-pool-release
+  cancel-in-progress: false
 
 jobs:
   verify-tag-on-main:
@@ -32,6 +36,8 @@ jobs:
   release:
     needs: [verify-tag-on-main, release-app, version]
     runs-on: macos-15
+    permissions:
+      contents: write
     outputs:
       pure_sha256: ${{ steps.shas.outputs.pure }}
     steps:
@@ -43,6 +49,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Download the verified staged CCPoolStatus application
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.release-app.outputs.artifact_name }}
+          path: dist/staged-app
 
       - name: Require CLI signing and notarization secrets
         env:
@@ -129,6 +141,7 @@ jobs:
       - name: Checksum the release assets
         id: shas
         run: |
+          set -euo pipefail
           cd dist
           shasum -a 256 -- *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
@@ -136,14 +149,216 @@ jobs:
           test -n "$PURE_SHA"
           echo "pure=${PURE_SHA}" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            dist/*.tar.gz
-            dist/SHA256SUMS.txt
-          generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
+      - name: Verify the complete staged stack before drafting
+        env:
+          APP_ASSET: ${{ needs.release-app.outputs.asset_filename }}
+          APP_ASSET_URL: ${{ needs.release-app.outputs.asset_url }}
+          APP_SHA256: ${{ needs.release-app.outputs.sha256 }}
+          CLI_ASSET: cc-pool-${{ github.ref_name }}-darwin-universal.tar.gz
+          CLI_SHA256: ${{ steps.shas.outputs.pure }}
+        run: |
+          set -euo pipefail
+          expected_app="cc-pool-status-${GITHUB_REF_NAME}-darwin.zip"
+          [ "$APP_ASSET" = "$expected_app" ] \
+            || { echo "::error::verified app filename '$APP_ASSET' != '$expected_app'"; exit 1; }
+          expected_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${expected_app}"
+          [ "$APP_ASSET_URL" = "$expected_url" ] \
+            || { echo "::error::verified app URL does not name the exact release asset"; exit 1; }
+
+          app_zip="dist/staged-app/$APP_ASSET"
+          app_sidecar="$app_zip.sha256"
+          test -f "$app_zip"
+          test -f "$app_sidecar"
+          read -r sidecar_sha sidecar_path < "$app_sidecar"
+          [ "$sidecar_sha" = "$APP_SHA256" ]
+          [ "$(basename "$sidecar_path")" = "$APP_ASSET" ]
+          [ "$(shasum -a 256 "$app_zip" | awk '{print $1}')" = "$APP_SHA256" ]
+
+          read -r cli_sidecar_sha cli_sidecar_path < dist/SHA256SUMS.txt
+          [ "$cli_sidecar_sha" = "$CLI_SHA256" ]
+          [ "$(basename "$cli_sidecar_path")" = "$CLI_ASSET" ]
+          [ "$(wc -l < dist/SHA256SUMS.txt | tr -d ' ')" = 1 ]
+          (cd dist && shasum -a 256 -c SHA256SUMS.txt)
+
+          rm -rf dist/verified
+          mkdir -p dist/verified/cli dist/verified/app
+          tar -xzf "dist/$CLI_ASSET" -C dist/verified/cli
+          codesign --verify --strict --verbose=2 dist/verified/cli/cc-pool
+          metadata="$(codesign -dvvv dist/verified/cli/cc-pool 2>&1)"
+          grep -q '^Identifier=com.yasyf.cc-pool$' <<< "$metadata"
+          grep -q '^TeamIdentifier=SXKCTF23Q2$' <<< "$metadata"
+          dist/verified/cli/cc-pool --version | grep -q "$GITHUB_REF_NAME"
+          dist/verified/cli/cc-pool --help | grep -q "emptiest account"
+
+          ditto -x -k "$app_zip" dist/verified/app
+          test -d dist/verified/app/CCPoolStatus.app
+          APP_PATH="$PWD/dist/verified/app/CCPoolStatus.app" \
+            TEAM_ID=SXKCTF23Q2 APP_GROUP=SXKCTF23Q2.ccp \
+            bash "$GITHUB_WORKSPACE/scripts/assert-signed-topology.sh"
+          xcrun stapler validate dist/verified/app/CCPoolStatus.app
+          spctl --assess --type execute --verbose=4 dist/verified/app/CCPoolStatus.app
+
+      - name: Create or reset the private draft GitHub Release
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ contains(github.ref_name, '-') }}
+        run: |
+          set -euo pipefail
+          releases="$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          if [ "$PRERELEASE" = false ]; then
+            newer="$(jq -r --arg current "$GITHUB_REF_NAME" '
+              def stable_version:
+                capture("^v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$")
+                | [.major, .minor, .patch] | map(tonumber);
+              ($current | stable_version) as $current_version
+              | [.[][]
+                  | select(.draft == false and .prerelease == false)
+                  | .tag_name as $tag
+                  | try (($tag | stable_version) as $version
+                    | select($version > $current_version) | $tag) catch empty]
+              | .[]
+            ' <<< "$releases")"
+            [ -z "$newer" ] \
+              || { echo "::error::newer stable release already published: $newer"; exit 1; }
+          fi
+          matches="$(jq --arg tag "$GITHUB_REF_NAME" \
+            '[.[][] | select(.tag_name == $tag)]' <<< "$releases")"
+          case "$(jq 'length' <<< "$matches")" in
+          0)
+            release="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
+              -f tag_name="$GITHUB_REF_NAME" -f target_commitish="$GITHUB_SHA" \
+              -f name="$GITHUB_REF_NAME" -F draft=true -F prerelease="$PRERELEASE" \
+              -F generate_release_notes=true)"
+            release_id="$(jq -r '.id' <<< "$release")"
+            already_public=false
+            ;;
+          1)
+            release="$(jq '.[0]' <<< "$matches")"
+            release_id="$(jq -r '.id' <<< "$release")"
+            if [ "$(jq -r '.draft' <<< "$release")" = true ]; then
+              release="$(gh api --method PATCH \
+                "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+                -f name="$GITHUB_REF_NAME" -F draft=true -F prerelease="$PRERELEASE")"
+              already_public=false
+            else
+              [ "$(jq -r '.prerelease' <<< "$release")" = "$PRERELEASE" ] \
+                || { echo "::error::public release prerelease state differs"; exit 1; }
+              already_public=true
+            fi
+            ;;
+          *)
+            echo "::error::multiple releases exist for tag $GITHUB_REF_NAME"
+            exit 1
+            ;;
+          esac
+          [ "$release_id" != null ] && [ -n "$release_id" ]
+          if [ "$already_public" = false ]; then
+            [ "$(jq -r '.draft' <<< "$release")" = true ]
+            while IFS= read -r asset_id; do
+              [ -n "$asset_id" ] || continue
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+            done < <(jq -r '.assets[].id' <<< "$release")
+          fi
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "already_public=$already_public" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the exact stack to the private draft
+        if: ${{ steps.draft.outputs.already_public != 'true' }}
+        env:
+          APP_ASSET: ${{ needs.release-app.outputs.asset_filename }}
+          CLI_ASSET: cc-pool-${{ github.ref_name }}-darwin-universal.tar.gz
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          upload_asset() {
+            path="$1"
+            name="${path##*/}"
+            curl --fail --silent --show-error --location --request POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/octet-stream" \
+              "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${name}" \
+              --data-binary "@$path" >/dev/null
+          }
+          upload_asset "dist/$CLI_ASSET"
+          upload_asset dist/SHA256SUMS.txt
+          upload_asset "dist/staged-app/$APP_ASSET"
+          upload_asset "dist/staged-app/$APP_ASSET.sha256"
+
+      - name: Validate the private draft asset set and bytes
+        env:
+          APP_ASSET: ${{ needs.release-app.outputs.asset_filename }}
+          ALREADY_PUBLIC: ${{ steps.draft.outputs.already_public }}
+          CLI_ASSET: cc-pool-${{ github.ref_name }}-darwin-universal.tar.gz
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ contains(github.ref_name, '-') }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          expected_draft=true
+          [ "$ALREADY_PUBLIC" != true ] || expected_draft=false
+          [ "$(jq -r '.draft' <<< "$release")" = "$expected_draft" ] \
+            || { echo "::error::release publication state changed before validation"; exit 1; }
+          [ "$(jq -r '.prerelease' <<< "$release")" = "$PRERELEASE" ] \
+            || { echo "::error::release prerelease state changed before validation"; exit 1; }
+          expected="$(printf '%s\n' \
+            "$CLI_ASSET" SHA256SUMS.txt "$APP_ASSET" "$APP_ASSET.sha256" | LC_ALL=C sort)"
+          actual="$(jq -r '.assets[].name' <<< "$release" | LC_ALL=C sort)"
+          [ "$actual" = "$expected" ] \
+            || { echo "::error::draft release asset set is not exact"; diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"); exit 1; }
+
+          rm -rf dist/draft-verify
+          mkdir -p dist/draft-verify
+          while IFS=$'\t' read -r name asset_id; do
+            curl --fail --silent --show-error --location \
+              -H "Accept: application/octet-stream" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              --output "dist/draft-verify/$name"
+          done < <(jq -r '.assets[] | [.name, (.id | tostring)] | @tsv' <<< "$release")
+          cmp "dist/$CLI_ASSET" "dist/draft-verify/$CLI_ASSET"
+          cmp dist/SHA256SUMS.txt dist/draft-verify/SHA256SUMS.txt
+          cmp "dist/staged-app/$APP_ASSET" "dist/draft-verify/$APP_ASSET"
+          cmp "dist/staged-app/$APP_ASSET.sha256" "dist/draft-verify/$APP_ASSET.sha256"
+
+      - name: Publish the complete draft release
+        if: ${{ steps.draft.outputs.already_public != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAKE_LATEST: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
+          PRERELEASE: ${{ contains(github.ref_name, '-') }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          if [ "$PRERELEASE" = false ]; then
+            releases="$(gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+            newer="$(jq -r --arg current "$GITHUB_REF_NAME" '
+              def stable_version:
+                capture("^v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$")
+                | [.major, .minor, .patch] | map(tonumber);
+              ($current | stable_version) as $current_version
+              | [.[][]
+                  | select(.draft == false and .prerelease == false)
+                  | .tag_name as $tag
+                  | try (($tag | stable_version) as $version
+                    | select($version > $current_version) | $tag) catch empty]
+              | .[]
+            ' <<< "$releases")"
+            [ -z "$newer" ] \
+              || { echo "::error::newer stable release published during staging: $newer"; exit 1; }
+          fi
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false -F prerelease="$PRERELEASE" -f make_latest="$MAKE_LATEST" \
+            >/dev/null
 
   widget-test:
     needs: verify-tag-on-main
@@ -176,8 +391,8 @@ jobs:
   release-app:
     needs: [version, widget-test]
     permissions:
-      contents: write
-    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@b143646dd7291fd4b83c53afdfbb9a5a130740c6
+      contents: read
+    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@1666a5363ad6f2ed7ac0be901702e523cc1fba66
     with:
       app_name: CCPoolStatus
       asset_name: cc-pool-status

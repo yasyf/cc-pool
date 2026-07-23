@@ -11,7 +11,7 @@ func TestReleaseCLIFailsClosedBeforeArtifactPublication(t *testing.T) {
 	release := readReleaseArtifactContract(t, ".github", "workflows", "release.yml")
 	require := strings.Index(release, "Require CLI signing and notarization secrets")
 	build := strings.Index(release, "Build universal CLI")
-	create := strings.Index(release, "Create GitHub Release")
+	create := strings.Index(release, "Create or reset the private draft GitHub Release")
 	if require < 0 || build < require || create < build {
 		t.Fatal("CLI signing and notarization secrets are not required before artifact publication")
 	}
@@ -37,6 +37,91 @@ func TestReleaseCLIFailsClosedBeforeArtifactPublication(t *testing.T) {
 	}
 	if strings.Contains(release[build:create], "spctl --assess --type execute --verbose=4 dist/pure/cc-pool") {
 		t.Fatal("CLI release assesses a raw Mach-O binary as an application bundle")
+	}
+}
+
+func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
+	release := readReleaseArtifactContract(t, ".github", "workflows", "release.yml")
+	releaseJob := strings.Index(release, "\n  release:")
+	widgetJob := strings.Index(release, "\n  widget-test:")
+	if releaseJob < 0 || widgetJob < releaseJob {
+		t.Fatal("release job boundaries are missing")
+	}
+	job := release[releaseJob:widgetJob]
+
+	stages := []string{
+		"Download the verified staged CCPoolStatus application",
+		"Build universal CLI",
+		"Verify the complete staged stack before drafting",
+		"Create or reset the private draft GitHub Release",
+		"Upload the exact stack to the private draft",
+		"Validate the private draft asset set and bytes",
+		"Publish the complete draft release",
+	}
+	previous := -1
+	for _, stage := range stages {
+		at := strings.Index(job, stage)
+		if at <= previous {
+			t.Fatalf("atomic release stage %q is missing or out of order", stage)
+		}
+		previous = at
+	}
+	for _, required := range []string{
+		"permissions:\n      contents: write",
+		"needs.release-app.outputs.artifact_name",
+		`[ "$(jq -r '.draft' <<< "$release")" = true ]`,
+		`gh api --paginate --slurp`,
+		`https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${name}`,
+		`"dist/$CLI_ASSET"`,
+		"dist/SHA256SUMS.txt",
+		`"dist/staged-app/$APP_ASSET"`,
+		`"dist/staged-app/$APP_ASSET.sha256"`,
+		`actual="$(jq -r '.assets[].name' <<< "$release" | LC_ALL=C sort)"`,
+		`release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"`,
+		`https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}`,
+		`if: ${{ steps.draft.outputs.already_public != 'true' }}`,
+		`already_public=$already_public`,
+		`[ "$ALREADY_PUBLIC" != true ] || expected_draft=false`,
+		`newer stable release published during staging`,
+		`-F draft=false`,
+	} {
+		if !strings.Contains(job, required) {
+			t.Fatalf("atomic release is missing %q", required)
+		}
+	}
+	for _, required := range []string{"group: cc-pool-release", "cancel-in-progress: false"} {
+		if !strings.Contains(release, required) {
+			t.Fatalf("release workflow is missing serialization contract %q", required)
+		}
+	}
+	if got := strings.Count(release, "contents: write"); got != 1 {
+		t.Fatalf("GitHub Release publishers = %d, want one", got)
+	}
+	if got := strings.Count(job, "if: ${{ steps.draft.outputs.already_public != 'true' }}"); got != 2 {
+		t.Fatalf("draft-only mutations = %d, want upload and publish", got)
+	}
+	if got := strings.Count(job, "gh api --paginate --slurp"); got != 2 {
+		t.Fatalf("stable-order checks = %d, want initial and final", got)
+	}
+	if !strings.Contains(release, "permissions:\n  contents: read") {
+		t.Fatal("release workflow does not default non-owner jobs to read-only contents")
+	}
+	if !strings.Contains(release, "release-app.yml@1666a5363ad6f2ed7ac0be901702e523cc1fba66") {
+		t.Fatal("release workflow is not pinned to the caller-owned staging contract")
+	}
+	appJob := strings.Index(release, "\n  release-app:")
+	publishJob := strings.Index(release, "\n  publish-tap:")
+	if appJob < 0 || publishJob < appJob || !strings.Contains(release[appJob:publishJob], "permissions:\n      contents: read") {
+		t.Fatal("artifact-only application workflow retains release publication authority")
+	}
+	for _, forbidden := range []string{
+		"softprops/action-gh-release",
+		"attach-to-release: \"true\"",
+		"releases/tags/${GITHUB_REF_NAME}",
+	} {
+		if strings.Contains(job, forbidden) {
+			t.Fatalf("release job retains an independent publisher %q", forbidden)
+		}
 	}
 }
 
