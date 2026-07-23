@@ -124,7 +124,7 @@ func (m *Manager) FinalizeAccountPresentationRebind(
 		oldState.Keychain.Digest != nil && oldDigest != nil &&
 		*oldDigest == mutation.PreviousCredentialDigest:
 		proof, casErr := m.credentialCAS(ctx, oldAccount, oldState, credentialCASMutation{
-			Target: creds.SourceKeychain, DeleteTarget: true,
+			Delete: true,
 		})
 		if casErr != nil {
 			if errors.Is(casErr, errCredentialCASConflict) {
