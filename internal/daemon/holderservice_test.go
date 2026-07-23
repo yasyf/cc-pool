@@ -119,6 +119,7 @@ func TestValidateHolderStopTargetAcceptsOlderStartingAndDrainingRuntime(t *testi
 }
 
 func TestStopObservedHolderRuntimeTargetsProcessGeneration(t *testing.T) {
+	useTestHolderApplication(t)
 	original := holderRuntimeHealth
 	t.Cleanup(func() { holderRuntimeHealth = original })
 	holderRuntimeHealth = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) {
@@ -510,6 +511,7 @@ func TestEnsureHolderServiceReadinessFailurePreservesPreexistingService(t *testi
 }
 
 func TestStopAndUninstallHolderServiceConvergesEmptyDesiredSet(t *testing.T) {
+	useTestHolderApplication(t)
 	stubNoHolderRuntime(t)
 	originalOpen := holderControllerOpen
 	t.Cleanup(func() { holderControllerOpen = originalOpen })
@@ -544,6 +546,7 @@ func TestStopAndUninstallHolderServiceConvergesEmptyDesiredSet(t *testing.T) {
 }
 
 func TestStopAndUninstallHolderServiceReportsControllerFailure(t *testing.T) {
+	useTestHolderApplication(t)
 	stubNoHolderRuntime(t)
 	originalOpen := holderControllerOpen
 	t.Cleanup(func() { holderControllerOpen = originalOpen })
