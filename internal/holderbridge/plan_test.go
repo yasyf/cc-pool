@@ -1,23 +1,17 @@
 package holderbridge
 
 import (
-	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 )
 
 func TestRuntimePlanSpecPinsProductIdentityAndProtectedPolicy(t *testing.T) {
 	const appPath = "/Applications/CCPoolStatus.app"
 	const runtimeDirectory = "/Users/test/.cc-pool/fusekit"
-	const presentationRoot = "/Users/test/.cc-pool/accounts"
 	const buildID = "v0.60.0"
-	spec := RuntimePlanSpec(appPath, runtimeDirectory, presentationRoot, buildID, nil)
+	spec := RuntimePlanSpec(appPath, runtimeDirectory, buildID)
 	application := spec.Application
 	if application != Application(appPath) || application.BundleID != BundleID ||
 		application.TeamID != TeamID || application.Broker != application.Runtime ||
@@ -25,7 +19,7 @@ func TestRuntimePlanSpecPinsProductIdentityAndProtectedPolicy(t *testing.T) {
 		application.Runtime.SigningIdentifier != BundleID {
 		t.Fatalf("application = %#v", application)
 	}
-	if spec.RuntimeDirectory != runtimeDirectory || spec.PresentationRoot != presentationRoot ||
+	if spec.RuntimeDirectory != runtimeDirectory || spec.Native != nil ||
 		spec.BuildID != buildID ||
 		spec.Readiness != ReadinessContract() ||
 		!spec.SourceCapable || spec.BrokerPolicy.RequiredAppGroup != AppGroup ||
@@ -88,45 +82,5 @@ func TestSignedAppDispatchesStopControlBeforeBrokerInitialization(t *testing.T) 
 	start := strings.Index(source, "CCPoolFuseKitStart()")
 	if stop < 0 || broker < 0 || start < 0 || stop >= broker || broker >= start {
 		t.Fatalf("signed app dispatch order stop=%d broker=%d start=%d", stop, broker, start)
-	}
-}
-
-func TestToolRunnerExecutesAndSettlesOneDisposableTask(t *testing.T) {
-	runner, err := NewToolRunner(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	directory := runner.directory
-	if err := runner.Run(t.Context(), supervise.Task{
-		RecoveryClass: proc.RecoveryTask,
-		Path:          "/usr/bin/true",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := runner.Close(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("runner directory still exists: %v", err)
-	}
-	if err := runner.Close(t.Context()); err != nil {
-		t.Fatalf("idempotent close = %v", err)
-	}
-}
-
-func TestToolRunnerRejectsTaskAfterClose(t *testing.T) {
-	runner, err := NewToolRunner(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := runner.Close(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	err = runner.Run(context.Background(), supervise.Task{
-		RecoveryClass: proc.RecoveryTask,
-		Path:          "/usr/bin/true",
-	})
-	if !errors.Is(err, supervise.ErrClosed) {
-		t.Fatalf("Run after Close = %v, want ErrClosed", err)
 	}
 }

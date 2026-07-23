@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -273,30 +275,29 @@ func abortDaemonSelection(ctx context.Context, cl *daemon.Client, token string) 
 }
 
 func validateDaemonSelection(m *pool.Manager, resp *daemon.Response, forced *store.Account) (store.Account, error) {
-	expectedDir := "<unknown>"
-	if forced != nil {
-		expectedDir = pool.AccountPresentationDir(forced.ID)
-	}
 	if resp.SelectedID == nil {
-		return store.Account{}, fmt.Errorf("invalid daemon selection: id <nil>, expected dir %q, returned dir %q", expectedDir, resp.Dir)
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id <nil>, returned dir %q", resp.Dir)
 	}
 	id := *resp.SelectedID
 	a, err := m.Store.GetAccount(id)
 	if err != nil {
-		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d, expected dir %q, returned dir %q: %w", id, expectedDir, resp.Dir, err)
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d, returned dir %q: %w", id, resp.Dir, err)
 	}
-	presentationDir := pool.AccountPresentationDir(a.ID)
-	if resp.Dir != presentationDir {
-		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d, expected dir %q, returned dir %q", id, presentationDir, resp.Dir)
+	if !exactSelectionPath(resp.Dir) {
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d returned invalid File Provider path %q", id, resp.Dir)
 	}
 	if forced != nil && id != forced.ID {
-		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d does not match forced account %d, expected dir %q, returned dir %q", id, forced.ID, expectedDir, resp.Dir)
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d does not match forced account %d, returned dir %q", id, forced.ID, resp.Dir)
 	}
 	if resp.AccountInstanceID != a.InstanceID || resp.AccountGeneration != a.Generation {
 		return store.Account{}, fmt.Errorf("invalid daemon selection: account %d identity %s/%d, current %s/%d",
 			id, resp.AccountInstanceID, resp.AccountGeneration, a.InstanceID, a.Generation)
 	}
 	return a, nil
+}
+
+func exactSelectionPath(value string) bool {
+	return value != "" && filepath.IsAbs(value) && filepath.Clean(value) == value && !strings.ContainsRune(value, 0)
 }
 
 func warnPinHeld(cmd *cobra.Command, m *pool.Manager, held, selected *int) {

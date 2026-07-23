@@ -7,8 +7,8 @@ Full style guide: [STYLEGUIDE.md](STYLEGUIDE.md)
 
 cc-pool (`ccp`) pools several Claude Max/Pro subscriptions and launches each Claude Code session on the emptiest account. Go, macOS-only, single binary.
 
-- **Build**: `CGO_ENABLED=0 go build ./cmd/cc-pool` (pure-Go default; `-tags fuse` needs cgo + fuse-t)
-- **Test**: `scripts/test.sh ./...` — a `ulimit -u` wrapper around `go test` so a runaway spawn can't fork-bomb the host. Must pass with no network, no Keychain, no daemon. **Never run bare `go test` (especially `-tags fuse`) on a real machine** — the fuse/holder spawn path can re-exec a test binary into a fork bomb that exhausts the process table and freezes the machine (see the cc-notes incident doc: `ccn doc show ef281ea`, or `ccn doc search "fork storm"`). Use the harness, or an isolated VM/container.
+- **Build**: `CGO_ENABLED=0 go build ./cmd/cc-pool`; the signed File Provider holder archive is built with cgo but has no native filesystem dependency.
+- **Test**: `scripts/test.sh ./...` — a `ulimit -u` wrapper around `go test` so a runaway spawn cannot fork-bomb the host. Must pass with no network, no Keychain, no daemon. Never run bare `go test` on a real machine; use the harness, or an isolated VM/container for live holder and File Provider work.
 - **Vet**: `go vet ./...` before every commit
 
 ## Releasing

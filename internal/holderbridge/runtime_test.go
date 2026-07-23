@@ -3,7 +3,6 @@ package holderbridge
 import (
 	"context"
 	"errors"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -34,9 +33,6 @@ func TestNewEmbeddedRuntimeSuppliesCatalogOperationDeadline(t *testing.T) {
 	}
 	if got.StopRole != StopRoleID || got.StopControlStore != store {
 		t.Fatalf("holder stop authority = %q/%T", got.StopRole, got.StopControlStore)
-	}
-	if got.NativeStdout != os.Stdout || got.NativeStderr != os.Stderr {
-		t.Fatalf("native output = %#v/%#v, want process stdout/stderr", got.NativeStdout, got.NativeStderr)
 	}
 }
 

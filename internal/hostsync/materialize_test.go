@@ -106,7 +106,7 @@ func (r *fixtureAccountRemover) callsSnapshot() []int {
 }
 
 func (p fixtureAccountRemoval) Finish(ctx context.Context) error {
-	if err := os.RemoveAll(pool.AccountPresentationDir(p.id)); err != nil {
+	if err := os.RemoveAll(pool.AccountDir(p.id)); err != nil {
 		return err
 	}
 	return p.remover.m.Remove(ctx, p.id, p.deleteCredential)

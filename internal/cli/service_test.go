@@ -474,7 +474,7 @@ func TestStopDaemonServiceDoesNotClaimSuccessWhenHolderStopFails(t *testing.T) {
 
 func TestPurgeRefusesProvisionedAccount(t *testing.T) {
 	tempHome(t)
-	seedAccounts(t, store.Account{ID: 1, ConfigDir: pool.AccountPresentationDir(1)})
+	seedAccounts(t, store.Account{ID: 1, ConfigDir: pool.AccountDir(1)})
 	cmd, _, _ := uninstallCmd()
 	err := purgeAll(cmd)
 	if err == nil || !strings.Contains(err.Error(), "accounts remain provisioned") {
@@ -517,7 +517,7 @@ func TestUninstallHelpMentionsPurgeGate(t *testing.T) {
 	}
 }
 
-func TestFuseKitPresentationRootIsInsideState(t *testing.T) {
+func TestFuseKitRuntimeIsInsideState(t *testing.T) {
 	tempHome(t)
 	if filepath.Dir(pool.FuseKitRuntimeDir()) != pool.StateDir() {
 		t.Fatalf("runtime dir = %q", pool.FuseKitRuntimeDir())

@@ -15,6 +15,7 @@ import (
 
 // PreparationRuntime converges one exact committed tenant source revision.
 type PreparationRuntime interface {
+	RuntimeHealth(context.Context) (mountproto.RuntimeHealthResponse, error)
 	PrepareTenant(context.Context, catalogproto.TenantID, catalogproto.PrepareTenantRequest) (catalogproto.PrepareTenantResponse, error)
 }
 

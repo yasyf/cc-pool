@@ -25,7 +25,7 @@ const (
 
 type sourcePreparer interface {
 	Prepare(context.Context, tenantfs.Account) (catalogproto.TenantPreparationProof, error)
-	Validate(tenantfs.Account, catalogproto.TenantPreparationProof) error
+	Validate(context.Context, tenantfs.Account, catalogproto.TenantPreparationProof) error
 }
 
 type tenantLifecycleRuntime interface {
@@ -457,6 +457,41 @@ func (s *Server) prepareTenant(
 	return s.tenantCoordinator.prepare(ctx, account)
 }
 
+func (s *Server) prepareReservedAccountPath(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+) (string, error) {
+	if s.prepareReservedAccount != nil {
+		publicPath, err := s.prepareReservedAccount(ctx, reservation)
+		if err != nil {
+			return "", err
+		}
+		if err := tenantfs.ValidateFileProviderPublicPath(publicPath); err != nil {
+			return "", err
+		}
+		return publicPath, nil
+	}
+	account := store.Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
+	}
+	proof, err := s.prepareTenant(ctx, account)
+	if err != nil {
+		return "", err
+	}
+	activate := func() error { return nil }
+	if s.activatePrepared != nil {
+		err = s.activatePrepared(ctx, account, proof, activate)
+	} else if s.tenantCoordinator != nil {
+		err = s.tenantCoordinator.activatePrepared(ctx, account, proof, activate)
+	} else {
+		err = errors.New("FuseKit tenant coordinator is unavailable")
+	}
+	if err != nil {
+		return "", err
+	}
+	return tenantfs.FileProviderPublicPath(proof)
+}
+
 func (c *tenantCoordinator) activatePrepared(
 	ctx context.Context,
 	account store.Account,
@@ -466,7 +501,7 @@ func (c *tenantCoordinator) activatePrepared(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := c.preparer.Validate(pool.TenantAccount(account), proof); err != nil {
+	if err := c.preparer.Validate(ctx, pool.TenantAccount(account), proof); err != nil {
 		return err
 	}
 	return activate()

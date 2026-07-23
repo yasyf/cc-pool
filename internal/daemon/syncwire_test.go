@@ -288,8 +288,8 @@ func TestExecPeerRoundTripThroughWiredFetcher(t *testing.T) {
 	credB.ClaudeAiOauth.RefreshToken = "rt-peer"
 	credB.ClaudeAiOauth.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
 	acctB := store.Account{
-		ID: 9, ConfigDir: pool.AccountPresentationDir(9),
-		KeychainService: creds.ServiceName(pool.AccountPresentationDir(9)),
+		ID: 9, ConfigDir: pool.AccountDir(9),
+		KeychainService: creds.ServiceName(pool.AccountDir(9)),
 		KeychainAccount: "me", AccountUUID: "u9",
 	}
 	if err := b.m.Store.UpsertAccount(acctB); err != nil {
@@ -367,7 +367,7 @@ func TestAuthKindClassification(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := s.m.Store.UpsertAccount(store.Account{
-		ID: 1, ConfigDir: pool.AccountPresentationDir(1),
+		ID: 1, ConfigDir: pool.AccountDir(1),
 		KeychainService: "svc-auth-kind", KeychainAccount: "cc-pool",
 		AccountUUID: "u-self",
 	}); err != nil {

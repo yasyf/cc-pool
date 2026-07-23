@@ -126,7 +126,7 @@ func execClaude(configDir string, args []string) error {
 // CLAUDE_CODE_PLUGIN_CACHE_DIR to canonical ~/.claude/plugins (claude's marketplace
 // validator string-compares unresolved paths, rejecting account-anchored ones as
 // "corrupted installLocation") and CLAUDE_CODE_DEBUG_LOGS_DIR to ~/.claude/debug
-// (keeping DEBUG=1's bulk log off the fuse-t mirror it would wedge; claude's
+// (keeping DEBUG=1's bulk log out of the File Provider presentation; claude's
 // per-session UUID log names keep pooled sessions from colliding in that shared dir).
 func execEnv(environ []string, configDir string) []string {
 	const cfgKey = "CLAUDE_CONFIG_DIR="

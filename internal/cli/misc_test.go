@@ -44,7 +44,7 @@ func TestEnvExportsFuseKitPresentationWithoutSessionOwnership(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("env failed: %v (stderr=%q)", err, stripANSI(stderr.String()))
 	}
-	if !strings.Contains(stdout.String(), "export CLAUDE_CONFIG_DIR='"+pool.AccountPresentationDir(1)+"'") {
+	if !strings.Contains(stdout.String(), "export CLAUDE_CONFIG_DIR='"+dir+"'") {
 		t.Fatalf("env exports missing the config dir: %q", stdout.String())
 	}
 	st, err = store.Open(pool.DBPath())

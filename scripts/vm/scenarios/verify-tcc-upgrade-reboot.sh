@@ -38,7 +38,6 @@ signature_snapshot() {
   local output="$1"
   vm_ssh "for bundle in \
     '$VMCTL_GUEST_APP' \
-    '$VMCTL_GUEST_APP/Contents/Frameworks/libfuse-t.dylib' \
     '$VMCTL_GUEST_APP/Contents/PlugIns/CCPoolFileProvider.appex' \
     '$VMCTL_GUEST_APP/Contents/PlugIns/CCPoolStatusWidget.appex'; do \
       /usr/bin/codesign -d -r- \"\$bundle\" 2>&1; \
@@ -61,7 +60,7 @@ launch_and_assert_runtime() {
   pid="$(vm_ssh 'for _ in $(seq 1 100); do
     for candidate in $(pgrep -x CCPoolStatus); do
       command=$(ps -p "$candidate" -o command=)
-      case "$command" in *fusekit-native-v1*) continue ;; esac
+      case "$command" in *--fusekit-*) continue ;; esac
       echo "$candidate"
       exit 0
     done
@@ -80,14 +79,8 @@ launch_and_assert_runtime() {
   done
   exit 1" || die "signed app did not bind both broker and holder sockets during $phase"
 
-  vm_ssh "for _ in \$(seq 1 100); do
-    for child in \$(pgrep -P '$APP_PID' -x CCPoolStatus); do
-      command=\$(ps -p \"\$child\" -o command=)
-      case \"\$command\" in *fusekit-native-v1*) exit 0 ;; esac
-    done
-    sleep 0.2
-  done
-  exit 1" || die "signed app did not own its native child during $phase"
+  vm_ssh "! ps -ax -o command= | grep '[f]usekit-native-v1'" \
+    || die "File Provider-only holder launched a native filesystem child during $phase"
 }
 
 vm_scp_to "$SCRIPT_DIR/tcc-snapshot.sh" "$TCC_PROBE" \

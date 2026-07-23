@@ -40,8 +40,8 @@ tcc_snapshot() {
   fi
 }
 
-# Release and VM use the same exact signature, entitlement, native-child, and
-# pure-Go boundary assertions.
+# Release and VM use the same exact signature, entitlement, and pure-Go
+# boundary assertions.
 vm_phase signatures
 require_seconds signatures
 vm_scp_to "$SCRIPT_DIR/../assert-signed-topology.sh" "$TOPOLOGY_PROBE" \
@@ -65,7 +65,7 @@ vm_ssh "open -gj '$VMCTL_GUEST_APP'" \
 APP_PID="$(vm_ssh 'for _ in $(seq 1 100); do
   for pid in $(pgrep -x CCPoolStatus); do
     command=$(ps -p "$pid" -o command=)
-    case "$command" in *fusekit-native-v1*) continue ;; esac
+    case "$command" in *--fusekit-*) continue ;; esac
     echo "$pid"
     exit 0
   done
@@ -89,17 +89,8 @@ done
 exit 1" \
   || die "fixed signed app did not bind both $BROKER_SOCKET and $HOLDER_SOCKET"
 
-# The native mount process is the same fixed signed executable under the host,
-# selected only by the exact FuseKit child contract.
-vm_ssh "for _ in \$(seq 1 100); do
-  for pid in \$(pgrep -P '$APP_PID' -x CCPoolStatus); do
-    command=\$(ps -p \"\$pid\" -o command=)
-    case \"\$command\" in *fusekit-native-v1*) exit 0 ;; esac
-  done
-  sleep 0.2
-done
-exit 1" \
-  || die "fixed signed host did not own its same-executable FuseKit native child"
+vm_ssh "! ps -ax -o command= | grep '[f]usekit-native-v1'" \
+  || die "File Provider-only holder launched a native filesystem child"
 
 vm_sudo "launchctl procinfo '$APP_PID'" >"$VMCTL_RESULTS_DIR/host-procinfo.txt" 2>&1 \
   || die "could not inspect the kernel-validated CCPoolStatus process identity"

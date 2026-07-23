@@ -161,7 +161,6 @@ jobs:
           go-cache-dependency-path: go.sum
           brew-packages: |
             xcodegen
-            macos-fuse-t/cask/fuse-t
       - name: Test widget and File Provider logic
         run: |
           set -euo pipefail
@@ -198,7 +197,6 @@ jobs:
       assert_script: .github/scripts/assert-widget-app.sh
       go_version: 1.26.5
       go_cache_dependency_path: go.sum
-      prebuild_brew_packages: macos-fuse-t/cask/fuse-t
     secrets:
       MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
       MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}

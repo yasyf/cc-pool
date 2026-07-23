@@ -43,7 +43,7 @@ servers, and per-project tool approvals instead of running first-run onboarding.
 
 Each account has one immutable FuseKit tenant generation. Its private backing directory
 keeps Claude identity and credential state, while the revisioned FuseKit catalog presents
-the effective shared configuration through both the native mount and File Provider. Tenant
+the effective shared configuration through File Provider. Tenant
 and domain identifiers derive from the account instance ID, never a path, filename, or
 private/computed classification.
 
@@ -54,10 +54,9 @@ tenants remain logically stale until `PrepareTenant` catches up that one selecte
 Atomic replacement is one catalog transaction: the source object keeps its identity, the
 replaced target is tombstoned once, and old handles retain their pinned snapshot.
 
-One native Fuse-T mount at `~/.cc-pool/fusekit/mount` presents every account subtree. The
-fixed Developer ID-signed `/Applications/CCPoolStatus.app` embeds the FuseKit holder and
-dispatches disposable native-child mode from the same Mach-O before SwiftUI starts. The
-fixed signing identity owns the intended Network Volumes authorization across upgrades.
+The fixed Developer ID-signed `/Applications/CCPoolStatus.app` embeds the File Provider-only
+FuseKit holder in the same Mach-O as the application. No native filesystem runtime, mount,
+or Network Volumes authorization participates in account presentation.
 
 The same app owns the File Provider broker endpoint in App Group `SXKCTF23Q2.ccp`.
 `CCPoolFileProvider.appex` reaches only that broker. The app forwards catalog traffic to

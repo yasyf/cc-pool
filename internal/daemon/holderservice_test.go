@@ -21,10 +21,6 @@ import (
 )
 
 func TestValidateHolderRuntimeHealthRequiresExactPublishedRuntime(t *testing.T) {
-	source, err := mountproto.NativeMountSource(pool.FuseKitPresentationRoot())
-	if err != nil {
-		t.Fatal(err)
-	}
 	healthy := mountproto.RuntimeHealthResponse{
 		Protocol:             mountproto.Version,
 		Code:                 mountproto.ErrorCodeOk,
@@ -34,16 +30,11 @@ func TestValidateHolderRuntimeHealthRequiresExactPublishedRuntime(t *testing.T) 
 		ProcessGeneration:    "process-generation-7",
 		ActivationGeneration: "activation-generation-9",
 		State:                mountproto.RuntimeStateHealthy,
+		Ready:                true,
 		ReadinessPhase:       mountproto.ReadinessPhaseReady,
 		ReadinessStep:        mountproto.ReadinessStepPublished,
-		NativePhase:          mountproto.NativePhaseLive,
-		NativeMount: &mountproto.NativeMountProof{
-			PresentationRoot: pool.FuseKitPresentationRoot(),
-			Filesystem:       mountproto.NativeMountFilesystem,
-			Source:           source,
-			RootReadEpoch:    7,
-		},
-		BrokerPhase: mountproto.BrokerPhaseLive,
+		NativePhase:          mountproto.NativePhaseDisabled,
+		BrokerPhase:          mountproto.BrokerPhaseLive,
 	}
 	if err := validateHolderRuntimeHealth(healthy); err != nil {
 		t.Fatalf("healthy runtime: %v", err)
@@ -66,23 +57,18 @@ func TestValidateHolderRuntimeHealthRequiresExactPublishedRuntime(t *testing.T) 
 		{name: "state", edit: func(h *mountproto.RuntimeHealthResponse) { h.State = mountproto.RuntimeStateDegraded }, want: "lifecycle is not ready"},
 		{name: "draining", edit: func(h *mountproto.RuntimeHealthResponse) { h.Draining = true }, want: "lifecycle is not ready"},
 		{name: "busy", edit: func(h *mountproto.RuntimeHealthResponse) { h.Busy = true }, want: "lifecycle is not ready"},
+		{name: "ready", edit: func(h *mountproto.RuntimeHealthResponse) { h.Ready = false }, want: "lifecycle is not ready"},
 		{name: "readiness phase", edit: func(h *mountproto.RuntimeHealthResponse) {
 			h.ReadinessPhase = mountproto.ReadinessPhaseStarting
 			h.ReadinessStep = mountproto.ReadinessStepBroker
 		}, want: "readiness is not published"},
 		{name: "readiness step", edit: func(h *mountproto.RuntimeHealthResponse) { h.ReadinessStep = mountproto.ReadinessStepReceipts }, want: "readiness is not published"},
-		{name: "phase", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativePhase = mountproto.NativePhaseStarting }, want: "presentation is not ready"},
-		{name: "proof", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount = nil }, want: "presentation is not ready"},
-		{name: "root", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.PresentationRoot += "-wrong" }, want: "proof is not exact"},
-		{name: "filesystem", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.Filesystem = "fusefs" }, want: "proof is not exact"},
-		{name: "source", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.Source = "fuse-t:/wrong" }, want: "proof is not exact"},
-		{name: "epoch", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount.RootReadEpoch = 0 }, want: "proof is not exact"},
+		{name: "phase", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativePhase = mountproto.NativePhaseStarting }, want: "presentation is not disabled"},
+		{name: "proof", edit: func(h *mountproto.RuntimeHealthResponse) { h.NativeMount = &mountproto.NativeMountProof{} }, want: "presentation is not disabled"},
 		{name: "broker", edit: func(h *mountproto.RuntimeHealthResponse) { h.BrokerPhase = mountproto.BrokerPhaseStarting }, want: "broker is not ready"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got := healthy
-			proof := *healthy.NativeMount
-			got.NativeMount = &proof
 			test.edit(&got)
 			if err := validateHolderRuntimeHealth(got); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("validateHolderRuntimeHealth(%#v) = %v, want %q", got, err, test.want)
@@ -212,12 +198,11 @@ func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testi
 		)
 	}
 	runtimeSpec := holderbridge.RuntimePlanSpec(
-		wantApplication.AppPath, pool.FuseKitRuntimeDir(), pool.FuseKitPresentationRoot(),
-		plan.BuildID(), nil,
+		wantApplication.AppPath, pool.FuseKitRuntimeDir(), plan.BuildID(),
 	)
 	if runtimeSpec.Application != application || !runtimeSpec.SourceCapable ||
 		runtimeSpec.Readiness != plan.Readiness() ||
-		runtimeSpec.PresentationRoot != pool.AccountsDir() ||
+		runtimeSpec.Native != nil ||
 		runtimeSpec.BrokerPolicy.RequiredAppGroup != holderbridge.AppGroup ||
 		runtimeSpec.RuntimePolicy.RequiredAppGroup != holderbridge.AppGroup {
 		t.Fatal("signed runtime contract differs from daemon deployment identity")
@@ -234,14 +219,12 @@ func TestHolderDeploymentPlanDerivesFixedApplicationAgentAndOpaqueTrust(t *testi
 	}
 	if plan.Paths().Directory != pool.FuseKitRuntimeDir() ||
 		plan.Paths().Socket != pool.FuseKitSocketPath() ||
-		plan.Paths().PresentationRoot != pool.AccountsDir() ||
+		plan.Paths().PresentationRoot != "" ||
 		plan.Paths().ProcessStore != filepath.Join(pool.FuseKitRuntimeDir(), "processes.db") {
 		t.Fatalf("runtime paths = %#v", plan.Paths())
 	}
-	for _, id := range []int{1, 7, 20} {
-		if parent := filepath.Dir(pool.AccountPresentationDir(id)); parent != plan.Paths().PresentationRoot {
-			t.Fatalf("account %d presentation parent = %q, want %q", id, parent, plan.Paths().PresentationRoot)
-		}
+	if native, ok := plan.NativePresentation(); ok {
+		t.Fatalf("File Provider-only holder exposes native presentation %#v", native)
 	}
 }
 

@@ -78,10 +78,10 @@ targetTemplates:
           export CGO_CFLAGS="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
           export CGO_LDFLAGS="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
           GOWORK=off CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
-            go build -tags fuse -buildmode=c-archive -ldflags "$holder_ldflags" \
+            go build -buildmode=c-archive -ldflags "$holder_ldflags" \
             -o "$arm64_archive" ./cmd/cc-pool-holder-archive
           GOWORK=off CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
-            go build -tags fuse -buildmode=c-archive -ldflags "$holder_ldflags" \
+            go build -buildmode=c-archive -ldflags "$holder_ldflags" \
             -o "$x86_archive" ./cmd/cc-pool-holder-archive
           lipo -create "$arm64_archive" "$x86_archive" -output "$archive"
     dependencies:

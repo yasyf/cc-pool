@@ -8,7 +8,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-func TestFuseKitPathsArePrivateAndAccountPresentationIsDirectChild(t *testing.T) {
+func TestFuseKitPathsArePrivate(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	runtime := filepath.Join(StateDir(), "fusekit")
 	if got := FuseKitRuntimeDir(); got != runtime {
@@ -20,22 +20,12 @@ func TestFuseKitPathsArePrivateAndAccountPresentationIsDirectChild(t *testing.T)
 	if got := FuseKitProcessStorePath(); got != filepath.Join(runtime, "processes.json") {
 		t.Fatalf("FuseKitProcessStorePath() = %q", got)
 	}
-	presentation := AccountsDir()
-	if got := FuseKitPresentationRoot(); got != presentation {
-		t.Fatalf("FuseKitPresentationRoot() = %q, want %q", got, presentation)
-	}
-	if got := AccountPresentationDir(7); got != filepath.Join(presentation, "acct-07") {
-		t.Fatalf("AccountPresentationDir(7) = %q", got)
-	}
 	backing := filepath.Join(runtime, "backing")
 	if got := FuseKitBackingRoot(); got != backing {
 		t.Fatalf("FuseKitBackingRoot() = %q, want %q", got, backing)
 	}
 	if got := AccountBackingDir(7); got != filepath.Join(backing, "acct-07") {
 		t.Fatalf("AccountBackingDir(7) = %q", got)
-	}
-	if AccountPresentationDir(7) != AccountDir(7) {
-		t.Fatalf("presentation %q changed byte-identical account identity %q", AccountPresentationDir(7), AccountDir(7))
 	}
 }
 

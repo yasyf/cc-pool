@@ -15,8 +15,8 @@ widget extension reads that file via a read-only sandbox exception for
 `~/.cc-pool/`; it never touches the socket, the database, or the Keychain.
 
 The fixed signed `/Applications/CCPoolStatus.app` is also the FuseKit holder and
-File Provider broker. Its one Mach-O handles native-child mode before SwiftUI
-startup, owns the ordinary FuseKit socket below `~/.cc-pool/fusekit`, and owns
+File Provider broker. Its one Mach-O dispatches authenticated service roles before
+SwiftUI startup, owns the ordinary FuseKit socket below `~/.cc-pool/fusekit`, and owns
 the App Group socket used by `CCPoolFileProvider.appex`. The Go account daemon
 never names or traverses the Group Container.
 
@@ -47,7 +47,7 @@ To remove it: `brew uninstall --cask cc-pool-status`.
 
 ## Build from source (development)
 
-Requires full Xcode, the Go version from `go.mod`, Fuse-T, and
+Requires full Xcode, the Go version from `go.mod`, and
 [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
 
 ```sh
@@ -64,7 +64,7 @@ xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
 ```
 
 This is a compile/unit-test build only. Do not copy it over the production app
-or exercise File Provider, TCC, native mounts, or worker-kill behavior on the
+or exercise File Provider, TCC, or worker-kill behavior on the
 host; use `scripts/vm/vmctl push` and the disposable VM scenarios for every live
 signed-runtime test.
 
@@ -91,12 +91,9 @@ Release builds (CI) are **Developer ID signed, notarized, and stapled**, so the
 cask installs and launches under Gatekeeper with no quarantine workaround — see
 the widget-app step in `.github/workflows/release.yml`.
 
-After Xcode seals the product bundles, FuseKit's packager validates the reviewed
-Fuse-T source, installs and same-Team signs the nested runtime, embeds its exact
-license and manifest, re-seals the outer app without changing product
-entitlements, and verifies the complete transaction. The host never disables
-library validation. The Fuse-T cask remains required for its system support app
-and FSKit extension.
+The fixed signed host embeds the File Provider-only FuseKit runtime in its one
+Mach-O and never disables library validation. No native filesystem runtime or
+system extension is installed.
 
 Ad-hoc signing is sufficient only for pure unit tests. File Provider and TCC
 verification require the exact Developer ID application identity and App Group

@@ -208,6 +208,7 @@ func (p *fleetSourcePreparer) Prepare(
 }
 
 func (*fleetSourcePreparer) Validate(
+	context.Context,
 	tenantfs.Account,
 	catalogproto.TenantPreparationProof,
 ) error {
@@ -300,6 +301,7 @@ func (p *sourcePreparerStub) Prepare(
 }
 
 func (p *sourcePreparerStub) Validate(
+	context.Context,
 	tenantfs.Account,
 	catalogproto.TenantPreparationProof,
 ) error {
@@ -356,7 +358,7 @@ func insertCoordinatorAccounts(t *testing.T, st *store.Store, total int) {
 	for id := 1; id <= total; id++ {
 		if err := st.UpsertAccount(store.Account{
 			ID: id, InstanceID: fmt.Sprintf("%032x", id), Generation: 1,
-			ConfigDir:       pool.AccountPresentationDir(id),
+			ConfigDir:       pool.AccountDir(id),
 			KeychainService: "service", KeychainAccount: "account",
 		}); err != nil {
 			t.Fatalf("insert account %d: %v", id, err)
@@ -729,7 +731,7 @@ func TestInitializePagesOnlyInterruptedRemovalClaims(t *testing.T) {
 	const total = store.AccountRemovalPageLimit + 1
 	for id := 1; id <= total; id++ {
 		if err := st.UpsertAccount(store.Account{
-			ID: id, ConfigDir: pool.AccountPresentationDir(id),
+			ID: id, ConfigDir: pool.AccountDir(id),
 			KeychainService: "service", KeychainAccount: "account",
 		}); err != nil {
 			t.Fatal(err)
@@ -898,7 +900,7 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 	if err := st.UpsertAccount(store.Account{
-		ID: 1, ConfigDir: pool.AccountPresentationDir(1),
+		ID: 1, ConfigDir: pool.AccountDir(1),
 		KeychainService: "service", KeychainAccount: "account",
 	}); err != nil {
 		t.Fatal(err)

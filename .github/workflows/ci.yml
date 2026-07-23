@@ -38,17 +38,8 @@ jobs:
       - name: Build amd64 (cross, pure Go)
         run: CGO_ENABLED=0 GOARCH=amd64 go build -o /tmp/ccp-amd64 ./cmd/cc-pool
 
-      - name: Vet + compile fuse variant (cgo + fuse-t headers)
-        # fuse-t is not present on CI runners; install headers/lib so the cgo
-        # fuse build compiles. The live mount test is skipped (needs the
-        # interactive "Network Volumes" grant) — compilation is the gate.
-        run: |
-          brew install macos-fuse-t/cask/fuse-t
-          test -f /usr/local/lib/libfuse-t.dylib
-          CGO_ENABLED=1 go vet -tags fuse ./...
-          CGO_ENABLED=1 go build -tags fuse ./...
-          CGO_ENABLED=1 go build -tags fuse -buildmode=c-archive \
-            -o /tmp/libCCPoolFuseKit.a ./cmd/cc-pool-holder-archive
+      - name: Build signed holder archive
+        run: CGO_ENABLED=1 go build -buildmode=c-archive -o /tmp/libCCPoolFuseKit.a ./cmd/cc-pool-holder-archive
 
   widget-test:
     runs-on: macos-15
@@ -65,7 +56,6 @@ jobs:
           go-cache-dependency-path: go.sum
           brew-packages: |
             xcodegen
-            macos-fuse-t/cask/fuse-t
 
       - name: Test widget and build File Provider app
         run: |

@@ -247,7 +247,7 @@ func TestHandleCredMoveLiveSessionGate(t *testing.T) {
 	a := acct(t, s, 1)
 	fk.Put(a.KeychainService, a.KeychainAccount, credFixture())
 	s.scanSessions = func(context.Context) ([]procscan.Session, error) {
-		return []procscan.Session{{PID: 4242, ConfigDir: pool.AccountPresentationDir(a.ID)}}, nil
+		return []procscan.Session{{PID: 4242, ConfigDir: pool.AccountDir(a.ID)}}, nil
 	}
 	if delta := s.heartbeatFor().refresh(t.Context(), 0); !delta.success {
 		t.Fatal("heartbeat did not observe the live session")

@@ -63,7 +63,7 @@ func FuseKitRuntimeDir() string { return statePath("fusekit") }
 // FuseKitSocketPath is the exact persistent holder session socket.
 func FuseKitSocketPath() string { return filepath.Join(FuseKitRuntimeDir(), "fusekit.sock") }
 
-// FuseKitProcessStorePath is the signed holder's durable native-child and worker identity store.
+// FuseKitProcessStorePath is the signed holder's durable child and worker identity store.
 func FuseKitProcessStorePath() string { return filepath.Join(FuseKitRuntimeDir(), "processes.json") }
 
 // FuseKitServiceStatePath is the holder LaunchAgent controller's durable desired state.
@@ -88,14 +88,6 @@ func HostSyncWorkerStorePath() string { return statePath("hostsync-workers-v1.js
 
 // FuseKitBackingRoot is the private source root behind every account presentation.
 func FuseKitBackingRoot() string { return filepath.Join(FuseKitRuntimeDir(), "backing") }
-
-// FuseKitPresentationRoot is the stable native mount root for every account tenant.
-func FuseKitPresentationRoot() string { return AccountsDir() }
-
-// AccountPresentationDir is one account's direct child in the native root.
-func AccountPresentationDir(id int) string {
-	return filepath.Join(FuseKitPresentationRoot(), AccountDirName(id))
-}
 
 // AccountBackingDir is one account's private FuseKit source directory.
 func AccountBackingDir(id int) string {

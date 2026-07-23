@@ -106,7 +106,7 @@ func validateHolderRuntimeHealth(health mountproto.RuntimeHealthResponse) error 
 	if health.ActivationGeneration == "" {
 		return errors.New("holder runtime activation generation is empty")
 	}
-	if health.State != mountproto.RuntimeStateHealthy || health.Draining || health.Busy {
+	if health.State != mountproto.RuntimeStateHealthy || health.Draining || health.Busy || !health.Ready {
 		return fmt.Errorf(
 			"holder runtime lifecycle is not ready: state=%q draining=%t busy=%t",
 			health.State, health.Draining, health.Busy,
@@ -119,24 +119,10 @@ func validateHolderRuntimeHealth(health mountproto.RuntimeHealthResponse) error 
 			health.ReadinessPhase, health.ReadinessStep,
 		)
 	}
-	if health.NativePhase != mountproto.NativePhaseLive || health.NativeMount == nil {
+	if health.NativePhase != mountproto.NativePhaseDisabled || health.NativeMount != nil {
 		return fmt.Errorf(
-			"holder native presentation is not ready: phase=%q proof=%t",
+			"holder native presentation is not disabled: phase=%q proof=%t",
 			health.NativePhase, health.NativeMount != nil,
-		)
-	}
-	proof := health.NativeMount
-	expectedSource, err := mountproto.NativeMountSource(pool.FuseKitPresentationRoot())
-	if err != nil {
-		return fmt.Errorf("derive holder native mount source: %w", err)
-	}
-	if proof.PresentationRoot != pool.FuseKitPresentationRoot() ||
-		proof.Filesystem != mountproto.NativeMountFilesystem ||
-		proof.Source != expectedSource ||
-		proof.RootReadEpoch == 0 {
-		return fmt.Errorf(
-			"holder native mount proof is not exact: root=%q filesystem=%q source=%q root_read_epoch=%d",
-			proof.PresentationRoot, proof.Filesystem, proof.Source, proof.RootReadEpoch,
 		)
 	}
 	if health.BrokerPhase != mountproto.BrokerPhaseLive {
@@ -174,7 +160,6 @@ func HolderDeploymentPlan() (holder.DeploymentPlan, error) {
 	return holder.NewDeploymentPlan(holder.DeploymentPlanSpec{
 		Application:         holderApplication(),
 		RuntimeDirectory:    pool.FuseKitRuntimeDir(),
-		PresentationRoot:    pool.FuseKitPresentationRoot(),
 		BuildID:             version.String(),
 		Readiness:           holderbridge.ReadinessContract(),
 		SourceCapable:       true,

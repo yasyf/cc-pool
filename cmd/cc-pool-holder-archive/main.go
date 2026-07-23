@@ -1,4 +1,4 @@
-//go:build darwin && cgo && fuse
+//go:build darwin && cgo
 
 // Package main exports the signed holder runtime archive entry points.
 package main
@@ -117,15 +117,9 @@ func CCPoolFuseKitStop() C.int32_t {
 }
 
 func newHolderRuntime(ctx context.Context) (daemon.EmbeddedRuntime, error) {
-	toolRunner, err := holderbridge.NewToolRunner(ctx)
-	if err != nil {
-		return nil, err
-	}
-	plan, planErr := holderbridge.NewRuntimePlan(
-		toolRunner, pool.WidgetAppPath(), pool.FuseKitRuntimeDir(),
-		pool.FuseKitPresentationRoot(), version.String(),
+	plan, err := holderbridge.NewRuntimePlan(
+		pool.WidgetAppPath(), pool.FuseKitRuntimeDir(), version.String(),
 	)
-	err = errors.Join(planErr, toolRunner.Close(ctx))
 	if err != nil {
 		return nil, err
 	}

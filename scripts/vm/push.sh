@@ -93,14 +93,6 @@ main() {
   local app="$dd/Build/Products/Release/CCPoolStatus.app"
   [[ -d "$app" ]] || die "status app build did not produce $app"
 
-  # Use the same FuseKit-owned reviewed source/sign/license transaction as the
-  # release assertion before the bundle leaves the host.
-  (
-    cd "$REPO_ROOT"
-    GOFLAGS=-mod=readonly go run ./cmd/cc-pool-fuse-package \
-      -app "$app" -signing-identity "$sign_id"
-  ) || die "FuseKit FUSE-T packaging failed for $app"
-
   # Assert the FP appex is present, validly signed, and App-Group-bound — the
   # same drift checks release.yml runs, so a broken build fails here not in-guest.
   local fp_appex="$app/Contents/PlugIns/CCPoolFileProvider.appex"

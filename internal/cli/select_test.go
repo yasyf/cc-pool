@@ -244,7 +244,7 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 		resp := daemon.Response{OK: true, Version: version.String()}
 		if op == daemon.OpSelect {
 			resp.SelectedID = &id
-			resp.Dir = pool.AccountPresentationDir(id)
+			resp.Dir = pool.AccountDir(id)
 			resp.AccountInstanceID = account.InstanceID
 			resp.AccountGeneration = account.Generation
 		}
@@ -258,7 +258,7 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	cmd.SetContext(context.Background())
 
 	_, gotDir, _, err := resolveSelection(cmd, m, selectReq{cwd: "/proj"})
-	if err != nil || gotDir != pool.AccountPresentationDir(id) {
+	if err != nil || gotDir != pool.AccountDir(id) {
 		t.Fatalf("daemon pick must succeed: dir=%q err=%v (stderr=%q)", gotDir, err, stripANSI(stderr.String()))
 	}
 	got, err := os.ReadFile(privatePath) //nolint:gosec // G304: test-owned path under t.TempDir.
@@ -316,8 +316,8 @@ func TestValidateDaemonSelection(t *testing.T) {
 	}
 	a, _ = st.GetAccount(a.ID)
 	b, _ = st.GetAccount(b.ID)
-	presentationA := pool.AccountPresentationDir(a.ID)
-	presentationB := pool.AccountPresentationDir(b.ID)
+	presentationA := pool.AccountDir(a.ID)
+	presentationB := pool.AccountDir(b.ID)
 	m := &pool.Manager{Store: st}
 	zero, unknown := 0, 999
 	cases := []struct {
@@ -330,43 +330,43 @@ func TestValidateDaemonSelection(t *testing.T) {
 		{
 			name:      "nil selected id",
 			resp:      daemon.Response{Dir: "/returned/nil"},
-			wantError: []string{"id <nil>", "expected dir \"<unknown>\"", "returned dir \"/returned/nil\""},
+			wantError: []string{"id <nil>", "returned dir \"/returned/nil\""},
 		},
 		{
 			name:      "empty selected id",
 			resp:      daemon.Response{SelectedID: &zero, Dir: "/returned/empty"},
-			wantError: []string{"id 0", "expected dir \"<unknown>\"", "returned dir \"/returned/empty\""},
+			wantError: []string{"id 0", "returned dir \"/returned/empty\""},
 		},
 		{
 			name:      "unknown selected id",
 			resp:      daemon.Response{SelectedID: &unknown, Dir: "/returned/unknown"},
-			wantError: []string{"id 999", "expected dir \"<unknown>\"", "returned dir \"/returned/unknown\""},
+			wantError: []string{"id 999", "returned dir \"/returned/unknown\""},
 		},
 		{
-			name:      "wrong dir",
-			resp:      daemon.Response{SelectedID: &a.ID, Dir: "/wrong/dir"},
-			wantError: []string{"id 5", "expected dir \"" + presentationA + "\"", "returned dir \"/wrong/dir\""},
+			name:      "relative public path fails",
+			resp:      daemon.Response{SelectedID: &a.ID, Dir: "relative/path"},
+			wantError: []string{"id 5", "invalid File Provider path", "relative/path"},
 		},
 		{
 			name:      "trailing slash alias fails",
 			resp:      daemon.Response{SelectedID: &a.ID, Dir: presentationA + "/"},
-			wantError: []string{"id 5", "expected dir \"" + presentationA + "\"", "returned dir \"" + presentationA + "/\""},
+			wantError: []string{"id 5", "invalid File Provider path", presentationA + "/"},
 		},
 		{
 			name:      "dot segment alias fails",
 			resp:      daemon.Response{SelectedID: &a.ID, Dir: presentationA + "/./"},
-			wantError: []string{"id 5", "expected dir \"" + presentationA + "\"", "returned dir \"" + presentationA + "/./\""},
+			wantError: []string{"id 5", "invalid File Provider path", presentationA + "/./"},
 		},
 		{
 			name:      "forced account mismatch",
 			resp:      daemon.Response{SelectedID: &b.ID, Dir: presentationB},
 			forced:    &a,
-			wantError: []string{"id 6", "forced account 5", "expected dir \"" + presentationA + "\"", "returned dir \"" + presentationB + "\""},
+			wantError: []string{"id 6", "forced account 5", "returned dir \"" + presentationB + "\""},
 		},
 		{
-			name: "exact automatic match succeeds",
+			name: "OS public path succeeds without static-path equality",
 			resp: daemon.Response{
-				SelectedID: &a.ID, Dir: presentationA, AccountInstanceID: a.InstanceID,
+				SelectedID: &a.ID, Dir: "/Users/test/Library/CloudStorage/account-5", AccountInstanceID: a.InstanceID,
 				AccountGeneration: a.Generation,
 			},
 			wantID: a.ID,

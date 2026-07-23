@@ -2,11 +2,8 @@
 package holderbridge
 
 import (
-	"context"
 	"fmt"
 
-	"github.com/yasyf/daemonkit/supervise"
-	"github.com/yasyf/fusekit/fuset"
 	"github.com/yasyf/fusekit/holder"
 )
 
@@ -40,49 +37,21 @@ func ReadinessContract() holder.ReadinessContract { return holder.StandardReadin
 
 // RuntimePlanSpec returns the concrete signed-side cc-pool holder contract.
 func RuntimePlanSpec(
-	appPath, runtimeDirectory, presentationRoot, buildID string,
-	verifier *holder.FUSEVerifier,
+	appPath, runtimeDirectory, buildID string,
 ) holder.RuntimePlanSpec {
 	policy := holder.EntitlementPolicy{RequiredAppGroup: AppGroup}
 	return holder.RuntimePlanSpec{
 		Application: Application(appPath), RuntimeDirectory: runtimeDirectory,
-		PresentationRoot: presentationRoot,
-		BuildID:          buildID, Readiness: ReadinessContract(), SourceCapable: true,
-		BrokerPolicy: policy, RuntimePolicy: policy, FUSEVerifier: verifier,
+		BuildID: buildID, Readiness: ReadinessContract(), SourceCapable: true,
+		BrokerPolicy: policy, RuntimePolicy: policy,
 	}
 }
 
-// PackageFUSE delegates the reviewed FUSE-T bundle transaction to FuseKit.
-func PackageFUSE(
-	ctx context.Context,
-	runner supervise.TaskRunner,
-	signingIdentity, appPath string,
-) error {
-	packager, err := holder.NewFUSEPackager(runner, signingIdentity)
+// NewRuntimePlan derives the File Provider-only signed holder plan.
+func NewRuntimePlan(appPath, runtimeDirectory, buildID string) (holder.RuntimePlan, error) {
+	plan, err := holder.NewRuntimePlan(RuntimePlanSpec(appPath, runtimeDirectory, buildID))
 	if err != nil {
-		return fmt.Errorf("holderbridge: create FUSE packager: %w", err)
-	}
-	_, err = packager.Package(ctx, Application(appPath), fuset.CaskDylib)
-	if err != nil {
-		return fmt.Errorf("holderbridge: package FUSE bundle: %w", err)
-	}
-	return nil
-}
-
-// NewRuntimePlan verifies FuseKit's installed bundle before deriving the holder plan.
-func NewRuntimePlan(
-	runner supervise.TaskRunner,
-	appPath, runtimeDirectory, presentationRoot, buildID string,
-) (holder.RuntimePlan, error) {
-	verifier, err := holder.NewFUSEVerifier(runner)
-	if err != nil {
-		return holder.RuntimePlan{}, fmt.Errorf("holderbridge: create FUSE verifier: %w", err)
-	}
-	plan, err := holder.NewRuntimePlan(RuntimePlanSpec(
-		appPath, runtimeDirectory, presentationRoot, buildID, verifier,
-	))
-	if err != nil {
-		return holder.RuntimePlan{}, fmt.Errorf("holderbridge: verify FUSE runtime plan: %w", err)
+		return holder.RuntimePlan{}, fmt.Errorf("holderbridge: create runtime plan: %w", err)
 	}
 	return plan, nil
 }

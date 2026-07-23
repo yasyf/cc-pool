@@ -7,14 +7,8 @@ set -euo pipefail
 # TEAM_ID the signing Team ID exported by import-developer-id.
 : "${APP_PATH:?APP_PATH (the built .app) must be set}"
 : "${TEAM_ID:?TEAM_ID must be exported by import-developer-id}"
-: "${MACOS_SIGN_IDENTITY:?MACOS_SIGN_IDENTITY must be exported by import-developer-id}"
 APP="$APP_PATH"
 test -d "$APP" || { echo "::error::APP_PATH '$APP' is not a bundle"; exit 1; }
-
-# FuseKit alone owns the reviewed source, install, signature, license, manifest,
-# and post-sign verification transaction.
-GOWORK=off GOFLAGS=-mod=readonly go run ./cmd/cc-pool-fuse-package \
-  -app "$APP" -signing-identity "$MACOS_SIGN_IDENTITY"
 
 # The fixed signed host and its extension own the App Group boundary. The Go
 # account daemon must never resolve or traverse it.
@@ -27,8 +21,8 @@ WIDGET_APPEX="$APP/Contents/PlugIns/CCPoolStatusWidget.appex"
 test -d "$FP_APPEX"
 test -d "$WIDGET_APPEX"
 
-# Product identity, exact App Group, hardened runtime, single Mach-O, and native
-# child dispatch share one gate with the VM scenario.
+# Product identity, exact App Group, hardened runtime, and single Mach-O share
+# one gate with the VM scenario.
 APP_PATH="$APP" TEAM_ID="$TEAM_ID" APP_GROUP="$APP_GROUP" \
   bash scripts/assert-signed-topology.sh
 

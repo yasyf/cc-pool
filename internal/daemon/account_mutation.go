@@ -720,6 +720,12 @@ func (s *Server) startOrAttachAccountMutation(
 		if err := s.requireCurrentAccountMutationOwner(active); err != nil {
 			return store.AccountMutation{}, nil, err
 		}
+		if active.State == store.AccountMutationAwaitingPresentation {
+			active, err = s.bindAccountMutationPresentation(ctx, active)
+			if err != nil {
+				return store.AccountMutation{}, nil, err
+			}
+		}
 		return active, nil, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -736,22 +742,30 @@ func (s *Server) startOrAttachAccountMutation(
 			_ = release()
 		}
 	}()
-	expectedState, err := s.m.CredentialExternalState(ctx, account)
-	if err != nil {
-		return store.AccountMutation{}, nil, err
-	}
-	expected, err := expectedState.Digest()
-	if err != nil {
-		return store.AccountMutation{}, nil, err
-	}
-	locator := store.CredentialLocatorDigest(
-		account.KeychainService, account.KeychainAccount,
-		creds.FileCredentialPath(account.ConfigDir),
-	)
 	intent := accountMutationIntentDigest(kind, account.ID, request.Label)
-	operationID, err := store.NewAccountMutationID(
-		account.ID, account.InstanceID, account.Generation, kind, locator, expected, intent,
-	)
+	var operationID store.AccountMutationID
+	var locator, expected store.CredentialDigest
+	if kind == store.AccountMutationAdd {
+		operationID, err = store.NewPendingAddMutationID(
+			account.ID, account.InstanceID, account.Generation, intent,
+		)
+	} else {
+		expectedState, stateErr := s.m.CredentialExternalState(ctx, account)
+		if stateErr != nil {
+			return store.AccountMutation{}, nil, stateErr
+		}
+		expected, err = expectedState.Digest()
+		if err != nil {
+			return store.AccountMutation{}, nil, err
+		}
+		locator = store.CredentialLocatorDigest(
+			account.KeychainService, account.KeychainAccount,
+			creds.FileCredentialPath(account.ConfigDir),
+		)
+		operationID, err = store.NewAccountMutationID(
+			account.ID, account.InstanceID, account.Generation, kind, locator, expected, intent,
+		)
+	}
 	if err != nil {
 		return store.AccountMutation{}, nil, err
 	}
@@ -777,7 +791,57 @@ func (s *Server) startOrAttachAccountMutation(
 	if begin.Active == nil {
 		return store.AccountMutation{}, nil, errors.New("store returned no account mutation")
 	}
-	return *begin.Active, nil, nil
+	active = *begin.Active
+	if active.State == store.AccountMutationAwaitingPresentation {
+		active, err = s.bindAccountMutationPresentation(ctx, active)
+		if err != nil {
+			return store.AccountMutation{}, nil, err
+		}
+	}
+	return active, nil, nil
+}
+
+func (s *Server) bindAccountMutationPresentation(
+	ctx context.Context,
+	mutation store.AccountMutation,
+) (store.AccountMutation, error) {
+	publicPath, err := s.prepareReservedAccountPath(ctx, accountMutationReservation(mutation))
+	if err != nil {
+		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
+	}
+	account := store.Account{
+		ID: mutation.AccountID, InstanceID: mutation.AccountInstanceID,
+		Generation: mutation.AccountGeneration, ConfigDir: publicPath,
+		KeychainService: creds.ServiceName(publicPath), KeychainAccount: creds.AccountLabel(),
+		Label: mutation.Label,
+	}
+	expectedState, err := s.m.CredentialExternalState(ctx, account)
+	if err != nil {
+		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
+	}
+	expected, err := expectedState.Digest()
+	if err != nil {
+		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
+	}
+	locator := store.CredentialLocatorDigest(
+		account.KeychainService, account.KeychainAccount,
+		creds.FileCredentialPath(publicPath),
+	)
+	fence, err := s.m.Store.BindAccountMutationPresentation(
+		mutation.Fence(), publicPath, account.KeychainService, account.KeychainAccount,
+		locator, expected,
+	)
+	if err != nil {
+		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
+	}
+	return s.m.Store.AccountMutation(fence.OperationID)
+}
+
+func (s *Server) cancelUnboundAccountMutation(
+	mutation store.AccountMutation,
+	cause error,
+) error {
+	return errors.Join(cause, s.m.Store.CancelUnboundAccountMutation(mutation.Fence()))
 }
 
 func (s *Server) currentAccountMutationOwner() (proc.Record, error) {
@@ -863,9 +927,7 @@ func (s *Server) accountMutationSubject(
 	}
 	account := store.Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
-		ConfigDir:       pool.AccountDir(reservation.ID),
-		KeychainService: creds.ServiceName(pool.AccountDir(reservation.ID)),
-		KeychainAccount: creds.AccountLabel(), Label: request.Label,
+		Label: request.Label,
 	}
 	return account, func() error { return s.m.Store.ReleaseAccountIndex(reservation) }, nil
 }

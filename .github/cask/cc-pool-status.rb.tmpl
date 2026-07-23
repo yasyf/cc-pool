@@ -14,7 +14,6 @@ cask "__CASK_TOKEN__" do
   homepage "https://github.com/__REPO__"
 
   depends_on macos: :sequoia # deployment target is macOS 15
-  depends_on cask: "macos-fuse-t/homebrew-cask/fuse-t"
   depends_on formula: "cc-pool"
 
   app "__APP_NAME__.app", target: "/Applications/__APP_NAME__.app"

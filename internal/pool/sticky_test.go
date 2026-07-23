@@ -62,7 +62,7 @@ func activatePoolTestSession(t *testing.T, m *Manager, accountID, pid int, cwd s
 		Token:     nextPoolTestToken(),
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   store.ProcessIdentity{PID: pid, StartedAt: started},
-		ConfigDir: AccountPresentationDir(accountID),
+		ConfigDir: AccountDir(accountID),
 		Cwd:       cwd, At: started,
 	}); err != nil {
 		t.Fatal(err)

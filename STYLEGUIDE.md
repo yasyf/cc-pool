@@ -60,5 +60,5 @@ Tests exist to catch bugs, not to satisfy coverage. Before writing one, answer: 
 ## Tooling
 
 - `gofmt` and `go vet` are assumed clean — never hand-flag mechanical issues (formatting, import order) in review; tooling owns them.
-- Default build is pure Go (`CGO_ENABLED=0`); only `-tags fuse` needs cgo + fuse-t. Code shared by both variants must compile under both — keep build-tag surface minimal (`fuse.go` / `fuse_stub.go` pattern).
+- The account daemon is pure Go (`CGO_ENABLED=0`); only the signed macOS holder archive needs cgo, and it has no native filesystem dependency.
 - `go test ./...` must pass with no network, no Keychain access, and no daemon running.

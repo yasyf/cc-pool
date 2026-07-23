@@ -13,12 +13,8 @@ func TestAccountDefinitionUsesImmutablePathFreeIdentity(t *testing.T) {
 	root := t.TempDir()
 	account := Account{
 		InstanceID: testInstanceID, Generation: 7,
-		PresentationRoot:        filepath.Join(root, "mount", "account"),
 		BackingRoot:             filepath.Join(root, "backing", "account"),
 		FileProviderDisplayName: "acct-18",
-		Presentations: []mountproto.Presentation{
-			mountproto.PresentationFileProvider, mountproto.PresentationMount,
-		},
 	}
 	tenant, err := account.TenantID()
 	if err != nil || tenant != "account-"+testInstanceID {
@@ -30,11 +26,10 @@ func TestAccountDefinitionUsesImmutablePathFreeIdentity(t *testing.T) {
 	}
 	if definition.ContentSourceID != string(ClaudeAuthorityID) || definition.Generation != 7 ||
 		definition.AccessMode != mountproto.AccessModeReadWrite || definition.CasePolicy != mountproto.CasePolicyInsensitive ||
-		definition.FileProviderAccountID != testInstanceID || definition.FileProviderDisplayName != "acct-18" {
+		definition.FileProviderPresentationInstanceID != testInstanceID || definition.FileProviderDisplayName != "acct-18" {
 		t.Fatalf("Definition = %+v", definition)
 	}
-	if len(definition.Presentations) != 2 || definition.Presentations[0] != mountproto.PresentationMount ||
-		definition.Presentations[1] != mountproto.PresentationFileProvider {
+	if len(definition.Presentations) != 1 || definition.Presentations[0] != mountproto.PresentationFileProvider {
 		t.Fatalf("sorted presentations = %v", definition.Presentations)
 	}
 	if err := mountproto.Validate(definition); err != nil {
@@ -47,7 +42,7 @@ func TestAccountDefinitionUsesImmutablePathFreeIdentity(t *testing.T) {
 		t.Fatalf("replacement Definition: %v", err)
 	}
 	if replacementDefinition.Generation != 8 ||
-		replacementDefinition.FileProviderAccountID != definition.FileProviderAccountID ||
+		replacementDefinition.FileProviderPresentationInstanceID != definition.FileProviderPresentationInstanceID ||
 		replacementDefinition.FileProviderDisplayName != definition.FileProviderDisplayName {
 		t.Fatalf("replacement definition changed File Provider identity: %+v", replacementDefinition)
 	}
@@ -59,19 +54,17 @@ func TestAccountDefinitionUsesImmutablePathFreeIdentity(t *testing.T) {
 	}
 }
 
-func TestAccountDefinitionRequiresExactFileProviderMetadataParity(t *testing.T) {
+func TestAccountDefinitionRequiresExactFileProviderMetadata(t *testing.T) {
 	root := t.TempDir()
 	account := Account{
 		InstanceID: testInstanceID, Generation: 1,
-		PresentationRoot: filepath.Join(root, "mount"), BackingRoot: filepath.Join(root, "backing"),
-		Presentations: []mountproto.Presentation{mountproto.PresentationFileProvider},
+		BackingRoot: filepath.Join(root, "backing"),
 	}
 	if _, err := account.Definition(); err == nil {
-		t.Fatal("Definition accepted File Provider presentation without display metadata")
+		t.Fatal("Definition accepted an empty File Provider display name")
 	}
-	account.Presentations = []mountproto.Presentation{mountproto.PresentationMount}
-	account.FileProviderDisplayName = "acct-18"
+	account.FileProviderDisplayName = "acct-18\x00suffix"
 	if _, err := account.Definition(); err == nil {
-		t.Fatal("Definition accepted File Provider metadata without presentation")
+		t.Fatal("Definition accepted a File Provider display name containing NUL")
 	}
 }

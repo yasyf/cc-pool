@@ -51,7 +51,7 @@ func newAccountRemovalTestServer(
 		t.Fatal(err)
 	}
 	if err := st.UpsertAccount(store.Account{
-		ID: 1, ConfigDir: pool.AccountPresentationDir(1),
+		ID: 1, ConfigDir: pool.AccountDir(1),
 		KeychainService: "service", KeychainAccount: "account",
 	}); err != nil {
 		_ = st.Close()

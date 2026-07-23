@@ -97,7 +97,7 @@ Use ` + "`ccp run`" + ` to launch. env does not create a session.`,
 					return err
 				}
 				out := cmd.OutOrStdout()
-				_, _ = fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(pool.AccountPresentationDir(a.ID)))
+				_, _ = fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(a.ConfigDir))
 				_, _ = fmt.Fprintf(out, "export CLAUDE_CODE_PLUGIN_CACHE_DIR=%s\n", shellQuote(filepath.Join(pool.ClaudeDir(), "plugins")))
 				return nil
 			})

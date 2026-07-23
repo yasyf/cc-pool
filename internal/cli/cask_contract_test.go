@@ -40,10 +40,9 @@ func TestStatusCaskRequiresExactHolderStopAndRejectsNameBasedKills(t *testing.T)
 	}
 }
 
-func TestStatusCaskPinsFixedAppAndFuseTRuntime(t *testing.T) {
+func TestStatusCaskPinsFixedFileProviderApp(t *testing.T) {
 	cask := readReleaseContract(t, ".github", "cask", "cc-pool-status.rb.tmpl")
 	for _, required := range []string{
-		"depends_on cask: \"macos-fuse-t/homebrew-cask/fuse-t\"",
 		"app \"__APP_NAME__.app\", target: \"/Applications/__APP_NAME__.app\"",
 		"\"/Applications/__APP_NAME__.app\"",
 	} {
@@ -53,6 +52,9 @@ func TestStatusCaskPinsFixedAppAndFuseTRuntime(t *testing.T) {
 	}
 	if strings.Contains(cask, "appdir") {
 		t.Fatal("status cask permits a configurable application path")
+	}
+	if strings.Contains(strings.ToLower(cask), "fuse-t") {
+		t.Fatal("status cask retains a native FUSE dependency")
 	}
 	if got := strings.Count(cask, "/Applications/__APP_NAME__.app"); got != 4 {
 		t.Fatalf("fixed application path occurrences = %d, want 4", got)
@@ -85,10 +87,10 @@ func TestReleasePublishesFormulaAndCaskOnlyAfterVerifiedApplication(t *testing.T
 	}
 }
 
-func TestWidgetBundlesReviewedSameTeamFuseTRuntime(t *testing.T) {
+func TestWidgetBuildsFileProviderOnlyHolderWithoutNativeRuntime(t *testing.T) {
 	project := readReleaseContract(t, "widget", "project.yml")
 	for _, required := range []string{
-		"go build -tags fuse -buildmode=c-archive",
+		"go build -buildmode=c-archive",
 		"./cmd/cc-pool-holder-archive",
 	} {
 		if !strings.Contains(project, required) {
@@ -100,6 +102,7 @@ func TestWidgetBundlesReviewedSameTeamFuseTRuntime(t *testing.T) {
 		t.Fatal("fixed app does not exit after exact holder terminal settlement")
 	}
 	for _, forbidden := range []string{
+		"-tags fuse", "cc-pool-fuse-package",
 		"fuset_source=", "fuset_target=", "license_source=", "license_target=",
 		"lipo \"$fuset_source\"", "codesign --force --sign", "ThirdPartyLicenses/FUSE-T.txt",
 	} {
@@ -109,22 +112,15 @@ func TestWidgetBundlesReviewedSameTeamFuseTRuntime(t *testing.T) {
 	}
 
 	assertions := readReleaseContract(t, ".github", "scripts", "assert-widget-app.sh")
-	for _, required := range []string{
-		"go run ./cmd/cc-pool-fuse-package",
-		"-app \"$APP\" -signing-identity \"$MACOS_SIGN_IDENTITY\"",
-	} {
-		if !strings.Contains(assertions, required) {
-			t.Fatalf("widget assertion is missing FuseKit packager invocation %q", required)
-		}
+	if strings.Contains(assertions, "cc-pool-fuse-package") || strings.Contains(assertions, "MACOS_SIGN_IDENTITY") {
+		t.Fatal("widget assertion retains native FUSE packaging")
 	}
 	release := readReleaseContract(t, ".github", "workflows", "release.yml")
-	for _, required := range []string{
-		"go_version: 1.26.5",
-		"prebuild_brew_packages: macos-fuse-t/cask/fuse-t",
-	} {
-		if !strings.Contains(release, required) {
-			t.Fatalf("release workflow is missing packager prerequisite %q", required)
-		}
+	if !strings.Contains(release, "go_version: 1.26.5") {
+		t.Fatal("release workflow is missing the pinned Go version")
+	}
+	if strings.Contains(release, "fuse-t") || strings.Contains(release, "prebuild_brew_packages") {
+		t.Fatal("release workflow retains a native FUSE dependency")
 	}
 
 	topology := readReleaseContract(t, "scripts", "assert-signed-topology.sh")
@@ -142,16 +138,12 @@ func TestWidgetBundlesReviewedSameTeamFuseTRuntime(t *testing.T) {
 	}
 
 	push := readReleaseContract(t, "scripts", "vm", "push.sh")
-	packageAt := strings.Index(push, "GOFLAGS=-mod=readonly go run ./cmd/cc-pool-fuse-package")
 	installAt := strings.Index(push, `log "installing $VMCTL_GUEST_APP"`)
-	if packageAt < 0 {
-		t.Fatal("VM push does not invoke the reviewed FuseKit FUSE-T packager")
+	if strings.Contains(push, "cc-pool-fuse-package") || strings.Contains(push, "FUSE-T") {
+		t.Fatal("VM push retains native FUSE packaging")
 	}
-	if !strings.Contains(push[packageAt:], `-app "$app" -signing-identity "$sign_id"`) {
-		t.Fatal("VM push does not package the exact app with the selected Developer ID")
-	}
-	if installAt < 0 || packageAt >= installAt {
-		t.Fatal("VM push does not package and re-sign FUSE-T before installing the app")
+	if installAt < 0 {
+		t.Fatal("VM push no longer installs the signed app")
 	}
 }
 
@@ -186,8 +178,8 @@ func TestTCCSnapshotCoversProtectedSurfacesAndRejectsDaemonRows(t *testing.T) {
 		if !strings.Contains(script, "grep -Fq '|daemon|'") {
 			t.Fatalf("%s does not reject unsigned-daemon TCC rows", scenario)
 		}
-		if got := strings.Count(script, "fusekit-native-v1"); got != 2 {
-			t.Fatalf("%s does not enforce the hard-cut native-child protocol", scenario)
+		if got := strings.Count(script, "[f]usekit-native-v1"); got != 1 {
+			t.Fatalf("%s does not reject the removed native filesystem child", scenario)
 		}
 	}
 }

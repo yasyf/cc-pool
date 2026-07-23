@@ -117,20 +117,22 @@ type Server struct {
 	// select may not have exec'd its claude yet.
 	startedAt time.Time
 
-	tenantClient        *tenantfs.Client
-	tenantCoordinator   *tenantCoordinator
-	holderSessionDone   <-chan struct{}
-	holderMonitorMu     sync.Mutex
-	holderMonitorCancel context.CancelFunc
-	holderActive        atomic.Bool
-	holderLost          atomic.Bool
-	runtimePublished    atomic.Bool
-	runtimeShutdown     func(context.Context) error
-	runtimeHealth       func(context.Context) (dkdaemon.Health, error)
-	prepareAccount      func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error)
-	activatePrepared    func(context.Context, store.Account, catalogproto.TenantPreparationProof, func() error) error
-	preflightCredential func(context.Context, store.Account) error
-	disposableWorkers   *supervise.Pool
+	tenantClient               *tenantfs.Client
+	tenantCoordinator          *tenantCoordinator
+	holderSessionDone          <-chan struct{}
+	holderMonitorMu            sync.Mutex
+	holderMonitorCancel        context.CancelFunc
+	holderActive               atomic.Bool
+	holderLost                 atomic.Bool
+	runtimePublished           atomic.Bool
+	runtimeShutdown            func(context.Context) error
+	runtimeHealth              func(context.Context) (dkdaemon.Health, error)
+	prepareAccount             func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error)
+	prepareReservedAccount     func(context.Context, store.PendingAccountReservation) (string, error)
+	observePresentationBinding func(context.Context, store.Account, store.PresentationEvidence) error
+	activatePrepared           func(context.Context, store.Account, catalogproto.TenantPreparationProof, func() error) error
+	preflightCredential        func(context.Context, store.Account) error
+	disposableWorkers          *supervise.Pool
 
 	// led is the product self-heal ledger for auth.streak and the
 	// ratelimit.acct / ratelimit.pool streaks. ledMu is its
@@ -482,6 +484,11 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 					s.cl.abortReservation(token)
 					return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
 				}
+				publicPath, err := s.selectionPublicPath(ctx, sn.Account, proof)
+				if err != nil {
+					s.cl.abortReservation(token)
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
+				}
 				if token != "" && !s.cl.bindPreparation(token, proof) {
 					return Response{OK: false, Error: fmt.Sprintf("acct-%02d reservation expired during PrepareTenant", sn.Account.ID)}
 				}
@@ -491,7 +498,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 				}
 				id := sn.Account.ID
 				return Response{
-					OK: true, Dir: pool.AccountPresentationDir(sn.Account.ID), SelectedID: &id,
+					OK: true, Dir: publicPath, SelectedID: &id,
 					ReservationToken:  token,
 					AccountInstanceID: sn.Account.InstanceID, AccountGeneration: sn.Account.Generation,
 					Remaining5h: sn.Remaining5h, Remaining7d: sn.Remaining7d, HasUsage: sn.HasUsage,
@@ -570,6 +577,11 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		s.cl.abortReservation(token)
 		return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
 	}
+	publicPath, err := s.selectionPublicPath(ctx, best.Account, proof)
+	if err != nil {
+		s.cl.abortReservation(token)
+		return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
+	}
 	if token != "" && !s.cl.bindPreparation(token, proof) {
 		return Response{OK: false, Error: fmt.Sprintf("acct-%02d reservation expired during PrepareTenant", best.Account.ID)}
 	}
@@ -586,7 +598,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		selectKind(outcome, fallback), req.Cwd, best.Account.ID,
 		r.Score, best.Util5h, best.Util7d, runnerUp(ranked, r.AccountID, fallback))
 	resp := Response{
-		OK: true, Dir: pool.AccountPresentationDir(best.Account.ID), SelectedID: &id,
+		OK: true, Dir: publicPath, SelectedID: &id,
 		ReservationToken:  token,
 		AccountInstanceID: best.Account.InstanceID, AccountGeneration: best.Account.Generation,
 		Sticky:      outcome == pool.StickyBind,
@@ -604,6 +616,35 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		resp.SoonestReset = &r.ExhaustedUntil
 	}
 	return resp
+}
+
+func (s *Server) selectionPublicPath(
+	ctx context.Context,
+	account store.Account,
+	proof catalogproto.TenantPreparationProof,
+) (string, error) {
+	publicPath, err := tenantfs.FileProviderPublicPath(proof)
+	if err != nil {
+		return "", err
+	}
+	fileProvider := proof.Presentation.FileProvider
+	evidence := store.PresentationEvidence{
+		TenantID:             string(fileProvider.TenantID),
+		DomainID:             string(fileProvider.DomainID),
+		Generation:           fileProvider.Generation,
+		ActivationGeneration: fileProvider.ActivationGeneration,
+		PublicPath:           publicPath,
+	}
+	observe := s.observePresentationBinding
+	if observe == nil {
+		observe = func(_ context.Context, account store.Account, evidence store.PresentationEvidence) error {
+			return s.m.Store.ObserveAccountPresentation(account, evidence)
+		}
+	}
+	if err := observe(ctx, account, evidence); err != nil {
+		return "", fmt.Errorf("observe account presentation: %w", err)
+	}
+	return publicPath, nil
 }
 
 func (s *Server) preflightSelectionCredential(
@@ -649,6 +690,10 @@ func (s *Server) activateSelection(ctx context.Context, token string, reserved r
 	if reserved.preparation == nil {
 		return Response{OK: false, Error: "selection reservation has no preparation proof"}
 	}
+	publicPath, err := tenantfs.FileProviderPublicPath(*reserved.preparation)
+	if err != nil {
+		return Response{OK: false, Error: fmt.Sprintf("selection reservation has invalid preparation proof: %v", err)}
+	}
 	account := store.Account{
 		ID: reserved.accountID, InstanceID: reserved.accountInstanceID, Generation: reserved.accountGeneration,
 	}
@@ -658,11 +703,11 @@ func (s *Server) activateSelection(ctx context.Context, token string, reserved r
 			AccountID: reserved.accountID, ExpectedInstanceID: reserved.accountInstanceID,
 			ExpectedGeneration: reserved.accountGeneration,
 			Process:            store.ProcessIdentity{PID: launch.pid, StartedAt: launch.processStartedAt},
-			ConfigDir:          pool.AccountPresentationDir(reserved.accountID),
+			ConfigDir:          publicPath,
 			Cwd:                launch.cwd, RecordSticky: launch.recordSticky, At: time.Now(),
 		})
 	}
-	var err error
+	err = nil
 	if s.activatePrepared != nil {
 		err = s.activatePrepared(ctx, account, *reserved.preparation, activate)
 	} else if s.tenantCoordinator != nil {
@@ -776,7 +821,7 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 	for _, sn := range snaps {
 		out = append(out, AccountStatus{
 			ID:                    sn.Account.ID,
-			ConfigDir:             pool.AccountPresentationDir(sn.Account.ID),
+			ConfigDir:             sn.Account.ConfigDir,
 			Label:                 sn.Account.Label,
 			Score:                 sn.Score,
 			Remaining5h:           sn.Remaining5h,

@@ -29,7 +29,7 @@ func TestScoreInputCountsOnlyPresentationIdentity(t *testing.T) {
 	m := &Manager{Store: st}
 	account := store.Account{ID: 7, ConfigDir: "/File Provider/CCPool/acct-07"}
 	sessions := []procscan.Session{
-		{PID: 1, ConfigDir: AccountPresentationDir(7)},
+		{PID: 1, ConfigDir: AccountDir(7)},
 		{PID: 2, ConfigDir: account.ConfigDir},
 	}
 	input, _, _, _, err := m.scoreInput(t.Context(), account, sessions, time.Now())

@@ -157,11 +157,7 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 		callsMu.Lock()
 		calls[account.ID]++
 		callsMu.Unlock()
-		proof := catalogproto.TenantPreparationProof{
-			Catalog: catalogproto.CatalogLaneProof{
-				Tenant: "test", Generation: account.Generation,
-			},
-		}
+		proof := daemonTestPreparationProof(account, pool.AccountDir(account.ID))
 		if account.ID != 1 {
 			return proof, nil
 		}
@@ -326,11 +322,11 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 	fakeCreds := credstest.NewFake()
 	now := time.Now()
 	for id, util := range map[int]float64{1: 10, 2: 50} {
-		dir := pool.AccountPresentationDir(id)
-		dirs[id] = dir
-		service := creds.ServiceName(dir)
+		configDir := pool.AccountDir(id)
+		dirs[id] = configDir
+		service := creds.ServiceName(configDir)
 		if err := st.UpsertAccount(store.Account{
-			ID: id, ConfigDir: dir, InstanceID: fmt.Sprintf("instance-%d", id), Generation: 1,
+			ID: id, ConfigDir: configDir, InstanceID: fmt.Sprintf("instance-%d", id), Generation: 1,
 			KeychainService: service, KeychainAccount: "ccp-test",
 		}); err != nil {
 			t.Fatal(err)
@@ -352,15 +348,127 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		cl:           newClaims(),
 		led:          newLedgers(),
 		prepareAccount: func(ctx context.Context, account store.Account) (catalogproto.TenantPreparationProof, error) {
-			return catalogproto.TenantPreparationProof{
-				Catalog: catalogproto.CatalogLaneProof{Tenant: catalogproto.TenantID("test"), Generation: account.Generation},
-			}, ctx.Err()
+			return daemonTestPreparationProof(account, dirs[account.ID]), ctx.Err()
 		},
 		activatePrepared: func(_ context.Context, _ store.Account, _ catalogproto.TenantPreparationProof, activate func() error) error {
 			return activate()
 		},
 	}
 	return s, dirs
+}
+
+func daemonTestPreparationProof(account store.Account, publicPath string) catalogproto.TenantPreparationProof {
+	return catalogproto.TenantPreparationProof{
+		Catalog: catalogproto.CatalogLaneProof{Tenant: catalogproto.TenantID("test"), Generation: account.Generation},
+		Presentation: catalogproto.PresentationProof{
+			Kind: catalogproto.PresentationKindFileProvider,
+			FileProvider: &catalogproto.FileProviderPresentationProof{
+				TenantID: catalogproto.TenantID("test"), DomainID: catalogproto.DomainID(fmt.Sprintf("domain-%d", account.ID)),
+				Generation: account.Generation, PublicPath: publicPath, ActivationGeneration: "activation-test",
+			},
+		},
+	}
+}
+
+func TestPrepareReservedAccountPathReturnsOnlyValidatedFusePublicPath(t *testing.T) {
+	s, dirs := newTestServer(t)
+	account, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation := store.PendingAccountReservation{
+		ID: account.ID, InstanceID: account.InstanceID, Generation: account.Generation,
+	}
+	publicPath, err := s.prepareReservedAccountPath(t.Context(), reservation)
+	if err != nil || publicPath != dirs[1] {
+		t.Fatalf("prepare reserved account path = %q, %v; want %q", publicPath, err, dirs[1])
+	}
+	s.prepareReservedAccount = func(_ context.Context, got store.PendingAccountReservation) (string, error) {
+		if got.ID != reservation.ID || got.InstanceID != reservation.InstanceID || got.Generation != reservation.Generation {
+			t.Fatalf("reservation = %+v, want %+v", got, reservation)
+		}
+		return "relative/path", nil
+	}
+	if _, err := s.prepareReservedAccountPath(t.Context(), reservation); !errors.Is(err, tenantfs.ErrPreparationConflict) {
+		t.Fatalf("invalid injected public path error = %v, want ErrPreparationConflict", err)
+	}
+}
+
+func TestSelectionUsesPersistedFusePublicPathWithoutSynthesizing(t *testing.T) {
+	s, _ := newTestServer(t)
+	account, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicPath := "/Users/test/Library/CloudStorage/cc-pool-account-1"
+	account.ConfigDir = publicPath
+	if err := s.m.Store.UpsertAccount(account); err != nil {
+		t.Fatal(err)
+	}
+	account, err = s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.prepareAccount = func(ctx context.Context, got store.Account) (catalogproto.TenantPreparationProof, error) {
+		return daemonTestPreparationProof(got, publicPath), ctx.Err()
+	}
+	forced := account.ID
+	response := s.handleSelect(t.Context(), Request{
+		Op: OpSelect, Account: &forced, PID: 4242,
+		ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proof-path",
+	})
+	if !response.OK || response.Dir != publicPath {
+		t.Fatalf("selection = %+v, want proof path %q", response, publicPath)
+	}
+	commitSelectResponse(t, s, response)
+	sessions, err := s.m.Store.ListActiveSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].ConfigDir != publicPath {
+		t.Fatalf("committed sessions = %+v, want proof path %q", sessions, publicPath)
+	}
+}
+
+func TestSelectionQuarantinesPresentationBindingDrift(t *testing.T) {
+	s, _ := newTestServer(t)
+	account, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenPath := "/Users/test/Library/CloudStorage/cc-pool-account-1"
+	s.prepareAccount = func(ctx context.Context, got store.Account) (catalogproto.TenantPreparationProof, error) {
+		return daemonTestPreparationProof(got, provenPath), ctx.Err()
+	}
+	forced := account.ID
+	response := s.handleSelect(t.Context(), Request{
+		Op: OpSelect, Account: &forced, PID: 4242,
+		ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proof-drift",
+	})
+	if response.OK || !strings.Contains(response.Error, store.ErrAccountPresentationQuarantined.Error()) {
+		t.Fatalf("selection = %+v, want quarantined drift", response)
+	}
+	quarantine, err := s.m.Store.AccountPresentationQuarantine(account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileProvider := daemonTestPreparationProof(account, provenPath).Presentation.FileProvider
+	if quarantine.AccountID != account.ID || quarantine.AccountInstanceID != account.InstanceID ||
+		quarantine.AccountGeneration != account.Generation || quarantine.ExpectedConfigDir != account.ConfigDir ||
+		quarantine.Observed.TenantID != string(fileProvider.TenantID) ||
+		quarantine.Observed.DomainID != string(fileProvider.DomainID) ||
+		quarantine.Observed.Generation != fileProvider.Generation ||
+		quarantine.Observed.ActivationGeneration != fileProvider.ActivationGeneration ||
+		quarantine.Observed.PublicPath != provenPath ||
+		quarantine.Reason != store.AccountPresentationPublicPathDrift {
+		t.Fatalf("presentation quarantine = %+v", quarantine)
+	}
+	if got := s.cl.reservedCount(account.ID); got != 0 {
+		t.Fatalf("drifted selection retained %d reservations", got)
+	}
+	if sessions, err := s.m.Store.ListActiveSessions(); err != nil || len(sessions) != 0 {
+		t.Fatalf("drifted selection sessions = %+v, %v", sessions, err)
+	}
 }
 
 func activateDaemonTestSession(t *testing.T, s *Server, accountID, pid int, cwd string, started time.Time) int64 {
@@ -374,7 +482,7 @@ func activateDaemonTestSession(t *testing.T, s *Server, accountID, pid int, cwd 
 		Token:     nextDaemonTestToken(),
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   store.ProcessIdentity{PID: pid, StartedAt: started},
-		ConfigDir: pool.AccountPresentationDir(accountID),
+		ConfigDir: pool.AccountDir(accountID),
 		Cwd:       cwd, At: started,
 	}); err != nil {
 		t.Fatal(err)
@@ -440,6 +548,12 @@ func TestSelectionActivationRejectsStalePreparationProof(t *testing.T) {
 	proof := catalogproto.TenantPreparationProof{
 		Catalog:        catalogproto.CatalogLaneProof{Tenant: "test", Generation: account.Generation, Requested: 1},
 		SourceRevision: 1,
+		Presentation: catalogproto.PresentationProof{
+			Kind: catalogproto.PresentationKindFileProvider,
+			FileProvider: &catalogproto.FileProviderPresentationProof{
+				PublicPath: "/Users/test/Library/CloudStorage/account-1",
+			},
+		},
 	}
 	if !s.cl.bindPreparation(token, proof) {
 		t.Fatal("bind preparation failed")
@@ -516,7 +630,7 @@ func TestHandleSelectTransactionAbortAndExclude(t *testing.T) {
 		t.Fatalf("excluded retry = %+v, want acct-2", second)
 	}
 	commitSelectResponse(t, s, second)
-	if live, _ := s.m.Store.ListActiveSessions(); len(live) != 1 || live[0].AccountID != 2 {
+	if live, _ := s.m.Store.ListActiveSessions(); len(live) != 1 || live[0].AccountID != 2 || live[0].ConfigDir != dirs[2] {
 		t.Fatalf("committed sessions = %+v, want only acct-2", live)
 	}
 	if sticky, ok, _ := s.m.Store.GetSticky("/proj"); !ok || sticky.AccountID != 2 {

@@ -851,6 +851,9 @@ func newAccountMutationTestServer(
 	s := &Server{
 		m: m, log: log.New(io.Discard, "", 0), accountMutationLifetime: t.Context(),
 		accountMutationOwner: func() (proc.Record, error) { return owner, nil },
+		prepareReservedAccount: func(_ context.Context, reservation store.PendingAccountReservation) (string, error) {
+			return pool.AccountDir(reservation.ID), nil
+		},
 		prepareAccount: func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error) {
 			return catalogproto.TenantPreparationProof{}, nil
 		},

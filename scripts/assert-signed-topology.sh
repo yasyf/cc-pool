@@ -131,16 +131,6 @@ for symbol in \
     || fail "$HOST does not embed $symbol"
 done
 
-# A malformed recognized child contract must exit through Go before SwiftUI.
-set +e
-child_output="$("$HOST" fusekit-native-v1 2>&1)"
-child_rc=$?
-set -e
-[[ "$child_rc" == 1 ]] \
-  || fail "malformed native-child invocation exited $child_rc, expected 1"
-grep -Fqx 'CCPoolStatus: FuseKit child failed: mountmux: native child arguments are invalid' <<<"$child_output" \
-  || fail "malformed native-child invocation did not reach the embedded Go dispatcher"
-
 set +e
 child_output="$("$HOST" --fusekit-source-task-child 2>&1)"
 child_rc=$?
