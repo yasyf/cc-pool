@@ -67,8 +67,8 @@ CREATE TABLE account_registry_sequences (
 CREATE TABLE account_mutations (
   operation_id               BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
   account_id                 INTEGER NOT NULL UNIQUE CHECK(account_id > 0),
-  kind                       TEXT NOT NULL CHECK(kind IN ('add','relogin','sync-install')),
-  state                      TEXT NOT NULL CHECK(state IN ('awaiting-presentation','awaiting-input','reserved','applying','applied','publishing','compensating')),
+  kind                       TEXT NOT NULL CHECK(kind IN ('add','relogin','sync-install','presentation-rebind')),
+  state                      TEXT NOT NULL CHECK(state IN ('awaiting-presentation','awaiting-input','reserved','applying','applied','publishing','compensating','rebind-published')),
   registry_sequence          INTEGER NOT NULL CHECK(registry_sequence > 0),
   account_instance_id        TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation         INTEGER NOT NULL CHECK(account_generation > 0),
@@ -101,11 +101,16 @@ CREATE TABLE account_mutations (
 	proof_presentation_generation INTEGER NOT NULL CHECK(proof_presentation_generation >= 0),
 	proof_activation_generation TEXT NOT NULL,
 	proof_public_path          TEXT NOT NULL,
+	previous_config_dir       TEXT NOT NULL,
+	previous_keychain_service TEXT NOT NULL,
+	previous_keychain_account TEXT NOT NULL,
+	previous_locator_digest   BLOB NOT NULL CHECK(length(previous_locator_digest)=32),
+	previous_credential_digest BLOB NOT NULL CHECK(length(previous_credential_digest)=32),
   owner_record               BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch                INTEGER NOT NULL CHECK(owner_epoch > 0),
   created_at                 INTEGER NOT NULL CHECK(created_at > 0),
   updated_at                 INTEGER NOT NULL CHECK(updated_at >= created_at),
-  CHECK((kind='add' AND state='awaiting-presentation' AND
+  CHECK((kind IN ('add','presentation-rebind') AND state='awaiting-presentation' AND
          locator_digest=zeroblob(32) AND expected_credential_digest=zeroblob(32) AND
          config_dir='' AND keychain_service='' AND keychain_account='' AND
 		 proof_catalog_tenant_id='' AND proof_catalog_generation=0 AND proof_requested=0 AND
@@ -115,7 +120,7 @@ CREATE TABLE account_mutations (
 		 proof_tenant_id='' AND proof_domain_id='' AND
 		 proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path='') OR
         (state<>'awaiting-presentation' AND config_dir<>'' AND keychain_service<>'' AND keychain_account<>'' AND
-		 ((kind='add' AND proof_presentation_kind='file_provider' AND
+		 ((kind IN ('add','presentation-rebind') AND proof_presentation_kind='file_provider' AND
 		   account_generation=proof_presentation_generation AND
 		   config_dir=proof_public_path AND proof_catalog_tenant_id=proof_tenant_id AND
 		   proof_catalog_generation=proof_presentation_generation AND proof_requested>0 AND
@@ -124,17 +129,24 @@ CREATE TABLE account_mutations (
 		   proof_source_authority<>'' AND proof_source_revision>0 AND proof_catalog_revision=proof_requested AND
 		   proof_change_id<>'' AND proof_operation_id<>'' AND proof_tenant_id<>'' AND proof_domain_id<>'' AND
 		   proof_activation_generation<>'') OR
-		  (kind<>'add' AND proof_catalog_tenant_id='' AND proof_catalog_generation=0 AND proof_requested=0 AND
+		  (kind NOT IN ('add','presentation-rebind') AND proof_catalog_tenant_id='' AND proof_catalog_generation=0 AND proof_requested=0 AND
 		   proof_desired=0 AND proof_observed=0 AND proof_verified=0 AND proof_applied=0 AND
 		   proof_source_authority='' AND proof_source_revision=0 AND proof_catalog_revision=0 AND
 		   proof_change_id='' AND proof_operation_id='' AND proof_presentation_kind='' AND
 		   proof_tenant_id='' AND proof_domain_id='' AND
-		   proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path=''))))
+		   proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path='')))),
+	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
+	       previous_keychain_account<>'' AND previous_locator_digest<>zeroblob(32) AND
+	       previous_credential_digest<>zeroblob(32)) OR
+	      (kind<>'presentation-rebind' AND previous_config_dir='' AND previous_keychain_service='' AND
+	       previous_keychain_account='' AND previous_locator_digest=zeroblob(32) AND
+	       previous_credential_digest=zeroblob(32))),
+	CHECK(state<>'rebind-published' OR kind='presentation-rebind')
 );
 CREATE TABLE account_mutation_receipts (
   operation_id      BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
   account_id        INTEGER NOT NULL CHECK(account_id > 0),
-  kind              TEXT NOT NULL CHECK(kind IN ('add','relogin','sync-install')),
+  kind              TEXT NOT NULL CHECK(kind IN ('add','relogin','sync-install','presentation-rebind')),
   registry_sequence INTEGER NOT NULL CHECK(registry_sequence > 0),
   account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation INTEGER NOT NULL CHECK(account_generation > 0),
@@ -174,13 +186,18 @@ CREATE TABLE account_mutation_receipts (
 	proof_presentation_generation INTEGER NOT NULL CHECK(proof_presentation_generation >= 0),
 	proof_activation_generation TEXT NOT NULL,
 	proof_public_path TEXT NOT NULL,
+	previous_config_dir TEXT NOT NULL,
+	previous_keychain_service TEXT NOT NULL,
+	previous_keychain_account TEXT NOT NULL,
+	previous_locator_digest BLOB NOT NULL CHECK(length(previous_locator_digest)=32),
+	previous_credential_digest BLOB NOT NULL CHECK(length(previous_credential_digest)=32),
   owner_record      BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch       INTEGER NOT NULL CHECK(owner_epoch > 0),
   committed_at      INTEGER NOT NULL CHECK(committed_at > 0),
   acknowledged_at   INTEGER CHECK(acknowledged_at IS NULL OR acknowledged_at >= committed_at),
   expires_at        INTEGER NOT NULL CHECK(expires_at > committed_at),
 	CHECK((credential_written=1) = (written_credential_digest IS NOT NULL)),
-	CHECK((kind='add' AND proof_presentation_kind='file_provider' AND
+	CHECK((kind IN ('add','presentation-rebind') AND proof_presentation_kind='file_provider' AND
 	       account_generation=proof_presentation_generation AND
 	       config_dir=proof_public_path AND proof_catalog_tenant_id=proof_tenant_id AND
 	       proof_catalog_generation=proof_presentation_generation AND proof_requested>0 AND
@@ -189,12 +206,18 @@ CREATE TABLE account_mutation_receipts (
 	       proof_source_authority<>'' AND proof_source_revision>0 AND proof_catalog_revision=proof_requested AND
 	       proof_change_id<>'' AND proof_operation_id<>'' AND proof_tenant_id<>'' AND proof_domain_id<>'' AND
 	       proof_activation_generation<>'') OR
-	      (kind<>'add' AND proof_catalog_tenant_id='' AND proof_catalog_generation=0 AND proof_requested=0 AND
+	      (kind NOT IN ('add','presentation-rebind') AND proof_catalog_tenant_id='' AND proof_catalog_generation=0 AND proof_requested=0 AND
 	       proof_desired=0 AND proof_observed=0 AND proof_verified=0 AND proof_applied=0 AND
 	       proof_source_authority='' AND proof_source_revision=0 AND proof_catalog_revision=0 AND
 	       proof_change_id='' AND proof_operation_id='' AND proof_presentation_kind='' AND
 	       proof_tenant_id='' AND proof_domain_id='' AND
 	       proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path='')),
+	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
+	       previous_keychain_account<>'' AND previous_locator_digest<>zeroblob(32) AND
+	       previous_credential_digest<>zeroblob(32)) OR
+	      (kind<>'presentation-rebind' AND previous_config_dir='' AND previous_keychain_service='' AND
+	       previous_keychain_account='' AND previous_locator_digest=zeroblob(32) AND
+	       previous_credential_digest=zeroblob(32))),
 	CHECK((terminal='quarantined') = (quarantine_file_locator_digest IS NOT NULL AND quarantine_reason IS NOT NULL)),
 	CHECK((resolution IS NULL AND resolution_observed_digest IS NULL AND resolved_at IS NULL)
 	   OR (resolution IS NOT NULL AND resolution_observed_digest IS NOT NULL AND resolved_at IS NOT NULL AND resolved_at>=committed_at))

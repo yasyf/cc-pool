@@ -157,6 +157,18 @@ type CredentialDigest [32]byte
 // CredentialOperationID is the stable semantic identity of one exact request.
 type CredentialOperationID [32]byte
 
+// CredentialKeychainLocatorDigest binds one exact Keychain owner without
+// credential bytes.
+func CredentialKeychainLocatorDigest(service, account string) CredentialDigest {
+	hash := sha256.New()
+	writeCredentialHashField(hash, []byte("cc-pool:keychain-credential-locator:v1"))
+	writeCredentialHashField(hash, []byte(service))
+	writeCredentialHashField(hash, []byte(account))
+	var digest CredentialDigest
+	copy(digest[:], hash.Sum(nil))
+	return digest
+}
+
 // CredentialSlotObservation records one slot without storing credential bytes.
 type CredentialSlotObservation struct {
 	State  CredentialSlotState

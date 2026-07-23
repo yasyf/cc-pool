@@ -26,6 +26,8 @@ const (
 	AccountMutationRelogin AccountMutationKind = "relogin"
 	// AccountMutationSyncInstall installs one synchronized account.
 	AccountMutationSyncInstall AccountMutationKind = "sync-install"
+	// AccountMutationPresentationRebind repairs one quarantined presentation generation.
+	AccountMutationPresentationRebind AccountMutationKind = "presentation-rebind"
 )
 
 // AccountMutationState is one daemon-owned durable mutation phase.
@@ -46,6 +48,8 @@ const (
 	AccountMutationPublishing AccountMutationState = "publishing"
 	// AccountMutationCompensating is undoing an unpublished external write.
 	AccountMutationCompensating AccountMutationState = "compensating"
+	// AccountMutationRebindPublished holds a new binding quarantined until old owners are retired.
+	AccountMutationRebindPublished AccountMutationState = "rebind-published"
 )
 
 // AccountMutationTerminal is one immutable registry mutation result.
@@ -107,6 +111,11 @@ type AccountMutation struct {
 	AccountUUID              string
 	PresentationProof        PresentationPreparationProof
 	HasPresentationProof     bool
+	PreviousConfigDir        string
+	PreviousKeychainService  string
+	PreviousKeychainAccount  string
+	PreviousLocatorDigest    CredentialDigest
+	PreviousCredentialDigest CredentialDigest
 	Owner                    proc.Record
 	OwnerEpoch               uint64
 	CreatedAt                time.Time
@@ -146,6 +155,11 @@ type AccountMutationReceipt struct {
 	AccountUUID              string
 	PresentationProof        PresentationPreparationProof
 	HasPresentationProof     bool
+	PreviousConfigDir        string
+	PreviousKeychainService  string
+	PreviousKeychainAccount  string
+	PreviousLocatorDigest    CredentialDigest
+	PreviousCredentialDigest CredentialDigest
 	Owner                    proc.Record
 	OwnerEpoch               uint64
 	CommittedAt              time.Time
@@ -196,6 +210,11 @@ type BeginAccountMutationRequest struct {
 	KeychainAccount          string
 	Label                    string
 	AccountUUID              string
+	PreviousConfigDir        string
+	PreviousKeychainService  string
+	PreviousKeychainAccount  string
+	PreviousLocatorDigest    CredentialDigest
+	PreviousCredentialDigest CredentialDigest
 	Owner                    proc.Record
 }
 
@@ -207,8 +226,9 @@ type BeginAccountMutationResult struct {
 }
 
 const (
-	accountMutationIDDomain    = "cc-pool:account-mutation:v1"
-	pendingAddMutationIDDomain = "cc-pool:pending-add-mutation:v1"
+	accountMutationIDDomain            = "cc-pool:account-mutation:v1"
+	pendingAddMutationIDDomain         = "cc-pool:pending-add-mutation:v1"
+	presentationRebindMutationIDDomain = "cc-pool:presentation-rebind-mutation:v1"
 )
 
 // NewPendingAddMutationID derives an add operation from its reservation and intent.
@@ -231,6 +251,36 @@ func NewPendingAddMutationID(
 	var generation [8]byte
 	binary.BigEndian.PutUint64(generation[:], accountGeneration)
 	writeCredentialHashField(hash, generation[:])
+	writeCredentialHashField(hash, intent[:])
+	var operationID AccountMutationID
+	copy(operationID[:], hash.Sum(nil))
+	return operationID, nil
+}
+
+// NewPresentationRebindMutationID derives one quarantined presentation repair.
+func NewPresentationRebindMutationID(
+	accountID int,
+	accountInstanceID string,
+	accountGeneration uint64,
+	previousLocator CredentialDigest,
+	previousCredential CredentialDigest,
+	intent CredentialDigest,
+) (AccountMutationID, error) {
+	if accountID <= 0 || validateAccountInstanceID(accountInstanceID) != nil ||
+		accountGeneration < 2 || previousLocator.zero() || previousCredential.zero() || intent.zero() {
+		return AccountMutationID{}, ErrAccountMutationState
+	}
+	hash := sha256.New()
+	writeCredentialHashField(hash, []byte(presentationRebindMutationIDDomain))
+	var account [8]byte
+	binary.BigEndian.PutUint64(account[:], uint64(accountID))
+	writeCredentialHashField(hash, account[:])
+	writeCredentialHashField(hash, []byte(accountInstanceID))
+	var generation [8]byte
+	binary.BigEndian.PutUint64(generation[:], accountGeneration)
+	writeCredentialHashField(hash, generation[:])
+	writeCredentialHashField(hash, previousLocator[:])
+	writeCredentialHashField(hash, previousCredential[:])
 	writeCredentialHashField(hash, intent[:])
 	var operationID AccountMutationID
 	copy(operationID[:], hash.Sum(nil))
@@ -310,7 +360,9 @@ func (s *Store) BeginAccountMutation(
 		return BeginAccountMutationResult{}, err
 	}
 	if _, err := accountPresentationQuarantine(tx, request.AccountID); err == nil {
-		return BeginAccountMutationResult{}, ErrAccountPresentationQuarantined
+		if request.Kind != AccountMutationPresentationRebind {
+			return BeginAccountMutationResult{}, ErrAccountPresentationQuarantined
+		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return BeginAccountMutationResult{}, err
 	}
@@ -341,7 +393,7 @@ func (s *Store) BeginAccountMutation(
 		return BeginAccountMutationResult{}, err
 	}
 	state := AccountMutationReserved
-	if request.Kind == AccountMutationAdd {
+	if request.Kind == AccountMutationAdd || request.Kind == AccountMutationPresentationRebind {
 		state = AccountMutationAwaitingPresentation
 	} else if request.Kind == AccountMutationRelogin {
 		state = AccountMutationAwaitingInput
@@ -355,12 +407,16 @@ func (s *Store) BeginAccountMutation(
 		 proof_verified,proof_applied,proof_source_authority,proof_source_revision,proof_catalog_revision,
 		 proof_change_id,proof_operation_id,proof_presentation_kind,proof_tenant_id,proof_domain_id,
 		 proof_presentation_generation,proof_activation_generation,proof_public_path,
+		 previous_config_dir,previous_keychain_service,previous_keychain_account,
+		 previous_locator_digest,previous_credential_digest,
 		 owner_record,owner_epoch,created_at,updated_at
-		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'',0,0,0,0,0,0,'',0,0,'','','','','',0,'','',?,1,?,?)`,
+		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'',0,0,0,0,0,0,'',0,0,'','','','','',0,'','',?,?,?,?,?,?,1,?,?)`,
 		request.OperationID[:], request.AccountID, request.Kind, state, sequence,
 		request.AccountInstanceID, request.AccountGeneration, request.LocatorDigest[:],
 		request.ExpectedCredentialDigest[:], request.IntentDigest[:], request.ConfigDir,
 		request.KeychainService, request.KeychainAccount, request.Label, request.AccountUUID,
+		request.PreviousConfigDir, request.PreviousKeychainService, request.PreviousKeychainAccount,
+		request.PreviousLocatorDigest[:], request.PreviousCredentialDigest[:],
 		owner, now.UnixNano(), now.UnixNano(),
 	); err != nil {
 		if request.Kind == AccountMutationAdd {
@@ -391,7 +447,7 @@ func (s *Store) BeginAccountMutation(
 }
 
 // BindAccountMutationPresentation records proven public credential coordinates
-// before an add may accept interactive input.
+// before an add or presentation rebind may accept interactive input.
 func (s *Store) BindAccountMutationPresentation(
 	fence AccountMutationFence,
 	proof PresentationPreparationProof,
@@ -419,13 +475,29 @@ func (s *Store) BindAccountMutationPresentation(
 		return AccountMutationFence{}, err
 	}
 	if !sameAccountMutationFence(mutation, fence) || mutation.State != AccountMutationAwaitingPresentation ||
-		mutation.Kind != AccountMutationAdd {
+		(mutation.Kind != AccountMutationAdd && mutation.Kind != AccountMutationPresentationRebind) {
 		return AccountMutationFence{}, ErrAccountMutationFence
 	}
 	if err := validatePresentationPreparationProofForAccount(
 		proof, mutation.AccountInstanceID, mutation.AccountGeneration, configDir,
 	); err != nil {
 		return AccountMutationFence{}, err
+	}
+	if mutation.Kind == AccountMutationPresentationRebind {
+		if configDir == mutation.PreviousConfigDir ||
+			(keychainService == mutation.PreviousKeychainService &&
+				keychainAccount == mutation.PreviousKeychainAccount) ||
+			locator == mutation.PreviousLocatorDigest ||
+			locator != CredentialKeychainLocatorDigest(keychainService, keychainAccount) {
+			return AccountMutationFence{}, ErrAccountPresentationEvidence
+		}
+		quarantine, err := s.AccountPresentationQuarantine(mutation.AccountID)
+		if err != nil {
+			return AccountMutationFence{}, err
+		}
+		if !quarantineAllowsPresentationRebind(quarantine, proof) {
+			return AccountMutationFence{}, ErrAccountPresentationEvidence
+		}
 	}
 	owner, err := json.Marshal(fence.Owner)
 	if err != nil {
@@ -442,7 +514,7 @@ func (s *Store) BindAccountMutationPresentation(
 		 proof_presentation_generation=?,proof_activation_generation=?,proof_public_path=?,
 		 owner_epoch=owner_epoch+1,updated_at=?
 		 WHERE operation_id=? AND owner_record=? AND owner_epoch=?
-		 AND kind='add' AND state='awaiting-presentation'`,
+		 AND kind IN ('add','presentation-rebind') AND state='awaiting-presentation'`,
 		configDir, keychainService, keychainAccount, locator[:], expected[:],
 		proof.CatalogTenantID, proof.CatalogGeneration, proof.Requested, proof.Desired,
 		proof.Observed, proof.Verified, proof.Applied, proof.SourceAuthority,
@@ -462,7 +534,129 @@ func (s *Store) BindAccountMutationPresentation(
 	return fence, nil
 }
 
-// CancelUnboundAccountMutation releases an add that never acquired a public presentation.
+// RefreshAccountMutationPresentation atomically replaces advancing preparation
+// provenance without permitting presentation identity drift.
+func (s *Store) RefreshAccountMutationPresentation(
+	fence AccountMutationFence,
+	proof PresentationPreparationProof,
+) (AccountMutationFence, error) {
+	if fence.OperationID == (AccountMutationID{}) || fence.OwnerEpoch == 0 {
+		return AccountMutationFence{}, ErrAccountMutationFence
+	}
+	if err := fence.Owner.Validate(); err != nil {
+		return AccountMutationFence{}, err
+	}
+	if err := validatePresentationPreparationProof(proof); err != nil {
+		return AccountMutationFence{}, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AccountMutationFence{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	mutation, err := accountMutationByID(tx, fence.OperationID)
+	if err != nil {
+		return AccountMutationFence{}, err
+	}
+	if !sameAccountMutationFence(mutation, fence) ||
+		mutation.Kind != AccountMutationPresentationRebind ||
+		mutation.State == AccountMutationAwaitingPresentation ||
+		mutation.State == AccountMutationCompensating {
+		return AccountMutationFence{}, ErrAccountMutationFence
+	}
+	if err := validatePresentationPreparationProofForAccount(
+		proof, mutation.AccountInstanceID, mutation.AccountGeneration, mutation.ConfigDir,
+	); err != nil {
+		return AccountMutationFence{}, err
+	}
+	if !sameRebindPresentationIdentity(mutation.PresentationProof, proof) ||
+		proof.Requested < mutation.PresentationProof.Requested ||
+		proof.SourceRevision < mutation.PresentationProof.SourceRevision ||
+		proof.CatalogRevision < mutation.PresentationProof.CatalogRevision {
+		return AccountMutationFence{}, ErrAccountPresentationEvidence
+	}
+	revisionAdvanced := proof.Requested > mutation.PresentationProof.Requested ||
+		proof.SourceRevision > mutation.PresentationProof.SourceRevision ||
+		proof.CatalogRevision > mutation.PresentationProof.CatalogRevision
+	if !revisionAdvanced && (proof.ChangeID != mutation.PresentationProof.ChangeID ||
+		proof.OperationID != mutation.PresentationProof.OperationID) {
+		return AccountMutationFence{}, ErrAccountPresentationEvidence
+	}
+	result, err := tx.Exec(
+		`UPDATE account_mutations SET
+		 proof_catalog_tenant_id=?,proof_catalog_generation=?,proof_requested=?,proof_desired=?,
+		 proof_observed=?,proof_verified=?,proof_applied=?,proof_source_authority=?,
+		 proof_source_revision=?,proof_catalog_revision=?,proof_change_id=?,proof_operation_id=?,
+		 proof_presentation_kind=?,proof_tenant_id=?,proof_domain_id=?,
+		 proof_presentation_generation=?,proof_activation_generation=?,proof_public_path=?,
+		 owner_epoch=owner_epoch+1,updated_at=?
+		 WHERE operation_id=? AND owner_record=? AND owner_epoch=?
+		 AND kind='presentation-rebind' AND state<>'awaiting-presentation' AND state<>'compensating'`,
+		proof.CatalogTenantID, proof.CatalogGeneration, proof.Requested, proof.Desired,
+		proof.Observed, proof.Verified, proof.Applied, proof.SourceAuthority,
+		proof.SourceRevision, proof.CatalogRevision, proof.ChangeID, proof.OperationID,
+		proof.PresentationKind, proof.FileProvider.TenantID, proof.FileProvider.DomainID,
+		proof.FileProvider.Generation, proof.FileProvider.ActivationGeneration,
+		proof.FileProvider.PublicPath, s.now().UnixNano(), fence.OperationID[:],
+		mustEncodeCredentialOwner(fence.Owner), fence.OwnerEpoch,
+	)
+	if err != nil {
+		return AccountMutationFence{}, err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return AccountMutationFence{}, ErrAccountMutationFence
+	}
+	if mutation.State == AccountMutationRebindPublished {
+		account, err := presentationAccount(tx, mutation.AccountID)
+		if err != nil {
+			return AccountMutationFence{}, err
+		}
+		if account.InstanceID != mutation.AccountInstanceID ||
+			account.Generation != mutation.AccountGeneration || account.ConfigDir != mutation.ConfigDir ||
+			account.KeychainService != mutation.KeychainService ||
+			account.KeychainAccount != mutation.KeychainAccount {
+			return AccountMutationFence{}, ErrAccountGenerationChanged
+		}
+		if err := upsertAccountPresentation(tx, AccountPresentation{
+			AccountID: account.ID, AccountInstanceID: account.InstanceID,
+			AccountGeneration: account.Generation, Proof: proof, ObservedAt: s.now(),
+		}); err != nil {
+			return AccountMutationFence{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return AccountMutationFence{}, err
+	}
+	fence.OwnerEpoch++
+	return fence, nil
+}
+
+func sameRebindPresentationIdentity(current, next PresentationPreparationProof) bool {
+	return current.CatalogTenantID == next.CatalogTenantID &&
+		current.CatalogGeneration == next.CatalogGeneration &&
+		current.SourceAuthority == next.SourceAuthority &&
+		current.PresentationKind == next.PresentationKind &&
+		current.FileProvider.TenantID == next.FileProvider.TenantID &&
+		current.FileProvider.DomainID == next.FileProvider.DomainID &&
+		current.FileProvider.Generation == next.FileProvider.Generation &&
+		current.FileProvider.PublicPath == next.FileProvider.PublicPath
+}
+
+func quarantineAllowsPresentationRebind(
+	quarantine AccountPresentationQuarantine,
+	target PresentationPreparationProof,
+) bool {
+	return quarantine.Proof.CatalogTenantID == target.CatalogTenantID &&
+		quarantine.Proof.SourceAuthority == target.SourceAuthority &&
+		quarantine.Proof.PresentationKind == target.PresentationKind &&
+		quarantine.Proof.FileProvider.TenantID == target.FileProvider.TenantID &&
+		quarantine.Proof.FileProvider.DomainID == target.FileProvider.DomainID &&
+		quarantine.Proof.FileProvider.PublicPath == target.FileProvider.PublicPath &&
+		(quarantine.Proof.FileProvider.Generation == quarantine.AccountGeneration ||
+			quarantine.Proof.FileProvider.Generation == target.FileProvider.Generation)
+}
+
+// CancelUnboundAccountMutation releases an add or rebind that never acquired a public presentation.
 func (s *Store) CancelUnboundAccountMutation(fence AccountMutationFence) error {
 	if fence.OperationID == (AccountMutationID{}) || fence.OwnerEpoch == 0 {
 		return ErrAccountMutationFence
@@ -482,12 +676,13 @@ func (s *Store) CancelUnboundAccountMutation(fence AccountMutationFence) error {
 	if !sameAccountMutationFence(mutation, fence) {
 		return ErrAccountMutationFence
 	}
-	if mutation.Kind != AccountMutationAdd || mutation.State != AccountMutationAwaitingPresentation {
+	if (mutation.Kind != AccountMutationAdd && mutation.Kind != AccountMutationPresentationRebind) ||
+		mutation.State != AccountMutationAwaitingPresentation {
 		return ErrAccountMutationState
 	}
 	result, err := tx.Exec(
 		`DELETE FROM account_mutations WHERE operation_id=? AND owner_record=? AND owner_epoch=?
-		 AND kind='add' AND state='awaiting-presentation'`,
+		 AND kind IN ('add','presentation-rebind') AND state='awaiting-presentation'`,
 		fence.OperationID[:], mustEncodeCredentialOwner(fence.Owner), fence.OwnerEpoch,
 	)
 	if err != nil {
@@ -495,6 +690,9 @@ func (s *Store) CancelUnboundAccountMutation(fence AccountMutationFence) error {
 	}
 	if rows, _ := result.RowsAffected(); rows != 1 {
 		return ErrAccountMutationFence
+	}
+	if mutation.Kind == AccountMutationPresentationRebind {
+		return tx.Commit()
 	}
 	result, err = tx.Exec(
 		`DELETE FROM pending_adds WHERE id=? AND instance_id=? AND generation=? AND owner_record=?`,
@@ -709,7 +907,8 @@ func (s *Store) RearmAccountMutationInput(
 	if !sameAccountMutationFence(mutation, fence) {
 		return AccountMutationFence{}, ErrAccountMutationFence
 	}
-	if (mutation.Kind != AccountMutationAdd && mutation.Kind != AccountMutationRelogin) ||
+	if (mutation.Kind != AccountMutationAdd && mutation.Kind != AccountMutationRelogin &&
+		mutation.Kind != AccountMutationPresentationRebind) ||
 		mutation.State != AccountMutationApplying {
 		return AccountMutationFence{}, ErrAccountMutationState
 	}
@@ -766,7 +965,8 @@ func (s *Store) SetAccountMutationMetadata(
 	if !sameAccountMutationFence(mutation, fence) {
 		return AccountMutationFence{}, ErrAccountMutationFence
 	}
-	if mutation.Kind != AccountMutationAdd && mutation.Kind != AccountMutationRelogin {
+	if mutation.Kind != AccountMutationAdd && mutation.Kind != AccountMutationRelogin &&
+		mutation.Kind != AccountMutationPresentationRebind {
 		return AccountMutationFence{}, ErrAccountMutationState
 	}
 	owner, err := json.Marshal(fence.Owner)
@@ -796,6 +996,218 @@ func (s *Store) MarkAccountMutationPublishing(fence AccountMutationFence) (Accou
 		fence, AccountMutationApplied, AccountMutationPublishing,
 		CredentialDigest{}, false, CredentialDigest{}, false,
 	)
+}
+
+// PublishAccountPresentationRebind atomically installs the target registry
+// binding while retaining both the journal and presentation quarantine.
+func (s *Store) PublishAccountPresentationRebind(
+	fence AccountMutationFence,
+) (AccountMutationFence, Account, error) {
+	if fence.OperationID == (AccountMutationID{}) || fence.OwnerEpoch == 0 {
+		return AccountMutationFence{}, Account{}, ErrAccountMutationFence
+	}
+	if err := fence.Owner.Validate(); err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	mutation, err := accountMutationByID(tx, fence.OperationID)
+	if err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	if !sameAccountMutationFence(mutation, fence) ||
+		mutation.Kind != AccountMutationPresentationRebind || mutation.State != AccountMutationPublishing ||
+		!mutation.CredentialWritten || mutation.WrittenCredentialDigest.zero() {
+		return AccountMutationFence{}, Account{}, ErrAccountMutationFence
+	}
+	var sequence uint64
+	if err := tx.QueryRow(
+		`SELECT sequence FROM account_registry_sequences WHERE account_id=?`, mutation.AccountID,
+	).Scan(&sequence); err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	if sequence != mutation.RegistrySequence {
+		return AccountMutationFence{}, Account{}, ErrAccountMutationSuperseded
+	}
+	if err := accountMutationSubjectMatches(tx, mutation); err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	quarantine, err := accountPresentationQuarantine(tx, mutation.AccountID)
+	if err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	if quarantine.AccountInstanceID != mutation.AccountInstanceID ||
+		quarantine.AccountGeneration+1 != mutation.AccountGeneration ||
+		quarantine.ExpectedConfigDir != mutation.PreviousConfigDir ||
+		!quarantineAllowsPresentationRebind(quarantine, mutation.PresentationProof) {
+		return AccountMutationFence{}, Account{}, ErrAccountPresentationEvidence
+	}
+	busy, err := accountPresentationBusyExceptMutation(tx, mutation.AccountID, mutation.OperationID)
+	if err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	if busy {
+		return AccountMutationFence{}, Account{}, ErrAccountPresentationBusy
+	}
+	result, err := tx.Exec(
+		`UPDATE accounts SET generation=?,config_dir=?,keychain_service=?,keychain_account=?,label=?,account_uuid=?
+		 WHERE id=? AND instance_id=? AND generation=? AND config_dir=?
+		 AND keychain_service=? AND keychain_account=? AND deleted_at IS NULL`,
+		mutation.AccountGeneration, mutation.ConfigDir, mutation.KeychainService,
+		mutation.KeychainAccount, mutation.Label, mutation.AccountUUID,
+		mutation.AccountID, mutation.AccountInstanceID, mutation.AccountGeneration-1,
+		mutation.PreviousConfigDir, mutation.PreviousKeychainService, mutation.PreviousKeychainAccount,
+	)
+	if err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return AccountMutationFence{}, Account{}, ErrAccountGenerationChanged
+	}
+	if _, err := tx.Exec(`DELETE FROM account_presentations WHERE account_id=?`, mutation.AccountID); err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	if err := upsertAccountPresentation(tx, AccountPresentation{
+		AccountID: mutation.AccountID, AccountInstanceID: mutation.AccountInstanceID,
+		AccountGeneration: mutation.AccountGeneration, Proof: mutation.PresentationProof,
+		ObservedAt: s.now(),
+	}); err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	result, err = tx.Exec(
+		`UPDATE account_mutations SET state='rebind-published',owner_epoch=owner_epoch+1,updated_at=?
+		 WHERE operation_id=? AND owner_record=? AND owner_epoch=?
+		 AND kind='presentation-rebind' AND state='publishing'`,
+		s.now().UnixNano(), mutation.OperationID[:], mustEncodeCredentialOwner(fence.Owner), fence.OwnerEpoch,
+	)
+	if err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return AccountMutationFence{}, Account{}, ErrAccountMutationFence
+	}
+	updated, err := presentationAccount(tx, mutation.AccountID)
+	if err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AccountMutationFence{}, Account{}, err
+	}
+	fence.OwnerEpoch++
+	return fence, updated, nil
+}
+
+// CommitAccountPresentationRebind admits a published binding only after its
+// caller has verified the old owners absent and the new owner unchanged.
+func (s *Store) CommitAccountPresentationRebind(
+	fence AccountMutationFence,
+	receiptExpiresAt time.Time,
+) (AccountMutationReceipt, error) {
+	now := s.now()
+	if fence.OperationID == (AccountMutationID{}) || fence.OwnerEpoch == 0 ||
+		!receiptExpiresAt.After(now) {
+		return AccountMutationReceipt{}, ErrAccountMutationState
+	}
+	if err := fence.Owner.Validate(); err != nil {
+		return AccountMutationReceipt{}, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AccountMutationReceipt{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	mutation, err := accountMutationByID(tx, fence.OperationID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			receipt, receiptErr := accountMutationReceiptByID(tx, fence.OperationID)
+			if receiptErr != nil {
+				return AccountMutationReceipt{}, receiptErr
+			}
+			if !accountMutationReceiptFenceMatches(receipt, fence) ||
+				receipt.Kind != AccountMutationPresentationRebind ||
+				receipt.Terminal != AccountMutationCommitted {
+				return receipt, ErrAccountMutationState
+			}
+			return receipt, nil
+		}
+		return AccountMutationReceipt{}, err
+	}
+	if !sameAccountMutationFence(mutation, fence) ||
+		mutation.Kind != AccountMutationPresentationRebind ||
+		mutation.State != AccountMutationRebindPublished || !mutation.CredentialWritten {
+		return AccountMutationReceipt{}, ErrAccountMutationFence
+	}
+	account, err := presentationAccount(tx, mutation.AccountID)
+	if err != nil {
+		return AccountMutationReceipt{}, err
+	}
+	if account.InstanceID != mutation.AccountInstanceID || account.Generation != mutation.AccountGeneration ||
+		account.ConfigDir != mutation.ConfigDir || account.KeychainService != mutation.KeychainService ||
+		account.KeychainAccount != mutation.KeychainAccount {
+		return AccountMutationReceipt{}, ErrAccountGenerationChanged
+	}
+	presentation, err := accountPresentation(tx, mutation.AccountID)
+	if err != nil {
+		return AccountMutationReceipt{}, err
+	}
+	if presentation.AccountInstanceID != mutation.AccountInstanceID ||
+		presentation.AccountGeneration != mutation.AccountGeneration ||
+		presentation.Proof != mutation.PresentationProof {
+		return AccountMutationReceipt{}, ErrAccountPresentationEvidence
+	}
+	quarantine, err := accountPresentationQuarantine(tx, mutation.AccountID)
+	if err != nil {
+		return AccountMutationReceipt{}, err
+	}
+	if quarantine.AccountInstanceID != mutation.AccountInstanceID ||
+		quarantine.AccountGeneration+1 != mutation.AccountGeneration ||
+		quarantine.ExpectedConfigDir != mutation.PreviousConfigDir ||
+		!quarantineAllowsPresentationRebind(quarantine, mutation.PresentationProof) {
+		return AccountMutationReceipt{}, ErrAccountPresentationEvidence
+	}
+	var sequence uint64
+	if err := tx.QueryRow(
+		`SELECT sequence FROM account_registry_sequences WHERE account_id=?`, mutation.AccountID,
+	).Scan(&sequence); err != nil {
+		return AccountMutationReceipt{}, err
+	}
+	if sequence != mutation.RegistrySequence {
+		return AccountMutationReceipt{}, ErrAccountMutationSuperseded
+	}
+	if _, err := accountRemovalByID(tx, mutation.AccountID); err == nil {
+		return AccountMutationReceipt{}, ErrAccountRemoving
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return AccountMutationReceipt{}, err
+	}
+	result, err := tx.Exec(
+		`DELETE FROM account_presentation_quarantines
+		 WHERE account_id=? AND account_instance_id=? AND account_generation=?`,
+		mutation.AccountID, mutation.AccountInstanceID, mutation.AccountGeneration-1,
+	)
+	if err != nil {
+		return AccountMutationReceipt{}, err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return AccountMutationReceipt{}, ErrAccountPresentationEvidence
+	}
+	if err := insertAccountMutationReceipt(
+		tx, mutation, AccountMutationCommitted, mutation.WrittenCredentialDigest, nil,
+		now, receiptExpiresAt,
+	); err != nil {
+		return AccountMutationReceipt{}, err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM account_mutations WHERE operation_id=?`, mutation.OperationID[:],
+	); err != nil {
+		return AccountMutationReceipt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AccountMutationReceipt{}, err
+	}
+	return s.AccountMutationReceipt(fence.OperationID)
 }
 
 func (s *Store) advanceAccountMutation(
@@ -864,6 +1276,9 @@ func (s *Store) CommitAccountMutation(
 	}
 	if !sameAccountMutationFence(mutation, fence) || mutation.State != AccountMutationPublishing {
 		return AccountMutationReceipt{}, ErrAccountMutationFence
+	}
+	if mutation.Kind == AccountMutationPresentationRebind {
+		return AccountMutationReceipt{}, ErrAccountMutationState
 	}
 	var sequence uint64
 	if err := tx.QueryRow(
@@ -1294,6 +1709,36 @@ func validateAccountMutationSubject(tx *sql.Tx, request BeginAccountMutationRequ
 		}
 		return nil
 	}
+	if request.Kind == AccountMutationPresentationRebind {
+		var instanceID, configDir, service, account string
+		var generation uint64
+		err := tx.QueryRow(
+			`SELECT instance_id,generation,config_dir,keychain_service,keychain_account
+			 FROM accounts WHERE id=? AND deleted_at IS NULL`, request.AccountID,
+		).Scan(&instanceID, &generation, &configDir, &service, &account)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrAccountGenerationChanged
+		}
+		if err != nil {
+			return err
+		}
+		if request.AccountGeneration != generation+1 || instanceID != request.AccountInstanceID ||
+			configDir != request.PreviousConfigDir || service != request.PreviousKeychainService ||
+			account != request.PreviousKeychainAccount {
+			return ErrAccountGenerationChanged
+		}
+		quarantine, err := accountPresentationQuarantine(tx, request.AccountID)
+		if err != nil {
+			return err
+		}
+		if quarantine.AccountInstanceID != instanceID || quarantine.AccountGeneration != generation ||
+			quarantine.ExpectedConfigDir != configDir ||
+			quarantine.Proof.FileProvider.TenantID != "account-"+instanceID ||
+			quarantine.Proof.FileProvider.PublicPath == configDir {
+			return ErrAccountPresentationEvidence
+		}
+		return nil
+	}
 	var instanceID, configDir, service, account string
 	var generation uint64
 	err := tx.QueryRow(
@@ -1314,6 +1759,15 @@ func validateAccountMutationSubject(tx *sql.Tx, request BeginAccountMutationRequ
 }
 
 func accountMutationSubjectMatches(tx *sql.Tx, mutation AccountMutation) error {
+	if mutation.Kind == AccountMutationPresentationRebind {
+		return validateAccountMutationSubject(tx, BeginAccountMutationRequest{
+			AccountID: mutation.AccountID, Kind: mutation.Kind,
+			AccountInstanceID: mutation.AccountInstanceID, AccountGeneration: mutation.AccountGeneration,
+			PreviousConfigDir:       mutation.PreviousConfigDir,
+			PreviousKeychainService: mutation.PreviousKeychainService,
+			PreviousKeychainAccount: mutation.PreviousKeychainAccount,
+		})
+	}
 	return validateAccountMutationSubject(tx, BeginAccountMutationRequest{
 		AccountID: mutation.AccountID, Kind: mutation.Kind,
 		AccountInstanceID: mutation.AccountInstanceID, AccountGeneration: mutation.AccountGeneration,
@@ -1356,6 +1810,8 @@ const accountMutationColumns = `operation_id,account_id,kind,state,registry_sequ
  proof_verified,proof_applied,proof_source_authority,proof_source_revision,proof_catalog_revision,
  proof_change_id,proof_operation_id,proof_presentation_kind,
  proof_tenant_id,proof_domain_id,proof_presentation_generation,proof_activation_generation,proof_public_path,
+ previous_config_dir,previous_keychain_service,previous_keychain_account,
+ previous_locator_digest,previous_credential_digest,
  owner_record,owner_epoch,created_at,updated_at`
 
 func accountMutationByID(queryer accountMutationQueryer, operationID AccountMutationID) (AccountMutation, error) {
@@ -1381,7 +1837,7 @@ func accountMutationByKind(
 
 func scanAccountMutation(row interface{ Scan(...any) error }) (AccountMutation, error) {
 	var mutation AccountMutation
-	var operationID, locator, expected, intent, input, written, owner []byte
+	var operationID, locator, expected, intent, input, written, previousLocator, previousCredential, owner []byte
 	var credentialWritten int
 	var createdAt, updatedAt int64
 	if err := row.Scan(
@@ -1402,19 +1858,24 @@ func scanAccountMutation(row interface{ Scan(...any) error }) (AccountMutation, 
 		&mutation.PresentationProof.FileProvider.Generation,
 		&mutation.PresentationProof.FileProvider.ActivationGeneration,
 		&mutation.PresentationProof.FileProvider.PublicPath,
+		&mutation.PreviousConfigDir, &mutation.PreviousKeychainService,
+		&mutation.PreviousKeychainAccount, &previousLocator, &previousCredential,
 		&owner, &mutation.OwnerEpoch,
 		&createdAt, &updatedAt,
 	); err != nil {
 		return mutation, err
 	}
 	if len(operationID) != 32 || len(locator) != 32 || len(expected) != 32 ||
-		len(intent) != 32 || len(written) != 32 {
+		len(intent) != 32 || len(written) != 32 || len(previousLocator) != 32 ||
+		len(previousCredential) != 32 {
 		return mutation, ErrAccountMutationState
 	}
 	copy(mutation.OperationID[:], operationID)
 	copy(mutation.LocatorDigest[:], locator)
 	copy(mutation.ExpectedCredentialDigest[:], expected)
 	copy(mutation.IntentDigest[:], intent)
+	copy(mutation.PreviousLocatorDigest[:], previousLocator)
+	copy(mutation.PreviousCredentialDigest[:], previousCredential)
 	if input != nil {
 		if len(input) != 32 {
 			return mutation, ErrAccountMutationState
@@ -1445,6 +1906,8 @@ const accountMutationReceiptColumns = `operation_id,account_id,kind,registry_seq
  proof_verified,proof_applied,proof_source_authority,proof_source_revision,proof_catalog_revision,
  proof_change_id,proof_operation_id,proof_presentation_kind,
  proof_tenant_id,proof_domain_id,proof_presentation_generation,proof_activation_generation,proof_public_path,
+ previous_config_dir,previous_keychain_service,previous_keychain_account,
+ previous_locator_digest,previous_credential_digest,
  committed_at,acknowledged_at,expires_at`
 
 func accountMutationReceiptByID(
@@ -1460,6 +1923,7 @@ func accountMutationReceiptByID(
 func scanAccountMutationReceipt(row interface{ Scan(...any) error }) (AccountMutationReceipt, error) {
 	var receipt AccountMutationReceipt
 	var operationID, locator, expected, intent, input, written, outcome, owner []byte
+	var previousLocator, previousCredential []byte
 	var quarantineFileLocator, resolutionObserved []byte
 	var credentialWritten int
 	var committedAt, expiresAt int64
@@ -1485,18 +1949,23 @@ func scanAccountMutationReceipt(row interface{ Scan(...any) error }) (AccountMut
 		&receipt.PresentationProof.FileProvider.Generation,
 		&receipt.PresentationProof.FileProvider.ActivationGeneration,
 		&receipt.PresentationProof.FileProvider.PublicPath,
+		&receipt.PreviousConfigDir, &receipt.PreviousKeychainService,
+		&receipt.PreviousKeychainAccount, &previousLocator, &previousCredential,
 		&committedAt, &acknowledgedAt, &expiresAt,
 	); err != nil {
 		return receipt, err
 	}
 	if len(operationID) != 32 || len(locator) != 32 || len(expected) != 32 ||
-		len(intent) != 32 || len(outcome) != 32 {
+		len(intent) != 32 || len(outcome) != 32 || len(previousLocator) != 32 ||
+		len(previousCredential) != 32 {
 		return receipt, ErrAccountMutationState
 	}
 	copy(receipt.OperationID[:], operationID)
 	copy(receipt.LocatorDigest[:], locator)
 	copy(receipt.ExpectedCredentialDigest[:], expected)
 	copy(receipt.IntentDigest[:], intent)
+	copy(receipt.PreviousLocatorDigest[:], previousLocator)
+	copy(receipt.PreviousCredentialDigest[:], previousCredential)
 	if input != nil {
 		if len(input) != 32 {
 			return receipt, ErrAccountMutationState
@@ -1580,8 +2049,10 @@ func insertAccountMutationReceipt(
 		 proof_verified,proof_applied,proof_source_authority,proof_source_revision,proof_catalog_revision,
 		 proof_change_id,proof_operation_id,proof_presentation_kind,
 		 proof_tenant_id,proof_domain_id,proof_presentation_generation,proof_activation_generation,proof_public_path,
+		 previous_config_dir,previous_keychain_service,previous_keychain_account,
+		 previous_locator_digest,previous_credential_digest,
 		 committed_at,acknowledged_at,expires_at
-		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)`,
+		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)`,
 		mutation.OperationID[:], mutation.AccountID, mutation.Kind, mutation.RegistrySequence,
 		mutation.AccountInstanceID, mutation.AccountGeneration, mutation.LocatorDigest[:],
 		mutation.ExpectedCredentialDigest[:], mutation.IntentDigest[:], input, written, mutation.CredentialWritten,
@@ -1600,6 +2071,8 @@ func insertAccountMutationReceipt(
 		mutation.PresentationProof.FileProvider.Generation,
 		mutation.PresentationProof.FileProvider.ActivationGeneration,
 		mutation.PresentationProof.FileProvider.PublicPath,
+		mutation.PreviousConfigDir, mutation.PreviousKeychainService, mutation.PreviousKeychainAccount,
+		mutation.PreviousLocatorDigest[:], mutation.PreviousCredentialDigest[:],
 		committedAt.UnixNano(), expiresAt.UnixNano(),
 	)
 	return err
@@ -1616,17 +2089,37 @@ func validateAccountMutationRequest(request BeginAccountMutationRequest) error {
 	}
 	var expectedID AccountMutationID
 	var err error
+	previousEmpty := request.PreviousConfigDir == "" && request.PreviousKeychainService == "" &&
+		request.PreviousKeychainAccount == "" && request.PreviousLocatorDigest.zero() &&
+		request.PreviousCredentialDigest.zero()
 	if request.Kind == AccountMutationAdd {
 		if request.ConfigDir != "" || request.KeychainService != "" || request.KeychainAccount != "" ||
-			!request.LocatorDigest.zero() || !request.ExpectedCredentialDigest.zero() {
+			!request.LocatorDigest.zero() || !request.ExpectedCredentialDigest.zero() || !previousEmpty {
 			return ErrAccountMutationState
 		}
 		expectedID, err = NewPendingAddMutationID(
 			request.AccountID, request.AccountInstanceID, request.AccountGeneration, request.IntentDigest,
 		)
+	} else if request.Kind == AccountMutationPresentationRebind {
+		if request.AccountGeneration < 2 || request.ConfigDir != "" || request.KeychainService != "" ||
+			request.KeychainAccount != "" || !request.LocatorDigest.zero() ||
+			!request.ExpectedCredentialDigest.zero() || request.PreviousConfigDir == "" ||
+			request.PreviousKeychainService == "" || request.PreviousKeychainAccount == "" ||
+			request.PreviousLocatorDigest.zero() || request.PreviousCredentialDigest.zero() {
+			return ErrAccountMutationState
+		}
+		if request.PreviousLocatorDigest != CredentialKeychainLocatorDigest(
+			request.PreviousKeychainService, request.PreviousKeychainAccount,
+		) {
+			return ErrAccountMutationState
+		}
+		expectedID, err = NewPresentationRebindMutationID(
+			request.AccountID, request.AccountInstanceID, request.AccountGeneration,
+			request.PreviousLocatorDigest, request.PreviousCredentialDigest, request.IntentDigest,
+		)
 	} else {
 		if request.ConfigDir == "" || request.KeychainService == "" || request.KeychainAccount == "" ||
-			request.LocatorDigest.zero() || request.ExpectedCredentialDigest.zero() {
+			request.LocatorDigest.zero() || request.ExpectedCredentialDigest.zero() || !previousEmpty {
 			return ErrAccountMutationState
 		}
 		expectedID, err = NewAccountMutationID(
@@ -1649,13 +2142,38 @@ func validateAccountMutation(mutation AccountMutation) error {
 		return ErrAccountMutationState
 	}
 	if mutation.State == AccountMutationAwaitingPresentation {
-		if mutation.Kind != AccountMutationAdd || !mutation.LocatorDigest.zero() ||
+		if (mutation.Kind != AccountMutationAdd && mutation.Kind != AccountMutationPresentationRebind) ||
+			!mutation.LocatorDigest.zero() ||
 			!mutation.ExpectedCredentialDigest.zero() || mutation.ConfigDir != "" ||
-			mutation.KeychainService != "" || mutation.KeychainAccount != "" {
+			mutation.KeychainService != "" || mutation.KeychainAccount != "" ||
+			mutation.HasPresentationProof {
 			return ErrAccountMutationState
 		}
 	} else if mutation.LocatorDigest.zero() || mutation.ExpectedCredentialDigest.zero() ||
 		mutation.ConfigDir == "" || mutation.KeychainService == "" || mutation.KeychainAccount == "" {
+		return ErrAccountMutationState
+	}
+	if mutation.Kind == AccountMutationPresentationRebind {
+		if mutation.PreviousConfigDir == "" || mutation.PreviousKeychainService == "" ||
+			mutation.PreviousKeychainAccount == "" || mutation.PreviousLocatorDigest.zero() ||
+			mutation.PreviousCredentialDigest.zero() {
+			return ErrAccountMutationState
+		}
+	} else if mutation.PreviousConfigDir != "" || mutation.PreviousKeychainService != "" ||
+		mutation.PreviousKeychainAccount != "" || !mutation.PreviousLocatorDigest.zero() ||
+		!mutation.PreviousCredentialDigest.zero() {
+		return ErrAccountMutationState
+	}
+	if (mutation.Kind == AccountMutationAdd || mutation.Kind == AccountMutationPresentationRebind) &&
+		mutation.State != AccountMutationAwaitingPresentation {
+		if !mutation.HasPresentationProof || validatePresentationPreparationProofForAccount(
+			mutation.PresentationProof, mutation.AccountInstanceID, mutation.AccountGeneration,
+			mutation.ConfigDir,
+		) != nil {
+			return ErrAccountMutationState
+		}
+	} else if mutation.Kind != AccountMutationAdd && mutation.Kind != AccountMutationPresentationRebind &&
+		mutation.HasPresentationProof {
 		return ErrAccountMutationState
 	}
 	if err := mutation.Owner.Validate(); err != nil {
@@ -1684,6 +2202,27 @@ func validateAccountMutationReceipt(receipt AccountMutationReceipt) error {
 	if receipt.CredentialWritten && receipt.WrittenCredentialDigest.zero() {
 		return ErrAccountMutationState
 	}
+	if receipt.Kind == AccountMutationPresentationRebind {
+		if receipt.PreviousConfigDir == "" || receipt.PreviousKeychainService == "" ||
+			receipt.PreviousKeychainAccount == "" || receipt.PreviousLocatorDigest.zero() ||
+			receipt.PreviousCredentialDigest.zero() {
+			return ErrAccountMutationState
+		}
+	} else if receipt.PreviousConfigDir != "" || receipt.PreviousKeychainService != "" ||
+		receipt.PreviousKeychainAccount != "" || !receipt.PreviousLocatorDigest.zero() ||
+		!receipt.PreviousCredentialDigest.zero() {
+		return ErrAccountMutationState
+	}
+	if receipt.Kind == AccountMutationAdd || receipt.Kind == AccountMutationPresentationRebind {
+		if !receipt.HasPresentationProof || validatePresentationPreparationProofForAccount(
+			receipt.PresentationProof, receipt.AccountInstanceID, receipt.AccountGeneration,
+			receipt.ConfigDir,
+		) != nil {
+			return ErrAccountMutationState
+		}
+	} else if receipt.HasPresentationProof {
+		return ErrAccountMutationState
+	}
 	if (receipt.Terminal == AccountMutationQuarantined) != receipt.HasQuarantine ||
 		(receipt.HasQuarantine &&
 			(receipt.QuarantineFileLocator.zero() || !receipt.QuarantineReason.quarantine())) {
@@ -1702,7 +2241,8 @@ func validateAccountMutationReceipt(receipt AccountMutationReceipt) error {
 
 func (kind AccountMutationKind) valid() bool {
 	switch kind {
-	case AccountMutationAdd, AccountMutationRelogin, AccountMutationSyncInstall:
+	case AccountMutationAdd, AccountMutationRelogin, AccountMutationSyncInstall,
+		AccountMutationPresentationRebind:
 		return true
 	default:
 		return false
@@ -1713,7 +2253,8 @@ func (state AccountMutationState) valid() bool {
 	switch state {
 	case AccountMutationAwaitingPresentation, AccountMutationAwaitingInput,
 		AccountMutationReserved, AccountMutationApplying,
-		AccountMutationApplied, AccountMutationPublishing, AccountMutationCompensating:
+		AccountMutationApplied, AccountMutationPublishing, AccountMutationCompensating,
+		AccountMutationRebindPublished:
 		return true
 	default:
 		return false
@@ -1736,6 +2277,17 @@ func sameAccountMutationIntent(mutation AccountMutation, request BeginAccountMut
 			mutation.AccountGeneration == request.AccountGeneration &&
 			mutation.IntentDigest == request.IntentDigest
 	}
+	if mutation.Kind == AccountMutationPresentationRebind &&
+		request.Kind == AccountMutationPresentationRebind {
+		return mutation.AccountInstanceID == request.AccountInstanceID &&
+			mutation.AccountGeneration == request.AccountGeneration &&
+			mutation.IntentDigest == request.IntentDigest &&
+			mutation.PreviousConfigDir == request.PreviousConfigDir &&
+			mutation.PreviousKeychainService == request.PreviousKeychainService &&
+			mutation.PreviousKeychainAccount == request.PreviousKeychainAccount &&
+			mutation.PreviousLocatorDigest == request.PreviousLocatorDigest &&
+			mutation.PreviousCredentialDigest == request.PreviousCredentialDigest
+	}
 	return mutation.Kind == request.Kind &&
 		mutation.AccountInstanceID == request.AccountInstanceID &&
 		mutation.AccountGeneration == request.AccountGeneration &&
@@ -1756,6 +2308,18 @@ func sameAccountMutationReceiptIntent(
 			receipt.AccountInstanceID == request.AccountInstanceID &&
 			receipt.AccountGeneration == request.AccountGeneration &&
 			receipt.IntentDigest == request.IntentDigest
+	}
+	if receipt.Kind == AccountMutationPresentationRebind &&
+		request.Kind == AccountMutationPresentationRebind {
+		return receipt.OperationID == request.OperationID && receipt.AccountID == request.AccountID &&
+			receipt.AccountInstanceID == request.AccountInstanceID &&
+			receipt.AccountGeneration == request.AccountGeneration &&
+			receipt.IntentDigest == request.IntentDigest &&
+			receipt.PreviousConfigDir == request.PreviousConfigDir &&
+			receipt.PreviousKeychainService == request.PreviousKeychainService &&
+			receipt.PreviousKeychainAccount == request.PreviousKeychainAccount &&
+			receipt.PreviousLocatorDigest == request.PreviousLocatorDigest &&
+			receipt.PreviousCredentialDigest == request.PreviousCredentialDigest
 	}
 	return receipt.OperationID == request.OperationID &&
 		receipt.AccountID == request.AccountID && receipt.Kind == request.Kind &&

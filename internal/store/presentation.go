@@ -138,96 +138,6 @@ func (s *Store) AccountPresentationQuarantine(accountID int) (AccountPresentatio
 	return accountPresentationQuarantine(s.db, accountID)
 }
 
-// RebindAccountPresentation atomically installs an operator-approved new path and generation.
-func (s *Store) RebindAccountPresentation(
-	account Account,
-	proof PresentationPreparationProof,
-	keychainService string,
-	keychainAccount string,
-) (Account, error) {
-	if err := validatePresentationPreparationProofForAccount(
-		proof, account.InstanceID, account.Generation+1, proof.FileProvider.PublicPath,
-	); err != nil {
-		return Account{}, err
-	}
-	fileProvider := proof.FileProvider
-	if keychainService == "" || keychainAccount == "" || fileProvider.Generation != account.Generation+1 ||
-		fileProvider.PublicPath == account.ConfigDir {
-		return Account{}, ErrAccountPresentationEvidence
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return Account{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	current, err := presentationAccount(tx, account.ID)
-	if err != nil {
-		return Account{}, err
-	}
-	if !samePresentationAccount(current, account) {
-		return Account{}, ErrAccountGenerationChanged
-	}
-	quarantine, err := accountPresentationQuarantine(tx, account.ID)
-	if err != nil {
-		return Account{}, err
-	}
-	if quarantine.AccountInstanceID != account.InstanceID ||
-		quarantine.AccountGeneration != account.Generation ||
-		quarantine.ExpectedConfigDir != account.ConfigDir ||
-		quarantine.Proof.FileProvider.TenantID != fileProvider.TenantID ||
-		quarantine.Proof.FileProvider.DomainID != fileProvider.DomainID ||
-		quarantine.Proof.FileProvider.PublicPath != fileProvider.PublicPath {
-		return Account{}, ErrAccountPresentationEvidence
-	}
-	busy, err := accountPresentationBusy(tx, account.ID)
-	if err != nil {
-		return Account{}, err
-	}
-	if busy {
-		return Account{}, ErrAccountPresentationBusy
-	}
-	result, err := tx.Exec(
-		`UPDATE accounts SET generation=?,config_dir=?,keychain_service=?,keychain_account=?
-		 WHERE id=? AND instance_id=? AND generation=? AND config_dir=? AND deleted_at IS NULL`,
-		fileProvider.Generation, fileProvider.PublicPath, keychainService, keychainAccount,
-		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
-	)
-	if err != nil {
-		return Account{}, err
-	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return Account{}, ErrAccountGenerationChanged
-	}
-	if _, err := tx.Exec(`DELETE FROM account_presentations WHERE account_id=?`, account.ID); err != nil {
-		return Account{}, err
-	}
-	if err := upsertAccountPresentation(tx, AccountPresentation{
-		AccountID: account.ID, AccountInstanceID: account.InstanceID,
-		AccountGeneration: fileProvider.Generation, Proof: proof, ObservedAt: s.now(),
-	}); err != nil {
-		return Account{}, err
-	}
-	result, err = tx.Exec(
-		`DELETE FROM account_presentation_quarantines
-		 WHERE account_id=? AND account_instance_id=? AND account_generation=?`,
-		account.ID, account.InstanceID, account.Generation,
-	)
-	if err != nil {
-		return Account{}, err
-	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return Account{}, ErrAccountPresentationEvidence
-	}
-	updated, err := presentationAccount(tx, account.ID)
-	if err != nil {
-		return Account{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Account{}, err
-	}
-	return updated, nil
-}
-
 func validateFileProviderPreparationProof(fileProvider FileProviderPreparationProof) error {
 	if fileProvider.TenantID == "" || fileProvider.DomainID == "" || fileProvider.Generation == 0 ||
 		fileProvider.ActivationGeneration == "" || !exactPresentationPath(fileProvider.PublicPath) ||
@@ -459,14 +369,18 @@ func insertAccountPresentationQuarantine(tx *sql.Tx, quarantine AccountPresentat
 	return err
 }
 
-func accountPresentationBusy(tx *sql.Tx, accountID int) (bool, error) {
+func accountPresentationBusyExceptMutation(
+	tx *sql.Tx,
+	accountID int,
+	operationID AccountMutationID,
+) (bool, error) {
 	var busy int
 	err := tx.QueryRow(
 		`SELECT EXISTS(SELECT 1 FROM sessions WHERE account_id=? AND ended_at IS NULL)
-		 OR EXISTS(SELECT 1 FROM account_mutations WHERE account_id=?)
+		 OR EXISTS(SELECT 1 FROM account_mutations WHERE account_id=? AND operation_id<>?)
 		 OR EXISTS(SELECT 1 FROM credential_operations WHERE account_id=?)
 		 OR EXISTS(SELECT 1 FROM account_removals WHERE account_id=?)`,
-		accountID, accountID, accountID, accountID,
+		accountID, accountID, operationID[:], accountID, accountID,
 	).Scan(&busy)
 	return busy != 0, err
 }
