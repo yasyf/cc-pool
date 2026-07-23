@@ -10,7 +10,12 @@ import (
 
 func TestProductionOrdinaryCallersContainNoProtectedLifecycleOperations(t *testing.T) {
 	for _, root := range []string{".", "../cli", "../../cmd"} {
-		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		rootFS, err := os.OpenRoot(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = rootFS.Close() })
+		err = fs.WalkDir(rootFS.FS(), ".", func(path string, entry fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -20,7 +25,7 @@ func TestProductionOrdinaryCallersContainNoProtectedLifecycleOperations(t *testi
 			if root == "." && filepath.Base(path) == "transport.go" {
 				return nil
 			}
-			payload, err := os.ReadFile(path)
+			payload, err := rootFS.ReadFile(path)
 			if err != nil {
 				return err
 			}

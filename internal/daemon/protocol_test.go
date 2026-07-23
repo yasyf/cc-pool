@@ -195,7 +195,7 @@ func TestOrdinaryPeerCannotInvokeAnyProtectedLifecycleOperation(t *testing.T) {
 			peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
 				Dial: wire.UnixDialer(socket), Build: BusinessBuild, LifecycleBuild: version.String(),
 			}}
-			defer peer.Close()
+			defer func() { _ = peer.Close() }()
 			if err := operation.call(peer); err == nil || !strings.Contains(err.Error(), wire.ErrProtectedSessionRequired.Error()) {
 				t.Fatalf("ordinary lifecycle %s = %v, want protected rejection", operation.name, err)
 			}

@@ -62,7 +62,8 @@ func (c *Client) Done() <-chan struct{} { return c.done }
 func sessionDone(events <-chan wire.Event) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
-		for range events {
+		for event := range events {
+			_ = event
 		}
 		close(done)
 	}()
