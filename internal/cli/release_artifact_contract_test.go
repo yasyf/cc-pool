@@ -106,7 +106,7 @@ func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
 	if !strings.Contains(release, "permissions:\n  contents: read") {
 		t.Fatal("release workflow does not default non-owner jobs to read-only contents")
 	}
-	if !strings.Contains(release, "release-app.yml@1666a5363ad6f2ed7ac0be901702e523cc1fba66") {
+	if !strings.Contains(release, "release-app.yml@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9") {
 		t.Fatal("release workflow is not pinned to the caller-owned staging contract")
 	}
 	appJob := strings.Index(release, "\n  release-app:")
