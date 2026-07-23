@@ -1,11 +1,36 @@
 package cli
 
 import (
+	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestPureGoCLIDoesNotEmbedSwiftOwnedContainerIdentity(t *testing.T) {
+	repository, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(t.TempDir(), "cc-pool")
+	//nolint:gosec // The test builds one fixed repository target into t.TempDir.
+	command := exec.CommandContext(t.Context(), "go", "build", "-trimpath", "-o", artifact, "./cmd/cc-pool")
+	command.Dir = repository
+	command.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build pure-Go CLI: %v\n%s", err, output)
+	}
+	payload, err := os.ReadFile(artifact) //nolint:gosec // The path is the exact t.TempDir output above.
+	if err != nil {
+		t.Fatal(err)
+	}
+	forbidden := []byte("SXKCTF23Q2.ccp")
+	if bytes.Contains(payload, forbidden) {
+		t.Fatalf("pure-Go CLI embeds signed-runtime container identity %q", forbidden)
+	}
+}
 
 const (
 	// releaseAppWorkflowCommit is an immutable Git commit, not a credential.
@@ -39,6 +64,9 @@ func TestReleaseCLIFailsClosedBeforeArtifactPublication(t *testing.T) {
 		"^TeamIdentifier=${TEAM_ID}$",
 		"flags=.*\\(runtime\\)",
 		`identifier "com.yasyf.cc-pool"`,
+		"application-groups",
+		"SXKCTF23Q2.ccp",
+		"Library/Group Containers",
 	} {
 		if !strings.Contains(release[build:create], required) {
 			t.Fatalf("CLI release is missing final identity/notarization assertion %q", required)
