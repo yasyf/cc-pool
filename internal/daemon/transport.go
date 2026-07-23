@@ -17,6 +17,8 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 )
 
+var errHolderSessionLost = errors.New("daemon: FuseKit holder session lost")
+
 func operationLadder() (wire.Ladder, error) {
 	server := map[wire.Op]time.Duration{
 		wire.Op(OpSelect):             selectRequestTimeout,
@@ -115,6 +117,8 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 		State:        serverState{owner: s},
 		Resources:    lifecycleResource{peer: peer, server: s},
 		Activate:     s.activate,
+		HealthState:  s.runtimeHealthState,
+		Busy:         s.runtimeBusy,
 	})
 	if err != nil {
 		_ = peer.Close()
@@ -176,6 +180,10 @@ func (s *sessionServer) Serve(
 		cancel()
 		return errors.New("host sync publication wiring is unavailable")
 	}
+	if s.owner.holderSessionDone == nil {
+		cancel()
+		return errors.New("FuseKit holder session monitor is unavailable")
+	}
 	if err := s.owner.m.RecoverRetiredCredentialOwners(execCtx); err != nil {
 		cancel()
 		return fmt.Errorf("recover retired credential owners: %w", err)
@@ -190,7 +198,27 @@ func (s *sessionServer) Serve(
 		}
 		s.owner.scheduler(execCtx)
 	}()
-	err := s.wire.Serve(ctx, listener, ready, admit, admitLifecycle)
+	serveCtx, cancelServe := context.WithCancelCause(ctx)
+	monitorDone := make(chan struct{})
+	go func() {
+		defer close(monitorDone)
+		select {
+		case <-serveCtx.Done():
+		case <-s.owner.holderSessionDone:
+			if serveCtx.Err() != nil {
+				return
+			}
+			s.owner.holderActive.Store(false)
+			s.owner.holderLost.Store(true)
+			cancelServe(errHolderSessionLost)
+		}
+	}()
+	err := s.wire.Serve(serveCtx, listener, ready, admit, admitLifecycle)
+	cancelServe(nil)
+	<-monitorDone
+	if errors.Is(context.Cause(serveCtx), errHolderSessionLost) {
+		err = errors.Join(errHolderSessionLost, err)
+	}
 	s.owner.log.Printf("daemon stopped")
 	return err
 }
@@ -247,6 +275,20 @@ type lifecycleResource struct {
 
 type serverState struct{ owner *Server }
 
+func (s *Server) runtimeHealthState() dkdaemon.State {
+	if s.holderLost.Load() {
+		return dkdaemon.StateFailed
+	}
+	if !s.holderActive.Load() {
+		return dkdaemon.StateDegraded
+	}
+	return dkdaemon.StateHealthy
+}
+
+func (s *Server) runtimeBusy() bool {
+	return !s.holderActive.Load() || s.holderLost.Load()
+}
+
 func (s serverState) Close() error {
 	if s.owner == nil || s.owner.m == nil {
 		return nil
@@ -265,6 +307,7 @@ func (r lifecycleResource) Close() error {
 		errs = append(errs, r.peer.Close())
 	}
 	if r.server != nil && r.server.tenantClient != nil {
+		r.server.holderActive.Store(false)
 		errs = append(errs, r.server.tenantClient.Close())
 	}
 	return errors.Join(errs...)
