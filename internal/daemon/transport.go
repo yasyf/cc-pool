@@ -224,11 +224,6 @@ func (w *serverWorkers) Cancel() {
 
 func (w *serverWorkers) Wait(ctx context.Context) error {
 	settleErr := w.owner.syncIntake.Settle(ctx)
-	if settleErr != nil {
-		if err := w.owner.syncIntake.Settle(context.WithoutCancel(ctx)); err != nil {
-			settleErr = errors.Join(settleErr, err)
-		}
-	}
 	if w.owner.disposableWorkers != nil {
 		settleErr = errors.Join(settleErr, w.owner.disposableWorkers.Wait(ctx))
 	}
@@ -237,7 +232,11 @@ func (w *serverWorkers) Wait(ctx context.Context) error {
 		w.owner.wg.Wait()
 		close(done)
 	}()
-	<-done
+	select {
+	case <-done:
+	case <-ctx.Done():
+		settleErr = errors.Join(settleErr, fmt.Errorf("daemon: await background workers: %w", ctx.Err()))
+	}
 	return settleErr
 }
 

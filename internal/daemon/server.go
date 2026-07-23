@@ -119,6 +119,9 @@ type Server struct {
 
 	tenantClient        *tenantfs.Client
 	tenantCoordinator   *tenantCoordinator
+	holderSessionDone   <-chan struct{}
+	holderActive        atomic.Bool
+	holderLost          atomic.Bool
 	prepareAccount      func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error)
 	activatePrepared    func(context.Context, store.Account, catalogproto.TenantPreparationProof, func() error) error
 	preflightCredential func(context.Context, store.Account) error
@@ -175,6 +178,8 @@ func Run(ctx context.Context) error {
 }
 
 func (s *Server) activate(activation dkdaemon.Activation) (err error) {
+	s.holderActive.Store(false)
+	s.holderLost.Store(false)
 	if err := ensureHolderRuntime(activation.Startup); err != nil {
 		return err
 	}
@@ -205,6 +210,7 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	workers := m.DisposableWorkers()
 	s.m = m
 	s.tenantClient = tenantClient
+	s.holderSessionDone = tenantClient.Done()
 	s.disposableWorkers = workers
 	s.accountMutationTerminal = daemonkitAccountMutationTerminalRunner{workers: workers, manager: m}
 	s.accountMutationLifetime = activation.Lifetime
@@ -218,14 +224,17 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 		s.clearActivation()
 		return fmt.Errorf("initialize FuseKit tenants: %w", err)
 	}
+	s.holderActive.Store(true)
 	published = true
 	return nil
 }
 
 func (s *Server) clearActivation() {
+	s.holderActive.Store(false)
 	s.m = nil
 	s.tenantClient = nil
 	s.tenantCoordinator = nil
+	s.holderSessionDone = nil
 	s.disposableWorkers = nil
 	s.accountMutationTerminal = nil
 	s.accountMutationLifetime = nil

@@ -23,6 +23,7 @@ type Client struct {
 	wire    *wire.Client
 	mount   *mountservice.Client
 	catalog *catalogservice.Client
+	done    <-chan struct{}
 }
 
 // NewClient opens one persistent exact-suite FuseKit session.
@@ -46,11 +47,27 @@ func NewClient(ctx context.Context, socket string) (*Client, error) {
 		_ = session.Close()
 		return nil, err
 	}
-	return &Client{wire: session, mount: mountClient, catalog: catalogClient}, nil
+	return &Client{
+		wire: session, mount: mountClient, catalog: catalogClient,
+		done: sessionDone(session.Events()),
+	}, nil
 }
 
 // Close settles and closes the shared persistent session.
 func (c *Client) Close() error { return c.wire.Close() }
+
+// Done closes when the persistent holder session terminates.
+func (c *Client) Done() <-chan struct{} { return c.done }
+
+func sessionDone(events <-chan wire.Event) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		for range events {
+		}
+		close(done)
+	}()
+	return done
+}
 
 // RuntimeHealth returns the holder's exact activation and native presentation state.
 func (c *Client) RuntimeHealth(ctx context.Context) (mountproto.RuntimeHealthResponse, error) {

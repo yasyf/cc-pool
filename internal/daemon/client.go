@@ -16,6 +16,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/daemonkit/wire/lifeproto"
@@ -219,7 +220,27 @@ func (c *Client) HealthContext(ctx context.Context) (*Response, error) {
 	if err := c.lifecycle(ctx, wire.Op(lifeproto.OpHealth), lifeproto.NewHealthRequest(), &response); err != nil {
 		return nil, err
 	}
+	if err := validateDaemonHealth(response, c.clientLifecycleBuild()); err != nil {
+		return nil, err
+	}
 	return &Response{OK: true, Version: response.Build}, nil
+}
+
+func validateDaemonHealth(response lifeproto.HealthResponse, build string) error {
+	if response.V != lifeproto.Version || response.Op != lifeproto.OpHealth ||
+		response.Build != build || response.Protocol != int(wire.ProtocolVersion) || response.PID <= 0 {
+		return fmt.Errorf(
+			"daemon lifecycle identity is not exact: v=%d op=%q build=%q protocol=%d pid=%d",
+			response.V, response.Op, response.Build, response.Protocol, response.PID,
+		)
+	}
+	if response.State != string(dkdaemon.StateHealthy) || response.Draining || response.Busy {
+		return fmt.Errorf(
+			"daemon lifecycle is not ready: state=%q draining=%t busy=%t",
+			response.State, response.Draining, response.Busy,
+		)
+	}
+	return nil
 }
 
 // CredMove asks the daemon to move account credentials to the given backend.

@@ -127,7 +127,8 @@ func tenantLifecycleOperation(operation mountproto.Operation) bool {
 }
 
 func nativeOperation(operation mountproto.Operation) bool {
-	return operation == mountproto.OperationNativeBind || operation == mountproto.OperationNativeReady ||
+	return operation == mountproto.OperationNativeBind || operation == mountproto.OperationNativeMounted ||
+		operation == mountproto.OperationNativeReady ||
 		operation == mountproto.OperationNativeUnbind || operation == mountproto.OperationNativeRoutePage ||
 		operation == mountproto.OperationNativePin || operation == mountproto.OperationNativeRelease ||
 		operation == mountproto.OperationNativeSnapshotOpen || operation == mountproto.OperationNativeSnapshotRead ||
