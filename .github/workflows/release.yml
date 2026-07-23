@@ -40,7 +40,7 @@ jobs:
       contents: write
     outputs:
       pure_sha256: ${{ steps.shas.outputs.pure }}
-      release_id: ${{ steps.draft.outputs.release_id }}
+      release_id: ${{ steps.draft.outputs['release-id'] }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -199,171 +199,38 @@ jobs:
           xcrun stapler validate dist/verified/app/CCPoolStatus.app
           spctl --assess --type execute --verbose=4 dist/verified/app/CCPoolStatus.app
 
-      - name: Create or reset the private draft GitHub Release
+      - name: Record the exact release asset manifest
+        env:
+          APP_ASSET: ${{ needs.release-app.outputs.asset_filename }}
+          CLI_ASSET: cc-pool-${{ github.ref_name }}-darwin-universal.tar.gz
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            "dist/$CLI_ASSET" \
+            dist/SHA256SUMS.txt \
+            "dist/staged-app/$APP_ASSET" \
+            "dist/staged-app/$APP_ASSET.sha256" \
+            > "$RUNNER_TEMP/cc-pool-release-assets"
+
+      - name: Stage and verify the complete draft release
         id: draft
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PRERELEASE: ${{ contains(github.ref_name, '-') }}
-        run: |
-          set -euo pipefail
-          releases="$(gh api --paginate --slurp \
-            "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
-          if [ "$PRERELEASE" = false ]; then
-            newer="$(jq -r --arg current "$GITHUB_REF_NAME" '
-              def stable_version:
-                capture("^v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$")
-                | [.major, .minor, .patch] | map(tonumber);
-              ($current | stable_version) as $current_version
-              | [.[][]
-                  | select(.draft == false and .prerelease == false)
-                  | .tag_name as $tag
-                  | try (($tag | stable_version) as $version
-                    | select($version > $current_version) | $tag) catch empty]
-              | .[]
-            ' <<< "$releases")"
-            [ -z "$newer" ] \
-              || { echo "::error::newer stable release already published: $newer"; exit 1; }
-          fi
-          matches="$(jq --arg tag "$GITHUB_REF_NAME" \
-            '[.[][] | select(.tag_name == $tag)]' <<< "$releases")"
-          case "$(jq 'length' <<< "$matches")" in
-          0)
-            release="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
-              -f tag_name="$GITHUB_REF_NAME" -f target_commitish="$GITHUB_SHA" \
-              -f name="$GITHUB_REF_NAME" -F draft=true -F prerelease="$PRERELEASE" \
-              -F generate_release_notes=true)"
-            release_id="$(jq -r '.id' <<< "$release")"
-            already_public=false
-            ;;
-          1)
-            release="$(jq '.[0]' <<< "$matches")"
-            release_id="$(jq -r '.id' <<< "$release")"
-            if [ "$(jq -r '.draft' <<< "$release")" = true ]; then
-              release="$(gh api --method PATCH \
-                "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
-                -f name="$GITHUB_REF_NAME" -F draft=true -F prerelease="$PRERELEASE")"
-              already_public=false
-            else
-              [ "$(jq -r '.prerelease' <<< "$release")" = "$PRERELEASE" ] \
-                || { echo "::error::public release prerelease state differs"; exit 1; }
-              already_public=true
-            fi
-            ;;
-          *)
-            echo "::error::multiple releases exist for tag $GITHUB_REF_NAME"
-            exit 1
-            ;;
-          esac
-          [ "$release_id" != null ] && [ -n "$release_id" ]
-          if [ "$already_public" = false ]; then
-            [ "$(jq -r '.draft' <<< "$release")" = true ]
-            assets="$(gh api --paginate --slurp \
-              "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100")"
-            while IFS= read -r asset_id; do
-              [ -n "$asset_id" ] || continue
-              gh api --method DELETE \
-                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
-            done < <(jq -r '.[][] | .id' <<< "$assets")
-          fi
-          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
-          echo "already_public=$already_public" >> "$GITHUB_OUTPUT"
+        uses: yasyf/homebrew-tap/.github/actions/stage-draft-release@54e3e194bda69896894a82c17fcdb2822beefab5
+        with:
+          token: ${{ github.token }}
+          tag: ${{ github.ref_name }}
+          manifest: ${{ runner.temp }}/cc-pool-release-assets
+          title: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
-      - name: Upload the exact stack to the private draft
-        if: ${{ steps.draft.outputs.already_public != 'true' }}
-        env:
-          APP_ASSET: ${{ needs.release-app.outputs.asset_filename }}
-          CLI_ASSET: cc-pool-${{ github.ref_name }}-darwin-universal.tar.gz
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
-        run: |
-          set -euo pipefail
-          upload_asset() {
-            path="$1"
-            name="${path##*/}"
-            curl --fail --silent --show-error --location --request POST \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              -H "Content-Type: application/octet-stream" \
-              "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${name}" \
-              --data-binary "@$path" >/dev/null
-          }
-          upload_asset "dist/$CLI_ASSET"
-          upload_asset dist/SHA256SUMS.txt
-          upload_asset "dist/staged-app/$APP_ASSET"
-          upload_asset "dist/staged-app/$APP_ASSET.sha256"
-
-      - name: Validate the private draft asset set and bytes
-        env:
-          APP_ASSET: ${{ needs.release-app.outputs.asset_filename }}
-          ALREADY_PUBLIC: ${{ steps.draft.outputs.already_public }}
-          CLI_ASSET: cc-pool-${{ github.ref_name }}-darwin-universal.tar.gz
-          GH_TOKEN: ${{ github.token }}
-          PRERELEASE: ${{ contains(github.ref_name, '-') }}
-          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
-        run: |
-          set -euo pipefail
-          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
-          expected_draft=true
-          [ "$ALREADY_PUBLIC" != true ] || expected_draft=false
-          [ "$(jq -r '.draft' <<< "$release")" = "$expected_draft" ] \
-            || { echo "::error::release publication state changed before validation"; exit 1; }
-          [ "$(jq -r '.prerelease' <<< "$release")" = "$PRERELEASE" ] \
-            || { echo "::error::release prerelease state changed before validation"; exit 1; }
-          assets="$(gh api --paginate --slurp \
-            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100")"
-          expected="$(printf '%s\n' \
-            "$CLI_ASSET" SHA256SUMS.txt "$APP_ASSET" "$APP_ASSET.sha256" | LC_ALL=C sort)"
-          actual="$(jq -r '.[][] | .name' <<< "$assets" | LC_ALL=C sort)"
-          [ "$actual" = "$expected" ] \
-            || { echo "::error::draft release asset set is not exact"; diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"); exit 1; }
-
-          rm -rf dist/draft-verify
-          mkdir -p dist/draft-verify
-          while IFS=$'\t' read -r name asset_id; do
-            curl --fail --silent --show-error --location \
-              -H "Accept: application/octet-stream" \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-              --output "dist/draft-verify/$name"
-          done < <(jq -r '.[][] | [.name, (.id | tostring)] | @tsv' <<< "$assets")
-          cmp "dist/$CLI_ASSET" "dist/draft-verify/$CLI_ASSET"
-          cmp dist/SHA256SUMS.txt dist/draft-verify/SHA256SUMS.txt
-          cmp "dist/staged-app/$APP_ASSET" "dist/draft-verify/$APP_ASSET"
-          cmp "dist/staged-app/$APP_ASSET.sha256" "dist/draft-verify/$APP_ASSET.sha256"
-
-      - name: Publish the complete draft release
-        if: ${{ steps.draft.outputs.already_public != 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MAKE_LATEST: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
-          PRERELEASE: ${{ contains(github.ref_name, '-') }}
-          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
-        run: |
-          set -euo pipefail
-          if [ "$PRERELEASE" = false ]; then
-            releases="$(gh api --paginate --slurp \
-              "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
-            newer="$(jq -r --arg current "$GITHUB_REF_NAME" '
-              def stable_version:
-                capture("^v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$")
-                | [.major, .minor, .patch] | map(tonumber);
-              ($current | stable_version) as $current_version
-              | [.[][]
-                  | select(.draft == false and .prerelease == false)
-                  | .tag_name as $tag
-                  | try (($tag | stable_version) as $version
-                    | select($version > $current_version) | $tag) catch empty]
-              | .[]
-            ' <<< "$releases")"
-            [ -z "$newer" ] \
-              || { echo "::error::newer stable release published during staging: $newer"; exit 1; }
-          fi
-          gh api --method PATCH \
-            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-            -F draft=false -F prerelease="$PRERELEASE" -f make_latest="$MAKE_LATEST" \
-            >/dev/null
+      - name: Publish the verified release
+        uses: yasyf/homebrew-tap/.github/actions/publish-draft-release@54e3e194bda69896894a82c17fcdb2822beefab5
+        with:
+          token: ${{ github.token }}
+          release-id: ${{ steps.draft.outputs['release-id'] }}
+          tag: ${{ github.ref_name }}
+          manifest: ${{ runner.temp }}/cc-pool-release-assets
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make-latest: ${{ !contains(github.ref_name, '-') }}
 
   widget-test:
     needs: verify-tag-on-main
@@ -397,7 +264,7 @@ jobs:
     needs: [version, widget-test]
     permissions:
       contents: read
-    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@8f422c652d836c40f9cc5a9d893d4120b26bc681
+    uses: yasyf/homebrew-tap/.github/workflows/release-app.yml@83ee384b1d4fe25a8e4aa7258bb76d55e1593735
     with:
       app_name: CCPoolStatus
       asset_name: cc-pool-status

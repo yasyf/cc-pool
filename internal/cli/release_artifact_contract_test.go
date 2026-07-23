@@ -8,15 +8,16 @@ import (
 )
 
 const (
-	releaseAppWorkflowPin = "8f422c652d836c40f9cc5a9d893d4120b26bc681"
+	releaseAppWorkflowPin = "83ee384b1d4fe25a8e4aa7258bb76d55e1593735"
 	releaseActionPin      = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
+	releaseDraftActionPin = "54e3e194bda69896894a82c17fcdb2822beefab5"
 )
 
 func TestReleaseCLIFailsClosedBeforeArtifactPublication(t *testing.T) {
 	release := readReleaseArtifactContract(t, ".github", "workflows", "release.yml")
 	require := strings.Index(release, "Require CLI signing and notarization secrets")
 	build := strings.Index(release, "Build universal CLI")
-	create := strings.Index(release, "Create or reset the private draft GitHub Release")
+	create := strings.Index(release, "Stage and verify the complete draft release")
 	if require < 0 || build < require || create < build {
 		t.Fatal("CLI signing and notarization secrets are not required before artifact publication")
 	}
@@ -58,10 +59,9 @@ func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
 		"Download the verified staged CCPoolStatus application",
 		"Build universal CLI",
 		"Verify the complete staged stack before drafting",
-		"Create or reset the private draft GitHub Release",
-		"Upload the exact stack to the private draft",
-		"Validate the private draft asset set and bytes",
-		"Publish the complete draft release",
+		"Record the exact release asset manifest",
+		"Stage and verify the complete draft release",
+		"Publish the verified release",
 	}
 	previous := -1
 	for _, stage := range stages {
@@ -74,22 +74,15 @@ func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
 	for _, required := range []string{
 		"permissions:\n      contents: write",
 		"needs.release-app.outputs.artifact_name",
-		`[ "$(jq -r '.draft' <<< "$release")" = true ]`,
-		`gh api --paginate --slurp`,
-		`https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${name}`,
 		`"dist/$CLI_ASSET"`,
 		"dist/SHA256SUMS.txt",
 		`"dist/staged-app/$APP_ASSET"`,
 		`"dist/staged-app/$APP_ASSET.sha256"`,
-		`actual="$(jq -r '.[][] | .name' <<< "$assets" | LC_ALL=C sort)"`,
-		`release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"`,
-		`repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100`,
-		`https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}`,
-		`if: ${{ steps.draft.outputs.already_public != 'true' }}`,
-		`already_public=$already_public`,
-		`[ "$ALREADY_PUBLIC" != true ] || expected_draft=false`,
-		`newer stable release published during staging`,
-		`-F draft=false`,
+		`> "$RUNNER_TEMP/cc-pool-release-assets"`,
+		"actions/stage-draft-release@" + releaseDraftActionPin,
+		"actions/publish-draft-release@" + releaseDraftActionPin,
+		`release-id: ${{ steps.draft.outputs['release-id'] }}`,
+		`manifest: ${{ runner.temp }}/cc-pool-release-assets`,
 	} {
 		if !strings.Contains(job, required) {
 			t.Fatalf("atomic release is missing %q", required)
@@ -103,14 +96,8 @@ func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
 	if got := strings.Count(release, "contents: write"); got != 1 {
 		t.Fatalf("GitHub Release publishers = %d, want one", got)
 	}
-	if got := strings.Count(job, "if: ${{ steps.draft.outputs.already_public != 'true' }}"); got != 2 {
-		t.Fatalf("draft-only mutations = %d, want upload and publish", got)
-	}
-	if got := strings.Count(job, `repos/${GITHUB_REPOSITORY}/releases?per_page=100`); got != 2 {
-		t.Fatalf("stable-order checks = %d, want initial and final", got)
-	}
-	if got := strings.Count(release, `/assets?per_page=100`); got != 3 {
-		t.Fatalf("paginated release-ID asset listings = %d, want draft reset, validation, and tap", got)
+	if got := strings.Count(release, `/assets?per_page=100`); got != 1 {
+		t.Fatalf("caller-owned release-ID asset listings = %d, want the tap verification only", got)
 	}
 	if !strings.Contains(release, "permissions:\n  contents: read") {
 		t.Fatal("release workflow does not default non-owner jobs to read-only contents")
@@ -127,6 +114,8 @@ func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
 		"softprops/action-gh-release",
 		"attach-to-release: \"true\"",
 		"releases/tags/${GITHUB_REF_NAME}",
+		"uploads.github.com",
+		"Create or reset the private draft GitHub Release",
 	} {
 		if strings.Contains(job, forbidden) {
 			t.Fatalf("release job retains an independent publisher %q", forbidden)
@@ -181,6 +170,11 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 		case strings.Contains(line, "yasyf/homebrew-tap/.github/workflows/release-app.yml@"):
 			if !strings.Contains(line, "@"+releaseAppWorkflowPin) {
 				t.Fatalf("release-app uses a mixed or mutable workflow reference: %s", line)
+			}
+		case strings.Contains(line, "actions/stage-draft-release@"),
+			strings.Contains(line, "actions/publish-draft-release@"):
+			if !strings.Contains(line, "@"+releaseDraftActionPin) {
+				t.Fatalf("release uses a mixed or mutable draft action reference: %s", line)
 			}
 		case strings.Contains(line, "yasyf/homebrew-tap/.github/actions/"):
 			if !strings.Contains(line, "@"+releaseActionPin) {
