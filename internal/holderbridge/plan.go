@@ -15,8 +15,6 @@ const (
 	TeamID = "SXKCTF23Q2"
 	// ExecutableName is the embedded status helper and broker executable.
 	ExecutableName = "CCPoolStatus"
-	// AppGroup is the one protected broker transport container.
-	AppGroup = TeamID + ".ccp"
 )
 
 var runtimePolicyDigest = codeidentity.PolicyDigest{
@@ -43,9 +41,9 @@ func ReadinessContract() holder.ReadinessContract { return holder.StandardReadin
 
 // RuntimePlanSpec returns the concrete signed-side cc-pool helper contract.
 func RuntimePlanSpec(
-	appPath, runtimeDirectory, buildID string,
+	appPath, runtimeDirectory, buildID, requiredAppGroup string,
 ) holder.RuntimePlanSpec {
-	policy := holder.EntitlementPolicy{RequiredAppGroup: AppGroup}
+	policy := holder.EntitlementPolicy{RequiredAppGroup: requiredAppGroup}
 	return holder.RuntimePlanSpec{
 		Application: Application(appPath), RuntimeDirectory: runtimeDirectory,
 		BuildID: buildID, Readiness: ReadinessContract(), SourceCapable: true,
@@ -68,8 +66,12 @@ func NewDeploymentPlan(appPath, runtimeDirectory, buildID string) (holder.Deploy
 }
 
 // NewRuntimePlan derives the File Provider-only signed helper plan.
-func NewRuntimePlan(appPath, runtimeDirectory, buildID string) (holder.RuntimePlan, error) {
-	plan, err := holder.NewRuntimePlan(RuntimePlanSpec(appPath, runtimeDirectory, buildID))
+func NewRuntimePlan(
+	appPath, runtimeDirectory, buildID, requiredAppGroup string,
+) (holder.RuntimePlan, error) {
+	plan, err := holder.NewRuntimePlan(RuntimePlanSpec(
+		appPath, runtimeDirectory, buildID, requiredAppGroup,
+	))
 	if err != nil {
 		return holder.RuntimePlan{}, err
 	}

@@ -5,13 +5,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/daemonkit/trust"
 )
 
 func TestRuntimePlanSpecPinsProductIdentityAndProtectedPolicy(t *testing.T) {
 	const appPath = "/Users/test/Applications/CCPoolStatus.app"
 	const runtimeDirectory = "/Users/test/.cc-pool/fusekit"
 	const buildID = "v0.60.0"
-	spec := RuntimePlanSpec(appPath, runtimeDirectory, buildID)
+	const requiredAppGroup = "ABCDE12345.ccp"
+	spec := RuntimePlanSpec(appPath, runtimeDirectory, buildID, requiredAppGroup)
 	application := spec.Application
 	if application != Application(appPath) || application.BundleID != BundleID ||
 		application.TeamID != TeamID || application.Broker != application.Runtime ||
@@ -22,9 +25,38 @@ func TestRuntimePlanSpecPinsProductIdentityAndProtectedPolicy(t *testing.T) {
 	if spec.RuntimeDirectory != runtimeDirectory || spec.Native != nil ||
 		spec.BuildID != buildID ||
 		spec.Readiness != ReadinessContract() ||
-		!spec.SourceCapable || spec.BrokerPolicy.RequiredAppGroup != AppGroup ||
-		spec.RuntimePolicy.RequiredAppGroup != AppGroup {
+		!spec.SourceCapable || spec.BrokerPolicy.RequiredAppGroup != requiredAppGroup ||
+		spec.RuntimePolicy.RequiredAppGroup != requiredAppGroup {
 		t.Fatalf("runtime plan spec = %#v", spec)
+	}
+}
+
+func TestOpaqueDeploymentDigestMatchesSignedSwiftPolicy(t *testing.T) {
+	payload, err := os.ReadFile(filepath.Join(
+		"..", "..", "widget", "Sources", "FileProviderRuntime", "Configuration.swift",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const marker = `static let appGroupIdentifier = "`
+	start := strings.Index(string(payload), marker)
+	if start < 0 {
+		t.Fatal("signed Swift configuration does not declare the App Group identifier")
+	}
+	value := string(payload)[start+len(marker):]
+	end := strings.IndexByte(value, '"')
+	if end <= 0 {
+		t.Fatal("signed Swift configuration has an invalid App Group identifier")
+	}
+	requirement := trust.Requirement{
+		TeamID: TeamID, SigningIdentifier: BundleID, RequiredAppGroup: value[:end],
+	}
+	digest, err := requirement.ValidationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != runtimePolicyDigest {
+		t.Fatalf("opaque deployment digest = %x, signed Swift policy digest = %x", runtimePolicyDigest, digest)
 	}
 }
 
@@ -79,7 +111,7 @@ func TestSignedAppDispatchesStopControlBeforeBrokerInitialization(t *testing.T) 
 	}
 	stop := strings.Index(source, "CCPoolFuseKitDispatchChild()")
 	broker := strings.Index(source, "CatalogBroker.runChildIfRequested")
-	start := strings.Index(source, "CCPoolFuseKitStart()")
+	start := strings.Index(source, "CCPoolFuseKitStart(")
 	if stop < 0 || broker < 0 || start < 0 || stop >= broker || broker >= start {
 		t.Fatalf("signed app dispatch order stop=%d broker=%d start=%d", stop, broker, start)
 	}

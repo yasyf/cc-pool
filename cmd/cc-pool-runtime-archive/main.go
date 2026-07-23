@@ -60,16 +60,22 @@ func CCPoolFuseKitDispatchChild() C.int32_t {
 }
 
 //export CCPoolFuseKitStart
-func CCPoolFuseKitStart() C.int32_t {
+func CCPoolFuseKitStart(appGroupIdentifier *C.char) C.int32_t {
+	if appGroupIdentifier == nil {
+		return operationStatus("runtime start", errors.New("signed app group identifier is required"))
+	}
+	requiredAppGroup := C.GoString(appGroupIdentifier)
 	ctx, cancel := context.WithTimeout(
 		context.Background(), holderbridge.ReadinessContract().StartupTimeout(),
 	)
 	defer cancel()
-	return operationStatus("runtime start", startHolder(ctx))
+	return operationStatus("runtime start", startHolder(ctx, requiredAppGroup))
 }
 
-func startHolder(ctx context.Context) error {
-	if err := embeddedHolder.Start(ctx, newHolderRuntime); err != nil {
+func startHolder(ctx context.Context, requiredAppGroup string) error {
+	if err := embeddedHolder.Start(ctx, func(ctx context.Context) (daemon.EmbeddedRuntime, error) {
+		return newHolderRuntime(ctx, requiredAppGroup)
+	}); err != nil {
 		return err
 	}
 	err := tenantfs.PublishClaudeSourceFleet(
@@ -116,9 +122,9 @@ func CCPoolFuseKitStop() C.int32_t {
 	return operationStatus("runtime shutdown", embeddedHolder.Close(ctx))
 }
 
-func newHolderRuntime(ctx context.Context) (daemon.EmbeddedRuntime, error) {
+func newHolderRuntime(ctx context.Context, requiredAppGroup string) (daemon.EmbeddedRuntime, error) {
 	plan, err := holderbridge.NewRuntimePlan(
-		pool.WidgetAppPath(), pool.FuseKitRuntimeDir(), version.String(),
+		pool.WidgetAppPath(), pool.FuseKitRuntimeDir(), version.String(), requiredAppGroup,
 	)
 	if err != nil {
 		return nil, err

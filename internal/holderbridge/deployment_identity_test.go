@@ -1,6 +1,7 @@
 package holderbridge
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -80,6 +81,9 @@ func TestDeploymentPolicyJSONAndDigestAreDeterministicAndComplete(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if bytes.Contains(payload, []byte(`"app_group"`)) {
+		t.Fatal("daemon-facing deployment policy owns the signed App Group identifier")
+	}
 	var policy deploymentPolicy
 	if err := json.Unmarshal(payload, &policy); err != nil {
 		t.Fatal(err)
@@ -93,7 +97,6 @@ func TestDeploymentPolicyJSONAndDigestAreDeterministicAndComplete(t *testing.T) 
 		!policy.Application.RequireCanonicalAccountHome || policy.Application.StopControlRole != StopRoleID ||
 		policy.FileProvider.BundleID != "com.yasyf.cc-pool.status.fileprovider" ||
 		policy.FileProvider.ExtensionRelativePath != "Contents/PlugIns/CCPoolFileProvider.appex" ||
-		policy.FileProvider.AppGroup != AppGroup ||
 		!policy.FileProvider.RequireRegistration || !policy.FileProvider.RequireEnabled ||
 		!policy.FileProvider.RequireExactElection ||
 		policy.FileProvider.ElectionTimeout != DeploymentElectionTimeout ||

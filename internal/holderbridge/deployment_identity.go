@@ -62,7 +62,6 @@ type deploymentApplicationPolicy struct {
 type deploymentFileProviderPolicy struct {
 	BundleID              string        `json:"bundle_id"`
 	ExtensionRelativePath string        `json:"extension_relative_path"`
-	AppGroup              string        `json:"app_group"`
 	RequireRegistration   bool          `json:"require_registration"`
 	RequireEnabled        bool          `json:"require_enabled"`
 	RequireExactElection  bool          `json:"require_exact_election"`
@@ -254,7 +253,6 @@ func deploymentPolicyJSON() ([]byte, error) {
 		FileProvider: deploymentFileProviderPolicy{
 			BundleID:              "com.yasyf.cc-pool.status.fileprovider",
 			ExtensionRelativePath: "Contents/PlugIns/CCPoolFileProvider.appex",
-			AppGroup:              AppGroup,
 			RequireRegistration:   true, RequireEnabled: true, RequireExactElection: true,
 			ElectionTimeout: DeploymentElectionTimeout, ElectionPoll: DeploymentPollInterval,
 		},
