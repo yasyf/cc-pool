@@ -163,6 +163,9 @@ func (s *Server) runAccountMutation(
 				)
 			}
 		}
+		if err := s.prepareCommittedAccountMutation(ctx, *receipt); err != nil {
+			return AccountMutationResult{}, err
+		}
 		return accountMutationReceiptResult(*receipt), nil
 	}
 	if request.Action == AccountMutationStartOrAttach {
@@ -629,6 +632,12 @@ func (s *Server) finishOrQuarantineAccountMutation(
 	}
 	current, err := s.m.Store.AccountMutation(mutation.OperationID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			receipt, receiptErr := s.m.Store.AccountMutationReceipt(mutation.OperationID)
+			if receiptErr == nil && receipt.Terminal == store.AccountMutationCommitted {
+				return AccountMutationResult{}, finishErr
+			}
+		}
 		return AccountMutationResult{}, errors.Join(finishErr, err)
 	}
 	if current.Kind == store.AccountMutationAdd && current.State == store.AccountMutationCompensating {
@@ -949,7 +958,30 @@ func (s *Server) finishAccountMutation(
 		}
 		return AccountMutationResult{}, err
 	}
+	if err := s.prepareCommittedAccountMutation(ctx, receipt); err != nil {
+		return AccountMutationResult{}, err
+	}
 	return accountMutationReceiptResult(receipt), nil
+}
+
+func (s *Server) prepareCommittedAccountMutation(
+	ctx context.Context,
+	receipt store.AccountMutationReceipt,
+) error {
+	if receipt.Terminal != store.AccountMutationCommitted || receipt.Kind != store.AccountMutationAdd {
+		return nil
+	}
+	account, err := s.m.Store.GetAccount(receipt.AccountID)
+	if err != nil {
+		return fmt.Errorf("read committed acct-%02d: %w", receipt.AccountID, err)
+	}
+	if account.InstanceID != receipt.AccountInstanceID || account.Generation != receipt.AccountGeneration {
+		return fmt.Errorf("prepare committed acct-%02d: account generation changed", receipt.AccountID)
+	}
+	if _, err := s.prepareTenant(ctx, account); err != nil {
+		return fmt.Errorf("prepare committed acct-%02d tenant: %w", receipt.AccountID, err)
+	}
+	return nil
 }
 
 func (s *Server) resolveSupersededAccountMutation(

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/synckit/converge"
 	"github.com/yasyf/synckit/cregistry"
 	"github.com/yasyf/synckit/syncservice"
@@ -64,6 +65,12 @@ type AccountRemover interface {
 	BeginAccountRemoval(id int, deleteCredential bool) (AccountRemoval, error)
 }
 
+// AccountPreparer establishes every product-required presentation for one
+// committed account before materialization reports success.
+type AccountPreparer interface {
+	PrepareAccount(context.Context, store.Account) error
+}
+
 // Service owns the convergent account registry and its write hooks: every
 // mutation is load-modify-save under the flock, then a stamp touch that notifies peers.
 type Service struct {
@@ -88,6 +95,8 @@ type Service struct {
 	Sessions Sessions
 	// Remover owns the durable FuseKit-first account removal lifecycle.
 	Remover AccountRemover
+	// Preparer establishes the committed account's FuseKit tenant and source state.
+	Preparer AccountPreparer
 	// Status is the process-lifetime peer up/down tracker; one per Service.
 	Status *converge.PeerStatus
 	// Driver is the converge.Driver the reconcile pass drives; the daemon wires

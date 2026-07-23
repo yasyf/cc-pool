@@ -74,6 +74,12 @@ type fixtureAccountRemoval struct {
 	deleteCredential bool
 }
 
+type fixtureAccountPreparer func(context.Context, store.Account) error
+
+func (prepare fixtureAccountPreparer) PrepareAccount(ctx context.Context, account store.Account) error {
+	return prepare(ctx, account)
+}
+
 func (r *fixtureAccountRemover) BeginAccountRemoval(id int, deleteCredential bool) (AccountRemoval, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -107,8 +113,9 @@ func (p fixtureAccountRemoval) Finish(ctx context.Context) error {
 }
 
 var (
-	_ AccountRemover = (*fixtureAccountRemover)(nil)
-	_ AccountRemoval = fixtureAccountRemoval{}
+	_ AccountRemover  = (*fixtureAccountRemover)(nil)
+	_ AccountRemoval  = fixtureAccountRemoval{}
+	_ AccountPreparer = fixtureAccountPreparer(nil)
 )
 
 // newMaterializeService wires a Service over a real temporary pool Manager,
@@ -140,6 +147,7 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 		StampDir: filepath.Join(t.TempDir(), "stamps"),
 		Run:      rec.run,
 		Remover:  &fixtureAccountRemover{m: m, fail: map[int]error{}},
+		Preparer: fixtureAccountPreparer(func(context.Context, store.Account) error { return nil }),
 	}
 	return s, m, fk, rec
 }
@@ -270,6 +278,38 @@ func TestMaterializeHappyPath(t *testing.T) {
 	// synckitd nudged with the manifest path.
 	if !recorded(rec, []string{"synckitd", "register", materializeManifest}) {
 		t.Fatalf("nudge calls = %v, want a synckitd register of %q", rec.calls, materializeManifest)
+	}
+}
+
+func TestMaterializeDoesNotReportSuccessBeforeTenantPreparation(t *testing.T) {
+	s, m, _, rec := newMaterializeService(t)
+	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{"oauthAccount":{"accountUuid":"PLAIN"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("presentation unavailable")
+	var prepared []store.Account
+	s.Preparer = fixtureAccountPreparer(func(_ context.Context, account store.Account) error {
+		prepared = append(prepared, account)
+		return wantErr
+	})
+	oauthAccount := json.RawMessage(`{"accountUuid":"u-prepare","emailAddress":"prepare@example.com"}`)
+	result, err := s.Materialize(
+		t.Context(),
+		materializeVal("u-prepare", "prepare@example.com", oauthAccount),
+		[]string{"hostB"}, pullConst(freshEnvelope("at-prepare")), materializeManifest,
+	)
+	if !errors.Is(err, wantErr) || result != (MaterializeResult{}) {
+		t.Fatalf("materialize before preparation = result %+v err %v", result, err)
+	}
+	if len(prepared) != 1 || prepared[0].ID != 1 || prepared[0].AccountUUID != "u-prepare" {
+		t.Fatalf("prepared accounts = %+v, want committed acct-01 with uuid", prepared)
+	}
+	row, readErr := m.Store.GetAccount(1)
+	if readErr != nil || row.AccountUUID != "u-prepare" {
+		t.Fatalf("durable account after preparation failure = %+v err %v", row, readErr)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("synckit nudge ran before tenant preparation: %v", rec.calls)
 	}
 }
 

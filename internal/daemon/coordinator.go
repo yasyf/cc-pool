@@ -85,12 +85,29 @@ func newTenantCoordinator(
 }
 
 func (c *tenantCoordinator) initialize(ctx context.Context) error {
-	// FuseKit recovers its paged desired fleet; cc-pool resumes only product-owned claims.
-	return recoverAccountRemovals(
+	if err := recoverAccountRemovals(
 		ctx,
 		c.server.m.Store.PageAccountRemovals,
 		c.finishRemoval,
-	)
+	); err != nil {
+		return err
+	}
+	accounts, err := c.server.m.Store.ListActiveAccounts()
+	if err != nil {
+		return fmt.Errorf("list active accounts for tenant recovery: %w", err)
+	}
+	group, groupContext := errgroup.WithContext(ctx)
+	group.SetLimit(tenantProvisionConcurrency)
+	for _, active := range accounts {
+		account := active
+		group.Go(func() error {
+			if _, err := c.prepare(groupContext, account); err != nil {
+				return fmt.Errorf("recover acct-%02d tenant: %w", account.ID, err)
+			}
+			return nil
+		})
+	}
+	return group.Wait()
 }
 
 func recoverAccountRemovals(

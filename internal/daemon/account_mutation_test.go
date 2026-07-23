@@ -21,6 +21,7 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/fusekit/catalogproto"
 )
 
 func TestAccountMutationStartOrAttachCoalescesExactIntentBeforeCredentialIO(t *testing.T) {
@@ -767,6 +768,38 @@ func TestAccountMutationReceiptIntentSurvivesDerivedLabelPublication(t *testing.
 	}
 }
 
+func TestCommittedAddPreparationFailsClosedAndRetries(t *testing.T) {
+	s, _, account := newAccountMutationTestServer(t, true)
+	wantErr := errors.New("presentation unavailable")
+	var calls atomic.Int64
+	s.prepareAccount = func(
+		_ context.Context,
+		got store.Account,
+	) (catalogproto.TenantPreparationProof, error) {
+		if got.ID != account.ID || got.InstanceID != account.InstanceID || got.Generation != account.Generation {
+			t.Fatalf("prepared account = %+v, want %+v", got, account)
+		}
+		if calls.Add(1) == 1 {
+			return catalogproto.TenantPreparationProof{}, wantErr
+		}
+		return catalogproto.TenantPreparationProof{}, nil
+	}
+	receipt := store.AccountMutationReceipt{
+		Kind: store.AccountMutationAdd, Terminal: store.AccountMutationCommitted,
+		AccountID: account.ID, AccountInstanceID: account.InstanceID,
+		AccountGeneration: account.Generation,
+	}
+	if err := s.prepareCommittedAccountMutation(t.Context(), receipt); !errors.Is(err, wantErr) {
+		t.Fatalf("first preparation = %v, want %v", err, wantErr)
+	}
+	if err := s.prepareCommittedAccountMutation(t.Context(), receipt); err != nil {
+		t.Fatalf("retry preparation: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("preparation calls = %d, want 2", calls.Load())
+	}
+}
+
 func newAccountMutationTestServer(
 	t *testing.T,
 	withAccount bool,
@@ -818,6 +851,9 @@ func newAccountMutationTestServer(
 	s := &Server{
 		m: m, log: log.New(io.Discard, "", 0), accountMutationLifetime: t.Context(),
 		accountMutationOwner: func() (proc.Record, error) { return owner, nil },
+		prepareAccount: func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error) {
+			return catalogproto.TenantPreparationProof{}, nil
+		},
 	}
 	if !withAccount {
 		return s, fake, store.Account{}

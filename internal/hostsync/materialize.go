@@ -48,6 +48,9 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	if emptyOAuth(v.OAuthAccount) {
 		return MaterializeResult{UUID: v.UUID, Deferred: true}, nil
 	}
+	if s.Preparer == nil {
+		return MaterializeResult{}, errors.New("hostsync: account preparer is required")
+	}
 
 	reservation, err := s.M.ReserveAdd()
 	if err != nil {
@@ -146,6 +149,13 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 
 	if err := s.M.Store.SetAccountUUID(acct.ID, v.UUID); err != nil {
 		return MaterializeResult{}, fmt.Errorf("materialize %s: backfill account uuid on acct-%d: %w", v.UUID, acct.ID, err)
+	}
+	committed, err := s.M.Store.GetAccount(acct.ID)
+	if err != nil {
+		return MaterializeResult{}, fmt.Errorf("materialize %s: read committed acct-%d: %w", v.UUID, acct.ID, err)
+	}
+	if err := s.Preparer.PrepareAccount(ctx, committed); err != nil {
+		return MaterializeResult{}, fmt.Errorf("materialize %s: prepare acct-%d tenant: %w", v.UUID, acct.ID, err)
 	}
 
 	// The new stamp dir is not watched yet; the nudge re-reads the manifest.

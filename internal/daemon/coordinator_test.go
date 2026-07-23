@@ -2,13 +2,13 @@ package daemon
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -111,6 +111,113 @@ type blockingLifecycleRuntime struct {
 	calls   int
 	active  int
 	maximum int
+}
+
+type fleetLifecycleRuntime struct {
+	mu          sync.Mutex
+	provisioned []string
+}
+
+func (r *fleetLifecycleRuntime) ProvisionTenant(
+	_ context.Context,
+	account tenantfs.Account,
+) (mountproto.ProvisionTenantResponse, error) {
+	id, err := account.TenantID()
+	if err != nil {
+		return mountproto.ProvisionTenantResponse{}, err
+	}
+	r.mu.Lock()
+	r.provisioned = append(r.provisioned, account.FileProviderDisplayName)
+	r.mu.Unlock()
+	return mountproto.ProvisionTenantResponse{
+		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+		TenantID: mountproto.TenantID(id), Generation: account.Generation,
+	}, nil
+}
+
+func (*fleetLifecycleRuntime) ReplaceTenant(
+	context.Context,
+	tenantfs.Account,
+	uint64,
+) (mountproto.ReplaceTenantResponse, error) {
+	return mountproto.ReplaceTenantResponse{}, errors.New("unexpected replace")
+}
+
+func (*fleetLifecycleRuntime) RemoveTenant(
+	context.Context,
+	tenantfs.Account,
+	uint64,
+) (mountproto.RemoveTenantResponse, error) {
+	return mountproto.RemoveTenantResponse{}, errors.New("unexpected remove")
+}
+
+func (*fleetLifecycleRuntime) TenantState(
+	context.Context,
+	tenantfs.Account,
+) (mountproto.StateResponse, error) {
+	return mountproto.StateResponse{}, remoteError(mountproto.ErrorCodeNotFound)
+}
+
+func (r *fleetLifecycleRuntime) provisionedAccounts() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.provisioned...)
+}
+
+type fleetSourcePreparer struct {
+	mu       sync.Mutex
+	started  chan string
+	release  <-chan struct{}
+	failName string
+	prepared []string
+	active   int
+	maximum  int
+}
+
+func (p *fleetSourcePreparer) Prepare(
+	ctx context.Context,
+	account tenantfs.Account,
+) (catalogproto.TenantPreparationProof, error) {
+	name := account.FileProviderDisplayName
+	p.mu.Lock()
+	p.prepared = append(p.prepared, name)
+	p.active++
+	if p.active > p.maximum {
+		p.maximum = p.active
+	}
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.active--
+		p.mu.Unlock()
+	}()
+	if p.started != nil {
+		p.started <- name
+	}
+	if p.release != nil {
+		select {
+		case <-p.release:
+		case <-ctx.Done():
+			return catalogproto.TenantPreparationProof{}, ctx.Err()
+		}
+	}
+	if name == p.failName {
+		return catalogproto.TenantPreparationProof{}, errors.New("injected prepare failure")
+	}
+	return catalogproto.TenantPreparationProof{}, nil
+}
+
+func (*fleetSourcePreparer) Validate(
+	tenantfs.Account,
+	catalogproto.TenantPreparationProof,
+) error {
+	return nil
+}
+
+func (p *fleetSourcePreparer) counts() (prepared []string, active, maximum int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.prepared...), p.active, p.maximum
 }
 
 func newBlockingLifecycleRuntime(total int) *blockingLifecycleRuntime {
@@ -244,36 +351,16 @@ func testTenantAccount(t *testing.T) (store.Account, tenantfs.Account, mountprot
 	return account, tenantAccount, mountproto.TenantID(tenantID)
 }
 
-func bulkInsertInactiveAccounts(t *testing.T, database string, total int) {
+func insertCoordinatorAccounts(t *testing.T, st *store.Store, total int) {
 	t.Helper()
-	db, err := sql.Open("sqlite", database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = db.Close() }()
-	tx, err := db.BeginTx(t.Context(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	statement, err := tx.PrepareContext(t.Context(), `
-		INSERT INTO accounts(
-			id,instance_id,generation,config_dir,keychain_service,keychain_account,created_at
-		) VALUES(?,?,?,?,?,?,?)`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = statement.Close() }()
 	for id := 1; id <= total; id++ {
-		if _, err := statement.ExecContext(
-			t.Context(), id, fmt.Sprintf("%032x", id), 1,
-			fmt.Sprintf("/accounts/%d", id), "service", "account", 1,
-		); err != nil {
+		if err := st.UpsertAccount(store.Account{
+			ID: id, InstanceID: fmt.Sprintf("%032x", id), Generation: 1,
+			ConfigDir:       pool.AccountPresentationDir(id),
+			KeychainService: "service", KeychainAccount: "account",
+		}); err != nil {
 			t.Fatalf("insert account %d: %v", id, err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -334,24 +421,143 @@ func TestPrepareProvisionsBeforeOnDemandConvergence(t *testing.T) {
 	_ = tenantAccount
 }
 
-func TestInitializeAdmissionDoesNotReplayHundredThousandInactiveAccounts(t *testing.T) {
+func TestInitializePreparesEveryActiveAccountWithBoundedFanout(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	database := filepath.Join(home, "pool-v1.db")
-	st, err := store.Open(database)
+	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
-	bulkInsertInactiveAccounts(t, database, 100_000)
-	runtime := &lifecycleRuntimeStub{provisionErr: errors.New("unexpected eager provision")}
+	const total = 20
+	insertCoordinatorAccounts(t, st, total)
+	runtime := &fleetLifecycleRuntime{}
+	release := make(chan struct{})
+	preparer := &fleetSourcePreparer{
+		started: make(chan string, total), release: release,
+	}
 	server := &Server{m: &pool.Manager{Store: st}}
-	coordinator := newTenantCoordinator(t.Context(), server, nil, runtime)
+	coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
+	done := make(chan error, 1)
+	go func() { done <- coordinator.initialize(t.Context()) }()
+	for range tenantProvisionConcurrency {
+		select {
+		case <-preparer.started:
+		case <-time.After(time.Second):
+			t.Fatal("startup preparation did not fill its bounded capacity")
+		}
+	}
+	select {
+	case name := <-preparer.started:
+		t.Fatalf("startup preparation exceeded bounded capacity with %s", name)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, active, maximum := preparer.counts(); active != tenantProvisionConcurrency || maximum != tenantProvisionConcurrency {
+		t.Fatalf("startup preparation concurrency = active %d maximum %d", active, maximum)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	prepared, active, maximum := preparer.counts()
+	provisioned := runtime.provisionedAccounts()
+	if len(prepared) != total || len(provisioned) != total || active != 0 || maximum != tenantProvisionConcurrency {
+		t.Fatalf(
+			"startup fleet = prepared %d provisioned %d active %d maximum %d",
+			len(prepared), len(provisioned), active, maximum,
+		)
+	}
+	slices.Sort(prepared)
+	slices.Sort(provisioned)
+	for id := 1; id <= total; id++ {
+		want := pool.AccountDirName(id)
+		if prepared[id-1] != want || provisioned[id-1] != want {
+			t.Fatalf("startup account %d = prepared %q provisioned %q, want %q", id, prepared[id-1], provisioned[id-1], want)
+		}
+	}
+}
+
+func TestInitializeRecoversRemovalBeforePreparingActiveFleet(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	insertCoordinatorAccounts(t, st, 2)
+	if err := os.MkdirAll(pool.AccountBackingDir(2), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.BeginAccountRemoval(2, true); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fleetLifecycleRuntime{}
+	preparer := &fleetSourcePreparer{}
+	server := &Server{
+		m: newDaemonTestManager(t, st, accountMutationTestRefresher{}, credstest.NewFake()),
+	}
+	coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
 	if err := coordinator.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if runtime.provisionCalls != 0 {
-		t.Fatalf("startup provision calls = %d, want 0", runtime.provisionCalls)
+	prepared, _, _ := preparer.counts()
+	provisioned := runtime.provisionedAccounts()
+	if !slices.Equal(prepared, []string{"acct-01"}) || !slices.Equal(provisioned, []string{"acct-01"}) {
+		t.Fatalf("active recovery = prepared %v provisioned %v, want only acct-01", prepared, provisioned)
+	}
+	if _, err := st.GetAccount(2); !errors.Is(err, store.ErrAccountNotFound) {
+		t.Fatalf("removed account after recovery = %v", err)
+	}
+}
+
+func TestInitializeFailureBlocksReadinessAndRestartRetriesFleet(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	insertCoordinatorAccounts(t, st, 2)
+	server := &Server{m: &pool.Manager{Store: st}}
+	release := make(chan struct{})
+	firstPreparer := &fleetSourcePreparer{
+		started: make(chan string, 2), release: release, failName: "acct-02",
+	}
+	first := newTenantCoordinator(t.Context(), server, firstPreparer, &fleetLifecycleRuntime{})
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- first.initialize(t.Context()) }()
+	for range 2 {
+		select {
+		case <-firstPreparer.started:
+		case <-time.After(time.Second):
+			t.Fatal("failed startup did not attempt the exact active fleet")
+		}
+	}
+	close(release)
+	if err := <-firstDone; err == nil {
+		t.Fatal("startup preparation failure reported readiness")
+	}
+	firstPrepared, _, _ := firstPreparer.counts()
+	slices.Sort(firstPrepared)
+	if !slices.Equal(firstPrepared, []string{"acct-01", "acct-02"}) {
+		t.Fatalf("failed startup prepared %v, want exact active fleet", firstPrepared)
+	}
+
+	restartRuntime := &fleetLifecycleRuntime{}
+	restartPreparer := &fleetSourcePreparer{}
+	restarted := newTenantCoordinator(t.Context(), server, restartPreparer, restartRuntime)
+	if err := restarted.initialize(t.Context()); err != nil {
+		t.Fatalf("restart recovery: %v", err)
+	}
+	retried, _, _ := restartPreparer.counts()
+	reprovisioned := restartRuntime.provisionedAccounts()
+	slices.Sort(retried)
+	slices.Sort(reprovisioned)
+	want := []string{"acct-01", "acct-02"}
+	if !slices.Equal(retried, want) || !slices.Equal(reprovisioned, want) {
+		t.Fatalf("restart fleet = prepared %v provisioned %v, want %v", retried, reprovisioned, want)
 	}
 }
 

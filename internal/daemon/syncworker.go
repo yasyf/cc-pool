@@ -83,6 +83,17 @@ func (r hostSyncWorkerRemoval) Finish(ctx context.Context) error {
 	return coordinator.finishRemoval(ctx, r.intent)
 }
 
+func (r *hostSyncWorkerRemover) PrepareAccount(ctx context.Context, account store.Account) error {
+	coordinator, err := r.runtime(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := coordinator.prepare(ctx, account); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -201,6 +212,7 @@ func newHostSyncWorkerRuntime(
 		Mesh:     hostsync.SynckitMesh{},
 		Sessions: hostSyncWorkerSessions{manager: manager},
 		Remover:  remover,
+		Preparer: remover,
 		Status:   converge.NewPeerStatus(),
 		Run:      manager.RunHostSyncCommand,
 	}
@@ -300,7 +312,8 @@ func classifyAuthKindOwner(origin, self string, peers []string) (store.AuthKind,
 }
 
 var (
-	_ hostsync.Sessions       = hostSyncWorkerSessions{}
-	_ hostsync.AccountRemover = (*hostSyncWorkerRemover)(nil)
-	_ hostsync.AccountRemoval = hostSyncWorkerRemoval{}
+	_ hostsync.Sessions        = hostSyncWorkerSessions{}
+	_ hostsync.AccountRemover  = (*hostSyncWorkerRemover)(nil)
+	_ hostsync.AccountRemoval  = hostSyncWorkerRemoval{}
+	_ hostsync.AccountPreparer = (*hostSyncWorkerRemover)(nil)
 )
