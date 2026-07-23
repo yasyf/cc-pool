@@ -33,7 +33,6 @@ const (
 type backingWorkerRequest struct {
 	Operation    backingWorkerOperation `json:"operation"`
 	AccountID    int                    `json:"account_id"`
-	ConfigDir    string                 `json:"config_dir"`
 	SourcePath   string                 `json:"source_path,omitempty"`
 	OAuthAccount json.RawMessage        `json:"oauth_account,omitempty"`
 }
@@ -108,12 +107,11 @@ func (m *Manager) runBackingWorker(
 func (m *Manager) prepareAccountBacking(
 	ctx context.Context,
 	accountID int,
-	configDir, sourcePath string,
+	sourcePath string,
 ) (SeedOutcome, error) {
 	response, err := m.runBackingWorker(ctx, backingWorkerRequest{
 		Operation:  backingWorkerPrepare,
 		AccountID:  accountID,
-		ConfigDir:  configDir,
 		SourcePath: sourcePath,
 	})
 	if err != nil {
@@ -127,11 +125,10 @@ func (m *Manager) prepareAccountBacking(
 	}
 }
 
-func (m *Manager) removeAccountBacking(ctx context.Context, accountID int, configDir string) error {
+func (m *Manager) removeAccountBacking(ctx context.Context, accountID int) error {
 	_, err := m.runBackingWorker(ctx, backingWorkerRequest{
 		Operation: backingWorkerRemove,
 		AccountID: accountID,
-		ConfigDir: configDir,
 	})
 	return err
 }
@@ -165,7 +162,7 @@ func RunBackingWorker(_ context.Context, input io.Reader, output io.Writer) erro
 		return fmt.Errorf("decode account backing request: %w", err)
 	}
 	response := backingWorkerResponse{}
-	backing, err := accountBackingPath(request.AccountID, request.ConfigDir)
+	backing, err := accountBackingPath(request.AccountID)
 	if err == nil {
 		switch request.Operation {
 		case backingWorkerPrepare:
@@ -195,13 +192,9 @@ func RunBackingWorker(_ context.Context, input io.Reader, output io.Writer) erro
 	return json.NewEncoder(output).Encode(response)
 }
 
-func accountBackingPath(accountID int, configDir string) (string, error) {
+func accountBackingPath(accountID int) (string, error) {
 	if accountID < 1 {
 		return "", errors.New("account backing request requires an account ID")
-	}
-	want := AccountDir(accountID)
-	if configDir != want {
-		return "", fmt.Errorf("account config dir %q does not match %q", configDir, want)
 	}
 	return AccountBackingDir(accountID), nil
 }

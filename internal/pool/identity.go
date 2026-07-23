@@ -28,12 +28,11 @@ func privateClaudeJSONPath(backingDir string) string {
 func (m *Manager) AccountIdentity(
 	ctx context.Context,
 	accountID int,
-	configDir string,
+	_ string,
 ) (*Identity, error) {
 	response, err := m.runBackingWorker(ctx, backingWorkerRequest{
 		Operation: backingWorkerReadIdentity,
 		AccountID: accountID,
-		ConfigDir: configDir,
 	})
 	if err != nil {
 		return nil, err
@@ -48,12 +47,11 @@ func (m *Manager) AccountIdentity(
 func (m *Manager) AccountOAuth(
 	ctx context.Context,
 	accountID int,
-	configDir string,
+	_ string,
 ) (json.RawMessage, *Identity, error) {
 	response, err := m.runBackingWorker(ctx, backingWorkerRequest{
 		Operation: backingWorkerReadOAuth,
 		AccountID: accountID,
-		ConfigDir: configDir,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -68,13 +66,12 @@ func (m *Manager) AccountOAuth(
 func (m *Manager) WriteIdentity(
 	ctx context.Context,
 	accountID int,
-	configDir string,
+	_ string,
 	oauthAccount json.RawMessage,
 ) error {
 	_, err := m.runBackingWorker(ctx, backingWorkerRequest{
 		Operation:    backingWorkerWriteIdentity,
 		AccountID:    accountID,
-		ConfigDir:    configDir,
 		OAuthAccount: oauthAccount,
 	})
 	return err

@@ -125,7 +125,7 @@ func TestReleaseAddRetainsCompletedLogin(t *testing.T) {
 func TestAccountIdentityAndWriteUseBackingOnly(t *testing.T) {
 	manager := newAccountManager(t)
 	accountID := 7
-	configDir := AccountDir(accountID)
+	configDir := filepath.Join(t.TempDir(), "File Provider", "CCPool", "acct-07")
 	backingDir := AccountBackingDir(accountID)
 	if err := os.MkdirAll(backingDir, 0o700); err != nil {
 		t.Fatal(err)

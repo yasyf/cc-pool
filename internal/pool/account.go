@@ -93,9 +93,7 @@ func (m *Manager) PrepareReservedAdd(
 		return nil, err
 	}
 	configDir := AccountDir(reservation.ID)
-	seed, err := m.prepareAccountBacking(
-		ctx, reservation.ID, configDir, ClaudeJSONPath(),
-	)
+	seed, err := m.prepareAccountBacking(ctx, reservation.ID, ClaudeJSONPath())
 	if err != nil {
 		return nil, fmt.Errorf("seed .claude.json for %s: %w", configDir, err)
 	}
@@ -197,9 +195,7 @@ func (m *Manager) AbandonAdd(ctx context.Context, pending *PendingAdd) error {
 		result = m.Creds.Store(account, creds.SourceKeychain).Delete(ctx)
 	}
 	result = errors.Join(result, m.Creds.Store(account, creds.SourceFile).Delete(ctx))
-	result = errors.Join(result, m.removeAccountBacking(
-		ctx, pending.Reservation.ID, pending.ConfigDir,
-	))
+	result = errors.Join(result, m.removeAccountBacking(ctx, pending.Reservation.ID))
 	return errors.Join(result, m.Store.ReleaseAccountIndex(pending.Reservation))
 }
 
@@ -227,7 +223,7 @@ func (m *Manager) Remove(ctx context.Context, id int, deleteCredential bool) err
 			return fmt.Errorf("cannot keep acct-%02d credential: it is stored in the private backing", id)
 		}
 	}
-	if err := m.removeAccountBacking(ctx, account.ID, account.ConfigDir); err != nil {
+	if err := m.removeAccountBacking(ctx, account.ID); err != nil {
 		return err
 	}
 	if deleteCredential {

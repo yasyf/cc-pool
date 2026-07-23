@@ -47,10 +47,17 @@ func writePoolTestExecutable(t *testing.T, path, contents string) {
 	}
 }
 
-func TestBackingWorkerRejectsMismatchedPresentationIdentity(t *testing.T) {
+func TestBackingWorkerUsesOnlyOpaqueAccountIdentity(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	if _, err := accountBackingPath(18, AccountDir(19)); err == nil {
-		t.Fatal("account backing worker accepted a mismatched presentation path")
+	got, err := accountBackingPath(18)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := AccountBackingDir(18); got != want {
+		t.Fatalf("account backing = %q, want %q", got, want)
+	}
+	if _, err := accountBackingPath(0); err == nil {
+		t.Fatal("account backing worker accepted an invalid account ID")
 	}
 }
 
@@ -102,9 +109,7 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 	defer cancel()
 	result := make(chan error, 1)
 	go func() {
-		_, prepareErr := manager.prepareAccountBacking(
-			ctx, 18, AccountDir(18), ClaudeJSONPath(),
-		)
+		_, prepareErr := manager.prepareAccountBacking(ctx, 18, ClaudeJSONPath())
 		result <- prepareErr
 	}()
 	var identity daemonproc.Identity
