@@ -28,8 +28,9 @@ type SyncedCredentialAdmission struct {
 type SyncedCredentialAdmissionStage struct {
 	AccountID int
 	SyncedCredentialAdmissionFence
-	StagedAt  time.Time
-	Finalized bool
+	StagedAt    time.Time
+	CandidateAt time.Time
+	Finalized   bool
 }
 
 func (fence SyncedCredentialAdmissionFence) validate(account Account) error {
@@ -81,7 +82,7 @@ func (s *Store) SyncedCredentialAdmission(account Account) (SyncedCredentialAdmi
 func (s *Store) PendingSyncedCredentialAdmission(account Account) (SyncedCredentialAdmissionStage, error) {
 	row := s.db.QueryRow(
 		`SELECT locator_digest,external_state_digest,token_chain_digest,
-		 access_hash_digest,staged_at
+		 access_hash_digest,staged_at,candidate_at
 		 FROM pending_synced_credential_admissions
 		 WHERE account_id=? AND account_instance_id=? AND account_generation=?`,
 		account.ID, account.InstanceID, account.Generation,
@@ -93,17 +94,21 @@ func (s *Store) PendingSyncedCredentialAdmission(account Account) (SyncedCredent
 		},
 	}
 	var locator, external, tokenChain, access []byte
-	var stagedAt int64
-	if err := row.Scan(&locator, &external, &tokenChain, &access, &stagedAt); err != nil {
+	var stagedAt, candidateAt int64
+	if err := row.Scan(&locator, &external, &tokenChain, &access, &stagedAt, &candidateAt); err != nil {
 		return SyncedCredentialAdmissionStage{}, err
 	}
 	if !copyCredentialDigest(&result.LocatorDigest, locator) ||
 		!copyCredentialDigest(&result.ExternalStateDigest, external) ||
 		!copyCredentialDigest(&result.TokenChainDigest, tokenChain) ||
-		!copyCredentialDigest(&result.AccessHashDigest, access) || stagedAt <= 0 {
+		!copyCredentialDigest(&result.AccessHashDigest, access) || stagedAt <= 0 ||
+		candidateAt < 0 || (candidateAt > 0 && candidateAt < stagedAt) {
 		return SyncedCredentialAdmissionStage{}, errors.New("pending synced credential admission evidence is corrupt")
 	}
 	result.StagedAt = time.Unix(0, stagedAt)
+	if candidateAt > 0 {
+		result.CandidateAt = time.Unix(0, candidateAt)
+	}
 	if err := result.SyncedCredentialAdmissionFence.validate(account); err != nil {
 		return SyncedCredentialAdmissionStage{}, err
 	}

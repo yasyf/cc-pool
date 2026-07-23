@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -108,7 +109,10 @@ func (m *Manager) admitSyncedCredential(
 		return false, err
 	}
 	if !credentialObservationHasPresent(observed) || tokenChain == nil {
-		return false, ErrCredentialChangedUnderfoot
+		return false, errors.Join(
+			ErrCredentialChangedUnderfoot,
+			m.reconcileChangedSyncedAdmission(account),
+		)
 	}
 	credential, _, err := m.ReadCredential(ctx, account)
 	if err != nil {
@@ -117,7 +121,10 @@ func (m *Manager) admitSyncedCredential(
 	if credential.HasRefreshToken() || !credential.Synced() ||
 		creds.AccessHash(credential) != expectedAccessHash ||
 		credentialTokenChainDigest(credential) != *tokenChain {
-		return false, ErrCredentialChangedUnderfoot
+		return false, errors.Join(
+			ErrCredentialChangedUnderfoot,
+			m.reconcileChangedSyncedAdmission(account),
+		)
 	}
 	if syncedAdmissionFailpoint != nil {
 		syncedAdmissionFailpoint("before-final-observation")
@@ -128,7 +135,10 @@ func (m *Manager) admitSyncedCredential(
 	}
 	if !sameStoreObservation(observed, verified) || verifiedTokenChain == nil ||
 		*verifiedTokenChain != *tokenChain {
-		return false, ErrCredentialChangedUnderfoot
+		return false, errors.Join(
+			ErrCredentialChangedUnderfoot,
+			m.reconcileChangedSyncedAdmission(account),
+		)
 	}
 	externalStateDigest, err := verified.Digest()
 	if err != nil {
@@ -167,32 +177,96 @@ func (m *Manager) admitSyncedCredential(
 		if syncedAdmissionFailpoint != nil {
 			syncedAdmissionFailpoint("after-post-stage-observation")
 		}
-		admitted, err := m.Store.FinalizeSyncedAccountAdmission(account, freshProof, fence)
+		candidate, err := m.Store.CommitSyncedAccountAdmissionCandidate(account, freshProof, fence)
 		if err != nil {
 			return false, err
 		}
-		if !admitted {
+		if !candidate {
 			return false, store.ErrAccountPresentationEvidence
 		}
+		if syncedAdmissionFailpoint != nil {
+			syncedAdmissionFailpoint("after-candidate")
+		}
 		if syncedAdmissionResultFailpoint != nil {
-			if err := syncedAdmissionResultFailpoint("after-finalize"); err != nil {
+			if err := syncedAdmissionResultFailpoint("after-candidate"); err != nil {
+				return false, err
+			}
+		}
+		postCandidate, postCandidateTokenChain, err := m.credentialTokenChainStateAtObservation(ctx, account)
+		if err != nil || !sameStoreObservation(verified, postCandidate) ||
+			postCandidateTokenChain == nil || *postCandidateTokenChain != *verifiedTokenChain {
+			rejectErr := m.Store.RejectSyncedAccountAdmissionCandidate(account, freshProof, fence)
+			if err != nil {
+				return false, errors.Join(err, rejectErr)
+			}
+			return false, errors.Join(ErrCredentialChangedUnderfoot, rejectErr)
+		}
+		if syncedAdmissionFailpoint != nil {
+			syncedAdmissionFailpoint("before-settle-observation")
+		}
+		settleObserved, settleTokenChain, err := m.credentialTokenChainStateAtObservation(ctx, account)
+		if err != nil || !sameStoreObservation(verified, settleObserved) ||
+			settleTokenChain == nil || *settleTokenChain != *verifiedTokenChain {
+			rejectErr := m.Store.RejectSyncedAccountAdmissionCandidate(account, freshProof, fence)
+			if err != nil {
+				return false, errors.Join(err, rejectErr)
+			}
+			return false, errors.Join(ErrCredentialChangedUnderfoot, rejectErr)
+		}
+		settled, err := m.Store.SettleSyncedAccountAdmission(account, freshProof, fence)
+		if err != nil {
+			return false, err
+		}
+		if !settled {
+			return false, store.ErrAccountPresentationEvidence
+		}
+		if syncedAdmissionFailpoint != nil {
+			syncedAdmissionFailpoint("after-settle")
+		}
+		if syncedAdmissionResultFailpoint != nil {
+			if err := syncedAdmissionResultFailpoint("after-settle"); err != nil {
 				return false, err
 			}
 		}
 	}
-	if syncedAdmissionFailpoint != nil {
-		syncedAdmissionFailpoint("before-post-finalize-observation")
+	return true, nil
+}
+
+func (m *Manager) reconcileChangedSyncedAdmission(account store.Account) error {
+	pending, err := m.Store.PendingSyncedCredentialAdmission(account)
+	if err == nil && pending.CandidateAt.IsZero() {
+		return nil
 	}
-	postFinalize, postFinalizeTokenChain, err := m.credentialTokenChainStateAtObservation(ctx, account)
-	if err == nil && sameStoreObservation(verified, postFinalize) &&
-		postFinalizeTokenChain != nil && *postFinalizeTokenChain == *verifiedTokenChain {
-		return true, nil
+	if err == nil {
+		presentation, presentationErr := m.Store.AccountPresentation(account.ID)
+		if presentationErr != nil {
+			return presentationErr
+		}
+		return m.Store.RejectSyncedAccountAdmissionCandidate(
+			account,
+			presentation.Proof,
+			pending.SyncedCredentialAdmissionFence,
+		)
 	}
-	reopenErr := m.Store.ReopenSyncedAccountAdmission(account, freshProof, fence)
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	final, err := m.Store.SyncedCredentialAdmission(account)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
-		return false, errors.Join(err, reopenErr)
+		return err
 	}
-	return false, errors.Join(ErrCredentialChangedUnderfoot, reopenErr)
+	presentation, err := m.Store.AccountPresentation(account.ID)
+	if err != nil {
+		return err
+	}
+	return m.Store.InvalidateSyncedAccountAdmission(
+		account,
+		presentation.Proof,
+		final.SyncedCredentialAdmissionFence,
+	)
 }
 
 func syncedAdmissionSignature(

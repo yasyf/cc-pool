@@ -179,13 +179,21 @@ func TestAdmitSyncedCredentialRetainsLiabilityAcrossExternalReplacementWindows(t
 	for _, checkpoint := range []string{
 		"after-stage",
 		"after-post-stage-observation",
-		"before-post-finalize-observation",
+		"after-candidate",
+		"before-settle-observation",
 	} {
 		t.Run(checkpoint, func(t *testing.T) {
 			manager, fake, account, currentProof, freshProof, credential, _ := syncedAdmissionFixture(t)
+			var eligibilityErr error
+			var origins []store.Account
+			var originsErr error
 			syncedAdmissionFailpoint = func(got string) {
 				if got != checkpoint {
 					return
+				}
+				if checkpoint == "after-candidate" {
+					eligibilityErr = manager.Store.SelectionEligible(account)
+					origins, originsErr = manager.Store.ListPublishableOrigins()
 				}
 				replacement := *credential
 				replacement.ClaudeAiOauth.AccessToken = "replacement-" + checkpoint
@@ -200,13 +208,21 @@ func TestAdmitSyncedCredentialRetainsLiabilityAcrossExternalReplacementWindows(t
 			if admitted || !errors.Is(err, ErrCredentialChangedUnderfoot) {
 				t.Fatalf("replacement admission = %v err=%v", admitted, err)
 			}
+			if checkpoint == "after-candidate" {
+				if !errors.Is(eligibilityErr, store.ErrAccountSelectionIneligible) {
+					t.Fatalf("pre-PID selection at candidate = %v", eligibilityErr)
+				}
+				if originsErr != nil || len(origins) != 0 {
+					t.Fatalf("origin publication at candidate = %+v err=%v", origins, originsErr)
+				}
+			}
 			assertSyncedAdmissionLiability(t, manager.Store, account, freshProof)
 		})
 	}
 }
 
-func TestAdmitSyncedCredentialRecoversLostStageAndFinalizeResponses(t *testing.T) {
-	for _, checkpoint := range []string{"after-stage", "after-finalize"} {
+func TestAdmitSyncedCredentialRecoversLostStageCandidateAndSettleResponses(t *testing.T) {
+	for _, checkpoint := range []string{"after-stage", "after-candidate", "after-settle"} {
 		t.Run(checkpoint, func(t *testing.T) {
 			manager, _, account, currentProof, freshProof, credential, databasePath := syncedAdmissionFixture(t)
 			lost := errors.New("injected " + checkpoint + " response loss")
@@ -223,9 +239,12 @@ func TestAdmitSyncedCredentialRecoversLostStageAndFinalizeResponses(t *testing.T
 			if admitted || !errors.Is(err, lost) {
 				t.Fatalf("lost response admission = %v err=%v", admitted, err)
 			}
-			if checkpoint == "after-stage" {
+			switch checkpoint {
+			case "after-stage":
 				assertSyncedAdmissionLiability(t, manager.Store, account, freshProof)
-			} else {
+			case "after-candidate":
+				assertSyncedAdmissionCandidate(t, manager.Store, account, freshProof)
+			case "after-settle":
 				assertSyncedAdmissionFinal(t, manager.Store, account, freshProof)
 			}
 			if err := manager.Store.Close(); err != nil {
@@ -246,6 +265,116 @@ func TestAdmitSyncedCredentialRecoversLostStageAndFinalizeResponses(t *testing.T
 			}
 			assertSyncedAdmissionFinal(t, reopened, account, freshProof)
 		})
+	}
+}
+
+func TestAdmitSyncedCredentialReopensCandidateAfterReplacementAndLostResponse(t *testing.T) {
+	manager, fake, account, currentProof, freshProof, credential, databasePath := syncedAdmissionFixture(t)
+	lost := errors.New("injected candidate response loss")
+	syncedAdmissionFailpoint = func(got string) {
+		if got != "after-candidate" {
+			return
+		}
+		replacement := *credential
+		replacement.ClaudeAiOauth.AccessToken = "replacement-after-candidate-loss"
+		replacement.ClaudeAiOauth.RefreshToken = "owned-after-candidate-loss"
+		fake.Put(account.KeychainService, account.KeychainAccount, &replacement)
+	}
+	syncedAdmissionResultFailpoint = func(got string) error {
+		if got == "after-candidate" {
+			return lost
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		syncedAdmissionFailpoint = nil
+		syncedAdmissionResultFailpoint = nil
+	})
+	admitted, err := manager.AdmitSyncedCredential(
+		t.Context(), account, currentProof, freshProof, creds.AccessHash(credential),
+	)
+	if admitted || !errors.Is(err, lost) {
+		t.Fatalf("lost candidate response admission = %v err=%v", admitted, err)
+	}
+	assertSyncedAdmissionCandidate(t, manager.Store, account, freshProof)
+	if err := manager.Store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	manager.Store = reopened
+	syncedAdmissionFailpoint = nil
+	syncedAdmissionResultFailpoint = nil
+	admitted, err = manager.AdmitSyncedCredential(
+		t.Context(), account, currentProof, freshProof, creds.AccessHash(credential),
+	)
+	if admitted || !errors.Is(err, ErrCredentialChangedUnderfoot) {
+		t.Fatalf("replacement recovery admission = %v err=%v", admitted, err)
+	}
+	assertSyncedAdmissionLiability(t, reopened, account, freshProof)
+}
+
+func TestAdmitSyncedCredentialInvalidatesSettledEvidenceAfterReplacementAndLostResponse(t *testing.T) {
+	manager, fake, account, currentProof, freshProof, credential, databasePath := syncedAdmissionFixture(t)
+	lost := errors.New("injected settle response loss")
+	syncedAdmissionFailpoint = func(got string) {
+		if got != "after-settle" {
+			return
+		}
+		replacement := *credential
+		replacement.ClaudeAiOauth.AccessToken = "replacement-after-settle-loss"
+		replacement.ClaudeAiOauth.RefreshToken = "owned-after-settle-loss"
+		fake.Put(account.KeychainService, account.KeychainAccount, &replacement)
+	}
+	syncedAdmissionResultFailpoint = func(got string) error {
+		if got == "after-settle" {
+			return lost
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		syncedAdmissionFailpoint = nil
+		syncedAdmissionResultFailpoint = nil
+	})
+	admitted, err := manager.AdmitSyncedCredential(
+		t.Context(), account, currentProof, freshProof, creds.AccessHash(credential),
+	)
+	if admitted || !errors.Is(err, lost) {
+		t.Fatalf("lost settle response admission = %v err=%v", admitted, err)
+	}
+	assertSyncedAdmissionFinal(t, manager.Store, account, freshProof)
+	if err := manager.Store.ActivateSelection(store.SelectionActivation{
+		Token:     "abcdef0123456789abcdef0123456789",
+		AccountID: account.ID, ExpectedInstanceID: account.InstanceID,
+		ExpectedGeneration: account.Generation,
+		Process:            store.ProcessIdentity{PID: os.Getpid(), StartedAt: time.Now()},
+		ConfigDir:          account.ConfigDir,
+	}); err != nil {
+		t.Fatalf("activate existing session before drift reconciliation: %v", err)
+	}
+	if err := manager.Store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	manager.Store = reopened
+	syncedAdmissionFailpoint = nil
+	syncedAdmissionResultFailpoint = nil
+	admitted, err = manager.AdmitSyncedCredential(
+		t.Context(), account, currentProof, freshProof, creds.AccessHash(credential),
+	)
+	if admitted || !errors.Is(err, ErrCredentialChangedUnderfoot) {
+		t.Fatalf("settled replacement recovery = %v err=%v", admitted, err)
+	}
+	assertSyncedAdmissionLiability(t, reopened, account, freshProof)
+	if active, err := reopened.ActiveSessionCount(account.ID); err != nil || active != 1 {
+		t.Fatalf("existing session after drift reconciliation = %d err=%v", active, err)
 	}
 }
 
@@ -414,11 +543,48 @@ func assertSyncedAdmissionLiability(
 	}
 	pending, err := st.PendingSyncedCredentialAdmission(account)
 	if err != nil || pending.AccountID != account.ID || pending.Finalized ||
-		pending.ExternalStateDigest == ([32]byte{}) {
+		!pending.CandidateAt.IsZero() || pending.ExternalStateDigest == ([32]byte{}) {
 		t.Fatalf("pending liability = %+v err=%v", pending, err)
 	}
 	if _, err := st.SyncedCredentialAdmission(account); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("final evidence exists beside pending liability: %v", err)
+	}
+	if err := st.SelectionEligible(account); !errors.Is(err, store.ErrAccountSelectionIneligible) {
+		t.Fatalf("pending liability was selection eligible: %v", err)
+	}
+	if origins, err := st.ListPublishableOrigins(); err != nil || len(origins) != 0 {
+		t.Fatalf("pending liability was publishable: %+v err=%v", origins, err)
+	}
+}
+
+func assertSyncedAdmissionCandidate(
+	t *testing.T,
+	st *store.Store,
+	account store.Account,
+	wantProof store.PresentationPreparationProof,
+) {
+	t.Helper()
+	health, err := st.GetAuthHealth(account.ID)
+	if err != nil || !health.NeedsLogin || health.Kind != store.AuthKindAwaitingOrigin {
+		t.Fatalf("candidate health = %+v err=%v", health, err)
+	}
+	presentation, err := st.AccountPresentation(account.ID)
+	if err != nil || presentation.Proof != wantProof {
+		t.Fatalf("candidate proof = %+v err=%v", presentation, err)
+	}
+	pending, err := st.PendingSyncedCredentialAdmission(account)
+	if err != nil || pending.AccountID != account.ID || pending.CandidateAt.IsZero() ||
+		pending.ExternalStateDigest == ([32]byte{}) {
+		t.Fatalf("candidate evidence = %+v err=%v", pending, err)
+	}
+	if _, err := st.SyncedCredentialAdmission(account); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("final evidence exists beside candidate: %v", err)
+	}
+	if err := st.SelectionEligible(account); !errors.Is(err, store.ErrAccountSelectionIneligible) {
+		t.Fatalf("candidate was selection eligible: %v", err)
+	}
+	if origins, err := st.ListPublishableOrigins(); err != nil || len(origins) != 0 {
+		t.Fatalf("candidate was publishable: %+v err=%v", origins, err)
 	}
 }
 

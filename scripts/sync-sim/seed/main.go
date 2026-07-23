@@ -210,11 +210,18 @@ func cmdAccount(args []string) error {
 	if _, err := db.StageSyncedAccountAdmission(acct, proof, freshProof, admissionFence); err != nil {
 		return fmt.Errorf("stage account admission: %w", err)
 	}
-	admitted, err := db.FinalizeSyncedAccountAdmission(acct, freshProof, admissionFence)
+	candidate, err := db.CommitSyncedAccountAdmissionCandidate(acct, freshProof, admissionFence)
 	if err != nil {
-		return fmt.Errorf("admit account row: %w", err)
+		return fmt.Errorf("commit account admission candidate: %w", err)
 	}
-	if !admitted {
+	if !candidate {
+		return errors.New("commit account admission candidate: exact candidate was not stored")
+	}
+	settled, err := db.SettleSyncedAccountAdmission(acct, freshProof, admissionFence)
+	if err != nil {
+		return fmt.Errorf("settle account admission: %w", err)
+	}
+	if !settled {
 		return errors.New("admit account row: awaiting-origin state was not cleared")
 	}
 	fmt.Printf("seeded acct-%02d uuid=%s hash=%s\n", *id, *uuid, creds.AccessHash(cred))

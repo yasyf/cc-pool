@@ -50,11 +50,18 @@ func admitCLITestAccount(t *testing.T, database *store.Store, requested store.Ac
 		if _, err := database.StageSyncedAccountAdmission(account, proof, fresh, fence); err != nil {
 			t.Fatal(err)
 		}
-		admitted, err := database.FinalizeSyncedAccountAdmission(account, fresh, fence)
+		candidate, err := database.CommitSyncedAccountAdmissionCandidate(account, fresh, fence)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !admitted {
+		if !candidate {
+			t.Fatal("synced fixture did not commit admission candidate")
+		}
+		settled, err := database.SettleSyncedAccountAdmission(account, fresh, fence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !settled {
 			t.Fatal("synced fixture did not clear awaiting-origin state")
 		}
 		if reservation.ID == requested.ID {

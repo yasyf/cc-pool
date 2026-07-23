@@ -412,7 +412,8 @@ CREATE TABLE pending_synced_credential_admissions (
 	external_state_digest    BLOB NOT NULL CHECK(length(external_state_digest) = 32 AND external_state_digest <> zeroblob(32)),
 	token_chain_digest       BLOB NOT NULL CHECK(length(token_chain_digest) = 32 AND token_chain_digest <> zeroblob(32)),
 	access_hash_digest       BLOB NOT NULL CHECK(length(access_hash_digest) = 32 AND access_hash_digest <> zeroblob(32)),
-	staged_at                INTEGER NOT NULL CHECK(staged_at > 0)
+	staged_at                INTEGER NOT NULL CHECK(staged_at > 0),
+	candidate_at             INTEGER NOT NULL CHECK(candidate_at = 0 OR candidate_at >= staged_at)
 );
 CREATE TABLE account_presentations (
   account_id              INTEGER PRIMARY KEY CHECK(account_id > 0),
