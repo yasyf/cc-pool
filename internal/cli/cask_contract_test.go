@@ -56,14 +56,35 @@ func TestStatusCaskPinsFixedFileProviderApp(t *testing.T) {
 	if strings.Contains(strings.ToLower(cask), "fuse-t") {
 		t.Fatal("status cask retains a native FUSE dependency")
 	}
-	if got := strings.Count(cask, "/Applications/__APP_NAME__.app"); got != 4 {
-		t.Fatalf("fixed application path occurrences = %d, want 4", got)
+	if got := strings.Count(cask, "/Applications/__APP_NAME__.app"); got != 3 {
+		t.Fatalf("fixed application path occurrences = %d, want 3", got)
 	}
 	register := strings.Index(cask, `args: ["-a", "/Applications/__APP_NAME__.app/Contents/PlugIns/CCPoolFileProvider.appex"], must_succeed: true`)
 	elect := strings.Index(cask, `args: ["-e", "use", "-i", "com.yasyf.cc-pool.status.fileprovider"], must_succeed: true`)
 	start := strings.Index(cask, `args: ["service", "install"]`)
 	if register < 0 || elect < register || start < elect {
 		t.Fatal("status cask does not fail-closed register and elect File Provider before daemon start")
+	}
+}
+
+func TestStatusCaskPreservesGatekeeperQuarantine(t *testing.T) {
+	cask := readReleaseContract(t, ".github", "cask", "cc-pool-status.rb.tmpl")
+	for _, forbidden := range []string{"xattr", "com.apple.quarantine", "--no-quarantine"} {
+		if strings.Contains(strings.ToLower(cask), forbidden) {
+			t.Fatalf("status cask bypasses Gatekeeper with %q", forbidden)
+		}
+	}
+	release := readReleaseContract(t, ".github", "workflows", "release.yml")
+	for _, required := range []string{
+		"Require CLI signing and notarization secrets",
+		"bash \"$GITHUB_WORKSPACE/scripts/assert-signed-topology.sh\"",
+		"xcrun stapler validate app/CCPoolStatus.app",
+		"spctl --assess --type execute --verbose=4 app/CCPoolStatus.app",
+		"! grep -Eiq 'xattr|com\\.apple\\.quarantine|--no-quarantine' \"$template\"",
+	} {
+		if !strings.Contains(release, required) {
+			t.Fatalf("release workflow is missing Gatekeeper contract %q", required)
+		}
 	}
 }
 

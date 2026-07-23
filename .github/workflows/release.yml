@@ -276,6 +276,7 @@ jobs:
           template=.github/cask/cc-pool-status.rb.tmpl
           grep -Eq '^[[:space:]]*app[[:space:]]+' "$template"
           ! grep -Eq '^[[:space:]]*binary[[:space:]]+' "$template"
+          ! grep -Eiq 'xattr|com\.apple\.quarantine|--no-quarantine' "$template"
 
       - name: Render the formula into the atomic tap transaction
         uses: yasyf/homebrew-tap/.github/actions/render-formula@f45550932b0c8a42eb04e9ab0e5de8f82ad78b6a
