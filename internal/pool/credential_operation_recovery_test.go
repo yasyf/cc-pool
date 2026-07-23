@@ -1449,9 +1449,8 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 		account.KeychainService, account.KeychainAccount, filePath,
 	)
 	accountIntent := credentialIntentDigest(store.CredentialOperationCompensate, "pending-add")
-	accountOperationID, err := store.NewAccountMutationID(
-		account.ID, account.InstanceID, account.Generation, store.AccountMutationAdd,
-		locator, emptyDigest, accountIntent,
+	accountOperationID, err := store.NewPendingAddMutationID(
+		account.ID, account.InstanceID, account.Generation, accountIntent,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1459,15 +1458,20 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 	begin, err := st.BeginAccountMutation(t.Context(), store.BeginAccountMutationRequest{
 		OperationID: accountOperationID, AccountID: account.ID, Kind: store.AccountMutationAdd,
 		AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation,
-		LocatorDigest: locator, ExpectedCredentialDigest: emptyDigest, IntentDigest: accountIntent,
-		ConfigDir: account.ConfigDir, KeychainService: account.KeychainService,
-		KeychainAccount: account.KeychainAccount, Owner: manager.workers.owner,
+		IntentDigest: accountIntent, Owner: manager.workers.owner,
 	})
 	if err != nil || begin.Active == nil {
 		t.Fatalf("begin pending Add = %+v err=%v", begin, err)
 	}
-	fence, err := st.MarkAccountMutationInputProvided(
-		begin.Active.Fence(), credentialIntentDigest(store.CredentialOperationCompensate, "input"),
+	fence, err := st.BindAccountMutationPresentation(
+		begin.Active.Fence(), account.ConfigDir, account.KeychainService,
+		account.KeychainAccount, locator, emptyDigest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err = st.MarkAccountMutationInputProvided(
+		fence, credentialIntentDigest(store.CredentialOperationCompensate, "input"),
 	)
 	if err != nil {
 		t.Fatal(err)

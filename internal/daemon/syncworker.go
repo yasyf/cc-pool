@@ -83,15 +83,27 @@ func (r hostSyncWorkerRemoval) Finish(ctx context.Context) error {
 	return coordinator.finishRemoval(ctx, r.intent)
 }
 
-func (r *hostSyncWorkerRemover) PrepareAccount(ctx context.Context, account store.Account) error {
+func (r *hostSyncWorkerRemover) PrepareReservedAccount(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+	label string,
+) (string, error) {
 	coordinator, err := r.runtime(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if _, err := coordinator.prepare(ctx, account); err != nil {
-		return err
+	account := store.Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation, Label: label,
 	}
-	return nil
+	proof, err := coordinator.prepare(ctx, account)
+	if err != nil {
+		return "", err
+	}
+	if err := coordinator.activatePrepared(ctx, account, proof, func() error { return nil }); err != nil {
+		return "", err
+	}
+	return tenantfs.FileProviderPublicPath(proof)
 }
 
 func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator, error) {

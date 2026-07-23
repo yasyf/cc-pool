@@ -112,6 +112,23 @@ func consumeReservation(e rowExecer, reservation PendingAccountReservation) erro
 // the index free between the two. A reservation already gone (released or
 // swept) fails loud and writes no row.
 func (s *Store) PromoteReservedAccount(reservation PendingAccountReservation, a Account) error {
+	return s.promoteReservedAccount(reservation, a, false)
+}
+
+// PromoteReservedSyncedAccount atomically publishes a non-origin row as
+// awaiting its first access-only credential.
+func (s *Store) PromoteReservedSyncedAccount(reservation PendingAccountReservation, a Account) error {
+	if a.AccountUUID == "" {
+		return errors.New("promote synced account: external UUID is required")
+	}
+	return s.promoteReservedAccount(reservation, a, true)
+}
+
+func (s *Store) promoteReservedAccount(
+	reservation PendingAccountReservation,
+	a Account,
+	awaitingOrigin bool,
+) error {
 	if err := validatePendingReservationFence(reservation); err != nil {
 		return err
 	}
@@ -126,6 +143,19 @@ func (s *Store) PromoteReservedAccount(reservation PendingAccountReservation, a 
 	defer func() { _ = tx.Rollback() }()
 	if err := consumeReservation(tx, reservation); err != nil {
 		return err
+	}
+	if a.AccountUUID != "" {
+		var duplicateID int
+		err := tx.QueryRow(
+			`SELECT id FROM accounts WHERE account_uuid=? AND deleted_at IS NULL LIMIT 1`,
+			a.AccountUUID,
+		).Scan(&duplicateID)
+		if err == nil {
+			return fmt.Errorf("%w: %q already belongs to account %d", ErrDuplicateAccountUUID, a.AccountUUID, duplicateID)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 	}
 	created := a.CreatedAt
 	if created.IsZero() {
@@ -145,6 +175,16 @@ func (s *Store) PromoteReservedAccount(reservation PendingAccountReservation, a 
 			return fmt.Errorf("promote account %d: %w", a.ID, err)
 		}
 		return fmt.Errorf("promote account %d: inserted %d rows", a.ID, rows)
+	}
+	if awaitingOrigin {
+		digest := DigestReason("host-sync: awaiting origin credential")
+		if _, err := tx.Exec(
+			`INSERT INTO auth_health(account_id,needs_login,since,reason,digest,kind,gen)
+			 VALUES(?,1,?,'awaiting_origin',?,'awaiting_origin',1)`,
+			a.ID, s.now().Unix(), digest[:],
+		); err != nil {
+			return fmt.Errorf("promote synced account %d auth health: %w", a.ID, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("promote account %d: %w", a.ID, err)

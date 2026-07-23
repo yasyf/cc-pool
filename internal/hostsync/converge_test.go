@@ -326,11 +326,7 @@ func TestTeardownRegistryFencePrecedesRemovalIntent(t *testing.T) {
 	}
 }
 
-// TestTeardownRefusesAmbiguousUUID pins the duplicate-uuid guard: a tombstone
-// whose uuid resolves to more than one local row is deferred loudly instead of
-// serially destroying every row that shares the uuid.
-func TestTeardownRefusesAmbiguousUUID(t *testing.T) {
-	ctx := context.Background()
+func TestTeardownDuplicateUUIDCannotBeCreated(t *testing.T) {
 	s, m, _, _ := newMaterializeService(t)
 	const uuid = "u-dup"
 	_, configDir, _ := materializeForTeardown(t, s, m, uuid)
@@ -341,27 +337,14 @@ func TestTeardownRefusesAmbiguousUUID(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Store.SetAccountUUID(99, uuid); err != nil {
-		t.Fatal(err)
-	}
-
-	s.Sessions = fakeSessions{busy: map[string]bool{}}
-
-	res, err := s.Converge(ctx, "")
-	if err != nil {
-		t.Fatalf("Converge: %v", err)
-	}
-	if res.SkippedBusy != 1 || res.Converged != 0 {
-		t.Fatalf("result = %+v, want SkippedBusy 1 / Converged 0", res)
-	}
-	if calls := s.Remover.(*fixtureAccountRemover).callsSnapshot(); len(calls) != 0 {
-		t.Errorf("removal calls = %v; an ambiguous uuid must be refused", calls)
+	if err := m.Store.SetAccountUUID(99, uuid); !errors.Is(err, store.ErrDuplicateAccountUUID) {
+		t.Fatalf("duplicate uuid = %v", err)
 	}
 	rows, err := m.Store.AccountsByUUID(uuid)
-	if err != nil || len(rows) != 2 {
-		t.Errorf("rows sharing the uuid = %d (err %v), want both to survive", len(rows), err)
+	if err != nil || len(rows) != 1 {
+		t.Errorf("rows sharing the uuid = %d (err %v), want exactly one", len(rows), err)
 	}
 	if _, err := os.Stat(configDir); err != nil {
-		t.Errorf("account dir destroyed despite the ambiguity: %v", err)
+		t.Errorf("account dir destroyed after rejected duplicate: %v", err)
 	}
 }

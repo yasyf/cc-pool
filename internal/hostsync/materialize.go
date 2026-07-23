@@ -2,6 +2,7 @@ package hostsync
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -51,14 +52,30 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	if s.Preparer == nil {
 		return MaterializeResult{}, errors.New("hostsync: account preparer is required")
 	}
+	if err := validateMaterializeIdentity(v); err != nil {
+		return MaterializeResult{}, err
+	}
+	if err := rejectExistingExternalUUID(ctx, s.M, v.UUID); err != nil {
+		return MaterializeResult{}, err
+	}
 
 	reservation, err := s.M.ReserveAdd()
 	if err != nil {
 		return MaterializeResult{}, err
 	}
-	p, err := s.M.PrepareReservedAdd(ctx, reservation)
+	releaseReservation := func(cause error) (MaterializeResult, error) {
+		if rerr := s.M.Store.ReleaseAccountIndex(reservation); rerr != nil {
+			return MaterializeResult{}, errors.Join(cause, fmt.Errorf("release %s: %w", v.UUID, rerr))
+		}
+		return MaterializeResult{}, cause
+	}
+	publicPath, err := s.Preparer.PrepareReservedAccount(ctx, reservation, v.Label)
 	if err != nil {
-		return MaterializeResult{}, fmt.Errorf("materialize %s: prepare add: %w", v.UUID, err)
+		return releaseReservation(fmt.Errorf("materialize %s: prepare presentation: %w", v.UUID, err))
+	}
+	p, err := s.M.PrepareReservedAdd(ctx, reservation, publicPath)
+	if err != nil {
+		return releaseReservation(fmt.Errorf("materialize %s: prepare add: %w", v.UUID, err))
 	}
 
 	// Every failure past PrepareAdd must roll the dir and reservation back —
@@ -126,47 +143,81 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	case !env.Synced():
 		return release(fmt.Errorf("materialize %s: %w", v.UUID, pool.ErrEnvelopeNoAccessToken))
 	}
-
-	fileFallback, err := s.installEnvelope(ctx, p, env)
-	switch {
-	// A credential landed (or a backend became unprovable) under the pull:
-	// AbandonAdd would delete it — release keeps it.
-	case errors.Is(err, pool.ErrCredentialChangedUnderfoot), errors.Is(err, pool.ErrCredentialUnverifiable):
-		return release(fmt.Errorf("materialize %s: install credential: %w", v.UUID, err))
-	case err != nil:
-		return abandon(fmt.Errorf("materialize %s: install credential: %w", v.UUID, err))
+	retained, err := s.slotRetainsCredential(ctx, p)
+	if err != nil && !errors.Is(err, creds.ErrUnavailable) {
+		return release(fmt.Errorf("materialize %s: recheck credential slot: %w", v.UUID, err))
+	}
+	if retained {
+		return release(fmt.Errorf("materialize %s: %w", v.UUID, pool.ErrCredentialChangedUnderfoot))
 	}
 
-	acct, err := s.M.FinalizeAdd(ctx, p, v.Label)
-	if acct == nil {
-		// A hard finalize failure leaves no row: roll the dir + reservation back.
-		return abandon(fmt.Errorf("materialize %s: finalize: %w", v.UUID, err))
+	if err := rejectExistingExternalUUID(ctx, s.M, v.UUID); err != nil {
+		return abandon(err)
 	}
+	acct, err := s.M.PromoteSyncedAdd(ctx, p, v.Label, v.UUID)
 	if err != nil {
-		// The row landed; only best-effort usage validation failed — keep the account.
-		s.logf("hostsync: materialized %s (acct-%d) but usage validation failed: %v", v.UUID, acct.ID, err)
+		return abandon(fmt.Errorf("materialize %s: publish awaiting-origin row: %w", v.UUID, err))
 	}
-
-	if err := s.M.Store.SetAccountUUID(acct.ID, v.UUID); err != nil {
-		return MaterializeResult{}, fmt.Errorf("materialize %s: backfill account uuid on acct-%d: %w", v.UUID, acct.ID, err)
-	}
-	committed, err := s.M.Store.GetAccount(acct.ID)
+	durable := MaterializeResult{UUID: v.UUID, AccountID: acct.ID, Bootstrapped: bootstrapped}
+	installed, err := s.M.InstallSyncedCredential(ctx, *acct, env)
 	if err != nil {
-		return MaterializeResult{}, fmt.Errorf("materialize %s: read committed acct-%d: %w", v.UUID, acct.ID, err)
+		return durable, fmt.Errorf("materialize %s: install access-only credential: %w", v.UUID, err)
 	}
-	if err := s.Preparer.PrepareAccount(ctx, committed); err != nil {
-		return MaterializeResult{}, fmt.Errorf("materialize %s: prepare acct-%d tenant: %w", v.UUID, acct.ID, err)
+	if !installed {
+		return durable, fmt.Errorf("materialize %s: access-only credential did not land", v.UUID)
+	}
+	credential, source, err := s.M.ReadCredential(ctx, *acct)
+	if err != nil {
+		return durable, fmt.Errorf("materialize %s: read installed credential: %w", v.UUID, err)
+	}
+	if credential.HasRefreshToken() || !credential.Synced() ||
+		creds.AccessHash(credential) != creds.AccessHash(env) {
+		return durable, fmt.Errorf("materialize %s: installed credential violates origin policy", v.UUID)
+	}
+	durable.FileFallback = source == creds.SourceFile
+	if _, _, _, err := s.M.SampleUsage(ctx, *acct, pool.SampleOpts{AllowRefresh: false}); err != nil {
+		return durable, fmt.Errorf("materialize %s: validate access-only credential: %w", v.UUID, err)
+	}
+	if _, err := s.M.Store.ClearNeedsLogin(acct.ID); err != nil {
+		return durable, fmt.Errorf("materialize %s: activate validated credential: %w", v.UUID, err)
 	}
 
 	// The new stamp dir is not watched yet; the nudge re-reads the manifest.
 	s.NudgeSynckitd(ctx, manifestPath)
 
-	return MaterializeResult{
-		UUID:         v.UUID,
-		AccountID:    acct.ID,
-		FileFallback: fileFallback,
-		Bootstrapped: bootstrapped,
-	}, nil
+	return durable, nil
+}
+
+func validateMaterializeIdentity(value AccountValue) error {
+	var identity struct {
+		AccountUUID string `json:"accountUuid"`
+	}
+	if err := json.Unmarshal(value.OAuthAccount, &identity); err != nil {
+		return fmt.Errorf("hostsync: decode oauthAccount for %s: %w", value.UUID, err)
+	}
+	if identity.AccountUUID == "" || identity.AccountUUID != value.UUID {
+		return fmt.Errorf(
+			"hostsync: oauthAccount UUID mismatch: registry %q, identity %q",
+			value.UUID, identity.AccountUUID,
+		)
+	}
+	return nil
+}
+
+func rejectExistingExternalUUID(ctx context.Context, manager *pool.Manager, uuid string) error {
+	rows, err := scanLocalAccounts(ctx, manager)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if row.uuid == uuid {
+			return fmt.Errorf(
+				"%w: %q already exists on acct-%02d",
+				store.ErrDuplicateAccountUUID, uuid, row.acct.ID,
+			)
+		}
+	}
+	return nil
 }
 
 // slotAccount is the pending slot's credential coordinates; Discover adopts
@@ -208,49 +259,4 @@ func (s *Service) slotRetainsCredential(
 		}
 	}
 	return false, nil
-}
-
-// installEnvelope writes the pulled stripped credential to the Keychain,
-// falling back to the file store when the login keychain is unsearchable (the
-// returned bool flags the fallback), under the same owned-precedence guard as
-// pool.InstallSyncedCredential — ccn note e30f860.
-func (s *Service) installEnvelope(ctx context.Context, p *pool.PendingAdd, env *creds.Credential) (bool, error) {
-	switch {
-	case env.HasRefreshToken():
-		return false, fmt.Errorf("install credential envelope: %w", pool.ErrEnvelopeCarriesSecret)
-	case !env.Synced():
-		return false, fmt.Errorf("install credential envelope: %w", pool.ErrEnvelopeNoAccessToken)
-	}
-	// PendingAdd is the durable exclusive reservation for this not-yet-created
-	// account. No account mutex or flock spans the credential I/O.
-	acct, err := s.slotAccount(ctx, p)
-	if err != nil {
-		return false, err
-	}
-	kc := s.M.Creds.Store(acct, creds.SourceKeychain)
-	file := s.M.Creds.Store(acct, creds.SourceFile)
-	target, fileFallback := kc, false
-	_, kcErr := kc.Read(ctx)
-	switch creds.ClassifyRead(kcErr) {
-	case creds.ReadEmpty:
-		// Provably empty (or a tombstone): install there.
-	case creds.ReadUnsearchable:
-		target, fileFallback = file, true
-	case creds.ReadFatal:
-		return false, fmt.Errorf("%w: %s: %w", pool.ErrCredentialUnverifiable, kc, kcErr)
-	case creds.ReadPresent:
-		return false, fmt.Errorf("%w: %s holds a credential", pool.ErrCredentialChangedUnderfoot, kc)
-	}
-	_, fErr := file.Read(ctx)
-	switch creds.ClassifyRead(fErr) {
-	case creds.ReadEmpty:
-	case creds.ReadUnsearchable, creds.ReadFatal:
-		return false, fmt.Errorf("%w: %s: %w", pool.ErrCredentialUnverifiable, file, fErr)
-	case creds.ReadPresent:
-		return false, fmt.Errorf("%w: %s holds a credential", pool.ErrCredentialChangedUnderfoot, file)
-	}
-	if err := target.Write(ctx, env); err != nil {
-		return false, fmt.Errorf("write credential to %s: %w", target, err)
-	}
-	return fileFallback, nil
 }

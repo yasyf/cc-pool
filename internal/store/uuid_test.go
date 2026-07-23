@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -54,38 +55,25 @@ func TestGetAccountByUUID(t *testing.T) {
 	}
 }
 
-// TestGetAccountByUUIDDuplicatePicksLowestID pins deterministic duplicate-uuid
-// resolution: always the lowest id, stable across calls.
-func TestGetAccountByUUIDDuplicatePicksLowestID(t *testing.T) {
+func TestDuplicateAccountUUIDIsRejected(t *testing.T) {
 	s := openTest(t)
-	// Higher id inserted first, so insertion order disagrees with id order.
-	for _, a := range []Account{
-		{ID: 5, ConfigDir: "/cfg/acct-05", KeychainService: "svc5", KeychainAccount: "me", AccountUUID: "u-dup"},
-		{ID: 2, ConfigDir: "/cfg/acct-02", KeychainService: "svc2", KeychainAccount: "me", AccountUUID: "u-dup"},
-	} {
-		if err := s.UpsertAccount(a); err != nil {
-			t.Fatalf("upsert %d: %v", a.ID, err)
-		}
+	first := Account{ID: 5, ConfigDir: "/cfg/acct-05", KeychainService: "svc5", KeychainAccount: "me", AccountUUID: "u-dup"}
+	if err := s.UpsertAccount(first); err != nil {
+		t.Fatal(err)
 	}
-	for i := range 3 {
-		acct, ok, err := s.GetAccountByUUID("u-dup")
-		if err != nil || !ok {
-			t.Fatalf("call %d: ok=%v err=%v", i, ok, err)
-		}
-		if acct.ID != 2 {
-			t.Fatalf("call %d: id = %d, want the lowest id 2", i, acct.ID)
-		}
+	second := Account{ID: 2, ConfigDir: "/cfg/acct-02", KeychainService: "svc2", KeychainAccount: "me"}
+	if err := s.UpsertAccount(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAccountUUID(second.ID, "u-dup"); !errors.Is(err, ErrDuplicateAccountUUID) {
+		t.Fatalf("duplicate SetAccountUUID = %v", err)
 	}
 }
 
-// TestAccountsByUUID pins the multi-row resolver ambiguity-refusing callers
-// depend on: every row sharing the uuid, ordered by id; empty uuid matches
-// nothing; a unique uuid returns exactly its row.
+// TestAccountsByUUID pins exact lookup and empty-UUID behavior.
 func TestAccountsByUUID(t *testing.T) {
 	s := openTest(t)
 	for _, a := range []Account{
-		{ID: 5, ConfigDir: "/cfg/acct-05", KeychainService: "svc5", KeychainAccount: "me", AccountUUID: "u-dup"},
-		{ID: 2, ConfigDir: "/cfg/acct-02", KeychainService: "svc2", KeychainAccount: "me", AccountUUID: "u-dup"},
 		{ID: 3, ConfigDir: "/cfg/acct-03", KeychainService: "svc3", KeychainAccount: "me", AccountUUID: "u-solo"},
 		{ID: 4, ConfigDir: "/cfg/acct-04", KeychainService: "svc4", KeychainAccount: "me"},
 	} {
@@ -94,13 +82,6 @@ func TestAccountsByUUID(t *testing.T) {
 		}
 	}
 
-	dup, err := s.AccountsByUUID("u-dup")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(dup) != 2 || dup[0].ID != 2 || dup[1].ID != 5 {
-		t.Fatalf("AccountsByUUID(u-dup) = %+v, want ids [2 5] in order", dup)
-	}
 	solo, err := s.AccountsByUUID("u-solo")
 	if err != nil || len(solo) != 1 || solo[0].ID != 3 {
 		t.Fatalf("AccountsByUUID(u-solo) = %+v (err %v), want exactly id 3", solo, err)

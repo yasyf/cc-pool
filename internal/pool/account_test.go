@@ -52,11 +52,12 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := manager.PrepareReservedAdd(t.Context(), firstReservation)
+	firstPath := filepath.Join(t.TempDir(), "CloudStorage", "account-1")
+	first, err := manager.PrepareReservedAdd(t.Context(), firstReservation, firstPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Reservation.ID != 1 || first.ConfigDir != AccountDir(1) {
+	if first.Reservation.ID != 1 || first.ConfigDir != firstPath {
 		t.Fatalf("first pending = %+v", first)
 	}
 	info, err := os.Lstat(AccountBackingDir(first.Reservation.ID))
@@ -73,7 +74,9 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := manager.PrepareReservedAdd(t.Context(), secondReservation)
+	second, err := manager.PrepareReservedAdd(
+		t.Context(), secondReservation, filepath.Join(t.TempDir(), "CloudStorage", "account-2"),
+	)
 	if err != nil || second.Reservation.ID != 2 {
 		t.Fatalf("second pending = %+v, %v", second, err)
 	}
@@ -84,7 +87,7 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reused, err := manager.PrepareReservedAdd(t.Context(), reusedReservation)
+	reused, err := manager.PrepareReservedAdd(t.Context(), reusedReservation, firstPath)
 	if err != nil || reused.Reservation.ID != 1 {
 		t.Fatalf("reused pending = %+v, %v", reused, err)
 	}
@@ -96,7 +99,8 @@ func TestReleaseAddRetainsCompletedLogin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pending, err := manager.PrepareReservedAdd(t.Context(), pendingReservation)
+	configDir := filepath.Join(t.TempDir(), "CloudStorage", "account-1")
+	pending, err := manager.PrepareReservedAdd(t.Context(), pendingReservation, configDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +117,7 @@ func TestReleaseAddRetainsCompletedLogin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	retry, err := manager.PrepareReservedAdd(t.Context(), retryReservation)
+	retry, err := manager.PrepareReservedAdd(t.Context(), retryReservation, configDir)
 	if err != nil {
 		t.Fatal(err)
 	}

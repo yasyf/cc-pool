@@ -2,6 +2,7 @@ package hostsync
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"os"
@@ -16,8 +17,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
@@ -30,7 +33,7 @@ const materializeManifest = "/cfg/synckit/manifests/cc-pool.json"
 type stubRefresher struct{}
 
 func (stubRefresher) Refresh(context.Context, string, string) (*oauth.TokenResponse, error) {
-	return &oauth.TokenResponse{AccessToken: "at-refreshed", RefreshToken: "rt-refreshed", ExpiresIn: 3600}, nil
+	return nil, errors.New("materialized peer credential must never refresh locally")
 }
 
 func (stubRefresher) Usage(context.Context, string) (*oauth.Usage, error) {
@@ -44,6 +47,67 @@ type runRecorder struct{ calls [][]string }
 func (r *runRecorder) run(_ context.Context, name string, args ...string) error {
 	r.calls = append(r.calls, append([]string{name}, args...))
 	return nil
+}
+
+type inlineMaterializeTaskRunner struct {
+	credentials backingCredentials
+}
+
+func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task supervise.Task) error {
+	switch {
+	case pool.IsBackingWorkerInvocation(task.Args):
+		return pool.RunBackingWorker(ctx, task.Stdin, task.Stdout)
+	case pool.IsCredentialCASWorkerInvocation(task.Args):
+		request, err := pool.DecodeCredentialCASRequest(task.Stdin)
+		if err != nil {
+			return err
+		}
+		account := store.Account{
+			ID: request.AccountID, ConfigDir: request.ConfigDir,
+			KeychainService: request.KeychainService, KeychainAccount: request.KeychainAccount,
+		}
+		after := request.Expected
+		empty := store.CredentialSlotObservation{State: store.CredentialSlotEmpty}
+		if len(request.Credential) != 0 {
+			var credential creds.Credential
+			if err := json.Unmarshal(request.Credential, &credential); err != nil {
+				return err
+			}
+			if err := runner.credentials.Store(account, request.Source).Write(ctx, &credential); err != nil {
+				return err
+			}
+			digest := store.CredentialDigest(sha256.Sum256(request.Credential))
+			present := store.CredentialSlotObservation{State: store.CredentialSlotPresent, Digest: &digest}
+			if request.Source == creds.SourceKeychain {
+				after.Keychain = present
+			} else {
+				after.File = present
+			}
+		} else if request.DeleteAll {
+			for _, source := range []creds.Source{creds.SourceKeychain, creds.SourceFile} {
+				if err := runner.credentials.Store(account, source).Delete(ctx); err != nil {
+					return err
+				}
+			}
+			after.Keychain, after.File = empty, empty
+		} else if request.DeleteTarget {
+			if err := runner.credentials.Store(account, request.Source).Delete(ctx); err != nil {
+				return err
+			}
+			if request.Source == creds.SourceKeychain {
+				after.Keychain = empty
+			} else {
+				after.File = empty
+			}
+		} else {
+			return errors.New("unsupported materialize test credential CAS mutation")
+		}
+		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+			Before: request.Expected, After: after,
+		})
+	default:
+		return errors.New("unexpected materialize test worker")
+	}
 }
 
 type backingCredentials struct{ *credstest.Fake }
@@ -74,10 +138,18 @@ type fixtureAccountRemoval struct {
 	deleteCredential bool
 }
 
-type fixtureAccountPreparer func(context.Context, store.Account) error
+type fixtureAccountPreparer func(
+	context.Context,
+	store.PendingAccountReservation,
+	string,
+) (string, error)
 
-func (prepare fixtureAccountPreparer) PrepareAccount(ctx context.Context, account store.Account) error {
-	return prepare(ctx, account)
+func (prepare fixtureAccountPreparer) PrepareReservedAccount(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+	label string,
+) (string, error) {
+	return prepare(ctx, reservation, label)
 }
 
 func (r *fixtureAccountRemover) BeginAccountRemoval(id int, deleteCredential bool) (AccountRemoval, error) {
@@ -106,10 +178,18 @@ func (r *fixtureAccountRemover) callsSnapshot() []int {
 }
 
 func (p fixtureAccountRemoval) Finish(ctx context.Context) error {
-	if err := os.RemoveAll(pool.AccountDir(p.id)); err != nil {
+	if err := os.RemoveAll(materializePresentationPath(p.id)); err != nil {
 		return err
 	}
 	return p.remover.m.Remove(ctx, p.id, p.deleteCredential)
+}
+
+func materializePresentationPath(id int) string {
+	home, err := pool.Home()
+	if err != nil {
+		panic(err)
+	}
+	return filepath.Join(home, "Library", "CloudStorage", "cc-pool-"+pool.AccountDirName(id))
 }
 
 var (
@@ -128,14 +208,48 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 	if err := os.MkdirAll(pool.ClaudeDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	m, err := pool.OpenDaemon(t.Context())
+	st, err := store.Open(filepath.Join(t.TempDir(), "materialize.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := proc.CurrentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := proc.Record{
+		RecoveryClass: proc.RecoveryTask,
+		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		Comm: identity.Comm, Executable: identity.Executable,
+		AuditToken: identity.AuditToken, Generation: "materialize-test",
+	}
+	fk := credstest.NewFake()
+	credentials := backingCredentials{fk}
+	authority, err := pool.NewWorkerAuthority(
+		inlineMaterializeTaskRunner{credentials: credentials}, identity.Executable, owner,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := pool.NewManager(
+		st, stubRefresher{},
+		func(context.Context) ([]procscan.Session, error) { return nil, nil },
+		authority,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.Close(t.Context()) })
-	fk := credstest.NewFake()
-	m.Creds = backingCredentials{fk}
+	m.Creds = credentials
 	m.OAuth = stubRefresher{}
+	m.BuildCredentialWritePublication = func(
+		store.Account,
+		*creds.Credential,
+		store.CredentialOperationID,
+		time.Time,
+	) ([]byte, error) {
+		return []byte("materialize-test"), nil
+	}
+	m.SettleCredentialWrite = func(context.Context, pool.CredentialWriteSettlement) error { return nil }
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +261,17 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 		StampDir: filepath.Join(t.TempDir(), "stamps"),
 		Run:      rec.run,
 		Remover:  &fixtureAccountRemover{m: m, fail: map[int]error{}},
-		Preparer: fixtureAccountPreparer(func(context.Context, store.Account) error { return nil }),
+		Preparer: fixtureAccountPreparer(func(
+			_ context.Context,
+			reservation store.PendingAccountReservation,
+			_ string,
+		) (string, error) {
+			path := materializePresentationPath(reservation.ID)
+			if err := os.MkdirAll(path, 0o700); err != nil {
+				return "", err
+			}
+			return path, nil
+		}),
 	}
 	return s, m, fk, rec
 }
@@ -210,13 +334,13 @@ func TestMaterializeHappyPath(t *testing.T) {
 		t.Fatalf("result = %+v, want uuid u-happy / acct 1", res)
 	}
 
-	configDir := pool.AccountDir(1)
+	configDir := materializePresentationPath(1)
 	backingDir := pool.AccountBackingDir(1)
 	if _, err := os.Stat(backingDir); err != nil {
 		t.Fatalf("account backing not created: %v", err)
 	}
-	if _, err := os.Lstat(configDir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("materialize mutated presentation path: %v", err)
+	if info, err := os.Stat(configDir); err != nil || !info.IsDir() {
+		t.Fatalf("prepared presentation path = %+v, %v", info, err)
 	}
 
 	// Identity injected verbatim and resolvable through the established reader.
@@ -254,6 +378,10 @@ func TestMaterializeHappyPath(t *testing.T) {
 	if row.AccountUUID != "u-happy" {
 		t.Fatalf("row AccountUUID = %q, want u-happy (backfill)", row.AccountUUID)
 	}
+	if row.ConfigDir != configDir || row.ConfigDir == pool.AccountDir(1) ||
+		row.KeychainService != creds.ServiceName(configDir) {
+		t.Fatalf("persisted presentation binding = %+v, want exact proven path %q", row, configDir)
+	}
 	byUUID, ok, err := m.Store.GetAccountByUUID("u-happy")
 	if err != nil || !ok {
 		t.Fatalf("GetAccountByUUID: ok=%v err=%v", ok, err)
@@ -274,10 +402,59 @@ func TestMaterializeHappyPath(t *testing.T) {
 	if _, ok := fk.Get(row.KeychainService, creds.AccountLabel()); !ok {
 		t.Fatalf("keychain item %q/%q absent, want the installed envelope", row.KeychainService, creds.AccountLabel())
 	}
+	health, err := m.Store.GetAuthHealth(row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.NeedsLogin {
+		t.Fatalf("valid stripped credential left account awaiting origin: %+v", health)
+	}
 
 	// synckitd nudged with the manifest path.
 	if !recorded(rec, []string{"synckitd", "register", materializeManifest}) {
 		t.Fatalf("nudge calls = %v, want a synckitd register of %q", rec.calls, materializeManifest)
+	}
+}
+
+func TestMaterializeRejectsExistingExternalUUIDBeforePull(t *testing.T) {
+	s, manager, _, _ := newMaterializeService(t)
+	existing := store.Account{
+		ID: 9, ConfigDir: materializePresentationPath(9),
+		KeychainService: "existing-service", KeychainAccount: "existing-account",
+	}
+	if err := manager.Store.UpsertAccount(existing); err != nil {
+		t.Fatal(err)
+	}
+	identityPath := filepath.Join(pool.AccountBackingDir(existing.ID), ".claude.json")
+	if err := os.MkdirAll(filepath.Dir(identityPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		identityPath,
+		[]byte(`{"oauthAccount":{"accountUuid":"duplicate","emailAddress":"existing@example.com"}}`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	pulled := false
+	_, err := s.Materialize(
+		t.Context(),
+		materializeVal(
+			"duplicate", "peer@example.com",
+			json.RawMessage(`{"accountUuid":"duplicate","emailAddress":"peer@example.com"}`),
+		),
+		[]string{"hostB"},
+		func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
+			pulled = true
+			return freshEnvelope("should-not-pull"), nil
+		},
+		materializeManifest,
+	)
+	if !errors.Is(err, store.ErrDuplicateAccountUUID) {
+		t.Fatalf("duplicate materialize = %v", err)
+	}
+	if pulled {
+		t.Fatal("duplicate materialize pulled a credential")
 	}
 }
 
@@ -287,10 +464,17 @@ func TestMaterializeDoesNotReportSuccessBeforeTenantPreparation(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantErr := errors.New("presentation unavailable")
-	var prepared []store.Account
-	s.Preparer = fixtureAccountPreparer(func(_ context.Context, account store.Account) error {
-		prepared = append(prepared, account)
-		return wantErr
+	var prepared []store.PendingAccountReservation
+	s.Preparer = fixtureAccountPreparer(func(
+		_ context.Context,
+		reservation store.PendingAccountReservation,
+		label string,
+	) (string, error) {
+		prepared = append(prepared, reservation)
+		if label != "peer-u-prepare" {
+			t.Fatalf("preparation label = %q", label)
+		}
+		return "", wantErr
 	})
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-prepare","emailAddress":"prepare@example.com"}`)
 	result, err := s.Materialize(
@@ -301,12 +485,11 @@ func TestMaterializeDoesNotReportSuccessBeforeTenantPreparation(t *testing.T) {
 	if !errors.Is(err, wantErr) || result != (MaterializeResult{}) {
 		t.Fatalf("materialize before preparation = result %+v err %v", result, err)
 	}
-	if len(prepared) != 1 || prepared[0].ID != 1 || prepared[0].AccountUUID != "u-prepare" {
-		t.Fatalf("prepared accounts = %+v, want committed acct-01 with uuid", prepared)
+	if len(prepared) != 1 || prepared[0].ID != 1 {
+		t.Fatalf("prepared reservations = %+v, want acct-01", prepared)
 	}
-	row, readErr := m.Store.GetAccount(1)
-	if readErr != nil || row.AccountUUID != "u-prepare" {
-		t.Fatalf("durable account after preparation failure = %+v err %v", row, readErr)
+	if _, readErr := m.Store.GetAccount(1); !errors.Is(readErr, store.ErrAccountNotFound) {
+		t.Fatalf("account after preparation failure = %v, want not found", readErr)
 	}
 	if len(rec.calls) != 0 {
 		t.Fatalf("synckit nudge ran before tenant preparation: %v", rec.calls)
@@ -332,7 +515,7 @@ func TestMaterializeSeedNoSourceBootstraps(t *testing.T) {
 		t.Fatalf("result = %+v, want a completed acct 1", res)
 	}
 
-	configDir := pool.AccountDir(1)
+	configDir := materializePresentationPath(1)
 	id, err := m.AccountIdentity(t.Context(), 1, configDir)
 	if err != nil {
 		t.Fatalf("AccountIdentity: %v", err)
@@ -385,7 +568,7 @@ func TestMaterializeKeychainUnavailableFallsBackToFile(t *testing.T) {
 		t.Fatalf("result = %+v, want a completed acct 1", res)
 	}
 
-	configDir := pool.AccountDir(1)
+	configDir := materializePresentationPath(1)
 	if _, err := os.Stat(creds.FileCredentialPath(pool.AccountBackingDir(1))); err != nil {
 		t.Fatalf("file credential not written: %v", err)
 	}
@@ -505,7 +688,7 @@ func TestMaterializeRejectedEnvelopeReleasesNotAbandons(t *testing.T) {
 			if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
 				t.Fatalf("account dir stat err = %v, want kept on rejection", statErr)
 			}
-			if _, ok := fk.Get(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel()); ok {
+			if _, ok := fk.Get(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel()); ok {
 				t.Fatal("a rejected envelope landed in the keychain")
 			}
 			// Reservation released: the freed index is handed straight back.
@@ -559,7 +742,7 @@ func TestMaterializeRejectedEnvelopeThroughRealPullerReleases(t *testing.T) {
 			retained.ClaudeAiOauth.ExpiresAt = future
 			pull := func(ctx context.Context, uuid string, chain ChainStamp, peers []string) (*creds.Credential, error) {
 				// The released add's still-running login lands mid-pull.
-				fk.Put(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel(), retained)
+				fk.Put(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel(), retained)
 				dial := func(string) syncservice.Transport {
 					return envelopeTransport(t, tc.served, creds.AccessHash(tc.served))
 				}
@@ -578,7 +761,7 @@ func TestMaterializeRejectedEnvelopeThroughRealPullerReleases(t *testing.T) {
 			if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
 				t.Fatalf("account dir stat err = %v, want kept on rejection", statErr)
 			}
-			got, ok := fk.Get(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel())
+			got, ok := fk.Get(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel())
 			if !ok || got.ClaudeAiOauth.RefreshToken != "rt-login" {
 				t.Fatalf("retained credential = %+v ok=%v, want rt-login intact", got, ok)
 			}
@@ -622,7 +805,7 @@ func TestMaterializePullFailureNeverDestroysConcurrentLogin(t *testing.T) {
 			owned.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
 			pull := func(ctx context.Context, uuid string, chain ChainStamp, peers []string) (*creds.Credential, error) {
 				// The released add's still-running login lands mid-pull.
-				fk.Put(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel(), owned)
+				fk.Put(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel(), owned)
 				dial := func(string) syncservice.Transport { return transport(t) }
 				return FetchCredential(ctx, dial, uuid, chain, 0, peers)
 			}
@@ -639,7 +822,7 @@ func TestMaterializePullFailureNeverDestroysConcurrentLogin(t *testing.T) {
 			if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
 				t.Fatalf("account dir stat err = %v, want kept", statErr)
 			}
-			got, ok := fk.Get(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel())
+			got, ok := fk.Get(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel())
 			if !ok || got.ClaudeAiOauth.RefreshToken != "rt-login" {
 				t.Fatalf("slot credential = %+v ok=%v, want the owned login intact", got, ok)
 			}
@@ -710,7 +893,7 @@ func TestMaterializeInstallNeverClobbersConcurrentLogin(t *testing.T) {
 	pull := func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
 		// The released add's still-running login completes mid-pull, after the
 		// pre-flight slot check but before the install write.
-		fk.Put(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel(), owned)
+		fk.Put(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel(), owned)
 		return freshEnvelope("at-peer"), nil
 	}
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-race","emailAddress":"race@example.com"}`)
@@ -723,7 +906,7 @@ func TestMaterializeInstallNeverClobbersConcurrentLogin(t *testing.T) {
 		t.Fatalf("result = %+v, want zero on abort", res)
 	}
 	// The owned login is intact — neither overwritten nor deleted by AbandonAdd.
-	got, ok := fk.Get(creds.ServiceName(pool.AccountDir(1)), creds.AccountLabel())
+	got, ok := fk.Get(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel())
 	if !ok || got.ClaudeAiOauth.RefreshToken != "rt-login" || got.ClaudeAiOauth.AccessToken != "at-login" {
 		t.Fatalf("slot credential = %+v ok=%v, want the owned login intact", got, ok)
 	}
@@ -761,7 +944,7 @@ func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
 	}
 
 	// A kept dir from an interrupted `ccp add`: its own identity + owned credential.
-	keptDir := pool.AccountDir(1)
+	keptDir := materializePresentationPath(1)
 	keptBacking := pool.AccountBackingDir(1)
 	if err := os.MkdirAll(keptBacking, 0o700); err != nil {
 		t.Fatal(err)

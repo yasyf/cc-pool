@@ -244,6 +244,34 @@ func TestPromoteReservedAccount(t *testing.T) {
 	})
 }
 
+func TestPromoteReservedSyncedAccountStartsAwaitingOrigin(t *testing.T) {
+	s := openReserveTest(t)
+	reservation := mustReserve(t, s)
+	account := Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "external-uuid",
+	}
+	if err := s.PromoteReservedSyncedAccount(reservation, account); err != nil {
+		t.Fatal(err)
+	}
+	health, err := s.GetAuthHealth(account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !health.NeedsLogin || health.Kind != AuthKindAwaitingOrigin ||
+		health.Reason != AuthReasonAwaitingOrigin {
+		t.Fatalf("initial synced auth health = %+v", health)
+	}
+	committed, err := s.GetAccount(account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.ConfigDir != account.ConfigDir || committed.AccountUUID != account.AccountUUID {
+		t.Fatalf("committed synced row = %+v", committed)
+	}
+}
+
 // TestPromoteReservedAccountConcurrent pins the atomic promote: many adds racing
 // reserve→promote each land a distinct index. A non-atomic consume-then-upsert
 // leaves a half-open window in which a concurrent ReserveAccountIndex reuses the

@@ -72,6 +72,7 @@ func scanLocalAccounts(ctx context.Context, m *pool.Manager) ([]localRow, error)
 		return nil, fmt.Errorf("list accounts: %w", err)
 	}
 	out := make([]localRow, 0, len(accts))
+	byUUID := make(map[string]int, len(accts))
 	for _, a := range accts {
 		raw, id, err := m.AccountOAuth(ctx, a.ID, a.ConfigDir)
 		if errors.Is(err, pool.ErrNoIdentity) {
@@ -80,6 +81,13 @@ func scanLocalAccounts(ctx context.Context, m *pool.Manager) ([]localRow, error)
 		if err != nil {
 			return nil, fmt.Errorf("acct-%d: %w", a.ID, err)
 		}
+		if prior, exists := byUUID[id.AccountUUID]; exists {
+			return nil, fmt.Errorf(
+				"%w: %q appears on acct-%02d and acct-%02d",
+				store.ErrDuplicateAccountUUID, id.AccountUUID, prior, a.ID,
+			)
+		}
+		byUUID[id.AccountUUID] = a.ID
 		out = append(out, localRow{acct: a, uuid: id.AccountUUID, email: id.EmailAddress, oauth: raw})
 	}
 	return out, nil

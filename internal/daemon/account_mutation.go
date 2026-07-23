@@ -293,7 +293,9 @@ func (s *Server) startAccountMutationRun(
 			return active, nil, nil, AccountMutationResult{}, err
 		}
 		if active.Kind == store.AccountMutationAdd {
-			if _, err := s.m.PrepareReservedAdd(ctx, accountMutationReservation(active)); err != nil {
+			if _, err := s.m.PrepareReservedAdd(
+				ctx, accountMutationReservation(active), active.ConfigDir,
+			); err != nil {
 				result, settleErr := s.settleAccountMutationTerminal(ctx, active, err)
 				return active, nil, nil, result, settleErr
 			}

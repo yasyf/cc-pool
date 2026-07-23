@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
@@ -569,8 +570,9 @@ func observeCredentialCASSlot(
 }
 
 func validateCredentialCASRequest(request CredentialCASRequest) error {
-	if request.AccountID < 1 || request.ConfigDir != AccountDir(request.AccountID) {
-		return errors.New("credential CAS account path is not canonical")
+	if request.AccountID < 1 || !filepath.IsAbs(request.ConfigDir) ||
+		filepath.Clean(request.ConfigDir) != request.ConfigDir || strings.ContainsRune(request.ConfigDir, 0) {
+		return errors.New("credential CAS account path is not one exact absolute presentation path")
 	}
 	if request.KeychainService != creds.ServiceName(request.ConfigDir) ||
 		request.KeychainAccount == "" || filepath.Base(request.KeychainAccount) != request.KeychainAccount {

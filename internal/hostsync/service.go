@@ -68,7 +68,11 @@ type AccountRemover interface {
 // AccountPreparer establishes every product-required presentation for one
 // committed account before materialization reports success.
 type AccountPreparer interface {
-	PrepareAccount(context.Context, store.Account) error
+	PrepareReservedAccount(
+		context.Context,
+		store.PendingAccountReservation,
+		string,
+	) (string, error)
 }
 
 // Service owns the convergent account registry and its write hooks: every

@@ -2,6 +2,7 @@ package hostsync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -189,6 +190,16 @@ func TestManagerLocalsAdvertisesOnlyOwnedChains(t *testing.T) {
 			t.Fatalf("chain = %+v, want zero", locals[0].Chain)
 		}
 	})
+}
+
+func TestManagerLocalIndexRejectsDuplicateExternalUUID(t *testing.T) {
+	fx := newLocalsFixture(t)
+	const identity = `{"oauthAccount":{"accountUuid":"duplicate","emailAddress":"a@example.com"}}`
+	fx.addAccount(t, 1, "", "one", identity)
+	fx.addAccount(t, 2, "", "two", identity)
+	if _, err := ManagerLocalIndex(fx.m)(t.Context()); !errors.Is(err, store.ErrDuplicateAccountUUID) {
+		t.Fatalf("duplicate external identity index = %v", err)
+	}
 }
 
 // TestManagerLocalIndex pins the uuid backfill index: logged-in rows map uuid

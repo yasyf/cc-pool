@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
@@ -88,11 +90,14 @@ func (m *Manager) ReserveAdd() (store.PendingAccountReservation, error) {
 func (m *Manager) PrepareReservedAdd(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
+	configDir string,
 ) (pending *PendingAdd, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	configDir := AccountDir(reservation.ID)
+	if !filepath.IsAbs(configDir) || filepath.Clean(configDir) != configDir || strings.ContainsRune(configDir, 0) {
+		return nil, errors.New("prepare reserved add: proven config dir must be one exact absolute path")
+	}
 	seed, err := m.prepareAccountBacking(ctx, reservation.ID, ClaudeJSONPath())
 	if err != nil {
 		return nil, fmt.Errorf("seed .claude.json for %s: %w", configDir, err)
@@ -159,6 +164,43 @@ func (m *Manager) FinalizeAdd(ctx context.Context, pending *PendingAdd, label st
 	}
 	if _, _, _, err := m.SampleUsage(ctx, committed, SampleOpts{AllowRefresh: true}); err != nil {
 		return &committed, fmt.Errorf("account added but usage validation failed: %w", err)
+	}
+	return &committed, nil
+}
+
+// PromoteSyncedAdd publishes one proven-path non-origin account before its
+// access-only credential is installed.
+func (m *Manager) PromoteSyncedAdd(
+	ctx context.Context,
+	pending *PendingAdd,
+	label string,
+	accountUUID string,
+) (*store.Account, error) {
+	if pending == nil {
+		return nil, errors.New("promote synced add: pending account is nil")
+	}
+	identity, err := m.AccountIdentity(ctx, pending.Reservation.ID, pending.ConfigDir)
+	if err != nil {
+		return nil, fmt.Errorf("read synced identity for %s: %w", pending.ConfigDir, err)
+	}
+	if accountUUID == "" || identity.AccountUUID != accountUUID {
+		return nil, fmt.Errorf(
+			"promote synced add: external UUID mismatch: registry %q, identity %q",
+			accountUUID, identity.AccountUUID,
+		)
+	}
+	account := store.Account{
+		ID: pending.Reservation.ID, InstanceID: pending.Reservation.InstanceID,
+		Generation: pending.Reservation.Generation, ConfigDir: pending.ConfigDir,
+		KeychainService: pending.KeychainService, KeychainAccount: creds.AccountLabel(),
+		Label: label, AccountUUID: accountUUID, CreatedAt: time.Now(),
+	}
+	if err := m.Store.PromoteReservedSyncedAccount(pending.Reservation, account); err != nil {
+		return nil, fmt.Errorf("promote synced account %s: %w", pending.ConfigDir, err)
+	}
+	committed, err := m.Store.GetAccount(account.ID)
+	if err != nil {
+		return nil, err
 	}
 	return &committed, nil
 }

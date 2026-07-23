@@ -432,6 +432,7 @@ CREATE TABLE account_presentation_quarantines (
 	CHECK(observed_catalog_tenant_id=observed_tenant_id AND observed_catalog_generation=observed_generation)
 );
 CREATE INDEX idx_accounts_uuid ON accounts(account_uuid);
+CREATE UNIQUE INDEX idx_accounts_live_uuid ON accounts(account_uuid) WHERE account_uuid != '' AND deleted_at IS NULL;
 CREATE UNIQUE INDEX idx_accounts_live_config_dir ON accounts(config_dir) WHERE deleted_at IS NULL;
 CREATE INDEX idx_account_mutations_owner ON account_mutations(owner_record,account_id);
 CREATE UNIQUE INDEX idx_account_mutations_single_add ON account_mutations(kind) WHERE kind='add';
@@ -815,6 +816,9 @@ func (s *Store) ListActiveAccounts() ([]Account, error) {
 // callers can distinguish a removed account from a real query failure.
 var ErrAccountNotFound = errors.New("account not found")
 
+// ErrDuplicateAccountUUID rejects two live rows for one external Claude identity.
+var ErrDuplicateAccountUUID = errors.New("duplicate external account UUID")
+
 // ErrAccountSessionActive means removal cannot begin while a session is live.
 var ErrAccountSessionActive = errors.New("account session is active")
 
@@ -832,7 +836,29 @@ func (s *Store) GetAccount(id int) (Account, error) {
 // SetAccountUUID records an account's Claude accountUuid; a targeted UPDATE so
 // it can't clobber concurrent updates to the row's other columns.
 func (s *Store) SetAccountUUID(id int, uuid string) error {
-	res, err := s.db.Exec(`UPDATE accounts SET account_uuid=? WHERE id=? AND deleted_at IS NULL`, uuid, id)
+	if uuid == "" {
+		return fmt.Errorf("set account_uuid for account %d: empty UUID", id)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var duplicateID int
+	err = tx.QueryRow(
+		`SELECT id FROM accounts WHERE account_uuid=? AND id!=? AND deleted_at IS NULL LIMIT 1`,
+		uuid, id,
+	).Scan(&duplicateID)
+	if err == nil {
+		return fmt.Errorf("%w: %q already belongs to account %d", ErrDuplicateAccountUUID, uuid, duplicateID)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	res, err := tx.Exec(
+		`UPDATE accounts SET account_uuid=? WHERE id=? AND deleted_at IS NULL`,
+		uuid, id,
+	)
 	if err != nil {
 		return fmt.Errorf("set account_uuid for account %d: %w", id, err)
 	}
@@ -843,7 +869,7 @@ func (s *Store) SetAccountUUID(id int, uuid string) error {
 	if n == 0 {
 		return fmt.Errorf("account %d not found", id)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // GetAccountByUUID returns the account whose Claude accountUuid is uuid,
