@@ -35,10 +35,11 @@ func TestPureGoCLIDoesNotEmbedSwiftOwnedContainerIdentity(t *testing.T) {
 const (
 	// releaseAppWorkflowCommit is an immutable Git commit, not a credential.
 	//nolint:gosec // G101 cannot distinguish the pinned commit from a secret.
-	releaseAppWorkflowCommit = "83ee384b1d4fe25a8e4aa7258bb76d55e1593735"
-	releaseActionCommit      = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
-	releaseDraftActionCommit = "54e3e194bda69896894a82c17fcdb2822beefab5"
-	releasePublishCommit     = "9ca67392d45d66b6ae01e262383c8f3138d56f5e"
+	releaseAppWorkflowCommit        = "83ee384b1d4fe25a8e4aa7258bb76d55e1593735"
+	releaseActionCommit             = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
+	releaseStageDraftActionCommit   = "e4c3108e693681df1a3c666bae80e890bc44cf3e"
+	releasePublishDraftActionCommit = "54e3e194bda69896894a82c17fcdb2822beefab5"
+	releasePublishCommit            = "9ca67392d45d66b6ae01e262383c8f3138d56f5e"
 )
 
 func TestReleaseCLIFailsClosedBeforeArtifactPublication(t *testing.T) {
@@ -110,8 +111,8 @@ func TestReleasePublishesCLIAndApplicationAtomically(t *testing.T) {
 		`"dist/staged-app/$APP_ASSET"`,
 		`"dist/staged-app/$APP_ASSET.sha256"`,
 		`> "$RUNNER_TEMP/cc-pool-release-assets"`,
-		"actions/stage-draft-release@" + releaseDraftActionCommit,
-		"actions/publish-draft-release@" + releaseDraftActionCommit,
+		"actions/stage-draft-release@" + releaseStageDraftActionCommit,
+		"actions/publish-draft-release@" + releasePublishDraftActionCommit,
 		`release-id: ${{ steps.draft.outputs['release-id'] }}`,
 		`manifest: ${{ runner.temp }}/cc-pool-release-assets`,
 	} {
@@ -203,10 +204,13 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 			if !strings.Contains(line, "@"+releaseAppWorkflowCommit) {
 				t.Fatalf("release-app uses a mixed or mutable workflow reference: %s", line)
 			}
-		case strings.Contains(line, "actions/stage-draft-release@"),
-			strings.Contains(line, "actions/publish-draft-release@"):
-			if !strings.Contains(line, "@"+releaseDraftActionCommit) {
-				t.Fatalf("release uses a mixed or mutable draft action reference: %s", line)
+		case strings.Contains(line, "actions/stage-draft-release@"):
+			if !strings.Contains(line, "@"+releaseStageDraftActionCommit) {
+				t.Fatalf("release uses a mixed or mutable draft-stage action reference: %s", line)
+			}
+		case strings.Contains(line, "actions/publish-draft-release@"):
+			if !strings.Contains(line, "@"+releasePublishDraftActionCommit) {
+				t.Fatalf("release uses a mixed or mutable draft-publish action reference: %s", line)
 			}
 		case strings.Contains(line, "yasyf/homebrew-tap/.github/actions/publish@"):
 			if !strings.Contains(line, "@"+releasePublishCommit) {
