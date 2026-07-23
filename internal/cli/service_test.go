@@ -219,38 +219,48 @@ func TestRunServiceInstallConvergesExactExecutableAgent(t *testing.T) {
 }
 
 func TestRunServiceInstallFailsClosedWhenDaemonIsNotReady(t *testing.T) {
-	executable := filepath.Join(t.TempDir(), "ccp")
-	swapVar(t, &serviceExecutable, func() (string, error) { return executable, nil })
-	install := &testHolderServiceInstall{created: true}
-	swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
-		return install, nil
-	})
-	controller := &testDaemonServiceController{}
-	useDaemonServiceController(t, controller)
-	holderStops := 0
-	swapVar(t, &stopHolder, func(context.Context) error {
-		holderStops++
-		return nil
-	})
-	want := errors.New("daemon health unavailable")
-	swapVar(t, &daemonServiceReady, func(context.Context, string) error { return want })
-	cmd, out, _ := uninstallCmd()
-	cmd.SetContext(t.Context())
-	err := runServiceInstall(cmd)
-	if !errors.Is(err, want) || !strings.Contains(err.Error(), "daemon readiness") {
-		t.Fatalf("error = %v, want daemon readiness failure", err)
-	}
-	if len(controller.desired) != 2 || controller.desired[1] != nil {
-		t.Fatalf("desired calls = %+v, want daemon install then empty rollback", controller.desired)
-	}
-	if holderStops != 1 || install.rollbackCalls != 0 || install.removeCalls != 0 {
-		t.Fatalf(
-			"holder stop/receipt rollback/remove calls = %d/%d/%d, want 1/0/0",
-			holderStops, install.rollbackCalls, install.removeCalls,
-		)
-	}
-	if strings.Contains(stripANSI(out.String()), "Installed and started") {
-		t.Fatalf("claimed install success: %q", out.String())
+	for _, test := range []struct {
+		name        string
+		created     bool
+		wantRemoves int
+	}{
+		{name: "created", created: true, wantRemoves: 1},
+		{name: "preexisting", created: false, wantRemoves: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executable := filepath.Join(t.TempDir(), "ccp")
+			swapVar(t, &serviceExecutable, func() (string, error) { return executable, nil })
+			install := &testHolderServiceInstall{created: test.created}
+			swapVar(t, &ensureHolder, func(context.Context) (holderServiceInstall, error) {
+				return install, nil
+			})
+			controller := &testDaemonServiceController{}
+			useDaemonServiceController(t, controller)
+			swapVar(t, &stopHolder, func(context.Context) error {
+				t.Fatal("readiness rollback bypassed the holder install receipt")
+				return nil
+			})
+			want := errors.New("daemon health unavailable")
+			swapVar(t, &daemonServiceReady, func(context.Context, string) error { return want })
+			cmd, out, _ := uninstallCmd()
+			cmd.SetContext(t.Context())
+			err := runServiceInstall(cmd)
+			if !errors.Is(err, want) || !strings.Contains(err.Error(), "daemon readiness") {
+				t.Fatalf("error = %v, want daemon readiness failure", err)
+			}
+			if len(controller.desired) != 2 || controller.desired[1] != nil {
+				t.Fatalf("desired calls = %+v, want daemon install then empty rollback", controller.desired)
+			}
+			if install.rollbackCalls != 1 || install.removeCalls != test.wantRemoves {
+				t.Fatalf(
+					"holder receipt rollback/remove calls = %d/%d, want 1/%d",
+					install.rollbackCalls, install.removeCalls, test.wantRemoves,
+				)
+			}
+			if strings.Contains(stripANSI(out.String()), "Installed and started") {
+				t.Fatalf("claimed install success: %q", out.String())
+			}
+		})
 	}
 }
 

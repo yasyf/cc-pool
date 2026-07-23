@@ -304,9 +304,8 @@ func installDaemonService(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	holderStopped := false
 	defer func() {
-		if err != nil && !holderStopped {
+		if err != nil {
 			err = errors.Join(err, holderInstall.Rollback(ctx))
 		}
 	}()
@@ -326,9 +325,7 @@ func installDaemonService(ctx context.Context) (err error) {
 		)
 		defer rollbackCancel()
 		daemonRollbackErr := controller.Converge(rollbackCtx, nil)
-		holderRollbackErr := stopHolder(rollbackCtx)
-		holderStopped = holderRollbackErr == nil
-		return errors.Join(readyErr, daemonRollbackErr, holderRollbackErr)
+		return errors.Join(readyErr, daemonRollbackErr)
 	}); err != nil {
 		return err
 	}
