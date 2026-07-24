@@ -2,7 +2,6 @@ package store
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -341,8 +340,6 @@ func (s *Store) PendingAddReservationsOwnedBy(
 		 WHERE owner_record=? AND id>?
 		 AND NOT EXISTS (SELECT 1 FROM account_mutations WHERE account_id=pending_adds.id AND account_instance_id=pending_adds.instance_id AND account_generation=pending_adds.generation)
 		 AND NOT EXISTS (SELECT 1 FROM account_mutation_receipts WHERE account_id=pending_adds.id AND account_instance_id=pending_adds.instance_id AND account_generation=pending_adds.generation)
-		 AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=pending_adds.id AND account_instance_id=pending_adds.instance_id AND account_generation=pending_adds.generation)
-		 AND NOT EXISTS (SELECT 1 FROM credential_quarantines WHERE account_id=pending_adds.id AND account_instance_id=pending_adds.instance_id AND account_generation=pending_adds.generation)
 		 ORDER BY id LIMIT ?`,
 		mustEncodeCredentialOwner(owner), afterAccountID, limit+1,
 	)
@@ -363,52 +360,6 @@ func (s *Store) PendingAddReservationsOwnedBy(
 		reservations = append(reservations, reservation)
 	}
 	return reservations, more, rows.Err()
-}
-
-// ReleaseRetiredPendingAdd releases only an exact owner-fenced reservation
-// with no durable mutation, receipt, removal, or quarantine evidence.
-func (s *Store) ReleaseRetiredPendingAdd(
-	ctx context.Context,
-	reservation PendingAccountReservation,
-	newOwner proc.Record,
-	receipt proc.ReapReceipt,
-	verifier ProcessRetirementVerifier,
-) error {
-	if err := verifyProcessRetirement(ctx, reservation.Owner, newOwner, receipt, verifier); err != nil {
-		return err
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	stored, err := pendingAccountReservationByID(tx, reservation.ID)
-	if err != nil {
-		return err
-	}
-	if !samePendingAccountReservation(stored, reservation) {
-		return ErrAccountGenerationChanged
-	}
-	var evidence int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM account_mutations WHERE account_id=? AND account_instance_id=? AND account_generation=?)
-		 OR EXISTS(SELECT 1 FROM account_mutation_receipts WHERE account_id=? AND account_instance_id=? AND account_generation=?)
-		 OR EXISTS(SELECT 1 FROM account_removals WHERE account_id=? AND account_instance_id=? AND account_generation=?)
-		 OR EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=? AND account_instance_id=? AND account_generation=?)`,
-		reservation.ID, reservation.InstanceID, reservation.Generation,
-		reservation.ID, reservation.InstanceID, reservation.Generation,
-		reservation.ID, reservation.InstanceID, reservation.Generation,
-		reservation.ID, reservation.InstanceID, reservation.Generation,
-	).Scan(&evidence); err != nil {
-		return err
-	}
-	if evidence != 0 {
-		return ErrCredentialOperationEvidenceActive
-	}
-	if err := consumeReservation(tx, reservation); err != nil {
-		return err
-	}
-	return tx.Commit()
 }
 
 // PendingAddIndexes lists every live account-index reservation, ascending. It

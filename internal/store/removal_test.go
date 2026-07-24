@@ -29,6 +29,33 @@ func TestBeginAccountRemovalRejectsActiveSessionUntilClosed(t *testing.T) {
 	}
 }
 
+func TestBeginAccountRemovalRejectsPendingPresentationRepair(t *testing.T) {
+	s := openTest(t)
+	account := insertDesiredPresentationTestAccount(t, s, 1)
+	previous := presentationTestIdentity(account, "/presentation/previous")
+	if err := s.BindDesiredAccountPresentation(account, previous); err != nil {
+		t.Fatal(err)
+	}
+	target := previous
+	target.PublicPath = "/presentation/target"
+	if err := s.ObserveAccountPresentation(account, target); !errors.Is(err, ErrAccountPresentationQuarantined) {
+		t.Fatalf("observe repair target = %v", err)
+	}
+	repair, err := s.StageAccountPresentationRepair(account, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BeginAccountRemoval(account.ID, true); !errors.Is(err, ErrAccountPresentationBusy) {
+		t.Fatalf("removal with pending presentation repair = %v", err)
+	}
+	if _, err := s.CommitAccountPresentationRepair(repair); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BeginAccountRemoval(account.ID, true); err != nil {
+		t.Fatalf("removal after presentation repair = %v", err)
+	}
+}
+
 func TestBeginAccountRemovalRejectsAdmittedExternalOperations(t *testing.T) {
 	t.Run("account mutation", func(t *testing.T) {
 		s := openTest(t)

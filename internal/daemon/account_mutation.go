@@ -868,18 +868,26 @@ func (s *Server) bindAccountMutationPresentation(
 		}
 	}
 	if err != nil {
-		return store.AccountMutation{}, fmt.Errorf("provision add presentation: %w", err)
+		return store.AccountMutation{}, s.retireAndCancelUnboundAccountMutation(
+			ctx, mutation, fmt.Errorf("provision add presentation: %w", err),
+		)
 	}
 	if err := pool.EnsureAccountConfigDir(account.InstanceID, identity.PublicPath); err != nil {
-		return store.AccountMutation{}, fmt.Errorf("bind add execution path: %w", err)
+		return store.AccountMutation{}, s.retireAndCancelUnboundAccountMutation(
+			ctx, mutation, fmt.Errorf("bind add execution path: %w", err),
+		)
 	}
 	expectedState, err := s.m.CredentialExternalStateAt(ctx, account, identity.PublicPath)
 	if err != nil {
-		return store.AccountMutation{}, err
+		return store.AccountMutation{}, s.retireAndCancelUnboundAccountMutation(
+			ctx, mutation, err,
+		)
 	}
 	expected, err := expectedState.Digest()
 	if err != nil {
-		return store.AccountMutation{}, err
+		return store.AccountMutation{}, s.retireAndCancelUnboundAccountMutation(
+			ctx, mutation, err,
+		)
 	}
 	locator := store.CredentialKeychainLocatorDigest(
 		account.KeychainService, account.KeychainAccount,
@@ -889,7 +897,16 @@ func (s *Server) bindAccountMutationPresentation(
 		locator, expected,
 	)
 	if err != nil {
-		return store.AccountMutation{}, err
+		current, readErr := s.m.Store.AccountMutation(mutation.OperationID)
+		if readErr == nil && current.State == store.AccountMutationAwaitingPresentation &&
+			current.Owner == mutation.Owner && current.OwnerEpoch == mutation.OwnerEpoch &&
+			current.AccountInstanceID == mutation.AccountInstanceID &&
+			current.AccountGeneration == mutation.AccountGeneration {
+			return store.AccountMutation{}, s.retireAndCancelUnboundAccountMutation(
+				ctx, current, err,
+			)
+		}
+		return store.AccountMutation{}, errors.Join(err, readErr)
 	}
 	return s.m.Store.AccountMutation(fence.OperationID)
 }
@@ -906,6 +923,33 @@ func (s *Server) cancelUnboundAccountMutation(
 	mutation store.AccountMutation,
 	cause error,
 ) error {
+	return errors.Join(cause, s.m.Store.CancelUnboundAccountMutation(mutation.Fence()))
+}
+
+func (s *Server) retireAndCancelUnboundAccountMutation(
+	ctx context.Context,
+	mutation store.AccountMutation,
+	cause error,
+) error {
+	if s.m.RetirePendingAdd == nil {
+		return errors.Join(cause, errors.New("reserved presentation retirement is unavailable"))
+	}
+	cleanupCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx), accountMutationSettleWait,
+	)
+	defer cancel()
+	reservation := accountMutationReservation(mutation)
+	proof, err := s.m.RetirePendingAdd(cleanupCtx, reservation)
+	if err != nil {
+		return errors.Join(cause, fmt.Errorf("retire reserved presentation: %w", err))
+	}
+	if proof.AccountID != reservation.ID || proof.AccountInstanceID != reservation.InstanceID ||
+		proof.AccountGeneration != reservation.Generation || proof.PublicPath == "" {
+		return errors.Join(cause, errors.New("retire reserved presentation: invalid proof"))
+	}
+	if err := pool.RemoveAccountConfigDir(reservation.InstanceID, proof.PublicPath); err != nil {
+		return errors.Join(cause, fmt.Errorf("unlink retired reserved presentation: %w", err))
+	}
 	return errors.Join(cause, s.m.Store.CancelUnboundAccountMutation(mutation.Fence()))
 }
 

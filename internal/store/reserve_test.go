@@ -157,36 +157,6 @@ func TestPendingAddIndexes(t *testing.T) {
 	}
 }
 
-func TestRetiredPendingAddRequiresExactReapReceipt(t *testing.T) {
-	s := openReserveTest(t)
-	owner := credentialOperationTestOwner("pending-owner")
-	reservation, err := s.ReserveAccountIndex(owner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newOwner := credentialOperationTestOwner("pending-recovery")
-	if err := s.ReleaseRetiredPendingAdd(
-		t.Context(), reservation, newOwner, procZeroReceipt(), nil,
-	); err == nil {
-		t.Fatal("retired pending add released without an exact receipt")
-	}
-	if err := s.ReleaseAccountIndex(PendingAccountReservation{
-		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, Owner: newOwner,
-	}); err == nil {
-		t.Fatal("foreign owner released pending add")
-	}
-	receipt, verifier := credentialOperationTestRetirement(t, owner, newOwner)
-	if err := s.ReleaseRetiredPendingAdd(
-		t.Context(), reservation, newOwner, receipt, verifier,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pendingAccountReservationByID(s.db, reservation.ID); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("retired reservation survived: %v", err)
-	}
-}
-
 func TestPromoteReservedSyncedAccount(t *testing.T) {
 	t.Run("spends the reservation and lands the row", func(t *testing.T) {
 		s := openReserveTest(t)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
@@ -13,6 +14,7 @@ const (
 	credentialRecoveryReceiptPage = 16
 	credentialRecoveryLanePage    = 64
 	accountRecoveryReceiptPage    = 16
+	pendingAddRecoveryTimeout     = 30 * time.Second
 )
 
 var credentialRecoveryIDs = [...]proc.RecoveryID{
@@ -97,8 +99,6 @@ func (m *Manager) recoverCredentialOwnerPage(ctx context.Context) (bool, error) 
 }
 
 func (m *Manager) recoverCredentialOwnerPass(ctx context.Context) (bool, bool, error) {
-	var owner proc.Record
-	ownerReady := false
 	remaining := false
 	progressed := false
 	for _, recoveryID := range credentialRecoveryIDs {
@@ -115,15 +115,8 @@ func (m *Manager) recoverCredentialOwnerPass(ctx context.Context) (bool, bool, e
 		if len(page.Receipts) == 0 {
 			continue
 		}
-		if !ownerReady {
-			owner, err = m.credentialOwnerRecord()
-			if err != nil {
-				return true, progressed, err
-			}
-			ownerReady = true
-		}
 		classRemaining, classProgressed, err := m.recoverCredentialOwnerClass(
-			ctx, owner, page.Receipts,
+			ctx, page.Receipts,
 		)
 		remaining = remaining || classRemaining
 		progressed = progressed || classProgressed
@@ -136,7 +129,6 @@ func (m *Manager) recoverCredentialOwnerPass(ctx context.Context) (bool, bool, e
 
 func (m *Manager) recoverCredentialOwnerClass(
 	ctx context.Context,
-	owner proc.Record,
 	receipts []proc.ReapReceipt,
 ) (bool, bool, error) {
 	remaining := false
@@ -168,9 +160,19 @@ func (m *Manager) recoverCredentialOwnerClass(
 		}
 		remaining = remaining || pendingMore
 		for _, reservation := range pending {
-			if err := m.Store.ReleaseRetiredPendingAdd(
-				ctx, reservation, owner, receipt, m.workers.reaper,
-			); err != nil {
+			if m.RetirePendingAdd == nil {
+				log.Printf("pending add recovery deferred: account=%d: retirement proof is unavailable", reservation.ID)
+				continue
+			}
+			cleanupCtx, cancel := context.WithTimeout(
+				context.WithoutCancel(ctx), pendingAddRecoveryTimeout,
+			)
+			proof, err := m.RetirePendingAdd(cleanupCtx, reservation)
+			if err == nil {
+				err = m.AbandonReservedAdd(cleanupCtx, reservation, proof)
+			}
+			cancel()
+			if err != nil {
 				log.Printf("pending add recovery deferred: account=%d: %v", reservation.ID, err)
 				continue
 			}

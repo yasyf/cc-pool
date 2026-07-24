@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sync/atomic"
@@ -716,6 +717,7 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 	old := credentialRecoveryManager(t, st, credstest.NewFake(), "source-receipt-owner")
 	old.workers.owner = syntheticCredentialOwner(t, 1)
 	recovery := credentialRecoveryManager(t, st, old.Creds, "source-receipt-recovery")
+	installTestBackingRunner(recovery)
 
 	credentialBefore, err := old.credentialObservation(t.Context(), credentialAccount)
 	if err != nil {
@@ -740,6 +742,37 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 	}
 	if pending.ID == 0 {
 		t.Fatal("pending-add fixture was not created")
+	}
+	installTestBackingRunner(old)
+	home, err := Home()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingPublicPath := filepath.Join(
+		home, "Library", "CloudStorage", "pending-"+pending.InstanceID,
+	)
+	if err := os.MkdirAll(pendingPublicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	preparedPending, err := old.PrepareReservedAdd(t.Context(), pending, pendingPublicPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingMarker := filepath.Join(pendingPublicPath, "survives-recovery")
+	if err := os.WriteFile(pendingMarker, []byte("public"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recovery.RetirePendingAdd = func(
+		ctx context.Context,
+		reservation store.PendingAccountReservation,
+	) (PendingAddRetirementProof, error) {
+		if err := ctx.Err(); err != nil {
+			return PendingAddRetirementProof{}, err
+		}
+		return PendingAddRetirementProof{
+			AccountID: reservation.ID, AccountInstanceID: reservation.InstanceID,
+			AccountGeneration: reservation.Generation, PublicPath: preparedPending.PublicPath,
+		}, nil
 	}
 
 	mutationBefore, err := old.credentialObservation(t.Context(), mutationAccount)
@@ -811,6 +844,16 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 	if len(pendingRows) != 0 {
 		t.Fatalf("credential-owner pending add survived recovery = %+v", pendingRows)
 	}
+	if got, err := os.ReadFile(pendingMarker); err != nil || string(got) != "public" {
+		t.Fatalf("pending public target after recovery = %q err=%v", got, err)
+	}
+	reused, err := st.ReserveAccountIndex(recovery.workers.owner)
+	if err != nil || reused.ID != pending.ID {
+		t.Fatalf("reservation after proven retirement = %+v err=%v", reused, err)
+	}
+	if err := st.ReleaseAccountIndex(reused); err != nil {
+		t.Fatal(err)
+	}
 	page, err := recovery.workers.reaper.ReapReceipts(
 		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 3,
 	)
@@ -848,6 +891,47 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 	}
 	if err := reopened.Add(t.Context(), blockedOwner); err != nil {
 		t.Fatalf("credential-owner receipt acknowledgement did not reopen admission: %v", err)
+	}
+}
+
+func TestCredentialOwnerRecoveryRetainsPendingAddWhenRetirementIsAmbiguous(t *testing.T) {
+	st := openTestStore(t)
+	old := credentialRecoveryManager(t, st, credstest.NewFake(), "pending-retirement-old")
+	recovery := credentialRecoveryManager(t, st, old.Creds, "pending-retirement-new")
+	reservation, err := st.ReserveAccountIndex(old.workers.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, verifier := credentialRetirementReceipt(
+		t, old.workers.owner, recovery.workers.owner.Generation,
+	)
+	recovery.workers.reaper = verifier
+	retirementErr := errors.New("tenant retirement unavailable")
+	recovery.RetirePendingAdd = func(
+		context.Context,
+		store.PendingAccountReservation,
+	) (PendingAddRetirementProof, error) {
+		return PendingAddRetirementProof{}, retirementErr
+	}
+	remaining, _, err := recovery.recoverCredentialOwnerClass(
+		t.Context(), []proc.ReapReceipt{receipt},
+	)
+	if err != nil || !remaining {
+		t.Fatalf("ambiguous recovery = remaining %v err=%v", remaining, err)
+	}
+	pending, _, err := st.PendingAddReservationsOwnedBy(old.workers.owner, 0, 1)
+	if err != nil || len(pending) != 1 || pending[0].ID != reservation.ID {
+		t.Fatalf("retained reservation = %+v err=%v", pending, err)
+	}
+	next, err := st.ReserveAccountIndex(recovery.workers.owner)
+	if err != nil || next.ID == reservation.ID {
+		t.Fatalf("reservation reused after ambiguous retirement = %+v err=%v", next, err)
+	}
+	page, err := verifier.ReapReceipts(
+		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 1,
+	)
+	if err != nil || len(page.Receipts) != 1 || page.Receipts[0].Digest != receipt.Digest {
+		t.Fatalf("retained retirement receipt = %+v err=%v", page, err)
 	}
 }
 

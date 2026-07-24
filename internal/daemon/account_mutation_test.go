@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -341,6 +342,67 @@ func TestAccountMutationAddExecutionConflictRetainsStableReplayState(t *testing.
 	}
 	if target, err := os.Readlink(configDir); err != nil || target != identity.PublicPath {
 		t.Fatalf("replayed stable execution link = %q, %v", target, err)
+	}
+}
+
+func TestAccountMutationAddRetiresUnboundPresentationBeforeCancellation(t *testing.T) {
+	s, _, _ := newAccountMutationTestServer(t, false)
+	ctx, cancel := context.WithCancel(t.Context())
+	var publicPath string
+	var retired store.PendingAccountReservation
+	s.provisionPresentationIdentity = func(
+		_ context.Context,
+		account store.Account,
+	) (store.FileProviderPresentationIdentity, error) {
+		identity, err := accountMutationTestPresentation(t, account)
+		if err != nil {
+			return store.FileProviderPresentationIdentity{}, err
+		}
+		publicPath = identity.PublicPath
+		identity.TenantID = "invalid-tenant"
+		cancel()
+		return identity, nil
+	}
+	s.m.RetirePendingAdd = func(
+		cleanup context.Context,
+		reservation store.PendingAccountReservation,
+	) (pool.PendingAddRetirementProof, error) {
+		if err := cleanup.Err(); err != nil {
+			return pool.PendingAddRetirementProof{}, fmt.Errorf("cleanup inherited cancellation: %w", err)
+		}
+		retired = reservation
+		return pool.PendingAddRetirementProof{
+			AccountID: reservation.ID, AccountInstanceID: reservation.InstanceID,
+			AccountGeneration: reservation.Generation, PublicPath: publicPath,
+		}, nil
+	}
+	request := AccountMutationRequest{
+		Kind: AccountMutationAdd, Action: AccountMutationStartOrAttach, Label: "cancel-account",
+	}
+	input := make(chan wire.Chunk)
+	close(input)
+	if _, err := s.runAccountMutation(ctx, request, input, make(chan []byte, 8)); err == nil {
+		t.Fatal("invalid presentation bind unexpectedly succeeded")
+	}
+	if retired.ID != 1 {
+		t.Fatalf("retired reservation = %+v, want acct-01", retired)
+	}
+	if _, err := s.m.Store.ActiveAccountMutation(1); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unbound mutation survived exact retirement: %v", err)
+	}
+	indexes, err := s.m.Store.PendingAddIndexes()
+	if err != nil || len(indexes) != 0 {
+		t.Fatalf("pending reservation after exact retirement = %v err=%v", indexes, err)
+	}
+	configDir, err := pool.AccountConfigDir(retired.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(configDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stable execution link survived exact retirement: %v", err)
+	}
+	if info, err := os.Stat(publicPath); err != nil || !info.IsDir() {
+		t.Fatalf("public presentation target after retirement = %v err=%v", info, err)
 	}
 }
 

@@ -976,18 +976,20 @@ func (s *Store) BeginAccountRemoval(id int, deleteCredential bool) (AccountRemov
 	if err != nil {
 		return AccountRemoval{}, err
 	}
-	var activeSession, activeCredentialOperation int
+	var activeSession, activeCredentialOperation, presentationRepair int
 	var unacknowledgedAccountMutation, unacknowledgedCredentialOperation, credentialQuarantine int
 	if err := tx.QueryRow(
 		`SELECT EXISTS(SELECT 1 FROM sessions WHERE account_id=? AND ended_at IS NULL),
 		        EXISTS(SELECT 1 FROM credential_operations WHERE account_id=?),
 		        EXISTS(SELECT 1 FROM account_mutation_receipts WHERE account_id=? AND acknowledged_at IS NULL),
 		        EXISTS(SELECT 1 FROM credential_operation_receipts WHERE account_id=? AND acknowledged_at IS NULL),
-		        EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=?)`,
-		id, id, id, id, id,
+		        EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=?),
+		        EXISTS(SELECT 1 FROM account_presentation_repairs WHERE account_id=?)`,
+		id, id, id, id, id, id,
 	).Scan(
 		&activeSession, &activeCredentialOperation,
 		&unacknowledgedAccountMutation, &unacknowledgedCredentialOperation, &credentialQuarantine,
+		&presentationRepair,
 	); err != nil {
 		return AccountRemoval{}, err
 	}
@@ -996,6 +998,9 @@ func (s *Store) BeginAccountRemoval(id int, deleteCredential bool) (AccountRemov
 	}
 	if activeCredentialOperation != 0 {
 		return AccountRemoval{}, ErrCredentialOperationBusy
+	}
+	if presentationRepair != 0 {
+		return AccountRemoval{}, ErrAccountPresentationBusy
 	}
 	if unacknowledgedAccountMutation != 0 || unacknowledgedCredentialOperation != 0 || credentialQuarantine != 0 {
 		return AccountRemoval{}, ErrCredentialOperationEvidenceActive

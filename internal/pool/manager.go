@@ -100,6 +100,12 @@ type Manager struct {
 	// reservations. A caller-owned reservation may replace this through context;
 	// the returned release must be called after the durable lane settles.
 	ClaimCredentialMutation CredentialMutationClaim
+	// RetirePendingAdd obtains exact tenant-generation and File Provider absence
+	// proof before dead-owner pending state is cleaned up.
+	RetirePendingAdd func(
+		context.Context,
+		store.PendingAccountReservation,
+	) (PendingAddRetirementProof, error)
 
 	credentialMu      sync.Mutex
 	credentialFlights map[int]*credentialFlight

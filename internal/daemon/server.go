@@ -239,6 +239,7 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	s.scanSessions = s.m.ScanSessions
 	s.scanProcesses = s.m.ScanProcesses
 	s.tenantCoordinator = newTenantCoordinator(activation.Context(), s, preparer, tenantClient)
+	s.m.RetirePendingAdd = s.tenantCoordinator.retireReservedAccount
 	if err := s.recoverRetiredAccountMutations(activation.Context()); err != nil {
 		return fmt.Errorf("recover account mutations: %w", err)
 	}
@@ -304,6 +305,9 @@ func (s *Server) monitorHolderSession(ctx context.Context, done <-chan struct{})
 
 func (s *Server) clearActivation() {
 	s.holderActive.Store(false)
+	if s.m != nil {
+		s.m.RetirePendingAdd = nil
+	}
 	s.m = nil
 	s.tenantClient = nil
 	s.tenantCoordinator = nil
