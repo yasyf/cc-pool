@@ -26,10 +26,9 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	configDir := testFileProviderConfigDir(1)
-	svc := creds.ServiceName(configDir)
-	a := store.Account{ID: 1, ConfigDir: configDir, KeychainService: svc, KeychainAccount: "user"}
+	a := store.Account{ID: 1, KeychainAccount: "user"}
 	a = persistTestAccount(t, st, a)
+	svc := a.KeychainService
 
 	fk := credstest.NewFake()
 	cred := &creds.Credential{}
@@ -56,7 +55,11 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginAccountRemoval: %v", err)
 	}
-	if err := m.FinishAccountRemoval(t.Context(), removal); err != nil {
+	presentation, err := st.AccountPresentation(a.ID)
+	if err != nil {
+		t.Fatalf("AccountPresentation: %v", err)
+	}
+	if err := m.FinishAccountRemoval(t.Context(), removal, presentation.Identity.PublicPath); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
 

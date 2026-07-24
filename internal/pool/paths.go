@@ -98,6 +98,11 @@ func AccountBackingDir(id int) string {
 	return filepath.Join(FuseKitBackingRoot(), AccountDirName(id))
 }
 
+// FileProviderConfigDir returns the deterministic public root for one account domain.
+func FileProviderConfigDir(id int) string {
+	return filepath.Join(mustHome(), "Library", "CloudStorage", "CCPoolStatus-"+AccountDirName(id))
+}
+
 // DBPath is the v1 runtime sqlite database path.
 func DBPath() string {
 	return statePath("pool-v1.db")

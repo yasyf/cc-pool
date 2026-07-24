@@ -31,15 +31,18 @@ var errCredentialCASConflict = errors.New("credential changed before compare-and
 // CredentialCASRequest is the exact v1 request accepted by the disposable
 // credential compare-and-swap worker.
 type CredentialCASRequest struct {
-	AccountID       int                           `json:"account_id"`
-	ConfigDir       string                        `json:"config_dir"`
-	KeychainService string                        `json:"keychain_service"`
-	KeychainAccount string                        `json:"keychain_account"`
-	Expected        store.CredentialExternalState `json:"expected"`
-	Credential      []byte                        `json:"credential"`
-	Delete          bool                          `json:"delete"`
-	Refresh         bool                          `json:"refresh"`
-	UserAgent       string                        `json:"user_agent,omitempty"`
+	AccountID          int                           `json:"account_id"`
+	AccountInstanceID  string                        `json:"account_instance_id"`
+	AccountGeneration  uint64                        `json:"account_generation"`
+	ConfigDir          string                        `json:"config_dir"`
+	ExpectedPublicPath string                        `json:"expected_public_path"`
+	KeychainService    string                        `json:"keychain_service"`
+	KeychainAccount    string                        `json:"keychain_account"`
+	Expected           store.CredentialExternalState `json:"expected"`
+	Credential         []byte                        `json:"credential"`
+	Delete             bool                          `json:"delete"`
+	Refresh            bool                          `json:"refresh"`
+	UserAgent          string                        `json:"user_agent,omitempty"`
 }
 
 // CredentialCASResponse is the exact v1 result emitted by the disposable
@@ -62,9 +65,10 @@ type credentialCASProof struct {
 }
 
 type credentialCASMutation struct {
-	Credential *creds.Credential
-	Delete     bool
-	Refresh    bool
+	Credential         *creds.Credential
+	ExpectedPublicPath string
+	Delete             bool
+	Refresh            bool
 }
 
 type credentialCASFunc func(
@@ -91,9 +95,20 @@ func (m *Manager) runCredentialCAS(
 			return credentialCASProof{}, err
 		}
 	}
+	publicPath := mutation.ExpectedPublicPath
+	if publicPath == "" {
+		publicPath, err = m.validateStoredCredentialBoundary(account)
+	} else {
+		err = ValidateAccountCredentialBoundary(account, publicPath)
+	}
+	if err != nil {
+		return credentialCASProof{}, err
+	}
 	request := CredentialCASRequest{
-		AccountID: account.ID, ConfigDir: account.ConfigDir,
-		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
+		AccountID: account.ID, AccountInstanceID: account.InstanceID,
+		AccountGeneration: account.Generation, ConfigDir: account.ConfigDir,
+		ExpectedPublicPath: publicPath,
+		KeychainService:    account.KeychainService, KeychainAccount: account.KeychainAccount,
 		Expected: expected, Credential: payload,
 		Delete: mutation.Delete, Refresh: mutation.Refresh,
 	}
@@ -405,11 +420,14 @@ func observeCredentialCASSlot(
 func validateCredentialCASRequest(request CredentialCASRequest) error {
 	if request.AccountID < 1 || !filepath.IsAbs(request.ConfigDir) ||
 		filepath.Clean(request.ConfigDir) != request.ConfigDir || strings.ContainsRune(request.ConfigDir, 0) {
-		return errors.New("credential CAS account path is not one exact absolute presentation path")
+		return errors.New("credential CAS account path is not one exact absolute execution path")
 	}
-	if request.KeychainService != creds.ServiceName(request.ConfigDir) ||
-		request.KeychainAccount == "" || filepath.Base(request.KeychainAccount) != request.KeychainAccount {
-		return errors.New("credential CAS Keychain identity is not canonical")
+	if err := ValidateAccountCredentialBoundary(store.Account{
+		ID: request.AccountID, InstanceID: request.AccountInstanceID,
+		Generation: request.AccountGeneration, ConfigDir: request.ConfigDir,
+		KeychainService: request.KeychainService, KeychainAccount: request.KeychainAccount,
+	}, request.ExpectedPublicPath); err != nil {
+		return fmt.Errorf("credential CAS identity: %w", err)
 	}
 	modes := 0
 	if len(request.Credential) != 0 {
@@ -438,7 +456,7 @@ func validateCredentialCASRequest(request CredentialCASRequest) error {
 	if _, err := request.Expected.Digest(); err != nil {
 		return err
 	}
-	return validateCredentialLockDirectory(request.ConfigDir)
+	return nil
 }
 
 // DecodeCredentialCASRequest decodes one exact v1 worker request frame.

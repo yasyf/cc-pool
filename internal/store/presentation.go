@@ -17,43 +17,12 @@ var (
 	ErrAccountPresentationBusy = errors.New("account presentation is busy")
 )
 
-// FileProviderPreparationProof is the exact File Provider arm of one preparation proof.
-type FileProviderPreparationProof struct {
-	TenantID             string
-	DomainID             string
-	Generation           uint64
-	ActivationGeneration string
-	PublicPath           string
-}
-
-// PresentationKindFileProvider identifies the sole account presentation kind.
-const PresentationKindFileProvider = "file_provider"
-
-// PresentationPreparationProof is the product-owned projection of one exact
-// FuseKit tenant preparation proof.
-type PresentationPreparationProof struct {
-	CatalogTenantID   string
-	CatalogGeneration uint64
-	Requested         uint64
-	Desired           uint64
-	Observed          uint64
-	Verified          uint64
-	Applied           uint64
-	SourceAuthority   string
-	SourceRevision    uint64
-	CatalogRevision   uint64
-	ChangeID          string
-	OperationID       string
-	PresentationKind  string
-	FileProvider      FileProviderPreparationProof
-}
-
-// AccountPresentation is the last exact proof bound to an account generation.
+// AccountPresentation is the immutable presentation identity bound to an account generation.
 type AccountPresentation struct {
 	AccountID         int
 	AccountInstanceID string
 	AccountGeneration uint64
-	Proof             PresentationPreparationProof
+	Identity          FileProviderPresentationIdentity
 	ObservedAt        time.Time
 }
 
@@ -86,17 +55,16 @@ type AccountPresentationQuarantine struct {
 	AccountInstanceID string
 	AccountGeneration uint64
 	ExpectedConfigDir string
-	Proof             PresentationPreparationProof
+	Observed          FileProviderPresentationIdentity
 	Reason            AccountPresentationQuarantineReason
 	CreatedAt         time.Time
 }
 
-// ObserveAccountPresentation binds matching proof evidence or durably quarantines drift.
-func (s *Store) ObserveAccountPresentation(account Account, proof PresentationPreparationProof) error {
-	if err := validatePresentationPreparationProof(proof); err != nil {
+// ObserveAccountPresentation validates an observed presentation identity or durably quarantines drift.
+func (s *Store) ObserveAccountPresentation(account Account, observed FileProviderPresentationIdentity) error {
+	if err := validateFileProviderPresentationIdentity(observed); err != nil {
 		return err
 	}
-	fileProvider := proof.FileProvider
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -121,12 +89,12 @@ func (s *Store) ObserveAccountPresentation(account Account, proof PresentationPr
 	if err != nil {
 		return err
 	}
-	reason := presentationMismatch(current, bound, fileProvider)
+	reason := presentationMismatch(current, bound, observed)
 	if reason != "" {
 		quarantine := AccountPresentationQuarantine{
 			AccountID: current.ID, AccountInstanceID: current.InstanceID,
 			AccountGeneration: current.Generation, ExpectedConfigDir: current.ConfigDir,
-			Proof: proof, Reason: reason, CreatedAt: s.now(),
+			Observed: observed, Reason: reason, CreatedAt: s.now(),
 		}
 		if err := insertAccountPresentationQuarantine(tx, quarantine); err != nil {
 			return err
@@ -136,28 +104,14 @@ func (s *Store) ObserveAccountPresentation(account Account, proof PresentationPr
 		}
 		return ErrAccountPresentationQuarantined
 	}
-	if err := ValidatePresentationPreparationProofAdvance(bound.Proof, proof); err != nil {
-		return err
-	}
-	if err := upsertAccountPresentation(tx, AccountPresentation{
-		AccountID: current.ID, AccountInstanceID: current.InstanceID,
-		AccountGeneration: current.Generation, Proof: proof, ObservedAt: s.now(),
-	}); err != nil {
-		return err
-	}
 	return tx.Commit()
 }
 
-// BindDesiredAccountPresentation atomically installs the first live holder
-// proof for a desired account or advances an already-bound exact identity.
+// BindDesiredAccountPresentation atomically installs one immutable presentation identity.
 func (s *Store) BindDesiredAccountPresentation(
 	account Account,
 	expected FileProviderPresentationIdentity,
-	proof PresentationPreparationProof,
 ) error {
-	if err := validatePresentationPreparationProof(proof); err != nil {
-		return err
-	}
 	if err := validateExpectedPresentationIdentity(account, expected); err != nil {
 		return err
 	}
@@ -184,38 +138,26 @@ func (s *Store) BindDesiredAccountPresentation(
 		}
 		return err
 	}
-	if reason := expectedPresentationMismatch(expected, proof); reason != "" {
-		quarantine := AccountPresentationQuarantine{
-			AccountID: current.ID, AccountInstanceID: current.InstanceID,
-			AccountGeneration: current.Generation, ExpectedConfigDir: current.ConfigDir,
-			Proof: proof, Reason: reason, CreatedAt: s.now(),
-		}
-		if err := insertAccountPresentationQuarantine(tx, quarantine); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-		return ErrAccountPresentationQuarantined
-	}
 	bound, err := accountPresentation(tx, account.ID)
 	if err == nil {
-		if err := ValidatePresentationPreparationProofAdvance(bound.Proof, proof); err != nil {
-			return err
+		if bound.Identity != expected {
+			return ErrAccountPresentationEvidence
 		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
+		return tx.Commit()
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	if err := upsertAccountPresentation(tx, AccountPresentation{
 		AccountID: current.ID, AccountInstanceID: current.InstanceID,
-		AccountGeneration: current.Generation, Proof: proof, ObservedAt: s.now(),
+		AccountGeneration: current.Generation, Identity: expected, ObservedAt: s.now(),
 	}); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// AccountPresentation returns the current proof binding for one account.
+// AccountPresentation returns the current identity binding for one account.
 func (s *Store) AccountPresentation(accountID int) (AccountPresentation, error) {
 	return accountPresentation(s.db, accountID)
 }
@@ -225,70 +167,19 @@ func (s *Store) AccountPresentationQuarantine(accountID int) (AccountPresentatio
 	return accountPresentationQuarantine(s.db, accountID)
 }
 
-// RefreshAccountPresentation atomically advances one admitted binding while
-// its account identity and previously retained proof still match.
-func (s *Store) RefreshAccountPresentation(
-	account Account,
-	currentProof PresentationPreparationProof,
-	freshProof PresentationPreparationProof,
-) error {
-	if err := validatePresentationPreparationProofForAccount(
-		freshProof, account.InstanceID, account.Generation, account.ConfigDir,
-	); err != nil {
-		return err
-	}
-	if err := ValidatePresentationPreparationProofAdvance(currentProof, freshProof); err != nil {
-		return err
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	current, err := presentationAccount(tx, account.ID)
-	if err != nil {
-		return err
-	}
-	if !samePresentationAccount(current, account) {
-		return ErrAccountGenerationChanged
-	}
-	if _, err := accountPresentationQuarantine(tx, account.ID); err == nil {
-		return ErrAccountPresentationQuarantined
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	bound, err := accountPresentation(tx, account.ID)
-	if err != nil {
-		return err
-	}
-	if bound.AccountInstanceID != account.InstanceID ||
-		bound.AccountGeneration != account.Generation || bound.Proof != currentProof {
-		return ErrAccountPresentationEvidence
-	}
-	if err := upsertAccountPresentation(tx, AccountPresentation{
-		AccountID: account.ID, AccountInstanceID: account.InstanceID,
-		AccountGeneration: account.Generation, Proof: freshProof, ObservedAt: s.now(),
-	}); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
 // StageSyncedAccountAdmission durably records exact external evidence and
 // advances the presentation while retaining awaiting-origin state.
 func (s *Store) StageSyncedAccountAdmission(
 	account Account,
-	currentProof PresentationPreparationProof,
-	freshProof PresentationPreparationProof,
+	currentIdentity FileProviderPresentationIdentity,
+	freshIdentity FileProviderPresentationIdentity,
 	credential SyncedCredentialAdmissionFence,
 ) (SyncedCredentialAdmissionStage, error) {
-	if err := validatePresentationPreparationProofForAccount(
-		freshProof, account.InstanceID, account.Generation, account.ConfigDir,
-	); err != nil {
+	if err := validateExpectedPresentationIdentity(account, freshIdentity); err != nil {
 		return SyncedCredentialAdmissionStage{}, err
 	}
-	if err := ValidatePresentationPreparationProofAdvance(currentProof, freshProof); err != nil {
-		return SyncedCredentialAdmissionStage{}, err
+	if currentIdentity != freshIdentity {
+		return SyncedCredentialAdmissionStage{}, ErrAccountPresentationEvidence
 	}
 	if err := credential.validate(account); err != nil {
 		return SyncedCredentialAdmissionStage{}, err
@@ -318,7 +209,7 @@ func (s *Store) StageSyncedAccountAdmission(
 	}
 	if final, finalErr := syncedCredentialAdmissionTx(tx, account); finalErr == nil &&
 		sameSyncedCredentialAdmissionFence(final.SyncedCredentialAdmissionFence, credential) &&
-		bound.Proof == freshProof && health.healthyOwned() {
+		bound.Identity == freshIdentity && health.healthyOwned() {
 		return SyncedCredentialAdmissionStage{
 			AccountID: account.ID, SyncedCredentialAdmissionFence: credential,
 			StagedAt: final.AdmittedAt, Finalized: true,
@@ -328,20 +219,20 @@ func (s *Store) StageSyncedAccountAdmission(
 	}
 	if pending, pendingErr := pendingSyncedCredentialAdmissionTx(tx, account); pendingErr == nil &&
 		sameSyncedCredentialAdmissionFence(pending.SyncedCredentialAdmissionFence, credential) &&
-		bound.Proof == freshProof && health.awaitingOrigin() {
+		bound.Identity == freshIdentity && health.awaitingOrigin() {
 		return pending, nil
 	} else if pendingErr != nil && !errors.Is(pendingErr, sql.ErrNoRows) {
 		return SyncedCredentialAdmissionStage{}, pendingErr
 	}
 	if bound.AccountInstanceID != account.InstanceID ||
-		bound.AccountGeneration != account.Generation || bound.Proof != currentProof ||
+		bound.AccountGeneration != account.Generation || bound.Identity != currentIdentity ||
 		!health.awaitingOrigin() {
 		return SyncedCredentialAdmissionStage{}, ErrAccountPresentationEvidence
 	}
 	now := s.now()
 	if err := upsertAccountPresentation(tx, AccountPresentation{
 		AccountID: account.ID, AccountInstanceID: account.InstanceID,
-		AccountGeneration: account.Generation, Proof: freshProof, ObservedAt: now,
+		AccountGeneration: account.Generation, Identity: freshIdentity, ObservedAt: now,
 	}); err != nil {
 		return SyncedCredentialAdmissionStage{}, err
 	}
@@ -381,12 +272,10 @@ func (s *Store) StageSyncedAccountAdmission(
 // retaining the pending admission fence and awaiting-origin state.
 func (s *Store) CommitSyncedAccountAdmissionCandidate(
 	account Account,
-	freshProof PresentationPreparationProof,
+	identity FileProviderPresentationIdentity,
 	credential SyncedCredentialAdmissionFence,
 ) (bool, error) {
-	if err := validatePresentationPreparationProofForAccount(
-		freshProof, account.InstanceID, account.Generation, account.ConfigDir,
-	); err != nil {
+	if err := validateExpectedPresentationIdentity(account, identity); err != nil {
 		return false, err
 	}
 	if err := credential.validate(account); err != nil {
@@ -418,7 +307,7 @@ func (s *Store) CommitSyncedAccountAdmissionCandidate(
 	pending, err := pendingSyncedCredentialAdmissionTx(tx, account)
 	if err != nil || !sameSyncedCredentialAdmissionFence(
 		pending.SyncedCredentialAdmissionFence, credential,
-	) || bound.Proof != freshProof || !health.awaitingOrigin() {
+	) || bound.Identity != identity || !health.awaitingOrigin() {
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return false, err
 		}
@@ -466,12 +355,10 @@ func (s *Store) CommitSyncedAccountAdmissionCandidate(
 // sole transition that clears awaiting-origin state.
 func (s *Store) SettleSyncedAccountAdmission(
 	account Account,
-	freshProof PresentationPreparationProof,
+	identity FileProviderPresentationIdentity,
 	credential SyncedCredentialAdmissionFence,
 ) (bool, error) {
-	if err := validatePresentationPreparationProofForAccount(
-		freshProof, account.InstanceID, account.Generation, account.ConfigDir,
-	); err != nil {
+	if err := validateExpectedPresentationIdentity(account, identity); err != nil {
 		return false, err
 	}
 	if err := credential.validate(account); err != nil {
@@ -493,7 +380,7 @@ func (s *Store) SettleSyncedAccountAdmission(
 		return false, err
 	}
 	bound, err := accountPresentation(tx, account.ID)
-	if err != nil || bound.Proof != freshProof {
+	if err != nil || bound.Identity != identity {
 		if err != nil {
 			return false, err
 		}
@@ -573,12 +460,10 @@ func (s *Store) SettleSyncedAccountAdmission(
 // retaining its pending liability and awaiting-origin state.
 func (s *Store) RejectSyncedAccountAdmissionCandidate(
 	account Account,
-	freshProof PresentationPreparationProof,
+	identity FileProviderPresentationIdentity,
 	credential SyncedCredentialAdmissionFence,
 ) error {
-	if err := validatePresentationPreparationProofForAccount(
-		freshProof, account.InstanceID, account.Generation, account.ConfigDir,
-	); err != nil {
+	if err := validateExpectedPresentationIdentity(account, identity); err != nil {
 		return err
 	}
 	if err := credential.validate(account); err != nil {
@@ -611,7 +496,7 @@ func (s *Store) RejectSyncedAccountAdmissionCandidate(
 		return err
 	}
 	bound, err := accountPresentation(tx, account.ID)
-	if err != nil || bound.Proof != freshProof {
+	if err != nil || bound.Identity != identity {
 		if err != nil {
 			return err
 		}
@@ -665,12 +550,10 @@ func (s *Store) RejectSyncedAccountAdmissionCandidate(
 // pending liability after a confirmed external credential change.
 func (s *Store) InvalidateSyncedAccountAdmission(
 	account Account,
-	proof PresentationPreparationProof,
+	identity FileProviderPresentationIdentity,
 	credential SyncedCredentialAdmissionFence,
 ) error {
-	if err := validatePresentationPreparationProofForAccount(
-		proof, account.InstanceID, account.Generation, account.ConfigDir,
-	); err != nil {
+	if err := validateExpectedPresentationIdentity(account, identity); err != nil {
 		return err
 	}
 	if err := credential.validate(account); err != nil {
@@ -703,7 +586,7 @@ func (s *Store) InvalidateSyncedAccountAdmission(
 		return err
 	}
 	bound, err := accountPresentation(tx, account.ID)
-	if err != nil || bound.Proof != proof {
+	if err != nil || bound.Identity != identity {
 		if err != nil {
 			return err
 		}
@@ -923,103 +806,26 @@ func syncedCredentialAdmissionTx(
 	return result, nil
 }
 
-func validateFileProviderPreparationProof(fileProvider FileProviderPreparationProof) error {
-	if fileProvider.TenantID == "" || fileProvider.DomainID == "" || fileProvider.Generation == 0 ||
-		fileProvider.ActivationGeneration == "" || !exactPresentationPath(fileProvider.PublicPath) ||
-		strings.ContainsRune(fileProvider.TenantID, 0) || strings.ContainsRune(fileProvider.DomainID, 0) ||
-		strings.ContainsRune(fileProvider.ActivationGeneration, 0) {
+func validateFileProviderPresentationIdentity(identity FileProviderPresentationIdentity) error {
+	if identity.TenantID == "" || identity.DomainID == "" || identity.Generation == 0 ||
+		!exactPresentationPath(identity.PublicPath) || strings.ContainsRune(identity.TenantID, 0) ||
+		strings.ContainsRune(identity.DomainID, 0) {
 		return ErrAccountPresentationEvidence
 	}
 	return nil
 }
 
-func validatePresentationPreparationProof(proof PresentationPreparationProof) error {
-	if proof.PresentationKind != PresentationKindFileProvider {
-		return ErrAccountPresentationEvidence
-	}
-	if err := validateFileProviderPreparationProof(proof.FileProvider); err != nil {
-		return err
-	}
-	if proof.CatalogTenantID == "" || proof.CatalogGeneration == 0 || proof.Requested == 0 ||
-		proof.Desired != proof.Requested || proof.Observed != proof.Requested ||
-		proof.Verified != proof.Requested || proof.Applied != proof.Requested ||
-		proof.SourceAuthority == "" || proof.SourceRevision == 0 ||
-		proof.CatalogRevision != proof.Requested || proof.ChangeID == "" || proof.OperationID == "" ||
-		proof.CatalogTenantID != proof.FileProvider.TenantID ||
-		proof.CatalogGeneration != proof.FileProvider.Generation {
-		return ErrAccountPresentationEvidence
-	}
-	for _, value := range []string{
-		proof.CatalogTenantID, proof.SourceAuthority, proof.ChangeID, proof.OperationID,
-	} {
-		if strings.ContainsRune(value, 0) {
-			return ErrAccountPresentationEvidence
-		}
-	}
-	return nil
-}
-
-func validatePresentationPreparationProofForAccount(
-	proof PresentationPreparationProof,
-	instanceID string,
-	generation uint64,
-	publicPath string,
-) error {
-	if err := validatePresentationPreparationProof(proof); err != nil {
-		return err
-	}
-	if validateAccountInstanceID(instanceID) != nil ||
-		proof.CatalogTenantID != "account-"+instanceID ||
-		proof.CatalogGeneration != generation || proof.FileProvider.Generation != generation ||
-		proof.FileProvider.PublicPath != publicPath {
-		return ErrAccountPresentationEvidence
-	}
-	return nil
-}
-
-// ValidateReservedPresentationPreparationProof requires proof for exactly one
-// prospective account identity before any product-owned state is materialized.
-func ValidateReservedPresentationPreparationProof(
+// ValidateReservedPresentationIdentity requires one exact prospective account identity.
+func ValidateReservedPresentationIdentity(
 	reservation PendingAccountReservation,
-	proof PresentationPreparationProof,
+	identity FileProviderPresentationIdentity,
 ) error {
-	return validatePresentationPreparationProofForAccount(
-		proof,
-		reservation.InstanceID,
-		reservation.Generation,
-		proof.FileProvider.PublicPath,
-	)
-}
-
-// ValidatePresentationPreparationProofAdvance permits only a monotonic proof
-// refresh for the same presentation identity and source authority.
-func ValidatePresentationPreparationProofAdvance(
-	current PresentationPreparationProof,
-	next PresentationPreparationProof,
-) error {
-	if err := validatePresentationPreparationProof(current); err != nil {
+	if err := validateFileProviderPresentationIdentity(identity); err != nil {
 		return err
 	}
-	if err := validatePresentationPreparationProof(next); err != nil {
-		return err
-	}
-	if current.CatalogTenantID != next.CatalogTenantID ||
-		current.CatalogGeneration != next.CatalogGeneration ||
-		current.SourceAuthority != next.SourceAuthority ||
-		current.PresentationKind != next.PresentationKind ||
-		current.FileProvider.TenantID != next.FileProvider.TenantID ||
-		current.FileProvider.DomainID != next.FileProvider.DomainID ||
-		current.FileProvider.Generation != next.FileProvider.Generation ||
-		current.FileProvider.PublicPath != next.FileProvider.PublicPath ||
-		next.Requested < current.Requested ||
-		next.SourceRevision < current.SourceRevision ||
-		next.CatalogRevision < current.CatalogRevision {
-		return ErrAccountPresentationEvidence
-	}
-	revisionAdvanced := next.Requested > current.Requested ||
-		next.SourceRevision > current.SourceRevision ||
-		next.CatalogRevision > current.CatalogRevision
-	if !revisionAdvanced && (next.ChangeID != current.ChangeID || next.OperationID != current.OperationID) {
+	if validateAccountInstanceID(reservation.InstanceID) != nil ||
+		identity.TenantID != "account-"+reservation.InstanceID ||
+		identity.Generation != reservation.Generation {
 		return ErrAccountPresentationEvidence
 	}
 	return nil
@@ -1030,33 +836,15 @@ func exactPresentationPath(path string) bool {
 }
 
 func validateExpectedPresentationIdentity(account Account, expected FileProviderPresentationIdentity) error {
-	if validateAccountInstanceID(account.InstanceID) != nil ||
+	if validateFileProviderPresentationIdentity(expected) != nil ||
+		validateAccountInstanceID(account.InstanceID) != nil ||
 		expected.TenantID != "account-"+account.InstanceID ||
 		expected.DomainID == "" || strings.ContainsRune(expected.DomainID, 0) ||
-		expected.Generation != account.Generation || expected.PublicPath != account.ConfigDir ||
+		expected.Generation != account.Generation ||
 		!exactPresentationPath(expected.PublicPath) {
 		return ErrAccountPresentationEvidence
 	}
 	return nil
-}
-
-func expectedPresentationMismatch(
-	expected FileProviderPresentationIdentity,
-	proof PresentationPreparationProof,
-) AccountPresentationQuarantineReason {
-	if proof.CatalogTenantID != expected.TenantID || proof.FileProvider.TenantID != expected.TenantID {
-		return AccountPresentationTenantIDDrift
-	}
-	if proof.FileProvider.DomainID != expected.DomainID {
-		return AccountPresentationDomainIDDrift
-	}
-	if proof.CatalogGeneration != expected.Generation || proof.FileProvider.Generation != expected.Generation {
-		return AccountPresentationGenerationDrift
-	}
-	if proof.FileProvider.PublicPath != expected.PublicPath {
-		return AccountPresentationPublicPathDrift
-	}
-	return ""
 }
 
 func samePresentationAccount(current, expected Account) bool {
@@ -1069,24 +857,21 @@ func samePresentationAccount(current, expected Account) bool {
 func presentationMismatch(
 	account Account,
 	bound AccountPresentation,
-	fileProvider FileProviderPreparationProof,
+	observed FileProviderPresentationIdentity,
 ) AccountPresentationQuarantineReason {
-	if fileProvider.Generation != account.Generation {
+	if observed.Generation != account.Generation {
 		return AccountPresentationGenerationDrift
 	}
-	if fileProvider.PublicPath != account.ConfigDir {
-		return AccountPresentationPublicPathDrift
-	}
-	if fileProvider.TenantID != bound.Proof.FileProvider.TenantID {
+	if observed.TenantID != bound.Identity.TenantID {
 		return AccountPresentationTenantIDDrift
 	}
-	if fileProvider.DomainID != bound.Proof.FileProvider.DomainID {
+	if observed.DomainID != bound.Identity.DomainID {
 		return AccountPresentationDomainIDDrift
 	}
-	if fileProvider.Generation != bound.Proof.FileProvider.Generation {
+	if observed.Generation != bound.Identity.Generation {
 		return AccountPresentationGenerationDrift
 	}
-	if fileProvider.PublicPath != bound.Proof.FileProvider.PublicPath {
+	if observed.PublicPath != bound.Identity.PublicPath {
 		return AccountPresentationPublicPathDrift
 	}
 	return ""
@@ -1114,25 +899,15 @@ func accountPresentation(queryer presentationQueryer, accountID int) (AccountPre
 	var observedAt int64
 	err := queryer.QueryRow(
 		`SELECT account_id,account_instance_id,account_generation,tenant_id,domain_id,
-		 presentation_generation,activation_generation,public_path,
-		 presentation_kind,catalog_tenant_id,catalog_generation,
-		 catalog_requested,catalog_desired,catalog_observed,catalog_verified,catalog_applied,
-		 source_authority,source_revision,catalog_revision,change_id,operation_id,observed_at
+		 presentation_generation,public_path,observed_at
 		 FROM account_presentations WHERE account_id=?`, accountID,
 	).Scan(
 		&presentation.AccountID, &presentation.AccountInstanceID, &presentation.AccountGeneration,
-		&presentation.Proof.FileProvider.TenantID, &presentation.Proof.FileProvider.DomainID,
-		&presentation.Proof.FileProvider.Generation, &presentation.Proof.FileProvider.ActivationGeneration,
-		&presentation.Proof.FileProvider.PublicPath, &presentation.Proof.PresentationKind,
-		&presentation.Proof.CatalogTenantID, &presentation.Proof.CatalogGeneration,
-		&presentation.Proof.Requested, &presentation.Proof.Desired, &presentation.Proof.Observed,
-		&presentation.Proof.Verified, &presentation.Proof.Applied,
-		&presentation.Proof.SourceAuthority, &presentation.Proof.SourceRevision,
-		&presentation.Proof.CatalogRevision, &presentation.Proof.ChangeID,
-		&presentation.Proof.OperationID, &observedAt,
+		&presentation.Identity.TenantID, &presentation.Identity.DomainID,
+		&presentation.Identity.Generation, &presentation.Identity.PublicPath, &observedAt,
 	)
 	if err == nil {
-		err = validatePresentationPreparationProof(presentation.Proof)
+		err = validateFileProviderPresentationIdentity(presentation.Identity)
 	}
 	presentation.ObservedAt = time.Unix(0, observedAt)
 	return presentation, err
@@ -1142,28 +917,12 @@ func upsertAccountPresentation(tx *sql.Tx, presentation AccountPresentation) err
 	_, err := tx.Exec(
 		`INSERT INTO account_presentations(
 		 account_id,account_instance_id,account_generation,tenant_id,domain_id,
-		 presentation_generation,activation_generation,public_path,
-		 presentation_kind,catalog_tenant_id,catalog_generation,
-		 catalog_requested,catalog_desired,catalog_observed,catalog_verified,catalog_applied,
-		 source_authority,source_revision,catalog_revision,change_id,operation_id,observed_at
-		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		 ON CONFLICT(account_id) DO UPDATE SET
-		 activation_generation=excluded.activation_generation,
-		 catalog_requested=excluded.catalog_requested,catalog_desired=excluded.catalog_desired,
-		 catalog_observed=excluded.catalog_observed,catalog_verified=excluded.catalog_verified,
-		 catalog_applied=excluded.catalog_applied,source_authority=excluded.source_authority,
-		 source_revision=excluded.source_revision,catalog_revision=excluded.catalog_revision,
-		 change_id=excluded.change_id,operation_id=excluded.operation_id,observed_at=excluded.observed_at`,
+		 presentation_generation,public_path,observed_at
+		 ) VALUES(?,?,?,?,?,?,?,?)
+		 ON CONFLICT(account_id) DO UPDATE SET observed_at=excluded.observed_at`,
 		presentation.AccountID, presentation.AccountInstanceID, presentation.AccountGeneration,
-		presentation.Proof.FileProvider.TenantID, presentation.Proof.FileProvider.DomainID,
-		presentation.Proof.FileProvider.Generation, presentation.Proof.FileProvider.ActivationGeneration,
-		presentation.Proof.FileProvider.PublicPath, presentation.Proof.PresentationKind,
-		presentation.Proof.CatalogTenantID, presentation.Proof.CatalogGeneration,
-		presentation.Proof.Requested, presentation.Proof.Desired, presentation.Proof.Observed,
-		presentation.Proof.Verified, presentation.Proof.Applied,
-		presentation.Proof.SourceAuthority, presentation.Proof.SourceRevision,
-		presentation.Proof.CatalogRevision, presentation.Proof.ChangeID,
-		presentation.Proof.OperationID, presentation.ObservedAt.UnixNano(),
+		presentation.Identity.TenantID, presentation.Identity.DomainID,
+		presentation.Identity.Generation, presentation.Identity.PublicPath, presentation.ObservedAt.UnixNano(),
 	)
 	return err
 }
@@ -1176,31 +935,17 @@ func accountPresentationQuarantine(
 	var createdAt int64
 	err := queryer.QueryRow(
 		`SELECT account_id,account_instance_id,account_generation,expected_config_dir,
-		 observed_tenant_id,observed_domain_id,observed_generation,
-		 observed_activation_generation,observed_public_path,
-		 observed_presentation_kind,
-		 observed_catalog_tenant_id,observed_catalog_generation,
-		 observed_catalog_requested,observed_catalog_desired,observed_catalog_observed,
-		 observed_catalog_verified,observed_catalog_applied,observed_source_authority,
-		 observed_source_revision,observed_catalog_revision,observed_change_id,
-		 observed_operation_id,reason,created_at
+		 observed_tenant_id,observed_domain_id,observed_generation,observed_public_path,reason,created_at
 		 FROM account_presentation_quarantines WHERE account_id=?`, accountID,
 	).Scan(
 		&quarantine.AccountID, &quarantine.AccountInstanceID, &quarantine.AccountGeneration,
-		&quarantine.ExpectedConfigDir, &quarantine.Proof.FileProvider.TenantID,
-		&quarantine.Proof.FileProvider.DomainID, &quarantine.Proof.FileProvider.Generation,
-		&quarantine.Proof.FileProvider.ActivationGeneration, &quarantine.Proof.FileProvider.PublicPath,
-		&quarantine.Proof.PresentationKind,
-		&quarantine.Proof.CatalogTenantID, &quarantine.Proof.CatalogGeneration,
-		&quarantine.Proof.Requested, &quarantine.Proof.Desired, &quarantine.Proof.Observed,
-		&quarantine.Proof.Verified, &quarantine.Proof.Applied,
-		&quarantine.Proof.SourceAuthority, &quarantine.Proof.SourceRevision,
-		&quarantine.Proof.CatalogRevision, &quarantine.Proof.ChangeID,
-		&quarantine.Proof.OperationID,
+		&quarantine.ExpectedConfigDir, &quarantine.Observed.TenantID,
+		&quarantine.Observed.DomainID, &quarantine.Observed.Generation,
+		&quarantine.Observed.PublicPath,
 		&quarantine.Reason, &createdAt,
 	)
 	if err == nil {
-		err = validatePresentationPreparationProof(quarantine.Proof)
+		err = validateFileProviderPresentationIdentity(quarantine.Observed)
 	}
 	quarantine.CreatedAt = time.Unix(0, createdAt)
 	return quarantine, err
@@ -1210,26 +955,11 @@ func insertAccountPresentationQuarantine(tx *sql.Tx, quarantine AccountPresentat
 	_, err := tx.Exec(
 		`INSERT INTO account_presentation_quarantines(
 		 account_id,account_instance_id,account_generation,expected_config_dir,
-		 observed_tenant_id,observed_domain_id,observed_generation,
-		 observed_activation_generation,observed_public_path,
-		 observed_presentation_kind,
-		 observed_catalog_tenant_id,observed_catalog_generation,
-		 observed_catalog_requested,observed_catalog_desired,observed_catalog_observed,
-		 observed_catalog_verified,observed_catalog_applied,observed_source_authority,
-		 observed_source_revision,observed_catalog_revision,observed_change_id,
-		 observed_operation_id,reason,created_at
-		 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id) DO NOTHING`,
+		 observed_tenant_id,observed_domain_id,observed_generation,observed_public_path,reason,created_at
+		 ) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id) DO NOTHING`,
 		quarantine.AccountID, quarantine.AccountInstanceID, quarantine.AccountGeneration,
-		quarantine.ExpectedConfigDir, quarantine.Proof.FileProvider.TenantID,
-		quarantine.Proof.FileProvider.DomainID, quarantine.Proof.FileProvider.Generation,
-		quarantine.Proof.FileProvider.ActivationGeneration, quarantine.Proof.FileProvider.PublicPath,
-		quarantine.Proof.PresentationKind,
-		quarantine.Proof.CatalogTenantID, quarantine.Proof.CatalogGeneration,
-		quarantine.Proof.Requested, quarantine.Proof.Desired, quarantine.Proof.Observed,
-		quarantine.Proof.Verified, quarantine.Proof.Applied,
-		quarantine.Proof.SourceAuthority, quarantine.Proof.SourceRevision,
-		quarantine.Proof.CatalogRevision, quarantine.Proof.ChangeID,
-		quarantine.Proof.OperationID,
+		quarantine.ExpectedConfigDir, quarantine.Observed.TenantID,
+		quarantine.Observed.DomainID, quarantine.Observed.Generation, quarantine.Observed.PublicPath,
 		quarantine.Reason, quarantine.CreatedAt.UnixNano(),
 	)
 	return err

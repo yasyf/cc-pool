@@ -12,27 +12,27 @@ import (
 	"github.com/yasyf/fusekit/transportproto"
 )
 
-func TestRuntimeHealthObservationUsesImmutablePeerIdentity(t *testing.T) {
-	authorizer := MountAuthorizer{UID: 42}
+func TestExternalMountControlIsExhaustivelyRejected(t *testing.T) {
+	authorizer := MountAuthorizer{}
 	identity := mountservice.ObservationIdentity{
 		Peer: wire.Peer{PID: 7, UID: 42}, WireBuild: transportproto.WireBuild,
 	}
-	if err := authorizer.AuthorizeObservation(t.Context(), identity, mountproto.OperationRuntimeHealth); err != nil {
-		t.Fatal(err)
+	if err := authorizer.AuthorizeObservation(t.Context(), identity, mountproto.OperationRuntimeHealth); err == nil {
+		t.Fatal("runtime-health observation was externally authorized")
 	}
-	for _, invalid := range []mountservice.ObservationIdentity{
-		{Peer: wire.Peer{PID: 1, UID: 42}, WireBuild: transportproto.WireBuild},
-		{Peer: wire.Peer{PID: 7, UID: 43}, WireBuild: transportproto.WireBuild},
-		{Peer: wire.Peer{PID: 7, UID: 42}, WireBuild: "wrong"},
-	} {
-		if err := authorizer.AuthorizeObservation(context.Background(), invalid, mountproto.OperationRuntimeHealth); err == nil {
-			t.Fatalf("authorized invalid observation identity %+v", invalid)
-		}
+	lifecycle := mountservice.Identity{
+		Peer: wire.Peer{PID: 7, UID: 42}, WireBuild: transportproto.WireBuild,
+		Session: &wire.AcceptedSession{},
+	}
+	if _, err := authorizer.Authorize(
+		context.Background(), lifecycle, mountproto.OperationTenantState, "tenant", 1,
+	); err == nil {
+		t.Fatal("tenant lifecycle was externally authorized")
 	}
 }
 
 func TestNativeOperationsAreExhaustivelyRejected(t *testing.T) {
-	authorizer := MountAuthorizer{UID: 42}
+	authorizer := MountAuthorizer{}
 	identity := mountservice.Identity{
 		Peer: wire.Peer{PID: 7, UID: 42}, WireBuild: transportproto.WireBuild,
 		Session: &wire.AcceptedSession{},
@@ -72,22 +72,19 @@ func TestUnforwardedTenantCatalogRequestsAreRejected(t *testing.T) {
 	}
 }
 
-func TestSourceFleetOperationsRequireExactUnroutedProductAdminRole(t *testing.T) {
+func TestProductAdminCatalogOperationsAreExternallyRejected(t *testing.T) {
 	for _, operation := range []catalogproto.Operation{
+		catalogproto.OperationTenantPrepare,
+		catalogproto.OperationPresentationLeaseCommit,
+		catalogproto.OperationPresentationLeaseRenew,
+		catalogproto.OperationPresentationLeaseRelease,
 		catalogproto.OperationSourceAuthorityPublishDesiredFleet,
 		catalogproto.OperationSourceAuthorityReadDesiredFleet,
 	} {
-		authorization, err := catalogAuthorization(operation, catalogservice.Route{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if authorization.Principal != string(SourceAuthorityFleetOwner) ||
-			authorization.Role != catalogservice.RoleProductAdmin ||
-			authorization.Route != (catalogservice.Route{}) {
-			t.Fatalf("source fleet authorization = %+v", authorization)
-		}
-		if _, err := catalogAuthorization(operation, catalogservice.Route{Tenant: "foreign"}); err == nil {
-			t.Fatal("routed source fleet operation was authorized")
+		for _, route := range []catalogservice.Route{{}, {Tenant: "tenant"}, {Tenant: "tenant", Domain: "domain"}} {
+			if _, err := catalogAuthorization(operation, route); err == nil {
+				t.Fatalf("product admin operation %q accepted route %+v", operation, route)
+			}
 		}
 	}
 }

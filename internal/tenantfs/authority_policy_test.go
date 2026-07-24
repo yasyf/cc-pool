@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/sourceauthority"
 	"github.com/yasyf/fusekit/tenant"
@@ -105,7 +106,7 @@ func TestClaudeAuthorityDeclarationDigestTracksProductConfiguration(t *testing.T
 	if first == ([32]byte{}) || repeated != first {
 		t.Fatalf("declaration digests = %x and %x", first, repeated)
 	}
-	const wantDigest = "c808d93d1096f26990bef30cb47344cb500715bd0081b3da621ec1f964594ec6"
+	const wantDigest = "13ff2fc2f7af667a6cbc1714290d25c35c29b88a4fea56c3e04d43cfc77705c3"
 	if got := hex.EncodeToString(first[:]); got != wantDigest {
 		t.Fatalf("declaration digest = %s, want %s", got, wantDigest)
 	}
@@ -163,6 +164,77 @@ func TestClaudeAuthorityPolicySnapshotIsBoundedAndDeterministic(t *testing.T) {
 	}
 	if pages < 5 || view.scanCalls == 0 {
 		t.Fatalf("snapshot pages=%d scanCalls=%d", pages, view.scanCalls)
+	}
+}
+
+func TestClaudeAuthorityPolicySuppressesPrivateStagingFromSnapshotAndDelta(t *testing.T) {
+	specs := testPolicyTenants()
+	privateRoot := privateRootID(specs[0].ID)
+	canonicalName := ".credentials.json"
+	canonical := sourceauthority.PhysicalEntry{
+		Root: privateRoot, Relative: canonicalName,
+		Exists: true, Kind: sourceauthority.PhysicalFile, Mode: 0o100600,
+	}
+	entries := []sourceauthority.PhysicalEntry{
+		{Root: canonicalClaudeJSONRoot, Relative: ".", Exists: true, Kind: sourceauthority.PhysicalFile, Mode: 0o100600},
+		{Root: sharedClaudeRoot, Relative: settingsFile, Exists: true, Kind: sourceauthority.PhysicalFile, Mode: 0o100600},
+		canonical,
+	}
+	deltaEntries := map[testPolicyPath]sourceauthority.IndexedEntry{
+		{canonical.Root, canonical.Relative}: {Physical: canonical},
+	}
+	deltaEvents := make([]sourceauthority.PathEvent, 0, len(overlay.PrivateStagingPrefixes)+1)
+	for _, prefix := range overlay.PrivateStagingPrefixes {
+		staging := sourceauthority.PhysicalEntry{
+			Root: privateRoot, Relative: prefix + "A1B2",
+			Exists: true, Kind: sourceauthority.PhysicalFile, Mode: 0o100600,
+		}
+		entries = append(entries, staging)
+		deltaEntries[testPolicyPath{staging.Root, staging.Relative}] = sourceauthority.IndexedEntry{Physical: staging}
+		deltaEvents = append(deltaEvents, sourceauthority.PathEvent{
+			Root: staging.Root, Relative: staging.Relative, Kind: sourceauthority.EventModified,
+		})
+	}
+	deltaEvents = append(deltaEvents, sourceauthority.PathEvent{
+		Root: canonical.Root, Relative: canonical.Relative, Kind: sourceauthority.EventModified,
+	})
+
+	snapshot := &testSnapshotView{fence: testPolicyFence(), tenants: specs, entries: entries}
+	var cursor sourceauthority.SnapshotPlanCursor
+	canonicalSeen := false
+	for {
+		page, err := testClaudePolicy().PlanSnapshot(t.Context(), snapshot, cursor, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, request := range page.Reads {
+			for _, input := range request.Inputs {
+				if input.Root == privateRoot && overlay.PrivateStagingEntry(topLevel(input.Relative)) {
+					t.Fatalf("snapshot projected private staging input %+v", input)
+				}
+				if input == (sourceauthority.PathRef{Root: privateRoot, Relative: canonicalName}) {
+					canonicalSeen = true
+				}
+			}
+		}
+		if page.Next == "" {
+			break
+		}
+		cursor = page.Next
+	}
+	if !canonicalSeen {
+		t.Fatal("snapshot omitted the canonical result")
+	}
+
+	index := &testIndexView{fence: testPolicyFence(), tenants: specs, entries: deltaEntries}
+	plan, err := testClaudePolicy().PlanDelta(t.Context(), index, sourceauthority.EventBatch{Events: deltaEvents})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index.entryCalls != len(deltaEvents) || len(plan.Reads) != 1 || len(plan.Deletes) != 0 ||
+		len(plan.Reads[0].Inputs) != 1 ||
+		plan.Reads[0].Inputs[0] != (sourceauthority.PathRef{Root: privateRoot, Relative: canonicalName}) {
+		t.Fatalf("delta plan = %+v, lookups=%d", plan, index.entryCalls)
 	}
 }
 

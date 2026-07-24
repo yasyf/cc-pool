@@ -2,4 +2,4 @@
 
 package daemon
 
-const WireBuild = "com.yasyf.cc-pool.control/36f76bee469e0147ef24ffccfcbccd6537a6eefd314f69b9c6b298c28f96c9c1/v1"
+const WireBuild = "com.yasyf.cc-pool.control/986fb1a10bd56a40369530da493bbb469178dffe045250558f3d7f16d2f18390/v1"

@@ -3,10 +3,12 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,10 +22,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalogproto"
-	"github.com/yasyf/fusekit/mountproto"
 )
 
 var daemonTestToken atomic.Uint64
@@ -97,8 +97,8 @@ func TestSelectPreflightSettlesBeforeReturn(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("selection did not enter credential preflight")
 	}
-	if got := s.cl.reservedCount(forced); got != 0 {
-		t.Fatalf("pending reservations = %d, want none during credential preflight", got)
+	if got := s.cl.reservedCount(forced); got != 1 {
+		t.Fatalf("pending reservations = %d, want one during credential preflight", got)
 	}
 	select {
 	case response := <-responses:
@@ -150,11 +150,12 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 	s.prepareAccount = func(
 		ctx context.Context,
 		account store.Account,
+		_ tenantfs.PreparationLease,
 	) (catalogproto.TenantPreparationProof, error) {
 		callsMu.Lock()
 		calls[account.ID]++
 		callsMu.Unlock()
-		proof := daemonTestPreparationProof(account, testFileProviderConfigDir(account.ID))
+		proof := daemonTestPreparationProof(account, testFileProviderPublicPath(account.ID))
 		if account.ID != 1 {
 			return proof, nil
 		}
@@ -177,8 +178,8 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 		})
 	}()
 	waitForBlockedPrepare(t, entered)
-	if got := s.cl.reservedCount(forcedOne); got != 0 {
-		t.Fatalf("primary PrepareTenant reservations = %d, want 0", got)
+	if got := s.cl.reservedCount(forcedOne); got != 1 {
+		t.Fatalf("primary PrepareTenant reservations = %d, want 1", got)
 	}
 
 	canceledContext, cancelCanceled := context.WithCancel(t.Context())
@@ -190,8 +191,8 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 		})
 	}()
 	waitForBlockedPrepare(t, entered)
-	if got := s.cl.reservedCount(forcedOne); got != 0 {
-		t.Fatalf("same-account reservations during PrepareTenant = %d, want 0", got)
+	if got := s.cl.reservedCount(forcedOne); got != 2 {
+		t.Fatalf("same-account reservations during PrepareTenant = %d, want 2", got)
 	}
 	cancelCanceled()
 	select {
@@ -202,8 +203,8 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("canceled same-account PrepareTenant retained the selection")
 	}
-	if got := s.cl.reservedCount(forcedOne); got != 0 {
-		t.Fatalf("canceled PrepareTenant reservation count = %d, want 0", got)
+	if got := s.cl.reservedCount(forcedOne); got != 1 {
+		t.Fatalf("canceled PrepareTenant reservation count = %d, want 1", got)
 	}
 
 	forcedTwo := 2
@@ -299,20 +300,21 @@ func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[in
 	t.Cleanup(func() { _ = st.Close() })
 
 	dirs := map[int]string{}
+	presentationPaths := map[int]string{}
 	fakeCreds := credstest.NewFake()
 	now := time.Now()
 	for _, id := range []int{1, 2} {
 		util := map[int]float64{1: 10, 2: 50}[id]
-		configDir := testFileProviderConfigDir(id)
+		presentationPath := testFileProviderPublicPath(id)
 		if paths[id] != "" {
-			configDir = paths[id]
+			presentationPath = paths[id]
 		}
-		dirs[id] = configDir
-		service := creds.ServiceName(configDir)
-		admitDaemonTestAccount(t, st, store.Account{
-			ID: id, ConfigDir: configDir, InstanceID: fmt.Sprintf("instance-%d", id), Generation: 1,
-			KeychainService: service, KeychainAccount: "ccp-test",
-		})
+		presentationPaths[id] = presentationPath
+		account := admitDaemonTestAccountAtPublicPath(t, st, store.Account{
+			ID: id, Generation: 1,
+			KeychainAccount: "ccp-test",
+		}, presentationPath)
+		dirs[id] = account.ConfigDir
 		if err := st.InsertUsageSample(store.UsageSample{AccountID: id, TS: now, Util5h: util, Util7d: util}); err != nil {
 			t.Fatal(err)
 		}
@@ -320,7 +322,7 @@ func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[in
 		credential.ClaudeAiOauth.AccessToken = fmt.Sprintf("access-%d", id)
 		credential.ClaudeAiOauth.RefreshToken = fmt.Sprintf("refresh-%d", id)
 		credential.ClaudeAiOauth.ExpiresAt = now.Add(time.Hour).UnixMilli()
-		fakeCreds.Put(service, "ccp-test", credential)
+		fakeCreds.Put(account.KeychainService, "ccp-test", credential)
 	}
 	s := &Server{
 		m:            newDaemonTestManager(t, st, &fakeOAuth{}, fakeCreds),
@@ -329,12 +331,13 @@ func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[in
 		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		cl:           newClaims(),
 		led:          newLedgers(),
-		prepareAccount: func(ctx context.Context, account store.Account) (catalogproto.TenantPreparationProof, error) {
-			return daemonTestPreparationProof(account, dirs[account.ID]), ctx.Err()
+		prepareAccount: func(ctx context.Context, account store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
+			return daemonTestPreparationProof(account, presentationPaths[account.ID]), ctx.Err()
 		},
-		activatePrepared: func(_ context.Context, _ store.Account, _ catalogproto.TenantPreparationProof, activate func() error) error {
+		activatePrepared: func(_ context.Context, _ store.Account, _ tenantfs.PreparationLease, _ catalogproto.TenantPreparationProof, activate func() error) error {
 			return activate()
 		},
+		sessionLeases: &testSessionLeaseManager{},
 	}
 	s.m.ClaimCredentialMutation = func(accountID int) (func(), error) {
 		if !s.cl.ownExclusive(accountID) {
@@ -358,6 +361,11 @@ func daemonTestPreparationProof(account store.Account, publicPath string) catalo
 		panic(err)
 	}
 	const revision = 7
+	const rootID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const policyDigest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const resolutionDigest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	const sourcePublication = "dddddddddddddddddddddddddddddddd"
+	presentationInstance := catalogproto.PresentationInstanceID(account.InstanceID)
 	return catalogproto.TenantPreparationProof{
 		Catalog: catalogproto.CatalogLaneProof{
 			Tenant: catalogproto.TenantID(tenantID), Generation: account.Generation,
@@ -368,127 +376,77 @@ func daemonTestPreparationProof(account store.Account, publicPath string) catalo
 			FileProvider: &catalogproto.FileProviderPresentationProof{
 				TenantID: catalogproto.TenantID(tenantID), DomainID: domainID,
 				Generation: account.Generation, PublicPath: publicPath, ActivationGeneration: "activation-test",
+				PresentationInstanceID: presentationInstance, RootID: rootID,
 			},
 		},
 		SourceAuthority: catalogproto.SourceAuthorityID(tenantfs.ClaudeAuthorityID),
 		SourceRevision:  revision, CatalogRevision: revision,
-		ChangeID: "change-test", OperationID: "operation-test",
+		ChangeID: "change-test", OperationID: "operation-test", SourcePublication: sourcePublication,
+		CriticalReadiness: &catalogproto.CriticalReadinessProof{
+			Lease: catalogproto.FileProviderLeaseReceipt{
+				LeaseID: account.InstanceID, TenantID: catalogproto.TenantID(tenantID), DomainID: domainID,
+				Generation: account.Generation, RootID: rootID, PresentationInstanceID: presentationInstance,
+				State:        catalogproto.FileProviderLeaseStateProvisional,
+				PolicyDigest: policyDigest, ResolutionDigest: resolutionDigest, CatalogHead: revision,
+				SourceAuthority:   catalogproto.SourceAuthorityID(tenantfs.ClaudeAuthorityID),
+				SourcePublication: sourcePublication, SourceRevision: revision,
+				ActivationGeneration: "activation-test", ExpiresUnixNano: uint64(time.Now().Add(time.Minute).UnixNano()),
+			},
+		},
 	}
 }
 
-func TestPrepareReservedAccountProofReturnsCompleteValidatedFuseProof(t *testing.T) {
+func TestPrepareSelectionReturnsCompleteValidatedFuseProof(t *testing.T) {
 	s, dirs := newTestServer(t)
 	account, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reservation := store.PendingAccountReservation{
-		ID: account.ID, InstanceID: account.InstanceID, Generation: account.Generation,
+	path, token, err := s.prepareSelection(t.Context(), account, selectionLaunch{})
+	if err != nil || path != dirs[1] || token == "" {
+		t.Fatalf("prepare selection = path %q token %q err %v; want path %q", path, token, err, dirs[1])
 	}
-	proof, err := s.prepareReservedAccountProof(t.Context(), reservation)
-	if err != nil || proof.FileProvider.PublicPath != dirs[1] || proof.ChangeID == "" || proof.OperationID == "" {
-		t.Fatalf("prepare reserved account proof = %+v, %v; want path %q", proof, err, dirs[1])
-	}
-	s.prepareReservedAccount = func(_ context.Context, got store.PendingAccountReservation) (catalogproto.TenantPreparationProof, error) {
-		if got.ID != reservation.ID || got.InstanceID != reservation.InstanceID || got.Generation != reservation.Generation {
-			t.Fatalf("reservation = %+v, want %+v", got, reservation)
+	s.cl.abortReservation(token)
+	s.prepareAccount = func(_ context.Context, got store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
+		if got.ID != account.ID || got.InstanceID != account.InstanceID || got.Generation != account.Generation {
+			t.Fatalf("account = %+v, want %+v", got, account)
 		}
 		invalid := daemonTestPreparationProof(account, "relative/path")
 		return invalid, nil
 	}
-	if _, err := s.prepareReservedAccountProof(t.Context(), reservation); !errors.Is(err, tenantfs.ErrPreparationConflict) {
+	if _, _, err := s.prepareSelection(t.Context(), account, selectionLaunch{}); !errors.Is(err, tenantfs.ErrPreparationConflict) {
 		t.Fatalf("invalid injected proof error = %v, want ErrPreparationConflict", err)
 	}
 }
 
-type fixedPreparationHealth struct {
-	health mountproto.RuntimeHealthResponse
-}
-
-func (r fixedPreparationHealth) RuntimeHealth(context.Context) (mountproto.RuntimeHealthResponse, error) {
-	return r.health, nil
-}
-
-func (fixedPreparationHealth) PrepareTenant(
-	context.Context,
-	catalogproto.TenantID,
-	catalogproto.PrepareTenantRequest,
-) (catalogproto.PrepareTenantResponse, error) {
-	return catalogproto.PrepareTenantResponse{}, errors.New("unexpected PrepareTenant call")
-}
-
-func TestStoredPreparationProofRevalidatesRuntimeBoundFieldsAgainstCurrentActivation(t *testing.T) {
+func TestPreparationIdentityProjectionRejectsDrift(t *testing.T) {
 	account := store.Account{
 		ID: 7, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 4,
 	}
-	raw := daemonTestPreparationProof(account, "/Users/test/Library/CloudStorage/proof-account-7")
-	stored, err := projectPreparationProof(raw)
+	publicPath := testFileProviderPublicPath(account.ID)
+	raw := daemonTestPreparationProof(account, publicPath)
+	identity, err := projectPreparationIdentity(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	roundTrip, err := catalogPreparationProof(stored)
-	if err != nil {
-		t.Fatal(err)
+	if identity.TenantID == "" || identity.DomainID == "" || identity.Generation != account.Generation ||
+		identity.PublicPath != publicPath {
+		t.Fatalf("identity = %+v", identity)
 	}
-	projectedAgain, err := projectPreparationProof(roundTrip)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if projectedAgain != stored {
-		t.Fatalf("stored proof did not round trip:\n got  %+v\n want %+v", projectedAgain, stored)
-	}
-	health := mountproto.RuntimeHealthResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		RuntimeBuild: version.String(), RuntimeProtocol: mountproto.RuntimeProtocolVersion,
-		RuntimePID: 42, ProcessGeneration: "process-current",
-		ActivationGeneration: stored.FileProvider.ActivationGeneration,
-		State:                mountproto.RuntimeStateHealthy, Ready: true,
-		ReadinessPhase: mountproto.ReadinessPhaseReady, ReadinessStep: mountproto.ReadinessStepPublished,
-		NativePhase: mountproto.NativePhaseDisabled, BrokerPhase: mountproto.BrokerPhaseLive,
-	}
-	preparer, err := tenantfs.NewPreparer(fixedPreparationHealth{health: health})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := &Server{tenantCoordinator: &tenantCoordinator{preparer: preparer}}
-	if err := s.revalidatePreparationProof(t.Context(), account, stored); err != nil {
-		t.Fatalf("revalidate exact proof: %v", err)
-	}
-	tests := map[string]func(*store.PresentationPreparationProof){
-		"catalog tenant":      func(p *store.PresentationPreparationProof) { p.CatalogTenantID += "-other" },
-		"catalog generation":  func(p *store.PresentationPreparationProof) { p.CatalogGeneration++ },
-		"requested":           func(p *store.PresentationPreparationProof) { p.Requested++ },
-		"desired":             func(p *store.PresentationPreparationProof) { p.Desired++ },
-		"observed":            func(p *store.PresentationPreparationProof) { p.Observed++ },
-		"verified":            func(p *store.PresentationPreparationProof) { p.Verified++ },
-		"applied":             func(p *store.PresentationPreparationProof) { p.Applied++ },
-		"source authority":    func(p *store.PresentationPreparationProof) { p.SourceAuthority = "foreign" },
-		"catalog revision":    func(p *store.PresentationPreparationProof) { p.CatalogRevision++ },
-		"presentation kind":   func(p *store.PresentationPreparationProof) { p.PresentationKind = "mount" },
-		"presentation tenant": func(p *store.PresentationPreparationProof) { p.FileProvider.TenantID += "-other" },
-		"domain":              func(p *store.PresentationPreparationProof) { p.FileProvider.DomainID += "-other" },
-		"presentation gen":    func(p *store.PresentationPreparationProof) { p.FileProvider.Generation++ },
-		"activation":          func(p *store.PresentationPreparationProof) { p.FileProvider.ActivationGeneration = "stale" },
-	}
-	for name, mutate := range tests {
-		t.Run(name, func(t *testing.T) {
-			changed := stored
-			mutate(&changed)
-			if err := s.revalidatePreparationProof(t.Context(), account, changed); !errors.Is(err, tenantfs.ErrPreparationConflict) {
-				t.Fatalf("revalidate changed proof error = %v, want ErrPreparationConflict", err)
-			}
-		})
+	raw.Presentation.FileProvider.PublicPath = "relative/path"
+	if _, err := projectPreparationIdentity(raw); !errors.Is(err, tenantfs.ErrPreparationConflict) {
+		t.Fatalf("relative identity error = %v", err)
 	}
 }
 
-func TestSelectionUsesPersistedFusePublicPathWithoutSynthesizing(t *testing.T) {
-	publicPath := "/Users/test/Library/CloudStorage/cc-pool-account-1"
-	s, _ := newTestServerWithPaths(t, map[int]string{1: publicPath})
+func TestSelectionUsesStableExecutionPathForVerifiedPresentation(t *testing.T) {
+	s, _ := newTestServer(t)
+	publicPath := testFileProviderPublicPath(1)
 	account, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.prepareAccount = func(ctx context.Context, got store.Account) (catalogproto.TenantPreparationProof, error) {
+	s.prepareAccount = func(ctx context.Context, got store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
 		return daemonTestPreparationProof(got, publicPath), ctx.Err()
 	}
 	forced := account.ID
@@ -496,27 +454,37 @@ func TestSelectionUsesPersistedFusePublicPathWithoutSynthesizing(t *testing.T) {
 		Op: OpSelect, Account: &forced, PID: 4242,
 		ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proof-path",
 	})
-	if !response.OK || response.Dir != publicPath {
-		t.Fatalf("selection = %+v, want proof path %q", response, publicPath)
+	if !response.OK || response.Dir != account.ConfigDir {
+		t.Fatalf("selection = %+v, want stable path %q", response, account.ConfigDir)
 	}
 	commitSelectResponse(t, s, response)
 	sessions, err := s.m.Store.ListActiveSessions()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sessions) != 1 || sessions[0].ConfigDir != publicPath {
-		t.Fatalf("committed sessions = %+v, want proof path %q", sessions, publicPath)
+	if len(sessions) != 1 || sessions[0].ConfigDir != account.ConfigDir {
+		t.Fatalf("committed sessions = %+v, want stable path %q", sessions, account.ConfigDir)
+	}
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != publicPath {
+		t.Fatalf("stable config target = %q, %v; want %q", target, err, publicPath)
 	}
 }
 
-func TestSelectionQuarantinesPresentationBindingDrift(t *testing.T) {
+func TestSelectionRepairsPresentationPathDriftWithoutChangingExecutionPath(t *testing.T) {
 	s, _ := newTestServer(t)
 	account, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	provenPath := "/Users/test/Library/CloudStorage/cc-pool-account-1"
-	s.prepareAccount = func(ctx context.Context, got store.Account) (catalogproto.TenantPreparationProof, error) {
+	home, err := pool.Home()
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenPath := filepath.Join(home, "Library", "CloudStorage", "CCPoolStatus-moved-acct-01")
+	if err := os.MkdirAll(provenPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s.prepareAccount = func(ctx context.Context, got store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
 		return daemonTestPreparationProof(got, provenPath), ctx.Err()
 	}
 	forced := account.ID
@@ -524,29 +492,31 @@ func TestSelectionQuarantinesPresentationBindingDrift(t *testing.T) {
 		Op: OpSelect, Account: &forced, PID: 4242,
 		ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proof-drift",
 	})
-	if response.OK || !strings.Contains(response.Error, store.ErrAccountPresentationQuarantined.Error()) {
-		t.Fatalf("selection = %+v, want quarantined drift", response)
+	if !response.OK || response.Dir != account.ConfigDir {
+		t.Fatalf("selection = %+v, want stable path %q", response, account.ConfigDir)
 	}
-	quarantine, err := s.m.Store.AccountPresentationQuarantine(account.ID)
+	commitSelectResponse(t, s, response)
+	presentation, err := s.m.Store.AccountPresentation(account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fileProvider := daemonTestPreparationProof(account, provenPath).Presentation.FileProvider
-	if quarantine.AccountID != account.ID || quarantine.AccountInstanceID != account.InstanceID ||
-		quarantine.AccountGeneration != account.Generation || quarantine.ExpectedConfigDir != account.ConfigDir ||
-		quarantine.Proof.FileProvider.TenantID != string(fileProvider.TenantID) ||
-		quarantine.Proof.FileProvider.DomainID != string(fileProvider.DomainID) ||
-		quarantine.Proof.FileProvider.Generation != fileProvider.Generation ||
-		quarantine.Proof.FileProvider.ActivationGeneration != fileProvider.ActivationGeneration ||
-		quarantine.Proof.FileProvider.PublicPath != provenPath ||
-		quarantine.Reason != store.AccountPresentationPublicPathDrift {
-		t.Fatalf("presentation quarantine = %+v", quarantine)
+	if presentation.AccountInstanceID != account.InstanceID ||
+		presentation.AccountGeneration != account.Generation ||
+		presentation.Identity.TenantID != string(fileProvider.TenantID) ||
+		presentation.Identity.DomainID != string(fileProvider.DomainID) ||
+		presentation.Identity.Generation != fileProvider.Generation ||
+		presentation.Identity.PublicPath != provenPath {
+		t.Fatalf("repaired presentation = %+v", presentation)
 	}
-	if got := s.cl.reservedCount(account.ID); got != 0 {
-		t.Fatalf("drifted selection retained %d reservations", got)
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != provenPath {
+		t.Fatalf("stable config target = %q, %v; want %q", target, err, provenPath)
 	}
-	if sessions, err := s.m.Store.ListActiveSessions(); err != nil || len(sessions) != 0 {
-		t.Fatalf("drifted selection sessions = %+v, %v", sessions, err)
+	if _, err := s.m.Store.AccountPresentationQuarantine(account.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("presentation quarantine remains after repair: %v", err)
+	}
+	if sessions, err := s.m.Store.ListActiveSessions(); err != nil || len(sessions) != 1 || sessions[0].ConfigDir != account.ConfigDir {
+		t.Fatalf("repaired selection sessions = %+v, %v", sessions, err)
 	}
 }
 
@@ -557,26 +527,44 @@ func activateDaemonTestSession(t *testing.T, s *Server, accountID, pid int, cwd 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.m.Store.ActivateSelection(store.SelectionActivation{
-		Token:     nextDaemonTestToken(),
+	token := nextDaemonTestToken()
+	provisional := store.FileProviderLeaseReceipt("daemon-test-provisional:" + token)
+	staged, err := s.m.Store.StageSelection(store.SelectionActivation{
+		Token:     token,
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   store.ProcessIdentity{PID: pid, StartedAt: started},
 		ConfigDir: a.ConfigDir,
 		Cwd:       cwd, At: started,
-	}); err != nil {
+		FileProviderLease: provisional, LeaseExpiresAt: started.Add(time.Minute),
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	committed := store.FileProviderLeaseReceipt("daemon-test-committed:" + token)
+	if err := s.m.Store.CommitSelection(token, provisional, committed, false, started); err != nil {
+		t.Fatal(err)
+	}
+	return staged.ID
+}
+
+func closeDaemonTestSession(t *testing.T, s *Server, id int64, at time.Time) {
+	t.Helper()
 	sessions, err := s.m.Store.ListActiveSessions()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, session := range sessions {
-		if session.PID == pid && session.ProcessStartedAt.Equal(started) && session.Cwd == cwd {
-			return session.ID
+		if session.ID != id {
+			continue
 		}
+		released := append(store.FileProviderLeaseReceipt(nil), session.FileProviderLease...)
+		released = append(released, []byte(":released")...)
+		if err := s.m.Store.CompleteSessionLeaseRelease(id, session.FileProviderLease, released, at); err != nil {
+			t.Fatal(err)
+		}
+		return
 	}
-	t.Fatal("activated session was not stored")
-	return 0
+	t.Fatalf("session %d not found", id)
 }
 
 func expireCommittedReservations(c *claims, accountID int) {
@@ -624,20 +612,16 @@ func TestSelectionActivationRejectsStalePreparationProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proof := catalogproto.TenantPreparationProof{
-		Catalog:        catalogproto.CatalogLaneProof{Tenant: "test", Generation: account.Generation, Requested: 1},
-		SourceRevision: 1,
-		Presentation: catalogproto.PresentationProof{
-			Kind: catalogproto.PresentationKindFileProvider,
-			FileProvider: &catalogproto.FileProviderPresentationProof{
-				PublicPath: "/Users/test/Library/CloudStorage/account-1",
-			},
-		},
+	presentation, err := s.m.Store.AccountPresentation(account.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
+	proof := daemonTestPreparationProof(account, presentation.Identity.PublicPath)
+	proof.SourceRevision = 1
 	if !s.cl.bindPreparation(token, proof) {
 		t.Fatal("bind preparation failed")
 	}
-	s.activatePrepared = func(_ context.Context, _ store.Account, got catalogproto.TenantPreparationProof, _ func() error) error {
+	s.activatePrepared = func(_ context.Context, _ store.Account, _ tenantfs.PreparationLease, got catalogproto.TenantPreparationProof, _ func() error) error {
 		if got.SourceRevision != 1 {
 			t.Fatalf("proof source revision = %d", got.SourceRevision)
 		}
@@ -657,10 +641,14 @@ func TestSelectionActivationRejectsStalePreparationProof(t *testing.T) {
 }
 
 func TestRawSelectHasNoActivationEffects(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
+	s.prepareAccount = func(context.Context, store.Account, tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
+		t.Fatal("metadata-only selection prepared a tenant")
+		return catalogproto.TenantPreparationProof{}, nil
+	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[1] {
-		t.Fatalf("expected emptier acct-1 (%s), got %+v", dirs[1], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 || resp.Prepared || resp.Dir != "" {
+		t.Fatalf("metadata-only select = %+v, want unprepared acct-1 with no path", resp)
 	}
 	if resp.Sticky {
 		t.Fatal("first select must not report sticky")
@@ -685,7 +673,7 @@ func TestRawSelectHasNoActivationEffects(t *testing.T) {
 func TestHandleSelectTransactionAbortAndExclude(t *testing.T) {
 	s, dirs := newTestServer(t)
 	first := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj"})
-	if !first.OK || first.Dir != dirs[1] || first.ReservationToken == "" {
+	if !first.OK || !first.Prepared || first.Dir != dirs[1] || first.ReservationToken == "" {
 		t.Fatalf("provisional select = %+v, want acct-1 with token", first)
 	}
 	if live, _ := s.m.Store.ListActiveSessions(); len(live) != 0 {
@@ -867,7 +855,7 @@ func TestRunCommitRejectsReservedGenerationMismatch(t *testing.T) {
 	committed := s.handleSelectCommit(context.Background(), Request{
 		Op: OpSelectCommit, ReservationToken: resp.ReservationToken,
 	})
-	if committed.OK || !strings.Contains(committed.Error, "account generation changed") {
+	if committed.OK || !strings.Contains(committed.Error, "identity changed") {
 		t.Fatalf("commit after generation change = %+v", committed)
 	}
 	if live, err := s.m.Store.ListActiveSessions(); err != nil {
@@ -886,21 +874,21 @@ func TestRunCommitRejectsReservedGenerationMismatch(t *testing.T) {
 }
 
 func TestHandleSelectHonorsSticky(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	// Sticky points at the WORSE account.
 	if err := s.m.Store.UpsertSticky("/proj", 2, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
-		t.Fatalf("expected sticky acct-2 (%s), got %+v", dirs[2], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 2 || resp.Prepared || resp.Dir != "" || !resp.Sticky {
+		t.Fatalf("expected metadata-only sticky acct-2, got %+v", resp)
 	}
 }
 
 // TestHandleSelectSkipsExhaustedStickyPin replays the 2026-06-10 incident:
 // reset credit (eff5 ≈ 93, reset ~21m out) must not keep a pegged pin alive.
 func TestHandleSelectSkipsExhaustedStickyPin(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	now := time.Now().Add(time.Minute) // newer than the harness samples
 	if err := s.m.Store.InsertUsageSample(store.UsageSample{
 		AccountID: 2, TS: now, Util5h: 100, Util7d: 21,
@@ -912,8 +900,8 @@ func TestHandleSelectSkipsExhaustedStickyPin(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[1] {
-		t.Fatalf("expected healthy acct-1 (%s) over the exhausted pin, got %+v", dirs[1], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 || resp.Prepared || resp.Dir != "" {
+		t.Fatalf("expected metadata-only healthy acct-1 over the exhausted pin, got %+v", resp)
 	}
 	if resp.Sticky || resp.ExhaustedFallback {
 		t.Fatalf("a fresh healthy pick must report neither sticky nor fallback: %+v", resp)
@@ -945,18 +933,16 @@ func TestHandleSelectMarksSessionWithCwd(t *testing.T) {
 // TestHandleSelectBindsWarmEndedSession: a pin whose session ended minutes
 // ago must still bind — the warm cache is what stickiness protects.
 func TestHandleSelectBindsWarmEndedSession(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	now := time.Now()
 	if err := s.m.Store.UpsertSticky("/proj", 2, now.Add(-3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	id := activateDaemonTestSession(t, s, 2, 800002, "/proj", now.Add(-3*time.Hour))
-	if err := s.m.Store.CloseSession(id, now.Add(-10*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
+	closeDaemonTestSession(t, s, id, now.Add(-10*time.Minute))
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
-		t.Fatalf("expected sticky acct-2 (%s) via warm ended session, got %+v", dirs[2], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 2 || resp.Prepared || resp.Dir != "" || !resp.Sticky {
+		t.Fatalf("expected metadata-only sticky acct-2 via warm ended session, got %+v", resp)
 	}
 }
 
@@ -976,8 +962,8 @@ func TestHandleSelectHoldsLiveOnlyPin(t *testing.T) {
 		return []procscan.Session{{PID: 800002, ConfigDir: dirs[2], StartedAt: started}}, nil
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[1] || resp.Sticky {
-		t.Fatalf("expected free non-sticky acct-1 (%s), got %+v", dirs[1], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 || resp.Prepared || resp.Dir != "" || resp.Sticky {
+		t.Fatalf("expected metadata-only free non-sticky acct-1, got %+v", resp)
 	}
 	if resp.PinHeldAccount != nil {
 		t.Fatalf("an auto hold must not flag a held manual pin: %+v", resp.PinHeldAccount)
@@ -994,7 +980,7 @@ func TestHandleSelectHoldsLiveOnlyPin(t *testing.T) {
 // TestHandleSelectQuickResumeBindsAfterReap: handleSelect reconciles before
 // deciding, so a just-died session reads as a warm end and the pin binds.
 func TestHandleSelectQuickResumeBindsAfterReap(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	now := time.Now()
 	if err := s.m.Store.UpsertSticky("/proj", 2, now.Add(-3*time.Hour)); err != nil {
 		t.Fatal(err)
@@ -1003,11 +989,11 @@ func TestHandleSelectQuickResumeBindsAfterReap(t *testing.T) {
 	// sweep reaps the row; the -10m reconcile below makes the reap a warm end.
 	activateDaemonTestSession(t, s, 2, 4000000, "/proj", now.Add(-3*time.Hour))
 	alive := map[int]time.Time{4000000: now.Add(-3 * time.Hour).Truncate(time.Microsecond)}
-	if _, err := s.m.Store.CloseDeadSessions(alive, alive, now.Add(-10*time.Minute)); err != nil {
+	if result, err := s.m.Store.ReconcileSessions(alive, alive, now.Add(-10*time.Minute)); err != nil || len(result.Live) != 1 {
 		t.Fatal(err)
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 2 || resp.Prepared || resp.Dir != "" || !resp.Sticky {
 		t.Fatalf("quick resume must bind the pin via the reaped warm end, got %+v", resp)
 	}
 }
@@ -1030,7 +1016,7 @@ func TestHandleSelectForcedMarksSession(t *testing.T) {
 }
 
 func TestHandleSelectHoldsUnusableManualPin(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	now := time.Now().Add(time.Minute)
 	if err := s.m.Store.PinManual("/proj", 2, now); err != nil {
 		t.Fatal(err)
@@ -1042,8 +1028,8 @@ func TestHandleSelectHoldsUnusableManualPin(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[1] || resp.Sticky {
-		t.Fatalf("expected free acct-1 (%s) over the exhausted manual pin, got %+v", dirs[1], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 || resp.Prepared || resp.Dir != "" || resp.Sticky {
+		t.Fatalf("expected metadata-only free acct-1 over the exhausted manual pin, got %+v", resp)
 	}
 	if resp.PinHeldAccount == nil || *resp.PinHeldAccount != 2 {
 		t.Fatalf("held manual pin must be surfaced, got %+v", resp.PinHeldAccount)
@@ -1055,14 +1041,14 @@ func TestHandleSelectHoldsUnusableManualPin(t *testing.T) {
 }
 
 func TestHandleSelectForcedKeepsManualPin(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	now := time.Now()
 	if err := s.m.Store.PinManual("/proj", 1, now); err != nil {
 		t.Fatal(err)
 	}
 	forced := 2
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[2] {
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 2 || resp.Prepared || resp.Dir != "" {
 		t.Fatalf("forced select failed: %+v", resp)
 	}
 	st, ok, _ := s.m.Store.GetSticky("/proj")
@@ -1074,7 +1060,7 @@ func TestHandleSelectForcedKeepsManualPin(t *testing.T) {
 // TestHandleSelectExhaustedFallback: an exhausted pool yields the least-bad
 // pick flagged ExhaustedFallback — never an error.
 func TestHandleSelectExhaustedFallback(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 	now := time.Now().Add(time.Minute)
@@ -1091,8 +1077,8 @@ func TestHandleSelectExhaustedFallback(t *testing.T) {
 	if !resp.OK || !resp.ExhaustedFallback {
 		t.Fatalf("expected a flagged fallback pick, got %+v", resp)
 	}
-	if resp.Dir != dirs[2] || !resp.ExtraEnabled {
-		t.Fatalf("expected least-bad acct-2 (%s) with extra usage surfaced, got %+v", dirs[2], resp)
+	if resp.SelectedID == nil || *resp.SelectedID != 2 || resp.Prepared || resp.Dir != "" || !resp.ExtraEnabled {
+		t.Fatalf("expected metadata-only least-bad acct-2 with extra usage surfaced, got %+v", resp)
 	}
 	if resp.SoonestReset == nil || !resp.SoonestReset.Equal(reset.Truncate(time.Second)) {
 		t.Fatalf("fallback must carry the pick's recovery time %v for the warning, got %v", reset, resp.SoonestReset)

@@ -8,56 +8,39 @@ import (
 )
 
 var (
-	statusAppInstall    = statusapp.InstallService
-	statusAppDeactivate = statusapp.DeactivateService
-	statusAppRollback   = func(ctx context.Context, receipt statusapp.ServiceInstallReceipt) error {
-		return receipt.Rollback(ctx)
-	}
+	statusAppRequire   = statusapp.RequireActiveService
+	statusAppUninstall = statusapp.UninstallPackagedApp
 )
 
-// HolderServiceInstall owns one exact pre-bootstrap signed service deployment.
-type HolderServiceInstall struct {
-	Receipt   statusapp.ServiceInstallReceipt
-	committed bool
-}
+// HolderServiceInstall records one successful exact active-service requirement.
+type HolderServiceInstall struct{}
 
-// Commit crosses the daemon-bootstrap boundary and permanently disarms rollback.
-func (i *HolderServiceInstall) Commit() { i.committed = true }
+// Commit records no product rollback because daemonkit terminally owns candidate application.
+func (*HolderServiceInstall) Commit() {}
 
-// Rollback deactivates only this receipt's uncommitted newly activated holder.
-func (i *HolderServiceInstall) Rollback(ctx context.Context) error {
-	if i == nil || i.committed {
-		return nil
-	}
-	if err := statusAppRollback(ctx, i.Receipt); err != nil {
-		return fmt.Errorf("rollback FuseKit runtime service: %w", err)
-	}
+// Rollback is a no-op because requiring the active service performs no mutation.
+func (*HolderServiceInstall) Rollback(ctx context.Context) error {
+	_ = ctx
 	return nil
 }
 
 // StopAndUninstallHolderService removes the holder from the complete desired service set.
 func StopAndUninstallHolderService(ctx context.Context) error {
-	if err := statusAppDeactivate(ctx); err != nil {
+	if err := statusAppUninstall(ctx); err != nil {
 		return fmt.Errorf("remove FuseKit runtime service: %w", err)
 	}
 	return nil
 }
 
-// EnsureHolderService installs the fixed app service and proves its FuseKit session ready.
+// EnsureHolderService requires the packaged fixed app service and proves its FuseKit session ready.
 func EnsureHolderService(ctx context.Context) error {
-	install, err := InstallHolderService(ctx)
-	if err != nil {
-		return err
-	}
-	install.Commit()
-	return nil
+	return statusAppRequire(ctx)
 }
 
-// InstallHolderService atomically deploys the signed app and its complete service plan.
+// InstallHolderService requires the separately packaged signed app and its complete service plan.
 func InstallHolderService(ctx context.Context) (*HolderServiceInstall, error) {
-	receipt, err := statusAppInstall(ctx)
-	if err != nil {
+	if err := statusAppRequire(ctx); err != nil {
 		return nil, err
 	}
-	return &HolderServiceInstall{Receipt: receipt}, nil
+	return &HolderServiceInstall{}, nil
 }

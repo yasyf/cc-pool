@@ -42,7 +42,9 @@ func (p ClaudeAuthorityPolicy) DeclarationDigest() ([32]byte, error) {
 	writeDeclarationSet(digest, "skip-entries", trueMapKeys(overlay.SkipEntries))
 	writeDeclarationSet(digest, "skip-prefixes", overlay.SkipPrefixes)
 	writeDeclarationSet(digest, "private-patterns", overlay.PrivatePatterns)
-	writeDeclarationSet(digest, "private-prefixes", overlay.PrivatePrefixes)
+	writeDeclarationSet(digest, "private-source-prefixes", overlay.PrivateSourcePrefixes)
+	writeDeclarationSet(digest, "private-staging-prefixes", overlay.PrivateStagingPrefixes)
+	writeDeclarationSet(digest, "private-lock-prefixes", overlay.PrivateLockPrefixes)
 	writeDeclarationSet(digest, "claude-json-private-keys", trueMapKeys(overlay.ClaudeJSONPrivateKeys))
 	writeDeclarationSet(
 		digest,

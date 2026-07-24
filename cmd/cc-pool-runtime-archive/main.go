@@ -66,13 +66,16 @@ func CCPoolFuseKitStart(appGroupIdentifier *C.char) C.int32_t {
 }
 
 func startHolder(ctx context.Context, requiredAppGroup string) error {
+	var runtime *holder.Runtime
 	if err := embeddedHolder.Start(ctx, func(ctx context.Context) (holderbridge.ProcessRuntime, error) {
-		return newHolderRuntime(ctx, requiredAppGroup)
+		constructed, err := newHolderRuntime(ctx, requiredAppGroup)
+		runtime = constructed
+		return constructed, err
 	}); err != nil {
 		return err
 	}
 	err := tenantfs.PublishClaudeSourceFleet(
-		ctx, pool.FuseKitSocketPath(), claudeAuthorityPolicy(),
+		ctx, runtime.LocalTenantController(), claudeAuthorityPolicy(),
 	)
 	if err == nil {
 		return nil
@@ -136,6 +139,7 @@ func newHolderRuntime(ctx context.Context, requiredAppGroup string) (*holder.Run
 		Owner:            tenantfs.SourceAuthorityFleetOwner, Drivers: drivers,
 		CatalogAuthorizer: tenantfs.NewCatalogAuthorizer(),
 		Authorizer:        tenantfs.NewMountAuthorizer(),
+		BusinessHandlers:  tenantfs.BusinessHandlers(),
 	})
 }
 

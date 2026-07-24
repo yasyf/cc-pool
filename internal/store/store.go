@@ -3,6 +3,7 @@
 package store
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -67,8 +68,8 @@ CREATE TABLE account_registry_sequences (
 CREATE TABLE account_mutations (
   operation_id               BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
   account_id                 INTEGER NOT NULL UNIQUE CHECK(account_id > 0),
-  kind                       TEXT NOT NULL CHECK(kind IN ('add','relogin','presentation-rebind')),
-  state                      TEXT NOT NULL CHECK(state IN ('awaiting-presentation','awaiting-input','reserved','applying','applied','publishing','compensating','rebind-published')),
+  kind                       TEXT NOT NULL CHECK(kind IN ('add','relogin')),
+  state                      TEXT NOT NULL CHECK(state IN ('awaiting-presentation','awaiting-input','reserved','applying','applied','publishing','compensating')),
   registry_sequence          INTEGER NOT NULL CHECK(registry_sequence > 0),
   account_instance_id        TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation         INTEGER NOT NULL CHECK(account_generation > 0),
@@ -83,73 +84,29 @@ CREATE TABLE account_mutations (
   keychain_account           TEXT NOT NULL,
   label                      TEXT NOT NULL DEFAULT '',
   account_uuid               TEXT NOT NULL DEFAULT '',
-	proof_catalog_tenant_id    TEXT NOT NULL,
-	proof_catalog_generation   INTEGER NOT NULL CHECK(proof_catalog_generation >= 0),
-	proof_requested            INTEGER NOT NULL CHECK(proof_requested >= 0),
-	proof_desired              INTEGER NOT NULL CHECK(proof_desired >= 0),
-	proof_observed             INTEGER NOT NULL CHECK(proof_observed >= 0),
-	proof_verified             INTEGER NOT NULL CHECK(proof_verified >= 0),
-	proof_applied              INTEGER NOT NULL CHECK(proof_applied >= 0),
-	proof_source_authority     TEXT NOT NULL,
-	proof_source_revision      INTEGER NOT NULL CHECK(proof_source_revision >= 0),
-	proof_catalog_revision     INTEGER NOT NULL CHECK(proof_catalog_revision >= 0),
-	proof_change_id            TEXT NOT NULL,
-	proof_operation_id         TEXT NOT NULL,
-	proof_presentation_kind    TEXT NOT NULL,
-	proof_tenant_id            TEXT NOT NULL,
-	proof_domain_id            TEXT NOT NULL,
-	proof_presentation_generation INTEGER NOT NULL CHECK(proof_presentation_generation >= 0),
-	proof_activation_generation TEXT NOT NULL,
-	proof_public_path          TEXT NOT NULL,
-	previous_config_dir       TEXT NOT NULL,
-	previous_keychain_service TEXT NOT NULL,
-	previous_keychain_account TEXT NOT NULL,
-	previous_locator_digest   BLOB NOT NULL CHECK(length(previous_locator_digest)=32),
-	previous_credential_state TEXT NOT NULL CHECK(previous_credential_state IN ('','empty','present')),
-	previous_credential_digest BLOB CHECK(previous_credential_digest IS NULL OR length(previous_credential_digest)=32),
+	presentation_tenant_id    TEXT NOT NULL,
+	presentation_domain_id    TEXT NOT NULL,
+	presentation_generation   INTEGER NOT NULL CHECK(presentation_generation >= 0),
+	presentation_public_path  TEXT NOT NULL,
   owner_record               BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch                INTEGER NOT NULL CHECK(owner_epoch > 0),
   created_at                 INTEGER NOT NULL CHECK(created_at > 0),
   updated_at                 INTEGER NOT NULL CHECK(updated_at >= created_at),
-  CHECK((kind IN ('add','presentation-rebind') AND state='awaiting-presentation' AND
+  CHECK((kind='add' AND state='awaiting-presentation' AND
          locator_digest=zeroblob(32) AND expected_credential_digest=zeroblob(32) AND
          config_dir='' AND keychain_service='' AND keychain_account='' AND
-		 proof_catalog_tenant_id='' AND proof_catalog_generation=0 AND proof_requested=0 AND
-		 proof_desired=0 AND proof_observed=0 AND proof_verified=0 AND proof_applied=0 AND
-		 proof_source_authority='' AND proof_source_revision=0 AND proof_catalog_revision=0 AND
-		 proof_change_id='' AND proof_operation_id='' AND proof_presentation_kind='' AND
-		 proof_tenant_id='' AND proof_domain_id='' AND
-		 proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path='') OR
+		 presentation_tenant_id='' AND presentation_domain_id='' AND
+		 presentation_generation=0 AND presentation_public_path='') OR
         (state<>'awaiting-presentation' AND config_dir<>'' AND keychain_service<>'' AND keychain_account<>'' AND
-		 ((kind IN ('add','presentation-rebind') AND proof_presentation_kind='file_provider' AND
-		   account_generation=proof_presentation_generation AND
-		   config_dir=proof_public_path AND proof_catalog_tenant_id=proof_tenant_id AND
-		   proof_catalog_generation=proof_presentation_generation AND proof_requested>0 AND
-		   proof_desired=proof_requested AND proof_observed=proof_requested AND
-		   proof_verified=proof_requested AND proof_applied=proof_requested AND
-		   proof_source_authority<>'' AND proof_source_revision>0 AND proof_catalog_revision=proof_requested AND
-		   proof_change_id<>'' AND proof_operation_id<>'' AND proof_tenant_id<>'' AND proof_domain_id<>'' AND
-		   proof_activation_generation<>'') OR
-		  (kind NOT IN ('add','presentation-rebind') AND proof_catalog_tenant_id='' AND proof_catalog_generation=0 AND proof_requested=0 AND
-		   proof_desired=0 AND proof_observed=0 AND proof_verified=0 AND proof_applied=0 AND
-		   proof_source_authority='' AND proof_source_revision=0 AND proof_catalog_revision=0 AND
-		   proof_change_id='' AND proof_operation_id='' AND proof_presentation_kind='' AND
-		   proof_tenant_id='' AND proof_domain_id='' AND
-		   proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path='')))),
-	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
-	       previous_keychain_account<>'' AND previous_locator_digest<>zeroblob(32) AND
-	       ((previous_credential_state='empty' AND previous_credential_digest IS NULL) OR
-	        (previous_credential_state='present' AND previous_credential_digest IS NOT NULL AND
-	         previous_credential_digest<>zeroblob(32)))) OR
-	      (kind<>'presentation-rebind' AND previous_config_dir='' AND previous_keychain_service='' AND
-	       previous_keychain_account='' AND previous_locator_digest=zeroblob(32) AND
-	       previous_credential_state='' AND previous_credential_digest IS NULL)),
-	CHECK(state<>'rebind-published' OR kind='presentation-rebind')
+		 ((kind='add' AND presentation_tenant_id<>'' AND
+		   presentation_domain_id<>'' AND account_generation=presentation_generation) OR
+		  (kind<>'add' AND presentation_tenant_id='' AND
+		   presentation_domain_id='' AND presentation_generation=0 AND presentation_public_path=''))))
 );
 CREATE TABLE account_mutation_receipts (
   operation_id      BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
   account_id        INTEGER NOT NULL CHECK(account_id > 0),
-  kind              TEXT NOT NULL CHECK(kind IN ('add','relogin','presentation-rebind')),
+  kind              TEXT NOT NULL CHECK(kind IN ('add','relogin')),
   registry_sequence INTEGER NOT NULL CHECK(registry_sequence > 0),
   account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation INTEGER NOT NULL CHECK(account_generation > 0),
@@ -170,30 +127,10 @@ CREATE TABLE account_mutation_receipts (
   keychain_account  TEXT NOT NULL CHECK(keychain_account <> ''),
   label             TEXT NOT NULL DEFAULT '',
   account_uuid      TEXT NOT NULL DEFAULT '',
-	proof_catalog_tenant_id TEXT NOT NULL,
-	proof_catalog_generation INTEGER NOT NULL CHECK(proof_catalog_generation >= 0),
-	proof_requested INTEGER NOT NULL CHECK(proof_requested >= 0),
-	proof_desired INTEGER NOT NULL CHECK(proof_desired >= 0),
-	proof_observed INTEGER NOT NULL CHECK(proof_observed >= 0),
-	proof_verified INTEGER NOT NULL CHECK(proof_verified >= 0),
-	proof_applied INTEGER NOT NULL CHECK(proof_applied >= 0),
-	proof_source_authority TEXT NOT NULL,
-	proof_source_revision INTEGER NOT NULL CHECK(proof_source_revision >= 0),
-	proof_catalog_revision INTEGER NOT NULL CHECK(proof_catalog_revision >= 0),
-	proof_change_id TEXT NOT NULL,
-	proof_operation_id TEXT NOT NULL,
-	proof_presentation_kind TEXT NOT NULL,
-	proof_tenant_id TEXT NOT NULL,
-	proof_domain_id TEXT NOT NULL,
-	proof_presentation_generation INTEGER NOT NULL CHECK(proof_presentation_generation >= 0),
-	proof_activation_generation TEXT NOT NULL,
-	proof_public_path TEXT NOT NULL,
-	previous_config_dir TEXT NOT NULL,
-	previous_keychain_service TEXT NOT NULL,
-	previous_keychain_account TEXT NOT NULL,
-	previous_locator_digest BLOB NOT NULL CHECK(length(previous_locator_digest)=32),
-	previous_credential_state TEXT NOT NULL CHECK(previous_credential_state IN ('','empty','present')),
-	previous_credential_digest BLOB CHECK(previous_credential_digest IS NULL OR length(previous_credential_digest)=32),
+	presentation_tenant_id TEXT NOT NULL,
+	presentation_domain_id TEXT NOT NULL,
+	presentation_generation INTEGER NOT NULL CHECK(presentation_generation >= 0),
+	presentation_public_path TEXT NOT NULL,
   owner_record      BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch       INTEGER NOT NULL CHECK(owner_epoch > 0),
 	publication_pending INTEGER NOT NULL CHECK(publication_pending IN (0,1)),
@@ -201,32 +138,13 @@ CREATE TABLE account_mutation_receipts (
   acknowledged_at   INTEGER CHECK(acknowledged_at IS NULL OR acknowledged_at >= committed_at),
   expires_at        INTEGER NOT NULL CHECK(expires_at > committed_at),
 	CHECK((credential_written=1) = (written_credential_digest IS NOT NULL)),
-	CHECK((kind IN ('add','presentation-rebind') AND proof_presentation_kind='file_provider' AND
-	       account_generation=proof_presentation_generation AND
-	       config_dir=proof_public_path AND proof_catalog_tenant_id=proof_tenant_id AND
-	       proof_catalog_generation=proof_presentation_generation AND proof_requested>0 AND
-	       proof_desired=proof_requested AND proof_observed=proof_requested AND
-	       proof_verified=proof_requested AND proof_applied=proof_requested AND
-	       proof_source_authority<>'' AND proof_source_revision>0 AND proof_catalog_revision=proof_requested AND
-	       proof_change_id<>'' AND proof_operation_id<>'' AND proof_tenant_id<>'' AND proof_domain_id<>'' AND
-	       proof_activation_generation<>'') OR
-	      (kind NOT IN ('add','presentation-rebind') AND proof_catalog_tenant_id='' AND proof_catalog_generation=0 AND proof_requested=0 AND
-	       proof_desired=0 AND proof_observed=0 AND proof_verified=0 AND proof_applied=0 AND
-	       proof_source_authority='' AND proof_source_revision=0 AND proof_catalog_revision=0 AND
-	       proof_change_id='' AND proof_operation_id='' AND proof_presentation_kind='' AND
-	       proof_tenant_id='' AND proof_domain_id='' AND
-	       proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path='')),
-	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
-	       previous_keychain_account<>'' AND previous_locator_digest<>zeroblob(32) AND
-	       ((previous_credential_state='empty' AND previous_credential_digest IS NULL) OR
-	        (previous_credential_state='present' AND previous_credential_digest IS NOT NULL AND
-	         previous_credential_digest<>zeroblob(32)))) OR
-	      (kind<>'presentation-rebind' AND previous_config_dir='' AND previous_keychain_service='' AND
-	       previous_keychain_account='' AND previous_locator_digest=zeroblob(32) AND
-	       previous_credential_state='' AND previous_credential_digest IS NULL)),
+	CHECK((kind='add' AND presentation_tenant_id<>'' AND
+	       presentation_domain_id<>'' AND account_generation=presentation_generation) OR
+	      (kind<>'add' AND presentation_tenant_id='' AND
+	       presentation_domain_id='' AND presentation_generation=0 AND presentation_public_path='')),
 	CHECK((terminal='quarantined') = (quarantine_reason IS NOT NULL)),
 	CHECK(publication_pending=0 OR
-	      (terminal='committed' AND kind IN ('add','presentation-rebind'))),
+	      (terminal='committed' AND kind='add')),
 	CHECK((resolution IS NULL AND resolution_observed_digest IS NULL AND resolved_at IS NULL)
 	   OR (resolution IS NOT NULL AND resolution_observed_digest IS NOT NULL AND resolved_at IS NOT NULL AND resolved_at>=committed_at))
 );
@@ -249,6 +167,7 @@ CREATE TABLE usage_samples (
 CREATE INDEX idx_usage_acct_ts ON usage_samples(account_id, ts DESC);
 CREATE TABLE sessions (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  selection_token TEXT NOT NULL UNIQUE CHECK(length(selection_token) = 32 AND selection_token NOT GLOB '*[^0-9a-f]*'),
   account_id   INTEGER NOT NULL CHECK(account_id > 0),
   account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation INTEGER NOT NULL CHECK(account_generation > 0),
@@ -257,6 +176,10 @@ CREATE TABLE sessions (
   config_dir   TEXT NOT NULL CHECK(config_dir <> ''),
   cwd          TEXT NOT NULL DEFAULT '',
   started_at   INTEGER NOT NULL CHECK(started_at > 0),
+  file_provider_lease_state TEXT NOT NULL CHECK(file_provider_lease_state IN ('pending','active','released')),
+  file_provider_lease_receipt BLOB NOT NULL CHECK(length(file_provider_lease_receipt) BETWEEN 1 AND 65536),
+  file_provider_lease_expires_at INTEGER NOT NULL CHECK(file_provider_lease_expires_at > 0),
+  lease_renewal_expires_at INTEGER CHECK(lease_renewal_expires_at > 0),
   last_seen_at INTEGER,
   ended_at     INTEGER
 );
@@ -267,6 +190,8 @@ CREATE TABLE selection_terminals (
   account_id          INTEGER NOT NULL CHECK(account_id > 0),
   account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation  INTEGER NOT NULL CHECK(account_generation > 0),
+	file_provider_provisional_lease_receipt BLOB NOT NULL CHECK(length(file_provider_provisional_lease_receipt) BETWEEN 1 AND 65536),
+	file_provider_committed_lease_receipt BLOB NOT NULL CHECK(length(file_provider_committed_lease_receipt) BETWEEN 1 AND 65536),
   committed_at        INTEGER NOT NULL CHECK(committed_at > 0),
   expires_at          INTEGER NOT NULL CHECK(expires_at > committed_at)
 );
@@ -422,24 +347,8 @@ CREATE TABLE account_presentations (
   tenant_id               TEXT NOT NULL CHECK(tenant_id <> ''),
   domain_id               TEXT NOT NULL CHECK(domain_id <> ''),
   presentation_generation INTEGER NOT NULL CHECK(presentation_generation > 0),
-  activation_generation   TEXT NOT NULL CHECK(activation_generation <> ''),
   public_path             TEXT NOT NULL CHECK(public_path <> ''),
-	presentation_kind       TEXT NOT NULL CHECK(presentation_kind='file_provider'),
-	catalog_tenant_id       TEXT NOT NULL CHECK(catalog_tenant_id<>''),
-	catalog_generation      INTEGER NOT NULL CHECK(catalog_generation>0),
-	catalog_requested       INTEGER NOT NULL CHECK(catalog_requested>0),
-	catalog_desired         INTEGER NOT NULL CHECK(catalog_desired=catalog_requested),
-	catalog_observed        INTEGER NOT NULL CHECK(catalog_observed=catalog_requested),
-	catalog_verified        INTEGER NOT NULL CHECK(catalog_verified=catalog_requested),
-	catalog_applied         INTEGER NOT NULL CHECK(catalog_applied=catalog_requested),
-	source_authority        TEXT NOT NULL CHECK(source_authority<>''),
-	source_revision         INTEGER NOT NULL CHECK(source_revision>0),
-	catalog_revision        INTEGER NOT NULL CHECK(catalog_revision=catalog_requested),
-	change_id               TEXT NOT NULL CHECK(change_id<>''),
-	operation_id            TEXT NOT NULL CHECK(operation_id<>''),
-  observed_at             INTEGER NOT NULL CHECK(observed_at > 0),
-  CHECK(account_generation = presentation_generation),
-	CHECK(catalog_tenant_id=tenant_id AND catalog_generation=presentation_generation)
+  observed_at             INTEGER NOT NULL CHECK(observed_at > 0)
 );
 CREATE TABLE account_presentation_quarantines (
   account_id              INTEGER PRIMARY KEY CHECK(account_id > 0),
@@ -449,24 +358,23 @@ CREATE TABLE account_presentation_quarantines (
   observed_tenant_id      TEXT NOT NULL CHECK(observed_tenant_id <> ''),
   observed_domain_id      TEXT NOT NULL CHECK(observed_domain_id <> ''),
   observed_generation     INTEGER NOT NULL CHECK(observed_generation > 0),
-  observed_activation_generation TEXT NOT NULL CHECK(observed_activation_generation <> ''),
   observed_public_path    TEXT NOT NULL CHECK(observed_public_path <> ''),
-	observed_presentation_kind TEXT NOT NULL CHECK(observed_presentation_kind='file_provider'),
-	observed_catalog_tenant_id TEXT NOT NULL CHECK(observed_catalog_tenant_id<>''),
-	observed_catalog_generation INTEGER NOT NULL CHECK(observed_catalog_generation>0),
-	observed_catalog_requested INTEGER NOT NULL CHECK(observed_catalog_requested>0),
-	observed_catalog_desired INTEGER NOT NULL CHECK(observed_catalog_desired=observed_catalog_requested),
-	observed_catalog_observed INTEGER NOT NULL CHECK(observed_catalog_observed=observed_catalog_requested),
-	observed_catalog_verified INTEGER NOT NULL CHECK(observed_catalog_verified=observed_catalog_requested),
-	observed_catalog_applied INTEGER NOT NULL CHECK(observed_catalog_applied=observed_catalog_requested),
-	observed_source_authority TEXT NOT NULL CHECK(observed_source_authority<>''),
-	observed_source_revision INTEGER NOT NULL CHECK(observed_source_revision>0),
-	observed_catalog_revision INTEGER NOT NULL CHECK(observed_catalog_revision=observed_catalog_requested),
-	observed_change_id TEXT NOT NULL CHECK(observed_change_id<>''),
-	observed_operation_id TEXT NOT NULL CHECK(observed_operation_id<>''),
   reason                  TEXT NOT NULL CHECK(reason IN ('public-path-drift','tenant-id-drift','domain-id-drift','generation-drift')),
-  created_at              INTEGER NOT NULL CHECK(created_at > 0),
-	CHECK(observed_catalog_tenant_id=observed_tenant_id AND observed_catalog_generation=observed_generation)
+  created_at              INTEGER NOT NULL CHECK(created_at > 0)
+);
+CREATE TABLE account_presentation_repairs (
+  account_id                       INTEGER PRIMARY KEY CHECK(account_id > 0),
+  account_instance_id              TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation               INTEGER NOT NULL CHECK(account_generation > 0),
+  previous_tenant_id               TEXT NOT NULL CHECK(previous_tenant_id <> ''),
+  previous_domain_id               TEXT NOT NULL CHECK(previous_domain_id <> ''),
+  previous_presentation_generation INTEGER NOT NULL CHECK(previous_presentation_generation > 0),
+  previous_public_path             TEXT NOT NULL CHECK(previous_public_path <> ''),
+  target_tenant_id                 TEXT NOT NULL CHECK(target_tenant_id <> ''),
+  target_domain_id                 TEXT NOT NULL CHECK(target_domain_id <> ''),
+  target_presentation_generation   INTEGER NOT NULL CHECK(target_presentation_generation > 0),
+  target_public_path               TEXT NOT NULL CHECK(target_public_path <> ''),
+  created_at                       INTEGER NOT NULL CHECK(created_at > 0)
 );
 CREATE UNIQUE INDEX idx_accounts_live_config_dir ON accounts(config_dir) WHERE deleted_at IS NULL;
 CREATE INDEX idx_account_mutations_owner ON account_mutations(owner_record,account_id);
@@ -837,7 +745,6 @@ func (s *Store) ListActiveAccounts() ([]Account, error) {
 		JOIN account_presentations ON account_presentations.account_id=accounts.id
 		  AND account_presentations.account_instance_id=accounts.instance_id
 		  AND account_presentations.account_generation=accounts.generation
-		  AND account_presentations.public_path=accounts.config_dir
 		WHERE deleted_at IS NULL
 		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)
 		  AND NOT EXISTS (SELECT 1 FROM account_presentation_quarantines WHERE account_id=accounts.id)
@@ -868,7 +775,6 @@ func (s *Store) ListPublishableOrigins() ([]Account, error) {
 		JOIN account_presentations ON account_presentations.account_id=accounts.id
 		  AND account_presentations.account_instance_id=accounts.instance_id
 		  AND account_presentations.account_generation=accounts.generation
-		  AND account_presentations.public_path=accounts.config_dir
 		LEFT JOIN auth_health ON auth_health.account_id=accounts.id
 		WHERE deleted_at IS NULL
 		  AND accounts.account_uuid<>''
@@ -1070,18 +976,20 @@ func (s *Store) BeginAccountRemoval(id int, deleteCredential bool) (AccountRemov
 	if err != nil {
 		return AccountRemoval{}, err
 	}
-	var activeSession, activeCredentialOperation int
+	var activeSession, activeCredentialOperation, presentationRepair int
 	var unacknowledgedAccountMutation, unacknowledgedCredentialOperation, credentialQuarantine int
 	if err := tx.QueryRow(
 		`SELECT EXISTS(SELECT 1 FROM sessions WHERE account_id=? AND ended_at IS NULL),
 		        EXISTS(SELECT 1 FROM credential_operations WHERE account_id=?),
 		        EXISTS(SELECT 1 FROM account_mutation_receipts WHERE account_id=? AND acknowledged_at IS NULL),
 		        EXISTS(SELECT 1 FROM credential_operation_receipts WHERE account_id=? AND acknowledged_at IS NULL),
-		        EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=?)`,
-		id, id, id, id, id,
+		        EXISTS(SELECT 1 FROM credential_quarantines WHERE account_id=?),
+		        EXISTS(SELECT 1 FROM account_presentation_repairs WHERE account_id=?)`,
+		id, id, id, id, id, id,
 	).Scan(
 		&activeSession, &activeCredentialOperation,
 		&unacknowledgedAccountMutation, &unacknowledgedCredentialOperation, &credentialQuarantine,
+		&presentationRepair,
 	); err != nil {
 		return AccountRemoval{}, err
 	}
@@ -1090,6 +998,9 @@ func (s *Store) BeginAccountRemoval(id int, deleteCredential bool) (AccountRemov
 	}
 	if activeCredentialOperation != 0 {
 		return AccountRemoval{}, ErrCredentialOperationBusy
+	}
+	if presentationRepair != 0 {
+		return AccountRemoval{}, ErrAccountPresentationBusy
 	}
 	if unacknowledgedAccountMutation != 0 || unacknowledgedCredentialOperation != 0 || credentialQuarantine != 0 {
 		return AccountRemoval{}, ErrCredentialOperationEvidenceActive
@@ -1280,7 +1191,6 @@ func selectionEligible(
 		JOIN account_presentations ON account_presentations.account_id=accounts.id
 		  AND account_presentations.account_instance_id=accounts.instance_id
 		  AND account_presentations.account_generation=accounts.generation
-		  AND account_presentations.public_path=accounts.config_dir
 		WHERE accounts.id=? AND accounts.instance_id=? AND accounts.generation=?
 		  AND accounts.config_dir=? AND accounts.deleted_at IS NULL
 		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)
@@ -1321,49 +1231,86 @@ func (s *Store) SelectionEligible(account Account) error {
 // tenant-defining shape changed before activation.
 var ErrAccountGenerationChanged = errors.New("account generation changed")
 
-// ActivateSelection atomically verifies the reserved account identity and
-// generation, then records sticky/session state. No filesystem or provider I/O
-// occurs in this transaction.
-func (s *Store) ActivateSelection(a SelectionActivation) (err error) {
+// ErrSessionLeaseConflict means an exact session lease receipt or renewal fence changed.
+var ErrSessionLeaseConflict = errors.New("session File Provider lease changed")
+
+func validateFileProviderLeaseReceipt(receipt FileProviderLeaseReceipt) error {
+	if len(receipt) == 0 || len(receipt) > 64*1024 {
+		return errors.New("File Provider lease receipt must contain 1..65536 bytes")
+	}
+	return nil
+}
+
+func cloneFileProviderLeaseReceipt(receipt FileProviderLeaseReceipt) FileProviderLeaseReceipt {
+	return append(FileProviderLeaseReceipt(nil), receipt...)
+}
+
+// StageSelection atomically records the exact provisional File Provider lease
+// before external lease promotion begins.
+func (s *Store) StageSelection(a SelectionActivation) (_ Session, err error) {
 	if err := validateSelectionToken(a.Token); err != nil {
-		return fmt.Errorf("activate selection: %w", err)
+		return Session{}, fmt.Errorf("stage selection: %w", err)
 	}
 	if a.Process.PID <= 0 {
-		return errors.New("activate selection: positive process pid is required")
+		return Session{}, errors.New("stage selection: positive process pid is required")
 	}
 	if a.Process.StartedAt.IsZero() {
-		return errors.New("activate selection: process start time is required")
+		return Session{}, errors.New("stage selection: process start time is required")
 	}
 	if a.ConfigDir == "" {
-		return errors.New("activate selection: config dir is required")
+		return Session{}, errors.New("stage selection: config dir is required")
+	}
+	if err := validateFileProviderLeaseReceipt(a.FileProviderLease); err != nil {
+		return Session{}, fmt.Errorf("stage selection: %w", err)
+	}
+	if a.LeaseExpiresAt.IsZero() || a.LeaseExpiresAt.UnixNano() <= 0 {
+		return Session{}, errors.New("stage selection: lease expiry is required")
 	}
 	if a.At.IsZero() {
 		a.At = s.now()
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("begin selection activation: %w", err)
+		return Session{}, fmt.Errorf("begin selection staging: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	terminalNow := s.now()
 	if err = pruneSelectionTerminals(tx, terminalNow); err != nil {
-		return fmt.Errorf("prune selection terminals: %w", err)
+		return Session{}, fmt.Errorf("prune selection terminals: %w", err)
 	}
 	var terminalAccountID int
 	var terminalInstanceID string
 	var terminalGeneration uint64
+	var terminalProvisional []byte
 	err = tx.QueryRow(
-		`SELECT account_id,account_instance_id,account_generation FROM selection_terminals WHERE token=?`, a.Token,
-	).Scan(&terminalAccountID, &terminalInstanceID, &terminalGeneration)
+		`SELECT account_id,account_instance_id,account_generation,file_provider_provisional_lease_receipt FROM selection_terminals WHERE token=?`, a.Token,
+	).Scan(&terminalAccountID, &terminalInstanceID, &terminalGeneration, &terminalProvisional)
 	if err == nil {
 		if terminalAccountID != a.AccountID || terminalInstanceID != a.ExpectedInstanceID || terminalGeneration != a.ExpectedGeneration {
-			return fmt.Errorf("activate selection: token %s belongs to account %d %s/%d", a.Token,
+			return Session{}, fmt.Errorf("stage selection: token %s belongs to account %d %s/%d", a.Token,
 				terminalAccountID, terminalInstanceID, terminalGeneration)
 		}
-		return nil
+		if !bytes.Equal(terminalProvisional, a.FileProviderLease) {
+			return Session{}, fmt.Errorf("stage selection: token %s: %w", a.Token, ErrSessionLeaseConflict)
+		}
+		return sessionBySelectionToken(tx, a.Token)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("read selection terminal: %w", err)
+		return Session{}, fmt.Errorf("read selection terminal: %w", err)
+	}
+	staged, err := sessionBySelectionToken(tx, a.Token)
+	if err == nil {
+		if staged.AccountID != a.AccountID || staged.AccountInstanceID != a.ExpectedInstanceID ||
+			staged.AccountGeneration != a.ExpectedGeneration || staged.PID != a.Process.PID ||
+			!staged.ProcessStartedAt.Equal(a.Process.StartedAt) || staged.ConfigDir != a.ConfigDir ||
+			!bytes.Equal(staged.FileProviderLease, a.FileProviderLease) ||
+			!staged.LeaseExpiresAt.Equal(a.LeaseExpiresAt) {
+			return Session{}, ErrSessionLeaseConflict
+		}
+		return staged, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Session{}, err
 	}
 	var instanceID string
 	var generation uint64
@@ -1371,47 +1318,129 @@ func (s *Store) ActivateSelection(a SelectionActivation) (err error) {
 		`SELECT instance_id,generation FROM accounts WHERE id=? AND deleted_at IS NULL`, a.AccountID,
 	).Scan(&instanceID, &generation); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("activate selection account %d: %w", a.AccountID, ErrAccountNotFound)
+			return Session{}, fmt.Errorf("stage selection account %d: %w", a.AccountID, ErrAccountNotFound)
 		}
-		return fmt.Errorf("activate selection account %d: %w", a.AccountID, err)
+		return Session{}, fmt.Errorf("stage selection account %d: %w", a.AccountID, err)
 	}
 	if instanceID != a.ExpectedInstanceID || generation != a.ExpectedGeneration {
-		return fmt.Errorf("%w: account=%d reserved=%s/%d current=%s/%d", ErrAccountGenerationChanged,
+		return Session{}, fmt.Errorf("%w: account=%d reserved=%s/%d current=%s/%d", ErrAccountGenerationChanged,
 			a.AccountID, a.ExpectedInstanceID, a.ExpectedGeneration, instanceID, generation)
 	}
 	if _, removalErr := accountRemovalByID(tx, a.AccountID); removalErr == nil {
-		return fmt.Errorf("activate selection account %d: %w", a.AccountID, ErrAccountRemoving)
+		return Session{}, fmt.Errorf("stage selection account %d: %w", a.AccountID, ErrAccountRemoving)
 	} else if !errors.Is(removalErr, sql.ErrNoRows) {
-		return fmt.Errorf("read selection removal for account %d: %w", a.AccountID, removalErr)
+		return Session{}, fmt.Errorf("read selection removal for account %d: %w", a.AccountID, removalErr)
 	}
 	if err = selectionEligible(
 		tx, a.AccountID, a.ExpectedInstanceID, a.ExpectedGeneration, a.ConfigDir,
 	); err != nil {
-		return fmt.Errorf("activate selection account %d: %w", a.AccountID, err)
+		return Session{}, fmt.Errorf("stage selection account %d: %w", a.AccountID, err)
 	}
-	if a.RecordSticky && a.Cwd != "" {
-		if _, err = tx.Exec(upsertStickySQL, a.Cwd, a.AccountID, a.At.Unix()); err != nil {
-			return fmt.Errorf("activate selection sticky for %s: %w", a.Cwd, err)
+	result, err := tx.Exec(
+		`INSERT INTO sessions(selection_token,account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at,
+		 file_provider_lease_state,file_provider_lease_receipt,file_provider_lease_expires_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.Token, a.AccountID, instanceID, generation, a.Process.PID, a.Process.StartedAt.UnixMicro(), a.ConfigDir, a.Cwd,
+		a.At.Unix(), SessionLeasePending, []byte(a.FileProviderLease), a.LeaseExpiresAt.UTC().UnixNano())
+	if err != nil {
+		return Session{}, fmt.Errorf("stage selection session for account %d: %w", a.AccountID, err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return Session{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return Session{}, fmt.Errorf("commit selection staging: %w", err)
+	}
+	return Session{
+		ID: id, SelectionToken: a.Token, AccountID: a.AccountID, AccountInstanceID: instanceID,
+		AccountGeneration: generation, PID: a.Process.PID, ProcessStartedAt: a.Process.StartedAt,
+		ConfigDir: a.ConfigDir, Cwd: a.Cwd, StartedAt: a.At, LeaseState: SessionLeasePending,
+		FileProviderLease: cloneFileProviderLeaseReceipt(a.FileProviderLease), LeaseExpiresAt: a.LeaseExpiresAt.UTC(),
+	}, nil
+}
+
+// CommitSelection atomically promotes one staged session after FuseKit returns
+// the exact committed lease receipt.
+func (s *Store) CommitSelection(
+	token string,
+	provisional FileProviderLeaseReceipt,
+	committed FileProviderLeaseReceipt,
+	recordSticky bool,
+	at time.Time,
+) (err error) {
+	if err := validateSelectionToken(token); err != nil {
+		return err
+	}
+	if err := validateFileProviderLeaseReceipt(provisional); err != nil {
+		return err
+	}
+	if err := validateFileProviderLeaseReceipt(committed); err != nil {
+		return err
+	}
+	if at.IsZero() {
+		at = s.now()
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	terminalNow := s.now()
+	if err = pruneSelectionTerminals(tx, terminalNow); err != nil {
+		return err
+	}
+	var terminalProvisional, terminalCommitted []byte
+	err = tx.QueryRow(
+		`SELECT file_provider_provisional_lease_receipt,file_provider_committed_lease_receipt FROM selection_terminals WHERE token=?`, token,
+	).Scan(&terminalProvisional, &terminalCommitted)
+	if err == nil {
+		if bytes.Equal(terminalProvisional, provisional) && bytes.Equal(terminalCommitted, committed) {
+			return nil
+		}
+		return ErrSessionLeaseConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	staged, err := sessionBySelectionToken(tx, token)
+	if err != nil {
+		return err
+	}
+	if staged.LeaseState != SessionLeasePending || !bytes.Equal(staged.FileProviderLease, provisional) {
+		return ErrSessionLeaseConflict
+	}
+	result, err := tx.Exec(
+		`UPDATE sessions SET file_provider_lease_state=?,file_provider_lease_receipt=?
+		 WHERE id=? AND ended_at IS NULL AND file_provider_lease_state=? AND file_provider_lease_receipt=?`,
+		SessionLeaseActive, []byte(committed), staged.ID, SessionLeasePending, []byte(provisional),
+	)
+	if err != nil {
+		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		if err != nil {
+			return err
+		}
+		return ErrSessionLeaseConflict
+	}
+	if recordSticky && staged.Cwd != "" {
+		if _, err = tx.Exec(upsertStickySQL, staged.Cwd, staged.AccountID, at.Unix()); err != nil {
+			return err
 		}
 	}
 	if _, err = tx.Exec(
-		`INSERT INTO sessions(account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at)
-		 VALUES(?,?,?,?,?,?,?,?)`,
-		a.AccountID, instanceID, generation, a.Process.PID, a.Process.StartedAt.UnixMicro(), a.ConfigDir, a.Cwd, a.At.Unix()); err != nil {
-		return fmt.Errorf("activate selection session for account %d: %w", a.AccountID, err)
-	}
-	if _, err = tx.Exec(
-		`INSERT INTO selection_terminals(token,account_id,account_instance_id,account_generation,committed_at,expires_at) VALUES(?,?,?,?,?,?)`,
-		a.Token, a.AccountID, instanceID, generation, terminalNow.Unix(), terminalNow.Add(selectionTerminalTTL).Unix()); err != nil {
-		return fmt.Errorf("record selection terminal: %w", err)
+		`INSERT INTO selection_terminals(token,account_id,account_instance_id,account_generation,
+		 file_provider_provisional_lease_receipt,file_provider_committed_lease_receipt,committed_at,expires_at)
+		 VALUES(?,?,?,?,?,?,?,?)`, token, staged.AccountID, staged.AccountInstanceID, staged.AccountGeneration,
+		[]byte(provisional), []byte(committed), terminalNow.Unix(), terminalNow.Add(selectionTerminalTTL).Unix(),
+	); err != nil {
+		return err
 	}
 	if err = pruneSelectionTerminals(tx, terminalNow); err != nil {
-		return fmt.Errorf("bound selection terminals: %w", err)
+		return err
 	}
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit selection activation: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 // SelectionCommitted reports whether token's activation committed durably.
@@ -1460,11 +1489,50 @@ func validateSelectionToken(token string) error {
 	return nil
 }
 
-// CloseSession marks a session ended by id at time at.
-func (s *Store) CloseSession(id int64, at time.Time) error {
-	_, err := s.db.Exec(`UPDATE sessions SET ended_at=? WHERE id=? AND ended_at IS NULL`,
-		at.Unix(), id)
-	return err
+const activeSessionColumns = `id,selection_token,account_id,account_instance_id,account_generation,
+pid,process_started_at,config_dir,cwd,started_at,file_provider_lease_state,
+file_provider_lease_receipt,file_provider_lease_expires_at,lease_renewal_expires_at,last_seen_at`
+
+type sessionScanner interface {
+	Scan(...any) error
+}
+
+func scanSession(row sessionScanner) (Session, error) {
+	var session Session
+	var processStarted, started, leaseExpires int64
+	var leaseReceipt []byte
+	var renewalExpires, seen sql.NullInt64
+	err := row.Scan(
+		&session.ID, &session.SelectionToken, &session.AccountID, &session.AccountInstanceID,
+		&session.AccountGeneration, &session.PID, &processStarted, &session.ConfigDir, &session.Cwd,
+		&started, &session.LeaseState, &leaseReceipt, &leaseExpires, &renewalExpires, &seen,
+	)
+	if err != nil {
+		return Session{}, err
+	}
+	session.ProcessStartedAt = time.UnixMicro(processStarted)
+	session.StartedAt = time.Unix(started, 0)
+	session.FileProviderLease = cloneFileProviderLeaseReceipt(leaseReceipt)
+	session.LeaseExpiresAt = time.Unix(0, leaseExpires).UTC()
+	if renewalExpires.Valid {
+		value := time.Unix(0, renewalExpires.Int64).UTC()
+		session.LeaseRenewalExpiresAt = &value
+	}
+	if seen.Valid {
+		value := time.Unix(seen.Int64, 0)
+		session.LastSeenAt = &value
+	}
+	return session, nil
+}
+
+type sessionQueryer interface {
+	QueryRow(string, ...any) *sql.Row
+}
+
+func sessionBySelectionToken(queryer sessionQueryer, token string) (Session, error) {
+	return scanSession(queryer.QueryRow(
+		`SELECT `+activeSessionColumns+` FROM sessions WHERE selection_token=? AND ended_at IS NULL`, token,
+	))
 }
 
 // ActiveSessionCount returns the number of live sessions for an account.
@@ -1485,27 +1553,16 @@ func (s *Store) ActiveSessionTotal() (int, error) {
 // ListActiveSessions returns all live sessions across accounts.
 func (s *Store) ListActiveSessions() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id,account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at,last_seen_at
-		 FROM sessions WHERE ended_at IS NULL`)
+		`SELECT ` + activeSessionColumns + ` FROM sessions WHERE ended_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	var out []Session
 	for rows.Next() {
-		var se Session
-		var started int64
-		var processStarted int64
-		var seen sql.NullInt64
-		if err := rows.Scan(&se.ID, &se.AccountID, &se.AccountInstanceID, &se.AccountGeneration,
-			&se.PID, &processStarted, &se.ConfigDir, &se.Cwd, &started, &seen); err != nil {
+		se, err := scanSession(rows)
+		if err != nil {
 			return nil, err
-		}
-		se.ProcessStartedAt = time.UnixMicro(processStarted)
-		se.StartedAt = time.Unix(started, 0)
-		if seen.Valid {
-			t := time.Unix(seen.Int64, 0)
-			se.LastSeenAt = &t
 		}
 		out = append(out, se)
 	}
@@ -1522,41 +1579,164 @@ func (s *Store) touchSession(id int64, at time.Time) error {
 	return err
 }
 
-// CloseDeadSessions reconciles sessions against one atomic process snapshot.
+// ReconcileSessions partitions sessions against one atomic process snapshot.
 // An exact Claude identity is touched. An exact live non-Claude identity is
 // retained only during SessionReapGrace; an absent or reused identity closes
-// immediately. A dead row ends at its last-seen (or start), never observation
-// time, so an observer gap cannot fabricate recent activity.
-func (s *Store) CloseDeadSessions(claude, processes map[int]time.Time, at time.Time) (int, error) {
+// only after its File Provider lease is released by the caller.
+func (s *Store) ReconcileSessions(claude, processes map[int]time.Time, at time.Time) (SessionReconciliation, error) {
 	sessions, err := s.ListActiveSessions()
 	if err != nil {
-		return 0, err
+		return SessionReconciliation{}, err
 	}
-	closed := 0
+	var result SessionReconciliation
 	for _, se := range sessions {
-		if se.PID <= 0 {
+		if se.LeaseState == SessionLeaseReleased ||
+			(se.LeaseState == SessionLeasePending && !at.Before(se.LeaseExpiresAt)) {
+			result.Dead = append(result.Dead, se)
 			continue
 		}
 		if started, ok := claude[se.PID]; ok && started.Equal(se.ProcessStartedAt) {
 			if err := s.touchSession(se.ID, at); err != nil {
-				return closed, err
+				return SessionReconciliation{}, err
 			}
+			seen := at
+			se.LastSeenAt = &seen
+			result.Live = append(result.Live, se)
 			continue
 		}
 		if started, ok := processes[se.PID]; ok && started.Equal(se.ProcessStartedAt) &&
 			at.Sub(se.StartedAt) < SessionReapGrace {
+			result.Live = append(result.Live, se)
 			continue
 		}
-		end := se.StartedAt
-		if se.LastSeenAt != nil && se.LastSeenAt.After(end) {
-			end = *se.LastSeenAt
-		}
-		if err := s.CloseSession(se.ID, end); err != nil {
-			return closed, err
-		}
-		closed++
+		result.Dead = append(result.Dead, se)
 	}
-	return closed, nil
+	return result, nil
+}
+
+// PlanSessionLeaseRenewal durably chooses one exact renewal expiry. Retries
+// return the existing request until CompleteSessionLeaseRenewal settles it.
+func (s *Store) PlanSessionLeaseRenewal(id int64, receipt FileProviderLeaseReceipt, expires time.Time) (_ time.Time, err error) {
+	if err := validateFileProviderLeaseReceipt(receipt); err != nil {
+		return time.Time{}, err
+	}
+	if expires.IsZero() {
+		return time.Time{}, errors.New("session lease renewal expiry is required")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var current []byte
+	var state SessionLeaseState
+	var pending sql.NullInt64
+	err = tx.QueryRow(
+		`SELECT file_provider_lease_state,file_provider_lease_receipt,lease_renewal_expires_at FROM sessions WHERE id=? AND ended_at IS NULL`, id,
+	).Scan(&state, &current, &pending)
+	if errors.Is(err, sql.ErrNoRows) || state != SessionLeaseActive || !bytes.Equal(current, receipt) {
+		return time.Time{}, ErrSessionLeaseConflict
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	if pending.Valid {
+		return time.Unix(0, pending.Int64).UTC(), nil
+	}
+	expires = expires.UTC()
+	if _, err = tx.Exec(
+		`UPDATE sessions SET lease_renewal_expires_at=? WHERE id=? AND ended_at IS NULL
+		 AND file_provider_lease_state=? AND file_provider_lease_receipt=? AND lease_renewal_expires_at IS NULL`,
+		expires.UnixNano(), id, SessionLeaseActive, []byte(receipt),
+	); err != nil {
+		return time.Time{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return time.Time{}, err
+	}
+	return expires, nil
+}
+
+// CompleteSessionLeaseRenewal atomically replaces the exact receipt and clears
+// the matching pending renewal. Replaying an already completed response succeeds.
+func (s *Store) CompleteSessionLeaseRenewal(
+	id int64,
+	previous FileProviderLeaseReceipt,
+	renewed FileProviderLeaseReceipt,
+	expires time.Time,
+) error {
+	if err := validateFileProviderLeaseReceipt(previous); err != nil {
+		return err
+	}
+	if err := validateFileProviderLeaseReceipt(renewed); err != nil {
+		return err
+	}
+	if expires.IsZero() {
+		return errors.New("session lease renewal expiry is required")
+	}
+	result, err := s.db.Exec(
+		`UPDATE sessions SET file_provider_lease_receipt=?,file_provider_lease_expires_at=?,lease_renewal_expires_at=NULL
+		 WHERE id=? AND ended_at IS NULL AND file_provider_lease_state=?
+		 AND file_provider_lease_receipt=? AND lease_renewal_expires_at=?`,
+		[]byte(renewed), expires.UTC().UnixNano(), id, SessionLeaseActive, []byte(previous), expires.UTC().UnixNano(),
+	)
+	if err != nil {
+		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil {
+		return err
+	} else if changed == 1 {
+		return nil
+	}
+	var current []byte
+	var pending sql.NullInt64
+	err = s.db.QueryRow(
+		`SELECT file_provider_lease_receipt,lease_renewal_expires_at FROM sessions WHERE id=? AND ended_at IS NULL`, id,
+	).Scan(&current, &pending)
+	if err == nil && bytes.Equal(current, renewed) && !pending.Valid {
+		return nil
+	}
+	return ErrSessionLeaseConflict
+}
+
+// CompleteSessionLeaseRelease records the exact released receipt and only then
+// closes the session. Replaying the same release succeeds.
+func (s *Store) CompleteSessionLeaseRelease(
+	id int64,
+	previous FileProviderLeaseReceipt,
+	released FileProviderLeaseReceipt,
+	at time.Time,
+) error {
+	if err := validateFileProviderLeaseReceipt(previous); err != nil {
+		return err
+	}
+	if err := validateFileProviderLeaseReceipt(released); err != nil {
+		return err
+	}
+	if at.IsZero() {
+		return errors.New("session lease close time is required")
+	}
+	result, err := s.db.Exec(
+		`UPDATE sessions SET file_provider_lease_state=?,file_provider_lease_receipt=?,ended_at=?
+		 WHERE id=? AND ended_at IS NULL AND file_provider_lease_receipt=?`,
+		SessionLeaseReleased, []byte(released), at.Unix(), id, []byte(previous),
+	)
+	if err != nil {
+		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil {
+		return err
+	} else if changed == 1 {
+		return nil
+	}
+	var current []byte
+	var state SessionLeaseState
+	var ended sql.NullInt64
+	err = s.db.QueryRow(`SELECT file_provider_lease_state,file_provider_lease_receipt,ended_at FROM sessions WHERE id=?`, id).Scan(&state, &current, &ended)
+	if err == nil && state == SessionLeaseReleased && bytes.Equal(current, released) && ended.Valid {
+		return nil
+	}
+	return ErrSessionLeaseConflict
 }
 
 // GetCwdActivity aggregates tracked session activity for cwd on one account —

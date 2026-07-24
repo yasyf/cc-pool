@@ -117,25 +117,25 @@ type Server struct {
 	// select may not have exec'd its claude yet.
 	startedAt time.Time
 
-	tenantClient               *tenantfs.Client
-	tenantCoordinator          *tenantCoordinator
-	holderSessionDone          <-chan struct{}
-	holderMonitorMu            sync.Mutex
-	holderMonitorCancel        context.CancelFunc
-	holderActive               atomic.Bool
-	holderLost                 atomic.Bool
-	runtimePublished           atomic.Bool
-	runtimeShutdown            func(context.Context) error
-	runtimeHealth              func(context.Context) (dkdaemon.Health, error)
-	bootstrapMu                sync.Mutex
-	bootstrap                  bootstrapState
-	prepareAccount             func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error)
-	prepareReservedAccount     func(context.Context, store.PendingAccountReservation) (catalogproto.TenantPreparationProof, error)
-	observePresentationBinding func(context.Context, store.Account, store.PresentationPreparationProof) error
-	activatePrepared           func(context.Context, store.Account, catalogproto.TenantPreparationProof, func() error) error
-	preflightCredential        func(context.Context, store.Account) error
-	disposableWorkers          *worker.Pool
-	accountTerminals           *accountterminal.Manager
+	tenantClient                  *tenantfs.ControlClient
+	tenantCoordinator             *tenantCoordinator
+	sessionLeases                 sessionLeaseManager
+	holderSessionDone             <-chan struct{}
+	holderMonitorMu               sync.Mutex
+	holderMonitorCancel           context.CancelFunc
+	holderActive                  atomic.Bool
+	holderLost                    atomic.Bool
+	runtimePublished              atomic.Bool
+	runtimeShutdown               func(context.Context) error
+	runtimeHealth                 func(context.Context) (dkdaemon.Health, error)
+	bootstrapMu                   sync.Mutex
+	bootstrap                     bootstrapState
+	prepareAccount                func(context.Context, store.Account, tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error)
+	provisionPresentationIdentity func(context.Context, store.Account) (store.FileProviderPresentationIdentity, error)
+	activatePrepared              func(context.Context, store.Account, tenantfs.PreparationLease, catalogproto.TenantPreparationProof, func() error) error
+	preflightCredential           func(context.Context, store.Account) error
+	disposableWorkers             *worker.Pool
+	accountTerminals              *accountterminal.Manager
 
 	// led is the product self-heal ledger for auth.streak and the
 	// ratelimit.acct / ratelimit.pool streaks. ledMu is its
@@ -215,7 +215,7 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	if err := terminals.Recover(activation.Context()); err != nil {
 		return fmt.Errorf("recover account terminals: %w", err)
 	}
-	tenantClient, err := tenantfs.NewClient(activation.Context(), pool.FuseKitSocketPath())
+	tenantClient, err := tenantfs.NewControlClient(activation.Context(), pool.FuseKitSocketPath())
 	if err != nil {
 		return fmt.Errorf("connect FuseKit runtime: %w", err)
 	}
@@ -231,6 +231,7 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 		return func() { s.cl.releaseExclusive(accountID) }, nil
 	}
 	s.tenantClient = tenantClient
+	s.sessionLeases = catalogSessionLeaseManager{runtime: tenantClient}
 	s.holderSessionDone = tenantClient.Done()
 	s.disposableWorkers = workers
 	s.accountMutationTerminal = managedAccountMutationTerminalRunner{terminals: terminals, manager: s.m}
@@ -238,9 +239,7 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	s.scanSessions = s.m.ScanSessions
 	s.scanProcesses = s.m.ScanProcesses
 	s.tenantCoordinator = newTenantCoordinator(activation.Context(), s, preparer, tenantClient)
-	if err := s.tenantCoordinator.initialize(activation.Context()); err != nil {
-		return fmt.Errorf("initialize FuseKit tenants: %w", err)
-	}
+	s.m.RetirePendingAdd = s.tenantCoordinator.retireReservedAccount
 	if err := s.recoverRetiredAccountMutations(activation.Context()); err != nil {
 		return fmt.Errorf("recover account mutations: %w", err)
 	}
@@ -254,12 +253,23 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	s.holderMonitorMu.Unlock()
 	s.wg.Add(1)
 	go s.monitorHolderSession(monitorCtx, s.holderSessionDone)
+	s.startTenantRecovery(activation.Context())
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		s.monitorPendingAccountMutationPublications(monitorCtx)
 	}()
 	return nil
+}
+
+func (s *Server) startTenantRecovery(ctx context.Context) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		if err := s.tenantCoordinator.initialize(ctx); err != nil && ctx.Err() == nil {
+			s.log.Printf("recover FuseKit tenants: %v", err)
+		}
+	}()
 }
 
 func (s *Server) cancelHolderMonitor() {
@@ -295,6 +305,9 @@ func (s *Server) monitorHolderSession(ctx context.Context, done <-chan struct{})
 
 func (s *Server) clearActivation() {
 	s.holderActive.Store(false)
+	if s.m != nil {
+		s.m.RetirePendingAdd = nil
+	}
 	s.m = nil
 	s.tenantClient = nil
 	s.tenantCoordinator = nil
@@ -573,37 +586,21 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 				if err := s.m.Store.SelectionEligible(sn.Account); err != nil {
 					return Response{OK: false, Error: fmt.Sprintf("account %d is not selectable: %v", *req.Account, err)}
 				}
-				proof, err := s.prepareTenant(ctx, sn.Account)
-				if err != nil {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
-				}
-				publicPath, err := s.selectionPublicPath(ctx, sn.Account, proof)
-				if err != nil {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
-				}
-				if err := s.preflightSelectionCredential(ctx, sn.Account); err != nil {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", sn.Account.ID, err)}
-				}
-				if err := s.m.Store.SelectionEligible(sn.Account); err != nil {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d selection eligibility: %v", sn.Account.ID, err)}
-				}
+				launching := req.PID > 0
 				launch := selectionLaunch{
 					pid: req.PID, processStartedAt: processStartedAt, cwd: req.Cwd,
 					recordSticky: true,
 				}
-				token := ""
-				if req.PID > 0 {
-					token, err = s.cl.beginSelection(sn.Account, launch, provisionalSelectionTTL)
+				executionPath, token := "", ""
+				if launching {
+					executionPath, token, err = s.prepareSelection(ctx, sn.Account, launch)
 					if err != nil {
-						return Response{OK: false, Error: fmt.Sprintf("reserve acct-%02d: %v", sn.Account.ID, err)}
-					}
-					if !s.cl.bindPreparation(token, proof) {
-						return Response{OK: false, Error: fmt.Sprintf("acct-%02d reservation expired after PrepareTenant", sn.Account.ID)}
+						return Response{OK: false, Error: err.Error()}
 					}
 				}
 				id := sn.Account.ID
 				return Response{
-					OK: true, Dir: publicPath, SelectedID: &id,
+					OK: true, Dir: executionPath, SelectedID: &id, Prepared: launching,
 					ReservationToken:  token,
 					AccountInstanceID: sn.Account.InstanceID, AccountGeneration: sn.Account.Generation,
 					Remaining5h: sn.Remaining5h, Remaining7d: sn.Remaining7d, HasUsage: sn.HasUsage,
@@ -672,43 +669,24 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		}
 	}
 	best := bySnap[r.AccountID]
-	proof, err := s.prepareTenant(ctx, best.Account)
-	if err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
-	}
-	publicPath, err := s.selectionPublicPath(ctx, best.Account, proof)
-	if err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
-	}
+	launching := req.PID > 0
 	id := best.Account.ID
-	// Credential mutation takes the exclusive claim before the pending selection
-	// is created; the claims mutex then orders every later mutation against it.
-	err = s.preflightSelectionCredential(ctx, best.Account)
-	if err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", best.Account.ID, err)}
-	}
-	if err := s.m.Store.SelectionEligible(best.Account); err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d selection eligibility: %v", best.Account.ID, err)}
-	}
 	launch := selectionLaunch{
 		pid: req.PID, processStartedAt: processStartedAt, cwd: req.Cwd,
 		recordSticky: !outcome.Held() || best.Account.ID == pin.AccountID,
 	}
-	token := ""
-	if req.PID > 0 {
-		token, err = s.cl.beginSelection(best.Account, launch, provisionalSelectionTTL)
+	executionPath, token := "", ""
+	if launching {
+		executionPath, token, err = s.prepareSelection(ctx, best.Account, launch)
 		if err != nil {
-			return Response{OK: false, Error: fmt.Sprintf("reserve acct-%02d: %v", best.Account.ID, err)}
-		}
-		if !s.cl.bindPreparation(token, proof) {
-			return Response{OK: false, Error: fmt.Sprintf("acct-%02d reservation expired after PrepareTenant", best.Account.ID)}
+			return Response{OK: false, Error: err.Error()}
 		}
 	}
 	s.log.Printf("select%s: %s -> acct-%02d (score %.1f · 5h %.0f%% used · 7d %.0f%% used%s)",
 		selectKind(outcome, fallback), req.Cwd, best.Account.ID,
 		r.Score, best.Util5h, best.Util7d, runnerUp(ranked, r.AccountID, fallback))
 	resp := Response{
-		OK: true, Dir: publicPath, SelectedID: &id,
+		OK: true, Dir: executionPath, SelectedID: &id, Prepared: launching,
 		ReservationToken:  token,
 		AccountInstanceID: best.Account.InstanceID, AccountGeneration: best.Account.Generation,
 		Sticky:      outcome == pool.StickyBind,
@@ -728,36 +706,96 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	return resp
 }
 
-func (s *Server) selectionPublicPath(
+func (s *Server) prepareSelection(
+	ctx context.Context,
+	account store.Account,
+	launch selectionLaunch,
+) (string, string, error) {
+	token, err := s.cl.beginSelection(account, launch, provisionalSelectionTTL)
+	if err != nil {
+		return "", "", fmt.Errorf("reserve acct-%02d: %w", account.ID, err)
+	}
+	lease, ok := s.cl.preparationLease(token)
+	if !ok {
+		return "", "", fmt.Errorf("acct-%02d reservation expired before PrepareTenant", account.ID)
+	}
+	proof, err := s.prepareTenant(ctx, account, lease)
+	if err != nil {
+		s.cl.abortReservation(token)
+		return "", "", fmt.Errorf("acct-%02d PrepareTenant: %w", account.ID, err)
+	}
+	fail := func(cause error) (string, string, error) {
+		releaseErr := s.releaseProvisionalPreparation(ctx, proof)
+		s.cl.abortReservation(token)
+		return "", "", errors.Join(cause, releaseErr)
+	}
+	executionPath, err := s.selectionExecutionPath(ctx, account, proof)
+	if err != nil {
+		return fail(fmt.Errorf("acct-%02d PrepareTenant: %w", account.ID, err))
+	}
+	if err := s.preflightSelectionCredential(ctx, account, token); err != nil {
+		return fail(fmt.Errorf("acct-%02d credential preflight: %w", account.ID, err))
+	}
+	if err := s.m.Store.SelectionEligible(account); err != nil {
+		return fail(fmt.Errorf("acct-%02d selection eligibility: %w", account.ID, err))
+	}
+	if !s.cl.bindPreparation(token, proof) {
+		return fail(fmt.Errorf("acct-%02d reservation expired after PrepareTenant", account.ID))
+	}
+	return executionPath, token, nil
+}
+
+func (s *Server) releaseProvisionalPreparation(
+	ctx context.Context,
+	proof catalogproto.TenantPreparationProof,
+) error {
+	if proof.CriticalReadiness == nil {
+		return errors.New("selection preparation has no critical readiness lease")
+	}
+	if s.sessionLeases == nil {
+		return errors.New("FuseKit File Provider session lease manager is unavailable")
+	}
+	receipt, err := encodeSessionLease(proof.CriticalReadiness.Lease)
+	if err != nil {
+		return err
+	}
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionLeaseOperationTimeout)
+	defer cancel()
+	_, err = s.sessionLeases.ReleaseProvisional(releaseCtx, receipt)
+	return err
+}
+
+func (s *Server) selectionExecutionPath(
 	ctx context.Context,
 	account store.Account,
 	proof catalogproto.TenantPreparationProof,
 ) (string, error) {
-	storedProof, err := projectPreparationProof(proof)
+	identity, err := projectPreparationIdentity(proof)
 	if err != nil {
 		return "", err
 	}
-	observe := s.observePresentationBinding
-	if observe == nil {
-		observe = func(_ context.Context, account store.Account, proof store.PresentationPreparationProof) error {
-			return s.m.Store.ObserveAccountPresentation(account, proof)
-		}
+	if _, err := s.m.ReconcileAccountPresentation(ctx, account, identity); err != nil {
+		return "", fmt.Errorf("reconcile account presentation: %w", err)
 	}
-	if err := observe(ctx, account, storedProof); err != nil {
-		return "", fmt.Errorf("observe account presentation: %w", err)
-	}
-	return storedProof.FileProvider.PublicPath, nil
+	return account.ConfigDir, nil
 }
 
 func (s *Server) preflightSelectionCredential(
 	ctx context.Context,
 	account store.Account,
+	token string,
 ) error {
 	pctx, cancel := context.WithTimeout(ctx, preflightTimeout)
 	defer cancel()
 	preflight := s.preflightCredential
 	if preflight == nil {
 		preflight = s.m.PreflightRefresh
+		pctx = pool.WithCredentialMutationClaim(pctx, func(accountID int) (func(), error) {
+			if !s.cl.ownSelectionExclusive(token, accountID) {
+				return nil, errAccountExclusive
+			}
+			return func() { s.cl.releaseExclusive(accountID) }, nil
+		})
 	}
 	err := preflight(pctx, account)
 	// A synced token expired here: the origin's rotation may already be in the
@@ -789,36 +827,82 @@ func (s *Server) handleSelectCommit(ctx context.Context, req Request) Response {
 }
 
 func (s *Server) activateSelection(ctx context.Context, token string, reserved reservation, launch selectionLaunch) Response {
+	fail := func(err error) Response {
+		return Response{OK: false, Error: fmt.Sprintf("activate selection for account %d: %v", reserved.accountID, err)}
+	}
 	if reserved.preparation == nil {
-		return Response{OK: false, Error: "selection reservation has no preparation proof"}
+		return fail(errors.New("selection reservation has no preparation proof"))
 	}
-	publicPath, err := tenantfs.FileProviderPublicPath(*reserved.preparation)
+	identity, err := projectPreparationIdentity(*reserved.preparation)
 	if err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("selection reservation has invalid preparation proof: %v", err)}
+		return fail(fmt.Errorf("selection reservation has invalid preparation proof: %w", err))
 	}
-	account := store.Account{
-		ID: reserved.accountID, InstanceID: reserved.accountInstanceID, Generation: reserved.accountGeneration,
+	account, err := s.m.Store.GetAccount(reserved.accountID)
+	if err != nil {
+		return fail(fmt.Errorf("read selection account: %w", err))
 	}
+	if account.InstanceID != reserved.accountInstanceID || account.Generation != reserved.accountGeneration {
+		return fail(fmt.Errorf(
+			"selection account %d identity changed from %s/%d to %s/%d",
+			reserved.accountID, reserved.accountInstanceID, reserved.accountGeneration,
+			account.InstanceID, account.Generation,
+		))
+	}
+	if _, err := s.m.ReconcileAccountPresentation(ctx, account, identity); err != nil {
+		return fail(fmt.Errorf("reconcile selection presentation: %w", err))
+	}
+	lease := tenantfs.PreparationLease{ID: token, ExpiresAt: reserved.expiresAt}
 	activate := func() error {
-		return s.m.Store.ActivateSelection(store.SelectionActivation{
+		process := store.ProcessIdentity{PID: launch.pid, StartedAt: launch.processStartedAt}
+		if reserved.preparation.CriticalReadiness == nil {
+			return errors.New("selection preparation has no critical readiness lease")
+		}
+		provisional, err := encodeSessionLease(reserved.preparation.CriticalReadiness.Lease)
+		if err != nil {
+			return err
+		}
+		commitExpires := time.Now().Add(sessionLeaseTTL).UTC()
+		provisionalExpires := time.Unix(0, int64(reserved.preparation.CriticalReadiness.Lease.ExpiresUnixNano)).UTC()
+		if provisionalExpires.After(commitExpires) {
+			commitExpires = provisionalExpires
+		}
+		activation := store.SelectionActivation{
 			Token:     token,
 			AccountID: reserved.accountID, ExpectedInstanceID: reserved.accountInstanceID,
 			ExpectedGeneration: reserved.accountGeneration,
-			Process:            store.ProcessIdentity{PID: launch.pid, StartedAt: launch.processStartedAt},
-			ConfigDir:          publicPath,
+			Process:            process,
+			ConfigDir:          account.ConfigDir,
 			Cwd:                launch.cwd, RecordSticky: launch.recordSticky, At: time.Now(),
-		})
+			FileProviderLease: provisional, LeaseExpiresAt: commitExpires,
+		}
+		staged, err := s.m.Store.StageSelection(activation)
+		if err != nil {
+			return err
+		}
+		if staged.LeaseState == store.SessionLeaseActive {
+			return nil
+		}
+		if s.sessionLeases == nil {
+			return errors.New("FuseKit File Provider session lease manager is unavailable")
+		}
+		leaseCtx, cancel := context.WithTimeout(ctx, sessionLeaseOperationTimeout)
+		defer cancel()
+		committed, err := s.sessionLeases.Commit(leaseCtx, provisional, staged.ID, process, commitExpires)
+		if err != nil {
+			return fmt.Errorf("commit File Provider session lease: %w", err)
+		}
+		return s.m.Store.CommitSelection(token, provisional, committed, launch.recordSticky, time.Now())
 	}
 	var activationErr error
 	if s.activatePrepared != nil {
-		activationErr = s.activatePrepared(ctx, account, *reserved.preparation, activate)
+		activationErr = s.activatePrepared(ctx, account, lease, *reserved.preparation, activate)
 	} else if s.tenantCoordinator != nil {
-		activationErr = s.tenantCoordinator.activatePrepared(ctx, account, *reserved.preparation, activate)
+		activationErr = s.tenantCoordinator.activatePrepared(ctx, account, lease, *reserved.preparation, activate)
 	} else {
 		activationErr = errors.New("FuseKit tenant coordinator is unavailable")
 	}
 	if activationErr != nil {
-		return Response{OK: false, Error: fmt.Sprintf("activate selection for account %d: %v", reserved.accountID, activationErr)}
+		return fail(activationErr)
 	}
 	return Response{OK: true}
 }
@@ -827,7 +911,12 @@ func (s *Server) handleSelectAbort(ctx context.Context, req Request) Response {
 	if req.ReservationToken == "" {
 		return Response{OK: false, Error: "select abort requires a reservation token"}
 	}
-	return s.cl.abortSelection(ctx, req.ReservationToken)
+	return s.cl.abortSelection(ctx, req.ReservationToken, func(cleanupCtx context.Context, reserved reservation) error {
+		if reserved.preparation == nil {
+			return nil
+		}
+		return s.releaseProvisionalPreparation(cleanupCtx, *reserved.preparation)
+	})
 }
 
 // selectKind renders the select log qualifier. A bind and a fallback are

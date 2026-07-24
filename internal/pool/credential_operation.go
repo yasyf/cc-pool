@@ -53,16 +53,23 @@ type CredentialWritePublicationBuilder func(
 ) ([]byte, error)
 
 type credentialOperationCodec[T any] struct {
-	target     store.CredentialTarget
-	intent     *store.CredentialDigest
-	resultCode func(T, error) store.CredentialResultCategory
-	replay     func(context.Context, *Manager, store.Account, store.CredentialOperationReceipt) (T, error)
+	target           store.CredentialTarget
+	intent           *store.CredentialDigest
+	tokenChainDigest credentialTokenChainDigestFunc
+	resultCode       func(T, error) store.CredentialResultCategory
+	replay           func(context.Context, *Manager, store.Account, store.CredentialOperationReceipt) (T, error)
 }
 
 type credentialObservationFunc func(
 	context.Context,
 	store.Account,
 ) (store.CredentialExternalState, error)
+
+type credentialTokenChainDigestFunc func(
+	context.Context,
+	*Manager,
+	store.Account,
+) (*store.CredentialDigest, error)
 
 type credentialOperationBoundary struct {
 	manager            *Manager
@@ -268,12 +275,13 @@ func runCredentialOperationObserved[T any](
 			}
 			return result, flight.err
 		}
-		if manager.ClaimCredentialMutation == nil {
+		claimCredentialMutation := credentialMutationClaim(ctx, manager.ClaimCredentialMutation)
+		if claimCredentialMutation == nil {
 			err = errors.New("pool: credential mutation claim is required")
 			manager.finishCredentialFlight(account.ID, flight, zero, err)
 			return zero, err
 		}
-		releaseCredentialClaim, err := manager.ClaimCredentialMutation(account.ID)
+		releaseCredentialClaim, err := claimCredentialMutation(account.ID)
 		if err != nil {
 			manager.finishCredentialFlight(account.ID, flight, zero, err)
 			return zero, err
@@ -411,9 +419,17 @@ func (m *Manager) credentialMutationObservation(
 	ctx context.Context,
 	account store.Account,
 ) (store.CredentialExternalState, error) {
+	return m.credentialMutationObservationAt(ctx, account, "")
+}
+
+func (m *Manager) credentialMutationObservationAt(
+	ctx context.Context,
+	account store.Account,
+	expectedPublicPath string,
+) (store.CredentialExternalState, error) {
 	quarantine, err := m.Store.CredentialQuarantine(account.ID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return m.credentialObservation(ctx, account)
+		return m.credentialObservationAt(ctx, account, expectedPublicPath)
 	}
 	if err != nil {
 		return store.CredentialExternalState{}, err
@@ -421,7 +437,7 @@ func (m *Manager) credentialMutationObservation(
 	if err := validateCredentialQuarantineAccount(account, quarantine); err != nil {
 		return store.CredentialExternalState{}, err
 	}
-	actual, err := m.credentialObservation(ctx, account)
+	actual, err := m.credentialObservationAt(ctx, account, expectedPublicPath)
 	if err != nil {
 		return store.CredentialExternalState{}, errors.Join(
 			credentialQuarantineError(quarantine), err,
@@ -430,13 +446,15 @@ func (m *Manager) credentialMutationObservation(
 	if !credentialStateReadable(actual) {
 		return store.CredentialExternalState{}, credentialQuarantineError(quarantine)
 	}
-	tokenDigest, chainErr := m.credentialTokenChainStateDigest(ctx, account)
+	tokenDigest, chainErr := m.credentialTokenChainStateDigestAt(
+		ctx, account, expectedPublicPath,
+	)
 	if chainErr != nil {
 		return store.CredentialExternalState{}, errors.Join(
 			credentialQuarantineError(quarantine), chainErr,
 		)
 	}
-	verified, err := m.credentialObservation(ctx, account)
+	verified, err := m.credentialObservationAt(ctx, account, expectedPublicPath)
 	if err != nil || !sameStoreObservation(actual, verified) {
 		return store.CredentialExternalState{}, errors.Join(
 			credentialQuarantineError(quarantine), err, ErrCredentialChangedUnderfoot,
@@ -445,10 +463,14 @@ func (m *Manager) credentialMutationObservation(
 	if quarantine.TokenChainDigest == nil {
 		if !credentialObservationHasPresent(quarantine.Observation) && tokenDigest != nil {
 			if err := m.Store.AcknowledgeCredentialQuarantine(quarantine); err != nil {
-				return m.verifyResolvedCredentialQuarantine(ctx, account, tokenDigest, err)
+				return m.verifyResolvedCredentialQuarantineAt(
+					ctx, account, expectedPublicPath, tokenDigest, err,
+				)
 			}
 			if err := m.Store.ClearCredentialQuarantine(quarantine); err != nil {
-				return m.verifyResolvedCredentialQuarantine(ctx, account, tokenDigest, err)
+				return m.verifyResolvedCredentialQuarantineAt(
+					ctx, account, expectedPublicPath, tokenDigest, err,
+				)
 			}
 			return verified, nil
 		}
@@ -464,10 +486,14 @@ func (m *Manager) credentialMutationObservation(
 		return store.CredentialExternalState{}, credentialQuarantineError(quarantine)
 	}
 	if err := m.Store.AcknowledgeCredentialQuarantine(quarantine); err != nil {
-		return m.verifyResolvedCredentialQuarantine(ctx, account, tokenDigest, err)
+		return m.verifyResolvedCredentialQuarantineAt(
+			ctx, account, expectedPublicPath, tokenDigest, err,
+		)
 	}
 	if err := m.Store.ClearCredentialQuarantine(quarantine); err != nil {
-		return m.verifyResolvedCredentialQuarantine(ctx, account, tokenDigest, err)
+		return m.verifyResolvedCredentialQuarantineAt(
+			ctx, account, expectedPublicPath, tokenDigest, err,
+		)
 	}
 	return verified, nil
 }
@@ -478,22 +504,36 @@ func (m *Manager) verifyResolvedCredentialQuarantine(
 	replacementDigest *store.CredentialDigest,
 	resolutionErr error,
 ) (store.CredentialExternalState, error) {
+	return m.verifyResolvedCredentialQuarantineAt(
+		ctx, account, "", replacementDigest, resolutionErr,
+	)
+}
+
+func (m *Manager) verifyResolvedCredentialQuarantineAt(
+	ctx context.Context,
+	account store.Account,
+	expectedPublicPath string,
+	replacementDigest *store.CredentialDigest,
+	resolutionErr error,
+) (store.CredentialExternalState, error) {
 	if _, err := m.Store.CredentialQuarantine(account.ID); err == nil {
 		return store.CredentialExternalState{}, resolutionErr
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return store.CredentialExternalState{}, errors.Join(resolutionErr, err)
 	}
-	actual, err := m.credentialObservation(ctx, account)
+	actual, err := m.credentialObservationAt(ctx, account, expectedPublicPath)
 	if err != nil || !credentialStateReadable(actual) {
 		return store.CredentialExternalState{}, errors.Join(resolutionErr, err)
 	}
-	tokenDigest, err := m.credentialTokenChainStateDigest(ctx, account)
+	tokenDigest, err := m.credentialTokenChainStateDigestAt(
+		ctx, account, expectedPublicPath,
+	)
 	if err != nil || !sameStoreOptionalCredentialDigest(tokenDigest, replacementDigest) {
 		return store.CredentialExternalState{}, errors.Join(
 			resolutionErr, err, ErrCredentialChangedUnderfoot,
 		)
 	}
-	verified, err := m.credentialObservation(ctx, account)
+	verified, err := m.credentialObservationAt(ctx, account, expectedPublicPath)
 	if err != nil || !sameStoreObservation(actual, verified) {
 		return store.CredentialExternalState{}, errors.Join(
 			resolutionErr, err, ErrCredentialChangedUnderfoot,
@@ -578,7 +618,7 @@ func applyCredentialOperation[T any](
 		credentialSettlementTimeout,
 	)
 	defer settleCancel()
-	after, observeErr := manager.credentialObservation(settleCtx, account)
+	after, observeErr := observe(settleCtx, account)
 	if observeErr != nil {
 		return result, errors.Join(operationErr, observeErr)
 	}
@@ -613,7 +653,7 @@ func applyCredentialOperation[T any](
 		}
 		return result, manager.Store.AcknowledgeCredentialOperation(receipt.Token)
 	}
-	actual, verifyErr := manager.credentialObservation(settleCtx, account)
+	actual, verifyErr := observe(settleCtx, account)
 	if verifyErr != nil {
 		return result, errors.Join(operationErr, verifyErr)
 	}
@@ -663,8 +703,18 @@ func applyCredentialOperation[T any](
 	}
 	var quarantineTokenChainDigest *store.CredentialDigest
 	if status == store.CredentialTerminalQuarantined {
-		stable, digest, stableErr := manager.credentialTokenChainStateAtObservation(
-			settleCtx, account,
+		readTokenChain := codec.tokenChainDigest
+		if readTokenChain == nil {
+			readTokenChain = func(
+				ctx context.Context,
+				manager *Manager,
+				account store.Account,
+			) (*store.CredentialDigest, error) {
+				return manager.credentialTokenChainStateDigest(ctx, account)
+			}
+		}
+		stable, digest, stableErr := manager.credentialTokenChainStateAtObservationUsing(
+			settleCtx, account, observe, readTokenChain,
 		)
 		if stableErr == nil {
 			if !sameStoreObservation(outcome, stable) {
@@ -1017,6 +1067,14 @@ func (m *Manager) removeCredentialForAccountRemoval(
 	ctx context.Context,
 	account store.Account,
 ) error {
+	return m.removeCredentialForAccountRemovalAt(ctx, account, "")
+}
+
+func (m *Manager) removeCredentialForAccountRemovalAt(
+	ctx context.Context,
+	account store.Account,
+	expectedPublicPath string,
+) error {
 	intent, err := store.CredentialRemovalIntentDigest(
 		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
 		account.KeychainService, account.KeychainAccount,
@@ -1040,27 +1098,37 @@ func (m *Manager) removeCredentialForAccountRemoval(
 	}
 	codec := unitCredentialOperationCodec(store.CredentialTargetKeychain)
 	codec.intent = &intent
+	codec.tokenChainDigest = func(
+		ctx context.Context,
+		manager *Manager,
+		account store.Account,
+	) (*store.CredentialDigest, error) {
+		return manager.credentialTokenChainStateDigestAt(
+			ctx, account, expectedPublicPath,
+		)
+	}
 	if receipt != nil {
-		if _, err := replayCredentialOperation(ctx, m, account, codec, *receipt); err != nil {
-			return err
-		}
-		return m.requireCredentialAbsent(ctx, account)
+		_, err := replayCredentialOperation(ctx, m, account, codec, *receipt)
+		return err
 	}
 	if active != nil {
 		receipt, err := m.waitCredentialOperation(ctx, active.Token)
 		if err != nil {
 			return err
 		}
-		if _, err := replayCredentialOperation(ctx, m, account, codec, receipt); err != nil {
-			return err
-		}
-		return m.requireCredentialAbsent(ctx, account)
+		_, err = replayCredentialOperation(ctx, m, account, codec, receipt)
+		return err
+	}
+	observe := func(ctx context.Context, account store.Account) (store.CredentialExternalState, error) {
+		return m.credentialMutationObservationAt(ctx, account, expectedPublicPath)
 	}
 	_, err = runCredentialOperationObserved(
 		ctx, m, account, store.CredentialOperationRemove, codec,
-		m.credentialMutationObservation,
+		observe,
 		func(ctx context.Context, boundary *credentialOperationBoundary) (struct{}, error) {
-			actual, err := m.credentialMutationObservation(ctx, account)
+			actual, err := m.credentialMutationObservationAt(
+				ctx, account, expectedPublicPath,
+			)
 			if err != nil {
 				return struct{}{}, err
 			}
@@ -1077,7 +1145,10 @@ func (m *Manager) removeCredentialForAccountRemoval(
 				return struct{}{}, errors.New("credential CAS worker is unavailable")
 			}
 			proof, err := m.credentialCAS(
-				ctx, account, boundary.expected, credentialCASMutation{Delete: true},
+				ctx, account, boundary.expected, credentialCASMutation{
+					ExpectedPublicPath: expectedPublicPath,
+					Delete:             true,
+				},
 			)
 			if errors.Is(err, errCredentialCASConflict) {
 				return struct{}{}, ErrCredentialChangedUnderfoot
@@ -1091,10 +1162,7 @@ func (m *Manager) removeCredentialForAccountRemoval(
 			return struct{}{}, nil
 		},
 	)
-	if err != nil {
-		return err
-	}
-	return m.requireCredentialAbsent(ctx, account)
+	return err
 }
 
 func (m *Manager) requireCredentialAbsent(ctx context.Context, account store.Account) error {
@@ -1649,7 +1717,18 @@ func (m *Manager) credentialObservation(
 	ctx context.Context,
 	account store.Account,
 ) (store.CredentialExternalState, error) {
-	location := m.Creds.Store(account, creds.SourceKeychain)
+	return m.credentialObservationAt(ctx, account, "")
+}
+
+func (m *Manager) credentialObservationAt(
+	ctx context.Context,
+	account store.Account,
+	expectedPublicPath string,
+) (store.CredentialExternalState, error) {
+	location, err := m.credentialStore(account, expectedPublicPath)
+	if err != nil {
+		return store.CredentialExternalState{}, err
+	}
 	slot := store.CredentialSlotObservation{}
 	credential, err := location.Read(ctx)
 	switch creds.ClassifyRead(err) {
@@ -1682,6 +1761,15 @@ func (m *Manager) CredentialExternalState(
 	account store.Account,
 ) (store.CredentialExternalState, error) {
 	return m.credentialObservation(ctx, account)
+}
+
+// CredentialExternalStateAt observes after validating one explicit presentation path.
+func (m *Manager) CredentialExternalStateAt(
+	ctx context.Context,
+	account store.Account,
+	expectedPublicPath string,
+) (store.CredentialExternalState, error) {
+	return m.credentialObservationAt(ctx, account, expectedPublicPath)
 }
 
 func credentialIntentDigest(
@@ -1727,7 +1815,18 @@ func (m *Manager) credentialTokenChainStateDigest(
 	ctx context.Context,
 	account store.Account,
 ) (*store.CredentialDigest, error) {
-	location := m.Creds.Store(account, creds.SourceKeychain)
+	return m.credentialTokenChainStateDigestAt(ctx, account, "")
+}
+
+func (m *Manager) credentialTokenChainStateDigestAt(
+	ctx context.Context,
+	account store.Account,
+	expectedPublicPath string,
+) (*store.CredentialDigest, error) {
+	location, err := m.credentialStore(account, expectedPublicPath)
+	if err != nil {
+		return nil, err
+	}
 	credential, err := location.Read(ctx)
 	switch creds.ClassifyRead(err) {
 	case creds.ReadEmpty:
@@ -1744,16 +1843,36 @@ func (m *Manager) credentialTokenChainStateAtObservation(
 	ctx context.Context,
 	account store.Account,
 ) (store.CredentialExternalState, *store.CredentialDigest, error) {
+	return m.credentialTokenChainStateAtObservationUsing(
+		ctx,
+		account,
+		m.credentialObservation,
+		func(
+			ctx context.Context,
+			manager *Manager,
+			account store.Account,
+		) (*store.CredentialDigest, error) {
+			return manager.credentialTokenChainStateDigest(ctx, account)
+		},
+	)
+}
+
+func (m *Manager) credentialTokenChainStateAtObservationUsing(
+	ctx context.Context,
+	account store.Account,
+	observe credentialObservationFunc,
+	readTokenChain credentialTokenChainDigestFunc,
+) (store.CredentialExternalState, *store.CredentialDigest, error) {
 	for range 3 {
-		before, err := m.credentialObservation(ctx, account)
+		before, err := observe(ctx, account)
 		if err != nil {
 			return store.CredentialExternalState{}, nil, err
 		}
-		digest, err := m.credentialTokenChainStateDigest(ctx, account)
+		digest, err := readTokenChain(ctx, m, account)
 		if err != nil {
 			return store.CredentialExternalState{}, nil, err
 		}
-		after, err := m.credentialObservation(ctx, account)
+		after, err := observe(ctx, account)
 		if err != nil {
 			return store.CredentialExternalState{}, nil, err
 		}

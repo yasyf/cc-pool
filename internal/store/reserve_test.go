@@ -157,36 +157,6 @@ func TestPendingAddIndexes(t *testing.T) {
 	}
 }
 
-func TestRetiredPendingAddRequiresExactReapReceipt(t *testing.T) {
-	s := openReserveTest(t)
-	owner := credentialOperationTestOwner("pending-owner")
-	reservation, err := s.ReserveAccountIndex(owner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newOwner := credentialOperationTestOwner("pending-recovery")
-	if err := s.ReleaseRetiredPendingAdd(
-		t.Context(), reservation, newOwner, procZeroReceipt(), nil,
-	); err == nil {
-		t.Fatal("retired pending add released without an exact receipt")
-	}
-	if err := s.ReleaseAccountIndex(PendingAccountReservation{
-		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, Owner: newOwner,
-	}); err == nil {
-		t.Fatal("foreign owner released pending add")
-	}
-	receipt, verifier := credentialOperationTestRetirement(t, owner, newOwner)
-	if err := s.ReleaseRetiredPendingAdd(
-		t.Context(), reservation, newOwner, receipt, verifier,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pendingAccountReservationByID(s.db, reservation.ID); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("retired reservation survived: %v", err)
-	}
-}
-
 func TestPromoteReservedSyncedAccount(t *testing.T) {
 	t.Run("spends the reservation and lands the row", func(t *testing.T) {
 		s := openReserveTest(t)
@@ -227,7 +197,7 @@ func TestPromoteReservedSyncedAccountStartsAwaitingOrigin(t *testing.T) {
 	reservation := mustReserve(t, s)
 	account := Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		Generation: reservation.Generation, ConfigDir: "/home/.cc-pool/config/00000000000000000000000000000001",
 		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "external-uuid",
 	}
 	proof := presentationTestProof(account, account.ConfigDir, "activation-synced")
@@ -257,23 +227,23 @@ func TestPromoteReservedSyncedAccountStartsAwaitingOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 	if presentation.AccountInstanceID != account.InstanceID ||
-		presentation.AccountGeneration != account.Generation || presentation.Proof != proof {
+		presentation.AccountGeneration != account.Generation || presentation.Identity != proof {
 		t.Fatalf("committed presentation = %+v, want proof %+v", presentation, proof)
 	}
 }
 
-func TestPromoteReservedSyncedAccountRejectsIncompleteProofAtomically(t *testing.T) {
+func TestPromoteReservedSyncedAccountRejectsIncompleteIdentityAtomically(t *testing.T) {
 	s := openReserveTest(t)
 	reservation := mustReserve(t, s)
 	account := Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		Generation: reservation.Generation, ConfigDir: "/home/.cc-pool/config/00000000000000000000000000000001",
 		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "external-uuid",
 	}
 	proof := presentationTestProof(account, account.ConfigDir, "activation-synced")
-	proof.SourceAuthority = ""
+	proof.DomainID = ""
 	if err := s.PromoteReservedSyncedAccount(reservation, account, proof); !errors.Is(err, ErrAccountPresentationEvidence) {
-		t.Fatalf("incomplete proof promotion = %v, want presentation evidence error", err)
+		t.Fatalf("incomplete identity promotion = %v, want presentation evidence error", err)
 	}
 	if _, err := s.GetAccount(account.ID); !errors.Is(err, ErrAccountNotFound) {
 		t.Fatalf("account after refused proof = %v, want absent", err)
@@ -302,7 +272,7 @@ func TestPromoteReservedSyncedAccountLostResponseReplaysAfterReopen(t *testing.T
 	reservation := mustReserve(t, s)
 	account := Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		Generation: reservation.Generation, ConfigDir: "/home/.cc-pool/config/00000000000000000000000000000001",
 		KeychainService: "svc", KeychainAccount: "user", Label: "peer",
 		AccountUUID: "external-uuid",
 	}
@@ -330,7 +300,7 @@ func TestPromoteReservedSyncedAccountLostResponseReplaysAfterReopen(t *testing.T
 		t.Fatalf("committed account = %+v err=%v", committed, err)
 	}
 	presentation, err := s.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != proof {
+	if err != nil || presentation.Identity != proof {
 		t.Fatalf("committed presentation = %+v err=%v", presentation, err)
 	}
 	health, err := s.GetAuthHealth(account.ID)
@@ -348,7 +318,7 @@ func TestResolveReservedSyncedPromotionProvesOnlyUntouchedReservationSafe(t *tes
 	reservation := mustReserve(t, s)
 	account := Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		Generation: reservation.Generation, ConfigDir: "/home/.cc-pool/config/00000000000000000000000000000001",
 		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "external-uuid",
 	}
 	proof := presentationTestProof(account, account.ConfigDir, "activation-synced")

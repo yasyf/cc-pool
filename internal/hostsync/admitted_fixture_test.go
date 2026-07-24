@@ -3,6 +3,7 @@ package hostsync
 import (
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -49,13 +50,20 @@ func commitHostsyncTestAccount(
 	requested store.Account,
 ) store.Account {
 	t.Helper()
-	configDir := requested.ConfigDir
-	if configDir == "" {
-		configDir = fmt.Sprintf("/tmp/cc-pool-hostsync-test/acct-%02d", reservation.ID)
+	configDir, err := pool.AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	keychainService := requested.KeychainService
-	if keychainService == "" {
-		keychainService = fmt.Sprintf("hostsync-test-service-%d", reservation.ID)
+	keychainService, err := pool.AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicPath := testFileProviderPublicPath(reservation.ID)
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
+		t.Fatal(err)
 	}
 	keychainAccount := requested.KeychainAccount
 	if keychainAccount == "" {
@@ -89,7 +97,7 @@ func commitHostsyncTestAccount(
 	if !begin.Created || begin.Active == nil {
 		t.Fatalf("admit hostsync test account: begin = %+v", begin)
 	}
-	proof := hostsyncTestPresentationProof(reservation, configDir)
+	proof := hostsyncTestPresentationProof(reservation, publicPath)
 	fence, err := st.BindAccountMutationPresentation(
 		begin.Active.Fence(), proof, configDir, keychainService, keychainAccount,
 		store.CredentialKeychainLocatorDigest(keychainService, keychainAccount),
@@ -155,18 +163,10 @@ func hostsyncTestDigest(value string) store.CredentialDigest {
 func hostsyncTestPresentationProof(
 	reservation store.PendingAccountReservation,
 	publicPath string,
-) store.PresentationPreparationProof {
+) store.FileProviderPresentationIdentity {
 	tenantID := "account-" + reservation.InstanceID
-	return store.PresentationPreparationProof{
-		CatalogTenantID: tenantID, CatalogGeneration: reservation.Generation,
-		Requested: 1, Desired: 1, Observed: 1, Verified: 1, Applied: 1,
-		SourceAuthority: "hostsync-test-source", SourceRevision: 1, CatalogRevision: 1,
-		ChangeID: "hostsync-test-change", OperationID: "hostsync-test-operation",
-		PresentationKind: store.PresentationKindFileProvider,
-		FileProvider: store.FileProviderPreparationProof{
-			TenantID: tenantID, DomainID: "domain-" + reservation.InstanceID,
-			Generation: reservation.Generation, ActivationGeneration: "activation-" + reservation.InstanceID,
-			PublicPath: publicPath,
-		},
+	return store.FileProviderPresentationIdentity{
+		TenantID: tenantID, DomainID: "domain-" + reservation.InstanceID,
+		Generation: reservation.Generation, PublicPath: publicPath,
 	}
 }

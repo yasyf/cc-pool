@@ -43,10 +43,11 @@ func TestSelectionReservationCancelIsTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp := c.abortSelection(t.Context(), token); !resp.OK {
+	release := func(context.Context, reservation) error { return nil }
+	if resp := c.abortSelection(t.Context(), token, release); !resp.OK {
 		t.Fatalf("abort = %+v", resp)
 	}
-	if resp := c.abortSelection(t.Context(), token); !resp.OK {
+	if resp := c.abortSelection(t.Context(), token, release); !resp.OK {
 		t.Fatalf("replayed abort = %+v", resp)
 	}
 	if c.reservedCount(a.ID) != 0 {
@@ -145,5 +146,36 @@ func TestLiveClaimCountsExcludeTerminalReplayMarkers(t *testing.T) {
 	}
 	if got := c.liveCounts(); got.reservations != 0 || got.exclusive != 1 {
 		t.Fatalf("post-commit counts = %+v; terminal replay marker counted as live", got)
+	}
+}
+
+func TestSelectionCredentialClaimRequiresExactPendingReservation(t *testing.T) {
+	c := newClaims()
+	account := store.Account{ID: 1, InstanceID: "instance-1", Generation: 1}
+	token, err := c.beginSelection(account, selectionLaunch{}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ownSelectionExclusive("wrong-token", account.ID) {
+		t.Fatal("wrong reservation token acquired credential exclusion")
+	}
+	if c.ownSelectionExclusive(token, account.ID+1) {
+		t.Fatal("wrong account acquired credential exclusion")
+	}
+	if !c.ownSelectionExclusive(token, account.ID) {
+		t.Fatal("exact pending reservation did not acquire credential exclusion")
+	}
+	if c.ownSelectionExclusive(token, account.ID) {
+		t.Fatal("duplicate credential exclusion acquisition succeeded")
+	}
+	c.releaseExclusive(account.ID)
+
+	response := c.commitSelection(t.Context(), token,
+		func(context.Context, string, reservation, selectionLaunch) Response { return Response{OK: true} })
+	if !response.OK {
+		t.Fatalf("commit response = %+v", response)
+	}
+	if c.ownSelectionExclusive(token, account.ID) {
+		t.Fatal("terminal reservation acquired credential exclusion")
 	}
 }

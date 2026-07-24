@@ -5,36 +5,60 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
-	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/deployment"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/fusekit/holder"
 )
 
 type recordingDeployer struct {
-	receipt         deploymentReceipt
-	err             error
-	calls           int
-	config          deployment.Config
-	deactivateCalls int
-	deactivate      deployment.DeactivateConfig
-	deactivation    deactivationResult
-	statuses        []deploymentStatus
-	statusCalls     int
+	attestation installedGeneration
+	attestSpec  deployment.InstalledSpec
+	attestErr   error
+
+	apply      candidateRequest
+	applied    candidateReceipt
+	applyErr   error
+	applyCalls int
+
+	statuses    []installedStatus
+	statusCalls int
+
+	uninstall      uninstallRequest
+	uninstalled    uninstallReceipt
+	uninstallErr   error
+	uninstallCalls int
+}
+
+func (d *recordingDeployer) Attest(
+	_ context.Context,
+	spec deployment.InstalledSpec,
+) (installedGeneration, error) {
+	d.attestSpec = spec
+	return d.attestation, d.attestErr
+}
+
+func (d *recordingDeployer) Apply(
+	_ context.Context,
+	request candidateRequest,
+) (candidateReceipt, error) {
+	d.applyCalls++
+	d.apply = request
+	return d.applied, d.applyErr
 }
 
 func (d *recordingDeployer) Status(
-	_ context.Context,
-	_ deployment.Config,
-) (deploymentStatus, error) {
+	context.Context,
+	deployment.InstalledSpec,
+) (installedStatus, error) {
 	index := d.statusCalls
 	d.statusCalls++
 	if len(d.statuses) == 0 {
-		return deploymentStatus{}, nil
+		return installedStatus{}, errors.New("unexpected status")
 	}
 	if index >= len(d.statuses) {
 		index = len(d.statuses) - 1
@@ -42,365 +66,259 @@ func (d *recordingDeployer) Status(
 	return d.statuses[index], nil
 }
 
-func (d *recordingDeployer) Deactivate(
+func (d *recordingDeployer) Uninstall(
 	_ context.Context,
-	config deployment.DeactivateConfig,
-) (deactivationResult, error) {
-	d.deactivateCalls++
-	d.deactivate = config
-	return d.deactivation, d.err
+	request uninstallRequest,
+) (uninstallReceipt, error) {
+	d.uninstallCalls++
+	d.uninstall = request
+	return d.uninstalled, d.uninstallErr
 }
 
-func (d *recordingDeployer) Deploy(
-	_ context.Context,
-	config deployment.Config,
-) (deploymentReceipt, error) {
-	d.calls++
-	d.config = config
-	return d.receipt, d.err
-}
-
-func useDeploymentHooks(t *testing.T, plan service.Plan) {
+func exactTestGeneration(t *testing.T) installedGeneration {
 	t.Helper()
-	original := makeProductHooks
-	t.Cleanup(func() { makeProductHooks = original })
-	makeProductHooks = func(buildID string, policyDigest deployment.SHA256) productHooks {
-		hooks := newProductHooks(buildID, policyDigest)
-		hooks.servicePlan = func(deployment.Operation) (service.Plan, error) { return plan, nil }
-		hooks.servicePlanBuild = func(deployment.Operation, string) (service.Plan, error) { return plan, nil }
+	directory, err := os.MkdirTemp("/private/tmp", "cc-pool-status-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	appPath := filepath.Join(directory, "CCPoolStatus.app")
+	executable := holderExecutablePath(appPath)
+	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return installedGeneration{
+		path: appPath, version: "0.63.0",
+		teamID: holderbridge.TeamID, signingIdentifier: holderbridge.BundleID,
+		designatedRequirement: "designated => anchor apple generic",
+		cdHash:                "0123456789abcdef0123456789abcdef01234567",
+		bundleDigest:          deployment.SHA256{1},
+		entitlementsDigest:    deployment.SHA256{2},
+		device:                "1",
+		inode:                 "2",
+	}
+}
+
+func installedTestGeneration(source installedGeneration) installedGeneration {
+	result := source
+	result.path = installedAppPath()
+	result.device = "3"
+	result.inode = "4"
+	return result
+}
+
+func exactTestActivation(t *testing.T, generation installedGeneration) activationReceipt {
+	t.Helper()
+	plan, err := testServicePlan(generation, "runtime-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return activationReceipt{
+		id: "activation-1", active: true, generation: generation, plan: plan,
+		readiness: runtimeReadiness{
+			runtimeBuild: "runtime-v1", processGeneration: proc.OwnerGeneration{1},
+			digest: deployment.SHA256{4},
+		},
+	}
+}
+
+func useDeploymentMetadata(t *testing.T, configure ...func(*productHooks)) {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	appPath := filepath.Join(root, "Applications", "CCPoolStatus.app")
+	executable := holderExecutablePath(appPath)
+	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldInstalledAppPath := installedAppPath
+	installedAppPath = func() string { return appPath }
+	t.Cleanup(func() { installedAppPath = oldInstalledAppPath })
+	oldVersion, oldAppVersion := version.Version, version.StatusAppVersion
+	version.Version, version.StatusAppVersion = "v0.63.0", "0.63.0"
+	t.Cleanup(func() { version.Version, version.StatusAppVersion = oldVersion, oldAppVersion })
+	oldHooks := makeProductHooks
+	makeProductHooks = func(buildID string, digest deployment.SHA256) productHooks {
+		hooks := newProductHooks("runtime-v1", digest)
+		installTestBuilders(&hooks)
+		for _, apply := range configure {
+			apply(&hooks)
+		}
 		return hooks
 	}
+	t.Cleanup(func() { makeProductHooks = oldHooks })
 }
 
-func exactDeploymentReceipt(
-	t *testing.T,
-	release deployment.Release,
-	state deployment.DeploymentState,
-) (deploymentReceipt, service.Plan) {
-	t.Helper()
-	requirement, err := statusAppCodeIdentity().DRString()
-	if err != nil {
-		t.Fatal(err)
-	}
-	generation := deployment.CanonicalGeneration{
-		Path: pool.WidgetAppPath(), Release: release,
-		DesignatedRequirement: requirement, CDHash: "0123456789abcdef",
-		BundleDigest: deployment.SHA256{2}, Device: "1", Inode: "2",
-	}
-	executable := holderExecutablePath(generation.Path)
-	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(executable, []byte("test helper"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(executable, 0o700); err != nil { //nolint:gosec // Executable fixture requires the owner execute bit.
-		t.Fatal(err)
-	}
-	operation := deployment.Operation{ID: "00112233445566778899aabbccddeeff", Generation: generation}
-	plan := testServicePlan(t, operation, version.String())
-	emptyPlan, err := service.NewPlan(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	receipt := deploymentReceipt{
-		operationID: operation.ID, state: state, current: generation, hasCurrent: true,
-		plan: emptyPlan, activationPlan: plan,
-	}
-	if state == deployment.DeploymentActive {
-		receipt.plan = plan
-	}
-	return receipt, plan
-}
-
-func setCanonicalTestHome(t *testing.T) string {
-	t.Helper()
-	home, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HOME", home)
-	return home
-}
-
-func exactTestRelease(t *testing.T) deployment.Release {
-	t.Helper()
-	digest, err := deployment.ParseSHA256(strings.Repeat("ab", 32))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return deployment.Release{
-		Version: "0.63.0", URL: "https://example.invalid/CCPoolStatus.zip", SHA256: digest,
-	}
-}
-
-func TestInstallServiceDeploysExactGeneration(t *testing.T) {
-	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("ab", 32))
-	home := setCanonicalTestHome(t)
-	release, err := release()
-	if err != nil {
-		t.Fatal(err)
-	}
-	active, plan := exactDeploymentReceipt(t, release, deployment.DeploymentActive)
-	useDeploymentHooks(t, plan)
-	controller := &recordingDeployer{receipt: active}
-	receipt, err := installService(t.Context(), controller)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if receipt.Current.State != ServiceDeploymentActive ||
-		receipt.Current.Holder.Path != pool.WidgetAppPath() || controller.calls != 1 {
-		t.Fatalf("receipt/calls = %#v/%d", receipt, controller.calls)
-	}
-	config := controller.config
-	if config.Dir != pool.WidgetAppDir() || config.AppName != appName || config.Release != release ||
-		config.Identity.TeamID != holderbridge.TeamID || config.Identity.SigningIdentifier != holderbridge.BundleID ||
-		config.ConsumerBuild == "" || config.PolicyDigest == (deployment.SHA256{}) ||
-		config.RuntimeQuiesce == nil || config.PostInstallProof == nil || config.PriorAppRestoreProof == nil ||
-		config.BuildPlan == nil || config.Readiness == nil {
-		t.Fatalf("deployment config = %#v", config)
-	}
-	if got, want := receipt.Current.Holder.Path, filepath.Join(home, "Applications", "CCPoolStatus.app"); got != want {
-		t.Fatalf("app path = %q, want %q", got, want)
-	}
-}
-
-func TestInstallServiceRequiresActiveExactReceipt(t *testing.T) {
-	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("ab", 32))
-	setCanonicalTestHome(t)
-	release, err := release()
-	if err != nil {
-		t.Fatal(err)
-	}
-	active, plan := exactDeploymentReceipt(t, release, deployment.DeploymentActive)
-	useDeploymentHooks(t, plan)
-	for _, receipt := range []deploymentReceipt{
-		{},
-		{state: deployment.DeploymentRecoveryRequired},
-		{state: deployment.DeploymentActive},
-		{state: deployment.DeploymentActive, current: deployment.CanonicalGeneration{Path: "/wrong", Release: release}, hasCurrent: true},
-		{state: deployment.DeploymentActive, current: active.current, hasCurrent: true, operationID: active.operationID},
-	} {
-		if _, err := installService(t.Context(), &recordingDeployer{receipt: receipt}); err == nil {
-			t.Fatalf("accepted receipt %#v", receipt)
-		}
-	}
-}
-
-func TestInstallServiceReturnsDeploymentFailure(t *testing.T) {
-	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("ab", 32))
-	setCanonicalTestHome(t)
-	want := errors.New("deployment failed")
-	if _, err := installService(t.Context(), &recordingDeployer{err: want}); !errors.Is(err, want) {
-		t.Fatalf("error = %v, want %v", err, want)
-	}
-}
-
-func TestInstallServiceReceiptDistinguishesPreexistingAndNewActivation(t *testing.T) {
-	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("ab", 32))
-	setCanonicalTestHome(t)
-	release, err := release()
-	if err != nil {
-		t.Fatal(err)
-	}
-	active, plan := exactDeploymentReceipt(t, release, deployment.DeploymentActive)
-	useDeploymentHooks(t, plan)
-
-	preexisting, err := installService(t.Context(), &recordingDeployer{
-		receipt:  active,
-		statuses: []deploymentStatus{{receipt: active, hasReceipt: true, configMatches: true}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if preexisting.Changed || preexisting.NewlyActivated || preexisting.Prior != preexisting.Current {
-		t.Fatalf("preexisting receipt = %#v", preexisting)
-	}
-
-	created, err := installService(t.Context(), &recordingDeployer{receipt: active})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !created.Changed || !created.NewlyActivated || created.Prior.State != ServiceDeploymentAbsent ||
-		created.Current.State != ServiceDeploymentActive {
-		t.Fatalf("new activation receipt = %#v", created)
-	}
-}
-
-func TestInstallServiceRecoversLostDeployResponseFromExactStatus(t *testing.T) {
-	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("ab", 32))
-	setCanonicalTestHome(t)
-	release, err := release()
-	if err != nil {
-		t.Fatal(err)
-	}
-	active, plan := exactDeploymentReceipt(t, release, deployment.DeploymentActive)
-	useDeploymentHooks(t, plan)
-	want := errors.New("deployment response lost")
-	controller := &recordingDeployer{
-		receipt: active, err: want,
-		statuses: []deploymentStatus{
-			{},
-			{receipt: active, hasReceipt: true, configMatches: true},
-		},
-	}
-	receipt, err := installService(t.Context(), controller)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !receipt.NewlyActivated || receipt.Current.OperationID != active.operationID || controller.statusCalls != 2 {
-		t.Fatalf("receipt/status calls = %#v/%d", receipt, controller.statusCalls)
-	}
-}
-
-func TestServiceInstallReceiptRollbackIsExactAndIdempotentAfterLostResponse(t *testing.T) {
-	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("ab", 32))
-	setCanonicalTestHome(t)
-	release, err := release()
-	if err != nil {
-		t.Fatal(err)
-	}
-	active, plan := exactDeploymentReceipt(t, release, deployment.DeploymentActive)
-	inactive := active
-	inactive.state = deployment.DeploymentInactive
-	emptyPlan, err := service.NewPlan(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inactive.plan = emptyPlan
-	useDeploymentHooks(t, plan)
-	receipt := ServiceInstallReceipt{
-		Prior: ServiceDeployment{State: ServiceDeploymentAbsent}, Current: publicServiceDeployment(active),
-		Changed: true, NewlyActivated: true,
-	}
-	want := errors.New("deactivation response lost")
-	controller := &recordingDeployer{
-		err: want, deactivation: deactivationResult{
-			state: deployment.DeactivationInactive, receipt: inactive, hasReceipt: true,
-		},
-		statuses: []deploymentStatus{
-			{receipt: active, hasReceipt: true, configMatches: true},
-			{receipt: inactive, hasReceipt: true, configMatches: true},
-		},
-	}
-	if err := rollbackService(t.Context(), controller, receipt); !errors.Is(err, want) {
-		t.Fatalf("first rollback error = %v, want lost response", err)
-	}
-	if err := rollbackService(t.Context(), controller, receipt); err != nil {
-		t.Fatalf("idempotent rollback: %v", err)
-	}
-	if controller.deactivateCalls != 1 || controller.statusCalls != 2 {
-		t.Fatalf("deactivate/status calls = %d/%d", controller.deactivateCalls, controller.statusCalls)
-	}
-
-	preexisting := receipt
-	preexisting.Prior = publicServiceDeployment(active)
-	preexisting.NewlyActivated = false
-	untouched := &recordingDeployer{}
-	if err := rollbackService(t.Context(), untouched, preexisting); err != nil ||
-		untouched.statusCalls != 0 || untouched.deactivateCalls != 0 {
-		t.Fatalf("preexisting rollback touched deployment: status=%d deactivate=%d err=%v",
-			untouched.statusCalls, untouched.deactivateCalls, err)
-	}
-}
-
-func TestInstallServiceValidatesReleaseBeforeCreatingApplications(t *testing.T) {
-	home, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HOME", home)
-	setRelease(t, "v0.63.0", "0.62.0", strings.Repeat("ab", 32))
-	controller := &recordingDeployer{}
-	if _, err := installService(t.Context(), controller); err == nil {
-		t.Fatal("accepted mismatched release")
-	}
-	if controller.calls != 0 {
-		t.Fatalf("deploy calls = %d, want 0", controller.calls)
-	}
-	if _, err := os.Lstat(filepath.Join(home, "Applications")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("invalid release changed user Applications directory: %v", err)
-	}
-}
-
-func TestDeactivateServiceRetiresExactDeploymentWithoutRemovingApplication(t *testing.T) {
-	setCanonicalTestHome(t)
-	inactive, plan := exactDeploymentReceipt(t, exactTestRelease(t), deployment.DeploymentInactive)
-	useDeploymentHooks(t, plan)
-	controller := &recordingDeployer{deactivation: deactivationResult{
-		state: deployment.DeactivationInactive, receipt: inactive, hasReceipt: true,
-	}}
-	result, err := deactivateService(t.Context(), controller)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.state != deployment.DeactivationInactive || !result.hasReceipt ||
-		!result.receipt.hasCurrent || result.receipt.current.Path != pool.WidgetAppPath() ||
-		controller.deactivateCalls != 1 {
-		t.Fatalf("result/calls = %#v/%d", result, controller.deactivateCalls)
-	}
-	config := controller.deactivate
-	if config.Dir != pool.WidgetAppDir() || config.AppName != appName ||
-		config.Identity.TeamID != holderbridge.TeamID || config.Identity.SigningIdentifier != holderbridge.BundleID ||
-		config.ConsumerBuild == "" || config.PolicyDigest == (deployment.SHA256{}) ||
-		config.RuntimeQuiesce == nil || config.Readiness == nil {
-		t.Fatalf("deactivation config = %#v", config)
-	}
-}
-
-func TestDeactivateServiceAcceptsAbsentAndRequiresExactInactiveReceipt(t *testing.T) {
-	setCanonicalTestHome(t)
-	inactive, plan := exactDeploymentReceipt(t, exactTestRelease(t), deployment.DeploymentInactive)
-	useDeploymentHooks(t, plan)
-	absent, err := deactivateService(t.Context(), &recordingDeployer{deactivation: deactivationResult{
-		state: deployment.DeactivationAbsent,
+func testServicePlan(generation installedGeneration, buildID string) (service.Plan, error) {
+	return service.NewPlan([]service.Agent{{
+		Label: holderbridge.BundleID + ".fusekit", Program: holderExecutablePath(generation.path),
+		LogPath: "/tmp/cc-pool-holder-test.log", Env: map[string]string{"FUSEKIT_BUILD_ID": buildID},
+		AssociatedBundleIdentifiers: []string{holderbridge.BundleID},
+		RestartPolicy:               service.RestartAlways,
+		LimitLoadToSessionType:      service.SessionTypeAqua,
 	}})
-	if err != nil || absent.state != deployment.DeactivationAbsent || absent.hasReceipt {
-		t.Fatalf("absent deactivation = %#v, %v", absent, err)
-	}
-	for _, result := range []deactivationResult{
-		{state: deployment.DeactivationAbsent, hasReceipt: true},
-		{state: deployment.DeactivationInactive},
-		{state: deployment.DeactivationInactive, hasReceipt: true, receipt: deploymentReceipt{state: deployment.DeploymentActive, current: deployment.CanonicalGeneration{Path: pool.WidgetAppPath()}, hasCurrent: true}},
-		{state: deployment.DeactivationInactive, hasReceipt: true, receipt: deploymentReceipt{state: deployment.DeploymentInactive}},
-		{state: deployment.DeactivationInactive, hasReceipt: true, receipt: deploymentReceipt{state: deployment.DeploymentInactive, current: deployment.CanonicalGeneration{Path: "/wrong"}, hasCurrent: true}},
-		{state: deployment.DeactivationInactive, hasReceipt: true, receipt: deploymentReceipt{state: deployment.DeploymentInactive, current: inactive.current, hasCurrent: true, operationID: inactive.operationID}},
-	} {
-		if _, err := deactivateService(t.Context(), &recordingDeployer{deactivation: result}); err == nil {
-			t.Fatalf("accepted result %#v", result)
+}
+
+func installTestBuilders(hooks *productHooks) {
+	hooks.servicePlan = testServicePlan
+	hooks.candidatePlan = func(
+		generation installedGeneration,
+		buildID, sourcePath string,
+	) (deployment.CandidatePlan, error) {
+		plan, err := testServicePlan(generation, buildID)
+		if err != nil {
+			return deployment.CandidatePlan{}, err
 		}
+		agents := plan.Agents()
+		agents[0].Program = holderExecutablePath(sourcePath)
+		return deployment.NewCandidatePlan(sourcePath, agents)
 	}
-	invalidPlan := inactive
-	invalidPlan.plan = service.Plan{}
-	if _, err := deactivateService(t.Context(), &recordingDeployer{deactivation: deactivationResult{
-		state: deployment.DeactivationInactive, receipt: invalidPlan, hasReceipt: true,
-	}}); err == nil {
-		t.Fatal("accepted zero-value inactive service plan")
+	hooks.target = func(installedGeneration, string) (runtimeTarget, error) {
+		return runtimeTarget{
+			executable: "/tmp/CCPoolStatus", socket: "/tmp/fusekit-test.sock", buildID: "runtime-v1",
+		}, nil
 	}
-}
-
-func TestDeactivateServiceFreshMachineIsZeroWrite(t *testing.T) {
-	home, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HOME", home)
-	result, err := deactivateService(t.Context(), daemonkitDeploymentController{inner: deployment.New()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.state != deployment.DeactivationAbsent || result.hasReceipt {
-		t.Fatalf("deactivation result = %#v", result)
-	}
-	if _, err := os.Lstat(filepath.Join(home, "Applications")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("fresh deactivation changed user Applications directory: %v", err)
+	hooks.proveApp = func(context.Context, string) error { return nil }
+	hooks.observe = func(context.Context, string) (holder.LocalRuntimeReadiness, error) {
+		return exactHealth(runtimeTarget{buildID: "runtime-v1"}), nil
 	}
 }
 
-func TestDeactivateServiceReturnsDeploymentFailure(t *testing.T) {
-	setCanonicalTestHome(t)
-	want := errors.New("deactivation failed")
-	if _, err := deactivateService(t.Context(), &recordingDeployer{err: want}); !errors.Is(err, want) {
-		t.Fatalf("error = %v, want %v", err, want)
+func TestApplyPackagedAppDelegatesExactCandidateAndReturnsTerminalApply(t *testing.T) {
+	useDeploymentMetadata(t)
+	candidate := exactTestGeneration(t)
+	installed := installedTestGeneration(candidate)
+	active := exactTestActivation(t, installed)
+	controller := &recordingDeployer{
+		attestation: candidate,
+		applied: candidateReceipt{
+			id: "apply-operation-1", activation: active,
+		},
+	}
+	receipt, err := applyPackagedApp(t.Context(), candidate.path, controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if controller.applyCalls != 1 || controller.attestSpec.AppPath != candidate.path ||
+		controller.apply.sourcePath != candidate.path ||
+		controller.apply.target.AppPath != installedAppPath() ||
+		controller.apply.candidate.bundleDigest != candidate.bundleDigest ||
+		controller.apply.consumerBuild == "" || controller.apply.policyDigest == (deployment.SHA256{}) {
+		t.Fatalf("candidate apply = %#v", controller.apply)
+	}
+	if receipt.OperationID != "apply-operation-1" ||
+		receipt.Activation.OperationID != active.id ||
+		receipt.Activation.Holder.Path != installedAppPath() ||
+		receipt.Activation.State != ServiceDeploymentActive {
+		t.Fatalf("receipt = %#v", receipt)
+	}
+	if err := receipt.Rollback(t.Context()); err != nil {
+		t.Fatalf("terminal daemonkit rollback = %v", err)
+	}
+}
+
+func TestApplyPackagedAppRejectsIncompleteTerminalReceipt(t *testing.T) {
+	useDeploymentMetadata(t)
+	candidate := exactTestGeneration(t)
+	installed := installedTestGeneration(candidate)
+	controller := &recordingDeployer{
+		attestation: candidate,
+		applied: candidateReceipt{
+			id: "apply-operation-1",
+			activation: activationReceipt{
+				id: "activation-1", active: true, generation: installed,
+			},
+		},
+	}
+	if _, err := applyPackagedApp(t.Context(), candidate.path, controller); err == nil {
+		t.Fatal("incomplete terminal apply receipt was accepted")
+	}
+	controller.applied.id = ""
+	controller.applied.activation = exactTestActivation(t, installed)
+	if _, err := applyPackagedApp(t.Context(), candidate.path, controller); err == nil {
+		t.Fatal("apply without terminal operation ID was accepted")
+	}
+}
+
+func TestRequireActiveServiceProvesDurableReceiptAndFreshReadiness(t *testing.T) {
+	useDeploymentMetadata(t)
+	installed := installedTestGeneration(exactTestGeneration(t))
+	active := exactTestActivation(t, installed)
+	controller := &recordingDeployer{statuses: []installedStatus{{
+		state: deployment.InstalledActive, generation: installed, activation: active, hasReceipt: true,
+	}}}
+	if err := requireActiveService(t.Context(), controller); err != nil {
+		t.Fatal(err)
+	}
+	if controller.statusCalls != 1 {
+		t.Fatalf("status calls = %d, want 1", controller.statusCalls)
+	}
+
+	controller.statusCalls = 0
+	controller.statuses[0].state = deployment.InstalledPrepared
+	if err := requireActiveService(t.Context(), controller); err == nil {
+		t.Fatal("prepared service was accepted as active")
+	}
+}
+
+func TestRequireActiveServiceRejectsStaleRuntimeReadiness(t *testing.T) {
+	useDeploymentMetadata(t, func(hooks *productHooks) {
+		hooks.observe = func(context.Context, string) (holder.LocalRuntimeReadiness, error) {
+			health := exactHealth(runtimeTarget{buildID: "other-runtime"})
+			return health, nil
+		}
+	})
+	installed := installedTestGeneration(exactTestGeneration(t))
+	active := exactTestActivation(t, installed)
+	controller := &recordingDeployer{statuses: []installedStatus{{
+		state: deployment.InstalledActive, generation: installed, activation: active, hasReceipt: true,
+	}}}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := requireActiveService(ctx, controller); err == nil {
+		t.Fatal("stale runtime generation was accepted")
+	}
+}
+
+func TestUninstallPackagedAppDelegatesSealedRemoval(t *testing.T) {
+	useDeploymentMetadata(t)
+	installed := installedTestGeneration(exactTestGeneration(t))
+	controller := &recordingDeployer{uninstalled: uninstallReceipt{
+		id: "uninstall-operation-1", generation: installed,
+		runtime: runtimeProof{absent: true, digest: deployment.SHA256{8}},
+	}}
+	if err := uninstallPackagedApp(t.Context(), controller); err != nil {
+		t.Fatal(err)
+	}
+	if controller.uninstallCalls != 1 || controller.uninstall.current.AppPath != installedAppPath() ||
+		controller.uninstall.readiness == nil || controller.uninstall.runtimeQuiesce == nil {
+		t.Fatalf("uninstall request = %#v", controller.uninstall)
+	}
+
+	controller.uninstalled.runtime = runtimeProof{}
+	if err := uninstallPackagedApp(t.Context(), controller); err == nil {
+		t.Fatal("uninstall without absence proof was accepted")
+	}
+}
+
+func TestCandidateApplyAndUninstallSurfaceControllerFailures(t *testing.T) {
+	useDeploymentMetadata(t)
+	candidate := exactTestGeneration(t)
+	want := errors.New("sealed transaction failed")
+	controller := &recordingDeployer{attestation: candidate, applyErr: want}
+	if _, err := applyPackagedApp(t.Context(), candidate.path, controller); !errors.Is(err, want) {
+		t.Fatalf("apply error = %v, want %v", err, want)
+	}
+	controller.uninstallErr = want
+	if err := uninstallPackagedApp(t.Context(), controller); !errors.Is(err, want) {
+		t.Fatalf("uninstall error = %v, want %v", err, want)
 	}
 }

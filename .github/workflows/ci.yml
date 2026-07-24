@@ -10,7 +10,17 @@ permissions:
   contents: read
 
 jobs:
+  suite-pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Reject Go and Swift dependency skew
+        run: |
+          .github/scripts/verify-suite-pins_test.sh
+          .github/scripts/verify-suite-pins.sh
+
   test:
+    needs: suite-pins
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
@@ -25,6 +35,9 @@ jobs:
 
       - name: Verify formula service ownership
         run: .github/scripts/assert-formula-service.sh
+
+      - name: Test Homebrew package bootstrap
+        run: scripts/install_test.sh
 
       - name: go vet
         run: go vet ./...
@@ -45,6 +58,7 @@ jobs:
         run: CGO_ENABLED=1 go build -buildmode=c-archive -o /tmp/libCCPoolFuseKit.a ./cmd/cc-pool-runtime-archive
 
   widget-test:
+    needs: suite-pins
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7

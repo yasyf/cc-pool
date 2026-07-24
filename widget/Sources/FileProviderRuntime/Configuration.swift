@@ -3,15 +3,16 @@ import Foundation
 import FuseKit
 
 enum CCPoolFileProviderConfiguration {
+  enum ConfigurationError: Error, Equatable, Sendable {
+    case missingFuseKitBuildID
+  }
+
   static let appGroupIdentifier = "SXKCTF23Q2.ccp"
   static let appGroupEndpoint = try! CatalogAppGroupEndpoint(
     identifier: appGroupIdentifier,
     socketLeaf: "fusekit.sock"
   )
-  static let brokerTeamIdentifier = "SXKCTF23Q2"
-  static let brokerSigningIdentifier = "com.yasyf.cc-pool.status"
-  static let extensionTeamIdentifier = "SXKCTF23Q2"
-  static let extensionSigningIdentifier = "com.yasyf.cc-pool.status.fileprovider"
+  static let brokerNoProgressTimeout: TimeInterval = 75
 
   static var realHome: String {
     if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
@@ -27,26 +28,35 @@ enum CCPoolFileProviderConfiguration {
   }
 
   static var brokerConfiguration: CatalogBroker.Configuration {
-    .init(
+    get throws {
+      try makeBrokerConfiguration(environment: ProcessInfo.processInfo.environment)
+    }
+  }
+
+  static func makeBrokerConfiguration(
+    environment: [String: String]
+  ) throws -> CatalogBroker.Configuration {
+    guard let buildID = environment["FUSEKIT_BUILD_ID"], !buildID.isEmpty else {
+      throw ConfigurationError.missingFuseKitBuildID
+    }
+    return .init(
       appGroupEndpoint: appGroupEndpoint,
       daemonSocketPath: holderSocketPath,
-      extensionTeamIdentifier: extensionTeamIdentifier,
-      extensionSigningIdentifier: extensionSigningIdentifier
+      expectedRuntimeBuild: buildID,
+      noProgressTimeout: brokerNoProgressTimeout
     )
   }
 
   static func makeRuntime(
+    domain: NSFileProviderDomain,
     binding: CatalogFileProviderBinding
   ) throws -> CatalogFileProviderRuntime {
-    let transport = try SocketCatalogTransport(
-      appGroupEndpoint: appGroupEndpoint,
-      brokerTeamIdentifier: brokerTeamIdentifier,
-      brokerSigningIdentifier: brokerSigningIdentifier,
-      brokerRequiredEntitlements: [:]
-    )
-    return CatalogFileProviderRuntime(
+    let transport = try SocketCatalogTransport(appGroupEndpoint: appGroupEndpoint)
+    return try CatalogFileProviderRuntime(
+      domain: domain,
       binding: binding,
-      client: CatalogClient(transport: transport)
+      client: CatalogClient(transport: transport),
+      mutationDispositionPolicy: CCPoolFileProviderMutationDispositionPolicy()
     )
   }
 }

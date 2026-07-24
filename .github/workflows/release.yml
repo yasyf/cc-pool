@@ -12,6 +12,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  suite-pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Reject Go and Swift dependency skew
+        run: .github/scripts/verify-suite-pins.sh
+
   verify-tag-on-main:
     runs-on: ubuntu-latest
     steps:
@@ -34,7 +41,7 @@ jobs:
           echo "marketing=${v%%-*}" >> "$GITHUB_OUTPUT"
 
   release:
-    needs: [verify-tag-on-main, release-app, version]
+    needs: [verify-tag-on-main, release-app, suite-pins, version]
     runs-on: macos-15
     permissions:
       contents: write
@@ -92,7 +99,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           COMMIT="$(git rev-parse --short HEAD)"
-          LDFLAGS="-s -w -X github.com/yasyf/cc-pool/internal/version.Version=${VERSION} -X github.com/yasyf/cc-pool/internal/version.Commit=${COMMIT} -X github.com/yasyf/cc-pool/internal/version.StatusAppVersion=${{ needs.version.outputs.marketing }} -X github.com/yasyf/cc-pool/internal/version.StatusAppSHA256=${{ needs.release-app.outputs.sha256 }}"
+          LDFLAGS="-s -w -X github.com/yasyf/cc-pool/internal/version.Version=${VERSION} -X github.com/yasyf/cc-pool/internal/version.Commit=${COMMIT} -X github.com/yasyf/cc-pool/internal/version.StatusAppVersion=${{ needs.version.outputs.marketing }}"
           mkdir -p dist/pure
 
           # The account daemon never touches the App Group; the fixed signed
@@ -236,7 +243,7 @@ jobs:
           make-latest: ${{ !contains(github.ref_name, '-') }}
 
   widget-test:
-    needs: verify-tag-on-main
+    needs: [suite-pins, verify-tag-on-main]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
@@ -379,17 +386,38 @@ jobs:
           spctl --assess --type execute --verbose=4 app/CCPoolStatus.app
 
       - name: Render the formula into the atomic tap transaction
+        id: formula
         uses: yasyf/homebrew-tap/.github/actions/render-formula@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
         with:
           template: .github/formula/cc-pool.rb.tmpl
           output: Formula/cc-pool.rb
           substitutions: |
             __SHA_PURE__=${{ needs.release.outputs.pure_sha256 }}
+            __SHA_APP__=${{ needs.release-app.outputs.sha256 }}
+
+      - name: Audit and install the exact rendered formula
+        env:
+          FORMULA: ${{ steps.formula.outputs.file }}
+        run: |
+          set -euo pipefail
+          ruby -c "$FORMULA"
+          audit_tap=cc-pool/release-audit
+          HOMEBREW_NO_AUTO_UPDATE=1 brew tap-new --no-git "$audit_tap"
+          audit_formula="$(brew --repository "$audit_tap")/Formula/cc-pool.rb"
+          cp "$FORMULA" "$audit_formula"
+          cmp -s "$FORMULA" "$audit_formula"
+          brew audit --strict --formula "$audit_tap/cc-pool"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "$audit_tap/cc-pool"
+          prefix="$(brew --prefix "$audit_tap/cc-pool")"
+          test -x "$prefix/bin/ccp"
+          test -d "$prefix/libexec/CCPoolStatus.app"
+          version="$("$prefix/bin/ccp" --version)"
+          grep -Fq "$GITHUB_REF_NAME" <<< "$version"
+          brew test "$audit_tap/cc-pool"
 
       - name: Publish the CLI formula to the tap
         uses: yasyf/homebrew-tap/.github/actions/publish@9ca67392d45d66b6ae01e262383c8f3138d56f5e
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging
-          delete-file: Casks/cc-pool-status.rb
           message: "cc-pool stack ${{ github.ref_name }}"

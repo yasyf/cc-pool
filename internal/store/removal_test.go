@@ -21,11 +21,38 @@ func TestBeginAccountRemovalRejectsActiveSessionUntilClosed(t *testing.T) {
 	if _, err := accountRemovalByID(s.db, account.ID); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("rejected removal persisted an intent: %v", err)
 	}
-	if err := s.CloseSession(sessionID, started.Add(time.Minute)); err != nil {
+	if err := closeSessionForTest(s, sessionID, started.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.BeginAccountRemoval(account.ID, true); err != nil {
 		t.Fatalf("begin removal after session close: %v", err)
+	}
+}
+
+func TestBeginAccountRemovalRejectsPendingPresentationRepair(t *testing.T) {
+	s := openTest(t)
+	account := insertDesiredPresentationTestAccount(t, s, 1)
+	previous := presentationTestIdentity(account, "/presentation/previous")
+	if err := s.BindDesiredAccountPresentation(account, previous); err != nil {
+		t.Fatal(err)
+	}
+	target := previous
+	target.PublicPath = "/presentation/target"
+	if err := s.ObserveAccountPresentation(account, target); !errors.Is(err, ErrAccountPresentationQuarantined) {
+		t.Fatalf("observe repair target = %v", err)
+	}
+	repair, err := s.StageAccountPresentationRepair(account, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BeginAccountRemoval(account.ID, true); !errors.Is(err, ErrAccountPresentationBusy) {
+		t.Fatalf("removal with pending presentation repair = %v", err)
+	}
+	if _, err := s.CommitAccountPresentationRepair(repair); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BeginAccountRemoval(account.ID, true); err != nil {
+		t.Fatalf("removal after presentation repair = %v", err)
 	}
 }
 
@@ -222,13 +249,14 @@ func TestConcurrentSelectionActivationAndRemovalAdmitExactlyOne(t *testing.T) {
 		ExpectedInstanceID: account.InstanceID, ExpectedGeneration: account.Generation,
 		Process:   ProcessIdentity{PID: 4242, StartedAt: now.Add(-time.Minute)},
 		ConfigDir: account.ConfigDir, Cwd: "/project", At: now,
+		FileProviderLease: storeTestLeaseReceipt("concurrent-removal"),
 	}
 	start := make(chan struct{})
 	activationResult := make(chan error, 1)
 	removalResult := make(chan error, 1)
 	go func() {
 		<-start
-		activationResult <- first.ActivateSelection(activation)
+		activationResult <- activateSelectionForTest(first, activation)
 	}()
 	go func() {
 		<-start
@@ -285,10 +313,11 @@ func TestAccountRemovalIntentFencesActiveFleetAndSurvivesRestart(t *testing.T) {
 	activation := SelectionActivation{
 		Token: nextStoreTestToken(), AccountID: account.ID,
 		ExpectedInstanceID: account.InstanceID, ExpectedGeneration: account.Generation,
-		Process:   ProcessIdentity{PID: 4242, StartedAt: time.Now().Add(-time.Minute)},
-		ConfigDir: account.ConfigDir,
+		Process:           ProcessIdentity{PID: 4242, StartedAt: time.Now().Add(-time.Minute)},
+		ConfigDir:         account.ConfigDir,
+		FileProviderLease: storeTestLeaseReceipt("removing"),
 	}
-	if err := s.ActivateSelection(activation); !errors.Is(err, ErrAccountRemoving) {
+	if err := activateSelectionForTest(s, activation); !errors.Is(err, ErrAccountRemoving) {
 		t.Fatalf("activate selection after removal = %v, want ErrAccountRemoving", err)
 	}
 	mutationRequest := existingAccountMutationTestRequest(

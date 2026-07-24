@@ -73,12 +73,11 @@ type AccountPreparer interface {
 		context.Context,
 		store.PendingAccountReservation,
 		string,
-	) (store.PresentationPreparationProof, error)
-	RefreshPreparedAccount(
+	) (store.FileProviderPresentationIdentity, error)
+	AbortReservedAccount(
 		context.Context,
-		store.Account,
-		store.PresentationPreparationProof,
-	) (store.PresentationPreparationProof, error)
+		store.PendingAccountReservation,
+	) (pool.PendingAddRetirementProof, error)
 }
 
 // Service owns the convergent account registry and its write hooks: every

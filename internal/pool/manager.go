@@ -52,8 +52,6 @@ func (m *Manager) MutationOwner() (proc.Record, error) {
 type Credentials interface {
 	// Store returns a's Keychain credential store.
 	Store(a store.Account, src creds.Source) creds.Store
-	// Stores returns a's sole Keychain credential store.
-	Stores(a store.Account) []creds.Store
 	// Discover resolves the account (-a) label actually stored on a service's
 	// Keychain item, or creds.ErrNotFound: `claude /login` items carry whatever
 	// label claude derived then, which a later recompute may not match, so
@@ -73,10 +71,6 @@ func (c sysCredentials) Store(a store.Account, src creds.Source) creds.Store {
 	return creds.KeychainItem{
 		Service: a.KeychainService, Account: a.KeychainAccount, Runner: c.runner,
 	}
-}
-
-func (c sysCredentials) Stores(a store.Account) []creds.Store {
-	return []creds.Store{c.Store(a, creds.SourceKeychain)}
 }
 
 func (c sysCredentials) Discover(ctx context.Context, service string) (string, error) {
@@ -103,8 +97,15 @@ type Manager struct {
 	// bytes before the terminal receipt commits. It must perform no I/O.
 	BuildCredentialWritePublication CredentialWritePublicationBuilder
 	// ClaimCredentialMutation serializes credential writes with daemon selection
-	// reservations. The returned release must be called after the durable lane settles.
-	ClaimCredentialMutation func(accountID int) (release func(), err error)
+	// reservations. A caller-owned reservation may replace this through context;
+	// the returned release must be called after the durable lane settles.
+	ClaimCredentialMutation CredentialMutationClaim
+	// RetirePendingAdd obtains exact tenant-generation and File Provider absence
+	// proof before dead-owner pending state is cleaned up.
+	RetirePendingAdd func(
+		context.Context,
+		store.PendingAccountReservation,
+	) (PendingAddRetirementProof, error)
 
 	credentialMu      sync.Mutex
 	credentialFlights map[int]*credentialFlight
@@ -117,6 +118,23 @@ type Manager struct {
 	recoveryMu       sync.Mutex
 	recoveryCancel   context.CancelFunc
 	recoveryDone     chan struct{}
+}
+
+// CredentialMutationClaim acquires one account's credential-write exclusion.
+type CredentialMutationClaim func(accountID int) (release func(), err error)
+
+type credentialMutationClaimContextKey struct{}
+
+// WithCredentialMutationClaim binds one exact caller-owned claim to credential work.
+func WithCredentialMutationClaim(ctx context.Context, claim CredentialMutationClaim) context.Context {
+	return context.WithValue(ctx, credentialMutationClaimContextKey{}, claim)
+}
+
+func credentialMutationClaim(ctx context.Context, fallback CredentialMutationClaim) CredentialMutationClaim {
+	if claim, ok := ctx.Value(credentialMutationClaimContextKey{}).(CredentialMutationClaim); ok && claim != nil {
+		return claim
+	}
+	return fallback
 }
 
 // OpenDaemon ensures state exists and creates the singleton daemon's durable worker runtime.

@@ -138,9 +138,8 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 		ID: 2, ConfigDir: filepath.Join(home, "acct-02"), Label: "returned@example.com",
 		KeychainService: "svc-2", KeychainAccount: "u-2",
 	}
-	for _, acct := range []store.Account{requested, returned} {
-		admitCLITestAccount(t, st, acct)
-	}
+	requested = admitCLITestAccount(t, st, requested)
+	returned = admitCLITestAccount(t, st, returned)
 	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +148,8 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 		resp := daemon.Response{OK: true}
 		if op == daemon.OpSelect {
 			resp.SelectedID = &returned.ID
-			resp.Dir = testFileProviderConfigDir(returned.ID)
+			resp.Prepared = true
+			resp.Dir = returned.ConfigDir
 			resp.ReservationToken = "malformed-selection"
 		}
 		if op == daemon.OpSelectAbort {
@@ -176,7 +176,7 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 	}
 	for _, want := range []string{
 		"id 2",
-		"returned dir \"" + testFileProviderConfigDir(returned.ID) + "\"",
+		"returned dir \"" + returned.ConfigDir + "\"",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err, want)

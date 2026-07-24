@@ -26,6 +26,8 @@ const (
 	affectedClaudeConfig    causal.LogicalKey        = "claude-config"
 	claudeJSONFile                                   = ".claude.json"
 	settingsFile                                     = "settings.json"
+	criticalRoleClaudeJSON                           = "claude-json"
+	criticalRoleSettings                             = "settings"
 )
 
 type snapshotPhase uint8
@@ -47,8 +49,8 @@ type materializationKind string
 
 const (
 	materializePhysical   materializationKind = "physical"
-	materializeClaudeJSON materializationKind = "claude-json"
-	materializeSettings   materializationKind = "settings"
+	materializeClaudeJSON materializationKind = criticalRoleClaudeJSON
+	materializeSettings   materializationKind = criticalRoleSettings
 	materializeDirectory  materializationKind = "directory"
 )
 
@@ -308,7 +310,7 @@ func (p ClaudeAuthorityPolicy) PlanDelta(
 			addRoot(spec)
 			affected[causal.LogicalKey(claudeJSONFile)] = struct{}{}
 		default:
-			request, include, err := deltaPhysicalRequest(view, event, specs)
+			request, include, err := deltaPhysicalRequest(event, entry, exists, specs)
 			if err != nil {
 				return sourceauthority.DeltaPlan{}, err
 			}
@@ -393,7 +395,7 @@ func (p ClaudeAuthorityPolicy) syntheticRequests(specs []tenant.TenantSpec) ([]s
 func syntheticClaudeJSONRequest(spec tenant.TenantSpec) (sourceauthority.MaterializationRequest, error) {
 	payload := claudeMaterializationPayload{Kind: materializeClaudeJSON, Tenant: spec.ID}
 	return newMaterializationRequest(
-		syntheticLogical(spec.ID, "claude-json"),
+		syntheticLogical(spec.ID, criticalRoleClaudeJSON),
 		[]sourceauthority.PathRef{
 			{Root: canonicalClaudeJSONRoot, Relative: "."},
 			{Root: privateRootID(spec.ID), Relative: claudeJSONFile},
@@ -405,7 +407,7 @@ func syntheticClaudeJSONRequest(spec tenant.TenantSpec) (sourceauthority.Materia
 func syntheticSettingsRequest(spec tenant.TenantSpec) (sourceauthority.MaterializationRequest, error) {
 	payload := claudeMaterializationPayload{Kind: materializeSettings, Tenant: spec.ID}
 	return newMaterializationRequest(
-		syntheticLogical(spec.ID, "settings"),
+		syntheticLogical(spec.ID, criticalRoleSettings),
 		[]sourceauthority.PathRef{{Root: sharedClaudeRoot, Relative: settingsFile}},
 		payload,
 	)
@@ -443,6 +445,9 @@ func physicalMaterializationRequest(
 		if top == claudeJSONFile || top == settingsFile {
 			return sourceauthority.MaterializationRequest{}, false, nil
 		}
+		if overlay.PrivateStagingEntry(top) {
+			return sourceauthority.MaterializationRequest{}, false, nil
+		}
 		if !overlay.PrivateTopLevel(top) {
 			return sourceauthority.MaterializationRequest{}, false, fmt.Errorf(
 				"tenantfs: private root contains non-private entry %q", top,
@@ -469,11 +474,11 @@ func physicalMaterializationRequest(
 }
 
 func deltaPhysicalRequest(
-	view sourceauthority.IndexView,
 	event sourceauthority.PathEvent,
+	entry sourceauthority.IndexedEntry,
+	exists bool,
 	specs []tenant.TenantSpec,
 ) (sourceauthority.MaterializationRequest, bool, error) {
-	entry, exists := view.Entry(event.Root, event.Relative)
 	if exists {
 		request, include, err := physicalMaterializationRequest(entry.Physical, specs)
 		if err != nil || !include {

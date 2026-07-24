@@ -89,17 +89,24 @@ func TestSelectionLine(t *testing.T) {
 	}
 }
 
+func TestMetadataSelectionOutput(t *testing.T) {
+	if got := metadataSelectionOutput(7); got != "acct-07\tprepared=false" {
+		t.Fatalf("metadata selection output = %q", got)
+	}
+}
+
 // NoneAvailable must win over a co-set Error so --wait reaches the wait loop.
 func TestDaemonSelectOutcome(t *testing.T) {
+	id := 1
 	cases := map[string]struct {
 		resp daemon.Response
 		wait bool
 		want selectOutcome
 	}{
-		"picked":                        {daemon.Response{OK: true, Dir: "/d"}, false, outcomePicked},
-		"picked ignores wait":           {daemon.Response{OK: true, Dir: "/d"}, true, outcomePicked},
-		"fallback pick accepted":        {daemon.Response{OK: true, Dir: "/d", ExhaustedFallback: true}, false, outcomePicked},
-		"fallback pick waits with wait": {daemon.Response{OK: true, Dir: "/d", ExhaustedFallback: true}, true, outcomeWait},
+		"metadata pick":                 {daemon.Response{OK: true, SelectedID: &id}, false, outcomePicked},
+		"prepared pick ignores wait":    {daemon.Response{OK: true, SelectedID: &id, Prepared: true, Dir: "/d"}, true, outcomePicked},
+		"fallback pick accepted":        {daemon.Response{OK: true, SelectedID: &id, ExhaustedFallback: true}, false, outcomePicked},
+		"fallback pick waits with wait": {daemon.Response{OK: true, SelectedID: &id, ExhaustedFallback: true}, true, outcomeWait},
 		"none available, no wait":       {daemon.Response{NoneAvailable: true, Error: "no account is currently available"}, false, outcomeFail},
 		"none available, wait":          {daemon.Response{NoneAvailable: true, Error: "no account is currently available"}, true, outcomeWait},
 		"real error":                    {daemon.Response{Error: "boom"}, false, outcomeError},
@@ -226,10 +233,10 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	if err := os.WriteFile(privatePath, private, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	admitCLITestAccount(t, st, store.Account{
-		ID: id, ConfigDir: dir, Label: "work@example.com",
+	admitCLITestAccountAtPublicPath(t, st, store.Account{
+		ID: id, Label: "work@example.com",
 		KeychainService: "svc", KeychainAccount: "u",
-	})
+	}, dir)
 	account, err := st.GetAccount(id)
 	if err != nil {
 		t.Fatal(err)
@@ -242,7 +249,6 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 		resp := daemon.Response{OK: true, Version: version.String()}
 		if op == daemon.OpSelect {
 			resp.SelectedID = &id
-			resp.Dir = testFileProviderConfigDir(id)
 			resp.AccountInstanceID = account.InstanceID
 			resp.AccountGeneration = account.Generation
 		}
@@ -256,8 +262,8 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	cmd.SetContext(context.Background())
 
 	_, gotDir, _, err := resolveSelection(cmd, m, selectReq{cwd: "/proj"})
-	if err != nil || gotDir != testFileProviderConfigDir(id) {
-		t.Fatalf("daemon pick must succeed: dir=%q err=%v (stderr=%q)", gotDir, err, stripANSI(stderr.String()))
+	if err != nil || gotDir != "" {
+		t.Fatalf("metadata-only daemon pick must have no path: dir=%q err=%v (stderr=%q)", gotDir, err, stripANSI(stderr.String()))
 	}
 	got, err := os.ReadFile(privatePath) //nolint:gosec // G304: test-owned path under t.TempDir.
 	if err != nil {
@@ -312,14 +318,14 @@ func TestValidateDaemonSelection(t *testing.T) {
 	}
 	a, _ = st.GetAccount(a.ID)
 	b, _ = st.GetAccount(b.ID)
-	presentationA := testFileProviderConfigDir(a.ID)
-	presentationB := testFileProviderConfigDir(b.ID)
+	publicPath := testFileProviderPublicPath(a.ID)
 	m := &pool.Manager{Store: st}
 	zero, unknown := 0, 999
 	cases := []struct {
 		name      string
 		resp      daemon.Response
 		forced    *store.Account
+		launch    bool
 		wantError []string
 		wantID    int
 	}{
@@ -339,47 +345,67 @@ func TestValidateDaemonSelection(t *testing.T) {
 			wantError: []string{"id 999", "returned dir \"/returned/unknown\""},
 		},
 		{
-			name:      "relative public path fails",
-			resp:      daemon.Response{SelectedID: &a.ID, Dir: "relative/path"},
-			wantError: []string{"id 5", "invalid File Provider path", "relative/path"},
+			name:      "relative execution path fails",
+			resp:      daemon.Response{SelectedID: &a.ID, Prepared: true, Dir: "relative/path"},
+			launch:    true,
+			wantError: []string{"id 5", "invalid execution path", "relative/path"},
 		},
 		{
 			name:      "trailing slash alias fails",
-			resp:      daemon.Response{SelectedID: &a.ID, Dir: presentationA + "/"},
-			wantError: []string{"id 5", "invalid File Provider path", presentationA + "/"},
+			resp:      daemon.Response{SelectedID: &a.ID, Prepared: true, Dir: a.ConfigDir + "/"},
+			launch:    true,
+			wantError: []string{"id 5", "invalid execution path", a.ConfigDir + "/"},
 		},
 		{
 			name:      "dot segment alias fails",
-			resp:      daemon.Response{SelectedID: &a.ID, Dir: presentationA + "/./"},
-			wantError: []string{"id 5", "invalid File Provider path", presentationA + "/./"},
+			resp:      daemon.Response{SelectedID: &a.ID, Prepared: true, Dir: a.ConfigDir + "/./"},
+			launch:    true,
+			wantError: []string{"id 5", "invalid execution path", a.ConfigDir + "/./"},
 		},
 		{
 			name:      "forced account mismatch",
-			resp:      daemon.Response{SelectedID: &b.ID, Dir: presentationB},
+			resp:      daemon.Response{SelectedID: &b.ID, Prepared: true, Dir: b.ConfigDir},
 			forced:    &a,
-			wantError: []string{"id 6", "forced account 5", "returned dir \"" + presentationB + "\""},
+			launch:    true,
+			wantError: []string{"id 6", "forced account 5", "returned dir \"" + b.ConfigDir + "\""},
 		},
 		{
-			name: "OS public path succeeds without static-path equality",
+			name: "presentation path cannot replace stable execution path",
 			resp: daemon.Response{
-				SelectedID: &a.ID, Dir: "/Users/test/Library/CloudStorage/account-5", AccountInstanceID: a.InstanceID,
+				SelectedID: &a.ID, Prepared: true, Dir: publicPath, AccountInstanceID: a.InstanceID,
 				AccountGeneration: a.Generation,
 			},
-			wantID: a.ID,
+			launch:    true,
+			wantError: []string{"id 5", "want stable account path", a.ConfigDir},
 		},
 		{
 			name: "exact forced match succeeds",
 			resp: daemon.Response{
-				SelectedID: &a.ID, Dir: presentationA, AccountInstanceID: a.InstanceID,
+				SelectedID: &a.ID, Prepared: true, Dir: a.ConfigDir, AccountInstanceID: a.InstanceID,
 				AccountGeneration: a.Generation,
 			},
 			forced: &a,
+			launch: true,
 			wantID: a.ID,
+		},
+		{
+			name: "metadata-only succeeds without a path",
+			resp: daemon.Response{
+				SelectedID: &a.ID, AccountInstanceID: a.InstanceID, AccountGeneration: a.Generation,
+			},
+			wantID: a.ID,
+		},
+		{
+			name: "metadata-only rejects a runnable path",
+			resp: daemon.Response{
+				SelectedID: &a.ID, Dir: a.ConfigDir, AccountInstanceID: a.InstanceID, AccountGeneration: a.Generation,
+			},
+			wantError: []string{"inspection", "runnable execution path"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := validateDaemonSelection(m, &tc.resp, tc.forced)
+			got, err := validateDaemonSelection(m, &tc.resp, tc.forced, tc.launch)
 			if len(tc.wantError) > 0 {
 				if err == nil {
 					t.Fatalf("validateDaemonSelection = %+v, nil; want error", got)

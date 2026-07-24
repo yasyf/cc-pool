@@ -23,10 +23,10 @@ func newSelectCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "select",
-		Short: "Print the config dir of the emptiest account",
-		Long: `select asks the exact running daemon to prepare and inspect the best account,
-then prints its config directory. It creates no session, reservation, sticky pin,
-or launch ownership. Use ` + "`ccp run`" + ` to launch Claude Code.`,
+		Short: "Inspect the emptiest account without preparing it",
+		Long: `select asks the exact running daemon to choose the best account without
+preparing or materializing its File Provider presentation. It prints the stable account
+identifier and prepared=false. Use ` + "`ccp run`" + ` to prepare and launch Claude Code.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(cmd.Context(), func(m *pool.Manager) error {
@@ -48,7 +48,7 @@ or launch ownership. Use ` + "`ccp run`" + ` to launch Claude Code.`,
 				if err := selection.Commit(cmd.Context()); err != nil {
 					return fmt.Errorf("commit selection: %w", err)
 				}
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), selection.dir)
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), metadataSelectionOutput(selection.acct.ID))
 				announceLine(cmd, selection.line)
 				return nil
 			})
@@ -174,12 +174,12 @@ func resolveSelectionTxn(ctx context.Context, cmd *cobra.Command, m *pool.Manage
 		}
 		switch daemonSelectOutcome(resp, req.wait) {
 		case outcomePicked:
-			a, err := validateDaemonSelection(m, resp, forced)
+			launch := req.process.PID > 0
+			a, err := validateDaemonSelection(m, resp, forced, launch)
 			if err != nil {
 				abortDaemonSelection(ctx, cl, resp.ReservationToken)
 				return nil, err
 			}
-			launch := req.process.PID > 0
 			if launch && resp.ReservationToken == "" {
 				return nil, fmt.Errorf("invalid daemon launch selection: empty reservation token for id %d", a.ID)
 			}
@@ -274,7 +274,12 @@ func abortDaemonSelection(ctx context.Context, cl *daemon.Client, token string) 
 	_ = cl.AbortSelection(ctx, token)
 }
 
-func validateDaemonSelection(m *pool.Manager, resp *daemon.Response, forced *store.Account) (store.Account, error) {
+func validateDaemonSelection(
+	m *pool.Manager,
+	resp *daemon.Response,
+	forced *store.Account,
+	launch bool,
+) (store.Account, error) {
 	if resp.SelectedID == nil {
 		return store.Account{}, fmt.Errorf("invalid daemon selection: id <nil>, returned dir %q", resp.Dir)
 	}
@@ -283,8 +288,20 @@ func validateDaemonSelection(m *pool.Manager, resp *daemon.Response, forced *sto
 	if err != nil {
 		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d, returned dir %q: %w", id, resp.Dir, err)
 	}
-	if !exactSelectionPath(resp.Dir) {
-		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d returned invalid File Provider path %q", id, resp.Dir)
+	if resp.Prepared != launch {
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d prepared=%v, want %v", id, resp.Prepared, launch)
+	}
+	if launch && !exactSelectionPath(resp.Dir) {
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d returned invalid execution path %q", id, resp.Dir)
+	}
+	if launch && resp.Dir != a.ConfigDir {
+		return store.Account{}, fmt.Errorf(
+			"invalid daemon selection: id %d returned dir %q, want stable account path %q",
+			id, resp.Dir, a.ConfigDir,
+		)
+	}
+	if !launch && resp.Dir != "" {
+		return store.Account{}, fmt.Errorf("invalid daemon inspection: id %d returned runnable execution path %q", id, resp.Dir)
 	}
 	if forced != nil && id != forced.ID {
 		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d does not match forced account %d, returned dir %q", id, forced.ID, resp.Dir)
@@ -311,10 +328,10 @@ func warnPinHeld(cmd *cobra.Command, m *pool.Manager, held, selected *int) {
 type selectOutcome int
 
 const (
-	outcomePicked selectOutcome = iota // use resp.Dir
-	outcomeWait                        // none available, caller waits via the live loop
-	outcomeFail                        // none available, caller errors
-	outcomeError                       // a real daemon error
+	outcomePicked selectOutcome = iota
+	outcomeWait                 // none available, caller waits via the live loop
+	outcomeFail                 // none available, caller errors
+	outcomeError                // a real daemon error
 )
 
 // daemonSelectOutcome classifies a daemon select reply: check NoneAvailable
@@ -322,9 +339,9 @@ const (
 // NoFallback must wait, not bill credits.
 func daemonSelectOutcome(resp *daemon.Response, wait bool) selectOutcome {
 	switch {
-	case resp.OK && resp.Dir != "" && resp.ExhaustedFallback && wait:
+	case resp.OK && resp.SelectedID != nil && resp.ExhaustedFallback && wait:
 		return outcomeWait
-	case resp.OK && resp.Dir != "":
+	case resp.OK && resp.SelectedID != nil:
 		return outcomePicked
 	case resp.NoneAvailable && wait:
 		return outcomeWait
@@ -376,6 +393,10 @@ func selectionLine(name string, sticky, hasUsage bool, used5, used7 float64, sco
 		styledName += dimStyle.Render(" (pinned)")
 	}
 	return fmt.Sprintf("%s %s%s", verb, styledName, usageSuffix(hasUsage, used5, used7, scopedModel, scopedUsed))
+}
+
+func metadataSelectionOutput(accountID int) string {
+	return fmt.Sprintf("acct-%02d\tprepared=false", accountID)
 }
 
 func daemonSelectionLine(m *pool.Manager, resp *daemon.Response) string {

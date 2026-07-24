@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sync/atomic"
@@ -333,17 +334,16 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 }
 
 func TestCredentialRemovalRecoversOwnerDeathAfterDelete(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	st := openTestStore(t)
 	credentials := credstest.NewFake()
 	owner := credentialRecoveryManager(t, st, credentials, "remove-owner")
-	reservation, err := st.ReserveAccountIndex(owner.workers.owner)
+	account := persistTestAccount(t, st, store.Account{
+		ID: 1, KeychainAccount: "account-remove-recovery",
+	})
+	presentation, err := st.AccountPresentation(account.ID)
 	if err != nil {
 		t.Fatal(err)
-	}
-	account := store.Account{
-		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: t.TempDir(),
-		KeychainService: "service-remove-recovery", KeychainAccount: "account-remove-recovery",
 	}
 	credentials.Put(
 		account.KeychainService, account.KeychainAccount,
@@ -357,6 +357,10 @@ func TestCredentialRemovalRecoversOwnerDeathAfterDelete(t *testing.T) {
 		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
 		account.KeychainService, account.KeychainAccount,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removal, err := st.BeginAccountRemoval(account.ID, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,15 +393,13 @@ func TestCredentialRemovalRecoversOwnerDeathAfterDelete(t *testing.T) {
 		terminal.Result != store.CredentialResultDone {
 		t.Fatalf("recovered removal = %+v", terminal)
 	}
-	if err := recovery.removeCredentialForAccountRemoval(t.Context(), account); err != nil {
+	if err := recovery.removeCredentialForAccountRemovalAt(
+		t.Context(), account, presentation.Identity.PublicPath,
+	); err != nil {
 		t.Fatalf("replay recovered receipt: %v", err)
 	}
-	removal, err := st.BeginAccountRemoval(account.ID, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.FinalizePendingAccountRemoval(removal); err != nil {
-		t.Fatalf("finalize recovered pending removal: %v", err)
+	if err := st.DeleteAccount(removal.AccountID); err != nil {
+		t.Fatalf("finalize recovered account removal: %v", err)
 	}
 }
 
@@ -714,6 +716,7 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 	old := credentialRecoveryManager(t, st, credstest.NewFake(), "source-receipt-owner")
 	old.workers.owner = syntheticCredentialOwner(t, 1)
 	recovery := credentialRecoveryManager(t, st, old.Creds, "source-receipt-recovery")
+	installTestBackingRunner(recovery)
 
 	credentialBefore, err := old.credentialObservation(t.Context(), credentialAccount)
 	if err != nil {
@@ -738,6 +741,37 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 	}
 	if pending.ID == 0 {
 		t.Fatal("pending-add fixture was not created")
+	}
+	installTestBackingRunner(old)
+	home, err := Home()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingPublicPath := filepath.Join(
+		home, "Library", "CloudStorage", "pending-"+pending.InstanceID,
+	)
+	if err := os.MkdirAll(pendingPublicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	preparedPending, err := old.PrepareReservedAdd(t.Context(), pending, pendingPublicPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingMarker := filepath.Join(pendingPublicPath, "survives-recovery")
+	if err := os.WriteFile(pendingMarker, []byte("public"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recovery.RetirePendingAdd = func(
+		ctx context.Context,
+		reservation store.PendingAccountReservation,
+	) (PendingAddRetirementProof, error) {
+		if err := ctx.Err(); err != nil {
+			return PendingAddRetirementProof{}, err
+		}
+		return PendingAddRetirementProof{
+			AccountID: reservation.ID, AccountInstanceID: reservation.InstanceID,
+			AccountGeneration: reservation.Generation, PublicPath: preparedPending.PublicPath,
+		}, nil
 	}
 
 	mutationBefore, err := old.credentialObservation(t.Context(), mutationAccount)
@@ -809,6 +843,16 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 	if len(pendingRows) != 0 {
 		t.Fatalf("credential-owner pending add survived recovery = %+v", pendingRows)
 	}
+	if got, err := os.ReadFile(pendingMarker); err != nil || string(got) != "public" {
+		t.Fatalf("pending public target after recovery = %q err=%v", got, err)
+	}
+	reused, err := st.ReserveAccountIndex(recovery.workers.owner)
+	if err != nil || reused.ID != pending.ID {
+		t.Fatalf("reservation after proven retirement = %+v err=%v", reused, err)
+	}
+	if err := st.ReleaseAccountIndex(reused); err != nil {
+		t.Fatal(err)
+	}
 	page, err := recovery.workers.reaper.ReapReceipts(
 		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 3,
 	)
@@ -846,6 +890,47 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 	}
 	if err := reopened.Add(t.Context(), blockedOwner); err != nil {
 		t.Fatalf("credential-owner receipt acknowledgement did not reopen admission: %v", err)
+	}
+}
+
+func TestCredentialOwnerRecoveryRetainsPendingAddWhenRetirementIsAmbiguous(t *testing.T) {
+	st := openTestStore(t)
+	old := credentialRecoveryManager(t, st, credstest.NewFake(), "pending-retirement-old")
+	recovery := credentialRecoveryManager(t, st, old.Creds, "pending-retirement-new")
+	reservation, err := st.ReserveAccountIndex(old.workers.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, verifier := credentialRetirementReceipt(
+		t, old.workers.owner, recovery.workers.owner.Generation,
+	)
+	recovery.workers.reaper = verifier
+	retirementErr := errors.New("tenant retirement unavailable")
+	recovery.RetirePendingAdd = func(
+		context.Context,
+		store.PendingAccountReservation,
+	) (PendingAddRetirementProof, error) {
+		return PendingAddRetirementProof{}, retirementErr
+	}
+	remaining, _, err := recovery.recoverCredentialOwnerClass(
+		t.Context(), []proc.ReapReceipt{receipt},
+	)
+	if err != nil || !remaining {
+		t.Fatalf("ambiguous recovery = remaining %v err=%v", remaining, err)
+	}
+	pending, _, err := st.PendingAddReservationsOwnedBy(old.workers.owner, 0, 1)
+	if err != nil || len(pending) != 1 || pending[0].ID != reservation.ID {
+		t.Fatalf("retained reservation = %+v err=%v", pending, err)
+	}
+	next, err := st.ReserveAccountIndex(recovery.workers.owner)
+	if err != nil || next.ID == reservation.ID {
+		t.Fatalf("reservation reused after ambiguous retirement = %+v err=%v", next, err)
+	}
+	page, err := verifier.ReapReceipts(
+		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 1,
+	)
+	if err != nil || len(page.Receipts) != 1 || page.Receipts[0].Digest != receipt.Digest {
+		t.Fatalf("retained retirement receipt = %+v err=%v", page, err)
 	}
 }
 
@@ -1144,6 +1229,10 @@ func TestCredentialQuarantineGatesEveryMutation(t *testing.T) {
 	}
 	syncedCredential := datedCred("synced", 2*time.Hour)
 	syncedCredential.ClaudeAiOauth.RefreshToken = ""
+	presentation, err := manager.Store.AccountPresentation(account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		name string
 		run  func() error
@@ -1174,7 +1263,9 @@ func TestCredentialQuarantineGatesEveryMutation(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			return manager.FinishAccountRemoval(t.Context(), removal)
+			return manager.FinishAccountRemoval(
+				t.Context(), removal, presentation.Identity.PublicPath,
+			)
 		}, store.ErrCredentialOperationEvidenceActive},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1327,6 +1418,7 @@ func TestExpiredCompensationRecoveryFinishesExactPartialDelete(t *testing.T) {
 }
 
 func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	st := openTestStore(t)
 	credentials := credstest.NewFake()
 	manager := credentialRecoveryManager(t, st, credentials, "pending-compensation-owner")
@@ -1334,14 +1426,28 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	account := store.Account{
-		ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
-		ConfigDir: t.TempDir(), KeychainService: "service-pending-compensation",
-		KeychainAccount: "account-pending-compensation",
-	}
-	empty, err := manager.credentialObservation(t.Context(), account)
+	configDir, err := AccountConfigDir(reservation.InstanceID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	keychainService, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicPath := testFileProviderPublicPath(reservation.ID)
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
+		t.Fatal(err)
+	}
+	account := store.Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
+		ConfigDir: configDir, KeychainService: keychainService,
+		KeychainAccount: "account-pending-compensation",
+	}
+	empty := store.CredentialExternalState{
+		Keychain: store.CredentialSlotObservation{State: store.CredentialSlotEmpty},
 	}
 	emptyDigest, err := empty.Digest()
 	if err != nil {
@@ -1366,7 +1472,7 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 		t.Fatalf("begin pending Add = %+v err=%v", begin, err)
 	}
 	fence, err := st.BindAccountMutationPresentation(
-		begin.Active.Fence(), presentationRebindProof(account, account.ConfigDir, "activation-pending"),
+		begin.Active.Fence(), poolTestPresentationProof(reservation, publicPath),
 		account.ConfigDir, account.KeychainService,
 		account.KeychainAccount, locator, emptyDigest,
 	)

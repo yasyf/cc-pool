@@ -12,27 +12,28 @@ import (
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
-	"github.com/yasyf/fusekit/mountproto"
-	"github.com/yasyf/fusekit/mountservice"
+	"github.com/yasyf/fusekit/holder"
+	"github.com/yasyf/fusekit/tenant"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
 
 const (
-	accountRemovalRecoveryConcurrency = 4
 	tenantProvisionConcurrency        = 4
+	backgroundProvisionConcurrency    = tenantProvisionConcurrency - 1
+	accountRemovalRecoveryConcurrency = backgroundProvisionConcurrency
 )
 
 type sourcePreparer interface {
-	Prepare(context.Context, tenantfs.Account) (catalogproto.TenantPreparationProof, error)
-	Validate(context.Context, tenantfs.Account, catalogproto.TenantPreparationProof) error
+	Prepare(context.Context, tenantfs.Account, tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error)
+	Validate(context.Context, tenantfs.Account, tenantfs.PreparationLease, catalogproto.TenantPreparationProof) error
 }
 
 type tenantLifecycleRuntime interface {
-	ProvisionTenant(context.Context, tenantfs.Account) (mountproto.ProvisionTenantResponse, error)
-	ReplaceTenant(context.Context, tenantfs.Account, uint64) (mountproto.ReplaceTenantResponse, error)
-	RemoveTenant(context.Context, tenantfs.Account, uint64) (mountproto.RemoveTenantResponse, error)
-	TenantState(context.Context, tenantfs.Account) (mountproto.StateResponse, error)
+	ProvisionTenant(context.Context, tenantfs.Account) (holder.LocalTenantAcknowledgement, error)
+	ReplaceTenant(context.Context, tenantfs.Account, uint64) (holder.LocalTenantAcknowledgement, error)
+	RetireTenant(context.Context, tenantfs.Account, uint64) (holder.LocalTenantRetirementProof, error)
+	TenantState(context.Context, catalog.TenantID) (tenant.TenantStatus, error)
 }
 
 // tenantCoordinator owns product account-to-tenant lifecycle and on-demand preparation.
@@ -85,6 +86,11 @@ func newTenantCoordinator(
 }
 
 func (c *tenantCoordinator) initialize(ctx context.Context) error {
+	if err := c.server.m.RecoverAccountPresentationRepairs(ctx); err != nil {
+		err = fmt.Errorf("recover account presentation repairs: %w", err)
+		c.server.finishBootstrap(err)
+		return err
+	}
 	if err := recoverAccountRemovals(
 		ctx,
 		c.server.m.Store.PageAccountRemovals,
@@ -107,7 +113,7 @@ func (c *tenantCoordinator) initialize(ctx context.Context) error {
 		defer cancel(context.Canceled)
 	}
 	var group errgroup.Group
-	group.SetLimit(tenantProvisionConcurrency)
+	group.SetLimit(backgroundProvisionConcurrency)
 	for _, desired := range accounts {
 		account := desired
 		group.Go(func() error {
@@ -125,26 +131,12 @@ func (c *tenantCoordinator) initialize(ctx context.Context) error {
 }
 
 func (c *tenantCoordinator) prepareDesiredAccount(ctx context.Context, account store.Account) (bool, error) {
-	proof, err := c.prepare(ctx, account)
-	if err != nil {
+	tenantAccount := pool.TenantAccount(account)
+	if err := c.ensureTenant(ctx, account, tenantAccount); err != nil {
 		return false, err
 	}
-	if err := c.activatePrepared(ctx, account, proof, func() error { return nil }); err != nil {
-		return false, err
-	}
-	stored, err := projectPreparationProof(proof)
-	if err != nil {
-		return false, err
-	}
-	expected, err := expectedPresentationIdentity(account)
-	if err != nil {
-		return false, err
-	}
-	if err := c.server.m.Store.BindDesiredAccountPresentation(account, expected, stored); err != nil {
-		if errors.Is(err, store.ErrAccountPresentationQuarantined) {
-			return true, nil
-		}
-		return false, err
+	if err := c.server.m.RecoverAccountConfigDir(account); err != nil {
+		return false, fmt.Errorf("recover acct-%02d stable config dir: %w", account.ID, err)
 	}
 	return false, nil
 }
@@ -164,7 +156,7 @@ func expectedPresentationIdentity(account store.Account) (store.FileProviderPres
 	}
 	return store.FileProviderPresentationIdentity{
 		TenantID: string(tenantID), DomainID: string(domainID),
-		Generation: account.Generation, PublicPath: account.ConfigDir,
+		Generation: account.Generation, PublicPath: pool.FileProviderConfigDir(account.ID),
 	}, nil
 }
 
@@ -210,12 +202,13 @@ func recoverAccountRemovals(
 func (c *tenantCoordinator) prepare(
 	ctx context.Context,
 	account store.Account,
+	lease tenantfs.PreparationLease,
 ) (catalogproto.TenantPreparationProof, error) {
 	tenantAccount := pool.TenantAccount(account)
 	if err := c.ensureTenant(ctx, account, tenantAccount); err != nil {
 		return catalogproto.TenantPreparationProof{}, err
 	}
-	return c.preparer.Prepare(ctx, tenantAccount)
+	return c.preparer.Prepare(ctx, tenantAccount, lease)
 }
 
 func (c *tenantCoordinator) ensureTenant(
@@ -350,15 +343,12 @@ func (c *tenantCoordinator) ensureTenantOnce(
 ) error {
 	response, err := c.runtime.ProvisionTenant(ctx, tenantAccount)
 	if err == nil {
-		if validTenantAcknowledgement(
-			response.Protocol, response.Code, response.Message, response.TenantID, response.Generation,
-			mountproto.TenantID(tenantID), tenantAccount.Generation,
-		) {
+		if validTenantAcknowledgement(response, tenantID, tenantAccount.Generation) {
 			return nil
 		}
 		return fmt.Errorf("provision acct-%02d: invalid FuseKit proof", account.ID)
 	}
-	if !isRemoteCode(err, mountproto.ErrorCodeConflict) {
+	if !isControlCode(err, tenantfs.ControlErrorConflict) {
 		return fmt.Errorf("provision acct-%02d: %w", account.ID, err)
 	}
 	state, present, err := c.tenantState(ctx, tenantAccount)
@@ -370,10 +360,7 @@ func (c *tenantCoordinator) ensureTenantOnce(
 		if retryErr != nil {
 			return fmt.Errorf("provision acct-%02d after absent state: %w", account.ID, retryErr)
 		}
-		if !validTenantAcknowledgement(
-			retried.Protocol, retried.Code, retried.Message, retried.TenantID, retried.Generation,
-			mountproto.TenantID(tenantID), tenantAccount.Generation,
-		) {
+		if !validTenantAcknowledgement(retried, tenantID, tenantAccount.Generation) {
 			return fmt.Errorf("provision acct-%02d after absent state: invalid FuseKit proof", account.ID)
 		}
 		return nil
@@ -381,23 +368,20 @@ func (c *tenantCoordinator) ensureTenantOnce(
 	if !state.ReplacementEligible {
 		return fmt.Errorf("replace acct-%02d: FuseKit tenant is not replacement eligible", account.ID)
 	}
-	if state.Generation >= tenantAccount.Generation {
+	if state.State.Generation >= catalog.Generation(tenantAccount.Generation) {
 		return fmt.Errorf(
 			"replace acct-%02d: durable FuseKit generation %d is not older than desired %d",
-			account.ID, state.Generation, tenantAccount.Generation,
+			account.ID, state.State.Generation, tenantAccount.Generation,
 		)
 	}
-	replaced, err := c.runtime.ReplaceTenant(ctx, tenantAccount, state.Generation)
+	replaced, err := c.runtime.ReplaceTenant(ctx, tenantAccount, uint64(state.State.Generation))
 	if err != nil {
 		return fmt.Errorf(
 			"replace acct-%02d generation %d from durable generation %d: %w",
-			account.ID, account.Generation, state.Generation, err,
+			account.ID, account.Generation, state.State.Generation, err,
 		)
 	}
-	if !validTenantAcknowledgement(
-		replaced.Protocol, replaced.Code, replaced.Message, replaced.TenantID, replaced.Generation,
-		mountproto.TenantID(tenantID), tenantAccount.Generation,
-	) {
+	if !validTenantAcknowledgement(replaced, tenantID, tenantAccount.Generation) {
 		return fmt.Errorf("replace acct-%02d generation %d: invalid FuseKit proof", account.ID, account.Generation)
 	}
 	return nil
@@ -406,44 +390,88 @@ func (c *tenantCoordinator) ensureTenantOnce(
 func (c *tenantCoordinator) tenantState(
 	ctx context.Context,
 	tenantAccount tenantfs.Account,
-) (mountproto.TenantState, bool, error) {
-	response, err := c.runtime.TenantState(ctx, tenantAccount)
-	if err != nil {
-		if isRemoteCode(err, mountproto.ErrorCodeNotFound) {
-			return mountproto.TenantState{}, false, nil
-		}
-		return mountproto.TenantState{}, false, err
-	}
+) (tenant.TenantStatus, bool, error) {
 	tenantID, err := tenantAccount.TenantID()
 	if err != nil {
-		return mountproto.TenantState{}, false, err
+		return tenant.TenantStatus{}, false, err
 	}
-	if response.Protocol != mountproto.Version || response.Code != mountproto.ErrorCodeOk ||
-		response.Message != "" || response.State == nil ||
-		response.State.OwnerID != mountproto.OwnerID(tenantfs.OwnerID) ||
-		response.State.TenantID != mountproto.TenantID(tenantID) ||
+	response, err := c.runtime.TenantState(ctx, tenantID)
+	if err != nil {
+		if isControlCode(err, tenantfs.ControlErrorNotFound) {
+			return tenant.TenantStatus{}, false, nil
+		}
+		return tenant.TenantStatus{}, false, err
+	}
+	if response.Owner != tenant.OwnerID(tenantfs.OwnerID) || response.State.Tenant != tenantID ||
 		response.State.Generation == 0 {
-		return mountproto.TenantState{}, false, errors.New("invalid owner-fenced FuseKit tenant state")
+		return tenant.TenantStatus{}, false, errors.New("invalid owner-fenced FuseKit tenant state")
 	}
-	return *response.State, true, nil
+	return response, true, nil
 }
 
-func isRemoteCode(err error, code mountproto.ErrorCode) bool {
-	var remote *mountservice.RemoteError
+func isControlCode(err error, code tenantfs.ControlErrorCode) bool {
+	var remote *tenantfs.ControlRemoteError
 	return errors.As(err, &remote) && remote.Code == code
 }
 
 func validTenantAcknowledgement(
-	protocol uint16,
-	code mountproto.ErrorCode,
-	message string,
-	tenantID mountproto.TenantID,
+	acknowledgement holder.LocalTenantAcknowledgement,
+	tenantID catalog.TenantID,
 	generation uint64,
-	wantID mountproto.TenantID,
-	wantGeneration uint64,
 ) bool {
-	return protocol == mountproto.Version && code == mountproto.ErrorCodeOk && message == "" &&
-		tenantID == wantID && generation == wantGeneration
+	return acknowledgement.Tenant == tenantID && acknowledgement.Generation == catalog.Generation(generation) &&
+		acknowledgement.Presentations == catalog.PresentFileProvider
+}
+
+func (c *tenantCoordinator) retireReservedAccount(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+) (pool.PendingAddRetirementProof, error) {
+	configDir, err := pool.AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, err
+	}
+	account := store.Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation, ConfigDir: configDir,
+	}
+	identity, err := expectedPresentationIdentity(account)
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, err
+	}
+	if err := store.ValidateReservedPresentationIdentity(reservation, identity); err != nil {
+		return pool.PendingAddRetirementProof{}, err
+	}
+	tenantAccount := pool.TenantAccount(account)
+	tenantID, err := tenantAccount.TenantID()
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, err
+	}
+	release, err := c.acquireTenantLane(ctx, tenantID)
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, err
+	}
+	defer release()
+	state, present, err := c.tenantState(ctx, tenantAccount)
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, fmt.Errorf("inspect reserved FuseKit tenant before retirement: %w", err)
+	}
+	if present && state.State.Generation != catalog.Generation(reservation.Generation) {
+		return pool.PendingAddRetirementProof{}, errors.New("reserved FuseKit tenant generation drifted")
+	}
+	retired, err := c.runtime.RetireTenant(ctx, tenantAccount, reservation.Generation)
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, fmt.Errorf("retire reserved FuseKit tenant: %w", err)
+	}
+	if retired.Tenant != tenantID || retired.Generation != catalog.Generation(reservation.Generation) ||
+		!retired.FileProviderAbsent {
+		return pool.PendingAddRetirementProof{}, errors.New("retire reserved FuseKit tenant: invalid proof")
+	}
+	c.forgetTenant(tenantID)
+	return pool.PendingAddRetirementProof{
+		AccountID: reservation.ID, AccountInstanceID: reservation.InstanceID,
+		AccountGeneration: reservation.Generation, PublicPath: identity.PublicPath,
+	}, nil
 }
 
 func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.AccountRemoval) error {
@@ -476,230 +504,76 @@ func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.Acc
 		account.Generation != removal.AccountGeneration {
 		return errors.New("account identity changed while awaiting removal lane")
 	}
+	presentation, err := c.server.m.Store.AccountPresentation(account.ID)
+	if err != nil {
+		return fmt.Errorf("read account presentation before removal: %w", err)
+	}
+	if presentation.AccountInstanceID != removal.AccountInstanceID ||
+		presentation.AccountGeneration != removal.AccountGeneration {
+		return errors.New("account presentation identity changed while awaiting removal lane")
+	}
 	tenantAccount = pool.TenantAccount(account)
 	state, present, err := c.tenantState(ctx, tenantAccount)
 	if err != nil {
 		return fmt.Errorf("inspect FuseKit tenant before removal: %w", err)
 	}
-	if present {
-		if state.Generation != removal.AccountGeneration {
-			return errors.New("FuseKit tenant generation drifted from removal intent")
-		}
-		response, err := c.runtime.RemoveTenant(ctx, tenantAccount, removal.AccountGeneration)
-		if err != nil {
-			return fmt.Errorf("remove FuseKit tenant: %w", err)
-		}
-		if response.Protocol != mountproto.Version || response.Code != mountproto.ErrorCodeOk ||
-			response.Message != "" || response.TenantID != mountproto.TenantID(tenantID) ||
-			response.Generation != removal.AccountGeneration || !response.FileProviderAbsent {
-			return errors.New("remove FuseKit tenant: invalid proof")
-		}
+	if present && state.State.Generation != catalog.Generation(removal.AccountGeneration) {
+		return errors.New("FuseKit tenant generation drifted from removal intent")
+	}
+	response, err := c.runtime.RetireTenant(ctx, tenantAccount, removal.AccountGeneration)
+	if err != nil {
+		return fmt.Errorf("retire FuseKit tenant: %w", err)
+	}
+	if response.Tenant != tenantID || response.Generation != catalog.Generation(removal.AccountGeneration) ||
+		!response.FileProviderAbsent {
+		return errors.New("retire FuseKit tenant: invalid proof")
 	}
 	c.forgetTenant(tenantID)
-	return c.server.m.FinishAccountRemoval(ctx, removal)
+	return c.server.m.FinishAccountRemoval(ctx, removal, presentation.Identity.PublicPath)
 }
 
 func (s *Server) prepareTenant(
 	ctx context.Context,
 	account store.Account,
+	lease tenantfs.PreparationLease,
 ) (catalogproto.TenantPreparationProof, error) {
 	if s.prepareAccount != nil {
-		return s.prepareAccount(ctx, account)
+		return s.prepareAccount(ctx, account, lease)
 	}
 	if s.tenantCoordinator == nil {
 		return catalogproto.TenantPreparationProof{}, errors.New("FuseKit tenant coordinator is unavailable")
 	}
-	return s.tenantCoordinator.prepare(ctx, account)
+	return s.tenantCoordinator.prepare(ctx, account, lease)
 }
 
-func (s *Server) prepareReservedAccountProof(
-	ctx context.Context,
-	reservation store.PendingAccountReservation,
-) (store.PresentationPreparationProof, error) {
-	account := store.Account{
-		ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
-	}
-	var proof catalogproto.TenantPreparationProof
-	var err error
-	if s.prepareReservedAccount != nil {
-		proof, err = s.prepareReservedAccount(ctx, reservation)
-	} else {
-		proof, err = s.prepareTenant(ctx, account)
-	}
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	activate := func() error { return nil }
-	if s.activatePrepared != nil {
-		err = s.activatePrepared(ctx, account, proof, activate)
-	} else if s.tenantCoordinator != nil {
-		err = s.tenantCoordinator.activatePrepared(ctx, account, proof, activate)
-	} else {
-		err = errors.New("FuseKit tenant coordinator is unavailable")
-	}
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	storedProof, err := projectPreparationProof(proof)
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	if err := validateReservedPreparationProof(reservation, storedProof); err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	return storedProof, nil
-}
-
-func (s *Server) prepareAccountProof(
-	ctx context.Context,
-	account store.Account,
-) (store.PresentationPreparationProof, error) {
-	proof, err := s.prepareTenant(ctx, account)
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	activate := func() error { return nil }
-	if s.activatePrepared != nil {
-		err = s.activatePrepared(ctx, account, proof, activate)
-	} else if s.tenantCoordinator != nil {
-		err = s.tenantCoordinator.activatePrepared(ctx, account, proof, activate)
-	} else {
-		err = errors.New("FuseKit tenant coordinator is unavailable")
-	}
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	return projectPreparationProof(proof)
-}
-
-func (s *Server) revalidatePreparationProof(
-	ctx context.Context,
-	account store.Account,
-	storedProof store.PresentationPreparationProof,
-) error {
-	proof, err := catalogPreparationProof(storedProof)
-	if err != nil {
-		return err
-	}
-	activate := func() error { return nil }
-	if s.activatePrepared != nil {
-		return s.activatePrepared(ctx, account, proof, activate)
-	}
-	if s.tenantCoordinator == nil {
-		return errors.New("FuseKit tenant coordinator is unavailable")
-	}
-	return s.tenantCoordinator.activatePrepared(ctx, account, proof, activate)
-}
-
-func projectPreparationProof(
+func projectPreparationIdentity(
 	proof catalogproto.TenantPreparationProof,
-) (store.PresentationPreparationProof, error) {
+) (store.FileProviderPresentationIdentity, error) {
 	publicPath, err := tenantfs.FileProviderPublicPath(proof)
 	if err != nil {
-		return store.PresentationPreparationProof{}, err
+		return store.FileProviderPresentationIdentity{}, err
 	}
 	fileProvider := proof.Presentation.FileProvider
 	if fileProvider == nil {
-		return store.PresentationPreparationProof{}, tenantfs.ErrPreparationConflict
+		return store.FileProviderPresentationIdentity{}, tenantfs.ErrPreparationConflict
 	}
-	return store.PresentationPreparationProof{
-		CatalogTenantID:   string(proof.Catalog.Tenant),
-		CatalogGeneration: proof.Catalog.Generation,
-		Requested:         proof.Catalog.Requested,
-		Desired:           proof.Catalog.Desired,
-		Observed:          proof.Catalog.Observed,
-		Verified:          proof.Catalog.Verified,
-		Applied:           proof.Catalog.Applied,
-		SourceAuthority:   string(proof.SourceAuthority),
-		SourceRevision:    proof.SourceRevision,
-		CatalogRevision:   proof.CatalogRevision,
-		ChangeID:          string(proof.ChangeID),
-		OperationID:       string(proof.OperationID),
-		PresentationKind:  store.PresentationKindFileProvider,
-		FileProvider: store.FileProviderPreparationProof{
-			TenantID:             string(fileProvider.TenantID),
-			DomainID:             string(fileProvider.DomainID),
-			Generation:           fileProvider.Generation,
-			ActivationGeneration: fileProvider.ActivationGeneration,
-			PublicPath:           publicPath,
-		},
+	return store.FileProviderPresentationIdentity{
+		TenantID: string(fileProvider.TenantID), DomainID: string(fileProvider.DomainID),
+		Generation: fileProvider.Generation, PublicPath: publicPath,
 	}, nil
-}
-
-func catalogPreparationProof(
-	proof store.PresentationPreparationProof,
-) (catalogproto.TenantPreparationProof, error) {
-	if proof.PresentationKind != store.PresentationKindFileProvider ||
-		proof.FileProvider.TenantID == "" || proof.FileProvider.DomainID == "" ||
-		proof.FileProvider.Generation == 0 || proof.FileProvider.ActivationGeneration == "" {
-		return catalogproto.TenantPreparationProof{}, tenantfs.ErrPreparationConflict
-	}
-	if err := tenantfs.ValidateFileProviderPublicPath(proof.FileProvider.PublicPath); err != nil {
-		return catalogproto.TenantPreparationProof{}, err
-	}
-	return catalogproto.TenantPreparationProof{
-		Catalog: catalogproto.CatalogLaneProof{
-			Tenant:     catalogproto.TenantID(proof.CatalogTenantID),
-			Generation: proof.CatalogGeneration,
-			Requested:  proof.Requested,
-			Desired:    proof.Desired,
-			Observed:   proof.Observed,
-			Verified:   proof.Verified,
-			Applied:    proof.Applied,
-		},
-		Presentation: catalogproto.PresentationProof{
-			Kind: catalogproto.PresentationKindFileProvider,
-			FileProvider: &catalogproto.FileProviderPresentationProof{
-				TenantID:             catalogproto.TenantID(proof.FileProvider.TenantID),
-				DomainID:             catalogproto.DomainID(proof.FileProvider.DomainID),
-				Generation:           proof.FileProvider.Generation,
-				PublicPath:           proof.FileProvider.PublicPath,
-				ActivationGeneration: proof.FileProvider.ActivationGeneration,
-			},
-		},
-		SourceAuthority: catalogproto.SourceAuthorityID(proof.SourceAuthority),
-		SourceRevision:  proof.SourceRevision,
-		CatalogRevision: proof.CatalogRevision,
-		ChangeID:        catalogproto.ChangeID(proof.ChangeID),
-		OperationID:     catalogproto.OperationID(proof.OperationID),
-	}, nil
-}
-
-func validateReservedPreparationProof(
-	reservation store.PendingAccountReservation,
-	proof store.PresentationPreparationProof,
-) error {
-	account := tenantfs.Account{InstanceID: reservation.InstanceID, Generation: reservation.Generation}
-	tenantID, err := account.TenantID()
-	if err != nil {
-		return err
-	}
-	domainID, err := catalogproto.DeriveDomainID(
-		tenantfs.OwnerID,
-		catalogproto.PresentationInstanceID(reservation.InstanceID),
-	)
-	if err != nil {
-		return err
-	}
-	if proof.CatalogTenantID != string(tenantID) || proof.FileProvider.TenantID != string(tenantID) ||
-		proof.FileProvider.DomainID != string(domainID) ||
-		proof.CatalogGeneration != reservation.Generation ||
-		proof.FileProvider.Generation != reservation.Generation {
-		return tenantfs.ErrPreparationConflict
-	}
-	return nil
 }
 
 func (c *tenantCoordinator) activatePrepared(
 	ctx context.Context,
 	account store.Account,
+	lease tenantfs.PreparationLease,
 	proof catalogproto.TenantPreparationProof,
 	activate func() error,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := c.preparer.Validate(ctx, pool.TenantAccount(account), proof); err != nil {
+	if err := c.preparer.Validate(ctx, pool.TenantAccount(account), lease, proof); err != nil {
 		return err
 	}
 	return activate()

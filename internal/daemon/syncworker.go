@@ -54,7 +54,7 @@ type hostSyncWorkerRemover struct {
 	manager   *pool.Manager
 
 	mu          sync.Mutex
-	client      *tenantfs.Client
+	client      *tenantfs.ControlClient
 	coordinator *tenantCoordinator
 	cancel      context.CancelCauseFunc
 }
@@ -84,53 +84,42 @@ func (r *hostSyncWorkerRemover) PrepareReservedAccount(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
 	label string,
-) (store.PresentationPreparationProof, error) {
+) (store.FileProviderPresentationIdentity, error) {
 	coordinator, err := r.runtime(ctx)
 	if err != nil {
-		return store.PresentationPreparationProof{}, err
+		return store.FileProviderPresentationIdentity{}, err
+	}
+	configDir, err := pool.AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		return store.FileProviderPresentationIdentity{}, fmt.Errorf("derive stable account config dir: %w", err)
 	}
 	account := store.Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, Label: label,
+		Generation: reservation.Generation, ConfigDir: configDir, Label: label,
 	}
-	proof, err := coordinator.prepare(ctx, account)
+	tenantAccount := pool.TenantAccount(account)
+	if err := coordinator.ensureTenant(ctx, account, tenantAccount); err != nil {
+		return store.FileProviderPresentationIdentity{}, err
+	}
+	identity, err := expectedPresentationIdentity(account)
 	if err != nil {
-		return store.PresentationPreparationProof{}, err
+		return store.FileProviderPresentationIdentity{}, err
 	}
-	if err := coordinator.activatePrepared(ctx, account, proof, func() error { return nil }); err != nil {
-		return store.PresentationPreparationProof{}, err
+	if err := store.ValidateReservedPresentationIdentity(reservation, identity); err != nil {
+		return store.FileProviderPresentationIdentity{}, err
 	}
-	storedProof, err := projectPreparationProof(proof)
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	if err := validateReservedPreparationProof(reservation, storedProof); err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	return storedProof, nil
+	return identity, nil
 }
 
-func (r *hostSyncWorkerRemover) RefreshPreparedAccount(
+func (r *hostSyncWorkerRemover) AbortReservedAccount(
 	ctx context.Context,
-	account store.Account,
-	retained store.PresentationPreparationProof,
-) (store.PresentationPreparationProof, error) {
+	reservation store.PendingAccountReservation,
+) (pool.PendingAddRetirementProof, error) {
 	coordinator, err := r.runtime(ctx)
 	if err != nil {
-		return store.PresentationPreparationProof{}, err
+		return pool.PendingAddRetirementProof{}, err
 	}
-	freshCatalogProof, err := coordinator.prepare(ctx, account)
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	fresh, err := projectPreparationProof(freshCatalogProof)
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	if err := store.ValidatePresentationPreparationProofAdvance(retained, fresh); err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	return fresh, nil
+	return coordinator.retireReservedAccount(ctx, reservation)
 }
 
 func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator, error) {
@@ -139,20 +128,15 @@ func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator
 	if r.coordinator != nil {
 		return r.coordinator, nil
 	}
-	client, err := tenantfs.NewClient(ctx, pool.FuseKitSocketPath())
+	client, err := tenantfs.NewControlClient(ctx, pool.FuseKitSocketPath())
 	if err != nil {
 		return nil, fmt.Errorf("connect FuseKit runtime: %w", err)
-	}
-	preparer, err := tenantfs.NewPreparer(client)
-	if err != nil {
-		_ = client.Close()
-		return nil, err
 	}
 	server := &Server{m: r.manager}
 	lifecycle, cancel := contextWithoutCancelUntil(ctx, r.lifecycle.Done())
 	r.client = client
 	r.cancel = cancel
-	r.coordinator = newTenantCoordinator(lifecycle, server, preparer, client)
+	r.coordinator = newTenantCoordinator(lifecycle, server, nil, client)
 	return r.coordinator, nil
 }
 

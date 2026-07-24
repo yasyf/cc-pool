@@ -20,22 +20,35 @@ func TestPromoteSyncedAddLostResponseResolvesWithoutCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	configDir := filepath.Join(t.TempDir(), "CloudStorage", "cc-pool-acct-01")
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
+	publicPath := filepath.Join(mustHome(), "Library", "CloudStorage", "cc-pool-acct-01")
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	prospective := store.Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: configDir,
+		Generation: reservation.Generation,
 	}
 	pending, err := manager.PrepareReservedSyncedAdd(
-		t.Context(), reservation, syncedAdmissionProof(prospective, "activation-promotion"),
+		t.Context(), reservation, syncedAdmissionProof(prospective, publicPath),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantConfigDir, err := AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantService, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.ConfigDir != wantConfigDir || pending.PublicPath != publicPath ||
+		pending.KeychainService != wantService {
+		t.Fatalf("synced pending identity = %+v", pending)
+	}
+	assertLinkTarget(t, pending.ConfigDir, publicPath)
 	identity := json.RawMessage(`{"accountUuid":"promotion-uuid"}`)
-	if err := manager.WriteIdentity(t.Context(), reservation.ID, configDir, identity); err != nil {
+	if err := manager.WriteIdentity(t.Context(), reservation.ID, pending.ConfigDir, identity); err != nil {
 		t.Fatal(err)
 	}
 	promoteSyncedAddFailpoint = func(checkpoint string) error {
@@ -138,7 +151,7 @@ func TestAdmitSyncedCredentialPersistsExactEvidenceAndRetriesAfterReopen(t *test
 		t.Fatalf("admitted health = %+v err=%v", health, err)
 	}
 	presentation, err := reopened.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != freshProof {
+	if err != nil || presentation.Identity != freshProof {
 		t.Fatalf("admitted proof = %+v err=%v", presentation, err)
 	}
 	evidence, err := reopened.SyncedCredentialAdmission(account)
@@ -156,7 +169,6 @@ func TestAdmitSyncedCredentialPersistsExactEvidenceAndRetriesAfterReopen(t *test
 	rotated.ClaudeAiOauth.AccessToken = "synced-access-rotated"
 	fake.Put(account.KeychainService, account.KeychainAccount, &rotated)
 	nextProof := freshProof
-	nextProof.FileProvider.ActivationGeneration = "activation-C"
 	admitted, err = manager.AdmitSyncedCredential(
 		t.Context(), account, freshProof, nextProof, creds.AccessHash(&rotated),
 	)
@@ -346,15 +358,7 @@ func TestAdmitSyncedCredentialInvalidatesSettledEvidenceAfterReplacementAndLostR
 		t.Fatalf("lost settle response admission = %v err=%v", admitted, err)
 	}
 	assertSyncedAdmissionFinal(t, manager.Store, account, freshProof)
-	if err := manager.Store.ActivateSelection(store.SelectionActivation{
-		Token:     "abcdef0123456789abcdef0123456789",
-		AccountID: account.ID, ExpectedInstanceID: account.InstanceID,
-		ExpectedGeneration: account.Generation,
-		Process:            store.ProcessIdentity{PID: os.Getpid(), StartedAt: time.Now()},
-		ConfigDir:          account.ConfigDir,
-	}); err != nil {
-		t.Fatalf("activate existing session before drift reconciliation: %v", err)
-	}
+	activatePoolTestSession(t, manager, account.ID, os.Getpid(), "", time.Now())
 	if err := manager.Store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -407,15 +411,7 @@ func TestAdmitSyncedCredentialRefusesLiveSession(t *testing.T) {
 	if err != nil || !admitted {
 		t.Fatalf("establish selectable admission = %v err=%v", admitted, err)
 	}
-	if err := manager.Store.ActivateSelection(store.SelectionActivation{
-		Token:     "0123456789abcdef0123456789abcdef",
-		AccountID: account.ID, ExpectedInstanceID: account.InstanceID,
-		ExpectedGeneration: account.Generation,
-		Process:            store.ProcessIdentity{PID: os.Getpid(), StartedAt: time.Now()},
-		ConfigDir:          account.ConfigDir, At: time.Now(),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	activatePoolTestSession(t, manager, account.ID, os.Getpid(), "", time.Now())
 	if _, err := manager.Store.SetNeedsLogin(
 		account.ID, time.Now(), store.AuthReasonAwaitingOrigin,
 		store.DigestReason("origin rotated during live session"), store.AuthKindAwaitingOrigin,
@@ -423,7 +419,6 @@ func TestAdmitSyncedCredentialRefusesLiveSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	nextProof := freshProof
-	nextProof.FileProvider.ActivationGeneration = "activation-C"
 	admitted, err = manager.AdmitSyncedCredential(
 		t.Context(), account, freshProof, nextProof, creds.AccessHash(credential),
 	)
@@ -435,7 +430,7 @@ func TestAdmitSyncedCredentialRefusesLiveSession(t *testing.T) {
 		t.Fatalf("live-session admission health = %+v err=%v", health, err)
 	}
 	presentation, err := manager.Store.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != freshProof {
+	if err != nil || presentation.Identity != freshProof {
 		t.Fatalf("live-session admission proof = %+v err=%v", presentation, err)
 	}
 	if _, err := manager.Store.SyncedCredentialAdmission(account); err != nil {
@@ -445,7 +440,7 @@ func TestAdmitSyncedCredentialRefusesLiveSession(t *testing.T) {
 
 func syncedAdmissionFixture(
 	t *testing.T,
-) (*Manager, *credstest.Fake, store.Account, store.PresentationPreparationProof, store.PresentationPreparationProof, *creds.Credential, string) {
+) (*Manager, *credstest.Fake, store.Account, store.FileProviderPresentationIdentity, store.FileProviderPresentationIdentity, *creds.Credential, string) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -464,22 +459,32 @@ func syncedAdmissionFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	configDir := filepath.Join(home, "Library", "CloudStorage", "cc-pool-acct-01")
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
+	publicPath := filepath.Join(home, "Library", "CloudStorage", "cc-pool-acct-01")
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configDir, err := AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keychainService, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
 		t.Fatal(err)
 	}
 	account := store.Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
 		Generation: reservation.Generation, ConfigDir: configDir,
-		KeychainService: "synced-service", KeychainAccount: creds.AccountLabel(),
+		KeychainService: keychainService, KeychainAccount: creds.AccountLabel(),
 		Label: "synced", AccountUUID: "synced-uuid", CreatedAt: time.Now(),
 	}
-	currentProof := syncedAdmissionProof(account, "activation-A")
+	currentProof := syncedAdmissionProof(account, publicPath)
 	if err := st.PromoteReservedSyncedAccount(reservation, account, currentProof); err != nil {
 		t.Fatal(err)
 	}
 	freshProof := currentProof
-	freshProof.FileProvider.ActivationGeneration = "activation-B"
 	credential := &creds.Credential{ClaudeAiOauth: creds.OAuth{
 		AccessToken: "synced-access", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
 	}}
@@ -489,20 +494,12 @@ func syncedAdmissionFixture(
 
 func syncedAdmissionProof(
 	account store.Account,
-	activation string,
-) store.PresentationPreparationProof {
+	publicPath string,
+) store.FileProviderPresentationIdentity {
 	tenantID := "account-" + account.InstanceID
-	return store.PresentationPreparationProof{
-		CatalogTenantID: tenantID, CatalogGeneration: account.Generation,
-		Requested: 1, Desired: 1, Observed: 1, Verified: 1, Applied: 1,
-		SourceAuthority: "source-authority", SourceRevision: 1, CatalogRevision: 1,
-		ChangeID: "change-id", OperationID: "operation-id",
-		PresentationKind: store.PresentationKindFileProvider,
-		FileProvider: store.FileProviderPreparationProof{
-			TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
-			Generation: account.Generation, ActivationGeneration: activation,
-			PublicPath: account.ConfigDir,
-		},
+	return store.FileProviderPresentationIdentity{
+		TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
+		Generation: account.Generation, PublicPath: publicPath,
 	}
 }
 
@@ -510,7 +507,7 @@ func assertSyncedAdmissionPending(
 	t *testing.T,
 	st *store.Store,
 	account store.Account,
-	wantProof store.PresentationPreparationProof,
+	wantProof store.FileProviderPresentationIdentity,
 ) {
 	t.Helper()
 	health, err := st.GetAuthHealth(account.ID)
@@ -518,7 +515,7 @@ func assertSyncedAdmissionPending(
 		t.Fatalf("pending health = %+v err=%v", health, err)
 	}
 	presentation, err := st.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != wantProof {
+	if err != nil || presentation.Identity != wantProof {
 		t.Fatalf("pending proof = %+v err=%v", presentation, err)
 	}
 	if _, err := st.SyncedCredentialAdmission(account); !errors.Is(err, sql.ErrNoRows) {
@@ -530,7 +527,7 @@ func assertSyncedAdmissionLiability(
 	t *testing.T,
 	st *store.Store,
 	account store.Account,
-	wantProof store.PresentationPreparationProof,
+	wantProof store.FileProviderPresentationIdentity,
 ) {
 	t.Helper()
 	health, err := st.GetAuthHealth(account.ID)
@@ -538,7 +535,7 @@ func assertSyncedAdmissionLiability(
 		t.Fatalf("pending liability health = %+v err=%v", health, err)
 	}
 	presentation, err := st.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != wantProof {
+	if err != nil || presentation.Identity != wantProof {
 		t.Fatalf("pending liability proof = %+v err=%v", presentation, err)
 	}
 	pending, err := st.PendingSyncedCredentialAdmission(account)
@@ -561,7 +558,7 @@ func assertSyncedAdmissionCandidate(
 	t *testing.T,
 	st *store.Store,
 	account store.Account,
-	wantProof store.PresentationPreparationProof,
+	wantProof store.FileProviderPresentationIdentity,
 ) {
 	t.Helper()
 	health, err := st.GetAuthHealth(account.ID)
@@ -569,7 +566,7 @@ func assertSyncedAdmissionCandidate(
 		t.Fatalf("candidate health = %+v err=%v", health, err)
 	}
 	presentation, err := st.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != wantProof {
+	if err != nil || presentation.Identity != wantProof {
 		t.Fatalf("candidate proof = %+v err=%v", presentation, err)
 	}
 	pending, err := st.PendingSyncedCredentialAdmission(account)
@@ -592,7 +589,7 @@ func assertSyncedAdmissionFinal(
 	t *testing.T,
 	st *store.Store,
 	account store.Account,
-	wantProof store.PresentationPreparationProof,
+	wantProof store.FileProviderPresentationIdentity,
 ) {
 	t.Helper()
 	health, err := st.GetAuthHealth(account.ID)
@@ -600,7 +597,7 @@ func assertSyncedAdmissionFinal(
 		t.Fatalf("final admission health = %+v err=%v", health, err)
 	}
 	presentation, err := st.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != wantProof {
+	if err != nil || presentation.Identity != wantProof {
 		t.Fatalf("final admission proof = %+v err=%v", presentation, err)
 	}
 	if _, err := st.SyncedCredentialAdmission(account); err != nil {

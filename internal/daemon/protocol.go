@@ -429,6 +429,7 @@ type Response struct {
 	Error             string  `json:"error,omitempty"`
 	Dir               string  `json:"dir,omitempty"` // select: chosen config dir
 	SelectedID        *int    `json:"selected_id,omitempty"`
+	Prepared          bool    `json:"prepared,omitempty"`
 	ReservationToken  string  `json:"reservation_token,omitempty"`
 	AccountInstanceID string  `json:"account_instance_id,omitempty"`
 	AccountGeneration uint64  `json:"account_generation,omitempty"`

@@ -10,7 +10,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +20,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalogproto"
@@ -117,30 +117,15 @@ func TestAccountMutationAddReceiptZeroScopeReplaysWithoutReservationOrCredential
 	}
 }
 
-func TestAccountMutationAddCommitsAndRevalidatesExactPresentationAfterLostResponse(t *testing.T) {
+func TestAccountMutationAddCommitsOneImmutablePresentationIdentity(t *testing.T) {
 	s, fake, _ := newAccountMutationTestServer(t, false)
 	var preparations atomic.Int64
-	s.prepareReservedAccount = func(
+	s.provisionPresentationIdentity = func(
 		_ context.Context,
-		reservation store.PendingAccountReservation,
-	) (catalogproto.TenantPreparationProof, error) {
-		account := store.Account{
-			ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
-		}
-		proof := daemonTestPreparationProof(
-			account,
-			fmt.Sprintf("/Users/test/Library/CloudStorage/cc-pool-account-%d", account.ID),
-		)
-		proof.Presentation.FileProvider.ActivationGeneration = fmt.Sprintf(
-			"activation-%d", preparations.Add(1),
-		)
-		return proof, nil
-	}
-	s.prepareAccount = func(
-		context.Context,
-		store.Account,
-	) (catalogproto.TenantPreparationProof, error) {
-		return catalogproto.TenantPreparationProof{}, errors.New("holder stopped after account commit")
+		account store.Account,
+	) (store.FileProviderPresentationIdentity, error) {
+		preparations.Add(1)
+		return accountMutationTestPresentation(t, account)
 	}
 	request := AccountMutationRequest{
 		Kind: AccountMutationAdd, Action: AccountMutationStartOrAttach, Label: "new-account",
@@ -152,6 +137,40 @@ func TestAccountMutationAddCommitsAndRevalidatesExactPresentationAfterLostRespon
 	mutation, err := s.m.Store.AccountMutation(store.AccountMutationID(begin.OperationID))
 	if err != nil {
 		t.Fatal(err)
+	}
+	wantConfigDir, err := pool.AccountConfigDir(mutation.AccountInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantService, err := pool.AccountKeychainService(mutation.AccountInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutation.ConfigDir != wantConfigDir || mutation.KeychainService != wantService ||
+		mutation.PresentationIdentity.PublicPath == mutation.ConfigDir {
+		t.Fatalf("add execution/presentation identity = %+v", mutation)
+	}
+	if target, err := os.Readlink(mutation.ConfigDir); err != nil || target != mutation.PresentationIdentity.PublicPath {
+		t.Fatalf("stable execution link before add input = %q, %v", target, err)
+	}
+	touched := fake.TouchedServices()
+	for _, service := range touched {
+		if service != wantService {
+			t.Fatalf("add touched presentation-derived credential service %q; stable=%q", service, wantService)
+		}
+	}
+	if _, ok := fake.Get(creds.ServiceName(mutation.PresentationIdentity.PublicPath), mutation.KeychainAccount); ok {
+		t.Fatal("add probed a presentation-derived credential slot")
+	}
+	replayed, err := runAccountMutationTest(t, s, request, nil)
+	if err != nil || replayed.OperationID != begin.OperationID || replayed.ConfigDir != wantConfigDir {
+		t.Fatalf("replayed add bind = %+v err=%v", replayed, err)
+	}
+	if len(fake.TouchedServices()) != len(touched) {
+		t.Fatal("replayed add bind repeated credential I/O")
+	}
+	if target, err := os.Readlink(mutation.ConfigDir); err != nil || target != mutation.PresentationIdentity.PublicPath {
+		t.Fatalf("replayed stable execution link = %q, %v", target, err)
 	}
 	fence, err := s.m.Store.MarkAccountMutationInputProvided(
 		mutation.Fence(), accountMutationInputDigest(mutation.OperationID),
@@ -166,10 +185,14 @@ func TestAccountMutationAddCommitsAndRevalidatesExactPresentationAfterLostRespon
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.m.PrepareReservedAdd(
-		t.Context(), accountMutationReservation(mutation), mutation.ConfigDir,
-	); err != nil {
+	pending, err := s.m.PrepareReservedAdd(
+		t.Context(), accountMutationReservation(mutation), mutation.PresentationIdentity.PublicPath,
+	)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if pending.ConfigDir != mutation.ConfigDir || pending.KeychainService != mutation.KeychainService {
+		t.Fatalf("prepared add identity = %+v, mutation = %+v", pending, mutation)
 	}
 	credential := &creds.Credential{}
 	credential.ClaudeAiOauth.AccessToken = "add-access"
@@ -183,83 +206,203 @@ func TestAccountMutationAddCommitsAndRevalidatesExactPresentationAfterLostRespon
 		t.Fatal(err)
 	}
 	completed, err := s.finishAccountMutation(t.Context(), mutation)
-	if err == nil || completed.Completed || !strings.Contains(err.Error(), "holder stopped after account commit") {
-		t.Fatalf("lost add response = %+v err=%v", completed, err)
+	if err != nil || !completed.Completed {
+		t.Fatalf("completed add = %+v err=%v", completed, err)
 	}
-	if preparations.Load() < 3 {
-		t.Fatalf("add preparation refreshes = %d, want bind and publish refreshes", preparations.Load())
+	if preparations.Load() != 1 {
+		t.Fatalf("presentation provisions = %d, want one", preparations.Load())
 	}
 	receipt, err := s.m.Store.AccountMutationReceipt(store.AccountMutationID(begin.OperationID))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !receipt.PublicationPending {
-		t.Fatal("lost add response cleared publication fence")
+	if receipt.PublicationPending {
+		t.Fatal("completed add retained publication fence")
 	}
 	presentation, err := s.m.Store.AccountPresentation(receipt.AccountID)
-	if err != nil || presentation.Proof != receipt.PresentationProof {
+	if err != nil || presentation.Identity != receipt.PresentationIdentity {
 		t.Fatalf("committed presentation = %+v receipt=%+v err=%v", presentation, receipt, err)
 	}
-	if active, err := s.m.Store.ListActiveAccounts(); err != nil || len(active) != 0 {
-		t.Fatalf("publication-pending active accounts = %+v err=%v", active, err)
-	}
-	var validations atomic.Int64
-	var settlements atomic.Int64
-	s.m.SettleCredentialWrite = func(context.Context, pool.CredentialWriteSettlement) error {
-		settlements.Add(1)
-		return nil
-	}
-	restarted := &Server{
-		m: s.m, log: log.New(io.Discard, "", 0),
-		prepareAccount: func(
-			_ context.Context,
-			account store.Account,
-		) (catalogproto.TenantPreparationProof, error) {
-			proof := daemonTestPreparationProof(account, account.ConfigDir)
-			proof.Presentation.FileProvider.ActivationGeneration = "activation-after-restart"
-			return proof, nil
-		},
-		activatePrepared: func(
-			_ context.Context,
-			_ store.Account,
-			proof catalogproto.TenantPreparationProof,
-			activate func() error,
-		) error {
-			got, err := projectPreparationProof(proof)
-			if err != nil {
-				return err
-			}
-			if err := store.ValidatePresentationPreparationProofAdvance(
-				presentation.Proof, got,
-			); err != nil {
-				return err
-			}
-			validations.Add(1)
-			return activate()
-		},
-	}
-	if err := restarted.recoverPendingAccountMutationPublications(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	receipt, err = s.m.Store.AccountMutationReceipt(receipt.OperationID)
-	if err != nil || receipt.PublicationPending || validations.Load() != 1 || settlements.Load() != 1 {
-		t.Fatalf(
-			"automatic publication recovery = %+v validations=%d settlements=%d err=%v",
-			receipt, validations.Load(), settlements.Load(), err,
-		)
-	}
 	if active, err := s.m.Store.ListActiveAccounts(); err != nil || len(active) != 1 || active[0].ID != receipt.AccountID {
-		t.Fatalf("recovered active accounts = %+v err=%v", active, err)
+		t.Fatalf("active accounts = %+v err=%v", active, err)
 	}
 	request.Action = AccountMutationStartOrAttach
 	request.Fence = AccountMutationFence{}
-	replayed, err := runAccountMutationTest(t, restarted, request, nil)
-	if err != nil || !replayed.Completed || replayed.OperationID != begin.OperationID ||
-		validations.Load() != 2 || settlements.Load() != 1 {
-		t.Fatalf(
-			"lost-response replay = %+v validations=%d settlements=%d err=%v",
-			replayed, validations.Load(), settlements.Load(), err,
-		)
+	replayed, err = runAccountMutationTest(t, s, request, nil)
+	if err != nil || !replayed.Completed || replayed.OperationID != begin.OperationID {
+		t.Fatalf("receipt replay = %+v err=%v", replayed, err)
+	}
+}
+
+func TestAccountMutationAddStableIdentitySurvivesStoreReopen(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dbPath := filepath.Join(t.TempDir(), "account-mutation-restart.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _, _ := newAccountMutationTestServerWithStore(t, st, false)
+	request := AccountMutationRequest{
+		Kind: AccountMutationAdd, Action: AccountMutationStartOrAttach, Label: "restart-account",
+	}
+	begin, err := runAccountMutationTest(t, s, request, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.OpenReadOnly(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reopened.Close() }()
+	mutation, err := reopened.AccountMutation(store.AccountMutationID(begin.OperationID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantConfigDir, err := pool.AccountConfigDir(mutation.AccountInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantService, err := pool.AccountKeychainService(mutation.AccountInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutation.ConfigDir != wantConfigDir || mutation.KeychainService != wantService ||
+		mutation.PresentationIdentity.PublicPath == wantConfigDir {
+		t.Fatalf("reopened add identity = %+v", mutation)
+	}
+	if target, err := os.Readlink(wantConfigDir); err != nil || target != mutation.PresentationIdentity.PublicPath {
+		t.Fatalf("reopened stable execution link = %q, %v", target, err)
+	}
+}
+
+func TestAccountMutationAddExecutionConflictRetainsStableReplayState(t *testing.T) {
+	s, _, _ := newAccountMutationTestServer(t, false)
+	var injected atomic.Bool
+	var conflictedPath string
+	s.provisionPresentationIdentity = func(
+		_ context.Context,
+		account store.Account,
+	) (store.FileProviderPresentationIdentity, error) {
+		identity, err := accountMutationTestPresentation(t, account)
+		if err != nil || injected.Swap(true) {
+			return identity, err
+		}
+		conflictedPath = account.ConfigDir
+		if err := os.MkdirAll(filepath.Dir(conflictedPath), 0o700); err != nil {
+			return store.FileProviderPresentationIdentity{}, err
+		}
+		if err := os.Symlink("/foreign/presentation", conflictedPath); err != nil {
+			return store.FileProviderPresentationIdentity{}, err
+		}
+		return identity, nil
+	}
+	request := AccountMutationRequest{
+		Kind: AccountMutationAdd, Action: AccountMutationStartOrAttach, Label: "failed-account",
+	}
+	if _, err := runAccountMutationTest(t, s, request, nil); err == nil {
+		t.Fatal("add bind unexpectedly replaced a foreign execution link")
+	}
+	mutation, err := s.m.Store.ActiveAccountMutation(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations, err := s.m.Store.PendingAddIndexes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reservations) != 1 || reservations[0] != mutation.AccountID {
+		t.Fatalf("failed bind did not retain exact reservation: %v", reservations)
+	}
+	if mutation.State != store.AccountMutationAwaitingPresentation {
+		t.Fatalf("failed bind mutation = %+v", mutation)
+	}
+	configDir, err := pool.AccountConfigDir(mutation.AccountInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := expectedPresentationIdentity(store.Account{
+		ID: mutation.AccountID, InstanceID: mutation.AccountInstanceID, Generation: mutation.AccountGeneration,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configDir != conflictedPath {
+		t.Fatalf("conflicted path = %q, stable path = %q", conflictedPath, configDir)
+	}
+	if target, err := os.Readlink(configDir); err != nil || target != "/foreign/presentation" {
+		t.Fatalf("foreign execution link = %q, %v", target, err)
+	}
+	if err := os.Remove(configDir); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := runAccountMutationTest(t, s, request, nil)
+	if err != nil || replayed.OperationID != [32]byte(mutation.OperationID) ||
+		replayed.State != AccountMutationAwaitingInput || replayed.ConfigDir != configDir {
+		t.Fatalf("replayed bind = %+v err=%v", replayed, err)
+	}
+	if target, err := os.Readlink(configDir); err != nil || target != identity.PublicPath {
+		t.Fatalf("replayed stable execution link = %q, %v", target, err)
+	}
+}
+
+func TestAccountMutationAddRetiresUnboundPresentationBeforeCancellation(t *testing.T) {
+	s, _, _ := newAccountMutationTestServer(t, false)
+	ctx, cancel := context.WithCancel(t.Context())
+	var publicPath string
+	var retired store.PendingAccountReservation
+	s.provisionPresentationIdentity = func(
+		_ context.Context,
+		account store.Account,
+	) (store.FileProviderPresentationIdentity, error) {
+		identity, err := accountMutationTestPresentation(t, account)
+		if err != nil {
+			return store.FileProviderPresentationIdentity{}, err
+		}
+		publicPath = identity.PublicPath
+		identity.TenantID = "invalid-tenant"
+		cancel()
+		return identity, nil
+	}
+	s.m.RetirePendingAdd = func(
+		cleanup context.Context,
+		reservation store.PendingAccountReservation,
+	) (pool.PendingAddRetirementProof, error) {
+		if err := cleanup.Err(); err != nil {
+			return pool.PendingAddRetirementProof{}, fmt.Errorf("cleanup inherited cancellation: %w", err)
+		}
+		retired = reservation
+		return pool.PendingAddRetirementProof{
+			AccountID: reservation.ID, AccountInstanceID: reservation.InstanceID,
+			AccountGeneration: reservation.Generation, PublicPath: publicPath,
+		}, nil
+	}
+	request := AccountMutationRequest{
+		Kind: AccountMutationAdd, Action: AccountMutationStartOrAttach, Label: "cancel-account",
+	}
+	input := make(chan wire.Chunk)
+	close(input)
+	if _, err := s.runAccountMutation(ctx, request, input, make(chan []byte, 8)); err == nil {
+		t.Fatal("invalid presentation bind unexpectedly succeeded")
+	}
+	if retired.ID != 1 {
+		t.Fatalf("retired reservation = %+v, want acct-01", retired)
+	}
+	if _, err := s.m.Store.ActiveAccountMutation(1); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unbound mutation survived exact retirement: %v", err)
+	}
+	indexes, err := s.m.Store.PendingAddIndexes()
+	if err != nil || len(indexes) != 0 {
+		t.Fatalf("pending reservation after exact retirement = %v err=%v", indexes, err)
+	}
+	configDir, err := pool.AccountConfigDir(retired.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(configDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stable execution link survived exact retirement: %v", err)
+	}
+	if info, err := os.Stat(publicPath); err != nil || !info.IsDir() {
+		t.Fatalf("public presentation target after retirement = %v err=%v", info, err)
 	}
 }
 
@@ -943,32 +1086,34 @@ func TestAccountMutationReceiptIntentSurvivesDerivedLabelPublication(t *testing.
 	}
 }
 
-func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) {
+func TestPresentationQuarantinedReloginRepairsPathBeforeOrdinaryLogin(t *testing.T) {
 	s, fake, account := newAccountMutationTestServer(t, true)
-	targetPath := seedAccountPresentationQuarantine(t, s, account)
-	var preparations atomic.Int64
-	s.prepareReservedAccount = func(
-		_ context.Context,
-		reservation store.PendingAccountReservation,
-	) (catalogproto.TenantPreparationProof, error) {
-		prepared := store.Account{
-			ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
-		}
-		proof := daemonTestPreparationProof(prepared, targetPath)
-		proof.Presentation.FileProvider.ActivationGeneration = fmt.Sprintf(
-			"activation-%d", preparations.Add(1),
-		)
-		return proof, nil
+	s.sessionLeases = &testSessionLeaseManager{}
+	bound, err := s.m.Store.AccountPresentation(account.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
+	home, err := pool.Home()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPath := filepath.Join(home, "Library", "CloudStorage", "CCPoolStatus-moved-acct-01")
+	if err := os.MkdirAll(targetPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	observed := bound.Identity
+	observed.PublicPath = targetPath
+	if err := s.m.Store.ObserveAccountPresentation(account, observed); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
+		t.Fatalf("seed presentation quarantine: %v", err)
+	}
+	var preparations, terminalCalls atomic.Int64
 	s.prepareAccount = func(
 		_ context.Context,
-		account store.Account,
+		got store.Account,
+		_ tenantfs.PreparationLease,
 	) (catalogproto.TenantPreparationProof, error) {
-		proof := daemonTestPreparationProof(account, targetPath)
-		proof.Presentation.FileProvider.ActivationGeneration = fmt.Sprintf(
-			"activation-%d", preparations.Add(1),
-		)
-		return proof, nil
+		preparations.Add(1)
+		return daemonTestPreparationProof(got, targetPath), nil
 	}
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		ctx context.Context,
@@ -978,18 +1123,25 @@ func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) 
 		_ <-chan wire.Chunk,
 		_ func(context.Context, []byte) error,
 	) error {
-		if mutation.Kind != store.AccountMutationPresentationRebind ||
-			mutation.AccountGeneration != account.Generation+1 || mutation.ConfigDir != targetPath {
-			t.Fatalf("terminal mutation = %+v", mutation)
+		terminalCalls.Add(1)
+		if mutation.Kind != store.AccountMutationRelogin ||
+			mutation.AccountGeneration != account.Generation ||
+			mutation.ConfigDir != account.ConfigDir ||
+			mutation.KeychainService != account.KeychainService {
+			t.Fatalf("ordinary relogin mutation = %+v", mutation)
+		}
+		if current, ok := fake.Get(account.KeychainService, account.KeychainAccount); !ok ||
+			current.ClaudeAiOauth.AccessToken != "old-access" {
+			t.Fatalf("credential changed before ordinary login: %+v", current)
 		}
 		credential := &creds.Credential{}
-		credential.ClaudeAiOauth.AccessToken = "rebound-access"
-		credential.ClaudeAiOauth.RefreshToken = "rebound-refresh"
+		credential.ClaudeAiOauth.AccessToken = "relogin-access"
+		credential.ClaudeAiOauth.RefreshToken = "relogin-refresh"
 		credential.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
 		fake.Put(mutation.KeychainService, mutation.KeychainAccount, credential)
 		return s.m.WriteIdentity(
 			ctx, mutation.AccountID, mutation.ConfigDir,
-			[]byte(`{"accountUuid":"rebound-uuid","emailAddress":"rebound@example.com"}`),
+			[]byte(`{"accountUuid":"relogin-uuid","emailAddress":"relogin@example.com"}`),
 		)
 	})
 	request := AccountMutationRequest{
@@ -997,13 +1149,34 @@ func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) 
 	}
 	begin, err := runAccountMutationTest(t, s, request, nil)
 	if err != nil || begin.Kind != AccountMutationRelogin || begin.State != AccountMutationAwaitingInput ||
-		begin.ConfigDir != targetPath || begin.Fence.AccountGeneration != account.Generation+1 {
-		t.Fatalf("rebind begin = %+v err=%v", begin, err)
+		begin.ConfigDir != account.ConfigDir || begin.Fence.AccountGeneration != account.Generation {
+		t.Fatalf("ordinary relogin begin = %+v err=%v", begin, err)
 	}
-	active, err := s.m.Store.AccountMutation(store.AccountMutationID(begin.OperationID))
-	if err != nil || active.Kind != store.AccountMutationPresentationRebind ||
-		active.PresentationProof.FileProvider.PublicPath != targetPath {
-		t.Fatalf("internal rebind = %+v err=%v", active, err)
+	if preparations.Load() != 1 || terminalCalls.Load() != 0 {
+		t.Fatalf("repair side effects: preparations=%d terminals=%d", preparations.Load(), terminalCalls.Load())
+	}
+	repaired, err := s.m.Store.GetAccount(account.ID)
+	if err != nil || repaired.InstanceID != account.InstanceID || repaired.Generation != account.Generation ||
+		repaired.ConfigDir != account.ConfigDir || repaired.KeychainService != account.KeychainService ||
+		repaired.AccountUUID != account.AccountUUID {
+		t.Fatalf("path repair changed account identity: %+v err=%v", repaired, err)
+	}
+	presentation, err := s.m.Store.AccountPresentation(account.ID)
+	if err != nil || presentation.Identity.PublicPath != targetPath {
+		t.Fatalf("repaired presentation = %+v err=%v", presentation, err)
+	}
+	if _, err := s.m.Store.AccountPresentationQuarantine(account.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("presentation quarantine survived repair: %v", err)
+	}
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != targetPath {
+		t.Fatalf("stable config target = %q, %v; want %q", target, err, targetPath)
+	}
+	if current, ok := fake.Get(account.KeychainService, account.KeychainAccount); !ok ||
+		current.ClaudeAiOauth.AccessToken != "old-access" {
+		t.Fatalf("repair moved credential: %+v", current)
+	}
+	if _, ok := fake.Get(creds.ServiceName(targetPath), account.KeychainAccount); ok {
+		t.Fatal("repair created a presentation-derived credential slot")
 	}
 	request.Action = AccountMutationProvideInput
 	request.Fence = begin.Fence
@@ -1012,93 +1185,17 @@ func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) 
 	close(input)
 	completed, err := runAccountMutationTest(t, s, request, input)
 	if err != nil || !completed.Completed || completed.Kind != AccountMutationRelogin ||
-		completed.State != AccountMutationCompleted || completed.ConfigDir != targetPath {
-		t.Fatalf("completed rebind = %+v err=%v", completed, err)
+		completed.State != AccountMutationCompleted || completed.ConfigDir != account.ConfigDir {
+		t.Fatalf("completed relogin = %+v err=%v", completed, err)
 	}
-	if preparations.Load() < 5 {
-		t.Fatalf("preparation refreshes = %d, want bind plus every durable boundary", preparations.Load())
+	if terminalCalls.Load() != 1 {
+		t.Fatalf("ordinary relogin terminals = %d, want one", terminalCalls.Load())
 	}
 	updated, err := s.m.Store.GetAccount(account.ID)
-	if err != nil || updated.Generation != account.Generation+1 || updated.ConfigDir != targetPath {
-		t.Fatalf("rebound account = %+v err=%v", updated, err)
+	if err != nil || updated.Generation != account.Generation || updated.ConfigDir != account.ConfigDir ||
+		updated.KeychainService != account.KeychainService || updated.AccountUUID != "relogin-uuid" {
+		t.Fatalf("ordinary relogin result = %+v err=%v", updated, err)
 	}
-	if _, ok := fake.Get(account.KeychainService, account.KeychainAccount); ok {
-		t.Fatal("old Keychain owner survived committed rebind")
-	}
-	if _, ok := fake.Get(updated.KeychainService, updated.KeychainAccount); !ok {
-		t.Fatal("new Keychain owner missing after committed rebind")
-	}
-	if _, err := s.m.Store.AccountPresentationQuarantine(account.ID); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("committed rebind retained presentation quarantine: %v", err)
-	}
-	request.Action = AccountMutationStartOrAttach
-	request.Fence = AccountMutationFence{}
-	replayed, err := runAccountMutationTest(t, s, request, nil)
-	if err != nil || replayed.OperationID != begin.OperationID || replayed.Kind != AccountMutationRelogin ||
-		replayed.State != AccountMutationApplying || replayed.Completed {
-		t.Fatalf("rebind replay = %+v err=%v", replayed, err)
-	}
-}
-
-func TestPresentationRebindFailureRetainsJournalAndQuarantine(t *testing.T) {
-	s, fake, account := newAccountMutationTestServer(t, true)
-	seedAccountPresentationQuarantine(t, s, account)
-	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
-		_ context.Context,
-		mutation store.AccountMutation,
-		_ accountterminal.TerminalInput,
-		_ accountterminal.TerminalSize,
-		_ <-chan wire.Chunk,
-		_ func(context.Context, []byte) error,
-	) error {
-		fake.Put(mutation.KeychainService, mutation.KeychainAccount, &creds.Credential{})
-		return errors.New("terminal failed after target write")
-	})
-	request := AccountMutationRequest{
-		Kind: AccountMutationRelogin, Action: AccountMutationStartOrAttach, AccountID: account.ID,
-	}
-	begin, err := runAccountMutationTest(t, s, request, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Action = AccountMutationProvideInput
-	request.Fence = begin.Fence
-	input := make(chan wire.Chunk, 1)
-	input <- accountMutationInputChunk(t, []byte("\n"))
-	close(input)
-	if _, err := runAccountMutationTest(t, s, request, input); err == nil {
-		t.Fatal("invalid rebind target was admitted")
-	}
-	active, err := s.m.Store.AccountMutation(store.AccountMutationID(begin.OperationID))
-	if err != nil || active.Kind != store.AccountMutationPresentationRebind ||
-		active.State != store.AccountMutationApplying {
-		t.Fatalf("failed rebind journal = %+v err=%v", active, err)
-	}
-	if _, err := s.m.Store.AccountPresentationQuarantine(account.ID); err != nil {
-		t.Fatalf("failed rebind cleared presentation quarantine: %v", err)
-	}
-	if _, ok := fake.Get(account.KeychainService, account.KeychainAccount); !ok {
-		t.Fatal("failed rebind removed old Keychain owner")
-	}
-}
-
-func seedAccountPresentationQuarantine(
-	t *testing.T,
-	s *Server,
-	account store.Account,
-) string {
-	t.Helper()
-	targetPath := fmt.Sprintf(
-		"/Users/test/Library/CloudStorage/cc-pool-account-%d", account.ID,
-	)
-	target, err := projectPreparationProof(daemonTestPreparationProof(account, targetPath))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.m.Store.ObserveAccountPresentation(account, target); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
-		t.Fatalf("seed presentation quarantine: %v", err)
-	}
-	return targetPath
 }
 
 func newAccountMutationTestServer(
@@ -1112,6 +1209,15 @@ func newAccountMutationTestServer(
 	if err != nil {
 		t.Fatal(err)
 	}
+	return newAccountMutationTestServerWithStore(t, st, withAccount)
+}
+
+func newAccountMutationTestServerWithStore(
+	t *testing.T,
+	st *store.Store,
+	withAccount bool,
+) (*Server, *credstest.Fake, store.Account) {
+	t.Helper()
 	fake := credstest.NewFake()
 	identity, err := proc.CurrentIdentity()
 	if err != nil {
@@ -1152,26 +1258,15 @@ func newAccountMutationTestServer(
 	s := &Server{
 		m: m, cl: newClaims(), log: log.New(io.Discard, "", 0), accountMutationLifetime: t.Context(),
 		accountMutationOwner: func() (proc.Record, error) { return owner, nil },
-		prepareReservedAccount: func(_ context.Context, reservation store.PendingAccountReservation) (catalogproto.TenantPreparationProof, error) {
-			account := store.Account{
-				ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
-			}
-			publicPath := testFileProviderConfigDir(reservation.ID)
-			if reservation.Generation > 1 {
-				publicPath = fmt.Sprintf(
-					"/Users/test/Library/CloudStorage/cc-pool-account-%d", reservation.ID,
-				)
-			}
+		provisionPresentationIdentity: func(_ context.Context, account store.Account) (store.FileProviderPresentationIdentity, error) {
+			return accountMutationTestPresentation(t, account)
+		},
+		prepareAccount: func(_ context.Context, account store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
 			return daemonTestPreparationProof(
-				account, publicPath,
+				account, testFileProviderPublicPath(account.ID),
 			), nil
 		},
-		prepareAccount: func(_ context.Context, account store.Account) (catalogproto.TenantPreparationProof, error) {
-			return daemonTestPreparationProof(
-				account, fmt.Sprintf("/Users/test/Library/CloudStorage/cc-pool-account-%d", account.ID),
-			), nil
-		},
-		activatePrepared: func(_ context.Context, _ store.Account, _ catalogproto.TenantPreparationProof, activate func() error) error {
+		activatePrepared: func(_ context.Context, _ store.Account, _ tenantfs.PreparationLease, _ catalogproto.TenantPreparationProof, activate func() error) error {
 			return activate()
 		},
 	}
@@ -1184,7 +1279,7 @@ func newAccountMutationTestServer(
 	if !withAccount {
 		return s, fake, store.Account{}
 	}
-	dir := testFileProviderConfigDir(1)
+	dir := testAccountConfigDir(1)
 	account := store.Account{
 		ID: 1, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 1,
 		ConfigDir: dir, KeychainService: "cc-pool-test-account-1",
@@ -1207,6 +1302,21 @@ func newAccountMutationTestServer(
 		t.Fatal(err)
 	}
 	return s, fake, account
+}
+
+func accountMutationTestPresentation(
+	t *testing.T,
+	account store.Account,
+) (store.FileProviderPresentationIdentity, error) {
+	t.Helper()
+	identity, err := expectedPresentationIdentity(account)
+	if err != nil {
+		return store.FileProviderPresentationIdentity{}, err
+	}
+	if err := os.MkdirAll(identity.PublicPath, 0o700); err != nil {
+		return store.FileProviderPresentationIdentity{}, err
+	}
+	return identity, nil
 }
 
 func runAccountMutationTest(

@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -19,25 +18,26 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
-	"github.com/yasyf/fusekit/mountproto"
-	"github.com/yasyf/fusekit/mountservice"
+	"github.com/yasyf/fusekit/holder"
+	"github.com/yasyf/fusekit/tenant"
 )
 
 type lifecycleRuntimeStub struct {
 	mu                 sync.Mutex
-	provision          mountproto.ProvisionTenantResponse
+	provision          holder.LocalTenantAcknowledgement
 	provisionErr       error
-	provisionResponses []mountproto.ProvisionTenantResponse
+	provisionResponses []holder.LocalTenantAcknowledgement
 	provisionErrors    []error
 	provisionCalls     int
-	state              mountproto.StateResponse
+	state              tenant.TenantStatus
 	stateErr           error
 	stateCalls         int
-	replace            mountproto.ReplaceTenantResponse
+	replace            holder.LocalTenantAcknowledgement
 	replaceErr         error
 	replaceExpected    uint64
-	remove             mountproto.RemoveTenantResponse
+	remove             holder.LocalTenantRetirementProof
 	removeErr          error
 	removeExpected     uint64
 	removed            bool
@@ -46,7 +46,7 @@ type lifecycleRuntimeStub struct {
 func (r *lifecycleRuntimeStub) ProvisionTenant(
 	context.Context,
 	tenantfs.Account,
-) (mountproto.ProvisionTenantResponse, error) {
+) (holder.LocalTenantAcknowledgement, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	index := r.provisionCalls
@@ -61,18 +61,18 @@ func (r *lifecycleRuntimeStub) ReplaceTenant(
 	_ context.Context,
 	_ tenantfs.Account,
 	expected uint64,
-) (mountproto.ReplaceTenantResponse, error) {
+) (holder.LocalTenantAcknowledgement, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.replaceExpected = expected
 	return r.replace, r.replaceErr
 }
 
-func (r *lifecycleRuntimeStub) RemoveTenant(
+func (r *lifecycleRuntimeStub) RetireTenant(
 	_ context.Context,
 	_ tenantfs.Account,
 	expected uint64,
-) (mountproto.RemoveTenantResponse, error) {
+) (holder.LocalTenantRetirementProof, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.removeExpected = expected
@@ -84,16 +84,16 @@ func (r *lifecycleRuntimeStub) RemoveTenant(
 
 func (r *lifecycleRuntimeStub) TenantState(
 	context.Context,
-	tenantfs.Account,
-) (mountproto.StateResponse, error) {
+	catalog.TenantID,
+) (tenant.TenantStatus, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stateCalls++
 	if r.stateErr != nil {
-		return mountproto.StateResponse{}, r.stateErr
+		return tenant.TenantStatus{}, r.stateErr
 	}
 	if r.removed {
-		return mountproto.StateResponse{}, remoteError(mountproto.ErrorCodeNotFound)
+		return tenant.TenantStatus{}, controlRemoteError(tenantfs.ControlErrorNotFound)
 	}
 	return r.state, nil
 }
@@ -115,25 +115,55 @@ type blockingLifecycleRuntime struct {
 	maximum int
 }
 
+type reservedLaneLifecycleRuntime struct {
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	release <-chan struct{}
+}
+
 type fleetLifecycleRuntime struct {
 	mu          sync.Mutex
 	provisioned []string
 }
 
+type absentRemovalRuntime struct {
+	lifecycleRuntimeStub
+	mu          sync.Mutex
+	removeCalls int
+}
+
+func (r *absentRemovalRuntime) RetireTenant(
+	_ context.Context,
+	account tenantfs.Account,
+	expected uint64,
+) (holder.LocalTenantRetirementProof, error) {
+	id, err := account.TenantID()
+	if err != nil {
+		return holder.LocalTenantRetirementProof{}, err
+	}
+	r.mu.Lock()
+	r.removeCalls++
+	r.mu.Unlock()
+	return holder.LocalTenantRetirementProof{
+		Tenant: id, Generation: catalog.Generation(expected),
+		FileProviderAbsent: true,
+	}, nil
+}
+
 func (r *fleetLifecycleRuntime) ProvisionTenant(
 	_ context.Context,
 	account tenantfs.Account,
-) (mountproto.ProvisionTenantResponse, error) {
+) (holder.LocalTenantAcknowledgement, error) {
 	id, err := account.TenantID()
 	if err != nil {
-		return mountproto.ProvisionTenantResponse{}, err
+		return holder.LocalTenantAcknowledgement{}, err
 	}
 	r.mu.Lock()
 	r.provisioned = append(r.provisioned, account.FileProviderDisplayName)
 	r.mu.Unlock()
-	return mountproto.ProvisionTenantResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		TenantID: mountproto.TenantID(id), Generation: account.Generation,
+	return holder.LocalTenantAcknowledgement{
+		Tenant: id, Generation: catalog.Generation(account.Generation), Presentations: catalog.PresentFileProvider,
 	}, nil
 }
 
@@ -141,23 +171,30 @@ func (*fleetLifecycleRuntime) ReplaceTenant(
 	context.Context,
 	tenantfs.Account,
 	uint64,
-) (mountproto.ReplaceTenantResponse, error) {
-	return mountproto.ReplaceTenantResponse{}, errors.New("unexpected replace")
+) (holder.LocalTenantAcknowledgement, error) {
+	return holder.LocalTenantAcknowledgement{}, errors.New("unexpected replace")
 }
 
-func (*fleetLifecycleRuntime) RemoveTenant(
-	context.Context,
-	tenantfs.Account,
-	uint64,
-) (mountproto.RemoveTenantResponse, error) {
-	return mountproto.RemoveTenantResponse{}, errors.New("unexpected remove")
+func (*fleetLifecycleRuntime) RetireTenant(
+	_ context.Context,
+	account tenantfs.Account,
+	expected uint64,
+) (holder.LocalTenantRetirementProof, error) {
+	id, err := account.TenantID()
+	if err != nil {
+		return holder.LocalTenantRetirementProof{}, err
+	}
+	return holder.LocalTenantRetirementProof{
+		Tenant: id, Generation: catalog.Generation(expected),
+		FileProviderAbsent: true,
+	}, nil
 }
 
 func (*fleetLifecycleRuntime) TenantState(
 	context.Context,
-	tenantfs.Account,
-) (mountproto.StateResponse, error) {
-	return mountproto.StateResponse{}, remoteError(mountproto.ErrorCodeNotFound)
+	catalog.TenantID,
+) (tenant.TenantStatus, error) {
+	return tenant.TenantStatus{}, controlRemoteError(tenantfs.ControlErrorNotFound)
 }
 
 func (r *fleetLifecycleRuntime) provisionedAccounts() []string {
@@ -181,6 +218,7 @@ type fleetSourcePreparer struct {
 func (p *fleetSourcePreparer) Prepare(
 	ctx context.Context,
 	account tenantfs.Account,
+	_ tenantfs.PreparationLease,
 ) (catalogproto.TenantPreparationProof, error) {
 	name := account.FileProviderDisplayName
 	p.mu.Lock()
@@ -208,9 +246,17 @@ func (p *fleetSourcePreparer) Prepare(
 			return catalogproto.TenantPreparationProof{}, ctx.Err()
 		}
 	}
+	home, err := pool.Home()
+	if err != nil {
+		return catalogproto.TenantPreparationProof{}, err
+	}
+	publicPath := filepath.Join(home, "Library", "CloudStorage", "CCPoolStatus-"+name)
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		return catalogproto.TenantPreparationProof{}, err
+	}
 	proof := daemonTestPreparationProof(store.Account{
 		InstanceID: account.InstanceID, Generation: account.Generation,
-	}, filepath.Join("/Users/test/Library/CloudStorage", "CCPoolStatus-"+name))
+	}, publicPath)
 	if p.activation != "" {
 		proof.Presentation.FileProvider.ActivationGeneration = p.activation
 	}
@@ -223,6 +269,7 @@ func (p *fleetSourcePreparer) Prepare(
 func (*fleetSourcePreparer) Validate(
 	context.Context,
 	tenantfs.Account,
+	tenantfs.PreparationLease,
 	catalogproto.TenantPreparationProof,
 ) error {
 	return nil
@@ -241,10 +288,65 @@ func newBlockingLifecycleRuntime(total int) *blockingLifecycleRuntime {
 	}
 }
 
+func (r *reservedLaneLifecycleRuntime) ProvisionTenant(
+	ctx context.Context,
+	account tenantfs.Account,
+) (holder.LocalTenantAcknowledgement, error) {
+	r.mu.Lock()
+	r.calls++
+	blocked := r.calls <= backgroundProvisionConcurrency
+	r.mu.Unlock()
+	if blocked {
+		r.started <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return holder.LocalTenantAcknowledgement{}, ctx.Err()
+		case <-r.release:
+		}
+	}
+	id, err := account.TenantID()
+	if err != nil {
+		return holder.LocalTenantAcknowledgement{}, err
+	}
+	return holder.LocalTenantAcknowledgement{
+		Tenant: id, Generation: catalog.Generation(account.Generation),
+		Presentations: catalog.PresentFileProvider,
+	}, nil
+}
+
+func (*reservedLaneLifecycleRuntime) ReplaceTenant(
+	context.Context,
+	tenantfs.Account,
+	uint64,
+) (holder.LocalTenantAcknowledgement, error) {
+	return holder.LocalTenantAcknowledgement{}, errors.New("unexpected replace")
+}
+
+func (*reservedLaneLifecycleRuntime) RetireTenant(
+	context.Context,
+	tenantfs.Account,
+	uint64,
+) (holder.LocalTenantRetirementProof, error) {
+	return holder.LocalTenantRetirementProof{}, errors.New("unexpected retire")
+}
+
+func (*reservedLaneLifecycleRuntime) TenantState(
+	context.Context,
+	catalog.TenantID,
+) (tenant.TenantStatus, error) {
+	return tenant.TenantStatus{}, errors.New("unexpected state")
+}
+
+func (r *reservedLaneLifecycleRuntime) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
 func (r *blockingLifecycleRuntime) ProvisionTenant(
 	ctx context.Context,
 	account tenantfs.Account,
-) (mountproto.ProvisionTenantResponse, error) {
+) (holder.LocalTenantAcknowledgement, error) {
 	r.mu.Lock()
 	r.calls++
 	r.active++
@@ -259,20 +361,18 @@ func (r *blockingLifecycleRuntime) ProvisionTenant(
 		r.mu.Lock()
 		r.active--
 		r.mu.Unlock()
-		return mountproto.ProvisionTenantResponse{}, ctx.Err()
+		return holder.LocalTenantAcknowledgement{}, ctx.Err()
 	}
 	r.mu.Lock()
 	r.active--
 	r.mu.Unlock()
 	id, err := account.TenantID()
 	if err != nil {
-		return mountproto.ProvisionTenantResponse{}, err
+		return holder.LocalTenantAcknowledgement{}, err
 	}
-	return mountproto.ProvisionTenantResponse{
-		Protocol:   mountproto.Version,
-		Code:       mountproto.ErrorCodeOk,
-		TenantID:   mountproto.TenantID(id),
-		Generation: account.Generation,
+	return holder.LocalTenantAcknowledgement{
+		Tenant: id, Generation: catalog.Generation(account.Generation),
+		Presentations: catalog.PresentFileProvider,
 	}, nil
 }
 
@@ -280,23 +380,23 @@ func (*blockingLifecycleRuntime) ReplaceTenant(
 	context.Context,
 	tenantfs.Account,
 	uint64,
-) (mountproto.ReplaceTenantResponse, error) {
-	return mountproto.ReplaceTenantResponse{}, errors.New("unexpected replace")
+) (holder.LocalTenantAcknowledgement, error) {
+	return holder.LocalTenantAcknowledgement{}, errors.New("unexpected replace")
 }
 
-func (*blockingLifecycleRuntime) RemoveTenant(
+func (*blockingLifecycleRuntime) RetireTenant(
 	context.Context,
 	tenantfs.Account,
 	uint64,
-) (mountproto.RemoveTenantResponse, error) {
-	return mountproto.RemoveTenantResponse{}, errors.New("unexpected remove")
+) (holder.LocalTenantRetirementProof, error) {
+	return holder.LocalTenantRetirementProof{}, errors.New("unexpected retire")
 }
 
 func (*blockingLifecycleRuntime) TenantState(
 	context.Context,
-	tenantfs.Account,
-) (mountproto.StateResponse, error) {
-	return mountproto.StateResponse{}, errors.New("unexpected state")
+	catalog.TenantID,
+) (tenant.TenantStatus, error) {
+	return tenant.TenantStatus{}, errors.New("unexpected state")
 }
 
 func (r *blockingLifecycleRuntime) counts() (calls, active, maximum int) {
@@ -308,6 +408,7 @@ func (r *blockingLifecycleRuntime) counts() (calls, active, maximum int) {
 func (p *sourcePreparerStub) Prepare(
 	context.Context,
 	tenantfs.Account,
+	tenantfs.PreparationLease,
 ) (catalogproto.TenantPreparationProof, error) {
 	p.prepared++
 	return p.proof, p.prepareErr
@@ -316,24 +417,32 @@ func (p *sourcePreparerStub) Prepare(
 func (p *sourcePreparerStub) Validate(
 	context.Context,
 	tenantfs.Account,
+	tenantfs.PreparationLease,
 	catalogproto.TenantPreparationProof,
 ) error {
 	p.validated++
 	return p.validateErr
 }
 
-func exactState(id mountproto.TenantID, generation uint64) mountproto.StateResponse {
-	return mountproto.StateResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		State: &mountproto.TenantState{
-			OwnerID: mountproto.OwnerID(tenantfs.OwnerID), TenantID: id, Generation: generation,
-			Desired: 11, Applied: 11, StateVersion: 1, ReplacementEligible: true,
+func exactState(id catalog.TenantID, generation uint64) tenant.TenantStatus {
+	return tenant.TenantStatus{
+		Owner: tenant.OwnerID(tenantfs.OwnerID),
+		State: tenant.TenantState{
+			Tenant: id, Generation: catalog.Generation(generation),
+			Desired: 11, Applied: 11, Version: 1,
 		},
+		ReplacementEligible: true,
 	}
 }
 
-func remoteError(code mountproto.ErrorCode) error {
-	return &mountservice.RemoteError{Code: code, Message: string(code)}
+func testPreparationLease() tenantfs.PreparationLease {
+	return tenantfs.PreparationLease{
+		ID: "00112233445566778899aabbccddeeff", ExpiresAt: time.Now().Add(time.Minute),
+	}
+}
+
+func controlRemoteError(code tenantfs.ControlErrorCode) error {
+	return &tenantfs.ControlRemoteError{Code: code, Message: string(code)}
 }
 
 func allAccountRemovals(t *testing.T, st *store.Store) []store.AccountRemoval {
@@ -352,7 +461,7 @@ func allAccountRemovals(t *testing.T, st *store.Store) []store.AccountRemoval {
 	}
 }
 
-func testTenantAccount(t *testing.T) (store.Account, tenantfs.Account, mountproto.TenantID) {
+func testTenantAccount(t *testing.T) (store.Account, tenantfs.Account, catalog.TenantID) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	account := store.Account{
@@ -363,7 +472,7 @@ func testTenantAccount(t *testing.T) (store.Account, tenantfs.Account, mountprot
 	if err != nil {
 		t.Fatal(err)
 	}
-	return account, tenantAccount, mountproto.TenantID(tenantID)
+	return account, tenantAccount, tenantID
 }
 
 func insertCoordinatorAccounts(t *testing.T, st *store.Store, total int) {
@@ -371,7 +480,6 @@ func insertCoordinatorAccounts(t *testing.T, st *store.Store, total int) {
 	for id := 1; id <= total; id++ {
 		admitDaemonTestAccount(t, st, store.Account{
 			ID: id, InstanceID: fmt.Sprintf("%032x", id), Generation: 1,
-			ConfigDir:       testFileProviderConfigDir(id),
 			KeychainService: "service", KeychainAccount: "account",
 		})
 	}
@@ -382,49 +490,23 @@ func openDesiredCoordinatorStore(t *testing.T, total int) *store.Store {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	path := filepath.Join(home, "pool-v1.db")
-	initial, err := store.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := initial.Close(); err != nil {
-		t.Fatal(err)
-	}
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(on)&_pragma=busy_timeout(5000)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for id := 1; id <= total; id++ {
-		if _, err := db.Exec(
-			`INSERT INTO accounts(
-			 id,instance_id,generation,config_dir,keychain_service,keychain_account,label,account_uuid,created_at
-			 ) VALUES(?,?,?,?,?,?,?,?,1)`,
-			id, fmt.Sprintf("%032x", id), 1, testFileProviderConfigDir(id),
-			fmt.Sprintf("service-%d", id), fmt.Sprintf("account-%d", id),
-			fmt.Sprintf("label-%d", id), fmt.Sprintf("uuid-%d", id),
-		); err != nil {
-			_ = db.Close()
-			t.Fatal(err)
-		}
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
 	st, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	insertCoordinatorAccounts(t, st, total)
 	return st
 }
 
 func TestEnsureTenantReplacesPriorGenerationAfterProvisionConflict(t *testing.T) {
 	account, tenantAccount, tenantID := testTenantAccount(t)
 	runtime := &lifecycleRuntimeStub{
-		provisionErr: remoteError(mountproto.ErrorCodeConflict),
+		provisionErr: controlRemoteError(tenantfs.ControlErrorConflict),
 		state:        exactState(tenantID, 2),
-		replace: mountproto.ReplaceTenantResponse{
-			Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-			TenantID: tenantID, Generation: account.Generation,
+		replace: holder.LocalTenantAcknowledgement{
+			Tenant: tenantID, Generation: catalog.Generation(account.Generation),
+			Presentations: catalog.PresentFileProvider,
 		},
 	}
 	coordinator := &tenantCoordinator{runtime: runtime}
@@ -439,15 +521,15 @@ func TestEnsureTenantReplacesPriorGenerationAfterProvisionConflict(t *testing.T)
 func TestEnsureTenantRetriesConflictThatRacesWithAbsence(t *testing.T) {
 	account, tenantAccount, tenantID := testTenantAccount(t)
 	runtime := &lifecycleRuntimeStub{
-		provisionResponses: []mountproto.ProvisionTenantResponse{
+		provisionResponses: []holder.LocalTenantAcknowledgement{
 			{},
 			{
-				Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-				TenantID: tenantID, Generation: account.Generation,
+				Tenant: tenantID, Generation: catalog.Generation(account.Generation),
+				Presentations: catalog.PresentFileProvider,
 			},
 		},
-		provisionErrors: []error{remoteError(mountproto.ErrorCodeConflict), nil},
-		stateErr:        remoteError(mountproto.ErrorCodeNotFound),
+		provisionErrors: []error{controlRemoteError(tenantfs.ControlErrorConflict), nil},
+		stateErr:        controlRemoteError(tenantfs.ControlErrorNotFound),
 	}
 	if err := (&tenantCoordinator{runtime: runtime}).ensureTenant(t.Context(), account, tenantAccount); err != nil {
 		t.Fatal(err)
@@ -459,13 +541,13 @@ func TestEnsureTenantRetriesConflictThatRacesWithAbsence(t *testing.T) {
 
 func TestPrepareProvisionsBeforeOnDemandConvergence(t *testing.T) {
 	account, tenantAccount, tenantID := testTenantAccount(t)
-	runtime := &lifecycleRuntimeStub{provision: mountproto.ProvisionTenantResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		TenantID: tenantID, Generation: account.Generation,
+	runtime := &lifecycleRuntimeStub{provision: holder.LocalTenantAcknowledgement{
+		Tenant: tenantID, Generation: catalog.Generation(account.Generation),
+		Presentations: catalog.PresentFileProvider,
 	}}
 	preparer := &sourcePreparerStub{}
 	coordinator := &tenantCoordinator{runtime: runtime, preparer: preparer}
-	if _, err := coordinator.prepare(t.Context(), account); err != nil {
+	if _, err := coordinator.prepare(t.Context(), account, testPreparationLease()); err != nil {
 		t.Fatal(err)
 	}
 	if runtime.provisionCalls != 1 || preparer.prepared != 1 {
@@ -474,7 +556,68 @@ func TestPrepareProvisionsBeforeOnDemandConvergence(t *testing.T) {
 	_ = tenantAccount
 }
 
-func TestInitializePreparesEveryActiveAccountWithBoundedFanout(t *testing.T) {
+func TestBackgroundTenantRecoveryReservesForegroundProvisionLane(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	const total = 20
+	insertCoordinatorAccounts(t, st, total)
+	server := &Server{
+		m:   newDaemonTestManager(t, st, accountMutationTestRefresher{}, credstest.NewFake()),
+		log: log.New(io.Discard, "", 0),
+	}
+	lifecycle, cancel := context.WithCancel(t.Context())
+	runtime := &reservedLaneLifecycleRuntime{
+		started: make(chan struct{}, backgroundProvisionConcurrency),
+		release: make(chan struct{}),
+	}
+	preparer := &sourcePreparerStub{}
+	coordinator := newTenantCoordinator(lifecycle, server, preparer, runtime)
+	server.tenantCoordinator = coordinator
+	server.beginBootstrap()
+	server.startTenantRecovery(lifecycle)
+	for range backgroundProvisionConcurrency {
+		select {
+		case <-runtime.started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("background tenant recovery did not fill its provision lanes")
+		}
+	}
+	account, err := st.GetAccount(total)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.prepare(t.Context(), account, testPreparationLease()); err != nil {
+		t.Fatalf("foreground PrepareTenant while recovery is blocked: %v", err)
+	}
+	if calls := runtime.callCount(); calls != tenantProvisionConcurrency {
+		t.Fatalf("provision calls = %d, want %d", calls, tenantProvisionConcurrency)
+	}
+	if preparer.prepared != 1 {
+		t.Fatalf("foreground prepares = %d, want 1", preparer.prepared)
+	}
+	progress := server.bootstrapSnapshot()
+	if progress.Terminal {
+		t.Fatalf("blocked recovery unexpectedly settled before foreground PrepareTenant: %+v", progress)
+	}
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		server.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tenant recovery did not join activation cancellation")
+	}
+}
+
+func TestInitializeProvisionsEveryActiveAccountWithoutPreparingContent(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
@@ -485,55 +628,48 @@ func TestInitializePreparesEveryActiveAccountWithBoundedFanout(t *testing.T) {
 	const total = 19
 	insertCoordinatorAccounts(t, st, total)
 	runtime := &fleetLifecycleRuntime{}
-	release := make(chan struct{})
-	preparer := &fleetSourcePreparer{
-		started: make(chan string, total), release: release,
-	}
+	preparer := &fleetSourcePreparer{}
 	server := &Server{m: &pool.Manager{Store: st}}
 	coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
-	done := make(chan error, 1)
-	go func() { done <- coordinator.initialize(t.Context()) }()
-	for range tenantProvisionConcurrency {
-		select {
-		case <-preparer.started:
-		case <-time.After(time.Second):
-			t.Fatal("startup preparation did not fill its bounded capacity")
-		}
-	}
-	select {
-	case name := <-preparer.started:
-		t.Fatalf("startup preparation exceeded bounded capacity with %s", name)
-	case <-time.After(50 * time.Millisecond):
-	}
-	if _, active, maximum := preparer.counts(); active != tenantProvisionConcurrency || maximum != tenantProvisionConcurrency {
-		t.Fatalf("startup preparation concurrency = active %d maximum %d", active, maximum)
-	}
-	close(release)
-	if err := <-done; err != nil {
+	if err := coordinator.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	prepared, active, maximum := preparer.counts()
 	provisioned := runtime.provisionedAccounts()
-	if len(prepared) != total || len(provisioned) != total || active != 0 || maximum != tenantProvisionConcurrency {
+	if len(prepared) != 0 || len(provisioned) != total || active != 0 || maximum != 0 {
 		t.Fatalf(
 			"startup fleet = prepared %d provisioned %d active %d maximum %d",
 			len(prepared), len(provisioned), active, maximum,
 		)
 	}
-	slices.Sort(prepared)
 	slices.Sort(provisioned)
 	for id := 1; id <= total; id++ {
 		want := pool.AccountDirName(id)
-		if prepared[id-1] != want || provisioned[id-1] != want {
-			t.Fatalf("startup account %d = prepared %q provisioned %q, want %q", id, prepared[id-1], provisioned[id-1], want)
+		if provisioned[id-1] != want {
+			t.Fatalf("startup account %d = provisioned %q, want %q", id, provisioned[id-1], want)
 		}
 	}
 }
 
-func TestInitializeBindsLiveProofForFreshDesiredAccounts(t *testing.T) {
+func TestInitializeRecoversStableConfigDirsForDesiredAccounts(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 2)
+	before, err := st.ListActiveAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := make(map[int]store.FileProviderPresentationIdentity, len(before))
+	for _, account := range before {
+		presentation, err := st.AccountPresentation(account.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.RemoveAccountConfigDir(account.InstanceID, presentation.Identity.PublicPath); err != nil {
+			t.Fatal(err)
+		}
+		bound[account.ID] = presentation.Identity
+	}
 	runtime := &fleetLifecycleRuntime{}
-	preparer := &fleetSourcePreparer{activation: "activation-fresh"}
+	preparer := &fleetSourcePreparer{}
 	server := &Server{m: &pool.Manager{Store: st}}
 	server.beginBootstrap()
 	coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
@@ -552,11 +688,18 @@ func TestInitializeBindsLiveProofForFreshDesiredAccounts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		expected := bound[account.ID]
 		if presentation.AccountInstanceID != account.InstanceID ||
 			presentation.AccountGeneration != account.Generation ||
-			presentation.Proof.FileProvider.PublicPath != account.ConfigDir ||
-			presentation.Proof.FileProvider.ActivationGeneration != "activation-fresh" {
+			presentation.Identity != expected {
 			t.Fatalf("acct-%02d presentation = %+v", account.ID, presentation)
+		}
+		target, err := os.Readlink(account.ConfigDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target != presentation.Identity.PublicPath {
+			t.Fatalf("acct-%02d stable config target = %q, want %q", account.ID, target, presentation.Identity.PublicPath)
 		}
 	}
 	progress := server.bootstrapSnapshot()
@@ -566,49 +709,51 @@ func TestInitializeBindsLiveProofForFreshDesiredAccounts(t *testing.T) {
 	}
 }
 
-func TestInitializeReadinessWaitsForDesiredPresentationProof(t *testing.T) {
+func TestInitializeRecoversStableConfigDirWithoutPreparingContent(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 1)
+	account, err := st.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	presentation, err := st.AccountPresentation(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.RemoveAccountConfigDir(account.InstanceID, presentation.Identity.PublicPath); err != nil {
+		t.Fatal(err)
+	}
 	release := make(chan struct{})
 	preparer := &fleetSourcePreparer{started: make(chan string, 1), release: release}
 	server := &Server{m: &pool.Manager{Store: st}}
 	server.beginBootstrap()
 	coordinator := newTenantCoordinator(t.Context(), server, preparer, &fleetLifecycleRuntime{})
-	done := make(chan error, 1)
-	go func() { done <- coordinator.initialize(t.Context()) }()
-	select {
-	case <-preparer.started:
-	case <-time.After(time.Second):
-		t.Fatal("desired preparation did not start")
-	}
-	select {
-	case err := <-done:
-		t.Fatalf("initialize returned before proof was available: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	if _, err := st.AccountPresentation(1); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("presentation before proof = %v", err)
-	}
-	close(release)
-	if err := <-done; err != nil {
+	if err := coordinator.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.AccountPresentation(1); err != nil {
 		t.Fatal(err)
 	}
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != presentation.Identity.PublicPath {
+		t.Fatalf("stable config target = %q, %v; want %q", target, err, presentation.Identity.PublicPath)
+	}
+	if prepared, _, _ := preparer.counts(); len(prepared) != 0 {
+		t.Fatalf("startup prepared content: %v", prepared)
+	}
+	close(release)
 }
 
-func TestInitializeRefreshesDesiredPresentationAfterRestart(t *testing.T) {
+func TestInitializeRetainsDesiredPresentationIdentityAfterRestart(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 1)
+	bound, err := st.AccountPresentation(1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := &Server{m: &pool.Manager{Store: st}}
-	first := newTenantCoordinator(
-		t.Context(), server, &fleetSourcePreparer{activation: "activation-1"}, &fleetLifecycleRuntime{},
-	)
+	first := newTenantCoordinator(t.Context(), server, &fleetSourcePreparer{}, &fleetLifecycleRuntime{})
 	if err := first.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	restarted := newTenantCoordinator(
-		t.Context(), server, &fleetSourcePreparer{activation: "activation-2"}, &fleetLifecycleRuntime{},
-	)
+	restarted := newTenantCoordinator(t.Context(), server, &fleetSourcePreparer{}, &fleetLifecycleRuntime{})
 	if err := restarted.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -616,8 +761,8 @@ func TestInitializeRefreshesDesiredPresentationAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if presentation.Proof.FileProvider.ActivationGeneration != "activation-2" {
-		t.Fatalf("restart activation = %q", presentation.Proof.FileProvider.ActivationGeneration)
+	if presentation.Identity != bound.Identity {
+		t.Fatalf("restart identity = %+v, want %+v", presentation.Identity, bound.Identity)
 	}
 }
 
@@ -647,12 +792,22 @@ func TestConcurrentInitializeConvergesOneDesiredPresentation(t *testing.T) {
 	}
 }
 
-func TestInitializeSettlesDesiredGenerationMismatchWithDurableQuarantine(t *testing.T) {
+func TestInitializeSettlesDesiredIdentityMismatchWithDurableQuarantine(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 1)
-	preparer := &fleetSourcePreparer{mutateProof: func(proof *catalogproto.TenantPreparationProof) {
-		proof.Catalog.Generation++
-		proof.Presentation.FileProvider.Generation++
-	}}
+	account, err := st.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	presentation, err := st.AccountPresentation(account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := presentation.Identity
+	observed.Generation++
+	if err := st.ObserveAccountPresentation(account, observed); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
+		t.Fatalf("seed identity quarantine: %v", err)
+	}
+	preparer := &fleetSourcePreparer{}
 	server := &Server{m: &pool.Manager{Store: st}}
 	server.beginBootstrap()
 	coordinator := newTenantCoordinator(t.Context(), server, preparer, &fleetLifecycleRuntime{})
@@ -667,7 +822,7 @@ func TestInitializeSettlesDesiredGenerationMismatchWithDurableQuarantine(t *test
 		t.Fatalf("active after mismatch = %+v err=%v", active, err)
 	}
 	progress := server.bootstrapSnapshot()
-	if progress.Total != 1 || progress.Settled != 1 || progress.Quarantined != 1 ||
+	if progress.Total != 0 || progress.Settled != 0 || progress.Quarantined != 0 ||
 		!progress.Terminal || progress.FailureCount != 0 {
 		t.Fatalf("quarantine bootstrap progress = %+v", progress)
 	}
@@ -694,7 +849,7 @@ func TestInitializeDoesNotRetryRawHolderTransitions(t *testing.T) {
 			if runtime.provisionCalls != 1 || len(prepared) != 0 {
 				t.Fatalf("%s attempts: provision=%d prepare=%d", test.name, runtime.provisionCalls, len(prepared))
 			}
-			if _, err := st.AccountPresentation(1); !errors.Is(err, sql.ErrNoRows) {
+			if _, err := st.AccountPresentation(1); err != nil {
 				t.Fatalf("presentation after %s = %v", test.name, err)
 			}
 		})
@@ -727,15 +882,15 @@ func TestInitializeRecoversRemovalBeforePreparingActiveFleet(t *testing.T) {
 	}
 	prepared, _, _ := preparer.counts()
 	provisioned := runtime.provisionedAccounts()
-	if !slices.Equal(prepared, []string{"acct-01"}) || !slices.Equal(provisioned, []string{"acct-01"}) {
-		t.Fatalf("active recovery = prepared %v provisioned %v, want only acct-01", prepared, provisioned)
+	if len(prepared) != 0 || !slices.Equal(provisioned, []string{"acct-01"}) {
+		t.Fatalf("active recovery = prepared %v provisioned %v, want provision only acct-01", prepared, provisioned)
 	}
 	if _, err := st.GetAccount(2); !errors.Is(err, store.ErrAccountNotFound) {
 		t.Fatalf("removed account after recovery = %v", err)
 	}
 }
 
-func TestInitializeFailureBlocksReadinessAndRestartRetriesFleet(t *testing.T) {
+func TestInitializeIgnoresContentPreparationFailuresAndRestartReprovisionsFleet(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
@@ -745,28 +900,20 @@ func TestInitializeFailureBlocksReadinessAndRestartRetriesFleet(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	insertCoordinatorAccounts(t, st, 2)
 	server := &Server{m: &pool.Manager{Store: st}}
-	release := make(chan struct{})
-	firstPreparer := &fleetSourcePreparer{
-		started: make(chan string, 2), release: release, failName: "acct-02",
-	}
-	first := newTenantCoordinator(t.Context(), server, firstPreparer, &fleetLifecycleRuntime{})
-	firstDone := make(chan error, 1)
-	go func() { firstDone <- first.initialize(t.Context()) }()
-	for range 2 {
-		select {
-		case <-firstPreparer.started:
-		case <-time.After(time.Second):
-			t.Fatal("failed startup did not attempt the exact active fleet")
-		}
-	}
-	close(release)
-	if err := <-firstDone; err == nil {
-		t.Fatal("startup preparation failure reported readiness")
+	firstPreparer := &fleetSourcePreparer{failName: "acct-02"}
+	firstRuntime := &fleetLifecycleRuntime{}
+	first := newTenantCoordinator(t.Context(), server, firstPreparer, firstRuntime)
+	if err := first.initialize(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	firstPrepared, _, _ := firstPreparer.counts()
-	slices.Sort(firstPrepared)
-	if !slices.Equal(firstPrepared, []string{"acct-01", "acct-02"}) {
-		t.Fatalf("failed startup prepared %v, want exact active fleet", firstPrepared)
+	if len(firstPrepared) != 0 {
+		t.Fatalf("startup prepared content: %v", firstPrepared)
+	}
+	firstProvisioned := firstRuntime.provisionedAccounts()
+	slices.Sort(firstProvisioned)
+	if !slices.Equal(firstProvisioned, []string{"acct-01", "acct-02"}) {
+		t.Fatalf("startup provisioned %v", firstProvisioned)
 	}
 
 	restartRuntime := &fleetLifecycleRuntime{}
@@ -780,12 +927,12 @@ func TestInitializeFailureBlocksReadinessAndRestartRetriesFleet(t *testing.T) {
 	slices.Sort(retried)
 	slices.Sort(reprovisioned)
 	want := []string{"acct-01", "acct-02"}
-	if !slices.Equal(retried, want) || !slices.Equal(reprovisioned, want) {
+	if len(retried) != 0 || !slices.Equal(reprovisioned, want) {
 		t.Fatalf("restart fleet = prepared %v provisioned %v, want %v", retried, reprovisioned, want)
 	}
 }
 
-func TestInitializeJoinsEveryStartedPreparationAfterFailure(t *testing.T) {
+func TestInitializeNeverStartsContentPreparation(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
@@ -795,32 +942,13 @@ func TestInitializeJoinsEveryStartedPreparationAfterFailure(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	insertCoordinatorAccounts(t, st, 2)
 	server := &Server{m: &pool.Manager{Store: st}}
-	release := make(chan struct{})
-	preparer := &fleetSourcePreparer{
-		started: make(chan string, 2), release: release, failName: "acct-02",
-	}
+	preparer := &fleetSourcePreparer{failName: "acct-02"}
 	coordinator := newTenantCoordinator(t.Context(), server, preparer, &fleetLifecycleRuntime{})
-	done := make(chan error, 1)
-	go func() { done <- coordinator.initialize(t.Context()) }()
-	for range 2 {
-		select {
-		case <-preparer.started:
-		case <-time.After(time.Second):
-			t.Fatal("startup did not begin the exact active fleet")
-		}
-	}
-	select {
-	case err := <-done:
-		t.Fatalf("startup returned before every started preparation settled: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(release)
-	if err := <-done; err == nil {
-		t.Fatal("startup preparation failure reported readiness")
+	if err := coordinator.initialize(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	prepared, active, _ := preparer.counts()
-	slices.Sort(prepared)
-	if !slices.Equal(prepared, []string{"acct-01", "acct-02"}) || active != 0 {
+	if len(prepared) != 0 || active != 0 {
 		t.Fatalf("settled startup fleet = prepared %v active %d", prepared, active)
 	}
 }
@@ -953,14 +1081,18 @@ func TestInitializePagesOnlyInterruptedRemovalClaims(t *testing.T) {
 	const total = store.AccountRemovalPageLimit + 1
 	for id := 1; id <= total; id++ {
 		admitDaemonTestAccount(t, st, store.Account{
-			ID: id, ConfigDir: testFileProviderConfigDir(id),
+			ID:              id,
 			KeychainService: "service", KeychainAccount: "account",
 		})
 		if _, err := st.BeginAccountRemoval(id, true); err != nil {
 			t.Fatal(err)
 		}
 	}
-	runtime := &lifecycleRuntimeStub{stateErr: remoteError(mountproto.ErrorCodeNotFound)}
+	runtime := &absentRemovalRuntime{
+		lifecycleRuntimeStub: lifecycleRuntimeStub{
+			stateErr: controlRemoteError(tenantfs.ControlErrorNotFound),
+		},
+	}
 	server := &Server{
 		m: newDaemonTestManager(t, st, accountMutationTestRefresher{}, credstest.NewFake()),
 	}
@@ -975,8 +1107,11 @@ func TestInitializePagesOnlyInterruptedRemovalClaims(t *testing.T) {
 	if len(accounts) != 0 || len(allAccountRemovals(t, st)) != 0 {
 		t.Fatalf("restart recovery left accounts=%d removals=%d", len(accounts), len(allAccountRemovals(t, st)))
 	}
-	if runtime.provisionCalls != 0 || runtime.stateCalls != total {
-		t.Fatalf("startup calls: provision=%d state=%d", runtime.provisionCalls, runtime.stateCalls)
+	if runtime.provisionCalls != 0 || runtime.stateCalls != total || runtime.removeCalls != total {
+		t.Fatalf(
+			"startup calls: provision=%d state=%d retirement=%d",
+			runtime.provisionCalls, runtime.stateCalls, runtime.removeCalls,
+		)
 	}
 }
 
@@ -1014,6 +1149,43 @@ func TestOnDemandProvisioningIsBounded(t *testing.T) {
 	calls, active, maximum := runtime.counts()
 	if calls != requests || active != 0 || maximum != tenantProvisionConcurrency {
 		t.Fatalf("provision counts = calls %d active %d maximum %d", calls, active, maximum)
+	}
+}
+
+func TestRetireReservedAccountRequiresExactFileProviderAbsenceProof(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	reservation := store.PendingAccountReservation{
+		ID: 7, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 3,
+	}
+	tenantID, err := pool.TenantAccount(store.Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation,
+	}).TenantID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &lifecycleRuntimeStub{
+		state: exactState(tenantID, reservation.Generation),
+		remove: holder.LocalTenantRetirementProof{
+			Tenant: tenantID, Generation: catalog.Generation(reservation.Generation),
+		},
+	}
+	coordinator := newTenantCoordinator(t.Context(), nil, nil, runtime)
+	if _, err := coordinator.retireReservedAccount(t.Context(), reservation); err == nil {
+		t.Fatal("reserved retirement accepted missing File Provider absence proof")
+	}
+	runtime.remove.FileProviderAbsent = true
+	proof, err := coordinator.retireReservedAccount(t.Context(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proof.AccountID != reservation.ID || proof.AccountInstanceID != reservation.InstanceID ||
+		proof.AccountGeneration != reservation.Generation ||
+		proof.PublicPath != pool.FileProviderConfigDir(reservation.ID) {
+		t.Fatalf("reserved retirement proof = %+v", proof)
+	}
+	if runtime.removeExpected != reservation.Generation {
+		t.Fatalf("retirement expected generation = %d", runtime.removeExpected)
 	}
 }
 
@@ -1097,7 +1269,7 @@ func TestActivatePreparedValidatesBeforeSessionActivation(t *testing.T) {
 	preparer := &sourcePreparerStub{validateErr: validationErr}
 	activated := false
 	err := (&tenantCoordinator{preparer: preparer}).activatePrepared(
-		t.Context(), account, catalogproto.TenantPreparationProof{},
+		t.Context(), account, testPreparationLease(), catalogproto.TenantPreparationProof{},
 		func() error {
 			activated = true
 			return nil
@@ -1119,10 +1291,18 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
-	admitDaemonTestAccount(t, st, store.Account{
-		ID: 1, ConfigDir: testFileProviderConfigDir(1),
+	publicPath := filepath.Join(home, "Library", "CloudStorage", "CCPoolStatus-acct-01")
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(publicPath, "preserved")
+	if err := os.WriteFile(marker, []byte("presentation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	admitDaemonTestAccountAtPublicPath(t, st, store.Account{
+		ID:              1,
 		KeychainService: "service", KeychainAccount: "account",
-	})
+	}, publicPath)
 	account, err := st.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
@@ -1139,10 +1319,9 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := &lifecycleRuntimeStub{
-		state: exactState(mountproto.TenantID(tenantID), account.Generation),
-		remove: mountproto.RemoveTenantResponse{
-			Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-			TenantID: mountproto.TenantID(tenantID), Generation: account.Generation,
+		state: exactState(tenantID, account.Generation),
+		remove: holder.LocalTenantRetirementProof{
+			Tenant: tenantID, Generation: catalog.Generation(account.Generation),
 			FileProviderAbsent: true,
 		},
 	}
@@ -1158,5 +1337,69 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 	}
 	if _, err := os.Lstat(pool.AccountBackingDir(account.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("backing after removal = %v", err)
+	}
+	if _, err := os.Lstat(account.ConfigDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stable execution link after removal = %v", err)
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "presentation" {
+		t.Fatalf("presentation target after removal = %q, %v", got, err)
+	}
+}
+
+func TestFinishRemovalRequiresExplicitTenantAbsenceProofWhenStateIsAbsent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := pool.EnsureStateDir(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	account := admitDaemonTestAccountAtPublicPath(t, st, store.Account{
+		ID:              1,
+		KeychainService: "service", KeychainAccount: "account",
+	}, testFileProviderPublicPath(1))
+	removal, err := st.BeginAccountRemoval(account.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID, err := pool.TenantAccount(account).TenantID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &lifecycleRuntimeStub{
+		stateErr: controlRemoteError(tenantfs.ControlErrorNotFound),
+		remove: holder.LocalTenantRetirementProof{
+			Tenant: tenantID, Generation: catalog.Generation(account.Generation),
+		},
+	}
+	server := &Server{
+		m:   newDaemonTestManager(t, st, accountMutationTestRefresher{}, credstest.NewFake()),
+		log: log.New(io.Discard, "", 0),
+	}
+	coordinator := &tenantCoordinator{server: server, runtime: runtime}
+	if err := coordinator.finishRemoval(t.Context(), removal); err == nil {
+		t.Fatal("absent state completed removal without explicit File Provider absence proof")
+	}
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != testFileProviderPublicPath(1) {
+		t.Fatalf("execution link changed before retirement proof: target=%q err=%v", target, err)
+	}
+	if _, err := st.GetAccount(account.ID); err != nil {
+		t.Fatalf("account after rejected absence proof = %v", err)
+	}
+	runtime.remove.FileProviderAbsent = true
+	if err := coordinator.finishRemoval(t.Context(), removal); err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.removed || runtime.removeExpected != account.Generation {
+		t.Fatalf("explicit retirement proof = removed %v expected generation %d", runtime.removed, runtime.removeExpected)
+	}
+	if _, err := st.GetAccount(account.ID); !errors.Is(err, store.ErrAccountNotFound) {
+		t.Fatalf("account after removal = %v", err)
+	}
+	if _, err := os.Lstat(account.ConfigDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("execution link survived proven retirement: %v", err)
 	}
 }

@@ -29,41 +29,33 @@ func (r *recordingRunner) Output(_ context.Context, name string, arguments ...st
 	return r.output, r.err
 }
 
-func TestReleasePinsExactVersionURLAndDigest(t *testing.T) {
-	setRelease(t, "v0.63.0", "0.63.0", strings.Repeat("ab", 32))
-	got, err := release()
+func TestStatusAppVersionPinsExactBundleVersion(t *testing.T) {
+	setRelease(t, "v0.63.0", "0.63.0")
+	got, err := statusAppVersion()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Version != "0.63.0" || got.SHA256.String() != strings.Repeat("ab", 32) {
-		t.Fatalf("release = %+v", got)
-	}
-	if got.URL != "https://github.com/yasyf/cc-pool/releases/download/v0.63.0/cc-pool-status-v0.63.0-darwin.zip" {
-		t.Fatalf("URL = %q", got.URL)
+	if got != "0.63.0" {
+		t.Fatalf("bundle version = %q", got)
 	}
 }
 
-func TestReleaseAcceptsPrereleaseTagWithNumericBundleVersion(t *testing.T) {
-	setRelease(t, "v0.63.0-rc.1", "0.63.0", strings.Repeat("ab", 32))
-	got, err := release()
+func TestStatusAppVersionAcceptsPrereleaseTagWithNumericBundleVersion(t *testing.T) {
+	setRelease(t, "v0.63.0-rc.1", "0.63.0")
+	got, err := statusAppVersion()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Version != "0.63.0" || got.URL != "https://github.com/yasyf/cc-pool/releases/download/v0.63.0-rc.1/cc-pool-status-v0.63.0-rc.1-darwin.zip" {
-		t.Fatalf("release = %+v", got)
+	if got != "0.63.0" {
+		t.Fatalf("bundle version = %q", got)
 	}
 }
 
-func TestReleaseRejectsMissingOrInexactMetadata(t *testing.T) {
-	for _, test := range []struct{ appVersion, digest string }{
-		{"", strings.Repeat("ab", 32)},
-		{" 0.63.0", strings.Repeat("ab", 32)},
-		{"0.64.0", strings.Repeat("ab", 32)},
-		{"0.63.0", ""},
-	} {
-		setRelease(t, "v0.63.0", test.appVersion, test.digest)
-		if _, err := release(); err == nil {
-			t.Fatalf("release accepted version=%q digest=%q", test.appVersion, test.digest)
+func TestStatusAppVersionRejectsMissingOrInexactMetadata(t *testing.T) {
+	for _, appVersion := range []string{"", " 0.63.0", "0.64.0"} {
+		setRelease(t, "v0.63.0", appVersion)
+		if _, err := statusAppVersion(); err == nil {
+			t.Fatalf("release accepted version=%q", appVersion)
 		}
 	}
 }
@@ -138,11 +130,11 @@ func TestVerifyElectionRequiresOneExactEnabledPath(t *testing.T) {
 	}
 }
 
-func setRelease(t *testing.T, releaseVersion, appVersion, digest string) {
+func setRelease(t *testing.T, releaseVersion, appVersion string) {
 	t.Helper()
-	oldVersion, oldAppVersion, oldDigest := version.Version, version.StatusAppVersion, version.StatusAppSHA256
-	version.Version, version.StatusAppVersion, version.StatusAppSHA256 = releaseVersion, appVersion, digest
+	oldVersion, oldAppVersion := version.Version, version.StatusAppVersion
+	version.Version, version.StatusAppVersion = releaseVersion, appVersion
 	t.Cleanup(func() {
-		version.Version, version.StatusAppVersion, version.StatusAppSHA256 = oldVersion, oldAppVersion, oldDigest
+		version.Version, version.StatusAppVersion = oldVersion, oldAppVersion
 	})
 }

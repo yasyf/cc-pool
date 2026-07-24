@@ -59,6 +59,14 @@ The fixed Developer ID-signed `~/Applications/CCPoolStatus.app` embeds the File 
 catalog runtime in the same Mach-O as the application. Account presentation uses only File
 Provider and requires no Network Volumes authorization.
 
+The release formula carries the exact notarized application as a verified Cellar resource;
+it never writes an Applications directory from the Homebrew sandbox. `ccp package install`
+passes that resource and its source-bound service policy to daemonkit's sealed deployment
+controller. Daemonkit alone stages it on the destination filesystem, proves the prior
+generation stopped, atomically replaces the fixed per-user application, activates the exact
+new generation, and recovers or rolls back every durable phase. `ccp package uninstall`
+likewise delegates quiescence and canonical removal to daemonkit's sealed transaction.
+
 The same app owns the File Provider broker endpoint in App Group `SXKCTF23Q2.ccp`.
 `CCPoolFileProvider.appex` reaches only that broker. The app forwards catalog traffic to
 the ordinary `~/.cc-pool/fusekit/fusekit.sock` endpoint; the pure-Go cc-pool account daemon
@@ -110,8 +118,9 @@ FuseKit to provision or prepare exact tenant generations. It does not supervise 
 File Provider extensions, or App Group listeners. The fixed signed app owns the FuseKit
 runtime through daemonkit; the account daemon connects over the exact private session and
 fails closed on a missing or mismatched runtime. `ccp add` and `ccp init` start the account
-daemon automatically; if it is not running, `ccp select` starts the exact matching daemon
-and refuses selection until the daemon and requested tenant revision are ready.
+daemon automatically. `ccp select` starts the exact matching daemon but remains metadata-only:
+it neither prepares a tenant nor returns a runnable path. `ccp run` refuses launch until the
+requested tenant revision and its File Provider presentation are proven ready.
 
 No secrets are ever stored in cc-pool's database — the macOS Keychain is the only secret
 store.

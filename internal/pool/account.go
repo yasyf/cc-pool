@@ -37,12 +37,26 @@ func (m *Manager) Init() (*InitResult, error) {
 
 // PendingAdd is one private account backing awaiting interactive login.
 type PendingAdd struct {
-	Reservation       store.PendingAccountReservation
-	ConfigDir         string
-	KeychainService   string
-	ClaudeJSONSeed    SeedOutcome
-	PresentationProof store.PresentationPreparationProof
+	Reservation          store.PendingAccountReservation
+	ConfigDir            string
+	PublicPath           string
+	KeychainService      string
+	ClaudeJSONSeed       SeedOutcome
+	PresentationIdentity store.FileProviderPresentationIdentity
 }
+
+// PendingAddRetirementProof binds one verified FuseKit retirement to the
+// exact pending reservation and public presentation path it retired.
+type PendingAddRetirementProof struct {
+	AccountID         int
+	AccountInstanceID string
+	AccountGeneration uint64
+	PublicPath        string
+}
+
+var abandonAddFailpoint func(string) error
+
+var finishAccountRemovalFailpoint func(string) error
 
 // DuplicateIdentity returns an existing account sharing want's subscription.
 func (m *Manager) DuplicateIdentity(ctx context.Context, want Identity) (*store.Account, error) {
@@ -88,44 +102,53 @@ func (m *Manager) ReserveAdd() (store.PendingAccountReservation, error) {
 func (m *Manager) PrepareReservedAdd(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
-	configDir string,
+	publicPath string,
 ) (pending *PendingAdd, err error) {
-	return m.prepareReservedAdd(ctx, reservation, configDir, store.PresentationPreparationProof{})
+	return m.prepareReservedAdd(ctx, reservation, publicPath, store.FileProviderPresentationIdentity{})
 }
 
-// PrepareReservedSyncedAdd seeds a peer-added account only from its complete
-// generation-fenced FuseKit presentation proof.
+// PrepareReservedSyncedAdd seeds a peer-added account from its immutable presentation identity.
 func (m *Manager) PrepareReservedSyncedAdd(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
-	proof store.PresentationPreparationProof,
+	identity store.FileProviderPresentationIdentity,
 ) (pending *PendingAdd, err error) {
-	if err := store.ValidateReservedPresentationPreparationProof(reservation, proof); err != nil {
+	if err := store.ValidateReservedPresentationIdentity(reservation, identity); err != nil {
 		return nil, fmt.Errorf("prepare reserved synced add: %w", err)
 	}
-	return m.prepareReservedAdd(ctx, reservation, proof.FileProvider.PublicPath, proof)
+	return m.prepareReservedAdd(ctx, reservation, identity.PublicPath, identity)
 }
 
 func (m *Manager) prepareReservedAdd(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
-	configDir string,
-	proof store.PresentationPreparationProof,
+	publicPath string,
+	identity store.FileProviderPresentationIdentity,
 ) (pending *PendingAdd, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !filepath.IsAbs(configDir) || filepath.Clean(configDir) != configDir || strings.ContainsRune(configDir, 0) {
-		return nil, errors.New("prepare reserved add: proven config dir must be one exact absolute path")
+	if !filepath.IsAbs(publicPath) || filepath.Clean(publicPath) != publicPath || strings.ContainsRune(publicPath, 0) {
+		return nil, errors.New("prepare reserved add: proven public path must be one exact absolute path")
+	}
+	configDir, err := AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		return nil, fmt.Errorf("prepare reserved add: stable config dir: %w", err)
+	}
+	service, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		return nil, fmt.Errorf("prepare reserved add: stable Keychain service: %w", err)
 	}
 	seed, err := m.prepareAccountBacking(ctx, reservation.ID, ClaudeJSONPath())
 	if err != nil {
-		return nil, fmt.Errorf("seed .claude.json for %s: %w", configDir, err)
+		return nil, fmt.Errorf("seed .claude.json for %s: %w", publicPath, err)
 	}
-	service := creds.ServiceName(configDir)
+	if err := EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
+		return nil, fmt.Errorf("prepare reserved add: stable config link: %w", err)
+	}
 	return &PendingAdd{
-		Reservation: reservation, ConfigDir: configDir, KeychainService: service,
-		ClaudeJSONSeed: seed, PresentationProof: proof,
+		Reservation: reservation, ConfigDir: configDir, PublicPath: publicPath, KeychainService: service,
+		ClaudeJSONSeed: seed, PresentationIdentity: identity,
 	}, nil
 }
 
@@ -154,7 +177,7 @@ func (m *Manager) PromoteSyncedAdd(
 	}
 	account := syncedPromotionAccount(pending, label, accountUUID)
 	if err := m.Store.PromoteReservedSyncedAccount(
-		pending.Reservation, account, pending.PresentationProof,
+		pending.Reservation, account, pending.PresentationIdentity,
 	); err != nil {
 		return nil, fmt.Errorf("promote synced account %s: %w", pending.ConfigDir, err)
 	}
@@ -185,7 +208,7 @@ func (m *Manager) ResolvePromotedSyncedAdd(
 	}
 	expected := syncedPromotionAccount(pending, label, accountUUID)
 	account, exact, err := m.Store.ResolveReservedSyncedPromotion(
-		pending.Reservation, expected, pending.PresentationProof,
+		pending.Reservation, expected, pending.PresentationIdentity,
 	)
 	if err != nil || !exact {
 		return nil, exact, err
@@ -202,18 +225,20 @@ func syncedPromotionAccount(pending *PendingAdd, label, accountUUID string) stor
 	}
 }
 
-// ReleaseAdd releases the index while retaining its private login state.
-func (m *Manager) ReleaseAdd(pending *PendingAdd) error {
-	if pending == nil {
-		return errors.New("release add: pending account is nil")
-	}
-	return m.Store.ReleaseAccountIndex(pending.Reservation)
-}
-
-// AbandonAdd removes an uncommitted account's credentials and private backing.
-func (m *Manager) AbandonAdd(ctx context.Context, pending *PendingAdd) error {
+// AbandonAdd removes an exactly retired uncommitted account's execution link,
+// credentials, private backing, and reservation.
+func (m *Manager) AbandonAdd(
+	ctx context.Context,
+	pending *PendingAdd,
+	retirement PendingAddRetirementProof,
+) error {
 	if pending == nil {
 		return errors.New("abandon add: pending account is nil")
+	}
+	if err := validatePendingAddRetirement(
+		pending.Reservation, pending.PublicPath, retirement,
+	); err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -224,29 +249,174 @@ func (m *Manager) AbandonAdd(ctx context.Context, pending *PendingAdd) error {
 		ConfigDir:  pending.ConfigDir, KeychainService: pending.KeychainService,
 		KeychainAccount: creds.AccountLabel(),
 	}
-	keychainAccount, err := m.Creds.Discover(ctx, pending.KeychainService)
-	switch {
-	case errors.Is(err, creds.ErrNotFound):
-	case err != nil:
-		return fmt.Errorf("probe credential for %s: %w", pending.ConfigDir, err)
-	default:
-		account.KeychainAccount = keychainAccount
+	settled, err := m.credentialRemovalSettled(account)
+	if err != nil {
+		return fmt.Errorf("read pending credential retirement evidence: %w", err)
 	}
-	if err := m.removeCredentialForAccountRemoval(ctx, account); err != nil {
-		return fmt.Errorf("retire pending credential for %s: %w", pending.ConfigDir, err)
+	if !settled {
+		if err := ValidateAccountCredentialBoundary(account, pending.PublicPath); err != nil {
+			return fmt.Errorf("validate retired pending credential boundary: %w", err)
+		}
 	}
 	removal, err := m.Store.BeginAccountRemoval(pending.Reservation.ID, true)
 	if err != nil {
-		return fmt.Errorf("read pending removal for %s: %w", pending.ConfigDir, err)
+		return fmt.Errorf("begin retired pending cleanup: %w", err)
+	}
+	if removal.AccountInstanceID != pending.Reservation.InstanceID ||
+		removal.AccountGeneration != pending.Reservation.Generation {
+		return store.ErrAccountGenerationChanged
+	}
+	if abandonAddFailpoint != nil {
+		if err := abandonAddFailpoint("after-removal-intent"); err != nil {
+			return err
+		}
+	}
+	if !settled {
+		if err := m.removeCredentialForAccountRemovalAt(ctx, account, pending.PublicPath); err != nil {
+			return fmt.Errorf("retire pending credential for %s: %w", pending.ConfigDir, err)
+		}
+	}
+	if abandonAddFailpoint != nil {
+		if err := abandonAddFailpoint("after-credential"); err != nil {
+			return err
+		}
+	}
+	if err := RemoveAccountConfigDir(
+		pending.Reservation.InstanceID, pending.PublicPath,
+	); err != nil {
+		return fmt.Errorf("unlink retired pending execution path: %w", err)
+	}
+	if abandonAddFailpoint != nil {
+		if err := abandonAddFailpoint("after-unlink"); err != nil {
+			return err
+		}
 	}
 	if err := m.removeAccountBacking(ctx, pending.Reservation.ID); err != nil {
 		return err
 	}
+	if abandonAddFailpoint != nil {
+		if err := abandonAddFailpoint("after-backing"); err != nil {
+			return err
+		}
+	}
 	return m.Store.FinalizePendingAccountRemoval(removal)
 }
 
+func (m *Manager) credentialRemovalSettled(account store.Account) (bool, error) {
+	intent, err := store.CredentialRemovalIntentDigest(
+		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
+		account.KeychainService, account.KeychainAccount,
+	)
+	if err != nil {
+		return false, err
+	}
+	active, receipt, err := m.Store.CredentialOperationEvidence(store.CredentialOperationEvidenceQuery{
+		AccountID: account.ID, AccountInstanceID: account.InstanceID,
+		AccountGeneration: account.Generation, ConfigDir: account.ConfigDir,
+		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
+		LocatorDigest: store.CredentialKeychainLocatorDigest(
+			account.KeychainService, account.KeychainAccount,
+		),
+		Kind: store.CredentialOperationRemove, Target: store.CredentialTargetKeychain,
+		IntentDigest: intent,
+	})
+	if err != nil || active != nil || receipt == nil {
+		return false, err
+	}
+	return receipt.TerminalStatus == store.CredentialTerminalSucceeded &&
+		receipt.Result == store.CredentialResultDone &&
+		!receipt.AcknowledgedAt.IsZero(), nil
+}
+
+// AbandonReservedAdd removes an exactly retired reservation whose preparation
+// did not return a complete PendingAdd.
+func (m *Manager) AbandonReservedAdd(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+	retirement PendingAddRetirementProof,
+) error {
+	pending, err := pendingAddForReservation(reservation, retirement.PublicPath)
+	if err != nil {
+		return err
+	}
+	return m.AbandonAdd(ctx, pending, retirement)
+}
+
+// AbandonPreparedAdd removes pool backing and an exact stable link after
+// preparation failed before any credential operation could begin.
+func (m *Manager) AbandonPreparedAdd(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+	retirement PendingAddRetirementProof,
+) error {
+	if err := validatePendingAddRetirement(reservation, retirement.PublicPath, retirement); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := RemoveAccountConfigDir(reservation.InstanceID, retirement.PublicPath); err != nil {
+		return fmt.Errorf("unlink prepared pending execution path: %w", err)
+	}
+	if err := m.removeAccountBacking(ctx, reservation.ID); err != nil {
+		return err
+	}
+	return m.Store.ReleaseAccountIndex(reservation)
+}
+
+// FinalizeUnpreparedAdd releases a reservation after presentation retirement
+// proved that preparation failed before pool-owned external I/O began.
+func (m *Manager) FinalizeUnpreparedAdd(
+	reservation store.PendingAccountReservation,
+	retirement PendingAddRetirementProof,
+) error {
+	if err := validatePendingAddRetirement(reservation, retirement.PublicPath, retirement); err != nil {
+		return err
+	}
+	return m.Store.ReleaseAccountIndex(reservation)
+}
+
+func pendingAddForReservation(
+	reservation store.PendingAccountReservation,
+	publicPath string,
+) (*PendingAdd, error) {
+	configDir, err := AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		return nil, err
+	}
+	service, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		return nil, err
+	}
+	return &PendingAdd{
+		Reservation: reservation, ConfigDir: configDir,
+		PublicPath: publicPath, KeychainService: service,
+	}, nil
+}
+
+func validatePendingAddRetirement(
+	reservation store.PendingAccountReservation,
+	publicPath string,
+	retirement PendingAddRetirementProof,
+) error {
+	if retirement.AccountID != reservation.ID ||
+		retirement.AccountInstanceID != reservation.InstanceID ||
+		retirement.AccountGeneration != reservation.Generation ||
+		retirement.PublicPath != publicPath {
+		return errors.New("pending add retirement proof does not match reservation")
+	}
+	if !filepath.IsAbs(publicPath) || filepath.Clean(publicPath) != publicPath || strings.ContainsRune(publicPath, 0) {
+		return errors.New("pending add retirement proof has invalid public path")
+	}
+	return nil
+}
+
 // FinishAccountRemoval settles one exact deprovisioned account removal.
-func (m *Manager) FinishAccountRemoval(ctx context.Context, removal store.AccountRemoval) error {
+func (m *Manager) FinishAccountRemoval(
+	ctx context.Context,
+	removal store.AccountRemoval,
+	expectedPublicPath string,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -264,12 +434,39 @@ func (m *Manager) FinishAccountRemoval(ctx context.Context, removal store.Accoun
 		return store.ErrAccountGenerationChanged
 	}
 	if removal.DeleteCredential {
-		if err := m.removeCredentialForAccountRemoval(ctx, account); err != nil {
-			return fmt.Errorf("retire acct-%02d credential: %w", account.ID, err)
+		settled, err := m.credentialRemovalSettled(account)
+		if err != nil {
+			return fmt.Errorf("read acct-%02d credential retirement evidence: %w", account.ID, err)
+		}
+		if !settled {
+			if err := ValidateAccountCredentialBoundary(account, expectedPublicPath); err != nil {
+				return fmt.Errorf("validate acct-%02d credential boundary: %w", account.ID, err)
+			}
+			if err := m.removeCredentialForAccountRemovalAt(ctx, account, expectedPublicPath); err != nil {
+				return fmt.Errorf("retire acct-%02d credential: %w", account.ID, err)
+			}
+		}
+	}
+	if finishAccountRemovalFailpoint != nil {
+		if err := finishAccountRemovalFailpoint("after-credential"); err != nil {
+			return err
+		}
+	}
+	if err := RemoveAccountConfigDir(account.InstanceID, expectedPublicPath); err != nil {
+		return fmt.Errorf("retire acct-%02d execution link: %w", account.ID, err)
+	}
+	if finishAccountRemovalFailpoint != nil {
+		if err := finishAccountRemovalFailpoint("after-unlink"); err != nil {
+			return err
 		}
 	}
 	if err := m.removeAccountBacking(ctx, account.ID); err != nil {
 		return err
+	}
+	if finishAccountRemovalFailpoint != nil {
+		if err := finishAccountRemovalFailpoint("after-backing"); err != nil {
+			return err
+		}
 	}
 	if pending {
 		return m.Store.FinalizePendingAccountRemoval(removal)

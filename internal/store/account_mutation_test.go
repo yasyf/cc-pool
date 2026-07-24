@@ -20,11 +20,12 @@ func TestAccountMutationIDDomainIsHardReset(t *testing.T) {
 func TestCredentialMutationsRejectLiveSession(t *testing.T) {
 	s := openTest(t)
 	account := credentialOperationTestAccount(t, s)
-	if err := s.ActivateSelection(SelectionActivation{
+	if err := activateSelectionForTest(s, SelectionActivation{
 		Token: nextStoreTestToken(), AccountID: account.ID,
 		ExpectedInstanceID: account.InstanceID, ExpectedGeneration: account.Generation,
-		Process:   ProcessIdentity{PID: 42, StartedAt: time.Now().Add(-time.Minute)},
-		ConfigDir: account.ConfigDir,
+		Process:           ProcessIdentity{PID: 42, StartedAt: time.Now().Add(-time.Minute)},
+		ConfigDir:         account.ConfigDir,
+		FileProviderLease: storeTestLeaseReceipt("credential-mutation"),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +102,7 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 		receipt.WrittenCredentialDigest != written || receipt.AccountInstanceID != reservation.InstanceID ||
 		receipt.AccountGeneration != reservation.Generation || receipt.Label != "verified-label" ||
 		receipt.AccountUUID != "verified-uuid" || receipt.OutcomeDigest != written ||
-		!receipt.HasPresentationProof || receipt.PresentationProof != operation.PresentationProof {
+		!receipt.HasPresentationIdentity || receipt.PresentationIdentity != operation.PresentationIdentity {
 		t.Fatalf("receipt lost exact evidence: %+v", receipt)
 	}
 	if !receipt.PublicationPending {
@@ -123,7 +124,7 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 	presentation, err := s.AccountPresentation(account.ID)
 	if err != nil || presentation.AccountInstanceID != account.InstanceID ||
 		presentation.AccountGeneration != account.Generation ||
-		presentation.Proof != operation.PresentationProof {
+		presentation.Identity != operation.PresentationIdentity {
 		t.Fatalf("published presentation = %+v err=%v", presentation, err)
 	}
 	if active, err := s.ListActiveAccounts(); err != nil || len(active) != 0 {
@@ -224,8 +225,7 @@ func TestBindAccountMutationPresentationRejectsSubstitutedTenant(t *testing.T) {
 	proof := presentationTestProof(Account{
 		InstanceID: reservation.InstanceID, Generation: reservation.Generation,
 	}, publicPath, "activation-test")
-	proof.CatalogTenantID = "account-0123456789abcdef0123456789abcdef"
-	proof.FileProvider.TenantID = proof.CatalogTenantID
+	proof.TenantID = "account-0123456789abcdef0123456789abcdef"
 	_, err = s.BindAccountMutationPresentation(
 		begin.Active.Fence(), proof, publicPath, "service", "account",
 		credentialOperationTestDigest("locator"), credentialOperationTestDigest("expected"),
@@ -234,7 +234,7 @@ func TestBindAccountMutationPresentationRejectsSubstitutedTenant(t *testing.T) {
 		t.Fatalf("substituted tenant bind = %v", err)
 	}
 	active, err := s.AccountMutation(request.OperationID)
-	if err != nil || active.State != AccountMutationAwaitingPresentation || active.HasPresentationProof {
+	if err != nil || active.State != AccountMutationAwaitingPresentation || active.HasPresentationIdentity {
 		t.Fatalf("mutation changed after rejected proof = %+v err=%v", active, err)
 	}
 }
@@ -878,382 +878,6 @@ func TestAccountMutationsOwnedByPagesExactOwner(t *testing.T) {
 	if _, _, err := s.AccountMutationsOwnedBy(owner, 0, 0); !errors.Is(err, ErrAccountMutationState) {
 		t.Fatalf("invalid owner page admitted: %v", err)
 	}
-}
-
-func TestPresentationRebindJournalRetainsQuarantineUntilOldOwnerCleanup(t *testing.T) {
-	s := openTest(t)
-	now := time.Unix(1_900_100_000, 0)
-	s.now = func() time.Time { return now }
-	account, request, target := presentationRebindMutationTestFixture(t, s)
-
-	begin, err := s.BeginAccountMutation(t.Context(), request)
-	if err != nil || !begin.Created || begin.Active == nil ||
-		begin.Active.State != AccountMutationAwaitingPresentation {
-		t.Fatalf("begin = %+v err=%v", begin, err)
-	}
-	if begin.Active.PreviousConfigDir != account.ConfigDir ||
-		begin.Active.PreviousKeychainService != account.KeychainService ||
-		begin.Active.PreviousKeychainAccount != account.KeychainAccount ||
-		begin.Active.PreviousLocatorDigest != request.PreviousLocatorDigest ||
-		begin.Active.PreviousCredentialState != request.PreviousCredentialState ||
-		begin.Active.PreviousCredentialDigest != request.PreviousCredentialDigest {
-		t.Fatalf("begin lost old ownership evidence: %+v", begin.Active)
-	}
-	fence, err := s.BindAccountMutationPresentation(
-		begin.Active.Fence(), target, target.FileProvider.PublicPath,
-		"new-service", "new-account", CredentialKeychainLocatorDigest("new-service", "new-account"),
-		credentialOperationTestDigest("new-expected"),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fence, err = s.MarkAccountMutationInputProvided(fence, credentialOperationTestDigest("input"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fence, err = s.MarkAccountMutationApplying(fence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	written := credentialOperationTestDigest("new-written")
-	fence, err = s.MarkAccountMutationApplied(fence, written)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fence, err = s.MarkAccountMutationPublishing(fence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.CommitAccountMutation(fence, now.Add(time.Hour)); !errors.Is(err, ErrAccountMutationState) {
-		t.Fatalf("generic commit admitted rebind: %v", err)
-	}
-	fence, updated, err := s.PublishAccountPresentationRebind(fence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if updated.Generation != account.Generation+1 || updated.ConfigDir != target.FileProvider.PublicPath ||
-		updated.KeychainService != "new-service" || updated.KeychainAccount != "new-account" {
-		t.Fatalf("published account = %+v", updated)
-	}
-	active, err := s.ActiveAccountMutation(account.ID)
-	if err != nil || active.State != AccountMutationRebindPublished || active.Fence() != fence {
-		t.Fatalf("published journal = %+v err=%v", active, err)
-	}
-	if _, err := s.AccountPresentationQuarantine(account.ID); err != nil {
-		t.Fatalf("publish cleared quarantine before old cleanup: %v", err)
-	}
-	if selectable, err := s.ListActiveAccounts(); err != nil || len(selectable) != 0 {
-		t.Fatalf("published rebind became selectable early: %+v err=%v", selectable, err)
-	}
-	receipt, err := s.CommitAccountPresentationRebind(fence, now.Add(time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if receipt.Kind != AccountMutationPresentationRebind || receipt.Terminal != AccountMutationCommitted ||
-		receipt.OutcomeDigest != written || receipt.PresentationProof != target ||
-		receipt.PreviousConfigDir != account.ConfigDir ||
-		receipt.PreviousKeychainService != account.KeychainService ||
-		receipt.PreviousKeychainAccount != account.KeychainAccount ||
-		receipt.PreviousLocatorDigest != request.PreviousLocatorDigest ||
-		receipt.PreviousCredentialState != request.PreviousCredentialState ||
-		receipt.PreviousCredentialDigest != request.PreviousCredentialDigest {
-		t.Fatalf("receipt lost rebind evidence: %+v", receipt)
-	}
-	if _, err := s.AccountPresentationQuarantine(account.ID); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("committed rebind retained quarantine: %v", err)
-	}
-	if !receipt.PublicationPending {
-		t.Fatal("committed rebind cleared publication fence")
-	}
-	if selectable, err := s.ListActiveAccounts(); err != nil || len(selectable) != 0 {
-		t.Fatalf("publication-pending rebind became selectable: %+v err=%v", selectable, err)
-	}
-	if err := s.MarkAccountMutationPublicationSettled(receipt.OperationID); err != nil {
-		t.Fatal(err)
-	}
-	receipt, err = s.AccountMutationReceipt(receipt.OperationID)
-	if err != nil || receipt.PublicationPending {
-		t.Fatalf("settled rebind receipt = %+v err=%v", receipt, err)
-	}
-	if selectable, err := s.ListActiveAccounts(); err != nil || len(selectable) != 1 ||
-		selectable[0].Generation != account.Generation+1 {
-		t.Fatalf("committed rebind not selectable: %+v err=%v", selectable, err)
-	}
-	replay, err := s.BeginAccountMutation(t.Context(), request)
-	if err != nil || replay.Receipt == nil || !reflect.DeepEqual(*replay.Receipt, receipt) {
-		t.Fatalf("receipt replay = %+v err=%v", replay, err)
-	}
-}
-
-func TestPresentationRebindEmptyOldCredentialStateRoundTrips(t *testing.T) {
-	s := openTest(t)
-	_, request, _ := presentationRebindMutationTestFixture(t, s)
-	presentID := request.OperationID
-	request.PreviousCredentialState = CredentialSlotEmpty
-	request.PreviousCredentialDigest = CredentialDigest{}
-	operationID, err := NewPresentationRebindMutationID(
-		request.AccountID, request.AccountInstanceID, request.AccountGeneration,
-		request.PreviousLocatorDigest, request.PreviousCredentialState,
-		request.PreviousCredentialDigest, request.IntentDigest,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if operationID == presentID {
-		t.Fatal("empty and present old-slot evidence produced the same operation ID")
-	}
-	request.OperationID = operationID
-	begin, err := s.BeginAccountMutation(t.Context(), request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if begin.Active == nil ||
-		begin.Active.PreviousCredentialState != CredentialSlotEmpty ||
-		begin.Active.PreviousCredentialDigest != (CredentialDigest{}) {
-		t.Fatalf("empty old-slot mutation = %+v", begin.Active)
-	}
-	var state CredentialSlotState
-	var digest []byte
-	if err := s.db.QueryRow(
-		`SELECT previous_credential_state,previous_credential_digest
-		 FROM account_mutations WHERE operation_id=?`, operationID[:],
-	).Scan(&state, &digest); err != nil {
-		t.Fatal(err)
-	}
-	if state != CredentialSlotEmpty || digest != nil {
-		t.Fatalf("durable empty old slot state=%q digest=%x", state, digest)
-	}
-}
-
-func TestPresentationRebindFencesCredentialOperationsThroughAdmission(t *testing.T) {
-	s := openTest(t)
-	account, request, target := presentationRebindMutationTestFixture(t, s)
-	empty := CredentialExternalState{
-		Keychain: CredentialSlotObservation{State: CredentialSlotEmpty},
-	}
-	oldOperation := credentialOperationTestRequest(
-		t, account, CredentialOperationEnsureFresh, CredentialTargetKeychain,
-		empty, "old-owner-before-rebind", request.Owner,
-	)
-	oldBegin, err := s.BeginCredentialOperation(oldOperation)
-	if err != nil || !oldBegin.Created || oldBegin.Active == nil {
-		t.Fatalf("begin old credential operation = %+v err=%v", oldBegin, err)
-	}
-	if _, err := s.BeginAccountMutation(t.Context(), request); !errors.Is(err, ErrAccountMutationRecoveryRequired) {
-		t.Fatalf("rebind admitted over active credential operation: %v", err)
-	}
-	if err := s.AbandonPreparedCredentialOperation(oldBegin.Active.Fence()); err != nil {
-		t.Fatal(err)
-	}
-
-	begin, err := s.BeginAccountMutation(t.Context(), request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fence, err := s.BindAccountMutationPresentation(
-		begin.Active.Fence(), target, target.FileProvider.PublicPath,
-		"new-service", "new-account", CredentialKeychainLocatorDigest("new-service", "new-account"),
-		credentialOperationTestDigest("new-expected"),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fence, err = s.MarkAccountMutationInputProvided(fence, credentialOperationTestDigest("input"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fence, err = s.MarkAccountMutationApplying(fence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	targetAccount := Account{
-		ID: account.ID, InstanceID: account.InstanceID, Generation: account.Generation + 1,
-		ConfigDir:       target.FileProvider.PublicPath,
-		KeychainService: "new-service", KeychainAccount: "new-account",
-	}
-	adopt := credentialOperationTestRequest(
-		t, targetAccount, CredentialOperationAdoptRotated, CredentialTargetKeychain,
-		empty, "target-adopt", request.Owner,
-	)
-	if _, err := s.BeginCredentialOperation(adopt); !errors.Is(err, ErrAccountPresentationQuarantined) {
-		t.Fatalf("credential operation entered applying rebind: %v", err)
-	}
-	fence, err = s.MarkAccountMutationApplied(fence, credentialOperationTestDigest("written"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.BeginCredentialOperation(adopt); !errors.Is(err, ErrAccountPresentationQuarantined) {
-		t.Fatalf("credential operation entered applied rebind: %v", err)
-	}
-	fence, err = s.MarkAccountMutationPublishing(fence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fence, _, err = s.PublishAccountPresentationRebind(fence)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.BeginCredentialOperation(adopt); !errors.Is(err, ErrAccountPresentationQuarantined) {
-		t.Fatalf("credential operation entered published rebind: %v", err)
-	}
-	if _, err := s.CommitAccountPresentationRebind(fence, time.Now().Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	after, err := s.BeginCredentialOperation(adopt)
-	if err != nil || !after.Created || after.Active == nil {
-		t.Fatalf("credential operation remained fenced after admission = %+v err=%v", after, err)
-	}
-}
-
-func TestRefreshPresentationRebindProofAllowsCurrentActivationAndAdvancingProvenance(t *testing.T) {
-	s := openTest(t)
-	account, request, target := presentationRebindMutationTestFixture(t, s)
-	begin, err := s.BeginAccountMutation(t.Context(), request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fence, err := s.BindAccountMutationPresentation(
-		begin.Active.Fence(), target, target.FileProvider.PublicPath,
-		"new-service", "new-account", CredentialKeychainLocatorDigest("new-service", "new-account"),
-		credentialOperationTestDigest("new-expected"),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	refreshed := target
-	refreshed.Requested++
-	refreshed.Desired = refreshed.Requested
-	refreshed.Observed = refreshed.Requested
-	refreshed.Verified = refreshed.Requested
-	refreshed.Applied = refreshed.Requested
-	refreshed.CatalogRevision = refreshed.Requested
-	refreshed.SourceRevision++
-	refreshed.ChangeID = "change-refreshed"
-	refreshed.OperationID = "operation-refreshed"
-	refreshed.FileProvider.ActivationGeneration = "activation-current"
-	fence, err = s.RefreshAccountMutationPresentation(fence, refreshed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mutation, err := s.AccountMutation(request.OperationID)
-	if err != nil || mutation.PresentationProof != refreshed || mutation.Fence() != fence {
-		t.Fatalf("refreshed mutation = %+v err=%v", mutation, err)
-	}
-	causalDrift := refreshed
-	causalDrift.ChangeID = "changed-without-revision"
-	if _, err := s.RefreshAccountMutationPresentation(fence, causalDrift); !errors.Is(err, ErrAccountPresentationEvidence) {
-		t.Fatalf("causal drift without revision = %v", err)
-	}
-	identityDrift := refreshed
-	identityDrift.FileProvider.DomainID = "other-domain"
-	if _, err := s.RefreshAccountMutationPresentation(fence, identityDrift); !errors.Is(err, ErrAccountPresentationEvidence) {
-		t.Fatalf("identity drift = %v", err)
-	}
-	if _, err := s.GetAccount(account.ID); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestCancelUnboundPresentationRebindPreservesAccountAndQuarantine(t *testing.T) {
-	s := openTest(t)
-	account, request, _ := presentationRebindMutationTestFixture(t, s)
-	begin, err := s.BeginAccountMutation(t.Context(), request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CancelUnboundAccountMutation(begin.Active.Fence()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.ActiveAccountMutation(account.ID); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("cancel retained journal: %v", err)
-	}
-	if current, err := s.GetAccount(account.ID); err != nil || current != account {
-		t.Fatalf("cancel changed account: %+v err=%v", current, err)
-	}
-	if _, err := s.AccountPresentationQuarantine(account.ID); err != nil {
-		t.Fatalf("cancel cleared quarantine: %v", err)
-	}
-}
-
-func TestPresentationRebindRejectsIncoherentOldEvidenceAndOwnerAliasing(t *testing.T) {
-	s := openTest(t)
-	account, request, target := presentationRebindMutationTestFixture(t, s)
-	invalid := request
-	invalid.PreviousLocatorDigest = credentialOperationTestDigest("substituted-old-locator")
-	operationID, err := NewPresentationRebindMutationID(
-		invalid.AccountID, invalid.AccountInstanceID, invalid.AccountGeneration,
-		invalid.PreviousLocatorDigest, invalid.PreviousCredentialState,
-		invalid.PreviousCredentialDigest, invalid.IntentDigest,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	invalid.OperationID = operationID
-	if _, err := s.BeginAccountMutation(t.Context(), invalid); !errors.Is(err, ErrAccountMutationState) {
-		t.Fatalf("incoherent previous locator admitted: %v", err)
-	}
-	begin, err := s.BeginAccountMutation(t.Context(), request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.BindAccountMutationPresentation(
-		begin.Active.Fence(), target, target.FileProvider.PublicPath,
-		account.KeychainService, account.KeychainAccount, request.PreviousLocatorDigest,
-		credentialOperationTestDigest("new-expected"),
-	); !errors.Is(err, ErrAccountPresentationEvidence) {
-		t.Fatalf("old Keychain owner alias admitted: %v", err)
-	}
-	if _, err := s.BindAccountMutationPresentation(
-		begin.Active.Fence(), target, target.FileProvider.PublicPath,
-		"new-service", "new-account", credentialOperationTestDigest("substituted-new-locator"),
-		credentialOperationTestDigest("new-expected"),
-	); !errors.Is(err, ErrAccountPresentationEvidence) {
-		t.Fatalf("incoherent new locator admitted: %v", err)
-	}
-}
-
-func presentationRebindMutationTestFixture(
-	t *testing.T,
-	s *Store,
-) (Account, BeginAccountMutationRequest, PresentationPreparationProof) {
-	t.Helper()
-	account := credentialOperationTestAccountID(t, s, 1)
-	initial := presentationTestProof(account, account.ConfigDir, "activation-initial")
-	if err := s.ObserveAccountPresentation(account, initial); err != nil {
-		t.Fatal(err)
-	}
-	newPath := "/File Provider/CCPool/rebound"
-	drifted := presentationTestProof(account, newPath, "activation-observed")
-	if err := s.ObserveAccountPresentation(account, drifted); !errors.Is(err, ErrAccountPresentationQuarantined) {
-		t.Fatalf("create quarantine: %v", err)
-	}
-	target := drifted
-	target.CatalogGeneration = account.Generation + 1
-	target.FileProvider.Generation = account.Generation + 1
-	request := BeginAccountMutationRequest{
-		AccountID: account.ID, Kind: AccountMutationPresentationRebind,
-		AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation + 1,
-		IntentDigest: credentialOperationTestDigest("rebind-intent"),
-		Label:        account.Label, AccountUUID: account.AccountUUID,
-		PreviousConfigDir: account.ConfigDir, PreviousKeychainService: account.KeychainService,
-		PreviousKeychainAccount: account.KeychainAccount,
-		PreviousLocatorDigest: CredentialKeychainLocatorDigest(
-			account.KeychainService, account.KeychainAccount,
-		),
-		PreviousCredentialState:  CredentialSlotPresent,
-		PreviousCredentialDigest: credentialOperationTestDigest("old-credential"),
-		Owner:                    credentialOperationTestOwner("rebind-owner"),
-	}
-	operationID, err := NewPresentationRebindMutationID(
-		request.AccountID, request.AccountInstanceID, request.AccountGeneration,
-		request.PreviousLocatorDigest, request.PreviousCredentialState,
-		request.PreviousCredentialDigest, request.IntentDigest,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.OperationID = operationID
-	return account, request, target
 }
 
 func accountMutationTestRequest(

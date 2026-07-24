@@ -16,37 +16,30 @@ import (
 
 var errUnauthorized = errors.New("tenantfs: unauthorized FuseKit peer")
 
-// MountAuthorizer binds every local lifecycle request to cc-pool's owner.
-type MountAuthorizer struct{ UID int }
+// MountAuthorizer rejects every external mount-control request.
+type MountAuthorizer struct{}
 
-// NewMountAuthorizer returns the current-user product authorizer.
-func NewMountAuthorizer() MountAuthorizer { return MountAuthorizer{UID: os.Getuid()} }
+// NewMountAuthorizer returns the deny-all external mount-control authorizer.
+func NewMountAuthorizer() MountAuthorizer { return MountAuthorizer{} }
 
-// AuthorizeObservation admits one exact immutable local runtime-health request.
+// AuthorizeObservation rejects external runtime observation.
 func (a MountAuthorizer) AuthorizeObservation(
 	_ context.Context,
-	identity mountservice.ObservationIdentity,
-	operation mountproto.Operation,
+	_ mountservice.ObservationIdentity,
+	_ mountproto.Operation,
 ) error {
-	if identity.WireBuild != transportproto.WireBuild || identity.Peer.PID <= 1 || identity.Peer.UID != a.UID ||
-		operation != mountproto.OperationRuntimeHealth {
-		return errUnauthorized
-	}
-	return nil
+	return errUnauthorized
 }
 
-// Authorize admits one exact local tenant lifecycle request.
+// Authorize rejects external tenant lifecycle control.
 func (a MountAuthorizer) Authorize(
 	_ context.Context,
-	identity mountservice.Identity,
-	operation mountproto.Operation,
+	_ mountservice.Identity,
+	_ mountproto.Operation,
 	_ catalog.TenantID,
 	_ catalog.Generation,
 ) (tenant.OwnerID, error) {
-	if !validMountIdentity(a.UID, identity) || !tenantLifecycleOperation(operation) {
-		return "", errUnauthorized
-	}
-	return tenant.OwnerID(OwnerID), nil
+	return "", errUnauthorized
 }
 
 // AuthorizeNative rejects native presentations for this File Provider-only product.
@@ -77,20 +70,8 @@ func catalogAuthorization(
 	operation catalogproto.Operation,
 	route catalogservice.Route,
 ) (catalogservice.Authorization, error) {
-	if operation == catalogproto.OperationSourceAuthorityPublishDesiredFleet ||
-		operation == catalogproto.OperationSourceAuthorityReadDesiredFleet {
-		if route != (catalogservice.Route{}) {
-			return catalogservice.Authorization{}, errUnauthorized
-		}
-		return catalogservice.Authorization{
-			Principal: string(SourceAuthorityFleetOwner), Role: catalogservice.RoleProductAdmin,
-		}, nil
-	}
 	authorization := catalogservice.Authorization{Route: route}
 	switch {
-	case operation == catalogproto.OperationTenantPrepare && route.Tenant != "" && !route.Forwarded && route.Domain == "":
-		authorization.Principal = "cc-pool-owner"
-		authorization.Role = catalogservice.RoleTenantOwner
 	case operation == catalogproto.OperationBrokerOpen && route == (catalogservice.Route{}):
 		authorization.Principal = "cc-pool-fileprovider"
 		authorization.Role = catalogservice.RoleFileProvider
@@ -105,19 +86,9 @@ func catalogAuthorization(
 	return authorization, nil
 }
 
-func validMountIdentity(uid int, identity mountservice.Identity) bool {
-	return identity.WireBuild == transportproto.WireBuild && identity.Session != nil &&
-		identity.Peer.PID > 1 && identity.Peer.UID == uid
-}
-
 func validCatalogIdentity(uid int, identity catalogservice.Identity) bool {
 	return identity.WireBuild == transportproto.WireBuild && identity.Session != nil &&
 		identity.Peer.PID > 1 && identity.Peer.UID == uid
-}
-
-func tenantLifecycleOperation(operation mountproto.Operation) bool {
-	return operation == mountproto.OperationTenantProvision || operation == mountproto.OperationTenantReplace ||
-		operation == mountproto.OperationTenantRemove || operation == mountproto.OperationTenantState
 }
 
 var (

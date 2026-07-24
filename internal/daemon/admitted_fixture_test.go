@@ -3,7 +3,7 @@ package daemon
 import (
 	"crypto/sha256"
 	"fmt"
-	"path/filepath"
+	"os"
 	"testing"
 	"time"
 
@@ -13,6 +13,18 @@ import (
 )
 
 func admitDaemonTestAccount(t *testing.T, st *store.Store, requested store.Account) store.Account {
+	t.Helper()
+	return admitDaemonTestAccountAtPublicPath(
+		t, st, requested, testFileProviderPublicPath(requested.ID),
+	)
+}
+
+func admitDaemonTestAccountAtPublicPath(
+	t *testing.T,
+	st *store.Store,
+	requested store.Account,
+	publicPath string,
+) store.Account {
 	t.Helper()
 	owner := proc.Record{
 		RecoveryID: pool.CredentialOwnerRecoveryID,
@@ -29,15 +41,19 @@ func admitDaemonTestAccount(t *testing.T, st *store.Store, requested store.Accou
 	if reservation.ID != requested.ID {
 		t.Fatalf("admit test account: reserved id %d, want %d", reservation.ID, requested.ID)
 	}
-	configDir := requested.ConfigDir
-	if configDir == "" {
-		configDir = fmt.Sprintf("/tmp/cc-pool-test/acct-%02d", requested.ID)
-	} else if !filepath.IsAbs(configDir) {
-		configDir = filepath.Join("/tmp/cc-pool-test", configDir)
+	configDir, err := pool.AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	keychainService := requested.KeychainService
-	if keychainService == "" {
-		keychainService = fmt.Sprintf("test-service-%d", requested.ID)
+	keychainService, err := pool.AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
+		t.Fatal(err)
 	}
 	keychainAccount := requested.KeychainAccount
 	if keychainAccount == "" {
@@ -74,7 +90,7 @@ func admitDaemonTestAccount(t *testing.T, st *store.Store, requested store.Accou
 	if !begin.Created || begin.Active == nil {
 		t.Fatalf("admit test account: begin = %+v", begin)
 	}
-	proof := daemonFixturePresentationProof(reservation, configDir)
+	proof := daemonFixturePresentationProof(reservation, publicPath)
 	fence, err := st.BindAccountMutationPresentation(
 		begin.Active.Fence(),
 		proof,
@@ -143,12 +159,12 @@ func daemonTestCredentialDigest(value string) store.CredentialDigest {
 func daemonFixturePresentationProof(
 	reservation store.PendingAccountReservation,
 	configDir string,
-) store.PresentationPreparationProof {
-	proof, err := projectPreparationProof(daemonTestPreparationProof(store.Account{
+) store.FileProviderPresentationIdentity {
+	identity, err := projectPreparationIdentity(daemonTestPreparationProof(store.Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
 	}, configDir))
 	if err != nil {
 		panic(err)
 	}
-	return proof
+	return identity
 }

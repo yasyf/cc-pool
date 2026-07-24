@@ -26,10 +26,10 @@ func TestEnvExportsFuseKitPresentationWithoutSessionOwnership(t *testing.T) {
 	if err := st.SetMeta("initialized", "1"); err != nil {
 		t.Fatal(err)
 	}
-	admitCLITestAccount(t, st, store.Account{
-		ID: 1, ConfigDir: dir, Label: "work@example.com",
+	account := admitCLITestAccountAtPublicPath(t, st, store.Account{
+		ID: 1, Label: "work@example.com",
 		KeychainService: "svc", KeychainAccount: "u",
-	})
+	}, dir)
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestEnvExportsFuseKitPresentationWithoutSessionOwnership(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("env failed: %v (stderr=%q)", err, stripANSI(stderr.String()))
 	}
-	if !strings.Contains(stdout.String(), "export CLAUDE_CONFIG_DIR='"+dir+"'") {
+	if !strings.Contains(stdout.String(), "export CLAUDE_CONFIG_DIR='"+account.ConfigDir+"'") {
 		t.Fatalf("env exports missing the config dir: %q", stdout.String())
 	}
 	st, err = store.Open(pool.DBPath())
