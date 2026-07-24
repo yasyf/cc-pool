@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -35,21 +36,23 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
 
 type directTaskRunner struct{}
 
-func (directTaskRunner) Run(ctx context.Context, task supervise.Task) error {
+func (directTaskRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 	command := exec.CommandContext(ctx, task.Path, task.Args...) //nolint:gosec // sim controls the exact security shim path
 	command.Dir = task.Dir
 	command.Env = task.Env
-	command.Stdin = task.Stdin
-	command.Stdout = task.Stdout
-	command.Stderr = task.Stderr
-	return command.Run()
+	command.Stdin = bytes.NewReader(task.Stdin)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	return worker.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
 }
 
 func simCredentialStore(configDir string) creds.KeychainItem {
@@ -174,10 +177,9 @@ func cmdAccount(args []string) error {
 		return fmt.Errorf("write Keychain credential: %w", err)
 	}
 
-	owner := proc.Record{
-		RecoveryClass: proc.RecoveryTask,
-		PID:           os.Getpid(), StartTime: "sync-sim", Boot: "sync-sim",
-		Comm: "seed", Generation: *uuid,
+	owner, err := simCredentialOwner()
+	if err != nil {
+		return fmt.Errorf("bind reservation owner: %w", err)
 	}
 	reservation, err := db.ReserveAccountIndex(owner)
 	if err != nil {
@@ -226,6 +228,27 @@ func cmdAccount(args []string) error {
 	}
 	fmt.Printf("seeded acct-%02d uuid=%s hash=%s\n", *id, *uuid, creds.AccessHash(cred))
 	return nil
+}
+
+func simCredentialOwner() (proc.Record, error) {
+	identity, err := proc.CurrentIdentity()
+	if err != nil {
+		return proc.Record{}, err
+	}
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		return proc.Record{}, err
+	}
+	owner := proc.Record{
+		RecoveryID: pool.CredentialOwnerRecoveryID,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		Comm: identity.Comm, Executable: identity.Executable, AuditToken: identity.AuditToken,
+		Generation: generation,
+	}
+	if err := owner.Validate(); err != nil {
+		return proc.Record{}, err
+	}
+	return owner, nil
 }
 
 func simAdmissionFence(

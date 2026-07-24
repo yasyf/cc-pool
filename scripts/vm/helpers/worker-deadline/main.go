@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 type result struct {
@@ -46,12 +46,36 @@ func run() (resultErr error) {
 	}
 	defer func() { resultErr = errors.Join(resultErr, rootFS.Close()) }()
 
-	store := &proc.FileStore{Path: filepath.Join(root, "processes.json")}
-	reaper := &proc.Reaper{Store: store, Generation: "ccpool-vm-worker-deadline"}
-	pool, err := supervise.NewPool(1, reaper)
+	store := &proc.FileStore{Path: filepath.Join(root, "processes.db")}
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		return fmt.Errorf("create worker generation: %w", err)
+	}
+	reaper := &proc.Reaper{Store: store, Generation: generation}
+	pool, err := worker.NewPool(worker.Config{
+		Capacity: 1, QueueCapacity: 0, MaxTotalRun: 5 * time.Second,
+		MaxStdinBytes: 0, MaxStdoutBytes: 1024, MaxStderrBytes: 1024,
+	}, reaper)
 	if err != nil {
 		return err
 	}
+	claim, err := pool.ClaimRuntime()
+	if err != nil {
+		return fmt.Errorf("claim worker runtime: %w", err)
+	}
+	if err := claim.Recover(context.Background()); err != nil {
+		_ = claim.Release(context.Background())
+		return fmt.Errorf("recover worker runtime: %w", err)
+	}
+	if err := claim.Activate(); err != nil {
+		_ = claim.Release(context.Background())
+		return fmt.Errorf("activate worker runtime: %w", err)
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		resultErr = errors.Join(resultErr, claim.Close(closeCtx))
+	}()
 	const leaderName = "leader.pid"
 	const descendantName = "descendant.pid"
 	const termName = "term-observed"
@@ -65,21 +89,22 @@ printf '%s\n' "$$" > "$1"
 while [ ! -s "$2" ]; do sleep 0.01; done
 while :; do sleep 10; done
 `
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	const requestTimeout = 2 * time.Second
 	started := time.Now()
-	err = pool.Run(ctx, supervise.Task{
-		Path: "/bin/sh", Args: []string{"-c", script, "worker", leaderPath, descendantPath, termPath},
+	commandResult, err := pool.Run(context.Background(), worker.CommandRequest{
+		Path: "/bin/sh", Dir: root,
+		Args:         []string{"-c", script, "worker", leaderPath, descendantPath, termPath},
+		TotalTimeout: requestTimeout,
 	})
-	cancel()
 	elapsed := time.Since(started)
 	if err == nil {
 		return errors.New("worker completed without deadline error")
 	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("worker error, want deadline exceeded: %w", err)
+	if !errors.Is(err, worker.ErrTimedOut) || !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("worker error, want typed timeout and deadline exceeded: %w", err)
 	}
-	if elapsed < supervise.TerminationGrace {
-		return fmt.Errorf("worker settled after %s, before TERM grace %s", elapsed, supervise.TerminationGrace)
+	if elapsed < 500*time.Millisecond {
+		return fmt.Errorf("worker settled after %s without an observable TERM grace", elapsed)
 	}
 	content, err := rootFS.ReadFile(termName)
 	if err != nil {
@@ -91,6 +116,9 @@ while :; do sleep 10; done
 	leader, err := readPID(rootFS, leaderName)
 	if err != nil {
 		return err
+	}
+	if receiptPID := commandResult.Receipt.ProcessIdentity().PID; receiptPID != leader {
+		return fmt.Errorf("worker receipt pid = %d, want leader %d", receiptPID, leader)
 	}
 	descendant, err := readPID(rootFS, descendantName)
 	if err != nil {
@@ -112,14 +140,10 @@ while :; do sleep 10; done
 	if len(records) != 0 {
 		return fmt.Errorf("durable records after settlement = %d, want 0", len(records))
 	}
-	retryCtx, retryCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer retryCancel()
-	if err := pool.Run(retryCtx, supervise.Task{Path: "/usr/bin/true"}); err != nil {
+	if _, err := pool.Run(context.Background(), worker.CommandRequest{
+		Path: "/usr/bin/true", Dir: root, TotalTimeout: requestTimeout,
+	}); err != nil {
 		return fmt.Errorf("reuse worker lane: %w", err)
-	}
-	pool.Close()
-	if err := pool.Wait(context.Background()); err != nil {
-		return fmt.Errorf("wait for worker pool: %w", err)
 	}
 	return json.NewEncoder(os.Stdout).Encode(result{
 		LeaderPID: leader, DescendantPID: descendant, ElapsedMS: elapsed.Milliseconds(),
