@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/catalog"
 )
 
 func TestTenantAccountSeparatesPreservedBackingFromPresentation(t *testing.T) {
@@ -27,11 +27,13 @@ func TestTenantAccountSeparatesPreservedBackingFromPresentation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if definition.BackingRoot != backing || definition.Generation != 7 ||
-		definition.FileProviderPresentationInstanceID != account.InstanceID || definition.FileProviderDisplayName != "acct-18" {
+	if definition.Backing.Root != backing || definition.Generation != 7 ||
+		!definition.FileProvider.Enabled ||
+		definition.FileProvider.PresentationInstanceID != account.InstanceID ||
+		definition.FileProvider.DisplayName != "acct-18" {
 		t.Fatalf("definition = %+v", definition)
 	}
-	if len(definition.Presentations) != 1 || definition.Presentations[0] != mountproto.PresentationFileProvider {
-		t.Fatalf("definition presentations = %v", definition.Presentations)
+	if definition.Traits.Presentations != catalog.PresentFileProvider {
+		t.Fatalf("definition presentations = %v", definition.Traits.Presentations)
 	}
 }
