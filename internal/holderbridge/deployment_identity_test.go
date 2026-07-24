@@ -135,15 +135,14 @@ func TestDeploymentPolicyJSONAndDigestAreDeterministicAndComplete(t *testing.T) 
 		!policy.Service.RequireNoWatchPaths || !policy.Service.RequireNoCalendarIntervals ||
 		!policy.Service.ProgramIsFixedBundleExecutable || !policy.Service.RequireNoArguments ||
 		policy.Service.BuildEnvironmentKey != "FUSEKIT_BUILD_ID" || !policy.Service.RequireExactBuildEnvironment ||
-		policy.Proofs.Identity != DeploymentProofIdentity ||
-		policy.Proofs.PostInstallRole != deployment.ProofPostInstall ||
-		policy.Proofs.CandidateReadyRole != deployment.ProofCandidateReady ||
-		policy.Proofs.PriorRestoreRole != deployment.ProofPriorRestore ||
-		policy.Proofs.PriorReadyRole != deployment.ProofPriorReady ||
-		policy.Proofs.PriorRuntimeRole != deployment.ProofPriorRuntime ||
-		policy.Proofs.RollbackRuntimeRole != deployment.ProofRollbackRuntime ||
-		!policy.Proofs.RequireReturnedRoleMatch || !policy.Proofs.RequireReadinessPlanDigest ||
-		!policy.Proofs.BindGenerationCDHash || !policy.Proofs.BindGenerationBundleDigest ||
+		policy.Activation.Identity != DeploymentEvidenceIdentity ||
+		!policy.Activation.RequireInstalledAttestation ||
+		!policy.Activation.RequireExactServicePlan ||
+		!policy.Activation.RequireReadinessRuntimeBuild ||
+		!policy.Activation.RequireReadinessProcessGeneration ||
+		!policy.Activation.BindGenerationCDHash ||
+		!policy.Activation.BindGenerationBundleDigest ||
+		!policy.Activation.BindGenerationEntitlementsDigest ||
 		!policy.Service.Quiesce.DirectPersistentControl ||
 		policy.Service.Quiesce.ControlRole != trustroles.StopController ||
 		!policy.Service.Quiesce.OperationIDIsDaemonkitScoped ||
