@@ -442,12 +442,9 @@ func (s *Store) BeginCredentialOperation(
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return BeginCredentialOperationResult{}, err
 	}
-	if mutation, err := accountMutationByAccount(tx, request.AccountID); err == nil {
+	if _, err := accountMutationByAccount(tx, request.AccountID); err == nil {
 		if request.Kind == CredentialOperationRemove {
 			return BeginCredentialOperationResult{}, ErrAccountMutationBusy
-		}
-		if mutation.Kind == AccountMutationPresentationRebind {
-			return BeginCredentialOperationResult{}, ErrAccountPresentationQuarantined
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return BeginCredentialOperationResult{}, err
