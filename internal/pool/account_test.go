@@ -230,7 +230,9 @@ func TestAbandonAddLostDeleteResponseReplaysReceipt(t *testing.T) {
 }
 
 func TestAbandonAddReplaysEveryRetiredCleanupBoundary(t *testing.T) {
-	for _, stage := range []string{"after-credential", "after-unlink", "after-backing"} {
+	for _, stage := range []string{
+		"after-removal-intent", "after-credential", "after-unlink", "after-backing",
+	} {
 		t.Run(stage, func(t *testing.T) {
 			manager := newAccountManager(t)
 			pending := prepareRemovalTestAdd(t, manager)
@@ -433,7 +435,7 @@ func TestAccountIdentityAndWriteUseBackingOnly(t *testing.T) {
 
 func TestIdentityMissingIsExplicit(t *testing.T) {
 	manager := newAccountManager(t)
-	if _, err := manager.AccountIdentity(t.Context(), 1, testFileProviderConfigDir(1)); !errors.Is(err, ErrNoIdentity) {
+	if _, err := manager.AccountIdentity(t.Context(), 1, testFileProviderPublicPath(1)); !errors.Is(err, ErrNoIdentity) {
 		t.Fatalf("AccountIdentity error = %v", err)
 	}
 }
