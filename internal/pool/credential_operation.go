@@ -1650,7 +1650,18 @@ func (m *Manager) credentialObservation(
 	ctx context.Context,
 	account store.Account,
 ) (store.CredentialExternalState, error) {
-	location := m.Creds.Store(account, creds.SourceKeychain)
+	return m.credentialObservationAt(ctx, account, "")
+}
+
+func (m *Manager) credentialObservationAt(
+	ctx context.Context,
+	account store.Account,
+	expectedPublicPath string,
+) (store.CredentialExternalState, error) {
+	location, err := m.credentialStore(account, expectedPublicPath)
+	if err != nil {
+		return store.CredentialExternalState{}, err
+	}
 	slot := store.CredentialSlotObservation{}
 	credential, err := location.Read(ctx)
 	switch creds.ClassifyRead(err) {
@@ -1683,6 +1694,15 @@ func (m *Manager) CredentialExternalState(
 	account store.Account,
 ) (store.CredentialExternalState, error) {
 	return m.credentialObservation(ctx, account)
+}
+
+// CredentialExternalStateAt observes after validating one explicit presentation path.
+func (m *Manager) CredentialExternalStateAt(
+	ctx context.Context,
+	account store.Account,
+	expectedPublicPath string,
+) (store.CredentialExternalState, error) {
+	return m.credentialObservationAt(ctx, account, expectedPublicPath)
 }
 
 func credentialIntentDigest(
@@ -1728,7 +1748,10 @@ func (m *Manager) credentialTokenChainStateDigest(
 	ctx context.Context,
 	account store.Account,
 ) (*store.CredentialDigest, error) {
-	location := m.Creds.Store(account, creds.SourceKeychain)
+	location, err := m.credentialStore(account, "")
+	if err != nil {
+		return nil, err
+	}
 	credential, err := location.Read(ctx)
 	switch creds.ClassifyRead(err) {
 	case creds.ReadEmpty:

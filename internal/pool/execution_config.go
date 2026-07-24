@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 )
@@ -103,6 +104,42 @@ func RemoveAccountConfigDir(instanceID, verifiedPublicPath string) error {
 	return syncDirectory(filepath.Dir(linkPath))
 }
 
+// ValidateAccountConfigDir verifies one exact stable execution link and its public target.
+func ValidateAccountConfigDir(instanceID, expectedPublicPath string) error {
+	linkPath, err := AccountConfigDir(instanceID)
+	if err != nil {
+		return err
+	}
+	if err := validateAccountConfigTarget(linkPath, expectedPublicPath); err != nil {
+		return err
+	}
+	parent := filepath.Dir(linkPath)
+	if err := validateRealPrivateDirectory(parent); err != nil {
+		return fmt.Errorf("account config parent: %w", err)
+	}
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink == 0 || info.IsDir() {
+		return fmt.Errorf("%w: %s is not the stable execution symlink", ErrAccountConfigLinkConflict, linkPath)
+	}
+	current, err := readExactAccountConfigTarget(linkPath)
+	if err != nil {
+		return err
+	}
+	if current != expectedPublicPath {
+		return fmt.Errorf(
+			"%w: %s targets %q, expected %q",
+			ErrAccountConfigLinkConflict, linkPath, current, expectedPublicPath,
+		)
+	}
+	if err := validateRealPrivateDirectory(expectedPublicPath); err != nil {
+		return fmt.Errorf("account public target: %w", err)
+	}
+	return nil
+}
+
 func replaceAccountConfigDir(
 	instanceID string,
 	previousVerifiedPublicPath string,
@@ -189,6 +226,21 @@ func ensureAccountConfigParent(parent string) error {
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
 		return fmt.Errorf("account config parent %s must be a real 0700 directory", parent)
+	}
+	return nil
+}
+
+func validateRealPrivateDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+		return errors.New("path must be a real private directory")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Geteuid() {
+		return errors.New("path has the wrong owner")
 	}
 	return nil
 }
