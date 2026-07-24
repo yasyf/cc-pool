@@ -840,7 +840,7 @@ func validateExpectedPresentationIdentity(account Account, expected FileProvider
 		validateAccountInstanceID(account.InstanceID) != nil ||
 		expected.TenantID != "account-"+account.InstanceID ||
 		expected.DomainID == "" || strings.ContainsRune(expected.DomainID, 0) ||
-		expected.Generation != account.Generation || expected.PublicPath != account.ConfigDir ||
+		expected.Generation != account.Generation ||
 		!exactPresentationPath(expected.PublicPath) {
 		return ErrAccountPresentationEvidence
 	}
@@ -861,9 +861,6 @@ func presentationMismatch(
 ) AccountPresentationQuarantineReason {
 	if observed.Generation != account.Generation {
 		return AccountPresentationGenerationDrift
-	}
-	if observed.PublicPath != account.ConfigDir {
-		return AccountPresentationPublicPathDrift
 	}
 	if observed.TenantID != bound.Identity.TenantID {
 		return AccountPresentationTenantIDDrift

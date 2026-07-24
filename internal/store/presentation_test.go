@@ -44,9 +44,6 @@ func TestBindDesiredAccountPresentationRejectsIdentityMismatch(t *testing.T) {
 		"tenant":     func(identity *FileProviderPresentationIdentity) { identity.TenantID = "account-other" },
 		"domain":     func(identity *FileProviderPresentationIdentity) { identity.DomainID = "" },
 		"generation": func(identity *FileProviderPresentationIdentity) { identity.Generation++ },
-		"public path": func(identity *FileProviderPresentationIdentity) {
-			identity.PublicPath += "-other"
-		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

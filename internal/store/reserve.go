@@ -134,8 +134,7 @@ func (s *Store) promoteReservedAccount(
 		if presentationIdentity == nil {
 			return errors.New("promote synced account: presentation identity is required")
 		}
-		if err := ValidateReservedPresentationIdentity(reservation, *presentationIdentity); err != nil ||
-			presentationIdentity.PublicPath != a.ConfigDir {
+		if err := ValidateReservedPresentationIdentity(reservation, *presentationIdentity); err != nil {
 			if err == nil {
 				err = ErrAccountPresentationEvidence
 			}
@@ -275,8 +274,7 @@ func (s *Store) ResolveReservedSyncedPromotion(
 		expected.Generation != reservation.Generation {
 		return Account{}, false, ErrSyncedPromotionAmbiguous
 	}
-	if err := ValidateReservedPresentationIdentity(reservation, identity); err != nil ||
-		identity.PublicPath != expected.ConfigDir {
+	if err := ValidateReservedPresentationIdentity(reservation, identity); err != nil {
 		if err == nil {
 			err = ErrAccountPresentationEvidence
 		}
