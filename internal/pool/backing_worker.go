@@ -61,9 +61,13 @@ func (m *Manager) runBackingWorker(
 		ctx, cancel = context.WithTimeout(ctx, backingWorkerTimeout)
 		defer cancel()
 	}
+	home, err := Home()
+	if err != nil {
+		return backingWorkerResponse{}, fmt.Errorf("resolve backing worker home: %w", err)
+	}
 	result, runErr := m.taskRunner.Run(ctx, worker.CommandRequest{
 		Path: m.workerExecutable, Dir: workerexec.TempDir(), Args: []string{backingWorkerArgument},
-		Stdin: input.Bytes(), TotalTimeout: backingWorkerTimeout,
+		Env: []string{"HOME=" + home}, Stdin: input.Bytes(), TotalTimeout: backingWorkerTimeout,
 	})
 	if runErr != nil {
 		return backingWorkerResponse{}, fmt.Errorf("account backing worker: %w: %s", runErr, string(result.Stderr))

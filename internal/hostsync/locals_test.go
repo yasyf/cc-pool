@@ -25,7 +25,7 @@ type localsFixture struct {
 func newLocalsFixture(t *testing.T) *localsFixture {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
-	m, err := pool.OpenDaemon(t.Context())
+	m, err := pool.OpenHostSyncWorker(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
