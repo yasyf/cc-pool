@@ -246,9 +246,17 @@ func (p *fleetSourcePreparer) Prepare(
 			return catalogproto.TenantPreparationProof{}, ctx.Err()
 		}
 	}
+	home, err := pool.Home()
+	if err != nil {
+		return catalogproto.TenantPreparationProof{}, err
+	}
+	publicPath := filepath.Join(home, "Library", "CloudStorage", "CCPoolStatus-"+name)
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		return catalogproto.TenantPreparationProof{}, err
+	}
 	proof := daemonTestPreparationProof(store.Account{
 		InstanceID: account.InstanceID, Generation: account.Generation,
-	}, filepath.Join("/Users/test/Library/CloudStorage", "CCPoolStatus-"+name))
+	}, publicPath)
 	if p.activation != "" {
 		proof.Presentation.FileProvider.ActivationGeneration = p.activation
 	}
@@ -472,7 +480,6 @@ func insertCoordinatorAccounts(t *testing.T, st *store.Store, total int) {
 	for id := 1; id <= total; id++ {
 		admitDaemonTestAccount(t, st, store.Account{
 			ID: id, InstanceID: fmt.Sprintf("%032x", id), Generation: 1,
-			ConfigDir:       testFileProviderConfigDir(id),
 			KeychainService: "service", KeychainAccount: "account",
 		})
 	}
@@ -1074,7 +1081,7 @@ func TestInitializePagesOnlyInterruptedRemovalClaims(t *testing.T) {
 	const total = store.AccountRemovalPageLimit + 1
 	for id := 1; id <= total; id++ {
 		admitDaemonTestAccount(t, st, store.Account{
-			ID: id, ConfigDir: testFileProviderConfigDir(id),
+			ID:              id,
 			KeychainService: "service", KeychainAccount: "account",
 		})
 		if _, err := st.BeginAccountRemoval(id, true); err != nil {
@@ -1292,10 +1299,10 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("presentation"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	admitDaemonTestAccount(t, st, store.Account{
-		ID: 1, ConfigDir: publicPath,
+	admitDaemonTestAccountAtPublicPath(t, st, store.Account{
+		ID:              1,
 		KeychainService: "service", KeychainAccount: "account",
-	})
+	}, publicPath)
 	account, err := st.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
@@ -1350,10 +1357,10 @@ func TestFinishRemovalRequiresExplicitTenantAbsenceProofWhenStateIsAbsent(t *tes
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
-	account := admitDaemonTestAccount(t, st, store.Account{
-		ID: 1, ConfigDir: testFileProviderConfigDir(1),
+	account := admitDaemonTestAccountAtPublicPath(t, st, store.Account{
+		ID:              1,
 		KeychainService: "service", KeychainAccount: "account",
-	})
+	}, testFileProviderPublicPath(1))
 	removal, err := st.BeginAccountRemoval(account.ID, true)
 	if err != nil {
 		t.Fatal(err)
@@ -1376,7 +1383,7 @@ func TestFinishRemovalRequiresExplicitTenantAbsenceProofWhenStateIsAbsent(t *tes
 	if err := coordinator.finishRemoval(t.Context(), removal); err == nil {
 		t.Fatal("absent state completed removal without explicit File Provider absence proof")
 	}
-	if target, err := os.Readlink(account.ConfigDir); err != nil || target != testFileProviderConfigDir(1) {
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != testFileProviderPublicPath(1) {
 		t.Fatalf("execution link changed before retirement proof: target=%q err=%v", target, err)
 	}
 	if _, err := st.GetAccount(account.ID); err != nil {

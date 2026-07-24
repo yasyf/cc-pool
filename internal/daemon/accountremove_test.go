@@ -52,7 +52,7 @@ func newAccountRemovalTestServer(
 		t.Fatal(err)
 	}
 	account := admitDaemonTestAccount(t, st, store.Account{
-		ID: 1, ConfigDir: testFileProviderConfigDir(1),
+		ID:              1,
 		KeychainService: "service", KeychainAccount: "account",
 	})
 	server := &Server{

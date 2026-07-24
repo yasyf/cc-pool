@@ -1031,7 +1031,14 @@ func TestPresentationQuarantinedReloginRepairsPathBeforeOrdinaryLogin(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	targetPath := "/Users/test/Library/CloudStorage/CCPoolStatus-moved-acct-01"
+	home, err := pool.Home()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPath := filepath.Join(home, "Library", "CloudStorage", "CCPoolStatus-moved-acct-01")
+	if err := os.MkdirAll(targetPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	observed := bound.Identity
 	observed.PublicPath = targetPath
 	if err := s.m.Store.ObserveAccountPresentation(account, observed); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
@@ -1194,7 +1201,7 @@ func newAccountMutationTestServerWithStore(
 		},
 		prepareAccount: func(_ context.Context, account store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
 			return daemonTestPreparationProof(
-				account, pool.FileProviderConfigDir(account.ID),
+				account, testFileProviderPublicPath(account.ID),
 			), nil
 		},
 		activatePrepared: func(_ context.Context, _ store.Account, _ tenantfs.PreparationLease, _ catalogproto.TenantPreparationProof, activate func() error) error {
@@ -1210,7 +1217,7 @@ func newAccountMutationTestServerWithStore(
 	if !withAccount {
 		return s, fake, store.Account{}
 	}
-	dir := testFileProviderConfigDir(1)
+	dir := testAccountConfigDir(1)
 	account := store.Account{
 		ID: 1, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 1,
 		ConfigDir: dir, KeychainService: "cc-pool-test-account-1",

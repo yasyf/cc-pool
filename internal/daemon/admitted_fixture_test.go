@@ -3,7 +3,7 @@ package daemon
 import (
 	"crypto/sha256"
 	"fmt"
-	"path/filepath"
+	"os"
 	"testing"
 	"time"
 
@@ -13,6 +13,18 @@ import (
 )
 
 func admitDaemonTestAccount(t *testing.T, st *store.Store, requested store.Account) store.Account {
+	t.Helper()
+	return admitDaemonTestAccountAtPublicPath(
+		t, st, requested, testFileProviderPublicPath(requested.ID),
+	)
+}
+
+func admitDaemonTestAccountAtPublicPath(
+	t *testing.T,
+	st *store.Store,
+	requested store.Account,
+	publicPath string,
+) store.Account {
 	t.Helper()
 	owner := proc.Record{
 		RecoveryID: pool.CredentialOwnerRecoveryID,
@@ -29,12 +41,6 @@ func admitDaemonTestAccount(t *testing.T, st *store.Store, requested store.Accou
 	if reservation.ID != requested.ID {
 		t.Fatalf("admit test account: reserved id %d, want %d", reservation.ID, requested.ID)
 	}
-	presentationPath := requested.ConfigDir
-	if presentationPath == "" {
-		presentationPath = fmt.Sprintf("/tmp/cc-pool-test/acct-%02d", requested.ID)
-	} else if !filepath.IsAbs(presentationPath) {
-		presentationPath = filepath.Join("/tmp/cc-pool-test", presentationPath)
-	}
 	configDir, err := pool.AccountConfigDir(reservation.InstanceID)
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +49,10 @@ func admitDaemonTestAccount(t *testing.T, st *store.Store, requested store.Accou
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.EnsureAccountConfigDir(reservation.InstanceID, presentationPath); err != nil {
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
 		t.Fatal(err)
 	}
 	keychainAccount := requested.KeychainAccount
@@ -81,7 +90,7 @@ func admitDaemonTestAccount(t *testing.T, st *store.Store, requested store.Accou
 	if !begin.Created || begin.Active == nil {
 		t.Fatalf("admit test account: begin = %+v", begin)
 	}
-	proof := daemonFixturePresentationProof(reservation, presentationPath)
+	proof := daemonFixturePresentationProof(reservation, publicPath)
 	fence, err := st.BindAccountMutationPresentation(
 		begin.Active.Fence(),
 		proof,
