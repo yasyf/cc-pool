@@ -50,7 +50,7 @@ func TestRecoverAccountPresentationRepairsHandlesBothCrashSides(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{name: "database old link missing", prepareLink: func(t *testing.T, _ store.Account, _, _ string) {}},
+		{name: "database old link missing", prepareLink: func(_ *testing.T, _ store.Account, _, _ string) {}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			home := t.TempDir()

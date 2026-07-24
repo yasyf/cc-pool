@@ -622,7 +622,8 @@ func (s *Store) GetMeta(key string) (string, bool, error) {
 func (s *Store) SetMeta(key, value string) error {
 	_, err := s.db.Exec(
 		`INSERT INTO meta(key,value) VALUES(?,?)
-		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value,
+	)
 	if err != nil {
 		return fmt.Errorf("set meta %q: %w", key, err)
 	}
@@ -1089,7 +1090,8 @@ func (s *Store) InsertUsageSample(u UsageSample) error {
 		 ON CONFLICT(account_id,ts) DO NOTHING`,
 		u.AccountID, u.TS.Unix(), u.Util5h, u.Util7d,
 		tsOrNil(u.Resets5h), tsOrNil(u.Resets7d), rl, xe, u.ExtraUsed, u.ExtraLimit,
-		u.Scoped7dUtil, tsOrNil(u.Scoped7dResets), u.Scoped7dModel)
+		u.Scoped7dUtil, tsOrNil(u.Scoped7dResets), u.Scoped7dModel,
+	)
 	return err
 }
 
@@ -1124,7 +1126,8 @@ func scanUsageSample(row interface{ Scan(...any) error }) (UsageSample, error) {
 func (s *Store) LatestUsageSample(accountID int) (UsageSample, bool, error) {
 	row := s.db.QueryRow(
 		`SELECT `+usageSampleCols+`
-		 FROM usage_samples WHERE account_id=? ORDER BY ts DESC LIMIT 1`, accountID)
+		 FROM usage_samples WHERE account_id=? ORDER BY ts DESC LIMIT 1`, accountID,
+	)
 	u, err := scanUsageSample(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return u, false, nil
@@ -1141,7 +1144,8 @@ func (s *Store) LatestUsageSample(accountID int) (UsageSample, bool, error) {
 func (s *Store) LatestGoodUsageSample(accountID int) (UsageSample, bool, error) {
 	row := s.db.QueryRow(
 		`SELECT `+usageSampleCols+`
-		 FROM usage_samples WHERE account_id=? AND rate_limited=0 ORDER BY ts DESC LIMIT 1`, accountID)
+		 FROM usage_samples WHERE account_id=? AND rate_limited=0 ORDER BY ts DESC LIMIT 1`, accountID,
+	)
 	u, err := scanUsageSample(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return u, false, nil
@@ -1159,7 +1163,8 @@ func (s *Store) UsageSamplesSince(accountID int, since time.Time) ([]UsageSample
 	rows, err := s.db.Query(
 		`SELECT `+usageSampleCols+`
 		 FROM usage_samples WHERE account_id=? AND ts>=? ORDER BY ts DESC`,
-		accountID, since.Unix())
+		accountID, since.Unix(),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1236,7 +1241,7 @@ var ErrSessionLeaseConflict = errors.New("session File Provider lease changed")
 
 func validateFileProviderLeaseReceipt(receipt FileProviderLeaseReceipt) error {
 	if len(receipt) == 0 || len(receipt) > 64*1024 {
-		return errors.New("File Provider lease receipt must contain 1..65536 bytes")
+		return errors.New("file provider lease receipt must contain 1..65536 bytes")
 	}
 	return nil
 }
@@ -1341,7 +1346,8 @@ func (s *Store) StageSelection(a SelectionActivation) (_ Session, err error) {
 		 file_provider_lease_state,file_provider_lease_receipt,file_provider_lease_expires_at)
 		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		a.Token, a.AccountID, instanceID, generation, a.Process.PID, a.Process.StartedAt.UnixMicro(), a.ConfigDir, a.Cwd,
-		a.At.Unix(), SessionLeasePending, []byte(a.FileProviderLease), a.LeaseExpiresAt.UTC().UnixNano())
+		a.At.Unix(), SessionLeasePending, []byte(a.FileProviderLease), a.LeaseExpiresAt.UTC().UnixNano(),
+	)
 	if err != nil {
 		return Session{}, fmt.Errorf("stage selection session for account %d: %w", a.AccountID, err)
 	}
@@ -1539,7 +1545,8 @@ func sessionBySelectionToken(queryer sessionQueryer, token string) (Session, err
 func (s *Store) ActiveSessionCount(accountID int) (int, error) {
 	var n int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM sessions WHERE account_id=? AND ended_at IS NULL`, accountID).Scan(&n)
+		`SELECT COUNT(*) FROM sessions WHERE account_id=? AND ended_at IS NULL`, accountID,
+	).Scan(&n)
 	return n, err
 }
 
@@ -1553,7 +1560,8 @@ func (s *Store) ActiveSessionTotal() (int, error) {
 // ListActiveSessions returns all live sessions across accounts.
 func (s *Store) ListActiveSessions() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT ` + activeSessionColumns + ` FROM sessions WHERE ended_at IS NULL`)
+		`SELECT ` + activeSessionColumns + ` FROM sessions WHERE ended_at IS NULL`,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1749,7 +1757,8 @@ func (s *Store) GetCwdActivity(cwd string, accountID int) (CwdActivity, error) {
 	err := s.db.QueryRow(
 		`SELECT COALESCE(SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END), 0),
 		        COALESCE(MAX(ended_at), 0)
-		 FROM sessions WHERE cwd = ? AND account_id = ?`, cwd, accountID).Scan(&act.Live, &lastEnded)
+		 FROM sessions WHERE cwd = ? AND account_id = ?`, cwd, accountID,
+	).Scan(&act.Live, &lastEnded)
 	if err != nil {
 		return CwdActivity{}, fmt.Errorf("cwd activity for %s: %w", cwd, err)
 	}
@@ -1782,7 +1791,8 @@ func (s *Store) PinManual(cwd string, accountID int, at time.Time) error {
 		   account_id=excluded.account_id,
 		   selected_at=excluded.selected_at,
 		   manual=1`,
-		cwd, accountID, at.Unix())
+		cwd, accountID, at.Unix(),
+	)
 	if err != nil {
 		return fmt.Errorf("pin %s: %w", cwd, err)
 	}
@@ -1804,7 +1814,8 @@ func (s *Store) DeleteSticky(cwd string) error {
 func (s *Store) DeleteStickyVersion(cwd string, selectedAt time.Time, manual bool) error {
 	if _, err := s.db.Exec(
 		`DELETE FROM sticky WHERE cwd=? AND selected_at=? AND manual=?`,
-		cwd, selectedAt.Unix(), manual); err != nil {
+		cwd, selectedAt.Unix(), manual,
+	); err != nil {
 		return fmt.Errorf("delete sticky for %s: %w", cwd, err)
 	}
 	return nil
@@ -1839,7 +1850,8 @@ func (s *Store) PruneSticky(cutoff time.Time) (int, error) {
 		           COALESCE((SELECT MAX(se.ended_at) FROM sessions se
 		                     WHERE se.cwd = sticky.cwd AND se.account_id = sticky.account_id
 		                       AND se.ended_at IS NOT NULL), 0)) < ?`,
-		cutoff.Unix())
+		cutoff.Unix(),
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -1852,7 +1864,8 @@ func (s *Store) LogRefresh(accountID int, category RefreshCategory, digest [32]b
 	_, err := s.db.Exec(
 		`INSERT INTO refresh_log(account_id,ts,category,digest) VALUES(?,?,?,?)
 		 ON CONFLICT(account_id,ts) DO NOTHING`,
-		accountID, time.Now().Unix(), category, digest[:])
+		accountID, time.Now().Unix(), category, digest[:],
+	)
 	return err
 }
 
@@ -1860,7 +1873,8 @@ func (s *Store) LogRefresh(accountID int, category RefreshCategory, digest [32]b
 // if none.
 func (s *Store) LastRefresh(accountID int) (RefreshEntry, bool, error) {
 	row := s.db.QueryRow(
-		`SELECT account_id,ts,category,digest FROM refresh_log WHERE account_id=? ORDER BY ts DESC LIMIT 1`, accountID)
+		`SELECT account_id,ts,category,digest FROM refresh_log WHERE account_id=? ORDER BY ts DESC LIMIT 1`, accountID,
+	)
 	var e RefreshEntry
 	var ts int64
 	var digest []byte
@@ -1882,7 +1896,8 @@ func (s *Store) LastRefresh(accountID int) (RefreshEntry, bool, error) {
 // as healthy (NeedsLogin false).
 func (s *Store) GetAuthHealth(accountID int) (AuthHealth, error) {
 	row := s.db.QueryRow(
-		`SELECT account_id,needs_login,since,reason,digest,kind,gen FROM auth_health WHERE account_id=?`, accountID)
+		`SELECT account_id,needs_login,since,reason,digest,kind,gen FROM auth_health WHERE account_id=?`, accountID,
+	)
 	var h AuthHealth
 	var needs int
 	var since sql.NullInt64
@@ -1968,7 +1983,8 @@ func (s *Store) SetNeedsLogin(
 		   since=CASE WHEN auth_health.needs_login=1 THEN auth_health.since ELSE excluded.since END,
 		   gen=auth_health.gen+1
 		 WHERE auth_health.kind<>'awaiting_origin' OR excluded.kind='awaiting_origin'`,
-		accountID, at.Unix(), reason, digest[:], string(kind))
+		accountID, at.Unix(), reason, digest[:], string(kind),
+	)
 	if err != nil {
 		return false, fmt.Errorf("set needs-login for account %d: %w", accountID, err)
 	}
@@ -1995,7 +2011,8 @@ func (s *Store) ClearNeedsLogin(accountID int) (bool, error) {
 	res, err := s.db.Exec(
 		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none', digest=zeroblob(32), kind='owned'
 		 WHERE account_id=? AND needs_login=1 AND kind<>'awaiting_origin'`,
-		accountID)
+		accountID,
+	)
 	if err != nil {
 		return false, fmt.Errorf("clear needs-login for account %d: %w", accountID, err)
 	}
@@ -2012,7 +2029,8 @@ func (s *Store) ClearNeedsLoginIfGen(accountID int, gen int64) (bool, error) {
 	res, err := s.db.Exec(
 		`UPDATE auth_health SET needs_login=0, since=NULL, reason='none', digest=zeroblob(32), kind='owned'
 		 WHERE account_id=? AND needs_login=1 AND gen=? AND kind<>'awaiting_origin'`,
-		accountID, gen)
+		accountID, gen,
+	)
 	if err != nil {
 		return false, fmt.Errorf("clear needs-login for account %d: %w", accountID, err)
 	}

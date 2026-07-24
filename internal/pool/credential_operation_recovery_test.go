@@ -422,7 +422,8 @@ func TestCredentialOperationLiveOwnerReopenOnlyJoins(t *testing.T) {
 		t, owner, account, kind, target, intent, before,
 	)
 	operation, err = st.MarkCredentialOperationApplying(
-		operation.Fence(), nil)
+		operation.Fence(), nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +574,8 @@ func TestCredentialOperationRetirementReceiptTakesOverImmediately(t *testing.T) 
 		before,
 	)
 	operation, err = st.MarkCredentialOperationApplying(
-		operation.Fence(), nil)
+		operation.Fence(), nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -843,6 +845,7 @@ func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.
 	if len(pendingRows) != 0 {
 		t.Fatalf("credential-owner pending add survived recovery = %+v", pendingRows)
 	}
+	// #nosec G304 -- pendingMarker is created beneath this test's private temporary root.
 	if got, err := os.ReadFile(pendingMarker); err != nil || string(got) != "public" {
 		t.Fatalf("pending public target after recovery = %q err=%v", got, err)
 	}
@@ -1769,7 +1772,8 @@ func beginRetiredCredentialOperation(
 	)
 	var err error
 	operation, err = manager.Store.MarkCredentialOperationApplying(
-		operation.Fence(), []byte(`{"version":1,"test":"staged-before-external-io"}`))
+		operation.Fence(), []byte(`{"version":1,"test":"staged-before-external-io"}`),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

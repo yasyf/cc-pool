@@ -13,6 +13,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 )
 
+// ErrAccountConfigLinkConflict reports a stable execution link that does not match its presentation.
 var ErrAccountConfigLinkConflict = errors.New("account config link conflicts with verified presentation")
 
 // AccountConfigDir returns the stable execution path for one immutable account instance.
@@ -287,7 +288,7 @@ func readExactAccountConfigTarget(linkPath string) (string, error) {
 		return "", err
 	}
 	if err := validateAccountConfigTarget(linkPath, target); err != nil {
-		return "", fmt.Errorf("%w: %s: %v", ErrAccountConfigLinkConflict, linkPath, err)
+		return "", fmt.Errorf("%w: %s: %w", ErrAccountConfigLinkConflict, linkPath, err)
 	}
 	return target, nil
 }
@@ -308,11 +309,14 @@ func temporaryAccountConfigLink(parent, target string) (string, error) {
 	return "", errors.New("allocate account config link: exhausted names")
 }
 
-func syncDirectory(path string) error {
+func syncDirectory(path string) (err error) {
+	// #nosec G304 -- callers derive path exclusively from validated account state roots.
 	directory, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer func() {
+		err = errors.Join(err, directory.Close())
+	}()
 	return directory.Sync()
 }

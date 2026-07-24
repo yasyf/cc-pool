@@ -171,6 +171,7 @@ func TestAbandonAddJournalsExactCredentialRemoval(t *testing.T) {
 			if _, err := os.Lstat(pending.ConfigDir); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("stable execution link survived retirement: %v", err)
 			}
+			// #nosec G304 -- marker is created beneath this test's private temporary root.
 			if raw, err := os.ReadFile(marker); err != nil || string(raw) != "target" {
 				t.Fatalf("presentation target changed: %q err=%v", raw, err)
 			}
@@ -277,6 +278,7 @@ func TestAbandonAddReplaysEveryRetiredCleanupBoundary(t *testing.T) {
 			if err != nil || reused.ID != pending.Reservation.ID {
 				t.Fatalf("cleanup replay did not release exact reservation: %+v err=%v", reused, err)
 			}
+			// #nosec G304 -- marker is created beneath this test's private temporary root.
 			if raw, err := os.ReadFile(marker); err != nil || string(raw) != stage {
 				t.Fatalf("presentation target after replay = %q err=%v", raw, err)
 			}
@@ -400,6 +402,7 @@ func TestFinishAccountRemovalReplaysAfterUnlinkWithoutCredentialIO(t *testing.T)
 	if _, err := os.Stat(AccountBackingDir(account.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("backing survived retry: %v", err)
 	}
+	// #nosec G304 -- marker is created beneath this test's private temporary root.
 	if raw, err := os.ReadFile(marker); err != nil || string(raw) != "target" {
 		t.Fatalf("presentation target changed: %q err=%v", raw, err)
 	}

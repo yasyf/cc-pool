@@ -88,7 +88,7 @@ func ensureRealDirectory(path string) error {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return errors.New("cc-pool package: application directory is not an exact absolute path")
 	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
+	if err := os.MkdirAll(path, 0o700); err != nil {
 		return fmt.Errorf("cc-pool package: create application directory: %w", err)
 	}
 	info, err := os.Lstat(path)

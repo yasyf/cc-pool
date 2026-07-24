@@ -272,8 +272,10 @@ var (
 type ServiceDeploymentState string
 
 const (
+	// ServiceDeploymentInactive records an installed generation without a live runtime.
 	ServiceDeploymentInactive ServiceDeploymentState = "inactive"
-	ServiceDeploymentActive   ServiceDeploymentState = "active"
+	// ServiceDeploymentActive records the exact running generation.
+	ServiceDeploymentActive ServiceDeploymentState = "active"
 )
 
 // ServiceGeneration identifies one exact attested fixed app generation.

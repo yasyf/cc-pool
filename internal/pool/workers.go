@@ -22,6 +22,7 @@ const (
 )
 
 // CredentialOwnerRecoveryID is the sole durable owner identity for credential mutations.
+// #nosec G101 -- this is a public process-recovery identifier, not credential material.
 const CredentialOwnerRecoveryID proc.RecoveryID = "com.yasyf.cc-pool.credential-owner.v1"
 
 type workerRuntime struct {

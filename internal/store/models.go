@@ -12,8 +12,11 @@ type FileProviderLeaseReceipt []byte
 type SessionLeaseState string
 
 const (
-	SessionLeasePending  SessionLeaseState = "pending"
-	SessionLeaseActive   SessionLeaseState = "active"
+	// SessionLeasePending records a lease awaiting process activation.
+	SessionLeasePending SessionLeaseState = "pending"
+	// SessionLeaseActive records a lease bound to a live process.
+	SessionLeaseActive SessionLeaseState = "active"
+	// SessionLeaseReleased records a terminal lease.
 	SessionLeaseReleased SessionLeaseState = "released"
 )
 

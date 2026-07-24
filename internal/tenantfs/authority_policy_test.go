@@ -175,11 +175,13 @@ func TestClaudeAuthorityPolicySuppressesPrivateStagingFromSnapshotAndDelta(t *te
 		Root: privateRoot, Relative: canonicalName,
 		Exists: true, Kind: sourceauthority.PhysicalFile, Mode: 0o100600,
 	}
-	entries := []sourceauthority.PhysicalEntry{
-		{Root: canonicalClaudeJSONRoot, Relative: ".", Exists: true, Kind: sourceauthority.PhysicalFile, Mode: 0o100600},
-		{Root: sharedClaudeRoot, Relative: settingsFile, Exists: true, Kind: sourceauthority.PhysicalFile, Mode: 0o100600},
+	entries := make([]sourceauthority.PhysicalEntry, 0, 3+len(overlay.PrivateStagingPrefixes))
+	entries = append(
+		entries,
+		sourceauthority.PhysicalEntry{Root: canonicalClaudeJSONRoot, Relative: ".", Exists: true, Kind: sourceauthority.PhysicalFile, Mode: 0o100600},
+		sourceauthority.PhysicalEntry{Root: sharedClaudeRoot, Relative: settingsFile, Exists: true, Kind: sourceauthority.PhysicalFile, Mode: 0o100600},
 		canonical,
-	}
+	)
 	deltaEntries := map[testPolicyPath]sourceauthority.IndexedEntry{
 		{canonical.Root, canonical.Relative}: {Physical: canonical},
 	}

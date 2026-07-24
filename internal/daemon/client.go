@@ -968,7 +968,7 @@ func (c *Client) dial(ctx context.Context) (*clientSession, error) {
 	})
 	if err != nil {
 		if errors.Is(err, wire.ErrBuildMismatch) {
-			return nil, fmt.Errorf("%w: %v", ErrDaemonBuildMismatch, err)
+			return nil, fmt.Errorf("%w: %w", ErrDaemonBuildMismatch, err)
 		}
 		return nil, fmt.Errorf("connect daemon: %w", err)
 	}

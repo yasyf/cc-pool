@@ -150,9 +150,11 @@ func cmdAccount(args []string) error {
 	publicPath := filepath.Join(
 		os.Getenv("HOME"), "Library", "CloudStorage", fmt.Sprintf("CCPool-sim-acct-%02d", *id),
 	)
+	// #nosec G703 -- this isolated simulation intentionally roots state under its caller-supplied HOME.
 	if err := os.MkdirAll(publicPath, 0o700); err != nil {
 		return fmt.Errorf("create simulated File Provider public root: %w", err)
 	}
+	// #nosec G703 -- publicPath is the exact isolated simulation root validated below.
 	publicInfo, err := os.Lstat(publicPath)
 	if err != nil {
 		return fmt.Errorf("inspect simulated File Provider public root: %w", err)

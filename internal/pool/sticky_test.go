@@ -98,15 +98,6 @@ func closePoolTestSession(st *store.Store, id int64, at time.Time) error {
 	return store.ErrSessionLeaseConflict
 }
 
-func mustPoolSessions(t *testing.T, m *Manager) []store.Session {
-	t.Helper()
-	sessions, err := m.Store.ListActiveSessions()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return sessions
-}
-
 func TestStickyPick(t *testing.T) {
 	// SelectedAt round-trips through the store as Unix seconds; the TTL-boundary
 	// case needs the exact comparison.

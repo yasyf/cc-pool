@@ -105,16 +105,15 @@ func (s *Store) PendingAccountPresentationRepairs() ([]AccountPresentationRepair
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var repairs []AccountPresentationRepair
 	for rows.Next() {
 		repair, err := scanAccountPresentationRepair(rows)
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(err, rows.Close())
 		}
 		repairs = append(repairs, repair)
 	}
-	return repairs, rows.Err()
+	return repairs, errors.Join(rows.Err(), rows.Close())
 }
 
 // CommitAccountPresentationRepair installs one path-only binding after exact link repair.

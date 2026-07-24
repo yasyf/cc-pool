@@ -560,6 +560,7 @@ func TestMaterializeAbandonsOnlyProvenUntouchedPromotion(t *testing.T) {
 	if _, err := os.Lstat(configDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stable link survived proven retirement: %v", err)
 	}
+	// #nosec G304 -- marker is created beneath this test's private temporary root.
 	if got, err := os.ReadFile(marker); err != nil || string(got) != "public" {
 		t.Fatalf("public target after cleanup = %q err=%v", got, err)
 	}
@@ -913,6 +914,7 @@ func TestMaterializeNeverReusesRetainedCredentialReservation(t *testing.T) {
 	if !ok || got.ClaudeAiOauth.RefreshToken != "rt-kept" {
 		t.Fatalf("retained credential = %+v ok=%v, want rt-kept intact", got, ok)
 	}
+	// #nosec G304 -- keptBacking is the pool-owned backing root created by this test.
 	raw, err := os.ReadFile(filepath.Join(keptBacking, ".claude.json"))
 	if err != nil {
 		t.Fatal(err)

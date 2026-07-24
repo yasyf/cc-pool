@@ -84,10 +84,11 @@ func exactTestGeneration(t *testing.T) installedGeneration {
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	appPath := filepath.Join(directory, "CCPoolStatus.app")
 	executable := holderExecutablePath(appPath)
-	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	// #nosec G306 -- the fixture must be executable to model the signed app binary.
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return installedGeneration{
@@ -133,10 +134,11 @@ func useDeploymentMetadata(t *testing.T, configure ...func(*productHooks)) {
 	}
 	appPath := filepath.Join(root, "Applications", "CCPoolStatus.app")
 	executable := holderExecutablePath(appPath)
-	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	// #nosec G306 -- the fixture must be executable to model the signed app binary.
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	oldInstalledAppPath := installedAppPath
@@ -146,7 +148,7 @@ func useDeploymentMetadata(t *testing.T, configure ...func(*productHooks)) {
 	version.Version, version.StatusAppVersion = "v0.63.0", "0.63.0"
 	t.Cleanup(func() { version.Version, version.StatusAppVersion = oldVersion, oldAppVersion })
 	oldHooks := makeProductHooks
-	makeProductHooks = func(buildID string, digest deployment.SHA256) productHooks {
+	makeProductHooks = func(_ string, digest deployment.SHA256) productHooks {
 		hooks := newProductHooks("runtime-v1", digest)
 		installTestBuilders(&hooks)
 		for _, apply := range configure {

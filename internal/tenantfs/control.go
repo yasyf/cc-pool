@@ -35,12 +35,18 @@ const (
 type ControlErrorCode string
 
 const (
-	ControlErrorOK          ControlErrorCode = "ok"
-	ControlErrorInvalid     ControlErrorCode = "invalid_request"
-	ControlErrorNotFound    ControlErrorCode = "not_found"
-	ControlErrorConflict    ControlErrorCode = "conflict"
+	// ControlErrorOK reports a successful operation.
+	ControlErrorOK ControlErrorCode = "ok"
+	// ControlErrorInvalid rejects malformed or unauthenticated input.
+	ControlErrorInvalid ControlErrorCode = "invalid_request"
+	// ControlErrorNotFound reports an absent tenant or lease.
+	ControlErrorNotFound ControlErrorCode = "not_found"
+	// ControlErrorConflict reports a generation or identity fence mismatch.
+	ControlErrorConflict ControlErrorCode = "conflict"
+	// ControlErrorUnavailable reports a runtime that cannot currently admit work.
 	ControlErrorUnavailable ControlErrorCode = "unavailable"
-	ControlErrorFailed      ControlErrorCode = "failed"
+	// ControlErrorFailed reports an unclassified operation failure.
+	ControlErrorFailed ControlErrorCode = "failed"
 )
 
 // ControlRemoteError is an exact holder business-operation rejection.
@@ -549,7 +555,8 @@ func classifyControlError(err error) ControlErrorCode {
 func controlSessionDone(events <-chan wire.Event) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
-		for range events {
+		for event := range events {
+			_ = event
 		}
 		close(done)
 	}()

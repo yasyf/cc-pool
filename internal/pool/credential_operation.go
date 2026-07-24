@@ -498,17 +498,6 @@ func (m *Manager) credentialMutationObservationAt(
 	return verified, nil
 }
 
-func (m *Manager) verifyResolvedCredentialQuarantine(
-	ctx context.Context,
-	account store.Account,
-	replacementDigest *store.CredentialDigest,
-	resolutionErr error,
-) (store.CredentialExternalState, error) {
-	return m.verifyResolvedCredentialQuarantineAt(
-		ctx, account, "", replacementDigest, resolutionErr,
-	)
-}
-
 func (m *Manager) verifyResolvedCredentialQuarantineAt(
 	ctx context.Context,
 	account store.Account,
@@ -1063,13 +1052,6 @@ func (m *Manager) CompensateQuarantinedCredentialState(
 	)
 }
 
-func (m *Manager) removeCredentialForAccountRemoval(
-	ctx context.Context,
-	account store.Account,
-) error {
-	return m.removeCredentialForAccountRemovalAt(ctx, account, "")
-}
-
 func (m *Manager) removeCredentialForAccountRemovalAt(
 	ctx context.Context,
 	account store.Account,
@@ -1163,20 +1145,6 @@ func (m *Manager) removeCredentialForAccountRemovalAt(
 		},
 	)
 	return err
-}
-
-func (m *Manager) requireCredentialAbsent(ctx context.Context, account store.Account) error {
-	actual, err := m.credentialMutationObservation(ctx, account)
-	if err != nil {
-		return err
-	}
-	if !credentialStateReadable(actual) {
-		return ErrCredentialUnverifiable
-	}
-	if !credentialStateEmpty(actual) {
-		return ErrCredentialChangedUnderfoot
-	}
-	return nil
 }
 
 func (m *Manager) compensateCredentialStateObserved(

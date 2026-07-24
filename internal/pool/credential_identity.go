@@ -5,9 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
+
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/store"
-	"path/filepath"
 )
 
 // ValidateAccountCredentialBoundary verifies exact execution identity before credential I/O.
@@ -33,9 +34,7 @@ func (m *Manager) credentialStore(
 	expectedPublicPath string,
 ) (creds.Store, error) {
 	if expectedPublicPath == "" {
-		var err error
-		expectedPublicPath, err = m.validateStoredCredentialBoundary(account)
-		if err != nil {
+		if _, err := m.validateStoredCredentialBoundary(account); err != nil {
 			return nil, err
 		}
 	} else if err := ValidateAccountCredentialBoundary(account, expectedPublicPath); err != nil {

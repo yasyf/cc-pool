@@ -964,19 +964,3 @@ func insertAccountPresentationQuarantine(tx *sql.Tx, quarantine AccountPresentat
 	)
 	return err
 }
-
-func accountPresentationBusyExceptMutation(
-	tx *sql.Tx,
-	accountID int,
-	operationID AccountMutationID,
-) (bool, error) {
-	var busy int
-	err := tx.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM sessions WHERE account_id=? AND ended_at IS NULL)
-		 OR EXISTS(SELECT 1 FROM account_mutations WHERE account_id=? AND operation_id<>?)
-		 OR EXISTS(SELECT 1 FROM credential_operations WHERE account_id=?)
-		 OR EXISTS(SELECT 1 FROM account_removals WHERE account_id=?)`,
-		accountID, accountID, operationID[:], accountID, accountID,
-	).Scan(&busy)
-	return busy != 0, err
-}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -185,7 +186,7 @@ func Run(ctx context.Context) error {
 	return s.serve(ctx)
 }
 
-func (s *Server) activate(activation dkdaemon.Activation) (err error) {
+func (s *Server) activate(ctx context.Context) (err error) {
 	s.beginBootstrap()
 	defer func() {
 		if err != nil {
@@ -195,7 +196,7 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	s.holderActive.Store(false)
 	s.holderLost.Store(false)
 	s.runtimePublished.Store(false)
-	if err := ensureHolderRuntime(activation.Context()); err != nil {
+	if err := ensureHolderRuntime(ctx); err != nil {
 		return err
 	}
 	if s.m == nil {
@@ -212,10 +213,10 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 		return err
 	}
 	s.accountTerminals = terminals
-	if err := terminals.Recover(activation.Context()); err != nil {
+	if err := terminals.Recover(ctx); err != nil {
 		return fmt.Errorf("recover account terminals: %w", err)
 	}
-	tenantClient, err := tenantfs.NewControlClient(activation.Context(), pool.FuseKitSocketPath())
+	tenantClient, err := tenantfs.NewControlClient(ctx, pool.FuseKitSocketPath())
 	if err != nil {
 		return fmt.Errorf("connect FuseKit runtime: %w", err)
 	}
@@ -235,25 +236,25 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	s.holderSessionDone = tenantClient.Done()
 	s.disposableWorkers = workers
 	s.accountMutationTerminal = managedAccountMutationTerminalRunner{terminals: terminals, manager: s.m}
-	s.accountMutationLifetime = activation.Context()
+	s.accountMutationLifetime = ctx
 	s.scanSessions = s.m.ScanSessions
 	s.scanProcesses = s.m.ScanProcesses
-	s.tenantCoordinator = newTenantCoordinator(activation.Context(), s, preparer, tenantClient)
+	s.tenantCoordinator = newTenantCoordinator(ctx, s, preparer, tenantClient)
 	s.m.RetirePendingAdd = s.tenantCoordinator.retireReservedAccount
-	if err := s.recoverRetiredAccountMutations(activation.Context()); err != nil {
+	if err := s.recoverRetiredAccountMutations(ctx); err != nil {
 		return fmt.Errorf("recover account mutations: %w", err)
 	}
-	if err := s.recoverPendingAccountMutationPublications(activation.Context()); err != nil {
+	if err := s.recoverPendingAccountMutationPublications(ctx); err != nil {
 		return fmt.Errorf("recover account mutation publications: %w", err)
 	}
 	s.holderActive.Store(true)
-	monitorCtx, monitorCancel := context.WithCancel(activation.Context())
+	monitorCtx, monitorCancel := context.WithCancel(ctx)
 	s.holderMonitorMu.Lock()
 	s.holderMonitorCancel = monitorCancel
 	s.holderMonitorMu.Unlock()
 	s.wg.Add(1)
 	go s.monitorHolderSession(monitorCtx, s.holderSessionDone)
-	s.startTenantRecovery(activation.Context())
+	s.startTenantRecovery(ctx)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -371,41 +372,43 @@ func (s *Server) serve(ctx context.Context) error {
 	settlement, err := activation.ClaimProductSettlement()
 	if err != nil {
 		_ = activation.Fail(err)
-		return errors.Join(err, runtime.Wait(context.Background()), m.Close(ctx))
+		return errors.Join(err, runtime.Wait(context.WithoutCancel(ctx)), m.Close(ctx))
 	}
+	lifetimeCtx, cancelLifetime := contextWithoutCancelUntil(ctx, activation.Context().Done())
+	defer cancelLifetime(context.Canceled)
 	cleanupDone := make(chan error, 1)
-	go func() {
+	go func(ctx context.Context) {
 		<-activation.Context().Done()
-		cleanupDone <- s.settleProductRuntime(settlement)
-	}()
-	fail := func(cause error) error {
+		cleanupDone <- s.settleProductRuntime(ctx, settlement)
+	}(lifetimeCtx)
+	fail := func(ctx context.Context, cause error) error {
 		failErr := activation.Fail(cause)
-		return errors.Join(cause, failErr, runtime.Wait(context.Background()), <-cleanupDone)
+		return errors.Join(cause, failErr, runtime.Wait(context.WithoutCancel(ctx)), <-cleanupDone)
 	}
-	if err := s.activate(activation); err != nil {
-		return fail(err)
+	if err := s.activate(lifetimeCtx); err != nil {
+		return fail(lifetimeCtx, err)
 	}
-	if err := s.startProductRuntime(activation.Context()); err != nil {
-		return fail(err)
+	if err := s.startProductRuntime(lifetimeCtx); err != nil {
+		return fail(lifetimeCtx, err)
 	}
 	staged, err := publication.Stage(activation, true)
 	if err != nil {
-		return fail(err)
+		return fail(lifetimeCtx, err)
 	}
 	if err := activation.CommitReady(staged); err != nil {
-		return fail(err)
+		return fail(lifetimeCtx, err)
 	}
 	s.runtimePublished.Store(true)
-	go func() {
+	go func(ctx context.Context) {
 		select {
 		case <-ctx.Done():
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), defaultEvictTimeout)
+			shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultEvictTimeout)
 			defer cancel()
 			_ = runtime.Shutdown(shutdownCtx)
 		case <-activation.Context().Done():
 		}
-	}()
-	err = runtime.Wait(context.Background())
+	}(ctx)
+	err = runtime.Wait(context.WithoutCancel(ctx))
 	cleanupErr := <-cleanupDone
 	s.log.Printf("daemon stopped")
 	if s.holderLost.Load() {
@@ -418,8 +421,11 @@ func (s *Server) serve(ctx context.Context) error {
 	return err
 }
 
-func (s *Server) settleProductRuntime(settlement dkdaemon.ProductSettlement) error {
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), daemonShutdownTimeout-defaultEvictTimeout)
+func (s *Server) settleProductRuntime(ctx context.Context, settlement dkdaemon.ProductSettlement) error {
+	cleanupCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		daemonShutdownTimeout-defaultEvictTimeout,
+	)
 	defer cancel()
 	s.markClosing()
 	s.runtimePublished.Store(false)
@@ -862,7 +868,11 @@ func (s *Server) activateSelection(ctx context.Context, token string, reserved r
 			return err
 		}
 		commitExpires := time.Now().Add(sessionLeaseTTL).UTC()
-		provisionalExpires := time.Unix(0, int64(reserved.preparation.CriticalReadiness.Lease.ExpiresUnixNano)).UTC()
+		expiresUnixNano := reserved.preparation.CriticalReadiness.Lease.ExpiresUnixNano
+		if expiresUnixNano > math.MaxInt64 {
+			return errors.New("selection preparation lease expiration exceeds the supported range")
+		}
+		provisionalExpires := time.Unix(0, int64(expiresUnixNano)).UTC()
 		if provisionalExpires.After(commitExpires) {
 			commitExpires = provisionalExpires
 		}

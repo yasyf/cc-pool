@@ -1341,6 +1341,7 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 	if _, err := os.Lstat(account.ConfigDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stable execution link after removal = %v", err)
 	}
+	// #nosec G304 -- marker is created beneath this test's private temporary root.
 	if got, err := os.ReadFile(marker); err != nil || string(got) != "presentation" {
 		t.Fatalf("presentation target after removal = %q, %v", got, err)
 	}

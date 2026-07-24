@@ -675,7 +675,7 @@ func (s *Server) finishOrQuarantineAccountMutation(
 }
 
 func (s *Server) exactAccountMutation(
-	ctx context.Context,
+	_ context.Context,
 	request AccountMutationRequest,
 ) (store.AccountMutation, *store.AccountMutationReceipt, error) {
 	operationID := store.AccountMutationID(request.Fence.CanonicalOperationID)

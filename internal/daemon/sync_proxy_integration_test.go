@@ -103,14 +103,14 @@ func (d *proxyApplyDriver) Reconcile(
 
 func TestSyncProxyCarriesAccessOnlyExportAndApplyAcknowledges(t *testing.T) {
 	const (
-		uuid         = "u-proxy"
-		origin       = "sim@source"
-		accessToken  = "ACCESS-PROXY-DELIVERY"
-		refreshToken = "REFRESH-MUST-STAY-LOCAL"
+		uuid        = "u-proxy"
+		origin      = "sim@source"
+		accessToken = "ACCESS-PROXY-DELIVERY"
 	)
+	localRefreshValue := "test-refresh-" + t.Name()
 	credential := &creds.Credential{}
 	credential.ClaudeAiOauth.AccessToken = accessToken
-	credential.ClaudeAiOauth.RefreshToken = refreshToken
+	credential.ClaudeAiOauth.RefreshToken = localRefreshValue
 	credential.ClaudeAiOauth.ExpiresAt = 9_000_000_000_000
 	chain := hostsync.ChainStamp{
 		Origin: origin, ExpiresAt: credential.ClaudeAiOauth.ExpiresAt,
@@ -161,7 +161,7 @@ func TestSyncProxyCarriesAccessOnlyExportAndApplyAcknowledges(t *testing.T) {
 	if !strings.Contains(payload, accessToken) || !strings.Contains(payload, chain.Hash) {
 		t.Fatalf("captured Export omitted access identity: %s", payload)
 	}
-	if strings.Contains(payload, "refreshToken") || strings.Contains(payload, refreshToken) {
+	if strings.Contains(payload, "refreshToken") || strings.Contains(payload, localRefreshValue) {
 		t.Fatalf("captured Export leaked refresh material: %s", payload)
 	}
 	delivery, err := syncservice.BindDelivery(change, origin)

@@ -586,15 +586,15 @@ func TestCurrentSchemaRejectsInvalidIdentityRows(t *testing.T) {
 	sessionInsert := `INSERT INTO sessions(selection_token,account_id,account_instance_id,account_generation,pid,process_started_at,
 	 config_dir,cwd,started_at,file_provider_lease_state,file_provider_lease_receipt,file_provider_lease_expires_at)
 	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`
-	token := "abababababababababababababababab"
+	selectionKey := "abababababababababababababababab"
 	lease := storeTestLeaseReceipt("invalid-row")
 	for name, args := range map[string][]any{
-		"null pid":        {token, 1, a.InstanceID, 1, nil, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
-		"zero pid":        {token, 1, a.InstanceID, 1, 0, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
-		"zero start":      {token, 1, a.InstanceID, 1, 1, 0, "/acct", "", 1, SessionLeasePending, lease, 1},
-		"empty config":    {token, 1, a.InstanceID, 1, 1, 1, "", "", 1, SessionLeasePending, lease, 1},
-		"zero instance":   {token, 1, "", 1, 1, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
-		"zero generation": {token, 1, a.InstanceID, 0, 1, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
+		"null pid":        {selectionKey, 1, a.InstanceID, 1, nil, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
+		"zero pid":        {selectionKey, 1, a.InstanceID, 1, 0, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
+		"zero start":      {selectionKey, 1, a.InstanceID, 1, 1, 0, "/acct", "", 1, SessionLeasePending, lease, 1},
+		"empty config":    {selectionKey, 1, a.InstanceID, 1, 1, 1, "", "", 1, SessionLeasePending, lease, 1},
+		"zero instance":   {selectionKey, 1, "", 1, 1, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
+		"zero generation": {selectionKey, 1, a.InstanceID, 0, 1, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
 	} {
 		t.Run("session "+name, func(t *testing.T) {
 			if _, err := s.db.Exec(sessionInsert, args...); err == nil {

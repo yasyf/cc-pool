@@ -3,8 +3,6 @@ package hostsync
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -262,11 +260,6 @@ func ResolveAppliedCredential(ctx context.Context, uuid string, chain ChainStamp
 	if credential.ClaudeAiOauth.ExpiresAt != chain.ExpiresAt || creds.AccessHash(credential) != chain.Hash {
 		return nil, errors.New("hostsync: applied credential does not match requested chain")
 	}
-	copy := *credential
-	return &copy, nil
-}
-
-func syncSchemaDigest() string {
-	digest := sha256.Sum256([]byte(syncSchemaIdentity + "\x00" + syncSchemaDeclaration))
-	return hex.EncodeToString(digest[:])
+	result := *credential
+	return &result, nil
 }

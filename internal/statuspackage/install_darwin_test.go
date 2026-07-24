@@ -66,7 +66,7 @@ func TestInstallRejectsIdenticalPackagedAndInstalledPaths(t *testing.T) {
 func TestInstallRejectsSymlinkedApplicationDirectory(t *testing.T) {
 	root := t.TempDir()
 	realParent := filepath.Join(root, "real")
-	if err := os.Mkdir(realParent, 0o755); err != nil {
+	if err := os.Mkdir(realParent, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	linkedParent := filepath.Join(root, "Applications")

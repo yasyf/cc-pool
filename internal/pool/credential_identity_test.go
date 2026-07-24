@@ -95,6 +95,7 @@ func TestCredentialBoundaryRejectsInvalidExecutionIdentityBeforeKeychain(t *test
 			name: "world-writable-target",
 			mutate: func(t *testing.T, _ *store.Account, publicPath string) {
 				t.Helper()
+				// #nosec G302 -- the test deliberately creates an insecure target.
 				if err := os.Chmod(publicPath, 0o777); err != nil {
 					t.Fatal(err)
 				}

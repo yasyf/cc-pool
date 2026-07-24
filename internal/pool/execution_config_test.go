@@ -92,6 +92,7 @@ func TestAccountConfigLinkRemovalPreservesTarget(t *testing.T) {
 	if err := RemoveAccountConfigDir(firstTestInstance, target); err != nil {
 		t.Fatal(err)
 	}
+	// #nosec G304 -- marker is created beneath this test's private temporary root.
 	if got, err := os.ReadFile(marker); err != nil || string(got) != "preserved" {
 		t.Fatalf("target marker = %q err=%v", got, err)
 	}

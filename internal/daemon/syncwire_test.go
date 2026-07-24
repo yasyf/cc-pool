@@ -43,7 +43,11 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 	if err := os.MkdirAll(bin, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "synckitd"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	synckitd := filepath.Join(bin, "synckitd")
+	if err := os.WriteFile(synckitd, []byte("#!/bin/sh\nexit 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(synckitd, 0o700); err != nil { // #nosec G302 -- the owner-only test stub must be executable.
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin)
