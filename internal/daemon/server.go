@@ -131,7 +131,6 @@ type Server struct {
 	runtimeHealth              func(context.Context) (dkdaemon.Health, error)
 	bootstrapMu                sync.Mutex
 	bootstrap                  bootstrapState
-	bootstrapNow               func() time.Time
 	prepareAccount             func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error)
 	prepareReservedAccount     func(context.Context, store.PendingAccountReservation) (catalogproto.TenantPreparationProof, error)
 	observePresentationBinding func(context.Context, store.Account, store.PresentationPreparationProof) error

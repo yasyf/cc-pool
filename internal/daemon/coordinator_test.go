@@ -561,7 +561,7 @@ func TestInitializeBindsLiveProofForFreshDesiredAccounts(t *testing.T) {
 	}
 	progress := server.bootstrapSnapshot()
 	if progress.Total != 2 || progress.Settled != 2 || progress.Quarantined != 0 ||
-		!progress.Terminal || len(progress.Failures) != 0 {
+		!progress.Terminal || progress.FailureCount != 0 {
 		t.Fatalf("bootstrap progress = %+v", progress)
 	}
 }
@@ -668,7 +668,7 @@ func TestInitializeSettlesDesiredGenerationMismatchWithDurableQuarantine(t *test
 	}
 	progress := server.bootstrapSnapshot()
 	if progress.Total != 1 || progress.Settled != 1 || progress.Quarantined != 1 ||
-		!progress.Terminal || len(progress.Failures) != 0 {
+		!progress.Terminal || progress.FailureCount != 0 {
 		t.Fatalf("quarantine bootstrap progress = %+v", progress)
 	}
 }

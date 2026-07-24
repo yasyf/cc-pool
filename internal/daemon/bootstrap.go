@@ -1,31 +1,27 @@
 package daemon
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"sort"
-	"time"
+	"strconv"
 )
 
 type bootstrapState struct {
-	started        bool
-	total          int
-	settled        int
-	quarantined    int
-	terminal       bool
-	failures       map[int]string
-	lastProgressAt time.Time
-}
-
-func (s *Server) bootstrapTime() time.Time {
-	if s.bootstrapNow != nil {
-		return s.bootstrapNow()
-	}
-	return time.Now()
+	started     bool
+	revision    uint64
+	total       int
+	settled     int
+	quarantined int
+	terminal    bool
+	failures    map[int][32]byte
 }
 
 func (s *Server) beginBootstrap() {
 	s.bootstrapMu.Lock()
 	s.bootstrap = bootstrapState{
-		started: true, failures: make(map[int]string), lastProgressAt: s.bootstrapTime(),
+		started: true, revision: 1, failures: make(map[int][32]byte),
 	}
 	s.bootstrapMu.Unlock()
 }
@@ -37,7 +33,7 @@ func (s *Server) setBootstrapTotal(total int) {
 		return
 	}
 	s.bootstrap.total = total
-	s.bootstrap.lastProgressAt = s.bootstrapTime()
+	s.bootstrap.revision++
 }
 
 func (s *Server) settleBootstrapAccount(accountID int, quarantined bool, err error) {
@@ -47,13 +43,16 @@ func (s *Server) settleBootstrapAccount(accountID int, quarantined bool, err err
 		return
 	}
 	s.bootstrap.settled++
+	s.bootstrap.revision++
 	if quarantined {
 		s.bootstrap.quarantined++
 	}
 	if err != nil {
-		s.bootstrap.failures[accountID] = err.Error()
+		s.bootstrap.failures[accountID] = sha256.Sum256([]byte(err.Error()))
+		if s.log != nil {
+			s.log.Printf("tenant bootstrap acct-%02d failed: %v", accountID, err)
+		}
 	}
-	s.bootstrap.lastProgressAt = s.bootstrapTime()
 }
 
 func (s *Server) finishBootstrap(err error) {
@@ -63,41 +62,56 @@ func (s *Server) finishBootstrap(err error) {
 		return
 	}
 	if err != nil && len(s.bootstrap.failures) == 0 {
-		s.bootstrap.failures[0] = err.Error()
+		s.bootstrap.failures[0] = sha256.Sum256([]byte(err.Error()))
+		if s.log != nil {
+			s.log.Printf("tenant bootstrap failed before account settlement: %v", err)
+		}
 	}
 	s.bootstrap.terminal = true
-	s.bootstrap.lastProgressAt = s.bootstrapTime()
+	s.bootstrap.revision++
 }
 
 type bootstrapProgress struct {
-	Total          int
-	Settled        int
-	Quarantined    int
-	Terminal       bool
-	Failures       []bootstrapFailure
-	LastProgressAt time.Time
-}
-
-type bootstrapFailure struct {
-	AccountID int
-	Error     string
+	Schema        uint16 `json:"schema"`
+	Revision      uint64 `json:"revision"`
+	Total         int    `json:"total"`
+	Settled       int    `json:"settled"`
+	Quarantined   int    `json:"quarantined"`
+	Terminal      bool   `json:"terminal"`
+	FailureCount  int    `json:"failure_count"`
+	FailureDigest string `json:"failure_digest"`
 }
 
 func (s *Server) bootstrapSnapshot() bootstrapProgress {
 	s.bootstrapMu.Lock()
 	defer s.bootstrapMu.Unlock()
 	progress := bootstrapProgress{
+		Schema: 1, Revision: s.bootstrap.revision,
 		Total: s.bootstrap.total, Settled: s.bootstrap.settled,
 		Quarantined: s.bootstrap.quarantined, Terminal: s.bootstrap.terminal,
-		LastProgressAt: s.bootstrap.lastProgressAt,
+		FailureCount: len(s.bootstrap.failures),
 	}
 	ids := make([]int, 0, len(s.bootstrap.failures))
 	for id := range s.bootstrap.failures {
 		ids = append(ids, id)
 	}
 	sort.Ints(ids)
+	hash := sha256.New()
 	for _, id := range ids {
-		progress.Failures = append(progress.Failures, bootstrapFailure{AccountID: id, Error: s.bootstrap.failures[id]})
+		_, _ = hash.Write([]byte(strconv.Itoa(id)))
+		_, _ = hash.Write([]byte{0})
+		digest := s.bootstrap.failures[id]
+		_, _ = hash.Write(digest[:])
 	}
+	progress.FailureDigest = hex.EncodeToString(hash.Sum(nil))
 	return progress
+}
+
+func (s *Server) bootstrapBarrierSnapshot() (uint64, []byte, error) {
+	progress := s.bootstrapSnapshot()
+	payload, err := json.Marshal(progress)
+	if err != nil {
+		return 0, nil, err
+	}
+	return progress.Revision, payload, nil
 }
