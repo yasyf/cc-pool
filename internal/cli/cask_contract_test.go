@@ -53,10 +53,12 @@ func TestReleasePreservesGatekeeperAndPinsAppResourceDigestIntoFormula(t *testin
 		t.Fatal("formula resource contract uses the resource-local unset version")
 	}
 	nounzip := strings.Index(formula, "using: :nounzip")
+	preserveRPath := strings.Index(formula, "preserve_rpath")
 	ditto := strings.Index(formula, `system "/usr/bin/ditto"`)
 	codesign := strings.Index(formula, `system "/usr/bin/codesign"`)
 	installApp := strings.Index(formula, "libexec.install staged_app")
-	if nounzip < resource || ditto < install || codesign < ditto || installApp < codesign {
+	if nounzip < resource || preserveRPath < dependency || preserveRPath >= resource ||
+		ditto < install || codesign < ditto || installApp < codesign {
 		t.Fatal("formula must preserve nounzip, explicit extraction, validation, and install ordering")
 	}
 	rendered := strings.ReplaceAll(formula, "__VERSION__", "0.64.4")
@@ -76,6 +78,7 @@ func TestReleasePreservesGatekeeperAndPinsAppResourceDigestIntoFormula(t *testin
 		`staged_app = Pathname("CCPoolStatus.app")`,
 		`staged_app.directory?`,
 		`(staged_app/"Contents").directory?`,
+		`preserve_rpath`,
 		`libexec.install staged_app`,
 		`ccp package install`,
 	} {

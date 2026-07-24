@@ -63,6 +63,7 @@ for stage_contract in \
   'staged_app = Pathname("CCPoolStatus.app")' \
   'staged_app.directory?' \
   '(staged_app/"Contents").directory?' \
+  'preserve_rpath' \
   'libexec.install staged_app'
 do
   grep -Fq "$stage_contract" "$formula" || {

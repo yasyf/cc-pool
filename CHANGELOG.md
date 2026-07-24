@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Homebrew installation now keeps the signed status application archive
   opaque until the formula extracts it explicitly, preserving the exact
-  `CCPoolStatus.app` bundle root through resource staging.
+  `CCPoolStatus.app` bundle root and signed Mach-O load commands through
+  resource staging and linkage repair.
 
 ## [0.64.3] - 2026-07-24
 
