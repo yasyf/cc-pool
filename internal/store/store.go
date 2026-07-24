@@ -105,8 +105,7 @@ CREATE TABLE account_mutations (
 		 presentation_generation=0 AND presentation_public_path='') OR
         (state<>'awaiting-presentation' AND config_dir<>'' AND keychain_service<>'' AND keychain_account<>'' AND
 		 ((kind IN ('add','presentation-rebind') AND presentation_tenant_id<>'' AND
-		   presentation_domain_id<>'' AND account_generation=presentation_generation AND
-		   config_dir=presentation_public_path) OR
+		   presentation_domain_id<>'' AND account_generation=presentation_generation) OR
 		  (kind NOT IN ('add','presentation-rebind') AND presentation_tenant_id='' AND
 		   presentation_domain_id='' AND presentation_generation=0 AND presentation_public_path='')))),
 	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
@@ -161,8 +160,7 @@ CREATE TABLE account_mutation_receipts (
   expires_at        INTEGER NOT NULL CHECK(expires_at > committed_at),
 	CHECK((credential_written=1) = (written_credential_digest IS NOT NULL)),
 	CHECK((kind IN ('add','presentation-rebind') AND presentation_tenant_id<>'' AND
-	       presentation_domain_id<>'' AND account_generation=presentation_generation AND
-	       config_dir=presentation_public_path) OR
+	       presentation_domain_id<>'' AND account_generation=presentation_generation) OR
 	      (kind NOT IN ('add','presentation-rebind') AND presentation_tenant_id='' AND
 	       presentation_domain_id='' AND presentation_generation=0 AND presentation_public_path='')),
 	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
@@ -379,8 +377,7 @@ CREATE TABLE account_presentations (
   domain_id               TEXT NOT NULL CHECK(domain_id <> ''),
   presentation_generation INTEGER NOT NULL CHECK(presentation_generation > 0),
   public_path             TEXT NOT NULL CHECK(public_path <> ''),
-  observed_at             INTEGER NOT NULL CHECK(observed_at > 0),
-  CHECK(account_generation = presentation_generation)
+  observed_at             INTEGER NOT NULL CHECK(observed_at > 0)
 );
 CREATE TABLE account_presentation_quarantines (
   account_id              INTEGER PRIMARY KEY CHECK(account_id > 0),
@@ -393,6 +390,20 @@ CREATE TABLE account_presentation_quarantines (
   observed_public_path    TEXT NOT NULL CHECK(observed_public_path <> ''),
   reason                  TEXT NOT NULL CHECK(reason IN ('public-path-drift','tenant-id-drift','domain-id-drift','generation-drift')),
   created_at              INTEGER NOT NULL CHECK(created_at > 0)
+);
+CREATE TABLE account_presentation_repairs (
+  account_id                       INTEGER PRIMARY KEY CHECK(account_id > 0),
+  account_instance_id              TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
+  account_generation               INTEGER NOT NULL CHECK(account_generation > 0),
+  previous_tenant_id               TEXT NOT NULL CHECK(previous_tenant_id <> ''),
+  previous_domain_id               TEXT NOT NULL CHECK(previous_domain_id <> ''),
+  previous_presentation_generation INTEGER NOT NULL CHECK(previous_presentation_generation > 0),
+  previous_public_path             TEXT NOT NULL CHECK(previous_public_path <> ''),
+  target_tenant_id                 TEXT NOT NULL CHECK(target_tenant_id <> ''),
+  target_domain_id                 TEXT NOT NULL CHECK(target_domain_id <> ''),
+  target_presentation_generation   INTEGER NOT NULL CHECK(target_presentation_generation > 0),
+  target_public_path               TEXT NOT NULL CHECK(target_public_path <> ''),
+  created_at                       INTEGER NOT NULL CHECK(created_at > 0)
 );
 CREATE UNIQUE INDEX idx_accounts_live_config_dir ON accounts(config_dir) WHERE deleted_at IS NULL;
 CREATE INDEX idx_account_mutations_owner ON account_mutations(owner_record,account_id);
@@ -763,7 +774,6 @@ func (s *Store) ListActiveAccounts() ([]Account, error) {
 		JOIN account_presentations ON account_presentations.account_id=accounts.id
 		  AND account_presentations.account_instance_id=accounts.instance_id
 		  AND account_presentations.account_generation=accounts.generation
-		  AND account_presentations.public_path=accounts.config_dir
 		WHERE deleted_at IS NULL
 		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)
 		  AND NOT EXISTS (SELECT 1 FROM account_presentation_quarantines WHERE account_id=accounts.id)
@@ -794,7 +804,6 @@ func (s *Store) ListPublishableOrigins() ([]Account, error) {
 		JOIN account_presentations ON account_presentations.account_id=accounts.id
 		  AND account_presentations.account_instance_id=accounts.instance_id
 		  AND account_presentations.account_generation=accounts.generation
-		  AND account_presentations.public_path=accounts.config_dir
 		LEFT JOIN auth_health ON auth_health.account_id=accounts.id
 		WHERE deleted_at IS NULL
 		  AND accounts.account_uuid<>''
@@ -1206,7 +1215,6 @@ func selectionEligible(
 		JOIN account_presentations ON account_presentations.account_id=accounts.id
 		  AND account_presentations.account_instance_id=accounts.instance_id
 		  AND account_presentations.account_generation=accounts.generation
-		  AND account_presentations.public_path=accounts.config_dir
 		WHERE accounts.id=? AND accounts.instance_id=? AND accounts.generation=?
 		  AND accounts.config_dir=? AND accounts.deleted_at IS NULL
 		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)

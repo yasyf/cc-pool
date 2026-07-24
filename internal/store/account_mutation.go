@@ -532,7 +532,7 @@ func (s *Store) BindAccountMutationPresentation(
 	}
 	if err := ValidateReservedPresentationIdentity(PendingAccountReservation{
 		ID: mutation.AccountID, InstanceID: mutation.AccountInstanceID, Generation: mutation.AccountGeneration,
-	}, identity); err != nil || identity.PublicPath != configDir {
+	}, identity); err != nil {
 		if err == nil {
 			err = ErrAccountPresentationEvidence
 		}
@@ -2203,8 +2203,7 @@ func validateAccountMutation(mutation AccountMutation) error {
 			ID: mutation.AccountID, InstanceID: mutation.AccountInstanceID, Generation: mutation.AccountGeneration,
 		}
 		if !mutation.HasPresentationIdentity ||
-			ValidateReservedPresentationIdentity(reservation, mutation.PresentationIdentity) != nil ||
-			mutation.PresentationIdentity.PublicPath != mutation.ConfigDir {
+			ValidateReservedPresentationIdentity(reservation, mutation.PresentationIdentity) != nil {
 			return ErrAccountMutationState
 		}
 	} else if mutation.Kind != AccountMutationAdd && mutation.Kind != AccountMutationPresentationRebind &&
@@ -2253,8 +2252,7 @@ func validateAccountMutationReceipt(receipt AccountMutationReceipt) error {
 			ID: receipt.AccountID, InstanceID: receipt.AccountInstanceID, Generation: receipt.AccountGeneration,
 		}
 		if !receipt.HasPresentationIdentity ||
-			ValidateReservedPresentationIdentity(reservation, receipt.PresentationIdentity) != nil ||
-			receipt.PresentationIdentity.PublicPath != receipt.ConfigDir {
+			ValidateReservedPresentationIdentity(reservation, receipt.PresentationIdentity) != nil {
 			return ErrAccountMutationState
 		}
 	} else if receipt.HasPresentationIdentity {
