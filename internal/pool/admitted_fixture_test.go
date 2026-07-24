@@ -16,12 +16,12 @@ func admitPoolTestAccount(t *testing.T, st *store.Store, requested store.Account
 	var fillers []store.Account
 	for {
 		owner := proc.Record{
-			RecoveryClass: proc.RecoveryTask,
-			PID:           42,
-			StartTime:     "1.0",
-			Boot:          "test-boot",
-			Comm:          "cc-pool-test",
-			Generation:    fmt.Sprintf("admitted-account-%d", requested.ID),
+			RecoveryID: CredentialOwnerRecoveryID,
+			PID:        42,
+			StartTime:  "1.0",
+			Boot:       "test-boot",
+			Comm:       "cc-pool-test",
+			Generation: poolTestGeneration(fmt.Sprintf("admitted-account-%d", requested.ID)),
 		}
 		reservation, err := st.ReserveAccountIndex(owner)
 		if err != nil {

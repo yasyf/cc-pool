@@ -20,9 +20,10 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/cc-pool/internal/workerexec"
+	"github.com/yasyf/daemonkit/worker"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -45,6 +46,7 @@ var usernameRE = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 const fallbackAccount = "claude-code-user"
 
 const maxSecurityOutput = 1 << 20
+const keychainTaskTimeout = 30 * time.Second
 
 type boundedBuffer struct {
 	bytes.Buffer
@@ -189,14 +191,17 @@ func runKeychainTask(
 	if runner == nil {
 		return errors.New("credential keychain worker runner is required")
 	}
-	task := supervise.Task{RecoveryClass: proc.RecoveryTask, Path: securityExecutable(), Args: args}
+	result, err := runner.Run(ctx, worker.CommandRequest{
+		Path: securityExecutable(), Dir: workerexec.TempDir(), Args: args,
+		TotalTimeout: keychainTaskTimeout,
+	})
 	if stdout != nil {
-		task.Stdout = stdout
+		_, _ = stdout.Write(result.Stdout)
 	}
 	if stderr != nil {
-		task.Stderr = stderr
+		_, _ = stderr.Write(result.Stderr)
 	}
-	return runner.Run(ctx, task)
+	return err
 }
 
 // isNotFound recognizes security(1)'s errSecItemNotFound ("could not be found") text.

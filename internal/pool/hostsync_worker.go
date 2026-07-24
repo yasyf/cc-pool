@@ -6,32 +6,24 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
-	"golang.org/x/sys/unix"
+	"github.com/yasyf/cc-pool/internal/workerexec"
+	"github.com/yasyf/daemonkit/worker"
 )
 
-// OpenHostSyncWorker opens child-local state inside an already tracked,
-// killable host-sync process group with its own recovered disposable workers.
-func OpenHostSyncWorker(ctx context.Context, owner proc.Record) (*Manager, error) {
+const hostSyncCommandTimeout = 10 * time.Minute
+
+// OpenHostSyncWorker opens child-local state with its own claimed disposable workers.
+func OpenHostSyncWorker(ctx context.Context) (*Manager, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	identity, err := proc.CurrentIdentity()
-	if err != nil {
-		return nil, fmt.Errorf("bind host-sync worker identity: %w", err)
-	}
-	sessionID, err := unix.Getsid(0)
-	if err != nil {
-		return nil, fmt.Errorf("resolve host-sync worker session: %w", err)
-	}
-	if err := validateHostSyncWorkerOwner(owner, identity, sessionID); err != nil {
-		return nil, err
-	}
-	workers, scanner, err := newWorkerRuntimeAt(ctx, HostSyncWorkerStorePath(), true)
+	workers, scanner, err := newWorkerRuntimeAt(
+		ctx, HostSyncWorkerStorePath(), HostSyncChildStorePath(), true,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -75,28 +67,9 @@ func (m *Manager) RunHostSyncCommand(
 	if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
 		return errors.New("host-sync command did not resolve to a clean absolute executable")
 	}
-	return m.taskRunner.Run(ctx, supervise.Task{
-		RecoveryClass: proc.RecoveryTask,
-		Path:          executable,
-		Args:          args,
+	_, err = m.taskRunner.Run(ctx, worker.CommandRequest{
+		Path: executable, Dir: workerexec.TempDir(), Args: args,
+		TotalTimeout: hostSyncCommandTimeout,
 	})
-}
-
-func validateHostSyncWorkerOwner(
-	owner proc.Record,
-	identity proc.Identity,
-	sessionID int,
-) error {
-	if err := owner.Validate(); err != nil {
-		return err
-	}
-	if owner.RecoveryClass != proc.RecoverySourceOwner || !owner.ProcessGroup ||
-		owner.SessionID != owner.PID || sessionID != owner.PID {
-		return errors.New("host-sync worker requires an exact tracked process-group owner")
-	}
-	if owner.PID != identity.PID || owner.StartTime != identity.StartTime ||
-		owner.Boot != identity.Boot {
-		return proc.ErrIdentityChanged
-	}
-	return nil
+	return err
 }

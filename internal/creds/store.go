@@ -8,7 +8,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 // ErrUnavailable means a Keychain item's state could not be determined: in a
@@ -18,7 +18,7 @@ var ErrUnavailable = errors.New("login keychain not in the security search list"
 
 // TaskRunner executes one durably tracked disposable process group.
 type TaskRunner interface {
-	Run(context.Context, supervise.Task) error
+	Run(context.Context, worker.CommandRequest) (worker.CommandResult, error)
 }
 
 // keychainPathRE captures each quoted keychain path in `security list-keychains` output.

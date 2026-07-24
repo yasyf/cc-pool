@@ -7,20 +7,20 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/workerexec"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 )
 
 // WorkerAuthority binds one Manager to an exact live process owner and task boundary.
 type WorkerAuthority struct {
-	runner     supervise.TaskRunner
+	runner     workerexec.Runner
 	executable string
 	owner      proc.Record
 }
 
 // NewWorkerAuthority validates a parent daemon's durable worker authority.
 func NewWorkerAuthority(
-	runner supervise.TaskRunner,
+	runner workerexec.Runner,
 	executable string,
 	owner proc.Record,
 ) (WorkerAuthority, error) {
@@ -34,7 +34,7 @@ func NewWorkerAuthority(
 	if err := validateCurrentWorkerOwner(owner, identity); err != nil {
 		return WorkerAuthority{}, err
 	}
-	if owner.RecoveryClass != proc.RecoveryTask || owner.ProcessGroup {
+	if owner.RecoveryID != CredentialOwnerRecoveryID || owner.ProcessGroup {
 		return WorkerAuthority{}, errors.New("parent worker authority cannot be a disposable process group")
 	}
 	return WorkerAuthority{runner: runner, executable: executable, owner: owner}, nil
@@ -75,7 +75,7 @@ func NewManager(
 	if err := validateCurrentWorkerOwner(authority.owner, identity); err != nil {
 		return nil, fmt.Errorf("validate worker-bound manager owner: %w", err)
 	}
-	if authority.owner.RecoveryClass != proc.RecoveryTask || authority.owner.ProcessGroup {
+	if authority.owner.RecoveryID != CredentialOwnerRecoveryID || authority.owner.ProcessGroup {
 		return nil, errors.New("worker authority kind does not match process ownership")
 	}
 	manager := &Manager{

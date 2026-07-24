@@ -15,9 +15,8 @@ const (
 	accountRecoveryReceiptPage    = 16
 )
 
-var credentialRecoveryClasses = [...]proc.RecoveryClass{
-	proc.RecoveryTask,
-	proc.RecoverySourceOwner,
+var credentialRecoveryIDs = [...]proc.RecoveryID{
+	CredentialOwnerRecoveryID,
 }
 
 // RecoverRetiredCredentialOwners performs one receipt-fenced bounded recovery
@@ -102,10 +101,10 @@ func (m *Manager) recoverCredentialOwnerPass(ctx context.Context) (bool, bool, e
 	ownerReady := false
 	remaining := false
 	progressed := false
-	for _, class := range credentialRecoveryClasses {
+	for _, recoveryID := range credentialRecoveryIDs {
 		page, err := m.workers.reaper.ReapReceipts(
 			ctx,
-			class,
+			recoveryID,
 			proc.ReapReceiptCursor{},
 			credentialRecoveryReceiptPage,
 		)
@@ -216,10 +215,10 @@ func (m *Manager) TakeoverRetiredAccountMutationPage(
 	ownerReady := false
 	taken := make([]store.AccountMutation, 0, credentialRecoveryLanePage)
 	more := false
-	for _, class := range credentialRecoveryClasses {
+	for _, recoveryID := range credentialRecoveryIDs {
 		page, err := m.workers.reaper.ReapReceipts(
 			ctx,
-			class,
+			recoveryID,
 			proc.ReapReceiptCursor{},
 			accountRecoveryReceiptPage,
 		)

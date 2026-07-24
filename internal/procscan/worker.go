@@ -7,36 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"time"
 
-	daemonproc "github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/cc-pool/internal/workerexec"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 const workerArgument = "__procscan-worker"
 
-const maxWorkerOutput = 1 << 20
-
-type boundedWorkerBuffer struct {
-	bytes.Buffer
-}
-
-func (buffer *boundedWorkerBuffer) Write(p []byte) (int, error) {
-	original := len(p)
-	remaining := maxWorkerOutput - buffer.Len()
-	if remaining <= 0 {
-		return original, nil
-	}
-	if len(p) > remaining {
-		p = p[:remaining]
-	}
-	_, err := buffer.Buffer.Write(p)
-	return original, err
-}
-
-type workerRunner interface {
-	Run(context.Context, supervise.Task) error
-}
+const procscanWorkerTimeout = 30 * time.Second
 
 type workerRequest struct {
 	Executable string `json:"executable,omitempty"`
@@ -50,12 +29,12 @@ type workerResponse struct {
 
 // WorkerScanner executes context-unaware process inspection in disposable workers.
 type WorkerScanner struct {
-	runner     workerRunner
+	runner     workerexec.Runner
 	executable string
 }
 
 // NewWorkerScanner binds process inspection to one daemonkit worker pool.
-func NewWorkerScanner(runner workerRunner, executable string) (*WorkerScanner, error) {
+func NewWorkerScanner(runner workerexec.Runner, executable string) (*WorkerScanner, error) {
 	if runner == nil || executable == "" {
 		return nil, errors.New("procscan: worker runner and executable are required")
 	}
@@ -84,31 +63,19 @@ func (s *WorkerScanner) ProcsByExecutable(ctx context.Context, executable string
 }
 
 func (s *WorkerScanner) run(ctx context.Context, request workerRequest) (workerResponse, error) {
-	input, err := os.CreateTemp("", "cc-pool-procscan-*.json")
+	input, err := json.Marshal(request)
 	if err != nil {
 		return workerResponse{}, err
 	}
-	name := input.Name()
-	defer func() { _ = os.Remove(name) }()
-	if err := json.NewEncoder(input).Encode(request); err != nil {
-		_ = input.Close()
-		return workerResponse{}, err
-	}
-	if _, err := input.Seek(0, io.SeekStart); err != nil {
-		_ = input.Close()
-		return workerResponse{}, err
-	}
-	var output, stderr boundedWorkerBuffer
-	runErr := s.runner.Run(ctx, supervise.Task{
-		RecoveryClass: daemonproc.RecoveryTask,
-		Path:          s.executable, Args: []string{workerArgument}, Stdin: input, Stdout: &output, Stderr: &stderr,
+	result, runErr := s.runner.Run(ctx, worker.CommandRequest{
+		Path: s.executable, Dir: workerexec.TempDir(), Args: []string{workerArgument},
+		Stdin: input, TotalTimeout: procscanWorkerTimeout,
 	})
-	_ = input.Close()
 	if runErr != nil {
-		return workerResponse{}, fmt.Errorf("procscan worker: %w: %s", runErr, stderr.String())
+		return workerResponse{}, fmt.Errorf("procscan worker: %w: %s", runErr, string(result.Stderr))
 	}
 	var response workerResponse
-	if err := json.NewDecoder(&output).Decode(&response); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(result.Stdout)).Decode(&response); err != nil {
 		return workerResponse{}, fmt.Errorf("decode procscan worker response: %w", err)
 	}
 	if response.Error != "" {

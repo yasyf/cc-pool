@@ -490,8 +490,8 @@ func currentCredentialLockWorker() (proc.Record, error) {
 		return proc.Record{}, err
 	}
 	record := proc.Record{
-		RecoveryClass: proc.RecoveryTask,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		RecoveryID: CredentialOwnerRecoveryID,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Executable: identity.Executable, AuditToken: identity.AuditToken,
 		Generation: generation,
 	}
@@ -606,7 +606,7 @@ func validateCredentialLockJournal(
 	if err := journal.Worker.Validate(); err != nil {
 		return err
 	}
-	if journal.Worker.RecoveryClass != proc.RecoveryTask || journal.Worker.ProcessGroup {
+	if journal.Worker.RecoveryID != CredentialOwnerRecoveryID || journal.Worker.ProcessGroup {
 		return errors.New("credential lock journal worker kind is invalid")
 	}
 	for index, target := range journal.Targets {

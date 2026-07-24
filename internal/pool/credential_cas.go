@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -17,8 +16,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
-	daemonproc "github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/cc-pool/internal/workerexec"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 const (
@@ -105,39 +104,20 @@ func (m *Manager) runCredentialCAS(
 	if err := json.NewEncoder(&input).Encode(request); err != nil {
 		return credentialCASProof{}, fmt.Errorf("encode credential CAS request: %w", err)
 	}
-	stdin, inputWriter, err := os.Pipe()
-	if err != nil {
-		return credentialCASProof{}, fmt.Errorf("create credential CAS input pipe: %w", err)
-	}
-	writeDone := make(chan error, 1)
-	go func() {
-		_, writeErr := inputWriter.Write(input.Bytes())
-		writeDone <- errors.Join(writeErr, inputWriter.Close())
-	}()
-	var output, stderr boundedBackingBuffer
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, credentialCASWorkerTimeout)
 		defer cancel()
 	}
-	runErr := m.taskRunner.Run(ctx, supervise.Task{
-		RecoveryClass: daemonproc.RecoveryTask,
-		Path:          m.workerExecutable, Args: []string{casWorkerArgument},
-		Stdin: stdin, Stdout: &output, Stderr: &stderr,
+	result, runErr := m.taskRunner.Run(ctx, worker.CommandRequest{
+		Path: m.workerExecutable, Dir: workerexec.TempDir(), Args: []string{casWorkerArgument},
+		Stdin: input.Bytes(), TotalTimeout: credentialCASWorkerTimeout,
 	})
-	_ = stdin.Close()
 	if runErr != nil {
-		_ = inputWriter.Close()
-	}
-	writeErr := <-writeDone
-	if runErr != nil && errors.Is(writeErr, os.ErrClosed) {
-		writeErr = nil
-	}
-	if err := errors.Join(runErr, writeErr); err != nil {
-		return credentialCASProof{}, fmt.Errorf("credential CAS worker: %w: %s", err, stderr.String())
+		return credentialCASProof{}, fmt.Errorf("credential CAS worker: %w: %s", runErr, string(result.Stderr))
 	}
 	var response CredentialCASResponse
-	if err := decodeCredentialCASJSON(&output, &response); err != nil {
+	if err := decodeCredentialCASJSON(bytes.NewReader(result.Stdout), &response); err != nil {
 		return credentialCASProof{}, fmt.Errorf("decode credential CAS response: %w", err)
 	}
 	proof := credentialCASProof{Before: response.Before, After: response.After}
@@ -496,19 +476,21 @@ func decodeCredentialCASJSON(input io.Reader, value any) error {
 
 type credentialCASDirectRunner struct{}
 
-func (credentialCASDirectRunner) Run(ctx context.Context, task supervise.Task) error {
+func (credentialCASDirectRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 	if task.Path == "" {
-		return errors.New("credential CAS nested task has no executable")
+		return worker.CommandResult{}, errors.New("credential CAS nested task has no executable")
 	}
 	if !filepath.IsAbs(task.Path) || filepath.Clean(task.Path) != task.Path {
-		return errors.New("credential CAS nested task requires a clean absolute executable")
+		return worker.CommandResult{}, errors.New("credential CAS nested task requires a clean absolute executable")
 	}
 	// #nosec G204 -- task.Path is a validated absolute security(1) or test-fixture path.
 	command := exec.CommandContext(ctx, task.Path, task.Args...)
 	command.Dir = task.Dir
 	command.Env = task.Env
-	command.Stdin = task.Stdin
-	command.Stdout = task.Stdout
-	command.Stderr = task.Stderr
-	return command.Run()
+	command.Stdin = bytes.NewReader(task.Stdin)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	return worker.CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
 }

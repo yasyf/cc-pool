@@ -1568,9 +1568,12 @@ func credentialOperationTestDigest(value string) CredentialDigest {
 }
 
 func credentialOperationTestOwner(generation string) proc.Record {
+	digest := sha256.Sum256([]byte(generation))
+	var ownerGeneration proc.OwnerGeneration
+	copy(ownerGeneration[:], digest[:len(ownerGeneration)])
 	return proc.Record{
-		RecoveryClass: proc.RecoveryTask,
-		PID:           42, StartTime: "1.0", Boot: "test-boot", Comm: "cc-pool", Generation: generation,
+		RecoveryID: "com.yasyf.cc-pool.store-test.v1",
+		PID:        42, StartTime: "1.0", Boot: "test-boot", Comm: "cc-pool", Generation: ownerGeneration,
 	}
 }
 

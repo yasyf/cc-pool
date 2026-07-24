@@ -10,8 +10,8 @@ import (
 	"os"
 	"time"
 
-	daemonproc "github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/cc-pool/internal/workerexec"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 const (
@@ -56,42 +56,20 @@ func (m *Manager) runBackingWorker(
 	if err := json.NewEncoder(&input).Encode(request); err != nil {
 		return backingWorkerResponse{}, fmt.Errorf("encode backing worker request: %w", err)
 	}
-	stdin, inputWriter, err := os.Pipe()
-	if err != nil {
-		return backingWorkerResponse{}, fmt.Errorf("create backing worker input pipe: %w", err)
-	}
-	writeDone := make(chan error, 1)
-	go func() {
-		_, writeErr := inputWriter.Write(input.Bytes())
-		writeDone <- errors.Join(writeErr, inputWriter.Close())
-	}()
-	var output, stderr boundedBackingBuffer
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, backingWorkerTimeout)
 		defer cancel()
 	}
-	runErr := m.taskRunner.Run(ctx, supervise.Task{
-		RecoveryClass: daemonproc.RecoveryTask,
-		Path:          m.workerExecutable,
-		Args:          []string{backingWorkerArgument},
-		Stdin:         stdin,
-		Stdout:        &output,
-		Stderr:        &stderr,
+	result, runErr := m.taskRunner.Run(ctx, worker.CommandRequest{
+		Path: m.workerExecutable, Dir: workerexec.TempDir(), Args: []string{backingWorkerArgument},
+		Stdin: input.Bytes(), TotalTimeout: backingWorkerTimeout,
 	})
-	_ = stdin.Close()
 	if runErr != nil {
-		_ = inputWriter.Close()
-	}
-	writeErr := <-writeDone
-	if runErr != nil && errors.Is(writeErr, os.ErrClosed) {
-		writeErr = nil
-	}
-	if err := errors.Join(runErr, writeErr); err != nil {
-		return backingWorkerResponse{}, fmt.Errorf("account backing worker: %w: %s", err, stderr.String())
+		return backingWorkerResponse{}, fmt.Errorf("account backing worker: %w: %s", runErr, string(result.Stderr))
 	}
 	var response backingWorkerResponse
-	if err := json.NewDecoder(&output).Decode(&response); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(result.Stdout)).Decode(&response); err != nil {
 		return backingWorkerResponse{}, fmt.Errorf("decode backing worker response: %w", err)
 	}
 	switch response.ErrorCode {
@@ -131,23 +109,6 @@ func (m *Manager) removeAccountBacking(ctx context.Context, accountID int) error
 		AccountID: accountID,
 	})
 	return err
-}
-
-type boundedBackingBuffer struct {
-	bytes.Buffer
-}
-
-func (buffer *boundedBackingBuffer) Write(p []byte) (int, error) {
-	original := len(p)
-	remaining := maxBackingWorkerIO - buffer.Len()
-	if remaining <= 0 {
-		return original, nil
-	}
-	if len(p) > remaining {
-		p = p[:remaining]
-	}
-	_, err := buffer.Buffer.Write(p)
-	return original, err
 }
 
 // IsBackingWorkerInvocation reports whether args request account backing I/O.

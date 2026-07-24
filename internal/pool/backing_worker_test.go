@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -11,16 +12,18 @@ import (
 	"time"
 
 	daemonproc "github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 type inlineBackingTaskRunner struct{}
 
-func (inlineBackingTaskRunner) Run(ctx context.Context, task supervise.Task) error {
+func (inlineBackingTaskRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 	if !IsBackingWorkerInvocation(task.Args) {
-		return errors.New("unexpected pool test worker task")
+		return worker.CommandResult{}, errors.New("unexpected pool test worker task")
 	}
-	return RunBackingWorker(ctx, task.Stdin, task.Stdout)
+	var output bytes.Buffer
+	err := RunBackingWorker(ctx, bytes.NewReader(task.Stdin), &output)
+	return worker.CommandResult{Stdout: output.Bytes()}, err
 }
 
 func installTestBackingRunner(manager *Manager) {
@@ -86,26 +89,9 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 		"#!/bin/sh\necho $$ > "+strconv.Quote(pidPath)+"\ntrap '' TERM\nwhile :; do sleep 1; done\n",
 	)
 	recordStore := &daemonproc.FileStore{Path: filepath.Join(home, "workers.json")}
-	reaper := &daemonproc.Reaper{
-		Store: recordStore, Generation: "account-backing-worker-test",
-	}
-	workers, err := supervise.NewPool(1, reaper)
-	if err != nil {
-		t.Fatal(err)
-	}
-	workersSettled := false
-	t.Cleanup(func() {
-		if workersSettled {
-			return
-		}
-		workers.Close()
-		workers.Cancel()
-		if waitErr := workers.Wait(context.Background()); waitErr != nil {
-			t.Errorf("settle account backing workers: %v", waitErr)
-		}
-	})
+	workers := activatedPoolTestWorkers(t, recordStore.Path, 1)
 	manager := &Manager{taskRunner: workers, workerExecutable: script}
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	result := make(chan error, 1)
 	go func() {
@@ -121,9 +107,9 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 			if parseErr != nil {
 				t.Fatal(parseErr)
 			}
-			identity, err = daemonproc.Probe(pid)
-			if err != nil {
-				t.Fatal(err)
+			identity, readErr = daemonproc.Probe(pid)
+			if readErr != nil {
+				t.Fatal(readErr)
 			}
 			break
 		}
@@ -136,16 +122,9 @@ func TestPrepareAccountBackingDeadlineKillsReapsAndUntracks(t *testing.T) {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
-	err = <-result
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("prepare account backing error = %v, want deadline exceeded", err)
-	}
-	workers.Close()
-	workers.Cancel()
-	waitErr := workers.Wait(context.Background())
-	workersSettled = true
-	if waitErr != nil {
-		t.Fatal(waitErr)
+	prepareErr := <-result
+	if !errors.Is(prepareErr, context.DeadlineExceeded) {
+		t.Fatalf("prepare account backing error = %v, want deadline exceeded", prepareErr)
 	}
 	records, err := recordStore.Load(context.Background())
 	if err != nil {

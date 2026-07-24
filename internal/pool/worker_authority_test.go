@@ -11,13 +11,13 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 type rejectingTestTaskRunner struct{}
 
-func (rejectingTestTaskRunner) Run(context.Context, supervise.Task) error {
-	return errors.New("unexpected test worker task")
+func (rejectingTestTaskRunner) Run(context.Context, worker.CommandRequest) (worker.CommandResult, error) {
+	return worker.CommandResult{}, errors.New("unexpected test worker task")
 }
 
 func bindTestWorkerAuthority(t *testing.T, manager *Manager, generation string) proc.Record {
@@ -27,14 +27,14 @@ func bindTestWorkerAuthority(t *testing.T, manager *Manager, generation string) 
 		t.Fatal(err)
 	}
 	owner := proc.Record{
-		RecoveryClass: proc.RecoveryTask,
-		PID:           identity.PID,
-		StartTime:     identity.StartTime,
-		Boot:          identity.Boot,
-		Comm:          identity.Comm,
-		Executable:    identity.Executable,
-		AuditToken:    identity.AuditToken,
-		Generation:    "test-worker-authority-" + generation,
+		RecoveryID: CredentialOwnerRecoveryID,
+		PID:        identity.PID,
+		StartTime:  identity.StartTime,
+		Boot:       identity.Boot,
+		Comm:       identity.Comm,
+		Executable: identity.Executable,
+		AuditToken: identity.AuditToken,
+		Generation: poolTestGeneration("test-worker-authority-" + generation),
 	}
 	if err := owner.Validate(); err != nil {
 		t.Fatal(err)

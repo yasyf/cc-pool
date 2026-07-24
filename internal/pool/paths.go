@@ -63,11 +63,23 @@ func DaemonServiceStatePath() string { return statePath("daemon-services.db") }
 // DaemonServiceProcessStorePath is the daemon service controller's worker and stop-authority ledger.
 func DaemonServiceProcessStorePath() string { return statePath("daemon-service-processes.db") }
 
-// DisposableWorkerStorePath is daemonkit's durable process-group identity store.
-func DisposableWorkerStorePath() string { return statePath("workers.json") }
+// DaemonStopControlStorePath is the runtime-side v1 stop preparation ledger.
+func DaemonStopControlStorePath() string { return statePath("daemon-stop-control-v1.db") }
 
-// HostSyncWorkerStorePath is the host-sync child's independent durable process ledger.
-func HostSyncWorkerStorePath() string { return statePath("hostsync-workers-v1.json") }
+// DisposableWorkerStorePath is daemonkit's v1 durable disposable-command ledger.
+func DisposableWorkerStorePath() string { return statePath("workers-v1.db") }
+
+// ChildProcessStorePath is daemonkit's v1 durable non-worker child ledger.
+func ChildProcessStorePath() string { return statePath("children-v1.db") }
+
+// HostSyncWorkerStorePath is the host-sync child's independent v1 worker ledger.
+func HostSyncWorkerStorePath() string { return statePath("hostsync-workers-v1.db") }
+
+// HostSyncChildStorePath is the host-sync child's independent v1 child ledger.
+func HostSyncChildStorePath() string { return statePath("hostsync-children-v1.db") }
+
+// AccountTerminalProcessStorePath is the product account-terminal v1 process ledger.
+func AccountTerminalProcessStorePath() string { return statePath("account-terminals-v1.db") }
 
 // FuseKitBackingRoot is the private source root behind every account presentation.
 func FuseKitBackingRoot() string { return filepath.Join(FuseKitRuntimeDir(), "backing") }

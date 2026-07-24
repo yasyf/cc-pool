@@ -10,8 +10,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/workerexec"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 // Refresher is the slice of *oauth.Client the Manager needs.
@@ -31,7 +32,7 @@ func (m *Manager) credentialOwnerRecord() (proc.Record, error) {
 	if err := validateCurrentWorkerOwner(m.workerAuthority.owner, identity); err != nil {
 		return proc.Record{}, err
 	}
-	if m.workerAuthority.owner.RecoveryClass != proc.RecoveryTask ||
+	if m.workerAuthority.owner.RecoveryID != CredentialOwnerRecoveryID ||
 		m.workerAuthority.owner.ProcessGroup {
 		return proc.Record{}, errors.New("credential worker authority kind changed")
 	}
@@ -110,7 +111,7 @@ type Manager struct {
 
 	workers          *workerRuntime
 	workerAuthority  *WorkerAuthority
-	taskRunner       supervise.TaskRunner
+	taskRunner       workerexec.Runner
 	workerExecutable string
 	credentialCAS    credentialCASFunc
 	recoveryMu       sync.Mutex
@@ -182,12 +183,20 @@ func (m *Manager) Close(ctx context.Context) error {
 	return result
 }
 
-// DisposableWorkers returns the manager-owned daemonkit worker pool.
-func (m *Manager) DisposableWorkers() *supervise.Pool {
+// DisposableWorkers returns the runtime-owned daemonkit worker pool.
+func (m *Manager) DisposableWorkers() *worker.Pool {
 	if m.workers == nil {
 		return nil
 	}
 	return m.workers.pool
+}
+
+// RuntimeChildren returns the runtime-owned bounded child manager.
+func (m *Manager) RuntimeChildren() *proc.Manager {
+	if m.workers == nil {
+		return nil
+	}
+	return m.workers.children
 }
 
 // Meta keys recording pool-level state in the store's meta table.

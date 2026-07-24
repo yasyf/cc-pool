@@ -2,6 +2,7 @@ package procscan
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,7 +10,7 @@ import (
 	"time"
 
 	dkproc "github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 func TestWorkerScannerCancellationKillsReapsAndUntracks(t *testing.T) {
@@ -22,24 +23,40 @@ func TestWorkerScannerCancellationKillsReapsAndUntracks(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := &dkproc.FileStore{Path: filepath.Join(dir, "workers.json")}
-	reaper := &dkproc.Reaper{Store: store, Generation: "procscan-worker-test"}
-	workers, err := supervise.NewPool(1, reaper)
+	digest := sha256.Sum256([]byte(t.Name()))
+	var generation dkproc.OwnerGeneration
+	copy(generation[:], digest[:len(generation)])
+	reaper := &dkproc.Reaper{Store: store, Generation: generation}
+	workers, err := worker.NewPool(worker.Config{
+		Capacity: 1, QueueCapacity: 1, MaxTotalRun: time.Minute,
+		MaxStdinBytes: 1 << 20, MaxStdoutBytes: 1 << 20, MaxStderrBytes: 1 << 20,
+	}, reaper)
 	if err != nil {
 		t.Fatal(err)
 	}
+	claim, err := workers.ClaimRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Activate(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := claim.Close(context.Background()); err != nil {
+			t.Errorf("close worker claim: %v", err)
+		}
+	})
 	scanner, err := NewWorkerScanner(workers, script)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if _, err := scanner.Scan(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Scan error = %v, want deadline exceeded", err)
-	}
-	workers.Close()
-	workers.Cancel()
-	if err := workers.Wait(context.Background()); err != nil {
-		t.Fatal(err)
 	}
 	records, err := store.Load(context.Background())
 	if err != nil {
@@ -47,16 +64,5 @@ func TestWorkerScannerCancellationKillsReapsAndUntracks(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Fatalf("durable worker records after cancellation = %+v", records)
-	}
-}
-
-func TestWorkerOutputIsBounded(t *testing.T) {
-	var output boundedWorkerBuffer
-	payload := make([]byte, maxWorkerOutput*2)
-	if n, err := output.Write(payload); err != nil || n != len(payload) {
-		t.Fatalf("Write = %d, %v", n, err)
-	}
-	if got := output.Len(); got != maxWorkerOutput {
-		t.Fatalf("buffer size = %d, want %d", got, maxWorkerOutput)
 	}
 }

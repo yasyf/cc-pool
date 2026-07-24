@@ -532,7 +532,7 @@ func TestCredentialOperationMismatchedRetirementReceiptCannotTakeOver(t *testing
 		before,
 	)
 	wrongOwner := operation.Owner
-	wrongOwner.Generation += "-other"
+	wrongOwner.Generation = poolTestGeneration("mismatched-receipt-other")
 	receipt, verifier := credentialRetirementReceipt(
 		t, wrongOwner, recovery.workers.owner.Generation,
 	)
@@ -674,7 +674,7 @@ func TestRetirementReceiptWaitsForCredentialAndAccountMutationLanes(t *testing.T
 		t.Fatalf("prepared credential lane after recovery = %v", err)
 	}
 	page, err := verifier.ReapReceipts(
-		t.Context(), proc.RecoveryTask, proc.ReapReceiptCursor{}, 1,
+		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 1,
 	)
 	if err != nil || len(page.Receipts) != 1 || page.Receipts[0].Digest != receipt.Digest {
 		t.Fatalf("retained shared receipt = %+v err=%v", page, err)
@@ -696,14 +696,14 @@ func TestRetirementReceiptWaitsForCredentialAndAccountMutationLanes(t *testing.T
 		t.Fatal("retirement recovery remained after both old-owner lane classes cleared")
 	}
 	page, err = verifier.ReapReceipts(
-		t.Context(), proc.RecoveryTask, proc.ReapReceiptCursor{}, 1,
+		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 1,
 	)
 	if err != nil || len(page.Receipts) != 0 {
 		t.Fatalf("acknowledged receipt remained = %+v err=%v", page, err)
 	}
 }
 
-func TestSourceOwnerReceiptsRecoverEveryCredentialLaneBeforeExactPrefixAck(t *testing.T) {
+func TestCredentialOwnerReceiptsRecoverEveryLaneBeforeExactPrefixAck(t *testing.T) {
 	st := openTestStore(t)
 	credentialAccount := persistTestAccount(t, st, store.Account{
 		ID: 1, ConfigDir: t.TempDir(), KeychainService: "service-source-credential", KeychainAccount: "account-source-credential",
@@ -712,7 +712,7 @@ func TestSourceOwnerReceiptsRecoverEveryCredentialLaneBeforeExactPrefixAck(t *te
 		ID: 2, ConfigDir: t.TempDir(), KeychainService: "service-source-mutation", KeychainAccount: "account-source-mutation",
 	})
 	old := credentialRecoveryManager(t, st, credstest.NewFake(), "source-receipt-owner")
-	old.workers.owner = syntheticSourceOwner(t, 1)
+	old.workers.owner = syntheticCredentialOwner(t, 1)
 	recovery := credentialRecoveryManager(t, st, old.Creds, "source-receipt-recovery")
 
 	credentialBefore, err := old.credentialObservation(t.Context(), credentialAccount)
@@ -772,16 +772,16 @@ func TestSourceOwnerReceiptsRecoverEveryCredentialLaneBeforeExactPrefixAck(t *te
 	}
 
 	reaperGeneration := recovery.workers.owner.Generation
-	receiptPath := filepath.Join(t.TempDir(), "source-owner-recovery.db")
+	receiptPath := filepath.Join(t.TempDir(), "credential-owner-recovery.db")
 	receiptStore := &proc.FileStore{Path: receiptPath, MaxOutstanding: 2}
 	firstReceipt := commitCredentialRetirementReceipt(t, receiptStore, old.workers.owner, reaperGeneration)
-	settledOwner := syntheticSourceOwner(t, 2)
+	settledOwner := syntheticCredentialOwner(t, 2)
 	secondReceipt := commitCredentialRetirementReceipt(t, receiptStore, settledOwner, reaperGeneration)
 	reopened := &proc.FileStore{Path: receiptPath, MaxOutstanding: 2}
 	recovery.workers.reaper = &proc.Reaper{Store: reopened, Generation: reaperGeneration}
-	blockedOwner := syntheticSourceOwner(t, 3)
+	blockedOwner := syntheticCredentialOwner(t, 3)
 	if err := reopened.Add(t.Context(), blockedOwner); !errors.Is(err, proc.ErrReceiptBacklog) {
-		t.Fatalf("unacknowledged source receipts did not retain admission backpressure: %v", err)
+		t.Fatalf("unacknowledged credential-owner receipts did not retain admission backpressure: %v", err)
 	}
 
 	remaining, err := recovery.recoverCredentialOwnerPage(t.Context())
@@ -789,10 +789,10 @@ func TestSourceOwnerReceiptsRecoverEveryCredentialLaneBeforeExactPrefixAck(t *te
 		t.Fatal(err)
 	}
 	if !remaining {
-		t.Fatal("source receipt was acknowledged while its account mutation remained")
+		t.Fatal("credential-owner receipt was acknowledged while its account mutation remained")
 	}
 	if _, err := st.CredentialOperationByToken(credentialOperation.Token); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("source-owned credential lane after recovery = %v", err)
+		t.Fatalf("credential-owner lane after recovery = %v", err)
 	}
 	credentialReceipt, err := st.CredentialOperationReceipt(credentialOperation.Token)
 	if err != nil {
@@ -800,22 +800,22 @@ func TestSourceOwnerReceiptsRecoverEveryCredentialLaneBeforeExactPrefixAck(t *te
 	}
 	if credentialReceipt.TerminalStatus != store.CredentialTerminalQuarantined ||
 		credentialReceipt.Result != store.CredentialResultAmbiguous {
-		t.Fatalf("source-owned credential receipt = %+v", credentialReceipt)
+		t.Fatalf("credential-owner receipt = %+v", credentialReceipt)
 	}
 	pendingRows, _, err := st.PendingAddReservationsOwnedBy(old.workers.owner, 0, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pendingRows) != 0 {
-		t.Fatalf("source-owned pending add survived recovery = %+v", pendingRows)
+		t.Fatalf("credential-owner pending add survived recovery = %+v", pendingRows)
 	}
 	page, err := recovery.workers.reaper.ReapReceipts(
-		t.Context(), proc.RecoverySourceOwner, proc.ReapReceiptCursor{}, 3,
+		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 3,
 	)
 	if err != nil || len(page.Receipts) != 2 ||
 		page.Receipts[0].Digest != firstReceipt.Digest ||
 		page.Receipts[1].Digest != secondReceipt.Digest {
-		t.Fatalf("source receipt prefix after blocked recovery = %+v err=%v", page, err)
+		t.Fatalf("credential-owner receipt prefix after blocked recovery = %+v err=%v", page, err)
 	}
 
 	taken, _, err := recovery.TakeoverRetiredAccountMutationPage(t.Context())
@@ -825,27 +825,27 @@ func TestSourceOwnerReceiptsRecoverEveryCredentialLaneBeforeExactPrefixAck(t *te
 	if len(taken) != 1 || taken[0].OperationID != mutationID ||
 		taken[0].Owner != recovery.workers.owner ||
 		taken[0].OwnerEpoch != mutationBegin.Active.OwnerEpoch+1 {
-		t.Fatalf("source-owned account mutation takeover = %+v", taken)
+		t.Fatalf("credential-owner account mutation takeover = %+v", taken)
 	}
 	remaining, err = recovery.recoverCredentialOwnerPage(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if remaining {
-		t.Fatal("source receipt recovery remained after every old-owner liability cleared")
+		t.Fatal("credential-owner recovery remained after every old-owner liability cleared")
 	}
 	page, err = recovery.workers.reaper.ReapReceipts(
-		t.Context(), proc.RecoverySourceOwner, proc.ReapReceiptCursor{}, 1,
+		t.Context(), CredentialOwnerRecoveryID, proc.ReapReceiptCursor{}, 1,
 	)
 	if err != nil || len(page.Receipts) != 0 {
-		t.Fatalf("acknowledged source receipts remained = %+v err=%v", page, err)
+		t.Fatalf("acknowledged credential-owner receipts remained = %+v err=%v", page, err)
 	}
-	floor, err := reopened.ReapReceiptFloor(t.Context(), proc.RecoverySourceOwner)
+	floor, err := reopened.ReapReceiptFloor(t.Context(), CredentialOwnerRecoveryID)
 	if err != nil || floor.Sequence != secondReceipt.Sequence {
-		t.Fatalf("source receipt floor = %+v err=%v, want sequence %d", floor, err, secondReceipt.Sequence)
+		t.Fatalf("credential-owner receipt floor = %+v err=%v, want sequence %d", floor, err, secondReceipt.Sequence)
 	}
 	if err := reopened.Add(t.Context(), blockedOwner); err != nil {
-		t.Fatalf("source receipt acknowledgement did not reopen admission: %v", err)
+		t.Fatalf("credential-owner receipt acknowledgement did not reopen admission: %v", err)
 	}
 }
 
@@ -1730,7 +1730,7 @@ func recoverExpiredCredentialOperation(
 func credentialRetirementReceipt(
 	t *testing.T,
 	owner proc.Record,
-	reaperGeneration string,
+	reaperGeneration proc.OwnerGeneration,
 ) (proc.ReapReceipt, *proc.Reaper) {
 	t.Helper()
 	receiptStore := &proc.FileStore{Path: filepath.Join(t.TempDir(), "recovery.db")}
@@ -1742,7 +1742,7 @@ func commitCredentialRetirementReceipt(
 	t *testing.T,
 	receiptStore *proc.FileStore,
 	owner proc.Record,
-	reaperGeneration string,
+	reaperGeneration proc.OwnerGeneration,
 ) proc.ReapReceipt {
 	t.Helper()
 	if err := receiptStore.Add(t.Context(), owner); err != nil {
@@ -1760,18 +1760,18 @@ func commitCredentialRetirementReceipt(
 	return receipt
 }
 
-func syntheticSourceOwner(t *testing.T, sequence int) proc.Record {
+func syntheticCredentialOwner(t *testing.T, sequence int) proc.Record {
 	t.Helper()
 	pid := 41000 + sequence
 	owner := proc.Record{
-		RecoveryClass: proc.RecoverySourceOwner,
-		PID:           pid,
-		StartTime:     fmt.Sprintf("source-owner-%d", sequence),
-		Boot:          "source-owner-test-boot",
-		Comm:          "source-owner-test",
-		Generation:    fmt.Sprintf("source-owner-generation-%d", sequence),
-		ProcessGroup:  true,
-		SessionID:     pid,
+		RecoveryID:   CredentialOwnerRecoveryID,
+		PID:          pid,
+		StartTime:    fmt.Sprintf("credential-owner-%d", sequence),
+		Boot:         "credential-owner-test-boot",
+		Comm:         "credential-owner-test",
+		Generation:   poolTestGeneration(fmt.Sprintf("credential-owner-generation-%d", sequence)),
+		ProcessGroup: true,
+		SessionID:    pid,
 	}
 	if err := owner.Validate(); err != nil {
 		t.Fatal(err)

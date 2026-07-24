@@ -19,7 +19,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 type credentialCASTestTaskRunner struct{}
@@ -29,11 +29,13 @@ type credentialCASTestResult struct {
 	err      error
 }
 
-func (credentialCASTestTaskRunner) Run(ctx context.Context, task supervise.Task) error {
+func (credentialCASTestTaskRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 	if len(task.Args) != 1 || task.Args[0] != casWorkerArgument {
-		return errors.New("unexpected credential CAS test task")
+		return worker.CommandResult{}, errors.New("unexpected credential CAS test task")
 	}
-	return RunCredentialCASWorker(ctx, task.Stdin, task.Stdout)
+	var output bytes.Buffer
+	err := RunCredentialCASWorker(ctx, bytes.NewReader(task.Stdin), &output)
+	return worker.CommandResult{Stdout: output.Bytes()}, err
 }
 
 func TestCredentialCASKeychainWrite(t *testing.T) {
