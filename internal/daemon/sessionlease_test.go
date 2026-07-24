@@ -10,6 +10,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/holder"
 )
 
 type testSessionLeaseManager struct {
@@ -68,42 +69,40 @@ func (m *testSessionLeaseManager) Release(
 }
 
 type testSessionLeaseRuntime struct {
-	commit func(catalogproto.CommitFileProviderLeaseRequest) catalogproto.CommitFileProviderLeaseResponse
+	commit func(holder.LocalFileProviderLeaseCommit) catalogproto.FileProviderLeaseReceipt
 }
 
 func (r testSessionLeaseRuntime) CommitFileProviderLease(
 	_ context.Context,
-	_ catalogproto.TenantID,
-	request catalogproto.CommitFileProviderLeaseRequest,
-) (catalogproto.CommitFileProviderLeaseResponse, error) {
+	request holder.LocalFileProviderLeaseCommit,
+) (catalogproto.FileProviderLeaseReceipt, error) {
 	if r.commit != nil {
 		return r.commit(request), nil
 	}
-	return catalogproto.CommitFileProviderLeaseResponse{
-		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Lease: &request.Lease,
-	}, nil
+	committed := request.Lease
+	committed.State = catalogproto.FileProviderLeaseStateCommitted
+	committed.SessionID = request.SessionID
+	committed.ProcessIdentity = request.ProcessIdentity
+	committed.ExpiresUnixNano = uint64(request.ExpiresAt.UnixNano())
+	return committed, nil
 }
 
 func (testSessionLeaseRuntime) RenewFileProviderLease(
 	_ context.Context,
-	_ catalogproto.TenantID,
-	request catalogproto.RenewFileProviderLeaseRequest,
-) (catalogproto.RenewFileProviderLeaseResponse, error) {
-	return catalogproto.RenewFileProviderLeaseResponse{
-		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Lease: &request.Lease,
-	}, nil
+	request holder.LocalFileProviderLeaseRenew,
+) (catalogproto.FileProviderLeaseReceipt, error) {
+	renewed := request.Lease
+	renewed.ExpiresUnixNano = uint64(request.ExpiresAt.UnixNano())
+	return renewed, nil
 }
 
 func (testSessionLeaseRuntime) ReleaseFileProviderLease(
 	_ context.Context,
-	_ catalogproto.TenantID,
-	request catalogproto.ReleaseFileProviderLeaseRequest,
-) (catalogproto.ReleaseFileProviderLeaseResponse, error) {
-	released := request.Lease
+	request catalogproto.FileProviderLeaseReceipt,
+) (catalogproto.FileProviderLeaseReceipt, error) {
+	released := request
 	released.State = catalogproto.FileProviderLeaseStateReleased
-	return catalogproto.ReleaseFileProviderLeaseResponse{
-		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Lease: &released,
-	}, nil
+	return released, nil
 }
 
 func TestCatalogSessionLeaseManagerExactLifecycle(t *testing.T) {
@@ -158,12 +157,14 @@ func TestCatalogSessionLeaseManagerRejectsChangedResponseAndReleasesPending(t *t
 		t.Fatal(err)
 	}
 	changed := catalogSessionLeaseManager{runtime: testSessionLeaseRuntime{commit: func(
-		request catalogproto.CommitFileProviderLeaseRequest,
-	) catalogproto.CommitFileProviderLeaseResponse {
+		request holder.LocalFileProviderLeaseCommit,
+	) catalogproto.FileProviderLeaseReceipt {
 		request.Lease.DomainID += "-changed"
-		return catalogproto.CommitFileProviderLeaseResponse{
-			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Lease: &request.Lease,
-		}
+		request.Lease.State = catalogproto.FileProviderLeaseStateCommitted
+		request.Lease.SessionID = request.SessionID
+		request.Lease.ProcessIdentity = request.ProcessIdentity
+		request.Lease.ExpiresUnixNano = uint64(request.ExpiresAt.UnixNano())
+		return request.Lease
 	}}}
 	process := store.ProcessIdentity{PID: 42, StartedAt: time.Unix(1_700_000_000, 0).UTC()}
 	if _, err := changed.Commit(t.Context(), raw, 7, process, time.Unix(1_800_000_000, 0)); err == nil {

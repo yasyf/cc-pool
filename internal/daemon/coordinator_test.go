@@ -19,25 +19,26 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
-	"github.com/yasyf/fusekit/mountproto"
-	"github.com/yasyf/fusekit/mountservice"
+	"github.com/yasyf/fusekit/holder"
+	"github.com/yasyf/fusekit/tenant"
 )
 
 type lifecycleRuntimeStub struct {
 	mu                 sync.Mutex
-	provision          mountproto.ProvisionTenantResponse
+	provision          holder.LocalTenantAcknowledgement
 	provisionErr       error
-	provisionResponses []mountproto.ProvisionTenantResponse
+	provisionResponses []holder.LocalTenantAcknowledgement
 	provisionErrors    []error
 	provisionCalls     int
-	state              mountproto.StateResponse
+	state              tenant.TenantStatus
 	stateErr           error
 	stateCalls         int
-	replace            mountproto.ReplaceTenantResponse
+	replace            holder.LocalTenantAcknowledgement
 	replaceErr         error
 	replaceExpected    uint64
-	remove             mountproto.RemoveTenantResponse
+	remove             holder.LocalTenantRetirementProof
 	removeErr          error
 	removeExpected     uint64
 	removed            bool
@@ -46,7 +47,7 @@ type lifecycleRuntimeStub struct {
 func (r *lifecycleRuntimeStub) ProvisionTenant(
 	context.Context,
 	tenantfs.Account,
-) (mountproto.ProvisionTenantResponse, error) {
+) (holder.LocalTenantAcknowledgement, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	index := r.provisionCalls
@@ -61,18 +62,18 @@ func (r *lifecycleRuntimeStub) ReplaceTenant(
 	_ context.Context,
 	_ tenantfs.Account,
 	expected uint64,
-) (mountproto.ReplaceTenantResponse, error) {
+) (holder.LocalTenantAcknowledgement, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.replaceExpected = expected
 	return r.replace, r.replaceErr
 }
 
-func (r *lifecycleRuntimeStub) RemoveTenant(
+func (r *lifecycleRuntimeStub) RetireTenant(
 	_ context.Context,
 	_ tenantfs.Account,
 	expected uint64,
-) (mountproto.RemoveTenantResponse, error) {
+) (holder.LocalTenantRetirementProof, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.removeExpected = expected
@@ -84,16 +85,16 @@ func (r *lifecycleRuntimeStub) RemoveTenant(
 
 func (r *lifecycleRuntimeStub) TenantState(
 	context.Context,
-	tenantfs.Account,
-) (mountproto.StateResponse, error) {
+	catalog.TenantID,
+) (tenant.TenantStatus, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stateCalls++
 	if r.stateErr != nil {
-		return mountproto.StateResponse{}, r.stateErr
+		return tenant.TenantStatus{}, r.stateErr
 	}
 	if r.removed {
-		return mountproto.StateResponse{}, remoteError(mountproto.ErrorCodeNotFound)
+		return tenant.TenantStatus{}, controlRemoteError(tenantfs.ControlErrorNotFound)
 	}
 	return r.state, nil
 }
@@ -126,21 +127,20 @@ type absentRemovalRuntime struct {
 	removeCalls int
 }
 
-func (r *absentRemovalRuntime) RemoveTenant(
+func (r *absentRemovalRuntime) RetireTenant(
 	_ context.Context,
 	account tenantfs.Account,
 	expected uint64,
-) (mountproto.RemoveTenantResponse, error) {
+) (holder.LocalTenantRetirementProof, error) {
 	id, err := account.TenantID()
 	if err != nil {
-		return mountproto.RemoveTenantResponse{}, err
+		return holder.LocalTenantRetirementProof{}, err
 	}
 	r.mu.Lock()
 	r.removeCalls++
 	r.mu.Unlock()
-	return mountproto.RemoveTenantResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		TenantID: mountproto.TenantID(id), Generation: expected,
+	return holder.LocalTenantRetirementProof{
+		Tenant: id, Generation: catalog.Generation(expected),
 		FileProviderAbsent: true,
 	}, nil
 }
@@ -148,17 +148,16 @@ func (r *absentRemovalRuntime) RemoveTenant(
 func (r *fleetLifecycleRuntime) ProvisionTenant(
 	_ context.Context,
 	account tenantfs.Account,
-) (mountproto.ProvisionTenantResponse, error) {
+) (holder.LocalTenantAcknowledgement, error) {
 	id, err := account.TenantID()
 	if err != nil {
-		return mountproto.ProvisionTenantResponse{}, err
+		return holder.LocalTenantAcknowledgement{}, err
 	}
 	r.mu.Lock()
 	r.provisioned = append(r.provisioned, account.FileProviderDisplayName)
 	r.mu.Unlock()
-	return mountproto.ProvisionTenantResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		TenantID: mountproto.TenantID(id), Generation: account.Generation,
+	return holder.LocalTenantAcknowledgement{
+		Tenant: id, Generation: catalog.Generation(account.Generation), Presentations: catalog.PresentFileProvider,
 	}, nil
 }
 
@@ -166,31 +165,30 @@ func (*fleetLifecycleRuntime) ReplaceTenant(
 	context.Context,
 	tenantfs.Account,
 	uint64,
-) (mountproto.ReplaceTenantResponse, error) {
-	return mountproto.ReplaceTenantResponse{}, errors.New("unexpected replace")
+) (holder.LocalTenantAcknowledgement, error) {
+	return holder.LocalTenantAcknowledgement{}, errors.New("unexpected replace")
 }
 
-func (*fleetLifecycleRuntime) RemoveTenant(
+func (*fleetLifecycleRuntime) RetireTenant(
 	_ context.Context,
 	account tenantfs.Account,
 	expected uint64,
-) (mountproto.RemoveTenantResponse, error) {
+) (holder.LocalTenantRetirementProof, error) {
 	id, err := account.TenantID()
 	if err != nil {
-		return mountproto.RemoveTenantResponse{}, err
+		return holder.LocalTenantRetirementProof{}, err
 	}
-	return mountproto.RemoveTenantResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		TenantID: mountproto.TenantID(id), Generation: expected,
+	return holder.LocalTenantRetirementProof{
+		Tenant: id, Generation: catalog.Generation(expected),
 		FileProviderAbsent: true,
 	}, nil
 }
 
 func (*fleetLifecycleRuntime) TenantState(
 	context.Context,
-	tenantfs.Account,
-) (mountproto.StateResponse, error) {
-	return mountproto.StateResponse{}, remoteError(mountproto.ErrorCodeNotFound)
+	catalog.TenantID,
+) (tenant.TenantStatus, error) {
+	return tenant.TenantStatus{}, controlRemoteError(tenantfs.ControlErrorNotFound)
 }
 
 func (r *fleetLifecycleRuntime) provisionedAccounts() []string {
@@ -279,7 +277,7 @@ func newBlockingLifecycleRuntime(total int) *blockingLifecycleRuntime {
 func (r *blockingLifecycleRuntime) ProvisionTenant(
 	ctx context.Context,
 	account tenantfs.Account,
-) (mountproto.ProvisionTenantResponse, error) {
+) (holder.LocalTenantAcknowledgement, error) {
 	r.mu.Lock()
 	r.calls++
 	r.active++
@@ -294,20 +292,18 @@ func (r *blockingLifecycleRuntime) ProvisionTenant(
 		r.mu.Lock()
 		r.active--
 		r.mu.Unlock()
-		return mountproto.ProvisionTenantResponse{}, ctx.Err()
+		return holder.LocalTenantAcknowledgement{}, ctx.Err()
 	}
 	r.mu.Lock()
 	r.active--
 	r.mu.Unlock()
 	id, err := account.TenantID()
 	if err != nil {
-		return mountproto.ProvisionTenantResponse{}, err
+		return holder.LocalTenantAcknowledgement{}, err
 	}
-	return mountproto.ProvisionTenantResponse{
-		Protocol:   mountproto.Version,
-		Code:       mountproto.ErrorCodeOk,
-		TenantID:   mountproto.TenantID(id),
-		Generation: account.Generation,
+	return holder.LocalTenantAcknowledgement{
+		Tenant: id, Generation: catalog.Generation(account.Generation),
+		Presentations: catalog.PresentFileProvider,
 	}, nil
 }
 
@@ -315,23 +311,23 @@ func (*blockingLifecycleRuntime) ReplaceTenant(
 	context.Context,
 	tenantfs.Account,
 	uint64,
-) (mountproto.ReplaceTenantResponse, error) {
-	return mountproto.ReplaceTenantResponse{}, errors.New("unexpected replace")
+) (holder.LocalTenantAcknowledgement, error) {
+	return holder.LocalTenantAcknowledgement{}, errors.New("unexpected replace")
 }
 
-func (*blockingLifecycleRuntime) RemoveTenant(
+func (*blockingLifecycleRuntime) RetireTenant(
 	context.Context,
 	tenantfs.Account,
 	uint64,
-) (mountproto.RemoveTenantResponse, error) {
-	return mountproto.RemoveTenantResponse{}, errors.New("unexpected remove")
+) (holder.LocalTenantRetirementProof, error) {
+	return holder.LocalTenantRetirementProof{}, errors.New("unexpected retire")
 }
 
 func (*blockingLifecycleRuntime) TenantState(
 	context.Context,
-	tenantfs.Account,
-) (mountproto.StateResponse, error) {
-	return mountproto.StateResponse{}, errors.New("unexpected state")
+	catalog.TenantID,
+) (tenant.TenantStatus, error) {
+	return tenant.TenantStatus{}, errors.New("unexpected state")
 }
 
 func (r *blockingLifecycleRuntime) counts() (calls, active, maximum int) {
@@ -359,13 +355,14 @@ func (p *sourcePreparerStub) Validate(
 	return p.validateErr
 }
 
-func exactState(id mountproto.TenantID, generation uint64) mountproto.StateResponse {
-	return mountproto.StateResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		State: &mountproto.TenantState{
-			OwnerID: mountproto.OwnerID(tenantfs.OwnerID), TenantID: id, Generation: generation,
-			Desired: 11, Applied: 11, StateVersion: 1, ReplacementEligible: true,
+func exactState(id catalog.TenantID, generation uint64) tenant.TenantStatus {
+	return tenant.TenantStatus{
+		Owner: tenant.OwnerID(tenantfs.OwnerID),
+		State: tenant.TenantState{
+			Tenant: id, Generation: catalog.Generation(generation),
+			Desired: 11, Applied: 11, Version: 1,
 		},
+		ReplacementEligible: true,
 	}
 }
 
@@ -375,8 +372,8 @@ func testPreparationLease() tenantfs.PreparationLease {
 	}
 }
 
-func remoteError(code mountproto.ErrorCode) error {
-	return &mountservice.RemoteError{Code: code, Message: string(code)}
+func controlRemoteError(code tenantfs.ControlErrorCode) error {
+	return &tenantfs.ControlRemoteError{Code: code, Message: string(code)}
 }
 
 func allAccountRemovals(t *testing.T, st *store.Store) []store.AccountRemoval {
@@ -395,7 +392,7 @@ func allAccountRemovals(t *testing.T, st *store.Store) []store.AccountRemoval {
 	}
 }
 
-func testTenantAccount(t *testing.T) (store.Account, tenantfs.Account, mountproto.TenantID) {
+func testTenantAccount(t *testing.T) (store.Account, tenantfs.Account, catalog.TenantID) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	account := store.Account{
@@ -406,7 +403,7 @@ func testTenantAccount(t *testing.T) (store.Account, tenantfs.Account, mountprot
 	if err != nil {
 		t.Fatal(err)
 	}
-	return account, tenantAccount, mountproto.TenantID(tenantID)
+	return account, tenantAccount, tenantID
 }
 
 func insertCoordinatorAccounts(t *testing.T, st *store.Store, total int) {
@@ -463,11 +460,11 @@ func openDesiredCoordinatorStore(t *testing.T, total int) *store.Store {
 func TestEnsureTenantReplacesPriorGenerationAfterProvisionConflict(t *testing.T) {
 	account, tenantAccount, tenantID := testTenantAccount(t)
 	runtime := &lifecycleRuntimeStub{
-		provisionErr: remoteError(mountproto.ErrorCodeConflict),
+		provisionErr: controlRemoteError(tenantfs.ControlErrorConflict),
 		state:        exactState(tenantID, 2),
-		replace: mountproto.ReplaceTenantResponse{
-			Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-			TenantID: tenantID, Generation: account.Generation,
+		replace: holder.LocalTenantAcknowledgement{
+			Tenant: tenantID, Generation: catalog.Generation(account.Generation),
+			Presentations: catalog.PresentFileProvider,
 		},
 	}
 	coordinator := &tenantCoordinator{runtime: runtime}
@@ -482,15 +479,15 @@ func TestEnsureTenantReplacesPriorGenerationAfterProvisionConflict(t *testing.T)
 func TestEnsureTenantRetriesConflictThatRacesWithAbsence(t *testing.T) {
 	account, tenantAccount, tenantID := testTenantAccount(t)
 	runtime := &lifecycleRuntimeStub{
-		provisionResponses: []mountproto.ProvisionTenantResponse{
+		provisionResponses: []holder.LocalTenantAcknowledgement{
 			{},
 			{
-				Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-				TenantID: tenantID, Generation: account.Generation,
+				Tenant: tenantID, Generation: catalog.Generation(account.Generation),
+				Presentations: catalog.PresentFileProvider,
 			},
 		},
-		provisionErrors: []error{remoteError(mountproto.ErrorCodeConflict), nil},
-		stateErr:        remoteError(mountproto.ErrorCodeNotFound),
+		provisionErrors: []error{controlRemoteError(tenantfs.ControlErrorConflict), nil},
+		stateErr:        controlRemoteError(tenantfs.ControlErrorNotFound),
 	}
 	if err := (&tenantCoordinator{runtime: runtime}).ensureTenant(t.Context(), account, tenantAccount); err != nil {
 		t.Fatal(err)
@@ -502,9 +499,9 @@ func TestEnsureTenantRetriesConflictThatRacesWithAbsence(t *testing.T) {
 
 func TestPrepareProvisionsBeforeOnDemandConvergence(t *testing.T) {
 	account, tenantAccount, tenantID := testTenantAccount(t)
-	runtime := &lifecycleRuntimeStub{provision: mountproto.ProvisionTenantResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		TenantID: tenantID, Generation: account.Generation,
+	runtime := &lifecycleRuntimeStub{provision: holder.LocalTenantAcknowledgement{
+		Tenant: tenantID, Generation: catalog.Generation(account.Generation),
+		Presentations: catalog.PresentFileProvider,
 	}}
 	preparer := &sourcePreparerStub{}
 	coordinator := &tenantCoordinator{runtime: runtime, preparer: preparer}
@@ -964,7 +961,7 @@ func TestInitializePagesOnlyInterruptedRemovalClaims(t *testing.T) {
 	}
 	runtime := &absentRemovalRuntime{
 		lifecycleRuntimeStub: lifecycleRuntimeStub{
-			stateErr: remoteError(mountproto.ErrorCodeNotFound),
+			stateErr: controlRemoteError(tenantfs.ControlErrorNotFound),
 		},
 	}
 	server := &Server{
@@ -1148,10 +1145,9 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := &lifecycleRuntimeStub{
-		state: exactState(mountproto.TenantID(tenantID), account.Generation),
-		remove: mountproto.RemoveTenantResponse{
-			Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-			TenantID: mountproto.TenantID(tenantID), Generation: account.Generation,
+		state: exactState(tenantID, account.Generation),
+		remove: holder.LocalTenantRetirementProof{
+			Tenant: tenantID, Generation: catalog.Generation(account.Generation),
 			FileProviderAbsent: true,
 		},
 	}
@@ -1194,10 +1190,9 @@ func TestFinishRemovalRequiresExplicitTenantAbsenceProofWhenStateIsAbsent(t *tes
 		t.Fatal(err)
 	}
 	runtime := &lifecycleRuntimeStub{
-		stateErr: remoteError(mountproto.ErrorCodeNotFound),
-		remove: mountproto.RemoveTenantResponse{
-			Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-			TenantID: mountproto.TenantID(tenantID), Generation: account.Generation,
+		stateErr: controlRemoteError(tenantfs.ControlErrorNotFound),
+		remove: holder.LocalTenantRetirementProof{
+			Tenant: tenantID, Generation: catalog.Generation(account.Generation),
 		},
 	}
 	server := &Server{

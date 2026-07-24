@@ -8,7 +8,7 @@ import (
 
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
-	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/tenant"
 )
 
 const (
@@ -32,31 +32,35 @@ func (a Account) TenantID() (catalog.TenantID, error) {
 	return catalog.NewTenantID("account-" + a.InstanceID)
 }
 
-// Definition returns the exact durable FuseKit tenant definition.
-func (a Account) Definition() (mountproto.TenantDefinition, error) {
-	if _, err := a.TenantID(); err != nil {
-		return mountproto.TenantDefinition{}, err
+// Spec returns the exact durable File Provider-only FuseKit tenant.
+func (a Account) Spec() (tenant.TenantSpec, error) {
+	id, err := a.TenantID()
+	if err != nil {
+		return tenant.TenantSpec{}, err
 	}
 	if a.Generation == 0 {
-		return mountproto.TenantDefinition{}, errors.New("tenantfs: account generation is zero")
+		return tenant.TenantSpec{}, errors.New("tenantfs: account generation is zero")
 	}
 	if !exactAbsolutePath(a.BackingRoot) {
-		return mountproto.TenantDefinition{}, errors.New("tenantfs: backing root must be a clean absolute path")
+		return tenant.TenantSpec{}, errors.New("tenantfs: backing root must be a clean absolute path")
 	}
 	if a.FileProviderDisplayName == "" || strings.ContainsRune(a.FileProviderDisplayName, 0) {
-		return mountproto.TenantDefinition{}, errors.New("tenantfs: File Provider display name is invalid")
+		return tenant.TenantSpec{}, errors.New("tenantfs: File Provider display name is invalid")
 	}
-	definition := mountproto.TenantDefinition{
-		BackingRoot:                        a.BackingRoot,
-		ContentSourceID:                    string(ClaudeAuthorityID),
-		AccessMode:                         mountproto.AccessModeReadWrite,
-		CasePolicy:                         mountproto.CasePolicyInsensitive,
-		Presentations:                      []mountproto.Presentation{mountproto.PresentationFileProvider},
-		Generation:                         a.Generation,
-		FileProviderPresentationInstanceID: a.InstanceID,
-		FileProviderDisplayName:            a.FileProviderDisplayName,
-	}
-	return definition, nil
+	return tenant.TenantSpec{
+		OwnerID: tenant.OwnerID(OwnerID), ID: id,
+		Backing: tenant.BackingSpec{Root: a.BackingRoot},
+		Content: tenant.ContentSource{ID: string(ClaudeAuthorityID)},
+		Traits: tenant.TenantTraits{
+			Access: tenant.ReadWrite, CaseSensitivity: catalog.CaseInsensitive,
+			Presentations: catalog.PresentFileProvider,
+		},
+		FileProvider: tenant.FileProviderSpec{
+			Enabled: true, PresentationInstanceID: a.InstanceID,
+			DisplayName: a.FileProviderDisplayName,
+		},
+		Generation: catalog.Generation(a.Generation),
+	}, nil
 }
 
 func validAccountInstanceID(value string) bool {

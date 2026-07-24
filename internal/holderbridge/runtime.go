@@ -31,6 +31,7 @@ type RuntimeSpec struct {
 	Drivers           holder.DriverFactories
 	CatalogAuthorizer catalogservice.Authorizer
 	Authorizer        mountservice.Authorizer
+	BusinessHandlers  []holder.BusinessHandlerSpec
 }
 
 // NewRuntime constructs the signed app's FuseKit runtime.
@@ -49,6 +50,7 @@ func newRuntime(
 		Owner: spec.Owner, Drivers: spec.Drivers,
 		CatalogAuthorizer:       spec.CatalogAuthorizer,
 		Authorizer:              spec.Authorizer,
+		BusinessHandlers:        spec.BusinessHandlers,
 		NativeReadinessTimeout:  NativeReadinessTimeout,
 		CatalogReadinessTimeout: CatalogReadinessTimeout,
 		CatalogOperationTimeout: CatalogOperationTimeout,

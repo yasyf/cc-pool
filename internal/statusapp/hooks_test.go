@@ -10,7 +10,7 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/transportproto"
 	"github.com/yasyf/fusekit/trustroles"
 )
@@ -29,7 +29,7 @@ func TestRuntimeQuiesceStopsExactObservedGeneration(t *testing.T) {
 	var request service.StopRuntimeRequest
 	hooks := newProductHooks("runtime-v1", deployment.SHA256{1})
 	installTestBuilders(&hooks)
-	hooks.observe = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) { return health, nil }
+	hooks.observe = func(context.Context, string) (holder.LocalRuntimeReadiness, error) { return health, nil }
 	hooks.stopRuntime = func(
 		_ context.Context,
 		_ deployment.RuntimeStopper,
@@ -42,11 +42,7 @@ func TestRuntimeQuiesceStopsExactObservedGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantGeneration, err := proc.ParseOwnerGeneration(health.ProcessGeneration)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !proof.absent || proof.processGeneration != wantGeneration || proof.digest == (deployment.SHA256{}) ||
+	if !proof.absent || proof.processGeneration != health.ProcessGeneration || proof.digest == (deployment.SHA256{}) ||
 		request.OperationID != operation.id || request.ExpectedRuntimeBuild != health.RuntimeBuild ||
 		request.ControlRole != trustroles.StopController ||
 		request.RuntimeClientConfig.Client.WireBuild != transportproto.WireBuild ||
@@ -61,8 +57,8 @@ func TestRuntimeQuiesceRequiresEmptyExecutableInventoryForAbsentEndpoint(t *test
 	operation := deactivationOperation{id: "deactivation-1", activation: exactTestActivation(t, generation)}
 	hooks := newProductHooks("runtime-v1", deployment.SHA256{1})
 	installTestBuilders(&hooks)
-	hooks.observe = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) {
-		return mountproto.RuntimeHealthResponse{}, errors.New("endpoint absent")
+	hooks.observe = func(context.Context, string) (holder.LocalRuntimeReadiness, error) {
+		return holder.LocalRuntimeReadiness{}, errors.New("endpoint absent")
 	}
 	hooks.identities = func(string) ([]proc.Identity, error) { return nil, nil }
 	proof, err := hooks.runtimeQuiesce(t.Context(), nil, operation)
@@ -89,54 +85,47 @@ func TestReadinessBindsExactPlanRuntimeAndElection(t *testing.T) {
 	health := exactHealth(target)
 	elections := 0
 	hooks.proveApp = func(context.Context, string) error { elections++; return nil }
-	hooks.observe = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) { return health, nil }
+	hooks.observe = func(context.Context, string) (holder.LocalRuntimeReadiness, error) { return health, nil }
 	proof, err := hooks.readiness(t.Context(), operation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantGeneration, err := proc.ParseOwnerGeneration(health.ProcessGeneration)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if elections != 1 || proof.runtimeBuild != "runtime-v1" || proof.processGeneration != wantGeneration ||
+	if elections != 1 || proof.runtimeBuild != "runtime-v1" || proof.processGeneration != health.ProcessGeneration ||
 		proof.digest == (deployment.SHA256{}) {
 		t.Fatalf("proof/elections = %#v/%d", proof, elections)
 	}
 }
 
-func TestRuntimeReadinessRequiresReconciledBrokerFixedPoint(t *testing.T) {
+func TestRuntimeReadinessRequiresPinnedPublicationIdentity(t *testing.T) {
 	target := runtimeTarget{buildID: "runtime-v1"}
 	health := exactHealth(target)
-	health.BrokerPhase = mountproto.BrokerPhaseStarting
+	health.ActivationGeneration = ""
 	if err := validateRuntimeReadiness(target, health); err == nil {
-		t.Fatal("accepted broker before its reconciliation fixed point")
+		t.Fatal("accepted readiness without an activation generation")
 	}
-	health.BrokerPhase = mountproto.BrokerPhaseLive
+	health.ActivationGeneration = "activation-generation"
+	health.ProcessGeneration = proc.OwnerGeneration{}
+	if err := validateRuntimeReadiness(target, health); err == nil {
+		t.Fatal("accepted readiness without a process generation")
+	}
+	health.ProcessGeneration = proc.OwnerGeneration{1}
 	if err := validateRuntimeReadiness(target, health); err != nil {
-		t.Fatalf("reconciled broker rejected: %v", err)
+		t.Fatalf("pinned runtime readiness rejected: %v", err)
 	}
 }
 
-func exactHealth(target runtimeTarget) mountproto.RuntimeHealthResponse {
-	return mountproto.RuntimeHealthResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		RuntimeBuild: target.buildID, RuntimeProtocol: mountproto.RuntimeProtocolVersion,
-		RuntimePID: 100, ProcessGeneration: "0102030405060708090a0b0c0d0e0f10", ActivationGeneration: "activation-generation",
-		State: mountproto.RuntimeStateHealthy, Ready: true,
-		ReadinessPhase: mountproto.ReadinessPhaseReady, ReadinessStep: mountproto.ReadinessStepPublished,
-		NativePhase: mountproto.NativePhaseDisabled, BrokerPhase: mountproto.BrokerPhaseLive,
+func exactHealth(target runtimeTarget) holder.LocalRuntimeReadiness {
+	return holder.LocalRuntimeReadiness{
+		RuntimeBuild: target.buildID, ProcessGeneration: proc.OwnerGeneration{1, 2, 3, 4},
+		ActivationGeneration: "activation-generation",
 	}
 }
 
-func exactRuntimeStopProof(t *testing.T, operationID string, health mountproto.RuntimeHealthResponse) runtimeStopProof {
+func exactRuntimeStopProof(t *testing.T, operationID string, health holder.LocalRuntimeReadiness) runtimeStopProof {
 	t.Helper()
-	generation, err := proc.ParseOwnerGeneration(health.ProcessGeneration)
-	if err != nil {
-		t.Fatal(err)
-	}
 	return runtimeStopProof{
 		operationID:   operationID,
-		target:        wire.RuntimeIdentity{RuntimeBuild: health.RuntimeBuild, ProcessGeneration: generation},
+		target:        wire.RuntimeIdentity{RuntimeBuild: health.RuntimeBuild, ProcessGeneration: health.ProcessGeneration},
 		processRecord: proc.RecordDigest{1}, settlement: service.StopSettlementGone,
 		digest: service.StopReceiptDigest{2},
 	}
