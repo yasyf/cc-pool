@@ -26,6 +26,8 @@ const (
 	affectedClaudeConfig    causal.LogicalKey        = "claude-config"
 	claudeJSONFile                                   = ".claude.json"
 	settingsFile                                     = "settings.json"
+	criticalRoleClaudeJSON                           = "claude-json"
+	criticalRoleSettings                             = "settings"
 )
 
 type snapshotPhase uint8
@@ -47,8 +49,8 @@ type materializationKind string
 
 const (
 	materializePhysical   materializationKind = "physical"
-	materializeClaudeJSON materializationKind = "claude-json"
-	materializeSettings   materializationKind = "settings"
+	materializeClaudeJSON materializationKind = criticalRoleClaudeJSON
+	materializeSettings   materializationKind = criticalRoleSettings
 	materializeDirectory  materializationKind = "directory"
 )
 
@@ -393,7 +395,7 @@ func (p ClaudeAuthorityPolicy) syntheticRequests(specs []tenant.TenantSpec) ([]s
 func syntheticClaudeJSONRequest(spec tenant.TenantSpec) (sourceauthority.MaterializationRequest, error) {
 	payload := claudeMaterializationPayload{Kind: materializeClaudeJSON, Tenant: spec.ID}
 	return newMaterializationRequest(
-		syntheticLogical(spec.ID, "claude-json"),
+		syntheticLogical(spec.ID, criticalRoleClaudeJSON),
 		[]sourceauthority.PathRef{
 			{Root: canonicalClaudeJSONRoot, Relative: "."},
 			{Root: privateRootID(spec.ID), Relative: claudeJSONFile},
@@ -405,7 +407,7 @@ func syntheticClaudeJSONRequest(spec tenant.TenantSpec) (sourceauthority.Materia
 func syntheticSettingsRequest(spec tenant.TenantSpec) (sourceauthority.MaterializationRequest, error) {
 	payload := claudeMaterializationPayload{Kind: materializeSettings, Tenant: spec.ID}
 	return newMaterializationRequest(
-		syntheticLogical(spec.ID, "settings"),
+		syntheticLogical(spec.ID, criticalRoleSettings),
 		[]sourceauthority.PathRef{{Root: sharedClaudeRoot, Relative: settingsFile}},
 		payload,
 	)

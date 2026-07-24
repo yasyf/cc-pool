@@ -2,8 +2,11 @@ package tenantfs
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/fusekit/catalogproto"
@@ -18,6 +21,12 @@ type Preparer struct {
 	runtime PreparationRuntime
 }
 
+// PreparationLease binds one launch reservation to provisional File Provider readiness.
+type PreparationLease struct {
+	ID        string
+	ExpiresAt time.Time
+}
+
 // NewPreparer constructs the product's on-demand convergence client.
 func NewPreparer(runtime PreparationRuntime) (*Preparer, error) {
 	if runtime == nil {
@@ -27,12 +36,16 @@ func NewPreparer(runtime PreparationRuntime) (*Preparer, error) {
 }
 
 // Prepare converges one account and returns its exact FuseKit activation proof.
-func (p *Preparer) Prepare(ctx context.Context, account Account) (catalogproto.TenantPreparationProof, error) {
+func (p *Preparer) Prepare(
+	ctx context.Context,
+	account Account,
+	lease PreparationLease,
+) (catalogproto.TenantPreparationProof, error) {
 	tenantID, err := account.TenantID()
 	if err != nil {
 		return catalogproto.TenantPreparationProof{}, err
 	}
-	request, err := p.request(ctx, account)
+	request, err := p.request(ctx, account, lease)
 	if err != nil {
 		return catalogproto.TenantPreparationProof{}, err
 	}
@@ -49,12 +62,17 @@ func (p *Preparer) Prepare(ctx context.Context, account Account) (catalogproto.T
 }
 
 // Validate confirms that a retained proof belongs to the current activation and account generation.
-func (p *Preparer) Validate(ctx context.Context, account Account, proof catalogproto.TenantPreparationProof) error {
+func (p *Preparer) Validate(
+	ctx context.Context,
+	account Account,
+	lease PreparationLease,
+	proof catalogproto.TenantPreparationProof,
+) error {
 	tenantID, err := account.TenantID()
 	if err != nil {
 		return err
 	}
-	request, err := p.request(ctx, account)
+	request, err := p.request(ctx, account, lease)
 	if err != nil {
 		return err
 	}
@@ -64,7 +82,18 @@ func (p *Preparer) Validate(ctx context.Context, account Account, proof catalogp
 	return nil
 }
 
-func (p *Preparer) request(ctx context.Context, account Account) (catalogproto.PrepareTenantRequest, error) {
+func (p *Preparer) request(
+	ctx context.Context,
+	account Account,
+	lease PreparationLease,
+) (catalogproto.PrepareTenantRequest, error) {
+	if err := validatePreparationLease(lease); err != nil {
+		return catalogproto.PrepareTenantRequest{}, err
+	}
+	tenantID, err := account.TenantID()
+	if err != nil {
+		return catalogproto.PrepareTenantRequest{}, err
+	}
 	health, err := p.runtime.RuntimeHealth(ctx)
 	if err != nil {
 		return catalogproto.PrepareTenantRequest{}, fmt.Errorf("tenantfs: observe FuseKit runtime activation: %w", err)
@@ -80,12 +109,29 @@ func (p *Preparer) request(ctx context.Context, account Account) (catalogproto.P
 		health.BrokerPhase != mountproto.BrokerPhaseLive {
 		return catalogproto.PrepareTenantRequest{}, ErrPreparationConflict
 	}
+	critical, err := newCriticalReadinessPolicy(tenantID)
+	if err != nil {
+		return catalogproto.PrepareTenantRequest{}, fmt.Errorf("tenantfs: build critical readiness policy: %w", err)
+	}
 	return catalogproto.PrepareTenantRequest{
 		Protocol:             catalogproto.Version,
 		Generation:           account.Generation,
 		Presentation:         catalogproto.PresentationKindFileProvider,
 		ActivationGeneration: health.ActivationGeneration,
+		CriticalPolicyDigest: critical.Digest,
+		CriticalObjects:      critical.Objects,
+		LeaseID:              lease.ID,
+		LeaseExpiresUnixNano: uint64(lease.ExpiresAt.UnixNano()),
 	}, nil
+}
+
+func validatePreparationLease(lease PreparationLease) error {
+	raw, err := hex.DecodeString(lease.ID)
+	if err != nil || len(raw) != 16 || lease.ID != strings.ToLower(lease.ID) ||
+		lease.ExpiresAt.IsZero() || lease.ExpiresAt.UnixNano() <= 0 {
+		return errors.New("tenantfs: preparation lease is invalid")
+	}
+	return nil
 }
 
 func matchingPreparation(
@@ -114,7 +160,8 @@ func matchingPreparation(
 		presentation.Kind == catalogproto.PresentationKindFileProvider && presentation.Mount == nil &&
 		fileProvider != nil && fileProvider.TenantID == tenantID && fileProvider.DomainID == domainID &&
 		fileProvider.Generation == request.Generation && fileProvider.ActivationGeneration == request.ActivationGeneration &&
-		exactAbsolutePath(fileProvider.PublicPath)
+		fileProvider.PresentationInstanceID == catalogproto.PresentationInstanceID(account.InstanceID) &&
+		fileProvider.RootID != "" && exactAbsolutePath(fileProvider.PublicPath) && matchingCriticalReadiness(proof, request)
 }
 
 // FileProviderPublicPath returns the OS-observed root from one validated preparation proof.
