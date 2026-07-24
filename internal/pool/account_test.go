@@ -89,7 +89,7 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 	if err != nil || second.Reservation.ID != 2 {
 		t.Fatalf("second pending = %+v, %v", second, err)
 	}
-	if err := manager.AbandonAdd(t.Context(), first); err != nil {
+	if err := manager.AbandonAdd(t.Context(), first, pendingRetirementProof(first)); err != nil {
 		t.Fatal(err)
 	}
 	reusedReservation, err := manager.ReserveAdd()
@@ -107,7 +107,7 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 	assertLinkTarget(t, reused.ConfigDir, firstPath)
 }
 
-func TestReleaseAddRetainsCompletedLogin(t *testing.T) {
+func TestRetainedAddKeepsExactReservationAndExecutionIdentity(t *testing.T) {
 	manager := newAccountManager(t)
 	pendingReservation, err := manager.ReserveAdd()
 	if err != nil {
@@ -124,19 +124,17 @@ func TestReleaseAddRetainsCompletedLogin(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.ReleaseAdd(pending); err != nil {
-		t.Fatal(err)
-	}
 	retryReservation, err := manager.ReserveAdd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	retry, err := manager.PrepareReservedAdd(t.Context(), retryReservation, configDir)
-	if err != nil {
-		t.Fatal(err)
+	if retryReservation.ID == pending.Reservation.ID {
+		t.Fatalf("retained reservation %d was reused", pending.Reservation.ID)
 	}
-	if retry.Reservation.ID != pending.Reservation.ID || retry.ClaudeJSONSeed != SeedKeptExisting {
-		t.Fatalf("retry = %+v", retry)
+	assertLinkTarget(t, pending.ConfigDir, pending.PublicPath)
+	if raw, err := os.ReadFile(privateClaudeJSONPath(AccountBackingDir(pending.Reservation.ID))); err != nil ||
+		string(raw) != string(identity) {
+		t.Fatalf("retained login state = %q err=%v", raw, err)
 	}
 }
 
@@ -146,14 +144,29 @@ func TestAbandonAddJournalsExactCredentialRemoval(t *testing.T) {
 			manager := newAccountManager(t)
 			fake := manager.Creds.(*credstest.Fake)
 			pending := prepareRemovalTestAdd(t, manager)
+			if err := os.MkdirAll(pending.PublicPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(pending.PublicPath, "target-survives")
+			if err := os.WriteFile(marker, []byte("target"), 0o600); err != nil {
+				t.Fatal(err)
+			}
 			if present {
 				fake.Put(pending.KeychainService, creds.AccountLabel(), datedCred("retire", time.Hour))
 			}
 
-			if err := manager.AbandonAdd(t.Context(), pending); err != nil {
+			if err := manager.AbandonAdd(
+				t.Context(), pending, pendingRetirementProof(pending),
+			); err != nil {
 				t.Fatal(err)
 			}
 			assertRemovalReceipt(t, manager.Store, pending)
+			if _, err := os.Lstat(pending.ConfigDir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("stable execution link survived retirement: %v", err)
+			}
+			if raw, err := os.ReadFile(marker); err != nil || string(raw) != "target" {
+				t.Fatalf("presentation target changed: %q err=%v", raw, err)
+			}
 			if _, ok := fake.Get(pending.KeychainService, creds.AccountLabel()); ok {
 				t.Fatal("credential survived exact removal")
 			}
@@ -189,7 +202,8 @@ func TestAbandonAddLostDeleteResponseReplaysReceipt(t *testing.T) {
 		return proof, err
 	}
 
-	if err := manager.AbandonAdd(t.Context(), pending); err == nil {
+	proof := pendingRetirementProof(pending)
+	if err := manager.AbandonAdd(t.Context(), pending, proof); err == nil {
 		t.Fatal("lost response unexpectedly reported success")
 	}
 	if _, ok := fake.Get(pending.KeychainService, creds.AccountLabel()); ok {
@@ -198,7 +212,7 @@ func TestAbandonAddLostDeleteResponseReplaysReceipt(t *testing.T) {
 	if _, err := os.Stat(AccountBackingDir(pending.Reservation.ID)); err != nil {
 		t.Fatalf("first attempt removed backing before durable replay: %v", err)
 	}
-	if err := manager.AbandonAdd(t.Context(), pending); err != nil {
+	if err := manager.AbandonAdd(t.Context(), pending, proof); err != nil {
 		t.Fatalf("receipt replay: %v", err)
 	}
 	if calls != 1 {
@@ -224,7 +238,7 @@ func TestAbandonAddReplacementRacePreservesReplacement(t *testing.T) {
 		return baseCAS(ctx, account, expected, mutation)
 	}
 
-	err := manager.AbandonAdd(t.Context(), pending)
+	err := manager.AbandonAdd(t.Context(), pending, pendingRetirementProof(pending))
 	if !errors.Is(err, ErrCredentialOperationQuarantined) {
 		t.Fatalf("replacement race = %v, want quarantine", err)
 	}
@@ -232,11 +246,28 @@ func TestAbandonAddReplacementRacePreservesReplacement(t *testing.T) {
 	if !ok || got.ClaudeAiOauth.AccessToken != replacement.ClaudeAiOauth.AccessToken {
 		t.Fatalf("replacement was not preserved: %+v", got)
 	}
-	if _, err := manager.Store.BeginAccountRemoval(pending.Reservation.ID, true); err != nil {
-		t.Fatalf("durable removal missing after race: %v", err)
+	ids, idsErr := manager.Store.PendingAddIndexes()
+	if idsErr != nil || len(ids) != 1 || ids[0] != pending.Reservation.ID {
+		t.Fatalf("quarantined reservation = %v err=%v", ids, idsErr)
 	}
 	if _, err := os.Stat(AccountBackingDir(pending.Reservation.ID)); err != nil {
 		t.Fatalf("quarantined removal deleted backing: %v", err)
+	}
+}
+
+func TestAbandonAddRejectsForeignRetirementProof(t *testing.T) {
+	manager := newAccountManager(t)
+	pending := prepareRemovalTestAdd(t, manager)
+	proof := pendingRetirementProof(pending)
+	proof.AccountInstanceID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	if err := manager.AbandonAdd(t.Context(), pending, proof); err == nil {
+		t.Fatal("foreign retirement proof was accepted")
+	}
+	assertLinkTarget(t, pending.ConfigDir, pending.PublicPath)
+	ids, err := manager.Store.PendingAddIndexes()
+	if err != nil || len(ids) != 1 || ids[0] != pending.Reservation.ID {
+		t.Fatalf("reservation changed after foreign proof: %v err=%v", ids, err)
 	}
 }
 
@@ -253,6 +284,13 @@ func prepareRemovalTestAdd(t *testing.T, manager *Manager) *PendingAdd {
 		t.Fatal(err)
 	}
 	return pending
+}
+
+func pendingRetirementProof(pending *PendingAdd) PendingAddRetirementProof {
+	return PendingAddRetirementProof{
+		AccountID: pending.Reservation.ID, AccountInstanceID: pending.Reservation.InstanceID,
+		AccountGeneration: pending.Reservation.Generation, PublicPath: pending.PublicPath,
+	}
 }
 
 func assertRemovalReceipt(t *testing.T, st *store.Store, pending *PendingAdd) {
