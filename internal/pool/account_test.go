@@ -230,7 +230,9 @@ func TestAbandonAddLostDeleteResponseReplaysReceipt(t *testing.T) {
 }
 
 func TestAbandonAddReplaysEveryRetiredCleanupBoundary(t *testing.T) {
-	for _, stage := range []string{"after-credential", "after-unlink", "after-backing"} {
+	for _, stage := range []string{
+		"after-removal-intent", "after-credential", "after-unlink", "after-backing",
+	} {
 		t.Run(stage, func(t *testing.T) {
 			manager := newAccountManager(t)
 			pending := prepareRemovalTestAdd(t, manager)

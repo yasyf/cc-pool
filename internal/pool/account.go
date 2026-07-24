@@ -257,6 +257,21 @@ func (m *Manager) AbandonAdd(
 		if err := ValidateAccountCredentialBoundary(account, pending.PublicPath); err != nil {
 			return fmt.Errorf("validate retired pending credential boundary: %w", err)
 		}
+	}
+	removal, err := m.Store.BeginAccountRemoval(pending.Reservation.ID, true)
+	if err != nil {
+		return fmt.Errorf("begin retired pending cleanup: %w", err)
+	}
+	if removal.AccountInstanceID != pending.Reservation.InstanceID ||
+		removal.AccountGeneration != pending.Reservation.Generation {
+		return store.ErrAccountGenerationChanged
+	}
+	if abandonAddFailpoint != nil {
+		if err := abandonAddFailpoint("after-removal-intent"); err != nil {
+			return err
+		}
+	}
+	if !settled {
 		if err := m.removeCredentialForAccountRemovalAt(ctx, account, pending.PublicPath); err != nil {
 			return fmt.Errorf("retire pending credential for %s: %w", pending.ConfigDir, err)
 		}
@@ -284,7 +299,7 @@ func (m *Manager) AbandonAdd(
 			return err
 		}
 	}
-	return m.Store.ReleaseAccountIndex(pending.Reservation)
+	return m.Store.FinalizePendingAccountRemoval(removal)
 }
 
 func (m *Manager) credentialRemovalSettled(account store.Account) (bool, error) {
