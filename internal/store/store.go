@@ -68,8 +68,8 @@ CREATE TABLE account_registry_sequences (
 CREATE TABLE account_mutations (
   operation_id               BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
   account_id                 INTEGER NOT NULL UNIQUE CHECK(account_id > 0),
-  kind                       TEXT NOT NULL CHECK(kind IN ('add','relogin','presentation-rebind')),
-  state                      TEXT NOT NULL CHECK(state IN ('awaiting-presentation','awaiting-input','reserved','applying','applied','publishing','compensating','rebind-published')),
+  kind                       TEXT NOT NULL CHECK(kind IN ('add','relogin')),
+  state                      TEXT NOT NULL CHECK(state IN ('awaiting-presentation','awaiting-input','reserved','applying','applied','publishing','compensating')),
   registry_sequence          INTEGER NOT NULL CHECK(registry_sequence > 0),
   account_instance_id        TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation         INTEGER NOT NULL CHECK(account_generation > 0),
@@ -88,40 +88,25 @@ CREATE TABLE account_mutations (
 	presentation_domain_id    TEXT NOT NULL,
 	presentation_generation   INTEGER NOT NULL CHECK(presentation_generation >= 0),
 	presentation_public_path  TEXT NOT NULL,
-	previous_config_dir       TEXT NOT NULL,
-	previous_keychain_service TEXT NOT NULL,
-	previous_keychain_account TEXT NOT NULL,
-	previous_locator_digest   BLOB NOT NULL CHECK(length(previous_locator_digest)=32),
-	previous_credential_state TEXT NOT NULL CHECK(previous_credential_state IN ('','empty','present')),
-	previous_credential_digest BLOB CHECK(previous_credential_digest IS NULL OR length(previous_credential_digest)=32),
   owner_record               BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch                INTEGER NOT NULL CHECK(owner_epoch > 0),
   created_at                 INTEGER NOT NULL CHECK(created_at > 0),
   updated_at                 INTEGER NOT NULL CHECK(updated_at >= created_at),
-  CHECK((kind IN ('add','presentation-rebind') AND state='awaiting-presentation' AND
+  CHECK((kind='add' AND state='awaiting-presentation' AND
          locator_digest=zeroblob(32) AND expected_credential_digest=zeroblob(32) AND
          config_dir='' AND keychain_service='' AND keychain_account='' AND
 		 presentation_tenant_id='' AND presentation_domain_id='' AND
 		 presentation_generation=0 AND presentation_public_path='') OR
         (state<>'awaiting-presentation' AND config_dir<>'' AND keychain_service<>'' AND keychain_account<>'' AND
-		 ((kind IN ('add','presentation-rebind') AND presentation_tenant_id<>'' AND
+		 ((kind='add' AND presentation_tenant_id<>'' AND
 		   presentation_domain_id<>'' AND account_generation=presentation_generation) OR
-		  (kind NOT IN ('add','presentation-rebind') AND presentation_tenant_id='' AND
-		   presentation_domain_id='' AND presentation_generation=0 AND presentation_public_path='')))),
-	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
-	       previous_keychain_account<>'' AND previous_locator_digest<>zeroblob(32) AND
-	       ((previous_credential_state='empty' AND previous_credential_digest IS NULL) OR
-	        (previous_credential_state='present' AND previous_credential_digest IS NOT NULL AND
-	         previous_credential_digest<>zeroblob(32)))) OR
-	      (kind<>'presentation-rebind' AND previous_config_dir='' AND previous_keychain_service='' AND
-	       previous_keychain_account='' AND previous_locator_digest=zeroblob(32) AND
-	       previous_credential_state='' AND previous_credential_digest IS NULL)),
-	CHECK(state<>'rebind-published' OR kind='presentation-rebind')
+		  (kind<>'add' AND presentation_tenant_id='' AND
+		   presentation_domain_id='' AND presentation_generation=0 AND presentation_public_path=''))))
 );
 CREATE TABLE account_mutation_receipts (
   operation_id      BLOB PRIMARY KEY CHECK(length(operation_id) = 32),
   account_id        INTEGER NOT NULL CHECK(account_id > 0),
-  kind              TEXT NOT NULL CHECK(kind IN ('add','relogin','presentation-rebind')),
+  kind              TEXT NOT NULL CHECK(kind IN ('add','relogin')),
   registry_sequence INTEGER NOT NULL CHECK(registry_sequence > 0),
   account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation INTEGER NOT NULL CHECK(account_generation > 0),
@@ -146,12 +131,6 @@ CREATE TABLE account_mutation_receipts (
 	presentation_domain_id TEXT NOT NULL,
 	presentation_generation INTEGER NOT NULL CHECK(presentation_generation >= 0),
 	presentation_public_path TEXT NOT NULL,
-	previous_config_dir TEXT NOT NULL,
-	previous_keychain_service TEXT NOT NULL,
-	previous_keychain_account TEXT NOT NULL,
-	previous_locator_digest BLOB NOT NULL CHECK(length(previous_locator_digest)=32),
-	previous_credential_state TEXT NOT NULL CHECK(previous_credential_state IN ('','empty','present')),
-	previous_credential_digest BLOB CHECK(previous_credential_digest IS NULL OR length(previous_credential_digest)=32),
   owner_record      BLOB NOT NULL CHECK(length(owner_record) > 0),
   owner_epoch       INTEGER NOT NULL CHECK(owner_epoch > 0),
 	publication_pending INTEGER NOT NULL CHECK(publication_pending IN (0,1)),
@@ -159,21 +138,13 @@ CREATE TABLE account_mutation_receipts (
   acknowledged_at   INTEGER CHECK(acknowledged_at IS NULL OR acknowledged_at >= committed_at),
   expires_at        INTEGER NOT NULL CHECK(expires_at > committed_at),
 	CHECK((credential_written=1) = (written_credential_digest IS NOT NULL)),
-	CHECK((kind IN ('add','presentation-rebind') AND presentation_tenant_id<>'' AND
+	CHECK((kind='add' AND presentation_tenant_id<>'' AND
 	       presentation_domain_id<>'' AND account_generation=presentation_generation) OR
-	      (kind NOT IN ('add','presentation-rebind') AND presentation_tenant_id='' AND
+	      (kind<>'add' AND presentation_tenant_id='' AND
 	       presentation_domain_id='' AND presentation_generation=0 AND presentation_public_path='')),
-	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
-	       previous_keychain_account<>'' AND previous_locator_digest<>zeroblob(32) AND
-	       ((previous_credential_state='empty' AND previous_credential_digest IS NULL) OR
-	        (previous_credential_state='present' AND previous_credential_digest IS NOT NULL AND
-	         previous_credential_digest<>zeroblob(32)))) OR
-	      (kind<>'presentation-rebind' AND previous_config_dir='' AND previous_keychain_service='' AND
-	       previous_keychain_account='' AND previous_locator_digest=zeroblob(32) AND
-	       previous_credential_state='' AND previous_credential_digest IS NULL)),
 	CHECK((terminal='quarantined') = (quarantine_reason IS NOT NULL)),
 	CHECK(publication_pending=0 OR
-	      (terminal='committed' AND kind IN ('add','presentation-rebind'))),
+	      (terminal='committed' AND kind='add')),
 	CHECK((resolution IS NULL AND resolution_observed_digest IS NULL AND resolved_at IS NULL)
 	   OR (resolution IS NOT NULL AND resolution_observed_digest IS NOT NULL AND resolved_at IS NOT NULL AND resolved_at>=committed_at))
 );

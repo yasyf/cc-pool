@@ -1366,7 +1366,7 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 		t.Fatalf("begin pending Add = %+v err=%v", begin, err)
 	}
 	fence, err := st.BindAccountMutationPresentation(
-		begin.Active.Fence(), presentationRebindProof(account, account.ConfigDir, "activation-pending"),
+		begin.Active.Fence(), poolTestPresentationProof(reservation, account.ConfigDir),
 		account.ConfigDir, account.KeychainService,
 		account.KeychainAccount, locator, emptyDigest,
 	)
