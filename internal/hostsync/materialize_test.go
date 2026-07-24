@@ -356,17 +356,17 @@ func TestMaterializeHappyPath(t *testing.T) {
 		t.Fatalf("result = %+v, want uuid u-happy / acct 1", res)
 	}
 
-	configDir := materializeFileProviderPublicPath(1)
+	publicPath := materializeFileProviderPublicPath(1)
 	backingDir := pool.AccountBackingDir(1)
 	if _, err := os.Stat(backingDir); err != nil {
 		t.Fatalf("account backing not created: %v", err)
 	}
-	if info, err := os.Stat(configDir); err != nil || !info.IsDir() {
+	if info, err := os.Stat(publicPath); err != nil || !info.IsDir() {
 		t.Fatalf("prepared presentation path = %+v, %v", info, err)
 	}
 
 	// Identity injected verbatim and resolvable through the established reader.
-	id, err := m.AccountIdentity(t.Context(), 1, configDir)
+	id, err := m.AccountIdentity(t.Context(), 1, publicPath)
 	if err != nil {
 		t.Fatalf("AccountIdentity: %v", err)
 	}
@@ -412,8 +412,8 @@ func TestMaterializeHappyPath(t *testing.T) {
 		row.KeychainService != wantService {
 		t.Fatalf("persisted execution identity = %+v, want immutable instance path %q", row, wantConfigDir)
 	}
-	if target, err := os.Readlink(row.ConfigDir); err != nil || target != configDir {
-		t.Fatalf("stable execution link target = %q, %v; want %q", target, err, configDir)
+	if target, err := os.Readlink(row.ConfigDir); err != nil || target != publicPath {
+		t.Fatalf("stable execution link target = %q, %v; want %q", target, err, publicPath)
 	}
 	presentation, err := m.Store.AccountPresentation(row.ID)
 	if err != nil {
@@ -421,7 +421,7 @@ func TestMaterializeHappyPath(t *testing.T) {
 	}
 	if presentation.AccountInstanceID != row.InstanceID ||
 		presentation.AccountGeneration != row.Generation ||
-		presentation.Identity.PublicPath != configDir || presentation.Identity.TenantID == "" ||
+		presentation.Identity.PublicPath != publicPath || presentation.Identity.TenantID == "" ||
 		presentation.Identity.DomainID == "" {
 		t.Fatalf("persisted presentation identity = %+v", presentation)
 	}
@@ -684,7 +684,7 @@ func TestMaterializeNeverAbandonsAmbiguousPromotion(t *testing.T) {
 func TestMaterializeRejectsExistingExternalUUIDBeforeMutation(t *testing.T) {
 	s, manager, _, _ := newMaterializeService(t)
 	existing := admitHostsyncTestAccount(t, manager, store.Account{
-		ID: 9, ConfigDir: materializeFileProviderPublicPath(9),
+		ID:              9,
 		KeychainService: "existing-service", KeychainAccount: "existing-account",
 		AccountUUID: "duplicate",
 	})
@@ -770,8 +770,8 @@ func TestMaterializeSeedNoSourceBootstraps(t *testing.T) {
 		t.Fatalf("result = %+v, want a completed acct 1", res)
 	}
 
-	configDir := materializeFileProviderPublicPath(1)
-	id, err := m.AccountIdentity(t.Context(), 1, configDir)
+	publicPath := materializeFileProviderPublicPath(1)
+	id, err := m.AccountIdentity(t.Context(), 1, publicPath)
 	if err != nil {
 		t.Fatalf("AccountIdentity: %v", err)
 	}
@@ -817,8 +817,8 @@ func TestMaterializeKeychainUnavailableFailsClosed(t *testing.T) {
 		t.Fatalf("result = %+v, want durable awaiting-origin acct 1", res)
 	}
 
-	configDir := materializeFileProviderPublicPath(1)
-	if _, ok := fk.Get(creds.ServiceName(configDir), creds.AccountLabel()); ok {
+	publicPath := materializeFileProviderPublicPath(1)
+	if _, ok := fk.Get(creds.ServiceName(publicPath), creds.AccountLabel()); ok {
 		t.Fatal("keychain item present after failed install")
 	}
 	row, err := m.Store.GetAccount(1)
