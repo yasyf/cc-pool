@@ -1145,6 +1145,43 @@ func TestOnDemandProvisioningIsBounded(t *testing.T) {
 	}
 }
 
+func TestRetireReservedAccountRequiresExactFileProviderAbsenceProof(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	reservation := store.PendingAccountReservation{
+		ID: 7, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 3,
+	}
+	tenantID, err := pool.TenantAccount(store.Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID,
+		Generation: reservation.Generation,
+	}).TenantID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &lifecycleRuntimeStub{
+		state: exactState(tenantID, reservation.Generation),
+		remove: holder.LocalTenantRetirementProof{
+			Tenant: tenantID, Generation: catalog.Generation(reservation.Generation),
+		},
+	}
+	coordinator := newTenantCoordinator(t.Context(), nil, nil, runtime)
+	if _, err := coordinator.retireReservedAccount(t.Context(), reservation); err == nil {
+		t.Fatal("reserved retirement accepted missing File Provider absence proof")
+	}
+	runtime.remove.FileProviderAbsent = true
+	proof, err := coordinator.retireReservedAccount(t.Context(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proof.AccountID != reservation.ID || proof.AccountInstanceID != reservation.InstanceID ||
+		proof.AccountGeneration != reservation.Generation ||
+		proof.PublicPath != pool.FileProviderConfigDir(reservation.ID) {
+		t.Fatalf("reserved retirement proof = %+v", proof)
+	}
+	if runtime.removeExpected != reservation.Generation {
+		t.Fatalf("retirement expected generation = %d", runtime.removeExpected)
+	}
+}
+
 func TestOnDemandProvisioningCoalescesOneTenantGeneration(t *testing.T) {
 	const requests = 32
 	runtime := newBlockingLifecycleRuntime(requests)

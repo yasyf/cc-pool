@@ -51,7 +51,11 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstPath := filepath.Join(t.TempDir(), "CloudStorage", "account-1")
+	home, err := Home()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPath := filepath.Join(home, "Library", "CloudStorage", "account-1")
 	first, err := manager.PrepareReservedAdd(t.Context(), firstReservation, firstPath)
 	if err != nil {
 		t.Fatal(err)
@@ -84,10 +88,13 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	second, err := manager.PrepareReservedAdd(
-		t.Context(), secondReservation, filepath.Join(t.TempDir(), "CloudStorage", "account-2"),
+		t.Context(), secondReservation, filepath.Join(home, "Library", "CloudStorage", "account-2"),
 	)
 	if err != nil || second.Reservation.ID != 2 {
 		t.Fatalf("second pending = %+v, %v", second, err)
+	}
+	if err := os.MkdirAll(first.PublicPath, 0o700); err != nil {
+		t.Fatal(err)
 	}
 	if err := manager.AbandonAdd(t.Context(), first, pendingRetirementProof(first)); err != nil {
 		t.Fatal(err)
@@ -332,8 +339,16 @@ func prepareRemovalTestAdd(t *testing.T, manager *Manager) *PendingAdd {
 	if err != nil {
 		t.Fatal(err)
 	}
+	home, err := Home()
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicPath := filepath.Join(home, "Library", "CloudStorage", reservation.InstanceID)
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	pending, err := manager.PrepareReservedAdd(
-		t.Context(), reservation, filepath.Join(t.TempDir(), "CloudStorage", "account"),
+		t.Context(), reservation, publicPath,
 	)
 	if err != nil {
 		t.Fatal(err)

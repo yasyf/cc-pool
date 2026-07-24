@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 )
+
+const materializeRetirementTimeout = 30 * time.Second
 
 // MaterializeResult reports what Materialize did for one peer-added account.
 type MaterializeResult struct {
@@ -26,10 +29,9 @@ type MaterializeResult struct {
 }
 
 // Materialize creates the local account for a peer-added entry without any
-// interactive login. An entry with no oauthAccount defers; failures after
-// PrepareAdd roll the dir and reservation back via AbandonAdd, except retained
-// or unprovable slot state and rejected envelopes, which only release the
-// reservation.
+// interactive login. An entry with no oauthAccount defers. Post-reservation
+// failures retire the exact tenant before cleanup; ambiguous state retains the
+// reservation and its execution identity.
 func (s *Service) Materialize(ctx context.Context, v AccountValue, credential *creds.Credential, manifestPath string) (MaterializeResult, error) {
 	if v.UUID == "" {
 		return MaterializeResult{}, fmt.Errorf("hostsync: Materialize requires a UUID")
@@ -61,58 +63,89 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, credential *c
 	if err != nil {
 		return MaterializeResult{}, err
 	}
-	releaseReservation := func(cause error) (MaterializeResult, error) {
-		if rerr := s.M.Store.ReleaseAccountIndex(reservation); rerr != nil {
-			return MaterializeResult{}, errors.Join(cause, fmt.Errorf("release %s: %w", v.UUID, rerr))
+	retireReservation := func(cause error) (pool.PendingAddRetirementProof, error) {
+		retireCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), materializeRetirementTimeout)
+		defer cancel()
+		proof, retireErr := s.Preparer.AbortReservedAccount(retireCtx, reservation)
+		if retireErr != nil {
+			return pool.PendingAddRetirementProof{}, errors.Join(
+				cause, fmt.Errorf("retire reserved presentation for %s: %w", v.UUID, retireErr),
+			)
+		}
+		return proof, nil
+	}
+	finalizeUnprepared := func(cause error) (MaterializeResult, error) {
+		proof, retireErr := retireReservation(cause)
+		if retireErr != nil {
+			return MaterializeResult{}, retireErr
+		}
+		if releaseErr := s.M.FinalizeUnpreparedAdd(reservation, proof); releaseErr != nil {
+			return MaterializeResult{}, errors.Join(cause, fmt.Errorf("release unprepared %s: %w", v.UUID, releaseErr))
+		}
+		return MaterializeResult{}, cause
+	}
+	abandonPrepared := func(cause error) (MaterializeResult, error) {
+		proof, retireErr := retireReservation(cause)
+		if retireErr != nil {
+			return MaterializeResult{}, retireErr
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), materializeRetirementTimeout)
+		defer cancel()
+		if abandonErr := s.M.AbandonPreparedAdd(cleanupCtx, reservation, proof); abandonErr != nil {
+			return MaterializeResult{}, errors.Join(cause, fmt.Errorf("roll back %s: %w", v.UUID, abandonErr))
 		}
 		return MaterializeResult{}, cause
 	}
 	presentation, err := s.Preparer.PrepareReservedAccount(ctx, reservation, v.Label)
 	if err != nil {
-		return releaseReservation(fmt.Errorf("materialize %s: prepare presentation: %w", v.UUID, err))
+		return finalizeUnprepared(fmt.Errorf("materialize %s: prepare presentation: %w", v.UUID, err))
 	}
 	p, err := s.M.PrepareReservedSyncedAdd(ctx, reservation, presentation)
 	if err != nil {
-		return releaseReservation(fmt.Errorf("materialize %s: prepare add: %w", v.UUID, err))
+		return abandonPrepared(fmt.Errorf("materialize %s: prepare add: %w", v.UUID, err))
 	}
 
-	// Every failure past PrepareAdd must roll the dir and reservation back —
-	// except a kept dir's retained login state, which release preserves.
+	// Every failure past preparation retires the tenant before cleanup.
 	abandon := func(cause error) (MaterializeResult, error) {
-		if aerr := s.M.AbandonAdd(ctx, p); aerr != nil {
+		proof, retireErr := retireReservation(cause)
+		if retireErr != nil {
+			return MaterializeResult{}, retireErr
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), materializeRetirementTimeout)
+		defer cancel()
+		if aerr := s.M.AbandonAdd(cleanupCtx, p, proof); aerr != nil {
 			return MaterializeResult{}, errors.Join(cause, fmt.Errorf("roll back %s: %w", v.UUID, aerr))
 		}
 		return MaterializeResult{}, cause
 	}
-	release := func(cause error) (MaterializeResult, error) {
-		if rerr := s.M.ReleaseAdd(p); rerr != nil {
-			return MaterializeResult{}, errors.Join(cause, fmt.Errorf("release %s: %w", v.UUID, rerr))
+	retain := func(cause error) (MaterializeResult, error) {
+		if _, retireErr := retireReservation(cause); retireErr != nil {
+			return MaterializeResult{}, retireErr
 		}
 		return MaterializeResult{}, cause
 	}
 	// A promotion race may leave an owned credential in the slot. Only a
-	// provably empty slot is torn down; retained or unprovable state is released.
+	// provably empty slot is torn down; retained or unprovable state is kept.
 	abandonUnlessRetained := func(cause error) (MaterializeResult, error) {
 		retained, err := s.slotRetainsCredential(ctx, p)
 		switch {
 		case err != nil:
-			return release(errors.Join(cause, err))
+			return retain(errors.Join(cause, err))
 		case retained:
-			return release(cause)
+			return retain(cause)
 		}
 		return abandon(cause)
 	}
 
-	// A kept dir may retain a usable credential from an interrupted `ccp add`
-	// (ReleaseAdd keeps login state); materializing over it would destroy an
-	// owned chain, so abort before touching the dir.
+	// An interrupted add may retain a usable credential. Materializing over it
+	// would destroy an owned chain, so abort before touching the dir.
 	if p.ClaudeJSONSeed == pool.SeedKeptExisting {
 		retained, err := s.slotRetainsCredential(ctx, p)
 		if err != nil {
-			return release(fmt.Errorf("materialize %s: %w", v.UUID, err))
+			return retain(fmt.Errorf("materialize %s: %w", v.UUID, err))
 		}
 		if retained {
-			return release(fmt.Errorf("materialize %s: %s retains a credential from an interrupted add; resume it with `ccp add` or remove the dir", v.UUID, p.ConfigDir))
+			return retain(fmt.Errorf("materialize %s: %s retains a credential from an interrupted add; resume it with `ccp add` or remove the dir", v.UUID, p.ConfigDir))
 		}
 	}
 
@@ -125,10 +158,10 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, credential *c
 
 	retained, err := s.slotRetainsCredential(ctx, p)
 	if err != nil && !errors.Is(err, creds.ErrUnavailable) {
-		return release(fmt.Errorf("materialize %s: recheck credential slot: %w", v.UUID, err))
+		return retain(fmt.Errorf("materialize %s: recheck credential slot: %w", v.UUID, err))
 	}
 	if retained {
-		return release(fmt.Errorf("materialize %s: %w", v.UUID, pool.ErrCredentialChangedUnderfoot))
+		return retain(fmt.Errorf("materialize %s: %w", v.UUID, pool.ErrCredentialChangedUnderfoot))
 	}
 
 	if err := rejectExistingExternalUUID(ctx, s.M, v.UUID); err != nil {
@@ -255,15 +288,13 @@ func rejectExistingExternalUUID(ctx context.Context, manager *pool.Manager, uuid
 	return nil
 }
 
-// slotAccount is the pending slot's credential coordinates; Discover adopts
-// whatever account label a prior login wrote, and an absent or unsearchable
-// Keychain keeps the default label (the store probes rule on it separately).
+// slotAccount is the pending slot's exact credential identity.
 func (s *Service) slotAccount(
 	ctx context.Context,
 	p *pool.PendingAdd,
 ) (store.Account, error) {
 	acct := store.Account{ID: p.Reservation.ID, InstanceID: p.Reservation.InstanceID, Generation: p.Reservation.Generation, ConfigDir: p.ConfigDir, KeychainService: p.KeychainService, KeychainAccount: creds.AccountLabel()}
-	account, err := s.M.Creds.Discover(ctx, p.KeychainService)
+	account, err := s.M.DiscoverCredentialAccount(ctx, acct, p.PublicPath)
 	switch {
 	case err == nil:
 		acct.KeychainAccount = account
@@ -283,14 +314,16 @@ func (s *Service) slotRetainsCredential(
 	if err != nil {
 		return false, err
 	}
-	st := s.M.Creds.Store(acct, creds.SourceKeychain)
-	_, err = st.Read(ctx)
-	switch creds.ClassifyRead(err) {
-	case creds.ReadEmpty:
+	state, err := s.M.CredentialExternalStateAt(ctx, acct, p.PublicPath)
+	if err != nil {
+		return false, fmt.Errorf("probe retained credential in %s: %w", p.ConfigDir, err)
+	}
+	switch state.Keychain.State {
+	case store.CredentialSlotEmpty:
 		return false, nil
-	case creds.ReadUnsearchable, creds.ReadFatal:
-		return false, fmt.Errorf("probe retained credential in %s: %w", st, err)
-	case creds.ReadPresent:
+	case store.CredentialSlotUnsearchable, store.CredentialSlotUnreadable:
+		return false, fmt.Errorf("probe retained credential in %s: credential is unverifiable", p.ConfigDir)
+	case store.CredentialSlotPresent:
 		return true, nil
 	}
 	panic("unreachable")

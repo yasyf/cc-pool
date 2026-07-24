@@ -111,6 +111,17 @@ func (r *hostSyncWorkerRemover) PrepareReservedAccount(
 	return identity, nil
 }
 
+func (r *hostSyncWorkerRemover) AbortReservedAccount(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+) (pool.PendingAddRetirementProof, error) {
+	coordinator, err := r.runtime(ctx)
+	if err != nil {
+		return pool.PendingAddRetirementProof{}, err
+	}
+	return coordinator.retireReservedAccount(ctx, reservation)
+}
+
 func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
