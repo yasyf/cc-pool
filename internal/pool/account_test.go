@@ -209,6 +209,7 @@ func TestAbandonAddLostDeleteResponseReplaysReceipt(t *testing.T) {
 	if _, ok := fake.Get(pending.KeychainService, creds.AccountLabel()); ok {
 		t.Fatal("credential was not deleted before response loss")
 	}
+	assertLinkTarget(t, pending.ConfigDir, pending.PublicPath)
 	if _, err := os.Stat(AccountBackingDir(pending.Reservation.ID)); err != nil {
 		t.Fatalf("first attempt removed backing before durable replay: %v", err)
 	}
@@ -219,6 +220,59 @@ func TestAbandonAddLostDeleteResponseReplaysReceipt(t *testing.T) {
 		t.Fatalf("credential CAS executions = %d, want one", calls)
 	}
 	assertRemovalReceipt(t, manager.Store, pending)
+}
+
+func TestAbandonAddReplaysEveryRetiredCleanupBoundary(t *testing.T) {
+	for _, stage := range []string{"after-credential", "after-unlink", "after-backing"} {
+		t.Run(stage, func(t *testing.T) {
+			manager := newAccountManager(t)
+			pending := prepareRemovalTestAdd(t, manager)
+			fake := manager.Creds.(*credstest.Fake)
+			fake.Put(pending.KeychainService, creds.AccountLabel(), datedCred(stage, time.Hour))
+			if err := os.MkdirAll(pending.PublicPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(pending.PublicPath, "target-survives")
+			if err := os.WriteFile(marker, []byte(stage), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			abandonAddFailpoint = func(current string) error {
+				if current == stage {
+					if current == "after-credential" {
+						assertLinkTarget(t, pending.ConfigDir, pending.PublicPath)
+						if _, ok := fake.Get(pending.KeychainService, creds.AccountLabel()); ok {
+							t.Fatal("credential survived the credential cleanup boundary")
+						}
+					}
+					return errors.New("injected cleanup crash")
+				}
+				return nil
+			}
+			t.Cleanup(func() { abandonAddFailpoint = nil })
+			proof := pendingRetirementProof(pending)
+			if err := manager.AbandonAdd(t.Context(), pending, proof); err == nil {
+				t.Fatal("cleanup crash reported success")
+			}
+			next, err := manager.ReserveAdd()
+			if err != nil || next.ID == pending.Reservation.ID {
+				t.Fatalf("cleanup crash reused reservation: next=%+v err=%v", next, err)
+			}
+			if err := manager.Store.ReleaseAccountIndex(next); err != nil {
+				t.Fatal(err)
+			}
+			abandonAddFailpoint = nil
+			if err := manager.AbandonAdd(t.Context(), pending, proof); err != nil {
+				t.Fatalf("cleanup replay: %v", err)
+			}
+			reused, err := manager.ReserveAdd()
+			if err != nil || reused.ID != pending.Reservation.ID {
+				t.Fatalf("cleanup replay did not release exact reservation: %+v err=%v", reused, err)
+			}
+			if raw, err := os.ReadFile(marker); err != nil || string(raw) != stage {
+				t.Fatalf("presentation target after replay = %q err=%v", raw, err)
+			}
+		})
+	}
 }
 
 func TestAbandonAddReplacementRacePreservesReplacement(t *testing.T) {
@@ -253,6 +307,7 @@ func TestAbandonAddReplacementRacePreservesReplacement(t *testing.T) {
 	if _, err := os.Stat(AccountBackingDir(pending.Reservation.ID)); err != nil {
 		t.Fatalf("quarantined removal deleted backing: %v", err)
 	}
+	assertLinkTarget(t, pending.ConfigDir, pending.PublicPath)
 }
 
 func TestAbandonAddRejectsForeignRetirementProof(t *testing.T) {

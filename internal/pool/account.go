@@ -54,6 +54,8 @@ type PendingAddRetirementProof struct {
 	PublicPath        string
 }
 
+var abandonAddFailpoint func(string) error
+
 // DuplicateIdentity returns an existing account sharing want's subscription.
 func (m *Manager) DuplicateIdentity(ctx context.Context, want Identity) (*store.Account, error) {
 	accounts, err := m.Store.ListAccounts()
@@ -239,32 +241,69 @@ func (m *Manager) AbandonAdd(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := RemoveAccountConfigDir(
-		pending.Reservation.InstanceID, pending.PublicPath,
-	); err != nil {
-		return fmt.Errorf("unlink retired pending execution path: %w", err)
-	}
 	account := store.Account{
 		ID: pending.Reservation.ID, InstanceID: pending.Reservation.InstanceID,
 		Generation: pending.Reservation.Generation,
 		ConfigDir:  pending.ConfigDir, KeychainService: pending.KeychainService,
 		KeychainAccount: creds.AccountLabel(),
 	}
-	keychainAccount, err := m.Creds.Discover(ctx, pending.KeychainService)
-	switch {
-	case errors.Is(err, creds.ErrNotFound):
-	case err != nil:
-		return fmt.Errorf("probe credential for %s: %w", pending.ConfigDir, err)
-	default:
-		account.KeychainAccount = keychainAccount
+	settled, err := m.pendingCredentialRemovalSettled(account)
+	if err != nil {
+		return fmt.Errorf("read pending credential retirement evidence: %w", err)
 	}
-	if err := m.removeCredentialForAccountRemoval(ctx, account); err != nil {
+	if !settled {
+		if err := ValidateAccountCredentialBoundary(account, pending.PublicPath); err != nil {
+			return fmt.Errorf("validate retired pending credential boundary: %w", err)
+		}
+	}
+	if err := m.removeCredentialForAccountRemovalAt(ctx, account, pending.PublicPath); err != nil {
 		return fmt.Errorf("retire pending credential for %s: %w", pending.ConfigDir, err)
+	}
+	if abandonAddFailpoint != nil {
+		if err := abandonAddFailpoint("after-credential"); err != nil {
+			return err
+		}
+	}
+	if err := RemoveAccountConfigDir(
+		pending.Reservation.InstanceID, pending.PublicPath,
+	); err != nil {
+		return fmt.Errorf("unlink retired pending execution path: %w", err)
+	}
+	if abandonAddFailpoint != nil {
+		if err := abandonAddFailpoint("after-unlink"); err != nil {
+			return err
+		}
 	}
 	if err := m.removeAccountBacking(ctx, pending.Reservation.ID); err != nil {
 		return err
 	}
+	if abandonAddFailpoint != nil {
+		if err := abandonAddFailpoint("after-backing"); err != nil {
+			return err
+		}
+	}
 	return m.Store.ReleaseAccountIndex(pending.Reservation)
+}
+
+func (m *Manager) pendingCredentialRemovalSettled(account store.Account) (bool, error) {
+	intent, err := store.CredentialRemovalIntentDigest(
+		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
+		account.KeychainService, account.KeychainAccount,
+	)
+	if err != nil {
+		return false, err
+	}
+	_, receipt, err := m.Store.CredentialOperationEvidence(store.CredentialOperationEvidenceQuery{
+		AccountID: account.ID, AccountInstanceID: account.InstanceID,
+		AccountGeneration: account.Generation, ConfigDir: account.ConfigDir,
+		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
+		LocatorDigest: store.CredentialKeychainLocatorDigest(
+			account.KeychainService, account.KeychainAccount,
+		),
+		Kind: store.CredentialOperationRemove, Target: store.CredentialTargetKeychain,
+		IntentDigest: intent,
+	})
+	return receipt != nil, err
 }
 
 // AbandonReservedAdd removes an exactly retired reservation whose preparation
@@ -279,6 +318,40 @@ func (m *Manager) AbandonReservedAdd(
 		return err
 	}
 	return m.AbandonAdd(ctx, pending, retirement)
+}
+
+// AbandonPreparedAdd removes pool backing and an exact stable link after
+// preparation failed before any credential operation could begin.
+func (m *Manager) AbandonPreparedAdd(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+	retirement PendingAddRetirementProof,
+) error {
+	if err := validatePendingAddRetirement(reservation, retirement.PublicPath, retirement); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := RemoveAccountConfigDir(reservation.InstanceID, retirement.PublicPath); err != nil {
+		return fmt.Errorf("unlink prepared pending execution path: %w", err)
+	}
+	if err := m.removeAccountBacking(ctx, reservation.ID); err != nil {
+		return err
+	}
+	return m.Store.ReleaseAccountIndex(reservation)
+}
+
+// FinalizeUnpreparedAdd releases a reservation after presentation retirement
+// proved that preparation failed before pool-owned external I/O began.
+func (m *Manager) FinalizeUnpreparedAdd(
+	reservation store.PendingAccountReservation,
+	retirement PendingAddRetirementProof,
+) error {
+	if err := validatePendingAddRetirement(reservation, retirement.PublicPath, retirement); err != nil {
+		return err
+	}
+	return m.Store.ReleaseAccountIndex(reservation)
 }
 
 func pendingAddForReservation(

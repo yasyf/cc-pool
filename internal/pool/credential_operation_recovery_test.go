@@ -389,7 +389,9 @@ func TestCredentialRemovalRecoversOwnerDeathAfterDelete(t *testing.T) {
 		terminal.Result != store.CredentialResultDone {
 		t.Fatalf("recovered removal = %+v", terminal)
 	}
-	if err := recovery.removeCredentialForAccountRemoval(t.Context(), account); err != nil {
+	if err := recovery.removeCredentialForAccountRemovalAt(
+		t.Context(), account, account.ConfigDir,
+	); err != nil {
 		t.Fatalf("replay recovered receipt: %v", err)
 	}
 	removal, err := st.BeginAccountRemoval(account.ID, true)
