@@ -386,6 +386,7 @@ jobs:
           spctl --assess --type execute --verbose=4 app/CCPoolStatus.app
 
       - name: Render the formula into the atomic tap transaction
+        id: formula
         uses: yasyf/homebrew-tap/.github/actions/render-formula@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
         with:
           template: .github/formula/cc-pool.rb.tmpl
@@ -393,6 +394,26 @@ jobs:
           substitutions: |
             __SHA_PURE__=${{ needs.release.outputs.pure_sha256 }}
             __SHA_APP__=${{ needs.release-app.outputs.sha256 }}
+
+      - name: Audit and install the exact rendered formula
+        env:
+          FORMULA: ${{ steps.formula.outputs.file }}
+        run: |
+          set -euo pipefail
+          ruby -c "$FORMULA"
+          audit_tap=cc-pool/release-audit
+          HOMEBREW_NO_AUTO_UPDATE=1 brew tap-new --no-git "$audit_tap"
+          audit_formula="$(brew --repository "$audit_tap")/Formula/cc-pool.rb"
+          cp "$FORMULA" "$audit_formula"
+          cmp -s "$FORMULA" "$audit_formula"
+          brew audit --strict --formula "$audit_tap/cc-pool"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "$audit_tap/cc-pool"
+          prefix="$(brew --prefix "$audit_tap/cc-pool")"
+          test -x "$prefix/bin/ccp"
+          test -d "$prefix/libexec/CCPoolStatus.app"
+          version="$("$prefix/bin/ccp" --version)"
+          grep -Fq "$GITHUB_REF_NAME" <<< "$version"
+          brew test "$audit_tap/cc-pool"
 
       - name: Publish the CLI formula to the tap
         uses: yasyf/homebrew-tap/.github/actions/publish@9ca67392d45d66b6ae01e262383c8f3138d56f5e
