@@ -4,7 +4,7 @@ set -euo pipefail
 workflow=.github/workflows/release.yml
 stage_pin=e4c3108e693681df1a3c666bae80e890bc44cf3e
 draft_pin=54e3e194bda69896894a82c17fcdb2822beefab5
-tap_pin=9ca67392d45d66b6ae01e262383c8f3138d56f5e
+tap_pin=9525763796fce4d1042cf3393d9479f791908eaa
 
 if grep -Eq 'yasyf/homebrew-tap/.+@(main|v[0-9]+|swift-v[0-9]+)' "$workflow"; then
   echo "homebrew-tap release actions must use an exact commit" >&2

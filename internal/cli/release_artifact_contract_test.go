@@ -39,7 +39,7 @@ const (
 	releaseActionCommit             = "19c3d5013032ad9c88f9a8f1170d1f366c19b8d9"
 	releaseStageDraftActionCommit   = "e4c3108e693681df1a3c666bae80e890bc44cf3e"
 	releasePublishDraftActionCommit = "54e3e194bda69896894a82c17fcdb2822beefab5"
-	releasePublishCommit            = "9ca67392d45d66b6ae01e262383c8f3138d56f5e"
+	releasePublishCommit            = "9525763796fce4d1042cf3393d9479f791908eaa"
 )
 
 func TestReleaseCLIFailsClosedBeforeArtifactPublication(t *testing.T) {
