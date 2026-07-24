@@ -318,8 +318,6 @@ func TestValidateDaemonSelection(t *testing.T) {
 	}
 	a, _ = st.GetAccount(a.ID)
 	b, _ = st.GetAccount(b.ID)
-	presentationA := testFileProviderConfigDir(a.ID)
-	presentationB := testFileProviderConfigDir(b.ID)
 	m := &pool.Manager{Store: st}
 	zero, unknown := 0, 999
 	cases := []struct {
@@ -346,43 +344,43 @@ func TestValidateDaemonSelection(t *testing.T) {
 			wantError: []string{"id 999", "returned dir \"/returned/unknown\""},
 		},
 		{
-			name:      "relative public path fails",
+			name:      "relative execution path fails",
 			resp:      daemon.Response{SelectedID: &a.ID, Prepared: true, Dir: "relative/path"},
 			launch:    true,
-			wantError: []string{"id 5", "invalid File Provider path", "relative/path"},
+			wantError: []string{"id 5", "invalid execution path", "relative/path"},
 		},
 		{
 			name:      "trailing slash alias fails",
-			resp:      daemon.Response{SelectedID: &a.ID, Prepared: true, Dir: presentationA + "/"},
+			resp:      daemon.Response{SelectedID: &a.ID, Prepared: true, Dir: a.ConfigDir + "/"},
 			launch:    true,
-			wantError: []string{"id 5", "invalid File Provider path", presentationA + "/"},
+			wantError: []string{"id 5", "invalid execution path", a.ConfigDir + "/"},
 		},
 		{
 			name:      "dot segment alias fails",
-			resp:      daemon.Response{SelectedID: &a.ID, Prepared: true, Dir: presentationA + "/./"},
+			resp:      daemon.Response{SelectedID: &a.ID, Prepared: true, Dir: a.ConfigDir + "/./"},
 			launch:    true,
-			wantError: []string{"id 5", "invalid File Provider path", presentationA + "/./"},
+			wantError: []string{"id 5", "invalid execution path", a.ConfigDir + "/./"},
 		},
 		{
 			name:      "forced account mismatch",
-			resp:      daemon.Response{SelectedID: &b.ID, Prepared: true, Dir: presentationB},
+			resp:      daemon.Response{SelectedID: &b.ID, Prepared: true, Dir: b.ConfigDir},
 			forced:    &a,
 			launch:    true,
-			wantError: []string{"id 6", "forced account 5", "returned dir \"" + presentationB + "\""},
+			wantError: []string{"id 6", "forced account 5", "returned dir \"" + b.ConfigDir + "\""},
 		},
 		{
-			name: "OS public path succeeds without static-path equality",
+			name: "presentation path cannot replace stable execution path",
 			resp: daemon.Response{
 				SelectedID: &a.ID, Prepared: true, Dir: "/Users/test/Library/CloudStorage/account-5", AccountInstanceID: a.InstanceID,
 				AccountGeneration: a.Generation,
 			},
-			launch: true,
-			wantID: a.ID,
+			launch:    true,
+			wantError: []string{"id 5", "want stable account path", a.ConfigDir},
 		},
 		{
 			name: "exact forced match succeeds",
 			resp: daemon.Response{
-				SelectedID: &a.ID, Prepared: true, Dir: presentationA, AccountInstanceID: a.InstanceID,
+				SelectedID: &a.ID, Prepared: true, Dir: a.ConfigDir, AccountInstanceID: a.InstanceID,
 				AccountGeneration: a.Generation,
 			},
 			forced: &a,
@@ -399,9 +397,9 @@ func TestValidateDaemonSelection(t *testing.T) {
 		{
 			name: "metadata-only rejects a runnable path",
 			resp: daemon.Response{
-				SelectedID: &a.ID, Dir: presentationA, AccountInstanceID: a.InstanceID, AccountGeneration: a.Generation,
+				SelectedID: &a.ID, Dir: a.ConfigDir, AccountInstanceID: a.InstanceID, AccountGeneration: a.Generation,
 			},
-			wantError: []string{"inspection", "runnable File Provider path"},
+			wantError: []string{"inspection", "runnable execution path"},
 		},
 	}
 	for _, tc := range cases {
