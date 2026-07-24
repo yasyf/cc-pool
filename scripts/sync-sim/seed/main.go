@@ -147,9 +147,19 @@ func cmdAccount(args []string) error {
 	if err := os.MkdirAll(backingDir, 0o700); err != nil {
 		return fmt.Errorf("create private account source: %w", err)
 	}
-	configDir := filepath.Join(
+	publicPath := filepath.Join(
 		os.Getenv("HOME"), "Library", "CloudStorage", fmt.Sprintf("CCPool-sim-acct-%02d", *id),
 	)
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		return fmt.Errorf("create simulated File Provider public root: %w", err)
+	}
+	publicInfo, err := os.Lstat(publicPath)
+	if err != nil {
+		return fmt.Errorf("inspect simulated File Provider public root: %w", err)
+	}
+	if !publicInfo.IsDir() || publicInfo.Mode()&os.ModeSymlink != 0 || publicInfo.Mode().Perm() != 0o700 {
+		return fmt.Errorf("simulated File Provider public root must be a real 0700 directory")
+	}
 
 	// Write the private identity exactly as the source authority expects.
 	identPath := filepath.Join(backingDir, ".claude.json")
@@ -166,11 +176,6 @@ func cmdAccount(args []string) error {
 		return fmt.Errorf("write identity: %w", err)
 	}
 
-	cred := makeCred(*access, *refresh, *expiresMS)
-	if err := simCredentialStore(configDir).Write(context.Background(), cred); err != nil {
-		return fmt.Errorf("write Keychain credential: %w", err)
-	}
-
 	owner, err := simCredentialOwner()
 	if err != nil {
 		return fmt.Errorf("bind reservation owner: %w", err)
@@ -182,18 +187,33 @@ func cmdAccount(args []string) error {
 	if reservation.ID != *id {
 		return fmt.Errorf("reserved account %d, want requested account %d", reservation.ID, *id)
 	}
+	configDir, err := pool.AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		return fmt.Errorf("derive stable account config dir: %w", err)
+	}
+	keychainService, err := pool.AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		return fmt.Errorf("derive stable account Keychain service: %w", err)
+	}
+	if err := pool.EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
+		return fmt.Errorf("bind stable account config dir: %w", err)
+	}
+	cred := makeCred(*access, *refresh, *expiresMS)
+	if err := simCredentialStore(configDir).Write(context.Background(), cred); err != nil {
+		return fmt.Errorf("write Keychain credential: %w", err)
+	}
 	acct := store.Account{
 		ID:              reservation.ID,
 		InstanceID:      reservation.InstanceID,
 		Generation:      reservation.Generation,
 		ConfigDir:       configDir,
-		KeychainService: creds.ServiceName(configDir),
+		KeychainService: keychainService,
 		KeychainAccount: creds.AccountLabel(),
 		Label:           *label,
 		AccountUUID:     *uuid,
 		CreatedAt:       time.Now(),
 	}
-	proof := simPresentationProof(acct, "sync-sim-promotion")
+	proof := simPresentationProof(acct, publicPath)
 	if err := db.PromoteReservedSyncedAccount(reservation, acct, proof); err != nil {
 		return fmt.Errorf("promote account row: %w", err)
 	}
@@ -268,11 +288,11 @@ func simAdmissionFence(
 	}, nil
 }
 
-func simPresentationProof(account store.Account, _ string) store.FileProviderPresentationIdentity {
+func simPresentationProof(account store.Account, publicPath string) store.FileProviderPresentationIdentity {
 	tenantID := "account-" + account.InstanceID
 	return store.FileProviderPresentationIdentity{
 		TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
-		Generation: account.Generation, PublicPath: account.ConfigDir,
+		Generation: account.Generation, PublicPath: publicPath,
 	}
 }
 
