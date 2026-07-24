@@ -12,8 +12,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
-	"github.com/yasyf/fusekit/mountproto"
-	"github.com/yasyf/fusekit/mountservice"
+	"github.com/yasyf/fusekit/holder"
+	"github.com/yasyf/fusekit/tenant"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
@@ -29,10 +29,10 @@ type sourcePreparer interface {
 }
 
 type tenantLifecycleRuntime interface {
-	ProvisionTenant(context.Context, tenantfs.Account) (mountproto.ProvisionTenantResponse, error)
-	ReplaceTenant(context.Context, tenantfs.Account, uint64) (mountproto.ReplaceTenantResponse, error)
-	RemoveTenant(context.Context, tenantfs.Account, uint64) (mountproto.RemoveTenantResponse, error)
-	TenantState(context.Context, tenantfs.Account) (mountproto.StateResponse, error)
+	ProvisionTenant(context.Context, tenantfs.Account) (holder.LocalTenantAcknowledgement, error)
+	ReplaceTenant(context.Context, tenantfs.Account, uint64) (holder.LocalTenantAcknowledgement, error)
+	RetireTenant(context.Context, tenantfs.Account, uint64) (holder.LocalTenantRetirementProof, error)
+	TenantState(context.Context, catalog.TenantID) (tenant.TenantStatus, error)
 }
 
 // tenantCoordinator owns product account-to-tenant lifecycle and on-demand preparation.
@@ -344,15 +344,12 @@ func (c *tenantCoordinator) ensureTenantOnce(
 ) error {
 	response, err := c.runtime.ProvisionTenant(ctx, tenantAccount)
 	if err == nil {
-		if validTenantAcknowledgement(
-			response.Protocol, response.Code, response.Message, response.TenantID, response.Generation,
-			mountproto.TenantID(tenantID), tenantAccount.Generation,
-		) {
+		if validTenantAcknowledgement(response, tenantID, tenantAccount.Generation) {
 			return nil
 		}
 		return fmt.Errorf("provision acct-%02d: invalid FuseKit proof", account.ID)
 	}
-	if !isRemoteCode(err, mountproto.ErrorCodeConflict) {
+	if !isControlCode(err, tenantfs.ControlErrorConflict) {
 		return fmt.Errorf("provision acct-%02d: %w", account.ID, err)
 	}
 	state, present, err := c.tenantState(ctx, tenantAccount)
@@ -364,10 +361,7 @@ func (c *tenantCoordinator) ensureTenantOnce(
 		if retryErr != nil {
 			return fmt.Errorf("provision acct-%02d after absent state: %w", account.ID, retryErr)
 		}
-		if !validTenantAcknowledgement(
-			retried.Protocol, retried.Code, retried.Message, retried.TenantID, retried.Generation,
-			mountproto.TenantID(tenantID), tenantAccount.Generation,
-		) {
+		if !validTenantAcknowledgement(retried, tenantID, tenantAccount.Generation) {
 			return fmt.Errorf("provision acct-%02d after absent state: invalid FuseKit proof", account.ID)
 		}
 		return nil
@@ -375,23 +369,20 @@ func (c *tenantCoordinator) ensureTenantOnce(
 	if !state.ReplacementEligible {
 		return fmt.Errorf("replace acct-%02d: FuseKit tenant is not replacement eligible", account.ID)
 	}
-	if state.Generation >= tenantAccount.Generation {
+	if state.State.Generation >= catalog.Generation(tenantAccount.Generation) {
 		return fmt.Errorf(
 			"replace acct-%02d: durable FuseKit generation %d is not older than desired %d",
-			account.ID, state.Generation, tenantAccount.Generation,
+			account.ID, state.State.Generation, tenantAccount.Generation,
 		)
 	}
-	replaced, err := c.runtime.ReplaceTenant(ctx, tenantAccount, state.Generation)
+	replaced, err := c.runtime.ReplaceTenant(ctx, tenantAccount, uint64(state.State.Generation))
 	if err != nil {
 		return fmt.Errorf(
 			"replace acct-%02d generation %d from durable generation %d: %w",
-			account.ID, account.Generation, state.Generation, err,
+			account.ID, account.Generation, state.State.Generation, err,
 		)
 	}
-	if !validTenantAcknowledgement(
-		replaced.Protocol, replaced.Code, replaced.Message, replaced.TenantID, replaced.Generation,
-		mountproto.TenantID(tenantID), tenantAccount.Generation,
-	) {
+	if !validTenantAcknowledgement(replaced, tenantID, tenantAccount.Generation) {
 		return fmt.Errorf("replace acct-%02d generation %d: invalid FuseKit proof", account.ID, account.Generation)
 	}
 	return nil
@@ -400,44 +391,37 @@ func (c *tenantCoordinator) ensureTenantOnce(
 func (c *tenantCoordinator) tenantState(
 	ctx context.Context,
 	tenantAccount tenantfs.Account,
-) (mountproto.TenantState, bool, error) {
-	response, err := c.runtime.TenantState(ctx, tenantAccount)
-	if err != nil {
-		if isRemoteCode(err, mountproto.ErrorCodeNotFound) {
-			return mountproto.TenantState{}, false, nil
-		}
-		return mountproto.TenantState{}, false, err
-	}
+) (tenant.TenantStatus, bool, error) {
 	tenantID, err := tenantAccount.TenantID()
 	if err != nil {
-		return mountproto.TenantState{}, false, err
+		return tenant.TenantStatus{}, false, err
 	}
-	if response.Protocol != mountproto.Version || response.Code != mountproto.ErrorCodeOk ||
-		response.Message != "" || response.State == nil ||
-		response.State.OwnerID != mountproto.OwnerID(tenantfs.OwnerID) ||
-		response.State.TenantID != mountproto.TenantID(tenantID) ||
+	response, err := c.runtime.TenantState(ctx, tenantID)
+	if err != nil {
+		if isControlCode(err, tenantfs.ControlErrorNotFound) {
+			return tenant.TenantStatus{}, false, nil
+		}
+		return tenant.TenantStatus{}, false, err
+	}
+	if response.Owner != tenant.OwnerID(tenantfs.OwnerID) || response.State.Tenant != tenantID ||
 		response.State.Generation == 0 {
-		return mountproto.TenantState{}, false, errors.New("invalid owner-fenced FuseKit tenant state")
+		return tenant.TenantStatus{}, false, errors.New("invalid owner-fenced FuseKit tenant state")
 	}
-	return *response.State, true, nil
+	return response, true, nil
 }
 
-func isRemoteCode(err error, code mountproto.ErrorCode) bool {
-	var remote *mountservice.RemoteError
+func isControlCode(err error, code tenantfs.ControlErrorCode) bool {
+	var remote *tenantfs.ControlRemoteError
 	return errors.As(err, &remote) && remote.Code == code
 }
 
 func validTenantAcknowledgement(
-	protocol uint16,
-	code mountproto.ErrorCode,
-	message string,
-	tenantID mountproto.TenantID,
+	acknowledgement holder.LocalTenantAcknowledgement,
+	tenantID catalog.TenantID,
 	generation uint64,
-	wantID mountproto.TenantID,
-	wantGeneration uint64,
 ) bool {
-	return protocol == mountproto.Version && code == mountproto.ErrorCodeOk && message == "" &&
-		tenantID == wantID && generation == wantGeneration
+	return acknowledgement.Tenant == tenantID && acknowledgement.Generation == catalog.Generation(generation) &&
+		acknowledgement.Presentations == catalog.PresentFileProvider
 }
 
 func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.AccountRemoval) error {
@@ -475,17 +459,16 @@ func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.Acc
 	if err != nil {
 		return fmt.Errorf("inspect FuseKit tenant before removal: %w", err)
 	}
-	if present && state.Generation != removal.AccountGeneration {
+	if present && state.State.Generation != catalog.Generation(removal.AccountGeneration) {
 		return errors.New("FuseKit tenant generation drifted from removal intent")
 	}
-	response, err := c.runtime.RemoveTenant(ctx, tenantAccount, removal.AccountGeneration)
+	response, err := c.runtime.RetireTenant(ctx, tenantAccount, removal.AccountGeneration)
 	if err != nil {
-		return fmt.Errorf("remove FuseKit tenant: %w", err)
+		return fmt.Errorf("retire FuseKit tenant: %w", err)
 	}
-	if response.Protocol != mountproto.Version || response.Code != mountproto.ErrorCodeOk ||
-		response.Message != "" || response.TenantID != mountproto.TenantID(tenantID) ||
-		response.Generation != removal.AccountGeneration || !response.FileProviderAbsent {
-		return errors.New("remove FuseKit tenant: invalid proof")
+	if response.Tenant != tenantID || response.Generation != catalog.Generation(removal.AccountGeneration) ||
+		!response.FileProviderAbsent {
+		return errors.New("retire FuseKit tenant: invalid proof")
 	}
 	c.forgetTenant(tenantID)
 	return c.server.m.FinishAccountRemoval(ctx, removal)

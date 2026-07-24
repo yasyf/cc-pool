@@ -9,12 +9,19 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
-	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/holder"
 )
 
 // ErrPreparationConflict means FuseKit did not prove one fully converged tenant revision.
 var ErrPreparationConflict = errors.New("tenantfs: preparation proof mismatch")
+
+// PreparationRuntime is cc-pool's exact holder-local convergence surface.
+type PreparationRuntime interface {
+	Readiness(context.Context) (holder.LocalRuntimeReadiness, error)
+	PrepareTenant(context.Context, catalog.TenantID, holder.LocalPreparationRequest) (catalogproto.TenantPreparationProof, error)
+}
 
 // Preparer converges selected accounts through FuseKit outside account claims.
 type Preparer struct {
@@ -45,20 +52,22 @@ func (p *Preparer) Prepare(
 	if err != nil {
 		return catalogproto.TenantPreparationProof{}, err
 	}
-	request, err := p.request(ctx, account, lease)
+	request, err := p.request(account, lease)
 	if err != nil {
 		return catalogproto.TenantPreparationProof{}, err
 	}
-	response, err := p.runtime.PrepareTenant(ctx, catalogproto.TenantID(tenantID), request)
+	proof, err := p.runtime.PrepareTenant(ctx, tenantID, request)
 	if err != nil {
 		return catalogproto.TenantPreparationProof{}, fmt.Errorf("tenantfs: prepare tenant %q: %w", tenantID, err)
 	}
-	if response.Protocol != catalogproto.Version || response.Code != catalogproto.ErrorCodeOk ||
-		response.Message != "" || response.Proof == nil ||
-		!matchingPreparation(*response.Proof, catalogproto.TenantID(tenantID), account, request) {
+	readiness, err := p.runtime.Readiness(ctx)
+	if err != nil {
+		return catalogproto.TenantPreparationProof{}, fmt.Errorf("tenantfs: observe holder readiness: %w", err)
+	}
+	if !matchingPreparation(proof, catalogproto.TenantID(tenantID), account, request, readiness) {
 		return catalogproto.TenantPreparationProof{}, ErrPreparationConflict
 	}
-	return *response.Proof, nil
+	return proof, nil
 }
 
 // Validate confirms that a retained proof belongs to the current activation and account generation.
@@ -72,56 +81,41 @@ func (p *Preparer) Validate(
 	if err != nil {
 		return err
 	}
-	request, err := p.request(ctx, account, lease)
+	request, err := p.request(account, lease)
 	if err != nil {
 		return err
 	}
-	if !matchingPreparation(proof, catalogproto.TenantID(tenantID), account, request) {
+	readiness, err := p.runtime.Readiness(ctx)
+	if err != nil {
+		return fmt.Errorf("tenantfs: observe holder readiness: %w", err)
+	}
+	if !matchingPreparation(proof, catalogproto.TenantID(tenantID), account, request, readiness) {
 		return ErrPreparationConflict
 	}
 	return nil
 }
 
 func (p *Preparer) request(
-	ctx context.Context,
 	account Account,
 	lease PreparationLease,
-) (catalogproto.PrepareTenantRequest, error) {
+) (holder.LocalPreparationRequest, error) {
 	if err := validatePreparationLease(lease); err != nil {
-		return catalogproto.PrepareTenantRequest{}, err
+		return holder.LocalPreparationRequest{}, err
 	}
 	tenantID, err := account.TenantID()
 	if err != nil {
-		return catalogproto.PrepareTenantRequest{}, err
-	}
-	health, err := p.runtime.RuntimeHealth(ctx)
-	if err != nil {
-		return catalogproto.PrepareTenantRequest{}, fmt.Errorf("tenantfs: observe FuseKit runtime activation: %w", err)
-	}
-	if health.Protocol != mountproto.Version || health.Code != mountproto.ErrorCodeOk ||
-		health.Message != "" || health.RuntimeBuild != version.String() ||
-		health.RuntimeProtocol != mountproto.RuntimeProtocolVersion || health.RuntimePID <= 0 ||
-		health.ProcessGeneration == "" || health.ActivationGeneration == "" ||
-		health.State != mountproto.RuntimeStateHealthy || health.Draining || health.Busy || !health.Ready ||
-		health.ReadinessPhase != mountproto.ReadinessPhaseReady ||
-		health.ReadinessStep != mountproto.ReadinessStepPublished ||
-		health.NativePhase != mountproto.NativePhaseDisabled || health.NativeMount != nil ||
-		health.BrokerPhase != mountproto.BrokerPhaseLive {
-		return catalogproto.PrepareTenantRequest{}, ErrPreparationConflict
+		return holder.LocalPreparationRequest{}, err
 	}
 	critical, err := newCriticalReadinessPolicy(tenantID)
 	if err != nil {
-		return catalogproto.PrepareTenantRequest{}, fmt.Errorf("tenantfs: build critical readiness policy: %w", err)
+		return holder.LocalPreparationRequest{}, fmt.Errorf("tenantfs: build critical readiness policy: %w", err)
 	}
-	return catalogproto.PrepareTenantRequest{
-		Protocol:             catalogproto.Version,
-		Generation:           account.Generation,
-		Presentation:         catalogproto.PresentationKindFileProvider,
-		ActivationGeneration: health.ActivationGeneration,
-		CriticalPolicyDigest: critical.Digest,
-		CriticalObjects:      critical.Objects,
-		LeaseID:              lease.ID,
-		LeaseExpiresUnixNano: uint64(lease.ExpiresAt.UnixNano()),
+	return holder.LocalPreparationRequest{
+		Generation:      catalog.Generation(account.Generation),
+		Presentation:    catalog.PresentationFileProvider,
+		CriticalObjects: critical.Objects,
+		LeaseID:         lease.ID,
+		LeaseExpiresAt:  lease.ExpiresAt.UTC(),
 	}, nil
 }
 
@@ -138,7 +132,8 @@ func matchingPreparation(
 	proof catalogproto.TenantPreparationProof,
 	tenantID catalogproto.TenantID,
 	account Account,
-	request catalogproto.PrepareTenantRequest,
+	request holder.LocalPreparationRequest,
+	readiness holder.LocalRuntimeReadiness,
 ) bool {
 	domainID, err := catalogproto.DeriveDomainID(
 		OwnerID,
@@ -150,7 +145,8 @@ func matchingPreparation(
 	catalogProof := proof.Catalog
 	presentation := proof.Presentation
 	fileProvider := presentation.FileProvider
-	return catalogProof.Tenant == tenantID && catalogProof.Generation == request.Generation &&
+	return readiness.RuntimeBuild == version.String() && readiness.ActivationGeneration != "" &&
+		catalogProof.Tenant == tenantID && catalogProof.Generation == uint64(request.Generation) &&
 		catalogProof.Requested != 0 && catalogProof.Desired == catalogProof.Requested &&
 		catalogProof.Observed == catalogProof.Requested && catalogProof.Verified == catalogProof.Requested &&
 		catalogProof.Applied == catalogProof.Requested &&
@@ -159,7 +155,7 @@ func matchingPreparation(
 		proof.ChangeID != "" && proof.OperationID != "" &&
 		presentation.Kind == catalogproto.PresentationKindFileProvider && presentation.Mount == nil &&
 		fileProvider != nil && fileProvider.TenantID == tenantID && fileProvider.DomainID == domainID &&
-		fileProvider.Generation == request.Generation && fileProvider.ActivationGeneration == request.ActivationGeneration &&
+		fileProvider.Generation == uint64(request.Generation) && fileProvider.ActivationGeneration == readiness.ActivationGeneration &&
 		fileProvider.PresentationInstanceID == catalogproto.PresentationInstanceID(account.InstanceID) &&
 		fileProvider.RootID != "" && exactAbsolutePath(fileProvider.PublicPath) && matchingCriticalReadiness(proof, request)
 }

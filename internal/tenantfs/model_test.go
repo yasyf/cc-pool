@@ -4,67 +4,58 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/tenant"
 )
 
 const testInstanceID = "0123456789abcdef0123456789abcdef"
 
-func TestAccountDefinitionUsesImmutablePathFreeIdentity(t *testing.T) {
+func TestAccountSpecUsesImmutablePathFreeIdentity(t *testing.T) {
 	root := t.TempDir()
 	account := Account{
 		InstanceID: testInstanceID, Generation: 7,
 		BackingRoot:             filepath.Join(root, "backing", "account"),
 		FileProviderDisplayName: "acct-18",
 	}
-	tenant, err := account.TenantID()
-	if err != nil || tenant != "account-"+testInstanceID {
-		t.Fatalf("TenantID = %q, %v", tenant, err)
+	tenantID, err := account.TenantID()
+	if err != nil || tenantID != "account-"+testInstanceID {
+		t.Fatalf("TenantID = %q, %v", tenantID, err)
 	}
-	definition, err := account.Definition()
+	spec, err := account.Spec()
 	if err != nil {
-		t.Fatalf("Definition: %v", err)
+		t.Fatalf("Spec: %v", err)
 	}
-	if definition.ContentSourceID != string(ClaudeAuthorityID) || definition.Generation != 7 ||
-		definition.AccessMode != mountproto.AccessModeReadWrite || definition.CasePolicy != mountproto.CasePolicyInsensitive ||
-		definition.FileProviderPresentationInstanceID != testInstanceID || definition.FileProviderDisplayName != "acct-18" {
-		t.Fatalf("Definition = %+v", definition)
-	}
-	if len(definition.Presentations) != 1 || definition.Presentations[0] != mountproto.PresentationFileProvider {
-		t.Fatalf("sorted presentations = %v", definition.Presentations)
-	}
-	if err := mountproto.Validate(definition); err != nil {
-		t.Fatalf("definition does not satisfy exact FuseKit wire contract: %v", err)
+	if spec.OwnerID != tenant.OwnerID(OwnerID) || spec.ID != tenantID ||
+		spec.Content.ID != string(ClaudeAuthorityID) || spec.Generation != 7 ||
+		spec.Traits.Access != tenant.ReadWrite || spec.Traits.CaseSensitivity != catalog.CaseInsensitive ||
+		spec.Traits.Presentations != catalog.PresentFileProvider || spec.Mount.PresentationRoot != "" ||
+		!spec.FileProvider.Enabled || spec.FileProvider.PresentationInstanceID != testInstanceID ||
+		spec.FileProvider.DisplayName != "acct-18" {
+		t.Fatalf("Spec = %+v", spec)
 	}
 	replacement := account
 	replacement.Generation++
-	replacementDefinition, err := replacement.Definition()
+	replacementSpec, err := replacement.Spec()
 	if err != nil {
-		t.Fatalf("replacement Definition: %v", err)
+		t.Fatalf("replacement Spec: %v", err)
 	}
-	if replacementDefinition.Generation != 8 ||
-		replacementDefinition.FileProviderPresentationInstanceID != definition.FileProviderPresentationInstanceID ||
-		replacementDefinition.FileProviderDisplayName != definition.FileProviderDisplayName {
-		t.Fatalf("replacement definition changed File Provider identity: %+v", replacementDefinition)
-	}
-	if err := mountproto.Validate(mountproto.ReplaceTenantRequest{
-		Protocol: mountproto.Version, ExpectedGeneration: definition.Generation,
-		Definition: replacementDefinition,
-	}); err != nil {
-		t.Fatalf("replacement does not satisfy exact FuseKit wire contract: %v", err)
+	if replacementSpec.Generation != 8 || replacementSpec.FileProvider != spec.FileProvider ||
+		replacementSpec.ID != spec.ID || replacementSpec.OwnerID != spec.OwnerID {
+		t.Fatalf("replacement spec changed File Provider identity: %+v", replacementSpec)
 	}
 }
 
-func TestAccountDefinitionRequiresExactFileProviderMetadata(t *testing.T) {
+func TestAccountSpecRequiresExactFileProviderMetadata(t *testing.T) {
 	root := t.TempDir()
 	account := Account{
 		InstanceID: testInstanceID, Generation: 1,
 		BackingRoot: filepath.Join(root, "backing"),
 	}
-	if _, err := account.Definition(); err == nil {
-		t.Fatal("Definition accepted an empty File Provider display name")
+	if _, err := account.Spec(); err == nil {
+		t.Fatal("Spec accepted an empty File Provider display name")
 	}
 	account.FileProviderDisplayName = "acct-18\x00suffix"
-	if _, err := account.Definition(); err == nil {
-		t.Fatal("Definition accepted a File Provider display name containing NUL")
+	if _, err := account.Spec(); err == nil {
+		t.Fatal("Spec accepted a File Provider display name containing NUL")
 	}
 }

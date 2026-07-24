@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 )
 
@@ -19,7 +20,7 @@ func TestCriticalReadinessPolicyUsesStableSyntheticLogicalIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []catalogproto.CriticalObjectRequirement{
+	want := []catalog.CriticalObjectRequirement{
 		{LogicalID: string(syntheticLogical(tenantID, criticalRoleClaudeJSON)), Role: criticalRoleClaudeJSON},
 		{LogicalID: string(syntheticLogical(tenantID, criticalRoleSettings)), Role: criticalRoleSettings},
 	}
@@ -42,7 +43,7 @@ func TestCriticalReadinessPolicyDigestSeparatesSubsetsAndSupersets(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	superset, err := criticalReadinessPolicyDigest([]catalogproto.CriticalObjectRequirement{
+	superset, err := criticalReadinessPolicyDigest([]catalog.CriticalObjectRequirement{
 		policy.Objects[0],
 		{LogicalID: string(syntheticLogical(tenantID, "plans")), Role: "plans"},
 		policy.Objects[1],
@@ -62,7 +63,7 @@ func TestPreparerRejectsCriticalReadinessDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := exactPreparationRequest(account, "activation-7", lease)
+	request := exactPreparationRequest(account, lease)
 	mutations := map[string]func(*catalogproto.TenantPreparationProof){
 		"policy digest": func(proof *catalogproto.TenantPreparationProof) {
 			proof.CriticalReadiness.PolicyDigest = strings.Repeat("f", 64)
@@ -96,11 +97,9 @@ func TestPreparerRejectsCriticalReadinessDrift(t *testing.T) {
 	}
 	for name, mutate := range mutations {
 		t.Run(name, func(t *testing.T) {
-			proof := exactPreparationProof(catalogproto.TenantID(tenantID), request, account.InstanceID)
+			proof := exactPreparationProof(catalogproto.TenantID(tenantID), request, "activation-7", account.InstanceID)
 			mutate(&proof)
-			runtime := &recordingPreparationRuntime{response: catalogproto.PrepareTenantResponse{
-				Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Proof: &proof,
-			}}
+			runtime := &recordingPreparationRuntime{proof: &proof}
 			preparer, err := NewPreparer(runtime)
 			if err != nil {
 				t.Fatal(err)

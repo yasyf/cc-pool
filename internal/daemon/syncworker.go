@@ -54,7 +54,7 @@ type hostSyncWorkerRemover struct {
 	manager   *pool.Manager
 
 	mu          sync.Mutex
-	client      *tenantfs.Client
+	client      *tenantfs.ControlClient
 	coordinator *tenantCoordinator
 	cancel      context.CancelCauseFunc
 }
@@ -113,7 +113,7 @@ func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator
 	if r.coordinator != nil {
 		return r.coordinator, nil
 	}
-	client, err := tenantfs.NewClient(ctx, pool.FuseKitSocketPath())
+	client, err := tenantfs.NewControlClient(ctx, pool.FuseKitSocketPath())
 	if err != nil {
 		return nil, fmt.Errorf("connect FuseKit runtime: %w", err)
 	}

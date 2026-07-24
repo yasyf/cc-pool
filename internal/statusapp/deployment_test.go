@@ -12,7 +12,7 @@ import (
 	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/holder"
 )
 
 type recordingDeployer struct {
@@ -187,7 +187,7 @@ func installTestBuilders(hooks *productHooks) {
 		}, nil
 	}
 	hooks.proveApp = func(context.Context, string) error { return nil }
-	hooks.observe = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) {
+	hooks.observe = func(context.Context, string) (holder.LocalRuntimeReadiness, error) {
 		return exactHealth(runtimeTarget{buildID: "runtime-v1"}), nil
 	}
 }
@@ -271,7 +271,7 @@ func TestRequireActiveServiceProvesDurableReceiptAndFreshReadiness(t *testing.T)
 
 func TestRequireActiveServiceRejectsStaleRuntimeReadiness(t *testing.T) {
 	useDeploymentMetadata(t, func(hooks *productHooks) {
-		hooks.observe = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) {
+		hooks.observe = func(context.Context, string) (holder.LocalRuntimeReadiness, error) {
 			health := exactHealth(runtimeTarget{buildID: "other-runtime"})
 			return health, nil
 		}

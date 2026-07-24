@@ -9,6 +9,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/fusekit/holder"
 )
 
 const (
@@ -17,9 +18,9 @@ const (
 )
 
 type sessionLeaseRuntime interface {
-	CommitFileProviderLease(context.Context, catalogproto.TenantID, catalogproto.CommitFileProviderLeaseRequest) (catalogproto.CommitFileProviderLeaseResponse, error)
-	RenewFileProviderLease(context.Context, catalogproto.TenantID, catalogproto.RenewFileProviderLeaseRequest) (catalogproto.RenewFileProviderLeaseResponse, error)
-	ReleaseFileProviderLease(context.Context, catalogproto.TenantID, catalogproto.ReleaseFileProviderLeaseRequest) (catalogproto.ReleaseFileProviderLeaseResponse, error)
+	CommitFileProviderLease(context.Context, holder.LocalFileProviderLeaseCommit) (catalogproto.FileProviderLeaseReceipt, error)
+	RenewFileProviderLease(context.Context, holder.LocalFileProviderLeaseRenew) (catalogproto.FileProviderLeaseReceipt, error)
+	ReleaseFileProviderLease(context.Context, catalogproto.FileProviderLeaseReceipt) (catalogproto.FileProviderLeaseReceipt, error)
 }
 
 type sessionLeaseManager interface {
@@ -48,17 +49,19 @@ func (m catalogSessionLeaseManager) Commit(
 		process.PID <= 0 || process.StartedAt.IsZero() || expires.IsZero() {
 		return nil, errors.New("commit File Provider lease: invalid session identity")
 	}
-	lease.State = catalogproto.FileProviderLeaseStateCommitted
-	lease.SessionID = strconv.FormatInt(sessionID, 10)
-	lease.ProcessIdentity = sessionProcessIdentity(process)
-	lease.ExpiresUnixNano = uint64(expires.UTC().UnixNano())
-	response, err := m.runtime.CommitFileProviderLease(ctx, lease.TenantID, catalogproto.CommitFileProviderLeaseRequest{
-		Protocol: catalogproto.Version, Lease: lease,
+	response, err := m.runtime.CommitFileProviderLease(ctx, holder.LocalFileProviderLeaseCommit{
+		Lease: lease, SessionID: strconv.FormatInt(sessionID, 10),
+		ProcessIdentity: sessionProcessIdentity(process), ExpiresAt: expires.UTC(),
 	})
 	if err != nil {
 		return nil, err
 	}
-	return exactSessionLeaseResponse(response.Protocol, response.Code, response.Message, response.Lease, lease)
+	expected := lease
+	expected.State = catalogproto.FileProviderLeaseStateCommitted
+	expected.SessionID = strconv.FormatInt(sessionID, 10)
+	expected.ProcessIdentity = sessionProcessIdentity(process)
+	expected.ExpiresUnixNano = uint64(expires.UTC().UnixNano())
+	return exactSessionLeaseResponse(response, expected)
 }
 
 func (m catalogSessionLeaseManager) Renew(
@@ -73,14 +76,15 @@ func (m catalogSessionLeaseManager) Renew(
 	if lease.State != catalogproto.FileProviderLeaseStateCommitted || expires.IsZero() {
 		return nil, errors.New("renew File Provider lease: invalid committed receipt")
 	}
-	lease.ExpiresUnixNano = uint64(expires.UTC().UnixNano())
-	response, err := m.runtime.RenewFileProviderLease(ctx, lease.TenantID, catalogproto.RenewFileProviderLeaseRequest{
-		Protocol: catalogproto.Version, Lease: lease,
+	response, err := m.runtime.RenewFileProviderLease(ctx, holder.LocalFileProviderLeaseRenew{
+		Lease: lease, ExpiresAt: expires.UTC(),
 	})
 	if err != nil {
 		return nil, err
 	}
-	return exactSessionLeaseResponse(response.Protocol, response.Code, response.Message, response.Lease, lease)
+	expected := lease
+	expected.ExpiresUnixNano = uint64(expires.UTC().UnixNano())
+	return exactSessionLeaseResponse(response, expected)
 }
 
 func (m catalogSessionLeaseManager) ReleaseProvisional(
@@ -95,15 +99,13 @@ func (m catalogSessionLeaseManager) ReleaseProvisional(
 		lease.SessionID != "" || lease.ProcessIdentity != "" {
 		return nil, errors.New("release File Provider lease: invalid provisional receipt")
 	}
-	response, err := m.runtime.ReleaseFileProviderLease(ctx, lease.TenantID, catalogproto.ReleaseFileProviderLeaseRequest{
-		Protocol: catalogproto.Version, Lease: lease,
-	})
+	response, err := m.runtime.ReleaseFileProviderLease(ctx, lease)
 	if err != nil {
 		return nil, err
 	}
 	expected := lease
 	expected.State = catalogproto.FileProviderLeaseStateReleased
-	return exactSessionLeaseResponse(response.Protocol, response.Code, response.Message, response.Lease, expected)
+	return exactSessionLeaseResponse(response, expected)
 }
 
 func (m catalogSessionLeaseManager) Release(
@@ -124,29 +126,23 @@ func (m catalogSessionLeaseManager) Release(
 	} else if session.LeaseState != store.SessionLeaseActive {
 		return nil, errors.New("release File Provider lease: invalid session state")
 	}
-	response, err := m.runtime.ReleaseFileProviderLease(ctx, lease.TenantID, catalogproto.ReleaseFileProviderLeaseRequest{
-		Protocol: catalogproto.Version, Lease: lease,
-	})
+	response, err := m.runtime.ReleaseFileProviderLease(ctx, lease)
 	if err != nil {
 		return nil, err
 	}
 	expected := lease
 	expected.State = catalogproto.FileProviderLeaseStateReleased
-	return exactSessionLeaseResponse(response.Protocol, response.Code, response.Message, response.Lease, expected)
+	return exactSessionLeaseResponse(response, expected)
 }
 
 func exactSessionLeaseResponse(
-	protocol uint16,
-	code catalogproto.ErrorCode,
-	message string,
-	receipt *catalogproto.FileProviderLeaseReceipt,
+	receipt catalogproto.FileProviderLeaseReceipt,
 	expected catalogproto.FileProviderLeaseReceipt,
 ) (store.FileProviderLeaseReceipt, error) {
-	if protocol != catalogproto.Version || code != catalogproto.ErrorCodeOk || message != "" ||
-		receipt == nil || *receipt != expected {
+	if receipt != expected {
 		return nil, errors.New("FuseKit File Provider lease response changed exact identity")
 	}
-	return encodeSessionLease(*receipt)
+	return encodeSessionLease(receipt)
 }
 
 func encodeSessionLease(receipt catalogproto.FileProviderLeaseReceipt) (store.FileProviderLeaseReceipt, error) {

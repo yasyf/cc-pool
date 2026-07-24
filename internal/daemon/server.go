@@ -117,7 +117,7 @@ type Server struct {
 	// select may not have exec'd its claude yet.
 	startedAt time.Time
 
-	tenantClient                  *tenantfs.Client
+	tenantClient                  *tenantfs.ControlClient
 	tenantCoordinator             *tenantCoordinator
 	sessionLeases                 sessionLeaseManager
 	holderSessionDone             <-chan struct{}
@@ -216,7 +216,7 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	if err := terminals.Recover(activation.Context()); err != nil {
 		return fmt.Errorf("recover account terminals: %w", err)
 	}
-	tenantClient, err := tenantfs.NewClient(activation.Context(), pool.FuseKitSocketPath())
+	tenantClient, err := tenantfs.NewControlClient(activation.Context(), pool.FuseKitSocketPath())
 	if err != nil {
 		return fmt.Errorf("connect FuseKit runtime: %w", err)
 	}

@@ -7,15 +7,16 @@ import (
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
 	"github.com/yasyf/fusekit/causal"
+	"github.com/yasyf/fusekit/holder"
 )
 
 type criticalReadinessPolicy struct {
 	Digest  string
-	Objects []catalogproto.CriticalObjectRequirement
+	Objects []catalog.CriticalObjectRequirement
 }
 
 func newCriticalReadinessPolicy(tenantID catalog.TenantID) (criticalReadinessPolicy, error) {
-	objects := []catalogproto.CriticalObjectRequirement{
+	objects := []catalog.CriticalObjectRequirement{
 		{LogicalID: string(syntheticLogical(tenantID, criticalRoleClaudeJSON)), Role: criticalRoleClaudeJSON},
 		{LogicalID: string(syntheticLogical(tenantID, criticalRoleSettings)), Role: criticalRoleSettings},
 	}
@@ -26,12 +27,8 @@ func newCriticalReadinessPolicy(tenantID catalog.TenantID) (criticalReadinessPol
 	return criticalReadinessPolicy{Digest: digest, Objects: objects}, nil
 }
 
-func criticalReadinessPolicyDigest(objects []catalogproto.CriticalObjectRequirement) (string, error) {
-	requirements := make([]catalog.CriticalObjectRequirement, len(objects))
-	for index, object := range objects {
-		requirements[index] = catalog.CriticalObjectRequirement{LogicalID: object.LogicalID, Role: object.Role}
-	}
-	digest, err := catalog.CriticalObjectPolicyDigest(requirements)
+func criticalReadinessPolicyDigest(objects []catalog.CriticalObjectRequirement) (string, error) {
+	digest, err := catalog.CriticalObjectPolicyDigest(objects)
 	if err != nil {
 		return "", err
 	}
@@ -40,7 +37,7 @@ func criticalReadinessPolicyDigest(objects []catalogproto.CriticalObjectRequirem
 
 func matchingCriticalReadiness(
 	proof catalogproto.TenantPreparationProof,
-	request catalogproto.PrepareTenantRequest,
+	request holder.LocalPreparationRequest,
 ) bool {
 	readiness := proof.CriticalReadiness
 	fileProvider := proof.Presentation.FileProvider
@@ -48,12 +45,13 @@ func matchingCriticalReadiness(
 	if readiness != nil {
 		lease = readiness.Lease
 	}
-	if readiness == nil || fileProvider == nil || readiness.PolicyDigest != request.CriticalPolicyDigest ||
+	policyDigest, err := criticalReadinessPolicyDigest(request.CriticalObjects)
+	if err != nil || readiness == nil || fileProvider == nil || readiness.PolicyDigest != policyDigest ||
 		readiness.CatalogHead != proof.CatalogRevision || readiness.SourceRevision != proof.SourceRevision ||
 		readiness.TenantGeneration != proof.Catalog.Generation || readiness.DomainID != fileProvider.DomainID ||
 		readiness.PresentationInstanceID != fileProvider.PresentationInstanceID || readiness.RootID != fileProvider.RootID ||
 		readiness.ActivationGeneration != fileProvider.ActivationGeneration ||
-		lease.LeaseID != request.LeaseID || lease.ExpiresUnixNano != request.LeaseExpiresUnixNano ||
+		lease.LeaseID != request.LeaseID || lease.ExpiresUnixNano != uint64(request.LeaseExpiresAt.UnixNano()) ||
 		lease.State != catalogproto.FileProviderLeaseStateProvisional || lease.SessionID != "" || lease.ProcessIdentity != "" ||
 		lease.TenantID != proof.Catalog.Tenant || lease.DomainID != readiness.DomainID ||
 		lease.Generation != readiness.TenantGeneration || lease.RootID != readiness.RootID ||
@@ -69,10 +67,6 @@ func matchingCriticalReadiness(
 		if object.LogicalID != expected.LogicalID || object.Role != expected.Role {
 			return false
 		}
-	}
-	policyDigest, err := criticalReadinessPolicyDigest(request.CriticalObjects)
-	if err != nil || policyDigest != request.CriticalPolicyDigest {
-		return false
 	}
 	resolutionDigest, ok := criticalReadinessResolutionDigest(proof)
 	return ok && resolutionDigest == readiness.ResolutionDigest

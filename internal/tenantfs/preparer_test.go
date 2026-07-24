@@ -9,48 +9,50 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
-	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/holder"
 )
 
 type recordingPreparationRuntime struct {
-	health    mountproto.RuntimeHealthResponse
-	healthErr error
-	tenant    catalogproto.TenantID
-	request   catalogproto.PrepareTenantRequest
-	response  catalogproto.PrepareTenantResponse
-	err       error
-	called    int
+	readiness    holder.LocalRuntimeReadiness
+	readinessErr error
+	tenant       catalog.TenantID
+	request      holder.LocalPreparationRequest
+	proof        *catalogproto.TenantPreparationProof
+	err          error
+	called       int
 }
 
-func (r *recordingPreparationRuntime) RuntimeHealth(context.Context) (mountproto.RuntimeHealthResponse, error) {
-	if r.healthErr != nil {
-		return mountproto.RuntimeHealthResponse{}, r.healthErr
+func (r *recordingPreparationRuntime) Readiness(context.Context) (holder.LocalRuntimeReadiness, error) {
+	if r.readinessErr != nil {
+		return holder.LocalRuntimeReadiness{}, r.readinessErr
 	}
-	if r.health.ActivationGeneration == "" {
-		return exactRuntimeHealth(), nil
+	if r.readiness.ActivationGeneration == "" {
+		return exactRuntimeReadiness(), nil
 	}
-	return r.health, nil
+	return r.readiness, nil
 }
 
 func (r *recordingPreparationRuntime) PrepareTenant(
 	_ context.Context,
-	tenantID catalogproto.TenantID,
-	request catalogproto.PrepareTenantRequest,
-) (catalogproto.PrepareTenantResponse, error) {
+	tenantID catalog.TenantID,
+	request holder.LocalPreparationRequest,
+) (catalogproto.TenantPreparationProof, error) {
 	r.called++
 	r.tenant = tenantID
 	r.request = request
 	if r.err != nil {
-		return catalogproto.PrepareTenantResponse{}, r.err
+		return catalogproto.TenantPreparationProof{}, r.err
 	}
-	if r.response.Proof == nil {
-		proof := exactPreparationProof(tenantID, request, "0123456789abcdef0123456789abcdef")
-		return catalogproto.PrepareTenantResponse{
-			Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Proof: &proof,
-		}, nil
+	if r.proof == nil {
+		return exactPreparationProof(
+			catalogproto.TenantID(tenantID), request, "activation-7",
+			"0123456789abcdef0123456789abcdef",
+		), nil
 	}
-	return r.response, nil
+	return *r.proof, nil
 }
 
 func TestPreparerFencesFileProviderPreparationToObservedActivation(t *testing.T) {
@@ -70,19 +72,16 @@ func TestPreparerFencesFileProviderPreparationToObservedActivation(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runtime.called != 1 || runtime.tenant != catalogproto.TenantID(tenantID) ||
-		!reflect.DeepEqual(runtime.request, catalogproto.PrepareTenantRequest{
-			Protocol: catalogproto.Version, Generation: account.Generation,
-			Presentation:         catalogproto.PresentationKindFileProvider,
-			ActivationGeneration: "activation-7",
-			CriticalPolicyDigest: critical.Digest,
-			CriticalObjects:      critical.Objects,
-			LeaseID:              lease.ID,
-			LeaseExpiresUnixNano: uint64(lease.ExpiresAt.UnixNano()),
-		}) {
+	want := holder.LocalPreparationRequest{
+		Generation: catalog.Generation(account.Generation), Presentation: catalog.PresentationFileProvider,
+		CriticalObjects: critical.Objects, LeaseID: lease.ID, LeaseExpiresAt: lease.ExpiresAt,
+	}
+	if runtime.called != 1 || runtime.tenant != tenantID || !reflect.DeepEqual(runtime.request, want) {
 		t.Fatalf("prepare call = tenant %q request %+v", runtime.tenant, runtime.request)
 	}
-	if !matchingPreparation(proof, runtime.tenant, account, runtime.request) {
+	if !matchingPreparation(
+		proof, catalogproto.TenantID(runtime.tenant), account, runtime.request, exactRuntimeReadiness(),
+	) {
 		t.Fatalf("proof = %+v", proof)
 	}
 }
@@ -91,12 +90,10 @@ func TestPreparerRejectsForeignAuthorityProof(t *testing.T) {
 	account := preparationAccount(t)
 	lease := testPreparationLease()
 	tenantID, _ := account.TenantID()
-	request := exactPreparationRequest(account, "activation-7", lease)
-	proof := exactPreparationProof(catalogproto.TenantID(tenantID), request, account.InstanceID)
+	request := exactPreparationRequest(account, lease)
+	proof := exactPreparationProof(catalogproto.TenantID(tenantID), request, "activation-7", account.InstanceID)
 	proof.SourceAuthority = "foreign"
-	runtime := &recordingPreparationRuntime{response: catalogproto.PrepareTenantResponse{
-		Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Proof: &proof,
-	}}
+	runtime := &recordingPreparationRuntime{proof: &proof}
 	preparer, err := NewPreparer(runtime)
 	if err != nil {
 		t.Fatal(err)
@@ -106,40 +103,30 @@ func TestPreparerRejectsForeignAuthorityProof(t *testing.T) {
 	}
 }
 
-func TestPreparerRejectsDrainingHealthAndStaleActivationProof(t *testing.T) {
+func TestPreparerRejectsUnavailableAndStaleActivation(t *testing.T) {
 	account := preparationAccount(t)
 	lease := testPreparationLease()
+	unavailable := errors.New("holder unavailable")
+	request := exactPreparationRequest(account, lease)
+	tenantID, _ := account.TenantID()
+	stale := exactPreparationProof(catalogproto.TenantID(tenantID), request, "stale-activation", account.InstanceID)
 	for name, runtime := range map[string]*recordingPreparationRuntime{
-		"starting": {health: func() mountproto.RuntimeHealthResponse {
-			health := exactRuntimeHealth()
-			health.State = mountproto.RuntimeStateDegraded
-			health.Busy = true
-			health.Ready = false
-			health.ReadinessPhase = mountproto.ReadinessPhaseStarting
-			health.ReadinessStep = mountproto.ReadinessStepBroker
-			health.BrokerPhase = mountproto.BrokerPhaseStarting
-			return health
-		}()},
-		"draining": {health: func() mountproto.RuntimeHealthResponse {
-			health := exactRuntimeHealth()
-			health.Draining = true
-			return health
-		}()},
-		"stale activation": {response: func() catalogproto.PrepareTenantResponse {
-			tenantID, _ := account.TenantID()
-			request := exactPreparationRequest(account, "stale-activation", lease)
-			proof := exactPreparationProof(catalogproto.TenantID(tenantID), request, account.InstanceID)
-			return catalogproto.PrepareTenantResponse{
-				Protocol: catalogproto.Version, Code: catalogproto.ErrorCodeOk, Proof: &proof,
-			}
-		}()},
+		"unavailable":      {readinessErr: unavailable},
+		"stale activation": {proof: &stale},
 	} {
 		t.Run(name, func(t *testing.T) {
 			preparer, err := NewPreparer(runtime)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := preparer.Prepare(t.Context(), account, lease); !errors.Is(err, ErrPreparationConflict) {
+			_, err = preparer.Prepare(t.Context(), account, lease)
+			if name == "unavailable" {
+				if !errors.Is(err, unavailable) {
+					t.Fatalf("Prepare error = %v, want unavailable", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrPreparationConflict) {
 				t.Fatalf("Prepare error = %v, want ErrPreparationConflict", err)
 			}
 		})
@@ -158,8 +145,8 @@ func TestPreparerValidateRejectsActivationRollover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime.health = exactRuntimeHealth()
-	runtime.health.ActivationGeneration = "activation-8"
+	runtime.readiness = exactRuntimeReadiness()
+	runtime.readiness.ActivationGeneration = "activation-8"
 	if err := preparer.Validate(t.Context(), account, lease, proof); !errors.Is(err, ErrPreparationConflict) {
 		t.Fatalf("Validate error = %v, want ErrPreparationConflict", err)
 	}
@@ -170,15 +157,11 @@ func preparationAccount(t *testing.T) Account {
 	root := t.TempDir()
 	return Account{
 		InstanceID: "0123456789abcdef0123456789abcdef", Generation: 7,
-		BackingRoot: filepath.Join(root, "backing"),
+		BackingRoot: filepath.Join(root, "backing"), FileProviderDisplayName: "acct-07",
 	}
 }
 
-func exactPreparationRequest(
-	account Account,
-	activationGeneration string,
-	lease PreparationLease,
-) catalogproto.PrepareTenantRequest {
+func exactPreparationRequest(account Account, lease PreparationLease) holder.LocalPreparationRequest {
 	tenantID, err := account.TenantID()
 	if err != nil {
 		panic(err)
@@ -187,40 +170,39 @@ func exactPreparationRequest(
 	if err != nil {
 		panic(err)
 	}
-	return catalogproto.PrepareTenantRequest{
-		Protocol: catalogproto.Version, Generation: account.Generation,
-		Presentation: catalogproto.PresentationKindFileProvider, ActivationGeneration: activationGeneration,
-		CriticalPolicyDigest: critical.Digest, CriticalObjects: critical.Objects,
-		LeaseID: lease.ID, LeaseExpiresUnixNano: uint64(lease.ExpiresAt.UnixNano()),
+	return holder.LocalPreparationRequest{
+		Generation: catalog.Generation(account.Generation), Presentation: catalog.PresentationFileProvider,
+		CriticalObjects: critical.Objects, LeaseID: lease.ID, LeaseExpiresAt: lease.ExpiresAt,
 	}
 }
 
 func exactPreparationProof(
 	tenantID catalogproto.TenantID,
-	request catalogproto.PrepareTenantRequest,
-	instanceID string,
+	request holder.LocalPreparationRequest,
+	activationGeneration, instanceID string,
 ) catalogproto.TenantPreparationProof {
 	domainID, err := catalogproto.DeriveDomainID(OwnerID, catalogproto.PresentationInstanceID(instanceID))
 	if err != nil {
 		panic(err)
 	}
+	policyDigest, err := criticalReadinessPolicyDigest(request.CriticalObjects)
+	if err != nil {
+		panic(err)
+	}
 	proof := catalogproto.TenantPreparationProof{
 		Catalog: catalogproto.CatalogLaneProof{
-			Tenant: tenantID, Generation: request.Generation,
+			Tenant: tenantID, Generation: uint64(request.Generation),
 			Requested: 11, Desired: 11, Observed: 11, Verified: 11, Applied: 11,
 		},
-		SourceAuthority:   catalogproto.SourceAuthorityID(ClaudeAuthorityID),
-		SourceRevision:    17,
-		CatalogRevision:   11,
-		ChangeID:          "11111111111111111111111111111111",
-		OperationID:       "22222222222222222222222222222222",
-		SourcePublication: "55555555555555555555555555555555",
+		SourceAuthority: catalogproto.SourceAuthorityID(ClaudeAuthorityID), SourceRevision: 17,
+		CatalogRevision: 11, ChangeID: "11111111111111111111111111111111",
+		OperationID: "22222222222222222222222222222222", SourcePublication: "55555555555555555555555555555555",
 		Presentation: catalogproto.PresentationProof{
 			Kind: catalogproto.PresentationKindFileProvider,
 			FileProvider: &catalogproto.FileProviderPresentationProof{
-				TenantID: tenantID, DomainID: domainID, Generation: request.Generation,
+				TenantID: tenantID, DomainID: domainID, Generation: uint64(request.Generation),
 				PublicPath:             filepath.Join("/Users/test/Library/CloudStorage", string(domainID)),
-				ActivationGeneration:   request.ActivationGeneration,
+				ActivationGeneration:   activationGeneration,
 				PresentationInstanceID: catalogproto.PresentationInstanceID(instanceID),
 				RootID:                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			},
@@ -241,11 +223,10 @@ func exactPreparationProof(
 		}
 	}
 	proof.CriticalReadiness = &catalogproto.CriticalReadinessProof{
-		PolicyDigest: request.CriticalPolicyDigest, CatalogHead: proof.CatalogRevision,
-		SourceRevision: proof.SourceRevision, TenantGeneration: proof.Catalog.Generation,
-		DomainID: domainID, PresentationInstanceID: catalogproto.PresentationInstanceID(instanceID),
-		RootID: proof.Presentation.FileProvider.RootID, ActivationGeneration: request.ActivationGeneration,
-		Objects: objects,
+		PolicyDigest: policyDigest, CatalogHead: proof.CatalogRevision, SourceRevision: proof.SourceRevision,
+		TenantGeneration: proof.Catalog.Generation, DomainID: domainID,
+		PresentationInstanceID: catalogproto.PresentationInstanceID(instanceID),
+		RootID:                 proof.Presentation.FileProvider.RootID, ActivationGeneration: activationGeneration, Objects: objects,
 	}
 	digest, ok := criticalReadinessResolutionDigest(proof)
 	if !ok {
@@ -254,32 +235,26 @@ func exactPreparationProof(
 	proof.CriticalReadiness.ResolutionDigest = digest
 	proof.CriticalReadiness.Lease = catalogproto.FileProviderLeaseReceipt{
 		LeaseID: request.LeaseID, TenantID: tenantID, DomainID: domainID,
-		Generation: request.Generation, RootID: proof.Presentation.FileProvider.RootID,
+		Generation: uint64(request.Generation), RootID: proof.Presentation.FileProvider.RootID,
 		PresentationInstanceID: catalogproto.PresentationInstanceID(instanceID),
-		State:                  catalogproto.FileProviderLeaseStateProvisional,
-		PolicyDigest:           request.CriticalPolicyDigest, ResolutionDigest: digest,
-		CatalogHead: proof.CatalogRevision, SourceAuthority: proof.SourceAuthority,
-		SourcePublication: proof.SourcePublication, SourceRevision: proof.SourceRevision,
-		ActivationGeneration: request.ActivationGeneration,
-		ExpiresUnixNano:      request.LeaseExpiresUnixNano,
+		State:                  catalogproto.FileProviderLeaseStateProvisional, PolicyDigest: policyDigest,
+		ResolutionDigest: digest, CatalogHead: proof.CatalogRevision,
+		SourceAuthority: proof.SourceAuthority, SourcePublication: proof.SourcePublication,
+		SourceRevision: proof.SourceRevision, ActivationGeneration: activationGeneration,
+		ExpiresUnixNano: uint64(request.LeaseExpiresAt.UnixNano()),
 	}
 	return proof
 }
 
 func testPreparationLease() PreparationLease {
 	return PreparationLease{
-		ID:        "abababababababababababababababab",
-		ExpiresAt: time.Unix(1_800_000_000, 123).UTC(),
+		ID: "abababababababababababababababab", ExpiresAt: time.Unix(1_800_000_000, 123).UTC(),
 	}
 }
 
-func exactRuntimeHealth() mountproto.RuntimeHealthResponse {
-	return mountproto.RuntimeHealthResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		RuntimeBuild: version.String(), RuntimeProtocol: mountproto.RuntimeProtocolVersion,
-		RuntimePID: 42, ProcessGeneration: "process-7", ActivationGeneration: "activation-7",
-		State: mountproto.RuntimeStateHealthy, Ready: true,
-		ReadinessPhase: mountproto.ReadinessPhaseReady, ReadinessStep: mountproto.ReadinessStepPublished,
-		NativePhase: mountproto.NativePhaseDisabled, BrokerPhase: mountproto.BrokerPhaseLive,
+func exactRuntimeReadiness() holder.LocalRuntimeReadiness {
+	return holder.LocalRuntimeReadiness{
+		RuntimeBuild: version.String(), ProcessGeneration: proc.OwnerGeneration{1},
+		ActivationGeneration: "activation-7",
 	}
 }

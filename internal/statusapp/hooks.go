@@ -13,13 +13,12 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/fusekit/mountproto"
-	"github.com/yasyf/fusekit/mountservice"
+	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/transportproto"
 	"github.com/yasyf/fusekit/trustroles"
 )
@@ -32,7 +31,7 @@ type productHooks struct {
 	servicePlan   func(installedGeneration, string) (service.Plan, error)
 	candidatePlan func(installedGeneration, string, string) (deployment.CandidatePlan, error)
 	target        func(installedGeneration, string) (runtimeTarget, error)
-	observe       func(context.Context, string) (mountproto.RuntimeHealthResponse, error)
+	observe       func(context.Context, string) (holder.LocalRuntimeReadiness, error)
 	identities    func(string) ([]proc.Identity, error)
 	proveApp      func(context.Context, string) error
 	stopRuntime   func(context.Context, deployment.RuntimeStopper, service.StopRuntimeRequest) (runtimeStopProof, error)
@@ -115,10 +114,7 @@ func (h productHooks) runtimeQuiesce(
 	if err := validateRuntimeTarget(health); err != nil {
 		return runtimeProof{}, err
 	}
-	processGeneration, err := proc.ParseOwnerGeneration(health.ProcessGeneration)
-	if err != nil {
-		return runtimeProof{}, fmt.Errorf("CCPoolStatus: parse prior runtime generation: %w", err)
-	}
+	processGeneration := health.ProcessGeneration
 	result, err := h.stopRuntime(ctx, stopper, service.StopRuntimeRequest{
 		OperationID: operation.id,
 		RuntimeClientConfig: wire.RuntimeClientConfig{
@@ -142,7 +138,7 @@ func (h productHooks) runtimeQuiesce(
 		absent: true, processGeneration: processGeneration,
 		digest: h.evidenceDigest(
 			"runtime-quiesced", operation.id, generation, operation.activation.plan.Digest(), h.buildID,
-			health.RuntimeBuild, health.ProcessGeneration, hex.EncodeToString(result.processRecord[:]),
+			health.RuntimeBuild, health.ProcessGeneration.String(), hex.EncodeToString(result.processRecord[:]),
 			hex.EncodeToString(result.digest[:]),
 		),
 	}, nil
@@ -175,15 +171,11 @@ func (h productHooks) readiness(ctx context.Context, operation installedOperatio
 		if observeErr == nil {
 			validateErr := validateRuntimeReadiness(target, health)
 			if validateErr == nil {
-				generation, parseErr := proc.ParseOwnerGeneration(health.ProcessGeneration)
-				if parseErr != nil {
-					return runtimeReadiness{}, fmt.Errorf("CCPoolStatus: parse ready runtime generation: %w", parseErr)
-				}
 				return runtimeReadiness{
-					runtimeBuild: health.RuntimeBuild, processGeneration: generation,
+					runtimeBuild: health.RuntimeBuild, processGeneration: health.ProcessGeneration,
 					digest: h.evidenceDigest(
 						"runtime-ready", operation.id, operation.generation, operation.plan.Digest(),
-						health.ProcessGeneration, health.ActivationGeneration,
+						health.ProcessGeneration.String(), health.ActivationGeneration,
 					),
 				}, nil
 			}
@@ -266,36 +258,27 @@ func holderExecutablePath(appPath string) string {
 func observeRuntimeHealth(
 	ctx context.Context,
 	socket string,
-) (health mountproto.RuntimeHealthResponse, resultErr error) {
-	client, err := mountservice.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), Role: trust.UnprotectedRole,
-	})
+) (health holder.LocalRuntimeReadiness, resultErr error) {
+	client, err := tenantfs.NewControlClient(ctx, socket)
 	if err != nil {
-		return mountproto.RuntimeHealthResponse{}, err
+		return holder.LocalRuntimeReadiness{}, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, client.Close()) }()
-	return client.RuntimeHealth(ctx)
+	return client.Readiness(ctx)
 }
 
-func validateRuntimeTarget(health mountproto.RuntimeHealthResponse) error {
-	if health.Protocol != mountproto.Version || health.Code != mountproto.ErrorCodeOk || health.Message != "" ||
-		health.RuntimeBuild == "" || health.RuntimeProtocol != mountproto.RuntimeProtocolVersion ||
-		health.RuntimePID <= 0 || health.ProcessGeneration == "" {
+func validateRuntimeTarget(health holder.LocalRuntimeReadiness) error {
+	if health.RuntimeBuild == "" || health.ProcessGeneration == (proc.OwnerGeneration{}) {
 		return errors.New("CCPoolStatus: prior runtime health has the wrong exact generation")
 	}
 	return nil
 }
 
-func validateRuntimeReadiness(target runtimeTarget, health mountproto.RuntimeHealthResponse) error {
+func validateRuntimeReadiness(target runtimeTarget, health holder.LocalRuntimeReadiness) error {
 	if err := validateRuntimeTarget(health); err != nil {
 		return err
 	}
-	if health.RuntimeBuild != target.buildID || health.ActivationGeneration == "" ||
-		health.State != mountproto.RuntimeStateHealthy || health.Draining || health.Busy || !health.Ready ||
-		health.ReadinessPhase != mountproto.ReadinessPhaseReady ||
-		health.ReadinessStep != mountproto.ReadinessStepPublished ||
-		health.NativePhase != mountproto.NativePhaseDisabled || health.NativeMount != nil ||
-		health.BrokerPhase != mountproto.BrokerPhaseLive {
+	if health.RuntimeBuild != target.buildID || health.ActivationGeneration == "" {
 		return errors.New("CCPoolStatus: FuseKit runtime is not the exact healthy deployment activation")
 	}
 	return nil

@@ -9,7 +9,7 @@ import (
 
 func TestSessionDoneTracksExactEventStreamLifetime(t *testing.T) {
 	events := make(chan wire.Event)
-	done := sessionDone(events)
+	done := controlSessionDone(events)
 	select {
 	case <-done:
 		t.Fatal("session done before event stream closed")

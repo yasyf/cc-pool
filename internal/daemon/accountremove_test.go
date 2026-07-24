@@ -14,7 +14,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
-	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/catalog"
+	"github.com/yasyf/fusekit/holder"
 )
 
 type blockingRemovalRuntime struct {
@@ -23,16 +24,16 @@ type blockingRemovalRuntime struct {
 	release <-chan struct{}
 }
 
-func (r *blockingRemovalRuntime) RemoveTenant(
+func (r *blockingRemovalRuntime) RetireTenant(
 	ctx context.Context,
 	_ tenantfs.Account,
 	expected uint64,
-) (mountproto.RemoveTenantResponse, error) {
+) (holder.LocalTenantRetirementProof, error) {
 	r.removeExpected = expected
 	close(r.entered)
 	select {
 	case <-ctx.Done():
-		return mountproto.RemoveTenantResponse{}, ctx.Err()
+		return holder.LocalTenantRetirementProof{}, ctx.Err()
 	case <-r.release:
 		if r.removeErr == nil {
 			r.removed = true
@@ -110,10 +111,9 @@ func TestAccountRemovalReleasesClaimBeforeTenantRemoval(t *testing.T) {
 	release := make(chan struct{})
 	runtime := &blockingRemovalRuntime{
 		lifecycleRuntimeStub: lifecycleRuntimeStub{
-			state: exactState(mountproto.TenantID(tenantID), account.Generation),
-			remove: mountproto.RemoveTenantResponse{
-				Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-				TenantID: mountproto.TenantID(tenantID), Generation: account.Generation,
+			state: exactState(tenantID, account.Generation),
+			remove: holder.LocalTenantRetirementProof{
+				Tenant: tenantID, Generation: catalog.Generation(account.Generation),
 				FileProviderAbsent: true,
 			},
 		},
@@ -170,7 +170,7 @@ func TestCancelledAccountRemovalReleasesClaimAndRestartResumesIntent(t *testing.
 		server: server,
 		runtime: &blockingRemovalRuntime{
 			lifecycleRuntimeStub: lifecycleRuntimeStub{
-				state: exactState(mountproto.TenantID(tenantID), account.Generation),
+				state: exactState(tenantID, account.Generation),
 			},
 			entered: entered,
 			release: make(chan struct{}),
@@ -214,10 +214,9 @@ func TestCancelledAccountRemovalReleasesClaimAndRestartResumesIntent(t *testing.
 		log: log.New(io.Discard, "", 0),
 	}
 	runtime := &lifecycleRuntimeStub{
-		state: exactState(mountproto.TenantID(tenantID), removal.AccountGeneration),
-		remove: mountproto.RemoveTenantResponse{
-			Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-			TenantID: mountproto.TenantID(tenantID), Generation: removal.AccountGeneration,
+		state: exactState(tenantID, removal.AccountGeneration),
+		remove: holder.LocalTenantRetirementProof{
+			Tenant: tenantID, Generation: catalog.Generation(removal.AccountGeneration),
 			FileProviderAbsent: true,
 		},
 	}
