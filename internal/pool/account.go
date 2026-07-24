@@ -39,6 +39,7 @@ func (m *Manager) Init() (*InitResult, error) {
 type PendingAdd struct {
 	Reservation          store.PendingAccountReservation
 	ConfigDir            string
+	PublicPath           string
 	KeychainService      string
 	ClaudeJSONSeed       SeedOutcome
 	PresentationIdentity store.FileProviderPresentationIdentity
@@ -88,9 +89,9 @@ func (m *Manager) ReserveAdd() (store.PendingAccountReservation, error) {
 func (m *Manager) PrepareReservedAdd(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
-	configDir string,
+	publicPath string,
 ) (pending *PendingAdd, err error) {
-	return m.prepareReservedAdd(ctx, reservation, configDir, store.FileProviderPresentationIdentity{})
+	return m.prepareReservedAdd(ctx, reservation, publicPath, store.FileProviderPresentationIdentity{})
 }
 
 // PrepareReservedSyncedAdd seeds a peer-added account from its immutable presentation identity.
@@ -108,22 +109,32 @@ func (m *Manager) PrepareReservedSyncedAdd(
 func (m *Manager) prepareReservedAdd(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
-	configDir string,
+	publicPath string,
 	identity store.FileProviderPresentationIdentity,
 ) (pending *PendingAdd, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !filepath.IsAbs(configDir) || filepath.Clean(configDir) != configDir || strings.ContainsRune(configDir, 0) {
-		return nil, errors.New("prepare reserved add: proven config dir must be one exact absolute path")
+	if !filepath.IsAbs(publicPath) || filepath.Clean(publicPath) != publicPath || strings.ContainsRune(publicPath, 0) {
+		return nil, errors.New("prepare reserved add: proven public path must be one exact absolute path")
+	}
+	configDir, err := AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		return nil, fmt.Errorf("prepare reserved add: stable config dir: %w", err)
+	}
+	service, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		return nil, fmt.Errorf("prepare reserved add: stable Keychain service: %w", err)
 	}
 	seed, err := m.prepareAccountBacking(ctx, reservation.ID, ClaudeJSONPath())
 	if err != nil {
-		return nil, fmt.Errorf("seed .claude.json for %s: %w", configDir, err)
+		return nil, fmt.Errorf("seed .claude.json for %s: %w", publicPath, err)
 	}
-	service := creds.ServiceName(configDir)
+	if err := EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
+		return nil, fmt.Errorf("prepare reserved add: stable config link: %w", err)
+	}
 	return &PendingAdd{
-		Reservation: reservation, ConfigDir: configDir, KeychainService: service,
+		Reservation: reservation, ConfigDir: configDir, PublicPath: publicPath, KeychainService: service,
 		ClaudeJSONSeed: seed, PresentationIdentity: identity,
 	}, nil
 }
