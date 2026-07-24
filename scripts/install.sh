@@ -22,10 +22,19 @@ if ! command -v brew >/dev/null 2>&1; then
   echo "cc-pool: Homebrew is required on macOS" >&2
   exit 1
 fi
-if ! brew install yasyf/tap/cc-pool >/dev/null 2>&1 || ! command -v ccp >/dev/null 2>&1; then
+if ! brew install yasyf/tap/cc-pool >/dev/null 2>&1; then
   echo "cc-pool: Homebrew could not install yasyf/tap/cc-pool" >&2
   exit 1
 fi
+if ! formula_prefix="$(brew --prefix yasyf/tap/cc-pool)"; then
+  echo "cc-pool: Homebrew could not resolve the installed cc-pool formula" >&2
+  exit 1
+fi
+ccp="$formula_prefix/bin/ccp"
+if [ ! -x "$ccp" ]; then
+  echo "cc-pool: installed formula has no executable ccp" >&2
+  exit 1
+fi
 
-ccp package install
-echo "cc-pool: installed via Homebrew ($(ccp --version))" >&2
+"$ccp" package install
+echo "cc-pool: installed via Homebrew ($("$ccp" --version))" >&2

@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INSTALL="$ROOT/scripts/install.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/stub"
+mkdir -p "$WORK/stub" "$WORK/formula/bin"
 
 cat > "$WORK/stub/uname" <<'EOF'
 #!/bin/sh
@@ -15,10 +15,20 @@ EOF
 cat > "$WORK/stub/brew" <<'EOF'
 #!/bin/sh
 printf 'brew %s\n' "$*" >> "$COMMAND_LOG"
+[ "${1:-}" != "--prefix" ] || {
+  [ "${2:-}" = "yasyf/tap/cc-pool" ]
+  printf '%s\n' "$FORMULA_PREFIX"
+}
 [ "${FAIL_BREW:-0}" != 1 ]
 EOF
 
 cat > "$WORK/stub/ccp" <<'EOF'
+#!/bin/sh
+printf 'shadow-ccp %s\n' "$*" >> "$COMMAND_LOG"
+exit 97
+EOF
+
+cat > "$WORK/formula/bin/ccp" <<'EOF'
 #!/bin/sh
 printf 'ccp %s\n' "$*" >> "$COMMAND_LOG"
 if [ "${1:-}" = "--version" ]; then
@@ -27,12 +37,14 @@ fi
 [ "${FAIL_PACKAGE:-0}" != 1 ]
 EOF
 
-chmod +x "$WORK/stub/uname" "$WORK/stub/brew" "$WORK/stub/ccp"
+chmod +x "$WORK/stub/uname" "$WORK/stub/brew" "$WORK/stub/ccp" "$WORK/formula/bin/ccp"
 export COMMAND_LOG="$WORK/commands"
+export FORMULA_PREFIX="$WORK/formula"
 
 PATH="$WORK/stub:/usr/bin:/bin" "$INSTALL" >/dev/null
 cat > "$WORK/expected" <<'EOF'
 brew install yasyf/tap/cc-pool
+brew --prefix yasyf/tap/cc-pool
 ccp package install
 ccp --version
 EOF
@@ -41,6 +53,12 @@ if ! diff -u "$WORK/expected" "$COMMAND_LOG"; then
   exit 1
 fi
 echo "ok: macOS bootstrap uses Homebrew then explicit package install"
+
+if grep -Fq 'shadow-ccp' "$COMMAND_LOG"; then
+  echo "FAIL: macOS bootstrap executed a PATH-shadowing ccp" >&2
+  exit 1
+fi
+echo "ok: macOS bootstrap executes the installed formula's exact ccp"
 
 : > "$COMMAND_LOG"
 if PATH="$WORK/stub:/usr/bin:/bin" "$INSTALL" v0.64.0 >/dev/null 2>&1; then
@@ -70,6 +88,19 @@ if PATH="/usr/bin:/bin" "$INSTALL" >/dev/null 2>&1; then
   exit 1
 fi
 echo "ok: missing Homebrew fails closed"
+
+: > "$COMMAND_LOG"
+chmod -x "$WORK/formula/bin/ccp"
+if PATH="$WORK/stub:/usr/bin:/bin" "$INSTALL" >/dev/null 2>&1; then
+  echo "FAIL: bootstrap without the formula's ccp succeeded" >&2
+  exit 1
+fi
+chmod +x "$WORK/formula/bin/ccp"
+if grep -Fq 'ccp package install' "$COMMAND_LOG"; then
+  echo "FAIL: missing formula ccp reached package install" >&2
+  exit 1
+fi
+echo "ok: missing formula ccp fails before package mutation"
 
 : > "$COMMAND_LOG"
 if FAIL_BREW=1 PATH="$WORK/stub:/usr/bin:/bin" "$INSTALL" >/dev/null 2>&1; then
