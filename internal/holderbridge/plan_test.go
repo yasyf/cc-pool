@@ -31,6 +31,26 @@ func TestRuntimePlanSpecPinsProductIdentityAndProtectedPolicy(t *testing.T) {
 	}
 }
 
+func TestRuntimeTrustRequirementsPinEveryFixedRole(t *testing.T) {
+	const requiredAppGroup = "ABCDE12345.ccp"
+	requirements := RuntimeTrustRequirements(requiredAppGroup)
+	for name, requirement := range map[string]trust.Requirement{
+		"stop":      requirements.StopController,
+		"receipt":   requirements.ReceiptController,
+		"readiness": requirements.ReadinessController,
+	} {
+		if requirement.TeamID != TeamID || requirement.SigningIdentifier != BundleID ||
+			requirement.RequiredAppGroup != "" || requirement.RequiredEntitlements != nil {
+			t.Fatalf("%s controller requirement = %#v", name, requirement)
+		}
+	}
+	extension := requirements.FileProviderExtension
+	if extension.TeamID != TeamID || extension.SigningIdentifier != fileProviderBundleID ||
+		extension.RequiredAppGroup != requiredAppGroup || extension.RequiredEntitlements != nil {
+		t.Fatalf("File Provider extension requirement = %#v", extension)
+	}
+}
+
 func TestOpaqueDeploymentDigestMatchesSignedSwiftPolicy(t *testing.T) {
 	payload, err := os.ReadFile(filepath.Join(
 		"..", "..", "widget", "Sources", "FileProviderRuntime", "Configuration.swift",
@@ -81,21 +101,20 @@ func TestSignedHolderUsesOnlyTheRuntimePlanReadinessBudget(t *testing.T) {
 	}
 }
 
-func TestSignedHolderDispatchesStopControlBeforeOtherChildWork(t *testing.T) {
+func TestSignedHolderDispatchesOnlyFuseKitChildren(t *testing.T) {
 	payload, err := os.ReadFile(filepath.Join("..", "..", "cmd", "cc-pool-runtime-archive", "main.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	source := string(payload)
-	stop := strings.Index(source, "holder.RunStopControlChild")
 	drivers := strings.Index(source, "drivers, err := claudeDriverFactories()")
 	child := strings.Index(source, "holder.RunChild")
-	if stop < 0 || drivers < 0 || child < 0 || stop >= drivers || drivers >= child {
-		t.Fatalf("signed child dispatch order stop=%d drivers=%d child=%d", stop, drivers, child)
+	if strings.Contains(source, "StopControl"+"Child") || drivers < 0 || child < 0 || drivers >= child {
+		t.Fatalf("signed FuseKit child dispatch order drivers=%d child=%d", drivers, child)
 	}
 }
 
-func TestSignedAppDispatchesStopControlBeforeBrokerInitialization(t *testing.T) {
+func TestSignedAppDispatchesFuseKitChildrenBeforeBrokerInitialization(t *testing.T) {
 	payload, err := os.ReadFile(filepath.Join("..", "..", "widget", "Sources", "App", "main.swift"))
 	if err != nil {
 		t.Fatal(err)
@@ -107,7 +126,7 @@ func TestSignedAppDispatchesStopControlBeforeBrokerInitialization(t *testing.T) 
 	}
 	entrypoint := source[importsEnd+2:]
 	if !strings.HasPrefix(entrypoint, "let childStatus = CCPoolFuseKitDispatchChild()") {
-		t.Fatal("signed app does not dispatch the authenticated stop child first")
+		t.Fatal("signed app does not dispatch FuseKit child roles first")
 	}
 	stop := strings.Index(source, "CCPoolFuseKitDispatchChild()")
 	broker := strings.Index(source, "CatalogBroker.runChildIfRequested")

@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	"github.com/yasyf/daemonkit/deployment"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
 )
 
@@ -94,8 +94,11 @@ func TestDeploymentPolicyJSONAndDigestAreDeterministicAndComplete(t *testing.T) 
 		policy.Application.BundleLeaf != "CCPoolStatus.app" ||
 		policy.Application.ExecutableName != ExecutableName ||
 		policy.Application.ExecutableRelativePath != "Contents/MacOS/CCPoolStatus" ||
-		!policy.Application.RequireCanonicalAccountHome || policy.Application.StopControlRole != StopRoleID ||
-		policy.FileProvider.BundleID != "com.yasyf.cc-pool.status.fileprovider" ||
+		!policy.Application.RequireCanonicalAccountHome ||
+		policy.Application.StopControllerRole != holder.StopControllerRole ||
+		policy.Application.ReceiptControllerRole != holder.ReceiptControllerRole ||
+		policy.Application.ReadinessControllerRole != holder.ReadinessControllerRole ||
+		policy.FileProvider.BundleID != fileProviderBundleID ||
 		policy.FileProvider.ExtensionRelativePath != "Contents/PlugIns/CCPoolFileProvider.appex" ||
 		!policy.FileProvider.RequireRegistration || !policy.FileProvider.RequireEnabled ||
 		!policy.FileProvider.RequireExactElection ||
@@ -114,7 +117,6 @@ func TestDeploymentPolicyJSONAndDigestAreDeterministicAndComplete(t *testing.T) 
 		policy.Runtime.Readiness.SettlementTimeout != ReadinessContract().SettlementTimeout() ||
 		policy.Runtime.Readiness.ObservationTimeout != ReadinessContract().ObservationTimeout() ||
 		policy.Runtime.Readiness.NativeReadinessTimeout != NativeReadinessTimeout ||
-		policy.Runtime.Readiness.SourceReadinessTimeout != SourceReadinessTimeout ||
 		policy.Runtime.Readiness.CatalogReadinessTimeout != CatalogReadinessTimeout ||
 		policy.Runtime.Readiness.CatalogOperationTimeout != CatalogOperationTimeout ||
 		policy.Runtime.Readiness.RuntimeShutdownTimeout != RuntimeShutdownTimeout ||
@@ -142,18 +144,17 @@ func TestDeploymentPolicyJSONAndDigestAreDeterministicAndComplete(t *testing.T) 
 		policy.Proofs.RollbackRuntimeRole != deployment.ProofRollbackRuntime ||
 		!policy.Proofs.RequireReturnedRoleMatch || !policy.Proofs.RequireReadinessPlanDigest ||
 		!policy.Proofs.BindGenerationCDHash || !policy.Proofs.BindGenerationBundleDigest ||
-		!policy.Service.Quiesce.UseDaemonkitOperationIntent ||
-		!reflect.DeepEqual(policy.Service.Quiesce.AcceptedStopIntents, []wire.StopIntent{
-			wire.StopIntentUpgrade, wire.StopIntentRestart, wire.StopIntentUninstall,
-		}) ||
-		!policy.Service.Quiesce.StopAuthorityUsesConsumerBuild ||
-		!policy.Service.Quiesce.RuntimeProofBindsIntent ||
-		!policy.Service.Quiesce.RuntimeProofBindsCallerBuild ||
+		!policy.Service.Quiesce.DirectPersistentControl ||
+		policy.Service.Quiesce.ControlRole != holder.StopControllerRole ||
+		!policy.Service.Quiesce.OperationIDIsDaemonkitScoped ||
+		!policy.Service.Quiesce.ExpectedBuildIsObservedRuntime ||
 		!policy.Service.Quiesce.RuntimeProofBindsObservedBuild ||
+		!policy.Service.Quiesce.RuntimeProofBindsReceipt ||
+		!policy.Service.Quiesce.RuntimeProofBindsProcessRecord ||
 		!policy.Service.Quiesce.RequireTargetProcessGeneration ||
 		!policy.Service.Quiesce.RequireExactExecutableInventory ||
 		!policy.Service.Quiesce.AbsentRequiresEmptyInventory ||
-		!policy.Service.Quiesce.RequireExactHealthTarget || !policy.Service.Quiesce.RequireExactStopResult {
+		!policy.Service.Quiesce.RequireExactHealthTarget || !policy.Service.Quiesce.RequireGoneSettlement {
 		t.Fatalf("deployment policy = %#v", policy)
 	}
 	second, err := deploymentPolicyJSON()

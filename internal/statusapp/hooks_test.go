@@ -13,121 +13,102 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 type recordingStopper struct {
-	result wire.StopResult
-	err    error
-	calls  int
-	spec   service.StopControlSpec
+	calls   int
+	request service.StopRuntimeRequest
 }
 
 func (s *recordingStopper) StopRuntime(
 	_ context.Context,
-	spec service.StopControlSpec,
-) (wire.StopResult, error) {
+	request service.StopRuntimeRequest,
+) (service.StopReceipt, error) {
 	s.calls++
-	s.spec = spec
-	return s.result, s.err
+	s.request = request
+	return service.StopReceipt{}, errors.New("test stopper requires projected receipt injection")
 }
 
 func TestRuntimeQuiesceStopsExactObservedGeneration(t *testing.T) {
 	deployOperation := testOperation(t)
-	operation := testRuntimeQuiesceOperation(deployOperation, wire.StopIntentUpgrade)
+	operation := testRuntimeQuiesceOperation(deployOperation)
 	target := runtimeTarget{
 		executable: holderExecutablePath(operation.Generation.Path), socket: "/tmp/fusekit.sock", buildID: "v0.62.0",
 	}
 	health := exactHealth(target)
-	stopper := &recordingStopper{result: exactStopResult(health, target)}
+	stopper := &recordingStopper{}
 	hooks := newProductHooks("v0.63.0", deployment.SHA256{1})
 	hooks.target = func(deployment.Operation) (runtimeTarget, error) { return target, nil }
 	hooks.observe = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) { return health, nil }
+	hooks.stopRuntime = projectedStopRuntime(t, health, &stopper.request)
 	proof, err := hooks.runtimeQuiesce(t.Context(), stopper, operation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if proof.Role != operation.Role || proof.Absent || proof.ProcessGeneration != health.ProcessGeneration ||
+	wantGeneration, err := proc.ParseOwnerGeneration(health.ProcessGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proof.Role != operation.Role || proof.Absent || proof.ProcessGeneration != wantGeneration ||
 		proof.Digest == (deployment.SHA256{}) ||
-		stopper.calls != 1 || stopper.spec.Executable != target.executable ||
-		stopper.spec.RuntimeBuild != hooks.buildID || stopper.spec.TargetProcessGeneration != health.ProcessGeneration ||
-		stopper.spec.Role != holderbridge.StopRoleID || stopper.spec.Intent != operation.Intent {
-		t.Fatalf("proof/spec = %#v/%#v", proof, stopper.spec)
+		stopper.request.OperationID != operation.ID ||
+		stopper.request.ExpectedRuntimeBuild != health.RuntimeBuild ||
+		stopper.request.ControlRole != holder.StopControllerRole ||
+		stopper.request.RuntimeClientConfig.Client.WireBuild != transportproto.WireBuild ||
+		stopper.request.RuntimeClientConfig.Client.Role != holder.StopControllerRole ||
+		stopper.request.RuntimeClientConfig.Client.Dial == nil ||
+		stopper.request.RuntimeClientConfig.NoProgressTimeout != holderbridge.ReadinessContract().PreparationNoProgressTimeout() {
+		t.Fatalf("proof/request = %#v/%#v", proof, stopper.request)
 	}
 }
 
-func TestRuntimeQuiesceRejectsUnboundStopProcessIdentity(t *testing.T) {
-	operation := testRuntimeQuiesceOperation(testOperation(t), wire.StopIntentUpgrade)
+func TestRuntimeQuiesceRejectsUnboundStopReceipt(t *testing.T) {
+	operation := testRuntimeQuiesceOperation(testOperation(t))
 	target := runtimeTarget{
 		executable: holderExecutablePath(operation.Generation.Path), socket: "/tmp/fusekit.sock", buildID: "v0.62.0",
 	}
 	health := exactHealth(target)
-	tests := map[string]func(*wire.StopResult){
-		"not stopped":        func(result *wire.StopResult) { result.Stopped = false },
-		"generation":         func(result *wire.StopResult) { result.ProcessGeneration = "other" },
-		"runtime build":      func(result *wire.StopResult) { result.RuntimeBuild = "v0.61.0" },
-		"runtime protocol":   func(result *wire.StopResult) { result.RuntimeProtocol++ },
-		"process pid":        func(result *wire.StopResult) { result.Process.PID++ },
-		"process start":      func(result *wire.StopResult) { result.Process.StartTime = "" },
-		"process boot":       func(result *wire.StopResult) { result.Process.Boot = "" },
-		"process executable": func(result *wire.StopResult) { result.Process.Executable = "/wrong" },
+	tests := map[string]func(*runtimeStopProof){
+		"operation":      func(result *runtimeStopProof) { result.operationID = "other" },
+		"generation":     func(result *runtimeStopProof) { result.target.ProcessGeneration[0]++ },
+		"runtime build":  func(result *runtimeStopProof) { result.target.RuntimeBuild = "v0.61.0" },
+		"process record": func(result *runtimeStopProof) { result.processRecord = proc.RecordDigest{} },
+		"settlement":     func(result *runtimeStopProof) { result.settlement = 0 },
+		"receipt digest": func(result *runtimeStopProof) { result.digest = service.StopReceiptDigest{} },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
-			result := exactStopResult(health, target)
+			result := exactRuntimeStopProof(t, operation.ID, health)
 			mutate(&result)
 			hooks := newProductHooks("v0.63.0", deployment.SHA256{1})
 			hooks.target = func(deployment.Operation) (runtimeTarget, error) { return target, nil }
 			hooks.observe = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) { return health, nil }
-			if _, err := hooks.runtimeQuiesce(t.Context(), &recordingStopper{result: result}, operation); err == nil {
+			hooks.stopRuntime = func(context.Context, deployment.RuntimeStopper, service.StopRuntimeRequest) (runtimeStopProof, error) {
+				return result, nil
+			}
+			if _, err := hooks.runtimeQuiesce(t.Context(), &recordingStopper{}, operation); err == nil {
 				t.Fatalf("accepted stop result with mismatched %s", name)
 			}
 		})
 	}
 }
 
-func TestRuntimeQuiesceForwardsEveryDaemonkitIntent(t *testing.T) {
-	deployOperation := testOperation(t)
-	proofs := make(map[wire.StopIntent]deployment.SHA256)
-	for _, intent := range []wire.StopIntent{wire.StopIntentUpgrade, wire.StopIntentRestart, wire.StopIntentUninstall} {
-		t.Run(string(intent), func(t *testing.T) {
-			target := runtimeTarget{
-				executable: holderExecutablePath(deployOperation.Generation.Path), socket: "/tmp/fusekit.sock", buildID: "v0.62.0",
-			}
-			health := exactHealth(target)
-			stopper := &recordingStopper{result: exactStopResult(health, target)}
-			hooks := newProductHooks("v0.63.0", deployment.SHA256{1})
-			hooks.target = func(deployment.Operation) (runtimeTarget, error) { return target, nil }
-			hooks.observe = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) { return health, nil }
-			proof, err := hooks.runtimeQuiesce(t.Context(), stopper, testRuntimeQuiesceOperation(deployOperation, intent))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if stopper.spec.Intent != intent || stopper.spec.RuntimeBuild != hooks.buildID {
-				t.Fatalf("stop intent = %q, want %q", stopper.spec.Intent, intent)
-			}
-			proofs[intent] = proof.Digest
-		})
-	}
-	if proofs[wire.StopIntentUpgrade] == proofs[wire.StopIntentRestart] ||
-		proofs[wire.StopIntentUpgrade] == proofs[wire.StopIntentUninstall] ||
-		proofs[wire.StopIntentRestart] == proofs[wire.StopIntentUninstall] {
-		t.Fatalf("runtime proofs do not bind the daemonkit intent: %#v", proofs)
-	}
-}
-
 func TestRuntimeQuiesceProofBindsCallerAndObservedBuilds(t *testing.T) {
-	operation := testRuntimeQuiesceOperation(testOperation(t), wire.StopIntentRestart)
+	operation := testRuntimeQuiesceOperation(testOperation(t))
 	quiesce := func(callerBuild, observedBuild string) deployment.SHA256 {
 		t.Helper()
 		target := runtimeTarget{
 			executable: holderExecutablePath(operation.Generation.Path), socket: "/tmp/fusekit.sock", buildID: observedBuild,
 		}
 		health := exactHealth(target)
-		stopper := &recordingStopper{result: exactStopResult(health, target)}
+		stopper := &recordingStopper{}
 		hooks := newProductHooks(callerBuild, deployment.SHA256{1})
 		hooks.target = func(deployment.Operation) (runtimeTarget, error) { return target, nil }
 		hooks.observe = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) { return health, nil }
+		hooks.stopRuntime = projectedStopRuntime(t, health, nil)
 		proof, err := hooks.runtimeQuiesce(t.Context(), stopper, operation)
 		if err != nil {
 			t.Fatal(err)
@@ -144,54 +125,40 @@ func TestRuntimeQuiesceProofBindsCallerAndObservedBuilds(t *testing.T) {
 	}
 }
 
-func TestRuntimeQuiesceProofBindsStoppedProcessIdentity(t *testing.T) {
-	operation := testRuntimeQuiesceOperation(testOperation(t), wire.StopIntentRestart)
+func TestRuntimeQuiesceProofBindsDurableStopReceipt(t *testing.T) {
+	operation := testRuntimeQuiesceOperation(testOperation(t))
 	target := runtimeTarget{
 		executable: holderExecutablePath(operation.Generation.Path), socket: "/tmp/fusekit.sock", buildID: "v0.62.0",
 	}
-	quiesce := func(identity proc.Identity) deployment.SHA256 {
+	quiesce := func(processRecord proc.RecordDigest, receipt service.StopReceiptDigest) deployment.SHA256 {
 		t.Helper()
 		health := exactHealth(target)
-		health.RuntimePID = int64(identity.PID)
-		result := exactStopResult(health, target)
-		result.Process = identity
+		result := exactRuntimeStopProof(t, operation.ID, health)
+		result.processRecord, result.digest = processRecord, receipt
 		hooks := newProductHooks("v0.63.0", deployment.SHA256{1})
 		hooks.target = func(deployment.Operation) (runtimeTarget, error) { return target, nil }
 		hooks.observe = func(context.Context, string) (mountproto.RuntimeHealthResponse, error) { return health, nil }
-		proof, err := hooks.runtimeQuiesce(t.Context(), &recordingStopper{result: result}, operation)
+		hooks.stopRuntime = func(context.Context, deployment.RuntimeStopper, service.StopRuntimeRequest) (runtimeStopProof, error) {
+			return result, nil
+		}
+		proof, err := hooks.runtimeQuiesce(t.Context(), &recordingStopper{}, operation)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return proof.Digest
 	}
-	baseIdentity := exactStopResult(exactHealth(target), target).Process
-	base := quiesce(baseIdentity)
-	mutations := []func(*proc.Identity){
-		func(identity *proc.Identity) { identity.PID++ },
-		func(identity *proc.Identity) { identity.StartTime = "other-start" },
-		func(identity *proc.Identity) { identity.Boot = "other-boot" },
-		func(identity *proc.Identity) { identity.Comm = "other-command" },
-		func(identity *proc.Identity) { identity.AuditToken[0] = 1 },
-	}
-	for _, mutate := range mutations {
-		identity := baseIdentity
-		mutate(&identity)
-		if base == quiesce(identity) {
-			t.Fatal("runtime proof does not bind the complete stopped process identity")
-		}
-	}
-}
-
-func TestRuntimeQuiesceRejectsUnknownDaemonkitIntent(t *testing.T) {
-	operation := testRuntimeQuiesceOperation(testOperation(t), wire.StopIntent("unknown"))
-	hooks := newProductHooks("v0.63.0", deployment.SHA256{1})
-	if _, err := hooks.runtimeQuiesce(t.Context(), &recordingStopper{}, operation); err == nil {
-		t.Fatal("accepted unknown daemonkit runtime stop intent")
+	processRecord, receipt := proc.RecordDigest{1}, service.StopReceiptDigest{2}
+	base := quiesce(processRecord, receipt)
+	processRecord[1]++
+	receipt[1]++
+	if base == quiesce(processRecord, service.StopReceiptDigest{2}) ||
+		base == quiesce(proc.RecordDigest{1}, receipt) {
+		t.Fatal("runtime proof does not bind both durable stop receipt identities")
 	}
 }
 
 func TestRuntimeQuiesceProvesAbsenceByExactExecutableInventory(t *testing.T) {
-	operation := testRuntimeQuiesceOperation(testOperation(t), wire.StopIntentUninstall)
+	operation := testRuntimeQuiesceOperation(testOperation(t))
 	target := runtimeTarget{
 		executable: holderExecutablePath(operation.Generation.Path), socket: "/tmp/fusekit.sock", buildID: "v0.62.0",
 	}
@@ -205,7 +172,7 @@ func TestRuntimeQuiesceProvesAbsenceByExactExecutableInventory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if proof.Role != operation.Role || !proof.Absent || proof.ProcessGeneration != "" ||
+	if proof.Role != operation.Role || !proof.Absent || proof.ProcessGeneration != (proc.OwnerGeneration{}) ||
 		proof.Digest == (deployment.SHA256{}) {
 		t.Fatalf("absence proof = %#v", proof)
 	}
@@ -348,9 +315,9 @@ func TestProofDigestBindsFullCanonicalGeneration(t *testing.T) {
 	}
 }
 
-func testRuntimeQuiesceOperation(operation deployment.Operation, intent wire.StopIntent) deployment.RuntimeQuiesceOperation {
+func testRuntimeQuiesceOperation(operation deployment.Operation) deployment.RuntimeQuiesceOperation {
 	return deployment.RuntimeQuiesceOperation{
-		ID: operation.ID, Generation: operation.Generation, Intent: intent, Role: deployment.ProofPriorRuntime,
+		ID: operation.ID, Generation: operation.Generation, Role: deployment.ProofPriorRuntime,
 	}
 }
 
@@ -358,20 +325,41 @@ func exactHealth(target runtimeTarget) mountproto.RuntimeHealthResponse {
 	return mountproto.RuntimeHealthResponse{
 		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
 		RuntimeBuild: target.buildID, RuntimeProtocol: mountproto.RuntimeProtocolVersion,
-		RuntimePID: 100, ProcessGeneration: "process-generation", ActivationGeneration: "activation-generation",
+		RuntimePID: 100, ProcessGeneration: "0102030405060708090a0b0c0d0e0f10", ActivationGeneration: "activation-generation",
 		State: mountproto.RuntimeStateHealthy, Ready: true,
 		ReadinessPhase: mountproto.ReadinessPhaseReady, ReadinessStep: mountproto.ReadinessStepPublished,
 		NativePhase: mountproto.NativePhaseDisabled, BrokerPhase: mountproto.BrokerPhaseLive,
 	}
 }
 
-func exactStopResult(health mountproto.RuntimeHealthResponse, target runtimeTarget) wire.StopResult {
-	return wire.StopResult{
-		Process: proc.Identity{
-			PID: int(health.RuntimePID), StartTime: "process-start", Boot: "boot-session",
-			Comm: "CCPoolStatus", Executable: target.executable,
-		},
-		ProcessGeneration: health.ProcessGeneration, RuntimeBuild: health.RuntimeBuild,
-		RuntimeProtocol: int(mountproto.RuntimeProtocolVersion), Stopped: true,
+func exactRuntimeStopProof(t *testing.T, operationID string, health mountproto.RuntimeHealthResponse) runtimeStopProof {
+	t.Helper()
+	generation, err := proc.ParseOwnerGeneration(health.ProcessGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtimeStopProof{
+		operationID:   operationID,
+		target:        wire.RuntimeIdentity{RuntimeBuild: health.RuntimeBuild, ProcessGeneration: generation},
+		processRecord: proc.RecordDigest{1}, settlement: service.StopSettlementGone,
+		digest: service.StopReceiptDigest{2},
+	}
+}
+
+func projectedStopRuntime(
+	t *testing.T,
+	health mountproto.RuntimeHealthResponse,
+	captured *service.StopRuntimeRequest,
+) func(context.Context, deployment.RuntimeStopper, service.StopRuntimeRequest) (runtimeStopProof, error) {
+	t.Helper()
+	return func(
+		_ context.Context,
+		_ deployment.RuntimeStopper,
+		request service.StopRuntimeRequest,
+	) (runtimeStopProof, error) {
+		if captured != nil {
+			*captured = request
+		}
+		return exactRuntimeStopProof(t, request.OperationID, health), nil
 	}
 }

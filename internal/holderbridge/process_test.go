@@ -6,25 +6,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-
-	"github.com/yasyf/daemonkit/daemon"
 )
 
-func TestOwnedRuntimeUsesExactEmbeddedReadinessAndSettlement(t *testing.T) {
+func TestProcessUsesExactRuntimeReadinessAndSettlement(t *testing.T) {
 	runtime := newExactRuntime(nil)
-	var cleanupCalls atomic.Int32
-	owned, err := OwnRuntime(runtime, func() error {
-		cleanupCalls.Add(1)
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	process := &daemon.EmbeddedProcess{}
+	process := &Process{}
 	started := make(chan error, 1)
 	go func() {
-		started <- process.Start(t.Context(), func(context.Context) (daemon.EmbeddedRuntime, error) {
-			return owned, nil
+		started <- process.Start(t.Context(), func(context.Context) (ProcessRuntime, error) {
+			return runtime, nil
 		})
 	}()
 	<-runtime.runStarted
@@ -46,30 +36,19 @@ func TestOwnedRuntimeUsesExactEmbeddedReadinessAndSettlement(t *testing.T) {
 	if err := process.Wait(t.Context()); err != nil {
 		t.Fatalf("Wait = %v", err)
 	}
-	if calls := cleanupCalls.Load(); calls != 1 {
-		t.Fatalf("cleanup calls = %d, want 1", calls)
-	}
 	if calls := runtime.closeCalls.Load(); calls != 1 {
 		t.Fatalf("runtime Close calls = %d, want 1", calls)
 	}
 }
 
-func TestOwnedRuntimeStartupCancellationJoinsCleanup(t *testing.T) {
+func TestProcessStartupCancellationJoinsRuntime(t *testing.T) {
 	runtime := newExactRuntime(nil)
-	var cleanupCalls atomic.Int32
-	owned, err := OwnRuntime(runtime, func() error {
-		cleanupCalls.Add(1)
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	process := &daemon.EmbeddedProcess{}
+	process := &Process{}
 	ctx, cancel := context.WithCancel(t.Context())
 	started := make(chan error, 1)
 	go func() {
-		started <- process.Start(ctx, func(context.Context) (daemon.EmbeddedRuntime, error) {
-			return owned, nil
+		started <- process.Start(ctx, func(context.Context) (ProcessRuntime, error) {
+			return runtime, nil
 		})
 	}()
 	<-runtime.runStarted
@@ -82,64 +61,20 @@ func TestOwnedRuntimeStartupCancellationJoinsCleanup(t *testing.T) {
 	default:
 		t.Fatal("Start returned before canceled runtime settlement")
 	}
-	if err := process.Wait(t.Context()); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Wait = %v, want replayed context.Canceled", err)
-	}
-	if calls := cleanupCalls.Load(); calls != 1 {
-		t.Fatalf("cleanup calls = %d, want 1", calls)
+	if err := process.Wait(t.Context()); err != nil {
+		t.Fatalf("Wait = %v", err)
 	}
 }
 
-func TestOwnedRuntimeCloseCancellationStillJoinsCleanup(t *testing.T) {
-	runtime := newExactRuntime(nil)
-	runtime.publishReady()
-	var cleanupCalls atomic.Int32
-	owned, err := OwnRuntime(runtime, func() error {
-		cleanupCalls.Add(1)
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	process := &daemon.EmbeddedProcess{}
-	if err := process.Start(t.Context(), func(context.Context) (daemon.EmbeddedRuntime, error) {
-		return owned, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	if err := process.Close(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Close = %v, want context.Canceled after exact settlement", err)
-	}
-	select {
-	case <-runtime.done:
-	default:
-		t.Fatal("Close returned caller cancellation before runtime settlement")
-	}
-	if calls := cleanupCalls.Load(); calls != 1 {
-		t.Fatalf("cleanup calls = %d, want 1", calls)
-	}
-}
-
-func TestOwnedRuntimeConcurrentCloseAndWaitReplayExactResult(t *testing.T) {
+func TestProcessConcurrentCloseAndWaitReplayExactResult(t *testing.T) {
 	terminalErr := errors.New("runtime terminal failure")
-	cleanupErr := errors.New("dependency cleanup failure")
 	runtime := newExactRuntime(terminalErr)
 	runtime.publishReady()
 	runtime.closeEntered = make(chan struct{})
 	runtime.closeRelease = make(chan struct{})
-	var cleanupCalls atomic.Int32
-	owned, err := OwnRuntime(runtime, func() error {
-		cleanupCalls.Add(1)
-		return cleanupErr
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	process := &daemon.EmbeddedProcess{}
-	if err := process.Start(t.Context(), func(context.Context) (daemon.EmbeddedRuntime, error) {
-		return owned, nil
+	process := &Process{}
+	if err := process.Start(t.Context(), func(context.Context) (ProcessRuntime, error) {
+		return runtime, nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -168,25 +103,27 @@ func TestOwnedRuntimeConcurrentCloseAndWaitReplayExactResult(t *testing.T) {
 	callersWG.Wait()
 	close(results)
 	for err := range results {
-		if !errors.Is(err, terminalErr) || !errors.Is(err, cleanupErr) {
-			t.Fatalf("concurrent terminal result = %v, want runtime and cleanup failures", err)
+		if !errors.Is(err, terminalErr) {
+			t.Fatalf("concurrent terminal result = %v, want %v", err, terminalErr)
 		}
-	}
-	if calls := runtime.closeCalls.Load(); calls != 1 {
-		t.Fatalf("runtime Close calls = %d, want 1", calls)
-	}
-	if calls := cleanupCalls.Load(); calls != 1 {
-		t.Fatalf("cleanup calls = %d, want 1", calls)
 	}
 }
 
-func TestOwnRuntimeRequiresRuntimeAndCleanup(t *testing.T) {
-	runtime := newExactRuntime(nil)
-	if _, err := OwnRuntime(nil, func() error { return nil }); err == nil {
-		t.Fatal("OwnRuntime accepted nil runtime")
+func TestProcessRejectsInvalidOrRepeatedStart(t *testing.T) {
+	process := &Process{}
+	if err := process.Start(t.Context(), nil); err == nil {
+		t.Fatal("Start accepted nil constructor")
 	}
-	if _, err := OwnRuntime(runtime, nil); err == nil {
-		t.Fatal("OwnRuntime accepted nil cleanup")
+	want := errors.New("construct failed")
+	if err := process.Start(t.Context(), func(context.Context) (ProcessRuntime, error) {
+		return nil, want
+	}); !errors.Is(err, want) {
+		t.Fatalf("Start = %v, want %v", err, want)
+	}
+	if err := process.Start(t.Context(), func(context.Context) (ProcessRuntime, error) {
+		return newExactRuntime(nil), nil
+	}); !errors.Is(err, errProcessStarted) {
+		t.Fatalf("repeated Start = %v, want process-started error", err)
 	}
 }
 
@@ -218,14 +155,7 @@ func newExactRuntime(terminal error) *exactRuntime {
 }
 
 func (r *exactRuntime) Run(ctx context.Context) error {
-	ran := false
-	r.runOnce.Do(func() {
-		ran = true
-		close(r.runStarted)
-	})
-	if !ran {
-		return daemon.ErrRuntimeStarted
-	}
+	r.runOnce.Do(func() { close(r.runStarted) })
 	var result error
 	select {
 	case <-ctx.Done():
@@ -247,13 +177,13 @@ func (r *exactRuntime) WaitReady(ctx context.Context) error {
 	case <-r.ready:
 		return nil
 	case <-r.done:
-		return errors.Join(daemon.ErrRuntimeNotReady, r.terminalResult())
+		return errors.New("runtime stopped before readiness")
 	}
 }
 
 func (r *exactRuntime) Close(ctx context.Context) error {
-	r.closeCalls.Add(1)
 	r.closeOnce.Do(func() {
+		r.closeCalls.Add(1)
 		if r.closeEntered != nil {
 			close(r.closeEntered)
 		}
@@ -270,16 +200,10 @@ func (r *exactRuntime) Wait(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-r.done:
-		return r.terminalResult()
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.result
 	}
 }
 
-func (r *exactRuntime) terminalResult() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.result
-}
-
-func (r *exactRuntime) publishReady() {
-	r.readyOnce.Do(func() { close(r.ready) })
-}
+func (r *exactRuntime) publishReady() { r.readyOnce.Do(func() { close(r.ready) }) }

@@ -13,7 +13,7 @@ import (
 
 	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/transportproto"
@@ -49,14 +49,16 @@ type deploymentPolicy struct {
 }
 
 type deploymentApplicationPolicy struct {
-	BundleID                    string `json:"bundle_id"`
-	TeamID                      string `json:"team_id"`
-	InstallRootHomeRelative     string `json:"install_root_home_relative"`
-	BundleLeaf                  string `json:"bundle_leaf"`
-	ExecutableName              string `json:"executable_name"`
-	ExecutableRelativePath      string `json:"executable_relative_path"`
-	RequireCanonicalAccountHome bool   `json:"require_canonical_account_home"`
-	StopControlRole             string `json:"stop_control_role"`
+	BundleID                    string         `json:"bundle_id"`
+	TeamID                      string         `json:"team_id"`
+	InstallRootHomeRelative     string         `json:"install_root_home_relative"`
+	BundleLeaf                  string         `json:"bundle_leaf"`
+	ExecutableName              string         `json:"executable_name"`
+	ExecutableRelativePath      string         `json:"executable_relative_path"`
+	RequireCanonicalAccountHome bool           `json:"require_canonical_account_home"`
+	StopControllerRole          trust.PeerRole `json:"stop_controller_role"`
+	ReceiptControllerRole       trust.PeerRole `json:"receipt_controller_role"`
+	ReadinessControllerRole     trust.PeerRole `json:"readiness_controller_role"`
 }
 
 type deploymentFileProviderPolicy struct {
@@ -115,7 +117,6 @@ type deploymentReadinessPolicy struct {
 	SettlementTimeout           time.Duration             `json:"settlement_timeout_ns"`
 	ObservationTimeout          time.Duration             `json:"observation_timeout_ns"`
 	NativeReadinessTimeout      time.Duration             `json:"native_readiness_timeout_ns"`
-	SourceReadinessTimeout      time.Duration             `json:"source_readiness_timeout_ns"`
 	CatalogReadinessTimeout     time.Duration             `json:"catalog_readiness_timeout_ns"`
 	CatalogOperationTimeout     time.Duration             `json:"catalog_operation_timeout_ns"`
 	RuntimeShutdownTimeout      time.Duration             `json:"runtime_shutdown_timeout_ns"`
@@ -170,18 +171,18 @@ type deploymentProofPolicy struct {
 }
 
 type deploymentQuiescePolicy struct {
-	StopControlArguments            []string          `json:"stop_control_arguments"`
-	UseDaemonkitOperationIntent     bool              `json:"use_daemonkit_operation_intent"`
-	AcceptedStopIntents             []wire.StopIntent `json:"accepted_stop_intents"`
-	StopAuthorityUsesConsumerBuild  bool              `json:"stop_authority_uses_consumer_build"`
-	RuntimeProofBindsIntent         bool              `json:"runtime_proof_binds_intent"`
-	RuntimeProofBindsCallerBuild    bool              `json:"runtime_proof_binds_caller_build"`
-	RuntimeProofBindsObservedBuild  bool              `json:"runtime_proof_binds_observed_build"`
-	RequireTargetProcessGeneration  bool              `json:"require_target_process_generation"`
-	RequireExactExecutableInventory bool              `json:"require_exact_executable_inventory"`
-	AbsentRequiresEmptyInventory    bool              `json:"absent_requires_empty_inventory"`
-	RequireExactHealthTarget        bool              `json:"require_exact_health_target"`
-	RequireExactStopResult          bool              `json:"require_exact_stop_result"`
+	DirectPersistentControl         bool           `json:"direct_persistent_control"`
+	ControlRole                     trust.PeerRole `json:"control_role"`
+	OperationIDIsDaemonkitScoped    bool           `json:"operation_id_is_daemonkit_scoped"`
+	ExpectedBuildIsObservedRuntime  bool           `json:"expected_build_is_observed_runtime"`
+	RuntimeProofBindsObservedBuild  bool           `json:"runtime_proof_binds_observed_build"`
+	RuntimeProofBindsReceipt        bool           `json:"runtime_proof_binds_receipt"`
+	RuntimeProofBindsProcessRecord  bool           `json:"runtime_proof_binds_process_record"`
+	RequireTargetProcessGeneration  bool           `json:"require_target_process_generation"`
+	RequireExactExecutableInventory bool           `json:"require_exact_executable_inventory"`
+	AbsentRequiresEmptyInventory    bool           `json:"absent_requires_empty_inventory"`
+	RequireExactHealthTarget        bool           `json:"require_exact_health_target"`
+	RequireGoneSettlement           bool           `json:"require_gone_settlement"`
 }
 
 // DeploymentIdentity returns the startup-frozen updater build and callback policy identities.
@@ -248,10 +249,12 @@ func deploymentPolicyJSON() ([]byte, error) {
 			BundleLeaf: ExecutableName + ".app", ExecutableName: ExecutableName,
 			ExecutableRelativePath:      "Contents/MacOS/" + ExecutableName,
 			RequireCanonicalAccountHome: true,
-			StopControlRole:             StopRoleID,
+			StopControllerRole:          holder.StopControllerRole,
+			ReceiptControllerRole:       holder.ReceiptControllerRole,
+			ReadinessControllerRole:     holder.ReadinessControllerRole,
 		},
 		FileProvider: deploymentFileProviderPolicy{
-			BundleID:              "com.yasyf.cc-pool.status.fileprovider",
+			BundleID:              fileProviderBundleID,
 			ExtensionRelativePath: "Contents/PlugIns/CCPoolFileProvider.appex",
 			RequireRegistration:   true, RequireEnabled: true, RequireExactElection: true,
 			ElectionTimeout: DeploymentElectionTimeout, ElectionPoll: DeploymentPollInterval,
@@ -284,8 +287,8 @@ func deploymentPolicyJSON() ([]byte, error) {
 			},
 			Readiness: deploymentReadinessPolicy{
 				StartupTimeout: readiness.StartupTimeout(), SettlementTimeout: readiness.SettlementTimeout(),
-				ObservationTimeout:     readiness.ObservationTimeout(),
-				NativeReadinessTimeout: NativeReadinessTimeout, SourceReadinessTimeout: SourceReadinessTimeout,
+				ObservationTimeout:      readiness.ObservationTimeout(),
+				NativeReadinessTimeout:  NativeReadinessTimeout,
 				CatalogReadinessTimeout: CatalogReadinessTimeout, CatalogOperationTimeout: CatalogOperationTimeout,
 				RuntimeShutdownTimeout: RuntimeShutdownTimeout, PollInterval: DeploymentPollInterval,
 				RequiredState: mountproto.RuntimeStateHealthy,
@@ -306,16 +309,13 @@ func deploymentPolicyJSON() ([]byte, error) {
 			BuildEnvironmentKey: "FUSEKIT_BUILD_ID", RequireExactBuildEnvironment: true,
 			ReplacementOwnsRestartFence: true,
 			Quiesce: deploymentQuiescePolicy{
-				StopControlArguments:        holder.StopControlChildArguments(),
-				UseDaemonkitOperationIntent: true,
-				AcceptedStopIntents: []wire.StopIntent{
-					wire.StopIntentUpgrade, wire.StopIntentRestart, wire.StopIntentUninstall,
-				},
-				StopAuthorityUsesConsumerBuild: true, RuntimeProofBindsIntent: true,
-				RuntimeProofBindsCallerBuild: true, RuntimeProofBindsObservedBuild: true,
+				DirectPersistentControl: true, ControlRole: holder.StopControllerRole,
+				OperationIDIsDaemonkitScoped: true, ExpectedBuildIsObservedRuntime: true,
+				RuntimeProofBindsObservedBuild: true, RuntimeProofBindsReceipt: true,
+				RuntimeProofBindsProcessRecord:  true,
 				RequireTargetProcessGeneration:  true,
 				RequireExactExecutableInventory: true, AbsentRequiresEmptyInventory: true,
-				RequireExactHealthTarget: true, RequireExactStopResult: true,
+				RequireExactHealthTarget: true, RequireGoneSettlement: true,
 			},
 		},
 	})

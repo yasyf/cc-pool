@@ -3,19 +3,20 @@ package holderbridge
 
 import (
 	"github.com/yasyf/daemonkit/codeidentity"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/fusekit/holder"
 )
 
 const (
 	// BundleID is the fixed signed status helper application's bundle identifier.
 	BundleID = "com.yasyf.cc-pool.status"
-	// StopRoleID is the controller-launched one-shot signed runtime settlement role.
-	StopRoleID = "com.yasyf.cc-pool.status.fusekit.stop-control"
 	// TeamID is the fixed signing team for every protected helper role.
 	TeamID = "SXKCTF23Q2"
 	// ExecutableName is the embedded status helper and broker executable.
 	ExecutableName = "CCPoolStatus"
 )
+
+const fileProviderBundleID = "com.yasyf.cc-pool.status.fileprovider"
 
 var runtimePolicyDigest = codeidentity.PolicyDigest{
 	0x48, 0xe0, 0x64, 0xe5, 0xc6, 0xcd, 0x4f, 0xa0,
@@ -38,6 +39,17 @@ func Application(appPath string) holder.SignedApplication {
 
 // ReadinessContract returns cc-pool's one signed-runtime and service-observer budget.
 func ReadinessContract() holder.ReadinessContract { return holder.StandardReadinessContract() }
+
+// RuntimeTrustRequirements returns the signed peers admitted to FuseKit's fixed roles.
+func RuntimeTrustRequirements(requiredAppGroup string) holder.RuntimeTrustRequirements {
+	controller := trust.Requirement{TeamID: TeamID, SigningIdentifier: BundleID}
+	return holder.RuntimeTrustRequirements{
+		StopController: controller, ReceiptController: controller, ReadinessController: controller,
+		FileProviderExtension: trust.Requirement{
+			TeamID: TeamID, SigningIdentifier: fileProviderBundleID, RequiredAppGroup: requiredAppGroup,
+		},
+	}
+}
 
 // RuntimePlanSpec returns the concrete signed-side cc-pool helper contract.
 func RuntimePlanSpec(

@@ -21,7 +21,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/cc-pool/internal/version"
-	"github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/fusekit/holder"
 )
@@ -32,7 +31,7 @@ const (
 )
 
 var (
-	embeddedHolder         daemon.EmbeddedProcess
+	embeddedHolder         holderbridge.Process
 	embeddedHolderStopping atomic.Bool
 )
 
@@ -40,17 +39,11 @@ var (
 func CCPoolFuseKitDispatchChild() C.int32_t {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	recognized, err := holder.RunStopControlChild(ctx, os.Args[1:], holder.StopControlChildConfig{
-		Socket: pool.FuseKitSocketPath(),
-	})
-	if recognized {
-		return operationStatus("stop-control child", err)
-	}
 	drivers, err := claudeDriverFactories()
 	if err != nil {
 		return operationStatus("source driver registry", err)
 	}
-	recognized, err = holder.RunChild(ctx, os.Args[1:], holder.ChildConfig{
+	recognized, err := holder.RunChild(ctx, os.Args[1:], holder.ChildConfig{
 		Stdout: os.Stdout, Drivers: drivers,
 	})
 	if !recognized {
@@ -73,7 +66,7 @@ func CCPoolFuseKitStart(appGroupIdentifier *C.char) C.int32_t {
 }
 
 func startHolder(ctx context.Context, requiredAppGroup string) error {
-	if err := embeddedHolder.Start(ctx, func(ctx context.Context) (daemon.EmbeddedRuntime, error) {
+	if err := embeddedHolder.Start(ctx, func(ctx context.Context) (holderbridge.ProcessRuntime, error) {
 		return newHolderRuntime(ctx, requiredAppGroup)
 	}); err != nil {
 		return err
@@ -122,7 +115,7 @@ func CCPoolFuseKitStop() C.int32_t {
 	return operationStatus("runtime shutdown", embeddedHolder.Close(ctx))
 }
 
-func newHolderRuntime(ctx context.Context, requiredAppGroup string) (daemon.EmbeddedRuntime, error) {
+func newHolderRuntime(ctx context.Context, requiredAppGroup string) (*holder.Runtime, error) {
 	plan, err := holderbridge.NewRuntimePlan(
 		pool.WidgetAppPath(), pool.FuseKitRuntimeDir(), version.String(), requiredAppGroup,
 	)
@@ -137,8 +130,8 @@ func newHolderRuntime(ctx context.Context, requiredAppGroup string) (daemon.Embe
 	if err != nil {
 		return nil, fmt.Errorf("FuseKit runtime: resolve deployment stop authority: %w", err)
 	}
-	return holderbridge.NewEmbeddedRuntime(ctx, holderbridge.EmbeddedRuntimeSpec{
-		Plan: plan, StopRole: holderbridge.StopRoleID,
+	return holderbridge.NewRuntime(ctx, holderbridge.RuntimeSpec{
+		Plan: plan, TrustRequirements: holderbridge.RuntimeTrustRequirements(requiredAppGroup),
 		StopControlStore: stopControlStore,
 		Owner:            tenantfs.SourceAuthorityFleetOwner, Drivers: drivers,
 		CatalogAuthorizer: tenantfs.NewCatalogAuthorizer(),

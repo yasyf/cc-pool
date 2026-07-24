@@ -16,10 +16,12 @@ import (
 	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
+	"github.com/yasyf/fusekit/transportproto"
 )
 
 const (
@@ -37,6 +39,7 @@ type productHooks struct {
 	observe          func(context.Context, string) (mountproto.RuntimeHealthResponse, error)
 	identities       func(string) ([]proc.Identity, error)
 	proveApp         func(context.Context, string) error
+	stopRuntime      func(context.Context, deployment.RuntimeStopper, service.StopRuntimeRequest) (runtimeStopProof, error)
 }
 
 func newProductHooks(buildID string, policyDigest deployment.SHA256) productHooks {
@@ -45,6 +48,21 @@ func newProductHooks(buildID string, policyDigest deployment.SHA256) productHook
 		observe: observeRuntimeHealth, identities: proc.ExecutableIdentities,
 		proveApp: func(ctx context.Context, appPath string) error {
 			return proveElection(ctx, appPath, commandRunner{})
+		},
+		stopRuntime: func(
+			ctx context.Context,
+			stopper deployment.RuntimeStopper,
+			request service.StopRuntimeRequest,
+		) (runtimeStopProof, error) {
+			receipt, err := stopper.StopRuntime(ctx, request)
+			if err != nil {
+				return runtimeStopProof{}, err
+			}
+			return runtimeStopProof{
+				operationID: receipt.OperationID(), target: receipt.Target(),
+				processRecord: receipt.ProcessRecordDigest(), settlement: receipt.Settlement(),
+				digest: receipt.Digest(),
+			}, nil
 		},
 	}
 	hooks.servicePlanBuild = hooks.servicePlanForBuild
@@ -61,14 +79,19 @@ type runtimeTarget struct {
 	buildID    string
 }
 
+type runtimeStopProof struct {
+	operationID   string
+	target        wire.RuntimeIdentity
+	processRecord proc.RecordDigest
+	settlement    service.StopSettlement
+	digest        service.StopReceiptDigest
+}
+
 func (h productHooks) runtimeQuiesce(
 	ctx context.Context,
 	stopper deployment.RuntimeStopper,
 	operation deployment.RuntimeQuiesceOperation,
 ) (deployment.RuntimeProof, error) {
-	if !validRuntimeStopIntent(operation.Intent) {
-		return deployment.RuntimeProof{}, fmt.Errorf("CCPoolStatus: unsupported daemonkit runtime stop intent %q", operation.Intent)
-	}
 	deployOperation := deployment.Operation{ID: operation.ID, Generation: operation.Generation, Role: operation.Role}
 	target, err := h.target(deployOperation)
 	if err != nil {
@@ -92,46 +115,43 @@ func (h productHooks) runtimeQuiesce(
 		return deployment.RuntimeProof{
 			Role: operation.Role, Absent: true,
 			Digest: h.proofDigest(
-				"runtime-absent", deployOperation, string(operation.Intent), h.buildID, target.executable,
+				"runtime-absent", deployOperation, h.buildID, target.executable,
 			),
 		}, nil
 	}
 	if err := validateRuntimeTarget(health); err != nil {
 		return deployment.RuntimeProof{}, err
 	}
-	result, err := stopper.StopRuntime(ctx, service.StopControlSpec{
-		Executable: target.executable, Args: holder.StopControlChildArguments(),
-		Role: holderbridge.StopRoleID, RuntimeBuild: h.buildID,
-		RuntimeProtocol:         int(mountproto.RuntimeProtocolVersion),
-		TargetProcessGeneration: health.ProcessGeneration, Intent: operation.Intent,
+	processGeneration, err := proc.ParseOwnerGeneration(health.ProcessGeneration)
+	if err != nil {
+		return deployment.RuntimeProof{}, fmt.Errorf("CCPoolStatus: parse prior runtime generation: %w", err)
+	}
+	result, err := h.stopRuntime(ctx, stopper, service.StopRuntimeRequest{
+		OperationID: operation.ID,
+		RuntimeClientConfig: wire.RuntimeClientConfig{
+			Client: wire.ClientConfig{
+				Dial: wire.UnixDialer(target.socket), WireBuild: transportproto.WireBuild,
+				Role: holder.StopControllerRole,
+			},
+			NoProgressTimeout: holderbridge.ReadinessContract().PreparationNoProgressTimeout(),
+		},
+		ExpectedRuntimeBuild: health.RuntimeBuild, ControlRole: holder.StopControllerRole,
 	})
 	if err != nil {
 		return deployment.RuntimeProof{}, fmt.Errorf("CCPoolStatus: settle prior runtime: %w", err)
 	}
-	if !result.Stopped || result.ProcessGeneration != health.ProcessGeneration ||
-		result.RuntimeBuild != health.RuntimeBuild || result.RuntimeProtocol != int(mountproto.RuntimeProtocolVersion) ||
-		int64(result.Process.PID) != health.RuntimePID || result.Process.StartTime == "" ||
-		result.Process.Boot == "" || result.Process.Executable != target.executable {
+	if result.operationID != operation.ID || result.target.RuntimeBuild != health.RuntimeBuild ||
+		result.target.ProcessGeneration != processGeneration || result.processRecord == (proc.RecordDigest{}) ||
+		result.settlement != service.StopSettlementGone || result.digest == (service.StopReceiptDigest{}) {
 		return deployment.RuntimeProof{}, errors.New("CCPoolStatus: stop result does not match the observed runtime generation")
 	}
 	return deployment.RuntimeProof{
-		Role: operation.Role, ProcessGeneration: health.ProcessGeneration,
+		Role: operation.Role, ProcessGeneration: processGeneration,
 		Digest: h.proofDigest(
-			"runtime-quiesced", deployOperation, string(operation.Intent), h.buildID,
-			health.RuntimeBuild, health.ProcessGeneration,
-			fmt.Sprintf("%d", result.Process.PID), result.Process.StartTime, result.Process.Boot,
-			result.Process.Comm, result.Process.Executable, hex.EncodeToString(result.Process.AuditToken[:]),
+			"runtime-quiesced", deployOperation, h.buildID, health.RuntimeBuild, health.ProcessGeneration,
+			hex.EncodeToString(result.processRecord[:]), hex.EncodeToString(result.digest[:]),
 		),
 	}, nil
-}
-
-func validRuntimeStopIntent(intent wire.StopIntent) bool {
-	switch intent {
-	case wire.StopIntentUpgrade, wire.StopIntentRestart, wire.StopIntentUninstall:
-		return true
-	default:
-		return false
-	}
 }
 
 func (h productHooks) postInstallProof(ctx context.Context, operation deployment.Operation) (deployment.Proof, error) {
@@ -273,7 +293,9 @@ func observeRuntimeHealth(
 	ctx context.Context,
 	socket string,
 ) (health mountproto.RuntimeHealthResponse, resultErr error) {
-	client, err := mountservice.NewClient(ctx, wire.ClientConfig{Dial: wire.UnixDialer(socket)})
+	client, err := mountservice.NewClient(ctx, wire.ClientConfig{
+		Dial: wire.UnixDialer(socket), Role: trust.UnprotectedRole,
+	})
 	if err != nil {
 		return mountproto.RuntimeHealthResponse{}, err
 	}
