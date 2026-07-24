@@ -110,8 +110,9 @@ FuseKit to provision or prepare exact tenant generations. It does not supervise 
 File Provider extensions, or App Group listeners. The fixed signed app owns the FuseKit
 runtime through daemonkit; the account daemon connects over the exact private session and
 fails closed on a missing or mismatched runtime. `ccp add` and `ccp init` start the account
-daemon automatically; if it is not running, `ccp select` starts the exact matching daemon
-and refuses selection until the daemon and requested tenant revision are ready.
+daemon automatically. `ccp select` starts the exact matching daemon but remains metadata-only:
+it neither prepares a tenant nor returns a runnable path. `ccp run` refuses launch until the
+requested tenant revision and its File Provider presentation are proven ready.
 
 No secrets are ever stored in cc-pool's database — the macOS Keychain is the only secret
 store.

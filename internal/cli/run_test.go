@@ -149,6 +149,7 @@ func TestRunClaudeRejectsMalformedDaemonSelectionBeforeConsequences(t *testing.T
 		resp := daemon.Response{OK: true}
 		if op == daemon.OpSelect {
 			resp.SelectedID = &returned.ID
+			resp.Prepared = true
 			resp.Dir = testFileProviderConfigDir(returned.ID)
 			resp.ReservationToken = "malformed-selection"
 		}

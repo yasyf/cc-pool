@@ -573,26 +573,31 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 				if err := s.m.Store.SelectionEligible(sn.Account); err != nil {
 					return Response{OK: false, Error: fmt.Sprintf("account %d is not selectable: %v", *req.Account, err)}
 				}
-				proof, err := s.prepareTenant(ctx, sn.Account)
-				if err != nil {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
-				}
-				publicPath, err := s.selectionPublicPath(ctx, sn.Account, proof)
-				if err != nil {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
-				}
-				if err := s.preflightSelectionCredential(ctx, sn.Account); err != nil {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", sn.Account.ID, err)}
-				}
-				if err := s.m.Store.SelectionEligible(sn.Account); err != nil {
-					return Response{OK: false, Error: fmt.Sprintf("acct-%02d selection eligibility: %v", sn.Account.ID, err)}
+				launching := req.PID > 0
+				publicPath := ""
+				var proof catalogproto.TenantPreparationProof
+				if launching {
+					proof, err = s.prepareTenant(ctx, sn.Account)
+					if err != nil {
+						return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
+					}
+					publicPath, err = s.selectionPublicPath(ctx, sn.Account, proof)
+					if err != nil {
+						return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", sn.Account.ID, err)}
+					}
+					if err := s.preflightSelectionCredential(ctx, sn.Account); err != nil {
+						return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", sn.Account.ID, err)}
+					}
+					if err := s.m.Store.SelectionEligible(sn.Account); err != nil {
+						return Response{OK: false, Error: fmt.Sprintf("acct-%02d selection eligibility: %v", sn.Account.ID, err)}
+					}
 				}
 				launch := selectionLaunch{
 					pid: req.PID, processStartedAt: processStartedAt, cwd: req.Cwd,
 					recordSticky: true,
 				}
 				token := ""
-				if req.PID > 0 {
+				if launching {
 					token, err = s.cl.beginSelection(sn.Account, launch, provisionalSelectionTTL)
 					if err != nil {
 						return Response{OK: false, Error: fmt.Sprintf("reserve acct-%02d: %v", sn.Account.ID, err)}
@@ -603,7 +608,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 				}
 				id := sn.Account.ID
 				return Response{
-					OK: true, Dir: publicPath, SelectedID: &id,
+					OK: true, Dir: publicPath, SelectedID: &id, Prepared: launching,
 					ReservationToken:  token,
 					AccountInstanceID: sn.Account.InstanceID, AccountGeneration: sn.Account.Generation,
 					Remaining5h: sn.Remaining5h, Remaining7d: sn.Remaining7d, HasUsage: sn.HasUsage,
@@ -672,30 +677,35 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		}
 	}
 	best := bySnap[r.AccountID]
-	proof, err := s.prepareTenant(ctx, best.Account)
-	if err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
-	}
-	publicPath, err := s.selectionPublicPath(ctx, best.Account, proof)
-	if err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
-	}
+	launching := req.PID > 0
+	publicPath := ""
+	var proof catalogproto.TenantPreparationProof
 	id := best.Account.ID
-	// Credential mutation takes the exclusive claim before the pending selection
-	// is created; the claims mutex then orders every later mutation against it.
-	err = s.preflightSelectionCredential(ctx, best.Account)
-	if err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", best.Account.ID, err)}
-	}
-	if err := s.m.Store.SelectionEligible(best.Account); err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("acct-%02d selection eligibility: %v", best.Account.ID, err)}
+	if launching {
+		proof, err = s.prepareTenant(ctx, best.Account)
+		if err != nil {
+			return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
+		}
+		publicPath, err = s.selectionPublicPath(ctx, best.Account, proof)
+		if err != nil {
+			return Response{OK: false, Error: fmt.Sprintf("acct-%02d PrepareTenant: %v", best.Account.ID, err)}
+		}
+		// Credential mutation takes the exclusive claim before the pending selection
+		// is created; the claims mutex then orders every later mutation against it.
+		err = s.preflightSelectionCredential(ctx, best.Account)
+		if err != nil {
+			return Response{OK: false, Error: fmt.Sprintf("acct-%02d credential preflight: %v", best.Account.ID, err)}
+		}
+		if err := s.m.Store.SelectionEligible(best.Account); err != nil {
+			return Response{OK: false, Error: fmt.Sprintf("acct-%02d selection eligibility: %v", best.Account.ID, err)}
+		}
 	}
 	launch := selectionLaunch{
 		pid: req.PID, processStartedAt: processStartedAt, cwd: req.Cwd,
 		recordSticky: !outcome.Held() || best.Account.ID == pin.AccountID,
 	}
 	token := ""
-	if req.PID > 0 {
+	if launching {
 		token, err = s.cl.beginSelection(best.Account, launch, provisionalSelectionTTL)
 		if err != nil {
 			return Response{OK: false, Error: fmt.Sprintf("reserve acct-%02d: %v", best.Account.ID, err)}
@@ -708,7 +718,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		selectKind(outcome, fallback), req.Cwd, best.Account.ID,
 		r.Score, best.Util5h, best.Util7d, runnerUp(ranked, r.AccountID, fallback))
 	resp := Response{
-		OK: true, Dir: publicPath, SelectedID: &id,
+		OK: true, Dir: publicPath, SelectedID: &id, Prepared: launching,
 		ReservationToken:  token,
 		AccountInstanceID: best.Account.InstanceID, AccountGeneration: best.Account.Generation,
 		Sticky:      outcome == pool.StickyBind,

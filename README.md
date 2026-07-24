@@ -107,7 +107,7 @@ draining. Details in [widget/README.md](widget/README.md).
 | `ccp add` | Pool a subscription via its own `claude /login`; auto-inits the pool and starts the daemon |
 | `ccp run [claude args…]` | Select the emptiest account and exec `claude`, forwarding every arg |
 | `ccp status` | Per-account usage, score, and sessions; TUI on a terminal, plain table when piped |
-| `ccp select` | Inspect and print the daemon-prepared best account without creating a session; launch only with `ccp run` |
+| `ccp select` | Choose the best account without preparing or materializing it; prints `acct-NN prepared=false`; launch only with `ccp run` |
 | `ccp sync` | Mirror the pool — accounts, credentials, removals — across Macs on a synckit mesh |
 | `ccp doctor` | Check accounts' Keychain items and File Provider presentations; `--fix` repairs drift |
 | `ccp service` | Manage the daemon and signed `CCPoolStatus.app` via `install`, `uninstall`, and `status` |

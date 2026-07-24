@@ -657,10 +657,14 @@ func TestSelectionActivationRejectsStalePreparationProof(t *testing.T) {
 }
 
 func TestRawSelectHasNoActivationEffects(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
+	s.prepareAccount = func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error) {
+		t.Fatal("metadata-only selection prepared a tenant")
+		return catalogproto.TenantPreparationProof{}, nil
+	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[1] {
-		t.Fatalf("expected emptier acct-1 (%s), got %+v", dirs[1], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 || resp.Prepared || resp.Dir != "" {
+		t.Fatalf("metadata-only select = %+v, want unprepared acct-1 with no path", resp)
 	}
 	if resp.Sticky {
 		t.Fatal("first select must not report sticky")
@@ -685,7 +689,7 @@ func TestRawSelectHasNoActivationEffects(t *testing.T) {
 func TestHandleSelectTransactionAbortAndExclude(t *testing.T) {
 	s, dirs := newTestServer(t)
 	first := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proj"})
-	if !first.OK || first.Dir != dirs[1] || first.ReservationToken == "" {
+	if !first.OK || !first.Prepared || first.Dir != dirs[1] || first.ReservationToken == "" {
 		t.Fatalf("provisional select = %+v, want acct-1 with token", first)
 	}
 	if live, _ := s.m.Store.ListActiveSessions(); len(live) != 0 {
@@ -886,21 +890,21 @@ func TestRunCommitRejectsReservedGenerationMismatch(t *testing.T) {
 }
 
 func TestHandleSelectHonorsSticky(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	// Sticky points at the WORSE account.
 	if err := s.m.Store.UpsertSticky("/proj", 2, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
-		t.Fatalf("expected sticky acct-2 (%s), got %+v", dirs[2], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 2 || resp.Prepared || resp.Dir != "" || !resp.Sticky {
+		t.Fatalf("expected metadata-only sticky acct-2, got %+v", resp)
 	}
 }
 
 // TestHandleSelectSkipsExhaustedStickyPin replays the 2026-06-10 incident:
 // reset credit (eff5 ≈ 93, reset ~21m out) must not keep a pegged pin alive.
 func TestHandleSelectSkipsExhaustedStickyPin(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	now := time.Now().Add(time.Minute) // newer than the harness samples
 	if err := s.m.Store.InsertUsageSample(store.UsageSample{
 		AccountID: 2, TS: now, Util5h: 100, Util7d: 21,
@@ -912,8 +916,8 @@ func TestHandleSelectSkipsExhaustedStickyPin(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[1] {
-		t.Fatalf("expected healthy acct-1 (%s) over the exhausted pin, got %+v", dirs[1], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 || resp.Prepared || resp.Dir != "" {
+		t.Fatalf("expected metadata-only healthy acct-1 over the exhausted pin, got %+v", resp)
 	}
 	if resp.Sticky || resp.ExhaustedFallback {
 		t.Fatalf("a fresh healthy pick must report neither sticky nor fallback: %+v", resp)
@@ -945,7 +949,7 @@ func TestHandleSelectMarksSessionWithCwd(t *testing.T) {
 // TestHandleSelectBindsWarmEndedSession: a pin whose session ended minutes
 // ago must still bind — the warm cache is what stickiness protects.
 func TestHandleSelectBindsWarmEndedSession(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	now := time.Now()
 	if err := s.m.Store.UpsertSticky("/proj", 2, now.Add(-3*time.Hour)); err != nil {
 		t.Fatal(err)
@@ -955,8 +959,8 @@ func TestHandleSelectBindsWarmEndedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
-		t.Fatalf("expected sticky acct-2 (%s) via warm ended session, got %+v", dirs[2], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 2 || resp.Prepared || resp.Dir != "" || !resp.Sticky {
+		t.Fatalf("expected metadata-only sticky acct-2 via warm ended session, got %+v", resp)
 	}
 }
 
@@ -976,8 +980,8 @@ func TestHandleSelectHoldsLiveOnlyPin(t *testing.T) {
 		return []procscan.Session{{PID: 800002, ConfigDir: dirs[2], StartedAt: started}}, nil
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[1] || resp.Sticky {
-		t.Fatalf("expected free non-sticky acct-1 (%s), got %+v", dirs[1], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 || resp.Prepared || resp.Dir != "" || resp.Sticky {
+		t.Fatalf("expected metadata-only free non-sticky acct-1, got %+v", resp)
 	}
 	if resp.PinHeldAccount != nil {
 		t.Fatalf("an auto hold must not flag a held manual pin: %+v", resp.PinHeldAccount)
@@ -994,7 +998,7 @@ func TestHandleSelectHoldsLiveOnlyPin(t *testing.T) {
 // TestHandleSelectQuickResumeBindsAfterReap: handleSelect reconciles before
 // deciding, so a just-died session reads as a warm end and the pin binds.
 func TestHandleSelectQuickResumeBindsAfterReap(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	now := time.Now()
 	if err := s.m.Store.UpsertSticky("/proj", 2, now.Add(-3*time.Hour)); err != nil {
 		t.Fatal(err)
@@ -1007,7 +1011,7 @@ func TestHandleSelectQuickResumeBindsAfterReap(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 2 || resp.Prepared || resp.Dir != "" || !resp.Sticky {
 		t.Fatalf("quick resume must bind the pin via the reaped warm end, got %+v", resp)
 	}
 }
@@ -1030,7 +1034,7 @@ func TestHandleSelectForcedMarksSession(t *testing.T) {
 }
 
 func TestHandleSelectHoldsUnusableManualPin(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	now := time.Now().Add(time.Minute)
 	if err := s.m.Store.PinManual("/proj", 2, now); err != nil {
 		t.Fatal(err)
@@ -1042,8 +1046,8 @@ func TestHandleSelectHoldsUnusableManualPin(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[1] || resp.Sticky {
-		t.Fatalf("expected free acct-1 (%s) over the exhausted manual pin, got %+v", dirs[1], resp)
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 || resp.Prepared || resp.Dir != "" || resp.Sticky {
+		t.Fatalf("expected metadata-only free acct-1 over the exhausted manual pin, got %+v", resp)
 	}
 	if resp.PinHeldAccount == nil || *resp.PinHeldAccount != 2 {
 		t.Fatalf("held manual pin must be surfaced, got %+v", resp.PinHeldAccount)
@@ -1055,14 +1059,14 @@ func TestHandleSelectHoldsUnusableManualPin(t *testing.T) {
 }
 
 func TestHandleSelectForcedKeepsManualPin(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	now := time.Now()
 	if err := s.m.Store.PinManual("/proj", 1, now); err != nil {
 		t.Fatal(err)
 	}
 	forced := 2
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, Cwd: "/proj"})
-	if !resp.OK || resp.Dir != dirs[2] {
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 2 || resp.Prepared || resp.Dir != "" {
 		t.Fatalf("forced select failed: %+v", resp)
 	}
 	st, ok, _ := s.m.Store.GetSticky("/proj")
@@ -1074,7 +1078,7 @@ func TestHandleSelectForcedKeepsManualPin(t *testing.T) {
 // TestHandleSelectExhaustedFallback: an exhausted pool yields the least-bad
 // pick flagged ExhaustedFallback — never an error.
 func TestHandleSelectExhaustedFallback(t *testing.T) {
-	s, dirs := newTestServer(t)
+	s, _ := newTestServer(t)
 	var buf bytes.Buffer
 	s.log = log.New(&buf, "", 0)
 	now := time.Now().Add(time.Minute)
@@ -1091,8 +1095,8 @@ func TestHandleSelectExhaustedFallback(t *testing.T) {
 	if !resp.OK || !resp.ExhaustedFallback {
 		t.Fatalf("expected a flagged fallback pick, got %+v", resp)
 	}
-	if resp.Dir != dirs[2] || !resp.ExtraEnabled {
-		t.Fatalf("expected least-bad acct-2 (%s) with extra usage surfaced, got %+v", dirs[2], resp)
+	if resp.SelectedID == nil || *resp.SelectedID != 2 || resp.Prepared || resp.Dir != "" || !resp.ExtraEnabled {
+		t.Fatalf("expected metadata-only least-bad acct-2 with extra usage surfaced, got %+v", resp)
 	}
 	if resp.SoonestReset == nil || !resp.SoonestReset.Equal(reset.Truncate(time.Second)) {
 		t.Fatalf("fallback must carry the pick's recovery time %v for the warning, got %v", reset, resp.SoonestReset)
