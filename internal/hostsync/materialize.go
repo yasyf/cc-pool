@@ -321,8 +321,16 @@ func (s *Service) slotRetainsCredential(
 	switch state.Keychain.State {
 	case store.CredentialSlotEmpty:
 		return false, nil
-	case store.CredentialSlotUnsearchable, store.CredentialSlotUnreadable:
-		return false, fmt.Errorf("probe retained credential in %s: credential is unverifiable", p.ConfigDir)
+	case store.CredentialSlotUnsearchable:
+		return false, fmt.Errorf(
+			"probe retained credential in %s: %w",
+			p.ConfigDir, errors.Join(pool.ErrCredentialUnverifiable, creds.ErrUnavailable),
+		)
+	case store.CredentialSlotUnreadable:
+		return false, fmt.Errorf(
+			"probe retained credential in %s: %w",
+			p.ConfigDir, pool.ErrCredentialUnverifiable,
+		)
 	case store.CredentialSlotPresent:
 		return true, nil
 	}
