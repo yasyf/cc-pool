@@ -56,15 +56,25 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Reservation.ID != 1 || first.ConfigDir != firstPath {
+	wantConfigDir, err := AccountConfigDir(firstReservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantService, err := AccountKeychainService(firstReservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Reservation.ID != 1 || first.ConfigDir != wantConfigDir ||
+		first.PublicPath != firstPath || first.KeychainService != wantService {
 		t.Fatalf("first pending = %+v", first)
 	}
+	assertLinkTarget(t, first.ConfigDir, first.PublicPath)
 	info, err := os.Lstat(AccountBackingDir(first.Reservation.ID))
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		t.Fatalf("private backing = %v, %v", info, err)
 	}
-	if _, err := os.Lstat(first.ConfigDir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("pool mutated presentation path %s: %v", first.ConfigDir, err)
+	if _, err := os.Lstat(first.PublicPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pool mutated presentation path %s: %v", first.PublicPath, err)
 	}
 	if first.ClaudeJSONSeed != SeedNoSource {
 		t.Fatalf("seed = %q", first.ClaudeJSONSeed)
@@ -90,6 +100,11 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 	if err != nil || reused.Reservation.ID != 1 {
 		t.Fatalf("reused pending = %+v, %v", reused, err)
 	}
+	if reused.Reservation.InstanceID == first.Reservation.InstanceID ||
+		reused.ConfigDir == first.ConfigDir || reused.KeychainService == first.KeychainService {
+		t.Fatalf("numeric ID reuse aliased immutable execution identity: first=%+v reused=%+v", first, reused)
+	}
+	assertLinkTarget(t, reused.ConfigDir, firstPath)
 }
 
 func TestReleaseAddRetainsCompletedLogin(t *testing.T) {

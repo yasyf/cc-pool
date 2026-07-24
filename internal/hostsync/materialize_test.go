@@ -378,9 +378,20 @@ func TestMaterializeHappyPath(t *testing.T) {
 	if row.AccountUUID != "u-happy" {
 		t.Fatalf("row AccountUUID = %q, want u-happy", row.AccountUUID)
 	}
-	if row.ConfigDir != configDir || row.ConfigDir == pool.AccountBackingDir(1) ||
-		row.KeychainService != creds.ServiceName(configDir) {
-		t.Fatalf("persisted presentation binding = %+v, want exact proven path %q", row, configDir)
+	wantConfigDir, err := pool.AccountConfigDir(row.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantService, err := pool.AccountKeychainService(row.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ConfigDir != wantConfigDir || row.ConfigDir == pool.AccountBackingDir(1) ||
+		row.KeychainService != wantService {
+		t.Fatalf("persisted execution identity = %+v, want immutable instance path %q", row, wantConfigDir)
+	}
+	if target, err := os.Readlink(row.ConfigDir); err != nil || target != configDir {
+		t.Fatalf("stable execution link target = %q, %v; want %q", target, err, configDir)
 	}
 	presentation, err := m.Store.AccountPresentation(row.ID)
 	if err != nil {
@@ -388,7 +399,7 @@ func TestMaterializeHappyPath(t *testing.T) {
 	}
 	if presentation.AccountInstanceID != row.InstanceID ||
 		presentation.AccountGeneration != row.Generation ||
-		presentation.Identity.PublicPath != row.ConfigDir || presentation.Identity.TenantID == "" ||
+		presentation.Identity.PublicPath != configDir || presentation.Identity.TenantID == "" ||
 		presentation.Identity.DomainID == "" {
 		t.Fatalf("persisted presentation identity = %+v", presentation)
 	}

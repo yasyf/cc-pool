@@ -34,6 +34,19 @@ func TestPromoteSyncedAddLostResponseResolvesWithoutCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantConfigDir, err := AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantService, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.ConfigDir != wantConfigDir || pending.PublicPath != configDir ||
+		pending.KeychainService != wantService {
+		t.Fatalf("synced pending identity = %+v", pending)
+	}
+	assertLinkTarget(t, pending.ConfigDir, configDir)
 	identity := json.RawMessage(`{"accountUuid":"promotion-uuid"}`)
 	if err := manager.WriteIdentity(t.Context(), reservation.ID, configDir, identity); err != nil {
 		t.Fatal(err)
