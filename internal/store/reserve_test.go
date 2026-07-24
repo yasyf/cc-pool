@@ -227,7 +227,7 @@ func TestPromoteReservedSyncedAccountStartsAwaitingOrigin(t *testing.T) {
 	reservation := mustReserve(t, s)
 	account := Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		Generation: reservation.Generation, ConfigDir: "/home/.cc-pool/config/00000000000000000000000000000001",
 		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "external-uuid",
 	}
 	proof := presentationTestProof(account, account.ConfigDir, "activation-synced")
@@ -267,7 +267,7 @@ func TestPromoteReservedSyncedAccountRejectsIncompleteIdentityAtomically(t *test
 	reservation := mustReserve(t, s)
 	account := Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		Generation: reservation.Generation, ConfigDir: "/home/.cc-pool/config/00000000000000000000000000000001",
 		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "external-uuid",
 	}
 	proof := presentationTestProof(account, account.ConfigDir, "activation-synced")
@@ -302,7 +302,7 @@ func TestPromoteReservedSyncedAccountLostResponseReplaysAfterReopen(t *testing.T
 	reservation := mustReserve(t, s)
 	account := Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		Generation: reservation.Generation, ConfigDir: "/home/.cc-pool/config/00000000000000000000000000000001",
 		KeychainService: "svc", KeychainAccount: "user", Label: "peer",
 		AccountUUID: "external-uuid",
 	}
@@ -348,7 +348,7 @@ func TestResolveReservedSyncedPromotionProvesOnlyUntouchedReservationSafe(t *tes
 	reservation := mustReserve(t, s)
 	account := Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: "/CloudStorage/account-1",
+		Generation: reservation.Generation, ConfigDir: "/home/.cc-pool/config/00000000000000000000000000000001",
 		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "external-uuid",
 	}
 	proof := presentationTestProof(account, account.ConfigDir, "activation-synced")
