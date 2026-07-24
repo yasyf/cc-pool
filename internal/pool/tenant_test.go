@@ -23,7 +23,7 @@ func TestTenantAccountSeparatesPreservedBackingFromPresentation(t *testing.T) {
 	if tenant.FileProviderDisplayName != "acct-18" {
 		t.Fatalf("File Provider display name = %q", tenant.FileProviderDisplayName)
 	}
-	definition, err := tenant.Definition()
+	definition, err := tenant.Spec()
 	if err != nil {
 		t.Fatal(err)
 	}
