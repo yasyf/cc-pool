@@ -183,7 +183,13 @@ func (r *fixtureAccountRemover) callsSnapshot() []int {
 }
 
 func (p fixtureAccountRemoval) Finish(ctx context.Context) error {
-	return p.remover.m.FinishAccountRemoval(ctx, p.removal)
+	presentation, err := p.remover.m.Store.AccountPresentation(p.removal.AccountID)
+	if err != nil {
+		return err
+	}
+	return p.remover.m.FinishAccountRemoval(
+		ctx, p.removal, presentation.Identity.PublicPath,
+	)
 }
 
 func materializeFileProviderPublicPath(id int) string {
