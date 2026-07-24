@@ -475,19 +475,17 @@ func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.Acc
 	if err != nil {
 		return fmt.Errorf("inspect FuseKit tenant before removal: %w", err)
 	}
-	if present {
-		if state.Generation != removal.AccountGeneration {
-			return errors.New("FuseKit tenant generation drifted from removal intent")
-		}
-		response, err := c.runtime.RemoveTenant(ctx, tenantAccount, removal.AccountGeneration)
-		if err != nil {
-			return fmt.Errorf("remove FuseKit tenant: %w", err)
-		}
-		if response.Protocol != mountproto.Version || response.Code != mountproto.ErrorCodeOk ||
-			response.Message != "" || response.TenantID != mountproto.TenantID(tenantID) ||
-			response.Generation != removal.AccountGeneration || !response.FileProviderAbsent {
-			return errors.New("remove FuseKit tenant: invalid proof")
-		}
+	if present && state.Generation != removal.AccountGeneration {
+		return errors.New("FuseKit tenant generation drifted from removal intent")
+	}
+	response, err := c.runtime.RemoveTenant(ctx, tenantAccount, removal.AccountGeneration)
+	if err != nil {
+		return fmt.Errorf("remove FuseKit tenant: %w", err)
+	}
+	if response.Protocol != mountproto.Version || response.Code != mountproto.ErrorCodeOk ||
+		response.Message != "" || response.TenantID != mountproto.TenantID(tenantID) ||
+		response.Generation != removal.AccountGeneration || !response.FileProviderAbsent {
+		return errors.New("remove FuseKit tenant: invalid proof")
 	}
 	c.forgetTenant(tenantID)
 	return c.server.m.FinishAccountRemoval(ctx, removal)

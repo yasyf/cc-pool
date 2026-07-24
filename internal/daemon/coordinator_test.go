@@ -120,6 +120,31 @@ type fleetLifecycleRuntime struct {
 	provisioned []string
 }
 
+type absentRemovalRuntime struct {
+	lifecycleRuntimeStub
+	mu          sync.Mutex
+	removeCalls int
+}
+
+func (r *absentRemovalRuntime) RemoveTenant(
+	_ context.Context,
+	account tenantfs.Account,
+	expected uint64,
+) (mountproto.RemoveTenantResponse, error) {
+	id, err := account.TenantID()
+	if err != nil {
+		return mountproto.RemoveTenantResponse{}, err
+	}
+	r.mu.Lock()
+	r.removeCalls++
+	r.mu.Unlock()
+	return mountproto.RemoveTenantResponse{
+		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+		TenantID: mountproto.TenantID(id), Generation: expected,
+		FileProviderAbsent: true,
+	}, nil
+}
+
 func (r *fleetLifecycleRuntime) ProvisionTenant(
 	_ context.Context,
 	account tenantfs.Account,
@@ -929,7 +954,11 @@ func TestInitializePagesOnlyInterruptedRemovalClaims(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	runtime := &lifecycleRuntimeStub{stateErr: remoteError(mountproto.ErrorCodeNotFound)}
+	runtime := &absentRemovalRuntime{
+		lifecycleRuntimeStub: lifecycleRuntimeStub{
+			stateErr: remoteError(mountproto.ErrorCodeNotFound),
+		},
+	}
 	server := &Server{
 		m: newDaemonTestManager(t, st, accountMutationTestRefresher{}, credstest.NewFake()),
 	}
@@ -944,8 +973,11 @@ func TestInitializePagesOnlyInterruptedRemovalClaims(t *testing.T) {
 	if len(accounts) != 0 || len(allAccountRemovals(t, st)) != 0 {
 		t.Fatalf("restart recovery left accounts=%d removals=%d", len(accounts), len(allAccountRemovals(t, st)))
 	}
-	if runtime.provisionCalls != 0 || runtime.stateCalls != total {
-		t.Fatalf("startup calls: provision=%d state=%d", runtime.provisionCalls, runtime.stateCalls)
+	if runtime.provisionCalls != 0 || runtime.stateCalls != total || runtime.removeCalls != total {
+		t.Fatalf(
+			"startup calls: provision=%d state=%d retirement=%d",
+			runtime.provisionCalls, runtime.stateCalls, runtime.removeCalls,
+		)
 	}
 }
 
@@ -1127,5 +1159,58 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 	}
 	if _, err := os.Lstat(pool.AccountBackingDir(account.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("backing after removal = %v", err)
+	}
+}
+
+func TestFinishRemovalRequiresExplicitTenantAbsenceProofWhenStateIsAbsent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := pool.EnsureStateDir(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	account := admitDaemonTestAccount(t, st, store.Account{
+		ID: 1, ConfigDir: testFileProviderConfigDir(1),
+		KeychainService: "service", KeychainAccount: "account",
+	})
+	removal, err := st.BeginAccountRemoval(account.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID, err := pool.TenantAccount(account).TenantID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &lifecycleRuntimeStub{
+		stateErr: remoteError(mountproto.ErrorCodeNotFound),
+		remove: mountproto.RemoveTenantResponse{
+			Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
+			TenantID: mountproto.TenantID(tenantID), Generation: account.Generation,
+		},
+	}
+	server := &Server{
+		m:   newDaemonTestManager(t, st, accountMutationTestRefresher{}, credstest.NewFake()),
+		log: log.New(io.Discard, "", 0),
+	}
+	coordinator := &tenantCoordinator{server: server, runtime: runtime}
+	if err := coordinator.finishRemoval(t.Context(), removal); err == nil {
+		t.Fatal("absent state completed removal without explicit File Provider absence proof")
+	}
+	if _, err := st.GetAccount(account.ID); err != nil {
+		t.Fatalf("account after rejected absence proof = %v", err)
+	}
+	runtime.remove.FileProviderAbsent = true
+	if err := coordinator.finishRemoval(t.Context(), removal); err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.removed || runtime.removeExpected != account.Generation {
+		t.Fatalf("explicit retirement proof = removed %v expected generation %d", runtime.removed, runtime.removeExpected)
+	}
+	if _, err := st.GetAccount(account.ID); !errors.Is(err, store.ErrAccountNotFound) {
+		t.Fatalf("account after removal = %v", err)
 	}
 }
