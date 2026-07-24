@@ -179,6 +179,7 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 		"scripts/assert-signed-topology.sh",
 		"xcrun stapler validate app/CCPoolStatus.app",
 		"spctl --assess --type execute --verbose=4 app/CCPoolStatus.app",
+		"__SHA_APP__=${{ needs.release-app.outputs.sha256 }}",
 		"Publish the CLI formula to the tap",
 		"homebrew-tap/.github/actions/publish@" + releasePublishCommit,
 	} {

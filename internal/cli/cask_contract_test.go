@@ -26,19 +26,37 @@ func TestRuntimeStopUninstallCommandUsesExactDaemonkitStopPath(t *testing.T) {
 	}
 }
 
-func TestReleasePreservesGatekeeperAndPinsAppDigestIntoCLI(t *testing.T) {
+func TestReleasePreservesGatekeeperAndPinsAppResourceDigestIntoFormula(t *testing.T) {
 	release := readReleaseContract(t, ".github", "workflows", "release.yml")
 	for _, required := range []string{
 		"Require CLI signing and notarization secrets",
 		"needs: [verify-tag-on-main, release-app, version]",
 		"internal/version.StatusAppVersion=${{ needs.version.outputs.marketing }}",
-		"internal/version.StatusAppSHA256=${{ needs.release-app.outputs.sha256 }}",
+		"__SHA_APP__=${{ needs.release-app.outputs.sha256 }}",
 		"bash \"$GITHUB_WORKSPACE/scripts/assert-signed-topology.sh\"",
 		"xcrun stapler validate app/CCPoolStatus.app",
 		"spctl --assess --type execute --verbose=4 app/CCPoolStatus.app",
 	} {
 		if !strings.Contains(release, required) {
 			t.Fatalf("release workflow is missing Gatekeeper contract %q", required)
+		}
+	}
+	formula := readReleaseContract(t, ".github", "formula", "cc-pool.rb.tmpl")
+	for _, required := range []string{
+		`resource "status_app" do`,
+		"cc-pool-status-v#{version}-darwin.zip",
+		`sha256 "__SHA_APP__"`,
+		`libexec.install "CCPoolStatus.app"`,
+		`ccp package install`,
+	} {
+		if !strings.Contains(formula, required) {
+			t.Fatalf("formula is missing packaged application contract %q", required)
+		}
+	}
+	withoutUserApp := strings.ReplaceAll(formula, "~/Applications/CCPoolStatus.app", "")
+	for _, forbidden := range []string{"head do", "install_from_source", "/Applications/CCPoolStatus.app"} {
+		if strings.Contains(withoutUserApp, forbidden) {
+			t.Fatalf("formula retains forbidden package path %q", forbidden)
 		}
 	}
 }
@@ -69,6 +87,32 @@ func TestReleasePublishesOnlyFormulaAfterVerifiedApplication(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join("..", "..", ".github", "cask")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("standalone cask directory exists or could not be inspected: %v", err)
+	}
+}
+
+func TestDirectInstallerPublishesExactPackageWithoutImplicitServiceMutation(t *testing.T) {
+	installer := readReleaseContract(t, "scripts", "install.sh")
+	for _, required := range []string{
+		`CLI_ASSET="cc-pool-${VERSION}-darwin-universal.tar.gz"`,
+		`APP_ASSET="cc-pool-status-${VERSION}-darwin.zip"`,
+		`curl -fsSL --retry 2 -o "$app_sidecar" "$BASE_URL/$APP_ASSET.sha256"`,
+		`/usr/bin/codesign --verify --strict --all-architectures`,
+		`! "$DEST" package install`,
+		`Dispatch may have committed before its response was lost`,
+		`restore_delivery_before_dispatch`,
+	} {
+		if !strings.Contains(installer, required) {
+			t.Fatalf("direct installer is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"service install", "service uninstall", "/Applications/CCPoolStatus.app"} {
+		if strings.Contains(installer, forbidden) {
+			t.Fatalf("direct installer retains forbidden implicit operation %q", forbidden)
+		}
+	}
+	ci := readReleaseContract(t, ".github", "workflows", "ci.yml")
+	if !strings.Contains(ci, "run: scripts/install_test.sh") {
+		t.Fatal("CI does not execute the direct installer harness")
 	}
 }
 

@@ -92,7 +92,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           COMMIT="$(git rev-parse --short HEAD)"
-          LDFLAGS="-s -w -X github.com/yasyf/cc-pool/internal/version.Version=${VERSION} -X github.com/yasyf/cc-pool/internal/version.Commit=${COMMIT} -X github.com/yasyf/cc-pool/internal/version.StatusAppVersion=${{ needs.version.outputs.marketing }} -X github.com/yasyf/cc-pool/internal/version.StatusAppSHA256=${{ needs.release-app.outputs.sha256 }}"
+          LDFLAGS="-s -w -X github.com/yasyf/cc-pool/internal/version.Version=${VERSION} -X github.com/yasyf/cc-pool/internal/version.Commit=${COMMIT} -X github.com/yasyf/cc-pool/internal/version.StatusAppVersion=${{ needs.version.outputs.marketing }}"
           mkdir -p dist/pure
 
           # The account daemon never touches the App Group; the fixed signed
@@ -385,6 +385,7 @@ jobs:
           output: Formula/cc-pool.rb
           substitutions: |
             __SHA_PURE__=${{ needs.release.outputs.pure_sha256 }}
+            __SHA_APP__=${{ needs.release-app.outputs.sha256 }}
 
       - name: Publish the CLI formula to the tap
         uses: yasyf/homebrew-tap/.github/actions/publish@9ca67392d45d66b6ae01e262383c8f3138d56f5e
