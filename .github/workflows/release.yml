@@ -400,6 +400,7 @@ jobs:
           FORMULA: ${{ steps.formula.outputs.file }}
         run: |
           set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.github/scripts/assert-formula-service.sh" "$FORMULA"
           ruby -c "$FORMULA"
           audit_tap=cc-pool/release-audit
           HOMEBREW_NO_AUTO_UPDATE=1 brew tap-new --no-git "$audit_tap"

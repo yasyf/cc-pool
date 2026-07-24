@@ -42,6 +42,11 @@ func TestReleasePreservesGatekeeperAndPinsAppResourceDigestIntoFormula(t *testin
 		}
 	}
 	formula := readReleaseContract(t, ".github", "formula", "cc-pool.rb.tmpl")
+	dependency := strings.Index(formula, "depends_on :macos")
+	resource := strings.Index(formula, `resource "status_app" do`)
+	if dependency < 0 || resource < 0 || dependency >= resource {
+		t.Fatal("formula dependencies must precede resources")
+	}
 	for _, required := range []string{
 		`resource "status_app" do`,
 		"cc-pool-status-v#{version}-darwin.zip",
@@ -58,6 +63,9 @@ func TestReleasePreservesGatekeeperAndPinsAppResourceDigestIntoFormula(t *testin
 		if strings.Contains(withoutUserApp, forbidden) {
 			t.Fatalf("formula retains forbidden package path %q", forbidden)
 		}
+	}
+	if !strings.Contains(release, `assert-formula-service.sh" "$FORMULA"`) {
+		t.Fatal("release does not validate the exact rendered formula ordering contract")
 	}
 }
 

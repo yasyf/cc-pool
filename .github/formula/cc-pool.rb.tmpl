@@ -20,12 +20,12 @@ class CcPool < Formula
     strategy :github_latest
   end
 
+  depends_on :macos
+
   resource "status_app" do
     url "https://github.com/yasyf/cc-pool/releases/download/v#{version}/cc-pool-status-v#{version}-darwin.zip"
     sha256 "__SHA_APP__"
   end
-
-  depends_on :macos
 
   def install
     bin.install "cc-pool"

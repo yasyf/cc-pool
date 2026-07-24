@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.64.2] - 2026-07-24
+
+### Fixed
+- Homebrew formula dependencies now precede packaged application resources,
+  and the exact rendered formula is rejected before publication when this
+  ordering regresses.
+
 ## [0.64.1] - 2026-07-24
 
 ### Fixed
@@ -559,7 +566,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.1...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.2...HEAD
+[0.64.2]: https://github.com/yasyf/cc-pool/compare/v0.64.1...v0.64.2
 [0.64.1]: https://github.com/yasyf/cc-pool/compare/v0.64.0...v0.64.1
 [0.64.0]: https://github.com/yasyf/cc-pool/compare/v0.63.3...v0.64.0
 [0.62.0]: https://github.com/yasyf/cc-pool/compare/v0.61.7...v0.62.0
