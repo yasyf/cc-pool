@@ -294,9 +294,15 @@ func (s *Server) startAccountMutationRun(
 			return active, nil, nil, AccountMutationResult{}, err
 		}
 		if active.Kind == store.AccountMutationAdd {
-			if _, err := s.m.PrepareReservedAdd(
-				ctx, accountMutationReservation(active), active.ConfigDir,
-			); err != nil {
+			pending, err := s.m.PrepareReservedAdd(
+				ctx, accountMutationReservation(active), active.PresentationIdentity.PublicPath,
+			)
+			if err == nil && (pending.ConfigDir != active.ConfigDir ||
+				pending.KeychainService != active.KeychainService ||
+				pending.PublicPath != active.PresentationIdentity.PublicPath) {
+				err = errors.New("prepared add execution identity does not match mutation")
+			}
+			if err != nil {
 				result, settleErr := s.settleAccountMutationTerminal(ctx, active, err)
 				return active, nil, nil, result, settleErr
 			}
@@ -835,13 +841,20 @@ func (s *Server) bindAccountMutationPresentation(
 	ctx context.Context,
 	mutation store.AccountMutation,
 ) (store.AccountMutation, error) {
+	configDir, err := pool.AccountConfigDir(mutation.AccountInstanceID)
+	if err != nil {
+		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
+	}
+	keychainService, err := pool.AccountKeychainService(mutation.AccountInstanceID)
+	if err != nil {
+		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
+	}
 	account := store.Account{
 		ID: mutation.AccountID, InstanceID: mutation.AccountInstanceID,
-		Generation: mutation.AccountGeneration, ConfigDir: pool.FileProviderConfigDir(mutation.AccountID),
-		Label: mutation.Label,
+		Generation: mutation.AccountGeneration, ConfigDir: configDir,
+		KeychainService: keychainService, KeychainAccount: creds.AccountLabel(), Label: mutation.Label,
 	}
 	var identity store.FileProviderPresentationIdentity
-	var err error
 	if s.provisionPresentationIdentity != nil {
 		identity, err = s.provisionPresentationIdentity(ctx, account)
 	} else {
@@ -855,28 +868,28 @@ func (s *Server) bindAccountMutationPresentation(
 		}
 	}
 	if err != nil {
-		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
+		return store.AccountMutation{}, fmt.Errorf("provision add presentation: %w", err)
 	}
-	publicPath := identity.PublicPath
-	account.KeychainService = creds.ServiceName(publicPath)
-	account.KeychainAccount = creds.AccountLabel()
-	expectedState, err := s.m.CredentialExternalState(ctx, account)
+	if err := pool.EnsureAccountConfigDir(account.InstanceID, identity.PublicPath); err != nil {
+		return store.AccountMutation{}, fmt.Errorf("bind add execution path: %w", err)
+	}
+	expectedState, err := s.m.CredentialExternalStateAt(ctx, account, identity.PublicPath)
 	if err != nil {
-		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
+		return store.AccountMutation{}, err
 	}
 	expected, err := expectedState.Digest()
 	if err != nil {
-		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
+		return store.AccountMutation{}, err
 	}
 	locator := store.CredentialKeychainLocatorDigest(
 		account.KeychainService, account.KeychainAccount,
 	)
 	fence, err := s.m.Store.BindAccountMutationPresentation(
-		mutation.Fence(), identity, publicPath, account.KeychainService, account.KeychainAccount,
+		mutation.Fence(), identity, account.ConfigDir, account.KeychainService, account.KeychainAccount,
 		locator, expected,
 	)
 	if err != nil {
-		return store.AccountMutation{}, s.cancelUnboundAccountMutation(mutation, err)
+		return store.AccountMutation{}, err
 	}
 	return s.m.Store.AccountMutation(fence.OperationID)
 }
