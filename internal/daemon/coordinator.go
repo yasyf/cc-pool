@@ -453,6 +453,14 @@ func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.Acc
 		account.Generation != removal.AccountGeneration {
 		return errors.New("account identity changed while awaiting removal lane")
 	}
+	presentation, err := c.server.m.Store.AccountPresentation(account.ID)
+	if err != nil {
+		return fmt.Errorf("read account presentation before removal: %w", err)
+	}
+	if presentation.AccountInstanceID != removal.AccountInstanceID ||
+		presentation.AccountGeneration != removal.AccountGeneration {
+		return errors.New("account presentation identity changed while awaiting removal lane")
+	}
 	tenantAccount = pool.TenantAccount(account)
 	state, present, err := c.tenantState(ctx, tenantAccount)
 	if err != nil {
@@ -470,6 +478,9 @@ func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.Acc
 		return errors.New("retire FuseKit tenant: invalid proof")
 	}
 	c.forgetTenant(tenantID)
+	if err := pool.RemoveAccountConfigDir(account.InstanceID, presentation.Identity.PublicPath); err != nil {
+		return fmt.Errorf("remove retired account execution link: %w", err)
+	}
 	return c.server.m.FinishAccountRemoval(ctx, removal)
 }
 

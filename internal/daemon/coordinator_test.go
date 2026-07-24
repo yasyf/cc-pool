@@ -1247,8 +1247,16 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
+	publicPath := filepath.Join(home, "Library", "CloudStorage", "CCPoolStatus-acct-01")
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(publicPath, "preserved")
+	if err := os.WriteFile(marker, []byte("presentation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	admitDaemonTestAccount(t, st, store.Account{
-		ID: 1, ConfigDir: testFileProviderConfigDir(1),
+		ID: 1, ConfigDir: publicPath,
 		KeychainService: "service", KeychainAccount: "account",
 	})
 	account, err := st.GetAccount(1)
@@ -1285,6 +1293,12 @@ func TestFinishRemovalNeedsOnlyTenantAbsenceProof(t *testing.T) {
 	}
 	if _, err := os.Lstat(pool.AccountBackingDir(account.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("backing after removal = %v", err)
+	}
+	if _, err := os.Lstat(account.ConfigDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stable execution link after removal = %v", err)
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "presentation" {
+		t.Fatalf("presentation target after removal = %q, %v", got, err)
 	}
 }
 
@@ -1325,6 +1339,9 @@ func TestFinishRemovalRequiresExplicitTenantAbsenceProofWhenStateIsAbsent(t *tes
 	if err := coordinator.finishRemoval(t.Context(), removal); err == nil {
 		t.Fatal("absent state completed removal without explicit File Provider absence proof")
 	}
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != testFileProviderConfigDir(1) {
+		t.Fatalf("execution link changed before retirement proof: target=%q err=%v", target, err)
+	}
 	if _, err := st.GetAccount(account.ID); err != nil {
 		t.Fatalf("account after rejected absence proof = %v", err)
 	}
@@ -1337,5 +1354,8 @@ func TestFinishRemovalRequiresExplicitTenantAbsenceProofWhenStateIsAbsent(t *tes
 	}
 	if _, err := st.GetAccount(account.ID); !errors.Is(err, store.ErrAccountNotFound) {
 		t.Fatalf("account after removal = %v", err)
+	}
+	if _, err := os.Lstat(account.ConfigDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("execution link survived proven retirement: %v", err)
 	}
 }
