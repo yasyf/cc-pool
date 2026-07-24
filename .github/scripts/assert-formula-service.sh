@@ -56,3 +56,17 @@ if [[ "$resource_url" != "$expected_resource_url" ]]; then
   echo "$formula status_app URL = $resource_url, want $expected_resource_url" >&2
   exit 1
 fi
+
+for stage_contract in \
+  'using: :nounzip' \
+  'system "/usr/bin/ditto", "-x", "-k", resource("status_app").cached_download, "."' \
+  'staged_app = Pathname("CCPoolStatus.app")' \
+  'staged_app.directory?' \
+  '(staged_app/"Contents").directory?' \
+  'libexec.install staged_app'
+do
+  grep -Fq "$stage_contract" "$formula" || {
+    echo "$formula is missing exact Homebrew resource-stage contract: $stage_contract" >&2
+    exit 1
+  }
+done

@@ -23,22 +23,26 @@ class CcPool < Formula
   depends_on :macos
 
   resource "status_app" do
-    url "https://github.com/yasyf/cc-pool/releases/download/v__VERSION__/cc-pool-status-v__VERSION__-darwin.zip"
+    url "https://github.com/yasyf/cc-pool/releases/download/v__VERSION__/cc-pool-status-v__VERSION__-darwin.zip", using: :nounzip
     sha256 "__SHA_APP__"
   end
 
   def install
     bin.install "cc-pool"
     resource("status_app").stage do
-      system "/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2", "CCPoolStatus.app"
-      system "/usr/bin/xcrun", "stapler", "validate", "CCPoolStatus.app"
-      system "/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=4", "CCPoolStatus.app"
+      system "/usr/bin/ditto", "-x", "-k", resource("status_app").cached_download, "."
+      staged_app = Pathname("CCPoolStatus.app")
+      odie "staged status app is missing" unless staged_app.directory?
+      odie "staged status app has no Contents" unless (staged_app/"Contents").directory?
+      system "/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2", staged_app
+      system "/usr/bin/xcrun", "stapler", "validate", staged_app
+      system "/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=4", staged_app
       app_version = Utils.safe_popen_read(
         "/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString",
-        "CCPoolStatus.app/Contents/Info.plist"
+        staged_app/"Contents/Info.plist"
       ).strip
       odie "CCPoolStatus.app version #{app_version} does not match #{version}" if app_version != version.to_s
-      libexec.install "CCPoolStatus.app"
+      libexec.install staged_app
     end
     bin.install_symlink "cc-pool" => "ccp"
   end

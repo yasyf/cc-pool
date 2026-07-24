@@ -52,10 +52,17 @@ func TestReleasePreservesGatekeeperAndPinsAppResourceDigestIntoFormula(t *testin
 	if strings.Contains(resourceContract, "#{version}") {
 		t.Fatal("formula resource contract uses the resource-local unset version")
 	}
-	rendered := strings.ReplaceAll(formula, "__VERSION__", "0.64.3")
+	nounzip := strings.Index(formula, "using: :nounzip")
+	ditto := strings.Index(formula, `system "/usr/bin/ditto"`)
+	codesign := strings.Index(formula, `system "/usr/bin/codesign"`)
+	installApp := strings.Index(formula, "libexec.install staged_app")
+	if nounzip < resource || ditto < install || codesign < ditto || installApp < codesign {
+		t.Fatal("formula must preserve nounzip, explicit extraction, validation, and install ordering")
+	}
+	rendered := strings.ReplaceAll(formula, "__VERSION__", "0.64.4")
 	renderedResource := strings.Index(rendered, `resource "status_app" do`)
 	renderedInstall := strings.Index(rendered, "\n  def install")
-	wantResourceURL := "https://github.com/yasyf/cc-pool/releases/download/v0.64.3/cc-pool-status-v0.64.3-darwin.zip"
+	wantResourceURL := "https://github.com/yasyf/cc-pool/releases/download/v0.64.4/cc-pool-status-v0.64.4-darwin.zip"
 	if renderedResource < 0 || renderedInstall <= renderedResource ||
 		!strings.Contains(rendered[renderedResource:renderedInstall], wantResourceURL) {
 		t.Fatalf("rendered formula resource is missing exact URL %q", wantResourceURL)
@@ -63,8 +70,13 @@ func TestReleasePreservesGatekeeperAndPinsAppResourceDigestIntoFormula(t *testin
 	for _, required := range []string{
 		`resource "status_app" do`,
 		"releases/download/v__VERSION__/cc-pool-status-v__VERSION__-darwin.zip",
+		`using: :nounzip`,
 		`sha256 "__SHA_APP__"`,
-		`libexec.install "CCPoolStatus.app"`,
+		`system "/usr/bin/ditto", "-x", "-k", resource("status_app").cached_download, "."`,
+		`staged_app = Pathname("CCPoolStatus.app")`,
+		`staged_app.directory?`,
+		`(staged_app/"Contents").directory?`,
+		`libexec.install staged_app`,
 		`ccp package install`,
 	} {
 		if !strings.Contains(formula, required) {
