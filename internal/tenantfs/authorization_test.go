@@ -72,6 +72,31 @@ func TestUnforwardedTenantCatalogRequestsAreRejected(t *testing.T) {
 	}
 }
 
+func TestFileProviderLeaseOperationsRequireExactTenantOwnerRoute(t *testing.T) {
+	for _, operation := range []catalogproto.Operation{
+		catalogproto.OperationPresentationLeaseCommit,
+		catalogproto.OperationPresentationLeaseRenew,
+		catalogproto.OperationPresentationLeaseRelease,
+	} {
+		authorization, err := catalogAuthorization(operation, catalogservice.Route{Tenant: "tenant"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if authorization.Role != catalogservice.RoleTenantOwner || authorization.Principal != "cc-pool-owner" {
+			t.Fatalf("lease authorization = %+v", authorization)
+		}
+		for _, route := range []catalogservice.Route{
+			{},
+			{Tenant: "tenant", Domain: "domain"},
+			{Tenant: "tenant", Forwarded: true},
+		} {
+			if _, err := catalogAuthorization(operation, route); err == nil {
+				t.Fatalf("lease operation %q accepted route %+v", operation, route)
+			}
+		}
+	}
+}
+
 func TestSourceFleetOperationsRequireExactUnroutedProductAdminRole(t *testing.T) {
 	for _, operation := range []catalogproto.Operation{
 		catalogproto.OperationSourceAuthorityPublishDesiredFleet,

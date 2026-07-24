@@ -88,7 +88,11 @@ func catalogAuthorization(
 	}
 	authorization := catalogservice.Authorization{Route: route}
 	switch {
-	case operation == catalogproto.OperationTenantPrepare && route.Tenant != "" && !route.Forwarded && route.Domain == "":
+	case (operation == catalogproto.OperationTenantPrepare ||
+		operation == catalogproto.OperationPresentationLeaseCommit ||
+		operation == catalogproto.OperationPresentationLeaseRenew ||
+		operation == catalogproto.OperationPresentationLeaseRelease) &&
+		route.Tenant != "" && !route.Forwarded && route.Domain == "":
 		authorization.Principal = "cc-pool-owner"
 		authorization.Role = catalogservice.RoleTenantOwner
 	case operation == catalogproto.OperationBrokerOpen && route == (catalogservice.Route{}):

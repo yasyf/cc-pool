@@ -20,11 +20,12 @@ func TestAccountMutationIDDomainIsHardReset(t *testing.T) {
 func TestCredentialMutationsRejectLiveSession(t *testing.T) {
 	s := openTest(t)
 	account := credentialOperationTestAccount(t, s)
-	if err := s.ActivateSelection(SelectionActivation{
+	if err := activateSelectionForTest(s, SelectionActivation{
 		Token: nextStoreTestToken(), AccountID: account.ID,
 		ExpectedInstanceID: account.InstanceID, ExpectedGeneration: account.Generation,
-		Process:   ProcessIdentity{PID: 42, StartedAt: time.Now().Add(-time.Minute)},
-		ConfigDir: account.ConfigDir,
+		Process:           ProcessIdentity{PID: 42, StartedAt: time.Now().Add(-time.Minute)},
+		ConfigDir:         account.ConfigDir,
+		FileProviderLease: storeTestLeaseReceipt("credential-mutation"),
 	}); err != nil {
 		t.Fatal(err)
 	}

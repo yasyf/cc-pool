@@ -346,15 +346,7 @@ func TestAdmitSyncedCredentialInvalidatesSettledEvidenceAfterReplacementAndLostR
 		t.Fatalf("lost settle response admission = %v err=%v", admitted, err)
 	}
 	assertSyncedAdmissionFinal(t, manager.Store, account, freshProof)
-	if err := manager.Store.ActivateSelection(store.SelectionActivation{
-		Token:     "abcdef0123456789abcdef0123456789",
-		AccountID: account.ID, ExpectedInstanceID: account.InstanceID,
-		ExpectedGeneration: account.Generation,
-		Process:            store.ProcessIdentity{PID: os.Getpid(), StartedAt: time.Now()},
-		ConfigDir:          account.ConfigDir,
-	}); err != nil {
-		t.Fatalf("activate existing session before drift reconciliation: %v", err)
-	}
+	activatePoolTestSession(t, manager, account.ID, os.Getpid(), "", time.Now())
 	if err := manager.Store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -407,15 +399,7 @@ func TestAdmitSyncedCredentialRefusesLiveSession(t *testing.T) {
 	if err != nil || !admitted {
 		t.Fatalf("establish selectable admission = %v err=%v", admitted, err)
 	}
-	if err := manager.Store.ActivateSelection(store.SelectionActivation{
-		Token:     "0123456789abcdef0123456789abcdef",
-		AccountID: account.ID, ExpectedInstanceID: account.InstanceID,
-		ExpectedGeneration: account.Generation,
-		Process:            store.ProcessIdentity{PID: os.Getpid(), StartedAt: time.Now()},
-		ConfigDir:          account.ConfigDir, At: time.Now(),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	activatePoolTestSession(t, manager, account.ID, os.Getpid(), "", time.Now())
 	if _, err := manager.Store.SetNeedsLogin(
 		account.ID, time.Now(), store.AuthReasonAwaitingOrigin,
 		store.DigestReason("origin rotated during live session"), store.AuthKindAwaitingOrigin,

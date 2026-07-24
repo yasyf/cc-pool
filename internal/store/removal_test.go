@@ -21,7 +21,7 @@ func TestBeginAccountRemovalRejectsActiveSessionUntilClosed(t *testing.T) {
 	if _, err := accountRemovalByID(s.db, account.ID); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("rejected removal persisted an intent: %v", err)
 	}
-	if err := s.CloseSession(sessionID, started.Add(time.Minute)); err != nil {
+	if err := closeSessionForTest(s, sessionID, started.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.BeginAccountRemoval(account.ID, true); err != nil {
@@ -222,13 +222,14 @@ func TestConcurrentSelectionActivationAndRemovalAdmitExactlyOne(t *testing.T) {
 		ExpectedInstanceID: account.InstanceID, ExpectedGeneration: account.Generation,
 		Process:   ProcessIdentity{PID: 4242, StartedAt: now.Add(-time.Minute)},
 		ConfigDir: account.ConfigDir, Cwd: "/project", At: now,
+		FileProviderLease: storeTestLeaseReceipt("concurrent-removal"),
 	}
 	start := make(chan struct{})
 	activationResult := make(chan error, 1)
 	removalResult := make(chan error, 1)
 	go func() {
 		<-start
-		activationResult <- first.ActivateSelection(activation)
+		activationResult <- activateSelectionForTest(first, activation)
 	}()
 	go func() {
 		<-start
@@ -285,10 +286,11 @@ func TestAccountRemovalIntentFencesActiveFleetAndSurvivesRestart(t *testing.T) {
 	activation := SelectionActivation{
 		Token: nextStoreTestToken(), AccountID: account.ID,
 		ExpectedInstanceID: account.InstanceID, ExpectedGeneration: account.Generation,
-		Process:   ProcessIdentity{PID: 4242, StartedAt: time.Now().Add(-time.Minute)},
-		ConfigDir: account.ConfigDir,
+		Process:           ProcessIdentity{PID: 4242, StartedAt: time.Now().Add(-time.Minute)},
+		ConfigDir:         account.ConfigDir,
+		FileProviderLease: storeTestLeaseReceipt("removing"),
 	}
-	if err := s.ActivateSelection(activation); !errors.Is(err, ErrAccountRemoving) {
+	if err := activateSelectionForTest(s, activation); !errors.Is(err, ErrAccountRemoving) {
 		t.Fatalf("activate selection after removal = %v, want ErrAccountRemoving", err)
 	}
 	mutationRequest := existingAccountMutationTestRequest(

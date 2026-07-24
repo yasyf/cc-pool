@@ -5,6 +5,18 @@ import (
 	"time"
 )
 
+// FileProviderLeaseReceipt is the byte-exact FuseKit receipt retained for one session.
+type FileProviderLeaseReceipt []byte
+
+// SessionLeaseState is the durable cross-store settlement state.
+type SessionLeaseState string
+
+const (
+	SessionLeasePending  SessionLeaseState = "pending"
+	SessionLeaseActive   SessionLeaseState = "active"
+	SessionLeaseReleased SessionLeaseState = "released"
+)
+
 // Account is one pool account. ID is the account index (>= 1).
 type Account struct {
 	ID              int
@@ -56,6 +68,7 @@ type UsageSample struct {
 // Session is a checkout of an account to a live claude process.
 type Session struct {
 	ID                int64
+	SelectionToken    string
 	AccountID         int
 	AccountInstanceID string
 	AccountGeneration uint64
@@ -64,6 +77,11 @@ type Session struct {
 	ConfigDir         string
 	Cwd               string // launch working directory; "" when unknown (never matches a pin)
 	StartedAt         time.Time
+	LeaseState        SessionLeaseState
+	FileProviderLease FileProviderLeaseReceipt
+	LeaseExpiresAt    time.Time
+	// LeaseRenewalExpiresAt is the durable exact renewal request awaiting settlement.
+	LeaseRenewalExpiresAt *time.Time
 	// LastSeenAt is when a reconcile scan last observed the pid alive; nil
 	// when never observed. Dead rows are closed at this time, not at reap
 	// time, so an observer gap cannot fabricate a recent session end.
@@ -90,6 +108,14 @@ type SelectionActivation struct {
 	Cwd                string
 	RecordSticky       bool
 	At                 time.Time
+	FileProviderLease  FileProviderLeaseReceipt
+	LeaseExpiresAt     time.Time
+}
+
+// SessionReconciliation partitions exact active rows after one process snapshot.
+type SessionReconciliation struct {
+	Live []Session
+	Dead []Session
 }
 
 // Sticky is the account pinned to a working directory, used to keep resumed

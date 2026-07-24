@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"database/sql"
 	"errors"
@@ -17,6 +18,41 @@ var storeTestToken atomic.Uint64
 
 func nextStoreTestToken() string {
 	return fmt.Sprintf("%032x", storeTestToken.Add(1))
+}
+
+func storeTestLeaseReceipt(value string) FileProviderLeaseReceipt {
+	return FileProviderLeaseReceipt("file-provider-lease:" + value)
+}
+
+func activateSelectionForTest(s *Store, activation SelectionActivation) error {
+	if activation.LeaseExpiresAt.IsZero() {
+		base := activation.At
+		if base.IsZero() {
+			base = time.Now()
+		}
+		activation.LeaseExpiresAt = base.Add(time.Minute)
+	}
+	if _, err := s.StageSelection(activation); err != nil {
+		return err
+	}
+	committed := append(cloneFileProviderLeaseReceipt(activation.FileProviderLease), []byte(":committed")...)
+	return s.CommitSelection(
+		activation.Token, activation.FileProviderLease, committed, activation.RecordSticky, activation.At,
+	)
+}
+
+func closeSessionForTest(s *Store, id int64, at time.Time) error {
+	sessions, err := s.ListActiveSessions()
+	if err != nil {
+		return err
+	}
+	for _, session := range sessions {
+		if session.ID == id {
+			released := append(cloneFileProviderLeaseReceipt(session.FileProviderLease), []byte(":released")...)
+			return s.CompleteSessionLeaseRelease(id, session.FileProviderLease, released, at)
+		}
+	}
+	return ErrSessionLeaseConflict
 }
 
 func openTest(t *testing.T) *Store {
@@ -45,11 +81,13 @@ func activateTestSession(t *testing.T, s *Store, accountID, pid int, cwd string,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ActivateSelection(SelectionActivation{
-		Token:     nextStoreTestToken(),
+	token := nextStoreTestToken()
+	if err := activateSelectionForTest(s, SelectionActivation{
+		Token:     token,
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   ProcessIdentity{PID: pid, StartedAt: started},
 		ConfigDir: a.ConfigDir, Cwd: cwd, At: started,
+		FileProviderLease: storeTestLeaseReceipt(token),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -119,11 +157,12 @@ func TestActivateSelectionRechecksExactEligibilityAfterReservation(t *testing.T)
 	); err != nil {
 		t.Fatal(err)
 	}
-	err := s.ActivateSelection(SelectionActivation{
+	err := activateSelectionForTest(s, SelectionActivation{
 		Token: nextStoreTestToken(), AccountID: account.ID,
 		ExpectedInstanceID: account.InstanceID, ExpectedGeneration: account.Generation,
 		Process:   ProcessIdentity{PID: 42, StartedAt: time.Now().Add(-time.Minute)},
 		ConfigDir: account.ConfigDir, Cwd: "/tmp/selection-race",
+		FileProviderLease: storeTestLeaseReceipt("selection-race"),
 	})
 	if !errors.Is(err, ErrAccountSelectionIneligible) {
 		t.Fatalf("activation after eligibility loss = %v", err)
@@ -353,11 +392,12 @@ func TestActivateSelectionRejectsGenerationChangeAtomically(t *testing.T) {
 	if _, err := s.db.Exec(`UPDATE accounts SET generation=generation+1 WHERE id=?`, account.ID); err != nil {
 		t.Fatal(err)
 	}
-	err := s.ActivateSelection(SelectionActivation{
+	err := activateSelectionForTest(s, SelectionActivation{
 		Token:     nextStoreTestToken(),
 		AccountID: 1, ExpectedInstanceID: reserved.InstanceID, ExpectedGeneration: reserved.Generation,
 		Process:   ProcessIdentity{PID: 4242, StartedAt: time.Now().Add(-time.Minute)},
 		ConfigDir: "/presentation/acct-01", Cwd: "/project", RecordSticky: true,
+		FileProviderLease: storeTestLeaseReceipt("generation-change"),
 	})
 	if !errors.Is(err, ErrAccountGenerationChanged) {
 		t.Fatalf("ActivateSelection after generation change = %v, want ErrAccountGenerationChanged", err)
@@ -367,6 +407,65 @@ func TestActivateSelectionRejectsGenerationChangeAtomically(t *testing.T) {
 	}
 	if _, ok, err := s.GetSticky("/project"); err != nil || ok {
 		t.Fatalf("sticky after rejected activation: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSelectionLeaseSettlementIsTwoPhaseAndExact(t *testing.T) {
+	s := openTest(t)
+	now := time.Unix(1_700_000_000, 0).UTC()
+	s.now = func() time.Time { return now }
+	admitTestAccount(t, s, Account{
+		ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct",
+	})
+	account, err := s.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisional := storeTestLeaseReceipt("two-phase-provisional")
+	activation := SelectionActivation{
+		Token: "1234567890abcdef1234567890abcdef", AccountID: account.ID,
+		ExpectedInstanceID: account.InstanceID, ExpectedGeneration: account.Generation,
+		Process:   ProcessIdentity{PID: 4242, StartedAt: now.Add(-time.Minute)},
+		ConfigDir: account.ConfigDir, Cwd: "/project", RecordSticky: true, At: now,
+		FileProviderLease: provisional, LeaseExpiresAt: now.Add(time.Minute),
+	}
+	staged, err := s.StageSelection(activation)
+	if err != nil || staged.LeaseState != SessionLeasePending || staged.SelectionToken != activation.Token {
+		t.Fatalf("staged selection = %+v, %v", staged, err)
+	}
+	if committed, err := s.SelectionCommitted(activation.Token); err != nil || committed {
+		t.Fatalf("pending selection terminal = %v, %v", committed, err)
+	}
+	if _, ok, err := s.GetSticky("/project"); err != nil || ok {
+		t.Fatalf("pending selection recorded sticky = %v, %v", ok, err)
+	}
+	if replay, err := s.StageSelection(activation); err != nil || replay.ID != staged.ID {
+		t.Fatalf("staging replay = %+v, %v", replay, err)
+	}
+	altered := activation
+	altered.FileProviderLease = storeTestLeaseReceipt("substituted-provisional")
+	if _, err := s.StageSelection(altered); !errors.Is(err, ErrSessionLeaseConflict) {
+		t.Fatalf("substituted staging = %v, want ErrSessionLeaseConflict", err)
+	}
+	committedReceipt := storeTestLeaseReceipt("two-phase-committed")
+	if err := s.CommitSelection(activation.Token, provisional, committedReceipt, true, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitSelection(activation.Token, provisional, committedReceipt, true, now); err != nil {
+		t.Fatalf("commit replay = %v", err)
+	}
+	if err := s.CommitSelection(
+		activation.Token, provisional, storeTestLeaseReceipt("substituted-committed"), true, now,
+	); !errors.Is(err, ErrSessionLeaseConflict) {
+		t.Fatalf("substituted commit = %v, want ErrSessionLeaseConflict", err)
+	}
+	active := mustActive(t, s)
+	if len(active) != 1 || active[0].LeaseState != SessionLeaseActive ||
+		!bytes.Equal(active[0].FileProviderLease, committedReceipt) {
+		t.Fatalf("active selection = %+v", active)
+	}
+	if sticky, ok, err := s.GetSticky("/project"); err != nil || !ok || sticky.AccountID != account.ID {
+		t.Fatalf("committed sticky = %+v, %v, %v", sticky, ok, err)
 	}
 }
 
@@ -383,12 +482,18 @@ func TestSelectionTerminalReplayAndExpiry(t *testing.T) {
 		ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   ProcessIdentity{PID: 4242, StartedAt: now.Add(-time.Minute)},
 		ConfigDir: a.ConfigDir, At: now,
+		FileProviderLease: storeTestLeaseReceipt("terminal-replay"),
 	}
-	if err := s.ActivateSelection(activation); err != nil {
+	if err := activateSelectionForTest(s, activation); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ActivateSelection(activation); err != nil {
+	if err := activateSelectionForTest(s, activation); err != nil {
 		t.Fatalf("idempotent activation replay: %v", err)
+	}
+	altered := activation
+	altered.FileProviderLease = storeTestLeaseReceipt("altered-terminal-replay")
+	if err := activateSelectionForTest(s, altered); !errors.Is(err, ErrSessionLeaseConflict) {
+		t.Fatalf("altered activation replay = %v, want ErrSessionLeaseConflict", err)
 	}
 	if got := tableCount(t, s, "sessions"); got != 1 {
 		t.Fatalf("replayed activation sessions = %d, want 1", got)
@@ -418,9 +523,12 @@ func TestSelectionTerminalRetentionIsDeterministicallyBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 1; i <= selectionTerminalLimit+3; i++ {
+		token := fmt.Sprintf("%032x", i)
 		if _, err := tx.Exec(
-			`INSERT INTO selection_terminals(token,account_id,account_instance_id,account_generation,committed_at,expires_at) VALUES(?,?,?,?,?,?)`,
-			fmt.Sprintf("%032x", i), a.ID, a.InstanceID, a.Generation, now.Unix(), now.Add(selectionTerminalTTL).Unix(),
+			`INSERT INTO selection_terminals(token,account_id,account_instance_id,account_generation,
+			 file_provider_provisional_lease_receipt,file_provider_committed_lease_receipt,committed_at,expires_at)
+			 VALUES(?,?,?,?,?,?,?,?)`, token, a.ID, a.InstanceID, a.Generation,
+			storeTestLeaseReceipt(token), storeTestLeaseReceipt(token+":committed"), now.Unix(), now.Add(selectionTerminalTTL).Unix(),
 		); err != nil {
 			_ = tx.Rollback()
 			t.Fatal(err)
@@ -448,7 +556,7 @@ func TestSelectionTerminalRejectsMalformedToken(t *testing.T) {
 			if _, err := s.SelectionCommitted(token); err == nil {
 				t.Fatal("SelectionCommitted accepted malformed token")
 			}
-			if err := s.ActivateSelection(SelectionActivation{Token: token}); err == nil {
+			if err := activateSelectionForTest(s, SelectionActivation{Token: token}); err == nil {
 				t.Fatal("ActivateSelection accepted malformed token")
 			}
 		})
@@ -475,14 +583,18 @@ func TestCurrentSchemaRejectsInvalidIdentityRows(t *testing.T) {
 	}
 	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "/acct", KeychainService: "svc", KeychainAccount: "user"})
 	a, _ := s.GetAccount(1)
-	sessionInsert := `INSERT INTO sessions(account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at) VALUES(?,?,?,?,?,?,?,?)`
+	sessionInsert := `INSERT INTO sessions(selection_token,account_id,account_instance_id,account_generation,pid,process_started_at,
+	 config_dir,cwd,started_at,file_provider_lease_state,file_provider_lease_receipt,file_provider_lease_expires_at)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`
+	token := "abababababababababababababababab"
+	lease := storeTestLeaseReceipt("invalid-row")
 	for name, args := range map[string][]any{
-		"null pid":        {1, a.InstanceID, 1, nil, 1, "/acct", "", 1},
-		"zero pid":        {1, a.InstanceID, 1, 0, 1, "/acct", "", 1},
-		"zero start":      {1, a.InstanceID, 1, 1, 0, "/acct", "", 1},
-		"empty config":    {1, a.InstanceID, 1, 1, 1, "", "", 1},
-		"zero instance":   {1, "", 1, 1, 1, "/acct", "", 1},
-		"zero generation": {1, a.InstanceID, 0, 1, 1, "/acct", "", 1},
+		"null pid":        {token, 1, a.InstanceID, 1, nil, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
+		"zero pid":        {token, 1, a.InstanceID, 1, 0, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
+		"zero start":      {token, 1, a.InstanceID, 1, 1, 0, "/acct", "", 1, SessionLeasePending, lease, 1},
+		"empty config":    {token, 1, a.InstanceID, 1, 1, 1, "", "", 1, SessionLeasePending, lease, 1},
+		"zero instance":   {token, 1, "", 1, 1, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
+		"zero generation": {token, 1, a.InstanceID, 0, 1, 1, "/acct", "", 1, SessionLeasePending, lease, 1},
 	} {
 		t.Run("session "+name, func(t *testing.T) {
 			if _, err := s.db.Exec(sessionInsert, args...); err == nil {
@@ -766,7 +878,7 @@ func TestSessionsReconcile(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	started := now.Add(-2 * SessionReapGrace)
 	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
-	id1 := activateTestSession(t, s, 1, 111, "/proj", started)
+	activateTestSession(t, s, 1, 111, "/proj", started)
 	activateTestSession(t, s, 1, 222, "/proj", started)
 	activateTestSession(t, s, 1, 444, "/proj", started)
 	activateTestSession(t, s, 1, 333, "/proj", now) // fresh: inside the reap grace
@@ -785,10 +897,11 @@ func TestSessionsReconcile(t *testing.T) {
 		444: started.Add(time.Second), // same PID, different kernel generation
 	}
 	processes := map[int]time.Time{222: started, 333: now, 444: started.Add(time.Second)}
-	closed, err := s.CloseDeadSessions(claude, processes, now)
-	if err != nil || closed != 2 {
-		t.Fatalf("closed = %d err=%v, want dead PID and reused PID", closed, err)
+	reconciled, err := s.ReconcileSessions(claude, processes, now)
+	if err != nil || len(reconciled.Dead) != 2 || len(reconciled.Live) != 2 {
+		t.Fatalf("reconciled = %+v err=%v, want two dead and two live", reconciled, err)
 	}
+	closeReconciledSessions(t, s, reconciled.Dead)
 	if n, _ := s.ActiveSessionCount(1); n != 2 {
 		t.Fatalf("active after reconcile = %d, want 2", n)
 	}
@@ -802,9 +915,6 @@ func TestSessionsReconcile(t *testing.T) {
 	}
 	if act, _ := s.GetCwdActivity("/proj", 1); !act.LastEnded.Equal(started) {
 		t.Fatalf("reaped row must end at its start, got %v want %v", act.LastEnded, started)
-	}
-	if err := s.CloseSession(id1, now); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -821,11 +931,12 @@ func TestActivateSelectionAtomic(t *testing.T) {
 
 	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"})
 	a, _ := s.GetAccount(1)
-	err := s.ActivateSelection(SelectionActivation{
+	err := activateSelectionForTest(s, SelectionActivation{
 		AccountID: 1, ExpectedInstanceID: a.InstanceID,
 		Token:              nextStoreTestToken(),
 		ExpectedGeneration: a.Generation, Process: ProcessIdentity{PID: 4242, StartedAt: now},
 		ConfigDir: a.ConfigDir, Cwd: "/proj", RecordSticky: true, At: now,
+		FileProviderLease: storeTestLeaseReceipt("atomic"),
 	})
 	if err == nil {
 		t.Fatal("ActivateSelection succeeded with failing session insert")
@@ -847,10 +958,11 @@ func TestActivateSelectionConditionalEffects(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"})
 	a, _ := s.GetAccount(1)
-	if err := s.ActivateSelection(SelectionActivation{
+	if err := activateSelectionForTest(s, SelectionActivation{
 		AccountID: 1, ExpectedInstanceID: a.InstanceID,
 		Token: nextStoreTestToken(), ExpectedGeneration: a.Generation,
 		Process: ProcessIdentity{PID: 4242, StartedAt: now}, ConfigDir: a.ConfigDir, At: now,
+		FileProviderLease: storeTestLeaseReceipt("conditional"),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -877,9 +989,80 @@ func mustActive(t *testing.T, s *Store) []Session {
 	return live
 }
 
-// TestCloseDeadSessionsEndsAtLastSeen: a pid seen alive by an earlier reconcile
+func closeReconciledSessions(t *testing.T, s *Store, sessions []Session) {
+	t.Helper()
+	for _, session := range sessions {
+		endedAt := session.StartedAt
+		if session.LastSeenAt != nil && session.LastSeenAt.After(endedAt) {
+			endedAt = *session.LastSeenAt
+		}
+		released := append(cloneFileProviderLeaseReceipt(session.FileProviderLease), []byte(":released")...)
+		if err := s.CompleteSessionLeaseRelease(session.ID, session.FileProviderLease, released, endedAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSessionFileProviderLeaseLifecycleIsExactAndRetryable(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().Truncate(time.Second)
+	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"})
+	id := activateTestSession(t, s, 1, 4242, "/project", now.Add(-time.Minute))
+
+	session := mustActive(t, s)[0]
+	original := cloneFileProviderLeaseReceipt(session.FileProviderLease)
+	session.FileProviderLease[0] ^= 0xff
+	if got := mustActive(t, s)[0].FileProviderLease; !bytes.Equal(got, original) {
+		t.Fatalf("stored lease aliased caller memory: got %x want %x", got, original)
+	}
+
+	firstExpiry := now.Add(30 * time.Second)
+	planned, err := s.PlanSessionLeaseRenewal(id, original, firstExpiry)
+	if err != nil || !planned.Equal(firstExpiry) {
+		t.Fatalf("first renewal plan = %v, %v; want %v", planned, err, firstExpiry)
+	}
+	plannedAgain, err := s.PlanSessionLeaseRenewal(id, original, firstExpiry.Add(time.Hour))
+	if err != nil || !plannedAgain.Equal(firstExpiry) {
+		t.Fatalf("retried renewal plan = %v, %v; want exact %v", plannedAgain, err, firstExpiry)
+	}
+	pending := mustActive(t, s)[0]
+	if pending.LeaseRenewalExpiresAt == nil || !pending.LeaseRenewalExpiresAt.Equal(firstExpiry) {
+		t.Fatalf("pending renewal = %+v, want %v", pending.LeaseRenewalExpiresAt, firstExpiry)
+	}
+
+	renewed := storeTestLeaseReceipt("renewed")
+	if err := s.CompleteSessionLeaseRenewal(id, original, renewed, firstExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteSessionLeaseRenewal(id, original, renewed, firstExpiry); err != nil {
+		t.Fatalf("completion replay: %v", err)
+	}
+	updated := mustActive(t, s)[0]
+	if !bytes.Equal(updated.FileProviderLease, renewed) || updated.LeaseRenewalExpiresAt != nil {
+		t.Fatalf("completed renewal = %+v", updated)
+	}
+	if _, err := s.PlanSessionLeaseRenewal(id, original, now.Add(time.Minute)); !errors.Is(err, ErrSessionLeaseConflict) {
+		t.Fatalf("stale renewal plan = %v, want ErrSessionLeaseConflict", err)
+	}
+
+	released := storeTestLeaseReceipt("released")
+	if err := s.CompleteSessionLeaseRelease(id, original, released, now); !errors.Is(err, ErrSessionLeaseConflict) {
+		t.Fatalf("stale close = %v, want ErrSessionLeaseConflict", err)
+	}
+	if err := s.CompleteSessionLeaseRelease(id, renewed, released, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteSessionLeaseRelease(id, renewed, released, now); err != nil {
+		t.Fatalf("close replay: %v", err)
+	}
+	if count, err := s.ActiveSessionCount(1); err != nil || count != 0 {
+		t.Fatalf("active after exact close = %d, %v", count, err)
+	}
+}
+
+// TestReconcileSessionsEndsAtLastSeen: a pid seen alive by an earlier reconcile
 // is closed at that observation, not reap time.
-func TestCloseDeadSessionsEndsAtLastSeen(t *testing.T) {
+func TestReconcileSessionsEndsAtLastSeen(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
 	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
@@ -887,13 +1070,14 @@ func TestCloseDeadSessionsEndsAtLastSeen(t *testing.T) {
 
 	// A reconcile 4h ago saw the pid alive; the process then died unobserved.
 	alive := map[int]time.Time{555: now.Add(-5 * time.Hour)}
-	if _, err := s.CloseDeadSessions(alive, alive, now.Add(-4*time.Hour)); err != nil {
+	if result, err := s.ReconcileSessions(alive, alive, now.Add(-4*time.Hour)); err != nil || len(result.Live) != 1 {
 		t.Fatal(err)
 	}
-	closed, err := s.CloseDeadSessions(map[int]time.Time{}, map[int]time.Time{}, now)
-	if err != nil || closed != 1 {
-		t.Fatalf("closed = %d err=%v", closed, err)
+	result, err := s.ReconcileSessions(map[int]time.Time{}, map[int]time.Time{}, now)
+	if err != nil || len(result.Dead) != 1 {
+		t.Fatalf("reconciled = %+v err=%v", result, err)
 	}
+	closeReconciledSessions(t, s, result.Dead)
 	act, err := s.GetCwdActivity("/proj", 1)
 	if err != nil {
 		t.Fatal(err)
@@ -904,7 +1088,7 @@ func TestCloseDeadSessionsEndsAtLastSeen(t *testing.T) {
 	}
 }
 
-func TestCloseDeadSessionsRejectsReusedPIDIdentity(t *testing.T) {
+func TestReconcileSessionsRejectsReusedPIDIdentity(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Microsecond)
 	started := now.Add(-2 * SessionReapGrace)
@@ -912,38 +1096,41 @@ func TestCloseDeadSessionsRejectsReusedPIDIdentity(t *testing.T) {
 	activateTestSession(t, s, 1, 777, "/project", started)
 	reusedAt := started.Add(time.Minute)
 	reused := map[int]time.Time{777: reusedAt}
-	closed, err := s.CloseDeadSessions(reused, reused, now)
-	if err != nil || closed != 1 {
-		t.Fatalf("CloseDeadSessions reused pid = %d, %v; want old identity closed", closed, err)
+	result, err := s.ReconcileSessions(reused, reused, now)
+	if err != nil || len(result.Dead) != 1 {
+		t.Fatalf("ReconcileSessions reused pid = %+v, %v; want old identity dead", result, err)
 	}
+	closeReconciledSessions(t, s, result.Dead)
 	if active, err := s.ActiveSessionCount(1); err != nil || active != 0 {
 		t.Fatalf("active sessions = %d, err=%v", active, err)
 	}
 }
 
-func TestCloseDeadSessionsLaunchGraceRequiresExactLiveProcess(t *testing.T) {
+func TestReconcileSessionsLaunchGraceRequiresExactLiveProcess(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Microsecond)
 	admitTestAccount(t, s, Account{ID: 1, ConfigDir: "/acct-01", KeychainService: "svc", KeychainAccount: "acct"})
 	activateTestSession(t, s, 1, 700, "/missing", now)
 	activateTestSession(t, s, 1, 701, "/pre-exec", now)
 
-	closed, err := s.CloseDeadSessions(
+	result, err := s.ReconcileSessions(
 		map[int]time.Time{}, map[int]time.Time{701: now}, now.Add(time.Second),
 	)
-	if err != nil || closed != 1 {
-		t.Fatalf("first reconcile = %d, %v; want missing identity closed", closed, err)
+	if err != nil || len(result.Dead) != 1 {
+		t.Fatalf("first reconcile = %+v, %v; want missing identity dead", result, err)
 	}
+	closeReconciledSessions(t, s, result.Dead)
 	active := mustActive(t, s)
 	if len(active) != 1 || active[0].PID != 701 {
 		t.Fatalf("active during launch grace = %+v", active)
 	}
-	closed, err = s.CloseDeadSessions(
+	result, err = s.ReconcileSessions(
 		map[int]time.Time{}, map[int]time.Time{701: now}, now.Add(SessionReapGrace),
 	)
-	if err != nil || closed != 1 {
-		t.Fatalf("post-grace reconcile = %d, %v; want stale pre-exec identity closed", closed, err)
+	if err != nil || len(result.Dead) != 1 {
+		t.Fatalf("post-grace reconcile = %+v, %v; want stale pre-exec identity dead", result, err)
 	}
+	closeReconciledSessions(t, s, result.Dead)
 }
 
 func TestGetCwdActivity(t *testing.T) {
@@ -960,11 +1147,11 @@ func TestGetCwdActivity(t *testing.T) {
 	activateTestSession(t, s, 1, 100, "/proj", now.Add(-3*time.Hour))
 	early := activateTestSession(t, s, 1, 200, "/proj", now.Add(-2*time.Hour))
 	late := activateTestSession(t, s, 1, 300, "/proj", now.Add(-90*time.Minute))
-	_ = s.CloseSession(early, now.Add(-time.Hour))
-	_ = s.CloseSession(late, now.Add(-10*time.Minute))
+	_ = closeSessionForTest(s, early, now.Add(-time.Hour))
+	_ = closeSessionForTest(s, late, now.Add(-10*time.Minute))
 	activateTestSession(t, s, 1, 400, "", now)
 	other := activateTestSession(t, s, 2, 500, "/proj", now.Add(-time.Hour))
-	_ = s.CloseSession(other, now.Add(-time.Minute))
+	_ = closeSessionForTest(s, other, now.Add(-time.Minute))
 
 	act, err = s.GetCwdActivity("/proj", 1)
 	if err != nil {
@@ -1109,11 +1296,11 @@ func TestPruneSticky(t *testing.T) {
 	// /warm: stale select, last session ended within the TTL.
 	_ = s.UpsertSticky("/warm", 1, now.Add(-3*time.Hour))
 	warm := activateTestSession(t, s, 1, 200, "/warm", now.Add(-3*time.Hour))
-	_ = s.CloseSession(warm, now.Add(-30*time.Minute))
+	_ = closeSessionForTest(s, warm, now.Add(-30*time.Minute))
 	// /cold: stale select, last session ended before the cutoff.
 	_ = s.UpsertSticky("/cold", 1, now.Add(-3*time.Hour))
 	cold := activateTestSession(t, s, 1, 300, "/cold", now.Add(-3*time.Hour))
-	_ = s.CloseSession(cold, now.Add(-2*time.Hour))
+	_ = closeSessionForTest(s, cold, now.Add(-2*time.Hour))
 	// /manual-new: never-used manual pin inside its 1h minimum.
 	_ = s.PinManual("/manual-new", 1, now.Add(-30*time.Minute))
 	// /manual-old: never-used manual pin past its 1h minimum.

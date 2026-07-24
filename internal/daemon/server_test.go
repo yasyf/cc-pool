@@ -335,6 +335,7 @@ func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[in
 		activatePrepared: func(_ context.Context, _ store.Account, _ catalogproto.TenantPreparationProof, activate func() error) error {
 			return activate()
 		},
+		sessionLeases: &testSessionLeaseManager{},
 	}
 	s.m.ClaimCredentialMutation = func(accountID int) (func(), error) {
 		if !s.cl.ownExclusive(accountID) {
@@ -358,6 +359,11 @@ func daemonTestPreparationProof(account store.Account, publicPath string) catalo
 		panic(err)
 	}
 	const revision = 7
+	const rootID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const policyDigest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const resolutionDigest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	const sourcePublication = "dddddddddddddddddddddddddddddddd"
+	presentationInstance := catalogproto.PresentationInstanceID(account.InstanceID)
 	return catalogproto.TenantPreparationProof{
 		Catalog: catalogproto.CatalogLaneProof{
 			Tenant: catalogproto.TenantID(tenantID), Generation: account.Generation,
@@ -368,11 +374,23 @@ func daemonTestPreparationProof(account store.Account, publicPath string) catalo
 			FileProvider: &catalogproto.FileProviderPresentationProof{
 				TenantID: catalogproto.TenantID(tenantID), DomainID: domainID,
 				Generation: account.Generation, PublicPath: publicPath, ActivationGeneration: "activation-test",
+				PresentationInstanceID: presentationInstance, RootID: rootID,
 			},
 		},
 		SourceAuthority: catalogproto.SourceAuthorityID(tenantfs.ClaudeAuthorityID),
 		SourceRevision:  revision, CatalogRevision: revision,
-		ChangeID: "change-test", OperationID: "operation-test",
+		ChangeID: "change-test", OperationID: "operation-test", SourcePublication: sourcePublication,
+		CriticalReadiness: &catalogproto.CriticalReadinessProof{
+			Lease: catalogproto.FileProviderLeaseReceipt{
+				LeaseID: account.InstanceID, TenantID: catalogproto.TenantID(tenantID), DomainID: domainID,
+				Generation: account.Generation, RootID: rootID, PresentationInstanceID: presentationInstance,
+				State:        catalogproto.FileProviderLeaseStateProvisional,
+				PolicyDigest: policyDigest, ResolutionDigest: resolutionDigest, CatalogHead: revision,
+				SourceAuthority:   catalogproto.SourceAuthorityID(tenantfs.ClaudeAuthorityID),
+				SourcePublication: sourcePublication, SourceRevision: revision,
+				ActivationGeneration: "activation-test", ExpiresUnixNano: uint64(time.Now().Add(time.Minute).UnixNano()),
+			},
+		},
 	}
 }
 
@@ -557,26 +575,44 @@ func activateDaemonTestSession(t *testing.T, s *Server, accountID, pid int, cwd 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.m.Store.ActivateSelection(store.SelectionActivation{
-		Token:     nextDaemonTestToken(),
+	token := nextDaemonTestToken()
+	provisional := store.FileProviderLeaseReceipt("daemon-test-provisional:" + token)
+	staged, err := s.m.Store.StageSelection(store.SelectionActivation{
+		Token:     token,
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   store.ProcessIdentity{PID: pid, StartedAt: started},
 		ConfigDir: a.ConfigDir,
 		Cwd:       cwd, At: started,
-	}); err != nil {
+		FileProviderLease: provisional, LeaseExpiresAt: started.Add(time.Minute),
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	committed := store.FileProviderLeaseReceipt("daemon-test-committed:" + token)
+	if err := s.m.Store.CommitSelection(token, provisional, committed, false, started); err != nil {
+		t.Fatal(err)
+	}
+	return staged.ID
+}
+
+func closeDaemonTestSession(t *testing.T, s *Server, id int64, at time.Time) {
+	t.Helper()
 	sessions, err := s.m.Store.ListActiveSessions()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, session := range sessions {
-		if session.PID == pid && session.ProcessStartedAt.Equal(started) && session.Cwd == cwd {
-			return session.ID
+		if session.ID != id {
+			continue
 		}
+		released := append(store.FileProviderLeaseReceipt(nil), session.FileProviderLease...)
+		released = append(released, []byte(":released")...)
+		if err := s.m.Store.CompleteSessionLeaseRelease(id, session.FileProviderLease, released, at); err != nil {
+			t.Fatal(err)
+		}
+		return
 	}
-	t.Fatal("activated session was not stored")
-	return 0
+	t.Fatalf("session %d not found", id)
 }
 
 func expireCommittedReservations(c *claims, accountID int) {
@@ -955,9 +991,7 @@ func TestHandleSelectBindsWarmEndedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := activateDaemonTestSession(t, s, 2, 800002, "/proj", now.Add(-3*time.Hour))
-	if err := s.m.Store.CloseSession(id, now.Add(-10*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
+	closeDaemonTestSession(t, s, id, now.Add(-10*time.Minute))
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})
 	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 2 || resp.Prepared || resp.Dir != "" || !resp.Sticky {
 		t.Fatalf("expected metadata-only sticky acct-2 via warm ended session, got %+v", resp)
@@ -1007,7 +1041,7 @@ func TestHandleSelectQuickResumeBindsAfterReap(t *testing.T) {
 	// sweep reaps the row; the -10m reconcile below makes the reap a warm end.
 	activateDaemonTestSession(t, s, 2, 4000000, "/proj", now.Add(-3*time.Hour))
 	alive := map[int]time.Time{4000000: now.Add(-3 * time.Hour).Truncate(time.Microsecond)}
-	if _, err := s.m.Store.CloseDeadSessions(alive, alive, now.Add(-10*time.Minute)); err != nil {
+	if result, err := s.m.Store.ReconcileSessions(alive, alive, now.Add(-10*time.Minute)); err != nil || len(result.Live) != 1 {
 		t.Fatal(err)
 	}
 	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj"})

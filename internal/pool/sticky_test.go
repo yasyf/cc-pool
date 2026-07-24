@@ -50,7 +50,7 @@ func seedSessionFor(t *testing.T, m *Manager, accountID int, cwd string, started
 	pid := 900000 + accountID*1000 + int(started.UnixNano()%997)
 	id := activatePoolTestSession(t, m, accountID, pid, cwd, started)
 	if ended != nil {
-		if err := m.Store.CloseSession(id, *ended); err != nil {
+		if err := closePoolTestSession(m.Store, id, *ended); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -63,22 +63,39 @@ func activatePoolTestSession(t *testing.T, m *Manager, accountID, pid int, cwd s
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Store.ActivateSelection(store.SelectionActivation{
-		Token:     nextPoolTestToken(),
+	token := nextPoolTestToken()
+	provisional := store.FileProviderLeaseReceipt("pool-provisional:" + token)
+	staged, err := m.Store.StageSelection(store.SelectionActivation{
+		Token:     token,
 		AccountID: accountID, ExpectedInstanceID: a.InstanceID, ExpectedGeneration: a.Generation,
 		Process:   store.ProcessIdentity{PID: pid, StartedAt: started},
 		ConfigDir: a.ConfigDir,
 		Cwd:       cwd, At: started,
-	}); err != nil {
+		FileProviderLease: provisional, LeaseExpiresAt: started.Add(time.Minute),
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, session := range mustPoolSessions(t, m) {
-		if session.PID == pid && session.ProcessStartedAt.Equal(started) && session.Cwd == cwd {
-			return session.ID
+	committed := store.FileProviderLeaseReceipt("pool-committed:" + token)
+	if err := m.Store.CommitSelection(token, provisional, committed, false, started); err != nil {
+		t.Fatal(err)
+	}
+	return staged.ID
+}
+
+func closePoolTestSession(st *store.Store, id int64, at time.Time) error {
+	sessions, err := st.ListActiveSessions()
+	if err != nil {
+		return err
+	}
+	for _, session := range sessions {
+		if session.ID == id {
+			released := append(store.FileProviderLeaseReceipt(nil), session.FileProviderLease...)
+			released = append(released, []byte(":released")...)
+			return st.CompleteSessionLeaseRelease(id, session.FileProviderLease, released, at)
 		}
 	}
-	t.Fatal("activated session was not stored")
-	return 0
+	return store.ErrSessionLeaseConflict
 }
 
 func mustPoolSessions(t *testing.T, m *Manager) []store.Session {

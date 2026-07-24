@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/procscan"
+	"github.com/yasyf/cc-pool/internal/store"
 )
 
 const (
@@ -207,10 +208,54 @@ func (s *Server) handleHeartbeatDelta(ctx context.Context, delta heartbeatDelta)
 	if !delta.success {
 		return
 	}
-	if n, err := s.m.Store.CloseDeadSessions(delta.snapshot.claude, delta.snapshot.processes, time.Now()); err != nil {
-		s.log.Printf("close dead sessions: %v", err)
-	} else if n > 0 {
-		s.log.Printf("reconciled %d ended session(s)", n)
+	reconciled, err := s.m.Store.ReconcileSessions(delta.snapshot.claude, delta.snapshot.processes, time.Now())
+	if err != nil {
+		s.log.Printf("reconcile sessions: %v", err)
+		return
+	}
+	if s.sessionLeases == nil {
+		s.log.Printf("reconcile sessions: FuseKit File Provider session lease manager is unavailable")
+		return
+	}
+	for _, session := range reconciled.Live {
+		if session.LeaseState != store.SessionLeaseActive {
+			continue
+		}
+		expires, err := s.m.Store.PlanSessionLeaseRenewal(
+			session.ID, session.FileProviderLease, time.Now().Add(sessionLeaseTTL),
+		)
+		if err != nil {
+			s.log.Printf("plan session %d File Provider lease renewal: %v", session.ID, err)
+			continue
+		}
+		if _, err := s.renewSessionLease(ctx, session, expires); err != nil {
+			s.log.Printf("renew session %d File Provider lease: %v", session.ID, err)
+		}
+	}
+	closed := 0
+	for _, session := range reconciled.Dead {
+		if session.LeaseRenewalExpiresAt != nil {
+			session, err = s.renewSessionLease(ctx, session, *session.LeaseRenewalExpiresAt)
+			if err != nil {
+				s.log.Printf("settle session %d File Provider lease renewal before release: %v", session.ID, err)
+				continue
+			}
+		}
+		released, err := s.releaseSessionLease(ctx, session)
+		if err != nil {
+			s.log.Printf("release session %d File Provider lease: %v", session.ID, err)
+			continue
+		}
+		if err := s.m.Store.CompleteSessionLeaseRelease(
+			session.ID, session.FileProviderLease, released, sessionEndedAt(session),
+		); err != nil {
+			s.log.Printf("close released session %d: %v", session.ID, err)
+			continue
+		}
+		closed++
+	}
+	if closed > 0 {
+		s.log.Printf("reconciled %d ended session(s)", closed)
 	}
 	for _, dir := range delta.idle {
 		s.handleIdleTransition(ctx, dir)

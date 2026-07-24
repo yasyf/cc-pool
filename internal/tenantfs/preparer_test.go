@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/version"
@@ -64,7 +65,7 @@ func TestPreparerFencesFileProviderPreparationToObservedActivation(t *testing.T)
 	}
 	tenantID, _ := account.TenantID()
 	if runtime.called != 1 || runtime.tenant != catalogproto.TenantID(tenantID) ||
-		runtime.request != (catalogproto.PrepareTenantRequest{
+		!reflect.DeepEqual(runtime.request, catalogproto.PrepareTenantRequest{
 			Protocol: catalogproto.Version, Generation: account.Generation,
 			Presentation:         catalogproto.PresentationKindFileProvider,
 			ActivationGeneration: "activation-7",

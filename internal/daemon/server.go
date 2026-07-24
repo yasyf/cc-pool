@@ -119,6 +119,7 @@ type Server struct {
 
 	tenantClient               *tenantfs.Client
 	tenantCoordinator          *tenantCoordinator
+	sessionLeases              sessionLeaseManager
 	holderSessionDone          <-chan struct{}
 	holderMonitorMu            sync.Mutex
 	holderMonitorCancel        context.CancelFunc
@@ -231,6 +232,7 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 		return func() { s.cl.releaseExclusive(accountID) }, nil
 	}
 	s.tenantClient = tenantClient
+	s.sessionLeases = catalogSessionLeaseManager{runtime: tenantClient}
 	s.holderSessionDone = tenantClient.Done()
 	s.disposableWorkers = workers
 	s.accountMutationTerminal = managedAccountMutationTerminalRunner{terminals: terminals, manager: s.m}
@@ -810,14 +812,45 @@ func (s *Server) activateSelection(ctx context.Context, token string, reserved r
 		ID: reserved.accountID, InstanceID: reserved.accountInstanceID, Generation: reserved.accountGeneration,
 	}
 	activate := func() error {
-		return s.m.Store.ActivateSelection(store.SelectionActivation{
+		process := store.ProcessIdentity{PID: launch.pid, StartedAt: launch.processStartedAt}
+		if reserved.preparation.CriticalReadiness == nil {
+			return errors.New("selection preparation has no critical readiness lease")
+		}
+		provisional, err := encodeSessionLease(reserved.preparation.CriticalReadiness.Lease)
+		if err != nil {
+			return err
+		}
+		commitExpires := time.Now().Add(sessionLeaseTTL).UTC()
+		provisionalExpires := time.Unix(0, int64(reserved.preparation.CriticalReadiness.Lease.ExpiresUnixNano)).UTC()
+		if provisionalExpires.After(commitExpires) {
+			commitExpires = provisionalExpires
+		}
+		activation := store.SelectionActivation{
 			Token:     token,
 			AccountID: reserved.accountID, ExpectedInstanceID: reserved.accountInstanceID,
 			ExpectedGeneration: reserved.accountGeneration,
-			Process:            store.ProcessIdentity{PID: launch.pid, StartedAt: launch.processStartedAt},
+			Process:            process,
 			ConfigDir:          publicPath,
 			Cwd:                launch.cwd, RecordSticky: launch.recordSticky, At: time.Now(),
-		})
+			FileProviderLease: provisional, LeaseExpiresAt: commitExpires,
+		}
+		staged, err := s.m.Store.StageSelection(activation)
+		if err != nil {
+			return err
+		}
+		if staged.LeaseState == store.SessionLeaseActive {
+			return nil
+		}
+		if s.sessionLeases == nil {
+			return errors.New("FuseKit File Provider session lease manager is unavailable")
+		}
+		leaseCtx, cancel := context.WithTimeout(ctx, sessionLeaseOperationTimeout)
+		defer cancel()
+		committed, err := s.sessionLeases.Commit(leaseCtx, provisional, staged.ID, process, commitExpires)
+		if err != nil {
+			return fmt.Errorf("commit File Provider session lease: %w", err)
+		}
+		return s.m.Store.CommitSelection(token, provisional, committed, launch.recordSticky, time.Now())
 	}
 	var activationErr error
 	if s.activatePrepared != nil {

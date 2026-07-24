@@ -3,6 +3,7 @@
 package store
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -249,6 +250,7 @@ CREATE TABLE usage_samples (
 CREATE INDEX idx_usage_acct_ts ON usage_samples(account_id, ts DESC);
 CREATE TABLE sessions (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  selection_token TEXT NOT NULL UNIQUE CHECK(length(selection_token) = 32 AND selection_token NOT GLOB '*[^0-9a-f]*'),
   account_id   INTEGER NOT NULL CHECK(account_id > 0),
   account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation INTEGER NOT NULL CHECK(account_generation > 0),
@@ -257,6 +259,10 @@ CREATE TABLE sessions (
   config_dir   TEXT NOT NULL CHECK(config_dir <> ''),
   cwd          TEXT NOT NULL DEFAULT '',
   started_at   INTEGER NOT NULL CHECK(started_at > 0),
+  file_provider_lease_state TEXT NOT NULL CHECK(file_provider_lease_state IN ('pending','active','released')),
+  file_provider_lease_receipt BLOB NOT NULL CHECK(length(file_provider_lease_receipt) BETWEEN 1 AND 65536),
+  file_provider_lease_expires_at INTEGER NOT NULL CHECK(file_provider_lease_expires_at > 0),
+  lease_renewal_expires_at INTEGER CHECK(lease_renewal_expires_at > 0),
   last_seen_at INTEGER,
   ended_at     INTEGER
 );
@@ -267,6 +273,8 @@ CREATE TABLE selection_terminals (
   account_id          INTEGER NOT NULL CHECK(account_id > 0),
   account_instance_id TEXT NOT NULL CHECK(length(account_instance_id) = 32 AND account_instance_id NOT GLOB '*[^0-9a-f]*'),
   account_generation  INTEGER NOT NULL CHECK(account_generation > 0),
+	file_provider_provisional_lease_receipt BLOB NOT NULL CHECK(length(file_provider_provisional_lease_receipt) BETWEEN 1 AND 65536),
+	file_provider_committed_lease_receipt BLOB NOT NULL CHECK(length(file_provider_committed_lease_receipt) BETWEEN 1 AND 65536),
   committed_at        INTEGER NOT NULL CHECK(committed_at > 0),
   expires_at          INTEGER NOT NULL CHECK(expires_at > committed_at)
 );
@@ -1321,49 +1329,86 @@ func (s *Store) SelectionEligible(account Account) error {
 // tenant-defining shape changed before activation.
 var ErrAccountGenerationChanged = errors.New("account generation changed")
 
-// ActivateSelection atomically verifies the reserved account identity and
-// generation, then records sticky/session state. No filesystem or provider I/O
-// occurs in this transaction.
-func (s *Store) ActivateSelection(a SelectionActivation) (err error) {
+// ErrSessionLeaseConflict means an exact session lease receipt or renewal fence changed.
+var ErrSessionLeaseConflict = errors.New("session File Provider lease changed")
+
+func validateFileProviderLeaseReceipt(receipt FileProviderLeaseReceipt) error {
+	if len(receipt) == 0 || len(receipt) > 64*1024 {
+		return errors.New("File Provider lease receipt must contain 1..65536 bytes")
+	}
+	return nil
+}
+
+func cloneFileProviderLeaseReceipt(receipt FileProviderLeaseReceipt) FileProviderLeaseReceipt {
+	return append(FileProviderLeaseReceipt(nil), receipt...)
+}
+
+// StageSelection atomically records the exact provisional File Provider lease
+// before external lease promotion begins.
+func (s *Store) StageSelection(a SelectionActivation) (_ Session, err error) {
 	if err := validateSelectionToken(a.Token); err != nil {
-		return fmt.Errorf("activate selection: %w", err)
+		return Session{}, fmt.Errorf("stage selection: %w", err)
 	}
 	if a.Process.PID <= 0 {
-		return errors.New("activate selection: positive process pid is required")
+		return Session{}, errors.New("stage selection: positive process pid is required")
 	}
 	if a.Process.StartedAt.IsZero() {
-		return errors.New("activate selection: process start time is required")
+		return Session{}, errors.New("stage selection: process start time is required")
 	}
 	if a.ConfigDir == "" {
-		return errors.New("activate selection: config dir is required")
+		return Session{}, errors.New("stage selection: config dir is required")
+	}
+	if err := validateFileProviderLeaseReceipt(a.FileProviderLease); err != nil {
+		return Session{}, fmt.Errorf("stage selection: %w", err)
+	}
+	if a.LeaseExpiresAt.IsZero() || a.LeaseExpiresAt.UnixNano() <= 0 {
+		return Session{}, errors.New("stage selection: lease expiry is required")
 	}
 	if a.At.IsZero() {
 		a.At = s.now()
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("begin selection activation: %w", err)
+		return Session{}, fmt.Errorf("begin selection staging: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	terminalNow := s.now()
 	if err = pruneSelectionTerminals(tx, terminalNow); err != nil {
-		return fmt.Errorf("prune selection terminals: %w", err)
+		return Session{}, fmt.Errorf("prune selection terminals: %w", err)
 	}
 	var terminalAccountID int
 	var terminalInstanceID string
 	var terminalGeneration uint64
+	var terminalProvisional []byte
 	err = tx.QueryRow(
-		`SELECT account_id,account_instance_id,account_generation FROM selection_terminals WHERE token=?`, a.Token,
-	).Scan(&terminalAccountID, &terminalInstanceID, &terminalGeneration)
+		`SELECT account_id,account_instance_id,account_generation,file_provider_provisional_lease_receipt FROM selection_terminals WHERE token=?`, a.Token,
+	).Scan(&terminalAccountID, &terminalInstanceID, &terminalGeneration, &terminalProvisional)
 	if err == nil {
 		if terminalAccountID != a.AccountID || terminalInstanceID != a.ExpectedInstanceID || terminalGeneration != a.ExpectedGeneration {
-			return fmt.Errorf("activate selection: token %s belongs to account %d %s/%d", a.Token,
+			return Session{}, fmt.Errorf("stage selection: token %s belongs to account %d %s/%d", a.Token,
 				terminalAccountID, terminalInstanceID, terminalGeneration)
 		}
-		return nil
+		if !bytes.Equal(terminalProvisional, a.FileProviderLease) {
+			return Session{}, fmt.Errorf("stage selection: token %s: %w", a.Token, ErrSessionLeaseConflict)
+		}
+		return sessionBySelectionToken(tx, a.Token)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("read selection terminal: %w", err)
+		return Session{}, fmt.Errorf("read selection terminal: %w", err)
+	}
+	staged, err := sessionBySelectionToken(tx, a.Token)
+	if err == nil {
+		if staged.AccountID != a.AccountID || staged.AccountInstanceID != a.ExpectedInstanceID ||
+			staged.AccountGeneration != a.ExpectedGeneration || staged.PID != a.Process.PID ||
+			!staged.ProcessStartedAt.Equal(a.Process.StartedAt) || staged.ConfigDir != a.ConfigDir ||
+			!bytes.Equal(staged.FileProviderLease, a.FileProviderLease) ||
+			!staged.LeaseExpiresAt.Equal(a.LeaseExpiresAt) {
+			return Session{}, ErrSessionLeaseConflict
+		}
+		return staged, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Session{}, err
 	}
 	var instanceID string
 	var generation uint64
@@ -1371,47 +1416,129 @@ func (s *Store) ActivateSelection(a SelectionActivation) (err error) {
 		`SELECT instance_id,generation FROM accounts WHERE id=? AND deleted_at IS NULL`, a.AccountID,
 	).Scan(&instanceID, &generation); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("activate selection account %d: %w", a.AccountID, ErrAccountNotFound)
+			return Session{}, fmt.Errorf("stage selection account %d: %w", a.AccountID, ErrAccountNotFound)
 		}
-		return fmt.Errorf("activate selection account %d: %w", a.AccountID, err)
+		return Session{}, fmt.Errorf("stage selection account %d: %w", a.AccountID, err)
 	}
 	if instanceID != a.ExpectedInstanceID || generation != a.ExpectedGeneration {
-		return fmt.Errorf("%w: account=%d reserved=%s/%d current=%s/%d", ErrAccountGenerationChanged,
+		return Session{}, fmt.Errorf("%w: account=%d reserved=%s/%d current=%s/%d", ErrAccountGenerationChanged,
 			a.AccountID, a.ExpectedInstanceID, a.ExpectedGeneration, instanceID, generation)
 	}
 	if _, removalErr := accountRemovalByID(tx, a.AccountID); removalErr == nil {
-		return fmt.Errorf("activate selection account %d: %w", a.AccountID, ErrAccountRemoving)
+		return Session{}, fmt.Errorf("stage selection account %d: %w", a.AccountID, ErrAccountRemoving)
 	} else if !errors.Is(removalErr, sql.ErrNoRows) {
-		return fmt.Errorf("read selection removal for account %d: %w", a.AccountID, removalErr)
+		return Session{}, fmt.Errorf("read selection removal for account %d: %w", a.AccountID, removalErr)
 	}
 	if err = selectionEligible(
 		tx, a.AccountID, a.ExpectedInstanceID, a.ExpectedGeneration, a.ConfigDir,
 	); err != nil {
-		return fmt.Errorf("activate selection account %d: %w", a.AccountID, err)
+		return Session{}, fmt.Errorf("stage selection account %d: %w", a.AccountID, err)
 	}
-	if a.RecordSticky && a.Cwd != "" {
-		if _, err = tx.Exec(upsertStickySQL, a.Cwd, a.AccountID, a.At.Unix()); err != nil {
-			return fmt.Errorf("activate selection sticky for %s: %w", a.Cwd, err)
+	result, err := tx.Exec(
+		`INSERT INTO sessions(selection_token,account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at,
+		 file_provider_lease_state,file_provider_lease_receipt,file_provider_lease_expires_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.Token, a.AccountID, instanceID, generation, a.Process.PID, a.Process.StartedAt.UnixMicro(), a.ConfigDir, a.Cwd,
+		a.At.Unix(), SessionLeasePending, []byte(a.FileProviderLease), a.LeaseExpiresAt.UTC().UnixNano())
+	if err != nil {
+		return Session{}, fmt.Errorf("stage selection session for account %d: %w", a.AccountID, err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return Session{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return Session{}, fmt.Errorf("commit selection staging: %w", err)
+	}
+	return Session{
+		ID: id, SelectionToken: a.Token, AccountID: a.AccountID, AccountInstanceID: instanceID,
+		AccountGeneration: generation, PID: a.Process.PID, ProcessStartedAt: a.Process.StartedAt,
+		ConfigDir: a.ConfigDir, Cwd: a.Cwd, StartedAt: a.At, LeaseState: SessionLeasePending,
+		FileProviderLease: cloneFileProviderLeaseReceipt(a.FileProviderLease), LeaseExpiresAt: a.LeaseExpiresAt.UTC(),
+	}, nil
+}
+
+// CommitSelection atomically promotes one staged session after FuseKit returns
+// the exact committed lease receipt.
+func (s *Store) CommitSelection(
+	token string,
+	provisional FileProviderLeaseReceipt,
+	committed FileProviderLeaseReceipt,
+	recordSticky bool,
+	at time.Time,
+) (err error) {
+	if err := validateSelectionToken(token); err != nil {
+		return err
+	}
+	if err := validateFileProviderLeaseReceipt(provisional); err != nil {
+		return err
+	}
+	if err := validateFileProviderLeaseReceipt(committed); err != nil {
+		return err
+	}
+	if at.IsZero() {
+		at = s.now()
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	terminalNow := s.now()
+	if err = pruneSelectionTerminals(tx, terminalNow); err != nil {
+		return err
+	}
+	var terminalProvisional, terminalCommitted []byte
+	err = tx.QueryRow(
+		`SELECT file_provider_provisional_lease_receipt,file_provider_committed_lease_receipt FROM selection_terminals WHERE token=?`, token,
+	).Scan(&terminalProvisional, &terminalCommitted)
+	if err == nil {
+		if bytes.Equal(terminalProvisional, provisional) && bytes.Equal(terminalCommitted, committed) {
+			return nil
+		}
+		return ErrSessionLeaseConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	staged, err := sessionBySelectionToken(tx, token)
+	if err != nil {
+		return err
+	}
+	if staged.LeaseState != SessionLeasePending || !bytes.Equal(staged.FileProviderLease, provisional) {
+		return ErrSessionLeaseConflict
+	}
+	result, err := tx.Exec(
+		`UPDATE sessions SET file_provider_lease_state=?,file_provider_lease_receipt=?
+		 WHERE id=? AND ended_at IS NULL AND file_provider_lease_state=? AND file_provider_lease_receipt=?`,
+		SessionLeaseActive, []byte(committed), staged.ID, SessionLeasePending, []byte(provisional),
+	)
+	if err != nil {
+		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		if err != nil {
+			return err
+		}
+		return ErrSessionLeaseConflict
+	}
+	if recordSticky && staged.Cwd != "" {
+		if _, err = tx.Exec(upsertStickySQL, staged.Cwd, staged.AccountID, at.Unix()); err != nil {
+			return err
 		}
 	}
 	if _, err = tx.Exec(
-		`INSERT INTO sessions(account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at)
-		 VALUES(?,?,?,?,?,?,?,?)`,
-		a.AccountID, instanceID, generation, a.Process.PID, a.Process.StartedAt.UnixMicro(), a.ConfigDir, a.Cwd, a.At.Unix()); err != nil {
-		return fmt.Errorf("activate selection session for account %d: %w", a.AccountID, err)
-	}
-	if _, err = tx.Exec(
-		`INSERT INTO selection_terminals(token,account_id,account_instance_id,account_generation,committed_at,expires_at) VALUES(?,?,?,?,?,?)`,
-		a.Token, a.AccountID, instanceID, generation, terminalNow.Unix(), terminalNow.Add(selectionTerminalTTL).Unix()); err != nil {
-		return fmt.Errorf("record selection terminal: %w", err)
+		`INSERT INTO selection_terminals(token,account_id,account_instance_id,account_generation,
+		 file_provider_provisional_lease_receipt,file_provider_committed_lease_receipt,committed_at,expires_at)
+		 VALUES(?,?,?,?,?,?,?,?)`, token, staged.AccountID, staged.AccountInstanceID, staged.AccountGeneration,
+		[]byte(provisional), []byte(committed), terminalNow.Unix(), terminalNow.Add(selectionTerminalTTL).Unix(),
+	); err != nil {
+		return err
 	}
 	if err = pruneSelectionTerminals(tx, terminalNow); err != nil {
-		return fmt.Errorf("bound selection terminals: %w", err)
+		return err
 	}
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit selection activation: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 // SelectionCommitted reports whether token's activation committed durably.
@@ -1460,11 +1587,50 @@ func validateSelectionToken(token string) error {
 	return nil
 }
 
-// CloseSession marks a session ended by id at time at.
-func (s *Store) CloseSession(id int64, at time.Time) error {
-	_, err := s.db.Exec(`UPDATE sessions SET ended_at=? WHERE id=? AND ended_at IS NULL`,
-		at.Unix(), id)
-	return err
+const activeSessionColumns = `id,selection_token,account_id,account_instance_id,account_generation,
+pid,process_started_at,config_dir,cwd,started_at,file_provider_lease_state,
+file_provider_lease_receipt,file_provider_lease_expires_at,lease_renewal_expires_at,last_seen_at`
+
+type sessionScanner interface {
+	Scan(...any) error
+}
+
+func scanSession(row sessionScanner) (Session, error) {
+	var session Session
+	var processStarted, started, leaseExpires int64
+	var leaseReceipt []byte
+	var renewalExpires, seen sql.NullInt64
+	err := row.Scan(
+		&session.ID, &session.SelectionToken, &session.AccountID, &session.AccountInstanceID,
+		&session.AccountGeneration, &session.PID, &processStarted, &session.ConfigDir, &session.Cwd,
+		&started, &session.LeaseState, &leaseReceipt, &leaseExpires, &renewalExpires, &seen,
+	)
+	if err != nil {
+		return Session{}, err
+	}
+	session.ProcessStartedAt = time.UnixMicro(processStarted)
+	session.StartedAt = time.Unix(started, 0)
+	session.FileProviderLease = cloneFileProviderLeaseReceipt(leaseReceipt)
+	session.LeaseExpiresAt = time.Unix(0, leaseExpires).UTC()
+	if renewalExpires.Valid {
+		value := time.Unix(0, renewalExpires.Int64).UTC()
+		session.LeaseRenewalExpiresAt = &value
+	}
+	if seen.Valid {
+		value := time.Unix(seen.Int64, 0)
+		session.LastSeenAt = &value
+	}
+	return session, nil
+}
+
+type sessionQueryer interface {
+	QueryRow(string, ...any) *sql.Row
+}
+
+func sessionBySelectionToken(queryer sessionQueryer, token string) (Session, error) {
+	return scanSession(queryer.QueryRow(
+		`SELECT `+activeSessionColumns+` FROM sessions WHERE selection_token=? AND ended_at IS NULL`, token,
+	))
 }
 
 // ActiveSessionCount returns the number of live sessions for an account.
@@ -1485,27 +1651,16 @@ func (s *Store) ActiveSessionTotal() (int, error) {
 // ListActiveSessions returns all live sessions across accounts.
 func (s *Store) ListActiveSessions() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id,account_id,account_instance_id,account_generation,pid,process_started_at,config_dir,cwd,started_at,last_seen_at
-		 FROM sessions WHERE ended_at IS NULL`)
+		`SELECT ` + activeSessionColumns + ` FROM sessions WHERE ended_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	var out []Session
 	for rows.Next() {
-		var se Session
-		var started int64
-		var processStarted int64
-		var seen sql.NullInt64
-		if err := rows.Scan(&se.ID, &se.AccountID, &se.AccountInstanceID, &se.AccountGeneration,
-			&se.PID, &processStarted, &se.ConfigDir, &se.Cwd, &started, &seen); err != nil {
+		se, err := scanSession(rows)
+		if err != nil {
 			return nil, err
-		}
-		se.ProcessStartedAt = time.UnixMicro(processStarted)
-		se.StartedAt = time.Unix(started, 0)
-		if seen.Valid {
-			t := time.Unix(seen.Int64, 0)
-			se.LastSeenAt = &t
 		}
 		out = append(out, se)
 	}
@@ -1522,41 +1677,164 @@ func (s *Store) touchSession(id int64, at time.Time) error {
 	return err
 }
 
-// CloseDeadSessions reconciles sessions against one atomic process snapshot.
+// ReconcileSessions partitions sessions against one atomic process snapshot.
 // An exact Claude identity is touched. An exact live non-Claude identity is
 // retained only during SessionReapGrace; an absent or reused identity closes
-// immediately. A dead row ends at its last-seen (or start), never observation
-// time, so an observer gap cannot fabricate recent activity.
-func (s *Store) CloseDeadSessions(claude, processes map[int]time.Time, at time.Time) (int, error) {
+// only after its File Provider lease is released by the caller.
+func (s *Store) ReconcileSessions(claude, processes map[int]time.Time, at time.Time) (SessionReconciliation, error) {
 	sessions, err := s.ListActiveSessions()
 	if err != nil {
-		return 0, err
+		return SessionReconciliation{}, err
 	}
-	closed := 0
+	var result SessionReconciliation
 	for _, se := range sessions {
-		if se.PID <= 0 {
+		if se.LeaseState == SessionLeaseReleased ||
+			(se.LeaseState == SessionLeasePending && !at.Before(se.LeaseExpiresAt)) {
+			result.Dead = append(result.Dead, se)
 			continue
 		}
 		if started, ok := claude[se.PID]; ok && started.Equal(se.ProcessStartedAt) {
 			if err := s.touchSession(se.ID, at); err != nil {
-				return closed, err
+				return SessionReconciliation{}, err
 			}
+			seen := at
+			se.LastSeenAt = &seen
+			result.Live = append(result.Live, se)
 			continue
 		}
 		if started, ok := processes[se.PID]; ok && started.Equal(se.ProcessStartedAt) &&
 			at.Sub(se.StartedAt) < SessionReapGrace {
+			result.Live = append(result.Live, se)
 			continue
 		}
-		end := se.StartedAt
-		if se.LastSeenAt != nil && se.LastSeenAt.After(end) {
-			end = *se.LastSeenAt
-		}
-		if err := s.CloseSession(se.ID, end); err != nil {
-			return closed, err
-		}
-		closed++
+		result.Dead = append(result.Dead, se)
 	}
-	return closed, nil
+	return result, nil
+}
+
+// PlanSessionLeaseRenewal durably chooses one exact renewal expiry. Retries
+// return the existing request until CompleteSessionLeaseRenewal settles it.
+func (s *Store) PlanSessionLeaseRenewal(id int64, receipt FileProviderLeaseReceipt, expires time.Time) (_ time.Time, err error) {
+	if err := validateFileProviderLeaseReceipt(receipt); err != nil {
+		return time.Time{}, err
+	}
+	if expires.IsZero() {
+		return time.Time{}, errors.New("session lease renewal expiry is required")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var current []byte
+	var state SessionLeaseState
+	var pending sql.NullInt64
+	err = tx.QueryRow(
+		`SELECT file_provider_lease_state,file_provider_lease_receipt,lease_renewal_expires_at FROM sessions WHERE id=? AND ended_at IS NULL`, id,
+	).Scan(&state, &current, &pending)
+	if errors.Is(err, sql.ErrNoRows) || state != SessionLeaseActive || !bytes.Equal(current, receipt) {
+		return time.Time{}, ErrSessionLeaseConflict
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	if pending.Valid {
+		return time.Unix(0, pending.Int64).UTC(), nil
+	}
+	expires = expires.UTC()
+	if _, err = tx.Exec(
+		`UPDATE sessions SET lease_renewal_expires_at=? WHERE id=? AND ended_at IS NULL
+		 AND file_provider_lease_state=? AND file_provider_lease_receipt=? AND lease_renewal_expires_at IS NULL`,
+		expires.UnixNano(), id, SessionLeaseActive, []byte(receipt),
+	); err != nil {
+		return time.Time{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return time.Time{}, err
+	}
+	return expires, nil
+}
+
+// CompleteSessionLeaseRenewal atomically replaces the exact receipt and clears
+// the matching pending renewal. Replaying an already completed response succeeds.
+func (s *Store) CompleteSessionLeaseRenewal(
+	id int64,
+	previous FileProviderLeaseReceipt,
+	renewed FileProviderLeaseReceipt,
+	expires time.Time,
+) error {
+	if err := validateFileProviderLeaseReceipt(previous); err != nil {
+		return err
+	}
+	if err := validateFileProviderLeaseReceipt(renewed); err != nil {
+		return err
+	}
+	if expires.IsZero() {
+		return errors.New("session lease renewal expiry is required")
+	}
+	result, err := s.db.Exec(
+		`UPDATE sessions SET file_provider_lease_receipt=?,file_provider_lease_expires_at=?,lease_renewal_expires_at=NULL
+		 WHERE id=? AND ended_at IS NULL AND file_provider_lease_state=?
+		 AND file_provider_lease_receipt=? AND lease_renewal_expires_at=?`,
+		[]byte(renewed), expires.UTC().UnixNano(), id, SessionLeaseActive, []byte(previous), expires.UTC().UnixNano(),
+	)
+	if err != nil {
+		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil {
+		return err
+	} else if changed == 1 {
+		return nil
+	}
+	var current []byte
+	var pending sql.NullInt64
+	err = s.db.QueryRow(
+		`SELECT file_provider_lease_receipt,lease_renewal_expires_at FROM sessions WHERE id=? AND ended_at IS NULL`, id,
+	).Scan(&current, &pending)
+	if err == nil && bytes.Equal(current, renewed) && !pending.Valid {
+		return nil
+	}
+	return ErrSessionLeaseConflict
+}
+
+// CompleteSessionLeaseRelease records the exact released receipt and only then
+// closes the session. Replaying the same release succeeds.
+func (s *Store) CompleteSessionLeaseRelease(
+	id int64,
+	previous FileProviderLeaseReceipt,
+	released FileProviderLeaseReceipt,
+	at time.Time,
+) error {
+	if err := validateFileProviderLeaseReceipt(previous); err != nil {
+		return err
+	}
+	if err := validateFileProviderLeaseReceipt(released); err != nil {
+		return err
+	}
+	if at.IsZero() {
+		return errors.New("session lease close time is required")
+	}
+	result, err := s.db.Exec(
+		`UPDATE sessions SET file_provider_lease_state=?,file_provider_lease_receipt=?,ended_at=?
+		 WHERE id=? AND ended_at IS NULL AND file_provider_lease_receipt=?`,
+		SessionLeaseReleased, []byte(released), at.Unix(), id, []byte(previous),
+	)
+	if err != nil {
+		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil {
+		return err
+	} else if changed == 1 {
+		return nil
+	}
+	var current []byte
+	var state SessionLeaseState
+	var ended sql.NullInt64
+	err = s.db.QueryRow(`SELECT file_provider_lease_state,file_provider_lease_receipt,ended_at FROM sessions WHERE id=?`, id).Scan(&state, &current, &ended)
+	if err == nil && state == SessionLeaseReleased && bytes.Equal(current, released) && ended.Valid {
+		return nil
+	}
+	return ErrSessionLeaseConflict
 }
 
 // GetCwdActivity aggregates tracked session activity for cwd on one account —

@@ -129,3 +129,30 @@ func (c *Client) PrepareTenant(
 ) (catalogproto.PrepareTenantResponse, error) {
 	return c.catalog.PrepareTenant(ctx, tenant, request)
 }
+
+// CommitFileProviderLease promotes one exact provisional readiness lease.
+func (c *Client) CommitFileProviderLease(
+	ctx context.Context,
+	tenant catalogproto.TenantID,
+	request catalogproto.CommitFileProviderLeaseRequest,
+) (catalogproto.CommitFileProviderLeaseResponse, error) {
+	return c.catalog.CommitFileProviderLease(ctx, tenant, request)
+}
+
+// RenewFileProviderLease extends one exact committed readiness lease.
+func (c *Client) RenewFileProviderLease(
+	ctx context.Context,
+	tenant catalogproto.TenantID,
+	request catalogproto.RenewFileProviderLeaseRequest,
+) (catalogproto.RenewFileProviderLeaseResponse, error) {
+	return c.catalog.RenewFileProviderLease(ctx, tenant, request)
+}
+
+// ReleaseFileProviderLease retires one exact readiness lease.
+func (c *Client) ReleaseFileProviderLease(
+	ctx context.Context,
+	tenant catalogproto.TenantID,
+	request catalogproto.ReleaseFileProviderLeaseRequest,
+) (catalogproto.ReleaseFileProviderLeaseResponse, error) {
+	return c.catalog.ReleaseFileProviderLease(ctx, tenant, request)
+}
