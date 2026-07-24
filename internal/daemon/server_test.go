@@ -44,10 +44,10 @@ func newDaemonTestManager(
 		t.Fatal(err)
 	}
 	owner := proc.Record{
-		RecoveryClass: proc.RecoveryTask,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		RecoveryID: pool.CredentialOwnerRecoveryID,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Executable: identity.Executable,
-		AuditToken: identity.AuditToken, Generation: "daemon-test",
+		AuditToken: identity.AuditToken, Generation: daemonTestGeneration("daemon-test"),
 	}
 	authority, err := pool.NewWorkerAuthority(
 		accountMutationTestTaskRunner{credentials: credentials, refresher: refresher},

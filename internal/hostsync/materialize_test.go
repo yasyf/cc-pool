@@ -1,6 +1,7 @@
 package hostsync
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -21,9 +22,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
-	"github.com/yasyf/synckit/rpc"
-	"github.com/yasyf/synckit/syncservice"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 const materializeManifest = "/cfg/synckit/manifests/cc-pool.json"
@@ -53,14 +52,16 @@ type inlineMaterializeTaskRunner struct {
 	credentials backingCredentials
 }
 
-func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task supervise.Task) error {
+func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
+	var output bytes.Buffer
 	switch {
 	case pool.IsBackingWorkerInvocation(task.Args):
-		return pool.RunBackingWorker(ctx, task.Stdin, task.Stdout)
+		err := pool.RunBackingWorker(ctx, bytes.NewReader(task.Stdin), &output)
+		return worker.CommandResult{Stdout: output.Bytes()}, err
 	case pool.IsCredentialCASWorkerInvocation(task.Args):
-		request, err := pool.DecodeCredentialCASRequest(task.Stdin)
+		request, err := pool.DecodeCredentialCASRequest(bytes.NewReader(task.Stdin))
 		if err != nil {
-			return err
+			return worker.CommandResult{}, err
 		}
 		account := store.Account{
 			ID: request.AccountID, ConfigDir: request.ConfigDir,
@@ -70,10 +71,10 @@ func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task supervis
 		if len(request.Credential) != 0 {
 			var credential creds.Credential
 			if err := json.Unmarshal(request.Credential, &credential); err != nil {
-				return err
+				return worker.CommandResult{}, err
 			}
 			if err := runner.credentials.Store(account, creds.SourceKeychain).Write(ctx, &credential); err != nil {
-				return err
+				return worker.CommandResult{}, err
 			}
 			digest := store.CredentialDigest(sha256.Sum256(request.Credential))
 			after.Keychain = store.CredentialSlotObservation{
@@ -81,17 +82,18 @@ func (runner inlineMaterializeTaskRunner) Run(ctx context.Context, task supervis
 			}
 		} else if request.Delete {
 			if err := runner.credentials.Store(account, creds.SourceKeychain).Delete(ctx); err != nil {
-				return err
+				return worker.CommandResult{}, err
 			}
 			after.Keychain = store.CredentialSlotObservation{State: store.CredentialSlotEmpty}
 		} else {
-			return errors.New("unsupported materialize test credential CAS mutation")
+			return worker.CommandResult{}, errors.New("unsupported materialize test credential CAS mutation")
 		}
-		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+		err = pool.WriteCredentialCASResponse(&output, pool.CredentialCASResponse{
 			Before: request.Expected, After: after,
 		})
+		return worker.CommandResult{Stdout: output.Bytes()}, err
 	default:
-		return errors.New("unexpected materialize test worker")
+		return worker.CommandResult{}, errors.New("unexpected materialize test worker")
 	}
 }
 
@@ -242,11 +244,14 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 	if err != nil {
 		t.Fatal(err)
 	}
+	ownerGenerationDigest := sha256.Sum256([]byte(t.Name()))
+	var ownerGeneration proc.OwnerGeneration
+	copy(ownerGeneration[:], ownerGenerationDigest[:len(ownerGeneration)])
 	owner := proc.Record{
-		RecoveryClass: proc.RecoveryTask,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		RecoveryID: pool.CredentialOwnerRecoveryID,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Executable: identity.Executable,
-		AuditToken: identity.AuditToken, Generation: "materialize-test",
+		AuditToken: identity.AuditToken, Generation: ownerGeneration,
 	}
 	fk := credstest.NewFake()
 	credentials := backingCredentials{fk}

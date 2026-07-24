@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -10,13 +11,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/accountterminal"
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 type accountMutationTestTaskRunner struct {
@@ -24,28 +26,37 @@ type accountMutationTestTaskRunner struct {
 	refresher   pool.Refresher
 }
 
-func (r accountMutationTestTaskRunner) Run(ctx context.Context, task supervise.Task) error {
+func (r accountMutationTestTaskRunner) Run(
+	ctx context.Context,
+	task worker.CommandRequest,
+) (worker.CommandResult, error) {
+	input := bytes.NewReader(task.Stdin)
+	var output bytes.Buffer
+	var err error
 	switch {
 	case pool.IsBackingWorkerInvocation(task.Args):
-		return pool.RunBackingWorker(ctx, task.Stdin, task.Stdout)
+		err = pool.RunBackingWorker(ctx, input, &output)
 	case pool.IsCredentialCASWorkerInvocation(task.Args):
-		return runDaemonTestCredentialCAS(ctx, task, r.credentials, r.refresher)
+		err = runDaemonTestCredentialCAS(ctx, input, &output, r.credentials, r.refresher)
 	case procscan.IsWorkerInvocation(task.Args):
-		return procscan.RunWorker(ctx, task.Stdin, task.Stdout)
+		err = procscan.RunWorker(ctx, input, &output)
+	default:
+		err = errors.New("unexpected account mutation test worker task")
 	}
-	return errors.New("unexpected account mutation test worker task")
+	return worker.CommandResult{Stdout: output.Bytes()}, err
 }
 
 func runDaemonTestCredentialCAS(
 	ctx context.Context,
-	task supervise.Task,
+	input io.Reader,
+	output io.Writer,
 	credentials pool.Credentials,
 	refresher pool.Refresher,
 ) error {
 	if credentials == nil {
 		return errors.New("daemon test credential CAS requires credentials")
 	}
-	request, err := pool.DecodeCredentialCASRequest(task.Stdin)
+	request, err := pool.DecodeCredentialCASRequest(input)
 	if err != nil {
 		return err
 	}
@@ -55,7 +66,7 @@ func runDaemonTestCredentialCAS(
 	}
 	before, err := daemonTestCredentialState(ctx, credentials, account)
 	if err != nil {
-		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{ErrorCode: "io", Error: err.Error()})
+		return pool.WriteCredentialCASResponse(output, pool.CredentialCASResponse{ErrorCode: "io", Error: err.Error()})
 	}
 	beforeDigest, err := before.Digest()
 	if err != nil {
@@ -66,22 +77,22 @@ func runDaemonTestCredentialCAS(
 		return err
 	}
 	if beforeDigest != expectedDigest {
-		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+		return pool.WriteCredentialCASResponse(output, pool.CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "conflict", Error: "credential changed before compare-and-swap",
 		})
 	}
 	if request.Refresh {
-		return runDaemonTestCredentialRefresh(ctx, task, credentials, refresher, account, request, before)
+		return runDaemonTestCredentialRefresh(ctx, output, credentials, refresher, account, request, before)
 	}
 	if request.Delete {
 		err = credentials.Store(account, creds.SourceKeychain).Delete(ctx)
 		after, observeErr := daemonTestCredentialState(ctx, credentials, account)
 		if err != nil || observeErr != nil {
-			return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+			return pool.WriteCredentialCASResponse(output, pool.CredentialCASResponse{
 				Before: before, After: after, ErrorCode: "io", Error: errors.Join(err, observeErr).Error(),
 			})
 		}
-		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{Before: before, After: after})
+		return pool.WriteCredentialCASResponse(output, pool.CredentialCASResponse{Before: before, After: after})
 	}
 	target := credentials.Store(account, creds.SourceKeychain)
 	var credential creds.Credential
@@ -90,16 +101,16 @@ func runDaemonTestCredentialCAS(
 	}
 	after, observeErr := daemonTestCredentialState(ctx, credentials, account)
 	if err != nil || observeErr != nil {
-		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+		return pool.WriteCredentialCASResponse(output, pool.CredentialCASResponse{
 			Before: before, After: after, ErrorCode: "io", Error: errors.Join(err, observeErr).Error(),
 		})
 	}
-	return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{Before: before, After: after})
+	return pool.WriteCredentialCASResponse(output, pool.CredentialCASResponse{Before: before, After: after})
 }
 
 func runDaemonTestCredentialRefresh(
 	ctx context.Context,
-	task supervise.Task,
+	output io.Writer,
 	credentials pool.Credentials,
 	refresher pool.Refresher,
 	account store.Account,
@@ -112,7 +123,7 @@ func runDaemonTestCredentialRefresh(
 	target := credentials.Store(account, creds.SourceKeychain)
 	previous, err := target.Read(ctx)
 	if err != nil {
-		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+		return pool.WriteCredentialCASResponse(output, pool.CredentialCASResponse{
 			Before: before, After: before, ErrorCode: "io", Error: err.Error(),
 		})
 	}
@@ -131,7 +142,7 @@ func runDaemonTestCredentialRefresh(
 		case errors.Is(err, oauth.ErrNetwork):
 			result.ErrorCode = "network"
 		}
-		return pool.WriteCredentialCASResponse(task.Stdout, result)
+		return pool.WriteCredentialCASResponse(output, result)
 	}
 	next := *previous
 	next.ClaudeAiOauth.AccessToken = response.AccessToken
@@ -145,11 +156,11 @@ func runDaemonTestCredentialRefresh(
 	}
 	after, observeErr := daemonTestCredentialState(ctx, credentials, account)
 	if err != nil || observeErr != nil {
-		return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+		return pool.WriteCredentialCASResponse(output, pool.CredentialCASResponse{
 			Before: before, After: after, ErrorCode: "io", Error: errors.Join(err, observeErr).Error(),
 		})
 	}
-	return pool.WriteCredentialCASResponse(task.Stdout, pool.CredentialCASResponse{
+	return pool.WriteCredentialCASResponse(output, pool.CredentialCASResponse{
 		Before: before, After: after, Credential: payload,
 	})
 }
@@ -196,8 +207,8 @@ func (accountMutationTestRefresher) Usage(context.Context, string) (*oauth.Usage
 type accountMutationTerminalRunnerFunc func(
 	context.Context,
 	store.AccountMutation,
-	supervise.TerminalInput,
-	supervise.TerminalSize,
+	accountterminal.TerminalInput,
+	accountterminal.TerminalSize,
 	<-chan wire.Chunk,
 	func(context.Context, []byte) error,
 ) error
@@ -210,9 +221,9 @@ type accountMutationTerminalStarter struct {
 func (s accountMutationTerminalStarter) Start(
 	context.Context,
 	store.AccountMutation,
-	supervise.TerminalSize,
+	accountterminal.TerminalSize,
 ) (accountMutationTerminal, error) {
-	s.terminal.start = func(supervise.TerminalInput) { close(s.started) }
+	s.terminal.start = func(accountterminal.TerminalInput) { close(s.started) }
 	return s.terminal, nil
 }
 
@@ -226,10 +237,10 @@ func (accountMutationTerminalStarter) LoginReady(
 func (f accountMutationTerminalRunnerFunc) Start(
 	ctx context.Context,
 	mutation store.AccountMutation,
-	size supervise.TerminalSize,
+	size accountterminal.TerminalSize,
 ) (accountMutationTerminal, error) {
 	terminal := newTestAccountMutationTerminal()
-	terminal.start = func(first supervise.TerminalInput) {
+	terminal.start = func(first accountterminal.TerminalInput) {
 		input := make(chan wire.Chunk)
 		close(input)
 		err := f(
@@ -239,8 +250,8 @@ func (f accountMutationTerminalRunnerFunc) Start(
 				return nil
 			},
 		)
-		outcome := supervise.TerminalOutcome{
-			Kind: supervise.TerminalExited, Digest: [32]byte{1},
+		outcome := accountterminal.TerminalOutcome{
+			Kind: accountterminal.TerminalExited, Digest: [32]byte{1},
 		}
 		if err != nil {
 			outcome.ExitCode = 1
@@ -262,14 +273,14 @@ type testAccountMutationTerminal struct {
 	startOnce   sync.Once
 	settleOnce  sync.Once
 	retireOnce  sync.Once
-	start       func(supervise.TerminalInput)
-	outputs     []supervise.TerminalOutput
+	start       func(accountterminal.TerminalInput)
+	outputs     []accountterminal.TerminalOutput
 	notify      chan struct{}
 	settled     chan struct{}
 	retired     chan struct{}
-	outcome     supervise.TerminalOutcome
+	outcome     accountterminal.TerminalOutcome
 	err         error
-	inputs      []supervise.TerminalInput
+	inputs      []accountterminal.TerminalInput
 	controller  *testAccountMutationAttachment
 	attachments map[*testAccountMutationAttachment]struct{}
 }
@@ -289,7 +300,7 @@ func newTestAccountMutationTerminal() *testAccountMutationTerminal {
 
 func (t *testAccountMutationTerminal) Attach(
 	ctx context.Context,
-	spec supervise.TerminalAttachmentSpec,
+	spec accountterminal.TerminalAttachmentSpec,
 ) (accountMutationTerminalAttachment, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -300,7 +311,7 @@ func (t *testAccountMutationTerminal) Attach(
 	if spec.Cursor != nil {
 		cursor = spec.Cursor.NextSequence
 		if cursor > uint64(len(t.outputs)) {
-			return nil, supervise.ErrTerminalOutputCursor
+			return nil, accountterminal.ErrTerminalOutputCursor
 		}
 	}
 	attachment := &testAccountMutationAttachment{terminal: t, cursor: cursor}
@@ -309,20 +320,20 @@ func (t *testAccountMutationTerminal) Attach(
 }
 
 func (t *testAccountMutationTerminal) Cancel(context.Context) error {
-	t.settle(supervise.TerminalOutcome{
-		Kind: supervise.TerminalCanceled, Digest: [32]byte{1},
+	t.settle(accountterminal.TerminalOutcome{
+		Kind: accountterminal.TerminalCanceled, Digest: [32]byte{1},
 	}, nil)
 	return nil
 }
 
-func (t *testAccountMutationTerminal) Wait(ctx context.Context) (supervise.TerminalOutcome, error) {
+func (t *testAccountMutationTerminal) Wait(ctx context.Context) (accountterminal.TerminalOutcome, error) {
 	select {
 	case <-t.settled:
 		t.mu.Lock()
 		defer t.mu.Unlock()
 		return t.outcome, t.err
 	case <-ctx.Done():
-		return supervise.TerminalOutcome{}, ctx.Err()
+		return accountterminal.TerminalOutcome{}, ctx.Err()
 	}
 }
 
@@ -335,10 +346,10 @@ func (t *testAccountMutationTerminal) Acknowledge(
 	select {
 	case <-t.settled:
 	default:
-		return supervise.ErrTerminalSettled
+		return accountterminal.ErrTerminalSettled
 	}
 	if digest != t.outcome.Digest {
-		return supervise.ErrTerminalOutcomeMismatch
+		return accountterminal.ErrTerminalOutcomeMismatch
 	}
 	if len(t.attachments) != 0 {
 		return errors.New("terminal attachments remain during acknowledgement")
@@ -353,7 +364,7 @@ func (t *testAccountMutationTerminal) Retired() <-chan struct{} {
 
 func (t *testAccountMutationTerminal) publish(payload []byte) {
 	t.mu.Lock()
-	t.outputs = append(t.outputs, supervise.TerminalOutput{
+	t.outputs = append(t.outputs, accountterminal.TerminalOutput{
 		Sequence: uint64(len(t.outputs)), Data: append([]byte(nil), payload...),
 	})
 	t.mu.Unlock()
@@ -363,7 +374,7 @@ func (t *testAccountMutationTerminal) publish(payload []byte) {
 	}
 }
 
-func (t *testAccountMutationTerminal) settle(outcome supervise.TerminalOutcome, err error) {
+func (t *testAccountMutationTerminal) settle(outcome accountterminal.TerminalOutcome, err error) {
 	t.settleOnce.Do(func() {
 		t.mu.Lock()
 		t.outcome, t.err = outcome, err
@@ -378,46 +389,46 @@ func (t *testAccountMutationTerminal) settle(outcome supervise.TerminalOutcome, 
 
 func (a *testAccountMutationAttachment) ClaimControl(
 	_ context.Context,
-	_ supervise.TerminalDisconnectPolicy,
+	_ accountterminal.TerminalDisconnectPolicy,
 	_ time.Duration,
-) (supervise.TerminalControllerLease, error) {
+) (accountterminal.TerminalControllerLease, error) {
 	a.terminal.mu.Lock()
 	defer a.terminal.mu.Unlock()
 	if a.closed {
-		return supervise.TerminalControllerLease{}, supervise.ErrTerminalDetached
+		return accountterminal.TerminalControllerLease{}, accountterminal.ErrTerminalDetached
 	}
 	select {
 	case <-a.terminal.settled:
-		return supervise.TerminalControllerLease{}, supervise.ErrTerminalSettled
+		return accountterminal.TerminalControllerLease{}, accountterminal.ErrTerminalSettled
 	default:
 	}
 	if a.terminal.controller != nil && a.terminal.controller != a {
-		return supervise.TerminalControllerLease{}, supervise.ErrTerminalControllerAttached
+		return accountterminal.TerminalControllerLease{}, accountterminal.ErrTerminalControllerAttached
 	}
 	a.terminal.controller = a
-	return supervise.TerminalControllerLease{Fence: 1, Expires: time.Now().Add(time.Minute)}, nil
+	return accountterminal.TerminalControllerLease{Fence: 1, Expires: time.Now().Add(time.Minute)}, nil
 }
 
 func (a *testAccountMutationAttachment) RenewControl(
 	context.Context,
-) (supervise.TerminalControllerLease, error) {
+) (accountterminal.TerminalControllerLease, error) {
 	a.terminal.mu.Lock()
 	defer a.terminal.mu.Unlock()
 	if a.closed || a.terminal.controller != a {
-		return supervise.TerminalControllerLease{}, supervise.ErrTerminalNotController
+		return accountterminal.TerminalControllerLease{}, accountterminal.ErrTerminalNotController
 	}
-	return supervise.TerminalControllerLease{Fence: 1, Expires: time.Now().Add(time.Minute)}, nil
+	return accountterminal.TerminalControllerLease{Fence: 1, Expires: time.Now().Add(time.Minute)}, nil
 }
 
 func (a *testAccountMutationAttachment) Send(
 	_ context.Context,
-	event supervise.TerminalInput,
+	event accountterminal.TerminalInput,
 ) error {
 	a.terminal.mu.Lock()
 	controller := !a.closed && a.terminal.controller == a
 	a.terminal.mu.Unlock()
 	if !controller {
-		return supervise.ErrTerminalNotController
+		return accountterminal.ErrTerminalNotController
 	}
 	a.terminal.mu.Lock()
 	a.terminal.inputs = append(a.terminal.inputs, event)
@@ -428,12 +439,12 @@ func (a *testAccountMutationAttachment) Send(
 
 func (a *testAccountMutationAttachment) Receive(
 	ctx context.Context,
-) (supervise.TerminalOutput, error) {
+) (accountterminal.TerminalOutput, error) {
 	for {
 		a.terminal.mu.Lock()
 		if a.closed {
 			a.terminal.mu.Unlock()
-			return supervise.TerminalOutput{}, supervise.ErrTerminalDetached
+			return accountterminal.TerminalOutput{}, accountterminal.ErrTerminalDetached
 		}
 		if a.cursor < uint64(len(a.terminal.outputs)) {
 			output := a.terminal.outputs[a.cursor]
@@ -446,7 +457,7 @@ func (a *testAccountMutationAttachment) Receive(
 		select {
 		case <-settled:
 			a.terminal.mu.Unlock()
-			return supervise.TerminalOutput{}, io.EOF
+			return accountterminal.TerminalOutput{}, io.EOF
 		default:
 		}
 		a.terminal.mu.Unlock()
@@ -455,7 +466,7 @@ func (a *testAccountMutationAttachment) Receive(
 			continue
 		case <-notify:
 		case <-ctx.Done():
-			return supervise.TerminalOutput{}, ctx.Err()
+			return accountterminal.TerminalOutput{}, ctx.Err()
 		}
 	}
 }

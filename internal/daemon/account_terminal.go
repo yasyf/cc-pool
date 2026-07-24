@@ -9,11 +9,10 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/accountterminal"
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -24,14 +23,14 @@ const (
 )
 
 type accountMutationTerminalRunner interface {
-	Start(context.Context, store.AccountMutation, supervise.TerminalSize) (accountMutationTerminal, error)
+	Start(context.Context, store.AccountMutation, accountterminal.TerminalSize) (accountMutationTerminal, error)
 	LoginReady(context.Context, store.AccountMutation) (bool, error)
 }
 
 type accountMutationTerminal interface {
-	Attach(context.Context, supervise.TerminalAttachmentSpec) (accountMutationTerminalAttachment, error)
+	Attach(context.Context, accountterminal.TerminalAttachmentSpec) (accountMutationTerminalAttachment, error)
 	Cancel(context.Context) error
-	Wait(context.Context) (supervise.TerminalOutcome, error)
+	Wait(context.Context) (accountterminal.TerminalOutcome, error)
 	Acknowledge(context.Context, [32]byte) error
 	Retired() <-chan struct{}
 }
@@ -39,31 +38,31 @@ type accountMutationTerminal interface {
 type accountMutationTerminalAttachment interface {
 	ClaimControl(
 		context.Context,
-		supervise.TerminalDisconnectPolicy,
+		accountterminal.TerminalDisconnectPolicy,
 		time.Duration,
-	) (supervise.TerminalControllerLease, error)
-	RenewControl(context.Context) (supervise.TerminalControllerLease, error)
-	Send(context.Context, supervise.TerminalInput) error
-	Receive(context.Context) (supervise.TerminalOutput, error)
+	) (accountterminal.TerminalControllerLease, error)
+	RenewControl(context.Context) (accountterminal.TerminalControllerLease, error)
+	Send(context.Context, accountterminal.TerminalInput) error
+	Receive(context.Context) (accountterminal.TerminalOutput, error)
 	Close() error
 }
 
-type daemonkitAccountMutationTerminalRunner struct {
-	workers *supervise.Pool
-	manager *pool.Manager
+type managedAccountMutationTerminalRunner struct {
+	terminals *accountterminal.Manager
+	manager   *pool.Manager
 }
 
-type daemonkitAccountMutationTerminal struct {
-	terminal *supervise.Terminal
+type managedAccountMutationTerminal struct {
+	terminal *accountterminal.Terminal
 }
 
-func (r daemonkitAccountMutationTerminalRunner) Start(
+func (r managedAccountMutationTerminalRunner) Start(
 	ctx context.Context,
 	mutation store.AccountMutation,
-	size supervise.TerminalSize,
+	size accountterminal.TerminalSize,
 ) (accountMutationTerminal, error) {
-	if r.workers == nil || r.manager == nil {
-		return nil, errors.New("daemonkit terminal worker pool is unavailable")
+	if r.terminals == nil || r.manager == nil {
+		return nil, errors.New("account terminal manager is unavailable")
 	}
 	args := []string{"auth", "login"}
 	if mutation.Kind == store.AccountMutationRelogin ||
@@ -78,23 +77,22 @@ func (r daemonkitAccountMutationTerminalRunner) Start(
 			args = append(args, "--email", identity.EmailAddress)
 		}
 	}
-	terminal, err := r.workers.StartTerminal(ctx, supervise.TerminalSpec{
-		RecoveryClass: proc.RecoveryTask,
+	terminal, err := r.terminals.Start(ctx, accountterminal.TerminalSpec{
 		Path:          "claude",
 		Args:          args,
 		Dir:           mutation.ConfigDir,
 		Env: accountMutationTerminalEnv(
 			os.Environ(), mutation.ConfigDir, filepath.Join(pool.ClaudeDir(), "plugins"),
 		),
-		Size: size, AttachTimeout: supervise.DefaultTerminalAttachTimeout,
+		Size: size, AttachTimeout: accountterminal.DefaultTerminalAttachTimeout,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return daemonkitAccountMutationTerminal{terminal: terminal}, nil
+	return managedAccountMutationTerminal{terminal: terminal}, nil
 }
 
-func (r daemonkitAccountMutationTerminalRunner) LoginReady(
+func (r managedAccountMutationTerminalRunner) LoginReady(
 	ctx context.Context,
 	mutation store.AccountMutation,
 ) (bool, error) {
@@ -129,28 +127,28 @@ func (r daemonkitAccountMutationTerminalRunner) LoginReady(
 	return true, nil
 }
 
-func (t daemonkitAccountMutationTerminal) Attach(
+func (t managedAccountMutationTerminal) Attach(
 	ctx context.Context,
-	spec supervise.TerminalAttachmentSpec,
+	spec accountterminal.TerminalAttachmentSpec,
 ) (accountMutationTerminalAttachment, error) {
 	return t.terminal.Attach(ctx, spec)
 }
 
-func (t daemonkitAccountMutationTerminal) Cancel(ctx context.Context) error {
+func (t managedAccountMutationTerminal) Cancel(ctx context.Context) error {
 	return t.terminal.Cancel(ctx)
 }
 
-func (t daemonkitAccountMutationTerminal) Wait(
+func (t managedAccountMutationTerminal) Wait(
 	ctx context.Context,
-) (supervise.TerminalOutcome, error) {
+) (accountterminal.TerminalOutcome, error) {
 	return t.terminal.Wait(ctx)
 }
 
-func (t daemonkitAccountMutationTerminal) Acknowledge(ctx context.Context, digest [32]byte) error {
+func (t managedAccountMutationTerminal) Acknowledge(ctx context.Context, digest [32]byte) error {
 	return t.terminal.Acknowledge(ctx, digest)
 }
 
-func (t daemonkitAccountMutationTerminal) Retired() <-chan struct{} {
+func (t managedAccountMutationTerminal) Retired() <-chan struct{} {
 	return t.terminal.Retired()
 }
 
@@ -159,9 +157,9 @@ func waitAccountMutationTerminal(
 	runner accountMutationTerminalRunner,
 	terminal accountMutationTerminal,
 	mutation store.AccountMutation,
-) (supervise.TerminalOutcome, error) {
+) (accountterminal.TerminalOutcome, error) {
 	type terminalWait struct {
-		outcome supervise.TerminalOutcome
+		outcome accountterminal.TerminalOutcome
 		err     error
 	}
 	waitDone := make(chan terminalWait, 1)
@@ -209,19 +207,19 @@ func waitAccountMutationTerminal(
 	}
 }
 
-func accountMutationTerminalOutcome(outcome supervise.TerminalOutcome, err error) error {
+func accountMutationTerminalOutcome(outcome accountterminal.TerminalOutcome, err error) error {
 	if err != nil {
 		return err
 	}
 	switch outcome.Kind {
-	case supervise.TerminalExited:
+	case accountterminal.TerminalExited:
 		if outcome.ExitCode == 0 {
 			return nil
 		}
 		return fmt.Errorf("claude auth login exited with status %d", outcome.ExitCode)
-	case supervise.TerminalSignaled:
+	case accountterminal.TerminalSignaled:
 		return fmt.Errorf("claude auth login terminated by %s", outcome.Signal)
-	case supervise.TerminalCanceled:
+	case accountterminal.TerminalCanceled:
 		return errors.New("claude auth login was cancelled")
 	default:
 		return errors.New("claude auth login returned an invalid terminal outcome")
@@ -246,64 +244,64 @@ func hasEnvKey(value, key string) bool {
 	return len(value) > len(key) && value[:len(key)] == key && value[len(key)] == '='
 }
 
-func encodeAccountTerminalInput(event supervise.TerminalInput) ([]byte, error) {
+func encodeAccountTerminalInput(event accountterminal.TerminalInput) ([]byte, error) {
 	switch event.Kind {
-	case supervise.TerminalInputBytes:
-		if len(event.Data) == 0 || len(event.Data) > supervise.TerminalChunkSize-1 {
+	case accountterminal.TerminalInputBytes:
+		if len(event.Data) == 0 || len(event.Data) > accountterminal.TerminalChunkSize-1 {
 			return nil, errors.New("terminal byte input is empty or oversized")
 		}
 		return append([]byte{accountTerminalBytes}, event.Data...), nil
-	case supervise.TerminalInputResize:
+	case accountterminal.TerminalInputResize:
 		payload := make([]byte, 5)
 		payload[0] = accountTerminalResize
 		binary.BigEndian.PutUint16(payload[1:3], event.Size.Rows)
 		binary.BigEndian.PutUint16(payload[3:5], event.Size.Cols)
 		return payload, nil
-	case supervise.TerminalInputEOF:
+	case accountterminal.TerminalInputEOF:
 		return []byte{accountTerminalEOF}, nil
 	default:
 		return nil, errors.New("unknown terminal input kind")
 	}
 }
 
-func decodeAccountTerminalInput(chunk wire.Chunk) (supervise.TerminalInput, error) {
+func decodeAccountTerminalInput(chunk wire.Chunk) (accountterminal.TerminalInput, error) {
 	if chunk.End && len(chunk.Payload) == 0 {
-		return supervise.TerminalInput{Kind: supervise.TerminalInputEOF}, nil
+		return accountterminal.TerminalInput{Kind: accountterminal.TerminalInputEOF}, nil
 	}
 	if len(chunk.Payload) == 0 {
-		return supervise.TerminalInput{}, nil
+		return accountterminal.TerminalInput{}, nil
 	}
 	switch chunk.Payload[0] {
 	case accountTerminalBytes:
-		if len(chunk.Payload) == 1 || len(chunk.Payload) > supervise.TerminalChunkSize {
-			return supervise.TerminalInput{}, errors.New("terminal byte input is empty or oversized")
+		if len(chunk.Payload) == 1 || len(chunk.Payload) > accountterminal.TerminalChunkSize {
+			return accountterminal.TerminalInput{}, errors.New("terminal byte input is empty or oversized")
 		}
-		return supervise.TerminalInput{
-			Kind: supervise.TerminalInputBytes, Data: append([]byte(nil), chunk.Payload[1:]...),
+		return accountterminal.TerminalInput{
+			Kind: accountterminal.TerminalInputBytes, Data: append([]byte(nil), chunk.Payload[1:]...),
 		}, nil
 	case accountTerminalResize:
 		if len(chunk.Payload) != 5 {
-			return supervise.TerminalInput{}, errors.New("terminal resize input is malformed")
+			return accountterminal.TerminalInput{}, errors.New("terminal resize input is malformed")
 		}
-		return supervise.TerminalInput{
-			Kind: supervise.TerminalInputResize,
-			Size: supervise.TerminalSize{
+		return accountterminal.TerminalInput{
+			Kind: accountterminal.TerminalInputResize,
+			Size: accountterminal.TerminalSize{
 				Rows: binary.BigEndian.Uint16(chunk.Payload[1:3]),
 				Cols: binary.BigEndian.Uint16(chunk.Payload[3:5]),
 			},
 		}, nil
 	case accountTerminalEOF:
 		if len(chunk.Payload) != 1 {
-			return supervise.TerminalInput{}, errors.New("terminal EOF input is malformed")
+			return accountterminal.TerminalInput{}, errors.New("terminal EOF input is malformed")
 		}
-		return supervise.TerminalInput{Kind: supervise.TerminalInputEOF}, nil
+		return accountterminal.TerminalInput{Kind: accountterminal.TerminalInputEOF}, nil
 	default:
-		return supervise.TerminalInput{}, errors.New("terminal input kind is unknown")
+		return accountterminal.TerminalInput{}, errors.New("terminal input kind is unknown")
 	}
 }
 
-func encodeAccountTerminalOutput(output supervise.TerminalOutput) ([]byte, error) {
-	if len(output.Data) == 0 || len(output.Data) > supervise.TerminalChunkSize {
+func encodeAccountTerminalOutput(output accountterminal.TerminalOutput) ([]byte, error) {
+	if len(output.Data) == 0 || len(output.Data) > accountterminal.TerminalChunkSize {
 		return nil, errors.New("terminal output is empty or oversized")
 	}
 	payload := make([]byte, 8+len(output.Data))

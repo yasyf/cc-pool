@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/workerexec"
 	"github.com/yasyf/daemonkit/worker"
-	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
 
@@ -42,7 +42,6 @@ const (
 	workerReconcile    workerOperation = "reconcile"
 	workerExport       workerOperation = "export"
 	workerApply        workerOperation = "apply"
-	workerFetch        workerOperation = "fetch-credential"
 	workerAuthKind     workerOperation = "auth-kind"
 )
 
@@ -73,15 +72,12 @@ type workerAuthKindParams struct {
 // the disposable child.
 type WorkerRuntime struct {
 	Consumer syncservice.SyncConsumer
-	Fetch    rpc.Handler
 	AuthKind func(context.Context, int, string) (store.AuthKind, error)
 }
 
 // WorkerRuntimeScope owns operation-specific resources until run returns.
-// needsTransport is true only for operations that can contact another host.
 type WorkerRuntimeScope func(
 	ctx context.Context,
-	needsTransport bool,
 	run func(WorkerRuntime) error,
 ) error
 
@@ -139,13 +135,6 @@ func (c *WorkerClient) Apply(ctx context.Context, change syncservice.ChangeEnvel
 	return result, err
 }
 
-// FetchCredentialHandler executes one complete credential fetch in a disposable child.
-func (c *WorkerClient) FetchCredentialHandler(ctx context.Context, params map[string]any) (any, error) {
-	var result any
-	err := c.do(ctx, workerFetch, params, &result)
-	return result, err
-}
-
 // AuthKind classifies one account from child-owned registry and credential reads.
 func (c *WorkerClient) AuthKind(ctx context.Context, accountID int, uuid string) (store.AuthKind, error) {
 	var result store.AuthKind
@@ -178,9 +167,13 @@ func (c *WorkerClient) do(ctx context.Context, operation workerOperation, params
 	if err := writeWorkerFrame(&framed, request); err != nil {
 		return err
 	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return errors.New("hostsync: resolve exact worker home")
+	}
 	command, runErr := c.runner.Run(ctx, worker.CommandRequest{
 		Path: c.executable, Dir: workerexec.TempDir(), Args: []string{hostSyncWorkerArgument},
-		Stdin: framed.Bytes(), TotalTimeout: c.timeout,
+		Env: []string{"HOME=" + home}, Stdin: framed.Bytes(), TotalTimeout: c.timeout,
 	})
 	if runErr != nil {
 		return fmt.Errorf("hostsync: %s worker: %w: %s", operation, runErr, string(command.Stderr))
@@ -238,8 +231,8 @@ func RunWorker(ctx context.Context, input io.Reader, output io.Writer, scope Wor
 		return errors.New("hostsync: worker protocol mismatch")
 	}
 	var result any
-	err := scope(ctx, workerNeedsTransport(request.Operation), func(runtime WorkerRuntime) error {
-		if runtime.Consumer == nil || runtime.Fetch == nil || runtime.AuthKind == nil {
+	err := scope(ctx, func(runtime WorkerRuntime) error {
+		if runtime.Consumer == nil || runtime.AuthKind == nil {
 			return errors.New("hostsync: complete worker runtime is required")
 		}
 		var executeErr error
@@ -268,10 +261,6 @@ func RunWorker(ctx context.Context, input io.Reader, output io.Writer, scope Wor
 		}
 	}
 	return writeWorkerFrame(output, response)
-}
-
-func workerNeedsTransport(operation workerOperation) bool {
-	return operation == workerReconcile || operation == workerApply
 }
 
 func executeWorkerOperation(ctx context.Context, runtime WorkerRuntime, request workerRequest) (any, error) {
@@ -304,12 +293,6 @@ func executeWorkerOperation(ctx context.Context, runtime WorkerRuntime, request 
 			return nil, err
 		}
 		return runtime.Consumer.Apply(ctx, params)
-	case workerFetch:
-		var params map[string]any
-		if err := decodeExactJSON(request.Params, &params); err != nil {
-			return nil, err
-		}
-		return runtime.Fetch(ctx, params)
 	case workerAuthKind:
 		var params workerAuthKindParams
 		if err := decodeExactJSON(request.Params, &params); err != nil {

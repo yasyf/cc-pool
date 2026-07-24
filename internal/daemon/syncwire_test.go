@@ -17,8 +17,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
-	daemonproc "github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/syncservice"
 )
@@ -53,22 +51,7 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 		cl:           newClaims(),
 		led:          newLedgers(),
 	}
-	reaper := &daemonproc.Reaper{
-		Store:      &daemonproc.FileStore{Path: filepath.Join(home, "workers.json")},
-		Generation: "syncwire-test",
-	}
-	workers, err := supervise.NewPool(2, reaper)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.disposableWorkers = workers
-	t.Cleanup(func() {
-		workers.Close()
-		workers.Cancel()
-		if err := workers.Wait(context.Background()); err != nil {
-			t.Errorf("wait disposable workers: %v", err)
-		}
-	})
+	s.disposableWorkers = activatedDaemonTestWorkers(t, 2)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); s.wg.Wait() })
 	return s, ctx

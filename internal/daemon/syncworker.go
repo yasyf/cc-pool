@@ -16,9 +16,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/synckit/converge"
-	"github.com/yasyf/synckit/syncservice"
 )
 
 type hostSyncWorkerSessions struct {
@@ -176,14 +173,13 @@ func (r *hostSyncWorkerRemover) Close() error {
 }
 
 // RunHostSyncWorker reconstructs and executes one complete host-sync operation
-// inside the already tracked disposable process group.
+// inside one daemonkit-owned disposable command.
 func RunHostSyncWorker(
 	ctx context.Context,
-	owner proc.Record,
 	input io.Reader,
 	output io.Writer,
 ) (err error) {
-	manager, err := pool.OpenHostSyncWorker(ctx, owner)
+	manager, err := pool.OpenHostSyncWorker(ctx)
 	if err != nil {
 		return err
 	}
@@ -199,19 +195,9 @@ func RunHostSyncWorker(
 	logger := log.New(os.Stderr, "[cc-pool-hostsync] ", log.LstdFlags)
 	return hostsync.RunWorker(ctx, input, output, func(
 		scopeCtx context.Context,
-		needsTransport bool,
 		run func(hostsync.WorkerRuntime) error,
 	) error {
-		if needsTransport {
-			return syncservice.WithTransportRunner(scopeCtx, func(runner syncservice.TransportRunner) error {
-				runtime, err := newHostSyncWorkerRuntime(scopeCtx, manager, remover, manifestPath, logger, runner)
-				if err != nil {
-					return err
-				}
-				return run(runtime)
-			})
-		}
-		runtime, err := newHostSyncWorkerRuntime(scopeCtx, manager, remover, manifestPath, logger, nil)
+		runtime, err := newHostSyncWorkerRuntime(scopeCtx, manager, remover, manifestPath, logger)
 		if err != nil {
 			return err
 		}
@@ -225,7 +211,6 @@ func newHostSyncWorkerRuntime(
 	remover *hostSyncWorkerRemover,
 	manifestPath string,
 	logger *log.Logger,
-	runner syncservice.TransportRunner,
 ) (hostsync.WorkerRuntime, error) {
 	self, err := (&Server{m: manager, log: logger}).resolveSyncSelf(ctx)
 	if err != nil {
@@ -255,36 +240,26 @@ func newHostSyncWorkerRuntime(
 		Sessions: hostSyncWorkerSessions{manager: manager},
 		Remover:  remover,
 		Preparer: remover,
-		Status:   converge.NewPeerStatus(),
 		Run:      manager.RunHostSyncCommand,
 	}
-	// Only reconcile and sync receive a runner; inbound read/serve operations
-	// must not contend with the caller's peer-transport owner.
-	if runner != nil {
-		fetcher, err := hostsync.NewSSHFetcher(runner)
-		if err != nil {
-			return hostsync.WorkerRuntime{}, err
-		}
-		service.Fetcher = fetcher
-		peerTransport := func(peer string) syncservice.Transport {
-			return hostsync.PeerTransport(runner, peer)
-		}
-		pull := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, localExpiresAt int64, peers []string) (*creds.Credential, error) {
-			return hostsync.FetchCredential(ctx, peerTransport, uuid, chain, localExpiresAt, peers)
-		}
-		service.Driver = hostsync.NewDriver(service, hostsync.DriverDeps{
-			Store: manager.Store,
-			Cred:  manager,
-			Materialize: func(ctx context.Context, value hostsync.AccountValue, peers []string) (hostsync.MaterializeResult, error) {
-				noLocal := func(ctx context.Context, uuid string, chain hostsync.ChainStamp, peers []string) (*creds.Credential, error) {
-					return pull(ctx, uuid, chain, 0, peers)
-				}
-				return service.Materialize(ctx, value, peers, noLocal, manifestPath)
+	service.CredentialSnapshot = func(ctx context.Context, registry hostsync.Registry) (map[string]hostsync.CredentialEnvelope, error) {
+		return hostsync.BuildCredentialSnapshot(
+			ctx, registry, self, manager.Store.GetAccountByUUID,
+			func(ctx context.Context, account store.Account) (*creds.Credential, error) {
+				credential, _, err := manager.ReadCredential(ctx, account)
+				return credential, err
 			},
-			Admit: service.AdmitSyncedAccount,
-			Pull:  pull,
-		})
+		)
 	}
+	service.Driver = hostsync.NewDriver(service, hostsync.DriverDeps{
+		Store: manager.Store,
+		Cred:  manager,
+		Materialize: func(ctx context.Context, value hostsync.AccountValue, credential *creds.Credential) (hostsync.MaterializeResult, error) {
+			return service.Materialize(ctx, value, credential, manifestPath)
+		},
+		Admit:   service.AdmitSyncedAccount,
+		Resolve: hostsync.ResolveAppliedCredential,
+	})
 	enabled := func() (bool, error) {
 		value, ok, err := manager.Store.GetMeta(metaSyncEnabled)
 		if err != nil {
@@ -293,16 +268,8 @@ func newHostSyncWorkerRuntime(
 		return ok && value == "1", nil
 	}
 	consumer := hostsync.NewConsumer(service, enabled)
-	fetch := hostsync.NewFetchCredentialHandler(
-		manager.Store.GetAccountByUUID,
-		func(ctx context.Context, account store.Account) (*creds.Credential, error) {
-			credential, _, err := manager.EnsureFreshToken(ctx, account, 0, false)
-			return credential, err
-		},
-	)
 	return hostsync.WorkerRuntime{
 		Consumer: consumer,
-		Fetch:    fetch,
 		AuthKind: func(ctx context.Context, accountID int, uuid string) (store.AuthKind, error) {
 			value, ok, err := manager.Store.GetMeta(metaSyncEnabled)
 			if err != nil {

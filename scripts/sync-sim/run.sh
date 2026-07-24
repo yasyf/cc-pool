@@ -420,13 +420,6 @@ scenario_1_materialize() {
   [ "$(hrun a "$BIN/seed" hash --id 1)" = "$(hrun b "$BIN/seed" hash --id 1)" ] || fail "AccessHash a != b"
   ok "AccessHash identical on a and b (owned and stripped hash alike)"
 
-  # Capture the exact wire bytes A serves B and prove no refresh token crosses.
-  local wire; wire="$(hrun b "$BIN/seed" wirecap --peer "$(exec_peer a)" --uuid "$UUID")"
-  echo "    wire envelope: $wire"
-  echo "$wire" | grep -qF "$A_AT" || fail "wire envelope missing the access token"
-  echo "$wire" | grep -qF "$RT_MARKER" && fail "wire envelope carries a refresh token" || true
-  ok "captured wire envelope carries the access token but NO refresh token"
-
   assert_reg_identical
   assert_zero_posts b
   assert_no_double_spend
@@ -450,10 +443,10 @@ scenario_2_rotation() {
   grep -qF "$A_RT_FAMILY" "$(credfile a)" || fail "A lost its refresh token after rotation"
   ok "A still owns the (rotated) chain — refresh token present"
 
-  # Propagate: A folds the fresher chain into the registry; B pulls it.
+  # Propagate: A folds the fresher chain into the registry; Synckit delivers it to B.
   quiesce
   [ "$(cred_get "$(credfile b)" accessToken)" = "$newAT" ] || fail "B did not install the rotated AT"
-  ok "B installed the rotated AT (pulled stripped from A)"
+  ok "B installed the rotated AT (delivered stripped from A)"
   [ -z "$(cred_get "$(credfile b)" refreshToken)" ] || fail "B's rotated copy carries a refreshToken"
   ! grep -qF "$RT_MARKER" "$(credfile b)" || fail "a refresh token appeared in B's blob after rotation"
   ok "B's rotated copy still has NO refresh token"
@@ -466,10 +459,10 @@ scenario_2_rotation() {
 }
 
 # ---------------------------------------------------------------------------
-# Scenario 5 — tombstone heal: a claude tombstone is restored by a pull
+# Scenario 5 — tombstone heal: delivery restores a Claude tombstone
 # ---------------------------------------------------------------------------
 scenario_5_tombstone_heal() {
-  hdr "Scenario 5: tombstone heal — a claude tombstone on B is restored by a pull"
+  hdr "Scenario 5: tombstone heal — snapshot delivery restores B"
   local liveAT; liveAT="$(cred_get "$(credfile a)" accessToken)"
   # Overwrite B's peer copy with claude's own dead-chain tombstone shape.
   printf '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}\n' > "$(credfile b)"
@@ -480,7 +473,7 @@ scenario_5_tombstone_heal() {
   [ "$(cred_get "$(credfile b)" accessToken)" = "$liveAT" ] || fail "B tombstone not healed to the live AT"
   [ -z "$(cred_get "$(credfile b)" refreshToken)" ] || fail "healed copy carries a refreshToken"
   ! grep -qF "$RT_MARKER" "$(credfile b)" || fail "healed copy carries a refresh token string"
-  ok "B's stripped copy restored by a pull (tombstone -> $liveAT, no refresh token)"
+  ok "B's stripped copy restored by delivery (tombstone -> $liveAT, no refresh token)"
 
   assert_zero_posts b
   assert_reg_identical

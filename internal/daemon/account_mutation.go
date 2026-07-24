@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/accountterminal"
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -34,7 +34,7 @@ type accountMutationRun struct {
 	terminal accountMutationTerminal
 	result   AccountMutationResult
 	err      error
-	outcome  supervise.TerminalOutcome
+	outcome  accountterminal.TerminalOutcome
 }
 
 func (s *Server) handleAccountMutationAck(ctx context.Context, request Request) Response {
@@ -60,7 +60,7 @@ func (s *Server) handleAccountMutationAck(ctx context.Context, request Request) 
 			ackCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			err := running.terminal.Acknowledge(ackCtx, running.outcome.Digest)
 			cancel()
-			if err != nil && !errors.Is(err, supervise.ErrTerminalRetentionExpired) {
+			if err != nil && !errors.Is(err, accountterminal.ErrTerminalRetentionExpired) {
 				return Response{Error: err.Error()}
 			}
 		}
@@ -205,7 +205,7 @@ func (s *Server) runAttachedAccountMutation(
 	}
 	if cursor != nil {
 		s.accountMutationMu.Unlock()
-		return AccountMutationResult{}, supervise.ErrTerminalOutputCursor
+		return AccountMutationResult{}, accountterminal.ErrTerminalOutputCursor
 	}
 	running := &accountMutationRun{ready: make(chan struct{}), done: make(chan struct{})}
 	s.accountMutationRuns[active.OperationID] = running
@@ -313,13 +313,13 @@ func (s *Server) startAccountMutationRun(
 			result, settleErr := s.settleAccountMutationTerminal(ctx, active, err)
 			return active, nil, nil, result, settleErr
 		}
-		attachment, err := terminal.Attach(context.WithoutCancel(ctx), supervise.TerminalAttachmentSpec{
-			Role: supervise.TerminalObserver, DisconnectPolicy: supervise.DetachOnDisconnect,
+		attachment, err := terminal.Attach(context.WithoutCancel(ctx), accountterminal.TerminalAttachmentSpec{
+			Role: accountterminal.TerminalObserver, DisconnectPolicy: accountterminal.DetachOnDisconnect,
 		})
 		if err == nil {
 			startupCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			_, err = attachment.ClaimControl(
-				startupCtx, supervise.DetachOnDisconnect, supervise.DefaultTerminalControlLease,
+				startupCtx, accountterminal.DetachOnDisconnect, accountterminal.DefaultTerminalControlLease,
 			)
 			if err == nil {
 				err = attachment.Send(startupCtx, first)
@@ -363,9 +363,9 @@ func (s *Server) attachAccountMutationRun(
 			return AccountMutationResult{}, ctx.Err()
 		}
 	}
-	var replay *supervise.TerminalOutputCursor
+	var replay *accountterminal.TerminalOutputCursor
 	if cursor != nil {
-		replay = &supervise.TerminalOutputCursor{NextSequence: *cursor}
+		replay = &accountterminal.TerminalOutputCursor{NextSequence: *cursor}
 	}
 	attachment, controller, err := claimAccountMutationAttachment(ctx, running, replay)
 	if err != nil {
@@ -377,22 +377,22 @@ func (s *Server) attachAccountMutationRun(
 func claimAccountMutationAttachment(
 	ctx context.Context,
 	running *accountMutationRun,
-	cursor *supervise.TerminalOutputCursor,
+	cursor *accountterminal.TerminalOutputCursor,
 ) (accountMutationTerminalAttachment, bool, error) {
-	attachment, err := running.terminal.Attach(context.WithoutCancel(ctx), supervise.TerminalAttachmentSpec{
-		Role: supervise.TerminalObserver, DisconnectPolicy: supervise.DetachOnDisconnect, Cursor: cursor,
+	attachment, err := running.terminal.Attach(context.WithoutCancel(ctx), accountterminal.TerminalAttachmentSpec{
+		Role: accountterminal.TerminalObserver, DisconnectPolicy: accountterminal.DetachOnDisconnect, Cursor: cursor,
 	})
 	if err != nil {
 		return nil, false, err
 	}
 	_, err = attachment.ClaimControl(
-		ctx, supervise.DetachOnDisconnect, supervise.DefaultTerminalControlLease,
+		ctx, accountterminal.DetachOnDisconnect, accountterminal.DefaultTerminalControlLease,
 	)
 	switch {
 	case err == nil:
 		return attachment, true, nil
-	case errors.Is(err, supervise.ErrTerminalControllerAttached),
-		errors.Is(err, supervise.ErrTerminalSettled):
+	case errors.Is(err, accountterminal.ErrTerminalControllerAttached),
+		errors.Is(err, accountterminal.ErrTerminalSettled):
 		return attachment, false, nil
 	default:
 		_ = attachment.Close()
@@ -445,7 +445,7 @@ func (s *Server) relayAccountMutationRun(
 					cancel()
 					return
 				}
-				if event.Kind == supervise.TerminalInputEOF {
+				if event.Kind == accountterminal.TerminalInputEOF {
 					return
 				}
 			}
@@ -459,14 +459,14 @@ func (s *Server) relayAccountMutationRun(
 			defer retry.Stop()
 			for {
 				_, err := attachment.ClaimControl(
-					ioCtx, supervise.DetachOnDisconnect, supervise.DefaultTerminalControlLease,
+					ioCtx, accountterminal.DetachOnDisconnect, accountterminal.DefaultTerminalControlLease,
 				)
 				switch {
 				case err == nil:
 					close(controlReady)
 					controller = true
-				case errors.Is(err, supervise.ErrTerminalControllerAttached):
-				case errors.Is(err, supervise.ErrTerminalSettled):
+				case errors.Is(err, accountterminal.ErrTerminalControllerAttached):
+				case errors.Is(err, accountterminal.ErrTerminalSettled):
 					return
 				default:
 					select {
@@ -486,7 +486,7 @@ func (s *Server) relayAccountMutationRun(
 				}
 			}
 		}
-		renew := time.NewTicker(supervise.DefaultTerminalControlLease / 3)
+		renew := time.NewTicker(accountterminal.DefaultTerminalControlLease / 3)
 		defer renew.Stop()
 		for {
 			select {
@@ -1454,31 +1454,31 @@ func accountMutationInputDigest(operationID store.AccountMutationID) store.Crede
 func firstAccountMutationInput(
 	ctx context.Context,
 	input <-chan wire.Chunk,
-) (supervise.TerminalInput, supervise.TerminalSize, bool, error) {
-	var size supervise.TerminalSize
+) (accountterminal.TerminalInput, accountterminal.TerminalSize, bool, error) {
+	var size accountterminal.TerminalSize
 	timer := time.NewTimer(accountMutationInputWait)
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return supervise.TerminalInput{}, size, false, nil
+			return accountterminal.TerminalInput{}, size, false, nil
 		case <-timer.C:
-			return supervise.TerminalInput{}, size, false, nil
+			return accountterminal.TerminalInput{}, size, false, nil
 		case chunk, ok := <-input:
 			if !ok {
-				return supervise.TerminalInput{}, size, false, nil
+				return accountterminal.TerminalInput{}, size, false, nil
 			}
 			event, err := decodeAccountTerminalInput(chunk)
 			if err != nil {
-				return supervise.TerminalInput{}, size, false, err
+				return accountterminal.TerminalInput{}, size, false, err
 			}
 			switch event.Kind {
-			case supervise.TerminalInputResize:
+			case accountterminal.TerminalInputResize:
 				size = event.Size
-			case supervise.TerminalInputBytes:
+			case accountterminal.TerminalInputBytes:
 				return event, size, true, nil
-			case supervise.TerminalInputEOF:
-				return supervise.TerminalInput{}, size, false, nil
+			case accountterminal.TerminalInputEOF:
+				return accountterminal.TerminalInput{}, size, false, nil
 			}
 		}
 	}

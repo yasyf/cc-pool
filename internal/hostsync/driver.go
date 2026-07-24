@@ -25,7 +25,7 @@ const (
 	OutcomeDeferred converge.Outcome = "deferred"
 	// OutcomeLabeled means the local label was updated to the registry's LWW label.
 	OutcomeLabeled converge.Outcome = "labeled"
-	// OutcomeCredInstalled means a fresher credential was pulled from a peer and installed.
+	// OutcomeCredInstalled means a delivered fresher credential was installed.
 	OutcomeCredInstalled converge.Outcome = "cred-installed"
 )
 
@@ -43,34 +43,29 @@ type CredentialManager interface {
 	// ReadCredential returns the account's current credential and its store, or
 	// creds.ErrNotFound when the account holds none.
 	ReadCredential(context.Context, store.Account) (*creds.Credential, creds.Source, error)
-	// InstallSyncedCredential installs a pulled credential under the durable account lane
+	// InstallSyncedCredential installs a delivered credential under the durable account lane
 	// when it wins the owned-precedence/freshness re-check; reports whether it landed.
 	InstallSyncedCredential(ctx context.Context, a store.Account, cred *creds.Credential) (bool, error)
 }
 
-// AccountMaterializer creates the local pool account for a peer-added entry
-// missing locally; tests inject a fake.
-type AccountMaterializer func(ctx context.Context, v AccountValue, peers []string) (MaterializeResult, error)
+// AccountMaterializer creates the local pool account for a delivered entry.
+type AccountMaterializer func(context.Context, AccountValue, *creds.Credential) (MaterializeResult, error)
 
 // SyncedAdmitter revalidates one persisted presentation before admission.
 type SyncedAdmitter func(context.Context, store.Account, string) (bool, error)
-
-// FresherPuller pulls a fresher credential for uuid from its chain origin,
-// falling back to the other peers; ErrNoPeerCredential is the deferred outcome.
-type FresherPuller func(ctx context.Context, uuid string, chain ChainStamp, localExpiresAt int64, peers []string) (*creds.Credential, error)
 
 // DriverDeps are the injected seams the Driver reconciles through.
 type DriverDeps struct {
 	// Store resolves and relabels local account rows.
 	Store DriverStore
-	// Cred reads the local credential and installs a fresher pulled one.
+	// Cred reads the local credential and installs fresher delivery material.
 	Cred CredentialManager
 	// Materialize creates a local account for a peer-added entry missing locally.
 	Materialize AccountMaterializer
 	// Admit revalidates a synced account's persisted presentation before selection.
 	Admit SyncedAdmitter
-	// Pull fetches a strictly-fresher credential for an existing local account.
-	Pull FresherPuller
+	// Resolve returns material carried by the current Apply delivery.
+	Resolve CredentialResolver
 }
 
 // Driver is cc-pool's converge.Driver[AccountValue]. converge.Reconcile calls
@@ -125,14 +120,14 @@ func (d *Driver) SaveRegistry(_ context.Context, reg cregistry.Registry[AccountV
 // Reconcile resolves one present entry to its local account: materialize when
 // missing, else apply the LWW label and install a fresher credential; a
 // tombstone here is a defensive noop.
-func (d *Driver) Reconcile(ctx context.Context, id string, entry cregistry.Entry[AccountValue], peers []string, _ string) (converge.Outcome, error) {
+func (d *Driver) Reconcile(ctx context.Context, id string, entry cregistry.Entry[AccountValue], _ []string, _ string) (converge.Outcome, error) {
 	if !entry.Present() {
 		return OutcomeNoop, nil
 	}
 	v := entry.Value
 	if v.UUID != id {
 		// The registry is keyed by account UUID; an entry whose value UUID
-		// disagrees with its key is a cross-account injection (pull/install the
+		// disagrees with its key is a cross-account injection (resolve/install the
 		// wrong account's credential into the key's local row). Never act on it.
 		d.svc.logf("hostsync: reconcile SKIPPED key %s: value UUID %q disagrees with the key — refusing a cross-account install", id, v.UUID)
 		return OutcomeNoop, nil
@@ -142,20 +137,27 @@ func (d *Driver) Reconcile(ctx context.Context, id string, entry cregistry.Entry
 		return "", fmt.Errorf("resolve account %s: %w", id, err)
 	}
 	if !ok {
-		return d.materialize(ctx, v, peers)
+		return d.materialize(ctx, v)
 	}
-	return d.reconcileLocal(ctx, a, v, peers)
+	return d.reconcileLocal(ctx, a, v)
 }
 
 // materialize creates a missing local account for v, deferring when the
 // identity is not yet scan-published or no peer holds the envelope.
-func (d *Driver) materialize(ctx context.Context, v AccountValue, peers []string) (converge.Outcome, error) {
+func (d *Driver) materialize(ctx context.Context, v AccountValue) (converge.Outcome, error) {
 	if emptyOAuth(v.OAuthAccount) {
 		return OutcomeDeferred, nil
 	}
-	res, err := d.deps.Materialize(ctx, v, peers)
+	credential, err := d.resolve(ctx, v)
+	if errors.Is(err, ErrCredentialMaterialUnavailable) {
+		return OutcomeDeferred, nil
+	}
 	if err != nil {
-		if errors.Is(err, ErrMaterializeNoEnvelope) {
+		return "", fmt.Errorf("resolve material for %s: %w", v.UUID, err)
+	}
+	res, err := d.deps.Materialize(ctx, v, credential)
+	if err != nil {
+		if errors.Is(err, ErrCredentialMaterialUnavailable) {
 			return OutcomeDeferred, nil
 		}
 		return "", fmt.Errorf("materialize %s: %w", v.UUID, err)
@@ -168,10 +170,10 @@ func (d *Driver) materialize(ctx context.Context, v AccountValue, peers []string
 	return OutcomeMaterialized, nil
 }
 
-// reconcileLocal applies the LWW label, then pulls a credential only when the
+// reconcileLocal applies the LWW label, then resolves delivery material only when the
 // local one is unowned and the registry chain is strictly fresher; the
 // definitive re-check runs in InstallSyncedCredential.
-func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountValue, peers []string) (converge.Outcome, error) {
+func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountValue) (converge.Outcome, error) {
 	outcome := OutcomeUnchanged
 	if v.Label != a.Label {
 		if err := d.deps.Store.SetAccountLabel(a.ID, v.Label); err != nil {
@@ -203,7 +205,7 @@ func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountV
 	}
 	// Strictly-later expiry, same ordering as InstallSyncedCredential's guard.
 	// Forward origin clock skew (a rollback child stamped earlier) is benign:
-	// the peer keeps the still-valid parent AT until expiry, then re-pulls.
+	// the peer keeps the still-valid parent AT until a fresher delivery arrives.
 	if v.Chain.ExpiresAt <= localExp {
 		return outcome, nil
 	}
@@ -219,7 +221,7 @@ func (d *Driver) reconcileLocal(ctx context.Context, a store.Account, v AccountV
 		return OutcomeDeferred, nil
 	}
 
-	installed, deferred, err := d.pullAndInstall(ctx, a, v, localExp, peers)
+	installed, deferred, err := d.resolveAndInstall(ctx, a, v)
 	switch {
 	case err != nil:
 		return "", err
@@ -247,15 +249,14 @@ func (d *Driver) installBusy(ctx context.Context, uuid string) (bool, string, er
 	return d.svc.Sessions.Busy(ctx, uuid)
 }
 
-// pullAndInstall pulls the fresher chain and installs it; ErrNoPeerCredential
-// and creds.ErrUnavailable are deferred, not failures — the next tick retries.
-func (d *Driver) pullAndInstall(ctx context.Context, a store.Account, v AccountValue, localExp int64, peers []string) (installed, deferred bool, err error) {
-	cred, err := d.deps.Pull(ctx, v.UUID, v.Chain, localExp, peers)
+// resolveAndInstall installs material carried by the current Apply call.
+func (d *Driver) resolveAndInstall(ctx context.Context, a store.Account, v AccountValue) (installed, deferred bool, err error) {
+	cred, err := d.resolve(ctx, v)
 	switch {
-	case errors.Is(err, ErrNoPeerCredential):
+	case errors.Is(err, ErrCredentialMaterialUnavailable):
 		return false, true, nil
 	case err != nil:
-		return false, false, fmt.Errorf("pull credential for %s: %w", v.UUID, err)
+		return false, false, fmt.Errorf("resolve credential for %s: %w", v.UUID, err)
 	case cred == nil:
 		return false, true, nil
 	}
@@ -269,8 +270,15 @@ func (d *Driver) pullAndInstall(ctx context.Context, a store.Account, v AccountV
 	return ok, false, nil
 }
 
+func (d *Driver) resolve(ctx context.Context, v AccountValue) (*creds.Credential, error) {
+	if d.deps.Resolve == nil {
+		return nil, ErrCredentialMaterialUnavailable
+	}
+	return d.deps.Resolve(ctx, v.UUID, v.Chain)
+}
+
 // localChain returns a's credential expiry (Unix ms), AccessHash, and whether
-// it is owned; absent and tombstoned both read (0, "", false) — pullable.
+// it is owned; absent and tombstoned both read (0, "", false) — replaceable by delivery.
 func (d *Driver) localChain(
 	ctx context.Context,
 	a store.Account,

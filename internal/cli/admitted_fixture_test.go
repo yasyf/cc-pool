@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
 )
@@ -14,9 +15,9 @@ func admitCLITestAccount(t *testing.T, database *store.Store, requested store.Ac
 	t.Helper()
 	for {
 		owner := proc.Record{
-			RecoveryClass: proc.RecoveryTask,
-			PID:           42, StartTime: "1.0", Boot: "cli-test", Comm: "cc-pool",
-			Generation: fmt.Sprintf("cli-account-%d", requested.ID),
+			RecoveryID: pool.CredentialOwnerRecoveryID,
+			PID:        42, StartTime: "1.0", Boot: "cli-test", Comm: "cc-pool",
+			Generation: cliTestOwnerGeneration(fmt.Sprintf("cli-account-%d", requested.ID)),
 		}
 		reservation, err := database.ReserveAccountIndex(owner)
 		if err != nil {
@@ -75,6 +76,13 @@ func admitCLITestAccount(t *testing.T, database *store.Store, requested store.Ac
 			t.Fatal(err)
 		}
 	}
+}
+
+func cliTestOwnerGeneration(label string) proc.OwnerGeneration {
+	digest := sha256.Sum256([]byte(label))
+	var generation proc.OwnerGeneration
+	copy(generation[:], digest[:len(generation)])
+	return generation
 }
 
 func cliTestAdmissionFence(account store.Account) store.SyncedCredentialAdmissionFence {

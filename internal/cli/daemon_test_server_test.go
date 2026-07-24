@@ -12,29 +12,13 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/version"
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 type daemonTestHandler func(context.Context, ccdaemon.Op, ccdaemon.Request) ccdaemon.Response
-
-type daemonTestCloser struct{}
-
-func (daemonTestCloser) Close() error { return nil }
-
-type daemonTestWorkers struct{}
-
-func (daemonTestWorkers) Close()                     {}
-func (daemonTestWorkers) Cancel()                    {}
-func (daemonTestWorkers) Wait(context.Context) error { return nil }
-
-type daemonTestStopVerifier struct{}
-
-func (daemonTestStopVerifier) Validate() error { return nil }
-func (daemonTestStopVerifier) VerifyStopControl(context.Context, wire.Peer, string) (proc.Record, error) {
-	return proc.Record{}, errors.New("daemon test stop control is unavailable")
-}
 
 // startDaemonTestServer exposes the current persistent daemon protocol at the
 // default test HOME socket. Tests vary only business behavior and build ID.
@@ -74,24 +58,57 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 		ccdaemon.OpAccountIdentity,
 	} {
 		op := op
-		server.RegisterConcurrent(wire.Op(op), func(ctx context.Context, request wire.Request) (any, error) {
-			var payload ccdaemon.Request
-			if err := json.Unmarshal(request.Payload, &payload); err != nil {
-				return nil, err
-			}
-			payload.Op = op
-			if handler == nil {
-				return ccdaemon.Response{OK: true, Version: build}, nil
-			}
-			return handler(ctx, op, payload), nil
+		server.Register(wire.HandlerSpec{
+			Op: wire.Op(op), Concurrent: true,
+			Handler: func(ctx context.Context, request wire.Request) (any, error) {
+				var payload ccdaemon.Request
+				if err := json.Unmarshal(request.Payload, &payload); err != nil {
+					return nil, err
+				}
+				payload.Op = op
+				if handler == nil {
+					return ccdaemon.Response{OK: true, Version: build}, nil
+				}
+				return handler(ctx, op, payload), nil
+			},
 		})
 	}
-	intake := &drain.Intake{}
+	stateDir := t.TempDir()
+	generation := cliTestOwnerGeneration(t.Name())
+	workers, err := worker.NewPool(worker.Config{
+		Capacity: 2, QueueCapacity: 2, MaxTotalRun: time.Minute,
+		MaxStdinBytes: 1 << 20, MaxStdoutBytes: 1 << 20, MaxStderrBytes: 1 << 20,
+	}, &proc.Reaper{
+		Store: &proc.FileStore{Path: stateDir + "/workers-v1.db"}, Generation: generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	children, err := proc.NewManager(2, &proc.Reaper{
+		Store: &proc.FileStore{Path: stateDir + "/children-v1.db"}, Generation: generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopRole := trust.PeerRole("com.yasyf.cc-pool.cli-test.stop")
+	receiptRole := trust.PeerRole("com.yasyf.cc-pool.cli-test.receipt")
+	readinessRole := trust.PeerRole("com.yasyf.cc-pool.cli-test.readiness")
+	requirement := trust.Requirement{TeamID: "ABCDE12345", SigningIdentifier: "com.yasyf.cc-pool.cli-test"}
+	policy, err := trust.NewTrustPolicy(trust.TrustPolicyConfig{
+		ExpectedUID: os.Geteuid(), AllowUnprotected: true,
+		Roles: map[trust.PeerRole]trust.Requirement{
+			stopRole: requirement, receiptRole: requirement, readinessRole: requirement,
+		},
+		StopRoles: []trust.PeerRole{stopRole}, ReceiptRoles: []trust.PeerRole{receiptRole},
+		ReadinessRoles: []trust.PeerRole{readinessRole},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	runtime, err := wire.NewRuntime(wire.RuntimeConfig{
 		Socket: pool.SocketPath(), RuntimeBuild: build, RuntimeProtocol: int(wire.ProtocolVersion),
-		Wire:       server,
-		Classifier: daemonTestProtectedClassifier{}, ReservedProtectedSessions: 1,
-		StopVerifier: daemonTestStopVerifier{},
+		Wire: server, TrustPolicy: policy,
+		StopControlStore: &proc.FileStore{Path: stateDir + "/stop-control-v1.db"},
 		Observations: []wire.ObservationRoute{{
 			Op: wire.Op(ccdaemon.OpHealth), MaxResponseBytes: 16 << 10,
 			Handler: func(_ context.Context, request wire.ObservationRequest) (wire.ObservationResponse, error) {
@@ -112,21 +129,33 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 			},
 		}},
 		ListenerWait: time.Second, ShutdownTimeout: time.Second,
-		Admission: intake, Workers: daemonTestWorkers{}, State: daemonTestCloser{},
-		Resources: daemonTestCloser{}, Activate: func(dkdaemon.Activation) error { return nil },
+		Workers: workers, Children: children,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() {
-		done <- runtime.Run(t.Context())
-	}()
-	readyCtx, cancelReady := context.WithTimeout(t.Context(), 3*time.Second)
-	defer cancelReady()
-	if err := runtime.WaitReady(readyCtx); err != nil {
+	slot := dkdaemon.NewPublicationSlot[struct{}](runtime)
+	activation, err := runtime.Begin(t.Context())
+	if err != nil {
 		t.Fatal(err)
 	}
+	settlement, err := activation.ClaimProductSettlement()
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := slot.Stage(activation, struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := activation.CommitReady(publication); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- runtime.Wait(context.Background()) }()
+	go func() {
+		<-activation.Context().Done()
+		_ = settlement.Complete()
+	}()
 	t.Cleanup(func() {
 		closeCtx, cancelClose := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancelClose()
@@ -138,11 +167,3 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 		}
 	})
 }
-
-type daemonTestProtectedClassifier struct{}
-
-func (daemonTestProtectedClassifier) Validate() error { return nil }
-func (daemonTestProtectedClassifier) Classify(context.Context, wire.Peer) (bool, error) {
-	return true, nil
-}
-func (daemonTestProtectedClassifier) AuthorizeLifecycleBuild(string, string) bool { return true }

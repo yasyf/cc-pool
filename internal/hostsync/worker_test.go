@@ -14,7 +14,6 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/worker"
-	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
 
@@ -58,7 +57,6 @@ type inlineHostSyncRunner struct {
 	runtime     WorkerRuntime
 	tasks       []worker.CommandRequest
 	runtimeCall int
-	transport   []bool
 }
 
 func (r *inlineHostSyncRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
@@ -67,14 +65,19 @@ func (r *inlineHostSyncRunner) Run(ctx context.Context, task worker.CommandReque
 	if !IsWorkerInvocation(task.Args) {
 		r.t.Fatalf("task = %+v, want exact recovery worker role", task)
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	if len(task.Env) != 1 || task.Env[0] != "HOME="+home {
+		r.t.Fatalf("task env = %v, want exact HOME", task.Env)
+	}
 	r.runtimeCall++
 	var output bytes.Buffer
-	err := RunWorker(ctx, bytes.NewReader(task.Stdin), &output, func(
+	err = RunWorker(ctx, bytes.NewReader(task.Stdin), &output, func(
 		_ context.Context,
-		needsTransport bool,
 		run func(WorkerRuntime) error,
 	) error {
-		r.transport = append(r.transport, needsTransport)
 		return run(r.runtime)
 	})
 	return worker.CommandResult{Stdout: output.Bytes()}, err
@@ -97,20 +100,12 @@ func TestWorkerClientExecutesExactOperations(t *testing.T) {
 		t.Fatal(err)
 	}
 	consumer := &workerConsumerFixture{
-		caps:      syncservice.Capabilities{Name: "cc-pool", Methods: []string{"list", MethodFetchCredential}},
+		caps:      syncservice.Capabilities{Name: "cc-pool", Methods: []string{"list"}},
 		items:     []syncservice.WatchItem{{ID: "u1", WatchDirs: []string{"/stamps/u1"}, Fingerprint: "fp"}},
 		reconcile: syncservice.ReconcileResult{Converged: 3, SkippedBusy: 1},
 		export:    exported,
 		apply:     syncservice.ApplyResult{AckedRevision: delivery.SourceRevision},
 	}
-	fetchCalls := 0
-	fetch := rpc.Handler(func(_ context.Context, params map[string]any) (any, error) {
-		fetchCalls++
-		if params["uuid"] != "u1" {
-			t.Fatalf("fetch params = %+v", params)
-		}
-		return map[string]any{"credential": "envelope"}, nil
-	})
 	authKind := func(_ context.Context, accountID int, uuid string) (store.AuthKind, error) {
 		if accountID != 7 || uuid != "u1" {
 			t.Fatalf("auth-kind account = %d/%s", accountID, uuid)
@@ -118,14 +113,14 @@ func TestWorkerClientExecutesExactOperations(t *testing.T) {
 		return store.AuthKindAwaitingOrigin, nil
 	}
 	runner := &inlineHostSyncRunner{t: t, runtime: WorkerRuntime{
-		Consumer: consumer, Fetch: fetch, AuthKind: authKind,
+		Consumer: consumer, AuthKind: authKind,
 	}}
 	client, err := NewWorkerClient(runner, "/exact/ccp")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if got, err := client.Capabilities(t.Context()); err != nil || got.Name != consumer.caps.Name || len(got.Methods) != 2 {
+	if got, err := client.Capabilities(t.Context()); err != nil || got.Name != consumer.caps.Name || len(got.Methods) != 1 {
 		t.Fatalf("Capabilities = %+v, %v", got, err)
 	}
 	if got, err := client.List(t.Context()); err != nil || len(got) != 1 || got[0].ID != "u1" {
@@ -140,16 +135,8 @@ func TestWorkerClientExecutesExactOperations(t *testing.T) {
 	if got, err := client.Apply(t.Context(), delivery); err != nil || got != consumer.apply {
 		t.Fatalf("Apply = %+v, %v", got, err)
 	}
-	got, err := client.FetchCredentialHandler(t.Context(), map[string]any{"uuid": "u1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	gotMap, ok := got.(map[string]any)
-	if !ok || gotMap["credential"] != "envelope" {
-		t.Fatalf("FetchCredentialHandler = %#v", got)
-	}
-	if fetchCalls != 1 || runner.runtimeCall != 6 {
-		t.Fatalf("calls: fetch=%d worker=%d", fetchCalls, runner.runtimeCall)
+	if runner.runtimeCall != 5 {
+		t.Fatalf("worker calls = %d", runner.runtimeCall)
 	}
 	if strings.Join(consumer.origins, ",") != "host-a" {
 		t.Fatalf("origins = %v", consumer.origins)
@@ -163,22 +150,13 @@ func TestWorkerClientExecutesExactOperations(t *testing.T) {
 	if kind, err := client.AuthKind(t.Context(), 7, "u1"); err != nil || kind != store.AuthKindAwaitingOrigin {
 		t.Fatalf("AuthKind = %q, %v", kind, err)
 	}
-	if runner.runtimeCall != 7 {
+	if runner.runtimeCall != 6 {
 		t.Fatalf("worker calls after auth kind = %d", runner.runtimeCall)
-	}
-	wantTransport := []bool{false, false, true, false, true, false, false}
-	if len(runner.transport) != len(wantTransport) {
-		t.Fatalf("transport requests = %v, want %v", runner.transport, wantTransport)
-	}
-	for index := range wantTransport {
-		if runner.transport[index] != wantTransport[index] {
-			t.Fatalf("transport requests = %v, want %v", runner.transport, wantTransport)
-		}
 	}
 }
 
 func staticWorkerRuntime(runtime WorkerRuntime) WorkerRuntimeScope {
-	return func(_ context.Context, _ bool, run func(WorkerRuntime) error) error {
+	return func(_ context.Context, run func(WorkerRuntime) error) error {
 		return run(runtime)
 	}
 }
@@ -186,7 +164,6 @@ func staticWorkerRuntime(runtime WorkerRuntime) WorkerRuntimeScope {
 func TestWorkerProtocolRejectsTrailingAndMismatchedFrames(t *testing.T) {
 	runtime := WorkerRuntime{
 		Consumer: &workerConsumerFixture{},
-		Fetch:    func(context.Context, map[string]any) (any, error) { return struct{}{}, nil },
 		AuthKind: func(context.Context, int, string) (store.AuthKind, error) { return store.AuthKindOwned, nil },
 	}
 	request := workerRequest{
@@ -215,7 +192,6 @@ func TestWorkerProtocolRejectsTrailingAndMismatchedFrames(t *testing.T) {
 func TestWorkerAuthKindPreservesTypedFailure(t *testing.T) {
 	runner := &inlineHostSyncRunner{t: t, runtime: WorkerRuntime{
 		Consumer: &workerConsumerFixture{},
-		Fetch:    func(context.Context, map[string]any) (any, error) { return struct{}{}, nil },
 		AuthKind: func(context.Context, int, string) (store.AuthKind, error) {
 			return "", ErrAuthKindOriginForeign
 		},
@@ -255,7 +231,6 @@ func (r *gatedHostSyncRunner) Run(ctx context.Context, task worker.CommandReques
 func TestWorkerClientSerializesExclusiveChildActivation(t *testing.T) {
 	inner := &inlineHostSyncRunner{t: t, runtime: WorkerRuntime{
 		Consumer: &workerConsumerFixture{},
-		Fetch:    func(context.Context, map[string]any) (any, error) { return struct{}{}, nil },
 		AuthKind: func(context.Context, int, string) (store.AuthKind, error) { return store.AuthKindOwned, nil },
 	}}
 	runner := &gatedHostSyncRunner{
@@ -288,7 +263,6 @@ func TestWorkerClientSerializesExclusiveChildActivation(t *testing.T) {
 func TestWorkerClientDefaultDeadlineIncludesLaneWait(t *testing.T) {
 	inner := &inlineHostSyncRunner{t: t, runtime: WorkerRuntime{
 		Consumer: &workerConsumerFixture{},
-		Fetch:    func(context.Context, map[string]any) (any, error) { return struct{}{}, nil },
 		AuthKind: func(context.Context, int, string) (store.AuthKind, error) { return store.AuthKindOwned, nil },
 	}}
 	runner := &gatedHostSyncRunner{

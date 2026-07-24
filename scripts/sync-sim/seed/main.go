@@ -14,7 +14,6 @@
 //	seed setexp  --id N ...       rewrite the credential's expiresAt in place, tokens preserved
 //	seed hash    --id N           print the current credential's AccessHash
 //	seed rowuuid --id N           print the account row's stored account_uuid
-//	seed wirecap --peer P --uuid U  fetch U's stripped envelope from peer P and print the raw wire bytes
 package main
 
 import (
@@ -32,13 +31,10 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/creds"
-	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/worker"
-	"github.com/yasyf/synckit/rpc"
-	"github.com/yasyf/synckit/syncservice"
 )
 
 type directTaskRunner struct{}
@@ -63,7 +59,7 @@ func simCredentialStore(configDir string) creds.KeychainItem {
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal(fmt.Errorf("usage: seed <init|account|rotate|setexp|hash|rowuuid|wirecap> [flags]"))
+		fatal(fmt.Errorf("usage: seed <init|account|rotate|setexp|hash|rowuuid> [flags]"))
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 	var err error
@@ -80,8 +76,6 @@ func main() {
 		err = cmdHash(args)
 	case "rowuuid":
 		err = cmdRowUUID(args)
-	case "wirecap":
-		err = cmdWireCap(args)
 	default:
 		err = fmt.Errorf("unknown subcommand %q", cmd)
 	}
@@ -395,36 +389,6 @@ func cmdRowUUID(args []string) error {
 	}
 	fmt.Print(a.AccountUUID)
 	return nil
-}
-
-// cmdWireCap issues the raw credential-fetch RPC to a peer and prints the exact
-// envelope bytes that crossed the wire, so the harness can prove the origin's
-// stripped envelope carries no refresh token. It bypasses FetchCredential's
-// verification on purpose — the goal is the unfiltered wire payload.
-func cmdWireCap(args []string) error {
-	fs := flag.NewFlagSet("wirecap", flag.ExitOnError)
-	peer := fs.String("peer", "", "peer transport string (exec:... or ssh target)")
-	uuid := fs.String("uuid", "", "account uuid to fetch")
-	_ = fs.Parse(args)
-	if *peer == "" || *uuid == "" {
-		return fmt.Errorf("wirecap needs --peer and --uuid")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	return syncservice.WithTransportRunner(ctx, func(runner syncservice.TransportRunner) error {
-		tx := hostsync.PeerTransport(runner, *peer)
-		defer func() { _ = tx.Close() }()
-		resp, err := tx.Do(ctx, &rpc.Request{Method: hostsync.MethodFetchCredential, Params: map[string]any{"uuid": *uuid}})
-		if err != nil {
-			return fmt.Errorf("fetch %s from peer: %w", *uuid, err)
-		}
-		if !resp.OK {
-			return fmt.Errorf("peer refused fetch: %s", resp.Error)
-		}
-		_, _ = os.Stdout.Write(resp.Result)
-		fmt.Println()
-		return nil
-	})
 }
 
 func makeCred(access, refresh string, expiresMS int64) *creds.Credential {

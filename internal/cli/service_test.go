@@ -16,7 +16,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/service"
-	"github.com/yasyf/daemonkit/wire"
 )
 
 func swapVar[T any](t *testing.T, target *T, val T) {
@@ -75,7 +74,7 @@ func uninstallCmd() (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
 
 type testDaemonServiceController struct {
 	desired     [][]service.Agent
-	stops       []service.StopControlSpec
+	stops       []service.StopRuntimeRequest
 	closed      int
 	closeCtxErr error
 	convergeErr error
@@ -105,9 +104,9 @@ func (c *testDaemonServiceController) Converge(_ context.Context, agents []servi
 	return c.convergeErr
 }
 
-func (c *testDaemonServiceController) StopRuntime(_ context.Context, spec service.StopControlSpec) (wire.StopResult, error) {
+func (c *testDaemonServiceController) StopRuntime(_ context.Context, spec service.StopRuntimeRequest) (service.StopReceipt, error) {
 	c.stops = append(c.stops, spec)
-	return wire.StopResult{ProcessGeneration: spec.TargetProcessGeneration, Stopped: true}, nil
+	return service.StopReceipt{}, nil
 }
 
 func (c *testDaemonServiceController) Close(ctx context.Context) error {
@@ -174,6 +173,31 @@ func TestDaemonServiceControllerConfigIsStableAndDistinct(t *testing.T) {
 	}
 	if config.WorkerLimit != daemonServiceWorkerLimit {
 		t.Fatalf("WorkerLimit = %d, want %d", config.WorkerLimit, daemonServiceWorkerLimit)
+	}
+}
+
+func TestStopObservedDaemonRuntimeUsesDurableExactRequest(t *testing.T) {
+	tempHome(t)
+	controller := &testDaemonServiceController{}
+	swapVar(t, &observeDaemonRuntime, func(context.Context) (*daemon.HealthResponse, error) {
+		return &daemon.HealthResponse{
+			RuntimeBuild: "old-build", ProcessGeneration: "generation-1",
+			State: daemon.RuntimeStateHealthy, Ready: true,
+		}, nil
+	})
+	if err := stopObservedDaemonRuntime(t.Context(), controller, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.stops) != 1 {
+		t.Fatalf("stop requests = %d, want 1", len(controller.stops))
+	}
+	request := controller.stops[0]
+	if request.OperationID != "cc-pool.stop-runtime.v1:generation-1" ||
+		request.ExpectedRuntimeBuild != "old-build" ||
+		string(request.ControlRole) != daemon.StopRoleID ||
+		string(request.RuntimeClientConfig.Client.Role) != daemon.StopRoleID ||
+		request.RuntimeClientConfig.Client.WireBuild != daemon.WireBuild {
+		t.Fatalf("stop request = %+v", request)
 	}
 }
 

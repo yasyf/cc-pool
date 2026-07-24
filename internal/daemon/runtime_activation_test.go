@@ -1,15 +1,11 @@
 package daemon
 
 import (
-	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/yasyf/daemonkit/daemonrole"
-	"github.com/yasyf/daemonkit/drain"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/trust"
 )
 
 func writeExecutableFixture(t *testing.T, dir, name string) string {
@@ -37,53 +33,6 @@ func writeExecutableFixture(t *testing.T, dir, name string) string {
 	return filepath.Join(resolvedDir, name)
 }
 
-func TestRuntimeAcquiresListenerBeforeGenerationActivation(t *testing.T) {
-	root, err := os.MkdirTemp("/tmp", "ccp-activation-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	_ = writeExecutableFixture(t, root, "ccp")
-	t.Setenv("PATH", root)
-	socket := filepath.Join(root, "daemon.sock")
-	want := errors.New("activation stopped")
-	originalEnsure := ensureHolderRuntime
-	t.Cleanup(func() { ensureHolderRuntime = originalEnsure })
-	ensureHolderRuntime = func(context.Context) error {
-		info, err := os.Lstat(socket)
-		if err != nil {
-			t.Fatalf("listener was not acquired before activation: %v", err)
-		}
-		if info.Mode()&os.ModeSocket == 0 {
-			t.Fatalf("activation observed non-socket listener mode %v", info.Mode())
-		}
-		return want
-	}
-	s := &Server{
-		socket:       socket,
-		wireIntake:   &drain.Intake{},
-		syncIntake:   &drain.Intake{},
-		evictTimeout: defaultEvictTimeout,
-	}
-	_, runtime, err := s.runtime()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.Run(t.Context()); !errors.Is(err, want) {
-		t.Fatalf("runtime error = %v, want activation failure", err)
-	}
-	if s.m != nil || s.tenantClient != nil || s.disposableWorkers != nil {
-		t.Fatal("failed activation published generation-owned resources")
-	}
-}
-
-func TestServiceRolePathIsStableHomebrewAliasWithoutPATH(t *testing.T) {
-	t.Setenv("PATH", "/usr/bin:/bin")
-	if path := ServiceRolePath(); path != "/opt/homebrew/bin/cc-pool" {
-		t.Fatalf("ServiceRolePath() = %q", path)
-	}
-}
-
 func TestCurrentServiceExecutableRequiresExactAbsolutePath(t *testing.T) {
 	root := t.TempDir()
 	target := writeExecutableFixture(t, root, "ccp-v1")
@@ -103,35 +52,26 @@ func TestCurrentServiceExecutableRequiresExactAbsolutePath(t *testing.T) {
 	}
 }
 
-func TestStableServiceRoleReauthorizesOnlyRetargetedSuccessor(t *testing.T) {
-	dir := t.TempDir()
-	oldExecutable := writeExecutableFixture(t, dir, "cc-pool-old")
-	newExecutable := writeExecutableFixture(t, dir, "cc-pool-new")
-	unrelated := writeExecutableFixture(t, dir, "unrelated")
-	alias := filepath.Join(dir, "cc-pool")
-	if err := os.Symlink(oldExecutable, alias); err != nil {
+func TestDaemonTrustPolicyAssignsDistinctLifecycleRoles(t *testing.T) {
+	policy, err := daemonTrustPolicy()
+	if err != nil {
 		t.Fatal(err)
 	}
-	classifier := daemonrole.Classifier{RoleID: ServiceRoleID, RolePath: alias}
-	peer := func(path string) wire.Peer {
-		return wire.Peer{PID: os.Getpid(), UID: os.Geteuid(), StartTime: "start", Boot: "boot", Executable: path}
+	stop := trust.PeerRole(StopRoleID)
+	receipt := trust.PeerRole(ReceiptRoleID)
+	readiness := trust.PeerRole(ReadinessRoleID)
+	if !policy.AllowsUnprotected() || !policy.AllowsStop(stop) ||
+		!policy.AllowsReceipt(receipt) || !policy.AllowsReadiness(readiness) {
+		t.Fatal("daemon trust policy omitted an exact lifecycle role")
 	}
-	if accepted, err := classifier.Classify(t.Context(), peer(oldExecutable)); err != nil || !accepted {
-		t.Fatalf("old role accepted=%t err=%v", accepted, err)
+	if policy.AllowsStop(receipt) || policy.AllowsStop(readiness) ||
+		policy.AllowsReceipt(stop) || policy.AllowsReadiness(stop) {
+		t.Fatal("daemon trust policy conflated lifecycle role authority")
 	}
-	replacement := alias + ".new"
-	if err := os.Symlink(newExecutable, replacement); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(replacement, alias); err != nil {
-		t.Fatal(err)
-	}
-	if accepted, err := classifier.Classify(t.Context(), peer(newExecutable)); err != nil || !accepted {
-		t.Fatalf("new role accepted=%t err=%v", accepted, err)
-	}
-	for _, path := range []string{oldExecutable, unrelated} {
-		if accepted, err := classifier.Classify(t.Context(), peer(path)); err != nil || accepted {
-			t.Fatalf("role %q accepted=%t err=%v", path, accepted, err)
+	for _, role := range []trust.PeerRole{stop, receipt, readiness} {
+		requirement, ok := policy.Requirement(role)
+		if !ok || requirement.TeamID != ServiceTeamID || requirement.SigningIdentifier != ServiceRoleID {
+			t.Fatalf("role %q requirement = %+v, present=%t", role, requirement, ok)
 		}
 	}
 }

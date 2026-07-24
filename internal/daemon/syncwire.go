@@ -64,7 +64,7 @@ func (s *Server) setupSync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := s.startSyncServer(ctx, worker, worker.FetchCredentialHandler); err != nil {
+	if err := s.startSyncServer(ctx, worker); err != nil {
 		return err
 	}
 	s.syncSvc = svc

@@ -16,30 +16,17 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if recognized, err := daemon.RunStopControlChild(ctx, os.Args[1:]); recognized {
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-		return
-	}
 	if hostsync.IsWorkerInvocation(os.Args[1:]) {
-		owner, err := supervise.ReceiveTrackedOwner(ctx, proc.RecoverySourceOwner)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
 		if err := proc.CloseInheritedFDs(); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
-		if err := daemon.RunHostSyncWorker(ctx, owner, os.Stdin, os.Stdout); err != nil {
+		if err := daemon.RunHostSyncWorker(ctx, os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}

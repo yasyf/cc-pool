@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalog"
 	"github.com/yasyf/fusekit/catalogproto"
@@ -33,7 +34,7 @@ func NewClient(ctx context.Context, socket string) (*Client, error) {
 		return nil, errors.New("tenantfs: FuseKit socket is empty")
 	}
 	session, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild,
+		Dial: wire.UnixDialer(socket), WireBuild: transportproto.WireBuild, Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		return nil, err

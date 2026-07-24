@@ -113,7 +113,7 @@ func materializeForTeardown(t *testing.T, s *Service, m *pool.Manager, uuid stri
 	t.Helper()
 	ctx := context.Background()
 	oauthAccount := json.RawMessage(`{"accountUuid":"` + uuid + `"}`)
-	res, err := s.Materialize(ctx, materializeVal(uuid, "e@x", oauthAccount), []string{"hostB"}, pullConst(freshEnvelope("at-"+uuid)), materializeManifest)
+	res, err := s.Materialize(ctx, materializeVal(uuid, "e@x", oauthAccount), freshEnvelope("at-"+uuid), materializeManifest)
 	if err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}

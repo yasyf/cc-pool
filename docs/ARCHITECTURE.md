@@ -132,14 +132,14 @@ entry, so `ccp remove` on any host tears the account down everywhere. synckitd w
 per-account stamp files and nudges peers on change; its periodic reconcile tick is the
 floor when a notify is missed.
 
-**One secret path.** The daemon serves synckit's consumer contract on a second socket,
-`~/.cc-pool/sync.sock`, and that dispatcher carries exactly one custom method:
-`ccp.fetch_stripped_credential`. It serves the credential **stripped** — the refresh
-token is removed at the origin, so that secret never leaves the origin process.
-Stripped credentials transit peer RPC — over SSH via the hidden `ccp sync rpc-serve`
-stdio bridge — only during a pull, and land directly in the receiving host's Keychain.
-A host whose login Keychain is unsearchable (headless SSH) falls back to the plaintext
-file store; `ccp sync status` flags the exposure.
+**One delivery path.** The daemon exposes only Synckit's exact Export/Apply contract.
+Each immutable snapshot contains the secretless CRDT plus delivery-only credentials
+owned by that source host. Those credentials are **stripped** before export: the access
+token is bound to the registry chain hash and expiry, while the refresh token never
+leaves the origin process. Apply validates the canonical envelope and chain before
+making the access-only credential available to that one local convergence call. cc-pool
+does not persist delivery material in its registry or outbox, and there is no custom
+credential-fetch RPC, peer dialer, or compatibility transport.
 
 **Refresh discipline: one origin per chain.** Claude refresh tokens are single-use, so
 two hosts refreshing one chain double-spend it and the loser gets signed out. Each
@@ -148,11 +148,11 @@ the origin refreshes. Origin is a static fact, not a leased role, and the enforc
 is structural: a peer holds only the access token and its expiry, never the refresh
 token, so it has nothing to double-spend no matter how it races. The origin's idle
 refresh rotates the chain as usual, and each new access token propagates through the
-registry and pull machinery, keeping peers usable indefinitely while the origin is
+registry snapshot delivery, keeping peers usable indefinitely while the origin is
 alive. A peer whose synced copy expires with nothing fresher available reports
 needs-login — log in there, or wait for the origin — and sinks in scoring; `ccp login`
 mints that host its own chain, making the account dual-origin. On `invalid_grant`, the
-daemon strips the spent refresh token from its own blob and pulls the winner's
+daemon strips the spent refresh token from its own blob and accepts the winner's
 stripped chain, so a chain owned by two hosts self-heals into origin plus peer on the
 first double-spend.
 

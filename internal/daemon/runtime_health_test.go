@@ -9,7 +9,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -32,7 +31,7 @@ func TestRuntimeHealthReflectsHolderSessionState(t *testing.T) {
 func TestDaemonHealthObservationRequiresPublishedHealthyRuntime(t *testing.T) {
 	health := dkdaemon.Health{
 		RuntimeBuild: version.String(), RuntimeProtocol: int(wire.ProtocolVersion),
-		ProcessGeneration: "generation-1", PID: 42, State: dkdaemon.StateHealthy, Busy: true,
+		ProcessGeneration: daemonTestGeneration("generation-1"), PID: 42, State: dkdaemon.StateHealthy, Busy: true,
 	}
 	claims := newClaims()
 	if _, err := claims.beginSelection(store.Account{ID: 1, InstanceID: "instance-1", Generation: 1}, selectionLaunch{}, time.Minute); err != nil {
@@ -42,7 +41,6 @@ func TestDaemonHealthObservationRequiresPublishedHealthyRuntime(t *testing.T) {
 		t.Fatal("own exclusive claim")
 	}
 	server := &Server{
-		wireIntake:    &drain.Intake{},
 		runtimeHealth: func(context.Context) (dkdaemon.Health, error) { return health, nil },
 		cl:            claims,
 	}
@@ -75,7 +73,7 @@ func TestDaemonHealthObservationRequiresPublishedHealthyRuntime(t *testing.T) {
 	if err := json.Unmarshal(result.Payload, &response); err != nil {
 		t.Fatal(err)
 	}
-	if !response.Ready || response.RuntimeBuild != version.String() || response.ProcessGeneration != "generation-1" {
+	if !response.Ready || response.RuntimeBuild != version.String() || response.ProcessGeneration != daemonTestGeneration("generation-1").String() {
 		t.Fatalf("health observation = %+v", response)
 	}
 	health.Draining = true

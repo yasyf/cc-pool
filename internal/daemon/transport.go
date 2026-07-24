@@ -12,10 +12,9 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/version"
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/daemonrole"
-	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -56,24 +55,12 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if s.wireIntake == nil {
-		s.wireIntake = &drain.Intake{}
-	}
-	if s.syncIntake == nil {
-		s.syncIntake = &drain.Intake{}
-	}
-	role, err := daemonRole()
+	policy, err := daemonTrustPolicy()
 	if err != nil {
 		return nil, nil, err
 	}
 	wireServer := &wire.Server{
 		WireBuild: WireBuild, Ladder: ladder,
-		Trust: func(_ context.Context, peer wire.Peer) error {
-			if peer.UID != os.Geteuid() {
-				return fmt.Errorf("%w: peer uid %d, daemon uid %d", wire.ErrUntrustedPeer, peer.UID, os.Geteuid())
-			}
-			return nil
-		},
 	}
 	for _, op := range []Op{
 		OpSelect,
@@ -87,7 +74,7 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 		OpAccountMutationAck,
 	} {
 		op := op
-		wireServer.RegisterConcurrent(wire.Op(op), func(ctx context.Context, wireRequest wire.Request) (any, error) {
+		wireServer.Register(wire.HandlerSpec{Op: wire.Op(op), Concurrent: true, Handler: func(ctx context.Context, wireRequest wire.Request) (any, error) {
 			var request Request
 			if err := decodeStrict(wireRequest.Payload, &request); err != nil {
 				return nil, fmt.Errorf("decode %s request: %w", op, err)
@@ -97,29 +84,18 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 				return s.handleAccountMutationWire(ctx, wireRequest, request)
 			}
 			return s.dispatch(ctx, request), nil
-		})
+		}})
+	}
+	if s.m == nil || s.m.DisposableWorkers() == nil || s.m.RuntimeChildren() == nil {
+		return nil, nil, errors.New("daemon: runtime process ownership is unavailable")
 	}
 	runtime, err := wire.NewRuntime(wire.RuntimeConfig{
-		Socket:                    s.socket,
-		RuntimeBuild:              version.String(),
-		RuntimeProtocol:           int(wire.ProtocolVersion),
-		Wire:                      wireServer,
-		Classifier:                role,
-		ReservedProtectedSessions: 1,
-		StopVerifier: wire.StopVerifier{
-			Classifier: role, Role: StopRoleID,
-			Store: &proc.FileStore{Path: pool.DaemonServiceProcessStorePath()},
-		},
-		Observations: []wire.ObservationRoute{s.daemonHealthRoute()},
-		Readiness:    serverReadiness{owner: s},
-		ListenerWait: s.evictTimeout,
-		Admission:    s.wireIntake,
-		Workers:      &serverWorkers{owner: s},
-		State:        serverState{owner: s},
-		Resources:    lifecycleResource{server: s},
-		Activate:     s.activate,
-		HealthState:  s.runtimeHealthState,
-		Busy:         s.runtimeBusy,
+		Socket: s.socket, RuntimeBuild: version.String(), RuntimeProtocol: int(wire.ProtocolVersion),
+		Wire: wireServer, TrustPolicy: policy,
+		StopControlStore: &proc.FileStore{Path: pool.DaemonStopControlStorePath()},
+		Observations:     []wire.ObservationRoute{s.daemonHealthRoute()}, ListenerWait: s.evictTimeout,
+		Workers: s.m.DisposableWorkers(), Children: s.m.RuntimeChildren(),
+		ShutdownTimeout: daemonShutdownTimeout,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -186,7 +162,7 @@ func daemonHealthSnapshot(health dkdaemon.Health) (HealthResponse, error) {
 	}
 	return HealthResponse{
 		Schema: DaemonHealthSchema, RuntimeBuild: health.RuntimeBuild, RuntimeProtocol: health.RuntimeProtocol,
-		ProcessGeneration: health.ProcessGeneration, PID: health.PID, State: state,
+		ProcessGeneration: health.ProcessGeneration.String(), PID: health.PID, State: state,
 		Draining: health.Draining, Busy: health.Busy, Ready: health.Ready,
 	}, nil
 }
@@ -204,12 +180,7 @@ func daemonRuntimeStateFromDaemon(state dkdaemon.State) (RuntimeState, error) {
 	}
 }
 
-const serviceRolePath = "/opt/homebrew/bin/cc-pool"
-
 var currentServiceExecutable = service.CanonicalExecutable
-
-// ServiceRolePath returns the stable Homebrew alias re-resolved for each authorization.
-func ServiceRolePath() string { return serviceRolePath }
 
 // CurrentServiceExecutable returns the exact resolved binary installed into launchd.
 func CurrentServiceExecutable() (string, error) {
@@ -223,151 +194,52 @@ func CurrentServiceExecutable() (string, error) {
 	return rolePath, nil
 }
 
-func daemonRole() (daemonrole.Classifier, error) {
-	role := daemonrole.Classifier{
-		RoleID: ServiceRoleID, RolePath: ServiceRolePath(),
-	}
-	if err := role.Validate(); err != nil {
-		return daemonrole.Classifier{}, err
-	}
-	return role, nil
+func daemonTrustPolicy() (trust.TrustPolicy, error) {
+	requirement := trust.Requirement{TeamID: ServiceTeamID, SigningIdentifier: ServiceRoleID}
+	return trust.NewTrustPolicy(trust.TrustPolicyConfig{
+		ExpectedUID: os.Geteuid(), AllowUnprotected: true,
+		Roles: map[trust.PeerRole]trust.Requirement{
+			trust.PeerRole(StopRoleID):      requirement,
+			trust.PeerRole(ReceiptRoleID):   requirement,
+			trust.PeerRole(ReadinessRoleID): requirement,
+		},
+		StopRoles:      []trust.PeerRole{trust.PeerRole(StopRoleID)},
+		ReceiptRoles:   []trust.PeerRole{trust.PeerRole(ReceiptRoleID)},
+		ReadinessRoles: []trust.PeerRole{trust.PeerRole(ReadinessRoleID)},
+	})
 }
 
-type serverReadiness struct{ owner *Server }
-
-func (s serverReadiness) BeforeReady(ctx context.Context) error {
+func (s *Server) startProductRuntime(ctx context.Context) error {
 	execCtx, cancel := context.WithCancel(ctx)
-	s.owner.execMu.Lock()
-	s.owner.execCancel = cancel
-	s.owner.execMu.Unlock()
+	s.execMu.Lock()
+	s.execCancel = cancel
+	s.execMu.Unlock()
 
-	if err := s.owner.setupSync(execCtx); err != nil {
+	if err := s.setupSync(execCtx); err != nil {
 		cancel()
 		return fmt.Errorf("setup host sync publication: %w", err)
 	}
-	if s.owner.m.BuildCredentialWritePublication == nil || s.owner.m.SettleCredentialWrite == nil {
+	if s.m.BuildCredentialWritePublication == nil || s.m.SettleCredentialWrite == nil {
 		cancel()
 		return errors.New("host sync publication wiring is unavailable")
 	}
-	if s.owner.holderSessionDone == nil {
+	if s.holderSessionDone == nil {
 		cancel()
 		return errors.New("FuseKit runtime session monitor is unavailable")
 	}
-	if err := s.owner.m.RecoverRetiredCredentialOwners(execCtx); err != nil {
+	if err := s.m.RecoverRetiredCredentialOwners(execCtx); err != nil {
 		cancel()
 		return fmt.Errorf("recover retired credential owners: %w", err)
 	}
-	s.owner.log.Printf("daemon %s started; socket=%s", version.String(), s.owner.socket)
-	s.owner.wg.Add(1)
+	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
+	s.wg.Add(1)
 	go func() {
-		defer s.owner.wg.Done()
-		s.owner.runTable(execCtx, s.owner.newTick(execCtx), startupTable)
+		defer s.wg.Done()
+		s.runTable(execCtx, s.newTick(execCtx), startupTable)
 		if execCtx.Err() != nil {
 			return
 		}
-		s.owner.scheduler(execCtx)
+		s.scheduler(execCtx)
 	}()
 	return nil
-}
-
-func (s serverReadiness) AfterReady(err error) {
-	if err == nil {
-		s.owner.runtimePublished.Store(true)
-		return
-	}
-	s.owner.runtimePublished.Store(false)
-	s.owner.execMu.Lock()
-	cancel := s.owner.execCancel
-	s.owner.execMu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-}
-
-func (s serverReadiness) Published() bool { return s.owner.runtimePublished.Load() }
-
-type serverWorkers struct{ owner *Server }
-
-func (w *serverWorkers) Close() {
-	w.owner.markClosing()
-	w.owner.runtimePublished.Store(false)
-	w.owner.syncIntake.Close()
-	if w.owner.syncListener != nil {
-		_ = w.owner.syncListener.Close()
-	}
-	if w.owner.disposableWorkers != nil {
-		w.owner.disposableWorkers.Close()
-	}
-}
-
-func (w *serverWorkers) Cancel() {
-	w.owner.cancelHolderMonitor()
-	w.owner.execMu.Lock()
-	cancel := w.owner.execCancel
-	w.owner.execMu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	if w.owner.disposableWorkers != nil {
-		w.owner.disposableWorkers.Cancel()
-	}
-}
-
-func (w *serverWorkers) Wait(ctx context.Context) error {
-	settleErr := w.owner.syncIntake.Settle(ctx)
-	if w.owner.disposableWorkers != nil {
-		settleErr = errors.Join(settleErr, w.owner.disposableWorkers.Wait(ctx))
-	}
-	done := make(chan struct{})
-	go func() {
-		w.owner.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		settleErr = errors.Join(settleErr, fmt.Errorf("daemon: await background workers: %w", ctx.Err()))
-	}
-	return settleErr
-}
-
-type lifecycleResource struct {
-	server *Server
-}
-
-type serverState struct{ owner *Server }
-
-func (s *Server) runtimeHealthState() dkdaemon.State {
-	if s.holderLost.Load() {
-		return dkdaemon.StateFailed
-	}
-	if !s.holderActive.Load() {
-		return dkdaemon.StateDegraded
-	}
-	return dkdaemon.StateHealthy
-}
-
-func (s *Server) runtimeBusy() bool {
-	return !s.holderActive.Load() || s.holderLost.Load()
-}
-
-func (s serverState) Close() error {
-	if s.owner == nil || s.owner.m == nil {
-		return nil
-	}
-	if s.owner.accountMutationLifetime == nil {
-		return errors.New("daemon manager close requires an active lifecycle")
-	}
-	err := s.owner.m.Close(s.owner.accountMutationLifetime)
-	s.owner.m = nil
-	return err
-}
-
-func (r lifecycleResource) Close() error {
-	var errs []error
-	if r.server != nil && r.server.tenantClient != nil {
-		r.server.holderActive.Store(false)
-		errs = append(errs, r.server.tenantClient.Close())
-	}
-	return errors.Join(errs...)
 }

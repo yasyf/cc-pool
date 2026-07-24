@@ -13,10 +13,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/accountterminal"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -373,7 +374,7 @@ func (c *Client) AccountMutation(
 	return *response.AccountMutation, nil
 }
 
-// AccountMutationTerminal attaches this terminal to the daemon-supervised
+// AccountMutationTerminal attaches this terminal to the daemon-owned
 // interactive writer. The daemon owns the child, journal, verification, and
 // compensation; the client carries only terminal bytes.
 func (c *Client) AccountMutationTerminal(
@@ -425,7 +426,7 @@ func (c *Client) AccountMutationTerminal(
 	if outputFile, ok := stdout.(*os.File); ok {
 		resizeSource = outputFile
 	}
-	if err := supervise.RunTerminalClient(ctx, supervise.TerminalClientConfig{
+	if err := accountterminal.RunTerminalClient(ctx, accountterminal.TerminalClientConfig{
 		Endpoint: endpoint, Stdin: stdin, Stdout: stdout, ResizeSource: resizeSource, OnURL: onURL,
 	}); err != nil {
 		return AccountMutationResult{}, err
@@ -468,7 +469,7 @@ func newAccountMutationTerminalEndpoint(
 
 func (e *accountMutationTerminalEndpoint) Send(
 	ctx context.Context,
-	input supervise.TerminalInput,
+	input accountterminal.TerminalInput,
 ) error {
 	payload, err := encodeAccountTerminalInput(input)
 	if err != nil {
@@ -522,13 +523,13 @@ func (e *accountMutationTerminalEndpoint) Send(
 
 func (e *accountMutationTerminalEndpoint) Receive(
 	ctx context.Context,
-) (supervise.TerminalOutput, error) {
+) (accountterminal.TerminalOutput, error) {
 	for {
 		e.mu.Lock()
 		call := e.call
 		e.mu.Unlock()
 		if call == nil {
-			return supervise.TerminalOutput{}, errors.New("account mutation terminal is detached")
+			return accountterminal.TerminalOutput{}, errors.New("account mutation terminal is detached")
 		}
 		select {
 		case chunk, ok := <-call.Chunks():
@@ -536,12 +537,12 @@ func (e *accountMutationTerminalEndpoint) Receive(
 				return e.decodeOutput(chunk.Payload)
 			}
 		case <-ctx.Done():
-			return supervise.TerminalOutput{}, ctx.Err()
+			return accountterminal.TerminalOutput{}, ctx.Err()
 		}
 		result, err := call.Response(ctx)
 		if err != nil || result.Outcome != wire.Delivered {
 			if ctx.Err() != nil {
-				return supervise.TerminalOutput{}, ctx.Err()
+				return accountterminal.TerminalOutput{}, ctx.Err()
 			}
 			failure := &CallError{
 				Op: wire.Op(OpAccountMutation), Outcome: result.Outcome,
@@ -549,31 +550,31 @@ func (e *accountMutationTerminalEndpoint) Receive(
 			}
 			if !retryableTerminalCall(result, err) {
 				e.drop(call, false)
-				return supervise.TerminalOutput{}, failure
+				return accountterminal.TerminalOutput{}, failure
 			}
 			e.drop(call, true)
 			if reconnectErr := e.reconnect(ctx); reconnectErr != nil {
-				return supervise.TerminalOutput{}, errors.Join(failure, reconnectErr)
+				return accountterminal.TerminalOutput{}, errors.Join(failure, reconnectErr)
 			}
 			continue
 		}
 		mutation, decodeErr := decodeAccountMutationTerminalResult(result)
 		if decodeErr != nil {
 			e.drop(call, false)
-			return supervise.TerminalOutput{}, decodeErr
+			return accountterminal.TerminalOutput{}, decodeErr
 		}
 		if validateErr := validateAccountMutationTerminalResult(
 			mutation, e.request.Kind, e.request.AccountID, &e.request.Fence,
 		); validateErr != nil {
 			e.drop(call, false)
-			return supervise.TerminalOutput{}, validateErr
+			return accountterminal.TerminalOutput{}, validateErr
 		}
 		if !accountMutationTerminalState(mutation.State) {
 			e.drop(call, false)
-			return supervise.TerminalOutput{}, errors.New("daemon terminal stream ended before the mutation settled")
+			return accountterminal.TerminalOutput{}, errors.New("daemon terminal stream ended before the mutation settled")
 		}
 		e.complete(call, mutation)
-		return supervise.TerminalOutput{}, io.EOF
+		return accountterminal.TerminalOutput{}, io.EOF
 	}
 }
 
@@ -717,24 +718,24 @@ func (e *accountMutationTerminalEndpoint) signalStateLocked() {
 	e.stateChanged = make(chan struct{})
 }
 
-func (e *accountMutationTerminalEndpoint) decodeOutput(payload []byte) (supervise.TerminalOutput, error) {
-	if len(payload) <= 8 || len(payload) > supervise.TerminalChunkSize+8 {
-		return supervise.TerminalOutput{}, errors.New("daemon terminal output frame is empty or oversized")
+func (e *accountMutationTerminalEndpoint) decodeOutput(payload []byte) (accountterminal.TerminalOutput, error) {
+	if len(payload) <= 8 || len(payload) > accountterminal.TerminalChunkSize+8 {
+		return accountterminal.TerminalOutput{}, errors.New("daemon terminal output frame is empty or oversized")
 	}
 	sequence := binary.BigEndian.Uint64(payload[:8])
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.haveCursor && sequence != e.nextSequence {
-		return supervise.TerminalOutput{}, fmt.Errorf(
+		return accountterminal.TerminalOutput{}, fmt.Errorf(
 			"daemon terminal output sequence %d, want %d", sequence, e.nextSequence,
 		)
 	}
 	if sequence == ^uint64(0) {
-		return supervise.TerminalOutput{}, errors.New("daemon terminal output sequence exhausted")
+		return accountterminal.TerminalOutput{}, errors.New("daemon terminal output sequence exhausted")
 	}
 	e.nextSequence = sequence + 1
 	e.haveCursor = true
-	return supervise.TerminalOutput{
+	return accountterminal.TerminalOutput{
 		Sequence: sequence, Data: append([]byte(nil), payload[8:]...),
 	}, nil
 }
@@ -963,7 +964,7 @@ func (c *Client) dial(ctx context.Context) (*clientSession, error) {
 		return nil, err
 	}
 	client, err := wire.NewClient(ctx, wire.ClientConfig{
-		Dial: wire.UnixDialer(c.socket), WireBuild: c.clientBuild(), Ladder: ladder,
+		Dial: wire.UnixDialer(c.socket), WireBuild: c.clientBuild(), Role: trust.UnprotectedRole, Ladder: ladder,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("connect daemon: %w", err)

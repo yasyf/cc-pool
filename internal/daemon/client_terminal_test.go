@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/cc-pool/internal/accountterminal"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -57,9 +57,9 @@ func TestAccountMutationTerminalEndpointWaitsForReconnectState(t *testing.T) {
 	endpoint := &accountMutationTerminalEndpoint{stateChanged: make(chan struct{})}
 	done := make(chan error, 1)
 	go func() {
-		done <- endpoint.Send(t.Context(), supervise.TerminalInput{
-			Kind: supervise.TerminalInputResize,
-			Size: supervise.TerminalSize{Rows: 24, Cols: 80},
+		done <- endpoint.Send(t.Context(), accountterminal.TerminalInput{
+			Kind: accountterminal.TerminalInputResize,
+			Size: accountterminal.TerminalSize{Rows: 24, Cols: 80},
 		})
 	}()
 	select {

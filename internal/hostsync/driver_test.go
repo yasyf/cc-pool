@@ -110,8 +110,8 @@ func (c *fakeCred) InstallSyncedCredential(_ context.Context, a store.Account, c
 }
 
 type materializeCall struct {
-	uuid  string
-	peers []string
+	uuid       string
+	credential *creds.Credential
 }
 
 // fakeMaterializer records each call and, on success, inserts the new row into the
@@ -126,8 +126,8 @@ type fakeMaterializer struct {
 	deferAll bool
 }
 
-func (m *fakeMaterializer) materialize(_ context.Context, v AccountValue, peers []string) (MaterializeResult, error) {
-	m.calls = append(m.calls, materializeCall{v.UUID, peers})
+func (m *fakeMaterializer) materialize(_ context.Context, v AccountValue, credential *creds.Credential) (MaterializeResult, error) {
+	m.calls = append(m.calls, materializeCall{v.UUID, credential})
 	if m.err != nil {
 		return MaterializeResult{}, m.err
 	}
@@ -143,23 +143,21 @@ func (m *fakeMaterializer) materialize(_ context.Context, v AccountValue, peers 
 	return MaterializeResult{UUID: v.UUID, AccountID: id}, nil
 }
 
-type pullCall struct {
-	uuid     string
-	chain    ChainStamp
-	localExp int64
-	peers    []string
+type resolveCall struct {
+	uuid  string
+	chain ChainStamp
 }
 
-// fakePuller records each pull and returns a canned credential/error.
-type fakePuller struct {
-	calls []pullCall
+// fakeResolver records each delivery-scoped lookup and returns canned material.
+type fakeResolver struct {
+	calls []resolveCall
 	cred  *creds.Credential
 	err   error
 }
 
-func (p *fakePuller) pull(_ context.Context, uuid string, chain ChainStamp, localExp int64, peers []string) (*creds.Credential, error) {
-	p.calls = append(p.calls, pullCall{uuid, chain, localExp, peers})
-	return p.cred, p.err
+func (r *fakeResolver) resolve(_ context.Context, uuid string, chain ChainStamp) (*creds.Credential, error) {
+	r.calls = append(r.calls, resolveCall{uuid, chain})
+	return r.cred, r.err
 }
 
 // fakeConvergeFetcher serves a fixed per-peer registry and can fail a chosen peer.
@@ -184,12 +182,12 @@ func (f *fakeConvergeFetcher) Fetch(_ context.Context, peer string) (cregistry.R
 // --- harness -----------------------------------------------------------------
 
 type driverHarness struct {
-	svc   *Service
-	store *fakeDriverStore
-	cred  *fakeCred
-	mat   *fakeMaterializer
-	pull  *fakePuller
-	d     *Driver
+	svc     *Service
+	store   *fakeDriverStore
+	cred    *fakeCred
+	mat     *fakeMaterializer
+	resolve *fakeResolver
+	d       *Driver
 }
 
 func newDriverHarness(t *testing.T) *driverHarness {
@@ -200,11 +198,11 @@ func newDriverHarness(t *testing.T) *driverHarness {
 	st := newFakeStore()
 	cr := newFakeCred()
 	h := &driverHarness{
-		svc:   svc,
-		store: st,
-		cred:  cr,
-		mat:   &fakeMaterializer{store: st, cred: cr},
-		pull:  &fakePuller{},
+		svc:     svc,
+		store:   st,
+		cred:    cr,
+		mat:     &fakeMaterializer{store: st, cred: cr},
+		resolve: &fakeResolver{cred: strippedCred(5_000)},
 	}
 	h.d = NewDriver(svc, DriverDeps{
 		Store:       st,
@@ -213,7 +211,7 @@ func newDriverHarness(t *testing.T) *driverHarness {
 		Admit: func(context.Context, store.Account, string) (bool, error) {
 			return false, nil
 		},
-		Pull: h.pull.pull,
+		Resolve: h.resolve.resolve,
 	})
 	return h
 }
@@ -277,9 +275,9 @@ func TestDriverReconcile(t *testing.T) {
 			},
 		},
 		{
-			name: "materialize-no-envelope-deferred",
+			name: "materialize-no-delivery-material-deferred",
 			setup: func(h *driverHarness) {
-				h.mat.err = ErrMaterializeNoEnvelope
+				h.resolve.err = ErrCredentialMaterialUnavailable
 			},
 			id:          "u1",
 			val:         acctValue("u1", "peer-u1", "hostA", 5000, freshOAuth("u1")),
@@ -293,15 +291,15 @@ func TestDriverReconcile(t *testing.T) {
 				h.cred.expiry[1] = 5000
 			},
 			id:          "u1",
-			val:         acctValue("u1", "new", "hostA", 5000, freshOAuth("u1")), // chain equal ⇒ no pull
+			val:         acctValue("u1", "new", "hostA", 5000, freshOAuth("u1")),
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeLabeled,
 			check: func(t *testing.T, h *driverHarness) {
 				if len(h.store.labelSets) != 1 || h.store.labelSets[0] != (labelSet{1, "new"}) {
 					t.Fatalf("label sets = %+v, want one (1,new)", h.store.labelSets)
 				}
-				if len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
-					t.Fatalf("a label-only reconcile pulled/installed: pulls=%+v installs=%+v", h.pull.calls, h.cred.installs)
+				if len(h.resolve.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("a label-only reconcile resolved/installed: resolves=%+v installs=%+v", h.resolve.calls, h.cred.installs)
 				}
 			},
 		},
@@ -310,7 +308,7 @@ func TestDriverReconcile(t *testing.T) {
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.expiry[1] = 1000
-				h.pull.cred = credWithExpiry(2000)
+				h.resolve.cred = strippedCred(2000)
 				h.svc.Sessions = fakeSessions{busy: map[string]bool{"u1": true}, reason: "live session"}
 			},
 			id:          "u1",
@@ -318,8 +316,8 @@ func TestDriverReconcile(t *testing.T) {
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeDeferred,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
-					t.Fatalf("a busy account's credential was touched: pulls=%+v installs=%+v", h.pull.calls, h.cred.installs)
+				if len(h.resolve.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("a busy account's credential was touched: resolves=%+v installs=%+v", h.resolve.calls, h.cred.installs)
 				}
 			},
 		},
@@ -328,7 +326,7 @@ func TestDriverReconcile(t *testing.T) {
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.expiry[1] = 1000
-				h.pull.cred = credWithExpiry(2000)
+				h.resolve.cred = strippedCred(2000)
 				h.svc.Sessions = fakeSessions{err: errors.New("scan failed")}
 			},
 			id:      "u1",
@@ -336,25 +334,25 @@ func TestDriverReconcile(t *testing.T) {
 			peers:   []string{"hostB"},
 			wantErr: true,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
-					t.Fatalf("an unprovably-idle account's credential was touched: pulls=%+v installs=%+v", h.pull.calls, h.cred.installs)
+				if len(h.resolve.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("an unprovably-idle account's credential was touched: resolves=%+v installs=%+v", h.resolve.calls, h.cred.installs)
 				}
 			},
 		},
 		{
-			name: "fresher-pulls-envelope-and-installs",
+			name: "fresher-delivery-installs",
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.expiry[1] = 1000
-				h.pull.cred = credWithExpiry(2000)
+				h.resolve.cred = strippedCred(2000)
 			},
 			id:          "u1",
 			val:         acctValue("u1", "same", "hostA", 2000, freshOAuth("u1")),
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeCredInstalled,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.pull.calls) != 1 || h.pull.calls[0].localExp != 1000 {
-					t.Fatalf("pull calls = %+v, want one with localExp 1000", h.pull.calls)
+				if len(h.resolve.calls) != 1 || h.resolve.calls[0].uuid != "u1" {
+					t.Fatalf("resolve calls = %+v, want one for u1", h.resolve.calls)
 				}
 				if len(h.cred.installs) != 1 || h.cred.installs[0] != (credInstall{1, 2000}) {
 					t.Fatalf("installs = %+v, want one (1,2000)", h.cred.installs)
@@ -366,15 +364,15 @@ func TestDriverReconcile(t *testing.T) {
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.expiry[1] = 1000
-				h.pull.cred = strippedCred(2000) // a fresher credential the guard must NOT install
+				h.resolve.cred = strippedCred(2000)
 			},
 			id:          "u1",
 			val:         acctValue("u-attacker", "same", "hostA", 2000, freshOAuth("u-attacker")), // value UUID != key
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeNoop,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.mat.calls) != 0 || len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
-					t.Fatalf("a key/value-UUID mismatch acted: mat=%+v pulls=%+v installs=%+v", h.mat.calls, h.pull.calls, h.cred.installs)
+				if len(h.mat.calls) != 0 || len(h.resolve.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("a key/value-UUID mismatch acted: mat=%+v resolves=%+v installs=%+v", h.mat.calls, h.resolve.calls, h.cred.installs)
 				}
 			},
 		},
@@ -391,36 +389,36 @@ func TestDriverReconcile(t *testing.T) {
 			},
 		},
 		{
-			name: "owned-local-never-pulled", // the owned-precedence litmus
+			name: "owned-local-never-replaced",
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.cred[1] = credWithExpiry(1000) // owned: refresh token present
-				h.pull.cred = strippedCred(2000)
+				h.resolve.cred = strippedCred(2000)
 			},
 			id:          "u1",
 			val:         acctValue("u1", "same", "hostA", 2000, freshOAuth("u1")), // registry strictly fresher
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeUnchanged,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
-					t.Fatalf("an owned local blob was pulled over: pulls=%+v installs=%+v", h.pull.calls, h.cred.installs)
+				if len(h.resolve.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("an owned local blob was replaced: resolves=%+v installs=%+v", h.resolve.calls, h.cred.installs)
 				}
 			},
 		},
 		{
-			name: "tombstone-local-pulls",
+			name: "tombstone-local-installs-delivery",
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.readErr = fmt.Errorf("read credential: %w", creds.ErrNoTokens)
-				h.pull.cred = strippedCred(2000)
+				h.resolve.cred = strippedCred(2000)
 			},
 			id:          "u1",
 			val:         acctValue("u1", "same", "hostA", 2000, freshOAuth("u1")),
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeCredInstalled,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.pull.calls) != 1 || h.pull.calls[0].localExp != 0 {
-					t.Fatalf("pull calls = %+v, want one with localExp 0 (tombstone reads as absent)", h.pull.calls)
+				if len(h.resolve.calls) != 1 {
+					t.Fatalf("resolve calls = %+v, want one", h.resolve.calls)
 				}
 				if len(h.cred.installs) != 1 || h.cred.installs[0] != (credInstall{1, 2000}) {
 					t.Fatalf("installs = %+v, want one (1,2000)", h.cred.installs)
@@ -438,13 +436,13 @@ func TestDriverReconcile(t *testing.T) {
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeDeferred,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
-					t.Fatalf("an unreadable slot pulled/installed: pulls=%+v installs=%+v", h.pull.calls, h.cred.installs)
+				if len(h.resolve.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("an unreadable slot resolved/installed: resolves=%+v installs=%+v", h.resolve.calls, h.cred.installs)
 				}
 			},
 		},
 		{
-			name: "same-chain-hash-never-pulls",
+			name: "same-chain-hash-never-resolves",
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.cred[1] = strippedCred(2000) // the advertised chain, already installed
@@ -460,8 +458,8 @@ func TestDriverReconcile(t *testing.T) {
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeUnchanged,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
-					t.Fatalf("same-chain entry pulled/installed: pulls=%+v installs=%+v", h.pull.calls, h.cred.installs)
+				if len(h.resolve.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("same-chain entry resolved/installed: resolves=%+v installs=%+v", h.resolve.calls, h.cred.installs)
 				}
 			},
 		},
@@ -470,15 +468,15 @@ func TestDriverReconcile(t *testing.T) {
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.expiry[1] = 2000 // local strictly fresher than the registry entry
-				h.pull.cred = credWithExpiry(1000)
+				h.resolve.cred = strippedCred(1000)
 			},
 			id:          "u1",
 			val:         acctValue("u1", "same", "hostA", 1000, freshOAuth("u1")),
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeUnchanged,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.pull.calls) != 0 {
-					t.Fatalf("a staler registry chain triggered a pull: %+v", h.pull.calls)
+				if len(h.resolve.calls) != 0 {
+					t.Fatalf("a staler registry chain triggered a resolve: %+v", h.resolve.calls)
 				}
 				if len(h.cred.installs) != 0 {
 					t.Fatalf("a staler registry chain triggered an install: %+v", h.cred.installs)
@@ -486,46 +484,43 @@ func TestDriverReconcile(t *testing.T) {
 			},
 		},
 		{
-			name: "hash-mismatch-rejected-surfaces-as-deferred",
+			name: "missing-delivery-material-is-deferred",
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.expiry[1] = 1000
-				h.pull.err = ErrNoPeerCredential // the credpull sentinel: no acceptable envelope
+				h.resolve.err = ErrCredentialMaterialUnavailable
 			},
 			id:          "u1",
 			val:         acctValue("u1", "same", "hostA", 2000, freshOAuth("u1")),
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeDeferred,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.pull.calls) != 1 {
-					t.Fatalf("pull calls = %+v, want one (the fresher entry was pulled)", h.pull.calls)
+				if len(h.resolve.calls) != 1 {
+					t.Fatalf("resolve calls = %+v, want one", h.resolve.calls)
 				}
 				if len(h.cred.installs) != 0 {
-					t.Fatalf("a rejected pull still installed: %+v", h.cred.installs)
+					t.Fatalf("missing delivery still installed: %+v", h.cred.installs)
 				}
 			},
 		},
 		{
-			name: "origin-unreachable-falls-back",
+			name: "delivery-material-is-chain-bound",
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.expiry[1] = 1000
-				h.pull.cred = strippedCred(2000) // fallback to a relay peer succeeded
+				h.resolve.cred = strippedCred(2000)
 			},
 			id:          "u1",
 			val:         acctValue("u1", "same", "hostA", 2000, freshOAuth("u1")),
 			peers:       []string{"hostB", "hostA"},
 			wantOutcome: OutcomeCredInstalled,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.pull.calls) != 1 {
-					t.Fatalf("pull calls = %+v, want one", h.pull.calls)
+				if len(h.resolve.calls) != 1 {
+					t.Fatalf("resolve calls = %+v, want one", h.resolve.calls)
 				}
-				got := h.pull.calls[0]
+				got := h.resolve.calls[0]
 				if got.chain.Origin != "hostA" {
-					t.Fatalf("pull chain origin = %q, want hostA (the origin is tried first)", got.chain.Origin)
-				}
-				if len(got.peers) != 2 || got.peers[0] != "hostB" || got.peers[1] != "hostA" {
-					t.Fatalf("pull peers = %v, want the full mesh for fallback", got.peers)
+					t.Fatalf("resolved chain origin = %q, want hostA", got.chain.Origin)
 				}
 			},
 		},
@@ -534,7 +529,7 @@ func TestDriverReconcile(t *testing.T) {
 			setup: func(h *driverHarness) {
 				h.store.add(store.Account{ID: 1, AccountUUID: "u1", Label: "same"})
 				h.cred.expiry[1] = 1000
-				h.pull.cred = credWithExpiry(2000)
+				h.resolve.cred = strippedCred(2000)
 				h.cred.installErr = creds.ErrUnavailable
 			},
 			id:          "u1",
@@ -558,9 +553,9 @@ func TestDriverReconcile(t *testing.T) {
 			peers:       []string{"hostB"},
 			wantOutcome: OutcomeUnchanged,
 			check: func(t *testing.T, h *driverHarness) {
-				if len(h.store.labelSets) != 0 || len(h.pull.calls) != 0 || len(h.cred.installs) != 0 {
-					t.Fatalf("a no-op reconcile wrote: labels=%+v pulls=%+v installs=%+v",
-						h.store.labelSets, h.pull.calls, h.cred.installs)
+				if len(h.store.labelSets) != 0 || len(h.resolve.calls) != 0 || len(h.cred.installs) != 0 {
+					t.Fatalf("a no-op reconcile wrote: labels=%+v resolves=%+v installs=%+v",
+						h.store.labelSets, h.resolve.calls, h.cred.installs)
 				}
 			},
 		},
@@ -693,8 +688,8 @@ func TestThreeWayMergeConverges(t *testing.T) {
 			}
 			outcomes[r.ID] = r.Outcome
 		}
-		if h.pull.calls != nil {
-			t.Fatalf("no pull should happen (all chains equal): %+v", h.pull.calls)
+		if len(h.resolve.calls) != 2 {
+			t.Fatalf("delivery resolves = %+v, want the two missing accounts", h.resolve.calls)
 		}
 
 		// Second pass: every account now resolves locally and matches ⇒ no mutation.
@@ -706,6 +701,9 @@ func TestThreeWayMergeConverges(t *testing.T) {
 			if r.Outcome != OutcomeUnchanged {
 				t.Fatalf("second pass item %s outcome = %q, want unchanged (idempotence)", r.ID, r.Outcome)
 			}
+		}
+		if len(h.resolve.calls) != 2 {
+			t.Fatalf("second pass repeated delivery resolution: %+v", h.resolve.calls)
 		}
 
 		raw, err := os.ReadFile(h.svc.Registry.Path)

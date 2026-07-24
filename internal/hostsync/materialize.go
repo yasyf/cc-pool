@@ -11,14 +11,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// ErrMaterializeNoEnvelope is a retryable materialization failure: no peer
-// held the credential envelope; the half-built account is rolled back first.
-var ErrMaterializeNoEnvelope = errors.New("hostsync: no credential envelope available from peers")
-
-// PullCredential fetches uuid's credential envelope from its chain origin,
-// falling back to the other peers; a nil credential with a nil error means no envelope.
-type PullCredential func(ctx context.Context, uuid string, chain ChainStamp, peers []string) (*creds.Credential, error)
-
 // MaterializeResult reports what Materialize did for one peer-added account.
 type MaterializeResult struct {
 	// UUID is the account this pass acted on.
@@ -38,7 +30,7 @@ type MaterializeResult struct {
 // PrepareAdd roll the dir and reservation back via AbandonAdd, except retained
 // or unprovable slot state and rejected envelopes, which only release the
 // reservation.
-func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []string, pull PullCredential, manifestPath string) (MaterializeResult, error) {
+func (s *Service) Materialize(ctx context.Context, v AccountValue, credential *creds.Credential, manifestPath string) (MaterializeResult, error) {
 	if v.UUID == "" {
 		return MaterializeResult{}, fmt.Errorf("hostsync: Materialize requires a UUID")
 	}
@@ -51,6 +43,15 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 	}
 	if err := validateMaterializeIdentity(v); err != nil {
 		return MaterializeResult{}, err
+	}
+	if credential == nil {
+		return MaterializeResult{}, ErrCredentialMaterialUnavailable
+	}
+	if credential.HasRefreshToken() {
+		return MaterializeResult{}, pool.ErrEnvelopeCarriesSecret
+	}
+	if !credential.Synced() {
+		return MaterializeResult{}, pool.ErrEnvelopeNoAccessToken
 	}
 	if err := rejectExistingExternalUUID(ctx, s.M, v.UUID); err != nil {
 		return MaterializeResult{}, err
@@ -89,10 +90,8 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		}
 		return MaterializeResult{}, cause
 	}
-	// Rollback after a failed pull is decided by what's in the slot, not the
-	// pull-error class: a concurrent `ccp add` login may have landed an owned
-	// credential mid-pull, which AbandonAdd would delete. Only a provably
-	// empty slot is torn down; a retained or unprovable one is released intact.
+	// A promotion race may leave an owned credential in the slot. Only a
+	// provably empty slot is torn down; retained or unprovable state is released.
 	abandonUnlessRetained := func(cause error) (MaterializeResult, error) {
 		retained, err := s.slotRetainsCredential(ctx, p)
 		switch {
@@ -124,22 +123,6 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		return abandon(fmt.Errorf("materialize %s: write identity: %w", v.UUID, err))
 	}
 
-	env, err := pull(ctx, v.UUID, v.Chain, peers)
-	switch {
-	// A rejected envelope (the puller's per-peer sentinels included) must
-	// never AbandonAdd: that deletes any retained slot credentials — release
-	// keeps them intact.
-	case errors.Is(err, pool.ErrEnvelopeCarriesSecret), errors.Is(err, pool.ErrEnvelopeNoAccessToken):
-		return release(fmt.Errorf("materialize %s: %w", v.UUID, err))
-	case err != nil:
-		return abandonUnlessRetained(fmt.Errorf("materialize %s: %w", v.UUID, errors.Join(ErrMaterializeNoEnvelope, err)))
-	case env == nil:
-		return abandonUnlessRetained(fmt.Errorf("materialize %s: %w", v.UUID, ErrMaterializeNoEnvelope))
-	case env.HasRefreshToken():
-		return release(fmt.Errorf("materialize %s: %w", v.UUID, pool.ErrEnvelopeCarriesSecret))
-	case !env.Synced():
-		return release(fmt.Errorf("materialize %s: %w", v.UUID, pool.ErrEnvelopeNoAccessToken))
-	}
 	retained, err := s.slotRetainsCredential(ctx, p)
 	if err != nil && !errors.Is(err, creds.ErrUnavailable) {
 		return release(fmt.Errorf("materialize %s: recheck credential slot: %w", v.UUID, err))
@@ -173,14 +156,14 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, peers []strin
 		acct = resolved
 	}
 	durable := MaterializeResult{UUID: v.UUID, AccountID: acct.ID, Bootstrapped: bootstrapped}
-	installed, err := s.M.InstallSyncedCredential(ctx, *acct, env)
+	installed, err := s.M.InstallSyncedCredential(ctx, *acct, credential)
 	if err != nil {
 		return durable, fmt.Errorf("materialize %s: install access-only credential: %w", v.UUID, err)
 	}
 	if !installed {
 		return durable, fmt.Errorf("materialize %s: access-only credential did not land", v.UUID)
 	}
-	if _, err := s.AdmitSyncedAccount(ctx, *acct, creds.AccessHash(env)); err != nil {
+	if _, err := s.AdmitSyncedAccount(ctx, *acct, creds.AccessHash(credential)); err != nil {
 		return durable, fmt.Errorf("materialize %s: admit synced account: %w", v.UUID, err)
 	}
 

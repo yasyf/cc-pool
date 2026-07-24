@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -14,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -32,11 +30,21 @@ func hasMethod(ms []string, want string) bool {
 	return false
 }
 
+type blockingSyncConsumer struct {
+	syncservice.SyncConsumer
+	apply func(context.Context, syncservice.ChangeEnvelope) (syncservice.ApplyResult, error)
+}
+
+func (c blockingSyncConsumer) Apply(
+	ctx context.Context,
+	change syncservice.ChangeEnvelope,
+) (syncservice.ApplyResult, error) {
+	return c.apply(ctx, change)
+}
+
 // TestSyncSocketServesConsumer stands up the real second socket and round-trips
-// both a contract method (svc.capabilities) and the custom credential fetch
-// over a unix client, pins the 0600 socket mode, and pins that v1's
-// ccp.fetch_credential (which served the full refresh-token-bearing blob) is
-// NOT registered — a downrev peer gets unknown-method, never a credential.
+// the contract capability method over a unix client, pins the 0600 socket mode,
+// and proves removed credential-fetch methods are not registered.
 func TestSyncSocketServesConsumer(t *testing.T) {
 	// macOS caps sun_path at 104 bytes; t.TempDir paths overflow it.
 	sockDir, err := os.MkdirTemp("/tmp", "ccp-sync")
@@ -51,25 +59,11 @@ func TestSyncSocketServesConsumer(t *testing.T) {
 	svc := &hostsync.Service{Registry: &rf, StampDir: filepath.Join(regDir, "stamps")}
 	consumer := hostsync.NewConsumer(svc, func() (bool, error) { return true, nil })
 
-	served := &creds.Credential{}
-	served.ClaudeAiOauth.AccessToken = "at-sock"
-	served.ClaudeAiOauth.RefreshToken = "rt-sock"
-	served.ClaudeAiOauth.ExpiresAt = 5_000_000_000_000
-	acct := store.Account{ID: 9, ConfigDir: "/cfg/acct-09", KeychainService: "svc9", KeychainAccount: "me"}
-	lookup := func(uuid string) (store.Account, bool, error) {
-		if uuid == "u-sock" {
-			return acct, true, nil
-		}
-		return store.Account{}, false, nil
-	}
-	read := func(context.Context, store.Account) (*creds.Credential, error) { return served, nil }
-	fetch := hostsync.NewFetchCredentialHandler(lookup, read)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	var intake drain.Intake
 	t.Cleanup(func() { cancel(); wg.Wait() })
-	if _, err := serveSyncSocket(ctx, &wg, &intake, sock, consumer, fetch, log.New(io.Discard, "", 0)); err != nil {
+	if _, err := serveSyncSocket(ctx, &wg, &intake, sock, consumer, log.New(io.Discard, "", 0)); err != nil {
 		t.Fatalf("serveSyncSocket: %v", err)
 	}
 
@@ -88,53 +82,22 @@ func TestSyncSocketServesConsumer(t *testing.T) {
 	if caps.Name != "cc-pool" {
 		t.Errorf("Capabilities Name = %q, want cc-pool", caps.Name)
 	}
-	if !hasMethod(caps.Methods, hostsync.MethodFetchCredential) {
-		t.Errorf("Capabilities Methods %v missing %s", caps.Methods, hostsync.MethodFetchCredential)
-	}
-
 	tx := syncservice.Socket(sock)
 	defer func() { _ = tx.Close() }()
-	resp, err := tx.Do(ctx, &rpc.Request{Method: hostsync.MethodFetchCredential, Params: map[string]any{"uuid": "u-sock"}})
-	if err != nil {
-		t.Fatalf("fetch_credential Do: %v", err)
-	}
-	if !resp.OK {
-		t.Fatalf("fetch_credential not OK: %s", resp.Error)
-	}
-	var env hostsync.CredentialEnvelope
-	if err := json.Unmarshal(resp.Result, &env); err != nil {
-		t.Fatalf("decode envelope: %v", err)
-	}
-	if env.Hash != creds.AccessHash(served) {
-		t.Errorf("envelope hash = %q, want %q", env.Hash, creds.AccessHash(served))
-	}
-	if env.ExpiresAt != served.ClaudeAiOauth.ExpiresAt {
-		t.Errorf("envelope ExpiresAt = %d, want %d", env.ExpiresAt, served.ClaudeAiOauth.ExpiresAt)
-	}
-
-	// An unknown uuid fails loud rather than serving a blank credential.
-	bad, err := tx.Do(ctx, &rpc.Request{Method: hostsync.MethodFetchCredential, Params: map[string]any{"uuid": "nope"}})
-	if err != nil {
-		t.Fatalf("fetch unknown Do: %v", err)
-	}
-	if bad.OK {
-		t.Error("fetch_credential for an unknown uuid returned OK")
-	}
-
-	// The removed secret-bearing method must never be answered by the fresh v1
-	// server; stale callers receive unknown-method and no payload.
-	removed, err := tx.Do(ctx, &rpc.Request{Method: "ccp.fetch_credential", Params: map[string]any{"uuid": "u-sock"}})
-	if err != nil {
-		t.Fatalf("removed fetch Do: %v", err)
-	}
-	if removed.OK {
-		t.Fatal("the fresh-v1 server answered removed ccp.fetch_credential")
-	}
-	if !strings.Contains(removed.Error, "unknown method") {
-		t.Errorf("removed fetch error = %q, want an unknown-method rejection", removed.Error)
-	}
-	if payload := string(removed.Result); payload != "" && payload != "null" {
-		t.Errorf("removed fetch carried a result payload: %s", payload)
+	for _, method := range []string{"ccp.fetch_credential", "ccp.fetch_stripped_credential"} {
+		if hasMethod(caps.Methods, method) {
+			t.Errorf("Capabilities Methods %v retain removed %s", caps.Methods, method)
+		}
+		removed, err := tx.Do(ctx, &rpc.Request{Method: method})
+		if err != nil {
+			t.Fatalf("removed %s Do: %v", method, err)
+		}
+		if removed.OK || !strings.Contains(removed.Error, "unknown method") {
+			t.Errorf("removed %s response = %+v", method, removed)
+		}
+		if payload := string(removed.Result); payload != "" && payload != "null" {
+			t.Errorf("removed %s carried result payload: %s", method, payload)
+		}
 	}
 }
 
@@ -168,19 +131,20 @@ func TestSyncSocketDrainsInFlightHandler(t *testing.T) {
 	})
 	ctxErr := make(chan error, 1)
 	storeErr := make(chan error, 1)
-	fetch := func(ctx context.Context, _ map[string]any) (any, error) {
+	blocking := blockingSyncConsumer{SyncConsumer: consumer}
+	blocking.apply = func(ctx context.Context, change syncservice.ChangeEnvelope) (syncservice.ApplyResult, error) {
 		close(entered)
 		<-release
 		ctxErr <- ctx.Err()
 		_, _, err := st.GetMeta("sync-drain-probe")
 		storeErr <- err
-		return map[string]any{"settled": true}, nil
+		return syncservice.ApplyResult{AckedRevision: change.SourceRevision}, nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	var intake drain.Intake
-	ln, err := serveSyncSocket(ctx, &wg, &intake, sock, consumer, fetch, log.New(io.Discard, "", 0))
+	ln, err := serveSyncSocket(ctx, &wg, &intake, sock, blocking, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,16 +154,27 @@ func TestSyncSocketDrainsInFlightHandler(t *testing.T) {
 		wg.Wait()
 	})
 
-	tx := syncservice.Socket(sock)
-	defer func() { _ = tx.Close() }()
+	client := syncservice.NewClient(syncservice.Socket(sock))
+	defer func() { _ = client.Close() }()
+	change, err := syncservice.NewExportedChange(
+		hostsync.SyncServiceID, hostsync.SyncSchemaFingerprint, syncservice.ChangeSnapshot,
+		syncservice.NewRevision(0), syncservice.NewRevision(1), []byte(`{}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change, err = syncservice.BindDelivery(change, "remote-host")
+	if err != nil {
+		t.Fatal(err)
+	}
 	type callResult struct {
-		resp *syncservice.Response
-		err  error
+		result syncservice.ApplyResult
+		err    error
 	}
 	called := make(chan callResult, 1)
 	go func() {
-		resp, err := tx.Do(context.Background(), &rpc.Request{Method: hostsync.MethodFetchCredential})
-		called <- callResult{resp: resp, err: err}
+		result, err := client.Apply(context.Background(), change)
+		called <- callResult{result: result, err: err}
 	}()
 	select {
 	case <-entered:
@@ -244,8 +219,8 @@ func TestSyncSocketDrainsInFlightHandler(t *testing.T) {
 		t.Fatalf("sync handler store access raced teardown: %v", err)
 	}
 	result := <-called
-	if result.err != nil || result.resp == nil || !result.resp.OK {
-		t.Fatalf("in-flight sync response: resp=%+v err=%v", result.resp, result.err)
+	if result.err != nil || result.result.AckedRevision != change.SourceRevision {
+		t.Fatalf("in-flight sync response: result=%+v err=%v", result.result, result.err)
 	}
 	if err := <-drained; err != nil {
 		t.Fatalf("Drain: %v", err)

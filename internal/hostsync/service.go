@@ -41,9 +41,9 @@ type LocalAccount struct {
 	Chain ChainStamp
 }
 
-// Mesh resolves this host's identity and the peer hosts a converge pass pulls from.
+// Mesh resolves this host's identity and exact product peers.
 type Mesh interface {
-	// Resolve returns this host's name and the peer hosts to pull from.
+	// Resolve returns this host's name and exact product peers.
 	Resolve(ctx context.Context) (self string, peers []string, err error)
 }
 
@@ -84,7 +84,7 @@ type AccountPreparer interface {
 // Service owns the convergent account registry and its write hooks: every
 // mutation is load-modify-save under the flock, then a stamp touch that notifies peers.
 type Service struct {
-	// M is the pool manager the materializer and cred-pull drive.
+	// M is the pool manager the materializer drives.
 	M *pool.Manager
 	// Registry is the on-disk convergent registry plus its flock.
 	Registry *RegistryFile
@@ -109,6 +109,8 @@ type Service struct {
 	Preparer AccountPreparer
 	// Driver owns local registry projection and product reconciliation.
 	Driver converge.Driver[AccountValue]
+	// CredentialSnapshot supplies access-only material for one immutable export.
+	CredentialSnapshot CredentialSnapshotSource
 
 	promoteSyncedAdd func(
 		context.Context, *pool.PendingAdd, string, string,
@@ -202,7 +204,7 @@ func (s *Service) mutate(ctx context.Context, uuid string, mut func(Registry) er
 // that lands past any tombstone or skewed add. It resurrects tombstones by
 // design, so bulk callers (enable backfill, scans) MUST use ScanPublish.
 // A non-zero chain must name its origin — an origin-less chain has no host to
-// pull from and would misclassify as owned everywhere; a zero chain (identity
+// deliver from and would misclassify as owned everywhere; a zero chain (identity
 // only) is fine.
 func (s *Service) PublishAccount(ctx context.Context, v AccountValue) error {
 	if v.UUID == "" {

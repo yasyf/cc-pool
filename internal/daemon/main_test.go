@@ -9,8 +9,6 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 )
 
 func TestMain(m *testing.M) {
@@ -18,14 +16,7 @@ func TestMain(m *testing.M) {
 	var err error
 	switch {
 	case hostsync.IsWorkerInvocation(os.Args[1:]):
-		var owner proc.Record
-		owner, err = supervise.ReceiveTrackedOwner(ctx, proc.RecoverySourceOwner)
-		if err == nil {
-			err = proc.CloseInheritedFDs()
-		}
-		if err == nil {
-			err = RunHostSyncWorker(ctx, owner, os.Stdin, os.Stdout)
-		}
+		err = RunHostSyncWorker(ctx, os.Stdin, os.Stdout)
 	case IsCredentialWriteWorkerInvocation(os.Args[1:]):
 		err = RunCredentialWriteWorker(ctx, os.Stdin, os.Stdout)
 	case pool.IsBackingWorkerInvocation(os.Args[1:]):

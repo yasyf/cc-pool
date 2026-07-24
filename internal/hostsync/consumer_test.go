@@ -41,7 +41,7 @@ func containsStr(ss []string, want string) bool {
 	return false
 }
 
-func TestCapabilitiesIncludeFetch(t *testing.T) {
+func TestCapabilitiesAreExactSynckitContract(t *testing.T) {
 	s, _ := newTestService(t)
 	c := NewConsumer(s, enabled(true))
 
@@ -51,9 +51,6 @@ func TestCapabilitiesIncludeFetch(t *testing.T) {
 	}
 	if caps.Name != "cc-pool" {
 		t.Errorf("Name = %q, want cc-pool", caps.Name)
-	}
-	if !containsStr(caps.Methods, MethodFetchCredential) {
-		t.Errorf("Methods %v missing the custom %s", caps.Methods, MethodFetchCredential)
 	}
 	for _, m := range []string{
 		syncservice.MethodCapabilities,
@@ -105,10 +102,9 @@ func TestDisabledFailsLoud(t *testing.T) {
 	})
 }
 
-// TestExportSecretless writes a real credential through the registry's cred-write
-// endpoint (NoteCredWrite) and pins that the exported snapshot carries
-// the chain hash but NEVER the access or refresh token.
-func TestExportSecretless(t *testing.T) {
+// TestExportCarriesAccessOnlyCredential pins the snapshot boundary: Synckit
+// carries the access token needed for Apply, but never its refresh token.
+func TestExportCarriesAccessOnlyCredential(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTestService(t)
 
@@ -122,6 +118,16 @@ func TestExportSecretless(t *testing.T) {
 	if err := s.NoteCredWrite(ctx, uuid, chain); err != nil {
 		t.Fatalf("NoteCredWrite: %v", err)
 	}
+	stripped := secret.Strip()
+	blob, err := stripped.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.CredentialSnapshot = func(context.Context, Registry) (map[string]CredentialEnvelope, error) {
+		return map[string]CredentialEnvelope{uuid: {
+			Credential: blob, ExpiresAt: stripped.ClaudeAiOauth.ExpiresAt, Hash: creds.AccessHash(stripped),
+		}}, nil
+	}
 
 	change, err := NewConsumer(s, enabled(true)).Export(ctx, syncservice.ExportRequest{
 		ServiceID: SyncServiceID, SchemaFingerprint: SyncSchemaFingerprint,
@@ -134,7 +140,10 @@ func TestExportSecretless(t *testing.T) {
 		t.Fatalf("Export change = %+v", change)
 	}
 	got := string(change.Payload)
-	for _, secretPart := range []string{"SEKRIT-11111", "SEKRIT-22222", "ACCESS-TOKEN", "REFRESH-TOKEN"} {
+	if !strings.Contains(got, "ACCESS-TOKEN-SEKRIT-11111") {
+		t.Fatalf("Export omitted delivery access token: %s", got)
+	}
+	for _, secretPart := range []string{"SEKRIT-22222", "REFRESH-TOKEN"} {
 		if strings.Contains(got, secretPart) {
 			t.Fatalf("Export leaked a token substring %q into the wire state: %s", secretPart, got)
 		}
@@ -156,7 +165,7 @@ func TestExportEmptyRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Export on empty registry: %v", err)
 	}
-	if change.SourceRevision != syncservice.NewRevision(1) || string(change.Payload) != "{}" {
+	if change.SourceRevision != syncservice.NewRevision(1) || string(change.Payload) != `{"registry":{},"credentials":{}}` {
 		t.Fatalf("empty Export = revision %q payload %q", change.SourceRevision, change.Payload)
 	}
 }
@@ -213,9 +222,10 @@ func TestApplyMergesOnceAndAcknowledgesSourceRevision(t *testing.T) {
 	incoming.Add("u-remote", AccountValue{
 		UUID: "u-remote", Email: "remote@example.com",
 		OAuthAccount: json.RawMessage(`{"accountUuid":"u-remote"}`),
-		Chain:        ChainStamp{Origin: "hostA", Hash: "chain"},
 	}, 10)
-	payload, err := encodeRegistrySnapshot(incoming)
+	payload, err := encodeSyncSnapshot(syncSnapshot{
+		Registry: incoming, Credentials: map[string]CredentialEnvelope{},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

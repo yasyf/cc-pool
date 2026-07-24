@@ -15,13 +15,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/accountterminal"
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/creds/credstest"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalogproto"
 )
@@ -288,7 +288,7 @@ func TestAccountMutationAttachRequiresExactFenceBeforeInput(t *testing.T) {
 	s, fake, account := newAccountMutationTestServer(t, true)
 	var loginCalls atomic.Int64
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
-		context.Context, store.AccountMutation, supervise.TerminalInput, supervise.TerminalSize,
+		context.Context, store.AccountMutation, accountterminal.TerminalInput, accountterminal.TerminalSize,
 		<-chan wire.Chunk, func(context.Context, []byte) error,
 	) error {
 		loginCalls.Add(1)
@@ -325,7 +325,7 @@ func TestAccountMutationDisconnectBeforeInputLeavesAwaitingInput(t *testing.T) {
 	s, fake, account := newAccountMutationTestServer(t, true)
 	var loginCalls atomic.Int64
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
-		context.Context, store.AccountMutation, supervise.TerminalInput, supervise.TerminalSize,
+		context.Context, store.AccountMutation, accountterminal.TerminalInput, accountterminal.TerminalSize,
 		<-chan wire.Chunk, func(context.Context, []byte) error,
 	) error {
 		loginCalls.Add(1)
@@ -361,7 +361,7 @@ func TestAccountMutationDuplicateTerminalAttachRunsOneSemanticOperation(t *testi
 	release := make(chan struct{})
 	var loginCalls atomic.Int64
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
-		context.Context, store.AccountMutation, supervise.TerminalInput, supervise.TerminalSize,
+		context.Context, store.AccountMutation, accountterminal.TerminalInput, accountterminal.TerminalSize,
 		<-chan wire.Chunk, func(context.Context, []byte) error,
 	) error {
 		if loginCalls.Add(1) == 1 {
@@ -413,7 +413,7 @@ func TestAccountMutationDuplicateTerminalAttachRunsOneSemanticOperation(t *testi
 func TestAccountMutationObserverReceivesOutputAndTakesControlAfterDisconnect(t *testing.T) {
 	terminal := newTestAccountMutationTerminal()
 	started := make(chan struct{})
-	terminal.start = func(supervise.TerminalInput) { close(started) }
+	terminal.start = func(accountterminal.TerminalInput) { close(started) }
 	running := &accountMutationRun{
 		ready: make(chan struct{}), done: make(chan struct{}), terminal: terminal,
 	}
@@ -480,7 +480,7 @@ func TestAccountMutationObserverReceivesOutputAndTakesControlAfterDisconnect(t *
 	deadline := time.Now().Add(time.Second)
 	for {
 		terminal.mu.Lock()
-		inputs := append([]supervise.TerminalInput(nil), terminal.inputs...)
+		inputs := append([]accountterminal.TerminalInput(nil), terminal.inputs...)
 		terminal.mu.Unlock()
 		if len(inputs) == 2 {
 			if string(inputs[1].Data) != "second-input" {
@@ -494,8 +494,8 @@ func TestAccountMutationObserverReceivesOutputAndTakesControlAfterDisconnect(t *
 		time.Sleep(time.Millisecond)
 	}
 
-	terminal.settle(supervise.TerminalOutcome{
-		Kind: supervise.TerminalExited, Digest: [32]byte{1},
+	terminal.settle(accountterminal.TerminalOutcome{
+		Kind: accountterminal.TerminalExited, Digest: [32]byte{1},
 	}, nil)
 	running.result = AccountMutationResult{State: AccountMutationCompleted, Completed: true}
 	close(running.done)
@@ -512,8 +512,8 @@ func TestAccountMutationTerminalDisconnectReplaysFromExactCursor(t *testing.T) {
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		ctx context.Context,
 		_ store.AccountMutation,
-		_ supervise.TerminalInput,
-		_ supervise.TerminalSize,
+		_ accountterminal.TerminalInput,
+		_ accountterminal.TerminalSize,
 		_ <-chan wire.Chunk,
 		emit func(context.Context, []byte) error,
 	) error {
@@ -628,8 +628,8 @@ func TestAccountMutationTerminalReplaysSettledReceiptBeforeAcknowledgement(t *te
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		ctx context.Context,
 		mutation store.AccountMutation,
-		_ supervise.TerminalInput,
-		_ supervise.TerminalSize,
+		_ accountterminal.TerminalInput,
+		_ accountterminal.TerminalSize,
 		_ <-chan wire.Chunk,
 		emit func(context.Context, []byte) error,
 	) error {
@@ -773,7 +773,7 @@ func TestAccountMutationGenerationCancellationCancelsReapsAndJoinsWatcher(t *tes
 		t.Fatal("generation-canceled mutation retained a terminal run")
 	}
 	outcome, err := terminal.Wait(t.Context())
-	if err != nil || outcome.Kind != supervise.TerminalCanceled {
+	if err != nil || outcome.Kind != accountterminal.TerminalCanceled {
 		t.Fatalf("generation-canceled terminal outcome = %+v err=%v", outcome, err)
 	}
 }
@@ -782,7 +782,7 @@ func TestAccountMutationTerminalFailureRearmsUnchangedOperation(t *testing.T) {
 	s, _, account := newAccountMutationTestServer(t, true)
 	wantErr := errors.New("terminal exited")
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
-		context.Context, store.AccountMutation, supervise.TerminalInput, supervise.TerminalSize,
+		context.Context, store.AccountMutation, accountterminal.TerminalInput, accountterminal.TerminalSize,
 		<-chan wire.Chunk, func(context.Context, []byte) error,
 	) error {
 		return wantErr
@@ -825,9 +825,9 @@ func TestAccountMutationOldOwnerFenceCannotAdvanceWithoutRetirementReceipt(t *te
 		t.Fatal(err)
 	}
 	newOwner := proc.Record{
-		RecoveryClass: proc.RecoveryTask,
+		RecoveryID: pool.CredentialOwnerRecoveryID,
 		PID:           84, StartTime: "2.0", Boot: "test-boot", Comm: "cc-pool",
-		Generation: "new-daemon-without-receipt",
+		Generation: daemonTestGeneration("new-daemon-without-receipt"),
 	}
 	s.accountMutationOwner = func() (proc.Record, error) { return newOwner, nil }
 	request.Action = AccountMutationCancel
@@ -858,8 +858,8 @@ func TestAccountMutationInvalidPostBoundaryCredentialQuarantines(t *testing.T) {
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		_ context.Context,
 		mutation store.AccountMutation,
-		_ supervise.TerminalInput,
-		_ supervise.TerminalSize,
+		_ accountterminal.TerminalInput,
+		_ accountterminal.TerminalSize,
 		_ <-chan wire.Chunk,
 		_ func(context.Context, []byte) error,
 	) error {
@@ -904,8 +904,8 @@ func TestAccountMutationReceiptIntentSurvivesDerivedLabelPublication(t *testing.
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		ctx context.Context,
 		mutation store.AccountMutation,
-		_ supervise.TerminalInput,
-		_ supervise.TerminalSize,
+		_ accountterminal.TerminalInput,
+		_ accountterminal.TerminalSize,
 		_ <-chan wire.Chunk,
 		_ func(context.Context, []byte) error,
 	) error {
@@ -973,8 +973,8 @@ func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) 
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		ctx context.Context,
 		mutation store.AccountMutation,
-		_ supervise.TerminalInput,
-		_ supervise.TerminalSize,
+		_ accountterminal.TerminalInput,
+		_ accountterminal.TerminalSize,
 		_ <-chan wire.Chunk,
 		_ func(context.Context, []byte) error,
 	) error {
@@ -1046,8 +1046,8 @@ func TestPresentationRebindFailureRetainsJournalAndQuarantine(t *testing.T) {
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		_ context.Context,
 		mutation store.AccountMutation,
-		_ supervise.TerminalInput,
-		_ supervise.TerminalSize,
+		_ accountterminal.TerminalInput,
+		_ accountterminal.TerminalSize,
 		_ <-chan wire.Chunk,
 		_ func(context.Context, []byte) error,
 	) error {
@@ -1118,10 +1118,10 @@ func newAccountMutationTestServer(
 		t.Fatal(err)
 	}
 	owner := proc.Record{
-		RecoveryClass: proc.RecoveryTask,
+		RecoveryID: pool.CredentialOwnerRecoveryID,
 		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Executable: identity.Executable,
-		AuditToken: identity.AuditToken, Generation: "account-mutation-test",
+		AuditToken: identity.AuditToken, Generation: daemonTestGeneration("account-mutation-test"),
 	}
 	authority, err := pool.NewWorkerAuthority(
 		accountMutationTestTaskRunner{
@@ -1226,8 +1226,8 @@ func runAccountMutationTest(
 
 func accountMutationInputChunk(t *testing.T, payload []byte) wire.Chunk {
 	t.Helper()
-	encoded, err := encodeAccountTerminalInput(supervise.TerminalInput{
-		Kind: supervise.TerminalInputBytes, Data: payload,
+	encoded, err := encodeAccountTerminalInput(accountterminal.TerminalInput{
+		Kind: accountterminal.TerminalInputBytes, Data: payload,
 	})
 	if err != nil {
 		t.Fatal(err)

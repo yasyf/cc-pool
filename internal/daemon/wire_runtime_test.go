@@ -5,31 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/worker"
 )
-
-type testRuntimeCloser struct{}
-
-func (testRuntimeCloser) Close() error { return nil }
-
-type testRuntimeWorkers struct{}
-
-func (testRuntimeWorkers) Close()                     {}
-func (testRuntimeWorkers) Cancel()                    {}
-func (testRuntimeWorkers) Wait(context.Context) error { return nil }
-
-type testRuntimeStopVerifier struct{}
-
-func (testRuntimeStopVerifier) Validate() error { return nil }
-func (testRuntimeStopVerifier) VerifyStopControl(context.Context, wire.Peer, string) (proc.Record, error) {
-	return proc.Record{}, errors.New("test stop control is unavailable")
-}
 
 func testHealthObservation(build string, called func()) wire.ObservationRoute {
 	return wire.ObservationRoute{
@@ -67,30 +51,64 @@ func startTestWireRuntime(
 	socket string,
 	build string,
 	server *wire.Server,
-	classifier wire.ProtectedSessionClassifier,
+	_ any,
 	observations []wire.ObservationRoute,
 ) {
 	t.Helper()
-	intake := &drain.Intake{}
-	runtime, err := wire.NewRuntime(wire.RuntimeConfig{
-		Socket: socket, RuntimeBuild: build, RuntimeProtocol: int(wire.ProtocolVersion),
-		Wire:       server,
-		Classifier: classifier, ReservedProtectedSessions: 1, Observations: observations,
-		StopVerifier: testRuntimeStopVerifier{},
-		ListenerWait: time.Second, ShutdownTimeout: time.Second,
-		Admission: intake, Workers: testRuntimeWorkers{}, State: testRuntimeCloser{},
-		Resources: testRuntimeCloser{}, Activate: func(dkdaemon.Activation) error { return nil },
+	stateDir := t.TempDir()
+	generation := daemonTestGeneration(t.Name())
+	workers, err := worker.NewPool(worker.Config{
+		Capacity: 2, QueueCapacity: 2, MaxTotalRun: time.Minute,
+		MaxStdinBytes: 1 << 20, MaxStdoutBytes: 1 << 20, MaxStderrBytes: 1 << 20,
+	}, &proc.Reaper{
+		Store: &proc.FileStore{Path: filepath.Join(stateDir, "workers-v1.db")}, Generation: generation,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- runtime.Run(t.Context()) }()
-	readyCtx, cancelReady := context.WithTimeout(t.Context(), 3*time.Second)
-	defer cancelReady()
-	if err := runtime.WaitReady(readyCtx); err != nil {
-		t.Fatalf("start test daemon runtime: %v", err)
+	children, err := proc.NewManager(2, &proc.Reaper{
+		Store: &proc.FileStore{Path: filepath.Join(stateDir, "children-v1.db")}, Generation: generation,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	policy, err := daemonTrustPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := wire.NewRuntime(wire.RuntimeConfig{
+		Socket: socket, RuntimeBuild: build, RuntimeProtocol: int(wire.ProtocolVersion),
+		Wire: server, TrustPolicy: policy,
+		StopControlStore: &proc.FileStore{Path: filepath.Join(stateDir, "stop-control-v1.db")},
+		Observations:     observations,
+		ListenerWait:     time.Second, ShutdownTimeout: time.Second,
+		Workers: workers, Children: children,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot := dkdaemon.NewPublicationSlot[struct{}](runtime)
+	activation, err := runtime.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	settlement, err := activation.ClaimProductSettlement()
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := slot.Stage(activation, struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := activation.CommitReady(publication); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- runtime.Wait(context.Background()) }()
+	go func() {
+		<-activation.Context().Done()
+		_ = settlement.Complete()
+	}()
 	t.Cleanup(func() {
 		closeCtx, cancelClose := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancelClose()

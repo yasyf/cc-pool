@@ -9,7 +9,6 @@ import (
 	"os"
 	"sync"
 
-	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
@@ -34,17 +33,16 @@ func (l *onceCloseListener) Close() error {
 }
 
 // startSyncServer stands up the daemon's second socket — the SyncConsumer
-// contract plus the credential fetch method — on a wg-tracked goroutine, returning
+// contract on a wg-tracked goroutine, returning
 // once the socket is bound; the broader sync setup wires the rest of the Service.
 func (s *Server) startSyncServer(
 	ctx context.Context,
 	consumer syncservice.SyncConsumer,
-	fetch rpc.Handler,
 ) error {
 	if s.syncIntake == nil {
 		s.syncIntake = &drain.Intake{}
 	}
-	ln, err := serveSyncSocket(ctx, &s.wg, s.syncIntake, s.syncSocket, consumer, fetch, s.log)
+	ln, err := serveSyncSocket(ctx, &s.wg, s.syncIntake, s.syncSocket, consumer, s.log)
 	if err != nil {
 		return err
 	}
@@ -64,7 +62,7 @@ func (s *Server) syncEnabled() (bool, error) {
 // serveSyncSocket binds sockPath (0600) and serves the sync dispatcher until
 // ctx is done; daemonkit wire admission remains held through terminal delivery.
 // Returns once bound.
-func serveSyncSocket(ctx context.Context, wg *sync.WaitGroup, intake *drain.Intake, sockPath string, consumer syncservice.SyncConsumer, fetch rpc.Handler, logger *log.Logger) (net.Listener, error) {
+func serveSyncSocket(ctx context.Context, wg *sync.WaitGroup, intake *drain.Intake, sockPath string, consumer syncservice.SyncConsumer, logger *log.Logger) (net.Listener, error) {
 	ln, err := rpc.Listen(ctx, sockPath)
 	if err != nil {
 		return nil, fmt.Errorf("bind sync socket %s: %w", sockPath, err)
@@ -76,7 +74,6 @@ func serveSyncSocket(ctx context.Context, wg *sync.WaitGroup, intake *drain.Inta
 	}
 	d := rpc.NewDispatcher()
 	syncservice.RegisterConsumer(d, consumer)
-	d.Register(hostsync.MethodFetchCredential, fetch)
 	server := rpc.NewServer(d)
 
 	wg.Add(1)

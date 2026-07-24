@@ -44,14 +44,12 @@ func (c *Consumer) gate() error {
 	return nil
 }
 
-// Capabilities advertises the sync contract plus the credential fetch method.
+// Capabilities advertises only Synckit's exact sync contract.
 func (c *Consumer) Capabilities(_ context.Context) (syncservice.Capabilities, error) {
 	if err := c.gate(); err != nil {
 		return syncservice.Capabilities{}, err
 	}
-	caps := syncservice.DefaultCapabilities("cc-pool")
-	caps.Methods = append(caps.Methods, MethodFetchCredential)
-	return caps, nil
+	return syncservice.DefaultCapabilities(SyncServiceID), nil
 }
 
 // List reports one WatchItem per registry account, tombstones included so
@@ -131,7 +129,16 @@ func (c *Consumer) Export(ctx context.Context, request syncservice.ExportRequest
 			state.Revision, since,
 		)
 	}
-	payload, err := encodeRegistrySnapshot(state.Snapshot)
+	credentials := make(map[string]CredentialEnvelope)
+	if c.S.CredentialSnapshot != nil {
+		credentials, err = c.S.CredentialSnapshot(ctx, state.Snapshot)
+		if err != nil {
+			return syncservice.ChangeEnvelope{}, err
+		}
+	}
+	payload, err := encodeSyncSnapshot(syncSnapshot{
+		Registry: state.Snapshot, Credentials: credentials,
+	})
 	if err != nil {
 		return syncservice.ChangeEnvelope{}, err
 	}
@@ -160,12 +167,16 @@ func (c *Consumer) Apply(ctx context.Context, change syncservice.ChangeEnvelope)
 	if change.Kind != syncservice.ChangeSnapshot {
 		return syncservice.ApplyResult{NeedSnapshot: true}, nil
 	}
-	incoming, err := decodeRegistrySnapshot(change.Payload)
+	snapshot, err := decodeSyncSnapshot(change.Payload)
+	if err != nil {
+		return syncservice.ApplyResult{}, err
+	}
+	credentials, err := validateAppliedCredentials(snapshot, change.Origin)
 	if err != nil {
 		return syncservice.ApplyResult{}, err
 	}
 	if err := c.S.Registry.Update(ctx, func(local Registry) error {
-		merged := cregistry.Merge(local, incoming)
+		merged := cregistry.Merge(local, snapshot.Registry)
 		clear(local)
 		for id, entry := range merged {
 			local[id] = entry
@@ -174,7 +185,7 @@ func (c *Consumer) Apply(ctx context.Context, change syncservice.ChangeEnvelope)
 	}); err != nil {
 		return syncservice.ApplyResult{}, fmt.Errorf("hostsync: persist applied snapshot: %w", err)
 	}
-	if _, err := c.S.Converge(ctx, change.Origin); err != nil {
+	if _, err := c.S.Converge(withAppliedCredentials(ctx, credentials), change.Origin); err != nil {
 		return syncservice.ApplyResult{}, err
 	}
 	return syncservice.ApplyResult{AckedRevision: change.SourceRevision}, nil

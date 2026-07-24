@@ -14,12 +14,12 @@ import (
 func admitDaemonTestAccount(t *testing.T, st *store.Store, requested store.Account) store.Account {
 	t.Helper()
 	owner := proc.Record{
-		RecoveryClass: proc.RecoveryTask,
-		PID:           42,
-		StartTime:     "1.0",
-		Boot:          "test-boot",
-		Comm:          "cc-pool-test",
-		Generation:    fmt.Sprintf("admitted-account-%d", requested.ID),
+		RecoveryID: pool.CredentialOwnerRecoveryID,
+		PID:        42,
+		StartTime:  "1.0",
+		Boot:       "test-boot",
+		Comm:       "cc-pool-test",
+		Generation: daemonTestGeneration(fmt.Sprintf("admitted-account-%d", requested.ID)),
 	}
 	reservation, err := st.ReserveAccountIndex(owner)
 	if err != nil {

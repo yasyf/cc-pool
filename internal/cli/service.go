@@ -17,6 +17,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/service"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -48,7 +49,7 @@ const (
 
 type daemonServiceController interface {
 	Converge(context.Context, []service.Agent) error
-	StopRuntime(context.Context, service.StopControlSpec) (wire.StopResult, error)
+	StopRuntime(context.Context, service.StopRuntimeRequest) (service.StopReceipt, error)
 	Close(context.Context) error
 }
 
@@ -233,11 +234,7 @@ func gateUninstallSessions(accts []store.Account) error {
 func stopDaemonService(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	if err := withDaemonServiceController(cmd.Context(), func(controller daemonServiceController) error {
-		executable, err := serviceExecutable()
-		if err != nil {
-			return err
-		}
-		if err := stopObservedDaemonRuntime(cmd.Context(), controller, executable, wire.StopIntentUninstall); err != nil {
+		if err := stopObservedDaemonRuntime(cmd.Context(), controller, true); err != nil {
 			return err
 		}
 		return controller.Converge(cmd.Context(), nil)
@@ -329,7 +326,7 @@ func installDaemonService(ctx context.Context) (err error) {
 		err = errors.Join(err, holderInstall.Rollback(rollbackCtx))
 	}()
 	if err := withDaemonServiceController(ctx, func(controller daemonServiceController) error {
-		if err := stopObservedDaemonRuntime(ctx, controller, executable, wire.StopIntentUpgrade); err != nil {
+		if err := stopObservedDaemonRuntime(ctx, controller, false); err != nil {
 			return err
 		}
 		holderInstall.Commit()
@@ -358,8 +355,7 @@ func installDaemonService(ctx context.Context) (err error) {
 func stopObservedDaemonRuntime(
 	ctx context.Context,
 	controller daemonServiceController,
-	executable string,
-	intent wire.StopIntent,
+	stopCurrent bool,
 ) error {
 	stopCtx, cancel := context.WithTimeout(ctx, daemonServiceStopTimeout)
 	defer cancel()
@@ -370,17 +366,21 @@ func stopObservedDaemonRuntime(
 	if err != nil {
 		return fmt.Errorf("observe cc-pool daemon stop target: %w", err)
 	}
-	if intent == wire.StopIntentUpgrade && health.RuntimeBuild == version.String() &&
+	if !stopCurrent && health.RuntimeBuild == version.String() &&
 		health.State == daemon.RuntimeStateHealthy && !health.Draining && !health.Busy && health.Ready {
 		return nil
 	}
-	if intent == wire.StopIntentUpgrade && health.RuntimeBuild == version.String() {
-		intent = wire.StopIntentRestart
-	}
-	_, err = controller.StopRuntime(stopCtx, service.StopControlSpec{
-		Executable: executable, Args: daemon.StopControlChildArguments(), Role: daemon.StopRoleID,
-		RuntimeBuild: version.String(), RuntimeProtocol: int(wire.ProtocolVersion),
-		TargetProcessGeneration: health.ProcessGeneration, Intent: intent,
+	_, err = controller.StopRuntime(stopCtx, service.StopRuntimeRequest{
+		OperationID: "cc-pool.stop-runtime.v1:" + health.ProcessGeneration,
+		RuntimeClientConfig: wire.RuntimeClientConfig{
+			Client: wire.ClientConfig{
+				Dial: wire.UnixDialer(pool.SocketPath()), WireBuild: daemon.WireBuild,
+				Role: trust.PeerRole(daemon.StopRoleID),
+			},
+			NoProgressTimeout: daemonServiceReadyTimeout,
+		},
+		ExpectedRuntimeBuild: health.RuntimeBuild,
+		ControlRole:          trust.PeerRole(daemon.StopRoleID),
 	})
 	if err != nil {
 		return fmt.Errorf("stop exact cc-pool daemon generation: %w", err)
