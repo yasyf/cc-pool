@@ -333,6 +333,145 @@ func TestAbandonAddRejectsForeignRetirementProof(t *testing.T) {
 	}
 }
 
+func TestFinishAccountRemovalReplaysAfterUnlinkWithoutCredentialIO(t *testing.T) {
+	manager := newAccountManager(t)
+	account, publicPath := prepareCommittedRemovalTestAccount(t, manager)
+	fake := manager.Creds.(*credstest.Fake)
+	fake.Put(account.KeychainService, account.KeychainAccount, datedCred("committed-replay", time.Hour))
+	marker := filepath.Join(publicPath, "target-survives")
+	if err := os.WriteFile(marker, []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removal, err := manager.Store.BeginAccountRemoval(account.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseCAS := manager.credentialCAS
+	casCalls := 0
+	manager.credentialCAS = func(
+		ctx context.Context,
+		observed store.Account,
+		expected store.CredentialExternalState,
+		mutation credentialCASMutation,
+	) (credentialCASProof, error) {
+		casCalls++
+		assertLinkTarget(t, observed.ConfigDir, publicPath)
+		return baseCAS(ctx, observed, expected, mutation)
+	}
+	crash := errors.New("simulated crash after unlink")
+	finishAccountRemovalFailpoint = func(stage string) error {
+		if stage == "after-unlink" {
+			return crash
+		}
+		return nil
+	}
+	t.Cleanup(func() { finishAccountRemovalFailpoint = nil })
+	if err := manager.FinishAccountRemoval(t.Context(), removal, publicPath); !errors.Is(err, crash) {
+		t.Fatalf("first removal = %v, want simulated crash", err)
+	}
+	if _, err := os.Lstat(account.ConfigDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("execution link survived first removal: %v", err)
+	}
+	if _, err := manager.Store.GetAccount(account.ID); err != nil {
+		t.Fatalf("account disappeared before retry: %v", err)
+	}
+	if _, err := os.Stat(AccountBackingDir(account.ID)); err != nil {
+		t.Fatalf("backing disappeared before retry: %v", err)
+	}
+	if _, ok := fake.Get(account.KeychainService, account.KeychainAccount); ok {
+		t.Fatal("credential survived first removal")
+	}
+	touches := len(fake.TouchedServices())
+	finishAccountRemovalFailpoint = nil
+	if err := manager.FinishAccountRemoval(t.Context(), removal, publicPath); err != nil {
+		t.Fatalf("retry removal: %v", err)
+	}
+	if got := len(fake.TouchedServices()); got != touches {
+		t.Fatalf("retry touched Keychain %d additional times", got-touches)
+	}
+	if casCalls != 1 {
+		t.Fatalf("credential CAS calls = %d, want one", casCalls)
+	}
+	if _, err := manager.Store.GetAccount(account.ID); !errors.Is(err, store.ErrAccountNotFound) {
+		t.Fatalf("account survived retry: %v", err)
+	}
+	if _, err := os.Stat(AccountBackingDir(account.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backing survived retry: %v", err)
+	}
+	if raw, err := os.ReadFile(marker); err != nil || string(raw) != "target" {
+		t.Fatalf("presentation target changed: %q err=%v", raw, err)
+	}
+}
+
+func TestFinishAccountRemovalReplaysLostCredentialDeleteResponse(t *testing.T) {
+	manager := newAccountManager(t)
+	account, publicPath := prepareCommittedRemovalTestAccount(t, manager)
+	fake := manager.Creds.(*credstest.Fake)
+	fake.Put(account.KeychainService, account.KeychainAccount, datedCred("committed-lost-response", time.Hour))
+	removal, err := manager.Store.BeginAccountRemoval(account.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseCAS := manager.credentialCAS
+	calls := 0
+	manager.credentialCAS = func(
+		ctx context.Context,
+		observed store.Account,
+		expected store.CredentialExternalState,
+		mutation credentialCASMutation,
+	) (credentialCASProof, error) {
+		calls++
+		assertLinkTarget(t, observed.ConfigDir, publicPath)
+		proof, err := baseCAS(ctx, observed, expected, mutation)
+		if err == nil && calls == 1 {
+			return proof, errors.New("simulated lost delete response")
+		}
+		return proof, err
+	}
+	if err := manager.FinishAccountRemoval(t.Context(), removal, publicPath); err == nil {
+		t.Fatal("lost response unexpectedly reported success")
+	}
+	assertLinkTarget(t, account.ConfigDir, publicPath)
+	if _, ok := fake.Get(account.KeychainService, account.KeychainAccount); ok {
+		t.Fatal("credential was not deleted before response loss")
+	}
+	if err := manager.FinishAccountRemoval(t.Context(), removal, publicPath); err != nil {
+		t.Fatalf("receipt replay: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("credential CAS calls = %d, want one", calls)
+	}
+}
+
+func TestFinishAccountRemovalMissingLinkWithoutReceiptDoesNotTouchCredentials(t *testing.T) {
+	manager := newAccountManager(t)
+	account, publicPath := prepareCommittedRemovalTestAccount(t, manager)
+	fake := manager.Creds.(*credstest.Fake)
+	fake.Put(account.KeychainService, account.KeychainAccount, datedCred("missing-link", time.Hour))
+	removal, err := manager.Store.BeginAccountRemoval(account.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveAccountConfigDir(account.InstanceID, publicPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.FinishAccountRemoval(t.Context(), removal, publicPath); err == nil {
+		t.Fatal("removal without link or receipt unexpectedly succeeded")
+	}
+	if touched := fake.TouchedServices(); len(touched) != 0 {
+		t.Fatalf("invalid boundary touched Keychain: %v", touched)
+	}
+	if _, ok := fake.Get(account.KeychainService, account.KeychainAccount); !ok {
+		t.Fatal("invalid boundary deleted credential")
+	}
+	if _, err := manager.Store.GetAccount(account.ID); err != nil {
+		t.Fatalf("invalid boundary deleted account: %v", err)
+	}
+	if _, err := os.Stat(AccountBackingDir(account.ID)); err != nil {
+		t.Fatalf("invalid boundary deleted backing: %v", err)
+	}
+}
+
 func prepareRemovalTestAdd(t *testing.T, manager *Manager) *PendingAdd {
 	t.Helper()
 	reservation, err := manager.ReserveAdd()
@@ -354,6 +493,45 @@ func prepareRemovalTestAdd(t *testing.T, manager *Manager) *PendingAdd {
 		t.Fatal(err)
 	}
 	return pending
+}
+
+func prepareCommittedRemovalTestAccount(t *testing.T, manager *Manager) (store.Account, string) {
+	t.Helper()
+	reservation, err := manager.ReserveAdd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	configDir, err := AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := Home()
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicPath := filepath.Join(home, "Library", "CloudStorage", "committed-removal")
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(AccountBackingDir(reservation.ID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := manager.MutationOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := commitPoolTestAccountAtPresentation(t, manager.Store, store.Account{
+		ID: reservation.ID, ConfigDir: configDir, KeychainService: service,
+		KeychainAccount: creds.AccountLabel(),
+	}, reservation, owner, publicPath)
+	return account, publicPath
 }
 
 func pendingRetirementProof(pending *PendingAdd) PendingAddRetirementProof {
