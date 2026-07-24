@@ -240,9 +240,6 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	s.scanSessions = s.m.ScanSessions
 	s.scanProcesses = s.m.ScanProcesses
 	s.tenantCoordinator = newTenantCoordinator(activation.Context(), s, preparer, tenantClient)
-	if err := s.tenantCoordinator.initialize(activation.Context()); err != nil {
-		return fmt.Errorf("initialize FuseKit tenants: %w", err)
-	}
 	if err := s.recoverRetiredAccountMutations(activation.Context()); err != nil {
 		return fmt.Errorf("recover account mutations: %w", err)
 	}
@@ -256,12 +253,23 @@ func (s *Server) activate(activation dkdaemon.Activation) (err error) {
 	s.holderMonitorMu.Unlock()
 	s.wg.Add(1)
 	go s.monitorHolderSession(monitorCtx, s.holderSessionDone)
+	s.startTenantRecovery(activation.Context())
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		s.monitorPendingAccountMutationPublications(monitorCtx)
 	}()
 	return nil
+}
+
+func (s *Server) startTenantRecovery(ctx context.Context) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		if err := s.tenantCoordinator.initialize(ctx); err != nil && ctx.Err() == nil {
+			s.log.Printf("recover FuseKit tenants: %v", err)
+		}
+	}()
 }
 
 func (s *Server) cancelHolderMonitor() {

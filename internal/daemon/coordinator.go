@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	accountRemovalRecoveryConcurrency = 4
 	tenantProvisionConcurrency        = 4
+	backgroundProvisionConcurrency    = tenantProvisionConcurrency - 1
+	accountRemovalRecoveryConcurrency = backgroundProvisionConcurrency
 )
 
 type sourcePreparer interface {
@@ -107,7 +108,7 @@ func (c *tenantCoordinator) initialize(ctx context.Context) error {
 		defer cancel(context.Canceled)
 	}
 	var group errgroup.Group
-	group.SetLimit(tenantProvisionConcurrency)
+	group.SetLimit(backgroundProvisionConcurrency)
 	for _, desired := range accounts {
 		account := desired
 		group.Go(func() error {

@@ -116,6 +116,13 @@ type blockingLifecycleRuntime struct {
 	maximum int
 }
 
+type reservedLaneLifecycleRuntime struct {
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	release <-chan struct{}
+}
+
 type fleetLifecycleRuntime struct {
 	mu          sync.Mutex
 	provisioned []string
@@ -272,6 +279,61 @@ func newBlockingLifecycleRuntime(total int) *blockingLifecycleRuntime {
 		started: make(chan struct{}, total),
 		release: make(chan struct{}),
 	}
+}
+
+func (r *reservedLaneLifecycleRuntime) ProvisionTenant(
+	ctx context.Context,
+	account tenantfs.Account,
+) (holder.LocalTenantAcknowledgement, error) {
+	r.mu.Lock()
+	r.calls++
+	blocked := r.calls <= backgroundProvisionConcurrency
+	r.mu.Unlock()
+	if blocked {
+		r.started <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return holder.LocalTenantAcknowledgement{}, ctx.Err()
+		case <-r.release:
+		}
+	}
+	id, err := account.TenantID()
+	if err != nil {
+		return holder.LocalTenantAcknowledgement{}, err
+	}
+	return holder.LocalTenantAcknowledgement{
+		Tenant: id, Generation: catalog.Generation(account.Generation),
+		Presentations: catalog.PresentFileProvider,
+	}, nil
+}
+
+func (*reservedLaneLifecycleRuntime) ReplaceTenant(
+	context.Context,
+	tenantfs.Account,
+	uint64,
+) (holder.LocalTenantAcknowledgement, error) {
+	return holder.LocalTenantAcknowledgement{}, errors.New("unexpected replace")
+}
+
+func (*reservedLaneLifecycleRuntime) RetireTenant(
+	context.Context,
+	tenantfs.Account,
+	uint64,
+) (holder.LocalTenantRetirementProof, error) {
+	return holder.LocalTenantRetirementProof{}, errors.New("unexpected retire")
+}
+
+func (*reservedLaneLifecycleRuntime) TenantState(
+	context.Context,
+	catalog.TenantID,
+) (tenant.TenantStatus, error) {
+	return tenant.TenantStatus{}, errors.New("unexpected state")
+}
+
+func (r *reservedLaneLifecycleRuntime) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
 }
 
 func (r *blockingLifecycleRuntime) ProvisionTenant(
@@ -512,6 +574,67 @@ func TestPrepareProvisionsBeforeOnDemandConvergence(t *testing.T) {
 		t.Fatalf("provision calls = %d, prepare calls = %d", runtime.provisionCalls, preparer.prepared)
 	}
 	_ = tenantAccount
+}
+
+func TestBackgroundTenantRecoveryReservesForegroundProvisionLane(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	const total = 20
+	insertCoordinatorAccounts(t, st, total)
+	server := &Server{
+		m:   newDaemonTestManager(t, st, accountMutationTestRefresher{}, credstest.NewFake()),
+		log: log.New(io.Discard, "", 0),
+	}
+	lifecycle, cancel := context.WithCancel(t.Context())
+	runtime := &reservedLaneLifecycleRuntime{
+		started: make(chan struct{}, backgroundProvisionConcurrency),
+		release: make(chan struct{}),
+	}
+	preparer := &sourcePreparerStub{}
+	coordinator := newTenantCoordinator(lifecycle, server, preparer, runtime)
+	server.tenantCoordinator = coordinator
+	server.beginBootstrap()
+	server.startTenantRecovery(lifecycle)
+	for range backgroundProvisionConcurrency {
+		select {
+		case <-runtime.started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("background tenant recovery did not fill its provision lanes")
+		}
+	}
+	account, err := st.GetAccount(total)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.prepare(t.Context(), account, testPreparationLease()); err != nil {
+		t.Fatalf("foreground PrepareTenant while recovery is blocked: %v", err)
+	}
+	if calls := runtime.callCount(); calls != tenantProvisionConcurrency {
+		t.Fatalf("provision calls = %d, want %d", calls, tenantProvisionConcurrency)
+	}
+	if preparer.prepared != 1 {
+		t.Fatalf("foreground prepares = %d, want 1", preparer.prepared)
+	}
+	progress := server.bootstrapSnapshot()
+	if progress.Terminal {
+		t.Fatalf("blocked recovery unexpectedly settled before foreground PrepareTenant: %+v", progress)
+	}
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		server.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tenant recovery did not join activation cancellation")
+	}
 }
 
 func TestInitializeProvisionsEveryActiveAccountWithoutPreparingContent(t *testing.T) {
