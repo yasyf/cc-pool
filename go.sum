@@ -110,10 +110,10 @@ github.com/winfsp/cgofuse v1.6.1-0.20260531120352-2fa812d1bdc7 h1:NObFZ97L9X6GLy
 github.com/winfsp/cgofuse v1.6.1-0.20260531120352-2fa812d1bdc7/go.mod h1:uxjoF2jEYT3+x+vC2KJddEGdk/LU8pRowXmyVMHSV5I=
 github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e h1:JVG44RsyaB9T2KIHavMF/ppJZNG9ZpyihvCd0w101no=
 github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e/go.mod h1:RbqR21r5mrJuqunuUZ/Dhy/avygyECGrLceyNeo4LiM=
-github.com/yasyf/daemonkit v0.17.2 h1:BcUH8+piFkeOlEqJOPkv7iF3NH6J2OOEL5ochHZs/iI=
-github.com/yasyf/daemonkit v0.17.2/go.mod h1:5tYeENawEKN1GpM12YXTqIZ1fbWv7bj9P4TyIcSZ24Q=
-github.com/yasyf/fusekit v1.13.2 h1:L9s3H7fjRyW6oEF71LA4MV65d98A6FCIiGmzBtJlRMI=
-github.com/yasyf/fusekit v1.13.2/go.mod h1:WHk3QDdPY1/+V3hDoPlXtpiRmgogpn9lkQT+o5waUdI=
+github.com/yasyf/daemonkit v0.17.4 h1:mp7kj/RF2MG3ueiANWBEsaeUypznsHn9eNksECJsA5I=
+github.com/yasyf/daemonkit v0.17.4/go.mod h1:5tYeENawEKN1GpM12YXTqIZ1fbWv7bj9P4TyIcSZ24Q=
+github.com/yasyf/fusekit v1.13.3 h1:XUcaCIV3nAwpbmLaIX5+KcF/4iFBpnlGjvQaShitPJE=
+github.com/yasyf/fusekit v1.13.3/go.mod h1:5DZl2YXpE5ze5P+cz/F17sgss7Qrk4wI+2Bwz8dOIJA=
 github.com/yasyf/synckit v0.31.0 h1:MZIcKWbYzfvcKCZ+w/A4VvTIZeRLBqCEoZD0BiHyU/M=
 github.com/yasyf/synckit v0.31.0/go.mod h1:675eWdQHuf3GKr0jv13zgK8Uxp6dovWmJlkkNePUT5U=
 go.etcd.io/bbolt v1.5.0 h1:S7GAl7Fxv12yohbwFfIbQCGDWbQbtDGPET4P/bD4lxU=
