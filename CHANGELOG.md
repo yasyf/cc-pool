@@ -553,7 +553,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.62.0...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.64.0...HEAD
+[0.64.0]: https://github.com/yasyf/cc-pool/compare/v0.63.3...v0.64.0
 [0.62.0]: https://github.com/yasyf/cc-pool/compare/v0.61.7...v0.62.0
 [0.18.2]: https://github.com/yasyf/cc-pool/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/yasyf/cc-pool/compare/v0.18.0...v0.18.1
