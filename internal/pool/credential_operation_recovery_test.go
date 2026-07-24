@@ -1146,6 +1146,10 @@ func TestCredentialQuarantineGatesEveryMutation(t *testing.T) {
 	}
 	syncedCredential := datedCred("synced", 2*time.Hour)
 	syncedCredential.ClaudeAiOauth.RefreshToken = ""
+	presentation, err := manager.Store.AccountPresentation(account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		name string
 		run  func() error
@@ -1176,7 +1180,9 @@ func TestCredentialQuarantineGatesEveryMutation(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			return manager.FinishAccountRemoval(t.Context(), removal)
+			return manager.FinishAccountRemoval(
+				t.Context(), removal, presentation.Identity.PublicPath,
+			)
 		}, store.ErrCredentialOperationEvidenceActive},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
