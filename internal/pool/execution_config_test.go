@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/creds"
@@ -72,6 +73,78 @@ func TestAccountConfigLinkCreateRetargetAndRemove(t *testing.T) {
 	if err := RemoveAccountConfigDir(firstTestInstance, second); err != nil {
 		t.Fatalf("idempotent remove: %v", err)
 	}
+}
+
+func TestAccountConfigLinkRemovalPreservesTarget(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	target := filepath.Join(home, "Library", "CloudStorage", "Target")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(target, "marker")
+	if err := os.WriteFile(marker, []byte("preserved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureAccountConfigDir(firstTestInstance, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveAccountConfigDir(firstTestInstance, target); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "preserved" {
+		t.Fatalf("target marker = %q err=%v", got, err)
+	}
+}
+
+func TestAccountConfigLinkConcurrentSameTargetIsIdempotent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	const workers = 16
+	var group sync.WaitGroup
+	errorsCh := make(chan error, workers)
+	for range workers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			errorsCh <- EnsureAccountConfigDir(firstTestInstance, "/verified/target")
+		}()
+	}
+	group.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	link, _ := AccountConfigDir(firstTestInstance)
+	assertLinkTarget(t, link, "/verified/target")
+}
+
+func TestAccountConfigIdentitySurvivesRepeatedRetarget(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	configDir, err := AccountConfigDir(firstTestInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := AccountKeychainService(firstTestInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureAccountConfigDir(firstTestInstance, "/verified/one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RetargetAccountConfigDir(firstTestInstance, "/verified/one", "/verified/two"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RetargetAccountConfigDir(firstTestInstance, "/verified/two", "/verified/three"); err != nil {
+		t.Fatal(err)
+	}
+	afterDir, _ := AccountConfigDir(firstTestInstance)
+	afterService, _ := AccountKeychainService(firstTestInstance)
+	if afterDir != configDir || afterService != service {
+		t.Fatalf("identity drifted: %q/%q -> %q/%q", configDir, service, afterDir, afterService)
+	}
+	assertLinkTarget(t, configDir, "/verified/three")
 }
 
 func TestAccountConfigLinkFailsClosed(t *testing.T) {

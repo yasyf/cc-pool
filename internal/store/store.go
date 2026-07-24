@@ -160,8 +160,7 @@ CREATE TABLE account_mutation_receipts (
   expires_at        INTEGER NOT NULL CHECK(expires_at > committed_at),
 	CHECK((credential_written=1) = (written_credential_digest IS NOT NULL)),
 	CHECK((kind IN ('add','presentation-rebind') AND presentation_tenant_id<>'' AND
-	       presentation_domain_id<>'' AND account_generation=presentation_generation AND
-	       config_dir=presentation_public_path) OR
+	       presentation_domain_id<>'' AND account_generation=presentation_generation) OR
 	      (kind NOT IN ('add','presentation-rebind') AND presentation_tenant_id='' AND
 	       presentation_domain_id='' AND presentation_generation=0 AND presentation_public_path='')),
 	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
