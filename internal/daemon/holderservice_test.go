@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/statusapp"
@@ -18,7 +19,7 @@ func TestInstallHolderServiceDelegatesAtomicDeployment(t *testing.T) {
 		return wantReceipt, nil
 	}
 	install, err := InstallHolderService(t.Context())
-	if err != nil || calls != 1 || install.Receipt != wantReceipt {
+	if err != nil || calls != 1 || !reflect.DeepEqual(install.Receipt, wantReceipt) {
 		t.Fatalf("calls/error = %d/%v", calls, err)
 	}
 
