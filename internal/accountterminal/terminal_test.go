@@ -164,6 +164,25 @@ func TestManagerRequiresRecoveryAndPermanentlyClosesAdmission(t *testing.T) {
 	}
 }
 
+func TestManagerCloseRetriesFailedRecoveryBeforeSettlement(t *testing.T) {
+	store := &proc.FileStore{Path: t.TempDir()}
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(1, &proc.Reaper{Store: store, Generation: generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Recover(t.Context()); err == nil {
+		t.Fatal("Recover unexpectedly accepted a directory as its process store")
+	}
+	store.Path = filepath.Join(t.TempDir(), "processes.db")
+	if err := manager.Close(t.Context()); err != nil {
+		t.Fatalf("Close did not settle recovery after the store was repaired: %v", err)
+	}
+}
+
 func TestManagerCloseCancelsAndJoinsLiveTerminal(t *testing.T) {
 	manager, store := newTerminalTestManager(t)
 	terminal := startTerminalTest(t, manager, `trap '' HUP TERM; printf ready; while :; do sleep 1; done`, TerminalSize{})

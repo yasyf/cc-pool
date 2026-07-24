@@ -188,6 +188,7 @@ func (m *Manager) Close(ctx context.Context) error {
 	} else {
 		m.mu.Unlock()
 	}
+	recoveryErr := m.recoverForClose(ctx)
 
 	done := ctx.Done()
 	var ctxErr error
@@ -199,7 +200,7 @@ func (m *Manager) Close(ctx context.Context) error {
 			if ctxErr == nil {
 				ctxErr = ctx.Err()
 			}
-			return errors.Join(append(errs, ctxErr)...)
+			return errors.Join(append(errs, recoveryErr, ctxErr)...)
 		}
 		changed := m.changed
 		m.mu.Unlock()
@@ -207,6 +208,42 @@ func (m *Manager) Close(ctx context.Context) error {
 		case <-changed:
 		case <-done:
 			ctxErr = fmt.Errorf("account terminal: close: %w", ctx.Err())
+			done = nil
+		}
+	}
+}
+
+func (m *Manager) recoverForClose(ctx context.Context) error {
+	done := ctx.Done()
+	var ctxErr error
+	for {
+		m.mu.Lock()
+		if m.recovered {
+			m.mu.Unlock()
+			return ctxErr
+		}
+		if !m.recovering {
+			m.recovering = true
+			m.mu.Unlock()
+			err := m.reaper.Reap(context.WithoutCancel(ctx))
+			m.mu.Lock()
+			m.recovering = false
+			if err == nil {
+				m.recovered = true
+			}
+			m.notifyLocked()
+			m.mu.Unlock()
+			if err != nil {
+				return errors.Join(fmt.Errorf("account terminal: settle retained processes during close: %w", err), ctxErr)
+			}
+			return ctxErr
+		}
+		changed := m.changed
+		m.mu.Unlock()
+		select {
+		case <-changed:
+		case <-done:
+			ctxErr = fmt.Errorf("account terminal: close recovery: %w", ctx.Err())
 			done = nil
 		}
 	}
