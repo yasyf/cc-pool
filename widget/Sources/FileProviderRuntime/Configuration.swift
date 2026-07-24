@@ -46,7 +46,8 @@ enum CCPoolFileProviderConfiguration {
     )
     return CatalogFileProviderRuntime(
       binding: binding,
-      client: CatalogClient(transport: transport)
+      client: CatalogClient(transport: transport),
+      mutationDispositionPolicy: CCPoolFileProviderMutationDispositionPolicy()
     )
   }
 }
