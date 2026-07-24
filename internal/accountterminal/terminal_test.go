@@ -627,7 +627,12 @@ func TestTerminalCancellationKillsAndReapsDescendant(t *testing.T) {
 		// #nosec G304 -- pidPath is a test-owned file under t.TempDir.
 		raw, err := os.ReadFile(pidPath)
 		if err == nil {
-			pid, err = strconv.Atoi(string(raw))
+			value := strings.TrimSpace(string(raw))
+			if value == "" {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			pid, err = strconv.Atoi(value)
 			if err != nil {
 				t.Fatal(err)
 			}
