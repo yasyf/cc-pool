@@ -233,10 +233,10 @@ func TestResolveSelectionDaemonPickDoesNotRepeatBaseMerge(t *testing.T) {
 	if err := os.WriteFile(privatePath, private, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	admitCLITestAccount(t, st, store.Account{
-		ID: id, ConfigDir: dir, Label: "work@example.com",
+	admitCLITestAccountAtPublicPath(t, st, store.Account{
+		ID: id, Label: "work@example.com",
 		KeychainService: "svc", KeychainAccount: "u",
-	})
+	}, dir)
 	account, err := st.GetAccount(id)
 	if err != nil {
 		t.Fatal(err)
@@ -318,6 +318,7 @@ func TestValidateDaemonSelection(t *testing.T) {
 	}
 	a, _ = st.GetAccount(a.ID)
 	b, _ = st.GetAccount(b.ID)
+	publicPath := testFileProviderPublicPath(a.ID)
 	m := &pool.Manager{Store: st}
 	zero, unknown := 0, 999
 	cases := []struct {
@@ -371,7 +372,7 @@ func TestValidateDaemonSelection(t *testing.T) {
 		{
 			name: "presentation path cannot replace stable execution path",
 			resp: daemon.Response{
-				SelectedID: &a.ID, Prepared: true, Dir: "/Users/test/Library/CloudStorage/account-5", AccountInstanceID: a.InstanceID,
+				SelectedID: &a.ID, Prepared: true, Dir: publicPath, AccountInstanceID: a.InstanceID,
 				AccountGeneration: a.Generation,
 			},
 			launch:    true,

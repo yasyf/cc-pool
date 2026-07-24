@@ -38,10 +38,10 @@ func addRenameAccount(t *testing.T, m *pool.Manager, id int, label, email string
 	default:
 		writeClaudeJSON(t, dir, fmt.Sprintf(`{"accountUuid": "u-%d", "emailAddress": %q}`, id, email))
 	}
-	admitCLITestAccount(t, m.Store, store.Account{
-		ID: id, ConfigDir: dir, Label: label,
+	admitCLITestAccountAtPublicPath(t, m.Store, store.Account{
+		ID: id, Label: label,
 		KeychainService: "ccp-test", KeychainAccount: "ccp-test",
-	})
+	}, dir)
 }
 
 func writeClaudeJSON(t *testing.T, dir, oauthJSON string) {
