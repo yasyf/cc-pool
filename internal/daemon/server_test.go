@@ -155,7 +155,7 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 		callsMu.Lock()
 		calls[account.ID]++
 		callsMu.Unlock()
-		proof := daemonTestPreparationProof(account, testFileProviderConfigDir(account.ID))
+		proof := daemonTestPreparationProof(account, testFileProviderPublicPath(account.ID))
 		if account.ID != 1 {
 			return proof, nil
 		}
@@ -305,15 +305,15 @@ func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[in
 	now := time.Now()
 	for _, id := range []int{1, 2} {
 		util := map[int]float64{1: 10, 2: 50}[id]
-		presentationPath := testFileProviderConfigDir(id)
+		presentationPath := testFileProviderPublicPath(id)
 		if paths[id] != "" {
 			presentationPath = paths[id]
 		}
 		presentationPaths[id] = presentationPath
-		account := admitDaemonTestAccount(t, st, store.Account{
-			ID: id, ConfigDir: presentationPath, Generation: 1,
+		account := admitDaemonTestAccountAtPublicPath(t, st, store.Account{
+			ID: id, Generation: 1,
 			KeychainAccount: "ccp-test",
-		})
+		}, presentationPath)
 		dirs[id] = account.ConfigDir
 		if err := st.InsertUsageSample(store.UsageSample{AccountID: id, TS: now, Util5h: util, Util7d: util}); err != nil {
 			t.Fatal(err)
@@ -423,13 +423,14 @@ func TestPreparationIdentityProjectionRejectsDrift(t *testing.T) {
 	account := store.Account{
 		ID: 7, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 4,
 	}
-	raw := daemonTestPreparationProof(account, "/Users/test/Library/CloudStorage/proof-account-7")
+	publicPath := testFileProviderPublicPath(account.ID)
+	raw := daemonTestPreparationProof(account, publicPath)
 	identity, err := projectPreparationIdentity(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if identity.TenantID == "" || identity.DomainID == "" || identity.Generation != account.Generation ||
-		identity.PublicPath != "/Users/test/Library/CloudStorage/proof-account-7" {
+		identity.PublicPath != publicPath {
 		t.Fatalf("identity = %+v", identity)
 	}
 	raw.Presentation.FileProvider.PublicPath = "relative/path"
@@ -439,8 +440,8 @@ func TestPreparationIdentityProjectionRejectsDrift(t *testing.T) {
 }
 
 func TestSelectionUsesStableExecutionPathForVerifiedPresentation(t *testing.T) {
-	publicPath := "/Users/test/Library/CloudStorage/cc-pool-account-1"
-	s, _ := newTestServerWithPaths(t, map[int]string{1: publicPath})
+	s, _ := newTestServer(t)
+	publicPath := testFileProviderPublicPath(1)
 	account, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
@@ -475,7 +476,14 @@ func TestSelectionRepairsPresentationPathDriftWithoutChangingExecutionPath(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	provenPath := "/Users/test/Library/CloudStorage/cc-pool-account-1"
+	home, err := pool.Home()
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenPath := filepath.Join(home, "Library", "CloudStorage", "CCPoolStatus-moved-acct-01")
+	if err := os.MkdirAll(provenPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	s.prepareAccount = func(ctx context.Context, got store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
 		return daemonTestPreparationProof(got, provenPath), ctx.Err()
 	}

@@ -318,7 +318,7 @@ func TestAuthKindClassification(t *testing.T) {
 	for index, uuid := range []string{"u-self", "u-peer", "u-absent", "u-noorigin", "u-foreign"} {
 		id := index + 1
 		accounts[uuid] = admitDaemonTestAccount(t, s.m.Store, store.Account{
-			ID: id, ConfigDir: testFileProviderConfigDir(id),
+			ID:              id,
 			KeychainService: fmt.Sprintf("svc-auth-kind-%d", id), KeychainAccount: "cc-pool",
 			AccountUUID: uuid,
 		})
