@@ -45,6 +45,15 @@ type PendingAdd struct {
 	PresentationIdentity store.FileProviderPresentationIdentity
 }
 
+// PendingAddRetirementProof binds one verified FuseKit retirement to the
+// exact pending reservation and public presentation path it retired.
+type PendingAddRetirementProof struct {
+	AccountID         int
+	AccountInstanceID string
+	AccountGeneration uint64
+	PublicPath        string
+}
+
 // DuplicateIdentity returns an existing account sharing want's subscription.
 func (m *Manager) DuplicateIdentity(ctx context.Context, want Identity) (*store.Account, error) {
 	accounts, err := m.Store.ListAccounts()
@@ -212,21 +221,28 @@ func syncedPromotionAccount(pending *PendingAdd, label, accountUUID string) stor
 	}
 }
 
-// ReleaseAdd releases the index while retaining its private login state.
-func (m *Manager) ReleaseAdd(pending *PendingAdd) error {
-	if pending == nil {
-		return errors.New("release add: pending account is nil")
-	}
-	return m.Store.ReleaseAccountIndex(pending.Reservation)
-}
-
-// AbandonAdd removes an uncommitted account's credentials and private backing.
-func (m *Manager) AbandonAdd(ctx context.Context, pending *PendingAdd) error {
+// AbandonAdd removes an exactly retired uncommitted account's execution link,
+// credentials, private backing, and reservation.
+func (m *Manager) AbandonAdd(
+	ctx context.Context,
+	pending *PendingAdd,
+	retirement PendingAddRetirementProof,
+) error {
 	if pending == nil {
 		return errors.New("abandon add: pending account is nil")
 	}
+	if err := validatePendingAddRetirement(
+		pending.Reservation, pending.PublicPath, retirement,
+	); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if err := RemoveAccountConfigDir(
+		pending.Reservation.InstanceID, pending.PublicPath,
+	); err != nil {
+		return fmt.Errorf("unlink retired pending execution path: %w", err)
 	}
 	account := store.Account{
 		ID: pending.Reservation.ID, InstanceID: pending.Reservation.InstanceID,
@@ -245,14 +261,59 @@ func (m *Manager) AbandonAdd(ctx context.Context, pending *PendingAdd) error {
 	if err := m.removeCredentialForAccountRemoval(ctx, account); err != nil {
 		return fmt.Errorf("retire pending credential for %s: %w", pending.ConfigDir, err)
 	}
-	removal, err := m.Store.BeginAccountRemoval(pending.Reservation.ID, true)
-	if err != nil {
-		return fmt.Errorf("read pending removal for %s: %w", pending.ConfigDir, err)
-	}
 	if err := m.removeAccountBacking(ctx, pending.Reservation.ID); err != nil {
 		return err
 	}
-	return m.Store.FinalizePendingAccountRemoval(removal)
+	return m.Store.ReleaseAccountIndex(pending.Reservation)
+}
+
+// AbandonReservedAdd removes an exactly retired reservation whose preparation
+// did not return a complete PendingAdd.
+func (m *Manager) AbandonReservedAdd(
+	ctx context.Context,
+	reservation store.PendingAccountReservation,
+	retirement PendingAddRetirementProof,
+) error {
+	pending, err := pendingAddForReservation(reservation, retirement.PublicPath)
+	if err != nil {
+		return err
+	}
+	return m.AbandonAdd(ctx, pending, retirement)
+}
+
+func pendingAddForReservation(
+	reservation store.PendingAccountReservation,
+	publicPath string,
+) (*PendingAdd, error) {
+	configDir, err := AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		return nil, err
+	}
+	service, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		return nil, err
+	}
+	return &PendingAdd{
+		Reservation: reservation, ConfigDir: configDir,
+		PublicPath: publicPath, KeychainService: service,
+	}, nil
+}
+
+func validatePendingAddRetirement(
+	reservation store.PendingAccountReservation,
+	publicPath string,
+	retirement PendingAddRetirementProof,
+) error {
+	if retirement.AccountID != reservation.ID ||
+		retirement.AccountInstanceID != reservation.InstanceID ||
+		retirement.AccountGeneration != reservation.Generation ||
+		retirement.PublicPath != publicPath {
+		return errors.New("pending add retirement proof does not match reservation")
+	}
+	if !filepath.IsAbs(publicPath) || filepath.Clean(publicPath) != publicPath || strings.ContainsRune(publicPath, 0) {
+		return errors.New("pending add retirement proof has invalid public path")
+	}
+	return nil
 }
 
 // FinishAccountRemoval settles one exact deprovisioned account removal.
