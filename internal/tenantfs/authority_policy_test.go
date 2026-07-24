@@ -106,7 +106,7 @@ func TestClaudeAuthorityDeclarationDigestTracksProductConfiguration(t *testing.T
 	if first == ([32]byte{}) || repeated != first {
 		t.Fatalf("declaration digests = %x and %x", first, repeated)
 	}
-	const wantDigest = "c808d93d1096f26990bef30cb47344cb500715bd0081b3da621ec1f964594ec6"
+	const wantDigest = "13ff2fc2f7af667a6cbc1714290d25c35c29b88a4fea56c3e04d43cfc77705c3"
 	if got := hex.EncodeToString(first[:]); got != wantDigest {
 		t.Fatalf("declaration digest = %s, want %s", got, wantDigest)
 	}

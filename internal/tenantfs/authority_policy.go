@@ -310,7 +310,7 @@ func (p ClaudeAuthorityPolicy) PlanDelta(
 			addRoot(spec)
 			affected[causal.LogicalKey(claudeJSONFile)] = struct{}{}
 		default:
-			request, include, err := deltaPhysicalRequest(view, event, specs)
+			request, include, err := deltaPhysicalRequest(event, entry, exists, specs)
 			if err != nil {
 				return sourceauthority.DeltaPlan{}, err
 			}
@@ -474,11 +474,11 @@ func physicalMaterializationRequest(
 }
 
 func deltaPhysicalRequest(
-	view sourceauthority.IndexView,
 	event sourceauthority.PathEvent,
+	entry sourceauthority.IndexedEntry,
+	exists bool,
 	specs []tenant.TenantSpec,
 ) (sourceauthority.MaterializationRequest, bool, error) {
-	entry, exists := view.Entry(event.Root, event.Relative)
 	if exists {
 		request, include, err := physicalMaterializationRequest(entry.Physical, specs)
 		if err != nil || !include {
