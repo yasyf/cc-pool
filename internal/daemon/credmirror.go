@@ -16,8 +16,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/cc-pool/internal/workerexec"
+	"github.com/yasyf/daemonkit/worker"
 )
 
 const (
@@ -47,7 +47,7 @@ type credentialWriteWorkerResponse struct {
 }
 
 type credentialWriteSettler struct {
-	runner           supervise.TaskRunner
+	runner           workerexec.Runner
 	workerExecutable string
 	enabled          func() (bool, error)
 	registry         hostsync.RegistryFile
@@ -56,7 +56,7 @@ type credentialWriteSettler struct {
 }
 
 func newCredentialWriteSettler(
-	runner supervise.TaskRunner,
+	runner workerexec.Runner,
 	workerExecutable string,
 	enabled func() (bool, error),
 	registry hostsync.RegistryFile,
@@ -166,63 +166,32 @@ func (settler *credentialWriteSettler) runWorker(
 	if err := json.NewEncoder(&input).Encode(request); err != nil {
 		return credentialWriteWorkerResponse{}, fmt.Errorf("encode credential write worker request: %w", err)
 	}
-	stdin, inputWriter, err := os.Pipe()
-	if err != nil {
-		return credentialWriteWorkerResponse{}, fmt.Errorf("create credential write worker input: %w", err)
-	}
-	writeDone := make(chan error, 1)
-	go func() {
-		_, writeErr := inputWriter.Write(input.Bytes())
-		writeDone <- errors.Join(writeErr, inputWriter.Close())
-	}()
-	var output, stderr credentialWriteWorkerBuffer
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, credentialWriteWorkerTimeout)
 		defer cancel()
 	}
-	runErr := settler.runner.Run(ctx, supervise.Task{
-		RecoveryClass: proc.RecoveryTask,
-		Path:          settler.workerExecutable,
-		Args:          []string{writeWorkerArgument},
-		Stdin:         stdin,
-		Stdout:        &output,
-		Stderr:        &stderr,
-	})
-	_ = stdin.Close()
-	_ = inputWriter.Close()
-	writeErr := <-writeDone
-	if err := errors.Join(runErr, writeErr); err != nil {
-		return credentialWriteWorkerResponse{}, fmt.Errorf("credential write settlement worker: %w: %s", err, stderr.String())
+	home, err := pool.Home()
+	if err != nil {
+		return credentialWriteWorkerResponse{}, fmt.Errorf("resolve credential write worker home: %w", err)
 	}
-	if output.overflow {
+	result, runErr := settler.runner.Run(ctx, worker.CommandRequest{
+		Path: settler.workerExecutable, Dir: workerexec.TempDir(), Args: []string{writeWorkerArgument},
+		Env: []string{"HOME=" + home}, Stdin: input.Bytes(), TotalTimeout: credentialWriteWorkerTimeout,
+	})
+	if runErr != nil {
+		return credentialWriteWorkerResponse{}, fmt.Errorf(
+			"credential write settlement worker: %w: %s", runErr, string(result.Stderr),
+		)
+	}
+	if len(result.Stdout) > credentialWriteWorkerMaxIO {
 		return credentialWriteWorkerResponse{}, errors.New("credential write settlement worker response exceeded its limit")
 	}
 	var response credentialWriteWorkerResponse
-	if err := decodeCredentialWriteWorkerJSON(&output, &response); err != nil {
+	if err := decodeCredentialWriteWorkerJSON(bytes.NewReader(result.Stdout), &response); err != nil {
 		return credentialWriteWorkerResponse{}, fmt.Errorf("decode credential write worker response: %w", err)
 	}
 	return response, nil
-}
-
-type credentialWriteWorkerBuffer struct {
-	bytes.Buffer
-	overflow bool
-}
-
-func (buffer *credentialWriteWorkerBuffer) Write(input []byte) (int, error) {
-	length := len(input)
-	remaining := credentialWriteWorkerMaxIO - buffer.Len()
-	if len(input) > remaining {
-		buffer.overflow = true
-	}
-	if remaining > 0 {
-		if len(input) > remaining {
-			input = input[:remaining]
-		}
-		_, _ = buffer.Buffer.Write(input)
-	}
-	return length, nil
 }
 
 // IsCredentialWriteWorkerInvocation reports whether args names exactly the

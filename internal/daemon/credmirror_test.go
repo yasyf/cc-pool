@@ -17,13 +17,12 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 )
 
-type credentialWriteTaskRunnerFunc func(context.Context, supervise.Task) error
+type credentialWriteTaskRunnerFunc func(context.Context, worker.CommandRequest) (worker.CommandResult, error)
 
-func (run credentialWriteTaskRunnerFunc) Run(ctx context.Context, task supervise.Task) error {
+func (run credentialWriteTaskRunnerFunc) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 	return run(ctx, task)
 }
 
@@ -62,13 +61,22 @@ func TestCredentialWriteSettlementIsWorkerBackedAndExactIdempotent(t *testing.T)
 	}
 
 	var calls atomic.Int32
-	runner := credentialWriteTaskRunnerFunc(func(ctx context.Context, task supervise.Task) error {
+	runner := credentialWriteTaskRunnerFunc(func(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 		calls.Add(1)
-		if task.RecoveryClass != proc.RecoveryTask || task.Path != "credential-worker" ||
+		if task.Path != "credential-worker" ||
 			len(task.Args) != 1 || task.Args[0] != writeWorkerArgument {
 			t.Fatalf("worker task = %+v", task)
 		}
-		return RunCredentialWriteWorker(ctx, task.Stdin, task.Stdout)
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(task.Env) != 1 || task.Env[0] != "HOME="+home {
+			t.Fatalf("worker environment = %v, want exact HOME", task.Env)
+		}
+		var output bytes.Buffer
+		err = RunCredentialWriteWorker(ctx, bytes.NewReader(task.Stdin), &output)
+		return worker.CommandResult{Stdout: output.Bytes()}, err
 	})
 	settler := newCredentialWriteSettler(
 		runner, "credential-worker", func() (bool, error) { return true, nil },
@@ -273,9 +281,9 @@ func TestCredentialWriteSettlementPublicationPolicyIsExact(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			var workerCalls atomic.Int32
-			runner := credentialWriteTaskRunnerFunc(func(context.Context, supervise.Task) error {
+			runner := credentialWriteTaskRunnerFunc(func(context.Context, worker.CommandRequest) (worker.CommandResult, error) {
 				workerCalls.Add(1)
-				return errors.New("worker must not run")
+				return worker.CommandResult{}, errors.New("worker must not run")
 			})
 			t.Setenv("HOME", t.TempDir())
 			registry := hostsync.NewRegistryFile(pool.SyncDir())
@@ -305,9 +313,8 @@ func TestCredentialWriteSettlementPropagatesCancellationAndRejectsWrongResponse(
 		store.Account{AccountUUID: "uuid"}, &credential,
 		time.UnixMilli(1_700_000_000_000),
 	)
-	cancelRunner := credentialWriteTaskRunnerFunc(func(ctx context.Context, task supervise.Task) error {
-		_, _ = io.Copy(io.Discard, task.Stdin)
-		return ctx.Err()
+	cancelRunner := credentialWriteTaskRunnerFunc(func(ctx context.Context, _ worker.CommandRequest) (worker.CommandResult, error) {
+		return worker.CommandResult{}, ctx.Err()
 	})
 	settler := newCredentialWriteSettler(
 		cancelRunner, "credential-worker", func() (bool, error) { return true, nil },
@@ -319,11 +326,12 @@ func TestCredentialWriteSettlementPropagatesCancellationAndRejectsWrongResponse(
 		t.Fatalf("cancelled settlement = %v, want context cancellation", err)
 	}
 
-	wrongResponseRunner := credentialWriteTaskRunnerFunc(func(_ context.Context, task supervise.Task) error {
-		_, _ = io.Copy(io.Discard, task.Stdin)
-		return json.NewEncoder(task.Stdout).Encode(credentialWriteWorkerResponse{
+	wrongResponseRunner := credentialWriteTaskRunnerFunc(func(_ context.Context, _ worker.CommandRequest) (worker.CommandResult, error) {
+		var output bytes.Buffer
+		err := json.NewEncoder(&output).Encode(credentialWriteWorkerResponse{
 			OperationID: store.CredentialOperationID{9},
 		})
+		return worker.CommandResult{Stdout: output.Bytes()}, err
 	})
 	settler.runner = wrongResponseRunner
 	if err := settler.Settle(t.Context(), settlement); err == nil {
