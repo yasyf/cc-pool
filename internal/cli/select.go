@@ -292,10 +292,16 @@ func validateDaemonSelection(
 		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d prepared=%v, want %v", id, resp.Prepared, launch)
 	}
 	if launch && !exactSelectionPath(resp.Dir) {
-		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d returned invalid File Provider path %q", id, resp.Dir)
+		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d returned invalid execution path %q", id, resp.Dir)
+	}
+	if launch && resp.Dir != a.ConfigDir {
+		return store.Account{}, fmt.Errorf(
+			"invalid daemon selection: id %d returned dir %q, want stable account path %q",
+			id, resp.Dir, a.ConfigDir,
+		)
 	}
 	if !launch && resp.Dir != "" {
-		return store.Account{}, fmt.Errorf("invalid daemon inspection: id %d returned runnable File Provider path %q", id, resp.Dir)
+		return store.Account{}, fmt.Errorf("invalid daemon inspection: id %d returned runnable execution path %q", id, resp.Dir)
 	}
 	if forced != nil && id != forced.ID {
 		return store.Account{}, fmt.Errorf("invalid daemon selection: id %d does not match forced account %d, returned dir %q", id, forced.ID, resp.Dir)
