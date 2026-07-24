@@ -89,9 +89,13 @@ func (r *hostSyncWorkerRemover) PrepareReservedAccount(
 	if err != nil {
 		return store.FileProviderPresentationIdentity{}, err
 	}
+	configDir, err := pool.AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		return store.FileProviderPresentationIdentity{}, fmt.Errorf("derive stable account config dir: %w", err)
+	}
 	account := store.Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: pool.FileProviderConfigDir(reservation.ID), Label: label,
+		Generation: reservation.Generation, ConfigDir: configDir, Label: label,
 	}
 	tenantAccount := pool.TenantAccount(account)
 	if err := coordinator.ensureTenant(ctx, account, tenantAccount); err != nil {

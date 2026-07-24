@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -484,38 +483,12 @@ func openDesiredCoordinatorStore(t *testing.T, total int) *store.Store {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	path := filepath.Join(home, "pool-v1.db")
-	initial, err := store.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := initial.Close(); err != nil {
-		t.Fatal(err)
-	}
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(on)&_pragma=busy_timeout(5000)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for id := 1; id <= total; id++ {
-		if _, err := db.Exec(
-			`INSERT INTO accounts(
-			 id,instance_id,generation,config_dir,keychain_service,keychain_account,label,account_uuid,created_at
-			 ) VALUES(?,?,?,?,?,?,?,?,1)`,
-			id, fmt.Sprintf("%032x", id), 1, testFileProviderConfigDir(id),
-			fmt.Sprintf("service-%d", id), fmt.Sprintf("account-%d", id),
-			fmt.Sprintf("label-%d", id), fmt.Sprintf("uuid-%d", id),
-		); err != nil {
-			_ = db.Close()
-			t.Fatal(err)
-		}
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
 	st, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	insertCoordinatorAccounts(t, st, total)
 	return st
 }
 
@@ -671,8 +644,23 @@ func TestInitializeProvisionsEveryActiveAccountWithoutPreparingContent(t *testin
 	}
 }
 
-func TestInitializeBindsImmutableIdentityForFreshDesiredAccounts(t *testing.T) {
+func TestInitializeRecoversStableConfigDirsForDesiredAccounts(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 2)
+	before, err := st.ListActiveAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := make(map[int]store.FileProviderPresentationIdentity, len(before))
+	for _, account := range before {
+		presentation, err := st.AccountPresentation(account.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.RemoveAccountConfigDir(account.InstanceID, presentation.Identity.PublicPath); err != nil {
+			t.Fatal(err)
+		}
+		bound[account.ID] = presentation.Identity
+	}
 	runtime := &fleetLifecycleRuntime{}
 	preparer := &fleetSourcePreparer{}
 	server := &Server{m: &pool.Manager{Store: st}}
@@ -693,14 +681,18 @@ func TestInitializeBindsImmutableIdentityForFreshDesiredAccounts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		expected, err := expectedPresentationIdentity(account)
-		if err != nil {
-			t.Fatal(err)
-		}
+		expected := bound[account.ID]
 		if presentation.AccountInstanceID != account.InstanceID ||
 			presentation.AccountGeneration != account.Generation ||
 			presentation.Identity != expected {
 			t.Fatalf("acct-%02d presentation = %+v", account.ID, presentation)
+		}
+		target, err := os.Readlink(account.ConfigDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target != presentation.Identity.PublicPath {
+			t.Fatalf("acct-%02d stable config target = %q, want %q", account.ID, target, presentation.Identity.PublicPath)
 		}
 	}
 	progress := server.bootstrapSnapshot()
@@ -710,8 +702,19 @@ func TestInitializeBindsImmutableIdentityForFreshDesiredAccounts(t *testing.T) {
 	}
 }
 
-func TestInitializeBindsIdentityWithoutPreparingContent(t *testing.T) {
+func TestInitializeRecoversStableConfigDirWithoutPreparingContent(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 1)
+	account, err := st.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	presentation, err := st.AccountPresentation(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.RemoveAccountConfigDir(account.InstanceID, presentation.Identity.PublicPath); err != nil {
+		t.Fatal(err)
+	}
 	release := make(chan struct{})
 	preparer := &fleetSourcePreparer{started: make(chan string, 1), release: release}
 	server := &Server{m: &pool.Manager{Store: st}}
@@ -723,6 +726,9 @@ func TestInitializeBindsIdentityWithoutPreparingContent(t *testing.T) {
 	if _, err := st.AccountPresentation(1); err != nil {
 		t.Fatal(err)
 	}
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != presentation.Identity.PublicPath {
+		t.Fatalf("stable config target = %q, %v; want %q", target, err, presentation.Identity.PublicPath)
+	}
 	if prepared, _, _ := preparer.counts(); len(prepared) != 0 {
 		t.Fatalf("startup prepared content: %v", prepared)
 	}
@@ -731,6 +737,10 @@ func TestInitializeBindsIdentityWithoutPreparingContent(t *testing.T) {
 
 func TestInitializeRetainsDesiredPresentationIdentityAfterRestart(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 1)
+	bound, err := st.AccountPresentation(1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := &Server{m: &pool.Manager{Store: st}}
 	first := newTenantCoordinator(t.Context(), server, &fleetSourcePreparer{}, &fleetLifecycleRuntime{})
 	if err := first.initialize(t.Context()); err != nil {
@@ -744,16 +754,8 @@ func TestInitializeRetainsDesiredPresentationIdentityAfterRestart(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	account, err := st.GetAccount(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	expected, err := expectedPresentationIdentity(account)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if presentation.Identity != expected {
-		t.Fatalf("restart identity = %+v, want %+v", presentation.Identity, expected)
+	if presentation.Identity != bound.Identity {
+		t.Fatalf("restart identity = %+v, want %+v", presentation.Identity, bound.Identity)
 	}
 }
 
@@ -789,14 +791,11 @@ func TestInitializeSettlesDesiredIdentityMismatchWithDurableQuarantine(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected, err := expectedPresentationIdentity(account)
+	presentation, err := st.AccountPresentation(account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.BindDesiredAccountPresentation(account, expected); err != nil {
-		t.Fatal(err)
-	}
-	observed := expected
+	observed := presentation.Identity
 	observed.Generation++
 	if err := st.ObserveAccountPresentation(account, observed); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
 		t.Fatalf("seed identity quarantine: %v", err)
@@ -843,7 +842,7 @@ func TestInitializeDoesNotRetryRawHolderTransitions(t *testing.T) {
 			if runtime.provisionCalls != 1 || len(prepared) != 0 {
 				t.Fatalf("%s attempts: provision=%d prepare=%d", test.name, runtime.provisionCalls, len(prepared))
 			}
-			if _, err := st.AccountPresentation(1); !errors.Is(err, sql.ErrNoRows) {
+			if _, err := st.AccountPresentation(1); err != nil {
 				t.Fatalf("presentation after %s = %v", test.name, err)
 			}
 		})

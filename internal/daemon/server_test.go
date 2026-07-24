@@ -3,10 +3,12 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -298,20 +300,21 @@ func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[in
 	t.Cleanup(func() { _ = st.Close() })
 
 	dirs := map[int]string{}
+	presentationPaths := map[int]string{}
 	fakeCreds := credstest.NewFake()
 	now := time.Now()
 	for _, id := range []int{1, 2} {
 		util := map[int]float64{1: 10, 2: 50}[id]
-		configDir := testFileProviderConfigDir(id)
+		presentationPath := testFileProviderConfigDir(id)
 		if paths[id] != "" {
-			configDir = paths[id]
+			presentationPath = paths[id]
 		}
-		dirs[id] = configDir
-		service := creds.ServiceName(configDir)
-		admitDaemonTestAccount(t, st, store.Account{
-			ID: id, ConfigDir: configDir, InstanceID: fmt.Sprintf("instance-%d", id), Generation: 1,
-			KeychainService: service, KeychainAccount: "ccp-test",
+		presentationPaths[id] = presentationPath
+		account := admitDaemonTestAccount(t, st, store.Account{
+			ID: id, ConfigDir: presentationPath, Generation: 1,
+			KeychainAccount: "ccp-test",
 		})
+		dirs[id] = account.ConfigDir
 		if err := st.InsertUsageSample(store.UsageSample{AccountID: id, TS: now, Util5h: util, Util7d: util}); err != nil {
 			t.Fatal(err)
 		}
@@ -319,7 +322,7 @@ func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[in
 		credential.ClaudeAiOauth.AccessToken = fmt.Sprintf("access-%d", id)
 		credential.ClaudeAiOauth.RefreshToken = fmt.Sprintf("refresh-%d", id)
 		credential.ClaudeAiOauth.ExpiresAt = now.Add(time.Hour).UnixMilli()
-		fakeCreds.Put(service, "ccp-test", credential)
+		fakeCreds.Put(account.KeychainService, "ccp-test", credential)
 	}
 	s := &Server{
 		m:            newDaemonTestManager(t, st, &fakeOAuth{}, fakeCreds),
@@ -329,7 +332,7 @@ func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[in
 		cl:           newClaims(),
 		led:          newLedgers(),
 		prepareAccount: func(ctx context.Context, account store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
-			return daemonTestPreparationProof(account, dirs[account.ID]), ctx.Err()
+			return daemonTestPreparationProof(account, presentationPaths[account.ID]), ctx.Err()
 		},
 		activatePrepared: func(_ context.Context, _ store.Account, _ tenantfs.PreparationLease, _ catalogproto.TenantPreparationProof, activate func() error) error {
 			return activate()
@@ -435,7 +438,7 @@ func TestPreparationIdentityProjectionRejectsDrift(t *testing.T) {
 	}
 }
 
-func TestSelectionUsesPersistedFusePublicPathWithoutSynthesizing(t *testing.T) {
+func TestSelectionUsesStableExecutionPathForVerifiedPresentation(t *testing.T) {
 	publicPath := "/Users/test/Library/CloudStorage/cc-pool-account-1"
 	s, _ := newTestServerWithPaths(t, map[int]string{1: publicPath})
 	account, err := s.m.Store.GetAccount(1)
@@ -450,20 +453,23 @@ func TestSelectionUsesPersistedFusePublicPathWithoutSynthesizing(t *testing.T) {
 		Op: OpSelect, Account: &forced, PID: 4242,
 		ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proof-path",
 	})
-	if !response.OK || response.Dir != publicPath {
-		t.Fatalf("selection = %+v, want proof path %q", response, publicPath)
+	if !response.OK || response.Dir != account.ConfigDir {
+		t.Fatalf("selection = %+v, want stable path %q", response, account.ConfigDir)
 	}
 	commitSelectResponse(t, s, response)
 	sessions, err := s.m.Store.ListActiveSessions()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sessions) != 1 || sessions[0].ConfigDir != publicPath {
-		t.Fatalf("committed sessions = %+v, want proof path %q", sessions, publicPath)
+	if len(sessions) != 1 || sessions[0].ConfigDir != account.ConfigDir {
+		t.Fatalf("committed sessions = %+v, want stable path %q", sessions, account.ConfigDir)
+	}
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != publicPath {
+		t.Fatalf("stable config target = %q, %v; want %q", target, err, publicPath)
 	}
 }
 
-func TestSelectionQuarantinesPresentationBindingDrift(t *testing.T) {
+func TestSelectionRepairsPresentationPathDriftWithoutChangingExecutionPath(t *testing.T) {
 	s, _ := newTestServer(t)
 	account, err := s.m.Store.GetAccount(1)
 	if err != nil {
@@ -478,28 +484,31 @@ func TestSelectionQuarantinesPresentationBindingDrift(t *testing.T) {
 		Op: OpSelect, Account: &forced, PID: 4242,
 		ProcessStartedAt: time.Now().Add(-time.Minute).UnixMicro(), Cwd: "/proof-drift",
 	})
-	if response.OK || !strings.Contains(response.Error, store.ErrAccountPresentationQuarantined.Error()) {
-		t.Fatalf("selection = %+v, want quarantined drift", response)
+	if !response.OK || response.Dir != account.ConfigDir {
+		t.Fatalf("selection = %+v, want stable path %q", response, account.ConfigDir)
 	}
-	quarantine, err := s.m.Store.AccountPresentationQuarantine(account.ID)
+	commitSelectResponse(t, s, response)
+	presentation, err := s.m.Store.AccountPresentation(account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fileProvider := daemonTestPreparationProof(account, provenPath).Presentation.FileProvider
-	if quarantine.AccountID != account.ID || quarantine.AccountInstanceID != account.InstanceID ||
-		quarantine.AccountGeneration != account.Generation || quarantine.ExpectedConfigDir != account.ConfigDir ||
-		quarantine.Observed.TenantID != string(fileProvider.TenantID) ||
-		quarantine.Observed.DomainID != string(fileProvider.DomainID) ||
-		quarantine.Observed.Generation != fileProvider.Generation ||
-		quarantine.Observed.PublicPath != provenPath ||
-		quarantine.Reason != store.AccountPresentationPublicPathDrift {
-		t.Fatalf("presentation quarantine = %+v", quarantine)
+	if presentation.AccountInstanceID != account.InstanceID ||
+		presentation.AccountGeneration != account.Generation ||
+		presentation.Identity.TenantID != string(fileProvider.TenantID) ||
+		presentation.Identity.DomainID != string(fileProvider.DomainID) ||
+		presentation.Identity.Generation != fileProvider.Generation ||
+		presentation.Identity.PublicPath != provenPath {
+		t.Fatalf("repaired presentation = %+v", presentation)
 	}
-	if got := s.cl.reservedCount(account.ID); got != 0 {
-		t.Fatalf("drifted selection retained %d reservations", got)
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != provenPath {
+		t.Fatalf("stable config target = %q, %v; want %q", target, err, provenPath)
 	}
-	if sessions, err := s.m.Store.ListActiveSessions(); err != nil || len(sessions) != 0 {
-		t.Fatalf("drifted selection sessions = %+v, %v", sessions, err)
+	if _, err := s.m.Store.AccountPresentationQuarantine(account.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("presentation quarantine remains after repair: %v", err)
+	}
+	if sessions, err := s.m.Store.ListActiveSessions(); err != nil || len(sessions) != 1 || sessions[0].ConfigDir != account.ConfigDir {
+		t.Fatalf("repaired selection sessions = %+v, %v", sessions, err)
 	}
 }
 
@@ -595,16 +604,12 @@ func TestSelectionActivationRejectsStalePreparationProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proof := catalogproto.TenantPreparationProof{
-		Catalog:        catalogproto.CatalogLaneProof{Tenant: "test", Generation: account.Generation, Requested: 1},
-		SourceRevision: 1,
-		Presentation: catalogproto.PresentationProof{
-			Kind: catalogproto.PresentationKindFileProvider,
-			FileProvider: &catalogproto.FileProviderPresentationProof{
-				PublicPath: "/Users/test/Library/CloudStorage/account-1",
-			},
-		},
+	presentation, err := s.m.Store.AccountPresentation(account.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
+	proof := daemonTestPreparationProof(account, presentation.Identity.PublicPath)
+	proof.SourceRevision = 1
 	if !s.cl.bindPreparation(token, proof) {
 		t.Fatal("bind preparation failed")
 	}
@@ -842,7 +847,7 @@ func TestRunCommitRejectsReservedGenerationMismatch(t *testing.T) {
 	committed := s.handleSelectCommit(context.Background(), Request{
 		Op: OpSelectCommit, ReservationToken: resp.ReservationToken,
 	})
-	if committed.OK || !strings.Contains(committed.Error, "account generation changed") {
+	if committed.OK || !strings.Contains(committed.Error, "identity changed") {
 		t.Fatalf("commit after generation change = %+v", committed)
 	}
 	if live, err := s.m.Store.ListActiveSessions(); err != nil {

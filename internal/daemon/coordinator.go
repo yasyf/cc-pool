@@ -86,6 +86,11 @@ func newTenantCoordinator(
 }
 
 func (c *tenantCoordinator) initialize(ctx context.Context) error {
+	if err := c.server.m.RecoverAccountPresentationRepairs(ctx); err != nil {
+		err = fmt.Errorf("recover account presentation repairs: %w", err)
+		c.server.finishBootstrap(err)
+		return err
+	}
 	if err := recoverAccountRemovals(
 		ctx,
 		c.server.m.Store.PageAccountRemovals,
@@ -130,15 +135,8 @@ func (c *tenantCoordinator) prepareDesiredAccount(ctx context.Context, account s
 	if err := c.ensureTenant(ctx, account, tenantAccount); err != nil {
 		return false, err
 	}
-	expected, err := expectedPresentationIdentity(account)
-	if err != nil {
-		return false, err
-	}
-	if err := c.server.m.Store.BindDesiredAccountPresentation(account, expected); err != nil {
-		if errors.Is(err, store.ErrAccountPresentationQuarantined) {
-			return true, nil
-		}
-		return false, err
+	if err := c.server.m.RecoverAccountConfigDir(account); err != nil {
+		return false, fmt.Errorf("recover acct-%02d stable config dir: %w", account.ID, err)
 	}
 	return false, nil
 }
@@ -158,7 +156,7 @@ func expectedPresentationIdentity(account store.Account) (store.FileProviderPres
 	}
 	return store.FileProviderPresentationIdentity{
 		TenantID: string(tenantID), DomainID: string(domainID),
-		Generation: account.Generation, PublicPath: account.ConfigDir,
+		Generation: account.Generation, PublicPath: pool.FileProviderConfigDir(account.ID),
 	}, nil
 }
 

@@ -132,7 +132,6 @@ type Server struct {
 	bootstrap                     bootstrapState
 	prepareAccount                func(context.Context, store.Account, tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error)
 	provisionPresentationIdentity func(context.Context, store.Account) (store.FileProviderPresentationIdentity, error)
-	observePresentationBinding    func(context.Context, store.Account, store.FileProviderPresentationIdentity) error
 	activatePrepared              func(context.Context, store.Account, tenantfs.PreparationLease, catalogproto.TenantPreparationProof, func() error) error
 	preflightCredential           func(context.Context, store.Account) error
 	disposableWorkers             *worker.Pool
@@ -588,16 +587,16 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 					pid: req.PID, processStartedAt: processStartedAt, cwd: req.Cwd,
 					recordSticky: true,
 				}
-				publicPath, token := "", ""
+				executionPath, token := "", ""
 				if launching {
-					publicPath, token, err = s.prepareSelection(ctx, sn.Account, launch)
+					executionPath, token, err = s.prepareSelection(ctx, sn.Account, launch)
 					if err != nil {
 						return Response{OK: false, Error: err.Error()}
 					}
 				}
 				id := sn.Account.ID
 				return Response{
-					OK: true, Dir: publicPath, SelectedID: &id, Prepared: launching,
+					OK: true, Dir: executionPath, SelectedID: &id, Prepared: launching,
 					ReservationToken:  token,
 					AccountInstanceID: sn.Account.InstanceID, AccountGeneration: sn.Account.Generation,
 					Remaining5h: sn.Remaining5h, Remaining7d: sn.Remaining7d, HasUsage: sn.HasUsage,
@@ -672,9 +671,9 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		pid: req.PID, processStartedAt: processStartedAt, cwd: req.Cwd,
 		recordSticky: !outcome.Held() || best.Account.ID == pin.AccountID,
 	}
-	publicPath, token := "", ""
+	executionPath, token := "", ""
 	if launching {
-		publicPath, token, err = s.prepareSelection(ctx, best.Account, launch)
+		executionPath, token, err = s.prepareSelection(ctx, best.Account, launch)
 		if err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
@@ -683,7 +682,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		selectKind(outcome, fallback), req.Cwd, best.Account.ID,
 		r.Score, best.Util5h, best.Util7d, runnerUp(ranked, r.AccountID, fallback))
 	resp := Response{
-		OK: true, Dir: publicPath, SelectedID: &id, Prepared: launching,
+		OK: true, Dir: executionPath, SelectedID: &id, Prepared: launching,
 		ReservationToken:  token,
 		AccountInstanceID: best.Account.InstanceID, AccountGeneration: best.Account.Generation,
 		Sticky:      outcome == pool.StickyBind,
@@ -726,7 +725,7 @@ func (s *Server) prepareSelection(
 		s.cl.abortReservation(token)
 		return "", "", errors.Join(cause, releaseErr)
 	}
-	publicPath, err := s.selectionPublicPath(ctx, account, proof)
+	executionPath, err := s.selectionExecutionPath(ctx, account, proof)
 	if err != nil {
 		return fail(fmt.Errorf("acct-%02d PrepareTenant: %w", account.ID, err))
 	}
@@ -739,7 +738,7 @@ func (s *Server) prepareSelection(
 	if !s.cl.bindPreparation(token, proof) {
 		return fail(fmt.Errorf("acct-%02d reservation expired after PrepareTenant", account.ID))
 	}
-	return publicPath, token, nil
+	return executionPath, token, nil
 }
 
 func (s *Server) releaseProvisionalPreparation(
@@ -762,7 +761,7 @@ func (s *Server) releaseProvisionalPreparation(
 	return err
 }
 
-func (s *Server) selectionPublicPath(
+func (s *Server) selectionExecutionPath(
 	ctx context.Context,
 	account store.Account,
 	proof catalogproto.TenantPreparationProof,
@@ -771,16 +770,10 @@ func (s *Server) selectionPublicPath(
 	if err != nil {
 		return "", err
 	}
-	observe := s.observePresentationBinding
-	if observe == nil {
-		observe = func(_ context.Context, account store.Account, identity store.FileProviderPresentationIdentity) error {
-			return s.m.Store.ObserveAccountPresentation(account, identity)
-		}
+	if _, err := s.m.ReconcileAccountPresentation(ctx, account, identity); err != nil {
+		return "", fmt.Errorf("reconcile account presentation: %w", err)
 	}
-	if err := observe(ctx, account, identity); err != nil {
-		return "", fmt.Errorf("observe account presentation: %w", err)
-	}
-	return identity.PublicPath, nil
+	return account.ConfigDir, nil
 }
 
 func (s *Server) preflightSelectionCredential(
@@ -830,15 +823,29 @@ func (s *Server) handleSelectCommit(ctx context.Context, req Request) Response {
 }
 
 func (s *Server) activateSelection(ctx context.Context, token string, reserved reservation, launch selectionLaunch) Response {
+	fail := func(err error) Response {
+		return Response{OK: false, Error: fmt.Sprintf("activate selection for account %d: %v", reserved.accountID, err)}
+	}
 	if reserved.preparation == nil {
-		return Response{OK: false, Error: "selection reservation has no preparation proof"}
+		return fail(errors.New("selection reservation has no preparation proof"))
 	}
-	publicPath, err := tenantfs.FileProviderPublicPath(*reserved.preparation)
+	identity, err := projectPreparationIdentity(*reserved.preparation)
 	if err != nil {
-		return Response{OK: false, Error: fmt.Sprintf("selection reservation has invalid preparation proof: %v", err)}
+		return fail(fmt.Errorf("selection reservation has invalid preparation proof: %w", err))
 	}
-	account := store.Account{
-		ID: reserved.accountID, InstanceID: reserved.accountInstanceID, Generation: reserved.accountGeneration,
+	account, err := s.m.Store.GetAccount(reserved.accountID)
+	if err != nil {
+		return fail(fmt.Errorf("read selection account: %w", err))
+	}
+	if account.InstanceID != reserved.accountInstanceID || account.Generation != reserved.accountGeneration {
+		return fail(fmt.Errorf(
+			"selection account %d identity changed from %s/%d to %s/%d",
+			reserved.accountID, reserved.accountInstanceID, reserved.accountGeneration,
+			account.InstanceID, account.Generation,
+		))
+	}
+	if _, err := s.m.ReconcileAccountPresentation(ctx, account, identity); err != nil {
+		return fail(fmt.Errorf("reconcile selection presentation: %w", err))
 	}
 	lease := tenantfs.PreparationLease{ID: token, ExpiresAt: reserved.expiresAt}
 	activate := func() error {
@@ -860,7 +867,7 @@ func (s *Server) activateSelection(ctx context.Context, token string, reserved r
 			AccountID: reserved.accountID, ExpectedInstanceID: reserved.accountInstanceID,
 			ExpectedGeneration: reserved.accountGeneration,
 			Process:            process,
-			ConfigDir:          publicPath,
+			ConfigDir:          account.ConfigDir,
 			Cwd:                launch.cwd, RecordSticky: launch.recordSticky, At: time.Now(),
 			FileProviderLease: provisional, LeaseExpiresAt: commitExpires,
 		}
@@ -891,7 +898,7 @@ func (s *Server) activateSelection(ctx context.Context, token string, reserved r
 		activationErr = errors.New("FuseKit tenant coordinator is unavailable")
 	}
 	if activationErr != nil {
-		return Response{OK: false, Error: fmt.Sprintf("activate selection for account %d: %v", reserved.accountID, activationErr)}
+		return fail(activationErr)
 	}
 	return Response{OK: true}
 }

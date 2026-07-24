@@ -29,15 +29,22 @@ func admitDaemonTestAccount(t *testing.T, st *store.Store, requested store.Accou
 	if reservation.ID != requested.ID {
 		t.Fatalf("admit test account: reserved id %d, want %d", reservation.ID, requested.ID)
 	}
-	configDir := requested.ConfigDir
-	if configDir == "" {
-		configDir = fmt.Sprintf("/tmp/cc-pool-test/acct-%02d", requested.ID)
-	} else if !filepath.IsAbs(configDir) {
-		configDir = filepath.Join("/tmp/cc-pool-test", configDir)
+	presentationPath := requested.ConfigDir
+	if presentationPath == "" {
+		presentationPath = fmt.Sprintf("/tmp/cc-pool-test/acct-%02d", requested.ID)
+	} else if !filepath.IsAbs(presentationPath) {
+		presentationPath = filepath.Join("/tmp/cc-pool-test", presentationPath)
 	}
-	keychainService := requested.KeychainService
-	if keychainService == "" {
-		keychainService = fmt.Sprintf("test-service-%d", requested.ID)
+	configDir, err := pool.AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keychainService, err := pool.AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.EnsureAccountConfigDir(reservation.InstanceID, presentationPath); err != nil {
+		t.Fatal(err)
 	}
 	keychainAccount := requested.KeychainAccount
 	if keychainAccount == "" {
@@ -74,7 +81,7 @@ func admitDaemonTestAccount(t *testing.T, st *store.Store, requested store.Accou
 	if !begin.Created || begin.Active == nil {
 		t.Fatalf("admit test account: begin = %+v", begin)
 	}
-	proof := daemonFixturePresentationProof(reservation, configDir)
+	proof := daemonFixturePresentationProof(reservation, presentationPath)
 	fence, err := st.BindAccountMutationPresentation(
 		begin.Active.Fence(),
 		proof,
