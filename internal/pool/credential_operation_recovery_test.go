@@ -334,17 +334,16 @@ func TestCredentialOperationRetryAfterLostResponseReplaysReceipt(t *testing.T) {
 }
 
 func TestCredentialRemovalRecoversOwnerDeathAfterDelete(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	st := openTestStore(t)
 	credentials := credstest.NewFake()
 	owner := credentialRecoveryManager(t, st, credentials, "remove-owner")
-	reservation, err := st.ReserveAccountIndex(owner.workers.owner)
+	account := persistTestAccount(t, st, store.Account{
+		ID: 1, KeychainAccount: "account-remove-recovery",
+	})
+	presentation, err := st.AccountPresentation(account.ID)
 	if err != nil {
 		t.Fatal(err)
-	}
-	account := store.Account{
-		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: t.TempDir(),
-		KeychainService: "service-remove-recovery", KeychainAccount: "account-remove-recovery",
 	}
 	credentials.Put(
 		account.KeychainService, account.KeychainAccount,
@@ -358,6 +357,10 @@ func TestCredentialRemovalRecoversOwnerDeathAfterDelete(t *testing.T) {
 		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
 		account.KeychainService, account.KeychainAccount,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removal, err := st.BeginAccountRemoval(account.ID, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,16 +394,12 @@ func TestCredentialRemovalRecoversOwnerDeathAfterDelete(t *testing.T) {
 		t.Fatalf("recovered removal = %+v", terminal)
 	}
 	if err := recovery.removeCredentialForAccountRemovalAt(
-		t.Context(), account, account.ConfigDir,
+		t.Context(), account, presentation.Identity.PublicPath,
 	); err != nil {
 		t.Fatalf("replay recovered receipt: %v", err)
 	}
-	removal, err := st.BeginAccountRemoval(account.ID, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.FinalizePendingAccountRemoval(removal); err != nil {
-		t.Fatalf("finalize recovered pending removal: %v", err)
+	if err := st.DeleteAccount(removal.AccountID); err != nil {
+		t.Fatalf("finalize recovered account removal: %v", err)
 	}
 }
 
@@ -1419,6 +1418,7 @@ func TestExpiredCompensationRecoveryFinishesExactPartialDelete(t *testing.T) {
 }
 
 func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	st := openTestStore(t)
 	credentials := credstest.NewFake()
 	manager := credentialRecoveryManager(t, st, credentials, "pending-compensation-owner")
@@ -1426,14 +1426,28 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	account := store.Account{
-		ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
-		ConfigDir: t.TempDir(), KeychainService: "service-pending-compensation",
-		KeychainAccount: "account-pending-compensation",
-	}
-	empty, err := manager.credentialObservation(t.Context(), account)
+	configDir, err := AccountConfigDir(reservation.InstanceID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	keychainService, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicPath := testFileProviderPublicPath(reservation.ID)
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
+		t.Fatal(err)
+	}
+	account := store.Account{
+		ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
+		ConfigDir: configDir, KeychainService: keychainService,
+		KeychainAccount: "account-pending-compensation",
+	}
+	empty := store.CredentialExternalState{
+		Keychain: store.CredentialSlotObservation{State: store.CredentialSlotEmpty},
 	}
 	emptyDigest, err := empty.Digest()
 	if err != nil {
@@ -1458,7 +1472,7 @@ func TestExpiredAddCompensationRecoversFromAccountMutationSubject(t *testing.T) 
 		t.Fatalf("begin pending Add = %+v err=%v", begin, err)
 	}
 	fence, err := st.BindAccountMutationPresentation(
-		begin.Active.Fence(), poolTestPresentationProof(reservation, account.ConfigDir),
+		begin.Active.Fence(), poolTestPresentationProof(reservation, publicPath),
 		account.ConfigDir, account.KeychainService,
 		account.KeychainAccount, locator, emptyDigest,
 	)

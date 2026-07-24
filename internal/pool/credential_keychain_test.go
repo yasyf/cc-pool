@@ -19,11 +19,11 @@ func datedCred(token string, exp time.Duration) *creds.Credential {
 }
 
 func TestReadCredentialUsesKeychain(t *testing.T) {
-	account := store.Account{
-		ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc-keychain-only", KeychainAccount: "user",
-	}
+	t.Setenv("HOME", t.TempDir())
+	database := openTestStore(t)
+	account := persistTestAccount(t, database, store.Account{ID: 1, KeychainAccount: "user"})
 	credentials := credstest.NewFake()
-	manager := &Manager{Creds: credentials}
+	manager := &Manager{Store: database, Creds: credentials}
 	if _, _, err := manager.ReadCredential(t.Context(), account); !errors.Is(err, creds.ErrNotFound) {
 		t.Fatalf("ReadCredential without Keychain credential = %v, want ErrNotFound", err)
 	}
