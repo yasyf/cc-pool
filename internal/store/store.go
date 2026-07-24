@@ -774,7 +774,6 @@ func (s *Store) ListActiveAccounts() ([]Account, error) {
 		JOIN account_presentations ON account_presentations.account_id=accounts.id
 		  AND account_presentations.account_instance_id=accounts.instance_id
 		  AND account_presentations.account_generation=accounts.generation
-		  AND account_presentations.public_path=accounts.config_dir
 		WHERE deleted_at IS NULL
 		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)
 		  AND NOT EXISTS (SELECT 1 FROM account_presentation_quarantines WHERE account_id=accounts.id)
@@ -805,7 +804,6 @@ func (s *Store) ListPublishableOrigins() ([]Account, error) {
 		JOIN account_presentations ON account_presentations.account_id=accounts.id
 		  AND account_presentations.account_instance_id=accounts.instance_id
 		  AND account_presentations.account_generation=accounts.generation
-		  AND account_presentations.public_path=accounts.config_dir
 		LEFT JOIN auth_health ON auth_health.account_id=accounts.id
 		WHERE deleted_at IS NULL
 		  AND accounts.account_uuid<>''
@@ -1217,7 +1215,6 @@ func selectionEligible(
 		JOIN account_presentations ON account_presentations.account_id=accounts.id
 		  AND account_presentations.account_instance_id=accounts.instance_id
 		  AND account_presentations.account_generation=accounts.generation
-		  AND account_presentations.public_path=accounts.config_dir
 		WHERE accounts.id=? AND accounts.instance_id=? AND accounts.generation=?
 		  AND accounts.config_dir=? AND accounts.deleted_at IS NULL
 		  AND NOT EXISTS (SELECT 1 FROM account_removals WHERE account_id=accounts.id)

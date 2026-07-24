@@ -21,7 +21,7 @@ func TestListActiveAccountsExcludesAccountWithoutExactPresentation(t *testing.T)
 func TestBindDesiredAccountPresentationIsLostResponseAndRestartIdempotent(t *testing.T) {
 	s := openTest(t)
 	account := insertDesiredPresentationTestAccount(t, s, 1)
-	identity := presentationTestIdentity(account, account.ConfigDir)
+	identity := presentationTestIdentity(account, "/presentation/acct-01")
 	if err := s.BindDesiredAccountPresentation(account, identity); err != nil {
 		t.Fatal(err)
 	}
@@ -36,6 +36,13 @@ func TestBindDesiredAccountPresentationIsLostResponseAndRestartIdempotent(t *tes
 		active[0].ID != account.ID || active[0].InstanceID != account.InstanceID ||
 		active[0].Generation != account.Generation || active[0].ConfigDir != account.ConfigDir {
 		t.Fatalf("active accounts = %+v err=%v, want %+v", active, err, account)
+	}
+	if origins, err := s.ListPublishableOrigins(); err != nil || len(origins) != 1 ||
+		!samePresentationAccount(origins[0], account) || origins[0].AccountUUID != account.AccountUUID {
+		t.Fatalf("publishable origins = %+v err=%v, want %+v", origins, err, account)
+	}
+	if err := s.SelectionEligible(account); err != nil {
+		t.Fatalf("stable-path account is not selection eligible: %v", err)
 	}
 }
 
