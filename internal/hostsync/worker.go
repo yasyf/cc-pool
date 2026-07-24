@@ -9,12 +9,11 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/cc-pool/internal/workerexec"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
@@ -22,7 +21,7 @@ import (
 const (
 	hostSyncWorkerArgument = "__host-sync-worker"
 	hostSyncWorkerProtocol = "cc-pool.hostsync.worker.v1"
-	maxHostSyncWorkerFrame = 8 << 20
+	maxHostSyncWorkerFrame = 12 << 20
 	hostSyncWorkerTimeout  = 2 * time.Minute
 )
 
@@ -41,8 +40,8 @@ const (
 	workerCapabilities workerOperation = "capabilities"
 	workerList         workerOperation = "list"
 	workerReconcile    workerOperation = "reconcile"
-	workerSync         workerOperation = "sync"
-	workerGetState     workerOperation = "get-state"
+	workerExport       workerOperation = "export"
+	workerApply        workerOperation = "apply"
 	workerFetch        workerOperation = "fetch-credential"
 	workerAuthKind     workerOperation = "auth-kind"
 )
@@ -88,14 +87,14 @@ type WorkerRuntimeScope func(
 
 // WorkerClient executes each host-sync operation in one daemonkit worker group.
 type WorkerClient struct {
-	runner     supervise.TaskRunner
+	runner     workerexec.Runner
 	executable string
 	lane       chan struct{}
 	timeout    time.Duration
 }
 
 // NewWorkerClient binds host-sync operations to one daemonkit worker pool.
-func NewWorkerClient(runner supervise.TaskRunner, executable string) (*WorkerClient, error) {
+func NewWorkerClient(runner workerexec.Runner, executable string) (*WorkerClient, error) {
 	if runner == nil || executable == "" {
 		return nil, errors.New("hostsync: worker runner and executable are required")
 	}
@@ -126,17 +125,17 @@ func (c *WorkerClient) Reconcile(ctx context.Context, origin string) (syncservic
 	return result, err
 }
 
-// Sync executes one complete convergence pass in a disposable child.
-func (c *WorkerClient) Sync(ctx context.Context, origin string) (syncservice.SyncResult, error) {
-	var result syncservice.SyncResult
-	err := c.do(ctx, workerSync, workerOriginParams{Origin: origin}, &result)
+// Export reads one immutable revisioned snapshot in a disposable child.
+func (c *WorkerClient) Export(ctx context.Context, request syncservice.ExportRequest) (syncservice.ChangeEnvelope, error) {
+	var result syncservice.ChangeEnvelope
+	err := c.do(ctx, workerExport, request, &result)
 	return result, err
 }
 
-// GetState executes the complete registry read in a disposable child.
-func (c *WorkerClient) GetState(ctx context.Context) (syncservice.RawRegistry, error) {
-	var result syncservice.RawRegistry
-	err := c.do(ctx, workerGetState, struct{}{}, &result)
+// Apply merges and reconciles one delivery-bound change in a disposable child.
+func (c *WorkerClient) Apply(ctx context.Context, change syncservice.ChangeEnvelope) (syncservice.ApplyResult, error) {
+	var result syncservice.ApplyResult
+	err := c.do(ctx, workerApply, change, &result)
 	return result, err
 }
 
@@ -179,32 +178,15 @@ func (c *WorkerClient) do(ctx context.Context, operation workerOperation, params
 	if err := writeWorkerFrame(&framed, request); err != nil {
 		return err
 	}
-	input, inputWriter, err := os.Pipe()
-	if err != nil {
-		return fmt.Errorf("hostsync: create worker input pipe: %w", err)
-	}
-	writeDone := make(chan error, 1)
-	go func() {
-		_, writeErr := inputWriter.Write(framed.Bytes())
-		writeDone <- errors.Join(writeErr, inputWriter.Close())
-	}()
-	var output, stderr boundedWorkerBuffer
-	runErr := c.runner.Run(ctx, supervise.Task{
-		RecoveryClass: proc.RecoverySourceOwner,
-		Path:          c.executable,
-		Args:          []string{hostSyncWorkerArgument},
-		Stdin:         input,
-		Stdout:        &output,
-		Stderr:        &stderr,
+	command, runErr := c.runner.Run(ctx, worker.CommandRequest{
+		Path: c.executable, Dir: workerexec.TempDir(), Args: []string{hostSyncWorkerArgument},
+		Stdin: framed.Bytes(), TotalTimeout: c.timeout,
 	})
-	_ = input.Close()
-	_ = inputWriter.Close()
-	writeErr := <-writeDone
-	if err := errors.Join(runErr, writeErr); err != nil {
-		return fmt.Errorf("hostsync: %s worker: %w: %s", operation, err, stderr.String())
+	if runErr != nil {
+		return fmt.Errorf("hostsync: %s worker: %w: %s", operation, runErr, string(command.Stderr))
 	}
 	var response workerResponse
-	if err := readWorkerFrame(bytes.NewReader(output.Bytes()), &response); err != nil {
+	if err := readWorkerFrame(bytes.NewReader(command.Stdout), &response); err != nil {
 		return fmt.Errorf("hostsync: decode %s worker response: %w", operation, err)
 	}
 	if response.Protocol != hostSyncWorkerProtocol || response.Operation != operation {
@@ -289,7 +271,7 @@ func RunWorker(ctx context.Context, input io.Reader, output io.Writer, scope Wor
 }
 
 func workerNeedsTransport(operation workerOperation) bool {
-	return operation == workerReconcile || operation == workerSync
+	return operation == workerReconcile || operation == workerApply
 }
 
 func executeWorkerOperation(ctx context.Context, runtime WorkerRuntime, request workerRequest) (any, error) {
@@ -310,17 +292,18 @@ func executeWorkerOperation(ctx context.Context, runtime WorkerRuntime, request 
 			return nil, err
 		}
 		return runtime.Consumer.Reconcile(ctx, params.Origin)
-	case workerSync:
-		var params workerOriginParams
+	case workerExport:
+		var params syncservice.ExportRequest
 		if err := decodeExactJSON(request.Params, &params); err != nil {
 			return nil, err
 		}
-		return runtime.Consumer.Sync(ctx, params.Origin)
-	case workerGetState:
-		if err := requireEmptyParams(request.Params); err != nil {
+		return runtime.Consumer.Export(ctx, params)
+	case workerApply:
+		var params syncservice.ChangeEnvelope
+		if err := decodeExactJSON(request.Params, &params); err != nil {
 			return nil, err
 		}
-		return runtime.Consumer.GetState(ctx)
+		return runtime.Consumer.Apply(ctx, params)
 	case workerFetch:
 		var params map[string]any
 		if err := decodeExactJSON(request.Params, &params); err != nil {
@@ -397,17 +380,6 @@ func decodeExactJSON(payload []byte, value any) error {
 		return errors.New("hostsync: worker JSON has trailing values")
 	}
 	return nil
-}
-
-type boundedWorkerBuffer struct {
-	bytes.Buffer
-}
-
-func (buffer *boundedWorkerBuffer) Write(payload []byte) (int, error) {
-	if len(payload) > maxHostSyncWorkerFrame+4-buffer.Len() {
-		return 0, errors.New("hostsync: worker output exceeds frame bound")
-	}
-	return buffer.Buffer.Write(payload)
 }
 
 var _ syncservice.SyncConsumer = (*WorkerClient)(nil)

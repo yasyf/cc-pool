@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -673,32 +671,24 @@ func TestFetchOrderTrustedSetOnly(t *testing.T) {
 	}
 }
 
-// TestRegistryOriginNeverShellExecuted is the RCE regression, end to end through
-// the REAL PeerTransport with the sim exec: transport ENABLED — so if the
-// registry-injected origin "exec:touch <sentinel>" were dialed, sh -c would run
-// and create the sentinel. It doesn't: fetchOrder drops the non-member origin,
-// so no sentinel appears. Reverting the fetchOrder trusted-set filter dials the
-// injected origin and the sentinel is created — the test fails.
-func TestRegistryOriginNeverShellExecuted(t *testing.T) {
-	t.Setenv(envExecPeer, "1")
-	prev := FetchTimeout
-	FetchTimeout = 2 * time.Second
-	t.Cleanup(func() { FetchTimeout = prev })
-
-	sentinel := filepath.Join(t.TempDir(), "pwned")
-	origin := execPeerPrefix + "touch " + sentinel // the registry-injected RCE payload
+// TestRegistryOriginNeverBecomesDialTarget is the RCE regression at the current
+// transport boundary: an attacker-controlled registry origin may reorder only
+// exact configured peers and can never introduce a dial target.
+func TestRegistryOriginNeverBecomesDialTarget(t *testing.T) {
+	origin := "exec:touch /tmp/pwned"
 	chain := ChainStamp{Origin: origin, ExpiresAt: 9_999, Hash: "h"}
-	withHostSyncTestTransportRunner(t, func(runner syncservice.TransportRunner) {
-		dial := func(peer string) syncservice.Transport { return PeerTransport(runner, peer) }
-
-		// The trusted configured mesh is a single exec: peer that fails; the injected
-		// origin is NOT a member.
-		_, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{execPeerPrefix + "false"})
-		if !errors.Is(err, ErrNoPeerCredential) {
-			t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
-		}
-	})
-	if _, statErr := os.Stat(sentinel); statErr == nil {
-		t.Fatalf("sentinel %s was created — the registry-injected exec: origin was shell-executed", sentinel)
+	var dialed []string
+	dial := func(peer string) syncservice.Transport {
+		dialed = append(dialed, peer)
+		return &fakeTransport{do: func(context.Context, *rpc.Request) (*syncservice.Response, error) {
+			return nil, errors.New("unreachable")
+		}}
+	}
+	_, err := FetchCredential(context.Background(), dial, "u-1", chain, 0, []string{"host-a"})
+	if !errors.Is(err, ErrNoPeerCredential) {
+		t.Fatalf("err = %v, want errors.Is ErrNoPeerCredential", err)
+	}
+	if !reflect.DeepEqual(dialed, []string{"host-a"}) {
+		t.Fatalf("dialed = %v, want only configured host-a", dialed)
 	}
 }

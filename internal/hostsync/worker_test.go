@@ -13,8 +13,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
@@ -23,9 +22,11 @@ type workerConsumerFixture struct {
 	caps      syncservice.Capabilities
 	items     []syncservice.WatchItem
 	reconcile syncservice.ReconcileResult
-	sync      syncservice.SyncResult
-	state     syncservice.RawRegistry
+	export    syncservice.ChangeEnvelope
+	apply     syncservice.ApplyResult
 	origins   []string
+	exports   []syncservice.ExportRequest
+	applies   []syncservice.ChangeEnvelope
 	err       error
 }
 
@@ -42,31 +43,33 @@ func (c *workerConsumerFixture) Reconcile(_ context.Context, origin string) (syn
 	return c.reconcile, c.err
 }
 
-func (c *workerConsumerFixture) Sync(_ context.Context, origin string) (syncservice.SyncResult, error) {
-	c.origins = append(c.origins, origin)
-	return c.sync, c.err
+func (c *workerConsumerFixture) Export(_ context.Context, request syncservice.ExportRequest) (syncservice.ChangeEnvelope, error) {
+	c.exports = append(c.exports, request)
+	return c.export, c.err
 }
 
-func (c *workerConsumerFixture) GetState(context.Context) (syncservice.RawRegistry, error) {
-	return c.state, c.err
+func (c *workerConsumerFixture) Apply(_ context.Context, change syncservice.ChangeEnvelope) (syncservice.ApplyResult, error) {
+	c.applies = append(c.applies, change)
+	return c.apply, c.err
 }
 
 type inlineHostSyncRunner struct {
 	t           *testing.T
 	runtime     WorkerRuntime
-	tasks       []supervise.Task
+	tasks       []worker.CommandRequest
 	runtimeCall int
 	transport   []bool
 }
 
-func (r *inlineHostSyncRunner) Run(ctx context.Context, task supervise.Task) error {
+func (r *inlineHostSyncRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 	r.t.Helper()
 	r.tasks = append(r.tasks, task)
-	if task.RecoveryClass != proc.RecoverySourceOwner || !IsWorkerInvocation(task.Args) {
+	if !IsWorkerInvocation(task.Args) {
 		r.t.Fatalf("task = %+v, want exact recovery worker role", task)
 	}
 	r.runtimeCall++
-	return RunWorker(ctx, task.Stdin, task.Stdout, func(
+	var output bytes.Buffer
+	err := RunWorker(ctx, bytes.NewReader(task.Stdin), &output, func(
 		_ context.Context,
 		needsTransport bool,
 		run func(WorkerRuntime) error,
@@ -74,15 +77,31 @@ func (r *inlineHostSyncRunner) Run(ctx context.Context, task supervise.Task) err
 		r.transport = append(r.transport, needsTransport)
 		return run(r.runtime)
 	})
+	return worker.CommandResult{Stdout: output.Bytes()}, err
 }
 
 func TestWorkerClientExecutesExactOperations(t *testing.T) {
+	exportRequest := syncservice.ExportRequest{
+		ServiceID: SyncServiceID, SchemaFingerprint: SyncSchemaFingerprint,
+		SinceRevision: syncservice.NewRevision(4),
+	}
+	exported, err := syncservice.NewExportedChange(
+		SyncServiceID, SyncSchemaFingerprint, syncservice.ChangeSnapshot,
+		syncservice.NewRevision(0), syncservice.NewRevision(5), []byte(`{"u1":{}}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := syncservice.BindDelivery(exported, "host-b")
+	if err != nil {
+		t.Fatal(err)
+	}
 	consumer := &workerConsumerFixture{
 		caps:      syncservice.Capabilities{Name: "cc-pool", Methods: []string{"list", MethodFetchCredential}},
 		items:     []syncservice.WatchItem{{ID: "u1", WatchDirs: []string{"/stamps/u1"}, Fingerprint: "fp"}},
 		reconcile: syncservice.ReconcileResult{Converged: 3, SkippedBusy: 1},
-		sync:      syncservice.SyncResult{Converged: 4, SkippedBusy: 2},
-		state:     json.RawMessage(`{"u1":{"added":1}}`),
+		export:    exported,
+		apply:     syncservice.ApplyResult{AckedRevision: delivery.SourceRevision},
 	}
 	fetchCalls := 0
 	fetch := rpc.Handler(func(_ context.Context, params map[string]any) (any, error) {
@@ -115,11 +134,11 @@ func TestWorkerClientExecutesExactOperations(t *testing.T) {
 	if got, err := client.Reconcile(t.Context(), "host-a"); err != nil || got != consumer.reconcile {
 		t.Fatalf("Reconcile = %+v, %v", got, err)
 	}
-	if got, err := client.Sync(t.Context(), "host-b"); err != nil || got != consumer.sync {
-		t.Fatalf("Sync = %+v, %v", got, err)
+	if got, err := client.Export(t.Context(), exportRequest); err != nil || got.ChangeID != exported.ChangeID || got.SourceRevision != exported.SourceRevision || !bytes.Equal(got.Payload, exported.Payload) {
+		t.Fatalf("Export = %+v, %v", got, err)
 	}
-	if got, err := client.GetState(t.Context()); err != nil || !bytes.Equal(got, consumer.state) {
-		t.Fatalf("GetState = %s, %v", got, err)
+	if got, err := client.Apply(t.Context(), delivery); err != nil || got != consumer.apply {
+		t.Fatalf("Apply = %+v, %v", got, err)
 	}
 	got, err := client.FetchCredentialHandler(t.Context(), map[string]any{"uuid": "u1"})
 	if err != nil {
@@ -132,8 +151,14 @@ func TestWorkerClientExecutesExactOperations(t *testing.T) {
 	if fetchCalls != 1 || runner.runtimeCall != 6 {
 		t.Fatalf("calls: fetch=%d worker=%d", fetchCalls, runner.runtimeCall)
 	}
-	if strings.Join(consumer.origins, ",") != "host-a,host-b" {
+	if strings.Join(consumer.origins, ",") != "host-a" {
 		t.Fatalf("origins = %v", consumer.origins)
+	}
+	if len(consumer.exports) != 1 || consumer.exports[0] != exportRequest {
+		t.Fatalf("export requests = %+v", consumer.exports)
+	}
+	if len(consumer.applies) != 1 || consumer.applies[0].ChangeID != delivery.ChangeID || consumer.applies[0].Origin != "host-b" {
+		t.Fatalf("applied changes = %+v", consumer.applies)
 	}
 	if kind, err := client.AuthKind(t.Context(), 7, "u1"); err != nil || kind != store.AuthKindAwaitingOrigin {
 		t.Fatalf("AuthKind = %q, %v", kind, err)
@@ -141,7 +166,7 @@ func TestWorkerClientExecutesExactOperations(t *testing.T) {
 	if runner.runtimeCall != 7 {
 		t.Fatalf("worker calls after auth kind = %d", runner.runtimeCall)
 	}
-	wantTransport := []bool{false, false, true, true, false, false, false}
+	wantTransport := []bool{false, false, true, false, true, false, false}
 	if len(runner.transport) != len(wantTransport) {
 		t.Fatalf("transport requests = %v, want %v", runner.transport, wantTransport)
 	}
@@ -205,7 +230,7 @@ func TestWorkerAuthKindPreservesTypedFailure(t *testing.T) {
 }
 
 type canceledHostSyncRunner struct {
-	task supervise.Task
+	task worker.CommandRequest
 }
 
 type gatedHostSyncRunner struct {
@@ -216,20 +241,20 @@ type gatedHostSyncRunner struct {
 	calls   atomic.Int32
 }
 
-func (r *gatedHostSyncRunner) Run(ctx context.Context, task supervise.Task) error {
+func (r *gatedHostSyncRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 	r.calls.Add(1)
 	r.once.Do(func() { close(r.started) })
 	select {
 	case <-r.release:
 		return r.inner.Run(ctx, task)
 	case <-ctx.Done():
-		return ctx.Err()
+		return worker.CommandResult{}, ctx.Err()
 	}
 }
 
 func TestWorkerClientSerializesExclusiveChildActivation(t *testing.T) {
 	inner := &inlineHostSyncRunner{t: t, runtime: WorkerRuntime{
-		Consumer: &workerConsumerFixture{state: json.RawMessage(`{}`)},
+		Consumer: &workerConsumerFixture{},
 		Fetch:    func(context.Context, map[string]any) (any, error) { return struct{}{}, nil },
 		AuthKind: func(context.Context, int, string) (store.AuthKind, error) { return store.AuthKindOwned, nil },
 	}}
@@ -242,7 +267,7 @@ func TestWorkerClientSerializesExclusiveChildActivation(t *testing.T) {
 	}
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := client.GetState(t.Context())
+		_, err := client.Export(t.Context(), testWorkerExportRequest())
 		firstDone <- err
 	}()
 	<-runner.started
@@ -262,7 +287,7 @@ func TestWorkerClientSerializesExclusiveChildActivation(t *testing.T) {
 
 func TestWorkerClientDefaultDeadlineIncludesLaneWait(t *testing.T) {
 	inner := &inlineHostSyncRunner{t: t, runtime: WorkerRuntime{
-		Consumer: &workerConsumerFixture{state: json.RawMessage(`{}`)},
+		Consumer: &workerConsumerFixture{},
 		Fetch:    func(context.Context, map[string]any) (any, error) { return struct{}{}, nil },
 		AuthKind: func(context.Context, int, string) (store.AuthKind, error) { return store.AuthKindOwned, nil },
 	}}
@@ -278,7 +303,7 @@ func TestWorkerClientDefaultDeadlineIncludesLaneWait(t *testing.T) {
 	defer cancelFirst()
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := client.GetState(firstCtx)
+		_, err := client.Export(firstCtx, testWorkerExportRequest())
 		firstDone <- err
 	}()
 	<-runner.started
@@ -294,10 +319,10 @@ func TestWorkerClientDefaultDeadlineIncludesLaneWait(t *testing.T) {
 	}
 }
 
-func (r *canceledHostSyncRunner) Run(ctx context.Context, task supervise.Task) error {
+func (r *canceledHostSyncRunner) Run(ctx context.Context, task worker.CommandRequest) (worker.CommandResult, error) {
 	r.task = task
 	<-ctx.Done()
-	return ctx.Err()
+	return worker.CommandResult{}, ctx.Err()
 }
 
 func TestWorkerDeadlineReturnsOnlyAfterRunnerSettlement(t *testing.T) {
@@ -310,11 +335,11 @@ func TestWorkerDeadlineReturnsOnlyAfterRunnerSettlement(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
-	_, err = client.GetState(ctx)
+	_, err = client.Export(ctx, testWorkerExportRequest())
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("GetState error = %v", err)
+		t.Fatalf("Export error = %v", err)
 	}
-	if runner.task.RecoveryClass != proc.RecoverySourceOwner || !IsWorkerInvocation(runner.task.Args) {
+	if !IsWorkerInvocation(runner.task.Args) {
 		t.Fatalf("task = %+v", runner.task)
 	}
 	entries, readErr := os.ReadDir(temp)
@@ -323,6 +348,13 @@ func TestWorkerDeadlineReturnsOnlyAfterRunnerSettlement(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("parent host-sync framing touched temp storage: %v", entries)
+	}
+}
+
+func testWorkerExportRequest() syncservice.ExportRequest {
+	return syncservice.ExportRequest{
+		ServiceID: SyncServiceID, SchemaFingerprint: SyncSchemaFingerprint,
+		SinceRevision: syncservice.NewRevision(0),
 	}
 }
 

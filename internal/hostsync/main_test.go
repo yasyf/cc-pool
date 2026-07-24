@@ -14,8 +14,6 @@ func TestMain(m *testing.M) {
 	ctx := context.Background()
 	var err error
 	switch {
-	case os.Getenv(testRPCStateEnv) != "":
-		err = runTestRPCServer(ctx)
 	case pool.IsBackingWorkerInvocation(os.Args[1:]):
 		err = pool.RunBackingWorker(ctx, os.Stdin, os.Stdout)
 	case procscan.IsWorkerInvocation(os.Args[1:]):
