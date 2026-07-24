@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 // setupSync constructs the host-sync engine and wires it onto the daemon.
@@ -23,6 +26,10 @@ func (s *Server) setupSync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	synckitdExecutable, err := resolveSynckitdExecutable()
+	if err != nil {
+		return err
+	}
 	if s.disposableWorkers == nil {
 		return errors.New("sync requires daemon disposable workers")
 	}
@@ -31,17 +38,14 @@ func (s *Server) setupSync(ctx context.Context) error {
 		return fmt.Errorf("resolve credential settlement worker executable: %w", err)
 	}
 
-	svc := &hostsync.Service{
-		Registry: hostsync.NewRegistryFile(pool.SyncDir()),
-		StampDir: pool.SyncStampsDir(),
-		Log:      s.log,
-	}
+	registry := hostsync.NewRegistryFile(pool.SyncDir())
+	stampDir := pool.SyncStampsDir()
 	settler := newCredentialWriteSettler(
 		s.disposableWorkers,
 		workerExecutable,
 		s.syncEnabled,
-		*svc.Registry,
-		svc.StampDir,
+		*registry,
+		stampDir,
 		self,
 	)
 	previousBuilder := s.m.BuildCredentialWritePublication
@@ -60,31 +64,59 @@ func (s *Server) setupSync(ctx context.Context) error {
 		return fmt.Errorf("settle pending credential writes: %w", err)
 	}
 
-	worker, err := hostsync.NewWorkerClient(s.disposableWorkers, workerExecutable)
+	worker, err := hostsync.NewWorkerClient(s.disposableWorkers, workerExecutable, synckitdExecutable)
 	if err != nil {
 		return err
 	}
-	if err := s.startSyncServer(ctx, worker); err != nil {
+	if err := s.startSyncHelper(ctx, workerExecutable, synckitdExecutable); err != nil {
 		return err
 	}
-	s.syncSvc = svc
+	client := syncservice.NewClient(syncservice.Socket(s.syncSocket))
+	defer func() {
+		if !wired {
+			_ = client.Close()
+		}
+	}()
+	s.syncClient = client
 	s.syncSelf = self
 	s.syncAuthKind = worker.AuthKind
 	s.syncPull = func(ctx context.Context) error {
-		_, err := worker.Reconcile(ctx, "")
-		if errors.Is(err, hostsync.ErrSyncDisabled) {
+		enabled, err := s.syncEnabled()
+		if err != nil {
+			return fmt.Errorf("read sync enablement: %w", err)
+		}
+		if !enabled {
 			return nil
 		}
+		_, err = client.Reconcile(ctx, "")
 		return err
 	}
 	wired = true
 	return nil
 }
 
+func resolveSynckitdExecutable() (string, error) {
+	executable, err := exec.LookPath("synckitd")
+	if err != nil {
+		return "", fmt.Errorf("resolve installed synckitd executable: %w", err)
+	}
+	if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
+		return "", errors.New("installed synckitd executable is not clean and absolute")
+	}
+	return executable, nil
+}
+
 // authKind classifies a needs-login at persist time in the disposable worker.
 // An absent worker or an unprovable registry owner is an error, never Owned.
 func (s *Server) authKind(ctx context.Context, a store.Account) (store.AuthKind, error) {
 	if a.AccountUUID == "" {
+		return store.AuthKindOwned, nil
+	}
+	enabled, err := s.syncEnabled()
+	if err != nil {
+		return "", fmt.Errorf("read sync enablement: %w", err)
+	}
+	if !enabled {
 		return store.AuthKindOwned, nil
 	}
 	if s.syncAuthKind == nil {

@@ -346,6 +346,7 @@ func (s *Service) Converge(ctx context.Context, origin string) (syncservice.Reco
 		return syncservice.ReconcileResult{}, fmt.Errorf("hostsync: resolve mesh: %w", err)
 	}
 	var results []converge.ItemResult
+	deliveryOwned := make(map[string]bool)
 	err = s.Registry.WithLock(ctx, func() error {
 		registry, err := s.Driver.LoadRegistry(ctx)
 		if err != nil {
@@ -362,6 +363,7 @@ func (s *Service) Converge(ctx context.Context, origin string) (syncservice.Reco
 		sort.Strings(ids)
 		results = make([]converge.ItemResult, 0, len(ids))
 		for _, id := range ids {
+			deliveryOwned[id] = origin != "" && present[id].Value.Chain.Origin == origin
 			outcome, reconcileErr := s.Driver.Reconcile(ctx, id, present[id], peers, origin)
 			results = append(results, converge.ItemResult{ID: id, Outcome: outcome, Err: reconcileErr})
 		}
@@ -371,9 +373,17 @@ func (s *Service) Converge(ctx context.Context, origin string) (syncservice.Reco
 		return syncservice.ReconcileResult{}, fmt.Errorf("hostsync: converge: %w", err)
 	}
 	converged := 0
+	var unsettled []error
 	for _, r := range results {
 		if r.Err != nil {
 			s.logf("hostsync: reconcile %s: %v", r.ID, r.Err)
+			if deliveryOwned[r.ID] {
+				unsettled = append(unsettled, fmt.Errorf("%s: %w", r.ID, r.Err))
+			}
+			continue
+		}
+		if deliveryOwned[r.ID] && r.Outcome == OutcomeDeferred {
+			unsettled = append(unsettled, fmt.Errorf("%s: %w", r.ID, ErrCredentialMaterialUnavailable))
 			continue
 		}
 		if convergedOutcome(r.Outcome) {
@@ -383,6 +393,11 @@ func (s *Service) Converge(ctx context.Context, origin string) (syncservice.Reco
 	tornDown, skippedBusy, err := s.teardown(ctx)
 	if err != nil {
 		return syncservice.ReconcileResult{}, err
+	}
+	if len(unsettled) != 0 {
+		return syncservice.ReconcileResult{}, fmt.Errorf(
+			"hostsync: delivery from %s did not converge: %w", origin, errors.Join(unsettled...),
+		)
 	}
 	return syncservice.ReconcileResult{Converged: converged + tornDown, SkippedBusy: skippedBusy}, nil
 }

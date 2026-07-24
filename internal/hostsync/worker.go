@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
@@ -46,9 +47,10 @@ const (
 )
 
 type workerRequest struct {
-	Protocol  string          `json:"protocol"`
-	Operation workerOperation `json:"operation"`
-	Params    json.RawMessage `json:"params"`
+	Protocol           string          `json:"protocol"`
+	SynckitdExecutable string          `json:"synckitd_executable"`
+	Operation          workerOperation `json:"operation"`
+	Params             json.RawMessage `json:"params"`
 }
 
 type workerResponse struct {
@@ -78,6 +80,7 @@ type WorkerRuntime struct {
 // WorkerRuntimeScope owns operation-specific resources until run returns.
 type WorkerRuntimeScope func(
 	ctx context.Context,
+	synckitdExecutable string,
 	run func(WorkerRuntime) error,
 ) error
 
@@ -85,17 +88,18 @@ type WorkerRuntimeScope func(
 type WorkerClient struct {
 	runner     workerexec.Runner
 	executable string
+	synckitd   string
 	lane       chan struct{}
 	timeout    time.Duration
 }
 
 // NewWorkerClient binds host-sync operations to one daemonkit worker pool.
-func NewWorkerClient(runner workerexec.Runner, executable string) (*WorkerClient, error) {
-	if runner == nil || executable == "" {
-		return nil, errors.New("hostsync: worker runner and executable are required")
+func NewWorkerClient(runner workerexec.Runner, executable, synckitdExecutable string) (*WorkerClient, error) {
+	if runner == nil || executable == "" || !exactExecutable(synckitdExecutable) {
+		return nil, errors.New("hostsync: worker runner and exact executables are required")
 	}
 	return &WorkerClient{
-		runner: runner, executable: executable, lane: make(chan struct{}, 1),
+		runner: runner, executable: executable, synckitd: synckitdExecutable, lane: make(chan struct{}, 1),
 		timeout: hostSyncWorkerTimeout,
 	}, nil
 }
@@ -161,19 +165,20 @@ func (c *WorkerClient) do(ctx context.Context, operation workerOperation, params
 		return fmt.Errorf("hostsync: encode %s params: %w", operation, err)
 	}
 	request := workerRequest{
-		Protocol: hostSyncWorkerProtocol, Operation: operation, Params: paramsJSON,
+		Protocol: hostSyncWorkerProtocol, SynckitdExecutable: c.synckitd,
+		Operation: operation, Params: paramsJSON,
 	}
 	var framed bytes.Buffer
 	if err := writeWorkerFrame(&framed, request); err != nil {
 		return err
 	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return errors.New("hostsync: resolve exact worker home")
+	environment, err := ProcessEnvironment()
+	if err != nil {
+		return err
 	}
 	command, runErr := c.runner.Run(ctx, worker.CommandRequest{
 		Path: c.executable, Dir: workerexec.TempDir(), Args: []string{hostSyncWorkerArgument},
-		Env: []string{"HOME=" + home}, Stdin: framed.Bytes(), TotalTimeout: c.timeout,
+		Env: environment, Stdin: framed.Bytes(), TotalTimeout: c.timeout,
 	})
 	if runErr != nil {
 		return fmt.Errorf("hostsync: %s worker: %w: %s", operation, runErr, string(command.Stderr))
@@ -213,6 +218,23 @@ func (c *WorkerClient) do(ctx context.Context, operation workerOperation, params
 	return nil
 }
 
+// ProcessEnvironment returns the exact host-sync environment inherited by
+// resident helpers and disposable workers.
+func ProcessEnvironment() ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" || !filepath.IsAbs(home) || filepath.Clean(home) != home {
+		return nil, errors.New("hostsync: resolve exact worker home")
+	}
+	environment := []string{"HOME=" + home}
+	if configHome, ok := os.LookupEnv("XDG_CONFIG_HOME"); ok {
+		if configHome == "" || !filepath.IsAbs(configHome) || filepath.Clean(configHome) != configHome {
+			return nil, errors.New("hostsync: XDG_CONFIG_HOME must be exact and absolute")
+		}
+		environment = append(environment, "XDG_CONFIG_HOME="+configHome)
+	}
+	return environment, nil
+}
+
 // IsWorkerInvocation reports whether args request the exact host-sync worker role.
 func IsWorkerInvocation(args []string) bool {
 	return len(args) == 1 && args[0] == hostSyncWorkerArgument
@@ -230,8 +252,11 @@ func RunWorker(ctx context.Context, input io.Reader, output io.Writer, scope Wor
 	if request.Protocol != hostSyncWorkerProtocol {
 		return errors.New("hostsync: worker protocol mismatch")
 	}
+	if !exactExecutable(request.SynckitdExecutable) {
+		return errors.New("hostsync: worker requires an exact synckitd executable")
+	}
 	var result any
-	err := scope(ctx, func(runtime WorkerRuntime) error {
+	err := scope(ctx, request.SynckitdExecutable, func(runtime WorkerRuntime) error {
 		if runtime.Consumer == nil || runtime.AuthKind == nil {
 			return errors.New("hostsync: complete worker runtime is required")
 		}
@@ -261,6 +286,10 @@ func RunWorker(ctx context.Context, input io.Reader, output io.Writer, scope Wor
 		}
 	}
 	return writeWorkerFrame(output, response)
+}
+
+func exactExecutable(path string) bool {
+	return path != "" && filepath.IsAbs(path) && filepath.Clean(path) == path
 }
 
 func executeWorkerOperation(ctx context.Context, runtime WorkerRuntime, request workerRequest) (any, error) {

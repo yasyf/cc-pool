@@ -40,7 +40,7 @@ func syncRecordLabel(cmd *cobra.Command, m *pool.Manager, a store.Account) {
 	}
 	cl := syncservice.NewClient(syncservice.Socket(pool.SyncSocketPath()))
 	defer func() { _ = cl.Close() }()
-	if _, err := cl.Sync(cmd.Context(), ""); err != nil {
+	if _, err := cl.Reconcile(cmd.Context(), ""); err != nil {
 		warn(cmd.ErrOrStderr(), "renamed locally, but couldn't record it in the sync registry: %v — a peer converge may revert it", err)
 	}
 }

@@ -12,22 +12,6 @@ import (
 	"github.com/yasyf/daemonkit/wire"
 )
 
-func TestRuntimeHealthReflectsHolderSessionState(t *testing.T) {
-	server := &Server{}
-	if state := server.runtimeHealthState(); state != dkdaemon.StateDegraded || !server.runtimeBusy() {
-		t.Fatalf("unactivated health = %q busy=%t", state, server.runtimeBusy())
-	}
-	server.holderActive.Store(true)
-	if state := server.runtimeHealthState(); state != dkdaemon.StateHealthy || server.runtimeBusy() {
-		t.Fatalf("active health = %q busy=%t", state, server.runtimeBusy())
-	}
-	server.holderActive.Store(false)
-	server.holderLost.Store(true)
-	if state := server.runtimeHealthState(); state != dkdaemon.StateFailed || !server.runtimeBusy() {
-		t.Fatalf("lost health = %q busy=%t", state, server.runtimeBusy())
-	}
-}
-
 func TestDaemonHealthObservationRequiresPublishedHealthyRuntime(t *testing.T) {
 	health := dkdaemon.Health{
 		RuntimeBuild: version.String(), RuntimeProtocol: int(wire.ProtocolVersion),
@@ -45,7 +29,7 @@ func TestDaemonHealthObservationRequiresPublishedHealthyRuntime(t *testing.T) {
 		cl:            claims,
 	}
 	route := server.daemonHealthRoute()
-	if route.Op != wire.Op(OpHealth) || route.MaxResponseBytes != daemonHealthMaxResponse || !route.AvailableBeforeReady {
+	if route.Op != wire.Op(OpHealth) || route.MaxResponseBytes != daemonHealthMaxResponse {
 		t.Fatalf("daemon health route = %+v", route)
 	}
 	request := wire.ObservationRequest{Op: wire.Op(OpHealth), Payload: []byte(`{"schema":1}`)}

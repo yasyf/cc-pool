@@ -78,9 +78,9 @@ func (r managedAccountMutationTerminalRunner) Start(
 		}
 	}
 	terminal, err := r.terminals.Start(ctx, accountterminal.TerminalSpec{
-		Path:          "claude",
-		Args:          args,
-		Dir:           mutation.ConfigDir,
+		Path: "claude",
+		Args: args,
+		Dir:  mutation.ConfigDir,
 		Env: accountMutationTerminalEnv(
 			os.Environ(), mutation.ConfigDir, filepath.Join(pool.ClaudeDir(), "plugins"),
 		),

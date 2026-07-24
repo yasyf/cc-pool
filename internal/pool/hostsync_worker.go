@@ -3,8 +3,6 @@ package pool
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -57,18 +55,11 @@ func (m *Manager) RunHostSyncCommand(
 	if m.workers == nil || m.taskRunner == nil {
 		return errors.New("host-sync command requires disposable worker ownership")
 	}
-	if path != "synckitd" {
-		return errors.New("host-sync command is not an approved executable")
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return errors.New("host-sync command requires a clean absolute executable")
 	}
-	executable, err := exec.LookPath(path)
-	if err != nil {
-		return fmt.Errorf("resolve host-sync command: %w", err)
-	}
-	if !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
-		return errors.New("host-sync command did not resolve to a clean absolute executable")
-	}
-	_, err = m.taskRunner.Run(ctx, worker.CommandRequest{
-		Path: executable, Dir: workerexec.TempDir(), Args: args,
+	_, err := m.taskRunner.Run(ctx, worker.CommandRequest{
+		Path: path, Dir: workerexec.TempDir(), Args: args,
 		TotalTimeout: hostSyncCommandTimeout,
 	})
 	return err

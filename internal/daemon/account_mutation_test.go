@@ -826,7 +826,7 @@ func TestAccountMutationOldOwnerFenceCannotAdvanceWithoutRetirementReceipt(t *te
 	}
 	newOwner := proc.Record{
 		RecoveryID: pool.CredentialOwnerRecoveryID,
-		PID:           84, StartTime: "2.0", Boot: "test-boot", Comm: "cc-pool",
+		PID:        84, StartTime: "2.0", Boot: "test-boot", Comm: "cc-pool",
 		Generation: daemonTestGeneration("new-daemon-without-receipt"),
 	}
 	s.accountMutationOwner = func() (proc.Record, error) { return newOwner, nil }
@@ -1119,7 +1119,7 @@ func newAccountMutationTestServer(
 	}
 	owner := proc.Record{
 		RecoveryID: pool.CredentialOwnerRecoveryID,
-		PID:           identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		PID:        identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
 		Comm: identity.Comm, Executable: identity.Executable,
 		AuditToken: identity.AuditToken, Generation: daemonTestGeneration("account-mutation-test"),
 	}

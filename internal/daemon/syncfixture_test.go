@@ -15,7 +15,7 @@ import (
 
 // newGateServer builds a one-account daemon Server whose account carries
 // AccountUUID "u1" and the given credential; sessions drives busy/idle. It wires
-// the fake OAuth and credential seams but no sync engine (s.syncSvc is nil).
+// the fake OAuth and credential seams but no host-sync helper client.
 func newGateServer(t *testing.T, cred *creds.Credential, sessions []procscan.Session) (*Server, *fakeOAuth, store.Account) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())

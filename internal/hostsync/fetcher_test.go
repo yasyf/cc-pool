@@ -13,6 +13,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/synckit/cregistry"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 func TestSyncSchemaFingerprintBindsExactDeclaration(t *testing.T) {
@@ -59,6 +60,75 @@ func TestSyncSnapshotRoundTripPreservesExactState(t *testing.T) {
 	}
 	if got.Credentials["u1"].Hash != creds.AccessHash(credential) {
 		t.Fatalf("credential envelope = %+v", got.Credentials["u1"])
+	}
+}
+
+func TestRegistryFromExportReturnsOnlyClonedV1Registry(t *testing.T) {
+	registry := cregistry.New[AccountValue]()
+	registry.Add("u1", AccountValue{
+		UUID: "u1", OAuthAccount: json.RawMessage(`{"accountUuid":"u1"}`),
+	}, 1)
+	payload, err := encodeSyncSnapshot(syncSnapshot{
+		Registry: registry, Credentials: map[string]CredentialEnvelope{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	change, err := syncservice.NewExportedChange(
+		SyncServiceID, SyncSchemaFingerprint, syncservice.ChangeSnapshot,
+		syncservice.NewRevision(0), syncservice.NewRevision(1), payload,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := RegistryFromExport(change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := got["u1"]
+	entry.Value.OAuthAccount[0] = '['
+	got["u1"] = entry
+	again, err := RegistryFromExport(change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again["u1"].Value.OAuthAccount) != `{"accountUuid":"u1"}` {
+		t.Fatalf("RegistryFromExport returned aliased state: %+v", again["u1"])
+	}
+	wrongService := change
+	wrongService.ServiceID = "other"
+	wrongSchema := change
+	wrongSchema.SchemaFingerprint = strings.Repeat("0", 64)
+	delta := change
+	delta.Kind = syncservice.ChangeDelta
+	delivery, err := syncservice.BindDelivery(change, "source@host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidRegistry := cregistry.New[AccountValue]()
+	invalidRegistry.Add("u-key", AccountValue{UUID: "u-value"}, 1)
+	invalidPayload, err := encodeSyncSnapshot(syncSnapshot{
+		Registry: invalidRegistry, Credentials: map[string]CredentialEnvelope{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidSemantics, err := syncservice.NewExportedChange(
+		SyncServiceID, SyncSchemaFingerprint, syncservice.ChangeSnapshot,
+		syncservice.NewRevision(0), syncservice.NewRevision(1), invalidPayload,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, candidate := range map[string]syncservice.ChangeEnvelope{
+		"service": wrongService, "schema": wrongSchema, "delta": delta,
+		"delivery": delivery, "registry semantics": invalidSemantics,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := RegistryFromExport(candidate); err == nil {
+				t.Fatalf("RegistryFromExport accepted invalid %s envelope", name)
+			}
+		})
 	}
 }
 

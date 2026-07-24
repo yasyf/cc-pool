@@ -21,7 +21,7 @@ func serveHandlerOnSocket(t *testing.T, serverState *Server) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &wire.Server{WireBuild: WireBuild, Ladder: ladder, MaxSessions: 2}
+	server := &wire.Server{WireBuild: WireBuild, Ladder: ladder, MaxSessions: 8}
 	for _, operation := range []Op{OpSelect, OpSelectCommit, OpSelectAbort, OpStatus} {
 		operation := operation
 		server.Register(wire.HandlerSpec{

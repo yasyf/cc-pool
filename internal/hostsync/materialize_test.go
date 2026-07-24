@@ -28,7 +28,7 @@ import (
 const materializeManifest = "/cfg/synckit/manifests/cc-pool.json"
 
 // stubRefresher satisfies pool.Refresher: Usage always succeeds and Refresh is
-// never reached by these tests because their pulled credentials are unexpired.
+// never reached by these tests because their delivered credentials are unexpired.
 type stubRefresher struct{}
 
 func (stubRefresher) Refresh(context.Context, string, string) (*oauth.TokenResponse, error) {
@@ -321,7 +321,7 @@ func mustMutationOwner(t *testing.T, manager *pool.Manager) proc.Record {
 	return owner
 }
 
-// freshEnvelope is a pulled stripped envelope whose access token is unexpired.
+// freshEnvelope is delivered access-only material whose token is unexpired.
 func freshEnvelope(access string) *creds.Credential {
 	c := cred(access, "")
 	c.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
@@ -340,12 +340,8 @@ func materializeVal(uuid, email string, oauthAccount json.RawMessage) AccountVal
 	}
 }
 
-func pullConst(c *creds.Credential) PullCredential {
-	return func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) { return c, nil }
-}
-
 // TestMaterializeHappyPath pins the full peer-add: a dir, the verbatim identity,
-// the pulled credential in the Keychain, an exact UUID-bound row, and a
+// the delivered credential in the Keychain, an exact UUID-bound row, and a
 // synckitd nudge — with no interactive login.
 func TestMaterializeHappyPath(t *testing.T) {
 	s, m, fk, rec := newMaterializeService(t)
@@ -358,7 +354,7 @@ func TestMaterializeHappyPath(t *testing.T) {
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-happy","emailAddress":"happy@example.com","organizationUuid":"org-1","nested":{"k":1},"flag":true}`)
 	env := freshEnvelope("at-happy")
 
-	res, err := s.Materialize(context.Background(), materializeVal("u-happy", "happy@example.com", oauthAccount), []string{"hostB"}, pullConst(env), materializeManifest)
+	res, err := s.Materialize(context.Background(), materializeVal("u-happy", "happy@example.com", oauthAccount), env, materializeManifest)
 	if err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
@@ -481,7 +477,7 @@ func TestMaterializeResolvesCommittedPromotionBeforeCleanup(t *testing.T) {
 	result, err := s.Materialize(
 		t.Context(),
 		materializeVal("u-lost-response", "lost@example.com", json.RawMessage(`{"accountUuid":"u-lost-response"}`)),
-		[]string{"hostB"}, pullConst(freshEnvelope("at-lost-response")), materializeManifest,
+		freshEnvelope("at-lost-response"), materializeManifest,
 	)
 	if err != nil || result.AccountID != 1 {
 		t.Fatalf("Materialize after lost promotion response = %+v err=%v", result, err)
@@ -508,7 +504,7 @@ func TestMaterializeAbandonsOnlyProvenUntouchedPromotion(t *testing.T) {
 	_, err := s.Materialize(
 		t.Context(),
 		materializeVal("u-precommit", "precommit@example.com", json.RawMessage(`{"accountUuid":"u-precommit"}`)),
-		[]string{"hostB"}, pullConst(freshEnvelope("at-precommit")), materializeManifest,
+		freshEnvelope("at-precommit"), materializeManifest,
 	)
 	if err == nil {
 		t.Fatal("Materialize pre-commit failure succeeded")
@@ -539,7 +535,7 @@ func TestMaterializeNeverAbandonsAmbiguousPromotion(t *testing.T) {
 	_, err := s.Materialize(
 		t.Context(),
 		materializeVal("u-ambiguous", "ambiguous@example.com", json.RawMessage(`{"accountUuid":"u-ambiguous"}`)),
-		[]string{"hostB"}, pullConst(freshEnvelope("at-ambiguous")), materializeManifest,
+		freshEnvelope("at-ambiguous"), materializeManifest,
 	)
 	if !errors.Is(err, store.ErrSyncedPromotionAmbiguous) {
 		t.Fatalf("Materialize ambiguous promotion err=%v", err)
@@ -553,7 +549,7 @@ func TestMaterializeNeverAbandonsAmbiguousPromotion(t *testing.T) {
 	}
 }
 
-func TestMaterializeRejectsExistingExternalUUIDBeforePull(t *testing.T) {
+func TestMaterializeRejectsExistingExternalUUIDBeforeMutation(t *testing.T) {
 	s, manager, _, _ := newMaterializeService(t)
 	existing := admitHostsyncTestAccount(t, manager, store.Account{
 		ID: 9, ConfigDir: materializePresentationPath(9),
@@ -571,25 +567,17 @@ func TestMaterializeRejectsExistingExternalUUIDBeforePull(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	pulled := false
 	_, err := s.Materialize(
 		t.Context(),
 		materializeVal(
 			"duplicate", "peer@example.com",
 			json.RawMessage(`{"accountUuid":"duplicate","emailAddress":"peer@example.com"}`),
 		),
-		[]string{"hostB"},
-		func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
-			pulled = true
-			return freshEnvelope("should-not-pull"), nil
-		},
+		freshEnvelope("unused-delivery"),
 		materializeManifest,
 	)
 	if !errors.Is(err, store.ErrDuplicateAccountUUID) {
 		t.Fatalf("duplicate materialize = %v", err)
-	}
-	if pulled {
-		t.Fatal("duplicate materialize pulled a credential")
 	}
 }
 
@@ -615,7 +603,7 @@ func TestMaterializeDoesNotReportSuccessBeforeTenantPreparation(t *testing.T) {
 	result, err := s.Materialize(
 		t.Context(),
 		materializeVal("u-prepare", "prepare@example.com", oauthAccount),
-		[]string{"hostB"}, pullConst(freshEnvelope("at-prepare")), materializeManifest,
+		freshEnvelope("at-prepare"), materializeManifest,
 	)
 	if !errors.Is(err, wantErr) || result != (MaterializeResult{}) {
 		t.Fatalf("materialize before preparation = result %+v err %v", result, err)
@@ -659,7 +647,7 @@ func TestMaterializeReprepareFailureCannotPromoteOrAdmit(t *testing.T) {
 			"u-reprepare", "reprepare@example.com",
 			json.RawMessage(`{"accountUuid":"u-reprepare","emailAddress":"reprepare@example.com"}`),
 		),
-		[]string{"hostB"}, pullConst(freshEnvelope("at-reprepare")), materializeManifest,
+		freshEnvelope("at-reprepare"), materializeManifest,
 	)
 	if !errors.Is(err, wantErr) || result != (MaterializeResult{}) {
 		t.Fatalf("materialize with stale proof = result %+v err %v", result, err)
@@ -756,7 +744,7 @@ func TestMaterializeSeedNoSourceBootstraps(t *testing.T) {
 	// No ~/.claude.json written: PrepareAdd reports SeedNoSource.
 
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-nosrc","emailAddress":"nosrc@example.com"}`)
-	res, err := s.Materialize(context.Background(), materializeVal("u-nosrc", "nosrc@example.com", oauthAccount), []string{"hostB"}, pullConst(freshEnvelope("at-n")), materializeManifest)
+	res, err := s.Materialize(context.Background(), materializeVal("u-nosrc", "nosrc@example.com", oauthAccount), freshEnvelope("at-n"), materializeManifest)
 	if err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
@@ -806,7 +794,7 @@ func TestMaterializeKeychainUnavailableFailsClosed(t *testing.T) {
 	fk.KeychainFaults = credstest.Faults{Read: creds.ErrUnavailable}
 
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-file","emailAddress":"file@example.com"}`)
-	res, err := s.Materialize(context.Background(), materializeVal("u-file", "file@example.com", oauthAccount), []string{"hostB"}, pullConst(freshEnvelope("at-f")), materializeManifest)
+	res, err := s.Materialize(context.Background(), materializeVal("u-file", "file@example.com", oauthAccount), freshEnvelope("at-f"), materializeManifest)
 	if !errors.Is(err, pool.ErrCredentialUnverifiable) {
 		t.Fatalf("Materialize error = %v, want ErrCredentialUnverifiable", err)
 	}
@@ -834,347 +822,45 @@ func TestMaterializeKeychainUnavailableFailsClosed(t *testing.T) {
 	}
 }
 
-// TestMaterializeNoEnvelopeAborts pins the required-envelope rule: a pull with
-// no credential rolls the half-built account back — dir gone, reservation
-// released, no row — and returns a retryable error.
-func TestMaterializeNoEnvelopeAborts(t *testing.T) {
-	pullBoom := errors.New("all peers unreachable")
-	cases := map[string]PullCredential{
-		"pull errors": func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
-			return nil, pullBoom
-		},
-		"pull returns nil credential": func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
-			return nil, nil
-		},
-	}
-	for name, pull := range cases {
-		t.Run(name, func(t *testing.T) {
-			s, m, _, rec := newMaterializeService(t)
-			if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			oauthAccount := json.RawMessage(`{"accountUuid":"u-x","emailAddress":"x@example.com"}`)
-
-			res, err := s.Materialize(context.Background(), materializeVal("u-x", "x@example.com", oauthAccount), []string{"hostB"}, pull, materializeManifest)
-			if !errors.Is(err, ErrMaterializeNoEnvelope) {
-				t.Fatalf("err = %v, want errors.Is ErrMaterializeNoEnvelope", err)
-			}
-			if res != (MaterializeResult{}) {
-				t.Fatalf("result = %+v, want zero on abort", res)
-			}
-
-			// Dir torn down.
-			if _, statErr := os.Stat(pool.AccountBackingDir(1)); !os.IsNotExist(statErr) {
-				t.Fatalf("account dir stat err = %v, want not-exist (AbandonAdd must remove it)", statErr)
-			}
-			// Reservation released: the freed index is handed straight back.
-			n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
-			if rerr != nil {
-				t.Fatal(rerr)
-			}
-			if n.ID != 1 {
-				t.Fatalf("next reserved index = %d, want the released 1", n.ID)
-			}
-			// No row registered.
-			accounts, lerr := m.Store.ListAccounts()
-			if lerr != nil {
-				t.Fatal(lerr)
-			}
-			if len(accounts) != 0 {
-				t.Fatalf("accounts = %+v, want none after abort", accounts)
-			}
-			// No nudge on a failed materialization.
-			if len(rec.calls) != 0 {
-				t.Fatalf("nudge calls = %v, want none on abort", rec.calls)
-			}
-		})
-	}
-}
-
-// TestMaterializeRejectedEnvelopeReleasesNotAbandons pins the rejection path:
-// a tokenless or RT-bearing envelope aborts WITHOUT AbandonAdd — the dir (and
-// any retained login state in it) survives, only the reservation is released,
-// and no row or nudge lands.
-func TestMaterializeRejectedEnvelopeReleasesNotAbandons(t *testing.T) {
-	tokenless := &creds.Credential{}
-	tokenless.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
-	rtBearing := cred("at-secret", "rt-secret")
-	rtBearing.ClaudeAiOauth.ExpiresAt = tokenless.ClaudeAiOauth.ExpiresAt
-
+// TestMaterializeRejectsUnavailableOrInvalidDeliveryBeforeMutation pins the
+// required-envelope boundary before any account state is created.
+func TestMaterializeRejectsUnavailableOrInvalidDeliveryBeforeMutation(t *testing.T) {
 	cases := map[string]struct {
-		env       *creds.Credential
-		wantErrIs error
+		credential *creds.Credential
+		wantErr    error
 	}{
-		"tokenless envelope":  {tokenless, pool.ErrEnvelopeNoAccessToken},
-		"RT-bearing envelope": {rtBearing, pool.ErrEnvelopeCarriesSecret},
+		"missing":         {nil, ErrCredentialMaterialUnavailable},
+		"tokenless":       {&creds.Credential{}, pool.ErrEnvelopeNoAccessToken},
+		"refresh-bearing": {cred("access", "refresh"), pool.ErrEnvelopeCarriesSecret},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			s, m, fk, rec := newMaterializeService(t)
-			if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
-				t.Fatal(err)
+			s, manager, _, rec := newMaterializeService(t)
+			oauthAccount := json.RawMessage(`{"accountUuid":"u-rejected"}`)
+			result, err := s.Materialize(t.Context(), materializeVal("u-rejected", "r.com", oauthAccount), tc.credential, materializeManifest)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Materialize error = %v, want %v", err, tc.wantErr)
 			}
-			oauthAccount := json.RawMessage(`{"accountUuid":"u-rej","emailAddress":"r@example.com"}`)
-
-			res, err := s.Materialize(context.Background(), materializeVal("u-rej", "r@example.com", oauthAccount), []string{"hostB"}, pullConst(tc.env), materializeManifest)
-			if !errors.Is(err, tc.wantErrIs) {
-				t.Fatalf("err = %v, want errors.Is %v", err, tc.wantErrIs)
+			if result != (MaterializeResult{}) {
+				t.Fatalf("result = %+v, want zero", result)
 			}
-			if res != (MaterializeResult{}) {
-				t.Fatalf("result = %+v, want zero on rejection", res)
+			if _, statErr := os.Stat(pool.AccountBackingDir(1)); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("delivery rejection mutated backing: %v", statErr)
 			}
-			// The dir is kept (release, not abandon) and no credential was written.
-			if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
-				t.Fatalf("account dir stat err = %v, want kept on rejection", statErr)
-			}
-			if _, ok := fk.Get(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel()); ok {
-				t.Fatal("a rejected envelope landed in the keychain")
-			}
-			// Reservation released: the freed index is handed straight back.
-			n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
-			if rerr != nil {
-				t.Fatal(rerr)
-			}
-			if n.ID != 1 {
-				t.Fatalf("next reserved index = %d, want the released 1", n.ID)
-			}
-			accounts, lerr := m.Store.ListAccounts()
-			if lerr != nil {
-				t.Fatal(lerr)
-			}
-			if len(accounts) != 0 {
-				t.Fatalf("accounts = %+v, want none after rejection", accounts)
+			reservation, reserveErr := manager.Store.ReserveAccountIndex(mustMutationOwner(t, manager))
+			if reserveErr != nil || reservation.ID != 1 {
+				t.Fatalf("reservation after rejection = %+v err=%v", reservation, reserveErr)
 			}
 			if len(rec.calls) != 0 {
-				t.Fatalf("nudge calls = %v, want none on rejection", rec.calls)
+				t.Fatalf("nudge calls = %v", rec.calls)
 			}
 		})
-	}
-}
-
-// TestMaterializeRejectedEnvelopeThroughRealPullerReleases pins the rejection
-// path END TO END: FetchCredential (the production puller) propagates the
-// per-peer rejection sentinel, so Materialize takes ReleaseAdd — a credential
-// a released `ccp add` login writes mid-pull survives (AbandonAdd would have
-// deleted it).
-func TestMaterializeRejectedEnvelopeThroughRealPullerReleases(t *testing.T) {
-	future := time.Now().Add(2 * time.Hour).UnixMilli()
-	tokenless := &creds.Credential{}
-	tokenless.ClaudeAiOauth.ExpiresAt = future
-	rtBearing := cred("at-secret", "rt-secret")
-	rtBearing.ClaudeAiOauth.ExpiresAt = future
-
-	cases := map[string]struct {
-		served    *creds.Credential
-		wantErrIs error
-	}{
-		"RT-bearing peer": {rtBearing, pool.ErrEnvelopeCarriesSecret},
-		"tokenless peer":  {tokenless, pool.ErrEnvelopeNoAccessToken},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			s, m, fk, rec := newMaterializeService(t)
-			if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			retained := cred("at-login", "rt-login")
-			retained.ClaudeAiOauth.ExpiresAt = future
-			pull := func(ctx context.Context, uuid string, chain ChainStamp, peers []string) (*creds.Credential, error) {
-				// The released add's still-running login lands mid-pull.
-				fk.Put(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel(), retained)
-				dial := func(string) syncservice.Transport {
-					return envelopeTransport(t, tc.served, creds.AccessHash(tc.served))
-				}
-				return FetchCredential(ctx, dial, uuid, chain, 0, peers)
-			}
-			oauthAccount := json.RawMessage(`{"accountUuid":"u-real","emailAddress":"r@example.com"}`)
-
-			res, err := s.Materialize(context.Background(), materializeVal("u-real", "r@example.com", oauthAccount), []string{"hostB"}, pull, materializeManifest)
-			if !errors.Is(err, tc.wantErrIs) {
-				t.Fatalf("err = %v, want errors.Is %v", err, tc.wantErrIs)
-			}
-			if res != (MaterializeResult{}) {
-				t.Fatalf("result = %+v, want zero on rejection", res)
-			}
-			// ReleaseAdd, not AbandonAdd: dir kept, the login's credential intact.
-			if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
-				t.Fatalf("account dir stat err = %v, want kept on rejection", statErr)
-			}
-			got, ok := fk.Get(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel())
-			if !ok || got.ClaudeAiOauth.RefreshToken != "rt-login" {
-				t.Fatalf("retained credential = %+v ok=%v, want rt-login intact", got, ok)
-			}
-			n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
-			if rerr != nil {
-				t.Fatal(rerr)
-			}
-			if n.ID != 1 {
-				t.Fatalf("next reserved index = %d, want the released 1", n.ID)
-			}
-			if len(rec.calls) != 0 {
-				t.Fatalf("nudge calls = %v, want none on rejection", rec.calls)
-			}
-		})
-	}
-}
-
-// TestMaterializePullFailureNeverDestroysConcurrentLogin pins the slot-driven
-// rollback for non-sentinel pull failures, through the REAL puller: a hash
-// mismatch or an unknown-method peer must not AbandonAdd when a concurrent
-// `ccp add` login landed an owned credential mid-pull — the login survives
-// and only the reservation is released.
-func TestMaterializePullFailureNeverDestroysConcurrentLogin(t *testing.T) {
-	cases := map[string]func(t *testing.T) syncservice.Transport{
-		"hash-mismatch envelope": func(t *testing.T) syncservice.Transport {
-			return envelopeTransport(t, freshEnvelope("at-peer"), "garbage-hash")
-		},
-		"method not found": func(_ *testing.T) syncservice.Transport {
-			return &fakeTransport{do: func(context.Context, *rpc.Request) (*syncservice.Response, error) {
-				return &syncservice.Response{OK: false, Error: `unknown method "ccp.fetch_stripped_credential"`}, nil
-			}}
-		},
-	}
-	for name, transport := range cases {
-		t.Run(name, func(t *testing.T) {
-			s, m, fk, rec := newMaterializeService(t)
-			if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			owned := cred("at-login", "rt-login")
-			owned.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
-			pull := func(ctx context.Context, uuid string, chain ChainStamp, peers []string) (*creds.Credential, error) {
-				// The released add's still-running login lands mid-pull.
-				fk.Put(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel(), owned)
-				dial := func(string) syncservice.Transport { return transport(t) }
-				return FetchCredential(ctx, dial, uuid, chain, 0, peers)
-			}
-			oauthAccount := json.RawMessage(`{"accountUuid":"u-pf","emailAddress":"pf@example.com"}`)
-
-			res, err := s.Materialize(context.Background(), materializeVal("u-pf", "pf@example.com", oauthAccount), []string{"hostB"}, pull, materializeManifest)
-			if !errors.Is(err, ErrMaterializeNoEnvelope) {
-				t.Fatalf("err = %v, want errors.Is ErrMaterializeNoEnvelope", err)
-			}
-			if res != (MaterializeResult{}) {
-				t.Fatalf("result = %+v, want zero on abort", res)
-			}
-			// ReleaseAdd, not AbandonAdd: dir kept, the login's credential intact.
-			if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
-				t.Fatalf("account dir stat err = %v, want kept", statErr)
-			}
-			got, ok := fk.Get(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel())
-			if !ok || got.ClaudeAiOauth.RefreshToken != "rt-login" {
-				t.Fatalf("slot credential = %+v ok=%v, want the owned login intact", got, ok)
-			}
-			n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
-			if rerr != nil {
-				t.Fatal(rerr)
-			}
-			if n.ID != 1 {
-				t.Fatalf("next reserved index = %d, want the released 1", n.ID)
-			}
-			accounts, lerr := m.Store.ListAccounts()
-			if lerr != nil {
-				t.Fatal(lerr)
-			}
-			if len(accounts) != 0 {
-				t.Fatalf("accounts = %+v, want none", accounts)
-			}
-			if len(rec.calls) != 0 {
-				t.Fatalf("nudge calls = %v, want none", rec.calls)
-			}
-		})
-	}
-}
-
-// TestMaterializePullFailureUnprovableSlotReleases pins the fail-safe: when a
-// pull fails and the slot cannot be proven empty (unsearchable Keychain), the
-// dir is released, never abandoned — nothing unprovable is deleted.
-func TestMaterializePullFailureUnprovableSlotReleases(t *testing.T) {
-	s, m, fk, _ := newMaterializeService(t)
-	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	pullBoom := errors.New("all peers unreachable")
-	pull := func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
-		// The keychain becomes unsearchable mid-pull.
-		fk.KeychainFaults = credstest.Faults{Read: creds.ErrUnavailable}
-		return nil, pullBoom
-	}
-	oauthAccount := json.RawMessage(`{"accountUuid":"u-up","emailAddress":"up@example.com"}`)
-
-	_, err := s.Materialize(context.Background(), materializeVal("u-up", "up@example.com", oauthAccount), []string{"hostB"}, pull, materializeManifest)
-	if !errors.Is(err, ErrMaterializeNoEnvelope) {
-		t.Fatalf("err = %v, want errors.Is ErrMaterializeNoEnvelope", err)
-	}
-	if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
-		t.Fatalf("account dir stat err = %v, want kept on an unprovable slot", statErr)
-	}
-	n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
-	if n.ID != 1 {
-		t.Fatalf("next reserved index = %d, want the released 1", n.ID)
-	}
-}
-
-// TestMaterializeInstallNeverClobbersConcurrentLogin pins the write-time slot
-// guard: an owned login landing AFTER the pre-flight retained-slot check (here
-// mid-pull, when a valid envelope is about to install) is never overwritten —
-// the pass releases with ErrCredentialChangedUnderfoot and the login survives.
-func TestMaterializeInstallNeverClobbersConcurrentLogin(t *testing.T) {
-	s, m, fk, rec := newMaterializeService(t)
-	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	owned := cred("at-login", "rt-login")
-	owned.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
-	pull := func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
-		// The released add's still-running login completes mid-pull, after the
-		// pre-flight slot check but before the install write.
-		fk.Put(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel(), owned)
-		return freshEnvelope("at-peer"), nil
-	}
-	oauthAccount := json.RawMessage(`{"accountUuid":"u-race","emailAddress":"race@example.com"}`)
-
-	res, err := s.Materialize(context.Background(), materializeVal("u-race", "race@example.com", oauthAccount), []string{"hostB"}, pull, materializeManifest)
-	if !errors.Is(err, pool.ErrCredentialChangedUnderfoot) {
-		t.Fatalf("err = %v, want errors.Is ErrCredentialChangedUnderfoot", err)
-	}
-	if res != (MaterializeResult{}) {
-		t.Fatalf("result = %+v, want zero on abort", res)
-	}
-	// The owned login is intact — neither overwritten nor deleted by AbandonAdd.
-	got, ok := fk.Get(creds.ServiceName(materializePresentationPath(1)), creds.AccountLabel())
-	if !ok || got.ClaudeAiOauth.RefreshToken != "rt-login" || got.ClaudeAiOauth.AccessToken != "at-login" {
-		t.Fatalf("slot credential = %+v ok=%v, want the owned login intact", got, ok)
-	}
-	// Release, not abandon: dir kept, reservation freed, no row, no nudge.
-	if _, statErr := os.Stat(pool.AccountBackingDir(1)); statErr != nil {
-		t.Fatalf("account dir stat err = %v, want kept", statErr)
-	}
-	n, rerr := m.Store.ReserveAccountIndex(mustMutationOwner(t, m))
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
-	if n.ID != 1 {
-		t.Fatalf("next reserved index = %d, want the released 1", n.ID)
-	}
-	accounts, lerr := m.Store.ListAccounts()
-	if lerr != nil {
-		t.Fatal(lerr)
-	}
-	if len(accounts) != 0 {
-		t.Fatalf("accounts = %+v, want none", accounts)
-	}
-	if len(rec.calls) != 0 {
-		t.Fatalf("nudge calls = %v, want none", rec.calls)
 	}
 }
 
 // TestMaterializeNeverOverwritesRetainedCredential pins the interrupted-add
 // guard: a kept dir whose slot retains a usable credential (from a prior
-// ReleaseAdd) aborts before writing identity or pulling — the retained
+// ReleaseAdd) aborts before writing identity or installing delivery material — the retained
 // credential and identity survive intact and the reservation is released.
 func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
 	s, m, fk, rec := newMaterializeService(t)
@@ -1196,12 +882,8 @@ func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
 	retained.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli()
 	fk.Put(creds.ServiceName(keptDir), "claude-login-label", retained)
 
-	pullFatal := PullCredential(func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
-		t.Fatal("pull invoked despite a retained slot credential")
-		return nil, nil
-	})
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-peer","emailAddress":"peer@example.com"}`)
-	res, err := s.Materialize(context.Background(), materializeVal("u-peer", "peer@example.com", oauthAccount), []string{"hostB"}, pullFatal, materializeManifest)
+	res, err := s.Materialize(context.Background(), materializeVal("u-peer", "peer@example.com", oauthAccount), freshEnvelope("unused-delivery"), materializeManifest)
 	if err == nil || !strings.Contains(err.Error(), "retains a credential") {
 		t.Fatalf("err = %v, want the retained-credential abort", err)
 	}
@@ -1243,7 +925,7 @@ func TestMaterializeNeverOverwritesRetainedCredential(t *testing.T) {
 }
 
 // TestMaterializeEmptyOAuthDefers pins carry-forward #3: an entry with no
-// oauthAccount is deferred — no dir, no reservation, no pull — never an error
+// oauthAccount is deferred — no dir, reservation, or material lookup — never an error
 // loop, so a later origin publication can supply the identity.
 func TestMaterializeEmptyOAuthDefers(t *testing.T) {
 	cases := map[string]json.RawMessage{
@@ -1253,12 +935,7 @@ func TestMaterializeEmptyOAuthDefers(t *testing.T) {
 	for name, raw := range cases {
 		t.Run(name, func(t *testing.T) {
 			s, m, _, rec := newMaterializeService(t)
-			pullFatal := PullCredential(func(context.Context, string, ChainStamp, []string) (*creds.Credential, error) {
-				t.Fatal("pull invoked for a deferred (empty-oauth) entry")
-				return nil, nil
-			})
-
-			res, err := s.Materialize(context.Background(), materializeVal("u-empty", "e@example.com", raw), []string{"hostB"}, pullFatal, materializeManifest)
+			res, err := s.Materialize(context.Background(), materializeVal("u-empty", "e@example.com", raw), nil, materializeManifest)
 			if err != nil {
 				t.Fatalf("Materialize: %v, want a clean deferral", err)
 			}

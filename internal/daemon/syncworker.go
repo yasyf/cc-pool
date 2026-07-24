@@ -195,9 +195,12 @@ func RunHostSyncWorker(
 	logger := log.New(os.Stderr, "[cc-pool-hostsync] ", log.LstdFlags)
 	return hostsync.RunWorker(ctx, input, output, func(
 		scopeCtx context.Context,
+		synckitdExecutable string,
 		run func(hostsync.WorkerRuntime) error,
 	) error {
-		runtime, err := newHostSyncWorkerRuntime(scopeCtx, manager, remover, manifestPath, logger)
+		runtime, err := newHostSyncWorkerRuntime(
+			scopeCtx, manager, remover, manifestPath, synckitdExecutable, logger,
+		)
 		if err != nil {
 			return err
 		}
@@ -210,6 +213,7 @@ func newHostSyncWorkerRuntime(
 	manager *pool.Manager,
 	remover *hostSyncWorkerRemover,
 	manifestPath string,
+	synckitdExecutable string,
 	logger *log.Logger,
 ) (hostsync.WorkerRuntime, error) {
 	self, err := (&Server{m: manager, log: logger}).resolveSyncSelf(ctx)
@@ -240,7 +244,9 @@ func newHostSyncWorkerRuntime(
 		Sessions: hostSyncWorkerSessions{manager: manager},
 		Remover:  remover,
 		Preparer: remover,
-		Run:      manager.RunHostSyncCommand,
+		Run: func(ctx context.Context, _ string, args ...string) error {
+			return manager.RunHostSyncCommand(ctx, synckitdExecutable, args...)
+		},
 	}
 	service.CredentialSnapshot = func(ctx context.Context, registry hostsync.Registry) (map[string]hostsync.CredentialEnvelope, error) {
 		return hostsync.BuildCredentialSnapshot(

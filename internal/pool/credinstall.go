@@ -20,7 +20,7 @@ var ErrEnvelopeCarriesSecret = errors.New("synced credential envelope carries a 
 // local copy under a tombstone.
 var ErrEnvelopeNoAccessToken = errors.New("credential envelope carries no access token")
 
-// InstallSyncedCredential installs cred — a stripped copy pulled from a peer —
+// InstallSyncedCredential installs one stripped credential from a validated delivery
 // under owned precedence, reporting whether it installed (a precedence or
 // freshness skip is a normal outcome). Owned-precedence rationale: ccn note e30f860.
 func (m *Manager) InstallSyncedCredential(ctx context.Context, a store.Account, cred *creds.Credential) (bool, error) {

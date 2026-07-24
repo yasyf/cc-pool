@@ -67,8 +67,9 @@ removals, and credential freshness converge across every enabled host.
     ccp sync status
 
 Requires synckitd (brew install yasyf/tap/synckit) and a mesh
-(synckitd host add <user@host>). The shared registry is secretless; credentials
-transit peer RPC only during a pull and land directly in the local Keychain.`,
+(synckitd host add <user@host>). Synckit delivers immutable revisioned snapshots;
+refresh tokens never leave their origin, and access-only credentials land directly
+in the local Keychain.`,
 	}
 	cmd.AddCommand(
 		newSyncEnableCmd(),
@@ -249,15 +250,14 @@ func runSyncStatus(cmd *cobra.Command, m *pool.Manager) error {
 func syncRegistryState(ctx context.Context, sock string) (hostsync.Registry, error) {
 	cl := syncservice.NewClient(syncservice.Socket(sock))
 	defer func() { _ = cl.Close() }()
-	raw, err := cl.GetState(ctx)
+	change, err := cl.Export(ctx, syncservice.ExportRequest{
+		ServiceID: hostsync.SyncServiceID, SchemaFingerprint: hostsync.SyncSchemaFingerprint,
+		SinceRevision: syncservice.NewRevision(0),
+	})
 	if err != nil {
 		return nil, err
 	}
-	var reg hostsync.Registry
-	if err := json.Unmarshal(raw, &reg); err != nil {
-		return nil, fmt.Errorf("decode shared registry: %w", err)
-	}
-	return reg, nil
+	return hostsync.RegistryFromExport(change)
 }
 
 // runSyncRPCServe bridges frames between in/out and the daemon's sync socket.
@@ -276,7 +276,7 @@ func runSyncConverge(ctx context.Context, out io.Writer, ensure func(context.Con
 	}
 	cl := syncservice.NewClient(syncservice.Socket(sock))
 	defer func() { _ = cl.Close() }()
-	res, err := cl.Sync(ctx, "")
+	res, err := cl.Reconcile(ctx, "")
 	if err != nil {
 		return fmt.Errorf("converge via %s: %w", sock, err)
 	}
@@ -296,9 +296,8 @@ func ccpoolManifest() manifest.Manifest {
 			Debounce: codec.Duration(syncWatchDebounce),
 		},
 		Service: manifest.ServiceSpec{
-			Transport: "socket",
-			ServeArgs: []string{"sync", "rpc-serve"},
-			Sock:      pool.SyncSocketPath(),
+			Kind: "resident", Socket: pool.SyncSocketPath(),
+			SchemaFingerprint: hostsync.SyncSchemaFingerprint,
 		},
 	}
 }

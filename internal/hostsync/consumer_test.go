@@ -1,9 +1,11 @@
 package hostsync
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -158,6 +160,9 @@ func TestExportCarriesAccessOnlyCredential(t *testing.T) {
 // TestExportEmptyRegistry pins the immutable initial revision and payload.
 func TestExportEmptyRegistry(t *testing.T) {
 	s, _ := newTestService(t)
+	s.CredentialSnapshot = func(context.Context, Registry) (map[string]CredentialEnvelope, error) {
+		return map[string]CredentialEnvelope{}, nil
+	}
 	change, err := NewConsumer(s, enabled(true)).Export(context.Background(), syncservice.ExportRequest{
 		ServiceID: SyncServiceID, SchemaFingerprint: SyncSchemaFingerprint,
 		SinceRevision: syncservice.NewRevision(0),
@@ -167,6 +172,41 @@ func TestExportEmptyRegistry(t *testing.T) {
 	}
 	if change.SourceRevision != syncservice.NewRevision(1) || string(change.Payload) != `{"registry":{},"credentials":{}}` {
 		t.Fatalf("empty Export = revision %q payload %q", change.SourceRevision, change.Payload)
+	}
+}
+
+func TestExportRequiresCredentialSnapshotSource(t *testing.T) {
+	s, _ := newTestService(t)
+	_, err := NewConsumer(s, enabled(true)).Export(t.Context(), syncservice.ExportRequest{
+		ServiceID: SyncServiceID, SchemaFingerprint: SyncSchemaFingerprint,
+		SinceRevision: syncservice.NewRevision(0),
+	})
+	if err == nil || !strings.Contains(err.Error(), "credential snapshot source is required") {
+		t.Fatalf("Export without credential source = %v", err)
+	}
+}
+
+func TestExportRejectsInvalidRegistryBeforeCredentialRead(t *testing.T) {
+	s, _ := newTestService(t)
+	registry := cregistry.New[AccountValue]()
+	registry.Add("u-key", AccountValue{UUID: "u-value"}, 1)
+	if err := s.Registry.Save(registry); err != nil {
+		t.Fatal(err)
+	}
+	credentialRead := false
+	s.CredentialSnapshot = func(context.Context, Registry) (map[string]CredentialEnvelope, error) {
+		credentialRead = true
+		return map[string]CredentialEnvelope{}, nil
+	}
+	_, err := NewConsumer(s, enabled(true)).Export(t.Context(), syncservice.ExportRequest{
+		ServiceID: SyncServiceID, SchemaFingerprint: SyncSchemaFingerprint,
+		SinceRevision: syncservice.NewRevision(0),
+	})
+	if err == nil {
+		t.Fatal("Export republished a semantically invalid registry")
+	}
+	if credentialRead {
+		t.Fatal("Export read credentials before validating registry semantics")
 	}
 }
 
@@ -182,9 +222,10 @@ func TestExportRejectsAcknowledgementAheadOfProductRevision(t *testing.T) {
 }
 
 type consumerApplyDriver struct {
-	service *Service
-	ids     []string
-	origins []string
+	service    *Service
+	ids        []string
+	origins    []string
+	deferFirst bool
 }
 
 type consumerApplyMesh struct{ peers []string }
@@ -210,6 +251,9 @@ func (d *consumerApplyDriver) Reconcile(
 ) (converge.Outcome, error) {
 	d.ids = append(d.ids, id)
 	d.origins = append(d.origins, origin)
+	if d.deferFirst && len(d.ids) == 1 {
+		return OutcomeDeferred, nil
+	}
 	return OutcomeUnchanged, nil
 }
 
@@ -259,6 +303,137 @@ func TestApplyMergesOnceAndAcknowledgesSourceRevision(t *testing.T) {
 	}
 	if len(driver.origins) != 2 || driver.origins[0] != "hostA" || driver.origins[1] != "hostA" {
 		t.Fatalf("reconcile origins = %v", driver.origins)
+	}
+}
+
+func TestApplyRetriesUnsettledOriginMaterialWithoutAdvancingRevision(t *testing.T) {
+	s, _ := newTestService(t)
+	s.Mesh = consumerApplyMesh{}
+	driver := &consumerApplyDriver{service: s, deferFirst: true}
+	s.Driver = driver
+	credential := &creds.Credential{}
+	credential.ClaudeAiOauth.AccessToken = "delivered-access"
+	credential.ClaudeAiOauth.ExpiresAt = 9_000
+	blob, err := credential.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := ChainStamp{Origin: "hostA", ExpiresAt: 9_000, Hash: creds.AccessHash(credential)}
+	incoming := cregistry.New[AccountValue]()
+	incoming.Add("u-retry", AccountValue{
+		UUID: "u-retry", OAuthAccount: json.RawMessage(`{"accountUuid":"u-retry"}`), Chain: chain,
+	}, 10)
+	payload, err := encodeSyncSnapshot(syncSnapshot{
+		Registry: incoming,
+		Credentials: map[string]CredentialEnvelope{"u-retry": {
+			Credential: blob, ExpiresAt: chain.ExpiresAt, Hash: chain.Hash,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	change, err := syncservice.NewExportedChange(
+		SyncServiceID, SyncSchemaFingerprint, syncservice.ChangeSnapshot,
+		syncservice.NewRevision(0), syncservice.NewRevision(7), payload,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change, err = syncservice.BindDelivery(change, "hostA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer := NewConsumer(s, enabled(true))
+	if _, err := consumer.Apply(t.Context(), change); err == nil {
+		t.Fatal("Apply acknowledged deferred origin material")
+	}
+	state, err := s.Registry.LoadState()
+	if err != nil || state.Revision != 2 {
+		t.Fatalf("state after deferred Apply = %+v err=%v", state, err)
+	}
+	ack, err := consumer.Apply(t.Context(), change)
+	if err != nil || ack.AckedRevision != change.SourceRevision {
+		t.Fatalf("retried Apply = %+v err=%v", ack, err)
+	}
+	state, err = s.Registry.LoadState()
+	if err != nil || state.Revision != 2 {
+		t.Fatalf("retry advanced local revision: state=%+v err=%v", state, err)
+	}
+}
+
+func TestApplyRejectsInvalidRegistryWithoutMutationOrAck(t *testing.T) {
+	tests := map[string]func(Registry){
+		"empty key": func(registry Registry) {
+			registry.Add("", AccountValue{UUID: ""}, 10)
+		},
+		"empty value UUID": func(registry Registry) {
+			registry.Add("u-key", AccountValue{}, 10)
+		},
+		"key value UUID mismatch": func(registry Registry) {
+			registry.Add("u-key", AccountValue{UUID: "u-value"}, 10)
+		},
+		"chain without origin": func(registry Registry) {
+			registry.Add("u-key", AccountValue{
+				UUID: "u-key", Chain: ChainStamp{ExpiresAt: 10, Hash: "hash"},
+			}, 10)
+		},
+		"tombstoned chain without origin": func(registry Registry) {
+			registry.Add("u-key", AccountValue{
+				UUID: "u-key", Chain: ChainStamp{ExpiresAt: 10, Hash: "hash"},
+			}, 10)
+			registry.Remove("u-key", 11)
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			s, _ := newTestService(t)
+			baseline := cregistry.New[AccountValue]()
+			baseline.Add("u-local", AccountValue{UUID: "u-local"}, 1)
+			if err := s.Registry.Save(baseline); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(s.Registry.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			incoming := cregistry.New[AccountValue]()
+			mutate(incoming)
+			payload, err := encodeSyncSnapshot(syncSnapshot{
+				Registry: incoming, Credentials: map[string]CredentialEnvelope{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			change, err := syncservice.NewExportedChange(
+				SyncServiceID, SyncSchemaFingerprint, syncservice.ChangeSnapshot,
+				syncservice.NewRevision(0), syncservice.NewRevision(7), payload,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			change, err = syncservice.BindDelivery(change, "source")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ack, err := NewConsumer(s, enabled(true)).Apply(t.Context(), change)
+			if err == nil {
+				t.Fatalf("Apply accepted invalid registry: ack=%+v", ack)
+			}
+			if ack.AckedRevision != "" || ack.NeedSnapshot {
+				t.Fatalf("invalid Apply returned acknowledgement: %+v", ack)
+			}
+			after, err := os.ReadFile(s.Registry.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatal("invalid Apply mutated registry bytes")
+			}
+			state, err := s.Registry.LoadState()
+			if err != nil || state.Revision != 2 {
+				t.Fatalf("invalid Apply changed revision: state=%+v err=%v", state, err)
+			}
+		})
 	}
 }
 

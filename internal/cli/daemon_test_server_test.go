@@ -48,7 +48,7 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 		t.Fatal(err)
 	}
 	server := &wire.Server{
-		WireBuild: ccdaemon.WireBuild, Ladder: ladder, MaxSessions: 2,
+		WireBuild: ccdaemon.WireBuild, Ladder: ladder, MaxSessions: 8,
 	}
 	for _, op := range []ccdaemon.Op{
 		ccdaemon.OpSelect,
@@ -74,9 +74,12 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 		})
 	}
 	stateDir := t.TempDir()
-	generation := cliTestOwnerGeneration(t.Name())
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
 	workers, err := worker.NewPool(worker.Config{
-		Capacity: 2, QueueCapacity: 2, MaxTotalRun: time.Minute,
+		Capacity: 3, QueueCapacity: 3, MaxTotalRun: time.Minute,
 		MaxStdinBytes: 1 << 20, MaxStdoutBytes: 1 << 20, MaxStderrBytes: 1 << 20,
 	}, &proc.Reaper{
 		Store: &proc.FileStore{Path: stateDir + "/workers-v1.db"}, Generation: generation,
@@ -122,7 +125,7 @@ func startDaemonTestServer(t *testing.T, build string, handler daemonTestHandler
 				}
 				payload, encodeErr := json.Marshal(ccdaemon.HealthResponse{
 					Schema: ccdaemon.DaemonHealthSchema, RuntimeBuild: build, RuntimeProtocol: int(wire.ProtocolVersion),
-					PID: os.Getpid(), ProcessGeneration: "test-generation", State: ccdaemon.RuntimeStateHealthy,
+					PID: os.Getpid(), ProcessGeneration: generation.String(), State: ccdaemon.RuntimeStateHealthy,
 					Ready: true,
 				})
 				return wire.ObservationResponse{Payload: payload}, encodeErr

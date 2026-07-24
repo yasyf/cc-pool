@@ -185,6 +185,9 @@ func TestSyncHealDecidesEachTick(t *testing.T) {
 
 	t.Run("auth-kind failure persists an internal unverified verdict", func(t *testing.T) {
 		s, a, _ := revokedServer(t)
+		if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
+			t.Fatal(err)
+		}
 		s.syncAuthKind = func(context.Context, int, string) (store.AuthKind, error) {
 			return "", errors.New("registry provenance unavailable")
 		}

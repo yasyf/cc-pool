@@ -119,6 +119,9 @@ func (c *Consumer) Export(ctx context.Context, request syncservice.ExportRequest
 	if err != nil {
 		return syncservice.ChangeEnvelope{}, err
 	}
+	if err := validateRegistrySemantics(state.Snapshot); err != nil {
+		return syncservice.ChangeEnvelope{}, err
+	}
 	since, err := request.SinceRevision.Uint64()
 	if err != nil {
 		return syncservice.ChangeEnvelope{}, err
@@ -129,12 +132,12 @@ func (c *Consumer) Export(ctx context.Context, request syncservice.ExportRequest
 			state.Revision, since,
 		)
 	}
-	credentials := make(map[string]CredentialEnvelope)
-	if c.S.CredentialSnapshot != nil {
-		credentials, err = c.S.CredentialSnapshot(ctx, state.Snapshot)
-		if err != nil {
-			return syncservice.ChangeEnvelope{}, err
-		}
+	if c.S.CredentialSnapshot == nil {
+		return syncservice.ChangeEnvelope{}, errors.New("hostsync: credential snapshot source is required")
+	}
+	credentials, err := c.S.CredentialSnapshot(ctx, state.Snapshot)
+	if err != nil {
+		return syncservice.ChangeEnvelope{}, err
 	}
 	payload, err := encodeSyncSnapshot(syncSnapshot{
 		Registry: state.Snapshot, Credentials: credentials,
@@ -171,12 +174,18 @@ func (c *Consumer) Apply(ctx context.Context, change syncservice.ChangeEnvelope)
 	if err != nil {
 		return syncservice.ApplyResult{}, err
 	}
+	if err := validateRegistrySemantics(snapshot.Registry); err != nil {
+		return syncservice.ApplyResult{}, err
+	}
 	credentials, err := validateAppliedCredentials(snapshot, change.Origin)
 	if err != nil {
 		return syncservice.ApplyResult{}, err
 	}
 	if err := c.S.Registry.Update(ctx, func(local Registry) error {
 		merged := cregistry.Merge(local, snapshot.Registry)
+		if err := validateRegistrySemantics(merged); err != nil {
+			return err
+		}
 		clear(local)
 		for id, entry := range merged {
 			local[id] = entry

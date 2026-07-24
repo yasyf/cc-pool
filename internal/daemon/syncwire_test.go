@@ -2,11 +2,13 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +19,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	daemonproc "github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/synckit/hostregistry"
+	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
 
@@ -34,6 +39,14 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	bin := filepath.Join(home, "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "synckitd"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
 	if err := pool.EnsureStateDir(); err != nil {
 		t.Fatal(err)
 	}
@@ -52,6 +65,50 @@ func newWireServer(t *testing.T) (*Server, context.Context) {
 		led:          newLedgers(),
 	}
 	s.disposableWorkers = activatedDaemonTestWorkers(t, 2)
+	s.launchSyncHelper = func(ctx context.Context, executable, synckitdExecutable string) error {
+		workers, children := testSyncHelperOwners(t)
+		consumer, err := hostsync.NewWorkerClient(workers, executable, synckitdExecutable)
+		if err != nil {
+			return err
+		}
+		runtime, err := newSyncHelperRuntime(
+			s.syncSocket, consumer, workers, children,
+			&daemonproc.FileStore{Path: filepath.Join(t.TempDir(), "helper-stop-v1.db")},
+		)
+		if err != nil {
+			return err
+		}
+		done := make(chan error, 1)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			done <- runtime.Run(ctx)
+		}()
+		client := rpc.NewClient(rpc.ClientConfig{
+			Dial: wire.UnixDialer(s.syncSocket), WireBuild: rpc.WireBuild,
+		})
+		defer func() { _ = client.Close() }()
+		deadline, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			health, probeErr := client.RuntimeHealth(deadline)
+			if probeErr == nil {
+				probeErr = validateSyncHelperHealth(health)
+			}
+			if probeErr == nil {
+				return nil
+			}
+			select {
+			case runErr := <-done:
+				return fmt.Errorf("test host-sync helper exited before readiness: %w", runErr)
+			case <-deadline.Done():
+				return fmt.Errorf("await test host-sync helper: %w", deadline.Err())
+			case <-ticker.C:
+			}
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); s.wg.Wait() })
 	return s, ctx
@@ -65,6 +122,15 @@ func writeWireMeshState(t *testing.T, self string, hosts []string) {
 	if err := hostregistry.Mesh.InitializeState(ctx); err != nil {
 		t.Fatal(err)
 	}
+	for _, identity := range hosts {
+		fact, err := hostregistry.NewSSHHostFact(identity, "/opt/homebrew/bin/synckitd", []string{identity})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hostregistry.Mesh.RegisterHost(ctx, fact); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := hostregistry.Mesh.Update(ctx, func(reg *hostregistry.Registry) error {
 		reg.Self = self
 		reg.Hosts = append([]string{}, hosts...)
@@ -74,21 +140,12 @@ func writeWireMeshState(t *testing.T, self string, hosts []string) {
 	}
 }
 
-// wiredService returns the wired *hostsync.Service.
-func wiredService(t *testing.T, s *Server) *hostsync.Service {
-	t.Helper()
-	if s.syncSvc == nil {
-		t.Fatal("sync service not wired")
-	}
-	return s.syncSvc
-}
-
 // TestSetupSyncWiresEverything pins that one setupSync call constructs the
 // mutation publisher, mesh identity, heal worker, credential settlement, and
-// worker-backed consumer socket without retaining an in-process converge path.
+// helper-backed consumer socket without retaining an in-process converge path.
 func TestSetupSyncWiresEverything(t *testing.T) {
 	s, ctx := newWireServer(t)
-	writeWireMeshState(t, "host-mesh", []string{"peer-b"})
+	writeWireMeshState(t, "test@host-mesh", []string{"test@peer-b"})
 	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
 		t.Fatal(err)
 	}
@@ -96,11 +153,11 @@ func TestSetupSyncWiresEverything(t *testing.T) {
 		t.Fatalf("setupSync: %v", err)
 	}
 
-	if s.syncSvc == nil || !s.syncEnabledBool() {
+	if s.syncClient == nil || !s.syncEnabledBool() {
 		t.Fatal("sync not wired or not active with sync_enabled=1")
 	}
-	if s.syncSelf != "host-mesh" {
-		t.Errorf("sync self = %q, want the mesh-resolved host-mesh", s.syncSelf)
+	if s.syncSelf != "test@host-mesh" {
+		t.Errorf("sync self = %q, want the mesh-resolved test@host-mesh", s.syncSelf)
 	}
 	if s.syncPull == nil {
 		t.Error("syncPull not wired")
@@ -109,26 +166,15 @@ func TestSetupSyncWiresEverything(t *testing.T) {
 		t.Error("Manager.SettleCredentialWrite not wired")
 	}
 
-	svc := wiredService(t, s)
-	if svc.M != nil || svc.Locals != nil || svc.Mesh != nil || svc.Sessions != nil ||
-		svc.Remover != nil || svc.Status != nil || svc.Driver != nil || svc.Fetcher != nil || svc.Run != nil {
-		t.Errorf("parent retained an in-process host-sync operation path: %+v", svc)
-	}
-	if want := filepath.Join(pool.SyncDir(), "registry.json"); svc.Registry.Path != want {
-		t.Errorf("registry path = %q, want %q", svc.Registry.Path, want)
-	}
-	if svc.StampDir != pool.SyncStampsDir() {
-		t.Errorf("stamp dir = %q, want %q", svc.StampDir, pool.SyncStampsDir())
-	}
-
 	client := syncservice.NewClient(syncservice.Socket(s.syncSocket))
 	defer func() { _ = client.Close() }()
 	caps, err := client.Capabilities(ctx)
 	if err != nil {
 		t.Fatalf("Capabilities over the wired socket: %v", err)
 	}
-	if caps.Name != "cc-pool" || !hasMethod(caps.Methods, hostsync.MethodFetchCredential) {
-		t.Fatalf("capabilities = %+v, want cc-pool with %s", caps, hostsync.MethodFetchCredential)
+	want := syncservice.DefaultCapabilities(hostsync.SyncServiceID)
+	if caps.Name != want.Name || !slices.Equal(caps.Methods, want.Methods) {
+		t.Fatalf("capabilities = %+v, want exact default %+v", caps, want)
 	}
 }
 
@@ -136,13 +182,15 @@ func TestServerReadinessRefusesPublicationWhenSyncSetupFails(t *testing.T) {
 	s, ctx := newWireServer(t)
 	s.m.BuildCredentialWritePublication = nil
 	s.m.SettleCredentialWrite = nil
-	s.syncSocket = filepath.Join(pool.StateDir(), "missing", "sync.sock")
-	err := (serverReadiness{owner: s}).BeforeReady(ctx)
-	if err == nil || !strings.Contains(err.Error(), "setup host sync publication") {
-		t.Fatalf("BeforeReady error = %v, want sync-publication setup failure", err)
+	s.launchSyncHelper = func(context.Context, string, string) error {
+		return errors.New("helper launch unavailable")
 	}
-	if s.runtimePublished.Load() {
-		t.Fatal("failed sync setup published runtime readiness")
+	err := s.setupSync(ctx)
+	if err == nil {
+		t.Fatal("setupSync accepted an unavailable helper socket")
+	}
+	if s.syncClient != nil {
+		t.Fatal("failed sync setup retained helper client")
 	}
 	if s.m.BuildCredentialWritePublication != nil || s.m.SettleCredentialWrite != nil {
 		t.Fatal("failed setup retained partial credential publication wiring")
@@ -150,7 +198,7 @@ func TestServerReadinessRefusesPublicationWhenSyncSetupFails(t *testing.T) {
 }
 
 // TestSetupSyncStaysInertWhenDisabled pins the per-call enablement contract:
-// with the meta unset the engine is constructed but every acting path no-ops
+// with the meta unset the helper is constructed but every acting path no-ops
 // with zero on-disk residue, and flipping the meta enables it with NO restart.
 func TestSetupSyncStaysInertWhenDisabled(t *testing.T) {
 	s, ctx := newWireServer(t)
@@ -158,7 +206,7 @@ func TestSetupSyncStaysInertWhenDisabled(t *testing.T) {
 	if err := s.setupSync(ctx); err != nil {
 		t.Fatalf("setupSync: %v", err)
 	}
-	if s.syncSvc == nil || s.syncSelf == "" {
+	if s.syncClient == nil || s.syncSelf == "" {
 		t.Fatal("sync not wired, or self empty on the hostname fallback")
 	}
 
@@ -216,15 +264,16 @@ func TestSetupSyncStaysInertWhenDisabled(t *testing.T) {
 
 func TestHostSyncWorkerDeadlineKillsReapsAndReusesLane(t *testing.T) {
 	s, ctx := newWireServer(t)
-	writeWireMeshState(t, "host-mesh", nil)
+	writeWireMeshState(t, "test@host-mesh", nil)
 	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.setupSync(ctx); err != nil {
 		t.Fatal(err)
 	}
+	registry := hostsync.NewRegistryFile(pool.SyncDir())
 	lock, err := (daemonproc.FileLockSpec{
-		Path: s.syncSvc.Registry.LockPath, Mode: daemonproc.FileLockExclusive, Deadline: time.Second,
+		Path: registry.LockPath, Mode: daemonproc.FileLockExclusive, Deadline: time.Second,
 	}).Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -240,7 +289,7 @@ func TestHostSyncWorkerDeadlineKillsReapsAndReusesLane(t *testing.T) {
 	}
 
 	records, err := (&daemonproc.FileStore{
-		Path: filepath.Join(os.Getenv("HOME"), "workers.json"),
+		Path: pool.HostSyncHelperWorkerStorePath(),
 	}).Load(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -261,7 +310,7 @@ func TestHostSyncWorkerDeadlineKillsReapsAndReusesLane(t *testing.T) {
 // its registry and credential, reached via `exec:nc -U <sock>`.
 func TestAuthKindClassification(t *testing.T) {
 	s, ctx := newWireServer(t)
-	writeWireMeshState(t, "host-self", []string{"peer-b"})
+	writeWireMeshState(t, "test@host-self", []string{"test@peer-b"})
 	if err := s.m.Store.SetMeta(metaSyncEnabled, "1"); err != nil {
 		t.Fatal(err)
 	}
@@ -277,22 +326,26 @@ func TestAuthKindClassification(t *testing.T) {
 	if err := s.setupSync(ctx); err != nil {
 		t.Fatalf("setupSync: %v", err)
 	}
-	if s.syncSelf != "host-self" {
-		t.Fatalf("syncSelf = %q, want host-self", s.syncSelf)
+	if s.syncSelf != "test@host-self" {
+		t.Fatalf("syncSelf = %q, want test@host-self", s.syncSelf)
+	}
+	registryService := &hostsync.Service{
+		Registry: hostsync.NewRegistryFile(pool.SyncDir()),
+		StampDir: pool.SyncStampsDir(),
 	}
 	pub := func(uuid, origin string) {
-		if err := s.syncSvc.PublishAccount(ctx, hostsync.AccountValue{
+		if err := registryService.PublishAccount(ctx, hostsync.AccountValue{
 			UUID: uuid, Chain: hostsync.ChainStamp{Origin: origin, ExpiresAt: 1},
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	pub("u-self", "host-self")
-	pub("u-peer", "peer-b")
+	pub("u-self", "test@host-self")
+	pub("u-peer", "test@peer-b")
 	pub("u-foreign", "intruder")
 	// An origin-less entry can only predate the PublishAccount guard (or come
 	// from a foreign writer); seed one as an identity-only value.
-	if err := s.syncSvc.PublishAccount(ctx, hostsync.AccountValue{UUID: "u-noorigin"}); err != nil {
+	if err := registryService.PublishAccount(ctx, hostsync.AccountValue{UUID: "u-noorigin"}); err != nil {
 		t.Fatal(err)
 	}
 	cases := map[string]struct {

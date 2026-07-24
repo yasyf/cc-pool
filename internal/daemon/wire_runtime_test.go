@@ -56,7 +56,10 @@ func startTestWireRuntime(
 ) {
 	t.Helper()
 	stateDir := t.TempDir()
-	generation := daemonTestGeneration(t.Name())
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
 	workers, err := worker.NewPool(worker.Config{
 		Capacity: 2, QueueCapacity: 2, MaxTotalRun: time.Minute,
 		MaxStdinBytes: 1 << 20, MaxStdoutBytes: 1 << 20, MaxStderrBytes: 1 << 20,

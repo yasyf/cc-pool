@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -16,8 +15,12 @@ import (
 	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/synckit/codec"
 	"github.com/yasyf/synckit/cregistry"
+	"github.com/yasyf/synckit/helperruntime"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/manifest"
 	"github.com/yasyf/synckit/rpc"
@@ -86,11 +89,95 @@ func stubSyncConverge(t *testing.T) *int {
 	return &calls
 }
 
+type cliTestSyncProduct struct{}
+
+func (cliTestSyncProduct) Drain(context.Context) error { return nil }
+func (cliTestSyncProduct) Close(context.Context) error { return nil }
+
+type cliTestSyncConsumer struct {
+	syncservice.SyncConsumer
+	reconcile syncservice.ReconcileResult
+}
+
+func (c cliTestSyncConsumer) Capabilities(context.Context) (syncservice.Capabilities, error) {
+	return syncservice.DefaultCapabilities(hostsync.SyncServiceID), nil
+}
+
+func (c cliTestSyncConsumer) Reconcile(context.Context, string) (syncservice.ReconcileResult, error) {
+	return c.reconcile, nil
+}
+
+func startCLITestSyncHelper(t *testing.T, socket string, consumer syncservice.SyncConsumer) {
+	t.Helper()
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workers, err := worker.NewPool(worker.Config{
+		Capacity: 2, QueueCapacity: 2, MaxTotalRun: 3 * time.Minute,
+		MaxStdinBytes: 1 << 20, MaxStdoutBytes: 1 << 20, MaxStderrBytes: 1 << 20,
+	}, &proc.Reaper{
+		Store: &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers-v1.db")}, Generation: generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	children, err := proc.NewManager(2, &proc.Reaper{
+		Store: &proc.FileStore{Path: filepath.Join(t.TempDir(), "children-v1.db")}, Generation: generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := rpc.NewDispatcher()
+	syncservice.RegisterConsumer(dispatcher, consumer)
+	runtime, err := helperruntime.New(helperruntime.Config{
+		App:    helperruntime.App{Name: hostsync.SyncServiceID, RuntimeBuild: "cli-test"},
+		Socket: socket, Server: rpc.NewServer(dispatcher), Workers: workers, Children: children,
+		StopStore: &proc.FileStore{Path: filepath.Join(t.TempDir(), "stop-v1.db")},
+		Prepare: func(dkdaemon.Activation) (helperruntime.Product, error) {
+			return cliTestSyncProduct{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("run CLI sync helper: %v", err)
+		}
+	})
+	client := syncservice.NewClient(syncservice.Socket(socket))
+	defer func() { _ = client.Close() }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := client.Capabilities(t.Context()); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("CLI sync helper never became ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func writeMeshState(t *testing.T, self string, hosts []string) {
 	t.Helper()
 	ctx := context.Background()
 	if err := hostregistry.Mesh.InitializeState(ctx); err != nil {
 		t.Fatal(err)
+	}
+	for _, identity := range hosts {
+		fact, err := hostregistry.NewSSHHostFact(identity, "/opt/homebrew/bin/synckitd", []string{identity})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hostregistry.Mesh.RegisterHost(ctx, fact); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := hostregistry.Mesh.Update(ctx, func(reg *hostregistry.Registry) error {
 		reg.Self = self
@@ -146,11 +233,9 @@ func TestEnableWritesValidManifest(t *testing.T) {
 	if lm.Watch.Debounce != codec.Duration(syncWatchDebounce) {
 		t.Fatalf("watch spec = %+v", lm.Watch)
 	}
-	if lm.Service.Transport != "socket" || lm.Service.Sock != pool.SyncSocketPath() {
+	if lm.Service.Kind != "resident" || lm.Service.Socket != pool.SyncSocketPath() ||
+		lm.Service.SchemaFingerprint != hostsync.SyncSchemaFingerprint {
 		t.Fatalf("service spec = %+v, want socket at %s", lm.Service, pool.SyncSocketPath())
-	}
-	if want := []string{"sync", "rpc-serve"}; !equalStrings(lm.Service.ServeArgs, want) {
-		t.Fatalf("serve args = %v, want %v", lm.Service.ServeArgs, want)
 	}
 	if lm.Helper != nil {
 		t.Fatalf("manifest must not carry a helper block: %+v", lm)
@@ -216,7 +301,9 @@ func TestDisableClearsMetaAndRemovesManifest(t *testing.T) {
 	calls := stubSynckitdRun(t)
 	stubSyncConverge(t)
 	rf := hostsync.NewRegistryFile(pool.SyncDir())
-	if err := rf.Save(hostsync.Registry{}); err != nil {
+	reg := hostsync.Registry{}
+	reg.Remove("persisted-tombstone", cregistry.UnixMicros(time.Now()))
+	if err := rf.Save(reg); err != nil {
 		t.Fatal(err)
 	}
 
@@ -305,18 +392,10 @@ func TestSyncConvergeReportsResult(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(base) })
 	sock := filepath.Join(base, "c.sock")
 
-	ln, err := rpc.Listen(t.Context(), sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	d := rpc.NewDispatcher()
-	d.Register(syncservice.MethodSync, func(context.Context, map[string]any) (any, error) {
-		return syncservice.SyncResult{Converged: 3, SkippedBusy: 1}, nil
+	startCLITestSyncHelper(t, sock, cliTestSyncConsumer{
+		reconcile: syncservice.ReconcileResult{Converged: 3, SkippedBusy: 1},
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { _ = rpc.NewServer(d).Serve(ctx, ln); close(done) }()
-	t.Cleanup(func() { cancel(); <-done })
+	ctx := context.Background()
 
 	var out bytes.Buffer
 	if err := runSyncConverge(ctx, &out, func(context.Context) bool { return true }, sock); err != nil {
@@ -351,32 +430,11 @@ func TestStatusRendersMesh(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg, err := rf.Load()
-	if err != nil {
-		t.Fatal(err)
+	service := &hostsync.Service{Registry: rf, StampDir: pool.SyncStampsDir()}
+	service.CredentialSnapshot = func(context.Context, hostsync.Registry) (map[string]hostsync.CredentialEnvelope, error) {
+		return map[string]hostsync.CredentialEnvelope{}, nil
 	}
-	raw, err := json.Marshal(reg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ln, err := rpc.Listen(t.Context(), pool.SyncSocketPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	d := rpc.NewDispatcher()
-	d.Register(syncservice.MethodCapabilities, func(context.Context, map[string]any) (any, error) {
-		return syncservice.Capabilities{
-			Name:    "cc-pool",
-			Methods: []string{syncservice.MethodCapabilities, syncservice.MethodGetState},
-		}, nil
-	})
-	d.Register(syncservice.MethodGetState, func(context.Context, map[string]any) (any, error) {
-		return json.RawMessage(raw), nil
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { _ = rpc.NewServer(d).Serve(ctx, ln); close(done) }()
-	t.Cleanup(func() { cancel(); <-done })
+	startCLITestSyncHelper(t, pool.SyncSocketPath(), hostsync.NewConsumer(service, nil))
 
 	admitCLITestAccount(t, m.Store, store.Account{
 		ID: 1, ConfigDir: t.TempDir(), Label: "Work", AccountUUID: "u-1",

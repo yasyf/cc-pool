@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/daemonkit/proc"
 )

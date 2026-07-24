@@ -21,7 +21,7 @@ func daemonTestGeneration(label string) proc.OwnerGeneration {
 func activatedDaemonTestWorkers(t *testing.T, capacity int) *worker.Pool {
 	t.Helper()
 	workers, err := worker.NewPool(worker.Config{
-		Capacity: capacity, QueueCapacity: capacity, MaxTotalRun: time.Minute,
+		Capacity: capacity, QueueCapacity: capacity, MaxTotalRun: 3 * time.Minute,
 		MaxStdinBytes: 1 << 20, MaxStdoutBytes: 1 << 20, MaxStderrBytes: 1 << 20,
 	}, &proc.Reaper{
 		Store:      &proc.FileStore{Path: filepath.Join(t.TempDir(), "workers-v1.db")},

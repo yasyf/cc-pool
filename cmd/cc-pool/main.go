@@ -38,6 +38,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+	if daemon.IsSyncHelperInvocation(os.Args[1:]) {
+		if err := daemon.RunSyncHelper(ctx, os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if pool.IsBackingWorkerInvocation(os.Args[1:]) {
 		if err := pool.RunBackingWorker(ctx, os.Stdin, os.Stdout); err != nil {

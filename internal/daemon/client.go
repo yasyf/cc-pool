@@ -967,6 +967,9 @@ func (c *Client) dial(ctx context.Context) (*clientSession, error) {
 		Dial: wire.UnixDialer(c.socket), WireBuild: c.clientBuild(), Role: trust.UnprotectedRole, Ladder: ladder,
 	})
 	if err != nil {
+		if errors.Is(err, wire.ErrBuildMismatch) {
+			return nil, fmt.Errorf("%w: %v", ErrDaemonBuildMismatch, err)
+		}
 		return nil, fmt.Errorf("connect daemon: %w", err)
 	}
 	peer := client.PeerWireIdentity()

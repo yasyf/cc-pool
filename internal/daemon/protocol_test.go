@@ -17,6 +17,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
+	"github.com/yasyf/daemonkit/trust"
 	"github.com/yasyf/daemonkit/wire"
 )
 
@@ -149,7 +150,7 @@ func TestClientAdmitsExactBuild(t *testing.T) {
 	}
 }
 
-func TestServerRejectsOldClientBuildBeforeBusinessDispatch(t *testing.T) {
+func TestServerRejectsOldClientBuildBeforeSession(t *testing.T) {
 	var calls atomic.Int64
 	socket := serveBuildTestServer(t, version.String(), &calls)
 	ladder, err := operationLadder()
@@ -157,18 +158,13 @@ func TestServerRejectsOldClientBuildBeforeBusinessDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), WireBuild: "0.0.1", Ladder: ladder,
+		Dial: wire.UnixDialer(socket), WireBuild: "0.0.1", Role: trust.UnprotectedRole, Ladder: ladder,
 	})
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, wire.ErrBuildMismatch) {
+		t.Fatalf("old client handshake = %v, want build mismatch", err)
 	}
-	t.Cleanup(func() { _ = client.Close() })
-	result, err := client.Call(t.Context(), wire.Op(OpStatus), "", []byte(`{"op":"status"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Outcome != wire.Rejected || result.Response.Reason != wire.ErrBuildMismatch.Error() {
-		t.Fatalf("old client result = %+v, want pre-dispatch build rejection", result)
+	if client != nil {
+		t.Fatal("old client build retained a session")
 	}
 	if calls.Load() != 0 {
 		t.Fatalf("old client dispatched %d business handlers", calls.Load())
@@ -191,11 +187,11 @@ func TestRemovedLifecycleOperationsAreAbsent(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
 	socket := filepath.Join(socketDir, "daemon.sock")
 	server := &wire.Server{
-		WireBuild: WireBuild, MaxSessions: 2,
+		WireBuild: WireBuild, MaxSessions: 8,
 	}
 	startTestWireRuntime(t, socket, version.String(), server, ordinaryTestProtectedClassifier{}, nil)
 	client, err := wire.NewClient(t.Context(), wire.ClientConfig{
-		Dial: wire.UnixDialer(socket), WireBuild: WireBuild,
+		Dial: wire.UnixDialer(socket), WireBuild: WireBuild, Role: trust.UnprotectedRole,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -347,7 +343,7 @@ func serveBuildTestServer(
 		t.Fatal(err)
 	}
 	server := &wire.Server{
-		WireBuild: build, Ladder: ladder, MaxSessions: 2,
+		WireBuild: build, Ladder: ladder, MaxSessions: 8,
 	}
 	for _, op := range []Op{OpStatus} {
 		server.Register(wire.HandlerSpec{

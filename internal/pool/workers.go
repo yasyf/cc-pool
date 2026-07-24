@@ -43,27 +43,12 @@ func newWorkerRuntimeAt(
 	childStorePath string,
 	activate bool,
 ) (*workerRuntime, *procscan.WorkerScanner, error) {
-	workerReaper, err := newWorkerReaper(workerStorePath)
+	runtime, err := newProcessRuntimeAt(workerStorePath, childStorePath)
 	if err != nil {
 		return nil, nil, err
 	}
-	workers, err := worker.NewPool(worker.Config{
-		Capacity: disposableWorkerLimit, QueueCapacity: disposableWorkerLimit,
-		MaxTotalRun: workerMaxTotalRun, MaxStdinBytes: workerMaxInput,
-		MaxStdoutBytes: workerMaxOutput, MaxStderrBytes: workerMaxOutput,
-	}, workerReaper)
-	if err != nil {
-		return nil, nil, err
-	}
-	childReaper, err := newWorkerReaper(childStorePath)
-	if err != nil {
-		return nil, nil, err
-	}
-	children, err := proc.NewManager(childProcessLimit, childReaper)
-	if err != nil {
-		return nil, nil, err
-	}
-	runtime := &workerRuntime{pool: workers, children: children, reaper: workerReaper}
+	workers := runtime.pool
+	workerReaper := runtime.reaper
 	if activate {
 		claim, claimErr := workers.ClaimRuntime()
 		if claimErr != nil {
@@ -90,19 +75,64 @@ func newWorkerRuntimeAt(
 		return nil, nil, fmt.Errorf("track credential owner process: %w", err)
 	}
 	runtime.owner = owner
-	executable, err := os.Executable()
-	if err != nil {
-		_ = runtime.close(ctx)
-		return nil, nil, fmt.Errorf("resolve disposable worker executable: %w", err)
-	}
-	runtime.executable = executable
-	scanner, err := procscan.NewWorkerScanner(workers, executable)
+	scanner, err := procscan.NewWorkerScanner(workers, runtime.executable)
 	if err != nil {
 		_ = runtime.close(ctx)
 		return nil, nil, err
 	}
 	return runtime, scanner, nil
 }
+
+func newProcessRuntimeAt(workerStorePath, childStorePath string) (*workerRuntime, error) {
+	workerReaper, err := newWorkerReaper(workerStorePath)
+	if err != nil {
+		return nil, err
+	}
+	workers, err := worker.NewPool(worker.Config{
+		Capacity: disposableWorkerLimit, QueueCapacity: disposableWorkerLimit,
+		MaxTotalRun: workerMaxTotalRun, MaxStdinBytes: workerMaxInput,
+		MaxStdoutBytes: workerMaxOutput, MaxStderrBytes: workerMaxOutput,
+	}, workerReaper)
+	if err != nil {
+		return nil, err
+	}
+	childReaper, err := newWorkerReaper(childStorePath)
+	if err != nil {
+		return nil, err
+	}
+	children, err := proc.NewManager(childProcessLimit, childReaper)
+	if err != nil {
+		return nil, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve disposable worker executable: %w", err)
+	}
+	return &workerRuntime{
+		pool: workers, children: children, reaper: workerReaper, executable: executable,
+	}, nil
+}
+
+// HostSyncHelperOwners are the resident helper's independent daemonkit process owners.
+type HostSyncHelperOwners struct{ runtime *workerRuntime }
+
+// OpenHostSyncHelperOwners constructs unclaimed owners for Synckit's helper runtime.
+func OpenHostSyncHelperOwners() (*HostSyncHelperOwners, error) {
+	runtime, err := newProcessRuntimeAt(HostSyncHelperWorkerStorePath(), HostSyncHelperChildStorePath())
+	if err != nil {
+		return nil, err
+	}
+	return &HostSyncHelperOwners{runtime: runtime}, nil
+}
+
+// Workers returns the helper's daemonkit worker pool.
+func (o *HostSyncHelperOwners) Workers() *worker.Pool { return o.runtime.pool }
+
+// Children returns the helper's daemonkit child manager.
+func (o *HostSyncHelperOwners) Children() *proc.Manager { return o.runtime.children }
+
+// Executable returns the exact helper binary used for disposable host-sync operations.
+func (o *HostSyncHelperOwners) Executable() string { return o.runtime.executable }
 
 func newWorkerReaper(path string) (*proc.Reaper, error) {
 	generation, err := proc.ProcessGeneration()

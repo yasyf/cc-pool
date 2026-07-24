@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/accountterminal"
-	"github.com/yasyf/cc-pool/internal/hostsync"
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
@@ -28,6 +26,7 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/fusekit/catalogproto"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 // reservationTTL suppresses re-picking an account until its claude becomes
@@ -146,13 +145,13 @@ type Server struct {
 	led   *ledgers
 	ledMu sync.Mutex
 
-	// syncSvc is the wired host-sync engine (registry, driver, mesh); nil ⇒ host
-	// sync never wired this run. syncSelf is this host's registry origin name.
-	// Both feed authKind's persist-time needs-login classification.
-	syncSvc      *hostsync.Service
+	// syncClient is the persistent client to the dedicated host-sync helper.
+	// syncSelf is this host's registry origin name.
+	syncClient   *syncservice.Client
 	syncSelf     string
-	syncListener net.Listener
 	syncAuthKind func(context.Context, int, string) (store.AuthKind, error)
+	// launchSyncHelper replaces managed child launch in focused runtime tests.
+	launchSyncHelper func(context.Context, string, string) error
 
 	// syncPull runs one converge pull for the invalid_grant self-heal (syncHeal)
 	// and the on-demand preflight pull; nil ⇒ sync disabled.
@@ -418,9 +417,6 @@ func (s *Server) settleProductRuntime(settlement dkdaemon.ProductSettlement) err
 	if execCancel != nil {
 		execCancel()
 	}
-	if s.syncListener != nil {
-		_ = s.syncListener.Close()
-	}
 	var result error
 	if s.accountTerminals != nil {
 		result = errors.Join(result, s.accountTerminals.Close(cleanupCtx))
@@ -434,6 +430,10 @@ func (s *Server) settleProductRuntime(settlement dkdaemon.ProductSettlement) err
 	case <-done:
 	case <-cleanupCtx.Done():
 		result = errors.Join(result, fmt.Errorf("daemon: await product workers: %w", cleanupCtx.Err()))
+	}
+	if s.syncClient != nil {
+		result = errors.Join(result, s.syncClient.Close())
+		s.syncClient = nil
 	}
 	if s.tenantClient != nil {
 		s.holderActive.Store(false)

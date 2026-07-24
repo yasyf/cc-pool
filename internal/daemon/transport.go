@@ -108,7 +108,7 @@ func (s *Server) runtime() (*wire.Server, *dkdaemon.Runtime, error) {
 func (s *Server) daemonHealthRoute() wire.ObservationRoute {
 	return wire.ObservationRoute{
 		Op: wire.Op(OpHealth), MaxResponseBytes: daemonHealthMaxResponse,
-		AvailableBeforeReady: true, Handler: s.daemonHealthObservation,
+		Handler: s.daemonHealthObservation,
 	}
 }
 

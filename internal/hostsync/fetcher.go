@@ -13,6 +13,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/creds"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 const (
@@ -89,6 +90,9 @@ func BuildCredentialSnapshot(
 		if err != nil {
 			return nil, fmt.Errorf("hostsync: read owned account %s credential: %w", uuid, err)
 		}
+		if credential == nil {
+			return nil, fmt.Errorf("hostsync: owned account %s returned no credential", uuid)
+		}
 		if !credential.HasRefreshToken() {
 			return nil, fmt.Errorf("hostsync: owned account %s has no refresh token", uuid)
 		}
@@ -144,6 +148,45 @@ func decodeSyncSnapshot(payload []byte) (syncSnapshot, error) {
 		return syncSnapshot{}, errors.New("hostsync: sync snapshot is not canonical")
 	}
 	return snapshot, nil
+}
+
+func validateRegistrySemantics(registry Registry) error {
+	for id, entry := range registry {
+		if id == "" || entry.Value.UUID == "" || entry.Value.UUID != id {
+			return fmt.Errorf("hostsync: registry entry %q has invalid UUID %q", id, entry.Value.UUID)
+		}
+		if entry.Value.Chain != (ChainStamp{}) && entry.Value.Chain.Origin == "" {
+			return fmt.Errorf("hostsync: registry entry %s has a chain without an origin", id)
+		}
+	}
+	return nil
+}
+
+// RegistryFromExport validates one current v1 Export envelope and returns its
+// secretless registry without exposing delivery-only credential material.
+func RegistryFromExport(change syncservice.ChangeEnvelope) (Registry, error) {
+	if err := change.Validate(false); err != nil {
+		return nil, err
+	}
+	if change.ServiceID != SyncServiceID || change.SchemaFingerprint != SyncSchemaFingerprint {
+		return nil, errors.New("hostsync: export service schema mismatch")
+	}
+	if change.Kind != syncservice.ChangeSnapshot {
+		return nil, errors.New("hostsync: export is not a snapshot")
+	}
+	snapshot, err := decodeSyncSnapshot(change.Payload)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateRegistrySemantics(snapshot.Registry); err != nil {
+		return nil, err
+	}
+	registry := make(Registry, len(snapshot.Registry))
+	for id, entry := range snapshot.Registry {
+		entry.Value.OAuthAccount = bytes.Clone(entry.Value.OAuthAccount)
+		registry[id] = entry
+	}
+	return registry, nil
 }
 
 func validateAppliedCredentials(snapshot syncSnapshot, origin string) (map[string]*creds.Credential, error) {

@@ -78,6 +78,15 @@ func HostSyncWorkerStorePath() string { return statePath("hostsync-workers-v1.db
 // HostSyncChildStorePath is the host-sync child's independent v1 child ledger.
 func HostSyncChildStorePath() string { return statePath("hostsync-children-v1.db") }
 
+// HostSyncHelperWorkerStorePath is the resident sync helper's independent v1 worker ledger.
+func HostSyncHelperWorkerStorePath() string { return statePath("hostsync-helper-workers-v1.db") }
+
+// HostSyncHelperChildStorePath is the resident sync helper's independent v1 child ledger.
+func HostSyncHelperChildStorePath() string { return statePath("hostsync-helper-children-v1.db") }
+
+// HostSyncHelperStopStorePath is the resident sync helper's v1 stop-control ledger.
+func HostSyncHelperStopStorePath() string { return statePath("hostsync-helper-stop-v1.db") }
+
 // AccountTerminalProcessStorePath is the product account-terminal v1 process ledger.
 func AccountTerminalProcessStorePath() string { return statePath("account-terminals-v1.db") }
 

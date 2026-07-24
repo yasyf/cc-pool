@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +18,8 @@ import (
 	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/synckit/syncservice"
 )
+
+const testSynckitdExecutable = "/exact/synckitd"
 
 type workerConsumerFixture struct {
 	caps      syncservice.Capabilities
@@ -69,18 +73,81 @@ func (r *inlineHostSyncRunner) Run(ctx context.Context, task worker.CommandReque
 	if err != nil {
 		r.t.Fatal(err)
 	}
-	if len(task.Env) != 1 || task.Env[0] != "HOME="+home {
-		r.t.Fatalf("task env = %v, want exact HOME", task.Env)
+	wantEnv := []string{"HOME=" + home}
+	if configHome, ok := os.LookupEnv("XDG_CONFIG_HOME"); ok {
+		wantEnv = append(wantEnv, "XDG_CONFIG_HOME="+configHome)
+	}
+	if !slices.Equal(task.Env, wantEnv) {
+		r.t.Fatalf("task env = %v, want %v", task.Env, wantEnv)
 	}
 	r.runtimeCall++
 	var output bytes.Buffer
 	err = RunWorker(ctx, bytes.NewReader(task.Stdin), &output, func(
 		_ context.Context,
+		synckitdExecutable string,
 		run func(WorkerRuntime) error,
 	) error {
+		if synckitdExecutable != testSynckitdExecutable {
+			r.t.Fatalf("synckitd executable = %q", synckitdExecutable)
+		}
 		return run(r.runtime)
 	})
 	return worker.CommandResult{Stdout: output.Bytes()}, err
+}
+
+func TestWorkerClientCarriesOnlyExactConfigIdentity(t *testing.T) {
+	configHome := filepath.Join(t.TempDir(), "config")
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	runner := &inlineHostSyncRunner{
+		t: t, runtime: WorkerRuntime{Consumer: &workerConsumerFixture{
+			caps: syncservice.DefaultCapabilities(SyncServiceID),
+		}, AuthKind: func(context.Context, int, string) (store.AuthKind, error) {
+			return store.AuthKindOwned, nil
+		}},
+	}
+	client, err := NewWorkerClient(runner, "/exact/ccp", testSynckitdExecutable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Capabilities(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.tasks) != 1 {
+		t.Fatalf("tasks = %d, want one", len(runner.tasks))
+	}
+}
+
+func TestWorkerClientRejectsInexactSynckitdExecutable(t *testing.T) {
+	runner := &inlineHostSyncRunner{t: t}
+	for _, executable := range []string{"", "synckitd", "/opt/homebrew/bin/../bin/synckitd"} {
+		if _, err := NewWorkerClient(runner, "/exact/ccp", executable); err == nil {
+			t.Fatalf("inexact synckitd executable %q accepted", executable)
+		}
+	}
+}
+
+func TestWorkerClientRejectsInexactConfigIdentity(t *testing.T) {
+	for _, value := range []string{"", "relative/config", t.TempDir() + "/x/../config"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", value)
+			runner := &inlineHostSyncRunner{t: t, runtime: WorkerRuntime{
+				Consumer: &workerConsumerFixture{},
+				AuthKind: func(context.Context, int, string) (store.AuthKind, error) {
+					return store.AuthKindOwned, nil
+				},
+			}}
+			client, err := NewWorkerClient(runner, "/exact/ccp", testSynckitdExecutable)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Capabilities(t.Context()); err == nil || !strings.Contains(err.Error(), "XDG_CONFIG_HOME") {
+				t.Fatalf("Capabilities with XDG_CONFIG_HOME=%q = %v", value, err)
+			}
+			if len(runner.tasks) != 0 {
+				t.Fatal("invalid environment launched a worker")
+			}
+		})
+	}
 }
 
 func TestWorkerClientExecutesExactOperations(t *testing.T) {
@@ -115,7 +182,7 @@ func TestWorkerClientExecutesExactOperations(t *testing.T) {
 	runner := &inlineHostSyncRunner{t: t, runtime: WorkerRuntime{
 		Consumer: consumer, AuthKind: authKind,
 	}}
-	client, err := NewWorkerClient(runner, "/exact/ccp")
+	client, err := NewWorkerClient(runner, "/exact/ccp", testSynckitdExecutable)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +223,7 @@ func TestWorkerClientExecutesExactOperations(t *testing.T) {
 }
 
 func staticWorkerRuntime(runtime WorkerRuntime) WorkerRuntimeScope {
-	return func(_ context.Context, run func(WorkerRuntime) error) error {
+	return func(_ context.Context, _ string, run func(WorkerRuntime) error) error {
 		return run(runtime)
 	}
 }
@@ -167,8 +234,9 @@ func TestWorkerProtocolRejectsTrailingAndMismatchedFrames(t *testing.T) {
 		AuthKind: func(context.Context, int, string) (store.AuthKind, error) { return store.AuthKindOwned, nil },
 	}
 	request := workerRequest{
-		Protocol: hostSyncWorkerProtocol, Operation: workerCapabilities,
-		Params: json.RawMessage(`{}`),
+		Protocol: hostSyncWorkerProtocol, SynckitdExecutable: testSynckitdExecutable,
+		Operation: workerCapabilities,
+		Params:    json.RawMessage(`{}`),
 	}
 	var framed bytes.Buffer
 	if err := writeWorkerFrame(&framed, request); err != nil {
@@ -196,7 +264,7 @@ func TestWorkerAuthKindPreservesTypedFailure(t *testing.T) {
 			return "", ErrAuthKindOriginForeign
 		},
 	}}
-	client, err := NewWorkerClient(runner, "/exact/ccp")
+	client, err := NewWorkerClient(runner, "/exact/ccp", testSynckitdExecutable)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +304,7 @@ func TestWorkerClientSerializesExclusiveChildActivation(t *testing.T) {
 	runner := &gatedHostSyncRunner{
 		inner: inner, started: make(chan struct{}), release: make(chan struct{}),
 	}
-	client, err := NewWorkerClient(runner, "/exact/ccp")
+	client, err := NewWorkerClient(runner, "/exact/ccp", testSynckitdExecutable)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +336,7 @@ func TestWorkerClientDefaultDeadlineIncludesLaneWait(t *testing.T) {
 	runner := &gatedHostSyncRunner{
 		inner: inner, started: make(chan struct{}), release: make(chan struct{}),
 	}
-	client, err := NewWorkerClient(runner, "/exact/ccp")
+	client, err := NewWorkerClient(runner, "/exact/ccp", testSynckitdExecutable)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +371,7 @@ func TestWorkerDeadlineReturnsOnlyAfterRunnerSettlement(t *testing.T) {
 	temp := t.TempDir()
 	t.Setenv("TMPDIR", temp)
 	runner := &canceledHostSyncRunner{}
-	client, err := NewWorkerClient(runner, "/exact/ccp")
+	client, err := NewWorkerClient(runner, "/exact/ccp", testSynckitdExecutable)
 	if err != nil {
 		t.Fatal(err)
 	}
