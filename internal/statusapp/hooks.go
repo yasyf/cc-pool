@@ -22,6 +22,7 @@ import (
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/mountservice"
 	"github.com/yasyf/fusekit/transportproto"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 const (
@@ -131,11 +132,11 @@ func (h productHooks) runtimeQuiesce(
 		RuntimeClientConfig: wire.RuntimeClientConfig{
 			Client: wire.ClientConfig{
 				Dial: wire.UnixDialer(target.socket), WireBuild: transportproto.WireBuild,
-				Role: holder.StopControllerRole,
+				Role: trustroles.StopController,
 			},
 			NoProgressTimeout: holderbridge.ReadinessContract().PreparationNoProgressTimeout(),
 		},
-		ExpectedRuntimeBuild: health.RuntimeBuild, ControlRole: holder.StopControllerRole,
+		ExpectedRuntimeBuild: health.RuntimeBuild, ControlRole: trustroles.StopController,
 	})
 	if err != nil {
 		return deployment.RuntimeProof{}, fmt.Errorf("CCPoolStatus: settle prior runtime: %w", err)

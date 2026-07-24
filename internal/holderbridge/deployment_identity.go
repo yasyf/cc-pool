@@ -14,9 +14,9 @@ import (
 	"github.com/yasyf/daemonkit/deployment"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/trust"
-	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/transportproto"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 const (
@@ -249,9 +249,9 @@ func deploymentPolicyJSON() ([]byte, error) {
 			BundleLeaf: ExecutableName + ".app", ExecutableName: ExecutableName,
 			ExecutableRelativePath:      "Contents/MacOS/" + ExecutableName,
 			RequireCanonicalAccountHome: true,
-			StopControllerRole:          holder.StopControllerRole,
-			ReceiptControllerRole:       holder.ReceiptControllerRole,
-			ReadinessControllerRole:     holder.ReadinessControllerRole,
+			StopControllerRole:          trustroles.StopController,
+			ReceiptControllerRole:       trustroles.ReceiptController,
+			ReadinessControllerRole:     trustroles.ReadinessController,
 		},
 		FileProvider: deploymentFileProviderPolicy{
 			BundleID:              fileProviderBundleID,
@@ -309,7 +309,7 @@ func deploymentPolicyJSON() ([]byte, error) {
 			BuildEnvironmentKey: "FUSEKIT_BUILD_ID", RequireExactBuildEnvironment: true,
 			ReplacementOwnsRestartFence: true,
 			Quiesce: deploymentQuiescePolicy{
-				DirectPersistentControl: true, ControlRole: holder.StopControllerRole,
+				DirectPersistentControl: true, ControlRole: trustroles.StopController,
 				OperationIDIsDaemonkitScoped: true, ExpectedBuildIsObservedRuntime: true,
 				RuntimeProofBindsObservedBuild: true, RuntimeProofBindsReceipt: true,
 				RuntimeProofBindsProcessRecord:  true,

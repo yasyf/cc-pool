@@ -13,9 +13,9 @@ import (
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/service"
 	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
 	"github.com/yasyf/fusekit/transportproto"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 type recordingStopper struct {
@@ -56,9 +56,9 @@ func TestRuntimeQuiesceStopsExactObservedGeneration(t *testing.T) {
 		proof.Digest == (deployment.SHA256{}) ||
 		stopper.request.OperationID != operation.ID ||
 		stopper.request.ExpectedRuntimeBuild != health.RuntimeBuild ||
-		stopper.request.ControlRole != holder.StopControllerRole ||
+		stopper.request.ControlRole != trustroles.StopController ||
 		stopper.request.RuntimeClientConfig.Client.WireBuild != transportproto.WireBuild ||
-		stopper.request.RuntimeClientConfig.Client.Role != holder.StopControllerRole ||
+		stopper.request.RuntimeClientConfig.Client.Role != trustroles.StopController ||
 		stopper.request.RuntimeClientConfig.Client.Dial == nil ||
 		stopper.request.RuntimeClientConfig.NoProgressTimeout != holderbridge.ReadinessContract().PreparationNoProgressTimeout() {
 		t.Fatalf("proof/request = %#v/%#v", proof, stopper.request)

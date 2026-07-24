@@ -12,8 +12,8 @@ import (
 	"testing"
 
 	"github.com/yasyf/daemonkit/deployment"
-	"github.com/yasyf/fusekit/holder"
 	"github.com/yasyf/fusekit/mountproto"
+	"github.com/yasyf/fusekit/trustroles"
 )
 
 func TestConsumerBuildForExecutableHashesExactBytes(t *testing.T) {
@@ -95,9 +95,9 @@ func TestDeploymentPolicyJSONAndDigestAreDeterministicAndComplete(t *testing.T) 
 		policy.Application.ExecutableName != ExecutableName ||
 		policy.Application.ExecutableRelativePath != "Contents/MacOS/CCPoolStatus" ||
 		!policy.Application.RequireCanonicalAccountHome ||
-		policy.Application.StopControllerRole != holder.StopControllerRole ||
-		policy.Application.ReceiptControllerRole != holder.ReceiptControllerRole ||
-		policy.Application.ReadinessControllerRole != holder.ReadinessControllerRole ||
+		policy.Application.StopControllerRole != trustroles.StopController ||
+		policy.Application.ReceiptControllerRole != trustroles.ReceiptController ||
+		policy.Application.ReadinessControllerRole != trustroles.ReadinessController ||
 		policy.FileProvider.BundleID != fileProviderBundleID ||
 		policy.FileProvider.ExtensionRelativePath != "Contents/PlugIns/CCPoolFileProvider.appex" ||
 		!policy.FileProvider.RequireRegistration || !policy.FileProvider.RequireEnabled ||
@@ -145,7 +145,7 @@ func TestDeploymentPolicyJSONAndDigestAreDeterministicAndComplete(t *testing.T) 
 		!policy.Proofs.RequireReturnedRoleMatch || !policy.Proofs.RequireReadinessPlanDigest ||
 		!policy.Proofs.BindGenerationCDHash || !policy.Proofs.BindGenerationBundleDigest ||
 		!policy.Service.Quiesce.DirectPersistentControl ||
-		policy.Service.Quiesce.ControlRole != holder.StopControllerRole ||
+		policy.Service.Quiesce.ControlRole != trustroles.StopController ||
 		!policy.Service.Quiesce.OperationIDIsDaemonkitScoped ||
 		!policy.Service.Quiesce.ExpectedBuildIsObservedRuntime ||
 		!policy.Service.Quiesce.RuntimeProofBindsObservedBuild ||
