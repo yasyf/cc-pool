@@ -22,10 +22,7 @@ func TestCredentialLockCrashHelper(t *testing.T) {
 	if phase == "" {
 		t.Skip("credential lock crash helper")
 	}
-	configDir := testFileProviderConfigDir(1)
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	configDir := prepareTestAccountConfigDir(t, 1)
 	credentialLockFailpoint = func(checkpoint string) {
 		if checkpoint != phase {
 			return
@@ -111,7 +108,7 @@ func TestCredentialLockRecoversEveryCrashTransition(t *testing.T) {
 				}
 			}
 
-			configDir := testFileProviderConfigDir(1)
+			configDir := prepareTestAccountConfigDir(t, 1)
 			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 			defer cancel()
 			lease, err := acquireCredentialRefreshLocks(ctx, 1, configDir)
@@ -128,10 +125,7 @@ func TestCredentialLockRecoversEveryCrashTransition(t *testing.T) {
 
 func TestCredentialLockRecoversAbandonedSameWorkerJournal(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	configDir := testFileProviderConfigDir(1)
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	configDir := prepareTestAccountConfigDir(t, 1)
 	lease, err := acquireCredentialRefreshLocks(t.Context(), 1, configDir)
 	if err != nil {
 		t.Fatal(err)
@@ -165,10 +159,7 @@ func TestCredentialLockRecoversAbandonedSameWorkerJournal(t *testing.T) {
 
 func TestCredentialLockReleaseOutlivesCallerCancellation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	configDir := testFileProviderConfigDir(1)
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	configDir := prepareTestAccountConfigDir(t, 1)
 	lease, err := acquireCredentialRefreshLocks(t.Context(), 1, configDir)
 	if err != nil {
 		t.Fatal(err)
@@ -183,10 +174,7 @@ func TestCredentialLockReleaseOutlivesCallerCancellation(t *testing.T) {
 
 func TestCredentialLockNeverDeletesUnmarkedAmbiguousTarget(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	configDir := testFileProviderConfigDir(1)
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	configDir := prepareTestAccountConfigDir(t, 1)
 	paths, err := credentialRefreshLockPaths(configDir)
 	if err != nil {
 		t.Fatal(err)

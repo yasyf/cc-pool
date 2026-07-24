@@ -13,8 +13,8 @@ func TestTenantAccountSeparatesPreservedBackingFromPresentation(t *testing.T) {
 	t.Setenv("HOME", home)
 	account := store.Account{
 		ID: 18, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 7,
-		ConfigDir: filepath.Join(home, "Library", "CloudStorage", "acct-18"),
 	}
+	account.ConfigDir, _ = AccountConfigDir(account.InstanceID)
 	tenant := TenantAccount(account)
 	backing := filepath.Join(home, ".cc-pool", "fusekit", "backing", "acct-18")
 	if tenant.BackingRoot != backing {

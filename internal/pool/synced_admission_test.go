@@ -20,16 +20,16 @@ func TestPromoteSyncedAddLostResponseResolvesWithoutCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	configDir := filepath.Join(t.TempDir(), "CloudStorage", "cc-pool-acct-01")
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
+	publicPath := filepath.Join(mustHome(), "Library", "CloudStorage", "cc-pool-acct-01")
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	prospective := store.Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, ConfigDir: configDir,
+		Generation: reservation.Generation,
 	}
 	pending, err := manager.PrepareReservedSyncedAdd(
-		t.Context(), reservation, syncedAdmissionProof(prospective, "activation-promotion"),
+		t.Context(), reservation, syncedAdmissionProof(prospective, publicPath),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -42,13 +42,13 @@ func TestPromoteSyncedAddLostResponseResolvesWithoutCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pending.ConfigDir != wantConfigDir || pending.PublicPath != configDir ||
+	if pending.ConfigDir != wantConfigDir || pending.PublicPath != publicPath ||
 		pending.KeychainService != wantService {
 		t.Fatalf("synced pending identity = %+v", pending)
 	}
-	assertLinkTarget(t, pending.ConfigDir, configDir)
+	assertLinkTarget(t, pending.ConfigDir, publicPath)
 	identity := json.RawMessage(`{"accountUuid":"promotion-uuid"}`)
-	if err := manager.WriteIdentity(t.Context(), reservation.ID, configDir, identity); err != nil {
+	if err := manager.WriteIdentity(t.Context(), reservation.ID, pending.ConfigDir, identity); err != nil {
 		t.Fatal(err)
 	}
 	promoteSyncedAddFailpoint = func(checkpoint string) error {
@@ -459,17 +459,28 @@ func syncedAdmissionFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	configDir := filepath.Join(home, "Library", "CloudStorage", "cc-pool-acct-01")
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
+	publicPath := filepath.Join(home, "Library", "CloudStorage", "cc-pool-acct-01")
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configDir, err := AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keychainService, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
 		t.Fatal(err)
 	}
 	account := store.Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
 		Generation: reservation.Generation, ConfigDir: configDir,
-		KeychainService: "synced-service", KeychainAccount: creds.AccountLabel(),
+		KeychainService: keychainService, KeychainAccount: creds.AccountLabel(),
 		Label: "synced", AccountUUID: "synced-uuid", CreatedAt: time.Now(),
 	}
-	currentProof := syncedAdmissionProof(account, "activation-A")
+	currentProof := syncedAdmissionProof(account, publicPath)
 	if err := st.PromoteReservedSyncedAccount(reservation, account, currentProof); err != nil {
 		t.Fatal(err)
 	}
@@ -483,12 +494,12 @@ func syncedAdmissionFixture(
 
 func syncedAdmissionProof(
 	account store.Account,
-	_ string,
+	publicPath string,
 ) store.FileProviderPresentationIdentity {
 	tenantID := "account-" + account.InstanceID
 	return store.FileProviderPresentationIdentity{
 		TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
-		Generation: account.Generation, PublicPath: account.ConfigDir,
+		Generation: account.Generation, PublicPath: publicPath,
 	}
 }
 

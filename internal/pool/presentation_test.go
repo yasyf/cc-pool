@@ -11,15 +11,15 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-func TestConfigDirIsExactClaudeAndKeychainIdentity(t *testing.T) {
+func TestStableConfigDirIsExactClaudeAndKeychainIdentity(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	account := store.Account{ID: 18, ConfigDir: "/File Provider/CCPool/acct-18"}
+	account := store.Account{ID: 18, ConfigDir: testAccountConfigDir(18)}
 	if creds.ServiceName(account.ConfigDir) == creds.ServiceName(AccountBackingDir(account.ID)) {
 		t.Fatal("private backing unexpectedly produced the presentation Keychain identity")
 	}
 }
 
-func TestScoreInputCountsOnlyPresentationIdentity(t *testing.T) {
+func TestScoreInputCountsOnlyStableExecutionIdentity(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool-v1.db"))
 	if err != nil {
@@ -27,9 +27,9 @@ func TestScoreInputCountsOnlyPresentationIdentity(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 	m := &Manager{Store: st}
-	account := store.Account{ID: 7, ConfigDir: "/File Provider/CCPool/acct-07"}
+	account := store.Account{ID: 7, ConfigDir: testAccountConfigDir(7)}
 	sessions := []procscan.Session{
-		{PID: 1, ConfigDir: testFileProviderConfigDir(7)},
+		{PID: 1, ConfigDir: testAccountConfigDir(8)},
 		{PID: 2, ConfigDir: account.ConfigDir},
 	}
 	input, _, _, _, err := m.scoreInput(t.Context(), account, sessions, time.Now())
@@ -41,9 +41,9 @@ func TestScoreInputCountsOnlyPresentationIdentity(t *testing.T) {
 	}
 }
 
-func TestPreflightRefreshSkipsPresentationSession(t *testing.T) {
+func TestPreflightRefreshSkipsStableExecutionSession(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	account := store.Account{ID: 7, ConfigDir: "/File Provider/CCPool/acct-07"}
+	account := store.Account{ID: 7, ConfigDir: testAccountConfigDir(7)}
 	m := &Manager{ScanSessions: func(context.Context) ([]procscan.Session, error) {
 		return []procscan.Session{{PID: 1, ConfigDir: account.ConfigDir}}, nil
 	}}
