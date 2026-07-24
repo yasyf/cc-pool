@@ -13,10 +13,7 @@ options:
 packages:
   FuseKit:
     url: https://github.com/yasyf/fusekit.git
-    exactVersion: 1.11.0
-  DaemonKit:
-    url: https://github.com/yasyf/daemonkit.git
-    exactVersion: 0.9.0
+    revision: 3c7bc3f6e2dfd3736b2621eba11c45a14e5334f7
 
 # release-app.yml writes a per-build Version.xcconfig before `xcodegen generate`;
 # keep MARKETING_VERSION/CURRENT_PROJECT_VERSION out of `settings:` so it wins.
@@ -89,7 +86,6 @@ targetTemplates:
         embed: true
         codeSign: true
       - package: FuseKit
-      - package: DaemonKit
 
 targets:
   CCPoolStatus:
@@ -182,7 +178,6 @@ targets:
         PROVISIONING_PROFILE_SPECIFIER: "cc-pool FileProvider DevID"
     dependencies:
       - package: FuseKit
-      - package: DaemonKit
 
   CCPoolStatusTests:
     # Host-less unit-test bundle for PURE logic only. It compiles the code
@@ -205,7 +200,6 @@ targets:
         CODE_SIGN_IDENTITY: "-"
     dependencies:
       - package: FuseKit
-      - package: DaemonKit
 
 schemes:
   CCPoolStatus:

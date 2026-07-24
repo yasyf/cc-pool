@@ -8,10 +8,7 @@ enum CCPoolFileProviderConfiguration {
     identifier: appGroupIdentifier,
     socketLeaf: "fusekit.sock"
   )
-  static let brokerTeamIdentifier = "SXKCTF23Q2"
-  static let brokerSigningIdentifier = "com.yasyf.cc-pool.status"
-  static let extensionTeamIdentifier = "SXKCTF23Q2"
-  static let extensionSigningIdentifier = "com.yasyf.cc-pool.status.fileprovider"
+  static let brokerNoProgressTimeout: TimeInterval = 5
 
   static var realHome: String {
     if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
@@ -26,27 +23,34 @@ enum CCPoolFileProviderConfiguration {
       .path
   }
 
-  static var brokerConfiguration: CatalogBroker.Configuration {
-    .init(
+  static func brokerConfigurationIfRequested(
+    arguments: [String] = ProcessInfo.processInfo.arguments,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+  ) throws -> CatalogBroker.Configuration? {
+    guard try CatalogBrokerChildMode.parse(arguments: arguments) != nil else { return nil }
+    guard let runtimeBuild = environment["FUSEKIT_BUILD_ID"], !runtimeBuild.isEmpty else {
+      throw CCPoolFileProviderConfigurationError.missingRuntimeBuild
+    }
+    return .init(
       appGroupEndpoint: appGroupEndpoint,
       daemonSocketPath: holderSocketPath,
-      extensionTeamIdentifier: extensionTeamIdentifier,
-      extensionSigningIdentifier: extensionSigningIdentifier
+      expectedRuntimeBuild: runtimeBuild,
+      noProgressTimeout: brokerNoProgressTimeout
     )
   }
 
   static func makeRuntime(
     binding: CatalogFileProviderBinding
   ) throws -> CatalogFileProviderRuntime {
-    let transport = try SocketCatalogTransport(
-      appGroupEndpoint: appGroupEndpoint,
-      brokerTeamIdentifier: brokerTeamIdentifier,
-      brokerSigningIdentifier: brokerSigningIdentifier,
-      brokerRequiredEntitlements: [:]
-    )
+    let transport = try SocketCatalogTransport(appGroupEndpoint: appGroupEndpoint)
     return CatalogFileProviderRuntime(
       binding: binding,
       client: CatalogClient(transport: transport)
     )
   }
+}
+
+enum CCPoolFileProviderConfigurationError: Error, Equatable {
+  case brokerChildNotRecognized
+  case missingRuntimeBuild
 }

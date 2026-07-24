@@ -7,9 +7,10 @@ if childStatus >= 0 {
 }
 
 do {
-    if try await CatalogBroker.runChildIfRequested(
-        configuration: CCPoolFileProviderConfiguration.brokerConfiguration
-    ) {
+    if let configuration = try CCPoolFileProviderConfiguration.brokerConfigurationIfRequested() {
+        guard try await CatalogBroker.runChildIfRequested(configuration: configuration) else {
+            throw CCPoolFileProviderConfigurationError.brokerChildNotRecognized
+        }
         exit(0)
     }
 } catch {

@@ -627,7 +627,7 @@ func useTestHolderApplication(t *testing.T) holder.SignedApplication {
 	if err := os.MkdirAll(applications, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	appPath := filepath.Join(applications, ".cc-pool-holder-"+filepath.Base(t.TempDir())+".app")
+	appPath := filepath.Join(applications, "CCPoolStatus-Test-"+filepath.Base(t.TempDir())+".app")
 	application := holderbridge.Application(appPath)
 	executable := filepath.Join(appPath, "Contents", "MacOS", application.Runtime.ExecutableName)
 	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
