@@ -30,7 +30,7 @@ func TestReleasePreservesGatekeeperAndPinsAppResourceDigestIntoFormula(t *testin
 	release := readReleaseContract(t, ".github", "workflows", "release.yml")
 	for _, required := range []string{
 		"Require CLI signing and notarization secrets",
-		"needs: [verify-tag-on-main, release-app, version]",
+		"needs: [verify-tag-on-main, release-app, suite-pins, version]",
 		"internal/version.StatusAppVersion=${{ needs.version.outputs.marketing }}",
 		"__SHA_APP__=${{ needs.release-app.outputs.sha256 }}",
 		"bash \"$GITHUB_WORKSPACE/scripts/assert-signed-topology.sh\"",
@@ -95,7 +95,9 @@ func TestMacOSBootstrapDelegatesExactPackageDeliveryWithoutImplicitServiceMutati
 	for _, required := range []string{
 		`VERSION="${1:-latest}"`,
 		`brew install yasyf/tap/cc-pool`,
-		`ccp package install`,
+		`formula_prefix="$(brew --prefix yasyf/tap/cc-pool)"`,
+		`ccp="$formula_prefix/bin/ccp"`,
+		`"$ccp" package install`,
 		`installed via Homebrew`,
 	} {
 		if !strings.Contains(installer, required) {
