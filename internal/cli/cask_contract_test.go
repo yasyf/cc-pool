@@ -90,24 +90,24 @@ func TestReleasePublishesOnlyFormulaAfterVerifiedApplication(t *testing.T) {
 	}
 }
 
-func TestDirectInstallerPublishesExactPackageWithoutImplicitServiceMutation(t *testing.T) {
+func TestMacOSBootstrapDelegatesExactPackageDeliveryWithoutImplicitServiceMutation(t *testing.T) {
 	installer := readReleaseContract(t, "scripts", "install.sh")
 	for _, required := range []string{
-		`CLI_ASSET="cc-pool-${VERSION}-darwin-universal.tar.gz"`,
-		`APP_ASSET="cc-pool-status-${VERSION}-darwin.zip"`,
-		`curl -fsSL --retry 2 -o "$app_sidecar" "$BASE_URL/$APP_ASSET.sha256"`,
-		`/usr/bin/codesign --verify --strict --all-architectures`,
-		`! "$DEST" package install`,
-		`Dispatch may have committed before its response was lost`,
-		`restore_delivery_before_dispatch`,
+		`VERSION="${1:-latest}"`,
+		`brew install yasyf/tap/cc-pool`,
+		`ccp package install`,
+		`installed via Homebrew`,
 	} {
 		if !strings.Contains(installer, required) {
-			t.Fatalf("direct installer is missing %q", required)
+			t.Fatalf("macOS bootstrap is missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"service install", "service uninstall", "/Applications/CCPoolStatus.app"} {
+	for _, forbidden := range []string{
+		"service install", "service uninstall", "/Applications/CCPoolStatus.app",
+		"CC_POOL_BIN_DIR", "SHA256SUMS", "codesign", "ditto", ".local/libexec", "curl -fsSL --retry",
+	} {
 		if strings.Contains(installer, forbidden) {
-			t.Fatalf("direct installer retains forbidden implicit operation %q", forbidden)
+			t.Fatalf("macOS bootstrap retains forbidden delivery operation %q", forbidden)
 		}
 	}
 	ci := readReleaseContract(t, ".github", "workflows", "ci.yml")

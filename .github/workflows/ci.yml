@@ -26,7 +26,7 @@ jobs:
       - name: Verify formula service ownership
         run: .github/scripts/assert-formula-service.sh
 
-      - name: Test direct package installer
+      - name: Test Homebrew package bootstrap
         run: scripts/install_test.sh
 
       - name: go vet
