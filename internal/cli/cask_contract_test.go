@@ -44,12 +44,25 @@ func TestReleasePreservesGatekeeperAndPinsAppResourceDigestIntoFormula(t *testin
 	formula := readReleaseContract(t, ".github", "formula", "cc-pool.rb.tmpl")
 	dependency := strings.Index(formula, "depends_on :macos")
 	resource := strings.Index(formula, `resource "status_app" do`)
-	if dependency < 0 || resource < 0 || dependency >= resource {
+	install := strings.Index(formula, "\n  def install")
+	if dependency < 0 || resource < 0 || install <= resource || dependency >= resource {
 		t.Fatal("formula dependencies must precede resources")
+	}
+	resourceContract := formula[resource:install]
+	if strings.Contains(resourceContract, "#{version}") {
+		t.Fatal("formula resource contract uses the resource-local unset version")
+	}
+	rendered := strings.ReplaceAll(formula, "__VERSION__", "0.64.3")
+	renderedResource := strings.Index(rendered, `resource "status_app" do`)
+	renderedInstall := strings.Index(rendered, "\n  def install")
+	wantResourceURL := "https://github.com/yasyf/cc-pool/releases/download/v0.64.3/cc-pool-status-v0.64.3-darwin.zip"
+	if renderedResource < 0 || renderedInstall <= renderedResource ||
+		!strings.Contains(rendered[renderedResource:renderedInstall], wantResourceURL) {
+		t.Fatalf("rendered formula resource is missing exact URL %q", wantResourceURL)
 	}
 	for _, required := range []string{
 		`resource "status_app" do`,
-		"cc-pool-status-v#{version}-darwin.zip",
+		"releases/download/v__VERSION__/cc-pool-status-v__VERSION__-darwin.zip",
 		`sha256 "__SHA_APP__"`,
 		`libexec.install "CCPoolStatus.app"`,
 		`ccp package install`,
@@ -66,6 +79,9 @@ func TestReleasePreservesGatekeeperAndPinsAppResourceDigestIntoFormula(t *testin
 	}
 	if !strings.Contains(release, `assert-formula-service.sh" "$FORMULA"`) {
 		t.Fatal("release does not validate the exact rendered formula ordering contract")
+	}
+	if !strings.Contains(release, `"$FORMULA" "$version"`) {
+		t.Fatal("release does not validate the exact rendered resource version")
 	}
 }
 
