@@ -12,6 +12,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  suite-pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Reject Go and Swift dependency skew
+        run: .github/scripts/verify-suite-pins.sh
+
   verify-tag-on-main:
     runs-on: ubuntu-latest
     steps:
@@ -34,7 +41,7 @@ jobs:
           echo "marketing=${v%%-*}" >> "$GITHUB_OUTPUT"
 
   release:
-    needs: [verify-tag-on-main, release-app, version]
+    needs: [verify-tag-on-main, release-app, suite-pins, version]
     runs-on: macos-15
     permissions:
       contents: write
@@ -236,7 +243,7 @@ jobs:
           make-latest: ${{ !contains(github.ref_name, '-') }}
 
   widget-test:
-    needs: verify-tag-on-main
+    needs: [suite-pins, verify-tag-on-main]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
