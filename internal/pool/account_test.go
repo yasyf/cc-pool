@@ -55,8 +55,8 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstPath := filepath.Join(home, "Library", "CloudStorage", "account-1")
-	first, err := manager.PrepareReservedAdd(t.Context(), firstReservation, firstPath)
+	firstPublicPath := filepath.Join(home, "Library", "CloudStorage", "account-1")
+	first, err := manager.PrepareReservedAdd(t.Context(), firstReservation, firstPublicPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first.Reservation.ID != 1 || first.ConfigDir != wantConfigDir ||
-		first.PublicPath != firstPath || first.KeychainService != wantService {
+		first.PublicPath != firstPublicPath || first.KeychainService != wantService {
 		t.Fatalf("first pending = %+v", first)
 	}
 	assertLinkTarget(t, first.ConfigDir, first.PublicPath)
@@ -103,7 +103,7 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reused, err := manager.PrepareReservedAdd(t.Context(), reusedReservation, firstPath)
+	reused, err := manager.PrepareReservedAdd(t.Context(), reusedReservation, firstPublicPath)
 	if err != nil || reused.Reservation.ID != 1 {
 		t.Fatalf("reused pending = %+v, %v", reused, err)
 	}
@@ -111,7 +111,7 @@ func TestPrepareAddUsesPlainPrivateBackingAndReservation(t *testing.T) {
 		reused.ConfigDir == first.ConfigDir || reused.KeychainService == first.KeychainService {
 		t.Fatalf("numeric ID reuse aliased immutable execution identity: first=%+v reused=%+v", first, reused)
 	}
-	assertLinkTarget(t, reused.ConfigDir, firstPath)
+	assertLinkTarget(t, reused.ConfigDir, firstPublicPath)
 }
 
 func TestRetainedAddKeepsExactReservationAndExecutionIdentity(t *testing.T) {
@@ -120,8 +120,8 @@ func TestRetainedAddKeepsExactReservationAndExecutionIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	configDir := filepath.Join(t.TempDir(), "CloudStorage", "account-1")
-	pending, err := manager.PrepareReservedAdd(t.Context(), pendingReservation, configDir)
+	publicPath := filepath.Join(mustHome(), "Library", "CloudStorage", "account-1")
+	pending, err := manager.PrepareReservedAdd(t.Context(), pendingReservation, publicPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +433,7 @@ func TestAccountIdentityAndWriteUseBackingOnly(t *testing.T) {
 
 func TestIdentityMissingIsExplicit(t *testing.T) {
 	manager := newAccountManager(t)
-	if _, err := manager.AccountIdentity(t.Context(), 1, testFileProviderConfigDir(1)); !errors.Is(err, ErrNoIdentity) {
+	if _, err := manager.AccountIdentity(t.Context(), 1, testAccountConfigDir(1)); !errors.Is(err, ErrNoIdentity) {
 		t.Fatalf("AccountIdentity error = %v", err)
 	}
 }
