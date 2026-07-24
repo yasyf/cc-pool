@@ -31,6 +31,7 @@ for required in \
   'name: Publish the verified release' \
   'publish-tap:' \
   'name: Download the final published release bytes' \
+  'name: Audit and install the exact rendered formula' \
   'name: Publish the CLI formula to the tap'; do
   grep -Fq "$required" "$workflow"
 done
@@ -38,14 +39,23 @@ done
 test "$(awk '/^  publish-tap:$/ { getline; print; exit }' "$workflow")" = \
   '    needs: [release, release-app]'
 test "$(grep -Fxc '          [ "$(jq -r '\''.draft'\'' <<< "$release")" = false ]' "$workflow")" = 1
+test "$(grep -Fxc "          ruby -c \"\$FORMULA\"" "$workflow")" = 1
+test "$(grep -Fxc '          audit_tap=cc-pool/release-audit' "$workflow")" = 1
+test "$(grep -Fxc "          brew audit --strict --formula \"\$audit_tap/cc-pool\"" "$workflow")" = 1
+test "$(grep -Fxc "          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula \"\$audit_tap/cc-pool\"" "$workflow")" = 1
+test "$(grep -Fxc "          brew test \"\$audit_tap/cc-pool\"" "$workflow")" = 1
 
 line() { grep -Fn "$1" "$workflow" | cut -d: -f1; }
 stage="$(line 'name: Stage and verify the complete draft release')"
 publish="$(line 'name: Publish the verified release')"
 tap_job="$(line 'publish-tap:')"
 download="$(line 'name: Download the final published release bytes')"
+render="$(line 'name: Render the formula into the atomic tap transaction')"
+audit="$(line 'name: Audit and install the exact rendered formula')"
 tap="$(line 'name: Publish the CLI formula to the tap')"
 test "$stage" -lt "$publish"
 test "$publish" -lt "$tap_job"
 test "$tap_job" -lt "$download"
-test "$download" -lt "$tap"
+test "$download" -lt "$render"
+test "$render" -lt "$audit"
+test "$audit" -lt "$tap"
