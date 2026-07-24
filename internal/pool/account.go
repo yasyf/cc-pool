@@ -56,6 +56,8 @@ type PendingAddRetirementProof struct {
 
 var abandonAddFailpoint func(string) error
 
+var finishAccountRemovalFailpoint func(string) error
+
 // DuplicateIdentity returns an existing account sharing want's subscription.
 func (m *Manager) DuplicateIdentity(ctx context.Context, want Identity) (*store.Account, error) {
 	accounts, err := m.Store.ListAccounts()
@@ -247,7 +249,7 @@ func (m *Manager) AbandonAdd(
 		ConfigDir:  pending.ConfigDir, KeychainService: pending.KeychainService,
 		KeychainAccount: creds.AccountLabel(),
 	}
-	settled, err := m.pendingCredentialRemovalSettled(account)
+	settled, err := m.credentialRemovalSettled(account)
 	if err != nil {
 		return fmt.Errorf("read pending credential retirement evidence: %w", err)
 	}
@@ -255,9 +257,9 @@ func (m *Manager) AbandonAdd(
 		if err := ValidateAccountCredentialBoundary(account, pending.PublicPath); err != nil {
 			return fmt.Errorf("validate retired pending credential boundary: %w", err)
 		}
-	}
-	if err := m.removeCredentialForAccountRemovalAt(ctx, account, pending.PublicPath); err != nil {
-		return fmt.Errorf("retire pending credential for %s: %w", pending.ConfigDir, err)
+		if err := m.removeCredentialForAccountRemovalAt(ctx, account, pending.PublicPath); err != nil {
+			return fmt.Errorf("retire pending credential for %s: %w", pending.ConfigDir, err)
+		}
 	}
 	if abandonAddFailpoint != nil {
 		if err := abandonAddFailpoint("after-credential"); err != nil {
@@ -285,7 +287,7 @@ func (m *Manager) AbandonAdd(
 	return m.Store.ReleaseAccountIndex(pending.Reservation)
 }
 
-func (m *Manager) pendingCredentialRemovalSettled(account store.Account) (bool, error) {
+func (m *Manager) credentialRemovalSettled(account store.Account) (bool, error) {
 	intent, err := store.CredentialRemovalIntentDigest(
 		account.ID, account.InstanceID, account.Generation, account.ConfigDir,
 		account.KeychainService, account.KeychainAccount,
@@ -293,7 +295,7 @@ func (m *Manager) pendingCredentialRemovalSettled(account store.Account) (bool, 
 	if err != nil {
 		return false, err
 	}
-	_, receipt, err := m.Store.CredentialOperationEvidence(store.CredentialOperationEvidenceQuery{
+	active, receipt, err := m.Store.CredentialOperationEvidence(store.CredentialOperationEvidenceQuery{
 		AccountID: account.ID, AccountInstanceID: account.InstanceID,
 		AccountGeneration: account.Generation, ConfigDir: account.ConfigDir,
 		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
@@ -303,7 +305,12 @@ func (m *Manager) pendingCredentialRemovalSettled(account store.Account) (bool, 
 		Kind: store.CredentialOperationRemove, Target: store.CredentialTargetKeychain,
 		IntentDigest: intent,
 	})
-	return receipt != nil, err
+	if err != nil || active != nil || receipt == nil {
+		return false, err
+	}
+	return receipt.TerminalStatus == store.CredentialTerminalSucceeded &&
+		receipt.Result == store.CredentialResultDone &&
+		!receipt.AcknowledgedAt.IsZero(), nil
 }
 
 // AbandonReservedAdd removes an exactly retired reservation whose preparation
@@ -390,7 +397,11 @@ func validatePendingAddRetirement(
 }
 
 // FinishAccountRemoval settles one exact deprovisioned account removal.
-func (m *Manager) FinishAccountRemoval(ctx context.Context, removal store.AccountRemoval) error {
+func (m *Manager) FinishAccountRemoval(
+	ctx context.Context,
+	removal store.AccountRemoval,
+	expectedPublicPath string,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -408,12 +419,39 @@ func (m *Manager) FinishAccountRemoval(ctx context.Context, removal store.Accoun
 		return store.ErrAccountGenerationChanged
 	}
 	if removal.DeleteCredential {
-		if err := m.removeCredentialForAccountRemoval(ctx, account); err != nil {
-			return fmt.Errorf("retire acct-%02d credential: %w", account.ID, err)
+		settled, err := m.credentialRemovalSettled(account)
+		if err != nil {
+			return fmt.Errorf("read acct-%02d credential retirement evidence: %w", account.ID, err)
+		}
+		if !settled {
+			if err := ValidateAccountCredentialBoundary(account, expectedPublicPath); err != nil {
+				return fmt.Errorf("validate acct-%02d credential boundary: %w", account.ID, err)
+			}
+			if err := m.removeCredentialForAccountRemovalAt(ctx, account, expectedPublicPath); err != nil {
+				return fmt.Errorf("retire acct-%02d credential: %w", account.ID, err)
+			}
+		}
+	}
+	if finishAccountRemovalFailpoint != nil {
+		if err := finishAccountRemovalFailpoint("after-credential"); err != nil {
+			return err
+		}
+	}
+	if err := RemoveAccountConfigDir(account.InstanceID, expectedPublicPath); err != nil {
+		return fmt.Errorf("retire acct-%02d execution link: %w", account.ID, err)
+	}
+	if finishAccountRemovalFailpoint != nil {
+		if err := finishAccountRemovalFailpoint("after-unlink"); err != nil {
+			return err
 		}
 	}
 	if err := m.removeAccountBacking(ctx, account.ID); err != nil {
 		return err
+	}
+	if finishAccountRemovalFailpoint != nil {
+		if err := finishAccountRemovalFailpoint("after-backing"); err != nil {
+			return err
+		}
 	}
 	if pending {
 		return m.Store.FinalizePendingAccountRemoval(removal)
