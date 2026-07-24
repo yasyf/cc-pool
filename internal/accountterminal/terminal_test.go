@@ -139,6 +139,46 @@ func assertTerminalStoreEmpty(t *testing.T, store *proc.FileStore) {
 	}
 }
 
+func TestManagerRequiresRecoveryAndPermanentlyClosesAdmission(t *testing.T) {
+	store := &proc.FileStore{Path: filepath.Join(t.TempDir(), "processes.db")}
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(1, &proc.Reaper{Store: store, Generation: generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := TerminalSpec{Path: "/usr/bin/true"}
+	if _, err := manager.Start(t.Context(), spec); err == nil || !strings.Contains(err.Error(), "recovery has not completed") {
+		t.Fatalf("Start before recovery = %v", err)
+	}
+	if err := manager.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Start(t.Context(), spec); err == nil || !strings.Contains(err.Error(), "manager is closed") {
+		t.Fatalf("Start after Close = %v", err)
+	}
+}
+
+func TestManagerCloseCancelsAndJoinsLiveTerminal(t *testing.T) {
+	manager, store := newTerminalTestManager(t)
+	terminal := startTerminalTest(t, manager, `trap '' HUP TERM; printf ready; while :; do sleep 1; done`, TerminalSize{})
+	attachment := attachTerminalTest(t, terminal, DetachOnDisconnect)
+	receiveUntil(t, attachment, "ready")
+	if err := manager.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := terminal.Wait(t.Context())
+	if err != nil || outcome.Kind != TerminalCanceled {
+		t.Fatalf("Wait after manager close = %+v, %v", outcome, err)
+	}
+	assertTerminalStoreEmpty(t, store)
+}
+
 func TestTerminalPTYResizeInputEOFAndTypedExit(t *testing.T) {
 	pool, store := newTerminalTestManager(t)
 	terminal := startTerminalTest(t, pool, `
