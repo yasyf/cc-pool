@@ -52,8 +52,6 @@ func (m *Manager) MutationOwner() (proc.Record, error) {
 type Credentials interface {
 	// Store returns a's Keychain credential store.
 	Store(a store.Account, src creds.Source) creds.Store
-	// Stores returns a's sole Keychain credential store.
-	Stores(a store.Account) []creds.Store
 	// Discover resolves the account (-a) label actually stored on a service's
 	// Keychain item, or creds.ErrNotFound: `claude /login` items carry whatever
 	// label claude derived then, which a later recompute may not match, so
@@ -73,10 +71,6 @@ func (c sysCredentials) Store(a store.Account, src creds.Source) creds.Store {
 	return creds.KeychainItem{
 		Service: a.KeychainService, Account: a.KeychainAccount, Runner: c.runner,
 	}
-}
-
-func (c sysCredentials) Stores(a store.Account) []creds.Store {
-	return []creds.Store{c.Store(a, creds.SourceKeychain)}
 }
 
 func (c sysCredentials) Discover(ctx context.Context, service string) (string, error) {

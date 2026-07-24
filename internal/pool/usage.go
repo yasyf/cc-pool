@@ -93,7 +93,20 @@ func (m *Manager) ReadCredential(
 	ctx context.Context,
 	a store.Account,
 ) (*creds.Credential, creds.Source, error) {
-	credential, err := m.Creds.Store(a, creds.SourceKeychain).Read(ctx)
+	return m.ReadCredentialAt(ctx, a, "")
+}
+
+// ReadCredentialAt reads after validating one explicit presentation path.
+func (m *Manager) ReadCredentialAt(
+	ctx context.Context,
+	a store.Account,
+	expectedPublicPath string,
+) (*creds.Credential, creds.Source, error) {
+	credentialStore, err := m.credentialStore(a, expectedPublicPath)
+	if err != nil {
+		return nil, creds.SourceKeychain, err
+	}
+	credential, err := credentialStore.Read(ctx)
 	return credential, creds.SourceKeychain, err
 }
 
@@ -112,7 +125,13 @@ func (m *Manager) writeObservedCredential(
 	if m.credentialCAS == nil {
 		return errors.New("credential CAS worker is unavailable")
 	}
-	s := m.Creds.Store(a, src)
+	if src != creds.SourceKeychain {
+		return errors.New("credential source is not canonical")
+	}
+	s, err := m.credentialStore(a, "")
+	if err != nil {
+		return err
+	}
 	cur, err := s.Read(ctx)
 	switch creds.ClassifyRead(err) {
 	case creds.ReadEmpty:

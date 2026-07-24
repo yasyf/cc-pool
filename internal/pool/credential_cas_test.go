@@ -214,11 +214,10 @@ func TestCredentialCASDeleteExactStateUnderOneLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response := runCredentialCASTestWorker(t, CredentialCASRequest{
-		AccountID: account.ID, ConfigDir: account.ConfigDir,
-		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
-		Expected: expected, Delete: true,
-	})
+	request := credentialCASTestBaseRequest(t, account)
+	request.Expected = expected
+	request.Delete = true
+	response := runCredentialCASTestWorker(t, request)
 	if response.ErrorCode != "" || !credentialStateEmpty(response.After) {
 		t.Fatalf("credential CAS delete = %+v", response)
 	}
@@ -228,19 +227,25 @@ func TestCredentialCASDeleteExactStateUnderOneLock(t *testing.T) {
 	assertCredentialCASLocksGone(t, account.ConfigDir)
 }
 
-func TestCredentialCASDeletesAtExactFileProviderPublicPath(t *testing.T) {
+func TestCredentialCASDeletesThroughStableInstanceExecutionPath(t *testing.T) {
 	account, _ := newCredentialCASFixture(t)
-	account.ConfigDir = filepath.Join(
-		os.Getenv("HOME"), "Library", "CloudStorage", "CCPool", "account-1",
-	)
-	account.KeychainService = creds.ServiceName(account.ConfigDir)
-	if err := os.MkdirAll(account.ConfigDir, 0o700); err != nil { //nolint:gosec // G703: the path is under the test HOME.
+	wantConfigDir, err := AccountConfigDir(account.InstanceID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	request := CredentialCASRequest{
-		AccountID: account.ID, ConfigDir: account.ConfigDir,
-		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
+	wantService, err := AccountKeychainService(account.InstanceID)
+	if err != nil {
+		t.Fatal(err)
 	}
+	publicPath, err := os.Readlink(account.ConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.ConfigDir != wantConfigDir || account.KeychainService != wantService ||
+		publicPath == account.ConfigDir {
+		t.Fatalf("credential CAS identity = %+v public=%q", account, publicPath)
+	}
+	request := credentialCASTestBaseRequest(t, account)
 	credentialStore := credentialCASStore(request, credentialCASDirectRunner{})
 	if err := credentialStore.Write(t.Context(), credentialCASCredential("old-public-path")); err != nil {
 		t.Fatal(err)
@@ -253,12 +258,15 @@ func TestCredentialCASDeletesAtExactFileProviderPublicPath(t *testing.T) {
 	request.Delete = true
 	response := runCredentialCASTestWorker(t, request)
 	if response.ErrorCode != "" || !credentialStateEmpty(response.After) {
-		t.Fatalf("File Provider credential CAS delete = %+v", response)
+		t.Fatalf("stable credential CAS delete = %+v", response)
 	}
 	if _, err := credentialStore.Read(t.Context()); creds.ClassifyRead(err) != creds.ReadEmpty {
-		t.Fatalf("File Provider credential remained: %v", err)
+		t.Fatalf("stable credential remained: %v", err)
 	}
 	assertCredentialCASLocksGone(t, account.ConfigDir)
+	if target, err := os.Readlink(account.ConfigDir); err != nil || target != publicPath {
+		t.Fatalf("credential CAS changed execution link: target=%q err=%v", target, err)
+	}
 }
 
 func TestCredentialCASWaitsForClaudeLockAndNeverClobbersRacingWriter(t *testing.T) {
@@ -433,12 +441,10 @@ func TestCredentialCASRefreshHoldsClaudeLocksThroughPostAndWrite(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	t.Setenv("CLAUDE_POOL_TOKEN_URL", server.URL)
-	request := CredentialCASRequest{
-		AccountID: account.ID, ConfigDir: account.ConfigDir,
-		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
-		Expected: expected, Refresh: true,
-		UserAgent: "credential-cas-test/1",
-	}
+	request := credentialCASTestBaseRequest(t, account)
+	request.Expected = expected
+	request.Refresh = true
+	request.UserAgent = "credential-cas-test/1"
 	response := runCredentialCASTestWorker(t, request)
 	if response.ErrorCode != "" || len(response.Credential) == 0 {
 		t.Fatalf("credential CAS refresh = %+v", response)
@@ -470,12 +476,11 @@ func TestCredentialCASRefreshPreservesTypedInvalidGrant(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	t.Setenv("CLAUDE_POOL_TOKEN_URL", server.URL)
-	response := runCredentialCASTestWorker(t, CredentialCASRequest{
-		AccountID: account.ID, ConfigDir: account.ConfigDir,
-		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
-		Expected: expected, Refresh: true,
-		UserAgent: "credential-cas-test/1",
-	})
+	request := credentialCASTestBaseRequest(t, account)
+	request.Expected = expected
+	request.Refresh = true
+	request.UserAgent = "credential-cas-test/1"
+	response := runCredentialCASTestWorker(t, request)
 	if response.ErrorCode != "refresh" || response.RefreshStatus != http.StatusBadRequest ||
 		!response.RefreshInvalidGrant || response.RefreshDigest == ([32]byte{}) {
 		t.Fatalf("typed invalid_grant response = %+v", response)
@@ -486,7 +491,13 @@ func TestCredentialCASRefreshPreservesTypedInvalidGrant(t *testing.T) {
 	}
 	assertCredentialCASLocksGone(t, account.ConfigDir)
 	manager := &Manager{taskRunner: credentialCASTestTaskRunner{}, workerExecutable: "test-worker"}
-	_, err = manager.runCredentialCAS(t.Context(), account, expected, credentialCASMutation{Refresh: true})
+	publicPath, err := os.Readlink(account.ConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.runCredentialCAS(t.Context(), account, expected, credentialCASMutation{
+		ExpectedPublicPath: publicPath, Refresh: true,
+	})
 	var refreshErr *oauth.RefreshError
 	if !errors.As(err, &refreshErr) || refreshErr.Status != http.StatusBadRequest ||
 		!refreshErr.ConfirmedInvalidGrant || refreshErr.ResponseDigest == ([32]byte{}) {
@@ -504,19 +515,31 @@ func newCredentialCASFixture(
 	itemPath := filepath.Join(t.TempDir(), "keychain-item")
 	t.Setenv("CCP_CAS_KEYCHAIN_ITEM", itemPath)
 	t.Setenv("CLAUDE_POOL_SECURITY_BIN", writeCredentialCASFakeSecurity(t, itemPath))
+	const instanceID = "0123456789abcdef0123456789abcdef"
+	publicPath := filepath.Join(home, "Library", "CloudStorage", "CCPool", "account-1")
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureAccountConfigDir(instanceID, publicPath); err != nil {
+		t.Fatal(err)
+	}
+	configDir, err := AccountConfigDir(instanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := AccountKeychainService(instanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	account := store.Account{
-		ID: 1, ConfigDir: testFileProviderConfigDir(1), KeychainService: creds.ServiceName(testFileProviderConfigDir(1)),
+		ID: 1, InstanceID: instanceID, Generation: 1,
+		ConfigDir: configDir, KeychainService: service,
 		KeychainAccount: "credential-cas-test",
 	}
-	for _, directory := range []string{account.ConfigDir, AccountBackingDir(account.ID)} {
-		if err := os.MkdirAll(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.MkdirAll(AccountBackingDir(account.ID), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	request := CredentialCASRequest{
-		AccountID: account.ID, ConfigDir: account.ConfigDir,
-		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
-	}
+	request := credentialCASTestBaseRequest(t, account)
 	return account, map[creds.Source]creds.Store{
 		creds.SourceKeychain: credentialCASStore(request, credentialCASDirectRunner{}),
 	}
@@ -535,10 +558,31 @@ func credentialCASTestRequest(
 		t.Fatal(err)
 	}
 	return CredentialCASRequest{
-		AccountID: account.ID, ConfigDir: account.ConfigDir,
-		KeychainService: account.KeychainService, KeychainAccount: account.KeychainAccount,
+		AccountID: account.ID, AccountInstanceID: account.InstanceID,
+		AccountGeneration: account.Generation, ConfigDir: account.ConfigDir,
+		ExpectedPublicPath: credentialCASTestPublicPath(t, account),
+		KeychainService:    account.KeychainService, KeychainAccount: account.KeychainAccount,
 		Expected: expected, Credential: payload,
 	}
+}
+
+func credentialCASTestBaseRequest(t *testing.T, account store.Account) CredentialCASRequest {
+	t.Helper()
+	return CredentialCASRequest{
+		AccountID: account.ID, AccountInstanceID: account.InstanceID,
+		AccountGeneration: account.Generation, ConfigDir: account.ConfigDir,
+		ExpectedPublicPath: credentialCASTestPublicPath(t, account),
+		KeychainService:    account.KeychainService, KeychainAccount: account.KeychainAccount,
+	}
+}
+
+func credentialCASTestPublicPath(t *testing.T, account store.Account) string {
+	t.Helper()
+	publicPath, err := os.Readlink(account.ConfigDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return publicPath
 }
 
 func runCredentialCASTestWorker(t *testing.T, request CredentialCASRequest) CredentialCASResponse {
