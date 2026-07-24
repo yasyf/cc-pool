@@ -3,7 +3,9 @@ package pool
 import (
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,15 +69,22 @@ func commitPoolTestAccountAtPresentation(
 	publicPath string,
 ) store.Account {
 	t.Helper()
-	configDir := requested.ConfigDir
-	if configDir == "" {
-		configDir = fmt.Sprintf("/tmp/cc-pool-test/acct-%02d", requested.ID)
-	} else if !filepath.IsAbs(configDir) {
-		configDir = filepath.Join("/tmp/cc-pool-test", configDir)
+	home, err := Home()
+	if err != nil {
+		t.Fatal(err)
 	}
-	keychainService := requested.KeychainService
-	if keychainService == "" {
-		keychainService = fmt.Sprintf("test-service-%d", requested.ID)
+	if !strings.HasPrefix(
+		filepath.Clean(home), filepath.Clean(os.TempDir())+string(os.PathSeparator),
+	) {
+		t.Setenv("HOME", t.TempDir())
+	}
+	configDir, err := AccountConfigDir(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keychainService, err := AccountKeychainService(reservation.InstanceID)
+	if err != nil {
+		t.Fatal(err)
 	}
 	keychainAccount := requested.KeychainAccount
 	if keychainAccount == "" {
@@ -113,7 +122,15 @@ func commitPoolTestAccountAtPresentation(
 		t.Fatalf("admit test account: begin = %+v", begin)
 	}
 	if publicPath == "" {
-		publicPath = configDir
+		publicPath = filepath.Join(
+			mustHome(), "Library", "CloudStorage", "CCPoolStatus-"+AccountDirName(reservation.ID),
+		)
+	}
+	if err := os.MkdirAll(publicPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureAccountConfigDir(reservation.InstanceID, publicPath); err != nil {
+		t.Fatal(err)
 	}
 	proof := poolTestPresentationProof(reservation, publicPath)
 	fence, err := st.BindAccountMutationPresentation(
@@ -183,11 +200,11 @@ func poolTestCredentialDigest(value string) store.CredentialDigest {
 
 func poolTestPresentationProof(
 	reservation store.PendingAccountReservation,
-	configDir string,
+	publicPath string,
 ) store.FileProviderPresentationIdentity {
 	return store.FileProviderPresentationIdentity{
 		TenantID:   "account-" + reservation.InstanceID,
 		DomainID:   "domain-" + reservation.InstanceID,
-		Generation: reservation.Generation, PublicPath: configDir,
+		Generation: reservation.Generation, PublicPath: publicPath,
 	}
 }
