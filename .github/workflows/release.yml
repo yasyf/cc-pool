@@ -391,5 +391,4 @@ jobs:
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging
-          delete-file: Casks/cc-pool-status.rb
           message: "cc-pool stack ${{ github.ref_name }}"

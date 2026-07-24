@@ -16,9 +16,9 @@ func newWidgetCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "widget",
 		Short: "Install the Notification Center status widget",
-		Long: `Reconciles the exact CCPoolStatus app from this cc-pool release,
-launches it so macOS discovers the widget, and prints how to enable it.
-Safe to re-run: an exact existing install is retained.`,
+		Long: `Requires the exact CCPoolStatus app from this cc-pool release to be installed
+with ` + "`ccp package install`" + `, reconciles its services, launches it so macOS discovers
+the widget, and prints how to enable it.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return runWidget(cmd) },
 	}

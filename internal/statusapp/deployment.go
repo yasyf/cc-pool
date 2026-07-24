@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 
 	"github.com/yasyf/cc-pool/internal/holderbridge"
 	"github.com/yasyf/cc-pool/internal/pool"
@@ -61,19 +60,32 @@ type runtimeProof struct {
 	digest            deployment.SHA256
 }
 
-type activationRequest struct {
-	expected      installedGeneration
-	consumerBuild string
-	policyDigest  deployment.SHA256
-	plan          service.Plan
-	readiness     func(context.Context, installedOperation) (runtimeReadiness, error)
-}
-
-type deactivationRequest struct {
-	expected       activationReceipt
+type candidateRequest struct {
+	target         deployment.CurrentInstalledSpec
+	sourcePath     string
+	candidate      installedGeneration
 	consumerBuild  string
 	policyDigest   deployment.SHA256
+	plan           deployment.CandidatePlan
+	readiness      func(context.Context, installedOperation) (runtimeReadiness, error)
 	runtimeQuiesce func(context.Context, deployment.RuntimeStopper, deactivationOperation) (runtimeProof, error)
+}
+
+type candidateReceipt struct {
+	id         string
+	activation activationReceipt
+}
+
+type uninstallRequest struct {
+	current        deployment.CurrentInstalledSpec
+	readiness      func(context.Context, installedOperation) (runtimeReadiness, error)
+	runtimeQuiesce func(context.Context, deployment.RuntimeStopper, deactivationOperation) (runtimeProof, error)
+}
+
+type uninstallReceipt struct {
+	id         string
+	generation installedGeneration
+	runtime    runtimeProof
 }
 
 type installedStatus struct {
@@ -85,9 +97,9 @@ type installedStatus struct {
 
 type deploymentController interface {
 	Attest(context.Context, deployment.InstalledSpec) (installedGeneration, error)
-	Activate(context.Context, activationRequest) (activationReceipt, error)
-	Deactivate(context.Context, deactivationRequest) (runtimeProof, error)
+	Apply(context.Context, candidateRequest) (candidateReceipt, error)
 	Status(context.Context, deployment.InstalledSpec) (installedStatus, error)
+	Uninstall(context.Context, uninstallRequest) (uninstallReceipt, error)
 }
 
 type daemonkitDeploymentController struct{ inner *deployment.Controller }
@@ -103,14 +115,35 @@ func (c daemonkitDeploymentController) Attest(
 	return observeInstalledGeneration(attestation), nil
 }
 
-func (c daemonkitDeploymentController) Activate(
+func (c daemonkitDeploymentController) Apply(
 	ctx context.Context,
-	request activationRequest,
-) (activationReceipt, error) {
-	receipt, err := c.inner.ActivateInstalled(ctx, deployment.ActivateInstalledConfig{
-		Expected: request.expected.raw, ConsumerBuild: request.consumerBuild,
-		PolicyDigest: request.policyDigest, Plan: request.plan,
-		Readiness: func(ctx context.Context, operation deployment.InstalledOperation) (deployment.ReadinessProof, error) {
+	request candidateRequest,
+) (candidateReceipt, error) {
+	receipt, err := c.inner.ApplyInstalledCandidate(ctx, deployment.ApplyInstalledCandidateConfig{
+		Target: request.target, CandidateSourcePath: request.sourcePath,
+		CandidateVersion: request.candidate.version, CandidateBundleDigest: request.candidate.bundleDigest,
+		ConsumerBuild: request.consumerBuild, PolicyDigest: request.policyDigest, Plan: request.plan,
+		RuntimeQuiesce: func(
+			ctx context.Context,
+			stopper deployment.RuntimeStopper,
+			operation deployment.DeactivateInstalledOperation,
+		) (deployment.RuntimeProof, error) {
+			activation, err := observeActivationReceipt(operation.Activation())
+			if err != nil {
+				return deployment.RuntimeProof{}, err
+			}
+			proof, err := request.runtimeQuiesce(ctx, stopper, deactivationOperation{
+				id: operation.OperationID(), activation: activation,
+			})
+			if err != nil {
+				return deployment.RuntimeProof{}, err
+			}
+			return deployment.NewRuntimeProof(proof.absent, proof.processGeneration, proof.digest)
+		},
+		Readiness: func(
+			ctx context.Context,
+			operation deployment.InstalledOperation,
+		) (deployment.ReadinessProof, error) {
 			proof, err := request.readiness(ctx, installedOperation{
 				id: operation.OperationID(), generation: observeInstalledGeneration(operation.Generation()),
 				plan: operation.Plan(),
@@ -122,38 +155,13 @@ func (c daemonkitDeploymentController) Activate(
 		},
 	})
 	if err != nil {
-		return activationReceipt{}, err
+		return candidateReceipt{}, err
 	}
-	return observeActivationReceipt(receipt)
-}
-
-func (c daemonkitDeploymentController) Deactivate(
-	ctx context.Context,
-	request deactivationRequest,
-) (runtimeProof, error) {
-	receipt, err := c.inner.DeactivateInstalled(ctx, deployment.DeactivateInstalledConfig{
-		Expected: request.expected.raw, ConsumerBuild: request.consumerBuild, PolicyDigest: request.policyDigest,
-		RuntimeQuiesce: func(
-			ctx context.Context,
-			stopper deployment.RuntimeStopper,
-			operation deployment.DeactivateInstalledOperation,
-		) (deployment.RuntimeProof, error) {
-			proof, err := request.runtimeQuiesce(ctx, stopper, deactivationOperation{
-				id: operation.OperationID(), activation: request.expected,
-			})
-			if err != nil {
-				return deployment.RuntimeProof{}, err
-			}
-			return deployment.NewRuntimeProof(proof.absent, proof.processGeneration, proof.digest)
-		},
-	})
+	activation, err := observeActivationReceipt(receipt.Activation())
 	if err != nil {
-		return runtimeProof{}, err
+		return candidateReceipt{}, err
 	}
-	proof := receipt.RuntimeProof()
-	return runtimeProof{
-		absent: proof.Absent(), processGeneration: proof.ProcessGeneration(), digest: proof.Digest(),
-	}, nil
+	return candidateReceipt{id: receipt.OperationID(), activation: activation}, nil
 }
 
 func (c daemonkitDeploymentController) Status(
@@ -175,6 +183,55 @@ func (c daemonkitDeploymentController) Status(
 		result.hasReceipt = true
 	}
 	return result, nil
+}
+
+func (c daemonkitDeploymentController) Uninstall(
+	ctx context.Context,
+	request uninstallRequest,
+) (uninstallReceipt, error) {
+	receipt, err := c.inner.UninstallCurrentInstalled(ctx, deployment.UninstallCurrentInstalledConfig{
+		Current: request.current,
+		RuntimeQuiesce: func(
+			ctx context.Context,
+			stopper deployment.RuntimeStopper,
+			operation deployment.DeactivateInstalledOperation,
+		) (deployment.RuntimeProof, error) {
+			activation, err := observeActivationReceipt(operation.Activation())
+			if err != nil {
+				return deployment.RuntimeProof{}, err
+			}
+			proof, err := request.runtimeQuiesce(ctx, stopper, deactivationOperation{
+				id: operation.OperationID(), activation: activation,
+			})
+			if err != nil {
+				return deployment.RuntimeProof{}, err
+			}
+			return deployment.NewRuntimeProof(proof.absent, proof.processGeneration, proof.digest)
+		},
+		Readiness: func(
+			ctx context.Context,
+			operation deployment.InstalledOperation,
+		) (deployment.ReadinessProof, error) {
+			proof, err := request.readiness(ctx, installedOperation{
+				id: operation.OperationID(), generation: observeInstalledGeneration(operation.Generation()),
+				plan: operation.Plan(),
+			})
+			if err != nil {
+				return deployment.ReadinessProof{}, err
+			}
+			return deployment.NewReadinessProof(proof.runtimeBuild, proof.processGeneration, proof.digest)
+		},
+	})
+	if err != nil {
+		return uninstallReceipt{}, err
+	}
+	proof := receipt.RuntimeProof()
+	return uninstallReceipt{
+		id: receipt.OperationID(), generation: observeInstalledGeneration(receipt.Generation()),
+		runtime: runtimeProof{
+			absent: proof.Absent(), processGeneration: proof.ProcessGeneration(), digest: proof.Digest(),
+		},
+	}, nil
 }
 
 func observeInstalledGeneration(attestation deployment.InstalledAttestation) installedGeneration {
@@ -208,6 +265,7 @@ func observeActivationReceipt(receipt deployment.ActivationReceipt) (activationR
 var (
 	newDeployer      = func() deploymentController { return daemonkitDeploymentController{inner: deployment.New()} }
 	makeProductHooks = newProductHooks
+	installedAppPath = pool.WidgetAppPath
 )
 
 // ServiceDeploymentState is the exact durable holder activation state.
@@ -239,22 +297,18 @@ type ServiceDeployment struct {
 	Holder      ServiceGeneration
 }
 
-// ServiceInstallReceipt binds one activation attempt to its exact prior and active states.
+// ServiceInstallReceipt binds one terminal daemonkit candidate apply to its active generation.
 type ServiceInstallReceipt struct {
-	Prior          ServiceDeployment
-	Current        ServiceDeployment
-	Changed        bool
-	NewlyActivated bool
-	activation     activationReceipt
+	OperationID string
+	Activation  ServiceDeployment
 }
 
-// Rollback deactivates only the exact activation created by this attempt.
-func (r ServiceInstallReceipt) Rollback(ctx context.Context) error {
-	return rollbackService(ctx, newDeployer(), r)
-}
+// Rollback is idempotent because daemonkit completes rollback before ApplyPackagedApp returns.
+func (ServiceInstallReceipt) Rollback(context.Context) error { return nil }
 
 type serviceDeploymentSpec struct {
 	installed     deployment.InstalledSpec
+	current       deployment.CurrentInstalledSpec
 	consumerBuild string
 	policyDigest  deployment.SHA256
 	hooks         productHooks
@@ -273,72 +327,132 @@ func makeServiceDeploymentSpec() (serviceDeploymentSpec, error) {
 	if err != nil {
 		return serviceDeploymentSpec{}, err
 	}
+	identity := statusAppCodeIdentity()
+	appPath := installedAppPath()
 	return serviceDeploymentSpec{
 		installed: deployment.InstalledSpec{
-			AppPath: pool.WidgetAppPath(), Version: appVersion, Identity: statusAppCodeIdentity(),
+			AppPath: appPath, Version: appVersion, Identity: identity,
 		},
+		current:       deployment.CurrentInstalledSpec{AppPath: appPath, Identity: identity},
 		consumerBuild: consumerBuild, policyDigest: policyDigest,
 		hooks: makeProductHooks(version.String(), policyDigest),
 	}, nil
 }
 
-// InstallService activates the already-packaged exact signed status application.
-func InstallService(ctx context.Context) (ServiceInstallReceipt, error) {
-	return installService(ctx, newDeployer())
+// ApplyPackagedApp installs or upgrades one exact packaged signed application candidate.
+func ApplyPackagedApp(ctx context.Context, candidateSourcePath string) (ServiceInstallReceipt, error) {
+	return applyPackagedApp(ctx, candidateSourcePath, newDeployer())
 }
 
-// DeactivateService durably retires the exact active status app runtime and service plan.
-func DeactivateService(ctx context.Context) error {
-	return deactivateService(ctx, newDeployer())
+// RequireActiveService proves the exact installed application and live FuseKit runtime are ready.
+func RequireActiveService(ctx context.Context) error {
+	return requireActiveService(ctx, newDeployer())
 }
 
-func installService(ctx context.Context, controller deploymentController) (ServiceInstallReceipt, error) {
+// UninstallPackagedApp quiesces and removes the exact controller-sealed installed application.
+func UninstallPackagedApp(ctx context.Context) error {
+	return uninstallPackagedApp(ctx, newDeployer())
+}
+
+func applyPackagedApp(
+	ctx context.Context,
+	candidateSourcePath string,
+	controller deploymentController,
+) (ServiceInstallReceipt, error) {
 	spec, err := makeServiceDeploymentSpec()
 	if err != nil {
 		return ServiceInstallReceipt{}, err
 	}
-	expected, err := controller.Attest(ctx, spec.installed)
+	candidateSpec := spec.installed
+	candidateSpec.AppPath = candidateSourcePath
+	candidate, err := controller.Attest(ctx, candidateSpec)
 	if err != nil {
-		return ServiceInstallReceipt{}, fmt.Errorf("CCPoolStatus: attest packaged signed app: %w", err)
+		return ServiceInstallReceipt{}, fmt.Errorf("CCPoolStatus: attest packaged candidate: %w", err)
 	}
-	priorStatus, err := controller.Status(ctx, spec.installed)
+	installedCandidate := candidate
+	installedCandidate.path = spec.current.AppPath
+	candidatePlan, err := spec.hooks.candidatePlanForBuild(
+		installedCandidate, spec.hooks.buildID, candidateSourcePath,
+	)
 	if err != nil {
-		return ServiceInstallReceipt{}, fmt.Errorf("CCPoolStatus: observe prior activation: %w", err)
+		return ServiceInstallReceipt{}, fmt.Errorf("CCPoolStatus: bind packaged candidate plan: %w", err)
 	}
-	prior := publicServiceDeployment(priorStatus)
-	plan, err := spec.hooks.servicePlanForBuild(expected, spec.hooks.buildID)
+	receipt, err := controller.Apply(ctx, candidateRequest{
+		target: spec.current, sourcePath: candidateSourcePath, candidate: candidate,
+		consumerBuild: spec.consumerBuild, policyDigest: spec.policyDigest, plan: candidatePlan,
+		readiness: spec.hooks.readiness, runtimeQuiesce: spec.hooks.runtimeQuiesce,
+	})
+	if err != nil {
+		return ServiceInstallReceipt{}, fmt.Errorf("CCPoolStatus: apply packaged candidate: %w", err)
+	}
+	installedPlan, err := spec.hooks.servicePlanForBuild(receipt.activation.generation, spec.hooks.buildID)
 	if err != nil {
 		return ServiceInstallReceipt{}, err
 	}
-	request := activationRequest{
-		expected: expected, consumerBuild: spec.consumerBuild, policyDigest: spec.policyDigest,
-		plan: plan, readiness: spec.hooks.readiness,
-	}
-	receipt, activateErr := controller.Activate(ctx, request)
-	if activateErr != nil {
-		observed, observeErr := controller.Status(ctx, spec.installed)
-		if observeErr != nil || observed.state != deployment.InstalledActive || !observed.hasReceipt {
-			return ServiceInstallReceipt{}, fmt.Errorf(
-				"CCPoolStatus: activate signed app: %w", errors.Join(activateErr, observeErr),
-			)
-		}
-		receipt = observed.activation
-	}
-	if err := validateActiveDeployment(expected, plan, receipt); err != nil {
+	if err := validateActiveDeployment(
+		candidate, spec.current.AppPath, spec.hooks.buildID, installedPlan, receipt.activation,
+	); err != nil {
 		return ServiceInstallReceipt{}, err
 	}
-	current := publicActivation(receipt)
+	if receipt.id == "" {
+		return ServiceInstallReceipt{}, errors.New("CCPoolStatus: candidate apply did not return a terminal operation")
+	}
 	return ServiceInstallReceipt{
-		Prior: prior, Current: current, Changed: !reflect.DeepEqual(prior, current),
-		NewlyActivated: prior.State != ServiceDeploymentActive, activation: receipt,
+		OperationID: receipt.id, Activation: publicActivation(receipt.activation),
 	}, nil
 }
 
-func publicServiceDeployment(status installedStatus) ServiceDeployment {
-	if status.state == deployment.InstalledActive && status.hasReceipt {
-		return publicActivation(status.activation)
+func requireActiveService(ctx context.Context, controller deploymentController) error {
+	spec, err := makeServiceDeploymentSpec()
+	if err != nil {
+		return err
 	}
-	return ServiceDeployment{State: ServiceDeploymentInactive, Holder: publicGeneration(status.generation)}
+	status, err := controller.Status(ctx, spec.installed)
+	if err != nil {
+		return fmt.Errorf("CCPoolStatus: observe installed service: %w", err)
+	}
+	if status.state != deployment.InstalledActive || !status.hasReceipt {
+		return errors.New("CCPoolStatus: packaged application service is not active")
+	}
+	plan, err := spec.hooks.servicePlanForBuild(status.generation, spec.hooks.buildID)
+	if err != nil {
+		return err
+	}
+	if err := validateActiveDeployment(
+		status.generation, spec.current.AppPath, spec.hooks.buildID, plan, status.activation,
+	); err != nil {
+		return err
+	}
+	fresh, err := spec.hooks.readiness(ctx, installedOperation{
+		id: status.activation.id, generation: status.generation, plan: status.activation.plan,
+	})
+	if err != nil {
+		return fmt.Errorf("CCPoolStatus: prove active service readiness: %w", err)
+	}
+	if fresh.runtimeBuild != spec.hooks.buildID || fresh.processGeneration == (proc.OwnerGeneration{}) ||
+		fresh.digest == (deployment.SHA256{}) {
+		return errors.New("CCPoolStatus: active service readiness proof is incomplete")
+	}
+	return nil
+}
+
+func uninstallPackagedApp(ctx context.Context, controller deploymentController) error {
+	spec, err := makeServiceDeploymentSpec()
+	if err != nil {
+		return err
+	}
+	receipt, err := controller.Uninstall(ctx, uninstallRequest{
+		current: spec.current, readiness: spec.hooks.readiness,
+		runtimeQuiesce: spec.hooks.runtimeQuiesce,
+	})
+	if err != nil {
+		return fmt.Errorf("CCPoolStatus: uninstall packaged application: %w", err)
+	}
+	if receipt.id == "" || receipt.generation.path != spec.current.AppPath ||
+		!receipt.runtime.absent || receipt.runtime.digest == (deployment.SHA256{}) {
+		return errors.New("CCPoolStatus: uninstall did not prove exact application removal")
+	}
+	return nil
 }
 
 func publicActivation(receipt activationReceipt) ServiceDeployment {
@@ -362,12 +476,14 @@ func publicGeneration(generation installedGeneration) ServiceGeneration {
 }
 
 func validateActiveDeployment(
-	expected installedGeneration,
+	candidate installedGeneration,
+	targetPath, runtimeBuild string,
 	plan service.Plan,
 	receipt activationReceipt,
 ) error {
-	if !receipt.active || receipt.id == "" || !sameGeneration(receipt.generation, expected) ||
-		receipt.plan.Digest() != plan.Digest() || receipt.readiness.runtimeBuild == "" ||
+	if !receipt.active || receipt.id == "" || receipt.generation.path != targetPath ||
+		!sameApplicationBytes(receipt.generation, candidate) || receipt.plan.Digest() != plan.Digest() ||
+		receipt.readiness.runtimeBuild != runtimeBuild ||
 		receipt.readiness.processGeneration == (proc.OwnerGeneration{}) ||
 		receipt.readiness.digest == (deployment.SHA256{}) {
 		return errors.New("CCPoolStatus: activation receipt does not prove the exact packaged runtime")
@@ -375,70 +491,10 @@ func validateActiveDeployment(
 	return nil
 }
 
-func sameGeneration(left, right installedGeneration) bool {
+func sameApplicationBytes(left, right installedGeneration) bool {
 	left.raw, right.raw = deployment.InstalledAttestation{}, deployment.InstalledAttestation{}
+	left.path, right.path = "", ""
+	left.device, right.device = "", ""
+	left.inode, right.inode = "", ""
 	return left == right
-}
-
-func rollbackService(
-	ctx context.Context,
-	controller deploymentController,
-	receipt ServiceInstallReceipt,
-) error {
-	if !receipt.Changed || !receipt.NewlyActivated || receipt.activation.id == "" {
-		return nil
-	}
-	spec, err := makeServiceDeploymentSpec()
-	if err != nil {
-		return err
-	}
-	status, err := controller.Status(ctx, spec.installed)
-	if err != nil {
-		return err
-	}
-	if status.state == deployment.InstalledVerifiedUnactivated {
-		return nil
-	}
-	if status.state != deployment.InstalledActive || !status.hasReceipt ||
-		status.activation.id != receipt.activation.id {
-		return errors.New("CCPoolStatus: rollback activation ownership changed")
-	}
-	return deactivateExact(ctx, controller, spec, receipt.activation)
-}
-
-func deactivateService(ctx context.Context, controller deploymentController) error {
-	spec, err := makeServiceDeploymentSpec()
-	if err != nil {
-		return err
-	}
-	status, err := controller.Status(ctx, spec.installed)
-	if err != nil {
-		return err
-	}
-	if status.state == deployment.InstalledVerifiedUnactivated {
-		return nil
-	}
-	if status.state != deployment.InstalledActive || !status.hasReceipt {
-		return errors.New("CCPoolStatus: packaged app activation is incomplete")
-	}
-	return deactivateExact(ctx, controller, spec, status.activation)
-}
-
-func deactivateExact(
-	ctx context.Context,
-	controller deploymentController,
-	spec serviceDeploymentSpec,
-	receipt activationReceipt,
-) error {
-	proof, err := controller.Deactivate(ctx, deactivationRequest{
-		expected: receipt, consumerBuild: spec.consumerBuild, policyDigest: spec.policyDigest,
-		runtimeQuiesce: spec.hooks.runtimeQuiesce,
-	})
-	if err != nil {
-		return err
-	}
-	if !proof.absent || proof.digest == (deployment.SHA256{}) {
-		return errors.New("CCPoolStatus: deactivation did not prove runtime absence")
-	}
-	return nil
 }

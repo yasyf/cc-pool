@@ -10,17 +10,24 @@
 
 ```sh
 brew install yasyf/tap/cc-pool
+ccp package install
 ccp
 ```
 
 <img src="docs/assets/demo.png" alt="Terminal running 'ccp --help' — the command list from add to widget, plus the guarantee that plain claude is never part of the pool" width="700">
 
-macOS only; the binary installs as `cc-pool` with a `ccp` symlink. On an empty pool, `ccp` walks you through logging in each subscription, one `claude /login` per account, then offers to wrap `claude` so every session lands on the account with the most headroom.
+macOS only; the formula installs the binary, its `ccp` symlink, and the exact
+signed application resource under its Cellar prefix. `ccp package install`
+delegates attestation and atomic publication of that resource to daemonkit at
+`~/Applications/CCPoolStatus.app` before activating it. On an empty pool, `ccp`
+walks you through logging in each subscription, one `claude /login` per account,
+then offers to wrap `claude` so every session lands on the account with the most
+headroom.
 
 Driving with an agent? Paste this:
 
 ```text
-Install cc-pool with `brew install yasyf/tap/cc-pool`, then run `ccp` and walk me through pooling my Claude subscriptions.
+Install cc-pool with `brew install yasyf/tap/cc-pool`, run `ccp package install`, then run `ccp` and walk me through pooling my Claude subscriptions.
 Add each account via its own `claude /login` flow and accept the alias so `claude` becomes `ccp run`.
 Finish by running `ccp status --plain` and tell me which account my next session will land on and why.
 ```
@@ -92,8 +99,9 @@ Headroom you check only at launch time is headroom you discover too late. Put it
 ccp widget
 ```
 
-The CLI reconciles the exact signed app from the same cc-pool release into
-`~/Applications/CCPoolStatus.app`. It shows per-account 5h/7d usage bars,
+Install the exact signed app from the same cc-pool release with `ccp package
+install`, then run `ccp widget`. The app at `~/Applications/CCPoolStatus.app`
+shows per-account 5h/7d usage bars,
 live-session counts, and a pool mascot whose mood tracks how fast the pool is
 draining. Details in [widget/README.md](widget/README.md).
 
@@ -110,7 +118,8 @@ draining. Details in [widget/README.md](widget/README.md).
 | `ccp select` | Choose the best account without preparing or materializing it; prints `acct-NN prepared=false`; launch only with `ccp run` |
 | `ccp sync` | Mirror the pool — accounts, credentials, removals — across Macs on a synckit mesh |
 | `ccp doctor` | Check accounts' Keychain items and File Provider presentations; `--fix` repairs drift |
-| `ccp service` | Manage the daemon and signed `CCPoolStatus.app` via `install`, `uninstall`, and `status` |
+| `ccp package` | Explicitly install/activate or deactivate/remove the delivered signed `CCPoolStatus.app` |
+| `ccp service` | Manage the background account daemon via `install`, `uninstall`, and `status` |
 
 Run `ccp help <command>` for every flag and the rest of the surface, which covers `env`, `list`, `login`, `rename`, `remove`, `init`, `cred`, `widget`, and `daemon`.
 
@@ -124,6 +133,7 @@ Run `ccp help <command>` for every flag and the rest of the surface, which cover
 ccp service uninstall            # stop the daemon + CCPoolStatus app services
                                  # (refuses under live sessions; --force overrides)
 ccp service uninstall --purge    # ...and remove all pool accounts/dirs/state
+ccp package uninstall            # deactivate and remove CCPoolStatus.app
 brew uninstall cc-pool
 ```
 

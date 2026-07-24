@@ -12,3 +12,13 @@ grep -Fq 'ccp service install' "$formula" || {
   echo "$formula must direct users to the daemonkit-owned service installer" >&2
   exit 1
 }
+
+grep -Fq 'ccp package install' "$formula" || {
+  echo "$formula must direct users to the explicit signed-application installer" >&2
+  exit 1
+}
+
+if grep -Eq '^[[:space:]]*head do|install_from_source' "$formula"; then
+  echo "$formula must not offer an unsigned source-only installation" >&2
+  exit 1
+fi

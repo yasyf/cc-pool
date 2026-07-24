@@ -181,7 +181,6 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 		"spctl --assess --type execute --verbose=4 app/CCPoolStatus.app",
 		"Publish the CLI formula to the tap",
 		"homebrew-tap/.github/actions/publish@" + releasePublishCommit,
-		"delete-file: Casks/cc-pool-status.rb",
 	} {
 		if !strings.Contains(publish, required) {
 			t.Fatalf("tap transaction is missing exact released-byte gate %q", required)
@@ -226,10 +225,9 @@ func TestReleaseTapUsesExactVerifiedPublishedBytes(t *testing.T) {
 
 func TestReleaseDoesNotPublishStandaloneStatusCask(t *testing.T) {
 	release := readReleaseArtifactContract(t, ".github", "workflows", "release.yml")
-	if got := strings.Count(release, "delete-file: Casks/cc-pool-status.rb"); got != 1 {
-		t.Fatalf("retired status cask deletions = %d, want exactly one", got)
-	}
-	for _, forbidden := range []string{"Render the cask", ".github/cask/cc-pool-status"} {
+	for _, forbidden := range []string{
+		"Render the cask", ".github/cask/cc-pool-status", "delete-file: Casks/cc-pool-status.rb",
+	} {
 		if strings.Contains(release, forbidden) {
 			t.Fatalf("release retains standalone status cask contract %q", forbidden)
 		}

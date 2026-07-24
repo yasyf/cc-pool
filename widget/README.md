@@ -28,12 +28,14 @@ exception.
 ## Install
 
 ```sh
+ccp package install
 ccp widget
 ```
 
-That reconciles the exact app from the same cc-pool release into
-`~/Applications/CCPoolStatus.app` (the release build is Developer ID signed,
-notarized, and stapled), launches it once so macOS discovers the widget, and
+The explicit package command delegates the exact app from the same cc-pool release to
+daemonkit's sealed install transaction at `~/Applications/CCPoolStatus.app` (the release
+build is Developer ID signed, notarized, and stapled). The widget command then
+reconciles its services, launches it once so macOS discovers the widget, and
 prints the enable steps:
 
 Open Notification Center (click the menu-bar clock), scroll down →

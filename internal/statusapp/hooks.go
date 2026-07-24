@@ -27,14 +27,15 @@ import (
 const readinessPoll = holderbridge.DeploymentPollInterval
 
 type productHooks struct {
-	buildID      string
-	policyDigest deployment.SHA256
-	servicePlan  func(installedGeneration, string) (service.Plan, error)
-	target       func(installedGeneration, string) (runtimeTarget, error)
-	observe      func(context.Context, string) (mountproto.RuntimeHealthResponse, error)
-	identities   func(string) ([]proc.Identity, error)
-	proveApp     func(context.Context, string) error
-	stopRuntime  func(context.Context, deployment.RuntimeStopper, service.StopRuntimeRequest) (runtimeStopProof, error)
+	buildID       string
+	policyDigest  deployment.SHA256
+	servicePlan   func(installedGeneration, string) (service.Plan, error)
+	candidatePlan func(installedGeneration, string, string) (deployment.CandidatePlan, error)
+	target        func(installedGeneration, string) (runtimeTarget, error)
+	observe       func(context.Context, string) (mountproto.RuntimeHealthResponse, error)
+	identities    func(string) ([]proc.Identity, error)
+	proveApp      func(context.Context, string) error
+	stopRuntime   func(context.Context, deployment.RuntimeStopper, service.StopRuntimeRequest) (runtimeStopProof, error)
 }
 
 func newProductHooks(buildID string, policyDigest deployment.SHA256) productHooks {
@@ -61,6 +62,7 @@ func newProductHooks(buildID string, policyDigest deployment.SHA256) productHook
 		},
 	}
 	hooks.servicePlan = hooks.defaultServicePlanForBuild
+	hooks.candidatePlan = hooks.defaultCandidatePlanForBuild
 	hooks.target = hooks.defaultRuntimeTargetForBuild
 	return hooks
 }
@@ -210,6 +212,24 @@ func (h productHooks) defaultServicePlanForBuild(generation installedGeneration,
 		return service.Plan{}, err
 	}
 	return service.NewPlan([]service.Agent{plan.Agent()})
+}
+
+func (h productHooks) candidatePlanForBuild(
+	generation installedGeneration,
+	buildID, sourceAppPath string,
+) (deployment.CandidatePlan, error) {
+	return h.candidatePlan(generation, buildID, sourceAppPath)
+}
+
+func (h productHooks) defaultCandidatePlanForBuild(
+	generation installedGeneration,
+	buildID, sourceAppPath string,
+) (deployment.CandidatePlan, error) {
+	plan, err := holderbridge.NewDeploymentPlan(generation.path, pool.FuseKitRuntimeDir(), buildID)
+	if err != nil {
+		return deployment.CandidatePlan{}, err
+	}
+	return plan.CandidatePlan(sourceAppPath)
 }
 
 func (h productHooks) runtimeTargetForBuild(generation installedGeneration, buildID string) (runtimeTarget, error) {

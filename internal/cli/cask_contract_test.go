@@ -60,10 +60,9 @@ func TestReleasePublishesOnlyFormulaAfterVerifiedApplication(t *testing.T) {
 	if publishJob < 0 || formula < publishJob || publish < formula {
 		t.Fatal("formula is not rendered and published after the verified stack")
 	}
-	if got := strings.Count(release, "delete-file: Casks/cc-pool-status.rb"); got != 1 {
-		t.Fatalf("retired status cask deletions = %d, want exactly one", got)
-	}
-	for _, forbidden := range []string{"Render the cask", ".github/cask/"} {
+	for _, forbidden := range []string{
+		"Render the cask", ".github/cask/", "delete-file: Casks/cc-pool-status.rb",
+	} {
 		if strings.Contains(release, forbidden) {
 			t.Fatalf("release retains standalone status cask contract %q", forbidden)
 		}

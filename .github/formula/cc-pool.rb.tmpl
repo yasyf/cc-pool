@@ -1,6 +1,5 @@
 # Homebrew formula for cc-pool. Installs the prebuilt universal binary from
-# GitHub Releases — no Go toolchain needed. `brew install --HEAD` builds from
-# source instead.
+# GitHub Releases — no Go toolchain needed.
 #
 #   brew install yasyf/tap/cc-pool
 #
@@ -21,41 +20,39 @@ class CcPool < Formula
     strategy :github_latest
   end
 
-  head do
-    url "https://github.com/yasyf/cc-pool.git", branch: "main"
-    depends_on "go" => :build
+  resource "status_app" do
+    url "https://github.com/yasyf/cc-pool/releases/download/v#{version}/cc-pool-status-v#{version}-darwin.zip"
+    sha256 "__SHA_APP__"
   end
 
   depends_on :macos
 
   def install
-    if build.head?
-      install_from_source
-    else
-      bin.install "cc-pool"
+    bin.install "cc-pool"
+    resource("status_app").stage do
+      system "/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2", "CCPoolStatus.app"
+      system "/usr/bin/xcrun", "stapler", "validate", "CCPoolStatus.app"
+      system "/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=4", "CCPoolStatus.app"
+      app_version = Utils.safe_popen_read(
+        "/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString",
+        "CCPoolStatus.app/Contents/Info.plist"
+      ).strip
+      odie "CCPoolStatus.app version #{app_version} does not match #{version}" if app_version != version.to_s
+      libexec.install "CCPoolStatus.app"
     end
     bin.install_symlink "cc-pool" => "ccp"
-  end
-
-  # HEAD builds compile pure Go from source.
-  def install_from_source
-    ldflags = %W[
-      -s -w
-      -X github.com/yasyf/cc-pool/internal/version.Version=#{version}
-    ]
-    args = std_go_args(ldflags: ldflags.join(" "), output: bin/"cc-pool")
-    ENV["CGO_ENABLED"] = "0"
-    system "go", "build", *args, "./cmd/cc-pool"
   end
 
   def caveats
     <<~EOS
       Get started:
+        ccp package install # install and activate this release's signed application
+        ccp service install # install and start the account daemon
         ccp             # walks you through pooling your subscriptions
         ccp run         # launch claude on the emptiest account
 
-      `ccp init`, `ccp widget`, and `ccp service install` reconcile the exact
-      signed CCPoolStatus app from the same release into:
+      `ccp package install` verifies the formula's exact signed application,
+      installs it outside Homebrew's sandbox into:
         ~/Applications/CCPoolStatus.app
 
       daemonkit owns the user LaunchAgent. Homebrew does not install or control
@@ -63,8 +60,8 @@ class CcPool < Formula
 
       Plain `claude` on ~/.claude keeps working untouched.
 
-      Before `brew uninstall`, run `ccp service uninstall` to stop the daemon
-      and stop active pool sessions.
+      Before `brew uninstall`, run `ccp service uninstall` and then
+      `ccp package uninstall`.
     EOS
   end
 
