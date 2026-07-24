@@ -12,16 +12,32 @@ acceptance_prepare
 convergence_tests="$(acceptance_stage_test_binary github.com/yasyf/fusekit/convergence fusekit-convergence-tests)"
 sourceauthority_tests="$(acceptance_stage_test_binary github.com/yasyf/fusekit/sourceauthority fusekit-sourceauthority-tests)"
 catalog_tests="$(acceptance_stage_test_binary github.com/yasyf/fusekit/catalog fusekit-catalog-tests)"
+tenant_tests="$(acceptance_stage_test_binary github.com/yasyf/fusekit/tenant fusekit-tenant-tests)"
 log_start="$(vm_ssh date -u '+%Y-%m-%d %H:%M:%S')" || die "could not timestamp convergence log window"
 
+# FuseKit v1.13.3 proves targeting, delivery, and on-demand catch-up in their owning packages.
 vm_phase convergence-fleet
 acceptance_run_tests \
+  "$catalog_tests" \
+  '^TestTenantActivationTargetsOnlyExactInterestedLiveFileProvider$|^TestTenantActivationRequiresLiveLeaseAndEligibleMaterializedSet$|^TestActivationDeliveryWindowIsGloballyBounded$|^TestActivationDeliverySentRequiresExactAcknowledgement$|^TestActivationDeliveryTimeoutQuarantinesWithoutReplay$' \
+  "$VMCTL_RESULTS_DIR/convergence-catalog-tests.log" \
+  TestTenantActivationTargetsOnlyExactInterestedLiveFileProvider \
+  TestTenantActivationRequiresLiveLeaseAndEligibleMaterializedSet \
+  TestActivationDeliveryWindowIsGloballyBounded \
+  TestActivationDeliverySentRequiresExactAcknowledgement \
+  TestActivationDeliveryTimeoutQuarantinesWithoutReplay
+
+acceptance_run_tests \
   "$convergence_tests" \
-  '^TestReportedFleetChangeTargetsOnlyNineActiveDomainsAtTwoPending$|^TestMaterializedLiveDemandAndOneOnDemandTenant$|^TestAcknowledgementStopsRelaunch$' \
-  "$VMCTL_RESULTS_DIR/convergence-tests.log" \
-  TestReportedFleetChangeTargetsOnlyNineActiveDomainsAtTwoPending \
-  TestMaterializedLiveDemandAndOneOnDemandTenant \
-  TestAcknowledgementStopsRelaunch
+  '^TestEngineClaimsSendsAndAcknowledgesExactActivation$' \
+  "$VMCTL_RESULTS_DIR/convergence-engine-tests.log" \
+  TestEngineClaimsSendsAndAcknowledgesExactActivation
+
+acceptance_run_tests \
+  "$tenant_tests" \
+  '^TestPrepareTenantRevalidatesLogicallyAppliedSameRevisionOnDemand$' \
+  "$VMCTL_RESULTS_DIR/convergence-on-demand-tests.log" \
+  TestPrepareTenantRevalidatesLogicallyAppliedSameRevisionOnDemand
 
 vm_phase convergence-source-deltas
 acceptance_run_tests \

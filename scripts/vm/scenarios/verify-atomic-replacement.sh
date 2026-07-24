@@ -10,18 +10,25 @@ source "$SCRIPT_DIR/acceptance-lib.sh"
 vm_phase replacement-build
 acceptance_prepare
 catalog_tests="$(acceptance_stage_test_binary github.com/yasyf/fusekit/catalog fusekit-replacement-tests)"
+sourceauthority_tests="$(acceptance_stage_test_binary github.com/yasyf/fusekit/sourceauthority fusekit-replacement-source-tests)"
 log_start="$(vm_ssh date -u '+%Y-%m-%d %H:%M:%S')" || die "could not timestamp replacement log window"
 
+# FuseKit v1.13.3 splits catalog commit atomicity from source locator reconciliation.
 vm_phase replacement-transaction
 acceptance_run_tests \
   "$catalog_tests" \
-  '^TestReplaceKeepsSourceIdentityAndOldHandleContent$|^TestConcurrentReplaceHasOneWinner$|^TestSourceDeltaReplacesDifferentKeyAtSameNameAtomically$|^TestReplacePublishesFinalMetadataAndContentInOneRevision$|^TestSourceSameNameReplacementFailpointsAreAtomic$' \
+  '^TestReplaceKeepsSourceIdentityAndOldHandleContent$|^TestConcurrentReplaceHasOneWinner$|^TestReplacePublishesFinalMetadataAndContentInOneRevision$|^TestPrivateAtomicReplaceIsOldOrNewAcrossCommitFailpoints$' \
   "$VMCTL_RESULTS_DIR/replacement-tests.log" \
   TestReplaceKeepsSourceIdentityAndOldHandleContent \
   TestConcurrentReplaceHasOneWinner \
-  TestSourceDeltaReplacesDifferentKeyAtSameNameAtomically \
   TestReplacePublishesFinalMetadataAndContentInOneRevision \
-  TestSourceSameNameReplacementFailpointsAreAtomic
+  TestPrivateAtomicReplaceIsOldOrNewAcrossCommitFailpoints
+
+acceptance_run_tests \
+  "$sourceauthority_tests" \
+  '^TestIncrementalAtomicReplaceRetainsLocatorBinding$' \
+  "$VMCTL_RESULTS_DIR/replacement-source-tests.log" \
+  TestIncrementalAtomicReplaceRetainsLocatorBinding
 
 vm_phase replacement-fileprovider-log
 fp_errors="$VMCTL_RESULTS_DIR/replacement-fileprovider-errors.log"
