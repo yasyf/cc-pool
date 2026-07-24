@@ -6,6 +6,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.64.0] - 2026-07-24
+
+### Changed
+- Each account now has an immutable, path-independent instance identity. Claude
+  runs through a private stable execution symlink under
+  `~/.cc-pool/config/<instance-id>`, while File Provider keeps the separate
+  public `~/Library/CloudStorage/CCPoolStatus-acct-NN` presentation. Keychain
+  services derive only from the stable execution path.
+- The signed `CCPoolStatus.app` embeds the FuseKit runtime and installs from the
+  same Homebrew formula at `~/Applications/CCPoolStatus.app`; there is no
+  standalone holder or cask.
+- The final runtime stack pins daemonkit `v0.17.4` and FuseKit `v1.13.3`
+  exactly in both Go and Swift.
+
+### Fixed
+- Daemon bootstrap now provisions every desired account presentation before
+  readiness, waits through the bounded starting state, and rejects draining
+  generations. Account selection no longer fails fleet-wide with
+  `runtime presentations are starting`, `wire: server is draining`, or holder
+  readiness timeouts during a normal startup.
+- Pending and committed account removal now durably records authorization,
+  retires the exact File Provider presentation, removes the stable execution
+  link, and settles credential/backing state before an account index can be
+  reused. Lost responses, owner death, restart replay, and ambiguous external
+  state all fail closed without deleting a live credential or presentation.
+- Credential access validates the exact account generation, stable execution
+  path, Keychain locator, and real owned `0700` public target before any
+  Keychain I/O. Foreign links and unverifiable external state remain
+  quarantined instead of being silently repaired.
+- Release packaging now verifies the exact signed, notarized, stapled app
+  digest carried by the formula and invokes the installed formula's `ccp`
+  binary for package activation.
+
 ## [0.62.0] - 2026-07-23
 
 ### Changed
