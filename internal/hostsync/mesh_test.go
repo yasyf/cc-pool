@@ -22,6 +22,15 @@ func writeMeshState(ctx context.Context, t *testing.T, reg *hostregistry.Registr
 	if err := hostregistry.Mesh.InitializeState(ctx); err != nil {
 		t.Fatal(err)
 	}
+	for _, identity := range reg.Hosts {
+		fact, err := hostregistry.NewSSHHostFact(identity, "/opt/homebrew/bin/synckitd", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hostregistry.Mesh.RegisterHost(ctx, fact); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := hostregistry.Mesh.Update(ctx, func(state *hostregistry.Registry) error {
 		state.Self = reg.Self
 		state.Hosts = append([]string{}, reg.Hosts...)
@@ -37,7 +46,7 @@ func TestSynckitMeshResolve(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("resolves self and peers from the shared state", func(t *testing.T) {
-		writeMeshState(ctx, t, &hostregistry.Registry{Self: "me@a.ts.net", Hosts: []string{"you@b.ts.net", "exec:true"}})
+		writeMeshState(ctx, t, &hostregistry.Registry{Self: "me@a.ts.net", Hosts: []string{"you@b.ts.net", "zed@c.ts.net"}})
 		self, peers, err := (SynckitMesh{}).Resolve(ctx)
 		if err != nil {
 			t.Fatalf("Resolve: %v", err)
@@ -45,7 +54,7 @@ func TestSynckitMeshResolve(t *testing.T) {
 		if self != "me@a.ts.net" {
 			t.Errorf("self = %q, want me@a.ts.net", self)
 		}
-		if want := []string{"you@b.ts.net", "exec:true"}; !reflect.DeepEqual(peers, want) {
+		if want := []string{"you@b.ts.net", "zed@c.ts.net"}; !reflect.DeepEqual(peers, want) {
 			t.Errorf("peers = %v, want %v", peers, want)
 		}
 	})
