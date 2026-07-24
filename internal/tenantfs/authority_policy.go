@@ -445,6 +445,9 @@ func physicalMaterializationRequest(
 		if top == claudeJSONFile || top == settingsFile {
 			return sourceauthority.MaterializationRequest{}, false, nil
 		}
+		if overlay.PrivateStagingEntry(top) {
+			return sourceauthority.MaterializationRequest{}, false, nil
+		}
 		if !overlay.PrivateTopLevel(top) {
 			return sourceauthority.MaterializationRequest{}, false, fmt.Errorf(
 				"tenantfs: private root contains non-private entry %q", top,
