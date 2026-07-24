@@ -103,8 +103,9 @@ type Manager struct {
 	// bytes before the terminal receipt commits. It must perform no I/O.
 	BuildCredentialWritePublication CredentialWritePublicationBuilder
 	// ClaimCredentialMutation serializes credential writes with daemon selection
-	// reservations. The returned release must be called after the durable lane settles.
-	ClaimCredentialMutation func(accountID int) (release func(), err error)
+	// reservations. A caller-owned reservation may replace this through context;
+	// the returned release must be called after the durable lane settles.
+	ClaimCredentialMutation CredentialMutationClaim
 
 	credentialMu      sync.Mutex
 	credentialFlights map[int]*credentialFlight
@@ -117,6 +118,23 @@ type Manager struct {
 	recoveryMu       sync.Mutex
 	recoveryCancel   context.CancelFunc
 	recoveryDone     chan struct{}
+}
+
+// CredentialMutationClaim acquires one account's credential-write exclusion.
+type CredentialMutationClaim func(accountID int) (release func(), err error)
+
+type credentialMutationClaimContextKey struct{}
+
+// WithCredentialMutationClaim binds one exact caller-owned claim to credential work.
+func WithCredentialMutationClaim(ctx context.Context, claim CredentialMutationClaim) context.Context {
+	return context.WithValue(ctx, credentialMutationClaimContextKey{}, claim)
+}
+
+func credentialMutationClaim(ctx context.Context, fallback CredentialMutationClaim) CredentialMutationClaim {
+	if claim, ok := ctx.Value(credentialMutationClaimContextKey{}).(CredentialMutationClaim); ok && claim != nil {
+		return claim
+	}
+	return fallback
 }
 
 // OpenDaemon ensures state exists and creates the singleton daemon's durable worker runtime.

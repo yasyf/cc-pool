@@ -37,11 +37,11 @@ func (m *Manager) Init() (*InitResult, error) {
 
 // PendingAdd is one private account backing awaiting interactive login.
 type PendingAdd struct {
-	Reservation       store.PendingAccountReservation
-	ConfigDir         string
-	KeychainService   string
-	ClaudeJSONSeed    SeedOutcome
-	PresentationProof store.PresentationPreparationProof
+	Reservation          store.PendingAccountReservation
+	ConfigDir            string
+	KeychainService      string
+	ClaudeJSONSeed       SeedOutcome
+	PresentationIdentity store.FileProviderPresentationIdentity
 }
 
 // DuplicateIdentity returns an existing account sharing want's subscription.
@@ -90,27 +90,26 @@ func (m *Manager) PrepareReservedAdd(
 	reservation store.PendingAccountReservation,
 	configDir string,
 ) (pending *PendingAdd, err error) {
-	return m.prepareReservedAdd(ctx, reservation, configDir, store.PresentationPreparationProof{})
+	return m.prepareReservedAdd(ctx, reservation, configDir, store.FileProviderPresentationIdentity{})
 }
 
-// PrepareReservedSyncedAdd seeds a peer-added account only from its complete
-// generation-fenced FuseKit presentation proof.
+// PrepareReservedSyncedAdd seeds a peer-added account from its immutable presentation identity.
 func (m *Manager) PrepareReservedSyncedAdd(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
-	proof store.PresentationPreparationProof,
+	identity store.FileProviderPresentationIdentity,
 ) (pending *PendingAdd, err error) {
-	if err := store.ValidateReservedPresentationPreparationProof(reservation, proof); err != nil {
+	if err := store.ValidateReservedPresentationIdentity(reservation, identity); err != nil {
 		return nil, fmt.Errorf("prepare reserved synced add: %w", err)
 	}
-	return m.prepareReservedAdd(ctx, reservation, proof.FileProvider.PublicPath, proof)
+	return m.prepareReservedAdd(ctx, reservation, identity.PublicPath, identity)
 }
 
 func (m *Manager) prepareReservedAdd(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
 	configDir string,
-	proof store.PresentationPreparationProof,
+	identity store.FileProviderPresentationIdentity,
 ) (pending *PendingAdd, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -125,7 +124,7 @@ func (m *Manager) prepareReservedAdd(
 	service := creds.ServiceName(configDir)
 	return &PendingAdd{
 		Reservation: reservation, ConfigDir: configDir, KeychainService: service,
-		ClaudeJSONSeed: seed, PresentationProof: proof,
+		ClaudeJSONSeed: seed, PresentationIdentity: identity,
 	}, nil
 }
 
@@ -154,7 +153,7 @@ func (m *Manager) PromoteSyncedAdd(
 	}
 	account := syncedPromotionAccount(pending, label, accountUUID)
 	if err := m.Store.PromoteReservedSyncedAccount(
-		pending.Reservation, account, pending.PresentationProof,
+		pending.Reservation, account, pending.PresentationIdentity,
 	); err != nil {
 		return nil, fmt.Errorf("promote synced account %s: %w", pending.ConfigDir, err)
 	}
@@ -185,7 +184,7 @@ func (m *Manager) ResolvePromotedSyncedAdd(
 	}
 	expected := syncedPromotionAccount(pending, label, accountUUID)
 	account, exact, err := m.Store.ResolveReservedSyncedPromotion(
-		pending.Reservation, expected, pending.PresentationProof,
+		pending.Reservation, expected, pending.PresentationIdentity,
 	)
 	if err != nil || !exact {
 		return nil, exact, err

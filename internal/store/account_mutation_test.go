@@ -102,7 +102,7 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 		receipt.WrittenCredentialDigest != written || receipt.AccountInstanceID != reservation.InstanceID ||
 		receipt.AccountGeneration != reservation.Generation || receipt.Label != "verified-label" ||
 		receipt.AccountUUID != "verified-uuid" || receipt.OutcomeDigest != written ||
-		!receipt.HasPresentationProof || receipt.PresentationProof != operation.PresentationProof {
+		!receipt.HasPresentationIdentity || receipt.PresentationIdentity != operation.PresentationIdentity {
 		t.Fatalf("receipt lost exact evidence: %+v", receipt)
 	}
 	if !receipt.PublicationPending {
@@ -124,7 +124,7 @@ func TestAccountMutationAddPublishesExactReservationAndReplaysReceipt(t *testing
 	presentation, err := s.AccountPresentation(account.ID)
 	if err != nil || presentation.AccountInstanceID != account.InstanceID ||
 		presentation.AccountGeneration != account.Generation ||
-		presentation.Proof != operation.PresentationProof {
+		presentation.Identity != operation.PresentationIdentity {
 		t.Fatalf("published presentation = %+v err=%v", presentation, err)
 	}
 	if active, err := s.ListActiveAccounts(); err != nil || len(active) != 0 {
@@ -225,8 +225,7 @@ func TestBindAccountMutationPresentationRejectsSubstitutedTenant(t *testing.T) {
 	proof := presentationTestProof(Account{
 		InstanceID: reservation.InstanceID, Generation: reservation.Generation,
 	}, publicPath, "activation-test")
-	proof.CatalogTenantID = "account-0123456789abcdef0123456789abcdef"
-	proof.FileProvider.TenantID = proof.CatalogTenantID
+	proof.TenantID = "account-0123456789abcdef0123456789abcdef"
 	_, err = s.BindAccountMutationPresentation(
 		begin.Active.Fence(), proof, publicPath, "service", "account",
 		credentialOperationTestDigest("locator"), credentialOperationTestDigest("expected"),
@@ -235,7 +234,7 @@ func TestBindAccountMutationPresentationRejectsSubstitutedTenant(t *testing.T) {
 		t.Fatalf("substituted tenant bind = %v", err)
 	}
 	active, err := s.AccountMutation(request.OperationID)
-	if err != nil || active.State != AccountMutationAwaitingPresentation || active.HasPresentationProof {
+	if err != nil || active.State != AccountMutationAwaitingPresentation || active.HasPresentationIdentity {
 		t.Fatalf("mutation changed after rejected proof = %+v err=%v", active, err)
 	}
 }
@@ -901,7 +900,7 @@ func TestPresentationRebindJournalRetainsQuarantineUntilOldOwnerCleanup(t *testi
 		t.Fatalf("begin lost old ownership evidence: %+v", begin.Active)
 	}
 	fence, err := s.BindAccountMutationPresentation(
-		begin.Active.Fence(), target, target.FileProvider.PublicPath,
+		begin.Active.Fence(), target, target.PublicPath,
 		"new-service", "new-account", CredentialKeychainLocatorDigest("new-service", "new-account"),
 		credentialOperationTestDigest("new-expected"),
 	)
@@ -932,7 +931,7 @@ func TestPresentationRebindJournalRetainsQuarantineUntilOldOwnerCleanup(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.Generation != account.Generation+1 || updated.ConfigDir != target.FileProvider.PublicPath ||
+	if updated.Generation != account.Generation+1 || updated.ConfigDir != target.PublicPath ||
 		updated.KeychainService != "new-service" || updated.KeychainAccount != "new-account" {
 		t.Fatalf("published account = %+v", updated)
 	}
@@ -951,7 +950,7 @@ func TestPresentationRebindJournalRetainsQuarantineUntilOldOwnerCleanup(t *testi
 		t.Fatal(err)
 	}
 	if receipt.Kind != AccountMutationPresentationRebind || receipt.Terminal != AccountMutationCommitted ||
-		receipt.OutcomeDigest != written || receipt.PresentationProof != target ||
+		receipt.OutcomeDigest != written || receipt.PresentationIdentity != target ||
 		receipt.PreviousConfigDir != account.ConfigDir ||
 		receipt.PreviousKeychainService != account.KeychainService ||
 		receipt.PreviousKeychainAccount != account.KeychainAccount ||
@@ -1052,7 +1051,7 @@ func TestPresentationRebindFencesCredentialOperationsThroughAdmission(t *testing
 		t.Fatal(err)
 	}
 	fence, err := s.BindAccountMutationPresentation(
-		begin.Active.Fence(), target, target.FileProvider.PublicPath,
+		begin.Active.Fence(), target, target.PublicPath,
 		"new-service", "new-account", CredentialKeychainLocatorDigest("new-service", "new-account"),
 		credentialOperationTestDigest("new-expected"),
 	)
@@ -1069,7 +1068,7 @@ func TestPresentationRebindFencesCredentialOperationsThroughAdmission(t *testing
 	}
 	targetAccount := Account{
 		ID: account.ID, InstanceID: account.InstanceID, Generation: account.Generation + 1,
-		ConfigDir:       target.FileProvider.PublicPath,
+		ConfigDir:       target.PublicPath,
 		KeychainService: "new-service", KeychainAccount: "new-account",
 	}
 	adopt := credentialOperationTestRequest(
@@ -1103,55 +1102,6 @@ func TestPresentationRebindFencesCredentialOperationsThroughAdmission(t *testing
 	after, err := s.BeginCredentialOperation(adopt)
 	if err != nil || !after.Created || after.Active == nil {
 		t.Fatalf("credential operation remained fenced after admission = %+v err=%v", after, err)
-	}
-}
-
-func TestRefreshPresentationRebindProofAllowsCurrentActivationAndAdvancingProvenance(t *testing.T) {
-	s := openTest(t)
-	account, request, target := presentationRebindMutationTestFixture(t, s)
-	begin, err := s.BeginAccountMutation(t.Context(), request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fence, err := s.BindAccountMutationPresentation(
-		begin.Active.Fence(), target, target.FileProvider.PublicPath,
-		"new-service", "new-account", CredentialKeychainLocatorDigest("new-service", "new-account"),
-		credentialOperationTestDigest("new-expected"),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	refreshed := target
-	refreshed.Requested++
-	refreshed.Desired = refreshed.Requested
-	refreshed.Observed = refreshed.Requested
-	refreshed.Verified = refreshed.Requested
-	refreshed.Applied = refreshed.Requested
-	refreshed.CatalogRevision = refreshed.Requested
-	refreshed.SourceRevision++
-	refreshed.ChangeID = "change-refreshed"
-	refreshed.OperationID = "operation-refreshed"
-	refreshed.FileProvider.ActivationGeneration = "activation-current"
-	fence, err = s.RefreshAccountMutationPresentation(fence, refreshed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mutation, err := s.AccountMutation(request.OperationID)
-	if err != nil || mutation.PresentationProof != refreshed || mutation.Fence() != fence {
-		t.Fatalf("refreshed mutation = %+v err=%v", mutation, err)
-	}
-	causalDrift := refreshed
-	causalDrift.ChangeID = "changed-without-revision"
-	if _, err := s.RefreshAccountMutationPresentation(fence, causalDrift); !errors.Is(err, ErrAccountPresentationEvidence) {
-		t.Fatalf("causal drift without revision = %v", err)
-	}
-	identityDrift := refreshed
-	identityDrift.FileProvider.DomainID = "other-domain"
-	if _, err := s.RefreshAccountMutationPresentation(fence, identityDrift); !errors.Is(err, ErrAccountPresentationEvidence) {
-		t.Fatalf("identity drift = %v", err)
-	}
-	if _, err := s.GetAccount(account.ID); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -1198,14 +1148,14 @@ func TestPresentationRebindRejectsIncoherentOldEvidenceAndOwnerAliasing(t *testi
 		t.Fatal(err)
 	}
 	if _, err := s.BindAccountMutationPresentation(
-		begin.Active.Fence(), target, target.FileProvider.PublicPath,
+		begin.Active.Fence(), target, target.PublicPath,
 		account.KeychainService, account.KeychainAccount, request.PreviousLocatorDigest,
 		credentialOperationTestDigest("new-expected"),
 	); !errors.Is(err, ErrAccountPresentationEvidence) {
 		t.Fatalf("old Keychain owner alias admitted: %v", err)
 	}
 	if _, err := s.BindAccountMutationPresentation(
-		begin.Active.Fence(), target, target.FileProvider.PublicPath,
+		begin.Active.Fence(), target, target.PublicPath,
 		"new-service", "new-account", credentialOperationTestDigest("substituted-new-locator"),
 		credentialOperationTestDigest("new-expected"),
 	); !errors.Is(err, ErrAccountPresentationEvidence) {
@@ -1216,7 +1166,7 @@ func TestPresentationRebindRejectsIncoherentOldEvidenceAndOwnerAliasing(t *testi
 func presentationRebindMutationTestFixture(
 	t *testing.T,
 	s *Store,
-) (Account, BeginAccountMutationRequest, PresentationPreparationProof) {
+) (Account, BeginAccountMutationRequest, FileProviderPresentationIdentity) {
 	t.Helper()
 	account := credentialOperationTestAccountID(t, s, 1)
 	initial := presentationTestProof(account, account.ConfigDir, "activation-initial")
@@ -1229,8 +1179,7 @@ func presentationRebindMutationTestFixture(
 		t.Fatalf("create quarantine: %v", err)
 	}
 	target := drifted
-	target.CatalogGeneration = account.Generation + 1
-	target.FileProvider.Generation = account.Generation + 1
+	target.Generation = account.Generation + 1
 	request := BeginAccountMutationRequest{
 		AccountID: account.ID, Kind: AccountMutationPresentationRebind,
 		AccountInstanceID: account.InstanceID, AccountGeneration: account.Generation + 1,

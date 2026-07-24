@@ -84,24 +84,10 @@ CREATE TABLE account_mutations (
   keychain_account           TEXT NOT NULL,
   label                      TEXT NOT NULL DEFAULT '',
   account_uuid               TEXT NOT NULL DEFAULT '',
-	proof_catalog_tenant_id    TEXT NOT NULL,
-	proof_catalog_generation   INTEGER NOT NULL CHECK(proof_catalog_generation >= 0),
-	proof_requested            INTEGER NOT NULL CHECK(proof_requested >= 0),
-	proof_desired              INTEGER NOT NULL CHECK(proof_desired >= 0),
-	proof_observed             INTEGER NOT NULL CHECK(proof_observed >= 0),
-	proof_verified             INTEGER NOT NULL CHECK(proof_verified >= 0),
-	proof_applied              INTEGER NOT NULL CHECK(proof_applied >= 0),
-	proof_source_authority     TEXT NOT NULL,
-	proof_source_revision      INTEGER NOT NULL CHECK(proof_source_revision >= 0),
-	proof_catalog_revision     INTEGER NOT NULL CHECK(proof_catalog_revision >= 0),
-	proof_change_id            TEXT NOT NULL,
-	proof_operation_id         TEXT NOT NULL,
-	proof_presentation_kind    TEXT NOT NULL,
-	proof_tenant_id            TEXT NOT NULL,
-	proof_domain_id            TEXT NOT NULL,
-	proof_presentation_generation INTEGER NOT NULL CHECK(proof_presentation_generation >= 0),
-	proof_activation_generation TEXT NOT NULL,
-	proof_public_path          TEXT NOT NULL,
+	presentation_tenant_id    TEXT NOT NULL,
+	presentation_domain_id    TEXT NOT NULL,
+	presentation_generation   INTEGER NOT NULL CHECK(presentation_generation >= 0),
+	presentation_public_path  TEXT NOT NULL,
 	previous_config_dir       TEXT NOT NULL,
 	previous_keychain_service TEXT NOT NULL,
 	previous_keychain_account TEXT NOT NULL,
@@ -115,28 +101,14 @@ CREATE TABLE account_mutations (
   CHECK((kind IN ('add','presentation-rebind') AND state='awaiting-presentation' AND
          locator_digest=zeroblob(32) AND expected_credential_digest=zeroblob(32) AND
          config_dir='' AND keychain_service='' AND keychain_account='' AND
-		 proof_catalog_tenant_id='' AND proof_catalog_generation=0 AND proof_requested=0 AND
-		 proof_desired=0 AND proof_observed=0 AND proof_verified=0 AND proof_applied=0 AND
-		 proof_source_authority='' AND proof_source_revision=0 AND proof_catalog_revision=0 AND
-		 proof_change_id='' AND proof_operation_id='' AND proof_presentation_kind='' AND
-		 proof_tenant_id='' AND proof_domain_id='' AND
-		 proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path='') OR
+		 presentation_tenant_id='' AND presentation_domain_id='' AND
+		 presentation_generation=0 AND presentation_public_path='') OR
         (state<>'awaiting-presentation' AND config_dir<>'' AND keychain_service<>'' AND keychain_account<>'' AND
-		 ((kind IN ('add','presentation-rebind') AND proof_presentation_kind='file_provider' AND
-		   account_generation=proof_presentation_generation AND
-		   config_dir=proof_public_path AND proof_catalog_tenant_id=proof_tenant_id AND
-		   proof_catalog_generation=proof_presentation_generation AND proof_requested>0 AND
-		   proof_desired=proof_requested AND proof_observed=proof_requested AND
-		   proof_verified=proof_requested AND proof_applied=proof_requested AND
-		   proof_source_authority<>'' AND proof_source_revision>0 AND proof_catalog_revision=proof_requested AND
-		   proof_change_id<>'' AND proof_operation_id<>'' AND proof_tenant_id<>'' AND proof_domain_id<>'' AND
-		   proof_activation_generation<>'') OR
-		  (kind NOT IN ('add','presentation-rebind') AND proof_catalog_tenant_id='' AND proof_catalog_generation=0 AND proof_requested=0 AND
-		   proof_desired=0 AND proof_observed=0 AND proof_verified=0 AND proof_applied=0 AND
-		   proof_source_authority='' AND proof_source_revision=0 AND proof_catalog_revision=0 AND
-		   proof_change_id='' AND proof_operation_id='' AND proof_presentation_kind='' AND
-		   proof_tenant_id='' AND proof_domain_id='' AND
-		   proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path='')))),
+		 ((kind IN ('add','presentation-rebind') AND presentation_tenant_id<>'' AND
+		   presentation_domain_id<>'' AND account_generation=presentation_generation AND
+		   config_dir=presentation_public_path) OR
+		  (kind NOT IN ('add','presentation-rebind') AND presentation_tenant_id='' AND
+		   presentation_domain_id='' AND presentation_generation=0 AND presentation_public_path='')))),
 	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
 	       previous_keychain_account<>'' AND previous_locator_digest<>zeroblob(32) AND
 	       ((previous_credential_state='empty' AND previous_credential_digest IS NULL) OR
@@ -171,24 +143,10 @@ CREATE TABLE account_mutation_receipts (
   keychain_account  TEXT NOT NULL CHECK(keychain_account <> ''),
   label             TEXT NOT NULL DEFAULT '',
   account_uuid      TEXT NOT NULL DEFAULT '',
-	proof_catalog_tenant_id TEXT NOT NULL,
-	proof_catalog_generation INTEGER NOT NULL CHECK(proof_catalog_generation >= 0),
-	proof_requested INTEGER NOT NULL CHECK(proof_requested >= 0),
-	proof_desired INTEGER NOT NULL CHECK(proof_desired >= 0),
-	proof_observed INTEGER NOT NULL CHECK(proof_observed >= 0),
-	proof_verified INTEGER NOT NULL CHECK(proof_verified >= 0),
-	proof_applied INTEGER NOT NULL CHECK(proof_applied >= 0),
-	proof_source_authority TEXT NOT NULL,
-	proof_source_revision INTEGER NOT NULL CHECK(proof_source_revision >= 0),
-	proof_catalog_revision INTEGER NOT NULL CHECK(proof_catalog_revision >= 0),
-	proof_change_id TEXT NOT NULL,
-	proof_operation_id TEXT NOT NULL,
-	proof_presentation_kind TEXT NOT NULL,
-	proof_tenant_id TEXT NOT NULL,
-	proof_domain_id TEXT NOT NULL,
-	proof_presentation_generation INTEGER NOT NULL CHECK(proof_presentation_generation >= 0),
-	proof_activation_generation TEXT NOT NULL,
-	proof_public_path TEXT NOT NULL,
+	presentation_tenant_id TEXT NOT NULL,
+	presentation_domain_id TEXT NOT NULL,
+	presentation_generation INTEGER NOT NULL CHECK(presentation_generation >= 0),
+	presentation_public_path TEXT NOT NULL,
 	previous_config_dir TEXT NOT NULL,
 	previous_keychain_service TEXT NOT NULL,
 	previous_keychain_account TEXT NOT NULL,
@@ -202,21 +160,11 @@ CREATE TABLE account_mutation_receipts (
   acknowledged_at   INTEGER CHECK(acknowledged_at IS NULL OR acknowledged_at >= committed_at),
   expires_at        INTEGER NOT NULL CHECK(expires_at > committed_at),
 	CHECK((credential_written=1) = (written_credential_digest IS NOT NULL)),
-	CHECK((kind IN ('add','presentation-rebind') AND proof_presentation_kind='file_provider' AND
-	       account_generation=proof_presentation_generation AND
-	       config_dir=proof_public_path AND proof_catalog_tenant_id=proof_tenant_id AND
-	       proof_catalog_generation=proof_presentation_generation AND proof_requested>0 AND
-	       proof_desired=proof_requested AND proof_observed=proof_requested AND
-	       proof_verified=proof_requested AND proof_applied=proof_requested AND
-	       proof_source_authority<>'' AND proof_source_revision>0 AND proof_catalog_revision=proof_requested AND
-	       proof_change_id<>'' AND proof_operation_id<>'' AND proof_tenant_id<>'' AND proof_domain_id<>'' AND
-	       proof_activation_generation<>'') OR
-	      (kind NOT IN ('add','presentation-rebind') AND proof_catalog_tenant_id='' AND proof_catalog_generation=0 AND proof_requested=0 AND
-	       proof_desired=0 AND proof_observed=0 AND proof_verified=0 AND proof_applied=0 AND
-	       proof_source_authority='' AND proof_source_revision=0 AND proof_catalog_revision=0 AND
-	       proof_change_id='' AND proof_operation_id='' AND proof_presentation_kind='' AND
-	       proof_tenant_id='' AND proof_domain_id='' AND
-	       proof_presentation_generation=0 AND proof_activation_generation='' AND proof_public_path='')),
+	CHECK((kind IN ('add','presentation-rebind') AND presentation_tenant_id<>'' AND
+	       presentation_domain_id<>'' AND account_generation=presentation_generation AND
+	       config_dir=presentation_public_path) OR
+	      (kind NOT IN ('add','presentation-rebind') AND presentation_tenant_id='' AND
+	       presentation_domain_id='' AND presentation_generation=0 AND presentation_public_path='')),
 	CHECK((kind='presentation-rebind' AND previous_config_dir<>'' AND previous_keychain_service<>'' AND
 	       previous_keychain_account<>'' AND previous_locator_digest<>zeroblob(32) AND
 	       ((previous_credential_state='empty' AND previous_credential_digest IS NULL) OR
@@ -430,24 +378,9 @@ CREATE TABLE account_presentations (
   tenant_id               TEXT NOT NULL CHECK(tenant_id <> ''),
   domain_id               TEXT NOT NULL CHECK(domain_id <> ''),
   presentation_generation INTEGER NOT NULL CHECK(presentation_generation > 0),
-  activation_generation   TEXT NOT NULL CHECK(activation_generation <> ''),
   public_path             TEXT NOT NULL CHECK(public_path <> ''),
-	presentation_kind       TEXT NOT NULL CHECK(presentation_kind='file_provider'),
-	catalog_tenant_id       TEXT NOT NULL CHECK(catalog_tenant_id<>''),
-	catalog_generation      INTEGER NOT NULL CHECK(catalog_generation>0),
-	catalog_requested       INTEGER NOT NULL CHECK(catalog_requested>0),
-	catalog_desired         INTEGER NOT NULL CHECK(catalog_desired=catalog_requested),
-	catalog_observed        INTEGER NOT NULL CHECK(catalog_observed=catalog_requested),
-	catalog_verified        INTEGER NOT NULL CHECK(catalog_verified=catalog_requested),
-	catalog_applied         INTEGER NOT NULL CHECK(catalog_applied=catalog_requested),
-	source_authority        TEXT NOT NULL CHECK(source_authority<>''),
-	source_revision         INTEGER NOT NULL CHECK(source_revision>0),
-	catalog_revision        INTEGER NOT NULL CHECK(catalog_revision=catalog_requested),
-	change_id               TEXT NOT NULL CHECK(change_id<>''),
-	operation_id            TEXT NOT NULL CHECK(operation_id<>''),
   observed_at             INTEGER NOT NULL CHECK(observed_at > 0),
-  CHECK(account_generation = presentation_generation),
-	CHECK(catalog_tenant_id=tenant_id AND catalog_generation=presentation_generation)
+  CHECK(account_generation = presentation_generation)
 );
 CREATE TABLE account_presentation_quarantines (
   account_id              INTEGER PRIMARY KEY CHECK(account_id > 0),
@@ -457,24 +390,9 @@ CREATE TABLE account_presentation_quarantines (
   observed_tenant_id      TEXT NOT NULL CHECK(observed_tenant_id <> ''),
   observed_domain_id      TEXT NOT NULL CHECK(observed_domain_id <> ''),
   observed_generation     INTEGER NOT NULL CHECK(observed_generation > 0),
-  observed_activation_generation TEXT NOT NULL CHECK(observed_activation_generation <> ''),
   observed_public_path    TEXT NOT NULL CHECK(observed_public_path <> ''),
-	observed_presentation_kind TEXT NOT NULL CHECK(observed_presentation_kind='file_provider'),
-	observed_catalog_tenant_id TEXT NOT NULL CHECK(observed_catalog_tenant_id<>''),
-	observed_catalog_generation INTEGER NOT NULL CHECK(observed_catalog_generation>0),
-	observed_catalog_requested INTEGER NOT NULL CHECK(observed_catalog_requested>0),
-	observed_catalog_desired INTEGER NOT NULL CHECK(observed_catalog_desired=observed_catalog_requested),
-	observed_catalog_observed INTEGER NOT NULL CHECK(observed_catalog_observed=observed_catalog_requested),
-	observed_catalog_verified INTEGER NOT NULL CHECK(observed_catalog_verified=observed_catalog_requested),
-	observed_catalog_applied INTEGER NOT NULL CHECK(observed_catalog_applied=observed_catalog_requested),
-	observed_source_authority TEXT NOT NULL CHECK(observed_source_authority<>''),
-	observed_source_revision INTEGER NOT NULL CHECK(observed_source_revision>0),
-	observed_catalog_revision INTEGER NOT NULL CHECK(observed_catalog_revision=observed_catalog_requested),
-	observed_change_id TEXT NOT NULL CHECK(observed_change_id<>''),
-	observed_operation_id TEXT NOT NULL CHECK(observed_operation_id<>''),
   reason                  TEXT NOT NULL CHECK(reason IN ('public-path-drift','tenant-id-drift','domain-id-drift','generation-drift')),
-  created_at              INTEGER NOT NULL CHECK(created_at > 0),
-	CHECK(observed_catalog_tenant_id=observed_tenant_id AND observed_catalog_generation=observed_generation)
+  created_at              INTEGER NOT NULL CHECK(created_at > 0)
 );
 CREATE UNIQUE INDEX idx_accounts_live_config_dir ON accounts(config_dir) WHERE deleted_at IS NULL;
 CREATE INDEX idx_account_mutations_owner ON account_mutations(owner_record,account_id);

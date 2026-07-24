@@ -181,6 +181,7 @@ type fleetSourcePreparer struct {
 func (p *fleetSourcePreparer) Prepare(
 	ctx context.Context,
 	account tenantfs.Account,
+	_ tenantfs.PreparationLease,
 ) (catalogproto.TenantPreparationProof, error) {
 	name := account.FileProviderDisplayName
 	p.mu.Lock()
@@ -223,6 +224,7 @@ func (p *fleetSourcePreparer) Prepare(
 func (*fleetSourcePreparer) Validate(
 	context.Context,
 	tenantfs.Account,
+	tenantfs.PreparationLease,
 	catalogproto.TenantPreparationProof,
 ) error {
 	return nil
@@ -308,6 +310,7 @@ func (r *blockingLifecycleRuntime) counts() (calls, active, maximum int) {
 func (p *sourcePreparerStub) Prepare(
 	context.Context,
 	tenantfs.Account,
+	tenantfs.PreparationLease,
 ) (catalogproto.TenantPreparationProof, error) {
 	p.prepared++
 	return p.proof, p.prepareErr
@@ -316,6 +319,7 @@ func (p *sourcePreparerStub) Prepare(
 func (p *sourcePreparerStub) Validate(
 	context.Context,
 	tenantfs.Account,
+	tenantfs.PreparationLease,
 	catalogproto.TenantPreparationProof,
 ) error {
 	p.validated++
@@ -329,6 +333,12 @@ func exactState(id mountproto.TenantID, generation uint64) mountproto.StateRespo
 			OwnerID: mountproto.OwnerID(tenantfs.OwnerID), TenantID: id, Generation: generation,
 			Desired: 11, Applied: 11, StateVersion: 1, ReplacementEligible: true,
 		},
+	}
+}
+
+func testPreparationLease() tenantfs.PreparationLease {
+	return tenantfs.PreparationLease{
+		ID: "00112233445566778899aabbccddeeff", ExpiresAt: time.Now().Add(time.Minute),
 	}
 }
 
@@ -465,7 +475,7 @@ func TestPrepareProvisionsBeforeOnDemandConvergence(t *testing.T) {
 	}}
 	preparer := &sourcePreparerStub{}
 	coordinator := &tenantCoordinator{runtime: runtime, preparer: preparer}
-	if _, err := coordinator.prepare(t.Context(), account); err != nil {
+	if _, err := coordinator.prepare(t.Context(), account, testPreparationLease()); err != nil {
 		t.Fatal(err)
 	}
 	if runtime.provisionCalls != 1 || preparer.prepared != 1 {
@@ -474,7 +484,7 @@ func TestPrepareProvisionsBeforeOnDemandConvergence(t *testing.T) {
 	_ = tenantAccount
 }
 
-func TestInitializePreparesEveryActiveAccountWithBoundedFanout(t *testing.T) {
+func TestInitializeProvisionsEveryActiveAccountWithoutPreparingContent(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
@@ -485,55 +495,33 @@ func TestInitializePreparesEveryActiveAccountWithBoundedFanout(t *testing.T) {
 	const total = 19
 	insertCoordinatorAccounts(t, st, total)
 	runtime := &fleetLifecycleRuntime{}
-	release := make(chan struct{})
-	preparer := &fleetSourcePreparer{
-		started: make(chan string, total), release: release,
-	}
+	preparer := &fleetSourcePreparer{}
 	server := &Server{m: &pool.Manager{Store: st}}
 	coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
-	done := make(chan error, 1)
-	go func() { done <- coordinator.initialize(t.Context()) }()
-	for range tenantProvisionConcurrency {
-		select {
-		case <-preparer.started:
-		case <-time.After(time.Second):
-			t.Fatal("startup preparation did not fill its bounded capacity")
-		}
-	}
-	select {
-	case name := <-preparer.started:
-		t.Fatalf("startup preparation exceeded bounded capacity with %s", name)
-	case <-time.After(50 * time.Millisecond):
-	}
-	if _, active, maximum := preparer.counts(); active != tenantProvisionConcurrency || maximum != tenantProvisionConcurrency {
-		t.Fatalf("startup preparation concurrency = active %d maximum %d", active, maximum)
-	}
-	close(release)
-	if err := <-done; err != nil {
+	if err := coordinator.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	prepared, active, maximum := preparer.counts()
 	provisioned := runtime.provisionedAccounts()
-	if len(prepared) != total || len(provisioned) != total || active != 0 || maximum != tenantProvisionConcurrency {
+	if len(prepared) != 0 || len(provisioned) != total || active != 0 || maximum != 0 {
 		t.Fatalf(
 			"startup fleet = prepared %d provisioned %d active %d maximum %d",
 			len(prepared), len(provisioned), active, maximum,
 		)
 	}
-	slices.Sort(prepared)
 	slices.Sort(provisioned)
 	for id := 1; id <= total; id++ {
 		want := pool.AccountDirName(id)
-		if prepared[id-1] != want || provisioned[id-1] != want {
-			t.Fatalf("startup account %d = prepared %q provisioned %q, want %q", id, prepared[id-1], provisioned[id-1], want)
+		if provisioned[id-1] != want {
+			t.Fatalf("startup account %d = provisioned %q, want %q", id, provisioned[id-1], want)
 		}
 	}
 }
 
-func TestInitializeBindsLiveProofForFreshDesiredAccounts(t *testing.T) {
+func TestInitializeBindsImmutableIdentityForFreshDesiredAccounts(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 2)
 	runtime := &fleetLifecycleRuntime{}
-	preparer := &fleetSourcePreparer{activation: "activation-fresh"}
+	preparer := &fleetSourcePreparer{}
 	server := &Server{m: &pool.Manager{Store: st}}
 	server.beginBootstrap()
 	coordinator := newTenantCoordinator(t.Context(), server, preparer, runtime)
@@ -552,10 +540,13 @@ func TestInitializeBindsLiveProofForFreshDesiredAccounts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		expected, err := expectedPresentationIdentity(account)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if presentation.AccountInstanceID != account.InstanceID ||
 			presentation.AccountGeneration != account.Generation ||
-			presentation.Proof.FileProvider.PublicPath != account.ConfigDir ||
-			presentation.Proof.FileProvider.ActivationGeneration != "activation-fresh" {
+			presentation.Identity != expected {
 			t.Fatalf("acct-%02d presentation = %+v", account.ID, presentation)
 		}
 	}
@@ -566,49 +557,33 @@ func TestInitializeBindsLiveProofForFreshDesiredAccounts(t *testing.T) {
 	}
 }
 
-func TestInitializeReadinessWaitsForDesiredPresentationProof(t *testing.T) {
+func TestInitializeBindsIdentityWithoutPreparingContent(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 1)
 	release := make(chan struct{})
 	preparer := &fleetSourcePreparer{started: make(chan string, 1), release: release}
 	server := &Server{m: &pool.Manager{Store: st}}
 	server.beginBootstrap()
 	coordinator := newTenantCoordinator(t.Context(), server, preparer, &fleetLifecycleRuntime{})
-	done := make(chan error, 1)
-	go func() { done <- coordinator.initialize(t.Context()) }()
-	select {
-	case <-preparer.started:
-	case <-time.After(time.Second):
-		t.Fatal("desired preparation did not start")
-	}
-	select {
-	case err := <-done:
-		t.Fatalf("initialize returned before proof was available: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	if _, err := st.AccountPresentation(1); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("presentation before proof = %v", err)
-	}
-	close(release)
-	if err := <-done; err != nil {
+	if err := coordinator.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.AccountPresentation(1); err != nil {
 		t.Fatal(err)
 	}
+	if prepared, _, _ := preparer.counts(); len(prepared) != 0 {
+		t.Fatalf("startup prepared content: %v", prepared)
+	}
+	close(release)
 }
 
-func TestInitializeRefreshesDesiredPresentationAfterRestart(t *testing.T) {
+func TestInitializeRetainsDesiredPresentationIdentityAfterRestart(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 1)
 	server := &Server{m: &pool.Manager{Store: st}}
-	first := newTenantCoordinator(
-		t.Context(), server, &fleetSourcePreparer{activation: "activation-1"}, &fleetLifecycleRuntime{},
-	)
+	first := newTenantCoordinator(t.Context(), server, &fleetSourcePreparer{}, &fleetLifecycleRuntime{})
 	if err := first.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	restarted := newTenantCoordinator(
-		t.Context(), server, &fleetSourcePreparer{activation: "activation-2"}, &fleetLifecycleRuntime{},
-	)
+	restarted := newTenantCoordinator(t.Context(), server, &fleetSourcePreparer{}, &fleetLifecycleRuntime{})
 	if err := restarted.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -616,8 +591,16 @@ func TestInitializeRefreshesDesiredPresentationAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if presentation.Proof.FileProvider.ActivationGeneration != "activation-2" {
-		t.Fatalf("restart activation = %q", presentation.Proof.FileProvider.ActivationGeneration)
+	account, err := st.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := expectedPresentationIdentity(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presentation.Identity != expected {
+		t.Fatalf("restart identity = %+v, want %+v", presentation.Identity, expected)
 	}
 }
 
@@ -647,12 +630,25 @@ func TestConcurrentInitializeConvergesOneDesiredPresentation(t *testing.T) {
 	}
 }
 
-func TestInitializeSettlesDesiredGenerationMismatchWithDurableQuarantine(t *testing.T) {
+func TestInitializeSettlesDesiredIdentityMismatchWithDurableQuarantine(t *testing.T) {
 	st := openDesiredCoordinatorStore(t, 1)
-	preparer := &fleetSourcePreparer{mutateProof: func(proof *catalogproto.TenantPreparationProof) {
-		proof.Catalog.Generation++
-		proof.Presentation.FileProvider.Generation++
-	}}
+	account, err := st.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := expectedPresentationIdentity(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BindDesiredAccountPresentation(account, expected); err != nil {
+		t.Fatal(err)
+	}
+	observed := expected
+	observed.Generation++
+	if err := st.ObserveAccountPresentation(account, observed); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
+		t.Fatalf("seed identity quarantine: %v", err)
+	}
+	preparer := &fleetSourcePreparer{}
 	server := &Server{m: &pool.Manager{Store: st}}
 	server.beginBootstrap()
 	coordinator := newTenantCoordinator(t.Context(), server, preparer, &fleetLifecycleRuntime{})
@@ -667,7 +663,7 @@ func TestInitializeSettlesDesiredGenerationMismatchWithDurableQuarantine(t *test
 		t.Fatalf("active after mismatch = %+v err=%v", active, err)
 	}
 	progress := server.bootstrapSnapshot()
-	if progress.Total != 1 || progress.Settled != 1 || progress.Quarantined != 1 ||
+	if progress.Total != 0 || progress.Settled != 0 || progress.Quarantined != 0 ||
 		!progress.Terminal || progress.FailureCount != 0 {
 		t.Fatalf("quarantine bootstrap progress = %+v", progress)
 	}
@@ -727,15 +723,15 @@ func TestInitializeRecoversRemovalBeforePreparingActiveFleet(t *testing.T) {
 	}
 	prepared, _, _ := preparer.counts()
 	provisioned := runtime.provisionedAccounts()
-	if !slices.Equal(prepared, []string{"acct-01"}) || !slices.Equal(provisioned, []string{"acct-01"}) {
-		t.Fatalf("active recovery = prepared %v provisioned %v, want only acct-01", prepared, provisioned)
+	if len(prepared) != 0 || !slices.Equal(provisioned, []string{"acct-01"}) {
+		t.Fatalf("active recovery = prepared %v provisioned %v, want provision only acct-01", prepared, provisioned)
 	}
 	if _, err := st.GetAccount(2); !errors.Is(err, store.ErrAccountNotFound) {
 		t.Fatalf("removed account after recovery = %v", err)
 	}
 }
 
-func TestInitializeFailureBlocksReadinessAndRestartRetriesFleet(t *testing.T) {
+func TestInitializeIgnoresContentPreparationFailuresAndRestartReprovisionsFleet(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
@@ -745,28 +741,20 @@ func TestInitializeFailureBlocksReadinessAndRestartRetriesFleet(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	insertCoordinatorAccounts(t, st, 2)
 	server := &Server{m: &pool.Manager{Store: st}}
-	release := make(chan struct{})
-	firstPreparer := &fleetSourcePreparer{
-		started: make(chan string, 2), release: release, failName: "acct-02",
-	}
-	first := newTenantCoordinator(t.Context(), server, firstPreparer, &fleetLifecycleRuntime{})
-	firstDone := make(chan error, 1)
-	go func() { firstDone <- first.initialize(t.Context()) }()
-	for range 2 {
-		select {
-		case <-firstPreparer.started:
-		case <-time.After(time.Second):
-			t.Fatal("failed startup did not attempt the exact active fleet")
-		}
-	}
-	close(release)
-	if err := <-firstDone; err == nil {
-		t.Fatal("startup preparation failure reported readiness")
+	firstPreparer := &fleetSourcePreparer{failName: "acct-02"}
+	firstRuntime := &fleetLifecycleRuntime{}
+	first := newTenantCoordinator(t.Context(), server, firstPreparer, firstRuntime)
+	if err := first.initialize(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	firstPrepared, _, _ := firstPreparer.counts()
-	slices.Sort(firstPrepared)
-	if !slices.Equal(firstPrepared, []string{"acct-01", "acct-02"}) {
-		t.Fatalf("failed startup prepared %v, want exact active fleet", firstPrepared)
+	if len(firstPrepared) != 0 {
+		t.Fatalf("startup prepared content: %v", firstPrepared)
+	}
+	firstProvisioned := firstRuntime.provisionedAccounts()
+	slices.Sort(firstProvisioned)
+	if !slices.Equal(firstProvisioned, []string{"acct-01", "acct-02"}) {
+		t.Fatalf("startup provisioned %v", firstProvisioned)
 	}
 
 	restartRuntime := &fleetLifecycleRuntime{}
@@ -780,12 +768,12 @@ func TestInitializeFailureBlocksReadinessAndRestartRetriesFleet(t *testing.T) {
 	slices.Sort(retried)
 	slices.Sort(reprovisioned)
 	want := []string{"acct-01", "acct-02"}
-	if !slices.Equal(retried, want) || !slices.Equal(reprovisioned, want) {
+	if len(retried) != 0 || !slices.Equal(reprovisioned, want) {
 		t.Fatalf("restart fleet = prepared %v provisioned %v, want %v", retried, reprovisioned, want)
 	}
 }
 
-func TestInitializeJoinsEveryStartedPreparationAfterFailure(t *testing.T) {
+func TestInitializeNeverStartsContentPreparation(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	st, err := store.Open(filepath.Join(home, "pool-v1.db"))
@@ -795,32 +783,13 @@ func TestInitializeJoinsEveryStartedPreparationAfterFailure(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	insertCoordinatorAccounts(t, st, 2)
 	server := &Server{m: &pool.Manager{Store: st}}
-	release := make(chan struct{})
-	preparer := &fleetSourcePreparer{
-		started: make(chan string, 2), release: release, failName: "acct-02",
-	}
+	preparer := &fleetSourcePreparer{failName: "acct-02"}
 	coordinator := newTenantCoordinator(t.Context(), server, preparer, &fleetLifecycleRuntime{})
-	done := make(chan error, 1)
-	go func() { done <- coordinator.initialize(t.Context()) }()
-	for range 2 {
-		select {
-		case <-preparer.started:
-		case <-time.After(time.Second):
-			t.Fatal("startup did not begin the exact active fleet")
-		}
-	}
-	select {
-	case err := <-done:
-		t.Fatalf("startup returned before every started preparation settled: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(release)
-	if err := <-done; err == nil {
-		t.Fatal("startup preparation failure reported readiness")
+	if err := coordinator.initialize(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	prepared, active, _ := preparer.counts()
-	slices.Sort(prepared)
-	if !slices.Equal(prepared, []string{"acct-01", "acct-02"}) || active != 0 {
+	if len(prepared) != 0 || active != 0 {
 		t.Fatalf("settled startup fleet = prepared %v active %d", prepared, active)
 	}
 }
@@ -1097,7 +1066,7 @@ func TestActivatePreparedValidatesBeforeSessionActivation(t *testing.T) {
 	preparer := &sourcePreparerStub{validateErr: validationErr}
 	activated := false
 	err := (&tenantCoordinator{preparer: preparer}).activatePrepared(
-		t.Context(), account, catalogproto.TenantPreparationProof{},
+		t.Context(), account, testPreparationLease(), catalogproto.TenantPreparationProof{},
 		func() error {
 			activated = true
 			return nil

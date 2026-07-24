@@ -268,12 +268,13 @@ func runCredentialOperationObserved[T any](
 			}
 			return result, flight.err
 		}
-		if manager.ClaimCredentialMutation == nil {
+		claimCredentialMutation := credentialMutationClaim(ctx, manager.ClaimCredentialMutation)
+		if claimCredentialMutation == nil {
 			err = errors.New("pool: credential mutation claim is required")
 			manager.finishCredentialFlight(account.ID, flight, zero, err)
 			return zero, err
 		}
-		releaseCredentialClaim, err := manager.ClaimCredentialMutation(account.ID)
+		releaseCredentialClaim, err := claimCredentialMutation(account.ID)
 		if err != nil {
 			manager.finishCredentialFlight(account.ID, flight, zero, err)
 			return zero, err

@@ -178,5 +178,7 @@ func TestSyncProxyCarriesAccessOnlyExportAndApplyAcknowledges(t *testing.T) {
 	}
 }
 
-var _ syncservice.Transport = (*proxiedSyncTransport)(nil)
-var _ converge.Driver[hostsync.AccountValue] = (*proxyApplyDriver)(nil)
+var (
+	_ syncservice.Transport                  = (*proxiedSyncTransport)(nil)
+	_ converge.Driver[hostsync.AccountValue] = (*proxyApplyDriver)(nil)
+)

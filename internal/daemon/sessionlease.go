@@ -25,6 +25,7 @@ type sessionLeaseRuntime interface {
 type sessionLeaseManager interface {
 	Commit(context.Context, store.FileProviderLeaseReceipt, int64, store.ProcessIdentity, time.Time) (store.FileProviderLeaseReceipt, error)
 	Renew(context.Context, store.FileProviderLeaseReceipt, time.Time) (store.FileProviderLeaseReceipt, error)
+	ReleaseProvisional(context.Context, store.FileProviderLeaseReceipt) (store.FileProviderLeaseReceipt, error)
 	Release(context.Context, store.Session) (store.FileProviderLeaseReceipt, error)
 }
 
@@ -80,6 +81,29 @@ func (m catalogSessionLeaseManager) Renew(
 		return nil, err
 	}
 	return exactSessionLeaseResponse(response.Protocol, response.Code, response.Message, response.Lease, lease)
+}
+
+func (m catalogSessionLeaseManager) ReleaseProvisional(
+	ctx context.Context,
+	provisional store.FileProviderLeaseReceipt,
+) (store.FileProviderLeaseReceipt, error) {
+	lease, err := decodeSessionLease(provisional)
+	if err != nil {
+		return nil, err
+	}
+	if lease.State != catalogproto.FileProviderLeaseStateProvisional ||
+		lease.SessionID != "" || lease.ProcessIdentity != "" {
+		return nil, errors.New("release File Provider lease: invalid provisional receipt")
+	}
+	response, err := m.runtime.ReleaseFileProviderLease(ctx, lease.TenantID, catalogproto.ReleaseFileProviderLeaseRequest{
+		Protocol: catalogproto.Version, Lease: lease,
+	})
+	if err != nil {
+		return nil, err
+	}
+	expected := lease
+	expected.State = catalogproto.FileProviderLeaseStateReleased
+	return exactSessionLeaseResponse(response.Protocol, response.Code, response.Message, response.Lease, expected)
 }
 
 func (m catalogSessionLeaseManager) Release(

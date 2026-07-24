@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -124,36 +123,15 @@ type fixtureAccountPreparer struct {
 		context.Context,
 		store.PendingAccountReservation,
 		string,
-	) (store.PresentationPreparationProof, error)
-	refresh func(
-		context.Context,
-		store.Account,
-		store.PresentationPreparationProof,
-	) (store.PresentationPreparationProof, error)
+	) (store.FileProviderPresentationIdentity, error)
 }
 
 func (prepare fixtureAccountPreparer) PrepareReservedAccount(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
 	label string,
-) (store.PresentationPreparationProof, error) {
+) (store.FileProviderPresentationIdentity, error) {
 	return prepare.prepare(ctx, reservation, label)
-}
-
-func (prepare fixtureAccountPreparer) RefreshPreparedAccount(
-	ctx context.Context,
-	account store.Account,
-	proof store.PresentationPreparationProof,
-) (store.PresentationPreparationProof, error) {
-	if prepare.refresh != nil {
-		return prepare.refresh(ctx, account, proof)
-	}
-	if err := store.ValidateReservedPresentationPreparationProof(store.PendingAccountReservation{
-		ID: account.ID, InstanceID: account.InstanceID, Generation: account.Generation,
-	}, proof); err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	return proof, nil
 }
 
 func (r *fixtureAccountRemover) BeginAccountRemoval(id int, deleteCredential bool) (AccountRemoval, error) {
@@ -203,20 +181,11 @@ func materializePresentationPath(id int) string {
 func materializePreparationProof(
 	reservation store.PendingAccountReservation,
 	publicPath string,
-) store.PresentationPreparationProof {
+) store.FileProviderPresentationIdentity {
 	tenantID := "account-" + reservation.InstanceID
-	return store.PresentationPreparationProof{
-		CatalogTenantID: tenantID, CatalogGeneration: reservation.Generation,
-		Requested: 1, Desired: 1, Observed: 1, Verified: 1, Applied: 1,
-		SourceAuthority: "source-" + reservation.InstanceID,
-		SourceRevision:  1, CatalogRevision: 1,
-		ChangeID: "change-" + reservation.InstanceID, OperationID: "operation-" + reservation.InstanceID,
-		PresentationKind: store.PresentationKindFileProvider,
-		FileProvider: store.FileProviderPreparationProof{
-			TenantID: tenantID, DomainID: "domain-" + reservation.InstanceID,
-			Generation: reservation.Generation, ActivationGeneration: "activation-" + reservation.InstanceID,
-			PublicPath: publicPath,
-		},
+	return store.FileProviderPresentationIdentity{
+		TenantID: tenantID, DomainID: "domain-" + reservation.InstanceID,
+		Generation: reservation.Generation, PublicPath: publicPath,
 	}
 }
 
@@ -301,10 +270,10 @@ func newMaterializeService(t *testing.T) (*Service, *pool.Manager, *credstest.Fa
 			_ context.Context,
 			reservation store.PendingAccountReservation,
 			_ string,
-		) (store.PresentationPreparationProof, error) {
+		) (store.FileProviderPresentationIdentity, error) {
 			path := materializePresentationPath(reservation.ID)
 			if err := os.MkdirAll(path, 0o700); err != nil {
-				return store.PresentationPreparationProof{}, err
+				return store.FileProviderPresentationIdentity{}, err
 			}
 			return materializePreparationProof(reservation, path), nil
 		}},
@@ -419,10 +388,9 @@ func TestMaterializeHappyPath(t *testing.T) {
 	}
 	if presentation.AccountInstanceID != row.InstanceID ||
 		presentation.AccountGeneration != row.Generation ||
-		presentation.Proof.FileProvider.PublicPath != row.ConfigDir ||
-		presentation.Proof.SourceAuthority == "" || presentation.Proof.SourceRevision == 0 ||
-		presentation.Proof.ChangeID == "" || presentation.Proof.OperationID == "" {
-		t.Fatalf("persisted complete presentation proof = %+v", presentation)
+		presentation.Identity.PublicPath != row.ConfigDir || presentation.Identity.TenantID == "" ||
+		presentation.Identity.DomainID == "" {
+		t.Fatalf("persisted presentation identity = %+v", presentation)
 	}
 	byUUID, ok, err := m.Store.GetAccountByUUID("u-happy")
 	if err != nil || !ok {
@@ -592,12 +560,12 @@ func TestMaterializeDoesNotReportSuccessBeforeTenantPreparation(t *testing.T) {
 		_ context.Context,
 		reservation store.PendingAccountReservation,
 		label string,
-	) (store.PresentationPreparationProof, error) {
+	) (store.FileProviderPresentationIdentity, error) {
 		prepared = append(prepared, reservation)
 		if label != "peer-u-prepare" {
 			t.Fatalf("preparation label = %q", label)
 		}
-		return store.PresentationPreparationProof{}, wantErr
+		return store.FileProviderPresentationIdentity{}, wantErr
 	}}
 	oauthAccount := json.RawMessage(`{"accountUuid":"u-prepare","emailAddress":"prepare@example.com"}`)
 	result, err := s.Materialize(
@@ -616,123 +584,6 @@ func TestMaterializeDoesNotReportSuccessBeforeTenantPreparation(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Fatalf("synckit nudge ran before tenant preparation: %v", rec.calls)
-	}
-}
-
-func TestMaterializeReprepareFailureCannotPromoteOrAdmit(t *testing.T) {
-	s, m, _, _ := newMaterializeService(t)
-	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	wantErr := errors.New("activation changed")
-	s.Preparer = fixtureAccountPreparer{
-		prepare: func(
-			_ context.Context,
-			reservation store.PendingAccountReservation,
-			_ string,
-		) (store.PresentationPreparationProof, error) {
-			return materializePreparationProof(reservation, materializePresentationPath(reservation.ID)), nil
-		},
-		refresh: func(
-			context.Context,
-			store.Account,
-			store.PresentationPreparationProof,
-		) (store.PresentationPreparationProof, error) {
-			return store.PresentationPreparationProof{}, wantErr
-		},
-	}
-	result, err := s.Materialize(
-		t.Context(),
-		materializeVal(
-			"u-reprepare", "reprepare@example.com",
-			json.RawMessage(`{"accountUuid":"u-reprepare","emailAddress":"reprepare@example.com"}`),
-		),
-		freshEnvelope("at-reprepare"), materializeManifest,
-	)
-	if !errors.Is(err, wantErr) || result != (MaterializeResult{}) {
-		t.Fatalf("materialize with stale proof = result %+v err %v", result, err)
-	}
-	if _, err := m.Store.GetAccount(1); !errors.Is(err, store.ErrAccountNotFound) {
-		t.Fatalf("account after failed reprepare = %v, want absent", err)
-	}
-	if _, err := m.Store.AccountPresentation(1); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("proof after failed reprepare = %v, want absent", err)
-	}
-	health, err := m.Store.GetAuthHealth(1)
-	if err != nil || health.NeedsLogin {
-		t.Fatalf("auth health after failed reprepare = %+v err=%v", health, err)
-	}
-}
-
-func TestSyncedAdmissionRefreshesActivationAfterRestart(t *testing.T) {
-	s, m, _, _ := newMaterializeService(t)
-	if err := os.WriteFile(pool.ClaudeJSONPath(), []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	reservation, err := m.ReserveAdd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := materializePresentationPath(reservation.ID)
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	proofA := materializePreparationProof(reservation, path)
-	proofA.FileProvider.ActivationGeneration = "activation-A"
-	pending, err := m.PrepareReservedSyncedAdd(t.Context(), reservation, proofA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity := json.RawMessage(`{"accountUuid":"u-restart","emailAddress":"restart@example.com"}`)
-	if err := m.WriteIdentity(t.Context(), reservation.ID, path, identity); err != nil {
-		t.Fatal(err)
-	}
-	account, err := m.PromoteSyncedAdd(t.Context(), pending, "peer-restart", "u-restart")
-	if err != nil {
-		t.Fatal(err)
-	}
-	envelope := freshEnvelope("at-restart")
-	installed, err := m.InstallSyncedCredential(t.Context(), *account, envelope)
-	if err != nil || !installed {
-		t.Fatalf("install after promotion = %v err=%v", installed, err)
-	}
-
-	proofB := proofA
-	proofB.FileProvider.ActivationGeneration = "activation-B"
-	drifted := proofB
-	drifted.FileProvider.PublicPath += "-other"
-	if _, err := m.Store.StageSyncedAccountAdmission(
-		*account, proofA, drifted, store.SyncedCredentialAdmissionFence{},
-	); !errors.Is(err, store.ErrAccountPresentationEvidence) {
-		t.Fatalf("drifted admission err=%v", err)
-	}
-	if presentation, err := m.Store.AccountPresentation(account.ID); err != nil || presentation.Proof != proofA {
-		t.Fatalf("proof after refused admission = %+v err=%v", presentation, err)
-	}
-	if health, err := m.Store.GetAuthHealth(account.ID); err != nil || !health.NeedsLogin {
-		t.Fatalf("health after refused admission = %+v err=%v", health, err)
-	}
-	s.Preparer = fixtureAccountPreparer{refresh: func(
-		_ context.Context,
-		got store.Account,
-		retained store.PresentationPreparationProof,
-	) (store.PresentationPreparationProof, error) {
-		if got.ID != account.ID || retained != proofA {
-			t.Fatalf("refresh input = account %+v proof %+v", got, retained)
-		}
-		return proofB, nil
-	}}
-	admitted, err := s.AdmitSyncedAccount(t.Context(), *account, creds.AccessHash(envelope))
-	if err != nil || !admitted {
-		t.Fatalf("admit after activation rollover = %v err=%v", admitted, err)
-	}
-	presentation, err := m.Store.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != proofB {
-		t.Fatalf("refreshed proof = %+v err=%v, want activation B", presentation, err)
-	}
-	health, err := m.Store.GetAuthHealth(account.ID)
-	if err != nil || health.NeedsLogin || health.Kind != store.AuthKindOwned {
-		t.Fatalf("auth health after recovery = %+v err=%v", health, err)
 	}
 }
 

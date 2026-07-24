@@ -22,8 +22,8 @@ var (
 func (m *Manager) AdmitSyncedCredential(
 	ctx context.Context,
 	account store.Account,
-	currentProof store.PresentationPreparationProof,
-	freshProof store.PresentationPreparationProof,
+	currentIdentity store.FileProviderPresentationIdentity,
+	freshIdentity store.FileProviderPresentationIdentity,
 	expectedAccessHash string,
 ) (bool, error) {
 	accessHashBytes, err := hex.DecodeString(expectedAccessHash)
@@ -51,7 +51,7 @@ func (m *Manager) AdmitSyncedCredential(
 			return result, flight.err
 		}
 		admitted, admissionErr := m.admitSyncedCredentialClaimed(
-			ctx, account, currentProof, freshProof, accessHashDigest, expectedAccessHash,
+			ctx, account, currentIdentity, freshIdentity, accessHashDigest, expectedAccessHash,
 		)
 		m.finishCredentialFlight(account.ID, flight, admitted, admissionErr)
 		return admitted, admissionErr
@@ -61,8 +61,8 @@ func (m *Manager) AdmitSyncedCredential(
 func (m *Manager) admitSyncedCredentialClaimed(
 	ctx context.Context,
 	account store.Account,
-	currentProof store.PresentationPreparationProof,
-	freshProof store.PresentationPreparationProof,
+	currentIdentity store.FileProviderPresentationIdentity,
+	freshIdentity store.FileProviderPresentationIdentity,
 	accessHashDigest store.CredentialDigest,
 	expectedAccessHash string,
 ) (bool, error) {
@@ -78,15 +78,15 @@ func (m *Manager) admitSyncedCredentialClaimed(
 	}
 	defer release()
 	return m.admitSyncedCredential(
-		ctx, account, currentProof, freshProof, accessHashDigest, expectedAccessHash,
+		ctx, account, currentIdentity, freshIdentity, accessHashDigest, expectedAccessHash,
 	)
 }
 
 func (m *Manager) admitSyncedCredential(
 	ctx context.Context,
 	account store.Account,
-	currentProof store.PresentationPreparationProof,
-	freshProof store.PresentationPreparationProof,
+	currentIdentity store.FileProviderPresentationIdentity,
+	freshIdentity store.FileProviderPresentationIdentity,
 	accessHashDigest store.CredentialDigest,
 	expectedAccessHash string,
 ) (admitted bool, resultErr error) {
@@ -155,7 +155,7 @@ func (m *Manager) admitSyncedCredential(
 		TokenChainDigest:    *verifiedTokenChain,
 		AccessHashDigest:    accessHashDigest,
 	}
-	stage, err := m.Store.StageSyncedAccountAdmission(account, currentProof, freshProof, fence)
+	stage, err := m.Store.StageSyncedAccountAdmission(account, currentIdentity, freshIdentity, fence)
 	if err != nil {
 		return false, err
 	}
@@ -179,7 +179,7 @@ func (m *Manager) admitSyncedCredential(
 		if syncedAdmissionFailpoint != nil {
 			syncedAdmissionFailpoint("after-post-stage-observation")
 		}
-		candidate, err := m.Store.CommitSyncedAccountAdmissionCandidate(account, freshProof, fence)
+		candidate, err := m.Store.CommitSyncedAccountAdmissionCandidate(account, freshIdentity, fence)
 		if err != nil {
 			return false, err
 		}
@@ -197,7 +197,7 @@ func (m *Manager) admitSyncedCredential(
 		postCandidate, postCandidateTokenChain, err := m.credentialTokenChainStateAtObservation(ctx, account)
 		if err != nil || !sameStoreObservation(verified, postCandidate) ||
 			postCandidateTokenChain == nil || *postCandidateTokenChain != *verifiedTokenChain {
-			rejectErr := m.Store.RejectSyncedAccountAdmissionCandidate(account, freshProof, fence)
+			rejectErr := m.Store.RejectSyncedAccountAdmissionCandidate(account, freshIdentity, fence)
 			if err != nil {
 				return false, errors.Join(err, rejectErr)
 			}
@@ -209,13 +209,13 @@ func (m *Manager) admitSyncedCredential(
 		settleObserved, settleTokenChain, err := m.credentialTokenChainStateAtObservation(ctx, account)
 		if err != nil || !sameStoreObservation(verified, settleObserved) ||
 			settleTokenChain == nil || *settleTokenChain != *verifiedTokenChain {
-			rejectErr := m.Store.RejectSyncedAccountAdmissionCandidate(account, freshProof, fence)
+			rejectErr := m.Store.RejectSyncedAccountAdmissionCandidate(account, freshIdentity, fence)
 			if err != nil {
 				return false, errors.Join(err, rejectErr)
 			}
 			return false, errors.Join(ErrCredentialChangedUnderfoot, rejectErr)
 		}
-		settled, err := m.Store.SettleSyncedAccountAdmission(account, freshProof, fence)
+		settled, err := m.Store.SettleSyncedAccountAdmission(account, freshIdentity, fence)
 		if err != nil {
 			return false, err
 		}
@@ -246,7 +246,7 @@ func (m *Manager) reconcileChangedSyncedAdmission(account store.Account) error {
 		}
 		return m.Store.RejectSyncedAccountAdmissionCandidate(
 			account,
-			presentation.Proof,
+			presentation.Identity,
 			pending.SyncedCredentialAdmissionFence,
 		)
 	}
@@ -266,7 +266,7 @@ func (m *Manager) reconcileChangedSyncedAdmission(account store.Account) error {
 	}
 	return m.Store.InvalidateSyncedAccountAdmission(
 		account,
-		presentation.Proof,
+		presentation.Identity,
 		final.SyncedCredentialAdmissionFence,
 	)
 }

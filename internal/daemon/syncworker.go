@@ -84,53 +84,27 @@ func (r *hostSyncWorkerRemover) PrepareReservedAccount(
 	ctx context.Context,
 	reservation store.PendingAccountReservation,
 	label string,
-) (store.PresentationPreparationProof, error) {
+) (store.FileProviderPresentationIdentity, error) {
 	coordinator, err := r.runtime(ctx)
 	if err != nil {
-		return store.PresentationPreparationProof{}, err
+		return store.FileProviderPresentationIdentity{}, err
 	}
 	account := store.Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID,
-		Generation: reservation.Generation, Label: label,
+		Generation: reservation.Generation, ConfigDir: pool.FileProviderConfigDir(reservation.ID), Label: label,
 	}
-	proof, err := coordinator.prepare(ctx, account)
+	tenantAccount := pool.TenantAccount(account)
+	if err := coordinator.ensureTenant(ctx, account, tenantAccount); err != nil {
+		return store.FileProviderPresentationIdentity{}, err
+	}
+	identity, err := expectedPresentationIdentity(account)
 	if err != nil {
-		return store.PresentationPreparationProof{}, err
+		return store.FileProviderPresentationIdentity{}, err
 	}
-	if err := coordinator.activatePrepared(ctx, account, proof, func() error { return nil }); err != nil {
-		return store.PresentationPreparationProof{}, err
+	if err := store.ValidateReservedPresentationIdentity(reservation, identity); err != nil {
+		return store.FileProviderPresentationIdentity{}, err
 	}
-	storedProof, err := projectPreparationProof(proof)
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	if err := validateReservedPreparationProof(reservation, storedProof); err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	return storedProof, nil
-}
-
-func (r *hostSyncWorkerRemover) RefreshPreparedAccount(
-	ctx context.Context,
-	account store.Account,
-	retained store.PresentationPreparationProof,
-) (store.PresentationPreparationProof, error) {
-	coordinator, err := r.runtime(ctx)
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	freshCatalogProof, err := coordinator.prepare(ctx, account)
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	fresh, err := projectPreparationProof(freshCatalogProof)
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	if err := store.ValidatePresentationPreparationProofAdvance(retained, fresh); err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	return fresh, nil
+	return identity, nil
 }
 
 func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator, error) {
@@ -143,16 +117,11 @@ func (r *hostSyncWorkerRemover) runtime(ctx context.Context) (*tenantCoordinator
 	if err != nil {
 		return nil, fmt.Errorf("connect FuseKit runtime: %w", err)
 	}
-	preparer, err := tenantfs.NewPreparer(client)
-	if err != nil {
-		_ = client.Close()
-		return nil, err
-	}
 	server := &Server{m: r.manager}
 	lifecycle, cancel := contextWithoutCancelUntil(ctx, r.lifecycle.Done())
 	r.client = client
 	r.cancel = cancel
-	r.coordinator = newTenantCoordinator(lifecycle, server, preparer, client)
+	r.coordinator = newTenantCoordinator(lifecycle, server, nil, client)
 	return r.coordinator, nil
 }
 

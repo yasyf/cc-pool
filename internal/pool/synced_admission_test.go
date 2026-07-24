@@ -138,7 +138,7 @@ func TestAdmitSyncedCredentialPersistsExactEvidenceAndRetriesAfterReopen(t *test
 		t.Fatalf("admitted health = %+v err=%v", health, err)
 	}
 	presentation, err := reopened.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != freshProof {
+	if err != nil || presentation.Identity != freshProof {
 		t.Fatalf("admitted proof = %+v err=%v", presentation, err)
 	}
 	evidence, err := reopened.SyncedCredentialAdmission(account)
@@ -156,7 +156,6 @@ func TestAdmitSyncedCredentialPersistsExactEvidenceAndRetriesAfterReopen(t *test
 	rotated.ClaudeAiOauth.AccessToken = "synced-access-rotated"
 	fake.Put(account.KeychainService, account.KeychainAccount, &rotated)
 	nextProof := freshProof
-	nextProof.FileProvider.ActivationGeneration = "activation-C"
 	admitted, err = manager.AdmitSyncedCredential(
 		t.Context(), account, freshProof, nextProof, creds.AccessHash(&rotated),
 	)
@@ -407,7 +406,6 @@ func TestAdmitSyncedCredentialRefusesLiveSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	nextProof := freshProof
-	nextProof.FileProvider.ActivationGeneration = "activation-C"
 	admitted, err = manager.AdmitSyncedCredential(
 		t.Context(), account, freshProof, nextProof, creds.AccessHash(credential),
 	)
@@ -419,7 +417,7 @@ func TestAdmitSyncedCredentialRefusesLiveSession(t *testing.T) {
 		t.Fatalf("live-session admission health = %+v err=%v", health, err)
 	}
 	presentation, err := manager.Store.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != freshProof {
+	if err != nil || presentation.Identity != freshProof {
 		t.Fatalf("live-session admission proof = %+v err=%v", presentation, err)
 	}
 	if _, err := manager.Store.SyncedCredentialAdmission(account); err != nil {
@@ -429,7 +427,7 @@ func TestAdmitSyncedCredentialRefusesLiveSession(t *testing.T) {
 
 func syncedAdmissionFixture(
 	t *testing.T,
-) (*Manager, *credstest.Fake, store.Account, store.PresentationPreparationProof, store.PresentationPreparationProof, *creds.Credential, string) {
+) (*Manager, *credstest.Fake, store.Account, store.FileProviderPresentationIdentity, store.FileProviderPresentationIdentity, *creds.Credential, string) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -463,7 +461,6 @@ func syncedAdmissionFixture(
 		t.Fatal(err)
 	}
 	freshProof := currentProof
-	freshProof.FileProvider.ActivationGeneration = "activation-B"
 	credential := &creds.Credential{ClaudeAiOauth: creds.OAuth{
 		AccessToken: "synced-access", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
 	}}
@@ -473,20 +470,12 @@ func syncedAdmissionFixture(
 
 func syncedAdmissionProof(
 	account store.Account,
-	activation string,
-) store.PresentationPreparationProof {
+	_ string,
+) store.FileProviderPresentationIdentity {
 	tenantID := "account-" + account.InstanceID
-	return store.PresentationPreparationProof{
-		CatalogTenantID: tenantID, CatalogGeneration: account.Generation,
-		Requested: 1, Desired: 1, Observed: 1, Verified: 1, Applied: 1,
-		SourceAuthority: "source-authority", SourceRevision: 1, CatalogRevision: 1,
-		ChangeID: "change-id", OperationID: "operation-id",
-		PresentationKind: store.PresentationKindFileProvider,
-		FileProvider: store.FileProviderPreparationProof{
-			TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
-			Generation: account.Generation, ActivationGeneration: activation,
-			PublicPath: account.ConfigDir,
-		},
+	return store.FileProviderPresentationIdentity{
+		TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
+		Generation: account.Generation, PublicPath: account.ConfigDir,
 	}
 }
 
@@ -494,7 +483,7 @@ func assertSyncedAdmissionPending(
 	t *testing.T,
 	st *store.Store,
 	account store.Account,
-	wantProof store.PresentationPreparationProof,
+	wantProof store.FileProviderPresentationIdentity,
 ) {
 	t.Helper()
 	health, err := st.GetAuthHealth(account.ID)
@@ -502,7 +491,7 @@ func assertSyncedAdmissionPending(
 		t.Fatalf("pending health = %+v err=%v", health, err)
 	}
 	presentation, err := st.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != wantProof {
+	if err != nil || presentation.Identity != wantProof {
 		t.Fatalf("pending proof = %+v err=%v", presentation, err)
 	}
 	if _, err := st.SyncedCredentialAdmission(account); !errors.Is(err, sql.ErrNoRows) {
@@ -514,7 +503,7 @@ func assertSyncedAdmissionLiability(
 	t *testing.T,
 	st *store.Store,
 	account store.Account,
-	wantProof store.PresentationPreparationProof,
+	wantProof store.FileProviderPresentationIdentity,
 ) {
 	t.Helper()
 	health, err := st.GetAuthHealth(account.ID)
@@ -522,7 +511,7 @@ func assertSyncedAdmissionLiability(
 		t.Fatalf("pending liability health = %+v err=%v", health, err)
 	}
 	presentation, err := st.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != wantProof {
+	if err != nil || presentation.Identity != wantProof {
 		t.Fatalf("pending liability proof = %+v err=%v", presentation, err)
 	}
 	pending, err := st.PendingSyncedCredentialAdmission(account)
@@ -545,7 +534,7 @@ func assertSyncedAdmissionCandidate(
 	t *testing.T,
 	st *store.Store,
 	account store.Account,
-	wantProof store.PresentationPreparationProof,
+	wantProof store.FileProviderPresentationIdentity,
 ) {
 	t.Helper()
 	health, err := st.GetAuthHealth(account.ID)
@@ -553,7 +542,7 @@ func assertSyncedAdmissionCandidate(
 		t.Fatalf("candidate health = %+v err=%v", health, err)
 	}
 	presentation, err := st.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != wantProof {
+	if err != nil || presentation.Identity != wantProof {
 		t.Fatalf("candidate proof = %+v err=%v", presentation, err)
 	}
 	pending, err := st.PendingSyncedCredentialAdmission(account)
@@ -576,7 +565,7 @@ func assertSyncedAdmissionFinal(
 	t *testing.T,
 	st *store.Store,
 	account store.Account,
-	wantProof store.PresentationPreparationProof,
+	wantProof store.FileProviderPresentationIdentity,
 ) {
 	t.Helper()
 	health, err := st.GetAuthHealth(account.ID)
@@ -584,7 +573,7 @@ func assertSyncedAdmissionFinal(
 		t.Fatalf("final admission health = %+v err=%v", health, err)
 	}
 	presentation, err := st.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != wantProof {
+	if err != nil || presentation.Identity != wantProof {
 		t.Fatalf("final admission proof = %+v err=%v", presentation, err)
 	}
 	if _, err := st.SyncedCredentialAdmission(account); err != nil {

@@ -155,18 +155,10 @@ func hostsyncTestDigest(value string) store.CredentialDigest {
 func hostsyncTestPresentationProof(
 	reservation store.PendingAccountReservation,
 	publicPath string,
-) store.PresentationPreparationProof {
+) store.FileProviderPresentationIdentity {
 	tenantID := "account-" + reservation.InstanceID
-	return store.PresentationPreparationProof{
-		CatalogTenantID: tenantID, CatalogGeneration: reservation.Generation,
-		Requested: 1, Desired: 1, Observed: 1, Verified: 1, Applied: 1,
-		SourceAuthority: "hostsync-test-source", SourceRevision: 1, CatalogRevision: 1,
-		ChangeID: "hostsync-test-change", OperationID: "hostsync-test-operation",
-		PresentationKind: store.PresentationKindFileProvider,
-		FileProvider: store.FileProviderPreparationProof{
-			TenantID: tenantID, DomainID: "domain-" + reservation.InstanceID,
-			Generation: reservation.Generation, ActivationGeneration: "activation-" + reservation.InstanceID,
-			PublicPath: publicPath,
-		},
+	return store.FileProviderPresentationIdentity{
+		TenantID: tenantID, DomainID: "domain-" + reservation.InstanceID,
+		Generation: reservation.Generation, PublicPath: publicPath,
 	}
 }

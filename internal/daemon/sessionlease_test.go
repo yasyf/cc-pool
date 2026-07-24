@@ -20,6 +20,13 @@ type testSessionLeaseManager struct {
 	release func(store.Session) (store.FileProviderLeaseReceipt, error)
 }
 
+func (m *testSessionLeaseManager) ReleaseProvisional(
+	context.Context,
+	store.FileProviderLeaseReceipt,
+) (store.FileProviderLeaseReceipt, error) {
+	return store.FileProviderLeaseReceipt("released-provisional"), nil
+}
+
 func (m *testSessionLeaseManager) Commit(
 	_ context.Context,
 	receipt store.FileProviderLeaseReceipt,

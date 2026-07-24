@@ -5,12 +5,10 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +19,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
 	"github.com/yasyf/fusekit/catalogproto"
@@ -117,30 +116,15 @@ func TestAccountMutationAddReceiptZeroScopeReplaysWithoutReservationOrCredential
 	}
 }
 
-func TestAccountMutationAddCommitsAndRevalidatesExactPresentationAfterLostResponse(t *testing.T) {
+func TestAccountMutationAddCommitsOneImmutablePresentationIdentity(t *testing.T) {
 	s, fake, _ := newAccountMutationTestServer(t, false)
 	var preparations atomic.Int64
-	s.prepareReservedAccount = func(
+	s.provisionPresentationIdentity = func(
 		_ context.Context,
-		reservation store.PendingAccountReservation,
-	) (catalogproto.TenantPreparationProof, error) {
-		account := store.Account{
-			ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
-		}
-		proof := daemonTestPreparationProof(
-			account,
-			fmt.Sprintf("/Users/test/Library/CloudStorage/cc-pool-account-%d", account.ID),
-		)
-		proof.Presentation.FileProvider.ActivationGeneration = fmt.Sprintf(
-			"activation-%d", preparations.Add(1),
-		)
-		return proof, nil
-	}
-	s.prepareAccount = func(
-		context.Context,
-		store.Account,
-	) (catalogproto.TenantPreparationProof, error) {
-		return catalogproto.TenantPreparationProof{}, errors.New("holder stopped after account commit")
+		account store.Account,
+	) (store.FileProviderPresentationIdentity, error) {
+		preparations.Add(1)
+		return expectedPresentationIdentity(account)
 	}
 	request := AccountMutationRequest{
 		Kind: AccountMutationAdd, Action: AccountMutationStartOrAttach, Label: "new-account",
@@ -183,83 +167,31 @@ func TestAccountMutationAddCommitsAndRevalidatesExactPresentationAfterLostRespon
 		t.Fatal(err)
 	}
 	completed, err := s.finishAccountMutation(t.Context(), mutation)
-	if err == nil || completed.Completed || !strings.Contains(err.Error(), "holder stopped after account commit") {
-		t.Fatalf("lost add response = %+v err=%v", completed, err)
+	if err != nil || !completed.Completed {
+		t.Fatalf("completed add = %+v err=%v", completed, err)
 	}
-	if preparations.Load() < 3 {
-		t.Fatalf("add preparation refreshes = %d, want bind and publish refreshes", preparations.Load())
+	if preparations.Load() != 1 {
+		t.Fatalf("presentation provisions = %d, want one", preparations.Load())
 	}
 	receipt, err := s.m.Store.AccountMutationReceipt(store.AccountMutationID(begin.OperationID))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !receipt.PublicationPending {
-		t.Fatal("lost add response cleared publication fence")
+	if receipt.PublicationPending {
+		t.Fatal("completed add retained publication fence")
 	}
 	presentation, err := s.m.Store.AccountPresentation(receipt.AccountID)
-	if err != nil || presentation.Proof != receipt.PresentationProof {
+	if err != nil || presentation.Identity != receipt.PresentationIdentity {
 		t.Fatalf("committed presentation = %+v receipt=%+v err=%v", presentation, receipt, err)
 	}
-	if active, err := s.m.Store.ListActiveAccounts(); err != nil || len(active) != 0 {
-		t.Fatalf("publication-pending active accounts = %+v err=%v", active, err)
-	}
-	var validations atomic.Int64
-	var settlements atomic.Int64
-	s.m.SettleCredentialWrite = func(context.Context, pool.CredentialWriteSettlement) error {
-		settlements.Add(1)
-		return nil
-	}
-	restarted := &Server{
-		m: s.m, log: log.New(io.Discard, "", 0),
-		prepareAccount: func(
-			_ context.Context,
-			account store.Account,
-		) (catalogproto.TenantPreparationProof, error) {
-			proof := daemonTestPreparationProof(account, account.ConfigDir)
-			proof.Presentation.FileProvider.ActivationGeneration = "activation-after-restart"
-			return proof, nil
-		},
-		activatePrepared: func(
-			_ context.Context,
-			_ store.Account,
-			proof catalogproto.TenantPreparationProof,
-			activate func() error,
-		) error {
-			got, err := projectPreparationProof(proof)
-			if err != nil {
-				return err
-			}
-			if err := store.ValidatePresentationPreparationProofAdvance(
-				presentation.Proof, got,
-			); err != nil {
-				return err
-			}
-			validations.Add(1)
-			return activate()
-		},
-	}
-	if err := restarted.recoverPendingAccountMutationPublications(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	receipt, err = s.m.Store.AccountMutationReceipt(receipt.OperationID)
-	if err != nil || receipt.PublicationPending || validations.Load() != 1 || settlements.Load() != 1 {
-		t.Fatalf(
-			"automatic publication recovery = %+v validations=%d settlements=%d err=%v",
-			receipt, validations.Load(), settlements.Load(), err,
-		)
-	}
 	if active, err := s.m.Store.ListActiveAccounts(); err != nil || len(active) != 1 || active[0].ID != receipt.AccountID {
-		t.Fatalf("recovered active accounts = %+v err=%v", active, err)
+		t.Fatalf("active accounts = %+v err=%v", active, err)
 	}
 	request.Action = AccountMutationStartOrAttach
 	request.Fence = AccountMutationFence{}
-	replayed, err := runAccountMutationTest(t, restarted, request, nil)
-	if err != nil || !replayed.Completed || replayed.OperationID != begin.OperationID ||
-		validations.Load() != 2 || settlements.Load() != 1 {
-		t.Fatalf(
-			"lost-response replay = %+v validations=%d settlements=%d err=%v",
-			replayed, validations.Load(), settlements.Load(), err,
-		)
+	replayed, err := runAccountMutationTest(t, s, request, nil)
+	if err != nil || !replayed.Completed || replayed.OperationID != begin.OperationID {
+		t.Fatalf("receipt replay = %+v err=%v", replayed, err)
 	}
 }
 
@@ -947,28 +879,12 @@ func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) 
 	s, fake, account := newAccountMutationTestServer(t, true)
 	targetPath := seedAccountPresentationQuarantine(t, s, account)
 	var preparations atomic.Int64
-	s.prepareReservedAccount = func(
-		_ context.Context,
-		reservation store.PendingAccountReservation,
-	) (catalogproto.TenantPreparationProof, error) {
-		prepared := store.Account{
-			ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
-		}
-		proof := daemonTestPreparationProof(prepared, targetPath)
-		proof.Presentation.FileProvider.ActivationGeneration = fmt.Sprintf(
-			"activation-%d", preparations.Add(1),
-		)
-		return proof, nil
-	}
-	s.prepareAccount = func(
+	s.provisionPresentationIdentity = func(
 		_ context.Context,
 		account store.Account,
-	) (catalogproto.TenantPreparationProof, error) {
-		proof := daemonTestPreparationProof(account, targetPath)
-		proof.Presentation.FileProvider.ActivationGeneration = fmt.Sprintf(
-			"activation-%d", preparations.Add(1),
-		)
-		return proof, nil
+	) (store.FileProviderPresentationIdentity, error) {
+		preparations.Add(1)
+		return expectedPresentationIdentity(account)
 	}
 	s.accountMutationTerminal = accountMutationTerminalRunnerFunc(func(
 		ctx context.Context,
@@ -1002,7 +918,7 @@ func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) 
 	}
 	active, err := s.m.Store.AccountMutation(store.AccountMutationID(begin.OperationID))
 	if err != nil || active.Kind != store.AccountMutationPresentationRebind ||
-		active.PresentationProof.FileProvider.PublicPath != targetPath {
+		active.PresentationIdentity.PublicPath != targetPath {
 		t.Fatalf("internal rebind = %+v err=%v", active, err)
 	}
 	request.Action = AccountMutationProvideInput
@@ -1015,8 +931,8 @@ func TestPresentationQuarantinedReloginRebindsAndReplaysAsRelogin(t *testing.T) 
 		completed.State != AccountMutationCompleted || completed.ConfigDir != targetPath {
 		t.Fatalf("completed rebind = %+v err=%v", completed, err)
 	}
-	if preparations.Load() < 5 {
-		t.Fatalf("preparation refreshes = %d, want bind plus every durable boundary", preparations.Load())
+	if preparations.Load() != 1 {
+		t.Fatalf("presentation provisions = %d, want one", preparations.Load())
 	}
 	updated, err := s.m.Store.GetAccount(account.ID)
 	if err != nil || updated.Generation != account.Generation+1 || updated.ConfigDir != targetPath {
@@ -1088,17 +1004,19 @@ func seedAccountPresentationQuarantine(
 	account store.Account,
 ) string {
 	t.Helper()
-	targetPath := fmt.Sprintf(
-		"/Users/test/Library/CloudStorage/cc-pool-account-%d", account.ID,
-	)
-	target, err := projectPreparationProof(daemonTestPreparationProof(account, targetPath))
+	targetAccount := account
+	targetAccount.Generation++
+	targetAccount.ConfigDir = pool.FileProviderConfigDir(account.ID)
+	target, err := expectedPresentationIdentity(targetAccount)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.m.Store.ObserveAccountPresentation(account, target); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
+	observed := target
+	observed.Generation = account.Generation
+	if err := s.m.Store.ObserveAccountPresentation(account, observed); !errors.Is(err, store.ErrAccountPresentationQuarantined) {
 		t.Fatalf("seed presentation quarantine: %v", err)
 	}
-	return targetPath
+	return target.PublicPath
 }
 
 func newAccountMutationTestServer(
@@ -1152,26 +1070,15 @@ func newAccountMutationTestServer(
 	s := &Server{
 		m: m, cl: newClaims(), log: log.New(io.Discard, "", 0), accountMutationLifetime: t.Context(),
 		accountMutationOwner: func() (proc.Record, error) { return owner, nil },
-		prepareReservedAccount: func(_ context.Context, reservation store.PendingAccountReservation) (catalogproto.TenantPreparationProof, error) {
-			account := store.Account{
-				ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
-			}
-			publicPath := testFileProviderConfigDir(reservation.ID)
-			if reservation.Generation > 1 {
-				publicPath = fmt.Sprintf(
-					"/Users/test/Library/CloudStorage/cc-pool-account-%d", reservation.ID,
-				)
-			}
+		provisionPresentationIdentity: func(_ context.Context, account store.Account) (store.FileProviderPresentationIdentity, error) {
+			return expectedPresentationIdentity(account)
+		},
+		prepareAccount: func(_ context.Context, account store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
 			return daemonTestPreparationProof(
-				account, publicPath,
+				account, pool.FileProviderConfigDir(account.ID),
 			), nil
 		},
-		prepareAccount: func(_ context.Context, account store.Account) (catalogproto.TenantPreparationProof, error) {
-			return daemonTestPreparationProof(
-				account, fmt.Sprintf("/Users/test/Library/CloudStorage/cc-pool-account-%d", account.ID),
-			), nil
-		},
-		activatePrepared: func(_ context.Context, _ store.Account, _ catalogproto.TenantPreparationProof, activate func() error) error {
+		activatePrepared: func(_ context.Context, _ store.Account, _ tenantfs.PreparationLease, _ catalogproto.TenantPreparationProof, activate func() error) error {
 			return activate()
 		},
 	}

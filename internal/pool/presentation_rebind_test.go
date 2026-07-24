@@ -265,8 +265,7 @@ func presentationRebindFixtureWithOldState(
 		t.Fatalf("seed presentation quarantine: %v", err)
 	}
 	proof := drifted
-	proof.CatalogGeneration++
-	proof.FileProvider.Generation++
+	proof.Generation++
 	oldCredential := presentationRebindCredential("old")
 	if expired {
 		oldCredential.ClaudeAiOauth.ExpiresAt = time.Now().Add(-time.Hour).UnixMilli()
@@ -369,18 +368,11 @@ func presentationRebindFixtureWithOldState(
 func presentationRebindProof(
 	account store.Account,
 	publicPath string,
-	activation string,
-) store.PresentationPreparationProof {
-	return store.PresentationPreparationProof{
-		CatalogTenantID: "account-" + account.InstanceID, CatalogGeneration: account.Generation,
-		Requested: 7, Desired: 7, Observed: 7, Verified: 7, Applied: 7,
-		SourceAuthority: "source-authority", SourceRevision: 5, CatalogRevision: 7,
-		ChangeID: "change-id", OperationID: "operation-id",
-		PresentationKind: store.PresentationKindFileProvider,
-		FileProvider: store.FileProviderPreparationProof{
-			TenantID: "account-" + account.InstanceID, DomainID: "domain-" + account.InstanceID,
-			Generation: account.Generation, ActivationGeneration: activation, PublicPath: publicPath,
-		},
+	_ string,
+) store.FileProviderPresentationIdentity {
+	return store.FileProviderPresentationIdentity{
+		TenantID: "account-" + account.InstanceID, DomainID: "domain-" + account.InstanceID,
+		Generation: account.Generation, PublicPath: publicPath,
 	}
 }
 

@@ -257,12 +257,12 @@ func TestPromoteReservedSyncedAccountStartsAwaitingOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 	if presentation.AccountInstanceID != account.InstanceID ||
-		presentation.AccountGeneration != account.Generation || presentation.Proof != proof {
+		presentation.AccountGeneration != account.Generation || presentation.Identity != proof {
 		t.Fatalf("committed presentation = %+v, want proof %+v", presentation, proof)
 	}
 }
 
-func TestPromoteReservedSyncedAccountRejectsIncompleteProofAtomically(t *testing.T) {
+func TestPromoteReservedSyncedAccountRejectsIncompleteIdentityAtomically(t *testing.T) {
 	s := openReserveTest(t)
 	reservation := mustReserve(t, s)
 	account := Account{
@@ -271,9 +271,9 @@ func TestPromoteReservedSyncedAccountRejectsIncompleteProofAtomically(t *testing
 		KeychainService: "svc", KeychainAccount: "user", AccountUUID: "external-uuid",
 	}
 	proof := presentationTestProof(account, account.ConfigDir, "activation-synced")
-	proof.SourceAuthority = ""
+	proof.DomainID = ""
 	if err := s.PromoteReservedSyncedAccount(reservation, account, proof); !errors.Is(err, ErrAccountPresentationEvidence) {
-		t.Fatalf("incomplete proof promotion = %v, want presentation evidence error", err)
+		t.Fatalf("incomplete identity promotion = %v, want presentation evidence error", err)
 	}
 	if _, err := s.GetAccount(account.ID); !errors.Is(err, ErrAccountNotFound) {
 		t.Fatalf("account after refused proof = %v, want absent", err)
@@ -330,7 +330,7 @@ func TestPromoteReservedSyncedAccountLostResponseReplaysAfterReopen(t *testing.T
 		t.Fatalf("committed account = %+v err=%v", committed, err)
 	}
 	presentation, err := s.AccountPresentation(account.ID)
-	if err != nil || presentation.Proof != proof {
+	if err != nil || presentation.Identity != proof {
 		t.Fatalf("committed presentation = %+v err=%v", presentation, err)
 	}
 	health, err := s.GetAuthHealth(account.ID)

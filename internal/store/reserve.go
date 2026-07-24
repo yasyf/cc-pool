@@ -105,23 +105,23 @@ func consumeReservation(e rowExecer, reservation PendingAccountReservation) erro
 }
 
 // PromoteReservedSyncedAccount atomically publishes a non-origin row, its
-// complete FuseKit presentation proof, and awaiting-origin health state.
+// immutable File Provider presentation identity, and awaiting-origin health state.
 func (s *Store) PromoteReservedSyncedAccount(
 	reservation PendingAccountReservation,
 	a Account,
-	proof PresentationPreparationProof,
+	identity FileProviderPresentationIdentity,
 ) error {
 	if a.AccountUUID == "" {
 		return errors.New("promote synced account: external UUID is required")
 	}
-	return s.promoteReservedAccount(reservation, a, true, &proof)
+	return s.promoteReservedAccount(reservation, a, true, &identity)
 }
 
 func (s *Store) promoteReservedAccount(
 	reservation PendingAccountReservation,
 	a Account,
 	awaitingOrigin bool,
-	presentationProof *PresentationPreparationProof,
+	presentationIdentity *FileProviderPresentationIdentity,
 ) error {
 	if err := validatePendingReservationFence(reservation); err != nil {
 		return err
@@ -131,12 +131,14 @@ func (s *Store) promoteReservedAccount(
 		return fmt.Errorf("promote account %d: reserved identity changed", a.ID)
 	}
 	if awaitingOrigin {
-		if presentationProof == nil {
-			return errors.New("promote synced account: presentation proof is required")
+		if presentationIdentity == nil {
+			return errors.New("promote synced account: presentation identity is required")
 		}
-		if err := validatePresentationPreparationProofForAccount(
-			*presentationProof, a.InstanceID, a.Generation, a.ConfigDir,
-		); err != nil {
+		if err := ValidateReservedPresentationIdentity(reservation, *presentationIdentity); err != nil ||
+			presentationIdentity.PublicPath != a.ConfigDir {
+			if err == nil {
+				err = ErrAccountPresentationEvidence
+			}
 			return fmt.Errorf("promote synced account: %w", err)
 		}
 	}
@@ -146,8 +148,8 @@ func (s *Store) promoteReservedAccount(
 	}
 	defer func() { _ = tx.Rollback() }()
 	if err := consumeReservation(tx, reservation); err != nil {
-		if awaitingOrigin && presentationProof != nil {
-			replayed, replayErr := exactSyncedPromotion(tx, a, *presentationProof)
+		if awaitingOrigin && presentationIdentity != nil {
+			replayed, replayErr := exactSyncedPromotion(tx, a, *presentationIdentity)
 			if replayErr != nil {
 				return errors.Join(err, replayErr)
 			}
@@ -192,7 +194,7 @@ func (s *Store) promoteReservedAccount(
 	if awaitingOrigin {
 		if err := upsertAccountPresentation(tx, AccountPresentation{
 			AccountID: a.ID, AccountInstanceID: a.InstanceID,
-			AccountGeneration: a.Generation, Proof: *presentationProof, ObservedAt: s.now(),
+			AccountGeneration: a.Generation, Identity: *presentationIdentity, ObservedAt: s.now(),
 		}); err != nil {
 			return fmt.Errorf("promote synced account %d presentation: %w", a.ID, err)
 		}
@@ -214,7 +216,7 @@ func (s *Store) promoteReservedAccount(
 func exactSyncedPromotion(
 	tx *sql.Tx,
 	expected Account,
-	proof PresentationPreparationProof,
+	identity FileProviderPresentationIdentity,
 ) (bool, error) {
 	current, err := presentationAccount(tx, expected.ID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -235,7 +237,7 @@ func exactSyncedPromotion(
 		return false, err
 	}
 	if presentation.AccountInstanceID != expected.InstanceID ||
-		presentation.AccountGeneration != expected.Generation || presentation.Proof != proof {
+		presentation.AccountGeneration != expected.Generation || presentation.Identity != identity {
 		return false, nil
 	}
 	var needsLogin, gen int64
@@ -264,7 +266,7 @@ func exactSyncedPromotion(
 func (s *Store) ResolveReservedSyncedPromotion(
 	reservation PendingAccountReservation,
 	expected Account,
-	proof PresentationPreparationProof,
+	identity FileProviderPresentationIdentity,
 ) (Account, bool, error) {
 	if err := validatePendingReservationFence(reservation); err != nil {
 		return Account{}, false, err
@@ -273,9 +275,11 @@ func (s *Store) ResolveReservedSyncedPromotion(
 		expected.Generation != reservation.Generation {
 		return Account{}, false, ErrSyncedPromotionAmbiguous
 	}
-	if err := validatePresentationPreparationProofForAccount(
-		proof, expected.InstanceID, expected.Generation, expected.ConfigDir,
-	); err != nil {
+	if err := ValidateReservedPresentationIdentity(reservation, identity); err != nil ||
+		identity.PublicPath != expected.ConfigDir {
+		if err == nil {
+			err = ErrAccountPresentationEvidence
+		}
 		return Account{}, false, err
 	}
 	tx, err := s.db.Begin()
@@ -283,7 +287,7 @@ func (s *Store) ResolveReservedSyncedPromotion(
 		return Account{}, false, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	replayed, err := exactSyncedPromotion(tx, expected, proof)
+	replayed, err := exactSyncedPromotion(tx, expected, identity)
 	if err != nil {
 		return Account{}, false, err
 	}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/tenantfs"
 	"github.com/yasyf/fusekit/catalogproto"
 )
 
@@ -26,9 +27,9 @@ var errAccountExclusive = errors.New("account is under exclusive maintenance")
 // claim-then-re-read for destructive convergence.
 //
 // Locking: claims owns its mutex; each operation is a self-contained critical
-// section. No claim survives filesystem, provider, process, Keychain, OAuth, or
-// socket I/O; external work starts only after durable intent exists and the claim
-// is released.
+// section. Reservations are bookkeeping records, not held locks. The separate
+// credential-write exclusion may span Keychain I/O only after an exact pending
+// reservation proves that selection owns the mutation.
 type claims struct {
 	mu         sync.Mutex
 	selections map[string]*selectionReservation
@@ -41,6 +42,7 @@ type reservation struct {
 	accountInstanceID string
 	accountGeneration uint64
 	createdAt         time.Time
+	expiresAt         time.Time
 	preparation       *catalogproto.TenantPreparationProof
 }
 
@@ -118,14 +120,27 @@ func (c *claims) beginSelection(account store.Account, launch selectionLaunch, t
 		return "", fmt.Errorf("generate reservation token: %w", err)
 	}
 	token := hex.EncodeToString(raw[:])
+	expiresAt := now.Add(ttl)
 	c.selections[token] = &selectionReservation{
 		reservation: reservation{
 			accountID: account.ID, accountInstanceID: account.InstanceID,
-			accountGeneration: account.Generation, createdAt: now,
+			accountGeneration: account.Generation, createdAt: now, expiresAt: expiresAt,
 		},
-		launch: launch, expiresAt: now.Add(ttl), state: selectionPending,
+		launch: launch, expiresAt: expiresAt, state: selectionPending,
 	}
 	return token, nil
+}
+
+func (c *claims) ownSelectionExclusive(token string, accountID int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pruneSelectionsLocked(c.now())
+	selection, ok := c.selections[token]
+	if !ok || selection.state != selectionPending || selection.accountID != accountID || c.exclusive[accountID] {
+		return false
+	}
+	c.exclusive[accountID] = true
+	return true
 }
 
 func (c *claims) commitSelection(ctx context.Context, token string, activate func(context.Context, string, reservation, selectionLaunch) Response) Response {
@@ -185,7 +200,22 @@ func (c *claims) bindPreparation(token string, proof catalogproto.TenantPreparat
 	return true
 }
 
-func (c *claims) abortSelection(ctx context.Context, token string) Response {
+func (c *claims) preparationLease(token string) (tenantfs.PreparationLease, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pruneSelectionsLocked(c.now())
+	selection, ok := c.selections[token]
+	if !ok || selection.state != selectionPending {
+		return tenantfs.PreparationLease{}, false
+	}
+	return tenantfs.PreparationLease{ID: token, ExpiresAt: selection.expiresAt}, true
+}
+
+func (c *claims) abortSelection(
+	ctx context.Context,
+	token string,
+	release func(context.Context, reservation) error,
+) Response {
 	for {
 		c.mu.Lock()
 		c.pruneSelectionsLocked(c.now())
@@ -208,8 +238,19 @@ func (c *claims) abortSelection(ctx context.Context, token string) Response {
 			}
 			continue
 		}
-		delete(c.selections, token)
+		selection.state = selectionCommitting
+		selection.done = make(chan struct{})
+		reserved := selection.reservation
+		done := selection.done
 		c.mu.Unlock()
+		err := release(ctx, reserved)
+		c.mu.Lock()
+		delete(c.selections, token)
+		close(done)
+		c.mu.Unlock()
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
 		return Response{OK: true}
 	}
 }

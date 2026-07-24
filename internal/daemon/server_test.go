@@ -20,10 +20,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/tenantfs"
-	"github.com/yasyf/cc-pool/internal/version"
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/fusekit/catalogproto"
-	"github.com/yasyf/fusekit/mountproto"
 )
 
 var daemonTestToken atomic.Uint64
@@ -97,8 +95,8 @@ func TestSelectPreflightSettlesBeforeReturn(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("selection did not enter credential preflight")
 	}
-	if got := s.cl.reservedCount(forced); got != 0 {
-		t.Fatalf("pending reservations = %d, want none during credential preflight", got)
+	if got := s.cl.reservedCount(forced); got != 1 {
+		t.Fatalf("pending reservations = %d, want one during credential preflight", got)
 	}
 	select {
 	case response := <-responses:
@@ -150,6 +148,7 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 	s.prepareAccount = func(
 		ctx context.Context,
 		account store.Account,
+		_ tenantfs.PreparationLease,
 	) (catalogproto.TenantPreparationProof, error) {
 		callsMu.Lock()
 		calls[account.ID]++
@@ -177,8 +176,8 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 		})
 	}()
 	waitForBlockedPrepare(t, entered)
-	if got := s.cl.reservedCount(forcedOne); got != 0 {
-		t.Fatalf("primary PrepareTenant reservations = %d, want 0", got)
+	if got := s.cl.reservedCount(forcedOne); got != 1 {
+		t.Fatalf("primary PrepareTenant reservations = %d, want 1", got)
 	}
 
 	canceledContext, cancelCanceled := context.WithCancel(t.Context())
@@ -190,8 +189,8 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 		})
 	}()
 	waitForBlockedPrepare(t, entered)
-	if got := s.cl.reservedCount(forcedOne); got != 0 {
-		t.Fatalf("same-account reservations during PrepareTenant = %d, want 0", got)
+	if got := s.cl.reservedCount(forcedOne); got != 2 {
+		t.Fatalf("same-account reservations during PrepareTenant = %d, want 2", got)
 	}
 	cancelCanceled()
 	select {
@@ -202,8 +201,8 @@ func TestBlockedPrepareDoesNotHoldClaimsOrStore(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("canceled same-account PrepareTenant retained the selection")
 	}
-	if got := s.cl.reservedCount(forcedOne); got != 0 {
-		t.Fatalf("canceled PrepareTenant reservation count = %d, want 0", got)
+	if got := s.cl.reservedCount(forcedOne); got != 1 {
+		t.Fatalf("canceled PrepareTenant reservation count = %d, want 1", got)
 	}
 
 	forcedTwo := 2
@@ -329,10 +328,10 @@ func newTestServerWithPaths(t *testing.T, paths map[int]string) (*Server, map[in
 		scanSessions: func(context.Context) ([]procscan.Session, error) { return nil, nil },
 		cl:           newClaims(),
 		led:          newLedgers(),
-		prepareAccount: func(ctx context.Context, account store.Account) (catalogproto.TenantPreparationProof, error) {
+		prepareAccount: func(ctx context.Context, account store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
 			return daemonTestPreparationProof(account, dirs[account.ID]), ctx.Err()
 		},
-		activatePrepared: func(_ context.Context, _ store.Account, _ catalogproto.TenantPreparationProof, activate func() error) error {
+		activatePrepared: func(_ context.Context, _ store.Account, _ tenantfs.PreparationLease, _ catalogproto.TenantPreparationProof, activate func() error) error {
 			return activate()
 		},
 		sessionLeases: &testSessionLeaseManager{},
@@ -394,108 +393,45 @@ func daemonTestPreparationProof(account store.Account, publicPath string) catalo
 	}
 }
 
-func TestPrepareReservedAccountProofReturnsCompleteValidatedFuseProof(t *testing.T) {
+func TestPrepareSelectionReturnsCompleteValidatedFuseProof(t *testing.T) {
 	s, dirs := newTestServer(t)
 	account, err := s.m.Store.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reservation := store.PendingAccountReservation{
-		ID: account.ID, InstanceID: account.InstanceID, Generation: account.Generation,
+	path, token, err := s.prepareSelection(t.Context(), account, selectionLaunch{})
+	if err != nil || path != dirs[1] || token == "" {
+		t.Fatalf("prepare selection = path %q token %q err %v; want path %q", path, token, err, dirs[1])
 	}
-	proof, err := s.prepareReservedAccountProof(t.Context(), reservation)
-	if err != nil || proof.FileProvider.PublicPath != dirs[1] || proof.ChangeID == "" || proof.OperationID == "" {
-		t.Fatalf("prepare reserved account proof = %+v, %v; want path %q", proof, err, dirs[1])
-	}
-	s.prepareReservedAccount = func(_ context.Context, got store.PendingAccountReservation) (catalogproto.TenantPreparationProof, error) {
-		if got.ID != reservation.ID || got.InstanceID != reservation.InstanceID || got.Generation != reservation.Generation {
-			t.Fatalf("reservation = %+v, want %+v", got, reservation)
+	s.cl.abortReservation(token)
+	s.prepareAccount = func(_ context.Context, got store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
+		if got.ID != account.ID || got.InstanceID != account.InstanceID || got.Generation != account.Generation {
+			t.Fatalf("account = %+v, want %+v", got, account)
 		}
 		invalid := daemonTestPreparationProof(account, "relative/path")
 		return invalid, nil
 	}
-	if _, err := s.prepareReservedAccountProof(t.Context(), reservation); !errors.Is(err, tenantfs.ErrPreparationConflict) {
+	if _, _, err := s.prepareSelection(t.Context(), account, selectionLaunch{}); !errors.Is(err, tenantfs.ErrPreparationConflict) {
 		t.Fatalf("invalid injected proof error = %v, want ErrPreparationConflict", err)
 	}
 }
 
-type fixedPreparationHealth struct {
-	health mountproto.RuntimeHealthResponse
-}
-
-func (r fixedPreparationHealth) RuntimeHealth(context.Context) (mountproto.RuntimeHealthResponse, error) {
-	return r.health, nil
-}
-
-func (fixedPreparationHealth) PrepareTenant(
-	context.Context,
-	catalogproto.TenantID,
-	catalogproto.PrepareTenantRequest,
-) (catalogproto.PrepareTenantResponse, error) {
-	return catalogproto.PrepareTenantResponse{}, errors.New("unexpected PrepareTenant call")
-}
-
-func TestStoredPreparationProofRevalidatesRuntimeBoundFieldsAgainstCurrentActivation(t *testing.T) {
+func TestPreparationIdentityProjectionRejectsDrift(t *testing.T) {
 	account := store.Account{
 		ID: 7, InstanceID: "0123456789abcdef0123456789abcdef", Generation: 4,
 	}
 	raw := daemonTestPreparationProof(account, "/Users/test/Library/CloudStorage/proof-account-7")
-	stored, err := projectPreparationProof(raw)
+	identity, err := projectPreparationIdentity(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	roundTrip, err := catalogPreparationProof(stored)
-	if err != nil {
-		t.Fatal(err)
+	if identity.TenantID == "" || identity.DomainID == "" || identity.Generation != account.Generation ||
+		identity.PublicPath != "/Users/test/Library/CloudStorage/proof-account-7" {
+		t.Fatalf("identity = %+v", identity)
 	}
-	projectedAgain, err := projectPreparationProof(roundTrip)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if projectedAgain != stored {
-		t.Fatalf("stored proof did not round trip:\n got  %+v\n want %+v", projectedAgain, stored)
-	}
-	health := mountproto.RuntimeHealthResponse{
-		Protocol: mountproto.Version, Code: mountproto.ErrorCodeOk,
-		RuntimeBuild: version.String(), RuntimeProtocol: mountproto.RuntimeProtocolVersion,
-		RuntimePID: 42, ProcessGeneration: "process-current",
-		ActivationGeneration: stored.FileProvider.ActivationGeneration,
-		State:                mountproto.RuntimeStateHealthy, Ready: true,
-		ReadinessPhase: mountproto.ReadinessPhaseReady, ReadinessStep: mountproto.ReadinessStepPublished,
-		NativePhase: mountproto.NativePhaseDisabled, BrokerPhase: mountproto.BrokerPhaseLive,
-	}
-	preparer, err := tenantfs.NewPreparer(fixedPreparationHealth{health: health})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := &Server{tenantCoordinator: &tenantCoordinator{preparer: preparer}}
-	if err := s.revalidatePreparationProof(t.Context(), account, stored); err != nil {
-		t.Fatalf("revalidate exact proof: %v", err)
-	}
-	tests := map[string]func(*store.PresentationPreparationProof){
-		"catalog tenant":      func(p *store.PresentationPreparationProof) { p.CatalogTenantID += "-other" },
-		"catalog generation":  func(p *store.PresentationPreparationProof) { p.CatalogGeneration++ },
-		"requested":           func(p *store.PresentationPreparationProof) { p.Requested++ },
-		"desired":             func(p *store.PresentationPreparationProof) { p.Desired++ },
-		"observed":            func(p *store.PresentationPreparationProof) { p.Observed++ },
-		"verified":            func(p *store.PresentationPreparationProof) { p.Verified++ },
-		"applied":             func(p *store.PresentationPreparationProof) { p.Applied++ },
-		"source authority":    func(p *store.PresentationPreparationProof) { p.SourceAuthority = "foreign" },
-		"catalog revision":    func(p *store.PresentationPreparationProof) { p.CatalogRevision++ },
-		"presentation kind":   func(p *store.PresentationPreparationProof) { p.PresentationKind = "mount" },
-		"presentation tenant": func(p *store.PresentationPreparationProof) { p.FileProvider.TenantID += "-other" },
-		"domain":              func(p *store.PresentationPreparationProof) { p.FileProvider.DomainID += "-other" },
-		"presentation gen":    func(p *store.PresentationPreparationProof) { p.FileProvider.Generation++ },
-		"activation":          func(p *store.PresentationPreparationProof) { p.FileProvider.ActivationGeneration = "stale" },
-	}
-	for name, mutate := range tests {
-		t.Run(name, func(t *testing.T) {
-			changed := stored
-			mutate(&changed)
-			if err := s.revalidatePreparationProof(t.Context(), account, changed); !errors.Is(err, tenantfs.ErrPreparationConflict) {
-				t.Fatalf("revalidate changed proof error = %v, want ErrPreparationConflict", err)
-			}
-		})
+	raw.Presentation.FileProvider.PublicPath = "relative/path"
+	if _, err := projectPreparationIdentity(raw); !errors.Is(err, tenantfs.ErrPreparationConflict) {
+		t.Fatalf("relative identity error = %v", err)
 	}
 }
 
@@ -506,7 +442,7 @@ func TestSelectionUsesPersistedFusePublicPathWithoutSynthesizing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.prepareAccount = func(ctx context.Context, got store.Account) (catalogproto.TenantPreparationProof, error) {
+	s.prepareAccount = func(ctx context.Context, got store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
 		return daemonTestPreparationProof(got, publicPath), ctx.Err()
 	}
 	forced := account.ID
@@ -534,7 +470,7 @@ func TestSelectionQuarantinesPresentationBindingDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 	provenPath := "/Users/test/Library/CloudStorage/cc-pool-account-1"
-	s.prepareAccount = func(ctx context.Context, got store.Account) (catalogproto.TenantPreparationProof, error) {
+	s.prepareAccount = func(ctx context.Context, got store.Account, _ tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
 		return daemonTestPreparationProof(got, provenPath), ctx.Err()
 	}
 	forced := account.ID
@@ -552,11 +488,10 @@ func TestSelectionQuarantinesPresentationBindingDrift(t *testing.T) {
 	fileProvider := daemonTestPreparationProof(account, provenPath).Presentation.FileProvider
 	if quarantine.AccountID != account.ID || quarantine.AccountInstanceID != account.InstanceID ||
 		quarantine.AccountGeneration != account.Generation || quarantine.ExpectedConfigDir != account.ConfigDir ||
-		quarantine.Proof.FileProvider.TenantID != string(fileProvider.TenantID) ||
-		quarantine.Proof.FileProvider.DomainID != string(fileProvider.DomainID) ||
-		quarantine.Proof.FileProvider.Generation != fileProvider.Generation ||
-		quarantine.Proof.FileProvider.ActivationGeneration != fileProvider.ActivationGeneration ||
-		quarantine.Proof.FileProvider.PublicPath != provenPath ||
+		quarantine.Observed.TenantID != string(fileProvider.TenantID) ||
+		quarantine.Observed.DomainID != string(fileProvider.DomainID) ||
+		quarantine.Observed.Generation != fileProvider.Generation ||
+		quarantine.Observed.PublicPath != provenPath ||
 		quarantine.Reason != store.AccountPresentationPublicPathDrift {
 		t.Fatalf("presentation quarantine = %+v", quarantine)
 	}
@@ -673,7 +608,7 @@ func TestSelectionActivationRejectsStalePreparationProof(t *testing.T) {
 	if !s.cl.bindPreparation(token, proof) {
 		t.Fatal("bind preparation failed")
 	}
-	s.activatePrepared = func(_ context.Context, _ store.Account, got catalogproto.TenantPreparationProof, _ func() error) error {
+	s.activatePrepared = func(_ context.Context, _ store.Account, _ tenantfs.PreparationLease, got catalogproto.TenantPreparationProof, _ func() error) error {
 		if got.SourceRevision != 1 {
 			t.Fatalf("proof source revision = %d", got.SourceRevision)
 		}
@@ -694,7 +629,7 @@ func TestSelectionActivationRejectsStalePreparationProof(t *testing.T) {
 
 func TestRawSelectHasNoActivationEffects(t *testing.T) {
 	s, _ := newTestServer(t)
-	s.prepareAccount = func(context.Context, store.Account) (catalogproto.TenantPreparationProof, error) {
+	s.prepareAccount = func(context.Context, store.Account, tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error) {
 		t.Fatal("metadata-only selection prepared a tenant")
 		return catalogproto.TenantPreparationProof{}, nil
 	}

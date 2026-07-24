@@ -143,12 +143,12 @@ func daemonTestCredentialDigest(value string) store.CredentialDigest {
 func daemonFixturePresentationProof(
 	reservation store.PendingAccountReservation,
 	configDir string,
-) store.PresentationPreparationProof {
-	proof, err := projectPreparationProof(daemonTestPreparationProof(store.Account{
+) store.FileProviderPresentationIdentity {
+	identity, err := projectPreparationIdentity(daemonTestPreparationProof(store.Account{
 		ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
 	}, configDir))
 	if err != nil {
 		panic(err)
 	}
-	return proof
+	return identity
 }

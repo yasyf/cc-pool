@@ -134,15 +134,6 @@ func (s *Service) Materialize(ctx context.Context, v AccountValue, credential *c
 	if err := rejectExistingExternalUUID(ctx, s.M, v.UUID); err != nil {
 		return abandon(err)
 	}
-	prospective := store.Account{
-		ID: p.Reservation.ID, InstanceID: p.Reservation.InstanceID,
-		Generation: p.Reservation.Generation, ConfigDir: p.ConfigDir,
-	}
-	freshProof, err := s.Preparer.RefreshPreparedAccount(ctx, prospective, p.PresentationProof)
-	if err != nil {
-		return abandon(fmt.Errorf("materialize %s: revalidate presentation before promotion: %w", v.UUID, err))
-	}
-	p.PresentationProof = freshProof
 	acct, err := s.promotePreparedSyncedAdd(ctx, p, v.Label, v.UUID)
 	if err != nil {
 		promotionErr := fmt.Errorf("materialize %s: publish awaiting-origin row: %w", v.UUID, err)
@@ -196,8 +187,7 @@ func (s *Service) resolvePreparedSyncedAdd(
 	return s.M.ResolvePromotedSyncedAdd(pending, label, accountUUID)
 }
 
-// AdmitSyncedAccount verifies credential and presentation freshness before
-// atomically refreshing proof and clearing awaiting-origin admission state.
+// AdmitSyncedAccount verifies the credential before clearing awaiting-origin admission state.
 func (s *Service) AdmitSyncedAccount(
 	ctx context.Context,
 	account store.Account,
@@ -215,14 +205,7 @@ func (s *Service) AdmitSyncedAccount(
 	}
 	presentation, err := s.M.Store.AccountPresentation(account.ID)
 	if err != nil {
-		return false, fmt.Errorf("read presentation proof: %w", err)
-	}
-	if s.Preparer == nil {
-		return false, errors.New("hostsync: account preparer is required")
-	}
-	freshProof, err := s.Preparer.RefreshPreparedAccount(ctx, account, presentation.Proof)
-	if err != nil {
-		return false, fmt.Errorf("revalidate presentation before admission: %w", err)
+		return false, fmt.Errorf("read presentation identity: %w", err)
 	}
 	credential, _, err := s.M.ReadCredential(ctx, account)
 	if err != nil {
@@ -236,7 +219,7 @@ func (s *Service) AdmitSyncedAccount(
 		return false, fmt.Errorf("validate access-only credential: %w", err)
 	}
 	return s.M.AdmitSyncedCredential(
-		ctx, account, presentation.Proof, freshProof, expectedAccessHash,
+		ctx, account, presentation.Identity, presentation.Identity, expectedAccessHash,
 	)
 }
 

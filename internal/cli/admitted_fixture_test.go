@@ -46,7 +46,6 @@ func admitCLITestAccount(t *testing.T, database *store.Store, requested store.Ac
 			t.Fatal(err)
 		}
 		fresh := proof
-		fresh.FileProvider.ActivationGeneration = "cli-test-admitted"
 		fence := cliTestAdmissionFence(account)
 		if _, err := database.StageSyncedAccountAdmission(account, proof, fresh, fence); err != nil {
 			t.Fatal(err)
@@ -98,18 +97,10 @@ func cliTestAdmissionFence(account store.Account) store.SyncedCredentialAdmissio
 	}
 }
 
-func cliTestPresentationProof(account store.Account, activation string) store.PresentationPreparationProof {
+func cliTestPresentationProof(account store.Account, _ string) store.FileProviderPresentationIdentity {
 	tenantID := "account-" + account.InstanceID
-	return store.PresentationPreparationProof{
-		CatalogTenantID: tenantID, CatalogGeneration: account.Generation,
-		Requested: 1, Desired: 1, Observed: 1, Verified: 1, Applied: 1,
-		SourceAuthority: "cli-test", SourceRevision: 1, CatalogRevision: 1,
-		ChangeID: "cli-test-change", OperationID: "cli-test-operation",
-		PresentationKind: store.PresentationKindFileProvider,
-		FileProvider: store.FileProviderPreparationProof{
-			TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
-			Generation: account.Generation, ActivationGeneration: activation,
-			PublicPath: account.ConfigDir,
-		},
+	return store.FileProviderPresentationIdentity{
+		TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
+		Generation: account.Generation, PublicPath: account.ConfigDir,
 	}
 }

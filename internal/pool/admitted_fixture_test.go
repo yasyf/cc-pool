@@ -170,20 +170,10 @@ func poolTestCredentialDigest(value string) store.CredentialDigest {
 func poolTestPresentationProof(
 	reservation store.PendingAccountReservation,
 	configDir string,
-) store.PresentationPreparationProof {
-	return store.PresentationPreparationProof{
-		CatalogTenantID:   "account-" + reservation.InstanceID,
-		CatalogGeneration: reservation.Generation,
-		Requested:         1, Desired: 1, Observed: 1, Verified: 1, Applied: 1,
-		SourceAuthority: "test-source", SourceRevision: 1, CatalogRevision: 1,
-		ChangeID: "test-change", OperationID: "test-operation",
-		PresentationKind: store.PresentationKindFileProvider,
-		FileProvider: store.FileProviderPreparationProof{
-			TenantID:             "account-" + reservation.InstanceID,
-			DomainID:             "domain-" + reservation.InstanceID,
-			Generation:           reservation.Generation,
-			ActivationGeneration: "test-activation-" + reservation.InstanceID,
-			PublicPath:           configDir,
-		},
+) store.FileProviderPresentationIdentity {
+	return store.FileProviderPresentationIdentity{
+		TenantID:   "account-" + reservation.InstanceID,
+		DomainID:   "domain-" + reservation.InstanceID,
+		Generation: reservation.Generation, PublicPath: configDir,
 	}
 }

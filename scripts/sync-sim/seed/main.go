@@ -197,23 +197,21 @@ func cmdAccount(args []string) error {
 	if err := db.PromoteReservedSyncedAccount(reservation, acct, proof); err != nil {
 		return fmt.Errorf("promote account row: %w", err)
 	}
-	freshProof := proof
-	freshProof.FileProvider.ActivationGeneration = "sync-sim-admitted"
 	admissionFence, err := simAdmissionFence(acct, cred)
 	if err != nil {
 		return fmt.Errorf("build admission evidence: %w", err)
 	}
-	if _, err := db.StageSyncedAccountAdmission(acct, proof, freshProof, admissionFence); err != nil {
+	if _, err := db.StageSyncedAccountAdmission(acct, proof, proof, admissionFence); err != nil {
 		return fmt.Errorf("stage account admission: %w", err)
 	}
-	candidate, err := db.CommitSyncedAccountAdmissionCandidate(acct, freshProof, admissionFence)
+	candidate, err := db.CommitSyncedAccountAdmissionCandidate(acct, proof, admissionFence)
 	if err != nil {
 		return fmt.Errorf("commit account admission candidate: %w", err)
 	}
 	if !candidate {
 		return errors.New("commit account admission candidate: exact candidate was not stored")
 	}
-	settled, err := db.SettleSyncedAccountAdmission(acct, freshProof, admissionFence)
+	settled, err := db.SettleSyncedAccountAdmission(acct, proof, admissionFence)
 	if err != nil {
 		return fmt.Errorf("settle account admission: %w", err)
 	}
@@ -270,19 +268,11 @@ func simAdmissionFence(
 	}, nil
 }
 
-func simPresentationProof(account store.Account, activation string) store.PresentationPreparationProof {
+func simPresentationProof(account store.Account, _ string) store.FileProviderPresentationIdentity {
 	tenantID := "account-" + account.InstanceID
-	return store.PresentationPreparationProof{
-		CatalogTenantID: tenantID, CatalogGeneration: account.Generation,
-		Requested: 1, Desired: 1, Observed: 1, Verified: 1, Applied: 1,
-		SourceAuthority: "sync-sim", SourceRevision: 1, CatalogRevision: 1,
-		ChangeID: "sync-sim-change", OperationID: "sync-sim-operation",
-		PresentationKind: store.PresentationKindFileProvider,
-		FileProvider: store.FileProviderPreparationProof{
-			TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
-			Generation: account.Generation, ActivationGeneration: activation,
-			PublicPath: account.ConfigDir,
-		},
+	return store.FileProviderPresentationIdentity{
+		TenantID: tenantID, DomainID: "domain-" + account.InstanceID,
+		Generation: account.Generation, PublicPath: account.ConfigDir,
 	}
 }
 

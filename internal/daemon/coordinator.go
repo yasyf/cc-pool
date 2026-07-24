@@ -24,8 +24,8 @@ const (
 )
 
 type sourcePreparer interface {
-	Prepare(context.Context, tenantfs.Account) (catalogproto.TenantPreparationProof, error)
-	Validate(context.Context, tenantfs.Account, catalogproto.TenantPreparationProof) error
+	Prepare(context.Context, tenantfs.Account, tenantfs.PreparationLease) (catalogproto.TenantPreparationProof, error)
+	Validate(context.Context, tenantfs.Account, tenantfs.PreparationLease, catalogproto.TenantPreparationProof) error
 }
 
 type tenantLifecycleRuntime interface {
@@ -125,22 +125,15 @@ func (c *tenantCoordinator) initialize(ctx context.Context) error {
 }
 
 func (c *tenantCoordinator) prepareDesiredAccount(ctx context.Context, account store.Account) (bool, error) {
-	proof, err := c.prepare(ctx, account)
-	if err != nil {
-		return false, err
-	}
-	if err := c.activatePrepared(ctx, account, proof, func() error { return nil }); err != nil {
-		return false, err
-	}
-	stored, err := projectPreparationProof(proof)
-	if err != nil {
+	tenantAccount := pool.TenantAccount(account)
+	if err := c.ensureTenant(ctx, account, tenantAccount); err != nil {
 		return false, err
 	}
 	expected, err := expectedPresentationIdentity(account)
 	if err != nil {
 		return false, err
 	}
-	if err := c.server.m.Store.BindDesiredAccountPresentation(account, expected, stored); err != nil {
+	if err := c.server.m.Store.BindDesiredAccountPresentation(account, expected); err != nil {
 		if errors.Is(err, store.ErrAccountPresentationQuarantined) {
 			return true, nil
 		}
@@ -210,12 +203,13 @@ func recoverAccountRemovals(
 func (c *tenantCoordinator) prepare(
 	ctx context.Context,
 	account store.Account,
+	lease tenantfs.PreparationLease,
 ) (catalogproto.TenantPreparationProof, error) {
 	tenantAccount := pool.TenantAccount(account)
 	if err := c.ensureTenant(ctx, account, tenantAccount); err != nil {
 		return catalogproto.TenantPreparationProof{}, err
 	}
-	return c.preparer.Prepare(ctx, tenantAccount)
+	return c.preparer.Prepare(ctx, tenantAccount, lease)
 }
 
 func (c *tenantCoordinator) ensureTenant(
@@ -502,204 +496,45 @@ func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.Acc
 func (s *Server) prepareTenant(
 	ctx context.Context,
 	account store.Account,
+	lease tenantfs.PreparationLease,
 ) (catalogproto.TenantPreparationProof, error) {
 	if s.prepareAccount != nil {
-		return s.prepareAccount(ctx, account)
+		return s.prepareAccount(ctx, account, lease)
 	}
 	if s.tenantCoordinator == nil {
 		return catalogproto.TenantPreparationProof{}, errors.New("FuseKit tenant coordinator is unavailable")
 	}
-	return s.tenantCoordinator.prepare(ctx, account)
+	return s.tenantCoordinator.prepare(ctx, account, lease)
 }
 
-func (s *Server) prepareReservedAccountProof(
-	ctx context.Context,
-	reservation store.PendingAccountReservation,
-) (store.PresentationPreparationProof, error) {
-	account := store.Account{
-		ID: reservation.ID, InstanceID: reservation.InstanceID, Generation: reservation.Generation,
-	}
-	var proof catalogproto.TenantPreparationProof
-	var err error
-	if s.prepareReservedAccount != nil {
-		proof, err = s.prepareReservedAccount(ctx, reservation)
-	} else {
-		proof, err = s.prepareTenant(ctx, account)
-	}
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	activate := func() error { return nil }
-	if s.activatePrepared != nil {
-		err = s.activatePrepared(ctx, account, proof, activate)
-	} else if s.tenantCoordinator != nil {
-		err = s.tenantCoordinator.activatePrepared(ctx, account, proof, activate)
-	} else {
-		err = errors.New("FuseKit tenant coordinator is unavailable")
-	}
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	storedProof, err := projectPreparationProof(proof)
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	if err := validateReservedPreparationProof(reservation, storedProof); err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	return storedProof, nil
-}
-
-func (s *Server) prepareAccountProof(
-	ctx context.Context,
-	account store.Account,
-) (store.PresentationPreparationProof, error) {
-	proof, err := s.prepareTenant(ctx, account)
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	activate := func() error { return nil }
-	if s.activatePrepared != nil {
-		err = s.activatePrepared(ctx, account, proof, activate)
-	} else if s.tenantCoordinator != nil {
-		err = s.tenantCoordinator.activatePrepared(ctx, account, proof, activate)
-	} else {
-		err = errors.New("FuseKit tenant coordinator is unavailable")
-	}
-	if err != nil {
-		return store.PresentationPreparationProof{}, err
-	}
-	return projectPreparationProof(proof)
-}
-
-func (s *Server) revalidatePreparationProof(
-	ctx context.Context,
-	account store.Account,
-	storedProof store.PresentationPreparationProof,
-) error {
-	proof, err := catalogPreparationProof(storedProof)
-	if err != nil {
-		return err
-	}
-	activate := func() error { return nil }
-	if s.activatePrepared != nil {
-		return s.activatePrepared(ctx, account, proof, activate)
-	}
-	if s.tenantCoordinator == nil {
-		return errors.New("FuseKit tenant coordinator is unavailable")
-	}
-	return s.tenantCoordinator.activatePrepared(ctx, account, proof, activate)
-}
-
-func projectPreparationProof(
+func projectPreparationIdentity(
 	proof catalogproto.TenantPreparationProof,
-) (store.PresentationPreparationProof, error) {
+) (store.FileProviderPresentationIdentity, error) {
 	publicPath, err := tenantfs.FileProviderPublicPath(proof)
 	if err != nil {
-		return store.PresentationPreparationProof{}, err
+		return store.FileProviderPresentationIdentity{}, err
 	}
 	fileProvider := proof.Presentation.FileProvider
 	if fileProvider == nil {
-		return store.PresentationPreparationProof{}, tenantfs.ErrPreparationConflict
+		return store.FileProviderPresentationIdentity{}, tenantfs.ErrPreparationConflict
 	}
-	return store.PresentationPreparationProof{
-		CatalogTenantID:   string(proof.Catalog.Tenant),
-		CatalogGeneration: proof.Catalog.Generation,
-		Requested:         proof.Catalog.Requested,
-		Desired:           proof.Catalog.Desired,
-		Observed:          proof.Catalog.Observed,
-		Verified:          proof.Catalog.Verified,
-		Applied:           proof.Catalog.Applied,
-		SourceAuthority:   string(proof.SourceAuthority),
-		SourceRevision:    proof.SourceRevision,
-		CatalogRevision:   proof.CatalogRevision,
-		ChangeID:          string(proof.ChangeID),
-		OperationID:       string(proof.OperationID),
-		PresentationKind:  store.PresentationKindFileProvider,
-		FileProvider: store.FileProviderPreparationProof{
-			TenantID:             string(fileProvider.TenantID),
-			DomainID:             string(fileProvider.DomainID),
-			Generation:           fileProvider.Generation,
-			ActivationGeneration: fileProvider.ActivationGeneration,
-			PublicPath:           publicPath,
-		},
+	return store.FileProviderPresentationIdentity{
+		TenantID: string(fileProvider.TenantID), DomainID: string(fileProvider.DomainID),
+		Generation: fileProvider.Generation, PublicPath: publicPath,
 	}, nil
-}
-
-func catalogPreparationProof(
-	proof store.PresentationPreparationProof,
-) (catalogproto.TenantPreparationProof, error) {
-	if proof.PresentationKind != store.PresentationKindFileProvider ||
-		proof.FileProvider.TenantID == "" || proof.FileProvider.DomainID == "" ||
-		proof.FileProvider.Generation == 0 || proof.FileProvider.ActivationGeneration == "" {
-		return catalogproto.TenantPreparationProof{}, tenantfs.ErrPreparationConflict
-	}
-	if err := tenantfs.ValidateFileProviderPublicPath(proof.FileProvider.PublicPath); err != nil {
-		return catalogproto.TenantPreparationProof{}, err
-	}
-	return catalogproto.TenantPreparationProof{
-		Catalog: catalogproto.CatalogLaneProof{
-			Tenant:     catalogproto.TenantID(proof.CatalogTenantID),
-			Generation: proof.CatalogGeneration,
-			Requested:  proof.Requested,
-			Desired:    proof.Desired,
-			Observed:   proof.Observed,
-			Verified:   proof.Verified,
-			Applied:    proof.Applied,
-		},
-		Presentation: catalogproto.PresentationProof{
-			Kind: catalogproto.PresentationKindFileProvider,
-			FileProvider: &catalogproto.FileProviderPresentationProof{
-				TenantID:             catalogproto.TenantID(proof.FileProvider.TenantID),
-				DomainID:             catalogproto.DomainID(proof.FileProvider.DomainID),
-				Generation:           proof.FileProvider.Generation,
-				PublicPath:           proof.FileProvider.PublicPath,
-				ActivationGeneration: proof.FileProvider.ActivationGeneration,
-			},
-		},
-		SourceAuthority: catalogproto.SourceAuthorityID(proof.SourceAuthority),
-		SourceRevision:  proof.SourceRevision,
-		CatalogRevision: proof.CatalogRevision,
-		ChangeID:        catalogproto.ChangeID(proof.ChangeID),
-		OperationID:     catalogproto.OperationID(proof.OperationID),
-	}, nil
-}
-
-func validateReservedPreparationProof(
-	reservation store.PendingAccountReservation,
-	proof store.PresentationPreparationProof,
-) error {
-	account := tenantfs.Account{InstanceID: reservation.InstanceID, Generation: reservation.Generation}
-	tenantID, err := account.TenantID()
-	if err != nil {
-		return err
-	}
-	domainID, err := catalogproto.DeriveDomainID(
-		tenantfs.OwnerID,
-		catalogproto.PresentationInstanceID(reservation.InstanceID),
-	)
-	if err != nil {
-		return err
-	}
-	if proof.CatalogTenantID != string(tenantID) || proof.FileProvider.TenantID != string(tenantID) ||
-		proof.FileProvider.DomainID != string(domainID) ||
-		proof.CatalogGeneration != reservation.Generation ||
-		proof.FileProvider.Generation != reservation.Generation {
-		return tenantfs.ErrPreparationConflict
-	}
-	return nil
 }
 
 func (c *tenantCoordinator) activatePrepared(
 	ctx context.Context,
 	account store.Account,
+	lease tenantfs.PreparationLease,
 	proof catalogproto.TenantPreparationProof,
 	activate func() error,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := c.preparer.Validate(ctx, pool.TenantAccount(account), proof); err != nil {
+	if err := c.preparer.Validate(ctx, pool.TenantAccount(account), lease, proof); err != nil {
 		return err
 	}
 	return activate()
