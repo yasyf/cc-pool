@@ -13,7 +13,7 @@ import (
 const testRPCStateEnv = "CCP_HOSTSYNC_TEST_RPC_STATE"
 
 type testRPCConsumer struct {
-	state syncservice.RawRegistry
+	state []byte
 }
 
 func (testRPCConsumer) Capabilities(context.Context) (syncservice.Capabilities, error) {
@@ -28,18 +28,24 @@ func (testRPCConsumer) Reconcile(context.Context, string) (syncservice.Reconcile
 	return syncservice.ReconcileResult{}, nil
 }
 
-func (testRPCConsumer) Sync(context.Context, string) (syncservice.SyncResult, error) {
-	return syncservice.SyncResult{}, nil
+func (c testRPCConsumer) Export(_ context.Context, request syncservice.ExportRequest) (syncservice.ChangeEnvelope, error) {
+	return syncservice.NewExportedChange(
+		request.ServiceID, request.SchemaFingerprint, syncservice.ChangeSnapshot,
+		syncservice.NewRevision(0), syncservice.NewRevision(1), c.state,
+	)
 }
 
-func (c testRPCConsumer) GetState(context.Context) (syncservice.RawRegistry, error) {
-	return c.state, nil
+func (testRPCConsumer) Apply(_ context.Context, change syncservice.ChangeEnvelope) (syncservice.ApplyResult, error) {
+	return syncservice.ApplyResult{AckedRevision: change.SourceRevision}, nil
 }
 
 func runTestRPCServer(ctx context.Context) error {
 	state, err := base64.RawStdEncoding.DecodeString(os.Getenv(testRPCStateEnv))
 	if err != nil {
 		return fmt.Errorf("decode test RPC registry: %w", err)
+	}
+	if len(state) == 0 {
+		state = []byte(`{}`)
 	}
 	dispatcher := rpc.NewDispatcher()
 	syncservice.RegisterConsumer(dispatcher, testRPCConsumer{state: state})

@@ -246,6 +246,13 @@ func TestNoteCredWriteNoopOnEqualChain(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 	base, _ := loadEntry(t, s, "u1")
+	state, err := s.Registry.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Revision != 2 {
+		t.Fatalf("publish revision = %d, want 2", state.Revision)
+	}
 	clk.advance(time.Second)
 	sig, ok := stampSig(t, s, "u1")
 	if !ok {
@@ -274,6 +281,13 @@ func TestNoteCredWriteNoopOnEqualChain(t *testing.T) {
 			if got, _ := stampSig(t, s, "u1"); got != sig {
 				t.Error("no-op NoteCredWrite touched the stamp")
 			}
+			state, err := s.Registry.LoadState()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Revision != 2 {
+				t.Fatalf("no-op NoteCredWrite revision = %d, want 2", state.Revision)
+			}
 		})
 	}
 
@@ -289,6 +303,13 @@ func TestNoteCredWriteNoopOnEqualChain(t *testing.T) {
 		}
 		if got, _ := stampSig(t, s, "u1"); got == sig {
 			t.Error("fresher NoteCredWrite did not touch the stamp")
+		}
+		state, err := s.Registry.LoadState()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Revision != 3 {
+			t.Fatalf("fresher NoteCredWrite revision = %d, want 3", state.Revision)
 		}
 	})
 

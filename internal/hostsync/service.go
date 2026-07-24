@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 
@@ -106,13 +107,8 @@ type Service struct {
 	Remover AccountRemover
 	// Preparer establishes the committed account's FuseKit tenant and source state.
 	Preparer AccountPreparer
-	// Status is the process-lifetime peer up/down tracker; one per Service.
-	Status *converge.PeerStatus
-	// Driver is the converge.Driver the reconcile pass drives; the daemon wires
-	// NewDriver, tests inject a fake.
+	// Driver owns local registry projection and product reconciliation.
 	Driver converge.Driver[AccountValue]
-	// Fetcher reads each peer's registry for the pull-merge.
-	Fetcher converge.Fetcher[AccountValue]
 
 	promoteSyncedAdd func(
 		context.Context, *pool.PendingAdd, string, string,
@@ -334,18 +330,41 @@ func (s *Service) run(ctx context.Context, name string, args ...string) error {
 	return s.Run(ctx, name, args...)
 }
 
-// Converge runs one convergence pass — pull peers (skipping origin, the
-// anti-echo), merge, reconcile each present entry, then the teardown pass —
-// and reports what changed. Per-peer and per-item failures never abort a pass.
+// Converge reconciles the already-delivered local registry into product state,
+// then runs teardown. Synckit alone owns peer delivery and acknowledgements.
 func (s *Service) Converge(ctx context.Context, origin string) (syncservice.ReconcileResult, error) {
 	if s.Mesh == nil {
 		return syncservice.ReconcileResult{}, fmt.Errorf("hostsync: Converge requires a Mesh")
+	}
+	if s.Driver == nil {
+		return syncservice.ReconcileResult{}, errors.New("hostsync: Converge requires a Driver")
 	}
 	_, peers, err := s.Mesh.Resolve(ctx)
 	if err != nil {
 		return syncservice.ReconcileResult{}, fmt.Errorf("hostsync: resolve mesh: %w", err)
 	}
-	results, err := converge.Reconcile(ctx, s.Registry.WithLock, s.Driver, s.Fetcher, s.Status, peers, origin)
+	var results []converge.ItemResult
+	err = s.Registry.WithLock(ctx, func() error {
+		registry, err := s.Driver.LoadRegistry(ctx)
+		if err != nil {
+			return err
+		}
+		if err := s.Driver.SaveRegistry(ctx, registry); err != nil {
+			return err
+		}
+		present := registry.Present()
+		ids := make([]string, 0, len(present))
+		for id := range present {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		results = make([]converge.ItemResult, 0, len(ids))
+		for _, id := range ids {
+			outcome, reconcileErr := s.Driver.Reconcile(ctx, id, present[id], peers, origin)
+			results = append(results, converge.ItemResult{ID: id, Outcome: outcome, Err: reconcileErr})
+		}
+		return nil
+	})
 	if err != nil {
 		return syncservice.ReconcileResult{}, fmt.Errorf("hostsync: converge: %w", err)
 	}

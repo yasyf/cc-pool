@@ -2,11 +2,8 @@ package hostsync
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"sort"
 
@@ -104,36 +101,83 @@ func (c *Consumer) Reconcile(ctx context.Context, origin string) (syncservice.Re
 	return c.S.Converge(ctx, origin)
 }
 
-// Sync runs the same converge pass as Reconcile; the two contract methods coincide.
-func (c *Consumer) Sync(ctx context.Context, origin string) (syncservice.SyncResult, error) {
+// Export returns the immutable canonical snapshot at the product's exact local revision.
+func (c *Consumer) Export(ctx context.Context, request syncservice.ExportRequest) (syncservice.ChangeEnvelope, error) {
 	if err := c.gate(); err != nil {
-		return syncservice.SyncResult{}, err
+		return syncservice.ChangeEnvelope{}, err
 	}
-	res, err := c.S.Converge(ctx, origin)
+	if err := request.Validate(); err != nil {
+		return syncservice.ChangeEnvelope{}, err
+	}
+	if request.ServiceID != SyncServiceID || request.SchemaFingerprint != SyncSchemaFingerprint {
+		return syncservice.ChangeEnvelope{}, errors.New("hostsync: export service schema mismatch")
+	}
+	var state RegistryState
+	err := c.S.Registry.WithLock(ctx, func() error {
+		var err error
+		state, err = c.S.Registry.LoadState()
+		return err
+	})
 	if err != nil {
-		return syncservice.SyncResult{}, err
+		return syncservice.ChangeEnvelope{}, err
 	}
-	return syncservice.SyncResult(res), nil
+	since, err := request.SinceRevision.Uint64()
+	if err != nil {
+		return syncservice.ChangeEnvelope{}, err
+	}
+	if since > state.Revision {
+		return syncservice.ChangeEnvelope{}, fmt.Errorf(
+			"hostsync: export revision %d precedes acknowledged revision %d",
+			state.Revision, since,
+		)
+	}
+	payload, err := encodeRegistrySnapshot(state.Snapshot)
+	if err != nil {
+		return syncservice.ChangeEnvelope{}, err
+	}
+	return syncservice.NewExportedChange(
+		SyncServiceID,
+		SyncSchemaFingerprint,
+		syncservice.ChangeSnapshot,
+		syncservice.NewRevision(0),
+		syncservice.NewRevision(state.Revision),
+		payload,
+	)
 }
 
-// GetState returns the registry's raw JSON — secretless — read verbatim so the
-// int64 stamps survive byte-exact; a not-yet-created registry answers empty.
-func (c *Consumer) GetState(_ context.Context) (syncservice.RawRegistry, error) {
+// Apply merges one delivery-bound snapshot, persists one local revision only
+// for effective CRDT change, then reconciles product state before acknowledging.
+func (c *Consumer) Apply(ctx context.Context, change syncservice.ChangeEnvelope) (syncservice.ApplyResult, error) {
 	if err := c.gate(); err != nil {
-		return nil, err
+		return syncservice.ApplyResult{}, err
 	}
-	data, err := os.ReadFile(c.S.Registry.Path)
-	if errors.Is(err, fs.ErrNotExist) {
-		empty, mErr := json.Marshal(cregistry.New[AccountValue]())
-		if mErr != nil {
-			return nil, fmt.Errorf("hostsync: marshal empty registry: %w", mErr)
-		}
-		return empty, nil
+	if err := change.Validate(true); err != nil {
+		return syncservice.ApplyResult{}, err
 	}
+	if change.ServiceID != SyncServiceID || change.SchemaFingerprint != SyncSchemaFingerprint {
+		return syncservice.ApplyResult{}, errors.New("hostsync: apply service schema mismatch")
+	}
+	if change.Kind != syncservice.ChangeSnapshot {
+		return syncservice.ApplyResult{NeedSnapshot: true}, nil
+	}
+	incoming, err := decodeRegistrySnapshot(change.Payload)
 	if err != nil {
-		return nil, fmt.Errorf("hostsync: read registry %s: %w", c.S.Registry.Path, err)
+		return syncservice.ApplyResult{}, err
 	}
-	return data, nil
+	if err := c.S.Registry.Update(ctx, func(local Registry) error {
+		merged := cregistry.Merge(local, incoming)
+		clear(local)
+		for id, entry := range merged {
+			local[id] = entry
+		}
+		return nil
+	}); err != nil {
+		return syncservice.ApplyResult{}, fmt.Errorf("hostsync: persist applied snapshot: %w", err)
+	}
+	if _, err := c.S.Converge(ctx, change.Origin); err != nil {
+		return syncservice.ApplyResult{}, err
+	}
+	return syncservice.ApplyResult{AckedRevision: change.SourceRevision}, nil
 }
 
 // Consumer satisfies the synckit sync contract.

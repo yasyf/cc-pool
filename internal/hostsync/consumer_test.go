@@ -2,12 +2,15 @@ package hostsync
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/creds"
+	"github.com/yasyf/synckit/converge"
+	"github.com/yasyf/synckit/cregistry"
 	"github.com/yasyf/synckit/syncservice"
 )
 
@@ -52,8 +55,13 @@ func TestCapabilitiesIncludeFetch(t *testing.T) {
 	if !containsStr(caps.Methods, MethodFetchCredential) {
 		t.Errorf("Methods %v missing the custom %s", caps.Methods, MethodFetchCredential)
 	}
-	// The five contract methods must still be advertised alongside the custom one.
-	for _, m := range []string{syncservice.MethodCapabilities, syncservice.MethodList, syncservice.MethodReconcile, syncservice.MethodSync, syncservice.MethodGetState} {
+	for _, m := range []string{
+		syncservice.MethodCapabilities,
+		syncservice.MethodList,
+		syncservice.MethodReconcile,
+		syncservice.MethodExport,
+		syncservice.MethodApply,
+	} {
 		if !containsStr(caps.Methods, m) {
 			t.Errorf("Methods %v missing contract method %s", caps.Methods, m)
 		}
@@ -75,11 +83,11 @@ func TestDisabledFailsLoud(t *testing.T) {
 		if _, err := c.Reconcile(ctx, ""); !errors.Is(err, ErrSyncDisabled) {
 			t.Errorf("Reconcile err = %v, want ErrSyncDisabled", err)
 		}
-		if _, err := c.Sync(ctx, ""); !errors.Is(err, ErrSyncDisabled) {
-			t.Errorf("Sync err = %v, want ErrSyncDisabled", err)
+		if _, err := c.Export(ctx, syncservice.ExportRequest{}); !errors.Is(err, ErrSyncDisabled) {
+			t.Errorf("Export err = %v, want ErrSyncDisabled", err)
 		}
-		if _, err := c.GetState(ctx); !errors.Is(err, ErrSyncDisabled) {
-			t.Errorf("GetState err = %v, want ErrSyncDisabled", err)
+		if _, err := c.Apply(ctx, syncservice.ChangeEnvelope{}); !errors.Is(err, ErrSyncDisabled) {
+			t.Errorf("Apply err = %v, want ErrSyncDisabled", err)
 		}
 	})
 
@@ -97,10 +105,10 @@ func TestDisabledFailsLoud(t *testing.T) {
 	})
 }
 
-// TestGetStateSecretless writes a real credential through the registry's cred-write
-// endpoint (NoteCredWrite) and pins that the bytes GetState ships to a peer carry
+// TestExportSecretless writes a real credential through the registry's cred-write
+// endpoint (NoteCredWrite) and pins that the exported snapshot carries
 // the chain hash but NEVER the access or refresh token.
-func TestGetStateSecretless(t *testing.T) {
+func TestExportSecretless(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTestService(t)
 
@@ -115,33 +123,162 @@ func TestGetStateSecretless(t *testing.T) {
 		t.Fatalf("NoteCredWrite: %v", err)
 	}
 
-	raw, err := NewConsumer(s, enabled(true)).GetState(ctx)
+	change, err := NewConsumer(s, enabled(true)).Export(ctx, syncservice.ExportRequest{
+		ServiceID: SyncServiceID, SchemaFingerprint: SyncSchemaFingerprint,
+		SinceRevision: syncservice.NewRevision(0),
+	})
 	if err != nil {
-		t.Fatalf("GetState: %v", err)
+		t.Fatalf("Export: %v", err)
 	}
-	got := string(raw)
+	if change.Kind != syncservice.ChangeSnapshot || change.SourceRevision == syncservice.NewRevision(0) {
+		t.Fatalf("Export change = %+v", change)
+	}
+	got := string(change.Payload)
 	for _, secretPart := range []string{"SEKRIT-11111", "SEKRIT-22222", "ACCESS-TOKEN", "REFRESH-TOKEN"} {
 		if strings.Contains(got, secretPart) {
-			t.Fatalf("GetState leaked a token substring %q into the wire state: %s", secretPart, got)
+			t.Fatalf("Export leaked a token substring %q into the wire state: %s", secretPart, got)
 		}
 	}
 	// Sanity: the state is non-empty and carries the chain hash, proving the cred
 	// was actually processed (so the absence above is not a vacuous pass).
 	if !strings.Contains(got, chain.Hash) {
-		t.Fatalf("GetState missing the chain hash %q; state = %s", chain.Hash, got)
+		t.Fatalf("Export missing the chain hash %q; state = %s", chain.Hash, got)
 	}
 }
 
-// TestGetStateEmptyRegistry pins that a not-yet-created registry answers with an
-// empty registry JSON rather than an error.
-func TestGetStateEmptyRegistry(t *testing.T) {
+// TestExportEmptyRegistry pins the immutable initial revision and payload.
+func TestExportEmptyRegistry(t *testing.T) {
 	s, _ := newTestService(t)
-	raw, err := NewConsumer(s, enabled(true)).GetState(context.Background())
+	change, err := NewConsumer(s, enabled(true)).Export(context.Background(), syncservice.ExportRequest{
+		ServiceID: SyncServiceID, SchemaFingerprint: SyncSchemaFingerprint,
+		SinceRevision: syncservice.NewRevision(0),
+	})
 	if err != nil {
-		t.Fatalf("GetState on empty registry: %v", err)
+		t.Fatalf("Export on empty registry: %v", err)
 	}
-	if len(raw) == 0 {
-		t.Fatal("GetState returned empty bytes; want a marshaled empty registry")
+	if change.SourceRevision != syncservice.NewRevision(1) || string(change.Payload) != "{}" {
+		t.Fatalf("empty Export = revision %q payload %q", change.SourceRevision, change.Payload)
+	}
+}
+
+func TestExportRejectsAcknowledgementAheadOfProductRevision(t *testing.T) {
+	s, _ := newTestService(t)
+	_, err := NewConsumer(s, enabled(true)).Export(context.Background(), syncservice.ExportRequest{
+		ServiceID: SyncServiceID, SchemaFingerprint: SyncSchemaFingerprint,
+		SinceRevision: syncservice.NewRevision(2),
+	})
+	if err == nil {
+		t.Fatal("Export accepted an acknowledgement ahead of product revision 1")
+	}
+}
+
+type consumerApplyDriver struct {
+	service *Service
+	ids     []string
+	origins []string
+}
+
+type consumerApplyMesh struct{ peers []string }
+
+func (m consumerApplyMesh) Resolve(context.Context) (string, []string, error) {
+	return "self", m.peers, nil
+}
+
+func (d *consumerApplyDriver) LoadRegistry(context.Context) (cregistry.Registry[AccountValue], error) {
+	return d.service.Registry.Load()
+}
+
+func (d *consumerApplyDriver) SaveRegistry(_ context.Context, reg cregistry.Registry[AccountValue]) error {
+	return d.service.Registry.Save(reg)
+}
+
+func (d *consumerApplyDriver) Reconcile(
+	_ context.Context,
+	id string,
+	_ cregistry.Entry[AccountValue],
+	_ []string,
+	origin string,
+) (converge.Outcome, error) {
+	d.ids = append(d.ids, id)
+	d.origins = append(d.origins, origin)
+	return OutcomeUnchanged, nil
+}
+
+func TestApplyMergesOnceAndAcknowledgesSourceRevision(t *testing.T) {
+	s, _ := newTestService(t)
+	s.Mesh = consumerApplyMesh{peers: []string{"hostB"}}
+	driver := &consumerApplyDriver{service: s}
+	s.Driver = driver
+	incoming := cregistry.New[AccountValue]()
+	incoming.Add("u-remote", AccountValue{
+		UUID: "u-remote", Email: "remote@example.com",
+		OAuthAccount: json.RawMessage(`{"accountUuid":"u-remote"}`),
+		Chain:        ChainStamp{Origin: "hostA", Hash: "chain"},
+	}, 10)
+	payload, err := encodeRegistrySnapshot(incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change, err := syncservice.NewExportedChange(
+		SyncServiceID, SyncSchemaFingerprint, syncservice.ChangeSnapshot,
+		syncservice.NewRevision(0), syncservice.NewRevision(7), payload,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change, err = syncservice.BindDelivery(change, "hostA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer := NewConsumer(s, enabled(true))
+	for attempt := 0; attempt < 2; attempt++ {
+		ack, applyErr := consumer.Apply(context.Background(), change)
+		if applyErr != nil {
+			t.Fatalf("Apply attempt %d: %v", attempt, applyErr)
+		}
+		if ack.NeedSnapshot || ack.AckedRevision != change.SourceRevision {
+			t.Fatalf("Apply attempt %d ack = %+v", attempt, ack)
+		}
+	}
+	state, err := s.Registry.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Revision != 2 || !state.Snapshot["u-remote"].Present() {
+		t.Fatalf("applied state = %+v", state)
+	}
+	if len(driver.origins) != 2 || driver.origins[0] != "hostA" || driver.origins[1] != "hostA" {
+		t.Fatalf("reconcile origins = %v", driver.origins)
+	}
+}
+
+func TestApplyDeltaRequestsSnapshotWithoutMutation(t *testing.T) {
+	s, _ := newTestService(t)
+	payload := []byte(`{}`)
+	change, err := syncservice.NewExportedChange(
+		SyncServiceID, SyncSchemaFingerprint, syncservice.ChangeDelta,
+		syncservice.NewRevision(1), syncservice.NewRevision(2), payload,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change, err = syncservice.BindDelivery(change, "hostA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewConsumer(s, enabled(true)).Apply(context.Background(), change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.NeedSnapshot || result.AckedRevision != "" {
+		t.Fatalf("delta Apply = %+v, want snapshot request", result)
+	}
+	state, err := s.Registry.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Revision != 1 {
+		t.Fatalf("delta Apply changed local revision to %d", state.Revision)
 	}
 }
 

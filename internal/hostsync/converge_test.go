@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -59,20 +58,6 @@ func (d *fakeDriver) Reconcile(_ context.Context, id string, _ cregistry.Entry[A
 	return out, nil
 }
 
-// fakeFetcher records every peer it is asked to fetch and fails the peers in fail.
-type fakeFetcher struct {
-	fetched []string
-	fail    map[string]bool
-}
-
-func (f *fakeFetcher) Fetch(_ context.Context, peer string) (cregistry.Registry[AccountValue], error) {
-	f.fetched = append(f.fetched, peer)
-	if f.fail[peer] {
-		return nil, fmt.Errorf("peer %s down", peer)
-	}
-	return cregistry.New[AccountValue](), nil
-}
-
 // regWith returns a one-entry registry with a present account, for driving the
 // fake driver's LoadRegistry.
 func regWith(uuid string) Registry {
@@ -85,11 +70,8 @@ func TestConvergeOriginPassedThrough(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTestService(t)
 	drv := &fakeDriver{load: regWith("u1")}
-	ftc := &fakeFetcher{fail: map[string]bool{}}
 	s.Mesh = fakeMesh{self: "self", peers: []string{"peerX", "origin-peer"}}
 	s.Driver = drv
-	s.Fetcher = ftc
-	s.Status = converge.NewPeerStatus()
 
 	if _, err := s.Converge(ctx, "origin-peer"); err != nil {
 		t.Fatalf("Converge: %v", err)
@@ -99,32 +81,18 @@ func TestConvergeOriginPassedThrough(t *testing.T) {
 	if len(drv.origins) != 1 || drv.origins[0] != "origin-peer" {
 		t.Fatalf("driver origins = %v, want [origin-peer]", drv.origins)
 	}
-	// The origin peer is skipped in the pull (anti-echo); the other peer is fetched.
-	if containsStr(ftc.fetched, "origin-peer") {
-		t.Errorf("fetched the origin peer %v; converge must skip it", ftc.fetched)
-	}
-	if !containsStr(ftc.fetched, "peerX") {
-		t.Errorf("did not fetch the non-origin peer; fetched = %v", ftc.fetched)
-	}
 }
 
-func TestConvergeUnreachablePeerNotFatal(t *testing.T) {
+func TestConvergeUsesMeshOnlyAsProductPeerContext(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTestService(t)
 	drv := &fakeDriver{load: regWith("u1")}
-	ftc := &fakeFetcher{fail: map[string]bool{"deadpeer": true}}
 	s.Mesh = fakeMesh{peers: []string{"deadpeer", "livepeer"}}
 	s.Driver = drv
-	s.Fetcher = ftc
-	s.Status = converge.NewPeerStatus()
 
-	if _, err := s.Converge(ctx, ""); err != nil {
-		t.Fatalf("Converge with one dead peer must not be fatal: %v", err)
+	if _, err := s.Converge(ctx, "origin"); err != nil {
+		t.Fatalf("Converge: %v", err)
 	}
-	if !containsStr(ftc.fetched, "deadpeer") || !containsStr(ftc.fetched, "livepeer") {
-		t.Errorf("fetched = %v, want both peers attempted", ftc.fetched)
-	}
-	// Reconcile still ran for the local present item despite the dead peer.
 	if len(drv.ids) != 1 || drv.ids[0] != "u1" {
 		t.Errorf("driver reconciled ids = %v, want [u1]", drv.ids)
 	}
@@ -134,8 +102,6 @@ func TestConvergeMeshResolveFailsLoud(t *testing.T) {
 	s, _ := newTestService(t)
 	s.Mesh = fakeMesh{err: errors.New("no mesh")}
 	s.Driver = &fakeDriver{}
-	s.Fetcher = &fakeFetcher{}
-	s.Status = converge.NewPeerStatus()
 	if _, err := s.Converge(context.Background(), ""); err == nil {
 		t.Fatal("Converge with a failing Mesh returned nil error")
 	}
@@ -160,8 +126,6 @@ func materializeForTeardown(t *testing.T, s *Service, m *pool.Manager, uuid stri
 	}
 	s.Mesh = fakeMesh{}
 	s.Driver = &fakeDriver{}
-	s.Fetcher = &fakeFetcher{}
-	s.Status = converge.NewPeerStatus()
 	return res.AccountID, pool.AccountBackingDir(res.AccountID), row.KeychainService
 }
 

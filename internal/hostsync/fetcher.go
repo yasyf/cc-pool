@@ -1,105 +1,49 @@
 package hostsync
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"strings"
-	"time"
-
-	"github.com/yasyf/synckit/converge"
-	"github.com/yasyf/synckit/cregistry"
-	"github.com/yasyf/synckit/syncservice"
+	"io"
 )
 
-// RemoteServeCmd is the command a peer runs to serve its account registry over
-// the ssh-stdio bridge, streaming the registry JSON byte-exact.
-const RemoteServeCmd = "cc-pool sync rpc-serve"
+const (
+	// SyncServiceID is cc-pool's exact Synckit service identity.
+	SyncServiceID = "cc-pool"
+	// SyncSchemaFingerprint binds the v1 secretless CRDT snapshot schema.
+	SyncSchemaFingerprint = "24e1ddc9cc2c5116e4fa16df7f01fef9f0b125d791e3d6c4c6fd4b57b5e77a41"
 
-// execPeerPrefix marks a peer served by a local shell command instead of ssh —
-// cc-pool's own convention, enabled only for the two-host sim harness.
-const execPeerPrefix = "exec:"
+	syncSchemaIdentity    = "com.yasyf.cc-pool.hostsync.registry.v1"
+	syncSchemaDeclaration = "map<string,{added_at:int64-micros,removed_at?:int64-micros," +
+		"value:{uuid:string,email:string,label:string,oauthAccount:json," +
+		"chain:{origin:string,expiresAt:int64-millis,hash:string,rotatedAt:int64-millis}}}>"
+)
 
-// envExecPeer gates the exec: transport (sim-only). Unset in production, so an
-// `exec:<cmd>` peer is treated as an ssh hostname, never `sh -c`; any non-empty
-// value enables it.
-const envExecPeer = "CCP_SYNC_EXEC_PEER"
-
-// getStateTimeout bounds one peer registry read; a slow peer is treated as
-// down for the pass. A var so tests shrink it.
-var getStateTimeout = 15 * time.Second
-
-// stateGetter is the read-only slice of syncservice.Client the fetcher
-// consumes; its lack of a write method is the structural never-mutate-a-peer guard.
-type stateGetter interface {
-	GetState(ctx context.Context) (syncservice.RawRegistry, error)
-	Close() error
+func encodeRegistrySnapshot(reg Registry) ([]byte, error) {
+	payload, _, err := canonicalRegistry(reg)
+	return payload, err
 }
 
-// PeerTransport opens a transport to peer — an `exec:<cmd>` peer runs
-// `sh -c <cmd>` locally ONLY when envExecPeer is set (sim harness); otherwise,
-// and for every other peer, it is ssh-stdio driving RemoteServeCmd. The shared
-// dialer for the registry fetch and the credential pull.
-func PeerTransport(runner syncservice.TransportRunner, peer string) syncservice.Transport {
-	if cmd, ok := execPeerCommand(peer); ok {
-		return runner.Stdio("sh", "-c", cmd)
+func decodeRegistrySnapshot(payload []byte) (Registry, error) {
+	if len(payload) == 0 {
+		return nil, errors.New("hostsync: registry snapshot is empty")
 	}
-	return runner.SSHStdio(peer, RemoteServeCmd)
-}
-
-// execPeerCommand reports the local shell command an exec: peer names, but only
-// when the sim-only exec: transport is enabled. In production (envExecPeer
-// unset) it always reports false, so a registry-injected `exec:<cmd>` never
-// reaches a shell.
-func execPeerCommand(peer string) (string, bool) {
-	if os.Getenv(envExecPeer) == "" {
-		return "", false
+	reg := Registry{}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&reg); err != nil {
+		return nil, fmt.Errorf("hostsync: decode registry snapshot: %w", err)
 	}
-	return strings.CutPrefix(peer, execPeerPrefix)
-}
-
-// SSHFetcher reads a peer's registry read-only for the pull-merge; a per-peer
-// failure skips that peer, never aborting the pass.
-type SSHFetcher struct {
-	// dial opens a typed sync client to peer; tests inject a fake.
-	dial func(peer string) stateGetter
-}
-
-// NewSSHFetcher builds the fetcher that dials each peer via PeerTransport.
-func NewSSHFetcher(runner syncservice.TransportRunner) (SSHFetcher, error) {
-	if runner == nil {
-		return SSHFetcher{}, errors.New("hostsync: SSH fetcher requires a transport runner")
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("hostsync: registry snapshot has trailing data")
 	}
-	return newSSHFetcher(func(peer string) stateGetter {
-		return syncservice.NewClient(PeerTransport(runner, peer))
-	}), nil
-}
-
-// newSSHFetcher builds the fetcher over an injected dial for tests.
-func newSSHFetcher(dial func(peer string) stateGetter) SSHFetcher {
-	return SSHFetcher{dial: dial}
-}
-
-// Fetch returns peer's registry without modifying it, decoded into the typed
-// Registry so the int64 stamps survive byte-exact; a failure is wrapped with
-// the peer name and skips that peer for the pass.
-func (f SSHFetcher) Fetch(ctx context.Context, peer string) (cregistry.Registry[AccountValue], error) {
-	ctx, cancel := context.WithTimeout(ctx, getStateTimeout)
-	defer cancel()
-	c := f.dial(peer)
-	defer func() { _ = c.Close() }()
-	raw, err := c.GetState(ctx)
+	canonical, err := encodeRegistrySnapshot(reg)
 	if err != nil {
-		return nil, fmt.Errorf("get_state from %s: %w", peer, err)
+		return nil, err
 	}
-	reg := cregistry.New[AccountValue]()
-	if err := json.Unmarshal(raw, &reg); err != nil {
-		return nil, fmt.Errorf("parse registry from %s: %w", peer, err)
+	if !bytes.Equal(payload, canonical) {
+		return nil, errors.New("hostsync: registry snapshot is not canonical")
 	}
 	return reg, nil
 }
-
-// SSHFetcher satisfies converge.Fetcher for the account registry.
-var _ converge.Fetcher[AccountValue] = SSHFetcher{}

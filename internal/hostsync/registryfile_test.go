@@ -36,15 +36,18 @@ func inode(t *testing.T, fi os.FileInfo) uint64 {
 
 func TestLoadMissingFileIsEmpty(t *testing.T) {
 	rf := tempRegistry(t)
-	reg, err := rf.Load()
+	state, err := rf.LoadState()
 	if err != nil {
-		t.Fatalf("Load of missing file: %v", err)
+		t.Fatalf("LoadState of missing file: %v", err)
 	}
-	if reg == nil {
+	if state.Revision != 1 || state.Digest == "" {
+		t.Fatalf("initial state = %+v, want revision 1 with digest", state)
+	}
+	if state.Snapshot == nil {
 		t.Fatal("Load returned a nil registry; want an empty non-nil one")
 	}
-	if len(reg) != 0 {
-		t.Fatalf("empty registry has %d entries", len(reg))
+	if len(state.Snapshot) != 0 {
+		t.Fatalf("empty registry has %d entries", len(state.Snapshot))
 	}
 }
 
@@ -59,6 +62,16 @@ func TestLoadCorruptFileIsLoud(t *testing.T) {
 	}
 	if reg != nil {
 		t.Fatalf("Load of corrupt file returned a registry: %v", reg)
+	}
+}
+
+func TestLoadRejectsLegacyRawRegistry(t *testing.T) {
+	rf := tempRegistry(t)
+	if err := os.WriteFile(rf.Path, []byte(`{"u":{"added_at":1,"value":{"uuid":"u"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rf.LoadState(); err == nil {
+		t.Fatal("LoadState accepted the removed raw-registry schema")
 	}
 }
 
@@ -81,6 +94,13 @@ func TestLoadSaveRoundTripInt64Stamps(t *testing.T) {
 
 	if err := rf.Save(reg); err != nil {
 		t.Fatalf("Save: %v", err)
+	}
+	state, err := rf.LoadState()
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if state.Revision != 2 || state.Digest == "" {
+		t.Fatalf("saved state = %+v, want revision 2 with digest", state)
 	}
 
 	// The stamp must be rendered as an exact integer literal on disk — direct
@@ -153,6 +173,13 @@ func TestSaveNoopWhenEqual(t *testing.T) {
 	if !fi1.ModTime().Equal(fi0.ModTime()) {
 		t.Errorf("no-op Save changed mtime: %v -> %v", fi0.ModTime(), fi1.ModTime())
 	}
+	state, err := rf.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Revision != 2 {
+		t.Fatalf("no-op Save advanced revision to %d, want 2", state.Revision)
+	}
 
 	// Positive control: a real content change must rewrite (new inode).
 	reg.Add("u2", AccountValue{UUID: "u2", OAuthAccount: json.RawMessage(`{}`)}, cregistry.Micros(1))
@@ -165,6 +192,41 @@ func TestSaveNoopWhenEqual(t *testing.T) {
 	}
 	if inode(t, fi2) == ino0 {
 		t.Error("changed Save did not rewrite the file (inode unchanged)")
+	}
+	state, err = rf.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Revision != 3 {
+		t.Fatalf("changed Save revision = %d, want 3", state.Revision)
+	}
+}
+
+func TestLoadRejectsDigestMismatch(t *testing.T) {
+	rf := tempRegistry(t)
+	reg := cregistry.New[AccountValue]()
+	reg.Add("u", AccountValue{UUID: "u", OAuthAccount: json.RawMessage(`{}`)}, 1)
+	if err := rf.Save(reg); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(rf.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state RegistryState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	state.Digest = "0000000000000000000000000000000000000000000000000000000000000000"
+	raw, err = json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rf.Path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rf.LoadState(); err == nil {
+		t.Fatal("LoadState accepted a digest-mismatched snapshot")
 	}
 }
 

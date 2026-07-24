@@ -3,10 +3,14 @@ package hostsync
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -25,6 +29,13 @@ type RegistryFile struct {
 	LockPath string
 }
 
+// RegistryState is the exact v1 persisted host-sync state.
+type RegistryState struct {
+	Revision uint64   `json:"revision"`
+	Snapshot Registry `json:"snapshot"`
+	Digest   string   `json:"digest"`
+}
+
 // NewRegistryFile is the registry layout under dir — registry.json beside its
 // registry.lock — shared by the daemon and the ccp sync CLI.
 func NewRegistryFile(dir string) *RegistryFile {
@@ -34,44 +45,91 @@ func NewRegistryFile(dir string) *RegistryFile {
 	}
 }
 
-// Load reads the registry: a missing file is a fresh empty registry, a
-// malformed one a loud error — never a silent reset. It decodes into the typed
-// registry so the int64 Micros stamps survive byte-exact.
-func (rf RegistryFile) Load() (Registry, error) {
+// LoadState reads the exact v1 state. A missing file is the immutable initial
+// revision; every malformed, legacy, or digest-mismatched file fails closed.
+func (rf RegistryFile) LoadState() (RegistryState, error) {
 	data, err := os.ReadFile(rf.Path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return cregistry.New[AccountValue](), nil
+		return initialRegistryState()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read registry %s: %w", rf.Path, err)
+		return RegistryState{}, fmt.Errorf("read registry %s: %w", rf.Path, err)
 	}
-	reg := cregistry.New[AccountValue]()
-	if err := json.Unmarshal(data, &reg); err != nil {
-		return nil, fmt.Errorf("parse registry %s: %w", rf.Path, err)
+	var state RegistryState
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&state); err != nil {
+		return RegistryState{}, fmt.Errorf("parse registry %s: %w", rf.Path, err)
 	}
-	return reg, nil
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return RegistryState{}, fmt.Errorf("parse registry %s: trailing data", rf.Path)
+	}
+	if state.Revision == 0 || state.Snapshot == nil {
+		return RegistryState{}, fmt.Errorf("parse registry %s: invalid v1 state", rf.Path)
+	}
+	_, digest, err := canonicalRegistry(state.Snapshot)
+	if err != nil {
+		return RegistryState{}, fmt.Errorf("parse registry %s: %w", rf.Path, err)
+	}
+	if state.Digest != digest {
+		return RegistryState{}, fmt.Errorf("parse registry %s: snapshot digest mismatch", rf.Path)
+	}
+	return state, nil
 }
 
-// Save writes the registry atomically, as a no-op when the marshaled bytes
-// match disk — a pass that changes nothing never churns the watched file.
-func (rf RegistryFile) Save(reg Registry) error {
-	data, err := json.MarshalIndent(reg, "", "  ")
+// Load returns the typed CRDT snapshot from the exact v1 state.
+func (rf RegistryFile) Load() (Registry, error) {
+	state, err := rf.LoadState()
 	if err != nil {
-		return fmt.Errorf("marshal registry: %w", err)
+		return nil, err
 	}
-	existing, err := os.ReadFile(rf.Path)
-	switch {
-	case err == nil:
-		if bytes.Equal(existing, data) {
-			return nil
-		}
-	case !errors.Is(err, fs.ErrNotExist):
-		return fmt.Errorf("read registry %s: %w", rf.Path, err)
+	return state.Snapshot, nil
+}
+
+// Save atomically advances the product revision only when the canonical CRDT
+// snapshot changes. Identical state is a byte-for-byte no-op.
+func (rf RegistryFile) Save(reg Registry) error {
+	current, err := rf.LoadState()
+	if err != nil {
+		return err
 	}
-	if err := overlay.WriteAtomic0600(rf.Path, data); err != nil {
+	_, digest, err := canonicalRegistry(reg)
+	if err != nil {
+		return err
+	}
+	if digest == current.Digest {
+		return nil
+	}
+	if current.Revision == math.MaxUint64 {
+		return errors.New("hostsync: registry revision exhausted")
+	}
+	state := RegistryState{Revision: current.Revision + 1, Snapshot: reg, Digest: digest}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshal registry state: %w", err)
+	}
+	if err := overlay.WriteAtomic0600(rf.Path, append(data, '\n')); err != nil {
 		return fmt.Errorf("write registry %s: %w", rf.Path, err)
 	}
 	return nil
+}
+
+func initialRegistryState() (RegistryState, error) {
+	snapshot := cregistry.New[AccountValue]()
+	_, digest, err := canonicalRegistry(snapshot)
+	return RegistryState{Revision: 1, Snapshot: snapshot, Digest: digest}, err
+}
+
+func canonicalRegistry(reg Registry) ([]byte, string, error) {
+	if reg == nil {
+		return nil, "", errors.New("hostsync: registry snapshot is nil")
+	}
+	payload, err := json.Marshal(reg)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal registry snapshot: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	return payload, hex.EncodeToString(digest[:]), nil
 }
 
 // WithLock runs fn under the exclusive registry flock; the signature matches
