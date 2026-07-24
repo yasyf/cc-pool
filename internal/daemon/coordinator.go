@@ -478,10 +478,7 @@ func (c *tenantCoordinator) finishRemoval(ctx context.Context, removal store.Acc
 		return errors.New("retire FuseKit tenant: invalid proof")
 	}
 	c.forgetTenant(tenantID)
-	if err := pool.RemoveAccountConfigDir(account.InstanceID, presentation.Identity.PublicPath); err != nil {
-		return fmt.Errorf("remove retired account execution link: %w", err)
-	}
-	return c.server.m.FinishAccountRemoval(ctx, removal)
+	return c.server.m.FinishAccountRemoval(ctx, removal, presentation.Identity.PublicPath)
 }
 
 func (s *Server) prepareTenant(
